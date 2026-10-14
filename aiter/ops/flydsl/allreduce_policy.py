@@ -48,6 +48,18 @@ Each algorithm has a tuning ladder per ``(arch, link, world_size)``:
 tuple of rungs in ascending ``min_bytes`` order, and a payload runs on the last
 rung whose ``min_bytes`` is at most its size (``select_rung``). The host builds
 one engine per rung.
+
+Fused all-reduce + RMSNorm
+==========================
+
+The fused kernels (``OneShotAllReduceRMSNorm``, ``FlyQuickAllReduceRMSNorm``)
+have their own tables of both levels: ``FUSED_FAMILY_POLICIES`` and
+``FUSED_ONESHOT_LADDER``, ``FUSED_MESH_ST_LADDER``, ``FUSED_RING_ST_LADDER``
+plus ``FUSED_QR_ROW_ATOMS``. All three fused families live in one slot
+(``QuickAllReduce``), so it is ``AITER_FLY_AR_ACCURACY`` and not the quick
+reduce quantization that picks the quantized or the exact windows; the default
+is ``exact``, since the fused output feeds the next layer. The overrides are
+``AITER_FLY_AR_FUSED_<ALG>_{MIN,MAX}_BYTES``.
 """
 
 from __future__ import annotations
@@ -65,6 +77,8 @@ from .kernels.comm.allreduce_shared import (
     SUPPORTED_WORLDS,
     AllReduceAlgorithm,
     FamilyPolicy,
+    FusedOneShotRung,
+    FusedTwoShotRung,
     OneShotRung,
     TwoShotRung,
     Window,
@@ -450,13 +464,15 @@ def _override(window: Window | None, lo, hi) -> Window | None:
     return Window(base.min if lo is _UNSET else lo, base.max if hi is _UNSET else hi)
 
 
-def apply_env_overrides(policy: FamilyPolicy) -> FamilyPolicy:
-    """*policy* with the ``AITER_FLY_AR_<ALG>_{MIN,MAX}_BYTES`` overrides."""
+def apply_env_overrides(
+    policy: FamilyPolicy, prefix: str = "AITER_FLY_AR"
+) -> FamilyPolicy:
+    """*policy* with the ``<prefix>_<ALG>_{MIN,MAX}_BYTES`` overrides."""
 
     bounds = {
         alg: (
-            _env_bound(f"AITER_FLY_AR_{infix}_MIN_BYTES", is_max=False),
-            _env_bound(f"AITER_FLY_AR_{infix}_MAX_BYTES", is_max=True),
+            _env_bound(f"{prefix}_{infix}_MIN_BYTES", is_max=False),
+            _env_bound(f"{prefix}_{infix}_MAX_BYTES", is_max=True),
         )
         for alg, infix in _WINDOW_ENV.items()
     }
@@ -573,3 +589,350 @@ def resolve_family_policy(
         world_size=world_size,
     )
     return apply_env_overrides(row)
+
+
+# Fused all-reduce + RMSNorm
+# ==========================
+#
+# The same two levels as the plain all-reduce, with tables of their own: the
+# fused kernels move the same bytes, but the epilogue changes where each
+# family pays, and the one-shot tile is pinned to the token row.
+
+
+# Level 1: algorithm boundaries
+#
+# The one-shot window is measured against what the caller would run instead,
+# the fused ``cross_device_reduce`` or RCCL plus a separate RMSNorm, and above
+# it the fused path declines. With ``AITER_FLY_AR_ACCURACY=fast`` the mesh and
+# the ring take the payloads of their windows first.
+FUSED_FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
+    # --- gfx942 (MI300X) / xGMI ----------------------------------------------
+    # Measured on MI325X. No ring: the mesh wins above the one-shot.
+    FamilyPolicy(
+        arch="gfx942",
+        link="xgmi",
+        world_size=2,
+        oneshot=Window(0, 32 * MiB),
+        mesh=Window(2 * MiB, None),
+        ring=None,
+    ),
+    FamilyPolicy(
+        arch="gfx942",
+        link="xgmi",
+        world_size=4,
+        oneshot=Window(0, 512 * KiB),
+        mesh=Window(1344 * KiB, None),
+        ring=None,
+    ),
+    FamilyPolicy(
+        arch="gfx942",
+        link="xgmi",
+        world_size=8,
+        oneshot=Window(0, 128 * KiB),
+        mesh=Window(448 * KiB, None),
+        ring=None,
+    ),
+    # --- gfx950 (MI355X) / xGMI ----------------------------------------------
+    # TODO: measured on gfx942; tune on gfx950.
+    FamilyPolicy(
+        arch="gfx950",
+        link="xgmi",
+        world_size=2,
+        oneshot=Window(0, 32 * MiB),
+        mesh=Window(2 * MiB, None),
+        ring=None,
+    ),
+    FamilyPolicy(
+        arch="gfx950",
+        link="xgmi",
+        world_size=4,
+        oneshot=Window(0, 512 * KiB),
+        mesh=Window(1344 * KiB, None),
+        ring=None,
+    ),
+    FamilyPolicy(
+        arch="gfx950",
+        link="xgmi",
+        world_size=8,
+        oneshot=Window(0, 128 * KiB),
+        mesh=Window(448 * KiB, None),
+        ring=None,
+    ),
+    # --- gfx950 (MI350P) / PCIe ----------------------------------------------
+    FamilyPolicy(
+        arch="gfx950",
+        link="pcie",
+        world_size=2,
+        oneshot=Window(0, 32 * MiB),
+        mesh=Window(672 * KiB, 768 * KiB),
+        ring=Window(768 * KiB, None),
+    ),
+    FamilyPolicy(
+        arch="gfx950",
+        link="pcie",
+        world_size=4,
+        oneshot=Window(0, 32 * MiB),
+        mesh=Window(336 * KiB, 21 * MiB),
+        ring=Window(21 * MiB, None),
+    ),
+    FamilyPolicy(
+        arch="gfx950",
+        link="pcie",
+        world_size=8,
+        oneshot=Window(0, 32 * MiB),
+        mesh=Window(168 * KiB, None),
+        ring=None,
+    ),
+)
+
+_FUSED_POLICY_BY_KEY = _index(FUSED_FAMILY_POLICIES)
+
+
+# Level 2: configuration ladders
+
+
+# One-shot, ``FusedOneShotRung``. Rungs select by payload, which at a fixed
+# hidden is the token count, so "split the row at M=1, not at M=4" is two rungs.
+#
+#   PCIe  measured on MI350P.
+#   xGMI  measured on MI325X. A split row wins at TP4/TP8 for small M; TP2 never
+#         benefits from splitting it.
+_FUSED_ONESHOT_XGMI = {
+    2: (FusedOneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", split=1),),
+    4: (
+        FusedOneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", split=16),
+        FusedOneShotRung(
+            min_bytes=144 * KiB, atoms=1, grid_cap=128, fanout="peer", split=1
+        ),
+    ),
+    8: (
+        FusedOneShotRung(min_bytes=0, atoms=1, grid_cap=64, fanout="peer", split=16),
+        FusedOneShotRung(
+            min_bytes=56 * KiB, atoms=1, grid_cap=128, fanout="peer", split=16
+        ),
+    ),
+}
+FUSED_ONESHOT_LADDER: dict[tuple[str, str, int], tuple[FusedOneShotRung, ...]] = {
+    # --- gfx942 (MI300X) / xGMI ----------------------------------------------
+    **{("gfx942", "xgmi", ws): rungs for ws, rungs in _FUSED_ONESHOT_XGMI.items()},
+    # --- gfx950 (MI355X) / xGMI ----------------------------------------------
+    # TODO: measured on gfx942; tune on gfx950.
+    **{("gfx950", "xgmi", ws): rungs for ws, rungs in _FUSED_ONESHOT_XGMI.items()},
+    # --- gfx950 (MI350P) / PCIe ----------------------------------------------
+    ("gfx950", "pcie", 2): (
+        FusedOneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", split=1),
+    ),
+    ("gfx950", "pcie", 4): (
+        FusedOneShotRung(min_bytes=0, atoms=2, grid_cap=64, fanout="peer", split=1),
+        FusedOneShotRung(
+            min_bytes=64 * KiB, atoms=1, grid_cap=128, fanout="peer", split=1
+        ),
+        FusedOneShotRung(
+            min_bytes=384 * KiB, atoms=2, grid_cap=32, fanout="peer", split=1
+        ),
+    ),
+    ("gfx950", "pcie", 8): (
+        FusedOneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", split=8),
+        FusedOneShotRung(
+            min_bytes=48 * KiB, atoms=1, grid_cap=32, fanout="peer", split=1
+        ),
+    ),
+}
+
+# Mesh, ``FusedTwoShotRung``.
+_FUSED_MESH_XGMI = {
+    2: (FusedTwoShotRung(min_bytes=0, super_tile=1, grid_cap=128),),
+    4: (
+        FusedTwoShotRung(min_bytes=0, super_tile=8, grid_cap=128),
+        FusedTwoShotRung(min_bytes=4 * MiB, super_tile=1, grid_cap=128),
+    ),
+    8: (
+        FusedTwoShotRung(min_bytes=0, super_tile=1, grid_cap=128),
+        FusedTwoShotRung(min_bytes=6 * MiB, super_tile=8, grid_cap=128),
+    ),
+}
+FUSED_MESH_ST_LADDER: dict[tuple[str, str, int], tuple[FusedTwoShotRung, ...]] = {
+    # --- gfx942 (MI300X) / xGMI ----------------------------------------------
+    **{("gfx942", "xgmi", ws): rungs for ws, rungs in _FUSED_MESH_XGMI.items()},
+    # --- gfx950 (MI355X) / xGMI ----------------------------------------------
+    # TODO: measured on gfx942; tune on gfx950.
+    **{("gfx950", "xgmi", ws): rungs for ws, rungs in _FUSED_MESH_XGMI.items()},
+    # --- gfx950 (MI350P) / PCIe ----------------------------------------------
+    ("gfx950", "pcie", 2): (FusedTwoShotRung(min_bytes=0, super_tile=1, grid_cap=64),),
+    ("gfx950", "pcie", 4): (
+        FusedTwoShotRung(min_bytes=0, super_tile=1, grid_cap=32),
+        FusedTwoShotRung(min_bytes=896 * KiB, super_tile=8, grid_cap=128),
+    ),
+    ("gfx950", "pcie", 8): (FusedTwoShotRung(min_bytes=0, super_tile=8, grid_cap=32),),
+}
+
+# Ring, ``FusedTwoShotRung``.
+_FUSED_RING_XGMI = {
+    2: (
+        FusedTwoShotRung(min_bytes=0, super_tile=8, grid_cap=128),
+        FusedTwoShotRung(min_bytes=24 * MiB, super_tile=16, grid_cap=128),
+    ),
+    4: (
+        FusedTwoShotRung(min_bytes=0, super_tile=8, grid_cap=128),
+        FusedTwoShotRung(min_bytes=24 * MiB, super_tile=16, grid_cap=128),
+        FusedTwoShotRung(min_bytes=48 * MiB, super_tile=32, grid_cap=128),
+    ),
+    8: (
+        FusedTwoShotRung(min_bytes=0, super_tile=16, grid_cap=128),
+        FusedTwoShotRung(min_bytes=48 * MiB, super_tile=32, grid_cap=128),
+    ),
+}
+FUSED_RING_ST_LADDER: dict[tuple[str, str, int], tuple[FusedTwoShotRung, ...]] = {
+    # --- gfx942 (MI300X) / xGMI ----------------------------------------------
+    **{("gfx942", "xgmi", ws): rungs for ws, rungs in _FUSED_RING_XGMI.items()},
+    # --- gfx950 (MI355X) / xGMI ----------------------------------------------
+    # TODO: measured on gfx942; tune on gfx950.
+    **{("gfx950", "xgmi", ws): rungs for ws, rungs in _FUSED_RING_XGMI.items()},
+    # --- gfx950 (MI350P) / PCIe ----------------------------------------------
+    ("gfx950", "pcie", 2): (FusedTwoShotRung(min_bytes=0, super_tile=1, grid_cap=128),),
+    ("gfx950", "pcie", 4): (
+        FusedTwoShotRung(min_bytes=0, super_tile=16, grid_cap=128),
+    ),
+    ("gfx950", "pcie", 8): (
+        FusedTwoShotRung(min_bytes=0, super_tile=32, grid_cap=128),
+    ),
+}
+
+# ``atoms_per_row`` of a fused mesh or ring build, per ``(arch, link,
+# world_size, algorithm)``: the portable form of the block knob, since which
+# blocks exist depends on the width and which ``atoms_per_row`` values exist
+# does not. A missing entry takes the widest workgroup the row allows.
+_FUSED_QR_ROW_ATOMS_XGMI = {(2, "ring"): 4, (4, "mesh"): 2, (8, "mesh"): 1}
+FUSED_QR_ROW_ATOMS: dict[tuple[str, str, int, str], int] = {
+    **{("gfx942", "xgmi", *k): v for k, v in _FUSED_QR_ROW_ATOMS_XGMI.items()},
+    # TODO: measured on gfx942; tune on gfx950.
+    **{("gfx950", "xgmi", *k): v for k, v in _FUSED_QR_ROW_ATOMS_XGMI.items()},
+    ("gfx950", "pcie", 2, "mesh"): 4,
+    ("gfx950", "pcie", 2, "ring"): 2,
+    ("gfx950", "pcie", 4, "mesh"): 2,
+    ("gfx950", "pcie", 4, "ring"): 2,
+    ("gfx950", "pcie", 8, "mesh"): 1,
+}
+
+
+def fused_oneshot_ladder(
+    *, world_size: int, link: str, arch: str | None = None
+) -> tuple[FusedOneShotRung, ...]:
+    """The fused one-shot rungs for *(arch, link, world_size)*. *arch*
+    defaults to this host's."""
+    return _ladder(FUSED_ONESHOT_LADDER, "fused one-shot", arch, link, world_size)
+
+
+def fused_mesh_st_ladder(
+    *, world_size: int, link: str, arch: str | None = None
+) -> tuple[FusedTwoShotRung, ...]:
+    """The fused mesh rungs for *(arch, link, world_size)*. *arch* defaults to
+    this host's."""
+    return _ladder(FUSED_MESH_ST_LADDER, "fused mesh", arch, link, world_size)
+
+
+def fused_ring_st_ladder(
+    *, world_size: int, link: str, arch: str | None = None
+) -> tuple[FusedTwoShotRung, ...]:
+    """The fused ring rungs for *(arch, link, world_size)*. *arch* defaults to
+    this host's."""
+    return _ladder(FUSED_RING_ST_LADDER, "fused ring", arch, link, world_size)
+
+
+def fused_qr_row_atoms(
+    *, world_size: int, algorithm: str, link: str, arch: str | None = None
+) -> int | None:
+    """``atoms_per_row`` of a fused *algorithm* build, or None for the default."""
+    arch = detect_arch() if arch is None else arch
+    return FUSED_QR_ROW_ATOMS.get((arch, link, int(world_size), str(algorithm)))
+
+
+# Host and environment
+
+ACCURACY_ENV = "AITER_FLY_AR_ACCURACY"
+ACCURACY_MODES = ("exact", "fast")
+DEFAULT_ACCURACY = "exact"
+
+# Comma-separated hidden sizes to build the fused engines for at startup. The
+# fused wire layout depends on the width, so a width cannot be built until it
+# is known, and building inside a HIP graph capture is not possible.
+FUSED_HIDDENS_ENV = "AITER_FLY_AR_FUSED_HIDDENS"
+
+# The prefix of the fused window overrides, ``<prefix>_<ALG>_{MIN,MAX}_BYTES``.
+FUSED_ENV_PREFIX = "AITER_FLY_AR_FUSED"
+
+
+def accuracy_mode() -> str:
+    """``"exact"`` (default) or ``"fast"``, from ``AITER_FLY_AR_ACCURACY``.
+
+    ``fast`` opens the quantized windows of the fused policy; ``exact`` keeps
+    only the exact one-shot.
+    """
+    raw = os.environ.get(ACCURACY_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_ACCURACY
+    mode = raw.strip().lower()
+    if mode not in ACCURACY_MODES:
+        logger.warning(
+            "FlyDSL all-reduce: ignoring %s=%r, expected one of %s",
+            ACCURACY_ENV,
+            raw,
+            ACCURACY_MODES,
+        )
+        return DEFAULT_ACCURACY
+    return mode
+
+
+def fused_hiddens(extra: tuple[int, ...] = ()) -> tuple[int, ...]:
+    """Widths to build the fused engines for up front, sorted and deduped.
+
+    ``AITER_FLY_AR_FUSED_HIDDENS`` plus *extra*. Sorted so every rank builds in
+    the same order: each build is a collective.
+    """
+    out = {int(h) for h in extra if int(h) > 0}
+    raw = os.environ.get(FUSED_HIDDENS_ENV, "")
+    for tok in raw.replace(" ", "").split(","):
+        if not tok:
+            continue
+        try:
+            val = int(tok)
+        except ValueError:
+            logger.warning(
+                "FlyDSL all-reduce: ignoring %r in %s, expected an integer",
+                tok,
+                FUSED_HIDDENS_ENV,
+            )
+            continue
+        if val > 0:
+            out.add(val)
+    return tuple(sorted(out))
+
+
+# Level 1: resolution
+
+
+def fused_family_policy(*, arch: str, link: str, world_size: int) -> FamilyPolicy:
+    """The fused table row for *(arch, link, world_size)*, without overrides."""
+    _check_platform(arch, link, int(world_size))
+    row = _FUSED_POLICY_BY_KEY.get((arch, link, int(world_size)))
+    if row is None:
+        raise NoPolicyError(
+            f"no FlyDSL fused all-reduce policy for {arch}/{link}/TP{world_size}"
+        )
+    return row
+
+
+def resolve_fused_policy(
+    *, world_size: int, arch: str | None = None, link: str | None = None
+) -> FamilyPolicy:
+    """The fused policy of this rank, with the
+    ``AITER_FLY_AR_FUSED_<ALG>_{MIN,MAX}_BYTES`` overrides applied.
+
+    Select with ``quantized=accuracy_mode() == "fast"``.
+    """
+    row = fused_family_policy(
+        arch=detect_arch() if arch is None else arch,
+        link=resolve_link(link),
+        world_size=world_size,
+    )
+    return apply_env_overrides(row, prefix=FUSED_ENV_PREFIX)
