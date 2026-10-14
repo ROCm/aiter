@@ -539,23 +539,28 @@ def build_hstu_attention_bwd_dvdk_pp(
 
         def make_dma(tensor, base_byte_off, dst_views, swizzled):
             div = _rebased_buffer_div(
-                # num_records = THIS sequence's extent, not the tensor's. The
-                # buffer descriptor then does the row bound check in hardware:
-                # any voffset past the last valid token returns 0, so the
-                # explicit `(q_start + row) < seq_len` select below is not
-                # needed, and out-of-range rows arrive in LDS as ZERO rather
-                # than as a copy of token 0.
+                # num_records = THIS sequence's extent, not the tensor's, so a
+                # stray voffset can never read another sequence's tokens. It is
+                # a backstop only: the descriptor bound DROPS an out-of-range
+                # `buffer_load ... lds` instead of zeroing it, so `fire` still
+                # has to clamp the row itself.
                 fx.get_iter(tensor),
                 base_byte_off,
                 seq_len * stride_qk_n,
             )
-            rows, gcols = [], []
+            # The out-of-range row has to land somewhere defined -- see `fire`.
+            # Both the lane's offset within a tile and the clamp target are
+            # loop-invariant, so build the whole element offset here and let the
+            # loop add only the tile base.
+            last_row_elem = (seq_len - fx.Int32(1)) * c_stride_n
+            rowoff, bound = [], []
             for d in range_constexpr(NUM_DMA):
                 pair = grp_tid + fx.Int32(d * GRP_THREADS)
                 row = pair // c_pairs_per_row
                 col = (pair % c_pairs_per_row) * c_dma_elems
-                rows.append(row)
-                gcols.append(q_swz_col(row, col) if const_expr(swizzled) else col)
+                gcol = q_swz_col(row, col) if const_expr(swizzled) else col
+                rowoff.append(row * c_stride_n + gcol)
+                bound.append(last_row_elem + gcol)
             # The DMA destination must be wave-uniform in an SGPR, so it is the
             # one LDS address that still goes through `inttoptr` -- that is how
             # `m0` is written and it is what the shipping kernel does too. One
@@ -568,10 +573,16 @@ def build_hstu_attention_bwd_dvdk_pp(
                 lane0.append(rocdl.readfirstlane(fx.Int32.ir_type, wave_byte))
 
             def fire(slot, q_start, d):
-                row = rows[d]
-                in_bounds = (q_start + row) < seq_len
-                local_tok = in_bounds.select(q_start + row, fx.Int32(0))
-                src_elem = local_tok * c_stride_n + gcols[d]
+                # A row past the end must still fetch SOMETHING -- an
+                # out-of-range `buffer_load ... lds` leaves the LDS slot
+                # unwritten rather than zeroed, and a stale NaN there poisons
+                # dV through `0 * Inf` (see `rm_zero`). Which row it reads is
+                # free, because the gate masks these rows out, so clamp to the
+                # sequence's LAST row rather than selecting token 0: that keeps
+                # the whole computation in the element-offset domain and drops
+                # the parallel token-index chain the bound check used to need.
+                raw = q_start * c_stride_n + rowoff[d]
+                src_elem = (raw > bound[d]).select(bound[d], raw)
                 lds_byte = fx.Int32(lane0[slot]) + fx.Int32(
                     d * GRP_THREADS * DMA_BYTES
                 )
