@@ -4,14 +4,14 @@
 import pytest
 import torch
 
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops import topk as topk_ops
 
 
 def _is_gfx1250() -> bool:
     if not torch.cuda.is_available() or torch.version.hip is None:
         return False
-    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
-    return arch.split(":", 1)[0] == "gfx1250"
+    return get_gfx() == "gfx1250"
 
 
 pytestmark = pytest.mark.skipif(not _is_gfx1250(), reason="requires gfx1250")

@@ -9,7 +9,7 @@ import os
 import torch
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from ..utility import dtypes
 from ..utility.graph_alloc import persistent_alloc
 
@@ -32,12 +32,6 @@ def topk_gating_fwd(
 _VALID_SCORE_FUNCS = {"sqrtsoftplus", "sigmoid", "softmax"}
 _GFX1250_SIGMOID_EXPERTS = {512, 768, 896, 900, 1024}
 _GFX1250_SIGMOID_TOPKS = {4, 8, 16}
-
-
-@functools.lru_cache(maxsize=16)
-def _is_gfx1250_device(device_index: int) -> bool:
-    arch = getattr(torch.cuda.get_device_properties(device_index), "gcnArchName", "")
-    return arch.split(":", 1)[0] == "gfx1250"
 
 
 def _can_use_gfx1250_exact_sigmoid_topk(
@@ -84,10 +78,7 @@ def _can_use_gfx1250_exact_sigmoid_topk(
     )
     if not input_ok or not bias_ok or not outputs_ok or not same_device:
         return False
-    device_index = gating_output.device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    return _is_gfx1250_device(device_index)
+    return get_gfx_runtime() == "gfx1250"
 
 
 def _gfx1250_exact_sigmoid_topk(
