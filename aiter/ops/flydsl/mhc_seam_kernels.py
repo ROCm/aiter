@@ -22,7 +22,12 @@ from aiter.ops.flydsl.kernels.kernels_common import ceildiv
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
 from aiter.ops.rmsnorm import rms_norm
 
-__all__ = ["MHC_SEAM_DEFAULTS", "flydsl_mhc_seam", "get_mhc_seam_config"]
+__all__ = [
+    "MHC_SEAM_DEFAULTS",
+    "flydsl_mhc_seam",
+    "flydsl_mhc_seam_pack_fn",
+    "get_mhc_seam_config",
+]
 
 _GFX = ("gfx942",)
 _N = 4
@@ -60,6 +65,8 @@ _NORMS = ("fused", "separate")
 # Tuned on 304-CU gfx942 at H=5120: (max T, BLOCK_M, CHUNK_C, CACHE_NT).
 # One row per token bucket; the last row also covers larger T.
 # SPLITS is derived from the grid. CACHE_NT helps once traffic exceeds the MALL.
+# BLOCK_M stays 32 above 1024 tokens: the accumulator is as wide as the limb stack, which a
+# 64-token tile cannot afford.
 _FUSED_NORM_TABLE = (
     (1, 16, 128, False),
     (32, 16, 128, False),
@@ -67,11 +74,11 @@ _FUSED_NORM_TABLE = (
     (384, 32, 64, False),
     (512, 32, 64, False),
     (1024, 32, 64, False),
-    (2048, 64, 64, False),
-    (4096, 64, 64, False),
-    (8192, 64, 64, True),
-    (16384, 64, 64, True),
-    (32768, 64, 64, True),
+    (2048, 32, 64, False),
+    (4096, 32, 64, False),
+    (8192, 32, 64, True),
+    (16384, 32, 64, True),
+    (32768, 32, 64, True),
 )
 # Same sweep: (max T, BLOCK_M, CHUNK_C, CACHE_NT, CACHE_NT_X).
 # Below the threshold, fused norm avoids the cost of a separate RMSNorm launch.
@@ -304,6 +311,7 @@ def _validate_inputs(
     comb_res_mix: torch.Tensor | None,
     norm_weight: torch.Tensor | None,
     residual_out: torch.Tensor | None,
+    fn_packed: torch.Tensor | None,
 ) -> tuple[int, int, str]:
     """Validate inputs and return the token count, hidden size, and GPU arch."""
     _require(residual.dim() == 3, "residual must be (T, 4, H)")
@@ -321,9 +329,16 @@ def _validate_inputs(
     _require(fn.dtype == torch.float32, "fn must be fp32", TypeError)
     _require(fn.is_contiguous(), "fn must be contiguous")
     _require(
-        mhc_seam.PAD_ROWS * fn.shape[1] * fn.element_size() < 2**31,
-        "fn exceeds the 2 GiB buffer descriptor offset window",
+        mhc_seam.PACK_ROWS * fn.shape[1] < 2**31,
+        "the packed fn exceeds the int32 element offsets the kernels use",
     )
+    if fn_packed is not None:
+        _require(
+            fn_packed.shape == _packed_fn_shape(H),
+            "fn_packed must come from flydsl_mhc_seam_pack_fn(fn)",
+        )
+        _require(fn_packed.dtype == torch.bfloat16, "fn_packed must be bf16", TypeError)
+        _require(fn_packed.is_contiguous(), "fn_packed must be contiguous")
     _require(
         hc_scale.shape == (3,) and hc_base.shape == (24,),
         "hc_scale (3,) and hc_base (24,)",
@@ -399,6 +414,7 @@ def _validate_inputs(
         post_layer_mix,
         comb_res_mix,
         residual_out,
+        fn_packed,
     ):
         _require(
             t is None or t.device == device, "all tensors must be on the same device"
@@ -409,6 +425,68 @@ def _validate_inputs(
 def _ptr(t: torch.Tensor | None, dtype):
     """Pass a null pointer for optional inputs the kernel does not read."""
     return flyc.from_c_void_p(dtype, 0) if t is None else ptr_arg(t, dtype)
+
+
+def _packed_fn_shape(H: int) -> tuple[int, ...]:
+    return (_N * H // 16, mhc_seam.N_TILES, 4, mhc_seam.MFMA_MN, 4)
+
+
+def flydsl_mhc_seam_pack_fn(fn: torch.Tensor) -> torch.Tensor:
+    """fn (24, 4H) fp32 -> bf16 [hi; lo] limbs in MFMA B lane order, for ``fn_packed=``.
+
+    Pack when the weight is loaded, and again into the same buffer when it is reloaded.
+    """
+    _require(fn.dim() == 2 and fn.shape[0] == 24, "fn must be (24, 4H)")
+    _require(fn.shape[1] % 16 == 0, "fn's 4H columns must be a multiple of 16")
+    _require(fn.dtype == torch.float32, "fn must be fp32", TypeError)
+    hi = fn.to(torch.bfloat16)
+    lo = (fn - hi.float()).to(torch.bfloat16)
+    rows = torch.cat([hi, lo])  # row-product n = 24 * limb + row
+    # (n, k) -> (k // 16, n // 16, k % 16 // 4, n % 16, k % 4); see kernels/mhc_seam.py
+    return (
+        rows.view(mhc_seam.N_TILES, mhc_seam.MFMA_MN, -1, 4, 4)
+        .permute(2, 0, 3, 1, 4)
+        .contiguous()
+    )
+
+
+_FN_CACHE: dict = {}
+
+
+def _pack_fn(fn: torch.Tensor, capturing: bool) -> torch.Tensor:
+    """``flydsl_mhc_seam_pack_fn`` cached per weight tensor, for calls without ``fn_packed``.
+
+    Keyed on the tensor object and stamped with its address and version counter, so an
+    in-place update through ``fn`` repacks; a write through ``fn.data`` changes neither and
+    is missed. A repack writes into the buffer captured graphs hold. Packing is eager only,
+    and the host waits for it so no other stream reads it half written.
+    """
+    key = id(fn)
+    hit = _FN_CACHE.get(key)
+    stamp = (fn.data_ptr(), fn._version)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    _require(
+        not capturing,
+        "fn is not packed during CUDA-graph capture: pass fn_packed, "
+        "or run one eager call with the same fn before capturing and again after "
+        "updating it in place",
+        RuntimeError,
+    )
+    packed = flydsl_mhc_seam_pack_fn(fn)
+    if hit is None:
+        weakref.finalize(fn, _FN_CACHE.pop, key, None)
+    else:
+        # A fresh buffer would leave captured graphs on the old one.
+        _require(
+            hit[1].shape == packed.shape,
+            "fn changed shape in place; the pack captured graphs hold cannot follow it",
+            RuntimeError,
+        )
+        packed = hit[1].copy_(packed)
+    torch.cuda.current_stream(fn.device).synchronize()
+    _FN_CACHE[key] = (stamp, packed)
+    return packed
 
 
 def _make_fused_norm_runner(
@@ -442,8 +520,12 @@ def _make_fused_norm_runner(
         layer_input: torch.Tensor,
         next_pre: torch.Tensor,
         stream: torch.cuda.Stream,
+        fn_packed: torch.Tensor | None,
     ) -> torch.Tensor:
         bf16, f32 = fx.BFloat16, fx.Float32
+        packed = fn_packed
+        if packed is None:
+            packed = _pack_fn(fn, torch.cuda.is_current_stream_capturing())
         part = torch.empty(part_size, dtype=torch.float32, device=residual.device)
         sums = torch.empty(sums_size, dtype=torch.float32, device=residual.device)
         part_p, sums_p = ptr_arg(part, f32), ptr_arg(sums, f32)
@@ -455,7 +537,7 @@ def _make_fused_norm_runner(
             _ptr(post_layer_mix if has_post else None, f32),
             _ptr(comb_res_mix if has_post else None, f32),
             _ptr(pre_mix, f32),
-            ptr_arg(fn, f32),
+            ptr_arg(packed, bf16),
             ptr_arg(residual_out, bf16),
             stage_p,
             part_p,
@@ -483,52 +565,6 @@ def _make_fused_norm_runner(
         return layer_input
 
     return run
-
-
-_FN_CACHE: dict = {}
-
-
-def _pack_fn_nonorm(fn: torch.Tensor, capturing: bool) -> torch.Tensor:
-    """fn (24, 4H) fp32 -> the no-norm fused pass's bf16 [hi; lo] rows in MFMA B lane order,
-    cached per weight tensor.
-
-    Keyed on the tensor object (dropped when it is freed, so a new weight at a recycled
-    address never hits a stale pack) and checked against its address and version counter, so
-    an in-place update repacks. A repack writes into the existing pack, whose address a
-    captured graph holds, so one eager call after an in-place update brings captured graphs
-    up to date too. Packing only runs eagerly: during capture it would be recorded, not
-    computed. The host waits for the pack once, so a call on another stream cannot read it
-    half written.
-    """
-    key = id(fn)
-    hit = _FN_CACHE.get(key)
-    stamp = (fn.data_ptr(), fn._version)
-    if hit is not None and hit[0] == stamp:
-        return hit[1]
-    _require(
-        not capturing,
-        "fn is not packed for NORM='separate' during CUDA-graph capture: run one eager "
-        "call with the same fn before capturing, and again after updating it in place",
-        RuntimeError,
-    )
-    hi = fn.to(torch.bfloat16)
-    lo = (fn - hi.float()).to(torch.bfloat16)
-    rows = torch.cat([hi, lo])  # row-product n = 24 * limb + row
-    # (n, k) -> (k // 16, n // 16, k % 16 // 4, n % 16, k % 4); see kernels/mhc_seam_nonorm.py
-    packed = rows.view(3, 16, -1, 4, 4).permute(2, 0, 3, 1, 4).contiguous()
-    if hit is None:
-        weakref.finalize(fn, _FN_CACHE.pop, key, None)
-    else:
-        # A fresh buffer would leave captured graphs on the old one.
-        _require(
-            hit[1].shape == packed.shape,
-            "fn changed shape in place; the pack captured graphs hold cannot follow it",
-            RuntimeError,
-        )
-        packed = hit[1].copy_(packed)
-    torch.cuda.current_stream(fn.device).synchronize()
-    _FN_CACHE[key] = (stamp, packed)
-    return packed
 
 
 def _make_separate_norm_runner(
@@ -560,9 +596,12 @@ def _make_separate_norm_runner(
         layer_input: torch.Tensor,
         next_pre: torch.Tensor,
         stream: torch.cuda.Stream,
+        fn_packed: torch.Tensor | None,
     ) -> torch.Tensor:
         bf16, f32 = fx.BFloat16, fx.Float32
-        packed = _pack_fn_nonorm(fn, torch.cuda.is_current_stream_capturing())
+        packed = fn_packed
+        if packed is None:
+            packed = _pack_fn(fn, torch.cuda.is_current_stream_capturing())
         part = torch.empty(part_size, dtype=torch.float32, device=residual.device)
         part_p = ptr_arg(part, f32)
         _run_compiled(
@@ -696,6 +735,7 @@ def flydsl_mhc_seam(
     *,
     residual_out: torch.Tensor | None = None,
     config: dict | None = None,
+    fn_packed: torch.Tensor | None = None,
 ):
     """Delayed mHC seam with RMSNorm for contiguous inputs.
 
@@ -709,9 +749,11 @@ def flydsl_mhc_seam(
     ``MHC_SEAM_DEFAULTS``. Fused RMSNorm takes two launches; separate RMSNorm takes
     three and is preferred above 128 tokens with post-mix and a carried pre gate.
 
-    Scratch is allocated per call. Compile before CUDA-graph capture. Separate
-    RMSNorm also needs an eager call with the same ``fn`` to pack it before capture,
-    and again after any in-place weight update before replaying the graph.
+    Scratch is allocated per call. Compile before CUDA-graph capture. Pass
+    ``fn_packed=flydsl_mhc_seam_pack_fn(fn)``, repacked into the same buffer when
+    ``fn`` is reloaded. Without it, ``fn`` is packed on the first eager call, which
+    must precede capture, and repacked after an in-place update through ``fn`` but
+    not through ``fn.data``.
     """
     T, H, arch = _validate_inputs(
         residual,
@@ -725,6 +767,7 @@ def flydsl_mhc_seam(
         comb_res_mix,
         norm_weight,
         residual_out,
+        fn_packed,
     )
     has_post = sublayer_out is not None
     identity_pre = pre_mix is None
@@ -773,5 +816,6 @@ def flydsl_mhc_seam(
         layer_input=layer_input,
         next_pre=next_pre,
         stream=torch.cuda.current_stream(device),
+        fn_packed=fn_packed,
     )
     return residual_out, post_out, comb_out, layer_input, next_pre

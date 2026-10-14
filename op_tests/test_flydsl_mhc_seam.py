@@ -17,7 +17,7 @@ Tables:
                          finish pass or as aiter.rms_norm after it.
   test_mhc_seam_streams  two seams on two streams at once, sharing one weight, either path.
   test_mhc_seam_knobs    builds the policy does not reach at these sizes, forced.
-  test_mhc_seam_weight_update  a captured graph after an in-place update of fn.
+  test_mhc_seam_weight_update  a captured graph after an in-place update of fn, per NORM.
   test_mhc_seam_errors   invalid inputs raise ValueError / TypeError.
 
 The reference, inputs and output checks are the Mega-mHC test's
@@ -70,7 +70,7 @@ _ROTATE_BYTES = 512 * 2**20
 
 def _with_fn(op, fn):
     """``op`` with the weight bound outside its arguments. run_perftest's rotation deep-copies
-    every argument, and a copied ``fn`` makes the separate path repack it on every call, which
+    every argument, and a copied ``fn`` makes the seam repack it on every call, which
     a model's one weight never does."""
 
     def call(residual, *rest, **kw):
@@ -210,7 +210,7 @@ def test_mhc_seam_norm(T, H, mode, norms):
 
 def _shared_fn_cases(T, H):
     """Two post-mode seams with their own activations and gates and one weight, as two
-    streams of one model have: the separate path's first call packs it for both."""
+    streams of one model have: the first call packs it for both."""
     first = _call_kwargs("post", T, H, seed=1)
     fn = first[0][1]
     residual, y, _, hc_scale, hc_base, post, comb, pre, w = mega_ref.make_inputs(
@@ -269,14 +269,14 @@ def test_mhc_seam_knobs(H):
     return rows
 
 
-def test_mhc_seam_weight_update(H):
-    """A graph captured on the separate path sees an in-place update of fn after one eager
-    call, as a weight sync into a running engine needs."""
-    from aiter.ops.flydsl import flydsl_mhc_seam
+def test_mhc_seam_weight_update(H, norm):
+    """A captured graph follows an in-place update of fn after one eager call, and a write
+    through fn.data once the caller repacks fn_packed in place."""
+    from aiter.ops.flydsl import flydsl_mhc_seam, flydsl_mhc_seam_pack_fn
 
     T = 256
     args, kw, _ = _call_kwargs("post", T, H)
-    cfg = {"NORM": "separate"}
+    cfg = {"NORM": norm}
     s = torch.cuda.Stream()
     with torch.cuda.stream(s):
         flydsl_mhc_seam(*args, config=cfg, **kw)
@@ -293,8 +293,33 @@ def test_mhc_seam_weight_update(H):
     want = flydsl_mhc_seam(*args, config=cfg, **kw)
     same = all(torch.equal(a, b) for a, b in zip(out[1:5], want[1:5]))
     if not same:
-        mega_ref._FAILURES.append("weight update: the replayed graph kept the old fn")
-    return {"gfx": get_gfx(), "T": T, "replay matches eager": same}
+        mega_ref._FAILURES.append(
+            f"weight update ({norm}): the replayed graph kept the old fn"
+        )
+
+    fn = args[1]
+    packed = flydsl_mhc_seam_pack_fn(fn)
+    with torch.cuda.stream(s):
+        flydsl_mhc_seam(*args, config=cfg, fn_packed=packed, **kw)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=s):
+        out = flydsl_mhc_seam(*args, config=cfg, fn_packed=packed, **kw)
+    fn.data.copy_(fn * 0.5)
+    packed.copy_(flydsl_mhc_seam_pack_fn(fn))
+    g.replay()
+    torch.cuda.synchronize()
+    # Against the reference: a stale pack would also match a stale eager call.
+    ref_kw = {k: v for k, v in kw.items() if k not in ("residual_out", "pre_mix")}
+    ref = mega_ref.run_torch(*args, pre_mix=kw["pre_mix"], **ref_kw)
+    err = check_outputs(f"weight update via fn.data ({norm})", out, ref, "bf16", "post")
+    return {
+        "gfx": get_gfx(),
+        "T": T,
+        "norm": norm,
+        "replay matches eager": same,
+        "fn.data replay err": err,
+    }
 
 
 def test_mhc_seam_errors(H):
@@ -457,7 +482,11 @@ def main():
         pd.DataFrame(rows).to_markdown(index=False),
     )
 
-    rows = [test_mhc_seam_weight_update(H) for H in args.hidden]
+    rows = [
+        test_mhc_seam_weight_update(H, norm)
+        for H in args.hidden
+        for norm in ("fused", "separate")
+    ]
     aiter.logger.info(
         "mhc seam weight-update check (markdown):\n%s",
         pd.DataFrame(rows).to_markdown(index=False),

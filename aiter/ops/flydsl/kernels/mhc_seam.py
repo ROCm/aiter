@@ -38,7 +38,7 @@ Paths:
 Gate packing, which a caller must match exactly and cannot derive from the signatures:
   - `fn` is `(gate_rows(streams), streams * hidden)` fp32, its rows ordered `pre | post | comb`
     -- `streams` pre rows, then `streams` post rows, then the `streams * streams` comb rows in
-    row-major `(i, j)` order.
+    row-major `(i, j)` order -- and arrives packed by `mhc_seam_kernels.flydsl_mhc_seam_pack_fn`.
   - `hc_scale` is three fp32, `(pre, post, comb)`, applied to the matching band of rows.
   - `hc_base` is one fp32 per projection row, in the same order as `fn`'s rows.
 
@@ -73,9 +73,6 @@ BLOCK = 4 * WAVE_SIZE
 VEC = 8
 MFMA_MN = 16
 MFMA_K = 16
-# The gate rows padded to two 16-wide MFMA N tiles. The atom asserts M == N, so 24 is not a
-# tile width; the eight padding rows read past `fn` and the buffer descriptor returns zeros.
-PAD_ROWS = 2 * MFMA_MN
 # Every wave covers the whole output tile and they split the contraction instead: splitting an
 # output axis would cost operand copies a tile this small cannot amortise. The price is a fold of
 # the partials, once per segment through LDS.
@@ -93,7 +90,7 @@ TILE_PAD = 8
 FOLD_BUDGET = 32 * 1024
 # fp32 per (segment, token) of the published logit row: one per gate row, then padding to the
 # 128 B line the finish pass gathers.
-SPLIT_SLOTS = PAD_ROWS
+SPLIT_SLOTS = 2 * MFMA_MN
 # Tokens one finish workgroup owns: exactly enough that its published lines give every lane of
 # the block one value to fold.
 TOKENS_PER_BLOCK = BLOCK // SPLIT_SLOTS
@@ -135,6 +132,13 @@ def _require(cond: bool, msg: str, exc: type[Exception] = ValueError) -> None:
 def gate_rows(streams: int) -> int:
     """Rows of the `fn` gate projection: `streams` pre + `streams` post + `streams^2` comb."""
     return 2 * streams + streams * streams
+
+
+# The gate rows' two bf16 limbs stacked: limb `l` row `r` is row-product `gate_rows * l + r`.
+# Two limbs carry the ~16 mantissa bits the gate tolerances need; stacked, they fill three
+# 16-wide N tiles exactly, so both ride one contraction.
+PACK_ROWS = 2 * gate_rows(STREAMS)
+N_TILES = PACK_ROWS // MFMA_MN
 
 
 def _rcp(value: Any) -> Any:
@@ -227,19 +231,17 @@ def _store_f32(ptr: Any, offset: Any, value: Any) -> None:
     fx.generic_store(fx.add_offset(ptr, offset), fx.Float32(value))
 
 
-def _rows_view(ptr: Any, rows: int, cols: int, live_rows: int, elem_bytes: int) -> Any:
-    """Re-view an fp32 pointer argument as a row-major `(rows, cols)` buffer tensor.
-
-    `rows` may overhang the argument's real row count: the descriptor's record limit is the live
-    extent, so the hardware returns zeros past it. That is the whole story of the second N tile,
-    with no mask in the loop and no padded copy of the weight on the host.
+def _packed_fn_view(ptr: Any, wide: int) -> Any:
+    """The packed `fn` as (row-product n, k): element `(n, k)` is at `(k // 16) * 16 * PACK_ROWS
+    + (n // 16) * 256 + (k % 16 // 4) * 64 + (n % 16) * 4 + k % 4`, MFMA B lane order.
     """
     return fx.Tensor(
         fx.make_view(
-            fx.rocdl.make_buffer_ptr(
-                ptr, num_records_bytes=live_rows * cols * elem_bytes
+            ptr,
+            fx.make_layout(
+                ((MFMA_MN, N_TILES), (4, 4, wide // MFMA_K)),
+                ((4, 256), (1, 64, MFMA_MN * PACK_ROWS)),
             ),
-            fx.make_layout((rows, cols), (cols, 1)),
         )
     )
 
@@ -281,7 +283,11 @@ def check_config(
     )
     rows = gate_rows(streams)
     _require(
-        rows <= PAD_ROWS and rows + 2 <= SPLIT_SLOTS,
+        2 * rows == PACK_ROWS,
+        f"the {PACK_ROWS} packed row-products must be the {rows} gate rows' two limbs",
+    )
+    _require(
+        rows + 2 <= SPLIT_SLOTS,
         f"the {rows} gate rows and the two sums of squares must fit the {SPLIT_SLOTS}-wide published line",
     )
     _require(
@@ -332,7 +338,7 @@ def fold_slots(block_m: int, chunk_c: int) -> int:
     """
     return (
         WAVES_K
-        if _tile_bytes(block_m, chunk_c) + WAVES_K * block_m * PAD_ROWS * 4
+        if _tile_bytes(block_m, chunk_c) + WAVES_K * block_m * PACK_ROWS * 4
         <= FOLD_BUDGET
         else 2
     )
@@ -352,7 +358,7 @@ def smem_bytes(block_m: int, chunk_c: int) -> int:
     """
     return (
         _tile_bytes(block_m, chunk_c)
-        + fold_slots(block_m, chunk_c) * block_m * PAD_ROWS * 4
+        + fold_slots(block_m, chunk_c) * block_m * PACK_ROWS * 4
     )
 
 
@@ -429,11 +435,8 @@ def compile_mhc_seam_fused(
     owns `VEC` contiguous columns of one token) reaches the fragment's (a lane holds one token's
     one k element).
 
-    `fn` needs no such staging: in B-fragment order a lane's elements are contiguous in k, so it
-    is read straight from global, once, in the fp32 the caller supplies, and the two bf16 limbs
-    the matrix core takes are formed from it in registers. It arrives as the
-    `(gate_rows(streams), streams * hidden)` weight, re-viewed `PAD_ROWS` tall so the matrix
-    core's second N tile reads its padding from past the weight's record limit and gets zeros.
+    `fn` needs no such staging: it arrives packed in B-fragment order, so it is read straight
+    from global, and the publish adds each gate row's two limbs back together.
     """
     # Fixed DPP controls make the gate chain a 4x4 comb and no other shape; every other value
     # compiles and returns a wrong `comb_out`, so it is refused rather than left to a host.
@@ -451,13 +454,6 @@ def compile_mhc_seam_fused(
     seg_chunks = chunks // splits
     groups = chunk_c // VEC
     slots = block_m * groups // BLOCK
-    # Weight elements one lane holds of the B fragment: the k tiles of a chunk, by the N tiles, by
-    # what one lane takes of an atom.
-    b_frag = (
-        (chunk_c // (WAVES_K * MFMA_K))
-        * (PAD_ROWS // MFMA_MN)
-        * (MFMA_MN * MFMA_K // WAVE_SIZE)
-    )
     folds = fold_slots(block_m, chunk_c)
     fold_rounds = WAVES_K // folds
     # Butterfly steps that close one token's sums across the `groups` lanes sharing it. They are
@@ -469,8 +465,8 @@ def compile_mhc_seam_fused(
     )
     coeffs = gate_coeffs(streams, has_post)
     _require(
-        coeffs <= folds * PAD_ROWS,
-        f"the {coeffs} staged coefficients must fit a token's {folds * PAD_ROWS} words of accumulator scratch",
+        coeffs <= folds * PACK_ROWS,
+        f"the {coeffs} staged coefficients must fit a token's {folds * PACK_ROWS} words of accumulator scratch",
     )
     # Where `pre` starts in a staged row; `post` is at 0 and `comb` follows it.
     pre_base = coeffs - streams
@@ -478,7 +474,7 @@ def compile_mhc_seam_fused(
     @fx.struct
     class SharedStorage:
         a: fx.Array[fx.BFloat16, block_m * (chunk_c + TILE_PAD)]
-        acc: fx.Array[fx.Float32, folds * block_m * PAD_ROWS]
+        acc: fx.Array[fx.Float32, folds * block_m * PACK_ROWS]
 
     mode = ("post" if has_post else "nopost") + ("_idpre" if identity_pre else "")
     name = (
@@ -519,10 +515,10 @@ def compile_mhc_seam_fused(
         s_a = lds.a.view(fx.make_layout((block_m, chunk_c), (chunk_c + TILE_PAD, 1)))
         s_acc = lds.acc.view(
             fx.make_layout(
-                (folds, block_m, PAD_ROWS), (block_m * PAD_ROWS, PAD_ROWS, 1)
+                (folds, block_m, PACK_ROWS), (block_m * PACK_ROWS, PACK_ROWS, 1)
             )
         )
-        s_acc_flat = lds.acc.view(fx.make_layout(folds * block_m * PAD_ROWS, 1))
+        s_acc_flat = lds.acc.view(fx.make_layout(folds * block_m * PACK_ROWS, 1))
         # The staged gates sit on the accumulator scratch rather than scratch of their own: they
         # are dead by the end of the chunk loop, which is the first thing the fold's barrier
         # separates them from, so the two never want the words at once.
@@ -543,7 +539,7 @@ def compile_mhc_seam_fused(
         sums_major = fx.make_layout((splits, n_tok, 2), (n_tok * 2, 2, 1))
 
         # ── Matrix core ──
-        g_fn = _rows_view(fn, PAD_ROWS, wide, rows, 4)
+        g_fn = _packed_fn_view(fn, wide)
         mma_atom = fx.make_mma_atom(
             fx.rocdl.MFMA(MFMA_MN, MFMA_MN, MFMA_K, fx.BFloat16)
         )
@@ -554,10 +550,10 @@ def compile_mhc_seam_fused(
         lds_copy = fx.make_copy_atom(
             fx.UniversalCopy(MFMA_MN * MFMA_K // WAVE_SIZE * 16), fx.BFloat16
         )
-        # The fragment is bf16 and the weight fp32: the same (lane -> k) map, twice the bytes, so
-        # one access carries what both limbs are made of.
+        # A lane's share of a B atom is four bf16 adjacent in k: one 8 B access. The pack fills
+        # its N tiles exactly, so a plain copy needs no buffer bound.
         wgt_copy = fx.make_copy_atom(
-            fx.rocdl.BufferCopy(MFMA_MN * MFMA_K // WAVE_SIZE * 32), fx.Float32
+            fx.UniversalCopy(MFMA_MN * MFMA_K // WAVE_SIZE * 16), fx.BFloat16
         )
         acc_copy = fx.make_copy_atom(fx.UniversalCopy(32), fx.Float32)
         thr_a = fx.make_tiled_copy_A(lds_copy, tiled_mma).get_slice(tid)
@@ -577,13 +573,11 @@ def compile_mhc_seam_fused(
             )
         )
 
-        t_fn = fx.flat_divide(g_fn, fx.make_tile(PAD_ROWS, chunk_c))[
+        t_fn = fx.flat_divide(g_fn, fx.make_tile(PACK_ROWS, chunk_c))[
             None, None, 0, None
         ]
         frag_a = thr_mma.make_fragment_A(s_a)
-        frag_hi = thr_mma.make_fragment_B(t_fn[None, None, 0])
-        frag_lo = thr_mma.make_fragment_B(t_fn[None, None, 0])
-        frag_wide = fx.make_fragment_like(frag_hi, fx.Float32.ir_type)
+        frag_b = thr_mma.make_fragment_B(t_fn[None, None, 0])
         frag_c = thr_mma.make_fragment_C(my_acc)
         frag_c.fill(0)
 
@@ -594,7 +588,7 @@ def compile_mhc_seam_fused(
         p_fn = thr_b.partition_S(t_fn)
         p_acc = thr_c.partition_S(my_acc)
         cf_a = thr_a.retile(frag_a)
-        cf_wide = thr_b.retile(frag_wide)
+        cf_b = thr_b.retile(frag_b)
         cf_c = thr_c.retile(frag_c)
 
         def stage_gates(out_gates: Any) -> None:
@@ -778,31 +772,8 @@ def compile_mhc_seam_fused(
                 fx.gpu.barrier()
                 k_tile = fx.Int32(j * chunks) + chunk
                 fx.copy(lds_copy, p_a, cf_a)
-                fx.copy(wgt_copy, p_fn[None, None, None, k_tile], cf_wide)
-                # Two limbs carry about sixteen mantissa bits, which is what the gate tolerances
-                # need and a single bf16 limb misses by an order. Formed here rather than read as
-                # two bf16 planes because that halves the loop's memory instructions, which is
-                # what it is bound by; the bytes are the same either way. The narrowing is the
-                # integer form because `fpext(fptrunc v)` is exactly the round trip
-                # `fast_fp_math` folds away, and `v - hi` needs the fp32 value to survive it.
-                wide = frag_wide.load()
-                limbs = [_narrow_round(wide[e], True) for e in range_constexpr(b_frag)]
-                frag_hi.store(
-                    fx.Vector.from_elements(
-                        [limbs[e][0] for e in range_constexpr(b_frag)], fx.BFloat16
-                    )
-                )
-                frag_lo.store(
-                    fx.Vector.from_elements(
-                        [
-                            _narrow_round(wide[e] - limbs[e][1], True)[0]
-                            for e in range_constexpr(b_frag)
-                        ],
-                        fx.BFloat16,
-                    )
-                )
-                fx.gemm(tiled_mma, frag_c, frag_a, frag_hi, frag_c)
-                fx.gemm(tiled_mma, frag_c, frag_a, frag_lo, frag_c)
+                fx.copy(wgt_copy, p_fn[None, None, None, k_tile], cf_b)
+                fx.gemm(tiled_mma, frag_c, frag_a, frag_b, frag_c)
 
         # ── Chunk loop ──
         stage_gates(s_gates)
@@ -817,23 +788,44 @@ def compile_mhc_seam_fused(
         # ── Publish ──
         # Each wave holds a partial over its share of the contraction, published in `fold_rounds`
         # rounds of `folds` with the running sum carried in registers between them -- which is
-        # what lets a wide token tile hold fewer slots than it has waves. The padding columns go
-        # out too: the weight's absent rows contracted to zero, so the finish pass reads `rows`.
-        fold_steps = block_m * PAD_ROWS // BLOCK
+        # what lets a wide token tile hold fewer slots than it has waves. A thread owns one gate
+        # row of one token and adds its two limbs, at `row` and `row + rows`; the finish pass
+        # reads nothing of the line past `rows`.
+        fold_steps = ceildiv(block_m * rows, BLOCK)
         carried = [fx.Float32(0.0) for _ in range_constexpr(fold_steps)]
+        # Where `rows` does not divide the block, the last step's spare threads store nothing.
+        keep = [
+            fx.Int32(g * BLOCK) + tid < fx.Int32(block_m * rows)
+            for g in range_constexpr(fold_steps)
+        ]
+        safe = [
+            keep[g].select(fx.Int32(g * BLOCK) + tid, fx.Int32(0))
+            for g in range_constexpr(fold_steps)
+        ]
+        token_local = [safe[g] // fx.Int32(rows) for g in range_constexpr(fold_steps)]
+        row_local = [
+            safe[g] - token_local[g] * fx.Int32(rows)
+            for g in range_constexpr(fold_steps)
+        ]
         for r in range_constexpr(fold_rounds):
             fx.gpu.barrier()
             if (wave >= fx.Int32(r * folds)) & (wave < fx.Int32((r + 1) * folds)):
                 fx.copy(acc_copy, cf_c, p_acc)
             fx.gpu.barrier()
             for g in range_constexpr(fold_steps):
-                i = fx.Int32(g * BLOCK) + tid
                 for h in range_constexpr(folds):
+                    hi = (
+                        fx.Int32(h * block_m * PACK_ROWS)
+                        + token_local[g] * fx.Int32(PACK_ROWS)
+                        + row_local[g]
+                    )
                     carried[g] = (
-                        carried[g] + s_acc_flat[fx.Int32(h * block_m * PAD_ROWS) + i]
+                        carried[g] + s_acc_flat[hi] + s_acc_flat[hi + fx.Int32(rows)]
                     )
         for g in range_constexpr(fold_steps):
-            g_part[fx.Int32(g * BLOCK) + tid] = carried[g]
+            if keep[g]:
+                line = token_local[g] * fx.Int32(SPLIT_SLOTS)
+                g_part[line + row_local[g]] = carried[g]
         # The `groups` lanes that share a token are consecutive and aligned, so both sums close
         # in a butterfly inside the wave rather than through LDS and a barrier.
         width = fx.Int32(WAVE_SIZE)

@@ -27,10 +27,8 @@ an LDS tile one stream at a time, where the four waves contract their share of i
 against `fn` with a one-wave tiled `MFMA(16, 16, 16, bf16)`.
 
 `fn` is carried as two bf16 limbs, about sixteen mantissa bits between them, which is what
-the gate tolerances need. The host stacks the limbs' 24 rows into 48 row-products, three
-16-wide N tiles, and preshuffles them into MFMA B lane order
-(`mhc_seam_kernels._pack_fn_nonorm`). A row's two limbs land in different accumulators, and
-the tail adds them while it folds the four waves' partials.
+the gate tolerances need, packed as for `mhc_seam.py` (`PACK_ROWS`). A row's two limbs land
+in different accumulators, and the tail adds them while it folds the four waves' partials.
 
 Neither the RMS nor the logits close inside a workgroup once the hidden axis is split, so the
 fused pass publishes per (segment, token) the unscaled logits and the segment's sum of
@@ -64,6 +62,7 @@ from aiter.ops.flydsl.kernels.mhc_seam import (
     MAX_FLAT_ELEMENTS,
     MFMA_K,
     MFMA_MN,
+    PACK_ROWS,
     STREAMS,
     VEC,
     WAVE_SIZE,
@@ -73,6 +72,7 @@ from aiter.ops.flydsl.kernels.mhc_seam import (
     _load_bf16,
     _load_f32,
     _narrow_round,
+    _packed_fn_view,
     _rcp,
     _require,
     _row_max,
@@ -86,10 +86,6 @@ N = STREAMS
 ROWS = gate_rows(N)  # 24 gate projection rows: pre, post, then the 4x4 comb
 # Per-token post, comb and carried-pre coefficients the post-mix reads, staged in LDS.
 GATE_COEFFS = N + N * N + N
-# The two limbs' 24 rows stacked are 48 row-products, exactly three 16-wide N tiles with
-# no padding. Limb `l` row `r` is slot `24 * l + r`.
-PACK_ROWS = 2 * ROWS
-N_TILES = PACK_ROWS // MFMA_MN
 WAVES = BLOCK // WAVE_SIZE  # four, which split the projection's k range between them
 # LDS row padding in bf16 elements: each token row starts two banks after the one above,
 # so the A fragment's sixteen-row read spreads over the banks.
@@ -334,18 +330,7 @@ def compile_mhc_seam_fused_nonorm(
             fx.make_layout((block_m, kspan), (stride, 1)),
         )
         t_a = fx.flat_divide(span, fx.make_tile(block_m, MFMA_K))[None, None, 0, None]
-        # The caller's preshuffle, read through the logical (row-product, k) coordinates:
-        # element (n, k) is at
-        # `(k // 16) * 768 + (n // 16) * 256 + (k % 16 // 4) * 64 + (n % 16) * 4 + k % 4`.
-        g_fn = fx.Tensor(
-            fx.make_view(
-                fn_packed,
-                fx.make_layout(
-                    ((16, N_TILES), (4, 4, wide // MFMA_K)),
-                    ((4, 256), (1, 64, 16 * PACK_ROWS)),
-                ),
-            )
-        )
+        g_fn = _packed_fn_view(fn_packed, wide)
         t_fn = fx.flat_divide(g_fn, fx.make_tile(PACK_ROWS, MFMA_K))[
             None, None, 0, None
         ]

@@ -27,8 +27,9 @@ def dispatch(monkeypatch):
         return build
 
     def pack(fn, capturing):
-        state.packs.append((fn, capturing))
-        return fn.to(torch.bfloat16)
+        packed = fn.to(torch.bfloat16)
+        state.packs.append((fn, capturing, packed))
+        return packed
 
     def norm(stage, weight, eps):
         out = torch.empty_like(stage)
@@ -44,7 +45,7 @@ def dispatch(monkeypatch):
     )
     monkeypatch.setattr(seam, "ptr_arg", lambda tensor, dtype: tensor)
     monkeypatch.setattr(seam.flyc, "from_c_void_p", lambda dtype, address: None)
-    monkeypatch.setattr(seam, "_pack_fn_nonorm", pack)
+    monkeypatch.setattr(seam, "_pack_fn", pack)
     monkeypatch.setattr(seam, "rms_norm", norm)
     monkeypatch.setattr(
         seam, "_run_compiled", lambda fn, *args: state.launches.append((fn, args))
@@ -141,19 +142,20 @@ def test_cached_runner_uses_each_calls_tensors_scratch_and_stream(dispatch, norm
         assert finish[-5] is outputs[2]
         assert finish[-4] is outputs[4]
 
+    assert dispatch.packs[0][0] is first["fn"]
+    assert dispatch.packs[0][1] is False
+    assert dispatch.packs[1][0] is second["fn"]
+    assert dispatch.packs[1][1] is True
+    assert first_fused[5] is dispatch.packs[0][2]
+    assert second_fused[5] is dispatch.packs[1][2]
+
     if norm == "separate":
-        assert dispatch.packs[0][0] is first["fn"]
-        assert dispatch.packs[0][1] is False
-        assert dispatch.packs[1][0] is second["fn"]
-        assert dispatch.packs[1][1] is True
         assert first_out[3] is dispatch.norms[0][3]
         assert second_out[3] is dispatch.norms[1][3]
     else:
-        assert first_fused[5] is first["fn"]
-        assert second_fused[5] is second["fn"]
         assert first_fused[7] is first_out[3]
         assert second_fused[7] is second_out[3]
-        assert not dispatch.packs and not dispatch.norms
+        assert not dispatch.norms
 
 
 @pytest.mark.parametrize("norm", ["fused", "separate"])
@@ -215,3 +217,20 @@ def test_empty_batch_skips_configuration_and_launch(dispatch, has_post, identity
     if not has_post:
         assert outputs[0] is inputs["residual"]
     assert not dispatch.compiled and not dispatch.launches and not dispatch.packs
+
+
+@pytest.mark.parametrize("norm", ["fused", "separate"])
+def test_fn_packed_skips_the_pack_cache(dispatch, norm):
+    inputs = _inputs()
+    packed = torch.empty(
+        seam._packed_fn_shape(512), dtype=torch.bfloat16, device="meta"
+    )
+    dispatch.capturing = True
+    seam.flydsl_mhc_seam(**inputs, config={"NORM": norm}, fn_packed=packed)
+    assert not dispatch.packs
+    assert dispatch.launches[0][1][5] is packed
+
+    with pytest.raises(ValueError, match="fn_packed"):
+        seam.flydsl_mhc_seam(**inputs, config={"NORM": norm}, fn_packed=packed[:-1])
+    with pytest.raises(TypeError, match="fn_packed"):
+        seam.flydsl_mhc_seam(**inputs, config={"NORM": norm}, fn_packed=packed.float())
