@@ -19,6 +19,7 @@ from aiter.ops.triton.utils.mxfp4 import (
     mxfp4_data_shuffle_supported,
     mxfp4_scale_swizzle_supported,
     prepare_h16_sign,
+    reserve_mxfp4_philox_streams,
 )
 
 __all__ = ["dual_layout_quant_mxfp4"]
@@ -27,7 +28,6 @@ __all__ = ["dual_layout_quant_mxfp4"]
 _LOGGER = AiterTritonLogger()
 _MXFP4_BLOCK_SIZE = 32
 _HADAMARD_SIZE = 16
-_MAX_PHILOX_COUNTER = (1 << 63) - 1
 _CONFIG_NAME = "DUAL-LAYOUT-MXFP4"
 
 
@@ -39,35 +39,10 @@ def _philox_streams(
     philox_seed: int | None,
     philox_offset: int,
 ) -> tuple[int, int, int]:
-    use_sr = use_sr_row or use_sr_transposed
-    if not use_sr:
-        if philox_seed is not None or philox_offset != 0:
-            raise ValueError(
-                "Philox arguments are only valid when stochastic rounding is enabled"
-            )
-        return 0, 0, 0
-
-    if philox_seed is None:
-        raise ValueError("philox_seed is required when stochastic rounding is enabled")
-    if type(philox_seed) is not int or type(philox_offset) is not int:
-        raise TypeError("philox_seed and philox_offset must be integers")
-    if not 0 <= philox_seed <= _MAX_PHILOX_COUNTER:
-        raise ValueError("philox_seed must be in [0, 2**63 - 1]")
-
-    counters_per_layout = M * N // 8
-    enabled_layouts = int(use_sr_row) + int(use_sr_transposed)
-    reserved_counters = enabled_layouts * counters_per_layout
-    if not 0 <= philox_offset <= _MAX_PHILOX_COUNTER - reserved_counters + 1:
-        raise ValueError(
-            "philox_offset must be non-negative and leave room for enabled layouts"
-        )
-
-    next_offset = philox_offset
-    row_offset = next_offset if use_sr_row else 0
-    if use_sr_row:
-        next_offset += counters_per_layout
-    transposed_offset = next_offset if use_sr_transposed else 0
-    return philox_seed, row_offset, transposed_offset
+    seed, offsets = reserve_mxfp4_philox_streams(
+        M * N, (use_sr_row, use_sr_transposed), philox_seed, philox_offset
+    )
+    return seed, offsets[0], offsets[1]
 
 
 def dual_layout_quant_mxfp4(
