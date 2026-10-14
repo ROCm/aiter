@@ -141,6 +141,38 @@ PRIO_V = 0
 # stream (+9% there).
 MASK_IN_M = False
 
+# Apply the XOR column swizzle to the streamed V tile as well as K.
+#
+# KEEP THIS FALSE. The conflicts it removes are real and large, and removing
+# them makes the kernel 10.5% SLOWER. Left as a knob so the measurement is
+# reproducible rather than re-derived.
+#
+# The diagnosis: V's row stride is head_dim = 64 elements = 32 dwords = exactly
+# the LDS bank count, so `bank` is independent of the row and GEMM2's operand
+# read puts all 16 rows on one bank -- a 16-way conflict, against the 2x floor
+# K reaches with the swizzle. Counters agree: over the whole kernel
+# SQ_LDS_BANK_CONFLICT / SQ_LDS_IDX_ACTIVE = 79%, 4.7x the conflict-free floor,
+# essentially all of it this one read.
+#
+# Measured, ATT phase split (`tmp/run_att.sh dq_pp`, `tmp/att_phases.py`):
+#
+#                     M phase            V phase           dq
+#     unswizzled      1676 cy (1119)     1992 cy (252)     206.8 ms
+#     swizzled        1324 cy ( 752)     2864 cy (582)     228.6 ms
+#
+# The swizzle does exactly what it promises -- M drops 21% and its LDS stall a
+# third. It buys nothing, because **M is not the critical phase**: the barrier
+# interval is max(M, V) and V already led by 316 cy. Meanwhile V degrades by
+# 872 cy and the per-trip total rises 3668 -> 4188. Two contributing costs: the
+# XOR makes V's addresses non-affine, so the backend can no longer fuse
+# `ds_read_b64` pairs into `ds_read2_b64` (3 fused + 18 single -> 0 + 24), and
+# the address arithmetic adds VALU to M (28.7 -> 33.6). Neither is spilling:
+# 255 VGPR, 0 spills, both ways.
+#
+# The general rule this is an instance of: bank conflicts are worth measuring
+# to find, and worth fixing only in the phase that sets `max(M, V)`.
+SWIZZLE_V = False
+
 
 def validate_hstu_attention_bwd_dq_pp(
     num_heads: int,
@@ -585,7 +617,7 @@ def build_hstu_attention_bwd_dq_pp(
         # K is column-swizzled for the MFMA reads; V stays row-major, exactly as
         # in the shipping kernel.
         dma_k = make_dma(k, k_base_byte_offset, k_views, True)
-        dma_v = make_dma(v, k_base_byte_offset, v_views, False)
+        dma_v = make_dma(v, k_base_byte_offset, v_views, SWIZZLE_V)
 
         def k_zero(slot):
             """Zero the one K slot trip 0's GEMM3 reads but no DMA ever fills.
@@ -643,6 +675,8 @@ def build_hstu_attention_bwd_dq_pp(
                 MFMA_DA_LANE_K
             )
             view = v_views[k_cur]
+            if const_expr(SWIZZLE_V):
+                col = k_swz_col(row, col)
             return view[row, col // fx.Int32(MFMA_DA_LANE_K), None].load().ir_value()
 
         def fmul_scalar(a, b):
