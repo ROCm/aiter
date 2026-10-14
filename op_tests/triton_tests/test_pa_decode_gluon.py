@@ -72,6 +72,7 @@ PS_OPTIONS = [True, False]
 CASE_SET_NAME_OPTIONS = [
     "normal_accuracy",
     "ps_accuracy",
+    "ps_long_query_accuracy",
     "sliding_window_accuracy",
     "sliding_window_performance",
 ]
@@ -2171,6 +2172,50 @@ def ps_accuracy_test():
     parse_arg_and_run_test()
 
 
+def ps_long_query_accuracy_test():
+    """Run PS accuracy test with query_length > 4 on a single KV head.
+
+    With one KV head the PS launch spreads the query tokens over the grid, so
+    the query tile does not grow with query_length: (16, 1) and (64, 1) give
+    each program one token, and (8, 1) packs two tokens into each 16-row tile.
+    """
+    global BLOCK_SIZE_OPTIONS
+    global QUERY_LENGTH_OPTIONS
+    global BATCH_SIZE_OPTIONS
+    global HEAD_CONFIGURATIONS
+    global CONTEXT_LENGTH_OPTIONS
+    global QUANT_MODE_OPTIONS
+    global HEAD_DIMENSION_OPTIONS
+    global TRANS_V_OPTIONS
+    global KV_VARLEN_OPTIONS
+    global USE_TORCH_FLASH_REF_OPTIONS
+    global CONTEXT_PARTITION_SIZE_OPTIONS
+    global SINKS_OPTIONS
+    global SLIDING_WINDOW_OPTIONS
+    global COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS
+    global PS_OPTIONS
+
+    SINKS_OPTIONS = [False]
+    SLIDING_WINDOW_OPTIONS = [0, 128]
+    PS_OPTIONS = [True]
+    USE_TORCH_FLASH_REF_OPTIONS = [False]
+    CONTEXT_PARTITION_SIZE_OPTIONS = [256]
+
+    HEAD_DIMENSION_OPTIONS = [128]
+    HEAD_CONFIGURATIONS = [(8, 1), (16, 1), (64, 1)]
+    QUERY_LENGTH_OPTIONS = [5, 8]
+    COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["fp8", True, True], ["bf16", False, False]]
+    QUANT_MODE_OPTIONS = ["per_token"]
+    # Batch 16 gets several splits, and these lengths put every split boundary
+    # on a 256-key partition boundary.
+    CONTEXT_LENGTH_OPTIONS = [2048, 8192]
+    BATCH_SIZE_OPTIONS = [16]
+    TRANS_V_OPTIONS = [False]
+    KV_VARLEN_OPTIONS = [False]
+    BLOCK_SIZE_OPTIONS = [16]
+    parse_arg_and_run_test()
+
+
 def sliding_window_accuracy_test():
     """Run sliding window accuracy test."""
     global BLOCK_SIZE_OPTIONS
@@ -2256,10 +2301,67 @@ def test_multi_case_set(case_set_name):
         normal_performance_test()
     elif case_set_name == "ps_accuracy":
         ps_accuracy_test()
+    elif case_set_name == "ps_long_query_accuracy":
+        ps_long_query_accuracy_test()
     elif case_set_name == "sliding_window_accuracy":
         sliding_window_accuracy_test()
     elif case_set_name == "sliding_window_performance":
         sliding_window_performance_test()
+
+
+@pytest.mark.parametrize(
+    "num_heads, ps, sliding_window, block_size, query_length",
+    [
+        # More than one KV head: the PS kernel holds every query token in one tile.
+        pytest.param((64, 8), True, 0, 16, 8, id="ps_multi_kv_head"),
+        # The non-PS kernels hold every query token in one tile.
+        pytest.param((8, 1), False, 0, 16, 8, id="non_ps"),
+        # PS hands sliding-window 1024-token blocks to the non-PS kernel.
+        pytest.param((8, 1), True, 128, 1024, 8, id="ps_sliding_window_block_1024"),
+        # One query token per program, but the group alone is 128 rows.
+        pytest.param((128, 1), True, 0, 16, 2, id="ps_one_kv_head_group_128"),
+    ],
+)
+def test_unsupported_query_shape_is_rejected(
+    num_heads, ps, sliding_window, block_size, query_length
+):
+    """Kernels that hold every query token in one tile still take at most 4
+    tokens, and no kernel takes a tile over 64 rows; both fail before launch."""
+    if pa_decode_gluon is None:
+        pytest.skip("pa_decode_gluon requires triton.experimental.gluon")
+    num_query_heads, num_kv_heads = num_heads
+    head_size = 128
+    dtype = torch.bfloat16
+    device = "cuda"
+    query = torch.randn(
+        query_length, num_query_heads, head_size, dtype=dtype, device=device
+    )
+    output = torch.empty_like(query)
+    x = 16 // query.element_size()
+    key_cache = torch.randn(
+        1, num_kv_heads, head_size // x, block_size, x, dtype=dtype, device=device
+    )
+    value_cache = torch.randn(
+        1, num_kv_heads, head_size, block_size, dtype=dtype, device=device
+    )
+    context_lengths = torch.tensor([query_length], dtype=torch.int32, device=device)
+    block_tables = torch.zeros(1, 1, dtype=torch.int32, device=device)
+
+    with pytest.raises(AssertionError, match="query"):
+        pa_decode_gluon(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            context_lengths,
+            block_tables,
+            softmax_scale=head_size**-0.5,
+            query_length=query_length,
+            max_context_partition_num=2,
+            compute_type=dtype,
+            sliding_window=sliding_window,
+            ps=ps,
+        )
 
 
 if __name__ == "__main__":
