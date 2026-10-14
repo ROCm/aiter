@@ -39,7 +39,6 @@ from .mega_moe_gfx1250.dedup_push import (
     SCOPE_DEV as DEDUP_SCOPE_DEV,
     emit_col_drain as emit_dedup_col_drain,
     emit_col_tile_done as emit_dedup_col_tile_done,
-    emit_ingrid_start as emit_dedup_ingrid_start,
     emit_step_push as emit_dedup_step_push,
     step_push_lds_bytes as dedup_step_push_lds_bytes,
 )
@@ -179,7 +178,6 @@ def launch_gemm_a8w4_tdm(
     a_scale_row_stride_bytes: Constexpr[int] = 0,
     lds_soa_load_interleave: Constexpr[int] = 0,
     ep_dedup: Constexpr[int] = 0,
-    ep_dedup_ingrid: Constexpr[int] = 0,
     ep_dedup_topk: Constexpr[int] = 0,
     ep_dedup_hidden: Constexpr[int] = 0,
     ep_dedup_tag: Constexpr[int] = 0,
@@ -190,12 +188,11 @@ def launch_gemm_a8w4_tdm(
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
-    ``ep_dedup`` replaces the fused scatter: the epilogue stages the weighted
-    tile in ``arg_c`` instead, for the dedup'd push
-    (``mega_moe_gfx1250/dedup_push.py``). With ``ep_dedup_ingrid`` (see
-    ``ep_dedup_ingrid()``) the push runs on DEDUP_PUSH_BLOCKS workgroups leading
-    this grid, and every staged tile bumps its N tile's counter in
-    ``arg_dedup_state``; ``ep_dedup_tag`` keys the cache on the push's source.
+    ``ep_dedup`` replaces the fused scatter with the dedup'd push
+    (``mega_moe_gfx1250/dedup_push.py``): the epilogue stages the weighted tile
+    in ``arg_c`` and bumps its N tile's counter in ``arg_dedup_state``, and
+    DEDUP_PUSH_BLOCKS workgroups leading the grid push each column once it is
+    complete. ``ep_dedup_tag`` keys the cache on the push's source.
 
     ``cluster_m`` and ``cluster_n`` explicitly select the physical workgroup
     cluster. Peers along N share A, while expert-compatible peers along M can
@@ -249,9 +246,9 @@ def launch_gemm_a8w4_tdm(
     cluster_m = 1 if FORCE_1X4_CLUSTER else cluster_m
     if ep_dedup:
         assert enable_ep_scatter and not ep_quant_bits, "dedup needs the bf16 scatter"
-    ep_dedup_pushers = DEDUP_PUSH_BLOCKS if ep_dedup and ep_dedup_ingrid else 0
+    ep_dedup_pushers = DEDUP_PUSH_BLOCKS if ep_dedup else 0
     if ep_dedup_pushers:
-        assert ep_dedup_ingrid in (1, 2, 3) and ep_dedup_topk > 0 and ep_dedup_hidden > 0
+        assert ep_dedup_topk > 0 and ep_dedup_hidden > 0
         # The pushers shift every GEMM block id, which a cluster cannot follow.
         assert cluster_m == 1 and cluster_n == 1
         # A push chunk is two N tiles, released by their two counters.
@@ -296,7 +293,6 @@ def launch_gemm_a8w4_tdm(
         a_scale_row_stride_bytes,
         ep_quant_bits,
         ep_dedup,
-        ep_dedup_ingrid,
         ep_dedup_topk,
         ep_dedup_hidden,
         ep_dedup_tag,
@@ -427,18 +423,20 @@ def launch_gemm_a8w4_tdm(
     )
     AS_FULL_OFF = INPUT_LDS_B
     AS_FULL_B = ceildiv(AS_SUPERS * AS_FULL_INNER * 4, 128) * 128
-    ARENA_B = max(AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0), C_STORE_B)
-    if ep_dedup_pushers:
-        # The pushers live in the GEMM's arena.
-        ARENA_B = max(
-            ARENA_B,
-            dedup_step_push_lds_bytes(
-                topk=ep_dedup_topk,
-                max_tok=ep_destination_stride // ep_dedup_topk,
-                world_size=ep_world_size,
-                block_num=ep_dedup_pushers,
-            ),
+    # The pushers live in the GEMM's arena.
+    DEDUP_PUSH_LDS_B = (
+        dedup_step_push_lds_bytes(
+            topk=ep_dedup_topk,
+            max_tok=ep_destination_stride // ep_dedup_topk,
+            world_size=ep_world_size,
+            block_num=ep_dedup_pushers,
         )
+        if ep_dedup_pushers
+        else 0
+    )
+    ARENA_B = max(
+        AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0), C_STORE_B, DEDUP_PUSH_LDS_B
+    )
 
     # Quant epilogue compile-time constants.
     QUANT_ROWS_PER_TILE = quant_wmma_rep * 16
@@ -486,7 +484,6 @@ def launch_gemm_a8w4_tdm(
         f"{_explicit_vgpr_partition}{_planar_lds}"
         f"{_interleaved_lds_load}"
         f"{'_dedup' if ep_dedup else ''}"
-        f"{f'_ig{ep_dedup_ingrid}' if ep_dedup_pushers else ''}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -1446,37 +1443,29 @@ def launch_gemm_a8w4_tdm(
             _dedup_col_target = (tile_map[n_experts - 1] + fx.Int32(tile_m - 1)) // fx.Int32(
                 tile_m
             )
-            _dedup_col_state = None
-            if const_expr(ep_dedup_ingrid == 3):
-                _dedup_col_state = _dedup_state_addr
-        if const_expr(ep_dedup_pushers):
             if is_pusher:
-                emit_dedup_ingrid_start(fx.Int32(tid), state_addr=_dedup_state_addr)
-                if const_expr(ep_dedup_ingrid >= 2):
-                    emit_dedup_step_push(
-                        fx.Int32(fx.block_idx.x),
-                        fx.Int32(tid),
-                        base_ptr,
-                        addr_out=_ptr_i64(arg_c),
-                        out_rows=fx.Int32(i32_m),
-                        addr_rows=_ptr_i64(arg_dedup_rows),
-                        addr_nvt=_ptr_i64(arg_dedup_nvt),
-                        addr_tis=_ptr_i64(arg_dedup_tis),
-                        lsa0=_ep_lsa0,
-                        peer_stride=_ep_lsa1 - _ep_lsa0,
-                        combine_input_offset=ep_combine_input_offset,
-                        slot_stride_bytes=ep_slot_stride_bytes,
-                        topk=ep_dedup_topk,
-                        max_tok=ep_destination_stride // ep_dedup_topk,
-                        hidden=ep_dedup_hidden,
-                        world_size=ep_world_size,
-                        block_num=ep_dedup_pushers,
-                        # Every block takes the columns in the order gemm2 has them.
-                        rotate=False,
-                        col_state=_dedup_col_state,
-                        col_target=_dedup_col_target,
-                        tile_n=tile_n,
-                    )
+                emit_dedup_step_push(
+                    fx.Int32(fx.block_idx.x),
+                    fx.Int32(tid),
+                    base_ptr,
+                    addr_out=_ptr_i64(arg_c),
+                    out_rows=fx.Int32(i32_m),
+                    addr_rows=_ptr_i64(arg_dedup_rows),
+                    addr_nvt=_ptr_i64(arg_dedup_nvt),
+                    addr_tis=_ptr_i64(arg_dedup_tis),
+                    lsa0=_ep_lsa0,
+                    peer_stride=_ep_lsa1 - _ep_lsa0,
+                    combine_input_offset=ep_combine_input_offset,
+                    slot_stride_bytes=ep_slot_stride_bytes,
+                    topk=ep_dedup_topk,
+                    max_tok=ep_destination_stride // ep_dedup_topk,
+                    hidden=ep_dedup_hidden,
+                    world_size=ep_world_size,
+                    col_state=_dedup_state_addr,
+                    col_target=_dedup_col_target,
+                    tile_n=tile_n,
+                    block_num=ep_dedup_pushers,
+                )
                 emit_dedup_col_drain(
                     fx.Int32(tid),
                     state_addr=_dedup_state_addr,

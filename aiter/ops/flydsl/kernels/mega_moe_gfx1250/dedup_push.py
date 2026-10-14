@@ -8,6 +8,10 @@ slot ``t`` its ``c`` local rows are ``topids_to_rows[t*topk + k] >= 0``; their s
 goes out as ONE row, to the origin's ``comb_inp[origin_lid*topk + lead_k]`` where
 ``lead_k`` is the first local ``k``. The receiving reduce sums only those lead
 slots, so a (token, rank) pair costs one row on the wire instead of ``c``.
+
+The push runs on PUSH_BLOCKS workgroups leading the gemm2 grid
+(``mxfp4_preshuffle_gfx1250_tdm.py``), one column chunk at a time as gemm2
+completes the columns.
 """
 
 import functools
@@ -16,7 +20,6 @@ import os
 from types import SimpleNamespace
 
 import torch
-import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.typing import T
@@ -31,7 +34,6 @@ from .tdm_gather_shim import (
     tensor_store_gather,
 )
 from ..communication_ops_utils import (
-    _to_ptr_global,
     atomic_add_agent,
     atomic_add_lds,
     load_i32_global_agent,
@@ -39,27 +41,18 @@ from ..communication_ops_utils import (
     store_i32_lds,
     traced,
 )
-from flydsl._mlir.dialects import llvm as _llvm_d
 
 WAVE = 32
 # cpol SCOPE_DEV: the rows were staged by other XCDs, so miss this XCD's L2.
 SCOPE_DEV = 16
-# The flydsl cache key covers neither module constants nor callers in other
-# files, so kernels built from this file carry its hash.
+# The flydsl cache key of the gemm2 that runs the push covers neither this
+# file's constants nor its code, so gemm2 takes this hash as a Constexpr.
 with open(__file__, "rb") as _f:
     SRC_TAG = int(hashlib.sha256(_f.read()).hexdigest()[:7], 16)
 
 
 def ep_dedup_enabled() -> bool:
     return os.environ.get("AITER_EP_DEDUP", "0") in ("1", "true", "True")
-
-
-def ep_dedup_ingrid() -> int:
-    """Where the push runs. 0: a kernel after gemm2. In the gemm2 grid, on its
-    leading PUSH_BLOCKS workgroups: 1 timing only, the pushers just hold their
-    CUs until every gemm2 column is in; 2 timing only, they push without
-    waiting for the columns; 3 they push each column once gemm2 has it."""
-    return int(os.environ.get("AITER_EP_DEDUP_INGRID", "0"))
 
 
 def _I16_GLOBAL():
@@ -87,66 +80,21 @@ _lds_poll_ge = traced(_lds_poll_ge)
 # tiles of gemm2 N tile n, [DONE_WORD] the pusher blocks that are done. The last
 # pusher block zeroes them all for the next layer.
 # ---------------------------------------------------------------------------
-COL_WORDS = 128
+COL_WORDS = 64
 DONE_WORD = COL_WORDS - 1
 # A wait gives up after this many polls: a broken invariant then shows up as
 # wrong output instead of a hung kernel.
 POLL_LIMIT = 1 << 22
-# Timing probe of the in-grid push, realtime ticks (100 MHz): [T_START] the
-# pushers' earliest start (as BIG - t), [T_PUSH] their latest push end,
-# [T_GEMM] the latest staged gemm2 tile; the last pusher block moves the two
-# durations into record T_REC + 2 * (layer % T_NREC) and clears them.
-T_START, T_PUSH, T_GEMM, T_LAYER = 64, 65, 66, 67
-T_REC, T_NREC = 72, 16
-T_BIG = 0x7FFFFFFF
-
-
-def _report_ingrid_timing(buf):
-    t = buf.cpu()[T_REC:T_REC + 2 * T_NREC].view(-1, 2).double() / 100.0
-    t = t[t[:, 1] > 0]
-    if len(t):
-        med = t.median(0).values
-        print(f"[ingrid-timing] rank={os.environ.get('RANK')} layers={len(t)} "
-              f"from pusher start: push done {med[0]:.1f} us, gemm2 done {med[1]:.1f} us "
-              f"(median)", flush=True)
 
 
 @functools.cache
 def dedup_col_state(device: str) -> torch.Tensor:
-    import atexit
-
-    buf = torch.zeros(COL_WORDS, dtype=torch.int32, device=device)
-    if ep_dedup_ingrid():
-        atexit.register(_report_ingrid_timing, buf)
-    return buf
-
-
-def _realtime():
-    t = _llvm_d.InlineAsmOp(
-        res=T.i64, operands_=[],
-        asm_string="s_sendmsg_rtn_b64 $0, sendmsg(MSG_RTN_GET_REALTIME)\ns_wait_kmcnt 0",
-        constraints="=s", has_side_effects=True, is_align_stack=False).result
-    return fx.Int32(fx.Int64(t) & fx.Int64(T_BIG))
-
-
-def _atomic_max_agent(addr_i64, val):
-    _llvm_d.AtomicRMWOp(
-        _llvm_d.AtomicBinOp.max, _to_ptr_global(addr_i64), _raw(fx.Int32(val)),
-        _llvm_d.AtomicOrdering.monotonic, syncscope=fx.rocdl.SyncScope.Agent)
-
-
-def emit_ingrid_start(tid, *, state_addr):
-    if tid == fx.Int32(0):
-        _atomic_max_agent(state_addr + fx.Int64(T_START * 4), fx.Int32(T_BIG) - _realtime())
-
-
-emit_ingrid_start = traced(emit_ingrid_start)
+    return torch.zeros(COL_WORDS, dtype=torch.int32, device=device)
 
 
 def emit_col_tile_done(n_tile, *, state_addr):
     """One gemm2 tile of N tile ``n_tile`` is staged; call once per workgroup,
     after every wave's stores of the tile have completed."""
-    _atomic_max_agent(state_addr + fx.Int64(T_GEMM * 4), _realtime())
     atomic_add_agent(state_addr + fx.Int64(n_tile) * fx.Int64(4), fx.Int32(1))
 
 
@@ -168,7 +116,6 @@ def emit_col_drain(tid, *, state_addr, target, n_cols, block_num):
     so no gemm2 tile can still add to one."""
     gpu.barrier()
     if tid == fx.Int32(0):
-        _atomic_max_agent(state_addr + fx.Int64(T_PUSH * 4), _realtime())
         for c in range_constexpr(n_cols):
             _wait_col(state_addr + fx.Int64(c * 4), target)
         old = fx.Int32(atomic_add_agent(state_addr + fx.Int64(DONE_WORD * 4), fx.Int32(1)))
@@ -176,16 +123,6 @@ def emit_col_drain(tid, *, state_addr, target, n_cols, block_num):
             for c in range_constexpr(n_cols):
                 store_i32_global_agent_release(state_addr + fx.Int64(c * 4), fx.Int32(0))
             store_i32_global_agent_release(state_addr + fx.Int64(DONE_WORD * 4), fx.Int32(0))
-            t0 = fx.Int32(T_BIG) - fx.Int32(load_i32_global_agent(state_addr + fx.Int64(T_START * 4)))
-            tp = fx.Int32(load_i32_global_agent(state_addr + fx.Int64(T_PUSH * 4)))
-            tg = fx.Int32(load_i32_global_agent(state_addr + fx.Int64(T_GEMM * 4)))
-            layer = fx.Int32(load_i32_global_agent(state_addr + fx.Int64(T_LAYER * 4)))
-            rec = state_addr + fx.Int64(fx.Int32(T_REC) + (layer % fx.Int32(T_NREC)) * fx.Int32(2)) * fx.Int64(4)
-            store_i32_global_agent_release(rec, tp - t0)
-            store_i32_global_agent_release(rec + fx.Int64(4), tg - t0)
-            store_i32_global_agent_release(state_addr + fx.Int64(T_LAYER * 4), layer + fx.Int32(1))
-            for w in range_constexpr(T_START, T_GEMM + 1):
-                store_i32_global_agent_release(state_addr + fx.Int64(w * 4), fx.Int32(0))
 
 
 emit_col_drain = traced(emit_col_drain)
@@ -283,16 +220,15 @@ def emit_step_push(
     max_tok,
     hidden,
     world_size,
+    col_state,
+    col_target,
+    tile_n,
     block_num=PUSH_BLOCKS,
-    rotate=True,
-    col_state=None,
-    col_target=None,
-    tile_n=256,
 ):
     """One push block, ``bid`` of ``block_num``: 4 waves, ``lds_base`` holding
-    step_push_lds_bytes(). ``rotate`` starts each block at a different column
-    chunk. With ``col_state`` a worker waits, before its first load of a chunk,
-    for both of its N tiles' counters to reach ``col_target``."""
+    step_push_lds_bytes(). Before its first load of a column chunk, a worker
+    waits for both of the chunk's N tile counters in ``col_state`` to reach
+    ``col_target``."""
     L = _step_layout(topk=topk, max_tok=max_tok, world_size=world_size, block_num=block_num)
     waves = WORKERS + 1
     lanes = waves * WAVE
@@ -301,8 +237,7 @@ def emit_step_push(
     resv, ov0, in_b, out_b, wave_b = L.resv, L.ov0, L.in_b, L.out_b, L.wave_b
     maxs, sm_w, tm_w = L.maxs, L.sm_w, L.tm_w
     t_cnt, t_dst, t_junk = topk, topk + 1, topk + 2
-    assert hidden % row_e == 0
-    assert col_state is None or row_e == 2 * tile_n
+    assert hidden % row_e == 0 and row_e == 2 * tile_n
     iters = hidden // row_e
     gathers = [(r0, min(r0 + 8, resv)) for r0 in range(0, resv, 8)]
     loads_per_step = len(gathers)
@@ -448,18 +383,11 @@ def emit_step_push(
 
     n_sw_safe = (n_sw > fx.Int32(0)).select(n_sw, fx.Int32(1))
 
-    def chunk_col(ch):
-        """First column of the ch-th chunk this block visits. Rotated, each
-        block starts at a different chunk, so the blocks' peer stores spread
-        over the slot rows instead of all hitting one 1 KB column slice."""
-        if const_expr(rotate):
-            ch = (ch + fx.Int32(bid)) % fx.Int32(iters)
-        return ch * fx.Int32(row_e)
-
     def step_coords(s):
-        """Step s: column chunk s // n_sw, packed step s % n_sw of this wave."""
+        """Step s: column chunk s // n_sw, the order gemm2 completes them in,
+        packed step s % n_sw of this wave."""
         ch = s // n_sw_safe
-        return s - ch * n_sw_safe, chunk_col(ch)
+        return s - ch * n_sw_safe, ch * fx.Int32(row_e)
 
     def pick(v, i):
         return fx.Int32(rocdl.readlane(T.i32, _raw(v), _raw(fx.Int32(i))))
@@ -477,11 +405,10 @@ def emit_step_push(
         ib = s % fx.Int32(NIN)
         packed = lane_words(k, L.s_pack, resv)
         rows = [live.select(pick(packed, r), out_rows) for r in range_constexpr(resv)]
-        if const_expr(col_state is not None):
-            if live & (k == fx.Int32(0)):
-                n0 = e0 // fx.Int32(tile_n)
-                for j in range_constexpr(2):
-                    _wait_col(col_state + fx.Int64(n0 + fx.Int32(j)) * fx.Int64(4), col_target)
+        if live & (k == fx.Int32(0)):
+            n0 = e0 // fx.Int32(tile_n)
+            for j in range_constexpr(2):
+                _wait_col(col_state + fx.Int64(n0 + fx.Int32(j)) * fx.Int64(4), col_target)
         for r0, r1 in gathers:
             desc = make_tensor_gather_descriptor(
                 src_view, in_view, rows[r0:r1],
@@ -545,7 +472,7 @@ def emit_step_push(
         nsafe = (n_sw_w > fx.Int32(0)).select(n_sw_w, fx.Int32(1))
         ch = t // nsafe
         k = t - ch * nsafe
-        e0 = chunk_col(ch)
+        e0 = ch * fx.Int32(row_e)
         dsts = lane_words(k, L.s_dst, TMAX, sm_idx + fx.Int32(w * maxs * sm_w * 4))
         desc = make_tensor_gather_descriptor(
             comb_view, tiles_view,
@@ -597,73 +524,3 @@ def emit_step_push(
 
 
 emit_step_push = traced(emit_step_push)
-
-
-def build_dedup_step_push_module(
-    *,
-    arena_handle,
-    combine_input_offset,
-    slot_stride_bytes,
-    topk,
-    max_tok,
-    hidden,
-    world_size,
-    block_num=PUSH_BLOCKS,
-):
-    """The push as its own kernel, run after the gemm2 that staged its rows."""
-    import mori.cco.device.flydsl as _cco
-
-    lanes = (WORKERS + 1) * WAVE
-    lds_b = step_push_lds_bytes(topk=topk, max_tok=max_tok, world_size=world_size,
-                                block_num=block_num)
-    src_tag = SRC_TAG
-
-    @flyc.kernel(
-        name=f"ep_dedup_step_push_k{topk}_h{hidden}_w{world_size}_b{block_num}",
-        known_block_size=[lanes, 1, 1],
-    )
-    def ep_dedup_step_push(
-        addr_out: fx.Int64,
-        out_rows: fx.Int32,
-        addr_rows: fx.Int64,
-        addr_nvt: fx.Int64,
-        addr_tis: fx.Int64,
-    ):
-        _ = src_tag
-        lds_base = fx.SharedAllocator(static=False).allocate(lds_b)._ptr
-        win = _cco.Window(fx.Int64(arena_handle))
-        lsa0 = fx.Int64(win.lsa_ptr(fx.Int32(0), 0))
-        emit_step_push(
-            fx.Int32(fx.block_idx.x),
-            fx.Int32(fx.thread_idx.x),
-            lds_base,
-            addr_out=addr_out,
-            out_rows=out_rows,
-            addr_rows=addr_rows,
-            addr_nvt=addr_nvt,
-            addr_tis=addr_tis,
-            lsa0=lsa0,
-            peer_stride=fx.Int64(win.lsa_ptr(fx.Int32(1), 0)) - lsa0,
-            combine_input_offset=combine_input_offset,
-            slot_stride_bytes=slot_stride_bytes,
-            topk=topk,
-            max_tok=max_tok,
-            hidden=hidden,
-            world_size=world_size,
-            block_num=block_num,
-        )
-
-    @flyc.jit
-    def launch(
-        addr_out: fx.Int64,
-        out_rows: fx.Int32,
-        addr_rows: fx.Int64,
-        addr_nvt: fx.Int64,
-        addr_tis: fx.Int64,
-        stream: fx.Stream = fx.Stream(None),  # noqa: B008
-    ):
-        ep_dedup_step_push(addr_out, out_rows, addr_rows, addr_nvt, addr_tis).launch(
-            grid=(block_num, 1, 1), block=[lanes, 1, 1], stream=stream
-        )
-
-    return launch

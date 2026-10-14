@@ -143,9 +143,8 @@ def flydsl_grouped_gemm_a8w4_masked(
 ):
     """Launches a contiguous-M grouped a8w4 GEMM on the TDM kernel.
 
-    ``ep_dedup`` (dict: ingrid, topk, rows, nvt, tis, state) stages the EP
-    output locally for the dedup'd push instead of scattering it; see
-    dedup_push.py.
+    ``ep_dedup`` (dict: topk, rows, nvt, tis, state) swaps the EP scatter for
+    the dedup'd push; see dedup_push.py.
     """
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
 
@@ -242,10 +241,9 @@ def flydsl_grouped_gemm_a8w4_masked(
 
 
 def _dedup_launch_kwargs(ep_dedup, out, N):
-    if not ep_dedup or not ep_dedup["ingrid"]:
+    if not ep_dedup:
         # The JIT cache signature cannot take None for a tensor argument.
         return dict(
-            ep_dedup=int(bool(ep_dedup)),
             arg_dedup_rows=out,
             arg_dedup_nvt=out,
             arg_dedup_tis=out,
@@ -255,7 +253,6 @@ def _dedup_launch_kwargs(ep_dedup, out, N):
 
     return dict(
         ep_dedup=1,
-        ep_dedup_ingrid=int(ep_dedup["ingrid"]),
         ep_dedup_topk=int(ep_dedup["topk"]),
         ep_dedup_hidden=int(N),
         ep_dedup_tag=SRC_TAG,

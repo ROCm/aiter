@@ -615,7 +615,6 @@ def _grouped_a8w4_tdm_moe(
     from aiter.ops.flydsl.kernels.mega_moe_gfx1250.dedup_push import (
         dedup_col_state,
         ep_dedup_enabled,
-        ep_dedup_ingrid,
     )
 
     # Dedup'd push (AITER_EP_DEDUP): gemm2 stages rows locally and one summed row
@@ -870,7 +869,6 @@ def _grouped_a8w4_tdm_moe(
             "ep_row_map": ep_rowmap,
             "ep_dedup": (
                 {
-                    "ingrid": ep_dedup_ingrid(),
                     "topk": int(topk),
                     # Remapped in place above: each route's final gemm2 row, < 0
                     # if remote.
@@ -1175,24 +1173,6 @@ def _grouped_a8w4_tdm_moe(
         lds_soa_load_interleave=lds_soa_load_interleave,
         **_ep_gemm2_kwargs,
     )
-    if _ep_dedup and not _ep_gemm2_kwargs["ep_dedup"]["ingrid"]:
-        _get_dedup_push(
-            int(stage2_scatter.arena_handle),
-            int(stage2_scatter.combine_input_offset),
-            int(stage2_scatter.slot_stride_bytes),
-            int(topk),
-            int(stage2_scatter.max_tokens_per_rank),
-            int(model_dim),
-            int(stage2_scatter.world_size),
-        )(
-            grouped_out.data_ptr(),
-            int(contiguous_m),
-            # Remapped in place above: each route's final gemm2 row, < 0 if remote.
-            topids_to_rows.data_ptr(),
-            _ep_nvt.data_ptr(),
-            stage2_scatter.source_token_map.data_ptr(),
-            stream=torch.cuda.current_stream(),
-        )
 
     if kernel_bench_callable is not None:
         kernel_bench_callable.append(
@@ -1854,26 +1834,6 @@ def contiguous_psum(masked_m: torch.Tensor, experts: int, tile_m: int):
         stream=torch.cuda.current_stream(),
     )
     return starts, psum, contiguous_m_t
-
-
-@functools.cache
-def _get_dedup_push(
-    arena_handle, combine_input_offset, slot_stride, topk, max_tok, hidden, world_size
-):
-    """The dedup'd push, run after the gemm2 that staged its rows."""
-    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.dedup_push import (
-        build_dedup_step_push_module,
-    )
-
-    return build_dedup_step_push_module(
-        arena_handle=arena_handle,
-        combine_input_offset=combine_input_offset,
-        slot_stride_bytes=slot_stride,
-        topk=topk,
-        max_tok=max_tok,
-        hidden=hidden,
-        world_size=world_size,
-    )
 
 
 @functools.cache
