@@ -56,9 +56,7 @@ The fused kernels (``OneShotAllReduceRMSNorm``, ``FlyQuickAllReduceRMSNorm``)
 have their own tables of both levels: ``FUSED_FAMILY_POLICIES`` and
 ``FUSED_ONESHOT_LADDER``, ``FUSED_MESH_ST_LADDER``, ``FUSED_RING_ST_LADDER``
 plus ``FUSED_QR_ROW_ATOMS``. All three fused families live in one slot
-(``QuickAllReduce``), so it is ``AITER_FLY_AR_ACCURACY`` and not the quick
-reduce quantization that picks the quantized or the exact windows; the default
-is ``exact``, since the fused output feeds the next layer. The overrides are
+(``QuickAllReduce``). The overrides are
 ``AITER_FLY_AR_FUSED_<ALG>_{MIN,MAX}_BYTES``.
 """
 
