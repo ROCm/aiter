@@ -567,6 +567,10 @@ M,N,K,q_dtype_w
 128,6144,7168,torch.float8_e4m3fn
 256,6144,7168,torch.float8_e4m3fn
 512,6144,7168,torch.float8_e4m3fn
+544,6144,7168,torch.float8_e4m3fn
+576,6144,7168,torch.float8_e4m3fn
+608,6144,7168,torch.float8_e4m3fn
+640,6144,7168,torch.float8_e4m3fn
 1024,6144,7168,torch.float8_e4m3fn
 2048,6144,7168,torch.float8_e4m3fn
 4096,6144,7168,torch.float8_e4m3fn
