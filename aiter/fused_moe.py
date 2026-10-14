@@ -406,18 +406,42 @@ def _validate_output_buffer_metadata(output, shape, dtype, device):
         )
 
 
+def _address_span(tensor):
+    """Return the [start, end) byte range a strided tensor can touch.
+
+    nbytes counts logical elements only, so a strided view such as pool[::2]
+    would under-report its reach; kernels that honor the strides read up to
+    the last element's address. The interval is conservative: it also covers
+    the gaps between strided elements.
+    """
+    if tensor.numel() == 0:
+        return None
+    start = tensor.data_ptr()
+    low = high = 0
+    for size, stride in zip(tensor.shape, tensor.stride()):
+        if stride < 0:
+            low += (size - 1) * stride
+        else:
+            high += (size - 1) * stride
+    itemsize = tensor.element_size()
+    return start + low * itemsize, start + (high + 1) * itemsize
+
+
 def _validate_output_buffer_no_overlap(output, **inputs):
     if output is None:
+        return
+    output_span = _address_span(output)
+    if output_span is None:
         return
     # Accumulate mode zeroes the output rows at sort time, before the stages read
     # any input, and atomic GEMM2 then writes into them while still reading.
     for name, tensor in inputs.items():
         if tensor is None:
             continue
-        if (
-            output.data_ptr() < tensor.data_ptr() + tensor.nbytes
-            and tensor.data_ptr() < output.data_ptr() + output.nbytes
-        ):
+        span = _address_span(tensor)
+        if span is None:
+            continue
+        if output_span[0] < span[1] and span[0] < output_span[1]:
             raise RuntimeError(
                 f"output overlaps {name}, which moe_sorting zeroes before the MoE "
                 "stages read it"

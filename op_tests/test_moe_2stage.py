@@ -1521,6 +1521,25 @@ def test_output_buffer_contract():
     pool[:token] = hidden
     assert torch.equal(fused_moe(pool[:token], *args[1:], output=pool[token:]), ref)
 
+    # A strided scale view reaches past its logical nbytes: scale_pool[::2] holds
+    # 8 rows (16 KiB) yet its expert 7 row starts at byte 28672, and the kernels
+    # honor stride(0). An output over that row must be rejected.
+    scale_pool = torch.zeros((16, model_dim), dtype=dtypes.fp32)
+    strided_scale = scale_pool[::2]
+    row = scale_pool[14].view(dtype)[:model_dim].view(1, model_dim)
+    assert row.data_ptr() >= strided_scale.data_ptr() + strided_scale.nbytes
+    try:
+        aiter.fused_moe._validate_output_buffer_no_overlap(row, w1_scale=strided_scale)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("output overlapping a strided w1_scale view was accepted")
+    # Memory past the view's last element stays legal.
+    aiter.fused_moe._validate_output_buffer_no_overlap(
+        scale_pool[15].view(dtype)[:model_dim].view(1, model_dim),
+        w1_scale=strided_scale,
+    )
+
     stage2_scatter = Stage2ScatterContext(
         arena_handle=0,
         combine_input_offset=0,
