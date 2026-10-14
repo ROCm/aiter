@@ -381,6 +381,7 @@ M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle
 4096,7168,4096,False,torch.bfloat16,torch.bfloat16,False,False
 8192,6144,7168,False,torch.bfloat16,torch.bfloat16,False,False
 8192,7168,1536,False,torch.bfloat16,torch.bfloat16,False,False
+16384,8448,7168,False,torch.bfloat16,torch.bfloat16,False,False
 1,1536,128,False,torch.bfloat16,torch.bfloat16,False,False
 2,1536,128,False,torch.bfloat16,torch.bfloat16,False,False
 4,1536,128,False,torch.bfloat16,torch.bfloat16,False,False
