@@ -139,12 +139,13 @@ def flydsl_grouped_gemm_a8w4_masked(
     row_major_ascale=0,
     a_row_stride_bytes=0,
     a_scale_row_stride_bytes=0,
-    ep_dedup=False,
+    ep_dedup=None,
 ):
     """Launches a contiguous-M grouped a8w4 GEMM on the TDM kernel.
 
-    ``ep_dedup`` stages the EP output locally for the dedup'd push instead of
-    scattering it; see dedup_push.py.
+    ``ep_dedup`` (dict: ingrid, topk, rows, nvt, tis, state) stages the EP
+    output locally for the dedup'd push instead of scattering it; see
+    dedup_push.py.
     """
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
 
@@ -235,6 +236,31 @@ def flydsl_grouped_gemm_a8w4_masked(
         a_row_stride_bytes=int(a_row_stride_bytes),
         a_scale_row_stride_bytes=int(a_scale_row_stride_bytes),
         lds_soa_load_interleave=int(lds_soa_load_interleave),
-        ep_dedup=int(bool(ep_dedup)),
+        **_dedup_launch_kwargs(ep_dedup, out, N),
     )
     return out
+
+
+def _dedup_launch_kwargs(ep_dedup, out, N):
+    if not ep_dedup or not ep_dedup["ingrid"]:
+        # The JIT cache signature cannot take None for a tensor argument.
+        return dict(
+            ep_dedup=int(bool(ep_dedup)),
+            arg_dedup_rows=out,
+            arg_dedup_nvt=out,
+            arg_dedup_tis=out,
+            arg_dedup_state=out,
+        )
+    from .kernels.mega_moe_gfx1250.dedup_push import SRC_TAG
+
+    return dict(
+        ep_dedup=1,
+        ep_dedup_ingrid=int(ep_dedup["ingrid"]),
+        ep_dedup_topk=int(ep_dedup["topk"]),
+        ep_dedup_hidden=int(N),
+        ep_dedup_tag=SRC_TAG,
+        arg_dedup_rows=ep_dedup["rows"],
+        arg_dedup_nvt=ep_dedup["nvt"],
+        arg_dedup_tis=ep_dedup["tis"],
+        arg_dedup_state=ep_dedup["state"],
+    )

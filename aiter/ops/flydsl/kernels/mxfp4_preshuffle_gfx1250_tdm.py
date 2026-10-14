@@ -34,7 +34,15 @@ from .mega_moe_gfx1250.tdm_gather_shim import (
     make_tensor_gather_descriptor,
     tensor_store_gather,
 )
-from .mega_moe_gfx1250.dedup_push import SCOPE_DEV as DEDUP_SCOPE_DEV
+from .mega_moe_gfx1250.dedup_push import (
+    PUSH_BLOCKS as DEDUP_PUSH_BLOCKS,
+    SCOPE_DEV as DEDUP_SCOPE_DEV,
+    emit_col_drain as emit_dedup_col_drain,
+    emit_col_tile_done as emit_dedup_col_tile_done,
+    emit_ingrid_start as emit_dedup_ingrid_start,
+    emit_step_push as emit_dedup_step_push,
+    step_push_lds_bytes as dedup_step_push_lds_bytes,
+)
 from .mega_moe_gfx1250.types import COMBINE_SCALE_BLOCK
 from .quant_utils import (
     emit_amax_e8m0_native_scale,
@@ -171,12 +179,23 @@ def launch_gemm_a8w4_tdm(
     a_scale_row_stride_bytes: Constexpr[int] = 0,
     lds_soa_load_interleave: Constexpr[int] = 0,
     ep_dedup: Constexpr[int] = 0,
+    ep_dedup_ingrid: Constexpr[int] = 0,
+    ep_dedup_topk: Constexpr[int] = 0,
+    ep_dedup_hidden: Constexpr[int] = 0,
+    ep_dedup_tag: Constexpr[int] = 0,
+    arg_dedup_rows: fx.Tensor = None,
+    arg_dedup_nvt: fx.Tensor = None,
+    arg_dedup_tis: fx.Tensor = None,
+    arg_dedup_state: fx.Tensor = None,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
     ``ep_dedup`` replaces the fused scatter: the epilogue stages the weighted
-    tile in ``arg_c`` instead, and the dedup'd push
-    (``mega_moe_gfx1250/dedup_push.py``) sends it after the GEMM.
+    tile in ``arg_c`` instead, for the dedup'd push
+    (``mega_moe_gfx1250/dedup_push.py``). With ``ep_dedup_ingrid`` (see
+    ``ep_dedup_ingrid()``) the push runs on DEDUP_PUSH_BLOCKS workgroups leading
+    this grid, and every staged tile bumps its N tile's counter in
+    ``arg_dedup_state``; ``ep_dedup_tag`` keys the cache on the push's source.
 
     ``cluster_m`` and ``cluster_n`` explicitly select the physical workgroup
     cluster. Peers along N share A, while expert-compatible peers along M can
@@ -230,6 +249,13 @@ def launch_gemm_a8w4_tdm(
     cluster_m = 1 if FORCE_1X4_CLUSTER else cluster_m
     if ep_dedup:
         assert enable_ep_scatter and not ep_quant_bits, "dedup needs the bf16 scatter"
+    ep_dedup_pushers = DEDUP_PUSH_BLOCKS if ep_dedup and ep_dedup_ingrid else 0
+    if ep_dedup_pushers:
+        assert ep_dedup_ingrid in (1, 2, 3) and ep_dedup_topk > 0 and ep_dedup_hidden > 0
+        # The pushers shift every GEMM block id, which a cluster cannot follow.
+        assert cluster_m == 1 and cluster_n == 1
+        # A push chunk is two N tiles, released by their two counters.
+        assert tile_n == 256 and ep_dedup_hidden % (2 * tile_n) == 0
     cache_tag = (
         K,
         tile_m,
@@ -270,6 +296,10 @@ def launch_gemm_a8w4_tdm(
         a_scale_row_stride_bytes,
         ep_quant_bits,
         ep_dedup,
+        ep_dedup_ingrid,
+        ep_dedup_topk,
+        ep_dedup_hidden,
+        ep_dedup_tag,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -398,6 +428,17 @@ def launch_gemm_a8w4_tdm(
     AS_FULL_OFF = INPUT_LDS_B
     AS_FULL_B = ceildiv(AS_SUPERS * AS_FULL_INNER * 4, 128) * 128
     ARENA_B = max(AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0), C_STORE_B)
+    if ep_dedup_pushers:
+        # The pushers live in the GEMM's arena.
+        ARENA_B = max(
+            ARENA_B,
+            dedup_step_push_lds_bytes(
+                topk=ep_dedup_topk,
+                max_tok=ep_destination_stride // ep_dedup_topk,
+                world_size=ep_world_size,
+                block_num=ep_dedup_pushers,
+            ),
+        )
 
     # Quant epilogue compile-time constants.
     QUANT_ROWS_PER_TILE = quant_wmma_rep * 16
@@ -445,6 +486,7 @@ def launch_gemm_a8w4_tdm(
         f"{_explicit_vgpr_partition}{_planar_lds}"
         f"{_interleaved_lds_load}"
         f"{'_dedup' if ep_dedup else ''}"
+        f"{f'_ig{ep_dedup_ingrid}' if ep_dedup_pushers else ''}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -463,6 +505,10 @@ def launch_gemm_a8w4_tdm(
         f32_swiglu_limit: fx.Float32,
         f32_situ_beta: fx.Float32,
         f32_situ_linear_beta: fx.Float32,
+        arg_dedup_rows: fx.Pointer,
+        arg_dedup_nvt: fx.Pointer,
+        arg_dedup_tis: fx.Pointer,
+        arg_dedup_state: fx.Pointer,
     ):
         K_TILES = K // tile_k
         A_KROW = K // A_PACK
@@ -471,6 +517,11 @@ def launch_gemm_a8w4_tdm(
 
         tid = fx.thread_idx.x
         bid_x = fx.block_idx.x
+        if const_expr(ep_dedup_pushers):
+            # The pushers lead the grid, so they are dispatched first and hold
+            # their CUs; the GEMM tiles follow and never wait on them.
+            is_pusher = bid_x < fx.Int32(ep_dedup_pushers)
+            bid_x = is_pusher.select(fx.Int32(0), bid_x - fx.Int32(ep_dedup_pushers))
         wave = rocdl.readfirstlane(T.i32, tid // WAVE)
         lane = tid % WAVE
         lane16 = lane % 16
@@ -479,7 +530,9 @@ def launch_gemm_a8w4_tdm(
         wave_n = wave % n_warp
 
         # DeepGEMM contiguous-M swizzle, run at physical-cluster granularity.
-        TILES_PER_GROUP = 16
+        # A group as wide as every M tile walks the grid column by column, the
+        # order the pushers take the columns in.
+        TILES_PER_GROUP = 4096 if ep_dedup_pushers else 16
         assert TILES_PER_GROUP % cluster_m == 0
         total_n_tiles = ceildiv(i32_n, tile_n)
         total_m_tiles = ceildiv(i32_m, tile_m)
@@ -522,6 +575,8 @@ def launch_gemm_a8w4_tdm(
         )
         tile_map = fx.recast_iter(i32_ptr, arg_m_tile_map)
         has_work = blk_m < tile_map[n_experts - 1]
+        if const_expr(ep_dedup_pushers):
+            has_work = has_work & (fx.block_idx.x >= fx.Int32(ep_dedup_pushers))
 
         # In-kernel bisect: find the expert owning this valid M-tile.  Seed the
         # result with the padding sentinel so it remains defined outside the
@@ -1382,6 +1437,54 @@ def launch_gemm_a8w4_tdm(
                 )
                 rocdl.sched_barrier(0)
 
+        def _ptr_i64(p):
+            return fx.Int64(fx.ptrtoint(fx.recast_iter(fx.Int8, p)))
+
+        if const_expr(ep_dedup_pushers):
+            _dedup_state_addr = _ptr_i64(arg_dedup_state)
+            # Every M tile with work stages one tile into each N tile's column.
+            _dedup_col_target = (tile_map[n_experts - 1] + fx.Int32(tile_m - 1)) // fx.Int32(
+                tile_m
+            )
+            _dedup_col_state = None
+            if const_expr(ep_dedup_ingrid == 3):
+                _dedup_col_state = _dedup_state_addr
+        if const_expr(ep_dedup_pushers):
+            if is_pusher:
+                emit_dedup_ingrid_start(fx.Int32(tid), state_addr=_dedup_state_addr)
+                if const_expr(ep_dedup_ingrid >= 2):
+                    emit_dedup_step_push(
+                        fx.Int32(fx.block_idx.x),
+                        fx.Int32(tid),
+                        base_ptr,
+                        addr_out=_ptr_i64(arg_c),
+                        out_rows=fx.Int32(i32_m),
+                        addr_rows=_ptr_i64(arg_dedup_rows),
+                        addr_nvt=_ptr_i64(arg_dedup_nvt),
+                        addr_tis=_ptr_i64(arg_dedup_tis),
+                        lsa0=_ep_lsa0,
+                        peer_stride=_ep_lsa1 - _ep_lsa0,
+                        combine_input_offset=ep_combine_input_offset,
+                        slot_stride_bytes=ep_slot_stride_bytes,
+                        topk=ep_dedup_topk,
+                        max_tok=ep_destination_stride // ep_dedup_topk,
+                        hidden=ep_dedup_hidden,
+                        world_size=ep_world_size,
+                        block_num=ep_dedup_pushers,
+                        # Every block takes the columns in the order gemm2 has them.
+                        rotate=False,
+                        col_state=_dedup_col_state,
+                        col_target=_dedup_col_target,
+                        tile_n=tile_n,
+                    )
+                emit_dedup_col_drain(
+                    fx.Int32(tid),
+                    state_addr=_dedup_state_addr,
+                    target=_dedup_col_target,
+                    n_cols=ep_dedup_hidden // tile_n,
+                    block_num=ep_dedup_pushers,
+                )
+
         # Skip padding tiles; uniform across every workgroup and cluster.
         if has_work:
             if const_expr(enable_ep_scatter):
@@ -2047,6 +2150,12 @@ def launch_gemm_a8w4_tdm(
                 )
                 fx.copy(atomC, src, gtC)
                 tdm_ops.tensor_wait(0)
+                if const_expr(ep_dedup_pushers):
+                    # Every wave's share of the tile has landed before the tile
+                    # is counted, so a full column means readable rows.
+                    workgroup_barrier()
+                    if tid == fx.Int32(0):
+                        emit_dedup_col_tile_done(n_unit, state_addr=_dedup_state_addr)
             elif const_expr(enable_ep_scatter):
                 # EP gemm2-fused scatter via TDM gather-store. cco's flat symmetric
                 # VA is peer_va = winBase + pe*perRankSize + off, and comb_inp slots
@@ -2233,6 +2342,8 @@ def launch_gemm_a8w4_tdm(
         arg_ep_row_map = arg_c
     if arg_quant_scale is None:
         arg_quant_scale = arg_c
+    if arg_dedup_rows is None:
+        arg_dedup_rows = arg_dedup_nvt = arg_dedup_tis = arg_dedup_state = arg_c
     kargs = (
         fx.get_iter(arg_c),
         arg_a,
@@ -2248,8 +2359,16 @@ def launch_gemm_a8w4_tdm(
         f32_swiglu_limit,
         f32_situ_beta,
         f32_situ_linear_beta,
+        fx.get_iter(arg_dedup_rows),
+        fx.get_iter(arg_dedup_nvt),
+        fx.get_iter(arg_dedup_tis),
+        fx.get_iter(arg_dedup_state),
     )
-    grid = (((m_tiles + cluster_m - 1) // cluster_m) * n_tiles, cluster_m, 1)
+    grid = (
+        ((m_tiles + cluster_m - 1) // cluster_m) * n_tiles + ep_dedup_pushers,
+        cluster_m,
+        1,
+    )
     if cluster_m > 1 or cluster_n > 1:
         # Geometry must reach BOTH the definition and the launch site, or the
         # cluster never forms and the TDM loads silently fall back to per-load.

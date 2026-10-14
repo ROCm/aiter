@@ -612,7 +612,11 @@ def _grouped_a8w4_tdm_moe(
     )
     if _compact:
         stage2_scatter = _compact_ctx
-    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.dedup_push import ep_dedup_enabled
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.dedup_push import (
+        dedup_col_state,
+        ep_dedup_enabled,
+        ep_dedup_ingrid,
+    )
 
     # Dedup'd push (AITER_EP_DEDUP): gemm2 stages rows locally and one summed row
     # per (token, rank) goes out. MegaMoE's combine reads the same switch.
@@ -864,7 +868,20 @@ def _grouped_a8w4_tdm_moe(
                 int(stage2_scatter.max_tokens_per_rank) * int(topk)
             ),
             "ep_row_map": ep_rowmap,
-            "ep_dedup": _ep_dedup,
+            "ep_dedup": (
+                {
+                    "ingrid": ep_dedup_ingrid(),
+                    "topk": int(topk),
+                    # Remapped in place above: each route's final gemm2 row, < 0
+                    # if remote.
+                    "rows": topids_to_rows,
+                    "nvt": _ep_nvt,
+                    "tis": stage2_scatter.source_token_map,
+                    "state": dedup_col_state(str(device)),
+                }
+                if _ep_dedup
+                else None
+            ),
         }
         if enable_ep_scatter
         else {}
@@ -1158,7 +1175,7 @@ def _grouped_a8w4_tdm_moe(
         lds_soa_load_interleave=lds_soa_load_interleave,
         **_ep_gemm2_kwargs,
     )
-    if _ep_dedup:
+    if _ep_dedup and not _ep_gemm2_kwargs["ep_dedup"]["ingrid"]:
         _get_dedup_push(
             int(stage2_scatter.arena_handle),
             int(stage2_scatter.combine_input_offset),
