@@ -13,6 +13,7 @@ breaks and how to fix it. The author can be new to these rules.
   words, one point in each sentence. You can use technical terms.
 - Keep each comment short: one sentence for the problem and one for the fix.
 - Do not repeat what the code does. Do not add long explanations.
+- Set the severity of each comment about a rule in this file to High.
 
 ## PR scope
 
