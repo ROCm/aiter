@@ -1,24 +1,26 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Host wrapper for the FlyDSL delayed mHC seam with RMSNorm (gfx942), two launches, or three
-with the separate RMSNorm.
+"""High-level FlyDSL delayed mHC seam with RMSNorm (gfx942).
 
-Same arguments and returns as the Triton seam
-``aiter.ops.triton.fusions.mhc_fused_post_pre_delayed_rmsnorm`` for contiguous inputs: the
-Triton seam copies a strided one, this wrapper rejects it. A fused pass post-mixes the
-streams, stages the un-normalised collapse in ``layer_input`` and publishes the split-K gate
-projection and both sums of squares; a finish pass folds them, forms the gates and rescales
-``layer_input`` in place. With ``NORM="separate"`` the kernels of
-``aiter/ops/flydsl/kernels/mhc_seam_nonorm.py`` produce the un-normalised collapse and
-``aiter.rms_norm`` applies the RMSNorm after it. See ``aiter/ops/flydsl/kernels/mhc_seam.py``
-for the fused-norm kernels.
+The fused pass post-mixes the residual streams, stages the collapse, and computes
+split-K gate projections. The finish pass forms the gates and applies RMSNorm.
+With NORM="separate", aiter.rms_norm normalizes the collapse in a third launch.
 """
 
 import functools
 import weakref
+from collections.abc import Callable
 
+import flydsl.compiler as flyc
+import flydsl.expr as fx
 import torch
+
+from aiter.jit.utils.chip_info import get_cu_num, get_lds_capacity_bytes
+from aiter.ops.flydsl.kernels import mhc_seam, mhc_seam_nonorm
+from aiter.ops.flydsl.kernels.kernels_common import ceildiv
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
+from aiter.ops.rmsnorm import rms_norm
 
 __all__ = ["MHC_SEAM_DEFAULTS", "flydsl_mhc_seam", "get_mhc_seam_config"]
 
@@ -34,7 +36,7 @@ _MIN_ROUND_FILL = 0.73
 _SPLIT_TARGET_BLOCKS = 512
 _MAX_SPLITS = 8
 
-# knob defaults merged under every policy decision and user override
+# Defaults for both the launch policy and explicit config overrides.
 MHC_SEAM_DEFAULTS = {
     "BLOCK_M": 16,  # tokens per fused-pass workgroup
     "CHUNK_C": 256,  # hidden columns per chunk of the fused pass's sweep
@@ -55,11 +57,10 @@ MHC_SEAM_DEFAULTS = {
 }
 _NORMS = ("fused", "separate")
 
-# Launch table from a sweep on 304-CU gfx942 parts at H = 5120, one row per token bucket:
-# (largest T, BLOCK_M, CHUNK_C, CACHE_NT). Past the last row its config holds. SPLITS is not
-# tabled: get_mhc_seam_config derives it from the grid, which reproduces the sweep's choices up
-# to 4096 tokens. CACHE_NT pays once the seam's traffic no longer fits the MALL.
-_TABLE = (
+# Tuned on 304-CU gfx942 at H=5120: (max T, BLOCK_M, CHUNK_C, CACHE_NT).
+# One row per token bucket; the last row also covers larger T.
+# SPLITS is derived from the grid. CACHE_NT helps once traffic exceeds the MALL.
+_FUSED_NORM_TABLE = (
     (1, 16, 128, False),
     (32, 16, 128, False),
     (128, 32, 128, False),
@@ -72,9 +73,8 @@ _TABLE = (
     (16384, 64, 64, True),
     (32768, 64, 64, True),
 )
-# The NORM="separate" path's table, same sweep: (largest T, BLOCK_M, CHUNK_C, CACHE_NT,
-# CACHE_NT_X), for T above _SEPARATE_NORM_ABOVE. Up to there the fused norm is faster: the
-# separate RMSNorm costs a launch the short call cannot hide. SPLITS follows the same rule.
+# Same sweep: (max T, BLOCK_M, CHUNK_C, CACHE_NT, CACHE_NT_X).
+# Below the threshold, fused norm avoids the cost of a separate RMSNorm launch.
 _SEPARATE_NORM_ABOVE = 128
 _SEPARATE_NORM_TABLE = (
     (384, 16, 256, True, False),
@@ -101,15 +101,11 @@ def _arch(device_index: int) -> str:
 @functools.lru_cache(maxsize=1)
 def _cu_num() -> int:
     """Memoized: ``get_cu_num`` shells out to rocminfo; it honours the ``CU_NUM`` override."""
-    from aiter.jit.utils.chip_info import get_cu_num
-
     return get_cu_num()
 
 
 @functools.lru_cache(maxsize=16)
 def _lds_bytes(arch: str) -> int:
-    from aiter.jit.utils.chip_info import get_lds_capacity_bytes
-
     return get_lds_capacity_bytes(arch)
 
 
@@ -118,13 +114,9 @@ def _check_config(T: int, H: int, cfg: dict, arch: str) -> None:
         cfg["NORM"] in _NORMS,
         f"NORM must be one of {_NORMS}, got {cfg['NORM']!r}",
     )
-    if cfg["NORM"] == "separate":
-        from aiter.ops.flydsl.kernels.mhc_seam_nonorm import check_config
-    else:
-        from aiter.ops.flydsl.kernels.mhc_seam import check_config
-
+    kernels = mhc_seam_nonorm if cfg["NORM"] == "separate" else mhc_seam
     try:
-        check_config(
+        kernels.check_config(
             T,
             H,
             _N,
@@ -137,6 +129,360 @@ def _check_config(T: int, H: int, cfg: dict, arch: str) -> None:
         )
     except ValueError as e:
         raise ValueError(f"[flydsl_mhc_seam] {e}") from None
+
+
+def _stage_nt(T: int, H: int) -> bool:
+    """Stream the staged bf16 collapse only when it exceeds the last-level cache."""
+    return T * H * 2 > _MALL_BYTES
+
+
+def _round_fill(grid: int, cu_num: int) -> float:
+    """Fraction of occupied workgroup slots across rounds, at one workgroup per CU."""
+    return grid / (ceildiv(grid, cu_num) * cu_num)
+
+
+def _splits(T: int, H: int, bm: int, cc: int, cu_num: int) -> int:
+    chunks = H // cc
+    blocks = ceildiv(T, bm)
+    target = max(_SPLIT_TARGET_BLOCKS, blocks * _MAX_SPLITS)
+    fitting = [
+        s for s in range(1, chunks + 1) if chunks % s == 0 and blocks * s <= target
+    ]
+    full = [s for s in fitting if _round_fill(blocks * s, cu_num) >= _MIN_ROUND_FILL]
+    return max(full or fitting)
+
+
+def _mode(has_post: bool, identity_pre: bool) -> str:
+    """Only post-mix with a carried pre gate supports separate RMSNorm."""
+    if has_post:
+        return "identity_pre" if identity_pre else "post"
+    return "no_post_identity_pre" if identity_pre else "no_post"
+
+
+def get_mhc_seam_config(
+    T: int,
+    H: int,
+    arch: str,
+    cu_num: int,
+    mode: str = "post",
+    *,
+    norm: str | None = None,
+) -> dict:
+    """Return a mutable copy of the launch config for this shape, device, and mode.
+
+    Modes are ``post``, ``no_post``, ``identity_pre``, and ``no_post_identity_pre``.
+    Post mode prefers separate RMSNorm above 128 tokens when a legal tile exists;
+    other modes use fused RMSNorm. Set ``norm`` to force ``"fused"`` or ``"separate"``.
+    """
+    return dict(_policy(T, H, arch, cu_num, mode, norm))
+
+
+@functools.lru_cache(maxsize=512)
+def _policy(T: int, H: int, arch: str, cu_num: int, mode: str, norm) -> dict:
+    """Cache the validated policy config. Callers must not mutate the result."""
+    _require(arch in _GFX, f"unsupported arch {arch}", RuntimeError)
+    _require(
+        T * _N * H <= mhc_seam.MAX_FLAT_ELEMENTS,
+        "residual exceeds the int32 element offsets the kernels use",
+    )
+    _require(norm in (None, *_NORMS), f"norm must be one of {_NORMS}, got {norm!r}")
+    _require(
+        norm != "separate" or mode == "post",
+        f"NORM='separate' serves the post mode only, got {mode!r}",
+    )
+    cfg = None
+    if norm == "separate" or (
+        norm is None and mode == "post" and T > _SEPARATE_NORM_ABOVE
+    ):
+        cfg = _separate_norm_policy(T, H, arch, cu_num)
+        _require(
+            cfg is not None or norm != "separate",
+            f"no legal NORM='separate' tile for H={H}",
+        )
+    if cfg is None:
+        cfg = _fused_norm_policy(T, H, arch, cu_num)
+    return _derive_knobs(cfg, T, H, cu_num)
+
+
+def _derive_knobs(cfg: dict, T: int, H: int, cu_num: int) -> dict:
+    """Resolve automatic knobs in place, preserving explicit values."""
+    if cfg["NORM"] == "fused":
+        if cfg["GATE_STEP"] is None:
+            cfg["GATE_STEP"] = mhc_seam.gate_step(T, H, cu_num)
+        if cfg["STAGE_NT"] is None:
+            cfg["STAGE_NT"] = _stage_nt(T, H)
+    elif cfg["CACHE_NT_X"] is None:
+        cfg["CACHE_NT_X"] = cfg["CACHE_NT"]
+    return cfg
+
+
+def _config_key(config: dict | None) -> tuple | None:
+    """Snapshot scalar overrides in key order; None selects the automatic policy."""
+    if config is None:
+        return None
+    unknown = sorted(set(config) - set(MHC_SEAM_DEFAULTS))
+    _require(not unknown, f"unknown config keys: {unknown}")
+    return tuple(sorted(config.items()))
+
+
+def _resolve_config(
+    T: int,
+    H: int,
+    arch: str,
+    cu_num: int,
+    mode: str,
+    config: dict | None,
+) -> dict:
+    """Use the policy, or merge explicit overrides over defaults and validate them."""
+    if config is None:
+        return _policy(T, H, arch, cu_num, mode, None)
+    cfg = {**MHC_SEAM_DEFAULTS, **config}
+    _check_config(T, H, cfg, arch)
+    _require(
+        cfg["NORM"] != "separate" or mode == "post",
+        "NORM='separate' needs the post-mix and a carried pre_mix",
+    )
+    return _derive_knobs(cfg, T, H, cu_num)
+
+
+def _separate_norm_policy(
+    T: int,
+    H: int,
+    arch: str,
+    cu_num: int,
+) -> dict | None:
+    """Use the separate-norm table, or return None if its tile is illegal for H."""
+    row = next((r for r in _SEPARATE_NORM_TABLE if T <= r[0]), _SEPARATE_NORM_TABLE[-1])
+    _, bm, cc, cache_nt, cache_nt_x = row
+    try:
+        mhc_seam_nonorm.check_config(T, H, _N, bm, cc, 1, lds_bytes=_lds_bytes(arch))
+    except ValueError:
+        return None
+    return dict(
+        MHC_SEAM_DEFAULTS,
+        NORM="separate",
+        BLOCK_M=bm,
+        CHUNK_C=cc,
+        SPLITS=_splits(T, H, bm, cc, cu_num),
+        CACHE_NT=cache_nt,
+        CACHE_NT_X=cache_nt_x,
+    )
+
+
+def _fused_norm_policy(T: int, H: int, arch: str, cu_num: int) -> dict:
+    """Use the fused-norm table, falling back to the first legal tile for H."""
+    lds = _lds_bytes(arch)
+    row = next((r for r in _FUSED_NORM_TABLE if T <= r[0]), _FUSED_NORM_TABLE[-1])
+    _, bm, cc, cache_nt = row
+    for tile in ((bm, cc), *_FALLBACK_TILES):
+        try:
+            mhc_seam.check_config(T, H, _N, *tile, 1, lds_bytes=lds)
+        except ValueError:
+            continue
+        bm, cc = tile
+        break
+    else:
+        raise ValueError(f"[flydsl_mhc_seam] no legal tile for H={H}")
+    return dict(
+        MHC_SEAM_DEFAULTS,
+        BLOCK_M=bm,
+        CHUNK_C=cc,
+        SPLITS=_splits(T, H, bm, cc, cu_num),
+        CACHE_NT=cache_nt,
+    )
+
+
+def _validate_inputs(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    sinkhorn_repeat: int,
+    pre_mix: torch.Tensor | None,
+    sublayer_out: torch.Tensor | None,
+    post_layer_mix: torch.Tensor | None,
+    comb_res_mix: torch.Tensor | None,
+    norm_weight: torch.Tensor | None,
+    residual_out: torch.Tensor | None,
+) -> tuple[int, int, str]:
+    """Validate inputs and return the token count, hidden size, and GPU arch."""
+    _require(residual.dim() == 3, "residual must be (T, 4, H)")
+    _require(residual.dtype == torch.bfloat16, "residual must be bf16", TypeError)
+    _require(residual.is_contiguous(), "residual must be contiguous")
+    T, n, H = residual.shape
+    _require(n == _N, f"the seam kernels are specialised for hc_mult=4, got {n}")
+    _require(
+        T * _N * H <= mhc_seam.MAX_FLAT_ELEMENTS,
+        "residual exceeds the int32 element offsets the kernels use",
+    )
+    _require(
+        fn.shape == (24, _N * H), f"fn must be (24, {_N * H}), got {tuple(fn.shape)}"
+    )
+    _require(fn.dtype == torch.float32, "fn must be fp32", TypeError)
+    _require(fn.is_contiguous(), "fn must be contiguous")
+    _require(
+        mhc_seam.PAD_ROWS * fn.shape[1] * fn.element_size() < 2**31,
+        "fn exceeds the 2 GiB buffer descriptor offset window",
+    )
+    _require(
+        hc_scale.shape == (3,) and hc_base.shape == (24,),
+        "hc_scale (3,) and hc_base (24,)",
+    )
+    _require(
+        hc_scale.dtype == hc_base.dtype == torch.float32,
+        "hc_scale and hc_base must be fp32",
+        TypeError,
+    )
+    _require(
+        hc_scale.is_contiguous() and hc_base.is_contiguous(),
+        "hc_scale / hc_base must be contiguous",
+    )
+    _require(
+        norm_weight is not None and norm_weight.shape == (H,),
+        f"norm_weight must be ({H},)",
+    )
+    _require(norm_weight.dtype == torch.bfloat16, "norm_weight must be bf16", TypeError)
+    _require(norm_weight.is_contiguous(), "norm_weight must be contiguous")
+    _require(int(sinkhorn_repeat) >= 1, "sinkhorn_repeat must be >= 1")
+    device = residual.device
+    arch = _arch(
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    _require(arch in _GFX, f"supports {_GFX}, got {arch}", RuntimeError)
+
+    if sublayer_out is not None:
+        _require(
+            post_layer_mix is not None and comb_res_mix is not None,
+            "sublayer_out needs post_layer_mix and comb_res_mix",
+        )
+        _require(sublayer_out.shape == (T, H), f"sublayer_out must be ({T}, {H})")
+        _require(
+            sublayer_out.dtype == torch.bfloat16, "sublayer_out must be bf16", TypeError
+        )
+        _require(sublayer_out.is_contiguous(), "sublayer_out must be contiguous")
+        _require(
+            post_layer_mix.numel() == T * _N and post_layer_mix.is_contiguous(),
+            f"post_layer_mix must be {T * _N} contiguous values",
+        )
+        _require(
+            comb_res_mix.numel() == T * _N * _N and comb_res_mix.is_contiguous(),
+            f"comb_res_mix must be {T * _N * _N} contiguous values",
+        )
+        _require(
+            post_layer_mix.dtype == comb_res_mix.dtype == torch.float32,
+            "post_layer_mix and comb_res_mix must be fp32",
+            TypeError,
+        )
+        if residual_out is not None:
+            _require(
+                residual_out.shape == residual.shape
+                and residual_out.dtype == torch.bfloat16,
+                "residual_out must match residual (shape, bf16)",
+            )
+            _require(residual_out.is_contiguous(), "residual_out must be contiguous")
+    else:
+        _require(residual_out is None, "no post-mix: the residual is returned as is")
+
+    if pre_mix is not None:
+        _require(
+            pre_mix.numel() == T * _N and pre_mix.dtype == torch.float32,
+            f"pre_mix must be {T * _N} fp32 values",
+        )
+        _require(pre_mix.is_contiguous(), "pre_mix must be contiguous")
+    for t in (
+        fn,
+        hc_scale,
+        hc_base,
+        norm_weight,
+        pre_mix,
+        sublayer_out,
+        post_layer_mix,
+        comb_res_mix,
+        residual_out,
+    ):
+        _require(
+            t is None or t.device == device, "all tensors must be on the same device"
+        )
+    return T, H, arch
+
+
+def _ptr(t: torch.Tensor | None, dtype):
+    """Pass a null pointer for optional inputs the kernel does not read."""
+    return flyc.from_c_void_p(dtype, 0) if t is None else ptr_arg(t, dtype)
+
+
+def _make_fused_norm_runner(
+    T: int,
+    cfg: dict,
+    fused: Callable,
+    finish: Callable,
+    has_post: bool,
+) -> Callable:
+    """Bind the launch geometry; allocate scratch and form pointers on each call."""
+    bm, splits = cfg["BLOCK_M"], cfg["SPLITS"]
+    part_size = mhc_seam.part_elements(T, splits, bm)
+    sums_size = mhc_seam.sums_elements(T, splits)
+    fused_blocks = ceildiv(T, bm)
+    finish_blocks = mhc_seam.finish_blocks(T)
+
+    def run(
+        *,
+        residual: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        pre_mix: torch.Tensor | None,
+        sublayer_out: torch.Tensor | None,
+        post_layer_mix: torch.Tensor | None,
+        comb_res_mix: torch.Tensor | None,
+        norm_weight: torch.Tensor,
+        residual_out: torch.Tensor,
+        post_out: torch.Tensor,
+        comb_out: torch.Tensor,
+        layer_input: torch.Tensor,
+        next_pre: torch.Tensor,
+        stream: torch.cuda.Stream,
+    ) -> torch.Tensor:
+        bf16, f32 = fx.BFloat16, fx.Float32
+        part = torch.empty(part_size, dtype=torch.float32, device=residual.device)
+        sums = torch.empty(sums_size, dtype=torch.float32, device=residual.device)
+        part_p, sums_p = ptr_arg(part, f32), ptr_arg(sums, f32)
+        stage_p = ptr_arg(layer_input, bf16)
+        _run_compiled(
+            fused,
+            ptr_arg(residual, bf16),
+            _ptr(sublayer_out, bf16),
+            _ptr(post_layer_mix if has_post else None, f32),
+            _ptr(comb_res_mix if has_post else None, f32),
+            _ptr(pre_mix, f32),
+            ptr_arg(fn, f32),
+            ptr_arg(residual_out, bf16),
+            stage_p,
+            part_p,
+            sums_p,
+            T,
+            fused_blocks,
+            stream,
+        )
+        _run_compiled(
+            finish,
+            part_p,
+            sums_p,
+            ptr_arg(hc_scale, f32),
+            ptr_arg(hc_base, f32),
+            stage_p,
+            ptr_arg(norm_weight, bf16),
+            stage_p,
+            ptr_arg(post_out, f32),
+            ptr_arg(comb_out, f32),
+            ptr_arg(next_pre, f32),
+            T,
+            finish_blocks,
+            stream,
+        )
+        return layer_input
+
+    return run
 
 
 _FN_CACHE: dict = {}
@@ -185,161 +531,150 @@ def _pack_fn_nonorm(fn: torch.Tensor, capturing: bool) -> torch.Tensor:
     return packed
 
 
-def _stage_nt(T: int, H: int) -> bool:
-    """Whether the staged collapse's round trip overruns the last-level cache.
+def _make_separate_norm_runner(
+    T: int,
+    cfg: dict,
+    fused: Callable,
+    finish: Callable,
+    norm_eps: float,
+) -> Callable:
+    """Bind the no-norm kernels and apply RMSNorm after their two launches."""
+    part_size = mhc_seam_nonorm.part_elements(T, cfg["SPLITS"])
+    fused_blocks = ceildiv(T, cfg["BLOCK_M"])
+    finish_blocks = mhc_seam_nonorm.finish_blocks(T)
 
-    It is the one streamed buffer whose writer and reader are the same call: the fused pass
-    writes ``T * H`` bf16 and the finish pass reads back exactly those lines, so while it fits
-    it never reaches HBM. At ``_N + 1`` times smaller than the read set ``CACHE_NT`` is tuned
-    against, it fits where that set does not.
-    """
-    return T * H * 2 > _MALL_BYTES
+    def run(
+        *,
+        residual: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        pre_mix: torch.Tensor | None,
+        sublayer_out: torch.Tensor | None,
+        post_layer_mix: torch.Tensor | None,
+        comb_res_mix: torch.Tensor | None,
+        norm_weight: torch.Tensor,
+        residual_out: torch.Tensor,
+        post_out: torch.Tensor,
+        comb_out: torch.Tensor,
+        layer_input: torch.Tensor,
+        next_pre: torch.Tensor,
+        stream: torch.cuda.Stream,
+    ) -> torch.Tensor:
+        bf16, f32 = fx.BFloat16, fx.Float32
+        packed = _pack_fn_nonorm(fn, torch.cuda.is_current_stream_capturing())
+        part = torch.empty(part_size, dtype=torch.float32, device=residual.device)
+        part_p = ptr_arg(part, f32)
+        _run_compiled(
+            fused,
+            ptr_arg(residual, bf16),
+            ptr_arg(sublayer_out, bf16),
+            ptr_arg(post_layer_mix, f32),
+            ptr_arg(comb_res_mix, f32),
+            ptr_arg(pre_mix, f32),
+            ptr_arg(packed, bf16),
+            ptr_arg(residual_out, bf16),
+            ptr_arg(layer_input, bf16),
+            part_p,
+            T,
+            fused_blocks,
+            stream,
+        )
+        _run_compiled(
+            finish,
+            part_p,
+            ptr_arg(hc_scale, f32),
+            ptr_arg(hc_base, f32),
+            ptr_arg(post_out, f32),
+            ptr_arg(comb_out, f32),
+            ptr_arg(next_pre, f32),
+            T,
+            finish_blocks,
+            stream,
+        )
+        return rms_norm(layer_input, norm_weight, norm_eps)
 
-
-def _round_fill(grid: int, cu_num: int) -> float:
-    """Fraction of the workgroup slots a grid's rounds keep busy, at one workgroup per CU; its
-    last round decides it."""
-    from aiter.ops.flydsl.kernels.kernels_common import ceildiv
-
-    return grid / (ceildiv(grid, cu_num) * cu_num)
-
-
-def _splits(T: int, H: int, bm: int, cc: int, cu_num: int) -> int:
-    from aiter.ops.flydsl.kernels.kernels_common import ceildiv
-
-    chunks = H // cc
-    blocks = ceildiv(T, bm)
-    target = max(_SPLIT_TARGET_BLOCKS, blocks * _MAX_SPLITS)
-    fitting = [
-        s for s in range(1, chunks + 1) if chunks % s == 0 and blocks * s <= target
-    ]
-    full = [s for s in fitting if _round_fill(blocks * s, cu_num) >= _MIN_ROUND_FILL]
-    return max(full or fitting)
-
-
-def _mode(has_post: bool, identity_pre: bool) -> str:
-    """The policy's mode of a call. The API's fourth combination, no post-mix with the
-    identity pre gate, takes the fused-norm policy like ``no_post``."""
-    if has_post:
-        return "identity_pre" if identity_pre else "post"
-    return "no_post_identity_pre" if identity_pre else "no_post"
-
-
-def get_mhc_seam_config(
-    T: int, H: int, arch: str, cu_num: int, mode: str = "post", *, norm=None
-) -> dict:
-    """Launch policy keyed on (arch, cu_num), H, T and the seam's mode (``post``, ``no_post``,
-    ``identity_pre``; see ``_mode``).
-
-    * ``NORM="separate"`` above ``_SEPARATE_NORM_ABOVE`` tokens in ``post`` mode, the only one
-      the no-norm kernels serve, from ``_separate_norm_policy``; ``_fused_norm_policy``
-      otherwise.
-    * ``norm`` restricts the policy to one path, ``"fused"`` or ``"separate"``.
-    * ``GATE_STEP`` and ``STAGE_NT`` of the fused-norm path from their rules (see
-      ``_fused_norm_policy``).
-
-    Returns a copy of the memoized decision (``_policy``), so the caller may change it.
-    """
-    return dict(_policy(T, H, arch, cu_num, mode, norm))
+    return run
 
 
 @functools.lru_cache(maxsize=512)
-def _policy(T: int, H: int, arch: str, cu_num: int, mode: str, norm) -> dict:
-    """``get_mhc_seam_config``'s decision, memoized: the table lookups, the split search and
-    the legality checks are per-call host cost otherwise. Every result passes
-    ``_check_config``, so a call on the policy skips it. Callers must not mutate the result.
+def _compile_launcher(
+    *,
+    T: int,
+    H: int,
+    arch: str,
+    cu_num: int,
+    config_key: tuple | None,
+    has_post: bool,
+    identity_pre: bool,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    norm_eps: float,
+) -> Callable:
+    """Cache a tensor-level runner by shape, device properties, mode, and config.
+
+    The runner retains only the compiled kernels and scalar launch metadata.
+    Tensors, scratch, and streams belong to each invocation.
     """
-    from aiter.ops.flydsl.kernels.mhc_seam import MAX_FLAT_ELEMENTS, gate_step
-
-    _require(arch in _GFX, f"unsupported arch {arch}", RuntimeError)
-    _require(
-        T * _N * H <= MAX_FLAT_ELEMENTS,
-        "residual exceeds the int32 element offsets the kernels use",
+    cfg = _resolve_config(
+        T,
+        H,
+        arch,
+        cu_num,
+        _mode(has_post, identity_pre),
+        None if config_key is None else dict(config_key),
     )
-    _require(norm in (None, *_NORMS), f"norm must be one of {_NORMS}, got {norm!r}")
-    _require(
-        norm != "separate" or mode == "post",
-        f"NORM='separate' serves the post mode only, got {mode!r}",
-    )
-
-    cfg = None
-    if cfg is None and (
-        norm == "separate"
-        or (norm is None and mode == "post" and T > _SEPARATE_NORM_ABOVE)
-    ):
-        cfg = _separate_norm_policy(T, H, arch, cu_num)
-        _require(
-            cfg is not None or norm != "separate",
-            f"no legal NORM='separate' tile for H={H}",
+    fused_kwargs = {
+        "hidden": H,
+        "block_m": cfg["BLOCK_M"],
+        "chunk_c": cfg["CHUNK_C"],
+        "splits": cfg["SPLITS"],
+        "fast_fp_math": cfg["FAST_FP_MATH"],
+        "fast_narrow": cfg["FAST_NARROW"],
+        "load_nt": cfg["CACHE_NT"],
+        "store_nt": True,
+        "waves_per_eu": cfg["WAVES_PER_EU"],
+    }
+    finish_kwargs = {
+        "hidden": H,
+        "splits": cfg["SPLITS"],
+        "rms_eps": rms_eps,
+        "hc_pre_eps": hc_pre_eps,
+        "hc_sinkhorn_eps": hc_sinkhorn_eps,
+        "hc_post_mult_value": hc_post_mult_value,
+        "sinkhorn_repeat": sinkhorn_repeat,
+        "fast_fp_math": cfg["FAST_FP_MATH"],
+    }
+    if cfg["NORM"] == "separate":
+        fused = mhc_seam_nonorm.compile_mhc_seam_fused_nonorm(
+            **fused_kwargs,
+            load_nt_x=bool(cfg["CACHE_NT_X"]),
         )
+        finish = mhc_seam_nonorm.compile_mhc_seam_finish_nonorm(**finish_kwargs)
+        return _make_separate_norm_runner(T, cfg, fused, finish, norm_eps)
 
-    if cfg is None:
-        cfg = _fused_norm_policy(T, H, arch, cu_num)
-    if cfg["NORM"] == "fused":
-        cfg["GATE_STEP"] = gate_step(T, H, cu_num)
-        cfg["STAGE_NT"] = _stage_nt(T, H)
-    return cfg
-
-
-def _separate_norm_policy(T: int, H: int, arch: str, cu_num: int) -> dict | None:
-    """In-code policy of the separate-norm path: ``BLOCK_M``, ``CHUNK_C``, ``CACHE_NT`` and
-    ``CACHE_NT_X`` from the ``_SEPARATE_NORM_TABLE`` row whose bucket holds ``T``, ``SPLITS``
-    by ``_splits``. ``None`` when the row's tile is illegal for ``H``."""
-    from aiter.ops.flydsl.kernels.mhc_seam_nonorm import check_config
-
-    row = next((r for r in _SEPARATE_NORM_TABLE if T <= r[0]), _SEPARATE_NORM_TABLE[-1])
-    _, bm, cc, cache_nt, cache_nt_x = row
-    try:
-        check_config(T, H, _N, bm, cc, 1, lds_bytes=_lds_bytes(arch))
-    except ValueError:
-        return None
-    return dict(
-        MHC_SEAM_DEFAULTS,
-        NORM="separate",
-        BLOCK_M=bm,
-        CHUNK_C=cc,
-        SPLITS=_splits(T, H, bm, cc, cu_num),
-        CACHE_NT=cache_nt,
-        CACHE_NT_X=cache_nt_x,
+    fused = mhc_seam.compile_mhc_seam_fused(
+        **fused_kwargs,
+        streams=_N,
+        has_post=has_post,
+        identity_pre=identity_pre,
+        stage_nt=bool(cfg["STAGE_NT"]),
     )
-
-
-def _fused_norm_policy(T: int, H: int, arch: str, cu_num: int) -> dict:
-    """In-code policy of the fused-norm path.
-
-    * ``BLOCK_M``, ``CHUNK_C`` and ``CACHE_NT`` from the first ``_TABLE`` row whose bucket holds
-      ``T`` (the last row beyond it).
-    * Another ``H``: the row's tile if it is legal, else the first legal one in
-      ``_FALLBACK_TILES``.
-    * ``SPLITS``: the largest divisor of the chunk count that keeps the fused grid within
-      ``_SPLIT_TARGET_BLOCKS`` workgroups or ``_MAX_SPLITS`` splits, whichever allows more,
-      preferring those whose last round is at least ``_MIN_ROUND_FILL`` full.
-    * ``GATE_STEP`` (set by ``get_mhc_seam_config``) from ``kernels.mhc_seam.gate_step``,
-      which is what the table's sweep found (on up to 4096 tokens at 304 CUs, off from 8192).
-    * ``STAGE_NT`` (likewise) from ``_stage_nt``: the staged collapse's round trip stays cached
-      while it fits the last-level cache, whatever ``CACHE_NT`` says.
-    """
-    from aiter.ops.flydsl.kernels.mhc_seam import check_config
-
-    lds = _lds_bytes(arch)
-    row = next((r for r in _TABLE if T <= r[0]), _TABLE[-1])
-    _, bm, cc, cache_nt = row
-    for tile in ((bm, cc), *_FALLBACK_TILES):
-        try:
-            check_config(T, H, _N, *tile, 1, lds_bytes=lds)
-        except ValueError:
-            continue
-        bm, cc = tile
-        break
-    else:
-        raise ValueError(f"[flydsl_mhc_seam] no legal tile for H={H}")
-    return dict(
-        MHC_SEAM_DEFAULTS,
-        BLOCK_M=bm,
-        CHUNK_C=cc,
-        SPLITS=_splits(T, H, bm, cc, cu_num),
-        CACHE_NT=cache_nt,
+    finish = mhc_seam.compile_mhc_seam_finish(
+        **finish_kwargs,
+        streams=_N,
+        block_m=cfg["BLOCK_M"],
+        norm_eps=norm_eps,
+        fast_narrow=cfg["FAST_NARROW"],
+        norm_load_nt=bool(cfg["STAGE_NT"]),
+        norm_store_nt=True,
+        waves_per_eu=cfg["FINISH_WAVES_PER_EU"],
+        gate_only=bool(cfg["GATE_STEP"]),
     )
+    return _make_fused_norm_runner(T, cfg, fused, finish, has_post)
 
 
 def flydsl_mhc_seam(
@@ -362,308 +697,81 @@ def flydsl_mhc_seam(
     residual_out: torch.Tensor | None = None,
     config: dict | None = None,
 ):
-    """Delayed mHC seam with RMSNorm, two launches, or three with the separate RMSNorm.
+    """Delayed mHC seam with RMSNorm for contiguous inputs.
 
-    Returns ``(residual_out, post_mix (T, 4, 1), comb_mix (T, 4, 4), layer_input (T, H) bf16,
-    next_pre_mix (T, 4))``; the gates are fp32. ``pre_mix=None`` is the identity pre gate (the
-    collapse is stream 0). With no post-mix (``sublayer_out=None``) the residual is returned as
-    is and ``residual_out`` must not be passed; otherwise it is allocated when not given.
+    Returns ``(residual_out, post_mix, comb_mix, layer_input, next_pre_mix)`` with
+    shapes ``(T, 4, H)``, ``(T, 4, 1)``, ``(T, 4, 4)``, ``(T, H)``, and ``(T, 4)``.
+    Residual and layer input are bf16; gates are fp32. ``pre_mix=None`` collapses
+    stream 0. Without ``sublayer_out``, the residual is returned unchanged and
+    ``residual_out`` must be None; otherwise it is allocated when not supplied.
 
-    Above 128 tokens with the post-mix and a carried ``pre_mix``, the policy runs the no-norm
-    kernels and ``aiter.rms_norm`` instead (``NORM="separate"``).
+    With ``config=None``, use the launch policy. Explicit configs override
+    ``MHC_SEAM_DEFAULTS``. Fused RMSNorm takes two launches; separate RMSNorm takes
+    three and is preferred above 128 tokens with post-mix and a carried pre gate.
 
-    Invalid inputs raise ``ValueError`` / ``TypeError`` (not ``assert``). The scratch is
-    allocated per call from the caching allocator, so CUDA-graph capture of the fused-norm path
-    needs no warm-up beyond the kernels' first compile. The separate path packs ``fn`` once per
-    weight and refuses to pack during capture, so it needs one eager call with the same ``fn``
-    before capturing, and one after updating ``fn`` in place before replaying graphs.
+    Scratch is allocated per call. Compile before CUDA-graph capture. Separate
+    RMSNorm also needs an eager call with the same ``fn`` to pack it before capture,
+    and again after any in-place weight update before replaying the graph.
     """
-    import flydsl.compiler as flyc
-    import flydsl.expr as fx
-
-    from aiter.ops.flydsl.kernels import mhc_seam as k
-    from aiter.ops.flydsl.kernels.kernels_common import ceildiv
-    from aiter.ops.flydsl.kernels.tensor_shim import (
-        _run_compiled,
-        ptr_arg,
-    )
-
-    _require(residual.dim() == 3, "residual must be (T, 4, H)")
-    _require(residual.dtype == torch.bfloat16, "residual must be bf16", TypeError)
-    _require(residual.is_contiguous(), "residual must be contiguous")
-    T, n, H = residual.shape
-    _require(n == _N, f"the seam kernels are specialised for hc_mult=4, got {n}")
-    _require(
-        T * _N * H <= k.MAX_FLAT_ELEMENTS,
-        "residual exceeds the int32 element offsets the kernels use",
-    )
-    _require(
-        fn.shape == (24, _N * H), f"fn must be (24, {_N * H}), got {tuple(fn.shape)}"
-    )
-    _require(fn.dtype == torch.float32, "fn must be fp32", TypeError)
-    _require(fn.is_contiguous(), "fn must be contiguous")
-    _require(
-        k.PAD_ROWS * fn.shape[1] * fn.element_size() < 2**31,
-        "fn exceeds the 2 GiB buffer descriptor offset window",
-    )
-    _require(
-        hc_scale.shape == (3,) and hc_base.shape == (24,),
-        "hc_scale (3,) and hc_base (24,)",
-    )
-    _require(
-        hc_scale.dtype == hc_base.dtype == torch.float32,
-        "hc_scale and hc_base must be fp32",
-        TypeError,
-    )
-    _require(
-        hc_scale.is_contiguous() and hc_base.is_contiguous(),
-        "hc_scale / hc_base must be contiguous",
-    )
-    _require(
-        norm_weight is not None and norm_weight.shape == (H,),
-        f"norm_weight must be ({H},)",
-    )
-    _require(norm_weight.dtype == torch.bfloat16, "norm_weight must be bf16", TypeError)
-    _require(norm_weight.is_contiguous(), "norm_weight must be contiguous")
-    _require(int(sinkhorn_repeat) >= 1, "sinkhorn_repeat must be >= 1")
-    device = residual.device
-    arch = _arch(
-        device.index if device.index is not None else torch.cuda.current_device()
-    )
-    _require(arch in _GFX, f"supports {_GFX}, got {arch}", RuntimeError)
-
-    has_post = sublayer_out is not None
-    if has_post:
-        _require(
-            post_layer_mix is not None and comb_res_mix is not None,
-            "sublayer_out needs post_layer_mix and comb_res_mix",
-        )
-        _require(sublayer_out.shape == (T, H), f"sublayer_out must be ({T}, {H})")
-        _require(
-            sublayer_out.dtype == torch.bfloat16, "sublayer_out must be bf16", TypeError
-        )
-        _require(sublayer_out.is_contiguous(), "sublayer_out must be contiguous")
-        _require(
-            post_layer_mix.numel() == T * _N and post_layer_mix.is_contiguous(),
-            f"post_layer_mix must be {T * _N} contiguous values",
-        )
-        _require(
-            comb_res_mix.numel() == T * _N * _N and comb_res_mix.is_contiguous(),
-            f"comb_res_mix must be {T * _N * _N} contiguous values",
-        )
-        _require(
-            post_layer_mix.dtype == comb_res_mix.dtype == torch.float32,
-            "post_layer_mix and comb_res_mix must be fp32",
-            TypeError,
-        )
-        if residual_out is None:
-            residual_out = torch.empty_like(residual)
-        _require(
-            residual_out.shape == residual.shape
-            and residual_out.dtype == torch.bfloat16,
-            "residual_out must match residual (shape, bf16)",
-        )
-        _require(residual_out.is_contiguous(), "residual_out must be contiguous")
-    else:
-        _require(residual_out is None, "no post-mix: the residual is returned as is")
-        # Never written: without the post block the fused pass skips the residual store.
-        residual_out = residual
-
-    # The entry seam's identity gate is a build flag; the kernel writes it and reads no tensor,
-    # so `pre_mix` stays None and the argument goes in as a null pointer rather than a buffer
-    # allocated per call to be ignored.
-    identity_pre = pre_mix is None
-    if not identity_pre:
-        _require(
-            pre_mix.numel() == T * _N and pre_mix.dtype == torch.float32,
-            f"pre_mix must be {T * _N} fp32 values",
-        )
-        _require(pre_mix.is_contiguous(), "pre_mix must be contiguous")
-    for t in (
+    T, H, arch = _validate_inputs(
+        residual,
         fn,
         hc_scale,
         hc_base,
-        norm_weight,
+        sinkhorn_repeat,
         pre_mix,
         sublayer_out,
         post_layer_mix,
         comb_res_mix,
+        norm_weight,
         residual_out,
-    ):
-        _require(
-            t is None or t.device == device, "all tensors must be on the same device"
-        )
+    )
+    has_post = sublayer_out is not None
+    identity_pre = pre_mix is None
+    device = residual.device
 
+    # The no-post kernel skips the residual store, so that output aliases the input.
+    if not has_post:
+        residual_out = residual
+    elif residual_out is None:
+        residual_out = torch.empty_like(residual)
     post_out = torch.empty(T, _N, 1, dtype=torch.float32, device=device)
     comb_out = torch.empty(T, _N, _N, dtype=torch.float32, device=device)
     next_pre = torch.empty(T, _N, dtype=torch.float32, device=device)
-    # also the fused pass's stage: the finish pass rescales it in place
     layer_input = torch.empty(T, H, dtype=torch.bfloat16, device=device)
     if T == 0:
         return residual_out, post_out, comb_out, layer_input, next_pre
 
-    if config is None:
-        # Read only below, so the memoized dict is used as is.
-        cfg = _policy(T, H, arch, _cu_num(), _mode(has_post, identity_pre), None)
-    else:
-        unknown = sorted(set(config) - set(MHC_SEAM_DEFAULTS))
-        if unknown:
-            raise ValueError(f"[flydsl_mhc_seam] unknown config keys: {unknown}")
-        cfg = dict(MHC_SEAM_DEFAULTS)
-        cfg.update(config)
-        _check_config(T, H, cfg, arch)
-
-    bm, splits = cfg["BLOCK_M"], cfg["SPLITS"]
-    stream = torch.cuda.current_stream(device)
-    bf16, f32 = fx.BFloat16, fx.Float32
-    if cfg["NORM"] == "separate":
-        # The no-norm kernels write the bf16 collapse and the gates; aiter.rms_norm
-        # normalises the collapse after them.
-        from aiter.ops.flydsl.kernels import mhc_seam_nonorm as nn
-        from aiter.ops.rmsnorm import rms_norm
-
-        _require(
-            has_post and not identity_pre,
-            "NORM='separate' needs the post-mix and a carried pre_mix",
-        )
-        load_nt_x = cfg["CACHE_NT_X"]
-        if load_nt_x is None:
-            load_nt_x = cfg["CACHE_NT"]
-        fused = nn.compile_mhc_seam_fused_nonorm(
-            hidden=H,
-            block_m=bm,
-            chunk_c=cfg["CHUNK_C"],
-            splits=splits,
-            load_nt=cfg["CACHE_NT"],
-            load_nt_x=bool(load_nt_x),
-            store_nt=True,
-            fast_fp_math=cfg["FAST_FP_MATH"],
-            fast_narrow=cfg["FAST_NARROW"],
-            waves_per_eu=cfg["WAVES_PER_EU"],
-        )
-        finish = nn.compile_mhc_seam_finish_nonorm(
-            hidden=H,
-            splits=splits,
-            rms_eps=float(rms_eps),
-            hc_pre_eps=float(hc_pre_eps),
-            hc_sinkhorn_eps=float(hc_sinkhorn_eps),
-            hc_post_mult_value=float(hc_post_mult_value),
-            sinkhorn_repeat=int(sinkhorn_repeat),
-            fast_fp_math=cfg["FAST_FP_MATH"],
-        )
-        packed = _pack_fn_nonorm(fn, torch.cuda.is_current_stream_capturing())
-        part = torch.empty(
-            nn.part_elements(T, splits), dtype=torch.float32, device=device
-        )
-        part_p = ptr_arg(part, f32)
-        _run_compiled(
-            fused,
-            ptr_arg(residual, bf16),
-            ptr_arg(sublayer_out, bf16),
-            ptr_arg(post_layer_mix, f32),
-            ptr_arg(comb_res_mix, f32),
-            ptr_arg(pre_mix, f32),
-            ptr_arg(packed, bf16),
-            ptr_arg(residual_out, bf16),
-            ptr_arg(layer_input, bf16),
-            part_p,
-            T,
-            ceildiv(T, bm),
-            stream,
-        )
-        _run_compiled(
-            finish,
-            part_p,
-            ptr_arg(hc_scale, f32),
-            ptr_arg(hc_base, f32),
-            ptr_arg(post_out, f32),
-            ptr_arg(comb_out, f32),
-            ptr_arg(next_pre, f32),
-            T,
-            nn.finish_blocks(T),
-            stream,
-        )
-        layer_input = rms_norm(layer_input, norm_weight, float(norm_eps))
-        return residual_out, post_out, comb_out, layer_input, next_pre
-
-    gate_only = cfg["GATE_STEP"]
-    if gate_only is None:
-        gate_only = k.gate_step(T, H, _cu_num())
-    stage_nt = cfg["STAGE_NT"]
-    if stage_nt is None:
-        stage_nt = _stage_nt(T, H)
-
-    fused = k.compile_mhc_seam_fused(
-        streams=_N,
-        hidden=H,
+    launcher = _compile_launcher(
+        T=T,
+        H=H,
+        arch=arch,
+        cu_num=_cu_num(),
+        config_key=_config_key(config),
         has_post=has_post,
         identity_pre=identity_pre,
-        block_m=bm,
-        chunk_c=cfg["CHUNK_C"],
-        splits=splits,
-        fast_fp_math=cfg["FAST_FP_MATH"],
-        fast_narrow=cfg["FAST_NARROW"],
-        load_nt=cfg["CACHE_NT"],
-        store_nt=True,
-        stage_nt=bool(stage_nt),
-        waves_per_eu=cfg["WAVES_PER_EU"],
-    )
-    finish = k.compile_mhc_seam_finish(
-        streams=_N,
-        hidden=H,
-        block_m=bm,
-        splits=splits,
         rms_eps=float(rms_eps),
-        norm_eps=float(norm_eps),
         hc_pre_eps=float(hc_pre_eps),
         hc_sinkhorn_eps=float(hc_sinkhorn_eps),
         hc_post_mult_value=float(hc_post_mult_value),
         sinkhorn_repeat=int(sinkhorn_repeat),
-        fast_fp_math=cfg["FAST_FP_MATH"],
-        fast_narrow=cfg["FAST_NARROW"],
-        norm_load_nt=bool(stage_nt),
-        norm_store_nt=True,
-        waves_per_eu=cfg["FINISH_WAVES_PER_EU"],
-        gate_only=bool(gate_only),
+        norm_eps=float(norm_eps),
     )
-
-    part = torch.empty(
-        k.part_elements(T, splits, bm), dtype=torch.float32, device=device
-    )
-    sums = torch.empty(k.sums_elements(T, splits), dtype=torch.float32, device=device)
-    # The flags the kernels were built with keep them off the null pointers.
-    stage_p = ptr_arg(layer_input, bf16)
-    part_p, sums_p = ptr_arg(part, f32), ptr_arg(sums, f32)
-    _run_compiled(
-        fused,
-        ptr_arg(residual, bf16),
-        ptr_arg(sublayer_out, bf16) if has_post else flyc.from_c_void_p(bf16, 0),
-        ptr_arg(post_layer_mix, f32) if has_post else flyc.from_c_void_p(f32, 0),
-        ptr_arg(comb_res_mix, f32) if has_post else flyc.from_c_void_p(f32, 0),
-        flyc.from_c_void_p(f32, 0) if identity_pre else ptr_arg(pre_mix, f32),
-        ptr_arg(fn, f32),
-        ptr_arg(residual_out, bf16),
-        stage_p,
-        part_p,
-        sums_p,
-        T,
-        ceildiv(T, bm),
-        stream,
-    )
-    _run_compiled(
-        finish,
-        part_p,
-        sums_p,
-        ptr_arg(hc_scale, f32),
-        ptr_arg(hc_base, f32),
-        stage_p,
-        ptr_arg(norm_weight, bf16),
-        stage_p,
-        ptr_arg(post_out, f32),
-        ptr_arg(comb_out, f32),
-        ptr_arg(next_pre, f32),
-        T,
-        k.finish_blocks(T),
-        stream,
+    layer_input = launcher(
+        residual=residual,
+        fn=fn,
+        hc_scale=hc_scale,
+        hc_base=hc_base,
+        pre_mix=pre_mix,
+        sublayer_out=sublayer_out,
+        post_layer_mix=post_layer_mix,
+        comb_res_mix=comb_res_mix,
+        norm_weight=norm_weight,
+        residual_out=residual_out,
+        post_out=post_out,
+        comb_out=comb_out,
+        layer_input=layer_input,
+        next_pre=next_pre,
+        stream=torch.cuda.current_stream(device),
     )
     return residual_out, post_out, comb_out, layer_input, next_pre
