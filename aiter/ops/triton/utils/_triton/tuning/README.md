@@ -121,7 +121,8 @@ killed, `--setup-timeout` the time allowed before a worker is ready.
 Compiling is most of the time per candidate, and it uses only the CPU. With
 `--compile-procs N --compile-gpus G ...` the driver plans every M first, then N compile-only
 workers (`harness.py --precompile`) fill the Triton cache M by M, in sweep order, while the
-timing workers run. The compile GPUs only hold the inputs; they must not be in `--gpu`. The
+timing workers run. A candidate that does not compile gets its `error` record from the pool
+(`compile_ahead` in the record), so its failed compile is not repeated. The compile GPUs only hold the inputs; they must not be in `--gpu`. The
 timing workers compile what the pool has not reached yet, so the results do not change.
 
     python3 sweep_configs.py gemm_a16w16 --all-buckets --N 5120 --K 2880 --gpu 0 1 2 \

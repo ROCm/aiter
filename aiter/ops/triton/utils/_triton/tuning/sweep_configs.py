@@ -403,7 +403,7 @@ def precompile_slice(spec, shape, backend, candidates, out, slot, gpu, args, sto
     with open(todo_file, "w") as f:
         json.dump(candidates, f)
     command = worker_command(
-        spec, shape, backend, ["--precompile", "--configs", todo_file]
+        spec, shape, backend, ["--precompile", "--configs", todo_file, "--out", out]
     )
     env = dict(os.environ, HIP_VISIBLE_DEVICES=str(gpu))
     outcome = run_worker(command, env, log_path, args.stall, args.setup_timeout, stop)

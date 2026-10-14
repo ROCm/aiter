@@ -7,8 +7,8 @@ Flow: set the kernel up once (inputs, call, should_skip), then
   --configs     for each candidate: compile without launching -> skip it when the compiled
                 kernels overflow LDS or spill registers -> warm up -> capture a CUDA graph over
                 cold input copies -> replay -> append one record to --out
-  --precompile  only compile the --configs candidates (no launch, no records): fills the Triton
-                cache ahead of the timing workers
+  --precompile  only compile the --configs candidates (no launch): fills the Triton cache ahead
+                of the timing workers; a candidate that does not compile gets its error record
 
 --configs is a JSON list of config dicts; null is the baseline, the wrapper called with
 config=None (the installed config). Records are appended as soon as a candidate finishes.
@@ -143,15 +143,34 @@ def compile_only(call, config, inputs):
     return [kernel for kernel in compiled if kernel is not None]
 
 
-def precompile(call, inputs, candidates):
-    """Compile every candidate into the Triton cache; a candidate that fails is left to the sweep."""
+def precompile(call, inputs, candidates, out, common):
+    """Compile every candidate into the Triton cache.
+
+    A candidate that does not compile gets its error record here (compiling is deterministic),
+    so the timing worker does not spend the same failed compile again.
+    """
     print("ready", flush=True)  # the driver's watchdog reads the worker's log
     for candidate in candidates:
+        t0 = time.time()
         try:
             compile_only(call, candidate, inputs)
             status = "compiled"
         except Exception as e:  # noqa: BLE001
             status = f"failed {type(e).__name__}"
+            if candidate is not None:  # the baseline is always left to the sweep
+                error = f"{type(e).__name__}: {' '.join(str(e).split())[:300]}"
+                append_record(
+                    out,
+                    dict(
+                        common,
+                        status="error",
+                        baseline=False,
+                        config=candidate,
+                        error=error,
+                        compile_ahead=True,
+                        dur_s=round(time.time() - t0, 1),
+                    ),
+                )
         print(status, json.dumps(candidate), flush=True)
 
 
@@ -301,7 +320,8 @@ def main(argv=None):
     parser.add_argument(
         "--precompile",
         action="store_true",
-        help="only compile the --configs candidates into the Triton cache (no launch, no records)",
+        help="only compile the --configs candidates into the Triton cache (no launch); "
+        "a candidate that does not compile gets its error record in --out",
     )
     parser.add_argument("--space-out", help="where --plan writes the space (JSON)")
     parser.add_argument("--configs", help="JSON list of candidates, null = baseline")
@@ -336,7 +356,14 @@ def main(argv=None):
     with open(args.configs) as f:
         candidates = json.load(f)
     if args.precompile:
-        precompile(call, inputs, candidates)
+        common = {
+            "kernel": spec.name,
+            "backend": backend,
+            "arch": arch,
+            "shape": shape,
+            "gpu": os.environ.get("HIP_VISIBLE_DEVICES"),
+        }
+        precompile(call, inputs, candidates, args.out, common)
         return 0
     benchmark(
         spec,
