@@ -15,6 +15,11 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import Stream
 
 from aiter.ops.mha_v4 import AttentionPack
+from aiter.ops.mha_v4_quant import (
+    MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
+    MHA_V4_KV_TILE_ROWS,
+    MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
+)
 from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
 
 from .communication_ops_utils import (
@@ -158,7 +163,8 @@ def _fp6_output_views(address, num_records_bytes=None):
 def _int8_e8m0_scale(amax):
     # Match the symmetric INT8 codec's floor and exponent cap, not MXFP8's.
     need = (amax / fx.Float32(127.0)).maximumf(fx.Float32(1.0e-30))
-    exponent = (fmath.ceil(fmath.log2(need)) + fx.Float32(127.0)).to(fx.Int32)
+    bits = need.bitcast(fx.Int32)
+    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(fx.Int32)
     exponent = (exponent < 0).select(fx.Int32(0), exponent)
     return (exponent > 254).select(fx.Int32(254), exponent)
 
@@ -583,6 +589,10 @@ def make_attention_a2a_kernel(
     seq_full = seq_len * npes
     valid_kv_len = seq_full if valid_kv_len is None else valid_kv_len
     transport_kind = _transport_kind(v4_output, codec)
+    if transport_kind in ("mx_v", "fp6_p_v") and warp_num_per_block != 4:
+        raise ValueError(
+            f"packed {codec} V requires warp_num_per_block=4, got {warp_num_per_block}"
+        )
     k_tiles = (valid_kv_len + 127) // 128
     split_v_exchange = needs_split_v_exchange(v_pack, seq_len)
     split_frame = ((rank // 2 * 2 + 1) * seq_len) // 64
@@ -844,11 +854,17 @@ def make_attention_a2a_kernel(
             dest_pe = fx.Int32(fx.get_scalar(fx.get(peer_coord, 1)))
             peer_base = fx.Uint64(fx.memref_load(p2p_bases, dest_pe))
             uniform_peer_base = wave_uniform_i64(peer_base)
-            dst_bytes_extent = (
-                heads_local * k_tiles * (17408 if codec == "mxfp6" else 8192)
-                if mode == "k" and codec != "mxfp8"
-                else total_chunks * wire_bytes
-            )
+            # K is allocated trimmed to valid_kv_len by the host (packed return only);
+            # Q and unpacked roles use the full-sequence size.
+            trimmed_numel = valid_kv_len * heads_local * head_dim
+            if const_expr(mode == "k" and codec != "mxfp8"):
+                dst_bytes_extent = (
+                    heads_local * k_tiles * (17408 if codec == "mxfp6" else 8192)
+                )
+            elif const_expr(mode == "k"):
+                dst_bytes_extent = _transport_bytes(trimmed_numel, codec)
+            else:
+                dst_bytes_extent = total_chunks * wire_bytes
             if const_expr(quant and codec == "mxfp6"):
                 dst_views = _fp6_output_views(uniform_peer_base, dst_bytes_extent)
                 dst_words, dst_bytes = dst_views[0], dst_views[3]
@@ -861,6 +877,22 @@ def make_attention_a2a_kernel(
                     unit_stride=1,
                     num_records_bytes=dst_bytes_extent,
                 )
+            # Mirror the host's scale backing size (token-local scales plus
+            # consumer slack) for K; other roles keep the full-sequence size.
+            if const_expr(mode == "k"):
+                scale_dst_extent = trimmed_numel // 32
+                if const_expr(codec == "mxfp6"):
+                    scale_dst_extent += 64
+                elif const_expr(codec == "mxfp4"):
+                    scale_dst_extent += (
+                        (valid_kv_len + MHA_V4_KV_TILE_ROWS - 1)
+                        // MHA_V4_KV_TILE_ROWS
+                        * MHA_V4_KV_TILE_ROWS
+                        + MHA_V4_KV_SCALE_LOOKAHEAD_ROWS
+                        - valid_kv_len
+                    ) * heads_local * 4 + MHA_V4_MXFP4_K_SCALE_SLACK_BYTES
+            else:
+                scale_dst_extent = total_chunks * elements_per_chunk // 32
             if const_expr(quant):
                 p2p_scale = ptr_buf_tensor(addr_p2p_scale, fx.Int64)
                 scale_base = fx.Uint64(buf_copy_load(p2p_scale, dest_pe, fx.Int64))
@@ -868,7 +900,7 @@ def make_attention_a2a_kernel(
                 scale_dst = ptr_buf_tensor(
                     uniform_scale_base,
                     fx.Int8,
-                    num_records_bytes=total_chunks * elements_per_chunk // 32,
+                    num_records_bytes=scale_dst_extent,
                 )
             group_step = peer_warp_num * _PUSH_PIPELINE_DEPTH
             for group_base in range(peer_warp_id, peer_group_count, group_step):
@@ -1334,7 +1366,6 @@ def make_attention_a2a_kernel(
         @flyc.jit
         def transport_fp6_native(shared):
             if const_expr(v4_output == "q"):
-                # Layout decomposition adds 26 VGPRs to packed native FP6 Q.
                 native_q_peer = fx.idx2crd(
                     fx.Int32(global_warp_id),
                     fx.make_layout((UNBOUNDED_OUTER_EXTENT, npes), (npes, 1)),
@@ -2870,6 +2901,9 @@ def make_attention_a2a_jit(
         )
     payload_kernels.append(make_attention_a2a_kernel(**common, pc_reduce=pc_partial))
     completion = make_attention_a2a_completion_kernel(rank=rank, npes=npes)
+    # rank is compile-time so rank-dependent ownership (split frame, k_own_tiles,
+    # last-rank padding, odd-rank scales, sender dword selection) folds; the cache
+    # therefore grows with world size.
     key = (
         rank,
         npes,
