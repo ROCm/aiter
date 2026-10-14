@@ -1971,3 +1971,26 @@ def test_fp8_public_varlen_descale_rejects_unsupported():
             k_descale=ks,
             v_descale=vs,
         )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_public_varlen_descale_rejects_non_fp8_before_dispatch(monkeypatch, dtype):
+    """Descales with non-fp8 q raise before any backend could drop them.
+
+    The FlyDSL entry is stubbed to accept the call, like the gfx1250 bf16 m32x8
+    path that ignores descales, so the check is exercised on every arch.
+    """
+    from aiter import flash_attn_varlen_func
+    from aiter.ops.flydsl import fmha_kernels
+
+    monkeypatch.setattr(
+        fmha_kernels,
+        "flydsl_flash_attn_varlen_func",
+        lambda *a, **kw: pytest.fail("descales reached backend dispatch"),
+    )
+    L, H, D = 128, 4, 128
+    q, k, v = (torch.randn(L, H, D, dtype=dtype) for _ in range(3))
+    s = torch.ones(1, dtype=torch.float32)
+    cu = torch.tensor([0, L], dtype=torch.int32)
+    with pytest.raises(ValueError, match="must be float8_e4m3fn"):
+        flash_attn_varlen_func(q, k, v, cu, cu, L, L, causal=True, q_descale=s)

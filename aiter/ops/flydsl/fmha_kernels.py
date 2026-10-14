@@ -220,7 +220,7 @@ def flydsl_flash_attn_func(
     return o_p
 
 
-def _fp8_gfx950_supported(
+def _fp8_gfx950_reject_reason(
     q,
     k,
     v,
@@ -237,29 +237,33 @@ def _fp8_gfx950_supported(
     k_descale,
     v_descale,
     out,
-) -> bool:
-    """Gate for the gfx950 fp8 kernel.
+) -> str | None:
+    """Why the gfx950 fp8 kernel cannot serve this call, or None if it can.
 
     It needs e4m3fn Q/K/V with per-tensor descales and a positive, finite
     softmax scale, and writes bf16. Reject anything else so it falls through rather than
     silently dropping the feature.
     """
-    if q.dtype is not torch.float8_e4m3fn or q_descale is None:
-        return False
+    if q.dtype is not torch.float8_e4m3fn:
+        return f"q/k/v must be float8_e4m3fn, got q {q.dtype}"
+    if q_descale is None:
+        return "q_descale is required"
 
     from .kernels.flash_attn_func_fp8_gfx950 import (
+        _fp8_config_reason,
+        _gpu_arch,
         _is_valid_softmax_scale,
         flydsl_flash_attn_fp8_supported,
     )
 
     if q.dim() not in (3, 4) or k.dim() != q.dim() or v.dim() != q.dim():
-        return False
+        return "q/k/v must all be 3D (varlen) or 4D (batch)"
     if not (k.dtype == v.dtype == torch.float8_e4m3fn):
-        return False
+        return f"q/k/v must be float8_e4m3fn, got k {k.dtype}, v {v.dtype}"
     if out is not None and (out.dtype != torch.bfloat16 or not out.is_contiguous()):
-        return False
+        return "out must be a contiguous bfloat16 tensor"
     if not (q.is_cuda and k.device == q.device and v.device == q.device):
-        return False
+        return "q/k/v must be on the same GPU"
     if any(
         s is None
         or not torch.is_tensor(s)
@@ -268,28 +272,43 @@ def _fp8_gfx950_supported(
         or s.device != q.device
         for s in (q_descale, k_descale, v_descale)
     ):
-        return False
+        return "q/k/v_descale must be 1-element float32 tensors on q's device"
     qk_hdim = q.shape[-1]
     if not _is_valid_softmax_scale(softmax_scale):
-        return False
+        return f"softmax_scale must be None or positive and finite, got {softmax_scale}"
     nq, nkv = q.shape[-2], k.shape[-2]
     if not flydsl_flash_attn_fp8_supported(
         q.device, nq, nkv, qk_hdim, v.shape[-1], dtype=q.dtype
     ):
-        return False
-    return (
-        k.shape[-1] == qk_hdim
-        and nkv > 0
-        and nq % nkv == 0
-        and dropout_p == 0.0
-        and all(w < 0 for w in window_size[:2])
-        and (len(window_size) < 3 or window_size[2] == 0)
-        and bias is None
-        and alibi_slopes is None
-        and sink is None
-        and block_table is None
-        and not return_attn_probs
-    )
+        arch = _gpu_arch(q.device)
+        if arch != "gfx950":
+            return f"the FlyDSL FP8 kernel needs gfx950, got {arch or 'unknown'}"
+        reason = _fp8_config_reason(nq, nkv, qk_hdim, v.shape[-1])
+        return reason or "unsupported head configuration"
+    if k.shape[-1] != qk_hdim:
+        return "q and k head_dim must match"
+    if nkv <= 0 or nq % nkv:
+        return "num_heads must be divisible by positive num_kv_heads"
+    if dropout_p != 0.0:
+        return "dropout is not supported"
+    if any(w >= 0 for w in window_size[:2]) or (
+        len(window_size) > 2 and window_size[2] != 0
+    ):
+        return f"sliding window / sink tokens are not supported, got {window_size=}"
+    if bias is not None or alibi_slopes is not None:
+        return "bias/alibi is not supported"
+    if sink is not None:
+        return "sink is not supported"
+    if block_table is not None:
+        return "block_table is not supported"
+    if return_attn_probs:
+        return "return_attn_probs is not supported"
+    return None
+
+
+def _fp8_gfx950_supported(q, k, v, **kwargs) -> bool:
+    """Gate for the gfx950 fp8 kernel; see :func:`_fp8_gfx950_reject_reason`."""
+    return _fp8_gfx950_reject_reason(q, k, v, **kwargs) is None
 
 
 def flydsl_flash_attn_varlen_func(
