@@ -208,7 +208,9 @@ if [ "$rc" -ne 0 ]; then
   # `|| true` is not optional: a pipeline that finds nothing returns non-zero under pipefail,
   # and a command substitution that fails is a fatal assignment under errexit -- the same trap
   # this block exists to fix. The red lines are the ones carrying `exit=`.
-  red=$(awk '/exit=/ {print $2}' "$W/gates.out" 2>/dev/null | paste -sd, - || true)
+  # `!seen[$2]++` because a gate can red on more than one line, and "card,card,ledger" tells a
+  # reader less than "card,ledger" does.
+  red=$(awk '/exit=/ && !seen[$2]++ {print $2}' "$W/gates.out" 2>/dev/null | paste -sd, - || true)
   fail flow 7 "the review was withheld by the ${red:-?} gate -- the card did not meet the bar, which is usually cleared by running it again; re-comment to retry"
 fi
 say "collect..."
