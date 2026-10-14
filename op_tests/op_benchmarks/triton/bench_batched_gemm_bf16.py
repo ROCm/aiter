@@ -1,3 +1,4 @@
+import functools
 import math
 import sys
 
@@ -12,6 +13,8 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     batched_model_benchmark_shapes,
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     get_model_benchmark_object,
     get_shape_benchmark_object,
@@ -25,7 +28,8 @@ from op_tests.triton_tests.gemm.batched.test_batched_gemm_bf16 import (
 def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str):
     c_dtype = torch.bfloat16
 
-    x, w, bias, y = generate_batched_gemm_bf16_inputs(
+    _p_gen = functools.partial(
+        generate_batched_gemm_bf16_inputs,
         batch,
         M,
         N,
@@ -34,31 +38,30 @@ def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str):
         layout=layout,
         output=True,
     )
+    # batched_gemm_bf16 names its activation/weight/output kwargs XQ/WQ/YQ
+    _out_vals_keys = ["XQ", "WQ", "bias", "YQ"]
+
+    rot_bufs = generate_rotating_buffers_pool(
+        [_p_gen], [_out_vals_keys], target_mb=256, min_pool_len=4
+    )
+
+    kernel_fn = functools.partial(batched_gemm_bf16, dtype=c_dtype)
 
     # FLOPs for batched GEMM:
     # C[B, M, N] = A[B, M, K] @ W[B, N, K]^T
     flops = 2.0 * batch * M * N * K
 
     # Memory traffic.
+    bias_buf = rot_bufs[0]["bias"]
     mem_read = (
-        x.numel() * x.element_size()
-        + w.numel() * w.element_size()
-        + (bias.numel() * bias.element_size() if bias is not None else 0)
+        rot_bufs[0]["XQ"].numel() * rot_bufs[0]["XQ"].element_size()
+        + rot_bufs[0]["WQ"].numel() * rot_bufs[0]["WQ"].element_size()
+        + (bias_buf.numel() * bias_buf.element_size() if bias_buf is not None else 0)
     )
-    mem_write = y.numel() * y.element_size()
+    mem_write = rot_bufs[0]["YQ"].numel() * rot_bufs[0]["YQ"].element_size()
     mem = mem_read + mem_write
 
-    ms = triton.testing.do_bench(
-        lambda: batched_gemm_bf16(
-            x,
-            w,
-            bias=bias,
-            dtype=c_dtype,
-            YQ=y,
-        ),
-        warmup=25,
-        rep=100,
-    )
+    ms = do_bench_aiter_triton(kernel_fn, rot_bufs)
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
