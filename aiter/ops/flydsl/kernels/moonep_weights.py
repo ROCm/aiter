@@ -9,7 +9,8 @@ as a contiguous ``[experts_per_rank + prefetch_slots]`` window::
     local[i][:experts_per_rank]   home experts of part i
     local[i][experts_per_rank:]   local prefetch slots
 
-Mori supplies the P2P address of the same allocation on every peer. The
+``MoonEPSymmetric`` (Mori shmem, or cco on gfx1250) supplies the P2P address
+of the same allocation on every peer. The
 prefetch kernel reads a selected expert from its owner's home rows and copies
 it into this rank's slot rows. Slots are not read remotely, but keeping them
 next to the home rows preserves MegaMoE's contiguous expert-window ABI.
@@ -23,10 +24,9 @@ from __future__ import annotations
 import math
 
 import flydsl.expr as fx
-import mori.shmem as ms
 import torch
-from mori.shmem import mori_shmem_create_tensor
 
+from aiter.ops.flydsl.kernels.moonep_symmetric import MoonEPSymmetric
 from aiter.ops.flydsl.kernels.moonep_weight_prefetch_fast import (
     make_moonep_weight_prefetch_fast_jit,
 )
@@ -46,12 +46,15 @@ class MoonEPWeightPool:
         parts: list[tuple[tuple[int, ...], torch.dtype]],
         block_num: int = 1024,
         block_threads: int = 256,
+        communicator=None,
+        group=None,
     ) -> None:
-        """Create one collective Mori allocation.
+        """Create one collective symmetric allocation.
 
-        ``parts`` lists each tensor's per-expert ``(shape, dtype)``. ``rank``
-        and ``world_size`` must describe the already-initialized Mori shmem
-        group.
+        ``parts`` lists each tensor's per-expert ``(shape, dtype)``. Without
+        ``communicator``, ``rank`` and ``world_size`` must describe the
+        already-initialized Mori shmem group; with a cco ``communicator`` the
+        pool is carved from it (see ``MoonEPSymmetric``).
         """
         if world_size <= 0 or not 0 <= rank < world_size:
             raise ValueError(f"invalid rank/world_size: {rank}/{world_size}")
@@ -95,22 +98,20 @@ class MoonEPWeightPool:
         # All ranks must create symmetric tensors in the same order and with
         # the same size. Only this rank's tensor is a torch object; peer_bases
         # supplies the corresponding address in every other rank.
-        self._storage = mori_shmem_create_tensor((used,), torch.uint8)
+        self._symmetric = MoonEPSymmetric(
+            used,
+            rank=rank,
+            world_size=world_size,
+            communicator=communicator,
+            group=group,
+        )
+        self._storage = self._symmetric.storage
+        self._peer_bases = self._symmetric.peer_bases
         self.local = [
             self._part(i, dtype, shape) for i, (shape, dtype) in enumerate(parts)
         ]
         self.home = [part[:experts_per_rank] for part in self.local]
         self.prefetched = [part[experts_per_rank:] for part in self.local]
-        self._storage.zero_()
-        torch.cuda.synchronize(self.device)
-        ms.shmem_barrier_all()
-
-        self._peer_bases = torch.empty(
-            (world_size,), dtype=torch.int64, device=self.device
-        )
-        for pe in range(world_size):
-            self._peer_bases[pe] = ms.shmem_ptr_p2p(self._storage.data_ptr(), rank, pe)
-        torch.cuda.synchronize(self.device)
 
         self._jit = make_moonep_weight_prefetch_fast_jit(
             experts_per_rank=experts_per_rank,
@@ -147,8 +148,7 @@ class MoonEPWeightPool:
             raise RuntimeError("weight pool is closed")
         if self._staged:
             raise RuntimeError("weight pool home rows were already published")
-        torch.cuda.synchronize(self.device)
-        ms.shmem_barrier_all()
+        self._symmetric.barrier()
         self._staged = True
 
     def stage_home(self, weights: list[torch.Tensor]) -> None:
@@ -201,11 +201,10 @@ class MoonEPWeightPool:
     def close(self) -> None:
         if self._closed:
             return
-        torch.cuda.synchronize(self.device)
-        ms.shmem_barrier_all()
         self.home = self.prefetched = self.local = None
         self._peer_bases = None
         self._storage = None
+        self._symmetric.close()
         self._closed = True
 
 

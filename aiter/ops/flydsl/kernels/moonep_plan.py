@@ -21,9 +21,11 @@ from flydsl.expr import rocdl as fly_rocdl
 from flydsl.expr.typing import Stream, T
 
 from . import communication_ops_utils as comm_ops
+from .moonep_symmetric import MoonEPSymmetric, device_gfx, device_wave_size
 from .tensor_shim import _run_compiled, buf_copy_load, ptr_buf_tensor
 
-WAVE_SIZE = 64
+# The sticky settle keeps one bit per slot in an int64.
+MAX_SLOTS = 64
 _INT_MIN = -(2**31)
 _INT_MAX = 2**31 - 1
 # Top-B candidate keys: -1 = not a candidate, -2 = already selected.
@@ -39,10 +41,25 @@ def _lds_store(ptr, val, idx):
     fx.ptr_store(val, ptr + fx.Int64(idx))
 
 
-def _wave_argmax(val, idx, lane):
+def _drain(gfx12):
+    """Retire this wave's outstanding memory ops before a barrier."""
+    if gfx12:
+        comm_ops.waitcnt_all()
+        fx.rocdl.s_wait_dscnt(0)
+    else:
+        fx.rocdl.s_waitcnt(0)
+
+
+def _peer_cache_modifier(gfx12):
+    """Load policy for data peers wrote: gfx950 bypasses L2 (nt); gfx1250
+    relies on the preceding system acquire alone, as its compact plan does."""
+    return 0 if gfx12 else 2
+
+
+def _wave_argmax(val, idx, lane, wave_size):
     """All-lanes argmax over one wave; ties go to the lower index."""
-    for stride in (1, 2, 4, 8, 16, 32):
-        peer = ((lane + fx.Int32(stride)) & fx.Int32(WAVE_SIZE - 1)) * 4
+    for stride in (1, 2, 4, 8, 16, 32)[: wave_size.bit_length() - 1]:
+        peer = ((lane + fx.Int32(stride)) & fx.Int32(wave_size - 1)) * 4
         o_val = fx.Int32(fly_rocdl.ds_bpermute(T.i32, peer, val))
         o_idx = fx.Int32(fly_rocdl.ds_bpermute(T.i32, peer, idx))
         take = (o_val > val) | ((o_val == val) & (o_idx < idx))
@@ -51,11 +68,13 @@ def _wave_argmax(val, idx, lane):
     return val, idx
 
 
-def moonep_lds_fields(*, npes: int, experts: int, slots: int) -> dict:
+def moonep_lds_fields(
+    *, npes: int, experts: int, slots: int, wave_size: int = 64
+) -> dict:
     """Element counts of the int32 LDS arrays ``emit_moonep_placement`` uses."""
 
     epn = experts // npes
-    rem_stride = ((epn + WAVE_SIZE - 1) // WAVE_SIZE) * WAVE_SIZE
+    rem_stride = ((epn + wave_size - 1) // wave_size) * wave_size
     return {
         "mp_alloc": experts * npes,
         "mp_key": npes * (experts + 1),
@@ -80,6 +99,7 @@ def _resolve_quota_round(
     npes,
     experts_per_rank,
     lanes_per_home,
+    wave_size,
 ):
     """One greedy round for one home wave: largest quota, largest remaining expert."""
     R = npes
@@ -90,16 +110,16 @@ def _resolve_quota_round(
         fx.Int32(_INT_MIN),
     )
     q_idx = q_in_range.select(lane, fx.Int32(1 << 30))
-    quota, dest = _wave_argmax(q_val, q_idx, lane)
+    quota, dest = _wave_argmax(q_val, q_idx, lane, wave_size)
     best_v = fx.Int32(_INT_MIN)
     best_i = fx.Int32(1 << 30)
     for c in range_constexpr(lanes_per_home):
-        slot = fx.Int32(c * WAVE_SIZE) + lane
+        slot = fx.Int32(c * wave_size) + lane
         v = _lds_load(p_rem, rem_base + slot)
         take = (v > best_v) | ((v == best_v) & (slot < best_i))
         best_v = take.select(v, best_v)
         best_i = take.select(slot, best_i)
-    remaining, local_e = _wave_argmax(best_v, best_i, lane)
+    remaining, local_e = _wave_argmax(best_v, best_i, lane, wave_size)
     active = quota > fx.Int32(0)
     move = (remaining < quota).select(remaining, quota)
     move = active.select(move, fx.Int32(0))
@@ -138,6 +158,8 @@ def emit_moonep_placement(
     experts,
     slots,
     count_stride,
+    wave_size=64,
+    gfx12=False,
 ):
     """Place every expert's routes on destinations; all CTA threads call this.
 
@@ -153,15 +175,15 @@ def emit_moonep_placement(
     E = experts
     B = slots
     epn = E // R
-    block = num_waves * WAVE_SIZE
-    lpl = (epn + WAVE_SIZE - 1) // WAVE_SIZE
-    rem_stride = lpl * WAVE_SIZE
-    epl = (E + WAVE_SIZE - 1) // WAVE_SIZE
+    block = num_waves * wave_size
+    lpl = (epn + wave_size - 1) // wave_size
+    rem_stride = lpl * wave_size
+    epl = (E + wave_size - 1) // wave_size
     # Prepare keeps 8 waves whatever the EP size, like the native offset
     # derivation: wave d owns rank d in the per-rank phases, waves >= R only
     # take part in the CTA-wide work and the barriers.
     assert R <= num_waves, "one wave per destination rank"
-    assert B <= WAVE_SIZE
+    assert B <= MAX_SLOTS
 
     count = ptr_buf_tensor(addr_count, fx.Int32)
     alloc_cumsum = ptr_buf_tensor(addr_alloc_cumsum, fx.Int32)
@@ -172,8 +194,8 @@ def emit_moonep_placement(
     alloc_base = fx.Int64(ptrtoint(p_alloc))
 
     tid = fx.Int32(fx.thread_idx.x)
-    lane = tid & fx.Int32(WAVE_SIZE - 1)
-    wave = tid >> fx.Int32(6)
+    lane = tid & fx.Int32(wave_size - 1)
+    wave = tid >> fx.Int32(wave_size.bit_length() - 1)
 
     for i in range(tid, fx.Int32(R * R), block):
         _lds_store(p_quota, fx.Int32(0), i)
@@ -181,7 +203,10 @@ def emit_moonep_placement(
         total = fx.Int32(0)
         for r in range_constexpr(R):
             total = total + buf_copy_load(
-                count, fx.Int32(r * count_stride) + e, fx.Int32, cache_modifier=2
+                count,
+                fx.Int32(r * count_stride) + e,
+                fx.Int32,
+                cache_modifier=_peer_cache_modifier(gfx12),
             )
         _lds_store(p_ecount, total, e)
     fx.barrier()
@@ -234,7 +259,7 @@ def emit_moonep_placement(
     home = owned
     rem_base = home * fx.Int32(rem_stride)
     for c in range_constexpr(lpl):
-        local_e = fx.Int32(c * WAVE_SIZE) + lane
+        local_e = fx.Int32(c * wave_size) + lane
         in_range = local_e < fx.Int32(epn)
         safe_e = in_range.select(local_e, fx.Int32(0))
         v = _lds_load(p_ecount, home * fx.Int32(epn) + safe_e)
@@ -242,7 +267,7 @@ def emit_moonep_placement(
             _lds_store(
                 p_rem,
                 in_range.select(v, fx.Int32(_INT_MIN)),
-                rem_base + fx.Int32(c * WAVE_SIZE) + lane,
+                rem_base + fx.Int32(c * wave_size) + lane,
             )
     for _round in range(fx.Int32(0), fx.Int32(epn + R), 1):
         if rank_wave:
@@ -256,6 +281,7 @@ def emit_moonep_placement(
                 npes=R,
                 experts_per_rank=epn,
                 lanes_per_home=lpl,
+                wave_size=wave_size,
             )
         fx.barrier()
     fx.barrier()
@@ -288,7 +314,7 @@ def emit_moonep_placement(
     cand_vals = []
     cand_ids = []
     for c in range_constexpr(epl):
-        e = fx.Int32(c * WAVE_SIZE) + lane
+        e = fx.Int32(c * wave_size) + lane
         in_range = e < fx.Int32(E)
         v = _lds_load(p_key, key_base + in_range.select(e, fx.Int32(E)))
         cand_vals.append(in_range.select(v, fx.Int32(_KEY_NOT_CANDIDATE)))
@@ -338,7 +364,7 @@ def emit_moonep_placement(
         want.append(_lds_load(p_etc, row + fx.Int32(s)))
         held.append(slot_held[row + fx.Int32(s)])
     target = []
-    # One bit per slot; B may reach a full wave (64).
+    # One bit per slot, up to MAX_SLOTS.
     taken = fx.Int64(0)
     for s in range_constexpr(B):
         hit = fx.Int32(-1)
@@ -377,7 +403,7 @@ def emit_moonep_placement(
                 placed[t], held[t]
             )
             _lds_store(p_target, target[t], row + fx.Int32(t))
-    fx.rocdl.s_waitcnt(0)
+    _drain(gfx12)
     fx.barrier()
 
     for e in range(tid, fx.Int32(E), block):
@@ -397,7 +423,7 @@ def emit_moonep_placement(
                 slot,
             )
         expert_to_slot[dest * fx.Int32(E) + expert] = slot
-    fx.rocdl.s_waitcnt(0)
+    _drain(gfx12)
     fx.barrier()
 
 
@@ -405,7 +431,15 @@ _BLOCK = 256
 
 
 def make_moonep_plan_jit(
-    *, rank: int, npes: int, experts: int, slots: int, grid: int, num_waves: int = 8
+    *,
+    rank: int,
+    npes: int,
+    experts: int,
+    slots: int,
+    grid: int,
+    num_waves: int = 8,
+    wave_size: int = 64,
+    gfx12: bool = False,
 ):
     """``(count, place, rewrite)`` launchers for one rank of one EP layout.
 
@@ -418,8 +452,8 @@ def make_moonep_plan_jit(
     R, E, B = npes, experts, slots
     epn = E // R
     vs = epn + B
-    block = num_waves * WAVE_SIZE
-    sizes = moonep_lds_fields(npes=R, experts=E, slots=B)
+    block = num_waves * wave_size
+    sizes = moonep_lds_fields(npes=R, experts=E, slots=B, wave_size=wave_size)
     n_alloc, n_key, n_ecount, n_rem, n_quota, n_bal, n_etc, n_target = (
         sizes[f"mp_{k}"]
         for k in ("alloc", "key", "ecount", "rem", "quota", "bal", "etc", "target")
@@ -436,7 +470,7 @@ def make_moonep_plan_jit(
         etc: fx.Array[fx.Int32, n_etc, 16]
         target: fx.Array[fx.Int32, n_target, 16]
 
-    tag = f"r{rank}_n{R}_e{E}_b{B}_g{grid}"
+    tag = f"r{rank}_n{R}_e{E}_b{B}_g{grid}_w{wave_size}"
 
     @flyc.kernel(name=f"moonep_plan_count_{tag}", known_block_size=[_BLOCK, 1, 1])
     def count_kernel(
@@ -474,8 +508,8 @@ def make_moonep_plan_jit(
     ):
         lds = fx.SharedAllocator().allocate(PlacementLds).peek()
         tid = fx.Int32(fx.thread_idx.x)
-        lane = tid & fx.Int32(WAVE_SIZE - 1)
-        warp = tid >> fx.Int32(6)
+        lane = tid & fx.Int32(wave_size - 1)
+        warp = tid >> fx.Int32(wave_size.bit_length() - 1)
         hist = ptr_buf_tensor(addr_hist, fx.Int32)
         epoch = ptr_buf_tensor(addr_epoch, fx.Int32)[fx.Int32(0)] + fx.Int32(1)
         # Two matrices alternate, so a rank one launch ahead never overwrites
@@ -489,24 +523,24 @@ def make_moonep_plan_jit(
                 remote[parity * fx.Int32(R * E) + fx.Int32(rank * E) + e] = hist[e]
         for e in range(tid, fx.Int32(E), block):
             hist[e] = fx.Int32(0)
-        fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+        _drain(gfx12)
         fx.barrier()
 
         if warp == fx.Int32(0):
             comm_ops.fence_system_release()
             peer_arrive = ptr_buf_tensor(addr_peer_arrive, fx.Int64)
-            for destination in range(lane, fx.Int32(R), WAVE_SIZE):
+            for destination in range(lane, fx.Int32(R), wave_size):
                 comm_ops.store_i32_system(
                     peer_arrive[destination],
                     parity * fx.Int32(R) + fx.Int32(rank),
                     epoch,
                 )
-            for source in range(lane, fx.Int32(R), WAVE_SIZE):
+            for source in range(lane, fx.Int32(R), wave_size):
                 comm_ops.wait_i32_until_equals(
                     addr_arrive + fx.Int64(parity * fx.Int32(R) + source) * fx.Int64(4),
                     epoch,
                 )
-        fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+        _drain(gfx12)
         fx.barrier()
         comm_ops.fence_system_acquire()
 
@@ -531,6 +565,8 @@ def make_moonep_plan_jit(
             experts=E,
             slots=B,
             count_stride=E,
+            wave_size=wave_size,
+            gfx12=gfx12,
         )
         matrix = ptr_buf_tensor(addr_matrix, fx.Int32)
         source_prefix = ptr_buf_tensor(addr_source_prefix, fx.Int32)
@@ -538,12 +574,15 @@ def make_moonep_plan_jit(
             below = fx.Int32(0)
             for source in range_constexpr(rank):
                 below = below + buf_copy_load(
-                    matrix, fx.Int32(source * E) + e, fx.Int32, cache_modifier=2
+                    matrix,
+                    fx.Int32(source * E) + e,
+                    fx.Int32,
+                    cache_modifier=_peer_cache_modifier(gfx12),
                 )
             source_prefix[e] = below
         if tid == fx.Int32(0):
             ptr_buf_tensor(addr_epoch, fx.Int32)[fx.Int32(0)] = epoch
-        fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+        _drain(gfx12)
 
     @flyc.kernel(name=f"moonep_plan_rewrite_{tag}", known_block_size=[_BLOCK, 1, 1])
     def rewrite_kernel(
@@ -650,8 +689,9 @@ def make_moonep_plan_jit(
 class MoonEPPlanner:
     """Places one EP group's logical routes and rewrites them to virtual ids.
 
-    The output feeds an ordinary MegaMoEV2 built over ``R * (EPR + B)``
-    experts whose weight windows are a ``MoonEPWeightPool``'s: expert ``k`` of
+    The output feeds an ordinary MegaMoE (``MegaMoEV2`` on gfx950,
+    ``MegaMoEGfx1250`` on gfx1250) built over ``R * (EPR + B)`` experts whose
+    weight windows are a ``MoonEPWeightPool``'s: expert ``k`` of
     rank ``d``'s window is virtual id ``d * (EPR + B) + k``.  One planner
     serves every layer; each layer keeps its own slot tables
     (``new_slot_state``), since a slot holds that layer's expert.
@@ -665,17 +705,21 @@ class MoonEPPlanner:
         experts: int,
         slots: int,
         max_routes: int,
+        communicator=None,
+        group=None,
     ) -> None:
-        """``rank``/``world_size`` are the EP rank and size, also the mori PEs."""
-        import mori.shmem as ms
-        from mori.shmem import mori_shmem_create_tensor
+        """``rank``/``world_size`` are the EP rank and size.
 
+        Without ``communicator`` they are also the Mori shmem PEs; with a cco
+        ``communicator`` (gfx1250) the symmetric buffers come from it and
+        ``group`` is the EP process group for host barriers.
+        """
         if world_size not in (4, 8):
             raise ValueError(f"MoonEP supports EP4 and EP8, got EP{world_size}")
         if experts % world_size:
             raise ValueError("experts must divide evenly over the ranks")
-        if not 0 < slots <= WAVE_SIZE:
-            raise ValueError(f"slots must be in [1, {WAVE_SIZE}], got {slots}")
+        if not 0 < slots <= MAX_SLOTS:
+            raise ValueError(f"slots must be in [1, {MAX_SLOTS}], got {slots}")
         self.rank, self.world_size = rank, world_size
         self.experts, self.slots = experts, slots
         self.experts_per_rank = experts // world_size
@@ -687,20 +731,21 @@ class MoonEPPlanner:
         def i32(n, fill=0):
             return torch.full((n,), fill, dtype=torch.int32, device=dev)
 
-        self._counts = mori_shmem_create_tensor((2 * R * E,), torch.int32)
-        self._arrive = mori_shmem_create_tensor((2 * R,), torch.int32)
-        self._counts.zero_()
-        self._arrive.zero_()
-        self._peer_counts = torch.tensor(
-            [ms.shmem_ptr_p2p(self._counts.data_ptr(), rank, pe) for pe in range(R)],
-            dtype=torch.int64,
-            device=dev,
-        )
-        self._peer_arrive = torch.tensor(
-            [ms.shmem_ptr_p2p(self._arrive.data_ptr(), rank, pe) for pe in range(R)],
-            dtype=torch.int64,
-            device=dev,
-        )
+        def symmetric(n):
+            return MoonEPSymmetric(
+                4 * n,
+                rank=rank,
+                world_size=R,
+                communicator=communicator,
+                group=group,
+            )
+
+        self._counts_buf = symmetric(2 * R * E)
+        self._arrive_buf = symmetric(2 * R)
+        self._counts = self._counts_buf.storage.view(torch.int32)
+        self._arrive = self._arrive_buf.storage.view(torch.int32)
+        self._peer_counts = self._counts_buf.peer_bases
+        self._peer_arrive = self._arrive_buf.peer_bases
         self._hist = i32(E)
         self._epoch = i32(1)
         self._local_index = i32(max_routes)
@@ -708,12 +753,17 @@ class MoonEPPlanner:
         self._alloc_cumsum = i32(E * R)
         self._expert_to_slot = i32(R * E)
         self._virtual_ids = i32(max_routes)
-        torch.cuda.synchronize(dev)
-        ms.shmem_barrier_all()
+        self._arrive_buf.barrier()
 
         grid = max(1, min(304, -(-max_routes // _BLOCK)))
         self._jit = make_moonep_plan_jit(
-            rank=rank, npes=R, experts=E, slots=slots, grid=grid
+            rank=rank,
+            npes=R,
+            experts=E,
+            slots=slots,
+            grid=grid,
+            wave_size=device_wave_size(dev),
+            gfx12=device_gfx(dev).startswith("gfx12"),
         )
 
     def new_slot_state(self) -> dict:
@@ -789,6 +839,7 @@ class MoonEPPlanner:
 
 
 __all__ = [
+    "MAX_SLOTS",
     "MoonEPPlanner",
     "emit_moonep_placement",
     "make_moonep_plan_jit",

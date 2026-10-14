@@ -22,6 +22,7 @@ from aiter.ops.flydsl.kernels.moonep_plan import (
     make_moonep_plan_jit,
     moonep_lds_fields,
 )
+from aiter.ops.flydsl.kernels.moonep_symmetric import device_gfx, device_wave_size
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 R, E, B, K = 8, 384, 8, 6
@@ -29,6 +30,8 @@ EPN = E // R
 VS = EPN + B
 COUNT_STRIDE = E + R
 WAVES = 8
+WAVE = device_wave_size()
+GFX12 = device_gfx().startswith("gfx12")
 
 _LAUNCHERS = {}
 _REWRITES = {}
@@ -39,7 +42,7 @@ def _launcher():
     if key in _LAUNCHERS:
         return _LAUNCHERS[key]
 
-    sizes = moonep_lds_fields(npes=R, experts=E, slots=B)
+    sizes = moonep_lds_fields(npes=R, experts=E, slots=B, wave_size=WAVE)
     n_alloc, n_key, n_ecount, n_rem, n_quota, n_bal, n_etc, n_target = (
         sizes[f"mp_{k}"]
         for k in ("alloc", "key", "ecount", "rem", "quota", "bal", "etc", "target")
@@ -58,8 +61,8 @@ def _launcher():
         target: fx.Array[fx.Int32, n_target, 16]
 
     @flyc.kernel(
-        name=f"test_moonep_placement_w{R}_s{B}",
-        known_block_size=[WAVES * 64, 1, 1],
+        name=f"test_moonep_placement_w{R}_s{B}_v{WAVE}",
+        known_block_size=[WAVES * WAVE, 1, 1],
     )
     def kernel(
         count: fx.Int64,
@@ -90,6 +93,8 @@ def _launcher():
             experts=E,
             slots=B,
             count_stride=COUNT_STRIDE,
+            wave_size=WAVE,
+            gfx12=GFX12,
         )
 
     @flyc.jit
@@ -109,7 +114,7 @@ def _launcher():
             slot_held,
             slot_prev,
             slot_placed,
-        ).launch(grid=(1, 1, 1), block=(WAVES * 64, 1, 1), stream=stream)
+        ).launch(grid=(1, 1, 1), block=(WAVES * WAVE, 1, 1), stream=stream)
 
     _LAUNCHERS[key] = launch
     return launch
@@ -231,7 +236,7 @@ def _rewrite_launcher():
     key = (B, R)
     if key not in _REWRITES:
         _, _, rewrite = make_moonep_plan_jit(
-            rank=0, npes=R, experts=E, slots=B, grid=64
+            rank=0, npes=R, experts=E, slots=B, grid=64, wave_size=WAVE, gfx12=GFX12
         )
         _REWRITES[key] = rewrite
     return _REWRITES[key]
