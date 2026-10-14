@@ -22,7 +22,7 @@ def make_communicator(*, use_all2all: bool = True) -> CudaCommunicator:
     communicator.unique_name = "ep" if use_all2all else "tp"
     communicator.all2all_backend = "mori"
     communicator._all2all_manager = None
-    communicator._all2all_manager_backend = None
+    communicator._active_all2all_backend = None
     return communicator
 
 
@@ -41,6 +41,9 @@ def test_manager_is_created_only_when_requested(monkeypatch):
 
     assert manager.backend == "flydsl"
     assert created == ["flydsl"]
+    assert communicator.all2all_backend == "mori"
+    assert communicator._active_all2all_backend == "flydsl"
+    assert communicator.all2all_manager is manager
 
 
 def test_compatibility_property_requests_configured_backend(monkeypatch):
@@ -105,7 +108,7 @@ def test_failed_creation_can_be_retried(monkeypatch):
         communicator.get_or_create_all2all_manager("mori")
 
     assert communicator._all2all_manager is None
-    assert communicator._all2all_manager_backend is None
+    assert communicator._active_all2all_backend is None
     assert communicator.get_or_create_all2all_manager("mori") is manager
 
 

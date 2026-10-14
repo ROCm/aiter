@@ -37,7 +37,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         reuse_from: "CudaCommunicator | None" = None,
     ):
         self._all2all_manager = None
-        self._all2all_manager_backend = None
+        self._active_all2all_backend = None
 
         super().__init__(cpu_group, device, device_group, unique_name)
         from aiter.dist.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
@@ -185,23 +185,24 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 f"{self.unique_name} is not an expert-parallel communicator"
             )
 
-        requested_backend = backend or self.all2all_backend
         manager = self._all2all_manager
         if manager is not None:
-            if self._all2all_manager_backend != requested_backend:
+            if backend is not None and self._active_all2all_backend != backend:
                 raise RuntimeError(
                     "all2all manager is already initialized with backend "
-                    f"{self._all2all_manager_backend!r}; cannot switch to "
-                    f"{requested_backend!r}"
+                    f"{self._active_all2all_backend!r}; cannot switch to "
+                    f"{backend!r}"
                 )
             return manager
+
+        requested_backend = backend or self.all2all_backend
 
         # Assign only after construction succeeds. A failed collective/backend
         # initialization must not leave the communicator permanently marked as
         # initialized with a missing or partially constructed manager.
         manager = self._create_all2all_manager(requested_backend)
         self._all2all_manager = manager
-        self._all2all_manager_backend = requested_backend
+        self._active_all2all_backend = requested_backend
 
         if is_global_first_rank():
             logger.info("Using %s all2all manager.", manager.__class__.__name__)
@@ -218,7 +219,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
     @all2all_manager.setter
     def all2all_manager(self, value: All2AllManagerBase | None):
         self._all2all_manager = value
-        self._all2all_manager_backend = (
+        self._active_all2all_backend = (
             self.all2all_backend if value is not None else None
         )
 
@@ -948,7 +949,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self._all2all_manager is not None:
             self._all2all_manager.destroy()
             self._all2all_manager = None
-            self._all2all_manager_backend = None
+            self._active_all2all_backend = None
 
     def all_gatherv(
         self,
