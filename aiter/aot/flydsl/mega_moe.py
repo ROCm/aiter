@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""AOT pre-compilation for the MegaMoE A8W4 deployment profiles.
+"""AOT pre-compilation for the MegaMoE A8W4 and A4W4 deployment profiles.
 
 Each job builds the runtime's own ``MegaMoEV2`` for one rank of a deployment
 profile and calls its ``preload_aot_bundles()``. The runtime derives the bundle
@@ -47,7 +47,7 @@ ARCH = "gfx950"
 DEVICE_NAME = "AMD Instinct MI355X"
 NUM_CU = 256
 DEFAULT_MTPRS = (8192, 16384, 32768)
-DEFAULT_QUANTS = ("a8w4",)
+DEFAULT_QUANTS = ("a8w4", "a4w4")
 # DeepSeek-V4-Pro deployment profiles: r0, r32, and r64 redundant experts.
 # Keep all three in the default AOT job set so the service never falls back to
 # an online compile merely because EPLB changes the physical expert count.

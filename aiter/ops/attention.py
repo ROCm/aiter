@@ -567,6 +567,7 @@ def pa_persistent_fwd(
     softmax_scale: float | None = None,
     mask: int = 0,
     quant_type: QuantType = QuantType.per_Token,
+    high_precision: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     device = Q.device
     total_s, nhead, v_head_dim = output.shape
@@ -602,6 +603,7 @@ def pa_persistent_fwd(
         logits,
         splitLse,
         mask,
+        high_precision=high_precision,
         quant_type=quant_type,
     )
     pa_reduce_v1(

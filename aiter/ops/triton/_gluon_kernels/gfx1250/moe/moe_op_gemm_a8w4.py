@@ -5,11 +5,14 @@ from triton._C.libtriton.gluon_ir import make_cga_layout
 from triton.experimental import gluon
 from triton.experimental.gluon.language.amd.gfx1250 import async_copy
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+    pid_grid,
+    remap_xcd,
+)
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp8_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 _MOE_GEMM_A8W4_REPR_KEYS = [
     "BLOCK_M",
