@@ -1196,8 +1196,12 @@ def _validate_mha_v4_raw_inputs(
         raise ValueError(f"{operation} currently expects BF16 Q, K, and V inputs")
     if q.shape[-1] != 128 or k.shape[-1] != 128 or v.shape[-1] != 128:
         raise ValueError(f"{operation} currently supports head dimension 128 only")
-    if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
-        raise ValueError(f"{operation} currently requires contiguous BSHD inputs")
+    # Only a row's channels have to be dense: the kernels and quantizers take the batch, sequence
+    # and head strides, so a sequence crop of a packed QKV tensor runs without a copy.
+    if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
+        raise ValueError(
+            f"{operation} requires BSHD inputs with a contiguous last dimension"
+        )
     if q.shape[0] != k.shape[0] or q.shape[0] != v.shape[0]:
         raise ValueError(f"{operation} requires Q, K, and V with the same batch size")
     if k.shape[1] != v.shape[1] or k.shape[2] != v.shape[2]:
@@ -1206,7 +1210,7 @@ def _validate_mha_v4_raw_inputs(
         )
     _validate_gqa_heads(q.shape[2], k.shape[2], operation)
     if out is None:
-        return torch.empty_like(q, dtype=torch.bfloat16)
+        return q.new_empty(q.shape, dtype=torch.bfloat16)
     if out.shape != q.shape or out.dtype != torch.bfloat16 or out.device != q.device:
         raise ValueError("out must match Q's shape/device and have BF16 dtype")
     return out
