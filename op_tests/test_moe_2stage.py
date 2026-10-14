@@ -14,18 +14,11 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.aot.flydsl.common import override_env, run_only_env
-from aiter.fhmoe_contract import FHMOE_BUFFER_MAX_BYTES
 from aiter.fused_moe import (
-    _flydsl_route_output_nbytes,
-    _is_flydsl_stage2,
-    _stage2_runtime_uses_route_reduce,
-    cktile_moe_stage1,
-    cktile_moe_stage2,
     fused_moe,
     fused_topk,
     get_2stage_cfgs,
     get_padded_M,
-    resolve_activation_dtype,
     torch_moe_stage1,
     torch_moe_stage2,
 )
@@ -110,10 +103,8 @@ def test_fmoe(
     beta=None,
     linear_beta=None,
     kernel_bench=False,
-    disable_stage1_bias=False,
     disable_stage2_bias=False,
     ref_dtype="bf16",
-    gate_up_layout: bool | None = None,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -141,8 +132,6 @@ def test_fmoe(
     else:
         w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
         exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
-    if disable_stage1_bias:
-        exp_bias1 = None
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
     if intermediate_pad != 0:
         w2[:, :, -intermediate_pad:] = 0
@@ -290,8 +279,8 @@ def test_fmoe(
         qType == aiter.QuantType.per_1x32
         and reference_aq_dtype == dtypes.bf16
         and WQDType == dtypes.fp4x2
-        and actType in (aiter.ActivationType.Situv2, aiter.ActivationType.Relu2)
-    ):  # a16w4 SiTUv2 / Relu2: no per-expert bias supported by these kernels.
+        and actType == aiter.ActivationType.Situv2
+    ):  # a16w4 SiTUv2: served by the ported FlyDSL kernel (no per-expert bias).
         # Key on reference_aq_dtype (runtime dispatch), not the declared AQDType:
         # a SiTUv2 case declared a8w4/a4w4 still runs as a16w4 without the env opt-in.
         exp_bias1 = exp_bias2 = None
@@ -355,7 +344,7 @@ def test_fmoe(
     ):  # a16w4 / a8w4
         # a16w4 (bf16/fp16 act) uses standard GGUU (gate_up=False), matching main;
         # a8w4 (fp8 act) keeps the gate/up-interleaved GUGU (gate_up=True).
-        _w1_gu = (AQDType == dtypes.fp8) if gate_up_layout is None else gate_up_layout
+        _w1_gu = AQDType == dtypes.fp8
         w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, _w1_gu)
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, _w1_gu)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
@@ -587,7 +576,41 @@ def test_fmoe(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
         )
 
-    return {"us": us2, "logits_diff": float(logits_diff)}
+    # Callers such as the serving MoE layer hand fused_moe their own [token,
+    # model_dim] buffer. Fill it with NaN so a path that skips zeroing it before
+    # accumulating, or writes the result elsewhere, cannot pass.
+    out_buf = torch.full_like(out2_ck, float("nan"))
+    out_ret = fused_moe(
+        input,
+        w1_qt_aiter,
+        w2_qt_aiter,
+        topk_weights,
+        topk_ids,
+        output=out_buf,
+        **_fused_moe_kwargs,
+    )
+    out_has_nan = out_buf.isnan().any().item()
+    out_err = checkAllclose(out2_ref, out_buf, msg="ck_moe_2stages output=")
+    out_logits_diff = calc_diff(out2_ref, out_buf)
+    out_failed = (
+        out_ret is not out_buf
+        or out_has_nan
+        or (out_err != 0 and out_logits_diff > 0.01)
+    )
+    out_msg = (
+        f"output= check failed: returned buf={out_ret is out_buf}, "
+        f"nan={out_has_nan}, err={out_err}, logits_diff={out_logits_diff}"
+    )
+    if strict_accuracy:
+        assert not out_failed, out_msg
+    elif out_failed:
+        logger.warning("accuracy check failed (non-strict): %s", out_msg)
+
+    return {
+        "us": us2,
+        "logits_diff": float(logits_diff),
+        "output logits_diff": float(out_logits_diff),
+    }
 
 
 l_quant = [
@@ -759,11 +782,6 @@ parser.add_argument(
     "--bm16-scale-boundary",
     action="store_true",
     help="Run only the deterministic BM16 tiled-scale boundary regression.",
-)
-parser.add_argument(
-    "--adaptive-output",
-    action="store_true",
-    help="Run only the adaptive-sort in-place output test.",
 )
 parser.add_argument(
     "--swiglu-limit",
@@ -1068,86 +1086,6 @@ def _moe_2stage_reference_workspace_gib(kwargs):
     )
 
 
-def _moe_2stage_route_workspace_skip_reason(kwargs):
-    """Return a reason when effective route-reduce exceeds 32-bit addressing."""
-    token = kwargs["token"]
-    model_dim = kwargs["model_dim"]
-    topk = kwargs["topk"]
-    q_dtype_a = resolve_activation_dtype(
-        kwargs["qType"],
-        kwargs["WQDType"],
-        activation=kwargs["actType"],
-        gate_mode=kwargs["gateMode"],
-        M=token,
-        hidden_dtype=kwargs["dtype"],
-        gfx=get_gfx(),
-    )
-    if q_dtype_a is None:
-        return None
-    is_shuffled = not (
-        kwargs["WQDType"] == dtypes.fp4x2
-        and kwargs["AQDType"] == dtypes.fp4x2
-        and not kwargs.get("preshuffle", False)
-    )
-    supports_expert_bias = (
-        kwargs["qType"] == aiter.QuantType.per_1x32
-        and kwargs["WQDType"] == dtypes.fp4x2
-        and kwargs["AQDType"] in (dtypes.bf16, dtypes.fp16, dtypes.fp8)
-        and kwargs["actType"] != aiter.ActivationType.Situv2
-    )
-    try:
-        metadata = get_2stage_cfgs(
-            get_padded_M(token),
-            model_dim,
-            kwargs["inter_dim"],
-            kwargs["E"],
-            topk,
-            kwargs["dtype"],
-            q_dtype_a,
-            kwargs["WQDType"],
-            kwargs["qType"],
-            kwargs["use_g1u1"],
-            kwargs["actType"],
-            kwargs["doweight_stage1"],
-            kwargs.get("hidden_pad", 0),
-            kwargs.get("intermediate_pad", 0),
-            is_shuffled,
-            kwargs["gateMode"],
-            situ_beta=kwargs.get("beta", 1.0),
-            situ_linear_beta=kwargs.get("linear_beta", 1.0),
-            swiglu_limit=kwargs.get("swiglu_limit"),
-            opus_weights_shuffled=is_shuffled,
-            has_stage1_bias=supports_expert_bias,
-            has_stage2_bias=(
-                supports_expert_bias and not kwargs.get("disable_stage2_bias", False)
-            ),
-        )
-    except Exception as exc:  # noqa: BLE001
-        aiter.logger.warning(
-            "moe_2stage: failed to resolve stage2 mode during preflight; "
-            "continuing to runtime validation: %s",
-            exc,
-        )
-        return None
-    if not _is_flydsl_stage2(metadata.stage2):
-        return None
-    if not _stage2_runtime_uses_route_reduce(metadata.stage2, token, model_dim):
-        return None
-    route_bytes = _flydsl_route_output_nbytes(
-        metadata.stage2,
-        token,
-        topk,
-        model_dim,
-        torch.empty((), dtype=kwargs["dtype"]).element_size(),
-    )
-    if route_bytes <= FHMOE_BUFFER_MAX_BYTES:
-        return None
-    return (
-        f"FlyDSL stage2 reduce workspace {route_bytes / (1024**3):.1f} GiB "
-        "exceeds the current 32-bit buffer-addressing limit"
-    )
-
-
 def _format_moe_2stage_case(kwargs):
     return (
         f"token={kwargs['token']}, dim=({kwargs['model_dim']},{kwargs['inter_dim']}), "
@@ -1158,10 +1096,6 @@ def _format_moe_2stage_case(kwargs):
 
 
 def _moe_2stage_skip_reason(kwargs):
-    route_workspace_reason = _moe_2stage_route_workspace_skip_reason(kwargs)
-    if route_workspace_reason is not None:
-        return route_workspace_reason
-
     # Set AITER_MOE_2STAGE_MAX_FREE_MEMORY_FRACTION=0 to run manually.
     max_free_memory_fraction = float(
         os.environ.get("AITER_MOE_2STAGE_MAX_FREE_MEMORY_FRACTION", "0.8")
@@ -1208,7 +1142,6 @@ def _iter_legacy_cases():
         wq_dtype,
         doweight_stage1,
         act_type,
-        use_g1u1=True,
         **over,
     ):
         return dict(
@@ -1223,7 +1156,7 @@ def _iter_legacy_cases():
             qType=quant_type,
             AQDType=aq_dtype,
             WQDType=wq_dtype,
-            use_g1u1=use_g1u1,
+            use_g1u1=True,
             doweight_stage1=doweight_stage1,
             strict_accuracy=False,
             check_aot_cache=False,
@@ -1249,29 +1182,22 @@ def _iter_legacy_cases():
         triple = (quant_type, aq_dtype, wq_dtype)
 
         if triple == _PER1X32_BF16_FP4:
-            bf16_fp4_acts = [
-                act_type
-                for act_type in args.act
-                if act_type in (aiter.ActivationType.Swiglu, aiter.ActivationType.Relu2)
-            ] or [aiter.ActivationType.Swiglu]
             for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
-                for act_type in bf16_fp4_acts:
-                    for m in args.tokenNum:
-                        yield _kw(
-                            dtype,
-                            m,
-                            model_dim,
-                            inter_dim,
-                            quant_type,
-                            aq_dtype,
-                            wq_dtype,
-                            doweight_stage1,
-                            act_type,
-                            use_g1u1=(act_type != aiter.ActivationType.Relu2),
-                            hidden_pad=hidden_pad,
-                            intermediate_pad=intermediate_pad,
-                            disable_stage2_bias=not stage2_bias,
-                        ), extras
+                for m in args.tokenNum:
+                    yield _kw(
+                        dtype,
+                        m,
+                        model_dim,
+                        inter_dim,
+                        quant_type,
+                        aq_dtype,
+                        wq_dtype,
+                        doweight_stage1,
+                        aiter.ActivationType.Swiglu,
+                        hidden_pad=hidden_pad,
+                        intermediate_pad=intermediate_pad,
+                        disable_stage2_bias=not stage2_bias,
+                    ), extras
         elif triple == _PER1X32_FP8_FP4:
             for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
                 for act_type in args.act:
@@ -1294,29 +1220,23 @@ def _iter_legacy_cases():
         elif triple == _PER1X32_FP4_FP4:
             for preshuffle in args.preshuffle:
                 for act_type in args.act:
-                    if act_type == aiter.ActivationType.Relu2:
-                        continue
                     for m in args.tokenNum:
-                        yield (
-                            _kw(
-                                dtype,
-                                m,
-                                model_dim,
-                                inter_dim,
-                                quant_type,
-                                aq_dtype,
-                                wq_dtype,
-                                doweight_stage1,
-                                act_type,
-                                use_g1u1=True,
-                                preshuffle=preshuffle,
-                                hidden_pad=0,
-                                intermediate_pad=0,
-                                disable_stage2_bias=not stage2_bias,
-                                **_situv2_beta_kwargs(act_type),
-                            ),
-                            extras,
-                        )
+                        yield _kw(
+                            dtype,
+                            m,
+                            model_dim,
+                            inter_dim,
+                            quant_type,
+                            aq_dtype,
+                            wq_dtype,
+                            doweight_stage1,
+                            act_type,
+                            preshuffle=preshuffle,
+                            hidden_pad=0,
+                            intermediate_pad=0,
+                            disable_stage2_bias=not stage2_bias,
+                            **_situv2_beta_kwargs(act_type),
+                        ), extras
         elif triple == _PER1X32_BF16_I4:
             for m in args.tokenNum:
                 yield _kw(
@@ -1341,23 +1261,19 @@ def _iter_legacy_cases():
                 ):
                     continue
                 for m in args.tokenNum:
-                    yield (
-                        _kw(
-                            dtype,
-                            m,
-                            model_dim,
-                            inter_dim,
-                            quant_type,
-                            aq_dtype,
-                            wq_dtype,
-                            doweight_stage1,
-                            act_type,
-                            use_g1u1=(act_type != aiter.ActivationType.Relu2),
-                            disable_stage2_bias=not stage2_bias,
-                            **_situv2_beta_kwargs(act_type),
-                        ),
-                        extras,
-                    )
+                    yield _kw(
+                        dtype,
+                        m,
+                        model_dim,
+                        inter_dim,
+                        quant_type,
+                        aq_dtype,
+                        wq_dtype,
+                        doweight_stage1,
+                        act_type,
+                        disable_stage2_bias=not stage2_bias,
+                        **_situv2_beta_kwargs(act_type),
+                    ), extras
 
 
 def test_route_workspace_token_capacity():
@@ -1527,8 +1443,13 @@ def test_output_buffer_contract():
         "a non-contiguous output",
         output=torch.empty((token, model_dim * 2), dtype=dtype)[:, ::2],
     )
-    # moe_sorting zeroes output before stage1 reads hidden_states.
+    # moe_sorting zeroes output before the stages read their inputs.
     expect_raise("an output overlapping hidden_states", output=hidden)
+    for name, tensor in (("w1", w1), ("w2", w2)):
+        expect_raise(
+            f"an output overlapping {name}",
+            output=tensor.view(-1)[: token * model_dim].view(token, model_dim),
+        )
 
     # Disjoint slices of one pool are the symmetric-buffer case, and stay legal.
     pool = torch.zeros((2 * token, model_dim), dtype=dtype)
@@ -1709,44 +1630,11 @@ def test_swiglu_mxfp4_untagged_layout_dispatch():
 def test_adaptive_sort_output_in_place():
     """The a4w4 adaptive aux sort accumulates straight into the caller's output.
 
-    Kimi-K3 A4W4 TP=8 decode. The output buffer arrives dirty (NaN), must be
-    zeroed and written in place with no trailing copy, and must match the result
-    fused_moe returns without an output buffer.
+    Kimi-K3 A4W4 TP=8. test_fmoe hands fused_moe a NaN-filled output buffer and
+    checks it against the torch reference; here we also check that the buffer
+    reached the adaptive sort as its atomic moe_buf and was never copied into.
     """
-    if get_gfx() != "gfx950":
-        aiter.logger.info("skip adaptive-sort in-place output test on %s", get_gfx())
-        return
     fm = aiter.fused_moe
-    torch.manual_seed(0)
-    E, topk, model_dim, inter_dim = 896, 16, 3584, 384
-    dtype = dtypes.bf16
-    torch_quant = aiter.get_torch_quant(aiter.QuantType.per_1x32)
-
-    def prep(w):
-        q, scale = torch_quant(w, quant_dtype=dtypes.fp4x2)
-        q = q.view(*w.shape[:-1], w.shape[-1] // 2)
-        scale = scale.view(*w.shape[:-1], w.shape[-1] // 32)
-        rows = scale.shape[0] * scale.shape[1]
-        return (
-            shuffle_weight(q.view(dtypes.fp4x2), (16, 16)),
-            fp4_utils.e8m0_shuffle(scale.view(rows, -1)).view(*scale.shape[:2], -1),
-        )
-
-    w1, w1_scale = prep(torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) / 10)
-    w2, w2_scale = prep(torch.randn((E, model_dim, inter_dim), dtype=dtype) / 10)
-    kwargs = {
-        "w1_scale": w1_scale,
-        "w2_scale": w2_scale,
-        "quant_type": aiter.QuantType.per_1x32,
-        "activation": aiter.ActivationType.Situv2,
-        "quant_dtype_a": dtypes.fp4x2,
-    }
-
-    # Atomic bf16 accumulation alone moves fused_moe by up to ~2e-5 run to run.
-    def calc_diff(x, y):
-        x, y = x.double(), y.double()
-        return float(1 - 2 * (x * y).sum() / (x * x + y * y).sum())
-
     real_adaptive = fm._adaptive_moe_sort
     real_return = fm._return_output
     adaptive_calls, copies = [], []
@@ -1760,32 +1648,48 @@ def test_adaptive_sort_output_in_place():
             copies.append(1)
         return real_return(ret, output)
 
+    # Decode batches; their tuned BM=16 configs take the adaptive aux sort.
+    rows = []
+    torch.manual_seed(0)
     try:
         fm._adaptive_moe_sort = tracking_adaptive
         fm._return_output = tracking_return
-        for token in (1, 4):
-            hidden = torch.randn((token, model_dim), dtype=dtype) / 10
-            gating = torch.randn((token, E), dtype=dtype)
-            topk_weights, topk_ids = fused_topk(hidden, gating, topk, True)
-            args = (hidden, w1, w2, topk_weights, topk_ids)
-            ref = fused_moe(*args, **kwargs)
-
-            adaptive_calls.clear()
-            copies.clear()
-            buf = torch.full((token, model_dim), float("nan"), dtype=dtype)
-            out = fused_moe(*args, output=buf, **kwargs)
-            torch.cuda.synchronize()
-            assert adaptive_calls == [
-                True
-            ], f"token={token}: adaptive sort calls {adaptive_calls}"
-            assert out is buf and not copies, f"token={token}: output was copied"
-            assert not buf.isnan().any(), f"token={token}: output not zeroed"
-            diff = calc_diff(ref, buf)
-            assert diff < 1e-4, f"token={token}: in-place vs returned diff {diff}"
+        with override_env("AITER_SITUV2_A8W4", None), override_env(
+            "AITER_SITUV2_A4W4", "1"
+        ):
+            for token in (1, 4):
+                adaptive_calls.clear()
+                copies.clear()
+                rows.append(
+                    test_fmoe(
+                        dtype=dtypes.bf16,
+                        token=token,
+                        model_dim=3584,
+                        inter_dim=384,
+                        E=896,
+                        topk=16,
+                        actType=aiter.ActivationType.Situv2,
+                        gateMode=GateMode.SEPARATED.value,
+                        qType=aiter.QuantType.per_1x32,
+                        AQDType=dtypes.fp4x2,
+                        WQDType=dtypes.fp4x2,
+                        use_g1u1=True,
+                        check_aot_cache=False,
+                    )
+                )
+                assert (
+                    True in adaptive_calls
+                ), f"token={token}: output never reached the adaptive sort"
+                assert not copies, f"token={token}: output was copied into"
+                gc.collect()
+                torch.cuda.empty_cache()
     finally:
         fm._adaptive_moe_sort = real_adaptive
         fm._return_output = real_return
-    aiter.logger.info("moe_2stage: adaptive-sort in-place output passed")
+    aiter.logger.info(
+        "moe_2stage adaptive-sort in-place output summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1803,13 +1707,17 @@ _case_iters = []
 test_route_workspace_token_capacity()
 if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
-elif args.adaptive_output:
-    test_adaptive_sort_output_in_place()
 else:
     test_output_buffer_contract()
     test_swiglu_mxfp4_nonsplit_nobias_dispatch()
     test_swiglu_mxfp4_untagged_layout_dispatch()
-    test_adaptive_sort_output_in_place()
+    if get_gfx() == "gfx950":
+        test_adaptive_sort_output_in_place()
+    else:
+        aiter.logger.warning(
+            "%s: skipping adaptive-sort in-place output test (a4w4 is gfx950-only)",
+            get_gfx(),
+        )
     # Skip unrelated tuned-CSV validation for an explicit CLI quant sweep.
     if not args.no_flydsl_csv and args.quant is None:
         _case_iters.append(

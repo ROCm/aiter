@@ -405,18 +405,22 @@ def _validate_output_buffer_metadata(output, shape, dtype, device):
         )
 
 
-def _validate_output_buffer_no_overlap(output, hidden_states):
+def _validate_output_buffer_no_overlap(output, **inputs):
     if output is None:
         return
-    # Accumulate mode zeroes the output rows before stage1 reads hidden_states.
-    if (
-        output.data_ptr() < hidden_states.data_ptr() + hidden_states.nbytes
-        and hidden_states.data_ptr() < output.data_ptr() + output.nbytes
-    ):
-        raise RuntimeError(
-            "output overlaps hidden_states, which moe_sorting zeroes before stage1 "
-            "reads it"
-        )
+    # Accumulate mode zeroes the output rows at sort time, before the stages read
+    # any input, and atomic GEMM2 then writes into them while still reading.
+    for name, tensor in inputs.items():
+        if tensor is None:
+            continue
+        if (
+            output.data_ptr() < tensor.data_ptr() + tensor.nbytes
+            and tensor.data_ptr() < output.data_ptr() + output.nbytes
+        ):
+            raise RuntimeError(
+                f"output overlaps {name}, which moe_sorting zeroes before the MoE "
+                "stages read it"
+            )
 
 
 def _return_output(ret, output):
@@ -1126,8 +1130,8 @@ def fused_moe(
     shared_expert_id: int = -1,
     stage2_scatter: Stage2ScatterContext | None = None,
     # Optional [M, model_dim] destination for the result, to save the caller a
-    # copy. Must be contiguous, match shape/dtype/device and not overlap
-    # hidden_states, or the call raises; when given it is what gets returned.
+    # copy. Must be contiguous, match shape/dtype/device and not overlap any
+    # input tensor, or the call raises; when given it is what gets returned.
     output: torch.Tensor | None = None,
     quant_type_a: QuantType | None = None,
     quant_dtype_a: torch.dtype | None = None,
@@ -1510,7 +1514,22 @@ def _fused_moe_impl(
     _validate_output_buffer_metadata(
         output, (M, model_dim), dtype, hidden_states.device
     )
-    _validate_output_buffer_no_overlap(output, hidden_states)
+    _validate_output_buffer_no_overlap(
+        output,
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weight=topk_weight,
+        topk_ids=topk_ids,
+        expert_mask=expert_mask,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        num_local_tokens=num_local_tokens,
+        bias1=bias1,
+        bias2=bias2,
+    )
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     q_dtype_a = resolve_activation_dtype(
