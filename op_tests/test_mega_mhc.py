@@ -7,6 +7,7 @@ Use --check-only to check those shapes and backends without benchmarking.
 """
 
 import argparse
+import copy
 import itertools
 import math
 from functools import cache
@@ -21,7 +22,7 @@ from aiter.ops.mega_mhc import (
     mega_mhc_shuffle_fn,
     prepare_mega_mhc,
 )
-from aiter.test_common import benchmark, run_perftest
+from aiter.test_common import benchmark, device_memory_profiling, run_perftest
 
 # rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult, sinkhorn_repeat
 ARGS = (1e-6, 1e-6, 1e-6, 2.0, 20)
@@ -225,6 +226,35 @@ class _BenchmarkBackend:
         return self.backend(r, fn, scale, base, *self.scalar_args, **kw)
 
 
+def _run_rotating_perftest(caller, tensors, num_iters):
+    """Prepare and rotate inputs locally, keeping FlyDSL's first pack untimed."""
+    # Match run_perftest's automatic rotation budget using the actual tensors.
+    iter_memory, input_bytes, _, _ = device_memory_profiling(caller, *tensors)
+    device = tensors[0].device
+    properties = torch.cuda.get_device_properties(device)
+    free_memory = torch.cuda.mem_get_info(device)[0]
+    cache_bytes = min(
+        getattr(properties, "L2_cache_size", 4096 * 1024) * 64 * 128,
+        (free_memory - iter_memory + input_bytes) * 0.9,
+    )
+    num_copies = min(num_iters, max(1, math.ceil(max(cache_bytes, 0) / input_bytes)))
+    rotated = [copy.deepcopy(tensors) for _ in range(num_copies - 1)] + [tensors]
+    if caller.name == "flydsl":
+        # The original fn is warm; each new tensor needs its own first call.
+        for copied in rotated[:-1]:
+            caller(*copied)
+    # Preserve the usual two warmup calls on the original inputs.
+    for _ in range(2):
+        caller(*tensors)
+    inputs = itertools.cycle(rotated)
+    return run_perftest(
+        lambda: caller(*next(inputs)),
+        num_iters=num_iters,
+        num_warmup=0,
+        num_rotate_args=1,  # Input rotation is already handled by this helper.
+    )
+
+
 @benchmark()
 def benchmark_mega_mhc(
     m,
@@ -240,8 +270,7 @@ def benchmark_mega_mhc(
     args, kw, reference = case(m, hidden_size, mode, seed)
     result = {"status": "PASS"}
     num_bytes = benchmark_bytes(m, hidden_size, mode, out_dtype)
-    # Pass actual tensors to run_perftest so its default memory-sizing and
-    # deepcopy rotation can see all inputs and the residual output buffer.
+    # Include all inputs and the residual output buffer in rotation sizing.
     tensors = (
         *args[:4],
         kw["pre_mix"],
@@ -278,13 +307,7 @@ def benchmark_mega_mhc(
         if not check_only:
             us = float("nan")  # Empty tensors have no kernel to time.
             if m:
-                out, us = run_perftest(
-                    caller,
-                    *backend_tensors,
-                    num_iters=num_iters,
-                    # FlyDSL accepts FP32 weights and caches its pack per tensor.
-                    prepare_func=caller if name == "flydsl" else None,
-                )
+                out, us = _run_rotating_perftest(caller, backend_tensors, num_iters)
                 if not math.isfinite(us) or us <= 0:
                     raise RuntimeError(f"{name} returned an invalid GPU timing: {us}")
                 check(out, reference)
