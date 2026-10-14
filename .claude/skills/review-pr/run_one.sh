@@ -199,7 +199,20 @@ python3 "$SKILL/_apply_refutation.py" "$W/card.md" "$W/independent.txt"
 
 # 4) gates + collect (call the python directly; no thin shell wrappers)
 say "gates..."
-python3 "$SKILL/_gates.py" "$W" "$PROJ"
+# errexit is on: a bare call exits here on a red gate, and the EXIT trap then reports "exited
+# unexpectedly with no classified failure" -- while the output right above it says exactly which
+# gate went red. Classify it instead, and name the gate, so the notice is actionable: a red gate
+# is a review that was withheld on purpose, and re-running the worker usually clears it.
+rc=0; python3 "$SKILL/_gates.py" "$W" "$PROJ" | tee "$W/gates.out" || rc=${PIPESTATUS[0]}
+if [ "$rc" -ne 0 ]; then
+  # `|| true` is not optional: a pipeline that finds nothing returns non-zero under pipefail,
+  # and a command substitution that fails is a fatal assignment under errexit -- the same trap
+  # this block exists to fix. The red lines are the ones carrying `exit=`.
+  # `!seen[$2]++` because a gate can red on more than one line, and "card,card,ledger" tells a
+  # reader less than "card,ledger" does.
+  red=$(awk '/exit=/ && !seen[$2]++ {print $2}' "$W/gates.out" 2>/dev/null | paste -sd, - || true)
+  fail flow 7 "the review was withheld by the ${red:-?} gate -- the card did not meet the bar, which is usually cleared by running it again; re-comment to retry"
+fi
 say "collect..."
 python3 "$SKILL/_collect.py" "$W"
 
