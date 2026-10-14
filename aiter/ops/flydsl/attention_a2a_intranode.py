@@ -39,6 +39,81 @@ _DEFAULT_WARP_NUM_PER_BLOCK = 8
 _MAX_RAW_BUFFER_BYTES = 0xFFFFFFFF
 
 
+def _payload_size(
+    role,
+    codec,
+    return_packed,
+    quant,
+    role_numel,
+    mxfp4_k_size,
+    fp6_k_payload_size,
+    mxfp4_v_size,
+    fp6_v_payload_size,
+):
+    if return_packed:
+        if role == 1 and codec == "mxfp4":
+            return mxfp4_k_size
+        if role == 1 and codec == "mxfp6":
+            return fp6_k_payload_size
+        if role == 2 and codec == "mxfp4":
+            return mxfp4_v_size
+        if role == 2 and codec == "mxfp6_p":
+            return fp6_v_payload_size
+    return _transport_bytes(role_numel, codec) if quant else role_numel
+
+
+def _scale_size(
+    role,
+    codec,
+    per_tensor,
+    return_packed,
+    role_numel,
+    heads_local,
+    world_size,
+    block_num,
+    valid_kv_len,
+    fp6_k_scale_size,
+):
+    if per_tensor:
+        if codec == "e4m3_pc":
+            return heads_local * 128 * (1 + world_size * world_size)
+        return 1 + world_size * block_num * 4
+    if return_packed and role == 2:
+        return (
+            heads_local * mxfp6_v_tiles(valid_kv_len) * MHA_V4_MXFP6_V_SCALE_TILE_BYTES
+        )
+    if return_packed and role == 1 and codec == "mxfp6":
+        return fp6_k_scale_size
+    return role_numel // 32
+
+
+def _scale_padding_size(role, codec, role_sequence, valid_kv_len, heads_local):
+    """Consumer-owned backing slack for speculative scale gathers (packed return)."""
+    from aiter.ops.mha_v4_quant import (
+        MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
+        MHA_V4_KV_TILE_ROWS,
+        MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
+        MHA_V4_MXFP4_V_SCALE_SLACK_BYTES,
+        MHA_V4_QUERY_TILE_ROWS,
+    )
+
+    if role == 0 and codec.startswith("mxfp"):
+        rounded = (
+            (role_sequence + MHA_V4_QUERY_TILE_ROWS - 1) // MHA_V4_QUERY_TILE_ROWS
+        ) * MHA_V4_QUERY_TILE_ROWS
+        return (rounded - role_sequence) * heads_local * 4
+    if role == 1 and codec == "mxfp4":
+        rounded = (
+            (valid_kv_len + MHA_V4_KV_TILE_ROWS - 1) // MHA_V4_KV_TILE_ROWS
+        ) * MHA_V4_KV_TILE_ROWS
+        return (
+            rounded + MHA_V4_KV_SCALE_LOOKAHEAD_ROWS - valid_kv_len
+        ) * heads_local * 4 + MHA_V4_MXFP4_K_SCALE_SLACK_BYTES
+    if role == 2 and codec == "mxfp4":
+        return MHA_V4_MXFP4_V_SCALE_SLACK_BYTES
+    return 0
+
+
 def _role_format(return_packed, role):
     return "qkv"[role] if return_packed else ""
 
@@ -65,7 +140,8 @@ class AttentionA2AIntraNodeOp:
 
     Submit Q/K/V as ordered per-role launch sequences.
     Set quant to one codec for uniform Q/K/V quantization or a (Q/K, V) codec pair.
-    Native codecs use one E8M0 scale per 32 adjacent values. Raw MXFP4 payloads
+    Native codecs use one E8M0 scale per 32 adjacent values (see the table below
+    for packed return). Raw MXFP4 payloads
     contain two E2M1 values per byte, low nibble first. Raw MXFP6 payloads contain
     contiguous E2M3 six-bit codes, least-significant bits first.
     Quantized calls return locally dequantized bf16 Q/K/V by default.
@@ -90,6 +166,26 @@ class AttentionA2AIntraNodeOp:
     and requires seq_local divisible by 32; DEFAULT retains the standard ordering.
     Odd multiples of 32 publish partial maxima before the V packing launch.
     Packed INT8 does not apply Hadamard rotation. MX Q folds softmax_scale * log2(e).
+    K is quantized without mha_v4's gated K-mean centering (_k_mean). Results match
+    mha_v4() only while that gate stays off; K with a large shared component can
+    incur more quantization error here than in mha_v4().
+    Scale format per codec and mode (native = return_packed=False, packed =
+    return_packed=True):
+
+    codec    native                       packed
+    e4m3     E8M0 per 32 channel values   FP32 per tensor (Q/K/V)
+    int8     E8M0 per 32 channel values   FP32 per tensor (Q/K only)
+    mxfp8    same bytes as native e4m3    E8M0 per 32 channel values (Q/K only)
+    mxfp4    E8M0 per 32 channel values   Q/K: E8M0 per 32 channels;
+                                          V: E8M0 per channel per 32 tokens
+    mxfp6    E8M0 per 32 channel values   E8M0 per 32 channel values (Q/K only)
+    e4m3_pc  not supported                FP32 per channel (V only)
+    mxfp6_p  not supported                E8M0 per channel per 32 tokens, FP6-P
+                                          order (V only)
+
+    On gfx942 packed return is limited to (int8, int8, e4m3) and (e4m3, e4m3, e4m3).
+    AITER_A2A_FP6_FORCE_SOFTWARE=1 forces the software FP6 encoder on gfx950 (the
+    encoder gfx942 uses); it is part of the JIT cache key.
     valid_kv_len defaults to the full padded sequence. With packed output and
     token-local K/V scales, it keeps Q untrimmed and returns K/V for valid_kv_len
     tokens in ceil(valid_kv_len / 128) tiles. Tokens at or past that length are
@@ -115,6 +211,8 @@ class AttentionA2AIntraNodeOp:
         hadamard=None,
         valid_kv_len=None,
     ):
+        self._next_role = 0
+        self._role_stream = None
         self.quant = quant is not None
         if self.quant:
             if isinstance(quant, str):
@@ -196,7 +294,11 @@ class AttentionA2AIntraNodeOp:
         # Amax and payload quantization must apply identical Q/K preprocessing.
         if hadamard is None:
             hadamard = self.return_packed
-        self.hadamard = self.quant and hadamard
+        self.hadamard = (
+            self.quant
+            and hadamard
+            and not (self.return_packed and self.codecs[0] == "int8")
+        )
         if self.return_packed and not self.quant:
             raise ValueError(
                 "return_packed=True requires quant to be set (a codec or codec pair); nothing to pack from a bf16 passthrough"
@@ -317,50 +419,31 @@ class AttentionA2AIntraNodeOp:
                 1, valid_kv_len, heads_local
             )
         payload_sizes = tuple(
-            (
-                mxfp4_k_size
-                if self.return_packed and role == 1 and codec == "mxfp4"
-                else (
-                    fp6_k_payload_size
-                    if self.return_packed and role == 1 and codec == "mxfp6"
-                    else (
-                        mxfp4_v_size
-                        if self.return_packed and role == 2 and codec == "mxfp4"
-                        else (
-                            fp6_v_payload_size
-                            if self.return_packed and role == 2 and codec == "mxfp6_p"
-                            else (
-                                (
-                                    _transport_bytes(role_numels[role], codec)
-                                    if self.quant
-                                    else role_numels[role]
-                                )
-                            )
-                        )
-                    )
-                )
+            _payload_size(
+                role,
+                codec,
+                self.return_packed,
+                self.quant,
+                role_numels[role],
+                mxfp4_k_size,
+                fp6_k_payload_size,
+                mxfp4_v_size,
+                fp6_v_payload_size,
             )
             for role, codec in enumerate(self.codecs)
         )
         scale_sizes = tuple(
-            (
-                (
-                    heads_local * 128 * (1 + world_size * world_size)
-                    if codec == "e4m3_pc"
-                    else 1 + world_size * block_num * 4
-                )
-                if per_tensor
-                else (
-                    heads_local
-                    * mxfp6_v_tiles(valid_kv_len)
-                    * MHA_V4_MXFP6_V_SCALE_TILE_BYTES
-                    if self.return_packed and role == 2
-                    else (
-                        fp6_k_scale_size
-                        if self.return_packed and role == 1 and codec == "mxfp6"
-                        else role_numels[role] // 32
-                    )
-                )
+            _scale_size(
+                role,
+                codec,
+                per_tensor,
+                self.return_packed,
+                role_numels[role],
+                heads_local,
+                world_size,
+                block_num,
+                valid_kv_len,
+                fp6_k_scale_size,
             )
             for role, (codec, per_tensor) in enumerate(
                 zip(self.codecs, v4_amax_exchange)
@@ -368,48 +451,10 @@ class AttentionA2AIntraNodeOp:
         )
         scale_storage_sizes = scale_sizes
         if self.return_packed:
-            from aiter.ops.mha_v4_quant import (
-                MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
-                MHA_V4_KV_TILE_ROWS,
-                MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
-                MHA_V4_MXFP4_V_SCALE_SLACK_BYTES,
-                MHA_V4_QUERY_TILE_ROWS,
-            )
-
             # Mirror mha_v4_quant's consumer-owned backing extent for speculative gathers.
             padding_sizes = tuple(
-                (
-                    (
-                        (
-                            (role_sequences[role] + MHA_V4_QUERY_TILE_ROWS - 1)
-                            // MHA_V4_QUERY_TILE_ROWS
-                        )
-                        * MHA_V4_QUERY_TILE_ROWS
-                        - role_sequences[role]
-                    )
-                    * heads_local
-                    * 4
-                    if role == 0 and codec.startswith("mxfp")
-                    else (
-                        (
-                            (
-                                (valid_kv_len + MHA_V4_KV_TILE_ROWS - 1)
-                                // MHA_V4_KV_TILE_ROWS
-                            )
-                            * MHA_V4_KV_TILE_ROWS
-                            + MHA_V4_KV_SCALE_LOOKAHEAD_ROWS
-                            - valid_kv_len
-                        )
-                        * heads_local
-                        * 4
-                        + MHA_V4_MXFP4_K_SCALE_SLACK_BYTES
-                        if role == 1 and codec == "mxfp4"
-                        else (
-                            MHA_V4_MXFP4_V_SCALE_SLACK_BYTES
-                            if role == 2 and codec == "mxfp4"
-                            else 0
-                        )
-                    )
+                _scale_padding_size(
+                    role, codec, role_sequences[role], valid_kv_len, heads_local
                 )
                 for role, codec in enumerate(self.codecs)
             )
@@ -535,6 +580,9 @@ class AttentionA2AIntraNodeOp:
         self.xdb_mem.zero_()
         self.xdb_flag = torch.ones(1, dtype=torch.int64, device=device)
 
+        # The MoRI barrier is host-only: peers must not publish into our flags
+        # before our zeroing has completed on the device.
+        torch.cuda.synchronize(self.device)
         ms.shmem_barrier_all()
         self.p2p_outputs_sets = tuple(
             tuple(
@@ -609,7 +657,7 @@ class AttentionA2AIntraNodeOp:
         - quantized BF16 (dequant): None for Q/K; the three BF16 outputs after V.
         - lossless BF16: None for Q/K; the three outputs after V.
         """
-        if role not in (0, 1, 2) or role != getattr(self, "_next_role", 0):
+        if role not in (0, 1, 2) or role != self._next_role:
             raise ValueError("submit Q, K, V in order without interleaving trios")
         if input.dtype != self.dtype or tuple(input.shape) != self.shape:
             raise ValueError(f"expected {self.dtype} input with shape {self.shape}")
