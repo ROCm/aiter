@@ -3938,8 +3938,7 @@ def flash_attn_varlen_func(
     # the only backend that honors descales, so always try it. Features FlyDSL
     # cannot express (soft-cap, padded cu_seqlens) never take the descale route.
     try_flydsl = not has_all_descales or (
-        ck_only_feature is None
-        and (not ENABLE_CK or _prefer_flydsl_fp8_descale(q, v))
+        ck_only_feature is None and (not ENABLE_CK or _prefer_flydsl_fp8_descale(q, v))
     )
     if try_flydsl and (len(window_size) < 3 or window_size[2] == 0):
         from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
