@@ -18,8 +18,9 @@ four blocks of a 128-wide K group; for block ``j`` the four lane groups then hol
 consecutive K. ``shuffle_scale_a8w4_gfx942`` likewise packs a column's four block scales
 into one dword. Both are one-time host relayouts of the a16w4 preshuffle.
 
-A is MXFP8 (E4M3FNUZ ``[n_tokens, K]`` in ``A8W4_K8_ORDER`` + E8M0 ``[n_tokens, K/32]``),
-quantised before the kernel (``mxfp8_quant_a8w4_gfx942``). Same sorting / cumsum / m_indices contract and the same bf16 intermediate
+A is MXFP8 E4M3FNUZ, either from aiter's ``fused_dynamic_mxfp8_quant_moe_sort``
+(``x_layout="moe_sort"``) or quantised from bf16 x inside the kernel (``x_layout="bf16"``,
+the ``_qi`` names). Same sorting / cumsum / m_indices contract and the same bf16 intermediate
 ``[sorted_size, inter_dim]`` (by sorted position) as the a16w4 port, so stage2 is unchanged.
 """
 
@@ -28,8 +29,6 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import scf
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
@@ -64,8 +63,9 @@ MX_BLOCK = 32  # E8M0 scale group == one fp8 MFMA K step
 
 
 # Byte order of one lane's 8 K values in both MFMA operands: the FP4 decode yields the
-# even elements then the odd ones, so A is stored in the same order (see
-# ``mxfp8_quant_a8w4_gfx942``) instead of interleaving W back with two more v_perm.
+# even elements then the odd ones, so A is staged in LDS in the same order (the
+# ``moe_sort`` load reorders it, the in-kernel quant writes it so) instead of
+# interleaving W back with two more v_perm.
 A8W4_K8_ORDER = (0, 2, 4, 6, 1, 3, 5, 7)
 
 
@@ -133,15 +133,13 @@ def _gemm1_body_a8w4(
     act,
     b_cache_mod,
     rocm_arch,
-    x_scale="mx",
     k_wave=1,
-    x_layout="a8w4",
+    x_layout="moe_sort",
 ):
-    _row_xs = x_scale == "row"
     # x_layout="moe_sort": x and its scales come straight from aiter's
     # fused_dynamic_mxfp8_quant_moe_sort (the a8w4 quant fused_moe already runs with the
     # sorting): x in natural K order, E8M0 scales per SORTED row in aiter's MX scale
-    # swizzle. "a8w4": mxfp8_quant_a8w4_gfx942 (A8W4_K8_ORDER, [n_tokens, K/32]).
+    # swizzle.
     _ms = x_layout == "moe_sort"
     # x_layout="bf16": x is the bf16 activation [n_tokens, K]; each K tile is quantised to
     # MXFP8 inside the kernel straight into the A LDS slot (A8W4_K8_ORDER) with the same
@@ -319,13 +317,14 @@ def _gemm1_body_a8w4(
             return byte, sc_byte
 
         def _if_then(cond, body):
-            # runtime `if` in a helper (the AST rewrite only covers the kernel body)
-            if_op = scf.IfOp(_raw(cond), [], has_else=False)
-            if len(if_op.regions[0].blocks) == 0:
-                if_op.regions[0].blocks.append(*[])
-            with ir.InsertionPoint(if_op.regions[0].blocks[0]):
-                body()
-                scf.YieldOp([])
+            # A runtime `if` in a helper: the AST rewrite covers only @flyc.kernel /
+            # @flyc.jit bodies, so the branch gets its own @flyc.jit boundary.
+            @flyc.jit
+            def _dispatch():
+                if cond:
+                    body()
+
+            _dispatch()
 
         def _a_quant_zero_pad():
             for it in range_constexpr(_q_iters):
@@ -409,30 +408,6 @@ def _gemm1_body_a8w4(
                 )
             return out
 
-    # A scales; this lane needs the rows its accumulator holds. Padding rows (token >=
-    # n_tokens) read past the resource -> 0 -> no contribution.
-    #   "mx":  e8m0 [n_tokens, K/32], applied per MFMA together with the W scale.
-    #   "row": f32 [n_tokens] (one scale per token), applied once in the epilogue.
-    xs_row_dwords = K // 128
-    xs_tiles1 = _global_i32_buffer_tiles(
-        arg_xscale,
-        fx.Int64(i32_ntok) * fx.Int64(4 if _row_xs else K // MX_BLOCK),
-        1,
-    )
-    xs_row_base = []  # [mi][i]: "mx" dword index of the row's first scale; "row" f32
-    for mi in range_constexpr(0 if (_ms or _qi) else m_repeat):
-        bases = []
-        for ii in range_constexpr(4):
-            row = bx_m + fx.Int32(mi * 16) + lane_div_16 * fx.Int32(4) + fx.Int32(ii)
-            tok = fx.Int32(_global_i32_at(arg_mind, row)) & fx.Int32(0x00FFFFFF)
-            if const_expr(_row_xs):
-                bases.append(
-                    _buffer_i32_scalar_read(xs_tiles1, tok, sw_atom).bitcast(fx.Float32)
-                )
-            else:
-                bases.append(tok * fx.Int32(xs_row_dwords))
-        xs_row_base.append(bases)
-
     # ---- gate/up column descriptors (standard GGUU layout) ------------------------
     n_tile_base = wave_n_id * fx.Int32(_n_per_wave)
     col_g_list, cols_gate, cols_up = [], [], []
@@ -499,28 +474,11 @@ def _gemm1_body_a8w4(
         return out, y0
 
     def load_x_scale(base_k):
-        """xs[mi][i] = list of TILE_K/128 dwords (4 e8m0 bytes each) for that row."""
-        if const_expr(_row_xs or _qi):
+        """moe_sort: the swizzled E8M0 scales of this lane's rows; bf16 (_qi): None, the
+        in-kernel quant keeps its block scales in LDS."""
+        if const_expr(_qi):
             return None
-        if const_expr(_ms):
-            return load_x_scale_moe_sort(base_k)
-        out = []
-        k_dw = base_k // fx.Int32(128)
-        for mi in range_constexpr(m_repeat):
-            rows = []
-            for ii in range_constexpr(4):
-                rows.append(
-                    [
-                        _buffer_i32_scalar_read(
-                            xs_tiles1,
-                            xs_row_base[mi][ii] + k_dw + fx.Int32(d),
-                            sw_atom,
-                        )
-                        for d in range_constexpr(n_k0)
-                    ]
-                )
-            out.append(rows)
-        return out
+        return load_x_scale_moe_sort(base_k)
 
     def load_tile(base_k):
         g_raw = [load_w_tile(base_k, c) for c in cols_gate]
@@ -596,26 +554,10 @@ def _gemm1_body_a8w4(
                         t_g[(b, ni, mi)] = _mfma(a_frags[mi][b], bg)
                         t_u[(b, ni, mi)] = _mfma(a_frags[mi][b], bu)
             for b in blks:
-                if const_expr(_row_xs):
-                    for ni in range_constexpr(num_acc_n):
-                        sg4 = _splat4(g_sc[ni][b])
-                        su4 = _splat4(u_sc[ni][b])
-                        for mi in range_constexpr(m_repeat):
-                            acc_gate[mi][ni] = _raw(
-                                fx.math.fma(
-                                    Vec(t_g[(b, ni, mi)]), sg4, Vec(acc_gate[mi][ni])
-                                )
-                            )
-                            acc_up[mi][ni] = _raw(
-                                fx.math.fma(
-                                    Vec(t_u[(b, ni, mi)]), su4, Vec(acc_up[mi][ni])
-                                )
-                            )
-                    continue
                 # x scales of this lane's 4 accumulator rows for block b, as one vector
                 if const_expr(_qi):
                     xs4 = [xs_q[mi][b] for mi in range_constexpr(m_repeat)]
-                elif const_expr(_ms):
+                else:
                     xs_v, y0 = x_sc
                     xs4 = []
                     for mi in range_constexpr(m_repeat):
@@ -639,21 +581,6 @@ def _gemm1_body_a8w4(
                                 fx.Float32,
                             )
                         )
-                else:
-                    xs4 = [
-                        Vec.from_elements(
-                            [
-                                _raw(
-                                    _e8m0_byte_to_f32(
-                                        x_sc[mi][ii][b // 4], fx.Int32(b % 4)
-                                    )
-                                )
-                                for ii in range_constexpr(4)
-                            ],
-                            fx.Float32,
-                        )
-                        for mi in range_constexpr(m_repeat)
-                    ]
                 for ni in range_constexpr(num_acc_n):
                     sg4 = _splat4(g_sc[ni][b])
                     su4 = _splat4(u_sc[ni][b])
@@ -764,9 +691,6 @@ def _gemm1_body_a8w4(
             for ni in range_constexpr(num_acc_n):
                 g = fx.Float32(Vec(acc_gate[mi][ni])[ii])
                 u = fx.Float32(Vec(acc_up[mi][ni])[ii])
-                if const_expr(_row_xs):
-                    g = g * xs_row_base[mi][ii]
-                    u = u * xs_row_base[mi][ii]
                 y = gate_up_act(act, [g], [u], situ)[0]
                 out_idx = sorted_row * inter_i32 + col_g_list[ni]
                 buffer_ops.buffer_store(
@@ -780,7 +704,8 @@ def _mxfp8_exponent(amax):
     With amax = (1 + f) * 2**E this is E - 7, or E - 6 when 1 + f > 1.875, i.e.
     ceil(log2(amax / 240)) computed on the float bits. Bitwise equal to aiter's
     gfx942 ``fused_dynamic_mxfp8_quant_moe_sort`` (checked incl. amax = 1.875 * 2**E,
-    zero and -0 blocks), the Triton quantiser below and the vLLM accuracy plugin.
+    zero and -0 blocks), the in-kernel quant of the ``_qi`` kernels and the vLLM
+    accuracy plugin.
     Clamped to the E8M0 range.
     """
     bits = amax.float().view(torch.int32)
@@ -789,71 +714,19 @@ def _mxfp8_exponent(amax):
 
 
 def mxfp8_quant_a8w4_gfx942_ref(x):
-    """Torch reference of :func:`mxfp8_quant_a8w4_gfx942` (same bits)."""
+    """Torch MXFP8 quantiser with the kernels' exponent rule (:func:`_mxfp8_exponent`).
+
+    bf16 ``[M, K]`` -> (E4M3FNUZ ``[M, K]`` in ``A8W4_K8_ORDER``, E8M0 ``[M, K/32]``).
+    Per-1x32 power-of-two scale with ``amax / scale <= 240``. Not aiter's
+    ``dynamic_mxfp8_quant``: that derives the scale for E4M3FN (max 448) and clips
+    ~12 % of the values when asked for E4M3FNUZ. Used by the op test's reference.
+    """
     M, K = x.shape
     xb = x.float().view(M, K // 32, 32)
     e = _mxfp8_exponent(xb.abs().amax(-1, keepdim=True))
     q = (xb * torch.exp2(-e.float())).to(torch.float8_e4m3fnuz).view(M, K // 8, 8)
     q = q[..., list(A8W4_K8_ORDER)].reshape(M, K).contiguous()
     return q, (e + 127).to(torch.uint8).view(M, K // 32).contiguous()
-
-
-try:
-    import triton
-    import triton.language as tl
-
-    @triton.jit
-    def _mxfp8_quant_a8w4_kernel(x_ptr, y_ptr, s_ptr, K, BLOCK_K: tl.constexpr):
-        # One program per row: the decode M is small and a row (K <= BLOCK_K) fits in
-        # registers. Output byte c of each 8 holds input element A8W4_K8_ORDER[c % 8].
-        row = tl.program_id(0)
-        c = tl.arange(0, BLOCK_K)
-        src = (c // 8) * 8 + (c % 4) * 2 + (c % 8) // 4
-        mask = c < K
-        x = tl.load(x_ptr + row * K + src, mask=mask, other=0.0).to(tl.float32)
-        xg = tl.reshape(x, (BLOCK_K // 32, 32))
-        amax = tl.max(tl.abs(xg), axis=1, keep_dims=True)
-        bits = amax.to(tl.int32, bitcast=True)
-        e = (
-            ((bits >> 23) & 0xFF)
-            - 127
-            - 7
-            + ((bits & 0x7FFFFF) > 0x700000).to(tl.int32)
-        )
-        e = tl.minimum(tl.maximum(e, -127), 127)
-        # 2**-e built from its exponent bits (exact; e in [-127, 127] -> 2**-e normal
-        # except at the clamp edges, where the block is ~0 anyway)
-        inv = ((127 - e).to(tl.int32) << 23).to(tl.float32, bitcast=True)
-        q = tl.reshape(xg * inv, (BLOCK_K,)).to(y_ptr.dtype.element_ty)
-        tl.store(y_ptr + row * K + c, q, mask=mask)
-        g = tl.arange(0, BLOCK_K // 32)
-        tl.store(
-            s_ptr + row * (K // 32) + g,
-            tl.reshape(e + 127, (BLOCK_K // 32,)).to(tl.uint8),
-            mask=g < K // 32,
-        )
-
-except ImportError:  # pragma: no cover - triton is an aiter dependency
-    _mxfp8_quant_a8w4_kernel = None
-
-
-def mxfp8_quant_a8w4_gfx942(x):
-    """bf16 ``[M, K]`` -> (E4M3FNUZ ``[M, K]`` in ``A8W4_K8_ORDER``, E8M0 ``[M, K/32]``).
-
-    Per-1x32 power-of-two scale with ``amax / scale <= 240`` (:func:`_mxfp8_exponent`).
-    One Triton launch on CUDA tensors; the torch reference elsewhere. Not aiter's
-    ``dynamic_mxfp8_quant``: that derives the scale for E4M3FN (max 448) and clips
-    ~12 % of the values when asked for E4M3FNUZ.
-    """
-    M, K = x.shape
-    assert K % 32 == 0, f"K must be a multiple of 32, got {K}"
-    if not x.is_cuda or _mxfp8_quant_a8w4_kernel is None:
-        return mxfp8_quant_a8w4_gfx942_ref(x)
-    x = x.contiguous()
-    y = torch.empty((M, K), dtype=torch.float8_e4m3fnuz, device=x.device)
-    s = torch.empty((M, K // 32), dtype=torch.uint8, device=x.device)
-    _mxfp8_quant_a8w4_kernel[(M,)](x, y, s, K, BLOCK_K=triton.next_power_of_2(K))
-    return y, s
 
 
 def shuffle_weight_a8w4_gfx942(w_a16w4_u8):
@@ -899,10 +772,9 @@ def compile_gemm1_a8w4_gfx942(
     b_cache_mod=2,
     xcd_swizzle=0,
     waves_per_eu=None,
-    x_scale="mx",
     k_wave=1,
-    x_layout="a8w4",
-    rev="r17",  # bump on kernel changes: the FlyDSL cache key hashes this factory only
+    x_layout="moe_sort",
+    rev="r18",  # bump on kernel changes: the FlyDSL cache key hashes this factory only
     rocm_arch,
 ):
     """Build the gfx942 a8w4 (MXFP8 A x MXFP4 W) fused stage1 (gate+up + act)."""
@@ -927,11 +799,7 @@ def compile_gemm1_a8w4_gfx942(
     assert BM % 16 == 0, f"BM must be a multiple of 16, got {BM}"
     assert (BM * TILE_K) % 1024 == 0, "BM*TILE_K must be a multiple of 1024"
     assert act in ("silu", "swiglu", "situv2"), f"bad act {act!r}"
-    assert x_scale in ("mx", "row"), f"x_scale must be 'mx' or 'row', got {x_scale!r}"
-    assert x_layout in ("a8w4", "moe_sort", "bf16"), f"bad x_layout {x_layout!r}"
-    assert (
-        x_layout == "a8w4" or x_scale == "mx"
-    ), "x_layout='moe_sort' carries MX scales"
+    assert x_layout in ("moe_sort", "bf16"), f"bad x_layout {x_layout!r}"
     NUM_N_BLOCKS = _INTER // TILE_N
     _a_lds_stages = 2 if (_K // k_wave // TILE_K) > 1 else 1
     lds_bytes = k_wave * _a_lds_stages * BM * TILE_K
@@ -950,7 +818,7 @@ def compile_gemm1_a8w4_gfx942(
     name_suffix = (
         f"a8w4_h{_K}_i{_INTER}_ne{NE}_bm{BM}_tn{TILE_N}_tk{TILE_K}"
         f"{_act_tag}{_bcm_tag}{_xcd_tag}{_wpe_tag}"
-        f"{'' if x_scale == 'mx' else '_xrow'}{f'_kw{k_wave}' if k_wave > 1 else ''}{'_ms' if x_layout == 'moe_sort' else ''}{'_qi' if x_layout == 'bf16' else ''}_{rev}"
+        f"{f'_kw{k_wave}' if k_wave > 1 else ''}{'_ms' if x_layout == 'moe_sort' else ''}{'_qi' if x_layout == 'bf16' else ''}_{rev}"
     )
 
     @fx.struct
@@ -1037,7 +905,6 @@ def compile_gemm1_a8w4_gfx942(
                 act=act,
                 b_cache_mod=b_cache_mod,
                 rocm_arch=rocm_arch,
-                x_scale=x_scale,
                 k_wave=k_wave,
                 x_layout=x_layout,
             )
@@ -1106,15 +973,13 @@ def flydsl_a8w4_gemm1_gfx942(
     situ_beta=1.0,
     situ_linear_beta=1.0,
     swiglu_limit=float("inf"),
-    x_scale="mx",
     k_wave=1,
-    x_layout="a8w4",
+    x_layout="moe_sort",
     stream=None,
 ):
     """gfx942 a8w4 fused stage1. ``x_layout="moe_sort"``: ``a_fp8`` / ``a_scale_u8`` are
     the outputs of aiter's ``fused_dynamic_mxfp8_quant_moe_sort`` (as in fused_moe).
-    ``x_layout="a8w4"``: ``a_fp8``: E4M3FNUZ ``[n_tokens, D_HIDDEN]``;
-    ``a_scale_u8``: E8M0 ``[n_tokens, D_HIDDEN/32]`` row-major. ``x_layout="bf16"``:
+    ``x_layout="bf16"``:
     ``a_fp8`` is the bf16 x ``[n_tokens, D_HIDDEN]``, quantised in-kernel; ``a_scale_u8``
     is unused (may be None). W1/scale: the a16w4 preshuffle relaid by
     ``shuffle_weight_a8w4_gfx942`` / ``shuffle_scale_a8w4_gfx942``.
@@ -1130,7 +995,6 @@ def flydsl_a8w4_gemm1_gfx942(
         b_cache_mod=2 if b_nt is None else b_nt,
         xcd_swizzle=xcd_swizzle,
         waves_per_eu=waves_per_eu,
-        x_scale=x_scale,
         k_wave=k_wave,
         x_layout=x_layout,
         rocm_arch=str(get_rocm_arch()),

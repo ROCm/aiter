@@ -122,9 +122,11 @@ def test_moe_a8w4_gfx942(token, model_dim, inter_dim, dtype):
 
     def moe(a8w4):
         def f():
-            # fused_moe reads the opt-in flag per call
-            if a8w4:
-                os.environ["AITER_SITUV2_A8W4"] = "1"
+            # fused_moe reads the opt-in flag per call. Set it either way, so a flag
+            # the caller already exported cannot turn the a16w4 candidate into a8w4,
+            # and put the caller's value back afterwards.
+            prev = os.environ.get("AITER_SITUV2_A8W4")
+            os.environ["AITER_SITUV2_A8W4"] = "1" if a8w4 else "0"
             try:
                 return fused_moe(
                     x,
@@ -142,7 +144,10 @@ def test_moe_a8w4_gfx942(token, model_dim, inter_dim, dtype):
                     linear_beta=LINEAR_BETA,
                 )
             finally:
-                os.environ.pop("AITER_SITUV2_A8W4", None)
+                if prev is None:
+                    os.environ.pop("AITER_SITUV2_A8W4", None)
+                else:
+                    os.environ["AITER_SITUV2_A8W4"] = prev
 
         return f
 
@@ -213,7 +218,8 @@ def main():
         "--token",
         type=int,
         nargs="*",
-        default=[1, 2, 16, 128],
+        # 1024 / 4096 reach the large-M tiles of the tuned CSV
+        default=[1, 2, 16, 128, 1024, 4096],
         help="number of tokens",
     )
     parser.add_argument(
