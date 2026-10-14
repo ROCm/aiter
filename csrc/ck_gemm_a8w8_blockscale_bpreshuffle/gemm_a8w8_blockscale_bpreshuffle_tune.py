@@ -1,18 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tune the FlyDSL single-launch blockscale bpreshuffle kernel (kernel 1).
+"""Tune the FlyDSL single-launch blockscale bpreshuffle kernel.
 
-Candidates come from the same tile/option space as the per-token kernel-1 tuner
+Candidates come from the same tile/option space as the per-token FlyDSL tuner
 (``flydsl_gemm_a8w8_bpreshuffle_common``), restricted to blockscale-legal ones
-(fp8, tile_k % 128 == 0, gfx950), including split-K values, and are benchmarked
+(fp8, tile_k % 128 == 0, gfx942/gfx950), including split-K values, and are benchmarked
 through ``flydsl_preshuffle_gemm_a8(scale_mode="blockscale")``. Candidate names
 carry the ``_smbs`` token, which the runtime dispatch and AOT parse back out.
 Every candidate is ``libtype=flydsl``.
 
 Winner rows go to ``aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv``
-(via ``AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE``). No tuned rows are
-shipped from this file; a real sweep is a separate follow-up.
+(via ``AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE``).
 """
 
 from dataclasses import replace
@@ -50,7 +49,7 @@ def run_torch_blockscale(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     """fp32 blockscale dequant reference.
 
     ``x_scale`` is fp32 ``[M, K//128]`` and ``w_scale`` is fp32
-    ``[N//128, K//128]`` -- the same layout ``gemm_a8w8_blockscale_tune.py``
+    ``[ceil(N/128), ceil(K/128)]`` -- the same layout ``gemm_a8w8_blockscale_tune.py``
     uses (verbatim dequant math, adapted to drop the untimed bias/asm-padding
     concerns that tuner also carries). Kept in fp32 throughout: never cast the
     dequantized operands to bf16 before the matmul.
@@ -104,14 +103,14 @@ def run_gemm_flydsl_blockscale(
 
 
 def generate_data_blockscale(m, n, k, seed, dtype=dtypes.bf16, device="cuda"):
-    """Random blockscale-quantized inputs, scales in the kernel-1 blockscale layout.
+    """Random blockscale-quantized inputs, scales in the FlyDSL blockscale layout.
 
     ``x_scale`` is generated ``[M, K//128]`` (the layout
     ``gemm_a8w8_blockscale_tune.py`` uses for its torch-reference dequant) and
     then transposed to ``[K//128, M]`` -- the layout
     ``flydsl_preshuffle_gemm_a8(..., scale_mode="blockscale")`` requires.
-    ``w_scale`` needs no transform: ``[N//128, K//128]`` is already what both
-    sides expect.
+    ``w_scale`` needs no transform: ``[ceil(N/128), ceil(K/128)]`` is already
+    what both sides expect.
     """
     torch.manual_seed(seed)
     block_n, block_k = BLOCK_SHAPE
@@ -137,10 +136,9 @@ def generate_data_blockscale(m, n, k, seed, dtype=dtypes.bf16, device="cuda"):
     }
 
 
-# Small built-in decode-shape smoke list -- for a quick
-# ``python3 gemm_a8w8_blockscale_bpreshuffle_tune.py`` sanity sweep only. Both
-# shapes satisfy the blockscale K%128==0 / N%128==0 constraint. Do NOT grow
-# this into a real tuning shape list here; real tuning is a separate effort.
+# Built-in decode shapes used when the untuned CSV is empty, for a quick
+# ``python3 gemm_a8w8_blockscale_bpreshuffle_tune.py`` sweep. Both shapes
+# satisfy the blockscale K%128==0 / N%128==0 constraint.
 SMOKE_SHAPES = [
     (1, 2048, 7168),
     (4, 4096, 7168),
@@ -156,7 +154,59 @@ class GemmA8W8BlockScaleBpreShuffleTuner(GemmCommonTuner):
     }
 
     def _setup_specific_arguments(self):
-        """No extra flags: single pipeline/libtype."""
+        # pretune.py always passes --libtype; this tuner only has FlyDSL
+        # candidates, so "all" and "flydsl" are the same sweep.
+        self.parser.add_argument(
+            "--libtype",
+            type=str,
+            default="all",
+            choices=["all", "flydsl"],
+            required=False,
+            help="Kernel family to tune: 'all' or 'flydsl' (the only family here).",
+        )
+
+    def run_config(self, args):
+        from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_bpreshuffle
+        from aiter.test_common import checkAllclose, run_perftest
+
+        untunedf = self.untunedf
+        run_kwargs = {"num_warmup": args.warmup, "num_iters": args.iters}
+        results = []
+        for i in range(len(untunedf)):
+            row = untunedf.iloc[i]
+            M, N, K = int(row["M"]), int(row["N"]), int(row["K"])
+            shape_str = f"({M}, {N}, {K})"
+            allowed_err_ratio, allowed_err_ratio_desc = (
+                self._get_run_config_err_ratio_limit(row, args)
+            )
+            try:
+                gd = generate_data_blockscale(M, N, K, 0)
+                # Production entry point, so the persisted winner is what runs.
+                out, us = run_perftest(
+                    gemm_a8w8_blockscale_bpreshuffle,
+                    gd["x"],
+                    gd["weight_shuffle"],
+                    gd["x_scale"],
+                    gd["w_scale"],
+                    **run_kwargs,
+                )
+                ref = run_torch_blockscale(
+                    gd["x"], gd["weight"], gd["x_scale_ref"], gd["w_scale"]
+                )
+                err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
+                status = (
+                    "ok"
+                    if err_ratio <= allowed_err_ratio
+                    else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_err_ratio_desc})"
+                )
+                results.append({"shape": shape_str, "e2e_us": us, "status": status})
+            except Exception as e:  # noqa: BLE001
+                results.append(
+                    {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
+                )
+            finally:
+                torch.cuda.empty_cache()
+        return results
 
     def _clear_op_caches(self):
         from aiter.ops import gemm_op_a8w8 as _op
@@ -294,8 +344,8 @@ if __name__ == "__main__":
 
     args = tuner.parse_args()
 
-    # If the untuned CSV is empty (no run-specific shapes requested), fall back
-    # to the small built-in smoke list rather than tuning nothing.
+    # If the untuned CSV is empty, fall back to the built-in shapes rather than
+    # tuning nothing.
     if tuner.get_untuned_gemm_list(args.untune_file).empty:
         import os
         import tempfile
