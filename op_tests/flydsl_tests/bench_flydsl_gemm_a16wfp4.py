@@ -95,6 +95,7 @@ def _bench(m: int, n: int, k: int, config: DenseGemmConfig | None = None):
     }
     return row
 
+
 def _graph_us(fn, repeats: int = _GRAPH_REPEATS, samples: int = _GRAPH_SAMPLES):
     fn()
     torch.cuda.synchronize()
@@ -190,6 +191,7 @@ def _run_default(out: str | None):
             _write(out, row)
             rows.append(row)
     return rows
+
 
 def _run_graph(out: str | None):
     rows = []

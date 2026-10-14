@@ -111,8 +111,6 @@ def _select_k_wave(k: int, tile_k: int, max_k_wave: int = 4) -> int:
     return 1
 
 
-
-
 def _decode_tile_n(m: int, n: int, k_wave: int) -> int:
     """Widest N tile that still puts a workgroup on every CU."""
     align = 16 * (4 // k_wave)
@@ -169,7 +167,7 @@ _K3_MEASURED: dict[tuple[int, int], tuple[tuple[int, DenseGemmConfig], ...]] = {
     ),
     (7168, 768): (
         (64, DenseGemmConfig(32, 128, 256, 1, 2)),
-        (1024, DenseGemmConfig(64, 256, 128, 1, 2)),
+        (1024, DenseGemmConfig(64, 256, 256, 1, 1)),
     ),
     (3584, 512): (
         (64, DenseGemmConfig(32, 128, 256, 1, 2)),
@@ -202,6 +200,7 @@ def _select_gemm_config(m: int, n: int, k: int) -> DenseGemmConfig:
         k_wave=1,
         waves_per_eu=2,
     )
+
 
 def _validate_buffer_limits(m: int, n: int, k: int) -> None:
     if m * n >= _MAX_BUFFER_ELEMENTS:
@@ -309,7 +308,6 @@ def flydsl_gemm_a16wfp4(
             )
         if not out.is_contiguous():
             raise ValueError("out must be contiguous")
-
 
     launch_stream = torch.cuda.current_stream(a.device) if stream is None else stream
     if launch_stream.device != a.device:

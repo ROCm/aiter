@@ -246,14 +246,48 @@ def compute_dense_tile(traits, mma, accumulators, b_loader, b_tile, a_frags):
     """Decode one B tile to BF16 and accumulate it into the FP32 tile."""
     b_raw, b_scale = b_tile
     a_fragment = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
-    b_fragment = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
-    for ni, ku in _mma_order(traits):
-        b_fragment.store(b_loader.upconvert(b_raw[ni], ku, b_scale[ni][ku]))
-        for mi in range_constexpr(traits.m_repeats):
-            a_fragment.store(a_frags[mi][ku])
-            fx.gemm(
-                mma, accumulators[mi][ni], a_fragment, b_fragment, accumulators[mi][ni]
-            )
+    order = _mma_order(traits)
+    # The K3 short-K projection is decode-latency bound at large M. Decode the
+    # next B fragment while the current one feeds MFMA. Keep this compile-time
+    # gated: other shapes showed no repeatable gain, and two live B fragments
+    # increase VGPR pressure.
+    if const_expr(traits.n == 7168 and traits.k == 768 and traits.block_m >= 64):
+        b_fragments = [
+            fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16),
+            fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16),
+        ]
+        ni0, ku0 = order[0]
+        b_fragments[0].store(b_loader.upconvert(b_raw[ni0], ku0, b_scale[ni0][ku0]))
+        for oi, (ni, ku) in enumerate(order):
+            if oi + 1 < len(order):
+                next_ni, next_ku = order[oi + 1]
+                b_fragments[(oi + 1) % 2].store(
+                    b_loader.upconvert(
+                        b_raw[next_ni], next_ku, b_scale[next_ni][next_ku]
+                    )
+                )
+            for mi in range_constexpr(traits.m_repeats):
+                a_fragment.store(a_frags[mi][ku])
+                fx.gemm(
+                    mma,
+                    accumulators[mi][ni],
+                    a_fragment,
+                    b_fragments[oi % 2],
+                    accumulators[mi][ni],
+                )
+    else:
+        b_fragment = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
+        for ni, ku in order:
+            b_fragment.store(b_loader.upconvert(b_raw[ni], ku, b_scale[ni][ku]))
+            for mi in range_constexpr(traits.m_repeats):
+                a_fragment.store(a_frags[mi][ku])
+                fx.gemm(
+                    mma,
+                    accumulators[mi][ni],
+                    a_fragment,
+                    b_fragment,
+                    accumulators[mi][ni],
+                )
 
 
 def reduce_dense_k_wave(traits, accumulators, lds, wave, wave_n_id, lane):

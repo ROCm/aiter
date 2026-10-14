@@ -215,9 +215,7 @@ def test_prepared_storage_and_warmed_launch_do_not_materialize_bf16_weight():
 
 @_SKIP
 def test_shape_and_dtype_validation(monkeypatch):
-    monkeypatch.setattr(
-        "aiter.ops.flydsl.gemm_a16wfp4.get_cu_num", lambda: 256
-    )
+    monkeypatch.setattr("aiter.ops.flydsl.gemm_a16wfp4.get_cu_num", lambda: 256)
     assert a16wfp4_shape_supported(1024, 3584)
     assert a16wfp4_shape_supported(8448, 7168)
     assert a16wfp4_shape_supported(1536, 7168)
@@ -245,8 +243,8 @@ def test_shape_and_dtype_validation(monkeypatch):
     assert _select_gemm_config(4096, 1536, 7168) == (32, 256, 128, 1, 1)
     assert _select_gemm_config(128, 7168, 768) == (32, 128, 256, 1, 2)
     assert _select_gemm_config(512, 7168, 768) == (32, 128, 256, 1, 2)
-    assert _select_gemm_config(1024, 7168, 768) == (64, 256, 128, 1, 2)
-    assert _select_gemm_config(4096, 7168, 768) == (64, 256, 128, 1, 2)
+    assert _select_gemm_config(1024, 7168, 768) == (64, 256, 256, 1, 1)
+    assert _select_gemm_config(4096, 7168, 768) == (64, 256, 256, 1, 1)
     assert _select_gemm_config(512, 3584, 512) == (32, 128, 256, 1, 2)
     assert _select_gemm_config(1024, 3584, 512) == (32, 256, 128, 1, 1)
 
@@ -263,15 +261,11 @@ def test_shape_and_dtype_validation(monkeypatch):
         prepare_gemm_a16wfp4_weight(packed, scale[:, :-1])
 
     overflow_a, overflow_packed, overflow_scale = _make_inputs(1, 1024, 3584)
-    overflow_prepared = prepare_gemm_a16wfp4_weight(
-        overflow_packed, overflow_scale
-    )
+    overflow_prepared = prepare_gemm_a16wfp4_weight(overflow_packed, overflow_scale)
     overflow_config = DenseGemmConfig(64, 128, 1792, 1, 1)
     assert not a16wfp4_config_legal(1024, 3584, overflow_config)
     with pytest.raises(ValueError, match="illegal A16WFP4 config"):
-        flydsl_gemm_a16wfp4(
-            overflow_a, overflow_prepared, config=overflow_config
-        )
+        flydsl_gemm_a16wfp4(overflow_a, overflow_prepared, config=overflow_config)
 
     with pytest.raises(ValueError, match=r"M \* N must be less than 2\*\*31"):
         _validate_buffer_limits(262144, 8448, 7168)
