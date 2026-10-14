@@ -120,6 +120,45 @@ def test_strict_flag_raises_without_touching_the_call_site():
         raise AssertionError("strict=True should have raised")
 
 
+def test_strict_opt_in_is_per_file():
+    """The switch names the files it applies to, so adoption can be gradual.
+
+    Enabling it everywhere at once would have turned 13 of 17 shards red on a
+    recent green run, 79% of that in files whose own accuracy criterion had
+    already passed. Naming files lets each one be gated when its tolerances are
+    known to be right.
+    """
+    from aiter.test_common import _STRICT_ALLCLOSE_ENV, _strict_allclose_default
+
+    argv, env = sys.argv, os.environ.get(_STRICT_ALLCLOSE_ENV)
+    try:
+        sys.argv = ["op_tests/test_mine.py"]
+
+        for value, expected in (
+            (None, False),
+            ("", False),
+            ("0", False),
+            ("test_other.py", False),
+            ("test_mine.py", True),
+            ("test_other.py,test_mine.py", True),
+            ("op_tests/test_mine.py", True),  # a path is matched by basename
+            ("1", True),  # the blunt form, for surveying
+        ):
+            os.environ.pop(_STRICT_ALLCLOSE_ENV, None)
+            if value is not None:
+                os.environ[_STRICT_ALLCLOSE_ENV] = value
+            assert _strict_allclose_default() is expected, value
+
+        # A file not named by the switch keeps the shipped behaviour.
+        os.environ[_STRICT_ALLCLOSE_ENV] = "test_other.py"
+        assert checkAllclose(torch.ones(8) * 10.0, torch.ones(8), printLog=False) == 1.0
+    finally:
+        sys.argv = argv
+        os.environ.pop(_STRICT_ALLCLOSE_ENV, None)
+        if env is not None:
+            os.environ[_STRICT_ALLCLOSE_ENV] = env
+
+
 def test_nan_hides_under_the_mismatch_ratio():
     """A ratio gate cannot see NaN, however much of the tensor is NaN.
 

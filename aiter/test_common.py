@@ -3,6 +3,7 @@
 import copy
 import multiprocessing as mp
 import os
+import sys
 from functools import wraps
 
 import numpy as np
@@ -452,15 +453,31 @@ _STRICT_ALLCLOSE_ENV = "AITER_STRICT_ALLCLOSE"
 
 
 def _strict_allclose_default():
-    """CI switch that turns every ``checkAllclose`` verdict into a test failure.
+    """Per-file opt-in that turns ``checkAllclose`` verdicts into test failures.
 
-    ``assertAllclose`` already does this, but only for the call sites that have
-    been converted to it. This switch covers the rest without editing them, so a
-    CI job can run the existing suite as a gate rather than as a log.
+    The variable holds a comma-separated list of test file names, so a file can
+    be gated as soon as its tolerances are known to be right, without waiting
+    for the rest of the suite. ``1`` enables every file at once, which is useful
+    for surveying but not for gating: on a recent green run that would have
+    turned 13 of 17 shards red, and 79% of what it raised was in files whose own
+    accuracy criterion had already passed.
+
+    The runner invokes each test as ``python3 op_tests/test_x.py``, so argv[0]
+    names the file under test without having to inspect the stack.
 
     Read at call time rather than import time so a single test can set it.
     """
-    return os.environ.get(_STRICT_ALLCLOSE_ENV, "0") == "1"
+    value = os.environ.get(_STRICT_ALLCLOSE_ENV, "").strip()
+    if not value:
+        return False
+    if value == "1":
+        return True
+    current = os.path.basename(sys.argv[0])
+    return any(
+        current == os.path.basename(name.strip())
+        for name in value.split(",")
+        if name.strip()
+    )
 
 
 def _relmag_catastrophic(actual_max_delta, b):
