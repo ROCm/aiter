@@ -334,16 +334,20 @@ _PIPE_CASES = [
             "staged": False,
         },
     ),
-    # Wide mode must widen the head term once the head stride spans the pool.
+    # A head-major pool of 2**15 + 1 blocks puts KV head 2 past 2**31 bytes, so
+    # the host must select wide addressing and widen the head term. 288 CTAs
+    # exceed the CU count, which selects one V buffer.
     (
-        "nhd-d256-page64-hkv2-head-major-wide",
+        "nhd-d256-page64-hkv3-head-major-wide",
         {
             **_NHD_BASE,
-            "kv_heads": 2,
+            "kv_heads": 3,
             "lengths": (1, 65, 8192),
-            "max_partitions": 8,
+            "max_partitions": 32,
             "head_major": True,
+            "pool_blocks": 2**15 + 1,
             "wide": True,
+            "nhd_bufs": 1,
         },
     ),
     (
@@ -497,23 +501,24 @@ def _one_hot_kv(key, value, table, context, compute_type, tokens_per_channel=256
     )
 
 
-def _nhd_caches(key, value, table, context, head_major):
+def _nhd_caches(key, value, table, context, head_major, pool_blocks=None):
     """K and V views of one [page, token, KV head, 2 * dim] row store.
 
     Unwritten V tails hold FP8 NaN: the kernel must zero-fill them because
-    0 * NaN would poison PV.
+    0 * NaN would poison PV. Pool blocks past the table's pages stay unwritten.
     """
     pages, kv_heads, page, dim = key.shape
+    pool = pool_blocks or pages
     if head_major:
         rows = torch.empty(
-            (kv_heads, pages, page, 2 * dim), dtype=key.dtype, device=key.device
+            (kv_heads, pool, page, 2 * dim), dtype=key.dtype, device=key.device
         ).transpose(0, 1)
     else:
         rows = torch.empty(
-            (pages, kv_heads, page, 2 * dim), dtype=key.dtype, device=key.device
+            (pool, kv_heads, page, 2 * dim), dtype=key.dtype, device=key.device
         )
-    rows[..., :dim] = key
-    rows[..., dim:] = value
+    rows[:pages, ..., :dim] = key
+    rows[:pages, ..., dim:] = value
     nan = torch.tensor(0x7F, dtype=torch.uint8, device=key.device).view(key.dtype)
     for seq, length in enumerate(context.tolist()):
         if length % page:
@@ -525,6 +530,7 @@ def _check_pipe_policy(case, arch, compile_kwargs, reducer_kwargs):
     """Pin the selected specialization so a case cannot drift off its path."""
     from aiter.ops.flydsl.kernels.pa_decode.traits import PaDecodeSchedule
 
+    assert compile_kwargs[-1]["wide_kv_addressing"] == case["wide"]
     if case["pipe"]:
         # The cache key ends with (D256_PIPE, staged page ids, NHD, NHD V buffers).
         pipe, staged, _, nhd_bufs = PaDecodeSchedule.select(
@@ -623,6 +629,7 @@ def test_pa_decode(case, device, monkeypatch):
             "lengths": None,
             "layout": "packed",
             "head_major": False,
+            "pool_blocks": None,
             "budget": None,
             "table_width": None,
             "max_context": "lengths",
@@ -653,6 +660,10 @@ def test_pa_decode(case, device, monkeypatch):
             "window",
         )
     )
+    if case["pool_blocks"]:
+        pool_bytes = case["pool_blocks"] * kv_heads * page * 2 * dim
+        if torch.cuda.mem_get_info(device)[0] < pool_bytes + 2**30:
+            pytest.skip(f"needs {pool_bytes} B of free GPU memory for the KV pool")
     torch.manual_seed(0)
     query, key, value, table, context = _make_inputs(
         query_length,
@@ -696,7 +707,7 @@ def test_pa_decode(case, device, monkeypatch):
     pages = key.shape[0]
     if nhd:
         key_cache, value_cache = _nhd_caches(
-            key, value, table, context, case["head_major"]
+            key, value, table, context, case["head_major"], case["pool_blocks"]
         )
     else:
         key_cache = (
@@ -747,8 +758,6 @@ def test_pa_decode(case, device, monkeypatch):
     )
 
     def spy_tile(**kwargs):
-        if case["wide"]:
-            kwargs["wide_kv_addressing"] = True
         compile_kwargs.append(kwargs)
         return compile_tile(**kwargs)
 
