@@ -38,7 +38,12 @@ from aiter.benchmark_data_init import (
 )
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a4w4 import MXFP8_OUT_SCALE_BLOCK, unpack_mxfp8_out_scale
-from aiter.ops.shuffle import shuffle_scale_f4, shuffle_weight_f4
+from aiter.ops.shuffle import (
+    shuffle_scale,
+    shuffle_scale_f4,
+    shuffle_weight,
+    shuffle_weight_f4,
+)
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -250,7 +255,93 @@ def run_torch_nvfp4(xq, wq, xs, ws, gA, gB):
     return float(gA) * float(gB) * (x_f32 * xs) @ (w_f32 * ws).T
 
 
-def _prep_mxfp4(M, N, K, apre, data_init, scale_init, gen):
+def _gluon_support_reason(intype, outtype, apre, M, N, K):
+    if get_gfx() != "gfx1250":
+        return "Gluon comparison requires gfx1250"
+    if intype != "mxfp4" or outtype != "bf16":
+        return "Gluon comparison requires --intype mxfp4 --outtype bf16"
+    if K % 256:
+        return f"Gluon preshuffled scales require K % 256 == 0, got K={K}"
+    return _support_reason(outtype, apre, M, N, K)
+
+
+def run_gluon_mxfp4(xq, wq, xs, ws):
+    """Run the benchmark's Gluon entry on the same logical data and scales.
+
+    ASM's shuffle_scale_f4 layout differs from Gluon's shuffle_scale layout.
+    Start from the original buffers, including row-major A for --apre 1.
+    """
+    from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
+        gemm_afp4wfp4_preshuffle,
+    )
+
+    M = xq.shape[0]
+    N, K_bytes = wq.shape
+    w_shuf = shuffle_weight(wq).reshape(N // 16, K_bytes * 16)
+    if M >= 32:
+        xs_shuf = shuffle_scale(xs)
+        xs_shuf = xs_shuf.view(-1, xs_shuf.shape[1] * 32)
+    else:
+        xs_shuf = xs.contiguous()
+    ws_shuf = shuffle_scale(ws)
+    ws_shuf = ws_shuf.view(-1, ws_shuf.shape[1] * 32)
+    y = torch.empty((M, N), dtype=dtypes.bf16, device=xq.device)
+    return gemm_afp4wfp4_preshuffle(xq, w_shuf, xs_shuf, ws_shuf, dtypes.bf16, y)
+
+
+def _compare_gluon_output(out, gluon_out):
+    """Compare BF16 storage bits, counting mismatched output elements.
+
+    Float equality would miss +0/-0 differences and discard NaN payloads.
+    Numeric error is diagnostic only; every bit mismatch fails this check.
+    """
+    assert (
+        out.shape == gluon_out.shape
+    ), f"ASM/Gluon shape mismatch: {tuple(out.shape)} vs {tuple(gluon_out.shape)}"
+    assert (
+        out.dtype == gluon_out.dtype == dtypes.bf16
+    ), f"ASM/Gluon bit-match requires BF16 outputs: {out.dtype} vs {gluon_out.dtype}"
+    out_bits = out.contiguous().view(torch.int16)
+    gluon_bits = gluon_out.contiguous().view(torch.int16)
+    mismatch = out_bits != gluon_bits
+    count = int(mismatch.count_nonzero().item())
+    total = out.numel()
+    ratio = count / total
+    max_abs = (out.float() - gluon_out.float()).abs().max().item() if count else 0.0
+    result = "failed" if count else "pass"
+    log = aiter.logger.warning if count else aiter.logger.info
+    log(
+        "ASM/Gluon bit-match %s: %d/%d BF16 elements differ (%.8f%%), max_abs=%g",
+        result,
+        count,
+        total,
+        100 * ratio,
+        max_abs,
+    )
+    if count:
+        # Limit diagnostic indexing to the first bad row: materializing every
+        # mismatch coordinate can consume hundreds of MB for benchmark shapes.
+        row = int(mismatch.any(dim=1).to(torch.int8).argmax().item())
+        cols = mismatch[row].nonzero().flatten()[:5].tolist()
+        for col in cols:
+            log(
+                "  [%d, %d]: ASM=%g (0x%04x), Gluon=%g (0x%04x)",
+                row,
+                col,
+                out[row, col].item(),
+                int(out_bits[row, col].item()) & 0xFFFF,
+                gluon_out[row, col].item(),
+                int(gluon_bits[row, col].item()) & 0xFFFF,
+            )
+    return {
+        "gluon bitmatch": result,
+        "gluon mismatches": count,
+        "gluon mismatch ratio": ratio,
+        "gluon max abs": max_abs,
+    }
+
+
+def _prep_mxfp4(M, N, K, apre, data_init, scale_init, gen, check_gluon=False):
     # DATA (fp4 e2m1, packed 2/byte). data & scale are sampled *independently*.
     # constant is built inside fill_fp4 via constant=; f4gemm.cpp data_init=0
     # keeps A=0x22, B=0x33 (fixed representable e2m1).
@@ -269,6 +360,10 @@ def _prep_mxfp4(M, N, K, apre, data_init, scale_init, gen):
         "gA": None,
         "gB": None,
     }
+    if check_gluon:
+        # Preserve the exact sampled buffers; do not regenerate from a seed or
+        # reuse ASM's shuffled scales as if they had Gluon's layout.
+        inp["gluon_args"] = (xq, wq, xs, ws)
     return inp, ref
 
 
@@ -313,7 +408,12 @@ def test_gemm(
     num_iters=None,
     test_graph=False,
     num_rotate=0,
+    check_gluon=False,
 ):
+    if check_gluon:
+        reason = _gluon_support_reason(intype, outtype, apre, M, N, K)
+        if reason is not None:
+            raise ValueError(f"--check-gluon: {reason}")
     # Skip unsupported combos up front (before prep/shuffle) so they show as
     # "not support" rather than crashing on a shape assert.
     pre = "ABpreShuffle" if apre else "BpreShuffle"
@@ -348,8 +448,12 @@ def test_gemm(
     out_fp8 = outtype == "fp8"
     out_dtype = _OUT_DTYPE[outtype]
     gen = make_generator(seed)  # fixed seed -> bit-identical buffers
-    prep = _prep_mxfp4 if intype == "mxfp4" else _prep_nvfp4
-    inp, ref_f32 = prep(M, N, K, apre, data_init, scale_init, gen)
+    if intype == "mxfp4":
+        inp, ref_f32 = _prep_mxfp4(
+            M, N, K, apre, data_init, scale_init, gen, check_gluon=check_gluon
+        )
+    else:
+        inp, ref_f32 = _prep_nvfp4(M, N, K, apre, data_init, scale_init, gen)
     # Reference in the kernel's output form: block-scaled (fp8 e4m3 data + e8m0
     # scale) tuple for fp8, else bf16.
     if out_fp8:
@@ -428,6 +532,9 @@ def test_gemm(
     # the verbatim knl_name otherwise (kept in the table, see main()).
     actual_knl = knl_name if (knl_name and knl_name != "auto") else base
     ret = {"gfx": get_gfx(), "knl_name": actual_knl}
+    if check_gluon:
+        # Missing ASM kernels must not silently pass a requested comparison.
+        ret["gluon bitmatch"] = "not checked"
     # Structured algo details (f4gemm.csv columns): F4GEMM tiles are always
     # 256x256 with a 4x4 (cluster_x x cluster_y) cluster; no splitk/unroll axis.
     ret["tile"] = "256x256"
@@ -540,20 +647,18 @@ def test_gemm(
         ret[f"{name} TB/s"] = round(nbytes / us / 1e6, 2)
         ret[f"{name} err"] = err
         ret[f"{name} result"] = _verdict(err)
+        if check_gluon:
+            # Gluon compilation, shuffling, execution and comparison are outside
+            # ASM's timed region. This uses the same entry/config as the Gluon
+            # benchmark, with the UT's --data-init/--scale-init/--seed buffers.
+            gluon_out = run_gluon_mxfp4(*inp["gluon_args"])
+            ret.update(_compare_gluon_output(out, gluon_out))
         if needTrace:
             ret[f"{name} trace"] = f"./aiter_logs/gpu_id_{torch.cuda.current_device()}"
     return ret
 
 
 def main():
-    # Whole-op arch gate goes HERE: @benchmark always returns the call-args dict,
-    # so an in-fn return would still emit an args-only NaN row.
-    if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning(
-            "gemm_a4w4 (F4GEMM) unsupported on %s; skipping", get_gfx()
-        )
-        return
-
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
         description="Test/benchmark gfx1250 A4W4 (F4GEMM) via the low-level asm entry",
@@ -563,6 +668,14 @@ def main():
         choices=["func", "perf", "profile"],
         default="perf",
         help="func=acc+timing table (fewer iters), perf=acc+timing table, profile=perf+trace",
+    )
+    parser.add_argument(
+        "--check-gluon",
+        action="store_true",
+        help="compare ASM output bit-for-bit with the gfx1250 Gluon kernel on "
+        "the SAME data/scales (outside timing). Requires --intype mxfp4 "
+        "--outtype bf16 and K%%256==0; supports --apre 0 and 1. "
+        "Any mismatch or unchecked case exits nonzero AFTER the summary/JSON.",
     )
     parser.add_argument(
         "--intype",
@@ -683,6 +796,15 @@ def main():
     )
     args = parser.parse_args()
 
+    # @benchmark always returns the call-args dict, so gate before emitting rows.
+    if get_gfx() not in SUPPORTED_GFX:
+        if args.check_gluon:
+            parser.error("--check-gluon requires gfx1250")
+        aiter.logger.warning(
+            "gemm_a4w4 (F4GEMM) unsupported on %s; skipping", get_gfx()
+        )
+        return
+
     # DATA and SCALE init are paired position-wise (NOT crossed). Mode-aware
     # defaults when unset: perf/profile run constant+constant and uniform+auto;
     # func drops the constant pair (its exact-boundary values trigger e8m0/e4m3
@@ -721,6 +843,16 @@ def main():
     else:
         apre_list = [1, 0]
 
+    if args.check_gluon:
+        if not (shapes and apre_list and args.intype and args.outtype):
+            parser.error("--check-gluon requires at least one case")
+        for intype, outtype, apre, (M, N, K) in itertools.product(
+            args.intype, args.outtype, apre_list, shapes
+        ):
+            reason = _gluon_support_reason(intype, outtype, apre, M, N, K)
+            if reason is not None:
+                parser.error(f"--check-gluon: {reason} (M,N,K={M},{N},{K})")
+
     rows = [
         test_gemm(
             intype,
@@ -738,6 +870,7 @@ def main():
             num_iters=args.iters,
             test_graph=args.graph,
             num_rotate=args.rotate,
+            check_gluon=args.check_gluon,
         )
         for apre, (di, si), intype, outtype, (M, N, K) in itertools.product(
             apre_list, init_pairs, args.intype, args.outtype, shapes
@@ -763,6 +896,7 @@ def main():
             "num_iters",
             "test_graph",
             "num_rotate",
+            "check_gluon",
         ],
         errors="ignore",
     )
@@ -772,6 +906,13 @@ def main():
     )
     if args.mode == "profile":
         aiter.logger.info("profiler traces written under ./aiter_logs/")
+    if args.check_gluon:
+        failed = sum(row.get("gluon bitmatch") != "pass" for row in rows)
+        if failed:
+            aiter.logger.error(
+                "ASM/Gluon bit-match did not pass for %d case(s)", failed
+            )
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":
