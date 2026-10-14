@@ -442,6 +442,15 @@ def compile_fp8_gemm_8w(
     N_LDS_STEPS_A = LDS_BLOCK_M // 64
     N_LDS_STEPS_B = LDS_BLOCK_N // 64
     N_LDS_ROUNDS = max(N_LDS_STEPS_A, N_LDS_STEPS_B)
+    # The original partial-wait schedule was tuned for BLOCK_M=128 (one A DMA
+    # round). With two A rounds, vmcnt(4+) can rotate an LDS stage while a late
+    # DMA is still outstanding, producing sparse, nondeterministic corruption
+    # on long-K shapes. vmcnt(3) is the highest value that preserves the
+    # required stage lifetime while retaining three newest prefetches.
+    if is_int8 and N_LDS_STEPS_A == 2:
+        main_loop_vmcnt = 3
+    else:
+        main_loop_vmcnt = 2 * N_LDS_STEPS_A + N_LDS_STEPS_B
 
     # half size
     a_lds_size = LDS_BLOCK_M * BLOCK_K
@@ -579,7 +588,7 @@ def compile_fp8_gemm_8w(
             c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
 
             b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * B_K_STEP)
-            wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
+            wait_barrier(main_loop_vmcnt)
 
             c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
 

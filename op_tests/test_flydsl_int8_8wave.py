@@ -14,9 +14,9 @@ from aiter.ops.shuffle import shuffle_weight
 
 
 def test_int8_8wave_kernel_name_contract():
-    name = "flydsl_bpreshuffle_8w_128x256x128_I8_I8_B16_1x8"
+    name = "flydsl_bpreshuffle_8w_256x256x128_I8_I8_B16_1x8"
     assert parse_8wave_kernel_name(name) == {
-        "block_m": 128,
+        "block_m": 256,
         "block_n": 256,
         "block_k": 128,
         "q_dtype_a": "I8",
@@ -72,7 +72,7 @@ def test_flydsl_int8_8wave_bit_exact_runtime_tails():
         x_scale,
         w_scale,
         actual,
-        block_m=128,
+        block_m=256,
         block_n=256,
         waves_per_eu=1,
         xcd_swizzle=0,
