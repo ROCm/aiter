@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+import itertools
+
+import pandas as pd
 import pytest
 import torch
 
@@ -10,7 +14,9 @@ from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops import gemm_op_a8w8 as gemm_mod
 from aiter.ops.shuffle import shuffle_weight
-from aiter.test_common import assertAllclose
+from aiter.test_common import benchmark, checkAllclose, run_perftest
+
+torch.set_default_device("cuda")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -230,55 +236,151 @@ def _padded_k_backend(m, n, k, w_k):
     return None
 
 
+def run_torch(xq, x_scale, wq, w_scale, dtype=dtypes.bf16):
+    # Reference only: fp32 dequant GEMM over the logical K. Not timed, not in the table.
+    out = (xq.to(dtypes.fp32) * x_scale) @ (wq.to(dtypes.fp32) * w_scale).t()
+    return out.to(dtype)
+
+
+@benchmark()
+def test_gemm_a8w8_bpreshuffle_pad_k(m, n, k, w_k, dtype):
+    torch.manual_seed(0)
+    x = torch.randn((m, k), dtype=dtypes.bf16)
+    w = torch.randn((n, k), dtype=dtypes.bf16)
+    xq, x_scale = aiter.pertoken_quant(x, quant_dtype=dtypes.fp8)
+    wq, w_scale = aiter.pertoken_quant(w, quant_dtype=dtypes.fp8)
+    ref = run_torch(xq, x_scale, wq, w_scale, dtype)
+    # As in the model: the weight is preshuffled once with K padded to w_k and
+    # the logical-K activation goes straight into the dispatcher.
+    wq_padded = shuffle_weight(wq, layout=(16, 16), pad_k_to=w_k)
+    assert wq_padded.shape == (n, w_k)
+
+    candidates = {
+        "a8w8_bpreshuffle": lambda: gemm_mod.gemm_a8w8_bpreshuffle(
+            xq, wq_padded, x_scale, w_scale, dtype=dtype
+        ),
+    }
+
+    backend = _padded_k_backend(m, n, k, w_k)
+    # Split-K sums bf16 partials, so small outputs pick up ~1 ulp of the row
+    # magnitude; a misread weight is still off by O(|ref|).
+    atol = 1.0 if backend is not None and backend[1] else 1e-2
+
+    # Every backend runs at the padded K: XQ is zero-padded to w_k before launch.
+    flops = 2 * m * n * w_k
+    nbytes = (m * w_k + n * w_k) * xq.element_size() + m * n * ref.element_size()
+
+    ret = {
+        "gfx": get_gfx(),
+        "backend": (
+            "untuned"
+            if backend is None
+            else backend[0] + ("-splitk" if backend[1] else "")
+        ),
+    }
+    for name, fn in candidates.items():
+        out, us = run_perftest(fn)
+        err = checkAllclose(
+            ref.to(dtypes.fp32),
+            out.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=atol,
+            msg=f"{name}: M={m} N={n} K={k}->{w_k} ",
+            catastrophic_check=True,
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+# Shape-arg sweep fn, not a pytest test: the parametrized wrapper below calls it.
+test_gemm_a8w8_bpreshuffle_pad_k.__test__ = False
+
+
 # gfx950 rows reaching each CK/CKTile/FlyDSL path with a K-padded weight, either
 # through the logical-K row or the padded-K fallback lookup, plus untuned shapes.
+# (case id, expected (libtype, split-K?) on a 256-CU gfx950, (m, n, k, w_k))
 _PADDED_K_CASES = [
-    ("untuned", None, 37, 1280, 448, 512),
-    ("untuned-half", None, 37, 1280, 256, 512),
-    ("ck-logical-k", ("ck", False), 1, 64, 4096, 4224),
-    ("ck-splitk-logical-k", ("ck", True), 4, 64, 4096, 4224),
-    ("cktile-logical-k", ("cktile", False), 1, 1536, 128, 256),
-    ("ck-padded-k-row", ("ck", False), 32, 384, 7040, 7168),
-    ("cktile-padded-k-row", ("cktile", False), 2048, 384, 7040, 7168),
-    ("flydsl-padded-k-row", ("flydsl", False), 512, 384, 7040, 7168),
+    ("untuned", None, (37, 1280, 448, 512)),
+    ("untuned-half", None, (37, 1280, 256, 512)),
+    ("ck-logical-k", ("ck", False), (1, 64, 4096, 4224)),
+    ("ck-splitk-logical-k", ("ck", True), (4, 64, 4096, 4224)),
+    ("cktile-logical-k", ("cktile", False), (1, 1536, 128, 256)),
+    ("ck-padded-k-row", ("ck", False), (32, 384, 7040, 7168)),
+    ("cktile-padded-k-row", ("cktile", False), (2048, 384, 7040, 7168)),
+    ("flydsl-padded-k-row", ("flydsl", False), (512, 384, 7040, 7168)),
 ]
+
+# Cards the CK/CKTile bpreshuffle paths are built for. gfx1250 has no CK path,
+# and its untuned FlyDSL fallback is not covered by these shapes.
+SUPPORTED_GFX = ["gfx942", "gfx950"]
+# checkAllclose default: max fraction of mismatching elements per case.
+TOL_ERR_RATIO = 0.05
 
 
 @pytest.mark.parametrize(
-    "backend,m,n,k,w_k",
+    "backend,mnk",
     [c[1:] for c in _PADDED_K_CASES],
     ids=[c[0] for c in _PADDED_K_CASES],
 )
-def test_gemm_a8w8_bpreshuffle_padded_k_matches_reference(backend, m, n, k, w_k):
+def test_gemm_a8w8_bpreshuffle_padded_k_matches_reference(backend, mnk):
     # Dispatch keys the tuned CSV with (get_gfx(), get_cu_num()), and the
     # untuned fallback is arch-specific too, so every row only holds for a
     # full 256-CU gfx950 device, not a partitioned one.
     if (get_gfx(), get_cu_num()) != ("gfx950", 256):
         pytest.skip("rows are picked from the gfx950 cu_num=256 tuned tables")
+    m, n, k, w_k = mnk
     assert (
         _padded_k_backend(m, n, k, w_k) == backend
     ), f"M={m} N={n} K={k}->{w_k} no longer selects {backend}; pick another row"
-    torch.manual_seed(0)
-    x = torch.randn((m, k), dtype=dtypes.bf16, device="cuda")
-    w = torch.randn((n, k), dtype=dtypes.bf16, device="cuda")
-    xq, x_scale = aiter.pertoken_quant(x, quant_dtype=dtypes.fp8)
-    wq, w_scale = aiter.pertoken_quant(w, quant_dtype=dtypes.fp8)
-    ref = (xq.to(torch.float32) * x_scale) @ (wq.to(torch.float32) * w_scale).t()
-    wq_padded = shuffle_weight(wq, layout=(16, 16), pad_k_to=w_k)
-    assert wq_padded.shape == (n, w_k)
+    ret = test_gemm_a8w8_bpreshuffle_pad_k(m, n, k, w_k, dtypes.bf16)
+    assert ret["a8w8_bpreshuffle err"] <= TOL_ERR_RATIO, ret
 
-    out = gemm_mod.gemm_a8w8_bpreshuffle(
-        xq, wq_padded, x_scale, w_scale, dtype=torch.bfloat16
-    )
 
-    # Split-K sums bf16 partials, so small outputs pick up ~1 ulp of the row
-    # magnitude; a misread weight is still off by O(|ref|).
-    split_k = backend is not None and backend[1]
-    assertAllclose(
-        out,
-        ref.to(torch.bfloat16),
-        rtol=1e-2,
-        atol=1.0 if split_k else 1e-2,
-        msg=f"M={m} N={n} K={k}->{w_k}:",
-        catastrophic_check=True,
+def main():
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "gemm_a8w8_bpreshuffle padded K unsupported on %s; skipping", get_gfx()
+        )
+        return
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
     )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        default=[dtypes.d_dtypes["bf16"]],
+        help="""Output data type.
+    e.g.: -d bf16""",
+    )
+    parser.add_argument(
+        "-s",
+        "--mnk",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=[c[2] for c in _PADDED_K_CASES],
+        help="""Shape m,n,k,w_k: k is the activation K, w_k the padded weight K.
+    e.g.: -s 37,1280,448,512""",
+    )
+    args = parser.parse_args()
+
+    df = []
+    for dtype, (m, n, k, w_k) in itertools.product(args.dtype, args.mnk):
+        df.append(test_gemm_a8w8_bpreshuffle_pad_k(m, n, k, w_k, dtype))
+    df = pd.DataFrame(df)
+    aiter.logger.info(
+        "gemm_a8w8_bpreshuffle padded K summary (markdown):\n%s",
+        df.to_markdown(index=False),
+    )
+    bad = df[df["a8w8_bpreshuffle err"] > TOL_ERR_RATIO]
+    assert bad.empty, f"padded-K mismatch above {TOL_ERR_RATIO}:\n{bad}"
+
+
+if __name__ == "__main__":
+    main()
