@@ -30,6 +30,12 @@ Contract:
 * The symmetric memory uses hipIpc handles; in containers on the host network ROCm 7.1
   needs ``HSA_ENABLE_IPC_MODE_LEGACY=1``.
 
+Large batches (ag_rs, Swiglu, from ``bigm_min_tokens`` global tokens, default 8192;
+``AITER_MEGAMOE_TP_BIGM_MIN``, 0 disables) run the big-M kernel (bigm_layer: chunked, SDMA,
+per-batch tuned configs from configs/mega_moe_tp_bigm_tuned.csv) behind the same
+``forward``; it needs MORI SDMA (``AITER_MORI_PATH``). The small-batch engine then only
+holds up to ``bigm_min_tokens / world_size - 1`` local tokens.
+
 Schedules (planned in the kernel from the routing): up to 256 global tokens the dynamic
 one, from ``lb_min`` (default 256) global tokens up the large-batch (LB) one; its row tile
 is 16 * ``lb_mt`` rows (``"T1:N1,...,N"``: up to Ti tokens Ni), 16 * ``lb_mt_small`` up to
@@ -39,6 +45,7 @@ chunks per GEMM2 unit. Unset fields fall back to ``AITER_MEGAMOE_TP_LB_*``.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -99,6 +106,9 @@ class MegaMoeTPConfig:
     # the fused tail's norm: GemmaRMSNorm (scale 1 + w) or RMSNorm (w), and its eps
     tail_eps: float = 1e-6
     tail_gemma: bool = True
+    # global tokens from which forward runs the big-M kernel (None: AITER_MEGAMOE_TP_BIGM_MIN
+    # or 8192; 0: never)
+    bigm_min_tokens: int | None = None
 
 
 class MegaMoeTP:
@@ -124,6 +134,23 @@ class MegaMoeTP:
             raise ValueError(f"MegaMoeTP: unknown comm_mode {cfg.comm_mode!r}")
         situ = act == "situv2"
         self.cfg = cfg
+        bmin = cfg.bigm_min_tokens
+        if bmin is None:
+            bmin = int(os.environ.get("AITER_MEGAMOE_TP_BIGM_MIN", "8192"))
+        big_ok = (
+            cfg.comm_mode == "ag_rs"
+            and cfg.activation == ActivationType.Swiglu
+            and cfg.act_dtype == "fp4"
+        )
+        # local tokens from which forward runs the big-M kernel (0: never)
+        self.bigm_m = -(-bmin // cfg.world_size) if bmin and big_ok else 0
+        self._bigm = None
+        self._bigm_args = dict(
+            w1=w1, w1_scale=w1_scale, w2=w2, w2_scale=w2_scale, group=group, device=device
+        )
+        small_max = cfg.max_local_tokens
+        if self.bigm_m and cfg.max_local_tokens >= self.bigm_m:
+            small_max = self.bigm_m - 1
         self.engine = MegaMoeTPEngine(
             rank=cfg.rank,
             world_size=cfg.world_size,
@@ -131,7 +158,7 @@ class MegaMoeTP:
             inter_dim=cfg.inter_dim,
             experts=cfg.experts,
             topk=cfg.topk,
-            max_local_tokens=cfg.max_local_tokens,
+            max_local_tokens=small_max,
             w1=w1,
             w1_scale=w1_scale,
             w2=w2,
@@ -174,7 +201,49 @@ class MegaMoeTP:
         tail_ok): (res_in, res_out, norm_w) -> also res_out = y + res_in and every rank's
         FP8 rows (+ fp32 scales; bf16: + the bf16 rows) of the norm of res_out: returns
         (y, q, scale[, rows])."""
+        if self._big(x_local.shape[0]):
+            if bf16:
+                raise ValueError("MegaMoeTP: the big-M path has no bf16 tail rows")
+            return self.bigm().moe(
+                x_local, topk_weights, topk_ids, out=out, tail=tail, local=bool(self.engine.tn_local)
+            )
         return self.engine(x_local, topk_weights, topk_ids, out, tail=tail, bf16=bf16)
+
+    def _big(self, local_tokens: int) -> bool:
+        return bool(self.bigm_m) and local_tokens >= self.bigm_m
+
+    def bigm(self):
+        """The big-M kernel's host object (collective on first use: its SDMA window)."""
+        if self._bigm is None:
+            from .kernels.mega_moe_tp.bigm_layer import MegaMoeTPBigM
+
+            cfg, a = self.cfg, self._bigm_args
+            self._bigm = MegaMoeTPBigM(
+                hidden=cfg.model_dim,
+                inter=cfg.inter_dim,
+                experts=cfg.experts - 1,  # bigm counts the last expert apart (shared)
+                topk=cfg.topk - 1,
+                max_tokens=cfg.max_local_tokens * cfg.world_size,
+                chunks=None,
+                eps=self.engine.tn_eps,
+                gemma=self.engine.tn_gemma,
+                scale=1.0,
+                shared_w=0.0,
+                swiglu_limit=self.engine.swiglu_limit,  # (None -> the engine's default)
+                w1=a["w1"],
+                w1_scale=a["w1_scale"],
+                w2=a["w2"],
+                w2_scale=a["w2_scale"],
+                group=a["group"],
+                device=a["device"],
+                io=True,
+            )
+        b = self._bigm
+        # the tail norm's eps / Gemma flag (settable on the engine after construction)
+        eps, gemma = float(self.engine.tn_eps), bool(self.engine.tn_gemma)
+        if b.cfg[:2] != (eps, gemma):
+            b.cfg = (eps, gemma) + tuple(b.cfg[2:])
+        return b
 
     __call__ = forward
 
@@ -188,6 +257,9 @@ class MegaMoeTP:
     ) -> None:
         """Run the next forwards on another layer's weights of the same shape."""
         self.engine.set_weights(w1, w1_scale, w2, w2_scale)
+        self._bigm_args.update(w1=w1, w1_scale=w1_scale, w2=w2, w2_scale=w2_scale)
+        if self._bigm is not None:
+            self._bigm.set_weights(w1, w1_scale, w2, w2_scale)
 
     def prepare(
         self,
@@ -197,15 +269,23 @@ class MegaMoeTP:
         warmup: bool = True,
     ) -> None:
         """Collective: compile, arm and (warmup) run once and check the launch configs
-        of these local token counts (tail / tail_bf16: their fused-tail variants)."""
-        self.engine.prepare(local_tokens, tail, tail_bf16, warmup)
+        of these local token counts (tail / tail_bf16: their fused-tail variants); counts on
+        the big-M path set up its SDMA window (its kernels compile on their first forward)."""
+        ts = [local_tokens] if isinstance(local_tokens, int) else list(local_tokens)
+        small = [t for t in ts if not self._big(t)]
+        if small:
+            self.engine.prepare(small, tail, tail_bf16, warmup)
+        if len(small) < len(ts):
+            self.bigm()
 
     @property
     def max_local_tokens(self) -> int:
-        return self.engine.mmax
+        return self.cfg.max_local_tokens if self.bigm_m else self.engine.mmax
 
     def tail_ok(self, local_tokens: int) -> bool:
         """forward(tail=...) runs for this local token count."""
+        if self._big(local_tokens):
+            return True
         return self.engine.tail_ok(local_tokens)
 
     def launch_config(self, local_tokens: int) -> LaunchCfg:

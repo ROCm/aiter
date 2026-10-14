@@ -49,7 +49,6 @@ const_expr = fx.const_expr
 
 ZT = 16
 NRT_MAX = 128
-ROWF = NRT_MAX * 16
 
 
 @functools.cache
@@ -64,9 +63,11 @@ def compile_sp_rs_norm(
     gemma: bool = True,
     logit_bf16: bool = True,
     nb: int = 256,
+    nrt: int = NRT_MAX,
 ):
     NB = nb  # CTAs: one per CU
-    ERR = NB + ROWF + NRT_MAX * KS_MAX  # ctrl: sticky watchdog bit
+    ROWF = nrt * ZT  # ctrl: per-row flags (rows per rank <= nrt * ZT)
+    ERR = NB + ROWF + nrt * KS_MAX  # ctrl: sticky watchdog bit
     RT = E > 0
     EPL = E // 64
     assert not RT or (E % 64 == 0 and EPL in (2, 4) and topk <= 64)
@@ -86,6 +87,7 @@ def compile_sp_rs_norm(
         + ("" if gemma else "_rms")
         + ("_lf32" if RT and not logit_bf16 else "")
         + (f"_nb{NB}" if NB != 256 else "")
+        + (f"_nrt{nrt}" if nrt != NRT_MAX else "")
     )
 
     def i8x4_pack(f, inv):
@@ -678,6 +680,8 @@ class SpRsNorm:
         self.rank = dist.get_rank(group)
         mmax = ceildiv(int(max_tokens), self.tp)
         self.mmax = mmax
+        # router row tiles per rank (ctrl / scratch sizes): the default up to 2048 rows per rank
+        self.nrt = max(NRT_MAX, ceildiv(mmax, ZT))
         self.router = router
         E = int(router[0]) if router else 0
         topk = int(router[1]) if router else 0
@@ -689,8 +693,7 @@ class SpRsNorm:
             bad.append(f"hidden % {8 * NTH} == 0")
         if router and (E not in (128, 256) or not 0 < topk < 64):
             bad.append("router experts in (128, 256) and 0 < topk < 64")
-        if router and mmax // ZT > NRT_MAX:
-            bad.append(f"router: max_tokens / tp <= {NRT_MAX * ZT}")
+
         if bad:
             raise ValueError(f"SpRsNorm h{self.H} tp{self.tp}: need " + ", ".join(bad))
         self._xbank = self.tp * mmax * self.H
@@ -700,15 +703,15 @@ class SpRsNorm:
         self._f = arena.reserve("f", (MAX_TP * self.nb,), torch.int32)
         arena.commit()
         self.arena = arena
-        self._err = self.nb + ROWF + NRT_MAX * KS_MAX
+        self._err = self.nb + self.nrt * ZT + self.nrt * KS_MAX
         self.ctrl = torch.zeros(self._err + 1, dtype=torch.int32, device=device)
         self._zp = torch.empty(
-            (NRT_MAX * KS_MAX * ZT * max(E, 1),) if router else (1,),
+            (self.nrt * KS_MAX * ZT * max(E, 1),) if router else (1,),
             dtype=torch.float32,
             device=device,
         )
         self._fn = compile_sp_rs_norm(
-            self.H, self.tp, self.eps, gemma=bool(gemma), nb=self.nb
+            self.H, self.tp, self.eps, gemma=bool(gemma), nb=self.nb, nrt=self.nrt
         )
         self._fn_rt = (
             compile_sp_rs_norm(
@@ -722,6 +725,7 @@ class SpRsNorm:
                 gemma=bool(gemma),
                 logit_bf16=bool(logit_bf16),
                 nb=self.nb,
+                nrt=self.nrt,
             )
             if router
             else None

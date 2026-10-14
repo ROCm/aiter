@@ -15,6 +15,7 @@ from flydsl.expr.typing import T
 from ..kernels_common import ceildiv
 from ..mxfp4_gemm_common import _activation_mul_batch, _e8m0_from_amax
 from .common import (
+    LDS_NAP,
     ACQ,
     ACQ_REL,
     AUX_SC1,
@@ -224,7 +225,7 @@ def build_communication(kc: KernelCtx) -> dict:
             else:
                 cur = lds_ld_acq(L, L_CTL + C_BARGEN * 4)
                 while cur == g:
-                    rocdl.s_sleep(0)
+                    rocdl.s_sleep(LDS_NAP)
                     cur = lds_ld_acq(L, L_CTL + C_BARGEN * 4)
         rocdl.sched_barrier(0)
 

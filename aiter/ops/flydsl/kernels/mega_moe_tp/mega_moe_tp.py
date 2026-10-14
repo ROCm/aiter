@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import dataclasses
+import functools
 import os
 from dataclasses import dataclass
 
@@ -57,6 +58,18 @@ _ERR_NAMES = (
 )
 
 
+def _compile_hints():
+    """FlyDSL compile hints of the fused kernel, e.g.
+    AITER_MEGAMOE_TP_HINTS='{"maxnreg": 256, "llvm_options": {"amdgpu-mfma-vgpr-form": true}}'."""
+    import contextlib
+    import json
+
+    from flydsl.compiler.kernel_function import CompilationContext
+
+    h = os.environ.get("AITER_MEGAMOE_TP_HINTS")
+    return CompilationContext.compile_hints(json.loads(h)) if h else contextlib.nullcontext()
+
+
 @dataclass(frozen=True)
 class LaunchCfg:
     """One kernel variant: row tile 16 * mt; ll / llr: LL reduce-scatter packets / LL
@@ -73,6 +86,7 @@ class LaunchCfg:
     tn: int = 0
     pf: bool = False
     lp: int = 0
+    q: int = 0  # LB GEMM2 output split (0: the engine's lb_q)
 
 
 # --- intra-node symmetric memory (hipIpc, via quick_allreduce_int4_ipc) ---------------
@@ -246,6 +260,38 @@ class MegaMoeTPLDSError(ValueError):
     """max_local_tokens does not fit in LDS (retry with a smaller one)."""
 
 
+# per-token tuned launch configs (op_tests/op_benchmarks/flydsl/tune_mega_moe_tp.py);
+# AITER_MEGAMOE_TP_TUNED: csv path, "0" disables; AITER_MEGAMOE_TP_FORCE="mt=4,npp=2":
+# fields forced for every batch (tuning)
+_TUNED_KEY = ("gfx", "model_dim", "inter_dim", "experts", "topk", "tp", "comm_mode", "act")
+_TUNED_FIELDS = ("mt", "npp", "q", "pf", "lp", "ll", "llr")
+_TUNED_DEFAULT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "configs",
+    "mega_moe_tp_tuned.csv",
+)
+
+
+@functools.cache
+def _tuned_table(path: str) -> dict:
+    """csv -> {key: {(lb, tot): {field: int}}}"""
+    import csv
+
+    out: dict = {}
+    if not os.path.isfile(path):
+        return out
+    with open(path) as f:
+        for row in csv.DictReader(f):
+            key = tuple(str(row[k]) for k in _TUNED_KEY)
+            cfg = {k: int(row[k]) for k in _TUNED_FIELDS if row.get(k, "") != ""}
+            out.setdefault(key, {})[(int(row["lb"]), int(row["tot"]))] = cfg
+    return out
+
+
+def _forced() -> dict:
+    spec = os.environ.get("AITER_MEGAMOE_TP_FORCE", "")
+    return {k.strip(): int(v) for k, v in (x.split("=") for x in spec.split(",") if x.strip())}
+
+
 def _lb_param(value, env: str, default):
     # explicit config value, else the AITER_MEGAMOE_TP_LB_* env var, else the default
     return value if value is not None else os.environ.get(env, default)
@@ -332,6 +378,7 @@ class MegaMoeTPEngine:
         step = gemm2_group_step(model_dim, inter_dim)
         valid = [d for d in range(1, nck + 1) if nck % d == 0 and d * gpc % step == 0]
         self.lb_q = max((d for d in valid if d <= lb_q), default=min(valid))
+        self._lb_q_valid = valid
         self.ar = comm_mode == "ar"
         self.rank, self.tp = int(rank), int(world_size)
         self.H, self.I, self.E, self.K = model_dim, inter_dim, experts, topk
@@ -387,9 +434,12 @@ class MegaMoeTPEngine:
         # the fused tail's norm (compiled in; part of the launcher key)
         self.tn_eps = float(tail_eps)
         self.tn_gemma = bool(tail_gemma)
+        # tail q/scales of own rows only (the caller gathers them, e.g. on SDMA)
+        self.tn_local = False
         arena.commit()
         self.arena = arena
-        self.ctrl = torch.zeros(CTRL_INTS, dtype=torch.int32, device=self.device)
+        tl = 2 * 24 * NCTA_MAX if os.environ.get("AITER_MEGAMOE_TP_TL") == "1" else 0
+        self.ctrl = torch.zeros(CTRL_INTS + tl, dtype=torch.int32, device=self.device)
         self.routes = torch.zeros(
             (tot * topk + 1, H), dtype=torch.bfloat16, device=self.device
         )
@@ -511,29 +561,73 @@ class MegaMoeTPEngine:
         ok = npp >= 1 and 4 % (2 * npp) == 0 and (self.H // 128 * npp) % 4 == 0
         return npp if ok else 1
 
+    def _tuned(self, lb: bool, tot: int) -> dict:
+        """The tuned fields of the nearest tuned batch (same schedule, <= tot, else the
+        smallest above), then AITER_MEGAMOE_TP_FORCE."""
+        path = os.environ.get("AITER_MEGAMOE_TP_TUNED", _TUNED_DEFAULT)
+        got: dict = {}
+        if path != "0":
+            from aiter.jit.utils.chip_info import get_gfx
+
+            key = (get_gfx(), self.H, self.I, self.E, self.K, self.tp, self.mode,
+                   "fp8" if self.a8 else "fp4")
+            rows = _tuned_table(os.path.abspath(path)).get(tuple(str(k) for k in key), {})
+            ts = sorted(t for b, t in rows if b == int(lb))
+            if ts:
+                t = max((x for x in ts if x <= tot), default=ts[0])
+                got = dict(rows[(int(lb), t)])
+        got.update(_forced())
+        return got
+
+    def tuned_rows(self) -> list[dict]:
+        """The csv rows (key + fields) of the launch configs used so far (tuning)."""
+        from aiter.jit.utils.chip_info import get_gfx
+
+        out = []
+        for m, c in self._cfgs.items():
+            key = (get_gfx(), self.H, self.I, self.E, self.K, self.tp, self.mode,
+                   "fp8" if self.a8 else "fp4")
+            row = dict(zip(_TUNED_KEY, key), lb=int(c.lb), tot=m * self.tp)
+            row.update(mt=c.mt, npp=c.npp, q=c.q or (self.lb_q if c.lb else 0), pf=int(c.pf),
+                       lp=c.lp, ll=int(c.ll), llr=int(c.llr))
+            out.append(row)
+        return out
+
+    def _lb_mt_ok(self, mt: int) -> int:
+        # LB row chunks of the largest batch fit the kernel's table: grow the tile if not
+        tot = self.mmax * self.tp
+        while mt < 6 and self.E + ceildiv(tot * self.K, 16 * mt) + 1 > NCHLB_MAX:
+            mt += 1
+        return mt
+
     def config(self, m: int) -> LaunchCfg:
         cfg = self._cfgs.get(m)
         if cfg is None:
             tot = m * self.tp
             lb = bool(self.lb_min) and tot >= self.lb_min
             fp8 = not self.comm_bf16
+            tu = self._tuned(lb, tot)
             if lb:
                 mt = next((n for t, n in self.lb_mt_table if tot <= t), self.lb_mt)
                 small = tot <= self.lb_small_max
-                lp = 0 if tot <= LB_PF_MAX else 3
+                lp = tu.get("lp", 0 if tot <= LB_PF_MAX else 3)
+                q = tu.get("q", 0)
                 cfg = LaunchCfg(
-                    self._fit_mt(self.lb_mt_small if small else mt, lb=True),
-                    npp=self._fit_npp(2 if small else self.lb_npp),
+                    self._fit_mt(
+                        self._lb_mt_ok(tu.get("mt", self.lb_mt_small if small else mt)), lb=True
+                    ),
+                    npp=self._fit_npp(tu.get("npp", 2 if small else self.lb_npp)),
                     ag8=self.ar and bool(self.ag_auto) and tot >= self.ag_auto,
                     lb=True,
-                    pf=tot <= LB_PF_MAX,
+                    pf=bool(tu.get("pf", tot <= LB_PF_MAX)),
                     lp=lp if self.I // 128 % max(lp, 1) == 0 else 0,
+                    q=q if q in self._lb_q_valid else 0,
                 )
             elif tot <= self.dyn_max:
                 cfg = LaunchCfg(
-                    self._fit_mt(1 if tot <= 32 else 2 if tot <= 64 else 3),
-                    ll=tot <= 256 and fp8,
-                    llr=tot <= 128 and fp8,
+                    self._fit_mt(tu.get("mt", 1 if tot <= 32 else 2 if tot <= 64 else 3)),
+                    ll=bool(tu.get("ll", tot <= 256 and fp8)),
+                    llr=bool(tu.get("llr", tot <= 128 and fp8)),
                     ag8=self.ar and bool(self.ag_auto) and tot >= self.ag_auto,
                 )
             else:
@@ -550,7 +644,7 @@ class MegaMoeTPEngine:
         return self.ar and (self.ag_fp8 or cfg.ag8) and not self._arll(cfg)
 
     def _key(self, cfg: LaunchCfg):
-        return (cfg, self.tn_eps, self.tn_gemma) if cfg.tn else cfg
+        return (cfg, self.tn_eps, self.tn_gemma, self.tn_local) if cfg.tn else cfg
 
     def _launcher(self, cfg: LaunchCfg):
         fn = self._launchers.get(self._key(cfg))
@@ -581,10 +675,11 @@ class MegaMoeTPEngine:
                 nch=nch,
                 a8=self.a8,
                 lb=cfg.lb,
-                lbq=self.lb_q if cfg.lb else 1,
+                lbq=(cfg.q or self.lb_q) if cfg.lb else 1,
                 tn=cfg.tn,
                 tn_eps=self.tn_eps,
                 tn_gemma=self.tn_gemma,
+                tn_local=self.tn_local,
                 lbpf=cfg.pf,
                 lbp=cfg.lp,
             )
@@ -712,7 +807,8 @@ class MegaMoeTPEngine:
         fn = self._launcher(cfg)
         m = m or next(m for m, c in self._cfgs.items() if c == cfg)
         args = self._launch_args(m, cfg, self.y, None, None, None)
-        _preload_compiled(fn, *args, torch.cuda.current_stream())
+        with _compile_hints():
+            _preload_compiled(fn, *args, torch.cuda.current_stream())
         torch.cuda.synchronize(self.device)
         self.arena.barrier()
         self._armed.add(self._key(cfg))
@@ -804,8 +900,9 @@ class MegaMoeTPEngine:
             args = self._launch_args(m, cfg, y, x, ids, tw, tail)
             self._args = (key, (args, x, ids, tw))
         self._arm(cfg, m)
-        _run_compiled(
-            self._launcher(cfg), *self._args[1][0], torch.cuda.current_stream()
+        with _compile_hints():
+            _run_compiled(
+                self._launcher(cfg), *self._args[1][0], torch.cuda.current_stream()
         )
         if self.check and not torch.cuda.is_current_stream_capturing():
             self.check_errors()
