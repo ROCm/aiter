@@ -244,7 +244,8 @@ def _fp8_gfx950_reject_reason(
     It needs e4m3fn Q/K/V with per-tensor descales and a positive, finite
     softmax scale, and writes bf16. Reject anything else so it falls through rather than
     silently dropping the feature. Every tensor the kernel reads or writes,
-    including ``out`` and the varlen ``cu_seqlens``, must be on q's device.
+    including ``out`` and the varlen ``cu_seqlens``, must be on q's device, and
+    ``cu_seqlens_q/k`` must be 1-D ``[B+1]`` arrays of the same length.
     """
     if q.dtype is not torch.float8_e4m3fn:
         return f"q/k/v must be float8_e4m3fn, got q {q.dtype}"
@@ -275,6 +276,11 @@ def _fp8_gfx950_reject_reason(
         for cu in cu_seqlens
     ):
         return "cu_seqlens_q/k must be contiguous int32 tensors on q's device"
+    if cu_seqlens and (
+        any(cu.dim() != 1 or cu.numel() < 2 for cu in cu_seqlens)
+        or len({cu.numel() for cu in cu_seqlens}) != 1
+    ):
+        return "cu_seqlens_q/k must be 1-D with equal lengths and at least 2 entries"
     if any(
         s is None
         or not torch.is_tensor(s)

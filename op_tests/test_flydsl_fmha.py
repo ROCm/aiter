@@ -2191,6 +2191,94 @@ def test_public_varlen_descale_host_tensor_skips_flydsl(monkeypatch, misplaced):
     assert calls == ["ck"]
 
 
+def _fp8_mismatched_cu_inputs(case):
+    """GPU fp8 varlen q/k/v plus a cu_seqlens_q/k pair the kernel cannot index."""
+    L, H = 256, 4
+    q = torch.empty(L, H, 192, dtype=torch.float8_e4m3fn, device="cuda")
+    k = torch.empty(L, H, 192, dtype=torch.float8_e4m3fn, device="cuda")
+    v = torch.empty(L, H, 128, dtype=torch.float8_e4m3fn, device="cuda")
+    s = torch.ones(1, dtype=torch.float32, device="cuda")
+    cu_q, cu_k = {
+        "k_shorter": ([0, 128, L], [0, L]),
+        "q_shorter": ([0, L], [0, 128, L]),
+        "single_entry": ([0], [0]),
+        "two_dim": ([[0, L]], [[0, L]]),
+    }[case]
+
+    def as_cu(x):
+        return torch.tensor(x, dtype=torch.int32, device="cuda")
+
+    return (q, k, v), s, as_cu(cu_q), as_cu(cu_k)
+
+
+_MISMATCHED_CU_CASES = ["k_shorter", "q_shorter", "single_entry", "two_dim"]
+
+
+@_needs_gpu
+@pytest.mark.parametrize("case", _MISMATCHED_CU_CASES)
+def test_public_varlen_descale_mismatched_cu_seqlens_skips_flydsl(monkeypatch, case):
+    """cu_seqlens_q/k of unequal length (or not 1-D with >= 2 entries) skip FlyDSL.
+
+    The kernel derives the batch from cu_seqlens_q and would read cu_seqlens_k out
+    of bounds; the gate declines so CK rejects it with CHECK_SHAPE. The arch check
+    and both launches are stubbed, so any GPU runs it.
+    """
+    from aiter import flash_attn_varlen_func
+    from aiter.ops import mha as mha_module
+    from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
+
+    calls = []
+
+    class _CkStub:
+        @staticmethod
+        def apply(*args):
+            calls.append("ck")
+            return "ck"
+
+    monkeypatch.setattr(mha_module, "ENABLE_CK", True)
+    monkeypatch.setattr(mha_module, "FlashAttnVarlenFunc", _CkStub)
+    monkeypatch.setattr(fa, "flydsl_flash_attn_fp8_supported", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        fa,
+        "flydsl_flash_attn_fp8_func",
+        lambda *a, **kw: pytest.fail("mismatched cu_seqlens reached the FlyDSL kernel"),
+    )
+    (q, k, v), s, cu_q, cu_k = _fp8_mismatched_cu_inputs(case)
+    L = q.shape[0]
+    out = flash_attn_varlen_func(
+        q, k, v, cu_q, cu_k, L, L, causal=True, q_descale=s, k_descale=s, v_descale=s
+    )
+    assert out == "ck"
+    assert calls == ["ck"]
+
+
+@_gfx950_only
+@pytest.mark.parametrize("case", _MISMATCHED_CU_CASES)
+def test_fp8_kernel_rejects_mismatched_cu_seqlens(case):
+    """The kernel entry refuses cu_seqlens_q/k it would index out of bounds."""
+    from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
+        flydsl_flash_attn_fp8_func,
+    )
+
+    (q, k, v), s, cu_q, cu_k = _fp8_mismatched_cu_inputs(case)
+    L = q.shape[0]
+    with pytest.raises(ValueError, match="cu_seqlens"):
+        flydsl_flash_attn_fp8_func(
+            q,
+            k,
+            v,
+            causal=True,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_kv=cu_k,
+            max_seqlen_q=L,
+            max_seqlen_kv=L,
+            cross_seqlen=False,
+            q_descale=s,
+            k_descale=s,
+            v_descale=s,
+        )
+
+
 @_gfx950_only
 @pytest.mark.parametrize("misplaced", ["out", "lse", "cu_seqlens_q", "cu_seqlens_k"])
 def test_fp8_kernel_rejects_host_tensors(misplaced):

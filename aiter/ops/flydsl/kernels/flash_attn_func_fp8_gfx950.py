@@ -447,6 +447,17 @@ def flydsl_flash_attn_fp8_func(
                 f"flydsl_flash_attn_fp8_func: {name} must be a contiguous int32 tensor "
                 f"on {q.device}, got {cu.dtype} on {cu.device}"
             )
+    if varlen and (
+        cu_seqlens_q.dim() != 1
+        or cu_seqlens_kv.dim() != 1
+        or cu_seqlens_q.numel() < 2
+        or cu_seqlens_q.numel() != cu_seqlens_kv.numel()
+    ):
+        raise ValueError(
+            "flydsl_flash_attn_fp8_func: cu_seqlens_q/cu_seqlens_kv must be 1-D [B+1] "
+            f"with B >= 1 and equal lengths, got {tuple(cu_seqlens_q.shape)} and "
+            f"{tuple(cu_seqlens_kv.shape)}"
+        )
 
     if varlen:
         if q.dim() != 3:
