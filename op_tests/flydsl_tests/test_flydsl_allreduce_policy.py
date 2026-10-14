@@ -34,8 +34,8 @@ from aiter.ops.flydsl.kernels.comm.allreduce_shared import (
     Window,
 )
 from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import SUPPORTED_ATOMS
-from aiter.ops.flydsl.kernels.comm.quick_allreduce_int4 import SUPER_TILES
-from aiter.ops.flydsl.kernels.comm.quick_allreduce_int4_ring import RING_SUPER_TILES
+from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import SUPER_TILES
+from aiter.ops.flydsl.kernels.comm.quick_allreduce_ring import RING_SUPER_TILES
 from aiter.ops.flydsl.one_shot_allreduce import resolve_oneshot_max_bytes
 
 WORLDS = P.SUPPORTED_WORLDS

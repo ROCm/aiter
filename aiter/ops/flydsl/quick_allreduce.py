@@ -3,7 +3,7 @@
 
 """Host launch for gfx942/gfx950 TP∈{2,4,8} INT4/INT6 all-reduce.
 
-Public type ``QuickAllReduceInt4``, with two interchangeable schedules selected
+Public type ``FlyQuickAllReduce``, with two interchangeable schedules selected
 by ``algorithm``. Both are two-shot -- reduce-scatter then all-gather -- so
 they are named for the topology of each lap instead:
 
@@ -55,13 +55,13 @@ from .kernels.comm.allreduce_shared import (
     has_release_fence,
     select_rung,
 )
-from .kernels.comm.quick_allreduce_int4 import (
+from .kernels.comm.quick_allreduce_mesh import (
     MESH_CODECS,
     SUPER_TILES,
     clamp_grid_cap,
-    make_quick_allreduce_int4_kernel,
+    make_quick_allreduce_mesh_kernel,
 )
-from .kernels.comm.quick_allreduce_int4_ring import (
+from .kernels.comm.quick_allreduce_ring import (
     AG_CODECS,
     RING_SUPER_TILES,
     RS_CODECS,
@@ -101,7 +101,7 @@ def _build_mesh(
             f"mesh algorithm has one wire format for both laps, got "
             f"rs_codec={rs_codec!r} != ag_codec={ag_codec!r}"
         )
-    return make_quick_allreduce_int4_kernel(
+    return make_quick_allreduce_mesh_kernel(
         world_size=world_size,
         super_tile=super_tile,
         grid=grid,
@@ -178,7 +178,7 @@ def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
 
 
 def batches_publishes(inbox_memory: str, algorithm: str, link: str) -> bool:
-    """Whether ``QuickAllReduceInt4`` batches publishes into super-tiles.
+    """Whether ``FlyQuickAllReduce`` batches publishes into super-tiles.
 
     Always with a release fence, where every publish is an L2 writeback. The
     PCIe ring batches without one too: each of its ``2(N-1)`` hops ends in a
@@ -187,8 +187,8 @@ def batches_publishes(inbox_memory: str, algorithm: str, link: str) -> bool:
     return has_release_fence(inbox_memory) or (algorithm == "ring" and link == "pcie")
 
 
-class QuickAllReduceInt4:
-    """IPC inbox + flag buffer and launch wrapper for ``quick_allreduce_int4``.
+class FlyQuickAllReduce:
+    """IPC inbox + flag buffer and launch wrapper for ``quick_allreduce_mesh``.
 
     Requires a non-NCCL, single-node process group for IPC metadata exchange.
 
@@ -250,9 +250,9 @@ class QuickAllReduceInt4:
         link = resolve_link(link)
         rs_codec, ag_codec = _resolve_codecs(algo, int(world_size), rs_codec, ag_codec)
         _validate_ipc_process_group(
-            group, rank=int(rank), world_size=world_size, owner="QuickAllReduceInt4"
+            group, rank=int(rank), world_size=world_size, owner="FlyQuickAllReduce"
         )
-        arch = require_arch(owner="QuickAllReduceInt4")
+        arch = require_arch(owner="FlyQuickAllReduce")
         if ladder is None:
             ladder = algo.st_ladder(world_size=world_size, link=link, arch=arch)
         if not ladder:
@@ -260,7 +260,7 @@ class QuickAllReduceInt4:
         inbox_flags, resolved_inbox = _resolve_inbox_flags(
             inbox_memory, world_size, link
         )
-        self._device_index = _cuda_index(device, owner="QuickAllReduceInt4")
+        self._device_index = _cuda_index(device, owner="FlyQuickAllReduce")
         self.group = group
         self.device = torch.device("cuda", self._device_index)
         self.rank = int(rank)
@@ -533,11 +533,11 @@ class QuickAllReduceInt4:
         ``stream=None`` uses the current PyTorch stream on this device.
         """
         live_bytes = check_payload(
-            inp, out, device_index=self._device_index, owner="QuickAllReduceInt4"
+            inp, out, device_index=self._device_index, owner="FlyQuickAllReduce"
         )
         if not self.is_beneficial(live_bytes):
             raise ValueError(
-                f"QuickAllReduceInt4.allreduce got a {live_bytes} B payload, "
+                f"FlyQuickAllReduce.allreduce got a {live_bytes} B payload, "
                 f"below the {self.min_bytes} B floor: at decode sizes this "
                 "kernel saves a few microseconds on a collective that is not "
                 "the bottleneck, and charges ~36 dB of SQNR for them. Route "

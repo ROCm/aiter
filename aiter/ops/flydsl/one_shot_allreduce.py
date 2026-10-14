@@ -263,7 +263,7 @@ class OneShotAllReduce:
                 f"{self.max_bytes} B ceiling: this kernel pushes the whole "
                 "payload to every peer, so its wire volume is (N-1)x the "
                 "message where a mesh schedule moves 2(N-1)/N. Route large messages "
-                "to QuickAllReduceInt4 or cross_device_reduce, or pass max_bytes to "
+                "to FlyQuickAllReduce or cross_device_reduce, or pass max_bytes to "
                 "override."
             )
         self._launch(inp, out, stream, live_bytes=live_bytes)

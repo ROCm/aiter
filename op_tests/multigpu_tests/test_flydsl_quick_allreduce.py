@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Runtime correctness and timing for FlyDSL quick all-reduce (``QuickAllReduceInt4``).
+"""Runtime correctness and timing for FlyDSL quick all-reduce (``FlyQuickAllReduce``).
 
 ``--scenario`` selects what a run does: ``verify`` (the default) checks the
 kernels, and ``bench`` compares them with aiter's HIP quick all-reduce.
@@ -73,7 +73,7 @@ floor.
 
 The kernels see a flat payload, so the derived shapes use one width, 4096,
 whose rows land exactly on every policy and ladder boundary.
-QuickAllReduceInt4 runs on gfx942/gfx950 at TP in {2, 4, 8}; ``main()`` fails on
+FlyQuickAllReduce runs on gfx942/gfx950 at TP in {2, 4, 8}; ``main()`` fails on
 an unsupported arch, and on a world size that is named with ``--tp`` but has
 fewer GPUs than ranks. The default sweep skips the world sizes that do not fit,
 and fails if none does.
@@ -130,8 +130,8 @@ from aiter.ops.flydsl.kernels.comm.allreduce_shared import (
     SUPPORTED_WORLDS,
     TwoShotRung,
 )
-from aiter.ops.flydsl.kernels.comm.quick_allreduce_int4 import clamp_grid_cap
-from aiter.ops.flydsl.quick_allreduce_int4 import (
+from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import clamp_grid_cap
+from aiter.ops.flydsl.quick_allreduce import (
     _resolve_inbox_flags,
     batches_publishes,
 )
@@ -367,7 +367,7 @@ def _expected_cfg(
     grid_by_cfg: dict[tuple, int],
     block: int | None = None,
 ) -> tuple[int, int]:
-    """Mirror of ``QuickAllReduceInt4._pick_cfg``: the ``(super_tile, block)``
+    """Mirror of ``FlyQuickAllReduce._pick_cfg``: the ``(super_tile, block)``
     kernel an engine with no super-tile pinned runs *nbytes* on. *block* is the
     override the engine was built with, ``None`` for the rung's own.
 
@@ -692,12 +692,12 @@ def _test_ladder(
 
 
 def _engine(rank: int, tp: int, gloo, device, engine_kw: dict):
-    """A ``QuickAllReduceInt4`` with every binary compiled.
+    """A ``FlyQuickAllReduce`` with every binary compiled.
 
     The ``super_tile``, ``grid_cap`` and ``block`` keys of *engine_kw* become
     the engine's ladder; refer to ``_test_ladder``.
     """
-    from aiter.ops.flydsl import QuickAllReduceInt4
+    from aiter.ops.flydsl import FlyQuickAllReduce
 
     engine_kw = dict(engine_kw)
     knobs = {
@@ -709,7 +709,7 @@ def _engine(rank: int, tp: int, gloo, device, engine_kw: dict):
         engine_kw["ladder"] = _test_ladder(
             engine_kw.get("algorithm", "mesh"), tp, **knobs
         )
-    fly = QuickAllReduceInt4(
+    fly = FlyQuickAllReduce(
         group=gloo,
         device=device,
         rank=rank,
@@ -794,7 +794,7 @@ def _run_rank(
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     tp_group = _init_dist(rank, tp, init_method, hip=False)
-    # QuickAllReduceInt4 exchanges IPC metadata over the gloo group; NCCL stays
+    # FlyQuickAllReduce exchanges IPC metadata over the gloo group; NCCL stays
     # for the fp32 reference all-reduce.
     gloo = tp_group.cpu_group
     group = tp_group.device_group
@@ -1859,7 +1859,7 @@ def main():
     args = parser.parse_args()
     fab.check_bench_args(parser, args)
     if ARCH not in SUPPORTED_ARCHS:
-        raise SystemExit(f"QuickAllReduceInt4 is unsupported on {ARCH}")
+        raise SystemExit(f"FlyQuickAllReduce is unsupported on {ARCH}")
     global _TIMING
     _TIMING = (args.reps, args.rounds)
 
@@ -1872,7 +1872,7 @@ def main():
     algos = args.algorithm
     dts = [d for d in args.dtype if d == dtypes.bf16]
     if len(dts) != len(args.dtype):
-        aiter.logger.warning("QuickAllReduceInt4 payload is bf16; skipping others")
+        aiter.logger.warning("FlyQuickAllReduce payload is bf16; skipping others")
 
     if args.mnk is not None:
         for mnk in args.mnk:
@@ -1894,7 +1894,7 @@ def main():
 
     if _FAILURES:
         raise SystemExit(
-            f"{len(_FAILURES)} QuickAllReduceInt4 check(s) failed:\n  "
+            f"{len(_FAILURES)} FlyQuickAllReduce check(s) failed:\n  "
             + "\n  ".join(_FAILURES)
         )
 

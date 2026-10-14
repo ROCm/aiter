@@ -17,7 +17,7 @@ from .kernels.comm.allreduce_shared import (
     SUPPORTED_ARCHS,
     SUPPORTED_WORLDS,
 )
-from .quick_allreduce_int4_ipc import UncachedIpcHeap
+from .quick_allreduce_ipc import UncachedIpcHeap
 
 logger = logging.getLogger("aiter")
 
