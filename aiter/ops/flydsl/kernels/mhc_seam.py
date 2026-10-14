@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Delayed mHC seam with RMSNorm, fused tile form -- the fused pass and the finish pass.
+"""Delayed mHC seam with RMSNorm, fused tile form -- the fused pass and the two finish passes.
 
 For `streams` residual streams R, the previous seam's gates post, comb and pre, and this seam's
 weight fn:
@@ -34,6 +34,9 @@ Paths:
     read and `residual_out` is the caller's `residual`, left unwritten.
   - `identity_pre` on: the pre band is the identity on stream 0, so `pre_mix` is never read and
     `x1` is `R'_0`.
+  - `norm` off (the fused pass of `NORM="separate"`): `stage` is the caller's `layer_input`, left
+    un-normalised, and `sum(R'^2)` rides in the published line for
+    `compile_mhc_seam_finish_nonorm`.
 
 Gate packing, which a caller must match exactly and cannot derive from the signatures:
   - `fn` is `(gate_rows(streams), streams * hidden)` fp32, its rows ordered `pre | post | comb`
@@ -88,8 +91,8 @@ TILE_PAD = 8
 # The LDS a workgroup may hold and still leave two of them resident on a 64 KB part, which is
 # what decides how wide the accumulator fold may be.
 FOLD_BUDGET = 32 * 1024
-# fp32 per (segment, token) of the published logit row: one per gate row, then padding to the
-# 128 B line the finish pass gathers.
+# fp32 per (segment, token) of the published logit row: one per gate row, `sum(R'^2)` after them
+# without the norm, then padding to the 128 B line the finish pass gathers.
 SPLIT_SLOTS = 2 * MFMA_MN
 # Tokens one finish workgroup owns: exactly enough that its published lines give every lane of
 # the block one value to fold.
@@ -422,11 +425,19 @@ def compile_mhc_seam_fused(
     fast_fp_math: bool,
     fast_narrow: bool,
     load_nt: bool,
+    load_nt_x: bool,
     store_nt: bool,
     stage_nt: bool,
     waves_per_eu: int,
+    norm: bool,
 ) -> Any:
-    """The fused pass: the post-mix, the collapse, the gate projection, and both sums of squares.
+    """The fused pass: the post-mix, the collapse, the gate projection, and the sums of squares.
+
+    Serves both NORM paths. `norm` says which finish pass reads what this publishes, and the
+    pass is otherwise the same: with it, the collapse goes to the `stage` buffer the fused
+    finish rescales and both sums of squares go to `sums`; without it, the collapse is already
+    `layer_input` -- the contract's un-normalised value, which `aiter.rms_norm` then takes --
+    and the one sum of squares rides in the published line's slot after the gate rows.
 
     A workgroup owns `block_m` tokens by one hidden segment and sweeps the segment in
     `chunk_c`-wide chunks. The streams of a chunk are post-mixed together -- every output stream
@@ -479,10 +490,11 @@ def compile_mhc_seam_fused(
     mode = ("post" if has_post else "nopost") + ("_idpre" if identity_pre else "")
     name = (
         f"mhc_seam_fused_n{streams}_h{hidden}_bm{block_m}_c{chunk_c}_s{splits}"
-        f"_{mode}_w{waves_per_eu}"
+        f"_{mode}_{'norm' if norm else 'nonorm'}_w{waves_per_eu}"
         + ("_ffm" if fast_fp_math else "")
         + ("_fnr" if fast_narrow else "")
         + ("_ntl" if load_nt else "")
+        + ("_ntx" if load_nt_x else "")
         + ("_nts" if store_nt else "")
         + ("_ntg" if stage_nt else "")
     )
@@ -494,11 +506,11 @@ def compile_mhc_seam_fused(
         post_layer_mix: fx.Pointer,  # (T, streams) fp32           [has_post]
         comb_res_mix: fx.Pointer,  # (T, streams, streams) fp32    [has_post]
         pre_mix: fx.Pointer,  # (T, streams) fp32          [not identity_pre]
-        fn: fx.Pointer,  # (gate_rows, streams * H) fp32
+        fn: fx.Pointer,  # the packed limbs, bf16
         residual_out: fx.Pointer,  # (T, streams, H) bf16
-        stage: fx.Pointer,  # (T, H) bf16
+        stage: fx.Pointer,  # (T, H) bf16; `layer_input` itself without the norm
         part: fx.Pointer,  # (T/block_m, splits, block_m, SPLIT_SLOTS) fp32
-        sums: fx.Pointer,  # (splits, T, 2) fp32
+        sums: fx.Pointer,  # (splits, T, 2) fp32                       [norm]
         n_tok: fx.Int32,
     ) -> None:
         tid = fx.thread_idx.x
@@ -691,7 +703,7 @@ def compile_mhc_seam_fused(
                             sublayer_out,
                             _offset(token_major, safe, 0) + col,
                             VEC,
-                            load_nt,
+                            load_nt_x,
                         )
                     ]
                     src = [
@@ -730,7 +742,8 @@ def compile_mhc_seam_fused(
                 held.append(mixed)
 
                 # `x1` is rounded to bf16 before it is squared and before it is rescaled, so the
-                # round trip through `stage` is the value the contract names.
+                # round trip through `stage` is the value the contract names. Without the norm
+                # nothing squares it and the store is the pass's final `layer_input`.
                 rounds = [
                     _narrow_round(collapse[e], fast_narrow)
                     for e in range_constexpr(VEC)
@@ -740,11 +753,14 @@ def compile_mhc_seam_fused(
                     _store_bf16(
                         stage, _offset(token_major, safe, 0) + col, staged, stage_nt
                     )
-                collapse_squares = fx.Float32(0.0)
-                for e in range_constexpr(VEC):
-                    collapse_squares = collapse_squares + rounds[e][1] * rounds[e][1]
                 sq[g] = sq[g] + squares
-                sqc[g] = sqc[g] + collapse_squares
+                if const_expr(norm):
+                    collapse_squares = fx.Float32(0.0)
+                    for e in range_constexpr(VEC):
+                        collapse_squares = (
+                            collapse_squares + rounds[e][1] * rounds[e][1]
+                        )
+                    sqc[g] = sqc[g] + collapse_squares
             return held, sq, sqc
 
         def project_chunk(chunk: Any, held: list[Any], tile_lds: Any) -> None:
@@ -789,8 +805,9 @@ def compile_mhc_seam_fused(
         # Each wave holds a partial over its share of the contraction, published in `fold_rounds`
         # rounds of `folds` with the running sum carried in registers between them -- which is
         # what lets a wide token tile hold fewer slots than it has waves. A thread owns one gate
-        # row of one token and adds its two limbs, at `row` and `row + rows`; the finish pass
-        # reads nothing of the line past `rows`.
+        # row of one token and adds its two limbs, at `row` and `row + rows`. The fused finish
+        # reads nothing of the line past `rows`; the no-norm finish loads all of it but uses
+        # only the gate rows and the sum of squares at `rows`.
         fold_steps = ceildiv(block_m * rows, BLOCK)
         carried = [fx.Float32(0.0) for _ in range_constexpr(fold_steps)]
         # Where `rows` does not divide the block, the last step's spare threads store nothing.
@@ -826,59 +843,105 @@ def compile_mhc_seam_fused(
             if keep[g]:
                 line = token_local[g] * fx.Int32(SPLIT_SLOTS)
                 g_part[line + row_local[g]] = carried[g]
-        # The `groups` lanes that share a token are consecutive and aligned, so both sums close
+        # The `groups` lanes that share a token are consecutive and aligned, so the sums close
         # in a butterfly inside the wave rather than through LDS and a barrier.
         width = fx.Int32(WAVE_SIZE)
         for g in range_constexpr(slots):
-            total_sq, total_sqc = sq[g], sqc[g]
+            total_sq = sq[g]
+            if const_expr(norm):
+                total_sqc = sqc[g]
             for step in range_constexpr(butterfly):
                 mask = fx.Int32(1 << step)
                 total_sq = total_sq + fx.Float32(
                     fx.gpu.shuffle_xor(total_sq, mask, width)
                 )
-                total_sqc = total_sqc + fx.Float32(
-                    fx.gpu.shuffle_xor(total_sqc, mask, width)
-                )
-            token = token0 + (fx.Int32(g * BLOCK) + tid) // fx.Int32(groups)
+                if const_expr(norm):
+                    total_sqc = total_sqc + fx.Float32(
+                        fx.gpu.shuffle_xor(total_sqc, mask, width)
+                    )
+            token_in_tile = (fx.Int32(g * BLOCK) + tid) // fx.Int32(groups)
+            token = token0 + token_in_tile
             if (tid % fx.Int32(groups) == fx.Int32(0)) & (token < n_tok):
-                base = _offset(sums_major, seg, token, 0)
-                _store_f32(sums, base, total_sq)
-                _store_f32(sums, base + 1, total_sqc)
+                # With the norm, the finish pass reads `sum(x1^2)` on its own in every rescale
+                # column step, so both sums go to a buffer it can read densely. Without it, the
+                # finish pass gathers the whole published line once and the one sum rides in it,
+                # in the lane's own 128 B window.
+                if const_expr(norm):
+                    base = _offset(sums_major, seg, token, 0)
+                    _store_f32(sums, base, total_sq)
+                    _store_f32(sums, base + 1, total_sqc)
+                if const_expr(not norm):
+                    g_part[token_in_tile * fx.Int32(SPLIT_SLOTS) + fx.Int32(rows)] = (
+                        total_sq
+                    )
 
-    @flyc.jit
-    def launch_mhc_seam_fused(
-        residual: fx.Pointer,
-        sublayer_out: fx.Pointer,
-        post_layer_mix: fx.Pointer,
-        comb_res_mix: fx.Pointer,
-        pre_mix: fx.Pointer,
-        fn: fx.Pointer,
-        residual_out: fx.Pointer,
-        stage: fx.Pointer,
-        part: fx.Pointer,
-        sums: fx.Pointer,
-        n_tok: fx.Int32,
-        n_blk: fx.Int32,
-        stream: fx.Stream,
-    ) -> None:
-        mhc_seam_fused_kernel(
-            residual,
-            sublayer_out,
-            post_layer_mix,
-            comb_res_mix,
-            pre_mix,
-            fn,
-            residual_out,
-            stage,
-            part,
-            sums,
-            n_tok,
-            value_attrs={"rocdl.waves_per_eu": waves_per_eu},
-        ).launch(
-            grid=(splits, n_blk, 1),
-            block=BLOCK,
-            stream=stream,
-        )
+    # The pass is one kernel; the launchers differ because `sums` is the norm's alone. The
+    # no-norm one keeps it out of the host's call and hands the kernel `part` in its place,
+    # which no store reaches: every write to `sums` sits under `const_expr(norm)`.
+    if norm:
+
+        @flyc.jit
+        def launch_mhc_seam_fused(
+            residual: fx.Pointer,
+            sublayer_out: fx.Pointer,
+            post_layer_mix: fx.Pointer,
+            comb_res_mix: fx.Pointer,
+            pre_mix: fx.Pointer,
+            fn: fx.Pointer,
+            residual_out: fx.Pointer,
+            stage: fx.Pointer,
+            part: fx.Pointer,
+            sums: fx.Pointer,
+            n_tok: fx.Int32,
+            n_blk: fx.Int32,
+            stream: fx.Stream,
+        ) -> None:
+            mhc_seam_fused_kernel(
+                residual,
+                sublayer_out,
+                post_layer_mix,
+                comb_res_mix,
+                pre_mix,
+                fn,
+                residual_out,
+                stage,
+                part,
+                sums,
+                n_tok,
+                value_attrs={"rocdl.waves_per_eu": waves_per_eu},
+            ).launch(grid=(splits, n_blk, 1), block=BLOCK, stream=stream)
+
+    else:
+
+        @flyc.jit
+        def launch_mhc_seam_fused(
+            residual: fx.Pointer,
+            sublayer_out: fx.Pointer,
+            post_layer_mix: fx.Pointer,
+            comb_res_mix: fx.Pointer,
+            pre_mix: fx.Pointer,
+            fn: fx.Pointer,
+            residual_out: fx.Pointer,
+            layer_input: fx.Pointer,
+            part: fx.Pointer,
+            n_tok: fx.Int32,
+            n_blk: fx.Int32,
+            stream: fx.Stream,
+        ) -> None:
+            mhc_seam_fused_kernel(
+                residual,
+                sublayer_out,
+                post_layer_mix,
+                comb_res_mix,
+                pre_mix,
+                fn,
+                residual_out,
+                layer_input,
+                part,
+                part,
+                n_tok,
+                value_attrs={"rocdl.waves_per_eu": waves_per_eu},
+            ).launch(grid=(splits, n_blk, 1), block=BLOCK, stream=stream)
 
     if fast_fp_math:
         launch_mhc_seam_fused.compile_hints = {
@@ -1201,3 +1264,147 @@ def compile_mhc_seam_finish(
         }
     launch_mhc_seam_finish.kernel_name = name
     return launch_mhc_seam_finish
+
+
+@cache
+def compile_mhc_seam_finish_nonorm(
+    *,
+    hidden: int,
+    block_m: int,
+    splits: int,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    fast_fp_math: bool = True,
+) -> Any:
+    """The finish pass of `NORM="separate"`: fold the segments' partials and form the gates.
+
+    It follows `compile_mhc_seam_fused` built with `norm=False`, `has_post=True` and
+    `identity_pre=False`, the only form that path serves; the caller then applies
+    `aiter.rms_norm` to the un-normalised `layer_input` the fused pass wrote. Only the
+    reductions the hidden split makes cross-workgroup live here: the sum of squares that sets
+    the RMS scale, and the gate logits. It folds them at `splits == 1` too.
+
+    It reads the published line whole -- the gate logits and, in the slot after them,
+    `sum(R'^2)`, in the lane's own 128 B window. Lanes past that slot load the line's unwritten
+    tail; their values move only inside their own DPP row, and the stores on that row take
+    `sig`, which no lane move touches. Every value that reaches a store is written by the fused
+    pass of the same call, so the scratch needs no zeroing.
+
+    A token spreads over `SPLIT_SLOTS` lanes, one per projection row, with the 4x4 comb on a
+    single 16-lane DPP row, so each Sinkhorn half-step is two DPP adds, a reciprocal and a
+    multiply per lane instead of 16 serial sums and 16 multiplies in one thread. The grid is
+    `finish_blocks(tokens)`, as for the fused finish.
+    """
+    _require(splits >= 1, f"splits must be at least 1, got {splits}")
+    _require(block_m >= 1, f"block_m must be at least 1, got {block_m}")
+    rows = gate_rows(STREAMS)
+    inv_wide = 1.0 / float(STREAMS * hidden)
+    # The fused pass indexes its slab by token tile, so a line sits at tile, then segment,
+    # then the token's row within the tile.
+    line = block_m * SPLIT_SLOTS
+    name = (
+        f"mhc_seam_finish_nonorm_h{hidden}_bm{block_m}_s{splits}_r{sinkhorn_repeat}_"
+        + _consts_tag(rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value)
+        + ("_ffm" if fast_fp_math else "")
+    )
+
+    @flyc.kernel(name=name, known_block_size=[BLOCK, 1, 1])
+    def mhc_seam_finish_nonorm_kernel(
+        part: fx.Pointer,  # (T/block_m, splits, block_m, SPLIT_SLOTS) fp32
+        hc_scale: fx.Pointer,  # (3,) fp32
+        hc_base: fx.Pointer,  # (gate_rows,) fp32
+        post_out: fx.Pointer,  # (T, streams) fp32
+        comb_out: fx.Pointer,  # (T, streams, streams) fp32
+        next_pre: fx.Pointer,  # (T, streams) fp32
+        n_tok: fx.Int32,
+    ) -> None:
+        tid = fx.thread_idx.x
+        lane = tid % fx.Int32(SPLIT_SLOTS)
+        raw_token = fx.block_idx.x * fx.Int32(TOKENS_PER_BLOCK) + tid // fx.Int32(
+            SPLIT_SLOTS
+        )
+        live = raw_token < n_tok
+        # The arithmetic runs unconditionally against a clamped token so the three stores
+        # are the kernel's only branches: a value computed in an enclosing `if` body and
+        # read from a nested one comes back permuted, so nesting is not available here.
+        t = live.select(raw_token, n_tok - fx.Int32(1))
+
+        # Lane -> projection row: comb rows 8..23 on lanes 0..15, pre 0..3 on 16..19, post
+        # 4..7 on 20..23, the sum of squares on 24; lanes 25..31 are inert.
+        row = (lane < fx.Int32(16)).select(lane + fx.Int32(8), lane - fx.Int32(16))
+        row = (lane < fx.Int32(24)).select(row, lane)
+
+        tile = t // fx.Int32(block_m)
+        row_in_tile = t - tile * fx.Int32(block_m)
+        total = fx.Float32(0.0)
+        squares = fx.Float32(0.0)
+        for s in range_constexpr(splits):
+            base = (tile * fx.Int32(splits) + fx.Int32(s)) * fx.Int32(
+                line
+            ) + row_in_tile * fx.Int32(SPLIT_SLOTS)
+            total = total + _load_f32(part, base + row)
+            # The sum of squares shares the lane's own 128 B window, so this is an L1 hit
+            # and saves a cross-lane broadcast of lane 24.
+            squares = squares + _load_f32(part, base + fx.Int32(rows))
+
+        rstd = fmath.rsqrt(squares * inv_wide + rms_eps)
+        s_pre = _load_f32(hc_scale, fx.Int32(0))
+        s_post = _load_f32(hc_scale, fx.Int32(1))
+        s_comb = _load_f32(hc_scale, fx.Int32(2))
+        scale = (lane < fx.Int32(16)).select(
+            s_comb, (lane < fx.Int32(20)).select(s_pre, s_post)
+        )
+        bias_row = (row < fx.Int32(rows)).select(row, fx.Int32(0))
+        logit = total * rstd * scale + _load_f32(hc_base, bias_row)
+
+        # Sigmoid on every lane; only 16..23 reach a store.
+        sig = sigmoid_f32(logit)
+
+        # Softmax across each comb row, then the `2 * repeat - 1` alternating half-steps,
+        # opening on the column pass as the reference does.
+        comb = _exp2((logit - _row_max(logit)) * LOG2E)
+        comb = comb * _rcp(_row_sum(comb)) + hc_sinkhorn_eps
+        comb = comb * _rcp(_col_sum(comb) + hc_sinkhorn_eps)
+        for _ in range_constexpr(sinkhorn_repeat - 1):
+            comb = comb * _rcp(_row_sum(comb) + hc_sinkhorn_eps)
+            comb = comb * _rcp(_col_sum(comb) + hc_sinkhorn_eps)
+
+        if live & (lane < fx.Int32(16)):
+            _store_f32(comb_out, t * fx.Int32(STREAMS * STREAMS) + lane, comb)
+        if live & (lane >= fx.Int32(16)) & (lane < fx.Int32(20)):
+            _store_f32(
+                next_pre, t * fx.Int32(STREAMS) + lane - fx.Int32(16), sig + hc_pre_eps
+            )
+        if live & (lane >= fx.Int32(20)) & (lane < fx.Int32(24)):
+            _store_f32(
+                post_out,
+                t * fx.Int32(STREAMS) + lane - fx.Int32(20),
+                sig * hc_post_mult_value,
+            )
+
+    @flyc.jit
+    def launch_mhc_seam_finish_nonorm(
+        part: fx.Pointer,
+        hc_scale: fx.Pointer,
+        hc_base: fx.Pointer,
+        post_out: fx.Pointer,
+        comb_out: fx.Pointer,
+        next_pre: fx.Pointer,
+        n_tok: fx.Int32,
+        n_blk: fx.Int32,
+        stream: fx.Stream,
+    ) -> None:
+        mhc_seam_finish_nonorm_kernel(
+            part, hc_scale, hc_base, post_out, comb_out, next_pre, n_tok
+        ).launch(grid=(n_blk, 1, 1), block=BLOCK, stream=stream)
+
+    if fast_fp_math:
+        launch_mhc_seam_finish_nonorm.compile_hints = {
+            **launch_mhc_seam_finish_nonorm.compile_hints,
+            "fast_fp_math": True,
+        }
+    launch_mhc_seam_finish_nonorm.kernel_name = name
+    return launch_mhc_seam_finish_nonorm

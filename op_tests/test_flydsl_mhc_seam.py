@@ -423,16 +423,12 @@ def main():
 
     if args.block_m:
         from aiter.jit.utils.chip_info import get_lds_capacity_bytes
-        from aiter.ops.flydsl.kernels import mhc_seam, mhc_seam_nonorm
+        from aiter.ops.flydsl.kernels import mhc_seam
 
         lds = get_lds_capacity_bytes(get_gfx())
-        checks = {
-            "fused": mhc_seam.check_config,
-            "separate": mhc_seam_nonorm.check_config,
-        }
         flags = lambda v: [bool(x) for x in v] or [None]
         rows = []
-        for T, H, norm, bm, cc, sp, nt in itertools.product(
+        for T, H, norm, bm, cc, sp, nt, ntx in itertools.product(
             [t for t in args.tokens if t > 0],
             args.hidden,
             args.sweep_norm,
@@ -440,14 +436,13 @@ def main():
             args.chunk_c,
             args.splits,
             flags(args.cache_nt),
+            flags(args.cache_nt_x),
         ):
             try:
-                checks[norm](T, H, 4, bm, cc, sp, lds_bytes=lds)
+                mhc_seam.check_config(T, H, 4, bm, cc, sp, lds_bytes=lds)
             except ValueError:
                 continue
-            # the fused-norm kernels have no separate sublayer_out hint
-            for ntx in flags(args.cache_nt_x) if norm == "separate" else [None]:
-                rows.append(test_mhc_seam_config(T, H, norm, bm, cc, sp, nt, ntx))
+            rows.append(test_mhc_seam_config(T, H, norm, bm, cc, sp, nt, ntx))
         sweep = pd.DataFrame(rows)
         aiter.logger.info(
             "mhc seam config sweep (markdown):\n%s", sweep.to_markdown(index=False)

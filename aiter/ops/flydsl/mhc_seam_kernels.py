@@ -17,7 +17,7 @@ import flydsl.expr as fx
 import torch
 
 from aiter.jit.utils.chip_info import get_cu_num, get_lds_capacity_bytes
-from aiter.ops.flydsl.kernels import mhc_seam, mhc_seam_nonorm
+from aiter.ops.flydsl.kernels import mhc_seam
 from aiter.ops.flydsl.kernels.kernels_common import ceildiv
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
 from aiter.ops.rmsnorm import rms_norm
@@ -52,12 +52,13 @@ MHC_SEAM_DEFAULTS = {
     "FAST_NARROW": True,  # bf16 rounding in integer ops; required by FAST_FP_MATH
     # nt hint on the residual / sublayer_out loads; the two stores are always streamed
     "CACHE_NT": False,
-    # nt hint on the staged collapse's store and its reload; None: _stage_nt
+    # nt hint on the staged collapse's store and its reload; None: _stage_nt, or True for
+    # NORM="separate", where the collapse is layer_input and is not read back
     "STAGE_NT": None,
     "GATE_STEP": None,  # finish pass gives the gates a column step; None: kernels.gate_step
     # "fused": the finish pass applies the RMSNorm; "separate": aiter.rms_norm after the seam
     "NORM": "fused",
-    # nt hint on the sublayer_out load of the NORM="separate" kernels; None: CACHE_NT
+    # nt hint on the sublayer_out load; None: CACHE_NT
     "CACHE_NT_X": None,
 }
 _NORMS = ("fused", "separate")
@@ -121,9 +122,8 @@ def _check_config(T: int, H: int, cfg: dict, arch: str) -> None:
         cfg["NORM"] in _NORMS,
         f"NORM must be one of {_NORMS}, got {cfg['NORM']!r}",
     )
-    kernels = mhc_seam_nonorm if cfg["NORM"] == "separate" else mhc_seam
     try:
-        kernels.check_config(
+        mhc_seam.check_config(
             T,
             H,
             _N,
@@ -218,7 +218,11 @@ def _derive_knobs(cfg: dict, T: int, H: int, cu_num: int) -> dict:
             cfg["GATE_STEP"] = mhc_seam.gate_step(T, H, cu_num)
         if cfg["STAGE_NT"] is None:
             cfg["STAGE_NT"] = _stage_nt(T, H)
-    elif cfg["CACHE_NT_X"] is None:
+    elif cfg["STAGE_NT"] is None:
+        # Without the norm the staged collapse is `layer_input`, which the seam does not read
+        # back, so it takes the same streaming hint as the pass's other writes.
+        cfg["STAGE_NT"] = True
+    if cfg["CACHE_NT_X"] is None:
         cfg["CACHE_NT_X"] = cfg["CACHE_NT"]
     return cfg
 
@@ -262,7 +266,7 @@ def _separate_norm_policy(
     row = next((r for r in _SEPARATE_NORM_TABLE if T <= r[0]), _SEPARATE_NORM_TABLE[-1])
     _, bm, cc, cache_nt, cache_nt_x = row
     try:
-        mhc_seam_nonorm.check_config(T, H, _N, bm, cc, 1, lds_bytes=_lds_bytes(arch))
+        mhc_seam.check_config(T, H, _N, bm, cc, 1, lds_bytes=_lds_bytes(arch))
     except ValueError:
         return None
     return dict(
@@ -582,9 +586,9 @@ def _make_separate_norm_runner(
     norm_eps: float,
 ) -> Callable:
     """Bind the no-norm kernels and apply RMSNorm after their two launches."""
-    part_size = mhc_seam_nonorm.part_elements(T, cfg["SPLITS"])
+    part_size = mhc_seam.part_elements(T, cfg["SPLITS"], cfg["BLOCK_M"])
     fused_blocks = ceildiv(T, cfg["BLOCK_M"])
-    finish_blocks = mhc_seam_nonorm.finish_blocks(T)
+    finish_blocks = mhc_seam.finish_blocks(T)
 
     def run(
         *,
@@ -673,17 +677,24 @@ def _compile_launcher(
         _mode(has_post, identity_pre),
         None if config_key is None else dict(config_key),
     )
-    fused_kwargs = {
-        "hidden": H,
-        "block_m": cfg["BLOCK_M"],
-        "chunk_c": cfg["CHUNK_C"],
-        "splits": cfg["SPLITS"],
-        "fast_fp_math": cfg["FAST_FP_MATH"],
-        "fast_narrow": cfg["FAST_NARROW"],
-        "load_nt": cfg["CACHE_NT"],
-        "store_nt": True,
-        "waves_per_eu": cfg["WAVES_PER_EU"],
-    }
+    separate = cfg["NORM"] == "separate"
+    fused = mhc_seam.compile_mhc_seam_fused(
+        streams=_N,
+        hidden=H,
+        has_post=has_post,
+        identity_pre=identity_pre,
+        block_m=cfg["BLOCK_M"],
+        chunk_c=cfg["CHUNK_C"],
+        splits=cfg["SPLITS"],
+        fast_fp_math=cfg["FAST_FP_MATH"],
+        fast_narrow=cfg["FAST_NARROW"],
+        load_nt=bool(cfg["CACHE_NT"]),
+        load_nt_x=bool(cfg["CACHE_NT_X"]),
+        store_nt=True,
+        stage_nt=bool(cfg["STAGE_NT"]),
+        waves_per_eu=cfg["WAVES_PER_EU"],
+        norm=not separate,
+    )
     finish_kwargs = {
         "hidden": H,
         "splits": cfg["SPLITS"],
@@ -694,21 +705,13 @@ def _compile_launcher(
         "sinkhorn_repeat": sinkhorn_repeat,
         "fast_fp_math": cfg["FAST_FP_MATH"],
     }
-    if cfg["NORM"] == "separate":
-        fused = mhc_seam_nonorm.compile_mhc_seam_fused_nonorm(
-            **fused_kwargs,
-            load_nt_x=bool(cfg["CACHE_NT_X"]),
+    if separate:
+        finish = mhc_seam.compile_mhc_seam_finish_nonorm(
+            **finish_kwargs,
+            block_m=cfg["BLOCK_M"],
         )
-        finish = mhc_seam_nonorm.compile_mhc_seam_finish_nonorm(**finish_kwargs)
         return _make_separate_norm_runner(T, cfg, fused, finish, norm_eps)
 
-    fused = mhc_seam.compile_mhc_seam_fused(
-        **fused_kwargs,
-        streams=_N,
-        has_post=has_post,
-        identity_pre=identity_pre,
-        stage_nt=bool(cfg["STAGE_NT"]),
-    )
     finish = mhc_seam.compile_mhc_seam_finish(
         **finish_kwargs,
         streams=_N,

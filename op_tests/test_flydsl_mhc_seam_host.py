@@ -50,15 +50,12 @@ def dispatch(monkeypatch):
     monkeypatch.setattr(
         seam, "_run_compiled", lambda fn, *args: state.launches.append((fn, args))
     )
-    for module, names in (
-        (seam.mhc_seam, ("compile_mhc_seam_fused", "compile_mhc_seam_finish")),
-        (
-            seam.mhc_seam_nonorm,
-            ("compile_mhc_seam_fused_nonorm", "compile_mhc_seam_finish_nonorm"),
-        ),
+    for name in (
+        "compile_mhc_seam_fused",
+        "compile_mhc_seam_finish",
+        "compile_mhc_seam_finish_nonorm",
     ):
-        for name in names:
-            monkeypatch.setattr(module, name, builder(name))
+        monkeypatch.setattr(seam.mhc_seam, name, builder(name))
     seam._compile_launcher.cache_clear()
     yield state
     seam._compile_launcher.cache_clear()
@@ -90,10 +87,14 @@ def _inputs(T=129, H=512):
 def test_config_overrides_preserve_policy_and_cache_semantics(dispatch):
     inputs = _inputs()
     seam.flydsl_mhc_seam(**inputs)
-    assert dispatch.compiled[0][0] == "compile_mhc_seam_fused_nonorm"
+    # One fused pass serves both paths; `norm` and the finish builder are what differ.
+    assert dispatch.compiled[0][0] == "compile_mhc_seam_fused"
+    assert dispatch.compiled[0][1]["norm"] is False
+    assert dispatch.compiled[1][0] == "compile_mhc_seam_finish_nonorm"
 
     seam.flydsl_mhc_seam(**inputs, config={})
     assert dispatch.compiled[2][0] == "compile_mhc_seam_fused"
+    assert dispatch.compiled[2][1]["norm"] is True
     assert dispatch.compiled[2][1]["chunk_c"] == 256
 
     config = {"NORM": "fused", "BLOCK_M": 32, "CHUNK_C": 128}
