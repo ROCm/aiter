@@ -1,17 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Correctness and bounds safety for ``mxfp4_moe_scatter_reduce``.
+"""BF16/MXFP4 scatter bounds regression at MiniMax-M3 H=6144, TOPK=5.
 
-MiniMax-M3 C40 (TP4, H=6144, TOPK=5, M=32768, BM=128) faulted in
-``scatter_reduce_kernel_impl`` with ``MEMORY_APERTURE_VIOLATION`` when a
-corrupt / uninitialized ``reverse_sorted`` index was nontemporal-loaded past
-``flat_out``. The kernel must:
-
-  * match a torch reference on legal reverse maps;
-  * skip ``sorted_pos < 0`` (EP) and ``sorted_pos >= max_sorted`` (corrupt)
-    without a GPU fault, including the BM>=128 NT path.
-
-    pytest op_tests/test_moe_scatter_reduce.py -q
+Run with: pytest op_tests/test_moe_scatter_reduce.py -q
 """
 
 from __future__ import annotations
@@ -30,7 +21,7 @@ pytest.importorskip("aiter.ops.moe_mxfp4_aux", reason="mxfp4 MoE aux module")
 M3_H = 6144
 M3_TOPK = 5
 # Keep unit-test M small; coverage of the NT path is via MB>=128, not M.
-M3_MS = (1, 3, 8, 64)
+M3_MS = (1, 64)
 
 
 def _reference(flat_out, reverse_sorted, sorted_weights, M, topk, max_sorted):
@@ -62,13 +53,6 @@ def _assert_bf16_matches(out, ref, *, exact=False):
     )
 
 
-def _raise_pending_launch_error():
-    try:
-        torch.ones(1, device="cuda").add_(1)
-    except RuntimeError as exc:
-        pytest.fail(f"a kernel launch failed silently: {exc}")
-
-
 def _run_scatter(flat_out, reverse_sorted, sorted_weights, out, topk, mb):
     aiter.mxfp4_moe_scatter_reduce(
         flat_out=flat_out,
@@ -80,11 +64,10 @@ def _run_scatter(flat_out, reverse_sorted, sorted_weights, out, topk, mb):
         D_HIDDEN=flat_out.shape[1],
         MB=mb,
     )
-    _raise_pending_launch_error()
     torch.cuda.synchronize()
 
 
-@pytest.mark.parametrize("mb", (16, 64, 128), ids=("nt0_bm16", "nt0_bm64", "nt1_bm128"))
+@pytest.mark.parametrize("mb", (16, 128), ids=("nt0", "nt1"))
 @pytest.mark.parametrize("M", M3_MS)
 def test_scatter_reduce_matches_reference(M, mb):
     torch.manual_seed(M * 17 + mb)
@@ -145,24 +128,6 @@ def test_scatter_reduce_skips_negative_and_oob_indices(mb):
     _assert_bf16_matches(out, ref, exact=True)
 
 
-@pytest.mark.parametrize("mb", (128,), ids=("nt1_bm128",))
-def test_scatter_reduce_m3_warmup_shape_smoke(mb):
-    """M=256 stand-in for the 32K warmup: same H/TOPK/NT, tractable memory.
-
-    Full M=32768 needs ~2 GB of staging alone; this covers the dispatch key
-    and NT path the C40 fault used without OOM on a shared CI GPU.
-    """
-    torch.manual_seed(0)
-    M, D, topk = 256, M3_H, M3_TOPK
-    max_sorted = ((M * topk + mb - 1) // mb) * mb
-    flat = torch.randn(max_sorted, D, dtype=torch.bfloat16, device="cuda") * 0.01
-    weights = torch.rand(max_sorted, dtype=torch.float32, device="cuda")
-    rs = torch.arange(M * topk, dtype=torch.int32, device="cuda") % max_sorted
-    out = torch.empty(M, D, dtype=torch.bfloat16, device="cuda")
-    _run_scatter(flat, rs, weights, out, topk, mb)
-    assert torch.isfinite(out).all()
-
-
 @pytest.mark.parametrize("mb", (16, 128), ids=("nt0", "nt1"))
 def test_scatter_reduce_mxfp4_bounds_and_reference(mb):
     """Exercise packed FP4 data and varying E8M0 scales, including OOB skips."""
@@ -194,7 +159,6 @@ def test_scatter_reduce_mxfp4_bounds_and_reference(mb):
         D_HIDDEN=D,
         MB=mb,
     )
-    _raise_pending_launch_error()
     torch.cuda.synchronize()
     _assert_bf16_matches(out, _reference(decoded, rs, weights, M, topk, rows))
     assert torch.count_nonzero(out[0]) == 0

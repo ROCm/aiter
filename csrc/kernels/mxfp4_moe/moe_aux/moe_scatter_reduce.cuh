@@ -13,15 +13,6 @@ namespace aiter::mxfp4_moe::moe_scatter_reduce {
 
 using opus::i32x4_t;
 
-// Gather-reduce per token over TOPK sorted rows.
-//
-// reverse_sorted[token * TOPK + i] indexes into flat_out / sorted_weights.
-// A negative index means "skip" (EP remote / dropped route). Any index
-// >= max_sorted is also skipped: without that upper bound, a corrupt or
-// uninitialized reverse map + nontemporal loads (NT_HINTS) fault with
-// HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION (seen on MiniMax-M3 TP4 at
-// M=32768 with the #5812 scatter epilog).
-
 template <int D_HIDDEN, int TOPK, int COLS_PER_THREAD, bool NT_HINTS>
 __global__ void scatter_reduce_kernel_impl(
     int M,
@@ -47,7 +38,7 @@ __global__ void scatter_reduce_kernel_impl(
     #pragma unroll
     for (int i = 0; i < TOPK; i++) {
         int sorted_pos = reverse_sorted[token * TOPK + i];
-        // < 0: EP remote / dropped. >= max_sorted: corrupt reverse map.
+        // Skip remote routes and indices outside the staging buffer.
         if (sorted_pos < 0 || sorted_pos >= max_sorted) continue;
         const float w = sorted_weights[sorted_pos];
 
