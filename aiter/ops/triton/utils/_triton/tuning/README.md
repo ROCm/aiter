@@ -104,6 +104,17 @@ carries keys that `DEFAULT.json` does not have are those stripped and the rest p
 (`dropped_keys` in the record). The numbers include dispatch gaps and both split-K kernels, so
 they are not comparable with the old rocprof logs.
 
+`--screen X` makes a far-off candidate cheap. After the first warm-up replay, one timed replay
+decides: a candidate that is slower than X times the fastest fully timed record of its M on the
+same GPU stops there, and that replay is its time (`screened` in the record). A candidate whose
+eager warm-up launch alone takes more than 1 ms and 1.25 times that limit stops before the graph
+replays. Each worker starts from the records of its GPU in the results file, so a resumed run
+screens at once. `--screen 1` stops every candidate that is slower than the fastest one so far.
+The final round re-times the ten fastest records, screened ones included, so a candidate that one
+noisy replay put just behind the leader still gets a full measurement. The baseline and the final
+round are always timed in full. A candidate stops only between two launches: the worker never
+kills a running kernel. `--screen 0` (the default) times every candidate in full.
+
 ## Results, resume, failures
 
 Results go to `runs/sweep-<arch>-<backend>-<kernel>-[B=..-]M=..-N=..-K=..jsonl` (worker output in
