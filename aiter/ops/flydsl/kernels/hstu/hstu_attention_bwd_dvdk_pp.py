@@ -569,7 +569,9 @@ def build_hstu_attention_bwd_dvdk_pp(
 
             def fire(slot, q_start, d):
                 row = rows[d]
-                src_elem = (q_start + row) * c_stride_n + gcols[d]
+                in_bounds = (q_start + row) < seq_len
+                local_tok = in_bounds.select(q_start + row, fx.Int32(0))
+                src_elem = local_tok * c_stride_n + gcols[d]
                 lds_byte = fx.Int32(lane0[slot]) + fx.Int32(
                     d * GRP_THREADS * DMA_BYTES
                 )
