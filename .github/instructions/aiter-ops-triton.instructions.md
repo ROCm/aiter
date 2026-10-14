@@ -74,11 +74,9 @@ and tuned JSON in `configs/`. Flag:
 - A kernel module or directory whose path under `_triton_kernels/`
   (`_gluon_kernels/<arch>/`) differs from the folder of the wrapper that
   launches it. A kernel directory is named after the wrapper folder, never
-  after the kernel family or a topic: `normalization/`, not `norm/`. One
-  existing directory predates this rule and is grandfathered until a
-  dedicated follow-up moves it and all its importers: the vendored
-  `_triton_kernels/flash_attn_triton_amd/` (launched by `attention/mha.py`).
-  Do not flag code in it; flag any new mismatched directory. A kernel that
+  after the kernel family or a topic: `normalization/`, not `norm/`. The
+  FlashAttention kernels live under `_triton_kernels/attention/dao_ai/`,
+  matching their `attention/` wrappers. A kernel that
   wrappers in several folders reuse lives with the wrapper that owns it, or in
   `_triton_kernels/common/` when none does (`common/splitk_reduce.py`);
   importing it across folders is fine. The same goes for `@triton.jit`
@@ -381,7 +379,7 @@ All weight/scale pre-shuffle helpers are unified in
   `gated_delta_net/test_fused_kda_decode.py`. The wrapper's folder decides
   the test folder, not the kernel directory: `attention/mha.py` keeps its
   tests in `triton_tests/attention/` even though its kernels sit in the
-  vendored `_triton_kernels/flash_attn_triton_amd/`; a sub-package counts as
+  vendored `_triton_kernels/attention/dao_ai/`; a sub-package counts as
   a folder (`moe/moe_routing/routing.py` → `triton_tests/moe/moe_routing/`).
   The few wrappers that still sit flat at `aiter/ops/triton/<op>.py`
   (`topk.py`, `softmax.py`, ...) keep their tests flat at the

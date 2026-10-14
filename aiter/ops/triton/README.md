@@ -52,6 +52,37 @@ import from the categorized path** (`aiter.ops.triton.gemm.basic.gemm_a16w16`).
 
 ---
 
+## FlashAttention through the public Triton MHA API
+
+Select the existing Dao-AI Triton implementation per call:
+
+```python
+from aiter.ops.triton.attention.mha import (
+    flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache,
+)
+
+out = flash_attn_func(q, k, v, implementation="dao_ai")
+out = flash_attn_varlen_func(
+    q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+    implementation="dao_ai",
+)
+```
+
+Omitting `implementation` preserves the configured Triton default. The selected
+implementation and dropout RNG state are retained for backward. Integrations
+choose between this public Triton API and the separate `aiter.ops.mha` API;
+this module does not change general MHA dispatch.
+The Dao-AI varlen LSE layout is `(heads, total_q)`; its existing return conventions
+are retained. KV-cache attention currently uses this implementation only and does
+not support backward, nonzero softcap or split counts above one.
+
+The kernel package is internal and now lives at
+`_triton_kernels/attention/dao_ai/`. Its former private import path
+is removed; external integrations must migrate before consuming this revision.
+Sage Attention stays in its existing location; only imports of this package change.
+
+---
+
 ## Framework portability — what may import `torch`
 
 `utils/_triton/` is the torch-free half of the shared machinery. The split
@@ -284,7 +315,7 @@ retuning it is a JSON edit rather than a code change.
 `env=` names the variable for a family that published its own before this
 convention existed, and `default=` is what an unset variable means for it —
 together they let such a family route through this helper without changing what
-it did before. `flash_attn_triton_amd/` uses both, for
+it did before. `attention/dao_ai/` uses both, for
 `FLASH_ATTENTION_TRITON_AMD_AUTOTUNE`, which is on by default where every other
 family is off. This covers the kernel that applies `triton.autotune()` as a call
 rather than a decorator too (`_triton_kernels/fusions/attn_res.py`, behind
