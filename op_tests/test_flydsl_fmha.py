@@ -2121,3 +2121,181 @@ def test_public_varlen_descale_route_skips_flydsl_for_ck_only_features(
         with pytest.raises(RuntimeError, match="requires ENABLE_CK=1"):
             flash_attn_varlen_func(q, k, v, cu, cu, L, L, **kwargs)
         assert calls == []
+
+
+_needs_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+
+
+def _fp8_misplaced_inputs(misplaced):
+    """GPU fp8 varlen q/k/v plus out/cu_seqlens, with one of them on the CPU."""
+    L, H = 256, 1
+    q = torch.empty(L, H, 192, dtype=torch.float8_e4m3fn, device="cuda")
+    k = torch.empty(L, H, 192, dtype=torch.float8_e4m3fn, device="cuda")
+    v = torch.empty(L, H, 128, dtype=torch.float8_e4m3fn, device="cuda")
+    s = torch.ones(1, dtype=torch.float32, device="cuda")
+    kw = {
+        "cu_seqlens_q": torch.tensor([0, L], dtype=torch.int32, device="cuda"),
+        "cu_seqlens_k": torch.tensor([0, L], dtype=torch.int32, device="cuda"),
+        "out": torch.empty(L, H, 128, dtype=torch.bfloat16, device="cuda"),
+    }
+    kw[misplaced] = kw[misplaced].cpu()
+    return (q, k, v), s, kw
+
+
+@_needs_gpu
+@pytest.mark.parametrize("misplaced", ["out", "cu_seqlens_q", "cu_seqlens_k"])
+def test_public_varlen_descale_host_tensor_skips_flydsl(monkeypatch, misplaced):
+    """A CPU out/cu_seqlens never reaches the FlyDSL fp8 kernel as a host pointer.
+
+    The FlyDSL fp8 gate declines it and the call goes to CK, which rejects it with
+    CHECK_DEVICE. The arch check and both launches are stubbed, so any GPU runs it.
+    """
+    from aiter import flash_attn_varlen_func
+    from aiter.ops import mha as mha_module
+    from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
+
+    calls = []
+
+    class _CkStub:
+        @staticmethod
+        def apply(*args):
+            calls.append("ck")
+            return "ck"
+
+    monkeypatch.setattr(mha_module, "ENABLE_CK", True)
+    monkeypatch.setattr(mha_module, "FlashAttnVarlenFunc", _CkStub)
+    monkeypatch.setattr(fa, "flydsl_flash_attn_fp8_supported", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        fa,
+        "flydsl_flash_attn_fp8_func",
+        lambda *a, **kw: pytest.fail("a host tensor reached the FlyDSL fp8 kernel"),
+    )
+    (q, k, v), s, kw = _fp8_misplaced_inputs(misplaced)
+    L = q.shape[0]
+    out = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        kw["cu_seqlens_q"],
+        kw["cu_seqlens_k"],
+        L,
+        L,
+        causal=True,
+        q_descale=s,
+        k_descale=s,
+        v_descale=s,
+        out=kw["out"],
+    )
+    assert out == "ck"
+    assert calls == ["ck"]
+
+
+@_gfx950_only
+@pytest.mark.parametrize("misplaced", ["out", "cu_seqlens_q", "cu_seqlens_k"])
+def test_fp8_kernel_rejects_host_tensors(misplaced):
+    """The kernel entry itself refuses a CPU out/cu_seqlens instead of launching."""
+    from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
+        flydsl_flash_attn_fp8_func,
+    )
+
+    (q, k, v), s, kw = _fp8_misplaced_inputs(misplaced)
+    L = q.shape[0]
+    with pytest.raises(ValueError, match="must be"):
+        flydsl_flash_attn_fp8_func(
+            q,
+            k,
+            v,
+            causal=True,
+            cu_seqlens_q=kw["cu_seqlens_q"],
+            cu_seqlens_kv=kw["cu_seqlens_k"],
+            max_seqlen_q=L,
+            max_seqlen_kv=L,
+            cross_seqlen=False,
+            q_descale=s,
+            k_descale=s,
+            v_descale=s,
+            out=kw["out"],
+        )
+
+
+@_gfx950_only
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("head_dim", [192, 128])
+@pytest.mark.parametrize(
+    "vl_q, vl_kv",
+    [
+        ([512, 128, 300], [512, 512, 400]),  # prefix-cached prefill, q <= kv
+        ([64, 1, 37], [64, 64, 64]),  # short chunks on a cached prefix
+        ([1024, 256], [256, 1024]),  # kv < q: whole causal q tiles fully masked
+        ([256, 128], [0, 256]),  # zero-length kv entry
+    ],
+)
+def test_fp8_varlen_equal_max_differing_lengths(
+    monkeypatch, causal, head_dim, vl_q, vl_kv
+):
+    """Equal q/kv maxima with per-sequence q != kv lengths stay exact on FlyDSL.
+
+    The public route infers ``cross_seqlen`` from the maxima only, so these calls
+    compile CROSS_SEQLEN=False. Varlen masking reads each sequence's lengths from
+    cu_seqlens; CROSS_SEQLEN only skips fully-masked causal q tiles, so the output
+    must match the reference and be bitwise equal to the CROSS_SEQLEN=True build.
+    """
+    from aiter import flash_attn_varlen_func
+    from aiter.ops import mha as mha_module
+    from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
+        flydsl_flash_attn_fp8_func,
+    )
+
+    class _CkStub:
+        @staticmethod
+        def apply(*args):
+            pytest.fail("expected the FlyDSL fp8 route, got CK")
+
+    monkeypatch.setattr(mha_module, "FlashAttnVarlenFunc", _CkStub)
+    assert max(vl_q) == max(vl_kv)
+    H = 8
+    torch.manual_seed(FP8_SEED)
+    cuq, cukv = [0], [0]
+    for a, b in zip(vl_q, vl_kv):
+        cuq.append(cuq[-1] + a)
+        cukv.append(cukv[-1] + b)
+
+    def _t(n, d, mul=1.0):
+        return torch.randn(n, H, d, device="cuda", dtype=torch.bfloat16) * mul
+
+    q, qs = _fp8_quant(_t(cuq[-1], head_dim, 3.0))
+    k, ks = _fp8_quant(_t(cukv[-1], head_dim))
+    v, vs = _fp8_quant(_t(cukv[-1], 128, 4.0))
+    cu_q = torch.tensor(cuq, dtype=torch.int32, device="cuda")
+    cu_kv = torch.tensor(cukv, dtype=torch.int32, device="cuda")
+    descales = {"q_descale": qs, "k_descale": ks, "v_descale": vs}
+    L = max(vl_q)
+    out = flash_attn_varlen_func(q, k, v, cu_q, cu_kv, L, L, causal=causal, **descales)
+    cross = flydsl_flash_attn_fp8_func(
+        q,
+        k,
+        v,
+        causal=causal,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_kv=cu_kv,
+        max_seqlen_q=L,
+        max_seqlen_kv=L,
+        cross_seqlen=True,
+        **descales,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out, cross), "CROSS_SEQLEN=False differs from the cross build"
+
+    refs = []
+    for b, (n_q, n_kv) in enumerate(zip(vl_q, vl_kv)):
+        if n_kv == 0:
+            refs.append(torch.zeros(n_q, H, 128, device="cuda"))
+            continue
+        qb = _fp8_dequant(q[cuq[b] : cuq[b + 1]], qs)[None]
+        kb = _fp8_dequant(k[cukv[b] : cukv[b + 1]], ks)[None]
+        vb = _fp8_dequant(v[cukv[b] : cukv[b + 1]], vs)[None]
+        refs.append(_ref_attention(qb, kb, vb, causal)[0])
+    ref = torch.cat(refs)
+    assert not torch.isnan(out.float()).any()
+    rel, err, _ = _fp8_rel_err(out.float(), ref)
+    assert rel < 0.05, f"rel err {rel:.4f} (abs {err:.4f})"

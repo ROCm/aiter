@@ -237,12 +237,14 @@ def _fp8_gfx950_reject_reason(
     k_descale,
     v_descale,
     out,
+    cu_seqlens=(),
 ) -> str | None:
     """Why the gfx950 fp8 kernel cannot serve this call, or None if it can.
 
     It needs e4m3fn Q/K/V with per-tensor descales and a positive, finite
     softmax scale, and writes bf16. Reject anything else so it falls through rather than
-    silently dropping the feature.
+    silently dropping the feature. Every tensor the kernel reads or writes,
+    including ``out`` and the varlen ``cu_seqlens``, must be on q's device.
     """
     if q.dtype is not torch.float8_e4m3fn:
         return f"q/k/v must be float8_e4m3fn, got q {q.dtype}"
@@ -263,6 +265,16 @@ def _fp8_gfx950_reject_reason(
         return "out must be a contiguous bfloat16 tensor"
     if not (q.is_cuda and k.device == q.device and v.device == q.device):
         return "q/k/v must be on the same GPU"
+    if out is not None and out.device != q.device:
+        return f"out must be on q's device {q.device}, got {out.device}"
+    if any(
+        not torch.is_tensor(cu)
+        or cu.device != q.device
+        or cu.dtype != torch.int32
+        or not cu.is_contiguous()
+        for cu in cu_seqlens
+    ):
+        return "cu_seqlens_q/k must be contiguous int32 tensors on q's device"
     if any(
         s is None
         or not torch.is_tensor(s)
@@ -366,6 +378,7 @@ def flydsl_flash_attn_varlen_func(
             k_descale=k_descale,
             v_descale=v_descale,
             out=out,
+            cu_seqlens=(cu_seqlens_q, cu_seqlens_k),
         )
     ):
         from .kernels.flash_attn_func_fp8_gfx950 import flydsl_flash_attn_fp8_func
@@ -380,6 +393,10 @@ def flydsl_flash_attn_varlen_func(
             cu_seqlens_kv=cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_kv=max_seqlen_k,
+            # Varlen masking always uses each sequence's own q/kv lengths from
+            # cu_seqlens; CROSS_SEQLEN only skips fully-masked causal q tiles and
+            # disables batch interleave, so equal maxima with differing per-sequence
+            # lengths stay exact (test_fp8_varlen_equal_max_differing_lengths).
             cross_seqlen=max_seqlen_q != max_seqlen_k,
             q_descale=q_descale,
             k_descale=k_descale,

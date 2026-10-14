@@ -439,6 +439,15 @@ def flydsl_flash_attn_fp8_func(
             "flydsl_flash_attn_fp8_func: cu_seqlens_q required when cu_seqlens_kv is given"
         )
 
+    for name, cu in (("cu_seqlens_q", cu_seqlens_q), ("cu_seqlens_kv", cu_seqlens_kv)):
+        if cu is not None and (
+            cu.device != q.device or cu.dtype != torch.int32 or not cu.is_contiguous()
+        ):
+            raise ValueError(
+                f"flydsl_flash_attn_fp8_func: {name} must be a contiguous int32 tensor "
+                f"on {q.device}, got {cu.dtype} on {cu.device}"
+            )
+
     if varlen:
         if q.dim() != 3:
             raise ValueError(
@@ -577,6 +586,10 @@ def flydsl_flash_attn_fp8_func(
             raise ValueError(
                 f"flydsl_flash_attn_fp8_func: fp8 output must be bf16, got {out.dtype}"
             )
+        elif out.device != q.device:
+            raise ValueError(
+                f"flydsl_flash_attn_fp8_func: out must be on {q.device}, got {out.device}"
+            )
         elif not out.is_contiguous():
             raise ValueError(
                 "flydsl_flash_attn_fp8_func: out must be contiguous, got strides "
@@ -595,6 +608,10 @@ def flydsl_flash_attn_fp8_func(
             elif lse.dtype != torch.float32:
                 raise ValueError(
                     f"flydsl_flash_attn_fp8_func: lse must be float32, got {lse.dtype}"
+                )
+            elif lse.device != q.device:
+                raise ValueError(
+                    f"flydsl_flash_attn_fp8_func: lse must be on {q.device}, got {lse.device}"
                 )
             elif not lse.is_contiguous():
                 raise ValueError(

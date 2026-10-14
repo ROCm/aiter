@@ -3838,6 +3838,7 @@ def flash_attn_varlen_func(
             k_descale=k_descale,
             v_descale=v_descale,
             out=out,
+            cu_seqlens=(cu_seqlens_q, cu_seqlens_k),
         )
 
     # Non-fp8 backends (e.g. the gfx1250 bf16 FlyDSL kernel) would ignore the
