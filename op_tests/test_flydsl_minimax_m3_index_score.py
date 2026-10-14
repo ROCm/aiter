@@ -709,22 +709,40 @@ def _build_map(lens, max_block, geom, device="cuda"):
 
 @requires_gfx950
 @pytest.mark.parametrize("cu", [80, 256, 304])
-def test_spread_map_covers_every_page_exactly_once(cu):
+def test_spread_map_covers_every_page_exactly_once(monkeypatch, cu):
     """The spread map's contract, stated as an invariant rather than as
     equality with a second implementation.
 
     A bit-for-bit comparison against a torch twin only says the two agree; it
     cannot survive either of them being rewritten. These four properties are
     what the kernel actually depends on, so they hold for any correct builder.
+
+    `cu` is the row budget the plan apportions against, so it is forced rather
+    than left as whatever this part reports -- otherwise every run tests one CU
+    count and the clamp's behaviour on a wider or narrower part is unexamined.
+    The env var alone would not do it: `get_cu_num` caches its first read, so
+    the second parametrisation would silently re-run the first one's count.
     """
     import random
 
+    from aiter.jit.utils import chip_info
+
+    monkeypatch.setenv("CU_NUM", str(cu))
+    monkeypatch.setattr(chip_info, "get_cu_num", lambda: cu)
     gen = random.Random(cu)
+    # First the case reported as dropping pages on a 304-CU part: 1028 pages
+    # against a 276-row budget, which the per-row spans cover exactly.
+    cases = [(1100, 1, 0, [1028 * P])]
     for _ in range(120):
         B = gen.choice([1, 2, 3, 4, 8])
         mb = gen.choice([1, 5, 64, 1100, 2049, 8192])
         world, rank = gen.choice([(1, 0), (1, 0), (4, 1), (2, 1)])
-        lens = [gen.choice([0, gen.randint(1, mb * world * P)]) for _ in range(B)]
+        cases.append(
+            (mb, world, rank,
+             [gen.choice([0, gen.randint(1, mb * world * P)]) for _ in range(B)])
+        )  # fmt: skip
+    for mb, world, rank, lens in cases:
+        B = len(lens)
         g = _geom(spread=1, world=world, rank=rank)
         wm, seq = _build_map(lens, mb, g)
         b, first, span_, length = decode_spread(wm)
@@ -1695,19 +1713,30 @@ def test_prefill_scale_must_be_order_preserving(scale):
 @requires_gfx950
 @pytest.mark.parametrize(
     "max_q,max_seq",
-    [(0, 2048), (-1, 2048), (128, 0), (128, -1), (128.0, 2048), (128, 2048.0)],
+    [
+        (0, 2048),
+        (-1, 2048),
+        (128, 0),
+        (128, -1),
+        (128.0, 2048),
+        (128, 2048.0),
+        (0x7FFFFFFF, 2048),
+        (128, 0x7FFFFFFF),
+    ],
 )
-def test_rejects_non_positive_launch_bounds(max_q, max_seq):
+def test_rejects_out_of_range_launch_bounds(max_q, max_seq):
     """The grid is sized from these two and nothing downstream re-checks them.
 
     `max_query_len=0` used to launch an empty query grid and return silently --
     the worst outcome, since the caller gets a buffer of sentinels and no
     signal. `max_seq_len=0` reached `hipModuleLaunchKernel` as a zero dimension
     and surfaced as `hipErrorInvalidValue`, which says nothing about which
-    argument was wrong.
+    argument was wrong. At the other end both feed i32 token arithmetic, and
+    `max_seq_len` rounded up to a page must still fit -- so the bound has to be
+    refused before `alloc_score` sizes a buffer from it.
     """
     c = make_prefill_case(1, 128, 2048)
-    with pytest.raises(ValueError, match="must be positive"):
+    with pytest.raises(ValueError, match="must be in"):
         score_prefill_flydsl(
             c["q_bf16"],
             c["cache"],

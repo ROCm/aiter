@@ -1202,10 +1202,18 @@ def score_prefill_flydsl(
     # it does for free since the cache is fp8.
     # The grid is sized from max_query_len/max_seq_len and nothing downstream
     # re-checks them, so a zero reaches the launch as an empty or invalid grid.
-    if not isinstance(max_query_len, int) or max_query_len < 1:
-        raise ValueError(f"max_query_len must be positive, got {max_query_len}")
-    if not isinstance(max_seq_len, int) or max_seq_len < 1:
-        raise ValueError(f"max_seq_len must be positive, got {max_seq_len}")
+    # The upper bound is the same contract decode states as "causal token
+    # address exceeds int32": both reach the kernel as i32 token arithmetic,
+    # and `max_seq_len` rounded up to a whole page has to fit too. It is
+    # checked here rather than after `max_block` so an absurd bound is a
+    # ValueError instead of a multi-GiB `alloc_score`.
+    max_len = 0x7FFFFFFF - (PAGE - 1)
+    for name, bound in (
+        ("max_query_len", max_query_len),
+        ("max_seq_len", max_seq_len),
+    ):
+        if not isinstance(bound, int) or not 1 <= bound <= max_len:
+            raise ValueError(f"{name} must be in [1, {max_len}], got {bound}")
         # The epilogue takes each page's MAX and only then multiplies by the scale,
         # so the scale must be order-preserving: for a negative one
         # `max(dot) * scale` is not `max(dot * scale)` and every score is silently
