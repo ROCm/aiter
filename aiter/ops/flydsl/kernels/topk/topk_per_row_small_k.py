@@ -50,7 +50,6 @@ from flydsl.expr import (
     range_constexpr,
 )
 from flydsl.expr import rocdl as fly_rocdl
-from flydsl.expr.typing import T
 
 from aiter.jit.utils.chip_info import get_gfx_runtime, get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels.act import sigmoid_batch, sigmoid_f32
@@ -198,10 +197,10 @@ def build_topk_per_row_small_k_module(
         raise ValueError("BF16 bias specialization requires sigmoid_bias scoring")
     if score_bf16 and score_mode != "sigmoid_bias":
         raise ValueError("BF16 score specialization requires sigmoid_bias scoring")
-    if wave_size != 64:
-        # The chunk selection is a single i64 ballot over the lanes, so a
-        # wave32 target would need a different mask width throughout.
-        raise ValueError(f"wave size must be 64, got {wave_size}")
+    if wave_size not in (32, 64):
+        # The chunk selection is a single ballot over the lanes, so the chunk
+        # mask is exactly as wide as the wave.
+        raise ValueError(f"wave size must be 32 or 64, got {wave_size}")
     if k < 1 or k > wave_size:
         raise ValueError(f"k must be in [1, {wave_size}] (one chunk per lane), got {k}")
     if n_max < k:
@@ -225,6 +224,7 @@ def build_topk_per_row_small_k_module(
     vec_per_thread = (vectors + block_threads - 1) // block_threads
     elems_per_thread = vec_per_thread * _VEC
     waves_per_block = block_threads // wave_size
+    LaneMask = Int64 if wave_size == 64 else Int32
 
     @fx.struct
     class SharedStorage:
@@ -390,7 +390,7 @@ def build_topk_per_row_small_k_module(
             cut = zero
             for bit in range_constexpr(32):
                 probe = cut | Int32(uint32_to_int32(1 << (31 - bit)))
-                hits = fly_rocdl.ballot(T.i64, _uge(key, probe))
+                hits = fly_rocdl.ballot(LaneMask.ir_type, _uge(key, probe))
                 cut = (Int32(fx.math.ctpop(hits)) >= top_k).select(probe, cut)
             # `cut` is the k-th largest chunk maximum. Chunks above it are in;
             # chunks equal to it are taken lowest-id first, so exactly k chunks
@@ -399,26 +399,36 @@ def build_topk_per_row_small_k_module(
             tied = key == cut
             tie_rank = Int32(
                 fx.math.ctpop(
-                    fly_rocdl.ballot(T.i64, tied)
-                    & ((Int64(1) << Int64(lane)) - Int64(1))
+                    fly_rocdl.ballot(LaneMask.ir_type, tied)
+                    & ((LaneMask(1) << LaneMask(lane)) - LaneMask(1))
                 )
             )
-            quota = top_k - Int32(fx.math.ctpop(fly_rocdl.ballot(T.i64, above)))
-            chosen = fly_rocdl.ballot(T.i64, above | (tied & (tie_rank < quota)))
+            quota = top_k - Int32(
+                fx.math.ctpop(fly_rocdl.ballot(LaneMask.ir_type, above))
+            )
+            chosen = LaneMask(
+                fly_rocdl.ballot(LaneMask.ir_type, above | (tied & (tie_rank < quota)))
+            )
             if lane == zero:
                 state[_ST_CUT] = cut
-                state[_ST_MASK_LO] = Int32(chosen)
-                state[_ST_MASK_HI] = Int32(chosen >> Int64(32))
+                if const_expr(wave_size == 64):
+                    state[_ST_MASK_LO] = Int32(chosen)
+                    state[_ST_MASK_HI] = Int32(chosen >> Int64(32))
+                else:
+                    state[_ST_MASK_LO] = chosen
         gpu.barrier()
 
         # --- 3. The chosen chunks contribute their elements above the cut. ---
         # Both tests are needed: the chunk mask bounds the buffer, the cut keeps
         # the count near k so the ranking below stays short.
         cut = state[_ST_CUT]
-        mask = (Int64(state[_ST_MASK_HI]) << Int64(32)) | (
-            Int64(state[_ST_MASK_LO]) & Int64(0xFFFFFFFF)
-        )
-        in_chosen = ((mask >> Int64(lane)) & Int64(1)) == Int64(1)
+        if const_expr(wave_size == 64):
+            mask = (Int64(state[_ST_MASK_HI]) << Int64(32)) | (
+                Int64(state[_ST_MASK_LO]) & Int64(0xFFFFFFFF)
+            )
+        else:
+            mask = state[_ST_MASK_LO]
+        in_chosen = ((mask >> LaneMask(lane)) & LaneMask(1)) == LaneMask(1)
         for slot in range_constexpr(elems_per_thread):
             col = col_of(slot // _VEC, slot % _VEC)
             if in_chosen & _uge(ords[slot] ^ neg_inf, cut) & (col < row_len):

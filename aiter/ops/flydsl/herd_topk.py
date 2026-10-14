@@ -5,7 +5,10 @@
 
 import torch
 
-from .kernels.herd_topk import build_herd_finalize_module
+from .kernels.herd_topk import (
+    build_herd_finalize_module,
+    build_herd_fused_softmax_module,
+)
 from .kernels.tensor_shim import _run_compiled, wave_size_of
 from .kernels.topk.topk_per_row_small_k import build_topk_per_row_small_k_module
 
@@ -13,7 +16,10 @@ _KIMI_K3_EXPERTS = 896
 _KIMI_K3_TOPK = 16
 _MINIMAX_M3_EXPERTS = 128
 _MINIMAX_M3_TOPK = 4
+_GPT_OSS_EXPERTS = 128
+_GPT_OSS_TOPK = 4
 _HERD_MAX_TOKENS = 128
+_FUSED_ROW_BUCKETS = (32, 64, _HERD_MAX_TOKENS)
 _DEFAULT_FINALIZE_THREADS = 256
 _K3_CANDIDATE_THREADS = 256
 _K3_FINALIZE_THREADS = 1024
@@ -49,6 +55,37 @@ def _run_sigmoid_candidate(
         candidate_values,
         correction_bias,
         rows,
+        stream,
+    )
+
+
+def _run_fused_softmax(
+    packed_gating: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    rows: int,
+    experts: int,
+    topk: int,
+    routed_scaling_factor: float,
+    stream: torch.cuda.Stream,
+) -> None:
+    # A smaller row bound gives each row more lanes and a shorter per-lane scan.
+    max_rows = next(b for b in _FUSED_ROW_BUCKETS if rows <= b)
+    launch = build_herd_fused_softmax_module(
+        topk,
+        experts,
+        max_rows,
+        wave_size_of(packed_gating.device.index),
+    )
+    _run_compiled(
+        launch,
+        packed_gating,
+        topk_weights,
+        topk_ids,
+        int(topk_weights.stride(0)),
+        int(topk_ids.stride(0)),
+        rows,
+        float(routed_scaling_factor),
         stream,
     )
 
@@ -101,6 +138,12 @@ def _profile(score_func: str, experts: int, topk: int) -> str | None:
         _MINIMAX_M3_TOPK,
     ):
         return "minimax_m3"
+    if (score_func, experts, topk) == (
+        "softmax",
+        _GPT_OSS_EXPERTS,
+        _GPT_OSS_TOPK,
+    ):
+        return "gpt_oss"
     return None
 
 
@@ -108,8 +151,9 @@ def _unsupported_reason(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     gating_output: torch.Tensor,
-    correction_bias: torch.Tensor,
+    correction_bias: torch.Tensor | None,
     score_func: str,
+    need_renorm: bool = True,
 ) -> str | None:
     if gating_output.dim() != 2:
         return f"gating_output must be 2-D, got {tuple(gating_output.shape)}"
@@ -133,19 +177,33 @@ def _unsupported_reason(
         return f"topk_ids must be int32 [{rows}, {topk}]"
     if topk_weights.stride(1) != 1 or topk_ids.stride(1) != 1:
         return "Top-K outputs must have inner stride 1"
-    if correction_bias.shape != (experts,):
-        return f"correction_bias must have shape [{experts}]"
-    if correction_bias.dtype not in (torch.float32, torch.bfloat16):
-        return f"unsupported correction_bias dtype {correction_bias.dtype}"
-    if correction_bias.stride(0) != 1:
-        return "correction_bias must be contiguous"
-    tensors = (topk_weights, topk_ids, gating_output, correction_bias)
+    tensors = (topk_weights, topk_ids, gating_output)
+    if profile == "gpt_oss":
+        # Top-K then softmax over the kept K: without renormalization the
+        # weights would be full-row probabilities, which K+1 candidates cannot
+        # reproduce.
+        if not need_renorm:
+            return "softmax HERD requires need_renorm"
+        if correction_bias is not None and correction_bias.numel() != 0:
+            return "softmax HERD does not take a correction_bias"
+        # The fused selector packs a score and its expert id into one 32-bit
+        # key, which only a 16-bit score leaves room for.
+        if gating_output.dtype != torch.bfloat16:
+            return "softmax HERD requires bfloat16 gating_output"
+    else:
+        if correction_bias is None or correction_bias.shape != (experts,):
+            return f"correction_bias must have shape [{experts}]"
+        if correction_bias.dtype not in (torch.float32, torch.bfloat16):
+            return f"unsupported correction_bias dtype {correction_bias.dtype}"
+        if correction_bias.stride(0) != 1:
+            return "correction_bias must be contiguous"
+        tensors += (correction_bias,)
     if not all(t.is_cuda for t in tensors):
         return "every tensor must be on the GPU"
     if len({t.device for t in tensors}) != 1:
         return "every tensor must be on the same GPU"
-    if wave_size_of(gating_output.device.index) != 64:
-        return "the FlyDSL HERD kernels require a wave64 GPU"
+    if wave_size_of(gating_output.device.index) not in (32, 64):
+        return "the FlyDSL HERD kernels require a wave32 or wave64 GPU"
     return None
 
 
@@ -153,8 +211,9 @@ def herd_topk_gating_supported(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     gating_output: torch.Tensor,
-    correction_bias: torch.Tensor,
+    correction_bias: torch.Tensor | None,
     score_func: str,
+    need_renorm: bool = True,
 ) -> bool:
     return (
         _unsupported_reason(
@@ -163,6 +222,7 @@ def herd_topk_gating_supported(
             gating_output,
             correction_bias,
             score_func,
+            need_renorm,
         )
         is None
     )
@@ -172,7 +232,7 @@ def herd_topk_gating(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     gating_output: torch.Tensor,
-    correction_bias: torch.Tensor,
+    correction_bias: torch.Tensor | None,
     need_renorm: bool,
     routed_scaling_factor: float,
     score_func: str,
@@ -180,7 +240,8 @@ def herd_topk_gating(
     """Apply Top-(K+1), batch popularity, and min-unique drop.
 
     Output routes are canonicalized to ascending expert id, matching the
-    Triton HERD output contract.
+    Triton HERD output contract. The softmax profile selects on raw logits and
+    weights the kept K by their softmax, as Triton's flat-topk HERD does.
     """
     reason = _unsupported_reason(
         topk_weights,
@@ -188,6 +249,7 @@ def herd_topk_gating(
         gating_output,
         correction_bias,
         score_func,
+        need_renorm,
     )
     if reason is not None:
         raise ValueError(f"[FlyDSL HERD Top-K] {reason}")
@@ -205,6 +267,18 @@ def herd_topk_gating(
     packed_gating = (
         gating_output if gating_output.is_contiguous() else gating_output.contiguous()
     )
+    if profile == "gpt_oss":
+        _run_fused_softmax(
+            packed_gating,
+            topk_weights,
+            topk_ids,
+            rows,
+            experts,
+            topk,
+            routed_scaling_factor,
+            stream,
+        )
+        return
     kp1 = topk + 1
     candidate_ids = torch.empty((rows, kp1), dtype=torch.int32, device=device)
     candidate_values = torch.empty((rows, kp1), dtype=torch.float32, device=device)

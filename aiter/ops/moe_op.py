@@ -35,6 +35,25 @@ def topk_softmax(
     num_shared_experts: int = 0,
     shared_expert_scoring_func: str = "",
 ) -> None:
+    if num_shared_experts == 0:
+        from .topk import _use_flydsl_herd
+
+        if _use_flydsl_herd(
+            topk_weights, topk_indices, gating_output, None, "softmax", need_renorm
+        ):
+            from .flydsl.herd_topk import herd_topk_gating
+
+            # token_expert_indices is left unwritten: no caller reads it.
+            herd_topk_gating(
+                topk_weights,
+                topk_indices,
+                gating_output,
+                None,
+                need_renorm,
+                1.0,
+                "softmax",
+            )
+            return
     # The softmax workspace is only touched on the non-power-of-2 / >256-expert
     # path, but is always allocated here (torch caching allocator) and passed in so
     # the C side stays torch-free. Size logic mirrors the original C implementation.

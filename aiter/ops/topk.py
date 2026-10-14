@@ -48,8 +48,9 @@ def _use_flydsl_herd(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
     gating_output: torch.Tensor,
-    correction_bias: torch.Tensor,
+    correction_bias: torch.Tensor | None,
     score_func: str,
+    need_renorm: bool = True,
 ) -> bool:
     """Whether this call matches an opt-in HERD model profile."""
     if not _FLYDSL_USE_HERD:
@@ -70,6 +71,7 @@ def _use_flydsl_herd(
         gating_output,
         correction_bias,
         score_func,
+        need_renorm,
     )
 
 
@@ -127,7 +129,12 @@ def topk_gating(
             f"{gating_output.dtype} gating_output, expected one of {valid}"
         )
     if _use_flydsl_herd(
-        topk_weights, topk_indices, gating_output, correction_bias, score_func
+        topk_weights,
+        topk_indices,
+        gating_output,
+        correction_bias,
+        score_func,
+        need_renorm,
     ):
         from .flydsl.herd_topk import herd_topk_gating
 
@@ -266,6 +273,7 @@ def biased_grouped_topk(
             gating_output,
             correction_bias,
             "sigmoid",
+            need_renorm,
         )
     ):
         from .flydsl.herd_topk import herd_topk_gating
