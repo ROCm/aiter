@@ -23,6 +23,9 @@ Record fields:
   gpu       HIP_VISIBLE_DEVICES of the worker
   is_tuned  baseline only: a specialized file served this shape
   us, us_min, us_max, tflops   per-launch time from graph replay (median, min, max)
+  rel       us / the installed config's time on the same GPU (status reference, timed when
+            the worker starts): GPUs differ by a few percent, so screening and the final-round
+            shortlist compare rel, not us
   screened  true when one replay was already slower than --screen x the fastest record of
             this M: the candidate stopped there and us is that replay
   wrong     status of a candidate whose output did not match the kernel's reference in one of
@@ -363,14 +366,26 @@ def plan(spec, shape, backend, arch, should_skip, space_out):
     return 0
 
 
-def fastest_time(out):
-    """Fastest fully timed ok record of this results file, or None."""
-    times = [
-        r["us"]
+def fastest_rel(out):
+    """Lowest rel of the fully timed ok records of this results file (all GPUs), or None."""
+    rels = [
+        r["rel"]
         for r in read_records(out).values()
-        if r["status"] == "ok" and not r.get("screened")
+        if r["status"] == "ok" and not r.get("screened") and "rel" in r
     ]
-    return min(times, default=None)
+    return min(rels, default=None)
+
+
+def reference_time(spec, shape, backend, keys, call, copies, calls, replays):
+    """This GPU's time for the installed config, or None when it does not run."""
+    installed, _ = resolve_installed(spec, shape, backend)
+    config = None
+    if any(k not in keys for k in installed):  # launch it as the baseline record does
+        config = {k: v for k, v in installed.items() if k in keys}
+    try:
+        return time_with_cuda_graph(call, config, copies, calls, replays).median
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def benchmark(
@@ -393,7 +408,7 @@ def benchmark(
     keys, _, _ = load_defaults(spec, backend)
     pool = CompilePool(pool_todo) if pool_todo else None
     pending = [(config_key(c), c) for c in candidates]
-    fastest = fastest_time(out) if screen else None
+    best_rel = fastest_rel(out) if screen else None
     copies = make_cold_copies(inputs, cold_mb)
     common = {
         "kernel": spec.name,
@@ -413,6 +428,8 @@ def benchmark(
             cold_mb=cold_mb,
         ),
     )
+    reference = reference_time(spec, shape, backend, keys, call, copies, calls, replays)
+    append_record(out, dict(common, status="reference", us=reference))
     print("ready", flush=True)  # the driver's watchdog reads the worker's log
     while pending and not STOPPING:
         candidate = next_ready(pending, pool, call, copies[0])
@@ -440,7 +457,9 @@ def benchmark(
                     record.update(status="skipped", reason=reason)
             if record["status"] == "ok":
                 # the baseline is never screened; nor is anything before a first full timing
-                abort_above = screen * fastest if fastest and not is_baseline else None
+                abort_above = None
+                if best_rel and reference and not is_baseline:
+                    abort_above = screen * best_rel * reference  # in this GPU's us
                 timing = time_with_cuda_graph(
                     call, candidate, copies, calls, replays, abort_above
                 )
@@ -450,10 +469,12 @@ def benchmark(
                     us_max=round(timing.high, 3),
                     tflops=round(flops(shape) / timing.median / 1e6, 2),
                 )
+                if reference:
+                    record["rel"] = round(timing.median / reference, 4)
                 if timing.screened:
                     record["screened"] = True
-                elif screen:
-                    fastest = min(fastest or timing.median, timing.median)
+                elif screen and reference:
+                    best_rel = min(best_rel or record["rel"], record["rel"])
                 if verify and check is not None:
                     wrong = verify_output(call, candidate, copies[0], check, verify)
                     if wrong:

@@ -429,14 +429,14 @@ def final_round(spec, shape, backend, candidates, out, gpu, args):
     """Re-time the baseline and the fastest current candidates on one GPU into the final-round file."""
     records = read_records(out)
     current = {config_key(c) for c in candidates}  # records of an older plan stay out
-    ok = sorted(
-        (
-            r
-            for key, r in records.items()
-            if key in current and r["status"] == "ok" and not r.get("baseline")
-        ),
-        key=lambda r: r["us"],
-    )
+    ok = [
+        r
+        for key, r in records.items()
+        if key in current and r["status"] == "ok" and not r.get("baseline")
+    ]
+    # rel compares candidates timed on different GPUs; records without it fall back to us
+    by_rel = all("rel" in r for r in ok)
+    ok.sort(key=lambda r: r["rel"] if by_rel else r["us"])
     final_out = final_results_path(out)
     if os.path.exists(final_out):
         os.remove(final_out)

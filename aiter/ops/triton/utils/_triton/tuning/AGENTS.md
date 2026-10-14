@@ -72,8 +72,11 @@ here. Update this file in the same change as any behaviour change.
    wins (it moves on to the next ten while all of them are wrong). Never two drivers on one GPU. `--compile-procs` workers
    (`harness.py --precompile --claim`) only compile, never launch, and run on `--compile-gpus`,
    which must not be timing GPUs because their input set-up runs kernels; timing workers get
-   `--pool` and time what the pool has compiled first, so they never duplicate its compiles. `--screen X` stops a candidate after
-   one replay when it is slower than X times the fastest fully timed record of its M (`screened`);
+   `--pool` and time what the pool has compiled first, so they never duplicate its compiles. Each timing worker times the installed
+   config on its own GPU first (`reference`) and records `rel` = time / that reference;
+   screening and the final-round shortlist compare `rel`, so GPU-to-GPU differences do not
+   decide. `--screen X` stops a candidate after
+   one replay when its `rel` is above X times the lowest fully timed `rel` of its M (`screened`);
    it never applies to the baseline or the final round.
 9. Call the public wrappers (`aiter.ops.triton.gemm...`) only, never `_triton_kernels` or
    `_gluon_kernels`; pass `backend=` where the wrapper takes it and refuse a backend the wrapper

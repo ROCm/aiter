@@ -108,7 +108,7 @@ def read_records(path):
     the worker died on keeps status 'start'."""
     records = {}
     for record in iter_records(path):
-        if record["status"] == "ready":
+        if record["status"] in ("ready", "reference"):
             continue
         key = "baseline" if record.get("baseline") else config_key(record["config"])
         is_final = record["status"] != "start"

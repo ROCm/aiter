@@ -105,6 +105,11 @@ carries keys that `DEFAULT.json` does not have are those stripped and the rest p
 (`dropped_keys` in the record). The numbers include dispatch gaps and both split-K kernels, so
 they are not comparable with the old rocprof logs.
 
+Each timing worker first times the installed config on its own GPU (a `reference` record) and
+stores every candidate's time relative to it (`rel`). GPUs of one node differ by a few percent,
+so screening and the final-round shortlist compare `rel`; the final round then times the
+shortlist on one GPU, and those numbers pick the winner.
+
 `--screen X` makes a far-off candidate cheap: after the first warm-up replay, one timed replay
 decides. A candidate slower than X times the fastest fully timed record of its M stops there,
 and that replay is its time (`screened` in the record). A candidate whose eager warm-up launch
