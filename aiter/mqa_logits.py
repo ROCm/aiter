@@ -2,8 +2,25 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """FP8 MQA logits over a contiguous KV (DSA indexer prefill scores), dispatched per call shape.
 
-``mqa_logits`` takes the same tensors as the Triton/Gluon ``fp8_mqa_logits`` and
-picks the backend and its kernel variant from the tuned table
+``mqa_logits`` returns ``[seq_len, seq_len_kv]`` float32 logits, where for each
+query row ``i`` and key ``j`` with ``cu_starts[i] <= j < cu_ends[i]``::
+
+    logits[i, j] = sum_h weights[i, h] * relu(Q[i, h] . KV[j] * kv_scales[j])
+
+It takes:
+
+- ``Q``: ``[seq_len, H, D]`` FP8 E4M3 queries (``float8_e4m3fn`` on gfx950,
+  ``float8_e4m3fnuz`` on gfx942).
+- ``KV``: ``[seq_len_kv, D]`` FP8 E4M3 keys, same dtype as ``Q``.
+- ``kv_scales``: ``[seq_len_kv]`` float32 per-key scales.
+- ``weights``: ``[seq_len, H]`` float32 head weights.
+- ``cu_starts``, ``cu_ends``: ``[seq_len]`` int32, the key window
+  ``[cu_starts[i], cu_ends[i])`` of each query row.
+- ``clean_logits``: write ``-inf`` outside each row's window; if False, those
+  positions are unspecified.
+
+Each backend (Triton/Gluon ``fp8_mqa_logits`` or FlyDSL) accepts these inputs.
+The backend and its kernel variant come from the tuned table
 ``AITER_CONFIG_MQA_LOGITS`` (``aiter/configs/tuned_mqa_logits.csv``, plus any
 ``model_configs/*tuned_mqa_logits*.csv``). Tune new shapes with
 ``csrc/mqa_logits/mqa_logits_tune.py``.
