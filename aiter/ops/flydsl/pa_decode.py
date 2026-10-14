@@ -68,8 +68,6 @@ def launch_pa_decode_ps_reduce(
     # so out-of-bounds reads cannot wrap back into valid data.
     bounded_plan_logits = (
         context_partition_num <= 64
-        and query_seq_len > 0
-        and query_group_size > 0
         and 0 <= stride_logits_head <= 2**31 - 1
         and stride_logits_group == head_size
         and stride_logits_part == query_seq_len * query_group_size * head_size
@@ -205,8 +203,6 @@ def pa_decode(
     0 <= context_lengths[i] <= block_tables.shape[1] * block_size and used
     block indices in [0, min(key_cache.shape[0], value_cache.shape[0])).
     """
-    if not isinstance(work_plan, PADecodePlan):
-        raise TypeError("work_plan must be a PADecodePlan")
     if context_partition_size != KV_COMPUTE_BLOCK:
         raise NotImplementedError(
             "pa_decode only supports context_partition_size=256, "
@@ -218,29 +214,11 @@ def pa_decode(
         )
     if alibi_slopes is not None:
         raise NotImplementedError("pa_decode does not support ALiBi")
-    if not isinstance(sliding_window, int):
-        raise TypeError("sliding_window must be an int")
     if sliding_window < -1:
         raise ValueError("sliding_window must be -1, 0, or positive")
     sliding_window = max(sliding_window, 0)
-    if not isinstance(query_length, int):
-        raise TypeError("query_length must be an int")
     if query_length < 1:
         raise ValueError(f"query_length must be positive, got {query_length}")
-
-    required_tensors = (
-        ("output", output),
-        ("query", query),
-        ("key_cache", key_cache),
-        ("value_cache", value_cache),
-        ("context_lengths", context_lengths),
-        ("block_tables", block_tables),
-    )
-    for name, tensor in required_tensors:
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError(
-                f"{name} must be a torch.Tensor, got {type(tensor).__name__}"
-            )
 
     expected_ranks = (
         ("output", output, (3,)),
@@ -415,8 +393,6 @@ def pa_decode(
 
     dev = query.device
     if sinks is not None:
-        if not isinstance(sinks, torch.Tensor):
-            raise TypeError("sinks must be a torch.Tensor")
         if sinks.shape != (num_q_heads,):
             raise ValueError("sinks must have shape [num_query_heads]")
         if sinks.dtype not in (torch.bfloat16, torch.float16, torch.float32):
@@ -449,8 +425,7 @@ def pa_decode(
     def normalize_scale(scale, name):
         if scale is None:
             return torch.ones(1, dtype=torch.float32, device=dev)
-        if not isinstance(scale, torch.Tensor):
-            return torch.tensor([float(scale)], dtype=torch.float32, device=dev)
+        scale = torch.as_tensor(scale, device=dev)
         if scale.numel() == 1:
             return scale.reshape(1)
         if scale.dim() == 4:
@@ -528,14 +503,9 @@ def pa_decode(
 
     schedule_context_length = int(max_blocks_per_seq) * int(block_size)
     if max_context_length is not None:
-        if (
-            isinstance(max_context_length, bool)
-            or not isinstance(max_context_length, int)
-            or not 0 <= max_context_length <= max_blocks_per_seq * block_size
-        ):
+        if not 0 <= max_context_length <= max_blocks_per_seq * block_size:
             raise ValueError(
-                "max_context_length must be a nonnegative host integer within "
-                "block-table capacity"
+                "max_context_length must be within [0, block-table capacity]"
             )
         schedule_context_length = (
             (max_context_length + block_size - 1) // block_size * block_size
@@ -592,15 +562,6 @@ def pa_decode(
         pout = torch.empty(
             *expected_scalar_shape, head_dim, dtype=output.dtype, device=dev
         )
-    for name, tensor in (
-        ("max_logits", pmax),
-        ("exp_sums", psum),
-        ("temporary_output", pout),
-    ):
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError(
-                f"{name} must be a torch.Tensor, got {type(tensor).__name__}"
-            )
     if pmax.shape != expected_scalar_shape:
         raise ValueError(
             f"max_logits shape {tuple(pmax.shape)} != {expected_scalar_shape}"
