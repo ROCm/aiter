@@ -15,6 +15,7 @@ import argparse
 import json
 import sys
 import traceback
+from statistics import median
 
 import torch
 
@@ -30,8 +31,10 @@ from aiter.test_common import run_perftest
 _K3_SHAPES = ((8448, 7168), (1536, 7168), (7168, 768))
 _TP2_SHAPES = ((1024, 3584), (3584, 512))
 _AB_SHAPES = _K3_SHAPES + _TP2_SHAPES
-_AB_MS = (1, 4096)
+_AB_MS = (1, 512, 4096)
 _SWEEP_MS = (1, 128, 4096)
+_GRAPH_REPEATS = 50
+_GRAPH_SAMPLES = 7
 
 
 def _make_inputs(m: int, n: int, k: int, seed: int = 0):
@@ -92,6 +95,52 @@ def _bench(m: int, n: int, k: int, config: DenseGemmConfig | None = None):
     }
     return row
 
+def _graph_us(fn, repeats: int = _GRAPH_REPEATS, samples: int = _GRAPH_SAMPLES):
+    fn()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(repeats):
+            fn()
+    for _ in range(5):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    timings = []
+    for _ in range(samples):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        graph.replay()
+        end.record()
+        end.synchronize()
+        timings.append(start.elapsed_time(end) * 1000.0 / repeats)
+    return median(timings)
+
+
+def _bench_graph(m: int, n: int, k: int):
+    a, packed, scale = _make_inputs(m, n, k, seed=m + n + k)
+    prepared = prepare_gemm_a16wfp4_weight(packed, scale)
+    out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    weight_bf16 = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
+    gemm_us = _graph_us(lambda: flydsl_gemm_a16wfp4(a, prepared, out=out))
+    bf16_us = _graph_us(lambda: torch.matmul(a, weight_bf16.T, out=out))
+    cfg = _select_gemm_config(m, n, k)
+    return {
+        "m": m,
+        "n": n,
+        "k": k,
+        "block_m": cfg.block_m,
+        "tile_n": cfg.tile_n,
+        "tile_k": cfg.tile_k,
+        "k_wave": cfg.k_wave,
+        "waves_per_eu": cfg.waves_per_eu,
+        "us": gemm_us,
+        "bf16_us": bf16_us,
+        "ratio": bf16_us / gemm_us,
+        "status": "ok",
+    }
+
 
 def _print_row(row: dict):
     if row.get("status") != "ok":
@@ -138,6 +187,19 @@ def _run_default(out: str | None):
         for m in _AB_MS:
             row = _bench(m, n, k)
             _print_row(row)
+            _write(out, row)
+            rows.append(row)
+    return rows
+
+def _run_graph(out: str | None):
+    rows = []
+    for n, k in _AB_SHAPES:
+        for m in _AB_MS:
+            row = _bench_graph(m, n, k)
+            print(
+                f"kernel-only M={m} N={n} K={k}: A16WFP4={row['us']:.2f} us, "
+                f"BF16={row['bf16_us']:.2f} us, ratio={row['ratio']:.2f}x"
+            )
             _write(out, row)
             rows.append(row)
     return rows
@@ -208,11 +270,15 @@ def _pick_winners(rows: list[dict]) -> dict[tuple[int, int, int], dict]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("default", "sweep"), default="default")
+    parser.add_argument(
+        "--mode", choices=("default", "graph", "sweep"), default="default"
+    )
     parser.add_argument("--out", default=None, help="JSONL path for per-config rows")
     args = parser.parse_args(argv)
     if args.mode == "default":
         _run_default(args.out)
+    elif args.mode == "graph":
+        _run_graph(args.out)
     else:
         _run_sweep(args.out)
     return 0

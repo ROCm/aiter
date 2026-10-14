@@ -13,6 +13,7 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.flydsl.gemm_a16wfp4 import (
     DenseGemmConfig,
     _select_gemm_config,
+    _validate_buffer_limits,
     a16wfp4_config_legal,
     a16wfp4_shape_supported,
     flydsl_gemm_a16wfp4,
@@ -213,7 +214,10 @@ def test_prepared_storage_and_warmed_launch_do_not_materialize_bf16_weight():
 
 
 @_SKIP
-def test_shape_and_dtype_validation():
+def test_shape_and_dtype_validation(monkeypatch):
+    monkeypatch.setattr(
+        "aiter.ops.flydsl.gemm_a16wfp4.get_cu_num", lambda: 256
+    )
     assert a16wfp4_shape_supported(1024, 3584)
     assert a16wfp4_shape_supported(8448, 7168)
     assert a16wfp4_shape_supported(1536, 7168)
@@ -268,6 +272,27 @@ def test_shape_and_dtype_validation():
         flydsl_gemm_a16wfp4(
             overflow_a, overflow_prepared, config=overflow_config
         )
+
+    with pytest.raises(ValueError, match=r"M \* N must be less than 2\*\*31"):
+        _validate_buffer_limits(262144, 8448, 7168)
+    with pytest.raises(ValueError, match=r"M \* K must be less than 2\*\*31"):
+        _validate_buffer_limits(300000, 1536, 7168)
+
+
+@_SKIP
+def test_empty_batch_returns_empty_output():
+    _, packed, scale = _make_inputs(1, 1024, 512)
+    prepared = prepare_gemm_a16wfp4_weight(packed, scale)
+    a = torch.empty((0, 512), device="cuda", dtype=torch.bfloat16)
+
+    actual = flydsl_gemm_a16wfp4(a, prepared)
+
+    assert actual.shape == (0, 1024)
+    assert actual.dtype == torch.bfloat16
+    assert actual.device == a.device
+
+    out = torch.empty_like(actual)
+    assert flydsl_gemm_a16wfp4(a, prepared, out=out) is out
 
 
 @_SKIP

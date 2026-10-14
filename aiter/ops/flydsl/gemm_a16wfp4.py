@@ -29,6 +29,7 @@ _TILE_K = 256
 _N_ALIGN = 256
 _K_ALIGN = 256
 _MAX_LDS_BYTES = 163840
+_MAX_BUFFER_ELEMENTS = 1 << 31
 
 
 class DenseGemmConfig(NamedTuple):
@@ -110,12 +111,12 @@ def _select_k_wave(k: int, tile_k: int, max_k_wave: int = 4) -> int:
     return 1
 
 
-_TARGET_BLOCKS = get_cu_num()
 
 
 def _decode_tile_n(m: int, n: int, k_wave: int) -> int:
     """Widest N tile that still puts a workgroup on every CU."""
     align = 16 * (4 // k_wave)
+    target_blocks = get_cu_num()
     grid_m = (m + 15) // 16
     legal = [
         tile_n
@@ -123,7 +124,7 @@ def _decode_tile_n(m: int, n: int, k_wave: int) -> int:
         if tile_n >= align and tile_n % align == 0 and n % tile_n == 0
     ]
     for tile_n in legal:
-        if grid_m * (n // tile_n) >= _TARGET_BLOCKS:
+        if grid_m * (n // tile_n) >= target_blocks:
             return tile_n
     return legal[-1]
 
@@ -202,6 +203,16 @@ def _select_gemm_config(m: int, n: int, k: int) -> DenseGemmConfig:
         waves_per_eu=2,
     )
 
+def _validate_buffer_limits(m: int, n: int, k: int) -> None:
+    if m * n >= _MAX_BUFFER_ELEMENTS:
+        raise ValueError(
+            f"M * N must be less than 2**31 for the output buffer, got M={m}, N={n}"
+        )
+    if m * k >= _MAX_BUFFER_ELEMENTS:
+        raise ValueError(
+            f"M * K must be less than 2**31 for the BF16 input buffer, got M={m}, K={k}"
+        )
+
 
 def prepare_gemm_a16wfp4_weight(
     weight: torch.Tensor,
@@ -273,8 +284,6 @@ def flydsl_gemm_a16wfp4(
         raise ValueError("a must be contiguous")
 
     m, k = a.shape
-    if m <= 0:
-        raise ValueError(f"M must be positive, got {m}")
     if k != prepared_weight.k:
         raise ValueError(
             f"a K={k} does not match prepared weight K={prepared_weight.k}"
@@ -284,6 +293,7 @@ def flydsl_gemm_a16wfp4(
             f"a and prepared weight must share a device, got {a.device} and "
             f"{prepared_weight.weight.device}"
         )
+    _validate_buffer_limits(m, prepared_weight.n, k)
 
     expected_shape = (m, prepared_weight.n)
     if out is None:
@@ -300,19 +310,26 @@ def flydsl_gemm_a16wfp4(
         if not out.is_contiguous():
             raise ValueError("out must be contiguous")
 
+
     launch_stream = torch.cuda.current_stream(a.device) if stream is None else stream
     if launch_stream.device != a.device:
         raise ValueError(
             f"stream must be on {a.device}, got stream device {launch_stream.device}"
         )
 
-    cfg = _select_gemm_config(m, prepared_weight.n, k) if config is None else config
-    if not isinstance(cfg, DenseGemmConfig):
-        raise TypeError(f"config must be DenseGemmConfig, got {type(cfg)!r}")
-    if not a16wfp4_config_legal(prepared_weight.n, k, cfg):
-        raise ValueError(
-            f"illegal A16WFP4 config for N={prepared_weight.n}, K={k}: {cfg}"
-        )
+    if m == 0:
+        return out
+
+    if config is None:
+        cfg = _select_gemm_config(m, prepared_weight.n, k)
+    else:
+        if not isinstance(config, DenseGemmConfig):
+            raise TypeError(f"config must be DenseGemmConfig, got {type(config)!r}")
+        if not a16wfp4_config_legal(prepared_weight.n, k, config):
+            raise ValueError(
+                f"illegal A16WFP4 config for N={prepared_weight.n}, K={k}: {config}"
+            )
+        cfg = config
     launcher = compile_gemm_a16wfp4(
         N=prepared_weight.n,
         K=prepared_weight.k,
