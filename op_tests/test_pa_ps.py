@@ -138,13 +138,17 @@ def torch_mha_extend(
     qo_indptr,
     k_scale=None,  # [num_heads, num_blocks * block_size] for per-token, [num_blocks, num_heads] for per-block
     v_scale=None,  # [num_heads, num_blocks * block_size] for per-token, [num_blocks, num_heads] for per-block
+    is_causal=True,
+    quant_type=QuantType.per_Token,
 ):
-    num_blocks, num_heads, head_size, block_size = v_cache.shape
+    _num_blocks, num_heads, head_size, block_size = v_cache.shape
     sm_scale = 1.0 / (head_size**0.5)
 
-    # Detect per-block vs per-token based on scale shape
-    # per-token: [num_heads, total_tokens], per-block: [num_blocks, num_heads]
-    per_block_quant = k_scale is not None and k_scale.shape[0] == num_blocks
+    per_block_quant = quant_type in (
+        QuantType.per_1x128,
+        QuantType.per_256x128,
+        QuantType.per_1024x128,
+    )
 
     dtype = q.dtype
     kv_dtype = k_cache.dtype
@@ -188,7 +192,7 @@ def torch_mha_extend(
             else:
                 # per-token: v_scale is [num_heads, total_tokens]
                 v *= v_scale[:, idx].t().unsqueeze(-1)
-        o = ref_masked_attention(q, k, v, sm_scale, dtype, is_causal=True)
+        o = ref_masked_attention(q, k, v, sm_scale, dtype, is_causal=is_causal)
         os.append(o)
     o = torch.concat(os)
     return o
@@ -313,6 +317,7 @@ def run_aiter_asm_ps(
     softmax_scale,
     mask,
     quant_type: QuantType = QuantType.per_Token,
+    high_precision: int = 1,
 ):
     return aiter.pa_persistent_fwd(
         Q=Q,
@@ -334,6 +339,7 @@ def run_aiter_asm_ps(
         softmax_scale=softmax_scale,
         mask=mask,
         quant_type=quant_type,
+        high_precision=high_precision,
     )
 
 
@@ -349,6 +355,7 @@ def run_aiter_asm(
     k_scale=None,
     v_scale=None,
     qo_indptr=None,
+    high_precision=1,
 ):
     return aiter.pa_fwd_asm(
         query,
@@ -362,7 +369,7 @@ def run_aiter_asm(
         v_scale,
         None,
         qo_indptr,
-        # kernelName="_ZN5aiter42pa_bf16_pertokenFp8_gqa10_1tg_4w_mtp3_msk1E",
+        high_precision=high_precision,
     )
 
 
@@ -437,22 +444,32 @@ def test_pa_ps(
     dump_metadata: bool = False,
     profile_ps: bool = False,
     quant_type: QuantType = QuantType.per_Token,
+    kv_dtype: torch.dtype = dtypes.fp8,
+    is_causal: bool = True,
+    high_precision: int = 1,
 ) -> dict:
     ret = {}
     seed = 0
+    torch.manual_seed(seed)
+    random.seed(seed)
     device = "cuda:0"
     torch.set_default_device(device)
     num_query_heads, num_kv_heads = num_heads
 
     assert num_query_heads % num_kv_heads == 0
+    assert 1 <= qlen <= ctx_lens
+    if (
+        kv_dtype in (torch.bfloat16, torch.float16)
+        and quant_type != QuantType.per_Token
+    ):
+        raise ValueError("unquantized KV does not support per-block quantization")
 
     qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
     kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
     seq_lens_kv = torch.empty(batch_size, dtype=torch.int)
     if varlen:
         for i in range(batch_size):
-            # seq_lens_kv[i] = max(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens)
-            seq_lens_kv[i] = random.uniform(5, ctx_lens)
+            seq_lens_kv[i] = random.randint(qlen, ctx_lens)
     else:
         seq_lens_kv.fill_(ctx_lens)
     seq_lens_qo = torch.randint(
@@ -511,18 +528,22 @@ def test_pa_ps(
         block_tables,
         seq_lens_kv,
         qo_indptr,
+        is_causal=is_causal,
     )
 
     scale = float(1.0 / (head_size**0.5))
 
     # ################## quant start ######################
-    if quant_type in [
+    if kv_dtype in (torch.bfloat16, torch.float16):
+        k_quant_, v_quant_ = k_cache.to(kv_dtype), v_cache.to(kv_dtype)
+        k_scale_ = v_scale_ = k_scale_asm = v_scale_asm = None
+    elif quant_type in [
         QuantType.per_1x128,
         QuantType.per_256x128,
         QuantType.per_1024x128,
     ]:
         k_quant_, k_scale_asm, v_quant_, v_scale_asm = perblock_quant_kvcache_symm(
-            k_cache, v_cache, quant_dtype=aiter.dtypes.fp8
+            k_cache, v_cache, quant_dtype=kv_dtype
         )
         # For per-block, k_scale_asm is [num_blocks, num_heads]
         k_scale_ = k_scale_asm
@@ -535,7 +556,7 @@ def test_pa_ps(
             v_scale_,
             k_scale_asm,
             v_scale_asm,
-        ) = pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=aiter.dtypes.fp8)
+        ) = pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=kv_dtype)
 
     # torch ref
     out_ref = torch_mha_extend(
@@ -547,6 +568,8 @@ def test_pa_ps(
         qo_indptr,
         k_scale_,
         v_scale_,
+        is_causal=is_causal,
+        quant_type=quant_type,
     )
 
     (
@@ -594,7 +617,7 @@ def test_pa_ps(
             torch.tensor([0], dtype=torch.int32),
             1,
             1,
-            True,
+            is_causal,
             work_metadata_ptrs,
             work_indptr,
             work_info,
@@ -618,7 +641,7 @@ def test_pa_ps(
             seq_lens_kv,
             num_query_heads // num_kv_heads,
             num_kv_heads,
-            True,
+            is_causal,
             work_metadata_ptrs,
             work_indptr,
             work_info,
@@ -645,78 +668,50 @@ def test_pa_ps(
 
     # Benchmark PA Persistent Scheduling
     output = torch.empty_like(query)
+    v_shuffled = asm_V_shuffle(v_quant_)
+    ps_kwargs = {
+        "Q": query,
+        "K": k_quant_,
+        "V": v_shuffled,
+        "output": output,
+        "max_qlen": max_qlen,
+        "qo_indptr": qo_indptr,
+        "kv_indptr": kv_indptr,
+        "kv_indices": kv_indices,
+        "context_lens": seq_lens_kv,
+        "K_QScale": k_scale_asm,
+        "V_QScale": v_scale_asm,
+        "work_indptr": work_indptr,
+        "work_info": work_info,
+        "reduce_indptr": reduce_indptr,
+        "reduce_final_map": reduce_final_map,
+        "reduce_partial_map": reduce_partial_map,
+        "softmax_scale": scale,
+        "mask": int(is_causal),
+        "quant_type": quant_type,
+        "high_precision": high_precision,
+    }
+    _, us_pa_ps = run_aiter_asm_ps(**ps_kwargs)
+    err = checkAllclose(out_ref, output, msg="[torch vs pa_persistent_fwd]")
+    assert err <= 0.05, f"PA_PS output mismatch ratio: {err:.2%}"
+    ret["us_metadata"] = us_metadata
+    ret["us_pa_ps"] = us_pa_ps
+    ret["err"] = err
 
     if profile_ps:
-        # Prepare V cache for both methods
-        v_shuffled = asm_V_shuffle(v_quant_)
-
-        _out_aiter_asm, us_pa_ps = run_aiter_asm_ps(
-            Q=query,
-            K=k_quant_,
-            V=v_shuffled,
-            output=output,
-            max_qlen=max_qlen,
-            qo_indptr=qo_indptr,
-            kv_indptr=kv_indptr,
-            kv_indices=kv_indices,
-            context_lens=seq_lens_kv,
-            K_QScale=k_scale_asm,
-            V_QScale=v_scale_asm,
-            work_indptr=work_indptr,
-            work_info=work_info,
-            reduce_indptr=reduce_indptr,
-            reduce_final_map=reduce_final_map,
-            reduce_partial_map=reduce_partial_map,
-            softmax_scale=scale,
-            mask=1,
-        )
-
-        _, us_pa_nops = run_aiter_asm(
-            query,
-            k_quant_,
-            v_shuffled,
-            block_tables,
-            seq_lens_kv,
-            block_tables.size(1),
-            max_qlen,
-            k_scale=k_scale_asm,
-            v_scale=v_scale_asm,
-            qo_indptr=qo_indptr,
-        )
-
-        # Profile kernel breakdown for PA PS
         (
             _,
             pa_ps_ratio,
             reduce_ratio,
             us_pa_ps_kernel,
             us_reduce_kernel,
-        ) = profile_kernel_breakdown(
-            lambda: aiter.pa_persistent_fwd(
-                Q=query,
-                K=k_quant_,
-                V=v_shuffled,
-                output=output,
-                max_qlen=max_qlen,
-                qo_indptr=qo_indptr,
-                kv_indptr=kv_indptr,
-                kv_indices=kv_indices,
-                context_lens=seq_lens_kv,
-                K_QScale=k_scale_asm,
-                V_QScale=v_scale_asm,
-                work_indptr=work_indptr,
-                work_info=work_info,
-                reduce_indptr=reduce_indptr,
-                reduce_final_map=reduce_final_map,
-                reduce_partial_map=reduce_partial_map,
-                softmax_scale=scale,
-                mask=1,
-            )
-        )
-
-        # Profile kernel breakdown for PA NOPS (no reduce kernel)
-        _, _, _, us_pa_nops_kernel, _ = profile_kernel_breakdown(
-            lambda: aiter.pa_fwd_asm(
+        ) = profile_kernel_breakdown(lambda: aiter.pa_persistent_fwd(**ps_kwargs))
+        ret["us_pa_ps_kernel"] = us_pa_ps_kernel
+        ret["pa_ps_ratio"] = pa_ps_ratio
+        ret["us_reduce_kernel"] = us_reduce_kernel
+        ret["reduce_ratio"] = reduce_ratio
+        if quant_type == QuantType.per_Token and (is_causal or max_qlen == 1):
+            nops_args = (
                 query,
                 k_quant_,
                 v_shuffled,
@@ -726,89 +721,20 @@ def test_pa_ps(
                 max_qlen,
                 k_scale_asm,
                 v_scale_asm,
-                None,
-                qo_indptr,
             )
-        )
-
-        # Verify correctness
-        err = checkAllclose(
-            out_ref,
-            output,
-            msg="[torch vs  pa_persistent_fwd][   Quant]: us......",
-        )
-
-        # Store results
-        ret["us_metadata"] = us_metadata
-        ret["us_pa_nops"] = us_pa_nops
-        ret["us_pa_ps"] = us_pa_ps
-        ret["us_pa_ps_kernel"] = us_pa_ps_kernel
-        ret["pa_ps_ratio"] = pa_ps_ratio
-        ret["us_reduce_kernel"] = us_reduce_kernel
-        ret["reduce_ratio"] = reduce_ratio
-        ret["speedup"] = us_pa_nops / us_pa_ps if us_pa_ps > 0 else 0
-        ret["speedup(pa)"] = (
-            us_pa_nops_kernel / us_pa_ps_kernel if us_pa_ps_kernel > 0 else 0
-        )
-        ret["err fp8"] = err
-    else:
-        _out_aiter_asm, us_aiter_asm = run_aiter_asm_ps(
-            Q=query,
-            K=k_quant_,
-            V=asm_V_shuffle(v_quant_),
-            output=output,
-            max_qlen=max_qlen,
-            qo_indptr=qo_indptr,
-            kv_indptr=kv_indptr,
-            kv_indices=kv_indices,
-            context_lens=seq_lens_kv,
-            K_QScale=k_scale_asm,
-            V_QScale=v_scale_asm,
-            work_indptr=work_indptr,
-            work_info=work_info,
-            reduce_indptr=reduce_indptr,
-            reduce_final_map=reduce_final_map,
-            reduce_partial_map=reduce_partial_map,
-            softmax_scale=scale,
-            mask=1,
-            quant_type=quant_type,
-        )
-
-        # _, us_asm_noquant = run_aiter_asm(
-        #     query,
-        #     k_quant_,
-        #     asm_V_shuffle(v_quant_),
-        #     block_tables,
-        #     seq_lens_kv,
-        #     block_tables.size(1),
-        #     max_qlen,
-        #     k_scale=k_scale_,
-        #     v_scale=v_scale_,
-        #     qo_indptr=qo_indptr,
-        # )
-
-        err = checkAllclose(
-            out_ref,
-            output,
-            msg="[torch vs  pa_persistent_fwd][   Quant]: us......",
-        )
-
-        # if isinstance(us_aiter_asm, torch.Tensor):
-        #     us_aiter_asm = us_aiter_asm.item()
-        # if isinstance(us_asm_noquant, torch.Tensor):
-        #     us_asm_noquant = us_asm_noquant.item()
-
-        # print(f"seq_lens_kv: {seq_lens_kv.tolist()[0]}")
-        # print(f"batch_size: {batch_size}")
-        # print(f"PA PS forward: {us_aiter_asm:>8.2f} ms")
-        # print(f"PA without persistent: {us_asm_noquant:>8.2f} ms")
-        # print(
-        #     f"Speedup: {us_asm_noquant / us_aiter_asm if us_aiter_asm > 0 else 0:.2f}x"
-        # )
-
-        ret["us_metadata"] = us_metadata
-        ret["us_asm_fp8"] = us_aiter_asm
-        ret["err fp8"] = err
+            _, us_pa_nops = run_aiter_asm(
+                *nops_args, qo_indptr=qo_indptr, high_precision=high_precision
+            )
+            _, _, _, us_pa_nops_kernel, _ = profile_kernel_breakdown(
+                lambda: aiter.pa_fwd_asm(
+                    *nops_args, qo_indptr=qo_indptr, high_precision=high_precision
+                )
+            )
+            ret["us_pa_nops"] = us_pa_nops
+            ret["speedup"] = us_pa_nops / us_pa_ps if us_pa_ps > 0 else 0
+            ret["speedup(pa)"] = (
+                us_pa_nops_kernel / us_pa_ps_kernel if us_pa_ps_kernel > 0 else 0
+            )
 
     return ret
 
@@ -816,10 +742,12 @@ def test_pa_ps(
 gpu = torch.cuda.current_device()
 device_properties = torch.cuda.get_device_properties(gpu)
 cu_num = device_properties.multi_processor_count
+gpu_arch = device_properties.gcnArchName.split(":", 1)[0]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
-    description="config input of test",
+    description="PA_PS correctness and performance tests. Page16 COs currently "
+    "support gfx950 (MI350 series) only; other page sizes are unchanged.",
 )
 parser.add_argument(
     "-d",
@@ -829,6 +757,16 @@ parser.add_argument(
     default=[dtypes.d_dtypes["bf16"]],
     help="""Data type.
     e.g.: -d bf16""",
+)
+parser.add_argument(
+    "-kvd",
+    "--kv_dtype",
+    type=dtypes.str2Dtype,
+    choices=[dtypes.fp8, dtypes.i8, dtypes.bf16, dtypes.fp16],
+    nargs="+",
+    default=[dtypes.fp8],
+    metavar="{fp8,i8,bf16,fp16}",
+    help="KV cache dtype; bf16/fp16 use unquantized KV.",
 )
 parser.add_argument(
     "-n",
@@ -879,8 +817,24 @@ parser.add_argument(
     type=int,
     nargs="*",
     default=[1024],
-    help="""Block size.
+    help="""KV page size. Page16 requires gfx950 (MI350 series);
+    page16 cases are skipped on other architectures, including gfx942 (MI300 series).
     e.g. --block_size 1024""",
+)
+parser.add_argument(
+    "--causal",
+    type=dtypes.str2bool,
+    nargs="+",
+    default=[True],
+    help="Causal mask, e.g. --causal true false.",
+)
+parser.add_argument(
+    "--high_precision",
+    type=int,
+    choices=[0, 1, 2],
+    nargs="+",
+    default=[1],
+    help="Kernel precision: 0=normal, 1=prefer high, 2=ultra.",
 )
 parser.add_argument(
     "--varlen",
@@ -910,25 +864,54 @@ parser.add_argument(
     "--quant_type",
     type=str,
     choices=["per_Token", "per_256x128", "per_1024x128"],
-    default="per_Token",
-    help="""Use per-block quantization instead of per-token. Default: False.
-    --per_block_quant # Enable per-block quantization""",
+    nargs="+",
+    default=["per_Token"],
+    help="Quantization granularity, e.g. --quant_type per_Token per_256x128.",
+)
+parser.add_argument(
+    "--output", default="pa_ps.csv", help="Path for the benchmark CSV output."
 )
 args = parser.parse_args()
 
-# Convert string to QuantType enum
-quant_type_map = {
-    "per_Token": QuantType.per_Token,
-    "per_256x128": QuantType.per_256x128,
-    "per_1024x128": QuantType.per_1024x128,
-}
-l_quant_type = quant_type_map.get(args.quant_type, QuantType.per_Token)
+if gpu_arch != "gfx950" and 16 in args.block_size:
+    aiter.logger.info(
+        "Skipping page16 PA_PS on %s: page16 COs are only provided for "
+        "gfx950 (MI350 series). Other requested page sizes will still run.",
+        gpu_arch,
+    )
+    args.block_size = [page_size for page_size in args.block_size if page_size != 16]
+    if not args.block_size:
+        aiter.logger.info(
+            "PA_PS skipped: no supported page sizes remain; "
+            "no cases ran and no result CSV was written."
+        )
+        raise SystemExit(0)
 
+df = []
 for dtype in args.dtype:
-    df = []
-    for num_heads, qlen, ctx_len, batch_size, block_size in itertools.product(
-        args.num_heads, args.qlen, args.ctx_len, args.batch_size, args.block_size
+    for (
+        num_heads,
+        qlen,
+        ctx_len,
+        batch_size,
+        block_size,
+        kv_dtype,
+        is_causal,
+        high_precision,
+        quant_type,
+    ) in itertools.product(
+        args.num_heads,
+        args.qlen,
+        args.ctx_len,
+        args.batch_size,
+        args.block_size,
+        args.kv_dtype,
+        args.causal,
+        args.high_precision,
+        args.quant_type,
     ):
+        if qlen > ctx_len:
+            continue
         ret = test_pa_ps(
             ctx_len,
             batch_size,
@@ -941,13 +924,14 @@ for dtype in args.dtype:
             args.load_metadata,
             args.dump_metadata,
             args.profile,
-            getattr(QuantType, args.quant_type),
+            getattr(QuantType, quant_type),
+            kv_dtype=kv_dtype,
+            is_causal=is_causal,
+            high_precision=high_precision,
         )
         df.append(ret)
-    df = pd.DataFrame(df)
-    df = df.drop(
-        columns=["load_metadata", "dump_metadata", "profile_ps"], errors="ignore"
-    )
-    df_md = df.to_markdown(index=False)
-    aiter.logger.info("pa_ps summary (markdown):\n%s", df_md)
-    df.to_csv("pa_ps.csv")
+df = pd.DataFrame(df)
+df = df.drop(columns=["load_metadata", "dump_metadata", "profile_ps"], errors="ignore")
+df_md = df.to_markdown(index=False)
+aiter.logger.info("pa_ps summary (markdown):\n%s", df_md)
+df.to_csv(args.output)

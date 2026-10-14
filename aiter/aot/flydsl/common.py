@@ -273,8 +273,9 @@ def _run_file_pool(
     kernel_timeout: float,
     max_retries: int,
     result_dir: str,
+    start_method: str = "fork",
 ) -> list[dict[str, Any] | None]:
-    ctx = multiprocessing.get_context("fork")
+    ctx = multiprocessing.get_context(start_method)
     n = len(specs)
     results: list[dict[str, Any] | None] = [None] * n
     attempts = [0] * n
@@ -401,6 +402,8 @@ def _run_file_pool(
 def run_jobs_parallel(
     worker: Callable[..., dict[str, Any]],
     jobs: list[dict[str, Any]],
+    *,
+    start_method: str = "fork",
 ) -> list[dict[str, Any]]:
     if not jobs:
         return []
@@ -413,7 +416,12 @@ def run_jobs_parallel(
     try:
         specs = [(worker, job, str(job.get("kernel_name", "?"))) for job in jobs]
         raw = _run_file_pool(
-            specs, max_workers, get_kernel_timeout(), get_max_retries(), result_dir
+            specs,
+            max_workers,
+            get_kernel_timeout(),
+            get_max_retries(),
+            result_dir,
+            start_method,
         )
     finally:
         shutil.rmtree(result_dir, ignore_errors=True)
