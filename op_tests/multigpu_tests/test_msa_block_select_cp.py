@@ -57,7 +57,7 @@ from aiter.ops.custom_all_reduce import (
     free_meta_buffer,
     get_meta_buffer_ipc_handle,
 )
-from aiter.ops.flydsl.quick_allreduce_int4_ipc import UncachedIpcHeap
+from aiter.ops.flydsl.quick_allreduce_ipc import UncachedIpcHeap
 from aiter.ops.msa_block_select import (
     CP_MAX_BLOCKS,
     pa_sparse_block_score_decode,

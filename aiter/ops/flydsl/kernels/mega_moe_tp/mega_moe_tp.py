@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
-from ...quick_allreduce_int4_ipc import UncachedIpcHeap as _Ipc
+from ...quick_allreduce_ipc import UncachedIpcHeap as _Ipc
 from ..kernels_common import ceildiv
 from ..tensor_shim import _preload_compiled, _run_compiled
 from .mega_moe_tp_config import (
@@ -75,7 +75,7 @@ class LaunchCfg:
     lp: int = 0
 
 
-# --- intra-node symmetric memory (hipIpc, via quick_allreduce_int4_ipc) ---------------
+# --- intra-node symmetric memory (hipIpc, via quick_allreduce_ipc) --------------------
 
 _ALIGN = 256
 # a peer allocation maps once per process (arenas can share one): handle -> [ptr, refs]

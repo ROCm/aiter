@@ -9,8 +9,8 @@ node.
 | File | Contents |
 |---|---|
 | `one_shot_allreduce.py` | The exact one-shot kernel. |
-| `quick_allreduce_int4.py` | The quantized two-shot **mesh** kernel. |
-| `quick_allreduce_int4_ring.py` | The quantized two-shot **ring** kernel. |
+| `quick_allreduce_mesh.py` | The quantized two-shot **mesh** kernel. |
+| `quick_allreduce_ring.py` | The quantized two-shot **ring** kernel. |
 | `quick_allreduce_codec.py` | The INT4, INT6 and FP16 wire codecs. The mesh and the ring use them. |
 | `allreduce_shared.py` | Tile geometry, the inbox cache policy, and the peer store and load primitives. All three kernels use them. |
 
@@ -19,7 +19,7 @@ The host classes are in `aiter/ops/flydsl/`:
 | File | Contents |
 |---|---|
 | `one_shot_allreduce.py` | `OneShotAllReduce`, the host class for the one-shot kernel. |
-| `quick_allreduce_int4.py` | `QuickAllReduceInt4`, the host class for the mesh and the ring. |
+| `quick_allreduce.py` | `FlyQuickAllReduce`, the host class for the mesh and the ring. |
 | `allreduce_policy.py` | The payload-size boundaries between the three kernels, and the tuning ladders. |
 | `allreduce_host_shared.py` | IPC inbox setup, link detection and other host helpers. |
 
@@ -225,7 +225,7 @@ what a test does:
 | Test | FlyDSL kernels | Stock kernels in `bench` |
 |---|---|---|
 | `op_tests/multigpu_tests/test_flydsl_one_shot_allreduce.py` | One-shot | `cdr` and `cdr_naive`, the `CustomAllreduce` kernels with `use_new` on and off, and `rccl` |
-| `op_tests/multigpu_tests/test_flydsl_quick_allreduce_int4.py` | Mesh and ring | `hip`, the HIP `QuickAllReduce` kernel at the INT4 regime |
+| `op_tests/multigpu_tests/test_flydsl_quick_allreduce.py` | Mesh and ring | `hip`, the HIP `QuickAllReduce` kernel at the INT4 regime |
 
 A test fails if the arch is not supported, or if a world size that you name
 with `--tp` needs more GPUs than the node has. The default sweep skips the world
@@ -240,7 +240,7 @@ the in-window payloads to FlyDSL, and that the result is correct.
 
 ```bash
 python3 op_tests/multigpu_tests/test_flydsl_one_shot_allreduce.py --scenario bench --tp 4
-python3 op_tests/multigpu_tests/test_flydsl_quick_allreduce_int4.py --scenario bench \
+python3 op_tests/multigpu_tests/test_flydsl_quick_allreduce.py --scenario bench \
     --tp 4 --report /tmp/int4.md
 ```
 

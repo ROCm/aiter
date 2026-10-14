@@ -83,7 +83,7 @@ __all__ = [
     "TILE_BYTES",
     "WORLD",
     "clamp_grid_cap",
-    "make_quick_allreduce_int4_kernel",
+    "make_quick_allreduce_mesh_kernel",
 ]
 
 PHASES = 2
@@ -126,7 +126,7 @@ def clamp_grid_cap(
         raise ValueError("block must be positive")
     if arch not in SUPPORTED_ARCHS:
         raise ValueError(
-            f"quick_allreduce_int4 has no residency measurement for {arch!r}"
+            f"quick_allreduce_mesh has no residency measurement for {arch!r}"
         )
     key = (int(world_size), int(super_tile))
     resident = _RESIDENT_WGS_PER_CU.get(key)
@@ -134,7 +134,7 @@ def clamp_grid_cap(
         for_world = [v for (w, _st), v in _RESIDENT_WGS_PER_CU.items() if w == key[0]]
         if not for_world:
             raise ValueError(
-                "quick_allreduce_int4 has no residency measurement for "
+                "quick_allreduce_mesh has no residency measurement for "
                 f"world_size={world_size}"
             )
         resident = min(for_world)
@@ -147,7 +147,7 @@ def clamp_grid_cap(
 MESH_CODECS = ("int4", "fp16")
 
 
-def make_quick_allreduce_int4_kernel(
+def make_quick_allreduce_mesh_kernel(
     *,
     world_size: int = WORLD,
     super_tile: int = 1,
@@ -234,7 +234,7 @@ def make_quick_allreduce_int4_kernel(
     flags_i32 = PHASES * grid * world_size
 
     @flyc.kernel(known_block_size=[block, 1, 1])
-    def quick_allreduce_int4(
+    def quick_allreduce_mesh(
         rank: Int32,
         nbytes: Int64,
         num_tiles: Int32,
@@ -554,7 +554,7 @@ def make_quick_allreduce_int4_kernel(
 
         # Stride by the *launched* grid, not the compile-time cap. The host
         # launches fewer blocks than `grid` whenever it wants each block to own
-        # several tiles (see QuickAllReduceInt4._grid_x); striding by the cap instead would
+        # several tiles (see FlyQuickAllReduce._grid_x); striding by the cap instead would
         # silently leave every tile above n_blocks unprocessed. `grid` still
         # sizes the wire slots and colour array, so n_blocks <= grid always.
         n_block_tiles = (num_tiles - bid + n_blocks - fx.Int32(1)) // n_blocks
@@ -649,7 +649,7 @@ def make_quick_allreduce_int4_kernel(
     flat_wg = f"{block},{block}"
 
     @flyc.jit
-    def launch_quick_allreduce_int4(
+    def launch_quick_allreduce_mesh(
         rank: Int32,
         nbytes: Int64,
         num_tiles: Int32,
@@ -660,7 +660,7 @@ def make_quick_allreduce_int4_kernel(
         grid_x: Int32,
         stream: Stream = Stream(None),  # noqa: B008
     ):
-        quick_allreduce_int4(
+        quick_allreduce_mesh(
             rank,
             nbytes,
             num_tiles,
@@ -678,13 +678,13 @@ def make_quick_allreduce_int4_kernel(
 
     tag = f"ws{world_size}_r{self_rank}_st{super_tile}_g{grid}_{inbox_memory}"
     tag += f"_{codec}_b{block}"
-    launch_quick_allreduce_int4.func.__name__ = f"launch_quick_allreduce_int4_{tag}"
+    launch_quick_allreduce_mesh.func.__name__ = f"launch_quick_allreduce_mesh_{tag}"
     try:
-        quick_allreduce_int4.func.__name__ = f"quick_allreduce_int4_{tag}"
+        quick_allreduce_mesh.func.__name__ = f"quick_allreduce_mesh_{tag}"
     except AttributeError:
         pass
     return {
-        "launch": launch_quick_allreduce_int4,
+        "launch": launch_quick_allreduce_mesh,
         "flags_bytes": flags_i32 * 4,
         "data_bytes": PHASES * grid * world_size * wire_tile_bytes,
         "lds_bytes": lds_bytes,
