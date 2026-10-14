@@ -1271,188 +1271,6 @@ def test_route_workspace_token_capacity():
     aiter.logger.info("moe_2stage: route workspace capacity passed")
 
 
-def test_bm16_tiled_scale_boundary():
-    """Validate tuned BM16 dispatch and the 33-row scale boundary."""
-    if get_gfx() != "gfx950":
-        aiter.logger.info("skip BM16 tiled-scale boundary test on %s", get_gfx())
-        return
-
-    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
-
-    expected_kernels = (
-        "flydsl_moe1_afp8_wfp4_bf16_t16x128x256_w3_gui_fp8",
-        "flydsl_moe2_afp8_wfp4_bf16_t16x256x256_atomic",
-    )
-    for token in (32, 64):
-        metadata = get_2stage_cfgs(
-            get_padded_M(token),
-            7168,
-            512,
-            385,
-            7,
-            torch.bfloat16,
-            dtypes.fp8,
-            dtypes.fp4x2,
-            aiter.QuantType.per_1x32,
-            True,
-            aiter.ActivationType.Silu,
-            False,
-            0,
-            0,
-            True,
-            GateMode.INTERLEAVE.value,
-        )
-        assert metadata.block_m == 16
-        stages = (metadata.stage1, metadata.stage2)
-        kernel_names = tuple(stage.keywords["kernelName"] for stage in stages)
-        assert kernel_names == expected_kernels
-        stage1_params = get_flydsl_kernel_params(kernel_names[0])
-        stage2_params = get_flydsl_kernel_params(kernel_names[1])
-        assert stage1_params is not None
-        assert stage2_params is not None
-        assert stage1_params["tile_m"] == 16
-        assert stage1_params["waves_per_eu"] == 3
-        assert stage2_params["tile_m"] == 16
-        assert stage2_params["tile_n"] == 256
-        assert stage2_params.get("xcd_swizzle", 0) == 0
-
-    old_moe_bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
-    os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
-    torch.manual_seed(0)
-    try:
-        test_fmoe(
-            dtype=torch.bfloat16,
-            token=33,
-            model_dim=7168,
-            inter_dim=512,
-            E=385,
-            topk=7,
-            actType=aiter.ActivationType.Silu,
-            gateMode=GateMode.INTERLEAVE.value,
-            qType=aiter.QuantType.per_1x32,
-            AQDType=dtypes.fp8,
-            WQDType=dtypes.fp4x2,
-            use_g1u1=True,
-            strict_accuracy=True,
-            check_aot_cache=False,
-        )
-    finally:
-        if old_moe_bound is None:
-            os.environ.pop("AITER_BF16_FP8_MOE_BOUND", None)
-        else:
-            os.environ["AITER_BF16_FP8_MOE_BOUND"] = old_moe_bound
-
-
-def test_output_buffer_contract():
-    """Validate output identity, copy-back, validation, and compile contracts."""
-    torch.manual_seed(0)
-    token, model_dim, inter_dim, E, topk = 32, 512, 256, 8, 2
-    dtype = dtypes.bf16
-    hidden = torch.randn((token, model_dim), dtype=dtype) / 10
-    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) / 10
-    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype) / 10
-    gating = torch.randn((token, E), dtype=dtype)
-    topk_weights, topk_ids = fused_topk(hidden, gating, topk, True)
-    args = (hidden, w1, w2, topk_weights, topk_ids)
-
-    ref = fused_moe(*args)
-    # The comparisons below are exact, so check that is a kernel property.
-    assert torch.equal(ref, fused_moe(*args)), "fused_moe is not run-to-run stable"
-
-    def fresh_buffer():
-        return torch.full((token, model_dim), -7.0, dtype=dtype)
-
-    def call_and_read_back(buf):
-        out = fused_moe(*args, output=buf)
-        # Reading buf afterwards is the trap: compiled, it is answered from
-        # whatever the fake said the op returned.
-        return out.sum(), buf.sum()
-
-    sort = aiter.fused_moe._moe_sorting_impl
-
-    def sort_without_output(*a, **kw):
-        kw["output"] = None
-        return sort(*a, **kw)
-
-    # in_place=False stands in for FLAT, adaptive-aux atomic, and grouped gfx1250
-    # paths, which cannot take the caller's buffer and must copy their result into it.
-    for in_place in (True, False):
-        try:
-            if not in_place:
-                aiter.fused_moe._moe_sorting_impl = sort_without_output
-            buf = fresh_buffer()
-            assert fused_moe(*args, output=buf) is buf, f"{in_place=}: buf not returned"
-            assert torch.equal(buf, ref), f"{in_place=}: buf does not hold the result"
-
-            eager = call_and_read_back(fresh_buffer())
-            compiled = torch.compile(call_and_read_back)(fresh_buffer())
-            assert [float(x) for x in eager] == [
-                float(x) for x in compiled
-            ], f"{in_place=}: eager {eager} != compiled {compiled}"
-            assert eager[0] == eager[1] == ref.sum()
-        finally:
-            aiter.fused_moe._moe_sorting_impl = sort
-
-    def expect_raise(described, **kwargs):
-        try:
-            fused_moe(*args, **kwargs)
-        except RuntimeError:
-            return
-        raise AssertionError(f"fused_moe accepted {described}")
-
-    expect_raise("a mis-shaped output", output=torch.empty((token, model_dim + 1)))
-    expect_raise(
-        "an output of the wrong dtype",
-        output=torch.empty((token, model_dim), dtype=dtypes.fp32),
-    )
-    expect_raise(
-        "a non-contiguous output",
-        output=torch.empty((token, model_dim * 2), dtype=dtype)[:, ::2],
-    )
-    # moe_sorting zeroes output before stage1 reads hidden_states.
-    expect_raise("an output overlapping hidden_states", output=hidden)
-
-    # Disjoint slices of one pool are the symmetric-buffer case, and stay legal.
-    pool = torch.zeros((2 * token, model_dim), dtype=dtype)
-    pool[:token] = hidden
-    assert torch.equal(fused_moe(pool[:token], *args[1:], output=pool[token:]), ref)
-
-    stage2_scatter = Stage2ScatterContext(
-        arena_handle=0,
-        combine_input_offset=0,
-        slot_stride_bytes=1,
-        max_tokens_per_rank=token,
-        world_size=1,
-        source_token_map=torch.zeros_like(topk_ids, dtype=dtypes.i32),
-    )
-
-    def call_with_stage2_scatter(buf):
-        return fused_moe(
-            *args,
-            stage2_scatter=stage2_scatter,
-            output=buf,
-        )
-
-    def expect_stage2_scatter_raise(described, call):
-        try:
-            call()
-        except RuntimeError as error:
-            assert "output= is incompatible with stage2_scatter" in str(error)
-            return
-        raise AssertionError(f"fused_moe accepted {described}")
-
-    expect_stage2_scatter_raise(
-        "output with stage2_scatter",
-        lambda: call_with_stage2_scatter(fresh_buffer()),
-    )
-    expect_stage2_scatter_raise(
-        "output with stage2_scatter under torch.compile",
-        lambda: torch.compile(call_with_stage2_scatter)(fresh_buffer()),
-    )
-
-    aiter.logger.info("moe_2stage: output buffer contract passed")
-
-
 def test_presorted_moe_hook():
     """register_presorted_moe() lets a caller's BM=16 route+sort replace fused_moe's.
 
@@ -1679,6 +1497,188 @@ def test_presorted_moe_block_m():
     aiter.logger.info("moe_2stage: presorted MoE block_m contract passed")
 
 
+def test_bm16_tiled_scale_boundary():
+    """Validate tuned BM16 dispatch and the 33-row scale boundary."""
+    if get_gfx() != "gfx950":
+        aiter.logger.info("skip BM16 tiled-scale boundary test on %s", get_gfx())
+        return
+
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    expected_kernels = (
+        "flydsl_moe1_afp8_wfp4_bf16_t16x128x256_w3_gui_fp8",
+        "flydsl_moe2_afp8_wfp4_bf16_t16x256x256_atomic",
+    )
+    for token in (32, 64):
+        metadata = get_2stage_cfgs(
+            get_padded_M(token),
+            7168,
+            512,
+            385,
+            7,
+            torch.bfloat16,
+            dtypes.fp8,
+            dtypes.fp4x2,
+            aiter.QuantType.per_1x32,
+            True,
+            aiter.ActivationType.Silu,
+            False,
+            0,
+            0,
+            True,
+            GateMode.INTERLEAVE.value,
+        )
+        assert metadata.block_m == 16
+        stages = (metadata.stage1, metadata.stage2)
+        kernel_names = tuple(stage.keywords["kernelName"] for stage in stages)
+        assert kernel_names == expected_kernels
+        stage1_params = get_flydsl_kernel_params(kernel_names[0])
+        stage2_params = get_flydsl_kernel_params(kernel_names[1])
+        assert stage1_params is not None
+        assert stage2_params is not None
+        assert stage1_params["tile_m"] == 16
+        assert stage1_params["waves_per_eu"] == 3
+        assert stage2_params["tile_m"] == 16
+        assert stage2_params["tile_n"] == 256
+        assert stage2_params.get("xcd_swizzle", 0) == 0
+
+    old_moe_bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
+    os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
+    torch.manual_seed(0)
+    try:
+        test_fmoe(
+            dtype=torch.bfloat16,
+            token=33,
+            model_dim=7168,
+            inter_dim=512,
+            E=385,
+            topk=7,
+            actType=aiter.ActivationType.Silu,
+            gateMode=GateMode.INTERLEAVE.value,
+            qType=aiter.QuantType.per_1x32,
+            AQDType=dtypes.fp8,
+            WQDType=dtypes.fp4x2,
+            use_g1u1=True,
+            strict_accuracy=True,
+            check_aot_cache=False,
+        )
+    finally:
+        if old_moe_bound is None:
+            os.environ.pop("AITER_BF16_FP8_MOE_BOUND", None)
+        else:
+            os.environ["AITER_BF16_FP8_MOE_BOUND"] = old_moe_bound
+
+
+def test_output_buffer_contract():
+    """Validate output identity, copy-back, validation, and compile contracts."""
+    torch.manual_seed(0)
+    token, model_dim, inter_dim, E, topk = 32, 512, 256, 8, 2
+    dtype = dtypes.bf16
+    hidden = torch.randn((token, model_dim), dtype=dtype) / 10
+    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) / 10
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype) / 10
+    gating = torch.randn((token, E), dtype=dtype)
+    topk_weights, topk_ids = fused_topk(hidden, gating, topk, True)
+    args = (hidden, w1, w2, topk_weights, topk_ids)
+
+    ref = fused_moe(*args)
+    # The comparisons below are exact, so check that is a kernel property.
+    assert torch.equal(ref, fused_moe(*args)), "fused_moe is not run-to-run stable"
+
+    def fresh_buffer():
+        return torch.full((token, model_dim), -7.0, dtype=dtype)
+
+    def call_and_read_back(buf):
+        out = fused_moe(*args, output=buf)
+        # Reading buf afterwards is the trap: compiled, it is answered from
+        # whatever the fake said the op returned.
+        return out.sum(), buf.sum()
+
+    sort = aiter.fused_moe._moe_sorting_impl
+
+    def sort_without_output(*a, **kw):
+        kw["output"] = None
+        return sort(*a, **kw)
+
+    # in_place=False stands in for FLAT, adaptive-aux atomic, and grouped gfx1250
+    # paths, which cannot take the caller's buffer and must copy their result into it.
+    for in_place in (True, False):
+        try:
+            if not in_place:
+                aiter.fused_moe._moe_sorting_impl = sort_without_output
+            buf = fresh_buffer()
+            assert fused_moe(*args, output=buf) is buf, f"{in_place=}: buf not returned"
+            assert torch.equal(buf, ref), f"{in_place=}: buf does not hold the result"
+
+            eager = call_and_read_back(fresh_buffer())
+            compiled = torch.compile(call_and_read_back)(fresh_buffer())
+            assert [float(x) for x in eager] == [
+                float(x) for x in compiled
+            ], f"{in_place=}: eager {eager} != compiled {compiled}"
+            assert eager[0] == eager[1] == ref.sum()
+        finally:
+            aiter.fused_moe._moe_sorting_impl = sort
+
+    def expect_raise(described, **kwargs):
+        try:
+            fused_moe(*args, **kwargs)
+        except RuntimeError:
+            return
+        raise AssertionError(f"fused_moe accepted {described}")
+
+    expect_raise("a mis-shaped output", output=torch.empty((token, model_dim + 1)))
+    expect_raise(
+        "an output of the wrong dtype",
+        output=torch.empty((token, model_dim), dtype=dtypes.fp32),
+    )
+    expect_raise(
+        "a non-contiguous output",
+        output=torch.empty((token, model_dim * 2), dtype=dtype)[:, ::2],
+    )
+    # moe_sorting zeroes output before stage1 reads hidden_states.
+    expect_raise("an output overlapping hidden_states", output=hidden)
+
+    # Disjoint slices of one pool are the symmetric-buffer case, and stay legal.
+    pool = torch.zeros((2 * token, model_dim), dtype=dtype)
+    pool[:token] = hidden
+    assert torch.equal(fused_moe(pool[:token], *args[1:], output=pool[token:]), ref)
+
+    stage2_scatter = Stage2ScatterContext(
+        arena_handle=0,
+        combine_input_offset=0,
+        slot_stride_bytes=1,
+        max_tokens_per_rank=token,
+        world_size=1,
+        source_token_map=torch.zeros_like(topk_ids, dtype=dtypes.i32),
+    )
+
+    def call_with_stage2_scatter(buf):
+        return fused_moe(
+            *args,
+            stage2_scatter=stage2_scatter,
+            output=buf,
+        )
+
+    def expect_stage2_scatter_raise(described, call):
+        try:
+            call()
+        except RuntimeError as error:
+            assert "output= is incompatible with stage2_scatter" in str(error)
+            return
+        raise AssertionError(f"fused_moe accepted {described}")
+
+    expect_stage2_scatter_raise(
+        "output with stage2_scatter",
+        lambda: call_with_stage2_scatter(fresh_buffer()),
+    )
+    expect_stage2_scatter_raise(
+        "output with stage2_scatter under torch.compile",
+        lambda: torch.compile(call_with_stage2_scatter)(fresh_buffer()),
+    )
+
+    aiter.logger.info("moe_2stage: output buffer contract passed")
+
+
 def test_swiglu_mxfp4_nonsplit_nobias_dispatch():
     if get_gfx() != "gfx950":
         aiter.logger.info(
@@ -1831,16 +1831,8 @@ if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 else:
     test_output_buffer_contract()
-    test_presorted_moe_wrapper_error()
-    test_presorted_moe_block_m()
     test_swiglu_mxfp4_nonsplit_nobias_dispatch()
     test_swiglu_mxfp4_untagged_layout_dispatch()
-    if get_gfx() == "gfx950":
-        test_presorted_moe_hook()
-    else:
-        aiter.logger.warning(
-            "%s: skipping presorted MoE hook test (a4w4 is gfx950-only)", get_gfx()
-        )
     # Skip unrelated tuned-CSV validation for an explicit CLI quant sweep.
     if not args.no_flydsl_csv and args.quant is None:
         _case_iters.append(
@@ -1852,6 +1844,14 @@ else:
         )
     if not args.no_legacy:
         _case_iters.append(_iter_legacy_cases())
+    test_presorted_moe_wrapper_error()
+    test_presorted_moe_block_m()
+    if get_gfx() == "gfx950":
+        test_presorted_moe_hook()
+    else:
+        aiter.logger.warning(
+            "%s: skipping presorted MoE hook test (a4w4 is gfx950-only)", get_gfx()
+        )
 case_iter = itertools.chain(*_case_iters)
 
 _csv_out = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
