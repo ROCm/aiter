@@ -567,6 +567,7 @@ def pa_persistent_fwd(
     softmax_scale: float | None = None,
     mask: int = 0,
     quant_type: QuantType = QuantType.per_Token,
+    high_precision: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     device = Q.device
     total_s, nhead, v_head_dim = output.shape
@@ -602,6 +603,7 @@ def pa_persistent_fwd(
         logits,
         splitLse,
         mask,
+        high_precision=high_precision,
         quant_type=quant_type,
     )
     pa_reduce_v1(
@@ -786,6 +788,20 @@ MD_NAME = "module_mla_asm"
 
 
 @compile_ops(MD_NAME, ffi_type="ctypes")
+def mla_ps64_qh128_fp8_asm_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor | None,
+    q_scale: torch.Tensor,
+    kv_scale: torch.Tensor,
+    softmax_scale: float,
+) -> None: ...
+
+
+@compile_ops(MD_NAME, ffi_type="ctypes")
 def mla_decode_stage1_asm_fwd(
     # [num_seqs, num_heads, head_size]
     Q: torch.Tensor,
@@ -859,94 +875,6 @@ def mla_ps1_fp8_asm_fwd(
     g_kv_indptr: torch.Tensor | None = None,
     cp_world_size: int = 1,
     cp_rank: int = 0,
-) -> None: ...
-
-
-MD_NAME_V4 = "module_mla_v4_asm"
-
-
-@compile_ops(MD_NAME_V4, ffi_type="ctypes")
-def mla_decode_v4_asm(
-    # [total_query_len, num_heads, head_size]   FP8 packed Q + e8m0 scale region
-    Q: torch.Tensor,
-    # [total_query_len, num_heads, kv_rotary]   BF16
-    qrope: torch.Tensor,
-    # [num_page, page_size, num_kv_heads, head_size]  FP8
-    KV: torch.Tensor,
-    # [num_page, page_size, num_kv_heads, kv_rotary]  BF16
-    kvrope: torch.Tensor,
-    # [num_seqs+1]
-    qo_indptr: torch.Tensor,
-    # [num_seqs+1]
-    kv_indptr: torch.Tensor,
-    # [num_page_used]
-    kv_page_indices: torch.Tensor,
-    # [num_seqs+1]
-    split_indptr: torch.Tensor,
-    # [num_heads] FP32 -- attention sink logit. Loaded by the kernel via
-    # kernarg slot 18 (byte offset 0x120). Caller must ALWAYS pass a real
-    # tensor; there is no nullable-sink convention on the C ABI. Pass
-    # torch.full((num_heads,), float("-inf")) for "no sink" math.
-    sink: torch.Tensor,
-    max_seqlen_q: int,
-    # ignored on v4 nm; kernel hardcodes 1/sqrt(kV4DimNope+kV4DimRope)=1/sqrt(512)
-    softmax_scale: float,
-    # 0 = fp32 split-out path; 1 = bf16 nosplit reduce path
-    out_16_nosplit: int,
-    num_kv_splits: int,
-    # outputs
-    # [num_seqs, num_kv_splits, num_kv_heads, gqa*max_seqlen_q, v_head_dim] FP32
-    splitData: torch.Tensor,
-    # [num_seqs, num_kv_splits, num_kv_heads, gqa*max_seqlen_q, 1]          FP32
-    splitLse: torch.Tensor,
-    # [total_query_len, num_heads, v_head_dim] BF16 (used when out_16_nosplit==1)
-    output: torch.Tensor,
-    # [num_seqs] int32 scratch for gfx1250 packed MLA kernels. Holds the
-    # per-request valid kv-split count the kernel writes (slot 19). Pass a
-    # real tensor when use_valid_split_count_reduce != 0; otherwise the
-    # kernel skips the write and nullptr is fine.
-    valid_split_count: torch.Tensor | None = None,
-    use_valid_split_count_reduce: int = 0,
-    # [num_seqs] int32. Unused on the v4 nm path (page_size=1 -> the kernel derives
-    # kv_seq_len from the token-level kv_indptr). Optional/nullable: None sends a
-    # nullptr; the host guards the deref (asm_mla_v4.cu) and the kernel never loads
-    # through it. Placed at the tail because it carries no data on this path.
-    kv_last_page_lens: torch.Tensor | None = None,
-) -> None: ...
-
-
-@compile_ops(MD_NAME_V4, ffi_type="ctypes")
-def mla_decode_v4_ps_asm(
-    # [N, 128, 512] FP8 packed Q + e8m0 scale region
-    Q: torch.Tensor,
-    # [N, 128, 64] BF16
-    qrope: torch.Tensor,
-    # [rows, ..., 512] FP8 packed KV pool (row-dense, page_size 1)
-    KV: torch.Tensor,
-    # [rows, ..., 64] BF16
-    kvrope: torch.Tensor,
-    # [>= N+1] int32
-    kv_indptr: torch.Tensor,
-    # [*] int32
-    kv_page_indices: torch.Tensor,
-    # [128] FP32 attention sink logit
-    sink: torch.Tensor,
-    # workspace (aiter.mla.get_mla_v4_nm_ps_workspace); P = desc.size(0)
-    # [2P, 128, 512] FP32
-    o_acc: torch.Tensor,
-    # [2P, 128] FP32
-    lse_acc: torch.Tensor,
-    # [P, 8] int32
-    desc: torch.Tensor,
-    # int32 counters, zero at rest
-    cnt: torch.Tensor,
-    # int32 arange
-    arange: torch.Tensor,
-    # outputs
-    # [N, 128, 512] BF16
-    output: torch.Tensor,
-    # [N, 128] FP32 natural-log LSE (sink included); None = not written
-    lse: torch.Tensor | None = None,
 ) -> None: ...
 
 
