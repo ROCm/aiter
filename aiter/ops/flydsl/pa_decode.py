@@ -15,7 +15,7 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
-from .kernels.pa_decode.traits import d256_m1_pipe
+from .kernels.pa_decode.traits import d256_pipe
 from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
 from .kernels.pa_decode_plan import PADecodePlan
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
@@ -184,8 +184,10 @@ def pa_decode(
     A 4D ``key_cache`` selects the NHD layout: K and V are equally shaped
     [num_blocks, 64, num_kv_heads, 256] views with a contiguous head axis and
     arbitrary other strides, e.g. both halves of one 512-byte token row. NHD
-    requires gfx950, FP8 KV, head 256, page 64, query_length 1, one query
-    M-tile, per-tensor scales, and no sliding window. Each view must be 16-byte
+    requires gfx950, FP8 KV, head 256, page 64, per-tensor scales, no sliding
+    window, and a uniform query_length whose rows (query_length times the GQA
+    group size) fit two 16-row M-tiles, e.g. query_length 1-4 at GQA 8. Each
+    view must be 16-byte
     aligned with 16-byte multiple strides, its token rows must not overlap, and
     its strides and in-page span must fit int32; heads-outermost storage with
     several KV heads is thus limited to 2 GiB per head.
@@ -622,7 +624,7 @@ def pa_decode(
     stride_k_block = stride_k_token = stride_k_head = 0
     stride_v_block = stride_v_token = stride_v_head = 0
     if nhd_layout:
-        if not d256_m1_pipe(
+        if not d256_pipe(
             arch,
             kv_dtype,
             head_dim,
@@ -635,8 +637,8 @@ def pa_decode(
         ):
             raise NotImplementedError(
                 "NHD pa_decode requires gfx950, FP8 KV, head 256, page 64, "
-                "query_length 1, one query M-tile, per-tensor scales, and no "
-                "sliding window"
+                "per-tensor scales, no sliding window, and a uniform "
+                "query_length * query_group_size of at most 32 rows"
             )
         stride_k_block, stride_k_token, stride_k_head = _nhd_strides(key_cache)
         stride_v_block, stride_v_token, stride_v_head = _nhd_strides(value_cache)

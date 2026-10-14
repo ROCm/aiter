@@ -288,9 +288,10 @@ _BF16_CASES = _COMMON_CASES + [
     ],
     ("graph-workspace", {"query_length": 4, "max_partitions": 7, "capture": True}),
 ]
-# FP8 per-tensor head 256, page 64, plain V: the gfx950 pipe. Dense CU-count
-# budgets and a plan-independent staging bound select its specialization; other
-# architectures run the same cases on the generic path.
+# FP8 per-tensor head 256, page 64, plain V, uniform query length with at most
+# 32 query rows: the gfx950 pipe. Dense CU-count budgets and a plan-independent
+# staging bound select its specialization; other architectures run the same
+# cases on the generic path.
 _PIPE_BASE = {
     "kv_dtype": "fp8",
     "scale_mode": "per-tensor",
@@ -303,14 +304,14 @@ _PIPE_BASE = {
 _NHD_BASE = {**_PIPE_BASE, "layout": "nhd"}
 _PIPE_CASES = [
     (
-        "d256-m1-page64",
+        "d256-page64",
         {**_PIPE_BASE, "lengths": (0, 1, 255, 256, 257, 8192), "max_partitions": 8},
     ),
     # Above 64 partitions the head-256 reducer splits partitions over four
     # groups; 130 leaves the last group short, and sequences with few or no
     # tasks exercise the inactive-partition masking.
     (
-        "d256-m1-page64-np130",
+        "d256-page64-np130",
         {
             **_PIPE_BASE,
             "lengths": (0, 1, 257, 66532),
@@ -322,7 +323,7 @@ _PIPE_CASES = [
     ),
     # Table padding wider than 4096 page ids per task cannot be staged.
     (
-        "d256-m1-unstaged",
+        "d256-unstaged",
         {
             **_PIPE_BASE,
             "lengths": (1, 65, 8192),
@@ -353,6 +354,72 @@ _PIPE_CASES = [
             "max_partitions": 8,
             "nhd_bufs": 2,
             "nhd_contracts": True,
+        },
+    ),
+    # Uniform MTP: query_length * 8 rows fill one M-tile at length 2 and two at
+    # 3 and 4 (3 pads the second). Each length puts some row's causal edge on a
+    # page or tile boundary, and lengths below query_length leave rows empty.
+    # P is FP8, so random rows see 0, 1 or at least 6 tokens; the one-hot case
+    # covers 2 to 5 with exact probabilities.
+    (
+        "nhd-d256-page64-q2",
+        {
+            **_NHD_BASE,
+            "query_length": 2,
+            "lengths": (0, 1, 65, 257, 8192),
+            "max_partitions": 8,
+        },
+    ),
+    # Packed plain V takes the same pipe.
+    (
+        "d256-page64-q2",
+        {
+            **_PIPE_BASE,
+            "query_length": 2,
+            "lengths": (0, 1, 65, 257, 8192),
+            "max_partitions": 8,
+        },
+    ),
+    (
+        "nhd-d256-page64-q3",
+        {
+            **_NHD_BASE,
+            "query_length": 3,
+            "lengths": (1, 65, 257, 2049),
+            "max_partitions": 8,
+        },
+    ),
+    (
+        "nhd-d256-page64-q4",
+        {
+            **_NHD_BASE,
+            "query_length": 4,
+            "lengths": (1, 66, 258, 8192),
+            "max_partitions": 8,
+            "capture": True,
+        },
+    ),
+    (
+        "nhd-d256-page64-q4-short",
+        {
+            **_NHD_BASE,
+            "query_length": 4,
+            "lengths": (0, 1, 2, 3, 5, 257),
+            "max_partitions": 8,
+            "pattern": "one_hot_token",
+        },
+    ),
+    # Every row must reach the reducer: a dropped row or tile changes a channel.
+    (
+        "nhd-d256-page64-q4-np130",
+        {
+            **_NHD_BASE,
+            "query_length": 4,
+            "lengths": (0, 1, 257, 66532),
+            "max_partitions": 130,
+            "budget": 130,
+            "pattern": "one_hot_v",
+            "parallel_reduce": True,
         },
     ),
 ]
@@ -407,19 +474,20 @@ def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
         )
 
 
-def _one_hot_kv(key, value, table, context, compute_type):
-    """Zero K and one-hot V in channel (token // 256) % dim.
+def _one_hot_kv(key, value, table, context, compute_type, tokens_per_channel=256):
+    """Zero K and one-hot V in channel (token // tokens_per_channel) % dim.
 
-    Each tile then owns one output channel, so a task that drops or repeats a
-    tile changes that channel's mean. Scales are explicit because a zero K must
-    not reach the quantizer.
+    With 256 tokens per channel each tile owns one output channel, so a task
+    that drops or repeats a tile changes that channel's mean. With one, a row's
+    output marks exactly the tokens it sees, and zero K keeps FP8 P exact.
+    Scales are explicit because a zero K must not reach the quantizer.
     """
     dim, page = value.shape[-1], value.shape[2]
     dense = torch.zeros(value.shape, dtype=torch.float32, device=value.device)
     for seq, length in enumerate(context.tolist()):
         tokens = torch.arange(length, device=value.device)
         pages = table[seq, tokens // page].long()
-        dense[pages, :, tokens % page, (tokens // 256) % dim] = 224
+        dense[pages, :, tokens % page, (tokens // tokens_per_channel) % dim] = 224
     scale = torch.ones(1, dtype=torch.float32, device=value.device)
     return (
         torch.zeros_like(key, dtype=compute_type),
@@ -458,7 +526,7 @@ def _check_pipe_policy(case, arch, compile_kwargs, reducer_kwargs):
     from aiter.ops.flydsl.kernels.pa_decode.traits import PaDecodeSchedule
 
     if case["pipe"]:
-        # The cache key ends with (D256_M1_PIPE, staged page ids, NHD, NHD V buffers).
+        # The cache key ends with (D256_PIPE, staged page ids, NHD, NHD V buffers).
         pipe, staged, _, nhd_bufs = PaDecodeSchedule.select(
             **compile_kwargs[-1]
         ).cache_key[-4:]
@@ -610,9 +678,10 @@ def test_pa_decode(case, device, monkeypatch):
         )
         vector = 16
         mode = case["scale_mode"]
-        if case["pattern"] == "one_hot_v":
+        if case["pattern"] in ("one_hot_v", "one_hot_token"):
+            tokens_per_channel = 1 if case["pattern"] == "one_hot_token" else 256
             key, key_scale, value, value_scale = _one_hot_kv(
-                key, value, table, context, compute_type
+                key, value, table, context, compute_type, tokens_per_channel
             )
         elif mode in ("per-tensor", "per-token"):
             quantize = pertoken_quant if mode == "per-token" else per_tensor_quant
@@ -763,7 +832,7 @@ def test_stage_bound_covers_plan(device):
 
 
 def test_pa_decode_nhd_rejected(device, monkeypatch):
-    """NHD is the gfx950 FP8 per-tensor dense page-64 single-token path only."""
+    """NHD is the gfx950 FP8 per-tensor dense page-64 path, at most 32 query rows."""
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
     fp8 = (
         torch.float8_e4m3fn if get_gfx_runtime() == "gfx950" else torch.float8_e4m3fnuz
@@ -778,7 +847,8 @@ def test_pa_decode_nhd_rejected(device, monkeypatch):
     monkeypatch.setattr(pa, "compile_pa_decode_tile", unexpected_compile)
     for variant in variants:
         page = 128 if variant == "page128" else 64
-        query_length = 2 if variant == "mtp" else 1
+        # GQA 8: query length 5 is 40 rows, past the pipe's two M-tiles.
+        query_length = 5 if variant == "mtp" else 1
         window = 1 if variant == "window" else 0
         dtype = torch.bfloat16 if variant == "bf16" else fp8
         query = torch.zeros((query_length, 8, 256), dtype=torch.bfloat16, device=device)

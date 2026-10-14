@@ -17,8 +17,9 @@ from pathlib import Path
 import torch
 from flydsl.autotune import Config, autotune
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.pa_decode import implementation_cache_tag
-from aiter.ops.flydsl.kernels.pa_decode.traits import d256_m1_pipe
+from aiter.ops.flydsl.kernels.pa_decode.traits import d256_pipe
 from aiter.ops.flydsl.kernels.pa_decode_plan import PADecodePlan, plan_pa_decode
 from aiter.ops.flydsl.pa_decode import pa_decode
 
@@ -172,7 +173,7 @@ def _default_workgroup_budget(
     sliding_window,
 ):
     """CU count for the head-256 pipe, otherwise two CTAs per CU."""
-    one_cta_per_cu = d256_m1_pipe(
+    one_cta_per_cu = d256_pipe(
         arch,
         "fp8" if "float8" in kv_dtype else "bf16",
         head_dim,
@@ -310,7 +311,7 @@ def prepare_pa_decode_plan(
     Call outside graph capture with the actual decode tensors/options. Native
     cache hits and misses with the default do not launch candidates. The default
     budget is the CU count for the one-CTA-per-CU head-256 pipe shapes (see
-    ``d256_m1_pipe``) and twice the CU count otherwise.
+    ``d256_pipe``) and twice the CU count otherwise.
     Set FLYDSL_AUTOTUNE=1 to prepare candidate workspaces/graphs and search with
     FlyDSL's default benchmark and fastest-config selection. Candidates must
     agree with the 2*CU baseline before timing.
@@ -339,7 +340,7 @@ def prepare_pa_decode_plan(
         num_cu = properties.multi_processor_count
         limit = num_cu if max_partitions is None else max_partitions
         num_kv_heads, block_size, layout = _cache_geometry(key_cache)
-        arch = properties.gcnArchName.split(":", 1)[0]
+        arch = get_gfx_runtime()
         window = (
             max(sliding_window, 0)
             if isinstance(sliding_window, int)
@@ -634,7 +635,7 @@ def main(argv=None):
     torch.cuda.set_device(args.device)
     device = torch.device("cuda", args.device)
     properties = torch.cuda.get_device_properties(device)
-    arch = properties.gcnArchName.split(":", 1)[0]
+    arch = get_gfx_runtime()
     if arch not in ("gfx942", "gfx950"):
         raise RuntimeError(f"PA decode tuning only supports gfx942/gfx950, got {arch}")
     if (

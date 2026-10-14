@@ -353,7 +353,7 @@ class PaDecodeKVLoader:
         return _load
 
     def init_loaders(self):
-        if const_expr(self.traits.D256_M1_PIPE):
+        if const_expr(self.traits.D256_PIPE):
             self._k_load_vector = self._make_nt_k_loader(self.ctx.key_cache_ptr)
         else:
             self._k_load_vector = self._make_raw_flat_loader(

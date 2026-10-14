@@ -6,7 +6,8 @@
 K/V use e4m3 (FNUZ on gfx942, OCP on gfx950); BF16/FP16 Q and probabilities P
 are quantized to FP8. Q/key scales fold into QK, value scale and 1/FP8_MAX into
 the epilogue; softmax max/sum stay f32. Tuned gfx950 BF16 per-token MTP3/MTP4
-uses K128 MFMA instead of K32, preserving normalized Q/P and operand layouts.
+and the head-256 page-64 pipe use K128 MFMA instead of K32, preserving normalized
+Q/P and operand layouts.
 Every FP8-path Q row uses absmax normalization; per-tensor and per-token K/V scales
 retain range normalization for P.
 BF16 K/V use vector-8 caches and native BF16 Q/K/P/V MFMA operands, with
@@ -17,7 +18,7 @@ Logical layouts (not preshuffled):
 * ``query``        [num_seqs * query_length, num_q_heads, head_dim]  f16/bf16
 * ``key_cache``    [num_blocks, num_kv_heads, head_dim//x, block_size, x]
                    or NHD [num_blocks, 64, num_kv_heads, 256] (strided, head contiguous;
-                   gfx950 FP8 head 256, page 64, one query M-tile only)
+                   gfx950 FP8 head 256, page 64, at most two query M-tiles)
 * ``value_cache``  [num_blocks, num_kv_heads, block_size//x, head_dim, x] (trans_v)
                    or [num_blocks, num_kv_heads, head_dim, block_size] (FP8 plain)
                    where x=16 for FP8 and x=8 for BF16; with NHD K, an NHD view of
