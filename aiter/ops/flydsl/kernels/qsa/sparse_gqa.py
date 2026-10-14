@@ -118,11 +118,9 @@ def _launch_config(
 ) -> tuple[int, int, int]:
     """Return ``(BLOCK_N, threads, splits)`` using the tuned policy."""
     base_programs = rows * n_kv_heads
-    # These bands used to mirror live AMD's (64 splits to base_programs 4,
-    # then 32) and were fitted only at D=256. Both ceilings measured too low
-    # at both head widths: 64 splits wins out to base_programs 12 at D=256
-    # and 16 at D=128, by 1.6-9.1%, and the 128-split band reaches 4 rather
-    # than 2 at D=128. BLOCK_N and the wave count did not move with D.
+    # Split bands follow head width: D<=128 uses (4, 16), and wider D uses
+    # (2, 12). The launch takes 128 splits, then 64, then 32, as
+    # ``base_programs`` crosses those ceilings.
     tiny_max, mid_max = (
         _DECODE_BANDS_NARROW if head_dim <= _NARROW_HEAD_DIM else _DECODE_BANDS_WIDE
     )

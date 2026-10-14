@@ -11,7 +11,7 @@ Two layers:
     the table is wider than 20000 columns and ``M<=64``),
     ``bench_qsa_gluon_parity_k1`` (H=8 emit; long-``L`` is H=8; the published
     page-size-8 point stays H=4),
-    ``bench_qsa_flash_next_k2`` (3d decode ``M<=8`` and a separate prefill table),
+    ``bench_qsa_flash_next_k2`` (decode ``M<=8`` and a separate prefill table),
     ``bench_qsa_flash_next_e2e`` / ``bench_qsa_gluon_parity_e2e`` (indexer through
     GQA; Gluon-parity keeps both head counts),
     ``bench_qsa_flash_next_e2e_graph`` (HIP graph replay at decode).
@@ -2392,7 +2392,7 @@ def bench_qsa_flash_next_k1(
 ):
     """Flash-Next FlyDSL indexer vs oracle set equality.
 
-    2d: short rows use fused emit. Long rows use BLOCK_N=32 BF16 MFMA scoring
+    Short rows use fused emit. Long rows use BLOCK_N=32 BF16 MFMA scoring
     into an fp32 score matrix. Selection is decode radix below 32768 columns
     and streaming radix at or above that width. Single-request prefill scores
     16 query rows per workgroup. The FlyDSL column times block ids and then
@@ -2521,7 +2521,7 @@ def bench_qsa_flash_next_k2(
 ):
     """Flash-Next FlyDSL sparse GQA vs the oracle.
 
-    3d: live-AMD-shaped BLOCK_N/threads/split policy, tiled MFMA QK/PV,
+    Live-AMD-shaped BLOCK_N/threads/split policy, tiled MFMA QK/PV,
     log2 online softmax, direct output at one split, and a two-wave merge.
     Expand and sigmoid stay unfused. The FlyDSL column passes the packed
     live prefix as ``n_sel`` so the split grid follows filled columns.
@@ -2670,7 +2670,7 @@ def bench_qsa_gluon_parity_k1(
 ):
     """Gluon-parity FlyDSL indexer vs oracle set equality.
 
-    2e/2f: emit on ``n_blocks <= 512``. Longer rows use the Flash-Next MFMA
+    Emit on ``n_blocks <= 512``. Longer rows use the Flash-Next MFMA
     scorer plus radix (``H=8`` is a second compile). ``H`` 4 and 8 emit
     share one kernel. Separate table from Flash-Next. Expand is not fused.
     ``pad_pages`` widens the block table every column sees; ``0`` keeps it

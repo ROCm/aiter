@@ -71,8 +71,8 @@ class QsaGqaSpec:
     head_dim: int
     rope_dim: int
     dtype: torch.dtype = torch.bfloat16
-    # Sigmoid output gate is fused in K2 later; the oracle attends, then
-    # callers may multiply ``o * sigmoid(gate)`` outside.
+    # The oracle does not apply the sigmoid output gate. Callers may
+    # multiply ``o * sigmoid(gate)`` outside.
     sigmoid_gate: bool = True
 
     @property

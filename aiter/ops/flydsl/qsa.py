@@ -80,9 +80,11 @@ def _qsa_arch() -> str:
     return arch
 
 
-# GQA query ``(n_q_heads, head_dim)`` -> the indexer head counts swept with
-# it. An unswept rank-3 pair still runs; the table only feeds the warning.
-# The measured thing is the pair.
+# GQA query ``(Hq, D)`` -> indexer head counts swept with it.
+# An unswept rank-3 pair still runs; the table only feeds the warning.
+# Sparse GQA does not read this table. Its grid is ``(rows, kv_heads, splits)``
+# from ``_launch_config``, so a different KV-head count is a different grid.
+# M past 512 reuses the M=512 single-split config.
 _FLYDSL_DISPATCH_TABLE = {
     (24, 256): (4, 8),  # Flash-Next / qwen4_exp, TP1
     (12, 256): (4, 8),  # Flash-Next TP2: 12 query heads, 1 KV head
@@ -90,29 +92,6 @@ _FLYDSL_DISPATCH_TABLE = {
     (3, 256): (4, 8),  # Flash-Next TP8: 3 query heads, 1 KV head
     (10, 128): (4, 8),
 }
-
-# GPU 6 / gfx950, cold ``--rotate 0``, page_size 16, M in {1, 2, 3, 4, 6, 8,
-# 12, 16, 32, 64, 128, 256, 512} crossed with L in {512, 2048, 8192, 32768}.
-# All 104 rows won with err=0: 24x256 by 1.03x to 1.67x, 10x128 by
-# 1.17x to 2.66x, and 10x128 also won at both indexer widths. The same grid
-# with an 8-head indexer on 24x256 also won all 52 rows, err=0, by 1.08x to
-# 1.70x. Indexer width does not change the K2 ladder. That reaches
-# every launch config the K2 policy can pick, and M past 512 reuses M=512's
-# BN32 single-split config with a larger grid, so neither M nor the
-# selection width filters this gate. The ``_launch_config`` decode bands are
-# now fitted at both head widths. A per-rank shard with a different KV-head
-# count is still its own grid, because the K2 launch is
-# ``(rows, kv_heads, splits)``. GPU 7 / gfx942, cold ``rotate=0``, page size
-# 16, the same M x L grid: q ``[M, 12, 256]`` over 1 KV head and the
-# replicated 4-head indexer. All 52 rows won with err=0, by 1.73x
-# to 6.06x. The same grid with an 8-head indexer also won all 52 rows,
-# FlyDSL err=0, by 1.46x to 4.86x. GPU 6 / gfx950, the same cold grid:
-# q ``[M, 6, 256]`` over 1 KV head (Flash-Next TP4, group 6). The 4-head
-# indexer won all 52 rows with err=0, by 1.28x to 3.29x. The 8-head indexer
-# also won all 52, FlyDSL err=0, by 1.38x to 3.28x. The same gfx950 grid
-# with q ``[M, 3, 256]`` over 1 KV head (Flash-Next TP8, group 3) won all
-# 52 rows at both indexer widths, FlyDSL err=0: 4-head by 1.21x to 3.29x,
-# 8-head by 1.27x to 3.34x.
 
 __all__ = [
     "qsa_indexer_block_ids",
@@ -179,8 +158,8 @@ def _expand_block_ids(
     token_topk: int,
     indices: torch.Tensor | None,
 ) -> torch.Tensor:
-    # Phase 5 owns fusing expand into K1 or K2. Until then this is the
-    # vendored expand+tail kernel.
+    # Expand is the vendored Triton kernel. It is not fused into the indexer
+    # or sparse GQA.
     from aiter.ops.triton.attention.qsa_expand import expand_qsa_block_indices
 
     return expand_qsa_block_indices(
@@ -341,8 +320,8 @@ def qsa_indexer_score_and_select(
     table, and the selector sees that prefix. A padded table with at
     most 64 rows and at most 20000 live columns uses the one-workgroup
     decode radix. More rows keep the streaming selector. A packed table
-    keeps the old split: stable decode radix below 32768 columns,
-    streaming radix (``tie='low'``) at or above that. ``row_bounded``
+    uses the stable decode radix below 32768 columns and streaming radix
+    (``tie='low'``) at or above that. ``row_bounded``
     runs the one-workgroup decode radix on the full width instead: it
     stops at each row's ``row_lens``, so it needs no readback of the
     widest row.
