@@ -144,7 +144,21 @@ def ptr_buf_tensor(
 
 
 def buf_copy_atom(unit_bytes, elem=fx.Int32, cache_modifier=0):
-    """Copy atom for a ``unit_bytes``-wide buffer access (0=cached, 2=nt)."""
+    """Copy atom for a ``unit_bytes``-wide buffer access (0=cached, 2=nt).
+
+    ``cache_modifier`` is the instruction's raw aux/CPOL field, and its width is
+    architecture-dependent: two bits (sc0, nt) on CDNA3, but gfx1250 puts scope
+    bits above them and passes values like ``CPOL_DEV`` (0x10). It is therefore
+    NOT range-checked here -- a bound that fits one generation rejects a legal
+    value on another, which is what happened when this was briefly capped at 3
+    and five gfx1250 mxfp8 GEMM kernels stopped building. Callers that know
+    their own encoding bound it themselves; the M3 scorers do.
+    """
+    if unit_bytes not in _BUF_COPY_ATOM:
+        raise ValueError(
+            f"unit_bytes {unit_bytes} is not a buffer access width; "
+            f"expected one of {sorted(_BUF_COPY_ATOM)}"
+        )
     return fx.make_copy_atom(_BUF_COPY_ATOM[unit_bytes](cache_modifier), elem)
 
 

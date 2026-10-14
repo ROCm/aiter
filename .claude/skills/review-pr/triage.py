@@ -1080,15 +1080,15 @@ def derive(files, title="", raw_diff=""):
         hit("dispatch-change", "B1 B3 B4 A3")
     # Tier-1 proper: break it and `import aiter` is dead, which earns a full Step 4
     if any(p in ("aiter/__init__.py", "aiter/jit/core.py") for p in paths):
-        hit("tier1-import-chain", "STEP4 E5")
+        hit("tier1-import-chain", "STEP4 E5 C5")
     # Tier-2 backbone: dispatch shared across model families; needs an owner's sign-off
     elif any(p in TIER for p in paths):
-        hit("tier2-dispatch", "E5 E4")
+        hit("tier2-dispatch", "E5 E4 C5")
     # Any other op wrapper: confirm the exported symbols still resolve; no full Step 4
     elif any(p.startswith(("aiter/ops/", "aiter/jit/")) or
              (p.startswith("aiter/") and p.count("/") == 1 and p.endswith(".py"))
              for p in paths):
-        hit("ops-wrapper", "B6")
+        hit("ops-wrapper", "B6 C5")
     if (re.search(r"^\s*(def |void |template)", dele, re.M)
             and re.search(r"^\s*(def |void |template)", add, re.M)) or \
             dropped_parameter(raw_diff):
@@ -1102,7 +1102,7 @@ def derive(files, title="", raw_diff=""):
     if re.search(r"cuda\.Stream|stream=|wait_stream", add):
         hit("async-stream", "G1 G1b")
     if any("flydsl" in p.lower() for p in paths):
-        hit("flydsl", "D10 D10b D12")
+        hit("flydsl", "D10 D10b D12 C5")
     # KERNEL_PY lists the triton and gluon paths and stops there, so a FlyDSL kernel was a
     # kernel to `flydsl` (D10, D10b -- compile-result handling) and to nothing else: 95 of
     # 600 open PRs edit aiter/ops/flydsl/kernels/*.py and derive neither kernel family, so
@@ -1111,7 +1111,7 @@ def derive(files, title="", raw_diff=""):
     # `tl.load`/`tl.store` without a mask, and there is no tl in FlyDSL.
     if any("aiter/ops/flydsl/kernels/" in p and p.endswith(".py") and (f["add"] or f["del"])
            for p, f in files.items()):
-        hit("flydsl-kernel", "A1 B8 D1 D8 D12 P6")
+        hit("flydsl-kernel", "A1 B8 D1 D8 D12 P6 C5")
     if any(d in p for p in paths for d in DOWNSTREAM):
         hit("downstream-op", "E4 E5 A2")   # A2 is the same shared-path condition
     if any("codegen" in p or p.startswith("csrc/cpp_itfs/") or p.endswith("Makefile")
@@ -1220,7 +1220,7 @@ UNREACHABLE_BY_DESIGN = {
     "D11": "evidence-backed: triage.py structabi writes struct_abi.txt in Step 1b",
 }
 
-ALL_RULES = ("A1 A2 A3 B1 B2 B3 B4 B5 B6 B7 C1 C2 C3 C4 D1 D1b D2 D3 D4 D5 D6 D7 D8 "
+ALL_RULES = ("A1 A2 A3 B1 B2 B3 B4 B5 B6 B7 C1 C2 C3 C4 C5 D1 D1b D2 D3 D4 D5 D6 D7 D8 "
              "D10 D10b E1 E2 E3 E4 E5 F1 G1 G1b P1 P2 P3 P4 P5 P6 HK1 HK2 HK3 "
              "T1 T2 T3 T4 T5 T6 T8 D11 HK12 HK12b STEP4")
 

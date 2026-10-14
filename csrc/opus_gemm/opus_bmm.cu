@@ -22,6 +22,7 @@
 #include "gfx950/opus_bmm_launchers_a8w8_mxscale_gfx950.cuh"
 
 #include <unordered_map>
+#include <utility>
 
 #ifdef OPUS_BUILD_HAS_GFX950
 namespace opus_bmm_detail {
@@ -36,6 +37,14 @@ using OpusBmmMxscaleKernel = void (*)(
 
 // Table-driven global exact-kid dispatch. Every registry BMM kid is generated;
 // an unknown id is an error rather than a fallback to another kernel.
+//
+// Throwing beats falling back, and that is worth stating because the fallback
+// looks harmless: adding a codegen tag means three hand-maintained lists in
+// gen_instances.py on top of the five gfx950 maps, and a kid missed by any of
+// them would quietly run another kid's tile, pass the correctness gate, and
+// time identically to its siblings. That is exactly how five different blds
+// tiles once measured within 0.1% of one another (see the kid224/225 note in
+// opus_gemm_common.py).
 static opus_bmm_detail::OpusBmmMxscaleKernel
 opus_bmm_a8w8_mxscale_exact_dispatch(int kid)
 {
@@ -45,10 +54,26 @@ opus_bmm_a8w8_mxscale_exact_dispatch(int kid)
   };
   auto it = kDispatch.find(kid);
   AITER_CHECK(it != kDispatch.end(),
-              "unknown exact OPUS a8w8_mxscale_bmm kid ", kid);
+              "opus_bmm_a8w8_mxscale: kid ", kid, " has no emitted instance. It is "
+              "either not in the catalog or its kernel_tag is missing from one of "
+              "the codegen maps; rebuild with AITER_REBUILD=1 after a codegen edit");
   return it->second;
 }
 #endif  // OPUS_BUILD_HAS_GFX950
+
+// (GROUP_N, GROUP_K) for a kid: 128 for the DSv4 block, 32 for the MX one.
+// Built from the same generated table as the dispatch, so a kid cannot be
+// dispatched with a scale shape nobody checked against its own blocks.
+static std::pair<int, int> opus_bmm_mxscale_kid_groups(int kid)
+{
+  static const std::unordered_map<int, std::pair<int, int>> kGroups = {
+      GENERATE_BMM_MXSCALE_KID_GROUPS
+  };
+  auto it = kGroups.find(kid);
+  AITER_CHECK(it != kGroups.end(),
+              "unknown exact OPUS a8w8_mxscale_bmm kid ", kid);
+  return it->second;
+}
 
 void opus_gemm_a8w8_mxscale_bmm_launch(
     aiter_tensor_t &O,
@@ -63,8 +88,13 @@ void opus_gemm_a8w8_mxscale_bmm_launch(
   // Common dtype/shape validation + arch gate, done once here so the codegen'd
   // launchers (which omit these to stay lean) and the fused kid 100 wrapper share
   // one check. The _impl still re-checks internally (idempotent).
+  // The kid's scale blocks, so the check knows which shape to demand. Looked up
+  // before the arch gate because a wrong-shaped scale is worth reporting on any
+  // device, and the table is compile-time data rather than a kernel.
+  const auto groups = opus_bmm_mxscale_kid_groups(kid);
   opus_bmm_a8w8_common_checks(O, wo_a, Y, x_scale, w_scale,
-                              "opus_gemm_a8w8_mxscale_bmm_launch");
+                              "opus_gemm_a8w8_mxscale_bmm_launch",
+                              groups.first, groups.second);
 #ifndef OPUS_BUILD_HAS_GFX950
   AITER_CHECK(false,
               "opus_gemm_a8w8_mxscale_bmm_launch requires "
