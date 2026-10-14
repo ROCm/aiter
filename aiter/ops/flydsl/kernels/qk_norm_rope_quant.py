@@ -2053,15 +2053,19 @@ def _build_kernel_w32_tdm(
 
             qw = _load_tensor_vec(q_weight, tid) if const_expr(q_weighted) else None
 
-            q_row0 = fx.Tensor(
-                fx.make_view(fx.get_iter(q_in), fx.make_layout((1, D), (D, 1)))
+            q_full = fx.Tensor(
+                fx.make_view(fx.get_iter(q_in), fx.make_layout((num_rows, D), (D, 1)))
             )
-            tdm_atom = fx.rocdl.make_tdm_atom(
-                q_row0,
-                [num_rows, None],
-                strides=[D, None],
+            q_tile = (1, D)
+            tdm_atom, q_coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                fx.rocdl.TensorLoad(),
+                q_full,
+                fx.make_layout(q_tile, (D, 1)),
+                q_tile,
                 num_warps=1,
             )
+            # Row axis stays a rest: fx.copy below indexes it with an i32 tile number.
+            q_blk = fx.zipped_divide(q_coord, q_tile)[None, (None, 0)]
 
             def row_of(tile_idx):
                 return fx.min(tile_idx * RT + wave, nr_m1)
@@ -2070,15 +2074,13 @@ def _build_kernel_w32_tdm(
                 dst = fx.Tensor(
                     fx.make_view(
                         fx.inttoptr(lds_bf16_ptr_ty, lds_i32 + wave_lds_off + buf),
-                        fx.make_layout((1, D), (D, 1)),
+                        fx.make_layout((q_tile, 1), ((D, 1), D)),
                     )
                 )
-                fx.copy(
-                    tdm_atom,
-                    q_row0,
-                    dst,
-                    imm_offset=fx.Int64(row_of(tile_idx)) * (D * eb),
+                ts, tg = fx.rocdl.cdna5.tdm_partition(
+                    tdm_atom, 0, fx.make_layout(1, 1), dst, q_blk
                 )
+                fx.copy(tdm_atom, tg[None, row_of(tile_idx)], ts[None, 0])
 
             def compute_store(buf, tile_idx, cosv, sinv):
                 xv = _concat(
