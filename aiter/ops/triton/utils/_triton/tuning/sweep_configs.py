@@ -261,9 +261,15 @@ def discard(out):
 
 
 def terminate(proc):
-    """The one place a worker is killed and reaped."""
-    os.killpg(proc.pid, signal.SIGKILL)
-    proc.wait()
+    """The one place a worker is stopped and reaped: SIGTERM lets it finish the candidate in
+    hand (killing a worker while its kernels run can fault the GPU on gfx1250); a worker that
+    does not stop within 30 s (a hung kernel or compile) is killed."""
+    os.killpg(proc.pid, signal.SIGTERM)
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
 
 
 def run_worker(command, env, log_path, stall, setup_timeout, stop=STOP):
@@ -568,6 +574,9 @@ def install(spec, args, backend, gpu):
 
 def main(argv=None):
     args = parse_args(argv)
+    signal.signal(
+        signal.SIGTERM, lambda signum, frame: STOP.set()
+    )  # stop the workers cleanly
     spec, gpus = args.kernel, args.gpu
     os.makedirs(args.runs_dir, exist_ok=True)
 
@@ -614,6 +623,8 @@ def main(argv=None):
             print(f"  results: {out}", flush=True)
             candidates = [None] + plan_["configs"]  # None is the installed baseline
             sweep(spec, shape, backend, candidates, out, gpus, args)
+            if STOP.is_set():
+                sys.exit("stopped by SIGTERM; rerun the same command to resume")
             # the installer prefers a final-round file, so an existing one is always refreshed
             if len(gpus) > 1 or os.path.exists(final_results_path(out)):
                 final_round(spec, shape, backend, candidates, out, gpus[0], args)

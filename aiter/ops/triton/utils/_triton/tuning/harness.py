@@ -35,6 +35,7 @@ import fcntl
 import gc
 import json
 import os
+import signal
 import sys
 import time
 from collections import namedtuple
@@ -235,11 +236,22 @@ def next_ready(pending, pool, call, inputs):
         for i, (key, _) in enumerate(pending):
             if key == "baseline" or key in pool.compiled:
                 return pending.pop(i)[1]
+        if STOPPING:
+            sys.exit(0)  # nothing in hand
         if not pool.help_one(call, inputs):
             time.sleep(1)
             waited += 1
             if waited % 30 == 0:
                 print("waiting for the compile-ahead pool", flush=True)
+
+
+STOPPING = []  # set by SIGTERM: finish the candidate in hand, then exit
+
+
+def stop_after_this_candidate(signum, frame):
+    """Killing a worker while its kernels run can fault the GPU on gfx1250, so SIGTERM only
+    asks the worker to stop between two candidates."""
+    STOPPING.append(signum)
 
 
 def precompile(call, inputs, candidates, out, common, done_file=None):
@@ -250,6 +262,8 @@ def precompile(call, inputs, candidates, out, common, done_file=None):
     """
     print("ready", flush=True)  # the driver's watchdog reads the worker's log
     for candidate in candidates:
+        if STOPPING:
+            return
         t0 = time.time()
         try:
             compile_only(call, candidate, inputs)
@@ -367,7 +381,7 @@ def benchmark(
         ),
     )
     print("ready", flush=True)  # the driver's watchdog reads the worker's log
-    while pending:
+    while pending and not STOPPING:
         candidate = next_ready(pending, pool, call, copies[0])
         is_baseline = candidate is None
         append_record(
@@ -466,6 +480,7 @@ def main(argv=None):
         help="stop a candidate after one replay when it is slower than this x the fastest (0: off)",
     )
     args = parser.parse_args(argv)
+    signal.signal(signal.SIGTERM, stop_after_this_candidate)
 
     spec = args.kernel
     shape = shape_from_args(args, spec.dims)
