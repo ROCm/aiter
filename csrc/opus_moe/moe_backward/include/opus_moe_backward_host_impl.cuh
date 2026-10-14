@@ -51,6 +51,7 @@ __global__ void megatron_moe_metadata_kernel(
     {
         int64_t compact = 0;
         int64_t padded = 0;
+        int32_t max_padded_routes = 0;
         bool valid = true;
         compact_offsets[0] = 0;
         padded_offsets[0] = 0;
@@ -60,11 +61,14 @@ __global__ void megatron_moe_metadata_kernel(
             const int count = tokens_per_expert[expert];
             valid = valid && count >= 0;
             const int nonnegative_count = count >= 0 ? count : 0;
-            compact += nonnegative_count;
-            padded +=
+            const int32_t padded_count = static_cast<int32_t>(
                 ((static_cast<int64_t>(nonnegative_count) + block_m - 1) /
                  block_m) *
-                block_m;
+                block_m);
+            if(padded_count > max_padded_routes)
+                max_padded_routes = padded_count;
+            compact += nonnegative_count;
+            padded += padded_count;
             valid = valid && compact <= route_count &&
                     padded <= sorted_capacity;
             compact_offsets[expert + 1] = static_cast<int32_t>(compact);
@@ -84,6 +88,7 @@ __global__ void megatron_moe_metadata_kernel(
         }
         num_valid_ids[0] = valid ? static_cast<int32_t>(padded) : 0;
         num_valid_ids[1] = valid ? route_count : -1;
+        num_valid_ids[2] = valid ? max_padded_routes : 0;
     }
     __syncthreads();
 
@@ -392,8 +397,8 @@ void opus_megatron_moe_metadata(aiter_tensor_t& tokens_per_expert,
                 "reverse_sorted must contain route_count entries");
     AITER_CHECK(expert_padded_offsets.numel() == num_experts + 1,
                 "expert_padded_offsets must contain E+1 entries");
-    AITER_CHECK(num_valid_ids.numel() == 2,
-                "num_valid_ids must contain two entries");
+    AITER_CHECK(num_valid_ids.numel() == 3,
+                "num_valid_ids must contain three entries");
     AITER_CHECK(sorted_capacity == route_count + num_experts * block_m - 1,
                 "sorted_token_ids has an unexpected capacity");
     AITER_CHECK(sorted_block_capacity ==
@@ -510,8 +515,8 @@ void opus_megatron_moe_poison_invalid_backward(
     check_down_tensor(d_z, "d_z", 2, AITER_DTYPE_bf16, "bfloat16");
     check_down_tensor(
         a_scaled, "a_scaled", 2, AITER_DTYPE_bf16, "bfloat16");
-    AITER_CHECK(num_valid_ids.numel() == 2,
-                "Megatron metadata status requires two int32 entries");
+    AITER_CHECK(num_valid_ids.numel() >= 2,
+                "Megatron metadata status requires at least two int32 entries");
     check_down_same_device(num_valid_ids, d_x, "d_x");
     check_down_same_device(num_valid_ids, d_w1, "d_w1");
     check_down_same_device(num_valid_ids, d_w2, "d_w2");
@@ -1837,6 +1842,10 @@ void opus_moe_dw2_bwd(aiter_tensor_t& d_out,
         reinterpret_cast<const int32_t*>(sorted_token_ids.data_ptr());
     route.num_valid_ids =
         reinterpret_cast<const int32_t*>(num_valid_ids.data_ptr());
+    route.max_padded_routes =
+        num_valid_ids.numel() >= 3
+            ? reinterpret_cast<const int32_t*>(num_valid_ids.data_ptr()) + 2
+            : nullptr;
     route.expert_offsets =
         reinterpret_cast<const int32_t*>(expert_padded_offsets.data_ptr());
     route.token_num = token_num;
@@ -2116,6 +2125,10 @@ void opus_moe_full_bwd(aiter_tensor_t& d_out,
         reinterpret_cast<const int32_t*>(sorted_expert_ids.data_ptr());
     route.num_valid_ids =
         reinterpret_cast<const int32_t*>(num_valid_ids.data_ptr());
+    route.max_padded_routes =
+        num_valid_ids.numel() >= 3
+            ? reinterpret_cast<const int32_t*>(num_valid_ids.data_ptr()) + 2
+            : nullptr;
     route.reverse_sorted =
         reinterpret_cast<const int32_t*>(reverse_sorted.data_ptr());
     route.expert_offsets =

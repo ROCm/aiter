@@ -1597,6 +1597,18 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
         if(route_count > T::MAX_ROUTE_COUNT)
             return;
     }
+    if constexpr(requires { T::MIN_GLOBAL_ROUTE_COUNT; })
+    {
+        if(kargs.route.max_padded_routes == nullptr ||
+           *kargs.route.max_padded_routes < T::MIN_GLOBAL_ROUTE_COUNT)
+            return;
+    }
+    if constexpr(requires { T::MAX_GLOBAL_ROUTE_COUNT; })
+    {
+        if(kargs.route.max_padded_routes != nullptr &&
+           *kargs.route.max_padded_routes > T::MAX_GLOBAL_ROUTE_COUNT)
+            return;
+    }
     const int tid = static_cast<int>(thread_id_x());
     const int lane_id = tid % get_warp_size();
     const int wave_id = __builtin_amdgcn_readfirstlane(tid / get_warp_size());
@@ -2172,6 +2184,15 @@ inline void dw2_launch_gfx950(const Dw2Kargs& kargs, hipStream_t stream)
             Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledRouteLe30720>(kargs, stream);
         dw2_launch_gfx950<
             Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledRouteGt30720>(kargs, stream);
+        return;
+    }
+    if constexpr(requires { T::ADAPTIVE_HOT_EXPERT_SPLIT; })
+    {
+        static_assert(T::ADAPTIVE_HOT_EXPERT_SPLIT);
+        dw2_launch_gfx950<Dw2Bf16Gfx950Bm256Bn128Bk64GlobalRouteLe1536>(
+            kargs, stream);
+        dw2_launch_gfx950<Dw2Bf16Gfx950Bm128Bn64Bk64GlobalRouteGt1536>(
+            kargs, stream);
         return;
     }
     AITER_CHECK(kargs.model_dim % T::B_M == 0 &&

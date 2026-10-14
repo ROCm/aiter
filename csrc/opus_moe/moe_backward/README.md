@@ -89,7 +89,7 @@ remain where production traits inherit their layout definitions; they do not
 create additional compiled kernels. The original implementations are recoverable
 from the pre-pruning Git backup, with context in TUNING_HISTORY.md.
 
-The registry has 54 instances (formerly 71). Retired IDs by family are K1
+The registry has 55 instances (formerly 71). Retired IDs by family are K1
 `5/6/8/14/15/17`, K3 `2`, K4 `10/12/17/19/20/21/22/23/24`, and K5 `17`.
 K2 `16` remains active for partial autograd; full-chain auto uses K2 `17`.
 K1 `12` remains a no-cache auto target but is no longer accepted with
@@ -101,6 +101,11 @@ renumbered or silently mapped to different kernels.
 Treat the registry as an entry-point list, not a complete device call graph.
 K5 kid `10` also instantiates `SwizzledRouteLe30720` and
 `SwizzledRouteGt30720` internally; its split uses padded expert route counts.
+K5 kid `19` is the sync-free top-1 hot-expert policy: Megatron metadata carries
+the maximum padded expert interval on device, and mutually exclusive BM256 and
+BM128 launches split at 1536 rows. Two-entry generic sorting metadata retains
+the pre-existing single-kernel behavior. K2 auto-dispatch keeps the legacy
+route-major kernel for `E_local=1`, where cohort scheduling only adds overhead.
 These helper traits and the long-route wave4x2 geometry are live even without
 standalone IDs. Python partial-autograd selection, compact routing, uncached
 paths and flat-address fallbacks must be audited alongside the host selector.

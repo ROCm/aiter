@@ -134,6 +134,7 @@ fallback when a genuinely different working-set regime needs it.
 | K5 `dw2` standalone pipelined reduction | 13 | kid 11 with three K32 stages |
 | K5 `dw2` full-pipeline native-B | 16 | kid 13 with direct padded `a_scaled` reads |
 | K5 `dw2` balanced full-pipeline | 17 | `BM128 x BN256 x BK32`, native-B three-stage LDS + N-wave A/B issue staggering |
+| K5 `dw2` top-1 hot-expert adaptive | 19 | device-selected BM256xBN128 for max interval <=1536, otherwise BM128xBN64 |
 | `router_bwd` | 0 | `BM32 x BE8` |
 | `bias_bwd` | 0 | `BM32 x BN16` |
 
@@ -342,6 +343,51 @@ skewed routing but also for its intended 20993--30720 interval after the K16
 pipeline landed.  The target code object uses 52 arch VGPRs, 132 accum VGPRs,
 112 SGPRs, and 48 KiB LDS with no scratch or spills.  Shapes outside that
 launch regime retain kid 10 or the existing smaller fallbacks.
+
+### 2026-10-14 routing-sensitive dispatch correction
+
+The original host auto selectors saw allocated sorted capacity and average
+routes per expert, but not the live distribution.  Qwen3 balanced, 75%-skewed,
+half-empty and single-hot inputs all allocate the same 8703 sorted rows, so
+they selected the same K5 geometry even though the longest expert interval
+ranges from 512 to 8192 rows.  This differs from forward GEMM: K4/K5 reduce
+over each expert's route count, and a single long interval needs more output
+CTAs to expose parallelism.
+
+Stage timing localized most of the balanced-to-hot regression to weight
+gradients: approximately +59 us in K1, +35 us in K2/K3, +373 us in K4 and
++408 us in K5.  Existing K5 kid 9 reduced the hot case from about 567 us to
+235 us, but forcing it globally regressed balanced and empty-expert routing.
+
+Megatron metadata therefore adds a third device-resident value containing the
+maximum padded expert interval.  K5 kid 19 issues two launches with mutually
+exclusive device predicates: production BM256xBN128 is used through 1536
+rows, and BM128xBN64 above it.  There is no `.item()`, host synchronization or
+graph break.  Generic two-entry metadata has a null statistic pointer and
+keeps the prior BM256 path.  The isolated crossover sweep was:
+
+| Max padded routes | BM128xBN64 (us) | BM256xBN128 (us) | Adaptive (us) |
+| ---: | ---: | ---: | ---: |
+| 512 | 206.8 | 165.3 | 153.3 |
+| 1024 | 189.4 | 169.0 | 165.8 |
+| 1536 | 173.4 | 174.9 | 173.5 |
+| 2048 | 187.2 | 195.8 | 195.0 |
+| 3072 | 185.6 | 232.2 | 187.6 |
+| 4096 | 184.3 | 261.7 | 185.4 |
+| 6144 | 191.9 | 365.8 | 194.8 |
+| 8192 | 222.2 | 475.0 | 228.5 |
+
+A same-node end-to-end check before the final 1536 threshold refinement kept
+Qwen3 balanced neutral (`1063.2 -> 1062.8 us`) while improving 75%-skewed
+(`1600.8 -> 1342.5 us`) and single-hot (`1869.3 -> 1507.7 us`) preallocated
+backward.  K4 remains the main unresolved routing-sensitive stage; its proper
+fix requires split-K or segmented reduction rather than another host shape
+override.
+
+The same review found an independent `E_local=1` K2 dispatch issue.  On the
+Mixtral local shape, legacy kid 5 measured about 700.8 us versus 730.9 us for
+the cohort auto target, so single-expert routing now stays on kid 5.  This is a
+host-visible geometry correction and does not affect multi-expert routing.
 
 ## Shape contract
 

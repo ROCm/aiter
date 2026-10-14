@@ -137,6 +137,8 @@ inline int select_fixed_route_dx_kernel_id(const RouteDxKargs& kargs,
        kargs.route.sorted_block_capacity < 4 ||
        kargs.model_dim <= output_n_tile)
         return legacy_kid;
+    if(kargs.route.num_experts == 1)
+        return legacy_kid;
     constexpr uint64_t l2_friendly_bytes = 128ull * 1024ull * 1024ull;
     const uint64_t gate_up_dim =
         2ull * static_cast<uint64_t>(kargs.inter_dim);
@@ -331,6 +333,7 @@ inline int select_fixed_dw2_kernel_id(const Dw2Kargs& kargs,
     constexpr int bm256x128_k32_prefetch_ab_triple_lds_kid = 13;
     constexpr int bm256x128_k32_native_b32_zero_pad_kid = 16;
     constexpr int bm128x256_k32_native_b32_zero_pad_grid3d_kid = 18;
+    constexpr int adaptive_hot_expert_routes_kid = 19;
     // A wide output grid amortizes the larger output tile.  Require at least
     // two K64 reduction tiles per expert on average so source reuse offsets
     // its wider LDS and accumulator footprint.  These tests use only
@@ -381,7 +384,9 @@ inline int select_fixed_dw2_kernel_id(const Dw2Kargs& kargs,
         if(kargs.route.topk == 1 && bm256x128_compatible &&
            bm256_output_blocks >= k1_bm256_min_output_blocks &&
            average_padded_routes >= 256)
-            return bm256x128_direct_kid;
+            return kargs.route.max_padded_routes != nullptr
+                       ? adaptive_hot_expert_routes_kid
+                       : bm256x128_direct_kid;
         if(bm256x128_compatible &&
            bm256_output_blocks >= bm256_min_output_blocks &&
            bm256_blocks_per_expert <= bm256_max_blocks_per_expert)

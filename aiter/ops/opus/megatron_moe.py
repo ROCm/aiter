@@ -201,7 +201,9 @@ def build_megatron_local_metadata(
     options = {"dtype": torch.int32, "device": tokens_per_expert.device}
     sorted_token_ids = torch.empty(capacity, **options)
     sorted_expert_ids = torch.empty(max_blocks, **options)
-    num_valid_ids = torch.empty(2, dtype=torch.int32, device=tokens_per_expert.device)
+    # [padded_count, validation_status, max_padded_expert_routes].  The third
+    # value lets K5 select a skew-safe launch entirely on device.
+    num_valid_ids = torch.empty(3, dtype=torch.int32, device=tokens_per_expert.device)
     reverse_sorted = torch.empty(route_count, **options)
     expert_padded_offsets = torch.empty(num_experts + 1, **options)
     _opus_megatron_moe_metadata_raw(

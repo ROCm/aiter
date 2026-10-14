@@ -553,6 +553,17 @@ OPUS_MOE_BACKWARD_INSTANCES: tuple[OpusMoeBackwardInstance, ...] = (
         "Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledAdaptiveRoutes",
     ),
     _instance(
+        19,
+        ("dw2_bf16_gfx950_adaptive_hot_expert_routes"),
+        OpusMoeBackwardFamily.DW2,
+        OpusMoeBackwardRouteLayout.SORTED_ROUTE_MAJOR,
+        (256, 128, 64),
+        256,
+        1,
+        False,
+        "Dw2Bf16Gfx950AdaptiveHotExpertRoutes",
+    ),
+    _instance(
         5,
         "dw2_bf16_gfx950_bm64_bn64_bk64_swizzled_cohort4_direct_lds",
         OpusMoeBackwardFamily.DW2,

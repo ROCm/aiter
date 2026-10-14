@@ -96,6 +96,9 @@ struct RouteMetadata
     const int32_t* __restrict__ sorted_token_ids;
     const int32_t* __restrict__ sorted_expert_ids;
     const int32_t* __restrict__ num_valid_ids;
+    // Optional sync-free routing statistic produced by the Megatron K=1
+    // metadata builder.  It stores the largest padded expert interval.
+    const int32_t* __restrict__ max_padded_routes;
     union
     {
         const int32_t* __restrict__ reverse_sorted;

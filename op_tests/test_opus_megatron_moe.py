@@ -219,7 +219,7 @@ def test_grouped_metadata_has_no_general_sort():
     counts = torch.tensor([17, 0, 35, 5], device="cuda", dtype=torch.int32)
     md = build_megatron_local_metadata(counts, 57)
     assert md.expert_padded_offsets.cpu().tolist() == [0, 32, 32, 96, 128]
-    assert md.num_valid_ids.cpu().tolist() == [128, 57]
+    assert md.num_valid_ids.cpu().tolist() == [128, 57, 64]
     assert md.sorted_expert_ids[:4].cpu().tolist() == [0, 2, 2, 3]
     torch.testing.assert_close(
         md.sorted_token_ids[md.reverse_sorted.long()].cpu(),
@@ -235,7 +235,7 @@ def test_grouped_metadata_has_no_general_sort():
 def test_grouped_metadata_supports_all_empty_experts():
     counts = torch.zeros(4, device="cuda", dtype=torch.int32)
     md = build_megatron_local_metadata(counts, 0)
-    assert md.num_valid_ids.cpu().tolist() == [0, 0]
+    assert md.num_valid_ids.cpu().tolist() == [0, 0, 0]
     assert md.expert_padded_offsets.cpu().tolist() == [0, 0, 0, 0, 0]
     assert md.reverse_sorted.numel() == 0
     assert torch.all(md.sorted_token_ids & (1 << 24))
@@ -253,7 +253,7 @@ def test_grouped_metadata_sanitizes_invalid_counts(counts, route_count):
     options = {"device": "cuda", "dtype": torch.int32}
     sorted_token_ids = torch.empty(capacity, **options)
     sorted_expert_ids = torch.empty(blocks, **options)
-    num_valid_ids = torch.empty(2, **options)
+    num_valid_ids = torch.empty(3, **options)
     reverse_sorted = torch.empty(route_count, **options)
     expert_padded_offsets = torch.empty(experts + 1, **options)
     _opus_megatron_moe_metadata_raw(
@@ -266,7 +266,7 @@ def test_grouped_metadata_sanitizes_invalid_counts(counts, route_count):
         route_count,
         32,
     )
-    assert num_valid_ids.cpu().tolist() == [0, -1]
+    assert num_valid_ids.cpu().tolist() == [0, -1, 0]
     assert expert_padded_offsets.cpu().tolist() == [0] * (experts + 1)
     assert reverse_sorted.cpu().tolist() == [0] * route_count
     assert torch.all(sorted_token_ids & (1 << 24))

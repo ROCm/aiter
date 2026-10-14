@@ -1092,6 +1092,30 @@ struct Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledAdaptiveRoutes
     static constexpr bool ADAPTIVE_ROUTE_SPLIT = true;
 };
 
+// Top-1 many-expert routing needs a different split from the very-long-route
+// E<=3 policy above.  Short/medium experts keep the BM256xBN128 production
+// tile, while a hot expert switches to BM128xBN64 to expose four times as
+// many output CTAs.  The mutually exclusive predicates are evaluated from
+// device-resident expert offsets, so this remains sync-free when balanced,
+// empty and highly skewed distributions share the same allocated capacity.
+struct Dw2Bf16Gfx950Bm256Bn128Bk64GlobalRouteLe1536
+    : Dw2Bf16Gfx950Bm256Bn128Bk64SwizzledCohort4DualLdsWave2x2
+{
+    static constexpr int MAX_GLOBAL_ROUTE_COUNT = 1536;
+};
+
+struct Dw2Bf16Gfx950Bm128Bn64Bk64GlobalRouteGt1536
+    : Dw2Bf16Gfx950Bm128Bn64Bk64SwizzledCohort1DualLds
+{
+    static constexpr int MIN_GLOBAL_ROUTE_COUNT = 1537;
+};
+
+struct Dw2Bf16Gfx950AdaptiveHotExpertRoutes
+    : Dw2Bf16Gfx950Bm256Bn128Bk64GlobalRouteLe1536
+{
+    static constexpr bool ADAPTIVE_HOT_EXPERT_SPLIT = true;
+};
+
 struct Dw1VarlenBf16Gfx950Bm64Bn128Bk32Swizzled
     : Dw1Bf16Gfx950Bm64Bn128Bk32Swizzled
 {

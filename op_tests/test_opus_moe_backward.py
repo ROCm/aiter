@@ -373,6 +373,52 @@ def test_adaptive_dw2_route_boundary(routes):
     assert torch.equal(actual, captured)
 
 
+@pytest.mark.parametrize("routes", [1536, 1568])
+def test_adaptive_hot_expert_dw2_split(routes):
+    # Kid 19 launches mutually exclusive BM256 and BM128 kernels based on
+    # the device-resident maximum padded expert interval.  Separate cases
+    # exercise both sides of the 1536-row boundary without host readback.
+    torch.manual_seed(20261014)
+    d, i, e = 256, 128, 4
+    counts = (routes, 0, 0, 0)
+    dout = torch.randn(routes, d, device="cuda", dtype=torch.bfloat16)
+    scaled = torch.randn(routes, i, device="cuda", dtype=torch.bfloat16)
+    ids = torch.arange(routes, device="cuda", dtype=torch.int32)
+    valid = torch.tensor(
+        [routes, routes, routes], device="cuda", dtype=torch.int32
+    )
+    offsets = torch.tensor(
+        [0, counts[0], routes, routes, routes],
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    def launch():
+        return opus.opus_moe_dw2_backward(
+            dout, scaled, ids, valid, offsets, topk=1, block_m=32, kernel_id=19
+        )
+
+    actual = launch()
+    expected = torch.zeros(e, d, i, device="cuda", dtype=torch.bfloat16)
+    begin = 0
+    for expert, count in enumerate(counts):
+        end = begin + count
+        if count:
+            expected[expert] = (
+                dout[begin:end].float().T @ scaled[begin:end].float()
+            ).bfloat16()
+        begin = end
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=0.02, atol=0.25)
+    assert torch.count_nonzero(actual[2:]) == 0
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = launch()
+    for _ in range(100):
+        graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(actual, captured)
+
+
 def test_compact_router_and_empty_token_segments():
     torch.manual_seed(42)
     logits = torch.randn(9, 7, device="cuda", requires_grad=True)
