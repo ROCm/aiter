@@ -1620,6 +1620,65 @@ def test_presorted_moe_hook():
     aiter.logger.info("moe_2stage: presorted MoE hook contract passed")
 
 
+def test_presorted_moe_wrapper_error():
+    """A fused_moe call rejected in the public wrapper still drops a registration.
+
+    activation must be an ActivationType; a str fails in the wrapper before the
+    custom op (which normally consumes the registration) runs, on both the
+    routed and the FHMoE (shared-expert) paths. No kernel launches, so CPU-only.
+    """
+    fm = aiter.fused_moe
+    x = torch.zeros((1, 1))
+    ids = torch.zeros((1, 1), dtype=torch.int32)
+    try:
+        for extra in ({}, {"shared_expert_id": 0}):
+            fm.register_presorted_moe({"M": 1})
+            try:
+                fused_moe(x, x, x, x, ids, activation="silu", **extra)
+            except AttributeError:
+                pass
+            else:
+                raise AssertionError(f"activation='silu' was accepted ({extra})")
+            assert (
+                getattr(fm._PRESORTED_MOE, "aux", None) is None
+            ), f"registration left live after a wrapper error ({extra})"
+    finally:
+        fm.register_presorted_moe(None)
+    aiter.logger.info("moe_2stage: presorted MoE wrapper-error contract passed")
+
+
+def test_presorted_moe_block_m():
+    """Only a BM=16 presort is accepted; another block_m falls back to fused_moe's sort.
+
+    kimik3_a4w4_tuned_fmoe.csv also routes BM=32 tiles through the aux-sort path,
+    so a registration labelled block_m=32 that matches the call must still be
+    ignored. CPU-only: checks the matcher fused_moe uses, no kernel launch.
+    """
+    fm = aiter.fused_moe
+    M, E, topk = 4, 8, 2
+    ids = torch.zeros((M, topk), dtype=torch.int32)
+    weights = torch.zeros((M, topk))
+
+    def aux(block_m):
+        return {
+            "topk_ids_ptr": ids.data_ptr(),
+            "topk_weights_ptr": weights.data_ptr(),
+            "M": M,
+            "block_m": block_m,
+            "num_experts": E,
+            "topk": topk,
+        }
+
+    def match(block_m):
+        return fm._match_presorted_moe(
+            aux(block_m), ids, weights, block_m=block_m, num_experts=E, topk=topk
+        )
+
+    assert match(16) is not None, "a matching BM=16 presort was rejected"
+    assert match(32) is None, "a BM=32 presort was accepted"
+    aiter.logger.info("moe_2stage: presorted MoE block_m contract passed")
+
+
 def test_swiglu_mxfp4_nonsplit_nobias_dispatch():
     if get_gfx() != "gfx950":
         aiter.logger.info(
@@ -1755,33 +1814,6 @@ def test_swiglu_mxfp4_untagged_layout_dispatch():
         "moe_2stage: SwiGLU MXFP4 untagged-layout dispatch regression test passed"
     )
 
-def test_presorted_moe_wrapper_error():
-    """A fused_moe call rejected in the public wrapper still drops a registration.
-
-    activation must be an ActivationType; a str fails in the wrapper before the
-    custom op (which normally consumes the registration) runs, on both the
-    routed and the FHMoE (shared-expert) paths. No kernel launches, so CPU-only.
-    """
-    fm = aiter.fused_moe
-    x = torch.zeros((1, 1))
-    ids = torch.zeros((1, 1), dtype=torch.int32)
-    try:
-        for extra in ({}, {"shared_expert_id": 0}):
-            fm.register_presorted_moe({"M": 1})
-            try:
-                fused_moe(x, x, x, x, ids, activation="silu", **extra)
-            except AttributeError:
-                pass
-            else:
-                raise AssertionError(f"activation='silu' was accepted ({extra})")
-            assert (
-                getattr(fm._PRESORTED_MOE, "aux", None) is None
-            ), f"registration left live after a wrapper error ({extra})"
-    finally:
-        fm.register_presorted_moe(None)
-    aiter.logger.info("moe_2stage: presorted MoE wrapper-error contract passed")
-
-
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -1800,6 +1832,7 @@ if args.bm16_scale_boundary:
 else:
     test_output_buffer_contract()
     test_presorted_moe_wrapper_error()
+    test_presorted_moe_block_m()
     test_swiglu_mxfp4_nonsplit_nobias_dispatch()
     test_swiglu_mxfp4_untagged_layout_dispatch()
     if get_gfx() == "gfx950":

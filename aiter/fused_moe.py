@@ -269,6 +269,8 @@ kernel_bench_callable = None
 # fused_moe. CUDA-graph replay does not re-enter Python, so a captured fused_moe
 # keeps whichever sort launches it was captured with.
 _PRESORTED_MOE = threading.local()
+# The only block size a presort is accepted for; other tile sizes re-sort.
+_PRESORTED_MOE_BLOCK_M = 16
 
 
 def register_presorted_moe(aux: dict | None) -> None:
@@ -280,7 +282,8 @@ def register_presorted_moe(aux: dict | None) -> None:
     num_experts, topk). Set moe_buf_zeroed and moe_buf_ptr when the caller
     already zeroed the buffer it will pass as ``output``. The next fused_moe
     consumes it on every path, whether or not it matches or is used, so a stale
-    registration never applies to a later call.
+    registration never applies to a later call. It is only used when the call
+    runs with block_m == 16; other block sizes run fused_moe's own sort.
     """
     _PRESORTED_MOE.aux = aux
 
@@ -292,7 +295,7 @@ def _pop_presorted_moe():
 
 
 def _match_presorted_moe(aux, topk_ids, topk_weight, *, block_m, num_experts, topk):
-    if not aux:
+    if not aux or int(block_m) != _PRESORTED_MOE_BLOCK_M:
         return None
     if (
         int(aux.get("topk_ids_ptr", 0)) != int(topk_ids.data_ptr())
