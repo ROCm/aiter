@@ -31,7 +31,7 @@ def is_supported(XQ: Tensor, WQ: Tensor, Out: Tensor, preshuffle_b: bool) -> boo
     fp8_storage = (torch.float8_e4m3fn, torch.int8, torch.uint8)
     if XQ.dtype not in fp8_storage or WQ.dtype not in fp8_storage:
         return False
-    if Out.dtype != torch.bfloat16:
+    if Out.dtype not in (torch.bfloat16, torch.float16):
         return False
     gfx = torch.cuda.get_device_properties(XQ.device).gcnArchName.split(":", 1)[0]
     return kernel_fits_shape(kernelInstance(preshuffle_b), M, N, K, gfx)
@@ -65,9 +65,19 @@ def _prepare_scales(
 
 
 @functools.lru_cache(maxsize=1024)
-def _compile_gemm(N: int, K: int, kernel_name: str, device_index: int):
+def _compile_gemm(
+    N: int,
+    K: int,
+    kernel_name: str,
+    device_index: int,
+    out_dtype: torch.dtype = torch.bfloat16,
+):
     from .kernels.gemm_a8w8_blockscale_8wave import compile_gemm_fp8_8wave
 
+    if out_dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError("FlyDSL blockscale requires BF16 or FP16 output")
+    # The output tensor specializes the epilogue. Keep separate launchers since
+    # _run_compiled caches the first typed CompiledFunction on each launcher.
     ki = kernels_by_name[kernel_name]
     launch = compile_gemm_fp8_8wave(
         TILE_M,
@@ -95,7 +105,7 @@ def run_gemm_a8w8_blockscale(
 
     Plain B: XQ[M,K], WQ[N,K], row-major x_scale[M,K/128] unless is_transposed=True.
     Preshuffled B: shuffle_weight(WQ, (16,16)) and column-major x_scale.
-    Both use w_scale[ceil(N/128),K/128] and BF16 output on gfx950.
+    Both use w_scale[ceil(N/128),K/128] and BF16/FP16 output on gfx950.
     """
     ki = kernels_by_name.get(kernel_name)
     if ki is None:
@@ -115,7 +125,7 @@ def run_gemm_a8w8_blockscale(
     N = WQ.shape[0]
     with torch.cuda.device(XQ.device):
         sa, sb = _prepare_scales(x_scale, w_scale, M, N, K, preshuffle_b)
-        launch = _compile_gemm(N, K, kernel_name, XQ.device.index)
+        launch = _compile_gemm(N, K, kernel_name, XQ.device.index, Out.dtype)
         out_contiguous = Out.contiguous()
         # Keep matrix dimensions separate in the launch ABI: flattening a
         # >2**31-element matrix overflows a dynamic i32 FlyDSL extent.

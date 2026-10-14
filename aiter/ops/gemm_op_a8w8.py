@@ -239,9 +239,10 @@ def gemm_a8w8_blockscale_flydsl(
     # A tuned FlyDSL row must execute FlyDSL, never silently select another backend.
     gfx = get_gfx()
     assert gfx == "gfx950", f"FlyDSL blockscale only supports gfx950, got {gfx}"
-    assert (
-        Out.dtype == dtypes.bf16
-    ), f"FlyDSL blockscale only supports BF16 output, got {Out.dtype}"
+    assert Out.dtype in (
+        dtypes.bf16,
+        dtypes.fp16,
+    ), f"FlyDSL blockscale only supports BF16/FP16 output, got {Out.dtype}"
     assert x_scale.dtype == dtypes.fp32 and w_scale.dtype == dtypes.fp32, (
         "FlyDSL blockscale requires FP32 scales, "
         f"got x_scale={x_scale.dtype}, w_scale={w_scale.dtype}"

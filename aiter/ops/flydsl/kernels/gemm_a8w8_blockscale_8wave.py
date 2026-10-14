@@ -3,7 +3,7 @@
 # ruff: noqa: B008
 # The FlyDSL body uses a typed Stream default for its tracing semantics.
 # Ported from pyhip a3a94c5a34fc525c118649418b76221cd6d91579, fixed to raw DMA.
-"""gfx950 FP8 GEMM: C = A @ B.T, FP32 accumulation and BF16 output.
+"""gfx950 FP8 GEMM: C = A @ B.T, FP32 accumulation and BF16/FP16 output.
 
 The blockscale contract is ScaleA[KB, M] and ScaleB[ceil(N/128), KB], KB=K/128.
 The kernel uses a 256x256 WG tile, eight waves, and ping-pong padded LDS.
@@ -834,6 +834,8 @@ def compile_gemm_fp8_8wave(
             rocdl.s_barrier()
 
         # ---- epilogue store ----
+        out_dtype = argC.dtype
+        assert out_dtype in (fx.BFloat16, fx.Float16)
         N_tail = N % TILE_N != 0
         if const_expr((permlane_epilogue or N_tail) and TILE_N % 256 == 0):
             # In physical C, lane_id % 16 selects a row within the MFMA tile;
@@ -852,11 +854,17 @@ def compile_gemm_fp8_8wave(
                         acc_a = Vec(c_frag[None, col_repeat, row_repeat].load())
                         acc_b = Vec(c_frag[None, col_repeat + 1, row_repeat].load())
                         # These 4-column slices share a row but are 64 columns apart.
-                        # Pack each pair into a dword: first BF16 low, second high.
-                        d0_a = rocdl.cvt_pk_bf16_f32(acc_a[0], acc_a[1])
-                        d1_a = rocdl.cvt_pk_bf16_f32(acc_a[2], acc_a[3])
-                        d0_b = rocdl.cvt_pk_bf16_f32(acc_b[0], acc_b[1])
-                        d1_b = rocdl.cvt_pk_bf16_f32(acc_b[2], acc_b[3])
+                        # Round to the output dtype, then pack low/high 16-bit pairs.
+                        if const_expr(out_dtype == fx.BFloat16):
+                            d0_a = rocdl.cvt_pk_bf16_f32(acc_a[0], acc_a[1])
+                            d1_a = rocdl.cvt_pk_bf16_f32(acc_a[2], acc_a[3])
+                            d0_b = rocdl.cvt_pk_bf16_f32(acc_b[0], acc_b[1])
+                            d1_b = rocdl.cvt_pk_bf16_f32(acc_b[2], acc_b[3])
+                        else:
+                            packed_a = acc_a.to(fx.Float16).bitcast(fx.Int32)
+                            packed_b = acc_b.to(fx.Float16).bitcast(fx.Int32)
+                            d0_a, d1_a = packed_a[0], packed_a[1]
+                            d0_b, d1_b = packed_b[0], packed_b[1]
 
                         # | lane | d0_a      | d1_a      | d0_b      | d1_b      |
                         # |------|-----------|-----------|-----------|-----------|
@@ -920,7 +928,7 @@ def compile_gemm_fp8_8wave(
                         )
                         byte_offset = fx.Int32((row * N + col) * 2)
                         if const_expr(N_tail):
-                            # N % 8 == 0: each 8-BF16 store is fully in or out.
+                            # N % 8 == 0: each eight-element store is fully in or out.
                             byte_offset = (col < b_rows_left).select(
                                 byte_offset, fx.Int32(0x7FFFFFFF)
                             )
@@ -942,14 +950,14 @@ def compile_gemm_fp8_8wave(
             assert (
                 N % TILE_N == 0
             ), "N must be a multiple of TILE_N for permlane_epilogue=False, not supported for now"
-            c_frag_bf16 = fx.make_fragment_like(frag_C_tl, dtype=fx.BFloat16)
-            store_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.BFloat16)
+            c_frag_out = fx.make_fragment_like(frag_C_tl, dtype=out_dtype)
+            store_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), out_dtype)
             store_thr = fx.make_tiled_copy_C(store_atom, tiled_mma).get_slice(tid)
 
             def store_c_quadrant(c_frag, bC):
-                c_frag_bf16.store(c_frag.load().to(fx.BFloat16))
+                c_frag_out.store(c_frag.load().to(out_dtype))
                 fx.copy(
-                    store_atom, store_thr.retile(c_frag_bf16), store_thr.partition_D(bC)
+                    store_atom, store_thr.retile(c_frag_out), store_thr.partition_D(bC)
                 )
 
             store_c_quadrant(frag_C_tl, bC_tl)

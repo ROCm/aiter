@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Correctness/performance of both public blockscale APIs with FlyDSL configs."""
+"""BF16/FP16 correctness/performance of both public APIs with FlyDSL configs."""
 
 import argparse
 import itertools
@@ -88,6 +88,7 @@ def test_gemm(m, n, k, dtype, layout, scale_layout, data_init):
                     x, gemm_weight, gemm_scale, w_scale, dtype=dtype
                 )
             result, us = run_perftest(fn, num_iters=50, num_warmup=50)
+        assert result.dtype == dtype, f"expected {dtype}, got {result.dtype}"
         if preshuffle_b:
             assert result.data_ptr() == out.data_ptr(), "out= must be honored"
         assert bool(torch.isfinite(result).all()), name
@@ -126,8 +127,9 @@ def main():
         "--dtype",
         type=dtypes.str2Dtype,
         nargs="+",
-        choices=[dtypes.bf16],
+        choices=[dtypes.bf16, dtypes.fp16],
         default=[dtypes.bf16],
+        help="Output dtype(s): bf16 or fp16 (default: bf16)",
     )
     parser.add_argument(
         "-s",
@@ -166,8 +168,9 @@ def main():
     )
     args = parser.parse_args()
     rows = []
-    for dtype, (m, n, k), layout, scale_layout, data_init in itertools.product(
-        args.dtype, args.mnk, args.layout, args.scale_layout, args.data_init
+    # Alternate output dtypes for the same shape to exercise launcher cache keys.
+    for (m, n, k), layout, scale_layout, data_init, dtype in itertools.product(
+        args.mnk, args.layout, args.scale_layout, args.data_init, args.dtype
     ):
         # The preshuffle API requires transposed activation scales.
         if layout == "preshuffle" and scale_layout == "non-transposed":

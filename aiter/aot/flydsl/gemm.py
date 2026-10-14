@@ -823,15 +823,17 @@ def _compile_blockscale_8wave_to_cache(
     dev = torch.device("cpu")
     a = torch.empty((m, k), device=dev, dtype=torch.int8)
     b = torch.empty((n, k), device=dev, dtype=torch.int8)
-    out = torch.empty((m, n), device=dev, dtype=torch.bfloat16)
     scale_a = torch.empty((m * (k // 128),), device=dev, dtype=torch.float32)
     scale_b = torch.empty(
         (((n + 127) // 128) * (k // 128),), device=dev, dtype=torch.float32
     )
     # Share the runtime factory, including opt_level=2 and the fixed pipeline
     # flags. The -1 host-cache slot cannot collide with a live device index.
-    exe = _compile_gemm(n, k, kernel_name, -1)
-    _compile_executable_to_cache(exe, a, b, out, scale_a, scale_b, m, fx.Stream(0))
+    # A tuned row has no output-dtype key, so precompile both public outputs.
+    for out_dtype in (torch.bfloat16, torch.float16):
+        out = torch.empty((m, n), device=dev, dtype=out_dtype)
+        exe = _compile_gemm(n, k, kernel_name, -1, out_dtype)
+        _compile_executable_to_cache(exe, a, b, out, scale_a, scale_b, m, fx.Stream(0))
 
 
 def _compile_bmm_mfma_to_cache(

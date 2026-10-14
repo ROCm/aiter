@@ -7,6 +7,8 @@ The tile, half-M pipeline, raw DMA, PID swizzle and permlane epilogue are fixed.
 The preshuffle bit distinguishes the two weight layouts: ID 0 is plain B and
 ID 1 is preshuffled B. Kernel names stay stable; removed full-M/tiled-DMA names
 are not aliases for another kernel.
+The historical B16 names also serve FP16 calls; the output tensor specializes
+the epilogue, with separate runtime/AOT cache entries for the two dtypes.
 No FlyDSL compiler imports are needed to read this table.
 """
 
