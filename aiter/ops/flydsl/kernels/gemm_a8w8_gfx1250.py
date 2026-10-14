@@ -262,7 +262,7 @@ def launch_gemm_a8w8(
             fx.PointerType.get(out_cls.ir_type, arg_c.address_space), arg_c
         )
         W_A, W_B = 0, 1
-        WARP1 = fx.make_layout(1, 1)  # single-warp TDM partition for the per-wave loads
+        WARP1 = fx.make_layout(1, 1)
 
         # A: tiled-TDM atom over the FULL A tensor. The coordinate tensor picks this block's
         # M-tile (bid_x) and keeps the K-tiles as its rest (replaces imm_offset); the LDS box
