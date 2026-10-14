@@ -625,20 +625,36 @@ def gemm_a16w16_gfx942_kernel(
             # 128-bit buffer_load of tile k+1 (vmem, overlaps the MFMAs below)
             load_ab_to_reg(k_tile + 1)
             read_tile_into(k_tile % stages, frag_A_ret, frag_B_ret)
-            mma_tile(frag_A, frag_B)
-            rocdl.s_waitcnt(vmcnt=0)
             if const_expr(stages == 1):
-                # single LDS buffer: every wave must finish reading tile k
-                # before tile k+1's ds_write overwrites it. Drain lgkmcnt first
-                # so all of *this* wave's ds_reads have landed (the MFMA issue
-                # only orders reads it consumes; at large block_k the barrier can
-                # otherwise race the ds_write against a not-yet-complete ds_read).
+                # Single LDS buffer, but tile k's operands are already live
+                # in registers. Once those ds_reads land, overwrite LDS with
+                # tile k+1 while mma_tile consumes only registers.
                 rocdl.s_waitcnt(lgkmcnt=0)
                 rocdl.s_barrier()
-            # ds_write tile k+1 into LDS (the other buffer when double-buffered)
-            commit_ab_to_lds(write_stage)
-            rocdl.s_waitcnt(lgkmcnt=0)
-            rocdl.s_barrier()
+                rocdl.s_waitcnt(vmcnt=0)
+                commit_ab_to_lds(write_stage)
+                mma_tile(frag_A, frag_B)
+                # Force each ds_write into the tail of the MFMA run.
+                n_mfma = const_expr(
+                    (block_m // param.m_waves // param.mma_m)
+                    * (block_n // param.n_waves // param.mma_n)
+                    * (block_k // param.mma_k)
+                )
+                n_dswr = const_expr(ldg_a_iters + ldg_b_iters)
+                if const_expr(n_mfma > n_dswr):
+                    rocdl.sched_mfma(n_mfma - n_dswr)
+                    for _ in range_constexpr(n_dswr):
+                        rocdl.sched_dswr(1)
+                        rocdl.sched_mfma(1)
+                rocdl.s_waitcnt(lgkmcnt=0)   # tile k+1 writes landed
+                rocdl.s_barrier()             # writes visible before next read
+            else:
+                mma_tile(frag_A, frag_B)
+                rocdl.s_waitcnt(vmcnt=0)
+                # ds_write tile k+1 into the other buffer (double-buffered)
+                commit_ab_to_lds(write_stage)
+                rocdl.s_waitcnt(lgkmcnt=0)
+                rocdl.s_barrier()
             rocdl.sched_barrier(0)
         read_tile_into((k_tiles - 1) % stages, frag_A_ret, frag_B_ret)
         mma_tile(frag_A, frag_B)
@@ -835,6 +851,19 @@ def gfx942_auto_config(m: int, n: int, k: int) -> dict:
     narrow_n = n <= 1024
     short_k = k <= 1024
 
+    # Small square problems are a grid-fill regime, not the long-K narrow-N
+    # regime below.  In particular, 512^3 already has 256 independent 32x32
+    # output tiles; split-K only adds redundant loads/atomics and regresses
+    # 5.5us -> 16.6us.  At 1024^3, 64x64 st4 is the best balance of fill and
+    # per-tile efficiency (14.3us -> 10.7us on GPU6).
+    if short_k and 256 <= m == n:
+        if m <= 512:
+            return dict(block_m=32, block_n=32, block_k=bk, stages=2,
+                        split_k=1, m_waves=2, n_waves=2, group_m=0)
+        if m <= 1024:
+            return dict(block_m=64, block_n=64, block_k=bk, stages=4,
+                        split_k=1, m_waves=2, n_waves=2, group_m=0)
+
     if m <= 8:  # decode / GEMV
         if narrow_n:  # long-K, narrow-N: split-K is decisive
             bm = 64 if m <= 2 else 16
@@ -851,6 +880,14 @@ def gfx942_auto_config(m: int, n: int, k: int) -> dict:
         # the workgroups sharing an A row-block scatter across XCDs and miss in
         # L2 (measured 44% hit vs hipBLASLt 81%). group_m groups M-tiles onto the
         # same XCD, lifting L2 hit to ~77% and cutting HBM traffic ~2.5x.
+        if n == 1024 and m >= 2048 and k >= 2048 and k % 128 == 0:
+            # The upper edge of "narrow" already has enough N tiles to fill the
+            # machine with a 128x128 macro-tile. Use the barrier-halving b40
+            # path instead of the 64x64 heuristic meant for N=256..512:
+            # 4096x1024x4096 120.5->99.2us; 2048x1024x4096 ->64.6us.
+            return dict(block_m=128, block_n=128, block_k=128, stages=1,
+                        split_k=1, m_waves=4, n_waves=4, group_m=8,
+                        buffered_load=True, async_load_bytes=16)
         if m <= 1024:
             # 32x32 fills the machine via split-K along the long K while the grid
             # underfills (<=304 tiles, M<=~680). Once the 32x32 grid already
@@ -915,10 +952,25 @@ def gfx942_auto_config(m: int, n: int, k: int) -> dict:
         # 2x2 (4x4 over-subdivides the smaller tile, as on the 64x64 down branch).
         bm = 128 if m >= 256 else 64
         waves = 4 if bm == 128 else 2
+        if m >= 1024 and k % 128 == 0 and m % 128 == 0 and n % 128 == 0:
+            # With enough output tiles to fill the machine, bk128 halves the
+            # K-loop barriers and b40's write-under-compute schedule hides the
+            # single-buffer ds_writes.  Broad-shape sweep: 1024x4096x512
+            # 17.4->16.3us; 4096x8192x512 113.9->107.8us.
+            return dict(block_m=128, block_n=128, block_k=128, stages=1,
+                        split_k=1, m_waves=4, n_waves=4,
+                        buffered_load=True, async_load_bytes=16)
         return dict(block_m=bm, block_n=128, block_k=bk, stages=2, split_k=1,
                     m_waves=waves, n_waves=waves)
 
     # square / general compute-bound
+    if k % 128 == 0 and m % 128 == 0 and n % 128 == 0:
+        # Same barrier-halving/write-overlap win as large-M down, now that the
+        # grid is naturally full.  It improves square 2048/4096 by 6/4% and
+        # moderate rectangles by 3-11% in the GPU6 broad-regime sweep.
+        return dict(block_m=128, block_n=128, block_k=128, stages=1,
+                    split_k=1, m_waves=4, n_waves=4,
+                    buffered_load=True, async_load_bytes=16)
     return dict(block_m=128, block_n=128, block_k=bk, stages=2, split_k=1,
                 m_waves=4, n_waves=4)
 
