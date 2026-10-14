@@ -48,7 +48,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.kernels.qsa import k1 as k1_kernel
+from aiter.ops.flydsl import qsa as qsa_k1_host
 from aiter.ops.flydsl.kernels.qsa.k2 import build_qsa_k2_module, qsa_k2_serves
 from aiter.ops.flydsl.kernels.qsa.paged import span_bytes
 from aiter.ops.flydsl.qsa import (
@@ -205,7 +205,7 @@ def test_wide_cache_layout_spans_past_4gib():
             raise AssertionError("wide view changed the packed pages")
         q = torch.empty(1, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
         table = torch.zeros(1, 1, dtype=dtypes.i32, device=device)
-        reason = k1_kernel.qsa_k1_serves(q, view, table, (4,))
+        reason = qsa_k1_host.qsa_k1_serves(q, view, table, (4,))
         if reason is not None:
             raise AssertionError(f"wide indexer cache was rejected: {reason}")
         if span_bytes(view.clone()) > _FOUR_GIB:
@@ -949,7 +949,7 @@ def test_k1_padded_decode_graph_capture():
     table[:n_varied, : random_table.shape[1]] = random_table
     table[n_varied, : tie_table.shape[1]] = tie_table + random_cache.shape[0]
     q = torch.randn(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
-    out = torch.empty(m, k1_kernel._K, dtype=dtypes.i32, device=device)
+    out = torch.empty(m, qsa_k1_host._K, dtype=dtypes.i32, device=device)
     tie_req = torch.zeros(1, dtype=dtypes.i32, device=device)
 
     def oracle():
@@ -1239,32 +1239,32 @@ def test_k1_serves_padded_page_and_rejects_misaligned():
     q = torch.zeros(1, 4, d, dtype=torch.bfloat16)
     table = torch.zeros(1, 1, dtype=torch.int32)
     dense = torch.zeros(n_pages, page_size, 1, d, dtype=torch.bfloat16)
-    if k1_kernel.qsa_k1_serves(q, dense, table, (4,)) is not None:
+    if qsa_k1_host.qsa_k1_serves(q, dense, table, (4,)) is not None:
         raise AssertionError("a packed indexer cache was rejected")
     page_stride = page_elems + 256
     parent = torch.empty(n_pages, page_stride, dtype=torch.bfloat16)
     view = parent.as_strided((n_pages, page_size, 1, d), (page_stride, d, d, 1))
     if view.is_contiguous():
         raise AssertionError("padded page stride should not be contiguous")
-    if k1_kernel.qsa_k1_serves(q, view, table, (4,)) is not None:
+    if qsa_k1_host.qsa_k1_serves(q, view, table, (4,)) is not None:
         raise AssertionError(f"padded page stride was rejected: {view.stride()}")
     span = span_bytes(view)
     packed = view.numel() * view.element_size()
     if span <= packed:
         raise AssertionError(f"span {span} did not exceed packed bytes {packed}")
     bad = parent.as_strided((n_pages, page_size, 1, d), (page_elems + 4, d, d, 1))
-    reason = k1_kernel.qsa_k1_serves(q, bad, table, (4,))
+    reason = qsa_k1_host.qsa_k1_serves(q, bad, table, (4,))
     if reason is None or "multiples of 8" not in reason:
         raise AssertionError(f"misaligned page stride served: {reason}")
     wide = torch.empty(n_pages, page_size, 1, d * 2, dtype=torch.bfloat16)
     strided_d = wide.as_strided(
         dense.shape, (wide.stride(0), wide.stride(1), wide.stride(2), 2)
     )
-    reason = k1_kernel.qsa_k1_serves(q, strided_d, table, (4,))
+    reason = qsa_k1_host.qsa_k1_serves(q, strided_d, table, (4,))
     if reason is None or "unit D" not in reason:
         raise AssertionError(f"strided D was served: {reason}")
     zero_page = torch.zeros(1, 0, 1, d, dtype=torch.bfloat16)
-    reason = k1_kernel.qsa_k1_serves(q, zero_page, table, (4,))
+    reason = qsa_k1_host.qsa_k1_serves(q, zero_page, table, (4,))
     if reason is None or "page_size" not in reason:
         raise AssertionError(f"zero page size was served: {reason}")
 
@@ -1305,7 +1305,7 @@ def test_k1_padded_page_stride_matches_packed():
     if gapped.is_contiguous():
         raise AssertionError("gapped indexer cache is contiguous")
     if (
-        k1_kernel.qsa_k1_serves(
+        qsa_k1_host.qsa_k1_serves(
             torch.empty(1, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device),
             gapped,
             index_table,
@@ -1841,7 +1841,9 @@ def test_k1_empty_or_short_request_geometry():
     positions = torch.zeros(1, dtype=torch.int32)
     requests = torch.zeros(1, dtype=torch.int32)
     try:
-        k1_kernel.qsa_k1_block_ids(q, cache, short_table, requests, positions, context)
+        qsa_k1_host.qsa_k1_block_ids(
+            q, cache, short_table, requests, positions, context
+        )
     except ValueError as exc:
         if "context lengths" not in str(exc):
             raise
@@ -1850,7 +1852,9 @@ def test_k1_empty_or_short_request_geometry():
     no_rows = torch.empty(0, 1, dtype=torch.int32)
     one_context = torch.zeros(1, dtype=torch.int32)
     try:
-        k1_kernel.qsa_k1_block_ids(q, cache, no_rows, requests, positions, one_context)
+        qsa_k1_host.qsa_k1_block_ids(
+            q, cache, no_rows, requests, positions, one_context
+        )
     except ValueError as exc:
         if "context lengths" not in str(exc):
             raise
@@ -1881,12 +1885,12 @@ def test_k1_empty_or_short_request_geometry():
         launched.append(1)
         raise AssertionError("qsa_k1 launched on empty geometry")
 
-    original = k1_kernel._run_compiled
-    k1_kernel._run_compiled = _record_launch
+    original = qsa_k1_host._run_compiled
+    qsa_k1_host._run_compiled = _record_launch
     try:
         for name, k_cache, page_table, lengths in cases:
             launched.clear()
-            out = k1_kernel.qsa_k1_block_ids(
+            out = qsa_k1_host.qsa_k1_block_ids(
                 q, k_cache, page_table, requests, positions, lengths
             )
             if launched:
@@ -1894,7 +1898,7 @@ def test_k1_empty_or_short_request_geometry():
             if not torch.equal(out, torch.full_like(out, -1)):
                 raise AssertionError(f"K1 {name} output was not -1")
     finally:
-        k1_kernel._run_compiled = original
+        qsa_k1_host._run_compiled = original
 
 
 def test_qsa_k1_rejects_a_score_workspace_before_launch():
@@ -2304,8 +2308,8 @@ def bench_qsa_family_a_k1(
     # crosses 32768 columns, so the two FlyDSL times are the two selectors.
     n_columns = int(index_table.shape[1]) * int(page_size)
     if (
-        m <= k1_kernel._DECODE_MAX_ROWS
-        and n_columns > k1_kernel._ONE_WORKGROUP_MAX_ROW_WIDTH
+        m <= qsa_k1_host._DECODE_MAX_ROWS
+        and n_columns > qsa_k1_host._ONE_WORKGROUP_MAX_ROW_WIDTH
     ):
         block_ids_g = torch.empty(m, idx.block_budget, dtype=dtypes.i32, device=device)
         indices_g = torch.empty(m, idx.index_width, dtype=dtypes.i32, device=device)
