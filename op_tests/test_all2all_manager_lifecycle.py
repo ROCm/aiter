@@ -112,6 +112,16 @@ def test_failed_creation_can_be_retried(monkeypatch):
     assert communicator.get_or_create_all2all_manager("mori") is manager
 
 
+def test_unsupported_backend_is_rejected_without_changing_state():
+    communicator = make_communicator()
+
+    with pytest.raises(ValueError, match="Unsupported all2all manager backend"):
+        communicator.get_or_create_all2all_manager("rccl")
+
+    assert communicator._all2all_manager is None
+    assert communicator._active_all2all_backend is None
+
+
 def test_non_ep_communicator_cannot_create_manager():
     communicator = make_communicator(use_all2all=False)
 

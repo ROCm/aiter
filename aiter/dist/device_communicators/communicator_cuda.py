@@ -15,6 +15,7 @@ from aiter.utility.dtypes import fp8
 from .base_device_communicator import All2AllManagerBase, DeviceCommunicatorBase
 
 should_nccl_symm_mem_allreduce = False
+_SUPPORTED_ALL2ALL_MANAGER_BACKENDS = ("flydsl", "mori")
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -136,26 +137,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
 
     def _create_all2all_manager(self, backend: str) -> All2AllManagerBase:
-        if backend == "naive":
-            from .all2all import NaiveAll2AllManager
-
-            return NaiveAll2AllManager(self.cpu_group)
-        if backend == "allgather_reducescatter":
-            from .all2all import AgRsAll2AllManager
-
-            return AgRsAll2AllManager(self.cpu_group)
-        if backend == "pplx":
-            from .all2all import PPLXAll2AllManager
-
-            return PPLXAll2AllManager(self.cpu_group)
-        if backend == "deepep_high_throughput":
-            from .all2all import DeepEPHTAll2AllManager
-
-            return DeepEPHTAll2AllManager(self.cpu_group)
-        if backend == "deepep_low_latency":
-            from .all2all import DeepEPLLAll2AllManager
-
-            return DeepEPLLAll2AllManager(self.cpu_group)
         if backend == "mori":
             from .all2all import MoriAll2AllManager
 
@@ -164,11 +145,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             from .all2all import FlyDSLAll2AllManager
 
             return FlyDSLAll2AllManager(self.cpu_group)
-        if backend == "flashinfer_all2allv":
-            from .all2all import FlashInferAllToAllManager
-
-            return FlashInferAllToAllManager(self.cpu_group)
-        raise ValueError(f"Unknown all2all backend: {backend}")
+        raise ValueError(
+            f"Unsupported all2all manager backend {backend!r}; "
+            f"expected one of {_SUPPORTED_ALL2ALL_MANAGER_BACKENDS}"
+        )
 
     def get_or_create_all2all_manager(
         self, backend: str | None = None
