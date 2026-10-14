@@ -39,6 +39,7 @@ class _PackedCase(NamedTuple):
     v_codec: str
     v_pack: AttentionPack = AttentionPack.DEFAULT
     valid_trim: int = 0
+    force_sw_fp6: bool = False
 
 
 _NATIVE_CASES = (
@@ -53,6 +54,8 @@ _PACKED_CASES = (
     _PackedCase("e4m3-e4m3", "e4m3", "e4m3"),
     _PackedCase("mxfp8-e4m3", "mxfp8", "e4m3"),
     _PackedCase("mxfp4-mxfp4", "mxfp4", "mxfp4"),
+    _PackedCase("mxfp4-mxfp4-valid", "mxfp4", "mxfp4", AttentionPack.DEFAULT, 176),
+    _PackedCase("mxfp8-mxfp4-valid", "mxfp8", "mxfp4", AttentionPack.DEFAULT, 176),
     _PackedCase("mxfp6-mxfp4", "mxfp6", "mxfp4"),
     _PackedCase("mxfp6-mxfp4-fp6p", "mxfp6", "mxfp4", AttentionPack.V_FOR_FP6_P),
     _PackedCase(
@@ -63,6 +66,10 @@ _PACKED_CASES = (
         176,
     ),
     _PackedCase("e4m3-mxfp6_p", "e4m3", "mxfp6_p", AttentionPack.V_FOR_FP6_P),
+    # Software FP6 Q/K and FP6-P V encoders on gfx950 (the path gfx942 would use).
+    _PackedCase(
+        "mxfp6-mxfp6_p-sw", "mxfp6", "mxfp6_p", AttentionPack.V_FOR_FP6_P, 0, True
+    ),
     _PackedCase(
         "mxfp4-mxfp6_p-valid", "mxfp4", "mxfp6_p", AttentionPack.V_FOR_FP6_P, 176
     ),
@@ -84,6 +91,7 @@ _SEQUENCE_DEPENDENT = (
     "packed-mxfp6-mxfp4-fp6p-valid",
     "packed-mxfp4-mxfp6_p-valid",
     "packed-e4m3-mxfp6_p",
+    "packed-mxfp6-mxfp6_p-sw",
     "fp6p-mxfp4",
     "fp6p-mxfp6_p",
     "e4m3_pc",
@@ -224,8 +232,10 @@ def _mx_fp8_reference(values, fp8_dtype, fp8_max):
 def _mx_int8_reference(values):
     blocks = values.float().reshape(*values.shape[:-1], -1, 32)
     need = (blocks.abs().amax(dim=-1) / 127.0).clamp_min(1.0e-30)
-    exponent = (torch.ceil(torch.log2(need)) + 127.0).clamp(0, 254)
-    scale = torch.exp2(exponent - 127.0)
+    # Exact float-bit ceil(log2): independent of log2/ceil rounding at powers of two.
+    bits = need.view(torch.int32)
+    exponent = (((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).int()).clamp(0, 254)
+    scale = torch.exp2((exponent - 127).float())
     payload = torch.round(blocks / scale.unsqueeze(-1)).clamp(-127, 127).to(torch.int8)
     return payload.view(torch.uint8).reshape_as(values), exponent.to(torch.uint8)
 
@@ -309,6 +319,14 @@ def _check_native(rank, world_size, heads, sequence, device, op_cls, name):
     inputs = tuple(
         _input(rank + 31 * role, heads, sequence, device) for role in range(3)
     )
+    if name == "int8":
+        # Blocks whose amax/127 is exactly 2^e (127 * 2^e) and the next bf16 above
+        # it (2^(e+7)); the INT8 E8M0 exponent must step up by one across each pair.
+        boundary = (31.75, 32.0, 127.0, 128.0, 1016.0, 1024.0, 0.5, 0.5078125)
+        for value in inputs:
+            for head, offset in ((0, 0), (1, 4)):
+                for i in range(4):
+                    value[:, 1, head, 32 * i : 32 * (i + 1)] = boundary[offset + i]
     codecs = _codecs(pair)
     op = op_cls(
         rank=rank,
@@ -437,7 +455,7 @@ def _check_packed(rank, world_size, heads, sequence, device, op_cls, name):
     )
 
     case = next(c for c in _PACKED_CASES if c.name == name)
-    _, qk_codec, v_codec, v_pack, _ = case
+    qk_codec, v_codec, v_pack = case.qk_codec, case.v_codec, case.v_pack
     inputs = tuple(
         _input(rank + 47 * role, heads, sequence, device) for role in range(3)
     )
@@ -480,19 +498,30 @@ def _check_packed(rank, world_size, heads, sequence, device, op_cls, name):
             if role == 2 and v_pack == AttentionPack.V_FOR_FP6_P
             else _packed_reference(codec, role, full, softmax_scale, packers)
         )
-    op = op_cls(
-        rank=rank,
-        world_size=world_size,
-        shape=inputs[0].shape,
-        quant=(qk_codec, v_codec),
-        v_pack=v_pack,
-        return_packed=True,
-        softmax_scale=softmax_scale,
-        hadamard=True,
-        valid_kv_len=valid_kv_len,
-    )
-    payloads, scales = _submit_roles(op, inputs)
-    torch.cuda.synchronize()
+    # The software-FP6 switch is read at kernel build time and is part of the JIT
+    # key, so it only needs to be set while the op is built and first launched.
+    saved_sw = os.environ.get("AITER_A2A_FP6_FORCE_SOFTWARE")
+    if case.force_sw_fp6:
+        os.environ["AITER_A2A_FP6_FORCE_SOFTWARE"] = "1"
+    try:
+        op = op_cls(
+            rank=rank,
+            world_size=world_size,
+            shape=inputs[0].shape,
+            quant=(qk_codec, v_codec),
+            v_pack=v_pack,
+            return_packed=True,
+            softmax_scale=softmax_scale,
+            hadamard=True,
+            valid_kv_len=valid_kv_len,
+        )
+        payloads, scales = _submit_roles(op, inputs)
+        torch.cuda.synchronize()
+    finally:
+        if saved_sw is None:
+            os.environ.pop("AITER_A2A_FP6_FORCE_SOFTWARE", None)
+        else:
+            os.environ["AITER_A2A_FP6_FORCE_SOFTWARE"] = saved_sw
 
     for role in (0, 1):
         expected_payload, expected_scales = references[role]
@@ -775,6 +804,8 @@ def _check_v4_consumer(rank, world_size, heads, sequence, device, op_cls, codec)
         v_format = AttentionFormat.MXFP4
     # Transport check: the fused A2A output, consumed through the packed views,
     # must equal canonical quantize + MHA on this rank's own gathered inputs.
+    # Equality relies on mha_v4's K-mean centering gate staying off (Gaussian
+    # inputs); the fused path never centers K.
     # Raw formats select canonical packing, so mha_v4 takes no v_pack.
     canonical = mha_v4(
         full[0],
@@ -955,6 +986,9 @@ def _check_reuse(rank, world_size, heads, sequence, device, op_cls):
         hadamard=False,
     )
     # Four calls run both flag parities twice; each must see only its own data.
+    # Submit all four calls back to back with no host sync between them, so the
+    # in-stream reuse handshake (not a host barrier) is what protects the buffers.
+    calls = []
     for call in range(4):
         inputs = tuple(
             _input(rank + 97 * role, heads, sequence, device, salt=call)
@@ -967,9 +1001,16 @@ def _check_reuse(rank, world_size, heads, sequence, device, op_cls):
             "e4m3",
             _CTX.fp8_dtype,
         ).to(torch.bfloat16)
-        result = _submit_roles(op, inputs)
-        actual = result[0].view(1, heads // world_size, sequence * world_size, 128)
-        torch.cuda.synchronize()
+        calls.append((inputs, expected))
+    torch.cuda.synchronize()
+    actuals = [
+        _submit_roles(op, inputs)[0]
+        .view(1, heads // world_size, sequence * world_size, 128)
+        .clone()
+        for inputs, _ in calls
+    ]
+    torch.cuda.synchronize()
+    for call, ((_, expected), actual) in enumerate(zip(calls, actuals)):
         _exact(actual, expected, f"reuse call {call}")
     return op, lambda: _submit_roles(op, inputs)
 
