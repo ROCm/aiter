@@ -36,18 +36,26 @@ def _shape(s, rows):
     }
 
 
-@pytest.mark.parametrize("form", ["expanded", "scalar1", "scalar11"])
+@pytest.mark.parametrize(
+    "form", ["expanded", "scalar1", "scalar11", "scalar_x", "scalar_w"]
+)
 @pytest.mark.parametrize("m,tm,tn,tk,sk", CONFIGS)
 def test_per_tensor_scale_forms(m, tm, tn, tk, sk, form):
     from aiter.ops.flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
 
     aq, xs, wq, ws, ref = _make(m, N, K)
     out = torch.full((m, N), float("nan"), device="cuda", dtype=dtypes.bf16)
+    x_form = (
+        "scalar1" if form == "scalar_x" else "expanded" if form == "scalar_w" else form
+    )
+    w_form = (
+        "scalar1" if form == "scalar_w" else "expanded" if form == "scalar_x" else form
+    )
     flydsl_preshuffle_gemm_a8(
         aq,
         wq,
-        _shape(xs, m)[form](),
-        _shape(ws, N)[form](),
+        _shape(xs, m)[x_form](),
+        _shape(ws, N)[w_form](),
         out,
         tm,
         tn,

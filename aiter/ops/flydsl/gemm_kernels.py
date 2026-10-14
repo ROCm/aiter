@@ -8,6 +8,7 @@ from __future__ import annotations
 import functools
 import re
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from torch import Tensor
@@ -382,12 +383,9 @@ def flydsl_preshuffle_gemm_a8(
                 raise ValueError(f"blockscale {name} buffer must be smaller than 4 GiB")
 
     if scale_mode == "epilogue":
-        # The epilogue indexes scales per row/column, so a per-tensor scalar
-        # would be read out of extent; broadcast it to [M,1] / [N,1].
+        # Scalar scales are broadcast inside the GEMM, without materialization.
         def _norm_scale(name, scale, rows):
-            if scale.numel() == 1:
-                return scale.reshape(1, 1).expand(rows, 1).contiguous()
-            if scale.numel() != rows:
+            if scale.numel() not in (1, rows):
                 raise ValueError(
                     f"[FlyDSL] {name} shape {tuple(scale.shape)} must have 1 "
                     f"(per-tensor) or {rows} elements"
@@ -458,8 +456,8 @@ def flydsl_preshuffle_gemm_a8(
         # dtype is part of the executable's cache signature, so this must match
         # what the AOT pre-compile passes or every non-split-K kernel misses it.
         semaphore = torch.empty(0, dtype=torch.int32, device=Out.device)
-    # The layout-API launcher takes fx.Tensor args, so pass flat tensors
-    # directly rather than raw pointers.
+    # Explicit scale adaptors retain static sizes for scalar specialization;
+    # bare torch arguments have dynamic layouts.
     _run_compiled(
         exe,
         workspace.view(-1),
@@ -467,12 +465,13 @@ def flydsl_preshuffle_gemm_a8(
         semaphore,
         _as_i8(XQ.contiguous()).view(-1),
         _as_i8(WQ.contiguous()).view(-1),
-        x_scale.contiguous().view(-1),
-        w_scale.contiguous().view(-1),
+        flyc.from_torch_tensor(x_scale.contiguous().view(-1)),
+        flyc.from_torch_tensor(w_scale.contiguous().view(-1)),
         dummy_bias,
         m,
         n,
         fx.Stream(torch.cuda.current_stream()),
+        specialization_key=(x_scale.numel() == 1, w_scale.numel() == 1),
     )
     if out_contig is not Out:
         Out.copy_(out_contig)

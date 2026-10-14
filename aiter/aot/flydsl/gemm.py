@@ -683,23 +683,26 @@ def _compile_preshuffle_to_cache(
         split_k=k_split,
         scale_mode=scale_mode,
     )
-    # The layout-API launcher uses fx.Tensor args (it builds views via
-    # fx.get_iter/make_view), so pass flat torch tensors directly rather
-    # than raw pointers (pointer args would fail GetIterOp type checks).
-    _compile_executable_to_cache(
-        exe,
-        workspace,
-        out,
-        semaphore,
-        a,
-        b,
-        scale_a,
-        scale_b,
-        bias,
-        m,
-        n,
-        stream,
-    )
+    # Match runtime's static scale layouts, including each scalar specialization.
+    scale_pairs = [(scale_a, scale_b)]
+    if scale_mode == "epilogue":
+        scalar = torch.empty((1,), device=dev, dtype=torch.float32)
+        scale_pairs += [(scalar, scale_b), (scale_a, scalar), (scalar, scalar)]
+    for sa, sb in scale_pairs:
+        _compile_executable_to_cache(
+            exe,
+            workspace,
+            out,
+            semaphore,
+            a,
+            b,
+            flyc.from_torch_tensor(sa),
+            flyc.from_torch_tensor(sb),
+            bias,
+            m,
+            n,
+            stream,
+        )
 
 
 def _compile_mxscale_preshuffle_to_cache(

@@ -878,7 +878,9 @@ def compile_preshuffle_gemm(
             s_a = s_b = bias = None
             if const_expr(is_8bit and not is_blockscale):
                 # Per-row(scale_a) × per-col(scale_b) scaling, applied in the epilogue.
-                if const_expr(n_ragged):
+                if const_expr(fx.size(arg_scale_b.shape).unpack() == 1):
+                    sb_tiles = _epi_tiles(arg_scale_b, 1)
+                elif const_expr(n_ragged):
                     sb_tiles = _epi_tiles(
                         arg_scale_b,
                         1,
@@ -891,7 +893,11 @@ def compile_preshuffle_gemm(
                 s_b = [
                     _epi_read1(
                         sb_tiles,
-                        by_n + (ni * num_waves + wave_id) * 16 + lane_mod_16,
+                        (
+                            fx.Int32(0)
+                            if const_expr(fx.size(arg_scale_b.shape).unpack() == 1)
+                            else by_n + (ni * num_waves + wave_id) * 16 + lane_mod_16
+                        ),
                         fx.Float32,
                         sb_atom,
                     )
@@ -902,22 +908,31 @@ def compile_preshuffle_gemm(
                         (k_off < num_k_tiles).select(fx.Float32(v), fx.Float32(0.0))
                         for v in s_b
                     ]
-                # scale_a: real byte bounds (runtime i32_m) so OOB rows clamp to 0.
-                # dwordx4 (128b) load; the element base is a multiple of 4, so the
-                # tile index (1 tile == 4 f32) is base // 4.
-                sa_tiles = _epi_tiles(
-                    arg_scale_a,
-                    4,
-                    max_size=False,
-                    num_records_bytes=fx.Int64(i32_m) * fx.Int64(4),
-                )
-                sa_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(0), fx.Float32)
+                scalar_a = fx.Float32(0.0)
+                if const_expr(fx.size(arg_scale_a.shape).unpack() == 1):
+                    scalar_tiles = _epi_tiles(arg_scale_a, 1)
+                    scalar_atom = fx.make_copy_atom(
+                        fx.rocdl.BufferCopy32b(0), fx.Float32
+                    )
+                    scalar_a = _epi_read1(scalar_tiles, 0, fx.Float32, scalar_atom)
+                else:
+                    # Bound per-row dwordx4 loads by runtime M so OOB rows clamp to 0.
+                    sa_tiles = _epi_tiles(
+                        arg_scale_a,
+                        4,
+                        max_size=False,
+                        num_records_bytes=fx.Int64(i32_m) * fx.Int64(4),
+                    )
+                    sa_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(0), fx.Float32)
                 s_a = []
                 for mi in range_constexpr(m_repeat):
-                    r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
-                    idx = fx.Int32(bx_m + mi * 16 + lane_div_16 * 4) // fx.Int32(4)
-                    fx.copy(sa_atom, fx.slice(sa_tiles, (None, idx)), r)
-                    scale = fx.Vector(fx.memref_load_vec(r)).bitcast(fx.Float32)
+                    if const_expr(fx.size(arg_scale_a.shape).unpack() == 1):
+                        scale = Vec.filled(4, scalar_a, fx.Float32)
+                    else:
+                        r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
+                        idx = fx.Int32(bx_m + mi * 16 + lane_div_16 * 4) // fx.Int32(4)
+                        fx.copy(sa_atom, fx.slice(sa_tiles, (None, idx)), r)
+                        scale = fx.Vector(fx.memref_load_vec(r)).bitcast(fx.Float32)
                     if const_expr(is_ragged):
                         keep = (k_off < num_k_tiles).select(fx.Int32(-1), fx.Int32(0))
                         scale = (
