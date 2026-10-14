@@ -636,7 +636,8 @@ namespace py = pybind11;
           py::arg("reg_bytes"),                                                      \
           py::arg("use_1stage"),                                                     \
           py::arg("bf16_out_ptr")    = static_cast<int64_t>(0),                      \
-          py::arg("transpose_scale") = false);                                       \
+          py::arg("transpose_scale") = false,                                        \
+          py::arg("gemma_norm")      = false);                                       \
     m.def("fused_allreduce_rmsnorm_mxfp4_quant",                                     \
           &aiter::fused_allreduce_rmsnorm_mxfp4_quant,                               \
           py::arg("_fa"),                                                            \
