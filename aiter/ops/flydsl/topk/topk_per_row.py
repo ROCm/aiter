@@ -433,9 +433,8 @@ def _run_adaptive(
         stream.cuda_stream,
         _adaptive.topk_workspace_slots(
             rows,
-            11,
             compact=cfg["compact"],
-            compact_cap=kw.get("compact_cap_mult", 16) * k,
+            compact_cap=_adaptive.COMPACT_CAP_MULT * k,
         ),
     )
     # `cfg_width` again, not `width`: this asks whether the config above left
@@ -446,10 +445,9 @@ def _run_adaptive(
         k,
         kw["short_max"],
         tier_mode=kw.get("tier_mode", "auto"),
-        bits_per_pass=11,
     ):
         if cfg["compact"]:
-            lead = _adaptive.workspace_zero_row_slots(11, compact=True)
+            lead = _adaptive.workspace_zero_row_slots(compact=True)
             workspace.view(rows, -1)[:, :lead].zero_()
         else:
             workspace.zero_()

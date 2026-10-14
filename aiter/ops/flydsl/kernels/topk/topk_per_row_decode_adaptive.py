@@ -21,8 +21,8 @@ Inputs/outputs:
   - indices: flattened int32 output with shape (num_rows, top_k); each row writes its
     unordered Top-K index set. A row with fewer than top_k valid entries is
     identity-filled and padded with -1.
-  - workspace: row-major int32 scratch sized by topk_workspace_slots(num_rows,
-    bits_per_pass). The multi-block tiers merge per-block LDS histograms into its
+  - workspace: row-major int32 scratch sized by topk_workspace_slots(num_rows).
+    The multi-block tiers merge per-block LDS histograms into its
     pass-private global histograms over an inter-workgroup acquire/release barrier and
     coordinate through its counters; the single-workgroup tier never touches it.
 
@@ -30,12 +30,10 @@ Paths (per row, by valid length row_len):
   - short (row_len <= short_max): active_parts = 1; part 0 runs the whole radix-select
     in one workgroup — LDS-only histograms, no inter-workgroup barrier, no workspace
     round-trip.
-  - mid (short_max < row_len <= mid_max): active_parts = min(blocks_per_row, mid_cap).
-  - long (row_len > mid_max): active_parts = min(blocks_per_row, long_cap).
+  - multi-part (row_len > short_max): active_parts = min(blocks_per_row, part_cap).
 
 Constraints:
   - logits are fp32; the order-preserving radix key twiddle is fp32-specific.
-  - bits_per_pass is 10 or 11; the short tier requires 11 bits (2048-bin LDS histogram).
   - BLOCK_THREADS is fixed at 1024 (wave64); the histogram/scan layout relies on it.
   - workspace must be zeroed before any launch that enters a multi-block tier; its
     counters and histograms accumulate from zero (needs_workspace_zero reports when).
@@ -74,22 +72,29 @@ _WORKGROUP = rocdl.SyncScope.Workgroup
 
 # HW max block size; also assumed by the bucket scan (2 bins/thread -> 2048 bins).
 BLOCK_THREADS = 1024
+# Radix digit width. The short tier's LDS histogram is the 2048-bin scan above.
+BITS_PER_PASS = 11
+NUM_PASSES = -(-32 // BITS_PER_PASS)
+NUM_BUCKETS = 1 << BITS_PER_PASS
 WARP_SIZE = 64
 LOAD_VEC = 4
 # log2(LOAD_VEC); LOAD_VEC must be a power of two. vec_blocks = ceil(row_len/LOAD_VEC)
 # is a right shift, so the shift amount must track LOAD_VEC, not a hardcoded width.
 LOAD_VEC_LOG2 = LOAD_VEC.bit_length() - 1
-# Default histogram-scan staging (one of 1/2/4/8)
-SCAN_STAGES = 2
 # Load staging width for ordered emit (matches unordered last-pass unroll).
 ORDERED_STAGES = 4
 # vec-loads a thread takes per compact-fill tile. The fill's block scan costs two
 # barriers and drains the loads in flight, so it wants to be paid as rarely as the
-# register budget allows; each step holds compact_fill_vecs * LOAD_VEC keys live.
+# register budget allows; each step holds COMPACT_FILL_VECS * LOAD_VEC keys live.
 COMPACT_FILL_VECS = 4
+# Candidate buffer slots per row, in units of k. Trades workspace for how often the
+# buffer path is taken, never correctness: a part that overflows rescans instead.
+COMPACT_CAP_MULT = 16
 
 # 128B-spaced inter-workgroup counter groups (32 int32 == 128B each), kept in the int32 workspace.
 COUNTER_STRIDE = 32
+# s_sleep units between barrier polls, about 64 clocks each.
+SPIN_SLEEP = 1
 # Bound on the certificate's re-read loop, so a bug cannot hang the GPU. It is a
 # liveness guard, not a schedule: the loop exits when the bins sum to the row's
 # live length, which every part's atomics make inevitable. Sized far past any
@@ -180,7 +185,7 @@ There a row has at most four parts, so the floor moves from the row
 """
 
 # parts = sqrt(c2 * seq / (c1 * rows)); only the ratio decides a width. Fitted
-# with `poll_then_acquire` on.
+# with the barrier polling monotonically and acquiring once.
 PARTS_C1 = {False: 187.979e-3, True: 153.875e-3}
 PARTS_C2 = {False: 1.87979e-3, True: 464.695e-6}
 
@@ -330,7 +335,6 @@ def decode_adaptive_config(
     seq: int,
     k: int = MEASURED_PARTS_K,
     *,
-    compact_cap_mult: int = 16,
     short_max: int | None = None,
     ordered: bool = True,
     early_stop: bool = True,
@@ -349,16 +353,12 @@ def decode_adaptive_config(
     compact = decode_compact_compacts(rows, seq, parts, short_max)
     kw = {
         "blocks_per_row": grid,
-        "bits_per_pass": 11,
         # Not "auto" when every row fits: at one part the cooperating path folds
         # away at compile time and "auto" has nowhere to send a long row.
         "tier_mode": "short" if seq <= short_max else "auto",
-        "mid_cap": max(2, parts),
-        "long_cap": max(2, parts),
+        "part_cap": max(2, parts),
         "short_max": short_max,
         "ordered": ordered,
-        # Poll with monotonic loads, then one acquire once the token lands.
-        "poll_then_acquire": True,
     }
     # Left out where the build cannot reach it, which would only split the JIT cache.
     # The short tier reaches it under `compact` too, since it never uses the buffer;
@@ -369,16 +369,7 @@ def decode_adaptive_config(
         kw["histogram_certificate"] = True
     if compact:
         kw["compact"] = True
-        kw["compact_cap_mult"] = compact_cap_mult
-        kw["compact_fill_vecs"] = COMPACT_FILL_VECS
-        # The early carry drops one barrier per fill tile and is built on the scan.
-        kw["compact_fast_scan"] = True
-        kw["compact_early_carry"] = True
     return {"kw": kw, "grid": grid, "parts": parts, "compact": compact}
-
-
-def _num_passes(bits_per_pass: int) -> int:
-    return (32 + bits_per_pass - 1) // bits_per_pass
 
 
 def _compact_row_slots(compact: bool, compact_cap: int) -> int:
@@ -388,21 +379,18 @@ def _compact_row_slots(compact: bool, compact_cap: int) -> int:
 
 def topk_workspace_slots(
     num_rows: int,
-    bits_per_pass: int = 11,
     compact: bool = False,
     compact_cap: int = 0,
 ) -> int:
     """Return int32 workspace slots for the multi-block tiers (row-major, per row)."""
-    if bits_per_pass not in (10, 11):
-        raise ValueError(f"bits_per_pass must be 10 or 11, got {bits_per_pass}")
-    row_slots = COUNTER_SLOTS + _num_passes(bits_per_pass) * (1 << bits_per_pass)
+    row_slots = COUNTER_SLOTS + NUM_PASSES * NUM_BUCKETS
     row_slots += _compact_row_slots(compact, compact_cap)
     return int(num_rows) * row_slots
 
 
-def workspace_zero_row_slots(bits_per_pass: int = 11, compact: bool = False) -> int:
+def workspace_zero_row_slots(compact: bool = False) -> int:
     """Leading int32 slots of each row that must start at zero; compact data may not."""
-    slots = COUNTER_SLOTS + _num_passes(bits_per_pass) * (1 << bits_per_pass)
+    slots = COUNTER_SLOTS + NUM_PASSES * NUM_BUCKETS
     return slots + (COMPACT_HDR_SLOTS if compact else 0)
 
 
@@ -411,16 +399,10 @@ def needs_workspace_zero(
     top_k: int,
     short_max: int,
     tier_mode: str = "auto",
-    bits_per_pass: int = 11,
 ) -> bool:
     """Return whether any row can enter the persistent multi-block path."""
     if tier_mode == "short":
         return False
-    if tier_mode in ("mid", "long"):
-        return True
-    # No short tier below 11 bits, so every row is persistent regardless of length.
-    if bits_per_pass != 11:
-        return True
     return max_row_len > max(short_max, top_k)
 
 
@@ -429,23 +411,12 @@ def create_topk_per_row_decode_adaptive_kernel(
     top_k: int,
     *,
     blocks_per_row: int = 8,
-    bits_per_pass: int = 11,
-    scan_stages: int = SCAN_STAGES,
-    tier_mode: Literal["auto", "short", "mid", "long"] = "auto",
+    tier_mode: Literal["auto", "short"] = "auto",
     short_max: int = 16384,
-    mid_cap: int = 16,
-    mid_max: int = 65536,
-    long_cap: int = 32,
-    mask_non_finite: bool = False,
+    part_cap: int = 32,
     early_stop: bool = False,
     ordered: bool = False,
     compact: bool = False,
-    compact_cap_mult: int = 16,
-    compact_fill_vecs: int = COMPACT_FILL_VECS,
-    compact_fast_scan: bool = False,
-    compact_early_carry: bool = False,
-    spin_sleep: int = 1,
-    poll_then_acquire: bool = False,
     histogram_certificate: bool = False,
     packed_rows: bool = False,
 ) -> Any:
@@ -456,69 +427,29 @@ def create_topk_per_row_decode_adaptive_kernel(
     Prefer `decode_adaptive_config` to choosing these by hand; it answers every knob
     from the shape. Constraints a caller can otherwise get wrong:
 
-    - `bits_per_pass` is 10 or 11, and the short tier needs 11 (2048-bin histogram).
-    - `scan_stages` is one of 1/2/4/8; `spin_sleep` is 0..15.
-    - `mask_non_finite` off is the default *because* it matches torch.topk, which
-      ranks every NaN, of either sign, above +inf. Asking for it is asking to
-      diverge from it.
-    - `compact_cap_mult` trades workspace for how often the buffer path is taken,
-      never correctness: a row that overflows rescans instead.
     - `early_stop` is silently dropped from the multi-block tiers under `compact`,
       where the last pass reads the candidate buffer rather than the row. The
       short tier takes it whenever it is compiled in.
-    - `mid_cap` / `long_cap` are clamped to `blocks_per_row`.
+    - `part_cap` is clamped to `blocks_per_row`.
     - `packed_rows` reads row r from element row_starts[r] of a flat input, with
       `width` then the plane's; otherwise row_starts is not read.
 
     The module docstring describes what each tier, the candidate buffer and the
     histogram certificate actually do.
     """
-    if bits_per_pass not in (10, 11):
-        raise ValueError(f"bits_per_pass must be 10 or 11, got {bits_per_pass}")
-    if compact and compact_cap_mult < 1:
-        raise ValueError(f"compact_cap_mult must be >= 1, got {compact_cap_mult}")
-    if compact and _num_passes(bits_per_pass) < 3:
-        raise ValueError(
-            "compact needs a pass after the one that fills the buffer; "
-            f"bits_per_pass={bits_per_pass} leaves too few passes"
-        )
-    if scan_stages not in (1, 2, 4, 8):
-        raise ValueError(f"scan_stages must be one of (1, 2, 4, 8), got {scan_stages}")
-
     # blocks_per_row == 1 collapses the launch to grid=(1, num_rows): every row runs
     # the barrier-free single-workgroup short tier (no cooperative parts, so no dead
-    # blocks hogging co-resident slots). Only valid when the short tier exists
-    # (auto/short + bpp==11); mid/long forced modes still need >=2 cooperating parts.
-    _min_blocks_per_row = (
-        1 if (tier_mode in ("auto", "short") and bits_per_pass == 11) else 2
-    )
-    if not _min_blocks_per_row <= blocks_per_row <= 32:
-        raise ValueError(
-            f"blocks_per_row must be in [{_min_blocks_per_row}, 32], got {blocks_per_row}"
-        )
+    # blocks hogging co-resident slots).
+    if not 1 <= blocks_per_row <= 32:
+        raise ValueError(f"blocks_per_row must be in [1, 32], got {blocks_per_row}")
 
-    if mid_cap < 2 or long_cap < 2:
-        raise ValueError(f"mid_cap/long_cap must be >= 2, got {mid_cap}/{long_cap}")
-    if mid_max < short_max:
-        raise ValueError(f"mid_max must be >= short_max, got {mid_max} < {short_max}")
-    if tier_mode not in ("auto", "short", "mid", "long"):
-        raise ValueError(
-            f"tier_mode must be one of auto/short/mid/long, got {tier_mode!r}"
-        )
-    # The short tier runs the standalone one-workgroup radix-select (2048-bin LDS
-    # histogram), so it needs bits_per_pass == 11. It is compiled in for "auto"
-    # (short rows) and "short" (all rows); forcing "short" without bpp==11 is an
-    # error rather than a silent fallback.
-    if tier_mode == "short" and bits_per_pass != 11:
-        raise ValueError(
-            f"tier_mode='short' requires bits_per_pass == 11, got {bits_per_pass}"
-        )
+    if part_cap < 2:
+        raise ValueError(f"part_cap must be >= 2, got {part_cap}")
+    if tier_mode not in ("auto", "short"):
+        raise ValueError(f"tier_mode must be auto or short, got {tier_mode!r}")
 
     # ordered=True drops the short tier; it assumes the unordered emit.
-    if ordered:
-        short_tier = False
-    else:
-        short_tier = tier_mode in ("auto", "short") and bits_per_pass == 11
+    short_tier = not ordered
     # The short tier reads the row on every pass and never orders, so it can stop
     # after any pass whose boundary bucket falls whole.
     short_early_stop = bool(early_stop) and short_tier
@@ -533,11 +464,6 @@ def create_topk_per_row_decode_adaptive_kernel(
     # there is the length read at runtime; every other build keeps its
     # cooperating path fixed at compile time.
     short_tier_by_len = short_tier and tier_mode == "auto" and blocks_per_row == 1
-    if compact_early_carry and not compact_fast_scan:
-        raise ValueError("compact_early_carry=True requires compact_fast_scan=True")
-    # s_sleep takes 0..15 and waits about 64 clocks per unit.
-    if not 0 <= spin_sleep <= 15:
-        raise ValueError(f"spin_sleep must be 0..15, got {spin_sleep}")
     if ordered and blocks_per_row > WARP_SIZE:
         raise ValueError(
             f"ordered=True scans slice bases within one wave, so blocks_per_row "
@@ -545,8 +471,8 @@ def create_topk_per_row_decode_adaptive_kernel(
         )
     block_threads = BLOCK_THREADS
     red_slots = (block_threads + WARP_SIZE - 1) // WARP_SIZE
-    num_passes = _num_passes(bits_per_pass)
-    num_buckets = 1 << bits_per_pass
+    num_passes = NUM_PASSES
+    num_buckets = NUM_BUCKETS
     # Pass 0 settles the digit that defines a candidate, so pass 1 is the earliest
     # that can fill the buffer; every pass after it reads the buffer instead of the row.
     compact_fill_pass = 1
@@ -577,35 +503,23 @@ def create_topk_per_row_decode_adaptive_kernel(
     # The emit waits behind every barrier the passes reached, for the same reason.
     emit_barrier_token = 1 + sum(not certified_pass(q) for q in range(num_passes))
 
-    compact_cap = compact_cap_mult * top_k if compact else 0
+    compact_cap = COMPACT_CAP_MULT * top_k if compact else 0
     compact_base = COUNTER_SLOTS + num_passes * num_buckets
     compact_data = compact_base + COMPACT_HDR_SLOTS
     row_workspace_slots = compact_base + _compact_row_slots(compact, compact_cap)
 
     # Caps/thresholds only affect codegen for modes that use them; include them in
     # the name for those modes so distinct configs cache separately.
-    _cap_tag = (
-        ""
-        if tier_mode == "short"
-        else f"_s{short_max}_mc{mid_cap}_mm{mid_max}_lc{long_cap}"
-    )
+    _cap_tag = "" if tier_mode == "short" else f"_s{short_max}_pc{part_cap}"
     kernel_name = (
         f"topk_per_row_decode_adaptive_k{top_k}_"
-        f"bpp{bits_per_pass}_g{blocks_per_row}"
-        f"_stage{scan_stages}"
+        f"g{blocks_per_row}"
         f"_{tier_mode}"
         f"{_cap_tag}"
         f"{'_1wg' if short_tier else ''}"
-        f"{'_mf' if mask_non_finite else ''}"
         f"{'_es' if early_stop else ''}"
         f"{'_ses' if short_early_stop else ''}"
         f"{'_ord' if ordered else ''}"
-        f"{f'_cmp{compact_cap_mult}' if compact else ''}"
-        f"{f'_fv{compact_fill_vecs}' if compact else ''}"
-        f"{'_fastscan' if compact and compact_fast_scan else ''}"
-        f"{'_earlycarry' if compact and compact_early_carry else ''}"
-        f"{f'_sl{spin_sleep}' if spin_sleep != 1 else ''}"
-        f"{'_poll1acq' if poll_then_acquire else ''}"
         f"{'_cert' if histogram_certificate else ''}"
         f"{'_packed' if packed_rows else ''}"
     )
@@ -653,8 +567,6 @@ def create_topk_per_row_decode_adaptive_kernel(
         c_bins_idx = fx.Index(num_buckets)
         c_parts = fx.Int32(blocks_per_row)
         c_sign_bit = fx.Int32(-2147483648)
-        c_exp_mask = fx.Int32(0x7F800000)  # fp32 exponent bits (all-ones => inf/NaN)
-        c_neg_inf_bits = fx.Int32(-0x800000)  # fp32 -inf
         c_nan_turn = fx.Int32(0x7FFFFF)  # keys from -inf past the -NaNs
         c_row_ws = fx.Int32(row_workspace_slots)
 
@@ -708,25 +620,15 @@ def create_topk_per_row_decode_adaptive_kernel(
         row_ws_base = row * c_row_ws
 
         # Active cooperating workgroups per row over the fixed grid (excess blocks
-        # return immediately). "auto" picks per row by length; short/mid/long force
-        # that tier for every row. Caps are clamped to the grid.
-        c_mid_cap = fx.Int32(mid_cap)
-        c_long_cap = fx.Int32(long_cap)
-        mid_parts = (c_parts < c_mid_cap).select(c_parts, c_mid_cap)
-        long_parts = (c_parts < c_long_cap).select(c_parts, c_long_cap)
+        # return immediately). "auto" picks per row by length; "short" gives every
+        # row one part. The cap is clamped to the grid.
+        c_part_cap = fx.Int32(part_cap)
+        capped_parts = (c_parts < c_part_cap).select(c_parts, c_part_cap)
         if const_expr(tier_mode == "short"):
             active_parts = c_one
-        elif const_expr(tier_mode == "mid"):
-            active_parts = mid_parts
-        elif const_expr(tier_mode == "long"):
-            active_parts = long_parts
         else:  # "auto": pick per row by valid length
             c_short = fx.Int32(short_max)
-            c_mid = fx.Int32(mid_max)
-            active_parts = (row_len <= c_short).select(
-                c_one,
-                (row_len <= c_mid).select(mid_parts, long_parts),
-            )
+            active_parts = (row_len <= c_short).select(c_one, capped_parts)
         active_threads = active_parts * c_block_i32
         single_part_active = active_parts == c_one
         if const_expr(short_tier_by_len):
@@ -780,21 +682,13 @@ def create_topk_per_row_decode_adaptive_kernel(
         def spin_until_slot_ge(elem_i32, target):
             cur = c_zero
             while cur < target:
-                rocdl.s_sleep(spin_sleep)
-                cur = ws_poll(
-                    elem_i32,
-                    (
-                        fx.AtomicOrdering.Monotonic
-                        if const_expr(poll_then_acquire)
-                        else fx.AtomicOrdering.Acquire
-                    ),
-                )
-            if const_expr(poll_then_acquire):
-                # The loop's monotonic observation only decides when to stop. This
-                # acquire re-reads the same monotonically increasing token and pairs
-                # with the last workgroup's release publish before any histogram
-                # data is consumed.
-                ws_poll(elem_i32, fx.AtomicOrdering.Acquire)
+                rocdl.s_sleep(SPIN_SLEEP)
+                cur = ws_poll(elem_i32, fx.AtomicOrdering.Monotonic)
+            # The loop's monotonic observation only decides when to stop. This
+            # acquire re-reads the same monotonically increasing token and pairs
+            # with the last workgroup's release publish before any histogram
+            # data is consumed.
+            ws_poll(elem_i32, fx.AtomicOrdering.Acquire)
 
         def row_barrier(token):
             # Intentional no-drain acquire/release protocol: workgroup barriers
@@ -826,14 +720,6 @@ def create_topk_per_row_decode_adaptive_kernel(
                     spin_until_slot_ge(counter_slot(COUNTER_PASS_DONE), token_value)
             gpu.barrier()
 
-        def key_bits(val):
-            # Under mask_non_finite every inf/NaN becomes -inf and is never selected.
-            bits = val.bitcast(fx.Int32)
-            if const_expr(not mask_non_finite):
-                return bits
-            is_nonfinite = (bits & c_exp_mask) == c_exp_mask
-            return is_nonfinite.select(c_neg_inf_bits, bits)
-
         def radix_twiddle_key(val):
             # Map larger fp32 values to smaller unsigned keys so ascending bucket
             # scans select descending values -- the bitwise complement of the
@@ -843,7 +729,7 @@ def create_topk_per_row_decode_adaptive_kernel(
             # change which tied index is emitted.
             # The wrapping add rotates the -NaNs, which twiddle past -inf, round to
             # the top, so every NaN ranks above +inf as torch.topk ranks it.
-            bits = key_bits(val)
+            bits = val.bitcast(fx.Int32)
             return (bits ^ ~((bits >> 31) | c_sign_bit)) + c_nan_turn
 
         def bucket_for_key(key, start_bit: int):
@@ -942,7 +828,7 @@ def create_topk_per_row_decode_adaptive_kernel(
             while (s_meta[fx.Int32(SMEM_META_TOTAL)] != expected_total) & (
                 spins < fx.Int32(CERTIFICATE_MAX_SPINS)
             ):
-                rocdl.s_sleep(spin_sleep)
+                rocdl.s_sleep(SPIN_SLEEP)
                 load_global_histogram(pass_id, coherent=True)
                 choose_bucket_prefix(target_k)
                 spins = spins + c_one
@@ -1037,7 +923,7 @@ def create_topk_per_row_decode_adaptive_kernel(
             Only the ties feed the next histogram.
 
             The emit reads this buffer back in column order, so the append must
-            preserve it. That is why each thread takes `compact_fill_vecs`
+            preserve it. That is why each thread takes `COMPACT_FILL_VECS`
             *contiguous* vec-loads rather than a strided share -- one scan over
             per-thread totals orders candidates by thread, and only a contiguous
             share makes thread order the same thing as column order.
@@ -1045,7 +931,7 @@ def create_topk_per_row_decode_adaptive_kernel(
             biased_current = current_bits ^ c_sign_bit
             keeps = []
             n_keep = c_zero
-            for v in range_constexpr(compact_fill_vecs):
+            for v in range_constexpr(COMPACT_FILL_VECS):
                 vec = vecs[v]
                 for j in range_constexpr(LOAD_VEC):
                     col_i32 = col_base + fx.Int32(v * LOAD_VEC + j)
@@ -1071,13 +957,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                     n_keep = n_keep + keep
 
             carried = s_run[fx.Int32(SMEM_RUN_COMPACT_COUNT)]
-            if const_expr(compact_early_carry):
-                my_excl = compact_early_carry_scan_i32(n_keep, carried)
-            elif const_expr(compact_fast_scan):
-                my_excl, tile_total = compact_exclusive_scan_i32(n_keep)
-            else:
-                my_excl, tile_total = block_exclusive_scan_i32(n_keep)
-                gpu.barrier()
+            my_excl = compact_early_carry_scan_i32(n_keep, carried)
             slot = part_slice_base + carried + my_excl
             for col_i32, key, keep in keeps:
                 if (keep == c_one) & (slot < part_slice_end):
@@ -1086,15 +966,6 @@ def create_topk_per_row_decode_adaptive_kernel(
                     )
                     buffer_ops.buffer_store(key, workspace_rsrc, compact_key_slot(slot))
                 slot = slot + keep
-            if const_expr(not compact_early_carry):
-                if tid == c_zero:
-                    total = carried + tile_total
-                    fx.memref_store(total, s_run, fx.Int32(SMEM_RUN_COMPACT_COUNT))
-                    if total > part_slice_cap:
-                        fx.memref_store(
-                            c_one, s_run, fx.Int32(SMEM_RUN_COMPACT_SPILLED)
-                        )
-                gpu.barrier()
 
         def scan_vec_block(
             vblk, pass_id: int, start_bit: int, previous_start_bit: int, current_bits
@@ -1118,14 +989,7 @@ def create_topk_per_row_decode_adaptive_kernel(
             stride_idx=None,
         ):
             stride_idx = stride_idx or active_stride_idx
-            if const_expr(scan_stages == 1):
-                strides = [fx.Index(0)]
-            elif const_expr(scan_stages == 2):
-                strides = [fx.Index(0), stride_idx()]
-            elif const_expr(scan_stages == 4):
-                strides = [fx.Index(0)] + [stride_idx(m) for m in (1, 2, 3)]
-            else:
-                strides = [fx.Index(0)] + [stride_idx(m) for m in (1, 2, 3, 4, 5, 6, 7)]
+            strides = [fx.Index(0), stride_idx()]
             cols_v = [fx.Int32(vblk + s) * c_vec for s in strides]
             vecs = [load_row_vec(cb) for cb in cols_v]
             for cb, vc in zip(cols_v, vecs):
@@ -1136,26 +1000,6 @@ def create_topk_per_row_decode_adaptive_kernel(
         def block_exclusive_scan_i32(value):
             """Exclusive prefix over tid and block total for one i32 per thread."""
             gpu.barrier()
-            wave_incl = wave_inclusive_scan_i32(value)
-            wave_excl_thread = wave_incl - value
-            if lane == c_last_lane:
-                fx.memref_store(wave_incl, s_scan, (wave, SCAN_TOTAL))
-            gpu.barrier()
-            if wave == c_zero:
-                in_slots = lane < c_red_slots
-                lane_safe = in_slots.select(lane, c_zero)
-                wtot = in_slots.select(s_scan[lane_safe, SCAN_TOTAL], c_zero)
-                wincl = wave_inclusive_scan_i32(wtot)
-                if in_slots:
-                    fx.memref_store(wincl - wtot, s_scan, (lane, SCAN_OFFSET))
-            gpu.barrier()
-            wave_off = s_scan[wave, SCAN_OFFSET]
-            last_off = s_scan[c_last_wave, SCAN_OFFSET]
-            last_tot = s_scan[c_last_wave, SCAN_TOTAL]
-            return wave_off + wave_excl_thread, last_off + last_tot
-
-        def compact_exclusive_scan_i32(value):
-            """Prefix scan for fill tiles already bracketed by a closing barrier."""
             wave_incl = wave_inclusive_scan_i32(value)
             wave_excl_thread = wave_incl - value
             if lane == c_last_lane:
@@ -1597,7 +1441,7 @@ def create_topk_per_row_decode_adaptive_kernel(
             same number of times. A tid-keyed loop bound would not; this walks a
             uniform trip count and predicates the tail columns away instead.
             """
-            per_tile = c_block_i32 * fx.Int32(compact_fill_vecs)
+            per_tile = c_block_i32 * fx.Int32(COMPACT_FILL_VECS)
             return fx.Index((vblks_per_run + per_tile - c_one) // per_tile)
 
         def compact_fill(start_bit: int, previous_start_bit: int, current_bits):
@@ -1608,7 +1452,7 @@ def create_topk_per_row_decode_adaptive_kernel(
             gpu.barrier()
 
             steps_idx = compact_steps_idx()
-            c_fill_span = fx.Int32(compact_fill_vecs) * c_vec
+            c_fill_span = fx.Int32(COMPACT_FILL_VECS) * c_vec
             for step_b, fill_state in range(
                 fx.Index(0), steps_idx, fx.Index(1), init=[c_zero]
             ):
@@ -1618,7 +1462,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                 )
                 vecs = [
                     load_row_vec(col_base + fx.Int32(v * LOAD_VEC))
-                    for v in range_constexpr(compact_fill_vecs)
+                    for v in range_constexpr(COMPACT_FILL_VECS)
                 ]
                 compact_scan_append_tile(
                     col_base,
@@ -1781,8 +1625,8 @@ def create_topk_per_row_decode_adaptive_kernel(
         def scan_pass(
             pass_id: int, current_k, current_bits, barrier_token: int, current_len
         ):
-            start_bit = max(32 - (pass_id + 1) * bits_per_pass, 0)
-            previous_start_bit = max(32 - pass_id * bits_per_pass, 0)
+            start_bit = max(32 - (pass_id + 1) * BITS_PER_PASS, 0)
+            previous_start_bit = max(32 - pass_id * BITS_PER_PASS, 0)
 
             clear_local_histogram()
             if const_expr(compact and pass_id == compact_fill_pass):
@@ -1799,18 +1643,9 @@ def create_topk_per_row_decode_adaptive_kernel(
             scan_step_idx = scan_run_stride_idx if ordered else active_stride_idx
             scan_start_idx = run_first_idx + tid_idx if ordered else global_vec_tid_idx
             scan_stop_idx = run_end_idx if ordered else vec_blocks_idx
-            if const_expr(scan_stages == 8):
-                unroll_limit_idx = scan_stop_idx - scan_step_idx(7)
-                staged_stride_idx = scan_step_idx(8)
-            elif const_expr(scan_stages == 4):
-                unroll_limit_idx = scan_stop_idx - scan_step_idx(3)
-                staged_stride_idx = scan_step_idx(4)
-            elif const_expr(scan_stages == 2):
-                unroll_limit_idx = scan_stop_idx - scan_step_idx()
-                staged_stride_idx = scan_step_idx(2)
-            else:
-                unroll_limit_idx = scan_stop_idx
-                staged_stride_idx = scan_step_idx()
+            # Two loads in flight per step; the loop below takes the odd one out.
+            unroll_limit_idx = scan_stop_idx - scan_step_idx()
+            staged_stride_idx = scan_step_idx(2)
             for vblk, pass_state in range(
                 scan_start_idx,
                 unroll_limit_idx,
@@ -1850,7 +1685,7 @@ def create_topk_per_row_decode_adaptive_kernel(
             the candidate buffer rather than the row; everything from the merge on is
             the same work either way.
             """
-            start_bit = max(32 - (pass_id + 1) * bits_per_pass, 0)
+            start_bit = max(32 - (pass_id + 1) * BITS_PER_PASS, 0)
 
             merged_locally = single_part_active
             certified = certified_pass(pass_id)
@@ -1904,7 +1739,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                 # An unsigned compare of two keys then orders the floats, which is
                 # what makes the histogram's bins ascend.
                 # The same NaN rotation as `radix_twiddle_key`, mirrored.
-                bits = key_bits(val)
+                bits = val.bitcast(fx.Int32)
                 return (bits ^ ((bits >> 31) | c_sign_bit)) - c_nan_turn
 
             def signed_key(val):
@@ -2186,7 +2021,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                         local_len,
                     )
                 last_pass = num_passes - 1
-                settled_bit = max(32 - last_pass * bits_per_pass, 0)
+                settled_bit = max(32 - last_pass * BITS_PER_PASS, 0)
                 early = local_len == local_k
                 if const_expr(not ordered):  # noqa: SIM102 - constexpr guard
                     if early:

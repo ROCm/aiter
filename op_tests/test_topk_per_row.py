@@ -840,11 +840,8 @@ def test_adaptive_compact_garbage(card):
             m, n, 2048, ordered=False, cu_count=card[1]
         )["compact"]
     )
-    cfg = adaptive_kernel.decode_adaptive_config(
-        rows, width, top_k, ordered=False, cu_count=card[1]
-    )
     slots = adaptive_kernel.topk_workspace_slots(
-        rows, 11, compact=True, compact_cap=cfg["kw"]["compact_cap_mult"] * top_k
+        rows, compact=True, compact_cap=adaptive_kernel.COMPACT_CAP_MULT * top_k
     )
     workspace = flydsl_decode_host._get_adaptive_workspace(
         torch.device("cuda", torch.cuda.current_device()),
@@ -873,7 +870,7 @@ def test_adaptive_compact_garbage(card):
         )
         torch.cuda.synchronize()
         # The launch cleared this buffer's leading slots, so it is the one it used.
-        lead = adaptive_kernel.workspace_zero_row_slots(11, compact=True)
+        lead = adaptive_kernel.workspace_zero_row_slots(compact=True)
         assert (workspace.view(rows, -1)[:, :lead] >= 0).all()
         torch_indices = logits.topk(top_k, dim=-1)[1]
         assert compare_topk_results(
