@@ -1099,7 +1099,7 @@ def mla_gluon(
     # grid axis 2 is q_pos (qlen). o uses the caller's layout (3-D or 4-D).
     grid_reduce = (batch_size, nhead, qlen)
     sl_b, sl_qs, sl_h, sl_split, _ = logits_buf.stride()
-    reduce_num_warps = 1 if REGIME == "bh16bn128" and NUM_KV_SPLITS <= 4 else 8
+    reduce_num_warps = 1 if NUM_KV_SPLITS <= 8 else 8
     _mla_softmax_reducev_kernel[grid_reduce](
         logits_buf,
         mid_lse,
