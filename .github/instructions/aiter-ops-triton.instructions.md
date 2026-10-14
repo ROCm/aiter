@@ -110,17 +110,25 @@ In GEMM configs, flag:
 
 - An M bucket key that is not `M_LEQ_<x>` or `"any"`, such as `"small"` or
   `"large"`. Use only `M_LEQ_<x>` keys and `"any"` for M buckets.
-- A new file without `"any"`, when the bounds do not cover all values of M.
-- An entry without one of these keys: `BLOCK_SIZE_M`, `BLOCK_SIZE_N`,
-  `BLOCK_SIZE_K`, `GROUP_SIZE_M`, `num_warps`, `num_stages`, `waves_per_eu`,
-  `matrix_instr_nonkdim`, `cache_modifier`, `NUM_KSPLIT`.
+- A new file without `"any"`, when the bounds do not cover all values of M
+  and the file does not have `"DEFAULT_FALLBACK": true`.
+- An entry without one of the keys of the family's `DEFAULT.json`.
+- A `DEFAULT.json` without a key that its kernel reads. The tuning scripts
+  tune only the keys in `DEFAULT.json`. For most Triton GEMM families the keys
+  are `BLOCK_SIZE_M`, `BLOCK_SIZE_N`, `BLOCK_SIZE_K`, `GROUP_SIZE_M`,
+  `num_warps`, `num_stages`, `waves_per_eu`, `matrix_instr_nonkdim`,
+  `cache_modifier`, `NUM_KSPLIT`.
 - MOE keys (`bm<block_m>_n<N>_k<K>`) in a GEMM config, or GEMM keys in a MOE
   table.
 - An `*AFP4WFP4*` file name with the packed K. The file name uses the logical
   K (`2 * K_bytes`).
 
-Do not flag a `cache_modifier` in a gfx1250 config. You can use cache
-modifiers on all archs, also on gfx1250.
+Do not flag:
+
+- A `cache_modifier` in a gfx1250 config. You can use cache modifiers on all
+  archs, also on gfx1250.
+- A specialized file with `"DEFAULT_FALLBACK": true` that has only some
+  buckets. The loader takes the other buckets from `DEFAULT.json`.
 
 In MOE dispatch tables, flag:
 

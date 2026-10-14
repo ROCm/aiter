@@ -150,8 +150,9 @@ def _get_config(M: int, N: int, K: int):
 ```
 
 [`configs/AGENTS.md`](configs/AGENTS.md) has the layout, the file names, the
-loaders, the JSON format and the steps to add a config. The manual tuning
-flow is in [`utils/_triton/tuning/README.md`](utils/_triton/tuning/README.md).
+loaders, the JSON format and the steps to add a config. To tune a GEMM, use
+the scripts in [`utils/_triton/tuning/`](utils/_triton/tuning/README.md).
+They write the tuned files into `configs/`.
 
 ### Config-aware kernel names in traces
 

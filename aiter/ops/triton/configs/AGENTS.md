@@ -104,11 +104,15 @@ get_gemm_config(config_name, M, N=None, K=None, bounds=None,
    exist.
 2. It uses a specialized file if one matches: `<CONFIG_NAME>-B=..-N=..-K=..`,
    then `<CONFIG_NAME>-N=..-K=..`, or `<CONFIG_NAME>-<specialized_filename>`.
+   A specialized file with `"DEFAULT_FALLBACK": true` gets the buckets that
+   it does not have from `DEFAULT.json`.
 3. In the file it tries the `M_LEQ_<x>` keys in increasing order, then
    `"any"`.
 
-`is_tuned` is `True` only when a specialized file matched. Keep it in the
-return value. The config is a new copy, so you can change it.
+`is_tuned` is `True` only when the bucket that matched comes from the
+specialized file. It is `False` for `"any"` and for a bucket from
+`DEFAULT.json`. Keep it in the return value. The config is a new copy, so you
+can change it.
 
 Keep `_get_config()` thin. Set the `backend` default to `"triton"`, never
 `None`:
@@ -135,9 +139,14 @@ File format:
 - Include `"any"`, unless the bounds cover all values of M.
 - Use only `M_LEQ_<x>` keys and `"any"` for M buckets. Do not use the old
   `"small"` and `"large"` keys.
-- Each entry has `BLOCK_SIZE_M`, `BLOCK_SIZE_N`, `BLOCK_SIZE_K`,
-  `GROUP_SIZE_M`, `num_warps`, `num_stages`, `waves_per_eu`,
-  `matrix_instr_nonkdim`, `cache_modifier` and `NUM_KSPLIT`.
+- `DEFAULT.json` sets the keys of the family: the keys that the kernel reads.
+  Each entry has these keys. For most Triton GEMM families they are
+  `BLOCK_SIZE_M`, `BLOCK_SIZE_N`, `BLOCK_SIZE_K`, `GROUP_SIZE_M`,
+  `num_warps`, `num_stages`, `waves_per_eu`, `matrix_instr_nonkdim`,
+  `cache_modifier` and `NUM_KSPLIT`. The tuning scripts tune only the keys
+  in `DEFAULT.json`.
+- The tuning scripts write a specialized file with `"DEFAULT_FALLBACK": true`,
+  the tuned buckets and a copy of the `"any"` of `DEFAULT.json`.
 - You can use `cache_modifier` on all archs, also on gfx1250.
 
 Names:
@@ -211,10 +220,12 @@ in lowercase (`mhc_fused_sinkhorn`).
 1. Select the config name. Make sure that its `<d_type>` is not already used.
 2. Add `<arch>/<backend>/<op>/<d_type>/DEFAULT.json`.
 3. Add specialized files next to it, with the `<CONFIG_NAME>-` prefix, for
-   example `GEMM-A16W16-N=256-K=7168.json`.
+   example `GEMM-A16W16-N=256-K=7168.json`. For GEMM, run the tuning scripts
+   in `utils/_triton/tuning/`. They write the file into this folder.
 4. Move tuning values that are still in Python into the JSON.
 5. Test on the target arch. Make sure that the config loads, that `is_tuned`
-   is `True` for a specialized shape and that the results do not change.
+   is `True` for each tuned M and that the results do not change. For GEMM,
+   `verify_configs.py --expect-tuned` checks `is_tuned`.
 
 ## Seed a new arch
 
