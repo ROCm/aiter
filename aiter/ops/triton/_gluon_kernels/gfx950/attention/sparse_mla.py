@@ -436,6 +436,8 @@ class Cfg:
         MFMA_K = 32 if FP8_MFMA or DSV4_WALK or STAGED_K32 else 16
         self.MFMA_K = gl.constexpr(MFMA_K)
         # fnuz fp8 operands only have CDNA3 (version 3) matrix-core intrinsics.
+        # FP8_FNUZ is set only for gfx942. False keeps the gfx950 kernel: the
+        # lines above stay OCP e4m3, max 448 and P scale 1, and this stays 4.
         MFMA_VERSION = 3 if FP8_MFMA and FP8_FNUZ else 4
 
         # Warps tile N; past 16 heads they also tile M, 16 heads per warp.
