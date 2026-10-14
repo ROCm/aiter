@@ -4174,9 +4174,9 @@ def paged_attention_decode_v2_reduce_kernel(
     OUTPUT_SEQ_LEN: tl.constexpr,
     ONE_OUTPUT_GROUP_SIZE: tl.constexpr,
     HEAD_SIZE_POW2: tl.constexpr,
-    VALUE_HEAD_PADDED: tl.constexpr,
     CONTEXT_PARTITION_SIZE: tl.constexpr,
     USE_SINKS: tl.constexpr,
+    VALUE_HEAD_PADDED: tl.constexpr = False,
 ):
     """
     Triton reduction kernel for paged attention decode that combines partial results.
