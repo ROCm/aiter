@@ -51,6 +51,9 @@ def sage_quant_mxfp4(
     b, qo_len, h_qo, head_dim = map_dims(q.shape, order)
     _, kv_len, h_kv, _ = map_dims(v.shape, order)
     stride_bz_v, stride_seq_v, stride_h_v, stride_d_v = map_dims(v.stride(), order)
+    stride_bz_vo, stride_seq_vo, stride_h_vo, stride_d_vo = map_dims(
+        v_fp8.stride(), order
+    )
     K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
 
     v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
@@ -89,6 +92,10 @@ def sage_quant_mxfp4(
         stride_h_v,
         stride_seq_v,
         stride_d_v,
+        stride_bz_vo,
+        stride_h_vo,
+        stride_seq_vo,
+        stride_d_vo,
         v_scale.stride(0),
         v_scale.stride(1),
         b,
@@ -457,6 +464,10 @@ def sage_quant_mxfp6(
             v.stride(2),
             v.stride(1),
             v.stride(3),
+            v_quantized.stride(0),
+            v_quantized.stride(2),
+            v_quantized.stride(1),
+            v_quantized.stride(3),
             v_scale.stride(0),
             v_scale.stride(1),
             b,
@@ -530,8 +541,6 @@ def sage_quant(
     order = _bshd_order(layout)
     b, qo_len, h_qo, head_dim = map_dims(q.shape, order)
     _, kv_len, h_kv, _ = map_dims(k.shape, order)
-    stride_bz_q, stride_seq_q, stride_h_q, _ = map_dims(q.stride(), order)
-    stride_bz_k, stride_seq_k, stride_h_k, _ = map_dims(k.stride(), order)
     Q_NUM_BLKS = (qo_len + BLKQ - 1) // BLKQ
     K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
 
@@ -600,6 +609,11 @@ def sage_quant(
 
     grid = (q_task_count + k_task_count + v_task_count,)
 
+    # Each tensor's own strides: q/k may be smoothed copies, outputs may be contiguous.
+    def _bhnd_strides(t):
+        bz, seq, h, d = map_dims(t.stride(), order)
+        return bz, h, seq, d
+
     # call sage_quant_kernel
     sage_quant_kernel[grid](
         q,
@@ -611,12 +625,12 @@ def sage_quant(
         v,
         v_fp8,
         v_scale,
-        stride_bz_q,
-        stride_h_q,
-        stride_seq_q,
-        stride_bz_k,
-        stride_h_k,
-        stride_seq_k,
+        *_bhnd_strides(q),
+        *_bhnd_strides(q_int8),
+        *_bhnd_strides(k),
+        *_bhnd_strides(k_int8),
+        *_bhnd_strides(v),
+        *_bhnd_strides(v_fp8),
         q_scale.stride(0),
         q_scale.stride(1),
         k_scale.stride(0),
@@ -784,6 +798,7 @@ def rotation_smooth_qk(
         # = Q_rot x K_rot + q_mean x K_rot
         # = Q_rot x K_rot + delta_s
         grid_delta = (b * h_q, Q_NUM_BLKS, K_NUM_BLKS)
+        stride_rkb, stride_rkn, stride_rkh, stride_rkd = map_dims(K_rot.stride(), bshd)
         _compute_delta_s_kernel[grid_delta](
             q_mean,
             K_rot,
@@ -792,10 +807,10 @@ def rotation_smooth_qk(
             q_mean.stride(1),
             q_mean.stride(2),
             q_mean.stride(3),
-            stride_kb,
-            stride_kh,
-            stride_kn,
-            stride_kd,
+            stride_rkb,
+            stride_rkh,
+            stride_rkn,
+            stride_rkd,
             delta_s.stride(0),
             delta_s.stride(1),
             delta_s.stride(2),

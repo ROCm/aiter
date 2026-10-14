@@ -571,6 +571,7 @@ def flydsl_pa_mqa_logits_fp4(
     max_query_len: int | None = None,
     pages_per_block: int = 1,
     plan: Fp4MqaPlan | None = None,
+    out_offsets: torch.Tensor | None = None,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Decode/varctx FP4 paged MQA logits (gfx950).
@@ -590,7 +591,9 @@ def flydsl_pa_mqa_logits_fp4(
     reads every key once per row, and the work is shared out by length in the
     kernel: ``cta_info``, ``block_k``, ``num_warps`` and ``parallel_unit_num``
     do not apply, and a given ``out`` is left as it was past each row's bound.
-    Without them the call runs this kernel, as it always has (64-row pages).
+    ``out_offsets`` [rows] i32 (ragged rows only) makes ``out`` flat, row r
+    at element out_offsets[r]. Without them the call runs this kernel, as it
+    always has (64-row pages).
     """
     if query_start_loc is not None:
         num_rows = row_ends.shape[0]
@@ -616,12 +619,18 @@ def flydsl_pa_mqa_logits_fp4(
             row_ends,
             weight_scale=weight_scale,
             out=out,
+            out_offsets=out_offsets,
             stream=stream,
         )
-    if row_ends is not None or plan is not None or pages_per_block != 1:
+    if (
+        row_ends is not None
+        or plan is not None
+        or pages_per_block != 1
+        or out_offsets is not None
+    ):
         raise ValueError(
-            "row_ends / plan / pages_per_block take the ragged rows: pass "
-            "query_start_loc"
+            "row_ends / plan / pages_per_block / out_offsets take the ragged "
+            "rows: pass query_start_loc"
         )
     batch_size, q_next_n, heads, head_dim_packed = q_fp4.shape
     head_dim = head_dim_packed * 2
