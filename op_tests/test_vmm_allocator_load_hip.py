@@ -60,6 +60,11 @@ class LoadHipRuntimeTest(unittest.TestCase):
             cdll_calls(MAPS.replace(CORE, CORE + " (deleted)")), [mock.call(CORE)]
         )
 
+    def test_binds_a_mapped_copy_with_escaped_path(self):
+        path = "/opt/my venv\n/lib/libamdhip64.so.7"
+        maps = MAPS.replace(CORE, "/opt/my venv\\012/lib/libamdhip64.so.7")
+        self.assertEqual(cdll_calls(maps), [mock.call(path)])
+
     def test_falls_back_to_the_soname(self):
         self.assertEqual(cdll_calls("")[0], mock.call("libamdhip64.so"))
 

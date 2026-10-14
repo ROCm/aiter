@@ -39,7 +39,9 @@ def load_hip_runtime() -> ctypes.CDLL:
     except OSError:
         maps = []
     for line in maps:
-        path = line[line.find("/") :].strip().removesuffix(" (deleted)")
+        # The kernel escapes only "\n" in maps paths, as "\012".
+        path = line[line.find("/") :].rstrip("\n").removesuffix(" (deleted)")
+        path = path.replace("\\012", "\n")
         if "/" in line and os.path.basename(path).startswith("libamdhip64.so"):
             return ctypes.CDLL(path)
     candidates = ["libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6"]
