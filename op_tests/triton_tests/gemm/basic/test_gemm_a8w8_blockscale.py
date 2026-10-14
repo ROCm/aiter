@@ -71,6 +71,9 @@ def get_x_vals():
     x_vals += [(v, 7168, 16384) for v in (1, 32, 64, 128, 256, 1024)]
     x_vals += [(v, 6144, 7168) for v in (1, 32, 64, 128, 256, 1024)]
     x_vals += [(v, 7168, 3072) for v in (1, 32, 64, 128, 256, 1024)]
+    # gfx942's tuned preshuffle config splits K=11008 into four 2816-wide
+    # partitions, so the last one runs 256 past K
+    x_vals += [(16, 4096, 11008)]
     return x_vals
 
 
