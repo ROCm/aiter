@@ -1,3 +1,4 @@
+import functools
 import math
 
 import torch
@@ -13,6 +14,8 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     batched_model_benchmark_shapes,
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     get_model_benchmark_object,
     get_shape_benchmark_object,
@@ -25,26 +28,34 @@ from op_tests.triton_tests.gemm.batched.test_batched_gemm_a8w8 import (
 
 def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str):
     c_dtype = torch.bfloat16
-    x, w, x_scale, w_scale, bias, y = generate_batched_gemm_a8w8_inputs(
-        batch, M, N, K, dtype=c_dtype, layout=layout, output=True
+
+    _p_gen = functools.partial(
+        generate_batched_gemm_a8w8_inputs,
+        batch, M, N, K, dtype=c_dtype, layout=layout, output=True,
     )
-    # print(f"M: {M}, N: {N}, K: {K}, x.shape: {x.shape}, x.stride(): {x.stride()}, w.shape: {w.shape}, w.stride(): {w.stride()}")
+    # batched_gemm_a8w8 names its activation/weight/output kwargs XQ/WQ/YQ
+    _out_vals_keys = ["XQ", "WQ", "x_scale", "w_scale", "bias", "YQ"]
+
+    rot_bufs = generate_rotating_buffers_pool(
+        [_p_gen], [_out_vals_keys], target_mb=256, min_pool_len=4
+    )
+
+    kernel_fn = functools.partial(batched_gemm_a8w8, dtype=c_dtype)
+
     # flops
     flops = 2.0 * M * N * K * batch
     # memory transfer
-    mem_read = x.numel() * x.element_size() + w.numel() * w.element_size()
+    mem_read = rot_bufs[0]["XQ"].numel() * rot_bufs[0]["XQ"].element_size() + rot_bufs[
+        0
+    ]["WQ"].numel() * rot_bufs[0]["WQ"].element_size()
     mem_read += (
-        x_scale.numel() * x_scale.element_size()
-        + w_scale.numel() * w_scale.element_size()
+        rot_bufs[0]["x_scale"].numel() * rot_bufs[0]["x_scale"].element_size()
+        + rot_bufs[0]["w_scale"].numel() * rot_bufs[0]["w_scale"].element_size()
     )
     mem_write = (M * N) * 2  # TODO: Fix for c_dtype != bf16
     mem = mem_read + mem_write
 
-    ms = triton.testing.do_bench(
-        lambda: batched_gemm_a8w8(x, w, x_scale, w_scale, bias, c_dtype, YQ=y),
-        warmup=25,
-        rep=100,
-    )
+    ms = do_bench_aiter_triton(kernel_fn, rot_bufs)
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":

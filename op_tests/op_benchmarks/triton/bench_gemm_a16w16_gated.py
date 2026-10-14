@@ -1,3 +1,4 @@
+import functools
 import math
 
 import torch
@@ -10,6 +11,8 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     get_model_benchmark_object,
     get_shape_benchmark_object,
@@ -24,26 +27,28 @@ def bench_gemm_fn(
     M: int, N: int, K: int, metric: str, layout: str, activation: str | None = None
 ):
     c_dtype = torch.bfloat16
-    x, w, _, y = generate_gemm_a16w16_gated_inputs(
-        M,
-        N,
-        K,
-        c_dtype,
-        layout=layout,
-        output=True,
+
+    _p_gen = functools.partial(
+        generate_gemm_a16w16_gated_inputs, M, N, K, c_dtype, layout=layout, output=True
     )
+    _out_vals_keys = ["x", "w", "_", "y"]
+
+    rot_bufs = generate_rotating_buffers_pool(
+        [_p_gen], [_out_vals_keys], target_mb=256, min_pool_len=4
+    )
+
+    kernel_fn = functools.partial(gemm_a16w16_gated, dtype=c_dtype, activation=activation)
+
     # flops: N is pre-gating dimension, output is N//2
     flops = 2.0 * M * N * K
     # memory transfer
-    mem_read = (M * K) * x.element_size() + (N * K) * w.element_size()
+    mem_read = (M * K) * rot_bufs[0]["x"].element_size() + (N * K) * rot_bufs[0][
+        "w"
+    ].element_size()
     mem_write = (M * N // 2) * 2
     mem = mem_read + mem_write
 
-    ms = triton.testing.do_bench(
-        lambda: gemm_a16w16_gated(x, w, c_dtype, y, activation=activation),
-        warmup=25,
-        rep=100,
-    )
+    ms = do_bench_aiter_triton(kernel_fn, rot_bufs)
 
     if metric == "time":
         return ms
