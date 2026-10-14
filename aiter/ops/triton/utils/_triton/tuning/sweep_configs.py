@@ -406,7 +406,10 @@ def precompile_slice(spec, shape, backend, candidates, out, slot, gpu, args, sto
         spec, shape, backend, ["--precompile", "--configs", todo_file]
     )
     env = dict(os.environ, HIP_VISIBLE_DEVICES=str(gpu))
-    run_worker(command, env, log_path, args.stall, args.setup_timeout, stop)
+    outcome = run_worker(command, env, log_path, args.stall, args.setup_timeout, stop)
+    os.remove(todo_file)
+    if outcome == "finished":  # keep the log only when something went wrong
+        os.remove(log_path)
 
 
 def precompile_ahead(spec, args, plans, stop):
