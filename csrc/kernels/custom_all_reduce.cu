@@ -67,7 +67,13 @@ void dispose(fptr_t _fa)
     delete fa;
 }
 
-int64_t meta_size() { return sizeof(aiter::Signal); }
+// Signal, plus the Lamport fused AR+RMSNorm scratch that get_tmp_buf() skips
+// over. Callers size the meta allocation as meta_size() + 2 * max_size, so
+// reporting the scratch here is what reserves it.
+int64_t meta_size()
+{
+    return static_cast<int64_t>(sizeof(aiter::Signal) + aiter::kLamportScratchBytes);
+}
 
 // ---- Internal dispatch helpers ----
 
