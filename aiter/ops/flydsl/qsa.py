@@ -18,8 +18,9 @@ Prefill runs BLOCK_N=32 two waves and writes output directly once the grid
 alone fills the machine. Softmax is online in log2 space and the split
 partials are FP32. Expand+tail and the sigmoid gate stay unfused.
 
-``qsa_oracle`` is the fp32 reference. The concrete shapes all of these are
-validated against are test fixtures in ``op_tests/qsa_shapes.py``.
+The fp32 reference and the paged-cache fixtures live in
+``op_tests/qsa_ref.py``. The concrete shapes are in
+``op_tests/qsa_shapes.py``.
 
 ``qsa_layer`` is the ``qwen4_exp`` opt-in. It runs K1, the vendored
 expand+tail, and K2. A rank-3 query pair missing from the measured
@@ -34,20 +35,6 @@ import torch
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .kernels.kernels_common import LOG2E, get_warp_size
-from .kernels.qsa import (
-    QsaGqaSpec,
-    QsaIndexerSpec,
-    QsaOracleResult,
-    gather_paged_cache,
-    gather_qsa_caches,
-    pack_paged_cache,
-    qsa_expand_tail,
-    qsa_indexer_scores,
-    qsa_oracle,
-    qsa_sparse_gqa,
-    qsa_topk_blocks,
-    qsa_visible_blocks,
-)
 from .kernels.qsa.indexer_select import (
     _D,
     _DECODE_MAX_ROWS,
@@ -63,7 +50,6 @@ from .kernels.qsa.indexer_select import (
     build_qsa_k1_prefill_scores_module,
     build_qsa_k1_scores_module,
 )
-from .kernels.qsa.paged import span_bytes
 from .kernels.qsa.sparse_gqa import (
     _TINY_SPLITS,
     _gfx942_reg_qk,
@@ -129,22 +115,23 @@ _MEASURED_QUERIES = {
 # 8-head by 1.27x to 3.34x.
 
 __all__ = [
-    "QsaGqaSpec",
-    "QsaIndexerSpec",
-    "QsaOracleResult",
-    "gather_paged_cache",
-    "gather_qsa_caches",
-    "pack_paged_cache",
-    "qsa_expand_tail",
-    "qsa_indexer_scores",
     "qsa_k1_block_ids",
     "qsa_k2",
     "qsa_layer",
-    "qsa_oracle",
-    "qsa_sparse_gqa",
-    "qsa_topk_blocks",
-    "qsa_visible_blocks",
+    "span_bytes",
 ]
+
+
+def span_bytes(t: torch.Tensor) -> int:
+    """Bytes from ``t``'s first element to one past its last, for any strides.
+
+    An empty tensor spans nothing. A view with gaps counts those gaps, which
+    is how a cache past 4 GiB selects the wide gather.
+    """
+    if t.numel() == 0:
+        return 0
+    last = sum((size - 1) * stride for size, stride in zip(t.shape, t.stride()))
+    return (last + 1) * t.element_size()
 
 
 def _rank3_query_pair(

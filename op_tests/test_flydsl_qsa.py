@@ -49,27 +49,29 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import qsa as qsa_k1_host
-from aiter.ops.flydsl.kernels.qsa.paged import span_bytes
 from aiter.ops.flydsl.kernels.qsa.sparse_gqa import build_qsa_k2_module
 from aiter.ops.flydsl.qsa import (
-    gather_paged_cache,
-    pack_paged_cache,
-    qsa_expand_tail,
-    qsa_indexer_scores,
     qsa_k1_block_ids,
     qsa_k2,
     qsa_k2_serves,
     qsa_layer,
-    qsa_oracle,
-    qsa_sparse_gqa,
-    qsa_topk_blocks,
-    qsa_visible_blocks,
+    span_bytes,
 )
 from aiter.ops.triton.attention.qsa_vllm_amd import expand_qsa_block_indices_cuda
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from op_tests.qsa_ref import (
+    gather_paged_cache,
+    pack_paged_cache,
+    qsa_expand_tail,
+    qsa_indexer_scores,
+    qsa_oracle,
+    qsa_sparse_gqa,
+    qsa_topk_blocks,
+    qsa_visible_blocks,
+)
 from op_tests.qsa_shapes import (
     FAMILY_A_GQA,
     FAMILY_A_INDEXER,

@@ -12,7 +12,7 @@ so they do not depend on a model registry.
 
 from __future__ import annotations
 
-from aiter.ops.flydsl.kernels.qsa.shapes import QsaGqaSpec, QsaIndexerSpec
+from op_tests.qsa_ref import QsaGqaSpec, QsaIndexerSpec
 
 # Flash-Next / Qwen3.8-Flash-Next / qwen4_exp (SILOTIGER-1047 family A).
 # Indexer in:  q [M, 4, 128] BF16, paged compressed k (1 KV head, D=128).
