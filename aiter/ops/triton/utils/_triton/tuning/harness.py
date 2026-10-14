@@ -149,17 +149,13 @@ def time_with_cuda_graph(call, config, copies, calls=24, replays=25, abort_above
     return Timing(times[len(times) // 2], times[0], times[-1], False)
 
 
-def verify_output(call, config, inputs, check, launches):
-    """The first mismatch of `launches` runs against the kernel's reference, or None.
+def verify_output(config, check, launches):
+    """What the kernel's check found in `launches` runs (every layout each), or None.
 
-    Several launches, because a race in a kernel shows up only now and then.
+    Several runs, because a race in a kernel shows up only now and then.
     """
-    import torch
-
     for _ in range(launches):
-        out = call(copy.deepcopy(config), *inputs)
-        torch.cuda.synchronize()
-        wrong = check(out, *inputs)
+        wrong = check(config)
         if wrong:
             return wrong
     return None
@@ -476,7 +472,7 @@ def benchmark(
                 elif screen and reference:
                     best_rel = min(best_rel or record["rel"], record["rel"])
                 if verify and check is not None:
-                    wrong = verify_output(call, candidate, copies[0], check, verify)
+                    wrong = verify_output(candidate, check, verify)
                     if wrong:
                         record.update(status="wrong", error=wrong)
         except Exception as e:  # noqa: BLE001
