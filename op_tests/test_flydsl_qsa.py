@@ -49,8 +49,8 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import qsa as qsa_k1_host
-from aiter.ops.flydsl.kernels.qsa.k2 import build_qsa_k2_module, qsa_k2_serves
 from aiter.ops.flydsl.kernels.qsa.paged import span_bytes
+from aiter.ops.flydsl.kernels.qsa.sparse_gqa import build_qsa_k2_module
 from aiter.ops.flydsl.qsa import (
     gather_paged_cache,
     pack_paged_cache,
@@ -58,6 +58,7 @@ from aiter.ops.flydsl.qsa import (
     qsa_indexer_scores,
     qsa_k1_block_ids,
     qsa_k2,
+    qsa_k2_serves,
     qsa_layer,
     qsa_oracle,
     qsa_sparse_gqa,
@@ -2008,7 +2009,6 @@ def test_k2_empty_cache_or_table_returns_zeros():
     """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
-    from aiter.ops.flydsl.kernels.qsa import k2 as k2_kernel
 
     gqa = FAMILY_A_GQA
     device = torch.device("cuda")
@@ -2035,8 +2035,8 @@ def test_k2_empty_cache_or_table_returns_zeros():
         launched.append(1)
         raise AssertionError("qsa_k2 launched with no pages")
 
-    original = k2_kernel._run_compiled
-    k2_kernel._run_compiled = _record_launch
+    original = qsa_k1_host._run_compiled
+    qsa_k1_host._run_compiled = _record_launch
     try:
         for name, k_cache, v_cache, page_table in cases:
             launched.clear()
@@ -2046,7 +2046,7 @@ def test_k2_empty_cache_or_table_returns_zeros():
             if not torch.equal(out, torch.zeros_like(out)):
                 raise AssertionError(f"K2 {name} output was not zeros")
     finally:
-        k2_kernel._run_compiled = original
+        qsa_k1_host._run_compiled = original
 
 
 def test_k2_caller_workspace_is_the_only_partial_buffer():
