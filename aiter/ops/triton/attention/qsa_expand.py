@@ -40,6 +40,22 @@ def expand_qsa_block_indices(
     token_topk: int,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """Expand compressed block ids into token ids, plus the current tail.
+
+    ``block_indices`` is int32 ``[rows, token_topk // compress_ratio]`` on a
+    GPU, and its strides are honored. ``query_positions`` and ``token_to_req``
+    are contiguous int32 ``[rows]`` on that device. ``sequence_lengths`` is a
+    contiguous 1-D int32 vector on that device, indexed by ``token_to_req``.
+
+    ``compress_ratio`` and ``token_topk`` are positive, and ``compress_ratio``
+    divides ``token_topk``. Each kept block becomes ``compress_ratio``
+    consecutive token ids. The result is int32
+    ``[rows, token_topk + compress_ratio - 1]``. The extra
+    ``compress_ratio - 1`` columns hold the incomplete tail. An unused column,
+    a block id of ``-1``, or a token outside ``[0, sequence_length)`` is
+    stored as ``-1``. ``out`` is that buffer, and its strides are honored.
+    ``None`` allocates it. Zero rows return ``out`` without a launch.
+    """
     if compress_ratio <= 0:
         raise ValueError("QSA compression ratio must be positive")
     if token_topk <= 0:
