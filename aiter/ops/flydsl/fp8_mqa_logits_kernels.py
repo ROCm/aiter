@@ -33,6 +33,9 @@ from .kernels.mqa_logits.fp8_mqa_logits import (
     _build_kernel_mfma_lds_pipe,
     _build_kernel_mfma_r_w,
 )
+from .kernels.mqa_logits.fp8_mqa_logits_gfx942_lds import (
+    _build_kernel_mfma_lds_gfx942,
+)
 from .kernels.tensor_shim import _run_compiled
 
 __all__ = [
@@ -114,6 +117,13 @@ _SPLIT_POLICIES = {
     ),
 }
 
+# gfx942 LDS-staged variants (BKV=64), tuned on MI300X. The kernel also floors
+# each split at min_tiles_per_split against the block's actual window, so the
+# host can size the split from seq_len_kv without over-splitting short windows.
+_LDS942_SPLIT_POLICY = _SplitPolicy(
+    min_seq_len_kv=0, min_tiles_per_split=2, cu_oversub=4, fallback_cu=304
+)
+
 
 def _split_policy() -> _SplitPolicy:
     """Split-policy constants for the current arch (gfx942's, conservatively,
@@ -165,6 +175,7 @@ def _auto_num_splits(
     rows_per_block: int,
     block_kv: int,
     device_index: int,
+    pol: _SplitPolicy | None = None,
     blocks_per_cu: int | None = None,
 ) -> int:
     """KV-column splits (grid.y) to fill the device when the row grid is small.
@@ -173,14 +184,14 @@ def _auto_num_splits(
     device block-starved; splitting each row's window across ``grid.y`` recovers
     occupancy at no correctness cost (logits[m,n] are independent across n).
     Returns 1 once the row grid alone oversubscribes the device. The tuning
-    constants are per-arch -- see ``_SPLIT_POLICIES``.
+    constants are per-arch (``_SPLIT_POLICIES``) unless ``pol`` is given.
 
     With ``blocks_per_cu`` known, minimizes ``_splits_by_wave_cost`` over
     ``cu_count * blocks_per_cu`` instead, since resident blocks per CU depend on
     the compiled kernel (its register and LDS use), not only on the device.
     """
-    pol = _split_policy()
-    grid_x = (seq_len + rows_per_block - 1) // rows_per_block
+    pol = pol or _split_policy()
+    grid_x = -(-seq_len // rows_per_block)
     if grid_x == 0 or seq_len_kv < pol.min_seq_len_kv:
         return 1
     max_splits = max(1, (seq_len_kv // block_kv) // pol.min_tiles_per_split)
@@ -260,10 +271,79 @@ def _register_variants(entries):
         _VARIANT_MFMA_M[tag] = mfma_m
 
 
+# gfx942 auto-selection keeps the direct-load kernel below one LDS block of
+# rows (4 waves x 4 rows): decode / spec-verify sized calls.
+_LDS942_MIN_SEQ_LEN = 16
+
+# Maximum head size (D) for LDS variants. With BKV=64 and 2 double-buffered
+# slots, total LDS = 2*(BKV*D + 256). D=256 uses 33280 bytes (fits 64kB);
+# D=512 needs 66048 bytes (exceeds the 64kB hardware limit on gfx942).
+_LDS942_MAX_HEAD_SIZE = 256
+
+
+def _mk_lds942_builder(rpw, wpb, bkv):
+    """gfx942 LDS-staged builder: ``rpw`` rows per wave, ``wpb`` waves share one
+    KV tile of ``bkv`` columns (see ``_build_kernel_mfma_lds_gfx942``)."""
+
+    def builder(**kw):
+        return _build_kernel_mfma_lds_gfx942(
+            **{**kw, "block_kv": bkv},
+            rows_per_wave=rpw,
+            waves_per_block=wpb,
+            min_split_tiles=_LDS942_SPLIT_POLICY.min_tiles_per_split,
+        )
+
+    return builder, _MFMA16.MFMA_M
+
+
+# Per-variant compile-hint overrides. The gfx942 LDS variants keep only their
+# own rows' Q and weights in registers, so they fit 3 waves/SIMD.
+_VARIANT_COMPILE_HINTS = {}
+
+# gfx942 LDS variants handle a short last block in-kernel, so the host does not
+# pad seq_len for them, and they use _LDS942_SPLIT_POLICY.
+_LDS942_VARIANTS = set()
+
 if _ARCH == "gfx942":
     _register_variants(
         {f"mfma_r{r}_w{w}": _mk_builder(r, w) for r in (1, 2, 4) for w in (1, 2, 4)}
     )
+    _LDS942 = {
+        f"mfma_bkv64_r{r}_w4_lds2": _mk_lds942_builder(r, 4, 64) for r in (1, 2, 4)
+    }
+    _register_variants(_LDS942)
+    for _t in _LDS942:
+        _VARIANT_COMPILE_HINTS[_t] = {"waves_per_eu": 3}
+        _LDS942_VARIANTS.add(_t)
+
+# gfx942 rows-per-wave cap for the auto-selected LDS variant, by num_heads: the
+# largest RPW whose Q and weights fit the VGPR budget for 3 waves/SIMD at D=128.
+_GFX942_LDS_BY_H = {16: 4, 32: 4, 64: 2, 128: 1}
+
+
+def _gfx942_lds_rpw(seq_len, seq_len_kv, num_heads):
+    """Rows per wave for the auto-selected gfx942 LDS variant.
+
+    More rows per wave reuse each staged KV tile more, but only pay off when
+    those rows can see the tile. Start from the VGPR cap and lower it where a
+    block's rows see little of its KV range. The boundaries were swept on
+    MI300X; each one is where the faster choice flips.
+    """
+    cap = _GFX942_LDS_BY_H[num_heads]
+    if seq_len < 64:
+        # Under 64 rows (4 blocks at RPW=4) the rows usually come from
+        # different sequences, so a wide block shares almost nothing.
+        return 1
+    if seq_len_kv <= seq_len:
+        # No cached prefix: windows are causal triangles no longer than the
+        # chunk. Up to 4096 rows RPW=1 wins; above, RPW=2 keeps some reuse.
+        return 1 if seq_len <= 4096 else min(cap, 2)
+    if seq_len <= 256 and seq_len_kv > 64 * seq_len:
+        # A few hundred rows against a much longer KV: grid.y carries the
+        # parallelism and RPW=2 is fastest. From ~512 rows the cap wins again.
+        return min(cap, 2)
+    return cap
+
 
 if _ARCH == "gfx950":
     # CDNA4 scaled MFMA atoms (K=128/64): gfx950-only, since those instructions
@@ -444,13 +524,19 @@ def _auto_variant(seq_len, seq_len_kv, num_heads):
     )
 
 
-def _resolve_variant(variant, seq_len, seq_len_kv, num_heads):
+def _resolve_variant(variant, seq_len, seq_len_kv, num_heads, head_size=128):
     """Effective variant: explicit ``variant=`` > env var > shape-adaptive."""
-    tag = (
-        variant
-        or os.environ.get("FLYDSL_FP8_MQA_LOGITS_VARIANT")
-        or _auto_variant(seq_len, seq_len_kv, num_heads)
-    )
+    tag = variant or os.environ.get("FLYDSL_FP8_MQA_LOGITS_VARIANT")
+    if not tag:
+        tag = _auto_variant(seq_len, seq_len_kv, num_heads)
+        if (
+            _ARCH == "gfx942"
+            and num_heads in _GFX942_LDS_BY_H
+            and head_size <= _LDS942_MAX_HEAD_SIZE
+            and seq_len >= _LDS942_MIN_SEQ_LEN
+        ):
+            rpw = _gfx942_lds_rpw(seq_len, seq_len_kv, num_heads)
+            tag = f"mfma_bkv64_r{rpw}_w4_lds2"
     if tag not in _VARIANT_BUILDERS:
         raise ValueError(
             f"unknown fp8_mqa_logits variant {tag!r} for arch {_ARCH}; "
@@ -513,7 +599,10 @@ def compile_fp8_mqa_logits(
         convert_kv_fn=convert_kv_fn,
         clean_logits=clean_logits,
     )
-    launcher.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
+    launcher.compile_hints = {
+        **_DEFAULT_COMPILE_HINTS,
+        **_VARIANT_COMPILE_HINTS.get(variant, {}),
+    }
     return launcher
 
 
@@ -598,7 +687,7 @@ def flydsl_fp8_mqa_logits(
     if scale_mul != 1.0:
         kv_scales = kv_scales.to(torch.float32) * scale_mul
 
-    variant = _resolve_variant(variant, seq_len, seq_len_kv, num_heads)
+    variant = _resolve_variant(variant, seq_len, seq_len_kv, num_heads, head_size)
 
     _BKV, _ROWS_PER_BLOCK = _parse_variant(variant)
 
@@ -613,11 +702,31 @@ def flydsl_fp8_mqa_logits(
         clean_logits=bool(clean_logits),
     )
 
-    # No torch.full even when clean_logits: the kernel writes -inf itself.
+    # Most kernels require seq_len padded to a multiple of the rows a block
+    # owns, so every block owns exactly that many. Padded rows get empty windows
+    # (start == end == 0) so the kernel writes nothing for them; the output is
+    # sliced back to the original seq_len after the launch. The gfx942 LDS
+    # variants handle a short last block in-kernel and skip the copies.
+    lds942 = variant in _LDS942_VARIANTS
+    if lds942:
+        seq_len_padded = seq_len
+    else:
+        seq_len_padded = (
+            (seq_len + _ROWS_PER_BLOCK - 1) // _ROWS_PER_BLOCK
+        ) * _ROWS_PER_BLOCK
+    if seq_len_padded != seq_len:
+        pad = seq_len_padded - seq_len
+        Q = torch.cat([Q, Q.new_zeros((pad, num_heads, head_size))], dim=0)
+        weights = torch.cat([weights, weights.new_zeros((pad, num_heads))], dim=0)
+        cu_starts = torch.cat([cu_starts, cu_starts.new_zeros(pad)], dim=0)
+        cu_ends = torch.cat([cu_ends, cu_ends.new_zeros(pad)], dim=0)
+
+    # No torch.full even when clean_logits: the kernel now writes -inf itself,
+    # at exactly the out-of-window positions it would otherwise skip.
     aligned_size = 256
     seq_len_kv_aligned = (seq_len_kv + aligned_size - 1) // aligned_size * aligned_size
     logits = torch.empty(
-        (seq_len, seq_len_kv_aligned),
+        (seq_len_padded, seq_len_kv_aligned),
         dtype=torch.float32,
         device=Q.device,
     )[:, :seq_len_kv]
@@ -626,20 +735,23 @@ def flydsl_fp8_mqa_logits(
         stream = torch.cuda.current_stream()
 
     tensors = (Q, KV, kv_scales, weights, cu_starts, cu_ends, logits)
-    scalars = (int(seq_len), int(seq_len_kv), int(logits.stride(0)))
+    scalars = (int(seq_len_padded), int(seq_len_kv), int(logits.stride(0)))
 
     with torch.cuda.device(Q.device.index):
+        split_pol = _LDS942_SPLIT_POLICY if lds942 else None
         blocks_per_cu = None
-        if _split_policy().block_overhead_tiles is not None:
+        effective_pol = split_pol or _split_policy()
+        if effective_pol.block_overhead_tiles is not None:
             blocks_per_cu = _max_blocks_per_cu(
                 launcher, (*tensors, *scalars, 1, stream)
             )
         num_splits = _auto_num_splits(
-            seq_len,
+            seq_len_padded,
             seq_len_kv,
             _ROWS_PER_BLOCK,
             _BKV,
             Q.device.index,
+            split_pol,
             blocks_per_cu,
         )
         _run_compiled(launcher, *tensors, *scalars, int(num_splits), stream)
