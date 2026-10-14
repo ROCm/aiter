@@ -16,7 +16,10 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     get_sage_fwd_configs_mxfp4,
 )
 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
-from aiter.ops.triton.quant.sage_attention_quant_wrappers import create_hadamard_matrix
+from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
+    create_hadamard_matrix,
+    rotation_smooth_qk,
+)
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.test_mha_common import (
     attention_ref,
@@ -312,6 +315,75 @@ def test_sage(
         rtol=RTOL_fp8,
         max_diff_percentage=0.5,
     )
+
+
+def _non_dense_qkv(kind, layout, batch, heads, seq, head_sz, dtype):
+    """Q/K/V views that are not non-overlapping and dense."""
+    g = torch.Generator(device="cuda").manual_seed(0)
+
+    def rand(*shape):
+        return torch.randn(*shape, generator=g, device="cuda", dtype=dtype)
+
+    def to_layout(t):  # t is BSHD
+        return t if layout == "bshd" else t.transpose(1, 2)
+
+    if kind == "qkv_split":  # slices of a fused QKV projection
+        qkv = rand(batch, seq, 3 * heads * head_sz)
+        return [
+            to_layout(t.view(batch, seq, heads, head_sz))
+            for t in qkv.split(heads * head_sz, dim=-1)
+        ]
+    if kind == "d_stride":  # every other element of a wider head dim
+        return [
+            to_layout(rand(batch, seq, heads, 2 * head_sz)[..., ::2]) for _ in range(3)
+        ]
+    q = to_layout(rand(batch, seq, heads, head_sz))
+    if layout == "bshd":
+        k, v = (rand(batch, seq + 64, heads, head_sz)[:, :seq] for _ in range(2))
+    else:
+        k, v = (rand(batch, heads, seq + 64, head_sz)[:, :, :seq] for _ in range(2))
+    if kind == "v_only":  # K and V in different layouts
+        k = k.contiguous()
+    return q, k, v
+
+
+@pytest.mark.parametrize("kind", ["seq_slice", "qkv_split", "v_only", "d_stride"])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+@pytest.mark.parametrize("smooth_k", [True, False])
+@pytest.mark.parametrize("q_smooth", [False, True])
+def test_sage_non_dense_inputs(kind, layout, smooth_k, q_smooth):
+    """Non-dense Q/K/V views must give the same result as contiguous copies."""
+    q, k, v = _non_dense_qkv(kind, layout, 2, 4, 1020, 128, torch.bfloat16)
+    assert not all(t.is_contiguous() for t in (q, k, v))
+    kwargs = {"layout": layout, "smooth_k": smooth_k, "q_smooth": q_smooth}
+    out = fav3_sage_wrapper_func(q, k, v, **kwargs)
+    ref = fav3_sage_wrapper_func(
+        q.contiguous(), k.contiguous(), v.contiguous(), **kwargs
+    )
+    # Q smoothing reduces over the head dim; a strided head dim changes that order (fp32 ulps).
+    tol = 1e-2 if kind == "d_stride" and q_smooth else 0
+    torch.testing.assert_close(
+        _tensor_from_result(out), _tensor_from_result(ref), atol=tol, rtol=tol
+    )
+
+
+@pytest.mark.parametrize("kind", ["seq_slice", "qkv_split"])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+@pytest.mark.parametrize("smooth_k", [True, False])
+def test_rotation_smooth_qk_non_dense_inputs(kind, layout, smooth_k):
+    """Rotated/smoothed Q, K and delta_s of non-dense views must match contiguous copies."""
+    q, k, _ = _non_dense_qkv(kind, layout, 2, 4, 1020, 128, torch.bfloat16)
+    kwargs = {
+        "BLOCK_R": 32,
+        "q_smoothing": True,
+        "layout": layout,
+        "sm_scale": 0.1,
+        "smooth_k": smooth_k,
+    }
+    out = rotation_smooth_qk(q, k, 64, **kwargs)
+    ref = rotation_smooth_qk(q.contiguous(), k.contiguous(), 64, **kwargs)
+    for name, actual, expected in zip(("q", "k", "delta_s"), out, ref):
+        assert torch.equal(actual, expected), name
 
 
 def _sage_int8_attention_ref(
