@@ -324,16 +324,17 @@ def _adaptive_moe_sort(
     sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
     reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
     m_indices = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
-    # Atomic GEMM2 accumulates into moe_buf, so the caller's buffer can stand in
-    # for it; it is zeroed below like a fresh one.
-    if atomic:
-        moe_buf = (
+    moe_buf = (
+        # Atomic GEMM2 accumulates into moe_buf, so the caller's buffer can stand
+        # in for it; it is zeroed below like a fresh one.
+        (
             output
             if output is not None
             else torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
         )
-    else:
-        moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
+        if atomic
+        else torch.empty((0, 0), dtype=moebuf_dtype, device=device)
+    )
     # BM16 sort fuses output zeroing; three-stage sort only sorts.
     # Atomic GEMM2 needs a zeroed destination on every invocation.
     if atomic and BM != 16:

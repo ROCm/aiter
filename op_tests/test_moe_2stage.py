@@ -1377,6 +1377,71 @@ def test_bm16_tiled_scale_boundary():
             os.environ["AITER_BF16_FP8_MOE_BOUND"] = old_moe_bound
 
 
+def test_adaptive_sort_output_in_place():
+    """The a4w4 adaptive aux sort accumulates straight into the caller's output.
+
+    Kimi-K3 A4W4 TP=8. test_fmoe hands fused_moe a NaN-filled output buffer and
+    checks it against the torch reference; here we also check that the buffer
+    reached the adaptive sort as its atomic moe_buf and was never copied into.
+    """
+    fm = aiter.fused_moe
+    real_adaptive = fm._adaptive_moe_sort
+    real_return = fm._return_output
+    adaptive_calls, copies = [], []
+
+    def tracking_adaptive(*a, **kw):
+        adaptive_calls.append(kw.get("output") is not None)
+        return real_adaptive(*a, **kw)
+
+    def tracking_return(ret, output):
+        if output is not None and ret is not output:
+            copies.append(1)
+        return real_return(ret, output)
+
+    # Decode batches; their tuned BM=16 configs take the adaptive aux sort.
+    rows = []
+    torch.manual_seed(0)
+    try:
+        fm._adaptive_moe_sort = tracking_adaptive
+        fm._return_output = tracking_return
+        with override_env("AITER_SITUV2_A8W4", None), override_env(
+            "AITER_SITUV2_A4W4", "1"
+        ):
+            for token in (1, 4):
+                adaptive_calls.clear()
+                copies.clear()
+                rows.append(
+                    test_fmoe(
+                        dtype=dtypes.bf16,
+                        token=token,
+                        model_dim=3584,
+                        inter_dim=384,
+                        E=896,
+                        topk=16,
+                        actType=aiter.ActivationType.Situv2,
+                        gateMode=GateMode.SEPARATED.value,
+                        qType=aiter.QuantType.per_1x32,
+                        AQDType=dtypes.fp4x2,
+                        WQDType=dtypes.fp4x2,
+                        use_g1u1=True,
+                        check_aot_cache=False,
+                    )
+                )
+                assert (
+                    True in adaptive_calls
+                ), f"token={token}: output never reached the adaptive sort"
+                assert not copies, f"token={token}: output was copied into"
+                gc.collect()
+                torch.cuda.empty_cache()
+    finally:
+        fm._adaptive_moe_sort = real_adaptive
+        fm._return_output = real_return
+    aiter.logger.info(
+        "moe_2stage adaptive-sort in-place output summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+
 def test_output_buffer_contract():
     """Validate output identity, copy-back, validation, and compile contracts."""
     torch.manual_seed(0)
@@ -1627,71 +1692,6 @@ def test_swiglu_mxfp4_untagged_layout_dispatch():
         "moe_2stage: SwiGLU MXFP4 untagged-layout dispatch regression test passed"
     )
 
-def test_adaptive_sort_output_in_place():
-    """The a4w4 adaptive aux sort accumulates straight into the caller's output.
-
-    Kimi-K3 A4W4 TP=8. test_fmoe hands fused_moe a NaN-filled output buffer and
-    checks it against the torch reference; here we also check that the buffer
-    reached the adaptive sort as its atomic moe_buf and was never copied into.
-    """
-    fm = aiter.fused_moe
-    real_adaptive = fm._adaptive_moe_sort
-    real_return = fm._return_output
-    adaptive_calls, copies = [], []
-
-    def tracking_adaptive(*a, **kw):
-        adaptive_calls.append(kw.get("output") is not None)
-        return real_adaptive(*a, **kw)
-
-    def tracking_return(ret, output):
-        if output is not None and ret is not output:
-            copies.append(1)
-        return real_return(ret, output)
-
-    # Decode batches; their tuned BM=16 configs take the adaptive aux sort.
-    rows = []
-    torch.manual_seed(0)
-    try:
-        fm._adaptive_moe_sort = tracking_adaptive
-        fm._return_output = tracking_return
-        with override_env("AITER_SITUV2_A8W4", None), override_env(
-            "AITER_SITUV2_A4W4", "1"
-        ):
-            for token in (1, 4):
-                adaptive_calls.clear()
-                copies.clear()
-                rows.append(
-                    test_fmoe(
-                        dtype=dtypes.bf16,
-                        token=token,
-                        model_dim=3584,
-                        inter_dim=384,
-                        E=896,
-                        topk=16,
-                        actType=aiter.ActivationType.Situv2,
-                        gateMode=GateMode.SEPARATED.value,
-                        qType=aiter.QuantType.per_1x32,
-                        AQDType=dtypes.fp4x2,
-                        WQDType=dtypes.fp4x2,
-                        use_g1u1=True,
-                        check_aot_cache=False,
-                    )
-                )
-                assert (
-                    True in adaptive_calls
-                ), f"token={token}: output never reached the adaptive sort"
-                assert not copies, f"token={token}: output was copied into"
-                gc.collect()
-                torch.cuda.empty_cache()
-    finally:
-        fm._adaptive_moe_sort = real_adaptive
-        fm._return_output = real_return
-    aiter.logger.info(
-        "moe_2stage adaptive-sort in-place output summary (markdown):\n%s",
-        pd.DataFrame(rows).to_markdown(index=False),
-    )
-
-
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -1708,9 +1708,6 @@ test_route_workspace_token_capacity()
 if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 else:
-    test_output_buffer_contract()
-    test_swiglu_mxfp4_nonsplit_nobias_dispatch()
-    test_swiglu_mxfp4_untagged_layout_dispatch()
     if get_gfx() == "gfx950":
         test_adaptive_sort_output_in_place()
     else:
@@ -1718,6 +1715,9 @@ else:
             "%s: skipping adaptive-sort in-place output test (a4w4 is gfx950-only)",
             get_gfx(),
         )
+    test_output_buffer_contract()
+    test_swiglu_mxfp4_nonsplit_nobias_dispatch()
+    test_swiglu_mxfp4_untagged_layout_dispatch()
     # Skip unrelated tuned-CSV validation for an explicit CLI quant sweep.
     if not args.no_flydsl_csv and args.quant is None:
         _case_iters.append(
