@@ -43,8 +43,10 @@ from _utils import (
     add_shape_args,
     append_record,
     config_key,
+    inputs_hash,
     read_records,
     shape_from_args,
+    specialized_filename,
 )
 from kernels import (
     check_backend,
@@ -290,6 +292,16 @@ def plan(spec, shape, backend, arch, should_skip, space_out):
     except UnknownConfigKey as e:
         print(e, file=sys.stderr)
         return 2
+    here = os.path.dirname(os.path.abspath(__file__))
+    shape_nk = {d: shape[d] for d in ("B", "N", "K") if d in shape}
+    inputs = [os.path.join(here, f) for f in ("space.py", "kernels.py", "_utils.py")]
+    inputs += [
+        report["default_path"],
+        os.path.join(
+            os.path.dirname(report["default_path"]),
+            specialized_filename(spec.config_name, shape_nk),
+        ),
+    ]
     plan_ = dict(
         report,
         arch=arch,
@@ -297,6 +309,8 @@ def plan(spec, shape, backend, arch, should_skip, space_out):
         kernel=spec.name,
         shape=shape,
         bounds=list(family_bounds(spec, backend, shape)),
+        inputs=inputs,
+        inputs_hash=inputs_hash(inputs),
         configs=configs,
     )
     with open(space_out, "w") as f:

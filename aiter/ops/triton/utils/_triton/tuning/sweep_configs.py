@@ -41,11 +41,13 @@ from _utils import (
     append_record,
     config_key,
     final_results_path,
+    inputs_hash,
     iter_records,
     plan_path,
     read_records,
     results_path,
     shape_from_args,
+    shape_tag,
 )
 from kernels import get_spec
 
@@ -97,6 +99,12 @@ def parse_args(argv=None):
         help="seconds allowed for planning and for a worker to become ready",
     )
     parser.add_argument(
+        "--plan-timeout",
+        type=int,
+        default=3600,
+        help="seconds allowed for planning one M (a Triton space walks millions of combinations)",
+    )
+    parser.add_argument(
         "--compile-procs",
         type=int,
         default=0,
@@ -145,8 +153,25 @@ def worker_command(spec, shape, backend, extra):
     return command + extra
 
 
+def kept_plan(spec, shape, backend, runs_dir):
+    """The kept plan of this shape when the files it was built from have not changed, else None.
+
+    Planning a Triton space walks millions of combinations, so a resumed sweep reuses it.
+    """
+    pattern = f"plan-*-{backend or '*'}-{spec.name}-{shape_tag(shape)}.json"
+    for path in glob.glob(os.path.join(runs_dir, pattern)):
+        with open(path) as f:
+            plan_ = json.load(f)
+        if plan_.get("inputs") and plan_["inputs_hash"] == inputs_hash(plan_["inputs"]):
+            return plan_
+    return None
+
+
 def plan(spec, shape, backend, gpu, runs_dir, timeout):
     """Ask the worker for the space; keep the plan under a name unique to arch, backend, kernel and shape."""
+    kept = kept_plan(spec, shape, backend, runs_dir)
+    if kept is not None:
+        return kept
     fd, space_file = tempfile.mkstemp(prefix="plan-", suffix=".json", dir=runs_dir)
     os.close(fd)
     command = worker_command(
@@ -165,7 +190,7 @@ def plan(spec, shape, backend, gpu, runs_dir, timeout):
     except subprocess.TimeoutExpired:
         os.remove(space_file)
         sys.exit(
-            f"planning {shape} on gpu {gpu} took more than {timeout} s (--setup-timeout)"
+            f"planning {shape} on gpu {gpu} took more than {timeout} s (--plan-timeout)"
         )
     if result.returncode:
         os.remove(space_file)
@@ -528,12 +553,24 @@ def main(argv=None):
     spec, gpus = args.kernel, args.gpu
     os.makedirs(args.runs_dir, exist_ok=True)
 
+    ms = args.M or all_bucket_ms(spec, args, gpus[0])
+    with ThreadPoolExecutor(len(ms)) as pool:  # a Triton space takes minutes per M
+        planned = {
+            M: pool.submit(
+                plan,
+                spec,
+                shape_from_args(args, spec.dims, M),
+                args.backend,
+                gpus[0],
+                args.runs_dir,
+                args.plan_timeout,
+            )
+            for M in ms
+        }
     plans = {}
-    for M in args.M or all_bucket_ms(spec, args, gpus[0]):
+    for M in ms:
         shape = shape_from_args(args, spec.dims, M)
-        plans[M] = plan(
-            spec, shape, args.backend, gpus[0], args.runs_dir, args.setup_timeout
-        )
+        plans[M] = planned[M].result()
         out = results_path(
             args.runs_dir, plans[M]["arch"], plans[M]["backend"], spec.name, shape
         )
