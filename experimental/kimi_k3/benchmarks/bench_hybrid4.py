@@ -16,6 +16,7 @@ from k3_gluon.moe_complete import pack_dense
 from k3_gluon.perf_reference_chain import chain
 from k3_gluon.serving import allocate_workspace
 from validate_complete_moe import checkpoint_weights, layer_weight
+from k3_gluon_hybrid_sort_b8.pipeline import launch_hybrid
 from hybrid_reference import check, expert_weights
 from k3_gluon_hybrid_sort_b8.host import prepare_metadata, run_prepared_experts
 
@@ -345,13 +346,15 @@ def worker(rank, port, args):
                 _ = k.run
 
             def launch(stages, barrier=args.phase_barrier):
-                start = stages[0][0]
-                test_chain[(args.grid,)](*call, START=start, END=2, BEGIN=True, **opts)
-                routed = run_prepared_experts(
-                    state["Latent"], expert, state["IDs"], state["Weights"], metadata
-                )
-                test_chain[(args.grid,)](
-                    *call, START=4, END=4, BEGIN=False, ExternalRouted=routed, **opts
+                launch_hybrid(
+                    test_chain,
+                    call,
+                    dict(opts, START=stages[0][0]),
+                    grid=args.grid,
+                    state=state,
+                    weights=expert,
+                    metadata=metadata,
+                    experts=run_prepared_experts,
                 )
 
             torch.cuda.synchronize()

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Build GPU Monokernels"
+  short_description: "Design and tune resident and hybrid GPU fusion"
+  default_prompt: "Use $build-monokernel to design and implement resident or hybrid fusion for this model."

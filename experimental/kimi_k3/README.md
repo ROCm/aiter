@@ -166,6 +166,37 @@ The numerical reference uses FP32 dense math, the baseline AITER experts, and
 rank-ordered TP sums. Baseline dense-projection rounding was separately observed
 to amplify through A4W4 experts; operator checks are not an lm-eval substitute.
 
-Kernel copies are deliberately separate. `source-manifest.json` records their
-original hashes and exported hashes; formatting is checked against the original
-Python AST so publishing does not alter their arithmetic or schedules.
+Kernel copies are deliberately separate. `source-manifest.json` records original
+and exported hashes and whether each original Python AST is unchanged. The hybrid
+host now adds an AITER dispatch guard; its entry records that intentional change.
+The device kernels retain the original arithmetic and schedules.
+
+## Four-kernel source integration
+
+`k3_gluon_hybrid_sort_b8/pipeline.py` is the shared launch contract used by both
+`integration/hybrid4.py` and `benchmarks/bench_hybrid4.py`. It checks the supported
+B8/TP8/512-CTA/eight-warp schedule, supplies the fused metadata to the front,
+advances the epoch once, invokes the prepared AITER experts, and passes their
+returned output directly to the tail. No sort or copy is enqueued by this wrapper.
+The AITER metadata transform rejects a different expert kernel pair, block size,
+one-stage implementation, or prequantization path. Preparation still initializes
+metadata once outside graph capture; the repeated decode path prepares it in the
+Gluon front. The exact four device launches require a future GPU trace.
+
+CPU-only wiring checks (no Torch, Triton, or HIP imports):
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+These check launch order, epoch options, output pointer identity and unsupported
+configurations. The current shared wrapper/dispatch guard have not been run on a
+GPU. Previous standalone evidence applies to the original candidate only.
+
+## Reusable Codex skill
+
+[build-monokernel/SKILL.md](skills/build-monokernel/SKILL.md) describes the general
+workflow, with detailed references for synchronization, IPC collectives, hybrid
+metadata, occupancy, tuning, numerical checks and serving validation. The K3 case
+study identifies case-specific assumptions and links to implementation anchors.
+Copy the `build-monokernel` folder into your Codex skills directory to reuse it.

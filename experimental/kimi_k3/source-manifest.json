@@ -1088,8 +1088,9 @@
   "k3_gluon_hybrid_sort_b8/host.py": {
     "source_sha256": "c6a1343fc8eaa7dacbcd5036ba4024935f51ea0d7bd488a4832484058c04873d",
     "source": "k3_gluon_hybrid_sort_b8/host.py",
-    "exported_sha256": "f202d95997fce15261f073d54d5ff29a4e14099813eaf85a864f3c6896bfb018",
-    "ast_unchanged": true
+    "exported_sha256": "134eaf4363ccf452d8c473ff0b6ef64815b76042c5e7d57ef9babcc297539026",
+    "ast_unchanged": false,
+    "change_note": "Add exact AITER expert-dispatch guard; device arithmetic and schedules unchanged."
   },
   "k3_gluon_hybrid_sort_b8/moe_complete.py": {
     "source_sha256": "61d2949fa275db9648c8c0c6d5d5339a8585c2bb61d778373dfda84fb52051c4",

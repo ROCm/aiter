@@ -26,6 +26,7 @@ from k3_gluon_serving_b4grid512.perf_reference_chain import (
     chain as complete_moe_grid512,
 )
 from k3_gluon_hybrid_sort_b8.perf_reference_chain import chain as hybrid_b8
+from k3_gluon_hybrid_sort_b8.pipeline import launch_hybrid, stage_options
 from k3_gluon_hybrid_sort_b8.host import (
     expert_weights,
     run_experts,
@@ -46,36 +47,22 @@ def warmup_kernels(entry, call, options):
     kernel, grid = entry["kernel"], entry["grid"]
     variants = [options]
     if entry.get("hybrid"):
-        variants = [
-            dict(options, END=2),
-            dict(
-                options,
-                START=4,
-                END=4,
-                BEGIN=False,
-                ExternalRouted=entry["local_routed"],
-            ),
-        ]
+        variants = stage_options(options, entry["sort_metadata"], grid)
     return [kernel.warmup(*call, grid=(grid,), **variant) for variant in variants]
 
 
 def launch(entry, call, options):
     kernel, grid = entry["kernel"], entry["grid"]
     if entry.get("hybrid"):
-        kernel[(grid,)](*call, **dict(options, END=2))
-        state = entry["state"]
-        # The front has prepared BM16 routes and zeroed the accumulation
-        # buffer. These are exactly the retained AITER MoE1 and MoE2 stages.
-        local_routed = run_prepared_experts(
-            state["Latent"],
-            entry["expert_weights"],
-            state["IDs"],
-            state["Weights"],
-            entry["sort_metadata"],
-        )
-        kernel[(grid,)](
-            *call,
-            **dict(options, START=4, END=4, BEGIN=False, ExternalRouted=local_routed),
+        launch_hybrid(
+            kernel,
+            call,
+            options,
+            grid=grid,
+            state=entry["state"],
+            weights=entry["expert_weights"],
+            metadata=entry["sort_metadata"],
+            experts=run_prepared_experts,
         )
     else:
         kernel[(grid,)](*call, **options)

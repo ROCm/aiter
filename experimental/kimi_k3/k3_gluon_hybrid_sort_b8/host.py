@@ -3,6 +3,7 @@
 import torch
 import aiter
 from aiter.fused_moe import fused_moe, fused_moe_2stages, _adaptive_moe_sort
+from .pipeline import require_expert_config
 
 
 def expert_weights(weights):
@@ -89,4 +90,5 @@ def run_prepared_experts(latent, weights, ids, route_weights, metadata):
         m_indices=metadata["SortM"],
         reverse_sorted=metadata["SortReverse"],
         routing_num_experts=896,
+        _metadata_transform=require_expert_config,
     )
