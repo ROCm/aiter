@@ -653,7 +653,7 @@ def test_mxfp4_fused_sort_quant(dtype, token_num, E, topk, block_size):
     fused, fused_us = run_perftest(
         _run_fused, hidden, topk_ids, topk_weights, E, block_size
     )
-    (f_ids, f_weights, f_experts, f_valid, f_buf, f_quant, f_scale) = fused
+    f_ids, f_weights, f_experts, f_valid, f_buf, f_quant, f_scale = fused
 
     assert _canonical_entries(
         ref_ids, ref_weights, ref_experts, ref_valid, block_size
