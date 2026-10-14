@@ -23,8 +23,7 @@ import pandas as pd
 import torch
 
 import aiter
-import aiter.fused_moe as fused_moe
-from aiter import dtypes, get_torch_quant
+from aiter import dtypes, fused_moe, get_torch_quant
 from aiter.fused_moe import (
     _fused_decode_sort_quant,
     _is_fused_decode_sort_quant_enabled,
@@ -33,12 +32,12 @@ from aiter.fused_moe import (
 )
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.quant import (
+    fused_dynamic_mxfp4_quant_moe_sort as hip_fused_mxfp4_quant_moe_sort,
+)
+from aiter.ops.quant import (
     per_1x32_f4_quant_hip,
     per_1x32_f8_scale_f8_quant,
     per_1x32_mx_quant_hip,
-)
-from aiter.ops.quant import (
-    fused_dynamic_mxfp4_quant_moe_sort as hip_fused_mxfp4_quant_moe_sort,
 )
 from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -499,21 +498,21 @@ _FUSED_ROUTES = ((513, 11), (512, 10))
 # a whitelist, and partial 32-row tail blocks take a different path.
 _FUSED_TOKEN_COUNTS = [1, 2, 3, 4, 8, 16, 17, 32, 64, 100, 127, 128]
 # Keyword gate inputs shared by the contract checks below.
-_FUSED_GATE_KWARGS = dict(
-    block_m=32,
-    quant_type=aiter.QuantType.per_1x32,
-    q_dtype_a=dtypes.fp4x2,
-    q_dtype_w=dtypes.fp4x2,
-    activation=aiter.ActivationType.Silu,
-    is_g1u1=True,
-    expert_mask=None,
-    num_local_tokens=None,
-    need_local_topk_ids=False,
-    run_1stage=False,
-    stage1_is_flydsl=True,
-    hidden_pad=0,
-    ksplit=0,
-)
+_FUSED_GATE_KWARGS = {
+    "block_m": 32,
+    "quant_type": aiter.QuantType.per_1x32,
+    "q_dtype_a": dtypes.fp4x2,
+    "q_dtype_w": dtypes.fp4x2,
+    "activation": aiter.ActivationType.Silu,
+    "is_g1u1": True,
+    "expert_mask": None,
+    "num_local_tokens": None,
+    "need_local_topk_ids": False,
+    "run_1stage": False,
+    "stage1_is_flydsl": True,
+    "hidden_pad": 0,
+    "ksplit": 0,
+}
 
 
 def _running_on_gfx950():
