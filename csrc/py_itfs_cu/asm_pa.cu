@@ -345,6 +345,8 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
     int head_size       = Q->size(2);
     int num_kv_heads    = K->size(1);
     int block_size      = K->size(3);
+    AITER_CHECK(num_heads > 0 && num_kv_heads > 0 && num_heads % num_kv_heads == 0,
+                __func__, ": query/KV head counts must be positive and query heads divisible by KV heads");
     const int gqa_ratio = num_heads / num_kv_heads;
 
     int dim            = head_size;
@@ -463,6 +465,19 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
     CFG* config_map = &cfg_pa_asm; // only one config csv in hsa/<arch>/pa, now
     static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
     std::string arch_id = get_gpu_arch();
+    if(arch_id == "gfx950" && ps == 1 && block_size == 16)
+    {
+        AITER_CHECK(head_size == 128 && (gqa_ratio == 8 || gqa_ratio == 16) &&
+                        max_qlen >= 1 && max_qlen <= 4,
+                    __func__, ": page16 PS requires D128, GQA8/16 and query length 1..4");
+        AITER_CHECK(kv_type != q_type || gqa_ratio != 16 || mask == 1,
+                    __func__, ": page16 PS GQA16 noquant requires causal masking");
+        gqa = gqa_ratio;
+        mtp = (max_qlen > 2 || mask == 0) ? 1 : 0;
+        if(kv_type == q_type && gqa_ratio == 16)
+            mtp = 0;
+        qTile = 0;
+    }
     std::string kernelName = (kernelName_ != nullptr) ? std::string(kernelName_) :
         get_heuristic_kernel(q_type, kv_type, gqa, mtp, msk, hp, block_size, arch_id, ps, qTile, quant_type, config_map);
     if(kernelName.empty())
