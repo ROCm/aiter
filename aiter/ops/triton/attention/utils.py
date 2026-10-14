@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import torch
+import triton
 
 from aiter.ops.triton._triton_kernels.attention.block_lut import (
     block_attn_mask_to_lut_kernel,
 )
+from aiter.ops.triton._triton_kernels.attention.lse_merge import _lse_merge_kernel
 
 
 def block_attn_mask_to_ragged_lut(
@@ -73,3 +75,72 @@ def block_attn_mask_to_ragged_lut(
     )
 
     return kv_block_indices, lut_start, lut_count
+
+
+def lse_merge(
+    partial_out: torch.Tensor,
+    partial_lse: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor | None = None,
+) -> None:
+    """
+    Merge attention partials over disjoint key ranges into `out` (and `lse`) by log-sum-exp.
+
+    partial_out: BSHD [batch * splits, Sq, H, D]; partial batch b * splits + i holds key
+        range i of batch b. Any strides with a contiguous last dimension.
+    partial_lse: FP32 [batch * splits, H, Sq], natural-log log-sum-exp of each range,
+        with a contiguous last dimension.
+    out: BSHD [batch, Sq, H, D], written as weighted by exp(partial_lse - lse).
+    lse: optional FP32 [batch, H, Sq] receiving the merged log-sum-exp.
+    """
+    batch, sequence, heads, head_dim = out.shape
+    if partial_out.shape[0] % batch or partial_out.shape[1:] != out.shape[1:]:
+        raise ValueError(
+            f"partial_out {tuple(partial_out.shape)} does not fold whole key ranges of "
+            f"out {tuple(out.shape)} into its batch"
+        )
+    splits = partial_out.shape[0] // batch
+    if partial_lse.shape != (partial_out.shape[0], heads, sequence):
+        raise ValueError(
+            f"partial_lse must be [batch * splits, heads, Sq] = "
+            f"{(partial_out.shape[0], heads, sequence)}, got {tuple(partial_lse.shape)}"
+        )
+    if lse is not None and lse.shape != (batch, heads, sequence):
+        raise ValueError(
+            f"lse must be [batch, heads, Sq] = {(batch, heads, sequence)}, "
+            f"got {tuple(lse.shape)}"
+        )
+    for name, tensor in (
+        ("partial_out", partial_out),
+        ("partial_lse", partial_lse),
+        ("out", out),
+        ("lse", lse),
+    ):
+        if tensor is not None and tensor.stride(-1) != 1:
+            raise ValueError(f"{name} must have a contiguous last dimension")
+    if head_dim & (head_dim - 1):
+        raise ValueError(f"head dimension must be a power of two, got {head_dim}")
+
+    block_m = 32
+    lse_strides = (lse.stride(0), lse.stride(1)) if lse is not None else (0, 0)
+    _lse_merge_kernel[(triton.cdiv(sequence, block_m), heads, batch)](
+        partial_out,
+        partial_lse,
+        out,
+        lse if lse is not None else partial_lse,
+        sequence,
+        partial_out.stride(0),
+        partial_out.stride(1),
+        partial_out.stride(2),
+        partial_lse.stride(0),
+        partial_lse.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        *lse_strides,
+        SPLITS=splits,
+        BLOCK_M=block_m,
+        HEAD_DIM=head_dim,
+        WRITE_LSE=lse is not None,
+        num_warps=4,
+    )
