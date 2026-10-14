@@ -139,12 +139,12 @@ def flydsl_grouped_gemm_a8w4_masked(
     row_major_ascale=0,
     a_row_stride_bytes=0,
     a_scale_row_stride_bytes=0,
-    ep_dedup=None,
+    ep_dedup=False,
 ):
     """Launches a contiguous-M grouped a8w4 GEMM on the TDM kernel.
 
-    ``ep_dedup`` (dict: mode, pushers, max_recv, topk, rows, nvt, tis, state)
-    swaps the fused scatter for the dedup'd push; see dedup_push.py.
+    ``ep_dedup`` stages the EP output locally for the dedup'd push instead of
+    scattering it; see dedup_push.py.
     """
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
 
@@ -235,26 +235,6 @@ def flydsl_grouped_gemm_a8w4_masked(
         a_row_stride_bytes=int(a_row_stride_bytes),
         a_scale_row_stride_bytes=int(a_scale_row_stride_bytes),
         lds_soa_load_interleave=int(lds_soa_load_interleave),
-        **(
-            # The JIT cache signature cannot take None for a tensor argument.
-            dict(
-                arg_dedup_rows=out,
-                arg_dedup_nvt=out,
-                arg_dedup_tis=out,
-                arg_dedup_state=out,
-            )
-            if ep_dedup is None
-            else dict(
-                ep_dedup=int(ep_dedup["mode"]),
-                ep_dedup_pushers=int(ep_dedup["pushers"]),
-                ep_dedup_max_recv=int(ep_dedup["max_recv"]),
-                ep_dedup_topk=int(ep_dedup["topk"]),
-                ep_dedup_hidden=int(N),
-                arg_dedup_rows=ep_dedup["rows"],
-                arg_dedup_nvt=ep_dedup["nvt"],
-                arg_dedup_tis=ep_dedup["tis"],
-                arg_dedup_state=ep_dedup["state"],
-            )
-        ),
+        ep_dedup=int(bool(ep_dedup)),
     )
     return out
