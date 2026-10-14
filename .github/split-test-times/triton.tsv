@@ -123,8 +123,7 @@ op_tests/triton_tests/rope/test_rope_mxfp4.py	3
 op_tests/triton_tests/test_cross_entropy.py	4
 op_tests/triton_tests/test_gather_kv_b_proj.py	38
 op_tests/triton_tests/test_kv_cache.py	1
-op_tests/triton_tests/test_pa_decode_gluon.py	396
-op_tests/triton_tests/test_pa_decode_gluon_varlen.py	55
+op_tests/triton_tests/test_pa_decode_gluon.py	451
 op_tests/triton_tests/test_softmax.py	4
 op_tests/triton_tests/test_topk.py	5
 op_tests/triton_tests/torch_compile/test_compile_activation.py	8
