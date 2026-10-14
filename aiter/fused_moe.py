@@ -1529,6 +1529,14 @@ def _fused_moe_impl(
         num_local_tokens=num_local_tokens,
         bias1=bias1,
         bias2=bias2,
+        # FHMoE passes its shared-expert weights and scales through here.
+        **{
+            name: value
+            for extra in (_stage1_extra_args, _stage2_extra_args)
+            if extra
+            for name, value in extra.items()
+            if isinstance(value, torch.Tensor)
+        },
     )
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
