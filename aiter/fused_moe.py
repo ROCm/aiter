@@ -3287,18 +3287,29 @@ def _mxmoe_cfg_shape_reason(kernelName1, kernelName2, model_dim, inter_dim):
     default heuristics, the same way ``_opus_a8w4.cfg_is_supported`` does for Opus.
     """
     v2 = parse_flydsl_v2_gemm2_kernel(kernelName2)
-    # Native mxmoe gemm1 encodes BN/BK in its name: K = model_dim by BK (at most
-    # 32 K tiles for its B-scale addressing) and N_OUT = 2 * inter_dim by BN,
-    # matching mxfp4_gemm1_kernels._assert_supported.
+    # Native mxmoe gemm1 encodes BN/BK in its name. Mirror its launcher and
+    # compile_gemm1_a4w4_port: BK == 256, K = model_dim by BK with at most 32 K
+    # tiles (B-scale addressing), at least kStages (2) K tiles per k_wave, and
+    # N_OUT = 2 * inter_dim by BN.
     if _is_mxfp4_kname(kernelName1):
         p1 = _parse_mxfp4_g1_kname(kernelName1)
-        bn1, bk1 = p1["BN"], p1["BK"]
-        if bn1 not in (64, 128, 256):
-            return f"native mxmoe gemm1 {kernelName1!r} has unsupported BN={bn1}"
-        if model_dim % bk1 != 0 or model_dim // bk1 > 32:
+        bn1, bk1, k_wave = p1["BN"], p1["BK"], p1["k_wave"]
+        if bn1 not in (64, 128, 256) or bk1 != 256:
+            return (
+                f"native mxmoe gemm1 {kernelName1!r} has unsupported "
+                f"BN={bn1}/BK={bk1}"
+            )
+        k_tiles = model_dim // bk1
+        if (
+            model_dim % bk1 != 0
+            or k_tiles > 32
+            or k_tiles % k_wave != 0
+            or k_tiles // k_wave < 2
+        ):
             return (
                 f"native mxmoe gemm1 {kernelName1!r} needs model_dim % {bk1} == 0 "
-                f"and model_dim // {bk1} <= 32, got model_dim={model_dim}"
+                f"and 2 * k_wave <= model_dim // {bk1} <= 32, got "
+                f"model_dim={model_dim} k_wave={k_wave}"
             )
         if (2 * inter_dim) % bn1 != 0:
             return (

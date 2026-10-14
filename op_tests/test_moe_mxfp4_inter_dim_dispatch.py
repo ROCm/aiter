@@ -298,10 +298,12 @@ _V2_G2_N256 = "flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x128_atomic_sbm16"
         (_MXMOE_G1, _MXMOE_G2_BK256, 3584, 512, None),
         (_MXMOE_G1, _V2_G2_K128, 3584, 384, None),
         ("", _V2_G2_N256, 3584, 384, None),
-        # Native gemm1 (_MXMOE_G1 is BN=128, BK=256): K = model_dim by BK, at most
-        # 32 K tiles, and N = 2 * inter_dim by BN.
+        # Native gemm1 (_MXMOE_G1 is BN=128, BK=256): BK must be 256, K = model_dim
+        # by BK with 2..32 K tiles, and N = 2 * inter_dim by BN.
         (_MXMOE_G1, _MXMOE_G2_BK128, 3712, 384, "model_dim % 256"),
         (_MXMOE_G1, "", 8448, 384, "model_dim // 256 <= 32"),
+        (_MXMOE_G1, "", 256, 384, "2 * k_wave <= model_dim // 256"),
+        ("flydsl_mxmoe_g1_a4w4_16x128x128_f16in_situv2", "", 3584, 384, "BK=128"),
         (_MXMOE_G1, "", 3584, 320, None),
         (_MXMOE_G1_BN256, "", 3584, 320, "2*inter_dim % 256"),
         (_MXMOE_G1, _MXMOE_G2_BK128, 3584, 320, "inter_dim % 128"),
