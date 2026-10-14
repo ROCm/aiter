@@ -279,7 +279,8 @@ _sparse_attn_prefill_kernel_repr = make_kernel_repr(
         "BLOCK_D",
         "BLOCK_K",
         "USE_EXP2",
-        "EVEN_HD",
+        "EVEN_H",
+        "EVEN_D",
     ],
 )
 
@@ -314,8 +315,10 @@ def _sparse_attn_prefill_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
     USE_EXP2: tl.constexpr = False,
-    # head_dim == BLOCK_D and num_heads % BLOCK_H == 0: no head/dim masks.
-    EVEN_HD: tl.constexpr = False,
+    # num_heads % BLOCK_H == 0: no head mask.
+    EVEN_H: tl.constexpr = False,
+    # head_dim == BLOCK_D: no dim mask; the KV gather is masked by row only.
+    EVEN_D: tl.constexpr = False,
 ):
     # 64-bit before the multiply, same reasoning as `slot_off` below: the
     # program id fits 32 bits, but `query_idx * q_stride_t` does not once
@@ -330,9 +333,10 @@ def _sparse_attn_prefill_kernel(
     head_mask = head_offsets < num_heads
     dim_mask = dim_offsets < head_dim
 
-    if EVEN_HD:
-        # Constant all-true masks fold away in the q load and out store.
+    # Constant all-true masks fold away in the loads and the out store.
+    if EVEN_H:
         head_mask = tl.full((BLOCK_H,), True, tl.int1)
+    if EVEN_D:
         dim_mask = tl.full((BLOCK_D,), True, tl.int1)
     q = tl.load(
         q_ptr
@@ -364,8 +368,8 @@ def _sparse_attn_prefill_kernel(
         in_range = k_pos < kv_len
         valid = in_range & (slot >= 0) & (slot < num_kv)
 
-        # 64-bit before the multiply, same as the decode kernel: a slot index
-        # fits 32 bits (the index buffer is int32 by ABI) but `slot *
+        # 64-bit before the multiply, same as the decode kernel: an int32
+        # slot index fits 32 bits but `slot *
         # kv_stride_n` does not once the unified V4 pool runs to ~150M rows.
         # The wrapped offset still lands inside the same allocation, so the
         # bad read is silent.
@@ -378,7 +382,7 @@ def _sparse_attn_prefill_kernel(
         )
         # Invalid rows are never loaded: a zero softmax weight does not
         # neutralize a non-finite value in the PV dot (0 * NaN = NaN).
-        if EVEN_HD:
+        if EVEN_D:
             kv = tl.load(kv_ptrs, mask=valid[:, None], other=0.0)
         else:
             kv = tl.load(kv_ptrs, mask=valid[:, None] & dim_mask[None, :], other=0.0)

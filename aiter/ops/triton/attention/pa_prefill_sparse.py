@@ -49,13 +49,16 @@ _NO_PINNED_CONFIG = triton.Config({})
 def _pinned_prefill_config(num_heads: int, head_dim: int) -> triton.Config | None:
     """Published single-source prefill tile for this device and shape, if any.
 
-    Shapes without an entry return None and use the autotuned launch.
+    Entries are keyed ``_sparse_attn_prefill_kernel_H{num_heads}_D{head_dim}``
+    in the arch's ``sparse_attention_dsv4/DEFAULT.json``. Devices and shapes
+    without an entry return None, quietly, and use the autotuned launch.
     """
     cfg = get_tuned_kernel_config(
         "attention",
         "SPARSE_ATTENTION_DSV4",
         f"_sparse_attn_prefill_kernel_H{num_heads}_D{head_dim}",
         fallback=_NO_PINNED_CONFIG,
+        warn_on_miss=False,
     )
     return None if cfg is _NO_PINNED_CONFIG else cfg
 
@@ -86,9 +89,9 @@ def pa_prefill_sparse(
     Args:
         q:                 [T, H, D] BF16/FP16 — queries.
         unified_kv:        [total_pages, D] — prefix KV source (paged).
-        kv_indices_prefix: [total_prefix] int32 (int64 also accepted by the
-            Triton branch) — flat per-token slot lists
-            into unified_kv. Invalid-slot handling depends on the branch; see
+        kv_indices_prefix: [total_prefix] int32 — flat per-token slot lists
+            into unified_kv. The Triton branch also takes int64 as is; gfx950
+            casts other dtypes to int32, so slots there must be below 2^31. Invalid-slot handling depends on the branch; see
             ``has_invalid``.
         kv_indptr_prefix:  [T+1] int32 — true prefix sum.
         kv:                [total_tokens, D] — extend KV source (this fwd's
@@ -286,13 +289,9 @@ def pa_prefill_sparse(
             float(softmax_scale),
         )
 
-        pinned = (
-            _pinned_prefill_config(num_heads, head_dim)
-            if DEVICE_ARCH == "gfx942"
-            else None
-        )
+        pinned = _pinned_prefill_config(num_heads, head_dim)
         if pinned is not None:
-            # Published per-shape tile (configs/gfx942/.../sparse_attention_dsv4).
+            # Published per-shape tile (configs/<arch>/.../sparse_attention_dsv4).
             block_h = pinned.kwargs["BLOCK_H"]
             _sparse_attn_prefill_kernel.fn[
                 (num_queries, triton.cdiv(num_heads, block_h))
@@ -300,11 +299,11 @@ def pa_prefill_sparse(
                 *args,
                 HAS_ATTN_SINK=has_attn_sink,
                 BLOCK_D=block_d,
-                USE_EXP2=True,
-                # Drops the head/dim masks only; invalid KV rows are still
+                # Drop the head/dim masks only; invalid KV rows are still
                 # masked out of the gather (never loaded), so an empty pool
                 # or a non-finite unused row is safe.
-                EVEN_HD=block_d == head_dim and num_heads % block_h == 0,
+                EVEN_H=num_heads % block_h == 0,
+                EVEN_D=block_d == head_dim,
                 num_warps=pinned.num_warps,
                 num_stages=pinned.num_stages,
                 **pinned.kwargs,

@@ -5,6 +5,7 @@
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
         "kpack": 2,
+        "USE_EXP2": true,
         "num_warps": 1,
         "num_stages": 2
     },
@@ -14,6 +15,7 @@
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
         "kpack": 2,
+        "USE_EXP2": true,
         "num_warps": 1,
         "num_stages": 2
     }
