@@ -430,7 +430,9 @@ def unclaimed(todo_file, size):
         return int(f.read() or 0) < size
 
 
-def precompile_worker(spec, shape, backend, todo_file, out, slot, gpu, args, stop):
+def precompile_worker(
+    spec, shape, backend, todo_file, size, out, slot, gpu, args, stop
+):
     """One compile-only slot: a worker claims the next candidate of todo_file until none is
     left; a worker killed on a huge compile is replaced, so the pool keeps its size."""
     log_path = f"{out}.pre{slot}.log"
@@ -441,8 +443,6 @@ def precompile_worker(spec, shape, backend, todo_file, out, slot, gpu, args, sto
         ["--precompile", "--configs", todo_file, "--claim", f"{todo_file}.next"],
     )
     env = dict(os.environ, HIP_VISIBLE_DEVICES=str(gpu))
-    with open(todo_file) as f:
-        size = len(json.load(f))
     while not stop.is_set():
         outcome = run_worker(
             command + ["--out", out],
@@ -510,6 +510,7 @@ def precompile_ahead(spec, args, plans, pools, stop):
                     shape,
                     plan_["backend"],
                     todo_file,
+                    len(todo),
                     out,
                     slot,
                     gpus[slot % len(gpus)],
