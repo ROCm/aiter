@@ -736,6 +736,49 @@ def summarize(title, rows):
     aiter.logger.info("%s (markdown):\n%s", title, df.to_markdown(index=False))
 
 
+def check_routing_declines():
+    """Options m32x8 cannot honour must never reach it -- they belong to CK.
+
+    Both escapes found so far (padded cu_seqlens, logits_soft_cap) were silent: the
+    kernel ran and returned plausible-looking numbers computed under the wrong contract.
+    A numeric sweep cannot catch that, so assert on the dispatch itself.
+    """
+    import aiter.ops.flydsl.fmha_kernels as fk
+
+    dev, L, D, H, H_kv = "cuda", 128, 64, 8, 2
+    cu = torch.tensor([0, L], dtype=dtypes.i32, device=dev)
+    q = torch.randn(L, H, D, dtype=dtypes.bf16, device=dev)
+    k = torch.randn(L, H_kv, D, dtype=dtypes.bf16, device=dev)
+    v = torch.randn(L, H_kv, D, dtype=dtypes.bf16, device=dev)
+
+    served = {}
+    real = fk.flydsl_flash_attn_varlen_func
+
+    def spy(*a, **kw):
+        out = real(*a, **kw)
+        served["hit"] = out is not None
+        return out
+
+    def ran_on_flydsl(**kw):
+        served.clear()
+        fk.flydsl_flash_attn_varlen_func = spy
+        try:
+            flash_attn_varlen_func(q, k, v, cu, cu, L, L, causal=True, **kw)
+        finally:
+            fk.flydsl_flash_attn_varlen_func = real
+        return served.get("hit", False)
+
+    assert ran_on_flydsl(), "baseline d64/64 should be served by m32x8"
+    for label, kw in [
+        ("logits_soft_cap", {"logits_soft_cap": 20.0}),
+        # the screen keys off presence, not value -- these never reach the kernel
+        ("cu_seqlens_q_padded", {"cu_seqlens_q_padded": cu}),
+        ("cu_seqlens_k_padded", {"cu_seqlens_k_padded": cu}),
+    ]:
+        assert not ran_on_flydsl(**kw), f"{label} must not route to m32x8"
+    aiter.logger.info("routing: m32x8 correctly declines %d unsupported options", 3)
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
@@ -901,6 +944,7 @@ def main():
     lses = [bool(e) for e in args.return_lse]
     sinks = [bool(n) for n in args.sink]
     windows = [tuple(w) for w in args.window]
+    check_routing_declines()
     thd_shapes, bshd_shapes = _shape_lists(args)
     # No -s: run every pair the kernel serves. With -b/-nh/-sq/-sk also unset that is
     # the full default sweep CI runs; any explicit flag narrows only what it names.

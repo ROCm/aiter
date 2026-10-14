@@ -3839,12 +3839,14 @@ def flash_attn_varlen_func(
             v_descale,
         )
 
-    # FlyDSL path returns result if supported, None otherwise. window_size[2] (sink
-    # size) is unsupported: the FlyDSL gate rejects it, and this screen keeps it off
-    # the path so a sink-token request is never silently dropped.
-    # FlyDSL also does not consume precomputed Q/K/V descales, so keep
-    # prequantized FP8 attention on the CK path.
-    if not has_all_descales and (len(window_size) < 3 or window_size[2] == 0):
+    # Options m32x8 silently ignores stay on CK; it returns None for shapes it declines.
+    if (
+        not has_all_descales
+        and (len(window_size) < 3 or window_size[2] == 0)
+        and cu_seqlens_q_padded is None
+        and cu_seqlens_k_padded is None
+        and logits_soft_cap == 0.0
+    ):
         from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
 
         _flydsl_result = flydsl_flash_attn_varlen_func(
