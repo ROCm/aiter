@@ -4,9 +4,11 @@ from pathlib import Path
 import torch
 import triton
 
+from aiter import logger
 from aiter.ops.triton.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
 )
+from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
     get_ff_args,
@@ -22,9 +24,21 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 from op_tests.triton_tests.gemm.batched.test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     generate_batched_gemm_a16w8_inputs as generate_batched_gemm_a8w8_per_token_group_inputs,
 )
-from op_tests.triton_tests.gemm.batched.test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
-    prepare_batched_gemm_input,
-)
+
+
+def prepare_batched_gemm_input(
+    x: torch.Tensor, transpose_bm_in: bool = False, input_pad: int = 0
+) -> torch.Tensor:
+    """Prepare the input layout while retaining optional padded row strides."""
+    assert input_pad >= 0
+    if transpose_bm_in:
+        x = x.transpose(0, 1).contiguous()
+    if input_pad:
+        k = x.shape[-1]
+        storage = x.new_zeros((*x.shape[:-1], k + input_pad))
+        storage[..., :k].copy_(x)
+        x = storage[..., :k]
+    return x
 
 
 def bench_gemm_fn(
@@ -37,6 +51,7 @@ def bench_gemm_fn(
     group_size: int,
     has_bias: bool,
     transpose_bm: bool,
+    backend: str | None = None,
     transpose_bm_in: bool = False,
     profile_path: str | None = None,
     supplied_output: bool = True,
@@ -77,6 +92,7 @@ def bench_gemm_fn(
             dtype=c_dtype,
             YQ=y,
             transpose_bm=transpose_bm,
+            backend=backend,
             transpose_bm_in=transpose_bm_in,
         )
 
@@ -96,7 +112,7 @@ def bench_gemm_fn(
             torch.cuda.synchronize()
         path.parent.mkdir(parents=True, exist_ok=True)
         profile.export_chrome_trace(str(path))
-        print(f"Profile only: {path}; no clean timing reported.")
+        logger.info("Profile only: %s; no clean timing reported.", path)
         return float("nan")
 
     ms = triton.testing.do_bench(fn, warmup=25, rep=100, return_mode="median")
@@ -148,10 +164,11 @@ def run_model_benchmark(args):
             args.group_size,
             not args.no_bias,
             args.transpose_bm,
-            args.transpose_bm_in,
-            args.profile,
-            not args.allocate_output,
-            args.input_pad,
+            args.backend,
+            transpose_bm_in=args.transpose_bm_in,
+            profile_path=args.profile,
+            supplied_output=not args.allocate_output,
+            input_pad=args.input_pad,
         )
 
     bench_batched_gemm_a8w8_per_token_group_prequant_w_per_batched_tensor_quant.run(
@@ -178,10 +195,11 @@ def run_shape_benchmark(args):
             args.group_size,
             not args.no_bias,
             args.transpose_bm,
-            args.transpose_bm_in,
-            args.profile,
-            not args.allocate_output,
-            args.input_pad,
+            args.backend,
+            transpose_bm_in=args.transpose_bm_in,
+            profile_path=args.profile,
+            supplied_output=not args.allocate_output,
+            input_pad=args.input_pad,
         )
 
     bench_batched_gemm_a8w8_per_token_group_prequant_w_per_batched_tensor_quant.run(
@@ -237,7 +255,14 @@ def parse_args(args: list[str] | None = None):
         "--no-bias",
         action="store_true",
         default=False,
-        help="Disable bias.",
+        help="Disable bias (required for --backend gluon).",
+    )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["triton", "gluon"],
+        default=None,
+        help="Kernel backend (default: auto -- gluon on gfx1250 when bias is off).",
     )
     parser.add_argument(
         "--transpose-bm",
@@ -251,6 +276,12 @@ def parse_args(args: list[str] | None = None):
 
 def main(args: list[str] | None = None) -> None:
     parsed_args, defaults = parse_args(args=args)
+    if parsed_args.backend == "gluon" and arch_info.get_arch() != "gfx1250":
+        print(
+            f"--backend gluon is gfx1250-only (running on {arch_info.get_arch()}); "
+            "nothing to benchmark."
+        )
+        return
     if parsed_args.print_vgpr:
         print_vgpr(lambda: run_benchmark(parsed_args, defaults))
         return

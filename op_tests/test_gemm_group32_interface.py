@@ -299,8 +299,8 @@ def test_mxscale_bpreshuffle_route(monkeypatch, row, block):
 
     calls = []
 
-    def lookup(m, n, k, w_scale_block):
-        calls.append(("lookup", m, n, k, w_scale_block))
+    def lookup(m, n, k, w_scale_block, bmm):
+        calls.append(("lookup", m, n, k, w_scale_block, bmm))
         return row
 
     def run(x, w, xs, ws, out, kernel_name=None, x_scale_transposed=False):
@@ -316,7 +316,7 @@ def test_mxscale_bpreshuffle_route(monkeypatch, row, block):
     kb = 512 // block
     assert y.shape == (3, 256) and y.dtype == torch.bfloat16
     assert calls == [
-        ("lookup", 3, 256, 512, f"{block}x{block}"),
+        ("lookup", 3, 256, 512, f"{block}x{block}", True),
         (
             "bmm",
             (3, 1, 512),
@@ -334,7 +334,7 @@ def test_mxscale_bpreshuffle_rejects_unknown_implementation(monkeypatch):
     monkeypatch.setattr(
         gemm_op_a8w8,
         "get_mxscale_bpreshuffle_config",
-        lambda *args: {**BMM_ROW, "kernelId": "other"},
+        lambda *a, **kw: {**BMM_ROW, "kernelId": "other"},
     )
     with pytest.raises(NotImplementedError, match="flydsl/other"):
         gemm_op_a8w8.gemm_a8w8_blockscale_bpreshuffle(*_mxscale_operands())
@@ -342,7 +342,9 @@ def test_mxscale_bpreshuffle_rejects_unknown_implementation(monkeypatch):
 
 def test_mxscale_bpreshuffle_rejects_row_scales(monkeypatch):
     monkeypatch.setattr(gemm_op_a8w8, "get_gfx", lambda: "gfx950")
-    monkeypatch.setattr(gemm_op_a8w8, "get_mxscale_bpreshuffle_config", lambda *a: None)
+    monkeypatch.setattr(
+        gemm_op_a8w8, "get_mxscale_bpreshuffle_config", lambda *a, **kw: None
+    )
     with pytest.raises(NotImplementedError, match="1x32"):
         gemm_op_a8w8.gemm_a8w8_blockscale_bpreshuffle(*_mxscale_operands(w_rows=1))
 
@@ -421,7 +423,9 @@ def _assert_matches(out, ref):
 )
 @pytest.mark.parametrize("row", [None, BMM_ROW])
 def test_mxscale_bpreshuffle_matches_dequant(monkeypatch, m, n, k, block, row):
-    monkeypatch.setattr(gemm_op_a8w8, "get_mxscale_bpreshuffle_config", lambda *a: row)
+    monkeypatch.setattr(
+        gemm_op_a8w8, "get_mxscale_bpreshuffle_config", lambda *a, **kw: row
+    )
     _assert_matches(*_mxscale_gemm_vs_dequant(m, n, k, block))
 
 
@@ -452,7 +456,9 @@ def test_mxscale_bpreshuffle_mid_dword_scale_rows(monkeypatch, m, k, config):
         7168, k, 1, **parse_bmm_kernel_name(name), **blocks, x_scale_transposed=m > 1
     )
     row = {**BMM_ROW, "kernelName": name}
-    monkeypatch.setattr(gemm_op_a8w8, "get_mxscale_bpreshuffle_config", lambda *a: row)
+    monkeypatch.setattr(
+        gemm_op_a8w8, "get_mxscale_bpreshuffle_config", lambda *a, **kw: row
+    )
     _assert_matches(*_mxscale_gemm_vs_dequant(m, 7168, k, 128))
 
 

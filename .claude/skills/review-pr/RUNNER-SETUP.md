@@ -29,6 +29,23 @@ The workflow's review step sets no environment on purpose, so the box-specific c
     PATH=<data-volume>/bin:/usr/local/bin:/usr/bin:/bin   # a gh >= 2.24 must be first (fetch needs baseRefOid)
     GH_CONFIG_DIR=<data-volume>/gh-config      # gh auth stored here, NOT as GH_TOKEN in the env
 
+Optional, and worth knowing before you change one: the review's time budget. A failure message
+names whichever of these is the one that actually helps, so follow the message rather than
+guessing.
+
+    AITER_AGENT_TIMEOUT=2400   # per agent attempt (40 min). Raising it past the budget below
+                               #   makes the budget refuse to start attempts SOONER, not later.
+    AITER_RUN_BUDGET=6000      # whole run (100 min), counted from the start of run_one.sh and
+                               #   shared by fetch, worker and refuter. Must stay under the
+                               #   review job's `timeout-minutes` (120) -- check_prompts.py
+                               #   asserts this, because a run killed at the job cap dies with
+                               #   no classified status at all.
+    AITER_REVIEW_RETRIES=2     # attempts per agent. A timeout is never retried.
+
+Anything set here silently overrides the defaults in `run_one.sh`, and `.env` is not in version
+control -- so a value left here outlives the reason it was added. Remove it once the default
+covers the case.
+
 ## 3. gh auth off the job environment
 
 `fetch.sh` calls `gh` to read the PR. Authenticate it under `GH_CONFIG_DIR` (from a token with
@@ -43,6 +60,40 @@ Set the repo secret `AITER_BOT_TOKEN` to the bot account's PAT (`public_repo`). 
 uses it only in the claim and publish steps — never in the review step — so the review agent
 cannot read it.
 
-## 5. Verify
+## 5. Keep it running across reboots
+
+Registering a runner does not keep it running. A hand-started runner (`./run.sh`, `nohup`, or a
+keeper loop) dies on the next reboot and never comes back — and nothing reports it: with no
+runner the job stays `queued` instead of failing, so GitHub sends no notification, and
+`_notify.py` cannot help because it only runs *inside* a job that started. This box lost its
+runner to a reboot and sat silently offline for days.
+
+Install it as a service instead — the runner package ships the wrapper:
+
+    cd <runner-dir>
+    sudo ./svc.sh install <user>    # writes a systemd unit, enabled at boot
+    sudo ./svc.sh start
+
+The unit `svc.sh` writes carries no `Restart=`, so it survives a reboot but not a crash. Add a
+drop-in for the other half:
+
+    U=$(systemctl list-unit-files 'actions.runner.*aiter*' --no-legend | awk '{print $1; exit}')
+    [ -n "$U" ] || echo 'no runner unit yet -- run svc.sh install first'   # else the paths below
+                                                                          # become /etc/.../.d
+    sudo mkdir -p "/etc/systemd/system/$U.d"
+    printf '[Service]\nRestart=always\nRestartSec=10\n' | sudo tee "/etc/systemd/system/$U.d/restart.conf"
+    sudo systemctl daemon-reload
+
+Do not hand-roll a unit or a keeper loop: a keeper only restarts what it is pointed at, and it
+cannot restart itself.
+
+## 6. Verify
 
     bash .claude/skills/review-pr/preflight.sh    # all green = @aiter-bot review runs end to end
+
+That includes `selftest.sh`, which holds `run_one.sh` to its guards: a timeout still routes to
+`flow` rather than paging the model owner, an attempt that cannot fit the run budget is refused,
+and a refuter timeout still publishes the card only by admitting it. Run it directly to see which
+guard broke:
+
+    bash .claude/skills/review-pr/selftest.sh

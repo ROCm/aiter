@@ -187,7 +187,7 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
         @flyc.jit
         def _accum_split(acc, den):
             if fx.Float32(l_i) > fx.Float32(0.0):
-                w = rocdl.exp2(T.f32, as_mlir_value(m_i - m_max))
+                w = fx.Float32(m_i - m_max).exp2(fastmath="afn").ir_value()
                 wl = w * l_i
                 den = den + wl
                 o2_raw = buffer_ops.buffer_load(

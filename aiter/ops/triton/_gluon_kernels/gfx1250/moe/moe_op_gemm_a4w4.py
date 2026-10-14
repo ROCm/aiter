@@ -1,3 +1,5 @@
+import functools
+
 import torch
 import triton.experimental.gluon.language as gl
 from triton._C.libtriton.gluon_ir import make_cga_layout
@@ -6,9 +8,12 @@ from triton.experimental import gluon
 from aiter.ops.triton._gluon_kernels.gfx1250.quant.fused_mxfp4_quant import (
     _mxfp4_quant_op,
 )
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+    pid_grid,
+    remap_xcd,
+)
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 _MOE_GEMM_A4W4_REPR_KEYS = [
     "BLOCK_M",
@@ -93,6 +98,7 @@ def matmul_launch_metadata(grid, kernel, args):
     return ret
 
 
+@functools.lru_cache(maxsize=None)  # noqa: UP033
 def get_moe_a4w4_layouts_prefill(
     BLOCK_M,
     BLOCK_N,
@@ -102,7 +108,8 @@ def get_moe_a4w4_layouts_prefill(
     ACTIVATION_REDUCTION_N,
     PRESHUFFLE_WEIGHTS,
     SWIZZLE_MX_SCALE,
-    GatherIndx,
+    has_GatherIndx,
+    gather_idx_bitwidth,
     X_SCALES_TDM=False,
 ):
     OUT_BLOCK_N = BLOCK_N // ACTIVATION_REDUCTION_N
@@ -215,9 +222,7 @@ def get_moe_a4w4_layouts_prefill(
     )
 
     GATHER_IDX_LAYOUT = None
-    if GatherIndx is not None:
-        assert GatherIndx.dtype == torch.uint16 or GatherIndx.dtype == torch.int32
-        gather_idx_bitwidth = 16 if GatherIndx.dtype == torch.uint16 else 32
+    if has_GatherIndx:
         GATHER_IDX_LAYOUT = gl.SliceLayout(
             0,
             gl.BlockedLayout(
@@ -336,6 +341,7 @@ def get_moe_a4w4_layouts_prefill(
     return layouts
 
 
+@functools.lru_cache(maxsize=None)  # noqa: UP033
 def get_moe_a4w4_layouts_decode(
     BLOCK_M,
     BLOCK_N,
@@ -344,7 +350,8 @@ def get_moe_a4w4_layouts_decode(
     ACTIVATION_REDUCTION_N,
     PRESHUFFLE_WEIGHTS,
     SWIZZLE_MX_SCALE,
-    GatherIndx,
+    has_GatherIndx,
+    gather_idx_bitwidth,
     X_SCALES_TDM=False,
 ):
     OUT_BLOCK_N = BLOCK_N // ACTIVATION_REDUCTION_N
@@ -413,9 +420,7 @@ def get_moe_a4w4_layouts_decode(
     )
 
     GATHER_IDX_LAYOUT = None
-    if GatherIndx is not None:
-        assert GatherIndx.dtype == torch.uint16 or GatherIndx.dtype == torch.int32
-        gather_idx_bitwidth = 16 if GatherIndx.dtype == torch.uint16 else 32
+    if has_GatherIndx:
         GATHER_IDX_LAYOUT = gl.SliceLayout(
             0,
             gl.BlockedLayout(

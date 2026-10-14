@@ -1,0 +1,6 @@
+{
+  "_sparse_mla": {
+    "BLOCK_K": 32,
+    "num_warps": 4
+  }
+}
