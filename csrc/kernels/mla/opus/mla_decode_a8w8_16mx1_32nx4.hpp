@@ -58,7 +58,7 @@
 #if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
 
 template <class Traits>
-__global__ void opus_mla_decode_fp8_16mx1_32nx4_kernel(opus_mla_decode_kargs)
+__global__ void opus_mla_decode_a8w8_16mx1_32nx4_kernel(opus_mla_decode_kargs)
 {
 }
 
@@ -71,7 +71,7 @@ __global__ void opus_mla_decode_fp8_16mx1_32nx4_kernel(opus_mla_decode_kargs)
 
 using opus::operator""_I;
 
-namespace opus_mla_decode_fp8_16mx1_32nx4 {
+namespace opus_mla_decode_a8w8_16mx1_32nx4 {
 
 // Moves a wave-uniform float into an SGPR. gfx950 has no scalar float ALU, so anything
 // computed from uniform inputs still lands in a VGPR and stays live there. The bit_cast is
@@ -1317,17 +1317,17 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(opus_mla_d
     }
 }
 
-} // namespace opus_mla_decode_fp8_16mx1_32nx4
+} // namespace opus_mla_decode_a8w8_16mx1_32nx4
 
 // Persistent entry point: the grid is sized to the machine, not to the problem, and each block
 // drains the work items the metadata kernel assigned it through work_indptr.
 template <class Traits>
 __global__
 __launch_bounds__(Traits::BLOCK_SIZE,
-                  1) void opus_mla_decode_fp8_16mx1_32nx4_kernel(opus_mla_decode_kargs kargs)
+                  1) void opus_mla_decode_a8w8_16mx1_32nx4_kernel(opus_mla_decode_kargs kargs)
 {
     using namespace opus;
-    using namespace opus_mla_decode_fp8_16mx1_32nx4;
+    using namespace opus_mla_decode_a8w8_16mx1_32nx4;
     using T = opus::remove_cvref_t<Traits>;
 
     const int work_id = block_id_x();

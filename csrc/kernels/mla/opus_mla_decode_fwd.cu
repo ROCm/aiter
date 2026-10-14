@@ -14,7 +14,7 @@
 //                                        toolchain aiter does not ship.
 //                                fp8  -- per-tensor scalar descales (q_scale /
 //                                        kv_scale); routed by nhead x max_seqlen_q
-//                                        in opus_fp8_route.
+//                                        in opus_a8w8_route.
 //   opus_mla_decode_mxfp8_fwd  fp8 NoPE with per-block E8M0 scales + bf16 RoPE,
 //                              so Q and KV are three tensors each.
 //
@@ -26,7 +26,7 @@
 #include "aiter_ctypes_error.h"
 
 #include "aiter_hip_common.h"
-#include "opus/mla_decode_fp8_16mx1_32nx4.hpp"
+#include "opus/mla_decode_a8w8_16mx1_32nx4.hpp"
 #include "opus/mla_decode_kargs.h"
 #include "opus/mla_decode_mxfp8_16mx8_32nx1.hpp"
 
@@ -65,20 +65,20 @@ constexpr OpusDecodeVariant kA16W16_32mx3{"opus_mla_decode_a16w16_32mx3_32nx1_ke
                                        "mla_opus/opus_mla_decode_a16w16_32mx3_32nx1.co",
                                        96,
                                        256};
-// fp8 32mx4 / 64nx1 (csrc/kernels/mla/opus/mla_decode_fp8_32mx4_64nx1.hpp): 4 waves x 32 packed
+// fp8 32mx4 / 64nx1 (csrc/kernels/mla/opus/mla_decode_a8w8_32mx4_64nx1.hpp): 4 waves x 32 packed
 // query rows, i.e. the 128-row work items aiter's metadata packs by default for fp8. Prebuilt
 // only: its register map (Q, half of O and the K/V ring in AGPRs, the other half of O and both
 // score buffers in VGPRs) needs the pin toolchain, and a stock ROCm clang forces every MFMA into
 // AGPR form, which cannot fit. One entry per specialization.
-constexpr const char* kFp8_32mx4_co = "mla_opus/opus_mla_decode_fp8_32mx4_64nx1.co";
-// fp8 32mx2 / 32nx2 (mla_decode_fp8_32mx2_32nx2.hpp): two wave pairs of 32 packed query rows,
-// 32x32x64 for both GEMMs, prebuilt the same way (mla_decode_fp8_32mx2_32nx2_co.hip). 64 packed
+constexpr const char* kA8W8_32mx4_co = "mla_opus/opus_mla_decode_a8w8_32mx4_64nx1.co";
+// fp8 32mx2 / 32nx2 (mla_decode_a8w8_32mx2_32nx2.hpp): two wave pairs of 32 packed query rows,
+// 32x32x64 for both GEMMs, prebuilt the same way (mla_decode_a8w8_32mx2_32nx2_co.hip). 64 packed
 // query rows per workgroup, so a work item must not carry more than 64 rows -- hand it a
 // 128-row item and the rows past 64 are never computed -- which the metadata guarantees for
-// exactly the shapes opus_fp8_route sends here (64 rows or fewer per request, and
+// exactly the shapes opus_a8w8_route sends here (64 rows or fewer per request, and
 // kPackedQoLenPerWg 64 for nhead 32 x 3).
-constexpr const char* kFp8_32mx2_co = "mla_opus/opus_mla_decode_fp8_32mx2_32nx2.co";
-constexpr int kFp8_co_block         = 256;
+constexpr const char* kA8W8_32mx2_co = "mla_opus/opus_mla_decode_a8w8_32mx2_32nx2.co";
+constexpr int kA8W8_co_block         = 256;
 
 constexpr int kHeadDimQk = 576;
 constexpr int kHeadDimVo = 512;
@@ -97,7 +97,7 @@ using MxFp8Traits = opus_mla_decode_mxfp8_16mx8_32nx1_traits<16, 32, 8, fp8_t, b
 // the python gate now keeps page_size > 1 on the asm path.
 template <bool CAUSAL, bool LARGE_KV = false>
 using OpusTraits16mx1x32nx4C =
-    opus_mla_decode_fp8_16mx1_32nx4_traits<16, 32, 4, fp8_t, fp8_t, bf16_t, CAUSAL, LARGE_KV, 2>;
+    opus_mla_decode_a8w8_16mx1_32nx4_traits<16, 32, 4, fp8_t, fp8_t, bf16_t, CAUSAL, LARGE_KV, 2>;
 inline bool opus_env_flag(const char* name)
 {
     const char* v = std::getenv(name);
@@ -109,7 +109,7 @@ inline bool opus_env_flag(const char* name)
 // per workgroup) goes to 32mx4, what it runs on qh16 / qseqlen4 (64 rows) to 32mx2. nhead
 // here is nhead per KV head (MLA has one), after mla.py's fold of the non-native head counts.
 // aiter/mla.py keeps the same table so a shape with no build stays on the asm path.
-enum class OpusFp8Route
+enum class OpusA8W8Route
 {
     k32mx4,
     k32mx2,
@@ -117,18 +117,18 @@ enum class OpusFp8Route
     kNone,
 };
 
-inline OpusFp8Route opus_fp8_route(int nhead, int max_seqlen_q)
+inline OpusA8W8Route opus_a8w8_route(int nhead, int max_seqlen_q)
 {
     const int q = max_seqlen_q;
     if((nhead == 32 && q >= 4) || (nhead == 64 && q >= 2) || nhead == 128 ||
        (nhead == 96 && q <= 6) || (nhead == 16 && q > 4) || (nhead == 12 && nhead * q <= 128))
-        return OpusFp8Route::k32mx4;
+        return OpusA8W8Route::k32mx4;
     if((nhead == 16 && (q == 3 || q == 4)) || (nhead == 32 && (q == 2 || q == 3)) ||
        (nhead == 64 && q == 1))
-        return OpusFp8Route::k32mx2;
+        return OpusA8W8Route::k32mx2;
     if(nhead == 16 && q == 1)
-        return OpusFp8Route::k16mx1;
-    return OpusFp8Route::kNone;
+        return OpusA8W8Route::k16mx1;
+    return OpusA8W8Route::kNone;
 }
 
 struct OpusLaunch16mx1x32nx4
@@ -137,7 +137,7 @@ struct OpusLaunch16mx1x32nx4
     static void
     launch(int num_workers, hipStream_t stream, const opus_mla_decode_kargs& kargs)
     {
-        opus_mla_decode_fp8_16mx1_32nx4_kernel<Traits>
+        opus_mla_decode_a8w8_16mx1_32nx4_kernel<Traits>
             <<<dim3(num_workers, 1, 1), dim3(Traits::BLOCK_SIZE), 0, stream>>>(kargs);
     }
 };
@@ -209,7 +209,7 @@ void opus_mla_decode_bf16(opus_mla_decode_kargs kargs, int num_workers, hipStrea
 // here addresses a block table: the 16mx1 shape's rope DMA deals a 16-token line and so
 // cannot carry a per-lane within-page offset, so page_size > 1 belongs to the asm path and
 // the python gate keeps it there.
-void opus_mla_decode_fp8(opus_mla_decode_kargs kargs,
+void opus_mla_decode_a8w8(opus_mla_decode_kargs kargs,
                          const aiter_tensor_t* q_scale,
                          const aiter_tensor_t* kv_scale,
                          int max_seqlen_q,
@@ -218,8 +218,8 @@ void opus_mla_decode_fp8(opus_mla_decode_kargs kargs,
                          hipStream_t stream)
 {
     AITER_CHECK(max_seqlen_q >= 1, kFwdName, ": fp8 needs max_seqlen_q, got ", max_seqlen_q);
-    const OpusFp8Route route = opus_fp8_route(kargs.H, max_seqlen_q);
-    AITER_CHECK(route != OpusFp8Route::kNone,
+    const OpusA8W8Route route = opus_a8w8_route(kargs.H, max_seqlen_q);
+    AITER_CHECK(route != OpusA8W8Route::kNone,
                 kFwdName,
                 ": no opus fp8 build for nhead ",
                 kargs.H,
@@ -259,53 +259,54 @@ void opus_mla_decode_fp8(opus_mla_decode_kargs kargs,
     const bool use_cprr = use_causal && kargs.cp_world_size > 1;
     size_t arg_size       = sizeof(kargs);
     auto launch_co        = [&](AiterAsmKernel& impl) {
-        impl.launch_kernel({&kargs, &arg_size, num_workers, 1, 1, kFp8_co_block, 1, 1, stream});
+        impl.launch_kernel({&kargs, &arg_size, num_workers, 1, 1, kA8W8_co_block, 1, 1, stream});
     };
-#define OPUS_FP8_CO_ENTRY(name, entry, co)                                             \
+#define OPUS_A8W8_CO_ENTRY(name, entry, co)                                            \
     do                                                                                 \
     {                                                                                  \
-        static AiterAsmKernel impl("opus_mla_decode_fp8_" name "_" entry, co);         \
+        static AiterAsmKernel impl("opus_mla_decode_a8w8_" name "_" entry, co);        \
         launch_co(impl);                                                               \
     } while(0)
-#define OPUS_FP8_CO_LAUNCH(name, co)                                                   \
+#define OPUS_A8W8_CO_LAUNCH(name, co)                                                  \
     do                                                                                 \
     {                                                                                  \
-        static bool traced = false; /* first call only: the test loops the kernel */  \
+        static bool traced = false; /* first call only: the test loops the kernel */   \
         if(!traced && opus_env_flag("AITER_MLA_OPUS_TRACE") && (traced = true))        \
             fprintf(stderr,                                                            \
-                    "[opus_mla_decode_fp8] " name " co causal=%d large_kv=%d cprr=%d\n", \
+                    "[opus_mla_decode_a8w8] " name " co causal=%d large_kv=%d"         \
+                    " cprr=%d\n",                                                      \
                     use_causal,                                                        \
                     large_kv,                                                          \
                     use_cprr);                                                         \
         if(large_kv && use_cprr)                                                       \
-            OPUS_FP8_CO_ENTRY(name, "causal_large_cprr", co);                          \
+            OPUS_A8W8_CO_ENTRY(name, "causal_large_cprr", co);                         \
         else if(use_cprr)                                                              \
-            OPUS_FP8_CO_ENTRY(name, "causal_cprr", co);                                \
+            OPUS_A8W8_CO_ENTRY(name, "causal_cprr", co);                               \
         else if(large_kv && use_causal)                                                \
-            OPUS_FP8_CO_ENTRY(name, "causal_large", co);                               \
+            OPUS_A8W8_CO_ENTRY(name, "causal_large", co);                              \
         else if(large_kv)                                                              \
-            OPUS_FP8_CO_ENTRY(name, "nc_large", co);                                   \
+            OPUS_A8W8_CO_ENTRY(name, "nc_large", co);                                  \
         else if(use_causal)                                                            \
-            OPUS_FP8_CO_ENTRY(name, "causal", co);                                     \
+            OPUS_A8W8_CO_ENTRY(name, "causal", co);                                    \
         else                                                                           \
-            OPUS_FP8_CO_ENTRY(name, "nc", co);                                         \
+            OPUS_A8W8_CO_ENTRY(name, "nc", co);                                        \
     } while(0)
 
     // 128 packed query rows per workgroup on 4 waves.
-    if(route == OpusFp8Route::k32mx4)
+    if(route == OpusA8W8Route::k32mx4)
     {
-        OPUS_FP8_CO_LAUNCH("32mx4_64nx1", kFp8_32mx4_co);
+        OPUS_A8W8_CO_LAUNCH("32mx4_64nx1", kA8W8_32mx4_co);
         return;
     }
 
     // 64 packed query rows per workgroup on 4 waves (two pairs of 32).
-    if(route == OpusFp8Route::k32mx2)
+    if(route == OpusA8W8Route::k32mx2)
     {
-        OPUS_FP8_CO_LAUNCH("32mx2_32nx2", kFp8_32mx2_co);
+        OPUS_A8W8_CO_LAUNCH("32mx2_32nx2", kA8W8_32mx2_co);
         return;
     }
-#undef OPUS_FP8_CO_LAUNCH
-#undef OPUS_FP8_CO_ENTRY
+#undef OPUS_A8W8_CO_LAUNCH
+#undef OPUS_A8W8_CO_ENTRY
 
     // route == k16mx1.
     launch_opus_16mx1<OpusTraits16mx1x32nx4C, OpusLaunch16mx1x32nx4>(
@@ -418,7 +419,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     if(q->dtype() == AITER_DTYPE_bf16)
         opus_mla_decode_bf16(kargs, num_workers, stream);
     else if(q->dtype() == AITER_DTYPE_fp8)
-        opus_mla_decode_fp8(
+        opus_mla_decode_a8w8(
             kargs, q_scale, kv_scale, max_seqlen_q, causal, num_workers, stream);
     else
         AITER_CHECK(false, __func__, ": q/kv must be bf16 or fp8.");

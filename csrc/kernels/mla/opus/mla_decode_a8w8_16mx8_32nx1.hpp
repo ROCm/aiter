@@ -46,7 +46,7 @@
 #if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
 
 template <class Traits>
-__global__ void opus_mla_decode_fp8_16mx8_32nx1_kernel(opus_mla_decode_kargs)
+__global__ void opus_mla_decode_a8w8_16mx8_32nx1_kernel(opus_mla_decode_kargs)
 {
 }
 
@@ -59,7 +59,7 @@ __global__ void opus_mla_decode_fp8_16mx8_32nx1_kernel(opus_mla_decode_kargs)
 
 using opus::operator""_I;
 
-namespace mla_decode_fwd_16mx8_32nx1_fp8fp8 {
+namespace mla_decode_fwd_16mx8_32nx1_a8w8 {
 
 // Moves a wave-uniform float into an SGPR. gfx950 has no scalar float ALU, so anything
 // computed from uniform inputs still lands in a VGPR and stays live there. The bit_cast is
@@ -72,10 +72,10 @@ __device__ inline float readfirstlane_f32(float v)
 
 // --- IGLP co-execution scheduling (sched_group_barrier) ---
 namespace sched_masks {
-constexpr int MFMA    = 0x08;
-constexpr int VALU    = 0x02;
-constexpr int DS_READ = 0x100;
-constexpr int EXP     = 0x400;
+constexpr int MFMA               = 0x08;
+constexpr int VALU               = 0x02;
+constexpr int DS_READ            = 0x100;
+constexpr int EXP                = 0x400;
 constexpr int KEEP_DS_READ_ORDER = 0x67F;
 } // namespace sched_masks
 
@@ -223,8 +223,8 @@ __device__ inline auto make_layout_kv_indices_rope(int warp_id, int lane_id)
 
 // K nope sub-range, d in [0, 512), fp8. The token dimension is folded into the per-thread
 // page offset (make_layout_kv_indices), so this layout only describes the d / warp
-// distribution: row-major d, seed {D_128B_NOPE_SIZE, 1}. the 3-buffer variant's scheme plus the V-read
-// bank swizzle.
+// distribution: row-major d, seed {D_128B_NOPE_SIZE, 1}. the 3-buffer variant's scheme plus the
+// V-read bank swizzle.
 //
 // The swizzle has to be applied on the SOURCE side, which is why it appears here and not
 // in the smem layout: buffer_load_lds takes no per-lane LDS address, the hardware simply
@@ -247,7 +247,7 @@ __device__ inline auto make_layout_gk_nope(int warp_id, int lane_id)
                                                    opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
 
     const int tok_in_line = lane_id / threads_d;
-    const int d_grp = (lane_id % threads_d) ^ ((tok_in_line & T::SWZ_TOK_BIT) ? 1 : 0);
+    const int d_grp       = (lane_id % threads_d) ^ ((tok_in_line & T::SWZ_TOK_BIT) ? 1 : 0);
 
     return opus::make_layout(
         gk_block_shape,
@@ -366,10 +366,9 @@ __device__ inline auto make_layout_rk_rope(int lane_id)
                                                      opus::number<T::WARP_SIZE / T::W_N>{},  // 4
                                                      opus::number<T::VEC_KV_ROPE>{});        // 8
 
-    constexpr auto rk_block_dim =
-        opus::make_tuple(opus::make_tuple(opus::p_dim{}),
-                         opus::make_tuple(opus::p_dim{}),
-                         opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
+    constexpr auto rk_block_dim = opus::make_tuple(opus::make_tuple(opus::p_dim{}),
+                                                   opus::make_tuple(opus::p_dim{}),
+                                                   opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
 
     auto lane_id_n = lane_id % T::W_N;
 
@@ -451,14 +450,13 @@ __device__ inline auto make_layout_rv(int lane_id)
 
     return opus::make_layout(
         rv_block_shape,
-        opus::unfold_x_stride(
-            rv_block_dim,
-            rv_block_shape,
-            opus::tuple{opus::number<T::D_128B_NOPE_SIZE>{},
-                        opus::number<line>{},
-                        opus::number<T::smem_n_rpt * T::D_128B_NOPE_SIZE + swz>{},
-                        opus::number<T::VEC_TR_V>{},
-                        1_I}),
+        opus::unfold_x_stride(rv_block_dim,
+                              rv_block_shape,
+                              opus::tuple{opus::number<T::D_128B_NOPE_SIZE>{},
+                                          opus::number<line>{},
+                                          opus::number<T::smem_n_rpt * T::D_128B_NOPE_SIZE + swz>{},
+                                          opus::number<T::VEC_TR_V>{},
+                                          1_I}),
         opus::unfold_p_coord(rv_block_dim,
                              opus::tuple{grp_id, lh % hi_lo, lh / hi_lo, lane_in_grp % lane_lo}));
 }
@@ -603,7 +601,6 @@ __device__ inline void attn_mask_vec2_imm(opus::u32_t rel_vgpr,
                  : "vcc");
 }
 
-
 template <typename T>
 __device__ inline int causal_kv_bound(int causal_diagonal, int nhead, int warp_id, int lane_id)
 {
@@ -614,7 +611,6 @@ __device__ inline int causal_kv_bound(int causal_diagonal, int nhead, int warp_i
     }
     return row / nhead + causal_diagonal;
 }
-
 
 template <typename T, typename V>
 __device__ inline void
@@ -1235,13 +1231,13 @@ mla_decode_fwd_one_req(opus_mla_decode_kargs kargs, int w, char* smem_kv, float 
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
     const opus_mla_decode_work_info work_item = kargs.work_info_set[w];
-    [[maybe_unused]] const int batch_idx = work_item.batch_idx;
-    const int slot                       = work_item.partial_slot;
-    const int q_len_ptr_s                = work_item.qo_start;
-    const int q_len_ptr_e                = work_item.qo_end;
-    const int kv_ind_ptr_s               = work_item.kv_start;
-    const int kv_ind_ptr_e               = work_item.kv_end;
-    [[maybe_unused]] const int kv_offset = work_item.kv_offset;
+    [[maybe_unused]] const int batch_idx      = work_item.batch_idx;
+    const int slot                            = work_item.partial_slot;
+    const int q_len_ptr_s                     = work_item.qo_start;
+    const int q_len_ptr_e                     = work_item.qo_end;
+    const int kv_ind_ptr_s                    = work_item.kv_start;
+    const int kv_ind_ptr_e                    = work_item.kv_end;
+    [[maybe_unused]] const int kv_offset      = work_item.kv_offset;
 
     const int q_len        = q_len_ptr_e - q_len_ptr_s;
     const int valid_kv_len = kv_ind_ptr_e - kv_ind_ptr_s;
@@ -1262,14 +1258,13 @@ mla_decode_fwd_one_req(opus_mla_decode_kargs kargs, int w, char* smem_kv, float 
     // Per-tensor descale folded into the two places it can be a single scalar multiply:
     // QK's descale_q*descale_k rides the softmax temperature, and V's descale_k is applied
     // once on the finished O below (the PV MFMA itself consumes raw fp8).
-    const float descale_q =
-        readfirstlane_f32(reinterpret_cast<const float*>(kargs.q_scale_ptr)[0]);
+    const float descale_q = readfirstlane_f32(reinterpret_cast<const float*>(kargs.q_scale_ptr)[0]);
     const float descale_k =
         readfirstlane_f32(reinterpret_cast<const float*>(kargs.kv_scale_ptr)[0]);
     const float qk_scale = readfirstlane_f32(temperature_scale * descale_q * descale_k);
 
     const int q_gmem_offset = q_len_ptr_s * kargs.stride_q_b;
-    auto g_q_nope = make_gmem(reinterpret_cast<const D_Q*>(kargs.q_ptr) + q_gmem_offset,
+    auto g_q_nope           = make_gmem(reinterpret_cast<const D_Q*>(kargs.q_ptr) + q_gmem_offset,
                               q_len * kargs.stride_q_b * sizeof(D_Q));
     auto g_q_rope =
         make_gmem(reinterpret_cast<const D_Q*>(kargs.q_ptr) + q_gmem_offset + T::D_NOPE_SIZE,
@@ -1345,17 +1340,18 @@ mla_decode_fwd_one_req(opus_mla_decode_kargs kargs, int w, char* smem_kv, float 
     }
 }
 
-} // namespace mla_decode_fwd_16mx8_32nx1_fp8fp8
+} // namespace mla_decode_fwd_16mx8_32nx1_a8w8
 
 // Persistent entry point: the grid is sized to the machine, not to the problem, and each
 // block drains the work items the metadata kernel assigned it through work_indptr. The
 // occupancy-2 launch bound is what caps the whole kernel at 256 VGPR.
 template <class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE,
-                             2) void opus_mla_decode_fp8_16mx8_32nx1_kernel(opus_mla_decode_kargs kargs)
+__global__
+__launch_bounds__(Traits::BLOCK_SIZE,
+                  2) void opus_mla_decode_a8w8_16mx8_32nx1_kernel(opus_mla_decode_kargs kargs)
 {
     using namespace opus;
-    using namespace mla_decode_fwd_16mx8_32nx1_fp8fp8;
+    using namespace mla_decode_fwd_16mx8_32nx1_a8w8;
     using T = opus::remove_cvref_t<Traits>;
 
     const int work_id = block_id_x();

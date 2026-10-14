@@ -1,6 +1,6 @@
 // Prebuilt code object for the fp8 32mx2 / 32nx2 MLA decode kernel, loaded by aiter's
-// AiterAsmKernel out of hsa/gfx950/mla_opus/opus_mla_decode_fp8_32mx2_32nx2.co. Build it with
-// build/build_mla_decode_fp8_32mx2_32nx2_co.sh: only the amdgpu-pin-op-dst toolchain honours the
+// AiterAsmKernel out of hsa/gfx950/mla_opus/opus_mla_decode_a8w8_32mx2_32nx2.co. Build it with
+// build/build_mla_decode_a8w8_32mx2_32nx2_co.sh: only the amdgpu-pin-op-dst toolchain honours the
 // register pins the kernel's register map depends on.
 //
 // extern "C", because AiterAsmKernel looks each entry up by this exact name. One entry per
@@ -8,11 +8,11 @@
 
 #include <hip/hip_runtime.h>
 
-#include "opus/mla_decode_fp8_32mx2_32nx2.hpp"
+#include "opus/mla_decode_a8w8_32mx2_32nx2.hpp"
 
 template <bool CAUSAL, bool LARGE_KV, bool CP = false>
 using mla32mx2_traits_t =
-    opus_mla_decode_fp8_32mx2_32nx2_traits<32, 64, 4, fp8_t, fp8_t, bf16_t, CAUSAL, LARGE_KV, 3,
+    opus_mla_decode_a8w8_32mx2_32nx2_traits<32, 64, 4, fp8_t, fp8_t, bf16_t, CAUSAL, LARGE_KV, 3,
                                            CP>;
 
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
@@ -22,7 +22,7 @@ using mla32mx2_traits_t =
 #define MLA32MX2_CO_ENTRY(name, causal, large, cp)                                                 \
     extern "C" __global__ __launch_bounds__(256, 1) void name(opus_mla_decode_kargs kargs) \
     {                                                                                           \
-        mla_decode_fwd_32mx2_32nx2_fp8fp8::mla_decode_fwd_persistent<                            \
+        mla_decode_fwd_32mx2_32nx2_a8w8::mla_decode_fwd_persistent<                            \
             mla32mx2_traits_t<causal, large, cp>>(kargs);                                       \
     }
 #else
@@ -30,12 +30,12 @@ using mla32mx2_traits_t =
     extern "C" __global__ void name(opus_mla_decode_kargs) {}
 #endif
 
-MLA32MX2_CO_ENTRY(opus_mla_decode_fp8_32mx2_32nx2_nc, false, false, false)
-MLA32MX2_CO_ENTRY(opus_mla_decode_fp8_32mx2_32nx2_causal, true, false, false)
-MLA32MX2_CO_ENTRY(opus_mla_decode_fp8_32mx2_32nx2_nc_large, false, true, false)
-MLA32MX2_CO_ENTRY(opus_mla_decode_fp8_32mx2_32nx2_causal_large, true, true, false)
-MLA32MX2_CO_ENTRY(opus_mla_decode_fp8_32mx2_32nx2_causal_cprr, true, false, true)
-MLA32MX2_CO_ENTRY(opus_mla_decode_fp8_32mx2_32nx2_causal_large_cprr, true, true, true)
+MLA32MX2_CO_ENTRY(opus_mla_decode_a8w8_32mx2_32nx2_nc, false, false, false)
+MLA32MX2_CO_ENTRY(opus_mla_decode_a8w8_32mx2_32nx2_causal, true, false, false)
+MLA32MX2_CO_ENTRY(opus_mla_decode_a8w8_32mx2_32nx2_nc_large, false, true, false)
+MLA32MX2_CO_ENTRY(opus_mla_decode_a8w8_32mx2_32nx2_causal_large, true, true, false)
+MLA32MX2_CO_ENTRY(opus_mla_decode_a8w8_32mx2_32nx2_causal_cprr, true, false, true)
+MLA32MX2_CO_ENTRY(opus_mla_decode_a8w8_32mx2_32nx2_causal_large_cprr, true, true, true)
 
 // The code object is frozen against this layout; a wrong offset is a compile error here
 // rather than garbage output.

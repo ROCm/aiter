@@ -1,9 +1,9 @@
 #!/bin/bash
-# Builds hsa/gfx950/mla_opus/opus_mla_decode_fp8_32mx4_64nx1.co with the amdgpu-pin-op-dst
+# Builds hsa/gfx950/mla_opus/opus_mla_decode_a8w8_32mx4_64nx1.co with the amdgpu-pin-op-dst
 # toolchain (git@github.com:yuyzhang512/llvm-project.git, branch amdgpu-pin-op-dst), driven
 # through hipcc so the ROCm device libs and --genco still apply.
 #
-#   PIN_LLVM=/path/to/llvm-project/build/bin ./build/build_mla_decode_fp8_32mx4_64nx1_co.sh
+#   PIN_LLVM=/path/to/llvm-project/build/bin ./build/build_mla_decode_a8w8_32mx4_64nx1_co.sh
 #
 # The flags are the code generation aiter's JIT gives its in-tree kernels; -Rpass-analysis
 # prints each entry's register budget.
@@ -13,11 +13,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OPUS="$(cd "$HERE/.." && pwd)"
 AITER="$(cd "$OPUS/../../../.." && pwd)"
 PIN_LLVM="${PIN_LLVM:-$HOME/llvm-project/build/bin}"
-OUT="${OUT:-$AITER/hsa/gfx950/mla_opus/opus_mla_decode_fp8_32mx4_64nx1.co}"
+OUT="${OUT:-$AITER/hsa/gfx950/mla_opus/opus_mla_decode_a8w8_32mx4_64nx1.co}"
 
 [ -x "$PIN_LLVM/clang++" ] || { echo "no pin toolchain at $PIN_LLVM" >&2; exit 1; }
 
-HIP_CLANG_PATH="$PIN_LLVM" /opt/rocm/bin/hipcc -x hip "$OPUS/mla_decode_fp8_32mx4_64nx1_co.hip" \
+HIP_CLANG_PATH="$PIN_LLVM" /opt/rocm/bin/hipcc -x hip "$OPUS/mla_decode_a8w8_32mx4_64nx1_co.hip" \
     -I"$AITER/csrc/include" -I"$AITER/csrc/kernels/mla" \
     -std=c++20 -O3 --offload-arch=gfx950 -D__HIPCC_RTC__ \
     -ffast-math -fgpu-flush-denormals-to-zero -fno-offload-uniform-block \

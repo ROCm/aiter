@@ -121,7 +121,7 @@ __host__ __device__ inline int cp_local_bound(int g, int world, int kv_off)
 
 // ============================================================================
 // Traits for the *combined* fp8 MLA decode kernel (mla_decode_fwd_16mx8_32nx1
-// mla_decode_fp8_16mx8_32nx1.hpp).
+// mla_decode_a8w8_16mx8_32nx1.hpp).
 //
 // Differences vs. opus_mla_decode_mxfp8_16mx8_32nx1_traits above:
 //   1. q_buffer / kv_buffer are a *single* contiguous d = D_HEAD_SIZE = 576 fp8
@@ -146,7 +146,7 @@ template <int Q_TILE_SIZE_        = 16,
           bool CAUSAL_            = false,
           bool LARGE_KV_          = false,
           bool WAVE_SPANS_TOKENS_ = false>
-struct opus_mla_decode_fp8_16mx8_32nx1_traits
+struct opus_mla_decode_a8w8_16mx8_32nx1_traits
 {
     static constexpr int Q_TILE_SIZE        = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE       = KV_TILE_SIZE_;
@@ -154,7 +154,7 @@ struct opus_mla_decode_fp8_16mx8_32nx1_traits
     static constexpr bool CAUSAL            = CAUSAL_;
     static constexpr bool WAVE_SPANS_TOKENS = WAVE_SPANS_TOKENS_;
     // KV cache past the 4 GiB a buffer descriptor can address; see the KV load in
-    // mla_decode_fp8_16mx8_32nx1.hpp. Costs ~1-2% and 3 spilled VGPR, so
+    // mla_decode_a8w8_16mx8_32nx1.hpp. Costs ~1-2% and 3 spilled VGPR, so
     // the host only turns it on for the caches that need it.
     static constexpr bool LARGE_KV = LARGE_KV_;
 
@@ -277,7 +277,7 @@ template <int Q_TILE_SIZE_  = 16,
           bool CAUSAL_      = false,
           bool LARGE_KV_    = false,
           int PAGE_SIZE_    = 1>
-struct opus_mla_decode_fp8_16mx1_16nx8_traits
+struct opus_mla_decode_a8w8_16mx1_16nx8_traits
 {
     static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
@@ -300,7 +300,7 @@ struct opus_mla_decode_fp8_16mx1_16nx8_traits
     static_assert(PAGE_SIZE == 1 || PAGE_SIZE == 2 || PAGE_SIZE == 4,
                   "PAGE_SIZE must be 1, 2 or 4");
     // KV cache past the 4 GiB a buffer descriptor can address; see the KV load in
-    // mla_decode_fp8_16mx1_16nx8.hpp. Costs ~1-2% and 3 spilled VGPR, so
+    // mla_decode_a8w8_16mx1_16nx8.hpp. Costs ~1-2% and 3 spilled VGPR, so
     // the host only turns it on for the caches that need it.
     static constexpr bool LARGE_KV = LARGE_KV_;
 
@@ -449,7 +449,7 @@ template <int Q_TILE_SIZE_     = 32,
           bool LARGE_KV_       = false,
           int KV_SLOTS_        = 3,
           bool CP_ROUND_ROBIN_ = false>
-struct opus_mla_decode_fp8_32mx4_64nx1_traits
+struct opus_mla_decode_a8w8_32mx4_64nx1_traits
 {
     static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;  // query rows one wave owns
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_; // tokens one tile carries
@@ -583,7 +583,7 @@ template <int Q_TILE_SIZE_     = 32,
           bool LARGE_KV_       = false,
           int KV_SLOTS_        = 3,
           bool CP_ROUND_ROBIN_ = false>
-struct opus_mla_decode_fp8_32mx2_32nx2_traits
+struct opus_mla_decode_a8w8_32mx2_32nx2_traits
 {
     static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;  // query rows one wave pair owns
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_; // tokens one tile carries
@@ -722,7 +722,7 @@ template <int Q_TILE_SIZE_  = 16,
           bool CAUSAL_      = false,
           bool LARGE_KV_    = false,
           int KV_SLOTS_     = 2>
-struct opus_mla_decode_fp8_16mx1_32nx4_traits
+struct opus_mla_decode_a8w8_16mx1_32nx4_traits
 {
     static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_; // tokens in one K LDS group

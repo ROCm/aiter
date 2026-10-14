@@ -49,7 +49,7 @@
 #if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
 
 template <class Traits>
-__global__ void opus_mla_decode_fp8_32mx2_32nx2_kernel(opus_mla_decode_kargs)
+__global__ void opus_mla_decode_a8w8_32mx2_32nx2_kernel(opus_mla_decode_kargs)
 {
 }
 
@@ -64,7 +64,7 @@ __global__ void opus_mla_decode_fp8_32mx2_32nx2_kernel(opus_mla_decode_kargs)
 
 using opus::operator""_I;
 
-namespace mla_decode_fwd_32mx2_32nx2_fp8fp8 {
+namespace mla_decode_fwd_32mx2_32nx2_a8w8 {
 
 // Register pins, live only under the amdgpu-pin-op-dst toolchain. A pin binds a definition.
 #if defined(__has_cpp_attribute)
@@ -1228,14 +1228,14 @@ mla_decode_fwd_persistent(opus_mla_decode_kargs kargs)
     }
 }
 
-} // namespace mla_decode_fwd_32mx2_32nx2_fp8fp8
+} // namespace mla_decode_fwd_32mx2_32nx2_a8w8
 
 template <class Traits>
 __global__
 __launch_bounds__(Traits::BLOCK_SIZE,
-                  1) void opus_mla_decode_fp8_32mx2_32nx2_kernel(opus_mla_decode_kargs kargs)
+                  1) void opus_mla_decode_a8w8_32mx2_32nx2_kernel(opus_mla_decode_kargs kargs)
 {
-    mla_decode_fwd_32mx2_32nx2_fp8fp8::mla_decode_fwd_persistent<Traits>(kargs);
+    mla_decode_fwd_32mx2_32nx2_a8w8::mla_decode_fwd_persistent<Traits>(kargs);
 }
 
 #endif // !__HIP_DEVICE_COMPILE__ || !__gfx950__

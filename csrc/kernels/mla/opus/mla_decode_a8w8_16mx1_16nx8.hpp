@@ -130,7 +130,7 @@
 #if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
 
 template <class Traits>
-__global__ void opus_mla_decode_fp8_16mx1_16nx8_kernel(opus_mla_decode_kargs)
+__global__ void opus_mla_decode_a8w8_16mx1_16nx8_kernel(opus_mla_decode_kargs)
 {
 }
 
@@ -152,7 +152,7 @@ __global__ void opus_mla_decode_fp8_16mx1_16nx8_kernel(opus_mla_decode_kargs)
 
 using opus::operator""_I;
 
-namespace opus_mla_decode_fp8_16mx1_16nx8 {
+namespace opus_mla_decode_a8w8_16mx1_16nx8 {
 
 // Moves a wave-uniform float into an SGPR. gfx950 has no scalar float ALU, so anything
 // computed from uniform inputs still lands in a VGPR and stays live there. The bit_cast is
@@ -1002,7 +1002,7 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
     }
 
     const int q_gmem_offset = q_len_ptr_s * kargs.stride_q_b;
-    auto g_q_nope = make_gmem(reinterpret_cast<const D_Q*>(kargs.q_ptr) + q_gmem_offset,
+    auto g_q_nope           = make_gmem(reinterpret_cast<const D_Q*>(kargs.q_ptr) + q_gmem_offset,
                               q_len * kargs.stride_q_b * sizeof(D_Q));
     auto g_q_rope =
         make_gmem(reinterpret_cast<const D_Q*>(kargs.q_ptr) + q_gmem_offset + T::D_NOPE_SIZE,
@@ -1348,8 +1348,10 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
 // means this item owns the whole request and writes the real output; otherwise it is one
 // split-KV partial and writes o_accum / lse_accum for the reduce kernel to merge.
 template <class Traits, bool STAGGER>
-__device__ __attribute__((always_inline)) void
-mla_decode_fwd_one_req(opus_mla_decode_kargs kargs, int w, char* smem_buffer, float temperature_scale)
+__device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(opus_mla_decode_kargs kargs,
+                                                                      int w,
+                                                                      char* smem_buffer,
+                                                                      float temperature_scale)
 {
     using namespace opus;
     using T     = opus::remove_cvref_t<Traits>;
@@ -1361,13 +1363,13 @@ mla_decode_fwd_one_req(opus_mla_decode_kargs kargs, int w, char* smem_buffer, fl
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
     const opus_mla_decode_work_info work_item = kargs.work_info_set[w];
-    [[maybe_unused]] const int batch_idx = work_item.batch_idx;
-    const int slot                       = work_item.partial_slot;
-    const int q_len_ptr_s                = work_item.qo_start;
-    const int q_len_ptr_e                = work_item.qo_end;
-    const int kv_ind_ptr_s               = work_item.kv_start;
-    const int kv_ind_ptr_e               = work_item.kv_end;
-    [[maybe_unused]] const int kv_offset = work_item.kv_offset;
+    [[maybe_unused]] const int batch_idx      = work_item.batch_idx;
+    const int slot                            = work_item.partial_slot;
+    const int q_len_ptr_s                     = work_item.qo_start;
+    const int q_len_ptr_e                     = work_item.qo_end;
+    const int kv_ind_ptr_s                    = work_item.kv_start;
+    const int kv_ind_ptr_e                    = work_item.kv_end;
+    [[maybe_unused]] const int kv_offset      = work_item.kv_offset;
 
     const int q_len = q_len_ptr_e - q_len_ptr_s;
 
@@ -1488,17 +1490,18 @@ mla_decode_fwd_one_req(opus_mla_decode_kargs kargs, int w, char* smem_buffer, fl
     }
 }
 
-} // namespace opus_mla_decode_fp8_16mx1_16nx8
+} // namespace opus_mla_decode_a8w8_16mx1_16nx8
 
 // Persistent entry point: the grid is sized to the machine, not to the problem, and each
 // block drains the work items the metadata kernel assigned it through work_indptr. The
 // occupancy-2 launch bound is what caps the whole kernel at 256 VGPR.
 template <class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE,
-                             2) void opus_mla_decode_fp8_16mx1_16nx8_kernel(opus_mla_decode_kargs kargs)
+__global__
+__launch_bounds__(Traits::BLOCK_SIZE,
+                  2) void opus_mla_decode_a8w8_16mx1_16nx8_kernel(opus_mla_decode_kargs kargs)
 {
     using namespace opus;
-    using namespace opus_mla_decode_fp8_16mx1_16nx8;
+    using namespace opus_mla_decode_a8w8_16mx1_16nx8;
     using T = opus::remove_cvref_t<Traits>;
 
     const int work_id = block_id_x();

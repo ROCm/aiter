@@ -51,7 +51,7 @@
 #if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
 
 template <class Traits>
-__global__ void opus_mla_decode_fp8_32mx4_64nx1_kernel(opus_mla_decode_kargs)
+__global__ void opus_mla_decode_a8w8_32mx4_64nx1_kernel(opus_mla_decode_kargs)
 {
 }
 
@@ -66,7 +66,7 @@ __global__ void opus_mla_decode_fp8_32mx4_64nx1_kernel(opus_mla_decode_kargs)
 
 using opus::operator""_I;
 
-namespace mla_decode_fwd_32mx4_64nx1_fp8fp8 {
+namespace mla_decode_fwd_32mx4_64nx1_a8w8 {
 
 // Register pins. Only the amdgpu-pin-op-dst toolchain knows the attributes, and only there do
 // the macros expand to them, so the .co build and a stock compile share one source. A pin
@@ -1366,18 +1366,18 @@ mla_decode_fwd_persistent(opus_mla_decode_kargs kargs)
     }
 }
 
-} // namespace mla_decode_fwd_32mx4_64nx1_fp8fp8
+} // namespace mla_decode_fwd_32mx4_64nx1_a8w8
 
 // The register map above only holds with the amdgpu-pin-op-dst toolchain, which is how the
-// prebuilt code object is built (see mla_decode_fp8_32mx4_64nx1_co.hip). A stock ROCm 7.1 clang
+// prebuilt code object is built (see mla_decode_a8w8_32mx4_64nx1_co.hip). A stock ROCm 7.1 clang
 // selects every MFMA in AGPR form at 512 registers per lane, and O (256) plus the two score
 // buffers (64) do not fit 256 AGPRs: that build spills heavily and is kept for reference only.
 template <class Traits>
 __global__
 __launch_bounds__(Traits::BLOCK_SIZE,
-                  1) void opus_mla_decode_fp8_32mx4_64nx1_kernel(opus_mla_decode_kargs kargs)
+                  1) void opus_mla_decode_a8w8_32mx4_64nx1_kernel(opus_mla_decode_kargs kargs)
 {
-    mla_decode_fwd_32mx4_64nx1_fp8fp8::mla_decode_fwd_persistent<Traits>(kargs);
+    mla_decode_fwd_32mx4_64nx1_a8w8::mla_decode_fwd_persistent<Traits>(kargs);
 }
 
 #endif // !__HIP_DEVICE_COMPILE__ || !__gfx950__
