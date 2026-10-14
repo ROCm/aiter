@@ -193,9 +193,8 @@ class CompilePool:
                 chunk = f.read()
         except OSError:
             return
-        whole = chunk[
-            : chunk.rfind(b"\n") + 1
-        ]  # a line being written waits for the next call
+        # a line still being written waits for the next call
+        whole = chunk[: chunk.rfind(b"\n") + 1]
         self.offset += len(whole)
         self.compiled.update(whole.decode().splitlines())
 

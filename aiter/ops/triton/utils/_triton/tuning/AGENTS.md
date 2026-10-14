@@ -66,8 +66,9 @@ here. Update this file in the same change as any behaviour change.
    `<results>.final.jsonl`, with the same crash/hang recovery as the sweep; when that file exists
    the installer uses only it, so a later run (even on one GPU) always refreshes it, and an M timed
    on several GPUs without it is skipped. Never two drivers on one GPU. `--compile-procs` workers
-   (`harness.py --precompile`) only compile, never launch, and run on `--compile-gpus`, which must
-   not be timing GPUs because their input set-up runs kernels. `--screen X` stops a candidate after
+   (`harness.py --precompile --claim`) only compile, never launch, and run on `--compile-gpus`,
+   which must not be timing GPUs because their input set-up runs kernels; timing workers get
+   `--pool` and time what the pool has compiled first, so they never duplicate its compiles. `--screen X` stops a candidate after
    one replay when it is slower than X times the fastest fully timed record of its M (`screened`);
    it never applies to the baseline or the final round.
 9. Call the public wrappers (`aiter.ops.triton.gemm...`) only, never `_triton_kernels` or

@@ -122,7 +122,11 @@ Compiling is most of the time per candidate, and it uses only the CPU. With
 `--compile-procs N --compile-gpus G ...` the driver plans every M first, then N compile-only
 workers (`harness.py --precompile --claim`) fill the Triton cache M by M while the timing
 workers run. The workers claim the candidates of one shared list in sweep order, so a slow
-compile holds up only its own candidate. A candidate that does not compile gets its `error` record from the pool
+compile holds up only its own candidate. The driver writes every M's list up front
+(`<results>.pre.todo.json`, with `.next` and `.done`), and each timing worker (`--pool`) times
+the candidates the pool has finished first: a timing GPU never waits for a compile that the pool
+is already doing. When nothing is ready, the timing worker compiles the pool's next candidate
+itself; when the pool has finished an M, its files go and the timing workers compile on their own. A candidate that does not compile gets its `error` record from the pool
 (`compile_ahead` in the record), so its failed compile is not repeated. The compile GPUs only hold the inputs; they must not be in `--gpu`. The
 timing workers compile what the pool has not reached yet, so the results do not change.
 
