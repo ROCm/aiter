@@ -784,6 +784,36 @@ def test_fmha_fp8(name, causal):
     return ret
 
 
+# Pre-existing pytest contract tests live in a separate module; the sweeps above
+# are script-style and do not cover routing, rejection or launch-argument contracts.
+from op_tests.flydsl_fmha_extended import (  # noqa: F401
+    test_flydsl_fmha_correctness_multi_device,
+    test_flydsl_fmha_rejects_cross_attention,
+    test_flydsl_fmha_rejects_device_mismatch,
+    test_flydsl_fmha_rejects_dtype_mismatch,
+    test_flydsl_fmha_rejects_excessive_padding,
+    test_flydsl_fmha_rejects_unsupported_head_dim,
+    test_fp8_auto_block_m_picks,
+    test_fp8_default_is_the_lazy_rescale,
+    test_fp8_dispatch_matches_direct_call,
+    test_fp8_dispatch_rejects_bf16_inputs,
+    test_fp8_dispatch_rejects_descale_on_another_device,
+    test_fp8_dispatch_rejects_unsupported,
+    test_fp8_dispatch_return_lse,
+    test_fp8_flat_overflow_guard_covers_every_tensor,
+    test_fp8_rejected_head_dims_raise_before_launch,
+    test_fp8_repeat_launch_is_bit_exact_under_load,
+    test_fp8_rescale_threshold_drops_past_the_long_sequence_bound,
+    test_fp8_short_causal_split_kv_rejected,
+    test_fp8_softmax_scale_cpu_dispatch_contract,
+    test_fp8_softmax_scale_cpu_launch_arguments,
+    test_fp8_softmax_scale_rejects_invalid,
+    test_fp8_split_result_survives_a_non_current_stream,
+    test_fp8_supported_config,
+    test_fp8_supported_cpu_does_not_query_gpu,
+)
+
+
 def main():
     arch, build = get_gfx_runtime(), get_gfx()
     if build != arch or arch not in ("gfx1201", "gfx950"):

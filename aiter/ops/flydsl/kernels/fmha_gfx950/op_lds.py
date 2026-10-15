@@ -112,6 +112,23 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
         else:
             self._load_k_bands(k_div, tile_start, k_lds_byte_base)
 
+    def _shuffled_k_src_elem(self, global_d, n_in_tile, tile_start):
+        """Element index of a shuffled-layout K chunk, or an OOB sentinel past the tail."""
+        traits = self.traits
+        layout = fx.make_layout(
+            (traits.HEAD_DIM // 16, traits.BLOCK_N, 16),
+            (traits.BLOCK_N * 16, 16, 1),
+        )
+        src_elem = self.kv_gmem_elem_offset + fx.Index(
+            fx.get_scalar(
+                fx.crd2idx((fx.Int32(global_d // 16), fx.Int32(n_in_tile), 0), layout)
+            )
+        )
+        # Shuffled tokens are strided across the page, so a prefix descriptor
+        # bound cannot mask the logical K tail.
+        valid = n_in_tile + tile_start < self.seqlen_kv_v
+        return valid.select(src_elem, fx.Index(0x7FFFFFF0))
+
     def _load_k_bn64(self, k_div, tile_start, k_lds_byte_base):
         traits = self.traits
         for pas in range_constexpr(2):
@@ -124,14 +141,7 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
                 self.kv_gmem_elem_offset + n_in_tile * self.stride_kv_n_v + global_d
             )
             if const_expr(traits.K_SHUFFLED):
-                src_elem = (
-                    self.kv_gmem_elem_offset
-                    + global_d // 16 * traits.BLOCK_N * 16
-                    + n_in_tile * 16
-                )
-                # A prefix descriptor bound cannot mask the shuffled logical tail.
-                valid = n_in_tile + tile_start < self.seqlen_kv_v
-                src_elem = valid.select(src_elem, fx.Index(0x7FFFFFF0))
+                src_elem = self._shuffled_k_src_elem(global_d, n_in_tile, tile_start)
             lds_addr = k_lds_byte_base + stripe * traits.K_BAND_LINE_STRIDE[0]
             self.buffer_load_lds_128(k_div, lds_addr, src_elem, 0)
 
@@ -157,22 +167,9 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
                     self.kv_gmem_elem_offset + n_in_tile * self.stride_kv_n_v + global_d
                 )
                 if const_expr(traits.K_SHUFFLED):
-                    layout = fx.make_layout(
-                        (traits.HEAD_DIM // 16, traits.BLOCK_N, 16),
-                        (traits.BLOCK_N * 16, 16, 1),
+                    src_elem = self._shuffled_k_src_elem(
+                        global_d, n_in_tile, tile_start
                     )
-                    src_elem = self.kv_gmem_elem_offset + fx.Index(
-                        fx.get_scalar(
-                            fx.crd2idx(
-                                (fx.Int32(global_d // 16), fx.Int32(n_in_tile), 0),
-                                layout,
-                            )
-                        )
-                    )
-                    # Shuffled tokens are strided across the page, so a prefix
-                    # descriptor bound cannot mask the logical K tail.
-                    valid = n_in_tile + tile_start < self.seqlen_kv_v
-                    src_elem = valid.select(src_elem, fx.Index(0x7FFFFFF0))
                 lds_addr = band_base + pas * traits.WARP_SIZE * traits.VEC_KV * eb
                 active = min(slots - pas * traits.WARP_SIZE, traits.WARP_SIZE)
                 if const_expr(active == traits.WARP_SIZE):
@@ -358,7 +355,7 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
                     count = (count < 4).select(count, fx.Int32(4))
                     # Shift a 32-bit all-ones word; avoid shifting by the word width.
                     shift = (count > 0).select((4 - count) * 8, fx.Int32(24))
-                    mask = fx.Int32(-1).shrui(shift)
+                    mask = fx.arith.shrui(fx.Int32(-1), shift)
                     masks.append((count > 0).select(mask, fx.Int32(0)))
         packs = [[None] * traits.D_CHUNKS for _ in range(4)]
         for dc in range_constexpr(traits.D_CHUNKS):

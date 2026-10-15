@@ -517,6 +517,9 @@ def test_pa_decode(case, device, monkeypatch):
 
 
 # Keep branch cases in a separate namespace because main changed the helper ABI.
+# The autouse fixture applies only to tests collected in its defining module, so
+# it must be imported here too.
+from op_tests.flydsl_pa_decode_extended import _default_cuda_device  # noqa: F401
 from op_tests.flydsl_pa_decode_extended import (  # noqa: F401
     test_pa_decode as test_pa_decode_extended,
 )

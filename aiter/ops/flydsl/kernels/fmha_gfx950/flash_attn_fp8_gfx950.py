@@ -6,10 +6,8 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
-from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
 from aiter.ops.flydsl.kernels.fmha_gfx950.op_combine import (
@@ -240,7 +238,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         pages = [None] * 4
         if const_expr(traits.PAGED):
             kv_gmem_to_lds.load_block_table_to_lds()
-            rocdl.s_waitcnt(0)
+            rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             rocdl.s_barrier()
             pages = kv_gmem_to_lds.end_page_ids(
                 kv_gmem_to_lds.begin_page_ids(
@@ -251,7 +249,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         kv_gmem_to_lds.load_k(t0 * BN, t0 % NPF_I, pages[0])
         if const_expr(traits.QLDS):
             q_loader.stage_q_to_lds()
-            rocdl.s_waitcnt(0)
+            rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             rocdl.sched_barrier(0)
             rocdl.s_barrier()
             q_row, q_wide = _load_q_regs()
@@ -264,7 +262,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         kv_gmem_to_lds.load_v((t0 + 2) * BN, (t0 + 2) % NPF_I, pages[2])
         kv_gmem_to_lds.load_v((t0 + 3) * BN, (t0 + 3) % NPF_I, pages[3])
         if const_expr(traits.QLDS):
-            rocdl.s_waitcnt(0)
+            rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
         else:
             _waitcnt_vm_n(DMA_PER_ITER)
         rocdl.sched_barrier(0)
@@ -349,7 +347,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
         l_row = loop_results[1]
         v_o = [loop_results[2 + i] for i in range_constexpr(D_CHUNKS)]
 
-        inv_l_rcp = rocdl.rcp(T.f32, _raw(l_row))
+        # No stable approximate-reciprocal API at v0.3.4.1: 1.0 / x lowers to arith.divf (IEEE).
+        inv_l_rcp = rocdl.rcp(T.f32, fx.as_ir_value(l_row))
         inv_l = fx.Float32(
             (fx.Float32(l_row) > ctx.c_zero_f).select(inv_l_rcp, ctx.c_zero_f)
         )
@@ -379,7 +378,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
 
         kv_gmem_to_lds.load_block_table_to_lds()
         q_loader.stage_q_to_lds()
-        rocdl.s_waitcnt(0)
+        rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
         rocdl.s_barrier()
         page = kv_gmem_to_lds.end_page_ids(kv_gmem_to_lds.begin_page_ids([t0]))[0]
         kv_gmem_to_lds.load_k(t0 * BN, fx.Int32(0), page)
@@ -401,7 +400,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
             buf = fx.Int32(j) % fx.Int32(2)
             next_buf = fx.Int32(1) - buf
             # Publish the prefetched tile and release the slot all waves last read.
-            rocdl.s_waitcnt(0)
+            rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             rocdl.sched_barrier(0)
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
@@ -440,12 +439,13 @@ def build_flash_attn_dualwave_swp_fp8_module(
         m_row = loop_results[0]
         l_row = loop_results[1]
         v_o = [loop_results[2 + i] for i in range_constexpr(D_CHUNKS)]
-        inv_l_rcp = rocdl.rcp(T.f32, _raw(l_row))
+        # No stable approximate-reciprocal API at v0.3.4.1: 1.0 / x lowers to arith.divf (IEEE).
+        inv_l_rcp = rocdl.rcp(T.f32, fx.as_ir_value(l_row))
         inv_l = fx.Float32(
             (fx.Float32(l_row) > ctx.c_zero_f).select(inv_l_rcp, ctx.c_zero_f)
         )
         softmax_helper.scale_o(v_o, inv_l * ctx.vd_fp8)
-        rocdl.s_waitcnt(0)
+        rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
         rocdl.s_barrier()
         output_store.store_final_o(v_o, q_row, m_row, l_row)
 
@@ -864,17 +864,15 @@ def build_flash_attn_dualwave_swp_fp8_module(
             args = args[:-1] + (block_table, block_table_stride, args[-1])
         return args
 
+    # Hints ride the launcher (public JitFunction attribute) instead of a
+    # CompilationContext scope around each call.
+    launch_flash_attn_dualwave_swp.compile_hints = dict(_dualwave_swp_compile_hints)
+
     def _launch(*args, **kwargs):
-        with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
-            return _run_compiled(
-                launch_flash_attn_dualwave_swp, *_prepare(*args, **kwargs)
-            )
+        return _run_compiled(launch_flash_attn_dualwave_swp, *_prepare(*args, **kwargs))
 
     def _compile(*args, **kwargs):
-        with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
-            return flyc.compile(
-                launch_flash_attn_dualwave_swp, *_prepare(*args, **kwargs)
-            )
+        return flyc.compile(launch_flash_attn_dualwave_swp, *_prepare(*args, **kwargs))
 
     _launch.compile = _compile
 

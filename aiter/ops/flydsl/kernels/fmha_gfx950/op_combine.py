@@ -187,7 +187,7 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
         @flyc.jit
         def _accum_split(acc, den):
             if fx.Float32(l_i) > fx.Float32(0.0):
-                w = fx.Float32(m_i - m_max).exp2(fastmath="afn").ir_value()
+                w = fx.math.exp2(fx.Float32(m_i - m_max), fastmath="afn").ir_value()
                 wl = w * l_i
                 den = den + wl
                 o2_raw = buffer_ops.buffer_load(
@@ -210,6 +210,7 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
         return acc, den
 
     def pack_output(self, acc, den):
+        # No stable approximate-reciprocal API at v0.3.4.1: 1.0 / x lowers to arith.divf (IEEE).
         inv_rcp = rocdl.rcp(T.f32, den)
         inv = (fx.Float32(den) > self.c_zero_f).select(inv_rcp, self.c_zero_f)
         inv4 = Vec.from_elements([fx.Float32(inv)], fx.Float32).broadcast_to(4)

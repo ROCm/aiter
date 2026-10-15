@@ -84,6 +84,8 @@ def _attn_mask_vec2_imm(rel_i32, neg_inf_i32, thr_x, thr_y, x_ref_i32, y_ref_i32
 def _reduction_pair(v_f32):
     v_i32 = _bitcast_i32(v_f32)
     pair_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
+    # No stable dual-output lane-swap API at v0.3.4.1; fx.gpu.shuffle_xor is not
+    # one-for-one (single result, different lowering).
     swapped = rocdl.permlane32_swap(pair_ty, v_i32, v_i32, False, True)
     lhs_i32 = llvm.extractvalue(T.i32, swapped, [0])
     rhs_i32 = llvm.extractvalue(T.i32, swapped, [1])
@@ -201,13 +203,13 @@ def _exp2_score_slice(v_s, start):
         s_lo = [Vec(v_s[0])[r] for r in range_constexpr(16)]
         lo_partial = []
         for r in range_constexpr(16):
-            lo_partial.append(fx.Float32(s_lo[r]).exp2(fastmath="afn"))
+            lo_partial.append(fx.math.exp2(fx.Float32(s_lo[r]), fastmath="afn"))
         return Vec.from_elements(lo_partial, fx.Float32).ir_value(), v_s[1]
 
     lo_partial = [Vec(v_s[0])[r] for r in range_constexpr(16)]
     hi_full = []
     for r in range_constexpr(16):
-        hi_full.append(fx.Float32(Vec(v_s[1])[r]).exp2(fastmath="afn"))
+        hi_full.append(fx.math.exp2(fx.Float32(Vec(v_s[1])[r]), fastmath="afn"))
     return lo_partial, hi_full
 
 
@@ -275,6 +277,10 @@ def _make_page_view(base_iter, page_id, page_byte_stride, page_nrec_bytes, page_
         address_space=base_ty.address_space,
         alignment=base_ty.alignment,
     )
+    # fx.add_offset on an existing buffer descriptor truncates the offset to i32 and
+    # keeps the original resource, which would reintroduce the int32 page-offset overflow
+    # and lose the page-local bound. Shift the global pointer in i64 before building a
+    # fresh descriptor with an explicit num_records instead.
     shifted = fx.inttoptr(byte_ptr_ty, base_i64 + off_i64)
     buf_ptr = fx.rocdl.make_buffer_ptr(shifted, num_records_bytes=page_nrec_bytes)
     return fx.logical_divide(fx.make_view(buf_ptr, page_layout), fx.make_layout(1, 1))
@@ -704,6 +710,8 @@ def _init_dualwave_thread_mapping(ctx):
     Sets h_idx / q_block_idx / batch_idx / split_idx and the lane decomposition."""
     traits = ctx.traits
     batch_interleave_group = traits.BATCH_INTERLEAVE_GROUP
+    # fx.Index over gpu.block_idx: gpu.block_id is not in the stable gpu.__all__ at
+    # v0.3.4.1, and fx.Int64(gpu.block_idx.*) materializes an i32 first.
     if const_expr(batch_interleave_group > 1):
         linear_head_batch = fx.Index(gpu.block_idx.x)
         ctx.h_idx = linear_head_batch % traits.NUM_HEADS_Q
@@ -749,14 +757,17 @@ def _init_dualwave_thread_mapping(ctx):
     ctx.wave_id_uni = fx.Index(_wave_id_uni_i32)
 
     ctx.wave_q_offset = ctx.wave_id * traits.ROWS_PER_WAVE
-    ctx.q_start = ctx.q_block_idx * traits.BLOCK_M
+    # Packed GQA tiles BLOCK_M packed rows, i.e. BLOCK_M // group query tokens.
+    block_q = traits.BLOCK_M
+    if const_expr(traits.GQA_PACK_M):
+        block_q = traits.BLOCK_M // traits.GQA_GROUP_SIZE
+    ctx.q_start = ctx.q_block_idx * block_q
 
     ctx.h_kv_idx = ctx.h_idx % traits.NUM_HEADS_KV
     ctx.group_id = ctx.h_idx // traits.NUM_HEADS_KV
     ctx.q_head_idx = ctx.h_kv_idx * traits.GQA_GROUP_SIZE + ctx.group_id
     ctx.kv_head_idx = ctx.h_kv_idx
     if const_expr(traits.GQA_PACK_M):
-        ctx.q_start = ctx.q_block_idx * (traits.BLOCK_M // traits.GQA_GROUP_SIZE)
         ctx.q_head_idx = ctx.h_kv_idx * traits.GQA_GROUP_SIZE
 
 
@@ -767,6 +778,8 @@ def _init_dualwave_q_row(ctx):
     ctx.q_start_pos_i32 = fx.Int32(ctx.q_start + ctx.wave_id_uni * traits.ROWS_PER_WAVE)
     ctx.q_row = ctx.q_start + ctx.q_row_in_block
     if const_expr(traits.GQA_PACK_M):
+        # Manual quotient/remainder: idx2crd would emit a modulo for every mode,
+        # including the outermost, where the plain division suffices.
         ctx.q_row = ctx.q_start + ctx.q_row_in_block // traits.GQA_GROUP_SIZE
         ctx.q_head_row = ctx.q_head_idx + ctx.q_row_in_block % traits.GQA_GROUP_SIZE
         ctx.q_start_pos_i32 = fx.Int32(
@@ -869,14 +882,12 @@ class DualwaveFp8KernelContext:
         init_sequence_lengths / init_tile_bounds / init_q_row read q_start.
         """
         traits = self.traits
-        num_q_blocks = (self.seq_len_v + traits.BLOCK_M - 1) // traits.BLOCK_M
-        self.q_block_idx = num_q_blocks - 1 - self.q_block_idx
-        self.q_start = self.q_block_idx * traits.BLOCK_M
+        block_q = traits.BLOCK_M
         if const_expr(traits.GQA_PACK_M):
             block_q = traits.BLOCK_M // traits.GQA_GROUP_SIZE
-            num_q_blocks = (self.seq_len_v + block_q - 1) // block_q
-            self.q_block_idx = num_q_blocks - 1 - fx.Index(gpu.block_idx.y)
-            self.q_start = self.q_block_idx * block_q
+        num_q_blocks = (self.seq_len_v + block_q - 1) // block_q
+        self.q_block_idx = num_q_blocks - 1 - fx.Index(gpu.block_idx.y)
+        self.q_start = self.q_block_idx * block_q
 
     def init_lds(self, shared_storage):
         lds = fx.SharedAllocator().allocate(shared_storage).peek()
@@ -1199,7 +1210,7 @@ class DualwaveFp8KernelContext:
 
     def global_idx_o(self, token_idx, col):
         """Element index into O, which is HEAD_DIM_V wide (not HEAD_DIM)."""
-        if self.traits.GQA_PACK_M:
+        if const_expr(self.traits.GQA_PACK_M):
             return (
                 (self.q_tok_base + token_idx) * self.stride_o_n_v
                 + self.ctx_ref.q_head_row * self.traits.HEAD_DIM_V

@@ -31,9 +31,9 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
         """
         if const_expr(self.traits.OUT_F16):
             v2 = rocdl.cvt_pkrtz(
-                Vec.make_type(2, fx.Float16), as_mlir_value(a), as_mlir_value(b)
+                Vec.make_type(2, fx.Float16), fx.as_ir_value(a), fx.as_ir_value(b)
             )
-            return as_mlir_value(Vec(v2, (2,), fx.Float16).bitcast(fx.Int32)[0])
+            return fx.as_ir_value(Vec(v2, (2,), fx.Float16).bitcast(fx.Int32)[0])
         return rocdl.cvt_pk_bf16_f32(a, b)
 
     def _o_pack_2dw(self, v_o, dc, store_group):
@@ -44,6 +44,8 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
 
     def _swap_half_partner(self, dw):
         pair_i32_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
+        # No stable dual-output lane-swap API at v0.3.4.1; fx.gpu.shuffle_xor is not
+        # one-for-one (single result, different lowering).
         swapped = rocdl.permlane32_swap(
             pair_i32_ty, as_mlir_value(dw), as_mlir_value(dw), False, False
         )

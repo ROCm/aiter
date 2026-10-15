@@ -131,10 +131,12 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
             reordered = []
             for base in range_constexpr(0, 8, 4):
                 for i in range_constexpr(2):
+                    # No stable dual-output lane-swap API at v0.3.4.1; fx.gpu.shuffle_xor
+                    # is not one-for-one (single result, different lowering).
                     pair = rocdl.permlane32_swap(
                         pair_ty,
-                        as_mlir_value(words[base + i]),
-                        as_mlir_value(words[base + i + 2]),
+                        fx.as_ir_value(words[base + i]),
+                        fx.as_ir_value(words[base + i + 2]),
                         False,
                         False,
                     )

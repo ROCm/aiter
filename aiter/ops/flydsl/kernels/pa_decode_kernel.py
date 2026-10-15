@@ -37,7 +37,6 @@ and launch wrappers.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu
 
 from .pa_decode import implementation_cache_tag
@@ -296,43 +295,46 @@ def compile_pa_decode_tile(
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         _ = _pa_decode_cache_tag
-        # Ambient contract permits FMAs; explicit per-op fastmath still wins.
-        with CompilationContext.compile_hints({"fastmath": "contract"}):
-            pa_decode_tile_kernel(
-                pmax,
-                psum,
-                pout,
-                query,
-                key_cache,
-                value_cache,
-                block_tables,
-                key_scale,
-                value_scale,
-                max_blocks_per_seq,
-                stride_ks_block,
-                stride_ks_head,
-                stride_q_row,
-                stride_q_head,
-                work_info,
-                num_seqs,
-                query_scale,
-            ).launch(
-                grid=(
-                    (
-                        num_seqs,
-                        num_kv_heads * traits.query_splits,
-                        work_capacity // num_seqs,
-                    )
-                    if traits.batch_first_plan_grid
-                    else (
-                        work_capacity,
-                        num_kv_heads * traits.query_splits,
-                        1,
-                    )
-                ),
-                block=(traits.BLOCK_THREADS, 1, 1),
-                stream=stream,
-            )
+        pa_decode_tile_kernel(
+            pmax,
+            psum,
+            pout,
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            key_scale,
+            value_scale,
+            max_blocks_per_seq,
+            stride_ks_block,
+            stride_ks_head,
+            stride_q_row,
+            stride_q_head,
+            work_info,
+            num_seqs,
+            query_scale,
+        ).launch(
+            grid=(
+                (
+                    num_seqs,
+                    num_kv_heads * traits.query_splits,
+                    work_capacity // num_seqs,
+                )
+                if traits.batch_first_plan_grid
+                else (
+                    work_capacity,
+                    num_kv_heads * traits.query_splits,
+                    1,
+                )
+            ),
+            block=(traits.BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    # Ambient contract permits FMAs; explicit per-op fastmath still wins. Hints
+    # ride the launcher (public JitFunction attribute) instead of a
+    # CompilationContext scope inside the traced body.
+    pa_decode_tile_launch.compile_hints = {"fastmath": "contract"}
 
     compiled = {
         "launch": pa_decode_tile_launch,

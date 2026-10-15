@@ -216,6 +216,7 @@ def test_decode(dtype, depth, layout):
     ret = measure(candidates, case, want, query_lens, kv_lens)
     if layout == "vectorized":
         compare(torch.zeros_like(want[-1]), case["out"][-1], 0, "empty KV")
+        check_decode_layer_graphs(dtype)
     if layout == "linear":
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -224,6 +225,77 @@ def test_decode(dtype, depth, layout):
         graph.replay()
         compare(want, case["out"], 0.08 * want.abs().max().item(), "decode graph")
     return ret
+
+
+def check_decode_layer_graphs(dtype):
+    query_lens, capacity_lens = [1] * 3, [1024] * 3
+    layers = [
+        make_case(query_lens, capacity_lens, dtype, seed=seed) for seed in (7, 19)
+    ]
+    lengths = layers[0]["seqused_k"]
+    table = layers[0]["block_table"]
+    calls, linear_layers = [], []
+    for layer in layers:
+        layer["seqused_k"], layer["block_table"] = lengths, table
+        linear_layers.append(dict(layer))
+        layer["k"], layer["v"] = shuffle_kv_cache(layer["k"], layer["v"])
+        layer["shuffled_kv_cache"] = True
+        calls.append(partial(ua.unified_attention, **layer, backend="flydsl"))
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for call in calls:
+            call()
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        for call in calls:
+            call()
+
+    def replay_and_check(graph, cases, context_lengths, label):
+        for case in cases:
+            case["out"].fill_(float("nan"))
+        graph.replay()
+        for i, case in enumerate(cases):
+            want = reference(case, query_lens, context_lengths)
+            compare(
+                want, case["out"], 0.08 * want.abs().max().item(), f"{label} layer {i}"
+            )
+
+    for context_lengths in ([65, 513, 0], [1024, 1, 257]):
+        lengths.copy_(torch.tensor(context_lengths, device="cuda", dtype=torch.int32))
+        table.copy_(table.roll(1, dims=1))
+        replay_and_check(graph, linear_layers, context_lengths, "shared decode graph")
+
+    # No eager adapter call separates captures: a transition-only cache would be stale.
+    second_lengths = torch.tensor([769, 129, 3], device="cuda", dtype=torch.int32)
+    second_cases = [dict(case, seqused_k=second_lengths) for case in linear_layers]
+    second_calls = [
+        partial(
+            ua.unified_attention,
+            **dict(layer, seqused_k=second_lengths),
+            backend="flydsl",
+        )
+        for layer in layers
+    ]
+    second_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(second_graph, stream=stream):
+        for call in second_calls:
+            call()
+    replay_and_check(second_graph, second_cases, [769, 129, 3], "second decode graph")
+    second_lengths.copy_(torch.tensor([0, 1024, 65], device="cuda", dtype=torch.int32))
+    table.copy_(table.roll(2, dims=1))
+    replay_and_check(second_graph, second_cases, [0, 1024, 65], "second decode replay")
+    replay_and_check(graph, linear_layers, [1024, 1, 257], "first graph after second")
+
+    second_graph.reset()
+    with torch.cuda.graph(second_graph, stream=stream):
+        for call in second_calls:
+            call()
+    replay_and_check(
+        second_graph, second_cases, [0, 1024, 65], "recaptured decode graph"
+    )
 
 
 @benchmark()

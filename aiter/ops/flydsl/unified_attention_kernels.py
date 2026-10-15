@@ -10,6 +10,7 @@ back to the Triton wrapper (Gluon on gfx950).
 
 from __future__ import annotations
 
+import ctypes
 import os
 from functools import lru_cache
 
@@ -56,7 +57,8 @@ _MAX_KV_TILES = 2048
 
 _FP8_DTYPE = torch.float8_e4m3fn
 
-# GQA group sizes routed to the packed BN64 body (group 1 packing is the identity).
+# GQA group sizes routed to the packed BN64 body. Group 1 is deliberately absent:
+# packing one head per group is a no-op, so it keeps the unpacked body.
 _PACKED_BN64_GROUPS = (4, 8, 16)
 
 
@@ -144,6 +146,29 @@ def _pa_decode_ok(max_seqlen_q, shuffled_kv_cache, out, num_seqs) -> bool:
 _PA_DECODE_WORKSPACES = {}
 
 
+@lru_cache(maxsize=1)
+def _stream_get_capture_info():
+    lib = ctypes.CDLL("libamdhip64.so")
+    get_info = lib.hipStreamGetCaptureInfo
+    get_info.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_ulonglong),
+    ]
+    get_info.restype = ctypes.c_int
+    return get_info
+
+
+def _capture_id(stream):
+    status, capture_id = ctypes.c_int(), ctypes.c_ulonglong()
+    error = _stream_get_capture_info()(
+        stream.cuda_stream, ctypes.byref(status), ctypes.byref(capture_id)
+    )
+    if error:
+        raise RuntimeError(f"hipStreamGetCaptureInfo failed: {error}")
+    return capture_id.value
+
+
 def _route_pa_decode(
     q,
     k,
@@ -185,9 +210,11 @@ def _route_pa_decode(
             0,
         )
         workspace = _PA_DECODE_WORKSPACES.get(key)
+        capturing = torch.cuda.is_current_stream_capturing()
         if workspace is None:
-            if torch.cuda.is_current_stream_capturing():
+            if capturing:
                 return None
+            _stream_get_capture_info()
             plan = plan_pa_decode(
                 seqused_k,
                 num_kv_heads,
@@ -206,9 +233,16 @@ def _route_pa_decode(
             }
             _PA_DECODE_WORKSPACES[key] = workspace
         else:
-            plan = plan_pa_decode(
-                seqused_k, num_kv_heads, query_length=1, plan=workspace["plan"]
+            refresh_key = (
+                (_capture_id(stream), seqused_k.data_ptr()) if capturing else None
             )
+            plan = workspace["plan"]
+            # vLLM/SGLang keep seqused_k unchanged between layers in a captured step.
+            if not capturing or workspace.get("refresh_key") != refresh_key:
+                plan = plan_pa_decode(
+                    seqused_k, num_kv_heads, query_length=1, plan=plan
+                )
+                workspace["refresh_key"] = refresh_key
         pa_decode(
             out,
             q,
@@ -618,7 +652,9 @@ def flydsl_unified_attention(
 
     if max_seqlen_q == 1:
         # Decode kernels are not AOT-compiled; decline so run-only deployments
-        # fall back.
+        # fall back. FlyDSL exposes no stable runtime-options API, so read the
+        # parsed run_only option directly (not os.environ, whose OptBool parse
+        # differs).
         if _flydsl_runtime.run_only:
             return None
         if _pa_decode_ok(max_seqlen_q, shuffled_kv_cache, out, num_seqs):
