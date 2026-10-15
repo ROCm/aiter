@@ -19,6 +19,9 @@ from pathlib import Path
 
 import pytest
 
+_NPS_KERNEL = "_ZN5aiter41f4gemm_bf16_mxfp4_BpreShuffle_192x256_4x4E"
+_PS_KERNEL = "_ZN5aiter44f4gemm_bf16_mxfp4_BpreShuffle_256x256_4x4_psE"
+
 
 @pytest.fixture(scope="module")
 def f4gemm_ut():
@@ -104,6 +107,79 @@ def test_bitmatch_storage_bits(f4gemm_ut, asm_bits, gluon_bits, expected_mismatc
     assert result["gluon bitmatch"] == ("failed" if expected_mismatches else "pass")
 
 
+@pytest.mark.parametrize("K", [256, 1536, 1792])
+@pytest.mark.parametrize(
+    "data_init,scale_init", [("constant", "constant"), ("uniform", "auto")]
+)
+@pytest.mark.parametrize("seed", [0, 1])
+def test_nps_asm_gluon_bitmatch(f4gemm_ut, K, data_init, scale_init, seed):
+    ut = f4gemm_ut
+    M, N = 768, 1024
+    inp, _ = ut._prep_mxfp4(
+        M, N, K, 0, data_init, scale_init, ut.make_generator(seed), check_gluon=True
+    )
+    y = ut.torch.empty((M, N), dtype=ut.dtypes.bf16, device=inp["A"].device)
+    args = (inp["A"], inp["B"], inp["sA"], inp["sB"])
+    out = ut.aiter.gemm_mxfp4_asm(
+        *args, a_preshuffle=False, kernelName=_NPS_KERNEL, y=y
+    )
+    assert out is y
+    persistent = ut.aiter.gemm_mxfp4_asm(
+        *args, a_preshuffle=False, kernelName=_PS_KERNEL
+    )
+    ut.torch.testing.assert_close(
+        out.view(ut.torch.int16), persistent.view(ut.torch.int16), rtol=0, atol=0
+    )
+    result = ut._compare_gluon_output(out, ut.run_gluon_mxfp4(*inp["gluon_args"]))
+    assert result["gluon mismatches"] == 0, result
+
+
+@pytest.mark.parametrize("apre", [0, 1])
+@pytest.mark.parametrize("outtype", ["bf16", "fp8"])
+def test_preallocated_output(f4gemm_ut, apre, outtype):
+    ut = f4gemm_ut
+    M, N, K = 32, 128, 256
+    inp, _ = ut._prep_mxfp4(M, N, K, apre, "uniform", "auto", ut.make_generator(0))
+    args = (inp["A"], inp["B"], inp["sA"], inp["sB"])
+    dtype = ut._OUT_DTYPE[outtype]
+    expected = ut.aiter.gemm_mxfp4_asm(*args, dtype=dtype, a_preshuffle=bool(apre))
+    y = ut.torch.empty((M, N), dtype=dtype, device=inp["A"].device)
+    y.view(ut.torch.uint8).fill_(0xFF)
+    result = ut.aiter.gemm_mxfp4_asm(*args, dtype=dtype, a_preshuffle=bool(apre), y=y)
+    if outtype == "fp8":
+        out, scale = result
+        expected, expected_scale = expected
+        ut.torch.testing.assert_close(
+            ut.unpack_mxfp8_out_scale(scale, M, N).view(ut.torch.uint8),
+            ut.unpack_mxfp8_out_scale(expected_scale, M, N).view(ut.torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+    else:
+        out = result
+    assert out is y
+    ut.torch.testing.assert_close(
+        out.view(ut.torch.uint8), expected.view(ut.torch.uint8), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("invalid", ["shape", "dtype", "device", "strides"])
+def test_reject_invalid_output(f4gemm_ut, invalid):
+    ut = f4gemm_ut
+    M, N, K = 32, 128, 256
+    inp, _ = ut._prep_mxfp4(M, N, K, 0, "constant", "constant", ut.make_generator(0))
+    shape = (M, N + 1) if invalid == "shape" else (M, N)
+    dtype = ut.torch.float32 if invalid == "dtype" else ut.dtypes.bf16
+    device = "cpu" if invalid == "device" else inp["A"].device
+    y = ut.torch.empty(shape, dtype=dtype, device=device)
+    if invalid == "strides":
+        y = y.t().contiguous().t()
+    with pytest.raises(ValueError, match="y must be contiguous"):
+        ut.aiter.gemm_mxfp4_asm(
+            inp["A"], inp["B"], inp["sA"], inp["sB"], a_preshuffle=False, y=y
+        )
+
+
 @pytest.fixture(scope="module")
 def dispatch_lib():
     jit_dir = Path(
@@ -152,10 +228,6 @@ def _launch_config(lib, M, N, K, intype="mxfp4", outtype="bf16", apre=0, kernel=
             raise RuntimeError(lib.aiter_get_last_error().decode())
         values.append(value)
     return tuple(values)
-
-
-_NPS_KERNEL = "_ZN5aiter41f4gemm_bf16_mxfp4_BpreShuffle_192x256_4x4E"
-_PS_KERNEL = "_ZN5aiter44f4gemm_bf16_mxfp4_BpreShuffle_256x256_4x4_psE"
 
 
 @pytest.mark.parametrize(

@@ -599,7 +599,7 @@ def test_gemm(
         asm_args = (inp["A"], inp["B"], inp["sA"], inp["sB"], inp["gA"], inp["gB"])
     else:
 
-        def run_asm(A, B, sA, sB):
+        def run_asm(A, B, sA, sB, y):
             return aiter.gemm_mxfp4_asm(
                 A,
                 B,
@@ -608,9 +608,11 @@ def test_gemm(
                 dtype=out_dtype,
                 a_preshuffle=bool(apre),
                 kernelName=knl,
+                y=y,
             )
 
-        asm_args = (inp["A"], inp["B"], inp["sA"], inp["sB"])
+        y = torch.empty((M, N), dtype=out_dtype, device=inp["A"].device)
+        asm_args = (inp["A"], inp["B"], inp["sA"], inp["sB"], y)
 
     # Only the low-level asm entry is timed/tabled. (fn, args); args are rotated.
     candidates = {"asm": (run_asm, asm_args)}
