@@ -202,16 +202,22 @@ STOCK = (*CDR_KERNELS, "rccl")
 STOCK_SQNR_FLOOR_DB = 40.0
 # bench: DeepSeek-V4 decode shapes, timed next to the policy-derived payloads.
 BENCH_SHAPES = [(m, HIDDEN) for m in (1, 2, 4, 8)]
-# bench, ar_rmsnorm: the stock fused paths, in the order each spawn captures
-# them. ``cdr_fused_*`` is ``CustomAllreduce``'s fused kernel at both stage
-# counts; ``<ar>+norm`` is that all-reduce and then ``rmsnorm2d_fwd_with_add``.
-FUSED_STOCK = ("cdr_fused_1stage", "cdr_fused_2stage", "cdr+norm", "rccl+norm")
-# bench, ar_rmsnorm: the accuracy floor of every candidate, on ``out`` and on
-# ``residual_out``. ``out`` goes through an approximate rsqrt, so it sits well
-# below the plain all-reduce's floor.
-FUSED_BENCH_SQNR_FLOOR_DB = 30.0
-# bench, ar_rmsnorm: default shapes, decode to prefill at three model widths.
-FUSED_BENCH_SHAPES = [(m, h) for h in (4096, 7168, 8192) for m in (1, 4, 16, 64, 256)]
+# bench, ar_rmsnorm: the stock fused paths (exact), and the accuracy floor of
+# every candidate. Shared with the quick all-reduce's bench.
+FUSED_STOCK = fab.EXACT_FUSED_STOCK
+FUSED_BENCH_SQNR_FLOOR_DB = fab.EXACT_FUSED_SQNR_FLOOR_DB
+# bench, ar_rmsnorm: default shapes. The decode sizes of the fused one-shot's
+# published comparison (8-168 KiB at hidden 4096 and 7168), then a coarser
+# sweep out to where the quantized schedules take over, at three widths.
+FUSED_BENCH_DECODE_SHAPES = [(m, 4096) for m in (1, 2, 4, 6, 8, 16)] + [
+    (m, 7168) for m in (1, 2, 4, 5, 6, 8, 11, 12)
+]
+FUSED_BENCH_SHAPES = FUSED_BENCH_DECODE_SHAPES + [
+    (m, h)
+    for h in (4096, 7168, 8192)
+    for m in (1, 4, 16, 64, 256)
+    if (m, h) not in FUSED_BENCH_DECODE_SHAPES
+]
 # bench: the largest payload a ``--candidates`` one-shot engine is timed at.
 # Not a correctness limit -- the kernel is exact at every size -- but the
 # one-shot handshakes once per tile, so far past any policy window it costs
@@ -2607,9 +2613,7 @@ def _bench_fused_rank(
                 res[name]["us"] = us
             for name, e in live.items():
                 res[name]["variant"] = e.variant(hidden, nbytes)
-            for name in ("cdr_fused_1stage", "cdr_fused_2stage", "cdr+norm"):
-                if name in res and not ca.enable_register_for_capturing:
-                    res[name]["variant"] = "staged"
+            fab.mark_staged(res, ca)
             rows.append({"prod": _fused_prod(ca, x, use_1stage), "candidates": res})
             del graphs
     finally:
@@ -2622,12 +2626,9 @@ def _bench_fused_rank(
 def _fused_thunks(fly, ca, nccl, outs, x, residual, weight, ar_buf, eps) -> dict:
     """The ``ar_rmsnorm`` bench thunks, by candidate name, for one case.
 
-    Every thunk writes into its preallocated ``outs[name]``: ``fused_ar_rms``
-    allocates whatever it is not given, and an allocation inside a capture is
-    at best a surprise.
+    Every thunk writes into its preallocated ``outs[name]``; the stock ones
+    are ``flydsl_allreduce_bench.exact_fused_thunks``.
     """
-    from aiter import rmsnorm2d_fwd_with_add
-
     thunks = {}
     for name, e in fly.items():
 
@@ -2636,44 +2637,9 @@ def _fused_thunks(fly, ca, nccl, outs, x, residual, weight, ar_buf, eps) -> dict
 
         thunks[name] = _fly
 
-    reg = ca is not None and ca.enable_register_for_capturing
-
-    def _registered():
-        # As CustomAllreduce: in place under capture, through its pool otherwise.
-        return reg and torch.cuda.is_current_stream_capturing()
-
-    custom = ca is not None and ca.should_custom_ar(x)
-    if custom and x.shape[-1] <= 16384:
-        for name, one in (("cdr_fused_1stage", True), ("cdr_fused_2stage", False)):
-
-            def _cdr_fused(o=outs[name], one=one):
-                ca.fused_ar_rms(
-                    x,
-                    residual,
-                    res_out=o[1],
-                    out=o[0],
-                    w=weight,
-                    eps=eps,
-                    registered=_registered(),
-                    use_1stage=one,
-                )
-
-            thunks[name] = _cdr_fused
-    if custom:
-
-        def _cdr_norm(o=outs["cdr+norm"]):
-            ca.all_reduce(x, out=ar_buf, registered_input=_registered())
-            rmsnorm2d_fwd_with_add(o[0], ar_buf, residual, o[1], weight, eps)
-
-        thunks["cdr+norm"] = _cdr_norm
-    if nccl is not None:
-
-        def _rccl_norm(o=outs["rccl+norm"]):
-            # What CudaCommunicator.all_reduce falls back to, then the norm.
-            nccl.all_reduce(x, ar_buf)
-            rmsnorm2d_fwd_with_add(o[0], ar_buf, residual, o[1], weight, eps)
-
-        thunks["rccl+norm"] = _rccl_norm
+    thunks.update(
+        fab.exact_fused_thunks(ca, nccl, outs, x, residual, weight, ar_buf, eps)
+    )
     return thunks
 
 
@@ -2725,13 +2691,7 @@ def bench_one_shot_allreduce_rmsnorm(tokens, hidden, tp, link, extra=()):
     fly_us = got["flydsl"]["us"]
     prod = per_rank[0]["prod"]
     prod_us = got[prod]["us"] if prod in got else None
-    passing = [
-        n
-        for n in FUSED_STOCK
-        if n in got and got[n]["SQNR dB"] >= FUSED_BENCH_SQNR_FLOOR_DB
-    ]
-    best = min(passing, key=lambda n: got[n]["us"], default=None)
-    best_us = got[best]["us"] if best else None
+    best, best_us = fab.best_candidate(got, FUSED_STOCK, FUSED_BENCH_SQNR_FLOOR_DB)
     route, route_exact = _fused_route(tp, link, tokens * hidden * 2)
     ret = {
         "gfx": ARCH,
@@ -2767,6 +2727,7 @@ def _bench_fused(args, tps, given, link) -> None:
         rows,
         candidates=("flydsl", *(name for name, _ in extra), *FUSED_STOCK),
         title="flydsl one-shot allreduce + rmsnorm vs stock",
+        geomean=("flydsl vs prod", "flydsl vs best"),
     )
     for title, df in tables:
         aiter.logger.info("%s (markdown):\n%s", title, fab.to_markdown(df))
@@ -2783,6 +2744,12 @@ def _bench_fused(args, tps, given, link) -> None:
                 "AITER_QUICK_REDUCE_QUANTIZATION=INT4, `route exact` without"
             ),
             "- `flydsl vs X` is `X us / flydsl us`: above 1.0 the one-shot is faster",
+            (
+                "- `best stock`: the fastest of "
+                + ", ".join(f"`{n}`" for n in FUSED_STOCK)
+                + f" at or above {FUSED_BENCH_SQNR_FLOOR_DB:g} dB"
+            ),
+            "- `n/a`: the candidate cannot run that payload (e.g. above its size gate)",
         ],
     )
     fab.write_outputs(

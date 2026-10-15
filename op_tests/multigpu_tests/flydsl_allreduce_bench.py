@@ -491,6 +491,87 @@ def fused_reference(total: torch.Tensor, residual, weight, eps: float = RMS_EPS)
     return out, res_out
 
 
+# ``ar_rmsnorm``: the exact stock fused paths, in the order each spawn captures
+# them. ``cdr_fused_*`` is ``CustomAllreduce``'s fused kernel at both stage
+# counts; ``<ar>+norm`` is that all-reduce and then ``rmsnorm2d_fwd_with_add``.
+EXACT_FUSED_STOCK = ("cdr_fused_1stage", "cdr_fused_2stage", "cdr+norm", "rccl+norm")
+# ``ar_rmsnorm``: the accuracy floor of an exact candidate, on ``out`` and on
+# ``residual_out``. ``out`` goes through an approximate rsqrt, so it sits well
+# below the plain all-reduce's floor.
+EXACT_FUSED_SQNR_FLOOR_DB = 30.0
+
+
+def exact_fused_thunks(ca, nccl, outs, x, residual, weight, ar_buf, eps) -> dict:
+    """The ``EXACT_FUSED_STOCK`` thunks that can run on *x*, by name.
+
+    *ca* is the group's ``CustomAllreduce`` and *nccl* its PyNccl, either None
+    when absent. Each candidate is gated as ``CudaCommunicator`` gates it, and
+    writes into its preallocated ``outs[name]``: ``fused_ar_rms`` allocates
+    whatever it is not given, and an allocation inside a capture is at best a
+    surprise.
+    """
+    from aiter import rmsnorm2d_fwd_with_add
+
+    thunks = {}
+    reg = ca is not None and ca.enable_register_for_capturing
+
+    def _registered():
+        # As CustomAllreduce: in place under capture, through its pool otherwise.
+        return reg and torch.cuda.is_current_stream_capturing()
+
+    custom = ca is not None and ca.should_custom_ar(x)
+    if custom and x.shape[-1] <= 16384:
+        for name, one in (("cdr_fused_1stage", True), ("cdr_fused_2stage", False)):
+
+            def _cdr_fused(o=outs[name], one=one):
+                ca.fused_ar_rms(
+                    x,
+                    residual,
+                    res_out=o[1],
+                    out=o[0],
+                    w=weight,
+                    eps=eps,
+                    registered=_registered(),
+                    use_1stage=one,
+                )
+
+            thunks[name] = _cdr_fused
+    if custom:
+
+        def _cdr_norm(o=outs["cdr+norm"]):
+            ca.all_reduce(x, out=ar_buf, registered_input=_registered())
+            rmsnorm2d_fwd_with_add(o[0], ar_buf, residual, o[1], weight, eps)
+
+        thunks["cdr+norm"] = _cdr_norm
+    if nccl is not None:
+
+        def _rccl_norm(o=outs["rccl+norm"]):
+            # What CudaCommunicator.all_reduce falls back to, then the norm.
+            nccl.all_reduce(x, ar_buf)
+            rmsnorm2d_fwd_with_add(o[0], ar_buf, residual, o[1], weight, eps)
+
+        thunks["rccl+norm"] = _rccl_norm
+    return thunks
+
+
+def mark_staged(res: dict, ca) -> None:
+    """Name the ``cdr`` candidates of *res* ``staged`` where production copies
+    the input into the IPC pool instead of registering it under capture."""
+    if ca is None or ca.enable_register_for_capturing:
+        return
+    for name in ("cdr_fused_1stage", "cdr_fused_2stage", "cdr+norm"):
+        if name in res:
+            res[name]["variant"] = "staged"
+
+
+def best_candidate(got: dict, names, floor_db: float):
+    """``(name, us)`` of the fastest of *names* in *got* that clears
+    *floor_db*, or ``(None, None)``. *got* maps a name to its ``collapse``."""
+    passing = [n for n in names if n in got and got[n]["SQNR dB"] >= floor_db]
+    best = min(passing, key=lambda n: got[n]["us"], default=None)
+    return best, (got[best]["us"] if best else None)
+
+
 def _gpu_numa_map() -> str:
     """``device:NUMA node`` for every visible GPU.
 
@@ -536,13 +617,49 @@ def provenance(args, link: str, extra: list[str] = ()) -> list[str]:
     ]
 
 
-def bench_tables(rows: list[dict], *, candidates, drop=(), title: str) -> list:
+def geomean_table(df: pd.DataFrame, speedups, by=("tp",)) -> pd.DataFrame | None:
+    """Per group of *by*, the geometric mean, minimum and count of each
+    ``X vs Y`` column of *speedups*, over the rows where it is defined."""
+    by = [c for c in by if c in df]
+    speedups = [c for c in speedups if c in df]
+    if not by or not speedups:
+        return None
+    out = []
+    for key, g in df.groupby(by, sort=True):
+        row = dict(zip(by, key if isinstance(key, tuple) else (key,)))
+        row["rows"] = len(g)
+        for col in speedups:
+            v = pd.to_numeric(g[col], errors="coerce").dropna()
+            v = v[v > 0]
+            row[f"{col} geomean"] = (
+                float(statistics.geometric_mean(v)) if len(v) else None
+            )
+            row[f"{col} min"] = float(v.min()) if len(v) else None
+            row[f"{col} n"] = len(v)
+        out.append(row)
+    return pd.DataFrame(out)
+
+
+def bench_tables(
+    rows: list[dict],
+    *,
+    candidates,
+    drop=(),
+    title: str,
+    times=None,
+    sections=(),
+    geomean=(),
+    geomean_by=("tp",),
+) -> list:
     """The ``(title, DataFrame)`` tables of a bench run.
 
     The first table has the comparisons: every column that does not belong to
-    one candidate. The second has each candidate's ``us``, ``spread us``,
-    ``SQNR dB`` and ``variant``. The two share the columns that identify the
-    row.
+    one candidate or to a section, and the ``us`` of *times* (default every
+    candidate). Each ``(name, columns)`` of *sections* is a table of its own.
+    *geomean* adds a table of those ``X vs Y`` columns' geometric means per
+    *geomean_by* group. The last table has each candidate's ``us``,
+    ``spread us``, ``SQNR dB`` and ``variant``. Every table but the geomean one
+    leads with the columns that identify the row.
     """
     if not rows:
         return []
@@ -557,17 +674,35 @@ def bench_tables(rows: list[dict], *, candidates, drop=(), title: str) -> list:
         if f"{n} {field}" in df
     ]
     # The comparisons need each candidate's time, but not the rest.
-    times = [f"{n} us" for n in candidates if f"{n} us" in df]
-    summary = [c for c in df.columns if c not in per_cand and c not in ids]
-    return [
-        (title, df[ids + times + summary]),
-        (f"{title}: per candidate", df[ids + per_cand]),
+    shown = candidates if times is None else times
+    time_cols = [f"{n} us" for n in shown if f"{n} us" in df]
+    in_section = {c for _name, cols in sections for c in cols}
+    summary = [
+        c
+        for c in df.columns
+        if c not in per_cand and c not in ids and c not in in_section
     ]
+    tables = [(title, df[ids + time_cols + summary])]
+    for name, cols in sections:
+        cols = [c for c in cols if c in df]
+        if cols:
+            tables.append((f"{title}: {name}", df[ids + cols]))
+    gm = geomean_table(df, geomean, by=geomean_by)
+    if gm is not None:
+        tables.append((f"{title}: geomean speedup", gm))
+    tables.append((f"{title}: per candidate", df[ids + per_cand]))
+    return tables
 
 
 def to_markdown(df: pd.DataFrame) -> str:
     # Payload sizes in full; ".4g" would print 32768 KiB as 3.277e+04.
     fmt = tuple(".10g" if c == "KiB" else ".4g" for c in df.columns)
+    # A missing value is NaN once pandas has a float column, and tabulate only
+    # writes ``missingval`` for None.
+    # A bit-exact result has no noise: its SQNR is inf, or float32's maximum
+    # where the SQNR is computed in float32.
+    df = df.map(lambda v: "inf" if isinstance(v, float) and abs(v) >= 1e30 else v)
+    df = df.astype(object).where(df.notna(), None)
     return df.to_markdown(index=False, floatfmt=fmt, missingval="n/a")
 
 
