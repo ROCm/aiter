@@ -43,3 +43,12 @@ def launch(shape, *, front, experts, tail, front_args, expert_args, tail_args):
     routed = experts(*expert_args)
     tail(routed, *tail_args)
     return routed
+
+
+def require_residency(*, grid, cus, resident_ctas_per_cu, spills):
+    """Call with compiled front/tail metadata before enabling a spinning grid."""
+    if spills or resident_ctas_per_cu * cus < grid:
+        raise ValueError(
+            f"Resident grid not proven: {grid=} {cus=} "
+            f"{resident_ctas_per_cu=} {spills=}"
+        )

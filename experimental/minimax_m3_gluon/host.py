@@ -8,7 +8,7 @@ from aiter.fused_moe import fused_moe_2stages
 from .front import front
 from .tail import tail
 from .pipeline import Shape, launch
-from .hip_ipc import DevicePointer
+from .hip_ipc import DevicePointer, PeerMemory
 
 SORT_BLOCK = 16
 HIDDEN = 6144
@@ -63,6 +63,15 @@ def allocate_workspace(tokens, device):
         "FrontErrors": torch.zeros(1, dtype=torch.int32, device=device),
         "TailErrors": torch.zeros(256 * 64, dtype=torch.int32, device=device),
     }
+
+
+def allocate_peer(tokens, rank, cpu_group):
+    """Persistent two-slot TP4 IPC region; allocate before graph capture."""
+    Shape(tokens)
+    if not 0 <= rank < 4:
+        raise ValueError("Invalid TP rank")
+    pairs = tokens * HIDDEN // 2
+    return PeerMemory(2 * 4 * pairs * 8, rank, 4, group=cpu_group)
 
 
 def expert_weights(w13, s13, w2, s2):

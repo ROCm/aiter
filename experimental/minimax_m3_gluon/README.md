@@ -42,7 +42,8 @@ AITER top-k metadata rather than assumed to be one.
 Front CTA mapping: CTAs `0..8B-1` compute 16 router experts each; CTA 128
 waits for all score tiles, chooses routes, and builds metadata; CTAs 129–255
 zero 1024 BF16 elements each. The 256-CTA grid must be resident on 256 CUs
-for the intended latency and wait schedule; compilation resource use and actual
+for the intended latency and wait schedule; `pipeline.require_residency` rejects
+spills or insufficient compiled occupancy. Compilation resource use and actual
 occupancy have not been checked. A16W4 MoE weights remain in AITER's shuffled
 layout. The metadata buffer allocates `16 * B * 5` rows, the worst case of one
 BM16 block per route; top-k uniqueness makes each expert occur at most B times.

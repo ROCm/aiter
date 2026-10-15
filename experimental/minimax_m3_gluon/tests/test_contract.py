@@ -73,6 +73,13 @@ class ContractTest(unittest.TestCase):
         )
         self.assertIs(routed, actual)
         self.assertEqual(events, ["front+metadata", "moe1", "moe2", "tail"])
+        pipeline.require_residency(grid=256, cus=256, resident_ctas_per_cu=1, spills=0)
+        for kwargs in (
+            dict(grid=256, cus=128, resident_ctas_per_cu=1, spills=0),
+            dict(grid=256, cus=256, resident_ctas_per_cu=1, spills=1),
+        ):
+            with self.assertRaises(ValueError):
+                pipeline.require_residency(**kwargs)
         self.assertFalse(pipeline.use_hybrid(4))
         self.assertTrue(pipeline.use_hybrid(5))
         for kwargs in (
