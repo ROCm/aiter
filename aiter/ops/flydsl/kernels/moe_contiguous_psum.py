@@ -883,7 +883,7 @@ def build_moe_route_psum_herd_module(topk: int):
         max_m: fx.Int32,
         tile_m: fx.Int32,
         routed_scaling_factor: fx.Float32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         route_psum_herd_kernel(
             cand_ids,

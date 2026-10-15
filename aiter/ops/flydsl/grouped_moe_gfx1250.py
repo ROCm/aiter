@@ -796,15 +796,13 @@ def _grouped_a8w4_tdm_moe(
     else:
         _fuse_ep_route_quant = False
         if herd_topk:
-            _masked_m, topids_to_rows, herd_psum, herd_gather_w = (
-                herd_route_psum_remap(
-                    topk_ids,
-                    topk_weight,
-                    E,
-                    max_m,
-                    _align_m,
-                    herd_routed_scaling_factor,
-                )
+            _masked_m, topids_to_rows, herd_psum, herd_gather_w = herd_route_psum_remap(
+                topk_ids,
+                topk_weight,
+                E,
+                max_m,
+                _align_m,
+                herd_routed_scaling_factor,
             )
         else:
             _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
