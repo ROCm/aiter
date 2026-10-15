@@ -22,6 +22,7 @@ from aiter.test_mha_common import (
     generate_qkv,
     generate_random_padding_mask,
 )
+from aiter.test_common import checkAllclose
 
 arch = get_arch()
 
@@ -381,6 +382,10 @@ def test_mha_backward_varlen(
 
 
 def mha_torch(q, k, v, sm_scale, causal):
+    # GQA: broadcast each K/V head to the group of query heads that shares it
+    group_size = q.shape[1] // k.shape[1]
+    k = k.repeat_interleave(group_size, dim=1)
+    v = v.repeat_interleave(group_size, dim=1)
     qk = q @ k.transpose(-2, -1)
     qk = qk * sm_scale
     if causal:
@@ -404,12 +409,13 @@ def quant_fp8(x):
     return (x / scale).to(torch.float8_e4m3fn), scale
 
 
-def init_qkv(b, h, s, d,  device="cuda"):
+def init_qkv(b, hq, hk, s, d, device="cuda"):
     """fp8 q/k/v in the requested layout, plus their per-tensor scales."""
-    shape = (b, h, s, d)
-    q, q_scale = quant_fp8(torch.randn(shape, device=device, dtype=torch.float32) * 0.5)
-    k, k_scale = quant_fp8(torch.randn(shape, device=device, dtype=torch.float32) * 0.5)
-    v, v_scale = quant_fp8(torch.randn(shape, device=device, dtype=torch.float32) * 0.5)
+    q_shape = (b, hq, s, d)
+    kv_shape = (b, hk, s, d)
+    q, q_scale = quant_fp8(torch.randn(q_shape, device=device, dtype=torch.float32) * 0.5)
+    k, k_scale = quant_fp8(torch.randn(kv_shape, device=device, dtype=torch.float32) * 0.5)
+    v, v_scale = quant_fp8(torch.randn(kv_shape, device=device, dtype=torch.float32) * 0.5)
     return q, k, v, q_scale, k_scale, v_scale
 
 
@@ -421,7 +427,8 @@ def init_qkv(b, h, s, d,  device="cuda"):
 @dataclass
 class Case:
     b: int
-    h: int
+    hq: int
+    hk: int
     s: int
     d: int
 
@@ -432,26 +439,32 @@ class Case:
         tuple(getattr(case, f.name) for f in fields(Case))
         for case in [
             # one K/V tile, one M tile: the shortest path through the pipeline
-            Case(1, 2, 64, 128),
-            Case(1, 1, 128, 128),
-            Case(1, 8, 256, 128),
-            Case(2, 8, 512, 128),
-            Case(4, 32, 1024, 128),
-            Case(2, 16, 2048, 128),
-            Case(1, 8, 4096, 128),
-            Case(3, 5, 1024, 128),
+            Case(1, 2, 2, 64, 128),
+            Case(1, 1, 1, 128, 128),
+            Case(1, 8, 8, 256, 128),
+            Case(2, 8, 8, 512, 128),
+            Case(4, 32, 32, 1024, 128),
+            Case(2, 16, 16, 2048, 128),
+            Case(1, 8, 8, 4096, 128),
+            Case(3, 5, 5, 1024, 128),
             # M not a multiple of BLOCK_M: the last program writes a partial tile
-            Case(2, 4, 600, 128),
+            Case(2, 4, 4, 600, 128),
             # HEAD_DIM != HEAD_DIM_POW2: the descriptors pad the head dim to 128
-            Case(2, 8, 512, 96),
+            Case(2, 8, 8, 512, 96),
+            # GQA: several query heads share one K/V head
+            Case(2, 8, 2, 512, 128),
+            Case(4, 32, 8, 1024, 128),
+            Case(1, 48, 8, 2048, 128),
         ]
     ],
 )
-@pytest.mark.parametrize("causal", [False])
-def test_mha_fwd_gluon_gfx1250(b, h, s, d, causal, device="cuda"):
+@pytest.mark.parametrize("causal", [False, True])
+def test_mha_fwd_gluon_gfx1250(b, hq, hk, s, d, causal, device="cuda"):
     torch.manual_seed(0)
 
-    q_tri, k_tri, v_tri, q_scale, k_scale, v_scale = init_qkv(b, h, s, d, device=device)
+    q_tri, k_tri, v_tri, q_scale, k_scale, v_scale = init_qkv(
+        b, hq, hk, s, d, device=device
+    )
     q_ref = q_tri.to(torch.float32) * q_scale
     k_ref = k_tri.to(torch.float32) * k_scale
     v_ref = v_tri.to(torch.float32) * v_scale

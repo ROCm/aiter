@@ -27,7 +27,9 @@ def mha_fwd(
     """
     Multi-head attention forward with per-tensor fp8 (e4m3) Q, K and V.
 
-    q, k, v:   [B, H, S, D] (layout "bhsd") dtype float8_e4m3fn. 
+    q:         [B, HQ, S, D] (layout "bhsd") dtype float8_e4m3fn.
+    k, v:      [B, HK, S, D] dtype float8_e4m3fn. HQ must be a multiple of HK
+               (grouped query attention; HK == HQ is plain MHA).
     q_scale, k_scale, v_scale: per-tensor dequant scales, fp32 scalars (python
                float or a 1-element / 0-dim tensor).
     o:         optional output buffer, same shape as q, dtype bfloat16. The
@@ -44,7 +46,15 @@ def mha_fwd(
         assert t.dtype == torch.float8_e4m3fn, f"{name} must be float8_e4m3fn"
         assert t.dim() == 4, f"{name} must be 4D, got {t.dim()}D"
 
-    batch, num_heads, seqlen, head_dim = q.shape
+    batch, num_q_heads, seqlen, head_dim = q.shape
+    num_k_heads = k.shape[1]
+    assert k.shape == v.shape, "k and v must have the same shape"
+    assert k.shape[0] == batch and k.shape[2:] == q.shape[2:], (
+        "k/v must match q in batch, seqlen and head_dim"
+    )
+    assert num_q_heads % num_k_heads == 0, (
+        f"num_q_heads ({num_q_heads}) must be a multiple of num_k_heads ({num_k_heads})"
+    )
 
     config = get_mha_fwd_config(q.device)
     BLOCK_M = config["BLOCK_M"]
@@ -92,7 +102,7 @@ def mha_fwd(
     stride_k_n *= preshuffle_factor_k
     stride_v_n *= preshuffle_factor_v
 
-    grid = (triton.cdiv(seqlen, BLOCK_M), num_heads, batch)
+    grid = (triton.cdiv(seqlen, BLOCK_M), num_q_heads, batch)
     _mha_fwd_subtiled[grid](
         q_ptr=q,
         k_ptr=k,
@@ -119,7 +129,8 @@ def mha_fwd(
         stride_o_d=stride_o_d,
         SM_SCALE=sm_scale,
         CAUSAL=causal,
-        NUM_HEADS=num_heads,
+        NUM_Q_HEADS=num_q_heads,
+        NUM_K_HEADS=num_k_heads,
         SEQLEN=seqlen,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
