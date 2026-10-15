@@ -1363,7 +1363,7 @@ def _make_gemm_a16w16_gfx950_param_cached(kwargs_items):
 
 
 def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
-    # build once per config to save python time 
+    # build once per config to save python time
     result = None
     key = tuple(sorted(kwargs.items()))
     hash(key)
