@@ -409,9 +409,17 @@ def build_hstu_attention_bwd_fused_pp(
 
         block_id = fx.Int32(gpu.block_idx.x)
         grid_group = block_id % fx.Int32(NUM_GRID_GROUPS)
+        # kv-chunking: a pass covers only kv tiles [kv_tile_lo, kv_tile_hi),
+        # so the grid is sized to that span and the tile index is biased back
+        # up. Splitting on KV and not q is load-bearing -- dV/dK sum over all
+        # q, so each pass gets the FULL q range for its kv rows and writes
+        # them out complete; only dQ spans passes, which is exactly what the
+        # reduction already handles. A q split would leave dV/dK with half
+        # their contributions and make every workgroup run in both passes.
+        n_pass_tiles = kv_tile_hi - kv_tile_lo
         pos_in_group = block_id // fx.Int32(NUM_GRID_GROUPS)
-        local_hz_idx = pos_in_group // fx.Int32(num_kv_tiles)
-        kv_tile_idx = pos_in_group % fx.Int32(num_kv_tiles)
+        local_hz_idx = pos_in_group // n_pass_tiles
+        kv_tile_idx = kv_tile_lo + pos_in_group % n_pass_tiles
         hz_idx = grid_group * hz_per_group + local_hz_idx
         block_valid = hz_idx < hz_total
         hz_idx = block_valid.select(hz_idx, fx.Int32(0))
@@ -1492,7 +1500,7 @@ def build_hstu_attention_bwd_fused_pp(
         c_ngg = fx.Int32(NUM_GRID_GROUPS)
         hz_total = batch * fx.Int32(num_heads)
         hz_per_group = (hz_total + fx.Int32(NUM_GRID_GROUPS - 1)) // c_ngg
-        grid = fx.Int32(num_kv_tiles) * hz_per_group * c_ngg
+        grid = (kv_tile_hi - kv_tile_lo) * hz_per_group * c_ngg
         hstu_attention_bwd_fused_pp(
             q,
             k,
