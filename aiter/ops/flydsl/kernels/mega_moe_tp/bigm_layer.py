@@ -2408,9 +2408,10 @@ class MegaMoeTPBigM:
             return max(bigm_lds(rg, n, inter, MODE=3)["BYTES"], bigm_lds(rg, n, inter, MODE=4)["BYTES"])
         return bigm_lds(rg, n, inter)["BYTES"]
 
-    def gather_rows(self, rows):
+    def gather_rows(self, rows, local=False):
         """Collective: every rank's rows [m, H] bf16 -> [tp * m, H] (rank r's at r * m), a
-        view of the arena valid until the next call. Each rank writes its rows into every
+        view of the arena valid until the next call. local: this rank's rows only (placed
+        at rank * m; no peer writes). Each rank writes its rows into every
         peer's arena (hipIpc mapping; one side stream per peer), then stream-ordered flags:
         hipStreamWriteValue32 of this call's epoch into every peer's flag slot of this rank,
         hipStreamWaitValue32 on every peer's slot here. No host sync (the host keeps running
@@ -2449,6 +2450,9 @@ class MegaMoeTPBigM:
         dst = self._brows_peer[self._bepoch & 1]
         src = rows.contiguous()
         lo, hi = self.rank * m, (self.rank + 1) * m
+        if local:
+            _kcopy(dst[self.rank][lo:hi], src)
+            return dst[self.rank][:T]
         ev = torch.cuda.Event()
         ev.record(stream)
         for p in range(self.tp):

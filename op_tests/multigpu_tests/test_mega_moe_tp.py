@@ -480,26 +480,41 @@ def case_tail(shape, wt, ctx, S):
     fp8 = torch.float8_e4m3fn
     q_ref = (xn.to(dtypes.bf16).float() / s_ref[:, None]).clamp(-448, 448).to(fp8)
     e_ref = float((q_ref.float() * s_ref[:, None] - xn).norm() / xn.norm())
-    for bf16 in (False, True):
-        r = res.clone()
-        outs = layer(c.x, c.w, c.ids, tail=(r, r, nw), bf16=bf16)
-        torch.cuda.synchronize()
-        y, q, s = outs[:3]
-        e_q = float((q.view(fp8).float() * s[:, None] - xn).norm() / xn.norm())
-        bad = [
-            what
-            for what, ok in (
-                ("watchdog", not layer.poll_errors()),
-                ("y", torch.equal(y, y0)),
-                ("res_out", torch.equal(r, r_ref)),
-                (f"q rel {e_q:.4f} (fp8 {e_ref:.4f})", e_q < 1.05 * e_ref),
-                ("scale", float(((s - s_ref).abs() / s_ref).max()) < 1e-2),
-                ("bf16 rows", not bf16 or rel_l2(outs[3], xn) < 0.01),
+    m = c.x.shape[0]
+    own = slice(ctx.rank * m, (ctx.rank + 1) * m)
+    # tn_local (the default): only this rank's rows of q / scales / bf16 rows are written
+    # (at their [T, H] position); False: every rank's
+    for local in (True, False):
+        eng.tn_local = local
+        rows = own if local else slice(None)
+        xn_, s_ref_ = xn[rows], s_ref[rows]
+        e_ref_ = float((q_ref[rows].float() * s_ref_[:, None] - xn_).norm() / xn_.norm())
+        for bf16 in (False, True):
+            r = res.clone()
+            outs = layer(c.x, c.w, c.ids, tail=(r, r, nw), bf16=bf16)
+            torch.cuda.synchronize()
+            y, q, s = outs[:3]
+            shapes_ok = q.shape[0] == s.shape[0] == m * ctx.world and (
+                not bf16 or outs[3].shape[0] == m * ctx.world
             )
-            if not ok
-        ]
-        if not ctx.all_ok(not bad):
-            raise CaseFailure(f"tail bf16={bf16}: {bad or 'other rank'}")
+            q, s = q[rows], s[rows]
+            e_q = float((q.view(fp8).float() * s[:, None] - xn_).norm() / xn_.norm())
+            bad = [
+                what
+                for what, ok in (
+                    ("watchdog", not layer.poll_errors()),
+                    ("shapes [T, ...]", shapes_ok),
+                    ("y", torch.equal(y, y0)),
+                    ("res_out", torch.equal(r, r_ref)),
+                    (f"q rel {e_q:.4f} (fp8 {e_ref_:.4f})", e_q < 1.05 * e_ref_),
+                    ("scale", float(((s - s_ref_).abs() / s_ref_).max()) < 1e-2),
+                    ("bf16 rows", not bf16 or rel_l2(outs[3][rows], xn_) < 0.01),
+                )
+                if not ok
+            ]
+            if not ctx.all_ok(not bad):
+                raise CaseFailure(f"tail tn_local={local} bf16={bf16}: {bad or 'other rank'}")
+    eng.tn_local = True
     return e_q
 
 

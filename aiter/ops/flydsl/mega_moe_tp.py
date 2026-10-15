@@ -196,9 +196,11 @@ class MegaMoeTP:
         bf16: bool = False,
     ):
         """ag_rs: x [m, H] (own tokens); ar: x [M, H] replicated. tail (ag_rs, see
-        tail_ok): (res_in, res_out, norm_w) -> also res_out = y + res_in and every rank's
-        FP8 rows (+ fp32 scales; bf16: + the bf16 rows) of the norm of res_out: returns
-        (y, q, scale[, rows])."""
+        tail_ok): (res_in, res_out, norm_w) -> also res_out = y + res_in and the FP8 rows
+        (+ fp32 scales; bf16: + the bf16 rows) of the norm of res_out: returns (y, q,
+        scale[, rows]), each [tp * m, ...] with rank r's rows at r * m. engine.tn_local
+        (default True): only this rank's rows are written (the others are undefined);
+        False: every rank's."""
         if self._big(x_local.shape[0]):
             local = bool(self.engine.tn_local)
             res = self.bigm().moe(x_local, topk_weights, topk_ids, out=out, tail=tail, local=local)
@@ -208,8 +210,9 @@ class MegaMoeTP:
         return self.engine(x_local, topk_weights, topk_ids, out, tail=tail, bf16=bf16)
 
     def _bigm_rows(self, res_out, norm_w, local):
-        """the big-M tail's bf16 rows: (Gemma)RMSNorm of res_out, this rank's (local) or every
-        rank's rows (the kernel writes the FP8 rows only). Every rank's rows are exchanged
+        """the big-M tail's bf16 rows [tp * m, H]: (Gemma)RMSNorm of res_out at this rank's
+        position, the other ranks' rows too unless local (the kernel writes the FP8 rows
+        only). Every rank's rows are exchanged
         through the big-M kernel's hipIpc arena (device copies over xGMI), not through the
         caller's group: that is a gloo CPU group in ATOM, where the ~400 MB all-gather of a
         32K batch took ~0.3 s."""
@@ -217,9 +220,7 @@ class MegaMoeTP:
         w = norm_w.float() + 1.0 if self.engine.tn_gemma else norm_w.float()
         inv = torch.rsqrt(r.pow(2).mean(-1, keepdim=True) + float(self.engine.tn_eps))
         rows = r.mul_(inv).mul_(w).to(torch.bfloat16)
-        if local:
-            return rows
-        return self.bigm().gather_rows(rows)
+        return self.bigm().gather_rows(rows, local=local)
 
     def _big(self, local_tokens: int) -> bool:
         return bool(self.bigm_m) and local_tokens >= self.bigm_m

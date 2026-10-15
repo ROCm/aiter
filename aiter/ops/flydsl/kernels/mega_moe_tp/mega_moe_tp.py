@@ -417,8 +417,10 @@ class MegaMoeTPEngine:
         # the fused tail's norm (compiled in; part of the launcher key)
         self.tn_eps = float(tail_eps)
         self.tn_gemma = bool(tail_gemma)
-        # tail q/scales of own rows only (the caller gathers them, e.g. on SDMA)
-        self.tn_local = False
+        # tail q/scales (bf16: + rows) of own rows only, at their [T, H] position; the other
+        # ranks' rows are not written (no peer stores / waits). Default: an SP caller (ATOM)
+        # consumes its own rows only; False: every rank's rows (the caller needs them all)
+        self.tn_local = True
         arena.commit()
         self.arena = arena
         self.ctrl = torch.zeros(CTRL_INTS, dtype=torch.int32, device=self.device)
