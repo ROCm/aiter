@@ -9,11 +9,18 @@ argument-hint: [model name or aiter/configs/**/*.csv file]
 Tuned config CSVs in `aiter/configs/` are **not read one file at a time**. At
 runtime `aiter/jit/core.py::AITER_CONFIGS.get_config_file` merges, per family,
 the canonical `aiter/configs/<name>.csv` **plus every**
-`aiter/configs/model_configs/*<name>*.csv`, and `update_config_files`
-de-duplicates that merge on a key derived from the matching **untuned** file's
-columns (+ `cu_num`/`gfx`/`_tag`). If two rows across the merged files share that
-key, the merge **raises** `RuntimeError: Found N duplicate shape entries during
-merge of '<family>'`.
+`aiter/configs/model_configs/*<name>*.csv`, and `_raise_on_duplicate_shapes`
+de-duplicates on a key derived from the matching **untuned** file's
+columns (+ `cu_num`/`gfx`/`_tag`). If two rows share that key, the check
+**raises** `RuntimeError: Found N duplicate shape entries during merge of
+'<family>'`.
+
+This check runs on **both** paths: multi-file merges **and** single-file families
+(a lone CSV with no `model_configs/` sibling). A single file can still hold
+duplicate shapes when a retune is appended instead of replacing the old row; since
+#6365 this is caught at load time instead of silently accepted. In a read-only
+install or container, the write-back may fail — the diagnostic is preserved and
+the files that could not be rewritten are listed under "Not updated".
 
 Consequence: a per-model config you add can be perfectly fine alone yet collide
 with a *different* model's config once both are on `main`. Single-PR CI only
@@ -147,7 +154,8 @@ After resolving, re-run the guard until it passes.
 - Guard test: `op_tests/tuning_tests/test_config_shape_collision.py` (drives the
   real merge; add a family here if you register a new `AITER_CONFIG_*` file).
 - Runtime merge + dedup: `aiter/jit/core.py::get_config_file` /
-  `update_config_files` (key derivation, gfx backfill, `_tag`, write-back).
+  `update_config_files` / `_raise_on_duplicate_shapes` (key derivation, gfx
+  backfill, `_tag`, write-back; single-file and multi-file paths).
 - GPU end-to-end counterpart: `op_tests/tuning_tests/test_run_config.py` (runs
   every merged shape).
 
