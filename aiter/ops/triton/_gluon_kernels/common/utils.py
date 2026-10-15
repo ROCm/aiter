@@ -7,6 +7,12 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.extra.hip import libdevice
 
+# Triton main renamed shared_memory_descriptor._reinterpret to reinterpret
+# (triton-lang/triton#11131); older Tritons, such as the ROCm 3.8 wheel, have
+# only _reinterpret. Kernels call reinterpret; give older Tritons that name too.
+if not hasattr(gl.shared_memory_descriptor, "reinterpret"):
+    gl.shared_memory_descriptor.reinterpret = gl.shared_memory_descriptor._reinterpret
+
 
 @gluon.jit
 def exp_scaled(scale, x):
