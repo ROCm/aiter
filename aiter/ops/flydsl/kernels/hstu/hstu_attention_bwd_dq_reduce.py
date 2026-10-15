@@ -51,10 +51,15 @@ from aiter.ops.flydsl.kernels.hstu.hstu_attention_common import (
     _dtype_to_elem_type,
 )
 
-# 16 q rows per workgroup. Each row is H*D fp32 = 1 KB at the tuned shape, so a
-# thread-per-(h, d) mapping makes every tile read one fully coalesced 1 KB run,
-# and 16 rows keeps the fp32 accumulators at 16 VGPR.
+# 16 q rows per workgroup, 16 fp32 accumulators per thread.
 ROWS_PER_BLOCK = 16
+# Elements per thread per access. A thread-per-(h, d) mapping is coalesced but
+# issues a separate `global_load_dword` for every row, because consecutive rows
+# are H*D elements apart and nothing fuses. Giving each thread VEC CONSECUTIVE
+# columns instead lets the backend widen them to dwordx4 (and the bf16 stores
+# to dwordx2), which is 4x fewer memory instructions for exactly the same
+# bytes. VEC must divide head_dim so a thread never straddles two heads.
+VEC = 4
 
 
 def validate_hstu_attention_bwd_dq_reduce(num_heads, head_dim, block_m, dtype_str):
@@ -74,6 +79,18 @@ def validate_hstu_attention_bwd_dq_reduce(num_heads, head_dim, block_m, dtype_st
             f"num_heads*head_dim ({num_heads * head_dim}) must be a multiple of "
             f"the wave size ({WARP_SIZE})"
         )
+    if head_dim % VEC != 0:
+        raise ValueError(
+            f"head_dim ({head_dim}) must be a multiple of VEC ({VEC}) so a "
+            f"thread's run of columns stays inside one head"
+        )
+    hd = num_heads * head_dim
+    row_group = max(hd // (hd // VEC), 1)
+    if ROWS_PER_BLOCK % row_group != 0:
+        raise ValueError(
+            f"ROWS_PER_BLOCK ({ROWS_PER_BLOCK}) must be a multiple of the "
+            f"{row_group} rows a workgroup spans at VEC={VEC}"
+        )
 
 
 @functools.lru_cache(maxsize=None)
@@ -90,8 +107,16 @@ def build_hstu_attention_bwd_dq_reduce(
     validate_hstu_attention_bwd_dq_reduce(num_heads, head_dim, block_m, dtype_str)
     elem_dtype = _dtype_to_elem_type(dtype_str)
     HD = num_heads * head_dim
-    THREADS = HD
     ROWS = ROWS_PER_BLOCK
+    # Threads tile the (row, column-run) grid: LANES_PER_ROW threads cover one
+    # row's VEC-element runs, so the workgroup spans ROW_GROUP rows at a time
+    # and sweeps its block in SLICES steps. THREADS stays HD -- making it
+    # HD//VEC would be a single wave per workgroup carrying ROWS*VEC
+    # accumulators.
+    THREADS = HD
+    LANES_PER_ROW = HD // VEC
+    ROW_GROUP = max(THREADS // LANES_PER_ROW, 1)
+    SLICES = ROWS // ROW_GROUP
 
     @flyc.kernel(known_block_size=[THREADS, 1, 1])
     def hstu_attention_bwd_dq_reduce(
@@ -118,26 +143,33 @@ def build_hstu_attention_bwd_dq_reduce(
         seq_len = fx.Int32(seq_offsets[fx.Int32(b) + fx.Int32(1)]) - seq_start
         row0 = fx.Int32(blk) * fx.Int32(ROWS)
 
-        h = tid // fx.Int32(head_dim)
-        d = tid % fx.Int32(head_dim)
+        row_sub = tid // fx.Int32(LANES_PER_ROW)
+        col = (tid % fx.Int32(LANES_PER_ROW)) * fx.Int32(VEC)
+        h = col // fx.Int32(head_dim)
+        d0 = col % fx.Int32(head_dim)
+
+        # The tail rows of the last block are clamped onto the last real row,
+        # so they read (and later rewrite) a valid element with the value that
+        # row would get anyway. Bounding the WRITE instead would need a dynamic
+        # `if` around a tensor subscript store, which makes the AST rewriter
+        # demand an scf.if result for the output tensor.
+        rr = []
+        for s in range_constexpr(SLICES):
+            _r = row0 + fx.Int32(s * ROW_GROUP) + row_sub
+            rr.append((_r < seq_len).select(_r, seq_len - fx.Int32(1)))
 
         # Every row of this workgroup lies in the same kv tile, so one count
         # serves all of them: BLOCK_M is a multiple of ROWS.
         n_t = row0 // fx.Int32(block_m) + fx.Int32(1)
         n_t = (n_t < tile_hi).select(n_t, tile_hi)
 
-        acc0 = [fx.Float32(0.0) for _ in range_constexpr(ROWS)]
+        acc0 = [fx.Float32(0.0) for _ in range_constexpr(SLICES * VEC)]
         if const_expr(not first_pass):
-            for r in range_constexpr(ROWS):
-                # The tail rows of the last block are clamped onto the last
-                # real row, so they read (and later rewrite) a valid element
-                # with the value that row would get anyway. Bounding the WRITE
-                # instead would need a dynamic `if` around a tensor subscript
-                # store, which makes the AST rewriter demand an scf.if result
-                # for the output tensor.
-                _rr = row0 + fx.Int32(r)
-                _rr = (_rr < seq_len).select(_rr, seq_len - fx.Int32(1))
-                acc0[r] = dq_acc[fx.Int64(seq_start + _rr), tid]
+            for s in range_constexpr(SLICES):
+                for j in range_constexpr(VEC):
+                    acc0[s * VEC + j] = dq_acc[
+                        fx.Int64(seq_start + rr[s]), col + fx.Int32(j)
+                    ]
 
         for _t, it in range(
             fx.Int64(tile_lo), fx.Int64(n_t), fx.Int64(1), init=acc0
@@ -148,31 +180,33 @@ def build_hstu_attention_bwd_dq_reduce(
                 fx.Float32(x)
                 for x in (list(it) if isinstance(it, (list, tuple)) else [it])
             ]
-            t = fx.Int32(_t)
-            o = part_off[fx.Int64(b) * fx.Int64(max_tiles) + fx.Int64(t)]
-            base = fx.Int64(o)
-            row_in_slot = row0 - t * fx.Int32(block_m)
+            t_i = fx.Int32(_t)
+            base = fx.Int64(part_off[fx.Int64(b) * fx.Int64(max_tiles) + fx.Int64(t_i)])
+            row_in_slot = row0 - t_i * fx.Int32(block_m)
             nxt = []
-            for r in range_constexpr(ROWS):
-                _rr = row0 + fx.Int32(r)
-                _rr = (_rr < seq_len).select(_rr, seq_len - fx.Int32(1))
-                _ri = row_in_slot + (_rr - row0)
-                nxt.append(
-                    acc[r] + dq_part[base + fx.Int64(_ri), tid]
-                )
+            for s in range_constexpr(SLICES):
+                _ri = row_in_slot + (rr[s] - row0)
+                for j in range_constexpr(VEC):
+                    nxt.append(
+                        acc[s * VEC + j]
+                        + dq_part[base + fx.Int64(_ri), col + fx.Int32(j)]
+                    )
             acc = yield nxt
 
         res = [
             fx.Float32(x)
             for x in (list(acc) if isinstance(acc, (list, tuple)) else [acc])
         ]
-        for r in range_constexpr(ROWS):
-            _rr = row0 + fx.Int32(r)
-            _rr = (_rr < seq_len).select(_rr, seq_len - fx.Int32(1))
-            if const_expr(last_pass):
-                out_dq[fx.Int64(seq_start + _rr), h, d] = res[r].to(elem_dtype)
-            else:
-                dq_acc[fx.Int64(seq_start + _rr), tid] = res[r]
+        for s in range_constexpr(SLICES):
+            for j in range_constexpr(VEC):
+                if const_expr(last_pass):
+                    out_dq[fx.Int64(seq_start + rr[s]), h, d0 + fx.Int32(j)] = res[
+                        s * VEC + j
+                    ].to(elem_dtype)
+                else:
+                    dq_acc[fx.Int64(seq_start + rr[s]), col + fx.Int32(j)] = res[
+                        s * VEC + j
+                    ]
 
     @flyc.jit
     def launch_hstu_attention_bwd_dq_reduce(
