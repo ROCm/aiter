@@ -33,12 +33,9 @@ from ...allreduce_policy import (
     MESH_CODECS,
     SUPER_TILES,
     SUPPORTED_ARCHS,
-    SUPPORTED_BLOCKS,
     SUPPORTED_WORLDS,
 )
 from .quick_allreduce_codec import (
-    _atom_bf16_to_f16,
-    _atom_f16_to_bf16,
     _clamp_fp16_overflow,
     _codec_dequant,
     _codec_load,
@@ -50,17 +47,9 @@ from .quick_allreduce_codec import (
     scale_slot_of,
     thread_lane,
 )
-from .quick_allreduce_fusions import (
-    ATOM_ELEMS,
-    FUSIONS,
-    make_rowbuf_atom_row,
-    make_wave_partials,
-    pack_bf16,
-    quick_reduce_row_block_at,
-    residual_add,
-    rms_rstd,
-    scale_by_weight,
-)
+from .quick_allreduce_epilogue import QuickReducePlainEpilogue
+from .quick_allreduce_fusions import check_fusion_args
+from .quick_allreduce_rmsnorm import MeshRMSNormEpilogue
 from .transport import (
     _INBOX_POLICY,
     ATOMS,
@@ -70,7 +59,6 @@ from .transport import (
     QUAD_LANES,
     QUADS_PER_WAVE,
     TILE_BYTES,
-    WAVE,
     WORLD,
     _acquire_inbox,
     _buffer_load,
@@ -79,12 +67,10 @@ from .transport import (
     _i32_to_bytes,
     _load_flag,
     _load_peers,
-    _payload_io,
     _release_inbox,
     _store_flag_peer,
     _store_v4i32_peer,
     _to_sgpr_i64,
-    make_hbm_operand,
     make_pack_storage,
 )
 
@@ -197,14 +183,7 @@ def make_quick_allreduce_mesh_kernel(
     h_pad: int | None = None,
     rank: int,
 ):
-    if fusion not in FUSIONS:
-        raise ValueError(f"fusion must be one of {FUSIONS}, got {fusion!r}")
-    if fusion != "none" and hidden is None:
-        raise ValueError(f"fusion={fusion!r} requires hidden")
-    if fusion == "none" and hidden is not None:
-        raise ValueError("hidden is only meaningful for a fused build")
-    if fusion == "none" and h_pad is not None:
-        raise ValueError("h_pad is only meaningful for a fused build")
+    check_fusion_args(fusion, hidden, h_pad)
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
@@ -218,42 +197,15 @@ def make_quick_allreduce_mesh_kernel(
     if not 0 <= int(rank) < world_size:
         raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
 
-    fused = fusion == "rmsnorm"
-    if fused:
-        # ``h_pad`` is the width the *workgroup* covers, ``hidden`` the width the
-        # *tensor* has. The block, the tile, the codec and the wire all follow
-        # h_pad; the HBM row stride and the RMS denominator follow hidden.
-        h_pad = hidden if h_pad is None else int(h_pad)
-        if h_pad < hidden:
-            raise ValueError(f"h_pad={h_pad} is narrower than hidden={hidden}")
-        if h_pad != hidden and hidden % ATOM_ELEMS:
-            raise ValueError(
-                f"a padded fused build needs hidden to be a whole number of "
-                f"{ATOM_ELEMS}-element atoms so the pad boundary lands on an "
-                f"atom granule, got hidden={hidden}"
-            )
-        block, atoms_per_row = quick_reduce_row_block_at(h_pad, world_size, block)
+    if fusion == "none":
+        epi = QuickReducePlainEpilogue(block=block, world_size=world_size)
     else:
-        # The plain kernel takes a caller-chosen block; the fused build derives
-        # its own from the row geometry just above.
-        if block is None:
-            raise ValueError("a plain build requires block")
-        if block not in SUPPORTED_BLOCKS:
-            raise ValueError(f"block must be one of {SUPPORTED_BLOCKS}, got {block!r}")
-        atoms_per_row = 1
-    padded = fused and h_pad != hidden
-    rows_per_tile = ATOMS // atoms_per_row
-    n_waves = block // WAVE
+        epi = MeshRMSNormEpilogue(
+            hidden=hidden, h_pad=h_pad, block=block, world_size=world_size
+        )
+    block = epi.block
     tile_i32 = block * ATOMS * 4
     tile_bytes = tile_i32 * 4
-    # i32 between one token row and the next *in HBM*, and the HBM bytes a whole
-    # tile spans. These part company from ``tile_i32``/``tile_bytes`` exactly
-    # when a build is padded: the wire tile is rows_per_tile rows of h_pad, the
-    # HBM footprint is rows_per_tile rows of hidden. The host derives num_tiles
-    # from ``hbm_tile_bytes``, never from ``tile_bytes``.
-    row_stride_i32 = (hidden // 2) if fused else tile_i32
-    hbm_tile_i32 = rows_per_tile * row_stride_i32 if fused else tile_i32
-    hbm_tile_bytes = hbm_tile_i32 * 4
 
     c = codecs_for_block(block)[codec]
     quads_per_block = block // QUAD_LANES
@@ -293,7 +245,7 @@ def make_quick_allreduce_mesh_kernel(
     # run out of quads and silently drop the sectors past the end, so a fused
     # build that lands there is rejected rather than built. (The plain path can
     # still narrow ``stripe_width`` below; only fused derives its own block.)
-    if const_expr(fused):
+    if fusion != "none":
         _, need_quads = mesh_fanout_quads(block, world_size, codec)
         if quads_per_block < need_quads:
             raise ValueError(
@@ -316,13 +268,8 @@ def make_quick_allreduce_mesh_kernel(
     pack_i32 = pack_rows * c.rank_tile_i32
     lds_bytes = pack_rows * c.rank_tile_bytes
 
-    # Per-wave partials for the fused sum of squares, one slot per row of a
-    # tile. Allocated from the same allocator as the pack staging (FlyDSL
-    # permits one per kernel) but as its own region, so it cannot alias a
-    # packet the fanout is still reading.
-    n_partials = rows_per_tile * n_waves if (fused and n_waves > 1) else 0
-    WavePartials = make_wave_partials(n_partials) if n_partials else None
-    lds_bytes += n_partials * 4
+    # The epilogue's per-wave LDS partials, if any, follow the pack staging.
+    lds_bytes += epi.partial_floats * 4
     PackStorage = make_pack_storage(pack_i32)
 
     # flags_i32 is also the i32 offset of the wire area, so the flag prefix has
@@ -339,8 +286,8 @@ def make_quick_allreduce_mesh_kernel(
     flags_i32 = PHASES * grid * world_size
 
     # One signature for both modes; the plain launcher below passes zeros for
-    # the fused operands, which ``const_expr(fused)`` elides every use of. See
-    # the ring kernel for why the split is at the launcher and not here.
+    # the fused operands, which a plain epilogue never reads. See the ring
+    # kernel for why the split is at the launcher and not here.
     @flyc.kernel(known_block_size=[block, 1, 1])
     def quick_allreduce_mesh(
         rank: fx.Int32,
@@ -369,36 +316,6 @@ def make_quick_allreduce_mesh_kernel(
         # 64 B NT sectors of one rank-tile: (sector, lane-in-quad) -> i32
         # start of the dwordx4. Isolated NT store stays explicit.
         nt_own_layout = fx.make_layout((c.n_sectors, QUAD_LANES), (16, 4))
-        # The fused epilogue reaches its HBM operands (residual, weight, final
-        # output) as raw bf16 atoms through a tiled copy; the plain reduce path
-        # uses the shared ``_payload_io`` helpers below and never builds these.
-        # ``hbm_row_layout`` (one atom-wide row) and ``hbm_copy`` serve both fused
-        # sub-modes; a padded build addresses each row through a per-row bounded
-        # descriptor (``_rowbuf_atom_row``), an unpadded one slices the
-        # whole-tensor buffer tensor (``_hbm_atom_row``). ``hbm_layout`` is the
-        # 3-D whole-tensor layout consumed only by the unpadded
-        # ``make_hbm_operand``; a padded build leaves it None.
-        hbm_i32_ptr = None
-        hbm_layout = None
-        hbm_row_layout = None
-        hbm_copy_atom = None
-        hbm_copy = None
-        if const_expr(fused):
-            hbm_i32_ptr = fx.PointerType.get(
-                T.i32, address_space=fx.AddressSpace.Global, alignment=16
-            )
-            if const_expr(not padded):
-                hbm_layout = fx.make_layout(
-                    (num_tiles, ATOMS, block * 4),
-                    (hbm_tile_i32, block * 4, 1),
-                )
-            hbm_row_layout = fx.make_layout((1, block * 4), (block * 4, 1))
-            hbm_copy_atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.Int32)
-            hbm_copy = fx.make_tiled_copy_tv(
-                hbm_copy_atom,
-                fx.make_layout((1, block), (1, 1)),
-                fx.make_layout((1, 4), (1, 1)),
-            ).get_slice(tid)
         # Four group-16 E4M3 bytes share the i32 slot eight threads already own.
         scale_slot, pair_in_slot = scale_slot_of(tid, block)
         wire_slot_layout = fx.make_layout(
@@ -415,13 +332,6 @@ def make_quick_allreduce_mesh_kernel(
         lds = allocator.allocate(PackStorage).peek()
         pack = lds.pack.view(pack_layout)
         smem_ptr = lds.pack.ptr
-        # A second region from the same allocator -- FlyDSL permits one per
-        # kernel -- hoisted here because it is static: an allocation reached
-        # from inside the tile loop would emit one LDS symbol per visit.
-        sq_lds = None
-        if const_expr(n_partials > 0):
-            sq_lds = allocator.allocate(WavePartials).peek().wave.ptr
-
         peers = _load_peers(peer_ptrs, world_size)
         peer_vec = fx.Vector.from_elements(peers, dtype=fx.Int64)
         inbox = _buffer_ptr(_to_sgpr_i64(peer_vec[rank]), T.i32, 4)
@@ -434,62 +344,30 @@ def make_quick_allreduce_mesh_kernel(
                 base = (j == fx.Int32(i)).select(peers[push_peers[i]], base)
             return base
 
-        # The plain reduce path moves whole tiles through the shared payload
-        # helpers; the fused epilogue below reaches the same rows as raw bf16
-        # atoms through the tiled copy instead.
-        _load_atom, _store_atom = _payload_io(
-            inp_ptr,
-            out_ptr,
-            nbytes,
-            num_tiles,
-            ATOMS,
-            block,
-            tid,
-            decode=_atom_bf16_to_f16,
-            encode=_atom_f16_to_bf16,
+        # Everything that touches HBM goes through the epilogue: the plain one
+        # moves whole tiles through ``_payload_io``, a fused one reaches the
+        # same rows as raw bf16 atoms. Its LDS, if any, comes from this kernel's
+        # one allocator, after the pack staging.
+        ep = epi.bind(
+            tid=tid,
+            nbytes=nbytes,
+            num_tiles=num_tiles,
+            inp_ptr=inp_ptr,
+            out_ptr=out_ptr,
+            res_in_ptr=res_in_ptr,
+            res_out_ptr=res_out_ptr,
+            w_ptr=w_ptr,
+            eps=eps,
+            allocator=allocator,
         )
+        # Bare names, not ``ep.<hook>(...)``: the rewriter takes a method call
+        # inside a runtime loop or branch as a possible mutation of its base
+        # and would try to carry ``ep`` through the loop as an SSA value.
+        _load_atom = ep.load_atom
+        _stash_own = ep.stash_own
+        _unstash_own = ep.unstash_own
+        _finish_tile = ep.finish_tile
         _load_color, _store_color = _color_io(colors_ptr, bid)
-
-        if const_expr(fused):
-            # A padded build keeps the HBM operands as raw ``Int64`` base
-            # pointers so ``_rowbuf_atom_row`` can bound a fresh descriptor per
-            # row; an unpadded build wraps them in the whole-tensor buffer tensor.
-            _operand = make_hbm_operand(
-                padded=padded,
-                nbytes=nbytes,
-                hbm_i32_ptr=hbm_i32_ptr,
-                hbm_layout=hbm_layout,
-            )
-            # A padded build addresses each row through a per-row buffer
-            # descriptor bounded to the true width, and to nothing at all for a
-            # row past M in a partial last tile; ``_rowbuf_atom_row(ptr, tile,
-            # atom)`` builds it from the operand's raw base pointer. Unpadded is
-            # None (unused).
-            _rowbuf_atom_row = (
-                make_rowbuf_atom_row(
-                    atoms_per_row=atoms_per_row,
-                    rows_per_tile=rows_per_tile,
-                    row_stride_i32=row_stride_i32,
-                    block=block,
-                    hidden=hidden,
-                    hbm_i32_ptr=hbm_i32_ptr,
-                    hbm_row_layout=hbm_row_layout,
-                    nbytes=nbytes,
-                )
-                if padded
-                else None
-            )
-
-            # residual in/out share the payload's (M, hidden) bf16 shape, so they
-            # ride the same addressing, as does the final output row. The gain is
-            # one (hidden,) row -- ``atoms_per_row`` atoms at tile 0; a padded
-            # build reads it through the per-row descriptor at row 0, an unpadded
-            # one bounds a one-row buffer tensor at the true width (the whole mask
-            # for this operand, since nothing lies past it).
-            out_buf = _operand(out_ptr)
-            res_in_buf = _operand(res_in_ptr)
-            res_out_buf = _operand(res_out_ptr)
-            w_buf = _operand(w_ptr, records=fx.Int64(hidden * 2))
 
         def _pack_off(peer, i32_idx):
             return fx.get_scalar(fx.crd2idx((peer, i32_idx), pack_layout))
@@ -500,29 +378,8 @@ def make_quick_allreduce_mesh_kernel(
             )
             return fx.Int32(flags_i32) + slot
 
-        if const_expr(fused):
-
-            def _hbm_atom_row(buf, tile, atom):
-                return fx.make_view(
-                    fx.get_iter(fx.slice(buf, (tile, atom, None))),
-                    hbm_row_layout,
-                )
-
-            # The row-view function is chosen once at trace time: a padded build
-            # addresses each row through a per-row bounded descriptor, an
-            # unpadded one slices the whole-tensor buffer tensor. Both return a
-            # one-atom-wide row view that ``partition_S/D`` consume, so the copy
-            # bodies are uniform.
-            _atom_row = _rowbuf_atom_row if padded else _hbm_atom_row
-
         def _load_tile_atoms(tile):
             return [_load_atom(tile, atom) for atom in range_constexpr(ATOMS)]
-
-        def _store_tile_atoms(tile, atoms):
-            """Store a gathered tile; ``None`` marks atoms already stored."""
-            for atom in range_constexpr(ATOMS):
-                if const_expr(atoms[atom] is not None):
-                    _store_atom(tile, atom, atoms[atom])
 
         def _own_atoms(atoms):
             """This rank's reduce-scatter share, out of a whole tile's atoms."""
@@ -534,84 +391,6 @@ def make_quick_allreduce_mesh_kernel(
                 [_i32(_f16x2(a[i]) + _f16x2(b[i])) for i in range_constexpr(4)],
                 fx.Int32,
             )
-
-        if const_expr(fused):
-
-            def _load_raw_atom(buf, tile, atom):
-                """One 16 B atom, unconverted -- the fused epilogue's bf16
-                operands are not codec values and never become fp16."""
-                src = hbm_copy.partition_S(_atom_row(buf, tile, atom))
-                frag = fx.make_fragment_like(src)
-                fx.copy(hbm_copy_atom, src, frag)
-                return fx.Vector(frag.load())
-
-            def _store_raw_atom(buf, tile, atom, value):
-                dst = hbm_copy.partition_D(_atom_row(buf, tile, atom))
-                frag = fx.make_fragment_like(dst)
-                frag.store(value)
-                fx.copy(hbm_copy_atom, frag, dst)
-
-            # The reduce-scatter input read must reach ``inp`` through the same
-            # per-row bounded descriptor the epilogue uses, not the plain path's
-            # whole-payload ``_payload_io`` tensor. At h_pad != hidden the wire
-            # tile is wider than the HBM row, so ``_payload_io``'s single bound
-            # lets a pad lane read the next row instead of zero -- which then
-            # rides the wire into residual_out. Re-home ``_load_tile_atoms`` onto
-            # the raw-atom route (bf16 -> f16 for the codec), shadowing the plain
-            # definition above for the fused build only.
-            in_buf = _operand(inp_ptr)
-
-            def _load_tile_atoms(tile):
-                atoms = []
-                for atom in range_constexpr(ATOMS):
-                    atoms.append(_atom_bf16_to_f16(_load_raw_atom(in_buf, tile, atom)))
-                return atoms
-
-            def _atom_f16_to_f32(atom):
-                """Packed fp16 -> 8 f32. A widening move; exact, no rounding."""
-                return fx.Vector(atom).bitcast(fx.Float16).to(fx.Float32)
-
-            def _epilogue(tile, gathered, w_atoms):
-                """Residual add + RMSNorm over the whole tile.
-
-                The mesh ends a tile holding every atom of it, and the fused
-                geometry makes ``atoms_per_row`` of them one token row, so the
-                tile is ``rows_per_tile`` independent rows and each reduces inside
-                this block. All of them go through one ``rms_rstd`` call, which is
-                one barrier rather than one per row.
-                """
-                rows = []
-                for r in range_constexpr(rows_per_tile):
-                    idx = [
-                        r * atoms_per_row + a for a in range_constexpr(atoms_per_row)
-                    ]
-                    xs = residual_add(
-                        [_atom_f16_to_f32(gathered[j]) for j in idx],
-                        [_load_raw_atom(res_in_buf, tile, j) for j in idx],
-                    )
-                    rows.append(xs)
-                    # residual_out is final here, so it is issued ahead of the
-                    # reduction rather than behind its barrier.
-                    packed = pack_bf16(xs)
-                    for a in range_constexpr(atoms_per_row):
-                        _store_raw_atom(res_out_buf, tile, idx[a], packed[a])
-
-                rstds = rms_rstd(rows, eps, hidden, tid=tid, block=block, lds=sq_lds)
-                for r in range_constexpr(rows_per_tile):
-                    outs = scale_by_weight(rows[r], rstds[r], w_atoms)
-                    for a in range_constexpr(atoms_per_row):
-                        _store_raw_atom(out_buf, tile, r * atoms_per_row + a, outs[a])
-                if const_expr(n_partials > 0):
-                    # The next tile reuses these slots, and the super-tile store
-                    # loop runs back-to-back with no barrier of its own between
-                    # iterations -- this is what separates its writes from reads.
-                    gpu.barrier()
-
-        def _finish_tile(tile, gathered, w_atoms):
-            if const_expr(fused):
-                _epilogue(tile, gathered, w_atoms)
-            else:
-                _store_tile_atoms(tile, gathered)
 
         def _lds_write_packet(slot, words, scale, is_leader):
             for (off, pred), word in zip(c.plane_slots(tid), words):
@@ -821,16 +600,16 @@ def make_quick_allreduce_mesh_kernel(
                             accs[k] = _codec_dequant(c, words, scale, tid, accs[k])
             return accs
 
-        def _recv_all_gather(sub, own=None):
+        def _recv_all_gather(sub, own):
             """Dequantize every peer's all-gather packet back into full-tile atoms.
 
-            Our own chunk is *own*, or ``None`` where it has been stored already.
+            Our own chunk is *own*, with ``None`` for atoms stored already.
             """
             gathered = []
             for src in range_constexpr(world_size):
                 for k in range_constexpr(rank_atoms):
                     if const_expr(src == self_rank):
-                        gathered.append(None if own is None else own[k])
+                        gathered.append(own[k])
                     else:
                         words, scale = _recv_quantized(
                             PHASE_ALL_GATHER, fx.Int32(src), sub, k
@@ -841,47 +620,16 @@ def make_quick_allreduce_mesh_kernel(
         # ST>1 carries nothing in registers between the three super-tile
         # loops; these move our own share and reduced chunk instead.
         def _load_own_share(tile, k):
-            """Our reduce-scatter share of *tile*, reloaded from the input. A
-            fused build reads it through the same per-row route as
-            ``_load_tile_atoms``, so a padded row's pad lanes come back zero."""
-            atom = self_rank * rank_atoms + k
-            if const_expr(fused):
-                return _atom_bf16_to_f16(_load_raw_atom(in_buf, tile, atom))
-            return _load_atom(tile, atom)
+            """Our reduce-scatter share of *tile*, reloaded from the input."""
+            return _load_atom(tile, self_rank * rank_atoms + k)
 
-        def _stash_own(tile, k, value):
-            """Park our reduced chunk in ``out`` until the tile is finished.
-
-            A plain build's store here is already its final one. A fused build
-            parks the raw fp16 bits in the same slot for ``_unstash_own`` --
-            exact, where a bf16 store would round -- and the epilogue then
-            overwrites them. The all-gather publish between the two drains
-            ``vmcnt``, so the reload sees the store.
-            """
-            atom = self_rank * rank_atoms + k
-            if const_expr(fused):
-                _store_raw_atom(out_buf, tile, atom, value)
-            else:
-                _store_atom(tile, atom, value)
-
-        def _unstash_own(tile):
+        def _unstash_own_chunk(tile):
             """The own slot for ``_recv_all_gather`` in the third loop: what
-            ``_stash_own`` parked on a fused build, else ``None`` (a plain
-            build, whose store was final)."""
-            if const_expr(fused):
-                return [
-                    _load_raw_atom(out_buf, tile, self_rank * rank_atoms + k)
-                    for k in range_constexpr(rank_atoms)
-                ]
-            return None
-
-        # One row shared by every token, so the gain is read once here rather
-        # than once per tile.
-        w_atoms = None
-        if const_expr(fused):
-            w_atoms = [
-                _load_raw_atom(w_buf, fx.Int32(0), a)
-                for a in range_constexpr(atoms_per_row)
+            ``_stash_own`` parked, or ``None`` per atom where that store was
+            already final."""
+            return [
+                _unstash_own(tile, self_rank * rank_atoms + k)
+                for k in range_constexpr(rank_atoms)
             ]
 
         # Stride by the *launched* grid, not the compile-time cap. The host
@@ -913,7 +661,7 @@ def make_quick_allreduce_mesh_kernel(
 
                 _wait_release(PHASE_ALL_GATHER, color)
                 gathered = _recv_all_gather(fx.Int32(0), own_ag)
-                _finish_tile(tile, gathered, w_atoms)
+                _finish_tile(tile, gathered)
 
                 color = color + fx.Int32(1)
                 if color == fx.Int32(0):  # 0 is unset sentinel
@@ -956,7 +704,7 @@ def make_quick_allreduce_mesh_kernel(
                     acc = _reduce_scattered(s, own_rs)
                     own_ag = _pack_all_gather(acc)
                     for k in range_constexpr(rank_atoms):
-                        _stash_own(tile, k, own_ag[k])
+                        _stash_own(tile, self_rank * rank_atoms + k, own_ag[k])
                     gpu.barrier()
                     _fanout_nt(PHASE_ALL_GATHER, rank, s)
                     if (s + fx.Int32(1)) < n_this:
@@ -968,8 +716,8 @@ def make_quick_allreduce_mesh_kernel(
 
                 for s in range(fx.Int32(0), n_this, fx.Int32(1)):
                     tile = bid + (i + s) * n_blocks
-                    gathered = _recv_all_gather(s, _unstash_own(tile))
-                    _finish_tile(tile, gathered, w_atoms)
+                    gathered = _recv_all_gather(s, _unstash_own_chunk(tile))
+                    _finish_tile(tile, gathered)
 
                 color = color + fx.Int32(1)
                 if color == fx.Int32(0):  # 0 is unset sentinel
@@ -1054,15 +802,11 @@ def make_quick_allreduce_mesh_kernel(
     # both have to be part of the symbol name -- two variants that differ only
     # in cache bits or wire format must not collide in the JIT cache.
     tag = f"ws{world_size}_r{self_rank}_st{super_tile}_g{grid}_{inbox_memory}"
-    tag += f"_{codec}_b{block}"
-    if fused:
-        # h_pad changes both the geometry and which loads carry a mask, so a
-        # padded build must not share a JIT key with the plain one.
-        tag += f"_rms_h{hidden}"
-        if padded:
-            tag += f"_p{h_pad}"
+    tag += f"_{codec}_b{block}" + epi.tag
     launcher = (
-        launch_quick_allreduce_mesh_fused if fused else launch_quick_allreduce_mesh
+        launch_quick_allreduce_mesh_fused
+        if epi.takes_operands
+        else launch_quick_allreduce_mesh
     )
     launcher.func.__name__ = f"launch_quick_allreduce_mesh_{tag}"
     try:
@@ -1079,7 +823,7 @@ def make_quick_allreduce_mesh_kernel(
         # from. Equal to tile_bytes unless the build is padded, where the wire
         # tile is rows_per_tile rows of h_pad but the footprint is
         # rows_per_tile rows of hidden.
-        "hbm_tile_bytes": hbm_tile_bytes,
+        "hbm_tile_bytes": epi.hbm_tile_bytes,
         "tile_fp16": tile_bytes // 2,
         "rank_tile_bytes": c.rank_tile_bytes,
         "wire_tile_bytes": wire_tile_bytes,
@@ -1093,11 +837,6 @@ def make_quick_allreduce_mesh_kernel(
         "rank_atoms": rank_atoms,
         "grid": grid,
         "block": block,
-        "fusion": fusion,
-        "hidden": hidden,
-        "h_pad": h_pad,
-        "padded": padded,
-        "atoms_per_row": atoms_per_row,
-        "rows_per_tile": rows_per_tile,
         "rank": self_rank,
+        **epi.spec(),
     }

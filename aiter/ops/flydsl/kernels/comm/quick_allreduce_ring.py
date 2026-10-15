@@ -36,13 +36,10 @@ from ...allreduce_policy import (
     AG_CODECS,
     RING_SUPER_TILES,
     RS_CODECS,
-    SUPPORTED_BLOCKS,
     SUPPORTED_WORLDS,
 )
 from .quick_allreduce_codec import (
     GROUP,
-    _atom_bf16_to_f16,
-    _atom_f16_to_bf16,
     _clamp_fp16_overflow,
     _codec_dequant,
     _codec_load,
@@ -52,17 +49,9 @@ from .quick_allreduce_codec import (
     scale_slot_of,
     thread_lane,
 )
-from .quick_allreduce_fusions import (
-    ATOM_ELEMS,
-    FUSIONS,
-    make_rowbuf_atom_row,
-    make_wave_partials,
-    pack_bf16,
-    quick_reduce_row_block_at,
-    residual_add,
-    rms_rstd,
-    scale_by_weight,
-)
+from .quick_allreduce_epilogue import QuickReducePlainEpilogue
+from .quick_allreduce_fusions import check_fusion_args
+from .quick_allreduce_rmsnorm import RingRMSNormEpilogue
 from .transport import (
     _INBOX_POLICY,
     _RECV_POLICY,
@@ -71,7 +60,6 @@ from .transport import (
     FLAG_LANES,
     QUAD_LANES,
     QUADS_PER_WAVE,
-    WAVE,
     _acquire_inbox,
     _buffer_load,
     _buffer_ptr,
@@ -79,12 +67,10 @@ from .transport import (
     _i32_to_bytes,
     _load_flag,
     _load_peers,
-    _payload_io,
     _release_inbox,
     _store_flag_peer,
     _store_v4i32_peer,
     _to_sgpr_i64,
-    make_hbm_operand,
     make_pack_storage,
 )
 
@@ -130,23 +116,17 @@ def make_quick_allreduce_ring_kernel(
 
     ``block`` is threads per workgroup.
 
-    ``fusion="rmsnorm"`` appends a residual-add + RMSNorm epilogue and requires
-    ``hidden``. It changes the geometry rather than just the tail: the block is
-    sized so one 16 B atom is one token row (see
+    ``fusion="rmsnorm"`` appends a residual-add + RMSNorm epilogue
+    (``quick_allreduce_rmsnorm``) and requires ``hidden``. It changes the
+    geometry rather than just the tail: the block is sized so a chunk is a
+    whole number of token rows (see
     ``quick_allreduce_fusions.quick_reduce_row_block``), which is what lets the
     epilogue run inside the op that receives a chunk. Without it a row would
     span several ops, and since this schedule carries nothing across a publish,
     the only way to reassemble one would be to pin ``super_tile`` at 1 -- which
     is where the ring's throughput goes to die.
     """
-    if fusion not in FUSIONS:
-        raise ValueError(f"fusion must be one of {FUSIONS}, got {fusion!r}")
-    if fusion != "none" and hidden is None:
-        raise ValueError(f"fusion={fusion!r} requires hidden")
-    if fusion == "none" and hidden is not None:
-        raise ValueError("hidden is only meaningful for a fused build")
-    if fusion == "none" and h_pad is not None:
-        raise ValueError("h_pad is only meaningful for a fused build")
+    check_fusion_args(fusion, hidden, h_pad)
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
@@ -185,44 +165,16 @@ def make_quick_allreduce_ring_kernel(
     n_ops = 2 * world_size - 1  # ops are 1-based; op k reads slot k-2, writes k-1
     nxt = (rank + 1) % world_size
 
-    fused = fusion == "rmsnorm"
-    # An explicit block picks among the widths this hidden dim admits; None keeps
-    # the widest.
-    if fused:
-        # ``h_pad`` is the width the *workgroup* covers, ``hidden`` the width the
-        # *tensor* has. The block, the chunk, the codec and the wire follow
-        # h_pad; the HBM row stride and the RMS denominator follow hidden.
-        h_pad = hidden if h_pad is None else int(h_pad)
-        if h_pad < hidden:
-            raise ValueError(f"h_pad={h_pad} is narrower than hidden={hidden}")
-        if h_pad != hidden and hidden % ATOM_ELEMS:
-            raise ValueError(
-                f"a padded fused build needs hidden to be a whole number of "
-                f"{ATOM_ELEMS}-element atoms so the pad boundary lands on an "
-                f"atom granule, got hidden={hidden}"
-            )
-        block, atoms_per_row = quick_reduce_row_block_at(h_pad, world_size, block)
+    if fusion == "none":
+        epi = QuickReducePlainEpilogue(block=block, world_size=world_size)
     else:
-        # The plain kernel takes a caller-chosen block; the fused build derives
-        # its own from the row geometry just above.
-        if block is None:
-            raise ValueError("a plain build requires block")
-        if block not in SUPPORTED_BLOCKS:
-            raise ValueError(f"block must be one of {SUPPORTED_BLOCKS}, got {block!r}")
-        atoms_per_row = 1
-    padded = fused and h_pad != hidden
-    rows_per_chunk = rank_atoms // atoms_per_row
-    rows_per_tile = ATOMS // atoms_per_row
+        epi = RingRMSNormEpilogue(
+            hidden=hidden, h_pad=h_pad, block=block, world_size=world_size
+        )
+    block = epi.block
     quads_per_block = block // QUAD_LANES
-    n_waves = block // WAVE
     tile_i32 = block * ATOMS * 4
     tile_bytes = tile_i32 * 4
-    # i32 between one token row and the next *in HBM*, and the HBM bytes a whole
-    # tile spans. These part company from ``tile_i32``/``tile_bytes`` exactly
-    # when a build is padded; the host derives num_tiles from hbm_tile_bytes.
-    row_stride_i32 = (hidden // 2) if fused else tile_i32
-    hbm_tile_i32 = rows_per_tile * row_stride_i32 if fused else tile_i32
-    hbm_tile_bytes = hbm_tile_i32 * 4
 
     codecs = codecs_for_block(block)
     rs = codecs[rs_codec]
@@ -255,11 +207,8 @@ def make_quick_allreduce_ring_kernel(
     pack_i32 = rank_atoms * pack_row_i32
     PackStorage = make_pack_storage(pack_i32)
 
-    # Per-wave partials for the fused sum of squares, one slot per row of a
-    # chunk. Allocated separately from the pack staging.
-    n_partials = rows_per_chunk * n_waves if (fused and n_waves > 1) else 0
-    WavePartials = make_wave_partials(n_partials) if n_partials else None
-    lds_bytes = pack_i32 * 4 + n_partials * 4
+    # The epilogue's per-wave LDS partials, if any, follow the pack staging.
+    lds_bytes = pack_i32 * 4 + epi.partial_floats * 4
 
     def _chunk_of(k: int) -> int:
         """Which chunk op *k* carries, following the standard ring schedule.
@@ -282,7 +231,7 @@ def make_quick_allreduce_ring_kernel(
         peer_ptrs: fx.Int64,
         colors_ptr: fx.Int64,
         n_blocks: fx.Int32,
-        # These args are discarded for non-fused kernel
+        # Read only by a fused epilogue; the plain launcher passes zeros.
         res_in_ptr: fx.Int64,
         res_out_ptr: fx.Int64,
         w_ptr: fx.Int64,
@@ -297,32 +246,6 @@ def make_quick_allreduce_ring_kernel(
         quad, lane_in_quad = fx.idx2crd(lane, quad_layout).unpack()
         quad_id = wave * fx.Int32(QUADS_PER_WAVE) + quad
 
-        # The fused epilogue reaches its HBM operands (residual, weight, final
-        # output) as raw bf16 atoms through a tiled copy; the plain reduce path
-        # uses the shared ``_payload_io`` helpers and never builds these.
-        # ``hbm_row_layout`` (one atom-wide row) and ``hbm_copy`` serve both fused
-        # sub-modes; a padded build addresses each row through a per-row bounded
-        # descriptor (``_rowbuf_atom_row``), an unpadded one slices the
-        # whole-tensor buffer tensor (``_hbm_atom_row``). ``hbm_layout`` is the
-        # 3-D whole-tensor layout consumed only by the unpadded
-        # ``make_hbm_operand``; a padded build leaves it None.
-        hbm_layout = None
-        hbm_row_layout = None
-        hbm_copy_atom = None
-        hbm_copy = None
-        if const_expr(fused):
-            if const_expr(not padded):
-                hbm_layout = fx.make_layout(
-                    (num_tiles, ATOMS, block * 4),
-                    (hbm_tile_i32, block * 4, 1),
-                )
-            hbm_row_layout = fx.make_layout((1, block * 4), (block * 4, 1))
-            hbm_copy_atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.Int32)
-            hbm_copy = fx.make_tiled_copy_tv(
-                hbm_copy_atom,
-                fx.make_layout((1, block), (1, 1)),
-                fx.make_layout((1, 4), (1, 1)),
-            ).get_slice(tid)
         scale_slot, pair_in_slot = scale_slot_of(tid, block)
 
         # One allocation, one view per codec.
@@ -335,76 +258,36 @@ def make_quick_allreduce_ring_kernel(
             )
             for c in ({rs.name: rs, ag.name: ag}).values()
         }
-        # A second allocation from the same allocator -- FlyDSL allows only
-        # one per kernel -- so it cannot alias the staged packet the fanout is
-        # still reading. Hoisted here because the allocator is static: one
-        # reached from inside the op loop would emit an LDS symbol per visit.
-        sq_lds = None
-        if const_expr(n_partials > 0):
-            sq_lds = allocator.allocate(WavePartials).peek().wave.ptr
-
         peers = _load_peers(peer_ptrs, world_size)
         # The ring uses only two peers: this rank and its successor.
         self_base = peers[rank]
         next_base = peers[nxt]
         inbox = _buffer_ptr(_to_sgpr_i64(self_base), T.i32, 4, inbox_bytes)
 
-        _load_atom, _store_atom = _payload_io(
-            inp_ptr,
-            out_ptr,
-            nbytes,
-            num_tiles,
-            ATOMS,
-            block,
-            tid,
-            decode=_atom_bf16_to_f16,
-            encode=_atom_f16_to_bf16,
+        # Everything that touches HBM goes through the epilogue: the plain one
+        # moves atoms through ``_payload_io``, a fused one reaches the same rows
+        # as raw bf16 atoms. Its LDS, if any, comes from this kernel's one
+        # allocator, after the pack staging.
+        ep = epi.bind(
+            tid=tid,
+            nbytes=nbytes,
+            num_tiles=num_tiles,
+            inp_ptr=inp_ptr,
+            out_ptr=out_ptr,
+            res_in_ptr=res_in_ptr,
+            res_out_ptr=res_out_ptr,
+            w_ptr=w_ptr,
+            eps=eps,
+            allocator=allocator,
         )
+        # Bare names, not ``ep.<hook>(...)``: the rewriter takes a method call
+        # inside a runtime loop or branch as a possible mutation of its base
+        # and would try to carry ``ep`` through the loop as an SSA value.
+        _load_atom = ep.load_atom
+        _begin_chunk = ep.begin_chunk
+        _complete_atom = ep.complete
+        _end_chunk = ep.end_chunk
         _load_color, _store_color = _color_io(colors_ptr, bid)
-
-        if const_expr(fused):
-            hbm_i32_ptr = fx.PointerType.get(
-                T.i32, address_space=fx.AddressSpace.Global, alignment=16
-            )
-            # A padded build keeps the HBM operands as raw ``Int64`` base
-            # pointers so ``_rowbuf_atom_row`` can bound a fresh descriptor per
-            # row; an unpadded build wraps them in the whole-tensor buffer tensor.
-            _operand = make_hbm_operand(
-                padded=padded,
-                nbytes=nbytes,
-                hbm_i32_ptr=hbm_i32_ptr,
-                hbm_layout=hbm_layout,
-            )
-            # A padded build addresses each row through a per-row buffer
-            # descriptor bounded to the true width, and to nothing at all for a
-            # row past M in a partial last tile; ``_rowbuf_atom_row(ptr, tile,
-            # atom)`` builds it from the operand's raw base pointer. Unpadded is
-            # None (unused).
-            _rowbuf_atom_row = (
-                make_rowbuf_atom_row(
-                    atoms_per_row=atoms_per_row,
-                    rows_per_tile=rows_per_tile,
-                    row_stride_i32=row_stride_i32,
-                    block=block,
-                    hidden=hidden,
-                    hbm_i32_ptr=hbm_i32_ptr,
-                    hbm_row_layout=hbm_row_layout,
-                    nbytes=nbytes,
-                )
-                if padded
-                else None
-            )
-
-            # residual in/out are (M, hidden) bf16 exactly like the payload, so
-            # they ride the same addressing, as does the final output row. The
-            # gain is a single (hidden,) row shared by every token --
-            # ``atoms_per_row`` atoms at tile 0; a padded build reads it through
-            # the per-row descriptor at row 0, an unpadded one bounds a one-row
-            # buffer tensor at the true width.
-            out_buf = _operand(out_ptr)
-            res_in_buf = _operand(res_in_ptr)
-            res_out_buf = _operand(res_out_ptr)
-            w_buf = _operand(w_ptr, records=fx.Int64(hidden * 2))
 
         def _slot_i32(step, sub):
             """i32 offset of (*step*, this block, *sub*) inside the inbox.
@@ -418,61 +301,12 @@ def make_quick_allreduce_ring_kernel(
                 + sub * fx.Int32(payload_i32[step])
             )
 
-        if const_expr(fused):
-
-            def _hbm_atom_row(buf, tile, atom):
-                return fx.make_view(
-                    fx.get_iter(fx.slice(buf, (tile, atom, None))),
-                    hbm_row_layout,
-                )
-
-            # The row-view function is chosen once at trace time: a padded build
-            # addresses each row through a per-row bounded descriptor, an
-            # unpadded one slices the whole-tensor buffer tensor. Both return a
-            # one-atom-wide row view that ``partition_S/D`` consume, so the copy
-            # bodies are uniform.
-            _atom_row = _rowbuf_atom_row if padded else _hbm_atom_row
-
-            def _load_raw_atom(buf, tile, atom):
-                """One 16 B atom, unconverted. For the bf16 operands of the fused
-                epilogue, which are not codec values and never become fp16."""
-                src = hbm_copy.partition_S(_atom_row(buf, tile, atom))
-                frag = fx.make_fragment_like(src)
-                fx.copy(hbm_copy_atom, src, frag)
-                return fx.Vector(frag.load())
-
-            def _store_raw_atom(buf, tile, atom, value):
-                dst = hbm_copy.partition_D(_atom_row(buf, tile, atom))
-                frag = fx.make_fragment_like(dst)
-                frag.store(value)
-                fx.copy(hbm_copy_atom, frag, dst)
-
         def _load_chunk_atoms(tile, chunk):
             """This rank's own bf16 data for *chunk*, as fp16 register atoms."""
             return [
                 _load_atom(tile, chunk * rank_atoms + j)
                 for j in range_constexpr(rank_atoms)
             ]
-
-        if const_expr(fused):
-            # See the mesh kernel: a padded fused build must read ``inp`` through
-            # the per-row bounded descriptor, not ``_payload_io``'s whole-payload
-            # tensor. At h_pad != hidden the wire tile is wider than the HBM row,
-            # so ``_payload_io``'s single bound lets a pad lane read the next row
-            # instead of zero -- which rides the wire into residual_out. Shadow
-            # the plain ``_load_chunk_atoms`` above for the fused build only.
-            in_buf = _operand(inp_ptr)
-
-            def _load_chunk_atoms(tile, chunk):
-                return [
-                    _atom_bf16_to_f16(
-                        _load_raw_atom(in_buf, tile, chunk * rank_atoms + j)
-                    )
-                    for j in range_constexpr(rank_atoms)
-                ]
-
-        def _store_chunk_atom(tile, chunk, j, value):
-            _store_atom(tile, chunk * rank_atoms + j, value)
 
         def _lds_write_packet(codec, j, words, scale_word, is_leader):
             """Stage one packet of *codec* into the row this hop will send."""
@@ -626,86 +460,17 @@ def make_quick_allreduce_ring_kernel(
                 _release_inbox(rocdl.SyncScope.OneAs)
             _acquire_inbox(acquire_scope)
 
-        def _atom_f16_to_f32(atom):
-            """Packed fp16 -> 8 f32. A widening move; exact, no rounding."""
-            return fx.Vector(atom).bitcast(fx.Float16).to(fx.Float32)
-
         def _complete(tile, chunk, j, value, recv):
-            """Dispose of an atom whose all-reduce is finished.
-
-            Plain: straight to ``out`` in bf16, as before. Fused: held for the
-            epilogue, which needs the whole row -- and has it, because the block
-            is sized so a chunk is ``rows_per_chunk`` complete rows. ``recv[0]``
-            is the prefetched residual, so the atoms follow it.
-            """
-            if const_expr(fused):
-                recv.append(value)
-            else:
-                _store_chunk_atom(tile, chunk, j, value)
-
-        def _load_residual(tile, chunk):
-            """This chunk's residual atoms, issued before the payload arrives.
-
-            Plain HBM with no dependence on any peer, so the load retires while
-            the receive and the dequantize are still running rather than
-            stalling the epilogue on a cold read after them. Same reasoning as
-            the one-shot's residual prefetch.
-            """
-            base = chunk * rank_atoms
-            return [
-                _load_raw_atom(res_in_buf, tile, base + j)
-                for j in range_constexpr(rank_atoms)
-            ]
-
-        def _epilogue(tile, chunk, chunk_atoms, res_atoms, w_atoms):
-            """Residual add + RMSNorm over the rows this chunk just completed.
-
-            Runs *after* the chunk has been forwarded, so no norm arithmetic
-            sits between a receive and the send that unblocks the successor.
-
-            ``chunk`` is a Python int (``_chunk_of`` folds at trace time), so
-            the atom indices below are compile-time and the loads are the same
-            static offsets the plain path uses.
-            """
-            base = chunk * rank_atoms
-            rows = []
-            for r in range_constexpr(rows_per_chunk):
-                idx = [r * atoms_per_row + a for a in range_constexpr(atoms_per_row)]
-                xs = residual_add(
-                    [_atom_f16_to_f32(chunk_atoms[j]) for j in idx],
-                    [res_atoms[j] for j in idx],
-                )
-                rows.append(xs)
-                # residual_out is final already, so it goes out ahead of the
-                # reduction rather than behind its barrier.
-                packed = pack_bf16(xs)
-                for a in range_constexpr(atoms_per_row):
-                    _store_raw_atom(res_out_buf, tile, base + idx[a], packed[a])
-
-            # One reduction for every row of the chunk: one barrier, not
-            # ``rows_per_chunk`` of them.
-            rstds = rms_rstd(rows, eps, hidden, tid=tid, block=block, lds=sq_lds)
-            for r in range_constexpr(rows_per_chunk):
-                outs = scale_by_weight(rows[r], rstds[r], w_atoms)
-                for a in range_constexpr(atoms_per_row):
-                    _store_raw_atom(
-                        out_buf, tile, base + r * atoms_per_row + a, outs[a]
-                    )
-            if const_expr(n_partials > 0):
-                # The next chunk reuses these slots. The last op has no fanout,
-                # hence no barrier of its own between our reads above and those
-                # writes -- this is it.
-                gpu.barrier()
+            """Hand an atom whose all-reduce is finished to the epilogue."""
+            _complete_atom(tile, chunk * rank_atoms + j, value, recv)
 
         def _op_substep(k, tile, sub, recv):
             """One op of the ring, for one sub-tile. Stages LDS; does not send.
 
-            The completed atoms leave through *recv*, a caller-owned list
-            this appends to, rather than through a return value: inside a
-            ``@flyc.kernel`` body the AST transform rewrites ``return`` away. A
-            fused build hands them to the epilogue once the fanout has gone
-            out; a plain build passes a list it ignores, and the atoms go
-            straight to ``out``.
+            Completed atoms go to the epilogue's ``complete``, which may hold
+            them in *recv*, a caller-owned list, until ``end_chunk`` runs after
+            the fanout -- a list rather than a return value: inside a
+            ``@flyc.kernel`` body the AST transform rewrites ``return`` away.
 
             The codecs are compile-time too: an op reads the codec of the step
             it receives from (``k-2``) and writes the codec of the step it sends
@@ -715,9 +480,9 @@ def make_quick_allreduce_ring_kernel(
             """
             chunk = _chunk_of(k)
             is_leader = (tid % fx.Int32(GROUP)) == fx.Int32(0)
-            if const_expr(fused and k >= world_size):
+            if const_expr(k >= world_size):
                 # Ahead of the receive, so the HBM latency hides behind it.
-                recv.append(_load_residual(tile, chunk))
+                _begin_chunk(tile, chunk, recv)
             c_in = step_codec[k - 2] if k >= 2 else None
             c_out = step_codec[k - 1] if k <= steps else None
 
@@ -786,7 +551,7 @@ def make_quick_allreduce_ring_kernel(
                         recv,
                     )
 
-        def _ring_group(i, n_this, color, w_atoms):
+        def _ring_group(i, n_this, color):
             """One super-tile group: ``2N-1`` ops, each a wait / work / publish.
 
             The wait is hoisted above the sub-tile loop and the publish sits
@@ -809,8 +574,7 @@ def make_quick_allreduce_ring_kernel(
                 for s in range(fx.Int32(0), n_this, fx.Int32(1)):
                     tile = bid + (i + s) * n_blocks
                     # A caller-owned list rather than a return value; see
-                    # ``_op_substep``. Empty for every op that completes nothing,
-                    # and for every op at all in a plain build.
+                    # ``_op_substep``. Only the epilogue reads it.
                     recv = []
                     _op_substep(k, tile, s, recv)
                     if const_expr(k <= steps):
@@ -824,25 +588,16 @@ def make_quick_allreduce_ring_kernel(
                             gpu.barrier()
                     else:
                         pass  # the last op receives only
-                    if const_expr(fused and k >= world_size):
+                    if const_expr(k >= world_size):
                         # After the fanout: the successor is already unblocked,
                         # so the epilogue runs off the ring's critical path.
-                        _epilogue(tile, _chunk_of(k), recv[1:], recv[0], w_atoms)
+                        _end_chunk(tile, _chunk_of(k), recv)
                     else:
                         pass
                 if const_expr(k <= steps):
                     _publish(k - 1, color)
                 else:
                     pass
-
-        # One row shared by every token, so the gain is read once here rather
-        # than once per chunk.
-        w_atoms = None
-        if const_expr(fused):
-            w_atoms = [
-                _load_raw_atom(w_buf, fx.Int32(0), a)
-                for a in range_constexpr(atoms_per_row)
-            ]
 
         # Stride by the launched grid, not the compile-time cap: the host
         # launches fewer blocks than `grid` when it wants each block to own a
@@ -854,7 +609,7 @@ def make_quick_allreduce_ring_kernel(
         for i in range(fx.Int32(0), n_block_tiles, st_i):
             remain = n_block_tiles - i
             n_this = (remain < st_i).select(remain, st_i)
-            _ring_group(i, n_this, color, w_atoms)
+            _ring_group(i, n_this, color)
             color = color + fx.Int32(1)
             if color == fx.Int32(0):  # 0 is the unset sentinel
                 color = fx.Int32(1)
@@ -945,13 +700,11 @@ def make_quick_allreduce_ring_kernel(
         f"ws{world_size}_r{rank}_st{super_tile}_g{grid}_{inbox_memory}"
         f"_{rs_codec}_{ag_codec}"
     )
-    tag += f"_b{block}"
-    if fused:
-        tag += f"_rms_h{hidden}"
-        if padded:
-            tag += f"_p{h_pad}"
+    tag += f"_b{block}" + epi.tag
     launcher = (
-        launch_quick_allreduce_ring_fused if fused else launch_quick_allreduce_ring
+        launch_quick_allreduce_ring_fused
+        if epi.takes_operands
+        else launch_quick_allreduce_ring
     )
     launcher.func.__name__ = f"launch_quick_allreduce_ring_{tag}"
     try:
@@ -966,7 +719,7 @@ def make_quick_allreduce_ring_kernel(
         "tile_bytes": tile_bytes,
         # HBM bytes one tile spans -- what a tile *count* has to come from.
         # Equal to tile_bytes unless the build is padded.
-        "hbm_tile_bytes": hbm_tile_bytes,
+        "hbm_tile_bytes": epi.hbm_tile_bytes,
         "tile_fp16": tile_bytes // 2,
         "rank_tile_bytes": rs.rank_tile_bytes,
         "wire_tile_bytes": wire_tile_i32[0] * 4,
@@ -985,11 +738,6 @@ def make_quick_allreduce_ring_kernel(
         "steps": steps,
         "grid": grid,
         "block": block,
-        "fusion": fusion,
-        "hidden": hidden,
-        "h_pad": h_pad,
-        "padded": padded,
-        "atoms_per_row": atoms_per_row,
-        "rows_per_tile": rows_per_tile,
-        "rows_per_chunk": rows_per_chunk,
+        "rows_per_chunk": epi.rows_per_chunk,
+        **epi.spec(),
     }

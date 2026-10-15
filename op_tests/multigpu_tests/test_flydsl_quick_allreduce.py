@@ -2390,7 +2390,7 @@ def _host_fused_one_shot_block_options() -> list[str]:
     width-dependent, which is the thing a tuner has to be told rather than
     allowed to assume.
     """
-    from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import (
+    from aiter.ops.flydsl.kernels.comm.one_shot_allreduce_rmsnorm import (
         fused_atoms_for_block,
         fused_block,
         fused_block_options,

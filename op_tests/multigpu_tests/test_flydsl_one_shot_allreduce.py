@@ -232,7 +232,7 @@ def _fused_applies(knobs: dict, hidden: int) -> bool:
     would fall back to the nearest geometry, and the column would then time
     another build under this candidate's name, so the cell is left empty.
     """
-    from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import (
+    from aiter.ops.flydsl.kernels.comm.one_shot_allreduce_rmsnorm import (
         fused_block_options,
         fused_hidden_supported,
         fused_padded_block_options,
@@ -1623,26 +1623,9 @@ def _run_rank_fused(args, rank, device, dist) -> None:
     ``out`` goes through ``rsqrt``, whose hardware approximation legitimately
     differs from torch's, so it is graded on SQNR.
 
-    ``fused_slice_lag`` builds with the factory's test-only
-    ``debug_slice_delay``, injected by wrapping the factory rather than through
-    the engine's API: slice 0 of every row group stalls between contributing to
-    the exchange and reading it, so its siblings run ahead into the next
-    colour's word.
-
     ``fused_fresh`` is the fused counterpart of ``_fresh_inputs``.
     """
-    from aiter.ops.flydsl import one_shot_allreduce as _host
     from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduceRMSNorm
-
-    if args.mode == "fused_slice_lag":
-        _factory = _host.make_one_shot_allreduce_kernel
-
-        def _lagging_factory(**kw):
-            if kw.get("split", 1) > 1:
-                kw["debug_slice_delay"] = 4
-            return _factory(**kw)
-
-        _host.make_one_shot_allreduce_kernel = _lagging_factory
 
     eng = OneShotAllReduceRMSNorm(
         group=dist.group.WORLD,
@@ -1710,7 +1693,7 @@ def _run_rank_fused(args, rank, device, dist) -> None:
         return bad
 
     failures = []
-    if args.mode in ("fused_run_ahead", "fused_slice_lag"):
+    if args.mode == "fused_run_ahead":
         m, hidden = args.tokens[0], args.hiddens[0]
         parts, residual, weight = _fused_inputs(m, hidden, args.tp, device)
         inp = parts[rank].contiguous()
@@ -1854,7 +1837,7 @@ def test_one_shot_allreduce_rmsnorm_padding_is_least_wire():
     Also pins the half of the contract that matters more -- a width with a
     native geometry must not pad at all, or every shipped shape pays for this.
     """
-    from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import (
+    from aiter.ops.flydsl.kernels.comm.one_shot_allreduce_rmsnorm import (
         fused_block_options,
         fused_padded_block,
         fused_padded_block_options,
@@ -1897,7 +1880,7 @@ def test_one_shot_allreduce_rmsnorm_padded_hidden_limits():
     host raises naming the constraint rather than building something else.
     """
     from aiter.ops.flydsl.allreduce_policy import SUPPORTED_ATOMS
-    from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import (
+    from aiter.ops.flydsl.kernels.comm.one_shot_allreduce_rmsnorm import (
         fused_padded_block,
         fused_padded_block_options,
     )
@@ -1932,7 +1915,9 @@ def test_one_shot_allreduce_rmsnorm_geom_for_pinned_block_pads():
     ``_geom_for`` reads only ``self.block``/``self._ladder``, so it
     is exercised on a bare instance -- host-side and GPU-free, no process group.
     """
-    from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import fused_block_options
+    from aiter.ops.flydsl.kernels.comm.one_shot_allreduce_rmsnorm import (
+        fused_block_options,
+    )
     from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduceRMSNorm
 
     def geom(block, hidden, rung_atoms=1):
@@ -2116,30 +2101,6 @@ def test_one_shot_allreduce_rmsnorm_split_magnitude(scale, world_size):
             )
 
 
-@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
-def test_one_shot_allreduce_rmsnorm_split_slice_lag(world_size):
-    """The exchange's reuse argument under deliberate skew inside one row.
-
-    Slice 0 of every row group stalls between contributing and reading
-    (``debug_slice_delay``), so its siblings finish the row and run on into the
-    next colour's word. That can only happen within a launch, so the grid cap
-    is pinned to two row groups: at M=8 every workgroup handles four rows per
-    call, crossing colours three times.
-    """
-    split = 4
-    ranks = _fused_spawn(
-        world_size,
-        [(8, 8192)],
-        atoms=None,
-        grid_cap=2 * split,
-        split=split,
-        mode="fused_slice_lag",
-        iters=RUN_AHEAD_ITERS,
-    )
-    for rank, bad in enumerate(ranks):
-        assert not bad, f"tp={world_size}, rank {rank}: " + "; ".join(bad)
-
-
 def test_one_shot_allreduce_rmsnorm_split_options():
     """``fused_split_options`` is the geometry every split build draws from.
 
@@ -2149,7 +2110,7 @@ def test_one_shot_allreduce_rmsnorm_split_options():
     arrival count.
     """
     from aiter.ops.flydsl.allreduce_policy import SUPPORTED_SPLITS
-    from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import (
+    from aiter.ops.flydsl.kernels.comm.one_shot_allreduce_rmsnorm import (
         fused_block_options,
         fused_split_options,
     )
@@ -2214,8 +2175,6 @@ def test_one_shot_allreduce_rmsnorm_split_factory():
         mk(**{**base, "grid": 63, "hidden": 4096}, split=7)
     with pytest.raises(ValueError, match="not a multiple of split"):
         mk(**base, split=7)  # 64 % 7
-    with pytest.raises(ValueError, match="needs a split build"):
-        mk(**base, debug_slice_delay=2)
     # 16 slices of 16 waves: 256 writers, one more than the arrival count holds.
     with pytest.raises(ValueError, match="counts arrivals"):
         mk(**{**base, "hidden": 131072}, split=16)
@@ -2963,7 +2922,7 @@ if __name__ == "__main__":
     _rank_parser.add_argument(
         "--mode",
         default="fused",
-        choices=("fused", "fused_run_ahead", "fused_slice_lag", "fused_fresh"),
+        choices=("fused", "fused_run_ahead", "fused_fresh"),
     )
     _rank_parser.add_argument("--tokens", default="")
     _rank_parser.add_argument("--hiddens", default="")

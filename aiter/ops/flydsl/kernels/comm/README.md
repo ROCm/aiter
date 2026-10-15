@@ -8,12 +8,15 @@ node.
 
 | File | Contents |
 |---|---|
-| `one_shot_allreduce.py` | The exact one-shot kernel. |
+| `one_shot_allreduce.py` | The exact one-shot kernel, and its plain epilogue. |
+| `one_shot_allreduce_rmsnorm.py` | The one-shot's residual-add + RMSNorm epilogue, its row geometry (`fused_*`) and the split-row exchange. |
 | `quick_allreduce_mesh.py` | The quantized two-shot **mesh** kernel. |
 | `quick_allreduce_ring.py` | The quantized two-shot **ring** kernel. |
+| `quick_allreduce_epilogue.py` | The plain epilogue of the mesh and the ring, and the hooks every mesh or ring epilogue implements. |
+| `quick_allreduce_rmsnorm.py` | The residual-add + RMSNorm epilogues of the mesh and the ring. |
 | `quick_allreduce_codec.py` | The INT4, INT6 and FP16 wire codecs. The mesh and the ring use them. |
 | `transport.py` | Tile geometry, the inbox cache policy, and the peer store and load primitives. All three kernels use them. |
-| `quick_allreduce_fusions.py` | The fused residual-add + RMSNorm epilogue and the row-to-workgroup geometry. All three kernels use them when built with `fusion="rmsnorm"`. |
+| `quick_allreduce_fusions.py` | The parts every fused epilogue shares: the RMSNorm arithmetic, the row-to-workgroup geometry, the per-wave reductions and the `RowIO` HBM row access. |
 
 The host classes are in `aiter/ops/flydsl/`:
 
@@ -149,6 +152,15 @@ the epilogue (`fusion="rmsnorm"`). For each token row:
 residual_out = allreduce(inp) + residual
 out          = rmsnorm(residual_out) * weight
 ```
+
+Each kernel file holds the schedule. The schedule reaches HBM only through
+an epilogue object, which the factory picks from `fusion`: the plain one
+stores the reduced values, and the RMSNorm one in `*_rmsnorm.py` normalizes
+them first. The epilogue also fixes the block and the row geometry. Its hooks
+run inline in the kernel trace. They cannot hold a runtime `if` or loop,
+because the FlyDSL AST rewriter sees only the `@flyc.kernel` body and
+`@flyc.jit` functions. The one-shot's split-row exchange is a `@flyc.jit`
+helper for that reason.
 
 `CudaCommunicator.fused_allreduce_rmsnorm` uses the fused kernels with the
 same split as the plain all-reduce:
@@ -347,7 +359,8 @@ and how it prevents bias in the comparison.
 
 The FlyDSL JIT cache key includes the source of the kernel function. It does
 not include helper functions from other modules, for example
-`transport.py` or `quick_allreduce_codec.py`. If you change a helper,
+`transport.py`, `quick_allreduce_codec.py` or the epilogue modules
+(`*_epilogue.py`, `*_rmsnorm.py`). If you change a helper,
 FlyDSL can run an old binary from the cache.
 
 To prevent this, set this variable at the repository root before you run a

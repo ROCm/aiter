@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Epilogues fused onto an all-reduce, shared by every schedule.
+"""The parts of a fused all-reduce epilogue that every schedule shares.
 
 The one-shot, mesh and ring kernels all end a tile holding reduced values in
 registers. Anything that can be computed from those before they are stored is
@@ -11,18 +11,23 @@ writes, norm reads it back) into four, and removes a launch.
 Two layers, and the split matters because RMSNorm is not the last fusion this
 will carry:
 
-* **Fusion-agnostic** -- ``FUSIONS``, the row-to-workgroup geometry
-  (:func:`row_block`, :func:`row_block_options`, :func:`quick_reduce_row_block`),
-  the per-wave LDS partials and :func:`block_reduce_add`. Any row-local epilogue
-  needs exactly these.
+* **Fusion-agnostic** -- ``FUSIONS`` and the factory-argument checks, the
+  row-to-workgroup geometry (:func:`row_block`, :func:`row_block_options`,
+  :func:`quick_reduce_row_block`), :class:`RowIO` (raw bf16 atoms of an HBM
+  row, padded or not), the per-wave LDS partials and :func:`block_reduce_add`.
+  Any row-local epilogue needs exactly these.
 * **RMSNorm** -- :func:`residual_add`, :func:`rms_rstd`,
   :func:`scale_by_weight`, kept as three steps rather than one call so a caller
   can issue the ``residual_out`` store *before* the reduction's barrier instead
   of behind it.
 * **RMSNorm across workgroups** -- the ``xchg_*`` helpers: the arithmetic of
   the one i64 word through which the one-shot's split build joins a row's sum
-  of squares over K workgroups. The spin that waits on it lives in the kernel
-  body, which is the only code the AST rewriter sees.
+  of squares over K workgroups. The spin that waits on it is a ``@flyc.jit``
+  helper in ``one_shot_allreduce_rmsnorm``, since only rewritten code may
+  branch at runtime.
+
+The epilogue objects that put these together live next to their schedules:
+``one_shot_allreduce_rmsnorm`` and ``quick_allreduce_rmsnorm``.
 
 Why a whole workgroup per row: RMSNorm reduces over the row, so a row split
 across two workgroups needs a cross-workgroup join -- which none of the
@@ -40,7 +45,7 @@ import math
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
-from flydsl.expr.typing import ReductionOp
+from flydsl.expr.typing import ReductionOp, T
 
 from ...allreduce_policy import (
     BLOCK_ALIGN,
@@ -51,6 +56,7 @@ from .transport import (
     WAVE,
     atom_bf16_to_f32,
     atom_f32_to_bf16,
+    make_hbm_operand,
 )
 
 #: Epilogues a kernel factory may be asked to build. ``"none"`` is the plain
@@ -279,6 +285,149 @@ def make_rowbuf_atom_row(
         return fx.make_view(buf_ptr, hbm_row_layout)
 
     return _rowbuf_atom_row
+
+
+class RowIO:
+    """Raw 16 B bf16 atoms of ``(M, hidden)`` HBM operands, through a tiled copy.
+
+    Built inside a kernel body by :func:`make_row_io`. ``operand(ptr)`` turns a
+    raw ``Int64`` base pointer into the handle ``load``/``store`` address; a
+    padded build bounds every row by its own descriptor (see
+    :func:`make_rowbuf_atom_row`), an unpadded one slices a whole-tensor buffer
+    tensor bounded by the live payload.
+    """
+
+    def __init__(self, *, operand, atom_row, copy, copy_atom, atoms_per_tile):
+        self.operand = operand
+        self._atom_row = atom_row
+        self._copy = copy
+        self._copy_atom = copy_atom
+        self._atoms_per_tile = atoms_per_tile
+
+    def load(self, buf, tile, atom):
+        """This thread's 16 B of *atom* of *tile* of *buf*, as raw i32x4."""
+        src = self._copy.partition_S(self._atom_row(buf, tile, atom))
+        frag = fx.make_fragment_like(src)
+        fx.copy(self._copy_atom, src, frag)
+        return fx.Vector(frag.load())
+
+    def store(self, buf, tile, atom, value):
+        dst = self._copy.partition_D(self._atom_row(buf, tile, atom))
+        frag = fx.make_fragment_like(dst)
+        frag.store(value)
+        fx.copy(self._copy_atom, frag, dst)
+
+    def load_tile(self, buf, tile):
+        """Every atom of *tile* of *buf*."""
+        return [
+            self.load(buf, tile, atom) for atom in range_constexpr(self._atoms_per_tile)
+        ]
+
+    def store_tile(self, buf, tile, values):
+        for atom in range_constexpr(self._atoms_per_tile):
+            self.store(buf, tile, atom, values[atom])
+
+
+def make_row_io(
+    *,
+    tid,
+    nbytes,
+    num_tiles,
+    block: int,
+    atoms_per_row: int,
+    rows_per_tile: int,
+    row_stride_i32: int,
+    padded: bool,
+    hidden: int | None,
+    bound_rows: bool,
+):
+    """The :class:`RowIO` of one kernel, built in its body.
+
+    A tile is ``rows_per_tile`` rows of ``atoms_per_row`` atoms, rows
+    ``row_stride_i32`` apart in HBM. *bound_rows* says whether a padded build's
+    tiles can outrun ``M`` (see ``nbytes`` in :func:`make_rowbuf_atom_row`).
+    """
+    atoms_per_tile = rows_per_tile * atoms_per_row
+    hbm_i32_ptr = fx.PointerType.get(
+        T.i32, address_space=fx.AddressSpace.Global, alignment=16
+    )
+    hbm_layout = None
+    if const_expr(not padded):
+        hbm_layout = fx.make_layout(
+            (num_tiles, atoms_per_tile, block * ATOM_I32),
+            (rows_per_tile * row_stride_i32, block * ATOM_I32, 1),
+        )
+    hbm_row_layout = fx.make_layout((1, block * ATOM_I32), (block * ATOM_I32, 1))
+    copy_atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.Int32)
+    copy = fx.make_tiled_copy_tv(
+        copy_atom,
+        fx.make_layout((1, block), (1, 1)),
+        fx.make_layout((1, ATOM_I32), (1, 1)),
+    ).get_slice(tid)
+
+    if const_expr(padded):
+        atom_row = make_rowbuf_atom_row(
+            atoms_per_row=atoms_per_row,
+            rows_per_tile=rows_per_tile,
+            row_stride_i32=row_stride_i32,
+            block=block,
+            hidden=hidden,
+            hbm_i32_ptr=hbm_i32_ptr,
+            hbm_row_layout=hbm_row_layout,
+            nbytes=nbytes if bound_rows else None,
+        )
+    else:
+
+        def atom_row(buf, tile, atom):
+            return fx.make_view(
+                fx.get_iter(fx.slice(buf, (tile, atom, None))), hbm_row_layout
+            )
+
+    return RowIO(
+        operand=make_hbm_operand(
+            padded=padded,
+            nbytes=nbytes,
+            hbm_i32_ptr=hbm_i32_ptr,
+            hbm_layout=hbm_layout,
+        ),
+        atom_row=atom_row,
+        copy=copy,
+        copy_atom=copy_atom,
+        atoms_per_tile=atoms_per_tile,
+    )
+
+
+# -- fusion-agnostic: factory arguments ----------------------------------------
+
+
+def check_fusion_args(fusion: str, hidden: int | None, h_pad: int | None) -> None:
+    """Reject a ``fusion``/``hidden``/``h_pad`` combination no factory builds."""
+    if fusion not in FUSIONS:
+        raise ValueError(f"fusion must be one of {FUSIONS}, got {fusion!r}")
+    if fusion != "none" and hidden is None:
+        raise ValueError(f"fusion={fusion!r} requires hidden")
+    if fusion == "none" and hidden is not None:
+        raise ValueError("hidden is only meaningful for a fused build")
+    if fusion == "none" and h_pad is not None:
+        raise ValueError("h_pad is only meaningful for a fused build")
+
+
+def resolve_h_pad(hidden: int, h_pad: int | None) -> int:
+    """The width a fused *workgroup* covers; ``hidden`` stays the *tensor*'s.
+
+    The block, the tile and the wire follow ``h_pad``; the HBM row stride and
+    the RMS denominator follow ``hidden``.
+    """
+    h_pad = hidden if h_pad is None else int(h_pad)
+    if h_pad < hidden:
+        raise ValueError(f"h_pad={h_pad} is narrower than hidden={hidden}")
+    if h_pad != hidden and hidden % ATOM_ELEMS:
+        raise ValueError(
+            f"a padded fused build needs hidden to be a whole number of "
+            f"{ATOM_ELEMS}-element atoms so the pad boundary lands on an "
+            f"atom granule, got hidden={hidden}"
+        )
+    return h_pad
 
 
 def _quick_reduce_atoms_choices(world_size: int) -> tuple[int, ...]:

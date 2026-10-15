@@ -41,11 +41,11 @@ from .allreduce_policy import (
     resolve_link,
     select_rung,
 )
-from .kernels.comm.one_shot_allreduce import (
+from .kernels.comm.one_shot_allreduce import make_one_shot_allreduce_kernel
+from .kernels.comm.one_shot_allreduce_rmsnorm import (
     fused_block_options,
     fused_padded_block_options,
     fused_split_options,
-    make_one_shot_allreduce_kernel,
 )
 from .kernels.tensor_shim import _preload_compiled, _run_compiled
 
