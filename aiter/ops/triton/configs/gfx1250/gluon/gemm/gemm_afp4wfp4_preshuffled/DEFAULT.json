@@ -9,8 +9,6 @@
     "GROUP_M": 1,
     "B2B_WMMA": 0,
     "NUM_KSUB": 1,
-    "SCALE_MODE": 0,
-    "A_DATA_PRESHUFFLE": 0,
     "EPI_SPLIT": 1
   },
   "M_LEQ_256": {
@@ -23,8 +21,6 @@
     "GROUP_M": 1,
     "B2B_WMMA": 0,
     "NUM_KSUB": 1,
-    "SCALE_MODE": 0,
-    "A_DATA_PRESHUFFLE": 0,
     "EPI_SPLIT": 1
   },
   "any": {
@@ -35,10 +31,8 @@
     "NUM_BUFFERS": 4,
     "num_ctas": 16,
     "GROUP_M": 8,
-    "B2B_WMMA": 0,
+    "B2B_WMMA": 1,
     "NUM_KSUB": 2,
-    "SCALE_MODE": 1,
-    "A_DATA_PRESHUFFLE": 1,
     "EPI_SPLIT": 2
   }
 }

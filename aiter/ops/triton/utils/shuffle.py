@@ -163,6 +163,27 @@ def unshuffle_scale_gemm(scales_shuffled: torch.Tensor, arch=None) -> torch.Tens
     return scales
 
 
+def shuffle_scale_gemm_128row(scales: torch.Tensor) -> torch.Tensor:
+    """gfx1250 128-row GEMM scale packing, for ``gemm_afp4wfp4_preshuffle(..., scale_layout="128row")``.
+
+    ``(rows, K//32)`` e8m0 -> ``(ceil(rows / 128), (K//32) * 128)``. Rows are padded to a
+    multiple of 128 with e8m0 1.0. Within each 128-row stripe and 4-scale K chunk, a lane's
+    rows r, r+32, r+64, r+96 sit in 16 contiguous bytes, each row's 4 scales in one dword,
+    so the WMMA scale operands load without byte gathers. Same layout as
+    ``shuffle_scale_batched(..., scale_k_width=4)``.
+    """
+    assert scales.ndim == 2, "scales must be (rows, K//32)"
+    rows, k_groups = scales.shape
+    assert k_groups % 4 == 0, f"K//32={k_groups} must be divisible by 4"
+    pad = (-rows) % 128
+    if pad:
+        fill = torch.full(
+            (pad, k_groups), 0x7F, dtype=torch.uint8, device=scales.device
+        ).view(scales.dtype)
+        scales = torch.cat([scales, fill])
+    return shuffle_scale_batched(scales.contiguous(), scale_k_width=4)
+
+
 # --- MoE MX scales (a8w4 / a8w8 / a16w4 / a4w4) ---
 def shuffle_scale_moe(
     data: torch.Tensor,
