@@ -48,6 +48,7 @@ Constraints:
 """
 
 import math
+from dataclasses import dataclass
 from functools import cache
 from typing import Any, Literal
 
@@ -330,6 +331,18 @@ def decode_adaptive_certificate(seq: int, parts: int) -> bool:
     return seq >= 32768 and parts >= 4
 
 
+@dataclass(frozen=True)
+class DecodeAdaptiveConfig:
+    """One shape's build and launch plan, so the host recomputes none of it."""
+
+    kw: dict[str, Any]  # create_topk_per_row_decode_adaptive_kernel keywords
+    grid: int
+    parts: int
+    compact: bool
+    workspace_slots: int
+    clear_row_slots: int  # leading slots of each row to zero; 0 clears nothing
+
+
 def decode_adaptive_config(
     rows: int,
     seq: int,
@@ -339,10 +352,9 @@ def decode_adaptive_config(
     ordered: bool = True,
     early_stop: bool = True,
     cu_count: int = FITTED_CU,
-) -> dict:
-    """Everything `create_topk_per_row_decode_adaptive_kernel` needs for a shape.
+) -> DecodeAdaptiveConfig:
+    """Everything `create_topk_per_row_decode_adaptive_kernel` and its launch need.
 
-    Returns the factory's keyword arguments plus `parts`, `grid` and `compact`.
     Pass `cu_count` for the device that will run it. The caps stay at least two
     even on a one-wide grid: they are upper bounds, and a cap of one is rejected.
     """
@@ -369,7 +381,17 @@ def decode_adaptive_config(
         kw["histogram_certificate"] = True
     if compact:
         kw["compact"] = True
-    return {"kw": kw, "grid": grid, "parts": parts, "compact": compact}
+    clear = needs_workspace_zero(seq, k, short_max, tier_mode=kw["tier_mode"])
+    return DecodeAdaptiveConfig(
+        kw=kw,
+        grid=grid,
+        parts=parts,
+        compact=compact,
+        workspace_slots=topk_workspace_slots(
+            rows, compact=compact, compact_cap=COMPACT_CAP_MULT * k
+        ),
+        clear_row_slots=workspace_zero_row_slots(compact) if clear else 0,
+    )
 
 
 def _compact_row_slots(compact: bool, compact_cap: int) -> int:
@@ -691,10 +713,9 @@ def create_topk_per_row_decode_adaptive_kernel(
             ws_poll(elem_i32, fx.AtomicOrdering.Acquire)
 
         def row_barrier(token):
-            # Intentional no-drain acquire/release protocol: workgroup barriers
-            # bracket local LDS work, the last workgroup release-publishes pass_done,
-            # and peers spin with acquire loads. A full waitcnt drain here is
-            # performance/correctness sensitive.
+            # Waves 1-15 do not drain their flush atomics before gpu.barrier(); peers
+            # still see them because the barrier's workgroup release and tid 0's
+            # agent-scope arrival are cumulative under the LLVM AMDGPU memory model.
             # The token doubles as the arrival count, so it may be a value the
             # row settles at runtime: skip a barrier and every later token has to
             # come down by one, or the last arrival never lands and the row hangs.
@@ -1483,7 +1504,9 @@ def create_topk_per_row_decode_adaptive_kernel(
                 )
             gpu.barrier()
 
-        def compact_rescan(start_bit: int, previous_start_bit: int, current_bits):
+        def compact_rescan(
+            pass_id: int, start_bit: int, previous_start_bit: int, current_bits
+        ):
             """Histogram this part's candidates, or its row if the slice overflowed.
 
             Both loops are always emitted and the unused one is given zero trips, so
@@ -1514,7 +1537,9 @@ def create_topk_per_row_decode_adaptive_kernel(
                 scan_run_stride_idx(),
                 init=[c_zero],
             ):
-                scan_vec_block(vblk, 2, start_bit, previous_start_bit, current_bits)
+                scan_vec_block(
+                    vblk, pass_id, start_bit, previous_start_bit, current_bits
+                )
                 yield [fallback_state[0]]
             gpu.barrier()
 
@@ -1635,7 +1660,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                     pass_id, current_k, current_bits, barrier_token, current_len
                 )
             if const_expr(compact and pass_id > compact_fill_pass):
-                compact_rescan(start_bit, previous_start_bit, current_bits)
+                compact_rescan(pass_id, start_bit, previous_start_bit, current_bits)
                 return finish_pass(
                     pass_id, current_k, current_bits, barrier_token, current_len
                 )

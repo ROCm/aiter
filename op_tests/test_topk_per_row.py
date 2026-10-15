@@ -838,16 +838,17 @@ def test_adaptive_compact_garbage(card):
         for n in (65536, 131072)
         if adaptive_kernel.decode_adaptive_config(
             m, n, 2048, ordered=False, cu_count=card[1]
-        )["compact"]
+        ).compact
     )
-    slots = adaptive_kernel.topk_workspace_slots(
-        rows, compact=True, compact_cap=adaptive_kernel.COMPACT_CAP_MULT * top_k
+    cfg = adaptive_kernel.decode_adaptive_config(
+        rows, width, top_k, ordered=False, cu_count=card[1]
     )
     workspace = flydsl_decode_host._get_adaptive_workspace(
         torch.device("cuda", torch.cuda.current_device()),
         torch.cuda.current_stream().cuda_stream,
-        slots,
+        cfg.workspace_slots,
     )
+    assert cfg.clear_row_slots, "a compact multi-part launch must clear its counters"
     seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
     row_starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
     for seed in (1, 2):
@@ -870,8 +871,7 @@ def test_adaptive_compact_garbage(card):
         )
         torch.cuda.synchronize()
         # The launch cleared this buffer's leading slots, so it is the one it used.
-        lead = adaptive_kernel.workspace_zero_row_slots(compact=True)
-        assert (workspace.view(rows, -1)[:, :lead] >= 0).all()
+        assert (workspace.view(rows, -1)[:, : cfg.clear_row_slots] >= 0).all()
         torch_indices = logits.topk(top_k, dim=-1)[1]
         assert compare_topk_results(
             logits, indices, torch_indices, row_starts, seq_lens, top_k
@@ -1022,19 +1022,19 @@ def test_adaptive_ordered_early_stop(card):
         short_max = adaptive_kernel.decode_adaptive_short_max(rows)
         c = cfg(rows, width)
         return (
-            c["parts"] > 1
+            c.parts > 1
             and width > short_max
-            and c["kw"].get("histogram_certificate", False) == certified
+            and c.kw.get("histogram_certificate", False) == certified
         )
 
     candidates = [(m, n) for m in (4, 8, 32, 64, 256) for n in (8192, 49152, 65536)]
     picks = (
         lambda m, n: multi_part(m, n, True),
         lambda m, n: multi_part(m, n, False),
-        lambda m, n: cfg(m, n)["grid"] == 1,
+        lambda m, n: cfg(m, n).grid == 1,
     )
     cells = [
-        next((m, n) for m, n in candidates if not cfg(m, n)["compact"] and pick(m, n))
+        next((m, n) for m, n in candidates if not cfg(m, n).compact and pick(m, n))
         for pick in picks
     ]
 
@@ -1097,9 +1097,7 @@ def test_adaptive_compact_cells(card):
         (m, n)
         for m in (32, 64, 128)
         for n in (131072, 262144)
-        if adaptive_kernel.decode_adaptive_config(m, n, top_k, cu_count=card[1])[
-            "compact"
-        ]
+        if adaptive_kernel.decode_adaptive_config(m, n, top_k, cu_count=card[1]).compact
     )
     torch.manual_seed(0)
     seq_lens = torch.randint(

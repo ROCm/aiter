@@ -8,7 +8,12 @@ from functools import lru_cache
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.topk import BACKEND_ADAPTIVE
+from aiter.ops.topk import (
+    BACKEND_ADAPTIVE,
+    _decode_cu_count,
+    decode_adaptive_width,
+    decode_backend_for_call,
+)
 
 from ..kernels.kernels_common import get_warp_size
 from ..kernels.tensor_shim import _run_compiled
@@ -43,7 +48,7 @@ def _get_adaptive_workspace(
     device: torch.device, stream_id: int, slots: int
 ) -> torch.Tensor:
     # Do not let graph-pool allocations escape through the process cache. Left
-    # uninitialised: `needs_workspace_zero` alone decides whether replay zeroes it.
+    # uninitialised: the config's `clear_row_slots` alone decides what replay zeroes.
     if torch.cuda.is_current_stream_capturing():
         return torch.empty(slots, device=device, dtype=torch.int32)
     return _get_cached_adaptive_workspace(device, stream_id, slots)
@@ -410,8 +415,6 @@ def _run_adaptive(
     `cfg_width` defaults to `width` for a caller that states no bound.
     `row_starts` makes the rows packed, `width` then being the plane's.
     """
-    from aiter.ops import topk as _gate
-
     if cfg_width is None:
         cfg_width = width
     # The gate's own count, so the band it admitted and the grid built here
@@ -421,36 +424,17 @@ def _run_adaptive(
         cfg_width,
         k,
         ordered=stable,
-        cu_count=_gate._decode_cu_count(logits.device.index),
+        cu_count=_decode_cu_count(logits.device.index),
     )
-    kw = cfg["kw"]
     packed = row_starts is not None
     launcher = _adaptive.create_topk_per_row_decode_adaptive_kernel(
-        top_k=k, packed_rows=packed, **kw
+        top_k=k, packed_rows=packed, **cfg.kw
     )
     workspace = _get_adaptive_workspace(
-        logits.device,
-        stream.cuda_stream,
-        _adaptive.topk_workspace_slots(
-            rows,
-            compact=cfg["compact"],
-            compact_cap=_adaptive.COMPACT_CAP_MULT * k,
-        ),
+        logits.device, stream.cuda_stream, cfg.workspace_slots
     )
-    # `cfg_width` again, not `width`: this asks whether the config above left
-    # counters a pass could read before writing, so it has to be asked about the
-    # same config. On the width it answers for a kernel that was never built.
-    if _adaptive.needs_workspace_zero(
-        cfg_width,
-        k,
-        kw["short_max"],
-        tier_mode=kw.get("tier_mode", "auto"),
-    ):
-        if cfg["compact"]:
-            lead = _adaptive.workspace_zero_row_slots(compact=True)
-            workspace.view(rows, -1)[:, :lead].zero_()
-        else:
-            workspace.zero_()
+    if cfg.clear_row_slots:
+        workspace.view(rows, -1)[:, : cfg.clear_row_slots].zero_()
     _run_compiled(
         launcher,
         logits,
@@ -549,8 +533,6 @@ def _decode_with_backend(
     starts = row_starts if packed else seq_lens
 
     if backend is None:
-        from aiter.ops.topk import decode_backend_for_call
-
         backend = decode_backend_for_call(
             logits,
             next_n,
@@ -571,8 +553,6 @@ def _decode_with_backend(
         # when the gate admitted the call, which needs `max_row_len`. So the
         # width is computed here, not before the gate: `decode_adaptive_width`
         # requires a bound and a `None` reaching it is a bug, not a fallback.
-        from aiter.ops.topk import decode_adaptive_width
-
         cfg_width = decode_adaptive_width(width, max_row_len)
         _run_adaptive(
             logits,
