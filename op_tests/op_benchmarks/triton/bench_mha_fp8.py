@@ -8,7 +8,8 @@ reason -- nothing but the launch happens inside the graph.
 
 Usage:
     python bench_mha.py                          # default seqlen sweep
-    python bench_mha.py --seqlen 4096 --batch 2
+    python bench_mha.py --seqlen_q 4096 --batch 2
+    python bench_mha.py --seqlen_q 1024 --seqlen_k 8192  # different q / k lengths
     python bench_mha.py --q_heads 32 --k_heads 8  # grouped query attention
     python bench_mha.py --rep 100
 """
@@ -31,9 +32,9 @@ def quant_fp8(x):
     return (x / scale).to(FP8_DTYPE), scale
 
 
-def make_inputs(b, hq, hk, s, d, device):
-    q_shape = (b, hq, s, d)
-    kv_shape = (b, hk, s, d)
+def make_inputs(b, hq, hk, sq, sk, d, device):
+    q_shape = (b, hq, sq, d)
+    kv_shape = (b, hk, sk, d)
     q, q_scale = quant_fp8(torch.randn(q_shape, device=device, dtype=torch.float32))
     k, k_scale = quant_fp8(torch.randn(kv_shape, device=device, dtype=torch.float32))
     v, v_scale = quant_fp8(torch.randn(kv_shape, device=device, dtype=torch.float32))
@@ -41,20 +42,20 @@ def make_inputs(b, hq, hk, s, d, device):
     return q, k, v, q_scale, k_scale, v_scale, o
 
 
-def bench_case(b, hq, hk, s, d, causal, rep, device):
-    q, k, v, q_scale, k_scale, v_scale, o = make_inputs(b, hq, hk, s, d, device)
+def bench_case(b, hq, hk, sq, sk, d, causal, rep, device):
+    q, k, v, q_scale, k_scale, v_scale, o = make_inputs(b, hq, hk, sq, sk, d, device)
 
     def run():
         mha_fwd(q, k, v, q_scale, k_scale, v_scale, o=o, causal=causal)
 
     ms = triton.testing.do_bench_cudagraph(run, rep=rep)
 
-    # Two S x S x D matmuls per (batch, query head): Q @ K^T and P @ V.
-    flops = 2 * (2.0 * b * hq * s * s * d)
+    # Two SQ x SK x D matmuls per (batch, query head): Q @ K^T and P @ V.
+    flops = 2 * (2.0 * b * hq * sq * sk * d)
     if causal:
         flops = flops // 2
-    # fp8 q (hq heads) and k/v (hk heads) in, bf16 o (hq heads) out.
-    num_bytes = (b * hq * s * d) + 2 * (b * hk * s * d) + 2 * (b * hq * s * d)
+    # fp8 q (hq heads, sq) and k/v (hk heads, sk) in, bf16 o (hq heads, sq) out.
+    num_bytes = (b * hq * sq * d) + 2 * (b * hk * sk * d) + 2 * (b * hq * sq * d)
     return {
         "us": ms * 1e3,
         "tflops": flops * 1e-12 / (ms * 1e-3),
@@ -69,9 +70,12 @@ def main():
     parser.add_argument("--q_heads", type=int, default=32,
                         help="number of query heads")
     parser.add_argument("--k_heads", type=int, default=None,
-                        help="number of K/V heads for GQA; defaults to --q_heads (plain MHA)")
-    parser.add_argument("--seqlen", type=int, default=8192)
-    parser.add_argument("--head-dim", type=int, default=128)
+                        help="number of K/V heads for GQA; defaults to --q-_heads (plain MHA)")
+    parser.add_argument("--seqlen_q", type=int, default=8192,
+                        help="query sequence length")
+    parser.add_argument("--seqlen_k", type=int, default=None,
+                        help="key/value sequence length; defaults to --seqlen_q")
+    parser.add_argument("--head_dim", type=int, default=128)
     parser.add_argument("--causal", action="store_true", default=False)
     parser.add_argument("--rep", type=int, default=500,
                         help="do_bench_cudagraph replay budget, in ms")
@@ -83,13 +87,18 @@ def main():
 
     k_heads = args.q_heads if args.k_heads is None else args.k_heads
     assert args.q_heads % k_heads == 0, (
-        f"--q_heads ({args.q_heads}) must be a multiple of --k_heads ({k_heads})"
+        f"--q_heads ({args.q_heads}) must be a multiple of --k-heads ({k_heads})"
+    )
+
+    seqlen_k = args.seqlen_q if args.seqlen_k is None else args.seqlen_k
+    assert not args.causal or args.seqlen_q == seqlen_k, (
+        f"--causal requires --seqlen_q ({args.seqlen_q}) == --seqlen_k ({seqlen_k})"
     )
 
     print(f"fp8 MHA fwd")
-    print(f"{'B':>4} {'HQ':>4} {'HK':>4} {'S':>7} {'D':>5} {'us':>10} {'TFLOP/s':>10} {'TB/s':>9}")
-    r = bench_case(args.batch, args.q_heads, k_heads, args.seqlen, args.head_dim, args.causal, args.rep, device)
-    print(f"{args.batch:>4} {args.q_heads:>4} {k_heads:>4} {args.seqlen:>7} {args.head_dim:>5} "
+    print(f"{'B':>4} {'HQ':>4} {'HK':>4} {'SQ':>7} {'SK':>7} {'D':>5} {'us':>10} {'TFLOP/s':>10} {'TB/s':>9}")
+    r = bench_case(args.batch, args.q_heads, k_heads, args.seqlen_q, seqlen_k, args.head_dim, args.causal, args.rep, device)
+    print(f"{args.batch:>4} {args.q_heads:>4} {k_heads:>4} {args.seqlen_q:>7} {seqlen_k:>7} {args.head_dim:>5} "
             f"{r['us']:>10.2f} {r['tflops']:>10.2f} {r['tbps']:>9.2f}")
 
 

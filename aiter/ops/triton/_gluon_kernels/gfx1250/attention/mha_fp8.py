@@ -55,7 +55,7 @@ def concat_subtile(x, y):
 
 
 @gluon.jit
-def apply_mask(qk, subtile: gl.constexpr, tile_m, tile_n, BLOCK_M, BLOCK_N, SEQLEN, LAYOUT, CAUSAL, EVEN_N):
+def apply_mask(qk, subtile: gl.constexpr, tile_m, tile_n, BLOCK_M, BLOCK_N, SEQLEN_K, LAYOUT, CAUSAL, EVEN_N):
     if CAUSAL:
         offs_m = tile_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LAYOUT))
 
@@ -66,12 +66,12 @@ def apply_mask(qk, subtile: gl.constexpr, tile_m, tile_n, BLOCK_M, BLOCK_N, SEQL
 
     if CAUSAL and not EVEN_N:
         mask_causal = offs_m[:, None] >= offs_n[None, :]
-        mask_oob = offs_n[None, :] < SEQLEN
+        mask_oob = offs_n[None, :] < SEQLEN_K
         mask = mask_causal & mask_oob
     elif CAUSAL:
         mask = offs_m[:, None] >= offs_n[None, :]
     else:
-        mask = offs_n[None, :] < SEQLEN
+        mask = offs_n[None, :] < SEQLEN_K
     
     qk = tl.where(mask, qk, float("-inf"))
     return qk
@@ -106,7 +106,8 @@ def _mha_fwd_subtiled(
     CAUSAL: gl.constexpr,
     NUM_Q_HEADS: gl.constexpr,
     NUM_K_HEADS: gl.constexpr,
-    SEQLEN,
+    SEQLEN_Q,
+    SEQLEN_K,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     HEAD_DIM: gl.constexpr,
@@ -155,7 +156,7 @@ def _mha_fwd_subtiled(
     h_q = gl.program_id(1)
     z = gl.program_id(2)
     if CAUSAL:
-        grid_m = gl.cdiv(SEQLEN, BLOCK_M)
+        grid_m = gl.cdiv(SEQLEN_Q, BLOCK_M)
         pid_m = grid_m - 1 - pid_m
     GQA_SIZE: gl.constexpr = NUM_Q_HEADS // NUM_K_HEADS
     h_k = h_q // GQA_SIZE
@@ -169,21 +170,21 @@ def _mha_fwd_subtiled(
 
     q_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
         base=q_ptr,
-        shape=(SEQLEN, HEAD_DIM),
+        shape=(SEQLEN_Q, HEAD_DIM),
         strides=(stride_q_m, stride_q_d),
         block_shape=(BLOCK_M, HEAD_DIM_POW2),
         layout=SHARED_LAYOUT_Q,
     )
     k_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
         base=k_ptr,
-        shape=(SEQLEN // PRESHUFFLE_FACTOR_K, HEAD_DIM * PRESHUFFLE_FACTOR_K),
+        shape=(SEQLEN_K // PRESHUFFLE_FACTOR_K, HEAD_DIM * PRESHUFFLE_FACTOR_K),
         strides=(stride_k_n, stride_k_d),
         block_shape=(BLOCK_N // 2 // PRESHUFFLE_FACTOR_K, HEAD_DIM_POW2 * PRESHUFFLE_FACTOR_K),
         layout=SHARED_LAYOUT_K,
     )
     v_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
         base=v_ptr,
-        shape=(SEQLEN // PRESHUFFLE_FACTOR_V, HEAD_DIM * PRESHUFFLE_FACTOR_V),
+        shape=(SEQLEN_K // PRESHUFFLE_FACTOR_V, HEAD_DIM * PRESHUFFLE_FACTOR_V),
         strides=(stride_v_n, stride_v_d),
         block_shape=(BLOCK_N // PRESHUFFLE_FACTOR_V, HEAD_DIM_POW2 // 2 * PRESHUFFLE_FACTOR_V),
         layout=SHARED_LAYOUT_V,
@@ -258,15 +259,15 @@ def _mha_fwd_subtiled(
     if CAUSAL:
         num_n_iter = gl.cdiv((pid_m + 1) * BLOCK_M, BLOCK_N)
     else:
-        num_n_iter = gl.cdiv(SEQLEN, BLOCK_N)
+        num_n_iter = gl.cdiv(SEQLEN_K, BLOCK_N)
 
     gl.amd.gfx1250.tdm.async_wait(5)
     qk0 = gl.amd.cdna5.wmma(q, k0, qk_zeros)
     qk1 = gl.amd.cdna5.wmma(q, k1, qk_zeros)
     if CAUSAL or not EVEN_N:
         if num_n_iter <= 2:
-            qk0 = apply_mask(qk0, 0, pid_m, 0, BLOCK_M, BLOCK_N, SEQLEN, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
-            qk1 = apply_mask(qk1, 1, pid_m, 0, BLOCK_M, BLOCK_N, SEQLEN, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
+            qk0 = apply_mask(qk0, 0, pid_m, 0, BLOCK_M, BLOCK_N, SEQLEN_K, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
+            qk1 = apply_mask(qk1, 1, pid_m, 0, BLOCK_M, BLOCK_N, SEQLEN_K, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
     qk = concat_subtile(qk0, qk1)
     m_ij = fast_maximum(m_i, gl.reduce(qk, 1, fast_maximum) * qk_scale)
     qk0_shifted = qk0 * qk_scale - m_ij[:, None]
@@ -327,7 +328,7 @@ def _mha_fwd_subtiled(
         qk0 = gl.amd.cdna5.wmma(q, k0, qk_zeros)
         if CAUSAL or not EVEN_N:
             num_n_iter = gl.maximum(num_n_iter, 3)
-            qk0 = apply_mask(qk0, 0, pid_m, num_n_iter - 2, BLOCK_M, BLOCK_N, SEQLEN, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
+            qk0 = apply_mask(qk0, 0, pid_m, num_n_iter - 2, BLOCK_M, BLOCK_N, SEQLEN_K, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
         k1 = local_load_k(k1_buffer, read_idx_k, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K)
         read_idx_k += 1
         p1 = gl.exp2(qk1_shifted)
@@ -342,7 +343,7 @@ def _mha_fwd_subtiled(
     with gl.amd.warp_pipeline_stage("ep0_1"):
         qk1 = gl.amd.cdna5.wmma(q, k1, qk_zeros)
         if CAUSAL or not EVEN_N:
-            qk1 = apply_mask(qk1, 1, pid_m, num_n_iter - 2, BLOCK_M, BLOCK_N, SEQLEN, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
+            qk1 = apply_mask(qk1, 1, pid_m, num_n_iter - 2, BLOCK_M, BLOCK_N, SEQLEN_K, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
         v0 = local_load_v(v0_buffer, read_idx_v, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V)
         p = concat_subtile(p0, p1)
         l_ij = gl.sum(p, 1)
@@ -377,7 +378,7 @@ def _mha_fwd_subtiled(
     with gl.amd.warp_pipeline_stage("ep1_0"):
         qk0 = gl.amd.cdna5.wmma(q, k0, qk_zeros)
         if CAUSAL or not EVEN_N:
-            qk0 = apply_mask(qk0, 0, pid_m, num_n_iter - 1, BLOCK_M, BLOCK_N, SEQLEN, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
+            qk0 = apply_mask(qk0, 0, pid_m, num_n_iter - 1, BLOCK_M, BLOCK_N, SEQLEN_K, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
         k1 = local_load_k(k1_buffer, read_idx_k, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K)
         read_idx_k += 1
         p1 = gl.exp2(qk1_shifted)
@@ -390,7 +391,7 @@ def _mha_fwd_subtiled(
     with gl.amd.warp_pipeline_stage("ep1_1"):
         qk1 = gl.amd.cdna5.wmma(q, k1, qk_zeros)
         if CAUSAL or not EVEN_N:
-            qk1 = apply_mask(qk1, 1, pid_m, num_n_iter - 1, BLOCK_M, BLOCK_N, SEQLEN, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
+            qk1 = apply_mask(qk1, 1, pid_m, num_n_iter - 1, BLOCK_M, BLOCK_N, SEQLEN_K, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
         v0 = local_load_v(v0_buffer, read_idx_v, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V)
         p = concat_subtile(p0, p1)
         l_ij = gl.sum(p, 1)
@@ -446,7 +447,7 @@ def _mha_fwd_subtiled(
     o_buffer.store(acc)
     o_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
         base=o_ptr,
-        shape=(SEQLEN, HEAD_DIM),
+        shape=(SEQLEN_Q, HEAD_DIM),
         strides=(stride_o_m, stride_o_d),
         block_shape=(BLOCK_M, HEAD_DIM_POW2),
         layout=SHARED_LAYOUT_O,

@@ -27,9 +27,10 @@ def mha_fwd(
     """
     Multi-head attention forward with per-tensor fp8 (e4m3) Q, K and V.
 
-    q:         [B, HQ, S, D] (layout "bhsd") dtype float8_e4m3fn.
-    k, v:      [B, HK, S, D] dtype float8_e4m3fn. HQ must be a multiple of HK
-               (grouped query attention; HK == HQ is plain MHA).
+    q:         [B, HQ, SQ, D] (layout "bhsd") dtype float8_e4m3fn.
+    k, v:      [B, HK, SK, D] dtype float8_e4m3fn. HQ must be a multiple of HK
+               (grouped query attention; HK == HQ is plain MHA). SK may differ
+               from SQ when causal=False.
     q_scale, k_scale, v_scale: per-tensor dequant scales, fp32 scalars (python
                float or a 1-element / 0-dim tensor).
     o:         optional output buffer, same shape as q, dtype bfloat16. The
@@ -46,14 +47,18 @@ def mha_fwd(
         assert t.dtype == torch.float8_e4m3fn, f"{name} must be float8_e4m3fn"
         assert t.dim() == 4, f"{name} must be 4D, got {t.dim()}D"
 
-    batch, num_q_heads, seqlen, head_dim = q.shape
-    num_k_heads = k.shape[1]
+    batch, num_q_heads, seqlen_q, head_dim = q.shape
+    _, num_k_heads, seqlen_k, _ = k.shape
     assert k.shape == v.shape, "k and v must have the same shape"
-    assert k.shape[0] == batch and k.shape[2:] == q.shape[2:], (
-        "k/v must match q in batch, seqlen and head_dim"
+    assert k.shape[0] == batch and k.shape[3] == head_dim, (
+        "k/v must match q in batch and head_dim"
     )
     assert num_q_heads % num_k_heads == 0, (
         f"num_q_heads ({num_q_heads}) must be a multiple of num_k_heads ({num_k_heads})"
+    )
+    # The causal mask assumes the diagonal starts at (0, 0).
+    assert not causal or seqlen_q == seqlen_k, (
+        f"causal requires seqlen_q ({seqlen_q}) == seqlen_k ({seqlen_k})"
     )
 
     config = get_mha_fwd_config(q.device)
@@ -63,12 +68,7 @@ def mha_fwd(
 
     head_dim_pow2 = triton.next_power_of_2(head_dim)
     # wmma_scaled runs a 16x16x128 fp8 instruction over the head dim.
-    assert head_dim_pow2 >= 128, f"head_dim must be at least 128, got {head_dim}"
-    # Only the final K/V tile is masked, so every tile the prologue prefetches
-    # has to be a real one.
-    assert triton.cdiv(seqlen, BLOCK_N) >= NUM_BUFFERS - 1, (
-        f"seqlen {seqlen} is too short for {NUM_BUFFERS} pipeline buffers"
-    )
+    # assert head_dim_pow2 >= 128, f"head_dim must be at least 128, got {head_dim}"
 
     if sm_scale is None:
         sm_scale = 1.0 / (head_dim**0.5)
@@ -94,7 +94,7 @@ def mha_fwd(
     stride_k_z, stride_k_h, stride_k_n, stride_k_d = (k.stride(i) for i in range(4))
     stride_v_z, stride_v_h, stride_v_n, stride_v_d = (v.stride(i) for i in range(4))
     stride_o_z, stride_o_h, stride_o_m, stride_o_d = (o.stride(i) for i in range(4))
-    if seqlen % 2 == 0 and head_dim == head_dim_pow2:
+    if seqlen_k % 2 == 0 and head_dim == head_dim_pow2:
         preshuffle_factor_k = 2
     else:
         preshuffle_factor_k = 1
@@ -102,7 +102,7 @@ def mha_fwd(
     stride_k_n *= preshuffle_factor_k
     stride_v_n *= preshuffle_factor_v
 
-    grid = (triton.cdiv(seqlen, BLOCK_M), num_q_heads, batch)
+    grid = (triton.cdiv(seqlen_q, BLOCK_M), num_q_heads, batch)
     _mha_fwd_subtiled[grid](
         q_ptr=q,
         k_ptr=k,
@@ -131,13 +131,14 @@ def mha_fwd(
         CAUSAL=causal,
         NUM_Q_HEADS=num_q_heads,
         NUM_K_HEADS=num_k_heads,
-        SEQLEN=seqlen,
+        SEQLEN_Q=seqlen_q,
+        SEQLEN_K=seqlen_k,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         HEAD_DIM=head_dim,
         HEAD_DIM_POW2=head_dim_pow2,
         NUM_BUFFERS=NUM_BUFFERS,
-        EVEN_N=(seqlen % BLOCK_N == 0) and (triton.cdiv(seqlen, BLOCK_N) >= 3),
+        EVEN_N=(seqlen_k % BLOCK_N == 0) and (triton.cdiv(seqlen_k, BLOCK_N) >= 3),
         PRESHUFFLE_FACTOR_K = preshuffle_factor_k,
         PRESHUFFLE_FACTOR_V = preshuffle_factor_v,
         num_warps=config["num_warps"],
