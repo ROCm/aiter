@@ -28,6 +28,7 @@ from op_tests.triton_tests.utils.paged_attn_ref import ref_paged_attn
 from op_tests.triton_tests.utils.shuffle_kv_cache import shuffle_kv_cache
 
 PAGE, H, HKV, D = 64, 64, 4, 128
+FP8_REL_ERR = {dtypes.bf16: 7.7e-2, dtypes.fp16: 7.7e-2}
 
 
 def q8(x):
@@ -116,9 +117,9 @@ def compare(want, got, atol, name):
 
 
 def measure(candidates, case, want, query_lens, kv_lens, atol=None):
-    # 8% of the global max rather than an element-relative rtol.
+    # Output-dtype bound on the global max rather than an element-relative rtol.
     if atol is None:
-        atol = 0.08 * want.abs().max().item()
+        atol = FP8_REL_ERR[case["out"].dtype] * want.abs().max().item()
     heads = case["q"].shape[1]
     # Bottom-right-aligned causal: query i sees kv_len - q_len + i + 1 keys.
     pairs = sum(
@@ -154,7 +155,7 @@ PREFILL_CASES = {
     "varlen": ([320, 300, 200, 150], [2048, 5000, 8192, 3000], 16),
     # Ragged causal prefill with partial KV pages.
     "varlen_causal": ([93, 80, 71, 60], [157, 100, 90, 70], 4),
-    **{f"ragged_g{g}": ([93, 17, 41, 9], [157, 0, 70, 1], g) for g in (1, 4, 8, 16)},
+    **{f"ragged_g{g}": ([93, 17, 41, 9], [157, 0, 70, 1], g) for g in (1, 2, 4, 8, 16)},
 }
 
 
@@ -195,7 +196,12 @@ def test_prefill(dtype, causal, kind, layout):
             call()
         case["out"].fill_(float("nan"))
         graph.replay()
-        compare(want, case["out"], 0.08 * want.abs().max().item(), "small-Sq graph")
+        compare(
+            want,
+            case["out"],
+            FP8_REL_ERR[case["out"].dtype] * want.abs().max().item(),
+            "small-Sq graph",
+        )
     return ret
 
 
@@ -223,7 +229,12 @@ def test_decode(dtype, depth, layout):
             candidates[name]()
         case["out"].fill_(float("nan"))
         graph.replay()
-        compare(want, case["out"], 0.08 * want.abs().max().item(), "decode graph")
+        compare(
+            want,
+            case["out"],
+            FP8_REL_ERR[case["out"].dtype] * want.abs().max().item(),
+            "decode graph",
+        )
     return ret
 
 
@@ -260,7 +271,10 @@ def check_decode_layer_graphs(dtype):
         for i, case in enumerate(cases):
             want = reference(case, query_lens, context_lengths)
             compare(
-                want, case["out"], 0.08 * want.abs().max().item(), f"{label} layer {i}"
+                want,
+                case["out"],
+                FP8_REL_ERR[case["out"].dtype] * want.abs().max().item(),
+                f"{label} layer {i}",
             )
 
     for context_lengths in ([65, 513, 0], [1024, 1, 257]):
@@ -300,6 +314,18 @@ def check_decode_layer_graphs(dtype):
 
 @benchmark()
 def test_paged_addressing(pool_blocks, layout):
+    # Shuffling temporarily holds both linear pools and both shuffled pools.
+    required_bytes = (4 if layout == "vectorized" else 2) * pool_blocks * PAGE * HKV * D
+    free_bytes, _ = torch.cuda.mem_get_info()
+    if required_bytes + 256 * 1024**2 > free_bytes:
+        aiter.logger.warning(
+            "paged addressing skipped: pool_blocks=%s layout=%s requires %s bytes plus 256 MiB; free=%s",
+            pool_blocks,
+            layout,
+            required_bytes,
+            free_bytes,
+        )
+        return {"gfx": get_gfx_runtime(), "skipped": "insufficient device memory"}
     query_lens, kv_lens = [128], [256]
     original = make_case(query_lens, kv_lens, dtypes.bf16)
     want = reference(original, query_lens, kv_lens)
@@ -321,7 +347,7 @@ def test_paged_addressing(pool_blocks, layout):
         case["shuffled_kv_cache"] = layout == "vectorized"
         cases[name] = case
         candidates[name] = partial(ua.unified_attention, **case, backend="flydsl")
-    ret = measure(candidates, cases["reversed"], want, query_lens, kv_lens, atol=0.1)
+    ret = measure(candidates, cases["reversed"], want, query_lens, kv_lens, atol=0.055)
     return ret
 
 
@@ -381,11 +407,11 @@ def main():
             test_decode,
             itertools.product(args.dtype, args.decode_depth, args.layout),
         ),
-        # Place live pages near the end of a two-GiB KV pool.
+        # The 65537-page pool puts page 65536 at byte offset 2**31.
         (
             "paged addressing",
             test_paged_addressing,
-            itertools.product([65535], args.layout),
+            itertools.product([65535, 65537], args.layout),
         ),
     ]
     for name, fn, parameters in sweeps:

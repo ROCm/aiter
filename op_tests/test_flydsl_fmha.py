@@ -29,7 +29,7 @@ from aiter.ops.quant import per_tensor_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 FP8_DTYPE = torch.float8_e4m3fn
-FP8_REL_ERR = 8e-2
+FP8_REL_ERR = {dtypes.bf16: 8e-2, dtypes.fp16: 7.6e-2}
 FP8_MIN_COS = 0.98
 FP8_LSE_REL_ERR = 1e-4
 FP8_UNIFORM_RANGE = (-1.0, 1.0)
@@ -241,6 +241,22 @@ def _add(name, **kw):
     FP8_CASES[name] = _case(**kw)
 
 
+# Explicit 256-row tiles and group-2 GQA cover branches missed by auto-tiling.
+for varlen in (False, True):
+    for dtype in (dtypes.bf16, dtypes.fp16):
+        _add(
+            f"gqa_group2_bm256_{'varlen' if varlen else 'dense'}_{dtype}",
+            S=385,
+            H=8,
+            HKV=4,
+            D=128,
+            splits=1,
+            block_m=256,
+            out_dtype=dtype,
+            varlen=varlen,
+            vl_q=[257, 129] if varlen else None,
+            vl_kv=[513, 257] if varlen else None,
+        )
 for S in (4096, 8192):
     for H, HKV in ((16, 1), (32, 8), (12, 12)):
         _add(f"gqa_dense_s{S}_h{H}_kv{HKV}", S=S, H=H, HKV=HKV, D=128)
@@ -574,7 +590,7 @@ def fp8_reference(c, causal, q, k, v, descales, scale):
 
 
 def compare(want, got, name):
-    atol = FP8_REL_ERR * want.abs().max().item()
+    atol = FP8_REL_ERR[got.dtype] * want.abs().max().item()
     got = got.float()
     assert not torch.isnan(
         got

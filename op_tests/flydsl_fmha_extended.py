@@ -260,7 +260,7 @@ def test_flydsl_fmha_rejects_device_mismatch():
 # error measured is the kernel's, not the quantizer's.
 
 FP8_DTYPE = torch.float8_e4m3fn
-FP8_REL_ERR = 8e-2
+FP8_REL_ERR = {torch.bfloat16: 8e-2}
 FP8_MIN_COS = 0.98
 FP8_LSE_REL_ERR = 1e-4
 FP8_UNIFORM_RANGE = (-1.0, 1.0)
@@ -482,8 +482,8 @@ def _run_fp8_shape(
         .min()
         .item()
     )
-    assert rel_err < FP8_REL_ERR and min_cos > FP8_MIN_COS, (
-        f"fp8 gate: rel_err={rel_err:.3e} (< {FP8_REL_ERR}), "
+    assert rel_err < FP8_REL_ERR[out.dtype] and min_cos > FP8_MIN_COS, (
+        f"fp8 gate: rel_err={rel_err:.3e} (< {FP8_REL_ERR[out.dtype]}), "
         f"max_err={max_err:.3e}, ref_amax={scale:.3e}, "
         f"min_cos={min_cos:.5f} (> {FP8_MIN_COS})"
     )
@@ -1432,7 +1432,7 @@ def test_fp8_dispatch_batch_routes_to_gfx950(causal, softmax_scale):
         softmax_scale,
     )
     cos = F.cosine_similarity(out.float().reshape(-1, D), ref.reshape(-1, D), dim=1)
-    assert _fp8_rel_err(out.float(), ref)[0] < FP8_REL_ERR
+    assert _fp8_rel_err(out.float(), ref)[0] < FP8_REL_ERR[out.dtype]
     assert cos.min().item() > FP8_MIN_COS
 
 
@@ -1477,7 +1477,7 @@ def test_fp8_dispatch_varlen_routes_to_gfx950(causal, softmax_scale):
             softmax_scale,
         ).squeeze(0)
     cos = F.cosine_similarity(out.float().reshape(-1, D), ref.reshape(-1, D), dim=1)
-    assert _fp8_rel_err(out.float(), ref)[0] < FP8_REL_ERR
+    assert _fp8_rel_err(out.float(), ref)[0] < FP8_REL_ERR[out.dtype]
     assert cos.min().item() > FP8_MIN_COS
 
 
@@ -1531,9 +1531,9 @@ def test_fp8_gate_is_scale_invariant(dist, causal):
     cos = F.cosine_similarity(
         out.float().reshape(-1, D), ref.reshape(-1, D), dim=1
     ).min()
-    assert rel_err < FP8_REL_ERR and cos.item() > FP8_MIN_COS, (
+    assert rel_err < FP8_REL_ERR[out.dtype] and cos.item() > FP8_MIN_COS, (
         f"fp8 gate ({dist}, causal={causal}): rel_err={rel_err:.3e} "
-        f"(< {FP8_REL_ERR}), max_err={max_err:.3e}, ref_amax={scale:.3e}, "
+        f"(< {FP8_REL_ERR[out.dtype]}), max_err={max_err:.3e}, ref_amax={scale:.3e}, "
         f"min_cos={cos.item():.5f}"
     )
 
@@ -1834,7 +1834,7 @@ def test_fp8_softmax_scale_dense(causal, S, Skv, H_KV, D, splits):
             assert torch.equal(out, default_out)
             assert torch.equal(lse, default_lse)
         ref = _ref_attention(qd, kd, vd, causal, scale)
-        assert _fp8_rel_err(out.float(), ref)[0] < FP8_REL_ERR
+        assert _fp8_rel_err(out.float(), ref)[0] < FP8_REL_ERR[out.dtype]
         _assert_lse_matches(lse, _ref_lse(qd, kd, causal, scale))
     for scale, saved in zip((qs, ks, vs), saved_descales):
         assert torch.equal(scale, saved), "softmax_scale must not mutate descales"
@@ -1885,7 +1885,10 @@ def test_fp8_softmax_scale_varlen(causal, cuq, cukv, splits):
             kr = kd[cukv[i] : cukv[i + 1]].unsqueeze(0)
             vr = vd[cukv[i] : cukv[i + 1]].unsqueeze(0)
             ref = _ref_attention(qr, kr, vr, causal, scale)[0]
-            assert _fp8_rel_err(out[cuq[i] : cuq[i + 1]].float(), ref)[0] < FP8_REL_ERR
+            assert (
+                _fp8_rel_err(out[cuq[i] : cuq[i + 1]].float(), ref)[0]
+                < FP8_REL_ERR[out.dtype]
+            )
             _assert_lse_matches(
                 lse[:, cuq[i] : cuq[i + 1]], _ref_lse(qr, kr, causal, scale)[0]
             )
