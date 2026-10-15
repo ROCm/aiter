@@ -726,7 +726,8 @@ def run_moe(
             inter_dim=inter_dim,
             data_format=data_format,
         )
-        tflops, bandwidth = _rates(work["total"], us)
+        #tflops, bandwidth = _rates(work["total"], us)
+        tflops, bandwidth = 0, 0
         print(
             f"[bench {tag}] fused_moe end-to-end us = {us:.2f}, "
             f"FLOPS = {work['total'][0]:.0f}, TFLOPS = {tflops:.2f}, "
