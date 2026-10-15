@@ -3887,7 +3887,8 @@ def get_2stage_cfgs(
         and dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and activation == ActivationType.Swiglu
-        and q_dtype_w not in [dtypes.fp8, dtypes.fp4x2]
+        and q_dtype_w != dtypes.fp8
+        and not (q_dtype_w == dtypes.fp4x2 and q_dtype_a in [dtypes.bf16, dtypes.fp16])
         and cktile_mxfp4_ok
     ):
         return MOEMetadata(
