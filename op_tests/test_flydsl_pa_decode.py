@@ -336,13 +336,15 @@ _PIPE_CASES = [
     ),
     # A head-major pool of 2**15 + 1 blocks puts KV head 2 past 2**31 bytes, so
     # the host must select wide addressing and widen the head term. 288 CTAs
-    # exceed the CU count, which selects one V buffer.
+    # exceed the CU count, which selects one V buffer. The long sequence gives
+    # each task four tiles that reuse that buffer, and its last tile ends
+    # mid-page with two empty pages.
     (
         "nhd-d256-page64-hkv3-head-major-wide",
         {
             **_NHD_BASE,
             "kv_heads": 3,
-            "lengths": (1, 65, 8192),
+            "lengths": (1, 65, 32600),
             "max_partitions": 32,
             "head_major": True,
             "pool_blocks": 2**15 + 1,
