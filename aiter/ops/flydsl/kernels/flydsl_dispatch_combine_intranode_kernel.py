@@ -435,6 +435,7 @@ def make_combine_kernel(
     fp8_direct_cast: bool = False,
     blockwise_fp8_transport: bool = False,
     max_recv: int | None = None,
+    mask_topk_ids: bool = False,
 ):
     """Build the intranode combine ``@flyc.kernel``.
 
@@ -460,6 +461,8 @@ def make_combine_kernel(
         raise ValueError(
             "blockwise_fp8_transport and fp8_direct_cast are mutually exclusive"
         )
+    if mask_topk_ids and (not skip_stage1 or zero_copy):
+        raise ValueError("mask_topk_ids requires skip_stage1=True without zero_copy")
     _xfer_bf16_to_fp8 = fp8_direct_cast
     _transport_dtype = torch.float8_e4m3fn if _xfer_bf16_to_fp8 else data_type
 
@@ -957,6 +960,8 @@ def make_combine_kernel(
             if const_expr(skip_stage1 and not zero_copy):
                 # Fused-upstream Stage 3: caller plain-stored per-(tok_id, k_slot)
                 # partials (no tok_map decode; zero_copy excluded, keeps decode).
+                # mask_topk_ids: addr_inp_tok_map is the caller's int32 top-k id
+                # table; a -1 slot was never dispatched, so its partial is stale.
                 for k_slot in range_constexpr(experts_per_token):
                     slot_idx = tok_id * experts_per_token + k_slot
                     expert_tok_off = fx.Int64(slot_idx) * nbytes
@@ -972,7 +977,13 @@ def make_combine_kernel(
                                 expert_tok_addr + fx.Int64(hidden_dim)
                             )
                         )
-                    expert_vlds.append(fx.Boolean(1))
+                    if const_expr(mask_topk_ids):
+                        topk_id = buffer_load(
+                            _rsrc_tok_map, slot_idx, vec_width=1, dtype=T.i32
+                        )
+                        expert_vlds.append(topk_id >= 0)
+                    else:
+                        expert_vlds.append(fx.Boolean(1))
             else:
                 # Baseline Stage 3: decode (peer_pe, dest_lid) from dest_tok_map and
                 # read each shmem_comb_inp slot (scalar loads; coalescer fuses dwords).
@@ -1316,6 +1327,7 @@ def make_combine_jit(
     fp8_direct_cast: bool = False,
     blockwise_fp8_transport: bool = False,
     max_recv=None,
+    mask_topk_ids: bool = False,
 ):
     """Build the JIT launcher for ``make_combine_kernel``. ``data_type`` is the
     external dtype (symmetric I/O); ``fp8_direct_cast`` enables bf16-external /
@@ -1340,6 +1352,7 @@ def make_combine_jit(
         fp8_direct_cast=fp8_direct_cast,
         blockwise_fp8_transport=blockwise_fp8_transport,
         max_recv=max_recv,
+        mask_topk_ids=mask_topk_ids,
     )
 
     # JIT cache key (mirrors the dispatch launcher above; keep in sync).
@@ -1353,6 +1366,7 @@ def make_combine_jit(
     _key_fp8_direct_cast = bool(fp8_direct_cast)
     _key_blockwise_fp8_transport = bool(blockwise_fp8_transport)
     _key_max_recv = max_recv if max_recv is not None else npes * max_tok_per_rank
+    _key_mask_topk_ids = bool(mask_topk_ids)
     # See dispatch launcher for the ``str(torch.dtype)`` rationale.
     _key_data_type = str(data_type)
     _key_schema_version = _DISPATCH_COMBINE_JIT_SCHEMA_VERSION
@@ -1393,6 +1407,7 @@ def make_combine_jit(
             _key_fp8_direct_cast,
             _key_blockwise_fp8_transport,
             _key_max_recv,
+            _key_mask_topk_ids,
             _key_data_type,
             _key_schema_version,
         )
