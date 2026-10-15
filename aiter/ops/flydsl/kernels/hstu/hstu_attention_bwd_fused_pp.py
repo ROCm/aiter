@@ -169,10 +169,11 @@ def validate_hstu_attention_bwd_fused_pp(
         raise ValueError(
             "hstu bwd fused requires (block_m, block_n, num_waves) = "
             f"(256, 16, 8), got ({block_m}, {block_n}, {num_waves}). 8 waves give "
-            "2 per SIMD inside one barrier domain. 384 is the dV/dK twin's shape "
-            "and is 6.9% faster in isolation, but the FUSED kernel does not "
-            "fit there: 256 VGPR with 10 spills, against 196 and 0 spills "
-            "at 256."
+            "2 per SIMD inside one barrier domain. BLOCK_M quantises to 128 "
+            "(8 waves x MFMA_M 16), so 256 and 384 are the only candidates. "
+            "384 is the dV/dK twin's shape and removes this kernel's 15 ms "
+            "geometry penalty, but it spills 21 registers and measures "
+            "503.7 ms against 461.0 at 256 (214 VGPR, 0 spills)."
         )
     if num_heads <= 0:
         raise ValueError(f"num_heads must be positive, got {num_heads}")
