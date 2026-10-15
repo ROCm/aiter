@@ -1274,6 +1274,11 @@ def topk_select(
     # of and reads as dense. `topk_select_backend` derives from it the pitch
     # each backend that reads rows in place would launch at.
     stride0 = strides[0] if rows > 1 else width
+    if rows == 1 and strides[0] != width:
+        # And is handed on as dense: a FlyDSL launcher keeps the build of its
+        # first call, and a row stride of 1 there builds one that reads every
+        # later call's rows at a pitch of 1.
+        input = input.as_strided((1, width), (width, 1))
     backend = _choose(
         rows,
         width,

@@ -446,6 +446,60 @@ def test_row_pitch():
     return failures
 
 
+# One shape per FlyDSL backend, each served on every supported part.
+_SINGLE_ROW_ROUTES = (
+    ("decode", 64, 131072, 1024),
+    ("stream", 64, 32768, 512),
+    ("small_k", 64, 4096, 16),
+    ("argmax", 64, 4096, 1),
+)
+
+
+def test_single_row_stride():
+    """A single row whose row stride is 1, then many rows, on each FlyDSL backend.
+
+    A FlyDSL launcher keeps the build of its first call, and a row stride of 1
+    there built one that read every later call's rows at a pitch of 1: after
+    one such row, 63 of 64 dense rows came back wrong from decode. Each launcher
+    has to meet that row first, so this runs in a process of its own.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = (
+        f"import sys; sys.path.insert(0, {here!r}); import test_topk_select as t; "
+        "print('SINGLE_ROW', repr(t._single_row_stride_failures()))"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False
+    )
+    lines = [ln for ln in done.stdout.splitlines() if ln.startswith("SINGLE_ROW ")]
+    if done.returncode != 0 or not lines:
+        tail = (done.stderr or done.stdout).strip().splitlines()[-3:]
+        return [f"exit {done.returncode}: {' | '.join(tail)}"]
+    failures = ast.literal_eval(lines[-1][len("SINGLE_ROW ") :])
+    for label in failures:
+        aiter.logger.error("SINGLE ROW STRIDE FAILED: %s", label)
+    return failures
+
+
+def _single_row_stride_failures():
+    failures = []
+    for backend, m, n, k in _SINGLE_ROW_ROUTES:
+        torch.manual_seed(m * n + k)
+        for label, x in (
+            ("1 row, stride (1, 1)", torch.randn(n, 1).T),
+            (f"{m} rows after it", torch.randn(m, n)),
+        ):
+            lens = torch.full((x.shape[0],), n, dtype=dtypes.i32)
+            try:
+                idx = _run_single_backend(x, lens, k, backend)
+            except _NotServed:
+                break
+            torch.cuda.synchronize()
+            if not torch.equal(_sorted_values(x, idx), run_torch(x, lens, k)):
+                failures.append(f"{backend} {label}: wrong selection")
+    return failures
+
+
 def test_rejections():
     """A wrong rank or dtype is refused with the ValueError that names the rule.
 
@@ -1017,6 +1071,12 @@ def main():
         "row pitch: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
     )
     assert not bad, f"row pitch: {len(bad)} failed"
+    bad = test_single_row_stride()
+    aiter.logger.info(
+        "single row stride: %s",
+        "all hold" if not bad else f"{len(bad)} FAILED: {bad}",
+    )
+    assert not bad, f"single row stride: {len(bad)} failed"
     bad = test_rejections()
     aiter.logger.info(
         "rejections: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
