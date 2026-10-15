@@ -13,7 +13,8 @@ config=None (the installed config). Records are appended as soon as a candidate 
 
 Record fields:
   status    ready (worker is set up), start (candidate began), ok, error, skipped (the
-            compiled kernels overflow LDS or spill registers; reason says which)
+            compiled kernels overflow LDS or spill registers; reason says which),
+            wrong (output did not match the kernel's reference in one of --verify launches)
   baseline  true for the installed config
   config    the raw candidate, never the mutated copy; for the baseline the installed config
             (launched through the wrapper's own config=None path unless keys DEFAULT.json does
@@ -136,6 +137,18 @@ def _timed_replay(graph, n_calls):
     return start.elapsed_time(end) * 1e3 / n_calls
 
 
+def verify_output(config, check, launches):
+    """What the kernel's check found in `launches` runs (every layout each), or None.
+
+    Several runs, because a race in a kernel shows up only now and then.
+    """
+    for _ in range(launches):
+        wrong = check(config)
+        if wrong:
+            return wrong
+    return None
+
+
 def compile_only(call, config, inputs):
     """Run the wrapper with every kernel launch turned into a compile; returns the compiled kernels."""
     from triton.runtime import jit
@@ -233,6 +246,8 @@ def benchmark(
     replays,
     cold_mb,
     screen,
+    verify=0,
+    check=None,
 ):
     keys, _, _ = load_defaults(spec, backend)
     best_rel = fastest_rel(out) if screen else None
@@ -302,6 +317,10 @@ def benchmark(
                     record["screened"] = True
                 elif screen and reference:
                     best_rel = min(best_rel or record["rel"], record["rel"])
+                if verify and check is not None and record["status"] == "ok":
+                    wrong = verify_output(candidate, check, verify)
+                    if wrong:
+                        record.update(status="wrong", error=wrong)
         except Exception as e:  # noqa: BLE001
             # a failing candidate is a result, not a crash
             record.update(
@@ -345,6 +364,12 @@ def main(argv=None):
         default=0,
         help="stop a candidate after one replay when it is slower than this x the fastest (0: off)",
     )
+    parser.add_argument(
+        "--verify",
+        type=int,
+        default=0,
+        help="check each timed candidate's output against the reference this many times",
+    )
     args = parser.parse_args(argv)
     signal.signal(signal.SIGTERM, stop_after_this_candidate)
 
@@ -356,7 +381,8 @@ def main(argv=None):
     arch = arch_info.get_arch()
     backend = args.backend or spec.default_backend(arch)
     check_backend(spec, arch, backend)
-    call, inputs, should_skip = spec.setup(shape, backend)
+    call, inputs, should_skip, *rest = spec.setup(shape, backend)
+    check = rest[0] if rest else None
 
     if args.plan:
         return plan(spec, shape, backend, arch, should_skip, args.space_out)
@@ -375,6 +401,8 @@ def main(argv=None):
         args.replays,
         args.cold_mb,
         args.screen,
+        args.verify,
+        check,
     )
     return 0
 

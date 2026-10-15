@@ -50,7 +50,8 @@ here. Update this file in the same change as any behaviour change.
    `kpack` is dropped outside gfx942 and `persistent` always. After writing, clear both loader
    caches and re-resolve every swept M; `is_tuned` must be True, otherwise the previous file is
    restored. Bucket collisions are resolved before writing (largest M wins).
-6. Data contracts: a kernel function returns `(call, inputs, should_skip)`; a result
+6. Data contracts: a kernel function returns `(call, inputs, should_skip)` or, with a torch
+   reference, `(call, inputs, should_skip, check)` (`output_check`); a result
    record's fields are listed in the `harness.py` docstring; the plan JSON carries the family's
    `bounds`; the worker prints `ready` and one line per candidate for the driver's watchdog;
    the plan is kept per (arch, backend, kernel, shape) in the runs dir and the installer only
@@ -71,7 +72,9 @@ here. Update this file in the same change as any behaviour change.
    the final-round shortlist compares `rel`, so GPU-to-GPU differences do not
    decide. `--screen X` stops a candidate after
    one replay when its `rel` is above X times the lowest fully timed `rel` of its M (`screened`);
-   it never applies to the baseline or the final round. Never two drivers on one GPU.
+   it never applies to the baseline or the final round. The final round also checks each
+   candidate's output `--verify` times against the kernel's `check` and records a mismatch as
+   `wrong`, which never wins (it moves on to the next ten while all of them are wrong). Never two drivers on one GPU.
 9. Call the public wrappers (`aiter.ops.triton.gemm...`) only, never `_triton_kernels` or
    `_gluon_kernels`; pass `backend=` where the wrapper takes it and refuse a backend the wrapper
    cannot select (`KernelSpec.supports`).

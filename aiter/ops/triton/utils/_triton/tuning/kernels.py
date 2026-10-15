@@ -15,6 +15,12 @@ Every kernel function has the same layout: imports -> inputs -> call -> optional
   should_skip(config)    True for a candidate the kernel would reject: its own asserts, or a
                          buffer count its wrapper clamps so the candidate only repeats another
                          one. None when the kernel has no rule of its own.
+  check(config)          optional 4th element: runs the candidate on fresh inputs in every
+                         layout the wrapper takes and returns None when each output matches a
+                         torch reference, else what went wrong. A config file serves every
+                         layout, but the sweep times one; the final round runs check on every
+                         candidate, so a config that is wrong or does not fit in another
+                         layout never wins.
 
 K is the logical element count everywhere, as the input generators take it: fp4 tensors hold
 K // 2 bytes and the config files of fp4 families are named by the logical K.
@@ -169,6 +175,41 @@ def family_bounds(spec, backend, shape_nk):
     )
 
 
+def a16w16_check(gemm, M, N, K, layouts, **kwargs):
+    """check(config) for the a16w16 wrappers: every layout, fresh inputs with a real bias."""
+    import copy
+
+    import torch
+
+    from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
+        generate_gemm_a16w16_inputs,
+    )
+
+    def check(config):
+        for layout in layouts:
+            x, w, _, _, y = generate_gemm_a16w16_inputs(
+                M, N, K, torch.bfloat16, layout=layout, output=True
+            )
+            bias = torch.randn(N, dtype=torch.bfloat16, device=x.device)
+            expected = torch.nn.functional.linear(x, w, bias)
+            try:  # a wrong output, or a config that does not run in this layout
+                out = gemm(
+                    x,
+                    w,
+                    bias=bias,
+                    dtype=torch.bfloat16,
+                    y=y,
+                    config=copy.deepcopy(config),
+                    **kwargs,
+                )
+                torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
+            except Exception as e:  # noqa: BLE001
+                return f"{layout}: {type(e).__name__}: {' '.join(str(e).split())[:240]}"
+        return None
+
+    return check
+
+
 def add_splitk_block_size(config, K):
     """Mutates config: the triton a16w16-style kernels read SPLITK_BLOCK_SIZE, which the JSON lacks.
 
@@ -265,7 +306,10 @@ def gemm_a16w16(shape, backend):
             return num_buffers > k_tiles - 2  # the wrapper clamps it there anyway
         return num_buffers > k_tiles  # the wrapper clamps it there anyway
 
-    return call, (x, w, bias, y), should_skip
+    check = a16w16_check(
+        gemm, M, N, K, ("TN", "NT", "TT", "NN"), backend=backend
+    )  # the layouts the wrapper takes
+    return call, (x, w, bias, y), should_skip, check
 
 
 @kernel(
@@ -310,7 +354,11 @@ def gemm_a16w16_persistent(shape, backend):
             return True  # the wrapper raises it to 2 anyway
         return num_buffers > k_tiles + 1  # the wrapper clamps it there anyway
 
-    return call, (x, w, bias, y), should_skip
+    layouts = ("TN", "TT") if backend == "gluon" else ("TN", "NT", "TT", "NN")
+    check = a16w16_check(  # gluon persistent has no column-major A path
+        gemm, M, N, K, layouts, backend=backend, persistent=True
+    )
+    return call, (x, w, bias, y), should_skip, check
 
 
 @kernel("GEMM-A16W16-ATOMIC", backend_kwarg=False)

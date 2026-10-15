@@ -42,6 +42,12 @@ installer uses only that file for the M, so the winner is picked from numbers me
 device. A resumed run refreshes an existing final-round file, even on one GPU. Never point two
 drivers at the same GPU, and never list a GPU twice.
 
+The final round also runs every candidate `--verify` (3) times against the kernel's torch
+reference (`check` in `kernels.py`). A candidate with a wrong output is recorded as `wrong` and
+cannot win; while all ten are wrong, the final round goes on with the next ten (at most 100).
+On gfx1250 some Gluon a16w16 configs race and give a few wrong elements at large M, so a winner
+picked on time alone is not enough. The timing sweep itself does not check outputs.
+
 Suggested M lists: `GEMM-AFP4WFP4_PRESHUFFLED` 4 8 16 31 32 64 ... 8192 (31 is a bucket of its
 own because `BLOCK_SIZE_M` must be 16 or less below M=32); standard families 1 4 8 16 ... 8192;
 `GEMM-A16W16-gated` 64 128 256 512 2048.
