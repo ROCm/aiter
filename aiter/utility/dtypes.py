@@ -25,7 +25,9 @@ _8bit_fallback = torch.uint8
 def get_dtype_fp8():
     if torch.version.hip is None or not torch.cuda.is_available():
         return _8bit_fallback
-    gfx = torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0]
+    from ..jit.utils.chip_info import get_gfx_runtime
+
+    gfx = get_gfx_runtime()
     return defaultDtypes.get(gfx, {"fp8": _8bit_fallback})["fp8"]
 
 

@@ -890,7 +890,9 @@ def check_and_set_ninja_worker():
     max_jobs_env = os.environ.get("MAX_JOBS")
     if max_jobs_env is not None:
         try:
-            if int(max_jobs_env) > 0:
+            max_jobs = int(max_jobs_env)
+            if max_jobs > 0:
+                os.environ["MAX_JOBS"] = str(max_jobs)
                 return
         except ValueError:
             pass

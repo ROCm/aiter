@@ -1684,14 +1684,16 @@ class TestNinjaWorkerLimit(unittest.TestCase):
         )
 
     def test_core_preserves_explicit_positive_override_and_bounds_defaults(self):
-        with (
-            mock.patch.dict(os.environ, {"MAX_JOBS": "32"}),
-            mock.patch.dict(sys.modules, {"psutil": self.psutil}),
-            mock.patch.object(os, "cpu_count", return_value=32) as cpu_count,
-        ):
-            self.namespace["check_and_set_ninja_worker"]()
-            self.assertEqual(os.environ["MAX_JOBS"], "32")
-            cpu_count.assert_not_called()
+        for value in ("32", "+32", " 32 "):
+            with (
+                self.subTest(value=value),
+                mock.patch.dict(os.environ, {"MAX_JOBS": value}),
+                mock.patch.dict(sys.modules, {"psutil": self.psutil}),
+                mock.patch.object(os, "cpu_count", return_value=32) as cpu_count,
+            ):
+                self.namespace["check_and_set_ninja_worker"]()
+                self.assertEqual(os.environ["MAX_JOBS"], "32")
+                cpu_count.assert_not_called()
 
         for initial in (None, "invalid", "0", "-1", "-32"):
             with self.subTest(initial=initial):

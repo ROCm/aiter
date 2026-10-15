@@ -107,14 +107,25 @@ def get_lds_capacity_bytes(gfx: str | None = None) -> int:
 
 @functools.lru_cache(maxsize=1)
 def get_gfx_runtime() -> str:
-    """Return the arch of the live GPU, always via rocminfo/hipinfo.
+    """Return the live GPU arch, using Torch if Windows hipinfo is unavailable.
 
     Unlike get_gfx(), ignores GPU_ARCHS -- always detects the actual running
     GPU.  Use for runtime dispatch decisions (selecting tuned kernels, picking
     code paths).  Use get_gfx() for build-time codegen paths (gen_instances,
     csrc module-level arch selection) where no GPU may be available.
     """
-    gfx_arch = _detect_native()[0]
+    try:
+        gfx_arch = _detect_native()[0]
+    except RuntimeError:
+        if not IS_WINDOWS:
+            raise
+        import torch
+
+        if torch.version.hip is None or not torch.cuda.is_available():
+            raise
+        gfx_arch = (
+            torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0].lower()
+        )
     supported = set(GFX_MAP.values())
     if gfx_arch not in supported:
         raise KeyError(
