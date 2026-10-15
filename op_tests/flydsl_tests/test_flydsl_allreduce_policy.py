@@ -10,8 +10,6 @@ Run with ``pytest op_tests/flydsl_tests/test_flydsl_allreduce_policy.py``.
 from __future__ import annotations
 
 import os
-import subprocess
-import sys
 from types import SimpleNamespace
 from unittest import mock
 

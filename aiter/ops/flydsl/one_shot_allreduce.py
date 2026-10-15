@@ -338,11 +338,11 @@ class OneShotAllReduceRMSNorm:
         residual_out = bf16(acc)
         out = bf16(acc * rsqrt(sum(acc^2)/hidden + eps) * weight)
 
-    The wire layout depends on ``hidden``, because the tile is pinned to one 
-    token row so the norm's reduction fits in one workgroup. A new hidden dim 
-    therefore needs a new engine, and building one is a collective (IPC handle exchange). 
-    Engines are built lazily on first use, which is safe because TP ranks enter 
-    a collective with the same shape in lockstep. Passing ``hiddens=(...)`` builds 
+    The wire layout depends on ``hidden``, because the tile is pinned to one
+    token row so the norm's reduction fits in one workgroup. A new hidden dim
+    therefore needs a new engine, and building one is a collective (IPC handle exchange).
+    Engines are built lazily on first use, which is safe because TP ranks enter
+    a collective with the same shape in lockstep. Passing ``hiddens=(...)`` builds
     them up front.
 
     ``split`` spreads each row over that many workgroups instead (``block *

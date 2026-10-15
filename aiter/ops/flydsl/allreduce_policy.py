@@ -364,8 +364,8 @@ class FamilyPolicy:
     Three families of all-reduce kernels: one-shot, mesh, and ring.
     Depending on the interconnect type (PCIe or xGMI), the one-shot is best for
     smaller messages, the mesh overtakes for bigger messages, and finally the
-    ring is the choice for very large messages on PCIe. The message sizes at 
-    which the transitions take place depend on the architecture, the world size, 
+    ring is the choice for very large messages on PCIe. The message sizes at
+    which the transitions take place depend on the architecture, the world size,
     and the interconnect type. Hence, the policy is a function of ``(arch, link, world_size)``.
 
     Each algorithm has a ``Window`` of payload sizes. ``None`` or an empty
@@ -373,7 +373,7 @@ class FamilyPolicy:
 
     The mesh and the ring are quantized, so they run only with quantization on
     (``AITER_QUICK_REDUCE_QUANTIZATION=INT4``), and their windows do not
-    overlap. The one-shot is exact and runs in both modes. 
+    overlap. The one-shot is exact and runs in both modes.
     """
 
     arch: str
