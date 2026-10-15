@@ -61,6 +61,9 @@ def _gfx1250_flydsl_default_kernel(M, N, K, bias, dtype, otype):
     """
     if dtype != dtypes.bf16 or otype not in (dtypes.bf16, dtypes.fp32):
         return None
+    # flydsl_gemm adds a bias it cannot fuse in the bias dtype, so a BF16 bias would round an FP32 output.
+    if bias and otype == dtypes.fp32:
+        return None
     if M < 512 or N < 4096 or K < 512:
         return None
     big = M > 768
@@ -79,6 +82,16 @@ def _gfx1250_flydsl_default_kernel(M, N, K, bias, dtype, otype):
     return _get_flydsl_gemm_kernels().flydsl_hgemm_kernel_name(
         dtype=dtype, out_dtype=otype, config=config, has_bias=bias, target_gfx="gfx1250"
     )
+
+
+def _gfx1250_flydsl_c_fits(M, N, kernel_name):
+    """Whether the gfx1250 FlyDSL kernel can write all of a contiguous M x N output C."""
+    params = _get_flydsl_gemm_kernels().get_flydsl_hgemm_kernel_params(kernel_name)
+    block_m = params["block_m"]
+    out_bytes = 4 if params["out_dtype"] == "fp32" else 2
+    # C takes 32-bit byte offsets and a 32-bit record count, which alone drops the last tile's rows past M;
+    # those rows wrap onto the first rows of C once they reach 2^32.
+    return -(-M // block_m) * block_m * N * out_bytes < 1 << 32
 
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -332,6 +345,10 @@ def get_GEMM_A16W16_config(
                     )
                 if kernel_name is None:
                     default_config["libtype"] = "triton"
+                    default_config["solidx"] = 0
+                elif not _gfx1250_flydsl_c_fits(M, N, kernel_name):
+                    # Triton's default config leaves the rows of C past byte 2^31 unwritten.
+                    default_config["libtype"] = "torch"
                     default_config["solidx"] = 0
                 else:
                     default_config["libtype"] = "flydsl"

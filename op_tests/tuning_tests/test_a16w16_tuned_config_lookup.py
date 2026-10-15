@@ -113,9 +113,10 @@ class TestGfx1250FlydslCandidates(unittest.TestCase):
 
 
 class TestGfx1250DefaultDispatch(unittest.TestCase):
-    """gfx1250 shapes without a tuned row: FlyDSL where Triton runs its default config, Triton otherwise."""
+    """gfx1250 shapes without a tuned row: FlyDSL where Triton runs its default config and FlyDSL can write C,
+    torch where it cannot, Triton otherwise."""
 
-    def _default(self, m, n, k, dtype=BF16, otype=BF16):
+    def _default(self, m, n, k, dtype=BF16, otype=BF16, bias=False):
         from aiter.ops.triton.utils._triton import arch_info
 
         patches = [
@@ -130,7 +131,7 @@ class TestGfx1250DefaultDispatch(unittest.TestCase):
             self.addCleanup(p.stop)
         tuned.get_GEMM_A16W16_config.cache_clear()
         self.addCleanup(tuned.get_GEMM_A16W16_config.cache_clear)
-        return tuned.get_GEMM_A16W16_config(m, n, k, False, dtype, otype)
+        return tuned.get_GEMM_A16W16_config(m, n, k, bias, dtype, otype)
 
     def test_large_shapes_take_flydsl(self):
         for m, tile in ((512, "_t128x128x64x4_"), (2048, "_t256x128x64x4_")):
@@ -154,6 +155,33 @@ class TestGfx1250DefaultDispatch(unittest.TestCase):
         for m, n, k, dtype in cases:
             config = self._default(m, n, k, dtype, dtype)
             self.assertEqual(config["libtype"], "triton", (m, n, k, dtype))
+
+    def test_outputs_past_the_flydsl_offsets_take_torch(self):
+        fp32 = str(torch.float32)
+        # The last 256-row tile of C must end below byte 2^32: 14081 rows of 151936 pad to 14336.
+        cases = [
+            (14080, 151936, 4096, BF16, "flydsl"),
+            (14081, 151936, 4096, BF16, "torch"),
+            (14134, 151936, 4096, BF16, "torch"),  # C itself is below 2^32
+            (16384, 151936, 4096, BF16, "torch"),
+            (21248, 50016, 6144, fp32, "flydsl"),
+            (21249, 50016, 6144, fp32, "torch"),
+        ]
+        for m, n, k, otype, libtype in cases:
+            config = self._default(m, n, k, otype=otype)
+            self.assertEqual(config["libtype"], libtype, (m, n, k, otype))
+
+    def test_bias_with_fp32_output_stays_on_triton(self):
+        fp32 = str(torch.float32)
+        self.assertEqual(
+            self._default(2048, 4096, 4096, otype=fp32, bias=True)["libtype"], "triton"
+        )
+        self.assertEqual(
+            self._default(2048, 4096, 4096, otype=fp32)["libtype"], "flydsl"
+        )
+        self.assertEqual(
+            self._default(2048, 4096, 4096, bias=True)["libtype"], "flydsl"
+        )
 
 
 if __name__ == "__main__":
