@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import range_constexpr, rocdl
+from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from .common import (
@@ -28,13 +28,16 @@ from .common import (
     V4I,
     alive,
     before,
+    bf16x8_to_f32,
     bld,
     bst,
     g_add_agent,
     g_or_agent,
     g_st_sys,
     i32,
+    lds_ld_i32,
     now,
+    pack_bf16x8,
     poll_sys_ge,
     rsrc,
     wait_vm,
@@ -50,6 +53,7 @@ from .mega_moe_ep_config import (
     MAX_NPES,
     NCTA_MAX,
     NT,
+    NTT,
     KernelCtx,
 )
 
@@ -60,6 +64,7 @@ def build_communication(kc: KernelCtx) -> dict:
     """The arena / flag / watchdog device functions of one instance (added to kc)."""
     const_expr = kc.get("const_expr")[0]
     TOPK, E, H, a8, EPR = kc.get("TOPK E H a8 EPR")
+    L_RIX = kc.get("L_RIX")[0]  # the compute wave's gathered recv-slot list (per unit)
     ROW_BYTES = H if a8 else H // 2  # quantized activation bytes per row (FP8 vs FP4)
     N_VEC = ROW_BYTES // 16  # 16-byte (V4I) copy units per payload row
     SCALE_I32 = H // 128  # i32 E8M0-scale units per row (H//32 bytes / 4)
@@ -211,5 +216,72 @@ def build_communication(kc: KernelCtx) -> dict:
             for p in range_constexpr(MAX_NPES):
                 if i32(p) < npes:
                     dispatch_arrive(a, i32(p), parity, i32(0), i32(1), npes)
+
+    # --- combine (GEMM2 epilog scatter back to source + source-side weighted sum) --
+    @flyc.jit
+    def combine_send(L, lane, a, src_out, nrows):
+        """GEMM2 epilog (per unit): scatter the unit's ``nrows`` output rows (row k's
+        recv slot = L_RIX[k], its H bf16 output at ``src_out`` row k) back to each row's
+        SOURCE rank's ``part`` region at (source_token*topk + route), then signal that
+        source (combine_arrive). ``src_out`` / ``nrows`` are the compute wave's GEMM2
+        output + row count, wired at bring-up."""
+        mtpr = a["mtpr"]
+        parity = a["epoch"] & i32(1)
+        HV = H // 8
+        for k_ in range(i32(0), nrows, i32(1)):
+            k = i32(k_)
+            idx = lds_ld_i32(L, L_RIX + k * i32(4))
+            sk = idx // i32(TOPK)
+            route = idx - sk * i32(TOPK)
+            src_rank = sk // mtpr
+            src_tok = sk - src_rank * mtpr
+            slot = src_tok * i32(TOPK) + route
+            dpart = peer_rs(a, src_rank, "off_part")
+            for g_ in range(lane, i32(HV), i32(64)):
+                g = i32(g_)
+                v = bld(src_out, (k * i32(HV) + g) * i32(16), 0, V4I, 0)
+                bst(v, dpart, (slot * i32(HV) + g) * i32(16), 0, AUX_SYS)
+            if lane == i32(0):
+                combine_arrive(a, src_rank, parity, src_tok, i32(1), i32(TOPK))
+        wait_vm(0)
+
+    @flyc.jit
+    def combine_final(L, tid, a):
+        """Source-side finish: for each local token wait its top-k partials, then
+        out[t] = sum over the top-k routes of part[t*topk+r] * wts[t,r]. The top-k
+        weight is applied here, so dispatch / compute never carry weights. Runs on the
+        whole block in the finish phase; expected=topk assumes all routes valid (the
+        -1 / mask_invalid_slots case is a follow-up)."""
+        m = a["m"]
+        parity = a["epoch"] & i32(1)
+        rpart = own_rs(a, "off_part")
+        rwts = rsrc(a["wts"], m * i32(TOPK) * i32(4))
+        rout = rsrc(a["out"])
+        HV = H // 8
+        nblk = i32(gpu.grid_dim.x)
+        for t_ in range(i32(gpu.block_id("x")), m, nblk):
+            t = i32(t_)
+            if tid == i32(0):
+                combine_wait(a, parity, t)
+            gpu.barrier()
+            for g_ in range(tid, i32(HV), i32(NTT)):
+                g = i32(g_)
+                acc = [fx.Float32(0.0) for _ in range(8)]
+                for r in range_constexpr(TOPK):
+                    w = fx.Int32(
+                        bld(rwts, (t * i32(TOPK) + i32(r)) * i32(4), 0, T.i32, 0)
+                    ).bitcast(fx.Float32)
+                    pv = bld(
+                        rpart,
+                        ((t * i32(TOPK) + i32(r)) * i32(HV) + g) * i32(16),
+                        0,
+                        V4I,
+                        0,
+                    )
+                    fv = bf16x8_to_f32(pv)
+                    for i in range(8):
+                        acc[i] = acc[i] + w * fv[i]
+                bst(pack_bf16x8(acc), rout, (t * i32(HV) + g) * i32(16), 0, 0)
+            gpu.barrier()
 
     return locals()

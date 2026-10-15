@@ -178,6 +178,9 @@ def mega_moe_ep_consts(
     c["L_WSUM"] = take(NW * 2 * 4)  # wave-prefix scratch (count + offset)
     c["L_DCH"] = take(NCHA * 4)  # chunk table: expert | ce<<16 | c<<24
     c["L_EOFF"] = take(EPR * 4)  # per-expert row offset (gather)
+    c["L_RIX"] = take(
+        RG * 4
+    )  # gathered source_key (payload row) list of one unit chunk
     c["L_CTL"] = take(128 * 4)  # control slots (C_* above)
     c["LDS_BYTES"] = ceildiv(off, 128) * 128
     return c
@@ -214,7 +217,7 @@ def kernel_config(
     RG, LDS_BYTES, NBW = c["RG"], c["LDS_BYTES"], c["NBW"]
     L_A, L_AS, L_INTER = c["L_A"], c["L_AS"], c["L_INTER"]
     L_DYN, L_DCNT, L_WSUM = c["L_DYN"], c["L_DCNT"], c["L_WSUM"]
-    L_DCH, L_EOFF, L_CTL = c["L_DCH"], c["L_EOFF"], c["L_CTL"]
+    L_DCH, L_EOFF, L_RIX, L_CTL = c["L_DCH"], c["L_EOFF"], c["L_RIX"], c["L_CTL"]
     # GEMM1 inter-piece choices the planner balances over (full inter dim = KS2 blocks).
     KS2 = I // 128
     DYN_PS = [p for p in range(1, KS2 + 1) if KS2 % p == 0]

@@ -45,6 +45,7 @@ from .common import (
 from .mega_moe_ep_config import (
     C_BARCNT,
     C_BARGEN,
+    C_CNT,
     C_DYNP,
     C_NACT,
     C_NCH,
@@ -65,11 +66,11 @@ __all__ = ["build_schedule"]
 
 def build_schedule(kc: KernelCtx) -> dict:
     """The dispatch-planner device functions of one instance (added to kc)."""
-    DYN_PS, EPR, I, KS2 = kc.get("DYN_PS EPR I KS2")
+    DYN_PS, EPR, I, KS2, TOPK = kc.get("DYN_PS EPR I KS2 TOPK")
     L_CTL, L_DCH, L_DCNT, L_DYN = kc.get("L_CTL L_DCH L_DCNT L_DYN")
-    L_EOFF, L_WSUM, NBW, TMAX = kc.get("L_EOFF L_WSUM NBW TMAX")
+    L_EOFF, L_RIX, L_WSUM, NBW = kc.get("L_EOFF L_RIX L_WSUM NBW")
     const_expr, rch = kc.get("const_expr rch")
-    assert L_EOFF is not None and const_expr  # L_EOFF: gather offsets (compute)
+    assert L_EOFF is not None and const_expr  # L_EOFF: gather offsets (future)
 
     @flyc.jit
     def cbar(L, tid):
@@ -232,12 +233,27 @@ def build_schedule(kc: KernelCtx) -> dict:
 
     @flyc.jit
     def gather_recv_chunk(L, tid, a, expert, cc, ce):
-        # TODO(compute/dispatch): collect the received row indices (and top-k weights)
-        # routed to local `expert`'s chunk `cc` of `ce` into L_RIX / weights, like TP
-        # gather_routes_chunk. The planner only needs the row count, which the route
-        # scan already accumulated in L_DCNT.
-        del tid, a, cc, ce
-        return fx.min(lds_ld_i32(L, L_DCNT + expert * i32(4)), i32(TMAX))
+        """Scan the received routing; collect the payload rows (source_keys) whose
+        local expert is ``expert`` and that fall in chunk ``cc`` of ``ce`` into L_RIX,
+        and return the chunk's row count. Chunk by source_key % ce (deterministic and
+        balanced). L_RIX stores each row's recv slot idx = source_key*topk + route; the
+        GEMM reads payload row source_key = idx//topk, and combine recovers route =
+        idx%topk (and source_key -> src rank/token) to scatter the result back."""
+        n = a["nrecv"]
+        rle = rsrc(a["recv_le"], n * i32(4))
+        if tid == i32(0):
+            lds_st(L, L_CTL + C_CNT * 4, i32(0))
+        cbar(L, tid)
+        for idx_ in range(tid, n, i32(NT)):
+            idx = i32(idx_)
+            le = fx.Int32(bld(rle, idx * i32(4), 0, T.i32, 0))
+            sk = idx // i32(TOPK)
+            if (le == expert) & ((sk % ce) == cc):
+                pos = lds_atomic_add(L, L_CTL + C_CNT * 4, 1)
+                if pos < i32(rch):
+                    lds_st(L, L_RIX + pos * i32(4), idx)
+        cbar(L, tid)
+        return fx.min(lds_ld_i32(L, L_CTL + C_CNT * 4), i32(rch))
 
     def unit_tile(L, tid, a, expert, i0, icnt, r0, rows, sig):
         # TODO(compute): local-expert GEMM1(expert, i0, icnt) + act + GEMM2 on these
