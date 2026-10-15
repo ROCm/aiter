@@ -478,12 +478,15 @@ void all_reduce_residual(fptr_t _fa,
     int64_t numel      = inp.numel();
     int64_t data_bytes = numel * inp.element_size();
 
-    // The kernels index out and residual by inp's extent, on inp's device.
+    // The kernels index out and residual densely by inp's extent, on inp's device.
     for(auto [t, name] : {std::pair{&residual, "residual"}, std::pair{&out, "out"}})
     {
         if(t->numel() != numel || t->dtype() != dtype || t->device_id != inp.device_id)
             throw std::runtime_error(std::string("all_reduce_residual: ") + name +
                                      " must match the input's numel, dtype and device");
+        if(!t->is_contiguous())
+            throw std::runtime_error(std::string("all_reduce_residual: ") + name +
+                                     " must be contiguous");
     }
 
     void* actual_inp             = inp.data_ptr();
@@ -624,7 +627,8 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
         throw std::runtime_error("fused allreduce rmsnorm: res_out must hold every input row");
     if(!skip_residual && static_cast<int64_t>(res_inp.numel()) < all_elems)
         throw std::runtime_error("fused allreduce rmsnorm: res_inp must hold every input row");
-    // The dispatcher casts every buffer by inp's dtype, on inp's device.
+    // The dispatcher casts every buffer by inp's dtype, on inp's device, and
+    // the kernels address them as dense rows of n.
     for(auto [t, name] : {std::pair{&out, "out"},
                           std::pair{&res_out, "res_out"},
                           std::pair{&res_inp, "res_inp"},
@@ -635,6 +639,9 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
         if(t->dtype() != dtype || t->device_id != inp.device_id)
             throw std::runtime_error(std::string("fused allreduce rmsnorm: ") + name +
                                      " must match the input's dtype and device");
+        if(!t->is_contiguous())
+            throw std::runtime_error(std::string("fused allreduce rmsnorm: ") + name +
+                                     " must be contiguous");
     }
 
     if(reg_ptr != 0)

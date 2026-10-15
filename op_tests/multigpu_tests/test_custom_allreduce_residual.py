@@ -172,6 +172,9 @@ def check_rejections(ca):
 
     expect_error(RuntimeError, "undersized out", lambda: native_ar_res(rows(m - 1)))
     expect_error(RuntimeError, "fp32 out", lambda: native_ar_res(rows(m, dtypes.fp32)))
+    # Same numel as x, but a strided view the kernels would write densely past.
+    strided = torch.empty((m, 2 * n), dtype=bf16, device="cuda")[:, ::2]
+    expect_error(RuntimeError, "strided out", lambda: native_ar_res(strided))
 
     # gfx1250 runs only one-shot all-reduce kernels, at every size.
     saved, ca._is_gfx1250 = ca._is_gfx1250, True
@@ -238,6 +241,16 @@ def check_rejections(ca):
         RuntimeError,
         "fp32 out",
         lambda: native_ar_rms(x, rows(m), rows(norm_rows, dtypes.fp32)),
+    )
+    expect_error(
+        RuntimeError,
+        "strided res_out",
+        lambda: native_ar_rms(x, strided, rows(norm_rows)),
+    )
+    expect_error(
+        RuntimeError,
+        "strided out",
+        lambda: native_ar_rms(x, rows(m), strided[:norm_rows]),
     )
     # num_norm_rows == m is the default behavior, so 1-stage accepts it.
     ca.custom_fused_ar_rms(x, x, w, EPS, True, num_norm_rows=m)
