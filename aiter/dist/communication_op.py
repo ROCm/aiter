@@ -124,14 +124,14 @@ def _canonical_fused_ar_rms_quant_type(quant_type):
 
 def _assert_no_custom_group(op_name: str):
     assert not has_custom_group(), (
-        f"custom_group_config is set — use custom_all_reduce() instead of "
+        f"custom_group_config is set -- use custom_all_reduce() instead of "
         f"{op_name}()"
     )
 
 
 def _assert_has_custom_group():
     assert has_custom_group(), (
-        "custom_group_config is not set — use tensor_model_parallel_all_reduce() "
+        "custom_group_config is not set -- use tensor_model_parallel_all_reduce() "
         "or other standard parallel group operations instead of custom_all_reduce()"
     )
 
@@ -197,6 +197,9 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
     ``transpose_scale`` (per-group only) writes the per-group scale in
     column-major layout ``(num_groups, M)`` viewed as ``(M, num_groups)``,
     matching what ``gemm_a8w8_blockscale_preshuffle`` expects.
+
+    ``gemma_norm`` (per-token and per-group) normalizes with ``x * (1 + w)``
+    from the raw ``weight_``; MXFP4 does not support it.
     """
     _assert_no_custom_group("tensor_model_parallel_fused_allreduce_rmsnorm_quant")
 
@@ -216,6 +219,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
             prefill_support=prefill_support,
             emit_bf16=emit_bf16,
             transpose_scale=transpose_scale,
+            gemma_norm=gemma_norm,
         )
 
     return get_tp_group().fused_allreduce_rmsnorm_quant(

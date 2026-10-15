@@ -5,11 +5,11 @@ import torch
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp8_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 
 
 def matmul_launch_metadata(grid, kernel, args):
@@ -203,7 +203,7 @@ def _moe_gemm_a8w4(
     SPLIT_K: tl.constexpr,
     W_CACHE_MODIFIER: tl.constexpr,
     UPCAST_INDICES: tl.constexpr = False,
-    # Idea 1: fold per-1×32 MXFP8 (ue8m0 scale) group quant into write-back.
+    # Idea 1: fold per-1x32 MXFP8 (ue8m0 scale) group quant into write-back.
     # When HAS_MX_OUT=True, Y is fp8 e4m3 and YMxScale receives uint8 ue8m0
     # exponents at [m, n // 32]. Eliminates the standalone `downcast_to_mxfp`
     # launch between GEMM1 and GEMM2. Requires SPLIT_K==1 and OUT_BLOCK_N % 32 == 0.
@@ -494,7 +494,7 @@ def _moe_gemm_a8w4(
     )
     mask = mask_m[:, None] & mask_n[None, :]
     if HAS_MX_OUT and SPLIT_K == 1:
-        # Per-1×32 MXFP8 group quant emit. Mirrors the ue8m0 path in
+        # Per-1x32 MXFP8 group quant emit. Mirrors the ue8m0 path in
         # `_fused_clamp_silu_mul_kernel`. OUT_BLOCK_N is the post-swiglu output
         # block size (BLOCK_N if no swiglu, BLOCK_N//2 with apply_swiglu).
         tl.static_assert(

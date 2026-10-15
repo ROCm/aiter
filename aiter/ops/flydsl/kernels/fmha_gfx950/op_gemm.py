@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (C) 2025-2026 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
 """The two GEMMs: QK^T and PV."""
@@ -75,7 +75,7 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
         packs = []
         for ws in range_constexpr(traits.HEAD_DIM // 64):
             byte_row = q_row_in_block * traits.HEAD_DIM + (ws * 64) + d_base
-            packs.append(self.read_i32x8_lds(self.lds_q_base_ptr, fx.Int32(byte_row)))
+            packs.append(self.read_i32x8_lds(self.lds.q.ptr, fx.Int32(byte_row)))
         return packs
 
     def _load_q_wide_global(self):

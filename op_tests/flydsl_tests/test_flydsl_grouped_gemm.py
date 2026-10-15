@@ -5,8 +5,8 @@
 
 Two formats covered:
 
-* **a4w4** -- MXFP4 activations × MXFP4 weights (``w1.dtype = fp4x2``).
-* **a8w4** -- MXFP8 activations × MXFP4 weights (``w1.dtype = uint8``).
+* **a4w4** -- MXFP4 activations x MXFP4 weights (``w1.dtype = fp4x2``).
+* **a8w4** -- MXFP8 activations x MXFP4 weights (``w1.dtype = uint8``).
 
 Both go through the public ``fused_moe`` API; we never call the underlying
 grouped GEMM launcher directly. The grouped path is opted-in via the
@@ -524,7 +524,7 @@ def _run_grouped_via_fused_moe(
         from aiter.test_common import run_perftest
 
         out, us = run_perftest(
-            _call, num_warmup=warmup, num_iters=iters, testGraph=False
+            _call, num_warmup=warmup, num_iters=iters, testGraph=True
         )
     else:
         # Verify: validate the eager (graph-off) path; no timing.

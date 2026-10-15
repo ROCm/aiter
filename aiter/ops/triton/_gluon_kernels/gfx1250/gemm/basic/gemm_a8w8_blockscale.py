@@ -5,8 +5,8 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 from aiter.ops.triton.utils.logger import AiterTritonLogger  # debug
 
 _LOGGER = AiterTritonLogger()
@@ -103,7 +103,7 @@ def _gemm_a8w8_blockscale_bandwidth_bound_kernel(
     **scale_n = (N + GROUP_N - 1) // GROUP_N
     """
 
-    # program setup — split-K decomposition
+    # program setup -- split-K decomposition
     pid_unified = gl.program_id(axis=0)
     num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
@@ -189,7 +189,7 @@ def _gemm_a8w8_blockscale_bandwidth_bound_kernel(
     off_am_tdm = pid_m * BLOCK_SIZE_M
     off_bm_tdm = pid_n * BLOCK_SIZE_N
 
-    # TDM tensor descriptors — offset base pointers by k_split_offset
+    # TDM tensor descriptors -- offset base pointers by k_split_offset
     a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=a_ptr + k_split_offset * stride_ak,
         shape=(M, K_local),
@@ -268,7 +268,7 @@ def _gemm_a8w8_blockscale_bandwidth_bound_kernel(
     # Scalar case carries b_scale in a register (folded into the a-scale below).
     cur_b_scale = b_scale
 
-    # setup for loop — iterate over this partition's K tiles
+    # setup for loop -- iterate over this partition's K tiles
     k_tiles_count = gl.cdiv(K_local, BLOCK_SIZE_K)
 
     # ----- Main Loop --------
@@ -397,7 +397,7 @@ def _gemm_a8w8_blockscale_bandwidth_bound_kernel(
     else:
         acc += res * cur_a_scale[:, None] * cur_b_scale[None, :]
 
-    # Store — offset c_ptr by pid_k * stride_ck for split-K
+    # Store -- offset c_ptr by pid_k * stride_ck for split-K
     tdm_shared_c: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
     )
@@ -478,7 +478,7 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
     this is currently a copy of the bandwidth_bound kernel
     """
 
-    # program setup — split-K decomposition
+    # program setup -- split-K decomposition
     pid_unified = gl.program_id(axis=0)
     num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
@@ -752,7 +752,7 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
     else:
         acc += res * cur_a_scale[:, None] * cur_b_scale[None, :]
 
-    # Store — offset c_ptr by pid_k * stride_ck for split-K
+    # Store -- offset c_ptr by pid_k * stride_ck for split-K
     tdm_shared_c: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
     )
@@ -900,7 +900,7 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
     # become compile-time -- removing the rolled-loop overhead and the runtime
     # descriptor address math (v_readfirstlane) that dominate low-K shapes.
 
-    # program setup — split-K decomposition
+    # program setup -- split-K decomposition
     pid_unified = gl.program_id(axis=0)
     num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
@@ -1296,7 +1296,7 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
     res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
     acc += res * cur_ab_scale
 
-    # Store — offset c_ptr by pid_k * stride_ck for split-K
+    # Store -- offset c_ptr by pid_k * stride_ck for split-K
     tdm_shared_c: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
     )
@@ -1388,7 +1388,7 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
 
     USE_DESC_STEP: gl.constexpr = False
 
-    # program setup — split-K decomposition
+    # program setup -- split-K decomposition
     pid_unified = gl.program_id(axis=0)
     num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
@@ -1769,7 +1769,7 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
         else:
             cur_a_scale = a_scale
 
-    # Final WMMA — last tile, operands already in registers
+    # Final WMMA -- last tile, operands already in registers
     if LDS_A_SCALE:
         cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
     if not SCALAR_B_SCALE:
@@ -1782,7 +1782,7 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
     res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
     acc += res * cur_ab_scale
 
-    # Store — offset c_ptr by pid_k * stride_ck for split-K
+    # Store -- offset c_ptr by pid_k * stride_ck for split-K
     tdm_shared_c: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
     )

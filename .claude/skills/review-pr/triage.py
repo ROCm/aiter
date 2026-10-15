@@ -1326,17 +1326,17 @@ def derive(files, title="", raw_diff=""):
         hit("dispatch-change", "B1 B3 B4 A3")
     # Tier-1 proper: break it and `import aiter` is dead, which earns a full Step 4
     if any(p in ("aiter/__init__.py", "aiter/jit/core.py") for p in paths):
-        hit("tier1-import-chain", "STEP4 E5")
+        hit("tier1-import-chain", "STEP4 E5 C5")
     # Tier-2 backbone: dispatch shared across model families; needs an owner's sign-off
     elif any(p in TIER for p in paths):
-        hit("tier2-dispatch", "E5 E4")
+        hit("tier2-dispatch", "E5 E4 C5")
     # Any other op wrapper: confirm the exported symbols still resolve; no full Step 4
     elif any(
         p.startswith(("aiter/ops/", "aiter/jit/"))
         or (p.startswith("aiter/") and p.count("/") == 1 and p.endswith(".py"))
         for p in paths
     ):
-        hit("ops-wrapper", "B6")
+        hit("ops-wrapper", "B6 C5")
     if (
         re.search(r"^\s*(def |void |template)", dele, re.M)
         and re.search(r"^\s*(def |void |template)", add, re.M)
@@ -1355,7 +1355,7 @@ def derive(files, title="", raw_diff=""):
     if re.search(r"cuda\.Stream|stream=|wait_stream", add):
         hit("async-stream", "G1 G1b")
     if any("flydsl" in p.lower() for p in paths):
-        hit("flydsl", "D10 D10b D12")
+        hit("flydsl", "D10 D10b D12 C5")
     # KERNEL_PY lists the triton and gluon paths and stops there, so a FlyDSL kernel was a
     # kernel to `flydsl` (D10, D10b -- compile-result handling) and to nothing else: 95 of
     # 600 open PRs edit aiter/ops/flydsl/kernels/*.py and derive neither kernel family, so
@@ -1368,7 +1368,7 @@ def derive(files, title="", raw_diff=""):
         and (f["add"] or f["del"])
         for p, f in files.items()
     ):
-        hit("flydsl-kernel", "A1 B8 D1 D8 D12 P6")
+        hit("flydsl-kernel", "A1 B8 D1 D8 D12 P6 C5")
     if any(d in p for p in paths for d in DOWNSTREAM):
         hit("downstream-op", "E4 E5 A2")  # A2 is the same shared-path condition
     if any(

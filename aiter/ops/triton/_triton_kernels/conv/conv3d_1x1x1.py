@@ -4,7 +4,9 @@
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.activation import _apply_activation_from_str
+from aiter.ops.triton._triton_kernels.common.activation import (
+    _apply_activation_from_str,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.conv_config_utils import get_conv_config, has_conv_config
 
@@ -63,7 +65,7 @@ def _conv3d_1x1x1_kernel(
     A 1x1x1 conv is a pure GEMM over channels, with no (t, r, s) taps to decode
     and no spatial-tap masking:
 
-        y[n,k,o,p,q] = Σ_c  x[n,c,o,p,q] · w[k,c]   (stride/padding still map
+        y[n,k,o,p,q] = S_c  x[n,c,o,p,q] ? w[k,c]   (stride/padding still map
                                                      the output cell back to its
                                                      input cell)
 

@@ -1,3 +1,5 @@
+import functools
+
 import triton.experimental.gluon.language as gl
 from triton._C.libtriton.gluon_ir import make_cga_layout
 from triton.experimental import gluon
@@ -22,6 +24,19 @@ def cluster_shape(num_ctas, BLOCK_M, BLOCK_N):
 
 
 def get_gemm_afp4wfp4_preshuffle_layouts(
+    num_warps, BLOCK_M, BLOCK_N, BLOCK_K, num_ctas
+):
+    # Building the layouts costs ~1 ms of Python per call and depends only on
+    # these ints: build once per config, return a copy (callers may mutate it).
+    return dict(
+        _build_gemm_afp4wfp4_preshuffle_layouts(
+            num_warps, BLOCK_M, BLOCK_N, BLOCK_K, num_ctas
+        )
+    )
+
+
+@functools.cache
+def _build_gemm_afp4wfp4_preshuffle_layouts(
     num_warps, BLOCK_M, BLOCK_N, BLOCK_K, num_ctas
 ):
     # each CTA computes BLOCK_M // CTAS_M x BLOCK_N // CTAS_N of it.
@@ -112,7 +127,7 @@ def get_gemm_afp4wfp4_preshuffle_layouts(
 
 # ---------------------------------------------------------------------------
 # View transforms for preshuffled data in LDS
-# These are zero-cost (no data movement) — they just reindex the LDS view
+# These are zero-cost (no data movement) -- they just reindex the LDS view
 # so load_shared_relaxed reads bytes in the order WMMA expects.
 # ---------------------------------------------------------------------------
 
@@ -430,7 +445,7 @@ def gemm_mxfp4_preshuffle_gfx1250(
     if num_ctas > 1:
         gl.amd.gfx1250.cluster.arrive()
 
-    # --- 3. Main loop: WMMA(cur) → TDM(future) → wait → pre-load(next) ---
+    # --- 3. Main loop: WMMA(cur) -> TDM(future) -> wait -> pre-load(next) ---
     main_iters = k_tiles - (NUM_BUFFERS)
     for _ in range(main_iters):
         acc = gl.amd.gfx1250.wmma_scaled(
@@ -528,7 +543,7 @@ def gemm_mxfp4_preshuffle_gfx1250(
         gl.amd.gfx1250.cluster.wait()
 
     # =====================================================================
-    # Store output via TDM: accumulator → shared memory → global memory.
+    # Store output via TDM: accumulator -> shared memory -> global memory.
     # =====================================================================
 
     c_buffer = gl.allocate_shared_memory(

@@ -11,6 +11,7 @@ import math
 
 import torch
 import triton
+from packaging.version import Version
 
 from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
     _sparse_mla as _sparse_mla_gfx950,
@@ -45,6 +46,9 @@ try:
     _HAS_SCALED_UPCAST = hasattr(_cdna4, "scaled_upcast")
 except ImportError:
     _HAS_SCALED_UPCAST = False
+
+# Below Triton 3.8 the peeled 64-bit split-K kernel spills ~110 VGPRs to scratch.
+_TRITON_GE_38 = Version(triton.__version__) >= Version("3.8.0")
 
 _LOGGER = AiterTritonLogger()
 
@@ -98,10 +102,10 @@ def pa_decode_sparse(
     Args:
         q: ``[N, H, D]`` decode queries, bf16/fp16.
         unified_kv: ``[total_pages, D]`` shared KV pool (page_size=1), same dtype as ``q``.
-        kv_indices: ``[total_indices]`` int32 — per-token slot lists, flat.
+        kv_indices: ``[total_indices]`` int32 -- per-token slot lists, flat.
             Per-token entries live in ``kv_indices[kv_indptr[t] : kv_indptr[t+1]]``.
             ``-1`` entries are skipped (sentinel for unused tail).
-        kv_indptr: ``[N+1]`` int32 — true prefix sum.
+        kv_indptr: ``[N+1]`` int32 -- true prefix sum.
         attn_sink: ``[H]`` per-head learnable softmax-denom bias (fp32).
         softmax_scale: scalar softmax scale.
         block_h: override ``BLOCK_H`` for the split kernel. Default picks
@@ -118,9 +122,9 @@ def pa_decode_sparse(
             ``kv_splits == 1`` (the single-CTA path already produces the final
             ``out`` directly). Useful for profiling the main kernel in
             isolation and for callers that fold the reduce into a downstream op.
-        extra_cache/extra_indices/extra_indptr: gfx950 packed-only — the SWA+top-k
+        extra_cache/extra_indices/extra_indptr: gfx950 packed-only -- the SWA+top-k
             two-loop's second (top-k) cache + index set; must be None otherwise.
-        inv_rope_positions/inv_rope_cos_sin_cache/out_mxfp8: gfx950 gluon only —
+        inv_rope_positions/inv_rope_cos_sin_cache/out_mxfp8: gfx950 gluon only --
             the output epilogue (see _pa_decode_sparse_gfx950_gluon).
 
     On gfx950 the DSv4 gluon driver handles this: a 3D ``unified_kv`` selects the
@@ -137,10 +141,10 @@ def pa_decode_sparse(
         [N, KV_SPLITS, H_padded])`` (all fp32).
 
     Optimizations targeted:
-      (1) Wider ``BLOCK_H`` so all heads of a token are handled by one CTA →
+      (1) Wider ``BLOCK_H`` so all heads of a token are handled by one CTA ->
           eliminates MLA-style KV re-fetch across head-block programs.
       (2) ``num_stages`` on the K loop pipelines KV gather behind the dot.
-      (3) Split the K dimension across CTAs via a third grid axis →
+      (3) Split the K dimension across CTAs via a third grid axis ->
           fixes grid undersubscription on long-context decode.
     """
     if not q.is_cuda:
@@ -412,7 +416,7 @@ def pa_decode_sparse(
         # is responsible for the log-sum-exp combine + sink fold.
         return acc_partial, m_partial, l_partial
 
-    # One reduce CTA per head. For small per-rank H (TP=8 → H ∈ {8, 16}) this
+    # One reduce CTA per head. For small per-rank H (TP=8 -> H ? {8, 16}) this
     # multiplies the reduce-side CTA count by H, replacing the previous single
     # under-occupied CTA per token with a small fan-out that hides launch
     # latency. tl.arange(0, 1) is a valid power-of-2 range.
@@ -788,10 +792,14 @@ def _pa_decode_sparse_gfx950_gluon(
     if one_wg_per_cu:
         waves_per_eu = 1
 
-    # Unpeeled is faster at prefill and, on the 64-bit gathers, unless split-K
-    # leaves each program a few tiles. Decode on buffer loads is faster peeled.
+    # Decode on buffer loads is faster peeled; prefill is faster unpeeled.
+    # On the 64-bit gathers unpeeled is faster unless split-K leaves each program
+    # a few tiles, and below Triton 3.8 the peeled kernel spills, so always unpeel.
     short_splits = num_splits > 1 and row_tiles <= 4 * num_splits
-    unpeel = num_queries >= _PREFILL_MIN_ROWS if use_buffer_load else not short_splits
+    if use_buffer_load:
+        unpeel = num_queries >= _PREFILL_MIN_ROWS
+    else:
+        unpeel = not (_TRITON_GE_38 and short_splits)
 
     main_splits = num_splits
     if has_extra and avg_main > 0:

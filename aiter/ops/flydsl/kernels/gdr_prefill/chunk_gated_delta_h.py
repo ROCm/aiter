@@ -16,7 +16,6 @@ h = h * exp(g_last) + k^T @ (v_new * exp(g_last - g_cumsum)).
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import T
 
 from ..gdr_common import _gview, _load_vec, _store_vec
 from ..kernels_common import LOG2E as _LOG2E
@@ -24,11 +23,10 @@ from ..kernels_common import LOG2E as _LOG2E
 
 def _make_fast_exp(g_is_log2_scaled: bool):
     """``exp(x)`` via ``exp2``, dropping ``* LOG2E`` when ``g`` is already
-    log2(e)-prescaled. Raw ``rocdl.exp2`` (untyped, hence the ir_value hop)
-    avoids the denormal rescale guard ``fx.exp2``'s math lowering adds."""
+    log2(e)-prescaled. ``afn`` keeps the direct device exp2 instruction."""
     if g_is_log2_scaled:
-        return lambda x: fx.Float32(rocdl.exp2(T.f32, x.ir_value()))
-    return lambda x: fx.Float32(rocdl.exp2(T.f32, (x * _LOG2E).ir_value()))
+        return lambda x: fx.exp2(x, fastmath="afn")
+    return lambda x: fx.exp2(x * _LOG2E, fastmath="afn")
 
 
 # Truncation keeps outputs bit-identical to the HIP/C++ K5 kernel; RNE is closer

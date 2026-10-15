@@ -1205,16 +1205,27 @@ OPUS_D constexpr unsigned short fp32_to_bf16_rtn_raw(float f)
     else if(bits & 0xffff) { bits |= 0x10000; /* Preserve signaling NaN */ }
     return static_cast<unsigned short>(bits >> 16);
 }
+
+// Optimized software RNE, selected with rounding mode 5. Canonicalizes NaNs to 0x7fff.
+OPUS_D constexpr unsigned short fp32_to_bf16_rtn_fast_raw(float f)
+{
+    const unsigned int bits    = __builtin_bit_cast(unsigned int, f);
+    const unsigned int rounded = bits + 0x7fffu + ((bits >> 16) & 1u);
+    // Fast-math builds may optimize away NaN handling.
+    const unsigned int result  = ((bits & 0x7fffffffu) > 0x7f800000u) ? 0x7fff0000u : rounded;
+    return static_cast<unsigned short>(result >> 16);
+}
 #if (defined(__gfx950__) || defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__)) && __clang_major__ >= 20
 template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // gfx950/gfx1250/gfx12 has instruction conversion, leave 'rm' here for compatiblity
 OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) { return static_cast<bf16_t>(x); }
 #else
-template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // 0:standard, 1:truncate_with_nan, 2:truncate, 3:standard asm 4:rta_asm(round to nearest away)
+template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // 0:standard, 1:truncate_with_nan, 2:truncate, 3:standard asm, 4:rta_asm(round to nearest away), 5:optimized software RNE
 OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) {
     if      constexpr (rm == 0) {return __builtin_bit_cast(bf16_t, fp32_to_bf16_rtn_raw(x)); }
     else if constexpr (rm == 1) {u32_t z = __builtin_bit_cast(u32_t, x); return __builtin_bit_cast(bf16_t, static_cast<unsigned short>(z | (!(~z & 0x7f800000) && (z & 0xffff) ? 0x10000 : 0) >> 16)); }
     else if constexpr (rm == 2) {u32_t z = __builtin_bit_cast(u32_t, x); return __builtin_bit_cast(bf16_t, static_cast<unsigned short>(z >> 16)); }
     else if constexpr (rm == 3) { return fp32_to_bf16_rtn_asm(x); }
+    else if constexpr (rm == 5) { return __builtin_bit_cast(bf16_t, fp32_to_bf16_rtn_fast_raw(x)); }
 }
 #endif
 
@@ -1755,7 +1766,7 @@ OPUS_D void llvm_amdgcn_raw_buffer_load_lds(i32x4_t r, OPUS_LDS_ADDR unsigned in
 #pragma clang diagnostic pop
 #endif
 
-// ── buffer atomic feature guards ───────────────────────────────────────────────
+// -- buffer atomic feature guards -----------------------------------------------
 // per BuiltinsAMDGPU.td / IntrinsicsAMDGPU.td:
 //   fadd.f32     : atomic-fadd-rtn-insts                 (gfx908+, incl. gfx942/gfx950/gfx1250)
 //   fadd.v2f16   : atomic-buffer-global-pk-add-f16-insts (gfx942/gfx950/gfx1250)
@@ -2235,8 +2246,9 @@ struct smem {
     }
 
     // bulk load API, give me a Shape of this tile, will issue multiple load instruction based on the y-shape space
+    // A compile-time c_os element offset folds LDS slot displacements into ds_read immediates, avoiding per-load address arithmetic.
     template<index_t vec = 1, typename Layout, std::enable_if_t<is_layout_v<Layout>, bool> = true>
-    OPUS_D auto load(const Layout& u)
+    OPUS_D auto load(const Layout& u, int c_os = 0)
     {
         using LT = layout_load_traits<Layout, vec>;
         constexpr auto r_elem = LT::r_elem;
@@ -2245,13 +2257,13 @@ struct smem {
 #if OPUS_TILE_CONTAINER == 0
         vector_t<scalar_type, vec * vector_size * r_elem.value> r;
         for (index_t i = 0; i < r_elem.value; i++) {
-            auto tmp = load<vec>(offsets[i]);
+            auto tmp = load<vec>(offsets[i] + c_os);
             for (index_t j = 0; j < vec * vector_size; j++) r[i * vec * vector_size + j] = tmp[j];
         }
         return r;
 #elif OPUS_TILE_CONTAINER == 1
         array<vector_type<vec>, r_elem.value> r;
-        for (index_t i = 0; i < r_elem.value; i++) r[i] = load<vec>(offsets[i]);
+        for (index_t i = 0; i < r_elem.value; i++) r[i] = load<vec>(offsets[i] + c_os);
         return r;
 #endif
     }
@@ -2420,13 +2432,13 @@ template<typename T> static constexpr bool tdm_elem_ok_v = tdm_elem<remove_cvref
 // TDM 1/3 -- tdm_traits: one tag per D# concern, plus the machinery resolving an unordered tag pack into one type per concern.
 namespace tdm_traits {
 
-// ── raw D# bits that are not policy ──
+// -- raw D# bits that are not policy --
 // Not inert: measured on gfx1250, setting all three breaks every example, so each needs its own programming worked out first.
 static constexpr bool atomic_barrier_enable   = false;   // [18]
 static constexpr bool iterate_enable          = false;   // [19]
 static constexpr bool multicast_early_timeout = false;   // [21]
 
-// ── cache policy ──
+// -- cache policy --
 // One 3-bit encoding, two enums (`th` is the hardware's field name): the assembler takes only TH_LOAD_* on loads, TH_STORE_* on stores, and encoding 3 splits again by scope -- LU/WB below sys, BYPASS at sys -- with the wrong spelling a hard error.
 enum class load_temporal_hint  : u8_t { regular=0, non_temporal=1, high_temporal=2, last_use=3, non_temporal_regular=4, regular_non_temporal=5, non_temporal_high_temporal=6 };                                 // 7 has no legal load spelling on gfx1250
 enum class store_temporal_hint : u8_t { regular=0, non_temporal=1, high_temporal=2, write_back=3, non_temporal_regular=4, regular_non_temporal=5, non_temporal_high_temporal=6, non_temporal_write_back=7 };   // 7 = TH_STORE_NT_WB, store-only
@@ -2437,7 +2449,7 @@ OPUS_H_D constexpr int make_cache_policy(load_temporal_hint th = load_temporal_h
 OPUS_H_D constexpr int make_cache_policy(store_temporal_hint th, scope sc = scope::dev, bool non_volatile = false) { return (int(th) & 0x7) | ((int(sc) & 0x3) << 3) | (non_volatile ? (1 << 5) : 0); }
 static constexpr int default_cache_policy = make_cache_policy();   // regular temporal hint, device scope
 
-// ── padding (LDS write side) ──
+// -- padding (LDS write side) --
 // "After every IntervalElements written, skip AmountElements of LDS", in ELEMENT counts (T only scales them to bytes); both D# fields are encoded, pad_interval [24:22] = 8 << enc bytes and pad_amount [31:25] = 4 * (enc + 1) bytes.
 // LOAD DIRECTION ONLY -- measured on gfx1250, a store ignores both fields even when programmed, so a padded tile stores a row at a time (tile_dim1 == 1); separately, a pad interval under 128 B demotes part of the transfer off the direct-copy path (perf, not correctness).
 template<typename T = u8_t, index_t IntervalElements = 0, index_t AmountElements = 0>
@@ -2474,7 +2486,7 @@ struct padding {
 template<typename T, index_t RowElements, index_t ReadVectorBytes = 16>
 using padding_auto = padding<T, RowElements, ReadVectorBytes / index_t(sizeof(T))>;
 
-// ── multicast (compile-time peer set) ──
+// -- multicast (compile-time peer set) --
 // The statically known peer set, stored as the finished workgroup_mask rather than the index list; the runtime mask still goes through set_workgroup_mask(), and multicast<> is the 0 the hardware reads as no multicast.
 // Folding a fan-out of <=1 to "no multicast" is SAFETY: a cluster-load opcode issued by a wave that is not in a cluster may hang or corrupt data. Not asserted, just pointless: GL1 merges at most 5 requests, so >5 peers buys nothing.
 template<index_t... Workgroups>
@@ -2516,7 +2528,7 @@ OPUS_D mask peers_along_x() {
     }
 }
 
-// ── gather/scatter (row-index list in D# groups 2/3) ──
+// -- gather/scatter (row-index list in D# groups 2/3) --
 template<index_t IndexBits = 0>
 struct gather {
     static_assert(IndexBits == 0 || IndexBits == 16 || IndexBits == 32,
@@ -2525,11 +2537,11 @@ struct gather {
     static constexpr u64_t index_size = (IndexBits == 32) ? 1 : 0;   // 16-bit -> 2 idx/dword, 32-bit -> 1
 };
 
-// ── cache ──
+// -- cache --
 // A wrapper because an unordered pack cannot hold a bare int; the member name is what is_cache keys on, so not `value`.
 template<int Policy> struct cache { static constexpr int cache_policy = Policy; };
 
-// ── resolving an unordered pack of the tags above ──
+// -- resolving an unordered pack of the tags above --
 // A tag's concern is read off the D# field it carries, so a new spelling of an existing one (padding_auto) classifies itself.
 template<typename T, typename = void> struct is_padding   : false_type {};
 template<typename T> struct is_padding  <T, std::void_t<decltype(T::encoded_interval)>> : true_type {};

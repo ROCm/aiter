@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
 import multiprocessing as mp
@@ -120,7 +120,9 @@ def run_mori_with_manager(
         )
         tokens_qt, scale = quant_func(tokens, quant_dtype=dtypes.fp8)
 
-        mori_manager = ep_group.device_communicator.all2all_manager
+        mori_manager = ep_group.device_communicator.get_or_create_all2all_manager(
+            "mori"
+        )
         assert mori_manager is not None, f"rank {rankID}: all2all_manager is None"
         print(
             f"rank {rankID} auto-created MoriAll2AllManager: {type(mori_manager).__name__}"

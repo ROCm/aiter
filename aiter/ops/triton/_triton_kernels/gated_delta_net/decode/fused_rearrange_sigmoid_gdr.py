@@ -6,7 +6,7 @@
 # This file contains code copied from the flash-linear-attention project.
 # The original source code was licensed under the MIT license and included
 # the following copyright notice:
-# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Copyright (C) 2023-2026, Songlin Yang, Yu Zhang
 
 import triton
 import triton.language as tl
@@ -162,4 +162,7 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
         p_v += stride_qkv_l
         p_o += HV * V
         p_b += HV
-        p_a += HV
+        if not IS_KDA:
+            p_a += HV
+        else:
+            p_a += HV * K

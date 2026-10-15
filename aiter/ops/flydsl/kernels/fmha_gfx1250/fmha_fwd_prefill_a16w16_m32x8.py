@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MHA Forward Prefill kernel — ``m32x8`` design, gfx1250 (MI400 / mi450).
+"""MHA Forward Prefill kernel -- ``m32x8`` design, gfx1250 (MI400 / mi450).
 
 A clean FlyDSL kernel written in the high-level layout-algebra style
 (tiled copy / tiled MMA + ``SharedAllocator``).
@@ -11,14 +11,14 @@ owning a **32-row** Q span (2 adjacent 16-row WMMA tiles). gfx1250 runs wave32,
 so a threadgroup is ``8 * 32 = 256`` threads and ``BLOCK_M = 32 * 8 = 256`` Q
 rows. (The leading ``32`` is per-wave Q rows; ``16`` is the WMMA M dimension.)
 
-Layout support — two device kernels over one shared compute core (option B):
-  - ``kn_fmha_fwd_prefill_a16w16_m32x8_thd``  — varlen THD, driven by ``cu_seqlens``.
-  - ``kn_fmha_fwd_prefill_a16w16_m32x8_bshd`` — batched BSHD, uniform ``seq_len`` scalar
-    (no ``cu_seqlens`` tensors → nothing transient to bake into a CUDA graph).
+Layout support -- two device kernels over one shared compute core (option B):
+  - ``kn_fmha_fwd_prefill_a16w16_m32x8_thd``  -- varlen THD, driven by ``cu_seqlens``.
+  - ``kn_fmha_fwd_prefill_a16w16_m32x8_bshd`` -- batched BSHD, uniform ``seq_len`` scalar
+    (no ``cu_seqlens`` tensors -> nothing transient to bake into a CUDA graph).
 Both resolve their per-workgroup base offsets + sequence bounds, then call the
 layout-agnostic ``_core_attention`` helper.
 
-Scope — v1 (this file is intentionally config-agnostic in its name):
+Scope -- v1 (this file is intentionally config-agnostic in its name):
   - ``qk_hdim in {128, 192, 256}`` (D_qk), ``v_hdim == 128`` (D_v), ``n_block == 64``
   - dtype: bf16 for Q/K/V/O
   - grouped-query attention (GQA): ``gqa = nheads_q // nheads_k``
@@ -37,9 +37,7 @@ from enum import IntEnum
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import arith, gpu, rocdl
-from flydsl.expr import math as fmath
 
 # Q/K/V staging managers (own their LDS swizzles + async copy schedules). They are
 # self-contained: this kernel maintains its own arch constants below and passes the
@@ -51,7 +49,7 @@ from flydsl.expr.utils.arith import _to_raw as _raw
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels import buffer_ops
 
-from ..kernels_common import LOG2E, create_llvm_ptr
+from ..kernels_common import LOG2E
 from ..tensor_shim import _run_compiled
 
 # Single source of truth for gfx1250 Expert Scheduling Mode 2 (DEP_MODE=2). Lives
@@ -78,10 +76,10 @@ from .fmha_b16_buffer_managers import (
 # ============================================================================
 
 WAVE_SIZE = 32  # gfx1250 kernels run wave32
-NUM_WAVES = 8  # "m32x8" — 8 waves per threadgroup
+NUM_WAVES = 8  # "m32x8" -- 8 waves per threadgroup
 BLOCK_SIZE = WAVE_SIZE * NUM_WAVES  # 256 threads
 
-# "m32x8": each wave owns WMMA_ROW_PER_WAVE adjacent 16-row (WMMA M) Q sub-tiles →
+# "m32x8": each wave owns WMMA_ROW_PER_WAVE adjacent 16-row (WMMA M) Q sub-tiles ->
 # BLOCK_M = 16 * 2 * 8 = 256 Q rows per threadgroup. Each wave's 2 tiles are
 # contiguous: warp i owns rows [i*32, i*32+32) = tiles 2i, 2i+1.
 WMMA_M = 16  # query rows per WMMA tile (the "m16" in m32x8)
@@ -120,7 +118,7 @@ MIN_KV_BLK_BYTES = 64 * 1024
 
 # log2(e): exp(x) = exp2(x * LOG2E). Softmax uses the native ISA exp2 intrinsic.
 
-# Deferred oaccu rescale (FAv4 innovation, hk_mla spec §9.1.1). Rescaling the
+# Deferred oaccu rescale (FAv4 innovation, hk_mla spec ?9.1.1). Rescaling the
 # running O accumulator by corr = exp(m_prev - m_new) is a full-width VALU pass
 # (d_tiles*8 f32/lane) every tile, but corr == 1 when the running max doesn't
 # move. So keep m STALE while the tile's row max stays within RESCALE_THRESHOLD
@@ -150,7 +148,7 @@ USE_TDM_LOADER = True
 O_VARIANT = "v3"
 
 # NOTE: the remaining tiling constants (chunk sizes, K/V write-tile + V swizzle
-# granularity) live inside fmha_b16_buffer_managers.py — they are intrinsic to the
+# granularity) live inside fmha_b16_buffer_managers.py -- they are intrinsic to the
 # managers' LDS layouts, so the kernel no longer declares them here.
 
 
@@ -165,12 +163,12 @@ def _warp_id():
 
 
 def _named_barrier_pair(warp_idx):
-    """2-wave SIMD-pair rendezvous (warp `i` ↔ `i+4`) for warp specialization.
+    """2-wave SIMD-pair rendezvous (warp `i` <-> `i+4`) for warp specialization.
 
-    TODO(named-barrier): wire the gfx1250 named barrier — one `@__nbar[warp_idx & 3]`
+    TODO(named-barrier): wire the gfx1250 named barrier -- one `@__nbar[warp_idx & 3]`
     per SIMD pair (`s_barrier_signal_var(ptr, 2)` + `s_barrier_wait`), joined once in
     the prologue. Currently a NO-OP: the LO/HI split only reorders each wave's own
-    self-contained load→compute, so it stays correct under the workgroup `gpu.barrier()`
+    self-contained load->compute, so it stays correct under the workgroup `gpu.barrier()`
     alone; the named barrier is a perf-only SIMD-issue rendezvous, added after the
     standalone probe validates allocation + per-pair sync."""
     del warp_idx
@@ -197,20 +195,16 @@ def _load_seqlen_pair(ptr_tensor, idx):
 
 def _load_sink_logit(ptr_sink, q_head_idx, num_heads_q):
     """Load this lane's per-head sink logit ``sink[q_head_idx]`` from the 1-D
-    ``[num_heads_q]`` fp32 ``sink`` — one extra ``exp(sink)`` term in the softmax
+    ``[num_heads_q]`` fp32 ``sink`` -- one extra ``exp(sink)`` term in the softmax
     denominator, in the scaled-score domain (same units as S).
 
-    Uses a flat ``llvm.load`` (not ``buffer_load``): ``buffer_load`` re-scales the
-    offset (``offset * element_bytes``) INTERNALLY, so a flat load keeps the address
-    arithmetic SSA-visible for LLVM to order/cover under sched mode 2. Safe without a
-    HW bounds check because ``q_head_idx = kv_head*gqa_ratio + row_idx%gqa_ratio`` is
-    always ``< num_heads_q`` (in-bounds by construction)."""
+    Uses a flat pointer load: ``buffer_load`` re-scales the offset
+    (``offset * element_bytes``) internally. The pointer offset is in f32 elements,
+    and its address arithmetic stays visible to LLVM under sched mode 2. Safe
+    without a HW bounds check because ``q_head_idx = kv_head*gqa_ratio +
+    row_idx%gqa_ratio`` is always ``< num_heads_q`` (in-bounds by construction)."""
     del num_heads_q  # in-bounds by construction; no buffer bounds check needed
-    sink_base_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(ptr_sink)))
-    byte_off = fx.Int64(q_head_idx) * fx.Int64(4)
-    addr = sink_base_i64 + byte_off
-    gptr = create_llvm_ptr(addr, address_space=1)
-    return fx.Float32(llvm_dialect.load(T.f32, gptr))
+    return fx.Float32(fx.ptr_load(fx.get_iter(ptr_sink) + fx.Int64(q_head_idx)))
 
 
 def _packed_tile_indices(gqa_ratio, warp_idx, lane_idx):
@@ -242,7 +236,7 @@ def _packed_tile_indices(gqa_ratio, warp_idx, lane_idx):
 
 
 # ============================================================================
-# Compute stages — EMPTY, unwired. Implemented and tested one at a time; the KV
+# Compute stages -- EMPTY, unwired. Implemented and tested one at a time; the KV
 # streaming driver below lands (and is tested) first with these left inert.
 # ============================================================================
 
@@ -284,7 +278,7 @@ def _qk_gemm(*, k_values, q_frags_list, n_block):
     d-tile shuffled into a v16 fragment matching the Q frag layout.
 
     NOTE: the ``s_wait_dscnt(0)`` that drains the K ds_load burst is now issued by the
-    (warp-specialized) main-loop preamble before this call — under warp specialization the
+    (warp-specialized) main-loop preamble before this call -- under warp specialization the
     LO and HI warps drain at different points, so the wait can't live inside the gemm.
     """
     R = len(q_frags_list)
@@ -380,9 +374,9 @@ def _softmax(
     length-R lists (R = WMMA_ROW_PER_WAVE); the q_*_list default to all-None. m_prev/d_prev
     are fx.Float32 shared by the l<->l^16 pair.
 
-    Returns 5 length-R lists ``(p, m_new, d_new, corr, do_rescale)`` — per row: p = NKV v8
+    Returns 5 length-R lists ``(p, m_new, d_new, corr, do_rescale)`` -- per row: p = NKV v8
     **bf16** P^T = exp(S^T - m_new); m_new = updated running max, STALE (== m_prev) when the
-    deferred-rescale ballot did not fire (FAv4 §9.1.1); d_new = corr*d_prev + rowsum(p);
+    deferred-rescale ballot did not fire (FAv4 ?9.1.1); d_new = corr*d_prev + rowsum(p);
     corr = exp(m_prev - m_new) (== 1 on the stale path); do_rescale = wave-uniform i1 (None
     when deferral is compiled out).
     """
@@ -394,27 +388,29 @@ def _softmax(
     log2e = fx.Float32(LOG2E)
 
     def fmax(a, b):
-        return fx.Float32(arith.MaxNumFOp(_raw(a), _raw(b), fastmath=fast).result)
+        return fx.maxnumf(a, b, fastmath=fast)
 
     def fadd(a, b):
-        return fx.Float32(arith.addf(_raw(a), _raw(b), fastmath=fast))
+        return a.addf(b, fastmath=fast)
 
     # fast-math WITHOUT reassoc: LLVM's Reassociate pass otherwise re-linearizes the
-    # sum tree back into a serial chain (max survives — Reassociate ignores maxnum).
+    # sum tree back into a serial chain (max survives -- Reassociate ignores maxnum).
     _FF = arith.FastMathFlags
     _no_reassoc = _FF.nnan | _FF.ninf | _FF.nsz | _FF.arcp | _FF.contract | _FF.afn
 
     def fadd_t(a, b):
-        return fx.Float32(arith.addf(_raw(a), _raw(b), fastmath=_no_reassoc))
+        return a.addf(b, fastmath=_no_reassoc)
 
     def fsub(a, b):
-        return fx.Float32(arith.subf(_raw(a), _raw(b), fastmath=fast))
+        with arith.fastmath(fast):
+            return a - b
 
     def fmul(a, b):
-        return fx.Float32(arith.mulf(_raw(a), _raw(b), fastmath=fast))
+        with arith.fastmath(fast):
+            return a * b
 
     def exp2(x):
-        return fx.Float32(rocdl.exp2(f32, _raw(x)))
+        return fx.exp2(x, fastmath="afn")
 
     # permlanex16 selectors: identity cross-16 gather (nibbles 0..15) => lane l<->l^16.
     sel_lo, sel_hi = _raw(fx.Int32(0x76543210)), _raw(fx.Int32(0xFEDCBA98))
@@ -517,9 +513,7 @@ def _softmax(
             pe = []
             for i in range(8):
                 # exp2(s*log2e - m_new*log2e) via one fma.
-                pj = exp2(
-                    fx.Float32(fmath.fma(_raw(s_masked[idx]), _raw(log2e), _raw(neg_m)))
-                )
+                pj = exp2(fx.fma(s_masked[idx], log2e, neg_m))
                 pe.append(pj)
                 p_flat.append(pj)
                 idx += 1
@@ -552,7 +546,7 @@ def _pv_gemm(*, v_values, p_list, v_hdim, n_block, o_acc_list=None):
     via ds_load_tr16_b128) and **B = P^T** (src_b, the bf16 softmax output). Contract
     kv in ``nkt = n_block//WMMA_K`` tiles (K=32); produce ``d_tiles = v_hdim//WMMA_M``
     output d-tiles (M axis). Lane ``l`` element ``si`` of tile ``dt`` holds
-    O[q = l%16, d = dt*WMMA_M + (l//16)*8 + si] — the OManager16b frag layout.
+    O[q = l%16, d = dt*WMMA_M + (l//16)*8 + si] -- the OManager16b frag layout.
 
     ``p_list`` is a length-R list; entry ``qt`` is that q-tile's list of softmax
     kv-tiles (bf16 P^T B-operands). ``o_acc_list`` is either None or a length-R
@@ -660,11 +654,11 @@ def _core_attention(
     lds_base,  # LDS base (fx.Int32), allocated once by the caller (_alloc_lds)
     elem_dtype,  # compile-time fx.BFloat16 / fx.Float16 for Q/K/V/P/O fragments
 ):
-    """Layout-agnostic m32x8 compute — empty scaffold.
+    """Layout-agnostic m32x8 compute -- empty scaffold.
 
     Shared by the THD and BSHD kernel entries. The caller resolves the per-batch
-    token ranges (``q_start``/``q_len`` and ``kv_start``/``kv_len``) — the only
-    part that differs between varlen and batched layouts — and passes them here.
+    token ranges (``q_start``/``q_len`` and ``kv_start``/``kv_len``) -- the only
+    part that differs between varlen and batched layouts -- and passes them here.
 
     Warp-specialized: the caller dispatches on runtime ``warp_type`` and traces this
     body TWICE (once per compile-time ``warp_type``); the two instantiations differ in
@@ -731,7 +725,7 @@ def _core_attention(
 
     # ---- Q staging TIME-SHARES slot 1: Q's LDS base = slot-1 base (kv_base +
     # slot_bytes). Q is loaded + drained into VGPR in the prologue, then dead; the
-    # main loop's first slot-1 prefetch reuses the region. Safe with zero new sync —
+    # main loop's first slot-1 prefetch reuses the region. Safe with zero new sync --
     # the prologue drains Q (part2) -> s_wait_asynccnt(0) -> gpu.barrier() BEFORE the
     # loop, and prologue K/V loads target slot 0. slot_bytes >= Q footprint by
     # construction (see above), so Q always fits in slot 1. ----
@@ -793,12 +787,12 @@ def _core_attention(
 
     # ---- Prologue (reordered for the mode-2 hang investigation): compute all K/V
     # addresses AND the loop-init in the Q global-load shadow, then run part2 (Q
-    # ds_load), then issue the K/V cluster_loads LAST — so NOTHING runs between the
+    # ds_load), then issue the K/V cluster_loads LAST -- so NOTHING runs between the
     # loads and the prologue barrier below. Sequence: (1) part1 [above] -> (2) KMgr
     # param calc -> (3) loop init -> (4) part2 -> (5) K cluster_load -> (6) V
     # cluster_load.
 
-    # (2) KMgr param calc — pure address arithmetic (no memory op), hoisted into the
+    # (2) KMgr param calc -- pure address arithmetic (no memory op), hoisted into the
     # Q global-load shadow.
     #
     # Ping-pong parity is LOCAL to this WG's tile stream: the prologue always loads the
@@ -860,7 +854,7 @@ def _core_attention(
             warp_idx=warp_idx,
             lane_idx=lane_idx,
         )
-        # (3) QMgr part2 — Q ds_load LDS->VGPR (drains the part1 Q async), issued AHEAD of
+        # (3) QMgr part2 -- Q ds_load LDS->VGPR (drains the part1 Q async), issued AHEAD of
         # the cluster_loads so its Q-scaling reg reuse leaves the load shadow.
         q_frags = q_mgr.load_q_to_vgpr_part2(scale=softmax_scale)
         # (4)+(5) Issue K then V cluster_loads LAST as ONE packed burst before the compiler
@@ -871,13 +865,13 @@ def _core_attention(
         rocdl.s_wait_asynccnt(0)
         gpu.barrier()
 
-    # (7) Loop init — MOVED to after the prologue barrier (ordering experiment). Online-
+    # (7) Loop init -- MOVED to after the prologue barrier (ordering experiment). Online-
     # softmax seed + O accumulators (iter_args) and loop bounds.
     #
     # Loop-carried state (scf.for_ iter_args): the online-softmax running max ``m`` and
     # denom ``d`` (per-lane f32), followed by the ``d_tiles`` fp32 O accumulators. Seed
     # m=-inf, d=0, O=0: the first tile's corr=exp2(m_prev-m_new)=0 zeroes the
-    # (already-zero) O before its PV adds in — the standard flash seed. (Fully-masked
+    # (already-zero) O before its PV adds in -- the standard flash seed. (Fully-masked
     # leading tiles under a finite-left window would make exp2(-inf-(-inf))=NaN;
     # _softmax sanitizes that on the q_min path.)
     #
@@ -885,7 +879,7 @@ def _core_attention(
     # softmax denominator. Fold it in by seeding m=sink[q_head] and d=1.0 (=exp(sink-
     # sink)); the rescales carry that d seed to exactly exp(sink - m_final), the sink
     # denom term. (Without a sink, m=-inf makes the first tile's corr zero the d seed,
-    # so d=1 would equal d=0 — the no-sink path keeps d=0 to stay byte-for-byte.)
+    # so d=1 would equal d=0 -- the no-sink path keeps d=0 to stay byte-for-byte.)
     d_tiles = v_hdim // WMMA_M
     R = WMMA_ROW_PER_WAVE
     _QS = 2 + d_tiles  # per-q-tile carried state: [m, d, O_0 .. O_{d_tiles-1}]
@@ -898,7 +892,7 @@ def _core_attention(
     else:
         m_init = [fx.Float32(BIG_NEG) for _ in range(R)]
         d_init = [fx.Float32(0.0) for _ in range(R)]
-    # _init = R copies of [m, d, O_tile0 .. O_tile{d_tiles-1}] — per q-tile running max,
+    # _init = R copies of [m, d, O_tile0 .. O_tile{d_tiles-1}] -- per q-tile running max,
     # denom, then one v8-f32 O accumulator per 16-wide output-dim tile (this lane's
     # partial O[q, d]), all zero. The R q-tiles have independent online-softmax state.
     _init = []
@@ -910,7 +904,7 @@ def _core_attention(
 
     # ---- ds_load LDS base pointers for both ping-pong buffers, carried as iter_args and
     # swapped curr<->next each iteration (buffer selected by pointer). Base count per mgr
-    # is manager-defined (V1: 2, V2: 1) — carried generically. Same machinery for V1/V2;
+    # is manager-defined (V1: 2, V2: 1) -- carried generically. Same machinery for V1/V2;
     # only the global->LDS ISSUE (_addr_phase/_prefetch/_drain) differs. ----
     k_lds_ld_curr = k_mgr.ds_load_ptrs(ptr_lds=_k_lds_buf(0), lane_idx=lane_idx)
     v_lds_ld_curr = v_mgr.ds_load_ptrs(ptr_lds=_v_lds_buf(0), lane_idx=lane_idx)
@@ -948,7 +942,7 @@ def _core_attention(
             n_block
         )  # this tile's first (batch-relative) kv row
 
-        # Unpack loop-carried state — R independent per-q-tile (m, d, O) groups,
+        # Unpack loop-carried state -- R independent per-q-tile (m, d, O) groups,
         # then the shared K/V ds pointers.
         m_prev = [fx.Float32(state[qt * _QS + 0]) for qt in range(R)]
         d_prev = [fx.Float32(state[qt * _QS + 1]) for qt in range(R)]
@@ -1147,7 +1141,7 @@ def _core_attention(
             o_acc_list=o_resc_list,
         )
 
-        # Yield state — R updated (m, d, O) groups, then the shared K/V ds pointers
+        # Yield state -- R updated (m, d, O) groups, then the shared K/V ds pointers
         # swapped curr<->next (4 s_swap_b32).
         out = []
         for qt in range(R):
@@ -1306,7 +1300,7 @@ def _core_attention(
         )
 
     # ---- LSE store (optional). LSE = m_final + ln(d_final) in the scaled-score
-    # domain (softmax_scale is folded into Q, so S already carries it) — matches
+    # domain (softmax_scale is folded into Q, so S already carries it) -- matches
     # torch.logsumexp(scale * Q @ K^T, dim=kv). Each query q = warp*R*16 + qt*16 + l%16
     # is held identically by the lane pair (l, l^16); store once from the khalf==0
     # lanes, masked by seq < q_len. buffer_store redirects mask-drops to byte
@@ -1360,7 +1354,7 @@ def _zero_fill_attention(
     """q_len>0 with kv_len==0 (cross-attention): softmax over an empty KV set, so O=0 for
     this WG's valid query rows. LSE=-inf, or (with a sink) LSE=sink[head] since the only
     surviving softmax term is exp(sink) (sink value is 0, O stays 0). Flat coalesced b128
-    write — consecutive lanes write consecutive 16-byte O chunks (no WMMA layout)."""
+    write -- consecutive lanes write consecutive 16-byte O chunks (no WMMA layout)."""
     tid = _warp_id() * fx.Int32(WAVE_SIZE) + _lane_id()
     kv_head = fx.Int32(gpu.block_id("y"))
     row0 = fx.Int32(gpu.block_id("x")) * fx.Int32(BLOCK_M)
@@ -1409,7 +1403,7 @@ def _zero_fill_attention(
 
 
 # ============================================================================
-# Builder — one device kernel per (layout, config)
+# Builder -- one device kernel per (layout, config)
 # ============================================================================
 
 
@@ -1485,7 +1479,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
             max_seqlen_q: fx.Int32,
             max_seqlen_k: fx.Int32,
         ):
-            """Varlen THD entry — empty scaffold.
+            """Varlen THD entry -- empty scaffold.
 
             THD: this batch's token ranges come from cu_seqlens (batch = grid.z).
             """
@@ -1608,10 +1602,10 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
         seq_len_q: fx.Int32,
         seq_len_k: fx.Int32,
     ):
-        """Batched BSHD entry — empty scaffold.
+        """Batched BSHD entry -- empty scaffold.
 
         Uniform sequence lengths (``seq_len_q`` / ``seq_len_k``) replace
-        cu_seqlens — nothing transient, so this path is CUDA-graph safe.
+        cu_seqlens -- nothing transient, so this path is CUDA-graph safe.
         Token base is batch_idx * seq_len (batch = grid.z).
         """
         batch = fx.Int32(gpu.block_id("z"))
@@ -1919,7 +1913,7 @@ def flash_attn_varlen_m32x8(
     sink=None,
     lse=None,
 ):
-    """Host entry — varlen THD, qk_hdim in {128,192,256} / v_hdim=128, bf16 or fp16.
+    """Host entry -- varlen THD, qk_hdim in {128,192,256} / v_hdim=128, bf16 or fp16.
 
     ``window_size`` (optional): ``(left, right)`` sliding-window bounds. ``-1`` =
     infinite on that side; ``(-1, -1)`` = full attention. ``causal`` forces
@@ -1928,7 +1922,7 @@ def flash_attn_varlen_m32x8(
     any window value.
 
     ``sink`` (optional): 1-D ``[nheads_q]`` fp32 per-head sink logits in the
-    scaled-score domain — one extra ``exp(sink)`` term in the softmax denominator.
+    scaled-score domain -- one extra ``exp(sink)`` term in the softmax denominator.
     Presence is baked into the kernel at compile time (``has_sink``).
 
     ``lse`` (optional): caller-provided ``[total_q, nheads_q]`` fp32 output buffer,
@@ -2071,7 +2065,7 @@ def flash_attn_batch_m32x8(
     sink=None,
     lse=None,
 ):
-    """Host entry — batched BSHD ``[B, S, H, D]``, qk_hdim in {128,192,256} / v_hdim=128, bf16 or fp16.
+    """Host entry -- batched BSHD ``[B, S, H, D]``, qk_hdim in {128,192,256} / v_hdim=128, bf16 or fp16.
 
     Uses the dedicated BSHD kernel with a uniform ``seq_len`` scalar (no
     cu_seqlens), so there is nothing transient to bake into a CUDA graph.
@@ -2082,7 +2076,7 @@ def flash_attn_batch_m32x8(
     ``mask_right``); the window magnitudes are runtime args.
 
     ``sink`` (optional): 1-D ``[nheads_q]`` fp32 per-head sink logits in the
-    scaled-score domain — one extra ``exp(sink)`` term in the softmax denominator.
+    scaled-score domain -- one extra ``exp(sink)`` term in the softmax denominator.
     Presence is baked into the kernel at compile time (``has_sink``).
 
     ``lse`` (optional): caller-provided ``[B, nheads_q, S_q]`` fp32 output buffer,
@@ -2149,7 +2143,7 @@ def flash_attn_batch_m32x8(
         stride_lse_head = 0
         stride_lse_batch = 0
 
-    # Empty tensor — skip the launch (host-known dims, no device sync). No queries: out
+    # Empty tensor -- skip the launch (host-known dims, no device sync). No queries: out
     # has no rows to write. No keys (seq_len_k==0, seq_len_q>0): softmax over an empty KV
     # set -> O=0. LSE=-inf, or (with a sink) LSE=sink[head] since the only surviving
     # softmax term is exp(sink) (sink value is 0, so O stays 0).
@@ -2167,7 +2161,7 @@ def flash_attn_batch_m32x8(
                     lse.fill_(float("-inf"))
         return (out, lse) if return_lse else out
 
-    # BSHD: seq is dim 1, head dim 2 — the per-batch base is derived in-kernel as
+    # BSHD: seq is dim 1, head dim 2 -- the per-batch base is derived in-kernel as
     # batch_idx * seq_len. Q/K/V/O strides in ELEMENTS (TDM loaders consume directly).
     stride_q_seq = q.stride(1)
     stride_k_seq = k.stride(1)

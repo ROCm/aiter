@@ -1,19 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942/gfx950 TP∈{2,4,8} INT4 two-shot all-reduce.
+"""gfx942/gfx950 TP?{2,4,8} INT4 two-shot all-reduce.
 
-INT4 nibble: [-8,+7], −1/8, 4 B/thread, 1152 B rank-tile. Scale is
-group-16 signed E4M3 in the 128 B region. Super-tile ST∈{1,8}; host
-uses ST=1 when ``num_tiles ≤`` the occupancy-clamped persistent grid.
+INT4 nibble: [-8,+7], -1/8, 4 B/thread, 1152 B rank-tile. Scale is
+group-16 signed E4M3 in the 128 B region. Super-tile ST?{1,8}; host
+uses ST=1 when ``num_tiles <=`` the occupancy-clamped persistent grid.
 Payload HBM is bf16; in-kernel math is packed fp16. Each rank owns
-``atoms / world_size`` atoms of a tile (8 GPUs → 1, 4 → 2, 2 → 4); LDS
+``atoms / world_size`` atoms of a tile (8 GPUs -> 1, 4 -> 2, 2 -> 4); LDS
 stays ``atoms * 1152``.
 """
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, Stream, T, as_ir_value
@@ -34,7 +33,7 @@ TILE_BYTES = BLOCK * ATOMS * 16
 RANK_TILE_BYTES = 1152
 PACK_I32 = ATOMS * (RANK_TILE_BYTES // 4)
 
-# (world_size, super_tile) → VGPR-limited workgroups per CU.
+# (world_size, super_tile) -> VGPR-limited workgroups per CU.
 _RESIDENT_WGS_PER_CU = {
     (2, 1): 3,
     (2, 8): 4,
@@ -82,7 +81,7 @@ def _splat_f16x2(x):
 
 
 def _clamp_fp16_overflow():
-    """Saturate packed fp16 overflow to ±65504 instead of Inf.
+    """Saturate packed fp16 overflow to ?65504 instead of Inf.
 
     Packed add/mul/FMA follow MODE bit 23 (FP16_OVFL). Unset, overflow
     becomes Inf and every later FMA in that tile is Inf. Set, it saturates
@@ -130,7 +129,7 @@ def _atom_f16_to_bf16(atom):
 def _f32_to_e4m3(x):
     """Pack f32 to a signed E4M3 byte: 1 sign, 4-bit exp (bias 7), 3-bit mantissa.
 
-    Decode is ``±(1 + m/8) * 2**(e - 7)`` for every ``e``, including 0
+    Decode is ``?(1 + m/8) * 2**(e - 7)`` for every ``e``, including 0
     (no OCP denorms). ``0x7F`` / ``0xFF`` are max finite, not NaN.
 
     ``0x00`` is +0 only. Any other value that would land there (positive
@@ -242,11 +241,10 @@ def _store_v4i32_nt_global(addr_i64, data):
     registers, so LLVM would serialize those lanes (one destination at a
     time). A flat global store takes the address from a vector register,
     so all destinations issue together. ``nontemporal`` skips L2; this is
-    payload, not a flag. ``fx.ptr_store`` has no NT flag.
+    payload, not a flag.
     """
-    ptr_ty = ir.Type.parse("!llvm.ptr<1>")
-    ptr = llvm.IntToPtrOp(ptr_ty, as_ir_value(addr_i64)).result
-    llvm.StoreOp(as_ir_value(data), ptr, alignment=16, nontemporal=True)
+    ptr = fx.inttoptr(fx.PointerType.get(T.i8, fx.AddressSpace.Global, 16), addr_i64)
+    fx.generic_store(ptr, data, nontemporal=True)
 
 
 def _load_i32_nt(rsrc, elem_off):
@@ -302,7 +300,7 @@ def make_quick_allreduce_int4_kernel(
     TILE_FP16 = TILE_BYTES // 2
     LDS_BYTES = ATOMS * RANK_TILE_BYTES
     # Each rank owns this many 16-byte atoms of a 32 KiB tile
-    # (8 GPUs → 1, 4 → 2, 2 → 4). LDS still holds all ATOMS atoms.
+    # (8 GPUs -> 1, 4 -> 2, 2 -> 4). LDS still holds all ATOMS atoms.
     rank_atoms = ATOMS // world_size
     # Last-sector pad is ST * rank_atoms * RANK_TILE_I32 after the ST tiles.
     rank_payload_i32 = rank_atoms * RANK_TILE_I32
@@ -366,7 +364,7 @@ def make_quick_allreduce_int4_kernel(
         scale_slot, pair_in_slot, _lane_in_pair = fx.idx2crd(
             tid, scale_own_layout
         ).unpack()
-        # Rank-tile = 18 × 64 B Infinity Fabric sectors: 16 INT4 then 2 E4M3.
+        # Rank-tile = 18 x 64 B Infinity Fabric sectors: 16 INT4 then 2 E4M3.
         # A workgroup has 64 quads. Lockstep: consecutive quads target
         # consecutive peers of one sector so one NT store hits every GPU.
         # A stripe of 8 sectors needs world_size*8 quads (64 at 8 GPUs);

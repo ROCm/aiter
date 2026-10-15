@@ -29,7 +29,7 @@ from ..kernels_common import LOG2E
 
 def _exp2_f32(x):
     """Evaluate exp2 directly; decay exponents are always non-positive."""
-    return fx.Float32(fx.rocdl.exp2(fx.Float32.ir_type, x.ir_value()))
+    return fx.exp2(x, fastmath="afn")
 
 
 WARP_SIZE = 64

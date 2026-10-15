@@ -5,10 +5,10 @@ import torch
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 
 
 def matmul_launch_metadata(grid, kernel, args):
@@ -186,7 +186,7 @@ def _moe_gemm_a8w8(
     W_CACHE_MODIFIER: tl.constexpr,
     UPCAST_INDICES: tl.constexpr = False,
     # Use fnuz FP8 (float8_e4m3fnuz / gfx942) instead of OCP FP8 (float8e4nv / gfx950).
-    # When True, replaces tl.dot_scaled with manual E8M0→fp32 dequant + tl.dot.
+    # When True, replaces tl.dot_scaled with manual E8M0->fp32 dequant + tl.dot.
     USE_FNUZ: tl.constexpr = False,
 ):
     tl.assume(stride_y_k >= 0)
@@ -376,7 +376,7 @@ def _moe_gemm_a8w8(
             w_scales = tl.full((BLOCK_N, MX_SCALE_BLOCK_K), 127, dtype=tl.uint8)
 
         if USE_FNUZ:
-            # fnuz path (gfx942): manual E8M0→fp32, then tl.dot.
+            # fnuz path (gfx942): manual E8M0->fp32, then tl.dot.
             # x_scales: [BLOCK_M, MX_SCALE_BLOCK_K], w_scales: [BLOCK_N, MX_SCALE_BLOCK_K]
             a_sc = (x_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
             b_sc = (w_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)

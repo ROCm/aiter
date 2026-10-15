@@ -4,10 +4,10 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton.rope.rope import _get_gptj_rotated_x_1D, _get_neox_rotated_x_1D
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _fused_fp4_bmm_rope_cat_and_cache_mla_repr = make_kernel_repr(
@@ -207,9 +207,9 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
     - RoPE writes to q_out[:, :, kv_lora_rank:] and handles KV cache
 
     Grid structure:
-    - Phase 1: pid < bmm_programs → BMM (tiled over heads, K-splits, M, N)
-    - Phase 2: pid in [bmm_programs, bmm_programs + B*QH) → RoPE + KV cache for decode
-    - Phase 3: pid >= bmm_programs + B*QH → KV cache only for prefill tokens
+    - Phase 1: pid < bmm_programs -> BMM (tiled over heads, K-splits, M, N)
+    - Phase 2: pid in [bmm_programs, bmm_programs + B*QH) -> RoPE + KV cache for decode
+    - Phase 3: pid >= bmm_programs + B*QH -> KV cache only for prefill tokens
     """
 
     pid = tl.program_id(0)
@@ -721,9 +721,9 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
     Note: FP8 does not support split-K.
 
     Grid structure:
-    - Phase 1: pid < bmm_programs → BMM (tiled over heads, M, N)
-    - Phase 2: pid in [bmm_programs, bmm_programs + B*QH) → RoPE + KV cache for decode
-    - Phase 3: pid >= bmm_programs + B*QH → KV cache only for prefill tokens
+    - Phase 1: pid < bmm_programs -> BMM (tiled over heads, M, N)
+    - Phase 2: pid in [bmm_programs, bmm_programs + B*QH) -> RoPE + KV cache for decode
+    - Phase 3: pid >= bmm_programs + B*QH -> KV cache only for prefill tokens
     """
 
     pid = tl.program_id(0)

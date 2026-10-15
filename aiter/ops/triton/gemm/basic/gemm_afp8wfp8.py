@@ -373,7 +373,7 @@ def gemm_afp8wfp8_preshuffle(
         dtype: Output dtype.
         y: Optional pre-allocated output (M, N).
         config: Optional kernel-tuning dict.
-        x_scale_group_size: K elements per activation scale — 128 for blockscale
+        x_scale_group_size: K elements per activation scale -- 128 for blockscale
             activations (default), 32 for MX activations.
         is_x_scale_transposed: x_scales bytes are column-major, i.e. logically
             (K // group, M). Default False (row-major).
@@ -535,7 +535,7 @@ def gemm_afp8wfp8_preshuffle(
             warp_bases=tuple(warp_bases),
             cache_modifier=config["cache_modifier"],
             NUM_BUFFERS=num_buffers,
-            # Every gluon preshuffle config declares this; configs/CLAUDE.md
+            # Every gluon preshuffle config declares this; configs/AGENTS.md
             # forbids Python-side defaults for tuning values, so a missing key
             # is a config bug and should fail loudly rather than silently tune
             # itself off. The kernel clamps it to the main-loop trip count.

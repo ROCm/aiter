@@ -13,7 +13,9 @@ directly to ``out`` in its native dtype and no scales are produced.
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.activation import _apply_activation_from_str
+from aiter.ops.triton._triton_kernels.common.activation import (
+    _apply_activation_from_str,
+)
 from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import _fp8_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -99,7 +101,7 @@ def _fused_clamp_silu_mul_kernel(
 
     if HAS_QUANT:
         if SCALE_FMT == "ue8m0":
-            # Per-1×QUANT_BLOCK_SIZE MXFP8 emit: fp8 e4m3 values + uint8 ue8m0
+            # Per-1xQUANT_BLOCK_SIZE MXFP8 emit: fp8 e4m3 values + uint8 ue8m0
             # biased-exponent scales. Mirrors the ue8m0 path used by moe_gemm_a8w4.
             NUM_QB: tl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE
             out_3d = tl.reshape(out, [1, NUM_QB, QUANT_BLOCK_SIZE])

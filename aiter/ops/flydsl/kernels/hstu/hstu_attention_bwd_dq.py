@@ -276,7 +276,7 @@ def build_hstu_attention_bwd_dq(
         )
         k_lds_byte_base = fx.ptrtoint(fx.get_iter(k_view))
 
-        # ── Copy-atom global->LDS DMA (buffer_load_lds via fx.copy) ──
+        # -- Copy-atom global->LDS DMA (buffer_load_lds via fx.copy) --
         # Same idiom as the dV/dK kernel (shared make_lds_dma helper).
         _dma_atom, _lds_ptr_ty, _rebased_buffer_div = make_lds_dma(DMA_BYTES, elem_type)
 
@@ -336,7 +336,7 @@ def build_hstu_attention_bwd_dq(
 
             The fastmath context gives every add/mul the `fast` flag and turns the
             reciprocal into v_rcp_f32; only exp2 stays on the amdgcn intrinsic. See the
-            dV/dK kernel for why the stable fx.math.exp2 is not used."""
+            dV/dK kernel for why exp2 needs the explicit `afn` flag."""
             with arith.fastmath(arith.FastMathFlags.fast):
                 sc = [s * c_alpha for s in s_list]
                 tt = [s * c_neg_log2e for s in sc]
