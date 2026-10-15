@@ -93,6 +93,10 @@ class Stage2ScatterContext:
     # gemm2 epilogue quantize per 1x32 e8m0 before the P2P write and have
     # ep_combine_fused dequantize on the way out.
     combine_quant_bits: int = 0
+    # Compact only: gemm2 returns each peer's run with one plain TDM store into
+    # the plan's dense comb_inp layout, reading the run table the plan appended
+    # to compact_psum (see compact_plan.compact_comb_tab_dwords).
+    per_rank_scatter: bool = False
 
     def __post_init__(self):
         if self.combine_quant_bits not in (0, 8, 4):

@@ -30,6 +30,7 @@ from .gemm_common_gfx1250 import (
     workgroup_barrier,
 )
 from .kernels_common import ceildiv
+from .mega_moe_gfx1250 import tdm_prims as TDM
 from .mega_moe_gfx1250.tdm_gather_shim import (
     make_tensor_gather_descriptor,
     tensor_store_gather,
@@ -162,6 +163,7 @@ def launch_gemm_a8w4_tdm(
     ep_destination_stride: Constexpr[int] = 0,
     ep_world_size: Constexpr[int] = 0,
     ep_quant_bits: Constexpr[int] = 0,
+    ep_scatter_per_rank: Constexpr[int] = 0,
     arg_ep_row_map: fx.Tensor = None,
     f32_situ_beta: fx.Float32 = 1.0,
     f32_situ_linear_beta: fx.Float32 = 1.0,
@@ -271,6 +273,7 @@ def launch_gemm_a8w4_tdm(
         a_row_stride_bytes,
         a_scale_row_stride_bytes,
         ep_quant_bits,
+        ep_scatter_per_rank,
         persistent_workers,
         rolled_drain,
     )
@@ -282,6 +285,8 @@ def launch_gemm_a8w4_tdm(
             raise ValueError("enable_ep_scatter is incompatible with stage1_quant_out")
     if ep_quant_bits not in (0, 8, 4):
         raise ValueError(f"ep_quant_bits must be 0, 8 or 4, got {ep_quant_bits}")
+    if ep_scatter_per_rank and not enable_ep_scatter:
+        raise ValueError("ep_scatter_per_rank requires enable_ep_scatter")
     if ep_quant_bits:
         if not enable_ep_scatter:
             raise ValueError("ep_quant_bits requires enable_ep_scatter")
@@ -427,6 +432,7 @@ def launch_gemm_a8w4_tdm(
         f"_wpt{num_waves_per_tensor_tdm}" if num_waves_per_tensor_tdm != 2 else ""
     )
     _ep = "_epscatter" if enable_ep_scatter else ""
+    _ep = _ep + ("_perrank" if ep_scatter_per_rank else "")
     _mma_group = (
         f"_mg{MMA_GROUP}"
         if MMA_FIRST_GROUP == MMA_GROUP
@@ -1408,7 +1414,9 @@ def launch_gemm_a8w4_tdm(
                 # row zero and are replaced with the TDM OOB index below.
                 _rm_dst_lanes = []
                 _scatter_lane_valids = []
-                for scatter_vector in range_constexpr(scatter_dst_vectors):
+                for scatter_vector in range_constexpr(
+                    0 if ep_scatter_per_rank else scatter_dst_vectors
+                ):
                     _scatter_pass_lane = lane // fx.Int32(
                         SCATTER_GROUP_ROWS
                     ) + fx.Int32(scatter_vector * SCATTER_PASSES_PER_VECTOR)
@@ -1437,6 +1445,24 @@ def launch_gemm_a8w4_tdm(
                         )
                     )
                     _scatter_lane_valids.append(_scatter_lane_valid)
+                # The per-rank scatter needs no per-row destination: lane p
+                # holds this expert's run-table entry for peer p, which sits
+                # after psum's n_experts ends (see compact_comb_tab_dwords).
+                _run_start_lanes = []
+                _run_delta_lanes = []
+                for rank_vector in range_constexpr(
+                    ceildiv(ep_world_size, WAVE) if ep_scatter_per_rank else 0
+                ):
+                    _peer = lane + fx.Int32(rank_vector * WAVE)
+                    _peer = (_peer < fx.Int32(ep_world_size)).select(_peer, fx.Int32(0))
+                    _entry = (
+                        tile_map
+                        + fx.Int64(n_experts)
+                        + (eb64 * fx.Int64(ep_world_size) + fx.Int64(_peer))
+                        * fx.Int64(2)
+                    )
+                    _run_start_lanes.append(fx.Int32(fx.ptr_load(_entry)))
+                    _run_delta_lanes.append(fx.Int32(fx.ptr_load(_entry + fx.Int64(1))))
                 # Every GEMM wave needs the route weight for all of its M rows.
                 # Coalesced global loads replace the shared row-map TDM,
                 # LDS allocation, barrier, and four epilogue LDS reads. Their
@@ -2065,7 +2091,90 @@ def launch_gemm_a8w4_tdm(
                 rocdl.s_barrier_wait(-1)
             else:
                 workgroup_barrier()
-            if const_expr(enable_ep_scatter):
+            if const_expr(enable_ep_scatter and ep_scatter_per_rank):
+                # One plain 2D TDM store per peer. A gemm2 tile lies inside one
+                # expert, whose compact rows the plan placed source-rank-major,
+                # so peer p's rows are the single run [lo, hi) of the tile, and
+                # the plan's dense comb_inp layout keeps that run contiguous on
+                # p's side at slot row + delta. Peer p is issued by wave
+                # p % num_waves; the run test is wave-uniform.
+                elem_bytes = 1 if ep_quant_bits else 2
+                _row_elems = C_ROW_BYTES if ep_quant_bits else STORE_N
+                _lds_row_elems = _lds_row_bytes if ep_quant_bits else STORE_PITCH
+                _stride_elems = ep_slot_stride_bytes // elem_bytes
+                _pr = _ep_lsa1 - _ep_lsa0
+                _comb0 = _ep_lsa0 + fx.Int64(ep_combine_input_offset)
+                _lds_c0 = fx.Int32(
+                    arith.trunci(T.i32, arith.unwrap(fx.Int64(fx.ptrtoint(base_ptr))))
+                )
+                if const_expr(ep_quant_bits):
+                    _elem_div = 8 // ep_quant_bits
+                    _gboff = blk_n64 // _elem_div
+                    _gboff_s = n64 // _elem_div + blk_n64 // EP_SCALE_BLOCK
+                else:
+                    _gboff = fx.Int64(blk_n * elem_bytes)
+                _expert_end = blk_m + mn_oob
+                _tile_end = blk_m + fx.Int32(tile_m)
+                _tile_end = (_expert_end < _tile_end).select(_expert_end, _tile_end)
+
+                def _run_lane(lanes, p):
+                    return fx.Int32(
+                        rocdl.readlane(
+                            T.i32,
+                            _raw(lanes[p // WAVE]),
+                            _raw(fx.Int32(p % WAVE)),
+                        )
+                    )
+
+                for p in range_constexpr(ep_world_size):
+                    run_lo = _run_lane(_run_start_lanes, p)
+                    run_hi = (
+                        _run_lane(_run_start_lanes, p + 1)
+                        if p + 1 < ep_world_size
+                        else _expert_end
+                    )
+                    run_lo = (run_lo > blk_m).select(run_lo, blk_m)
+                    run_hi = (run_hi < _tile_end).select(run_hi, _tile_end)
+                    run_rows = run_hi - run_lo
+                    if (wave == fx.Int32(p % num_waves)) & (run_rows > fx.Int32(0)):
+                        r0 = run_lo - blk_m
+                        slot = run_lo + _run_lane(_run_delta_lanes, p)
+                        dst = (
+                            _comb0
+                            + fx.Int64(p) * _pr
+                            + fx.Int64(slot) * fx.Int64(ep_slot_stride_bytes)
+                        )
+                        TDM.tdm_store(
+                            TDM.tdm_group0(
+                                _lds_c0 + r0 * fx.Int32(_lds_row_elems * elem_bytes),
+                                dst + _gboff,
+                            ),
+                            TDM.tdm_group1_rows(
+                                run_rows,
+                                _row_elems,
+                                _lds_row_elems,
+                                elem_bytes,
+                                _stride_elems,
+                            ),
+                        )
+                        if const_expr(ep_quant_bits):
+                            TDM.tdm_store(
+                                TDM.tdm_group0(
+                                    _lds_c0
+                                    + fx.Int32(_ep_scale_lds_off)
+                                    + r0 * fx.Int32(_lds_scale_row_bytes),
+                                    dst + _gboff_s,
+                                ),
+                                TDM.tdm_group1_rows(
+                                    run_rows,
+                                    EP_SCALE_ROW_BYTES,
+                                    _lds_scale_row_bytes,
+                                    1,
+                                    ep_slot_stride_bytes,
+                                ),
+                            )
+                tdm_ops.tensor_wait(0)
+            elif const_expr(enable_ep_scatter):
                 # EP gemm2-fused scatter via TDM gather-store. cco's flat symmetric
                 # VA is peer_va = winBase + pe*perRankSize + off, and comb_inp slots
                 # are padded to a pow2 so perRankSize divides by the slot stride

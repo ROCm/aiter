@@ -134,6 +134,42 @@ def tdm_group1_rows_4b(rows):
     )
 
 
+def tdm_group1_rows(rows, row_elems, tile_row_elems, elem_bytes, stride):
+    """GROUP1 for ``rows`` runtime rows of a padded LDS tile, ``stride`` apart.
+
+    The LDS side is dense at ``tile_row_elems`` per row; ``row_elems`` is the
+    tensor's row width, so on a store the pad columns past it fall out of
+    bounds and never land. ``rows`` is both the tile and the tensor height,
+    must be wave-uniform and in ``[1, TDM_MAX_DIM]``, and goes through
+    ``readfirstlane`` like :func:`tdm_group1_rows_4b`.
+    """
+    if elem_bytes not in (1, 2, 4, 8):
+        raise ValueError(
+            f"TDM data_size encodes 1/2/4/8-byte elements, got {elem_bytes}"
+        )
+    if not (1 <= row_elems <= tile_row_elems <= TDM_MAX_DIM):
+        raise ValueError(
+            f"TDM row needs 1 <= row_elems ({row_elems}) <= tile_row_elems "
+            f"({tile_row_elems}) <= {TDM_MAX_DIM}"
+        )
+    ds = int(math.log2(elem_bytes))
+    r = readfirstlane(T.i32, arith.unwrap(rows))
+    r_hi = arith.shli(r, _i32(16))
+    return vector.from_elements(
+        T.vec(8, T.i32),
+        [
+            _i32(ds << 16),
+            _i32((row_elems & 0xFFFF) << 16),
+            arith.ori(r_hi, _i32((row_elems >> 16) & 0xFFFF)),
+            _i32((tile_row_elems & 0xFFFF) << 16),
+            r,
+            _i32(stride & 0xFFFFFFFF),
+            arith.ori(r_hi, _i32((stride >> 32) & 0xFFFF)),
+            _i32(0),
+        ],
+    )
+
+
 def tdm_plan_xfer_4b(src_addr, dst_addr, n_elems):
     """Split a dword run into a scalar head/tail and a row-aligned TDM body.
 

@@ -24,8 +24,13 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
-from flydsl.expr import arith, range_constexpr, tdm_ops
-from flydsl.expr.rocdl import cvt_scale_pk8_f32_fp4, cvt_scale_pk8_f32_fp8
+from flydsl.expr import arith, const_expr, range_constexpr, tdm_ops
+from flydsl.expr.rocdl import (
+    cvt_scale_pk8_f32_fp4,
+    cvt_scale_pk8_f32_fp8,
+    readfirstlane,
+    readlane,
+)
 from flydsl.expr.typing import Int32, Int64, T
 from flydsl.expr.typing import Vector as Vec
 
@@ -43,6 +48,7 @@ from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
 from .config import (
     _WAVE_SIZE as WAVE,
 )
+from .tdm_gather_shim import make_tensor_gather_descriptor, tensor_load_gather
 from .types import COMBINE_SCALE_BLOCK as SCALE_BLOCK
 
 # The reduce's slicing granularity along hidden; chunks_per_iter of these make
@@ -157,6 +163,7 @@ def _make_combine_fused_reduce(
     quant_bits=0,
     tokens_per_block=2,
     chunks_per_iter=4,
+    dense_slots=0,
 ):
     """Stage B of the GEMM2-fused scatter combine: the per-token topk sum.
 
@@ -184,6 +191,11 @@ def _make_combine_fused_reduce(
     On an MX wire ``chunks_per_iter`` wants to cover as much of the hidden dim as
     it can: the scale plane contributes only C*8 bytes to a row, and anything
     under a cache line makes the second load fetch lines it mostly discards.
+
+    A nonzero ``dense_slots`` is the per-rank scatter's comb_inp: the plan's
+    segment-major layout of that many slots, where route ``tok*topk + k`` lives
+    at ``comb_slot[tok*topk + k]`` (-1 for a dropped route). The tile is then
+    gathered into the same ``t*topk + k`` LDS rows, so the sum is unchanged.
     """
     topk = experts_per_token
     lanes = warp_num_per_block * WAVE
@@ -249,7 +261,26 @@ def _make_combine_fused_reduce(
     # hands this trip its input tile must leave the prefetch's loads and the
     # previous trip's store in flight. This rests on TDM ops retiring in issue
     # order, so that a count names an exact prefix of the issue stream.
-    WAIT_N = (2 if quant_bits else 1) + 1
+    PLANES = 2 if quant_bits else 1
+    WAIT_N = PLANES + 1
+
+    # Gathered tile: GATHER_IDX rows per gather, gather g issued by warp
+    # g % warps. Gathered rows past tensor_dim1 still land (zero-filled), so the
+    # last gather carries only the rows it has instead of padding to the full
+    # index count. A warp can own one gather fewer than others, so the wait
+    # depth is per warp: HI for the first HI_WARPS warps, LO for the rest.
+    dense_slots = int(dense_slots)
+    GATHER_IDX = 16 if dense_slots and dense_slots <= 0xFFFF else 8
+    GATHERS = (
+        [(r0, min(r0 + GATHER_IDX, IN_ROWS)) for r0 in range(0, IN_ROWS, GATHER_IDX)]
+        if dense_slots
+        else []
+    )
+    GATHERS_LO = len(GATHERS) // warp_num_per_block
+    GATHERS_HI_WARPS = len(GATHERS) - GATHERS_LO * warp_num_per_block
+    GATHERS_HI = GATHERS_LO + (1 if GATHERS_HI_WARPS else 0)
+    if dense_slots:
+        WAIT_N = GATHERS_LO * PLANES + 1
 
     def _dequant_pk8(packed, e8m0_i32):
         """Native gfx1250 ``v_cvt_scale_pk8_f32_{fp8,fp4}``: 8 MX values -> 8 f32.
@@ -288,10 +319,15 @@ def _make_combine_fused_reduce(
     def ep_combine_fused(
         addr_comb_inp: Int64,
         addr_out: Int64,
+        addr_comb_slot: Int64,
         cur_rank_num_token: Int32,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
+        if const_expr(dense_slots):
+            warp = fx.Int32(readfirstlane(T.i32, tid // WAVE))
+            lane = tid % WAVE
+            rsrc_cslot = create_buffer_resource_from_addr(addr_comb_slot)
 
         # These build MLIR layouts/atoms, so they only work inside the kernel
         # body where a Context is established.
@@ -388,6 +424,71 @@ def _make_combine_fused_reduce(
             grp = work // iters_per_tok
             it = work % iters_per_tok
             return grp * T_TOK, it * C_CHK
+
+        def issue_gather_load(work, buf, live):
+            """-- global -> LDS: the T*topk slot rows, gathered by comb_slot --
+
+            ``issue_load`` for the dense layout. A dead work item, a dropped
+            route and a token past the count all gather the OOB index, whose
+            rows land zero-filled; every warp still issues its gathers, so the
+            per-warp tensorcnt depth stays constant.
+            """
+            work = (work > last_work).select(last_work, work)
+            tok0, q0 = tile_origin(work)
+            route0 = tok0 * topk
+            rows_left = live.select((cur_rank_num_token - tok0) * topk, 0)
+            g_off = fx.Int64(q0) * fx.Int64(IN_CHUNK_BYTES)
+            g_off_s = fx.Int64(hidden_dim * quant_bits // 8) + fx.Int64(q0) * fx.Int64(
+                CHUNK_ELEMS // SCALE_BLOCK
+            )
+            comb_view = global_view(
+                inp_iter, 0, (dense_slots, P_ROW_BYTES), (slot_stride, 1)
+            )
+            for g in range_constexpr(len(GATHERS)):
+                r0, r1 = GATHERS[g]
+                if warp == fx.Int32(g % warp_num_per_block):
+                    idx_ok = (lane < fx.Int32(r1 - r0)) & (
+                        fx.Int32(r0) + lane < rows_left
+                    )
+                    slot = fx.Int32(
+                        buffer_load(
+                            rsrc_cslot,
+                            idx_ok.select(route0 + fx.Int32(r0) + lane, fx.Int32(0)),
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                    )
+                    slot = (idx_ok & (slot >= fx.Int32(0))).select(
+                        slot, fx.Int32(dense_slots)
+                    )
+                    rows = [
+                        fx.Int32(readlane(T.i32, slot, i))
+                        for i in range_constexpr(r1 - r0)
+                    ]
+                    planes = [
+                        (lds_in_view, P_ROW_BYTES, g_off),
+                        (lds_scale_view, S_ROW_BYTES, g_off_s),
+                    ]
+                    for plane in range_constexpr(PLANES):
+                        lds_of, row_bytes, plane_off = planes[plane]
+                        lds_plane = lds_of(buf)
+                        tensor_load_gather(
+                            make_tensor_gather_descriptor(
+                                comb_view,
+                                lds_plane,
+                                rows,
+                                row_width=row_bytes,
+                                tensor_dim0=row_bytes,
+                                tensor_dim1=dense_slots,
+                                stride=slot_stride,
+                                elem_bytes=1,
+                                index_size=32 if GATHER_IDX == 8 else 16,
+                                lds_byte_offset=fx.index_cast(
+                                    T.index, fx.Int32(r0 * row_bytes)
+                                ),
+                                global_byte_offset=plane_off,
+                            )
+                        )
 
         def issue_load(work, buf, live):
             """-- global -> LDS: T*topk slot rows, one copy per wire plane --
@@ -524,9 +625,20 @@ def _make_combine_fused_reduce(
             )
             fx.copy(atom_out, lds_out_view(buf), gt_out)
 
+        issue = issue_gather_load if dense_slots else issue_load
+
+        def wait_input():
+            if const_expr(GATHERS_HI != GATHERS_LO):
+                if warp < fx.Int32(GATHERS_HI_WARPS):
+                    tdm_ops.tensor_wait(GATHERS_HI * PLANES + 1)
+                else:
+                    tdm_ops.tensor_wait(WAIT_N)
+            else:
+                tdm_ops.tensor_wait(WAIT_N)
+
         # Prime buffer 0. bid < block_num, so work // block_num is the trip count
         # and its parity picks the buffer -- trip 0 reads what this load writes.
-        issue_load(bid, 0, bid <= last_work)
+        issue(bid, 0, bid <= last_work)
         # A trip issues a load then a store, so from trip 1 on there are two
         # newer TDMs sitting behind the load being waited for. Repeat the prime
         # so trip 0 carries that depth too and the wait count stays uniform
@@ -536,19 +648,19 @@ def _make_combine_fused_reduce(
         # copy's row extent, and the rows past it land zero-filled, so a short
         # copy aimed at buffer 1 wipes most of the tile trip 1 is about to read
         # -- the two copies race, and whichever retires last wins.
-        issue_load(bid, 0, bid <= last_work)
+        issue(bid, 0, bid <= last_work)
         for work in range(bid, total_work, block_num):
             buf = (work // block_num) % 2
             nxt = work + block_num
             # Prefetch the tile this block wants next before touching the one it
             # already has, so the load overlaps the dequantize below.
-            issue_load(nxt, 1 - buf, nxt <= last_work)
+            issue(nxt, 1 - buf, nxt <= last_work)
             # Only the prefetch just issued and the previous trip's store may
             # still be in flight. In issue order everything older has retired --
             # this tile's own load, so its input buffer is readable, and the
             # store from two trips back, which is the one that owned the output
             # buffer about to be rewritten.
-            tdm_ops.tensor_wait(WAIT_N)
+            wait_input()
             workgroup_barrier()
             reduce_tile(buf)
             workgroup_barrier()
@@ -559,12 +671,14 @@ def _make_combine_fused_reduce(
     def run(
         addr_comb_inp: Int64,
         addr_out: Int64,
+        addr_comb_slot: Int64,
         cur_rank_num_token: Int32,
         stream=fx.Stream(None),  # noqa: B008
     ):
         ep_combine_fused(
             addr_comb_inp,
             addr_out,
+            addr_comb_slot,
             cur_rank_num_token,
         ).launch(
             grid=(block_num, 1, 1),

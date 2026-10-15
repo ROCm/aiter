@@ -944,6 +944,7 @@ class MegaMoEGfx1250:
                 hist_stride=self._compact_hist_stride,
                 max_routes=self._compact_max_routes,
                 hist_pingpong=False,
+                dense_comb=self._per_rank_scatter,
             )
             self._compact_plan_launches[key] = launch
         return launch
@@ -1032,6 +1033,7 @@ class MegaMoEGfx1250:
                 bufs["masked_m"].data_ptr(),
                 bufs["psum"].data_ptr(),
                 bufs["barrier"].data_ptr(),
+                bufs["comb_slot"].data_ptr() if bufs["comb_slot"] is not None else 0,
                 self._config.rank,
                 token_count,
                 fx.Stream(plan_stream),
@@ -1053,6 +1055,7 @@ class MegaMoEGfx1250:
             "masked_m": self._masked_ms[slot],
             "psum": self._psums[slot],
             "barrier": self._barriers[slot],
+            "comb_slot": self._comb_slots[slot],
         }
 
     def _begin_compact_step(self, recv_token_bound: int | None) -> None:
@@ -1097,6 +1100,19 @@ class MegaMoEGfx1250:
         device = torch.device("cuda", torch.cuda.current_device())
         max_recv = config.max_recv
         self._compact_plan = config.stage1_fused
+        # gemm2 returns each peer's rows with one plain TDM store instead of
+        # 8-row gather stores. Needs the compact plan: only its source-rank-major
+        # rows make a peer's rows one run of the tile.
+        self._per_rank_scatter = os.environ.get("AITER_MEGA_PER_RANK_SCATTER", "0") in (
+            "1",
+            "true",
+            "True",
+        )
+        if self._per_rank_scatter and not self._compact_plan:
+            raise ValueError(
+                "AITER_MEGA_PER_RANK_SCATTER requires the compact plan "
+                "(stage1_fused=True)"
+            )
         self._compact_tile_m = _compact_gemm_align_m(
             config,
             activation=self.activation,
@@ -1119,6 +1135,7 @@ class MegaMoEGfx1250:
         )
         from .compact_plan import (
             PLAN_BLOCKS,
+            compact_comb_tab_dwords,
             compact_done_nbytes,
             compact_hist_stride,
         )
@@ -1187,6 +1204,7 @@ class MegaMoEGfx1250:
         )
         self._compact_masked_m = None
         self._compact_psum = None
+        self._compact_comb_slot = None
         self._compact_plan_launches = {}
         self._compact_step_align_m = self._compact_tile_m
         self._compact_step_rows = self._compact_cap
@@ -1202,8 +1220,29 @@ class MegaMoEGfx1250:
                 torch.zeros(config.experts_per_rank, dtype=torch.int32, device=device)
                 for _ in range(self._COMPACT_PLAN_SLOTS)
             ]
+            # The per-rank scatter's run table rides behind psum, so gemm2 finds
+            # it through the m-tile map it already takes, double-buffered with it.
+            psum_tail = (
+                compact_comb_tab_dwords(
+                    npes=config.world_size, experts_per_rank=config.experts_per_rank
+                )
+                if self._per_rank_scatter
+                else 0
+            )
             self._psums = [
-                torch.zeros(config.experts_per_rank, dtype=torch.int32, device=device)
+                torch.zeros(
+                    config.experts_per_rank + psum_tail,
+                    dtype=torch.int32,
+                    device=device,
+                )[: config.experts_per_rank]
+                for _ in range(self._COMPACT_PLAN_SLOTS)
+            ]
+            self._comb_slots = [
+                (
+                    torch.full((n_tok,), -1, dtype=torch.int32, device=device)
+                    if self._per_rank_scatter
+                    else None
+                )
                 for _ in range(self._COMPACT_PLAN_SLOTS)
             ]
             self._block_hists = [
@@ -1220,6 +1259,7 @@ class MegaMoEGfx1250:
             ]
             self._compact_masked_m = self._masked_ms[0]
             self._compact_psum = self._psums[0]
+            self._compact_comb_slot = self._comb_slots[0]
             self._compact_dummy_ids = torch.zeros(
                 (1, config.topk), dtype=torch.int32, device=device
             )
@@ -1324,6 +1364,11 @@ class MegaMoEGfx1250:
                 quant_bits=_bits,
                 tokens_per_block=_toks,
                 chunks_per_iter=_chunks,
+                dense_slots=(
+                    config.max_tokens_per_rank * config.topk
+                    if self._per_rank_scatter
+                    else 0
+                ),
             )
         self._combine_sync = _make_combine_fused_sync(
             rank=config.rank,
@@ -1705,6 +1750,7 @@ class MegaMoEGfx1250:
             self._token_destination_map = tok_map
             self._compact_masked_m = self._masked_ms[self._compact_slot]
             self._compact_psum = self._psums[self._compact_slot]
+            self._compact_comb_slot = self._comb_slots[self._compact_slot]
         else:
             tok_map = self._token_destination_map
         self._dispatch_variants[spec](
@@ -1768,6 +1814,7 @@ class MegaMoEGfx1250:
             compact_align_m=(self._compact_step_align_m if self._compact_plan else 0),
             compact_rows=(self._compact_step_rows if self._compact_plan else 0),
             combine_quant_bits=combine_quant_bits,
+            per_rank_scatter=self._per_rank_scatter,
         )
 
     def _combine(self, routing: Routing, combine_quant_bits: int = 0) -> torch.Tensor:
@@ -1789,6 +1836,11 @@ class MegaMoEGfx1250:
         self._combine_variants[combine_quant_bits](
             self._arena.local_ptr("comb_inp"),
             self._combine_output.data_ptr(),
+            (
+                self._compact_comb_slot.data_ptr()
+                if self._compact_comb_slot is not None
+                else 0
+            ),
             routing.token_count,
             stream,
         )

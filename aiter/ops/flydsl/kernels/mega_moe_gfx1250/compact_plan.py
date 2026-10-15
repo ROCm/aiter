@@ -117,6 +117,16 @@ def compact_row_capacity(
     return max(tile_m, aligned)
 
 
+def compact_comb_tab_dwords(*, npes: int, experts_per_rank: int) -> int:
+    """Dwords of the ``dense_comb`` run table the plan appends after psum.
+
+    Entry ``e*npes + src`` is ``(row_start, delta)``: the first compact row this
+    rank's local expert ``e`` holds from ``src``, and ``comb_slot - row`` for
+    every row of that run on ``src``'s side.
+    """
+    return 2 * int(npes) * int(experts_per_rank)
+
+
 @functools.cache
 def compile_tdm_compact_plan(
     *,
@@ -131,6 +141,7 @@ def compile_tdm_compact_plan(
     hist_stride: int,
     max_routes: int,
     hist_pingpong: bool = True,
+    dense_comb: bool = False,
 ):
     """Compile the compact-plan kernel. ``hist_stride`` is ``npes * row_dwords``.
 
@@ -138,6 +149,14 @@ def compile_tdm_compact_plan(
     arena by ``gen & 1``. Double-buffered callers pass a slot-specific
     ``off_hist`` / ``off_done`` and set this False so two in-flight plans do
     not share a done counter.
+
+    ``dense_comb`` lays this rank's comb_inp out segment-major instead of
+    ``tok*topk + k``: the route of segment ``seg`` with intra index ``i`` owns
+    slot ``local_base[seg] + i``, ``local_base`` being the exclusive prefix of
+    this rank's own histogram. A ``(src, dest, e)`` run then sits contiguous on
+    both ends, in the same order, so gemm2 can return it in one plain TDM. The
+    plan writes ``comb_slot[route]`` for the reduce, and the run table of
+    :func:`compact_comb_tab_dwords` into ``psum[experts_per_rank:]`` for gemm2.
     """
     if WAVE != 32:
         raise ValueError("compact plan requires gfx1250 wave32")
@@ -151,7 +170,10 @@ def compile_tdm_compact_plan(
     compact_cap = int(compact_cap)
     max_routes = max(1, int(max_routes))
     hist_pingpong = bool(hist_pingpong)
+    dense_comb = bool(dense_comb)
     plan_blocks = PLAN_BLOCKS
+    if dense_comb and plan_blocks != 1:
+        raise ValueError("dense_comb reads the hist matrix from block 0's LDS")
     plan_waves = compact_plan_waves(npes=npes, max_routes=max_routes)
     plan_threads = plan_waves * WAVE
     peer_bits = max(1, (int(npes) - 1).bit_length())
@@ -188,6 +210,7 @@ def compile_tdm_compact_plan(
         addr_masked_m: Int64,
         addr_psum: Int64,
         addr_barrier: Int64,
+        addr_comb_slot: Int64,
         my_lsa_rank: Int32,
         inp_cur_tok: Int32,
     ):
@@ -204,6 +227,8 @@ def compile_tdm_compact_plan(
         rsrc_mm = create_buffer_resource_from_addr(addr_masked_m)
         rsrc_psum = create_buffer_resource_from_addr(addr_psum)
         rsrc_bar = create_buffer_resource_from_addr(addr_barrier)
+        if const_expr(dense_comb):
+            rsrc_cslot = create_buffer_resource_from_addr(addr_comb_slot)
 
         smem = fx.SharedAllocator(static=False)
         hist_ptr = smem.allocate(segs * 4, 128)._ptr
@@ -217,6 +242,9 @@ def compile_tdm_compact_plan(
         if const_expr(merge_routes):
             routes_ptr = smem.allocate(max_routes * 4, 16)._ptr
             lds_routes = fx.Int64(fx.ptrtoint(routes_ptr))
+        if const_expr(dense_comb):
+            estart_ptr = smem.allocate(epr * 4, 16)._ptr
+            lds_estart = fx.Int64(fx.ptrtoint(estart_ptr))
         if const_expr(use_sparse):
             pack_ptr = smem.allocate(row_dwords * 4, 128)._ptr
             recv_ptr = smem.allocate(npes * row_dwords * 4, 128)._ptr
@@ -506,6 +534,11 @@ def compile_tdm_compact_plan(
                         send = expert_start + my_prefix
                         if dest == rank:
                             buffer_store(expert_start + total, rsrc_psum, e)
+                            if const_expr(dense_comb):
+                                comm_ops.store_i32_lds(
+                                    lds_estart + fx.Int64(safe_e) * fx.Int64(4),
+                                    expert_start,
+                                )
                         buffer_store(send, rsrc_base, idx)
                         comm_ops.store_i32_lds(
                             lds_hist + fx.Int64(idx) * fx.Int64(4), send
@@ -513,6 +546,63 @@ def compile_tdm_compact_plan(
                     carry = carry + readlane(T.i32, inclusive, WAVE - 1)
             comm_ops.waitcnt_stores()
             fx.barrier()
+
+            if const_expr(dense_comb):
+                # Each src row of the matrix becomes its inclusive prefix in
+                # place, one warp per row. Row src then gives both src's
+                # local_base (its entry one segment back) and its count in a
+                # segment (the difference of two neighbours).
+                if warp < npes:
+                    row_base = lds_matrix + fx.Int64(warp) * fx.Int64(segs * 4)
+                    carry = arith.constant(0)
+                    for chunk in range(0, segs, WAVE):
+                        s = fx.Int32(chunk) + lane
+                        in_seg = s < fx.Int32(segs)
+                        s_addr = row_base + fx.Int64(
+                            in_seg.select(s, fx.Int32(0))
+                        ) * fx.Int64(4)
+                        cnt = arith.constant(0)
+                        if in_seg:
+                            cnt = comm_ops.load_i32_lds(s_addr)
+                        inclusive = _wave32_inclusive_scan_i32(cnt, lane)
+                        if in_seg:
+                            comm_ops.store_i32_lds(s_addr, carry + inclusive)
+                        carry = carry + readlane(T.i32, inclusive, WAVE - 1)
+                fx.barrier()
+
+                def incl_at(src, seg):
+                    return comm_ops.load_i32_lds(
+                        lds_matrix
+                        + (fx.Int64(src) * fx.Int64(segs) + fx.Int64(seg)) * fx.Int64(4)
+                    )
+
+                def excl_at(src, seg):
+                    has_prev = seg > fx.Int32(0)
+                    prev = incl_at(src, has_prev.select(seg - 1, fx.Int32(0)))
+                    return has_prev.select(prev, fx.Int32(0))
+
+                # Run table for gemm2: src's rows of local expert e start at
+                # estart[e] + (rows of lower srcs) and map onto src's slots
+                # local_base_src[seg] + i, so their slot is row + delta.
+                for item in range(tid, epr * npes, plan_threads):
+                    e = item // fx.Int32(npes)
+                    src = item - e * fx.Int32(npes)
+                    seg = fx.Int32(rank * epr) + e
+                    prefix = arith.constant(0)
+                    for lower in range_constexpr(npes):
+                        cnt = incl_at(lower, seg) - excl_at(lower, seg)
+                        prefix = prefix + (fx.Int32(lower) < src).select(
+                            cnt, fx.Int32(0)
+                        )
+                    row_start = (
+                        comm_ops.load_i32_lds(lds_estart + fx.Int64(e) * fx.Int64(4))
+                        + prefix
+                    )
+                    tab = fx.Int32(epr) + item * fx.Int32(2)
+                    buffer_store(row_start, rsrc_psum, tab)
+                    buffer_store(
+                        excl_at(src, seg) - row_start, rsrc_psum, tab + fx.Int32(1)
+                    )
 
         if const_expr(plan_blocks > 1):
             if tid == 0:
@@ -552,6 +642,25 @@ def compile_tdm_compact_plan(
                 rsrc_map,
                 route,
             )
+            if const_expr(dense_comb):
+                own_seg = valid.select(segment, fx.Int32(0))
+                has_prev = own_seg > fx.Int32(0)
+                local_base = comm_ops.load_i32_lds(
+                    lds_matrix
+                    + (
+                        fx.Int64(rank * segs)
+                        + fx.Int64(has_prev.select(own_seg - 1, fx.Int32(0)))
+                    )
+                    * fx.Int64(4)
+                )
+                local_base = has_prev.select(local_base, fx.Int32(0))
+                buffer_store(
+                    arith.select(
+                        valid & in_cap, local_base + intra, arith.constant(dropped)
+                    ),
+                    rsrc_cslot,
+                    route,
+                )
 
     @flyc.jit
     def launch(
@@ -563,6 +672,7 @@ def compile_tdm_compact_plan(
         addr_masked_m: Int64,
         addr_psum: Int64,
         addr_barrier: Int64,
+        addr_comb_slot: Int64,
         my_lsa_rank: Int32,
         inp_cur_tok: Int32,
         stream=fx.Stream(None),  # noqa: B008
@@ -576,6 +686,7 @@ def compile_tdm_compact_plan(
             addr_masked_m,
             addr_psum,
             addr_barrier,
+            addr_comb_slot,
             my_lsa_rank,
             inp_cur_tok,
         ).launch(
