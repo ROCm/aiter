@@ -17,9 +17,8 @@ once the grid alone fills the machine. Softmax is online in log2 space and the
 split
 partials are FP32. Expand+tail and the sigmoid gate stay unfused.
 
-The fp32 reference and the paged-cache fixtures live in
-``op_tests/qsa_ref.py``. The concrete shapes are in
-``op_tests/qsa_shapes.py``.
+The fp32 reference, the paged-cache fixtures, and the concrete shapes
+live in ``op_tests/qsa_ref.py``.
 
 ``qsa_layer`` is the ``qwen4_exp`` opt-in. It runs the indexer, the vendored
 expand+tail, and sparse GQA. A rank-3 query pair missing from the measured
@@ -225,7 +224,7 @@ def _k1_uses_prefill_scorer(
 ) -> bool:
     """Whether this launch uses the 16-row scorer.
 
-    gfx942 H=8 stays on the one-row scorer. That tile is 73792 bytes and
+    gfx942 H=8 stays on the one-row scorer. That tile is 73920 bytes and
     gfx942 has 65536. gfx950 H=8 keeps the 16-row tile.
     """
     if n_requests != 1 or rows < 16:
