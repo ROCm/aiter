@@ -54,9 +54,29 @@ def is_fx_set_register_available():
 
 
 TDM_DESCRIPTOR_VERSION = 1
-MMA_GROUP = int(os.environ.get("AITER_FLYDSL_MMA_GROUP", "10"))
-MMA_FIRST_GROUP = int(os.environ.get("AITER_FLYDSL_MMA_FIRST_GROUP", MMA_GROUP))
-DS_FIRST_N = int(os.environ.get("AITER_FLYDSL_DS_FIRST_N", "0"))
+IGLP_PARAMS = {
+    "a8w4": {
+        "default": {"mma_group": 10, "mma_first_group": 10, "ds_first_n": 0},
+        "prefill": {"mma_group": 15, "mma_first_group": 14, "ds_first_n": 15},
+    },
+    "a4w4": {
+        "default": {"mma_group": 10, "mma_first_group": 10, "ds_first_n": 0},
+        "prefill": {"mma_group": 11, "mma_first_group": 13, "ds_first_n": 16},
+    },
+}
+# Prefill means tile_m == tile_n == tile_k == 256 for either data format.
+for _format_params in IGLP_PARAMS.values():
+    for _params in _format_params.values():
+        for _name in _params:
+            _env_name = "AITER_FLYDSL_" + _name.upper()
+            _value = os.environ.get(_env_name)
+            if _value is not None:
+                _value = int(_value)
+                _minimum = 0 if _name == "ds_first_n" else 1
+                if _value < _minimum:
+                    raise ValueError(f"{_env_name} must be >= {_minimum}")
+                _params[_name] = _value
+
 EXPLICIT_VGPR_PARTITION = int(
     os.environ.get("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION", "0")
 )
@@ -67,10 +87,6 @@ if LDS_SOA_LOAD_INTERLEAVE is not None:
     LDS_SOA_LOAD_INTERLEAVE = int(LDS_SOA_LOAD_INTERLEAVE)
 FORCE_1X4_CLUSTER = int(os.environ.get("AITER_FLYDSL_FORCE_1X4_CLUSTER", "0"))
 DISABLE_CLUSTER_SYNC = int(os.environ.get("AITER_FLYDSL_DISABLE_CLUSTER_SYNC", "0"))
-if MMA_GROUP < 1 or MMA_FIRST_GROUP < 1:
-    raise ValueError("AITER_FLYDSL_MMA_GROUP values must be positive")
-if DS_FIRST_N < 0:
-    raise ValueError("AITER_FLYDSL_DS_FIRST_N must be non-negative")
 if EXPLICIT_VGPR_PARTITION not in (0, 1):
     raise ValueError("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION must be 0 or 1")
 if PLANAR_LDS not in (0, 1):
@@ -232,6 +248,12 @@ def launch_gemm_a8w4_tdm(
     # Keep the experiment switch as an override while normal dispatch obtains
     # both cluster dimensions from the tuned configuration.
     cluster_m = 1 if FORCE_1X4_CLUSTER else cluster_m
+    iglp_params = IGLP_PARAMS["a4w4" if a_is_fp4 else "a8w4"][
+        "prefill" if tile_m == 256 and tile_n == 256 and tile_k == 256 else "default"
+    ]
+    sched_mma_group = iglp_params["mma_group"]
+    sched_first_group = iglp_params["mma_first_group"]
+    sched_ds_first = iglp_params["ds_first_n"]
     cache_tag = (
         K,
         tile_m,
@@ -261,9 +283,9 @@ def launch_gemm_a8w4_tdm(
         ep_slot_stride_bytes,
         ep_destination_stride,
         ep_world_size,
-        MMA_GROUP,
-        MMA_FIRST_GROUP,
-        DS_FIRST_N,
+        sched_mma_group,
+        sched_first_group,
+        sched_ds_first,
         SUPPORT_EXPLICIT_VGPR_PARTITION,
         planar_lds_on,
         interleaved_lds_load_on,
@@ -428,11 +450,11 @@ def launch_gemm_a8w4_tdm(
     )
     _ep = "_epscatter" if enable_ep_scatter else ""
     _mma_group = (
-        f"_mg{MMA_GROUP}"
-        if MMA_FIRST_GROUP == MMA_GROUP
-        else f"_mg{MMA_FIRST_GROUP}x{MMA_GROUP}"
+        f"_mg{sched_mma_group}"
+        if sched_first_group == sched_mma_group
+        else f"_mg{sched_first_group}x{sched_mma_group}"
     )
-    _ds_first = f"_dsfirst{DS_FIRST_N}" if DS_FIRST_N else ""
+    _ds_first = f"_dsfirst{sched_ds_first}" if sched_ds_first else ""
     _explicit_vgpr_partition = "_regpart" if SUPPORT_EXPLICIT_VGPR_PARTITION else ""
     _planar_lds = "_planarlds" if planar_lds_on else ""
     _interleaved_lds_load = "_interleavelds" if interleaved_lds_load_on else ""
@@ -1107,7 +1129,7 @@ def launch_gemm_a8w4_tdm(
         # REUSE fence; the prefetch reads interleave evenly over the rest. Narrow
         # tiles can have n_acc as low as the tail itself, so clamp it to keep at
         # least one group for the interleaved part.
-        FENCE_COVER_MMA = min(8, max(0, n_acc - MMA_GROUP))
+        FENCE_COVER_MMA = min(8, max(0, n_acc - sched_mma_group))
 
         def mma_rows(wm_list, act, wt, sa_k, sb_k):
             for i in range_constexpr(len(wm_list)):
@@ -1310,12 +1332,12 @@ def launch_gemm_a8w4_tdm(
                     rocdl.sched_dsrd(STATE_DS if not rmem_preloaded else 0)
                 # Keep one normal group for the LDS/TDM scheduling slots. Small
                 # tiles can have no more MFMAs than the requested fence tail.
-                tail_mfma = min(tail_mfma, max(0, n_acc - MMA_GROUP))
+                tail_mfma = min(tail_mfma, max(0, n_acc - sched_mma_group))
                 mma_total = n_acc - tail_mfma
                 # K256 needs grouping to limit VGPR-bank switches without
                 # turning the complete A/B/scale prefetch into long LDS bursts.
-                mma_group = min(MMA_GROUP, mma_total) if KWS > 1 else 1
-                first_group = min(MMA_FIRST_GROUP, mma_total) if KWS > 1 else 1
+                mma_group = min(sched_mma_group, mma_total) if KWS > 1 else 1
+                first_group = min(sched_first_group, mma_total) if KWS > 1 else 1
                 remaining_mma = mma_total - first_group
                 remaining_slots = (
                     (remaining_mma + mma_group - 1) // mma_group
@@ -1334,7 +1356,7 @@ def launch_gemm_a8w4_tdm(
                     TDM_PER if (prefetch_kt is not None and ksl + 1 == KWS) else 0,
                     schedule_slots,
                 )
-                first_ds = min(DS_FIRST_N, future_schedule[0])
+                first_ds = min(sched_ds_first, future_schedule[0])
                 for i in range_constexpr(schedule_slots):
                     if const_expr(tdm_schedule[i] > 0):
                         rocdl.sched_vmem(tdm_schedule[i])
