@@ -2286,6 +2286,168 @@ def sliding_window_performance_test():
     parse_arg_and_run_test()
 
 
+@pytest.mark.parametrize("quant_kv", [False, True], ids=["bf16-kv", "fp8-kv"])
+@pytest.mark.parametrize(
+    ("query_length", "num_query_heads", "context_length", "ps"),
+    [
+        pytest.param(1, 16, 512, True, id="decode"),
+        pytest.param(4, 16, 512, True, id="qlen4"),
+        pytest.param(1, 16, 256, False, id="one-shot"),
+        pytest.param(4, 4, 512, True, id="packed-mtp"),
+        pytest.param(4, 4, 256, False, id="packed-mtp-one-shot"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("sliding_window", "use_sinks"),
+    [(0, False), (128, True)],
+    ids=["full-attention", "swa-with-sinks"],
+)
+def test_pa_decode_qk192_v128_vectorized_5d(
+    quant_kv: bool,
+    query_length: int,
+    num_query_heads: int,
+    context_length: int,
+    ps: bool,
+    sliding_window: int,
+    use_sinks: bool,
+):
+    """Cover split and one-shot output paths, including packed qlen-4 MTP.
+
+    ps=False with context_length=256 forces a single partition. Four Q heads
+    keep QUERY_SEQ_LEN_POW2=4 instead of dispatching each query separately.
+    """
+    if arch_info.get_arch() not in ("gfx942", "gfx950"):
+        pytest.skip("asymmetric Gluon paged decode supports gfx942/gfx950")
+
+    global USE_TORCH_FLASH_REF
+
+    old_use_torch_flash_ref = USE_TORCH_FLASH_REF
+    USE_TORCH_FLASH_REF = False
+    try:
+        result = run_pa_gluon_test(
+            context_length=context_length,
+            batch_size=2,
+            num_heads=(num_query_heads, 1),
+            head_size=192,
+            value_head_size=128,
+            block_size=64,
+            compute_type=torch.bfloat16,
+            query_length=query_length,
+            quant_mode="per_tensor",
+            context_partition_size=256,
+            trans_v=True,
+            kv_varlen=False,
+            quant_q=False,
+            quant_kv=quant_kv,
+            use_sinks=use_sinks,
+            sliding_window=sliding_window,
+            ps=ps,
+        )
+    finally:
+        USE_TORCH_FLASH_REF = old_use_torch_flash_ref
+
+    assert result["err_gluon"] == 0
+
+
+def test_pa_decode_qk192_v128_temporary_output():
+    """Reject unsafe workspaces and retain support for reusable padded storage."""
+    if arch_info.get_arch() not in ("gfx942", "gfx950"):
+        pytest.skip("asymmetric Gluon paged decode supports gfx942/gfx950")
+
+    query = torch.zeros((1, 16, 192), dtype=torch.bfloat16, device="cuda")
+    key_cache = torch.zeros((8, 1, 24, 64, 8), dtype=query.dtype, device=query.device)
+    value_cache = torch.ones((8, 1, 8, 128, 8), dtype=query.dtype, device=query.device)
+    output = torch.empty((1, 16, 128), dtype=query.dtype, device=query.device)
+    context_lengths = torch.tensor([512], dtype=torch.int32, device=query.device)
+    block_tables = torch.arange(8, dtype=torch.int32, device=query.device).view(1, 8)
+    storage = torch.full(
+        (1, 1, 2, 16, 256), -77, dtype=query.dtype, device=query.device
+    )
+    workspace = storage[..., :128]
+
+    def launch(temporary_output):
+        pa_decode_gluon(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            context_lengths,
+            block_tables,
+            softmax_scale=192**-0.5,
+            query_length=1,
+            max_context_partition_num=2,
+            temporary_output=temporary_output,
+            ps=True,
+        )
+
+    for invalid in (
+        workspace[..., :64],
+        workspace[:, :, :1],
+        storage.flatten(),
+        storage[..., ::2],
+    ):
+        with pytest.raises(ValueError, match="temporary_output"):
+            launch(invalid)
+
+    # Zero Q/K and constant-one V have an independent, exact output of one.
+    launch(workspace)
+    assert (
+        checkAllclose(
+            torch.ones_like(output, dtype=torch.float32),
+            output.float(),
+            rtol=0,
+            atol=0,
+        )
+        == 0
+    )
+    assert torch.all(storage[..., 128:] == -77)
+
+
+@pytest.mark.parametrize(
+    ("context_length", "ps"),
+    [(2048, True), (4097, True), (4097, False)],
+    ids=["causal-split", "persistent-oob", "partitioned-oob"],
+)
+def test_head_192_full_context_regression(context_length, ps):
+    """Cover the non-power-of-two head paged-attention decode path.
+
+    The 2,048-token persistent case catches application of the qlen-4 causal
+    frontier at each local scheduler split instead of at the global context
+    boundary.  With the fixed seed, the 4,097-token cases reference the final
+    physical cache block.  Before padded K/V and reduction loads were masked,
+    rounding head size 192 up to the 256-wide MFMA layout read past that block
+    and produced a GPU memory-access fault. The remaining shape covers qlen 4,
+    16Q/1KV, page 64, per-tensor FP8 KV, and transposed 5D V.
+    """
+    global USE_TORCH_FLASH_REF
+
+    old_use_torch_flash_ref = USE_TORCH_FLASH_REF
+    USE_TORCH_FLASH_REF = False
+    try:
+        result = run_pa_gluon_test(
+            context_length=context_length,
+            batch_size=32,
+            num_heads=(16, 1),
+            head_size=192,
+            block_size=64,
+            compute_type=torch.bfloat16,
+            query_length=4,
+            quant_mode="per_tensor",
+            context_partition_size=256,
+            trans_v=True,
+            kv_varlen=False,
+            quant_q=False,
+            quant_kv=True,
+            use_sinks=False,
+            sliding_window=0,
+            ps=ps,
+        )
+    finally:
+        USE_TORCH_FLASH_REF = old_use_torch_flash_ref
+
+    assert result["err_gluon"] == 0
+
+
 @pytest.mark.parametrize(
     "num_seqs, num_kv_heads, kwargs, expected",
     [
