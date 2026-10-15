@@ -39,6 +39,7 @@ from aiter.ops.flydsl.comm_fused_moe_host import (
     config_name,
     config_record,
     create_runner,
+    get_gpu_model,
 )
 from aiter.ops.flydsl.kernels.comm_fused_moe.gfx950.a8w4.config import (
     DirectConfig,
@@ -332,6 +333,7 @@ _WINNER_KEY_FIELDS = (
     "comm_tp",
     "comm_add_shared",
     "comm_mode",
+    "comm_gpu_model",
 )
 _COMM_MODES = ("ar", "rs")
 _COMM_CONFIGS_FIELD = "comm_fused_configs"
@@ -667,6 +669,7 @@ def _winner_key(shape: ShapeKey, token: int) -> dict:
         "comm_add_shared": int(shape.add_shared),
         "comm_tp": shape.tp,
         "comm_mode": shape.comm,
+        "comm_gpu_model": shape.gpu_model or get_gpu_model(),
     }
 
 
@@ -683,12 +686,15 @@ def _check_matching_block_m(row: dict, winner: dict, base_key) -> None:
         )
 
 
-def _comm_config(mode, tp, add_shared, config, latency):
+def _comm_config(mode, tp, add_shared, gpu_model, config, latency):
     if mode not in _COMM_MODES:
         raise ValueError(f"unsupported comm mode {mode!r}")
+    if not gpu_model:
+        raise ValueError("gpu_model is required for a comm-fused winner")
     record = {
         "tp": int(tp),
         "add_shared": bool(int(add_shared)),
+        "gpu_model": str(gpu_model).lower(),
         **config_record(config),
     }
     if latency not in (None, ""):
@@ -766,6 +772,7 @@ def write_winner(path, row: dict, config: PipelineConfig) -> None:
         mode,
         row["comm_tp"],
         row["comm_add_shared"],
+        row["comm_gpu_model"],
         config,
         row["comm_stage2_tp_us"],
     )
@@ -947,6 +954,7 @@ def main():
             get_cu_num(),
             add_shared=bool(args.add_shared),
             comm=args.comm_mode,
+            gpu_model=get_gpu_model(),
         )
         current = production_config(shape, args.token, args.family)
         candidates = candidate_configs(
