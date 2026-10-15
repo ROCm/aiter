@@ -883,6 +883,33 @@ def build_hstu_attention_bwd_fused_pp(
                 )
             )
 
+        def fadd_scalar(a, b):
+            """`a + b` as a scalar `v_add_f32`, blocking the SLP repack.
+
+            Same motivation as `fmul_const_scalar`. The dQ flush accumulates
+            DQ_PER_LANE=4 independent lanes of fp32; SLP pairs them into
+            `v_pk_add_f32`, which halves the number of independent dependency
+            chains the scheduler can interleave. This phase is latency-bound,
+            not VALU-throughput-bound, so that is a loss -- the same finding as
+            the gate's packing.
+
+            No `s_nop`: both operands come from VALU/LDS, never an MFMA
+            accumulator, so there is no wait state for the hazard recogniser to
+            miss inside the INLINEASM it cannot see into.
+            """
+            from flydsl._mlir import ir
+            from flydsl._mlir.dialects import llvm as _llvm
+
+            return fx.Float32(
+                _llvm.inline_asm(
+                    ir.F32Type.get(),
+                    [fx.Float32(a).ir_value(), fx.Float32(b).ir_value()],
+                    "v_add_f32 $0, $1, $2",
+                    "=v,v,v",
+                    has_side_effects=False,
+                )
+            )
+
         def fma_scalar(a, b, c):
             """`a*b + c` as a scalar `v_fma_f32`, via inline asm.
 
@@ -1053,9 +1080,10 @@ def build_hstu_attention_bwd_fused_pp(
             acc = [fx.Float32(0.0) for _ in range_constexpr(DQ_PER_LANE)]
             for w in range_constexpr(NUM_WAVES // 2):
                 for j in range_constexpr(DQ_PER_LANE):
-                    acc[j] = acc[j] + dqw[
-                        dq_wbase + fx.Int32(w), dq_frow, dq_fcol + fx.Int32(j)
-                    ]
+                    acc[j] = fadd_scalar(
+                        acc[j],
+                        dqw[dq_wbase + fx.Int32(w), dq_frow, dq_fcol + fx.Int32(j)],
+                    )  # fmt: skip
             for j in range_constexpr(DQ_PER_LANE):
                 dqg[dq_wrow, dq_fcol + fx.Int32(j)] = acc[j]
             # No fence between the write and the read: NEITHER group reads what
@@ -1064,7 +1092,9 @@ def build_hstu_attention_bwd_fused_pp(
             # barrier ago. A defensive lgkmcnt(0) here is a whole LDS round
             # trip on the critical path of every gate phase.
             for j in range_constexpr(DQ_PER_LANE):
-                acc[j] = acc[j] + dqg[dq_rrow, dq_fcol + fx.Int32(j)]
+                acc[j] = fadd_scalar(
+                    acc[j], dqg[dq_rrow, dq_fcol + fx.Int32(j)]
+                )  # fmt: skip
 
             # The partial belongs to tile q_tile_v - 1: phase M consumes
             # `ds_prev`, produced by the PREVIOUS trip's gate phase.
@@ -1082,7 +1112,12 @@ def build_hstu_attention_bwd_fused_pp(
             _r = is_g0.select(_r, fx.Int64(0))
             _hc = head_idx * fx.Int32(head_dim) + dq_fcol
             for j in range_constexpr(DQ_PER_LANE):
-                dq_part[_r, _hc + fx.Int32(j)] = acc[j] * c_inv_n
+                # Scalar, not `acc[j] * c_inv_n`: packed, this was the single
+                # largest non-barrier stall in the dispatch-150 trace --
+                # 12.4 M cycles, 12.4% of all stall, 317 cy/exec.
+                dq_part[_r, _hc + fx.Int32(j)] = fmul_const_scalar(
+                    acc[j], c_inv_n
+                )  # fmt: skip
 
         # ---- phase M -------------------------------------------------------
         def mfma_phase(dv, dk, p_prev, ds_prev, q_tile, rm_cur, rm_fill, t_cur,
