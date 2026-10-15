@@ -324,6 +324,10 @@ def _adaptive_moe_sort(
     sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
     reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
     m_indices = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
+    # The BM16 sort zeroes moe_buf with 16-byte stores, so an underaligned
+    # caller buffer gets a fresh one and _return_output copies back.
+    if output is not None and output.data_ptr() % 16:
+        output = None
     moe_buf = (
         # Atomic GEMM2 accumulates into moe_buf, so the caller's buffer can stand
         # in for it; it is zeroed below like a fresh one.

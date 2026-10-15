@@ -105,6 +105,7 @@ def test_fmoe(
     kernel_bench=False,
     disable_stage2_bias=False,
     ref_dtype="bf16",
+    output_offset=0,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -578,8 +579,15 @@ def test_fmoe(
 
     # Callers such as the serving MoE layer hand fused_moe their own [token,
     # model_dim] buffer. Fill it with NaN so a path that skips zeroing it before
-    # accumulating, or writes the result elsewhere, cannot pass.
-    out_buf = torch.full_like(out2_ck, float("nan"))
+    # accumulating, or writes the result elsewhere, cannot pass. output_offset
+    # starts it that many elements into its allocation, as a contiguous view.
+    out_pool = torch.full(
+        (out2_ck.numel() + output_offset,),
+        float("nan"),
+        dtype=out2_ck.dtype,
+        device=out2_ck.device,
+    )
+    out_buf = out_pool[output_offset:].view(out2_ck.shape)
     out_ret = fused_moe(
         input,
         w1_qt_aiter,
@@ -589,17 +597,18 @@ def test_fmoe(
         output=out_buf,
         **_fused_moe_kwargs,
     )
-    out_has_nan = out_buf.isnan().any().item()
+    # calc_diff turns an inf element into NaN, which no threshold catches.
+    out_non_finite = not out_buf.isfinite().all().item()
     out_err = checkAllclose(out2_ref, out_buf, msg="ck_moe_2stages output=")
     out_logits_diff = calc_diff(out2_ref, out_buf)
     out_failed = (
         out_ret is not out_buf
-        or out_has_nan
+        or out_non_finite
         or (out_err != 0 and out_logits_diff > 0.01)
     )
     out_msg = (
         f"output= check failed: returned buf={out_ret is out_buf}, "
-        f"nan={out_has_nan}, err={out_err}, logits_diff={out_logits_diff}"
+        f"non_finite={out_non_finite}, err={out_err}, logits_diff={out_logits_diff}"
     )
     if strict_accuracy:
         assert not out_failed, out_msg
@@ -1383,10 +1392,14 @@ def test_adaptive_sort_output_in_place():
     Kimi-K3 A4W4 TP=8. test_fmoe hands fused_moe a NaN-filled output buffer and
     checks it against the torch reference; here we also check that the buffer
     reached the adaptive sort as its atomic moe_buf and was never copied into.
+    A buffer starting 2 bytes into its allocation is too underaligned for the
+    sort's 16-byte zeroing, so it must take a fresh moe_buf and be copied into.
     """
     fm = aiter.fused_moe
     real_adaptive = fm._adaptive_moe_sort
     real_return = fm._return_output
+    # AITER_MOE_SORT_BACKEND=opus/ck bypasses the adaptive sort under test.
+    real_backend = fm._MOE_SORT_BACKEND
     adaptive_calls, copies = [], []
 
     def tracking_adaptive(*a, **kw):
@@ -1404,10 +1417,11 @@ def test_adaptive_sort_output_in_place():
     try:
         fm._adaptive_moe_sort = tracking_adaptive
         fm._return_output = tracking_return
+        fm._MOE_SORT_BACKEND = "auto"
         with override_env("AITER_SITUV2_A8W4", None), override_env(
             "AITER_SITUV2_A4W4", "1"
         ):
-            for token in (1, 4):
+            for token, output_offset in ((1, 0), (4, 0), (1, 1)):
                 adaptive_calls.clear()
                 copies.clear()
                 rows.append(
@@ -1425,17 +1439,22 @@ def test_adaptive_sort_output_in_place():
                         WQDType=dtypes.fp4x2,
                         use_g1u1=True,
                         check_aot_cache=False,
+                        output_offset=output_offset,
                     )
                 )
                 assert (
                     True in adaptive_calls
                 ), f"token={token}: output never reached the adaptive sort"
-                assert not copies, f"token={token}: output was copied into"
+                if output_offset:
+                    assert copies, f"token={token}: underaligned output used in place"
+                else:
+                    assert not copies, f"token={token}: output was copied into"
                 gc.collect()
                 torch.cuda.empty_cache()
     finally:
         fm._adaptive_moe_sort = real_adaptive
         fm._return_output = real_return
+        fm._MOE_SORT_BACKEND = real_backend
     aiter.logger.info(
         "moe_2stage adaptive-sort in-place output summary (markdown):\n%s",
         pd.DataFrame(rows).to_markdown(index=False),
