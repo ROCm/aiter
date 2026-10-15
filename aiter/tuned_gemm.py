@@ -57,8 +57,9 @@ def _gfx1250_flydsl_default_kernel(M, N, K, bias, dtype, otype):
 
     Against Triton's gluon DEFAULT.json, these two FlyDSL configs took 0.50 to 1.10 of Triton's time (geomean 0.78)
     for M from 512 to 1024 or above 4096, N >= 4096 and K >= 512 (the shapes of the untuned BF16 CSVs), and 0.81 to
-    1.28 (geomean 0.99) for 1024 < M <= 4096, the M_LEQ_2048 and M_LEQ_4096 buckets of that file. With fewer tiles
-    Triton was faster, and K < 512 is too short for the 4-stage pipeline.
+    1.28 (geomean 0.99) for 1024 < M <= 4096, the M_LEQ_2048 and M_LEQ_4096 buckets of that file, which that range
+    leaves to Triton wherever Triton can write C. With fewer tiles Triton was faster, and K < 512 is too short for the
+    4-stage pipeline.
     """
     if dtype != dtypes.bf16 or otype not in (dtypes.bf16, dtypes.fp32):
         return None
@@ -67,8 +68,9 @@ def _gfx1250_flydsl_default_kernel(M, N, K, bias, dtype, otype):
         return None
     if M < 512 or N < 4096 or K < 512:
         return None
-    # Tied to the gfx1250 gluon DEFAULT.json buckets; measure again when that file changes.
-    if 1024 < M <= 4096:
+    # Tied to the gfx1250 gluon DEFAULT.json buckets; measure again when that file changes. Past byte 2^31 of C,
+    # Triton's default config leaves rows unwritten, so FlyDSL keeps those shapes.
+    if 1024 < M <= 4096 and M * N * otype.itemsize <= 1 << 31:
         return None
     big = M > 768
     config = {
@@ -341,24 +343,26 @@ def get_GEMM_A16W16_config(
             ):
                 # An (N, K) with its own Triton config can beat FlyDSL, so FlyDSL
                 # only replaces Triton's default config.
-                if _gfx1250_gluon_a16w16_has_config(N, K):
-                    kernel_name = None
-                else:
+                has_config = _gfx1250_gluon_a16w16_has_config(N, K)
+                kernel_name = None
+                if not has_config:
                     kernel_name = _gfx1250_flydsl_default_kernel(
                         M, N, K, bias, eval(dtype), eval(otype)
                     )
-                if kernel_name is None:
-                    default_config["libtype"] = "triton"
-                    default_config["solidx"] = 0
-                elif not _gfx1250_flydsl_c_fits(M, N, kernel_name):
-                    # Triton's default config leaves the rows of C past byte 2^31 unwritten.
-                    default_config["libtype"] = "torch"
-                    default_config["solidx"] = 0
-                else:
+                if kernel_name is not None and _gfx1250_flydsl_c_fits(
+                    M, N, kernel_name
+                ):
                     default_config["libtype"] = "flydsl"
                     default_config["solidx"] = 0
                     default_config["splitK"] = 1
                     default_config["kernelName"] = kernel_name
+                elif has_config or M * N * eval(otype).itemsize <= 1 << 31:
+                    default_config["libtype"] = "triton"
+                    default_config["solidx"] = 0
+                else:
+                    # Triton's default config leaves the rows of C past byte 2^31 unwritten.
+                    default_config["libtype"] = "torch"
+                    default_config["solidx"] = 0
             else:
                 default_config["libtype"] = "torch"
                 default_config["solidx"] = 0

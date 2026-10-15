@@ -113,8 +113,9 @@ class TestGfx1250FlydslCandidates(unittest.TestCase):
 
 
 class TestGfx1250DefaultDispatch(unittest.TestCase):
-    """gfx1250 shapes without a tuned row: FlyDSL where Triton runs its default config and FlyDSL can write C,
-    torch where it cannot, Triton otherwise."""
+    """gfx1250 shapes without a tuned row: Triton where the (N, K) has its own config, else FlyDSL where it beats
+    Triton's default config and can write C, else Triton's default config where it can write C, else torch.
+    """
 
     def _default(self, m, n, k, dtype=BF16, otype=BF16, bias=False):
         from aiter.ops.triton.utils._triton import arch_info
@@ -176,6 +177,20 @@ class TestGfx1250DefaultDispatch(unittest.TestCase):
         for m, n, k, otype, libtype in cases:
             config = self._default(m, n, k, otype=otype)
             self.assertEqual(config["libtype"], libtype, (m, n, k, otype))
+
+    def test_outputs_past_the_triton_default_config_leave_it(self):
+        fp16, fp32 = str(torch.float16), str(torch.float32)
+        # Triton's default config writes C up to byte 2^31: 7067 rows of 151936 x 2 bytes, not 7068.
+        cases = [
+            (7067, 151936, 4096, fp16, fp16, False, "triton"),
+            (7068, 151936, 4096, fp16, fp16, False, "torch"),
+            (3533, 151936, 4096, BF16, fp32, False, "triton"),  # 1024 < M <= 4096
+            (3534, 151936, 4096, BF16, fp32, False, "flydsl"),
+            (8192, 151936, 4096, BF16, fp32, True, "torch"),  # bias with FP32 output
+        ]
+        for m, n, k, dtype, otype, bias, libtype in cases:
+            config = self._default(m, n, k, dtype, otype, bias)
+            self.assertEqual(config["libtype"], libtype, (m, n, k, dtype, otype, bias))
 
     def test_bias_with_fp32_output_stays_on_triton(self):
         fp32 = str(torch.float32)
