@@ -179,7 +179,10 @@ def _hc_up_silu(
     # tile's arithmetic defined.
     for row in range_constexpr(_MFMA_M):
         for c0 in range_constexpr(0, R, threads):
-            col = fx.Int32(c0) + tid
+            # Cast tid explicitly: Int32 + raw index promotes to fx.Index, which
+            # FlyDSL 0.3.4.1 passes unconverted into int-tuple inference and
+            # segfaults on (fixed upstream by ROCm/FlyDSL#1294).
+            col = fx.Int32(c0) + fx.Int32(tid)
             if const_expr(row < M):
                 acc = fx.Float32(0.0)
                 for s in range_constexpr(SPLIT):
