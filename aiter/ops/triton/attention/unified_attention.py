@@ -64,6 +64,13 @@ def _is_gluon_available():
     return any(supported in DEVICE_ARCH for supported in _GLUON_SUPPORTED_ARCHS)
 
 
+def _split_launch_config(config):
+    # Tuned CSV values can be numpy scalar integers. Gluon constexpr arguments
+    # must be native Python scalars; passing numpy.int32 fails during TTIR
+    # lowering once a runtime shape selects the 3D path.
+    return int(config["NUM_SEGMENTS"]), int(config["TILE_SIZE"])
+
+
 class _UAParams(NamedTuple):
     # tensors
     q: torch.Tensor
@@ -421,14 +428,14 @@ def unified_attention(
         config = get_unified_attention_config(
             "kv_split", split_params, backend="gluon" if use_gluon_3d else "triton"
         )
-        NUM_SEGMENTS = config["NUM_SEGMENTS"]
+        NUM_SEGMENTS, CONFIG_TILE_SIZE = _split_launch_config(config)
         # The triton kernels read a shuffled tile as one contiguous page, so
         # there the tile is the page. The gfx950 gluon loader gathers per token
         # and keeps its tuned tile.
         if shuffled_kv_cache and not use_gluon_3d:
             TILE_SIZE = block_size
         else:
-            TILE_SIZE = config["TILE_SIZE"]
+            TILE_SIZE = CONFIG_TILE_SIZE
 
         if NUM_SEGMENTS > 1:
             segm_output = torch.empty(
