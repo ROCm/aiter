@@ -7,6 +7,7 @@
 // the t2opus<c10::*> specializations, so nothing here needs torch/ATen/c10.
 #define AITER_NO_TORCH_TYPES
 #include <cmath>
+#include <limits>
 
 #include "aiter_hip_common.h"
 #include "aiter_opus_plus.h"
@@ -826,7 +827,11 @@ situv2_activate_scalar(const opus::vector_t<opus::bf16_t, VecSize>& gate,
 // FP32 LDS. WARP_SIZE is a device compile-time constant (32 on gfx12, 64 on
 // gfx9/gfx950), so the reduction follows the native wave topology on both, and
 // a single-wave block skips the cross-wave stage entirely.
-template <int32_t BlockSize, int32_t VecSize, int32_t StaticD = 0, bool SinglePass = false>
+template <int32_t BlockSize,
+          int32_t VecSize,
+          int32_t StaticD = 0,
+          bool SinglePass = false,
+          bool RecomputeMultiPass = false>
 __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
     opus::fp8_t* __restrict__ out,
     const opus::bf16_t* __restrict__ input,
@@ -866,26 +871,34 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
     static constexpr int32_t load_chunk_bytes =
         load_bytes % 16 == 0 ? 16 : (load_bytes % 8 == 0 ? 8 : 4);
     auto gate_buffer = opus::make_gmem<opus::bf16_t>(
-        gate_ptr, dim * sizeof(opus::bf16_t));
+        gate_ptr,
+        static_cast<unsigned int>(dim) *
+            static_cast<unsigned int>(sizeof(opus::bf16_t)));
     auto up_buffer = opus::make_gmem<opus::bf16_t>(
-        up_ptr, dim * sizeof(opus::bf16_t));
+        up_ptr,
+        static_cast<unsigned int>(dim) *
+            static_cast<unsigned int>(sizeof(opus::bf16_t)));
     auto out_buffer = opus::make_gmem<opus::fp8_t>(
-        out_ptr, dim * sizeof(opus::fp8_t));
+        out_ptr,
+        static_cast<unsigned int>(dim) *
+            static_cast<unsigned int>(sizeof(opus::fp8_t)));
 
     extern __shared__ float activated[];
-    auto* reduce_scratch = activated + (register_resident ? 0 : dim);
+    auto* reduce_scratch =
+        activated + ((register_resident || RecomputeMultiPass) ? 0 : dim);
     float thread_max = 0.0f;
     using vec_f       = opus::vector_t<float, VecSize>;
     vec_f register_values{};
 
-    auto activate_chunk = [&](int idx) {
+    auto compute_chunk = [&](int idx) {
         auto gate = load_vector_nbytes<
             opus::bf16_t, VecSize, load_chunk_bytes, GROUP_NT>(gate_buffer, idx);
         auto up = load_vector_nbytes<
             opus::bf16_t, VecSize, load_chunk_bytes, GROUP_NT>(up_buffer, idx);
 
         vec_f act_values{};
-        if constexpr(StaticD == 768 && (VecSize == 8 || VecSize == 4))
+        if constexpr(
+            (StaticD == 768 || StaticD == 33792) && (VecSize == 8 || VecSize == 4))
         {
             act_values = situv2_activate_packed<VecSize>(gate,
                                                          up,
@@ -900,9 +913,18 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
             act_values = situv2_activate_scalar<VecSize>(
                 gate, up, beta, gate_tanh_mul, linear_beta, up_tanh_mul, thread_max);
         }
+        return act_values;
+    };
+
+    auto activate_chunk = [&](int idx) {
+        vec_f act_values = compute_chunk(idx);
         if constexpr(register_resident)
         {
             register_values = act_values;
+        }
+        else if constexpr(RecomputeMultiPass)
+        {
+            return;
         }
         else if constexpr(VecSize == 8 && StaticD != 0)
         {
@@ -997,6 +1019,10 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
         if constexpr(register_resident)
         {
             values = register_values;
+        }
+        else if constexpr(RecomputeMultiPass)
+        {
+            values = compute_chunk(idx);
         }
         else if constexpr(VecSize == 8 && StaticD != 0)
         {
@@ -1732,7 +1758,11 @@ void silu_and_mul_quant(const aiter_tensor_t& out,
     }
 }
 
-template <int32_t BlockSize, int32_t VecSize, int32_t StaticD = 0, bool SinglePass = false>
+template <int32_t BlockSize,
+          int32_t VecSize,
+          int32_t StaticD = 0,
+          bool SinglePass = false,
+          bool RecomputeMultiPass = false>
 static void launch_situv2_and_mul_quant(const aiter_tensor_t& out,
                                         const aiter_tensor_t& input,
                                         const aiter_tensor_t& scale,
@@ -1759,15 +1789,17 @@ static void launch_situv2_and_mul_quant(const aiter_tensor_t& out,
     const size_t num_waves  = (BlockSize + wave_size - 1) / wave_size;
     // Activations need d floats unless they stay in registers; the cross-wave
     // scratch needs num_waves floats unless the block is a single wave.
-    const size_t lds_bytes = (static_cast<size_t>(register_resident ? 0 : d) +
+    const size_t lds_bytes =
+        (static_cast<size_t>((register_resident || RecomputeMultiPass) ? 0 : d) +
                               (single_wave ? 0 : num_waves)) *
-                             sizeof(float);
+        sizeof(float);
     // Both live in one dynamic allocation, so a wide row plus its scratch can
     // outgrow the 64 KB budget even though d alone fits. Catch it here instead
     // of at the launch, which would only report hipErrorInvalidValue.
-    AITER_CHECK(lds_bytes <= static_cast<size_t>(opus::get_smem_size()),
+    AITER_CHECK(lds_bytes <= get_smem_size_func(),
                 "situv2_and_mul_quant: d is too large for the LDS budget");
-    situv2_and_mul_quant_kernel<BlockSize, VecSize, StaticD, SinglePass>
+    situv2_and_mul_quant_kernel<
+        BlockSize, VecSize, StaticD, SinglePass, RecomputeMultiPass>
         <<<dim3(num_tokens), dim3(BlockSize), lds_bytes, stream>>>(
             reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
             reinterpret_cast<const opus::bf16_t*>(input.data_ptr()),
@@ -1807,16 +1839,22 @@ void situv2_and_mul_quant(const aiter_tensor_t& out,
                     linear_beta > 0.0f,
                 "situv2_and_mul_quant: beta and linear_beta must be finite and positive");
 
-    const int d              = input.size(-1) / 2;
+    // Dynamic kernels advance a signed 32-bit index by at most 1024 * 8
+    // elements. Leave room for the final loop increment, and reject before
+    // narrowing the tensor dimension to int.
+    constexpr int64_t max_kernel_stride = 1024 * 8;
+    constexpr int64_t max_supported_d =
+        static_cast<int64_t>(std::numeric_limits<int>::max()) - max_kernel_stride + 1;
+    const int64_t d64 = input.size(-1) / 2;
+    AITER_CHECK(d64 <= max_supported_d,
+                "situv2_and_mul_quant: d exceeds the 32-bit kernel indexing limit (",
+                max_supported_d,
+                ")");
+
+    const int d              = static_cast<int>(d64);
     const int64_t num_tokens = input.numel() / input.size(-1);
-    // Beyond 4096 the row no longer fits one chunk per thread, so it is staged
-    // in FP32 LDS instead. 16384 floats fill the 64 KB budget exactly, but the
-    // multi-pass path also needs one float per wave of cross-wave scratch out
-    // of the same allocation -- four of them for the widest such block (256
-    // threads on wave64) -- so the usable bound is the largest multiple of 8
-    // below 16384 - 4.
-    AITER_CHECK(d > 0 && d <= 16376 && d % 8 == 0,
-                "situv2_and_mul_quant: d must be divisible by 8 and in (0, 16376]");
+    AITER_CHECK(d > 0 && d % 8 == 0,
+                "situv2_and_mul_quant: d must be positive and divisible by 8");
     AITER_CHECK(group_size == d,
                 "situv2_and_mul_quant: only per-token quantization "
                 "(group_size == d) is implemented");
@@ -1843,6 +1881,25 @@ void situv2_and_mul_quant(const aiter_tensor_t& out,
 #define LAUNCH_SITUV2_SP(BLOCK_SIZE, VEC_SIZE, STATIC_D)                                   \
     launch_situv2_and_mul_quant<BLOCK_SIZE, VEC_SIZE, STATIC_D, true>(                     \
         out, input, scale, d, num_tokens, beta, linear_beta, stream)
+#define LAUNCH_SITUV2_RECOMPUTE(BLOCK_SIZE, VEC_SIZE)                                      \
+    launch_situv2_and_mul_quant<BLOCK_SIZE, VEC_SIZE, 0, false, true>(                      \
+        out, input, scale, d, num_tokens, beta, linear_beta, stream)
+
+    const size_t smem_size = get_smem_size_func();
+    const size_t static_scratch = (1024 / wave_size) * sizeof(float);
+    if(d == 33792 &&
+       static_cast<size_t>(d) * sizeof(float) + static_scratch <= smem_size)
+    {
+        LAUNCH_SITUV2(1024, 8, 33792);
+        return;
+    }
+    const size_t generic_block = wave_size == 32 ? 96 : 256;
+    const size_t generic_scratch = generic_block / wave_size * sizeof(float);
+    if(static_cast<size_t>(d) * sizeof(float) + generic_scratch > smem_size)
+    {
+        LAUNCH_SITUV2_RECOMPUTE(1024, 8);
+        return;
+    }
 
     if(d == 768)
     {
@@ -1935,6 +1992,7 @@ void situv2_and_mul_quant(const aiter_tensor_t& out,
 
 #undef LAUNCH_SITUV2
 #undef LAUNCH_SITUV2_SP
+#undef LAUNCH_SITUV2_RECOMPUTE
 }
 
 void gelu_and_mul(const aiter_tensor_t& out,   // [..., d]
@@ -2015,53 +2073,6 @@ __global__ void activation_kernel_vec(DTYPE_I* __restrict__ out,
     }
 }
 
-// Bounds-safe variant of activation_kernel_vec: guards both x0 and x1
-// against numel not being a multiple of VEC_SIZE_I * 2, with a scalar
-// tail loop for any remainder. Used by relu2().
-
-template <typename DTYPE_I, float (*ACT_FN)(const DTYPE_I&), int32_t VEC_SIZE_I>
-__global__ void activation_kernel_vec_safe(DTYPE_I* __restrict__ out,
-                                            const DTYPE_I* __restrict__ input,
-                                            const int64_t numel)
-{
-    using vec_i = opus::vector_t<DTYPE_I, VEC_SIZE_I>;
-    const int64_t stride = gridDim.x * blockDim.x * VEC_SIZE_I * 2;
-
-    for(int64_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * VEC_SIZE_I * 2;
-        idx < numel;
-        idx += stride)
-    {
-        bool has_first  = (idx + VEC_SIZE_I <= numel);
-        bool has_second = (idx + 2 * VEC_SIZE_I <= numel);
-
-        vec_i x0{};
-        vec_i x1{};
-        if (has_first)  x0 = *reinterpret_cast<const vec_i*>(&input[idx]);
-        if (has_second) x1 = *reinterpret_cast<const vec_i*>(&input[idx + VEC_SIZE_I]);
-
-        DTYPE_I* x0_ptr = reinterpret_cast<DTYPE_I*>(&x0);
-        DTYPE_I* x1_ptr = reinterpret_cast<DTYPE_I*>(&x1);
-
-        #pragma unroll
-        for(size_t j = 0; j < VEC_SIZE_I; j++) {
-            if (has_first)  x0_ptr[j] = opus::cast<DTYPE_I>(ACT_FN(x0_ptr[j]));
-            if (has_second) x1_ptr[j] = opus::cast<DTYPE_I>(ACT_FN(x1_ptr[j]));
-        }
-
-        if (has_first)  *reinterpret_cast<vec_i*>(&out[idx]) = x0;
-        if (has_second) *reinterpret_cast<vec_i*>(&out[idx + VEC_SIZE_I]) = x1;
-
-        // Scalar tail for any remainder smaller than a full vec_i.
-        if (!has_first) {
-            for(int64_t k = idx; k < numel; k++)
-                out[k] = opus::cast<DTYPE_I>(ACT_FN(input[k]));
-        } else if (!has_second) {
-            for(int64_t k = idx + VEC_SIZE_I; k < numel; k++)
-                out[k] = opus::cast<DTYPE_I>(ACT_FN(input[k]));
-        }
-    }
-}
-
 } // namespace aiter
 
 #define LAUNCH_ACTIVATION_KERNEL_VEC(KERNEL)                                                \
@@ -2086,33 +2097,6 @@ __global__ void activation_kernel_vec_safe(DTYPE_I* __restrict__ out,
         AITER_DISPATCH_CASE_VEC_SIZE_rmTorch(                                                              \
             vec_size,                                                                              \
             aiter::activation_kernel_vec<input_dtype, KERNEL<input_dtype>, VEC_SIZE>               \
-            <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(out.data_ptr()),           \
-                                         reinterpret_cast<input_dtype*>(input.data_ptr()),         \
-                                         numel);)                                                  \
-    });
-
-#define LAUNCH_ACTIVATION_KERNEL_VEC_SAFE(KERNEL)                                                \
-    int64_t numel      = input.numel();                                                          \
-    int warp_size = static_cast<int>(WARP_SIZE);                                                 \
-    int vec_size       = nextPow2(static_cast<unsigned int>(numel / warp_size));                  \
-    vec_size           = vec_size > max_vec_size ? max_vec_size : vec_size;                        \
-    vec_size           = vec_size < 1 ? 1 : vec_size;                                              \
-    int64_t num_vecs   = (numel + vec_size - 1) / vec_size;                                        \
-    int num_wave       = nextPow2(static_cast<unsigned int>(num_vecs / warp_size));               \
-    num_wave           = num_wave > max_wave_num ? max_wave_num : num_wave;                        \
-    num_wave           = num_wave < 1 ? 1 : num_wave;                                              \
-    int block_size     = num_wave * warp_size;                                                     \
-    int64_t num_blocks = (num_vecs + block_size - 1) / block_size;                                 \
-    num_blocks         = num_blocks > 2048 ? 2048 : num_blocks;                                    \
-    dim3 grid(num_blocks);                                                                         \
-    dim3 block(block_size);                                                                        \
-    HipDeviceGuard device_guard(input.device_id);                                                  \
-    const hipStream_t stream = aiter::getCurrentHIPStream();                                       \
-    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "activation_kernel_vec_safe", [&] {                  \
-        using input_dtype = typename aiter::hip2opus<scalar_t>::type;                              \
-        AITER_DISPATCH_CASE_VEC_SIZE_rmTorch(                                                              \
-            vec_size,                                                                              \
-            aiter::activation_kernel_vec_safe<input_dtype, KERNEL<input_dtype>, VEC_SIZE>               \
             <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(out.data_ptr()),           \
                                          reinterpret_cast<input_dtype*>(input.data_ptr()),         \
                                          numel);)                                                  \
@@ -2149,21 +2133,17 @@ __device__ __forceinline__ float relu2_kernel(const T& x)
 void relu2(const aiter_tensor_t& out,   // [..., d]
            const aiter_tensor_t& input) // [..., d]
 {
-    AITER_CHECK(out.dtype() == input.dtype(),
-                "relu2: out and input dtype must match");
-    AITER_CHECK(input.is_gpu() && out.is_gpu(),
-                "relu2: out and input must be GPU tensors");
-    AITER_CHECK(input.is_contiguous() && out.is_contiguous(),
-                "relu2: out and input must be contiguous");
-    AITER_CHECK(out.device_id == input.device_id,
-                "relu2: out and input must be on the same device");
+    AITER_CHECK(out.is_gpu() && input.is_gpu(),
+                "relu2: input and out must be GPU tensors");
+    AITER_CHECK(out.is_contiguous() && input.is_contiguous(),
+                "relu2: input and out must be contiguous");
     AITER_CHECK(out.numel() == input.numel(),
-                "relu2: out and input must have the same number of elements");
-    if(input.numel() == 0)
-    {
-        return;
-    }
-    LAUNCH_ACTIVATION_KERNEL_VEC_SAFE(aiter::relu2_kernel);
+                "relu2: out.numel must match input.numel");
+    AITER_CHECK(out.dtype() == input.dtype(),
+                "relu2: out dtype must match input dtype");
+    AITER_CHECK(out.device_id == input.device_id,
+                "relu2: input and out must be on the same device");
+    LAUNCH_ACTIVATION_KERNEL_VEC(aiter::relu2_kernel);
 }
 
 } // namespace aiter
