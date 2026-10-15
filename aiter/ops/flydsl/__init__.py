@@ -75,6 +75,7 @@ _LAZY_IMPORTS = {
         ".hstu_attention",
         "flydsl_hstu_attention_fwd",
     ),
+    "flydsl_mega_mhc": (".mega_mhc_kernels", "flydsl_mega_mhc"),
     "flydsl_mla_reduce_v1": (".mla_reduce_kernels", "flydsl_mla_reduce_v1"),
     "flydsl_moe_stage1": (".moe_kernels", "flydsl_moe_stage1"),
     "flydsl_moe_stage2": (".moe_kernels", "flydsl_moe_stage2"),
@@ -116,9 +117,44 @@ _LAZY_IMPORTS = {
         "gather_kv_b_proj_flydsl_supported",
     ),
     "pa_decode": (".pa_decode", "pa_decode"),
+    "prepare_pa_decode_plan": (".pa_decode_tuning", "prepare_pa_decode_plan"),
     "gather_kv_b_proj_flydsl_fp8_supported": (
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl_fp8_supported",
+    ),
+    "minimax_m3_index_score_flydsl": (
+        ".kernels.minimax_m3_index_score",
+        "score_flydsl",
+    ),
+    "minimax_m3_index_score_flydsl_supported": (
+        ".kernels.minimax_m3_index_score",
+        "index_score_supported",
+    ),
+    "minimax_m3_index_score_alloc": (
+        ".kernels.minimax_m3_index_score",
+        "alloc_score",
+    ),
+    "minimax_m3_index_score_work_map": (
+        ".kernels.minimax_m3_index_score",
+        "build_work_map",
+    ),
+    "minimax_m3_index_score_work_map_capacity": (
+        ".kernels.minimax_m3_index_score",
+        "work_map_capacity",
+    ),
+    "minimax_m3_index_score_work_map_size": (
+        ".kernels.minimax_m3_index_score",
+        "work_map_size",
+    ),
+    "minimax_m3_index_score_prefill_flydsl": (
+        ".kernels.minimax_m3_index_score_prefill",
+        "score_prefill_flydsl",
+    ),
+    # Its own, not the decode scorer's: prefill's output is
+    # [heads, total_q, max_block] and is sized from the ragged batch.
+    "minimax_m3_index_score_prefill_alloc": (
+        ".kernels.minimax_m3_index_score_prefill",
+        "alloc_score",
     ),
 }
 
@@ -140,6 +176,7 @@ __all__ = [
     "flydsl_hstu_attention",
     "flydsl_hstu_attention_bwd",
     "flydsl_hstu_attention_fwd",
+    "flydsl_mega_mhc",
     "flydsl_mla_reduce_v1",
     "flydsl_moe_stage1",
     "flydsl_moe_stage2",
@@ -153,7 +190,16 @@ __all__ = [
     "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
     "make_fp4_mqa_plan",
+    "minimax_m3_index_score_alloc",
+    "minimax_m3_index_score_flydsl",
+    "minimax_m3_index_score_flydsl_supported",
+    "minimax_m3_index_score_prefill_alloc",
+    "minimax_m3_index_score_prefill_flydsl",
+    "minimax_m3_index_score_work_map",
+    "minimax_m3_index_score_work_map_capacity",
+    "minimax_m3_index_score_work_map_size",
     "pa_decode",
+    "prepare_pa_decode_plan",
 ]
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
