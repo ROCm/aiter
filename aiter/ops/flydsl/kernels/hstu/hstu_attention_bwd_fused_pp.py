@@ -1333,6 +1333,17 @@ def build_hstu_attention_bwd_fused_pp(
             # cross-group RAW on the tile), still after every operand read has
             # issued, and the slot lifetimes are untouched -- write t_cur, read
             # t_prev, both within this phase.
+            def _dq_stage_chunk(ks):
+                # q = l%16, d = ks*MFMA_M + MFMA_LANE_K*(l/16) + e, so the four
+                # elements are one contiguous run of the
+                # (.., BLOCK_N, head_dim/VEC, VEC) view.
+                dqw[
+                    wave_id,
+                    lane_mod_16,
+                    fx.Int32(ks * MFMA_M // DQ_PER_LANE) + lane_div_16,
+                    None,
+                ].store(Vec(dq_acc[ks]))  # fmt: skip
+
             # ABLATION (`dq_mode`): "nodq" drops all dQ work, "nostore" keeps
             # the GEMM and the LDS reduction but not the HBM flush.
             if const_expr(dq_mode != "nodq"):
@@ -1361,6 +1372,15 @@ def build_hstu_attention_bwd_fused_pp(
                         dq_acc[ks] = mfma_acc(
                             kt_packs[ks][og], ds_t[og], dq_acc[ks]
                         )  # fmt: skip
+                    # Stage the PREVIOUS chunk here, interleaved with the GEMM
+                    # rather than four-in-a-row afterwards. Its accumulator
+                    # chain closed KV_OWNED_SUBTILES MFMAs ago, which is the
+                    # hazard cover an MFMA result needs before a non-MFMA
+                    # consumer, and spreading the writes keeps four b128 off
+                    # the LDS pipe back to back. The LAST chunk has no
+                    # following MFMA, so it stays in the transpose build.
+                    if const_expr(ks >= 1):
+                        _dq_stage_chunk(ks - 1)
 
             rocdl.sched_barrier(0)
 
@@ -1380,17 +1400,12 @@ def build_hstu_attention_bwd_fused_pp(
             # the busiest bank -- the floor. T_GPAD and DQ_PAD=68 are what buy
             # that; removing either doubles the busiest bank to 16.
             def _dq_stage():
+                # Only the last chunk is left: the other three went out
+                # interleaved with the dQ GEMM above. This one has no following
+                # MFMA to cover it, so it keeps the transpose's four
+                # `ds_read_u16` as its hazard cover.
                 if const_expr(dq_mode != "nodq"):
-                    for ks in range_constexpr(K_STEPS):
-                        # q = l%16, d = ks*MFMA_M + MFMA_LANE_K*(l/16) + e, so the
-                        # four elements are one contiguous run of the
-                        # (.., BLOCK_N, head_dim/VEC, VEC) view.
-                        dqw[
-                            wave_id,
-                            lane_mod_16,
-                            fx.Int32(ks * MFMA_M // DQ_PER_LANE) + lane_div_16,
-                            None,
-                        ].store(Vec(dq_acc[ks]))  # fmt: skip
+                    _dq_stage_chunk(K_STEPS - 1)
 
             rocdl.sched_barrier(0)
             if is_g0:
