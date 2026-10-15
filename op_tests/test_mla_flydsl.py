@@ -40,6 +40,7 @@ Examples:
   python3 op_tests/test_mla_flydsl.py --mode ps1
   python3 op_tests/test_mla_flydsl.py --mode ps1 -b 1 -c 1 63 64 65
   python3 op_tests/test_mla_flydsl.py --mode ps1 --varlen --varlen-min-ratio 0.1
+  python3 op_tests/test_mla_flydsl.py --mode ps1 --dtype bf16 -c 1 64 65 2048
   python3 op_tests/test_mla_flydsl.py --mode cp --num-heads 16 96 \\
       --q-seq-len 2 4 --cp-world-size 2 4 8 -c 3 64 1200 --varlen
   python3 op_tests/test_mla_flydsl.py --mode ps1-asm -c 65 2048 8192 --varlen
@@ -79,8 +80,8 @@ SUPPORTED_NUM_Q_HEADS = (16, 32, 64, 96, 128)
 # Query lengths PS1 serves per head count.
 PS1_Q_SEQ_LENS = {
     16: (1, 2, 3, 4),
-    32: (1,),
-    64: (1,),
+    32: (1, 2, 3, 4),
+    64: (1, 2),
     96: (1, 2, 3, 4, 6, 8),
     128: (1,),
 }
@@ -114,6 +115,9 @@ KV_GRANULARITY = 16
 MAX_SPLIT_PER_BATCH = 16
 
 SCALE_MODES = ("unit", "poc")
+# Q/KV types PS1 takes; BF16 runs in the ps1 and cp modes (JIT only).
+DTYPES = {"fp8": dtypes.fp8, "bf16": dtypes.bf16}
+BF16_MODES = ("ps1", "cp")
 _SEED = 20260909
 _PERF_NUM_ITERS = 101
 _PERF_NUM_WARMUP = 5
@@ -269,13 +273,13 @@ def _pack_kv_ps64(kv_logical, seq_lens):
     return kv_buffer, page_indices
 
 
-def _allocate_ps1_metadata(batch, q_seq_len, nhead):
+def _allocate_ps1_metadata(batch, q_seq_len, nhead, qkv_dtype):
     metadata_info = aiter.get_mla_metadata_info_v1(
         batch,
         q_seq_len,
         nhead,
-        dtypes.fp8,
-        dtypes.fp8,
+        qkv_dtype,
+        qkv_dtype,
         is_sparse=False,
         fast_mode=True,
         num_kv_splits=MAX_SPLIT_PER_BATCH,
@@ -287,7 +291,13 @@ def _allocate_ps1_metadata(batch, q_seq_len, nhead):
 
 
 def _build_ps1_metadata(
-    seq_lens, q_seq_len, nhead, qo_indptr, is_cp_round_robin=False, causal=True
+    seq_lens,
+    q_seq_len,
+    nhead,
+    qo_indptr,
+    is_cp_round_robin=False,
+    causal=True,
+    qkv_dtype=dtypes.fp8,
 ):
     device = qo_indptr.device
     kv_indptr = _prefix_sum(seq_lens, device)
@@ -299,7 +309,7 @@ def _build_ps1_metadata(
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
-    ) = _allocate_ps1_metadata(len(seq_lens), q_seq_len, nhead)
+    ) = _allocate_ps1_metadata(len(seq_lens), q_seq_len, nhead, qkv_dtype)
 
     aiter.get_mla_metadata_v1(
         qo_indptr,
@@ -324,8 +334,8 @@ def _build_ps1_metadata(
         max_split_per_batch=MAX_SPLIT_PER_BATCH,
         intra_batch_mode=False,
         is_cp_round_robin=is_cp_round_robin,
-        dtype_q_nope=dtypes.fp8,
-        dtype_kv_nope=dtypes.fp8,
+        dtype_q_nope=qkv_dtype,
+        dtype_kv_nope=qkv_dtype,
     )
 
     num_works = int(work_indptr[-1].item())
@@ -350,22 +360,28 @@ def _build_ps1_metadata(
     }
 
 
-def _build_logical_case(seq_lens, q_seq_len, nhead, scales):
+def _build_logical_case(seq_lens, q_seq_len, nhead, scales, dtype="fp8"):
+    """``dtype`` is the Q/KV type: "fp8" with per-tensor scales, or "bf16"
+    without (its scales are None)."""
     device = torch.device("cuda")
     batch = len(seq_lens)
     total_kv = sum(seq_lens)
+    qkv_dtype = DTYPES[dtype]
     query = torch.randn(
         (batch * q_seq_len, nhead, QK_HEAD_DIM),
         dtype=torch.bfloat16,
         device=device,
-    ).to(dtypes.fp8)
+    ).to(qkv_dtype)
     kv_logical = torch.randn(
         (total_kv, QK_HEAD_DIM),
         dtype=torch.bfloat16,
         device=device,
-    ).to(dtypes.fp8)
-    q_scale, kv_scale = _make_fp8_scales(device, scales)
+    ).to(qkv_dtype)
+    q_scale, kv_scale = (
+        _make_fp8_scales(device, scales) if dtype == "fp8" else (None, None)
+    )
     return {
+        "dtype": qkv_dtype,
         "seq_lens": seq_lens,
         "kv_offsets": [0, *itertools.accumulate(seq_lens)],
         "query": query,
@@ -381,14 +397,16 @@ def _build_logical_case(seq_lens, q_seq_len, nhead, scales):
     }
 
 
-def _prepare_case(batch, ctx_len, q_seq_len, nhead, varlen, min_ratio, scales):
+def _prepare_case(
+    batch, ctx_len, q_seq_len, nhead, varlen, min_ratio, scales, dtype="fp8"
+):
     if batch < 1 or ctx_len < 1:
         raise ValueError(
             f"batch and ctx_len must be positive, got {batch=}, {ctx_len=}"
         )
     torch.manual_seed(_seed_for(batch, ctx_len, q_seq_len, varlen, min_ratio, nhead))
     seq_lens = _make_seq_lens(batch, ctx_len, varlen, min_ratio)
-    return _build_logical_case(seq_lens, q_seq_len, nhead, scales)
+    return _build_logical_case(seq_lens, q_seq_len, nhead, scales, dtype)
 
 
 def _add_ps1_layout(case, causal=True):
@@ -406,6 +424,7 @@ def _add_ps1_layout(case, causal=True):
             case["nhead"],
             case["qo_indptr"],
             causal=causal,
+            qkv_dtype=case["dtype"],
         )
     )
 
@@ -477,11 +496,15 @@ def _decode_output(case, nhead=None):
 # ---------------------------------------------------------------------------
 
 
+def _scale_value(scale):
+    return 1.0 if scale is None else float(scale[0])
+
+
 def _torch_reference(case, softmax_scale, causal=True, return_lse=False):
     query = case["query"].float()
     kv_logical = case["kv_logical"].float()
-    q_scale = float(case["q_scale"][0])
-    kv_scale = float(case["kv_scale"][0])
+    q_scale = _scale_value(case["q_scale"])
+    kv_scale = _scale_value(case["kv_scale"])
     score_scale = softmax_scale * q_scale * kv_scale
     q_seq_len = case["q_seq_len"]
     output = torch.empty(
@@ -529,8 +552,8 @@ def _torch_reference_cp_rank(case, softmax_scale, cp_world_size, cp_rank):
     """
     query = case["query"].float()
     kv_logical = case["kv_logical"].float()
-    q_scale = float(case["q_scale"][0])
-    kv_scale = float(case["kv_scale"][0])
+    q_scale = _scale_value(case["q_scale"])
+    kv_scale = _scale_value(case["kv_scale"])
     score_scale = softmax_scale * q_scale * kv_scale
     q_seq_len = case["q_seq_len"]
     rows = len(case["seq_lens"]) * q_seq_len
@@ -762,6 +785,7 @@ def _row(mode, case, nhead, q_seq_len, **columns):
     """A summary row: the columns every mode shares, then the mode's own."""
     return {
         "mode": mode,
+        "dtype": str(case["dtype"]).removeprefix("torch."),
         "batch": len(case["seq_lens"]),
         "min_ctx": min(case["seq_lens"]),
         "max_ctx": max(case["seq_lens"]),
@@ -781,8 +805,11 @@ def _test_ps1(
     scales,
     varlen=False,
     min_ratio=0.5,
+    dtype="fp8",
 ):
-    case = _prepare_case(batch, ctx_len, q_seq_len, nhead, varlen, min_ratio, scales)
+    case = _prepare_case(
+        batch, ctx_len, q_seq_len, nhead, varlen, min_ratio, scales, dtype
+    )
     _add_ps1_layout(case)
     reference = _torch_reference(case, SOFTMAX_SCALE)
     output = _decode_output(case)
@@ -867,12 +894,15 @@ def _test_cp(
     use_asm=None,
     return_tensors=False,
     return_lse=True,
+    dtype="fp8",
 ):
     """``use_asm`` pins the PS1 stage 1 backend (None leaves mla_decode_fwd's);
     ``return_tensors`` also returns every rank's output and LSE. Without
     ``return_lse`` the kernel writes no LSE, so the ranks are merged with the
     reference LSE and the returned LSEs are None."""
-    case = _prepare_case(batch, ctx_len, q_seq_len, nhead, varlen, min_ratio, scales)
+    case = _prepare_case(
+        batch, ctx_len, q_seq_len, nhead, varlen, min_ratio, scales, dtype
+    )
     min_len = min(case["seq_lens"])
     if min_len < q_seq_len:
         raise ValueError(
@@ -910,7 +940,12 @@ def _test_cp(
                     1, dtype=torch.int32, device=kv_buffer.device
                 )
             metadata = _build_ps1_metadata(
-                local_lens, q_seq_len, nhead, case["qo_indptr"], is_cp_round_robin=True
+                local_lens,
+                q_seq_len,
+                nhead,
+                case["qo_indptr"],
+                is_cp_round_robin=True,
+                qkv_dtype=case["dtype"],
             )
             output = _decode_output(case)
 
@@ -1217,6 +1252,33 @@ def test_mla_flydsl(
         raise ValueError(f"unsupported page_size={page_size}; expected 1 or 64")
 
 
+def test_mla_flydsl_bf16(
+    batch=4,
+    ctx_len=2048,
+    num_q_heads=32,
+    q_seq_len=4,
+    varlen=True,
+    varlen_min_ratio=0.5,
+    num_iters=_PERF_NUM_ITERS,
+    num_warmup=_PERF_NUM_WARMUP,
+):
+    """BF16 PS1 (FlyDSL JIT) against the reference."""
+    _require_gfx()
+    _require_ps1(num_q_heads, q_seq_len)
+    _test_ps1(
+        batch,
+        ctx_len,
+        num_q_heads,
+        q_seq_len,
+        num_iters,
+        num_warmup,
+        "unit",
+        varlen,
+        varlen_min_ratio,
+        dtype="bf16",
+    )
+
+
 def test_ps1_asm_matches_flydsl(
     batch=4,
     ctx_len=2048,
@@ -1404,6 +1466,12 @@ def _parse_args():
         default=0.5,
         help="With --varlen, the shortest length as a fraction of the mean.",
     )
+    parser.add_argument(
+        "--dtype",
+        choices=tuple(DTYPES),
+        default="fp8",
+        help=f"Q/KV type; bf16 runs in {', '.join(BF16_MODES)} (scales unused).",
+    )
     parser.add_argument("--scales", choices=SCALE_MODES, default="unit")
     parser.add_argument("--num-iters", type=int, default=_PERF_NUM_ITERS)
     parser.add_argument("--num-warmup", type=int, default=_PERF_NUM_WARMUP)
@@ -1416,6 +1484,8 @@ def _cases(args):
     timing = (args.num_iters, args.num_warmup, args.scales)
     lengths = (args.varlen, args.varlen_min_ratio)
     cases, skipped = [], collections.Counter()
+    if args.dtype != "fp8" and args.mode not in BF16_MODES:
+        raise ValueError(f"--dtype {args.dtype} runs in {BF16_MODES}, not {args.mode}")
 
     if args.mode == "ps64":
         for batch, ctx_len, num_splits in itertools.product(
@@ -1437,7 +1507,9 @@ def _cases(args):
             continue
         shape = (batch, ctx_len, nhead, q_seq_len)
         if args.mode == "ps1":
-            cases.append(lambda s=shape: _test_ps1(*s, *timing, *lengths))
+            cases.append(
+                lambda s=shape: _test_ps1(*s, *timing, *lengths, dtype=args.dtype)
+            )
         elif args.mode == "ps1-asm":
             for causal, return_lse in itertools.product((True, False), (False, True)):
                 cases.append(
@@ -1462,7 +1534,7 @@ def _cases(args):
                     continue
                 cp_args = (*shape, cp_world_size, *timing, *lengths)
                 if args.mode == "cp":
-                    cases.append(lambda a=cp_args: _test_cp(*a))
+                    cases.append(lambda a=cp_args: _test_cp(*a, dtype=args.dtype))
                     continue
                 for return_lse in (True, False):
                     cases.append(

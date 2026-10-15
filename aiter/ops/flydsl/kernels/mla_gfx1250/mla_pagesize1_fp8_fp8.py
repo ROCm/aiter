@@ -5,11 +5,14 @@
 
 The M direction is split into 16-row groups, head groups times query slots:
   128 heads: four waves of two groups      96 heads: three waves of two groups,
-  64 heads:  four waves of one group       the fourth only gathers
-  32 heads:  two groups, the output columns split over two waves
+  64 heads:  one or two query slots,       the fourth only gathers
+             four waves of one or two groups
+  32 heads:  one, two or four query slots; one slot splits the output columns
+             over two waves, four take two groups per wave
   16 heads:  one, two or four query slots, the output columns split over the rest
 Two groups of a wave are adjacent heads of the same query position: a wave takes
-two only above four groups, which the planner gives one query row per work item.
+two only above four groups. Above 64 heads the planner gives one query row per
+work item; at most 64 it packs up to 128 head rows (four slots at most).
 """
 
 import math
@@ -30,28 +33,30 @@ from ..mega_moe_gfx1250.tdm_gather_shim import (
 )
 from ..tensor_shim import buf_load_scalar, ptr_buf_tensor, ptr_rsrc
 from .mla_common import (
+    BLOCK_THREADS,
+    HEADS_PER_GROUP,
+    MAX_GROUPS_PER_WAVE,
+    NUM_WAVES,
+    PV_D_TILES,
+    QK_HEAD_DIM,
+    QK_NOPE_HEAD_DIM,
+    V_HEAD_DIM,
+    WAVE_SIZE,
     _concat_ds_tr8_b64,
     _concat_wmma_operand,
     _concat_wmma_operand_k64,
+    _drain,
     _instruction_prefetch,
+    _min_u32,
     _rmem_i32,
+    _softmax_all,
+    _unhoisted,
+    _wait_scalars,
     _xor16_f32,
     make_fp8_wmma_atom,
+    wave_layout,
 )
 
-BLOCK_THREADS = 128
-WAVE_SIZE = 32
-NUM_WAVES = BLOCK_THREADS // WAVE_SIZE
-HEADS_PER_GROUP = 16
-MAX_GROUPS_PER_WAVE = 2
-SUPPORTED_NUM_Q_HEADS = (16, 32, 64, 96, 128)
-
-PLANNER_PACKED_Q_BUDGET = 128
-
-QK_NOPE_HEAD_DIM = 512
-QK_ROPE_HEAD_DIM = 64
-QK_HEAD_DIM = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM
-V_HEAD_DIM = QK_NOPE_HEAD_DIM
 Q_HEAD_STRIDE = QK_HEAD_DIM
 
 Q_NOPE_FRAGMENT_COUNT = QK_NOPE_HEAD_DIM // 128
@@ -63,7 +68,6 @@ QK_WMMA_PER_N_TILE = Q_NOPE_FRAGMENT_COUNT + 1
 
 QK_DS_READ_SCHEDULE = (4, 4, 4, 3, 3)
 
-PV_D_TILES = V_HEAD_DIM // 16
 PV_ACC_DWORDS = 8
 PV_LOAD_DEPTH = 8
 
@@ -96,20 +100,6 @@ def kv_row_offset(data_offset: int) -> int:
 KV_RING_BYTES = (KV_QUARTERS - 1) * KV_SEGMENT_BYTES + (
     KV_RING_STAGES * KV_QUARTER_SLOT_BYTES
 )
-
-
-def _unhoisted(value):
-    from flydsl._mlir.dialects import llvm
-
-    return fx.Int32(
-        llvm.inline_asm(
-            T.i32,
-            [fx.Int32(value).ir_value()],
-            "v_mov_b32 $0, $1",
-            "=v,v",
-            has_side_effects=True,
-        )
-    )
 
 
 def _softmax_group(
@@ -204,13 +194,9 @@ def _softmax_group(
     with fx.fastmath(ctx.fm_no_inf):
         for i in range(QK_ACC_DWORDS):
             local_sum = local_sum + sum_vector[i]
-        # Each lane half keeps its own partial sum; the halves share max and
-        # alpha, so they merge once, at the output.
         new_sum = running_sum * alpha + local_sum
     yield
 
-    # One v_cvt_scalef32_pk8_fp8_f32 per n-tile: its 8 probabilities, in
-    # order, become the tile's two P words.
     packed_words = []
     for n_tile in range(KV_N_TILES):
         pair = Vec(
@@ -228,74 +214,6 @@ def _softmax_group(
     out.extend([new_max, new_sum, alpha, needs_rescale, packed_probability_words])
 
 
-def _softmax_all(ctx, qk_accs, running_max, running_sum, valid_count, mask_bounds, out):
-    """The tile's softmax for the wave's groups as a generator, the groups'
-    steps in turn. Appends to `out`, flat: G maxima, G sums, G rescale
-    factors, whether any lane rescales (i32) and G packed P."""
-    results = [[] for _ in range(ctx.G)]
-    yield from _round_robin(
-        [
-            _softmax_group(
-                ctx,
-                qk_accs[g],
-                running_max[g],
-                running_sum[g],
-                valid_count,
-                mask_bounds,
-                results[g],
-            )
-            for g in range(ctx.G)
-        ]
-    )
-    rescales = results[0][3]
-    for g in range(1, ctx.G):
-        rescales = rescales | results[g][3]
-    any_rescale = fx.Int32(rocdl.ballot(T.i32, rescales.ir_value())) != fx.Int32(0)
-    out.extend(
-        [r[0] for r in results]
-        + [r[1] for r in results]
-        + [r[2] for r in results]
-        + [any_rescale.select(fx.Int32(1), fx.Int32(0))]
-        + [r[4] for r in results]
-    )
-
-
-def _round_robin(steppers):
-    active = list(steppers)
-    while active:
-        for stepper in tuple(active):
-            if next(stepper, _DONE) is _DONE:
-                active.remove(stepper)
-            else:
-                yield
-
-
-def _drain(stepper):
-    for _ in stepper:
-        pass
-
-
-_DONE = object()
-
-
-def _min_u32(lhs, rhs):
-    from flydsl._mlir.dialects import arith
-
-    return fx.Int32(arith.minui(fx.Int32(lhs).ir_value(), fx.Int32(rhs).ir_value()))
-
-
-def _wait_scalars(values):
-    from flydsl._mlir.dialects import llvm
-
-    llvm.inline_asm(
-        None,
-        [fx.Int32(value).ir_value() for value in values],
-        "",
-        ",".join(["s"] * len(values)),
-        has_side_effects=True,
-    )
-
-
 INSTRUCTION_PREFETCH_PAGES = 4
 WORK_INFO_DWORDS = 8
 OUTPUT_ROW_PAD_BYTES = 16
@@ -309,35 +227,6 @@ assert OUTPUT_CHUNK_BYTES <= KV_QUARTER_SLOT_BYTES
 LOG2E = math.log2(math.e)
 LAZY_RESCALE_THRESHOLD_LOG2 = 8.0
 _DEFAULT_STREAM = fx.Stream(None)
-
-
-def wave_layout(num_q_heads, max_seqlen_q):
-    if num_q_heads not in SUPPORTED_NUM_Q_HEADS:
-        raise ValueError(
-            f"num_q_heads: expected one of {list(SUPPORTED_NUM_Q_HEADS)}, "
-            f"got {num_q_heads}"
-        )
-    q_tile_rows = 1 if num_q_heads * 2 > PLANNER_PACKED_Q_BUDGET else max_seqlen_q
-    if num_q_heads != HEADS_PER_GROUP and q_tile_rows != 1:
-        raise ValueError(
-            f"num_q_heads={num_q_heads} only supports max_seqlen_q=1, "
-            f"got {max_seqlen_q}"
-        )
-    head_groups = num_q_heads // HEADS_PER_GROUP
-    q_slots = 1 if q_tile_rows == 1 else 2 if q_tile_rows == 2 else 4
-    groups = head_groups * q_slots
-    groups_per_wave = MAX_GROUPS_PER_WAVE if groups > NUM_WAVES else 1
-    assert groups % groups_per_wave == 0
-    assert groups_per_wave == 1 or q_slots == 1
-    m_waves = groups // groups_per_wave
-    dv_waves = NUM_WAVES // m_waves
-    if dv_waves == 0 or PV_D_TILES % dv_waves != 0:
-        raise ValueError(
-            f"num_q_heads={num_q_heads} with max_seqlen_q={max_seqlen_q} needs "
-            f"{m_waves} m-waves, which does not tile {NUM_WAVES} waves x "
-            f"{PV_D_TILES} output tiles"
-        )
-    return q_tile_rows, head_groups, groups_per_wave, m_waves, dv_waves
 
 
 @flyc.jit
@@ -1006,6 +895,7 @@ def launch_mla_pagesize1_fp8_fp8(
 
             def softmax(out):
                 return _softmax_all(
+                    _softmax_group,
                     softmax_ctx,
                     qk_accs,
                     running_max,
