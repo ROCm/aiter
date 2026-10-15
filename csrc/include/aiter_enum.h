@@ -12,7 +12,6 @@ enum class ActivationType : int
     Swiglu   = 2,
     Situv2   = 3,
     GeluTanh = 4,
-    Relu2    = 5,
 };
 
 enum class QuantType : int
