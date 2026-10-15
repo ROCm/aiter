@@ -530,7 +530,10 @@ def gemm_afp4wfp4_preshuffle(
             SCALE_MODE=1 needs both scales in the 128-row packing,
             (rows // 128, (K // 32) * 128); it needs 4 warps and 128 rows or more
             per CTA. A_DATA_PRESHUFFLE=1 needs x from shuffle_weight (same shape,
-            contiguous, M % 16 == 0) and NUM_KSUB=2.
+            contiguous, M % 16 == 0) and NUM_KSUB=2. EPI_SPLIT=2 runs the last WMMA in two
+            N halves and issues each half's TDM store as soon as it is done, overlapping
+            the output store with the remaining WMMAs; it falls back to 1 unless
+            N % (BLOCK_SIZE_N // CTAs along N) == 0.
         skip_reduce (Optional[bool]): skip reduction, y becomes (SPK, M, N) where SPK is determined by config
 
     Returns:
@@ -602,7 +605,7 @@ def gemm_afp4wfp4_preshuffle(
         config["NUM_BUFFERS"] = min(config["NUM_BUFFERS"], k_tiles)
 
         num_ctas = config["num_ctas"]
-        ctas_m, _ = cluster_shape(
+        ctas_m, ctas_n = cluster_shape(
             num_ctas, config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"]
         )
         # The kernel takes a CTA's A scales as preshuffled iff it has 32+ rows.
@@ -611,7 +614,13 @@ def gemm_afp4wfp4_preshuffle(
             f"{config['BLOCK_SIZE_M']}, which num_ctas={num_ctas} splits {ctas_m} ways"
         )
 
-        # SCALE_MODE / NUM_KSUB are opt-in kernel keys; they also select the layouts.
+        # The sliced epilogue stores through a (N / BNc, M, BNc) view of y, BNc = per-CTA N.
+        if config.get("EPI_SPLIT", 1) > 1 and (
+            N % (config["BLOCK_SIZE_N"] // ctas_n) != 0 or config["NUM_BUFFERS"] < 2
+        ):
+            config["EPI_SPLIT"] = 1
+
+        # SCALE_MODE / NUM_KSUB / EPI_SPLIT are opt-in kernel keys; they also select the layouts.
         layouts = get_gemm_afp4wfp4_preshuffle_layouts(
             config["num_warps"],
             config["BLOCK_SIZE_M"],
@@ -621,6 +630,7 @@ def gemm_afp4wfp4_preshuffle(
             config.get("SCALE_MODE", 0),
             config.get("NUM_KSUB", 1),
             config.get("A_DATA_PRESHUFFLE", 0),
+            config.get("EPI_SPLIT", 1),
         )
         if config.get("A_DATA_PRESHUFFLE", 0):
             # The kernel reads shuffled A as its raw (M // 16, K_bytes * 16) layout.

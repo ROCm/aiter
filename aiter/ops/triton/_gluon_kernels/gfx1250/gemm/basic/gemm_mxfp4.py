@@ -32,6 +32,7 @@ def get_gemm_afp4wfp4_preshuffle_layouts(
     scale_mode=0,
     num_ksub=1,
     a_preshuffle=0,
+    epi_split=1,
 ):
     # Building the layouts costs ~1 ms of Python per call and depends only on
     # these ints: build once per config, return a copy (callers may mutate it).
@@ -45,6 +46,7 @@ def get_gemm_afp4wfp4_preshuffle_layouts(
             scale_mode,
             num_ksub,
             a_preshuffle,
+            epi_split,
         )
     )
 
@@ -59,6 +61,7 @@ def _build_gemm_afp4wfp4_preshuffle_layouts(
     scale_mode=0,
     num_ksub=1,
     a_preshuffle=0,
+    epi_split=1,
 ):
     # each CTA computes BLOCK_M // CTAS_M x BLOCK_N // CTAS_N of it.
     CTAS_M, CTAS_N = cluster_shape(num_ctas, BLOCK_M, BLOCK_N)
@@ -152,7 +155,22 @@ def _build_gemm_afp4wfp4_preshuffle_layouts(
         dot_b, [BLOCK_N, K_GROUPS // num_ksub], scale_factor=SCALE_GROUP_ELEMS
     )
 
+    # Sliced epilogue: each CTA's N range is cut into epi_split slices of Q columns. A slice
+    # of the cluster tile is [CTAS_N, BLOCK_M, Q] in a 3D view of C as (N / BNc, M, BNc).
+    BNc = BLOCK_N // CTAS_N
+    Q = BNc // epi_split
+    scale_b_epi = gl.amd.gfx1250.get_wmma_scale_layout(
+        dot_b, [BLOCK_N // epi_split, K_GROUPS // num_ksub], scale_factor=SCALE_GROUP_ELEMS
+    )
+    # slice view [CTAS_N, BLOCK_M, Q]: the per-CTA size-1 dim must be outermost for TDM
+    cga3 = [[bn, bm, 0] for bm, bn in cga_layout]
+    shared_C_epi = gl.PaddedSharedLayout.with_identity_for(
+        [[Q, 8]], [CTAS_N, BLOCK_M, Q], [2, 1, 0], cga3
+    )
+
     return {
+        "b_scale_layout_epi": scale_b_epi,
+        "shared_C_epi": shared_C_epi,
         "wmma_layout": wmma_layout,
         "wmma_acc_layout": wmma_acc_layout,
         "shared_A": shared_A,
@@ -348,6 +366,82 @@ def _load_ksub(
     return cur_A, cur_B, cur_AS, cur_BS
 
 
+@gluon.jit
+def _split_n(x, AXIS: gl.constexpr, CTAS_N: gl.constexpr):
+    # Split the per-CTA N range of x in half (N = (CTAS_N, 2, BNc / 2)); the split bit is a
+    # register bit of the WMMA layouts, so this is free.
+    if AXIS == 1:
+        R: gl.constexpr = x.shape[0]
+        NN: gl.constexpr = x.shape[1]
+        y = x.reshape([R, CTAS_N, 2, NN // CTAS_N // 2]).permute((0, 1, 3, 2))
+        lo, hi = y.split()
+        return lo.reshape([R, NN // 2]), hi.reshape([R, NN // 2])
+    else:
+        NN: gl.constexpr = x.shape[0]
+        C: gl.constexpr = x.shape[1]
+        y = x.reshape([CTAS_N, 2, NN // CTAS_N // 2, C]).permute((0, 2, 3, 1))
+        lo, hi = y.split()
+        return lo.reshape([NN // 2, C]), hi.reshape([NN // 2, C])
+
+
+@gluon.jit
+def _epi_slice(acc_s, cur_A, cur_AS, b_s, bs_s, c_bufs, c3_desc, s: gl.constexpr, off_m, off_n3,
+               Q: gl.constexpr, CTAS_N: gl.constexpr, wmma_acc_layout: gl.constexpr,
+               dot_b_layout: gl.constexpr, b_scale_layout_epi: gl.constexpr):
+    # last WMMA of slice s, then hand the slice to the TDM engine right away
+    acc_s = gl.convert_layout(acc_s, wmma_acc_layout, assert_trivial=True)
+    b_s = gl.convert_layout(b_s, dot_b_layout, assert_trivial=True)
+    bs_s = gl.convert_layout(bs_s, b_scale_layout_epi, assert_trivial=True)
+    if s > 0:
+        # scheduling boundary (an EXEC clobber ends the machine-scheduler region): keeps this
+        # slice's WMMAs after the previous slice's TDM store instead of hoisted above it
+        gl.inline_asm_elementwise(
+            "; epi sched fence", constraints="=s,~{exec}", args=[], dtype=gl.int32,
+            is_pure=False, pack=1,
+        )
+    acc_s = gl.amd.gfx1250.wmma_scaled(cur_A, cur_AS, "e2m1", b_s, bs_s, "e2m1", acc_s)
+    BM: gl.constexpr = acc_s.shape[0]
+    c_bufs.index(s).store(acc_s.to(c_bufs.dtype).reshape([BM, CTAS_N, Q]).permute((1, 0, 2)))
+    gl.amd.gfx1250.tdm.async_store(c3_desc, [off_n3, off_m, s * Q], c_bufs.index(s))
+
+
+@gluon.jit
+def _sliced_final_wmma_store(acc, cur_A, cur_AS, cur_B, cur_BS, c_ptr, M, N, stride_c_m, stride_c_n,
+                             tile_m, tile_n, BLOCK_SIZE_M: gl.constexpr, BLOCK_SIZE_N: gl.constexpr,
+                             CTAS_N: gl.constexpr, EPI_SPLIT: gl.constexpr, wmma_acc_layout: gl.constexpr,
+                             dot_b_layout: gl.constexpr, b_scale_layout_epi: gl.constexpr,
+                             shared_C_epi: gl.constexpr):
+    gl.static_assert(EPI_SPLIT == 2 or EPI_SPLIT == 4)
+    BNc: gl.constexpr = BLOCK_SIZE_N // CTAS_N
+    Q: gl.constexpr = BNc // EPI_SPLIT
+    c_bufs = gl.allocate_shared_memory(
+        c_ptr.type.element_ty, [EPI_SPLIT, CTAS_N, BLOCK_SIZE_M, Q], layout=shared_C_epi)
+    # C viewed as (N / BNc, M, BNc); needs N % BNc == 0
+    c3_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=c_ptr, shape=(N // BNc, M, BNc), strides=(BNc * stride_c_n, stride_c_m, stride_c_n),
+        block_shape=(CTAS_N, BLOCK_SIZE_M, Q), layout=shared_C_epi)
+    off_m = tile_m * BLOCK_SIZE_M
+    off_n3 = tile_n * CTAS_N
+    a0, a1 = _split_n(acc, 1, CTAS_N)
+    b0, b1 = _split_n(cur_B, 1, CTAS_N)
+    s0, s1 = _split_n(cur_BS, 0, CTAS_N)
+    if EPI_SPLIT == 2:
+        _epi_slice(a0, cur_A, cur_AS, b0, s0, c_bufs, c3_desc, 0, off_m, off_n3, Q, CTAS_N, wmma_acc_layout, dot_b_layout, b_scale_layout_epi)  # fmt: skip
+        _epi_slice(a1, cur_A, cur_AS, b1, s1, c_bufs, c3_desc, 1, off_m, off_n3, Q, CTAS_N, wmma_acc_layout, dot_b_layout, b_scale_layout_epi)  # fmt: skip
+    else:
+        # second split: halves of each half (CTAS_N * 2 groups of BNc / 2)
+        a00, a01 = _split_n(a0, 1, CTAS_N)
+        a10, a11 = _split_n(a1, 1, CTAS_N)
+        b00, b01 = _split_n(b0, 1, CTAS_N)
+        b10, b11 = _split_n(b1, 1, CTAS_N)
+        s00, s01 = _split_n(s0, 0, CTAS_N)
+        s10, s11 = _split_n(s1, 0, CTAS_N)
+        _epi_slice(a00, cur_A, cur_AS, b00, s00, c_bufs, c3_desc, 0, off_m, off_n3, Q, CTAS_N, wmma_acc_layout, dot_b_layout, b_scale_layout_epi)  # fmt: skip
+        _epi_slice(a01, cur_A, cur_AS, b01, s01, c_bufs, c3_desc, 1, off_m, off_n3, Q, CTAS_N, wmma_acc_layout, dot_b_layout, b_scale_layout_epi)  # fmt: skip
+        _epi_slice(a10, cur_A, cur_AS, b10, s10, c_bufs, c3_desc, 2, off_m, off_n3, Q, CTAS_N, wmma_acc_layout, dot_b_layout, b_scale_layout_epi)  # fmt: skip
+        _epi_slice(a11, cur_A, cur_AS, b11, s11, c_bufs, c3_desc, 3, off_m, off_n3, Q, CTAS_N, wmma_acc_layout, dot_b_layout, b_scale_layout_epi)  # fmt: skip
+
+
 _gemm_mxfp4_preshuffle_gfx1250_repr = make_kernel_repr(
     "_gemm_mxfp4_preshuffle_gfx1250_kernel",
     [
@@ -404,6 +498,9 @@ def gemm_mxfp4_preshuffle_gfx1250(
     GROUP_M: gl.constexpr = 1,
     A_DATA_PRESHUFFLE: gl.constexpr = 0,
     B2B_WMMA: gl.constexpr = 0,
+    EPI_SPLIT: gl.constexpr = 1,
+    b_scale_layout_epi: gl.constexpr = None,
+    shared_C_epi: gl.constexpr = None,
 ):
     # async_wait counts TDM ops in flight. The compiler fuses each stage's four
     # copies into one op (two with 2 warps, which fuse in pairs).
@@ -712,9 +809,12 @@ def gemm_mxfp4_preshuffle_gfx1250(
             gl.amd.gfx1250.cluster.arrive()
 
         # --- 5. Final WMMA ---
-        acc = gl.amd.gfx1250.wmma_scaled(
-            cur_A, cur_AS, "e2m1", cur_B, cur_BS, "e2m1", acc
-        )
+        if EPI_SPLIT > 1:
+            _sliced_final_wmma_store(acc, cur_A, cur_AS, cur_B, cur_BS, c_ptr, M, N, stride_c_m, stride_c_n, tile_m, tile_n, BLOCK_SIZE_M, BLOCK_SIZE_N, CTAS_N, EPI_SPLIT, wmma_acc_layout, dot_b_layout, b_scale_layout_epi, shared_C_epi)  # fmt: skip
+        else:
+            acc = gl.amd.gfx1250.wmma_scaled(
+                cur_A, cur_AS, "e2m1", cur_B, cur_BS, "e2m1", acc
+            )
 
         if num_ctas > 1:
             gl.amd.gfx1250.cluster.wait()
@@ -800,9 +900,13 @@ def gemm_mxfp4_preshuffle_gfx1250(
                     gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS - 3 - i)
                 if j == NUM_KSUB - 1 and num_ctas > 1:
                     gl.amd.gfx1250.cluster.arrive()
-                acc = gl.amd.gfx1250.wmma_scaled(
-                    cur_A, cur_AS, "e2m1", cur_B, cur_BS, "e2m1", acc
-                )
+                if EPI_SPLIT > 1 and i == NUM_BUFFERS - 2 and j == NUM_KSUB - 1:
+                    # last WMMA in slices, each slice's store issued as soon as it is done
+                    _sliced_final_wmma_store(acc, cur_A, cur_AS, cur_B, cur_BS, c_ptr, M, N, stride_c_m, stride_c_n, tile_m, tile_n, BLOCK_SIZE_M, BLOCK_SIZE_N, CTAS_N, EPI_SPLIT, wmma_acc_layout, dot_b_layout, b_scale_layout_epi, shared_C_epi)  # fmt: skip
+                else:
+                    acc = gl.amd.gfx1250.wmma_scaled(
+                        cur_A, cur_AS, "e2m1", cur_B, cur_BS, "e2m1", acc
+                    )
             if i < NUM_BUFFERS - 2:
                 compute_idx += 1
                 cur_A, cur_B, cur_AS, cur_BS = _load_ksub(smem_A, smem_B, smem_AS, smem_BS, compute_idx % NUM_BUFFERS, 0, BLOCK_SIZE_M, BLOCK_SIZE_N, KSUB_BYTES, KSUB_GROUPS, NUM_KSUB, A_PRESHUFFLE_FACTOR, PRESHUFFLE_FACTOR, SCALE_KWIDTH, dot_a_layout, dot_b_layout, a_scale_layout, b_scale_layout, A_DATA_PRESHUFFLE)  # fmt: skip
@@ -817,23 +921,24 @@ def gemm_mxfp4_preshuffle_gfx1250(
     # Store output via TDM: accumulator → shared memory → global memory.
     # =====================================================================
 
-    c_buffer = gl.allocate_shared_memory(
-        c_ptr.type.element_ty,
-        shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
-        layout=shared_C,
-    )
-    c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=c_ptr,
-        shape=(M, N),
-        strides=(stride_c_m, stride_c_n),
-        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
-        layout=shared_C,
-    )
+    if EPI_SPLIT == 1:
+        c_buffer = gl.allocate_shared_memory(
+            c_ptr.type.element_ty,
+            shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+            layout=shared_C,
+        )
+        c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=c_ptr,
+            shape=(M, N),
+            strides=(stride_c_m, stride_c_n),
+            block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
+            layout=shared_C,
+        )
 
-    c_buffer.store(acc.to(c_ptr.type.element_ty))
+        c_buffer.store(acc.to(c_ptr.type.element_ty))
 
-    gl.amd.gfx1250.tdm.async_store(
-        c_desc, [tile_m * BLOCK_SIZE_M, tile_n * BLOCK_SIZE_N], c_buffer
-    )
+        gl.amd.gfx1250.tdm.async_store(
+            c_desc, [tile_m * BLOCK_SIZE_M, tile_n * BLOCK_SIZE_N], c_buffer
+        )
 
     gl.amd.gfx1250.tdm.async_wait(0)

@@ -38,6 +38,7 @@ SEARCH_SPACE = {
     "kpack": [1, 2],
     "persistent": [True, False],
     "B2B_WMMA": [0, 1],
+    "EPI_SPLIT": [1, 2],
 }
 
 # Families that spell a key differently share its table row and shape rules;

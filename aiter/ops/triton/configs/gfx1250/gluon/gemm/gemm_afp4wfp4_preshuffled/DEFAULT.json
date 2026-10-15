@@ -10,7 +10,8 @@
     "B2B_WMMA": 0,
     "NUM_KSUB": 1,
     "SCALE_MODE": 0,
-    "A_DATA_PRESHUFFLE": 0
+    "A_DATA_PRESHUFFLE": 0,
+    "EPI_SPLIT": 1
   },
   "M_LEQ_256": {
     "BLOCK_SIZE_M": 256,
@@ -23,7 +24,8 @@
     "B2B_WMMA": 0,
     "NUM_KSUB": 1,
     "SCALE_MODE": 0,
-    "A_DATA_PRESHUFFLE": 0
+    "A_DATA_PRESHUFFLE": 0,
+    "EPI_SPLIT": 1
   },
   "any": {
     "BLOCK_SIZE_M": 1024,
@@ -36,6 +38,7 @@
     "B2B_WMMA": 0,
     "NUM_KSUB": 2,
     "SCALE_MODE": 1,
-    "A_DATA_PRESHUFFLE": 1
+    "A_DATA_PRESHUFFLE": 1,
+    "EPI_SPLIT": 2
   }
 }
