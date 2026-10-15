@@ -376,12 +376,14 @@ def _gpu_numa_map() -> str:
 def provenance(args, link: str, extra: list[str] = ()) -> list[str]:
     """Header lines that record everything that changes the numbers."""
     import aiter
+    from aiter.jit.utils.chip_info import get_gfx
 
     p = torch.cuda.get_device_properties(0)
     return [
         f"- generated: {datetime.now().astimezone():%Y-%m-%d %H:%M:%S %Z}",
         (
-            f"- device: {torch.cuda.get_device_name(0)} [{p.gcnArchName}, "
+            #f"- device: {torch.cuda.get_device_name(0)} [{p.gcnArchName}, "
+            f"- device: {torch.cuda.get_device_name(0)} [{get_gfx()}, "
             f"{p.multi_processor_count} CU, {p.total_memory / 2**30:.0f} GiB]"
         ),
         f"- peer link: {link}",
