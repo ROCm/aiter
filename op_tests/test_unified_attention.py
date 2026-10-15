@@ -233,6 +233,7 @@ def test_decode(dtype, depth, layout):
         if dtype not in _LAYER_GRAPH_CHECKED:
             _LAYER_GRAPH_CHECKED.add(dtype)
             check_decode_layer_graphs(dtype)
+            check_decode_workspace_growth(dtype)
     if layout == "linear":
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -320,6 +321,152 @@ def check_decode_layer_graphs(dtype):
     replay_and_check(
         second_graph, second_cases, [0, 1024, 65], "recaptured decode graph"
     )
+
+
+def check_decode_workspace_growth(dtype):
+    from aiter.ops.flydsl import unified_attention_kernels as kernels
+
+    buffers = ("work_info", "reduce_info", "exp_sums", "max_logits", "temporary_output")
+
+    def pointers(workspace):
+        return tuple(workspace[name].data_ptr() for name in buffers)
+
+    def prepare(batch, depth=64):
+        lengths = [depth] * batch
+        linear = make_case([1] * batch, lengths, dtype)
+        case = dict(linear)
+        case["k"], case["v"] = shuffle_kv_cache(case["k"], case["v"])
+        case["shuffled_kv_cache"] = True
+        call = partial(ua.unified_attention, **case, backend="flydsl")
+        return linear, call
+
+    def check(case, label):
+        lengths = case["seqused_k"].tolist()
+        want = reference(case, [1] * len(lengths), lengths)
+        compare(
+            want,
+            case["out"],
+            FP8_REL_ERR[dtype] * want.abs().max().item(),
+            label,
+        )
+
+    def key_for(stream):
+        return (torch.cuda.current_device(), stream.cuda_stream, HKV, H, D, dtype)
+
+    eager_stream = torch.cuda.Stream()
+    eager_stream.wait_stream(torch.cuda.current_stream())
+    key = key_for(eager_stream)
+    assert key not in kernels._PA_DECODE_WORKSPACES
+    with torch.cuda.stream(eager_stream):
+        high_water = 0
+        # Cross each power-of-two boundary, then revisit smaller logical views.
+        for batch in list(range(1, 34, 2)) + list(range(32, 0, -2)):
+            case, call = prepare(batch)
+            call()
+            high_water = max(high_water, batch)
+            state = kernels._PA_DECODE_WORKSPACES[key]
+            assert sum(k == key for k in kernels._PA_DECODE_WORKSPACES) == 1
+            assert state["current"]["captured"] is False
+            assert state["pinned"] == []
+            assert state["current"]["capacity"] == 1 << (high_water - 1).bit_length()
+            check(case, f"eager workspace batch {batch}")
+        workspace = state["current"]
+        for depth in (513, 1024):
+            case, call = prepare(3, depth)
+            assert (
+                kernels._pa_decode_num_partitions(
+                    3, HKV, depth, kernels._num_cu(case["q"].device)
+                )
+                > 1
+            )
+            call()
+            assert state["current"] is workspace and state["pinned"] == []
+            check(case, f"partitioned workspace depth {depth}")
+    eager_stream.synchronize()
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    key = key_for(stream)
+    assert key not in kernels._PA_DECODE_WORKSPACES
+    with torch.cuda.stream(stream):
+        small, small_call = prepare(3)
+        small_call()
+        state = kernels._PA_DECODE_WORKSPACES[key]
+        first = state["current"]
+        assert first["capacity"] == 4
+        first_pointers = pointers(first)
+        small_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(small_graph, stream=stream):
+            small_call()
+        assert first["captured"] is True and state["current"] is first
+
+        medium, medium_call = prepare(17)
+        medium_call()
+        shared = state["current"]
+        assert shared["capacity"] == 32
+        assert len(state["pinned"]) == 1 and state["pinned"][0] is first
+        assert pointers(first) == first_pointers
+        small["seqused_k"].copy_(
+            torch.tensor([0, 1, 63], device="cuda", dtype=torch.int32)
+        )
+        small_graph.replay()
+        check(small, "small graph after growth")
+
+        middle, middle_call = prepare(5)
+        middle_call()
+        medium_call()
+        shared_pointers = pointers(shared)
+        graphs = [(small_graph, small)]
+        for case, call in ((middle, middle_call), (medium, medium_call)):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                call()
+            graphs.append((graph, case))
+            assert state["current"] is shared and pointers(shared) == shared_pointers
+            assert shared["captured"] is True and len(state["pinned"]) == 1
+        for iteration in range(2):
+            for graph, case in reversed(graphs):
+                batch = case["q"].shape[0]
+                lengths = [(i * 17 + iteration * 7) % 65 for i in range(batch)]
+                case["seqused_k"].copy_(
+                    torch.tensor(lengths, device="cuda", dtype=torch.int32)
+                )
+                case["out"].fill_(float("nan"))
+                graph.replay()
+                check(case, f"shared workspace replay {batch}/{iteration}")
+
+        large, large_call = prepare(33)
+        large_call()
+        current = state["current"]
+        assert current["capacity"] == 64 and current["captured"] is False
+        assert len(state["pinned"]) == 2
+        assert state["pinned"][0] is first and state["pinned"][1] is shared
+        assert pointers(first) == first_pointers and pointers(shared) == shared_pointers
+        check(large, "eager growth to 64")
+        for graph, case in graphs:
+            case["seqused_k"].zero_()
+            case["seqused_k"][-1] = 64
+            case["out"].fill_(float("nan"))
+            graph.replay()
+            check(case, "older graph after second growth")
+
+        # Explicit FlyDSL declines before any planner or workspace allocation.
+        _cold, cold_call = prepare(65)
+        current_pointers = pointers(current)
+        cold_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(cold_graph, stream=stream):
+            try:
+                cold_call()
+            except RuntimeError as error:
+                assert "does not support this configuration" in str(error)
+            else:
+                raise AssertionError("insufficient captured workspace did not decline")
+        assert state["current"] is current and pointers(current) == current_pointers
+        assert current["capacity"] == 64 and current["captured"] is False
+        assert len(state["pinned"]) == 2
+        assert key in kernels._PA_DECODE_COLD_CAPTURE_WARNED
+    stream.synchronize()
+    aiter.logger.info("PASS: decode workspace growth and retained graphs (%s)", dtype)
 
 
 @benchmark()

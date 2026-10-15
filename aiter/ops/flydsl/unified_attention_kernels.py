@@ -142,12 +142,13 @@ def _pa_decode_ok(max_seqlen_q, shuffled_kv_cache, out, num_seqs) -> bool:
     )
 
 
-# Serving creates fresh tensor views; geometry and stream retain graph-owned
-# pointers without cross-stream scratch sharing. Never evict captured buffers:
-# captured graphs keep these pointers, so entries live for the process and callers
-# sharing a key must serialize on one stream.
+# One grow-only backing allocation per device/stream/head geometry. Calls use
+# exact-sized views and record a planner refresh before attention/reduction.
+# Serialized captures may share an allocation; retain captured allocations when
+# growth replaces them. Uncaptured replacements are dropped. All eager calls and
+# graph replays sharing storage must be ordered without overlap.
 _PA_DECODE_WORKSPACES = {}
-# Keys already warned about, so each cold captured shape logs once, not per call.
+# Warn once per geometry when capture needs an unprepared or larger workspace.
 _PA_DECODE_COLD_CAPTURE_WARNED = set()
 
 
@@ -169,27 +170,27 @@ def _route_pa_decode(
 ):
     """All-decode call -> FlyDSL pa_decode with fp8 Q. seqused_k is already the
     per-sequence context length, so no cumulative-offset conversion is needed."""
-    from .pa_decode import pa_decode, plan_pa_decode
+    from .pa_decode import PADecodePlan, pa_decode, plan_pa_decode
 
     np_ = _pa_decode_num_partitions(
         num_seqs, num_kv_heads, int(max_seqlen_k), _num_cu(q.device)
     )
     with torch.cuda.device(q.device):
         stream = torch.cuda.current_stream(q.device)
-        budget = num_seqs * num_kv_heads * np_
+        capacity = num_seqs * np_
+        group = q.shape[1] // num_kv_heads
         key = (
             q.device.index,
             stream.cuda_stream,
-            num_seqs,
             num_kv_heads,
-            np_,
             q.shape[1],
             q.shape[2],
             out.dtype,
         )
-        workspace = _PA_DECODE_WORKSPACES.get(key)
+        state = _PA_DECODE_WORKSPACES.get(key)
+        workspace = None if state is None else state["current"]
         capturing = torch.cuda.is_current_stream_capturing()
-        if workspace is None:
+        if workspace is None or capacity > workspace["capacity"]:
             if capturing:
                 if key not in _PA_DECODE_COLD_CAPTURE_WARNED:
                     _PA_DECODE_COLD_CAPTURE_WARNED.add(key)
@@ -201,29 +202,54 @@ def _route_pa_decode(
                         "with the same shape and stream before capture."
                     )
                 return None
-            plan = plan_pa_decode(
-                seqused_k,
-                num_kv_heads,
-                max_partitions=np_,
-                workgroup_budget=budget,
-                query_length=1,
-            )
-            shape = (num_kv_heads, plan.capacity, q.shape[1] // num_kv_heads)
-            workspace = {
-                "plan": plan,
-                "exp_sums": torch.empty(shape, dtype=torch.float32, device=q.device),
-                "max_logits": torch.empty(shape, dtype=torch.float32, device=q.device),
+            backing_capacity = 1 << (capacity - 1).bit_length()
+            scalar_elements = num_kv_heads * backing_capacity * group
+            replacement = {
+                "capacity": backing_capacity,
+                "captured": False,
+                "work_info": torch.empty(
+                    (backing_capacity, 4), dtype=torch.int32, device=q.device
+                ),
+                "reduce_info": torch.empty(
+                    (backing_capacity, 2), dtype=torch.int32, device=q.device
+                ),
+                "exp_sums": torch.empty(
+                    scalar_elements, dtype=torch.float32, device=q.device
+                ),
+                "max_logits": torch.empty(
+                    scalar_elements, dtype=torch.float32, device=q.device
+                ),
                 "temporary_output": torch.empty(
-                    (*shape, q.shape[2]), dtype=out.dtype, device=q.device
+                    scalar_elements * q.shape[2], dtype=out.dtype, device=q.device
                 ),
             }
-            _PA_DECODE_WORKSPACES[key] = workspace
-        else:
-            # Record every planner launch: lengths can change within a capture.
-            # Same-stream attention/reduction consumes this plan before the next refresh.
-            plan = plan_pa_decode(
-                seqused_k, num_kv_heads, query_length=1, plan=workspace["plan"]
-            )
+            if state is None:
+                state = {"current": replacement, "pinned": []}
+                _PA_DECODE_WORKSPACES[key] = state
+            else:
+                if workspace["captured"]:
+                    state["pinned"].append(workspace)
+                state["current"] = replacement
+            workspace = replacement
+
+        shape = (num_kv_heads, capacity, group)
+        scalar_elements = num_kv_heads * capacity * group
+        exp_sums = workspace["exp_sums"][:scalar_elements].view(shape)
+        max_logits = workspace["max_logits"][:scalar_elements].view(shape)
+        temporary_output = workspace["temporary_output"][
+            : scalar_elements * q.shape[2]
+        ].view(*shape, q.shape[2])
+        plan = PADecodePlan(
+            work_info=workspace["work_info"][:capacity],
+            reduce_info=workspace["reduce_info"][:num_seqs],
+            num_kv_heads=num_kv_heads,
+            max_partitions=np_,
+            query_length=1,
+        )
+        if capturing:
+            workspace["captured"] = True
+        # Record every planner launch: lengths can change within a capture.
+        plan = plan_pa_decode(seqused_k, num_kv_heads, query_length=1, plan=plan)
         pa_decode(
             out,
             q,
@@ -240,9 +266,9 @@ def _route_pa_decode(
             value_scale=v_descale.reshape(-1),
             work_plan=plan,
             max_context_length=int(max_seqlen_k),
-            exp_sums=workspace["exp_sums"],
-            max_logits=workspace["max_logits"],
-            temporary_output=workspace["temporary_output"],
+            exp_sums=exp_sums,
+            max_logits=max_logits,
+            temporary_output=temporary_output,
         )
     return out
 
