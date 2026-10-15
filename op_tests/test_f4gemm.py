@@ -22,8 +22,11 @@
 # ============================================================================
 
 import argparse
+import csv
+import functools
 import itertools
 import sys
+from pathlib import Path
 
 import pandas as pd
 import torch
@@ -36,6 +39,7 @@ from aiter.benchmark_data_init import (
     fill_scale_e8m0,
     make_generator,
 )
+from aiter.jit.core import get_asm_dir
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a4w4 import MXFP8_OUT_SCALE_BLOCK, unpack_mxfp8_out_scale
 from aiter.ops.shuffle import (
@@ -65,7 +69,41 @@ _OUT_DTYPE = {"bf16": dtypes.bf16, "fp8": dtypes.fp8}
 PERSISTENT_TG = 256
 
 
-def _report_active_tg(M, N, tile_m, tile_n, label):
+@functools.lru_cache(None)
+def _manifest_configs():
+    with (Path(get_asm_dir()) / "f4gemm/f4gemm.csv").open() as f:
+        return list(csv.DictReader(f))
+
+
+def _kernel_config(M, N, K, intype, outtype, apre, knl_name=None):
+    configs = _manifest_configs()
+    if knl_name and knl_name != "auto":
+        matches = [c for c in configs if c["knl_name"] == knl_name]
+        if not matches:
+            raise ValueError(f"kernel not in f4gemm manifest: {knl_name}")
+        return matches[0]
+    candidates = []
+    for c in configs:
+        if (c["intype"], c["outtype"], int(c["a_preshuffle"])) != (
+            intype,
+            outtype,
+            apre,
+        ):
+            continue
+        if int(c["ps_mode"]) == 0 and not (
+            M > 0
+            and N > 0
+            and K > 0
+            and M % 768 == 0
+            and N % 1024 == 0
+            and K % 256 == 0
+        ):
+            continue
+        candidates.append(c)
+    return min(candidates, key=lambda c: (int(c["ps_mode"]), c["knl_name"]))
+
+
+def _report_active_tg(M, N, tile_m, tile_n, label, ps_mode=1):
     """Warn when the persistent shader's TG slots aren't fully packed.
 
     The .co always launches PERSISTENT_TG (256) threadgroups. The real work is
@@ -76,6 +114,11 @@ def _report_active_tg(M, N, tile_m, tile_n, label):
     tg_m = (M + tile_m - 1) // tile_m
     tg_n = (N + tile_n - 1) // tile_n
     active_tg = tg_m * tg_n
+    if ps_mode == 0:
+        aiter.logger.info(
+            "dispatch to %s: PS mode=0, grid=%dx%d, %d TG", label, tg_n, tg_m, active_tg
+        )
+        return
     wave_active = (
         PERSISTENT_TG if active_tg % PERSISTENT_TG == 0 else active_tg % PERSISTENT_TG
     )
@@ -92,6 +135,11 @@ def _report_active_tg(M, N, tile_m, tile_n, label):
 
 PERF_SHAPES = [(16384, 16384, 16384)]
 FUNC_SHAPES = [
+    # NPS: one cluster, the K6 boundary, and the production shape.
+    (768, 1024, 256),
+    (768, 1024, 1536),
+    (768, 1024, 1792),
+    (1536, 7168, 16384),
     # pure_compute
     (256, 2048, 8192),
     (2048, 8192, 8192),
@@ -467,7 +515,8 @@ def test_gemm(
     # Kernel/.co base name for this config (used for logging, and to derive the
     # mangled knl_name when an explicit dispatch is requested). See
     # hsa/gfx1250/f4gemm/f4gemm.csv. (`pre` is set above.)
-    base = f"f4gemm_{outtype}_{intype}_{pre}_256x256_4x4_ps"
+    cfg = _kernel_config(M, N, K, intype, outtype, apre, knl_name)
+    base = Path(cfg["co_name"]).stem
 
     # Dispatch mode. Default (knl_name=None) is heuristic: kernelName="" lets the
     # aiter op pick the .co from f4gemm.csv by (intype, a_preshuffle, outtype), so
@@ -535,12 +584,12 @@ def test_gemm(
     if check_gluon:
         # Missing ASM kernels must not silently pass a requested comparison.
         ret["gluon bitmatch"] = "not checked"
-    # Structured algo details (f4gemm.csv columns): F4GEMM tiles are always
-    # 256x256 with a 4x4 (cluster_x x cluster_y) cluster; no splitk/unroll axis.
-    ret["tile"] = "256x256"
-    ret["cluster"] = "4x4"
-    # Report TG occupancy for the 256x256 tile.
-    _report_active_tg(M, N, 256, 256, base)
+    ret["tile"] = f'{cfg["tile_m"]}x{cfg["tile_n"]}'
+    ret["cluster"] = f'{cfg["cluster_x"]}x{cfg["cluster_y"]}'
+    ret["ps_mode"] = int(cfg["ps_mode"])
+    _report_active_tg(
+        M, N, int(cfg["tile_m"]), int(cfg["tile_n"]), base, int(cfg["ps_mode"])
+    )
     # Only a missing .co is reported as "not support"; any other failure (OOM,
     # memory fault, shape assert, ...) must propagate, not show as a green cell.
     # An explicit --knl-name that isn't in the cfg is a real error (typo / missing

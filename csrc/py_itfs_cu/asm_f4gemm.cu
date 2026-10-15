@@ -82,13 +82,31 @@ struct __attribute__((packed)) KernelArgs
 // Only fp8 outputs ship ScaleD; other outputs ship 80B (MXFP4) / 88B (NVFP4).
 static_assert(sizeof(KernelArgs) == 96, "f4gemm preload KernelArgs must be 96B");
 
+// The 192x256 NPS shader stores full tiles and synchronizes whole clusters.
+// Restrict it to complete 4x4 clusters and full K256 steps. Other shapes keep
+// the existing persistent kernels, which support partial tiles and K tails.
+template <typename Config>
+static bool supports_shape(const Config& cfg, int M, int N, int K)
+{
+    if(M <= 0 || N <= 0 || K <= 0)
+        return false;
+    const int m_align = cfg.a_preshuffle ? F4GEMM_M_ALIGN_APRE : 1;
+    if(M % m_align || N % F4GEMM_N_ALIGN || K % F4GEMM_K_ALIGN)
+        return false;
+    if(cfg.ps_mode == 1)
+        return true;
+    return cfg.ps_mode == 0 && cfg.tile_m == 192 && cfg.tile_n == 256 &&
+           cfg.cluster_x == 4 && cfg.cluster_y == 4 && cfg.intype == "mxfp4" &&
+           cfg.outtype == "bf16" && cfg.a_preshuffle == 0 && cfg.scale == 1 &&
+           M % (192 * 4) == 0 && N % (256 * 4) == 0 && K % 256 == 0;
+}
+
 static std::tuple<std::string, int> get_heuristic_kernel(
     int M, int N, int K, std::string arch_id, const std::string& intype,
     const std::string& outtype, int a_preshuffle, CFG* cfgs)
 {
-    // (intype, a_preshuffle, outtype) maps to a single .co in the CSV -- the scale
-    // mode is baked into that variant -- so there is no tile/round search: pick
-    // the one variant whose alignment matches.
+    // Prefer the NPS kernel on its supported shapes. Select deterministically
+    // regardless of unordered-map iteration order, with persistent fallback.
     std::string selectedKernelName = "";
 
     for(const auto& el : *cfgs)
@@ -101,12 +119,13 @@ static std::tuple<std::string, int> get_heuristic_kernel(
         if(cfg.outtype != outtype)
             continue;
 
-        const int m_align = a_preshuffle ? F4GEMM_M_ALIGN_APRE : 1;
-        if((M % m_align) != 0 || (N % F4GEMM_N_ALIGN) != 0 || (K % F4GEMM_K_ALIGN) != 0)
+        if(!supports_shape(cfg, M, N, K))
             continue;
 
-        selectedKernelName = el.first;
-        break;
+        if(selectedKernelName.empty() ||
+           cfg.ps_mode < cfgs->at(selectedKernelName).ps_mode ||
+           (cfg.ps_mode == cfgs->at(selectedKernelName).ps_mode && el.first < selectedKernelName))
+            selectedKernelName = el.first;
     }
 
     AITER_CHECK(selectedKernelName != "",
@@ -279,13 +298,17 @@ static void f4gemm_launch(aiter_tensor_t* A,
                 ", outtype=",
                 out_type,
                 ")");
+    AITER_CHECK(supports_shape(cfg, Mdim, Ndim, Kdim),
+                __func__, " selected kernel does not support M/N/K=",
+                Mdim, "/", Ndim, "/", Kdim,
+                "; 192x256 NPS requires MXFP4/BF16/AP0, M%768=0, N%1024=0, K%256=0");
 
     static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
     AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(
         cfg.knl_name, [&]() { return AiterAsmKernel(cfg.knl_name.c_str(), cfg.co_name.c_str()); });
 
-    // ----- Launch geometry: cluster + persistent -----
-    // Every f4gemm .co is a persistent shader, so the launch is fixed-size and
+    // ----- Launch geometry: cluster + manifest PS mode -----
+    // Persistent shaders use a fixed-size launch, which is
     // independent of M/N/K. The tile-walk swizzle is NOT baked into
     // the .co: the shader reads log2(gridX)/log2(gridY) as kernargs, so the host
     // picks the cluster-grid shape here and must ship it. persistent_tg / grid_y
@@ -293,52 +316,59 @@ static void f4gemm_launch(aiter_tensor_t* A,
     const int cluster_x = cfg.cluster_x > 0 ? cfg.cluster_x : 1; // compile-time per .co (CSV)
     const int cluster_y = cfg.cluster_y > 0 ? cfg.cluster_y : 1;
 
-    constexpr int PERSISTENT_TG = 256; // total threadgroups (pow2 * cluster count)
-    constexpr int PERSISTENT_GY = 4;   // cluster-grid Y dim (M dir); gridX derived
-
-    AITER_CHECK((PERSISTENT_TG % (cluster_x * cluster_y)) == 0,
-                __func__, " persistent_tg=", PERSISTENT_TG,
-                " not divisible by cluster_x*cluster_y=", cluster_x * cluster_y);
-    const int clusters = PERSISTENT_TG / (cluster_x * cluster_y);
-    AITER_CHECK(PERSISTENT_GY != 0 && (clusters % PERSISTENT_GY) == 0,
-                __func__, " grid_y=", PERSISTENT_GY,
-                " must be a nonzero divisor of cluster count ", clusters);
-    const int gridY = PERSISTENT_GY;
-    const int gridX = clusters / gridY;
-    // grid_flat advance = 1 << (log2_grid_x + log2_grid_y) must equal the
-    // cluster count, so cluster count and both grid dims must be power-of-two.
-    AITER_CHECK((clusters & (clusters - 1)) == 0,
-                __func__, " persistent cluster count ", clusters, " must be power-of-two");
-    AITER_CHECK((gridX & (gridX - 1)) == 0 && (gridY & (gridY - 1)) == 0,
-                __func__, " persistent gridX=", gridX, " gridY=", gridY,
-                " must each be power-of-two");
-
-    // HIP gridDim must be a multiple of clusterDim per axis: the cluster grid
-    // scaled by the cluster dims.
-    const int gdx = gridX * cluster_x;
-    const int gdy = gridY * cluster_y;
+    int gdx = Ndim / cfg.tile_n;
+    int gdy = Mdim / cfg.tile_m;
     const int gdz = 1;
-
-    unsigned int log2_grid_x = 0;
-    unsigned int log2_grid_y = 0;
-    for(int g = gridX; g > 1; g >>= 1)
-        log2_grid_x++;
-    for(int g = gridY; g > 1; g >>= 1)
-        log2_grid_y++;
-
-    // Persistent shader reads log2(gridX)/log2(gridY). NVFP4 ships them at
-    // dw20/21; MXFP4 has no GlobalScale so the shader reads them from the
-    // GlobalScale slots (dw18/19).
-    if(intype == "nvfp4")
+    if(cfg.ps_mode == 1)
     {
-        args.log2_grid_x = log2_grid_x;
-        args.log2_grid_y = log2_grid_y;
+        constexpr int PERSISTENT_TG = 256; // total threadgroups (pow2 * cluster count)
+        constexpr int PERSISTENT_GY = 4;   // cluster-grid Y dim (M dir); gridX derived
+
+        AITER_CHECK((PERSISTENT_TG % (cluster_x * cluster_y)) == 0,
+                    __func__, " persistent_tg=", PERSISTENT_TG,
+                    " not divisible by cluster_x*cluster_y=", cluster_x * cluster_y);
+        const int clusters = PERSISTENT_TG / (cluster_x * cluster_y);
+        AITER_CHECK(PERSISTENT_GY != 0 && (clusters % PERSISTENT_GY) == 0,
+                    __func__, " grid_y=", PERSISTENT_GY,
+                    " must be a nonzero divisor of cluster count ", clusters);
+        const int gridY = PERSISTENT_GY;
+        const int gridX = clusters / gridY;
+        // grid_flat advance = 1 << (log2_grid_x + log2_grid_y) must equal the
+        // cluster count, so cluster count and both grid dims must be power-of-two.
+        AITER_CHECK((clusters & (clusters - 1)) == 0,
+                    __func__, " persistent cluster count ", clusters, " must be power-of-two");
+        AITER_CHECK((gridX & (gridX - 1)) == 0 && (gridY & (gridY - 1)) == 0,
+                    __func__, " persistent gridX=", gridX, " gridY=", gridY,
+                    " must each be power-of-two");
+
+        // HIP gridDim must be a multiple of clusterDim per axis: the cluster grid
+        // scaled by the cluster dims.
+        gdx = gridX * cluster_x;
+        gdy = gridY * cluster_y;
+
+        unsigned int log2_grid_x = 0;
+        unsigned int log2_grid_y = 0;
+        for(int g = gridX; g > 1; g >>= 1)
+            log2_grid_x++;
+        for(int g = gridY; g > 1; g >>= 1)
+            log2_grid_y++;
+
+        // Persistent shader reads log2(gridX)/log2(gridY). NVFP4 ships them at
+        // dw20/21; MXFP4 has no GlobalScale so the shader reads them from the
+        // GlobalScale slots (dw18/19).
+        if(intype == "nvfp4")
+        {
+            args.log2_grid_x = log2_grid_x;
+            args.log2_grid_y = log2_grid_y;
+        }
+        else
+        {
+            std::memcpy(&args.GlobalScaleA, &log2_grid_x, sizeof(unsigned int));
+            std::memcpy(&args.GlobalScaleB, &log2_grid_y, sizeof(unsigned int));
+        }
     }
-    else
-    {
-        std::memcpy(&args.GlobalScaleA, &log2_grid_x, sizeof(unsigned int));
-        std::memcpy(&args.GlobalScaleB, &log2_grid_y, sizeof(unsigned int));
-    }
+    // NPS uses one WG per full output tile. The final two MXFP4 kernarg
+    // dwords are unused placeholders and remain zero in the 80-byte buffer.
 
     // fp8 output E8M0 scale pointer (set after the persistent block so the log2
     // writes can't clobber it): NVFP4 uses dw22/23; MXFP4 overlays it on dw20/21.

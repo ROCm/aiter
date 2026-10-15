@@ -303,7 +303,7 @@ def gemm_a4w4_asm(
 
 
 @compile_ops(
-    "module_f4gemm_asm",
+    "module_f4gemm_asm_nps",
     fc_name="mxfp4_gemm_asm",
     ffi_type="ctypes",
 )
@@ -320,7 +320,7 @@ def _mxfp4_gemm_asm(
 
 
 @compile_ops(
-    "module_f4gemm_asm",
+    "module_f4gemm_asm_nps",
     fc_name="nvfp4_gemm_asm",
     ffi_type="ctypes",
 )
