@@ -79,9 +79,16 @@ def unified_attention(
     else:
         shuffled_kv_cache = bool(shuffled_kv_cache)
 
+    unified_attention_flydsl = None
     if backend in (None, "flydsl"):
-        from aiter.ops.flydsl.unified_attention import unified_attention_flydsl
-
+        # FlyDSL is absent in AITER_TRITON_ONLY and Windows installs, where this
+        # op ran Triton; only an explicit backend="flydsl" may fail on it.
+        try:
+            from aiter.ops.flydsl.unified_attention import unified_attention_flydsl
+        except ModuleNotFoundError as e:
+            if e.name != "flydsl" or backend == "flydsl":
+                raise
+    if unified_attention_flydsl is not None:
         flydsl_out = unified_attention_flydsl(
             q,
             k,
