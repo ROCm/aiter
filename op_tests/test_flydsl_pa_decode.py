@@ -303,35 +303,41 @@ _PIPE_BASE = {
 }
 _NHD_BASE = {**_PIPE_BASE, "layout": "nhd"}
 _PIPE_CASES = [
-    (
-        "d256-page64",
-        {**_PIPE_BASE, "lengths": (0, 1, 255, 256, 257, 8192), "max_partitions": 8},
-    ),
-    # Above 64 partitions the head-256 reducer splits partitions over four
-    # groups; 130 leaves the last group short, and sequences with few or no
-    # tasks exercise the inactive-partition masking.
-    (
-        "d256-page64-np130",
-        {
-            **_PIPE_BASE,
-            "lengths": (0, 1, 257, 66532),
-            "max_partitions": 130,
-            "budget": 130,
-            "pattern": "one_hot_v",
-            "parallel_reduce": True,
-        },
-    ),
+    # At GQA 8, query length q gives 8 * q rows: one M-tile at 1 and 2 (1 pads
+    # it), two at 3 and 4 (3 pads the second). Lengths put some row's causal
+    # edge on a page or tile boundary, and lengths below q leave rows empty.
+    # P is FP8, so random rows see 0, 1 or at least 6 tokens; the per-token
+    # one-hot query-length-3 case covers 2 to 5 exactly. Packed plain V takes
+    # the same pipe as NHD.
+    #
     # Table padding wider than 4096 page ids per task cannot be staged.
     (
-        "d256-unstaged",
+        "d256-unstaged-q2",
         {
             **_PIPE_BASE,
-            "lengths": (1, 65, 8192),
+            "query_length": 2,
+            "lengths": (0, 1, 65, 257, 8192),
             "max_partitions": 4,
             "budget": 1,
             "table_width": 20000,
             "max_context": None,
             "staged": False,
+        },
+    ),
+    # Above 64 partitions the head-256 reducer splits partitions over four
+    # groups; 130 leaves the last group short, and sequences with few or no
+    # tasks exercise the inactive-partition masking. A dropped row or tile
+    # changes a channel.
+    (
+        "d256-page64-q4-np130",
+        {
+            **_PIPE_BASE,
+            "query_length": 4,
+            "lengths": (0, 1, 257, 66532),
+            "max_partitions": 130,
+            "budget": 130,
+            "pattern": "one_hot_v",
+            "parallel_reduce": True,
         },
     ),
     # A head-major pool of 2**15 + 1 blocks puts KV head 2 past 2**31 bytes, so
@@ -362,37 +368,16 @@ _PIPE_CASES = [
             "nhd_contracts": True,
         },
     ),
-    # Uniform MTP: query_length * 8 rows fill one M-tile at length 2 and two at
-    # 3 and 4 (3 pads the second). Each length puts some row's causal edge on a
-    # page or tile boundary, and lengths below query_length leave rows empty.
-    # P is FP8, so random rows see 0, 1 or at least 6 tokens; the one-hot case
-    # covers 2 to 5 with exact probabilities.
-    (
-        "nhd-d256-page64-q2",
-        {
-            **_NHD_BASE,
-            "query_length": 2,
-            "lengths": (0, 1, 65, 257, 8192),
-            "max_partitions": 8,
-        },
-    ),
-    # Packed plain V takes the same pipe.
-    (
-        "d256-page64-q2",
-        {
-            **_PIPE_BASE,
-            "query_length": 2,
-            "lengths": (0, 1, 65, 257, 8192),
-            "max_partitions": 8,
-        },
-    ),
+    # Two M-tiles always take two V buffers. The longest sequence gives tasks
+    # several tiles that alternate them, and the last task ends mid-page.
     (
         "nhd-d256-page64-q3",
         {
             **_NHD_BASE,
             "query_length": 3,
-            "lengths": (1, 65, 257, 2049),
+            "lengths": (0, 1, 2, 3, 5, 65, 257, 2049),
             "max_partitions": 8,
+            "pattern": "one_hot_token",
         },
     ),
     (
@@ -400,32 +385,10 @@ _PIPE_CASES = [
         {
             **_NHD_BASE,
             "query_length": 4,
-            "lengths": (1, 66, 258, 8192),
+            "lengths": (0, 1, 65, 66, 257, 258, 8258),
             "max_partitions": 8,
+            "nhd_bufs": 2,
             "capture": True,
-        },
-    ),
-    (
-        "nhd-d256-page64-q4-short",
-        {
-            **_NHD_BASE,
-            "query_length": 4,
-            "lengths": (0, 1, 2, 3, 5, 257),
-            "max_partitions": 8,
-            "pattern": "one_hot_token",
-        },
-    ),
-    # Every row must reach the reducer: a dropped row or tile changes a channel.
-    (
-        "nhd-d256-page64-q4-np130",
-        {
-            **_NHD_BASE,
-            "query_length": 4,
-            "lengths": (0, 1, 257, 66532),
-            "max_partitions": 130,
-            "budget": 130,
-            "pattern": "one_hot_v",
-            "parallel_reduce": True,
         },
     ),
 ]
