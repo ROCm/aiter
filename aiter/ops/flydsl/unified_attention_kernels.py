@@ -16,6 +16,8 @@ from functools import lru_cache
 import torch
 from flydsl.utils.env import runtime as _flydsl_runtime
 
+from aiter import logger
+
 from .kernels.flash_attn_func_fp8_gfx950 import (
     _FP8_MAX_FLAT_ELEMS,
     _fp8_auto_block_m,
@@ -145,6 +147,8 @@ def _pa_decode_ok(max_seqlen_q, shuffled_kv_cache, out, num_seqs) -> bool:
 # captured graphs keep these pointers, so entries live for the process and callers
 # sharing a key must serialize on one stream.
 _PA_DECODE_WORKSPACES = {}
+# Keys already warned about, so each cold captured shape logs once, not per call.
+_PA_DECODE_COLD_CAPTURE_WARNED = set()
 
 
 def _route_pa_decode(
@@ -187,6 +191,15 @@ def _route_pa_decode(
         capturing = torch.cuda.is_current_stream_capturing()
         if workspace is None:
             if capturing:
+                if key not in _PA_DECODE_COLD_CAPTURE_WARNED:
+                    _PA_DECODE_COLD_CAPTURE_WARNED.add(key)
+                    logger.warning(
+                        "[FlyDSL] unprepared paged-decode call during graph capture "
+                        f"fell back to Triton (num_seqs={num_seqs}, "
+                        f"num_heads={q.shape[1]}, num_kv_heads={num_kv_heads}, "
+                        f"head_dim={q.shape[2]}). Make one uncaptured warmup call "
+                        "with the same shape and stream before capture."
+                    )
                 return None
             plan = plan_pa_decode(
                 seqused_k,

@@ -57,9 +57,11 @@ def unified_attention(
     contiguous with equal row stride; the block table is int32 with stride-1
     last dim; K/V use the exact linear or shuffled layout. AOT covers bf16 and
     f16 prefill for the H64/Hkv4 shape; other shapes and decode JIT-compile.
-    Decode graph capture requires a warm workspace (first call must be
-    uncaptured), and each captured call records a planner refresh, so
-    sequence lengths may change between replays.
+    A captured decode call requires a workspace warmed by an uncaptured call
+    with the same shape and stream; otherwise it falls back to Triton/Gluon
+    with a one-time warning (``backend="flydsl"`` raises instead). Each
+    captured call records a planner refresh, so sequence lengths may change
+    between replays.
     """
     if backend is not None:
         backend = backend.lower()

@@ -135,7 +135,7 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
                 first, second = pairs[i]
                 # Raw rocdl op: stable fx.gpu.shuffle_xor returns one value per call, so replacing
                 # the dual-output swap needs extra selects/moves (+~10% main-loop VALU on shuffled
-                # BN64/paged, -5-6% prefill on gfx950). No stable dual-output swap at v0.3.4.1.
+                # BN64/paged, 5-6% slower prefill on gfx950). No stable dual-output swap at v0.3.4.1.
                 pair = rocdl.permlane32_swap(
                     pair_ty,
                     fx.as_ir_value(words[first]),
