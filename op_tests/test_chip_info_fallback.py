@@ -60,6 +60,17 @@ def test_arch_fallback_reads_current_device(device1_selected_empty_tool):
     assert chip_info.get_gfx_runtime() == "gfx942"
 
 
+def test_build_target_is_not_the_runtime_arch(device1_selected_empty_tool, monkeypatch):
+    # No tool output and no torch device: an explicit GPU_ARCHS build target
+    # must not be reported as the live GPU, or _needs_arch_rebuild would reject
+    # a prebuilt extension on a GPU-less host instead of skipping the check.
+    monkeypatch.setenv("GPU_ARCHS", "gfx950")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    _clear_caches()
+    with pytest.raises(RuntimeError, match="No gfx arch"):
+        chip_info.get_gfx_runtime()
+
+
 def test_cu_fallback_reads_current_device(device1_selected_empty_tool):
     assert chip_info._torch_cu_num() == 304
     assert chip_info.get_cu_num_custom_op() == 304

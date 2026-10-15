@@ -63,15 +63,6 @@ def _torch_gcn_arch() -> str | None:
     return _gfx_from_text(str(name))
 
 
-def _explicit_gpu_arch() -> str | None:
-    gfx = os.getenv("GPU_ARCHS", "").strip()
-    if not gfx or gfx.lower() == "native":
-        return None
-    if ";" in gfx:
-        gfx = gfx.split(";")[-1].strip()
-    return _gfx_from_text(gfx) or gfx.lower()
-
-
 def _torch_cu_num() -> int | None:
     try:
         props = _current_device_properties()
@@ -93,10 +84,11 @@ def _detect_native() -> list[str]:
                 return [arch]
     except Exception as e:
         raise RuntimeError(f"Get GPU arch from {_GPU_INFO_TOOL} failed: {e}") from e
-    arch = _torch_gcn_arch() or _explicit_gpu_arch()
+    # GPU_ARCHS is a build target, not the running GPU; get_gfx() reads it.
+    arch = _torch_gcn_arch()
     if arch:
         logger.warning(
-            "%s returned no gfx arch; using %s from the live device or GPU_ARCHS",
+            "%s returned no gfx arch; using %s from the live device",
             _GPU_INFO_TOOL,
             arch,
         )
@@ -164,7 +156,7 @@ def get_gfx_runtime() -> str:
     """Return the live GPU arch, using Torch if the GPU info tool is empty.
 
     Prefers rocminfo, or hipinfo on Windows. When that prints no gfx name,
-    uses the HIP device name and then an explicit GPU_ARCHS value. On
+    uses the HIP device name; GPU_ARCHS is never consulted. On
     Windows, a hipinfo failure still falls back to the Torch device name.
     Use for runtime dispatch (tuned kernels, code paths). Use get_gfx()
     for build-time codegen (gen_instances, csrc module-level arch
