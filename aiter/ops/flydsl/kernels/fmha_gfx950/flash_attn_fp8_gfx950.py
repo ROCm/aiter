@@ -347,7 +347,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         l_row = loop_results[1]
         v_o = [loop_results[2 + i] for i in range_constexpr(D_CHUNKS)]
 
-        # No stable approximate-reciprocal API at v0.3.4.1: 1.0 / x lowers to arith.divf (IEEE).
+        # No stable approximate-reciprocal API at v0.4.0: 1.0 / x lowers to arith.divf (IEEE).
         inv_l_rcp = rocdl.rcp(T.f32, fx.as_ir_value(l_row))
         inv_l = fx.Float32(
             (fx.Float32(l_row) > ctx.c_zero_f).select(inv_l_rcp, ctx.c_zero_f)
@@ -445,7 +445,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         m_row = loop_results[0]
         l_row = loop_results[1]
         v_o = [loop_results[2 + i] for i in range_constexpr(D_CHUNKS)]
-        # No stable approximate-reciprocal API at v0.3.4.1: 1.0 / x lowers to arith.divf (IEEE).
+        # No stable approximate-reciprocal API at v0.4.0: 1.0 / x lowers to arith.divf (IEEE).
         inv_l_rcp = rocdl.rcp(T.f32, fx.as_ir_value(l_row))
         inv_l = fx.Float32(
             (fx.Float32(l_row) > ctx.c_zero_f).select(inv_l_rcp, ctx.c_zero_f)

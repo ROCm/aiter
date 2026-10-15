@@ -7,9 +7,9 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
+from flydsl.expr import as_ir_value as as_mlir_value
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
-from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
     DualwaveFp8KernelContext,

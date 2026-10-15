@@ -6,10 +6,10 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl.expr import as_ir_value as as_mlir_value
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
@@ -210,7 +210,7 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
         return acc, den
 
     def pack_output(self, acc, den):
-        # No stable approximate-reciprocal API at v0.3.4.1: 1.0 / x lowers to arith.divf (IEEE).
+        # No stable approximate-reciprocal API at v0.4.0: 1.0 / x lowers to arith.divf (IEEE).
         inv_rcp = rocdl.rcp(T.f32, den)
         inv = (fx.Float32(den) > self.c_zero_f).select(inv_rcp, self.c_zero_f)
         inv4 = Vec.from_elements([fx.Float32(inv)], fx.Float32).broadcast_to(4)

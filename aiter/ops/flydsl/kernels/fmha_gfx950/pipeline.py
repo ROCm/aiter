@@ -10,10 +10,10 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm
+from flydsl.expr import as_ir_value as as_mlir_value
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
@@ -84,7 +84,7 @@ def _attn_mask_vec2_imm(rel_i32, neg_inf_i32, thr_x, thr_y, x_ref_i32, y_ref_i32
 def _reduction_pair(v_f32):
     v_i32 = _bitcast_i32(v_f32)
     pair_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
-    # No stable dual-output lane-swap API at v0.3.4.1; fx.gpu.shuffle_xor is not
+    # No stable dual-output lane-swap API at v0.4.0; fx.gpu.shuffle_xor is not
     # one-for-one (single result, different lowering).
     swapped = rocdl.permlane32_swap(pair_ty, v_i32, v_i32, False, True)
     lhs_i32 = llvm.extractvalue(T.i32, swapped, [0])

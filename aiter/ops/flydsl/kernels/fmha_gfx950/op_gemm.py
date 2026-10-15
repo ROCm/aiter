@@ -7,10 +7,10 @@
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
+from flydsl.expr import as_ir_value as as_mlir_value
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from aiter.ops.flydsl.kernels.fmha_gfx950.operand_layouts import probability_swap_pairs
 from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
@@ -135,7 +135,7 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
                 first, second = pairs[i]
                 # Raw rocdl op: stable fx.gpu.shuffle_xor returns one value per call, so replacing
                 # the dual-output swap needs extra selects/moves (+~10% main-loop VALU on shuffled
-                # BN64/paged, 5-6% slower prefill on gfx950). No stable dual-output swap at v0.3.4.1.
+                # BN64/paged, 5-6% slower prefill on gfx950). No stable dual-output swap at v0.4.0.
                 pair = rocdl.permlane32_swap(
                     pair_ty,
                     fx.as_ir_value(words[first]),
