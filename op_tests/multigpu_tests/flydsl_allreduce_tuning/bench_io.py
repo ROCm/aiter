@@ -111,8 +111,8 @@ def auto_family(
     """The family the shipped policy routes *nbytes* to, or None when FlyDSL
     declines it (``cross_device_reduce``/RCCL, or the unfused path).
 
-    ``accuracy`` is ``fast`` (quantization on: the plain path with quick reduce
-    at INT4, the fused one with ``AITER_FLY_AR_ACCURACY=fast``) or ``exact``.
+    ``accuracy`` is ``fast`` (quantization on, quick reduce at INT4) or
+    ``exact``.
     """
     from aiter.ops.flydsl import allreduce_policy as P
 

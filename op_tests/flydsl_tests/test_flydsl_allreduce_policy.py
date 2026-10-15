@@ -20,6 +20,9 @@ from aiter.dist.device_communicators.custom_all_reduce import (
     CustomAllreduce,
     is_weak_contiguous,
 )
+from aiter.dist.device_communicators.flydsl_backends import (
+    FlyDSLAllReduceRMSNorm,
+)
 from aiter.dist.device_communicators.quick_all_reduce import QuickAllReduce
 from aiter.ops.flydsl import allreduce_policy as P
 from aiter.ops.flydsl.allreduce_policy import (
@@ -488,8 +491,8 @@ if __name__ == "__main__":
 # ==========================
 #
 # The fused kernels have tables of their own, read by the same ``FamilyPolicy``
-# and ``select_rung`` machinery. ``AITER_FLY_AR_ACCURACY`` picks the quantized
-# (``fast``) or the exact windows, and the overrides carry a ``FUSED`` infix.
+# and ``select_rung`` machinery. ``AITER_QUICK_REDUCE_QUANTIZATION=INT4`` opens
+# the quantized windows, and the overrides carry a ``FUSED`` infix.
 
 
 def _fused_row(link, ws, arch):
@@ -529,14 +532,14 @@ def test_fused_dispatch_is_monotone(cell):
 
 
 @pytest.mark.parametrize("cell", CELLS)
-def test_fused_exact_mode_runs_only_the_one_shot(cell):
+def test_fused_unquantized_runs_only_the_one_shot(cell):
     assert _fused_row(*cell).algorithms(quantized=False) == (ONESHOT,)
 
 
 @pytest.mark.parametrize("cell", CELLS)
-def test_fused_fast_mode_reaches_past_the_one_shot(cell):
-    """Quantization pays above the one-shot on every platform, so ``fast``
-    always has a quantized window, and it is unbounded above."""
+def test_fused_quantized_reaches_past_the_one_shot(cell):
+    """Quantization pays above the one-shot on every platform, so there is
+    always a quantized window, and it is unbounded above."""
     row = _fused_row(*cell)
     algs = row.algorithms(quantized=True)
     assert algs[0] == ONESHOT and len(algs) >= 2, algs
@@ -590,23 +593,11 @@ def test_fused_ladder_lookup_rejects_unknown_keys():
 
 
 @pytest.mark.parametrize("cell", CELLS)
-def test_fused_oneshot_max_bytes_follows_the_accuracy_mode(cell):
+def test_fused_oneshot_max_bytes_is_the_window_max(cell):
     link, ws, arch = cell
-    row = _fused_row(*cell)
-    kw = {"world_size": ws, "link": link, "arch": arch}
-    for mode, quantized in (("exact", False), ("fast", True)):
-        with _env(AITER_FLY_AR_ACCURACY=mode):
-            want = row.window(ONESHOT, quantized=quantized).max - 1
-            assert resolve_fused_oneshot_max_bytes(**kw) == want, mode
-
-
-def test_accuracy_mode_env():
-    with _env(AITER_FLY_AR_ACCURACY=""):
-        assert P.accuracy_mode() == P.DEFAULT_ACCURACY == "exact"
-    with _env(AITER_FLY_AR_ACCURACY="FAST"):
-        assert P.accuracy_mode() == "fast"
-    with _env(AITER_FLY_AR_ACCURACY="lossy"):
-        assert P.accuracy_mode() == P.DEFAULT_ACCURACY
+    want = _fused_row(*cell).window(ONESHOT, quantized=False).max - 1
+    got = resolve_fused_oneshot_max_bytes(world_size=ws, link=link, arch=arch)
+    assert got == want
 
 
 def test_fused_overrides_are_separate_from_the_plain_ones():
@@ -623,6 +614,78 @@ def test_fused_overrides_are_separate_from_the_plain_ones():
         assert got.window(ONESHOT, quantized=False) == Window(0, 65536)
         assert got.window(MESH, quantized=True).min == 65536
         assert _resolve() == plain
+
+
+class _FakeFusedEngine:
+    """The geometry methods the fused predicate asks an engine."""
+
+    def supports_hidden(self, hidden):
+        return True
+
+    def pads_hidden(self, hidden):
+        return hidden
+
+
+def _fused_backend(quantized, link="pcie", ws=4, arch="gfx950"):
+    """A ``FlyDSLAllReduceRMSNorm`` with fake engines and every width ready, so
+    no process group or GPU is needed. The families are the ones its
+    constructor builds."""
+    policy = _fused_row(link, ws, arch)
+    b = object.__new__(FlyDSLAllReduceRMSNorm)
+    b.disabled = False
+    b.device = torch.device("cpu")
+    b.policy = policy
+    b._quantized = quantized
+    b._engines = {
+        alg.value: _FakeFusedEngine()
+        for alg in policy.algorithms(quantized=quantized)
+        if quantized != (alg == ONESHOT)
+    }
+    b._ready = {(fam, h) for fam in b._engines for h in (64, 4096)}
+    b._warned_capture = False
+    return b
+
+
+def test_fused_backends_split_the_families():
+    """The exact backend (``CustomAllreduce``) runs only the one-shot; the
+    quantized one (``QuickAllReduce``) only the mesh and the ring, and declines
+    the one-shot's payloads so the exact backend gets them."""
+    policy = _fused_row("pcie", 4, "gfx950")
+    exact, quant = _fused_backend(False), _fused_backend(True)
+    assert set(exact._engines) == {ONESHOT.value}
+    assert ONESHOT.value not in quant._engines and quant._engines
+    small = policy.window(ONESHOT, quantized=False).min + 4096
+    big = policy.window(MESH, quantized=True).min + (64 << 10)
+    assert exact.family_for(small) == ONESHOT.value
+    assert quant.family_for(small) is None
+    assert quant.family_for(big) == policy.select(big, quantized=True).value
+    assert exact.family_for(big) == (
+        ONESHOT.value if policy.window(ONESHOT, quantized=False).contains(big) else None
+    )
+
+
+def test_fused_selector_rejects_what_the_engines_reject():
+    """The fused predicate declines a weakly-contiguous view, a misaligned
+    tensor, a non-bf16 one and a wrong-width weight: once dispatch picks
+    FlyDSL, the engine's exception replaces the fallback."""
+    b = _fused_backend(False)
+    hidden = 4096
+    inp = torch.zeros(4, hidden, dtype=torch.bfloat16)
+    res = torch.zeros_like(inp)
+    w = torch.ones(hidden, dtype=torch.bfloat16)
+    assert b.should_fly_fused_ar_rms(inp, res, w)
+
+    weak = torch.zeros(hidden, 4, dtype=torch.bfloat16).t()
+    assert is_weak_contiguous(weak) and not weak.is_contiguous()
+    assert not b.should_fly_fused_ar_rms(weak, res, w)
+    assert not b.should_fly_fused_ar_rms(inp, weak, w)
+
+    flat = torch.zeros(4 * hidden + 1, dtype=torch.bfloat16)
+    shifted = flat[1:].view(4, hidden)
+    assert shifted.data_ptr() % 16
+    assert not b.should_fly_fused_ar_rms(shifted, res, w)
+    assert not b.should_fly_fused_ar_rms(inp.half(), res, w)
+    assert not b.should_fly_fused_ar_rms(inp, res, w[:-64])
 
 
 def test_fused_hiddens_env():

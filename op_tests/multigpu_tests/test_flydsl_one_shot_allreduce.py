@@ -91,8 +91,8 @@ means the one-shot is faster:
 ``CustomAllreduce``'s fused kernel, and ``cdr+norm`` and ``rccl+norm``, each
 all-reduce followed by ``rmsnorm2d_fwd_with_add``. ``prod`` is what
 ``CudaCommunicator.fused_allreduce_rmsnorm`` runs with the FlyDSL path off,
-and ``route``/``route exact`` the family the fused policy picks in each
-accuracy mode. Its default shapes are ``FUSED_BENCH_SHAPES``.
+and ``route``/``route exact`` the family the fused policy picks with
+quantization on and off. Its default shapes are ``FUSED_BENCH_SHAPES``.
 
 ``flydsl_allreduce_bench.py`` describes how the comparison is kept unbiased.
 The default payloads are the verify sweep's plus the DeepSeek-V4 decode
@@ -1216,6 +1216,161 @@ def test_one_shot_allreduce_dispatch(tp):
     }
 
 
+# Payloads above this are not probed: the quantized windows are unbounded.
+FUSED_DISPATCH_TOP_BYTES = 64 << 20
+# ``out`` and ``residual_out`` floor of a quantized (INT4) fused call, as in
+# test_flydsl_quick_allreduce.
+FUSED_QUANTIZED_SQNR_FLOOR_DB = 18.0
+
+
+def _fused_dispatch_rank(rank: int, tp: int, init_method: str, regime: str) -> dict:
+    """One rank of the fused production-dispatch spawn.
+
+    Stands up the real communicators with ``AITER_FLY_AR=1`` and
+    ``AITER_QUICK_REDUCE_QUANTIZATION=<regime>``, and drives payloads across
+    the fused policy's windows through ``CudaCommunicator.fused_allreduce_rmsnorm``.
+    ``CustomAllreduce`` owns the exact backend (the one-shot), ``QuickAllReduce``
+    the quantized one (the mesh and the ring, INT4 only). A wrapper on each
+    backend records which one ran.
+    """
+    import torch.distributed as dist
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    os.environ["AITER_FLY_AR"] = "1"
+    os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = regime
+    set_custom_all_reduce(True)
+    init_distributed_environment(
+        world_size=tp, rank=rank, distributed_init_method=init_method
+    )
+    ensure_model_parallel_initialized(tp, 1)
+    tp_group = get_tp_group()
+    cpu_group = tp_group.cpu_group
+    comm = tp_group.device_communicator
+    backends = {
+        "exact": getattr(comm.ca_comm, "_fly_rms", None),
+        "quantized": getattr(comm.qr_comm, "_fly_rms", None),
+    }
+    built = {name: b is not None for name, b in backends.items()}
+
+    hidden = FUSED_FRESH_HIDDEN
+    row_bytes = hidden * 2
+    quantized = regime == "INT4"
+    policy = fly_policy.resolve_fused_policy(world_size=tp)
+    probes = []
+    try:
+        ran = []
+        for name, b in backends.items():
+            if b is None:
+                continue
+
+            def fused(*args, _run=b.fly_fused_ar_rms, _name=name, **kw):
+                ran.append(_name)
+                return _run(*args, **kw)
+
+            b.fly_fused_ar_rms = fused
+        # Whole-row payloads at both ends of every window, the quantized ones
+        # too in either regime, and one row past each end of the one-shot.
+        sizes = set()
+        for alg in policy.algorithms(quantized=True):
+            lo, hi = policy.window(alg, quantized=True).inclusive_range()
+            rlo = max(-(-lo // row_bytes), 1) * row_bytes
+            rhi = min(hi, FUSED_DISPATCH_TOP_BYTES) // row_bytes * row_bytes
+            if rlo <= rhi:
+                sizes.update((rlo, rhi))
+                if alg == fly_policy.AllReduceAlgorithm.OneShot:
+                    sizes.add(rhi + row_bytes)
+                    if rlo > row_bytes:
+                        sizes.add(rlo - row_bytes)
+        for nbytes in sorted(sizes):
+            m = nbytes // row_bytes
+            parts, residual, weight = _fused_inputs(m, hidden, tp, device)
+            ran.clear()
+            out, res_out = comm.fused_allreduce_rmsnorm(
+                parts[rank].contiguous(), residual, weight, RMS_EPS
+            )
+            torch.cuda.synchronize()
+            out_ref, res_ref = _fused_reference(parts, residual, weight, RMS_EPS)
+            alg = policy.select(nbytes, quantized=quantized)
+            expect = (
+                None
+                if alg is None
+                else (
+                    "exact"
+                    if alg == fly_policy.AllReduceAlgorithm.OneShot
+                    else "quantized"
+                )
+            )
+            probes.append(
+                {
+                    "nbytes": nbytes,
+                    "expect": expect,
+                    "ran": list(ran),
+                    "out_sqnr_db": _sqnr_db(out_ref.float(), out.float()),
+                    "res_sqnr_db": _sqnr_db(res_ref.float(), res_out.float()),
+                    "res_mismatches": int(
+                        (res_out.view(torch.int16) != res_ref.view(torch.int16)).sum()
+                    ),
+                }
+            )
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier(group=cpu_group)
+        destroy_model_parallel()
+        destroy_distributed_environment()
+    return {"built": built, "probes": probes}
+
+
+@benchmark()
+def test_fused_allreduce_rmsnorm_dispatch(tp, regime):
+    """Production fused dispatch with ``AITER_FLY_AR=1``: custom all-reduce
+    serves the exact one-shot in every regime; quick reduce serves the mesh and
+    the ring at INT4, ahead of the one-shot, and is not built at NONE.
+    """
+    ranks = _spawn(_fused_dispatch_rank, tp, regime=regime)
+    fails = []
+    for rank, r in enumerate(ranks):
+        want_built = {"exact": True, "quantized": regime == "INT4"}
+        if r["built"] != want_built:
+            fails.append(f"rank {rank}: built {r['built']}, expected {want_built}")
+            continue
+        for p in r["probes"]:
+            want = [] if p["expect"] is None else [p["expect"]]
+            if p["ran"] != want:
+                fails.append(
+                    f"rank {rank}: {p['nbytes']} B ran {p['ran']}, expected {want}"
+                )
+                continue
+            if p["expect"] == "exact":
+                if p["out_sqnr_db"] < SQNR_FLOOR_DB:
+                    fails.append(
+                        f"rank {rank}: {p['nbytes']} B out SQNR "
+                        f"{p['out_sqnr_db']:.2f} dB below {SQNR_FLOOR_DB} dB"
+                    )
+                if p["res_mismatches"]:
+                    fails.append(
+                        f"rank {rank}: {p['nbytes']} B residual_out not bit-exact "
+                        f"in {p['res_mismatches']} lanes"
+                    )
+            elif p["expect"] == "quantized":
+                db = min(p["out_sqnr_db"], p["res_sqnr_db"])
+                if db < FUSED_QUANTIZED_SQNR_FLOOR_DB:
+                    fails.append(
+                        f"rank {rank}: {p['nbytes']} B SQNR {db:.2f} dB below "
+                        f"{FUSED_QUANTIZED_SQNR_FLOOR_DB} dB"
+                    )
+    _check(f"fused dispatch tp={tp} {regime}", fails)
+    probes0 = ranks[0]["probes"]
+    return {
+        "gfx": ARCH,
+        "probes": len(probes0),
+        "exact": sum(p["ran"] == ["exact"] for p in probes0),
+        "quantized": sum(p["ran"] == ["quantized"] for p in probes0),
+        "fallback": sum(not p["ran"] for p in probes0),
+        "failures": len(fails),
+    }
+
+
 # Fused all-reduce + RMSNorm
 # ==========================
 
@@ -2281,6 +2436,14 @@ def _verify_fused(tps) -> None:
             ]
         _FAILURES.extend(fused_fails)
         aiter.logger.info("fused tp=%s: %d failures", tp, len(fused_fails))
+    _summarize(
+        "fused allreduce + rmsnorm production dispatch",
+        [
+            test_fused_allreduce_rmsnorm_dispatch(tp, regime)
+            for tp in tps
+            for regime in ("NONE", "INT4")
+        ],
+    )
 
 
 def _candidates(args, operation: str) -> tuple:
@@ -2654,7 +2817,7 @@ def _bench_fused(args, tps, given, link) -> None:
             ),
             (
                 "- `route`: the fused policy's family with "
-                "AITER_FLY_AR_ACCURACY=fast, `route exact` with exact"
+                "AITER_QUICK_REDUCE_QUANTIZATION=INT4, `route exact` without"
             ),
             "- `flydsl vs X` is `X us / flydsl us`: above 1.0 the one-shot is faster",
         ],

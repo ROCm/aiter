@@ -307,24 +307,21 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         qr_comm = self.qr_comm
 
-        # FlyDSL fused first when enabled, ahead of the use_1stage gate. Its
-        # engines live in qr_comm; the windows of the fused policy keep it off
-        # the shapes where cdr_fused:1stage wins.
+        # FlyDSL fused first when enabled. Try first the quantized kernels,
+        # then exact one-shot.
         if (
             not use_general_path
             and x_pad_to_multiple == 0
             and input_n == n
             and not gemma_norm
-            and qr_comm is not None
-            and not qr_comm.disabled
-            and qr_comm.should_fly_allreduce_rmsnorm(input_, res_inp_, weight_)
         ):
-            out, res_out = qr_comm.quick_all_reduce_rmsnorm(
-                input_, res_inp_, weight_, eps, n
-            )
-            assert out is not None
-            assert res_out is not None
-            return out, res_out
+            for comm in (qr_comm, ca_comm):
+                if (
+                    comm is not None
+                    and not comm.disabled
+                    and comm.should_fly_allreduce_rmsnorm(input_, res_inp_, weight_)
+                ):
+                    return comm.fly_allreduce_rmsnorm(input_, res_inp_, weight_, eps)
 
         if (
             not use_1stage

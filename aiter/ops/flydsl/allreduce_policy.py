@@ -601,8 +601,9 @@ def resolve_family_policy(
 #
 # The one-shot window is measured against what the caller would run instead,
 # the fused ``cross_device_reduce`` or RCCL plus a separate RMSNorm, and above
-# it the fused path declines. With ``AITER_FLY_AR_ACCURACY=fast`` the mesh and
-# the ring take the payloads of their windows first.
+# it the fused path declines. With quantization on
+# (``AITER_QUICK_REDUCE_QUANTIZATION=INT4``) the mesh and the ring take the
+# payloads of their windows first.
 FUSED_FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
     # --- gfx942 (MI300X) / xGMI ----------------------------------------------
     # Measured on MI325X. No ring: the mesh wins above the one-shot.
@@ -847,10 +848,6 @@ def fused_qr_row_atoms(
 
 # Host and environment
 
-ACCURACY_ENV = "AITER_FLY_AR_ACCURACY"
-ACCURACY_MODES = ("exact", "fast")
-DEFAULT_ACCURACY = "exact"
-
 # Comma-separated hidden sizes to build the fused engines for at startup. The
 # fused wire layout depends on the width, so a width cannot be built until it
 # is known, and building inside a HIP graph capture is not possible.
@@ -858,27 +855,6 @@ FUSED_HIDDENS_ENV = "AITER_FLY_AR_FUSED_HIDDENS"
 
 # The prefix of the fused window overrides, ``<prefix>_<ALG>_{MIN,MAX}_BYTES``.
 FUSED_ENV_PREFIX = "AITER_FLY_AR_FUSED"
-
-
-def accuracy_mode() -> str:
-    """``"exact"`` (default) or ``"fast"``, from ``AITER_FLY_AR_ACCURACY``.
-
-    ``fast`` opens the quantized windows of the fused policy; ``exact`` keeps
-    only the exact one-shot.
-    """
-    raw = os.environ.get(ACCURACY_ENV)
-    if raw is None or not raw.strip():
-        return DEFAULT_ACCURACY
-    mode = raw.strip().lower()
-    if mode not in ACCURACY_MODES:
-        logger.warning(
-            "FlyDSL all-reduce: ignoring %s=%r, expected one of %s",
-            ACCURACY_ENV,
-            raw,
-            ACCURACY_MODES,
-        )
-        return DEFAULT_ACCURACY
-    return mode
 
 
 def fused_hiddens(extra: tuple[int, ...] = ()) -> tuple[int, ...]:
@@ -926,7 +902,8 @@ def resolve_fused_policy(
     """The fused policy of this rank, with the
     ``AITER_FLY_AR_FUSED_<ALG>_{MIN,MAX}_BYTES`` overrides applied.
 
-    Select with ``quantized=accuracy_mode() == "fast"``.
+    Select with ``quantized=True`` when quantization is on
+    (``AITER_QUICK_REDUCE_QUANTIZATION=INT4``).
     """
     row = fused_family_policy(
         arch=detect_arch() if arch is None else arch,

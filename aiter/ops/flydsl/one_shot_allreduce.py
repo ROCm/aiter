@@ -29,7 +29,6 @@ from .allreduce_host_shared import (
     require_arch,
 )
 from .allreduce_policy import (
-    accuracy_mode,
     fused_oneshot_ladder,
     oneshot_ladder,
     resolve_family_policy,
@@ -81,13 +80,12 @@ def resolve_fused_oneshot_max_bytes(
 ) -> int:
     """Largest payload the fused one-shot should be asked to move, inclusive.
 
-    The maximum of the one-shot window of this rank's fused policy in the
-    current ``AITER_FLY_AR_ACCURACY`` mode, with the environment overrides
-    applied.
+    The maximum of the one-shot window of this rank's fused policy, with the
+    environment overrides applied.
     """
     window = resolve_fused_policy(
         world_size=int(world_size), arch=arch, link=link
-    ).window(AllReduceAlgorithm.OneShot, quantized=accuracy_mode() == "fast")
+    ).window(AllReduceAlgorithm.OneShot, quantized=False)
     return 0 if window is None else window.inclusive_range()[1]
 
 

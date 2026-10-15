@@ -21,8 +21,16 @@ The host classes are in `aiter/ops/flydsl/`:
 |---|---|
 | `one_shot_allreduce.py` | `OneShotAllReduce` and `OneShotAllReduceRMSNorm`, the host classes for the one-shot kernel. |
 | `quick_allreduce.py` | `FlyQuickAllReduce` and `FlyQuickAllReduceRMSNorm`, the host classes for the mesh and the ring. |
-| `allreduce_policy.py` | The payload-size boundaries between the three kernels, and the tuning ladders. |
+| `allreduce_policy.py` | The payload-size boundaries between the three kernels, and the tuning ladders, for the plain and the fused all-reduce. |
 | `allreduce_host_shared.py` | IPC inbox setup, link detection and other host helpers. |
+
+The dispatchers are in `aiter/dist/device_communicators/`:
+
+| File | Contents |
+|---|---|
+| `custom_all_reduce.py` | `CustomAllreduce`. It owns the exact one-shot, plain and fused. |
+| `quick_all_reduce.py` | `QuickAllReduce`. It owns the quantized mesh and ring, plain and fused. |
+| `flydsl_backends.py` | `FlyDSLAllReduceRMSNorm`, the fused backend. `CustomAllreduce` and `QuickAllReduce` each own one instance. |
 
 ## Kernels
 
@@ -125,10 +133,61 @@ levels:
    or RCCL. `FamilyPolicy.select()` gives the algorithm for a payload size.
 
    The mesh and the ring run only with the INT4 quantization regime, and their
-   windows do not overlap. The one-shot is exact and runs in both modes. With quantization on, the mesh/ring takes those payloads first.
+   windows do not overlap. The one-shot is exact and runs in both modes. With
+   quantization on, the mesh and the ring take the payloads of their windows
+   first.
 2. Which configuration of that algorithm runs. Each algorithm has a tuning
    ladder for each arch, link type and world size: `ONESHOT_LADDER`,
    `MESH_ST_LADDER` and `RING_ST_LADDER`.
+
+## Fused all-reduce + RMSNorm
+
+The three kernels can also run with a residual add and an RMSNorm fused into
+the epilogue (`fusion="rmsnorm"`). For each token row:
+
+```text
+residual_out = allreduce(inp) + residual
+out          = rmsnorm(residual_out) * weight
+```
+
+`CudaCommunicator.fused_allreduce_rmsnorm` uses the fused kernels with the
+same split as the plain all-reduce:
+
+* `QuickAllReduce` owns the quantized mesh and ring. It builds them only when
+  `AITER_QUICK_REDUCE_QUANTIZATION=INT4`.
+* `CustomAllreduce` owns the exact one-shot. It builds it in every regime.
+
+The communicator tries `QuickAllReduce` first, then `CustomAllreduce`, and
+both before the other fused kernels. If neither FlyDSL backend takes the call,
+the communicator uses the HIP quick-reduce fused kernel, the
+`CustomAllreduce` fused kernel, or an all-reduce and a separate RMSNorm.
+
+The fused path has its own policy tables in `allreduce_policy.py`:
+`FUSED_FAMILY_POLICIES` for the windows, and `FUSED_ONESHOT_LADDER`,
+`FUSED_MESH_ST_LADDER`, `FUSED_RING_ST_LADDER` and `FUSED_QR_ROW_ATOMS` for the
+configurations. Above the one-shot window, the exact path declines.
+
+The fused path declines a call if:
+
+* a tensor is not bf16, not contiguous, or not 16-byte aligned,
+* the caller asks for gemma norm or a padded output,
+* no build exists for the hidden size. One workgroup covers one row, so only
+  some widths are supported, some of them with padding.
+
+### Hidden sizes and graph capture
+
+The fused wire layout depends on the hidden size, so the engines are built for
+each hidden size. A build allocates an IPC inbox and exchanges handles, which
+is not possible inside a HIP graph capture. Build a width before capture in one
+of these ways:
+
+1. Set `AITER_FLY_AR_FUSED_HIDDENS`. The engines build the widths at startup.
+2. Call `FlyDSLAllReduceRMSNorm.prime(hidden)` on every rank.
+3. Make one call at that width before capture. A warmup pass does this.
+
+If a width is not built when a capture starts, the fused path declines it
+during the capture and logs a warning. The capture then records the unfused
+path. This is slower but correct.
 
 
 ## Environment variables
@@ -195,18 +254,34 @@ payloads first. To move the boundary between the one-shot and the mesh with
 quantization on, set `AITER_FLY_AR_MESH_MIN_BYTES`. To change the payloads that
 the one-shot serves without quantization, set `AITER_FLY_AR_ONESHOT_MAX_BYTES`.
 
+### Fused all-reduce + RMSNorm
+
+| Variable | Effect |
+|---|---|
+| `AITER_FLY_AR_FUSED_HIDDENS` | Comma-separated hidden sizes to build at startup, for example `4096,7168`. |
+| `AITER_FLY_AR_FUSED_ONESHOT_MIN_BYTES` | The minimum of the fused one-shot window. |
+| `AITER_FLY_AR_FUSED_ONESHOT_MAX_BYTES` | The maximum of the fused one-shot window. |
+| `AITER_FLY_AR_FUSED_MESH_MIN_BYTES` | The minimum of the fused mesh window. |
+| `AITER_FLY_AR_FUSED_MESH_MAX_BYTES` | The maximum of the fused mesh window. |
+| `AITER_FLY_AR_FUSED_RING_MIN_BYTES` | The minimum of the fused ring window. |
+| `AITER_FLY_AR_FUSED_RING_MAX_BYTES` | The maximum of the fused ring window. |
+
+The window variables follow the rules of the plain ones above, but they change
+`FUSED_FAMILY_POLICIES`. The plain and the fused variables are independent.
+The `AITER_CUSTOM_AR_*` limits do not apply to the fused one-shot.
+
 ### Related aiter variables
 
 These variables are not new, but they change where the FlyDSL kernels run.
 
 | Variable | Effect on the FlyDSL kernels |
 |---|---|
-| `AITER_QUICK_REDUCE_QUANTIZATION` | Set to `INT4` to use the mesh and the ring. With other values, `QuickAllReduce` does not use them. |
-| `AITER_CUSTOM_AR_MIN_SIZE` | `CustomAllreduce` uses the one-shot only for payloads larger than this value. |
-| `AITER_CUSTOM_AR_MAX_SIZE` | `CustomAllreduce` uses the one-shot only for payloads up to this value. With `0`, the one-shot is not used. |
+| `AITER_QUICK_REDUCE_QUANTIZATION` | Set to `INT4` to use the mesh and the ring, plain and fused. With other values, `QuickAllReduce` does not use them. |
+| `AITER_CUSTOM_AR_MIN_SIZE` | `CustomAllreduce` uses the plain one-shot only for payloads larger than this value. |
+| `AITER_CUSTOM_AR_MAX_SIZE` | `CustomAllreduce` uses the plain one-shot only for payloads up to this value. With `0`, the plain one-shot is not used. |
 
 If the `AITER_CUSTOM_AR_*` window and the one-shot window do not overlap,
-`CustomAllreduce` does not build the one-shot.
+`CustomAllreduce` does not build the plain one-shot.
 
 ### Development variables
 
@@ -233,11 +308,16 @@ with `--tp` needs more GPUs than the node has. The default sweep skips the world
 sizes that do not fit, and fails if none of them does; name a size that fits with
 `--tp` instead.
 
-The `verify` scenario drives the engines directly with `AITER_FLY_AR=0`, but it
-also includes a production-dispatch check. That check drives payloads across the policy
-window boundaries through `CudaCommunicator.all_reduce`. It verifies that
-`_init_fly_backend` / `_init_fly_oneshot` built the slot, that dispatch routes
-the in-window payloads to FlyDSL, and that the result is correct.
+`--operation ar_rmsnorm` selects the fused kernels. Without it, `verify`
+runs the plain and the fused kernels, and `bench` runs the plain ones.
+
+The `verify` scenario drives the engines directly with `AITER_FLY_AR=0`. It
+also has production-dispatch checks, which drive payloads across the window
+boundaries through `CudaCommunicator.all_reduce` and
+`CudaCommunicator.fused_allreduce_rmsnorm`. They verify that the expected
+backends are built, that dispatch routes each payload to the expected backend,
+and that the result is correct. The fused check runs with
+`AITER_QUICK_REDUCE_QUANTIZATION` at `NONE` and at `INT4`.
 
 ```bash
 python3 op_tests/multigpu_tests/test_flydsl_one_shot_allreduce.py --scenario bench --tp 4
@@ -274,7 +354,7 @@ To prevent this, set this variable at the repository root before you run a
 test:
 
 ```bash
-export FLYDSL_EXTRA_SOURCE_DIRS=$PWD/aiter/ops/flydsl/kernels
+export FLYDSL_EXTRA_SOURCE_DIRS=$PWD/aiter/ops/flydsl/kernels/comm
 ```
 
 FlyDSL then includes all the `.py` files in this directory tree in the cache

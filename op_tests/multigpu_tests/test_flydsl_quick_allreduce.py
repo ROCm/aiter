@@ -72,7 +72,7 @@ With ``--operation ar_rmsnorm``, bench times each fused schedule
 ``FUSED_STOCK``: ``hip_fused``, the HIP quick all-reduce's own fused kernel,
 where its row constraint allows, and ``hip+norm``, the HIP quick all-reduce
 followed by ``rmsnorm2d_fwd_with_add``. ``route`` is the family the fused
-policy picks with ``AITER_FLY_AR_ACCURACY=fast``. Its default shapes are
+policy picks with ``AITER_QUICK_REDUCE_QUANTIZATION=INT4``. Its default shapes are
 ``FUSED_BENCH_SHAPES``.
 
 ``flydsl_allreduce_bench.py`` describes how the comparison is kept unbiased.
@@ -2928,7 +2928,7 @@ def _bench_fused_rank(
 
 def _fused_route(policy, nbytes: int) -> str:
     """The family the fused policy routes *nbytes* to with
-    ``AITER_FLY_AR_ACCURACY=fast``, or ``fallback``."""
+    ``AITER_QUICK_REDUCE_QUANTIZATION=INT4``, or ``fallback``."""
     alg = policy.select(nbytes, quantized=True)
     return "fallback" if alg is None else alg.value
 
