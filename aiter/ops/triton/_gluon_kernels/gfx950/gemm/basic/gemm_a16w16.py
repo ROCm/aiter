@@ -213,8 +213,10 @@ def _gemm_a16w16_compute_bound_kernel(
     offs_bn = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, gLoadLayoutB))
     offs_bk = gl.arange(0, BLOCK_K, gl.SliceLayout(1, gLoadLayoutB))
 
-    a_base = a_ptr + pid_m * BLOCK_M * stride_am
-    b_base = b_ptr + pid_n * BLOCK_N * stride_bn
+    # Tile bases in 64-bit: a tile's first element can sit beyond 2^31 elements
+    # (16384x201088 outputs, for one). Offsets within a tile stay 32-bit.
+    a_base = a_ptr + (pid_m * BLOCK_M).to(gl.int64) * stride_am
+    b_base = b_ptr + (pid_n * BLOCK_N).to(gl.int64) * stride_bn
 
     # Rows and columns of the two halves, relative to the tile. On a ragged last
     # tile they are clamped to the matrix edge: the clamped rows and columns load
@@ -494,7 +496,11 @@ def _gemm_a16w16_compute_bound_kernel(
 
     offs_cm = gl.arange(0, BLOCK_M // 2, gl.SliceLayout(1, gStoreLayoutC))
     offs_cn = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, gStoreLayoutC))
-    c_base = c_ptr + pid_m * BLOCK_M * stride_cm + pid_n * BLOCK_N * stride_cn
+    c_base = (
+        c_ptr
+        + (pid_m * BLOCK_M).to(gl.int64) * stride_cm
+        + (pid_n * BLOCK_N).to(gl.int64) * stride_cn
+    )
     c_rows = gl.multiple_of(offs_cm * stride_cm, 8)  # same alignment hint as the loads
     c_tl_offsets = c_rows[:, None] + stride_cn * offs_cn[None, :]
     c_tr_offsets = c_tl_offsets + BLOCK_N * stride_cn // 2
