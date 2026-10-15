@@ -5205,14 +5205,22 @@ inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len,
     // registers them, and nothing launches them there.
     return false;
 #else
-    if(len < 16 * 1024)
+    // The register families' lane counts run from the any-rows range's first
+    // row length to kRegMaxLen, so no row in between drops to the generic
+    // kernel (topk_oneblock_plain_gfx950_serves counts on it).
+    constexpr int64_t kRegMaxLen = 16 * 1024 - 1;
+    constexpr int kEpt512Min     = (kTopkPlainGfx950AnyRowsMinLen + 511) / 512;
+    constexpr int kEpt512Max     = (kRegMaxLen + 511) / 512;
+    constexpr int kEpt1024Min    = (kTopkPlainGfx950AnyRowsMinLen + 1023) / 1024;
+    constexpr int kEpt1024Max    = (kRegMaxLen + 1023) / 1024;
+    if(len <= kRegMaxLen)
     {
         int const num_cu = topk_oneblock_num_cu();
         if((batch_size > 2 * num_cu && len <= 12 * 1024) || batch_size > 4 * num_cu)
         {
             int const ept = static_cast<int>((len + 511) / 512);
-            return topk_oneblock_reg_launch<T, IdxT, 512, WRITE_TOPK_VALUES, 11, 10, 5, 32, true,
-                                            false, false, NanHigh>(
+            return topk_oneblock_reg_launch<T, IdxT, 512, WRITE_TOPK_VALUES, 11, 10, kEpt512Min,
+                                            kEpt512Max, true, false, false, NanHigh>(
                 ept, batch_size, stream, in, len, k, out, out_idx, select_min);
         }
         int const ept = static_cast<int>((len + 1023) / 1024);
@@ -5220,8 +5228,8 @@ inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len,
             return topk_oneblock_reg_launch<T, IdxT, 1024, WRITE_TOPK_VALUES, 11, 10, 5, 5, true,
                                             false, false, NanHigh>(
                 ept, batch_size, stream, in, len, k, out, out_idx, select_min);
-        return topk_oneblock_reg_launch<T, IdxT, 1024, WRITE_TOPK_VALUES, 12, 8, 3, 16, true, true,
-                                        true, NanHigh>(
+        return topk_oneblock_reg_launch<T, IdxT, 1024, WRITE_TOPK_VALUES, 12, 8, kEpt1024Min,
+                                        kEpt1024Max, true, true, true, NanHigh>(
             ept, batch_size, stream, in, len, k, out, out_idx, select_min);
     }
     if(len <= 22 * 1024)
@@ -5257,13 +5265,20 @@ inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len,
 // its `specialized` conditions plus a row length inside the any-rows range.
 // Measured with all 256 CUs of an MI355X only, so smaller parts and
 // partitions answer false.
+// The calls dispatch_topk_oneblock may give a specialised one-block kernel
+// rather than the generic one; dispatch_topk_oneblock and
+// topk_oneblock_plain_gfx950_serves both ask this.
+inline bool topk_oneblock_plain_specialized(bool ranged, bool select_min, int k)
+{
+    return !ranged && !select_min && k == 2048 && topk_oneblock_use_large_bpp();
+}
+
 inline bool topk_oneblock_plain_gfx950_serves(int64_t len, int k, bool ranged,
                                               bool write_values, bool select_min)
 {
-    return !ranged && !write_values && !select_min && k == 2048 &&
+    return !write_values && topk_oneblock_plain_specialized(ranged, select_min, k) &&
            len >= kTopkPlainGfx950AnyRowsMinLen && len <= kTopkPlainGfx950AnyRowsMaxLen &&
-           topk_oneblock_num_cu() >= 256 && topk_oneblock_use_large_bpp() &&
-           topk_oneblock_is_gfx950();
+           topk_oneblock_num_cu() >= 256 && topk_oneblock_is_gfx950();
 }
 
 // The kernels below serve calls with no row range (rowStarts == rowEnds ==
@@ -5289,9 +5304,9 @@ inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, Idx
                  std::is_same_v<IdxT, int> && BlockSize == 1024 && !WRITE_TOPK_VALUES && !STABLE &&
                  phase == Phase::Prefill)
     {
-        bool const specialized = buf != nullptr && topk_oneblock_use_large_bpp() &&
-                                 in_idx == nullptr && rowStarts == nullptr &&
-                                 rowEnds == nullptr && !select_min && k == 2048;
+        bool const specialized = buf != nullptr && in_idx == nullptr &&
+                                 topk_oneblock_plain_specialized(
+                                     rowStarts != nullptr || rowEnds != nullptr, select_min, k);
         if(specialized && topk_oneblock_is_gfx950())
         {
             if(dispatch_topk_plain_gfx950<T, IdxT, WRITE_TOPK_VALUES, NanHigh>(
