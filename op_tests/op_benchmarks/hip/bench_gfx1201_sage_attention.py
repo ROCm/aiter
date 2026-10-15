@@ -6,8 +6,9 @@
 Providers run in interleaved rounds on the same inputs; the reported time is the
 median over rounds of the per-round mean. With --compare_to_ref every provider is
 also checked against an FP32 reference (computed in query chunks). ``sage``/``sage_core``
-use the code object (default backend), ``sage_hip``/``sage_core_hip`` the HIP kernel;
-``*_core`` times the attention kernel alone on prepared inputs.
+use the code object (default backend), ``sage_hip``/``sage_core_hip`` the HIP kernel,
+``sage_h3``/``sage_core_h3`` the H3 bm256 code object (backend="asm_h3", Q quantized
+in-kernel); ``*_core`` times the attention kernel alone on prepared inputs.
 """
 
 import argparse
@@ -39,15 +40,29 @@ def parse_shape(text):
 
 def make_providers(names):
     providers = {}
-    for backend, suffix in (("asm", ""), ("hip", "_hip")):
+    for backend, suffix in (("asm", ""), ("hip", "_hip"), ("asm_h3", "_h3")):
         if f"sage{suffix}" in names:
             providers[f"sage{suffix}"] = (
                 lambda q, k, v, b=backend: torch.ops.aiter.gfx1201_sage_attention(
                     q, k, v, backend=b
                 )
             )
-        if f"sage_core{suffix}" in names:
-            cache = {}
+        if f"sage_core{suffix}" not in names:
+            continue
+        cache = {}
+
+        if backend == "asm_h3":
+            # The H3 core takes raw BF16 Q, so only K/V are prepared ahead of the timed region.
+            def core(q, k, v, cache=cache):
+                key = (q.data_ptr(), q.shape)
+                if key not in cache:
+                    cache.clear()
+                    cache[key] = aiter.gfx1201_sage_prepare_h3(k, v)
+                return aiter.gfx1201_sage_attention_h3_fwd(
+                    q, *cache[key], q.shape[-1] ** -0.5
+                )
+
+        else:
 
             def core(q, k, v, b=backend, cache=cache):
                 key = (q.data_ptr(), q.shape)
@@ -58,7 +73,7 @@ def make_providers(names):
                     *cache[key], q.shape[1], backend=b
                 )[:, : q.shape[1]]
 
-            providers[f"sage_core{suffix}"] = core
+        providers[f"sage_core{suffix}"] = core
     if "sdpa" in names:
         providers["sdpa"] = lambda q, k, v: F.scaled_dot_product_attention(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
@@ -142,6 +157,8 @@ def main():
         default=[
             "sage",
             "sage_core",
+            "sage_h3",
+            "sage_core_h3",
             "sage_hip",
             "sage_core_hip",
             "sdpa",

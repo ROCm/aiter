@@ -2121,5 +2121,35 @@
         "blob_gen_cmd": [
             "f'{AITER_META_DIR}/hsa/codegen.py -m sage_attn --output_dir {{}}'"
         ]
+    },
+    "module_gfx1201_sage_prepare_h3": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/gfx1201_sage_prepare_h3_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/gfx1201_sage_prepare_h3.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffp-contract=off'",
+            "'-fno-gpu-flush-denormals-to-zero'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
+    "module_gfx1201_sage_attention_h3_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_gfx1201_sage_attention_h3.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": [
+            "f'{AITER_META_DIR}/hsa/codegen.py -m sage_attn_h3 --output_dir {{}}'"
+        ]
     }
 }
