@@ -20,6 +20,7 @@ from aiter.ops.triton.gluon.pa_decode_gluon import (
     get_recommended_splits,
     pa_decode_gluon,
 )
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.test_common import benchmark, checkAllclose, perftest
 
 try:
@@ -229,8 +230,11 @@ def create_kv_cache(
     seed: int = 0,
     device: str | None = "cuda",
     itemsize: int = 1,
+    value_head_size: int | None = None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """Create key and value cache tensors."""
+    if value_head_size is None:
+        value_head_size = head_size
     if cache_dtype == "fp8" and head_size % 16:
         raise ValueError(
             f"Does not support key cache of type fp8 with head_size {head_size}"
@@ -257,7 +261,7 @@ def create_kv_cache(
             raise ValueError(f"Does not support key cache of type {cache_dtype}")
         key_caches.append(key_cache)
 
-    value_cache_shape = (num_blocks, num_heads, head_size, block_size)
+    value_cache_shape = (num_blocks, num_heads, value_head_size, block_size)
     value_caches: list[torch.Tensor] = []
     for _ in range(num_layers):
         value_cache = torch.empty(
@@ -359,18 +363,21 @@ def torch_mha_extend(
     sliding_window=0,
 ) -> torch.Tensor:
     """PyTorch reference implementation of paged attention."""
-    _num_blocks, num_heads, head_size, block_size = value_cache.shape
-    softmax_scale = 1.0 / (head_size**0.5)
+    _num_blocks, num_heads, value_head_size, block_size = value_cache.shape
+    key_head_size = key_cache.shape[2] * key_cache.shape[4]
+    softmax_scale = 1.0 / (key_head_size**0.5)
 
     output_dtype = query.dtype
     kv_dtype = key_cache.dtype
 
     queries_split = torch.tensor_split(query, query_output_indptr.tolist()[1:])
     key_cache_flat = (
-        key_cache.permute(0, 3, 1, 2, 4).contiguous().view(-1, num_heads, head_size)
+        key_cache.permute(0, 3, 1, 2, 4).contiguous().view(-1, num_heads, key_head_size)
     )
     value_cache_flat = (
-        value_cache.permute(0, 3, 1, 2).contiguous().view(-1, num_heads, head_size)
+        value_cache.permute(0, 3, 1, 2)
+        .contiguous()
+        .view(-1, num_heads, value_head_size)
     )
 
     batch_size = query_output_indptr.shape[0] - 1
@@ -879,7 +886,8 @@ def quantize_kv_cache_symmetric(
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
     """Apply symmetric per-token quantization to KV cache."""
-    num_blocks, num_heads, head_dim, block_size = value_cache.shape
+    num_blocks, num_heads, value_head_size, block_size = value_cache.shape
+    key_head_size = key_cache.shape[2] * key_cache.shape[4]
     total_tokens = num_blocks * block_size
 
     key_cache_reshaped = (
@@ -908,7 +916,7 @@ def quantize_kv_cache_symmetric(
             num_blocks,
             num_heads,
             block_size,
-            head_dim // elements_per_vector,
+            key_head_size // elements_per_vector,
             elements_per_vector,
         )
         .permute(0, 1, 3, 2, 4)
@@ -922,7 +930,7 @@ def quantize_kv_cache_symmetric(
     )
 
     quantized_values = (
-        quantized_values.view(num_blocks, num_heads, block_size, head_dim)
+        quantized_values.view(num_blocks, num_heads, block_size, value_head_size)
         .permute(0, 1, 3, 2)
         .contiguous()
     )
@@ -951,7 +959,8 @@ def quantize_kv_cache_per_tensor(
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
     """Apply per-tensor quantization to KV cache."""
-    num_blocks, num_heads, head_dim, block_size = value_cache.shape
+    num_blocks, num_heads, _value_head_size, block_size = value_cache.shape
+    key_head_size = key_cache.shape[2] * key_cache.shape[4]
     elements_per_vector = 16 // quant_dtype.itemsize
 
     key_cache_reshaped = (
@@ -964,7 +973,7 @@ def quantize_kv_cache_per_tensor(
             num_blocks,
             num_heads,
             block_size,
-            head_dim // elements_per_vector,
+            key_head_size // elements_per_vector,
             elements_per_vector,
         )
         .permute(0, 1, 3, 2, 4)
@@ -1022,6 +1031,7 @@ def prepare_gluon_query_and_scale(
     num_query_heads: int,
     num_kv_heads: int,
     head_size: int,
+    value_head_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Prepare inputs for Gluon kernel by reshaping and transposing tensors.
@@ -1029,16 +1039,20 @@ def prepare_gluon_query_and_scale(
     Args:
         quantized_query: Quantized query tensor [batch_size * query_length, num_query_heads, head_size]
         query_scale_factors: Query scale factors [batch_size * query_length, num_query_heads, 1] or scalar
-        reference_output_quant: Reference output tensor [batch_size * query_length, num_query_heads, head_size]
+        reference_output_quant: Reference output tensor [batch_size * query_length, num_query_heads, value_head_size]
         batch_size: Batch size
         query_length: Query sequence length
         num_query_heads: Number of query heads
         num_kv_heads: Number of key-value heads
         head_size: Head dimension size
+        value_head_size: Value/output head dimension. Defaults to head_size.
 
     Returns:
         Tuple of (quantized_query_gluon, query_scale_gluon, output_gluon)
     """
+    if value_head_size is None:
+        value_head_size = head_size
+
     quantized_query_gluon = quantized_query
     query_scale_gluon = query_scale_factors
     output_gluon = torch.empty_like(reference_output_quant)
@@ -1057,10 +1071,16 @@ def prepare_gluon_query_and_scale(
 
         # Reshape and transpose output tensor for Gluon kernel
         output_gluon = output_gluon.reshape(
-            batch_size, query_length, num_kv_heads, query_group_size, head_size
+            batch_size,
+            query_length,
+            num_kv_heads,
+            query_group_size,
+            value_head_size,
         )
         output_gluon = output_gluon.transpose(1, 2).reshape(
-            batch_size, num_kv_heads * query_length * query_group_size, head_size
+            batch_size,
+            num_kv_heads * query_length * query_group_size,
+            value_head_size,
         )
 
         # Handle query scale factors based on quantization mode
@@ -1104,15 +1124,15 @@ def run_gluon_kernel(
     """Run Gluon FP8/BF16/FP16 kernel for paged attention.
 
     Args:
-        output: Output tensor [num_seqs * query_length, num_query_heads, head_size]
+        output: Output tensor [num_seqs * query_length, num_query_heads, value_head_size]
         query: Query tensor [num_seqs * query_length, num_query_heads, head_size]
         key_cache: Key cache tensor [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
-        value_cache: Value cache tensor [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
+        value_cache: Value cache tensor [num_blocks, num_kv_heads, value_head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, value_head_size, x]
         context_lengths: Current context lengths for each sequence [num_seqs]
         block_tables: Mapping from sequences to physical cache blocks [num_seqs, max_num_blocks_per_seq]
         softmax_scale: Softmax scale factor, typically 1/sqrt(head_size)
         query_length: Query sequence length
-        max_context_length: Maximum sequence length supported
+        max_context_partition_num: Maximum number of context partitions
         context_partition_size: Context partition size
         compute_type: Compute data type (torch.dtype)
         query_scale: Query scale tensor [num_seqs * query_length, num_query_heads, 1] or [1]
@@ -1120,7 +1140,7 @@ def run_gluon_kernel(
         value_scale: Value scale tensor [num_blocks, num_kv_heads, kv_block_size, 1]
         exp_sums: Exponential sums tensor [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
         max_logits: Max logits tensor [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
-        temporary_output: Temporary output tensor [num_seqs, num_kv_heads, max_context_partition_num, query_group_size, head_size]
+        temporary_output: Temporary output tensor [num_seqs, num_kv_heads, max_context_partition_num, query_length * query_group_size, value_head_size]
         alibi_slopes: Optional ALiBi slopes tensor
         sinks: Optional sinks tensor for attention sinks
         sliding_window: Sliding window size (default: 0, disabled)
@@ -1177,6 +1197,7 @@ def run_pa_gluon_test(
     use_sinks: bool,
     sliding_window: int,
     ps: bool,
+    value_head_size: int | None = None,
 ) -> dict[str, float | str]:
     """Test the Gluon paged attention decode implementation."""
     data_type = compute_type
@@ -1187,6 +1208,13 @@ def run_pa_gluon_test(
     setup_seed(seed)
     device = "cuda:0"
     num_query_heads, num_kv_heads = num_heads
+    if value_head_size is None:
+        value_head_size = head_size
+    if USE_TORCH_FLASH_REF and value_head_size != head_size:
+        raise ValueError(
+            "The flash-style reference requires equal Q/K and V head sizes; "
+            "set USE_TORCH_FLASH_REF=False to use the standard PyTorch reference"
+        )
     assert (
         num_query_heads % num_kv_heads == 0
     ), "Query heads must be divisible by KV heads"
@@ -1253,6 +1281,7 @@ def run_pa_gluon_test(
         seed,
         device,
         1 if quant_kv else 2,
+        value_head_size=value_head_size,
     )
     key_cache, value_cache = key_caches[0], value_caches[0]
     softmax_scale = 1.0 / (head_size**0.5)
@@ -1345,9 +1374,12 @@ def run_pa_gluon_test(
         min(context_length, sliding_window) if sliding_window > 0 else context_length
         for context_length in kv_len_list
     ]
-    pa_rw_bytes = head_size * (
-        2 * sum(kv_len_list) * num_kv_heads * quantized_keys.dtype.itemsize
-        + 2 * query_length * num_query_heads * quantized_query.dtype.itemsize
+    pa_rw_bytes = sum(kv_len_list) * num_kv_heads * (
+        head_size * quantized_keys.dtype.itemsize
+        + value_head_size * quantized_values.dtype.itemsize
+    ) + batch_size * query_length * num_query_heads * (
+        head_size * quantized_query.dtype.itemsize
+        + value_head_size * reference_output_quant.dtype.itemsize
     )
 
     if trans_v:
@@ -1381,6 +1413,7 @@ def run_pa_gluon_test(
             num_query_heads,
             num_kv_heads,
             head_size,
+            value_head_size,
         )
     )
 
@@ -1472,7 +1505,7 @@ def run_pa_gluon_test(
     )
     temporary_output = torch.empty(
         *intermediate_shape,
-        head_size,
+        value_head_size,
         dtype=reference_output_quant.dtype,
         device=reference_output_quant.device,
     )

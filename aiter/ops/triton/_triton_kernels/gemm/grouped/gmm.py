@@ -12,7 +12,10 @@ import functools
 import triton
 import triton.language as tl
 
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+    pid_grid,
+    remap_xcd,
+)
 
 # AITER
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
