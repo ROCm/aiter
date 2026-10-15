@@ -66,7 +66,10 @@ here. Update this file in the same change as any behaviour change.
    the baseline and the ten fastest candidates of the current plan on the first GPU into
    `<results>.final.jsonl`, with the same crash/hang recovery as the sweep; when that file exists
    the installer uses only it, so a later run (even on one GPU) always refreshes it, and an M timed
-   on several GPUs without it is skipped. Never two drivers on one GPU.
+   on several GPUs without it is skipped. Each timing worker times the installed
+   config on its own GPU first (`reference`) and records `rel` = time / that reference;
+   the final-round shortlist compares `rel`, so GPU-to-GPU differences do not
+   decide. Never two drivers on one GPU.
 9. Call the public wrappers (`aiter.ops.triton.gemm...`) only, never `_triton_kernels` or
    `_gluon_kernels`; pass `backend=` where the wrapper takes it and refuse a backend the wrapper
    cannot select (`KernelSpec.supports`).

@@ -351,14 +351,14 @@ def final_round(spec, shape, backend, candidates, out, gpu, args):
     """Re-time the baseline and the fastest current candidates on one GPU into the final-round file."""
     records = read_records(out)
     current = {config_key(c) for c in candidates}  # records of an older plan stay out
-    ok = sorted(
-        (
-            r
-            for key, r in records.items()
-            if key in current and r["status"] == "ok" and not r.get("baseline")
-        ),
-        key=lambda r: r["us"],
-    )
+    ok = [
+        r
+        for key, r in records.items()
+        if key in current and r["status"] == "ok" and not r.get("baseline")
+    ]
+    # rel compares candidates timed on different GPUs; records without it fall back to us
+    by_rel = all("rel" in r for r in ok)
+    ok.sort(key=lambda r: r["rel"] if by_rel else r["us"])
     fastest = [r["config"] for r in ok[:FINAL_ROUND_SIZE]]
     final_out = final_results_path(out)
     if os.path.exists(final_out):
@@ -376,6 +376,14 @@ def summarize(out, candidates):
     for candidate in candidates:
         status = records.get(config_key(candidate), {}).get("status", "missing")
         counts[status] = counts.get(status, 0) + 1
+    # show the reference time from the sweep results
+    ref_us = None
+    for r in iter_records(out):
+        if r["status"] == "reference" and r.get("us"):
+            ref_us = r["us"]
+            break
+    if ref_us is not None:
+        print(f"  reference (installed config on this GPU): {ref_us:.3f} us")
     if os.path.exists(final_results_path(out)):
         records = read_records(final_results_path(out))
         print("  final round (same-device numbers the installer uses):")
@@ -393,6 +401,10 @@ def summarize(out, candidates):
         print(
             f"  {record['us']:10.3f} us  {record['tflops']:8.1f} TFLOPS  {json.dumps(record['config'])}"
         )
+    if ok and baseline.get("status") == "ok":
+        winner = ok[0]
+        pct = (1 - winner["us"] / baseline["us"]) * 100
+        print(f"  winner: {winner['us']:.3f} us, {pct:+.1f}% vs installed {baseline['us']:.3f} us")
     print(f"  {counts}", flush=True)
 
 

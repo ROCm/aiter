@@ -21,6 +21,9 @@ Record fields:
   gpu       HIP_VISIBLE_DEVICES of the worker
   is_tuned  baseline only: a specialized file served this shape
   us, us_min, us_max, tflops   per-launch time from graph replay (median, min, max)
+  rel       us / the installed config's time on the same GPU (status reference, timed when
+            the worker starts): GPUs differ by a few percent, so the final-round shortlist
+            compares rel, not us
   error     the exception text when status is error
   dur_s     wall time of the candidate
 """
@@ -172,6 +175,18 @@ def plan(spec, shape, backend, arch, should_skip, space_out):
     return 0
 
 
+def reference_time(spec, shape, backend, keys, call, copies, calls, replays):
+    """This GPU's time for the installed config, or None when it does not run."""
+    installed, _ = resolve_installed(spec, shape, backend)
+    config = None
+    if any(k not in keys for k in installed):  # launch it as the baseline record does
+        config = {k: v for k, v in installed.items() if k in keys}
+    try:
+        return time_with_cuda_graph(call, config, copies, calls, replays).median
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def benchmark(
     spec, shape, backend, arch, call, inputs, candidates, out, calls, replays, cold_mb
 ):
@@ -195,6 +210,8 @@ def benchmark(
             cold_mb=cold_mb,
         ),
     )
+    reference = reference_time(spec, shape, backend, keys, call, copies, calls, replays)
+    append_record(out, dict(common, status="reference", us=reference))
     print("ready", flush=True)  # the driver's watchdog reads the worker's log
     for candidate in candidates:
         if STOPPING:
@@ -230,6 +247,8 @@ def benchmark(
                     us_max=round(timing.high, 3),
                     tflops=round(flops(shape) / timing.median / 1e6, 2),
                 )
+                if reference:
+                    record["rel"] = round(timing.median / reference, 4)
         except Exception as e:  # noqa: BLE001
             # a failing candidate is a result, not a crash
             record.update(
