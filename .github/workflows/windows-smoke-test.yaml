@@ -12,6 +12,9 @@ on:
       - "requirements.txt"
       - "setup.py"
   workflow_dispatch:
+  schedule:
+    # Run daily at 9 PM Beijing Time (UTC+8)
+    - cron: '0 13 * * *'
 
 permissions:
   actions: read
@@ -145,7 +148,10 @@ jobs:
               print(f"{tool}={executable_path(tool)}")
           '@
 
-          $verifyRocm | & $python -
+          $verifyPath = Join-Path $env:RUNNER_TEMP "verify-rocm-toolchain.py"
+          $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+          [System.IO.File]::WriteAllText($verifyPath, $verifyRocm, $utf8NoBom)
+          & $python $verifyPath
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           & $python -m pip install -e . --no-build-isolation -v
@@ -157,6 +163,41 @@ jobs:
           $ErrorActionPreference = "Continue"
           $venv = Join-Path $env:RUNNER_TEMP "aiter-windows-smoke"
           $python = Join-Path $venv "Scripts\python.exe"
+          $logPath = Join-Path $env:RUNNER_TEMP "windows-smoke-test.log"
 
-          & $python -m pytest -q -s op_tests/windows
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $python -m pytest -q -s op_tests/windows 2>&1 | Tee-Object -FilePath $logPath
+          $pytestStatus = $LASTEXITCODE
+          if ($pytestStatus -ne 0) { exit $pytestStatus }
+
+      - name: Summarize Windows smoke accuracy
+        if: always()
+        shell: powershell
+        run: |
+          $logPath = Join-Path $env:RUNNER_TEMP "windows-smoke-test.log"
+
+          "## Windows Smoke Accuracy" >> $env:GITHUB_STEP_SUMMARY
+          "" >> $env:GITHUB_STEP_SUMMARY
+
+          if (!(Test-Path $logPath)) {
+            "No Windows smoke test log was found." >> $env:GITHUB_STEP_SUMMARY
+            exit 0
+          }
+
+          $lines = @(Get-Content $logPath | Where-Object { $_ -match "max_abs_diff=" })
+          if ($lines.Count -eq 0) {
+            "No max_abs_diff lines were found in the Windows smoke test log." >> $env:GITHUB_STEP_SUMMARY
+            exit 0
+          }
+
+          "| Check | max_abs_diff | Tolerance |" >> $env:GITHUB_STEP_SUMMARY
+          "| --- | ---: | --- |" >> $env:GITHUB_STEP_SUMMARY
+
+          foreach ($line in $lines) {
+            $clean = $line -replace '^\.+', ''
+            if ($clean -match '^(?<name>.+?): max_abs_diff=(?<diff>\S+) tol=(?<tol>.*)$') {
+              $name = $Matches["name"] -replace '\|', '\|'
+              $diff = $Matches["diff"] -replace '\|', '\|'
+              $tol = $Matches["tol"] -replace '\|', '\|'
+              "| ``$name`` | ``$diff`` | ``$tol`` |" >> $env:GITHUB_STEP_SUMMARY
+            }
+          }

@@ -655,6 +655,9 @@ def _mhc_post_pre_gluon_split_k(
     if max_ctas:
         m_blocks = triton.cdiv(M, config["SPLIT_BLOCK_M"])
         split_k = min(split_k, max(1, max_ctas * cu_num // m_blocks))
+    # Small-M buckets cap the splits further (fewer, longer K-splits measured
+    # faster there).
+    split_k = min(split_k, config.get("SPLIT_K_MAX", split_k))
     while C % (split_k * ks) != 0:
         split_k -= 1
     return split_k
@@ -828,6 +831,10 @@ def _mhc_post_pre_gluon_gfx1250(
             config["RA_NORM_NUM_WARPS"],
             1,
         )
+        # RA_NORM_NUM_WARPS is the fewest apply warps: raise it until the row fits
+        # the fused RMSNorm's 4 chunks (8 bf16 x 32 lanes per warp and chunk).
+        while triton.cdiv(C, 256 * ra_warps) > 4:
+            ra_warps *= 2
     else:
         # RA_ROWS rows per CTA; split C across CTAs until the grid reaches
         # RA_CTAS_PER_CU CTAs per CU.
