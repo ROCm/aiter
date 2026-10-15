@@ -1,4 +1,4 @@
-# MiniMax M3 source-only Gluon port
+# MiniMax M3 experimental Gluon MoE region
 
 This experimental port starts at the **already reduced attention output** of a
 MiniMax M3 sparse MoE layer. The current region has four intended device stages:
@@ -43,8 +43,9 @@ Front CTA mapping: CTAs `0..8B-1` compute 16 router experts each; CTA 128
 waits for all score tiles, chooses routes, and builds metadata; CTAs 129–255
 zero 1024 BF16 elements each. The 256-CTA grid must be resident on 256 CUs
 for the intended latency and wait schedule; `pipeline.require_residency` rejects
-spills or insufficient compiled occupancy. Compilation resource use and actual
-occupancy have not been checked. A16W4 MoE weights remain in AITER's shuffled
+spills or insufficient compiled occupancy. On the tested gfx950 build, the front
+uses 53–55 VGPRs, spills none, and permits four resident CTAs/CU for B1–16.
+A16W4 MoE weights remain in AITER's shuffled
 layout. The metadata buffer allocates `16 * B * 5` rows, the worst case of one
 BM16 block per route; top-k uniqueness makes each expert occur at most B times.
 
@@ -56,27 +57,64 @@ numerical and latency checks. ATOM uses direct peer reduction for small B and
 reduce-scatter/all-gather from B=12; this tail presently uses direct exchange
 through B=16, another performance decision to measure.
 
-## Source-only checks
+## Validation performed
 
 ```bash
 python -m unittest discover -s experimental/minimax_m3_gluon/tests -v
 python -m compileall -q experimental/minimax_m3_gluon
 ```
 
-The tests verify source orchestration, routing selection, shared weight handling,
-and metadata capacity/padding on B1–16 without importing a GPU runtime. They do
-not compile Gluon or validate numerical output, cache ordering, IPC, occupancy,
-graph replay, actual launch count, TP4 serving, or model quality.
+The CPU tests verify source orchestration, routing selection, shared weight
+handling, and metadata capacity/padding on B1–16 without importing a GPU runtime.
+On gfx950 with PyTorch 2.13 and Triton 3.8, the `validate_gpu_*.py` scripts
+compiled and exercised these stages:
 
-## Next device-validation gates
+| Check | Batch sizes | Result |
+|---|---|---|
+| Fused front vs PyTorch norm/router reference, BM16 metadata semantics | 1, 2, 4, 8, 16 | Pass; no spills, 4 CTAs/CU |
+| AITER MoE1/MoE2 with Gluon metadata vs AITER sorting | 1, 4, 8, 16 | Pass within BF16 rounding on synthetic MXFP4 bytes |
+| Router with layer-3 checkpoint gate/bias/norm | 1, 8, 16 | Pass after loading gate as BF16 and applying ATOM's seven-bit score tie rule |
+| Four-rank HIP-IPC tail, three consecutive epochs | 1, 4, 8, 16 | Exact BF16 rank-ordered sum |
+| Four-rank full region: front → AITER experts → tail | 1, 8, 16 | Exact BF16 TP4 sum of local expert results; graph replay x3 |
 
-Once GPU execution is authorized: compile the front and tail on the exact
-Triton/Gluon build; inspect atomic and `sc1` poll/cache instructions; verify zero spills
-and at least one resident CTA/CU; compare route IDs/weights and every metadata
-array with ATOM/AITER across 1–16 tokens and replayed changed routes. Check
-AITER's selected MoE1/MoE2 names and a trace for hidden launches. Then compare
-full local and TP-reduced outputs, replay after allocator churn, all sparse
-layers, TTFT/TPOT/throughput and lm-eval. The serving adapter must account for ATOM's `batch_id_per_q_token` pad rows,
+Single-GPU CUDA-graph front latency on that build (µs):
+
+| B | 1 | 2 | 4 | 8 | 16 |
+|---|---:|---:|---:|---:|---:|
+| Gluon front | 15.18 | 18.12 | 22.14 | 31.38 | 49.59 |
+| PyTorch + AITER sorting proxy | 70.07 | 70.67 | 74.65 | 80.90 | 80.55 |
+
+The proxy is an unfused component comparison, not a vLLM or ATOM baseline.
+With synthetic MXFP4 weights, the full TP4 region took 40.13 µs at B1,
+94.44 µs at B8, and 142.85 µs at B16 (maximum rank GPU time across 64 graph
+replays). These are region latencies; no vLLM or ATOM serving metrics have been
+measured yet.
+
+The checkpoint stores the router gate in FP32; ATOM's loaded model view is BF16.
+The host path requires that BF16 view. A plain `torch.topk` on FP32 biased
+scores can order almost-tied experts differently: ATOM clears seven low score
+bits and breaks the resulting tie by expert ID. The Gluon route matches that
+policy with the real layer-3 gate/bias/norm tensors.
+
+The first integrated eager attempt timed out because ranks entered the tail at
+different times while AITER was compiling/configuring its expert kernels. The
+host now prepares each shape on every rank during its first eager invocation and
+synchronizes the ranks before the first cross-rank tail. The passing integrated
+test exercises this host path. A serving adapter must make one eager invocation
+on all ranks before graph capture; a first invocation during capture raises.
+The tail's timeout is a failure bound, not a mechanism for handling rank startup
+skew.
+
+## Next validation and integration gates
+
+The front's graph replay has passed with changed route choices at B8. Tail
+occupancy is also four CTAs/CU with no spills across B1–16. Generated gfx950 ISA
+contains the `global_load_dwordx2 ... sc1` polls and the tail's
+`global_atomic_swap_x2 ... sc1` peer publication. Verify allocator churn; compare against
+real MiniMax M3 weights, all sparse layers, TTFT/TPOT/throughput and lm-eval.
+The synthetic-weight tests establish the handoff and collective, not model
+quality. Inspect a device trace for hidden AITER launches and compare the full
+region with real baselines before choosing a batch threshold. The serving adapter must account for ATOM's `batch_id_per_q_token` pad rows,
 TP-uniform width decisions, attention metadata and cached sparse selections. Only
 after the MoE region is correct should the preceding output projection and sparse
 attention stages be fused into the Gluon front.

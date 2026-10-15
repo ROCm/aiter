@@ -47,7 +47,7 @@ def tail(
         bits = low.to(gl.uint16, bitcast=True).to(gl.uint32)
         bits |= high.to(gl.uint16, bitcast=True).to(gl.uint32) << 16
         message = (epoch.to(gl.uint64) << 32) | bits.to(gl.uint64)
-        gl.atomic_store(
+        gl.atomic_xchg(
             dest + (slot * 4 + RANK) * pairs + pair,
             message,
             mask=(wave < 4) & active,

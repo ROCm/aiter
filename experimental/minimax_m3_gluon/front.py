@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
 """MiniMax M3 post-attention norm, router, BM16 metadata and MoE zeroing.
 
-Source-only gfx950 Gluon port of the corresponding ATOM FlyDSL K4 stages.
+Experimental gfx950 Gluon port of the corresponding ATOM FlyDSL K4 stages.
 The input is the already reduced attention output, so sparse attention, o_proj
 and its TP collective remain upstream. One 256-CTA launch prepares everything
-that the selected two-stage AITER expert path consumes. No GPU validation yet.
+that the selected two-stage AITER expert path consumes.
 """
 
 from triton.experimental import gluon as g
@@ -165,7 +165,7 @@ def front(
             key = (ordered & -128) | (127 - expert)
             gl.store(Scores + token * 128 + expert, key)
             gl.store(Sigmoids + token * 128 + expert, sig)
-        gl.atomic_store(
+        gl.atomic_xchg(
             Ready + pid, epoch.to(gl.uint64) << 32 | 1, sem="release", scope="gpu"
         )
     elif pid == 128:

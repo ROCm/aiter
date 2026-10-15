@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Source-only launch contract for the MiniMax M3 MoE hybrid.
+"""Launch contract for the MiniMax M3 MoE hybrid.
 
 No runtime imports: host tests can assert order and direct tensor ownership
 without initializing Torch, Triton or HIP.

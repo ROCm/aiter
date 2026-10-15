@@ -2,6 +2,7 @@
 """Allocation and AITER boundary for the experimental MiniMax M3 hybrid."""
 
 import torch
+import torch.distributed as dist
 import aiter
 from aiter.fused_moe import fused_moe_2stages
 
@@ -25,10 +26,11 @@ def _require_expert_abi(config):
         or "atomic" not in second
         or config.block_m != SORT_BLOCK
         or config.run_1stage
-        or config.prequant
     ):
         raise ValueError(
-            "M3 fused metadata requires A16W4 BM16 inline-activation two-stage MoE"
+            "M3 fused metadata requires A16W4 BM16 inline-activation two-stage MoE: "
+            f"stage1={first}, stage2={second}, block_m={config.block_m}, "
+            f"run_1stage={config.run_1stage}, prequant={config.prequant}"
         )
     return config
 
@@ -140,8 +142,16 @@ def launch_region(
         raise ValueError("Invalid TP rank")
     if attn_reduced.shape != (tokens, HIDDEN) or residual.shape != (tokens, HIDDEN):
         raise ValueError("Expected Bx6144 attention partial and residual")
+    if attn_reduced.dtype != torch.bfloat16 or residual.dtype != torch.bfloat16:
+        raise ValueError("M3 attention partial and residual must be BF16")
     if gate.shape != (128, HIDDEN) or bias.numel() != 128 or gain.numel() != HIDDEN:
         raise ValueError("Unexpected router/gain shape")
+    if (
+        gate.dtype != torch.bfloat16
+        or gain.dtype != torch.bfloat16
+        or bias.dtype != torch.float32
+    ):
+        raise ValueError("Expected loaded BF16 gate/gain and FP32 routing bias")
     if peer.addresses.numel() != 4:
         raise ValueError("Expected four IPC peer pointers")
 
@@ -191,6 +201,40 @@ def launch_region(
             RANK=rank,
             num_warps=8,
         )
+
+    if not state.get("_m3_prepared", False):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "Prepare the M3 region eagerly on every TP rank before graph capture"
+            )
+        # AITER's first config lookup/JIT can skew rank arrival by seconds,
+        # whereas the device peer poll is deliberately bounded. Prepare every
+        # stage, then align ranks immediately before the first tail publish.
+        front_call()
+        prepared_output = experts_call()
+        tail.warmup(
+            prepared_output,
+            peer.addresses,
+            DevicePointer(peer.ptr.value),
+            state["Out"],
+            state["TailEpochs"],
+            state["TailErrors"],
+            B=tokens,
+            RANK=rank,
+            num_warps=8,
+            grid=(shape.grid,),
+        )
+        torch.cuda.synchronize()
+        dist.barrier(group=peer.group)
+        tail_call(prepared_output)
+        torch.cuda.synchronize()
+        front_error = bool(state["FrontErrors"].item())
+        tail_error = bool(state["TailErrors"].any().item())
+        error = torch.tensor(int(front_error or tail_error), dtype=torch.int32)
+        dist.all_reduce(error, op=dist.ReduceOp.MAX, group=peer.group)
+        if error.item():
+            raise RuntimeError("M3 region preparation mailbox timed out")
+        state["_m3_prepared"] = True
 
     launch(
         shape,
