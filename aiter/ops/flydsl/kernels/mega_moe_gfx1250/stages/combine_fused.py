@@ -154,6 +154,11 @@ class _FusedScatterCombine:
                 quant_bits=bits,
                 tokens_per_block=toks,
                 chunks_per_iter=chunks,
+                dense_slots=(
+                    config.max_tokens_per_rank * config.topk
+                    if config.per_rank_scatter
+                    else 0
+                ),
             )
         self._sync = _make_combine_fused_sync(
             rank=config.rank,
@@ -173,6 +178,7 @@ class _FusedScatterCombine:
             source_token_map=batch.routing.source_token_map,
             **(batch.grouping.scatter_fields() if grouped else {}),
             combine_quant_bits=quant_bits,
+            per_rank_scatter=config.per_rank_scatter,
         )
         return _ComputeTarget(
             scatter=scatter, dispatch_context=scatter if grouped else None
@@ -198,6 +204,7 @@ class _FusedScatterCombine:
             self._reduces[quant_bits],
             res.arena.local_ptr("comb_inp"),
             res.combine_output.data_ptr(),
+            routing.comb_slot.data_ptr() if routing.comb_slot is not None else 0,
             routing.token_count,
             stream,
         )

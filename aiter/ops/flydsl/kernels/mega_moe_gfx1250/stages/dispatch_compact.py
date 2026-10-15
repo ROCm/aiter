@@ -306,7 +306,7 @@ class _CompactDispatch(_Dispatch):
 
     def build(self, res: _EpResources) -> None:
         super().build(res)
-        from ..compact_plan import compact_plan_blocks
+        from ..compact_plan import compact_comb_tab_dwords, compact_plan_blocks
 
         config, geo, arena = self.config, self.compact, res.arena
         device = res.total_recv.device
@@ -320,8 +320,24 @@ class _CompactDispatch(_Dispatch):
         self._masked_ms = [
             torch.zeros(epr, dtype=torch.int32, device=device) for _ in slots
         ]
+        # The per-rank scatter's run table rides behind psum, so gemm2 finds it
+        # through the m-tile map it already takes, double-buffered with it.
+        psum_tail = (
+            compact_comb_tab_dwords(npes=config.world_size, experts_per_rank=epr)
+            if config.per_rank_scatter
+            else 0
+        )
         self._psums = [
-            torch.zeros(epr, dtype=torch.int32, device=device) for _ in slots
+            torch.zeros(epr + psum_tail, dtype=torch.int32, device=device)[:epr]
+            for _ in slots
+        ]
+        self._comb_slots = [
+            (
+                torch.full_like(res.token_destination_map, -1)
+                if config.per_rank_scatter
+                else None
+            )
+            for _ in slots
         ]
         self._block_hists = [
             torch.empty(
@@ -571,7 +587,7 @@ class _CompactDispatch(_Dispatch):
             topk_ids=self._dummy_ids,
             scales=self.recv_scales,
             num_local_tokens=None,
-            routing=self._routing(token_count),
+            routing=self._routing(token_count, self._comb_slots[slot]),
             layout=BatchLayout.EXPERT_GROUPED,
             grouping=ExpertGrouping(
                 masked_m=self._masked_ms[slot],
@@ -791,6 +807,9 @@ class _CompactDispatch(_Dispatch):
                 else int(token_count) * int(self.config.topk)
             )
             blocks = compact_plan_blocks(routes)
+            # The per-rank run table is built from block 0's LDS hist matrix.
+            if self.config.per_rank_scatter:
+                blocks = 1
             key = (align_m, slot, waves, blocks, write_tok_map, plan_s1f, qb)
         else:
             waves, blocks = None, None
@@ -840,6 +859,7 @@ class _CompactDispatch(_Dispatch):
                 hist_stride=geo.hist_stride,
                 max_routes=geo.max_routes,
                 hist_pingpong=False,
+                dense_comb=config.per_rank_scatter,
                 **extra,
             )
             # Compiled now, without a launch, so a graph capture never has to.
@@ -863,6 +883,7 @@ class _CompactDispatch(_Dispatch):
         wire_ptr: int = 0,
     ) -> tuple:
         bufs = self._slot_bufs(slot)
+        comb_slot = self._comb_slots[slot]
         args = (
             self.res.arena.handle,
             topk_ids_ptr,
@@ -872,6 +893,7 @@ class _CompactDispatch(_Dispatch):
             bufs["masked_m"].data_ptr(),
             bufs["psum"].data_ptr(),
             bufs["barrier"].data_ptr(),
+            comb_slot.data_ptr() if comb_slot is not None else 0,
             self.config.rank,
             token_count,
         )

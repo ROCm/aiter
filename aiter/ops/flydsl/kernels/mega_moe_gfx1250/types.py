@@ -97,6 +97,10 @@ class Stage2ScatterContext:
     # signature of ``flydsl_grouped_gemm_a8w4_masked``; it runs the fused
     # dispatch + GEMM1 stage-1 kernel instead. None keeps the default GEMM1.
     stage1_gemm1: object = None
+    # Compact only: gemm2 returns each peer's run with one plain TDM store into
+    # the plan's dense comb_inp layout, reading the run table the plan appended
+    # to compact_psum (see compact_plan.compact_comb_tab_dwords).
+    per_rank_scatter: bool = False
 
     def __post_init__(self):
         if self.combine_quant_bits not in (0, 8, 4):

@@ -35,6 +35,11 @@ def read_dispatch_wire_env() -> str:
     return os.environ.get("MEGA_DISPATCH_WIRE") or "bf16"
 
 
+def read_per_rank_scatter_env() -> bool:
+    """$AITER_MEGA_PER_RANK_SCATTER, defaulting to off."""
+    return os.environ.get("AITER_MEGA_PER_RANK_SCATTER", "0") in ("1", "true", "True")
+
+
 @dataclass(frozen=True)
 class _DispatchWire:
     """One DISPATCH wire. Per token at hidden 7168: bf16 14336 B, fp8 7168 + 256,
@@ -357,8 +362,20 @@ class MegaMoEConfig:
 
     recipe: MegaMoERecipe
     geometry: MegaMoEGeometry
+    # gemm2 returns each peer's rows with one plain TDM store instead of 8-row
+    # gather stores. Needs the compact plan: only its source-rank-major rows
+    # make a peer's rows one run of the tile.
+    per_rank_scatter: bool = field(default_factory=read_per_rank_scatter_env)
 
     def __post_init__(self):
+        if self.per_rank_scatter and not (
+            self.recipe.dispatch is DispatchKind.COMPACT
+            and self.recipe.combine is CombineKind.FUSED_SCATTER
+        ):
+            raise ValueError(
+                "AITER_MEGA_PER_RANK_SCATTER requires the compact plan "
+                "(dispatch=compact) and the gemm2 scatter (combine=fused_scatter)"
+            )
         if self.is_quant_dispatch_wire and self.hidden_dim % 32:
             raise ValueError(
                 "one e8m0 scale covers 32 features, so a quantizing dispatch "
