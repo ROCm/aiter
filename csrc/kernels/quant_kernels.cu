@@ -862,7 +862,81 @@ __global__ void scaled_quant_kernel(DTYPE_O* __restrict__ out,
     scaled_quant_impl<DTYPE_I>(out, input, scale, cols);
 }
 
-template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 16>
+template <typename DTYPE_I, int vec_size>
+__device__ opus::vector_t<opus::i8_t, vec_size>
+quantize_i8_rne(const opus::vector_t<DTYPE_I, vec_size>& values,
+                const float inverted_scale)
+{
+    opus::vector_t<opus::i8_t, vec_size> quantized;
+#pragma unroll
+    for(int i = 0; i < vec_size; ++i)
+    {
+        const float scaled = static_cast<float>(values[i]) * inverted_scale;
+        int rounded = __float2int_rn(scaled);
+        rounded = rounded < -127 ? -127 : (rounded > 127 ? 127 : rounded);
+        quantized[i] = static_cast<opus::i8_t>(rounded);
+    }
+    return quantized;
+}
+
+template <typename DTYPE_I>
+__device__ void scaled_quant_i8_rne_impl(opus::i8_t* __restrict__ out,
+                                         const DTYPE_I* __restrict__ input,
+                                         const float* __restrict__ scale,
+                                         const int32_t cols)
+{
+    const float inverted_scale = *scale > 0.0f ? 1.0f / *scale : 0.0f;
+    static constexpr int32_t vec_size = 16;
+    using vec_i = opus::vector_t<DTYPE_I, vec_size>;
+    using vec_o = opus::vector_t<opus::i8_t, vec_size>;
+
+    const int64_t row_offset = static_cast<int64_t>(blockIdx.x) * cols;
+    auto const* ptr_i        = input + row_offset;
+    auto* ptr_o              = out + row_offset;
+    static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
+    const int32_t oob_i = (cols + ooba_i - 1) / ooba_i * ooba_i;
+    auto buffer_i = opus::make_gmem<DTYPE_I>(ptr_i, oob_i * sizeof(DTYPE_I));
+
+    const int32_t num_vecs = (cols + vec_size - 1) / vec_size;
+    for(int32_t vec_idx = threadIdx.x; vec_idx < num_vecs; vec_idx += BlockSize)
+    {
+        const vec_i values =
+            load_vector_nbytes<DTYPE_I, vec_size, 16>(buffer_i, vec_idx * vec_size);
+        const vec_o quantized =
+            quantize_i8_rne<DTYPE_I, vec_size>(values, inverted_scale);
+        *reinterpret_cast<vec_o*>(ptr_o + vec_idx * vec_size) = quantized;
+    }
+}
+
+template <typename DTYPE_I, int thread_data_size>
+__device__ void scaled_quant_i8_rne_vgpr_impl(opus::i8_t* __restrict__ out,
+                                              DTYPE_I* __restrict__ input,
+                                              const float* __restrict__ scale,
+                                              const int32_t cols,
+                                              int64_t out_offset)
+{
+    static_assert(thread_data_size % 4 == 0);
+    const float inverted_scale = *scale > 0.0f ? 1.0f / *scale : 0.0f;
+    using vec_i = opus::vector_t<DTYPE_I, thread_data_size>;
+    using vec_o = opus::vector_t<opus::i8_t, thread_data_size>;
+
+    auto const* input_vecs = reinterpret_cast<vec_i const*>(input);
+    auto* ptr_o            = out + out_offset;
+    const int32_t num_vecs = (cols + thread_data_size - 1) / thread_data_size;
+
+    if(threadIdx.x < num_vecs)
+    {
+        const vec_o quantized =
+            quantize_i8_rne<DTYPE_I, thread_data_size>(*input_vecs, inverted_scale);
+        *reinterpret_cast<vec_o*>(ptr_o + threadIdx.x * thread_data_size) =
+            quantized;
+    }
+}
+
+template <typename DTYPE_I,
+          typename DTYPE_O,
+          int thread_data_size = 16,
+          bool round_i8_to_nearest = false>
 __global__ void
 dynamic_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                       float* __restrict__ scale,
@@ -872,6 +946,7 @@ dynamic_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                       int32_t const* __restrict__ num_rows = nullptr,
                                       const int32_t num_rows_factor        = 1)
 {
+    static_assert(!round_i8_to_nearest || std::is_same_v<DTYPE_O, opus::i8_t>);
     const int token_idx = blockIdx.x;
     if(num_rows != nullptr)
     {
@@ -899,12 +974,20 @@ dynamic_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
 
     if constexpr(thread_data_size == 0)
     {
-        scaled_quant_impl<DTYPE_I>(out, input, &row_scale, cols);
+        if constexpr(round_i8_to_nearest)
+            scaled_quant_i8_rne_impl(out, input, &row_scale, cols);
+        else
+            scaled_quant_impl<DTYPE_I>(out, input, &row_scale, cols);
     }
     else
     {
         const int64_t row_offset = blockIdx.x * cols;
-        scaled_quant_vgpr_impl<DTYPE_I, DTYPE_O, thread_data_size>(out, vec_ptr, &row_scale, cols, row_offset);
+        if constexpr(round_i8_to_nearest)
+            scaled_quant_i8_rne_vgpr_impl<DTYPE_I, thread_data_size>(
+                out, vec_ptr, &row_scale, cols, row_offset);
+        else
+            scaled_quant_vgpr_impl<DTYPE_I, DTYPE_O, thread_data_size>(
+                out, vec_ptr, &row_scale, cols, row_offset);
     }
 }
 
@@ -1342,6 +1425,76 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
             AITER_CHECK(false, __func__, " not support output type: ", AiterDtype_to_str(out.dtype()));
         }
     }
+}
+
+void dynamic_per_token_quant_i8_rne(aiter_tensor_t& out,         // [..., d], int8
+                                    const aiter_tensor_t& input, // [..., d], fp16/bf16
+                                    aiter_tensor_t& scales,      // [..., 1], fp32
+                                    std::optional<aiter_tensor_t> num_rows,
+                                    int num_rows_factor)
+{
+    AITER_CHECK(input.is_contiguous());
+    AITER_CHECK(out.is_contiguous());
+    AITER_CHECK(scales.is_contiguous());
+    AITER_CHECK(out.dtype() == AITER_DTYPE_i8,
+                __func__,
+                " requires int8 output, got ",
+                AiterDtype_to_str(out.dtype()));
+    AITER_CHECK(scales.dtype() == AITER_DTYPE_fp32,
+                __func__,
+                " requires fp32 scales, got ",
+                AiterDtype_to_str(scales.dtype()));
+    AITER_CHECK(out.numel() == input.numel(),
+                __func__,
+                " requires output and input with the same number of elements");
+
+    const int cols = input.size(-1);
+    const int rows = input.numel() / cols;
+    AITER_CHECK(cols % 16 == 0,
+                __func__,
+                " requires the row width to be divisible by 16, got ",
+                cols);
+    AITER_CHECK(scales.numel() >= rows,
+                __func__,
+                " requires at least one scale per input row");
+    int32_t* num_rows_ptr =
+        num_rows.has_value() ? reinterpret_cast<int32_t*>(num_rows->data_ptr()) : nullptr;
+
+    HipDeviceGuard device_guard(input.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    const dim3 grid(rows);
+    const dim3 block(BlockSize);
+
+    auto launch = [&](auto thread_data_tag) {
+        constexpr int thread_data_size = decltype(thread_data_tag)::value;
+        AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
+            input.dtype(), "dynamic_per_token_quant_i8_rne", [&] {
+                using input_dtype = typename aiter::hip2opus<scalar_t>::type;
+                aiter::dynamic_per_token_scaled_quant_kernel<
+                    input_dtype, opus::i8_t, thread_data_size, true>
+                    <<<grid, block, 0, stream>>>(
+                        reinterpret_cast<opus::i8_t*>(out.data_ptr()),
+                        reinterpret_cast<float*>(scales.data_ptr()),
+                        reinterpret_cast<input_dtype*>(input.data_ptr()),
+                        nullptr,
+                        cols,
+                        num_rows_ptr,
+                        num_rows_factor);
+            });
+    };
+
+    if(cols <= 8 * BlockSize && cols % 8 == 0)
+        launch(std::integral_constant<int, 8>{});
+    else if(cols <= 16 * BlockSize && cols % 16 == 0)
+        launch(std::integral_constant<int, 16>{});
+    else if(cols <= 20 * BlockSize && cols % 20 == 0)
+        launch(std::integral_constant<int, 20>{});
+    else if(cols <= 32 * BlockSize && cols % 32 == 0)
+        launch(std::integral_constant<int, 32>{});
+    else if(cols <= 64 * BlockSize && cols % 64 == 0)
+        launch(std::integral_constant<int, 64>{});
+    else
+        launch(std::integral_constant<int, 0>{});
 }
 
 // MXFP8 1x32 quant whose e8m0 scale is written straight into the gfx1250 MXFP8 ASM GEMM's

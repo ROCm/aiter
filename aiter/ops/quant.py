@@ -436,6 +436,30 @@ def per_token_quant_hip(
     return y, scale
 
 
+@torch_compile_guard()
+def per_token_quant_i8_rne_hip(
+    x: Tensor,
+    scale: Tensor | None = None,
+    num_rows: Tensor | None = None,
+    num_rows_factor: int = 1,
+) -> tuple[Tensor, Tensor]:
+    """Dynamically quantize each row to signed INT8 using round-to-nearest-even."""
+    if scale is not None:
+        raise ValueError("unsupported: static per token quant")
+    x = x.contiguous()
+    shape = x.shape
+    y = torch.empty(shape, dtype=dtypes.i8, device=x.device)
+    scale = torch.empty((*shape[:-1], 1), dtype=dtypes.fp32, device=x.device)
+    dynamic_per_token_quant_i8_rne(
+        y,
+        x,
+        scale,
+        num_rows=num_rows,
+        num_rows_factor=num_rows_factor,
+    )
+    return y, scale
+
+
 # Capability marker: per_group_quant_hip / dynamic_per_group_scaled_quant and
 # aiter.ops.rmsnorm.rmsnorm_quant / add_rmsnorm_quant accept
 # `scale_layout_m32k4` (MXFP8 1x32 scale written in the gfx1250 ASM GEMM A-scale
@@ -785,6 +809,16 @@ def dynamic_per_token_scaled_quant(
     scales: torch.Tensor,
     scale_ub: torch.Tensor | None = None,
     shuffle_scale: bool = False,
+    num_rows: torch.Tensor | None = None,
+    num_rows_factor: int = 1,
+) -> None: ...
+
+
+@compile_ops("module_quant", develop=True)
+def dynamic_per_token_quant_i8_rne(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    scales: torch.Tensor,
     num_rows: torch.Tensor | None = None,
     num_rows_factor: int = 1,
 ) -> None: ...

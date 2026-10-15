@@ -1705,6 +1705,13 @@ namespace py = pybind11;
           py::arg("shuffle_scale")   = false,                            \
           py::arg("num_rows")        = std::nullopt,                     \
           py::arg("num_rows_factor") = 1);                               \
+    m.def("dynamic_per_token_quant_i8_rne",                              \
+          &aiter::dynamic_per_token_quant_i8_rne,                        \
+          py::arg("out"),                                                \
+          py::arg("input"),                                              \
+          py::arg("scales"),                                             \
+          py::arg("num_rows")        = std::nullopt,                     \
+          py::arg("num_rows_factor") = 1);                               \
     m.def("dynamic_per_group_scaled_quant",                              \
           &aiter::dynamic_per_group_scaled_quant,                        \
           py::arg("out"),                                                \

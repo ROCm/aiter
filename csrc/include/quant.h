@@ -49,6 +49,15 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
                                     std::optional<aiter_tensor_t> num_rows  = std::nullopt,
                                     int num_rows_factor                     = 1);
 
+// Per-token symmetric signed INT8 quantization with round-to-nearest-even:
+// scale = amax / 127, out = round_even(input / scale), with zero rows mapped
+// to all-zero output and a zero scale.
+void dynamic_per_token_quant_i8_rne(aiter_tensor_t& out,         // [..., d], int8
+                                    const aiter_tensor_t& input, // [..., d], fp16/bf16
+                                    aiter_tensor_t& scales,      // [..., 1], fp32
+                                    std::optional<aiter_tensor_t> num_rows = std::nullopt,
+                                    int num_rows_factor                    = 1);
+
 // Canonical dtype-aware per-group dynamic quant. Accepts fp8 / i8 / fp4x2.
 // For fp4x2 it writes an e8m0 byte per group; for fp8/i8 it writes an
 // fp32 per-group scale.
