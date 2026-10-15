@@ -29,17 +29,20 @@ def _skill_md():
     return p.read_text(encoding="utf-8")
 
 
-# (prompt file relative to HERE, start anchor, end anchor) -- anchors are unique lines in SKILL.md.
+_EMDASH = chr(0x2014)
+_SECTION = chr(0x00A7)
+_WARN = chr(0x26A0) + chr(0xFE0F)
+# (prompt file relative to HERE, start anchor, end anchor)
 CHECKS = [
     (
         "prompts/refuter.md",
-        "## Step 7.7 -- Independent refutation",
-        "`rules.md` ? Refutation has why.",
+        f"## Step 7.7 {_EMDASH} Independent refutation",
+        f"`rules.md` {_SECTION} Refutation has why.",
     ),
     (
         "prompts/worker.md",
         "**Output rules (strictly enforced):**",
-        '- `? The benchmark may not include setup cost` -- no "Author must" conclusion',
+        f'- `{_WARN} The benchmark may not include setup cost` {_EMDASH} no "Author must" conclusion',
     ),
 ]
 

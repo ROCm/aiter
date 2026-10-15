@@ -226,13 +226,15 @@ def main():
     src = SRC.read_text(encoding="utf-8")
     ok = bad = 0
 
+    _X, _OK, _EM = chr(0x274C), chr(0x2705), chr(0x2014)
+
     def t(name, err):
         nonlocal ok, bad
         if err:
-            print("  ? %s -- %s" % (name, err))
+            print("  %s %s %s %s" % (_X, name, _EM, err))
             bad += 1
         else:
-            print("  ? %s" % name)
+            print("  %s %s" % (_OK, name))
             ok += 1
 
     print("[lost review behaviour]")
