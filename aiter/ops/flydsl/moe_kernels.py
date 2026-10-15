@@ -1378,6 +1378,7 @@ def flydsl_silu_and_mul_interleaved(
     topk: int,
     quant_mode: str = "none",
     gui_layout: bool = True,
+    swiglu_limit: float | None = None,
 ) -> None:
     """Fused silu activation for interleaved (gate/up block-interleaved) layout.
 
@@ -1412,7 +1413,7 @@ def flydsl_silu_and_mul_interleaved(
             1.0,
             1.0,
             1.0,
-            float("inf"),
+            runtime_swiglu_limit(swiglu_limit, "silu"),
             torch.cuda.current_stream(),
         ),
     )
