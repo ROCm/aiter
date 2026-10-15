@@ -1,9 +1,10 @@
 """Selected kda layer decode schedules and shared helpers."""
 
-import torch
 import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _CONV = gl.constexpr(gl.BlockedLayout([1, 1], [1, 64], [4, 2], [1, 0]))
 _OUTPUT = gl.constexpr(gl.BlockedLayout([1, 2], [1, 64], [8, 1], [1, 0]))
@@ -39,8 +40,8 @@ def _m1_contract(packets, vectors, ORDER: gl.constexpr):
 
 @gluon.jit
 def _m128_stage_masked_panel(sa, sb, X, W, ao, bo, am, bm, offset):
-    la = sa._reinterpret(layout=gl.SwizzledSharedLayout(1, 1, 1, [1, 0]))
-    lb = sb._reinterpret(layout=gl.SwizzledSharedLayout(1, 1, 1, [0, 1]))
+    la = sa.reinterpret(layout=gl.SwizzledSharedLayout(1, 1, 1, [1, 0]))
+    lb = sb.reinterpret(layout=gl.SwizzledSharedLayout(1, 1, 1, [0, 1]))
     gl.amd.cdna4.async_copy.buffer_load_to_shared(la, X + offset, ao, am, 0)
     gl.amd.cdna4.async_copy.buffer_load_to_shared(lb, W + offset, bo, bm, 0)
     gl.amd.cdna4.async_copy.commit_group()
@@ -59,7 +60,13 @@ def _m128_eight_parts(values):
     return (p0, p1, p2, p3, p4, p5, p6, p7)
 
 
-@gluon.jit
+_m256_fallback_gemm_repr = make_kernel_repr(
+    "_m256_fallback_gemm",
+    ["M", "N", "K"],
+)
+
+
+@gluon.jit(repr=_m256_fallback_gemm_repr)
 def _m256_fallback_gemm(
     X,
     W,
@@ -102,25 +109,6 @@ def _m256_fallback_gemm(
         acc.to(gl.bfloat16),
         (row[:, None] < M) & (col[None, :] < N),
     )
-
-
-def _m256_fallback_linear(x, weight, output_tensor=None):
-    m, k = x.shape
-    n = weight.shape[0]
-    out = x.new_empty((m, n)) if output_tensor is None else output_tensor
-    _m256_fallback_gemm[(triton.cdiv(n, 64), triton.cdiv(m, 16))](
-        x,
-        weight,
-        out,
-        m,
-        n,
-        k,
-        *x.stride(),
-        *weight.stride(),
-        out.stride(0),
-        num_warps=4,
-    )
-    return out
 
 
 @gluon.jit
@@ -224,8 +212,8 @@ def _m256_masked_dense_tile(
 def _m256_stage_dense_panel(
     a_shared, b_shared, x_base, w_base, a_offsets, b_offsets, CACHE: gl.constexpr
 ):
-    a_linear = a_shared._reinterpret(layout=gl.SwizzledSharedLayout(1, 1, 1, [1, 0]))
-    b_linear = b_shared._reinterpret(layout=gl.SwizzledSharedLayout(1, 1, 1, [0, 1]))
+    a_linear = a_shared.reinterpret(layout=gl.SwizzledSharedLayout(1, 1, 1, [1, 0]))
+    b_linear = b_shared.reinterpret(layout=gl.SwizzledSharedLayout(1, 1, 1, [0, 1]))
     gl.amd.cdna4.async_copy.buffer_load_to_shared(a_linear, x_base, a_offsets)
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
         b_linear, w_base, b_offsets, cache_modifier=CACHE
@@ -318,9 +306,7 @@ def _m256_dense_tile(
         _m256_stage_dense_panel(
             a_slots[0], b_slots[0], x_base, w_base, a_offsets, b_offsets, ".cs"
         )
-        b_next = b_slots[1]._reinterpret(
-            layout=gl.SwizzledSharedLayout(1, 1, 1, [0, 1])
-        )
+        b_next = b_slots[1].reinterpret(layout=gl.SwizzledSharedLayout(1, 1, 1, [0, 1]))
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             b_next, w_base + BK, b_offsets, cache_modifier=".cs"
         )
@@ -339,7 +325,7 @@ def _m256_dense_tile(
                 acc = gl.amd.cdna4.mfma(a, b, acc)
                 if fragment == 32:
                     if step < K // BK - 1:
-                        a_spare = a_slots[(step + 1) % 2]._reinterpret(
+                        a_spare = a_slots[(step + 1) % 2].reinterpret(
                             layout=gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
                         )
                         gl.amd.cdna4.async_copy.buffer_load_to_shared(
@@ -347,7 +333,7 @@ def _m256_dense_tile(
                         )
                         gl.amd.cdna4.async_copy.commit_group()
                     if step < K // BK - 2:
-                        b_spare = b_slots[(step + 2) % 3]._reinterpret(
+                        b_spare = b_slots[(step + 2) % 3].reinterpret(
                             layout=gl.SwizzledSharedLayout(1, 1, 1, [0, 1])
                         )
                         gl.amd.cdna4.async_copy.buffer_load_to_shared(
@@ -438,7 +424,13 @@ def _m256_state_row_order(
     gl.store(ORDER + row, key, row < M)
 
 
-@gluon.jit
+_m256_project_qkvg_beta_repr = make_kernel_repr(
+    "_m256_project_qkvg_beta",
+    ["M", "BM", "BN", "NW", "GROUP", "SORT"],
+)
+
+
+@gluon.jit(repr=_m256_project_qkvg_beta_repr)
 def _m256_project_qkvg_beta(
     X,
     WQ,
@@ -529,7 +521,13 @@ def _m256_project_qkvg_beta(
         _m256_state_row_order(IDX, ORDER, M, SI, NW, OB, LOG)
 
 
-@gluon.jit
+_m256_project_ragged_repr = make_kernel_repr(
+    "_m256_project_ragged",
+    ["M", "SORT"],
+)
+
+
+@gluon.jit(repr=_m256_project_ragged_repr)
 def _m256_project_ragged(
     X,
     WQ,
@@ -603,7 +601,13 @@ def _m256_project_ragged(
         _m256_state_row_order(IDX, ORDER, M, SI, 4, OB, LOG)
 
 
-@gluon.jit
+_m256_output_ragged_repr = make_kernel_repr(
+    "_m256_output_ragged",
+    ["M"],
+)
+
+
+@gluon.jit(repr=_m256_output_ragged_repr)
 def _m256_output_ragged(
     X, W, Y, M: gl.constexpr, SX: gl.constexpr, SW: gl.constexpr, SY: gl.constexpr
 ):
@@ -635,7 +639,7 @@ def _m256_output_ragged(
 def _m256_stage_output_a(a_slots, X, offsets, PANEL: gl.constexpr):
 
     for segment in gl.static_range(3):
-        linear = a_slots[PANEL % 2 * 3 + segment]._reinterpret(
+        linear = a_slots[PANEL % 2 * 3 + segment].reinterpret(
             layout=gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
         )
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
@@ -647,7 +651,7 @@ def _m256_stage_output_a(a_slots, X, offsets, PANEL: gl.constexpr):
 @gluon.jit
 def _m256_stage_output_b(b_slots, W, offsets, PANEL: gl.constexpr):
     for segment in gl.static_range(3):
-        linear = b_slots[PANEL % 2 * 3 + segment]._reinterpret(
+        linear = b_slots[PANEL % 2 * 3 + segment].reinterpret(
             layout=gl.SwizzledSharedLayout(1, 1, 1, [0, 1])
         )
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
@@ -656,7 +660,13 @@ def _m256_stage_output_b(b_slots, W, offsets, PANEL: gl.constexpr):
     gl.amd.cdna4.async_copy.commit_group()
 
 
-@gluon.jit
+_m256_output_m128_repr = make_kernel_repr(
+    "_m256_output_m128",
+    [],
+)
+
+
+@gluon.jit(repr=_m256_output_m128_repr)
 def _m256_output_m128(X, W, Y, SX: gl.constexpr, SW: gl.constexpr, SY: gl.constexpr):
     pid = gl.program_id(0).to(gl.uint32)
     tile_m = pid >> 3 & 1
@@ -733,7 +743,13 @@ def _m256_output_m128(X, W, Y, SX: gl.constexpr, SW: gl.constexpr, SY: gl.conste
     )
 
 
-@gluon.jit
+_m256_output_m256_repr = make_kernel_repr(
+    "_m256_output_m256",
+    ["M"],
+)
+
+
+@gluon.jit(repr=_m256_output_m256_repr)
 def _m256_output_m256(
     X, W, Y, M: gl.constexpr, SX: gl.constexpr, SW: gl.constexpr, SY: gl.constexpr
 ):
@@ -910,7 +926,13 @@ def _m256_store_changed_vectors(
     )
 
 
-@gluon.jit
+_m256_kda_decode_repr = make_kernel_repr(
+    "_m256_kda_decode",
+    ["H", "GROUP", "NW", "LARGE_BATCH", "SORT", "STATE_STREAM"],
+)
+
+
+@gluon.jit(repr=_m256_kda_decode_repr)
 def _m256_kda_decode(
     X,
     Gate,
@@ -924,7 +946,7 @@ def _m256_kda_decode(
     CS,
     S,
     IDX,
-    O,
+    OUT,
     H: gl.constexpr,
     SX: gl.constexpr,
     SG: gl.constexpr,
@@ -972,7 +994,7 @@ def _m256_kda_decode(
     v = gl.arange(0, 128, gl.SliceLayout(1, layout))
     k = gl.arange(0, 128, gl.SliceLayout(0, layout))
     if slot < 0:
-        gl.store(O + m * SO + h * 128 + v, 0)
+        gl.store(OUT + m * SO + h * 128 + v, 0)
     else:
         prep = gl.allocate_shared_memory(
             gl.bfloat16, (512,), gl.SwizzledSharedLayout(1, 1, 1, [0])
@@ -1180,198 +1202,7 @@ def _m256_kda_decode(
             * weight
             * _m1_sigmoid(gate)
         )
-        gl.store(O + m * SO + h * 128 + nv, out)
-
-
-def kda_layer_decode_m256(
-    x,
-    qkvg_weight,
-    beta_forget_weight,
-    output_weight,
-    forget_weight,
-    conv_weight,
-    a_log,
-    dt_bias,
-    norm_weight,
-    conv_state,
-    state,
-    state_indices,
-    *,
-    lower_bound=-5.0,
-    norm_eps=1e-5,
-    output_tensor=None,
-):
-
-    m = x.shape[0]
-    group = 8
-    q_write_through = m not in (128, 256)
-    qkvg = x.new_empty((m, 6144))
-    beta_forget = x.new_empty((m, 144))
-    core = x.new_empty((m, 1536))
-    aligned = (
-        m in (128, 256)
-        and x.stride(0) % 8 == 0
-        and qkvg_weight.stride(0) % 8 == 0
-        and beta_forget_weight.stride(0) % 8 == 0
-        and output_weight.stride(0) % 8 == 0
-    )
-    ragged_aligned = (
-        m >= 64
-        and x.stride(0) % 8 == 0
-        and qkvg_weight.stride(0) % 8 == 0
-        and beta_forget_weight.stride(0) % 8 == 0
-        and output_weight.stride(0) % 8 == 0
-    )
-    sort_rows = 128 <= m <= 512 and ragged_aligned
-    order_dtype = torch.int64 if state_indices.dtype == torch.int32 else torch.int32
-    row_order = (
-        torch.empty((m,), device=x.device, dtype=order_dtype) if sort_rows else None
-    )
-    order_block = triton.next_power_of_2(m)
-    order_log = order_block.bit_length() - 1
-    if aligned:
-        tile_n = 64
-        tile_m = 128
-        waves = 4
-        pid_groups = 16
-        beta_columns = 32
-        beta_depth = 4
-        programs = m // tile_m * (6144 // tile_n) + m // 64 * triton.cdiv(
-            144, beta_columns
-        )
-        _m256_project_qkvg_beta[(programs + int(sort_rows),)](
-            x,
-            qkvg_weight,
-            beta_forget_weight,
-            qkvg,
-            beta_forget,
-            m,
-            x.stride(0),
-            qkvg_weight.stride(0),
-            beta_forget_weight.stride(0),
-            tile_n,
-            waves,
-            pid_groups,
-            64,
-            beta_columns,
-            beta_depth,
-            q_write_through,
-            qkvg.stride(0),
-            beta_forget.stride(0),
-            state_indices,
-            row_order,
-            state_indices.stride(0),
-            sort_rows,
-            order_block,
-            order_log,
-            tile_m,
-            2,
-            3,
-            128,
-            num_warps=waves,
-            waves_per_eu=2,
-        )
-    elif ragged_aligned:
-        _m256_project_ragged[(triton.cdiv(m, 64) * 105 + int(sort_rows),)](
-            x,
-            qkvg_weight,
-            beta_forget_weight,
-            qkvg,
-            beta_forget,
-            m,
-            x.stride(0),
-            qkvg_weight.stride(0),
-            beta_forget_weight.stride(0),
-            qkvg.stride(0),
-            beta_forget.stride(0),
-            state_indices,
-            row_order,
-            state_indices.stride(0),
-            sort_rows,
-            order_block,
-            order_log,
-            num_warps=4,
-            waves_per_eu=2,
-        )
-    else:
-        _m256_fallback_linear(x, qkvg_weight, output_tensor=qkvg)
-        _m256_fallback_linear(x, beta_forget_weight, output_tensor=beta_forget)
-    decode = _m256_kda_decode
-    decode[(12 * group, m // group)](
-        qkvg,
-        qkvg[:, 4608:],
-        beta_forget,
-        beta_forget[:, 128:140],
-        forget_weight,
-        conv_weight,
-        a_log,
-        dt_bias,
-        norm_weight,
-        conv_state,
-        state,
-        state_indices,
-        core,
-        12,
-        qkvg.stride(0),
-        qkvg.stride(0),
-        beta_forget.stride(0),
-        beta_forget.stride(0),
-        forget_weight.stride(0),
-        *conv_state.stride(),
-        state.stride(0),
-        state_indices.stride(0),
-        lower_bound,
-        norm_eps,
-        group,
-        m >= 192,
-        8,
-        True,
-        core.stride(0),
-        row_order,
-        sort_rows,
-        4,
-        m >= 128,
-        num_warps=8,
-        enable_fp_fusion=False,
-    )
-    out = x.new_empty((m, 7168)) if output_tensor is None else output_tensor
-    if aligned and m == 256:
-        _m256_output_m256[(m // 128 * 112,)](
-            core,
-            output_weight,
-            out,
-            m,
-            core.stride(0),
-            output_weight.stride(0),
-            out.stride(0),
-            num_warps=4,
-            waves_per_eu=2,
-        )
-    elif aligned:
-        _m256_output_m128[(m // 64 * 112,)](
-            core,
-            output_weight,
-            out,
-            core.stride(0),
-            output_weight.stride(0),
-            out.stride(0),
-            num_warps=4,
-            waves_per_eu=2,
-        )
-    elif ragged_aligned:
-        _m256_output_ragged[(triton.cdiv(m, 64) * 112,)](
-            core,
-            output_weight,
-            out,
-            m,
-            core.stride(0),
-            output_weight.stride(0),
-            out.stride(0),
-            num_warps=4,
-        )
-    else:
-        _m256_fallback_linear(core, output_weight, output_tensor=out)
-    return out, conv_state, state
+        gl.store(OUT + m * SO + h * 128 + nv, out)
 
 
 @gluon.jit
@@ -1607,7 +1438,13 @@ def _m32_project_stream(
     return acc
 
 
-@gluon.jit
+_m32_projection_repr = make_kernel_repr(
+    "_m32_projection",
+    ["M", "K", "BM", "NW", "BK", "INPUT"],
+)
+
+
+@gluon.jit(repr=_m32_projection_repr)
 def _m32_projection(
     X,
     WQ,
@@ -1706,7 +1543,13 @@ def _m32_projection(
     )
 
 
-@gluon.jit
+_m64_recurrent_head_repr = make_kernel_repr(
+    "_m64_recurrent_head",
+    ["M", "NW", "GROUP", "NARROW_SLOT"],
+)
+
+
+@gluon.jit(repr=_m64_recurrent_head_repr)
 def _m64_recurrent_head(
     X,
     CW,
@@ -1717,7 +1560,7 @@ def _m64_recurrent_head(
     A,
     DT,
     NORM,
-    O,
+    OUT,
     SW: gl.constexpr,
     SI: gl.constexpr,
     SC0: gl.constexpr,
@@ -1751,7 +1594,7 @@ def _m64_recurrent_head(
     i = gl.arange(0, 128, vector_layout)
     slot = gl.load(IDX + m * SI).to(gl.int64)
     if slot < 0:
-        gl.store(O + m * CORE_STRIDE + h * 128 + i, 0)
+        gl.store(OUT + m * CORE_STRIDE + h * 128 + i, 0)
     else:
 
         if NARROW_SLOT:
@@ -1845,110 +1688,4 @@ def _m64_recurrent_head(
         gl.amd.cdna4.buffer_store(old1, hb, ho, valid)
         gl.amd.cdna4.buffer_store(old2, hb, SC1 + ho, valid)
         gl.amd.cdna4.buffer_store(x, hb, 2 * SC1 + ho, valid)
-        gl.store(O + m * CORE_STRIDE + h * 128 + i, out)
-
-
-def kda_layer_decode_m64(
-    x,
-    qkvg_weight,
-    beta_forget_weight,
-    output_weight,
-    forget_weight,
-    conv_weight,
-    a_log,
-    dt_bias,
-    norm_weight,
-    conv_state,
-    state,
-    state_indices,
-    *,
-    lower_bound=-5.0,
-    norm_eps=1e-5,
-    output_tensor=None,
-):
-
-    m = x.shape[0]
-    packed = torch.empty((m, 6336), device=x.device, dtype=torch.bfloat16)
-
-    core = torch.empty((m, 1536), device=x.device, dtype=torch.bfloat16)
-    out = (
-        torch.empty((m, 7168), device=x.device, dtype=torch.bfloat16)
-        if output_tensor is None
-        else output_tensor
-    )
-    assert (
-        out.shape == (m, 7168)
-        and out.dtype == torch.bfloat16
-        and out.device == x.device
-        and out.is_contiguous()
-    )
-    small_batch = m <= 32
-    rows = 64
-    waves = 8
-    input_panel = 256
-    output_panel = 256
-    _m32_projection[(197 * triton.cdiv(m, rows),)](
-        x,
-        qkvg_weight,
-        beta_forget_weight,
-        packed,
-        m,
-        7168,
-        x.stride(0),
-        qkvg_weight.stride(0),
-        beta_forget_weight.stride(0),
-        6336,
-        True,
-        BM=rows,
-        NW=waves,
-        BK=input_panel,
-        num_warps=waves,
-    )
-    _m64_recurrent_head[(m * 12,)](
-        packed,
-        conv_weight,
-        forget_weight,
-        conv_state,
-        state,
-        state_indices,
-        a_log,
-        dt_bias,
-        norm_weight,
-        core,
-        forget_weight.stride(0),
-        state_indices.stride(0),
-        *conv_state.stride(),
-        state.stride(0),
-        lower_bound,
-        norm_eps,
-        NW=8,
-        M=m,
-        GROUP=2,
-        CORE_STRIDE=core.stride(0),
-        NARROW_SLOT=(
-            m > 32
-            and state.shape[0] * state.stride(0) < 2**31
-            and conv_state.shape[0] * conv_state.stride(0) < 2**31
-        ),
-        num_warps=8,
-        enable_fp_fusion=False,
-        waves_per_eu=1,
-    )
-    _m32_projection[(224 * triton.cdiv(m, rows),)](
-        core,
-        output_weight,
-        output_weight,
-        out,
-        m,
-        1536,
-        core.stride(0),
-        output_weight.stride(0),
-        output_weight.stride(0),
-        7168,
-        False,
-        BM=rows,
-        NW=waves,
-        BK=output_panel,
-        num_warps=waves,
-    )
-    return out, conv_state, state
+        gl.store(OUT + m * CORE_STRIDE + h * 128 + i, out)

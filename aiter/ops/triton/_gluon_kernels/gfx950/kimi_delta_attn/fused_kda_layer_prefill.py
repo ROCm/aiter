@@ -1,9 +1,7 @@
-from typing import NamedTuple
-
-import torch
-import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 @gluon.jit
@@ -294,7 +292,13 @@ def _conv_prepare(
         gl.store(Betas + beta_t * H + h, beta, beta_t < M)
 
 
-@gluon.jit
+_fused_prepare_repr = make_kernel_repr(
+    "_fused_prepare",
+    ["H", "NS", "M", "PROJECT_ROWS"],
+)
+
+
+@gluon.jit(repr=_fused_prepare_repr)
 def _fused_prepare(
     X,
     CW,
@@ -345,9 +349,8 @@ def _fused_prepare(
         )
     else:
         tile = tile * 3 + role - 1
-        if PROJECT_ROWS == 32:
-            if tile >= gl.cdiv(M, 16) * H * 3:
-                return
+        if PROJECT_ROWS == 32 and tile >= gl.cdiv(M, 16) * H * 3:
+            return
         CONV_ROWS: gl.constexpr = 32 if PROJECT_ROWS == 64 else 16
         _conv_prepare(
             X,
@@ -586,7 +589,13 @@ def _response_factor_body(
     gl.amd.cdna4.buffer_store(product, base, 4096 + li)
 
 
-@gluon.jit
+_response_factors_repr = make_kernel_repr(
+    "_response_factors",
+    ["H", "NS", "BULK", "UNROLL", "PREFETCH"],
+)
+
+
+@gluon.jit(repr=_response_factors_repr)
 def _response_factors(
     Prepared,
     Decay,
@@ -808,7 +817,13 @@ def _serial_affine_body(
         )
 
 
-@gluon.jit
+_serial_affine_chunks_repr = make_kernel_repr(
+    "_serial_affine_chunks",
+    ["H", "CHUNK"],
+)
+
+
+@gluon.jit(repr=_serial_affine_chunks_repr)
 def _serial_affine_chunks(
     Prepared,
     Decay,
@@ -836,7 +851,7 @@ def _serial_affine_chunks(
     row_block = gl.program_id(0)
     seq = seq_head // H
     h = seq_head % H
-    first, start, end, chunk_id, chunk = _chunk_bounds(CU, seq, CHUNK)
+    _first, start, end, chunk_id, chunk = _chunk_bounds(CU, seq, CHUNK)
     slot = gl.load(IDX + seq * SI)
     if (start >= end) | (slot < 0):
         return
@@ -1225,19 +1240,16 @@ def _blocked_affine_body(
             gl.store(
                 ZeroFlags + (chunk_id * H + h) * 8 + row_block, is_zero.to(gl.int32)
             )
-            if SPARSE:
-                if not is_zero:
-                    _store_transition(state, map_base, row_block, 32)
+            if SPARSE and not is_zero:
+                _store_transition(state, map_base, row_block, 32)
     else:
         gl.amd.cdna4.buffer_store(state, map_base, r[:, None] * 128 + k[None, :])
-        if PUBLISH:
-
-            if start + CHUNK < end:
-                gl.amd.cdna4.buffer_store(
-                    state.to(gl.bfloat16),
-                    Incoming + ((chunk_id + 1) * H + h) * 16384,
-                    (k[None, :] // 8) * 1024 + r[:, None] * 8 + k[None, :] % 8,
-                )
+        if PUBLISH and start + CHUNK < end:
+            gl.amd.cdna4.buffer_store(
+                state.to(gl.bfloat16),
+                Incoming + ((chunk_id + 1) * H + h) * 16384,
+                (k[None, :] // 8) * 1024 + r[:, None] * 8 + k[None, :] % 8,
+            )
         if ROUNDOFF_SKIP:
             exponent = (state.to(gl.int32, bitcast=True) >> 23) & 255
             minimum = gl.min(gl.min(exponent, 1), 0)
@@ -1259,7 +1271,13 @@ def _blocked_affine_body(
             gl.store(ZeroFlags + (chunk_id * H + h) * 8 + row_block, certificate)
 
 
-@gluon.jit
+_blocked_affine_chunks_repr = make_kernel_repr(
+    "_blocked_affine_chunks",
+    ["H", "CHUNK", "ZERO_SKIP", "SPARSE", "ROUNDOFF_SKIP", "BOUNDED"],
+)
+
+
+@gluon.jit(repr=_blocked_affine_chunks_repr)
 def _blocked_affine_chunks(
     Prepared,
     Factors,
@@ -1400,7 +1418,13 @@ def _blocked_affine_chunks(
         )
 
 
-@gluon.jit
+_chunk_prefix_repr = make_kernel_repr(
+    "_chunk_prefix",
+    ["H", "CHUNK", "BM", "ZERO_SKIP", "SPARSE", "ROUNDOFF_SKIP"],
+)
+
+
+@gluon.jit(repr=_chunk_prefix_repr)
 def _chunk_prefix(
     Maps,
     Incoming,
@@ -1642,7 +1666,13 @@ def _chunk_prefix(
     gl.amd.cdna4.buffer_store(state, S + slot * SS + h * 16384, row_offsets)
 
 
-@gluon.jit
+_published_prefix_repr = make_kernel_repr(
+    "_published_prefix",
+    ["H", "CHUNK", "BM", "LOW_YIELD_DENSE", "BITMAP_SCAN"],
+)
+
+
+@gluon.jit(repr=_published_prefix_repr)
 def _published_prefix(
     Maps,
     Incoming,
@@ -1968,7 +1998,13 @@ def _output_panel(
     )
 
 
-@gluon.jit
+_normalize_output_repr = make_kernel_repr(
+    "_normalize_output",
+    ["H", "CHUNK", "BM", "DIRECT", "HEAD_GROUP"],
+)
+
+
+@gluon.jit(repr=_normalize_output_repr)
 def _normalize_output(
     Coeff,
     CoeffFlags,
@@ -2076,356 +2112,3 @@ def _normalize_output(
             IncomingFlags,
             PREFIX_TILES,
         )
-
-
-class _LaunchPolicy(NamedTuple):
-
-    chunk: int
-    prefix_rows: int
-    project_rows: int
-    output_rows: int
-    direct_output: bool
-    head_group: int
-    blocked: bool
-    zero_skip: bool
-    sparse_maps: bool
-    roundoff_skip: bool
-    sparse_coeff: bool
-    flag_chunks: int
-    factor_unroll: int
-    factor_prefetch: bool
-    bulk_factors: bool
-    bounded_recurrence: bool
-    late_update_factor: bool
-    mirror_prediction: bool
-    early_decay: bool
-
-
-def _launch_policy(m, sequences, heads):
-    blocked = m > 257
-    if not blocked:
-        chunk = 64
-    elif m <= 2048:
-        chunk = 96
-    elif m <= 4096:
-        chunk = 192
-    elif m <= 6144:
-        chunk = 320
-    else:
-        chunk = 320 if sequences >= 8 else 384
-    prefix_rows = 8 if sequences == 1 else 16
-    if blocked and 4 <= sequences < 8:
-        prefix_rows = 32
-    if m == 4096 and sequences == 4:
-        prefix_rows = 16
-    sparse_maps = blocked and sequences >= 8
-    roundoff_skip = (m, sequences) in ((1024, 1), (4096, 1), (4096, 4), (6144, 2))
-    zero_skip = (
-        roundoff_skip
-        or sparse_maps
-        or (m > 6144 and sequences == 1)
-        or (m == 4096 and sequences == 4)
-    )
-    short_factors = m <= 1024 and sequences == 1
-    output_rows = 32 if chunk == 96 or m == 4096 or (m, sequences) == (8192, 1) else 64
-    head_group = 4 if blocked and sequences > 1 and heads % 4 == 0 else 1
-    if m == 4096 and sequences == 1 and heads % 12 == 0:
-        head_group = 12
-    if (m, sequences) == (8192, 1) and heads % 4 == 0:
-        head_group = 4
-    return _LaunchPolicy(
-        chunk=chunk,
-        prefix_rows=prefix_rows,
-        project_rows=64 if m >= 2048 and m % 64 == 0 else 32,
-        output_rows=output_rows,
-        direct_output=output_rows == 32 or (m == 8192 and sequences == 1),
-        head_group=head_group,
-        blocked=blocked,
-        zero_skip=zero_skip,
-        sparse_maps=sparse_maps,
-        roundoff_skip=roundoff_skip,
-        sparse_coeff=m == 8192 and sequences == 1,
-        flag_chunks=(
-            triton.next_power_of_2(triton.cdiv(m, chunk))
-            if zero_skip and not sparse_maps
-            else 0
-        ),
-        factor_unroll=8 if short_factors else (16 if sequences >= 8 else 4),
-        factor_prefetch=short_factors or (1024 < m <= 2048 and sequences == 2),
-        bulk_factors=sequences >= 8,
-        mirror_prediction=(m, sequences)
-        in ((2048, 2), (4096, 1), (4096, 4), (6144, 2), (8192, 1), (8192, 8)),
-        late_update_factor=(m, sequences) in ((2048, 2), (4096, 1)),
-        early_decay=(m, sequences) == (1024, 1),
-        bounded_recurrence=(m, sequences)
-        in ((2048, 2), (4096, 1), (4096, 4), (6144, 2), (8192, 1), (8192, 8)),
-    )
-
-
-def fused_kda_prefill(
-    qkv,
-    gate,
-    forget_a,
-    beta,
-    forget_weight,
-    conv_weight,
-    a_log,
-    dt_bias,
-    norm_weight,
-    conv_state,
-    state,
-    state_indices,
-    cu_seqlens,
-    has_initial_state,
-    *,
-    lower_bound=-5.0,
-    norm_eps=1e-5,
-):
-
-    m, heads, sequences = qkv.shape[0], state.shape[1], state_indices.numel()
-    policy = _launch_policy(m, sequences, heads)
-    chunk = policy.chunk
-    max_chunks = triton.cdiv(m, chunk)
-    map_slots = max_chunks + sequences - 1
-    decay_elements = m * heads * 128
-    if policy.blocked:
-        decay_elements = max(decay_elements, map_slots * heads * 32768)
-    prepared = torch.empty(
-        (m, 3 * heads * 128), dtype=torch.bfloat16, device=qkv.device
-    )
-    decay = torch.empty((decay_elements,), dtype=torch.float32, device=qkv.device)
-    betas = torch.empty((m, heads), dtype=torch.float32, device=qkv.device)
-    prepare_roles = 4 if policy.project_rows == 64 else 8
-    _fused_prepare[(triton.cdiv(m, 32) * heads * prepare_roles,)](
-        qkv,
-        conv_weight,
-        conv_state,
-        state_indices,
-        cu_seqlens,
-        has_initial_state,
-        beta,
-        prepared,
-        betas,
-        forget_a,
-        forget_weight,
-        a_log,
-        dt_bias,
-        decay,
-        lower_bound,
-        heads,
-        sequences,
-        qkv.stride(0),
-        beta.stride(0),
-        state_indices.stride(0),
-        *conv_state.stride(),
-        m,
-        forget_a.stride(0),
-        forget_weight.stride(0),
-        policy.project_rows,
-        num_warps=4,
-        enable_fp_fusion=False,
-    )
-
-    if policy.blocked:
-        maps = decay[: map_slots * heads * 32768].view(map_slots, heads, 256, 128)
-    else:
-        maps = torch.empty(
-            (map_slots, heads, 256, 128), dtype=torch.float32, device=qkv.device
-        )
-    if policy.roundoff_skip and chunk == 96:
-        zero_flags = (
-            betas.view(torch.int32)
-            .view(-1)[: map_slots * heads * 8]
-            .view(map_slots, heads, 8)
-        )
-    else:
-        zero_flags = (
-            torch.empty((map_slots, heads, 8), dtype=torch.int32, device=qkv.device)
-            if policy.zero_skip
-            else None
-        )
-    factor_slots = triton.cdiv(m, 16) + sequences - 1
-    coeff_flags = (
-        torch.empty((factor_slots, heads, 4), dtype=torch.int32, device=qkv.device)
-        if policy.sparse_coeff
-        else None
-    )
-    incoming_flags = (
-        torch.empty(
-            (map_slots, heads, 128 // policy.prefix_rows),
-            dtype=torch.int32,
-            device=qkv.device,
-        )
-        if policy.sparse_coeff
-        else None
-    )
-    coeff = torch.empty((m, heads * 128), dtype=torch.bfloat16, device=qkv.device)
-    if policy.blocked:
-        local = prepared.view(torch.float32)[:, : heads * 128]
-        out = coeff
-        factor_elements = max(factor_slots * heads * 4224, map_slots * heads * 8192)
-        factors = torch.empty(
-            (factor_elements,), dtype=torch.float32, device=qkv.device
-        )
-        incoming = (
-            torch.empty(
-                (map_slots, heads, 16384), dtype=torch.bfloat16, device=qkv.device
-            )
-            if policy.roundoff_skip
-            else factors.view(torch.bfloat16)
-        )
-        output_factors = torch.empty(
-            (factor_slots, heads, 2304), dtype=torch.bfloat16, device=qkv.device
-        )
-        _response_factors[(heads, factor_slots)](
-            prepared,
-            decay,
-            betas,
-            factors,
-            output_factors,
-            state_indices,
-            cu_seqlens,
-            heads,
-            state_indices.stride(0),
-            sequences,
-            policy.bulk_factors,
-            policy.factor_unroll,
-            policy.factor_prefetch,
-            num_warps=1,
-            enable_fp_fusion=True,
-        )
-        recurrence_grid = (sequences * heads, 8, max_chunks)
-        _blocked_affine_chunks[recurrence_grid](
-            prepared,
-            factors,
-            output_factors,
-            maps,
-            zero_flags,
-            coeff_flags,
-            coeff,
-            local,
-            state,
-            has_initial_state,
-            state_indices,
-            cu_seqlens,
-            qkv,
-            conv_state,
-            heads,
-            state_indices.stride(0),
-            state.stride(0),
-            qkv.stride(0),
-            *conv_state.stride(),
-            chunk,
-            local.stride(0),
-            policy.zero_skip,
-            policy.sparse_maps,
-            policy.roundoff_skip,
-            policy.bounded_recurrence,
-            policy.sparse_coeff,
-            policy.late_update_factor,
-            policy.mirror_prediction,
-            policy.early_decay,
-            incoming,
-            policy.roundoff_skip,
-            MIRROR_UPDATE=(m, sequences) == (4096, 1),
-            num_warps=1,
-            enable_fp_fusion=True,
-        )
-    else:
-        incoming = maps
-        local = torch.empty((m, heads * 128), dtype=torch.float32, device=qkv.device)
-        out = prepared.view(-1)[: m * heads * 128].view(m, heads * 128)
-        _serial_affine_chunks[(16, sequences * heads, max_chunks)](
-            prepared,
-            decay,
-            betas,
-            maps,
-            coeff,
-            local,
-            state,
-            has_initial_state,
-            state_indices,
-            cu_seqlens,
-            qkv,
-            conv_state,
-            heads,
-            state_indices.stride(0),
-            state.stride(0),
-            qkv.stride(0),
-            *conv_state.stride(),
-            chunk,
-            num_warps=1,
-            enable_fp_fusion=True,
-        )
-    if policy.roundoff_skip:
-        _published_prefix[(sequences * heads, 128 // policy.prefix_rows)](
-            maps,
-            incoming,
-            zero_flags,
-            state,
-            state_indices,
-            cu_seqlens,
-            heads,
-            state_indices.stride(0),
-            state.stride(0),
-            chunk,
-            policy.prefix_rows,
-            policy.flag_chunks,
-            LOW_YIELD_DENSE=(m, sequences) in ((1024, 1), (6144, 2)),
-            BITMAP_SCAN=(m, sequences) in ((4096, 1), (6144, 2)),
-            num_warps=8,
-        )
-    else:
-        _chunk_prefix[(sequences * heads, 128 // policy.prefix_rows)](
-            maps,
-            incoming,
-            zero_flags,
-            state,
-            state_indices,
-            cu_seqlens,
-            heads,
-            state_indices.stride(0),
-            state.stride(0),
-            chunk,
-            policy.prefix_rows,
-            policy.blocked,
-            policy.zero_skip,
-            policy.sparse_maps,
-            policy.flag_chunks,
-            policy.roundoff_skip,
-            incoming_flags,
-            policy.sparse_coeff,
-            COPY_INITIAL=(m, sequences) == (4096, 1),
-            PROPAGATE_BOUND=(m, sequences) in ((1024, 1), (4096, 1)),
-            OMIT_FINAL_EXP=(m, sequences) == (4096, 4),
-            num_warps=8,
-            waves_per_eu=6 if (m, sequences) == (2048, 2) else 0,
-        )
-    output_rows = policy.output_rows
-    _normalize_output[(triton.cdiv(chunk, output_rows), sequences * heads, max_chunks)](
-        coeff,
-        coeff_flags,
-        local,
-        maps,
-        incoming,
-        gate,
-        norm_weight,
-        out,
-        state_indices,
-        cu_seqlens,
-        norm_eps,
-        heads,
-        state_indices.stride(0),
-        gate.stride(0),
-        chunk,
-        output_rows,
-        policy.blocked,
-        local.stride(0),
-        policy.direct_output,
-        policy.head_group,
-        policy.sparse_coeff,
-        incoming_flags,
-        128 // policy.prefix_rows,
-        num_warps=4,
-    )
-    return out, conv_state, state
