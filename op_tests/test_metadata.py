@@ -314,6 +314,73 @@ def test_metadata(
     return ret
 
 
+def check_intra_batch_kv_coverage(nhead, dtype, kvtype):
+    """intra_batch_mode (v1_0): each batch's works must tile its KV range exactly.
+
+    gfx942 splits every sequence 16 ways, so short contexts reach the case where a
+    tail of <= 4 tokens is folded into the previous split and the split count drops
+    to 1. Returns the kv lengths whose works leave a gap or an overlap.
+    """
+    kv_lens = list(range(1, 65)) + [127, 128, 129, 2048, 2049]
+    batch_size = len(kv_lens)
+    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32)
+    kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32)
+    kv_indptr[1:] = torch.tensor(kv_lens, dtype=torch.int32).cumsum(0)
+    info = aiter.get_mla_metadata_info_v1(
+        batch_size,
+        MAX_SEQLEN_QO,
+        nhead,
+        dtype,
+        kvtype,
+        is_sparse=False,
+        fast_mode=False,
+        num_kv_splits=MAX_SPLIT_PER_BATCH,
+        intra_batch_mode=True,
+    )
+    names = ("work_meta_data", "work_indptr", "work_info_set")
+    names += ("reduce_indptr", "reduce_final_map", "reduce_partial_map")
+    outs = alloc_outputs(dict(zip(names, info)))
+    aiter.get_mla_metadata_v1(
+        qo_indptr,
+        kv_indptr,
+        torch.ones(batch_size, dtype=torch.int32),
+        nhead // KIMI_NHEAD_KV,
+        KIMI_NHEAD_KV,
+        IS_CAUSAL,
+        outs["work_meta_data"],
+        outs["work_info_set"],
+        outs["work_indptr"],
+        outs["reduce_indptr"],
+        outs["reduce_final_map"],
+        outs["reduce_partial_map"],
+        page_size=PAGE_SIZE,
+        kv_granularity=KV_GRANULARITY,
+        max_seqlen_qo=MAX_SEQLEN_QO,
+        uni_seqlen_qo=UNI_SEQLEN_QO,
+        fast_mode=False,
+        max_split_per_batch=MAX_SPLIT_PER_BATCH,
+        intra_batch_mode=True,
+        dtype_q_nope=dtype,
+        dtype_kv_nope=kvtype,
+    )
+    num_works = int(outs["work_indptr"][-1].item())
+    works = outs["work_info_set"].view(-1, 8)[:num_works].tolist()
+    kv = kv_indptr.tolist()
+    bad = []
+    for b, kv_len in enumerate(kv_lens):
+        pos = kv[b]
+        for _, _, _, _, kv_start, kv_end, _, _ in sorted(
+            (w for w in works if w[0] == b), key=lambda w: w[4]
+        ):
+            if kv_start != pos:
+                pos = None
+                break
+            pos = kv_end
+        if pos != kv[b + 1]:
+            bad.append(kv_len)
+    return bad
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
@@ -415,6 +482,10 @@ def main():
         "without comparing anything"
     )
     assert all_match, "parallel MLA metadata planner diverged from serial reference"
+
+    if get_gfx() == "gfx942":
+        bad = check_intra_batch_kv_coverage(nhead, dtype, kvtype)
+        assert not bad, f"intra_batch_mode leaves KV uncovered for kv_len {bad}"
 
 
 if __name__ == "__main__":
