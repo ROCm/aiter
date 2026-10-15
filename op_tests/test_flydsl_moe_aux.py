@@ -40,6 +40,7 @@ from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
     build_moe_contiguous_psum_remap_ep_module,
     build_moe_contiguous_psum_remap_module,
     build_moe_route_psum_fused_module,
+    build_moe_route_psum_herd_module,
 )
 from aiter.ops.flydsl.kernels.moe_g2l_lut import build_moe_g2l_lut_module
 from aiter.ops.flydsl.kernels.moe_gather_reduce import build_moe_gather_reduce_module
@@ -118,6 +119,23 @@ def run_torch_scatter_copy(src, dst, dst_src):
     keep = dst_src >= 0
     out[keep] = src[dst_src[keep].long()]
     return out
+
+
+def run_torch_herd_drop(cand_ids, cand_scores, E, scale):
+    tokens, kp1 = cand_ids.shape
+    pop = torch.bincount(cand_ids.reshape(-1).long(), minlength=E)
+    order = torch.argsort(cand_ids, dim=1)
+    ids, scores = cand_ids.gather(1, order), cand_scores.gather(1, order)
+    cp = pop[ids.long()]
+    least = cp == cp.min(1, keepdim=True).values
+    s = torch.where(least, scores, torch.full_like(scores, float("inf")))
+    least &= s == s.min(1, keepdim=True).values
+    cols = torch.arange(kp1).expand(tokens, kp1)
+    drop = torch.where(least, cols, torch.full_like(cols, kp1)).min(1).values
+    keep = cols != drop[:, None]
+    kept_ids = ids[keep].reshape(tokens, kp1 - 1)
+    kept = scores[keep].reshape(tokens, kp1 - 1)
+    return kept_ids, kept / kept.sum(1, keepdim=True).clamp_min(1e-20) * scale
 
 
 def run_torch_gather_reduce(grouped, rmap, w, dtype):
@@ -881,6 +899,73 @@ def test_route_psum_fused(numel, E, tile_m):
 
 
 @benchmark()
+def test_route_psum_herd(tokens, E, topk, tile_m):
+    launch = build_moe_route_psum_herd_module(topk)
+    kp1 = topk + 1
+    scale = 2.5
+    max_m = max(512, 4 * tokens * topk // E)
+    cand_ids = torch.rand(tokens, E).topk(kp1, dim=1).indices.to(I32)
+    cand_scores = torch.rand(tokens, kp1, dtype=torch.float32)
+    kept_ids, kept_w = run_torch_herd_drop(cand_ids, cand_scores, E, scale)
+    counts = torch.bincount(kept_ids.reshape(-1).long(), minlength=E).to(I32)
+    ref_starts, ref_psum, _ = run_torch_psum(counts, tile_m)
+
+    numel = tokens * topk
+    rows = torch.full((numel,), -99, dtype=I32)
+    gw = torch.full((numel,), -99.0, dtype=torch.float32)
+    masked = torch.full((E,), -99, dtype=I32)
+    starts = torch.full((E,), -99, dtype=I32)
+    psum = torch.full((E,), -99, dtype=I32)
+
+    def fn():
+        launch(
+            ptr_arg(cand_ids),
+            ptr_arg(cand_scores),
+            ptr_arg(rows),
+            ptr_arg(gw),
+            ptr_arg(masked),
+            ptr_arg(starts),
+            ptr_arg(psum),
+            tokens,
+            E,
+            max_m,
+            tile_m,
+            scale,
+            stream=torch.cuda.current_stream().cuda_stream,
+        )
+
+    nbytes = tokens * kp1 * 2 * 4 + numel * 2 * 4 + E * 3 * 4
+    ret = {"gfx": get_gfx()}
+    candidates = {"eager": fn, "cudagraph": _graph_runner(fn)}
+    for name, run in candidates.items():
+        rows.fill_(-99)
+        _, us = run_perftest(run)
+        err = checkAllclose(
+            counts.float(), masked.float(), rtol=0, atol=0, msg=f"{name}: masked_m"
+        )
+        checkAllclose(
+            ref_starts.float(), starts.float(), rtol=0, atol=0, msg=f"{name}: starts"
+        )
+        checkAllclose(
+            ref_psum.float(), psum.float(), rtol=0, atol=0, msg=f"{name}: psum"
+        )
+        checkAllclose(
+            kept_w.reshape(-1), gw, rtol=1e-6, atol=1e-6, msg=f"{name}: gather_w"
+        )
+        r = rows.cpu().long()
+        ids = kept_ids.reshape(-1).cpu().long()
+        lo = ref_starts.cpu().long()[ids]
+        assert bool(
+            ((r >= lo) & (r < lo + counts.cpu().long()[ids])).all()
+        ), f"{name}: row outside its kept expert's contiguous band"
+        assert len(set(r.tolist())) == numel, f"{name}: rows not a bijection"
+        ret[f"{name} us"] = us
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+@benchmark()
 def test_route_g2l_fused(numel, E_global, n_buckets, w_dtype):
     """Single-block g2l-LUT build fused into the EP route pass.
 
@@ -1172,6 +1257,19 @@ def main():
             for n, E, tm in itertools.product(
                 args.numel, [e for e in args.experts if e <= 512], args.tile_m
             )
+        ],
+    )
+    summarize(
+        "moe_route_psum_herd",
+        [
+            test_route_psum_herd(t, E, tk, tm)
+            for t, E, tk, tm in itertools.product(
+                args.tokens + [128],
+                [e for e in args.experts if e <= 512] + [256],
+                args.topk + [6],
+                args.tile_m,
+            )
+            if tk + 1 <= E
         ],
     )
     summarize(
