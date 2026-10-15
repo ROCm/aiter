@@ -8,10 +8,9 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_d
 from flydsl.compiler.protocol import dsl_size_of
-from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import math as fmath
-from flydsl.expr.typing import ReductionOp, T
-from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.typing import ReductionOp
 
 from .. import buffer_ops, dpp_utils
 from ..tensor_shim import buf_base_i64, ptr_buf_tensor
@@ -34,10 +33,8 @@ class PaDecodeLds:
         lds = fx.SharedAllocator().allocate(self.storage_type).peek()
         self.base = fx.recast_iter(fx.Uint8, lds.buf.ptr)  # byte-addressed base
         if const_expr(self.traits.nhd_layout):
-            # The waitcnt pass treats every LDS access after an LDS-DMA as a
-            # possible alias of it and drains vmcnt, prefetched K included,
-            # unless scoped metadata proves otherwise. The NHD V region gets
-            # its own scope; all other LDS traffic is marked disjoint from it.
+            # Raw alias scopes (no FlyDSL op carries them) keep waitcnt from draining
+            # vmcnt after V DMAs. Explicit waits order the V reads (other scope).
             domain = '#llvm.alias_scope_domain<id = "pa_decode_lds">'
             v_scope, other_scope = (
                 ir.ArrayAttr.get(
@@ -68,33 +65,61 @@ class PaDecodeLds:
 
     def load(self, byte_off, elem_ty, n):
         if const_expr(self.traits.nhd_layout):
+            # Raw llvm.load: fx.ptr_load cannot attach the alias scopes.
             raw = llvm_d.load(
-                T.vec(n, elem_ty.ir_type),
-                fx.as_ir_value(fx.to_llvm_ptr(self.pointer(byte_off, elem_ty))),
+                fx.Vector.make_type(n, elem_ty),
+                self.pointer(byte_off, elem_ty).llvm_ptr,
                 alignment=dsl_size_of(elem_ty),
                 **self.other_scopes,
             )
-            return Vec(raw)
+            return fx.Vector(raw)
         return fx.ptr_load(
             self.pointer(byte_off, elem_ty), result_type=fx.Vector.make_type(n, elem_ty)
         )
 
     def store(self, byte_off, elem_ty, vec):
         if const_expr(self.traits.nhd_layout):
+            # Raw llvm.store: fx.ptr_store cannot attach the alias scopes.
             llvm_d.store(
                 fx.as_ir_value(vec),
-                fx.as_ir_value(fx.to_llvm_ptr(self.pointer(byte_off, elem_ty))),
+                self.pointer(byte_off, elem_ty).llvm_ptr,
                 alignment=dsl_size_of(elem_ty),
                 **self.other_scopes,
             )
             return
         fx.ptr_store(vec, self.pointer(byte_off, elem_ty))
 
+    def load_tr8_b64(self, byte_off):
+        """ds_read_tr8_b64 at ``byte_off``, as one i64 pack."""
+        # Not the LDSReadTrans8_64b atom: it drops the alias scopes, so waitcnt
+        # would also wait for the next tile's V DMA into the other buffer.
+        raw = fx.rocdl.ds_read_tr8_b64(
+            fx.Vector.make_type(2, fx.Int32),
+            self.pointer(byte_off, fx.Int32).llvm_ptr,
+            **self.other_scopes,
+        ).result
+        return fx.Vector(raw).bitcast(fx.Int64)[0]
+
+    def dma_v(self, rsrc, lds_ptr, voffset):
+        """16-byte nontemporal LDS DMA of ``rsrc`` + ``voffset`` to ``lds_ptr``."""
+        # Not BufferCopyLDS128b: cached aux, no alias scopes. Build lds_ptr before
+        # voffset: the voffset VALU op then fills the M0 hazard slot (no s_nop).
+        fx.rocdl.raw_ptr_buffer_load_lds(
+            rsrc,
+            lds_ptr.llvm_ptr,
+            size=16,
+            voffset=voffset,
+            soffset=0,
+            offset=0,
+            aux=NT_LOAD,
+            **self.v_dma_scopes,
+        )
+
     def barrier_keep_dma(self):
-        # Retire this CTA's LDS writes, then sync. s_barrier does not wait for
-        # the in-flight V copy; fx.rocdl.barrier() would.
-        rocdl.s_waitcnt(lgkmcnt=0)
-        rocdl.s_barrier()
+        # Retire LDS writes, then sync without vmcnt: fx.barrier() also waits
+        # vmcnt(0), draining the in-flight V DMA and the K prefetch.
+        fx.rocdl.s_waitcnt(lgkmcnt=0)
+        fx.rocdl.s_barrier()
 
     def row_offset(self, byte_off, m_idx, width, elem_ty):
         return byte_off + m_idx * (width * dsl_size_of(elem_ty))
@@ -347,6 +372,8 @@ class PaDecodeKVLoader:
 
         def _load(elem_idx):
             # FP8 elements are one byte, so the element index is the byte offset.
+            # inttoptr, not add_offset: the GEP form reschedules the K loads and
+            # splits their vmcnt waits (q4 loop: one wait becomes seven).
             ptr = fx.Pointer(fx.inttoptr(ptr_ty, base + fx.Int64(elem_idx)))
             return fx.generic_load(ptr, dtype=fx.Int32, count=4, nontemporal=True)
 
@@ -743,9 +770,11 @@ class PaDecodeKVLoader:
         # wrap every load in a waterfall loop. The page comes from LDS, staged
         # a tile earlier; reading it from the block table here would make the
         # descriptor wait on a global load and drain the K prefetch with it.
-        warp_u = fx.Int32(rocdl.readfirstlane(T.i32, fx.as_ir_value(self.ctx.warp)))
+        # fx.coop.warp_broadcast stays in VGPRs. readfirstlane of the uniform
+        # warp keeps each DMA's voffset op in its M0 hazard slot (else s_nop).
+        warp_u = fx.Int32(fx.rocdl.readfirstlane(fx.Int32.ir_type, self.ctx.warp))
         page = fx.Int32(
-            rocdl.readfirstlane(T.i32, fx.as_ir_value(self.read_k_pages()[0]))
+            fx.rocdl.readfirstlane(fx.Int32.ir_type, self.read_k_pages()[0])
         )
         # Bound the page by the live context so hardware zero-fills the tail.
         # Unwritten tails and block-0 padding can hold FP8 NaN, and 0 * NaN =
@@ -761,7 +790,7 @@ class PaDecodeKVLoader:
             live, fx.Int32(traits.block_size)
         )
         n_records = fx.Int32(
-            rocdl.readfirstlane(T.i32, fx.as_ir_value(live * self.ctx.stride_v_token))
+            fx.rocdl.readfirstlane(fx.Int32.ir_type, live * self.ctx.stride_v_token)
         )
         page_base = self.nhd_byte(
             page,
@@ -783,32 +812,21 @@ class PaDecodeKVLoader:
         for i in range_constexpr(traits.NHD_DMAS):
             tok = i * traits.NHD_TOKS_PER_DMA + (self.ctx.lane >> 4)
             band = self.ctx.lane & 15
-            rocdl.raw_ptr_buffer_load_lds(
+            self.lds.dma_v(
                 v_page,
-                fx.as_ir_value(
-                    fx.to_llvm_ptr(self.lds.pointer(region + i * (WAVE * 16), fx.Int32))
-                ),
-                size=16,
-                voffset=fx.as_ir_value(
-                    tok * self.ctx.stride_v_token
-                    + self.nhd_band_slot(warp_u, tok, band)
-                ),
-                soffset=0,
-                offset=0,
-                aux=NT_LOAD,
-                **self.lds.v_dma_scopes,
+                self.lds.pointer(region + i * (WAVE * 16), fx.Int32),
+                tok * self.ctx.stride_v_token + self.nhd_band_slot(warp_u, tok, band),
             )
+        # Scheduling fence: DMAs mixed into softmax tighten the loop-top K wait.
         fx.rocdl.sched_barrier(0)
 
     def nhd_v_gather(self, buf):
         """Read the staged V as the i64 packs ``load_v`` returns.
 
-        Callers wait for the DMA and pass a barrier first. The reads are scoped
-        disjoint from the DMA so the waitcnt pass does not also wait for the
-        next tile's DMA into the other buffer. The 16-lane group covers one
-        8-token pack: lane16 supplies row lane16>>1 and the half-chunk
-        lane16&1, and holds head element band*16+lane16 for all 8 tokens once
-        transposed with ds_read_tr8_b64.
+        Callers wait for the DMA and pass a barrier first. The 16-lane group
+        covers one 8-token pack: lane16 supplies row lane16>>1 and the
+        half-chunk lane16&1, and holds head element band*16+lane16 for all 8
+        tokens once transposed with ds_read_tr8_b64.
         """
         traits = self.traits
         row = self.ctx.lane16 >> 1
@@ -827,18 +845,7 @@ class PaDecodeKVLoader:
             ops = []
             for pack in range_constexpr(traits.NVOPS):
                 # Constant row stride per pack: a DS offset immediate.
-                raw = rocdl.ds_read_tr8_b64(
-                    T.vec(2, T.i32),
-                    fx.as_ir_value(
-                        fx.to_llvm_ptr(
-                            self.lds.pointer(
-                                base + pack * (8 * traits.head_dim), fx.Int32
-                            )
-                        )
-                    ),
-                    **self.lds.other_scopes,
-                ).result
-                ops.append(Vec(raw).bitcast(fx.Int64)[0])
+                ops.append(self.lds.load_tr8_b64(base + pack * (8 * traits.head_dim)))
             gathered.append(ops)
         return gathered
 

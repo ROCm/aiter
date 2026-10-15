@@ -10,7 +10,7 @@ explicit SSA values. Every LDS publication/retirement barrier stays here.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import ReductionOp
 
 from .op_epilog import PaDecodeEpilogue
@@ -517,7 +517,7 @@ class PaDecodePipeline:
         if const_expr(self.traits.nhd_layout and self.traits.NHD_V_BUFS == 1):
             # Finish V before the next K load joins the vmcnt chain.
             fx.rocdl.sched_barrier(0)
-            rocdl.s_waitcnt(vmcnt=0)
+            fx.rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
             v_vh_shared = self.kv.nhd_v_gather(0)
         if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
@@ -590,9 +590,9 @@ class PaDecodePipeline:
             # only by the next tile's K (none on the last tile) and DMA.
             fx.rocdl.sched_barrier(0)
             if tt1 < self.ctx.part_end:
-                rocdl.s_waitcnt(vmcnt=self.traits.NHD_K_LOADS + self.traits.NHD_DMAS)
+                fx.rocdl.s_waitcnt(vmcnt=self.traits.NHD_K_LOADS + self.traits.NHD_DMAS)
             else:
-                rocdl.s_waitcnt(vmcnt=self.traits.NHD_DMAS)
+                fx.rocdl.s_waitcnt(vmcnt=self.traits.NHD_DMAS)
             self.lds.barrier_keep_dma()
         else:
             gpu.barrier()
