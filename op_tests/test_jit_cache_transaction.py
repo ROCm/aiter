@@ -764,6 +764,7 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
             "AITER_LOG_MORE": 0,
             "AITER_DISABLE_KERNARG_PRELOAD": True,
             "AITER_ROOT_DIR": self.root,
+            "JIT_LIB_EXT": ".so",
             "AITER_CSRC_DIR": self.root,
             "CK_3RDPARTY_DIR": os.path.join(self.root, "absent_ck"),
             "HIP_KITTENS_DIR": os.path.join(self.root, "absent_kittens"),
@@ -1537,8 +1538,13 @@ class TestOpusRequestedKids(unittest.TestCase):
                         dispatch = _read(
                             os.path.join(tmp, "opus_bmm_mxscale_kid_dispatch.h")
                         )
+                        # Anchor on the kernel pointer, not on "{ <int>,":
+                        # the header carries a second table mapping each kid to
+                        # its { GROUP_N, GROUP_K }, whose inner braces the bare
+                        # pattern reads as kids and so reports 1 / 32 / 128 as
+                        # spurious extras.
                         emitted = {
-                            int(kid) for kid in re.findall(r"\{\s*(\d+),", dispatch)
+                            int(kid) for kid in re.findall(r"\{\s*(\d+),\s*&", dispatch)
                         }
                         self.assertEqual(emitted, set(bmm_kids))
                 else:

@@ -23,6 +23,7 @@ from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 
 _LOGGER = AiterTritonLogger()
 
@@ -95,8 +96,30 @@ def get_kernel_config_triton(m, n, k, routing_data):
     num_xcds = 8
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_stages = 1
     split_k = 1
+
+    # Entries carry no BLOCK_SIZE_M: block_m is the dispatch key, not a
+    # tunable, because routing fixes it for the layer.
+    tuned = get_moe_dispatch("A16W4", get_arch(), "triton").get(
+        f"bm{block_m}_n{n}_k{k}"
+    )
+    if tuned is not None:
+        return {
+            "block_m": block_m,
+            "block_n": tuned["BLOCK_SIZE_N"],
+            "block_k": tuned["BLOCK_SIZE_K"],
+            "num_warps": tuned["num_warps"],
+            "num_stages": tuned["num_stages"],
+            "group_m": group_m,
+            "xcd_swizzle": xcd_swizzle,
+            "w_cache_modifier": w_cache_modifier,
+            "split_k": split_k,
+            "waves_per_eu": tuned.get("waves_per_eu", 0),
+            "matrix_instr_nonkdim": tuned.get("matrix_instr_nonkdim", 16),
+            "kpack": tuned.get("kpack", 1),
+        }
+
+    num_stages = 1
     block_k = 256
 
     if block_m == 16:
@@ -331,6 +354,8 @@ def moe_gemm_a16w4(
     unpadded_N=None,
     unpadded_K=None,
     backend: str | None = None,
+    expert_map=None,
+    gate_valid=None,
 ):
     """
     Computes MoE GEMM with 16-bit activations and MxFP4 weights
@@ -470,6 +495,23 @@ def moe_gemm_a16w4(
         config["split_k"],
         x.device,
     )
+    if expert_map is not None:
+        assert (
+            backend == "triton"
+        ), "expert_map (EP) is only supported on the triton backend"
+        # Non-local experts' output rows are left unwritten (no zero-fill), so the
+        # combine must skip their gates -- gate_valid is required to do that.
+        assert (
+            gate_valid is not None
+        ), "expert_map (EP) requires gate_valid so the combine skips non-local gates"
+        # The kernel indexes ExpertMap as a flat pointer, so enforce the same
+        # contiguous int32 contract the fused routing path uses.
+        assert (
+            expert_map.is_contiguous()
+            and expert_map.dtype == torch.int32
+            and expert_map.device == x.device
+            and expert_map.numel() == routing_data.n_expts_tot
+        ), "expert_map must be a contiguous int32 [n_expts_tot] tensor on x.device"
     stride_bias = None if bias is None else bias.stride(0)
 
     # moe metadata
@@ -679,6 +721,7 @@ def moe_gemm_a16w4(
             expt_token_offs_raw,
             expt_hist_sum,
             expt_block_pid_map,
+            expert_map,
             grid_m,
             grid_n,
             apply_swiglu_matmul,
@@ -687,6 +730,7 @@ def moe_gemm_a16w4(
             reduction_n_matmul,
             swiglu_add_residual,
             routing_data.n_expts_act,
+            expert_map is not None,
             config["block_m"],
             config["block_n"],
             config["block_k"],
@@ -711,6 +755,13 @@ def moe_gemm_a16w4(
         if scatter_indx is None
         else scatter_indx.view(-1, routing_data.n_expts_act)
     )
+    # Expert parallelism: skip gates whose expert is not on this rank instead of
+    # zero-filling their (unwritten) output rows, so the combine never reads them.
+    group_valid = (
+        None
+        if (gate_valid is None or scatter_indx is None)
+        else gate_valid.view(-1, routing_data.n_expts_act)
+    )
     y_final = reduce_grouped(
         y,
         group_indx,
@@ -721,6 +772,7 @@ def moe_gemm_a16w4(
         reduction_n_reduction,
         out_dtype=out_dtype,
         swiglu_add_residual=swiglu_add_residual,
+        indx_valid=group_valid,
     )
 
     return y_final
