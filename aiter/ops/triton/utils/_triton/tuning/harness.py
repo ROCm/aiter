@@ -22,8 +22,10 @@ Record fields:
   is_tuned  baseline only: a specialized file served this shape
   us, us_min, us_max, tflops   per-launch time from graph replay (median, min, max)
   rel       us / the installed config's time on the same GPU (status reference, timed when
-            the worker starts): GPUs differ by a few percent, so the final-round shortlist
-            compares rel, not us
+            the worker starts): GPUs differ by a few percent, so screening and the final-round
+            shortlist compare rel, not us
+  screened  true when one replay was already slower than --screen x the fastest record of
+            this M: the candidate stopped there and us is that replay
   error     the exception text when status is error
   dur_s     wall time of the candidate
 """
@@ -72,18 +74,31 @@ def make_cold_copies(inputs, cold_mb):
 Timing = namedtuple("Timing", "median low high screened")
 
 
-def time_with_cuda_graph(call, config, copies, calls=24, replays=25):
+def time_with_cuda_graph(call, config, copies, calls=24, replays=25, abort_above=None):
     """Median/min/max microseconds per launch: one eager warm-up (compiles), then graph replay.
 
-    Every launch gets a deep copy of config because the wrappers mutate it.
+    Every launch gets a deep copy of config because the wrappers mutate it. With abort_above
+    (microseconds per launch), one replay after the first warm-up replay decides: a candidate
+    slower than that stops there (screened), so a far-off candidate costs a few launches. A
+    candidate whose eager warm-up alone takes over 1 ms and 1.25x abort_above stops right
+    there: at that length the launch overhead in the eager time does not matter, and the
+    margin covers the cold caches of a first launch.
     """
     import torch
 
     stream = torch.cuda.Stream()
     n_calls = max(calls, len(copies))
     with torch.cuda.stream(stream):
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
+            enable_timing=True
+        )
+        start.record()
         call(copy.deepcopy(config), *copies[0])
+        end.record()
         torch.cuda.synchronize()
+        eager = start.elapsed_time(end) * 1e3
+        if abort_above is not None and eager > max(1.25 * abort_above, 1000):
+            return Timing(eager, eager, eager, True)
         graph = torch.cuda.CUDAGraph()
         gc.disable()
         try:
@@ -93,7 +108,13 @@ def time_with_cuda_graph(call, config, copies, calls=24, replays=25):
         finally:
             gc.enable()
     torch.cuda.synchronize()
-    for _ in range(3):
+
+    graph.replay()
+    if abort_above is not None:
+        first = _timed_replay(graph, n_calls)
+        if first > abort_above:
+            return Timing(first, first, first, True)
+    for _ in range(2):
         graph.replay()
     torch.cuda.synchronize()
     times = sorted(
@@ -187,10 +208,34 @@ def reference_time(spec, shape, backend, keys, call, copies, calls, replays):
         return None
 
 
+def fastest_rel(out):
+    """Lowest rel of the fully timed ok records of this results file (all GPUs), or None."""
+    from _utils import read_records
+
+    rels = [
+        r["rel"]
+        for r in read_records(out).values()
+        if r["status"] == "ok" and not r.get("screened") and "rel" in r
+    ]
+    return min(rels, default=None)
+
+
 def benchmark(
-    spec, shape, backend, arch, call, inputs, candidates, out, calls, replays, cold_mb
+    spec,
+    shape,
+    backend,
+    arch,
+    call,
+    inputs,
+    candidates,
+    out,
+    calls,
+    replays,
+    cold_mb,
+    screen,
 ):
     keys, _, _ = load_defaults(spec, backend)
+    best_rel = fastest_rel(out) if screen else None
     copies = make_cold_copies(inputs, cold_mb)
     common = {
         "kernel": spec.name,
@@ -238,8 +283,12 @@ def benchmark(
                 if reason:
                     record.update(status="skipped", reason=reason)
             if record["status"] == "ok":
+                # the baseline is never screened; nor is anything before a first full timing
+                abort_above = None
+                if best_rel and reference and not is_baseline:
+                    abort_above = screen * best_rel * reference  # in this GPU's us
                 timing = time_with_cuda_graph(
-                    call, candidate, copies, calls, replays
+                    call, candidate, copies, calls, replays, abort_above
                 )
                 record.update(
                     us=round(timing.median, 3),
@@ -249,6 +298,10 @@ def benchmark(
                 )
                 if reference:
                     record["rel"] = round(timing.median / reference, 4)
+                if timing.screened:
+                    record["screened"] = True
+                elif screen and reference:
+                    best_rel = min(best_rel or record["rel"], record["rel"])
         except Exception as e:  # noqa: BLE001
             # a failing candidate is a result, not a crash
             record.update(
@@ -286,6 +339,12 @@ def main(argv=None):
     parser.add_argument(
         "--cold-mb", type=int, default=1024, help="byte budget for cold input copies"
     )
+    parser.add_argument(
+        "--screen",
+        type=float,
+        default=0,
+        help="stop a candidate after one replay when it is slower than this x the fastest (0: off)",
+    )
     args = parser.parse_args(argv)
     signal.signal(signal.SIGTERM, stop_after_this_candidate)
 
@@ -315,6 +374,7 @@ def main(argv=None):
         args.calls,
         args.replays,
         args.cold_mb,
+        args.screen,
     )
     return 0
 

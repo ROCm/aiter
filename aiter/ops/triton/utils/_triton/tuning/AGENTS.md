@@ -69,7 +69,9 @@ here. Update this file in the same change as any behaviour change.
    on several GPUs without it is skipped. Each timing worker times the installed
    config on its own GPU first (`reference`) and records `rel` = time / that reference;
    the final-round shortlist compares `rel`, so GPU-to-GPU differences do not
-   decide. Never two drivers on one GPU.
+   decide. `--screen X` stops a candidate after
+   one replay when its `rel` is above X times the lowest fully timed `rel` of its M (`screened`);
+   it never applies to the baseline or the final round. Never two drivers on one GPU.
 9. Call the public wrappers (`aiter.ops.triton.gemm...`) only, never `_triton_kernels` or
    `_gluon_kernels`; pass `backend=` where the wrapper takes it and refuse a backend the wrapper
    cannot select (`KernelSpec.supports`).

@@ -91,6 +91,13 @@ def parse_args(argv=None):
         default=600,
         help="seconds allowed for planning and for a worker to become ready",
     )
+    parser.add_argument(
+        "--screen",
+        type=float,
+        default=0,
+        help="stop a candidate after one replay when it is slower than this x the fastest "
+        "record of its M (0: off); the final round always times fully",
+    )
     parser.add_argument("--replays", type=int, default=25)
     parser.add_argument("--calls", type=int, default=24)
     parser.add_argument("--cold-mb", type=int, default=1024)
@@ -266,7 +273,7 @@ def run_worker(command, env, log_path, stall, setup_timeout):
     return "failed" if ready or became_ready() else "setup_failed"
 
 
-def run_batch(spec, shape, backend, batch, out, gpu, args):
+def run_batch(spec, shape, backend, batch, out, gpu, args, screen):
     """One worker process on one GPU for these candidates; marks the candidate it died on."""
     env = dict(os.environ, HIP_VISIBLE_DEVICES=str(gpu))
     todo_file, log_path = f"{out}.gpu{gpu}.todo.json", f"{out}.gpu{gpu}.log"
@@ -283,6 +290,8 @@ def run_batch(spec, shape, backend, batch, out, gpu, args):
             str(args.calls),
             "--cold-mb",
             str(args.cold_mb),
+            "--screen",
+            str(screen),
             "--configs",
             todo_file,
             "--out",
@@ -312,7 +321,7 @@ def run_batch(spec, shape, backend, batch, out, gpu, args):
             print(f"  gpu {gpu}: {status}: {json.dumps(candidate)}", flush=True)
 
 
-def sweep_shard(spec, shape, backend, candidates, out, gpu, args):
+def sweep_shard(spec, shape, backend, candidates, out, gpu, args, screen):
     """Run every candidate of this shard that has no final record yet, in batches, on one GPU."""
     while not STOP.is_set():
         records = read_records(out)
@@ -328,7 +337,7 @@ def sweep_shard(spec, shape, backend, candidates, out, gpu, args):
             f"running {min(len(todo), args.batch)}",
             flush=True,
         )
-        run_batch(spec, shape, backend, todo[: args.batch], out, gpu, args)
+        run_batch(spec, shape, backend, todo[: args.batch], out, gpu, args, screen)
 
 
 def sweep(spec, shape, backend, candidates, out, gpus, args):
@@ -336,7 +345,9 @@ def sweep(spec, shape, backend, candidates, out, gpus, args):
     shards = [candidates[i :: len(gpus)] for i in range(len(gpus))]
     with ThreadPoolExecutor(len(gpus)) as pool:
         futures = [
-            pool.submit(sweep_shard, spec, shape, backend, shard, out, gpu, args)
+            pool.submit(
+                sweep_shard, spec, shape, backend, shard, out, gpu, args, args.screen
+            )
             for shard, gpu in zip(shards, gpus)
         ]
         try:
@@ -367,7 +378,7 @@ def final_round(spec, shape, backend, candidates, out, gpu, args):
         f"  final round on gpu {gpu}: re-timing the baseline and the {len(fastest)} fastest",
         flush=True,
     )
-    sweep_shard(spec, shape, backend, [None] + fastest, final_out, gpu, args)
+    sweep_shard(spec, shape, backend, [None] + fastest, final_out, gpu, args, 0)
 
 
 def summarize(out, candidates):

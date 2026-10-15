@@ -105,6 +105,15 @@ stores every candidate's time relative to it (`rel`). GPUs of one node differ by
 so the final-round shortlist compares `rel`; the final round then times the shortlist on one GPU,
 and those numbers pick the winner.
 
+`--screen X` makes a far-off candidate cheap: after the first warm-up replay, one timed replay
+decides. A candidate slower than X times the fastest fully timed record of its M stops there,
+and that replay is its time (`screened` in the record). A candidate whose eager warm-up launch
+alone takes over 1 ms and 1.25 times that bound stops before the graph is replayed at all.
+`--screen 1` stops every candidate that is slower than the fastest one so far; the final round
+re-times the ten fastest records, screened ones included, so a candidate that a single noisy
+replay put just behind the leader still gets its full measurement. The baseline and the
+final round are always timed in full.
+
 ## Results, resume, failures
 
 Results go to `runs/sweep-<arch>-<backend>-<kernel>-[B=..-]M=..-N=..-K=..jsonl` (worker output in
