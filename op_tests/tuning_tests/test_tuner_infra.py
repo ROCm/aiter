@@ -574,5 +574,22 @@ class TestUpdateConfigFiles(unittest.TestCase):
                 os.unlink(merged_path)
 
 
+class TestGpuModelKey(unittest.TestCase):
+    """Tuned rows keyed by gpu_model must not mix SKUs of one arch."""
+
+    def test_products_sharing_an_arch_get_distinct_models(self):
+        from aiter.jit.utils.chip_info import normalize_gpu_model
+
+        self.assertEqual(normalize_gpu_model("AMD Instinct MI300X"), "mi300x")
+        self.assertEqual(normalize_gpu_model("AMD Instinct MI325X"), "mi325x")
+        self.assertEqual(normalize_gpu_model("AMD Instinct MI355X"), "mi355x")
+
+    def test_an_unrecognized_name_is_kept_rather_than_dropped(self):
+        from aiter.jit.utils.chip_info import normalize_gpu_model
+
+        self.assertEqual(normalize_gpu_model("Radeon RX 7900"), "radeon-rx-7900")
+        self.assertEqual(normalize_gpu_model(""), "unknown")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
