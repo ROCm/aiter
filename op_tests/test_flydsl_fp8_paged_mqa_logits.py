@@ -435,7 +435,8 @@ def _context_lens_arg(context_lens, next_n, layout):
     if layout == "1d":
         return context_lens
     offsets = torch.arange(next_n, dtype=torch.int32, device=context_lens.device)
-    return context_lens[:, None] - next_n + 1 + offsets
+    # vLLM clamps at 0, so a padding request (L_b = 0) is an all-zero row.
+    return (context_lens[:, None] - next_n + 1 + offsets).clamp_(min=0)
 
 
 @benchmark()
@@ -688,6 +689,59 @@ def _summarize(name, rows):
     aiter.logger.info("%s summary (markdown):\n%s", name, table)
 
 
+def test_fp8_paged_mqa_logits_mixed_context_lens(batch=5, next_n=3, kv_len=3000):
+    """Distinct per-request lengths and one empty (CUDA-graph padding) request,
+    graded against the fp32 reference for both layouts. With uniform lengths a
+    kernel that read every request's length from row 0 would still pass."""
+    inp = _build_inputs(
+        batch,
+        next_n,
+        HEADS,
+        HEAD_DIM,
+        kv_len,
+        _E4M3_NATIVE,
+        block_size=KV_BLOCK_SIZE,
+        var_ratio=0.9,
+    )
+    kv_cache_kernel, out = _kernel_inputs(inp, batch, next_n, HEAD_DIM)
+    seq_lens = inp.context_lens.clone()
+    seq_lens[1] = 0
+    live = seq_lens[seq_lens > 0].tolist()
+    assert len(set(live)) == len(live), f"lengths are not distinct: {live}"
+    ref = run_torch(
+        inp.q,
+        inp.kv_cache_fp8,
+        inp.weights,
+        seq_lens,
+        inp.block_tables,
+        inp.max_model_len,
+        inp.fp8_dtype,
+        block_size=KV_BLOCK_SIZE,
+    )
+    for layout, split_kv in itertools.product(("1d", "2d"), (0, 3)):
+        out.fill_(float("-inf"))
+        flydsl_fp8_paged_mqa_logits(
+            inp.q_fp8,
+            kv_cache_kernel,
+            inp.weights,
+            out,
+            _context_lens_arg(seq_lens, next_n, layout),
+            inp.block_tables,
+            inp.max_model_len,
+            Preshuffle=True,
+            KVBlockSize=KV_BLOCK_SIZE,
+            SplitKV=_split_arg(split_kv),
+        )
+        _grade(
+            ref,
+            out,
+            f"mixed context_lens {layout} split_kv={split_kv} lengths={seq_lens.tolist()}",
+        )
+    aiter.logger.info(
+        "fp8_paged_mqa_logits mixed context_lens ok: lengths=%s", seq_lens.tolist()
+    )
+
+
 def test_fp8_paged_mqa_logits_bad_context_lens(next_n=3, kv_len=3000):
     """Layouts the kernel would read wrongly raise ``ValueError``."""
     batch = 4
@@ -880,6 +934,7 @@ def main():
             args.ctx_lens,
         )
     ]
+    test_fp8_paged_mqa_logits_mixed_context_lens()
     test_fp8_paged_mqa_logits_bad_context_lens()
     if compact:
         _summarize("fp8_paged_mqa_logits", compact)
