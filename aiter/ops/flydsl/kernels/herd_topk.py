@@ -8,6 +8,7 @@ from functools import cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import Float32, Int32, Int64, const_expr, gpu, range_constexpr
+from flydsl.expr import math as fly_math
 from flydsl.expr import rocdl as fly_rocdl
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
@@ -686,7 +687,7 @@ def build_herd_fused_sqrtsoftplus_module(
         for i in range_constexpr(epl):
             biased = scores[i] + biases[i]
             # NaN takes the lowest real key, so it loses to every number.
-            biased = (biased == biased).select(biased, Float32(float("-inf")))
+            biased = fly_math.isnan(biased).select(Float32(float("-inf")), biased)
             bits = biased.bitcast(Int32)
             sign = bits >> Int32(31)
             ordered = ((bits & Int32(0x7FFFFFFF)) ^ sign) - sign
