@@ -133,7 +133,7 @@ def _atomic_bf16_epilog(
                 out_off = row_base_addr + fx.Int32(s * 64)
                 if const_expr(is_gfx942):
                     fx.atomic_add(
-                        (out_elems + out_off).llvm_ptr,
+                        fx.recast_iter(out_elems.type, out_elems + out_off),
                         pk,
                         syncscope=fx.rocdl.SyncScope.Agent,
                     )

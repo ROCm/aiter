@@ -10,7 +10,7 @@ from collections import namedtuple
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl.expr import arith, const_expr, range_constexpr, rocdl, tdm_ops
+from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import Constexpr, T
@@ -108,7 +108,7 @@ def _pack_bytes_i32(byte_vals):
     assert 1 <= len(byte_vals) <= 4, len(byte_vals)
     packed = None
     for n, b in enumerate(byte_vals):
-        w = fx.Int32(arith.extui(T.i32, _raw(b)))
+        w = fx.Int32(fx.Uint8(b))
         if n:
             w = w << fx.Int32(8 * n)
         packed = w if packed is None else packed | w

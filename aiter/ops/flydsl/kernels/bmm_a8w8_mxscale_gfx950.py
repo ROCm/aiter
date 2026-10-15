@@ -36,8 +36,7 @@ from typing import NamedTuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import rocdl as rocdl_ir
+from flydsl.compiler.mlir_utils import convert_to_mlir_attr
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import BFloat16, Constexpr, Float32, Int8, Int32, T
 from flydsl.expr.typing import Vector as Vec
@@ -513,14 +512,14 @@ def launch_bmm_a8w8_mxscale(
                 lds_ptr = fx.to_llvm_ptr(
                     fx.add_offset(lds_i8, rocdl.readfirstlane(T.i32, lds_off))
                 )
-                rocdl_ir.raw_ptr_buffer_load_async_lds(
+                rocdl.raw_ptr_buffer_load_async_lds(
                     rsrc,
                     lds_ptr,
                     fx.Int32(size).ir_value(),
                     fx.Int32(byte).ir_value(),
                     fx.Int32(0).ir_value(),
                     fx.Int32(0).ir_value(),
-                    aux=ir.IntegerAttr.get(ir.IntegerType.get_signless(32), aux),
+                    aux=convert_to_mlir_attr(aux),
                 )
 
             def _dma_b(byte, lds_off):
