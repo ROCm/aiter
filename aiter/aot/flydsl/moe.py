@@ -636,6 +636,15 @@ def run(csv_paths: list[str], *, edges: bool = True, check: bool = False) -> int
     # The archs replay side by side and split one worker budget by job count.
     workers = get_max_workers(len(jobs))
     jobs_per_arch = Counter(job_arch(job) for job in jobs)
+    if jobs_per_arch:
+        # Importing aiter builds its C++ core module with the flags of the
+        # importing process's arch, and not every toolchain builds every arch
+        # (ROCm 7.2's HIP lacks the cluster launch gfx1250 builds turn on). The
+        # module has no device code, so build it once, before the replays race
+        # for it.
+        core_arch = jobs_per_arch.most_common(1)[0][0]
+        command = [sys.executable, "-c", "import aiter"]
+        subprocess.run(command, env=replay_env(core_arch, 1), check=True)
     replays = []
     for arch in archs:
         command = [sys.executable, "-m", "aiter.aot.flydsl.moe", "--arch", arch]

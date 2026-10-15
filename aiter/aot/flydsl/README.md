@@ -53,6 +53,9 @@ need no AOT change.
   process per target arch with the GPUs hidden and `GPU_ARCHS` set before
   aiter is imported. `python -m aiter.aot.flydsl.moe` starts those processes
   side by side and splits `AITER_FLYDSL_AOT_WORKERS` between them by job count.
+  It builds aiter's C++ core module once beforehand, for the arch with the most
+  jobs: the module has no device code, and not every toolchain builds every
+  arch (ROCm 7.2 cannot build the cluster launch gfx1250 builds turn on).
 - A worker replays up to 12 jobs of one row in turn, so the kernels they share
   compile once. `AITER_FLYDSL_AOT_TIMEOUT` applies to the worker's whole batch.
 - `--check` compiles nothing and fails on any kernel the replay would need but
