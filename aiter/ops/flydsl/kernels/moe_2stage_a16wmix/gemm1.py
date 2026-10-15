@@ -10,7 +10,12 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.ops.flydsl.kernels.act import gate_up_act, situ_params
+from aiter.ops.flydsl.kernels.act import (
+    clamp_gate_up,
+    gate_up_act,
+    silu_mul_batch,
+    situ_params,
+)
 from aiter.ops.flydsl.kernels.mxfp4_gemm_common import lds_typed_ptr, lds_vec_load
 from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
 
@@ -346,7 +351,7 @@ def _gemm1_body_a16w4(
         _reduce_round(acc_gate)
         _reduce_round(acc_up)
 
-    # ---- epilogue: SiLU(gate)*up -> bf16 intermediate [sorted_size, inter] -----
+    # ---- epilogue: act(gate)*up -> bf16 intermediate [sorted_size, inter] -----
     # Stored by SORTED POSITION (row = bx_m + row_in_tile). Padding rows (token >=
     # tokens) masked out; for k_wave>1 only the primary k-group (wave_k_id==0) writes.
     if const_expr(k_wave > 1):
@@ -363,7 +368,13 @@ def _gemm1_body_a16w4(
             for ni in range_constexpr(num_acc_n):
                 g = fx.Float32(fx.Vector(fx.memref_load_vec(acc_gate[mi][ni]))[ii])
                 u = fx.Float32(fx.Vector(fx.memref_load_vec(acc_up[mi][ni]))[ii])
-                y = gate_up_act(act, [g], [u], situ)[0]
+                # mixed_moe clamps SiLU before the shared unclamped helper.
+                # Do not clamp inside silu_mul_batch (that helper is shared).
+                if const_expr(act == "silu"):
+                    g, u = clamp_gate_up(g, u, situ.neg_clamp_limit)
+                    y = silu_mul_batch([g], [u])[0]
+                else:
+                    y = gate_up_act(act, [g], [u], situ)[0]
                 yb = y.to(fx.BFloat16)
                 out_idx = sorted_row * inter_i32 + col_g_list[ni]
                 buffer_ops.buffer_store(yb, _raw(out_rsrc), _raw(out_idx), mask=valid)
@@ -537,17 +548,15 @@ def compile_gemm1_a16w4_port(
                 _tile = _xcd(bx_i32)
             else:
                 _tile = bx_i32
-            # Runtime activation scalars; plain silu ignores them.
-            if const_expr(act in ("swiglu", "situv2")):
-                _situ = situ_params(
-                    fx.Float32(f32_situ_beta),
-                    fx.Float32(f32_situ_beta_rcp),
-                    fx.Float32(f32_situ_linbeta),
-                    fx.Float32(f32_situ_linbeta_rcp),
-                    fx.Float32(f32_swiglu_limit),
-                )
-            else:
-                _situ = None
+            # Runtime activation scalars. SiLU uses only neg_clamp_limit
+            # (+inf is a no-op, matching runtime_swiglu_limit).
+            _situ = situ_params(
+                fx.Float32(f32_situ_beta),
+                fx.Float32(f32_situ_beta_rcp),
+                fx.Float32(f32_situ_linbeta),
+                fx.Float32(f32_situ_linbeta_rcp),
+                fx.Float32(f32_swiglu_limit),
+            )
             _gemm1_body_a16w4(
                 lds_raw_ptr,
                 arg_x,
