@@ -93,6 +93,10 @@ def _run_tuner(script, untuned, tuned, extra_args=None, timeout=300, mp=1):
     if extra_args:
         cmd.extend(extra_args)
     env = os.environ.copy()
+    # The fmoe tuner defaults TUNE_ONLY=flydslv2 (a dev focus), which only tunes
+    # per_1x32 fp4/fp8 shapes; this pipeline also exercises bf16/int8/fp8 shapes,
+    # so opt into all task generators unless the caller overrides TUNE_ONLY.
+    env.setdefault("TUNE_ONLY", "")
     script_dir = os.path.dirname(os.path.join(AITER_ROOT, script))
     env["PYTHONPATH"] = script_dir + ":" + env.get("PYTHONPATH", "")
     try:

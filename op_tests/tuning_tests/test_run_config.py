@@ -18,6 +18,7 @@ import re
 import subprocess
 import sys
 import unittest
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 AITER_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -42,6 +43,15 @@ def _gpu_available():
         return torch.cuda.is_available() and torch.cuda.device_count() > 0
     except ImportError:
         return False
+
+
+def _gpu_count():
+    try:
+        import torch
+
+        return torch.cuda.device_count() if torch.cuda.is_available() else 0
+    except ImportError:
+        return 0
 
 
 def _find_tuned_csvs(pattern):
@@ -82,7 +92,25 @@ def _merge_config_paths(csv_list):
     return os.pathsep.join(csv_list)
 
 
-def _run_config(script, config_csv, timeout=600, extra_args=None):
+def _csv_row_count(path):
+    with open(path, newline="") as f:
+        return sum(1 for _ in csv.DictReader(f))
+
+
+def _balance_csv_shards(csvs, shard_count):
+    """Greedily balance whole CSVs across shards by data-row count."""
+    shards = [{"rows": 0, "csvs": []} for _ in range(min(shard_count, len(csvs)))]
+    weighted_csvs = sorted(
+        ((_csv_row_count(path), path) for path in csvs), reverse=True
+    )
+    for rows, path in weighted_csvs:
+        shard = min(shards, key=lambda item: item["rows"])
+        shard["rows"] += rows
+        shard["csvs"].append(path)
+    return shards
+
+
+def _run_config(script, config_csv, timeout=600, extra_args=None, env_overrides=None):
     """Run tuner with --run_config <tuned_csv> and return result."""
     cmd = [
         sys.executable,
@@ -99,6 +127,8 @@ def _run_config(script, config_csv, timeout=600, extra_args=None):
     env = os.environ.copy()
     script_dir = os.path.dirname(os.path.join(AITER_ROOT, script))
     env["PYTHONPATH"] = script_dir + ":" + env.get("PYTHONPATH", "")
+    if env_overrides:
+        env.update(env_overrides)
     try:
         return subprocess.run(
             cmd,
@@ -323,8 +353,10 @@ TUNER_FAMILIES = {
         "script": "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
         "csv_pattern": "tuned_fmoe",
         "exclude_patterns": ["untuned", "profile"],
-        # fmoe merges many model configs and JIT-builds many modules; needs >1h.
-        "timeout": 3600,
+        # A full single-GPU pass takes about 90 minutes including JIT builds.
+        "timeout": 6000,
+        # Eight balanced shards finish in about 11 minutes; keep headroom for CI.
+        "sharded_timeout": 1200,
         "config_property": "AITER_CONFIG_FMOE_FILE",
     },
     "gradlib_bf16": {
@@ -352,6 +384,85 @@ TUNER_FAMILIES = {
 @unittest.skipUnless(_gpu_available(), "No GPU available")
 class TestRunConfig(unittest.TestCase):
     """Run --run_config on all existing tuned CSVs to verify production ops."""
+
+    def _test_family_sharded(self, name, shard_count):
+        cfg = TUNER_FAMILIES[name]
+        pattern = cfg["csv_pattern"]
+        excludes = cfg.get("exclude_patterns", [])
+        csvs = [
+            path
+            for path in _find_tuned_csvs(pattern)
+            if not any(ex in os.path.basename(path) for ex in excludes)
+        ]
+        if not csvs:
+            self.skipTest(f"No tuned CSVs found for {name} (pattern={pattern})")
+
+        shards = _balance_csv_shards(csvs, shard_count)
+        print(
+            f"\nRunning {name} across {len(shards)} GPUs: "
+            f"{len(csvs)} CSVs / {sum(s['rows'] for s in shards)} rows"
+        )
+        for gpu, shard in enumerate(shards):
+            print(f"  GPU {gpu}: {len(shard['csvs'])} CSVs / {shard['rows']} rows")
+
+        def run_shard(gpu, shard):
+            result = _run_config(
+                cfg["script"],
+                _merge_config_paths(shard["csvs"]),
+                timeout=cfg.get("sharded_timeout", cfg.get("timeout", 600)),
+                extra_args=cfg.get("extra_args"),
+                env_overrides={"HIP_VISIBLE_DEVICES": str(gpu)},
+            )
+            return gpu, shard, result
+
+        shard_results = []
+        with ThreadPoolExecutor(max_workers=len(shards)) as pool:
+            futures = [
+                pool.submit(run_shard, gpu, shard) for gpu, shard in enumerate(shards)
+            ]
+            for future in as_completed(futures):
+                shard_results.append(future.result())
+
+        all_results = []
+        all_errors = []
+        all_mismatches = []
+        all_output_lines = []
+        returncode_failures = []
+        total_ok = 0
+        total_skip = 0
+        for gpu, shard, result in sorted(shard_results):
+            output = result.stdout + result.stderr
+            lines = output.splitlines()
+            errors, mismatches, ok_count, skip_count = _parse_benchmark_results(lines)
+            print(
+                f"  GPU {gpu}: {ok_count} OK, {skip_count} SKIP, "
+                f"{len(errors)} ERROR, {len(mismatches)} MISMATCH"
+            )
+            if result.returncode != 0:
+                returncode_failures.append(
+                    f"GPU {gpu} exited {result.returncode} "
+                    f"({len(shard['csvs'])} CSVs)\n{output[-3000:]}"
+                )
+            all_results.extend(_parse_all_benchmark_results(lines))
+            all_errors.extend(f"[GPU {gpu}] {item}" for item in errors)
+            all_mismatches.extend(f"[GPU {gpu}] {item}" for item in mismatches)
+            all_output_lines.extend(lines)
+            total_ok += ok_count
+            total_skip += skip_count
+
+        csv_file = _save_results_csv(name, all_results)
+        if csv_file:
+            print(f"\n  Results CSV: {csv_file} ({len(all_results)} shapes)")
+        failures = _format_failures(
+            name, all_errors, all_mismatches, total_skip, all_output_lines
+        )
+        self.assertEqual(
+            returncode_failures + failures,
+            [],
+            f"{name} sharded run_config: {total_ok} OK, {total_skip} SKIP, "
+            f"{len(all_errors)} ERROR, {len(all_mismatches)} MISMATCH\n"
+            + "\n".join(returncode_failures + failures),
+        )
 
     def _test_family(self, name):
         cfg = TUNER_FAMILIES[name]
@@ -442,7 +553,11 @@ class TestRunConfig(unittest.TestCase):
         self._test_family("batched_bf16")
 
     def test_fmoe(self):
-        self._test_family("fmoe")
+        gpu_count = _gpu_count()
+        if gpu_count > 1:
+            self._test_family_sharded("fmoe", gpu_count)
+        else:
+            self._test_family("fmoe")
 
     def test_gradlib_bf16(self):
         self._test_family("gradlib_bf16")
