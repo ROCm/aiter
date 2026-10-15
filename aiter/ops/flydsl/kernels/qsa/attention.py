@@ -25,6 +25,7 @@ from . import attention_union as union
 from .attention_common import (
     ARENA_GROWTH_PERCENT,
     SCRATCH_ALIGN,
+    UNION_SCRATCH_LIMIT,
     WORKSPACE_CACHE,
     platform,
 )
@@ -84,16 +85,16 @@ class _Workspace:
         lengths = q_lens + np.asarray(prefix_lens, dtype=np.int64)
         sequence = np.repeat(np.arange(len(q_lens)), q_lens)
         positions = np.arange(len(sequence)) + (lengths - np.cumsum(q_lens))[sequence]
-        self.metadata = dict(
-            query_lens=query_lens,
-            prefix_lens=prefix_lens,
-            scale=scale,
-            topk=topk,
-            kv_lens=prepare.upload(lengths, q.device),
-            query_positions=prepare.upload(positions, q.device),
-            query_sequence_ids=prepare.upload(sequence, q.device),
-            max_seqlen_k=int(lengths.max(initial=0)),
-        )
+        self.metadata = {
+            "query_lens": query_lens,
+            "prefix_lens": prefix_lens,
+            "scale": scale,
+            "topk": topk,
+            "kv_lens": prepare.upload(lengths, q.device),
+            "query_positions": prepare.upload(positions, q.device),
+            "query_sequence_ids": prepare.upload(sequence, q.device),
+            "max_seqlen_k": int(lengths.max(initial=0)),
+        }
         self.captured = False
         self.block_indices = None
         inputs = SimpleNamespace(
@@ -101,9 +102,14 @@ class _Workspace:
         )
         self.union = None
         if q.shape[0] >= _union_min_rows(q.shape[1] // k.shape[1]):
-            self.union = prepare.allocate_plan(
-                inputs=inputs, query_tile=32, scratch=False
+            plan = prepare.allocate_plan(inputs=inputs, query_tile=32, scratch=False)
+            # Dense membership grows with tiles x KV blocks.
+            needed = sum(
+                _aligned(math.prod(shape) * dtype.itemsize)
+                for _, shape, dtype, _ in prepare.scratch_specs(plan)
             )
+            if needed <= UNION_SCRATCH_LIMIT:
+                self.union = plan
         self.direct = direct.prepare(inputs=inputs, union=self.union, scratch=False)
         self.specs = [(self, "block_indices", (q.shape[0], topk), torch.int32, False)]
         if self.union is not None:
@@ -262,7 +268,7 @@ def qsa_sparse_attention_flydsl(
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
         raise ValueError("Q/K/V must be contiguous BF16 [tokens, heads, 256]")
     if isinstance(softmax_scale, (torch.Tensor, bool)):
-        raise ValueError("softmax_scale must be a host scalar or None")
+        raise TypeError("softmax_scale must be a host scalar or None")
     scale = 0.0625 if softmax_scale is None else float(softmax_scale)
     if not math.isfinite(scale) or scale <= 0:
         raise ValueError("softmax_scale must be finite and positive")

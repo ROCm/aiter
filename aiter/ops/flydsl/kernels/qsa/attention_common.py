@@ -33,6 +33,7 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 WORKSPACE_CACHE = 8  # layouts kept per process; captured workspaces are never evicted
 ARENA_GROWTH_PERCENT = 125  # a growing arena takes at least this share of its size
 SCRATCH_ALIGN = 256  # bytes between the scratch views of an arena
+UNION_SCRATCH_LIMIT = 4 << 30  # union scratch bytes; past it a layout runs direct only
 
 
 @dataclasses.dataclass(frozen=True)
