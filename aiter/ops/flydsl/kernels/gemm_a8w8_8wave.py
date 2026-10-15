@@ -10,6 +10,7 @@ from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.jit.utils.chip_info import get_cdna4_num_xcds
 from aiter.ops.flydsl.kernels.kernels_common import ceildiv
 from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import split_row_major_2d
 
@@ -392,24 +393,24 @@ class Mfma16x16x64Int8:
         return c_values
 
 
-def _xcd_swizzle_any(num_pid_m, num_pid_n, wgm, wgid=None):
+def _xcd_swizzle_any(num_pid_m, num_pid_n, wgm, wgid=None, num_xcds=8):
     """XCD-aware tile remap that works for any workgroup count. This function is used to swizzle the tile indices to improve the L2 reuse.
 
     ``wgid`` defaults to the workgroup index; a persistent kernel passes its
-    tile index, which must lie on the XCD of index ``wgid % 8``.
+    tile index, which must lie on XCD ``wgid % num_xcds``.
     """
-    NUM_XCDS = 8
+    assert num_xcds > 0 and num_xcds & (num_xcds - 1) == 0
 
     if wgid is None:
         wgid = fx.block_idx.x
     num_wg = num_pid_m * num_pid_n
 
-    # Hardware dispatches workgroup i to XCD (i % NUM_XCDS). Invert that so
+    # Hardware dispatches workgroup i to XCD (i % num_xcds). Invert that so
     # logically adjacent tiles share an XCD, and thus its L2.
-    xcd = wgid % NUM_XCDS
-    intra_xcd = wgid // NUM_XCDS
-    base = num_wg // NUM_XCDS
-    extra = num_wg % NUM_XCDS
+    xcd = wgid % num_xcds
+    intra_xcd = wgid // num_xcds
+    base = num_wg // num_xcds
+    extra = num_wg % num_xcds
     wgid_remap = xcd * base + fx.min(xcd, extra) + intra_xcd
 
     # Group-of-WGM row swizzle for L2 reuse within one XCD.
@@ -433,8 +434,15 @@ def compile_fp8_gemm_8w(
     int8_merged_phases: bool = True,
     int8_balanced_tail: bool = True,
     int8_early_scales: bool = True,
+    num_xcds: int | None = None,
 ):
     BLOCK_K = 128
+
+    if num_xcds is None:
+        num_xcds = get_cdna4_num_xcds() if xcd_swizzle > 0 else 8
+    num_xcds = int(num_xcds)
+    if num_xcds <= 0 or num_xcds > 8 or num_xcds & (num_xcds - 1):
+        raise ValueError(f"num_xcds must be a power of two in [1, 8], got {num_xcds}")
 
     if input_dtype not in ("fp8", "int8"):
         raise ValueError(f"input_dtype must be 'fp8' or 'int8', got {input_dtype!r}")
@@ -483,6 +491,7 @@ def compile_fp8_gemm_8w(
         f"{waves_per_eu}x{xcd_swizzle}_k{K}"
         f"{'_mp' if merged_phases else ''}{'_bt' if balanced_tail else ''}"
         f"{'_es' if early_scales else ''}"
+        f"{f'_xcd{num_xcds}' if num_xcds != 8 else ''}"
     )
 
     input_elem_t = fx.Int8 if is_int8 else fx.Float8E4M3FN
@@ -528,7 +537,10 @@ def compile_fp8_gemm_8w(
         wave_n = wave_id % 4
         if const_expr(xcd_swizzle > 0):
             block_m, block_n = _xcd_swizzle_any(
-                ceildiv(c_m, BLOCK_M), n_blocks, wgm=xcd_swizzle
+                ceildiv(c_m, BLOCK_M),
+                n_blocks,
+                wgm=xcd_swizzle,
+                num_xcds=num_xcds,
             )
         else:
             block_m, block_n = split_row_major_2d(fx.block_idx.x, n_blocks)

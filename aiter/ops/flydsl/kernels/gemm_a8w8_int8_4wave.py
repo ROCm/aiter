@@ -30,6 +30,7 @@ from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.jit.utils.chip_info import get_cdna4_num_xcds
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.gemm_a8w8_8wave import (
     S2RLoader,
@@ -301,7 +302,13 @@ def _mfma_drain(accs):
     ]
 
 
-def compile_int8_gemm_4w(*, K: int, xcd_swizzle: int = 8, num_cu: int = 0):
+def compile_int8_gemm_4w(
+    *,
+    K: int,
+    xcd_swizzle: int = 8,
+    num_cu: int = 0,
+    num_xcds: int | None = None,
+):
     """``num_cu > 0`` makes the kernel persistent over that many workgroups.
 
     A persistent workgroup loads the first two K tiles of its next output
@@ -311,11 +318,16 @@ def compile_int8_gemm_4w(*, K: int, xcd_swizzle: int = 8, num_cu: int = 0):
     workgroup takes one block.
     """
     assert K % BLOCK_K == 0 and K >= 2 * BLOCK_K
+    if num_xcds is None:
+        num_xcds = get_cdna4_num_xcds() if xcd_swizzle > 0 else 8
+    num_xcds = int(num_xcds)
+    if num_xcds <= 0 or num_xcds > 8 or num_xcds & (num_xcds - 1):
+        raise ValueError(f"num_xcds must be a power of two in [1, 8], got {num_xcds}")
     K_ITERS = K // BLOCK_K
     B_K_STEP = 16 * BLOCK_K  # bytes per K128 tile inside a preshuffled 16-row strip
     HALF = WAVE_TILES // 2
     persistent = num_cu > 0 and K_ITERS % 2 == 0
-    assert not persistent or num_cu % 8 == 0
+    assert not persistent or num_cu % num_xcds == 0
 
     # Quadrants of the wave's tile grid by (A half, B half).
     def quadrant(a_half, b_half):
@@ -366,7 +378,9 @@ def compile_int8_gemm_4w(*, K: int, xcd_swizzle: int = 8, num_cu: int = 0):
 
     _kname = (
         f"flydsl_bpreshuffle_4w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_I8_I8_B16_"
-        f"1x{xcd_swizzle}_k{K}" + (f"_p{num_cu}" if persistent else "")
+        f"1x{xcd_swizzle}_k{K}"
+        + (f"_p{num_cu}" if persistent else "")
+        + (f"_xcd{num_xcds}" if num_xcds != 8 else "")
     )
 
     @fx.struct
@@ -400,10 +414,16 @@ def compile_int8_gemm_4w(*, K: int, xcd_swizzle: int = 8, num_cu: int = 0):
         wave_n = wave_id % 2
 
         def block_coords(block):
-            # A persistent grid is a multiple of 8 workgroups or covers all
-            # blocks, so block b runs on the XCD of workgroup b % 8.
+            # A persistent grid is a multiple of num_xcds workgroups or
+            # covers all blocks, so block b stays on its workgroup's XCD.
             if const_expr(xcd_swizzle > 0):
-                return _xcd_swizzle_any(m_blocks, n_blocks, xcd_swizzle, block)
+                return _xcd_swizzle_any(
+                    m_blocks,
+                    n_blocks,
+                    xcd_swizzle,
+                    block,
+                    num_xcds,
+                )
             return split_row_major_2d(block, n_blocks)
 
         a_g2s = G2SGlobal(A, wave_id, A_BLOCK_STRIDE, a_lds)

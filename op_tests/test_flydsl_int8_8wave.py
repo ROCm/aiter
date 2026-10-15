@@ -8,13 +8,13 @@ import torch
 
 import aiter
 from aiter.jit.core import AITER_CONFIGS
-from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.gemm_op_a8w8 import get_GEMM_config_with_quant_type
+from aiter.jit.utils.chip_info import get_cdna4_num_xcds, get_gfx_runtime
 from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
     flydsl_8wave_gemm_a8,
     parse_8wave_kernel_name,
     run_gemm_a8w8_bpreshuffle_8wave,
 )
+from aiter.ops.gemm_op_a8w8 import get_GEMM_config_with_quant_type
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8 as gluon_gemm_a8w8
 
@@ -31,6 +31,39 @@ def test_int8_8wave_kernel_name_contract():
         "waves_per_eu": 1,
         "xcd_swizzle": 8,
     }
+
+
+@pytest.mark.parametrize("cu_num,num_xcds", [(64, 2), (128, 4), (256, 8)])
+def test_cdna4_xcd_count_from_cus(cu_num, num_xcds):
+    assert get_cdna4_num_xcds(cu_num) == num_xcds
+
+
+@pytest.mark.parametrize("cu_num", [0, 96, 129, 288])
+def test_cdna4_xcd_count_rejects_invalid_cus(cu_num):
+    with pytest.raises(ValueError, match="CDNA4"):
+        get_cdna4_num_xcds(cu_num)
+
+
+def test_8wave_compile_cache_keys_xcd_count(monkeypatch):
+    import aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave as mod
+
+    monkeypatch.setattr(mod, "_validate", lambda **_kwargs: None)
+    monkeypatch.setattr(mod, "_compile_fp8_gemm_8w", lambda **kwargs: kwargs)
+    mod.compile_8wave_gemm.cache_clear()
+    common = {
+        "K": 256,
+        "block_m": 256,
+        "block_n": 256,
+        "waves_per_eu": 1,
+        "xcd_swizzle": 8,
+        "q_dtype": "int8",
+    }
+    xcd4 = mod.compile_8wave_gemm(**common, num_xcds=4)
+    xcd8 = mod.compile_8wave_gemm(**common, num_xcds=8)
+    assert xcd4["num_xcds"] == 4
+    assert xcd8["num_xcds"] == 8
+    assert xcd4 is not xcd8
+    mod.compile_8wave_gemm.cache_clear()
 
 
 def test_8wave_kernel_name_rejects_dtype_mismatch():

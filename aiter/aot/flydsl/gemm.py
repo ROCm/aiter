@@ -757,6 +757,8 @@ def _compile_8wave_to_cache(
     dtype: str = "B16",
     **kwargs,
 ):
+    num_xcds = kwargs.pop("num_xcds", None)
+    cu_num = kwargs.pop("cu_num", None)
     del kwargs
     if q_dtype_a != q_dtype_w or q_dtype_a not in ("F8", "I8"):
         raise ValueError(
@@ -775,12 +777,26 @@ def _compile_8wave_to_cache(
     scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
     scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)
 
+    if num_xcds is None:
+        from aiter.jit.utils.chip_info import get_cdna4_num_xcds
+
+        if cu_num is not None:
+            num_xcds = get_cdna4_num_xcds(cu_num)
+        else:
+            try:
+                num_xcds = get_cdna4_num_xcds()
+            except (RuntimeError, ValueError):
+                # Preserve offline codegen's historical MI350X/MI355X default
+                # when neither a live GPU nor CU_NUM was supplied.
+                num_xcds = 8
+
     exe = compile_8wave_gemm(
         K=k,
         block_m=block_m,
         block_n=block_n,
         waves_per_eu=waves_per_eu,
         xcd_swizzle=int(xcd_swizzle),
+        num_xcds=int(num_xcds),
         q_dtype=q_dtype,
     )
     # NOTE: the 8-wave launcher takes (A, B, C, ...), not the preshuffle

@@ -11,7 +11,7 @@ import re
 import torch
 from torch import Tensor
 
-from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+from aiter.jit.utils.chip_info import get_cdna4_num_xcds, get_lds_capacity_bytes
 
 # Fixed by the kernel: MFMA_Scale(16, 16, 128) over a 128-deep K tile.
 BLOCK_K = 128
@@ -118,6 +118,7 @@ def compile_8wave_gemm(
     block_n: int,
     waves_per_eu: int,
     xcd_swizzle: int,
+    num_xcds: int | None = None,
     b_preshuffled: bool = True,
     q_dtype: str = "fp8",
 ):
@@ -127,6 +128,16 @@ def compile_8wave_gemm(
         raise ValueError(
             f"[FlyDSL 8wave] q_dtype must be 'fp8' or 'int8', got {q_dtype!r}"
         )
+    if num_xcds is None:
+        if xcd_swizzle > 0:
+            try:
+                num_xcds = get_cdna4_num_xcds()
+            except (RuntimeError, ValueError):
+                # Offline compilation without a live GPU keeps the historical
+                # full-gfx950 default. AOT callers with cu_num pass it explicitly.
+                num_xcds = 8
+        else:
+            num_xcds = 8
     _validate(K=K, block_m=block_m, block_n=block_n, waves_per_eu=waves_per_eu)
     return _compile_fp8_gemm_8w(
         K=K,
@@ -135,6 +146,7 @@ def compile_8wave_gemm(
         b_preshuffled=bool(b_preshuffled),
         waves_per_eu=int(waves_per_eu),
         xcd_swizzle=int(xcd_swizzle),
+        num_xcds=int(num_xcds),
         input_dtype=q_dtype,
     )
 
@@ -185,6 +197,7 @@ def flydsl_8wave_gemm_a8(
     *,
     waves_per_eu: int = 2,
     xcd_swizzle: int = 0,
+    num_xcds: int | None = None,
 ) -> Tensor:
     """Run the 8-wave a8w8 ptpc GEMM; writes into ``Out`` and returns it.
 
@@ -238,6 +251,8 @@ def flydsl_8wave_gemm_a8(
 
     sa = _as_1d_fp32(x_scale, M, "x_scale")
     sb = _as_1d_fp32(w_scale, N, "w_scale")
+    if num_xcds is None:
+        num_xcds = get_cdna4_num_xcds() if xcd_swizzle > 0 else 8
 
     exe = compile_8wave_gemm(
         K=K,
@@ -245,6 +260,7 @@ def flydsl_8wave_gemm_a8(
         block_n=int(block_n),
         waves_per_eu=int(waves_per_eu),
         xcd_swizzle=int(xcd_swizzle),
+        num_xcds=int(num_xcds),
         q_dtype=q_dtype,
     )
 
