@@ -3372,9 +3372,9 @@ def _force_a16wmix_bf16() -> bool:
     return os.environ.get("AITER_FORCE_A16WMIX_BF16", "0") == "1"
 
 
-# SwiGLU already clamps in a16wmix gemm1. SiLU is added by a follow-up commit
-# once the epilogue honours f32_swiglu_limit.
-_A16WMIX_BF16_ACTIVATIONS = (ActivationType.Swiglu,)
+# a16wmix gemm1 clamps SwiGLU natively and SiLU via clamp_gate_up then
+# silu_mul_batch (the shared helper stays unclamped for mixed_moe).
+_A16WMIX_BF16_ACTIVATIONS = (ActivationType.Silu, ActivationType.Swiglu)
 
 
 def _can_reroute_bf16_to_a16wmix(
