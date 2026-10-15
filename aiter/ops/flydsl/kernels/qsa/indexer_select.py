@@ -488,6 +488,7 @@ def build_qsa_indexer_prefill_scores_module(
         q: fx.Array[BFloat16, block_m * n_heads * _D, 16]
         k: fx.Array[BFloat16, block_n * _D, 16]
         visible: fx.Array[Int32, block_m, 16]
+        live: fx.Array[Int32, block_n, 16]
         c: fx.Array[Float32, n_heads * n_subtiles * num_waves * 64 * 4, 16]
 
     @flyc.kernel(
@@ -561,6 +562,7 @@ def build_qsa_indexer_prefill_scores_module(
         )
         k_lds = storage.k.view(fx.make_layout((block_n, _D), (_D, 1)))
         visible_lds = storage.visible.view(fx.make_layout(block_m, 1))
+        live_lds = storage.live.view(fx.make_layout(block_n, 1))
         c_lds = storage.c.view(
             fx.make_layout(
                 (n_heads, n_subtiles, num_waves, 64, 4),
@@ -661,6 +663,8 @@ def build_qsa_indexer_prefill_scores_module(
                 for i in range_constexpr(vec):
                     kv = col_live.select(k_vec[i].to(Float32), Float32(0.0))
                     k_lds[col, d0 + Int32(i)] = kv.to(BFloat16)
+                # Every d_chunk of a column stores the same flag.
+                live_lds[col] = col_live.select(one, zero)
             gpu.barrier()
 
             for head in range_constexpr(n_heads):
@@ -697,6 +701,9 @@ def build_qsa_indexer_prefill_scores_module(
             if wave == zero:
                 for ng in range_constexpr(n_subtiles):
                     out_col = tile * Int32(block_n) + Int32(ng * 16) + lane_m
+                    # A visible column on an invalid page scored a zeroed K;
+                    # it must not tie into the top-512.
+                    page_live = live_lds[Int32(ng * 16) + lane_m] != zero
                     for i in range_constexpr(4):
                         row_local = lane_kg * Int32(4) + Int32(i)
                         row = row_tile * Int32(block_m) + row_local
@@ -707,7 +714,7 @@ def build_qsa_indexer_prefill_scores_module(
                                 dot = dot + c_lds[head, ng, w, lane, i]
                             score = score + fx.max(dot, Float32(0.0))
                         if (row < rows) & (out_col < n_columns):
-                            live = out_col < visible_lds[row_local]
+                            live = (out_col < visible_lds[row_local]) & page_live
                             # ``scores`` must keep a dynamic row stride: a static
                             # layout, use_32bit_stride=True, or an Int32 linear
                             # index would wrap.
