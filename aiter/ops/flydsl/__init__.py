@@ -27,6 +27,42 @@ if _base_version < _MIN_FLYDSL_VERSION:
     )
 
 _LAZY_IMPORTS = {
+    "E16_ROUTE_POLICY_SIZES": (".sonicmoe", "E16_ROUTE_POLICY_SIZES"),
+    "E16RoutePolicy": (".sonicmoe", "E16RoutePolicy"),
+    "SonicMoE": (".sonicmoe", "SonicMoE"),
+    "SonicMoEConfig": (".sonicmoe", "SonicMoEConfig"),
+    "SonicMoEDynamicWorkspacePool": (
+        ".sonicmoe",
+        "SonicMoEDynamicWorkspacePool",
+    ),
+    "SonicMoEForwardState": (".sonicmoe", "SonicMoEForwardState"),
+    "SonicMoERoutesForwardState": (
+        ".sonicmoe",
+        "SonicMoERoutesForwardState",
+    ),
+    "SonicMoEWeights": (".sonicmoe", "SonicMoEWeights"),
+    "SonicMoEWorkspace": (".sonicmoe", "SonicMoEWorkspace"),
+    "canonical_e16_route_policy_size": (
+        ".sonicmoe",
+        "canonical_e16_route_policy_size",
+    ),
+    "e16_route_policy_representative": (
+        ".sonicmoe",
+        "e16_route_policy_representative",
+    ),
+    "prepare_sonic_bf16_weights": (".sonicmoe", "prepare_sonic_bf16_weights"),
+    "prepare_sonic_fp16_weights": (".sonicmoe", "prepare_sonic_fp16_weights"),
+    "prepare_sonic_mxfp4_weights": (".sonicmoe", "prepare_sonic_mxfp4_weights"),
+    "select_e16_route_policy": (".sonicmoe", "select_e16_route_policy"),
+    "sonic_moe_backward": (".sonicmoe", "sonic_moe_backward"),
+    "sonic_moe_backward_expert_major": (
+        ".sonicmoe",
+        "sonic_moe_backward_expert_major",
+    ),
+    "sonic_moe_backward_routes": (".sonicmoe", "sonic_moe_backward_routes"),
+    "sonic_moe_mxfp4_reference": (".sonicmoe", "sonic_moe_mxfp4_reference"),
+    "sonic_moe_reference": (".sonicmoe", "sonic_moe_reference"),
+    "warmup_sonic_e16_training": (".sonicmoe", "warmup_sonic_e16_training"),
     "FP8_MQA_LOGITS_DEFAULT_VARIANT": (
         ".fp8_mqa_logits_kernels",
         "DEFAULT_VARIANT",
@@ -159,12 +195,23 @@ _LAZY_IMPORTS = {
 }
 
 __all__ = [
+    "E16_ROUTE_POLICY_SIZES",
     "FP8_MQA_LOGITS_DEFAULT_VARIANT",
     "FP8_MQA_LOGITS_VARIANTS",
+    "E16RoutePolicy",
     "Fp4MqaPlan",
     "GateMode",
     "QuickAllReduceInt4",
+    "SonicMoE",
+    "SonicMoEConfig",
+    "SonicMoEDynamicWorkspacePool",
+    "SonicMoEForwardState",
+    "SonicMoERoutesForwardState",
+    "SonicMoEWeights",
+    "SonicMoEWorkspace",
+    "canonical_e16_route_policy_size",
     "compute_varqlen_windows",
+    "e16_route_policy_representative",
     "flydsl_conv_implicit",
     "flydsl_flash_attn_fp8_func",
     "flydsl_flash_attn_fp8_supported",
@@ -200,6 +247,16 @@ __all__ = [
     "minimax_m3_index_score_work_map_size",
     "pa_decode",
     "prepare_pa_decode_plan",
+    "prepare_sonic_bf16_weights",
+    "prepare_sonic_fp16_weights",
+    "prepare_sonic_mxfp4_weights",
+    "select_e16_route_policy",
+    "sonic_moe_backward",
+    "sonic_moe_backward_expert_major",
+    "sonic_moe_backward_routes",
+    "sonic_moe_mxfp4_reference",
+    "sonic_moe_reference",
+    "warmup_sonic_e16_training",
 ]
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
