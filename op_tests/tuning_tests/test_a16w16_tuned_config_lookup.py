@@ -134,7 +134,11 @@ class TestGfx1250DefaultDispatch(unittest.TestCase):
         return tuned.get_GEMM_A16W16_config(m, n, k, bias, dtype, otype)
 
     def test_large_shapes_take_flydsl(self):
-        for m, tile in ((512, "_t128x128x64x4_"), (2048, "_t256x128x64x4_")):
+        for m, tile in (
+            (512, "_t128x128x64x4_"),
+            (1024, "_t256x128x64x4_"),
+            (4097, "_t256x128x64x4_"),
+        ):
             config = self._default(m, 4096, 4096)
             self.assertEqual(config["libtype"], "flydsl")
             self.assertIn(tile, config["kernelName"])
@@ -147,10 +151,12 @@ class TestGfx1250DefaultDispatch(unittest.TestCase):
         fp16 = str(torch.float16)
         cases = [
             (256, 4096, 4096, BF16),  # M below 512
-            (2048, 2048, 4096, BF16),  # N below 4096
-            (2048, 4096, 256, BF16),  # K below 512
-            (2048, 5120, 5120, BF16),  # Triton has a gfx1250 config for this (N, K)
-            (2048, 4096, 4096, fp16),
+            (1025, 4096, 4096, BF16),  # 1024 < M <= 4096
+            (4096, 4096, 4096, BF16),
+            (8192, 2048, 4096, BF16),  # N below 4096
+            (8192, 4096, 256, BF16),  # K below 512
+            (8192, 5120, 5120, BF16),  # Triton has a gfx1250 config for this (N, K)
+            (8192, 4096, 4096, fp16),
         ]
         for m, n, k, dtype in cases:
             config = self._default(m, n, k, dtype, dtype)
@@ -174,13 +180,13 @@ class TestGfx1250DefaultDispatch(unittest.TestCase):
     def test_bias_with_fp32_output_stays_on_triton(self):
         fp32 = str(torch.float32)
         self.assertEqual(
-            self._default(2048, 4096, 4096, otype=fp32, bias=True)["libtype"], "triton"
+            self._default(8192, 4096, 4096, otype=fp32, bias=True)["libtype"], "triton"
         )
         self.assertEqual(
-            self._default(2048, 4096, 4096, otype=fp32)["libtype"], "flydsl"
+            self._default(8192, 4096, 4096, otype=fp32)["libtype"], "flydsl"
         )
         self.assertEqual(
-            self._default(2048, 4096, 4096, bias=True)["libtype"], "flydsl"
+            self._default(8192, 4096, 4096, bias=True)["libtype"], "flydsl"
         )
 
 
