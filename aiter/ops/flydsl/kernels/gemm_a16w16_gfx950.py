@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import copy
 import functools
 from dataclasses import dataclass
 from typing import Any
@@ -1356,10 +1357,18 @@ def gemm_a16w16_gfx950(
     )
 
 
+@functools.lru_cache(maxsize=1024)
+def _make_gemm_a16w16_gfx950_param_cached(kwargs_items):
+    return make_gemm_a16w16_gfx950_param(**dict(kwargs_items))
+
+
 def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
+    # build once per config to save python time 
     result = None
+    key = tuple(sorted(kwargs.items()))
+    hash(key)
     try:
-        result = make_gemm_a16w16_gfx950_param(**kwargs)
+        result = copy.copy(_make_gemm_a16w16_gfx950_param_cached(key))
     except Exception:  # noqa: BLE001 - invalid policies are filtered here
         return None
     split_k = kwargs.get("split_k", 1)
