@@ -535,7 +535,7 @@ def gemm_afp8wfp8_preshuffle(
             warp_bases=tuple(warp_bases),
             cache_modifier=config["cache_modifier"],
             NUM_BUFFERS=num_buffers,
-            # Every gluon preshuffle config declares this; configs/CLAUDE.md
+            # Every gluon preshuffle config declares this; configs/AGENTS.md
             # forbids Python-side defaults for tuning values, so a missing key
             # is a config bug and should fail loudly rather than silently tune
             # itself off. The kernel clamps it to the main-loop trip count.

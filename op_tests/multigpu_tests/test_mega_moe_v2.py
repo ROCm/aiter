@@ -37,6 +37,13 @@ NETWORKS = {
         "topk": 6,
         "swiglu_limit": 10.0,
     },
+    "r1_v3": {
+        "model_dim": 7168,
+        "inter_dim": 2048,
+        "experts": 256,
+        "topk": 8,
+        "swiglu_limit": 0.0,
+    },
     # Kimi-K3 routing/weight geometry.  This exercises topk16 and EP8/epr112 and
     # the real K3 activation: SiTUv2 (hidden_act="situ"), which self-saturates
     # via tanh, so it carries no hard swiglu clamp.  beta=4.0 / linear_beta=25.0
@@ -524,7 +531,7 @@ def _install_config_policy(moe, config_tokens, unify_fields):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--network", choices=NETWORKS, default="v4_pro")
-    parser.add_argument("--quant", choices=("a8w4",), default="a8w4")
+    parser.add_argument("--quant", choices=("a4w4", "a8w4"), default="a8w4")
     parser.add_argument(
         "--stage2-p2p-quant",
         choices=("auto", "none", "fp8_blockwise_1x32"),
@@ -563,7 +570,7 @@ def main():
     ):
         raise ValueError("fanout adversarial flags are mutually exclusive")
     if args.rtol is None:
-        args.rtol = 0.10
+        args.rtol = 0.25 if args.quant == "a4w4" else 0.10
     batch_sizes = [int(value) for value in args.bs_list.split(",")]
     if not batch_sizes or min(batch_sizes) <= 0:
         raise ValueError("--bs-list must contain positive integers")
