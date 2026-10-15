@@ -26,26 +26,36 @@ def test_splits_by_wave_cost(
     assert splits == expected
 
 
-def test_occupancy_is_known_on_first_call(monkeypatch):
+def test_occupancy_is_known_on_first_call():
+    """FlyDSL reports occupancy for a kernel that has not launched yet."""
     if not torch.cuda.is_available() or kernels._ARCH != "gfx942":
         pytest.skip("occupancy-aware splits are gfx942 only")
-    kernels.compile_fp8_mqa_logits.cache_clear()
-    seen = []
-    real = kernels._auto_num_splits
-    monkeypatch.setattr(
-        kernels, "_auto_num_splits", lambda *a: seen.append(a[-1]) or real(*a)
-    )
     seq_len, seq_len_kv, num_heads, head_size = 128, 8192, 64, 128
-    fp8 = torch.float8_e4m3fnuz
-    kernels.flydsl_fp8_mqa_logits(
-        torch.randn(seq_len, num_heads, head_size, device="cuda").to(fp8),
-        torch.randn(seq_len_kv, head_size, device="cuda").to(fp8),
-        torch.ones(seq_len_kv, device="cuda"),
-        torch.ones(seq_len, num_heads, device="cuda"),
-        torch.zeros(seq_len, dtype=torch.int32, device="cuda"),
-        torch.full((seq_len,), seq_len_kv, dtype=torch.int32, device="cuda"),
+    variant = kernels._resolve_variant(None, seq_len, seq_len_kv, num_heads)
+    kernels.compile_fp8_mqa_logits.cache_clear()
+    launcher = kernels.compile_fp8_mqa_logits(
+        num_heads=num_heads,
+        head_size=head_size,
+        block_kv=kernels._parse_variant(variant)[0],
+        variant=variant,
     )
-    assert seen[0] >= 1
+    fp8 = torch.float8_e4m3fnuz
+    args = (
+        torch.empty(seq_len, num_heads, head_size, device="cuda", dtype=fp8),
+        torch.empty(seq_len_kv, head_size, device="cuda", dtype=fp8),
+        torch.empty(seq_len_kv, device="cuda"),
+        torch.empty(seq_len, num_heads, device="cuda"),
+        torch.empty(seq_len, dtype=torch.int32, device="cuda"),
+        torch.empty(seq_len, dtype=torch.int32, device="cuda"),
+        torch.empty(seq_len, seq_len_kv, device="cuda"),
+        seq_len,
+        seq_len_kv,
+        seq_len_kv,
+        1,
+        torch.cuda.current_stream(),
+    )
+    blocks = kernels._max_blocks_per_cu(launcher, args)
+    assert isinstance(blocks, int) and blocks >= 1
 
 
 if __name__ == "__main__":

@@ -131,12 +131,17 @@ def _device_cu_count(device_index: int) -> int:
         return _split_policy().fallback_cu
 
 
+# Upper bound on the grid.y splits the cost model searches.
+_MAX_SPLITS = 64
+
+
 @lru_cache(maxsize=256)
 def _splits_by_wave_cost(grid_x, effective_cus, window_tiles, max_splits, overhead):
-    """``num_splits`` in [1, min(max_splits, 64)] minimizing the wave-quantized cost
+    """``num_splits`` in [1, min(max_splits, _MAX_SPLITS)] minimizing the
+    wave-quantized cost
     ``ceil(grid_x * s / effective_cus) * (ceil(window_tiles / s) + overhead)``."""
     return min(
-        range(1, min(max_splits, 64) + 1),
+        range(1, min(max_splits, _MAX_SPLITS) + 1),
         key=lambda s: -(-(grid_x * s) // effective_cus)
         * (-(-window_tiles // s) + overhead),
     )
@@ -167,12 +172,12 @@ def _auto_num_splits(
     For small-M / large-N shapes the ``ceil(seq_len/RPB)`` row grid leaves the
     device block-starved; splitting each row's window across ``grid.y`` recovers
     occupancy at no correctness cost (logits[m,n] are independent across n).
-    Returns 1 once the row grid alone oversubscribes the device. The three
-    tuning constants are per-arch -- see ``_SPLIT_POLICIES``.
+    Returns 1 once the row grid alone oversubscribes the device. The tuning
+    constants are per-arch -- see ``_SPLIT_POLICIES``.
 
     With ``blocks_per_cu`` known, minimizes ``_splits_by_wave_cost`` over
-    ``cu_count * blocks_per_cu`` instead, since occupancy depends on the kernel
-    instance (``mfma_r2_w4``: 8 blocks/CU at H=16, 2 at H=128).
+    ``cu_count * blocks_per_cu`` instead, since resident blocks per CU depend on
+    the compiled kernel (its register and LDS use), not only on the device.
     """
     pol = _split_policy()
     grid_x = seq_len_padded // rows_per_block
