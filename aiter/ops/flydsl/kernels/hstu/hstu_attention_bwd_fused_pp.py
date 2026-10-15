@@ -202,6 +202,7 @@ def build_hstu_attention_bwd_fused_pp(
     num_waves: int = 8,
     waves_per_eu: int = 2,
     has_perm: bool = False,
+    dq_mode="full",
 ):
     validate_hstu_attention_bwd_fused_pp(
         num_heads,
@@ -283,10 +284,20 @@ def build_hstu_attention_bwd_fused_pp(
     # -- a 4-way conflict on every one of the 16 adds per lane. +4 shifts each
     # quarter by 4 banks so all 64 lanes land on distinct ones.
     DQ_PAD = head_dim + 4
-    DQR_ELEMS = BLOCK_N * DQ_PAD
-    # Each wave GROUP flushes half the tile; see `dq_flush`.
-    DQ_FLUSH_ROWS = BLOCK_N // 2
-    DQ_PER_LANE = BLOCK_N * head_dim // 2 // (NUM_WAVES // 2 * WARP_SIZE)
+    # One PRIVATE slot per wave, written with ds_write. `ds_add_f32` into a
+    # shared slot is 55x a ds_write_b32 on gfx942 -- 737 vs 13 ns per op per
+    # wave, measured in tmp/hstu_repro/bench_lds_fadd.py, and unchanged by
+    # giving the waves private addresses or by the bank padding, so it is the
+    # instruction and not contention. It cost 1520 ms of a 1915 ms kernel.
+    DQW_ELEMS = NUM_WAVES * BLOCK_N * DQ_PAD
+    # Group-exchange buffer. Two rows past the tile: row BLOCK_N is g0's write
+    # sink and row BLOCK_N+1 is a permanently-zero source for g1's read, which
+    # is how the exchange stays branch-free.
+    DQG_SINK, DQG_ZERO = BLOCK_N, BLOCK_N + 1
+    DQG_ELEMS = (BLOCK_N + 2) * DQ_PAD
+    # 4 contiguous outputs per lane: 16 rows x 16 lanes x 4 = BLOCK_N*head_dim.
+    DQ_PER_LANE = BLOCK_N * head_dim // (NUM_WAVES // 2 * WARP_SIZE)
+    DQ_LANES_PER_ROW = head_dim // DQ_PER_LANE
 
     rm_tile_elems_per_pass = GRP_THREADS * DMA_ELEMS
     assert RM_TILE_ELEMS % rm_tile_elems_per_pass == 0
@@ -357,11 +368,8 @@ def build_hstu_attention_bwd_fused_pp(
         do_t0: fx.Array[elem_dtype, T_TILE_ELEMS, 16]
         do_t1: fx.Array[elem_dtype, T_TILE_ELEMS, 16]
         ft: fx.Array[elem_dtype, FT_ELEMS, 16]
-        # Two slots, indexed by the UNROLL position -- a CONSTEXPR, never the
-        # runtime tile parity, so each access stays inside one global (see the
-        # LDS-provenance note on the rotating tiles above).
-        dqr0: fx.Array[fx.Float32, DQR_ELEMS, 16]
-        dqr1: fx.Array[fx.Float32, DQR_ELEMS, 16]
+        dqw: fx.Array[fx.Float32, DQW_ELEMS, 16]
+        dqg: fx.Array[fx.Float32, DQG_ELEMS, 16]
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def hstu_attention_bwd_fused_pp(
@@ -499,9 +507,12 @@ def build_hstu_attention_bwd_fused_pp(
         q_t_rd = [lds.q_t0.view(t_rd_layout), lds.q_t1.view(t_rd_layout)]
         do_t_rd = [lds.do_t0.view(t_rd_layout), lds.do_t1.view(t_rd_layout)]
 
-        dqr_layout = fx.make_layout((BLOCK_N, DQ_PAD), (DQ_PAD, 1))
-        dqr = [lds.dqr0.view(dqr_layout), lds.dqr1.view(dqr_layout)]
-        dqr_base = [fx.get_iter(dqr[0]), fx.get_iter(dqr[1])]
+        dqw = lds.dqw.view(
+            fx.make_layout(
+                (NUM_WAVES, BLOCK_N, DQ_PAD), (BLOCK_N * DQ_PAD, DQ_PAD, 1)
+            )
+        )
+        dqg = lds.dqg.view(fx.make_layout((BLOCK_N + 2, DQ_PAD), (DQ_PAD, 1)))
 
         ft_view = lds.ft.view(
             fx.make_layout(
@@ -1009,65 +1020,82 @@ def build_hstu_attention_bwd_fused_pp(
                 out.append(keep & (q_raw < seq_len) & kv_in_bounds[og])
             return out
 
-        # ---- dQ split-K flush ----------------------------------------------
+        # ---- dQ split-K reduction + flush ----------------------------------
         # Scratch base for this (batch, kv_tile); -1 marks a tile the sequence
         # does not have, which only an out-of-range q row could reach and those
         # are steered to the trash row below.
         dq_poff = part_off[
             fx.Int64(batch_idx * fx.Int32(num_kv_tiles) + kv_tile_idx)
         ]
-        # The two wave groups flush DISJOINT halves of the tile, g1 rows 0..7
-        # and g0 rows 8..15, one interval apart. That is what makes the flush
-        # branch-free: a `if not is_g0:` around a tensor subscript store makes
-        # the AST rewriter demand an scf.if result for `dq_part`, and letting
-        # one group flush the whole tile while the other idles wastes half the
-        # workgroup. Disjoint halves are safe because an add to a slot is
-        # always two intervals ahead of its flush -- see `dq_flush`.
+        # 256 lanes per group, 4 contiguous outputs each.
         dq_gtid = (wave_id % fx.Int32(NUM_WAVES // 2)) * fx.Int32(WARP_SIZE) + _lane
-        dq_lanes_per_row = fx.Int32(head_dim // DQ_PER_LANE)
-        dq_frow = is_g0.select(fx.Int32(DQ_FLUSH_ROWS), fx.Int32(0)) + (
-            dq_gtid // dq_lanes_per_row
-        )
-        dq_fcol = (dq_gtid % dq_lanes_per_row) * fx.Int32(DQ_PER_LANE)
+        dq_frow = dq_gtid // fx.Int32(DQ_LANES_PER_ROW)
+        dq_fcol = (dq_gtid % fx.Int32(DQ_LANES_PER_ROW)) * fx.Int32(DQ_PER_LANE)
+        dq_wbase = is_g0.select(fx.Int32(0), fx.Int32(NUM_WAVES // 2))
+        # g1 writes its group sum to the row g0 will read; g0 writes to the
+        # sink row and reads the real one. g1 reads the permanently-zero row,
+        # so it adds nothing. No branch, and neither group idles.
+        dq_wrow = is_g0.select(fx.Int32(DQG_SINK), dq_frow)
+        dq_rrow = is_g0.select(dq_frow, fx.Int32(DQG_ZERO))
 
-        def dq_flush(slot, tile):
-            """Drain dQ reduction slot `slot`, holding q tile `tile`, and zero it.
+        def dq_reduce_flush(q_tile_v):
+            """Sum the 8 per-wave dQ partials for q tile `q_tile_v - 1` and store.
 
-            Ordering, with g1 one interval ahead (g0 takes the extra skew
-            barrier, so g1 reaches M(i) first):
+            Runs in phase V, not phase M, and that placement is forced. Within
+            one M phase a group's four waves have no mutual visibility -- there
+            is no barrier inside a phase -- so a wave cannot read a slot another
+            wave of its own group just wrote. The intervals, with g1 one ahead:
 
-                interval A    g1 M(u=0)  adds dqr0, flushes dqr1 rows 0-7
-                         A+1  g0 M(u=0)  adds dqr0, flushes dqr1 rows 8-15
-                         A+2  g1 M(u=1)  adds dqr1, flushes dqr0 rows 0-7
-                         A+3  g0 M(u=1)  adds dqr1, flushes dqr0 rows 8-15
+                A    g1 M(i)    writes slots 4-7
+                A+1  g0 M(i)    writes slots 0-3 | g1 V(i)  sums 4-7 -> dqg
+                A+2  g1 M(i+1)  rewrites 4-7     | g0 V(i)  sums 0-3 + dqg, stores
 
-            A slot's two adds land in consecutive intervals and its flush is in
-            the next one again, so the flush always sees both -- and the zeroing
-            is two intervals ahead of the next add. Every edge is a barrier.
+            Each group reads its OWN slots one interval after writing them and
+            one interval before overwriting them, so ONE set of eight slots is
+            enough -- two sets would be 65,536 B and would not fit beside the
+            16,640 B the dV/dK schedule already holds.
 
-            Zeroing on the way out is why no separate clear is needed and why
-            the first flush of each slot (reading an all-zero buffer for a tile
-            below `kv_start_row`) is harmless.
+            g1 stores too, to the trash row. Its 256 lanes collapse onto the 64
+            dwords of this workgroup's single head there, so the wasted HBM
+            traffic is 256 B per tile; only the issue slot is paid.
             """
-            _qa = tile * fx.Int32(BLOCK_N) + dq_frow
-            _ql = _qa - kv_start_row
-            _b = fx.Int64(dq_poff) + fx.Int64(
-                _ql * fx.Int32(num_heads * head_dim)
-                + head_idx * fx.Int32(head_dim)
-                + dq_fcol
-            )
-            # Out-of-range rows go to the reserved trash row at offset 0, which
-            # is a full H*D elements so `dq_fcol` cannot run out of it.
-            _b = (_qa < seq_len).select(_b, fx.Int64(0))
-            _b = (_qa >= kv_start_row).select(_b, fx.Int64(0))
+            acc = [fx.Float32(0.0) for _ in range_constexpr(DQ_PER_LANE)]
+            for w in range_constexpr(NUM_WAVES // 2):
+                for j in range_constexpr(DQ_PER_LANE):
+                    acc[j] = acc[j] + dqw[
+                        dq_wbase + fx.Int32(w), dq_frow, dq_fcol + fx.Int32(j)
+                    ]
             for j in range_constexpr(DQ_PER_LANE):
-                _c = dq_fcol + fx.Int32(j)
-                dq_part[_b + fx.Int64(j)] = dqr[slot][dq_frow, _c] * c_inv_n
-                dqr[slot][dq_frow, _c] = fx.Float32(0.0)
+                dqg[dq_wrow, dq_fcol + fx.Int32(j)] = acc[j]
+            # No fence between the write and the read: NEITHER group reads what
+            # it just wrote. g1 writes `dq_frow` and reads the permanently-zero
+            # row; g0 writes the sink row and reads the row g1 published a full
+            # barrier ago. A defensive lgkmcnt(0) here is a whole LDS round
+            # trip on the critical path of every gate phase.
+            for j in range_constexpr(DQ_PER_LANE):
+                acc[j] = acc[j] + dqg[dq_rrow, dq_fcol + fx.Int32(j)]
+
+            # The partial belongs to tile q_tile_v - 1: phase M consumes
+            # `ds_prev`, produced by the PREVIOUS trip's gate phase.
+            _qa = (q_tile_v - fx.Int32(1)) * fx.Int32(BLOCK_N) + dq_frow
+            # `dq_part` is [row][H*D] and the offsets are in ROWS. A flat
+            # element layout is the same memory but overflows the launch ABI,
+            # which packs dynamic extents as i32: the scratch is 21e9 fp32 per
+            # pass at the benchmark shape.
+            _r = fx.Int64(dq_poff) + fx.Int64(_qa - kv_start_row)
+            # Upper bound is the jagged tail; the lower one catches the first
+            # trip, whose `ds_prev` is the zero pack from `acc_init` and whose
+            # nominal tile is q_tile_start-1.
+            _r = (_qa < seq_len).select(_r, fx.Int64(0))
+            _r = (_qa >= kv_start_row).select(_r, fx.Int64(0))
+            _r = is_g0.select(_r, fx.Int64(0))
+            _hc = head_idx * fx.Int32(head_dim) + dq_fcol
+            for j in range_constexpr(DQ_PER_LANE):
+                dq_part[_r, _hc + fx.Int32(j)] = acc[j] * c_inv_n
 
         # ---- phase M -------------------------------------------------------
         def mfma_phase(dv, dk, p_prev, ds_prev, q_tile, rm_cur, rm_fill, t_cur,
-                       t_prev, kt_packs, dq_slot, flush_tile):
+                       t_prev, kt_packs):
             """Four GEMMs, the operand feed, this group's DMA and transpose, the mask.
 
             `kt_packs` is a PARAMETER, unlike every other loop-invariant here
@@ -1080,10 +1108,15 @@ def build_hstu_attention_bwd_fused_pp(
             # kt_packs: one scratch slot per subtile, written and read inside
             # this phase by the owning wave only, so no barrier is involved and
             # the slots never cross one.
-            ds_t = [
-                transpose_frag(ds_prev[og], og)
-                for og in range_constexpr(KV_OWNED_SUBTILES)
-            ]
+            if const_expr(dq_mode == "notrans"):
+                # TIMING ONLY, RESULTS ARE WRONG: feeds the dQ GEMM the
+                # untransposed dS to price the transpose on its own.
+                ds_t = [ds_prev[og] for og in range_constexpr(KV_OWNED_SUBTILES)]
+            elif const_expr(dq_mode != "nodq"):
+                ds_t = [
+                    transpose_frag(ds_prev[og], og)
+                    for og in range_constexpr(KV_OWNED_SUBTILES)
+                ]
 
             rocdl.s_setprio(1)
             q_start = fx.Int32(q_tile) * fx.Int32(BLOCK_N)
@@ -1172,49 +1205,37 @@ def build_hstu_attention_bwd_fused_pp(
                 transpose_do(rm_cur, t_cur)
             rocdl.sched_barrier(0)
 
-            # ---- dQ: partial over THIS workgroup's KV range ----------------
-            # dQ[q][d] = sum_kv dS[q][kv].K[kv][d]. Both operands are
-            # register-resident (transposed dS, kt_packs), so this needs no
-            # operand-window group -- at PREFETCH_W=15 every window slot is
-            # live at once and an LDS-fed group would add live registers
-            # one-for-one.
-            #
-            # C[m=q][n=d] over 4 d-chunks x KV_OWNED_SUBTILES kv steps.
-            rocdl.sched_barrier(0)
-            dq_acc = [c_zero_v4f32 for _ in range_constexpr(K_STEPS)]
-            for ks in range_constexpr(K_STEPS):
-                for og in range_constexpr(KV_OWNED_SUBTILES):
-                    dq_acc[ks] = mfma_acc(ds_t[og], kt_packs[ks][og], dq_acc[ks])
-
-            # Reduce across all 8 waves into this slot. The waves own disjoint
-            # KV rows but the SAME q rows, so their partials must be added, not
-            # placed side by side -- and one slot per (batch, kv_tile, wave)
-            # would be 227 GB of scratch at the benchmark shape.
-            #
-            # No scale here: `c_inv_n` is applied once at the flush, 2 elements
-            # per lane instead of 16. Alpha needs nothing -- `kt_packs` is
-            # transposed from the alpha-scaled `k_packs`, and ds.(aK) = a.(ds.K)
-            # is exactly the chain rule. Do NOT also apply dq_pp's
-            # `alpha/max_seq_len`; that kernel folds alpha into Q, not K.
-            for e in range_constexpr(MFMA_ELEMS_PER_LANE):
-                _q = lane_div_16 * fx.Int32(MFMA_LANE_K) + fx.Int32(e)
+            # ABLATION (`dq_mode`): "nodq" drops all dQ work, "nostore" keeps
+            # the GEMM and the LDS reduction but not the HBM flush.
+            if const_expr(dq_mode != "nodq"):
+                # ---- dQ: partial over THIS workgroup's KV range ----------------
+                # dQ[q][d] = sum_kv dS[q][kv].K[kv][d]. Both operands are
+                # register-resident (transposed dS, kt_packs), so this needs no
+                # operand-window group -- at PREFETCH_W=15 every window slot is
+                # live at once and an LDS-fed group would add live registers
+                # one-for-one.
+                #
+                # C[m=q][n=d] over 4 d-chunks x KV_OWNED_SUBTILES kv steps.
+                rocdl.sched_barrier(0)
+                dq_acc = [c_zero_v4f32 for _ in range_constexpr(K_STEPS)]
                 for ks in range_constexpr(K_STEPS):
-                    _d = fx.Int32(ks * MFMA_M) + lane_mod_16
-                    fx.atomic_add(
-                        fx.to_llvm_ptr(
-                            fx.add_offset(
-                                dqr_base[dq_slot], _q * fx.Int32(DQ_PAD) + _d
-                            )
-                        ),
-                        Vec(dq_acc[ks])[e],
-                        syncscope=fx.rocdl.SyncScope.Workgroup,
-                    )
+                    for og in range_constexpr(KV_OWNED_SUBTILES):
+                        dq_acc[ks] = mfma_acc(ds_t[og], kt_packs[ks][og], dq_acc[ks])
 
-            # Drain the OTHER slot, filled two intervals ago. Issued after this
-            # phase's DMA so the closing `vmcnt(0)` covers both in one wait --
-            # `vmcnt` is in-order, so putting the stores first would make every
-            # tile wait on them separately.
-            dq_flush(1 - dq_slot, flush_tile)
+                # Park this wave's partial in its PRIVATE slot. Phase V sums
+                # the eight of them; see `dq_reduce_flush` for why the reduction
+                # cannot happen here.
+                #
+                # No scale: `c_inv_n` is applied once at the store, 4 elements
+                # per lane instead of 16. Alpha needs nothing -- `kt_packs` is
+                # transposed from the alpha-scaled `k_packs`, and
+                # ds.(aK) = a.(ds.K) is exactly the chain rule. Do NOT also
+                # apply dq_pp's `alpha/max_seq_len`; that folds alpha into Q.
+                for e in range_constexpr(MFMA_ELEMS_PER_LANE):
+                    _q = lane_div_16 * fx.Int32(MFMA_LANE_K) + fx.Int32(e)
+                    for ks in range_constexpr(K_STEPS):
+                        _d = fx.Int32(ks * MFMA_M) + lane_mod_16
+                        dqw[wave_id, _q, _d] = Vec(dq_acc[ks])[e]
             rocdl.sched_barrier(0)
 
             rocdl.s_setprio(0)
@@ -1235,7 +1256,15 @@ def build_hstu_attention_bwd_fused_pp(
             GEMM0 and GEMM2 both finished in phase M, so `grad` never has to
             outlive the element it belongs to -- unlike the non-ping-pong kernel,
             which carries `s_meta` across a barrier and 24 MFMAs.
+
+            Also carries the dQ cross-wave reduction. That is the one memory
+            operation in this phase, and it is here because phase M cannot host
+            it (see `dq_reduce_flush`) -- but it also lands well: the partner
+            group is in phase M on the matrix core, so the LDS and store units
+            are otherwise idle for the whole interval.
             """
+            if const_expr(dq_mode in ("full", "dswrite", "notrans")):
+                dq_reduce_flush(q_start // fx.Int32(BLOCK_N))
             # Batched a stage at a time across ALL KV_OWNED_SUBTILES *
             # MFMA_ELEMS_PER_LANE elements, not one element at a time. The gate
             # is a ~10-deep serial dependency chain per element with two
@@ -1354,19 +1383,16 @@ def build_hstu_attention_bwd_fused_pp(
             # runs while the zeroing and the staging DMA are still being set
             # up, and it corrupted dv/dk (5.4k elements). Here nothing is in
             # flight.
-            # The flush zeroes each slot on its way out, so this is the only
-            # clear needed -- but it IS needed: the first flush of each slot
-            # reads the buffer before anything has been added to it.
+            # Only `dqg` needs clearing, and only its permanently-zero row --
+            # but zero the whole thing, it is one short loop and leaves no
+            # assumption about which rows g1 reads. `dqw` is fully overwritten
+            # by every M phase before anything reads it.
             for _z in range_constexpr(
-                (2 * DQR_ELEMS + BLOCK_THREADS - 1) // BLOCK_THREADS
+                (DQG_ELEMS + BLOCK_THREADS - 1) // BLOCK_THREADS
             ):
                 _zi = tid + fx.Int32(_z * BLOCK_THREADS)
-                _zs = _zi // fx.Int32(DQR_ELEMS)
-                _zo = _zi % fx.Int32(DQR_ELEMS)
-                _zo = (_zi < fx.Int32(2 * DQR_ELEMS)).select(_zo, fx.Int32(0))
-                for _s in range_constexpr(2):
-                    _w = (_zs == fx.Int32(_s)).select(_zo, fx.Int32(0))
-                    dqr[_s][fx.Int32(0), _w] = fx.Float32(0.0)
+                _zi = (_zi < fx.Int32(DQG_ELEMS)).select(_zi, fx.Int32(0))
+                dqg[fx.Int32(0), _zi] = fx.Float32(0.0)
             rocdl.s_waitcnt(lgkmcnt=0)
 
             kt_packs = []
@@ -1426,7 +1452,7 @@ def build_hstu_attention_bwd_fused_pp(
                     t_prev = (u + 1) % T_SLOTS
                     dv, dk, s_accs, da_accs, q_start = mfma_phase(
                         dv, dk, p_prev, ds_prev, q_tile, rm_cur, rm_fill, t_cur,
-                        t_prev, kt_packs, u, base_tile + fx.Int32(u - 2),
+                        t_prev, kt_packs,
                     )  # fmt: skip
                     phase_barrier()
                     p_prev, ds_prev = gate_phase(s_accs, da_accs, q_start)
@@ -1439,12 +1465,9 @@ def build_hstu_attention_bwd_fused_pp(
             # without a trailing barrier inside the loop.
             phase_barrier()
 
-            # Drain. Slot 0 was flushed by the loop's last u=1 phase; slot 1,
-            # filled by that same phase, was never reached by a following M.
-            # Both groups run here in the SAME interval, which is fine because
-            # they own disjoint row halves. The barrier above makes every add
-            # visible.
-            dq_flush(1, q_tile_start + fx.Int32(2) * n_outer - fx.Int32(2))
+            # No drain: every tile's partial is flushed by g0's gate phase in
+            # the same trip that produced it, and the last gate phase is inside
+            # the loop.
 
             if not is_g0:
                 phase_barrier()

@@ -17,8 +17,12 @@ Scratch layout, built by `partial_offsets` on the host and compact by
 necessity -- the dense `[max_tiles][L][H][D]` alternative is 331 GB at the
 benchmark shape:
 
-    offset[b][t]  prefix sum over (b, t) of (S_b - t*BLOCK_M) * H * D
-    index         offset[b][t] + ((q_row - t*BLOCK_M) * H + h) * D + d
+    offset[b][t]  prefix sum over (b, t) of (S_b - t*BLOCK_M)   -- in ROWS
+    dq_part[offset[b][t] + (q_row - t*BLOCK_M)][h * D + d]
+
+`dq_part` is 2-D rather than a flat element array only because the launch ABI
+packs dynamic extents as i32 and the per-pass scratch is 21e9 fp32 at the
+benchmark shape. The bytes are identical.
 
 kv tile `t` only serves q rows `[t*BLOCK_M, S_b)` -- under the causal mask
 nothing above the diagonal contributes -- so q row `r` sums tiles
@@ -133,9 +137,7 @@ def build_hstu_attention_bwd_dq_reduce(
                 # for the output tensor.
                 _rr = row0 + fx.Int32(r)
                 _rr = (_rr < seq_len).select(_rr, seq_len - fx.Int32(1))
-                acc0[r] = dq_acc[
-                    fx.Int64(seq_start + _rr) * fx.Int64(HD) + fx.Int64(tid)
-                ]
+                acc0[r] = dq_acc[fx.Int64(seq_start + _rr), tid]
 
         for _t, it in range(
             fx.Int64(tile_lo), fx.Int64(n_t), fx.Int64(1), init=acc0
@@ -148,7 +150,7 @@ def build_hstu_attention_bwd_dq_reduce(
             ]
             t = fx.Int32(_t)
             o = part_off[fx.Int64(b) * fx.Int64(max_tiles) + fx.Int64(t)]
-            base = fx.Int64(o) + fx.Int64(tid)
+            base = fx.Int64(o)
             row_in_slot = row0 - t * fx.Int32(block_m)
             nxt = []
             for r in range_constexpr(ROWS):
@@ -156,7 +158,7 @@ def build_hstu_attention_bwd_dq_reduce(
                 _rr = (_rr < seq_len).select(_rr, seq_len - fx.Int32(1))
                 _ri = row_in_slot + (_rr - row0)
                 nxt.append(
-                    acc[r] + dq_part[base + fx.Int64(_ri) * fx.Int64(HD)]
+                    acc[r] + dq_part[base + fx.Int64(_ri), tid]
                 )
             acc = yield nxt
 
@@ -170,9 +172,7 @@ def build_hstu_attention_bwd_dq_reduce(
             if const_expr(last_pass):
                 out_dq[fx.Int64(seq_start + _rr), h, d] = res[r].to(elem_dtype)
             else:
-                dq_acc[
-                    fx.Int64(seq_start + _rr) * fx.Int64(HD) + fx.Int64(tid)
-                ] = res[r]
+                dq_acc[fx.Int64(seq_start + _rr), tid] = res[r]
 
     @flyc.jit
     def launch_hstu_attention_bwd_dq_reduce(
