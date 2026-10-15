@@ -1388,8 +1388,6 @@ def build_hstu_attention_bwd_fused_pp(
             group is in phase M on the matrix core, so the LDS and store units
             are otherwise idle for the whole interval.
             """
-            if const_expr(dq_mode in ("full", "dswrite", "notrans")):
-                _dq_issued = dq_flush_issue()
             # Batched a stage at a time across ALL KV_OWNED_SUBTILES *
             # MFMA_ELEMS_PER_LANE elements, not one element at a time. The gate
             # is a ~10-deep serial dependency chain per element with two
@@ -1420,6 +1418,19 @@ def build_hstu_attention_bwd_fused_pp(
                 # k_packs), so only the exp2 argument needs a multiply.
                 sc = s
                 emu = [exp2_f32(fmul_const_scalar(sc[j], c_neg_log2e)) for j in rng]
+                # The five flush reads are issued HERE, a third of the way into
+                # the gate, rather than at the top of the phase.
+                #
+                # At the top they land in the same cycles as the partner
+                # group's phase-M head, which opens with eleven operand
+                # `ds_read`s of its own -- two waves per SIMD sharing one LDS
+                # issue port, and the trace charged the fifth read 3.7% of all
+                # stall for it. By here the partner is mid-MFMA-burst and the
+                # port is quiet. The sixteen quarter-rate `exp2` above and the
+                # whole chain below still cover the latency; only the issue
+                # cycle moves.
+                if const_expr(dq_mode in ("full", "dswrite", "notrans")):
+                    _dq_issued = dq_flush_issue()
                 sig = [rcp_scalar(addone_scalar(emu[j])) for j in rng]
                 silu = [fmul_scalar(sc[j], sig[j]) for j in rng]
                 # silu'(z) = sig*(1 + z*(1 - sig)) = sig + silu*(1 - sig).
