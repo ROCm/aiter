@@ -168,7 +168,7 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
     def rescale_from_tile_max(self, m_row, m_tile_max):
         row_max = fx.maxnumf(m_row, m_tile_max)
         diff_scaled = (m_row - row_max) * self.c_logit_scale
-        rescale = rocdl.exp2(T.f32, as_mlir_value(diff_scaled))
+        rescale = fx.Float32(diff_scaled).exp2(fastmath="afn").ir_value()
         return row_max, rescale
 
     def apply_l_rescale(self, l_row, rescale):

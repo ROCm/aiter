@@ -10,10 +10,12 @@ import shutil
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
 
+IS_WINDOWS = sys.platform == "win32"
 GENERATED_BUILD_INPUT_SUFFIXES = (".cpp", ".cu", ".h", ".hpp", ".cuh")
 STAGING_DIRECTORY_NAME = "blob.staging"
 CODEGEN_INCOMPLETE_MARKER = ".aiter-codegen-incomplete"
@@ -32,6 +34,53 @@ _ABANDONED_ARTIFACT_PREFIXES = (
 _copy2 = shutil.copy2
 _link = os.link
 _replace = os.replace
+
+
+def _posix_path(path):
+    return path.replace("\\", "/") if IS_WINDOWS else path
+
+
+def _pid_alive(pid):
+    """Liveness probe for a local process id.
+
+    Kept self-contained rather than shared with file_baton: this module is
+    also loaded straight from its path, without its directory on sys.path.
+    """
+    if IS_WINDOWS:
+        # os.kill() on Windows calls TerminateProcess() for any signal other
+        # than CTRL_C/CTRL_BREAK_EVENT, so a `kill(pid, 0)` liveness probe
+        # would kill the very owner it is checking on.
+        import ctypes
+        from ctypes import wintypes
+
+        SYNCHRONIZE = 0x00100000
+        ERROR_ACCESS_DENIED = 5
+        WAIT_TIMEOUT = 0x102
+        # A private WinDLL, so the prototypes below do not leak into
+        # ctypes.windll, and so HANDLE is not truncated to the default c_int.
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+        if not handle:
+            # Exists but owned by another user, like the PermissionError below.
+            return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+        try:
+            # Not GetExitCodeProcess: a process that exited with 259 is
+            # indistinguishable from STILL_ACTIVE there.
+            return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by another user
+    return True
 
 
 def _remove_path(path):
@@ -67,13 +116,7 @@ def _artifact_owner_active(name):
             return None
         if parts[0] != socket.gethostname():
             return True
-        try:
-            os.kill(int(parts[1]), 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        return True
+        return _pid_alive(int(parts[1]))
     return None
 
 
@@ -116,13 +159,7 @@ def _marker_owner_is_active(marker_path):
         return False
     if lines[1] != socket.gethostname():
         return True
-    try:
-        os.kill(int(lines[0]), 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    return _pid_alive(int(lines[0]))
 
 
 def _recover_blob_backup(blob_dir):
@@ -255,7 +292,9 @@ def stage_blob_sources(
         output_dir = os.path.join(staging_dir, "")
         for command in commands:
             formatted_command = command.format(output_dir)
-            args = [python_executable, *shlex.split(formatted_command)]
+            # shlex.split() reads a backslash as an escape, so a Windows
+            # separator would be swallowed. Both platforms accept "/".
+            args = [python_executable, *shlex.split(_posix_path(formatted_command))]
             if log_commands and logger is not None:
                 logger.info("exec_blob ---> %s", shlex.join(args))
             subprocess.run(args, check=True)
@@ -444,6 +483,16 @@ def atomic_copy(source, destination, validate=None):
     os.close(fd)
     try:
         _copy2(source, temporary_path)
+        if IS_WINDOWS:
+            # os.replace() cannot move a file that is still open unless the
+            # handle was granted FILE_SHARE_DELETE, which open() does not do.
+            # The temporary path is private to this call, so reading the
+            # identity just before the rename still describes this inode.
+            identity = _stat_identity(os.stat(temporary_path))
+            if validate is not None:
+                validate()
+            _replace(temporary_path, destination)
+            return identity
         with open(temporary_path, "rb") as copied:
             if validate is not None:
                 validate()
