@@ -1275,13 +1275,25 @@ def build_hstu_attention_bwd_fused_pp(
             # else's, and leaves slot lifetimes untouched (still: write t_cur,
             # read t_prev, both within phase M), so it adds no cross-group
             # hazard.
-            rocdl.sched_barrier(0)
-            if is_g0:
-                transpose_q(rm_cur, t_cur)
-            else:
-                transpose_do(rm_cur, t_cur)
-            rocdl.sched_barrier(0)
-
+            # The dQ GEMM runs BEFORE the q_t/do_t transpose build, not after.
+            #
+            # That build reads an LDS tile `buffer_load ... lds` fills, and the
+            # backend cannot tell which bytes the outstanding DMAs will touch,
+            # so it guards the read with `vmcnt(0)`. The trace charged 2.57 M
+            # cycles to that one wait (3.1% of stall, 61/exec) -- the largest
+            # non-barrier item inside phase M. Two things follow:
+            #
+            #  - the eight dQ MFMAs now run BEFORE it, giving this phase's DMA
+            #    ~128 more cycles to land before anything has to wait on it;
+            #  - the forced `vmcnt(0)` ends up adjacent to the phase's own
+            #    closing `vmcnt(0)`, so the second one is free instead of
+            #    being a second full drain.
+            #
+            # Nothing about the transpose's placement rules changes: it is
+            # still inside phase M (phase V would be an unsynchronised
+            # cross-group RAW on the tile), still after every operand read has
+            # issued, and the slot lifetimes are untouched -- write t_cur, read
+            # t_prev, both within this phase.
             # ABLATION (`dq_mode`): "nodq" drops all dQ work, "nostore" keeps
             # the GEMM and the LDS reduction but not the HBM flush.
             if const_expr(dq_mode != "nodq"):
@@ -1330,6 +1342,13 @@ def build_hstu_attention_bwd_fused_pp(
                         fx.Int32(ks * MFMA_M // DQ_PER_LANE) + lane_div_16,
                         None,
                     ].store(Vec(dq_acc[ks]))  # fmt: skip
+            rocdl.sched_barrier(0)
+
+            rocdl.sched_barrier(0)
+            if is_g0:
+                transpose_q(rm_cur, t_cur)
+            else:
+                transpose_do(rm_cur, t_cur)
             rocdl.sched_barrier(0)
 
             rocdl.s_setprio(0)
