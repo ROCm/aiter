@@ -284,11 +284,6 @@ def build_hstu_attention_bwd_fused_pp(
     # PER-WAVE PRIVATE -- a wave transposes only its own kv rows -- so it
     # needs no barrier, only `s_waitcnt lgkmcnt`, and it does not rotate, so
     # it does not force UNROLL to lcm(...).
-    # ONE transpose slot per wave, not one per subtile: the calls are
-    # sequential and each ends with an lgkmcnt(0) after its reads, so the next
-    # write cannot pass them. Per-subtile slots would be 12,288 B at BLOCK_M
-    # 384, which with the dQ buffers overruns LDS by 3,104 B.
-    FT_ELEMS = NUM_WAVES * MFMA_M * MFMA_M
     # dQ reduction buffer: one BLOCK_N x head_dim fp32 tile per UNROLL slot.
     # The row stride is padded by 4 dwords. Unpadded, the four quarter-waves of
     # a `ds_add_f32` sit 4*head_dim = 256 dwords apart, which is 0 mod 64 banks
@@ -378,7 +373,6 @@ def build_hstu_attention_bwd_fused_pp(
         q_t1: fx.Array[elem_dtype, T_TILE_ELEMS, 16]
         do_t0: fx.Array[elem_dtype, T_TILE_ELEMS, 16]
         do_t1: fx.Array[elem_dtype, T_TILE_ELEMS, 16]
-        ft: fx.Array[elem_dtype, FT_ELEMS, 16]
         dqw: fx.Array[fx.Float32, DQW_ELEMS, 16]
         dqg: fx.Array[fx.Float32, DQG_ELEMS, 16]
 
@@ -524,57 +518,6 @@ def build_hstu_attention_bwd_fused_pp(
             )
         )
         dqg = lds.dqg.view(fx.make_layout((BLOCK_N + 2, DQ_PAD), (DQ_PAD, 1)))
-
-        ft_view = lds.ft.view(
-            fx.make_layout(
-                (NUM_WAVES, MFMA_M, MFMA_M // MFMA_LANE_K, MFMA_LANE_K),
-                (MFMA_M * MFMA_M, MFMA_M, MFMA_LANE_K, 1),
-            )
-        )
-
-        def transpose_frag(frag):
-            """16x16 fragment transpose, A-layout <-> C-layout.
-
-            dQ reduces over kv, but in BOTH MFMA operand layouts a lane's four
-            values run along the reduction index -- so a fragment's "4-value
-            axis" IS its reduction axis and swapping A<->B cannot change it.
-            `ds_packs` reduces over q and `k_packs` over d, so both dQ operands
-            need this. 240 of 256 elements change lane.
-
-            The permutation is IDENTICAL for both (verified exhaustively): a
-            target lane gathers from 4 CONSECUTIVE source lanes, taking the same
-            element index from each. It is also an involution, so one helper
-            serves both directions.
-
-            Scratch is contiguous in the source row, making the write one
-            `ds_write_b64` and the read four strided `ds_read_u16` -- the same
-            shape as the q_t/do_t build. Per-wave private, so `lgkmcnt` alone
-            orders it; the trailing wait lets a caller reuse a slot.
-            """
-            _i = wave_id
-            ft_view[_i, lane_mod_16, lane_div_16, None].store(Vec(frag))
-            # `s_waitcnt` alone is NOT enough. Unlike the q_t/do_t build --
-            # which writes t_cur and reads t_prev, two different slots -- this
-            # reads back the SAME locations it just wrote, through a different
-            # index expression. Without a scheduling fence the backend is free
-            # to hoist the reads above the write: measured ~78,000 wrong
-            # elements per run, against ~300 for the bug this kernel already
-            # had.
-            rocdl.sched_barrier(0)
-            rocdl.s_waitcnt(lgkmcnt=0)
-            rocdl.sched_barrier(0)
-            _e = []
-            for _j in range_constexpr(MFMA_LANE_K):
-                _r = lane_div_16 * fx.Int32(MFMA_LANE_K) + fx.Int32(_j)
-                _e.append(
-                    ft_view[_i, _r, lane_mod_16 // fx.Int32(MFMA_LANE_K),
-                            lane_mod_16 % fx.Int32(MFMA_LANE_K)]
-                )  # fmt: skip
-            out = Vec.from_elements(_e, elem_dtype).ir_value()
-            rocdl.sched_barrier(0)
-            rocdl.s_waitcnt(lgkmcnt=0)
-            rocdl.sched_barrier(0)
-            return out
 
         def q_swz_col(tile_row, col):
             return swz_col(tile_row, col, K_SWZ_ROWS, K_SWZ_SHIFT)
@@ -1009,6 +952,44 @@ def build_hstu_attention_bwd_fused_pp(
                 )
             return Vec.from_elements(words, fx.Int32).bitcast(elem_dtype).ir_value()
 
+        # Identity in B-operand layout: lane l element i is 1.0 exactly when
+        # 4*(l/16)+i == l%16. Loop-invariant, 2 VGPR.
+        c_ident = pack_bf16_perm(
+            [
+                (
+                    lane_div_16 * fx.Int32(MFMA_LANE_K) + fx.Int32(_i) == lane_mod_16
+                ).select(fx.Float32(1.0), fx.Float32(0.0))
+                for _i in range_constexpr(MFMA_ELEMS_PER_LANE)
+            ]
+        )
+
+        def transpose_frag(frag):
+            """Transpose a 16x16 fragment with ONE MFMA, no LDS and no shuffle.
+
+            The A and B operand layouts are transposes of each other -- A is
+            `lane l elem i <-> [l%16][4*(l/16)+i]`, B is `[4*(l/16)+i][l%16]`
+            -- and the C accumulator shares B's. So feeding a B-layout fragment
+            of X as the A operand makes it denote X^T, and `X^T . I = X^T`
+            lands in C layout, which read back IS the A layout of X. Verified
+            exhaustively: 256 of 256 lane-slots.
+
+            Bit-exact. The input is already bf16, `x * 1.0` accumulated in fp32
+            is exact, and the pack back to bf16 is exact.
+
+            This replaces an LDS round trip -- `ds_write`, fence, four strided
+            `ds_read_u16`, fence, per subtile. Done inside one phase that cost
+            16.4 M cycles, 16.7% of all stall in the dispatch-150 trace, since
+            a wave cannot see its own LDS write without draining `lgkmcnt`.
+            Splitting the write into the previous gate phase removed those
+            waits and was still SLOWER (+28 ms): `lgkmcnt` is in-order, so
+            reads issued before the operand window join the first MFMA's wait.
+            The matrix core sidesteps the counter altogether.
+            """
+            _c = mfma_acc(frag, c_ident, c_zero_v4f32)
+            return pack_bf16_perm(
+                [Vec(_c)[_e] for _e in range_constexpr(MFMA_ELEMS_PER_LANE)]
+            )
+
         def keep_masks(q_start, og):
             q_base = q_start + lane_div_16 * fx.Int32(MFMA_LANE_K)
             out = []
@@ -1148,6 +1129,7 @@ def build_hstu_attention_bwd_fused_pp(
             for _s in range_constexpr(PREFETCH_W):
                 _g = GROUP_ORDER[_s]
                 win[_s % (PREFETCH_W + 1)] = read_operand(_g, rm_cur, t_prev, halves)
+
 
             for step in range_constexpr(NUM_OPERAND_GROUPS):
                 g = GROUP_ORDER[step]
@@ -1411,6 +1393,7 @@ def build_hstu_attention_bwd_fused_pp(
                 for og in range_constexpr(KV_OWNED_SUBTILES):
                     per_og.append(transpose_frag(k_packs[ks][og]))
                 kt_packs.append(per_og)
+
 
             acc_init = [c_zero_v4f32 for _ in range_constexpr(N_ACC)] + [
                 c_zero_pack for _ in range_constexpr(2 * N_PACK)
