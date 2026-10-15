@@ -700,7 +700,13 @@ def build_hstu_attention_bwd_fused_pp(
         t_unit_c = t_unit_row // fx.Int32(MFMA_M)
 
         def make_transpose(rm_views_, t_views_, swizzled):
-            def run(rm_slot, t_slot):
+            def run(rm_slot, t_slot, between=None):
+                """`between` is emitted after the gather and before the store.
+
+                It is a callback and not just a statement ordering because this
+                runs inside a RUNTIME `if is_g0:` branch, and the frontend will
+                not let values defined in a branch escape it.
+                """
                 view = rm_views_[rm_slot]
                 elems = []
                 for i in range_constexpr(MFMA_LANE_K):
@@ -717,6 +723,8 @@ def build_hstu_attention_bwd_fused_pp(
                             col % fx.Int32(MFMA_LANE_K),
                         ]
                     )
+                if between is not None:
+                    between()
                 t_views_[t_slot][t_unit_qg, t_unit_m, t_unit_c, None].store(
                     Vec.from_elements(elems, elem_dtype)
                 )
@@ -1341,38 +1349,41 @@ def build_hstu_attention_bwd_fused_pp(
 
             rocdl.sched_barrier(0)
 
+            # The dQ staging writes are emitted INSIDE the transpose build,
+            # between its gather and its store.
+            #
+            # They read dQ accumulators directly, and an MFMA result costs a
+            # non-MFMA consumer wait states -- the hazard recogniser emits
+            # `s_nop 3`/`s_nop 6` and the writes absorb the rest. The four
+            # `ds_read_u16` ahead of them cover that. Sitting AFTER the whole
+            # transpose instead, they landed immediately before the phase's
+            # closing `lgkmcnt(0)` with nothing to cover their own retirement;
+            # here the transpose's own wait and store do it.
+            #
+            # Neither side has a bank conflict to fix: both are 64-lane b128,
+            # 256 dwords over 32 banks, and both measure exactly 8 accesses on
+            # the busiest bank -- the floor. T_GPAD and DQ_PAD=68 are what buy
+            # that; removing either doubles the busiest bank to 16.
+            def _dq_stage():
+                if const_expr(dq_mode != "nodq"):
+                    for ks in range_constexpr(K_STEPS):
+                        # q = l%16, d = ks*MFMA_M + MFMA_LANE_K*(l/16) + e, so the
+                        # four elements are one contiguous run of the
+                        # (.., BLOCK_N, head_dim/VEC, VEC) view.
+                        dqw[
+                            wave_id,
+                            lane_mod_16,
+                            fx.Int32(ks * MFMA_M // DQ_PER_LANE) + lane_div_16,
+                            None,
+                        ].store(Vec(dq_acc[ks]))  # fmt: skip
+
             rocdl.sched_barrier(0)
             if is_g0:
-                transpose_q(rm_cur, t_cur)
+                transpose_q(rm_cur, t_cur, _dq_stage)
             else:
-                transpose_do(rm_cur, t_cur)
+                transpose_do(rm_cur, t_cur, _dq_stage)
             rocdl.sched_barrier(0)
 
-            # The dQ staging writes go HERE, after the transpose build, not
-            # straight off the MFMAs that produce them. They read dQ
-            # accumulators directly, and an MFMA result costs a non-MFMA
-            # consumer wait states: the hazard recogniser emits `s_nop 3` /
-            # `s_nop 6` and the writes absorb the rest. The trace charged them
-            # 5.5% of all stall, and tellingly the ONE write that already had
-            # an `s_nop 6` ahead of it stalled 23 K against its neighbour's
-            # 2.18 M. The transpose's four `ds_read_u16`, its `vmcnt(0)` and
-            # its `ds_write` touch none of `dq_acc`, so they are free cover.
-            #
-            # No scale here: `c_inv_n` is applied once at the flush, 4 elements
-            # per lane instead of 16. Alpha needs nothing -- `kt_packs` is
-            # transposed from the alpha-scaled `k_packs`, and
-            # ds.(aK) = a.(ds.K) is exactly the chain rule.
-            if const_expr(dq_mode != "nodq"):
-                for ks in range_constexpr(K_STEPS):
-                    # q = l%16, d = ks*MFMA_M + MFMA_LANE_K*(l/16) + e, so the
-                    # four elements are one contiguous run of the
-                    # (.., BLOCK_N, head_dim/VEC, VEC) view.
-                    dqw[
-                        wave_id,
-                        lane_mod_16,
-                        fx.Int32(ks * MFMA_M // DQ_PER_LANE) + lane_div_16,
-                        None,
-                    ].store(Vec(dq_acc[ks]))  # fmt: skip
             rocdl.s_setprio(0)
             # The tile i+1 DMA fired above must land before the mid barrier, not
             # merely before this group's own next read: with the half-iteration
