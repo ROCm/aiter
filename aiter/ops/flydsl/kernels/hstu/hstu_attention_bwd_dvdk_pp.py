@@ -1091,15 +1091,28 @@ def build_hstu_attention_bwd_dvdk_pp(
             else:
                 dma_do(0, _t0, 0)
                 dma_do(0, _t0, 1)
-            rocdl.s_waitcnt(vmcnt=0)
-            rocdl.s_waitcnt(lgkmcnt=0)
-            phase_barrier()
-
             # The skew: g0 burns one extra barrier so that from here on g0 is in
             # phase M exactly when g1 is in phase V, and vice versa. Barrier
             # counts stay equal overall -- g1 repays it after the loop.
+            #
+            # It MUST come before the prologue's DMA fence, not after. Each
+            # group stages only its own tensor (g0 Q, g1 dO) but trip 0 reads
+            # BOTH, so the fence that publishes them has to be the last thing
+            # either group does before the loop. With the skew after the fence,
+            # g1 enters M(0) a full interval ahead while g0 still sits at the
+            # skew barrier, and g0's trip-0 GEMM2 reads a dO tile that g1 staged
+            # without an intervening publish -- nondeterministic dA, hence dV
+            # and dK, confined to the q rows g1's waves 2-3 wrote.
+            #
+            # Invisible at the tuned (384,16,8) shape, which is why this
+            # survived: measured 0/63 runs there, against 36/63 at
+            # (256,16,8) and 10/27 at (512,16,8). Output is bitwise unchanged
+            # at every shape -- this reorders publication, not arithmetic.
             if is_g0:
                 phase_barrier()
+            rocdl.s_waitcnt(vmcnt=0)
+            rocdl.s_waitcnt(lgkmcnt=0)
+            phase_barrier()
 
             acc_init = [c_zero_v4f32 for _ in range_constexpr(N_ACC)] + [
                 c_zero_pack for _ in range_constexpr(2 * N_PACK)
