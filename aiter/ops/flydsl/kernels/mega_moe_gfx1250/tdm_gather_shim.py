@@ -283,6 +283,26 @@ def make_tensor_gather_dgroup0(
 
 
 @dsl_loc_tracing
+def tensor_load_gather(
+    desc: TDMGatherDescriptor,
+    cache_policy: int = 0,
+) -> None:
+    """Issue one TDM gather load (Global -> LDS) for the descriptor's rows.
+
+    Rows whose index is at or past the descriptor's tensor_dim1 land zero-filled.
+    """
+    dg4 = _zero_dgroup_v8i32()
+    rocdl.tensor_load_to_lds(
+        desc.dgroup0,
+        desc.dgroup1,
+        desc.dgroup2,
+        desc.dgroup3,
+        dg4,
+        cache_policy=cache_policy if cache_policy else None,
+    )
+
+
+@dsl_loc_tracing
 def tensor_store_gather(
     desc: TDMGatherDescriptor,
     cache_policy: int = 0,

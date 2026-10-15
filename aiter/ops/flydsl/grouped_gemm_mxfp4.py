@@ -302,6 +302,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(ep_destination_stride),
         int(stage2_scatter.world_size) if enable_ep_scatter else 0,
         int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0,
+        int(stage2_scatter.per_rank_scatter) if enable_ep_scatter else 0,
     )
     layout_spec = (
         int(row_major_ascale),
