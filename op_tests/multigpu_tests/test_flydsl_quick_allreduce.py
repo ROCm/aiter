@@ -35,6 +35,10 @@ sweep ends in a markdown table:
   refilled between replays. A block-64 row with every block relaying, eager
   and graph, makes each block re-read its bounce slots, which catches a relay
   acquire that no longer empties L1.
+* ``test_quick_allreduce_setup_failure`` -- at TP2, one rank fails the inbox
+  allocation or the peer-handle open while the engines are built. Every rank
+  must raise, none may hang in an exchange, and a clean engine must build
+  afterwards. Every engine shares this setup code.
 
 ``--extended`` adds what production never selects: the legacy fixed shipping
 shapes, the full ``block``/``skip_self`` sweep, the fp16 transport over a
@@ -69,6 +73,7 @@ import math
 import os
 import sys
 from multiprocessing import Pool, freeze_support, set_start_method
+from time import perf_counter
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _REPO_ROOT not in sys.path:
@@ -293,6 +298,14 @@ EXTENDED_RELAY_CASES = (
 # Seconds to wait for each rank of a spawn. The kernels spin on flags written
 # by peers, so a protocol bug or a dead rank hangs the rest.
 SPAWN_TIMEOUT_S = 600
+
+# Setup steps of ``_StEngine`` that a rank can fail alone, by the
+# ``UncachedIpcHeap`` method made to raise: the inbox allocation, before the
+# handle exchange, and opening the peer's handle, after it.
+SETUP_FAULTS = {"alloc": "alloc", "open": "open_mem_handle"}
+SETUP_FAULT_RANK = 1
+# A rank left behind in an exchange would wait out the gloo timeout, far longer.
+SETUP_FAULT_TIMEOUT_S = 300
 
 _FILLS = (
     "normal",
@@ -918,32 +931,60 @@ def _run_rank(
     return rows
 
 
-def _spawn(
-    world_size: int,
-    engine_kw: dict,
-    cases: list[tuple],
-    window: tuple[int, int] | None = None,
-) -> list[list[dict]]:
-    if world_size not in SUPPORTED_WORLDS:
-        raise ValueError(f"unsupported world_size={world_size}")
-    init_method = get_distributed_init_method(get_ip(), get_open_port())
+def _run_setup_fault_rank(rank: int, tp: int, init_method: str, fault: str) -> dict:
+    """One rank of a setup-fault spawn: build an engine with *fault* injected
+    on ``SETUP_FAULT_RANK``, then build a clean one on every rank."""
+    import torch.distributed as dist
+
+    from aiter.ops.flydsl import FlyQuickAllReduce
+    from aiter.ops.flydsl.quick_allreduce_ipc import UncachedIpcHeap
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="gloo", init_method=init_method, world_size=tp, rank=rank
+    )
+    name = SETUP_FAULTS[fault]
+    real = vars(UncachedIpcHeap)[name]
+
+    def _fail(*_args, **_kwargs):
+        raise RuntimeError(f"injected {name} failure")
+
+    def _build():
+        FlyQuickAllReduce(
+            group=dist.group.WORLD, device=device, rank=rank, world_size=tp
+        ).close()
+
+    row = {"err": None, "s": None, "rebuild_err": None}
+    try:
+        if rank == SETUP_FAULT_RANK:
+            setattr(UncachedIpcHeap, name, staticmethod(_fail))
+        start = perf_counter()
+        try:
+            _build()
+        except Exception as exc:  # noqa: BLE001
+            row["err"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            row["s"] = perf_counter() - start
+            setattr(UncachedIpcHeap, name, real)
+        try:
+            _build()
+        except Exception as exc:  # noqa: BLE001
+            row["rebuild_err"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        dist.destroy_process_group()
+    return row
+
+
+def _pool_run(world_size: int, fn, kwds: dict, timeout_s: float) -> list:
+    """``fn(rank=r, **kwds)`` on one spawn worker per rank, in rank order."""
     pool = Pool(processes=world_size)
     try:
         results = [
-            pool.apply_async(
-                _run_rank,
-                kwds={
-                    "rank": rank,
-                    "tp": world_size,
-                    "init_method": init_method,
-                    "engine_kw": engine_kw,
-                    "cases": cases,
-                    "window": window,
-                },
-            )
+            pool.apply_async(fn, kwds={"rank": rank, **kwds})
             for rank in range(world_size)
         ]
-        ranks = [fut.get(timeout=SPAWN_TIMEOUT_S) for fut in results]
+        ranks = [fut.get(timeout=timeout_s) for fut in results]
     except Exception:
         pool.terminate()
         raise
@@ -952,6 +993,28 @@ def _spawn(
     finally:
         pool.join()
     return ranks
+
+
+def _spawn(
+    world_size: int,
+    engine_kw: dict,
+    cases: list[tuple],
+    window: tuple[int, int] | None = None,
+) -> list[list[dict]]:
+    if world_size not in SUPPORTED_WORLDS:
+        raise ValueError(f"unsupported world_size={world_size}")
+    return _pool_run(
+        world_size,
+        _run_rank,
+        {
+            "tp": world_size,
+            "init_method": get_distributed_init_method(get_ip(), get_open_port()),
+            "engine_kw": engine_kw,
+            "cases": cases,
+            "window": window,
+        },
+        SPAWN_TIMEOUT_S,
+    )
 
 
 # Rows are registered up front, grouped by the engine they need, so that each
@@ -1398,6 +1461,55 @@ def test_quick_allreduce_relay(
 
 
 @benchmark()
+def test_quick_allreduce_setup_failure(tp, fault):
+    """A ``_StEngine`` setup step failing on one rank fails engine construction
+    on every rank.
+
+    ``SETUP_FAULT_RANK`` fails *fault* while the host builds its engines. Gates:
+    every rank raises a RuntimeError naming that rank and the injected error,
+    none is left waiting in an exchange, and a clean engine then builds on
+    every rank. The time to the raise is reported, not asserted.
+    """
+    label = f"tp={tp} setup fault={fault} on rank {SETUP_FAULT_RANK}"
+    try:
+        rows = _pool_run(
+            tp,
+            _run_setup_fault_rank,
+            {
+                "tp": tp,
+                "init_method": get_distributed_init_method(get_ip(), get_open_port()),
+                "fault": fault,
+            },
+            SETUP_FAULT_TIMEOUT_S,
+        )
+    except Exception as exc:  # noqa: BLE001
+        why = str(exc) or f"no result within {SETUP_FAULT_TIMEOUT_S} s"
+        _check(label, [f"spawn failed: {type(exc).__name__}: {why}"])
+        return {"gfx": ARCH, "fault": fault, "raised_on_all": False, "rebuilt": False}
+    expected = (
+        f"rank {SETUP_FAULT_RANK}: RuntimeError: "
+        f"injected {SETUP_FAULTS[fault]} failure"
+    )
+    fails = []
+    for rank, row in enumerate(rows):
+        err = row["err"]
+        if err is None:
+            fails.append(f"rank {rank}: the engine built")
+        elif not err.startswith("RuntimeError: ") or expected not in err:
+            fails.append(f"rank {rank}: raised {err!r}, expected {expected!r}")
+        if row["rebuild_err"] is not None:
+            fails.append(f"rank {rank}: rebuild failed: {row['rebuild_err']}")
+    _check(label, fails)
+    return {
+        "gfx": ARCH,
+        "fault": fault,
+        "raised_on_all": all(r["err"] for r in rows),
+        "max raise s": max(r["s"] for r in rows),
+        "rebuilt": not any(r["rebuild_err"] for r in rows),
+    }
+
+
+@benchmark()
 def test_quick_allreduce_int4_coverage(tp, algorithm, window):
     """Every kernel production dispatch can select on this host ran in the
     shipping sweep.
@@ -1686,14 +1798,12 @@ def main():
         for pair in relay_pairs:
             if (
                 len(pair) != 2
-                or len(set(pair)) != 2
                 or min(pair) < 0
                 or max(pair) >= n_gpu
                 or {0, 1} & set(pair)
             ):
                 aiter.logger.warning(
-                    "relay %s needs two distinct devices outside 0,1 and below %s; "
-                    "skipping",
+                    "relay %s needs two devices outside 0,1 and below %s; skipping",
                     pair,
                     n_gpu,
                 )
@@ -1907,6 +2017,13 @@ def main():
         "flydsl quick allreduce TP2 relay",
         [test_quick_allreduce_relay(*row) for row in relay],
     )
+    _summarize(
+        "flydsl quick allreduce engine setup failure",
+        [
+            test_quick_allreduce_setup_failure(2, fault)
+            for fault in (SETUP_FAULTS if 2 in tps else ())
+        ],
+    )
 
     if _FAILURES:
         raise SystemExit(
@@ -1917,8 +2034,6 @@ def main():
 
 if __name__ == "__main__":
     freeze_support()
-    from time import perf_counter
-
     start = perf_counter()
     main()
     end = perf_counter()

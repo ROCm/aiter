@@ -209,10 +209,11 @@ MESH_CODECS = ("int4", "int5", "int6", "fp16")
 
 # Largest ``den`` of a relay fraction. Block ``b`` relays when ``b % den < num``,
 # and blocks reach the 8 XCDs round-robin, so a ``den`` that divides 8 keeps the
-# relay blocks on whole XCDs rather than spreading them over all of them.
+# relay blocks on whole XCDs. Any other ``den`` up to 8 is also correct, but
+# spreads the relay blocks over every XCD.
 RELAY_MAX_DEN = 8
 
-# A relay block's payload stores go out at system scope (``sc0 sc1``). The
+# A relay block's payload stores go out at system scope (``sc0 sc1 nt``). The
 # ``vmcnt(0)`` before the flag then means the payload is visible on the relay,
 # which the flag, landing in the peer's inbox, does not otherwise order.
 _RELAY_STORE_CM = _CM_SC0 | _CM_SC1 | _CM_NT

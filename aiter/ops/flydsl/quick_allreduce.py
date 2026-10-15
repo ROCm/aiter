@@ -353,8 +353,9 @@ class FlyQuickAllReduce:
     JIT symbol carries an ``_r<n>_`` field.
 
     ``relay_devices=(r01, r10)`` routes a fraction of each call's blocks through
-    two other GPUs of the node, the relay for rank0→rank1 and the one for
-    rank1→rank0, for TP2 on xGMI only. ``relay_fraction=(num, den)`` is the share
+    other GPUs of the node, the relay for rank0→rank1 and the one for
+    rank1→rank0, for TP2 on xGMI only. ``r01 == r10`` relays both directions
+    through one GPU. ``relay_fraction=(num, den)`` is the share
     of blocks and ``relay_min_bytes`` the payload from which relay engines are
     used; ``None`` takes the per-arch default, and an arch with none needs both.
     ``relay_provider`` supplies the bounce buffers. Every rank passes the same
@@ -658,9 +659,9 @@ class FlyQuickAllReduce:
                     "relay_fraction and relay_min_bytes"
                 )
             devices = tuple(int(d) for d in devices)
-            if len(devices) != 2 or devices[0] == devices[1]:
+            if len(devices) != 2:
                 raise ValueError(
-                    f"relay_devices must be two distinct devices, got {devices}"
+                    f"relay_devices must be one device per direction, got {devices}"
                 )
             n_devices = torch.cuda.device_count()
             if not all(0 <= d < n_devices for d in devices):

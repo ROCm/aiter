@@ -14,8 +14,8 @@ each direction's traffic through a third GPU, over the two links that GPU has to
 the pair.
 
 - `FlyQuickAllReduce(..., relay_devices=(r01, r10))` names one relay GPU per
-  direction. Only a TP2 mesh on xGMI accepts it. Production dispatch never
-  passes it.
+  direction; `r01 == r10` relays both directions through one GPU. Only a TP2
+  mesh on xGMI accepts it. Production dispatch never passes it.
 - Block `b` is a relay block when `b % den < num`. It writes its packed packet
   into a bounce buffer on the relay GPU instead of the peer's inbox. The flag
   still goes to the peer's inbox, and flags, colours and the reduction order
@@ -157,6 +157,36 @@ fraction, interleaved), 1/2 and 3/8 are within run-to-run spread at 2.5 and
 the GEMM slowdown on the relay GPUs at every size, and 2-4 times the copy
 slowdown at 2.5 and 10 MiB (1.3 times at 80 MiB).
 
+### One relay for both directions
+
+Pair on GPUs 0 and 1, relays on 2 and 3, CUDA-graph replay, INT4, two runs in
+separate processes.
+
+| MiB | 2,3 at 3/8 | 2,2 at 3/8 | 3,3 at 3/8 | 2,3 at 1/2 | 2,2 at 1/2 |
+| --: | --: | --: | --: | --: | --: |
+| 2.5 | 1.27x | 1.24-1.25x | 1.26-1.27x | 1.16-1.17x | 1.26-1.27x |
+| 10 | 1.35x | 1.36x | 1.33x | 1.27x | 1.22-1.24x |
+| 80 | 1.53-1.54x | 1.54-1.55x | 1.41-1.42x | 1.68-1.69x | 1.44-1.45x |
+| 120 | 1.53-1.54x | 1.54-1.55x | 1.41-1.42x | 1.70x | 1.45x |
+
+One relay does best at 3/8, and two relays at 1/2 are the fastest from 20 MiB
+up. At 3/8 one relay usually matches two, with one exception that repeated.
+For the pair on GPUs 0 and 1, one relay on GPU 3 was 1.41-1.42x at 80 MiB in
+four runs across two sessions, while GPU 3 carrying either direction alone,
+with GPU 2 carrying the other, was 1.52-1.53x. Every other single-relay case
+tried was 1.51-1.57x at 80 MiB: GPU 2 for 0,1, GPU 3 for 1,2 and 0,2, GPU 1
+for 0,2, GPU 0 for 1,2, and GPU 0 or 1 for 2,3. The cause is not known. Peer-copy
+rates do not explain it: they were 60.4 GB/s on most links, but a different
+link or two read 54-55 GB/s in each of four runs.
+
+In the two-pair contention harness at 3/8, with only pair A relaying, A's
+80 MiB all-reduce is 1.49-1.50x with two relays and 1.46-1.49x with one. One
+relay moves the whole cost onto that GPU. On B's slower GPU the GEMM is +3.3
+to +6.2% (two relays: +2.0 to +3.3%) and the copy +5.5 to +7.6% (+3.1 to
++4.2%) at 10 MiB, and B's other GPU is unaffected. B's direct all-reduce and
+its layer stand-in are within 1% either way. One relay also holds both TP
+processes' ~490 MB on one GPU.
+
 ## Other measurements (3/8)
 
 Two-pair contention harness, current kernel. This harness times the 80 MiB
@@ -170,18 +200,26 @@ relay at 311-313 µs, against 305-306 µs in the one-pair sweep above.
   GPUs: 2473-2489 µs (0.89x the time). Both pairs relaying through each other:
   2482-2493 µs for A and 2466-2475 µs for B.
 - **Memory.** At INT4 a rank allocates 13.6 MiB for relaying: two bounces on a
-  relay GPU and the two relay engines' inboxes on its own GPU, half each. The
-  first uncached allocation on a GPU also holds about 150 MiB of driver
-  overhead that `hipFree` never returns.
+  relay GPU and the two relay engines' inboxes on its own GPU, half each.
+- **Memory on the relay GPU.** Each TP process's first allocation on a relay
+  GPU, its bounce, makes HIP set up that device in the process, which charges
+  about 490 MB there. It stays charged until the process exits, after the
+  bounce is freed, and amd-smi lists no process for it. With both directions
+  through one relay, that GPU's used VRAM went from 286 to 1288 MB, of which
+  14.3 MB is the two bounces. Opening a bounce that a process on the relay GPU
+  allocated, and writing through it, charged nothing there, so a
+  `relay_provider` whose bounces come from the relay GPU's own worker would
+  cost that GPU only the bounce bytes.
 
 ## Not measured
 
 - gfx942 has not been run. It takes the same code path and emits the same
   acquire, but whether its L1 keeps UC lines has not been probed, and the relay
   has no defaults there.
-- The context cost of the relay on the relay GPUs.
 - All four TP2 pairs of a node relaying at once.
 - More than one relay per direction.
+- Why one relay on GPU 3 is slower for the pair on GPUs 0 and 1, and whether
+  other hosts have such combinations.
 
 ## Testing
 
