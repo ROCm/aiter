@@ -25,7 +25,13 @@ import torch
 
 import aiter
 from aiter import ActivationType, QuantType, dtypes
-from aiter.fused_moe import fused_moe, fused_topk, torch_moe_stage1, torch_moe_stage2
+from aiter.fused_moe import (
+    fused_moe,
+    fused_topk,
+    resolve_activation_dtype,
+    torch_moe_stage1,
+    torch_moe_stage2,
+)
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
@@ -40,6 +46,29 @@ def _cos_diff(x, y):
     x, y = x.double(), y.double()
     denom = (x * x + y * y).sum()
     return float(1 - 2 * (x * y).sum() / denom)
+
+
+def test_silu_a16w4_activation_dtype_is_explicit(monkeypatch):
+    monkeypatch.delenv("AITER_SILU_A16W4", raising=False)
+    assert (
+        resolve_activation_dtype(
+            QuantType.per_1x32,
+            dtypes.fp4x2,
+            activation=ActivationType.Silu,
+            gfx="gfx942",
+        )
+        == dtypes.fp4x2
+    )
+    monkeypatch.setenv("AITER_SILU_A16W4", "1")
+    assert (
+        resolve_activation_dtype(
+            QuantType.per_1x32,
+            dtypes.fp4x2,
+            activation=ActivationType.Silu,
+            gfx="gfx942",
+        )
+        == dtypes.bf16
+    )
 
 
 @_SKIP
