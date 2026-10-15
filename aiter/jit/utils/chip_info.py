@@ -12,6 +12,7 @@ from build_targets import (
     _parse_gpu_archs_env,
     filter_tune_df,
     get_build_targets_env,
+    torch_processor_count_to_cu,
 )
 from cpp_extension import executable_path
 from torch_guard import torch_compile_guard
@@ -272,6 +273,12 @@ def _parse_cu_num_hipinfo(output: str) -> list[int]:
 def get_cu_num_custom_op() -> int:
     cu_num = int(os.getenv("CU_NUM", "0"))
     if cu_num == 0:
+        if IS_WINDOWS:
+            import torch
+
+            props = torch.cuda.get_device_properties(0)
+            gfx = props.gcnArchName.split(":", 1)[0]
+            return torch_processor_count_to_cu(gfx, props.multi_processor_count)
         try:
             output = _gpu_info_output()
             if IS_WINDOWS:

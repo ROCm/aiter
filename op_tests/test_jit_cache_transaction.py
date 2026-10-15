@@ -29,6 +29,7 @@ from unittest import mock
 JIT_CACHE_PATH = (
     Path(__file__).resolve().parents[1] / "aiter" / "jit" / "utils" / "jit_cache.py"
 )
+CORE_PATH = JIT_CACHE_PATH.parents[1] / "core.py"
 
 
 def _load_module(path, name):
@@ -98,6 +99,127 @@ def _load_functions(path, names, namespace):
 
 
 class TestJitCacheTransaction(unittest.TestCase):
+    def test_windows_codegen_keeps_paths_with_spaces_as_single_arguments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            op_dir = os.path.join(tmp, "work tree", "module")
+            command = (
+                r'"C:\Work Tree\aiter\3rdparty\composable_kernel'
+                r'\example\ck_tile\01_fmha\generate.py" '
+                '-d fwd --receipt 100 --filter " @ " --output_dir {}'
+            )
+
+            def run(args, check):
+                self.assertTrue(check)
+                output_dir = args[args.index("--output_dir") + 1]
+                _write(os.path.join(output_dir, "generated.cpp"), "// generated\n")
+
+            with mock.patch.object(jit_cache, "IS_WINDOWS", True), mock.patch.object(
+                jit_cache.subprocess, "run", side_effect=run
+            ) as run_process:
+                staging_dir = jit_cache.stage_blob_sources(
+                    command,
+                    op_dir,
+                    r"C:\Program Files\Python\python.exe",
+                )
+
+            args = run_process.call_args.args[0]
+            self.assertEqual(args[0], r"C:\Program Files\Python\python.exe")
+            self.assertEqual(
+                args[1],
+                r"C:\Work Tree\aiter\3rdparty\composable_kernel"
+                r"\example\ck_tile\01_fmha\generate.py",
+            )
+            self.assertEqual(args[args.index("--filter") + 1], " @ ")
+            self.assertEqual(
+                args[args.index("--output_dir") + 1],
+                os.path.join(staging_dir, ""),
+            )
+            self.assertTrue(os.path.isfile(os.path.join(staging_dir, "generated.cpp")))
+
+    def test_windows_codegen_keeps_positional_output_paths_with_spaces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            op_dir = os.path.join(tmp, "work tree", "module")
+            command = r'"C:\Work Tree\generator.py" {}'
+
+            def run(args, check):
+                self.assertTrue(check)
+                _write(os.path.join(args[2], "generated.cpp"), "// generated\n")
+
+            with mock.patch.object(jit_cache, "IS_WINDOWS", True), mock.patch.object(
+                jit_cache.subprocess, "run", side_effect=run
+            ) as run_process:
+                staging_dir = jit_cache.stage_blob_sources(
+                    command, op_dir, r"C:\Program Files\Python\python.exe"
+                )
+
+            args = run_process.call_args.args[0]
+            self.assertEqual(args[1], r"C:\Work Tree\generator.py")
+            self.assertEqual(args[2], os.path.join(staging_dir, ""))
+            self.assertTrue(os.path.isfile(os.path.join(staging_dir, "generated.cpp")))
+
+    def test_windows_codegen_preserves_format_placeholders_and_escaped_braces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            op_dir = os.path.join(tmp, "work tree", "module")
+            command = r'"C:\Work Tree\generator.py" {0} --again {0} --literal {{}}'
+
+            def run(args, check):
+                self.assertTrue(check)
+                _write(os.path.join(args[2], "generated.cpp"), "// generated\n")
+
+            with mock.patch.object(jit_cache, "IS_WINDOWS", True), mock.patch.object(
+                jit_cache.subprocess, "run", side_effect=run
+            ) as run_process:
+                staging_dir = jit_cache.stage_blob_sources(
+                    command, op_dir, r"C:\Program Files\Python\python.exe"
+                )
+
+            args = run_process.call_args.args[0]
+            self.assertEqual(args[2], os.path.join(staging_dir, ""))
+            self.assertEqual(args[3], "--again")
+            self.assertEqual(args[4], os.path.join(staging_dir, ""))
+            self.assertEqual(args[5], "--literal")
+            self.assertEqual(args[6], "{}")
+
+            with self.assertRaises(IndexError):
+                command = r'"C:\Work Tree\generator.py" {} {}'
+                with mock.patch.object(jit_cache, "IS_WINDOWS", True):
+                    jit_cache.stage_blob_sources(
+                        command, op_dir, r"C:\Program Files\Python\python.exe"
+                    )
+
+    def test_windows_codegen_preserves_multi_value_and_equals_tokens(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            op_dir = os.path.join(tmp, "work tree", "module")
+            command = (
+                r'"C:\Work Tree\generator.py" --extra_kids 7 9 '
+                r'--filter=" @ " --config "C:\Program Files\Aiter\config.json" '
+                r"--output_dir {}"
+            )
+
+            def run(args, check):
+                self.assertTrue(check)
+                output_dir = args[args.index("--output_dir") + 1]
+                _write(os.path.join(output_dir, "generated.cpp"), "// generated\n")
+
+            with mock.patch.object(jit_cache, "IS_WINDOWS", True), mock.patch.object(
+                jit_cache.subprocess, "run", side_effect=run
+            ) as run_process:
+                staging_dir = jit_cache.stage_blob_sources(
+                    command, op_dir, r"C:\Program Files\Python\python.exe"
+                )
+
+            args = run_process.call_args.args[0]
+            kids_index = args.index("--extra_kids")
+            self.assertEqual(args[kids_index + 1 : kids_index + 3], ["7", "9"])
+            self.assertEqual(args[args.index("--filter= @ ")], "--filter= @ ")
+            self.assertEqual(
+                args[args.index("--config") + 1],
+                r"C:\Program Files\Aiter\config.json",
+            )
+            self.assertEqual(
+                args[args.index("--output_dir") + 1], os.path.join(staging_dir, "")
+            )
+
     def test_failed_codegen_restores_last_complete_sources(self):
         with tempfile.TemporaryDirectory() as tmp:
             op_dir = os.path.join(tmp, "module")
@@ -484,13 +606,20 @@ with open(args.output_dir + "/generated.hpp", "w") as header:
                     os.path.join(staging, jit_cache.CODEGEN_COMPLETE_MARKER), "ready"
                 )
                 os.chmod(op_dir, mode)
+                expected_dir_mode = stat.S_IMODE(os.stat(op_dir).st_mode)
                 os.chmod(staging, mode)
                 os.chmod(os.path.join(staging, "sub"), mode)
-                os.chmod(os.path.join(staging, "sub", "generated.cpp"), 0o644)
+                generated_file = os.path.join(staging, "sub", "generated.cpp")
+                os.chmod(generated_file, 0o644)
+                expected_file_mode = stat.S_IMODE(os.stat(generated_file).st_mode)
                 original_snapshot = jit_cache._copy_blob_snapshot
 
                 def check_candidate(
-                    source, destination, previous, expected=mode, copy=original_snapshot
+                    source,
+                    destination,
+                    previous,
+                    expected=expected_dir_mode,
+                    copy=original_snapshot,
                 ):
                     self.assertEqual(
                         stat.S_IMODE(os.stat(destination).st_mode), expected
@@ -503,12 +632,12 @@ with open(args.output_dir + "/generated.hpp", "w") as header:
                 ):
                     jit_cache.publish_blob_sources(staging, blob)
                 for path in (blob, os.path.join(blob, "sub")):
-                    self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), mode)
+                    self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), expected_dir_mode)
                 self.assertEqual(
                     stat.S_IMODE(
                         os.stat(os.path.join(blob, "sub", "generated.cpp")).st_mode
                     ),
-                    0o644,
+                    expected_file_mode,
                 )
 
     def test_atomic_copy_keeps_previous_binary_on_copy_failure(self):
@@ -548,6 +677,7 @@ class TestJitCacheRecovery(unittest.TestCase):
         _write(os.path.join(self.blob_dir, "first.cpp"), "// first\n")
         _write(os.path.join(self.blob_dir, "second.cpp"), "// second\n")
         os.chmod(self.op_dir, 0o755)
+        self.op_dir_mode = stat.S_IMODE(os.stat(self.op_dir).st_mode)
         self.generator = _write_generator(self.root, "pass\n")
 
     def _restore_with_copy_failure(self):
@@ -557,7 +687,7 @@ class TestJitCacheRecovery(unittest.TestCase):
             # Recovery must correct mkdtemp's 0700 before copying any sources.
             candidate = os.path.dirname(destination)
             self.assertTrue(os.path.basename(candidate).startswith(".blob-reset-"))
-            self.assertEqual(stat.S_IMODE(os.stat(candidate).st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE(os.stat(candidate).st_mode), self.op_dir_mode)
             if os.path.basename(source) == "second.cpp":
                 raise OSError("simulated partial restore failure")
             return original_copy(source, destination, *args, **kwargs)
@@ -572,7 +702,9 @@ class TestJitCacheRecovery(unittest.TestCase):
         ):
             self.assertEqual(_read(os.path.join(self.staging_dir, name)), contents)
             self.assertEqual(_read(os.path.join(self.blob_dir, name)), contents)
-        self.assertEqual(stat.S_IMODE(os.stat(self.staging_dir).st_mode), 0o755)
+        self.assertEqual(
+            stat.S_IMODE(os.stat(self.staging_dir).st_mode), self.op_dir_mode
+        )
         self.assertEqual(_transaction_artifacts(self.op_dir), [])
 
     def test_initial_restore_copy_failure_does_not_install_partial_staging(self):
@@ -1375,7 +1507,7 @@ class TestCppExtensionControl(unittest.TestCase):
 
         self.namespace = _load_functions(
             JIT_CACHE_PATH.with_name("cpp_extension.py"),
-            ["_jit_compile"],
+            ["_get_num_workers", "_jit_compile"],
             {
                 "os": os,
                 "sys": sys,
@@ -1387,6 +1519,27 @@ class TestCppExtensionControl(unittest.TestCase):
                 "_import_module_from_library": lambda *args: None,
             },
         )
+
+    def test_explicit_ninja_worker_count_is_preserved(self):
+        with mock.patch.dict(os.environ, {"MAX_JOBS": "32"}), mock.patch.object(
+            os, "cpu_count", return_value=32
+        ):
+            self.assertEqual(self.namespace["_get_num_workers"](verbose=False), 32)
+
+        with mock.patch.dict(os.environ, {"MAX_JOBS": "0"}), mock.patch.object(
+            os, "cpu_count", return_value=32
+        ):
+            self.assertEqual(self.namespace["_get_num_workers"](verbose=False), 0)
+
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            os, "cpu_count", return_value=32
+        ):
+            self.assertEqual(self.namespace["_get_num_workers"](verbose=False), 25)
+
+        with mock.patch.dict(os.environ, {"MAX_JOBS": "invalid"}), mock.patch.object(
+            os, "cpu_count", return_value=32
+        ):
+            self.assertEqual(self.namespace["_get_num_workers"](verbose=False), 25)
 
     def compile(self, **options):
         self.namespace["_jit_compile"](
@@ -1476,6 +1629,33 @@ class TestCppExtensionControl(unittest.TestCase):
         self.compile(use_versioner=False)
         self.assertNotIn("no work to do", outputs[-1])
         self.assertNotEqual(os.stat(artifact).st_mtime_ns, unchanged_mtime)
+
+
+class TestNinjaWorkerLimit(unittest.TestCase):
+    def setUp(self):
+        self.namespace = _load_functions(
+            CORE_PATH, ["check_and_set_ninja_worker"], {"os": os}
+        )
+        self.psutil = types.SimpleNamespace(
+            virtual_memory=lambda: types.SimpleNamespace(available=4 * 1024**3)
+        )
+
+    def test_core_preserves_explicit_positive_override_and_bounds_defaults(self):
+        with mock.patch.dict(os.environ, {"MAX_JOBS": "32"}), mock.patch.dict(
+            sys.modules, {"psutil": self.psutil}
+        ), mock.patch.object(os, "cpu_count", return_value=32) as cpu_count:
+            self.namespace["check_and_set_ninja_worker"]()
+            self.assertEqual(os.environ["MAX_JOBS"], "32")
+            cpu_count.assert_not_called()
+
+        for initial in (None, "invalid", "0", "-1", "-32"):
+            with self.subTest(initial=initial):
+                env = {} if initial is None else {"MAX_JOBS": initial}
+                with mock.patch.dict(os.environ, env, clear=True), mock.patch.dict(
+                    sys.modules, {"psutil": self.psutil}
+                ), mock.patch.object(os, "cpu_count", return_value=32):
+                    self.namespace["check_and_set_ninja_worker"]()
+                    self.assertEqual(os.environ["MAX_JOBS"], "8")
 
 
 @unittest.skipUnless(importlib.util.find_spec("pandas"), "Opus codegen requires pandas")
