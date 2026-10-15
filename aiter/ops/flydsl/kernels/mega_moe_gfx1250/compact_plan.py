@@ -109,7 +109,7 @@ def compact_done_nbytes() -> int:
     return 8
 
 
-@comm_ops.traced
+@flyc.jit
 def _spin_until_tag(addr_i64, tag):
     """Spin until the upper half of an i32 slot is ``tag`` or newer; return it.
 
@@ -227,6 +227,10 @@ def compile_tdm_compact_plan(
         raise ValueError(
             f"hist_stride={hist_stride} != npes*row_dwords={npes * row_dwords}"
         )
+    # LDS hist/matrix are indexed by segment on every path, so they keep the
+    # dense pitch; row_dwords is only the window row, which on the sparse path
+    # is the shorter packed (nnz, seg|cnt) row.
+    hist_dwords = _align32(segs)
     # Dense rows ship (gen16 << 16) | count, so a count must fit 16 bits; one
     # source's count toward an expert is at most its token count.
     use_tag = (
@@ -275,10 +279,10 @@ def compile_tdm_compact_plan(
         rsrc_bar = create_buffer_resource_from_addr(addr_barrier)
 
         smem = fx.SharedAllocator(static=False)
-        hist_ptr = smem.allocate(row_dwords * 4, 128)._ptr
+        hist_ptr = smem.allocate(hist_dwords * 4, 128)._ptr
         total_ptr = smem.allocate(segs * 4, 16)._ptr
         pref_ptr = smem.allocate(segs * 4, 16)._ptr
-        matrix_ptr = smem.allocate(npes * row_dwords * 4, 128)._ptr
+        matrix_ptr = smem.allocate(npes * hist_dwords * 4, 128)._ptr
         lds_hist = fx.Int64(fx.ptrtoint(hist_ptr))
         lds_total = fx.Int64(fx.ptrtoint(total_ptr))
         lds_pref = fx.Int64(fx.ptrtoint(pref_ptr))
@@ -298,8 +302,8 @@ def compile_tdm_compact_plan(
         # only once all have arrived.
         gen = buffer_load(rsrc_bar, 2, vec_width=1, dtype=T.i32) + arith.constant(1)
 
-        # row_dwords, not segs: the pad tail ships with the row.
-        for s in range(tid, row_dwords, plan_threads):
+        # hist_dwords, not segs: the pad tail ships with the dense row.
+        for s in range(tid, hist_dwords, plan_threads):
             comm_ops.store_i32_lds(lds_hist + fx.Int64(s) * 4, arith.constant(0))
         fx.barrier()
 
@@ -506,7 +510,7 @@ def compile_tdm_compact_plan(
                         TDM.tdm_group1(32, tdm_rows, 4),
                     )
                     TDM.tdm_wait(0)
-                for s in range(tid, npes * row_dwords, plan_threads):
+                for s in range(tid, npes * hist_dwords, plan_threads):
                     comm_ops.store_i32_lds(
                         lds_matrix + fx.Int64(s) * 4, arith.constant(0)
                     )
@@ -524,7 +528,7 @@ def compile_tdm_compact_plan(
                         cnt = packed >> arith.constant(16)
                         comm_ops.store_i32_lds(
                             lds_matrix
-                            + fx.Int64(src * row_dwords) * fx.Int64(4)
+                            + fx.Int64(src * hist_dwords) * fx.Int64(4)
                             + fx.Int64(seg) * fx.Int64(4),
                             cnt,
                         )
@@ -574,7 +578,7 @@ def compile_tdm_compact_plan(
                 for src in range_constexpr(npes):
                     cnt = comm_ops.load_i32_lds(
                         lds_matrix
-                        + fx.Int64(src * row_dwords + dest * fx.Int32(epr) + e)
+                        + fx.Int64(src * hist_dwords + dest * fx.Int32(epr) + e)
                         * fx.Int64(4)
                     )
                     if src == rank:
