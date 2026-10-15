@@ -46,6 +46,7 @@ from flydsl.expr.typing import Vector as Vec
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels.buffer_ops import create_buffer_resource_from_addr
 from aiter.ops.flydsl.kernels.kernels_common import ceildiv, format_kernel_name
+from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import group_m_major
 
 WAVE = 64
 MFMA_M = MFMA_N = 16
@@ -137,6 +138,16 @@ def _padded_k(K):
     return ceildiv(K, MFMA_K) * MFMA_K
 
 
+def check_xcd_swizzle(xcd_swizzle, xcd_order, splits=1):
+    """Raise ValueError unless xcd_swizzle is 0 or groups 2+ M tiles of the
+    xcd_order run. Split K keeps its own tile order and would ignore it."""
+    if xcd_swizzle and (xcd_swizzle < 2 or not xcd_order or splits > 1):
+        raise ValueError(
+            f"[FlyDSL gfx950] xcd_swizzle={xcd_swizzle} needs xcd_order, no "
+            f"split K and a group of 2+ M tiles"
+        )
+
+
 def check_bmm_config(
     N,
     K,
@@ -223,8 +234,7 @@ def check_bmm_config(
         raise ValueError(
             "[FlyDSL gfx950] a column-major x_scale is 1x128 blocks at batch 1"
         )
-    if xcd_swizzle < 0 or (xcd_swizzle and not xcd_order):
-        raise ValueError("[FlyDSL gfx950] xcd_swizzle re-tiles the xcd_order run")
+    check_xcd_swizzle(xcd_swizzle, xcd_order, splits)
     if b_direct and not 1 <= b_ahead <= num_buffers - 1:
         raise ValueError("[FlyDSL gfx950] b_ahead must be in [1, num_buffers - 1]")
     if layout.stage_a % (threads * 16) or layout.stage_b % (threads * 16):
@@ -437,27 +447,27 @@ def launch_bmm_a8w8_mxscale(
             )
             kt0 = split * k_tiles
         elif const_expr(xcd_order):
-            # pid % 8 is the XCD. Give each XCD a contiguous run of tiles with N
-            # fastest, so the N tiles sharing an A row block, and the M tiles
-            # sharing a B column block, meet in that XCD's L2.
+            # pid % 8 is the XCD. Give each XCD a contiguous run of tiles, so the
+            # N tiles sharing an A row block, and the M tiles sharing a B column
+            # block, meet in that XCD's L2.
             per_xcd = ceildiv(tiles, 8) if padded else tiles // 8
             tile = bid_x % 8 * per_xcd + bid_x // 8
-            rest = tile // (N // tile_n)
-            bid_x, bid_y, bid_z = rest % m_tiles, tile % (N // tile_n), rest // m_tiles
             if const_expr(xcd_swizzle > 1):
-                # Re-tile a batch's run M-major in groups of xcd_swizzle M tiles,
-                # as xcd_remap_bx_by does: fewer B column blocks live at once.
-                wgid = tile % (m_tiles * (N // tile_n))
-                bid_z = tile // (m_tiles * (N // tile_n))
-                num_wgid_in_group = xcd_swizzle * (N // tile_n)
-                first_pid_m = wgid // num_wgid_in_group * xcd_swizzle
-                remaining_m = m_tiles - first_pid_m
-                group_size_m = (remaining_m < xcd_swizzle).select(
-                    remaining_m, fx.Int32(xcd_swizzle)
+                # M-major groups of xcd_swizzle M tiles: fewer B column blocks
+                # live at once.
+                batch_tiles = m_tiles * (N // tile_n)
+                bid_x, bid_y = group_m_major(
+                    tile % batch_tiles, m_tiles, N // tile_n, fx.Int32(xcd_swizzle)
                 )
-                wgid_in_group = wgid % num_wgid_in_group
-                bid_x = first_pid_m + wgid_in_group % group_size_m
-                bid_y = wgid_in_group // group_size_m
+                bid_z = tile // batch_tiles
+            else:
+                # N fastest.
+                rest = tile // (N // tile_n)
+                bid_x, bid_y, bid_z = (
+                    rest % m_tiles,
+                    tile % (N // tile_n),
+                    rest // m_tiles,
+                )
             kt0 = 0
         else:
             kt0 = 0
