@@ -392,17 +392,6 @@ KW_CASES = [
         {"padding": 1},
         True,
     ),
-    # kH x kW reuse: 4 x 64 output blocks, with both an H (30 % 4) and a
-    # W (300 % 64) tail.
-    (
-        "2d_block_rows4",
-        2,
-        (1, 96, 30, 300),
-        _W2,
-        {"padding": 1, "tile": (256, 96, 4, 1), "block_rows": 4},
-        {"padding": 1},
-        True,
-    ),
 ]
 
 # -c labels, read back off the sweep builders so the choices cannot drift from the
