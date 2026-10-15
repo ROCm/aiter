@@ -1,7 +1,9 @@
 #!/bin/bash
-# Builds hsa/gfx950/mla_opus/opus_mla_decode_a8w8_32mx4_64nx1.co with the amdgpu-pin-op-dst
-# toolchain (git@github.com:yuyzhang512/llvm-project.git, branch amdgpu-pin-op-dst), driven
-# through hipcc so the ROCm device libs and --genco still apply.
+# Builds hsa/gfx950/mla_opus/opus_mla_decode_a8w8_32mx4_64nx1.co with the named-register pin
+# toolchain (https://github.com/yuyzhang512/llvm-project, branch amdgpu-named-reg-pin-std), driven
+# through hipcc so the ROCm device libs and --genco still apply. Besides clang and lld, --genco
+# needs that build's clang-offload-bundler and llvm-objcopy:
+#   ninja clang lld clang-offload-bundler llvm-objcopy
 #
 #   PIN_LLVM=/path/to/llvm-project/build/bin ./build/build_mla_decode_a8w8_32mx4_64nx1_co.sh
 #
@@ -12,7 +14,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OPUS="$(cd "$HERE/.." && pwd)"
 AITER="$(cd "$OPUS/../../../.." && pwd)"
-PIN_LLVM="${PIN_LLVM:-$HOME/llvm-project/build/bin}"
+PIN_LLVM="${PIN_LLVM:-$HOME/llvm-project-std/build/bin}"
 OUT="${OUT:-$AITER/hsa/gfx950/mla_opus/opus_mla_decode_a8w8_32mx4_64nx1.co}"
 
 [ -x "$PIN_LLVM/clang++" ] || { echo "no pin toolchain at $PIN_LLVM" >&2; exit 1; }

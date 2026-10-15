@@ -29,8 +29,8 @@
 // VGPR (144), S two 32-register ping-pong buffers in VGPR, K and V one shared 32-register ring
 // in AGPR (2 GEMM0 k-steps / 4 PV d-tiles). The ring cannot be VGPR: O's half and both score
 // buffers leave ~48 VGPRs, which P, addresses and the softmax need; a deeper ring (4 k-steps /
-// 8 d-tiles) spills. The map holds only under the amdgpu-pin-op-dst toolchain -- see the
-// kernel entry at the end -- so aiter loads this kernel as a prebuilt code object.
+// 8 d-tiles) spills. The map holds only under the amdgpu-named-reg-pin-std toolchain -- see
+// the kernel entry at the end -- so aiter loads this kernel as a prebuilt code object.
 //
 // Software pipeline, one phase per tile, 3 KV slots. Phase t:
 //   stage0 [mem]     vmcnt (DMA(t) landed) + barrier (publishes K(t); every wave is done
@@ -68,20 +68,43 @@ using opus::operator""_I;
 
 namespace mla_decode_fwd_32mx4_64nx1_a8w8 {
 
-// Register pins. Only the amdgpu-pin-op-dst toolchain knows the attributes, and only there do
-// the macros expand to them, so the .co build and a stock compile share one source. A pin
-// binds a *definition*: every value below is pinned where it is produced.
-#if defined(__has_cpp_attribute)
-#if __has_cpp_attribute(clang::amdgpu_pin_agpr) && __has_cpp_attribute(clang::amdgpu_pin_vgpr)
-#define MLA32MX4_PIN_AGPR(n) [[clang::amdgpu_pin_agpr(n)]]
-#define MLA32MX4_PIN_VGPR(n) [[clang::amdgpu_pin_vgpr(n)]]
+// sched_barrier masks: the instruction classes allowed to cross the fence.
+constexpr int SCHED_VALU  = 0x002;
+constexpr int SCHED_SALU  = 0x004;
+constexpr int SCHED_TRANS = 0x400;
+
+// Register pins (amdgpu-named-reg-pin-std toolchain). A local declared amdgpu_pin_{vgpr,agpr}
+// has no storage: every write of it is a write of that register, so routing a value through
+// one places its definition there, and an MFMA whose result is pinned to an AGPR selects the
+// AGPR-accumulator form. A stock clang does not know the attributes and the helpers degrade
+// to plain copies. A pinned value is at most 16 registers (the widest named tuple).
+#if defined(__has_attribute)
+#if __has_attribute(amdgpu_pin_agpr) && __has_attribute(amdgpu_pin_vgpr)
 #define MLA32MX4_HAS_PIN 1
 #endif
 #endif
-#ifndef MLA32MX4_PIN_AGPR
-#define MLA32MX4_PIN_AGPR(n)
-#define MLA32MX4_PIN_VGPR(n)
+
+template <int REG, class V>
+__device__ inline V pin_vgpr(V v)
+{
+#ifdef MLA32MX4_HAS_PIN
+    __attribute__((amdgpu_pin_vgpr(REG))) V r = v;
+#else
+    V r = v;
 #endif
+    return r;
+}
+
+template <int REG, class V>
+__device__ inline V pin_agpr(V v)
+{
+#ifdef MLA32MX4_HAS_PIN
+    __attribute__((amdgpu_pin_agpr(REG))) V r = v;
+#else
+    V r = v;
+#endif
+    return r;
+}
 
 // The register map. AGPR: Q, the AGPR half of O, the K/V ring. VGPR: the other half of O at the
 // top, the two score buffers under it; v0 .. S_VGPR_BASE-1 are the compiler's (P, addresses,
@@ -510,25 +533,6 @@ attn_mask_kv_tile(V& v_s, int last_valid_kv_pos, int kv_tile_idx, opus::u32_t ne
     });
 }
 
-// Register-class anchors: an empty asm with a tied operand is a use and a def of the value in
-// that class, which the allocator honours by homing the value there. Free functions rather
-// than lambdas, because an asm operand naming a captured local does not compile inside a
-// generic (static_for) lambda. "a"/"v" take no _BitInt vector, hence the int view.
-template <class X>
-__device__ inline void anchor_agpr(X& x)
-{
-    static_assert(sizeof(X) % 4 == 0);
-    using w_t = opus::vector_t<int, sizeof(X) / 4>;
-    asm volatile("" : "+a"(*reinterpret_cast<w_t*>(&x))::);
-}
-template <class X>
-__device__ inline void anchor_vgpr(X& x)
-{
-    static_assert(sizeof(X) % 4 == 0);
-    using w_t = opus::vector_t<int, sizeof(X) / 4>;
-    asm volatile("" : "+v"(*reinterpret_cast<w_t*>(&x))::);
-}
-
 template <class S>
 __device__ inline opus::u32_t lds_addr(const S& s)
 {
@@ -646,38 +650,30 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
     // alongside QK(t+1). Indexed only by unrolled compile-time constants.
     using s_flat_t = vector_t<D_ACC, T::GEMM0_E_N * T::O_TILE_REGS>;
     opus::array<s_tile_t, T::GEMM0_E_N> v_s[2];
-    auto sflat   = [](auto& a) -> s_flat_t& { return *reinterpret_cast<s_flat_t*>(&a); };
-    auto clear_s = [](auto& a, auto sbuf) {
+    auto sflat = [](auto& a) -> s_flat_t& { return *reinterpret_cast<s_flat_t*>(&a); };
+    // Score buffer sbuf, one 16-register token tile at a time (a pin is at most 16 registers).
+    auto pin_s = [](auto& a, auto sbuf) {
         static_for<T::GEMM0_E_N>([&](auto i) {
-            MLA32MX4_PIN_VGPR(S_VGPR_BASE<T> + decltype(sbuf)::value * S_VGPR_PER_BUF<T> +
-                              i.value * T::O_TILE_REGS)
-            a[i.value] = s_tile_t{0};
+            a[i.value] = pin_vgpr<S_VGPR_BASE<T> + decltype(sbuf)::value * S_VGPR_PER_BUF<T> +
+                                  i.value * T::O_TILE_REGS>(a[i.value]);
         });
+    };
+    // Not pinned: a pinned zero is a real register write (16 s_mov + 8 v_mov_b64 per tile),
+    // unpinned it folds into the first MFMA as srcC = 0, whose pinned result places S.
+    auto clear_s = [](auto& a) {
+        static_for<T::GEMM0_E_N>([&](auto i) { a[i.value] = s_tile_t{0}; });
     };
     op_t v_p;
     static_assert(check_register_map<T>());
 
-    op_t v_q_steps[T::GEMM0_E_K];
-    static_for<T::GEMM0_E_K>([&](auto i) {
-        MLA32MX4_PIN_AGPR(i.value * Q_AGPR_PER_STEP<T>)
-        v_q_steps[i.value] = reinterpret_cast<const op_t*>(&v_q)[i.value];
-    });
-
     // Register classes: Q, the first O_AGPR_TILES O tiles and the K/V ring in AGPRs; the rest
     // of O, S and P in VGPRs. With O's VGPR half (144) and both score buffers (64) the VGPR
     // file has no room for the ring, and the AGPRs have exactly the 72 Q and O leave over.
-    auto pin_q = [&]() {
-        static_for<T::GEMM0_E_K>([&](auto i) { anchor_agpr(v_q_steps[i.value]); });
-    };
-    auto pin_o = [&]() {
-        static_for<T::GEMM1_E_M>([&](auto i) {
-            if constexpr(i.value < T::O_AGPR_TILES)
-                anchor_agpr(v_o_tiles[i.value]);
-            else
-                anchor_vgpr(v_o_tiles[i.value]);
-        });
-    };
-    auto pin_s = [&](auto& a) { anchor_vgpr(a); };
+    op_t v_q_steps[T::GEMM0_E_K];
+    static_for<T::GEMM0_E_K>([&](auto i) {
+        v_q_steps[i.value] =
+            pin_agpr<i.value * Q_AGPR_PER_STEP<T>>(reinterpret_cast<const op_t*>(&v_q)[i.value]);
+    });
 
     // Inside a slot: GEMM0 k-step ks is chunk ks / 2 and 64 d on for odd ks; token tile nt is
     // one DMA pass (NUM_WARPS blocks); the operand's second pass is 32 d on. PV d-tile dt is
@@ -698,17 +694,19 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
                       (d % tiles_per_chunk) * 2 * T::VEC_KV>{};
     };
 
-    // One GEMM0 k-step's K, both token tiles: four ds_read_b128.
+    // One GEMM0 k-step's K, both token tiles: four ds_read_b128. Pinned a whole MFMA operand
+    // at a time: pinning the two halves separately leaves the MFMA reading a sub-register of a
+    // named tuple, which the toolchain cannot lower.
     auto load_k_step = [&](auto& dst, smem<D_K> kv, auto ks) {
         constexpr int base =
             KV_AGPR_BASE<T> + (decltype(ks)::value % T::K_DEPTH) * K_AGPR_PER_STEP<T>;
-        auto* half = reinterpret_cast<k_half_t*>(&dst);
+        auto* k_op = reinterpret_cast<op_t*>(&dst);
         static_for<T::GEMM0_E_N>([&](auto nt) {
-            static_for<2>([&](auto pp) {
-                constexpr int h = nt.value * 2 + pp.value;
-                MLA32MX4_PIN_AGPR(base + h * K_AGPR_PER_HALF<T>)
-                half[h] = load<T::VEC_KV>(kv, u_rk + k_off(nt, ks, pp));
-            });
+            op_t op;
+            auto* half = reinterpret_cast<k_half_t*>(&op);
+            static_for<2>(
+                [&](auto pp) { half[pp.value] = load<T::VEC_KV>(kv, u_rk + k_off(nt, ks, pp)); });
+            k_op[nt.value] = pin_agpr<base + nt.value * 2 * K_AGPR_PER_HALF<T>>(op);
         });
     };
     auto load_k_head = [&](smem<D_K> kv) {
@@ -719,23 +717,26 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
     // ks % K_DEPTH, refilled with step ks + K_DEPTH behind its MFMA. `per_step(ks)` rides the
     // shadow of step ks: a KV DMA and a chunk of the previous tile's softmax tail. A fence right
     // behind each step's MFMA: left free, the scheduler hoists a refill above the MFMA still
-    // reading its entry, and the ring turns into K_DEPTH + 1 live buffers. Nothing else is
-    // fenced, so the next step's MFMA may issue ahead of this step's chunk (~2% at c16384 over
-    // fencing the chunk in too).
+    // reading its entry, and the ring turns into K_DEPTH + 1 live buffers. A second fence behind
+    // the step's chunk keeps the next step's MFMA below this step's refill and DMA (left free,
+    // the scheduler issues it right behind this step's second MFMA, the in-order issue stalls
+    // there for a whole MFMA and the refill / DMA / exp lose their shadow: ~20 cycles a step);
+    // VALU, SALU and TRANS may still cross it, so the next step's MFMA may issue ahead of this
+    // step's chunk (~2% at c16384 over fencing the chunk in too).
     auto compute_qk = [&](auto& s, smem<D_K> kv, auto sbuf, auto&& per_step) {
         constexpr int sbase = S_VGPR_BASE<T> + decltype(sbuf)::value * S_VGPR_PER_BUF<T>;
         static_for<T::GEMM0_E_K>([&](auto ks) {
             constexpr int buf = ks.value % T::K_DEPTH;
             auto* k_op        = reinterpret_cast<op_t*>(&v_k[buf][0]);
-            anchor_agpr(v_k[buf]); // as for V: the load pin alone is dropped
             static_for<T::GEMM0_E_N>([&](auto nt) {
-                MLA32MX4_PIN_VGPR(sbase + nt.value * T::O_TILE_REGS)
-                s[nt.value] = mfma0(k_op[nt.value], v_q_steps[ks.value], s[nt.value], 0, 0);
+                s[nt.value] = pin_vgpr<sbase + nt.value * T::O_TILE_REGS>(
+                    mfma0(k_op[nt.value], v_q_steps[ks.value], s[nt.value], 0, 0));
             });
             __builtin_amdgcn_sched_barrier(0);
             if constexpr(ks.value + T::K_DEPTH < T::GEMM0_E_K)
                 load_k_step(v_k[buf], kv, number<ks.value + T::K_DEPTH>{});
             per_step(ks);
+            __builtin_amdgcn_sched_barrier(SCHED_VALU | SCHED_SALU | SCHED_TRANS);
         });
     };
 
@@ -743,11 +744,11 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
     auto load_v = [&](smem<D_K> kv, auto dt) {
         constexpr int buf  = decltype(dt)::value % T::V_DEPTH;
         constexpr int base = KV_AGPR_BASE<T> + buf * V_AGPR_PER_TILE<T>;
-        auto* piece        = reinterpret_cast<v_piece_t*>(&v_v[buf]);
-        static_for<T::v_tile_ds_read_insts>([&](auto q) {
-            MLA32MX4_PIN_AGPR(base + q.value * (T::VEC_TR_V / 4))
-            piece[q.value] = tr_load_b8<T::VEC_TR_V>(kv, u_rv + v_off(dt, q));
-        });
+        op_t op;
+        auto* piece = reinterpret_cast<v_piece_t*>(&op);
+        static_for<T::v_tile_ds_read_insts>(
+            [&](auto q) { piece[q.value] = tr_load_b8<T::VEC_TR_V>(kv, u_rv + v_off(dt, q)); });
+        v_v[buf] = pin_agpr<base>(op);
     };
     auto load_v_head = [&](smem<D_K> kv) {
         static_for<T::V_DEPTH>([&](auto dt) { load_v(kv, dt); });
@@ -758,19 +759,12 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
     auto compute_pv = [&](smem<D_K> kv, auto&& co) {
         static_for<T::GEMM1_E_M>([&](auto dt) {
             constexpr int d = dt.value;
-            // The tr8 pin alone is dropped (the MFMA takes either file); a use in the AGPR
-            // class right here is what keeps V out of the VGPRs O and S need.
-            anchor_agpr(v_v[d % T::V_DEPTH]);
             if constexpr(d < T::O_AGPR_TILES)
-            {
-                MLA32MX4_PIN_AGPR(O_AGPR_BASE<T> + d * T::O_TILE_REGS)
-                v_o_tiles[d] = mfma1(v_v[d % T::V_DEPTH], v_p, v_o_tiles[d], 0, 0);
-            }
+                v_o_tiles[d] = pin_agpr<O_AGPR_BASE<T> + d * T::O_TILE_REGS>(
+                    mfma1(v_v[d % T::V_DEPTH], v_p, v_o_tiles[d], 0, 0));
             else
-            {
-                MLA32MX4_PIN_VGPR(O_VGPR_BASE<T> + (d - T::O_AGPR_TILES) * T::O_TILE_REGS)
-                v_o_tiles[d] = mfma1(v_v[d % T::V_DEPTH], v_p, v_o_tiles[d], 0, 0);
-            }
+                v_o_tiles[d] = pin_vgpr<O_VGPR_BASE<T> + (d - T::O_AGPR_TILES) * T::O_TILE_REGS>(
+                    mfma1(v_v[d % T::V_DEPTH], v_p, v_o_tiles[d], 0, 0));
             __builtin_amdgcn_sched_barrier(0);
             if constexpr(d + T::V_DEPTH < T::GEMM1_E_M)
                 load_v(kv, number<d + T::V_DEPTH>{});
@@ -855,16 +849,13 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
             static_for<T::GEMM1_E_M>([&](auto i) {
                 constexpr int d = i.value;
                 if constexpr(d < T::O_AGPR_TILES)
-                {
                     // Measured: a plain (pinned) multiply here costs 57 VGPR of spill.
-                    MLA32MX4_PIN_AGPR(O_AGPR_BASE<T> + d * T::O_TILE_REGS)
-                    v_o_tiles[d] = scale_tile_agpr(v_o_tiles[d], rescale_m);
-                }
+                    v_o_tiles[d] = pin_agpr<O_AGPR_BASE<T> + d * T::O_TILE_REGS>(
+                        scale_tile_agpr(v_o_tiles[d], rescale_m));
                 else
-                {
-                    MLA32MX4_PIN_VGPR(O_VGPR_BASE<T> + (d - T::O_AGPR_TILES) * T::O_TILE_REGS)
-                    v_o_tiles[d] = v_o_tiles[d] * rescale_m;
-                }
+                    v_o_tiles[d] =
+                        pin_vgpr<O_VGPR_BASE<T> + (d - T::O_AGPR_TILES) * T::O_TILE_REGS>(
+                            v_o_tiles[d] * rescale_m);
             });
             asm volatile("s_nop 4" ::);
         }
@@ -974,8 +965,6 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
     // flight; nothing below may touch a slot before every wave is past both.
     __builtin_amdgcn_s_waitcnt(0);
     lds_barrier();
-    pin_q();
-    pin_o();
 
     // Tiles tile_begin and tile_begin+1 into slots 0 and 1, then the index DMA of tile_begin+3
     // -- what a phase for tile_begin would have issued -- so the first loop phase's vmcnt
@@ -997,7 +986,7 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
     // tail or a PV for, and since O and l start at zero the head needs no rescale either.
     load_k_head(s_kv[0]);
     stage_end();
-    clear_s(v_s[0], 0_I);
+    clear_s(v_s[0]);
     compute_qk(v_s[0], s_kv[0], 0_I, [](auto) {});
     mask_oob_scores(v_s[0], tile_begin);
     m_row = max(m_row, temperature_scale * attn_row_max<T>(sflat(v_s[0])));
@@ -1005,7 +994,7 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
         sflat(v_s[0])[i.value] = __builtin_fmaf(sflat(v_s[0])[i.value], temperature_scale, -m_row);
     });
     attn_exp2_slice<T, 0, s_half_len>(sflat(v_s[0]));
-    pin_s(v_s[0]);
+    pin_s(v_s[0], 0_I);
     stage_end();
 
     static_assert(T::K_DEPTH == 2 && T::V_DEPTH % T::K_DEPTH == 0,
@@ -1025,7 +1014,6 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
         // is about to overwrite.
         s_waitcnt_vmcnt(number<T::kv_index_load_insts>{});
         lds_barrier();
-        pin_q();
         const auto po = dma_offsets(load_kv_pages(t + 1));
         load_k_head(kv_cur);
         stage_end();
@@ -1033,7 +1021,7 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
         // stage1 [compute]: gemm0 QK(t) [18 MFMA, one DMA of t+1 per k-step] || softmax
         // tail(t-1) -> P(t-1) || V head of t-1 (last two k-steps).
         __builtin_amdgcn_s_setprio(1);
-        clear_s(vs_cur_arr, sbuf);
+        clear_s(vs_cur_arr);
         compute_qk(vs_cur_arr, kv_cur, sbuf, [&](auto ks) {
             // DMA(t+1), one per k-step, the remainder on the last; then the index DMA of t+3.
             constexpr int n_dma = T::kv_buffer_load_insts;
@@ -1105,28 +1093,27 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
             {
                 attn_exp2_slice<T, (k - 4) * 2, 2>(vs_cur);
             }
-            // Redefine what this chunk wrote in place. Nothing reads it before the next phase,
-            // so without a use here the whole subtract + exp sinks past the rescale branch
-            // and runs as a serial block after the last PV MFMA; sched_barrier cannot stop
-            // that, it only fences the scheduler.
-            using g8_t = vector_t<D_ACC, 8>;
-            auto* grp  = reinterpret_cast<g8_t*>(&vs_cur);
+            // Pin what this chunk wrote in place. Nothing reads it before the next phase, so
+            // without a register write here the whole subtract + exp sinks past the rescale
+            // branch and runs as a serial block after the last PV MFMA; sched_barrier cannot
+            // stop that, it only fences the scheduler.
+            using g8_t        = vector_t<D_ACC, 8>;
+            auto* grp         = reinterpret_cast<g8_t*>(&vs_cur);
+            constexpr int sb  = S_VGPR_BASE<T> + decltype(sbuf)::value * S_VGPR_PER_BUF<T>;
+            constexpr int g_s = k - 3, g_e = (k - 4) / 4;
             if constexpr(k >= 3 && k < 3 + s_len / 8)
-                anchor_vgpr(grp[k - 3]);
-            if constexpr(k >= 4 && k < 4 + s_half_len / 2 && (k - 4) / 4 != k - 3)
-                anchor_vgpr(grp[(k - 4) / 4]);
+                grp[g_s] = pin_vgpr<sb + g_s * 8>(grp[g_s]);
+            if constexpr(k >= 4 && k < 4 + s_half_len / 2 && g_e != g_s)
+                grp[g_e] = pin_vgpr<sb + g_e * 8>(grp[g_e]);
         };
         static_assert(4 + s_half_len / 2 <= T::GEMM1_E_M, "the head must fit the PV shadows");
         __builtin_amdgcn_s_setprio(1);
-        pin_o();
         compute_pv(kv_prev, head_chunk);
         // O now holds PV(t-1) at the old max; move it to the new one before PV(t) lands.
         rescale_o();
         // What lets the next barrier release slot t-1: without it a wave could pass it with V
         // reads of that slot in flight while another wave's DMA overwrites it.
         s_waitcnt_lgkmcnt(0_I);
-        pin_o();
-        pin_s(vs_cur_arr);
         __builtin_amdgcn_s_setprio(0);
         stage_end();
     };
@@ -1151,10 +1138,8 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
         __builtin_amdgcn_sched_barrier(0);
         run_phase(v_s[1], v_s[0], kv_prev, kv_cur, kv_next, t, 1_I);
         rotate();
-        static_for<T::GEMM0_E_N>([&](auto i) {
-            MLA32MX4_PIN_VGPR(S_VGPR_BASE<T> + i.value * T::O_TILE_REGS)
-            v_s[0][i.value] = v_s[1][i.value];
-        });
+        static_for<T::GEMM0_E_N>([&](auto i) { v_s[0][i.value] = v_s[1][i.value]; });
+        pin_s(v_s[0], 0_I);
         ++t;
         __builtin_amdgcn_sched_barrier(0);
     }
@@ -1175,9 +1160,7 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
     stage_end();
     load_v_head(kv_prev);
     stage_end();
-    pin_o();
     compute_pv(kv_prev, no_co);
-    pin_o();
     __builtin_amdgcn_sched_barrier(0);
 }
 
@@ -1260,15 +1243,10 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(opus_mla_d
     static_for<T::GEMM1_E_M>([&](auto i) {
         constexpr int d = i.value;
         if constexpr(d < T::O_AGPR_TILES)
-        {
-            MLA32MX4_PIN_AGPR(O_AGPR_BASE<T> + d * T::O_TILE_REGS)
-            v_o_tiles[d] = o_tile_t{0};
-        }
+            v_o_tiles[d] = pin_agpr<O_AGPR_BASE<T> + d * T::O_TILE_REGS>(o_tile_t{0});
         else
-        {
-            MLA32MX4_PIN_VGPR(O_VGPR_BASE<T> + (d - T::O_AGPR_TILES) * T::O_TILE_REGS)
-            v_o_tiles[d] = o_tile_t{0};
-        }
+            v_o_tiles[d] =
+                pin_vgpr<O_VGPR_BASE<T> + (d - T::O_AGPR_TILES) * T::O_TILE_REGS>(o_tile_t{0});
     });
     // Finite on purpose: under -ffast-math max(lowest, x) folds to x, and a fully masked row
     // (x = -inf, e.g. a CP rank holding none of the row's causal past) would turn every
@@ -1368,9 +1346,9 @@ mla_decode_fwd_persistent(opus_mla_decode_kargs kargs)
 
 } // namespace mla_decode_fwd_32mx4_64nx1_a8w8
 
-// The register map above only holds with the amdgpu-pin-op-dst toolchain, which is how the
-// prebuilt code object is built (see mla_decode_a8w8_32mx4_64nx1_co.hip). A stock ROCm 7.1 clang
-// selects every MFMA in AGPR form at 512 registers per lane, and O (256) plus the two score
+// The register map above only holds with the amdgpu-named-reg-pin-std toolchain, which is how
+// the prebuilt code object is built (see mla_decode_a8w8_32mx4_64nx1_co.hip). A stock ROCm 7.1
+// clang selects every MFMA in AGPR form at 512 registers per lane, and O (256) plus the two score
 // buffers (64) do not fit 256 AGPRs: that build spills heavily and is kept for reference only.
 template <class Traits>
 __global__

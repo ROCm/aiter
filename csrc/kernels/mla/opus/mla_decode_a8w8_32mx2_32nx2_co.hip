@@ -1,7 +1,7 @@
 // Prebuilt code object for the fp8 32mx2 / 32nx2 MLA decode kernel, loaded by aiter's
 // AiterAsmKernel out of hsa/gfx950/mla_opus/opus_mla_decode_a8w8_32mx2_32nx2.co. Build it with
-// build/build_mla_decode_a8w8_32mx2_32nx2_co.sh: only the amdgpu-pin-op-dst toolchain honours the
-// register pins the kernel's register map depends on.
+// build/build_mla_decode_a8w8_32mx2_32nx2_co.sh: only the amdgpu-named-reg-pin-std toolchain
+// honours the register pins the kernel's register map depends on.
 //
 // extern "C", because AiterAsmKernel looks each entry up by this exact name. One entry per
 // (causal, large KV, round-robin CP) specialization; the in-tree dispatch picks by name.
@@ -17,7 +17,7 @@ using mla32mx2_traits_t =
 
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
 #ifndef MLA32MX2_HAS_PIN
-#error "build this code object with the amdgpu-pin-op-dst toolchain (see the build script)"
+#error "build this code object with the amdgpu-named-reg-pin-std toolchain (see the build script)"
 #endif
 #define MLA32MX2_CO_ENTRY(name, causal, large, cp)                                                 \
     extern "C" __global__ __launch_bounds__(256, 1) void name(opus_mla_decode_kargs kargs) \

@@ -32,7 +32,7 @@
 // Registers (512 per lane at one wave per SIMD): Q 72 AGPR; K and V one shared ring of 9
 // operands (72 AGPR) holding a whole tile's K, then a whole tile's V; O 8 tiles (128 VGPR)
 // and the two 16-register score buffers in VGPR. The map holds only under the
-// amdgpu-pin-op-dst toolchain, so aiter loads this kernel as a prebuilt code object.
+// amdgpu-named-reg-pin-std toolchain, so aiter loads this kernel as a prebuilt code object.
 //
 // Software pipeline, one phase per tile, 3 KV slots. Phase t:
 //   stage0 [mem]     vmcnt (DMA(t) landed) + barrier B0 (publishes K(t) and the pair's row
@@ -66,18 +66,37 @@ using opus::operator""_I;
 
 namespace mla_decode_fwd_32mx2_32nx2_a8w8 {
 
-// Register pins, live only under the amdgpu-pin-op-dst toolchain. A pin binds a definition.
-#if defined(__has_cpp_attribute)
-#if __has_cpp_attribute(clang::amdgpu_pin_agpr) && __has_cpp_attribute(clang::amdgpu_pin_vgpr)
-#define MLA32MX2_PIN_AGPR(n) [[clang::amdgpu_pin_agpr(n)]]
-#define MLA32MX2_PIN_VGPR(n) [[clang::amdgpu_pin_vgpr(n)]]
+// Register pins (amdgpu-named-reg-pin-std toolchain). A local declared amdgpu_pin_{vgpr,agpr}
+// has no storage: every write of it is a write of that register, so routing a value through
+// one places its definition there. A stock clang does not know the attributes and the helpers
+// degrade to plain copies. A pinned value is at most 16 registers (the widest named tuple).
+#if defined(__has_attribute)
+#if __has_attribute(amdgpu_pin_agpr) && __has_attribute(amdgpu_pin_vgpr)
 #define MLA32MX2_HAS_PIN 1
 #endif
 #endif
-#ifndef MLA32MX2_PIN_AGPR
-#define MLA32MX2_PIN_AGPR(n)
-#define MLA32MX2_PIN_VGPR(n)
+
+template <int REG, class V>
+__device__ inline V pin_vgpr(V v)
+{
+#ifdef MLA32MX2_HAS_PIN
+    __attribute__((amdgpu_pin_vgpr(REG))) V r = v;
+#else
+    V r = v;
 #endif
+    return r;
+}
+
+template <int REG, class V>
+__device__ inline V pin_agpr(V v)
+{
+#ifdef MLA32MX2_HAS_PIN
+    __attribute__((amdgpu_pin_agpr(REG))) V r = v;
+#else
+    V r = v;
+#endif
+    return r;
+}
 
 // The register map. AGPR: Q, then the K/V ring. VGPR: O at the top, the two score buffers
 // under it; v0 .. S_VGPR_BASE-1 are the compiler's (P, addresses, softmax temporaries).
@@ -469,24 +488,6 @@ attn_mask_kv_tile(V& v_s, int last_valid_kv_pos, int kv_tile_idx, int half, opus
     });
 }
 
-// Register-class anchors: an empty asm with a tied operand is a use and a def of the value in
-// that class. Free functions, because an asm operand naming a captured local does not compile
-// inside a generic (static_for) lambda.
-template <class X>
-__device__ inline void anchor_agpr(X& x)
-{
-    static_assert(sizeof(X) % 4 == 0);
-    using w_t = opus::vector_t<int, sizeof(X) / 4>;
-    asm volatile("" : "+a"(*reinterpret_cast<w_t*>(&x))::);
-}
-template <class X>
-__device__ inline void anchor_vgpr(X& x)
-{
-    static_assert(sizeof(X) % 4 == 0);
-    using w_t = opus::vector_t<int, sizeof(X) / 4>;
-    asm volatile("" : "+v"(*reinterpret_cast<w_t*>(&x))::);
-}
-
 template <class S>
 __device__ inline opus::u32_t lds_addr(const S& s)
 {
@@ -609,17 +610,14 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
     op_t v_kv[T::KV_ENTRIES];
     // Scores for two tiles: tile t's QK runs alongside tile t-1's softmax tail.
     s_tile_t v_s[2];
-    auto clear_s = [](auto& a, auto sbuf) {
-        MLA32MX2_PIN_VGPR(S_VGPR_BASE<T> + decltype(sbuf)::value * S_VGPR_PER_BUF<T>)
-        a = s_tile_t{0};
+    auto pin_s = [](auto& a, auto sbuf) {
+        a = pin_vgpr<S_VGPR_BASE<T> + decltype(sbuf)::value * S_VGPR_PER_BUF<T>>(a);
     };
+    // Not pinned: a pinned zero is a real register write, unpinned it folds into the first
+    // MFMA as srcC = 0, whose pinned result places S.
+    auto clear_s = [](auto& a) { a = s_tile_t{0}; };
     op_t v_p;
     op_t v_q[T::GEMM0_E_K];
-
-    auto pin_q = [&]() { static_for<T::GEMM0_E_K>([&](auto i) { anchor_agpr(v_q[i.value]); }); };
-    auto pin_o = [&]() {
-        static_for<T::GEMM1_E_M>([&](auto i) { anchor_vgpr(v_o_tiles[i.value]); });
-    };
 
     // Inside a slot: k-step ks is chunk ks / 2 and 64 d on for odd ks, the operand's second
     // pass 32 d on. PV d-tile dt (of the wave's half) is chunk dt / 4 plus 2 slots per tile;
@@ -637,13 +635,14 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
                       (qq % 2) * 2 * T::smem_row_kv + (d % tc) * 2 * T::VEC_KV>{};
     };
 
-    // One operand (k-step ks) of the 32-row group `u` reads: two ds_read_b128.
+    // One operand (k-step ks) of the 32-row group `u` reads: two ds_read_b128. Pinned as a
+    // whole: pinning the halves separately leaves the MFMA reading a sub-register of a named
+    // tuple, which the toolchain cannot lower.
     auto load_op = [&](op_t& dst, smem<D_K> s, int u, auto ks, auto agpr_base) {
-        auto* h = reinterpret_cast<k_half_t*>(&dst);
-        static_for<2>([&](auto pp) {
-            MLA32MX2_PIN_AGPR(decltype(agpr_base)::value + pp.value * K_AGPR_PER_HALF<T>)
-            h[pp.value] = lds_load<T::VEC_KV>(s, u, k_off(ks, pp));
-        });
+        op_t op;
+        auto* h = reinterpret_cast<k_half_t*>(&op);
+        static_for<2>([&](auto pp) { h[pp.value] = lds_load<T::VEC_KV>(s, u, k_off(ks, pp)); });
+        dst = pin_agpr<decltype(agpr_base)::value>(op);
     };
     auto load_k_all = [&](smem<D_K> kv) {
         static_for<T::K_DEPTH>([&](auto ks) {
@@ -655,26 +654,23 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
     // V d-tile dt of the tile in slot `kv`: four transpose reads into ring entry dt.
     auto load_v = [&](smem<D_K> kv, auto dt) {
         constexpr int base = KV_AGPR_BASE<T> + decltype(dt)::value * T::OP_REGS;
-        auto* piece        = reinterpret_cast<v_piece_t*>(&v_kv[dt.value]);
-        static_for<T::v_tile_ds_read_insts>([&](auto q) {
-            MLA32MX2_PIN_AGPR(base + q.value * (T::VEC_TR_V / 4))
-            piece[q.value] = tr_load_b8<T::VEC_TR_V>(kv, u_rv, v_off(dt, q));
-        });
+        op_t op;
+        auto* piece = reinterpret_cast<v_piece_t*>(&op);
+        static_for<T::v_tile_ds_read_insts>(
+            [&](auto q) { piece[q.value] = tr_load_b8<T::VEC_TR_V>(kv, u_rv, v_off(dt, q)); });
+        v_kv[dt.value] = pin_agpr<base>(op);
     };
 
     // GEMM0: 9 k-steps of one MFMA, K step ks in ring entry ks. `per_step(ks)` rides the
     // shadow of step ks. The MFMA is a pure call, so IR passes sink the whole chain below the
     // per-step work and sched_barrier, a backend fence, cannot undo it: the V reads end up
     // ahead of the first MFMA, which then waits out ~28 LDS reads (lgkmcnt saturates at 15)
-    // instead of its own two. The anchor on S ties each MFMA to its place among the volatile
-    // asm, the memory fence keeps the V reads behind it.
+    // instead of its own two. The pin on S (a register write, ordered like memory) ties each
+    // MFMA to its place among the volatile asm, the memory fence keeps the V reads behind it.
     auto compute_qk = [&](auto& s, auto sbuf, auto&& per_step) {
         constexpr int sbase = S_VGPR_BASE<T> + decltype(sbuf)::value * S_VGPR_PER_BUF<T>;
         static_for<T::GEMM0_E_K>([&](auto ks) {
-            anchor_agpr(v_kv[ks.value]);
-            MLA32MX2_PIN_VGPR(sbase)
-            s = mfma0(v_kv[ks.value], v_q[ks.value], s, 0, 0);
-            anchor_vgpr(s);
+            s = pin_vgpr<sbase>(mfma0(v_kv[ks.value], v_q[ks.value], s, 0, 0));
             __builtin_amdgcn_sched_barrier(0);
             asm volatile("" ::: "memory");
             per_step(ks);
@@ -682,14 +678,12 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
     };
 
     // GEMM1 out of the ring: one MFMA per d-tile; `co(dt)` rides the shadow of MFMA dt. The O
-    // anchor holds each MFMA among the DMA issues, as the S anchor does in GEMM0.
+    // pin holds each MFMA among the DMA issues, as the S pin does in GEMM0.
     auto compute_pv = [&](auto&& co) {
         static_for<T::GEMM1_E_M>([&](auto dt) {
             constexpr int d = dt.value;
-            anchor_agpr(v_kv[d]);
-            MLA32MX2_PIN_VGPR(O_VGPR_BASE<T> + d * T::O_TILE_REGS)
-            v_o_tiles[d] = mfma1(v_kv[d], v_p, v_o_tiles[d], 0, 0);
-            anchor_vgpr(v_o_tiles[d]);
+            v_o_tiles[d]    = pin_vgpr<O_VGPR_BASE<T> + d * T::O_TILE_REGS>(
+                mfma1(v_kv[d], v_p, v_o_tiles[d], 0, 0));
             __builtin_amdgcn_sched_barrier(0);
             co(dt);
         });
@@ -716,7 +710,7 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
     //   0  merged max, rescale decision, m / l update   1,2  scale-subtract (8 each)
     //   3,4  exp2 (8 each)                               5  row-sum tree
     //   6  sum across the lane halves, l update; P cast, re-deal and store to LDS
-    auto tail_chunk = [&](auto& vs, auto ks) {
+    auto tail_chunk = [&](auto& vs, auto ks, auto sbuf) {
         constexpr int k = decltype(ks)::value;
         if constexpr(k == 0)
         {
@@ -753,14 +747,15 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
             const auto ph = build_p_half<T>(vs);
             store<T::VEC_P>(s_p, __builtin_bit_cast(vector_t<D_K, T::VEC_P>, ph), u_sp);
         }
-        // Redefine what the chunk wrote in place, so it stays in its MFMA shadow: pure VALU
+        // Pin what the chunk wrote in place, so it stays in its MFMA shadow: pure VALU
         // otherwise sinks to the P store and runs as one block.
-        using g8_t = vector_t<D_ACC, 8>;
-        auto* grp  = reinterpret_cast<g8_t*>(&vs);
+        using g8_t       = vector_t<D_ACC, 8>;
+        auto* grp        = reinterpret_cast<g8_t*>(&vs);
+        constexpr int sb = S_VGPR_BASE<T> + decltype(sbuf)::value * S_VGPR_PER_BUF<T>;
         if constexpr(k == 1 || k == 2)
-            anchor_vgpr(grp[k - 1]);
+            grp[k - 1] = pin_vgpr<sb + (k - 1) * 8>(grp[k - 1]);
         if constexpr(k == 3 || k == 4)
-            anchor_vgpr(grp[k - 3]);
+            grp[k - 3] = pin_vgpr<sb + (k - 3) * 8>(grp[k - 3]);
     };
     constexpr int TAIL_CHUNKS = 7;
     static_assert(TAIL_CHUNKS <= T::GEMM0_E_K, "the tail must fit the GEMM0 shadows");
@@ -770,8 +765,8 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
         if(!all_below)
         {
             static_for<T::GEMM1_E_M>([&](auto i) {
-                MLA32MX2_PIN_VGPR(O_VGPR_BASE<T> + i.value * T::O_TILE_REGS)
-                v_o_tiles[i.value] = v_o_tiles[i.value] * rescale_m;
+                v_o_tiles[i.value] = pin_vgpr<O_VGPR_BASE<T> + i.value * T::O_TILE_REGS>(
+                    v_o_tiles[i.value] * rescale_m);
             });
         }
     };
@@ -907,7 +902,6 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
     // flight; nothing below may touch LDS before every wave is past both.
     __builtin_amdgcn_s_waitcnt(0);
     lds_barrier();
-    pin_o();
 
     // Index DMAs of tiles tile_begin .. +3, the Q image into the third slot, tiles tile_begin
     // and tile_begin+1 into slots 0 and 1.
@@ -926,7 +920,6 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
         load_op(v_q[ks.value], s_kv[T::Q_SLOT], u_rq, ks, number<ks.value * Q_AGPR_PER_STEP<T>>{});
     });
     s_waitcnt_lgkmcnt(0_I);
-    pin_q();
     lds_barrier(); // every wave is done with the Q image: the slot is tile_begin+2's now
     // What the phase of tile_begin would have issued, so the first loop phase's vmcnt holds.
     async_load_kv(s_kv[T::Q_SLOT], pages_c);
@@ -935,13 +928,13 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
     // Partial phase for tile_begin: QK and the row max. No tail, no PV.
     load_k_all(s_kv[0]);
     stage_end();
-    clear_s(v_s[0], 0_I);
+    clear_s(v_s[0]);
     compute_qk(v_s[0], 0_I, [](auto) {});
     mask_oob_scores(v_s[0], tile_begin);
     head_chunk(v_s[0], 0_I);
     head_chunk(v_s[0], 1_I);
     s_waitcnt_lgkmcnt(0_I);
-    anchor_vgpr(v_s[0]);
+    pin_s(v_s[0], 0_I);
     stage_end();
 
     // kv_prev: slot t-1 (its V read this phase, then DMA(t+2) into it), kv_cur: slot t.
@@ -951,7 +944,6 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
             // index DMA of t+3 in flight. B0 publishes K(t) and the pair's row maxima of S(t-1).
             s_waitcnt_vmcnt(number<T::kv_buffer_load_insts + T::kv_index_load_insts>{});
             lds_barrier();
-            pin_q();
             read_peer_max();
             const auto pages = load_kv_pages(t + 2);
             load_k_all(kv_cur);
@@ -960,10 +952,10 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
             // stage1 [compute]: gemm0 QK(t) [9 MFMA] || softmax tail(t-1) -> P half to LDS
             // || V(t-1) d-tile ks into the ring entry step ks has just finished with.
             __builtin_amdgcn_s_setprio(1);
-            clear_s(vs_cur, sbuf);
+            clear_s(vs_cur);
             compute_qk(vs_cur, sbuf, [&](auto ks) {
                 if constexpr(ks.value < TAIL_CHUNKS)
-                    tail_chunk(vs_prev, ks);
+                    tail_chunk(vs_prev, ks, number<1 - decltype(sbuf)::value>{});
                 if constexpr(ks.value < T::V_DEPTH)
                     load_v(kv_prev, ks);
             });
@@ -983,7 +975,6 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
             // stage3 [compute]: gemm1 PV(t-1) [8 MFMA] || DMA(t+2) into slot t-1, then the index
             // DMA of t+4 || the row max of S(t).
             __builtin_amdgcn_s_setprio(1);
-            pin_o();
             compute_pv([&](auto dt) {
                 constexpr int d     = dt.value;
                 constexpr int n     = T::kv_buffer_load_insts;
@@ -998,8 +989,7 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
             // The max store must land before B0 publishes it; the P read before B0 lets the
             // partner overwrite P.
             s_waitcnt_lgkmcnt(0_I);
-            pin_o();
-            anchor_vgpr(vs_cur);
+            pin_s(vs_cur, sbuf);
             __builtin_amdgcn_s_setprio(0);
             stage_end();
         };
@@ -1022,8 +1012,7 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
         __builtin_amdgcn_sched_barrier(0);
         run_phase(v_s[1], v_s[0], kv_prev, kv_cur, t, 1_I);
         rotate();
-        MLA32MX2_PIN_VGPR(S_VGPR_BASE<T>)
-        v_s[0] = v_s[1];
+        v_s[0] = pin_vgpr<S_VGPR_BASE<T>>(v_s[1]);
         ++t;
         __builtin_amdgcn_sched_barrier(0);
     }
@@ -1043,16 +1032,14 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
     //     The barriers stand in for the B0 / B1 a next phase would have had.
     lds_barrier();
     read_peer_max();
-    static_for<TAIL_CHUNKS>([&](auto k) { tail_chunk(v_s[0], k); });
+    static_for<TAIL_CHUNKS>([&](auto k) { tail_chunk(v_s[0], k, 0_I); });
     static_for<T::V_DEPTH>([&](auto dt) { load_v(kv_prev, dt); });
     rescale_o();
     stage_end();
     s_waitcnt_lgkmcnt(0_I);
     lds_barrier();
     read_p();
-    pin_o();
     compute_pv(no_co);
-    pin_o();
     __builtin_amdgcn_sched_barrier(0);
 }
 
@@ -1127,8 +1114,7 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(opus_mla_d
     using o_tile_t = vector_t<D_ACC, T::O_TILE_REGS>;
     o_tile_t v_o_tiles[T::GEMM1_E_M];
     static_for<T::GEMM1_E_M>([&](auto i) {
-        MLA32MX2_PIN_VGPR(O_VGPR_BASE<T> + i.value * T::O_TILE_REGS)
-        v_o_tiles[i.value] = o_tile_t{0};
+        v_o_tiles[i.value] = pin_vgpr<O_VGPR_BASE<T> + i.value * T::O_TILE_REGS>(o_tile_t{0});
     });
     // Finite on purpose: under -ffast-math max(lowest, x) folds to x, and a fully masked row
     // (x = -inf, e.g. a CP rank holding none of the row's causal past) would turn every
