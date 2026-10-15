@@ -24,11 +24,12 @@ SEARCH_SPACE = {
     "GROUP_SIZE_M": [1, 4, 8, 16],
     "num_warps": [1, 2, 4, 8],
     "num_stages": [1, 2],
-    "waves_per_eu": [1, 2, 4, 6, 8],
+    "waves_per_eu": [0, 1, 2, 4, 6, 8],  # 0: no occupancy hint, the compiler decides
     "matrix_instr_nonkdim": [16],
-    "cache_modifier": [".cg", None],
+    # gfx1250 load policies: None (= .ca) CU+RT, .cg DEV+RT, .cs CU+NT, .cv SYS+bypass
+    "cache_modifier": [None, ".cg", ".cs", ".cv"],
     "NUM_KSPLIT": [1, 3, 4, 7, 8, 14, 16, 28],
-    "NUM_BUFFERS": [1, 2, 3, 4, 6, 8],
+    "NUM_BUFFERS": [1, 2, 3, 4, 5, 6, 7, 8],
     "kernel_type": ["bandwidth_bound", "compute_bound"],
     "num_ctas": [1, 2, 4, 8, 16],
     "CTAS_M": [1, 2, 4],
@@ -86,7 +87,7 @@ def default_values(spec, backend, M, keys, buckets):
     return values
 
 
-def candidate_values(spec, backend, keys, defaults, default_path):
+def candidate_values(spec, backend, arch, keys, defaults, default_path):
     """Candidate list per key. A one-element list means the key is pinned (not swept)."""
     values, pinned = {}, []
     for key in keys:
@@ -106,6 +107,9 @@ def candidate_values(spec, backend, keys, defaults, default_path):
             candidates = [
                 defaults[key]
             ]  # sweeping it would only repeat the same kernel
+        # on gfx950, .cg and .cs set the same bits (SC0+NT): sweep only .cg
+        if name == "cache_modifier" and arch.startswith("gfx950"):
+            candidates = [v for v in candidates if v != ".cs"]
         values[key] = list(candidates)
         if len(values[key]) == 1:
             pinned.append(key)
@@ -192,6 +196,42 @@ def exceeds_registers(config, spec, arch):
     return acc_per_thread > MAX_ACC_PER_THREAD.get(arch, 256)
 
 
+def exceeds_operand_registers(config, spec, arch, backend):
+    """Triton only: True when one thread's dot operands plus accumulator need more than twice
+    its registers. Triton holds whole BLOCK_K operand tiles in registers for tl.dot; measured on
+    gfx1250, every such config spilled or overflowed LDS, and they are the slowest to compile.
+    Gluon kernels walk BLOCK_K in instruction-sized steps, so the rule does not apply there.
+    """
+    tile = cta_tile(config, spec)
+    if backend != "triton" or tile is None or "num_warps" not in config:
+        return False
+    block_m, block_n, block_k = tile
+    wave_size = 32 if arch.startswith("gfx1250") else 64
+    bits = block_m * block_n * 32 + block_k * (
+        block_m * spec.bits[0] + block_n * spec.bits[1]
+    )
+    registers_per_thread = bits / 32 / (config["num_warps"] * wave_size)
+    return registers_per_thread > 2 * MAX_ACC_PER_THREAD.get(arch, 256)
+
+
+def exceeds_compiled_resources(kernels):
+    """Why the compiled kernels of a candidate cannot run well, or None (truthy = reject).
+
+    The static LDS and register checks above are estimates; this reads what the compiler
+    produced: shared memory above the device's (loading the kernel raises), or spilled registers.
+    """
+    from triton.runtime.errors import OutOfResources
+
+    for kernel in kernels:
+        try:
+            kernel._init_handles()  # loads the binary, no launch
+        except OutOfResources as e:
+            return f"LDS: {' '.join(str(e).split())[:120]}"
+        if kernel.n_spills:
+            return f"spills {kernel.n_spills} registers"
+    return None
+
+
 def exceeds_lds(config, spec, arch, backend):
     """True when buffers x (A tile + B tile) cannot fit the LDS; such a config never compiles."""
     from aiter.ops.triton.utils._triton.arch_info import _LDS_CAP_BYTES
@@ -216,7 +256,7 @@ def build_space(spec, shape, backend, arch, kernel_should_skip):
     """All configs to benchmark for one shape, plus a report of how the space was built."""
     keys, buckets, default_path = load_defaults(spec, backend)
     defaults = default_values(spec, backend, shape["M"], keys, buckets)
-    values, pinned = candidate_values(spec, backend, keys, defaults, default_path)
+    values, pinned = candidate_values(spec, backend, arch, keys, defaults, default_path)
 
     def shape_filtered(allow_oversized_tiles):
         return {
@@ -230,7 +270,13 @@ def build_space(spec, shape, backend, arch, kernel_should_skip):
 
     def prune(candidate_lists):
         configs = []
-        skipped = {"generic rules": 0, "LDS": 0, "registers": 0, "kernel rules": 0}
+        skipped = {
+            "generic rules": 0,
+            "LDS": 0,
+            "registers": 0,
+            "operand registers": 0,
+            "kernel rules": 0,
+        }
         for combination in itertools.product(*candidate_lists.values()):
             config = dict(zip(keys, combination))
             if should_skip_generic(shape, config, backend):
@@ -241,6 +287,9 @@ def build_space(spec, shape, backend, arch, kernel_should_skip):
                 continue
             if exceeds_registers(config, spec, arch):
                 skipped["registers"] += 1
+                continue
+            if exceeds_operand_registers(config, spec, arch, backend):
+                skipped["operand registers"] += 1
                 continue
             if kernel_should_skip is not None and kernel_should_skip(config):
                 skipped["kernel rules"] += 1

@@ -207,9 +207,15 @@ def discard(out):
 
 
 def terminate(proc):
-    """The one place a worker is killed and reaped."""
-    os.killpg(proc.pid, signal.SIGKILL)
-    proc.wait()
+    """The one place a worker is stopped and reaped: SIGTERM lets it finish the candidate in
+    hand (killing a worker while its kernels run can fault the GPU on gfx1250); a worker that
+    does not stop within 30 s (a hung kernel or compile) is killed."""
+    os.killpg(proc.pid, signal.SIGTERM)
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
 
 
 def run_worker(command, env, log_path, stall, setup_timeout):

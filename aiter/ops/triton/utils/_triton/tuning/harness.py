@@ -4,14 +4,16 @@
 
 Flow: set the kernel up once (inputs, call, should_skip), then
   --plan     build the space (space.build_space) and write it as JSON for the driver
-  --configs  for each candidate: warm up (compiles) -> capture a CUDA graph over cold input
-             copies -> replay -> append one record to --out
+  --configs  for each candidate: compile without launching -> skip it when the compiled
+             kernels overflow LDS or spill registers -> warm up -> capture a CUDA graph over
+             cold input copies -> replay -> append one record to --out
 
 --configs is a JSON list of config dicts; null is the baseline, the wrapper called with
 config=None (the installed config). Records are appended as soon as a candidate finishes.
 
 Record fields:
-  status    ready (worker is set up), start (candidate began), ok, error
+  status    ready (worker is set up), start (candidate began), ok, error, skipped (the
+            compiled kernels overflow LDS or spill registers; reason says which)
   baseline  true for the installed config
   config    the raw candidate, never the mutated copy; for the baseline the installed config
             (launched through the wrapper's own config=None path unless keys DEFAULT.json does
@@ -28,8 +30,10 @@ import copy
 import gc
 import json
 import os
+import signal
 import sys
 import time
+from collections import namedtuple
 
 from _utils import add_shape_args, append_record, shape_from_args
 from kernels import (
@@ -40,7 +44,7 @@ from kernels import (
     get_spec,
     resolve_installed,
 )
-from space import UnknownConfigKey, build_space, load_defaults
+from space import UnknownConfigKey, build_space, exceeds_compiled_resources, load_defaults
 
 
 def make_cold_copies(inputs, cold_mb):
@@ -60,6 +64,9 @@ def make_cold_copies(inputs, cold_mb):
     budget = min(cold_mb << 20, torch.cuda.mem_get_info()[0] // 4)
     n = max(1, min(64, budget // max(per_copy, 1)))
     return [tuple(inputs)] + [tuple(clone(a) for a in inputs) for _ in range(n - 1)]
+
+
+Timing = namedtuple("Timing", "median low high screened")
 
 
 def time_with_cuda_graph(call, config, copies, calls=24, replays=25):
@@ -86,18 +93,52 @@ def time_with_cuda_graph(call, config, copies, calls=24, replays=25):
     for _ in range(3):
         graph.replay()
     torch.cuda.synchronize()
-    times = []
-    for _ in range(replays):
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
-            enable_timing=True
-        )
-        start.record()
-        graph.replay()
-        end.record()
-        end.synchronize()
-        times.append(start.elapsed_time(end) * 1e3 / n_calls)
-    times.sort()
-    return times[len(times) // 2], times[0], times[-1]
+    times = sorted(
+        _timed_replay(graph, n_calls) for _ in range(replays)
+    )
+    return Timing(times[len(times) // 2], times[0], times[-1], False)
+
+
+def _timed_replay(graph, n_calls):
+    import torch
+
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
+        enable_timing=True
+    )
+    start.record()
+    graph.replay()
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end) * 1e3 / n_calls
+
+
+def compile_only(call, config, inputs):
+    """Run the wrapper with every kernel launch turned into a compile; returns the compiled kernels."""
+    from triton.runtime import jit
+
+    compiled = []
+    launch = jit.JITFunction.run
+
+    def compile_instead(self, *args, grid, warmup, **kwargs):
+        kernel = launch(self, *args, grid=grid, warmup=True, **kwargs)
+        compiled.append(kernel)
+        return kernel
+
+    jit.JITFunction.run = compile_instead
+    try:
+        call(copy.deepcopy(config), *inputs)
+    finally:
+        jit.JITFunction.run = launch
+    return [kernel for kernel in compiled if kernel is not None]
+
+
+STOPPING = []  # set by SIGTERM: finish the candidate in hand, then exit
+
+
+def stop_after_this_candidate(signum, frame):
+    """Killing a worker while its kernels run can fault the GPU on gfx1250, so SIGTERM only
+    asks the worker to stop between two candidates."""
+    STOPPING.append(signum)
 
 
 def gpu_alive():
@@ -156,6 +197,8 @@ def benchmark(
     )
     print("ready", flush=True)  # the driver's watchdog reads the worker's log
     for candidate in candidates:
+        if STOPPING:
+            return
         is_baseline = candidate is None
         append_record(
             out, dict(common, status="start", baseline=is_baseline, config=candidate)
@@ -171,15 +214,22 @@ def benchmark(
                     record["dropped_keys"] = dropped
                     candidate = record["config"]
                 # otherwise candidate stays None: the wrapper's own installed-config path
-            median, low, high = time_with_cuda_graph(
-                call, candidate, copies, calls, replays
-            )
-            record.update(
-                us=round(median, 3),
-                us_min=round(low, 3),
-                us_max=round(high, 3),
-                tflops=round(flops(shape) / median / 1e6, 2),
-            )
+            else:
+                reason = exceeds_compiled_resources(
+                    compile_only(call, candidate, copies[0])
+                )
+                if reason:
+                    record.update(status="skipped", reason=reason)
+            if record["status"] == "ok":
+                timing = time_with_cuda_graph(
+                    call, candidate, copies, calls, replays
+                )
+                record.update(
+                    us=round(timing.median, 3),
+                    us_min=round(timing.low, 3),
+                    us_max=round(timing.high, 3),
+                    tflops=round(flops(shape) / timing.median / 1e6, 2),
+                )
         except Exception as e:  # noqa: BLE001
             # a failing candidate is a result, not a crash
             record.update(
@@ -218,6 +268,7 @@ def main(argv=None):
         "--cold-mb", type=int, default=1024, help="byte budget for cold input copies"
     )
     args = parser.parse_args(argv)
+    signal.signal(signal.SIGTERM, stop_after_this_candidate)
 
     spec = args.kernel
     shape = shape_from_args(args, spec.dims)

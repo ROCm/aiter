@@ -26,10 +26,13 @@ here. Update this file in the same change as any behaviour change.
    `Unknown config key 'X' in <DEFAULT.json>: add it to SEARCH_SPACE in space.py first`. Never pin
    or skip it silently.
 3. The whole `SEARCH_SPACE` is swept. No CLI overrides, no caps, no sampling. Pruning is: the
-   shape filters, `should_skip_generic`, `exceeds_lds` and `exceeds_registers` (fp32 accumulator per
-   thread above `MAX_ACC_PER_THREAD`: 512 on gfx1250, 256 elsewhere) in `space.py`, then the kernel's own
+   shape filters, `should_skip_generic`, `exceeds_lds`, `exceeds_registers` (fp32 accumulator per
+   thread above `MAX_ACC_PER_THREAD`: 512 on gfx1250, 256 elsewhere) and, for Triton only,
+   `exceeds_operand_registers` (operands + accumulator above twice that) in `space.py`, then the kernel's own
    `should_skip(config)`. Every rule returns True to reject; `build_space` reads as separate
-   `if ...: continue` checks. When the kernel rejects every tile that fits the shape, `build_space`
+   `if ...: continue` checks. The worker then compiles each candidate without a launch and
+   records it as `skipped` (with the `reason`) when the compiled kernels overflow LDS or spill
+   registers (`exceeds_compiled_resources`); the baseline is always timed. When the kernel rejects every tile that fits the shape, `build_space`
    allows block sizes above the shape for that M (`oversized_tiles_allowed` in the plan). `gluon_candidates` is only for a key whose meaning differs under
    gluon (gfx1250 a8w8 blockscale `num_stages` is `NUM_BUFFERS`).
 4. Results always install into `resolve_config_dir(op, config_name, backend)`. No export directory,

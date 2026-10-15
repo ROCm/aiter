@@ -6,7 +6,7 @@ import glob
 import json
 import os
 
-FINAL_STATUSES = ("ok", "error", "crashed", "hung")
+FINAL_STATUSES = ("ok", "error", "crashed", "hung", "skipped", "wrong")
 TOP_BUCKET_M = 8192  # --all-buckets sweeps the family's M_LEQ buckets up to here
 
 
@@ -96,7 +96,7 @@ def read_records(path):
     the worker died on keeps status 'start'."""
     records = {}
     for record in iter_records(path):
-        if record["status"] == "ready":
+        if record["status"] in ("ready", "reference"):
             continue
         key = "baseline" if record.get("baseline") else config_key(record["config"])
         is_final = record["status"] != "start"
