@@ -2225,6 +2225,48 @@ PAD = 64  # the kernel's local rows (and chunk rows) are multiples of this (moe(
 GEOMS = ((128, 1),)  # (unit rows AITER_BIGM_RG, CTAs per CU AITER_BIGM_CPU) of the io path
 
 
+_HIP = None
+
+
+def _hip():
+    """the HIP runtime torch uses (ctypes): stream write / wait value"""
+    global _HIP
+    if _HIP is None:
+        import ctypes
+
+        import torch
+
+        torch.cuda.init()
+        path = next(l.split()[-1] for l in open("/proc/self/maps") if "libamdhip64" in l)
+        lib = ctypes.CDLL(path)
+        lib.hipStreamWriteValue32.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint]
+        lib.hipStreamWaitValue32.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint, ctypes.c_uint32]
+        lib.hipStreamWriteValue32.restype = lib.hipStreamWaitValue32.restype = ctypes.c_int
+        _HIP = lib
+    return _HIP
+
+
+def _hip_check(err):
+    if err != 0:
+        raise RuntimeError(f"MegaMoeTP big-M: HIP stream value op failed ({err})")
+
+
+def _kcopy(dst, src):
+    """dst <- src by a shader kernel (dst: a peer's memory). Not copy_: a contiguous copy_ is a
+    hipMemcpyAsync, which ROCm runs on the SDMA engine of that xGMI link -- the engines the
+    big-M kernel's MORI queues use; ROCr's own queue there slows every later big-M put."""
+    import torch
+
+    torch.mul(src, 1, out=dst)
+
+
+class _CudaBuf:
+    """__cuda_array_interface__ of raw device bytes (a peer's arena as mapped here)."""
+
+    def __init__(self, ptr, nbytes):
+        self.__cuda_array_interface__ = {"shape": (nbytes,), "typestr": "|u1", "data": (ptr, False), "version": 3}
+
+
 class MegaMoeTPBigM:
     """Host side of the big-M dispatch: the SDMA window (same regions on every rank),
     scratch buffers and the launch.
@@ -2277,6 +2319,9 @@ class MegaMoeTPBigM:
         sd = self.sd = SdmaComm(group=group, num_queues=NQ, device=device)
         for r_ in self.REGIONS:
             sd.reserve(r_, sizes[r_])
+        if self.io:  # gather_rows: every rank's bf16 tail rows (not a kernel region)
+            sd.reserve("brows", 2 * T * H * 2)  # two buffers in turn
+            sd.reserve("bflag", tp * 64)  # per-rank epoch flags (gather_rows)
         sd.commit()
         dev = self.device = sd.device
         self.offs = torch.tensor([sd.offset(r_) for r_ in self.REGIONS], dtype=torch.int64, device=dev)
@@ -2362,6 +2407,70 @@ class MegaMoeTPBigM:
         if int(dict(self.opts).get("AITER_BIGM_GSPLIT", "0")):
             return max(bigm_lds(rg, n, inter, MODE=3)["BYTES"], bigm_lds(rg, n, inter, MODE=4)["BYTES"])
         return bigm_lds(rg, n, inter)["BYTES"]
+
+    def gather_rows(self, rows):
+        """Collective: every rank's rows [m, H] bf16 -> [tp * m, H] (rank r's at r * m), a
+        view of the arena valid until the next call. Each rank writes its rows into every
+        peer's arena (hipIpc mapping; one side stream per peer), then stream-ordered flags:
+        hipStreamWriteValue32 of this call's epoch into every peer's flag slot of this rank,
+        hipStreamWaitValue32 on every peer's slot here. No host sync (the host keeps running
+        ahead of the GPU). Two buffers in turn: a peer's writes of call k + 2 follow its wait
+        for this rank's flag of call k + 1, which this stream writes after whatever it ran on
+        call k's rows."""
+        import torch
+        import torch.distributed as dist
+
+        assert not torch.cuda.is_current_stream_capturing(), "gather_rows: not graph-capturable"
+        m, H = rows.shape
+        T = m * self.tp
+        assert T <= self.Tmax and rows.dtype == torch.bfloat16
+        stream = torch.cuda.current_stream()
+        if getattr(self, "_brows_peer", None) is None:
+            off, half = self.sd.offset("brows"), self.Tmax * H * 2
+            bases = [int(b_) for b_ in self.sd.arena.base_ptrs]
+            self._brows_peer = [
+                [
+                    torch.as_tensor(_CudaBuf(b_ + off + i * half, half), device=self.device)
+                    .view(torch.bfloat16).view(self.Tmax, H)
+                    for b_ in bases
+                ]
+                for i in range(2)
+            ]
+            foff = self.sd.offset("bflag")
+            # flag slot of rank r (64 B apart) in rank p's arena, as mapped here
+            self._bflag = [[b_ + foff + r * 64 for r in range(self.tp)] for b_ in bases]
+            self.sd.view("bflag", (self.tp * 16,), torch.int32).zero_()
+            self._brows_streams = [torch.cuda.Stream(self.device) for _ in range(self.tp)]
+            self._bepoch = 0
+            torch.cuda.synchronize(self.device)
+            dist.barrier(group=self.sd.group)
+        self._bepoch += 1
+        ep = self._bepoch & 0x7FFFFFFF
+        dst = self._brows_peer[self._bepoch & 1]
+        src = rows.contiguous()
+        lo, hi = self.rank * m, (self.rank + 1) * m
+        ev = torch.cuda.Event()
+        ev.record(stream)
+        for p in range(self.tp):
+            if p == self.rank:
+                continue
+            s_ = self._brows_streams[p]
+            s_.wait_event(ev)
+            with torch.cuda.stream(s_):
+                _kcopy(dst[p][lo:hi], src)
+            src.record_stream(s_)
+        _kcopy(dst[self.rank][lo:hi], src)
+        hip, sh = _hip(), stream.cuda_stream
+        for p in range(self.tp):
+            if p != self.rank:
+                stream.wait_stream(self._brows_streams[p])
+        for p in range(self.tp):  # this rank's rows landed in p's arena
+            if p != self.rank:
+                _hip_check(hip.hipStreamWriteValue32(sh, self._bflag[p][self.rank], ep, 0))
+        for p in range(self.tp):  # every peer's rows landed here
+            if p != self.rank:
+                _hip_check(hip.hipStreamWaitValue32(sh, self._bflag[self.rank][p], ep, 0, 0x7FFFFFFF))
+        return dst[self.rank][:T]
 
     def poll_errors(self) -> int:
         """Nonzero if a wait on a peer inside the kernel gave up since the last clear."""
@@ -2539,17 +2648,28 @@ class MegaMoeTPBigM:
         if mp == m:
             return self._moe(x, topk_weights, topk_ids, out, tail, local)
         pb = self._pads.get(mp)
-        if pb is None:  # rows m.. stay zero / no route: written once
+        if pb is None:
             H, K1, dev = self.H, self.K1, self.device
-            pb = self._pads[mp] = (
+            pb = self._pads[mp] = [
                 torch.zeros((mp, H), dtype=torch.bfloat16, device=dev),
                 torch.zeros((mp, K1), dtype=torch.float32, device=dev),
                 torch.full((mp, K1), -1, dtype=torch.int32, device=dev),
                 torch.zeros((mp, H), dtype=torch.bfloat16, device=dev),
-                torch.empty((self.tp * m, H), dtype=torch.uint8, device=dev),
-                torch.empty((self.tp * m,), dtype=torch.float32, device=dev),
-            )
-        xp, twp, idp, rp, qc, qsc = pb
+                # q / scales of [rank][m] rows: sized for the largest m of this mp
+                torch.empty((self.tp * mp, H), dtype=torch.uint8, device=dev),
+                torch.empty((self.tp * mp,), dtype=torch.float32, device=dev),
+                mp,  # rows m.. hold no stale token / route from here on
+            ]
+        if pb[6] < m:
+            pb[6] = m
+        elif pb[6] > m:  # a smaller m than an earlier call of this mp: clear rows m..
+            pb[0][m:].zero_()
+            pb[1][m:].zero_()
+            pb[2][m:].fill_(-1)
+            pb[3][m:].zero_()
+            pb[6] = m
+        xp, twp, idp, rp, qc, qsc = pb[:6]
+        qc, qsc = qc[: self.tp * m], qsc[: self.tp * m]
         xp[:m].copy_(x)
         twp[:m].copy_(topk_weights)
         idp[:m].copy_(topk_ids)

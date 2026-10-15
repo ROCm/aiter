@@ -209,17 +209,17 @@ class MegaMoeTP:
 
     def _bigm_rows(self, res_out, norm_w, local):
         """the big-M tail's bf16 rows: (Gemma)RMSNorm of res_out, this rank's (local) or every
-        rank's rows (the kernel writes the FP8 rows only)"""
-        import torch.distributed as dist
-
-        r = res_out.float()
+        rank's rows (the kernel writes the FP8 rows only). Every rank's rows are exchanged
+        through the big-M kernel's hipIpc arena (device copies over xGMI), not through the
+        caller's group: that is a gloo CPU group in ATOM, where the ~400 MB all-gather of a
+        32K batch took ~0.3 s."""
+        r = res_out.to(torch.float32, copy=True)  # (scaled in place below)
         w = norm_w.float() + 1.0 if self.engine.tn_gemma else norm_w.float()
-        rows = (r * torch.rsqrt(r.pow(2).mean(-1, keepdim=True) + float(self.engine.tn_eps)) * w).to(torch.bfloat16)
+        inv = torch.rsqrt(r.pow(2).mean(-1, keepdim=True) + float(self.engine.tn_eps))
+        rows = r.mul_(inv).mul_(w).to(torch.bfloat16)
         if local:
             return rows
-        out = torch.empty((rows.shape[0] * self.cfg.world_size, rows.shape[1]), dtype=rows.dtype, device=rows.device)
-        dist.all_gather_into_tensor(out, rows, group=self._bigm_args["group"])
-        return out
+        return self.bigm().gather_rows(rows)
 
     def _big(self, local_tokens: int) -> bool:
         return bool(self.bigm_m) and local_tokens >= self.bigm_m
@@ -292,6 +292,11 @@ class MegaMoeTP:
         if small:
             self.engine.prepare(small, tail, tail_bf16, warmup)
         big = [t for t in ts if self._big(t)]
+        if not big and self._big(self.cfg.max_local_tokens):
+            # the big-M path is reachable: set it up (MORI communicator, SDMA queues, arena)
+            # and compile it here, collectively at init, not lazily inside the first big
+            # forward (where its 85-90 s compile and the setup interleave with the model)
+            big = [self.cfg.max_local_tokens]
         if big:
             self.bigm()
         for m in big if warmup else ():
