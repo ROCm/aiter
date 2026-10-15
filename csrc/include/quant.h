@@ -55,6 +55,8 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
 // scale_layout_m32k4: fp8 + e8m0 + group_size 32 only. Writes the scale directly in the
 // gfx1250 MXFP8 ASM GEMM A-scale layout (shuffle_mxfp8fp4_scale bytes); `scales` must hold
 // (pad32(M), K/32) bytes and the pad rows are written as 0x7F. shuffle_scale is ignored.
+// hadamard_rotate: fp4x2 + group_size 32 only. Rotates each group by the normalized
+// 32-point Sylvester Hadamard matrix before quantizing it.
 void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                                     const aiter_tensor_t& input, // [..., d]
                                     aiter_tensor_t& scales,
@@ -62,7 +64,8 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                                     bool shuffle_scale                         = true,
                                     std::optional<aiter_tensor_t> num_rows     = std::nullopt,
                                     int num_rows_factor                        = 1,
-                                    bool scale_layout_m32k4                    = false);
+                                    bool scale_layout_m32k4                    = false,
+                                    bool hadamard_rotate                       = false);
 
 // Backward-compat fp4-only entry; delegates to dynamic_per_group_scaled_quant.
 void dynamic_per_group_scaled_quant_fp4(aiter_tensor_t& out,         // [..., d]
