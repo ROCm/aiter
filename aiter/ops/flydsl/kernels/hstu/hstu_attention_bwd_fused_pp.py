@@ -1105,19 +1105,28 @@ def build_hstu_attention_bwd_fused_pp(
                 Vec(dqw[dq_wbase + fx.Int32(w), dq_frow, dq_fvec, None].load())
                 for w in range_constexpr(NUM_WAVES // 2)
             ]
+            # FIFTH read, issued with the other four and consumed last. The
+            # group-exchange row depends on nothing computed in this phase --
+            # the other group published it a full barrier ago -- so its only
+            # reason to sit after the write below was program order. Behind the
+            # write it had ZERO cover: the trace showed it immediately followed
+            # by its own `lgkmcnt(0)`. Here the twelve adds cover it.
+            #
+            # Safe in either order, and the backend may not see that: the two
+            # rows are disjoint. g1 writes `dq_frow` and reads the
+            # permanently-zero row; g0 writes the sink row and reads the one g1
+            # published last interval. Neither group ever reads what it wrote.
+            _g = Vec(dqg[dq_rrow, dq_fvec, None].load())
+
             acc = [fx.Float32(0.0) for _ in range_constexpr(DQ_PER_LANE)]
             for w in range_constexpr(NUM_WAVES // 2):
                 for j in range_constexpr(DQ_PER_LANE):
                     acc[j] = fadd_scalar(acc[j], _vs[w][j])
+            # Issued once `acc` is ready and AFTER all five reads, so it never
+            # competes with them for the LDS pipe.
             dqg[dq_wrow, dq_fvec, None].store(
                 Vec.from_elements(acc, fx.Float32)
             )
-            # No fence between the write and the read: NEITHER group reads what
-            # it just wrote. g1 writes `dq_frow` and reads the permanently-zero
-            # row; g0 writes the sink row and reads the row g1 published a full
-            # barrier ago. A defensive lgkmcnt(0) here is a whole LDS round
-            # trip on the critical path of every gate phase.
-            _g = Vec(dqg[dq_rrow, dq_fvec, None].load())
             for j in range_constexpr(DQ_PER_LANE):
                 acc[j] = fadd_scalar(acc[j], _g[j])
 
