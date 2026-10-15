@@ -25,7 +25,6 @@ import argparse
 import csv
 import functools
 import itertools
-import sys
 from pathlib import Path
 
 import pandas as pd
@@ -41,7 +40,11 @@ from aiter.benchmark_data_init import (
 )
 from aiter.jit.core import get_asm_dir
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
-from aiter.ops.gemm_op_a4w4 import MXFP8_OUT_SCALE_BLOCK, unpack_mxfp8_out_scale
+from aiter.ops.gemm_op_a4w4 import (
+    MXFP8_OUT_SCALE_BLOCK,
+    get_f4gemm_launch_config,
+    unpack_mxfp8_out_scale,
+)
 from aiter.ops.shuffle import (
     shuffle_scale,
     shuffle_scale_f4,
@@ -64,7 +67,7 @@ SUPPORTED_GFX = ["gfx1250"]
 
 _OUT_DTYPE = {"bf16": dtypes.bf16, "fp8": dtypes.fp8}
 
-# gfx1250 F4GEMM .co is a persistent shader: it always launches PERSISTENT_TG
+# gfx1250 F4GEMM persistent shaders always launch PERSISTENT_TG
 # threadgroups regardless of problem size (must match the .co's WG_MAX).
 PERSISTENT_TG = 256
 
@@ -72,65 +75,110 @@ PERSISTENT_TG = 256
 @functools.lru_cache(None)
 def _manifest_configs():
     with (Path(get_asm_dir()) / "f4gemm/f4gemm.csv").open() as f:
-        return list(csv.DictReader(f))
+        return list(
+            csv.DictReader(line for line in f if not line.lstrip().startswith("#"))
+        )
 
 
 def _kernel_config(M, N, K, intype, outtype, apre, knl_name=None):
-    configs = _manifest_configs()
-    if knl_name and knl_name != "auto":
-        matches = [c for c in configs if c["knl_name"] == knl_name]
-        if not matches:
-            raise ValueError(f"kernel not in f4gemm manifest: {knl_name}")
-        return matches[0]
-    candidates = []
-    for c in configs:
-        if (c["intype"], c["outtype"], int(c["a_preshuffle"])) != (
+    knl = knl_name if knl_name and knl_name != "auto" else ""
+    launch = get_f4gemm_launch_config(
+        M, N, K, intype=intype, outtype=outtype, a_preshuffle=bool(apre), kernelName=knl
+    )
+    for cfg in _manifest_configs():
+        if knl and cfg["knl_name"] != knl:
+            continue
+        if (cfg["intype"], cfg["outtype"], int(cfg["a_preshuffle"])) != (
             intype,
             outtype,
             apre,
         ):
             continue
-        if int(c["ps_mode"]) == 0 and not (
-            M > 0
-            and N > 0
-            and K > 0
-            and M % 768 == 0
-            and N % 1024 == 0
-            and K % 256 == 0
-        ):
-            continue
-        candidates.append(c)
-    return min(candidates, key=lambda c: (int(c["ps_mode"]), c["knl_name"]))
+        if all(int(cfg[key]) == launch[key] for key in ("tile_m", "tile_n", "ps_mode")):
+            return {**cfg, **launch}
+    raise ValueError("selected kernel not in f4gemm manifest")
 
 
-def _report_active_tg(M, N, tile_m, tile_n, label, ps_mode=1):
-    """Warn when the persistent shader's TG slots aren't fully packed.
+def _report_active_tg(M, N, tile_m, tile_n, label, geometry, ps_mode=1):
+    """Report useful TGs using the shader's cluster/column-band tile walk.
 
-    The .co always launches PERSISTENT_TG (256) threadgroups. The real work is
-    ceil(M/tile_m) * ceil(N/tile_n) tiles; when that isn't a multiple of 256 the
-    final wave leaves the leftover TG slots idle (wasted CUs) -> "poor perf".
-    (Moved here from the cpp dispatch so the report lives with the test.)
+    Whole tiles added by cluster padding still execute in the shader. Counting
+    only (M_tiles * N_tiles) % 256 misreports both the tail and that extra work.
+    These are logical scheduling counts, not measured hardware CU occupancy.
     """
     tg_m = (M + tile_m - 1) // tile_m
     tg_n = (N + tile_n - 1) // tile_n
-    active_tg = tg_m * tg_n
+    cx, cy, gx, gy = geometry
     if ps_mode == 0:
         aiter.logger.info(
-            "dispatch to %s: PS mode=0, grid=%dx%d, %d TG", label, tg_n, tg_m, active_tg
+            "dispatch to %s: PS mode=0, cluster=%dx%d, HIP-grid=%dx%d, %d TG",
+            label,
+            cx,
+            cy,
+            gx * cx,
+            gy * cy,
+            tg_m * tg_n,
         )
-        return
-    wave_active = (
-        PERSISTENT_TG if active_tg % PERSISTENT_TG == 0 else active_tg % PERSISTENT_TG
+        return {
+            "cluster": f"{cx}x{cy}",
+            "cluster grid": f"{gx}x{gy}",
+            "TG waves": None,
+            "padding tiles": 0,
+            "first active TG": None,
+            "last active TG": None,
+        }
+    rows = (tg_m + cy - 1) // cy
+    cols = (tg_n + cx - 1) // cx
+    clusters = rows * cols
+    persistent_clusters = gx * gy
+    waves = (clusters + persistent_clusters - 1) // persistent_clusters
+    interior_cols = cols // gx * gx
+    interior_clusters = interior_cols * rows
+
+    def useful_tg(wave):
+        active = 0
+        start = wave * persistent_clusters
+        for flat in range(start, min(start + persistent_clusters, clusters)):
+            if flat < interior_clusters:
+                band, within_band = divmod(flat, gx * rows)
+                y, x = divmod(within_band, gx)
+                x += band * gx
+            else:
+                y, x = divmod(flat - interior_clusters, cols - interior_cols)
+                x += interior_cols
+            active += min(cx, tg_n - x * cx) * min(cy, tg_m - y * cy)
+        return active
+
+    first = useful_tg(0) if waves else 0
+    last = useful_tg(waves - 1) if waves else 0
+    padding = clusters * cx * cy - tg_m * tg_n
+    aiter.logger.info(
+        "dispatch to %s: cluster=%dx%d, cluster-grid=%dx%d, HIP-grid=%dx%d, "
+        "%d persistent wave(s), useful TG first/last=%d/%d of %d, "
+        "%d cluster-padding tile(s) (%d M-tiles x %d N-tiles)",
+        label,
+        cx,
+        cy,
+        gx,
+        gy,
+        gx * cx,
+        gy * cy,
+        waves,
+        first,
+        last,
+        PERSISTENT_TG,
+        padding,
+        tg_m,
+        tg_n,
     )
-    info = (
-        f"{label}: active {wave_active}/{PERSISTENT_TG} TG "
-        f"({tg_m} M-tiles x {tg_n} N-tiles, tile_m={tile_m}, tile_n={tile_n})"
-    )
-    if active_tg % PERSISTENT_TG == 0:
-        aiter.logger.info("dispatch to %s", info)
-    else:
-        tag = "\033[31mpoor perf\033[0m" if sys.stderr.isatty() else "poor perf"
-        aiter.logger.warning("dispatch to %s - %s!", info, tag)
+    return {
+        "cluster": f"{cx}x{cy}",
+        "cluster grid": f"{gx}x{gy}",
+        "TG waves": waves,
+        "padding tiles": padding,
+        "first active TG": first,
+        "last active TG": last,
+    }
 
 
 PERF_SHAPES = [(16384, 16384, 16384)]
@@ -139,6 +187,7 @@ FUNC_SHAPES = [
     (768, 1024, 256),
     (768, 1024, 1536),
     (768, 1024, 1792),
+    (1536, 24576, 1536),
     (1536, 7168, 16384),
     # pure_compute
     (256, 2048, 8192),
@@ -267,6 +316,8 @@ def _support_reason(outtype, apre, M, N, K):
     supported, else a short reason string (row marked "not support"). Mirrors
     the dispatch heuristic in asm_f4gemm.cu so shapes are skipped before the
     shuffle/prep step rather than crashing on an assert."""
+    if M <= 0 or N <= 0 or K <= 0:
+        return "M/N/K must be positive"
     if outtype not in _OUT_DTYPE:
         return f"outtype {outtype}"  # no kernel for this output format yet
     if K % 32 != 0:
@@ -483,7 +534,7 @@ def test_gemm(
             "gfx": get_gfx(),
             "knl_name": actual_knl,
             "tile": "256x256",
-            "cluster": "4x4",
+            "cluster": "n/a",
             "asm us": float("nan"),
             "asm TFLOPS": float("nan"),
             "asm TB/s": float("nan"),
@@ -585,10 +636,12 @@ def test_gemm(
         # Missing ASM kernels must not silently pass a requested comparison.
         ret["gluon bitmatch"] = "not checked"
     ret["tile"] = f'{cfg["tile_m"]}x{cfg["tile_n"]}'
-    ret["cluster"] = f'{cfg["cluster_x"]}x{cfg["cluster_y"]}'
-    ret["ps_mode"] = int(cfg["ps_mode"])
-    _report_active_tg(
-        M, N, int(cfg["tile_m"]), int(cfg["tile_n"]), base, int(cfg["ps_mode"])
+    ret["ps_mode"] = cfg["ps_mode"]
+    geometry = tuple(cfg[key] for key in ("cluster_x", "cluster_y", "grid_x", "grid_y"))
+    ret.update(
+        _report_active_tg(
+            M, N, cfg["tile_m"], cfg["tile_n"], base, geometry, cfg["ps_mode"]
+        )
     )
     # Only a missing .co is reported as "not support"; any other failure (OOM,
     # memory fault, shape assert, ...) must propagate, not show as a green cell.
@@ -934,8 +987,7 @@ def main():
         aiter.logger.info(
             "wrote JSON summary (%d rows) to %s", len(df_full), args.json_out
         )
-    # Keep knl_name (the actual .co) + tile; drop columns constant within a table
-    # (cluster is always 4x4).
+    # Keep the actual kernel and runtime geometry; detailed TG counts stay in JSON.
     df = df_full.drop(
         columns=[
             "seed",
@@ -946,6 +998,8 @@ def main():
             "test_graph",
             "num_rotate",
             "check_gluon",
+            "first active TG",
+            "last active TG",
         ],
         errors="ignore",
     )

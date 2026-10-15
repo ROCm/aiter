@@ -303,7 +303,7 @@ def gemm_a4w4_asm(
 
 
 @compile_ops(
-    "module_f4gemm_asm_nps",
+    "module_f4gemm_asm_nps_dispatch",
     fc_name="mxfp4_gemm_asm",
     ffi_type="ctypes",
 )
@@ -320,7 +320,7 @@ def _mxfp4_gemm_asm(
 
 
 @compile_ops(
-    "module_f4gemm_asm_nps",
+    "module_f4gemm_asm_nps_dispatch",
     fc_name="nvfp4_gemm_asm",
     ffi_type="ctypes",
 )
@@ -341,6 +341,54 @@ def _nvfp4_gemm_asm(
 # gfx1250 f4gemm mxfp8-output block size along N: the kernel dynamically
 # quantizes each 128-wide output block to fp8 e4m3 and emits one E8M0 scale.
 MXFP8_OUT_SCALE_BLOCK = 128
+
+
+@compile_ops(
+    "module_f4gemm_asm_nps_dispatch",
+    fc_name="f4gemm_launch_config",
+    ffi_type="ctypes",
+)
+def _f4gemm_launch_config(
+    M: int,
+    N: int,
+    K: int,
+    intype: str,
+    outtype: str,
+    a_preshuffle: int,
+    kernelName: str | None,
+    field: int,
+) -> int: ...
+
+
+def get_f4gemm_launch_config(
+    M: int,
+    N: int,
+    K: int,
+    *,
+    intype: str = "mxfp4",
+    outtype: str = "bf16",
+    a_preshuffle: bool = False,
+    kernelName: str = "",
+) -> dict[str, int]:
+    """Return the selected tile, PS mode and launch geometry for gfx1250 F4GEMM.
+
+    Grid dimensions count clusters. Use this query outside the timed GEMM path.
+    """
+    fields = (
+        "cluster_x",
+        "cluster_y",
+        "grid_x",
+        "grid_y",
+        "tile_m",
+        "tile_n",
+        "ps_mode",
+    )
+    return {
+        name: _f4gemm_launch_config(
+            M, N, K, intype, outtype, int(a_preshuffle), kernelName or None, field
+        )
+        for field, name in enumerate(fields)
+    }
 
 
 def _is_mxfp8_out(dtype: torch.dtype) -> bool:

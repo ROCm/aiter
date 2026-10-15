@@ -1,3 +1,5 @@
+# Persistent kernels select runtime cluster/grid dimensions; 4x4 is the default.
+# The 192x256 NPS kernel requires the registered 4x4 cluster.
 tile_m,tile_n,intype,a_preshuffle,cluster_x,cluster_y,scale,outtype,knl_name,co_name,ps_mode
 256,256,mxfp4,1,4,4,1,bf16,_ZN5aiter45f4gemm_bf16_mxfp4_ABpreShuffle_256x256_4x4_psE,f4gemm_bf16_mxfp4_ABpreShuffle_256x256_4x4_ps.co,1
 256,256,mxfp4,1,4,4,1,fp8,_ZN5aiter44f4gemm_fp8_mxfp4_ABpreShuffle_256x256_4x4_psE,f4gemm_fp8_mxfp4_ABpreShuffle_256x256_4x4_ps.co,1
