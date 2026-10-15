@@ -1094,6 +1094,19 @@ def build_hstu_attention_bwd_fused_pp(
                 Vec(dqg[dq_rrow, dq_fvec, None].load()),
             )
 
+        def dq_absorb(acc, v):
+            """Fold one staged slot into the running sum.
+
+            Called BETWEEN gate stages, one slot at a time, so the backend
+            puts each `s_waitcnt lgkmcnt(N)` at a different point in the chain
+            instead of clustering all five where the reduction used to sit.
+            It also lets each slot's 4 VGPRs die as it is consumed, instead of
+            all 20 living to the end of the phase.
+            """
+            return [
+                fadd_scalar(acc[j], v[j]) for j in range_constexpr(DQ_PER_LANE)
+            ]
+
         def dq_reduce_flush(q_tile_v, _issued):
             """Sum the 8 per-wave dQ partials for q tile `q_tile_v - 1` and store.
 
@@ -1125,19 +1138,16 @@ def build_hstu_attention_bwd_fused_pp(
             # `ds_read_b128` alone (5.7% of all stall, 239/exec). Four live
             # buffers cost 16 VGPR against 46 spare, and push every `lgkmcnt`
             # further from the read it covers.
-            # All five reads were issued by `dq_flush_issue` at the top of the
-            # phase. The group-exchange read is one of them: it depends on
-            # nothing computed here -- the other group published that row a
-            # full barrier ago -- and the two rows are disjoint, so it is safe
-            # ahead of the write below. g1 writes `dq_frow` and reads the
+            # The four per-wave slots were already folded in by `dq_absorb`,
+            # interleaved with the gate. Only the group exchange is left.
+            #
+            # That fifth read was issued with the other four and depends on
+            # nothing computed here -- the other group published its row a full
+            # barrier ago -- and the two rows are disjoint, so it is safe ahead
+            # of the write below. g1 writes `dq_frow` and reads the
             # permanently-zero row; g0 writes a sink row and reads the one g1
             # published last interval. Neither group reads what it wrote.
-            _vs, _g = _issued
-
-            acc = [fx.Float32(0.0) for _ in range_constexpr(DQ_PER_LANE)]
-            for w in range_constexpr(NUM_WAVES // 2):
-                for j in range_constexpr(DQ_PER_LANE):
-                    acc[j] = fadd_scalar(acc[j], _vs[w][j])
+            acc, _g = _issued
             # The own-group sum is kept aside so the exchange write can be
             # issued LAST, after the HBM store -- as far from the five reads as
             # this phase allows. Next to them it stalled 3.06 M cycles (3.8% of
@@ -1388,6 +1398,17 @@ def build_hstu_attention_bwd_fused_pp(
             group is in phase M on the matrix core, so the LDS and store units
             are otherwise idle for the whole interval.
             """
+            # PINNED at the very head of phase V by the `sched_barrier`
+            # below. Source placement alone does not hold: the scheduler sinks
+            # these loads toward their use to shorten the live range of the 20
+            # VGPRs they fill, and it did so from every position tried --
+            # measured at 54 VALU ops deep even when written right after the
+            # exp2 batch. The fence is the only way to choose the issue cycle.
+            if const_expr(dq_mode in ("full", "dswrite", "notrans")):
+                _dq_vs, _dq_g = dq_flush_issue()
+                _dq_acc = [fx.Float32(0.0) for _ in range_constexpr(DQ_PER_LANE)]
+            rocdl.sched_barrier(0)
+
             # Batched a stage at a time across ALL KV_OWNED_SUBTILES *
             # MFMA_ELEMS_PER_LANE elements, not one element at a time. The gate
             # is a ~10-deep serial dependency chain per element with two
@@ -1418,21 +1439,14 @@ def build_hstu_attention_bwd_fused_pp(
                 # k_packs), so only the exp2 argument needs a multiply.
                 sc = s
                 emu = [exp2_f32(fmul_const_scalar(sc[j], c_neg_log2e)) for j in rng]
-                # The five flush reads are issued HERE, a third of the way into
-                # the gate, rather than at the top of the phase.
-                #
-                # At the top they land in the same cycles as the partner
-                # group's phase-M head, which opens with eleven operand
-                # `ds_read`s of its own -- two waves per SIMD sharing one LDS
-                # issue port, and the trace charged the fifth read 3.7% of all
-                # stall for it. By here the partner is mid-MFMA-burst and the
-                # port is quiet. The sixteen quarter-rate `exp2` above and the
-                # whole chain below still cover the latency; only the issue
-                # cycle moves.
                 if const_expr(dq_mode in ("full", "dswrite", "notrans")):
-                    _dq_issued = dq_flush_issue()
+                    _dq_acc = dq_absorb(_dq_acc, _dq_vs[0])
                 sig = [rcp_scalar(addone_scalar(emu[j])) for j in rng]
+                if const_expr(dq_mode in ("full", "dswrite", "notrans")):
+                    _dq_acc = dq_absorb(_dq_acc, _dq_vs[1])
                 silu = [fmul_scalar(sc[j], sig[j]) for j in rng]
+                if const_expr(dq_mode in ("full", "dswrite", "notrans")):
+                    _dq_acc = dq_absorb(_dq_acc, _dq_vs[2])
                 # silu'(z) = sig*(1 + z*(1 - sig)) = sig + silu*(1 - sig).
                 # The second form is a subtract plus an FMA, against the first
                 # form's sub/mul/add/mul -- 2 VALU per element instead of 4, and
@@ -1446,6 +1460,8 @@ def build_hstu_attention_bwd_fused_pp(
                 # No `c_inv_n` here: dS is linear in it, so it rides along to the
                 # dK epilogue and is folded into that store's existing scale.
                 # Saves one multiply per element.
+                if const_expr(dq_mode in ("full", "dswrite", "notrans")):
+                    _dq_acc = dq_absorb(_dq_acc, _dq_vs[3])
                 gated = [fmul_scalar(grad[j], da[j]) for j in rng]
                 p_vals = [flat_keep[j].select(silu[j], c_zero_f) for j in rng]
                 ds_vals = [flat_keep[j].select(gated[j], c_zero_f) for j in rng]
@@ -1460,7 +1476,7 @@ def build_hstu_attention_bwd_fused_pp(
             ]
             # Consumed LAST, so the gate above is the reads' cover.
             if const_expr(dq_mode in ("full", "dswrite", "notrans")):
-                dq_reduce_flush(q_start // fx.Int32(BLOCK_N), _dq_issued)
+                dq_reduce_flush(q_start // fx.Int32(BLOCK_N), (_dq_acc, _dq_g))
             return p_packs, ds_packs
 
         # ---- the pipeline ---------------------------------------------------
