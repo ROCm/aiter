@@ -9,10 +9,16 @@ range, written to an HBM scratch that `hstu_attention_bwd_dq_reduce.py` sums.
 Split-K and not atomics because fp atomics are a 0.40 TB/s wall while plain
 stores run at 3.56 TB/s -- 8.8x, measured.
 
-Geometry is (256, 16, 8), NOT the twin's 384: the fused kernel spills 10
-registers at 384 and fits with 60 to spare at 256. That shape is only
-trustworthy as of e2a81264d, which fixed a prologue publish-ordering bug that
-made every geometry except 384 nondeterministic.
+Geometry is (256, 16, 8), NOT the twin's 384. 384 spills 21 registers --
+KV_OWNED_SUBTILES=3 costs 74 VGPR over KV=2 and the dQ state adds ~46 more --
+and measures 503.7 ms against 461.0 at 256, even though it removes the
+geometry penalty entirely (nodq 220.4 vs dvdk_pp's 219.2) and cuts the
+reduction pass by a third (36.9 vs 52.0 ms). The spills cost +58 ms on the
+kernel, more than both gains together. BLOCK_M quantises to 128 (8 waves x
+MFMA_M 16), so 256 and 384 are the only candidates; there is nothing between.
+
+(256, 16, 8) is only trustworthy as of e2a81264d, which fixed a prologue
+publish-ordering bug that made every geometry except 384 nondeterministic.
 
 Everything below this line is inherited from the twin.
 
@@ -161,7 +167,7 @@ def validate_hstu_attention_bwd_fused_pp(
         )
     if (block_m, block_n, num_waves) != (256, 16, 8):
         raise ValueError(
-            "hstu bwd dvdk ping-pong requires (block_m, block_n, num_waves) = "
+            "hstu bwd fused requires (block_m, block_n, num_waves) = "
             f"(256, 16, 8), got ({block_m}, {block_n}, {num_waves}). 8 waves give "
             "2 per SIMD inside one barrier domain. 384 is the dV/dK twin's shape "
             "and is 6.9% faster in isolation, but the FUSED kernel does not "
@@ -277,7 +283,11 @@ def build_hstu_attention_bwd_fused_pp(
     # PER-WAVE PRIVATE -- a wave transposes only its own kv rows -- so it
     # needs no barrier, only `s_waitcnt lgkmcnt`, and it does not rotate, so
     # it does not force UNROLL to lcm(...).
-    FT_ELEMS = NUM_WAVES * KV_OWNED_SUBTILES * MFMA_M * MFMA_M
+    # ONE transpose slot per wave, not one per subtile: the calls are
+    # sequential and each ends with an lgkmcnt(0) after its reads, so the next
+    # write cannot pass them. Per-subtile slots would be 12,288 B at BLOCK_M
+    # 384, which with the dQ buffers overruns LDS by 3,104 B.
+    FT_ELEMS = NUM_WAVES * MFMA_M * MFMA_M
     # dQ reduction buffer: one BLOCK_N x head_dim fp32 tile per UNROLL slot.
     # The row stride is padded by 4 dwords. Unpadded, the four quarter-waves of
     # a `ds_add_f32` sit 4*head_dim = 256 dwords apart, which is 0 mod 64 banks
@@ -516,13 +526,12 @@ def build_hstu_attention_bwd_fused_pp(
 
         ft_view = lds.ft.view(
             fx.make_layout(
-                (NUM_WAVES * KV_OWNED_SUBTILES, MFMA_M, MFMA_M // MFMA_LANE_K,
-                 MFMA_LANE_K),
+                (NUM_WAVES, MFMA_M, MFMA_M // MFMA_LANE_K, MFMA_LANE_K),
                 (MFMA_M * MFMA_M, MFMA_M, MFMA_LANE_K, 1),
             )
         )
 
-        def transpose_frag(frag, slot):
+        def transpose_frag(frag):
             """16x16 fragment transpose, A-layout <-> C-layout.
 
             dQ reduces over kv, but in BOTH MFMA operand layouts a lane's four
@@ -541,7 +550,7 @@ def build_hstu_attention_bwd_fused_pp(
             shape as the q_t/do_t build. Per-wave private, so `lgkmcnt` alone
             orders it; the trailing wait lets a caller reuse a slot.
             """
-            _i = wave_id * fx.Int32(KV_OWNED_SUBTILES) + fx.Int32(slot)
+            _i = wave_id
             ft_view[_i, lane_mod_16, lane_div_16, None].store(Vec(frag))
             # `s_waitcnt` alone is NOT enough. Unlike the q_t/do_t build --
             # which writes t_cur and reads t_prev, two different slots -- this
@@ -1114,7 +1123,7 @@ def build_hstu_attention_bwd_fused_pp(
                 ds_t = [ds_prev[og] for og in range_constexpr(KV_OWNED_SUBTILES)]
             elif const_expr(dq_mode != "nodq"):
                 ds_t = [
-                    transpose_frag(ds_prev[og], og)
+                    transpose_frag(ds_prev[og])
                     for og in range_constexpr(KV_OWNED_SUBTILES)
                 ]
 
@@ -1399,7 +1408,7 @@ def build_hstu_attention_bwd_fused_pp(
             for ks in range_constexpr(K_STEPS):
                 per_og = []
                 for og in range_constexpr(KV_OWNED_SUBTILES):
-                    per_og.append(transpose_frag(k_packs[ks][og], 0))
+                    per_og.append(transpose_frag(k_packs[ks][og]))
                 kt_packs.append(per_og)
 
             acc_init = [c_zero_v4f32 for _ in range_constexpr(N_ACC)] + [
