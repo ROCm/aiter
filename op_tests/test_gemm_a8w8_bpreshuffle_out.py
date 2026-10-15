@@ -22,6 +22,7 @@ from aiter.ops import gemm_op_a8w8
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
+# gfx1250 is excluded on purpose: gemm_a8w8_bpreshuffle_out rejects it at runtime.
 SUPPORTED_GFX = ["gfx942", "gfx950"]
 
 # get_gfx is get_gfx_runtime: gemm_op_a8w8 dispatches and looks up tuned rows
@@ -195,6 +196,19 @@ def test_input_on_another_device_rejected_before_launch(cpu_arg):
 
     with pytest.raises(ValueError, match="same device"):
         aiter.gemm_a8w8_bpreshuffle_out(out, *args.values())
+    assert torch.all(out == 3.0)
+
+
+def test_gfx1250_rejected_before_launch(monkeypatch):
+    # The shared dispatch would pick the gfx1250 WMMA backend, which this op
+    # does not support; the arch is patched so the check runs on every card.
+    m, n, k = 32, 256, 512
+    xq, wq, x_scale, w_scale = _inputs(m, n, k)
+    out = torch.full((m, n), 3.0, dtype=dtypes.bf16, device="cuda")
+    monkeypatch.setattr(gemm_op_a8w8, "get_gfx", lambda: "gfx1250")
+
+    with pytest.raises(NotImplementedError, match="gfx1250"):
+        gemm_op_a8w8.gemm_a8w8_bpreshuffle_out(out, xq, wq, x_scale, w_scale)
     assert torch.all(out == 3.0)
 
 

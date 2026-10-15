@@ -845,8 +845,14 @@ def gemm_a8w8_bpreshuffle_out(
     tuned rows select, write bf16 only.
     CK and CKTile write a dense row-major [M, N], so a strided ``out`` (e.g. a
     column slice of a wider buffer) is rejected instead of being written past
-    its bounds. Every check runs before any kernel launch.
+    its bounds. Every check runs before any kernel launch. gfx1250 is rejected:
+    its WMMA backend is reachable through the shared dispatch but unvalidated.
     """
+    if get_gfx() == "gfx1250":
+        raise NotImplementedError(
+            "gemm_a8w8_bpreshuffle_out is not supported on gfx1250; "
+            "use gemm_a8w8_bpreshuffle"
+        )
     # The dispatcher reads K from shape[-1] but the CK launcher reads size(1),
     # so any other rank would tune for one K and launch with another.
     if XQ.ndim != 2 or WQ.ndim != 2:
