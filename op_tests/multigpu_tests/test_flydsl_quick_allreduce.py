@@ -139,18 +139,18 @@ from aiter.test_common import benchmark, checkAllclose
 set_start_method("spawn", force=True)
 
 from aiter.ops.flydsl import allreduce_policy as fly_policy
-from aiter.ops.flydsl.allreduce_policy import mesh_st_ladder, ring_st_ladder
-from aiter.ops.flydsl.kernels.comm.allreduce_shared import (
-    ATOMS,
-    BLOCK,
-    DEFAULT_GRID_CAP,
+from aiter.ops.flydsl.allreduce_policy import (
     MAX_PAYLOAD_BYTES,
     SUPPORTED_ARCHS,
     SUPPORTED_BLOCKS,
     SUPPORTED_WORLDS,
-    TwoShotRung,
+    mesh_st_ladder,
+    ring_st_ladder,
 )
 from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import clamp_grid_cap
+from aiter.ops.flydsl.kernels.comm.transport import (
+    ATOMS,
+)
 from aiter.ops.flydsl.quick_allreduce import (
     _resolve_inbox_flags,
     batches_publishes,
@@ -462,7 +462,7 @@ def _rung_grids(world_size: int, ladder: tuple) -> dict[tuple, int]:
         grids.setdefault(
             (rung.super_tile, rung.block),
             clamp_grid_cap(
-                min(rung.grid_cap, DEFAULT_GRID_CAP),
+                rung.grid_cap,
                 arch=ARCH,
                 world_size=world_size,
                 super_tile=rung.super_tile,
@@ -695,27 +695,16 @@ def _test_ladder(
     grid_cap: int | None = None,
     block: int | None = None,
 ) -> tuple:
-    """The ladder of a test engine, from the knobs this test pins.
-
-    *super_tile* pins that super-tile for every payload size, as one rung at
-    *grid_cap* (default ``DEFAULT_GRID_CAP``) and *block* (default ``BLOCK``).
-    Otherwise the production ladder runs, with *block* overriding and
-    *grid_cap* bounding every rung.
+    """The ladder of a test engine, from the knobs this test pins: the
+    production ladder, with *super_tile* and *block* overriding and *grid_cap*
+    bounding every rung.
     """
-    if super_tile is not None:
-        return (
-            TwoShotRung(
-                min_bytes=0,
-                super_tile=int(super_tile),
-                grid_cap=DEFAULT_GRID_CAP if grid_cap is None else int(grid_cap),
-                block=BLOCK if block is None else int(block),
-            ),
-        )
     link = fly_policy.detect_link()
     ladder = _ladder(algorithm, world_size, link)
     return tuple(
         dataclasses.replace(
             r,
+            super_tile=r.super_tile if super_tile is None else int(super_tile),
             grid_cap=r.grid_cap if grid_cap is None else min(r.grid_cap, grid_cap),
             block=r.block if block is None else int(block),
         )
@@ -738,9 +727,7 @@ def _engine(rank: int, tp: int, gloo, device, engine_kw: dict):
         if k in engine_kw
     }
     if knobs:
-        engine_kw["ladder"] = _test_ladder(
-            engine_kw.get("algorithm", "mesh"), tp, **knobs
-        )
+        engine_kw["ladder"] = _test_ladder(engine_kw["algorithm"], tp, **knobs)
     fly = FlyQuickAllReduce(
         group=gloo,
         device=device,
@@ -2287,7 +2274,7 @@ def _host_padded_hidden_limits() -> list[str]:
 
 
 def _padded_pick(hidden: int, world_size: int):
-    from aiter.ops.flydsl.kernels.comm.allreduce_shared import BLOCK_ALIGN
+    from aiter.ops.flydsl.allreduce_policy import BLOCK_ALIGN
     from aiter.ops.flydsl.kernels.comm.quick_allreduce_fusions import (
         _quick_reduce_atoms_choices,
         padded_row_block,
@@ -2323,7 +2310,13 @@ def _host_mesh_fanout_quad_budget_gates_narrow_blocks() -> list[str]:
         "hidden=1024 tp=8 factory",
         "quads",
         lambda: make_quick_allreduce_mesh_kernel(
-            world_size=8, grid=64, rank=0, fusion="rmsnorm", hidden=1024
+            world_size=8,
+            grid=64,
+            inbox_memory="uncached",
+            codec="int4",
+            rank=0,
+            fusion="rmsnorm",
+            hidden=1024,
         ),
     )
     for world_size in SUPPORTED_WORLDS:
@@ -2333,6 +2326,8 @@ def _host_mesh_fanout_quad_budget_gates_narrow_blocks() -> list[str]:
                 make_quick_allreduce_mesh_kernel(
                     world_size=world_size,
                     grid=64,
+                    inbox_memory="uncached",
+                    codec="int4",
                     rank=0,
                     fusion="rmsnorm",
                     hidden=block * 8,

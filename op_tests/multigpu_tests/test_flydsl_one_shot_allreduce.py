@@ -112,6 +112,7 @@ world size when fewer GPUs are visible than TP.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import itertools
 import json
 import os
@@ -151,19 +152,13 @@ from aiter.test_common import benchmark, checkAllclose
 set_start_method("spawn", force=True)
 
 from aiter.ops.flydsl import allreduce_policy as fly_policy
-from aiter.ops.flydsl.allreduce_policy import oneshot_ladder
-from aiter.ops.flydsl.kernels.comm.allreduce_shared import (
+from aiter.ops.flydsl.allreduce_policy import (
     SUPPORTED_ARCHS,
     SUPPORTED_BLOCKS,
     SUPPORTED_WORLDS,
     FusedOneShotRung,
-    OneShotRung,
-)
-from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import (
-    DEFAULT_ATOMS,
-    DEFAULT_BLOCK,
-    DEFAULT_FANOUT,
-    DEFAULT_GRID_CAP,
+    detect_link,
+    oneshot_ladder,
 )
 
 try:
@@ -531,18 +526,21 @@ def _init_dist(rank: int, tp: int, init_method: str, stock: bool):
     return get_tp_group()
 
 
-def _test_ladder(atoms=None, grid_cap=None, fanout=None, block=None) -> tuple:
-    """One rung with the knobs this test pins, for every payload size. An
-    unpinned knob takes the kernel's default."""
-    return (
-        OneShotRung(
-            min_bytes=0,
-            atoms=DEFAULT_ATOMS if atoms is None else atoms,
-            grid_cap=DEFAULT_GRID_CAP if grid_cap is None else grid_cap,
-            fanout=DEFAULT_FANOUT if fanout is None else fanout,
-            block=DEFAULT_BLOCK if block is None else block,
-        ),
-    )
+def _test_ladder(tp: int, atoms=None, grid_cap=None, fanout=None, block=None):
+    """The production ladder with the knobs this test pins overriding that
+    field on every rung. An unpinned knob keeps the ladder's value."""
+    pins = {
+        name: value
+        for name, value in (
+            ("atoms", atoms),
+            ("grid_cap", grid_cap),
+            ("fanout", fanout),
+            ("block", block),
+        )
+        if value is not None
+    }
+    ladder = oneshot_ladder(world_size=tp, link=detect_link())
+    return tuple(dataclasses.replace(r, **pins) for r in ladder)
 
 
 def _engine(rank: int, tp: int, group, device, engine_kw: dict):
@@ -563,7 +561,7 @@ def _engine(rank: int, tp: int, group, device, engine_kw: dict):
         # covers. Lifted so the shape list stays free to include sizes
         # production would route elsewhere.
         max_bytes=1 << 30,
-        ladder=_test_ladder(**engine_kw) if engine_kw else None,
+        ladder=_test_ladder(tp, **engine_kw) if engine_kw else None,
     )
     eng.preload()
     return eng
@@ -1490,9 +1488,9 @@ def _fused_spawn(
     world_size: int,
     pairs: list[tuple[int, int]],
     *,
-    atoms: int | None = DEFAULT_ATOMS,
-    grid_cap: int | None = DEFAULT_GRID_CAP,
-    fanout: str | None = DEFAULT_FANOUT,
+    atoms: int | None = None,
+    grid_cap: int | None = None,
+    fanout: str | None = None,
     block: int | None = None,
     mode: str = "fused",
     iters: int = RUN_AHEAD_ITERS,
@@ -1796,7 +1794,7 @@ def _batch_cache_lookup(
     """
     if key not in _BATCH_CACHE:
         world_size, mode = key[0], key[1]
-        spawn_kwargs.setdefault("atoms", key[2] if len(key) > 2 else DEFAULT_ATOMS)
+        spawn_kwargs.setdefault("atoms", key[2] if len(key) > 2 else None)
         ranks = _fused_spawn(world_size, pairs, mode=mode, **spawn_kwargs)
         _BATCH_CACHE[key] = _index_by_shape(ranks, pairs)
     return _BATCH_CACHE[key]
@@ -1841,9 +1839,7 @@ def test_one_shot_allreduce_rmsnorm_padded(m, hidden, label, world_size):
     # key[2] is read as ``atoms`` by ``_batch_cache_lookup``; the trailing
     # "pad" is only there to keep this group's spawn out of the plain fused
     # cache entry, which shares both the mode and the atoms value.
-    batch = _batch_cache_lookup(
-        (world_size, "fused", DEFAULT_ATOMS, "pad"), group_pairs
-    )
+    batch = _batch_cache_lookup((world_size, "fused", None, "pad"), group_pairs)
     for rank, bad in enumerate(batch[(m, hidden)]):
         assert not bad, f"{label}, tp={world_size}, rank {rank}: " + "; ".join(bad)
 
@@ -1900,8 +1896,8 @@ def test_one_shot_allreduce_rmsnorm_padded_hidden_limits():
     ``SUPPORTED_ATOMS`` (4), i.e. 32768. Past it, and off the atom grid, the
     host raises naming the constraint rather than building something else.
     """
+    from aiter.ops.flydsl.allreduce_policy import SUPPORTED_ATOMS
     from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import (
-        SUPPORTED_ATOMS,
         fused_padded_block,
         fused_padded_block_options,
     )
@@ -2152,8 +2148,8 @@ def test_one_shot_allreduce_rmsnorm_split_options():
     row in whole waves, and every wave of the row fits the exchange word's
     arrival count.
     """
+    from aiter.ops.flydsl.allreduce_policy import SUPPORTED_SPLITS
     from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import (
-        SUPPORTED_SPLITS,
         fused_block_options,
         fused_split_options,
     )
@@ -2192,13 +2188,24 @@ def test_one_shot_allreduce_rmsnorm_split_factory():
     base = {
         "world_size": 4,
         "grid": 64,
+        "inbox_memory": "uncached",
+        "fanout": "peer",
         "rank": 0,
         "fusion": "rmsnorm",
         "hidden": 7168,
         "atoms": 1,
     }
     with pytest.raises(ValueError, match="only meaningful for a fused"):
-        mk(world_size=4, grid=64, rank=0, split=2)
+        mk(
+            world_size=4,
+            atoms=1,
+            grid=64,
+            inbox_memory="uncached",
+            fanout="peer",
+            block=256,
+            rank=0,
+            split=2,
+        )
     with pytest.raises(ValueError, match="split must be one of"):
         mk(**base, split=3)
     with pytest.raises(ValueError, match="needs a native geometry"):
@@ -2408,9 +2415,6 @@ def _verify_fused(tps) -> None:
         fused_ranks = _fused_spawn(
             tp,
             fused_pairs,
-            atoms=DEFAULT_ATOMS,
-            grid_cap=DEFAULT_GRID_CAP,
-            fanout=DEFAULT_FANOUT,
             mode="fused",
         )
         fused_fails = [

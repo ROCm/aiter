@@ -30,7 +30,7 @@ every codec, and all in-kernel arithmetic is packed fp16. Two limits follow.
 many blocks a payload gets.
 
 Imported by the mesh and ring kernels, which must agree on it byte for byte.
-Depends on ``allreduce_shared`` for ``BLOCK``, ``WAVE`` and ``I32_BYTES``.
+Depends on ``transport`` for ``BLOCK``, ``WAVE`` and ``I32_BYTES``.
 """
 
 import functools
@@ -40,17 +40,18 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, range_constexpr
 
-from ..kernels_common import ceildiv
-from .allreduce_shared import (
-    BLOCK,
+from ...allreduce_policy import (
     BLOCK_ALIGN,
-    I32_BYTES,
     MAX_BLOCK,
     SUPPORTED_BLOCKS,
+)
+from ..kernels_common import ceildiv
+from .transport import (
+    BLOCK,
+    I32_BYTES,
     WAVE,
 )
 
-SUPER_TILES = (1, 8)
 # Two threads (PAIR) share one E4M3; GROUP threads share the i32 slot.
 GROUP = 8
 PAIR = 2

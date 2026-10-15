@@ -44,27 +44,23 @@ from .allreduce_host_shared import (
     require_arch,
 )
 from .allreduce_policy import (
+    AG_CODECS,
+    MESH_CODECS,
     MIN_BATCH_BLOCKS,
-    RS_INT6_MIN_WORLD,
+    PAD_MASK_MAX_BYTES,
+    RING_SUPER_TILES,
+    RS_CODECS,
+    SUPER_TILES,
+    FusedTwoShotRung,
+    TwoShotRung,
+    default_codecs,
     fused_mesh_st_ladder,
     fused_ring_st_ladder,
     mesh_st_ladder,
+    quantized_floor,
     resolve_link,
     ring_st_ladder,
-)
-from .kernels.comm.allreduce_shared import (
-    ATOMS,
-    DEFAULT_GRID_CAP,
-    QUANT_MIN_PAYLOAD_BYTES,
-    WAVE,
-    WORLD,
-    FusedTwoShotRung,
-    TwoShotRung,
-    has_release_fence,
     select_rung,
-)
-from .kernels.comm.quick_allreduce_fusions import (
-    PAD_MASK_MAX_BYTES as _PAD_MASK_MAX_BYTES,
 )
 from .kernels.comm.quick_allreduce_fusions import (
     quick_reduce_padded_row_block_options,
@@ -73,17 +69,17 @@ from .kernels.comm.quick_allreduce_fusions import (
     quick_reduce_row_block_options,
 )
 from .kernels.comm.quick_allreduce_mesh import (
-    MESH_CODECS,
-    SUPER_TILES,
     clamp_grid_cap,
     make_quick_allreduce_mesh_kernel,
     mesh_fanout_fits,
 )
 from .kernels.comm.quick_allreduce_ring import (
-    AG_CODECS,
-    RING_SUPER_TILES,
-    RS_CODECS,
     make_quick_allreduce_ring_kernel,
+)
+from .kernels.comm.transport import (
+    ATOMS,
+    WAVE,
+    has_release_fence,
 )
 from .kernels.tensor_shim import _preload_compiled, _run_compiled
 
@@ -162,11 +158,10 @@ ALGORITHMS = {
         fused_st_ladder=fused_ring_st_ladder,
     ),
 }
-DEFAULT_ALGORITHM = "mesh"
 
 
 def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
-    """Codecs for one engine: explicit argument > per-N default.
+    """Codecs for one engine: explicit argument > ``default_codecs``.
 
     ``None`` means "not specified", and the caller is expected to pass it
     whenever it wants the schedule's own default rather than a pinned wire
@@ -174,9 +169,7 @@ def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
     lap defaults to INT6: an explicit ``rs_codec="int4"`` there is a real
     downgrade, not a restatement of the default.
 
-    A codec the selected schedule cannot build raises. The per-N *default*
-    silently narrows to what the schedule supports -- the mesh has no INT6
-    path, so TP8's INT6 reduce-scatter default does not leak into it.
+    A codec the selected schedule cannot build raises.
 
     The mesh has one wire format for both laps, so there ``rs_codec`` and
     ``ag_codec`` follow each other: give either one and the other takes the
@@ -185,24 +178,17 @@ def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
     if algo.name == "mesh" and (rs_codec is None) != (ag_codec is None):
         rs_codec = ag_codec = rs_codec if rs_codec is not None else ag_codec
 
-    rs_default = "int6" if world_size >= RS_INT6_MIN_WORLD else "int4"
-
-    # The all-gather lap forwards bytes verbatim and so contributes exactly one
-    # quantization. It is the dominant error term if the RS lap is INT6.
-    ag_default = "int4"
+    rs_default, ag_default = default_codecs(algo.name, world_size)
 
     def _pick(requested, default, supported, label):
-        if requested is not None:
-            if requested not in supported:
-                raise ValueError(
-                    f"{label} must be one of {supported} for "
-                    f"algorithm={algo.name!r}, got {requested!r}"
-                )
-            return requested
-        # The default is a property of the world size, not of the schedule.
-        if default not in supported:
-            default = supported[0]
-        return default
+        if requested is None:
+            return default
+        if requested not in supported:
+            raise ValueError(
+                f"{label} must be one of {supported} for "
+                f"algorithm={algo.name!r}, got {requested!r}"
+            )
+        return requested
 
     resolved_rs = _pick(rs_codec, rs_default, algo.rs_codecs, "rs_codec")
     resolved_ag = _pick(ag_codec, ag_default, algo.ag_codecs, "ag_codec")
@@ -227,7 +213,7 @@ class FlyQuickAllReduce:
     ``algorithm`` selects the schedule. Both are two-shot -- reduce-scatter
     then all-gather -- so they are named for the topology of each lap:
 
-    * ``"mesh"`` (default): each rank pushes to every one of the ``N-1``
+    * ``"mesh"``: each rank pushes to every one of the ``N-1``
       peers, twice. Two hops. Optimal on a meshed xGMI node.
     * ``"ring"``: ``2(N-1)`` hops, each a single contiguous run into exactly
       one peer's inbox. Same wire volume (``2(N-1)/N`` of the payload), traded
@@ -250,7 +236,8 @@ class FlyQuickAllReduce:
       before the flag goes out write-through (``sc0 sc1``).
 
     ``min_bytes`` is the payload below which ``allreduce`` refuses to run,
-    defaulting to ``QUANT_MIN_PAYLOAD_BYTES``.
+    defaulting to where the policy's mesh and ring windows start
+    (``quantized_floor``).
 
     ``link`` selects the tuning ladder and is detected from the KFD topology
     when not given. ``ladder`` replaces the tuning ladder of the policy, for
@@ -264,10 +251,10 @@ class FlyQuickAllReduce:
         group,
         device,
         rank: int,
-        world_size: int = WORLD,
+        world_size: int,
         inbox_memory: str = "auto",
         min_bytes: int | None = None,
-        algorithm: str = DEFAULT_ALGORITHM,
+        algorithm: str,
         rs_codec: str | None = None,
         ag_codec: str | None = None,
         link: str | None = None,
@@ -312,7 +299,9 @@ class FlyQuickAllReduce:
         self._batch_publishes = batches_publishes(resolved_inbox, algorithm, link)
 
         self.min_bytes = (
-            QUANT_MIN_PAYLOAD_BYTES if min_bytes is None else int(min_bytes)
+            quantized_floor(world_size=world_size, link=link, arch=arch)
+            if min_bytes is None
+            else int(min_bytes)
         )
         if self.min_bytes < 0:
             raise ValueError(f"min_bytes must be non-negative, got {self.min_bytes}")
@@ -554,7 +543,7 @@ class FlyQuickAllReduce:
         """Whether *nbytes* is large enough for this kernel to be worth using.
 
         Callers with a fallback should route anything smaller to it; see
-        ``QUANT_MIN_PAYLOAD_BYTES``. ``allreduce`` refuses payloads below the
+        ``quantized_floor``. ``allreduce`` refuses payloads below the
         threshold rather than silently running them slowly.
         """
         return int(nbytes) >= self.min_bytes
@@ -591,9 +580,6 @@ class FlyQuickAllReduceRMSNorm:
         residual_out = bf16(acc)
         out = bf16(acc * rsqrt(sum(acc^2)/hidden + eps) * weight)
 
-    Defaults to ``algorithm="ring"``, the schedule whose structure the
-    row-sized block was chosen for.
-
     The mesh runs its epilogue once per tile, as a
     tail after the all-gather, on values already in registers -- so it collects
     the two saved HBM passes and nothing else changes. The ring runs it inside
@@ -614,8 +600,11 @@ class FlyQuickAllReduceRMSNorm:
     ``link`` selects the super-tile ladder (``FUSED_MESH_ST_LADDER``,
     ``FUSED_RING_ST_LADDER``), as in ``FlyQuickAllReduce``, and is detected
     from the KFD topology when not given. ``min_bytes`` is the payload below
-    which ``allreduce_rmsnorm`` refuses to run, defaulting to
-    ``QUANT_MIN_PAYLOAD_BYTES``.
+    which ``allreduce_rmsnorm`` refuses to run, defaulting to where the fused
+    policy's mesh and ring windows start (``quantized_floor``).
+
+    ``super_tile`` and ``grid_cap`` each override that field on every rung of
+    the ladder; the knobs left unset keep the ladder's values.
     """
 
     #: Fused launches are capped at one workgroup per CU. That is not a
@@ -635,8 +624,8 @@ class FlyQuickAllReduceRMSNorm:
         group,
         device,
         rank: int,
-        world_size: int = WORLD,
-        algorithm: str = "ring",
+        world_size: int,
+        algorithm: str,
         super_tile: int | None = None,
         grid_cap: int | None = None,
         inbox_memory: str = "auto",
@@ -657,7 +646,6 @@ class FlyQuickAllReduceRMSNorm:
                 f"algorithm must be one of {tuple(ALGORITHMS)}, got {algorithm!r}"
             )
         algo = ALGORITHMS[algorithm]
-        pinned_st = super_tile is not None
         if super_tile is not None and super_tile not in algo.super_tiles:
             raise ValueError(
                 f"super_tile must be one of {algo.super_tiles} for "
@@ -671,9 +659,8 @@ class FlyQuickAllReduceRMSNorm:
             owner="FlyQuickAllReduceRMSNorm",
         )
         arch = require_arch(owner="FlyQuickAllReduceRMSNorm")
-        cap = DEFAULT_GRID_CAP if grid_cap is None else int(grid_cap)
-        if cap < 1:
-            raise ValueError(f"grid_cap must be positive, got {cap}")
+        if grid_cap is not None and int(grid_cap) < 1:
+            raise ValueError(f"grid_cap must be positive, got {grid_cap}")
 
         inbox_flags, resolved_inbox = _resolve_inbox_flags(
             inbox_memory, world_size, link
@@ -707,29 +694,31 @@ class FlyQuickAllReduceRMSNorm:
             if batch_publishes is None
             else bool(batch_publishes)
         )
-        # The floor is the plain class's accuracy gate on the codec, which the
-        # epilogue does not change; the ceiling is None because nothing here
-        # pushes the whole payload to every peer.
+        # The ceiling is None because nothing here pushes the whole payload to
+        # every peer.
         self.min_bytes = (
-            QUANT_MIN_PAYLOAD_BYTES if min_bytes is None else int(min_bytes)
+            quantized_floor(world_size=world_size, link=link, arch=arch, fused=True)
+            if min_bytes is None
+            else int(min_bytes)
         )
         if self.min_bytes < 0:
             raise ValueError(f"min_bytes must be non-negative, got {self.min_bytes}")
         self.max_bytes = max_bytes
 
-        # Rungs to build, as ``(super_tile, grid_cap)``, from the fused ladder;
-        # pinning ``super_tile`` collapses it to one rung.
-        if pinned_st:
-            self._ladder = (
-                FusedTwoShotRung(min_bytes=0, super_tile=int(super_tile), grid_cap=cap),
+        # Rungs to build, as ``(super_tile, grid_cap)``, from the fused ladder.
+        # A pinned ``super_tile`` or ``grid_cap`` overrides that field on every
+        # rung.
+        pins = {
+            name: int(value)
+            for name, value in (("super_tile", super_tile), ("grid_cap", grid_cap))
+            if value is not None
+        }
+        self._ladder = tuple(
+            dataclasses.replace(r, **pins)
+            for r in algo.fused_st_ladder(
+                world_size=self.world_size, link=link, arch=arch
             )
-        else:
-            self._ladder = tuple(
-                dataclasses.replace(r, grid_cap=min(r.grid_cap, cap))
-                for r in algo.fused_st_ladder(
-                    world_size=self.world_size, link=link, arch=arch
-                )
-            )
+        )
         self._rungs = [(r.super_tile, r.grid_cap) for r in self._ladder]
         # ST=1 is the fallback when a payload has fewer tiles than the chosen
         # super-tile, exactly as in FlyQuickAllReduce.
@@ -979,11 +968,11 @@ class FlyQuickAllReduceRMSNorm:
         live_bytes = int(inp.numel()) * 2
         if live_bytes > 0xFFFFFFFF:
             raise ValueError("payload must not exceed the 4 GiB buffer window")
-        if live_bytes > _PAD_MASK_MAX_BYTES and self.pads_hidden(hidden) != hidden:
+        if live_bytes > PAD_MASK_MAX_BYTES and self.pads_hidden(hidden) != hidden:
             raise ValueError(
                 f"a padded fused build (hidden={hidden} runs at "
                 f"h_pad={self.pads_hidden(hidden)}) masks its pad lanes with an "
-                f"offset of {_PAD_MASK_MAX_BYTES} B, so the payload must not "
+                f"offset of {PAD_MASK_MAX_BYTES} B, so the payload must not "
                 f"exceed that; got {live_bytes} B"
             )
 

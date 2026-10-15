@@ -10,6 +10,8 @@ Run with ``pytest op_tests/flydsl_tests/test_flydsl_allreduce_policy.py``.
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest import mock
 
@@ -26,6 +28,14 @@ from aiter.dist.device_communicators.flydsl_backends import (
 from aiter.dist.device_communicators.quick_all_reduce import QuickAllReduce
 from aiter.ops.flydsl import allreduce_policy as P
 from aiter.ops.flydsl.allreduce_policy import (
+    RING_SUPER_TILES,
+    SUPER_TILES,
+    SUPPORTED_ATOMS,
+    SUPPORTED_BLOCKS,
+    SUPPORTED_SPLITS,
+    AllReduceAlgorithm,
+    FamilyPolicy,
+    Window,
     fused_mesh_st_ladder,
     fused_oneshot_ladder,
     fused_ring_st_ladder,
@@ -33,18 +43,6 @@ from aiter.ops.flydsl.allreduce_policy import (
     oneshot_ladder,
     ring_st_ladder,
 )
-from aiter.ops.flydsl.kernels.comm.allreduce_shared import (
-    SUPPORTED_BLOCKS,
-    AllReduceAlgorithm,
-    FamilyPolicy,
-    Window,
-)
-from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import (
-    SUPPORTED_ATOMS,
-    SUPPORTED_SPLITS,
-)
-from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import SUPER_TILES
-from aiter.ops.flydsl.kernels.comm.quick_allreduce_ring import RING_SUPER_TILES
 from aiter.ops.flydsl.one_shot_allreduce import (
     resolve_fused_oneshot_max_bytes,
     resolve_oneshot_max_bytes,
@@ -75,12 +73,6 @@ def test_every_platform_has_one_policy():
     keys = [(r.arch, r.link, r.world_size) for r in P.FAMILY_POLICIES]
     assert len(keys) == len(set(keys))
     assert sorted(keys) == sorted((a, link, ws) for link, ws, a in CELLS)
-
-
-def test_no_such_platform_raises():
-    for (arch, link), reason in P.NOT_SUPPORTED_PLATFORMS.items():
-        with pytest.raises(ValueError, match=reason):
-            P.family_policy(arch=arch, link=link, world_size=4)
 
 
 def _policy(**windows):
@@ -439,6 +431,65 @@ def test_resolve_rejects_unknown_keys():
         _resolve(ws=3)
     with pytest.raises(P.NoPolicyError):
         _resolve(link="pcie", arch="gfx942")
+
+
+@pytest.mark.parametrize("ws", WORLDS)
+def test_default_codecs(ws):
+    """The ring's reduce-scatter lap is INT6 from ``RS_INT6_MIN_WORLD``; the
+    mesh, which has no INT6 path, stays INT4 on both laps."""
+    rs = "int6" if ws >= P.RS_INT6_MIN_WORLD else "int4"
+    assert P.default_codecs("ring", ws) == (rs, "int4")
+    assert P.default_codecs("mesh", ws) == ("int4", "int4")
+    for algorithm, (rs_codecs, ag_codecs) in (
+        ("mesh", (P.MESH_CODECS, P.MESH_CODECS)),
+        ("ring", (P.RS_CODECS, P.AG_CODECS)),
+    ):
+        got_rs, got_ag = P.default_codecs(algorithm, ws)
+        assert got_rs in rs_codecs and got_ag in ag_codecs
+
+
+def test_default_inbox_memory():
+    """Uncached on xGMI and at TP2, fine-grained on PCIe above TP2."""
+    for ws in WORLDS:
+        assert P.default_inbox_memory(ws, "xgmi") == "uncached"
+        assert P.default_inbox_memory(ws, "pcie") == (
+            "uncached" if ws == 2 else "finegrained"
+        )
+    assert set(P.INBOX_MEMORY_MODES) - {"auto"} == {"uncached", "finegrained"}
+
+
+@pytest.mark.parametrize("cell", CELLS)
+@pytest.mark.parametrize("fused", (False, True))
+def test_quantized_floor_is_where_quantization_starts(cell, fused):
+    """A mesh or ring host refuses what the policy would not quantize, and
+    accepts everything it would."""
+    link, ws, arch = cell
+    row = (P.fused_family_policy if fused else P.family_policy)(
+        arch=arch, link=link, world_size=ws
+    )
+    floor = P.quantized_floor(world_size=ws, link=link, arch=arch, fused=fused)
+    quantized = [
+        w for alg in (MESH, RING) if (w := row.window(alg, quantized=True)) is not None
+    ]
+    if not quantized:
+        assert floor == 0
+        return
+    assert row.select(floor, quantized=True) in (MESH, RING)
+    if floor > 0:
+        assert row.select(floor - 1, quantized=True) not in (MESH, RING)
+
+
+def test_quantized_floor_follows_the_overrides():
+    kw = {"world_size": 4, "link": "pcie", "arch": "gfx950"}
+    fused = P.quantized_floor(fused=True, **kw)
+    with _env(AITER_FLY_AR_MESH_MIN_BYTES=str(256 << 10)):
+        assert P.quantized_floor(**kw) == 256 << 10
+        # The plain variable leaves the fused floor alone.
+        assert P.quantized_floor(fused=True, **kw) == fused
+    with _env(AITER_FLY_AR_FUSED_MESH_MIN_BYTES=str(512 << 10)):
+        assert P.quantized_floor(fused=True, **kw) == 512 << 10
+    with _env(AITER_FLY_AR_MESH_MAX_BYTES="0", AITER_FLY_AR_RING_MAX_BYTES="0"):
+        assert P.quantized_floor(**kw) == 0
 
 
 def _full_storage_transpose(nbytes: int) -> torch.Tensor:

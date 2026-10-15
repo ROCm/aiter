@@ -32,37 +32,15 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from .allreduce_shared import (
-    _CM_SC0,
-    _CM_SC1,
-    _INBOX_POLICY,
-    ATOMS,
-    BLOCK,
-    DEFAULT_GRID_CAP,  # noqa: F401  -- re-exported for host symmetry
-    FLAG_I32_PER_LANE,
-    FLAG_LANES,
-    QUAD_LANES,
-    QUADS_PER_WAVE,
+from ...allreduce_policy import (
+    AG_CODECS,
+    RING_SUPER_TILES,
+    RS_CODECS,
+    SUPPORTED_BLOCKS,
     SUPPORTED_WORLDS,
-    WAVE,
-    _acquire_inbox,
-    _buffer_load,
-    _buffer_ptr,
-    _color_io,
-    _i32_to_bytes,
-    _load_flag,
-    _load_peers,
-    _payload_io,
-    _release_inbox,
-    _store_flag_peer,
-    _store_v4i32_peer,
-    _to_sgpr_i64,
-    make_hbm_operand,
-    make_pack_storage,
 )
 from .quick_allreduce_codec import (
     GROUP,
-    SUPPORTED_BLOCKS,
     _atom_bf16_to_f16,
     _atom_f16_to_bf16,
     _clamp_fp16_overflow,
@@ -85,28 +63,30 @@ from .quick_allreduce_fusions import (
     rms_rstd,
     scale_by_weight,
 )
-
-# Super-tile values the ring accepts.
-#
-# The ring publishes 2(N-1) times per super-tile.
-# On a cacheable inbox every publish is a full L2 writeback. Publishes per rank
-# are ``num_tiles / ST * 2(N-1)``.
-RING_SUPER_TILES = (1, 8, 16, 32)
-
-# Wire formats accepted per lap.
-#
-# Both laps take the same set, but they are separate arguments because they are
-# separate decisions: the reduce-scatter lap requantizes ``N-1`` times, while
-# the all-gather lap forwards the bytes it received without touching them.
-RS_CODECS = ("int4", "int6", "fp16")
-AG_CODECS = ("int4", "int6", "fp16")
-
-# Cache policy for the loads of a rank-tile from our own inbox. The ring uses
-# this policy for all inbox types. It does not use the ``recv`` entry of
-# ``_INBOX_POLICY``, which is ``nt`` on a fine-grained inbox. ``nt`` is only a
-# reuse hint, and the ring needs a cache bypass. With ``sc0 sc1``, the load
-# goes to memory.
-_RECV_POLICY = _CM_SC0 | _CM_SC1
+from .transport import (
+    _INBOX_POLICY,
+    _RECV_POLICY,
+    ATOMS,
+    FLAG_I32_PER_LANE,
+    FLAG_LANES,
+    QUAD_LANES,
+    QUADS_PER_WAVE,
+    WAVE,
+    _acquire_inbox,
+    _buffer_load,
+    _buffer_ptr,
+    _color_io,
+    _i32_to_bytes,
+    _load_flag,
+    _load_peers,
+    _payload_io,
+    _release_inbox,
+    _store_flag_peer,
+    _store_v4i32_peer,
+    _to_sgpr_i64,
+    make_hbm_operand,
+    make_pack_storage,
+)
 
 
 def _load_i32_at(ptr, elem_off, cache_modifier):
@@ -134,9 +114,9 @@ def make_quick_allreduce_ring_kernel(
     rank: int,
     super_tile: int = 1,
     grid: int,
-    inbox_memory: str = "finegrained",
-    rs_codec: str = "int4",
-    ag_codec: str = "int4",
+    inbox_memory: str,
+    rs_codec: str,
+    ag_codec: str,
     fusion: str = "none",
     hidden: int | None = None,
     block: int | None = None,
@@ -225,7 +205,8 @@ def make_quick_allreduce_ring_kernel(
     else:
         # The plain kernel takes a caller-chosen block; the fused build derives
         # its own from the row geometry just above.
-        block = BLOCK if block is None else block
+        if block is None:
+            raise ValueError("a plain build requires block")
         if block not in SUPPORTED_BLOCKS:
             raise ValueError(f"block must be one of {SUPPORTED_BLOCKS}, got {block!r}")
         atoms_per_row = 1

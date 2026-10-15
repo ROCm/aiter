@@ -33,27 +33,12 @@ from flydsl.expr.typing import T
 
 # The peer-store/load primitives, the cache-policy table and the inbox-memory
 # taxonomy are shared with the quantized kernels verbatim.
-from .allreduce_shared import (
-    _CM_SC0,
-    _CM_SC1,
-    _INBOX_POLICY,
+from ...allreduce_policy import (
+    FANOUT_ORDERS,
+    SUPPORTED_ATOMS,
     SUPPORTED_BLOCKS,
+    SUPPORTED_SPLITS,
     SUPPORTED_WORLDS,
-    WAVE,
-    _buffer_load,
-    _buffer_ptr,
-    _buffer_store,
-    _color_io,
-    _global_ptr,
-    _i32_to_bytes,
-    _load_peers,
-    _poll_v4i32,
-    _release_inbox,
-    _store_v4i32_peer,
-    _to_sgpr_i64,
-    atom_bf16_to_f32,
-    atom_f32_to_bf16,
-    make_hbm_operand,
 )
 
 # The fused epilogue and the row-to-workgroup geometry are shared with the
@@ -81,29 +66,36 @@ from .quick_allreduce_fusions import (
     xchg_contribution,
     xchg_total,
 )
+from .transport import (
+    _CM_SC0,
+    _CM_SC1,
+    _INBOX_POLICY,
+    _RECV_POLICY,
+    WAVE,
+    _buffer_load,
+    _buffer_ptr,
+    _buffer_store,
+    _color_io,
+    _global_ptr,
+    _i32_to_bytes,
+    _load_peers,
+    _poll_v4i32,
+    _release_inbox,
+    _store_v4i32_peer,
+    _to_sgpr_i64,
+    atom_bf16_to_f32,
+    atom_f32_to_bf16,
+    make_hbm_operand,
+)
 
-# Threads per block, which sets the tile width: ``tile = block * atoms * 16 B``.
-# It sets the parallelism floor at a given payload. ``SUPPORTED_BLOCKS`` lists
-# the values.
+# ``block`` is threads per block, which sets the tile width:
+# ``tile = block * atoms * 16 B``. It sets the parallelism floor at a given
+# payload. The trade is per-block fixed cost: every block polls and re-arms its
+# own slots, so that work rises by the same factor the block count does.
 #
-# The trade is per-block fixed cost: every block polls and re-arms its own
-# slots, so that work rises by the same factor the block count does.
-DEFAULT_BLOCK = 256
 # 16 B per thread per atom -- one ``global_store_dwordx4``.
 ATOM_BYTES = 16
 ATOM_I32 = ATOM_BYTES // 4
-DEFAULT_ATOMS = 1
-# Atoms per thread per tile. More atoms means a bigger tile, hence fewer blocks
-# for a given payload, at the cost of coarser load balance on the last partial
-# tile.
-SUPPORTED_ATOMS = (1, 2, 4)
-DEFAULT_GRID_CAP = 64
-# Workgroups one fused token row is split over. 1 is one workgroup per row, the
-# unsplit build. The rest are the counts that divide the shipped widths into
-# whole waves: 7168 = 14 waves at atoms=1 gives {2, 7, 14}; 4096/8192 give the
-# powers of two.
-SUPPORTED_SPLITS = (1, 2, 4, 7, 8, 14, 16)
-DEFAULT_SPLIT = 1
 
 # In the plain schedule ``atoms`` sets the *tile width*: tile = BLOCK*atoms*16 B,
 # so a bigger atom count means fewer, fatter tiles for a given payload.
@@ -185,22 +177,6 @@ def fused_atoms_for_block(hidden: int, block: int) -> int:
     )
 
 
-# Read our own inbox with the caches bypassed: a peer wrote these lines
-# microseconds ago and an L1 hit here is a stale hit. Same reasoning as the
-# ring kernel's ``_RECV_POLICY``.
-_RECV_POLICY = _CM_SC0 | _CM_SC1
-
-# Which axis of the (peer, atom) fanout runs fastest across consecutive stores.
-#
-# "peer": a thread pushes all its atoms to one destination before moving to the
-# next, so a wave hands each destination a contiguous ``block * 16`` B run.
-#
-# "atom": consecutive stores walk the peers of one atom. On xGMI the native
-# packet is 64 B and there is no per-destination run-length benefit to collect,
-# so spreading across links sooner can start more of them in parallel.
-FANOUT_ORDERS = ("peer", "atom")
-DEFAULT_FANOUT = "peer"
-
 # Three inbox buffers rotate by colour. Round ``c`` reads buffer ``c``, and
 # re-arms buffer ``c + 2`` (mod 3) with the sentinel. No peer can be writing that
 # one: a peer is at most one round ahead, and that round uses ``c + 1``.
@@ -258,16 +234,16 @@ class _LdsWindow:
 def make_one_shot_allreduce_kernel(
     *,
     world_size: int,
-    atoms: int = DEFAULT_ATOMS,
+    atoms: int,
     grid: int,
-    inbox_memory: str = "uncached",
-    fanout: str = DEFAULT_FANOUT,
+    inbox_memory: str,
+    fanout: str,
     rank: int,
     block: int | None = None,
     fusion: str = "none",
     hidden: int | None = None,
     h_pad: int | None = None,
-    split: int = DEFAULT_SPLIT,
+    split: int = 1,
     debug_slice_delay: int = 0,
 ):
     """Build the one-shot all-reduce, plain or fused with residual-add + RMSNorm.
@@ -364,7 +340,9 @@ def make_one_shot_allreduce_kernel(
             )
         block = row_width
     else:
-        block = DEFAULT_BLOCK if block is None else int(block)
+        if block is None:
+            raise ValueError("a plain build requires block")
+        block = int(block)
         if block not in SUPPORTED_BLOCKS:
             raise ValueError(f"block must be one of {SUPPORTED_BLOCKS}, got {block!r}")
     # Whether any lane of the workgroup sits past the end of the real row.

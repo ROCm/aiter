@@ -12,7 +12,7 @@ Payload HBM is bf16; in-kernel math is packed fp16. Each rank owns
 ``ATOMS / world_size`` atoms of a tile (8 GPUs → 1, 4 → 2, 2 → 4); LDS
 stays ``ATOMS * rank_tile_bytes``.
 
-The geometry and the cache policy are in ``allreduce_shared``.
+The geometry and the cache policy are in ``transport``.
 The wire codec is in ``quick_allreduce_codec``.
 
 One tuning knob besides the super-tile: ``block``, threads per workgroup. It
@@ -29,38 +29,14 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from .allreduce_shared import (
-    _INBOX_POLICY,
-    ATOMS,
-    BLOCK,
-    DEFAULT_GRID_CAP,
-    FLAG_I32_PER_LANE,
-    FLAG_LANES,
-    QUAD_LANES,
-    QUADS_PER_WAVE,
+from ...allreduce_policy import (
+    MESH_CODECS,
+    SUPER_TILES,
     SUPPORTED_ARCHS,
+    SUPPORTED_BLOCKS,
     SUPPORTED_WORLDS,
-    TILE_BYTES,
-    WAVE,
-    WORLD,
-    _acquire_inbox,
-    _buffer_load,
-    _buffer_ptr,
-    _color_io,
-    _i32_to_bytes,
-    _load_flag,
-    _load_peers,
-    _payload_io,
-    _release_inbox,
-    _store_flag_peer,
-    _store_v4i32_peer,
-    _to_sgpr_i64,
-    make_hbm_operand,
-    make_pack_storage,
 )
 from .quick_allreduce_codec import (
-    SUPER_TILES,
-    SUPPORTED_BLOCKS,
     _atom_bf16_to_f16,
     _atom_f16_to_bf16,
     _clamp_fp16_overflow,
@@ -85,14 +61,35 @@ from .quick_allreduce_fusions import (
     rms_rstd,
     scale_by_weight,
 )
+from .transport import (
+    _INBOX_POLICY,
+    ATOMS,
+    BLOCK,
+    FLAG_I32_PER_LANE,
+    FLAG_LANES,
+    QUAD_LANES,
+    QUADS_PER_WAVE,
+    TILE_BYTES,
+    WAVE,
+    WORLD,
+    _acquire_inbox,
+    _buffer_load,
+    _buffer_ptr,
+    _color_io,
+    _i32_to_bytes,
+    _load_flag,
+    _load_peers,
+    _payload_io,
+    _release_inbox,
+    _store_flag_peer,
+    _store_v4i32_peer,
+    _to_sgpr_i64,
+    make_hbm_operand,
+    make_pack_storage,
+)
 
 # Re-exported for the host, which imports its tile math from this module.
 __all__ = [
-    "DEFAULT_GRID_CAP",
-    "MESH_CODECS",
-    "SUPER_TILES",
-    "SUPPORTED_BLOCKS",
-    "SUPPORTED_WORLDS",
     "TILE_BYTES",
     "WORLD",
     "clamp_grid_cap",
@@ -169,10 +166,6 @@ def clamp_grid_cap(
     return min(int(requested), resident * int(cu_count))
 
 
-# Wire formats the mesh can build.
-MESH_CODECS = ("int4", "fp16")
-
-
 def mesh_fanout_quads(block: int, world_size: int, codec: str) -> tuple[int, int]:
     """``(quads the block has, quads the mesh fanout needs)`` at this geometry.
 
@@ -193,11 +186,11 @@ def mesh_fanout_fits(block: int, world_size: int, codec: str) -> bool:
 
 def make_quick_allreduce_mesh_kernel(
     *,
-    world_size: int = WORLD,
+    world_size: int,
     super_tile: int = 1,
     grid: int,
-    inbox_memory: str = "uncached",
-    codec: str = "int4",
+    inbox_memory: str,
+    codec: str,
     fusion: str = "none",
     hidden: int | None = None,
     block: int | None = None,
@@ -243,7 +236,8 @@ def make_quick_allreduce_mesh_kernel(
     else:
         # The plain kernel takes a caller-chosen block; the fused build derives
         # its own from the row geometry just above.
-        block = BLOCK if block is None else block
+        if block is None:
+            raise ValueError("a plain build requires block")
         if block not in SUPPORTED_BLOCKS:
             raise ValueError(f"block must be one of {SUPPORTED_BLOCKS}, got {block!r}")
         atoms_per_row = 1

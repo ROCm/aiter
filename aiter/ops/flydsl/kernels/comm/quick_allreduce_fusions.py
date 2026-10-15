@@ -42,10 +42,12 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp
 
-from .allreduce_shared import (
-    ATOMS,
+from ...allreduce_policy import (
     BLOCK_ALIGN,
     MAX_BLOCK,
+)
+from .transport import (
+    ATOMS,
     WAVE,
     atom_bf16_to_f32,
     atom_f32_to_bf16,
@@ -140,11 +142,6 @@ def row_block_options(
 
 
 # -- fusion-agnostic: geometry with padding -----------------------------------
-#: Largest payload a padded build may address, in bytes: the 31-bit byte-offset
-#: range. The host gates reject a padded fused payload above it.
-PAD_MASK_MAX_BYTES = 0x7FFFFFFF
-
-
 def padded_row_block_options(
     hidden: int,
     *,
@@ -368,30 +365,6 @@ def quick_reduce_row_block_at(
         f"block={block}: one workgroup covers one token row, so the legal "
         f"blocks at this width are {legal}"
     )
-
-
-#: ``atoms_per_row`` for a fused mesh/ring build, per ``(link, world_size,
-#: algorithm)``. The portable form of the block knob: which blocks exist
-#: depends on the width, which ``atoms_per_row`` values exist does not.
-FUSED_QR_ROW_ATOMS: dict[tuple[str, int, str], int] = {
-    # PCIe: From measurements
-    ("pcie", 2, "mesh"): 4,
-    ("pcie", 2, "ring"): 2,
-    ("pcie", 4, "mesh"): 2,
-    ("pcie", 4, "ring"): 2,
-    ("pcie", 8, "mesh"): 1,
-    # xGMI: From measurements
-    ("xgmi", 2, "ring"): 4,
-    ("xgmi", 4, "mesh"): 2,
-    ("xgmi", 8, "mesh"): 1,
-}
-
-
-def fused_qr_row_atoms(
-    world_size: int, algorithm: str, link: str = "pcie"
-) -> int | None:
-    """Table entry for *(link, world_size, algorithm)*, or None for the default."""
-    return FUSED_QR_ROW_ATOMS.get((str(link), int(world_size), str(algorithm)))
 
 
 def quick_reduce_row_block_for(

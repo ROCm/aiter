@@ -29,32 +29,23 @@ from .allreduce_host_shared import (
     require_arch,
 )
 from .allreduce_policy import (
+    PAD_MASK_MAX_BYTES,
+    SUPPORTED_ATOMS,
+    SUPPORTED_SPLITS,
+    AllReduceAlgorithm,
+    OneShotRung,
     fused_oneshot_ladder,
     oneshot_ladder,
     resolve_family_policy,
     resolve_fused_policy,
     resolve_link,
-)
-from .kernels.comm.allreduce_shared import (
-    AllReduceAlgorithm,
-    FusedOneShotRung,
-    OneShotRung,
     select_rung,
 )
 from .kernels.comm.one_shot_allreduce import (
-    DEFAULT_ATOMS,
-    DEFAULT_FANOUT,
-    DEFAULT_GRID_CAP,
-    DEFAULT_SPLIT,
-    SUPPORTED_ATOMS,
-    SUPPORTED_SPLITS,
     fused_block_options,
     fused_padded_block_options,
     fused_split_options,
     make_one_shot_allreduce_kernel,
-)
-from .kernels.comm.quick_allreduce_fusions import (
-    PAD_MASK_MAX_BYTES as _PAD_MASK_MAX_BYTES,
 )
 from .kernels.tensor_shim import _preload_compiled, _run_compiled
 
@@ -347,22 +338,22 @@ class OneShotAllReduceRMSNorm:
         residual_out = bf16(acc)
         out = bf16(acc * rsqrt(sum(acc^2)/hidden + eps) * weight)
 
-    Unlike ``OneShotAllReduce`` the wire layout depends on ``hidden``, because
-    the tile is pinned to one token row so the norm's reduction fits in one
-    workgroup. A new hidden therefore needs a new engine, and building one is a
-    collective (IPC handle exchange). Engines are built lazily on first use,
-    which is safe because TP ranks enter a collective with the same shape in
-    lockstep; pass ``hiddens=(...)`` to build them up front instead.
-
-    Same tuning surface as ``OneShotAllReduce`` with one difference. ``block``
-    is not free: the row has to fit one workgroup, so ``block * atoms * 8 ==
-    hidden`` and picking either of ``atoms``/``block`` picks the other.
+    The wire layout depends on ``hidden``, because the tile is pinned to one 
+    token row so the norm's reduction fits in one workgroup. A new hidden dim 
+    therefore needs a new engine, and building one is a collective (IPC handle exchange). 
+    Engines are built lazily on first use, which is safe because TP ranks enter 
+    a collective with the same shape in lockstep. Passing ``hiddens=(...)`` builds 
+    them up front.
 
     ``split`` spreads each row over that many workgroups instead (``block *
     atoms * 8 * split == hidden``), which joins the row's sum of squares through
     one HBM exchange word; at decode sizes one workgroup per row leaves most of
-    the GPU idle. It overrides every ladder rung rather than pinning one. A width with no split geometry for the requested value takes
+    the GPU idle. A width with no split geometry for the requested value takes
     the nearest one it has, and a padded width runs unsplit.
+
+    ``atoms``, ``grid_cap``, ``fanout`` and ``split`` each override that field
+    on every rung of the ladder, and ``block`` overrides the geometry of every
+    rung; the knobs left unset keep the ladder's values.
     """
 
     def __init__(
@@ -385,12 +376,6 @@ class OneShotAllReduceRMSNorm:
         check_world_size(world_size)
         link = resolve_link(link)
         self.link = link
-        pinned = (
-            atoms is not None
-            or grid_cap is not None
-            or fanout is not None
-            or block is not None
-        )
         if atoms is not None and atoms not in SUPPORTED_ATOMS:
             raise ValueError(f"atoms must be one of {SUPPORTED_ATOMS}, got {atoms!r}")
         if split is not None and int(split) not in SUPPORTED_SPLITS:
@@ -428,33 +413,24 @@ class OneShotAllReduceRMSNorm:
         )
         self.block = None if block is None else int(block)
 
-        # ``split`` overrides every rung, and ``grid_cap`` caps every rung.
-        k = None if split is None else int(split)
-        if pinned:
-            self._ladder = (
-                FusedOneShotRung(
-                    min_bytes=0,
-                    atoms=DEFAULT_ATOMS if atoms is None else int(atoms),
-                    grid_cap=DEFAULT_GRID_CAP if grid_cap is None else int(grid_cap),
-                    fanout=DEFAULT_FANOUT if fanout is None else fanout,
-                    split=DEFAULT_SPLIT if k is None else k,
-                ),
+        # A pinned knob overrides its field on every ladder rung. A pinned
+        # ``block`` is not a rung field: ``_geom_for`` reads it.
+        pins = {
+            name: value
+            for name, value in (
+                ("atoms", None if atoms is None else int(atoms)),
+                ("grid_cap", None if grid_cap is None else int(grid_cap)),
+                ("fanout", fanout),
+                ("split", None if split is None else int(split)),
             )
-        else:
-            self._ladder = tuple(
-                dataclasses.replace(
-                    rung,
-                    grid_cap=(
-                        rung.grid_cap
-                        if grid_cap is None
-                        else min(rung.grid_cap, int(grid_cap))
-                    ),
-                    split=rung.split if k is None else k,
-                )
-                for rung in fused_oneshot_ladder(
-                    world_size=world_size, link=link, arch=arch
-                )
+            if value is not None
+        }
+        self._ladder = tuple(
+            dataclasses.replace(rung, **pins)
+            for rung in fused_oneshot_ladder(
+                world_size=world_size, link=link, arch=arch
             )
+        )
         self.split = self._ladder[0].split
 
         # (hidden, atoms, grid_cap, fanout, h_pad, split) -> (engine, spec)
@@ -491,7 +467,7 @@ class OneShotAllReduceRMSNorm:
         return atoms, hidden, split
 
     def _geom_for(
-        self, hidden: int, rung_atoms: int, rung_split: int = DEFAULT_SPLIT
+        self, hidden: int, rung_atoms: int, rung_split: int = 1
     ) -> tuple[int, int, int]:
         """``(atoms, h_pad, split)`` for a rung at hidden dim.
 
@@ -673,11 +649,11 @@ class OneShotAllReduceRMSNorm:
         live_bytes = int(inp.numel()) * 2
         if live_bytes > 0xFFFFFFFF:
             raise ValueError("payload must not exceed the 4 GiB buffer window")
-        if live_bytes > _PAD_MASK_MAX_BYTES and self.pads_hidden(hidden) != hidden:
+        if live_bytes > PAD_MASK_MAX_BYTES and self.pads_hidden(hidden) != hidden:
             raise ValueError(
                 f"a padded fused build (hidden={hidden} runs at "
                 f"h_pad={self.pads_hidden(hidden)}) masks its pad lanes with an "
-                f"offset of {_PAD_MASK_MAX_BYTES} B, so the payload must not "
+                f"offset of {PAD_MASK_MAX_BYTES} B, so the payload must not "
                 f"exceed that; got {live_bytes} B"
             )
         # Distinct destinations: the kernel writes out and residual_out from the

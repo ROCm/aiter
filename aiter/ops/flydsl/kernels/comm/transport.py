@@ -4,13 +4,11 @@
 """Transport parts that the one-shot, mesh and ring all-reduce kernels share.
 
 This module contains the tile geometry, the inbox cache-policy table, the peer
-store and load primitives, and the LDS staging factory. It also contains the
-dataclass definitions for heuristics, i.e., policy definitions for kernel selection.
+store and load primitives, and the LDS staging factory. The limits and the
+policy records are in ``aiter.ops.flydsl.allreduce_policy``.
 """
 
-import enum
 import logging
-from dataclasses import dataclass
 
 import flydsl.expr as fx
 from flydsl.expr import rocdl
@@ -18,34 +16,13 @@ from flydsl.expr.typing import T, as_ir_value
 
 logger = logging.getLogger("aiter")
 
-# Limits
-# ======
-#
-# What the FlyDSL all-reduce kernels and their hosts support. The other
-# modules import these instead of restating them.
-
-SUPPORTED_ARCHS = ("gfx942", "gfx950")
-SUPPORTED_WORLDS = (2, 4, 8)
-# Fabric between GPUs.
-LINKS = ("pcie", "xgmi")
-# Threads per workgroup that every kernel can build. The block sets the tile.
-SUPPORTED_BLOCKS = (64, 128, 256, 512)
-# The fused schedules size a workgroup to one token row instead, on any
-# BLOCK_ALIGN multiple up to the hardware workgroup limit MAX_BLOCK.
-BLOCK_ALIGN = 128
-MAX_BLOCK = 1024
-# Payload and buffer address alignment, in bytes: one 16 B store per lane.
-PAYLOAD_ALIGN_BYTES = 16
-# Largest payload, in bytes: the window of a buffer descriptor.
-MAX_PAYLOAD_BYTES = 0xFFFFFFFF
-# Smallest payload a quantized schedule accepts when it is used on its own.
-QUANT_MIN_PAYLOAD_BYTES = 128 << 10
+# Tile geometry
+# =============
 
 WORLD = 8  # Default value for world size
 BLOCK = 256
 ATOMS = 8
 TILE_BYTES = BLOCK * ATOMS * 16
-DEFAULT_GRID_CAP = 304 * 4
 WAVE = 64
 WAVES = BLOCK // WAVE
 # 4 lanes × 16 B = one 64 B NT sector. Not world_size.
@@ -59,251 +36,6 @@ I32_BYTES = 4
 FLAG_LANES = 8
 FLAG_I32_PER_LANE = 2
 
-# Tuning ladders
-# ==============
-#
-# A ladder is a tuple of rungs in ascending ``min_bytes`` order, and the first
-# rung has ``min_bytes == 0``. The host builds one engine per distinct rung
-# and, at launch, runs a payload on the last rung whose ``min_bytes`` is at
-# most the payload size.
-
-
-@dataclass(frozen=True)
-class OneShotRung:
-    """The one-shot kernel configuration for payloads of at least ``min_bytes``.
-
-    ``atoms`` and ``block`` both scale the tile, and their product sets the
-    block count. In addition, ``block`` also changes the workgroup size, and ``atoms``
-    also changes how many stores one thread has in flight. ``grid_cap`` bounds
-    the block count. ``fanout``selects the order of the stores to the peers.
-    """
-
-    min_bytes: int
-    atoms: int
-    grid_cap: int
-    fanout: str
-    block: int
-
-    @property
-    def cfg(self) -> tuple[int, int, str, int]:
-        """The engine key: every field except ``min_bytes``."""
-        return (self.atoms, self.grid_cap, self.fanout, self.block)
-
-
-@dataclass(frozen=True)
-class TwoShotRung:
-    """The mesh or ring kernel configuration for payloads of at least
-    ``min_bytes``.
-
-    ``super_tile`` is the number of tiles a block publishes at once, and
-    ``block`` sets the tile. ``grid_cap`` bounds the block count, and with
-    ``super_tile`` it sets the size of the IPC inbox.
-    """
-
-    min_bytes: int
-    super_tile: int
-    grid_cap: int
-    block: int
-
-
-@dataclass(frozen=True)
-class FusedOneShotRung:
-    """The fused (all-reduce + RMSNorm) one-shot configuration for payloads of
-    at least ``min_bytes``.
-
-    The fused tile is one token row, or one ``1/split`` slice of it, because
-    the RMSNorm reduces over the row. So ``atoms`` sets the block width
-    (``block = hidden / (split * 8 * atoms)``) instead of the tile, and there
-    is no ``block`` field. ``split`` spreads a row over that many workgroups.
-    """
-
-    min_bytes: int
-    atoms: int
-    grid_cap: int
-    fanout: str
-    split: int
-
-
-@dataclass(frozen=True)
-class FusedTwoShotRung:
-    """The fused mesh or ring configuration for payloads of at least
-    ``min_bytes``. As ``TwoShotRung``, without ``block``: a fused build sizes
-    its workgroup to the token row (``FUSED_QR_ROW_ATOMS``)."""
-
-    min_bytes: int
-    super_tile: int
-    grid_cap: int
-
-
-def select_rung(ladder, nbytes: int):
-    """The rung of *ladder* that runs a payload of *nbytes*."""
-    chosen = ladder[0]
-    for rung in ladder:
-        if nbytes >= rung.min_bytes:
-            chosen = rung
-    return chosen
-
-
-# Dispatch policy records
-# =======================
-#
-# ``allreduce_policy`` keeps the tables of these records and the functions
-# that resolve them.
-
-
-class AllReduceAlgorithm(enum.Enum):
-    """The FlyDSL all-reduce algorithms."""
-
-    OneShot = "oneshot"
-    TwoShotMesh = "mesh"
-    TwoShotRing = "ring"
-
-
-@dataclass(frozen=True)
-class Window:
-    """A range of payload sizes in bytes: ``min`` inclusive, ``max`` exclusive.
-
-    ``max=None`` means no upper limit. ``min == max`` is an empty window, which
-    disables the algorithm it belongs to.
-    """
-
-    min: int
-    max: int | None = None
-
-    def __post_init__(self):
-        if self.min < 0:
-            raise ValueError(f"window min ({self.min}) must be non-negative")
-        if self.max is not None and self.max < self.min:
-            raise ValueError(f"window max ({self.max}) must be >= min ({self.min})")
-
-    @property
-    def is_empty(self) -> bool:
-        return self.max is not None and self.max <= self.min
-
-    def contains(self, nbytes: int) -> bool:
-        return self.min <= nbytes and (self.max is None or nbytes < self.max)
-
-    def inclusive_range(self) -> tuple[int, int]:
-        """``(first, last)`` payload sizes, both inclusive, for the callers
-        that need finite bounds. An unbounded window ends at
-        ``MAX_PAYLOAD_BYTES``."""
-        return self.min, MAX_PAYLOAD_BYTES if self.max is None else self.max - 1
-
-    def __str__(self) -> str:
-        return f"[{_fmt_bytes(self.min)}, {_fmt_bytes(self.max)})"
-
-
-def _fmt_bytes(nbytes: int | None) -> str:
-    if nbytes is None:
-        return "inf"
-    for unit, shift in (("MiB", 20), ("KiB", 10)):
-        if nbytes >= 1 << shift and nbytes % (1 << shift) == 0:
-            return f"{nbytes >> shift} {unit}"
-    return f"{nbytes} B"
-
-
-@dataclass(frozen=True)
-class FamilyPolicy:
-    """Which algorithm runs which payload sizes, on one platform.
-
-    We have three families of all-reduce kernels: one-shot, mesh and ring.
-    Depending on the interconnect type (PCIe or xGMI), the one-shot is best for
-    smaller messages, the mesh overtakes for bigger messages, and finally the
-    ring is the choice for very large messages. The ring is in the tables of
-    gfx942/xGMI, where it starts at 128 MiB, and of PCIe at TP4 and TP8. On
-    gfx950/xGMI the ring is off. The message sizes at which the transitions take
-    place depend on the architecture, the world size and the interconnect type,
-    so a policy belongs to one ``(arch, link, world_size)``.
-
-    Each algorithm has a ``Window`` of payload sizes. ``None`` or an empty
-    window disables the algorithm. A payload in no window goes to
-    ``cross_device_reduce`` or RCCL.
-
-    The mesh and the ring are quantized, so they run only with quantization on
-    (``AITER_QUICK_REDUCE_QUANTIZATION=INT4``), and their windows do not
-    overlap. The one-shot is exact and runs in both modes. ``QuickAllReduce``
-    serves the mesh and the ring before ``CustomAllreduce`` serves the
-    one-shot, and when enabled, the mesh and the ring take the payloads
-    of their windows first.
-    """
-
-    arch: str
-    link: str
-    world_size: int
-    oneshot: Window | None
-    mesh: Window | None
-    ring: Window | None
-
-    def __post_init__(self):
-        if self.arch not in SUPPORTED_ARCHS:
-            raise ValueError(
-                f"arch must be one of {SUPPORTED_ARCHS}, got {self.arch!r}"
-            )
-        if self.link not in LINKS:
-            raise ValueError(f"link must be one of {LINKS}, got {self.link!r}")
-        if self.world_size not in SUPPORTED_WORLDS:
-            raise ValueError(
-                f"world_size must be one of {SUPPORTED_WORLDS}, got {self.world_size}"
-            )
-        mesh, ring = self.mesh, self.ring
-        if mesh is None or mesh.is_empty or ring is None or ring.is_empty:
-            return
-        lo, hi = sorted((mesh, ring), key=lambda w: w.min)
-        if lo.max is None or lo.max > hi.min:
-            raise ValueError(
-                f"{self._cell()}: the mesh window {mesh} overlaps the ring "
-                f"window {ring}"
-            )
-
-    def _cell(self) -> str:
-        return f"{self.arch}/{self.link}/TP{self.world_size}"
-
-    def window(
-        self, algorithm: AllReduceAlgorithm, *, quantized: bool
-    ) -> Window | None:
-        """The window of *algorithm*, or None if it is disabled."""
-        if algorithm == AllReduceAlgorithm.OneShot:
-            w = self.oneshot
-        elif not quantized:
-            w = None
-        elif algorithm == AllReduceAlgorithm.TwoShotMesh:
-            w = self.mesh
-        else:
-            w = self.ring
-        return None if w is None or w.is_empty else w
-
-    def algorithms(self, *, quantized: bool) -> tuple[AllReduceAlgorithm, ...]:
-        """The enabled algorithms, in payload order."""
-        enabled = [
-            (w.min, alg)
-            for alg in AllReduceAlgorithm
-            if (w := self.window(alg, quantized=quantized)) is not None
-        ]
-        return tuple(alg for _min, alg in sorted(enabled, key=lambda e: e[0]))
-
-    def select(self, nbytes: int, *, quantized: bool) -> AllReduceAlgorithm | None:
-        """The algorithm that runs *nbytes*, or None for
-        ``cross_device_reduce`` or RCCL. The mesh and the ring come first, as
-        in dispatch."""
-        for alg in (
-            AllReduceAlgorithm.TwoShotMesh,
-            AllReduceAlgorithm.TwoShotRing,
-            AllReduceAlgorithm.OneShot,
-        ):
-            w = self.window(alg, quantized=quantized)
-            if w is not None and w.contains(nbytes):
-                return alg
-        return None
-
-    def describe(self, *, quantized: bool) -> str:
-        """The enabled windows, for logs."""
-        parts = [
-            f"{alg.value} {self.window(alg, quantized=quantized)}"
-            for alg in self.algorithms(quantized=quantized)
-        ]
-        return ", ".join(parts) or "no FlyDSL algorithm"
-
-
 # Buffer aux bits on gfx942/gfx950. This is LLVM's CPol encoding, which the
 # backend renames for CDNA: bit 0 (GLC) prints as `sc0`, bit 1 (SLC) as `nt`,
 # bit 4 (SCC) as `sc1`. Bit 2 exists in the encoding but CDNA has no use for
@@ -311,6 +43,12 @@ class FamilyPolicy:
 _CM_SC0 = 1
 _CM_NT = 2
 _CM_SC1 = 16
+
+# Cache policy for the loads of a rank-tile from our own inbox, in the one-shot
+# and the ring, on every inbox type. These loads need a cache bypass: with
+# ``sc0 sc1`` it goes to memory. The ``recv`` entry of ``_INBOX_POLICY`` is
+# ``nt`` on a fine-grained inbox, which is only a reuse hint.
+_RECV_POLICY = _CM_SC0 | _CM_SC1
 
 # Cache policy for each inbox memory type
 # =======================================
@@ -330,7 +68,7 @@ _CM_SC1 = 16
 #   recv     The ``_CM_*`` cache-modifier bits on the payload loads of the
 #            reader.
 #
-# The table is the policy of the flag-based mesh. The ring uses its own
+# The table is the policy of the flag-based mesh. The ring uses
 # ``_RECV_POLICY`` instead of ``recv``. The one-shot has no flag and no
 # acquire: it polls the payload itself for a sentinel, and so it loads every
 # payload with ``_CM_SC0 | _CM_SC1`` on both memory types, and it does not use

@@ -10,20 +10,18 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from .allreduce_policy import resolve_link
-from .kernels.comm.allreduce_shared import (
+from .allreduce_policy import (
+    INBOX_MEMORY_MODES,
     MAX_PAYLOAD_BYTES,
     PAYLOAD_ALIGN_BYTES,
     SUPPORTED_ARCHS,
     SUPPORTED_WORLDS,
+    default_inbox_memory,
+    resolve_link,
 )
 from .quick_allreduce_ipc import UncachedIpcHeap
 
 logger = logging.getLogger("aiter")
-
-# How the IPC inbox is allocated. The wire protocol is identical in every
-# mode; only the memory type changes.
-INBOX_MEMORY_MODES = ("auto", "uncached", "finegrained")
 
 
 def _cuda_index(device, *, owner: str) -> int:
@@ -44,21 +42,14 @@ def _resolve_inbox_flags(
 ) -> tuple[int, str]:
     """(hipExtMallocWithFlags mode, resolved name) for an ``inbox_memory``.
 
-    ``"auto"`` is ``uncached`` on xGMI and ``finegrained`` on PCIe, except at
-    TP2, where it is ``uncached`` on PCIe too. The PCIe rule exists because
-    uncached peer writes serialize per destination and collapse as the fanout
-    widens. At TP2 every schedule writes to a single remote peer,
-    so there is nothing to collapse, and an uncached inbox skips the L2 writeback.
+    ``"auto"`` resolves to ``default_inbox_memory``.
     """
     if mode not in INBOX_MEMORY_MODES:
         raise ValueError(
             f"inbox_memory must be one of {INBOX_MEMORY_MODES}, got {mode!r}"
         )
     if mode == "auto":
-        single_peer = int(world_size) == 2
-        mode = (
-            "uncached" if single_peer or resolve_link(link) == "xgmi" else "finegrained"
-        )
+        mode = default_inbox_memory(world_size, resolve_link(link))
     flags = {
         "uncached": UncachedIpcHeap._HIP_DEVICE_MALLOC_UNCACHED,
         "finegrained": UncachedIpcHeap._HIP_DEVICE_MALLOC_FINEGRAINED,

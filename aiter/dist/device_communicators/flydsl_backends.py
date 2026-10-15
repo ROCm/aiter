@@ -19,16 +19,12 @@ logger = logging.getLogger(__name__)
 # checked at import time.
 try:
     from aiter.ops.flydsl import allreduce_policy as fly_policy
-    from aiter.ops.flydsl.kernels.comm.quick_allreduce_fusions import (
-        PAD_MASK_MAX_BYTES,
-    )
     from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduceRMSNorm
     from aiter.ops.flydsl.quick_allreduce import FlyQuickAllReduceRMSNorm
 
     _FLY_IMPORT_OK = True
 except Exception:  # noqa: BLE001
     fly_policy = None
-    PAD_MASK_MAX_BYTES = None
     OneShotAllReduceRMSNorm = None
     FlyQuickAllReduceRMSNorm = None
     _FLY_IMPORT_OK = False
@@ -336,7 +332,7 @@ class FlyDSLAllReduceRMSNorm:
         # most widths have no build at all in a given family.
         if eng is None or not eng.supports_hidden(hidden):
             return False
-        if nbytes > PAD_MASK_MAX_BYTES and eng.pads_hidden(hidden) != hidden:
+        if nbytes > fly_policy.PAD_MASK_MAX_BYTES and eng.pads_hidden(hidden) != hidden:
             return False
         return not self._capture_blocked(family, hidden)
 

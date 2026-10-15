@@ -12,7 +12,7 @@ node.
 | `quick_allreduce_mesh.py` | The quantized two-shot **mesh** kernel. |
 | `quick_allreduce_ring.py` | The quantized two-shot **ring** kernel. |
 | `quick_allreduce_codec.py` | The INT4, INT6 and FP16 wire codecs. The mesh and the ring use them. |
-| `allreduce_shared.py` | Tile geometry, the inbox cache policy, and the peer store and load primitives. All three kernels use them. |
+| `transport.py` | Tile geometry, the inbox cache policy, and the peer store and load primitives. All three kernels use them. |
 | `quick_allreduce_fusions.py` | The fused residual-add + RMSNorm epilogue and the row-to-workgroup geometry. All three kernels use them when built with `fusion="rmsnorm"`. |
 
 The host classes are in `aiter/ops/flydsl/`:
@@ -21,7 +21,7 @@ The host classes are in `aiter/ops/flydsl/`:
 |---|---|
 | `one_shot_allreduce.py` | `OneShotAllReduce` and `OneShotAllReduceRMSNorm`, the host classes for the one-shot kernel. |
 | `quick_allreduce.py` | `FlyQuickAllReduce` and `FlyQuickAllReduceRMSNorm`, the host classes for the mesh and the ring. |
-| `allreduce_policy.py` | The payload-size boundaries between the three kernels, and the tuning ladders, for the plain and the fused all-reduce. |
+| `allreduce_policy.py` | The limits and the values each kernel can build, the policy records, and the tables: the payload-size boundaries between the three kernels and the tuning ladders, for the plain and the fused all-reduce. |
 | `allreduce_host_shared.py` | IPC inbox setup, link detection and other host helpers. |
 
 The dispatchers are in `aiter/dist/device_communicators/`:
@@ -107,7 +107,7 @@ selects the memory type of the inbox:
   topology cannot be read. At TP2, `auto` selects `uncached` on PCIe also, because
   there is only one remote peer.
 
-The cache policy for each mode is in `_INBOX_POLICY` in `allreduce_shared.py`.
+The cache policy for each mode is in `_INBOX_POLICY` in `transport.py`.
 
 ## Dispatch
 
@@ -203,8 +203,8 @@ The code reads `AITER_FLY_AR` when it creates `CustomAllreduce` and
 
 `AITER_FLY_AR=1` does not enable a kernel on an unsupported system. The
 kernels need gfx942 or gfx950, a world size of 2, 4 or 8, and the `flydsl`
-package. These limits, and the other shared constants of the kernels, are in
-the "Limits" section of `aiter/ops/flydsl/kernels/comm/allreduce_shared.py`.
+package. These limits, and the values each kernel can build, are in the
+"Limits" section of `aiter/ops/flydsl/allreduce_policy.py`.
 
 ### Set the interconnect type
 
@@ -347,7 +347,7 @@ and how it prevents bias in the comparison.
 
 The FlyDSL JIT cache key includes the source of the kernel function. It does
 not include helper functions from other modules, for example
-`allreduce_shared.py` or `quick_allreduce_codec.py`. If you change a helper,
+`transport.py` or `quick_allreduce_codec.py`. If you change a helper,
 FlyDSL can run an old binary from the cache.
 
 To prevent this, set this variable at the repository root before you run a
