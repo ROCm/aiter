@@ -104,7 +104,22 @@ from aiter.ops.flydsl.kernels.hstu.hstu_attention_common import (
 # PREFETCH_W * KV_OWNED_SUBTILES MFMAs of cover.  The fp8 reference uses depth 2
 # against a 32-cycle `32x32x64`; `16x16x16_bf16` is only ~16 cycles, so the
 # depth has to be larger here to hide the same ~130-cycle ds_read.
-PREFETCH_W = 15
+#
+# But NOT as large as it will go. At W = NUM_OPERAND_GROUPS - 1 the priming
+# loop issues every read but one before the burst, and they queue on the LDS
+# pipe -- 8 cycles of bank time each, times eight waves sharing the unit, with
+# no MFMA between them to absorb it. Lower W scatters them INTO the burst.
+# Swept on the benchmark shape (fused kernel, median of 3):
+#
+#     W = 15   360.2 ms        W = 6    351.4 ms   <- best
+#     W = 11   354.0 ms        W = 4    353.1 ms
+#     W =  8   352.0 ms
+#
+# The curve is flat between 6 and 8 and turns back up by 4, where the cover
+# per read gets too short. An earlier sweep of this constant looked only at
+# VGPR (flat at every value) and concluded it was not a lever; it is one for
+# TIME.
+PREFETCH_W = 6
 # Operand groups per MFMA phase: 4 GEMMs x (head_dim / MFMA_M) chunks.
 NUM_OPERAND_GROUPS = 16
 
