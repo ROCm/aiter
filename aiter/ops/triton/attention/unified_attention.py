@@ -201,6 +201,29 @@ def use_2d_kernel(params: _UAParams, backend: str = "triton"):
     )
 
 
+def _zero_empty_decode_rows(output: torch.Tensor, params: _UAParams):
+    """Make zero-KV decode padding rows deterministic instead of NaN."""
+    if params.all_decode:
+        empty = params.seqused_k == 0
+        empty = empty.view(-1, *([1] * (output.ndim - 1)))
+        output.masked_fill_(empty, 0)
+    return output
+
+
+def _neutralize_empty_decode_partials(
+    segm_output: torch.Tensor,
+    segm_max: torch.Tensor,
+    segm_expsum: torch.Tensor,
+    params: _UAParams,
+):
+    if params.all_decode:
+        empty = params.seqused_k == 0
+        segm_output.masked_fill_(empty[:, None, None, None], 0)
+        segm_max.masked_fill_(empty[:, None, None], float("-inf"))
+        segm_expsum.masked_fill_(empty[:, None, None], 0)
+    return segm_output, segm_max, segm_expsum
+
+
 def unified_attention(
     q,
     k,
@@ -467,9 +490,11 @@ def unified_attention(
             )
 
         if NUM_SEGMENTS == 1:
-            return segm_output
+            return _zero_empty_decode_rows(segm_output, params)
         elif skip_reduce:
-            return segm_output, segm_max, segm_expsum
+            return _neutralize_empty_decode_partials(
+                segm_output, segm_max, segm_expsum, params
+            )
 
         # Gluon reduce (one workgroup/token, in-wave segment merge); valid for all-decode with small split counts, else the Triton reduce_segments.
         use_gluon_reduce = (
@@ -497,7 +522,7 @@ def unified_attention(
                 NUM_SEGMENTS,
                 TILE_SIZE,
             )
-    return out
+    return _zero_empty_decode_rows(out, params)
 
 
 def is_2d_gluon_available(params: _UAParams, backend: str):
