@@ -320,8 +320,11 @@ def build_hstu_attention_bwd_fused_pp(
     # address the same 64 dwords (measured 64 of 256 distinct). One sink row
     # per flush row restores g1's spread -- consecutive rows are DQ_PAD apart,
     # which is 4 banks.
-    DQG_SINK, DQG_ZERO = BLOCK_N, 2 * BLOCK_N
-    DQG_ROWS = 2 * BLOCK_N + 1
+    # One row past the tile: a permanently-zero source for g1's read. The 16
+    # SINK rows are gone -- g0 no longer writes a dead row, it simply does not
+    # write, now that the two tails are a uniform `if is_g0:` branch.
+    DQG_ZERO = BLOCK_N
+    DQG_ROWS = BLOCK_N + 1
     DQG_ELEMS = DQG_ROWS * DQ_PAD
     # 4 contiguous outputs per lane: 16 rows x 16 lanes x 4 = BLOCK_N*head_dim.
     DQ_PER_LANE = BLOCK_N * head_dim // (NUM_WAVES // 2 * WARP_SIZE)
@@ -1097,7 +1100,6 @@ def build_hstu_attention_bwd_fused_pp(
         # g1 writes its group sum to the row g0 will read; g0 writes to the
         # sink row and reads the real one. g1 reads the permanently-zero row,
         # so it adds nothing. No branch, and neither group idles.
-        dq_wrow = is_g0.select(fx.Int32(DQG_SINK) + dq_frow, dq_frow)
         dq_rrow = is_g0.select(dq_frow, fx.Int32(DQG_ZERO))
 
         def dq_flush_issue():
@@ -1178,35 +1180,44 @@ def build_hstu_attention_bwd_fused_pp(
             # are two VALU adds old. That is LDS-pipe contention, both with its
             # own reads and with the partner group's phase M, so distance is
             # the only lever. Costs 4 VGPR to hold the pre-exchange sum.
+            # The two tails are now an `if is_g0:` branch, not two writes to
+            # dead destinations. `is_g0` is wave-UNIFORM, so this is a scalar
+            # branch, and the kernel already branches on it for transpose_q vs
+            # transpose_do.
+            #
+            # What this removes: g1's HBM store to the trash row, and g0's
+            # `dqg` write to a sink row. The 16 sink rows go with them.
+            #
+            # The HBM store has to be `fx.generic_store`, not
+            # `dq_part[...] = v`. A subscript ASSIGNMENT inside a dynamic `if`
+            # makes the AST rewriter treat `dq_part` as branch-assigned and
+            # demand an scf.if result for it; a call has no assignment target.
+            # That restriction is what forced the trash rows originally.
+            #
+            # The `dqg` READ stays unconditional at the head of the phase: g1
+            # reads the permanently-zero row and adds nothing. Moving it in
+            # here would cost it the gate's latency cover, which is worth far
+            # more than the one read.
             _own = list(acc)
-            for j in range_constexpr(DQ_PER_LANE):
-                acc[j] = fadd_scalar(acc[j], _g[j])
-
-            # The partial belongs to tile q_tile_v - 1: phase M consumes
-            # `ds_prev`, produced by the PREVIOUS trip's gate phase.
             _qa = (q_tile_v - fx.Int32(1)) * fx.Int32(BLOCK_N) + dq_frow
-            # `dq_part` is [row][H*D] and the offsets are in ROWS. A flat
-            # element layout is the same memory but overflows the launch ABI,
-            # which packs dynamic extents as i32: the scratch is 21e9 fp32 per
-            # pass at the benchmark shape.
             _r = fx.Int64(dq_poff) + fx.Int64(_qa - kv_start_row)
-            # Upper bound is the jagged tail; the lower one catches the first
-            # trip, whose `ds_prev` is the zero pack from `acc_init` and whose
-            # nominal tile is q_tile_start-1.
             _r = (_qa < seq_len).select(_r, fx.Int64(0))
             _r = (_qa >= kv_start_row).select(_r, fx.Int64(0))
-            _r = is_g0.select(_r, fx.Int64(0))
             _hc = head_idx * fx.Int32(head_dim) + dq_fcol
-            for j in range_constexpr(DQ_PER_LANE):
-                # Scalar, not `acc[j] * c_inv_n`: packed, this was the single
-                # largest non-barrier stall in the dispatch-150 trace --
-                # 12.4 M cycles, 12.4% of all stall, 317 cy/exec.
-                dq_part[_r, _hc + fx.Int32(j)] = fmul_const_scalar(
-                    acc[j], c_inv_n
-                )  # fmt: skip
-            dqg[dq_wrow, dq_fvec, None].store(
-                Vec.from_elements(_own, fx.Float32)
-            )
+            if is_g0:
+                for j in range_constexpr(DQ_PER_LANE):
+                    fx.generic_store(
+                        fx.get_iter(dq_part)
+                        + _r * fx.Int64(num_heads * head_dim)
+                        + fx.Int64(_hc + fx.Int32(j)),
+                        fmul_const_scalar(
+                            fadd_scalar(_own[j], _g[j]), c_inv_n
+                        ),
+                    )  # fmt: skip
+            else:
+                dqg[dq_frow, dq_fvec, None].store(
+                    Vec.from_elements(_own, fx.Float32)
+                )
 
         # ---- phase M -------------------------------------------------------
         def mfma_phase(dv, dk, p_prev, ds_prev, q_tile, rm_cur, rm_fill, t_cur,
