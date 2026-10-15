@@ -1030,12 +1030,22 @@ def _run_moe_reduction(
     fp8_scale_blk=None,
     fp8_pitch_align=None,
 ):
-    """Topk reduction epilogue for stage2 reduce mode."""
+    """Topk reduction epilogue for stage2 reduce mode.
+
+    ``moe_sorting`` drops every route whose router id is negative, so the slot
+    GEMM2 writes per (token, route) is left uninitialized for those routes. When
+    ``topk_ids`` is available the kernel skips them (and, under EP, the
+    mask-rejected ones) instead of summing garbage into ``out``.
+    """
     use_mask = expert_mask is not None
     if use_mask and topk_ids is None:
         raise ValueError(
             "topk_ids is required when expert_mask is provided for reduce mode"
         )
+    # Derived, never passed in: the kernel specialization must be a pure
+    # function of the arguments so the AOT precompile cannot disagree with the
+    # runtime call site.
+    skip_invalid_ids = topk_ids is not None
     # Map torch dtype -> compile_moe_reduction dtype_str
     if out.dtype == torch.float16:
         _reduce_dtype_str = "f16"
@@ -1078,11 +1088,16 @@ def _run_moe_reduction(
         X = target.view(token_num, topk, model_dim)
     if use_mask:
         em = expert_mask.to(torch.int32).contiguous()
-        tk = topk_ids.to(torch.int32).contiguous()
     else:
-        # Placeholders; kernel ignores them when use_mask=False (and for fp8).
+        # Placeholder; the kernel ignores it when use_mask=False (and for fp8).
         em = torch.empty(0, device=out.device, dtype=torch.int32)
-        tk = torch.empty(0, device=out.device, dtype=torch.int32)
+    # Real ids make the kernel skip the routes moe_sorting dropped; without
+    # them the caller has to have zeroed those rows (see the v2 stage2 wrapper).
+    tk = (
+        topk_ids.to(torch.int32).contiguous()
+        if skip_invalid_ids
+        else torch.empty(0, device=out.device, dtype=torch.int32)
+    )
     # Set when stage2 deferred the route-weight multiply to this reduction.
     use_weight = topk_weights is not None
     tw = (
@@ -1099,6 +1114,7 @@ def _run_moe_reduction(
         model_dim=model_dim,
         dtype_str=_reduce_dtype_str,
         use_mask=use_mask,
+        skip_invalid_ids=skip_invalid_ids,
         num_experts=num_experts,
         out_dtype_str=out_dtype_str,
         use_weight=use_weight,
