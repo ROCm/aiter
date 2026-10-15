@@ -197,13 +197,12 @@ _PLAIN_K2048_SMALL_CU_NARROW_MIN_ROWS = 128
 # plain falls back to its generic kernel and decode is faster again at 8..32
 # rows from 100000 columns, so the few-row band stops there.  Rows the
 # stream small-reject path serves with its specialised branch -- one or two
-# rejected columns (`REJECTS <= 2` in `_stream_small_reject_kernel`) -- stay
-# with it: 1.09x-1.60x faster than plain at 1..16384 rows, bar 6..8 rows at two
+# rejected columns (`_SMALL_REJECT_UNMASKED_MAX`) -- stay with it:
+# 1.09x-1.60x faster than plain at 1..16384 rows, bar 6..8 rows at two
 # rejects (2-4% slower).  From three rejects on, its rejection mask and prefix
 # scan run slower than plain at every row count measured, 1..16384 (plain
 # 0.54x-0.94x of it at 2051..2056 columns), so plain keeps those rows; the
 # kernel's wider limits (`_stream_small_reject`) still serve `stream` itself.
-_PLAIN_K2048_SMALL_REJECT_YIELD_MAX = 2
 _PLAIN_K2048_NARROW_WIDTH = 8192
 _PLAIN_K2048_FEW_ROWS = 128
 # `kTopkPlainGfx950AnyRowsMaxLen` in csrc/kernels/topk_per_row_kernels.cu;
@@ -501,6 +500,11 @@ def _select_whole_rows(input, idx, with_values):
     return out
 
 
+# The rejects `_stream_small_reject_kernel` takes through its unmasked branch,
+# which is written out for one and two; `_plain_takes` leaves those rows to it.
+_SMALL_REJECT_UNMASKED_MAX: tl.constexpr = tl.constexpr(2)
+
+
 @triton.jit
 def _stream_small_reject_kernel(
     scores_ptr,
@@ -534,7 +538,7 @@ def _stream_small_reject_kernel(
     is_nan = (bits & 0x7FFFFFFF) > 0x7F800000
     key = tl.where(is_nan | ~live, 0x7FFFFFFF, key)
 
-    if REJECTS <= 2:
+    if REJECTS <= _SMALL_REJECT_UNMASKED_MAX:
         # Keep the two hottest shapes byte-for-byte equivalent to the original
         # specialization: no rejection mask and no prefix scan.
         worst_key0 = tl.min(key, axis=0)
@@ -851,7 +855,7 @@ def _plain_takes(
         if width < _PLAIN_K2048_NARROW_WIDTH:
             rejects = width - k
             return rejects > 0 and not (
-                rejects <= _PLAIN_K2048_SMALL_REJECT_YIELD_MAX
+                rejects <= _SMALL_REJECT_UNMASKED_MAX.value
                 and _stream_small_reject(rows, rejects)
             )
         if rows <= _PLAIN_K2048_FEW_ROWS:
