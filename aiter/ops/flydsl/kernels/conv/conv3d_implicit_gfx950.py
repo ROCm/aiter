@@ -338,7 +338,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         SharedStorage = make_shared_storage(elem_ty, cfg)
 
     def _body_kw_reuse(y, x, weight, bias, ext, grid_m):
-        KW, CGP = param.kw, geom.cgp
+        KW = param.kw
         strip = StripGather(im2col_plan, x, ext)
         weights = WeightLoader(cfg, kernel_grid, CRS, weight, W_BYTES)
         scatter = OutputScatter(scatter_plan, y, bias, elem_ty, ext)
@@ -400,7 +400,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         )
 
     def _body_kh_reuse(y, x, weight, bias, ext, grid_m):
-        KH, KW, CGP = param.kh, param.kw, geom.cgp
+        KH, KW = param.kh, param.kw
         PIPE = cfg.pipe_stages
         patch = PatchGather(im2col_plan, x, ext)
         weights = WeightLoader(cfg, kernel_grid, CRS, weight, W_BYTES)
