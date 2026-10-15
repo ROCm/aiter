@@ -1109,6 +1109,18 @@ if __name__ == "__main__":
     )
     torch.set_printoptions(sci_mode=False)
     args = parser.parse_args()
+
+    # CI runs this file as `python3 op_tests/test_pa_ragged.py` (see
+    # .github/scripts/aiter_test.sh), not under pytest, so the pytest-style
+    # tests below are only reached if called from here. Run the FP8 KV checks
+    # first: they take ~18s and they are the ones guarding in-kernel precision,
+    # so a failure should surface before the long sweep rather than after it.
+    print("[test] FP8 KV cache checks")
+    test_paged_attention_ragged_glm_gqa_fp8_kv_nhd()
+    for seq_len in (256, 512):
+        test_paged_attention_ragged_fp8_logits_stay_in_normal_range(seq_len)
+    print("[test] FP8 KV cache checks passed")
+
     if args.pa_variant != [PAVariant.Shomy, PAVariant.Asm]:
         args.pa_variant = [PAVariant[variant] for variant in args.pa_variant]
     args.quant_cache_dtype = [
