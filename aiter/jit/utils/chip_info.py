@@ -281,10 +281,7 @@ def get_cu_num_custom_op() -> int:
             return torch_processor_count_to_cu(gfx, props.multi_processor_count)
         try:
             output = _gpu_info_output()
-            if IS_WINDOWS:
-                gpu_compute_units = _parse_cu_num_hipinfo(output)
-            else:
-                gpu_compute_units = _parse_cu_num_rocminfo(output)
+            gpu_compute_units = _parse_cu_num_rocminfo(output)
         except Exception as e:  # noqa: BLE001  blanket catch is intentional here
             raise RuntimeError(
                 f"Get GPU Compute Unit from {_GPU_INFO_TOOL} failed {e!s}"
