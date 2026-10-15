@@ -116,9 +116,9 @@ class TestProveSelection(_StubFamily):
         self.assertEqual(proof.status, "failed")
         self.assertIn("output differs", proof.detail)
 
-    def test_no_expectation_checks_only_that_the_operator_runs(self):
+    def test_no_expectation_is_reported_as_unchecked(self):
         proof = self.prove("ck", None)
-        self.assertEqual(proof.status, "verified", proof.detail)
+        self.assertEqual(proof.status, "unchecked", proof.detail)
         self.assertEqual(proof.observed, [{"backend": "ck"}])
 
 
@@ -168,6 +168,15 @@ class TestTunerCommonRunConfig(_StubFamily):
             def expected_selection(self, row):
                 return {"backend": row["backend"]}
 
+            def get_gfx(self):
+                return "gfx950"
+
+            def get_gpu_model(self):
+                return "mi355x"
+
+            def get_cu_num(self):
+                return 256
+
         tuner = StubTuner("stub", ["m"], ["backend"])
         tuner.untunedf = pd.DataFrame({"m": [128, 256], "backend": ["triton", "ck"]})
         return tuner
@@ -186,6 +195,16 @@ class TestTunerCommonRunConfig(_StubFamily):
         self.assertEqual(results[0]["status"], "ok")
         self.assertEqual(results[0]["e2e_us"], 1.5)
         self.assertTrue(results[1]["status"].startswith("error:"), results[1])
+
+    def test_a_row_keyed_on_another_gpu_fails_without_spawning(self):
+        tuner = self.make_tuner()
+        args = argparse.Namespace(warmup=1, iters=1, timeout=60)
+        row = {"m": 128, "backend": "triton", "gpu_model": "mi300x"}
+        with mock.patch("aiter.utility.selection_proof.prove_selection") as spawn:
+            proof = tuner.prove_selection(row, self.config("triton"), args)
+        spawn.assert_not_called()
+        self.assertEqual(proof.status, "failed")
+        self.assertIn("gpu_model=mi300x", proof.detail)
 
 
 if __name__ == "__main__":

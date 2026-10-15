@@ -22,6 +22,9 @@ from aiter.utility.tuning_policy import (
     DEFAULT_MEASUREMENT,
     DEFAULT_PROMOTION,
     DEFAULT_RUN,
+    PROMOTE,
+    PromotionPolicy,
+    gate_against_incumbent,
 )
 
 _REPOSITORY_ROOT = str(Path(__file__).resolve().parents[2])
@@ -614,8 +617,8 @@ class TunerCommon:
     def expected_selection(self, row) -> dict[str, Any] | None:
         """The selection a fresh process must record when it runs ``row``.
 
-        None checks only that the public operator runs and is correct, which
-        is right for an untuned row that should stay on auto-select.
+        None checks only that the public operator runs and is correct, and the
+        proof reports ``unchecked`` rather than ``verified``.
         """
         return None
 
@@ -630,22 +633,43 @@ class TunerCommon:
             for key, value in row.items()
             if pd.notna(value)
         }
-        extra_env = {}
-        if "gpu_model" in probe_row:
-            extra_env["AITER_GPU_MODEL"] = str(probe_row["gpu_model"])
+        expected = self.expected_selection(row)
+        mismatch = self._hardware_mismatch(probe_row)
+        if mismatch:
+            return selection_proof.SelectionProof(
+                "failed", expected, [], None, mismatch, 0.0
+            )
         return selection_proof.prove_selection(
             family=self.SELECTION_FAMILY or self.name,
             probe_module=self.SELECTION_PROBE_MODULE,
             row=probe_row,
-            expected=self.expected_selection(row),
+            expected=expected,
             config_env=self.get_arg_defaults().get("config_env_name"),
             config_file=config_file,
             warmup=args.warmup,
             iters=args.iters,
             timeout=args.timeout,
             repository_root=_REPOSITORY_ROOT,
-            extra_env=extra_env,
         )
+
+    def _hardware_mismatch(self, row) -> str:
+        """Why ``row`` cannot be proven on this GPU, or "" when it can.
+
+        The child resolves the hardware key from the device it runs on, as
+        serving does, so a row keyed on other hardware would simply miss.
+        """
+        live = {
+            "gfx": self.get_gfx,
+            "gpu_model": self.get_gpu_model,
+            "cu_num": self.get_cu_num,
+        }
+        for field, resolve in live.items():
+            value = row.get(field)
+            if value is None or str(value).strip() == "":
+                continue
+            if str(value).strip().lower() != str(resolve()).strip().lower():
+                return f"row is keyed on {field}={value}, this GPU is {resolve()}"
+        return ""
 
     def run_config(self, args):
         """Run the production operator for each shape in the untuned CSV.
@@ -665,12 +689,14 @@ class TunerCommon:
         results = []
         for _, row in self.untunedf.iterrows():
             proof = self.prove_selection(row, config_file, args)
-            verified = proof.status == "verified"
+            passed = proof.status in ("verified", "unchecked")
             results.append(
                 {
                     "shape": str(tuple(row[key] for key in self.keys)),
-                    "e2e_us": proof.latency_us if verified else -1,
-                    "status": "ok" if verified else f"error: {proof.detail}",
+                    "e2e_us": proof.latency_us if passed else -1,
+                    "status": (
+                        "ok" if passed else f"error: {proof.status}: {proof.detail}"
+                    ),
                 }
             )
         return results
@@ -1070,10 +1096,19 @@ class TunerCommon:
         )
         comparison.loc[~valid, "improvement_pct"] = float("nan")
         comparison["update_reason"] = "skip"
-        comparison.loc[
-            valid & (comparison["improvement_pct"] >= threshold_percent),
-            "update_reason",
-        ] = "threshold_met"
+        policy = PromotionPolicy(min_improvement_pct=float(threshold_percent))
+        promoted = pd.Series(
+            [
+                bool(ok)
+                and gate_against_incumbent(pre, post, policy).outcome == PROMOTE
+                for ok, pre, post in zip(
+                    valid, comparison["pre_us"], comparison["post_us"]
+                )
+            ],
+            index=comparison.index,
+            dtype=bool,
+        )
+        comparison.loc[promoted, "update_reason"] = "threshold_met"
         comparison.loc[no_baseline, "update_reason"] = "no_baseline"
         comparison["update"] = comparison["update_reason"] != "skip"
         return comparison[columns]
@@ -1473,8 +1508,12 @@ class TunerCommon:
                 if "cu_num" in tunedf.columns:
                     tunedf = tunedf[tunedf["cu_num"] == cu]
                 if "gpu_model" in tunedf.columns:
+                    # A blank gpu_model is a row from before the column existed.
+                    models = tunedf["gpu_model"].fillna("").astype(str).str.strip()
+                    live = chip_info.normalize_gpu_model(self.get_gpu_model())
                     tunedf = tunedf[
-                        tunedf["gpu_model"].astype(str) == self.get_gpu_model()
+                        (models == "")
+                        | (models.map(chip_info.normalize_gpu_model) == live)
                     ]
                 self.untunedf = tunedf.drop_duplicates(subset=self.keys).reset_index(
                     drop=True

@@ -82,7 +82,6 @@ def run_selection_probe(
     result = dict(
         probe(request["row"], warmup=request["warmup"], iters=request["iters"])
     )
-    result.setdefault("correctness", "ok")
     print(_RESULT_PREFIX + json.dumps(result, sort_keys=True), flush=True)
     return 0
 
@@ -91,9 +90,10 @@ class SelectionProof(NamedTuple):
     """Outcome of one fresh-process proof.
 
     ``status`` is ``verified`` when the child ran, matched the reference and
-    recorded only the expected selection; ``wrong_selection`` when it ran
-    correctly but dispatched elsewhere; ``failed`` when the child itself
-    failed or could not be judged.
+    recorded only the expected selection; ``unchecked`` when it ran and
+    matched the reference but there was no expected selection to compare;
+    ``wrong_selection`` when it ran correctly but dispatched elsewhere;
+    ``failed`` when the child itself failed or could not be judged.
     """
 
     status: str
@@ -131,7 +131,7 @@ def _judge(
     expected: Mapping[str, Any] | None, observed: list[dict[str, Any]]
 ) -> tuple[str, str]:
     if expected is None:
-        return "verified", ""
+        return "unchecked", ""
     if not observed:
         return "wrong_selection", "the operator recorded no selection"
     stray = [
@@ -156,7 +156,6 @@ def prove_selection(
     iters: int,
     timeout: float,
     repository_root: str,
-    extra_env: Mapping[str, str] | None = None,
 ) -> SelectionProof:
     """Run ``row`` in a fresh process and check what it dispatched to.
 
@@ -164,7 +163,7 @@ def prove_selection(
     from ``repository_root``, so ``import aiter`` resolves to the checkout
     being tuned rather than an installed copy. ``config_file=None`` keeps the
     caller's config. ``expected=None`` checks only that the public operator
-    runs and matches its reference.
+    runs and matches its reference, and reports ``unchecked``.
     """
 
     started = time.time()
@@ -172,7 +171,6 @@ def prove_selection(
     os.close(descriptor)
     os.unlink(proof_path)
     environment = os.environ.copy()
-    environment.update(extra_env or {})
     if config_env and config_file:
         environment[config_env] = os.path.abspath(config_file)
     environment[SELECTION_PROOF_ENV] = proof_path
@@ -230,8 +228,9 @@ def prove_selection(
                 f"{completed.stderr[-2000:].strip()}"
             ),
         )
-    result = json.loads(result_line)
-    if result.get("correctness") != "ok":
-        return outcome("failed", observed, detail=f"correctness: {result}")
+    try:
+        result = json.loads(result_line)
+    except ValueError as error:
+        return outcome("failed", observed, detail=f"unreadable probe result: {error}")
     status, detail = _judge(expected_dict, observed)
     return outcome(status, observed, result.get("latency_us"), detail)

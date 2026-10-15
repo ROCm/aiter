@@ -655,11 +655,14 @@ def mp_tuner(
 
     print(f"Distributing {len(task_group)} task groups across {mp_num} GPUs")
 
-    # Every caller gets per-candidate progress, not just checkpointing ones: a
-    # group that faults loses only the candidate that faulted, instead of every
-    # measurement the worker had already finished for that shape.
-    manager = mp.Manager()
-    progress_queue = manager.Queue()
+    # Per-candidate progress lets a group that faults keep what it had already
+    # measured. Only typed-status and checkpointing callers can use a partial
+    # group, so only they pay for the manager process.
+    if return_status or result_callback is not None:
+        manager = mp.Manager()
+        progress_queue = manager.Queue()
+    else:
+        manager = progress_queue = None
     progress_results = {}
 
     def publish_progress(result):
@@ -669,6 +672,8 @@ def mp_tuner(
             result_callback(result)
 
     def drain_progress():
+        if progress_queue is None:
+            return
         while True:
             try:
                 publish_progress(progress_queue.get_nowait())
@@ -980,7 +985,8 @@ def mp_tuner(
     except Exception as e:  # noqa: BLE001
         print(f"Warning: Error during pool cleanup: {e}")
     drain_progress()
-    manager.shutdown()
+    if manager is not None:
+        manager.shutdown()
 
     # Print summary
     if failed_tasks:
