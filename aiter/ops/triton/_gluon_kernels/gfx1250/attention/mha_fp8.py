@@ -55,14 +55,14 @@ def concat_subtile(x, y):
 
 
 @gluon.jit
-def apply_mask(qk, subtile: gl.constexpr, iter_from_end, num_iters, pid_m, BLOCK_M, BLOCK_N, SEQLEN, LAYOUT, CAUSAL, EVEN_N):
+def apply_mask(qk, subtile: gl.constexpr, tile_m, tile_n, BLOCK_M, BLOCK_N, SEQLEN, LAYOUT, CAUSAL, EVEN_N):
     if CAUSAL:
-        offs_m = pid_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LAYOUT))
+        offs_m = tile_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LAYOUT))
 
     if subtile == 0:
-        offs_n = (num_iters - iter_from_end) * BLOCK_N + gl.arange(0, BLOCK_N // 2, layout=gl.SliceLayout(0, LAYOUT))
+        offs_n = tile_n * BLOCK_N + gl.arange(0, BLOCK_N // 2, layout=gl.SliceLayout(0, LAYOUT))
     else:
-        offs_n = (num_iters - iter_from_end) * BLOCK_N + BLOCK_N // 2 + gl.arange(0, BLOCK_N // 2, layout=gl.SliceLayout(0, LAYOUT))
+        offs_n = tile_n * BLOCK_N + BLOCK_N // 2 + gl.arange(0, BLOCK_N // 2, layout=gl.SliceLayout(0, LAYOUT))
 
     if CAUSAL and not EVEN_N:
         mask_causal = offs_m[:, None] >= offs_n[None, :]
@@ -259,17 +259,14 @@ def _mha_fwd_subtiled(
         num_n_iter = gl.cdiv((pid_m + 1) * BLOCK_M, BLOCK_N)
     else:
         num_n_iter = gl.cdiv(SEQLEN, BLOCK_N)
-        
-    if CAUSAL or not EVEN_N:
-        num_n_iter = gl.maximum(num_n_iter, 3)
 
     gl.amd.gfx1250.tdm.async_wait(5)
     qk0 = gl.amd.cdna5.wmma(q, k0, qk_zeros)
-    if CAUSAL or not EVEN_N:
-        qk0 = apply_mask(qk0, 0, 3, num_n_iter, pid_m, BLOCK_M, BLOCK_N, SEQLEN, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
     qk1 = gl.amd.cdna5.wmma(q, k1, qk_zeros)
     if CAUSAL or not EVEN_N:
-        qk1 = apply_mask(qk1, 1, 3, num_n_iter, pid_m, BLOCK_M, BLOCK_N, SEQLEN, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
+        if num_n_iter <= 2:
+            qk0 = apply_mask(qk0, 0, pid_m, 0, BLOCK_M, BLOCK_N, SEQLEN, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
+            qk1 = apply_mask(qk1, 1, pid_m, 0, BLOCK_M, BLOCK_N, SEQLEN, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
     qk = concat_subtile(qk0, qk1)
     m_ij = fast_maximum(m_i, gl.reduce(qk, 1, fast_maximum) * qk_scale)
     qk0_shifted = qk0 * qk_scale - m_ij[:, None]
@@ -329,7 +326,8 @@ def _mha_fwd_subtiled(
     with gl.amd.warp_pipeline_stage("ep0_0"):
         qk0 = gl.amd.cdna5.wmma(q, k0, qk_zeros)
         if CAUSAL or not EVEN_N:
-            qk0 = apply_mask(qk0, 0, 2, num_n_iter, pid_m, BLOCK_M, BLOCK_N, SEQLEN, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
+            num_n_iter = gl.maximum(num_n_iter, 3)
+            qk0 = apply_mask(qk0, 0, pid_m, num_n_iter - 2, BLOCK_M, BLOCK_N, SEQLEN, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
         k1 = local_load_k(k1_buffer, read_idx_k, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K)
         read_idx_k += 1
         p1 = gl.exp2(qk1_shifted)
@@ -344,7 +342,7 @@ def _mha_fwd_subtiled(
     with gl.amd.warp_pipeline_stage("ep0_1"):
         qk1 = gl.amd.cdna5.wmma(q, k1, qk_zeros)
         if CAUSAL or not EVEN_N:
-            qk1 = apply_mask(qk1, 1, 2, num_n_iter, pid_m, BLOCK_M, BLOCK_N, SEQLEN, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
+            qk1 = apply_mask(qk1, 1, pid_m, num_n_iter - 2, BLOCK_M, BLOCK_N, SEQLEN, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
         v0 = local_load_v(v0_buffer, read_idx_v, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V)
         p = concat_subtile(p0, p1)
         l_ij = gl.sum(p, 1)
@@ -379,7 +377,7 @@ def _mha_fwd_subtiled(
     with gl.amd.warp_pipeline_stage("ep1_0"):
         qk0 = gl.amd.cdna5.wmma(q, k0, qk_zeros)
         if CAUSAL or not EVEN_N:
-            qk0 = apply_mask(qk0, 0, 1, num_n_iter, pid_m, BLOCK_M, BLOCK_N, SEQLEN, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
+            qk0 = apply_mask(qk0, 0, pid_m, num_n_iter - 1, BLOCK_M, BLOCK_N, SEQLEN, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
         k1 = local_load_k(k1_buffer, read_idx_k, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K)
         read_idx_k += 1
         p1 = gl.exp2(qk1_shifted)
@@ -392,7 +390,7 @@ def _mha_fwd_subtiled(
     with gl.amd.warp_pipeline_stage("ep1_1"):
         qk1 = gl.amd.cdna5.wmma(q, k1, qk_zeros)
         if CAUSAL or not EVEN_N:
-            qk1 = apply_mask(qk1, 1, 1, num_n_iter, pid_m, BLOCK_M, BLOCK_N, SEQLEN, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
+            qk1 = apply_mask(qk1, 1, pid_m, num_n_iter - 1, BLOCK_M, BLOCK_N, SEQLEN, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
         v0 = local_load_v(v0_buffer, read_idx_v, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V)
         p = concat_subtile(p0, p1)
         l_ij = gl.sum(p, 1)
