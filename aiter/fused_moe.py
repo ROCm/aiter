@@ -1065,9 +1065,7 @@ def resolve_activation_dtype(
         elif activation == ActivationType.Relu2:
             q_dtype_a = dtypes.bf16
         elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
-            if gfx != "gfx950":
-                q_dtype_a = dtypes.bf16
-            elif gate_up_interleave is False:
+            if gfx != "gfx950" or gate_up_interleave is False:
                 q_dtype_a = dtypes.bf16
             else:
                 q_dtype_a = _bound_split(M, bf16_fp8_bound, dtypes.bf16, dtypes.fp8)
@@ -3303,9 +3301,9 @@ def _make_mxfp4_metadata(
 
 def _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode, gate_up_interleave=None):
     if gate_up_interleave is not None:
-        return (
-            gate_up_interleave is False and gate_mode == GateMode.SEPARATED
-        ) or (gate_up_interleave is True and gate_mode == GateMode.INTERLEAVE)
+        return (gate_up_interleave is False and gate_mode == GateMode.SEPARATED) or (
+            gate_up_interleave is True and gate_mode == GateMode.INTERLEAVE
+        )
     return (
         q_dtype_a in (dtypes.bf16, dtypes.fp4x2) and gate_mode == GateMode.SEPARATED
     ) or (q_dtype_a == dtypes.fp8 and gate_mode == GateMode.INTERLEAVE)
