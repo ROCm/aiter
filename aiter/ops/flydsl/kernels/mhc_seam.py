@@ -1323,23 +1323,20 @@ def compile_mhc_seam_finish_nonorm(
     ) -> None:
         tid = fx.thread_idx.x
         lane = tid % fx.Int32(SPLIT_SLOTS)
-        raw_token = fx.block_idx.x * fx.Int32(TOKENS_PER_BLOCK) + tid // fx.Int32(
+        token = fx.block_idx.x * fx.Int32(TOKENS_PER_BLOCK) + tid // fx.Int32(
             SPLIT_SLOTS
         )
-        live = raw_token < n_tok
-        # The arithmetic runs unconditionally against a clamped token so the three stores
-        # stay the kernel's only branches; an out-of-range lane computes a duplicate of the
-        # last token and never stores it. The clamp needs n_tok >= 1: the wrapper returns
-        # early for T == 0, which finish_blocks(0) == 1 would otherwise launch with t = -1.
-        t = live.select(raw_token, n_tok - fx.Int32(1))
 
         # Lane -> projection row: comb rows 8..23 on lanes 0..15, pre 0..3 on 16..19, post
         # 4..7 on 20..23, the sum of squares on 24; lanes 25..31 are inert.
         row = (lane < fx.Int32(16)).select(lane + fx.Int32(8), lane - fx.Int32(16))
         row = (lane < fx.Int32(24)).select(row, lane)
 
-        tile = t // fx.Int32(block_m)
-        row_in_tile = t - tile * fx.Int32(block_m)
+        # Dead tokens fold token 0's line, which part_elements always allocates, so the
+        # loads stay hoisted out of the branch as the fused finish does.
+        safe = (token < n_tok).select(token, fx.Int32(0))
+        tile = safe // fx.Int32(block_m)
+        row_in_tile = safe - tile * fx.Int32(block_m)
         total = fx.Float32(0.0)
         squares = fx.Float32(0.0)
         for s in range_constexpr(splits):
@@ -1347,44 +1344,50 @@ def compile_mhc_seam_finish_nonorm(
                 line
             ) + row_in_tile * fx.Int32(SPLIT_SLOTS)
             total = total + _load_f32(part, base + row)
-            # The sum of squares shares the lane's own 128 B window, so this is an L1 hit
-            # and saves a cross-lane broadcast of lane 24.
+            # The sum of squares shares the lane's own 128 B window, so this is an L1
+            # hit and saves a cross-lane broadcast of lane 24.
             squares = squares + _load_f32(part, base + fx.Int32(rows))
 
-        rstd = fmath.rsqrt(squares * inv_wide + rms_eps)
-        s_pre = _load_f32(hc_scale, fx.Int32(0))
-        s_post = _load_f32(hc_scale, fx.Int32(1))
-        s_comb = _load_f32(hc_scale, fx.Int32(2))
-        scale = (lane < fx.Int32(16)).select(
-            s_comb, (lane < fx.Int32(20)).select(s_pre, s_post)
-        )
-        bias_row = (row < fx.Int32(rows)).select(row, fx.Int32(0))
-        logit = total * rstd * scale + _load_f32(hc_base, bias_row)
+        # No cross-lane move in this block leaves a token's own 32-lane group, and it holds
+        # no barrier or LDS, so one guard can cover the whole gate chain: a token owns a
+        # whole group, which makes the branch uniform over every lane `_dpp` can reach.
+        if token < n_tok:
+            rstd = fmath.rsqrt(squares * inv_wide + rms_eps)
+            s_pre = _load_f32(hc_scale, fx.Int32(0))
+            s_post = _load_f32(hc_scale, fx.Int32(1))
+            s_comb = _load_f32(hc_scale, fx.Int32(2))
+            scale = (lane < fx.Int32(16)).select(
+                s_comb, (lane < fx.Int32(20)).select(s_pre, s_post)
+            )
+            bias_row = (row < fx.Int32(rows)).select(row, fx.Int32(0))
+            logit = total * rstd * scale + _load_f32(hc_base, bias_row)
 
-        # Sigmoid on every lane; only 16..23 reach a store.
-        sig = sigmoid_f32(logit)
+            # Sigmoid on every lane; only 16..23 reach a store.
+            sig = sigmoid_f32(logit)
 
-        # Softmax across each comb row, then the `2 * repeat - 1` alternating half-steps,
-        # opening on the column pass as the reference does.
-        comb = _exp2((logit - _row_max(logit)) * LOG2E)
-        comb = comb * _rcp(_row_sum(comb)) + hc_sinkhorn_eps
-        comb = comb * _rcp(_col_sum(comb) + hc_sinkhorn_eps)
-        for _ in range_constexpr(sinkhorn_repeat - 1):
-            comb = comb * _rcp(_row_sum(comb) + hc_sinkhorn_eps)
+            # Softmax across each comb row, then the `2 * repeat - 1` alternating
+            # half-steps, opening on the column pass as the reference does.
+            comb = _exp2((logit - _row_max(logit)) * LOG2E)
+            comb = comb * _rcp(_row_sum(comb)) + hc_sinkhorn_eps
             comb = comb * _rcp(_col_sum(comb) + hc_sinkhorn_eps)
+            for _ in range_constexpr(sinkhorn_repeat - 1):
+                comb = comb * _rcp(_row_sum(comb) + hc_sinkhorn_eps)
+                comb = comb * _rcp(_col_sum(comb) + hc_sinkhorn_eps)
 
-        if live & (lane < fx.Int32(16)):
-            _store_f32(comb_out, t * fx.Int32(STREAMS * STREAMS) + lane, comb)
-        if live & (lane >= fx.Int32(16)) & (lane < fx.Int32(20)):
-            _store_f32(
-                next_pre, t * fx.Int32(STREAMS) + lane - fx.Int32(16), sig + hc_pre_eps
-            )
-        if live & (lane >= fx.Int32(20)) & (lane < fx.Int32(24)):
-            _store_f32(
-                post_out,
-                t * fx.Int32(STREAMS) + lane - fx.Int32(20),
-                sig * hc_post_mult_value,
-            )
+            if lane < fx.Int32(16):
+                _store_f32(comb_out, token * fx.Int32(STREAMS * STREAMS) + lane, comb)
+            if (lane >= fx.Int32(16)) & (lane < fx.Int32(20)):
+                _store_f32(
+                    next_pre,
+                    token * fx.Int32(STREAMS) + lane - fx.Int32(16),
+                    sig + hc_pre_eps,
+                )
+            if (lane >= fx.Int32(20)) & (lane < fx.Int32(24)):
+                _store_f32(
+                    post_out,
+                    token * fx.Int32(STREAMS) + lane - fx.Int32(20),
+                    sig * hc_post_mult_value,
+                )
 
     @flyc.jit
     def launch_mhc_seam_finish_nonorm(
