@@ -384,6 +384,39 @@ def topk_per_row_radix_stream_window_cap(
     return _window_cap(k, block_threads, vec, unroll, soft_trigger)
 
 
+def build_topk_per_row_radix_stream_module_for_width(
+    k: int,
+    wave_size: int,
+    width: int,
+    terminal_ok: bool,
+    block_threads: int = _BLOCK_THREADS,
+    lds_budgets: tuple[int, int] | None = None,
+    lds_plan: tuple[int, int] | None = None,
+):
+    """`build_topk_per_row_radix_stream_module` for an unsplit, unlabelled
+    selection over rows of at most `width` columns: `terminal` when the caller
+    allows it and the rows fit the initial window, past k columns (a row of k
+    needs no selection and keeps the path it has). The window is sized from the
+    same arguments the build is given, so a `terminal` build never meets a row
+    it would cut short."""
+    terminal = (
+        terminal_ok
+        and width > k
+        and width
+        <= topk_per_row_radix_stream_window_cap(
+            k, block_threads, lds_budgets, lds_plan=lds_plan
+        )
+    )
+    return build_topk_per_row_radix_stream_module(
+        k,
+        wave_size,
+        terminal=terminal,
+        block_threads=block_threads,
+        lds_budgets=lds_budgets,
+        lds_plan=lds_plan,
+    )
+
+
 @lru_cache(maxsize=64)
 def topk_per_row_radix_stream_serves(
     k: int,
@@ -458,7 +491,8 @@ def build_topk_per_row_radix_stream_module(
 
     `terminal` is for an unsplit row that fits wholly in the initial candidate
     window, at most `topk_per_row_radix_stream_window_cap` columns: it has no
-    loop past the window, so a wider row would lose its tail. There is no later
+    loop past the window, so a wider row would lose its tail;
+    `build_topk_per_row_radix_stream_module_for_width` decides it for a width. There is no later
     tile to consume the selected keys, so compact can
     write each winning column directly to the output and omit the survivor
     copy, threshold publication, final coalesced copy, and their two barriers.

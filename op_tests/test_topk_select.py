@@ -526,9 +526,9 @@ def test_plain_gfx950_widths():
 
 def test_terminal_window():
     """`stream` drops its loop past the initial window (`terminal`) only for
-    rows that fit it. The width the dispatch decides on and the width the
-    build holds come from one derivation; this holds them to each other and
-    checks the selection on both sides of the edge."""
+    rows that fit it, and the build for a width decides that from the window it
+    builds. This holds the window to the buffer, the decision to the edge, and
+    checks the selection on both sides of it."""
     import aiter.ops.topk_select as ts
 
     failures = []
@@ -546,12 +546,19 @@ def test_terminal_window():
         whole = cfg["capacity"] // cfg["vec"] * cfg["vec"]
         if not cap == cfg["window_cap"] == whole:
             failures.append(
-                f"{rows} rows: dispatch asks {cap}, build holds {cfg['window_cap']}, "
+                f"{rows} rows: the window is {cap}, the build holds {cfg['window_cap']}, "
                 f"its buffer {cfg['capacity']} rounds to {whole}"
             )
         for width in (cap, cap + st._VEC):
             if st.topk_per_row_radix_stream_lds_plan(rows, width, k) != plan:
                 continue  # another plan, another window; not this edge
+            built = st.build_topk_per_row_radix_stream_module_for_width(
+                k, 64, width, True, block_threads=bt, lds_budgets=budgets, lds_plan=plan
+            ).topk_stream_config
+            if built["terminal"] != (width <= cap):
+                failures.append(
+                    f"{rows}x{width} (cap {cap}): terminal={built['terminal']}"
+                )
             torch.manual_seed(width)
             x = torch.randn(rows, width, dtype=dtypes.fp32)
             lens = torch.full((rows,), width, dtype=dtypes.i32)
