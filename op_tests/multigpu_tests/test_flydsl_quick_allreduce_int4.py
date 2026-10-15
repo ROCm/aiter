@@ -13,7 +13,7 @@ validity uses SQNR, a calibrated mismatch ratio, and a per-tile SQNR
 floor.
 
 The divisor case runs an outlier fill at TP 8 that clips the E4M3 scale
-at divisor 1 and must recover SQNR once divided.
+at divisor 1 and must recover SQNR at the default divisor.
 
 hidden=5120 is the width the kernel was tuned on, not a shape the kernel
 requires. QuickAllReduceInt4 runs on gfx942/gfx950 at TP∈{2,4,8}; other
@@ -82,8 +82,6 @@ _CODEC_FILL_CASES = (
 )
 # (512, 5120) runs ST=1 and (32768, 5120) runs ST=8.
 _DIVISOR_SHAPES = [(512, 5120), (32768, 5120)]
-# Above TP * peak / 480 (~9.3) for the "outlier" fill.
-_OUTLIER_DIVISOR = 16.0
 # One spawn per world size so compile happens once. hidden=4096 is a width
 # the ST pick was not fitted to; (8, 1024) is smaller than one 32 KiB tile.
 _VALIDITY_SHAPES = {
@@ -477,7 +475,7 @@ def main():
         )
     else:
         outlier = {}
-        for divisor in (1.0, _OUTLIER_DIVISOR):
+        for divisor in (1.0, DEFAULT_DIVISOR):
             outlier[divisor] = _spawn(
                 TP,
                 _DIVISOR_SHAPES,
@@ -488,15 +486,15 @@ def main():
             )
         # CLOSE_ATOL is calibrated to the 0.1-std fill, not to std 100.
         _assert_validity(
-            outlier[_OUTLIER_DIVISOR],
+            outlier[DEFAULT_DIVISOR],
             pairs=_DIVISOR_SHAPES,
             world_size=TP,
-            label=f"outlier divisor={_OUTLIER_DIVISOR}",
+            label=f"outlier divisor={DEFAULT_DIVISOR}",
             check_close=False,
         )
         for k, (tokens, hidden) in enumerate(_DIVISOR_SHAPES):
             base = min(r[k]["sqnr_db"] for r in outlier[1.0])
-            fixed = min(r[k]["sqnr_db"] for r in outlier[_OUTLIER_DIVISOR])
+            fixed = min(r[k]["sqnr_db"] for r in outlier[DEFAULT_DIVISOR])
             aiter.logger.info(
                 "outlier tokens=%s hidden=%s: SQNR %.2f dB at divisor 1, "
                 "%.2f dB at divisor %s",
@@ -504,12 +502,12 @@ def main():
                 hidden,
                 base,
                 fixed,
-                _OUTLIER_DIVISOR,
+                DEFAULT_DIVISOR,
             )
             if fixed - base < 3.0:
                 raise AssertionError(
                     f"outlier tokens={tokens} hidden={hidden}: divisor "
-                    f"{_OUTLIER_DIVISOR} gives {fixed:.2f} dB vs {base:.2f} dB "
+                    f"{DEFAULT_DIVISOR} gives {fixed:.2f} dB vs {base:.2f} dB "
                     "at divisor 1; expected the E4M3 clip to be recovered"
                 )
 

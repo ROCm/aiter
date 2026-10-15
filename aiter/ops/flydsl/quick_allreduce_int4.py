@@ -28,10 +28,11 @@ from .kernels.tensor_shim import _run_compiled
 from .quick_allreduce_int4_ipc import UncachedIpcHeap
 
 _SUPPORTED_ARCHS = ("gfx942", "gfx950")
-# The kernel holds both the divisor and its reciprocal in fp16; this range
-# keeps both normal (fp16 normals start at 2**-14).
+# The kernel holds both the divisor and its reciprocal in fp16 (normals start
+# at 2**-14), and restores the sum in fp16 before the bf16 store, so
+# 480 * divisor must stay below the fp16 max of 65504.
 DIVISOR_MIN = 2.0**-14
-DIVISOR_MAX = 2.0**14
+DIVISOR_MAX = 128.0
 
 
 def _check_divisor(divisor: float) -> float:
