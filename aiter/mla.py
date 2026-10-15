@@ -868,6 +868,91 @@ def _check_mla_qh64_shuffled_inputs(q, kv, out, qo, indptr, indices, last, split
         raise ValueError("num_kv_splits must be a positive integer or None")
 
 
+@triton.jit
+def _mla_page_csr_indptr(Lens, Indptr, Last, B: tl.constexpr, BLOCK: tl.constexpr):
+    rows = tl.arange(0, BLOCK)
+    lengths = tl.load(Lens + rows, rows < B, other=0)
+    counts = (lengths + 63) // 64
+    ends = tl.cumsum(counts, 0)
+    tl.store(Indptr, 0)
+    tl.store(Indptr + rows + 1, ends, rows < B)
+    tl.store(Last + rows, tl.where(lengths > 0, (lengths - 1) % 64 + 1, 0), rows < B)
+
+
+@triton.jit
+def _mla_page_csr_indices(
+    Table, Indptr, Indices, ROW_STRIDE, COLS: tl.constexpr, BLOCK: tl.constexpr
+):
+    row = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    start = tl.load(Indptr + row)
+    count = tl.load(Indptr + row + 1) - start
+    mask = (cols < count) & (cols < COLS)
+    pages = tl.load(Table + row * ROW_STRIDE + cols, mask, other=0)
+    tl.store(Indices + start + cols, pages, mask)
+
+
+def mla_decode_prepare_page_csr(
+    seq_lens, block_tables, kv_indptr, kv_indices, kv_last_page_lens
+):
+    """Write page64 CSR into caller-owned buffers, once per scheduling step.
+
+    Inputs are GPU int32 lengths[B] and a dense physical page table[B,C]
+    with unit inner stride. Outputs are contiguous int32 [B+1], [>=B*C],
+    and [B]. All tensors share a device. No allocation or host synchronization;
+    buffers may be reused by graph replay. Only indices[:kv_indptr[-1]] are
+    valid. Empty rows use zero pages and last-page length zero.
+
+    Caller guarantees 0 <= seq_lens <= C*64 and valid physical page IDs for
+    each live page. Padded requests must have length zero. Contents are not
+    read back to the host for validation.
+    """
+    if not isinstance(seq_lens, torch.Tensor) or not seq_lens.is_cuda:
+        raise ValueError("seq_lens must be a GPU int32 vector")
+    tensors = (seq_lens, block_tables, kv_indptr, kv_indices, kv_last_page_lens)
+    if any(
+        not isinstance(t, torch.Tensor)
+        or t.device != seq_lens.device
+        or t.dtype != torch.int32
+        for t in tensors
+    ):
+        raise ValueError("page CSR tensors must be int32 on the seq_lens device")
+    if seq_lens.ndim != 1 or not seq_lens.is_contiguous():
+        raise ValueError("seq_lens must be contiguous [B]")
+    batch = seq_lens.numel()
+    if (
+        block_tables.ndim != 2
+        or block_tables.shape[0] != batch
+        or block_tables.stride(1) != 1
+    ):
+        raise ValueError("block_tables must be [B,C] with unit inner stride")
+    if (
+        kv_indptr.shape != (batch + 1,)
+        or kv_last_page_lens.shape != (batch,)
+        or kv_indices.ndim != 1
+        or kv_indices.numel() < block_tables.numel()
+        or any(not t.is_contiguous() for t in tensors[2:])
+    ):
+        raise ValueError("page CSR outputs require contiguous [B+1], [>=B*C], [B]")
+    _mla_page_csr_indptr[(1,)](
+        seq_lens,
+        kv_indptr,
+        kv_last_page_lens,
+        B=batch,
+        BLOCK=triton.next_power_of_2(max(1, batch)),
+    )
+    if batch and block_tables.shape[1]:
+        _mla_page_csr_indices[(batch, triton.cdiv(block_tables.shape[1], 256))](
+            block_tables,
+            kv_indptr,
+            kv_indices,
+            block_tables.stride(0),
+            COLS=block_tables.shape[1],
+            BLOCK=256,
+        )
+    return kv_indptr, kv_indices, kv_last_page_lens
+
+
 def mla_decode_fwd(
     q,
     kv_buffer,
