@@ -58,6 +58,12 @@ def _resolve_inbox_flags(mode: str, world_size: int) -> tuple[int, str]:
     return flags, mode
 
 
+def _raise_on_rank_failures(errors) -> None:
+    failures = UncachedIpcHeap.rank_failures(errors)
+    if failures:
+        raise RuntimeError(f"_StEngine setup failed: {failures}")
+
+
 class _StEngine:
     """One compile-time SUPER inbox + launch."""
 
@@ -69,6 +75,7 @@ class _StEngine:
         rank: int,
         world_size: int,
         inbox_flags: int,
+        extra_ptrs: tuple[int, ...] = (),
     ):
         self.spec = spec
         self.launch = spec["launch"]
@@ -88,17 +95,35 @@ class _StEngine:
         self._gpu_peer_ptrs = None
         self._colors = None
         try:
+            self._build(group, rank, world_size, inbox_flags, extra_ptrs)
+        except Exception:
+            # Also reached when an exchange itself fails (a dead peer, a
+            # timeout), which leaves the partial engine to this rank alone.
+            self.close()
+            raise
+
+    def _build(self, group, rank, world_size, inbox_flags, extra_ptrs) -> None:
+        # Every step that can fail on one rank alone is followed by an exchange
+        # of its outcome, so no rank raises (or moves on) while its peer waits
+        # in a collective. After either exchange all ranks raise together.
+        err = my_handle = None
+        try:
             # The inbox is the only allocation peers write into, so it is the
             # only one whose memory type matters for fabric throughput.
             self._buf_ptr = UncachedIpcHeap.alloc(self.buf_bytes, inbox_flags)
             my_handle = UncachedIpcHeap.get_mem_handle_bytes(self._buf_ptr)
-            all_meta = UncachedIpcHeap.gather_object_list_via_broadcast(
-                group, (my_handle, 0)
-            )
+        except Exception as exc:  # noqa: BLE001
+            err = f"{type(exc).__name__}: {exc}"
+        all_meta = UncachedIpcHeap.gather_object_list_via_broadcast(
+            group, (err, my_handle, 0)
+        )
+        _raise_on_rank_failures([m[0] for m in all_meta])
 
+        err = None
+        try:
             peer_ptrs = [0] * world_size
             for r in range(world_size):
-                handle, off = all_meta[r]
+                _, handle, off = all_meta[r]
                 if r == rank:
                     peer_ptrs[r] = self._buf_ptr + off
                 else:
@@ -106,7 +131,9 @@ class _StEngine:
                     self._peer_bases[r] = base
                     peer_ptrs[r] = base + off
 
-            peer_bytes = world_size * 8
+            # Device-side table: the inbox of every rank, then ``extra_ptrs``.
+            table = (*peer_ptrs, *extra_ptrs)
+            peer_bytes = len(table) * 8
             color_bytes = self.grid * 4
             # Peer-pointer table and per-block colours: written by the host once
             # and by this rank's own kernel, never by a peer. Stays uncached in
@@ -117,7 +144,7 @@ class _StEngine:
             self._colors = self._meta_ptr + peer_bytes
             UncachedIpcHeap.copy_host_to_device(
                 self._gpu_peer_ptrs,
-                (ctypes.c_int64 * world_size)(*peer_ptrs),
+                (ctypes.c_int64 * len(table))(*table),
                 peer_bytes,
             )
             UncachedIpcHeap.copy_host_to_device(
@@ -125,9 +152,11 @@ class _StEngine:
                 (ctypes.c_int32 * self.grid)(*([1] * self.grid)),
                 color_bytes,
             )
-        except Exception:
-            self.close()
-            raise
+        except Exception as exc:  # noqa: BLE001
+            err = f"{type(exc).__name__}: {exc}"
+        _raise_on_rank_failures(
+            UncachedIpcHeap.gather_object_list_via_broadcast(group, err)
+        )
 
     def close(self):
         for b in self._peer_bases:

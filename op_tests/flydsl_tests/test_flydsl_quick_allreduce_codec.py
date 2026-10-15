@@ -488,6 +488,7 @@ def test_default_block_keeps_the_original_geometry():
     }
     assert geometry == {
         "int4": (None, 256, 288),
+        "int5": (256, 320, 352),
         "int6": (256, 384, 416),
         "fp16": (None, None, 1024),
     }
@@ -505,7 +506,6 @@ def test_fp16_codec_memory_path_matches_register_path(block):
     through_lds = codec_roundtrip(x, "fp16", via_memory=True, block=block)
     in_regs = codec_roundtrip(x, "fp16", via_memory=False, block=block)
     assert torch.equal(through_lds, in_regs)
-
 
 
 def _resolve(algorithm, world_size, rs=None, ag=None):

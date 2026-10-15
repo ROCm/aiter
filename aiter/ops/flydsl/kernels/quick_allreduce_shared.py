@@ -48,7 +48,7 @@ _CM_SC0 = 1
 _CM_NT = 2
 _CM_SC1 = 16
 
-# Cache policy for the peer stores in _fanout_nt / _publish, per inbox memory
+# Cache policy for the peer stores in _fanout / _publish, per inbox memory
 # type.
 #
 # On an uncached inbox the memory type does all the work: a store cannot sit in
@@ -79,6 +79,8 @@ _CM_SC1 = 16
 # makes every payload load bypass L1 and L2 (``sc0 sc1``) -- ``nt`` is a reuse
 # hint, not a bypass, and could be answered from a line cached by an earlier
 # call into the same slot. A system-scope acquire is what makes ``nt`` safe.
+# The mesh's relay blocks are the exception: they read the bounce with plain
+# loads behind an agent-scope acquire, see ``_RELAY_RECV_CM`` there.
 #
 # ``fanout`` picks which axis of the (peer, sector) fanout runs fastest across
 # consecutive quads; see the layouts in the kernel body.
@@ -232,18 +234,23 @@ def _buffer_load(ptr, elem_off, n, dtype, cache_modifier=0):
     return fx.Vector(fx.memref_load_vec(reg))
 
 
-def _buffer_store(ptr, elem_off, vec):
-    """Store the vector *vec* to a buffer pointer, at an element offset."""
-    atom = fx.make_copy_atom(rocdl.BufferCopy(vec.numel * vec.dtype.width), vec.dtype)
+def _buffer_store(ptr, elem_off, vec, cache_modifier=0):
+    """Store the vector *vec* to a buffer pointer, at an element offset.
+
+    *cache_modifier* is ``_CM_*`` bits, as for :func:`_buffer_load`.
+    """
+    atom = fx.make_copy_atom(
+        rocdl.BufferCopy(vec.numel * vec.dtype.width, cache_modifier), vec.dtype
+    )
     reg = fx.make_rmem_tensor(vec.numel, vec.dtype)
     fx.memref_store_vec(vec, reg)
     fx.copy(atom, reg, fx.make_view(ptr + elem_off, fx.make_layout(vec.numel, 1)))
 
 
-def _load_peers(peer_ptrs, world_size):
-    """The ``world_size`` inbox base addresses from the device-side peer table."""
+def _load_peers(peer_ptrs, n):
+    """The first ``n`` addresses of the device-side peer table."""
     table = _buffer_ptr(peer_ptrs, T.i64, 8)
-    return [_buffer_load(table, i, 1, fx.Int64)[0] for i in range(world_size)]
+    return [_buffer_load(table, i, 1, fx.Int64)[0] for i in range(n)]
 
 
 def _color_io(colors_ptr, bid):
