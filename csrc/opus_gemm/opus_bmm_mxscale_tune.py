@@ -961,11 +961,13 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             df[name] = values.astype("int64")
         if "gfx" not in df:
             df["gfx"] = self.get_gfx()
-        # 0 leaves a row unbound, matching any CU count of its arch. Stamping this
-        # device's count would rebind other devices' rows when the tuner writes
-        # the table back.
+        # 0 leaves a row unbound, matching any CU count of its arch, as the
+        # runtime loader reads it. Stamping this device's count would rebind
+        # other devices' rows when the tuner writes the table back.
         if "cu_num" not in df:
-            df["cu_num"] = 0
+            df.insert(df.columns.get_loc("gfx") + 1, "cu_num", 0)
+        cu_num = pd.to_numeric(df["cu_num"], errors="coerce").fillna(0)
+        df["cu_num"] = cu_num.clip(lower=0).astype(int)
         if "w_scale_block" not in df:
             df = pd.concat(
                 [
@@ -992,7 +994,6 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
 
     def pre_process(self, args):
         gfx = self.get_gfx()
-        cu_num = self.get_cu_num()
         if gfx != "gfx950":
             raise RuntimeError(f"MXFP8 BMM tuning is gfx950-only; detected {gfx!r}")
         self._bpreshuffle = args.bpreshuffle or args.pool in (
@@ -1040,6 +1041,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             raise ValueError("1x32 tuning requires --bpreshuffle")
         # A source row tuned for another CU count still names a shape to measure
         # here, so it is retargeted to this device rather than dropped.
+        cu_num = self.get_cu_num()
         self.untunedf = (
             self.untunedf[self.untunedf["gfx"] == gfx]
             .assign(cu_num=cu_num)[self.keys]
@@ -1049,9 +1051,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         self.tunedf = self.get_tuned_gemm_list(args.tune_file)
         if not (args.all or args.run_config or args.compare) and not self.tunedf.empty:
             # An unbound row counts as tuned for every CU count of its arch.
-            tuned = self.tunedf[self.keys].copy()
-            tuned_cu = pd.to_numeric(tuned["cu_num"], errors="coerce").fillna(0)
-            tuned["cu_num"] = tuned_cu.where(tuned_cu > 0, cu_num).astype(int)
+            tuned = self.tunedf[self.keys].replace({"cu_num": {0: cu_num}})
             have = set(tuned.apply(tuple, axis=1))
             self.untunedf = self.untunedf[
                 ~self.untunedf.apply(tuple, axis=1).isin(have)

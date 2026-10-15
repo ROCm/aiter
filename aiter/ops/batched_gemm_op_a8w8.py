@@ -183,8 +183,8 @@ def _get_mxscale_bmm_launchers():
 def _load_mxscale_bmm_tuned(
     libtype: str | None = None, bpreshuffle: bool = False
 ) -> dict:
-    """{(gfx,cu_num,b,m,n,k,w_scale_block) or (gfx,b,m,n,k,w_scale_block): row}
-    from the mxscale BMM tuned CSV; see opus.policy.index_tuned_by_cu_num."""
+    """{(gfx,cu_num,b,m,n,k,w_scale_block): row} from the mxscale BMM tuned CSV;
+    a row without a cu_num is keyed (gfx,b,m,n,k,w_scale_block)."""
     from .opus.policy import _load_mxscale_bmm_tuned as load
 
     return load(libtype, bpreshuffle)

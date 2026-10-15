@@ -461,12 +461,14 @@ class TunerCommon:
         # dedup/sort keys below do not KeyError; keep gfx as the leading column.
         if "gfx" in self.keys and "gfx" not in tunedf.columns:
             tunedf.insert(0, "gfx", self.get_gfx())
+        # Other key columns can be absent too (an MXFP8 BMM table without
+        # cu_num); sort and dedup on the ones present.
         if issorted:
-            tunedf = tunedf.sort_values(by=values)
-        dedup_keys = self.keys
+            tunedf = tunedf.sort_values(by=[v for v in values if v in tunedf])
+        dedup_keys = [k for k in self.keys if k in tunedf]
         if "_tag" in tunedf.columns:
             tunedf["_tag"] = tunedf["_tag"].fillna("")
-            dedup_keys = self.keys + ["_tag"]
+            dedup_keys = dedup_keys + ["_tag"]
         tunedf = tunedf.drop_duplicates(
             subset=dedup_keys,
             keep="last",
@@ -1374,7 +1376,9 @@ class TunerCommon:
                 if "gfx" in tunedf.columns:
                     tunedf = tunedf[tunedf["gfx"].astype(str) == str(gfx)]
                 if "cu_num" in tunedf.columns:
-                    tunedf = tunedf[tunedf["cu_num"] == cu]
+                    # MXFP8 BMM tables use cu_num 0 for a row that matches any
+                    # CU count of its arch.
+                    tunedf = tunedf[tunedf["cu_num"].isin((cu, 0))]
                 self.untunedf = tunedf.drop_duplicates(subset=self.keys).reset_index(
                     drop=True
                 )

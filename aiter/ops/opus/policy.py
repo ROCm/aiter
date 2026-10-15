@@ -605,43 +605,6 @@ def _parse_mxscale_bmm_tuned_split_k(value: object) -> int:
     return int(numeric)
 
 
-def index_tuned_by_cu_num(
-    df,
-    path: str,
-    shape_keys: list[str],
-    shape_keys_fallback: list[str],
-) -> dict:
-    """Index a tuned frame that may mix rows with and without a CU count.
-
-    jit/core.py:update_config_files fills a missing cu_num with 0 when it
-    merges the per-model CSVs. Key those on gfx alone, which the lookup's
-    gfx-only retry already reaches, and leave the rest bound.
-
-    Given these rows:
-        gfx950, cu_num=256, b=1, m=2, n=3, k=4, w_scale_block=128x128
-        gfx950, cu_num=0,   b=1, m=2, n=3, k=4, w_scale_block=128x128
-
-    The output will have these keys:
-        ("gfx950", 256, 1, 2, 3, 4, "128x128")
-        ("gfx950", 1, 2, 3, 4, "128x128")
-    """
-    cu_num = pd.to_numeric(df["cu_num"], errors="coerce").fillna(0).astype(int)
-    unbound = cu_num <= 0
-    if unbound.any():
-        logger.warning(
-            "Tuned CSV %r has %d row(s) carrying no cu_num; they stay "
-            "keyed on gfx alone and will match any CU count of that arch. Re-run "
-            "the tuner to bind them to the device they were measured on.",
-            path,
-            int(unbound.sum()),
-        )
-
-    df = df.assign(cu_num=cu_num)
-    tuned = df[unbound].set_index(shape_keys_fallback).to_dict("index")
-    tuned.update(df[~unbound].set_index(shape_keys).to_dict("index"))
-    return tuned
-
-
 @cache
 def _load_mxscale_bmm_tuned(
     libtype: str | None = None, bpreshuffle: bool = False
@@ -658,36 +621,25 @@ def _load_mxscale_bmm_tuned(
         if bpreshuffle
         else AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
     )
-    # w_scale_block is part of the key, not a note on the row: the same shape
-    # has a best 128x128 kid and a best 32x32 kid, and they are different
-    # kernels. Without it the two collide as duplicate shapes, and a lookup
-    # could hand a 128 kid a scale buffer with sixteen times the entries -- not
-    # a shape error downstream, just the wrong stride, so a plausible wrong
-    # answer at full speed.
-    shape_keys = ["gfx", "cu_num", "b", "m", "n", "k", "w_scale_block"]
-    shape_keys_fallback = ["gfx", "b", "m", "n", "k", "w_scale_block"]
-
     try:
         df = pd.read_csv(path).drop_duplicates()
     except FileNotFoundError:
         logger.warning("MXFP8 BMM tuned CSV was not found at %s", path)
         return {}
 
-    df = with_mxscale_w_scale_block(df, path)
-
-    required = set(shape_keys_fallback) | {"kernelId", "splitK"}
+    required = {"gfx", "b", "m", "n", "k", "kernelId", "splitK"}
     missing = required.difference(df.columns)
     if missing:
         raise ValueError(f"MXFP8 BMM tuned CSV is missing columns {sorted(missing)}")
+    df = with_mxscale_w_scale_block(df, path)
 
+    # A missing, blank or non-positive cu_num leaves a row unbound: keyed on gfx
+    # alone, so it matches any CU count of its arch. jit/core.py
+    # update_config_files fills cu_num with 0 for per-model CSVs without it.
     if "cu_num" not in df.columns:
-        logger.warning(
-            "MXFP8 BMM tuned CSV %r has no 'cu_num' column; falling back to "
-            "the gfx-only key. Re-run the tuner to distinguish devices "
-            "that share an architecture but have different CU counts.",
-            path,
-        )
-        shape_keys = list(shape_keys_fallback)
+        df["cu_num"] = 0
+    cu_num = pd.to_numeric(df["cu_num"], errors="coerce").fillna(0).astype(int)
+    df["cu_num"] = cu_num.clip(lower=0)
 
     if libtype is not None and "libtype" in df.columns:
         df = df[df["libtype"] == libtype].copy()
@@ -745,13 +697,31 @@ def _load_mxscale_bmm_tuned(
         )
         df = df.loc[~invalid_opus_rows].copy()
 
+    # w_scale_block is part of the key, not a note on the row: the same shape
+    # has a best 128x128 kid and a best 32x32 kid, and they are different
+    # kernels. Without it the two collide as duplicate shapes, and a lookup
+    # could hand a 128 kid a scale buffer with sixteen times the entries -- not
+    # a shape error downstream, just the wrong stride, so a plausible wrong
+    # answer at full speed.
+    shape_keys = ["gfx", "cu_num", "b", "m", "n", "k", "w_scale_block"]
     duplicate_shapes = df.duplicated(subset=shape_keys, keep=False)
     if duplicate_shapes.any():
         rows = df.loc[duplicate_shapes, shape_keys].drop_duplicates().to_dict("records")
         raise RuntimeError(f"duplicate shapes across MXFP8 BMM tuned CSV files: {rows}")
-    if "cu_num" not in df.columns:
-        return df.set_index(shape_keys).to_dict("index")
-    return index_tuned_by_cu_num(df, path, shape_keys, shape_keys_fallback)
+
+    unbound = df["cu_num"] == 0
+    if unbound.any():
+        logger.info(
+            "MXFP8 BMM tuned CSV %r has %d row(s) without a cu_num; they match "
+            "any CU count of their arch. Re-run the tuner to bind them to the "
+            "device they were measured on.",
+            path,
+            int(unbound.sum()),
+        )
+    unbound_keys = [key for key in shape_keys if key != "cu_num"]
+    tuned = df[unbound].drop(columns="cu_num").set_index(unbound_keys).to_dict("index")
+    tuned.update(df[~unbound].set_index(shape_keys).to_dict("index"))
+    return tuned
 
 
 @lru_cache(maxsize=1024)
@@ -801,13 +771,11 @@ def lookup_mxscale_bmm_config(
             key: value for key, value in row.items() if key not in _TUNED_PERF_COLUMNS
         }
         logger.info(
-            "shape B:%s M:%s N:%s K:%s on gfx:%s cu_num:%s uses padded_M:%s "
-            "MXFP8 config %s",
+            "shape B:%s M:%s N:%s K:%s cu_num:%s uses padded_M:%s MXFP8 config %s",
             b,
             m,
             n,
             k,
-            gfx,
             cu_num,
             padded_m,
             cfg,

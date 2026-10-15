@@ -66,10 +66,11 @@ preshuffle layout, scales use ordinary E8M0 storage, and tuning uses BF16 output
 
 The full result key is `gfx,cu_num,b,m,n,k,w_scale_block`. An optional input `gfx`
 column restricts rows to that architecture; otherwise the current GPU is used.
-Results are keyed on the current GPU's `cu_num`. A tuned row with `cu_num` 0, or
-from a table without the column, matches any CU count of its architecture and
-counts as already tuned.
-Uppercase shape column names and `g` as an alias for `b` are also accepted.
+New results carry the current GPU's `cu_num`. A row with `cu_num` 0, or from a
+table without the column, matches any CU count of its architecture and counts as 
+already tuned.
+Uppercase shape column names and `g` as an alias for `b` are also 
+accepted.
 
 Keep `w_scale_block` in the input to specify the exact shape/scale combinations.
 `--w_scale_block 128x128` filters explicit scale rows; it does not create

@@ -460,9 +460,8 @@ class AITER_CONFIG:
             keys.append("gfx")
         dedup_keys = keys + ["_tag"] if has_tag else keys
         # Only key on columns actually present in the merged frame. Most
-        # families carry cu_num, but some (e.g. the mxscale batched-GEMM
-        # table) key on gfx and never carry cu_num; keeping a missing column
-        # in the subset would raise inside pandas' duplicated().
+        # families carry cu_num, but some tables lack it; keeping a missing
+        # column in the subset would raise inside pandas' duplicated().
         dedup_keys = [k for k in dedup_keys if k in merge_df.columns]
         if not dedup_keys:
             return
