@@ -58,6 +58,60 @@ _COMBINE_QUANT_CHUNKS_PER_ITER = 4
 _DECODE_PLAN_OVERLAP_TOKENS = 128
 
 
+def _read_s1f_mode() -> bool:
+    """``AITER_MEGA_S1F=1``: dispatch and GEMM1 as one persistent stage-1 kernel.
+
+    Compact (stage1_fused) flydsl path on the fp4 wire only. The standalone
+    dispatch kernel (and its X2 tail) is not launched; the compact plan also
+    emits the run table and per-tile source masks; GEMM2 and the combine run
+    unchanged after the stage-1 kernel. Unset (or 0) keeps today's pipeline.
+    """
+    mode = os.environ.get("AITER_MEGA_S1F", "0").strip() or "0"
+    if mode not in ("0", "1"):
+        raise ValueError(f"AITER_MEGA_S1F must be 0 or 1, got {mode!r}")
+    return mode == "1"
+
+
+def _s1f_env_int(name: str, default: int) -> int:
+    v = os.environ.get(name)
+    return int(v) if v not in (None, "") else int(default)
+
+
+def _s1f_cu_num() -> int:
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    return int(get_cu_num())
+
+
+# Smallest m-tile the S1F flag region is sized for (one flag per tile/source).
+_S1F_MIN_TILE_M = 16
+#: The GEMM1 shape the stage-1 kernel embeds: tile, waves, pipeline buffers.
+_S1F_TILE_M, _S1F_TILE_N, _S1F_TILE_K = 64, 256, 256
+_S1F_M_WARP, _S1F_N_WARP, _S1F_NUM_BUFFERS = 1, 4, 3
+#: m-tiles per group in the GEMM1 work order.
+_S1F_GROUP_M = 8
+
+
+def _s1f_fallback_warn(owner, reasons) -> None:
+    """Warn once per instance that this configuration keeps the default path."""
+    if getattr(owner, "_s1f_warned", False):
+        return
+    owner._s1f_warned = True
+    import logging
+
+    logging.getLogger("aiter").warning(
+        "AITER_MEGA_S1F=1 falls back to dispatch + GEMM1: %s", "; ".join(reasons)
+    )
+
+
+def _s1f_tile_flag_nbytes(*, compact_rows: int, world_size: int) -> int:
+    from .s1f_stage1 import FLAG_STRIDE
+
+    tiles = (int(compact_rows) + _S1F_MIN_TILE_M - 1) // _S1F_MIN_TILE_M
+    assert int(world_size) * 4 <= FLAG_STRIDE
+    return tiles * FLAG_STRIDE
+
+
 def _combine_tile(*, topk, hidden_dim, quant_bits):
     """(tokens_per_block, chunks_per_iter) for the reduce, widest that fits.
 
@@ -582,6 +636,7 @@ def _arena_regions(
     wire_row: int,
     scale_row: int,
     hist_stride: int,
+    tile_flag_nbytes: int = 0,
 ) -> list[tuple[str, int]]:
     from .compact_plan import compact_done_nbytes
 
@@ -614,6 +669,10 @@ def _arena_regions(
             config.max_tokens_per_rank * config.topk * config.combine_slot_stride_bytes,
         )
     )
+    if tile_flag_nbytes:
+        # S1F: generation-tagged per-(m-tile, source) dispatch flags, never
+        # cleared. Last, so every other region keeps its offset.
+        regions.append(("tile_flag", int(tile_flag_nbytes)))
     return regions
 
 
@@ -634,6 +693,7 @@ def _arena_bound_nbytes(
     experts_per_rank: int,
     topk: int,
     stage1_fused: bool,
+    s1f: bool = False,
 ) -> int:
     """Arena bytes for this geometry with every dispatch row at the bf16 pitch.
 
@@ -675,6 +735,11 @@ def _arena_bound_nbytes(
             wire_row=2 * hidden_dim,
             scale_row=0,
             hist_stride=hist_stride,
+            tile_flag_nbytes=(
+                _s1f_tile_flag_nbytes(compact_rows=recv_rows, world_size=world_size)
+                if s1f and stage1_fused
+                else 0
+            ),
         )
     )
 
@@ -820,6 +885,7 @@ class MegaMoEGfx1250:
         experts: int,
         topk: int,
         stage1_fused: bool,
+        s1f: bool | None = None,
     ) -> int:
         """Per-rank cco VMM to reserve before building an instance of this geometry.
 
@@ -840,6 +906,7 @@ class MegaMoEGfx1250:
             experts_per_rank=int(experts) // int(world_size),
             topk=int(topk),
             stage1_fused=bool(stage1_fused),
+            s1f=_read_s1f_mode() if s1f is None else bool(s1f),
         )
         return _align_up(nbytes + _VMM_SLACK_BYTES, 2 << 20)
 
@@ -948,6 +1015,14 @@ class MegaMoEGfx1250:
                 f"topk_ids must have shape {expected_shape}, "
                 f"got {tuple(topk_ids.shape)}"
             )
+        s1f = self._s1f_eligible(bias1, bias2)
+        if s1f:
+            # No in-forward plan prefetch under S1F: without the dispatch X2
+            # tail, the next layer's X1 exchange (its plan) must come after
+            # this rank's reduce -- a peer's GEMM2(L+1) scatter into this
+            # rank's comb_inp is ordered after this reduce(L) only through X1.
+            # The next forward launches its plan in stream order instead.
+            next_topk_ids = None
         if self._compact_plan:
             # Compact cannot slice recv_x -- the rows are grouped per expert, not
             # token-major -- so the bound is spent on the geometry instead: it
@@ -966,7 +1041,7 @@ class MegaMoEGfx1250:
                 self._compact_recv_bound(token_count, recv_token_bound)
             )
         recv_x, recv_weights, recv_ids, total_recv, routing = self._dispatch(
-            hidden_states, topk_weights, topk_ids
+            hidden_states, topk_weights, topk_ids, s1f=s1f
         )
         if recv_token_bound is not None and not self._compact_plan:
             bound = int(recv_token_bound)
@@ -991,6 +1066,10 @@ class MegaMoEGfx1250:
             extra["beta"] = self.situ_beta
             extra["linear_beta"] = self.situ_linear_beta
         scatter = self._scatter_context(routing, combine_quant_bits)
+        if s1f:
+            import dataclasses
+
+            scatter = dataclasses.replace(scatter, stage1_gemm1=self._s1f_gemm1)
         from aiter.ops.flydsl.grouped_moe_gfx1250 import (
             set_flydsl_dispatch_context,
         )
@@ -1039,7 +1118,349 @@ class MegaMoEGfx1250:
             )
         finally:
             set_flydsl_dispatch_context(None)
+        if s1f and self._s1f_step is not None:
+            self._s1f_step = None
+            raise RuntimeError(
+                "AITER_MEGA_S1F: the GEMM1 launch never reached the stage-1 hook, "
+                "so this layer's rows were never dispatched"
+            )
         return self._combine(routing, combine_quant_bits)
+
+    def _s1f_eligible(self, bias1, bias2) -> bool:
+        """Whether this step runs the S1F stage-1 kernel (else: today's path)."""
+        # _s1f: built for S1F (plan outputs, buffers); _s1f_enabled: per-step
+        # switch (tests flip it to A/B the two paths on one instance).
+        if not (getattr(self, "_s1f", False) and getattr(self, "_s1f_enabled", True)):
+            return False
+        reasons = []
+        for b in (bias1, bias2):
+            if b is not None and b.numel() > 0:
+                reasons.append("bias is not supported")
+        if self.activation not in (ActivationType.Silu, ActivationType.Swiglu):
+            reasons.append(f"activation {self.activation} is not supported")
+        if os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_REQUANT", "0") not in (
+            "",
+            "0",
+            "false",
+            "False",
+        ):
+            reasons.append("needs the fused GEMM1 requant epilogue")
+        reasons += self._s1f_gemm1_reasons()
+        if reasons:
+            _s1f_fallback_warn(self, reasons)
+            return False
+        return True
+
+    def _s1f_gemm1_reasons(self) -> list:
+        """Why this step's GEMM1 is not the one the stage-1 kernel embeds.
+
+        The stage-1 kernel inlines one GEMM1 configuration, so a tuned CSV row
+        (or an ``AITER_TDM_*`` override) naming a different tile has to keep the
+        separate dispatch + GEMM1 path. This runs before the dispatch is
+        skipped; the hook's own check is then only an assertion.
+        """
+        cached = getattr(self, "_s1f_g1_cache", None)
+        key = (int(self._compact_step_align_m), int(self._compact_step_recv_bound))
+        if cached is not None and cached[0] == key:
+            return list(cached[1])
+        reasons = []
+        if int(self._compact_step_align_m) != _S1F_TILE_M:
+            reasons.append(f"step tile_m {self._compact_step_align_m} != {_S1F_TILE_M}")
+        from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+            _as_int,
+            _find_grouped_config,
+            _get_padded_m,
+        )
+
+        config = self._config
+        row = _find_grouped_config(
+            token_num=_get_padded_m(int(self._compact_step_recv_bound)),
+            model_dim=config.hidden_dim,
+            inter_dim=int(self.inter_dim),
+            experts=config.experts_per_rank,
+            topk=-1,
+            activation=self.activation,
+            dtype=dtypes.bf16,
+            q_dtype_a=dtypes.fp4x2,
+            q_dtype_w=dtypes.fp4x2,
+            quant_type=QuantType.per_1x32,
+            ep_fused=True,
+        )
+        want = {
+            "tile_m": _S1F_TILE_M,
+            "tile_n": _S1F_TILE_N,
+            "tile_k": _S1F_TILE_K,
+            "m_warp": _S1F_M_WARP,
+            "n_warp": _S1F_N_WARP,
+            "num_buffers": _S1F_NUM_BUFFERS,
+        }
+        for field, embedded in want.items():
+            got = embedded if row is None else _as_int(row.get(field), embedded)
+            env = os.environ.get("AITER_TDM_" + field.upper())
+            if env not in (None, ""):
+                got = int(env)
+            if int(got or embedded) != embedded:
+                reasons.append(f"GEMM1 {field} {got} != {embedded}")
+        self._s1f_g1_cache = (key, tuple(reasons))
+        return reasons
+
+    def _s1f_launcher(
+        self, *, producers, group_m, stage1_act, quant_wmma_rep, block_runs
+    ):
+        from .s1f_stage1 import make_s1f_stage1
+
+        key = (producers, group_m, stage1_act, quant_wmma_rep, block_runs)
+        launch = self._s1f_launches.get(key)
+        if launch is None:
+            config = self._config
+            launch = make_s1f_stage1(
+                rank=config.rank,
+                npes=config.world_size,
+                experts_per_rank=config.experts_per_rank,
+                topk=config.topk,
+                payload_bytes=config.dispatch_token_nbytes,
+                scale_bytes=config.dispatch_scale_nbytes,
+                row_stride=self._compact_wire_row,
+                compact_cap=self._compact_cap,
+                max_tok_per_rank=config.max_tokens_per_rank,
+                max_routes=self._compact_max_routes,
+                off_out_tok=self._arena.offset("disp_out"),
+                off_ep_rowmap=self._arena.offset("ep_rowmap"),
+                off_tile_flag=self._arena.offset("tile_flag"),
+                model_dim=self.model_dim,
+                inter_dim=self.inter_dim,
+                stage1_act=stage1_act,
+                quant_wmma_rep=quant_wmma_rep,
+                workers=self._s1f_workers,
+                producers=producers,
+                group_m=group_m,
+                block_runs=block_runs,
+            )
+            self._s1f_launches[key] = launch
+        return launch
+
+    def _s1f_variant(self, tokens: int):
+        """(producers, runs per claimed block) of the stage-1 kernel."""
+        from .s1f_stage1 import s1f_block_runs, s1f_producers
+
+        return s1f_producers(tokens), s1f_block_runs(tokens)
+
+    def _s1f_precompile(self, launch_args, *, group_m, stage1_act, quant_wmma_rep):
+        """Compile every tokens-bucket variant of the stage-1 kernel up front.
+
+        A variant first met mid-run is JIT-compiled by each rank at its own
+        speed, and the consumers of the ranks that finish first then wait for
+        the others' flags past the poll limit (trap). Each variant is launched
+        once on an empty plan (no runs, no m-tiles: every CTA exits at once;
+        every rank makes the same launches, so the generations stay in step),
+        then the ranks meet at a host barrier.
+        """
+        from .compact_plan import compact_run_buffer_dwords
+
+        config = self._config
+        dev = self._s1f_ctl.device
+        runs = torch.zeros(
+            compact_run_buffer_dwords(
+                npes=config.world_size,
+                experts_per_rank=config.experts_per_rank,
+                max_routes=self._compact_max_routes,
+                s1f=True,
+            ),
+            dtype=torch.int32,
+            device=dev,
+        )
+        send = torch.zeros(self._compact_max_routes, dtype=torch.int32, device=dev)
+        tsrc = torch.zeros(max(1, self._s1f_tile_cap), dtype=torch.int32, device=dev)
+        psum = torch.zeros(
+            max(1, config.experts_per_rank), dtype=torch.int32, device=dev
+        )
+        seen = set()
+        for tok in (1, 129, 1025, 2049):  # one per s1f_producers bucket
+            producers, block_runs = self._s1f_variant(tok)
+            launch = self._s1f_launcher(
+                producers=producers,
+                group_m=group_m,
+                stage1_act=stage1_act,
+                quant_wmma_rep=quant_wmma_rep,
+                block_runs=block_runs,
+            )
+            if id(launch) not in seen:
+                seen.add(id(launch))
+                launch(*launch_args(psum, send, runs, tsrc, 0))
+        torch.cuda.synchronize()
+        self._arena._communicator.barrier()
+
+    def _s1f_gemm1(
+        self,
+        out,
+        a,
+        w,
+        a_scales,
+        w_scales,
+        m_tile_map,
+        *,
+        n_experts,
+        contiguous_m,
+        N,
+        K,
+        tile_m=64,
+        tile_n=256,
+        tile_k=256,
+        m_warp=1,
+        n_warp=4,
+        num_buffers=3,
+        out_is_f16=0,
+        a_is_fp4=0,
+        stage1_act=0,
+        bias=None,
+        swiglu_limit=7.0,
+        stream=None,
+        stage1_quant_out=0,
+        quant_scale=None,
+        quant_wmma_rep=1,
+        cluster_m=-1,
+        cluster_n=-1,
+        waves_per_tensor_tdm=-1,
+        next_stage_prefetch=0,
+        tdm_as_in_prologue=0,
+        tdm_b_th=0,
+        lds_soa_load_interleave=0,
+        row_major_ascale=0,
+        a_row_stride_bytes=0,
+        a_scale_row_stride_bytes=0,
+        situ_beta=1.0,
+        situ_linear_beta=1.0,
+        persistent_workers=0,
+        rolled_drain=0,
+        **_unused,
+    ):
+        """GEMM1 launch stand-in (``flydsl_grouped_gemm_a8w4_masked`` signature):
+        runs the S1F stage-1 kernel, i.e. this layer's dispatch AND GEMM1.
+
+        Only the configuration the stage-1 kernel embeds is accepted (the
+        default compact GEMM1: 64x256x256, 1x4 waves, 3 buffers, no cluster,
+        2 waves per TDM tensor, fused act + fp4 quant, row-major wire A-scale).
+        """
+        from aiter.ops.flydsl.grouped_gemm_mxfp4 import (
+            _select_bool_env,
+            _select_cluster_m,
+            _select_cluster_n,
+            _select_num_waves_per_tensor_tdm,
+            _select_tdm_b_th,
+        )
+        from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+
+        step = self._s1f_step
+        if step is None:
+            raise RuntimeError("AITER_MEGA_S1F: stage-1 hook called without a step")
+        self._s1f_step = None
+        n_tiles = (int(N) + int(tile_n) - 1) // int(tile_n)
+        cl_n = _select_cluster_n(n_tiles, cluster_n)
+        got = {
+            "tile": (tile_m, tile_n, tile_k, m_warp, n_warp),
+            "num_buffers": min(int(num_buffers), max(1, int(K) // int(tile_k))),
+            "out_is_f16": int(out_is_f16),
+            "a_is_fp4": int(a_is_fp4),
+            "bias": bias is not None,
+            "stage1_quant_out": int(stage1_quant_out),
+            "cluster": (_select_cluster_m(cluster_m, cl_n, stage1_act), cl_n),
+            "waves_per_tensor_tdm": _select_num_waves_per_tensor_tdm(
+                waves_per_tensor_tdm
+            ),
+            "next_stage_prefetch": _select_bool_env(
+                "AITER_TDM_NEXT_STAGE_PREFETCH", next_stage_prefetch
+            ),
+            "tdm_as_in_prologue": _select_bool_env(
+                "AITER_GROUPED_GEMM_AS_PROLOGUE", tdm_as_in_prologue
+            ),
+            "tdm_b_th": _select_tdm_b_th(tdm_b_th),
+            "lds_soa_load_interleave": int(lds_soa_load_interleave),
+            "row_major_ascale": int(row_major_ascale),
+            "a_strides": (int(a_row_stride_bytes), int(a_scale_row_stride_bytes)),
+            "align_m": int(self._compact_step_align_m),
+        }
+        want = {
+            "tile": (
+                _S1F_TILE_M,
+                _S1F_TILE_N,
+                _S1F_TILE_K,
+                _S1F_M_WARP,
+                _S1F_N_WARP,
+            ),
+            "num_buffers": _S1F_NUM_BUFFERS,
+            "out_is_f16": 0,
+            "a_is_fp4": 1,
+            "bias": False,
+            "stage1_quant_out": 1,
+            "cluster": (1, 1),
+            "waves_per_tensor_tdm": 2,
+            "next_stage_prefetch": 0,
+            "tdm_as_in_prologue": 0,
+            "tdm_b_th": 0,
+            "lds_soa_load_interleave": 0,
+            "row_major_ascale": 1,
+            "a_strides": (self._compact_wire_row, self._compact_wire_row),
+            "align_m": _S1F_TILE_M,
+        }
+        bad = {k: (got[k], want[k]) for k in want if got[k] != want[k]}
+        if bad or stage1_act not in (1, 2) or quant_scale is None:
+            # _s1f_gemm1_reasons() gates on this before the dispatch is
+            # skipped, so reaching here means the two have drifted apart.
+            raise RuntimeError(
+                "AITER_MEGA_S1F: the stage-1 kernel embeds only the default "
+                f"compact GEMM1; mismatches (got, want): {bad}, "
+                f"stage1_act={stage1_act}"
+            )
+        tokens = int(step["token_count"])
+        producers, block_runs = self._s1f_variant(tokens)
+        group_m = _S1F_GROUP_M
+        bufs = self._compact_slot_bufs(step["slot"])
+        if stream is None:
+            stream = torch.cuda.current_stream()
+
+        def launch_args(psum_t, send_t, runs_t, tsrc_t, n_tok):
+            return (
+                out,
+                ptr_arg(a),
+                ptr_arg(w),
+                a_scales.view(torch.int32),
+                w_scales.view(torch.int32),
+                quant_scale.view(torch.uint8),
+                ptr_arg(psum_t),
+                self._arena.handle,
+                step["payload_ptr"],
+                step["scale_ptr"],
+                step["wts_ptr"],
+                send_t.data_ptr(),
+                runs_t.data_ptr(),
+                tsrc_t.data_ptr(),
+                self._s1f_ctl.data_ptr(),
+                int(contiguous_m),
+                n_tok,
+                float(swiglu_limit),
+                fx.Stream(stream),
+            )
+
+        if not self._s1f_precompiled and not torch.cuda.is_current_stream_capturing():
+            self._s1f_precompiled = True
+            self._s1f_precompile(
+                launch_args,
+                group_m=group_m,
+                stage1_act=int(stage1_act),
+                quant_wmma_rep=int(quant_wmma_rep),
+            )
+        launch = self._s1f_launcher(
+            producers=producers,
+            group_m=group_m,
+            stage1_act=int(stage1_act),
+            quant_wmma_rep=int(quant_wmma_rep),
+            block_runs=block_runs,
+        )
+        launch(
+            *launch_args(
+                m_tile_map, bufs["send_list"], bufs["runs"], bufs["tile_src"], tokens
+            )
+        )
 
     def _resolve_combine_quant(self, combine_quant: str | None) -> int:
         """This step's combine payload width, checked against what was built.
@@ -1107,12 +1528,26 @@ class MegaMoEGfx1250:
                 routes,
                 max(1, int(token_count) * int(self._config.topk)),
             )
-        return compact_plan_waves(npes=self._config.world_size, max_routes=routes)
+        waves = compact_plan_waves(npes=self._config.world_size, max_routes=routes)
+        if getattr(self, "_s1f", False):
+            # The S1F plan runs alone between the quant and the stage-1
+            # kernel (no GEMM beside it), and its tables want the wide scan.
+            waves = max(waves, 16)
+        return waves
 
     def _compact_plan_for(
-        self, align_m: int, slot: int | None = None, token_count: int | None = None
+        self,
+        align_m: int,
+        slot: int | None = None,
+        token_count: int | None = None,
+        tok_map: bool = True,
     ):
         """The compact-plan launch that aligns each expert's rows to ``align_m``.
+
+        ``tok_map=False`` (an S1F step, known at launch): the S1F plan skips the
+        tok_map rewrite, which only the default dispatch reads. A plan launched
+        before the step is known (a prefetch) keeps it, so an S1F-built
+        instance can still fall back to the default dispatch.
 
         Compiled per alignment, hist/done slot, wave width, and workgroup count.
         The plan and the expert GEMM must agree on the tile, double-buffered
@@ -1135,7 +1570,8 @@ class MegaMoEGfx1250:
             else int(token_count)
         )
         blocks = compact_plan_blocks(tok * int(self._config.topk))
-        key = (align_m, slot, waves, blocks)
+        write_tok_map = not getattr(self, "_s1f", False) or bool(tok_map)
+        key = (align_m, slot, waves, blocks, write_tok_map)
         launch = self._compact_plan_launches.get(key)
         if launch is None:
             if torch.cuda.is_current_stream_capturing():
@@ -1165,6 +1601,8 @@ class MegaMoEGfx1250:
                 hist_pingpong=False,
                 plan_waves=None if waves == full_waves else waves,
                 plan_blocks=blocks,
+                # S1F: + run table, piece rows and per-tile source masks.
+                **({"s1f": True, "write_tok_map": write_tok_map} if self._s1f else {}),
             )
             self._compact_plan_launches[key] = launch
         return launch
@@ -1192,6 +1630,10 @@ class MegaMoEGfx1250:
         self._begin_compact_step(self._compact_recv_bound(tok, recv_token_bound))
         for slot in range(self._COMPACT_PLAN_SLOTS):
             self._compact_plan_for(self._compact_step_align_m, slot, tok)
+            if self._s1f:
+                self._compact_plan_for(
+                    self._compact_step_align_m, slot, tok, tok_map=False
+                )
 
     def prefetch_compact_plan(
         self,
@@ -1252,6 +1694,7 @@ class MegaMoEGfx1250:
         token_count: int,
         slot: int | None = None,
         ready_event: torch.cuda.Event | None = None,
+        tok_map: bool = True,
     ) -> None:
         slot = int(self._compact_slot if slot is None else slot)
         bufs = self._compact_slot_bufs(slot)
@@ -1262,7 +1705,7 @@ class MegaMoEGfx1250:
         else:
             plan_stream.wait_event(ready_event)
         with torch.cuda.stream(plan_stream):
-            self._compact_plan_for(self._compact_step_align_m, slot, token_count)(
+            plan_args = (
                 self._arena.handle,
                 topk_ids.data_ptr(),
                 bufs["tok_map"].data_ptr(),
@@ -1273,8 +1716,16 @@ class MegaMoEGfx1250:
                 bufs["barrier"].data_ptr(),
                 self._config.rank,
                 token_count,
-                fx.Stream(plan_stream),
             )
+            if self._s1f:
+                plan_args += (
+                    bufs["send_list"].data_ptr(),
+                    bufs["runs"].data_ptr(),
+                    bufs["tile_src"].data_ptr(),
+                )
+            self._compact_plan_for(
+                self._compact_step_align_m, slot, token_count, tok_map=tok_map
+            )(*plan_args, fx.Stream(plan_stream))
         self._compact_plan_event.record(plan_stream)
         self._compact_plan_pending = True
 
@@ -1285,7 +1736,7 @@ class MegaMoEGfx1250:
         self._compact_plan_pending = False
 
     def _compact_slot_bufs(self, slot: int) -> dict:
-        return {
+        bufs = {
             "tok_map": self._tok_maps[slot],
             "block_hist": self._block_hists[slot],
             "send_base": self._send_bases[slot],
@@ -1293,6 +1744,11 @@ class MegaMoEGfx1250:
             "psum": self._psums[slot],
             "barrier": self._barriers[slot],
         }
+        if self._s1f:
+            bufs["send_list"] = self._s1f_send_lists[slot]
+            bufs["runs"] = self._s1f_run_bufs[slot]
+            bufs["tile_src"] = self._s1f_tile_srcs[slot]
+        return bufs
 
     def _begin_compact_step(self, recv_token_bound: int | None) -> None:
         """Fix this step's compact geometry from the caller's recv bound.
@@ -1385,6 +1841,38 @@ class MegaMoEGfx1250:
                 f"compact tile_m={self._compact_tile_m} exceeds the "
                 f"{_MAX_COMPACT_TILE_M} required_vmm_bytes() reserves for"
             )
+        self._s1f = _read_s1f_mode()
+        if self._s1f:
+            reasons = []
+            if not self._compact_plan:
+                reasons.append("needs stage1_fused (the compact plan)")
+            if config.dispatch_backend != "flydsl":
+                reasons.append("needs the flydsl dispatch backend")
+            if config.dispatch_wire != "fp4":
+                reasons.append(
+                    f"needs the fp4 dispatch wire, got {config.dispatch_wire}"
+                )
+            # Shapes the stage-1 kernel encodes in its packed fields.
+            if config.world_size > 8:
+                reasons.append(
+                    f"world_size {config.world_size} > 8 (8-bit source mask)"
+                )
+            if config.experts_per_rank > 255:
+                reasons.append(f"{config.experts_per_rank} experts per rank > 255")
+            if config.max_tokens_per_rank > 0xFFFF:
+                reasons.append(
+                    f"max_tokens_per_rank {config.max_tokens_per_rank} > 65535"
+                )
+            if self._compact_wire_row > 0xFFFF:
+                reasons.append(f"wire row {self._compact_wire_row} B > 65535")
+            if 2 * self.inter_dim > 16 * _S1F_TILE_N:
+                reasons.append(f"inter_dim {self.inter_dim} needs more than 16 n-tiles")
+            if reasons:
+                _s1f_fallback_warn(self, reasons)
+                self._s1f = False
+        self._s1f_tile_cap = (
+            (recv_rows + _S1F_MIN_TILE_M - 1) // _S1F_MIN_TILE_M if self._s1f else 0
+        )
         arena_regions = _arena_regions(
             config,
             compact=self._compact_plan,
@@ -1392,6 +1880,13 @@ class MegaMoEGfx1250:
             wire_row=self._compact_wire_row,
             scale_row=config.dispatch_scale_dst_nbytes,
             hist_stride=hist_stride,
+            tile_flag_nbytes=(
+                _s1f_tile_flag_nbytes(
+                    compact_rows=recv_rows, world_size=config.world_size
+                )
+                if self._s1f
+                else 0
+            ),
         )
         arena_bytes = _arena_nbytes(arena_regions)
         bound_bytes = _arena_bound_nbytes(
@@ -1401,6 +1896,7 @@ class MegaMoEGfx1250:
             experts_per_rank=config.experts_per_rank,
             topk=config.topk,
             stage1_fused=config.stage1_fused,
+            s1f=self._s1f,
         )
         if arena_bytes > bound_bytes:
             raise AssertionError(
@@ -1469,6 +1965,54 @@ class MegaMoEGfx1250:
                 torch.zeros(4, dtype=torch.int32, device=device)
                 for _ in range(self._COMPACT_PLAN_SLOTS)
             ]
+            if self._s1f:
+                from .compact_plan import compact_run_buffer_dwords
+                from .s1f_stage1 import s1f_ctl_words
+
+                # Per plan slot, like tok_map. The run table (+ piece rows) and
+                # the send list drive the producers; tile_src (one source mask
+                # per m-tile of this rank) drives the GEMM1 flag waits.
+                self._s1f_send_lists = [
+                    torch.zeros(max_routes, dtype=torch.int32, device=device)
+                    for _ in range(self._COMPACT_PLAN_SLOTS)
+                ]
+                self._s1f_run_bufs = [
+                    torch.zeros(
+                        compact_run_buffer_dwords(
+                            npes=config.world_size,
+                            experts_per_rank=config.experts_per_rank,
+                            max_routes=max_routes,
+                            s1f=True,
+                        ),
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    for _ in range(self._COMPACT_PLAN_SLOTS)
+                ]
+                self._s1f_tile_srcs = [
+                    torch.zeros(self._s1f_tile_cap, dtype=torch.int32, device=device)
+                    for _ in range(self._COMPACT_PLAN_SLOTS)
+                ]
+                # Entry ticket, work heads and piece counters: zeroed once here,
+                # then generation/parity managed by the kernel itself.
+                self._s1f_ctl = torch.zeros(
+                    s1f_ctl_words(npes=config.world_size, tile_cap=self._s1f_tile_cap),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                # Two CTAs per CU: the GEMM1 arena is half the LDS, and the
+                # grid must be all-resident for the producer/consumer waits.
+                self._s1f_workers = 2 * _s1f_cu_num()
+                self._s1f_launches = {}
+                self._s1f_precompiled = False
+                self._s1f_step = None
+                # The producer gathers whole wire rows, so the sender quant
+                # writes payload | e8m0 | pad at the compact wire pitch.
+                self._s1f_wire = torch.empty(
+                    (config.max_tokens_per_rank, self._compact_wire_row),
+                    dtype=torch.uint8,
+                    device=device,
+                )
             self._compact_masked_m = self._masked_ms[0]
             self._compact_psum = self._psums[0]
             self._compact_dummy_ids = torch.zeros(
@@ -1487,6 +2031,8 @@ class MegaMoEGfx1250:
             # inside graph capture is not allowed.
             for slot in range(self._COMPACT_PLAN_SLOTS):
                 self._compact_plan_for(self._compact_tile_m, slot)
+                if self._s1f:
+                    self._compact_plan_for(self._compact_tile_m, slot, tok_map=False)
         self._destination_peer_counter = torch.zeros(
             config.world_size, dtype=torch.int32, device=device
         )
@@ -1927,11 +2473,14 @@ class MegaMoEGfx1250:
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        s1f: bool = False,
     ):
         token_count = hidden_states.shape[0]
         spec = self._select_dispatch(token_count)
         if self._compact_plan and not self._compact_plan_pending:
-            self._launch_compact_plan_async(topk_ids, token_count)
+            # An S1F step's plan needs no tok_map (the stage-1 kernel reads
+            # the send list); a default step's dispatch reads it.
+            self._launch_compact_plan_async(topk_ids, token_count, tok_map=not s1f)
         stream = fx.Stream(torch.cuda.current_stream())
         payload = hidden_states
         if self._config.is_quant_dispatch_wire:
@@ -1943,16 +2492,32 @@ class MegaMoEGfx1250:
 
             payload = self._dispatch_quant_payload[:token_count]
             scale_rows = self._dispatch_quant_scales[:token_count]
-            dynamic_per_group_scaled_quant(
-                payload,
-                hidden_states,
-                scale_rows,
-                32,
-                shuffle_scale=False,
-            )
-            # Straight onto the wire; mori restrides these packed rows while it
-            # stages them, so there is no repack here.
-            self._dispatch_sent_scales_ptr = scale_rows.data_ptr()
+            wire = getattr(self, "_s1f_wire", None) if s1f else None
+            if wire is not None:
+                # S1F mailbox producer: the same bytes, written as whole wire
+                # rows (payload | e8m0 | pad) so one TDM gather moves a run.
+                pb = self._config.dispatch_token_nbytes
+                sb = self._config.dispatch_scale_nbytes
+                wrows = wire[:token_count]
+                dynamic_per_group_scaled_quant(
+                    wrows[:, :pb].view(payload.dtype),
+                    hidden_states,
+                    wrows[:, pb : pb + sb].view(scale_rows.dtype),
+                    32,
+                    shuffle_scale=False,
+                )
+                self._dispatch_sent_scales_ptr = wrows.data_ptr() + pb
+            else:
+                dynamic_per_group_scaled_quant(
+                    payload,
+                    hidden_states,
+                    scale_rows,
+                    32,
+                    shuffle_scale=False,
+                )
+                # Straight onto the wire; mori restrides these packed rows while it
+                # stages them, so there is no repack here.
+                self._dispatch_sent_scales_ptr = scale_rows.data_ptr()
         if self._compact_plan:
             self._wait_compact_plan()
             tok_map = self._tok_maps[self._compact_slot]
@@ -1961,19 +2526,41 @@ class MegaMoEGfx1250:
             self._compact_psum = self._psums[self._compact_slot]
         else:
             tok_map = self._token_destination_map
-        self._dispatch_variants[spec](
-            self._arena.handle,
-            payload.data_ptr(),
-            topk_ids.data_ptr(),
-            topk_weights.data_ptr(),
-            tok_map.data_ptr(),
-            self._destination_peer_counter.data_ptr(),
-            self._dispatch_barrier.data_ptr(),
-            self._total_recv.data_ptr(),
-            self._config.rank,
-            token_count,
-            stream,
-        )
+        if s1f:
+            # S1F: no dispatch kernel. The stage-1 kernel (launched in place
+            # of GEMM1) ships this step's rows off the plan's run table.
+            wire = getattr(self, "_s1f_wire", None)
+            self._s1f_step = {
+                "slot": self._compact_slot,
+                "token_count": int(token_count),
+                "payload_ptr": (
+                    payload.data_ptr() if wire is None else wire.data_ptr()
+                ),
+                "scale_ptr": self._dispatch_sent_scales_ptr,
+                # S1F check mode re-quantizes into the dense rows (wire mode).
+                "hidden": hidden_states,
+                "wts_ptr": topk_weights.data_ptr(),
+                # S1F check mode re-runs the default dispatch with these.
+                "spec": spec,
+                "payload": payload,
+                "topk_ids": topk_ids,
+                "topk_weights": topk_weights,
+                "tok_map": tok_map,
+            }
+        else:
+            self._dispatch_variants[spec](
+                self._arena.handle,
+                payload.data_ptr(),
+                topk_ids.data_ptr(),
+                topk_weights.data_ptr(),
+                tok_map.data_ptr(),
+                self._destination_peer_counter.data_ptr(),
+                self._dispatch_barrier.data_ptr(),
+                self._total_recv.data_ptr(),
+                self._config.rank,
+                token_count,
+                stream,
+            )
         reverse_source_view = _from_gpu_ptr(
             self._arena.local_ptr("recv_to_src_token"),
             (self._config.max_recv,),
