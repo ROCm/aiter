@@ -50,7 +50,7 @@ _NUM_BUFFERS = 4
 
 
 @flyc.jit
-def launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250(
+def launch_gather_kv_b_proj_8wave_gfx1250(
     arg_k: fx.Pointer,
     arg_v: fx.Pointer,
     arg_cache: fx.Pointer,
@@ -623,7 +623,7 @@ def launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250(
         )
 
 
-launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250.compile_hints["llvm_options"] = {
+launch_gather_kv_b_proj_8wave_gfx1250.compile_hints["llvm_options"] = {
     "amdgpu-expert-scheduling-mode": True,
     "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
     "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,

@@ -20,11 +20,11 @@ def _projection_runtime():
     import flydsl.expr as fx
 
     from .kernels.gather_kv_b_proj_gfx1250 import (
-        launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250,
+        launch_gather_kv_b_proj_8wave_gfx1250,
     )
     from .kernels.tensor_shim import ptr_arg
 
-    return launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250, ptr_arg, fx
+    return launch_gather_kv_b_proj_8wave_gfx1250, ptr_arg, fx
 
 
 def _cluster_n(m: int, n_heads: int) -> int:
