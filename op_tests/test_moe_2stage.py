@@ -110,6 +110,7 @@ def test_fmoe(
     kernel_bench=False,
     disable_stage2_bias=False,
     ref_dtype="bf16",
+    block_size_M=None,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -489,6 +490,8 @@ def test_fmoe(
         "linear_beta": linear_beta,
         "gate_mode": gateMode,
     }
+    if block_size_M is not None:
+        _fused_moe_kwargs["block_size_M"] = block_size_M
 
     if kernel_bench:
         # Kernel-bench: time the stage1 / stage2 kernels in isolation. One eager
@@ -1542,6 +1545,109 @@ def test_output_buffer_contract():
     aiter.logger.info("moe_2stage: output buffer contract passed")
 
 
+# gfx950 fp8 block-scale SiLU kernels.
+_FMOE_64XN = {
+    "64x128": "_ZN5aiter46fmoe_bf16_blockscaleFp8_g1u1_vs_ps_silu_64x128E",
+    "64x256": "_ZN5aiter46fmoe_bf16_blockscaleFp8_g1u1_vs_ps_silu_64x256E",
+    "64x384": "_ZN5aiter50fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_64x384E",
+}
+
+
+def _run_blockscale_case(symbol, **case):
+    """Run one SiLU case on the named kernel."""
+    launched = []
+    orig = aiter.fmoe_fp8_blockscale_g1u1
+
+    def wrap(*args, **kwargs):
+        if len(args) >= 13:
+            args = (*args[:12], symbol, *args[13:])
+        else:
+            kwargs["kernelName"] = symbol
+        name = args[12] if len(args) >= 13 else kwargs.get("kernelName", "")
+        launched.append(name)
+        return orig(*args, **kwargs)
+
+    aiter.fmoe_fp8_blockscale_g1u1 = wrap
+    torch.manual_seed(0)
+    try:
+        test_fmoe(
+            dtype=dtypes.bf16,
+            actType=aiter.ActivationType.Silu,
+            gateMode=GateMode.SEPARATED.value,
+            qType=aiter.QuantType.per_128x128,
+            AQDType=dtypes.fp8,
+            WQDType=dtypes.fp8,
+            use_g1u1=True,
+            doweight_stage1=False,
+            strict_accuracy=True,
+            check_aot_cache=False,
+            block_size_M=64,
+            **case,
+        )
+    finally:
+        aiter.fmoe_fp8_blockscale_g1u1 = orig
+    assert launched, f"fp8 block-scale kernel was not launched for {case}"
+    assert set(launched) == {
+        symbol
+    }, f"dispatched {launched}, expected {symbol} for {case}"
+
+
+def test_gfx950_blockscale_64xn():
+    """Coverage for the gfx950 fp8 block-scale SiLU kernels. Each case names
+    its kernel.
+
+    inter_dim=1536 on 64x256 is a regression: the old object fails the
+    numerical check. model_dim=512 is the smallest supported K on each
+    kernel, checked through the numerical output.
+    """
+    if get_gfx() != "gfx950":
+        return
+
+    # Dispatch must not consult a tuned config for these shapes.
+    get_2stage_cfgs.cache_clear()
+    try:
+        with override_env("AITER_BYPASS_TUNE_CONFIG", "1"):
+            # Regression: 64x256 at inter_dim=1536. The tile count is smaller
+            # than the launch grid and is not a multiple of the de-swizzle
+            # group. The old object fails this numerical check.
+            for case in (
+                {
+                    "token": 256,
+                    "model_dim": 4096,
+                    "inter_dim": 1536,
+                    "E": 16,
+                    "topk": 8,
+                },
+                {
+                    "token": 1024,
+                    "model_dim": 3072,
+                    "inter_dim": 1536,
+                    "E": 64,
+                    "topk": 8,
+                },
+            ):
+                _run_blockscale_case(_FMOE_64XN["64x256"], **case)
+
+            # Smallest supported K on 64x128, 64x256, and 64x384. The check
+            # compares the numerical output.
+            for tile, inter_dim in (
+                ("64x128", 128),
+                ("64x256", 256),
+                ("64x384", 384),
+            ):
+                _run_blockscale_case(
+                    _FMOE_64XN[tile],
+                    token=64,
+                    model_dim=512,
+                    inter_dim=inter_dim,
+                    E=8,
+                    topk=2,
+                )
+    finally:
+        get_2stage_cfgs.cache_clear()
+    aiter.logger.info("moe_2stage: gfx950 block-scale 64xN coverage passed")
+
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -1559,6 +1665,7 @@ if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 else:
     test_output_buffer_contract()
+    test_gfx950_blockscale_64xn()
     # Skip unrelated tuned-CSV validation for an explicit CLI quant sweep.
     if not args.no_flydsl_csv and args.quant is None:
         _case_iters.append(
