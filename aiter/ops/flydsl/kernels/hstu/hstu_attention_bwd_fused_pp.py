@@ -1323,15 +1323,30 @@ def build_hstu_attention_bwd_fused_pp(
                             kt_packs[ks][og], ds_t[og], dq_acc[ks]
                         )  # fmt: skip
 
-                # Park this wave's partial in its PRIVATE slot. Phase V sums
-                # the eight of them; see `dq_reduce_flush` for why the reduction
-                # cannot happen here.
-                #
-                # No scale: `c_inv_n` is applied once at the store, 4 elements
-                # per lane instead of 16. Alpha needs nothing -- `kt_packs` is
-                # transposed from the alpha-scaled `k_packs`, and
-                # ds.(aK) = a.(ds.K) is exactly the chain rule. Do NOT also
-                # apply dq_pp's `alpha/max_seq_len`; that folds alpha into Q.
+            rocdl.sched_barrier(0)
+
+            rocdl.sched_barrier(0)
+            if is_g0:
+                transpose_q(rm_cur, t_cur)
+            else:
+                transpose_do(rm_cur, t_cur)
+            rocdl.sched_barrier(0)
+
+            # The dQ staging writes go HERE, after the transpose build, not
+            # straight off the MFMAs that produce them. They read dQ
+            # accumulators directly, and an MFMA result costs a non-MFMA
+            # consumer wait states: the hazard recogniser emits `s_nop 3` /
+            # `s_nop 6` and the writes absorb the rest. The trace charged them
+            # 5.5% of all stall, and tellingly the ONE write that already had
+            # an `s_nop 6` ahead of it stalled 23 K against its neighbour's
+            # 2.18 M. The transpose's four `ds_read_u16`, its `vmcnt(0)` and
+            # its `ds_write` touch none of `dq_acc`, so they are free cover.
+            #
+            # No scale here: `c_inv_n` is applied once at the flush, 4 elements
+            # per lane instead of 16. Alpha needs nothing -- `kt_packs` is
+            # transposed from the alpha-scaled `k_packs`, and
+            # ds.(aK) = a.(ds.K) is exactly the chain rule.
+            if const_expr(dq_mode != "nodq"):
                 for ks in range_constexpr(K_STEPS):
                     # q = l%16, d = ks*MFMA_M + MFMA_LANE_K*(l/16) + e, so the
                     # four elements are one contiguous run of the
@@ -1342,15 +1357,6 @@ def build_hstu_attention_bwd_fused_pp(
                         fx.Int32(ks * MFMA_M // DQ_PER_LANE) + lane_div_16,
                         None,
                     ].store(Vec(dq_acc[ks]))  # fmt: skip
-            rocdl.sched_barrier(0)
-
-            rocdl.sched_barrier(0)
-            if is_g0:
-                transpose_q(rm_cur, t_cur)
-            else:
-                transpose_do(rm_cur, t_cur)
-            rocdl.sched_barrier(0)
-
             rocdl.s_setprio(0)
             # The tile i+1 DMA fired above must land before the mid barrier, not
             # merely before this group's own next read: with the half-iteration
