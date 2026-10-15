@@ -2554,7 +2554,13 @@ namespace py = pybind11;
           py::arg("numRows"),                     \
           py::arg("stride0"),                     \
           py::arg("k"));                          \
-    m.def("topk_plain_gfx950_width", &topk_plain_gfx950_width, py::arg("name"));
+    m.def("topk_plain_width",                     \
+          &topk_plain_width,                      \
+          py::arg("name"));                       \
+    m.def("topk_plain_uses_radix",                \
+          &topk_plain_uses_radix,                 \
+          py::arg("width"),                       \
+          py::arg("k"));
 
 #define RMSNORM_QUANT_PYBIND                 \
     AITER_SET_STREAM_PYBIND;                 \

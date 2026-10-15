@@ -34,7 +34,12 @@ bool topk_plain_use_mulblocks(int64_t numRows, int64_t stride0, int64_t k, bool 
 // be allocated + cached on the Python side and passed into topk_plain.
 int64_t topk_plain_workspace_size(int64_t numRows, int64_t stride0, int64_t k);
 
-// The row lengths bounding the gfx950 one-block kernels -- "any_rows_min",
-// "any_rows_max", "lds_tail_max" -- for the tests that hold topk_select's copies
-// to them; -1 for any other name.
-int64_t topk_plain_gfx950_width(const std::string& name);
+// The row lengths bounding the one-block kernels -- gfx950's "any_rows_min",
+// "any_rows_max", "lds_tail_max", and the register window other parts keep,
+// "reg_window_min", "reg_window_max" -- for topk_select's router; -1 for any
+// other name.
+int64_t topk_plain_width(const std::string& name);
+
+// Whether rows of `width` at `k` take the radix path rather than the block-sort
+// fallback (should_use_topk_radix), the one path with an indices-only build.
+bool topk_plain_uses_radix(int64_t width, int64_t k);

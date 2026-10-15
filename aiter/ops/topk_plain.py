@@ -4,7 +4,6 @@
 # user interface
 
 import functools
-import math
 
 import torch
 
@@ -41,7 +40,11 @@ def topk_plain_workspace_size(numRows: int, stride0: int, k: int) -> int: ...
 
 
 @compile_ops("module_topk_plain")
-def topk_plain_gfx950_width(name: str) -> int: ...
+def topk_plain_width(name: str) -> int: ...
+
+
+@compile_ops("module_topk_plain")
+def topk_plain_uses_radix(width: int, k: int) -> bool: ...
 
 
 @functools.lru_cache(maxsize=1024)
@@ -59,17 +62,13 @@ _MAX_CAPACITY = 2048
 
 @functools.lru_cache(maxsize=1024)
 def _uses_radix(width: int, topk: int) -> bool:
-    """Mirrors `should_use_topk_radix` in csrc/kernels/topk_plain_kernels.cu.
+    """`should_use_topk_radix` in csrc/kernels/topk_plain_kernels.cu, asked.
 
     Both `AdaptiveTopK` overloads consult it to choose between the radix
     selector and the block-sort fallback, and the two questions below are both
     really this one.
     """
-    if topk <= 1:
-        return False
-    denom = max(0.0001, math.log2(width) - 9.5)
-    log_k = math.log2(topk)
-    return topk * log_k * log_k >= (4.8 * width) / denom
+    return bool(topk_plain_uses_radix(width, topk))
 
 
 def topk_plain_batches_ragged_rows(width: int, topk: int) -> bool:

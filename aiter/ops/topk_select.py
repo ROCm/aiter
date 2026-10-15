@@ -72,6 +72,7 @@ from aiter.ops.topk_plain import (
     topk_plain,
     topk_plain_use_mulblocks,
     topk_plain_values_optional,
+    topk_plain_width,
 )
 
 __all__ = ["topk_select", "topk_select_backend"]
@@ -178,6 +179,11 @@ _PLAIN_K2048_TINY_BAND = (8192, 32770)
 _PLAIN_K2048_TINY_MAX_ROWS = 8
 _PLAIN_K2048_SHORT_BANDS = ((8192, 8194), (16384, 16386), (20000, 32770))
 _PLAIN_K2048_SHORT_MAX_ROWS = 128
+# The two triplets that sit inside the register window plain keeps off gfx950
+# (`reg_window_min`..`reg_window_max`, asked of the kernels). Should the window
+# stop covering a row of them, those bands lapse for it on every part rather
+# than send it to the generic kernel they were not tuned against.
+_PLAIN_K2048_REG_WINDOW_BANDS = (_PLAIN_K2048_4K_BAND, _PLAIN_K2048_SHORT_BANDS[0])
 # gfx942 below 128 CUs (MI308X, k=2048, randn, device time): plain also beat
 # decode on the 4K triplet at every row count, at 129..255 rows on the short
 # bands, and from 128 rows below 8192 columns -- 25% less total time over 732
@@ -195,7 +201,8 @@ _PLAIN_K2048_SMALL_CU_NARROW_MIN_ROWS = 128
 # 129..255 rows from 8192 to 65536 columns (0.37x--0.85x) and at 129..4000
 # rows from 65537 to 131071 columns (0.42x--0.89x).  Past 80 * 1024 columns
 # plain falls back to its generic kernel and decode is faster again at 8..32
-# rows from 100000 columns, so the few-row band stops there.  Rows the
+# rows from 100000 columns, so the few-row band stops there, at the kernels'
+# own `any_rows_max` (`_plain_width`).  Rows the
 # stream small-reject path serves with its specialised branch -- one or two
 # rejected columns (`_SMALL_REJECT_UNMASKED_MAX`) -- stay with it:
 # 1.09x-1.60x faster than plain at 1..16384 rows, bar 6..8 rows at two
@@ -205,9 +212,6 @@ _PLAIN_K2048_SMALL_CU_NARROW_MIN_ROWS = 128
 # kernel's wider limits (`_stream_small_reject`) still serve `stream` itself.
 _PLAIN_K2048_NARROW_WIDTH = 8192
 _PLAIN_K2048_FEW_ROWS = 128
-# `kTopkPlainGfx950AnyRowsMaxLen` in csrc/kernels/topk_per_row_kernels.cu;
-# test_plain_gfx950_widths holds the copy to it.
-_PLAIN_K2048_FEW_ROWS_MAX_WIDTH = 80 * 1024
 _PLAIN_K2048_MAX_WIDTH = 131071
 # Below sampled's width door these kernels beat `sampled` on every measured
 # uniform cell its work door took -- 2049..131072 rows of 2100..131071 columns,
@@ -239,11 +243,9 @@ _PLAIN_K2048_MAX_WIDTH = 131071
 # columns: 0.80x-0.968x across four processes (seed-0 randn, MI355X; 4096 rows
 # of 131072 columns 405 against 420us). The edges are where that stopped:
 # 2816 rows reached 0.998x at 131104 columns, 2048 rows 0.979x at 131072, and
-# 4096 rows 0.978x at 131999 and 0.983x at 132000 columns. Mirrors
-# `kTopkPlainGfx950LdsTailMaxLen` in csrc/kernels/topk_per_row_kernels.cu;
-# test_plain_gfx950_widths holds the copy to it.
+# 4096 rows 0.978x at 131999 and 0.983x at 132000 columns. The width bound is
+# the kernels' own, `lds_tail_max` (`_plain_width`).
 _PLAIN_K2048_LDS_TAIL_MIN_ROWS = 3000
-_PLAIN_K2048_LDS_TAIL_MAX_WIDTH = 128 * 1024 + 768
 # Ragged rows at k=2048 on gfx950, which plain's band above does not take (see
 # `_plain_takes`). Every backend measured over 1..4096 rows of 2100..131071
 # columns with three row-end patterns -- uniform in [width/2, width], causal
@@ -719,6 +721,16 @@ def _plain_multiblock(
     return bool(topk_plain_use_mulblocks(rows, stride0, k, ragged))
 
 
+@lru_cache(maxsize=8)
+def _plain_width(name: str) -> int:
+    """A row length bounding plain's one-block kernels (`topk_plain_width`),
+    asked of them rather than kept here, so the bands cannot drift from them."""
+    width = topk_plain_width(name)
+    if width < 0:
+        raise ValueError(f"topk_plain_width does not know {name!r}")
+    return width
+
+
 def _plain_k2048_lds_tail_takes(rows: int, width: int, k: int, device: int) -> bool:
     """Whether uniform rows past sampled's width door go to plain's LDS tail.
 
@@ -729,7 +741,7 @@ def _plain_k2048_lds_tail_takes(rows: int, width: int, k: int, device: int) -> b
         k == 2048
         and _device_arch(device) == "gfx950"
         and rows >= _PLAIN_K2048_LDS_TAIL_MIN_ROWS
-        and _SAMPLED_MIN_WIDTH <= width <= _PLAIN_K2048_LDS_TAIL_MAX_WIDTH
+        and _SAMPLED_MIN_WIDTH <= width <= _plain_width("lds_tail_max")
     )
 
 
@@ -813,7 +825,7 @@ def _sampled_takes(
         plain_band = _plain_takes(rows, width, k, device, ragged)
         plain_pitch = pitch if ragged else width
         if (plain_band and _plain_multiblock(rows, plain_pitch, k, ragged, device)) or (
-            rows <= _PLAIN_K2048_FEW_ROWS and width > _PLAIN_K2048_FEW_ROWS_MAX_WIDTH
+            rows <= _PLAIN_K2048_FEW_ROWS and width > _plain_width("any_rows_max")
         ):
             return _sampled_supports_cached(rows, pitch, k, device)
         if yield_to_plain and plain_band:
@@ -854,12 +866,12 @@ def _plain_takes(
     if k == 2048 and not ragged and _device_arch(device) == "gfx950":
         if width < _PLAIN_K2048_NARROW_WIDTH:
             rejects = width - k
-            return rejects > 0 and not (
+            return width >= _plain_width("any_rows_min") and not (
                 rejects <= _SMALL_REJECT_UNMASKED_MAX.value
                 and _stream_small_reject(rows, rejects)
             )
         if rows <= _PLAIN_K2048_FEW_ROWS:
-            return width <= _PLAIN_K2048_FEW_ROWS_MAX_WIDTH
+            return width <= _plain_width("any_rows_max")
         return width <= _PLAIN_K2048_MAX_WIDTH
     if k == 2048:
         small_cu = (
@@ -872,20 +884,29 @@ def _plain_takes(
             and width < _PLAIN_K2048_NARROW_WIDTH
         ):
             return True
+        bands_hold = not any(
+            lo <= width <= hi for lo, hi in _PLAIN_K2048_REG_WINDOW_BANDS
+        ) or (_plain_width("reg_window_min") <= width <= _plain_width("reg_window_max"))
         four_k_lo, four_k_hi = _PLAIN_K2048_4K_BAND
-        if (small_cu or rows <= _PLAIN_K2048_4K_MAX_ROWS) and (
-            four_k_lo <= width <= four_k_hi
+        if (
+            bands_hold
+            and (small_cu or rows <= _PLAIN_K2048_4K_MAX_ROWS)
+            and four_k_lo <= width <= four_k_hi
         ):
             return True
         tiny_lo, tiny_hi = _PLAIN_K2048_TINY_BAND
-        if rows <= _PLAIN_K2048_TINY_MAX_ROWS and tiny_lo <= width <= tiny_hi:
+        if (
+            bands_hold
+            and rows <= _PLAIN_K2048_TINY_MAX_ROWS
+            and tiny_lo <= width <= tiny_hi
+        ):
             return True
         short_max_rows = (
             _PLAIN_K2048_SMALL_CU_SHORT_MAX_ROWS
             if small_cu
             else _PLAIN_K2048_SHORT_MAX_ROWS
         )
-        if rows <= short_max_rows:
+        if bands_hold and rows <= short_max_rows:
             for short_lo, short_hi in _PLAIN_K2048_SHORT_BANDS:
                 if short_lo <= width <= short_hi:
                     return True

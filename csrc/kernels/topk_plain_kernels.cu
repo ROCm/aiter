@@ -2671,3 +2671,5 @@ int64_t topk_plain_workspace_size(int64_t numRows, int64_t stride0, int64_t k)
     return invokeComputeTopkLastDimWorkspaceSize<float, aiter::Phase::Prefill>(
         static_cast<int32_t>(numRows), static_cast<int32_t>(stride0), static_cast<int>(k));
 }
+
+bool topk_plain_uses_radix(int64_t width, int64_t k) { return should_use_topk_radix(width, k); }

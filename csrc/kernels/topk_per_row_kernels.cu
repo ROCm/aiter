@@ -5281,6 +5281,10 @@ inline bool topk_oneblock_plain_gfx950_serves(int64_t len, int k, bool ranged,
            topk_oneblock_num_cu() >= 256 && topk_oneblock_is_gfx950();
 }
 
+// The register window other large-BPP wave64 parts keep (dispatch_topk_oneblock).
+constexpr int64_t kTopkPlainRegWindowMinLen = 4096;
+constexpr int64_t kTopkPlainRegWindowMaxLen = 8194;
+
 // The kernels below serve calls with no row range (rowStarts == rowEnds ==
 // nullptr), which only topk_plain makes; module_topk_plain defines this. The
 // other module that builds this file passes row bounds on every call, so it
@@ -5323,7 +5327,8 @@ inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, Idx
             // window is wave64 only too: at wave32 a 1024-thread block is 32
             // waves, past the 16 its bucket reduce scans.
 #if !defined(__HIP_DEVICE_COMPILE__) || defined(__GFX9__)
-            if(len >= 4096 && len <= 8194 && get_warp_size_func() == 64)
+            if(len >= kTopkPlainRegWindowMinLen && len <= kTopkPlainRegWindowMaxLen &&
+               get_warp_size_func() == 64)
             {
                 int const ept = static_cast<int>((len + BlockSize - 1) / BlockSize);
                 if(topk_oneblock_reg_launch<T, IdxT, BlockSize, WRITE_TOPK_VALUES, 12, 8, 4, 9, false,
@@ -5541,10 +5546,9 @@ bool topk_plain_use_mulblocks(int64_t numRows, int64_t stride0, int64_t k, bool 
                                              /*select_min=*/false);
 }
 
-// The row lengths that bound the gfx950 one-block kernels, by name, which
-// topk_select's router keeps copies of; its tests hold those copies to these.
-// -1 for a name it does not know.
-int64_t topk_plain_gfx950_width(const std::string& name)
+// The row lengths that bound the one-block kernels, by name, for topk_select's
+// router to ask rather than copy. -1 for a name it does not know.
+int64_t topk_plain_width(const std::string& name)
 {
     if(name == "any_rows_min")
         return aiter::ob::kTopkPlainGfx950AnyRowsMinLen;
@@ -5552,6 +5556,10 @@ int64_t topk_plain_gfx950_width(const std::string& name)
         return aiter::ob::kTopkPlainGfx950AnyRowsMaxLen;
     if(name == "lds_tail_max")
         return aiter::ob::kTopkPlainGfx950LdsTailMaxLen;
+    if(name == "reg_window_min")
+        return aiter::ob::kTopkPlainRegWindowMinLen;
+    if(name == "reg_window_max")
+        return aiter::ob::kTopkPlainRegWindowMaxLen;
     return -1;
 }
 
