@@ -523,11 +523,6 @@ def build_hstu_attention_bwd_fused_pp(
                 (BLOCK_N * DQ_PAD, DQ_PAD, DQ_PER_LANE, 1),
             )
         )
-        dqw_wr = lds.dqw.view(
-            fx.make_layout(
-                (NUM_WAVES, BLOCK_N, DQ_PAD), (BLOCK_N * DQ_PAD, DQ_PAD, 1)
-            )
-        )
         dqg = lds.dqg.view(
             fx.make_layout(
                 (BLOCK_N + 2, head_dim // DQ_PER_LANE, DQ_PER_LANE),
@@ -1099,13 +1094,21 @@ def build_hstu_attention_bwd_fused_pp(
             # One `ds_read_b128` per source wave, then SCALAR adds: the wide
             # load and the unpacked arithmetic are independent wins and the
             # naive form gives up one to get the other.
+            # ALL four reads first, then the adds. Interleaved, the compiler
+            # rotates only two destination buffers, so read 3 cannot issue
+            # until the adds have drained read 1 -- a read/wait/add chain with
+            # ILP 2. The trace charged 4.87 M cycles to that third
+            # `ds_read_b128` alone (5.7% of all stall, 239/exec). Four live
+            # buffers cost 16 VGPR against 46 spare, and push every `lgkmcnt`
+            # further from the read it covers.
+            _vs = [
+                Vec(dqw[dq_wbase + fx.Int32(w), dq_frow, dq_fvec, None].load())
+                for w in range_constexpr(NUM_WAVES // 2)
+            ]
             acc = [fx.Float32(0.0) for _ in range_constexpr(DQ_PER_LANE)]
             for w in range_constexpr(NUM_WAVES // 2):
-                _v = Vec(
-                    dqw[dq_wbase + fx.Int32(w), dq_frow, dq_fvec, None].load()
-                )
                 for j in range_constexpr(DQ_PER_LANE):
-                    acc[j] = fadd_scalar(acc[j], _v[j])
+                    acc[j] = fadd_scalar(acc[j], _vs[w][j])
             dqg[dq_wrow, dq_fvec, None].store(
                 Vec.from_elements(acc, fx.Float32)
             )
@@ -1266,10 +1269,22 @@ def build_hstu_attention_bwd_fused_pp(
                 #
                 # C[m=q][n=d] over 4 d-chunks x KV_OWNED_SUBTILES kv steps.
                 rocdl.sched_barrier(0)
+                # Operands SWAPPED: this computes dQ^T, C[m=d][n=q]. Same
+                # arithmetic for free, different lane layout -- a lane then
+                # holds 4 CONSECUTIVE d of ONE q row, so the staging write
+                # below is one `ds_write_b128` per chunk instead of 4 scattered
+                # dwords. Unswapped, C is [m=q][n=d]: a lane holds one d across
+                # 4 q rows, strided by DQ_PAD, and the flush's read wants the
+                # other axis -- only one side could ever be contiguous.
+                #
+                # A = kt_packs reads as K^T[d][kv], B = ds_t as dS^T[kv][q],
+                # and K^T.dS^T = (dS.K)^T = dQ^T. Checked against the lane maps.
                 dq_acc = [c_zero_v4f32 for _ in range_constexpr(K_STEPS)]
                 for ks in range_constexpr(K_STEPS):
                     for og in range_constexpr(KV_OWNED_SUBTILES):
-                        dq_acc[ks] = mfma_acc(ds_t[og], kt_packs[ks][og], dq_acc[ks])
+                        dq_acc[ks] = mfma_acc(
+                            kt_packs[ks][og], ds_t[og], dq_acc[ks]
+                        )  # fmt: skip
 
                 # Park this wave's partial in its PRIVATE slot. Phase V sums
                 # the eight of them; see `dq_reduce_flush` for why the reduction
@@ -1280,11 +1295,16 @@ def build_hstu_attention_bwd_fused_pp(
                 # transposed from the alpha-scaled `k_packs`, and
                 # ds.(aK) = a.(ds.K) is exactly the chain rule. Do NOT also
                 # apply dq_pp's `alpha/max_seq_len`; that folds alpha into Q.
-                for e in range_constexpr(MFMA_ELEMS_PER_LANE):
-                    _q = lane_div_16 * fx.Int32(MFMA_LANE_K) + fx.Int32(e)
-                    for ks in range_constexpr(K_STEPS):
-                        _d = fx.Int32(ks * MFMA_M) + lane_mod_16
-                        dqw_wr[wave_id, _q, _d] = Vec(dq_acc[ks])[e]
+                for ks in range_constexpr(K_STEPS):
+                    # q = l%16, d = ks*MFMA_M + MFMA_LANE_K*(l/16) + e, so the
+                    # four elements are one contiguous run of the
+                    # (.., BLOCK_N, head_dim/VEC, VEC) view.
+                    dqw[
+                        wave_id,
+                        lane_mod_16,
+                        fx.Int32(ks * MFMA_M // DQ_PER_LANE) + lane_div_16,
+                        None,
+                    ].store(Vec(dq_acc[ks]))  # fmt: skip
             rocdl.sched_barrier(0)
 
             rocdl.s_setprio(0)
