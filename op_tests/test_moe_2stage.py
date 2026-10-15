@@ -1395,11 +1395,14 @@ def test_adaptive_sort_output_in_place():
     A buffer starting 2 bytes into its allocation is too underaligned for the
     sort's 16-byte zeroing, so it must take a fresh moe_buf and be copied into.
     """
+    global AITER_MOE_NUM_EXPERT_ACTIVATED
     fm = aiter.fused_moe
     real_adaptive = fm._adaptive_moe_sort
     real_return = fm._return_output
     # AITER_MOE_SORT_BACKEND=opus/ck bypasses the adaptive sort under test.
     real_backend = fm._MOE_SORT_BACKEND
+    # The parsed override can exceed token * topk at M=1 and make test_fmoe raise.
+    real_n_act = AITER_MOE_NUM_EXPERT_ACTIVATED
     adaptive_calls, copies = [], []
 
     def tracking_adaptive(*a, **kw):
@@ -1418,6 +1421,7 @@ def test_adaptive_sort_output_in_place():
         fm._adaptive_moe_sort = tracking_adaptive
         fm._return_output = tracking_return
         fm._MOE_SORT_BACKEND = "auto"
+        AITER_MOE_NUM_EXPERT_ACTIVATED = 0
         with override_env("AITER_SITUV2_A8W4", None), override_env(
             "AITER_SITUV2_A4W4", "1"
         ):
@@ -1455,6 +1459,7 @@ def test_adaptive_sort_output_in_place():
         fm._adaptive_moe_sort = real_adaptive
         fm._return_output = real_return
         fm._MOE_SORT_BACKEND = real_backend
+        AITER_MOE_NUM_EXPERT_ACTIVATED = real_n_act
     aiter.logger.info(
         "moe_2stage adaptive-sort in-place output summary (markdown):\n%s",
         pd.DataFrame(rows).to_markdown(index=False),
