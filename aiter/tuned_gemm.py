@@ -55,11 +55,11 @@ def _gfx1250_gluon_a16w16_has_config(N, K):
 def _gfx1250_flydsl_default_kernel(M, N, K, bias, dtype, otype):
     """The FlyDSL kernel for a gfx1250 BF16 GEMM without a tuned row, or None.
 
-    Against Triton's gluon DEFAULT.json, these two FlyDSL configs took 0.50 to 1.10 of Triton's time (geomean 0.78)
-    for M from 512 to 1024 or above 4096, N >= 4096 and K >= 512 (the shapes of the untuned BF16 CSVs), and 0.81 to
-    1.28 (geomean 0.99) for 1024 < M <= 4096, the M_LEQ_2048 and M_LEQ_4096 buckets of that file, which that range
-    leaves to Triton wherever Triton can write C. With fewer tiles Triton was faster, and K < 512 is too short for the
-    4-stage pipeline.
+    Against Triton's gluon DEFAULT.json, these two FlyDSL configs took 0.81 of Triton's time in geomean (0.50 to
+    1.11) for M from 512 to 1024 or above 4096, N >= 4096 and K >= 512 (the shapes of the untuned BF16 CSVs), and 1.01
+    (0.79 to 1.84) for 1024 < M <= 4096, the M_LEQ_2048 and M_LEQ_4096 buckets of that file, which that range leaves to
+    Triton wherever Triton can write C. With fewer tiles Triton was faster, and K < 512 is too short for the 4-stage
+    pipeline.
     """
     if dtype != dtypes.bf16 or otype not in (dtypes.bf16, dtypes.fp32):
         return None
