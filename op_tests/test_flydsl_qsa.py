@@ -63,6 +63,12 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from op_tests.qsa_ref import (
+    FLASH_NEXT_GQA,
+    FLASH_NEXT_INDEXER,
+    FLASH_NEXT_SCORE_SCALE,
+    GLUON_PARITY_GQA,
+    GLUON_PARITY_INDEXER,
+    GLUON_PARITY_INDEXER_H8,
     gather_paged_cache,
     pack_paged_cache,
     qsa_expand_tail,
@@ -73,14 +79,6 @@ from op_tests.qsa_ref import (
 )
 from op_tests.qsa_ref import (
     qsa_sparse_gqa as sparse_gqa_ref,
-)
-from op_tests.qsa_shapes import (
-    FLASH_NEXT_GQA,
-    FLASH_NEXT_INDEXER,
-    FLASH_NEXT_SCORE_SCALE,
-    GLUON_PARITY_GQA,
-    GLUON_PARITY_INDEXER,
-    GLUON_PARITY_INDEXER_H8,
 )
 
 SUPPORTED_GFX = ["gfx942", "gfx950"]
@@ -773,6 +771,58 @@ def test_k1_prefill_padded_page_table():
         )
         _assert_k1_block_ids(
             ref_ids, got, f"K1 prefill pad {name} changed the selected set"
+        )
+
+
+def test_k1_prefill_rejects_invalid_visible_page():
+    """The 16-row scorer must not select a visible block whose page id is -1.
+
+    One request, M=32, context 4096, so the 16-row scorer runs on every
+    supported arch. The gather zeroes K on that page. With an all-zero Q
+    every live score is 0 too, so a block on that page would tie into
+    the top 512 unless it scores -inf. The page is first, then inside
+    the visible range.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FLASH_NEXT_INDEXER
+    device = torch.device("cuda")
+    m, context, page_size = 32, 4096, 16
+    n_blocks = context // idx.compress_ratio
+    torch.manual_seed(0)
+    q = torch.zeros(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+    qpos = _query_positions(m, context, device)
+    slen = torch.full((1,), context, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(1)
+    index_cache, index_table = pack_paged_cache(
+        k_bar.unsqueeze(1), page_size, generator=gen
+    )
+    ref_scores = qsa_indexer_scores(
+        q,
+        k_bar,
+        qpos,
+        slen,
+        token_to_req,
+        idx.compress_ratio,
+        score_scale=FLASH_NEXT_SCORE_SCALE,
+    )
+    for bad_page in (0, 3):
+        table = index_table.clone()
+        table[0, bad_page] = -1
+        block0 = bad_page * page_size
+        scores = ref_scores.clone()
+        scores[:, block0 : block0 + page_size] = float("-inf")
+        ref_ids = qsa_topk_blocks(scores, idx.block_budget)
+        got = qsa_indexer_block_ids(
+            q, index_cache, table, token_to_req, qpos, slen, heads=(4,)
+        )
+        _assert_k1_block_ids(
+            ref_ids,
+            got,
+            f"K1 prefill kept a block on page {bad_page}, whose id is -1",
         )
 
 
