@@ -250,7 +250,8 @@ def qsa_sparse_attention_flydsl(
     indices is contiguous int32[M,4T+3]: up to T complete four-token blocks (T =
     256, 512, 768 or 1024, set by the width), followed by the query's 0..3 causal
     tail tokens, then -1 padding. Block IDs are request-local, unique, and may be
-    unordered. The selected set is exact.
+    unordered. The selected set is exact. K/V must be finite: rows of a request share
+    union tiles, so a non-finite value can also reach rows that did not select it.
     A selection that breaks this layout traps on the GPU, which aborts the process.
 
     Host query_lens/prefix_lens describe packed requests. For one request they

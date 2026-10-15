@@ -226,8 +226,6 @@ def _body(
     BLOCKS,
     MEMBERS,
     COUNTS,
-    ACTIVE,
-    DIRECT_FLAG,
     storage,
     work,
     H: fx.Constexpr[int],
@@ -546,11 +544,6 @@ def _body(
     if fx.const_expr(not STAGGER):
         _stage_end()
     inv = (row_sum > 0.0).select(fx.Float32(1.0) / row_sum, fx.Float32(0.0))
-    # Rows share V, so a value one row selects meets the others' zero probabilities.
-    finite = fx.isfinite(o0[0])
-    for value in [o0[i] for i in range(1, 32)] + [o1[i] for i in range(32)]:
-        finite = finite & fx.isfinite(value)
-    nonfinite = fx.Int64(rocdl.ballot(fx.Int64.ir_type, valid_row & ~finite))
     output = rocdl.make_buffer_tensor(
         fx.make_view(
             fx.get_iter(OUT) + fx.Int64(q0) * (H * D) + hkv * (H // HK) * D,
@@ -573,10 +566,6 @@ def _body(
         qextent,
         row_offset,
     )
-    # The gated direct kernel, which reads only selected values, recomputes the tile.
-    if nonfinite != 0:
-        ACTIVE[tile_id] = 0
-        DIRECT_FLAG[0] = 1
 
 
 @flyc.kernel(name="attention_union_bf16_d256", known_block_size=[THREADS, 1, 1])
@@ -591,7 +580,6 @@ def _kernel(
     COUNTS: fx.Tensor,
     ACTIVE: fx.Tensor,
     ORDER: fx.Tensor,
-    DIRECT_FLAG: fx.Tensor,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
@@ -628,8 +616,6 @@ def _kernel(
                     BLOCKS,
                     MEMBERS,
                     COUNTS,
-                    ACTIVE,
-                    DIRECT_FLAG,
                     storage,
                     mapped,
                     H,
@@ -651,8 +637,6 @@ def _kernel(
                     BLOCKS,
                     MEMBERS,
                     COUNTS,
-                    ACTIVE,
-                    DIRECT_FLAG,
                     storage,
                     mapped,
                     H,
@@ -679,7 +663,6 @@ def _launch(
     COUNTS: fx.Tensor,
     ACTIVE: fx.Tensor,
     ORDER: fx.Tensor,
-    DIRECT_FLAG: fx.Tensor,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
@@ -703,7 +686,6 @@ def _launch(
             COUNTS,
             ACTIVE,
             ORDER,
-            DIRECT_FLAG,
             H,
             HK,
             NQ,
@@ -735,7 +717,6 @@ def _args(inputs, plan, out, stream):
         plan.counts.view(-1),
         plan.active,
         plan.task_order,
-        plan.direct_flag,
         inputs.q.shape[1],
         inputs.k.shape[1],
         inputs.q.shape[0],
@@ -752,14 +733,14 @@ def _args(inputs, plan, out, stream):
 
 
 def _compiled(inputs, args, stream):
-    key = (inputs.q.device, args[11], args[12], args[15], args[16], args[19])
+    key = (inputs.q.device, args[10], args[11], args[14], args[15], args[18])
     compiled = _COMPILED.get(key)
     if compiled is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Warm the QSA specialization before graph capture")
         with torch.cuda.device(inputs.q.device), torch.cuda.stream(stream):
             compiled = _COMPILED[key] = flyc.compile(
-                _launch, *args[:18], 0, args[19], stream
+                _launch, *args[:17], 0, args[18], stream
             )
     return compiled
 

@@ -17,9 +17,8 @@ Groups (Q heads per KV head) follow Qwen3.8-Flash-Next per TP rank (12/6/3 for
 TP2/4/8, where HK = 1 and H = group); HK = 2/16 cases repeat those groups over
 more KV heads. Functional cases cover one row, a short extend and chunked
 prefill against long cached contexts (one whose packed KV exceeds the direct
-kernel's 64 MiB budget), ragged batches with an empty request, HK > 1,
-T = 256/768/1024 selections, and a NaN V token that only later rows of its
-union tiles select. Performance cases are single-request full
+kernel's 64 MiB budget), ragged batches with an empty request, HK > 1 and
+T = 256/768/1024 selections. Performance cases are single-request full
 prefills of 1k-32k tokens plus the 12000-token serving prompt (T = 512); they
 are checked as well and are the only cases using the full-prefill BQ21/BQ42
 union tiles. ``shared`` selections let 32-row windows share block priorities;
@@ -74,10 +73,7 @@ FUNCTIONAL_CASES = {
     "topk256_chunk_1024_ctx_31024": ((1024,), (30000,), 1, "shared", 256),
     "topk768_ragged_4": ((300, 129, 1001, 63), (0, 517, 4093, 12345), 1, "shared", 768),
     "topk1024_chunk_1024_ctx_132096": ((1024,), (131072,), 1, "shared", 1024),
-    "nan_v_prefill_768": ((768,), (0,), 1, "shared", 512),
 }
-# V tokens set to NaN: only the rows selecting them may turn NaN, not their tile neighbours.
-NAN_V_TOKENS = {"nan_v_prefill_768": (715,)}
 # Performance: one full prefill of 1k-32k tokens, plus the 12000-token serving prompt.
 PERF_CASES = {
     f"prefill_{tokens}": ((tokens,), (0,), 1, "correlated", 512)
@@ -559,8 +555,6 @@ def test_qsa_sparse_attention(case, heads):
     v = torch.randn(
         kv_tokens, kv_heads, HEAD_DIM, generator=generator, dtype=dtypes.bf16
     )
-    for token in NAN_V_TOKENS.get(case, ()):
-        v[token] = float("nan")
     indices = make_indices(query_lens, prefix_lens, selection, generator, topk)
 
     # Both run as the SGLang QSA backend calls them; each allocates its output.
@@ -576,8 +570,7 @@ def test_qsa_sparse_attention(case, heads):
         ),
         "triton": (*sglang_triton(q, k, v, indices, query_lens, prefix_lens), {}),
     }
-    # NaN compares as 1e4, so NaN rows must match the reference's exactly.
-    ref = run_torch(q, k, v, indices, query_lens, prefix_lens, SCALE).nan_to_num(1e4)
+    ref = run_torch(q, k, v, indices, query_lens, prefix_lens, SCALE)
     # QK^T and PV over the selected tokens; compulsory traffic reads Q/K/V/indices
     # and writes O once.
     flops = 4 * heads * HEAD_DIM * int((indices >= 0).sum().item())
@@ -593,7 +586,7 @@ def test_qsa_sparse_attention(case, heads):
         out, us = run_perftest(fn, *args, **kwargs, num_rotate_args=10)
         err = checkAllclose(
             ref,
-            out.to(dtypes.fp32).nan_to_num(1e4),
+            out.to(dtypes.fp32),
             rtol=2e-2,
             atol=2e-2,
             msg=f"{case} H{heads} {name}: out",
