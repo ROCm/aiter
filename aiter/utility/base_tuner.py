@@ -302,10 +302,12 @@ class TunerCommon:
                         df_list[j][c] = _FILL_DEFAULTS.get(c, 0)
                 df_list[j] = df_list[j][all_cols]
         merge_df = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
-        dedup_keys = self.keys
+        # A key column none of the files has cannot tell rows apart; dedup on
+        # the ones present.
+        dedup_keys = [k for k in self.keys if k in merge_df.columns]
         if "_tag" in merge_df.columns:
             merge_df["_tag"] = merge_df["_tag"].fillna("")
-            dedup_keys = self.keys + ["_tag"]
+            dedup_keys = dedup_keys + ["_tag"]
         merge_df = (
             merge_df.sort_values("us")
             .drop_duplicates(subset=dedup_keys, keep="first")
@@ -461,8 +463,8 @@ class TunerCommon:
         # dedup/sort keys below do not KeyError; keep gfx as the leading column.
         if "gfx" in self.keys and "gfx" not in tunedf.columns:
             tunedf.insert(0, "gfx", self.get_gfx())
-        # Other key columns can be absent too (an MXFP8 BMM table without
-        # cu_num); sort and dedup on the ones present.
+        # Other key columns can be absent too; sort and dedup on the ones
+        # present.
         if issorted:
             tunedf = tunedf.sort_values(by=[v for v in values if v in tunedf])
         dedup_keys = [k for k in self.keys if k in tunedf]

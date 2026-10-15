@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -396,6 +397,19 @@ def test_mxscale_tuner_keys_on_device_cu_count(monkeypatch, tmp_path):
         )
     )
     assert sorted(benchmarked) == [1, 16]
+
+    # Merging tables that all lack cu_num leaves every row unbound.
+    first_path, second_path = tmp_path / "first.csv", tmp_path / "second.csv"
+    first_path.write_text(
+        "gfx,b,m,n,k,w_scale_block,libtype,kernelId,splitK,us\n"
+        "gfx950,2,1,1024,4096,128x128,opus,8311,1,10.0\n"
+    )
+    second_path.write_text(
+        "gfx,b,m,n,k,w_scale_block,libtype,kernelId,splitK,us\n"
+        "gfx950,2,16,1024,4096,128x128,opus,8311,1,9.0\n"
+    )
+    merged = tuner.get_tuned_gemm_list(f"{first_path}{os.pathsep}{second_path}")
+    assert sorted(merged[["cu_num", "m"]].values.tolist()) == [[0, 1], [0, 16]]
 
     # Writing results into a table without cu_num leaves its rows unbound and
     # adds the column after gfx. The first sort is what a run with nothing to
