@@ -1163,8 +1163,12 @@ def _grouped_a8w4_tdm_moe(
         )
         # The gemm1 kernel writes fp8 payload to `a2_payload` (passed as
         # `out` / arg_c) and preshuffled e8m0 scale to `a2_scale` (passed via
-        # quant_scale / arg_quant_scale).
-        flydsl_grouped_gemm_a8w4_masked(
+        # quant_scale / arg_quant_scale). Under S1F the compact context swaps
+        # in the fused dispatch + GEMM1 stage-1 kernel with the same signature.
+        _stage1_gemm1 = (
+            getattr(stage2_scatter, "stage1_gemm1", None) if _compact else None
+        )
+        (_stage1_gemm1 or flydsl_grouped_gemm_a8w4_masked)(
             a2_payload.view(torch.uint8),
             a1_payload,
             w1_u8,

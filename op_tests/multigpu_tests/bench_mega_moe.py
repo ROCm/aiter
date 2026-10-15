@@ -17,6 +17,14 @@ holds its own copy of them after its routed experts, so MegaMoE sees
 up past the shared slots of the ranks before them, and every token gets N
 extra columns, weight 1, on its own rank's copies.
 
+``--routing`` decides how often each routed expert is picked; the top-k stays
+distinct per token either way. ``uniform`` (the default) draws it uniformly.
+``zipf`` gives the routed experts Zipf(``--zipf_s``) popularities, dealt to
+experts by a seeded permutation per layer that every rank shares, so the same
+experts run hot everywhere and their ranks receive more rows. ``zipf_rank``
+deals a different permutation on each rank, so each rank sends its own hot
+experts. ``--zipf_s 0`` is ``uniform`` again, id for id.
+
 Two isolated paths (never touch each other's intermediates; they only share the
 config, the bf16 weights and the per-layer routings):
 
@@ -48,7 +56,7 @@ Launch (4x gfx1250; every env knob below is already the script's default):
 
 Env / CLI: --layers --logits_tol --acc_verify --dispatch_backend
            --stage1_fused --dispatch_wire --combine --combine_quant
-           -tpr -hd -id -e -k --fused_shared_experts -q
+           -tpr -hd -id -e -k --fused_shared_experts --routing --zipf_s -q
            --data-init --seed --warmup --iters --prof_replays
 
 ``--data-init`` / ``--scale-init`` / ``--seed`` are the shared ubench knobs from
@@ -364,13 +372,47 @@ def make_shared_weights(
     return w1, w2, sw1, sw2
 
 
-def make_routings(n_layers, ct, E, topk, dev, seed, expert_balance=False):
+ROUTING_MODES = ("uniform", "zipf", "zipf_rank")
+# Seeds the popularity permutations of --routing zipf/zipf_rank. Kept apart from
+# the per-rank token seeds so that zipf deals the SAME hot experts on every rank.
+_POPULARITY_SEED = 5150
+
+
+def _zipf_log_popularity(E, zipf_s, seed, dev):
+    """log p over the E routed experts: p is Zipf(zipf_s) over popularity ranks,
+    and a permutation seeded by ``seed`` deals those ranks to the experts, so the
+    hot experts land on random EP ranks instead of all on rank 0. A CPU
+    generator keeps the deal identical on every device."""
+    rank_of = torch.randperm(E, generator=torch.Generator().manual_seed(seed))
+    p = torch.arange(1, E + 1, dtype=torch.float64).pow(-float(zipf_s))[rank_of]
+    return (p / p.sum()).log().to(device=dev, dtype=torch.float32)
+
+
+def make_routings(
+    n_layers,
+    ct,
+    E,
+    topk,
+    dev,
+    seed,
+    expert_balance=False,
+    routing="uniform",
+    zipf_s=0.0,
+    popularity_seed=_POPULARITY_SEED,
+):
     """Build retained per-layer routing for device and reference replay.
 
     ``expert_balance`` mirrors ``AITER_MOE_EXPERT_BALANCE`` in
     ``test_moe_2stage.py``: route slots walk the experts round-robin. Otherwise,
     top-k is selected from random scores. Weights stay random and normalized in
     both modes.
+
+    ``routing`` other than ``uniform`` skews which experts the scores pick: layer
+    ``l`` adds the log popularities dealt by ``popularity_seed + l`` to Gumbel
+    noise made from the same uniform draw, and its top-k is then a draw of
+    ``topk`` distinct experts without replacement, each pick proportional to its
+    popularity (Gumbel-top-k). Gumbel noise is monotone in the uniform draw, so
+    ``zipf_s=0`` picks exactly the uniform ids.
     """
     routings = []
     balanced_ids = None
@@ -384,6 +426,12 @@ def make_routings(n_layers, ct, E, topk, dev, seed, expert_balance=False):
             ids = balanced_ids
         else:
             score = torch.rand(ct, E, generator=gen, device=dev, dtype=torch.float32)
+            if routing != "uniform":
+                log_p = _zipf_log_popularity(
+                    E, zipf_s, popularity_seed + layer_idx, dev
+                )
+                # u == 0 scores -inf: that expert just cannot be picked there.
+                score = log_p - torch.log(-torch.log(score))
             _, ids = score.topk(topk, dim=-1)  # distinct experts per token
         wts = torch.rand(ct, topk, generator=gen, device=dev, dtype=torch.float32)
         wts = wts / wts.sum(dim=-1, keepdim=True).clamp_min(1e-9)
@@ -426,6 +474,59 @@ def shared_dispatch_routings(routings, routed_per_rank, rank, n_shared):
         moved = ids + n_shared * torch.div(ids, routed_per_rank, rounding_mode="floor")
         out.append(_append_shared_columns(moved, wts, first_shared, n_shared))
     return out
+
+
+def routing_load_report(dist_ctx, routings, experts, n_shared):
+    """How the dispatch-space ``routings`` load the EP ranks (collective).
+
+    Every rank counts its routes per dispatch-space expert; rank 0 folds them
+    into one dict of the numbers that tell a skewed routing from a uniform one:
+    remote routes and distinct remote ranks per token (mean over layers), and
+    the hottest routed expert's rows over the routed mean and the busiest
+    rank's received rows over the mean (worst layer). Shared slots (the last
+    ``n_shared`` of each rank) are left out of the expert ratio: they take
+    exactly one row per local token by construction. Non-zero ranks get None."""
+    world, rank = dist_ctx.world, dist_ctx.rank
+    epr = experts // world
+    local = []
+    for ids, _wts in routings:
+        dest = ids.long() // epr
+        remote = dest != rank
+        # distinct remote ranks per token: one bit per destination rank
+        seen = torch.zeros(ids.shape[0], world, dtype=torch.bool, device=ids.device)
+        seen.scatter_(1, dest, True)
+        seen[:, rank] = False
+        local.append(
+            (
+                torch.bincount(ids.long().flatten(), minlength=experts).cpu(),
+                int(remote.sum()),
+                int(seen.sum()),
+                int(ids.shape[0]),
+            )
+        )
+    gathered = dist_ctx.gather_objects(local)
+    if rank != 0:
+        return None
+    routed_slot = torch.ones(experts, dtype=torch.bool)
+    for r in range(world):
+        routed_slot[(r + 1) * epr - n_shared : (r + 1) * epr] = False
+    stats = {"remote": [], "remote_ranks": [], "hot_expert": [], "busy_rank": []}
+    for layer in range(len(routings)):
+        load = sum(per_rank[layer][0] for per_rank in gathered).double()
+        tokens = sum(per_rank[layer][3] for per_rank in gathered)
+        rows_per_rank = load.view(world, epr).sum(dim=1)
+        routed = load[routed_slot]
+        stats["remote"].append(sum(p[layer][1] for p in gathered) / tokens)
+        stats["remote_ranks"].append(sum(p[layer][2] for p in gathered) / tokens)
+        stats["hot_expert"].append(float(routed.max() / routed.mean()))
+        stats["busy_rank"].append(float(rows_per_rank.max() / rows_per_rank.mean()))
+    return {
+        "remote_routes_per_token": sum(stats["remote"]) / len(stats["remote"]),
+        "remote_ranks_per_token": sum(stats["remote_ranks"])
+        / len(stats["remote_ranks"]),
+        "hot_expert_over_mean": max(stats["hot_expert"]),
+        "busy_rank_over_mean": max(stats["busy_rank"]),
+    }
 
 
 def _rmsnorm(x, eps=1e-6):
@@ -1271,6 +1372,12 @@ def main():
     assert (
         E % dist_ctx.world == 0
     ), f"E={E} must be divisible by world_size={dist_ctx.world}"
+    assert n_shared >= 0, f"--fused_shared_experts must be >= 0, got {n_shared}"
+    if args.routing != "uniform" and expert_balance:
+        raise ValueError(
+            f"--routing {args.routing} skews random scores, which "
+            "AITER_MOE_EXPERT_BALANCE=true replaces with a fixed round-robin"
+        )
 
     data_dist = resolve_data_init(args.data_init)
 
@@ -1289,6 +1396,8 @@ def main():
             f"combine_quant={args.combine_quant} "
             f"force_a8w4={os.environ['AITER_FORCE_A8W4']} "
             f"gate={spec['gate_mode'].name} fused_shared_experts={n_shared} "
+            f"routing={args.routing}"
+            f"{f' zipf_s={args.zipf_s}' if args.routing != 'uniform' else ''} "
             f"expert_balance={expert_balance} data_init={data_dist} "
             f"seed={args.seed} gfx={get_gfx()} "
             f"hip_graph={'classic' if classic_graph else 'default'} pass={run_pass}",
@@ -1360,12 +1469,29 @@ def main():
         dev,
         seed=4242 + 100 * dist_ctx.rank + args.seed,
         expert_balance=expert_balance,
+        routing=args.routing,
+        zipf_s=args.zipf_s,
+        # zipf deals the same popularities on every rank, zipf_rank its own.
+        popularity_seed=_POPULARITY_SEED
+        + args.seed
+        + (100_000 * (dist_ctx.rank + 1) if args.routing == "zipf_rank" else 0),
     )
     ref_routings = dispatch_routings = routings
     if n_shared:
         ref_routings = shared_logical_routings(routings, E, n_shared)
         dispatch_routings = shared_dispatch_routings(
             routings, E // dist_ctx.world, dist_ctx.rank, n_shared
+        )
+    # Collective, so every rank builds it; rank 0 prints it and files it on
+    # every summary row so a log says which load it measured.
+    routing_load = routing_load_report(
+        dist_ctx, dispatch_routings, E + n_shared * dist_ctx.world, n_shared
+    )
+    if dist_ctx.rank == 0:
+        print(
+            "# routing load: "
+            + " ".join(f"{k}={v:.3f}" for k, v in routing_load.items()),
+            flush=True,
         )
 
     # ---- device path (isolated): setup -> capture 61 layers in one graph -> bench,
@@ -1462,6 +1588,13 @@ def main():
             # alive; teardown below frees it.
             if args.acc_verify:
                 outputs[combine_mode] = pipe.final_output().float()
+                # MEGA_OUT_DUMP=<prefix>: this rank's logits, for a bitwise A/B
+                # between pipeline variants (e.g. AITER_MEGA_S1F=0/1).
+                if os.environ.get("MEGA_OUT_DUMP"):
+                    torch.save(
+                        outputs[combine_mode].cpu(),
+                        f"{os.environ['MEGA_OUT_DUMP']}_{combine_mode}_r{dist_ctx.rank}.pt",
+                    )
             summary_rows.append(
                 {
                     "quant_type": args.quant_type,
@@ -1475,6 +1608,9 @@ def main():
                     "experts": E,
                     "topk": topk,
                     "fused_shared_experts": n_shared,
+                    "routing": args.routing,
+                    "zipf_s": args.zipf_s if args.routing != "uniform" else None,
+                    **(routing_load or {}),
                     "hidden": hdim,
                     "intermediate": idim,
                     "layers": n_layers,
@@ -1590,6 +1726,30 @@ def _parse_args():
         help="shared experts fused into the MoE as a per-rank replica, the way "
         "ATOM's DP+EP path runs them (see the module docstring)",
     )
+    p.add_argument(
+        # Kept so the old spelling fails with a pointer rather than
+        # "unrecognized arguments": the dense shared FFN it drove is gone.
+        "--shared_experts",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--routing",
+        type=str,
+        choices=ROUTING_MODES,
+        default="uniform",
+        help="how often each routed expert is picked: uniform | zipf (Zipf "
+        "popularities shared by every rank) | zipf_rank (each rank its own); "
+        "see the module docstring",
+    )
+    p.add_argument(
+        "--zipf_s",
+        type=float,
+        default=0.5,
+        help="Zipf exponent of the routed-expert popularities under --routing "
+        "zipf/zipf_rank; 0 is uniform",
+    )
     p.add_argument("--layers", type=int, default=61, help="number of MoE layers")
     # The shared ubench data-init knobs: --data-init, --scale-init and --seed.
     # default_dist=norm reproduces the historical N(0,1)*0.1 weights, which is
@@ -1681,7 +1841,14 @@ def _parse_args():
         "(fp8 e4m3 payload) | mxfp4 (fp4 e2m1 payload), both with a per-1x32 "
         "e8m0 scale plane. Falls back to $COMBINE_QUANT.",
     )
-    return p.parse_args()
+    args = p.parse_args()
+    if args.shared_experts is not None:
+        p.error(
+            "--shared_experts (a dense shared FFN added after the MoE) is gone; "
+            "use --fused_shared_experts N, which runs the shared experts inside "
+            "the MoE as a per-rank replica"
+        )
+    return args
 
 
 if __name__ == "__main__":
