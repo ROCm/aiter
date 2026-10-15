@@ -2045,15 +2045,16 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
     // wave32: one token per wave, eight experts per lane in registers. A group
-    // must cover whole lanes, and the rows are read as 16 B-aligned vectors.
+    // must cover whole lanes, and the rows are read as naturally aligned
+    // eight-element vectors (16 B for 16-bit inputs, 32 B for fp32).
     constexpr int W32_EPL = 8;
-    const int elem_bytes  = gating_output.element_size();
+    const int vec_bytes   = W32_EPL * gating_output.element_size();
     if(get_warp_size_func() == 32 && num_experts == 32 * W32_EPL &&
        num_expert_group <= 8 && 32 % num_expert_group == 0 && topk >= 1 && topk <= 32 &&
        topk <= topk_grp * (num_experts / num_expert_group) &&
-       (stride_gating * elem_bytes) % 16 == 0 &&
-       reinterpret_cast<uintptr_t>(gating_output.data_ptr()) % 16 == 0 &&
-       reinterpret_cast<uintptr_t>(correction_bias.data_ptr()) % 16 == 0 &&
+       stride_gating % W32_EPL == 0 &&
+       reinterpret_cast<uintptr_t>(gating_output.data_ptr()) % vec_bytes == 0 &&
+       reinterpret_cast<uintptr_t>(correction_bias.data_ptr()) % vec_bytes == 0 &&
        correction_bias.dtype() == gating_output.dtype())
     {
         if(num_tokens == 0)

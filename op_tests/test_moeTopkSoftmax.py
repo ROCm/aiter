@@ -1084,7 +1084,23 @@ ret = test_biased_grouped_topk(
     num_iters=args.iters,
     num_warmup=args.warmup,
 )
-df = pd.DataFrame([ret])
+df = [ret]
+# fp32 rows 16 B- but not 32 B-aligned: wave32 must skip its eight-float vector loads.
+backing = torch.randn((odd_token, 260), dtype=dtypes.fp32)
+ret = test_biased_grouped_topk(
+    odd_token,
+    256,
+    8,
+    8,
+    4,
+    True,
+    dtypes.fp32,
+    gating_output=backing[:, :256],
+    num_iters=args.iters,
+    num_warmup=args.warmup,
+)
+df.append(ret)
+df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info(
     "moeTopkSoftmax_reg_biased_grouped_topk_odd_stride summary (markdown):\n%s",
