@@ -2,10 +2,17 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_tensor.h"
 #include "asm_mla_configs.hpp"
+
+#undef ADD_CFG
+namespace mla_dsl {
+#include "asm_mla_dsl_configs.hpp"
+} // namespace mla_dsl
 #include "aiter_ctypes_error.h"
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <memory>
 #include <unordered_map>
@@ -159,14 +166,21 @@ std::string get_heuristic_kernel_mla(std::string q_type,
                                      std::string arch_id,
                                      CFG* cfgs,
                                      int lse = 0,
-                                     int cprr = 0)
+                                     int cprr = 0,
+                                     int page_size = 0,
+                                     int kv_shuffled = 0)
 {
     for(const auto& el : *cfgs)
     {
         if (el.first.find(arch_id) != 0)
             continue;
         const auto& cfg = el.second;
-        
+
+        // Defaults preserve legacy ABI selection; shuffled page64 uses the
+        // dedicated 88-byte QH128 launcher.
+        if (cfg.page_size != page_size || cfg.kv_shuffled != kv_shuffled)
+            continue;
+
         if (cfg.qType != q_type || cfg.kvType != kv_type)
             continue;
         if (cfg.Gqa != gqa || cfg.ps != ps || cfg.prefill != prefill)
@@ -193,7 +207,9 @@ std::string get_heuristic_kernel_mla(std::string q_type,
                 " causal:", causal,
                 " qseqlen:", qseqlen,
                 " lse:", lse,
-                " cprr:", cprr);
+                " cprr:", cprr,
+                " page_size:", page_size,
+                " kv_shuffled:", kv_shuffled);
     return "";
 }
 
@@ -959,9 +975,17 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 } else {
                     config_max_seqlen_q = 4;
                 }
+            } else if (max_seqlen_q == 1 && arch_id == "gfx950"){
+                // qt64 kernel: one WG handles 1 token x 64 heads
+                config_max_seqlen_q = 1;
+                sub_Q = 64;
+                // fp32 split output [tokens, kv_split, 64, 512] is addressed with 32-bit offsets
+                AITER_CHECK(kv_split == 1 || (int64_t)Q->size(0) * kv_split <= 32768, __func__,
+                    ": fp8/fp8 gqa_ratio=64 with kv_split>1 requires total_q * kv_split <= 32768, got total_q=",
+                    Q->size(0), " kv_split=", kv_split);
             } else {
                 AITER_CHECK(false, __func__,
-                    ": fp8/fp8 with gqa_ratio=64 only supports persistent mode");
+                    ": fp8/fp8 with gqa_ratio=64 only supports decode_qlen=1 on gfx950 in non-persistent mode");
             }
         }
     } else if (gqa_ratio == 8){
@@ -1331,4 +1355,307 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                              1,                                              // bdy
                              1,                                              // bdz
                              stream});
+}
+
+// Kernel arguments of the persistent page-size-1 FP8 decode stage 1 exported
+// from FlyDSL (hsa/gfx1250/mla_dsl/mla_dsl.csv). The layout is the code object's
+// amdhsa.kernels .args list; the offsets below pin it.
+struct __attribute__((packed)) MlaPs1Fp8KernelArgs
+{
+    void* ptr_r;
+    void* ptr_lse;
+    void* ptr_final;
+    void* ptr_final_lse;
+    void* ptr_q;
+    void* ptr_kv;
+    void* kv_page_indices;
+    void* work_indptr;
+    void* work_info_set;
+    void* q_scale;
+    void* kv_scale;
+    float softmax_scale;
+    int num_pages;
+    int num_page_indices;
+    unsigned int _pad0;
+    void* qo_indptr;
+    void* kv_indptr;
+    void* g_kv_indptr;
+    int cp_world_size;
+    int cp_rank;
+};
+static_assert(offsetof(MlaPs1Fp8KernelArgs, softmax_scale) == 88, "mla_ps1 kernarg layout");
+static_assert(offsetof(MlaPs1Fp8KernelArgs, qo_indptr) == 104, "mla_ps1 kernarg layout");
+static_assert(offsetof(MlaPs1Fp8KernelArgs, cp_rank) == 132, "mla_ps1 kernarg layout");
+static_assert(sizeof(MlaPs1Fp8KernelArgs) == 136, "mla_ps1 kernarg layout");
+
+// Bridged: an exception crossing extern "C" would terminate the process.
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    mla_ps1_fp8_asm_fwd,
+    (aiter_tensor_t* split_data,      //   [num_partials, num_heads, 512] fp32
+    aiter_tensor_t* split_lse,        //   [num_partials, num_heads] fp32
+    aiter_tensor_t* final_output,     //   [total_q, num_heads, 512] bf16
+    aiter_tensor_t* final_lse,        //   [total_q, num_heads] fp32 (nullable)
+    aiter_tensor_t* q,                //   [total_q, num_heads, 576] fp8
+    aiter_tensor_t* kv_buffer,        //   [num_pages, 1, 1, 576] fp8
+    aiter_tensor_t* kv_page_indices,  //   [num_page_indices] int32
+    aiter_tensor_t* work_indptr,      //   [num_workers + 1] int32
+    aiter_tensor_t* work_info_set,    //   [num_works, 8] int32
+    float softmax_scale,
+    aiter_tensor_t* q_scale,          //   [1] fp32
+    aiter_tensor_t* kv_scale,         //   [1] fp32
+    int max_seqlen_q,
+    int causal,
+    aiter_tensor_t* qo_indptr,        //   [batch + 1] int32, round-robin CP only (nullable)
+    aiter_tensor_t* kv_indptr,        //   [batch + 1] int32, round-robin CP only (nullable)
+    aiter_tensor_t* g_kv_indptr,      //   [batch + 1] int32, round-robin CP only (nullable)
+    int cp_world_size,
+    int cp_rank,
+    hipStream_t stream),
+    (split_data, split_lse, final_output, final_lse, q, kv_buffer, kv_page_indices, work_indptr, work_info_set, softmax_scale, q_scale, kv_scale, max_seqlen_q, causal, qo_indptr, kv_indptr, g_kv_indptr, cp_world_size, cp_rank, stream))
+{
+    const std::string arch_id = get_gpu_arch();
+    AITER_CHECK(arch_id == "gfx1250", __func__, ": only supports gfx1250, got ", arch_id);
+    const HipDeviceGuard device_guard(q->device_id);
+
+    const int total_q   = q->size(0);
+    const int num_heads = q->size(1);
+    auto require_i32 = [](const aiter_tensor_t* t, const char* name) {
+        AITER_CHECK(t != nullptr && t->dtype() == AITER_DTYPE_i32 && t->is_contiguous(),
+                    "mla_ps1_fp8_asm_fwd: ", name, " must be a contiguous int32 tensor");
+    };
+    AITER_CHECK(q->dim() == 3 && q->size(2) == 576 && q->dtype() == AITER_DTYPE_fp8 &&
+                    q->is_contiguous(),
+                __func__, ": q must be a contiguous fp8 [total_q, num_heads, 576] tensor");
+    AITER_CHECK(kv_buffer->size(-1) == 576 && kv_buffer->numel() == kv_buffer->size(0) * 576 &&
+                    kv_buffer->dtype() == AITER_DTYPE_fp8 && kv_buffer->is_contiguous(),
+                __func__, ": kv_buffer must be a contiguous fp8 [num_pages, 1, 1, 576] tensor");
+    AITER_CHECK(split_data->dtype() == AITER_DTYPE_fp32 && split_data->size(-2) == num_heads &&
+                    split_data->size(-1) == 512 && split_data->is_contiguous(),
+                __func__, ": split_data must be a contiguous fp32 [*, num_heads, 512] tensor");
+    AITER_CHECK(split_lse->dtype() == AITER_DTYPE_fp32 && split_lse->is_contiguous(),
+                __func__, ": split_lse must be a contiguous fp32 tensor");
+    AITER_CHECK(final_output->dtype() == AITER_DTYPE_bf16 && final_output->size(0) == total_q &&
+                    final_output->is_contiguous(),
+                __func__, ": final_output must be a contiguous bf16 [total_q, num_heads, 512] tensor");
+    AITER_CHECK(final_lse == nullptr ||
+                    (final_lse->dtype() == AITER_DTYPE_fp32 && final_lse->is_contiguous()),
+                __func__, ": final_lse must be a contiguous fp32 tensor");
+    AITER_CHECK(q_scale != nullptr && kv_scale != nullptr &&
+                    q_scale->dtype() == AITER_DTYPE_fp32 && kv_scale->dtype() == AITER_DTYPE_fp32,
+                __func__, ": q_scale and kv_scale must be fp32 scalar tensors");
+    require_i32(kv_page_indices, "kv_page_indices");
+    require_i32(work_indptr, "work_indptr");
+    require_i32(work_info_set, "work_info_set");
+
+    const int lse_flag  = final_lse != nullptr ? 1 : 0;
+    const int causal_flag = causal ? 1 : 0;
+    // Round-robin CP only exists with causal masking, matching the FlyDSL wrapper.
+    const int cprr = (cp_world_size > 1 && causal_flag) ? 1 : 0;
+    if(cprr)
+    {
+        AITER_CHECK(0 <= cp_rank && cp_rank < cp_world_size,
+                    __func__, ": cp_rank must be in [0, cp_world_size)");
+        require_i32(qo_indptr, "qo_indptr");
+        require_i32(kv_indptr, "kv_indptr");
+        require_i32(g_kv_indptr, "g_kv_indptr");
+    }
+
+    const mla_dsl::mla_dslConfig* cfg = nullptr;
+    for(const auto& el : mla_dsl::cfg_mla_dsl)
+    {
+        const auto& c = el.second;
+        if(el.first.find(arch_id) == 0 && c.qType == "fp8" && c.kvType == "fp8" &&
+           c.Gqa == num_heads && (c.qSeqLen == 0 || c.qSeqLen == max_seqlen_q) &&
+           c.causal == causal_flag && c.lse == lse_flag && c.cprr == cprr)
+        {
+            cfg = &c;
+            break;
+        }
+    }
+    AITER_CHECK(cfg != nullptr, __func__, ": no mla_ps1 code object for num_heads=", num_heads,
+                " max_seqlen_q=", max_seqlen_q, " causal=", causal_flag, " lse=", lse_flag,
+                " cprr=", cprr);
+
+    // Compiler output, not shipped hand-written asm: the gfx1250 B0-only gate
+    // does not apply.
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
+    const char* name    = cfg->knl_name.c_str();
+    const char* co_name = cfg->co_name.c_str();
+    AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(name, [&]() {
+        return AiterAsmKernel(name, co_name, AiterAsmKernel::SkipGfx1250Gate{});
+    });
+
+    MlaPs1Fp8KernelArgs args{};
+    args.ptr_r            = split_data->data_ptr();
+    args.ptr_lse          = split_lse->data_ptr();
+    args.ptr_final        = final_output->data_ptr();
+    args.ptr_final_lse    = lse_flag ? final_lse->data_ptr() : nullptr;
+    args.ptr_q            = q->data_ptr();
+    args.ptr_kv           = kv_buffer->data_ptr();
+    args.kv_page_indices  = kv_page_indices->data_ptr();
+    args.work_indptr      = work_indptr->data_ptr();
+    args.work_info_set    = work_info_set->data_ptr();
+    args.q_scale          = q_scale->data_ptr();
+    args.kv_scale         = kv_scale->data_ptr();
+    args.softmax_scale    = softmax_scale;
+    args.num_pages        = static_cast<int>(kv_buffer->size(0));
+    args.num_page_indices = static_cast<int>(kv_page_indices->numel());
+    args.qo_indptr        = cprr ? qo_indptr->data_ptr() : nullptr;
+    args.kv_indptr        = cprr ? kv_indptr->data_ptr() : nullptr;
+    args.g_kv_indptr      = cprr ? g_kv_indptr->data_ptr() : nullptr;
+    args.cp_world_size    = cprr ? cp_world_size : 1;
+    args.cp_rank          = cprr ? cp_rank : 0;
+    size_t arg_size       = sizeof(args);
+
+    // Persistent: one workgroup per worker slot of the metadata planner.
+    const int num_workers = static_cast<int>(work_indptr->numel()) - 1;
+    AITER_CHECK(num_workers > 0, __func__, ": work_indptr must hold at least one worker");
+    impl_ptr->launch_kernel({&args,
+                             &arg_size,
+                             num_workers, // gdx
+                             1,           // gdy
+                             1,           // gdz
+                             256,         // bdx: 8 wave32
+                             1,           // bdy
+                             1,           // bdz
+                             stream,
+                             1,           // cluster_x
+                             1,           // cluster_y
+                             1,           // cluster_z
+                             static_cast<unsigned int>(cfg->dyn_lds)});
+}
+
+// QH128 decode over kv-shuffled page64 FP8 caches.
+namespace {
+struct MlaPs64Qh128Args
+{
+    const void* q;
+    const void* kv;
+    const void* seq_lens;
+    const void* page_table;
+    void* out;
+    void* lse;
+    const void* q_scale;
+    const void* kv_scale;
+    float softmax_scale;
+    uint32_t q_stride;
+    uint32_t physical_pages;
+    uint32_t page_table_stride;
+    uint32_t page_table_width;
+    uint32_t reserved;
+};
+static_assert(sizeof(MlaPs64Qh128Args) == 88);
+static_assert(offsetof(MlaPs64Qh128Args, q) == 0 && offsetof(MlaPs64Qh128Args, kv) == 8);
+static_assert(offsetof(MlaPs64Qh128Args, seq_lens) == 16 &&
+              offsetof(MlaPs64Qh128Args, page_table) == 24);
+static_assert(offsetof(MlaPs64Qh128Args, out) == 32 && offsetof(MlaPs64Qh128Args, lse) == 40);
+static_assert(offsetof(MlaPs64Qh128Args, q_scale) == 48 &&
+              offsetof(MlaPs64Qh128Args, kv_scale) == 56);
+static_assert(offsetof(MlaPs64Qh128Args, softmax_scale) == 64);
+static_assert(offsetof(MlaPs64Qh128Args, q_stride) == 68);
+static_assert(offsetof(MlaPs64Qh128Args, physical_pages) == 72);
+static_assert(offsetof(MlaPs64Qh128Args, page_table_stride) == 76);
+static_assert(offsetof(MlaPs64Qh128Args, page_table_width) == 80);
+static_assert(offsetof(MlaPs64Qh128Args, reserved) == 84);
+
+void check_mla_qh128_tensor(
+    const aiter_tensor_t* t, const char* name, AiterDtype dtype, int device, bool contiguous = true)
+{
+    AITER_CHECK(
+        t != nullptr && t->is_gpu() && t->device_id == device, name, " must be on the Q device");
+    AITER_CHECK(t->dtype() == dtype, name, " has an unsupported dtype");
+    AITER_CHECK(t->data_ptr() != nullptr || t->numel() == 0, name, " has a NULL pointer");
+    AITER_CHECK(!contiguous || t->is_contiguous(), name, " must be contiguous");
+}
+
+// Cache one kernel per device. Architecture probing,
+// heuristic selection and string construction happen only on cache misses.
+void launch_mla_qh128(MlaPs64Qh128Args& args, int device, int batch, hipStream_t stream)
+{
+    static SynchronizedCache<int, AiterAsmKernel> kernels;
+    auto& kernel = kernels.get_or_create(device, [&]() {
+        const std::string arch_id = get_gpu_arch();
+        AITER_CHECK(arch_id == "gfx1250", "QH128 page64 MLA requires gfx1250");
+        // The lse=0 row supports LSE through a nullable pointer.
+        // This field describes the CO ABI, not the caller's choice.
+        const auto name = get_heuristic_kernel_mla(
+            "fp8", "fp8", 128, 0, 0, 0, 1, arch_id, &cfg_mla_asm, 0, 0, 64, 1);
+        const auto& config = cfg_mla_asm.at(name);
+        return AiterAsmKernel(config.knl_name.c_str(), config.co_name.c_str());
+    });
+    size_t size = sizeof(args);
+    kernel.launch_kernel({&args, &size, batch, 1, 1, 128, 1, 1, stream});
+}
+} // namespace
+
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    mla_ps64_qh128_fp8_asm_fwd,
+    (aiter_tensor_t* q,
+     aiter_tensor_t* kv,
+     aiter_tensor_t* seq_lens,
+     aiter_tensor_t* page_table,
+     aiter_tensor_t* out,
+     aiter_tensor_t* lse,
+     aiter_tensor_t* q_scale,
+     aiter_tensor_t* kv_scale,
+     float softmax_scale,
+     hipStream_t stream),
+    (q, kv, seq_lens, page_table, out, lse, q_scale, kv_scale, softmax_scale, stream))
+{
+    AITER_CHECK(q != nullptr && q->is_gpu(), "Q must be a GPU tensor");
+    const HipDeviceGuard guard(q->device_id);
+    check_mla_qh128_tensor(q, "Q", AITER_DTYPE_fp8, q->device_id, false);
+    check_mla_qh128_tensor(kv, "KV", AITER_DTYPE_fp8, q->device_id);
+    check_mla_qh128_tensor(out, "out", AITER_DTYPE_bf16, q->device_id);
+    check_mla_qh128_tensor(q_scale, "q_scale", AITER_DTYPE_fp32, q->device_id);
+    check_mla_qh128_tensor(kv_scale, "kv_scale", AITER_DTYPE_fp32, q->device_id);
+    AITER_CHECK(q->dim() == 3 && q->size(1) == 128 && q->size(2) == 576, "Q must be [B,128,576]");
+    const int64_t batch = q->size(0);
+    // LSE uses a 32-bit byte offset. Q and O use full 64-bit addresses:
+    // Q multiplies with mul_hi_u32, O retains head_base >> 22 when shifting.
+    AITER_CHECK(batch < (int64_t{1} << 32) / (128 * 4), "batch exceeds kernel address range");
+    AITER_CHECK(q->stride(2) == 1 && (q->stride(1) == 576 || q->stride(1) == 768) &&
+                    q->stride(0) == 128 * q->stride(1),
+                "Q requires dense batches with head stride 576 or 768");
+    AITER_CHECK(kv->dim() == 4 && kv->size(1) == 1 && kv->size(2) == 64 &&
+                    kv->size(3) == 576 && kv->size(0) <= INT32_MAX,
+                "KV must be contiguous [physical_pages,1,64,576] with int32 page IDs");
+    // KV is not limited to 4 GiB: the kernel forms page * 36864 with both
+    // low and high product words.
+    AITER_CHECK(out->dim() == 3 && out->size(0) == batch && out->size(1) == 128 &&
+                    out->size(2) == 512,
+                "out must be [B,128,512]");
+    if(lse != nullptr)
+    {
+        check_mla_qh128_tensor(lse, "lse", AITER_DTYPE_fp32, q->device_id);
+        AITER_CHECK(lse->dim() == 2 && lse->size(0) == batch && lse->size(1) == 128,
+                    "lse must be [B,128]");
+    }
+    AITER_CHECK(q_scale->numel() == 1 && kv_scale->numel() == 1,
+                "q_scale and kv_scale must each contain one FP32 scalar");
+    AITER_CHECK(std::isfinite(softmax_scale), "softmax_scale must be finite");
+
+    AITER_CHECK(kv->size(0) > 0, "KV must contain at least one physical page");
+    check_mla_qh128_tensor(seq_lens, "seq_lens", AITER_DTYPE_i32, q->device_id);
+    check_mla_qh128_tensor(page_table, "page_table", AITER_DTYPE_i32, q->device_id, false);
+    AITER_CHECK(seq_lens->dim() == 1 && seq_lens->size(0) == batch, "seq_lens must be [B]");
+    // The row product is uint32 *elements*. Conversion to a byte address
+    // uses (row << 2, row >> 30) and a 64-bit add into the descriptor base.
+    AITER_CHECK(page_table->dim() == 2 && page_table->size(0) == batch &&
+                    page_table->stride(1) == 1 && page_table->stride(0) > 0 &&
+                    page_table->size(1) < (int64_t{1} << 25) &&
+                    page_table->stride(0) <= UINT32_MAX &&
+                    batch <= UINT32_MAX / page_table->stride(0),
+                "page_table requires [B,max_pages], unit inner stride, and uint32 element offsets");
+    if(batch == 0)
+        return;
+    MlaPs64Qh128Args args{q->data_ptr(), kv->data_ptr(), seq_lens->data_ptr(),
+                         page_table->data_ptr(), out->data_ptr(),
+                         lse == nullptr ? nullptr : lse->data_ptr(),
+                         q_scale->data_ptr(), kv_scale->data_ptr(), softmax_scale,
+                         static_cast<uint32_t>(q->stride(1)),
+                         static_cast<uint32_t>(kv->size(0)),
+                         static_cast<uint32_t>(page_table->stride(0)),
+                         static_cast<uint32_t>(page_table->size(1)), 0};
+    launch_mla_qh128(args, q->device_id, static_cast<int>(batch), stream);
 }
