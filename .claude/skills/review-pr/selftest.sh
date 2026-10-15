@@ -98,6 +98,48 @@ t "a budget refusal does not blame the agent timeout" \
 t "a real timeout still names the agent timeout" \
   "$(printf '%s' "$clock_msg" | grep -c AITER_AGENT_TIMEOUT)" "1"
 
+echo "[gates call site]"
+# Same bug as the refuter had: `python3 _gates.py ...` bare under `set -euo pipefail` exits the
+# script on a red gate, so the EXIT trap reports "exited unexpectedly with no classified
+# failure" -- while the log says plainly which gate went red. A reader gets the useless half.
+gates_site() {  # <rc from _gates.py> -> what the call site reported
+  local W; W=$(mktemp -d)
+  # the fixture must not be the file the code tees to: tee truncates it on open, and the
+  # stub's cat then races against that -- a test that passes or fails by timing is worse than none
+  printf '======== SEVEN GATES ========\n  \342\234\205 answers\n  \342\235\214 card         exit=1\n' > "$W/fixture.out"
+  { echo 'set -euo pipefail'
+    echo 'say() { :; }'
+    echo 'fail() { echo "$1 | $3"; exit 0; }'
+    printf 'W=%s\nSKILL=%s\nPROJ=/tmp\n' "$W" "$S"
+    printf 'python3() { cat "%s/fixture.out"; return %s; }\n' "$W" "$1"
+    sed -n '/^# 4) gates + collect/,/^python3 "\$SKILL\/_collect.py"/p' "$S/run_one.sh"
+    echo 'echo "REACHED-END"'
+  } | bash
+  rm -rf "$W"
+}
+t "a red gate is reported as a classified failure" \
+  "$(gates_site 1 | grep ' | ' | cut -d'|' -f1 | tr -d ' ')" "flow"
+t "the report names which gate went red" \
+  "$(gates_site 1 | grep ' | ' | grep -c card)" "1"
+t "green gates fall through to collect" "$(gates_site 0 | tail -1)" "REACHED-END"
+
+# A gate that prints more than one line carrying `exit=` must not be named twice: a reader
+# shown "card,card,ledger" learns less than one shown "card,ledger".
+gates_multi() {
+  local W; W=$(mktemp -d)
+  printf '   \342\235\214 card    exit=1\n   \342\235\214 card    exit=1\n   \342\235\214 ledger  exit=1\n' > "$W/fixture.out"
+  { echo 'set -euo pipefail'
+    echo 'say() { :; }'
+    echo 'fail() { echo "$3"; exit 0; }'
+    printf 'W=%s\nSKILL=%s\nPROJ=/tmp\n' "$W" "$S"
+    printf 'python3() { cat "%s/fixture.out"; return 1; }\n' "$W"
+    sed -n '/^# 4) gates + collect/,/^python3 "\$SKILL\/_collect.py"/p' "$S/run_one.sh"
+  } | bash | grep ' gate'
+  rm -rf "$W"
+}
+t "a gate red on several lines is named once" \
+  "$(gates_multi | grep -oE 'by the [a-z,]+ gate' | head -1)" "by the card,ledger gate"
+
 echo "[refuter call site]"
 # The harnesses above run run_agent in isolation under `set -uo pipefail`. The shipping script
 # runs under `set -euo pipefail`, where a bare `cmd; rc=$?` exits before rc is ever read -- so
@@ -158,6 +200,49 @@ if [ "$wd_rc" -ne 0 ] && [ "$wbad" -eq 0 ]; then
   why=$(printf '%s
 ' "$wd" | grep -m1 -E 'Error|Traceback|No such file' | sed 's/^ *//' | cut -c1-110)
   echo "  ❌ watchdog_test.py did not run — ${why:-exit $wd_rc}"; bad=$((bad + 1))
+fi
+
+echo "[queue gate]"
+# Same reason as the watchdog: the gate only runs from the default branch, so GitHub will not
+# execute this until it merges. Drive the shipping script against a fake API and a fixed clock.
+qg=$(python3 "$S/queue_gate_test.py" 2>&1); qg_rc=$?
+printf '%s\n' "$qg" | grep -E '^  (✅|❌)' || true
+qok=$(printf '%s\n' "$qg" | grep -c '✅' || true)
+qbad=$(printf '%s\n' "$qg" | grep -c '❌' || true)
+ok=$((ok + qok)); bad=$((bad + qbad))
+if [ "$qg_rc" -ne 0 ] && [ "$qbad" -eq 0 ]; then
+  why=$(printf '%s\n' "$qg" | grep -m1 -E 'Error|Traceback|No such file' | sed 's/^ *//' | cut -c1-110)
+  echo "  ❌ queue_gate_test.py did not run — ${why:-exit $qg_rc}"; bad=$((bad + 1))
+fi
+
+echo "[notify handoff]"
+# The report job stays quiet when _notify.py says it already spoke, so that flag must mean a
+# comment actually landed. _notify.py returns 0 without posting in three cases -- no status
+# file, no token, a POST that threw -- and claiming "notified" in any of them would trade a
+# visible failure for a silent one. Two of the three are testable without a network.
+notified_flag() {  # <status file contents or empty> -> what _notify.py wrote to GITHUB_OUTPUT
+  local w o; w=$(mktemp -d); o=$(mktemp)
+  [ -n "$1" ] && printf '%s\n' "$1" > "$w/.aiter-review-status"
+  ( cd "$w" && GITHUB_WORKSPACE="$w" GITHUB_OUTPUT="$o" AITER_BOT_TOKEN= GITHUB_REPOSITORY= \
+      python3 "$S/_notify.py" 42 >/dev/null 2>&1 )
+  local n; n=$(grep -c notified "$o" 2>/dev/null || true)   # grep -c exits 1 on zero matches
+  echo "${n:-0}"
+  rm -rf "$w" "$o"
+}
+t "no status to report claims nothing" "$(notified_flag '')" "0"
+t "a report it could not send claims nothing" "$(notified_flag 'flow\tsomething broke')" "0"
+
+echo "[lost review]"
+# The other end of the watchdog: a review that started and then vanished. Same reason it cannot
+# be exercised here -- the job only runs from the default branch.
+lr=$(python3 "$S/lost_review_test.py" 2>&1); lr_rc=$?
+printf '%s\n' "$lr" | grep -E '^  (✅|❌)' || true
+lok=$(printf '%s\n' "$lr" | grep -c '✅' || true)
+lbad=$(printf '%s\n' "$lr" | grep -c '❌' || true)
+ok=$((ok + lok)); bad=$((bad + lbad))
+if [ "$lr_rc" -ne 0 ] && [ "$lbad" -eq 0 ]; then
+  why=$(printf '%s\n' "$lr" | grep -m1 -E 'Error|Traceback|No such file' | sed 's/^ *//' | cut -c1-110)
+  echo "  ❌ lost_review_test.py did not run — ${why:-exit $lr_rc}"; bad=$((bad + 1))
 fi
 
 echo "=== $ok green / $bad red ==="
