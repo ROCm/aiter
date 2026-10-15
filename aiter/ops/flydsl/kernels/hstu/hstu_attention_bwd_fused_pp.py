@@ -1382,6 +1382,21 @@ def build_hstu_attention_bwd_fused_pp(
                     if const_expr(ks >= 1):
                         _dq_stage_chunk(ks - 1)
 
+                # Source order alone does NOT produce the interleave: the
+                # scheduler is free to sink all three stores together, and the
+                # trace showed it doing exactly that -- nine MFMAs, then three
+                # `ds_write_b128` back to back, then the last MFMA.
+                #
+                # `sched_group_barrier` states the pattern the scheduler must
+                # form instead: KV_OWNED_SUBTILES MFMAs, one DS write, repeat.
+                # Unlike `sched_barrier(0)` this constrains only the shape of
+                # the groups, so the scheduler keeps its freedom WITHIN each
+                # one and across the rest of the phase.
+                for ks in range_constexpr(K_STEPS):
+                    rocdl.sched_mfma(KV_OWNED_SUBTILES)
+                    if const_expr(ks >= 1):
+                        rocdl.sched_dswr(1)
+
             rocdl.sched_barrier(0)
 
             # The dQ staging writes are emitted INSIDE the transpose build,
