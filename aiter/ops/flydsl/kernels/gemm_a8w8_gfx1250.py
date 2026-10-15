@@ -264,15 +264,6 @@ def launch_gemm_a8w8(
         W_A, W_B = 0, 1
         WARP1 = fx.make_layout(1, 1)
 
-        # A: tiled-TDM atom over the FULL A tensor. The coordinate tensor picks this block's
-        # M-tile (bid_x) and keeps the K-tiles as its rest (replaces imm_offset); the LDS box
-        # carries an independent PIPE rest (num_buffers). Row slack in sA_box
-        # (A_LDS_ROW = A_TDM_ROW + LDS_PAD_A) encodes the old pad_interval/pad_amount, and
-        # M-OOB comes from the tensor extent + boundary_check. Batch stays in the base offset.
-        #
-        # A-preshuffle pairs two M rows into one TDM row (A_PAIR == 2), so the tiled view is
-        # over (ceil(M / A_PAIR), K * A_PAIR) with a matching row stride -- the same reshape the
-        # old atom spelled as extents=[a_oob, None] + strides=[lda64 * A_PAIR, None].
         a_base_off = bz64 * k64 if const_expr(batched) else fx.Int64(0)
         a_rows = i32_m if const_expr(A_PAIR == 1) else (i32_m + (A_PAIR - 1)) // A_PAIR
         gA_full = _gv(
@@ -294,8 +285,6 @@ def launch_gemm_a8w8(
         )
         tAsA, tAgA = fx.rocdl.cdna5.tdm_partition(atomA, 0, WARP1, sA_lds, blkA)
 
-        # B: full (N//16, K*16) preshuffled tensor; block picks the N-tile (bid_y), K advances
-        # through the coordinate rest.
         b_base_off = (
             bz64 * fx.Int64(i32_n) * k64 if const_expr(batched) else fx.Int64(0)
         )
