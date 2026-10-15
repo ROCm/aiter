@@ -135,6 +135,7 @@ def fused_allreduce_rmsnorm_quant_per_group(
     use_1stage: bool,
     bf16_out_ptr: int = 0,
     transpose_scale: bool = False,
+    gemma_norm: bool = False,
 ) -> None: ...
 
 

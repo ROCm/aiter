@@ -6,31 +6,20 @@
 #undef __HIP_NO_HALF_OPERATORS__
 #undef __HIP_NO_HALF_CONVERSIONS__
 
-#include <iostream>
-#include <numeric>
-#include <initializer_list>
 #include <cstdlib>
+#include <iterator>
 
-#include <ATen/ATen.h>
-#include <torch/extension.h>
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
+#include "aiter_hip_common.h"
+#include "aiter_tensor.h"
 
 #include "ck/ck.hpp"
 #include "ck/tensor_operation/gpu/device/tensor_layout.hpp"
 #include "ck/tensor_operation/gpu/element/unary_element_wise_operation.hpp"
 #include "ck/tensor_operation/gpu/device/gemm_specialization.hpp"
 #include "ck/tensor_operation/gpu/device/impl/device_gemm_xdl_cshuffle_v3_mx.hpp"
-#include "ck/library/utility/host_tensor_generator.hpp"
 #include "ck/utility/blkgemmpipe_scheduler.hpp"
 #include "ck/utility/data_type.hpp"
 #include "ck/utility/sequence.hpp"
-#include "ck/library/reference_tensor_operation/cpu/reference_mx_gemm.hpp"
-#include "ck/library/utility/check_err.hpp"
-#include "ck/library/utility/device_memory.hpp"
-#include "ck/library/utility/fill.hpp"
-#include "ck/library/utility/host_tensor.hpp"
 
 template <ck::index_t... Is>
 using S = ck::Sequence<Is...>;
@@ -111,15 +100,43 @@ using DeviceGemmHelperF4BlockScale = ck::tensor_operation::device::DeviceGemmMX_
           ADataType, BDataType>;
 // clang-format on
 
-template <typename CDataType, typename DeviceGemmInstance>
-__forceinline__ torch::Tensor gemm_a4w4_blockscale_impl(
-    torch::Tensor &A,
-    torch::Tensor &B,
-    torch::Tensor &a_scale,
-    torch::Tensor &b_scale,
-    torch::Tensor &C,
-    int splitK)
+// The kernels below guard on A.device_id, and HipDeviceGuard issues a fatal
+// hipSetDevice() for the -1 that aiter_tensor_t carries for a host tensor. Run
+// this from the entry points, before any guard is constructed, so a CPU or
+// cross-device operand surfaces as a catchable check failure.
+inline void check_a4w4_operands(const aiter_tensor_t& XQ,
+                                const aiter_tensor_t& WQ,
+                                const aiter_tensor_t& x_scale,
+                                const aiter_tensor_t& w_scale,
+                                const aiter_tensor_t& Y)
 {
+    const aiter_tensor_t* operands[] = {&XQ, &WQ, &x_scale, &w_scale, &Y};
+    const char* names[]              = {"XQ", "WQ", "x_scale", "w_scale", "Y"};
+    for(size_t i = 0; i < std::size(operands); ++i)
+    {
+        AITER_CHECK(operands[i]->is_gpu(), names[i], " must be a GPU tensor!");
+        AITER_CHECK(operands[i]->device_id == XQ.device_id,
+                    names[i],
+                    " is on device ",
+                    operands[i]->device_id,
+                    " but XQ is on device ",
+                    XQ.device_id,
+                    "; all operands must be on one device!");
+    }
+}
+
+template <typename CDataType, typename DeviceGemmInstance>
+__forceinline__ aiter_tensor_t& gemm_a4w4_blockscale_impl(
+    aiter_tensor_t& A,
+    aiter_tensor_t& B,
+    aiter_tensor_t& a_scale,
+    aiter_tensor_t& b_scale,
+    aiter_tensor_t& C,
+    int splitK,
+    hipStream_t stream)
+{
+    HipDeviceGuard guard(A.device_id);
+
     int M = A.size(0);
     int N = B.size(0);
     int K = A.size(1) * 2; // always fp4_x2
@@ -136,7 +153,6 @@ __forceinline__ torch::Tensor gemm_a4w4_blockscale_impl(
     auto a_element_op = AElementOp{};
     auto b_element_op = BElementOp{};
     auto c_element_op = CElementOp{};
-
 
     // do GEMM
     auto device_gemm = DeviceGemmInstance{};
@@ -159,9 +175,9 @@ __forceinline__ torch::Tensor gemm_a4w4_blockscale_impl(
                                              b_element_op,
                                              c_element_op);
 
-    TORCH_CHECK(device_gemm.IsSupportedArgument(argument), "This GEMM is not supported!");
+    AITER_CHECK(device_gemm.IsSupportedArgument(argument), "This GEMM is not supported!");
 
-    invoker.Run(argument, StreamConfig{at::hip::getCurrentHIPStream()});
+    invoker.Run(argument, StreamConfig{stream});
     return C;
 }
 

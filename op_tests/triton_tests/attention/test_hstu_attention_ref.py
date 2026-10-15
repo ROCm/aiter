@@ -34,7 +34,7 @@ def test_existing_qkv_zero_padding():
     k = q + 1
     v = torch.arange(18, dtype=torch.float32).reshape(3, 2, 3)
     for actual, original in zip(qkv_to_padded_dense(q, k, v, offsets, 3), (q, k, v)):
-        expected = torch.zeros(3, 3, *original.shape[1:])
+        expected = original.new_zeros(3, 3, *original.shape[1:])
         expected[0, :2] = original[:2]
         expected[2, :1] = original[2:]
         torch.testing.assert_close(actual, expected.transpose(1, 2), rtol=0, atol=0)
