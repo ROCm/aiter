@@ -512,12 +512,30 @@ def build_hstu_attention_bwd_fused_pp(
         q_t_rd = [lds.q_t0.view(t_rd_layout), lds.q_t1.view(t_rd_layout)]
         do_t_rd = [lds.do_t0.view(t_rd_layout), lds.do_t1.view(t_rd_layout)]
 
+        # 4-D, not 3-D: a lane's DQ_PER_LANE-wide run must be one `None` slice
+        # so the flush reads it as a single `ds_read_b128`. Indexed per element
+        # it comes out as DQ_PER_LANE/2 `ds_read2_b32` instead -- twice the LDS
+        # instructions for the same bytes, which the trace put at 9.6 M cycles
+        # (10.3% of all stall) once the scalar adds stopped it fusing wider.
         dqw = lds.dqw.view(
+            fx.make_layout(
+                (NUM_WAVES, BLOCK_N, head_dim // DQ_PER_LANE, DQ_PER_LANE),
+                (BLOCK_N * DQ_PAD, DQ_PAD, DQ_PER_LANE, 1),
+            )
+        )
+        dqw_wr = lds.dqw.view(
             fx.make_layout(
                 (NUM_WAVES, BLOCK_N, DQ_PAD), (BLOCK_N * DQ_PAD, DQ_PAD, 1)
             )
         )
-        dqg = lds.dqg.view(fx.make_layout((BLOCK_N + 2, DQ_PAD), (DQ_PAD, 1)))
+        dqg = lds.dqg.view(
+            fx.make_layout(
+                (BLOCK_N + 2, head_dim // DQ_PER_LANE, DQ_PER_LANE),
+                (DQ_PAD, DQ_PER_LANE, 1),
+            )
+        )
+        # Flat, for the prologue clear only.
+        dqg_flat = lds.dqg.view(fx.make_layout((DQG_ELEMS,), (1,)))
 
         def q_swz_col(tile_row, col):
             return swz_col(tile_row, col, K_SWZ_ROWS, K_SWZ_SHIFT)
@@ -1048,7 +1066,8 @@ def build_hstu_attention_bwd_fused_pp(
         # 256 lanes per group, 4 contiguous outputs each.
         dq_gtid = (wave_id % fx.Int32(NUM_WAVES // 2)) * fx.Int32(WARP_SIZE) + _lane
         dq_frow = dq_gtid // fx.Int32(DQ_LANES_PER_ROW)
-        dq_fcol = (dq_gtid % fx.Int32(DQ_LANES_PER_ROW)) * fx.Int32(DQ_PER_LANE)
+        dq_fvec = dq_gtid % fx.Int32(DQ_LANES_PER_ROW)
+        dq_fcol = dq_fvec * fx.Int32(DQ_PER_LANE)
         dq_wbase = is_g0.select(fx.Int32(0), fx.Int32(NUM_WAVES // 2))
         # g1 writes its group sum to the row g0 will read; g0 writes to the
         # sink row and reads the real one. g1 reads the permanently-zero row,
@@ -1077,24 +1096,27 @@ def build_hstu_attention_bwd_fused_pp(
             dwords of this workgroup's single head there, so the wasted HBM
             traffic is 256 B per tile; only the issue slot is paid.
             """
+            # One `ds_read_b128` per source wave, then SCALAR adds: the wide
+            # load and the unpacked arithmetic are independent wins and the
+            # naive form gives up one to get the other.
             acc = [fx.Float32(0.0) for _ in range_constexpr(DQ_PER_LANE)]
             for w in range_constexpr(NUM_WAVES // 2):
+                _v = Vec(
+                    dqw[dq_wbase + fx.Int32(w), dq_frow, dq_fvec, None].load()
+                )
                 for j in range_constexpr(DQ_PER_LANE):
-                    acc[j] = fadd_scalar(
-                        acc[j],
-                        dqw[dq_wbase + fx.Int32(w), dq_frow, dq_fcol + fx.Int32(j)],
-                    )  # fmt: skip
-            for j in range_constexpr(DQ_PER_LANE):
-                dqg[dq_wrow, dq_fcol + fx.Int32(j)] = acc[j]
+                    acc[j] = fadd_scalar(acc[j], _v[j])
+            dqg[dq_wrow, dq_fvec, None].store(
+                Vec.from_elements(acc, fx.Float32)
+            )
             # No fence between the write and the read: NEITHER group reads what
             # it just wrote. g1 writes `dq_frow` and reads the permanently-zero
             # row; g0 writes the sink row and reads the row g1 published a full
             # barrier ago. A defensive lgkmcnt(0) here is a whole LDS round
             # trip on the critical path of every gate phase.
+            _g = Vec(dqg[dq_rrow, dq_fvec, None].load())
             for j in range_constexpr(DQ_PER_LANE):
-                acc[j] = fadd_scalar(
-                    acc[j], dqg[dq_rrow, dq_fcol + fx.Int32(j)]
-                )  # fmt: skip
+                acc[j] = fadd_scalar(acc[j], _g[j])
 
             # The partial belongs to tile q_tile_v - 1: phase M consumes
             # `ds_prev`, produced by the PREVIOUS trip's gate phase.
@@ -1262,7 +1284,7 @@ def build_hstu_attention_bwd_fused_pp(
                     _q = lane_div_16 * fx.Int32(MFMA_LANE_K) + fx.Int32(e)
                     for ks in range_constexpr(K_STEPS):
                         _d = fx.Int32(ks * MFMA_M) + lane_mod_16
-                        dqw[wave_id, _q, _d] = Vec(dq_acc[ks])[e]
+                        dqw_wr[wave_id, _q, _d] = Vec(dq_acc[ks])[e]
             rocdl.sched_barrier(0)
 
             rocdl.s_setprio(0)
@@ -1419,7 +1441,7 @@ def build_hstu_attention_bwd_fused_pp(
             ):
                 _zi = tid + fx.Int32(_z * BLOCK_THREADS)
                 _zi = (_zi < fx.Int32(DQG_ELEMS)).select(_zi, fx.Int32(0))
-                dqg[fx.Int32(0), _zi] = fx.Float32(0.0)
+                dqg_flat[_zi] = fx.Float32(0.0)
             rocdl.s_waitcnt(lgkmcnt=0)
 
             kt_packs = []
