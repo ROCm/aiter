@@ -263,5 +263,11 @@ def flydsl_grouped_gemm_a8w4_masked(
         lds_soa_load_interleave=int(lds_soa_load_interleave),
         persistent_workers=persistent_workers,
         rolled_drain=rolled_drain,
+        ep_scale_planar_offset=(
+            int(stage2_scatter.combine_scale_offset) if enable_ep_scatter else 0
+        ),
+        ep_scale_planar_slots=(
+            int(stage2_scatter.combine_scale_slots) if enable_ep_scatter else 0
+        ),
     )
     return out

@@ -1181,6 +1181,18 @@ class MegaMoEGfx1250:
                 * config.combine_slot_stride_bytes,
             )
         )
+        # On a quantized wire the per-rank scatter keeps the slots' e8m0 scales
+        # in a separate [hidden/256][slot] region instead of each slot's tail,
+        # so a peer's run of slots takes them as one contiguous store per block.
+        if self._per_rank_scatter and config.combine_quant_bits:
+            arena_regions.append(
+                (
+                    "comb_scale",
+                    config.max_tokens_per_rank
+                    * config.topk
+                    * (config.hidden_dim // _COMBINE_SCALE_BLOCK),
+                )
+            )
         self._arena = SymmetricArena(communicator, arena_regions)
         self._compact_scale_row = (
             config.dispatch_scale_nbytes
@@ -1367,6 +1379,11 @@ class MegaMoEGfx1250:
                 dense_slots=(
                     config.max_tokens_per_rank * config.topk
                     if self._per_rank_scatter
+                    else 0
+                ),
+                scale_planar_rel=(
+                    self._arena.offset("comb_scale") - self._arena.offset("comb_inp")
+                    if self._per_rank_scatter and _bits
                     else 0
                 ),
             )
@@ -1815,6 +1832,12 @@ class MegaMoEGfx1250:
             compact_rows=(self._compact_step_rows if self._compact_plan else 0),
             combine_quant_bits=combine_quant_bits,
             per_rank_scatter=self._per_rank_scatter,
+            combine_scale_offset=(
+                self._arena.offset("comb_scale")
+                if self._per_rank_scatter and combine_quant_bits
+                else 0
+            ),
+            combine_scale_slots=self._config.max_tokens_per_rank * self._config.topk,
         )
 
     def _combine(self, routing: Routing, combine_quant_bits: int = 0) -> torch.Tensor:

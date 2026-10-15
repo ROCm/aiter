@@ -164,6 +164,7 @@ def _make_combine_fused_reduce(
     tokens_per_block=2,
     chunks_per_iter=4,
     dense_slots=0,
+    scale_planar_rel=0,
 ):
     """Stage B of the GEMM2-fused scatter combine: the per-token topk sum.
 
@@ -196,6 +197,12 @@ def _make_combine_fused_reduce(
     segment-major layout of that many slots, where route ``tok*topk + k`` lives
     at ``comb_slot[tok*topk + k]`` (-1 for a dropped route). The tile is then
     gathered into the same ``t*topk + k`` LDS rows, so the sum is unchanged.
+
+    On a quantized wire the dense layout keeps its e8m0 scales planar:
+    ``scale_planar_rel`` is the byte offset from comb_inp to a
+    [hidden/256][slot] x 8 B region in place of the slots' scale plane. Each
+    256-column chunk is its own 8-byte gather, and the LDS scale region is laid
+    out [chunk][row] x 8 B to match.
     """
     topk = experts_per_token
     lanes = warp_num_per_block * WAVE
@@ -279,8 +286,20 @@ def _make_combine_fused_reduce(
     GATHERS_LO = len(GATHERS) // warp_num_per_block
     GATHERS_HI_WARPS = len(GATHERS) - GATHERS_LO * warp_num_per_block
     GATHERS_HI = GATHERS_LO + (1 if GATHERS_HI_WARPS else 0)
+    scale_planar = bool(dense_slots and quant_bits)
+    if scale_planar != bool(scale_planar_rel):
+        raise ValueError(
+            "scale_planar_rel is required by, and only valid for, the dense "
+            "layout on a quantized wire"
+        )
+    SC_CHUNK_B = CHUNK_ELEMS // SCALE_BLOCK
+    # TDM loads one gather group issues: the payload, then one per scale chunk.
+    GATHER_OPS = 1 + (C_CHK if scale_planar else 0)
+    # LDS scale byte of (row, chunk): row-major per tile, or chunk-major planar.
+    SC_ROW_STEP = SC_CHUNK_B if scale_planar else S_ROW_BYTES
+    SC_CHUNK_STEP = IN_ROWS * SC_CHUNK_B if scale_planar else SC_CHUNK_B
     if dense_slots:
-        WAIT_N = GATHERS_LO * PLANES + 1
+        WAIT_N = GATHERS_LO * GATHER_OPS + 1
 
     def _dequant_pk8(packed, e8m0_i32):
         """Native gfx1250 ``v_cvt_scale_pk8_f32_{fp8,fp4}``: 8 MX values -> 8 f32.
@@ -438,11 +457,13 @@ def _make_combine_fused_reduce(
             route0 = tok0 * topk
             rows_left = live.select((cur_rank_num_token - tok0) * topk, 0)
             g_off = fx.Int64(q0) * fx.Int64(IN_CHUNK_BYTES)
-            g_off_s = fx.Int64(hidden_dim * quant_bits // 8) + fx.Int64(q0) * fx.Int64(
-                CHUNK_ELEMS // SCALE_BLOCK
-            )
             comb_view = global_view(
                 inp_iter, 0, (dense_slots, P_ROW_BYTES), (slot_stride, 1)
+            )
+            scale_view = (
+                global_view(inp_iter, 0, (dense_slots, SC_CHUNK_B), (SC_CHUNK_B, 1))
+                if const_expr(scale_planar)
+                else None
             )
             for g in range_constexpr(len(GATHERS)):
                 r0, r1 = GATHERS[g]
@@ -465,30 +486,44 @@ def _make_combine_fused_reduce(
                         fx.Int32(readlane(T.i32, slot, i))
                         for i in range_constexpr(r1 - r0)
                     ]
-                    planes = [
-                        (lds_in_view, P_ROW_BYTES, g_off),
-                        (lds_scale_view, S_ROW_BYTES, g_off_s),
-                    ]
-                    for plane in range_constexpr(PLANES):
-                        lds_of, row_bytes, plane_off = planes[plane]
-                        lds_plane = lds_of(buf)
+                    for c in range_constexpr(C_CHK if scale_planar else 0):
                         tensor_load_gather(
                             make_tensor_gather_descriptor(
-                                comb_view,
-                                lds_plane,
+                                scale_view,
+                                lds_scale_view(buf),
                                 rows,
-                                row_width=row_bytes,
-                                tensor_dim0=row_bytes,
+                                row_width=SC_CHUNK_B,
+                                tensor_dim0=SC_CHUNK_B,
                                 tensor_dim1=dense_slots,
-                                stride=slot_stride,
+                                stride=SC_CHUNK_B,
                                 elem_bytes=1,
                                 index_size=32 if GATHER_IDX == 8 else 16,
                                 lds_byte_offset=fx.index_cast(
-                                    T.index, fx.Int32(r0 * row_bytes)
+                                    T.index,
+                                    fx.Int32(c * SC_CHUNK_STEP + r0 * SC_ROW_STEP),
                                 ),
-                                global_byte_offset=plane_off,
+                                global_byte_offset=fx.Int64(scale_planar_rel)
+                                + (fx.Int64(q0) + fx.Int64(c))
+                                * fx.Int64(dense_slots * SC_CHUNK_B),
                             )
                         )
+                    tensor_load_gather(
+                        make_tensor_gather_descriptor(
+                            comb_view,
+                            lds_in_view(buf),
+                            rows,
+                            row_width=P_ROW_BYTES,
+                            tensor_dim0=P_ROW_BYTES,
+                            tensor_dim1=dense_slots,
+                            stride=slot_stride,
+                            elem_bytes=1,
+                            index_size=32 if GATHER_IDX == 8 else 16,
+                            lds_byte_offset=fx.index_cast(
+                                T.index, fx.Int32(r0 * P_ROW_BYTES)
+                            ),
+                            global_byte_offset=g_off,
+                        )
+                    )
 
         def issue_load(work, buf, live):
             """-- global -> LDS: T*topk slot rows, one copy per wire plane --
@@ -565,8 +600,8 @@ def _make_combine_fused_reduce(
                     sc_i = lane_elem[r] // SCALE_BLOCK
                     sc_dw = (
                         IN_SCALE_OFF
-                        + lane_tok[r] * (topk * S_ROW_BYTES)
-                        + lane_chunk[r] * (CHUNK_ELEMS // SCALE_BLOCK)
+                        + lane_tok[r] * (topk * SC_ROW_STEP)
+                        + lane_chunk[r] * SC_CHUNK_STEP
                         + (sc_i // 4) * 4
                     )
                     sc_sh = (sc_i % 4) * 8
@@ -574,7 +609,7 @@ def _make_combine_fused_reduce(
                         payload = lds_load_payload(
                             in_idx, base_in + k_slot * P_ROW_BYTES
                         )
-                        dw = lds_load_b32(in_idx, sc_dw + k_slot * S_ROW_BYTES)[0]
+                        dw = lds_load_b32(in_idx, sc_dw + k_slot * SC_ROW_STEP)[0]
                         e8m0 = (dw >> sc_sh) & 0xFF
                         for j in range_constexpr(2):
                             accs[j] = accs[j] + _dequant_pk8(
@@ -630,7 +665,7 @@ def _make_combine_fused_reduce(
         def wait_input():
             if const_expr(GATHERS_HI != GATHERS_LO):
                 if warp < fx.Int32(GATHERS_HI_WARPS):
-                    tdm_ops.tensor_wait(GATHERS_HI * PLANES + 1)
+                    tdm_ops.tensor_wait(GATHERS_HI * GATHER_OPS + 1)
                 else:
                     tdm_ops.tensor_wait(WAIT_N)
             else:
