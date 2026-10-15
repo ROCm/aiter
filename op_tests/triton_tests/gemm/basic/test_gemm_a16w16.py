@@ -24,7 +24,7 @@ def _skip_unsupported_gluon(
     from aiter.ops.triton.utils._triton.arch_info import get_arch
 
     if "gfx950" in (get_arch() or ""):
-        # gfx950 has one gluon a16w16 kernel: compute_bound, TN, tile-aligned shapes.
+        # gfx950 has one gluon a16w16 kernel: compute_bound, TN layout.
         if kernel_type != "compute_bound":
             pytest.skip("gfx950 gluon a16w16 has only the compute_bound kernel")
         if layout != "TN":
@@ -308,6 +308,46 @@ def test_gemm_a16_w16_gluon_compute_bound(M: int, N: int, K: int, dtype, output,
 
 
 @pytest.mark.parametrize(
+    "M, N, K",
+    [
+        (1000, 2048, 512),  # ragged M
+        (512, 1016, 512),  # ragged N (a multiple of 8, not of any tile)
+        (256, 256, 1032),  # ragged K, one tail chunk
+        (256, 256, 1000),  # ragged K, two tail chunks, K not a multiple of 16
+        (475, 1016, 1000),  # all three ragged
+        (100, 72, 264),  # smaller than every tile
+        (57, 19360, 4096),  # a production shape with a ragged M
+    ],
+)
+@pytest.mark.parametrize("tile", [None, (256, 256), (64, 64)])
+@pytest.mark.parametrize("bias", [False, True])
+def test_gemm_a16_w16_gluon_compute_bound_ragged(M, N, K, tile, bias):
+    """Ragged M and N (clamped loads, masked stores) and ragged K (the tail
+    consumed first) give the right result, with the config's tile and forced
+    ones; the output is pre-filled with NaN so an unwritten element shows."""
+    _skip_unsupported_gluon("gluon", "compute_bound", M, N, K)
+    x, w, _, out_dtype, _ = generate_gemm_a16w16_inputs(
+        M, N, K, torch.bfloat16, output=False
+    )
+    b = torch.randn((N,), dtype=torch.bfloat16, device="cuda") if bias else None
+    y = torch.full((M, N), float("nan"), dtype=torch.bfloat16, device="cuda")
+    torch_out = F.linear(x, w, bias=b)
+    config = None if tile is None else {"BLOCK_M": tile[0], "BLOCK_N": tile[1]}
+    out = gemm_a16w16(
+        x,
+        w,
+        b,
+        out_dtype,
+        y,
+        backend="gluon",
+        kernel_type="compute_bound",
+        config=config,
+    )
+    assert not torch.isnan(out).any()
+    torch.testing.assert_close(out, torch_out, atol=1e-1, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
     "tile",
     [
         (256, 256),
@@ -337,6 +377,7 @@ def test_gemm_a16_w16_gluon_compute_bound_tiles(tile, bias):
     )
     b = torch.randn((N,), dtype=torch.bfloat16, device="cuda") if bias else None
     torch_out = F.linear(x, w, bias=b)
+    _gemm_a16w16_compute_bound_kernel.device_caches.clear()  # inspect this compile only
     out = gemm_a16w16(
         x,
         w,
@@ -361,31 +402,41 @@ def test_gemm_a16_w16_gluon_compute_bound_tiles(tile, bias):
 
 
 def test_gemm_a16_w16_gluon_pick_gemm_tile():
-    """The default gluon config picks the largest tile that fills the GPU once;
-    a tuned config names its tile."""
+    """The default gluon config picks by the wave cost model (workgroup waves over
+    per-tile throughput); a tuned config names its tile."""
     from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_tile
 
+    tiles = [
+        [256, 256],
+        [256, 128],
+        [128, 256],
+        [128, 128],
+        [256, 64],
+        [64, 256],
+        [128, 64],
+        [64, 128],
+        [64, 64],
+    ]
     default = {
-        "TILES": [
-            [256, 256],
-            [256, 128],
-            [128, 256],
-            [128, 128],
-            [256, 64],
-            [64, 256],
-            [128, 64],
-            [64, 128],
-            [64, 64],
-        ],
-        "WORKGROUPS_PER_CU": 1,
+        "TILES": tiles,
+        "TILE_TFLOPS": [1583, 1386, 1388, 1162, 1040, 1009, 877, 871, 603],
+        "TAIL_WAVE_COST": 0.5,
     }
+    # Exactly one wave of the largest tile.
     assert pick_gemm_tile(default, 4096, 4096, 256) == (256, 256)
+    # Half a wave of 256x256 loses to one full wave of 256x128.
     assert pick_gemm_tile(default, 4096, 2048, 256) == (256, 128)
     assert pick_gemm_tile(default, 2048, 2048, 256) == (128, 128)
     assert pick_gemm_tile(default, 1024, 1024, 256) == (64, 64)
-    # Nothing fills the GPU: the tile with the most workgroups.
-    assert pick_gemm_tile(default, 256, 256, 256) == (64, 64)
-    assert pick_gemm_tile(default, 100, 4096, 256) is None
+    # 91% of a wave of 256x256 beats two waves of 256x128 (ragged M).
+    assert pick_gemm_tile(default, 7226, 2048, 256) == (256, 256)
+    # A tiny M: the tile that pads M least, not the one that fills the GPU.
+    assert pick_gemm_tile(default, 57, 19360, 256) == (64, 128)
+    assert pick_gemm_tile(default, 100, 4096, 256) == (64, 64)
+    # Without throughputs: the largest tile that fills the GPU once.
+    legacy = {"TILES": tiles, "WORKGROUPS_PER_CU": 1}
+    assert pick_gemm_tile(legacy, 4096, 2048, 256) == (256, 128)
+    assert pick_gemm_tile(legacy, 256, 256, 256) == (64, 64)
     assert pick_gemm_tile({"BLOCK_M": 128, "BLOCK_N": 256}, 4096, 4096, 256) == (
         128,
         256,

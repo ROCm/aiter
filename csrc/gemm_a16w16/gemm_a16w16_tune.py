@@ -1032,8 +1032,8 @@ class GemmA16W16Tuner(GemmCommonTuner):
             shape_kernel_nums = len(task) - prev_count
             if shape_kernel_nums == 0:
                 # A shape none of the selected backends can run (e.g. --libtype
-                # gluon on an unaligned shape): no task group, so no data entry,
-                # or mp_tuner's per-shape grouping miscounts.
+                # gluon with N or K not a multiple of 8): no task group, so no
+                # data entry, or mp_tuner's per-shape grouping miscounts.
                 logger.warning(
                     f"no candidate for M={M}, N={N}, K={K} with libtype {libtype}"
                 )

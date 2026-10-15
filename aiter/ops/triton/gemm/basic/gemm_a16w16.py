@@ -88,8 +88,8 @@ def gemm_a16w16_(
     and the triton backend everywhere else. Pass ``backend`` to force a choice.
     On gfx950, ``backend="gluon"`` with ``kernel_type="compute_bound"`` runs the
     gfx950 gluon compute-bound kernel (scheduled by Triton's MFMA scheduler); it
-    runs the tile its gluon config picks for the shape (sides 256, 128 or 64) and
-    needs M, N multiples of the tile and K a multiple of 128.
+    runs the tile its gluon config picks for the shape (sides 256, 128 or 64),
+    handles ragged M, N and K (N and K multiples of 8, K at least 256).
 
     Args:
         x (torch.Tensor): Input matrix with shape (M, K).
@@ -627,8 +627,8 @@ def gemm_a16w16(
     and the triton backend everywhere else. Pass ``backend`` to force a choice.
     On gfx950, ``backend="gluon"`` with ``kernel_type="compute_bound"`` runs the
     gfx950 gluon compute-bound kernel (scheduled by Triton's MFMA scheduler); it
-    runs the tile its gluon config picks for the shape (sides 256, 128 or 64) and
-    needs M, N multiples of the tile and K a multiple of 128.
+    runs the tile its gluon config picks for the shape (sides 256, 128 or 64),
+    handles ragged M, N and K (N and K multiples of 8, K at least 256).
     See ``gemm_a16w16_`` for the full argument description; ``config`` is a dict
     here and is serialized before dispatch so the op is torch.compile-traceable.
     """

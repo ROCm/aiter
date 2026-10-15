@@ -18,9 +18,13 @@ https://github.com/ROCm/gfx950-gluon-tutorials/tree/main/kernels/gemm/intra_wave
 The tile is any (BLOCK_M, BLOCK_N) with sides 64, 128 or 256, with BLOCK_K 64; every
 layout is derived from it. Which tile a shape runs with comes from the gluon GEMM
 config (``configs/gfx950/gluon/gemm/gemm_a16w16``): a tuned config names it, the
-default config's rule picks the largest tile that fills the GPU once. Nothing is
-masked, so the kernel needs a TN problem (x row-major, w row-major (N, K)) with M
-and N multiples of the tile and K a multiple of 128 of at least 256.
+default config's cost model picks the tile whose workgroup waves finish first
+(``pick_gemm_tile``; its per-tile throughputs live in the JSON). Ragged shapes
+are handled per dimension, each specialized at compile time: a ragged M or N clamps
+the loads of the last tile to the matrix edge and masks its stores; a ragged K
+(EVEN_K false) consumes the K tail first, unpipelined, so the hot loop stays
+unmasked. The kernel needs a TN problem (x row-major, w row-major (N, K)) with N
+and K multiples of 8 (16-byte loads and stores) and K at least 256.
 ``unsupported_reason`` says why a problem is outside that.
 """
 
@@ -29,6 +33,7 @@ import math
 import os
 
 import torch
+import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.amd import cdna4 as ttgl_cdna4
@@ -150,6 +155,9 @@ def _gemm_a16w16_compute_bound_kernel(
     NUM_XCDS: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
     ADD_BIAS: gl.constexpr,
+    EVEN_M: gl.constexpr,
+    EVEN_N: gl.constexpr,
+    EVEN_K: gl.constexpr,
 ):
     """
     Beyond the hot loop: L2 locality + interleaved epilogue on top of v8_sliceMN.
@@ -208,11 +216,35 @@ def _gemm_a16w16_compute_bound_kernel(
     a_base = a_ptr + pid_m * BLOCK_M * stride_am
     b_base = b_ptr + pid_n * BLOCK_N * stride_bn
 
+    # Rows and columns of the two halves, relative to the tile. On a ragged last
+    # tile they are clamped to the matrix edge: the clamped rows and columns load
+    # valid data (duplicates), compute rows nobody keeps, and the masked store
+    # drops them. Clamping keeps the buffer offsets inside one tile's range.
+    rows_top = offs_am
+    rows_bot = offs_am + BLOCK_M // 2
+    if not EVEN_M:
+        rows_top = gl.minimum(rows_top, M - 1 - pid_m * BLOCK_M)
+        rows_bot = gl.minimum(rows_bot, M - 1 - pid_m * BLOCK_M)
+    cols_left = offs_bn
+    cols_right = offs_bn + BLOCK_N // 2
+    if not EVEN_N:
+        cols_left = gl.minimum(cols_left, N - 1 - pid_n * BLOCK_N)
+        cols_right = gl.minimum(cols_right, N - 1 - pid_n * BLOCK_N)
+
+    # Row and column terms of the offsets. The row strides are multiples of 8
+    # elements (the wrapper checks), which keeps every 8-element group of a row
+    # 16-byte aligned; the hint says so, because Triton's argument specialization
+    # only records strides that are multiples of 16.
+    a_rows_top = gl.multiple_of(rows_top * stride_am, 8)
+    a_rows_bot = gl.multiple_of(rows_bot * stride_am, 8)
+    b_cols_left = gl.multiple_of(cols_left * stride_bn, 8)
+    b_cols_right = gl.multiple_of(cols_right * stride_bn, 8)
+
     # Two sets of offsets: base (even K-steps) and _next (odd K-steps).
-    a_top_offsets = offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak
-    a_bot_offsets = a_top_offsets + BLOCK_M * stride_am // 2
-    b_left_offsets = offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-    b_right_offsets = b_left_offsets + BLOCK_N * stride_bn // 2
+    a_top_offsets = a_rows_top[:, None] + offs_ak[None, :] * stride_ak
+    a_bot_offsets = a_rows_bot[:, None] + offs_ak[None, :] * stride_ak
+    b_left_offsets = offs_bk[:, None] * stride_bk + b_cols_left[None, :]
+    b_right_offsets = offs_bk[:, None] * stride_bk + b_cols_right[None, :]
 
     a_top_offsets_next = a_top_offsets + BLOCK_K * stride_ak
     a_bot_offsets_next = a_bot_offsets + BLOCK_K * stride_ak
@@ -224,7 +256,61 @@ def _gemm_a16w16_compute_bound_kernel(
     acc_tr = gl.zeros((BLOCK_M // 2, BLOCK_N // 2), gl.float32, mfmaLayout)
     acc_br = gl.zeros((BLOCK_M // 2, BLOCK_N // 2), gl.float32, mfmaLayout)
 
-    iterMax = gl.cdiv(K, BLOCK_K)
+    # A ragged K: the tail (K % (2 * BLOCK_K) elements) is consumed first through
+    # buffer 0, unpipelined, with the loads masked at 8-element granularity. The
+    # pipelined loop below then covers K_MAIN exactly as for an even K; only the
+    # accumulation order differs.
+    if EVEN_K:
+        K_MAIN: gl.constexpr = K
+    else:
+        K_MAIN: gl.constexpr = K - K % (2 * BLOCK_K)
+        K_TAIL: gl.constexpr = K - K_MAIN
+        a_tail = a_base + K_MAIN * stride_ak
+        b_tail = b_base + K_MAIN * stride_bk
+        k_of_a = gl.zeros_like(a_top_offsets) + offs_ak[None, :]
+        k_of_b = gl.zeros_like(b_left_offsets) + offs_bk[:, None]
+        for t in gl.static_range(gl.cdiv(K_TAIL, BLOCK_K)):
+            mask_a = k_of_a + t * BLOCK_K < K_TAIL
+            mask_b = k_of_b + t * BLOCK_K < K_TAIL
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                smemB_left.index(0),
+                b_tail,
+                b_left_offsets + t * BLOCK_K * stride_bk,
+                mask=mask_b,
+            )
+            gl.amd.cdna4.async_copy.commit_group()
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                smemA_top.index(0),
+                a_tail,
+                a_top_offsets + t * BLOCK_K * stride_ak,
+                mask=mask_a,
+            )
+            gl.amd.cdna4.async_copy.commit_group()
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                smemA_bot.index(0),
+                a_tail,
+                a_bot_offsets + t * BLOCK_K * stride_ak,
+                mask=mask_a,
+            )
+            gl.amd.cdna4.async_copy.commit_group()
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                smemB_right.index(0),
+                b_tail,
+                b_right_offsets + t * BLOCK_K * stride_bk,
+                mask=mask_b,
+            )
+            gl.amd.cdna4.async_copy.commit_group()
+            gl.amd.cdna4.async_copy.wait_group(0)
+            b_left = smemB_left.index(0).load(dotOpLayoutB)
+            a_top = smemA_top.index(0).load(dotOpLayoutA)
+            a_bot = smemA_bot.index(0).load(dotOpLayoutA)
+            b_right = smemB_right.index(0).load(dotOpLayoutB)
+            acc_tl = gl.amd.cdna3.mfma(a_top, b_left, acc_tl, cd_regclass="a")
+            acc_bl = gl.amd.cdna3.mfma(a_bot, b_left, acc_bl, cd_regclass="a")
+            acc_tr = gl.amd.cdna3.mfma(a_top, b_right, acc_tr, cd_regclass="a")
+            acc_br = gl.amd.cdna3.mfma(a_bot, b_right, acc_br, cd_regclass="a")
+
+    iterMax = gl.cdiv(K_MAIN, BLOCK_K)
 
     ## Prologue — same as v8
     g_idx = 0
@@ -409,19 +495,53 @@ def _gemm_a16w16_compute_bound_kernel(
     offs_cm = gl.arange(0, BLOCK_M // 2, gl.SliceLayout(1, gStoreLayoutC))
     offs_cn = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, gStoreLayoutC))
     c_base = c_ptr + pid_m * BLOCK_M * stride_cm + pid_n * BLOCK_N * stride_cn
-    c_tl_offsets = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_rows = gl.multiple_of(offs_cm * stride_cm, 8)  # same alignment hint as the loads
+    c_tl_offsets = c_rows[:, None] + stride_cn * offs_cn[None, :]
     c_tr_offsets = c_tl_offsets + BLOCK_N * stride_cn // 2
     c_bl_offsets = c_tl_offsets + BLOCK_M * stride_cm // 2
     c_br_offsets = c_bl_offsets + BLOCK_N * stride_cn // 2
+    if not EVEN_N:
+        # Columns of C left from this tile's origin: a multiple of 8 (N and
+        # BLOCK_N are), which the hint states so that each thread's 8-column
+        # group keeps one predicate and one 16-byte store. The hint cannot go on
+        # N itself: Triton drops hints on kernel arguments.
+        n_left = gl.multiple_of(N - pid_n * BLOCK_N, 8)
+    if not (EVEN_M and EVEN_N):
+        # The ragged last tile stores only the rows and columns inside C.
+        m_left = M - pid_m * BLOCK_M
+        in_top = offs_cm[:, None] < m_left
+        in_bot = offs_cm[:, None] + BLOCK_M // 2 < m_left
+        if EVEN_N:
+            in_left = (
+                offs_cn[None, :] < BLOCK_N
+            )  # no column limit; gives the mask its shape
+            in_right = in_left
+        else:
+            in_left = offs_cn[None, :] < n_left
+            in_right = offs_cn[None, :] + BLOCK_N // 2 < n_left
+        mask_tl = in_top & in_left
+        mask_tr = in_top & in_right
+        mask_bl = in_bot & in_left
+        mask_br = in_bot & in_right
 
     if ADD_BIAS:
         # bias[N] is added in fp32 before the downcast; loaded here so its latency
         # overlaps the last MFMAs.
         offs_bias = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, mfmaLayout))
-        bias_l = gl.load(bias_ptr + pid_n * BLOCK_N + offs_bias).to(gl.float32)
-        bias_r = gl.load(bias_ptr + pid_n * BLOCK_N + BLOCK_N // 2 + offs_bias).to(
-            gl.float32
-        )
+        if EVEN_N:
+            bias_l = gl.load(bias_ptr + pid_n * BLOCK_N + offs_bias).to(gl.float32)
+            bias_r = gl.load(bias_ptr + pid_n * BLOCK_N + BLOCK_N // 2 + offs_bias).to(
+                gl.float32
+            )
+        else:
+            bias_l = gl.load(
+                bias_ptr + pid_n * BLOCK_N + offs_bias, mask=offs_bias < n_left, other=0
+            ).to(gl.float32)
+            bias_r = gl.load(
+                bias_ptr + pid_n * BLOCK_N + BLOCK_N // 2 + offs_bias,
+                mask=offs_bias + BLOCK_N // 2 < n_left,
+                other=0,
+            ).to(gl.float32)
 
     ## Iter iterMax - 2: same 4-region pattern as main loop, no AC
     acc_tl = gl.amd.cdna3.mfma(a_top, b_left, acc_tl, cd_regclass="a")
@@ -457,7 +577,12 @@ def _gemm_a16w16_compute_bound_kernel(
         acc_tl = acc_tl + bias_l[None, :]
     c_tl = acc_tl.to(c_ptr.dtype.element_ty)
     c_tl = gl.convert_layout(c_tl, layout=gStoreLayoutC)
-    gl.amd.cdna3.buffer_store(ptr=c_base, offsets=c_tl_offsets, stored_value=c_tl)
+    if EVEN_M and EVEN_N:
+        gl.amd.cdna3.buffer_store(ptr=c_base, offsets=c_tl_offsets, stored_value=c_tl)
+    else:
+        gl.amd.cdna3.buffer_store(
+            ptr=c_base, offsets=c_tl_offsets, stored_value=c_tl, mask=mask_tl
+        )
 
     acc_tr = gl.amd.cdna3.mfma(a_top, b_right, acc_tr, cd_regclass="a")
 
@@ -465,7 +590,12 @@ def _gemm_a16w16_compute_bound_kernel(
         acc_bl = acc_bl + bias_l[None, :]
     c_bl = acc_bl.to(c_ptr.dtype.element_ty)
     c_bl = gl.convert_layout(c_bl, layout=gStoreLayoutC)
-    gl.amd.cdna3.buffer_store(ptr=c_base, offsets=c_bl_offsets, stored_value=c_bl)
+    if EVEN_M and EVEN_N:
+        gl.amd.cdna3.buffer_store(ptr=c_base, offsets=c_bl_offsets, stored_value=c_bl)
+    else:
+        gl.amd.cdna3.buffer_store(
+            ptr=c_base, offsets=c_bl_offsets, stored_value=c_bl, mask=mask_bl
+        )
 
     acc_br = gl.amd.cdna3.mfma(a_bot, b_right, acc_br, cd_regclass="a")
 
@@ -473,13 +603,23 @@ def _gemm_a16w16_compute_bound_kernel(
         acc_tr = acc_tr + bias_r[None, :]
     c_tr = acc_tr.to(c_ptr.dtype.element_ty)
     c_tr = gl.convert_layout(c_tr, layout=gStoreLayoutC)
-    gl.amd.cdna3.buffer_store(ptr=c_base, offsets=c_tr_offsets, stored_value=c_tr)
+    if EVEN_M and EVEN_N:
+        gl.amd.cdna3.buffer_store(ptr=c_base, offsets=c_tr_offsets, stored_value=c_tr)
+    else:
+        gl.amd.cdna3.buffer_store(
+            ptr=c_base, offsets=c_tr_offsets, stored_value=c_tr, mask=mask_tr
+        )
 
     if ADD_BIAS:
         acc_br = acc_br + bias_r[None, :]
     c_br = acc_br.to(c_ptr.dtype.element_ty)
     c_br = gl.convert_layout(c_br, layout=gStoreLayoutC)
-    gl.amd.cdna3.buffer_store(ptr=c_base, offsets=c_br_offsets, stored_value=c_br)
+    if EVEN_M and EVEN_N:
+        gl.amd.cdna3.buffer_store(ptr=c_base, offsets=c_br_offsets, stored_value=c_br)
+    else:
+        gl.amd.cdna3.buffer_store(
+            ptr=c_base, offsets=c_br_offsets, stored_value=c_br, mask=mask_br
+        )
 
 
 MFMA_SCHEDULE_HINT = "mfma-schedule"
@@ -498,8 +638,8 @@ def _cu_count(device):
 
 def default_tile(M, N, K, device=None):
     """The tile the gluon GEMM config picks for a shape: a tuned config names it, the
-    default config's rule picks the largest tile that fills the GPU once (see
-    ``pick_gemm_tile``). None when no tile divides M and N."""
+    default config's cost model picks the tile whose workgroup waves finish
+    first (see ``pick_gemm_tile``)."""
     config, _ = get_gemm_config("GEMM-A16W16", M, N, K, backend="gluon")
     device = torch.cuda.current_device() if device is None else device
     return pick_gemm_tile(config, M, N, _cu_count(device))
@@ -512,19 +652,17 @@ def unsupported_reason(M, N, K, x=None, w=None, bias=None, activation=None, tile
         return "no activation support yet"
     if tile is None:
         tile = default_tile(M, N, K)
-        if tile is None:
-            return f"no tile with sides in {TILE_SIDES} divides M={M}, N={N}"
     bm, bn = tile
     if bm not in TILE_SIDES or bn not in TILE_SIDES:
         return f"tile {bm}x{bn} has a side outside {TILE_SIDES}"
-    if M % bm or N % bn:
-        return f"M and N must be multiples of the {bm}x{bn} tile (got M={M}, N={N})"
-    if K % (2 * BLOCK_K) or K < 4 * BLOCK_K:
-        return f"K must be a multiple of {2 * BLOCK_K} and at least {4 * BLOCK_K} (got K={K})"
-    if x is not None and x.stride(1) != 1:
-        return "x must be row-major (M, K)"
-    if w is not None and w.stride(1) != 1:
-        return "w must be row-major (N, K)"
+    if M < 1 or N % 8:
+        return f"N must be a multiple of 8 (16-byte stores; got M={M}, N={N})"
+    if K % 8 or K < 4 * BLOCK_K:
+        return f"K must be a multiple of 8 and at least {4 * BLOCK_K} (got K={K})"
+    if x is not None and (x.stride(1) != 1 or x.stride(0) % 8):
+        return "x must be row-major (M, K) with a row stride that is a multiple of 8"
+    if w is not None and (w.stride(1) != 1 or w.stride(0) % 8):
+        return "w must be row-major (N, K) with a row stride that is a multiple of 8"
     if x is not None and x.dtype not in (torch.float16, torch.bfloat16):
         return f"dtype {x.dtype} is not fp16/bf16"
     return None
@@ -538,11 +676,13 @@ def gemm_a16w16_compute_bound(x, w, y, bias=None, tile=None):
     if tile is None:
         tile = default_tile(M, N, K, x.device)
     reason = unsupported_reason(M, N, K, x, w, tile=tile)
+    if reason is None and (y.stride(1) != 1 or y.stride(0) % 8):
+        reason = "y must be row-major (M, N) with a row stride that is a multiple of 8"
     if reason is not None:
         raise ValueError(f"gfx950 gluon compute_bound a16w16: {reason}")
     bm, bn = tile
     b = w.T  # (K, N) view, K contiguous: the layout the kernel loads
-    grid_mn = (M // bm) * (N // bn)
+    grid_mn = triton.cdiv(M, bm) * triton.cdiv(N, bn)
     _gemm_a16w16_compute_bound_kernel[(grid_mn, 1)](
         x,
         b,
@@ -564,6 +704,9 @@ def gemm_a16w16_compute_bound(x, w, y, bias=None, tile=None):
         NUM_XCDS=NUM_XCDS,
         GROUP_SIZE_M=GROUP_SIZE_M,
         ADD_BIAS=bias is not None,
+        EVEN_M=M % bm == 0,
+        EVEN_N=N % bn == 0,
+        EVEN_K=K % (2 * BLOCK_K) == 0,
         num_warps=NUM_WARPS,
         schedule_hint=schedule_hint(),
     )
