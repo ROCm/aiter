@@ -5,7 +5,6 @@
         "num_warps": 4,
         "num_stages": 2,
         "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 32,
         "SEQUENCE_PARALLEL": true,
         "UNROLL": 1
     },
@@ -15,7 +14,6 @@
         "num_warps": 4,
         "num_stages": 1,
         "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16,
         "SEQUENCE_PARALLEL": false,
         "UNROLL": 1
     }
