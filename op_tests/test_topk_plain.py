@@ -88,6 +88,34 @@ def run_topk_case(batch_size, hiddensize, topk, largest, dtype):
     }
 
 
+def check_multi_block_filter(dtype):
+    # Row counts below the occupancy grid size split each row across several
+    # filter blocks, which the 3072-row sweep never reaches. A unique maximum
+    # in the last block tile used to be selected twice for fp16/bf16 (the empty
+    # trailing block re-read the end of the row), so assert the ids are unique.
+    for batch_size, hiddensize, topk in [
+        (32, 248320, 16),
+        (112, 248320, 16),
+        (448, 248320, 16),
+        (64, 151936, 64),
+        (112, 32768, 8),
+        (7, 4099, 16),
+    ]:
+        x = torch.randn(batch_size, hiddensize, dtype=dtype)
+        x[:, -3] = 100.0
+        topk_ids = torch.empty((batch_size, topk), dtype=dtypes.i32)
+        topk_value = torch.empty((batch_size, topk), dtype=dtype)
+        topk_plain(x, topk_ids, topk_value, topk, True)
+        ids = topk_ids.to(torch.long)
+        ref_value = torch.topk(x, topk, largest=True).values
+        assert not (ids.sort(dim=-1).values.diff(dim=-1) == 0).any(), (
+            f"topk_plain returned duplicate ids (batch_size={batch_size}, "
+            f"hiddensize={hiddensize}, topk={topk}, dtype={dtype})"
+        )
+        assert torch.equal(x.gather(1, ids), topk_value)
+        assert torch.equal(topk_value.sort(dim=-1, descending=True).values, ref_value)
+
+
 BATCH_SIZES = [3072]
 HIDDENSIZES = [3072, 4096, 8192, 16384, 32768, 65536, 131072]
 TOPKS = [2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1]
@@ -95,6 +123,9 @@ largest = True
 
 
 def main():
+    for dtype in (dtypes.bf16, dtypes.fp16, dtypes.fp32):
+        check_multi_block_filter(dtype)
+
     rows = []
     for batch_size in BATCH_SIZES:
         for hiddensize in HIDDENSIZES:

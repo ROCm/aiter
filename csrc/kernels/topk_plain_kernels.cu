@@ -1718,7 +1718,9 @@ struct WaveTopkFilter
             constexpr IdxT tile    = elements;
             const IdxT block_tile  = blockDim.x * tile;
             const IdxT end_aligned = start + utils::round_up_to_multiple_of(n, block_tile);
-            const IdxT tail        = end_aligned - block_tile;
+            // An empty slice must not fall back into [start - block_tile, start):
+            // those elements belong to the previous block and would be counted twice.
+            const IdxT tail = (n > 0) ? end_aligned - block_tile : end_aligned;
 
             using VecType = std::conditional_t<std::is_same_v<DataT, __bf16>,
                                                buffer_load_helpers::bf16x8_t,
@@ -2017,10 +2019,14 @@ __global__ void __launch_bounds__(512, 2) topk_filter_kernel(const DataT* __rest
     const IdxT block_per_batch     = gridDim.x / batch_size;
     const IdxT batch_id            = blockIdx.x / block_per_batch;
     const IdxT block_id_in_a_batch = blockIdx.x % block_per_batch;
-    // TODO: Consider multiple blocks
-    const IdxT len_per_block   = len;
+    // Each block filters its own slice of the row; topk_merge_kernel combines the
+    // per-block results. Slices start on a 16-byte boundary so the vector loads in
+    // sort_buffer_addressing stay aligned to the row.
+    constexpr IdxT elems_per_vec = 16 / sizeof(DataT);
+    const IdxT len_per_block =
+        utils::round_up_to_multiple_of((len - 1) / block_per_batch + 1, elems_per_vec);
     const uint64_t batch_start = static_cast<uint64_t>(batch_id) * len;
-    IdxT start                 = block_id_in_a_batch * len_per_block;
+    IdxT start                 = std::min(block_id_in_a_batch * len_per_block, len);
     IdxT end                   = std::min(start + len_per_block, len);
 
     BlockTopkFilter<capacity, greater, DataT, IdxT> topk(k, sentinel, lds_buf);
