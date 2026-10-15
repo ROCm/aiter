@@ -83,6 +83,7 @@ _ARENA_REGION_ORDER = (
     "compact_hist",
     "compact_done",
     "comb_inp",
+    "comb_scale",
 )
 # cco rounds each allocation up to its VMM granularity -- 2 MiB on the parts
 # MegaMoE runs on -- and, past 2 GiB, to 2 MiB again for the MR registration.

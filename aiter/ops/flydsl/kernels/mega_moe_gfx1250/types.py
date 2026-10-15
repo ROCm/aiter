@@ -97,6 +97,12 @@ class Stage2ScatterContext:
     # the plan's dense comb_inp layout, reading the run table the plan appended
     # to compact_psum (see compact_plan.compact_comb_tab_dwords).
     per_rank_scatter: bool = False
+    # Per-rank scatter on a quantized wire only, 0 when off: arena offset of a
+    # [N/256][slot] x 8 B e8m0 region that replaces the slots' scale plane, so a
+    # peer's run of slots takes its 8-byte scale slices as one contiguous store.
+    combine_scale_offset: int = 0
+    # Slots per N/256 column block of that region (max_tokens_per_rank * topk).
+    combine_scale_slots: int = 0
 
     def __post_init__(self):
         if self.combine_quant_bits not in (0, 8, 4):
