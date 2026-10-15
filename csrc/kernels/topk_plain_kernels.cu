@@ -1094,6 +1094,11 @@ struct WaveBuffer
         for(int i = 0; i < slots_per_lane; ++i)
         {
             priorities[i] = sentinel;
+            // An input equal to the sentinel (-inf when finding the largest) never
+            // displaces a sentinel slot, so a row with fewer than k other values
+            // flushes sentinel slots. Give them an in-range row offset instead of
+            // an uninitialized register.
+            positions[i] = 0;
         }
     }
 
