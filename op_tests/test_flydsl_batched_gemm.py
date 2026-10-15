@@ -185,12 +185,12 @@ def test_fused_quant_n32k4_mbn(b, m, k, dtype):
 
 @benchmark()
 def test_batched_gemm(b, m, n, k, dtype, layout):
-    """a8w4 and a8w8 strided-batched GEMM vs the same BF16 einsum."""
+    """a8w4 and a8w8 strided-batched GEMM, each vs the BF16 einsum of its
+    weight."""
     torch.manual_seed(SEED)
     # Model path: o is physically [m, b, k] (mbn); kernel out is a transposed
     # view of preallocated [m, b, n] — same as test_batched_gemm_bf16 mbn case.
     o_mbn = blockwise_randn(m, b, k, dtype=dtype)
-    w_bnk = blockwise_randn(b, n, k, dtype=dtype)
 
     if layout == "mbn":
         y_phys = torch.empty(m, b, n, dtype=dtype)
@@ -199,10 +199,11 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
         y_phys = torch.empty(b, m, n, dtype=dtype)
         y_out = y_phys
 
-    ref = run_torch_wo_a(o_mbn, w_bnk, dtype)
     candidates, nbytes, refs = {}, {}, {}
 
     if get_gfx() in A8W4_GFX:
+        w_bnk = blockwise_randn(b, n, k, dtype=dtype)
+        refs["a8w4"] = run_torch_wo_a(o_mbn, w_bnk, dtype)
         # Offline weight prep (not in the hot path); act quant mirrors every forward.
         w_codes, w_scales = preshuffle_a8w4_weight_mbn(w_bnk)
         a_fp8, a_scales = quant_act_mxfp8_mbn(o_mbn)
@@ -257,7 +258,7 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
             out_mbn = out.transpose(0, 1).contiguous()
         else:
             out_mbn = out
-        ref_f = refs.get(name, ref).to(dtypes.fp32).flatten()
+        ref_f = refs[name].to(dtypes.fp32).flatten()
         out_f = out_mbn.to(dtypes.fp32).flatten()
         cos = torch.nn.functional.cosine_similarity(ref_f, out_f, dim=0).item()
         denom = ref_f.abs().mean().clamp_min(1e-6)
@@ -346,7 +347,7 @@ def main():
             args.layout, args.batch, args.mnk
         ):
             gemm_rows.append(test_batched_gemm(b, m, n, k, dtype, layout))
-        summarize("batched_gemm (a8w4 vs a8w8, same BF16 reference)", gemm_rows)
+        summarize("batched_gemm (a8w4 and a8w8, each vs its BF16 reference)", gemm_rows)
 
 
 if __name__ == "__main__":
