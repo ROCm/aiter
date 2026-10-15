@@ -14,7 +14,7 @@ op_tests/test_concat_cache_mla.py	268
 op_tests/test_deepgemm.py	10
 op_tests/test_dsv4_rotate_quant.py	4
 op_tests/test_f4gemm.py	4
-op_tests/test_fhmoe.py	4
+op_tests/test_fhmoe.py	300
 op_tests/test_flydsl_batched_gemm.py	10
 op_tests/test_flydsl_causal_conv1d_update.py	90
 op_tests/test_flydsl_compress_attn.py	62
@@ -166,4 +166,5 @@ op_tests/test_topk_softmax_shared_gate.py	26
 op_tests/test_vsa_sparse_attention.py	4
 op_tests/tuning_tests/test_config_shape_collision.py	4
 op_tests/tuning_tests/test_csv_validation.py	1
+op_tests/tuning_tests/test_fhmoe_tuner.py	12
 op_tests/tuning_tests/test_mixed_mxfp_tuning.py	4
