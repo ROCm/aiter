@@ -1058,24 +1058,6 @@ def test_mha_v4_mxfp4_v_scale_backing_storage_covers_lookahead_tiles(
 
 def test_mha_v4_rejects_unsupported_contracts():
     q = torch.empty((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
-    # Refused by the manifest's lse column rather than by a blanket rule, because the rows differ:
-    # every gfx950 dense row writes an LSE, and so does every sparse row except MXFP6/FP8's, whose
-    # code object is built without the store. Refusing at all matters more than where -- a row
-    # without the store leaves the buffer as allocated, which reads as a log-sum-exp rather than as
-    # a failure. Checked in the launcher because only it knows which row the dispatch chose.
-    if get_gfx() == "gfx950":
-        block_mask = torch.ones((1, 2, 1, 1), device="cuda", dtype=torch.bool)
-        with pytest.raises(RuntimeError, match="has no LSE store in its code object"):
-            mha_v4(
-                q,
-                q,
-                q,
-                AttentionFormat.MXFP6,
-                AttentionFormat.MXFP6,
-                native_fp8_format(),
-                return_lse=True,
-                block_mask=block_mask,
-            )
     with pytest.raises(ValueError, match="matching Q and K formats"):
         mha_v4(
             q,

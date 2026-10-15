@@ -1208,6 +1208,7 @@ _LSE_ROWS = (
     # INT8 and MXFP8 feed PV the same FP8 P as the FP8 row, and so share its tolerance.
     ("i8fp8", AttentionFormat.INT8, None, 0.09),
     ("mxfp8", None, None, 0.09),
+    ("f6f8", AttentionFormat.MXFP6, None, 0.09),
     # The FP6-P rows, scored against the BF16 sources the way every row here is, so the residual
     # is mostly their own Q/K rounding: FP4's is the coarsest in the file.
     ("mxfp4_fp6p", AttentionFormat.MXFP4, AttentionFormat.MXFP4, 0.2),
@@ -1222,7 +1223,7 @@ _LSE_ROWS = (
 _LSE_FP6_P_IDS = ("mxfp4_fp6p", "mxfp6_fp6p", "f8f6_fp6p", "f6f4_fp6p")
 
 
-_LSE_SPARSE_IDS = ("bf16", "bf16fp8", "fp8", "i8fp8", "mxfp8", *_LSE_FP6_P_IDS)
+_LSE_SPARSE_IDS = ("bf16", "bf16fp8", "fp8", "i8fp8", "mxfp8", "f6f8", *_LSE_FP6_P_IDS)
 
 
 def _lse_ids(ids):
