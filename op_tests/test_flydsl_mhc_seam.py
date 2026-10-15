@@ -154,7 +154,7 @@ def _graph_us(op, args, kw, T, replays=10):
     return us
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _warn_triton_skip(span, H, T):
     aiter.logger.warning(
         "triton seam needs H %% %d == 0; skipping it at H=%d, T=%d", span, H, T
