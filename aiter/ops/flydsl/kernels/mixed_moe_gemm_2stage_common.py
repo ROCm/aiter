@@ -430,6 +430,20 @@ def compile_mixed_moe_gemm1_common(
     fp4_ratio = 2 if a_dtype == "fp4" else 1
     gui_ratio = 1 if gate_up_interleave else 2
 
+    # Stage 1 writes the intermediate's unpadded columns rounded up to stage 2's
+    # K tile (tile_k // 2): stage 2 reads that far, and columns left unwritten
+    # are stale memory (NaN through mfma_scale even against zero weights). The
+    # grid skips the rest of the padding, counted in w1 rows: two per column,
+    # (gate, up), in both the separated and the interleaved layouts.
+    inter_dim_written = inter_dim - inter_dim_pad
+    if not gate_only:
+        tile_k_stage2 = tile_k // 2
+        inter_dim_written = min(
+            inter_dim,
+            -(-inter_dim_written // tile_k_stage2) * tile_k_stage2,
+        )
+    n_rows_skipped = 2 * (inter_dim - inter_dim_written)
+
     if True:
 
         def _emit_moe_gemm1(
@@ -522,7 +536,7 @@ def compile_mixed_moe_gemm1_common(
                 num_xcds = 8
                 one = arith.constant(1, index=True)
                 tile_n_idx = arith.constant(tile_n, index=True)
-                inter_pad_idx = arith.constant(2 * inter_dim_pad, index=True)
+                inter_pad_idx = arith.constant(n_rows_skipped, index=True)
                 if const_expr(mock_gate_only or gate_up_interleave):
                     grid_x = (n_in - inter_pad_idx + tile_n_idx - one) // tile_n_idx
                 else:
@@ -2952,23 +2966,14 @@ def compile_mixed_moe_gemm1_common(
         # manual finalize is needed.
         ctx = CompilationContext.get_current()
 
-        inter_dim_pad_total = arith.constant(2 * inter_dim_pad, index=True)
-        tile2_pad = 0
-        if const_expr(not gate_only):
-            tile_k_stage2 = tile_k // 2
-            tile2_pad = (
-                tile_k_stage2 - (inter_dim - inter_dim_pad) % tile_k_stage2
-            ) % tile_k_stage2
-
+        n_rows_skipped_idx = arith.constant(n_rows_skipped, index=True)
         inter_in = fx.Index(i32_inter_in)
         tile_n_index = arith.constant(tile_n, index=True)
         if const_expr(mock_gate_only or gate_up_interleave):
-            gx = (
-                inter_in - inter_dim_pad_total + tile2_pad + tile_n_index - 1
-            ) // tile_n_index
+            gx = (inter_in - n_rows_skipped_idx + tile_n_index - 1) // tile_n_index
         else:
             gx = (
-                (inter_in - inter_dim_pad_total + tile2_pad + 2 * tile_n_index - 1)
+                (inter_in - n_rows_skipped_idx + 2 * tile_n_index - 1)
                 // tile_n_index
                 // arith.constant(2, index=True)
             )
