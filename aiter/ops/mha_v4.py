@@ -825,9 +825,6 @@ def _lse_unsupported(
         return "MHA v4 does not produce LSE on the sorted-sparse path yet"
     arch = get_gfx()
     if arch != "gfx950":
-        # The gfx942 objects do carry the epilogue, but they predate the frozen-max correction
-        # and their LSE has never been compared against torch.logsumexp. O never reads LSE, so
-        # passing every output test says nothing about it. Lift this once MI300 is measured.
         return f"MHA v4 LSE is not validated on {arch} yet"
     if (q_format, v_format) not in _LSE_CAPABLE_QV:
         return (
@@ -858,13 +855,17 @@ _VARLEN_CAPABLE_QV = frozenset(
 )
 
 
+def _varlen_capable(q_format: AttentionFormat, v_format: AttentionFormat) -> bool:
+    """Whether the dense row for these operands takes per-batch key lengths."""
+    return get_gfx() == "gfx950" and (q_format, v_format) in _VARLEN_CAPABLE_QV
+
+
 def _check_varlen_capable(q_format: AttentionFormat, v_format: AttentionFormat) -> None:
     """Reject per-batch key lengths on rows whose code object ignores them."""
-    arch = get_gfx()
-    if arch != "gfx950" or (q_format, v_format) not in _VARLEN_CAPABLE_QV:
+    if not _varlen_capable(q_format, v_format):
         raise NotImplementedError(
             f"MHA v4 per-batch key lengths are not implemented for "
-            f"Q={q_format.name} V={v_format.name} on {arch} yet"
+            f"Q={q_format.name} V={v_format.name} on {get_gfx()} yet"
         )
 
 
@@ -1210,6 +1211,8 @@ def mha_v4_kv_splits(
     query_heads: int,
     key_length: int,
     device: Optional[torch.device] = None,  # noqa: UP045
+    *,
+    ragged: bool = False,
 ) -> int:
     """The KV split count mha_v4(kv_splits="auto") uses for these shapes on `device`.
 
@@ -1217,15 +1220,17 @@ def mha_v4_kv_splits(
     sequence with few heads leaves most CUs idle: [1, 4352, 3] fills 51 of MI355X's 256.
     The CU count is the device's own, so each SKU and partition mode gets its own split.
     Splitting the keys into n ranges folded into the batch multiplies the grid by n at the cost
-    of a merge pass. This takes the largest n that still fits the grid in one wave, divides the
-    key length and leaves each range at least _MHA_V4_MIN_KV_SPLIT_TOKENS keys; a grid that
-    already fills the GPU gets 1, since further splits only add work-groups and merge traffic.
+    of a merge pass. This takes the largest n that still fits the grid in one wave and leaves
+    each range at least _MHA_V4_MIN_KV_SPLIT_TOKENS keys; a grid that already fills the GPU
+    gets 1, since further splits only add work-groups and merge traffic. n must also divide the
+    key length unless `ragged`, for operands whose dense row takes per-batch key lengths: the
+    last range then takes the remainder.
     """
     work_groups = batch * query_heads * -(-query_length // _MHA_V4_Q_TILE)
     cus = torch.cuda.get_device_properties(device).multi_processor_count
     most = min(cus // max(work_groups, 1), key_length // _MHA_V4_MIN_KV_SPLIT_TOKENS)
     for splits in range(most, 1, -1):
-        if key_length % splits == 0:
+        if ragged or key_length % splits == 0:
             return splits
     return 1
 
@@ -1254,7 +1259,12 @@ def _resolve_kv_splits(
         ):
             return 1
         return mha_v4_kv_splits(
-            q.shape[0], q.shape[1], q.shape[2], k.shape[1], q.device
+            q.shape[0],
+            q.shape[1],
+            q.shape[2],
+            k.shape[1],
+            q.device,
+            ragged=_varlen_capable(q_format, v_format),
         )
     if isinstance(kv_splits, bool) or not isinstance(kv_splits, int) or kv_splits < 1:
         raise ValueError(
@@ -1272,9 +1282,15 @@ def _resolve_kv_splits(
             f"FP8/FP8), not recipe {recipe.kind.name} with V {v_format.name}"
         )
     _check_lse_capable(q_format, v_format, False)
-    if k.shape[1] % kv_splits:
+    if kv_splits > k.shape[1]:
         raise ValueError(
-            f"kv_splits={kv_splits} must divide the key length {k.shape[1]}"
+            f"kv_splits={kv_splits} must be at most the key length {k.shape[1]}"
+        )
+    if k.shape[1] % kv_splits and not _varlen_capable(q_format, v_format):
+        raise ValueError(
+            f"kv_splits={kv_splits} must divide the key length {k.shape[1]} for "
+            f"Q={q_format.name} V={v_format.name}, whose dense row takes no per-batch key "
+            "lengths to end a shorter range with"
         )
     return kv_splits
 
@@ -1289,8 +1305,33 @@ def _repeat_queries(t: Tensor, splits: int) -> Tensor:
 
 
 def _fold_key_ranges(t: Tensor, splits: int) -> Tensor:
-    """[B, Sk, H, D] -> [B * splits, Sk / splits, H, D], row b * splits + i = range i of b."""
-    return t.reshape(t.shape[0] * splits, t.shape[1] // splits, *t.shape[2:])
+    """[B, Sk, H, D] -> [B * splits, span, H, D], row b * splits + i = range i of b.
+
+    Range i starts at key i * (Sk // splits) and is span = Sk - (splits - 1) * (Sk // splits)
+    keys long, so the ranges overlap by the remainder and the last one ends at Sk; when the
+    splits do not divide Sk, _key_range_lengths cuts every other range back to Sk // splits. A
+    view when B is 1 or the splits divide Sk, and a copy otherwise.
+    """
+    step = t.shape[1] // splits
+    span = t.shape[1] - (splits - 1) * step
+    ranges = t.as_strided(
+        (t.shape[0], splits, span, *t.shape[2:]),
+        (t.stride(0), step * t.stride(1), *t.stride()[1:]),
+        t.storage_offset(),
+    )
+    return ranges.reshape(-1, span, *t.shape[2:])
+
+
+def _key_range_lengths(
+    batch: int, splits: int, key_length: int, device: torch.device
+) -> Optional[Tensor]:  # noqa: UP045
+    """The seqlens_k ending each range of _fold_key_ranges, or None when they all end at span."""
+    step = key_length // splits
+    if key_length == step * splits:
+        return None
+    lengths = torch.full((batch * splits,), step, dtype=torch.int32, device=device)
+    lengths[splits - 1 :: splits] = key_length - (splits - 1) * step
+    return lengths
 
 
 def _k_mean(k: Tensor, kind: _RawRecipeKind) -> Optional[Tensor]:  # noqa: UP045
@@ -1408,13 +1449,15 @@ def mha_v4(
     that writes a zero output tile.
     With ``return_lse`` the call returns ``(out, lse)``, where ``lse`` is FP32
     ``[batch, heads, Sq]`` holding ``ln(sum exp(s - max)) + max``.
-    ``kv_splits`` splits the keys into that many equal ranges, run as extra batches of one
-    launch and merged by their LSE, for grids too small to fill the GPU: a short sequence with
-    few heads. ``"auto"`` picks the count with mha_v4_kv_splits() and falls back to 1 wherever
+    ``kv_splits`` splits the keys into that many ranges, run as extra batches of one launch
+    and merged by their LSE, for grids too small to fill the GPU: a short sequence with few
+    heads. ``"auto"`` picks the count with mha_v4_kv_splits() and falls back to 1 wherever
     splitting is unsupported. Operands are quantized once, before the split, so per-tensor
     scales stay global. For BF16, BF16/FP8, INT8/FP8 and FP8/FP8 operands wherever MHA v4
-    exports their LSE (gfx950 today), without ``block_mask`` or ``seqlens_k``; an explicit
-    count must divide the key length.
+    exports their LSE (gfx950 today), without ``block_mask`` or ``seqlens_k``. The ranges are
+    equal when the count divides the key length; otherwise the last one takes the remainder,
+    which needs operands that take per-batch key lengths (BF16 and BF16/FP8), and the other
+    recipes need a count that divides it.
     """
     if return_lse:
         _check_lse_capable(q_format, v_format, block_mask is not None)
@@ -1591,6 +1634,7 @@ def mha_v4(
             v_scale_mode,
             softmax_scale=softmax_scale,
             return_lse=True,
+            seqlens_k=_key_range_lengths(q.shape[0], splits, k.shape[1], q.device),
             v_pack=recipe.v_pack,
         )
         lse_out = _empty_lse(q, return_lse)

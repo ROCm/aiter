@@ -1182,11 +1182,11 @@ _KV_SPLIT_FORMATS = [
 @pytest.mark.parametrize(
     "formats", _KV_SPLIT_FORMATS, ids=lambda formats: "-".join(f.name for f in formats)
 )
-@pytest.mark.parametrize("splits", [2, 4])
+@pytest.mark.parametrize("splits", [2, 3, 4])
 @pytest.mark.parametrize(
     ("batch", "query_length", "key_length", "query_heads", "kv_heads"),
-    [(1, 1000, 1024, 3, 3), (2, 333, 768, 4, 2)],
-    ids=["b1", "b2-gqa"],
+    [(1, 1000, 1024, 3, 3), (2, 333, 768, 4, 2), (2, 333, 1001, 4, 2)],
+    ids=["b1", "b2-gqa", "b2-gqa-remainder"],
 )
 def test_mha_v4_kv_splits_match_the_unsplit_call(
     formats, splits, batch, query_length, key_length, query_heads, kv_heads
@@ -1197,7 +1197,8 @@ def test_mha_v4_kv_splits_match_the_unsplit_call(
     the unsplit call. The result is still not the unsplit one: each partial output is rounded to
     BF16, and a quantized P is scaled by its range's running max rather than the row's. The keys
     escalate along the sequence so the ranges carry very different softmax mass, and a range
-    weighted by anything other than its true LSE shows up as a large error.
+    weighted by anything other than its true LSE shows up as a large error. A count that does
+    not divide the keys ends the shorter ranges through seqlens_k, on the operands that take it.
     """
     torch.manual_seed(47)
     q = torch.randn(
@@ -1226,6 +1227,12 @@ def test_mha_v4_kv_splits_match_the_unsplit_call(
         output = (out.float() - reference).norm() / reference.norm()
         return output.item(), (lse - reference_lse).abs().max().item()
 
+    if key_length % splits and not mha_v4_module._varlen_capable(
+        formats[0], formats[2]
+    ):
+        with pytest.raises(ValueError, match="divide the key length"):
+            mha_v4(q, k, v, *formats, kv_splits=splits)
+        return
     unsplit = errors(*mha_v4(q, k, v, *formats, return_lse=True))
     actual, actual_lse = mha_v4(q, k, v, *formats, return_lse=True, kv_splits=splits)
     split = errors(actual, actual_lse)
@@ -1252,6 +1259,30 @@ def test_mha_v4_kv_splits_auto_fills_one_wave(monkeypatch):
     # Ranges stay at least 512 keys long.
     assert mha_v4_kv_splits(1, 256, 1, 1536) == 3
     assert mha_v4_kv_splits(1, 256, 1, 1000) == 1
+    # Operands that take per-batch key lengths need no divisor: the last range takes the rest.
+    assert mha_v4_kv_splits(1, 4352, 3, 4352, ragged=True) == 5
+    assert mha_v4_kv_splits(1, 4352, 3, 4349, ragged=True) == 5
+    assert mha_v4_kv_splits(1, 256, 1, 1000, ragged=True) == 1
+
+
+@pytest.mark.parametrize(
+    ("batch", "key_length", "splits"),
+    [(1, 1024, 4), (1, 1001, 3), (2, 1024, 4), (2, 1001, 3)],
+)
+def test_mha_v4_kv_splits_fold_every_key_once(batch, key_length, splits):
+    """Each range starts where the last one ends, and only an uneven batched fold copies."""
+    k = torch.randn((batch, key_length, 2, 128), device="cuda", dtype=torch.bfloat16)
+    ranges = mha_v4_module._fold_key_ranges(k, splits)
+    lengths = mha_v4_module._key_range_lengths(batch, splits, key_length, k.device)
+    if lengths is None:
+        lengths = torch.full((batch * splits,), ranges.shape[1], dtype=torch.int32)
+    lengths = lengths.tolist()
+
+    for b in range(batch):
+        keys = [ranges[b * splits + i, : lengths[b * splits + i]] for i in range(splits)]
+        assert torch.equal(torch.cat(keys), k[b])
+    view = ranges.untyped_storage().data_ptr() == k.untyped_storage().data_ptr()
+    assert view == (batch == 1 or key_length % splits == 0)
 
 
 @pytest.mark.parametrize(
@@ -1311,7 +1342,12 @@ def test_mha_v4_kv_splits_auto_leaves_unsupported_calls_unsplit():
     [
         ({"kv_splits": 0}, ValueError, "positive int"),
         ({"kv_splits": "many"}, ValueError, "positive int"),
-        ({"kv_splits": 3}, ValueError, "divide the key length"),
+        (
+            {"kv_splits": 3, "formats": (AttentionFormat.FP8,) * 3},
+            ValueError,
+            "divide the key length",
+        ),
+        ({"kv_splits": 1025}, ValueError, "at most the key length"),
         (
             {"kv_splits": 2, "block_mask": torch.ones((1, 4, 8), dtype=torch.bool)},
             NotImplementedError,
@@ -1343,7 +1379,8 @@ def test_mha_v4_kv_splits_auto_leaves_unsupported_calls_unsplit():
     ids=[
         "zero",
         "string",
-        "non-divisor",
+        "fp8-non-divisor",
+        "more-than-keys",
         "block-mask",
         "seqlens-k",
         "mxfp4",
