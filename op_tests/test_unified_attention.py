@@ -155,6 +155,10 @@ PREFILL_CASES = {
     "varlen": ([320, 300, 200, 150], [2048, 5000, 8192, 3000], 16),
     # Ragged causal prefill with partial KV pages.
     "varlen_causal": ([93, 80, 71, 60], [157, 100, 90, 70], 4),
+    # Long group-2 paged prefill: 4096 KV tokens = 64 tiles > 48 selects the BM256
+    # tile; group 2 is not a packed-BN64 group. Single sequence also passes the
+    # causal no-decode proof, which the ragged rows cannot.
+    "long_g2": ([256], [4096], 2),
     **{f"ragged_g{g}": ([93, 17, 41, 9], [157, 0, 70, 1], g) for g in (1, 2, 4, 8, 16)},
 }
 
@@ -205,6 +209,9 @@ def test_prefill(dtype, causal, kind, layout):
     return ret
 
 
+_LAYER_GRAPH_CHECKED = set()
+
+
 @benchmark()
 def test_decode(dtype, depth, layout):
     query_lens = [1] * 8
@@ -222,7 +229,10 @@ def test_decode(dtype, depth, layout):
     ret = measure(candidates, case, want, query_lens, kv_lens)
     if layout == "vectorized":
         compare(torch.zeros_like(want[-1]), case["out"][-1], 0, "empty KV")
-        check_decode_layer_graphs(dtype)
+        # Layer-graph coverage depends on dtype only, so run it once per dtype.
+        if dtype not in _LAYER_GRAPH_CHECKED:
+            _LAYER_GRAPH_CHECKED.add(dtype)
+            check_decode_layer_graphs(dtype)
     if layout == "linear":
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -282,7 +292,7 @@ def check_decode_layer_graphs(dtype):
         table.copy_(table.roll(1, dims=1))
         replay_and_check(graph, linear_layers, context_lengths, "shared decode graph")
 
-    # No eager adapter call separates captures: a transition-only cache would be stale.
+    # Each captured call's planner refresh must observe lengths changed between captures.
     second_lengths = torch.tensor([769, 129, 3], device="cuda", dtype=torch.int32)
     second_cases = [dict(case, seqused_k=second_lengths) for case in linear_layers]
     second_calls = [
@@ -329,25 +339,22 @@ def test_paged_addressing(pool_blocks, layout):
     query_lens, kv_lens = [128], [256]
     original = make_case(query_lens, kv_lens, dtypes.bf16)
     want = reference(original, query_lens, kv_lens)
-    candidates, cases = {}, {}
     count = original["k"].shape[0]
-    for name, ids in (("reversed", list(reversed(range(count)))),):
-        case = dict(original, out=torch.empty_like(original["out"]))
-        ids = [pool_blocks - count + i for i in ids]
-        for key in ("k", "v"):
-            pool = torch.zeros(
-                pool_blocks, PAGE, HKV, D, device="cuda", dtype=original[key].dtype
-            )
-            for logical, pid in enumerate(ids):
-                pool[pid] = original[key][int(original["block_table"][0, logical])]
-            case[key] = pool
-        case["block_table"] = torch.tensor([ids], device="cuda", dtype=torch.int32)
-        if layout == "vectorized":
-            case["k"], case["v"] = shuffle_kv_cache(case["k"], case["v"])
-        case["shuffled_kv_cache"] = layout == "vectorized"
-        cases[name] = case
-        candidates[name] = partial(ua.unified_attention, **case, backend="flydsl")
-    ret = measure(candidates, cases["reversed"], want, query_lens, kv_lens, atol=0.055)
+    case = dict(original, out=torch.empty_like(original["out"]))
+    ids = [pool_blocks - 1 - i for i in range(count)]
+    for key in ("k", "v"):
+        pool = torch.zeros(
+            pool_blocks, PAGE, HKV, D, device="cuda", dtype=original[key].dtype
+        )
+        for logical, pid in enumerate(ids):
+            pool[pid] = original[key][int(original["block_table"][0, logical])]
+        case[key] = pool
+    case["block_table"] = torch.tensor([ids], device="cuda", dtype=torch.int32)
+    if layout == "vectorized":
+        case["k"], case["v"] = shuffle_kv_cache(case["k"], case["v"])
+    case["shuffled_kv_cache"] = layout == "vectorized"
+    candidates = {"reversed": partial(ua.unified_attention, **case, backend="flydsl")}
+    ret = measure(candidates, case, want, query_lens, kv_lens, atol=0.055)
     return ret
 
 

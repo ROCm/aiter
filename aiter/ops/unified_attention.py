@@ -51,6 +51,15 @@ def unified_attention(
     The Triton/Gluon fallback supports causal attention only. Returns ``out``
     written in place; with ``skip_reduce`` the fallback may instead return
     unreduced segment buffers.
+
+    FlyDSL contract: q/k/v are float8_e4m3fn, out is bf16/f16, and the three
+    descales are float32 with one element (0-dim is widened to [1]). Q/out are
+    contiguous with equal row stride; the block table is int32 with stride-1
+    last dim; K/V use the exact linear or shuffled layout. AOT covers bf16 and
+    f16 prefill for the H64/Hkv4 shape; other shapes and decode JIT-compile.
+    Decode graph capture requires a warm workspace (first call must be
+    uncaptured), and each captured call records a planner refresh, so
+    sequence lengths may change between replays.
     """
     if backend is not None:
         backend = backend.lower()

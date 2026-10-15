@@ -109,9 +109,12 @@ Unified-attention AOT covers the prefill path. Decode kernels compile on first u
 | `ARCH` / `GPU_ARCHS` | Selects which jobs to build, not what arch a job compiles *for* (that comes from the CSV's `cu_num`). `conv.py` applies it inside `parse_csv`, so both `python -m` and the `setup.py` path (`run_aot`) honour it. `gemm.py` still filters in `main()` only, so `run_aot` builds all of its archs. | auto-detect |
 
 > **About the compile target arch.** The arch each kernel is actually compiled
-> for is derived per-job from the CSV's `cu_num` column (`cu_num_to_arch(...)`);
-> unified attention is the exception and hardcodes `gfx950` because it has no
-> CSV. The target is applied internally via `FLYDSL_GPU_ARCH`, overwriting the
+> for is derived per-job from the CSV's `cu_num` column (`cu_num_to_arch(...)`)
+> for CSV-backed families. Fixed-target families (`unified_attention` and
+> `fmha_fp8`) have no CSV and hardcode `gfx950`. Unified attention prebuilds the
+> H64/Hkv4 packed paged prefill for both bf16 and f16 outputs (16 jobs: causal x
+> out dtype x shuffled x rescale threshold); dense FMHA FP8 AOT is bf16-only, so
+> its f16 output is JIT-only. The target is applied internally via `FLYDSL_GPU_ARCH`, overwriting the
 > shell value for every job. Setting `ARCH` / `GPU_ARCHS` /
 > `FLYDSL_GPU_ARCH` therefore does **not** change what gets built. To
 > cross-compile a CSV-backed family, edit the `cu_num` column in the CSV.

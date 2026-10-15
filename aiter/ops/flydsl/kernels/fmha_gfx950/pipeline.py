@@ -1098,7 +1098,10 @@ class DualwaveFp8KernelContext:
         else:
             causal_end_raw_i32 = None
             max_num_tiles = num_kv_tiles
-        # Pipeline needs an EVEN tile count >= 4; extra tiles read 0 (num_records) and are masked.
+        # Pipeline needs an EVEN tile count >= 4; extra tiles are masked. Past the sequence end they read zero
+        # (num_records) or clamped pages; under causal masking the loop end can precede
+        # the physical KV end, so dead tiles may read finite payload from clamped pages
+        # that masking discards.
         if const_expr(traits.BODY_VARIANT == "default"):
             max_num_tiles = ((max_num_tiles + 1) // 2) * 2
             max_num_tiles = (max_num_tiles < 4).select(4, max_num_tiles)

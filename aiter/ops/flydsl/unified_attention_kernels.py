@@ -141,7 +141,9 @@ def _pa_decode_ok(max_seqlen_q, shuffled_kv_cache, out, num_seqs) -> bool:
 
 
 # Serving creates fresh tensor views; geometry and stream retain graph-owned
-# pointers without cross-stream scratch sharing. Never evict captured buffers.
+# pointers without cross-stream scratch sharing. Never evict captured buffers:
+# captured graphs keep these pointers, so entries live for the process and callers
+# sharing a key must serialize on one stream.
 _PA_DECODE_WORKSPACES = {}
 
 
@@ -160,7 +162,6 @@ def _route_pa_decode(
     *,
     num_kv_heads,
     num_seqs,
-    sinks=None,
 ):
     """All-decode call -> FlyDSL pa_decode with fp8 Q. seqused_k is already the
     per-sequence context length, so no cumulative-offset conversion is needed."""
@@ -178,12 +179,9 @@ def _route_pa_decode(
             num_seqs,
             num_kv_heads,
             np_,
-            budget,
             q.shape[1],
             q.shape[2],
             out.dtype,
-            1,
-            0,
         )
         workspace = _PA_DECODE_WORKSPACES.get(key)
         capturing = torch.cuda.is_current_stream_capturing()
@@ -232,7 +230,6 @@ def _route_pa_decode(
             exp_sums=workspace["exp_sums"],
             max_logits=workspace["max_logits"],
             temporary_output=workspace["temporary_output"],
-            sinks=sinks,
         )
     return out
 
@@ -642,7 +639,6 @@ def flydsl_unified_attention(
                 v_descale,
                 num_kv_heads=num_kv_heads,
                 num_seqs=num_seqs,
-                sinks=sinks,
             )
         # Linear-cache decode has no FlyDSL kernel.
         return None

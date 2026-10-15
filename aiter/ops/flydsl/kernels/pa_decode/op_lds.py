@@ -73,7 +73,8 @@ class PaDecodeLds:
 
 
 class PaDecodeQueryLoader:
-    """Load Q early and stage native BF16 or normalized FP8 MFMA operands."""
+    """Load Q early and stage MFMA operands: native BF16, FP8 quantized in-kernel
+    from f16/bf16, or externally quantized FP8 query that bypasses quantization."""
 
     def __init__(self, ctx, lds, gemm):
         self.ctx = ctx

@@ -401,8 +401,10 @@ def build_flash_attn_dualwave_swp_fp8_module(
             next_buf = fx.Int32(1) - buf
             # Publish the prefetched tile and release the slot all waves last read.
             rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+            # Keep the scheduler from moving LDS accesses across the barrier; the pinned FlyDSL exports no stable equivalent.
             rocdl.sched_barrier(0)
             fx.gpu.barrier()
+            # Same fence after the barrier; no stable sched_barrier equivalent in the pinned FlyDSL.
             rocdl.sched_barrier(0)
             pf = j + fx.Int64(1)
             if pf < t_end:

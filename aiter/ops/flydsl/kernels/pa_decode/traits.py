@@ -428,7 +428,7 @@ class PaDecodeTraits:
             "f16",
             "bf16",
             "fp8",
-        ), f"pa_decode_tile only supports query_dtype in ('f16', 'bf16'), got {query_dtype}"
+        ), f"pa_decode_tile only supports query_dtype in ('f16', 'bf16', 'fp8'), got {query_dtype}"
         FP8_QUERY = query_dtype == "fp8"
         Q_DTYPE = fx.BFloat16 if output_dtype == "bf16" else fx.Float16
         Q_INPUT_DTYPE = FP8 if FP8_QUERY else Q_DTYPE

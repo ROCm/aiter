@@ -87,6 +87,7 @@ class DualwaveFp8PageIdLoader(DualwaveFp8KernelContext):
 
     def end_page_ids(self, handles):
         rocdl.s_waitcnt(lgkmcnt=0)
+        # Page ids must be wave-uniform SGPRs for buffer descriptors; the pinned FlyDSL exports no stable readfirstlane.
         return [fx.Int64(fx.Int32(rocdl.readfirstlane(T.i32, h))) for h in handles]
 
 
