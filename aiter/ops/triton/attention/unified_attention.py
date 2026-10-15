@@ -159,11 +159,16 @@ def _gfx950_split_params(params: _UAParams):
 
 
 def _gfx950_split_grid(params: _UAParams):
-    """Decode, and batches too small to fill the GPU, take the split grid."""
+    """Decode, short sliding-window queries, and batches too small to fill the
+    GPU take the split grid."""
     if params.all_decode:
         return True
     if params.sliding_window > 0:
-        return False
+        return (
+            params.max_seqlen_q <= 8
+            and params.max_seqlen_k >= 512
+            and params.num_tokens <= 1024
+        )
     # unsplit, the 2d grid is faster
     config = get_unified_attention_config(
         "kv_split", _gfx950_split_params(params), backend="gluon"

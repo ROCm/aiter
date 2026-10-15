@@ -384,11 +384,13 @@ def ref_paged_attn(
         [(1, 8192)] * 32,
         [(1, 523), (1, 37), (1, 2011)],
         [(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)],
+        [(2, 8704), (7, 8704)],
+        [(8, 8704)] * 32,
     ],
 )
 @pytest.mark.parametrize("num_heads", [(64, 8), (8, 1)])
 @pytest.mark.parametrize("head_size", [64])
-@pytest.mark.parametrize("sliding_window", [None])
+@pytest.mark.parametrize("sliding_window", [None, 2048])
 @pytest.mark.parametrize(
     "q_dtype, kv_dtype, o_dtype, block_size, use_out_scale",
     [
