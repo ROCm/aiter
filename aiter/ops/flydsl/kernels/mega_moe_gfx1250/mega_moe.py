@@ -93,9 +93,14 @@ _S1F_M_WARP, _S1F_N_WARP, _S1F_NUM_BUFFERS = 1, 4, 3
 _S1F_GROUP_M = 8
 
 
+#: Placeholder reason for the one step that probes the GEMM1 configuration.
+_S1F_PROBING = "probing the GEMM1 configuration"
+
+
 def _s1f_fallback_warn(owner, reasons) -> None:
     """Warn once per instance that this configuration keeps the default path."""
-    if getattr(owner, "_s1f_warned", False):
+    reasons = [r for r in reasons if r != _S1F_PROBING]
+    if not reasons or getattr(owner, "_s1f_warned", False):
         return
     owner._s1f_warned = True
     import logging
@@ -1091,6 +1096,16 @@ class MegaMoEGfx1250:
             import dataclasses
 
             scatter = dataclasses.replace(scatter, stage1_gemm1=self._s1f_gemm1)
+        elif (
+            getattr(self, "_s1f", False)
+            and self._s1f_g1_seen.get(self._s1f_g1_key()) is None
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            # First step at this alignment: learn the real GEMM1 configuration
+            # while the default path runs, so the next step can decide.
+            import dataclasses
+
+            scatter = dataclasses.replace(scatter, stage1_gemm1=self._s1f_probe_gemm1)
         from aiter.ops.flydsl.grouped_moe_gfx1250 import (
             set_flydsl_dispatch_context,
         )
@@ -1166,47 +1181,84 @@ class MegaMoEGfx1250:
             "False",
         ):
             reasons.append("needs the fused GEMM1 requant epilogue")
+        self._s1f_other_ok = not reasons
         reasons += self._s1f_gemm1_reasons()
         if reasons:
             _s1f_fallback_warn(self, reasons)
             return False
         return True
 
+    def _s1f_step_will_run(self) -> bool:
+        """Whether the step whose geometry is current will run the stage-1 kernel.
+
+        Used to drop the tok_map rewrite from the plan that feeds it. Every
+        input is already fixed for that step: its alignment, its probed GEMM1
+        configuration, and the bias / activation half of the verdict, which a
+        model does not vary between layers. Anything unknown answers False, so
+        the plan keeps tok_map and the default dispatch stays possible.
+        """
+        if not (
+            getattr(self, "_s1f", False)
+            and getattr(self, "_s1f_enabled", True)
+            and getattr(self, "_s1f_other_ok", False)
+        ):
+            return False
+        seen = self._s1f_g1_seen.get(self._s1f_g1_key())
+        return (
+            seen is not None
+            and not seen
+            and not self._s1f_tile_reasons(self._compact_step_align_m)
+        )
+
+    def _s1f_tile_reasons(self, align_m: int) -> list:
+        """Why a step aligned to ``align_m`` cannot run the stage-1 kernel.
+
+        The stage-1 kernel embeds one GEMM1 tile, and the plan packs the
+        expert and the tile's rows in 8 bits each, so only that alignment
+        works. Keyed on align_m alone, so the plan (compiled per alignment,
+        sometimes ahead of the step) and the GEMM1 hook always agree on
+        whether a step is an S1F step.
+        """
+        reasons = []
+        if int(align_m) != _S1F_TILE_M:
+            reasons.append(f"step tile_m {align_m} != {_S1F_TILE_M}")
+        if int(self._config.experts_per_rank) > 255:
+            reasons.append(f"{self._config.experts_per_rank} experts per rank > 255")
+        return reasons
+
+    def _s1f_plan_mode(self, align_m: int) -> bool:
+        """Whether the plan for ``align_m`` emits the stage-1 kernel's inputs."""
+        return bool(getattr(self, "_s1f", False)) and not self._s1f_tile_reasons(
+            align_m
+        )
+
     def _s1f_gemm1_reasons(self) -> list:
         """Why this step's GEMM1 is not the one the stage-1 kernel embeds.
 
-        The stage-1 kernel inlines one GEMM1 configuration, so a tuned CSV row
-        (or an ``AITER_TDM_*`` override) naming a different tile has to keep the
-        separate dispatch + GEMM1 path. This runs before the dispatch is
-        skipped; the hook's own check is then only an assertion.
+        The stage-1 kernel inlines one GEMM1 configuration. What the grouped
+        GEMM resolves for a step (tuned CSV row, ``AITER_TDM_*`` overrides,
+        stage-2 fallbacks) is not reproducible from here, so it is observed
+        rather than predicted: the first step of each (alignment, recv bound)
+        runs the default path behind ``_s1f_probe_gemm1``, which records the
+        configuration that launch actually got. Deciding from a prediction let
+        the two drift, and the hook's assertion then fired with the dispatch
+        already skipped, which cannot be recovered.
         """
-        cached = getattr(self, "_s1f_g1_cache", None)
-        key = (int(self._compact_step_align_m), int(self._compact_step_recv_bound))
-        if cached is not None and cached[0] == key:
-            return list(cached[1])
-        reasons = []
-        if int(self._compact_step_align_m) != _S1F_TILE_M:
-            reasons.append(f"step tile_m {self._compact_step_align_m} != {_S1F_TILE_M}")
-        from aiter.ops.flydsl.grouped_moe_gfx1250 import (
-            _as_int,
-            _find_grouped_config,
-            _get_padded_m,
-        )
+        reasons = self._s1f_tile_reasons(self._compact_step_align_m)
+        seen = self._s1f_g1_seen.get(self._s1f_g1_key())
+        if seen is None:
+            # Not a fallback: this one step runs the default path so the probe
+            # can record what the GEMM1 launch resolves to. Kept out of the
+            # warning, which is for configurations that stay on that path.
+            return reasons + [_S1F_PROBING]
+        return reasons + list(seen)
 
-        config = self._config
-        row = _find_grouped_config(
-            token_num=_get_padded_m(int(self._compact_step_recv_bound)),
-            model_dim=config.hidden_dim,
-            inter_dim=int(self.inter_dim),
-            experts=config.experts_per_rank,
-            topk=-1,
-            activation=self.activation,
-            dtype=dtypes.bf16,
-            q_dtype_a=dtypes.fp4x2,
-            q_dtype_w=dtypes.fp4x2,
-            quant_type=QuantType.per_1x32,
-            ep_fused=True,
-        )
+    def _s1f_g1_key(self):
+        return (int(self._compact_step_align_m), int(self._compact_step_recv_bound))
+
+    @staticmethod
+    def _s1f_g1_mismatches(got: dict) -> tuple:
+        """How ``got`` differs from the GEMM1 the stage-1 kernel embeds."""
         want = {
             "tile_m": _S1F_TILE_M,
             "tile_n": _S1F_TILE_N,
@@ -1215,15 +1267,34 @@ class MegaMoEGfx1250:
             "n_warp": _S1F_N_WARP,
             "num_buffers": _S1F_NUM_BUFFERS,
         }
-        for field, embedded in want.items():
-            got = embedded if row is None else _as_int(row.get(field), embedded)
-            env = os.environ.get("AITER_TDM_" + field.upper())
-            if env not in (None, ""):
-                got = int(env)
-            if int(got or embedded) != embedded:
-                reasons.append(f"GEMM1 {field} {got} != {embedded}")
-        self._s1f_g1_cache = (key, tuple(reasons))
-        return reasons
+        return tuple(
+            f"GEMM1 {k} {got[k]} != {v}" for k, v in want.items() if got.get(k) != v
+        )
+
+    def _s1f_probe_gemm1(self, out, a, w, a_scales, w_scales, m_tile_map, **kw):
+        """Record this step's real GEMM1 configuration, then run it as usual."""
+        from aiter.ops.flydsl.grouped_gemm_mxfp4 import (
+            flydsl_grouped_gemm_a8w4_masked,
+        )
+
+        got = {
+            "tile_m": int(kw.get("tile_m", 64)),
+            "tile_n": int(kw.get("tile_n", 256)),
+            "tile_k": int(kw.get("tile_k", 256)),
+            "m_warp": int(kw.get("m_warp", 1)),
+            "n_warp": int(kw.get("n_warp", 4)),
+            "num_buffers": min(
+                int(kw.get("num_buffers", 3)),
+                max(1, int(kw.get("K", 1)) // int(kw.get("tile_k", 256))),
+            ),
+        }
+        mismatches = self._s1f_g1_mismatches(got)
+        self._s1f_g1_seen[self._s1f_g1_key()] = mismatches
+        if mismatches:
+            _s1f_fallback_warn(self, list(mismatches))
+        return flydsl_grouped_gemm_a8w4_masked(
+            out, a, w, a_scales, w_scales, m_tile_map, **kw
+        )
 
     def _s1f_launcher(
         self, *, producers, group_m, stage1_act, quant_wmma_rep, block_runs
@@ -1591,8 +1662,9 @@ class MegaMoEGfx1250:
             else int(token_count)
         )
         blocks = compact_plan_blocks(tok * int(self._config.topk))
-        write_tok_map = not getattr(self, "_s1f", False) or bool(tok_map)
-        key = (align_m, slot, waves, blocks, write_tok_map)
+        plan_s1f = self._s1f_plan_mode(align_m)
+        write_tok_map = not plan_s1f or bool(tok_map)
+        key = (align_m, slot, waves, blocks, write_tok_map, plan_s1f)
         launch = self._compact_plan_launches.get(key)
         if launch is None:
             if torch.cuda.is_current_stream_capturing():
@@ -1623,7 +1695,7 @@ class MegaMoEGfx1250:
                 plan_waves=None if waves == full_waves else waves,
                 plan_blocks=blocks,
                 # S1F: + run table, piece rows and per-tile source masks.
-                **({"s1f": True, "write_tok_map": write_tok_map} if self._s1f else {}),
+                **({"s1f": True, "write_tok_map": write_tok_map} if plan_s1f else {}),
             )
             self._compact_plan_launches[key] = launch
         return launch
@@ -1651,7 +1723,7 @@ class MegaMoEGfx1250:
         self._begin_compact_step(self._compact_recv_bound(tok, recv_token_bound))
         for slot in range(self._COMPACT_PLAN_SLOTS):
             self._compact_plan_for(self._compact_step_align_m, slot, tok)
-            if self._s1f:
+            if self._s1f_plan_mode(self._compact_step_align_m):
                 self._compact_plan_for(
                     self._compact_step_align_m, slot, tok, tok_map=False
                 )
@@ -1673,7 +1745,12 @@ class MegaMoEGfx1250:
         self._begin_compact_step(
             self._compact_recv_bound(token_count, recv_token_bound)
         )
-        self._launch_compact_plan_async(topk_ids, token_count, self._compact_slot)
+        self._launch_compact_plan_async(
+            topk_ids,
+            token_count,
+            self._compact_slot,
+            tok_map=not self._s1f_step_will_run(),
+        )
 
     def _prefetch_next_compact_plan(
         self,
@@ -1701,7 +1778,13 @@ class MegaMoEGfx1250:
             if self._overlap_plan_with_dispatch(live_tokens)
             else None
         )
-        self._launch_compact_plan_async(topk_ids, token_count, nxt, ready_event=ready)
+        self._launch_compact_plan_async(
+            topk_ids,
+            token_count,
+            nxt,
+            ready_event=ready,
+            tok_map=not self._s1f_step_will_run(),
+        )
         (
             self._compact_step_align_m,
             self._compact_step_rows,
@@ -1738,7 +1821,7 @@ class MegaMoEGfx1250:
                 self._config.rank,
                 token_count,
             )
-            if self._s1f:
+            if self._s1f_plan_mode(self._compact_step_align_m):
                 plan_args += (
                     bufs["send_list"].data_ptr(),
                     bufs["runs"].data_ptr(),
@@ -1867,6 +1950,9 @@ class MegaMoEGfx1250:
                 f"{_MAX_COMPACT_TILE_M} required_vmm_bytes() reserves for"
             )
         self._s1f = _read_s1f_mode()
+        # (align_m, recv bound) -> the GEMM1 mismatches _s1f_probe_gemm1 saw
+        # there; empty tuple means the step can run the stage-1 kernel.
+        self._s1f_g1_seen = {}
         if self._s1f:
             reasons = []
             if not self._compact_plan:
@@ -2056,7 +2142,7 @@ class MegaMoEGfx1250:
             # inside graph capture is not allowed.
             for slot in range(self._COMPACT_PLAN_SLOTS):
                 self._compact_plan_for(self._compact_tile_m, slot)
-                if self._s1f:
+                if self._s1f_plan_mode(self._compact_tile_m):
                     self._compact_plan_for(self._compact_tile_m, slot, tok_map=False)
         self._destination_peer_counter = torch.zeros(
             config.world_size, dtype=torch.int32, device=device

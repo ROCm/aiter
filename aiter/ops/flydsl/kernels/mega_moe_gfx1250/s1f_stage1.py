@@ -530,8 +530,10 @@ def make_s1f_stage1(
             f"block-id roles need producers={producers} and workers={workers} "
             f"to be multiples of {N_XCC}"
         )
-    if int(experts_per_rank) > 255 or int(tile_m) > 255:
-        raise ValueError("tile_info packs the expert and the rows in 8 bits each")
+    if int(experts_per_rank) > 255 or int(tile_m) > 0xFFFF:
+        raise ValueError(
+            "tile_info packs the expert in 8 bits and the tile's rows in 16"
+        )
     epr = int(experts_per_rank)
     run_hdr = compact_run_header_dwords(npes=npes, experts_per_rank=epr)
     run_cap = compact_run_capacity(max_routes=max_routes)
@@ -1746,7 +1748,7 @@ def make_s1f_stage1(
                 set_holders(
                     (
                         (tinfo >> fx.Int32(8)) & fx.Int32(0xFF),
-                        (tinfo >> fx.Int32(16)) & fx.Int32(0xFF),
+                        (tinfo >> fx.Int32(16)) & fx.Int32(0xFFFF),
                     ),
                     a_ready,
                     {

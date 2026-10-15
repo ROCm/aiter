@@ -341,8 +341,10 @@ def compile_tdm_compact_plan(
         kernel_name += f"_w{plan_waves}"
     s1f = bool(s1f)
     emit_runs = bool(emit_runs) or s1f
-    if s1f and (epr > 255 or tile_m > 255):
-        raise ValueError("tile_info packs the expert and the rows in 8 bits each")
+    if s1f and (epr > 255 or tile_m > 0xFFFF):
+        raise ValueError(
+            "tile_info packs the expert in 8 bits and the tile's rows in 16"
+        )
     run_rows = int(run_rows)
     if emit_runs:
         kernel_name += "_s1f" if s1f else "_runs"
