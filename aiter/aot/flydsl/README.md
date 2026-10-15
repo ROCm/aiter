@@ -7,14 +7,78 @@ the JIT path hits the cache instead of compiling again.
 
 | Module | OpKind | Description |
 | --- | --- | --- |
-| `moe.py` | `MOE` | MoE / Mixed-MoE kernels (stage1 + stage2) |
+| `moe.py` | `MOE` | Every FlyDSL kernel the tuned fused-MoE / FHMoE / gfx1250 grouped rows reach, by replaying `fused_moe` itself (see below) |
 | `gemm.py` | `GEMM` | GEMM kernels |
 | `conv.py` | `CONV` | conv3d implicit-GEMM kernels, plus the NCDHW->NDHWC pre-transpose each NCDHW caller reaches first |
-| `grouped_moe.py` | `GROUPED_MOE` | gfx1250 grouped MoE GEMM kernels |
 | `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
-| `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 profile bundles for MTPR 8192/16384/32768 |
+| `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 and A4W4 bundles of every deployment profile, by preloading `MegaMoEV2` itself (see below) |
 | `fmha_fp8.py` | `FMHA_FP8` | gfx950 FP8 flash-attention forward, per head shape in `DEFAULT_SHAPES` |
+| `mxfp4_moe.py` | — | Not part of the AOT build; the MXFP4 tuner's `--fast-scan` precompiles its candidates with it |
 | `common.py` | — | Shared job collection, the deadlock-free fork pool, and cache-hit checking logic |
+| `dry_run.py` | — | Runs aiter's real host code on CPU (FakeTensors, `COMPILE_ONLY=1`, GPU runtime forbidden) |
+
+### How `moe.py` works
+
+`moe.py` does not restate any MoE launch logic. For every tuned row it builds
+what a caller passes `fused_moe` (bf16 activations, routing, and weights
+quantized and preshuffled the way `op_tests/test_moe_2stage.py` prepares them)
+as FakeTensors and calls the runtime's own implementation (`_fused_moe_impl`,
+or `_fhmoe_impl` for shared-expert rows) inside `dry_run`. The runtime looks the
+row up, picks and parameterizes its kernels, sizes its buffers and launches its
+auxiliary kernels as at inference; every FlyDSL launch on that path is
+compiled into the cache instead of run. Kernel or wrapper changes therefore
+need no AOT change.
+
+- Each row is replayed at its tuned token count and at the smallest M that
+  `get_padded_M` maps to it, because some compile-time parameters follow the
+  actual M. Where the two request different FlyDSL kernels, the replay bisects
+  the M between them down to every M at which the runtime switches kernels,
+  since a row can switch more than once in its bucket (e.g. the gfx1250
+  stage-1 quant's K split). These extra replays are reported as `[BISECT]`.
+  `--row-tokens-only` replays the tuned count only.
+- Caller-side choices a row does not fix are enumerated: expert bias where the
+  quant family supports it (on both stages, and on stage 1 alone, since a
+  stage-2 bias makes the runtime re-select configs whose stage 2 cannot take
+  one), both gate/up layouts for MXMOE stage-1 rows, the default and model
+  SiTUv2 betas, and a received token count (`num_local_tokens`, as callers
+  behind an EP dispatch pass). Combinations the runtime rejects are reported
+  as `[SKIP]`.
+- Rows of the gfx1250 grouped table replay with the gate/up-interleaved
+  weights and n32k4 scales gfx1250 callers pass; `_fused_moe_impl` hands them
+  to FlyDSL's grouped GEMM. Grouped rows tuned for EP only (`topk` -1, or
+  `ep_fused`) are skipped: the runtime picks them only under a caller's expert
+  mask or MegaMoE's stage-2 scatter, and the table records neither the global
+  expert count nor the real topk.
+- aiter fixes some arch-dependent values at import, so the replay runs in one
+  process per target arch with the GPUs hidden and `GPU_ARCHS` set before
+  aiter is imported. `python -m aiter.aot.flydsl.moe` starts those processes
+  side by side and splits `AITER_FLYDSL_AOT_WORKERS` between them by job count.
+  It builds aiter's C++ core module once beforehand, for the arch with the most
+  jobs: the module has no device code, and not every toolchain builds every
+  arch (ROCm 7.2 cannot build the cluster launch gfx1250 builds turn on).
+- A worker replays up to 12 jobs of one row in turn, so the kernels they share
+  compile once. `AITER_FLYDSL_AOT_TIMEOUT` applies to the worker's whole batch.
+- `--check` compiles nothing and fails on any kernel the replay would need but
+  the cache lacks; it is the CPU-side counterpart of the step-2 test below.
+
+### How `mega_moe.py` works
+
+`mega_moe.py` does not restate MegaMoE's kernel selection either. For each rank
+of each deployment profile it builds the runtime's own `MegaMoEV2` inside
+`dry_run`, with FakeTensor expert weights, and calls `preload_aot_bundles()`:
+the method serving uses to load every Stage1/prepare, Stage2 and combine
+variant of the profile's bundle plan.
+
+- mori shmem, through which `MegaMoEV2` allocates its symmetric buffers and
+  exchanges peer pointers, hands out FakeTensors and fake addresses, so no GPU,
+  process group or mori install is needed.
+- The device reports itself as an MI355X, because the combine launch geometry
+  is tuned per GPU model.
+- `quantize()` is replayed too: `preload_aot_bundles()` leaves it out, but
+  fixed-slot `forward` and the per-stage benchmarks call it.
+- Like the MoE replay, it runs in a process of its own, with the GPUs hidden
+  and `GPU_ARCHS=gfx950` set before aiter is imported; both
+  `python -m aiter.aot.flydsl.mega_moe` and `setup.py` start it that way.
 
 ---
 
@@ -48,9 +112,6 @@ python -m aiter.aot.flydsl.gemm
 # conv3d
 python -m aiter.aot.flydsl.conv
 
-# grouped MoE (gfx1250)
-python -m aiter.aot.flydsl.grouped_moe
-
 # chunk-gdn-h
 python -m aiter.aot.flydsl.chunk_gdn_h
 
@@ -75,9 +136,10 @@ python -m aiter.aot.flydsl.fmha_fp8
 python -m aiter.aot.flydsl.fmha_fp8 --shape 12:12:192:128
 ```
 
-MegaMoE defaults to all three DeepSeek-V4-Pro deployment profiles: r0/r32/r64
-(`experts_per_rank=48/52/56`). The expert count is part of the compiled ABI, so
-one profile cannot safely reuse another profile's bundle.
+MegaMoE defaults to every profile the service ships: DeepSeek-V4-Pro r0/r32/r64
+(`experts_per_rank=48/52/56`) and Kimi-K3 (`experts_per_rank=112`). The expert
+count is part of the compiled ABI, so one profile cannot safely reuse another
+profile's bundle.
 
 ### Common arguments
 
@@ -85,6 +147,9 @@ one profile cannot safely reuse another profile's bundle.
 # Custom CSV(s) — every module supports --csv and accepts multiple paths
 python -m aiter.aot.flydsl.moe --csv /path/to/config1.csv /path/to/config2.csv
 python -m aiter.aot.flydsl.chunk_gdn_h --csv /path/to/tuned.csv
+
+# MoE: verify an existing cache on CPU instead of compiling
+python -m aiter.aot.flydsl.moe --csv /path/to/config.csv --check
 ```
 
 ### Environment variables
@@ -105,7 +170,9 @@ python -m aiter.aot.flydsl.chunk_gdn_h --csv /path/to/tuned.csv
 > and applied internally via `FLYDSL_GPU_ARCH`. That internal var is overwritten
 > for every job, so setting `ARCH` / `GPU_ARCHS` / `FLYDSL_GPU_ARCH` in your shell
 > does **not** change what gets built. To cross-compile, edit the `cu_num`
-> column in the CSV.
+> column in the CSV. `moe.py` and `mega_moe.py` additionally run each target
+> arch in its own process with `GPU_ARCHS` pinned and the GPUs hidden, so they
+> build the same kernels on a machine with or without GPUs.
 
 Example:
 

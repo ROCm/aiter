@@ -9,6 +9,17 @@ from packaging import version
 from packaging.version import Version
 
 aiter_lib = None
+_host_scalar_ops_real = False
+
+
+def run_host_scalar_ops_for_real(enabled: bool) -> bool:
+    """Make scalar-returning custom ops run their implementation instead of
+    dispatching, so they still answer under FakeTensorMode, whose fakes carry no
+    value. Returns the previous setting."""
+    global _host_scalar_ops_real
+    previous = _host_scalar_ops_real
+    _host_scalar_ops_real = enabled
+    return previous
 
 
 def is_torch_equal_or_newer(target: str) -> bool:
@@ -298,6 +309,14 @@ def torch_compile_guard(
                 )
             )
             return result[1] if return_non_tensor else result
+
+        if return_non_tensor:
+            dispatch_custom = wrapper_custom
+
+            def wrapper_custom(*args, **kwargs):
+                if _host_scalar_ops_real:
+                    return func(*args, **kwargs)
+                return dispatch_custom(*args, **kwargs)
 
         if hasattr(torch.ops.aiter, loadName):
             return wrapper_custom
