@@ -47,6 +47,16 @@ def _get_platform_dtypes():
         return "torch.float8_e4m3fnuz", "QuantType.per_Token"
 
 
+def _is_gfx942():
+    """True on gfx942 (MI300X / MI325X), the only target of gfx942-only tuners."""
+    try:
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
+        return get_gfx_runtime() == "gfx942"
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _write_csv(path, header, rows):
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
@@ -366,6 +376,15 @@ class TestTunePipeline(unittest.TestCase):
                 "keys": ["M", "N", "K"],
                 "timeout": 300,
             },
+            "a16w8_mxfp8_asm": {
+                # gfx942 only. The tuner writes a row only where the kernel
+                # beats BF16; at this shape it does by a wide margin.
+                "script": "csrc/gemm_a16w8_mxfp8/gemm_a16w8_mxfp8_tune.py",
+                "header": ["M", "N", "K"],
+                "shapes": [(1, 5120, 576)],
+                "keys": ["gfx", "cu_num", "M", "N", "K", "kernelName", "splitK"],
+                "timeout": 900,
+            },
             "csrc_bf16": {
                 "script": "csrc/gemm_a16w16/gemm_a16w16_tune.py",
                 "header": [
@@ -601,6 +620,14 @@ class TestTunePipeline(unittest.TestCase):
 
     def test_a4w6_asm_mp_default(self):
         self._run_one("a4w6_asm", mp=None)
+
+    @unittest.skipUnless(_is_gfx942(), "A16W8 MXFP8 tuner is gfx942-only")
+    def test_a16w8_mxfp8_asm_mp1(self):
+        self._run_one("a16w8_mxfp8_asm", mp=1)
+
+    @unittest.skipUnless(_is_gfx942(), "A16W8 MXFP8 tuner is gfx942-only")
+    def test_a16w8_mxfp8_asm_mp_default(self):
+        self._run_one("a16w8_mxfp8_asm", mp=None)
 
     def test_csrc_bf16_mp1(self):
         self._run_one("csrc_bf16", mp=1)
