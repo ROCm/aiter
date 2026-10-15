@@ -200,6 +200,13 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         AITER_CHECK(cfg.pack_layout == kPackLayout,
                     __func__,
                     " unsupported a6w6 packed layout " + cfg.pack_layout);
+        if(cfg.exact_K > 0)
+        {
+            AITER_CHECK(Mdim == cfg.exact_M && Ndim == cfg.exact_N && Kdim == cfg.exact_K,
+                        __func__,
+                        " kernel " + cfg.knl_name +
+                            " does not support the requested physical shape");
+        }
         if(cfg.swizzle_max_K > 0 && Kdim <= cfg.swizzle_max_K)
         {
             AITER_CHECK(Mdim <= cfg.swizzle_max_M,

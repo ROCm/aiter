@@ -636,7 +636,8 @@ namespace py = pybind11;
           py::arg("reg_bytes"),                                                      \
           py::arg("use_1stage"),                                                     \
           py::arg("bf16_out_ptr")    = static_cast<int64_t>(0),                      \
-          py::arg("transpose_scale") = false);                                       \
+          py::arg("transpose_scale") = false,                                        \
+          py::arg("gemma_norm")      = false);                                       \
     m.def("fused_allreduce_rmsnorm_mxfp4_quant",                                     \
           &aiter::fused_allreduce_rmsnorm_mxfp4_quant,                               \
           py::arg("_fa"),                                                            \
@@ -746,16 +747,16 @@ namespace py = pybind11;
           py::arg("kernelName")  = std::nullopt, \
           py::arg("bpreshuffle") = false);
 
-#define GEMM_A4W4_BLOCKSCALE_PYBIND  \
-    m.def("gemm_a4w4_blockscale",    \
-          &gemm_a4w4_blockscale,     \
-          "fp4 blockscale gemm",     \
-          py::arg("XQ"),             \
-          py::arg("WQ"),             \
-          py::arg("x_scale"),        \
-          py::arg("w_scale"),        \
-          py::arg("Out"),            \
-          py::arg("splitK")     = 0, \
+#define GEMM_A4W4_BLOCKSCALE_PYBIND                 \
+    m.def("gemm_a4w4_blockscale",                   \
+          &aiter::torch_itfs::gemm_a4w4_blockscale, \
+          "fp4 blockscale gemm",                    \
+          py::arg("XQ"),                            \
+          py::arg("WQ"),                            \
+          py::arg("x_scale"),                       \
+          py::arg("w_scale"),                       \
+          py::arg("Out"),                           \
+          py::arg("splitK")     = 0,                \
           py::arg("kernelName") = "");
 
 #define GEMM_A8W8_BLOCKSCALE_PYBIND  \
@@ -856,16 +857,16 @@ namespace py = pybind11;
           py::arg("splitK")      = 0,                       \
           py::arg("preshuffleB") = true);
 
-#define GEMM_A4W4_BLOCKSCALE_TUNE_PYBIND \
-    m.def("gemm_a4w4_blockscale_tune",   \
-          &gemm_a4w4_blockscale_tune,    \
-          "gemm_a4w4_blockscale_tune",   \
-          py::arg("XQ"),                 \
-          py::arg("WQ"),                 \
-          py::arg("x_scale"),            \
-          py::arg("w_scale"),            \
-          py::arg("Out"),                \
-          py::arg("kernelId") = 0,       \
+#define GEMM_A4W4_BLOCKSCALE_TUNE_PYBIND                 \
+    m.def("gemm_a4w4_blockscale_tune",                   \
+          &aiter::torch_itfs::gemm_a4w4_blockscale_tune, \
+          "gemm_a4w4_blockscale_tune",                   \
+          py::arg("XQ"),                                 \
+          py::arg("WQ"),                                 \
+          py::arg("x_scale"),                            \
+          py::arg("w_scale"),                            \
+          py::arg("Out"),                                \
+          py::arg("kernelId") = 0,                       \
           py::arg("splitK")   = 0);
 
 #define GEMM_A8W8_PYBIND                    \
@@ -1444,6 +1445,7 @@ namespace py = pybind11;
           py::arg("need_renorm"),                            \
           py::arg("routed_scaling_factor") = 1.0,            \
           py::arg("score_func")            = "sqrtsoftplus", \
+          py::arg("num_shared_experts")    = 0,              \
           "Fused topk gating: score_func='sqrtsoftplus'|'sigmoid'|'softmax'.");
 
 #define MOE_TOPK_CK_PYBIND          \
@@ -1476,7 +1478,8 @@ namespace py = pybind11;
           py::arg("tokens"),                           \
           py::arg("num_experts"),                      \
           py::arg("topk"),                             \
-          py::arg("dispatch_policy") = 0);             \
+          py::arg("dispatch_policy") = 0,              \
+          py::arg("device_id")       = -1);            \
     m.def("moe_sorting_opus_fwd",                      \
           &moe_sorting_opus_fwd,                       \
           py::arg("topk_ids"),                         \
@@ -1494,7 +1497,20 @@ namespace py = pybind11;
           py::arg("dispatch_policy")   = 0,            \
           py::arg("local_topk_ids")    = std::nullopt, \
           py::arg("m_indices")         = std::nullopt, \
-          py::arg("reverse_sorted")    = std::nullopt);
+          py::arg("reverse_sorted")    = std::nullopt); \
+    m.def("mxfp4_moe_sort_quant_fwd",                  \
+          &mxfp4_moe_sort_quant_fwd,                   \
+          py::arg("hidden_states"),                    \
+          py::arg("topk_ids"),                         \
+          py::arg("topk_weights"),                     \
+          py::arg("sorted_token_ids"),                 \
+          py::arg("sorted_weights"),                   \
+          py::arg("sorted_expert_ids"),                \
+          py::arg("num_valid_ids"),                    \
+          py::arg("moe_buf"),                          \
+          py::arg("activation_quant"),                 \
+          py::arg("activation_scale_token"),           \
+          py::arg("num_experts"));
 
 #define MLA_V4_PREFILL_OPUS_PYBIND                  \
     m.def("pa_sparse_prefill_gfx950_opus_fwd",      \
@@ -1509,6 +1525,22 @@ namespace py = pybind11;
           py::arg("attn_sink"),                     \
           py::arg("out"),                           \
           py::arg("softmax_scale"));                \
+    m.def("pa_sparse_prefill_gfx950_opus_split_fwd", \
+          &opus_mla_v4_prefill_a16w16_gfx950_split_fwd, \
+          py::arg("q"),                             \
+          py::arg("unified_kv"),                    \
+          py::arg("kv_indices_prefix"),             \
+          py::arg("kv_indptr_prefix"),              \
+          py::arg("kv"),                            \
+          py::arg("kv_indices_extend"),             \
+          py::arg("kv_indptr_extend"),              \
+          py::arg("attn_sink"),                     \
+          py::arg("partial_o"),                     \
+          py::arg("partial_max"),                   \
+          py::arg("partial_sum"),                   \
+          py::arg("out"),                           \
+          py::arg("softmax_scale"),                 \
+          py::arg("num_splits"));                   \
     m.def("pa_sparse_prefill_gfx1250_opus_fwd",     \
           &opus_mla_v4_prefill_a16w16_gfx1250_fwd,  \
           py::arg("q"),                             \
@@ -2121,7 +2153,9 @@ namespace py = pybind11;
           py::arg("block_size"),                                       \
           py::arg("x"),                                                \
           py::arg("rotary_dim") = 0,                                   \
-          py::arg("v_norm")     = false);                              \
+          py::arg("v_norm")     = false,                              \
+          py::arg("q_out_fp8")  = py::none(),                          \
+          py::arg("per_tensor_q_scale") = py::none());                 \
     m.def("fused_qk_norm_rope_cache_block_quant_shuffle",              \
           &aiter::fused_qk_norm_rope_cache_block_quant_shuffle,        \
           py::arg("qkv"),                                              \
@@ -2562,6 +2596,7 @@ namespace py = pybind11;
           py::arg("z"),                                    \
           py::arg("weight"),                               \
           py::arg("epsilon"),                              \
+          py::arg("use_sigmoid") = false,                  \
           "Fused Gated RMSNorm + FP8 Per-Token Quantization");
 
 #define MHC_PYBIND                                \
