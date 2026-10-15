@@ -56,10 +56,8 @@ def _make_paged_scenario(
 @pytest.mark.parametrize("start", [15, 2047, 2063])
 def test_qsa_verification_is_causal_and_matches_individual_queries(k, start):
     """Future draft keys must not enter an earlier query's selected context."""
-    from aiter.ops.triton.attention.qsa import (
-        qsa_select_paged_tokens,
-        qsa_sparse_paged_gqa,
-    )
+    from aiter.ops.qsa import qsa_select_paged_tokens
+    from aiter.ops.triton.attention.qsa import qsa_sparse_paged_gqa
 
     torch.manual_seed(93)
     block, ratio, budget = 16, 4, 2048

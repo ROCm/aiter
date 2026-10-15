@@ -18,10 +18,8 @@ import argparse
 import torch
 import triton
 
-from aiter.ops.triton.attention.qsa import (
-    qsa_select_paged_tokens,
-    qsa_sparse_paged_gqa,
-)
+from aiter.ops.qsa import qsa_select_paged_tokens
+from aiter.ops.triton.attention.qsa import qsa_sparse_paged_gqa
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
 torch.set_default_device("cuda")
