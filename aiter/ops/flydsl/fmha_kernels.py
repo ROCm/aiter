@@ -254,6 +254,7 @@ def _fp8_gfx950_reject_reason(
 
     from .kernels.flash_attn_func_fp8_gfx950 import (
         _fp8_config_reason,
+        _fp8_flat_elems_reason,
         _is_valid_softmax_scale,
         flydsl_flash_attn_fp8_supported,
     )
@@ -325,7 +326,8 @@ def _fp8_gfx950_reject_reason(
         return "block_table is not supported"
     if return_attn_probs:
         return "return_attn_probs is not supported"
-    return None
+    # The kernel would raise past the int32 flat dim; decline so CK can serve it.
+    return _fp8_flat_elems_reason(q, k, v, packed=bool(cu_seqlens) or q.dim() != 4)
 
 
 def _fp8_gfx950_supported(q, k, v, **kwargs) -> bool:

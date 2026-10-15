@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from aiter.ops.flydsl import flydsl_flash_attn_func
+from aiter.test_common import checkAllclose
 
 
 def _arch() -> str:
@@ -361,6 +362,25 @@ def _fp8_rel_err(got, ref, floor=0.0):
     scale = max(ref.abs().max().item(), floor)
     err = (got - ref).abs().max().item()
     return (err / scale if scale > 0 else err), err, scale
+
+
+# Per-element fp8 tolerance against the fp32 reference. On gfx950 the public
+# varlen descale cases mismatch at most 0.7% of elements at 0.05 (median 0.5%),
+# so 2% leaves headroom while still catching a wrong subset of small outputs.
+_FP8_ELEM_TOL = 0.05
+_FP8_MAX_MISMATCH = 0.02
+
+
+def _assert_fp8_close(got, ref, msg):
+    ratio = checkAllclose(
+        ref.float(),
+        got.float(),
+        rtol=_FP8_ELEM_TOL,
+        atol=_FP8_ELEM_TOL,
+        tol_err_ratio=_FP8_MAX_MISMATCH,
+        msg=msg,
+    )
+    assert ratio <= _FP8_MAX_MISMATCH, f"{msg}: {ratio:.2%} of elements mismatch"
 
 
 _FP8_HEADS = 12
@@ -1945,8 +1965,7 @@ def test_fp8_public_varlen_descale_routes_to_flydsl():
         _fp8_dequant(v, vs)[None],
         causal=True,
     )[0]
-    rel, err, _ = _fp8_rel_err(out.float(), ref)
-    assert rel < 0.05, f"rel err {rel:.4f} (abs {err:.4f})"
+    _assert_fp8_close(out, ref, "public varlen descale")
 
 
 @_gfx950_only
@@ -1971,6 +1990,70 @@ def test_fp8_public_varlen_descale_rejects_unsupported():
             k_descale=ks,
             v_descale=vs,
         )
+
+
+@_gfx950_only
+@pytest.mark.parametrize("layout", ["varlen", "dense"])
+def test_fp8_gate_rejects_flat_dim_overflow(monkeypatch, layout):
+    """The gate declines exactly what the kernel's int32 flat-dim guard rejects.
+
+    Packed varlen has no batch to split; dense launches once per entry, so only
+    one entry has to fit. The bound is lowered rather than allocating 2**31.
+    """
+    from aiter.ops.flydsl import fmha_kernels
+    from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
+
+    (q, k, v), (qs, ks, vs), cu = _fp8_public_varlen_inputs()
+    kw = {
+        "softmax_scale": None,
+        "dropout_p": 0.0,
+        "window_size": (-1, -1),
+        "bias": None,
+        "alibi_slopes": None,
+        "sink": None,
+        "return_attn_probs": False,
+        "block_table": None,
+        "out": None,
+        "q_descale": qs,
+        "k_descale": ks,
+        "v_descale": vs,
+    }
+    if layout == "varlen":
+        kw["cu_seqlens"] = (cu, cu)
+        fits = q.numel()
+    else:
+        q, k, v = (t.view(2, t.shape[0] // 2, *t.shape[1:]) for t in (q, k, v))
+        fits = q.numel() // 2
+
+    monkeypatch.setattr(fa, "_FP8_MAX_FLAT_ELEMS", fits + 1)
+    assert fmha_kernels._fp8_gfx950_reject_reason(q, k, v, **kw) is None
+    monkeypatch.setattr(fa, "_FP8_MAX_FLAT_ELEMS", fits)
+    reason = fmha_kernels._fp8_gfx950_reject_reason(q, k, v, **kw)
+    assert reason is not None and "int32" in reason
+
+
+@_gfx950_only
+def test_fp8_public_varlen_descale_overflow_falls_back_to_ck(monkeypatch):
+    """A descaled varlen call past the fp8 flat-dim bound reaches CK, not a raise."""
+    from aiter import flash_attn_varlen_func
+    from aiter.ops import mha as mha_module
+    from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
+
+    class _CkStub:
+        @staticmethod
+        def apply(*args):
+            return "ck"
+
+    monkeypatch.setattr(mha_module, "ENABLE_CK", True)
+    monkeypatch.setattr(mha_module, "FlashAttnVarlenFunc", _CkStub)
+    (q, k, v), (qs, ks, vs), cu = _fp8_public_varlen_inputs(head_dim=192)
+    v = v[..., :128].contiguous()
+    monkeypatch.setattr(fa, "_FP8_MAX_FLAT_ELEMS", q.numel())
+    L = q.shape[0]
+    out = flash_attn_varlen_func(
+        q, k, v, cu, cu, L, L, causal=True, q_descale=qs, k_descale=ks, v_descale=vs
+    )
+    assert out == "ck"
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -2118,9 +2201,11 @@ def test_public_varlen_descale_route_skips_flydsl_for_ck_only_features(
         assert flash_attn_varlen_func(q, k, v, cu, cu, L, L, **kwargs) == "ck"
         assert calls == ["ck"]
     else:
-        with pytest.raises(RuntimeError, match="requires ENABLE_CK=1"):
+        with pytest.raises(RuntimeError, match="requires ENABLE_CK=1") as exc:
             flash_attn_varlen_func(q, k, v, cu, cu, L, L, **kwargs)
         assert calls == []
+        # The per-tensor fp8 entry drops soft-cap and padded cu_seqlens too.
+        assert "pertensor" not in str(exc.value)
 
 
 _needs_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -2377,16 +2462,17 @@ def test_fp8_varlen_equal_max_differing_lengths(
     torch.cuda.synchronize()
     assert torch.equal(out, cross), "CROSS_SEQLEN=False differs from the cross build"
 
-    refs = []
+    assert torch.isfinite(out.float()).all()
     for b, (n_q, n_kv) in enumerate(zip(vl_q, vl_kv)):
-        if n_kv == 0:
-            refs.append(torch.zeros(n_q, H, 128, device="cuda"))
+        o_b = out[cuq[b] : cuq[b + 1]].float()
+        # Rows that see no key: all of an empty-KV entry, and under bottom-right
+        # causal the first n_q - n_kv rows. The kernel must write exact zeros.
+        n_masked = n_q if n_kv == 0 else (max(n_q - n_kv, 0) if causal else 0)
+        assert (o_b[:n_masked] == 0).all(), f"entry {b}: masked rows are not zero"
+        if n_masked == n_q:
             continue
         qb = _fp8_dequant(q[cuq[b] : cuq[b + 1]], qs)[None]
         kb = _fp8_dequant(k[cukv[b] : cukv[b + 1]], ks)[None]
         vb = _fp8_dequant(v[cukv[b] : cukv[b + 1]], vs)[None]
-        refs.append(_ref_attention(qb, kb, vb, causal)[0])
-    ref = torch.cat(refs)
-    assert not torch.isnan(out.float()).any()
-    rel, err, _ = _fp8_rel_err(out.float(), ref)
-    assert rel < 0.05, f"rel err {rel:.4f} (abs {err:.4f})"
+        ref_b = _ref_attention(qb, kb, vb, causal)[0]
+        _assert_fp8_close(o_b[n_masked:], ref_b[n_masked:], f"entry {b}")

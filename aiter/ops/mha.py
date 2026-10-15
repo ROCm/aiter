@@ -3977,8 +3977,7 @@ def flash_attn_varlen_func(
         raise RuntimeError(
             "prequantized FP8 attention with descales requires ENABLE_CK=1 when "
             "the FlyDSL FP8 path cannot serve the call "
-            f"({descale_reject_reason()}). Use flash_attn_varlen_fp8_pertensor_func "
-            "for per-tensor FP8 attention with these options."
+            f"({descale_reject_reason()})"
         )
 
     if not ENABLE_CK:
