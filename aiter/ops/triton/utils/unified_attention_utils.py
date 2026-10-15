@@ -25,23 +25,13 @@ that exists: LEQ bounds ascending, then GEQ descending, then "any". So the
 leftmost axis wins: D before Q is what makes head_size outrank max_seqlen_q.
 Dtypes fall back too: DT_fp8_fp8, then DT_fp8_any, DT_any_fp8, then "any".
 
-Because the leftmost axis wins outright, D_GEQ_256 beats Q_GEQ_256 at head_size
-256 despite saying less. An entry narrowing a rightward axis has to be repeated
-at every bound of a leftward one, which is why some keys differ only in that.
-
-LEQ bounds nest, so a range is a pair of them: D_LEQ_128 claims head_size <= 128
-first, leaving D_LEQ_256 with 129-256. Adding a D_LEQ_256 entry therefore needs
-a D_LEQ_128 one beside it, holding what those smaller sizes resolved to before.
-
 A section with no axes, like reduce above, is just a config.
 
 Tile size and number of splits (segments) are derived from the following parameters:
 TILE_SIZE_MIN/MAX, and MIN_SEGMENTS/MAX_SEGMENTS/SEGMENTS_PER_CU, plus MFMA_DIM
 and the SPLIT_MIN_* floors; see compute_segment_params.
 
-An "<op>.OPT_IN" section holds entries that exist only when the user opts in
-(_load); a LARGE_KV block inside one applies only above a KV cache size
-(_resolve_large_kv).
+An "<op>.OPT_IN" section is merged in only when AITER_TRITON_UA_FAST_PATH=1.
 """
 
 import copy
@@ -166,28 +156,20 @@ def _lookup(table: dict, axes: tuple, values: dict) -> tuple:
     )
 
 
-# Opt-in section suffix, and the env var that admits it. Unset, the table loads
-# exactly as written. These configs trade occupancy for registers and are tuned
-# against one shape family, so whether that suits a deployment is its own call.
 _OPT_IN = ".OPT_IN"
-
 _USE_OPT_IN = os.environ.get("AITER_TRITON_UA_FAST_PATH", "") == "1"
-
 _LARGE_KV = "LARGE_KV"
 
-# Below this the backend indexes the cache with 32-bit buffer ops, and against
-# that different code the LARGE_KV overrides invert: gfx950 d=256 prefill runs
-# 6.2 -> 4.7ms above the limit, 5.2 -> 14.9ms below. The crossover is exact.
+# Smaller caches are indexed with 32-bit buffer ops, where LARGE_KV is ~3x slower.
 _BUFFER_OP_LIMIT = 2**31
 
-# Compiler options only newer Triton takes, so a LARGE_KV block naming one is
-# skipped where the backend has no such option.
+# Compiler options older Triton versions don't accept.
 _OPTIONAL_COMPILER_OPTIONS = frozenset(("llvm_fn_attrs", "schedule_hint"))
 
 
 @functools.lru_cache(maxsize=1)
 def _compiler_option_names() -> frozenset:
-    """Compiler options the installed Triton takes as launch kwargs, if askable."""
+    """Compiler options the installed Triton accepts; empty if it can't be asked."""
     try:
         from triton.compiler.compiler import make_backend
         from triton.runtime.driver import driver
@@ -195,18 +177,11 @@ def _compiler_option_names() -> frozenset:
         backend = make_backend(driver.active.get_current_target())
         return frozenset(f.name for f in dataclasses.fields(backend.parse_options({})))
     except (ImportError, AttributeError, TypeError, RuntimeError):
-        # older Triton, unfamiliar backend, or no GPU: decline rather than risk
-        # a launch the backend rejects
         return frozenset()
 
 
 def _resolve_large_kv(config: dict, params) -> dict:
-    """Apply an entry's LARGE_KV overrides, if the cache is large enough for them.
-
-    They lose about threefold below _BUFFER_OP_LIMIT, and cost bf16 sixfold at
-    any size, so only DT_fp8_fp8 entries carry them. Counting elements rather
-    than bytes leaves a borderline cache on the safe side of the limit.
-    """
+    """Apply an entry's LARGE_KV overrides if Triton supports them and the cache is large."""
     large_kv = config.pop(_LARGE_KV, None)
     if large_kv is None:
         return config
@@ -222,16 +197,8 @@ def _resolve_large_kv(config: dict, params) -> dict:
         )
         return config
 
-    if params.k.numel() < _BUFFER_OP_LIMIT:
-        _LOGGER.debug(
-            "unified attention: KV cache of %d elements is under the %d the "
-            "large-KV overrides need",
-            params.k.numel(),
-            _BUFFER_OP_LIMIT,
-        )
-        return config
-
-    config.update(large_kv)
+    if params.k.numel() >= _BUFFER_OP_LIMIT:
+        config.update(large_kv)
     return config
 
 
@@ -295,11 +262,7 @@ def compute_segment_params(config: dict, params) -> dict:
 
 
 def _derive(config: dict, params) -> dict:
-    """Fill in the parts of a config that depend on the launch, not the key.
-
-    Only the trailing compute_tile_params call can be a repeat: it re-derives
-    TILE_SIZE if the large-KV overrides moved its bounds, and is a no-op if not.
-    """
+    """Fill in the parts of a config that depend on the launch, not the key."""
     config = compute_segment_params(config, params)
     return compute_tile_params(_resolve_large_kv(config, params), params.block_size)
 
@@ -349,8 +312,6 @@ def _load(op: str, backend, arch: str | None) -> tuple:
 
     table = config[op]
     if _USE_OPT_IN:
-        # A merge, not an edit: an opt-in key may be new to the table, and then
-        # has to enter the lookup as a candidate rather than replace a config.
         table = {**table, **config.get(op + _OPT_IN, {})}
     return table, axes, cfg_dir
 
@@ -420,8 +381,8 @@ def get_unified_attention_config(
         backend,
         arch,
     )
-    # Derived out here, not in the cached lookup: these read the launch's
-    # program count and KV cache, neither of which is in the cache key.
+    # Derived out here rather than in the cached lookup: these read the launch's
+    # program count and KV cache, which are not part of the cache key.
     return _derive(copy.deepcopy(config), params)
 
 
@@ -439,7 +400,7 @@ def explain(op: str, params, backend: str = "triton", arch: str | None = None) -
         params.kv_cache_dtype,
     )
     key, config = _lookup(table, axes, values)
-    derived = _derive(compute_tile_params(dict(config), params.block_size), params)
+    derived = _derive(dict(config), params)
 
     lines = [
         f"{_CONFIG_NAME}[{op}]  {cfg_dir}",
