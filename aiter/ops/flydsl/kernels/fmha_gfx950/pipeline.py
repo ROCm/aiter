@@ -365,7 +365,7 @@ def _stagger_extra_barrier_if_one(stagger_i32):
     """Emit `sched_barrier(0); s_barrier;` only when stagger == 1."""
     if fx.Int32(stagger_i32) != fx.Int32(0):
         rocdl.sched_barrier(0)
-        rocdl.s_barrier()
+        fx.gpu.barrier()
 
 
 @dataclass(frozen=True)

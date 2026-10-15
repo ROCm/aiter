@@ -30,11 +30,14 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
         conversion differs; the lane-swap and store code downstream is shared.
         """
         if const_expr(self.traits.OUT_F16):
+            # FlyDSL 0.3.4.1's toward_zero cast emits scalar v_cvt_f16_f32 (not RTZ), changing f16 outputs by 1 ulp.
             v2 = rocdl.cvt_pkrtz(
                 Vec.make_type(2, fx.Float16), fx.as_ir_value(a), fx.as_ir_value(b)
             )
             return fx.as_ir_value(Vec(v2, (2,), fx.Float16).bitcast(fx.Int32)[0])
-        return rocdl.cvt_pk_bf16_f32(a, b)
+        return fx.as_ir_value(
+            Vec.from_elements([a, b], fx.BFloat16).bitcast(fx.Int32)[0]
+        )
 
     def _o_pack_2dw(self, v_o, dc, store_group):
         r_base = store_group * 4

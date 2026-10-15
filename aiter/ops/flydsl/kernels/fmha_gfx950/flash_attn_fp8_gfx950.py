@@ -187,7 +187,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         def _phase_bar():
             _waitcnt_vm_n(DMA_PER_ITER)
             rocdl.sched_barrier(0)
-            rocdl.s_barrier()
+            fx.gpu.barrier()
             rocdl.sched_barrier(0)
 
         def _softmax_part(v_s, l_row, m_new):
@@ -239,7 +239,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         if const_expr(traits.PAGED):
             kv_gmem_to_lds.load_block_table_to_lds()
             rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-            rocdl.s_barrier()
+            fx.gpu.barrier()
             pages = kv_gmem_to_lds.end_page_ids(
                 kv_gmem_to_lds.begin_page_ids(
                     [fx.Index(t0) + i for i in range_constexpr(4)]
@@ -251,7 +251,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
             q_loader.stage_q_to_lds()
             rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             rocdl.sched_barrier(0)
-            rocdl.s_barrier()
+            fx.gpu.barrier()
             q_row, q_wide = _load_q_regs()
 
         kv_gmem_to_lds.load_k((t0 + 1) * BN, (t0 + 1) % NPF_I, pages[1])
@@ -266,7 +266,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         else:
             _waitcnt_vm_n(DMA_PER_ITER)
         rocdl.sched_barrier(0)
-        rocdl.s_barrier()
+        fx.gpu.barrier()
         rocdl.sched_barrier(0)
 
         if const_expr(traits.DUALWAVE_SWP_ENABLE_STAGGER):
@@ -354,7 +354,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         )
         inv_l = inv_l * ctx.vd_fp8
         softmax_helper.scale_o(v_o, inv_l)
-        rocdl.s_barrier()
+        fx.gpu.barrier()
         if const_expr(not SPLITK):
             output_store.store_final_o(v_o, q_row, m_row, l_row)
         else:
@@ -379,7 +379,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         kv_gmem_to_lds.load_block_table_to_lds()
         q_loader.stage_q_to_lds()
         rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-        rocdl.s_barrier()
+        fx.gpu.barrier()
         page = kv_gmem_to_lds.end_page_ids(kv_gmem_to_lds.begin_page_ids([t0]))[0]
         kv_gmem_to_lds.load_k(t0 * BN, fx.Int32(0), page)
         kv_gmem_to_lds.load_v(t0 * BN, fx.Int32(0), page)
@@ -402,7 +402,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
             # Publish the prefetched tile and release the slot all waves last read.
             rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             rocdl.sched_barrier(0)
-            rocdl.s_barrier()
+            fx.gpu.barrier()
             rocdl.sched_barrier(0)
             pf = j + fx.Int64(1)
             page = kv_gmem_to_lds.end_page_ids(kv_gmem_to_lds.begin_page_ids([pf]))[0]
@@ -445,8 +445,6 @@ def build_flash_attn_dualwave_swp_fp8_module(
             (fx.Float32(l_row) > ctx.c_zero_f).select(inv_l_rcp, ctx.c_zero_f)
         )
         softmax_helper.scale_o(v_o, inv_l * ctx.vd_fp8)
-        rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-        rocdl.s_barrier()
         output_store.store_final_o(v_o, q_row, m_row, l_row)
 
     # BN128: two BLOCK_N=64 KV tiles per iteration, one merged softmax correction.
