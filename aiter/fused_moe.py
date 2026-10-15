@@ -890,6 +890,7 @@ def resolve_activation_dtype(
     hidden_dtype: torch.dtype | None = None,
     has_a1_scale: bool = False,
     gfx: str | None = None,
+    gate_up_interleave: bool | None = None,
 ) -> torch.dtype | None:
     """The activation dtype fused_moe() quantizes its input to.
 
@@ -909,7 +910,7 @@ def resolve_activation_dtype(
     quant_type = quant_remap.get(quant_type, quant_type)
     activation = ActivationType(activation)
     gate_mode = GateMode(gate_mode)
-    gfx = get_gfx() if gfx is None else gfx
+    gfx = get_gfx_runtime() if gfx is None else gfx
 
     q_dtype_a = q_dtype_w if q_dtype_w != torch.uint32 else dtypes.fp8
     # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,
@@ -949,6 +950,8 @@ def resolve_activation_dtype(
             q_dtype_a = dtypes.bf16
         elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
             if gfx != "gfx950":
+                q_dtype_a = dtypes.bf16
+            elif gate_up_interleave is False:
                 q_dtype_a = dtypes.bf16
             else:
                 q_dtype_a = _bound_split(M, bf16_fp8_bound, dtypes.bf16, dtypes.fp8)
@@ -1341,6 +1344,7 @@ def _fused_moe_impl(
         M=M,
         hidden_dtype=hidden_states.dtype,
         has_a1_scale=a1_scale is not None,
+        gate_up_interleave=getattr(w1, "gate_up_interleave", None),
     )
 
     if quant_dtype_a is not None:
@@ -1416,6 +1420,7 @@ def _fused_moe_impl(
             use_g1u1=isG1U1,
             doweight_stage1=doweight_stage1,
             gate_mode=gate_mode,
+            gate_up_interleave=getattr(w1, "gate_up_interleave", None),
         )
     )
     if _is_a16w4_situv2 or _is_a16w4_swiglu_rerouted:
@@ -1473,6 +1478,7 @@ def _fused_moe_impl(
             swiglu_limit=swiglu_limit,
             opus_weights_shuffled=getattr(w1, "is_shuffled", False)
             and getattr(w2, "is_shuffled", False),
+            gate_up_interleave=getattr(w1, "gate_up_interleave", None),
             config_file=_metadata_config_file,
             _disable_inline_sort=disable_inline_sort,
             q_dtype_a2=quant_dtype_a2,
@@ -3091,7 +3097,11 @@ def _make_mxfp4_metadata(
     )
 
 
-def _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode):
+def _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode, gate_up_interleave=None):
+    if gate_up_interleave is not None:
+        return (
+            gate_up_interleave is False and gate_mode == GateMode.SEPARATED
+        ) or (gate_up_interleave is True and gate_mode == GateMode.INTERLEAVE)
     return (
         q_dtype_a in (dtypes.bf16, dtypes.fp4x2) and gate_mode == GateMode.SEPARATED
     ) or (q_dtype_a == dtypes.fp8 and gate_mode == GateMode.INTERLEAVE)
@@ -3116,6 +3126,7 @@ def _can_reroute_mxfp4_to_flydsl(
     use_g1u1,
     doweight_stage1,
     gate_mode,
+    gate_up_interleave=None,
 ):
     """Whether the heuristic FlyDSL path accepts this MXFP4 shape and layout."""
     return (
@@ -3126,7 +3137,7 @@ def _can_reroute_mxfp4_to_flydsl(
         and activation == ActivationType.Swiglu
         and inter_dim % 128 == 0
         and model_dim % 256 == 0
-        and _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode)
+        and _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode, gate_up_interleave)
         and is_shuffled
         and use_g1u1
         and not doweight_stage1
@@ -3158,6 +3169,7 @@ def get_2stage_cfgs(
     situ_linear_beta=1.0,
     swiglu_limit=None,
     opus_weights_shuffled=None,
+    gate_up_interleave=None,
     config_file=None,
     _disable_inline_sort=False,
     q_dtype_a2=None,
@@ -3180,6 +3192,7 @@ def get_2stage_cfgs(
         use_g1u1=use_g1u1,
         doweight_stage1=doweight_stage1,
         gate_mode=gate_mode,
+        gate_up_interleave=gate_up_interleave,
     )
     if activation == ActivationType.Relu2:
         if use_g1u1:
@@ -3887,8 +3900,8 @@ def get_2stage_cfgs(
         and dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and activation == ActivationType.Swiglu
-        and q_dtype_w != dtypes.fp8
-        and not (q_dtype_w == dtypes.fp4x2 and q_dtype_a in [dtypes.bf16, dtypes.fp16])
+        and q_dtype_w == dtypes.fp4x2
+        and (gate_up_interleave is None or gate_up_interleave is True)
         and cktile_mxfp4_ok
     ):
         return MOEMetadata(
@@ -3915,10 +3928,10 @@ def get_2stage_cfgs(
     swiglu_mxfp4_bf16_cktile = (
         q_type == QuantType.per_1x32
         and activation == ActivationType.Swiglu
-        and q_dtype_a in [dtypes.bf16, dtypes.fp16]
         and q_dtype_w == dtypes.fp4x2
         and is_shuffled
         and cktile_mxfp4_ok
+        and gate_up_interleave is False
     )
     if (
         activation == ActivationType.Relu2
@@ -4032,7 +4045,7 @@ def get_2stage_cfgs(
             q_dtype_a in (dtypes.fp4x2, dtypes.fp8)
             and q_dtype_w in (dtypes.fp4x2, dtypes.fp8)
         )
-        and _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode)
+        and _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode, gate_up_interleave)
         and is_shuffled
         and use_g1u1
         and not doweight_stage1
@@ -4421,6 +4434,7 @@ def fused_moe_2stages(
         swiglu_limit=swiglu_limit,
         opus_weights_shuffled=getattr(w1, "is_shuffled", False)
         and getattr(w2, "is_shuffled", False),
+        gate_up_interleave=getattr(w1, "gate_up_interleave", None),
         config_file=_metadata_config_file,
         input_dtype=hidden_states.dtype,
     )
