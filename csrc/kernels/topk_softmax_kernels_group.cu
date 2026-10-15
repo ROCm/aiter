@@ -671,6 +671,9 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
     float sum = 0.0f;
     int topk_indice;
     float topk_value;
+    // A pick with no finite score left weighs zero and takes the lowest id not
+    // yet emitted (one is at most k, as topk <= WARP_SIZE), so ids stay unique.
+    uint64_t emitted = 0;
     for(int k = 0; k < topk; ++k)
     {
         float max_val = -INFINITY;
@@ -700,11 +703,16 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
         {
             // max_val = result_kvp.value;
             // max_idx = result_kvp.key;
+            const bool live = max_val > -INFINITY;
+            if(!live)
+                max_idx = __builtin_ctzll(~emitted);
+            emitted |= max_idx < 64 ? 1ull << max_idx : 0;
             if constexpr(isBiased)
             {
                 max_val = sig_scores[max_idx];
                 // max_val -= bias[max_idx];
             }
+            max_val         = live ? max_val : 0.0f;
             scores[max_idx] = -INFINITY;
             // topk_indices[k] = max_idx;
             // topk_values[k] = max_val;
@@ -1463,10 +1471,14 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
 
         if(threadIdx.x < topk)
         {
+            // A pick with no finite score left weighs zero; with a -inf bias
+            // the subtraction is NaN, which would zero the whole row's renorm.
+            const bool live = topk_v > -INFINITY;
             if constexpr(isBiased)
             {
                 topk_v -= static_cast<float>(correction_bias[topk_i]);
             }
+            topk_v = live ? topk_v : 0.0f;
             if(need_renorm)
             {
                 sum    = multithread_reduce(topk_v, [&](auto x_, auto y_) { return x_ + y_; }, 8);
@@ -1494,10 +1506,14 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
         {
             float topk_v = topk_values[threadIdx.x];
             int topk_i   = final_topk_idx[threadIdx.x];
+            // A pick with no finite score left weighs zero; with a -inf bias
+            // the subtraction is NaN, which would zero the whole row's renorm.
+            const bool live = topk_v > -INFINITY;
             if constexpr(isBiased)
             {
                 topk_v -= static_cast<float>(correction_bias[topk_i]);
             }
+            topk_v = live ? topk_v : 0.0f;
             if(need_renorm)
             {
                 sum    = multithread_reduce(topk_v, [&](auto x_, auto y_) { return x_ + y_; }, 8);
