@@ -8,6 +8,8 @@ aligned uint64. Rank-ordered FP32 addition follows ATOM's small-batch path.
 from triton.experimental import gluon as g
 from triton.experimental.gluon import language as gl
 
+from .sync import poll_peers4
+
 
 @g.jit
 def tail(
@@ -55,42 +57,18 @@ def tail(
         gl.barrier()
         local_pair = task * 64 + lane
         use = (tid < 64) & (local_pair < pairs)
-        p0 = own + 0 * pairs + local_pair
-        p1 = own + 1 * pairs + local_pair
-        p2 = own + 2 * pairs + local_pair
-        p3 = own + 3 * pairs + local_pair
-        missing = gl.full((512,), True, gl.int1, layout)
-        w0 = gl.full((512,), 0, gl.uint64, layout)
-        w1 = gl.full((512,), 0, gl.uint64, layout)
-        w2 = gl.full((512,), 0, gl.uint64, layout)
-        w3 = gl.full((512,), 0, gl.uint64, layout)
-        for attempt in range(100000):
-            w0 = gl.atomic_load(p0, mask=use, sem="acquire", scope="sys")
-            w1 = gl.atomic_load(p1, mask=use, sem="acquire", scope="sys")
-            w2 = gl.atomic_load(p2, mask=use, sem="acquire", scope="sys")
-            w3 = gl.atomic_load(p3, mask=use, sem="acquire", scope="sys")
-            missing = use & (
-                ((w0 >> 32) != epoch)
-                | ((w1 >> 32) != epoch)
-                | ((w2 >> 32) != epoch)
-                | ((w3 >> 32) != epoch)
-            )
-            if gl.sum(missing.to(gl.int32), 0) == 0:
-                break
-        if gl.sum(missing.to(gl.int32), 0) != 0:
-            gl.store(Errors + pid * 64 + lane, 1, mask=tid < 64)
-        else:
-            # The reduction order is rank 0, 1, 2, 3, with one rounding at
-            # the final BF16 store, as in ATOM's small-batch FFN reduction.
-            lo = (w0.to(gl.uint32) << 16).to(gl.float32, bitcast=True)
-            lo += (w1.to(gl.uint32) << 16).to(gl.float32, bitcast=True)
-            lo += (w2.to(gl.uint32) << 16).to(gl.float32, bitcast=True)
-            lo += (w3.to(gl.uint32) << 16).to(gl.float32, bitcast=True)
-            hi = (w0.to(gl.uint32) & 4294901760).to(gl.float32, bitcast=True)
-            hi += (w1.to(gl.uint32) & 4294901760).to(gl.float32, bitcast=True)
-            hi += (w2.to(gl.uint32) & 4294901760).to(gl.float32, bitcast=True)
-            hi += (w3.to(gl.uint32) & 4294901760).to(gl.float32, bitcast=True)
-            gl.store(Out + local_pair * 2, lo, mask=use)
-            gl.store(Out + local_pair * 2 + 1, hi, mask=use)
+        w0, w1, w2, w3, failed = poll_peers4(own, local_pair, epoch, use, pairs)
+        gl.store(Errors + pid * 64 + lane, 1, mask=use & (failed != 0))
+        # Rank 0, 1, 2, 3 in FP32; round only at the final BF16 store.
+        lo = (w0.to(gl.uint32) << 16).to(gl.float32, bitcast=True)
+        lo += (w1.to(gl.uint32) << 16).to(gl.float32, bitcast=True)
+        lo += (w2.to(gl.uint32) << 16).to(gl.float32, bitcast=True)
+        lo += (w3.to(gl.uint32) << 16).to(gl.float32, bitcast=True)
+        hi = (w0.to(gl.uint32) & 4294901760).to(gl.float32, bitcast=True)
+        hi += (w1.to(gl.uint32) & 4294901760).to(gl.float32, bitcast=True)
+        hi += (w2.to(gl.uint32) & 4294901760).to(gl.float32, bitcast=True)
+        hi += (w3.to(gl.uint32) & 4294901760).to(gl.float32, bitcast=True)
+        gl.store(Out + local_pair * 2, lo, mask=use & (failed == 0))
+        gl.store(Out + local_pair * 2 + 1, hi, mask=use & (failed == 0))
         task += 256
     gl.store(Epochs + pid, epoch)

@@ -10,6 +10,8 @@ that the selected two-stage AITER expert path consumes. No GPU validation yet.
 from triton.experimental import gluon as g
 from triton.experimental.gluon import language as gl
 
+from .sync import poll_local
+
 
 @g.jit
 def _route_and_sort(
@@ -36,15 +38,8 @@ def _route_and_sort(
     # Readiness words are initialized once; each invocation has a fresh epoch.
     flags = gl.arange(0, 128, layout=flat)
     active = flags < B * 8
-    pending = gl.full((128,), True, gl.int1, flat)
-    for attempt in range(100000):
-        observed = gl.atomic_load(
-            Ready + flags, mask=active, sem="acquire", scope="gpu"
-        )
-        pending = active & ((observed >> 32) != Epoch.to(gl.uint64))
-        if gl.sum(pending.to(gl.int32), 0) == 0:
-            break
-    if gl.sum(pending.to(gl.int32), 0) != 0:
+    failed = poll_local(Ready + flags, Epoch, active)
+    if gl.sum((active & (failed != 0)).to(gl.int32), 0) != 0:
         gl.store(Errors, 1)
         gl.store(SortCounts, 0)
         gl.store(SortCounts + 1, B)

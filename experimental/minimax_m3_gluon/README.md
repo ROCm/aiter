@@ -25,18 +25,18 @@ Ported from ROCm/ATOM commit `6e9b3e1c5b50b9e6a3b2f8bcf651a9b0229d3ac0`,
 `atom/models/minimax_m3/mono`, especially `post_attn.py`, `stages/router.py`,
 `stages/moe_wide.py`, `stages/ffn_reduce.py`, `layout.py`, `weights.py`, and
 `runner.py`. This snapshot targets MI355X/gfx950 and TP4 with 1–16 physical
-decode tokens. It assumes hidden 6144, 128 routed experts, top-4, one fused
+decode tokens, with every row live (graph padding is not yet handled). It assumes hidden 6144, 128 routed experts, top-4, one fused
 shared expert, 129 packed A16W4 experts, per-group-32 scales, Gemma norm, and
 SwiGLU-OAI with clamp limit 7. The shared route weight is read from the model's
 AITER top-k metadata rather than assumed to be one.
 
 | Writer → reader | Buffer | Ordering and reuse |
 |---|---|---|
-| Score CTA → routing CTA | score key, sigmoid; eight ready words/token | GPU-scope release/acquire tagged by a front epoch; coherent score reads; ready allocated once per width |
+| Score CTA → routing CTA | score key, sigmoid; eight ready words/token | GPU-scope release and side-effecting `sc1` epoch poll; coherent score reads; ready allocated once per width |
 | Routing CTA → AITER MoE1 | IDs, weights, BM16 metadata | Same stream launch boundary; each route has one sorted destination |
 | Zero CTAs → AITER MoE2 | `SortOut`, BF16 `[B,6144]` | Same stream boundary; zeroing finishes before atomic accumulation |
 | AITER MoE2 → Gluon tail | Returned output tensor | Same stream boundary; keep tensor alive through capture/replay |
-| Rank → all ranks | Two BF16 values + epoch per aligned 64-bit IPC word | System-scope peer publication and acquire polling; two slots alternate by epoch |
+| Rank → all ranks | Two BF16 values + epoch per aligned 64-bit IPC word | System-scope peer publication and side-effecting `sc1` polling; two slots alternate by epoch |
 | Tail → next layer | `ar_out` and `h_mid` | Same stream; layer parity/buffer ownership must be established in serving integration |
 
 Front CTA mapping: CTAs `0..8B-1` compute 16 router experts each; CTA 128
@@ -70,11 +70,12 @@ graph replay, actual launch count, TP4 serving, or model quality.
 ## Next device-validation gates
 
 Once GPU execution is authorized: compile the front and tail on the exact
-Triton/Gluon build; inspect atomic and cache instructions; verify zero spills
+Triton/Gluon build; inspect atomic and `sc1` poll/cache instructions; verify zero spills
 and at least one resident CTA/CU; compare route IDs/weights and every metadata
 array with ATOM/AITER across 1–16 tokens and replayed changed routes. Check
 AITER's selected MoE1/MoE2 names and a trace for hidden launches. Then compare
 full local and TP-reduced outputs, replay after allocator churn, all sparse
-layers, TTFT/TPOT/throughput and lm-eval. Only after the MoE region is correct
-should the preceding output projection and sparse attention stages be fused
-into the Gluon front.
+layers, TTFT/TPOT/throughput and lm-eval. The serving adapter must account for ATOM's `batch_id_per_q_token` pad rows,
+TP-uniform width decisions, attention metadata and cached sparse selections. Only
+after the MoE region is correct should the preceding output projection and sparse
+attention stages be fused into the Gluon front.
