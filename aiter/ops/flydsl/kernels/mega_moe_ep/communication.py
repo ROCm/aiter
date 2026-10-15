@@ -1,0 +1,215 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+"""Symmetric-arena addressing, epoch-flag readiness and the watchdog for the EP kernel.
+
+Ported from :mod:`mega_moe_tp.communication` (peer / arena resource builders, the
+sticky-error watchdog) with EP-specific readiness flags replacing TP's reduce-scatter /
+all-gather ones:
+
+* ``dispatch_*`` -- a dispatch-send wave on a source rank adds its contribution to the
+  expert-owner rank's per-receive-tile arrival counter; the last arriver zeroes the
+  counter and stamps the paired ready flag with the launch epoch. The owner's compute
+  waves ``dispatch_wait`` (spin until the ready flag reaches the epoch, wrap-safe).
+* ``combine_*`` -- the mirror for GEMM2 partials scattered back to the source rank.
+
+The device code reaches arena peers through ``peer_rs`` / ``own_rs`` (raw buffer
+resources at ``peer_base + off_region``) exactly like the TP kernel.
+"""
+
+from __future__ import annotations
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl.expr import range_constexpr, rocdl
+from flydsl.expr.typing import T
+
+from .common import (
+    AUX_SYS,
+    V4I,
+    alive,
+    before,
+    bld,
+    bst,
+    g_add_agent,
+    g_or_agent,
+    g_st_sys,
+    i32,
+    now,
+    poll_sys_ge,
+    rsrc,
+    wait_vm,
+)
+from .mega_moe_ep_config import (
+    CTRL_ERR,
+    ERR_COMBINE,
+    ERR_DISPATCH,
+    FLAG_COMB_CNT,
+    FLAG_COMBINE,
+    FLAG_DISP_CNT,
+    FLAG_DISPATCH,
+    MAX_NPES,
+    NCTA_MAX,
+    NT,
+    KernelCtx,
+)
+
+__all__ = ["build_communication"]
+
+
+def build_communication(kc: KernelCtx) -> dict:
+    """The arena / flag / watchdog device functions of one instance (added to kc)."""
+    const_expr = kc.get("const_expr")[0]
+    TOPK, E, H, a8, EPR = kc.get("TOPK E H a8 EPR")
+    ROW_BYTES = H if a8 else H // 2  # quantized activation bytes per row (FP8 vs FP4)
+    N_VEC = ROW_BYTES // 16  # 16-byte (V4I) copy units per payload row
+    SCALE_I32 = H // 128  # i32 E8M0-scale units per row (H//32 bytes / 4)
+    SENTINEL = EPR  # recv_le empty-slot marker (masked by the planner: >= EPR)
+
+    # --- arena addressing --------------------------------------------------------
+    def ctrl_at(a, idx):
+        return fx.Int64(a["ctrl"]) + fx.Int64(i32(idx) * i32(4))
+
+    def peer_sel(a, p):
+        v = fx.Int64(a["peer"][0])
+        for j in range_constexpr(1, MAX_NPES):
+            v = (p == i32(j)).select(fx.Int64(a["peer"][j]), v)
+        return v
+
+    def peer_rs(a, p, key, nbytes=None):
+        return rsrc(fx.Int64(a["peer"][p]) + fx.Int64(a[key]), nbytes)
+
+    def own_rs(a, key, nbytes=None):
+        return rsrc(a["mine"] + fx.Int64(a[key]), nbytes)
+
+    def _flag(a, base, parity, tile):
+        return fx.Int64((i32(base) + parity * i32(NCTA_MAX) + tile) * i32(4))
+
+    def peer_flag(a, p, base, parity, tile):
+        return peer_sel(a, p) + fx.Int64(a["off_flag"]) + _flag(a, base, parity, tile)
+
+    def own_flag(a, base, parity, tile):
+        return a["mine"] + fx.Int64(a["off_flag"]) + _flag(a, base, parity, tile)
+
+    # --- watchdog (sticky error word in the global ctrl tensor) ------------------
+    def report(a, code):
+        g_or_agent(ctrl_at(a, CTRL_ERR), code)
+
+    @flyc.jit
+    def _report_if(a, bad, code):
+        if bad:
+            report(a, code)
+
+    @flyc.jit
+    def poll_zero(fn, a=None, lane=None, err=0):
+        pend = fn()
+        t0 = now()
+        while (pend != i32(0)) & alive(t0):
+            rocdl.s_sleep(1)
+            pend = fn()
+        if const_expr(err != 0):
+            _report_if(a, (pend != i32(0)) & (lane == i32(0)), err)
+
+    @flyc.jit
+    def spin_sys_ge(addr, target, a=None, err=0):
+        cur = poll_sys_ge(addr, target)
+        if const_expr(a is not None):
+            _report_if(a, before(cur, target), err)
+
+    # --- EP dispatch / combine readiness -----------------------------------------
+    @flyc.jit
+    def dispatch_arrive(a, p, parity, tile, delta, expected):
+        """Source wave adds ``delta`` to owner ``p``'s receive-tile arrival counter;
+        the last arriver zeroes it and stamps the ready flag with the launch epoch."""
+        old = g_add_agent(peer_flag(a, p, FLAG_DISP_CNT, parity, tile), delta)
+        if old + delta == expected:
+            g_st_sys(peer_flag(a, p, FLAG_DISP_CNT, parity, tile), i32(0))
+            g_st_sys(peer_flag(a, p, FLAG_DISPATCH, parity, tile), a["epoch"])
+
+    @flyc.jit
+    def dispatch_wait(a, parity, tile):
+        spin_sys_ge(
+            own_flag(a, FLAG_DISPATCH, parity, tile), a["epoch"], a, ERR_DISPATCH
+        )
+
+    @flyc.jit
+    def combine_arrive(a, p, parity, tile, delta, expected):
+        """Mirror of ``dispatch_arrive`` for GEMM2 partials scattered back to source."""
+        old = g_add_agent(peer_flag(a, p, FLAG_COMB_CNT, parity, tile), delta)
+        if old + delta == expected:
+            g_st_sys(peer_flag(a, p, FLAG_COMB_CNT, parity, tile), i32(0))
+            g_st_sys(peer_flag(a, p, FLAG_COMBINE, parity, tile), a["epoch"])
+
+    @flyc.jit
+    def combine_wait(a, parity, tile):
+        spin_sys_ge(own_flag(a, FLAG_COMBINE, parity, tile), a["epoch"], a, ERR_COMBINE)
+
+    # --- dispatch send (a2a scatter of this rank's tokens to expert owners) -------
+    @flyc.jit
+    def init_recv(L, tid, a):
+        """Sentinel this rank's received-routing region so the planner masks the
+        (token, route) pairs no sender fills this launch. Runs before dispatch; a
+        cross-rank barrier (roles_entry) orders it before any peer writes recv_le."""
+        n = a["npes"] * a["mtpr"] * i32(TOPK)
+        rle = own_rs(a, "off_recv", n * i32(4))
+        for s_ in range(tid, n, i32(NT)):
+            bst(i32(SENTINEL), rle, i32(s_) * i32(4), 0, 0)
+
+    @flyc.jit
+    def dispatch_send(L, lane, a):
+        """One wave: scatter each local (token, route) payload to its expert-owner
+        rank's arena, indexed by ``source_key = rank*mtpr + token`` (bounded by
+        npes*mtpr, overflow-proof), and record the received local-expert id. The top-k
+        weights stay at the source and are applied in combine_final. After the scatter
+        each rank signals every owner it is done (an all-to-all dispatch barrier)."""
+        m, mtpr, rank, epr, npes = a["m"], a["mtpr"], a["rank"], a["epr"], a["npes"]
+        parity = a["epoch"] & i32(1)
+        rids = rsrc(a["ids"], m * i32(TOPK) * i32(4))
+        rx = rsrc(a["x"])
+        rxs = rsrc(a["xs"])
+        for wk_ in range(i32(0), m * i32(TOPK), i32(1)):
+            wk = i32(wk_)
+            t = wk // i32(TOPK)
+            r = wk - t * i32(TOPK)
+            e = fx.Int32(bld(rids, wk * i32(4), 0, T.i32, 0))
+            if (e >= i32(0)) & (e < i32(E)):
+                owner = e // epr
+                source_key = rank * mtpr + t
+                dpay = peer_rs(a, owner, "off_payload")
+                dsc = peer_rs(a, owner, "off_pscale")
+                if lane == i32(0):
+                    bst(
+                        e - owner * epr,
+                        peer_rs(a, owner, "off_recv"),
+                        (source_key * i32(TOPK) + r) * i32(4),
+                        0,
+                        AUX_SYS,
+                    )
+                for j in range_constexpr((N_VEC + 63) // 64):
+                    u = lane + i32(j * 64)
+                    if u < i32(N_VEC):
+                        v = bld(rx, t * i32(ROW_BYTES) + u * i32(16), 0, V4I, 0)
+                        bst(
+                            v,
+                            dpay,
+                            source_key * i32(ROW_BYTES) + u * i32(16),
+                            0,
+                            AUX_SYS,
+                        )
+                for j in range_constexpr((SCALE_I32 + 63) // 64):
+                    u = lane + i32(j * 64)
+                    if u < i32(SCALE_I32):
+                        s = bld(rxs, (t * i32(SCALE_I32) + u) * i32(4), 0, T.i32, 0)
+                        bst(
+                            s,
+                            dsc,
+                            (source_key * i32(SCALE_I32) + u) * i32(4),
+                            0,
+                            AUX_SYS,
+                        )
+        wait_vm(0)
+        if lane == i32(0):
+            for p in range_constexpr(MAX_NPES):
+                if i32(p) < npes:
+                    dispatch_arrive(a, i32(p), parity, i32(0), i32(1), npes)
+
+    return locals()

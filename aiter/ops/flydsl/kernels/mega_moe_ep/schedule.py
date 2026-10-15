@@ -1,0 +1,270 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+"""In-kernel dispatch planner for the EP MegaMoE kernel.
+
+Ported from the TP dynamic planner (:mod:`mega_moe_tp.schedule` ``dyn_plan``) and
+adapted to expert parallelism:
+
+* the active-expert space is this rank's ``EPR`` *local* experts (bitmap ``L_DYN``,
+  per-expert counts ``L_DCNT``), not the whole replicated expert set;
+* the routing scanned is the dispatched ``(token, expert)`` pairs this rank *received*
+  -- ``a["recv_le"]`` (received pair -> local expert id) over ``a["nrecv"]`` pairs --
+  which ``dispatch_send`` fills, not the all-gathered routing;
+* a local expert routed by ``R`` received tokens runs as ``ceil(R / rch)`` row chunks,
+  each in ``P`` equal inter pieces (``P`` chosen to balance ``#CU`` CTAs), the unit list
+  sliced per CTA ``[u_lo, u_hi)`` XCD-aware -- identical to TP.
+
+The GEMM1+act+GEMM2 body (``unit_tile``) and the per-expert received-row gather
+(``gather_recv_chunk``) are stubs filled by the compute / dispatch milestones; the
+planner only needs the per-expert row counts the route scan already wrote to ``L_DCNT``.
+"""
+
+from __future__ import annotations
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr.typing import T
+
+from ..kernels_common import ceildiv
+from .common import (
+    ACQ_REL,
+    _ctpop,
+    bld,
+    i32,
+    lds_atomic_add,
+    lds_atomic_or,
+    lds_ld_acq,
+    lds_ld_i32,
+    lds_st,
+    lds_st_rel,
+    rsrc,
+    wait_lgkm0,
+    wave_rank,
+)
+from .mega_moe_ep_config import (
+    C_BARCNT,
+    C_BARGEN,
+    C_DYNP,
+    C_NACT,
+    C_NCH,
+    C_PLAN,
+    C_UL,
+    C_UNIT,
+    C_UROWS,
+    C_USEQ,
+    N_XCD,
+    NT,
+    NW,
+    UL_MAX,
+    KernelCtx,
+)
+
+__all__ = ["build_schedule"]
+
+
+def build_schedule(kc: KernelCtx) -> dict:
+    """The dispatch-planner device functions of one instance (added to kc)."""
+    DYN_PS, EPR, I, KS2 = kc.get("DYN_PS EPR I KS2")
+    L_CTL, L_DCH, L_DCNT, L_DYN = kc.get("L_CTL L_DCH L_DCNT L_DYN")
+    L_EOFF, L_WSUM, NBW, TMAX = kc.get("L_EOFF L_WSUM NBW TMAX")
+    const_expr, rch = kc.get("const_expr rch")
+    assert L_EOFF is not None and const_expr  # L_EOFF: gather offsets (compute)
+
+    @flyc.jit
+    def cbar(L, tid):
+        """The four compute waves' LDS generation barrier (TP ``communication.cbar``)."""
+        wait_lgkm0()
+        if (tid % i32(64)) == i32(0):
+            g = lds_ld_acq(L, L_CTL + C_BARGEN * 4)
+            old = lds_atomic_add(L, L_CTL + C_BARCNT * 4, 1, ACQ_REL)
+            if old == i32(NW - 1):
+                lds_st(L, L_CTL + C_BARCNT * 4, i32(0))
+                lds_st_rel(L, L_CTL + C_BARGEN * 4, g + i32(1))
+            else:
+                cur = lds_ld_acq(L, L_CTL + C_BARGEN * 4)
+                while cur == g:
+                    rocdl.s_sleep(0)
+                    cur = lds_ld_acq(L, L_CTL + C_BARGEN * 4)
+        rocdl.sched_barrier(0)
+
+    def unit_fields(L, u):
+        f = [
+            lds_ld_i32(L, L_CTL + (i32(C_UL) + u * i32(4) + i32(k)) * i32(4))
+            for k in range(4)
+        ]
+        return f[0], f[1], f[2], f[3]
+
+    def masked(le):
+        # invalid / foreign slot: le >= EPR (and -1 wraps to a huge unsigned value)
+        return fx.Int32(le).bitcast(fx.Uint32) >= fx.Uint32(EPR)
+
+    def _wave_prefix(v, bits):
+        pre, tot = i32(0), i32(0)
+        for b in range_constexpr(bits):
+            below, cnt = wave_rank(((v >> i32(b)) & i32(1)) == i32(1))
+            pre = pre + (below << i32(b))
+            tot = tot + (cnt << i32(b))
+        return pre, tot
+
+    def _pick_p(nun, C, ps):
+        # pick the GEMM1 inter-piece count that best fills the CTAs within UL_MAX units
+        P = i32(ps[0])
+        best = ceildiv(nun * i32(ps[0]), C) * i32(KS2 // ps[0])
+        for q in ps[1:]:
+            cost = ceildiv(nun * i32(q), C) * i32(KS2 // q)
+            better = (cost < best) & (nun * i32(q) <= C * i32(UL_MAX))
+            P = better.select(i32(q), P)
+            best = better.select(cost, best)
+        return P
+
+    def _xcd_rank(C):
+        bid = i32(gpu.block_id("x"))
+        return (C % i32(N_XCD) == i32(0)).select(
+            (bid % i32(N_XCD)) * (C // i32(N_XCD)) + bid // i32(N_XCD), bid
+        )
+
+    @flyc.jit
+    def _dyn_prefix(L, tid):
+        if tid == i32(0):
+            acc = i32(0)
+            for w in range_constexpr(NBW):
+                lds_st(L, L_DYN + i32((NBW + w) * 4), acc)
+                acc = acc + _ctpop(lds_ld_i32(L, L_DYN + i32(w * 4)))
+            lds_st(L, L_CTL + C_NACT * 4, acc)
+
+    @flyc.jit
+    def _dyn_list(L, e):
+        if e < i32(EPR):
+            wv = lds_ld_i32(L, L_DYN + (e >> i32(5)) * i32(4))
+            if ((wv >> (e & i32(31))) & i32(1)) != i32(0):
+                low = (i32(1) << (e & i32(31))) - i32(1)
+                rank = lds_ld_i32(
+                    L, L_DYN + (i32(NBW) + (e >> i32(5))) * i32(4)
+                ) + _ctpop(wv & low)
+                lds_st(L, L_DYN + (i32(2 * NBW) + rank) * i32(4), e)
+
+    @flyc.jit
+    def _chunk_table(L, tid):
+        nact = lds_ld_i32(L, L_CTL + C_NACT * 4)
+        w = tid // i32(64)
+        lane = tid % i32(64)
+        base = i32(0)
+        for rnd in range_constexpr(ceildiv(EPR, NT)):
+            j = tid + i32(rnd * NT)
+            live = j < nact
+            e = live.select(
+                lds_ld_i32(
+                    L, L_DYN + (i32(2 * NBW) + fx.min(j, i32(EPR - 1))) * i32(4)
+                ),
+                i32(0),
+            )
+            r = lds_ld_i32(L, L_DCNT + e * i32(4))
+            ce = fx.min(fx.max(ceildiv(r, i32(rch)), i32(1)), i32(255))
+            ce = live.select(ce, i32(0))
+            pre, tot = _wave_prefix(ce, 8)
+            if lane == i32(0):
+                lds_st(L, L_WSUM + w * i32(4), tot)
+            cbar(L, tid)
+            o, total = base + pre, i32(0)
+            for v in range_constexpr(NW):
+                sv = lds_ld_i32(L, L_WSUM + i32(v * 4))
+                o = o + (i32(v) < w).select(sv, i32(0))
+                total = total + sv
+            base = base + total
+            for c_ in range(i32(0), ce, i32(1)):
+                c = i32(c_)
+                lds_st(
+                    L, L_DCH + (o + c) * i32(4), e | (ce << i32(16)) | (c << i32(24))
+                )
+            cbar(L, tid)
+        if tid == i32(0):
+            lds_st(L, L_CTL + C_NCH * 4, base)
+
+    @flyc.jit
+    def _dyn_units(L, tid):
+        if tid == i32(0):
+            nun = lds_ld_i32(L, L_CTL + C_NCH * 4)
+            C = i32(gpu.grid_dim.x)
+            P = _pick_p(nun, C, DYN_PS)
+            U = nun * P
+            bid = _xcd_rank(C)
+            u_lo = bid * U // C
+            u_hi = (bid + i32(1)) * U // C
+            icnt = i32(I) // P
+            for u_ in range(u_lo, u_hi, i32(1)):
+                u = i32(u_)
+                j = u // P
+                ul = L_CTL + (i32(C_UL) + (u - u_lo) * i32(4)) * i32(4)
+                lds_st(L, ul, lds_ld_i32(L, L_DCH + j * i32(4)))
+                lds_st(L, ul + i32(4), (u - j * P) * icnt)
+                lds_st(L, ul + i32(8), icnt)
+                lds_st(L, ul + i32(12), i32(0))
+            lds_st(L, L_CTL + C_DYNP * 4, P)
+            lds_st(L, L_CTL + C_UNIT * 4, i32(0))
+            lds_st(L, L_CTL + (C_UNIT + 1) * 4, u_hi - u_lo)
+            lds_st_rel(L, L_CTL + C_PLAN * 4, i32(1))
+
+    @flyc.jit
+    def dyn_plan(L, tid, a):
+        """Scan this rank's received routing -> per-local-expert bitmap + counts ->
+        active list -> row-chunk table -> per-CTA unit list [u_lo, u_hi) (XCD-aware)."""
+        n = a["nrecv"]
+        rle = rsrc(a["recv_le"], n * i32(4))
+        for idx_ in range(tid, n, i32(NT)):
+            idx = i32(idx_)
+            le = fx.Int32(bld(rle, idx * i32(4), 0, T.i32, 0))
+            if masked(le) == fx.Boolean(False):
+                lds_atomic_or(
+                    L, L_DYN + (le >> i32(5)) * i32(4), i32(1) << (le & i32(31))
+                )
+                lds_atomic_add(L, L_DCNT + le * i32(4), 1)
+        cbar(L, tid)
+        _dyn_prefix(L, tid)
+        cbar(L, tid)
+        for it in range_constexpr(ceildiv(EPR, NT)):
+            _dyn_list(L, tid + i32(it * NT))
+        cbar(L, tid)
+        _chunk_table(L, tid)
+        cbar(L, tid)
+        _dyn_units(L, tid)
+        cbar(L, tid)
+
+    @flyc.jit
+    def gather_recv_chunk(L, tid, a, expert, cc, ce):
+        # TODO(compute/dispatch): collect the received row indices (and top-k weights)
+        # routed to local `expert`'s chunk `cc` of `ce` into L_RIX / weights, like TP
+        # gather_routes_chunk. The planner only needs the row count, which the route
+        # scan already accumulated in L_DCNT.
+        del tid, a, cc, ce
+        return fx.min(lds_ld_i32(L, L_DCNT + expert * i32(4)), i32(TMAX))
+
+    def unit_tile(L, tid, a, expert, i0, icnt, r0, rows, sig):
+        # TODO(compute): local-expert GEMM1(expert, i0, icnt) + act + GEMM2 on these
+        # `rows` received tokens, then combine_send the weighted partial (signal on sig).
+        del L, tid, a, expert, i0, icnt, r0, rows, sig
+
+    @flyc.jit
+    def compute_units(L, tid, a):
+        """Run the planner, then walk this CTA's unit list (GEMM body is a stub)."""
+        dyn_plan(L, tid, a)
+        ub = lds_ld_i32(L, L_CTL + C_UNIT * 4)
+        ue = lds_ld_i32(L, L_CTL + (C_UNIT + 1) * 4)
+        for u_ in range(ub, ue, i32(1)):
+            u = i32(u_)
+            expert_chunk, i0, icnt, _kind = unit_fields(L, u)
+            expert = expert_chunk & i32(0xFFFF)
+            cc = expert_chunk.shrui(i32(24))
+            ce = expert_chunk.shrui(i32(16)) & i32(0xFF)
+            R = gather_recv_chunk(L, tid, a, expert, cc, ce)
+            if tid == i32(0):
+                lds_st(L, L_CTL + C_UROWS * 4, R)
+                lds_st_rel(L, L_CTL + C_USEQ * 4, u - ub + i32(1))
+            for r0_ in range(i32(0), R, i32(rch)):
+                r0 = i32(r0_)
+                rows = fx.min(R - r0, i32(rch))
+                sig = (u == ue - i32(1)) & (r0 + i32(rch) >= R)
+                unit_tile(L, tid, a, expert, i0, icnt, r0, rows, sig)
+                cbar(L, tid)
+
+    return locals()
