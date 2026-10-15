@@ -93,7 +93,8 @@ AITER_FDA_USE_GLUON_K1: bool = _GLUON_BOTH or _GLUON_SEL == "k1"
 AITER_FDA_USE_GLUON_K2: bool = _GLUON_BOTH or _GLUON_SEL == "k2"
 
 DEVICE_ARCH = arch_info.get_arch()
-_GLUON_ARCH_OK: bool = DEVICE_ARCH == "gfx950"
+_GLUON_ARCH_OK: bool = DEVICE_ARCH in ("gfx950", "gfx1250")
+_GLUON_K2C_ARCH_OK: bool = DEVICE_ARCH == "gfx1250"
 
 _LOGGED_ROUTES: set = set()
 
@@ -763,6 +764,15 @@ def _gluon_k2_usable(C: int, K: int, V: int) -> bool:
     )
 
 
+def _tdm_operand(x: torch.Tensor, tdm: bool) -> tuple[torch.Tensor, int]:
+    """``x`` ``[B, T, H, D]`` and its token stride: ``x`` itself if ``tdm`` and
+    the gfx1250 Gluon kernels can read it in place, else a packed copy."""
+    B, T, H, D = x.shape
+    if tdm and B == 1 and T > 1 and x.stride(3) == 1 and (H == 1 or x.stride(2) == D):
+        return x, x.stride(1)
+    return x.contiguous(), H * D
+
+
 def _log_route(k1_gluon: bool, k2_gluon: bool, C: int, K: int, V: int) -> None:
     key = (k1_gluon, k2_gluon, C, K, V)
     if key in _LOGGED_ROUTES:
@@ -779,33 +789,28 @@ def _log_route(k1_gluon: bool, k2_gluon: bool, C: int, K: int, V: int) -> None:
     )
 
 
-# Launchable anywhere: BW=32 needs two warps, the narrowest the state split
-# allows. The zero floor keeps the pair self-consistent -- a device with no
-# published table takes the wide branch and finds this same schedule there.
-_K2_GLUON_FALLBACK = triton.Config({"BW": 32, "MIN_BLOCKS_PER_CU": 0}, num_warps=2)
+# BW=64 at four warps is the narrowest tile that the gfx950 and gfx1250 kernels
+# both accept. With a zero floor, a device with no published table takes this
+# schedule in the wide branch.
+_K2_GLUON_FALLBACK = triton.Config({"BW": 64, "MIN_BLOCKS_PER_CU": 0}, num_warps=4)
 
 
 @functools.cache
-def _k2_gluon_schedule(W: int, num_segs: int, H: int) -> tuple[int, int]:
-    """``(BW, num_warps)`` for the Gluon K2, which does not autotune.
-
-    The warps can only split BW -- the state is the B operand of ``dot(kd, h)``
-    and its K axis is the contraction axis -- so a count above ``BW // 16``
-    duplicates columns instead of splitting them, which bounds the pairs the
-    config may publish. Which of the two a shape runs is decided by the grid,
-    ``cdiv(W, BW) * num_segs * H``: the wide tile reads the per-chunk workspace
-    half as many times, but only while there are still enough blocks to fill the
-    device, so it is taken above a published blocks-per-CU floor.
-    """
+def _k2_gluon_schedule(
+    W: int, num_segs: int, H: int, kernel: str = "k2_ab_fused_gluon"
+) -> tuple[int, int]:
+    """``(BW, num_warps)`` for the Gluon K2 pass ``kernel``, which does not
+    autotune. The wide tile is taken while the grid stays above the published
+    blocks-per-CU floor."""
     wide = chunk_delta_attn_tuned_config(
-        "k2_ab_fused_gluon_wide", _K2_GLUON_FALLBACK, backend="gluon"
+        f"{kernel}_wide", _K2_GLUON_FALLBACK, backend="gluon"
     )
     bw = wide.kwargs["BW"]
     blocks = (W // bw) * num_segs * H
     if W % bw == 0 and blocks >= wide.kwargs["MIN_BLOCKS_PER_CU"] * _num_cus():
         return bw, wide.num_warps
     narrow = chunk_delta_attn_tuned_config(
-        "k2_ab_fused_gluon_narrow", _K2_GLUON_FALLBACK, backend="gluon"
+        f"{kernel}_narrow", _K2_GLUON_FALLBACK, backend="gluon"
     )
     return narrow.kwargs["BW"], narrow.num_warps
 
@@ -964,7 +969,7 @@ def _check_paged_state_cache(
         raise ValueError(f"state_indices and has_initial_state must have N={N} entries")
 
 
-@input_guard(skip=("state_cache", "out"))
+@input_guard(skip=("q", "k", "v", "g", "state_cache", "out"))
 def flash_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1055,6 +1060,24 @@ def flash_kda_fwd(
         if not out.is_contiguous():
             raise ValueError("out must be contiguous")
 
+    use_gluon_k1 = AITER_FDA_USE_GLUON_K1 and _gluon_k1_usable(C, K)
+    use_gluon_k2 = AITER_FDA_USE_GLUON_K2 and _gluon_k2_usable(C, K, V)
+    # The gfx1250 Gluon kernels read q, k, g (K1) and v (K2) at their own token
+    # stride. Every other kernel needs them packed.
+    stride_q = stride_k = stride_g = H * K
+    stride_v = H * V
+    if not (
+        q.is_contiguous()
+        and k.is_contiguous()
+        and g.is_contiguous()
+        and v.is_contiguous()
+    ):
+        tdm = DEVICE_ARCH == "gfx1250"
+        q, stride_q = _tdm_operand(q, tdm and use_gluon_k1)
+        k, stride_k = _tdm_operand(k, tdm and use_gluon_k1)
+        g, stride_g = _tdm_operand(g, tdm and use_gluon_k1)
+        v, stride_v = _tdm_operand(v, tdm and use_gluon_k2)
+
     if cu_seqlens is not None:
         if B != 1:
             raise ValueError(f"Varlen mode requires B=1, got {B}.")
@@ -1115,11 +1138,23 @@ def flash_kda_fwd(
     # here for the same reason.
     ws_inv_mqk = torch.empty(H * total_tiles, 2 * C, C, dtype=torch.float16, device=dev)
 
-    use_gluon_k1 = AITER_FDA_USE_GLUON_K1 and _gluon_k1_usable(C, K)
     if use_gluon_k1:
-        from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn.flash_kda_k1 import (
-            gluon_k1_prepare,
-        )
+        if DEVICE_ARCH == "gfx1250":
+            from aiter.ops.triton._gluon_kernels.gfx1250.kimi_delta_attn.flash_kda_k1 import (
+                gluon_k1_prepare,
+            )
+
+            k1_strides = {
+                "stride_q": stride_q,
+                "stride_k": stride_k,
+                "stride_g": stride_g,
+            }
+        else:
+            from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn.flash_kda_k1 import (
+                gluon_k1_prepare,
+            )
+
+            k1_strides = {}
 
         gluon_k1_prepare(
             q=q,
@@ -1147,6 +1182,7 @@ def flash_kda_fwd(
             B=B,
             CM_WS=CM_STORE,
             CM_LOAD=CM_LOAD,
+            **k1_strides,
         )
     else:
         _prepare_fast[(total_tiles if cu_seqlens is not None else NT, B * H)](
@@ -1191,7 +1227,11 @@ def flash_kda_fwd(
             h0 = h0.transpose(-1, -2)
         h0 = h0.contiguous()
 
-    o = out if out is not None else torch.empty_like(v)
+    o = (
+        out
+        if out is not None
+        else torch.empty_like(v, memory_format=torch.contiguous_format)
+    )
     final_state = None
     store_final = output_final_state or paged
     if output_final_state and not paged:
@@ -1229,20 +1269,29 @@ def flash_kda_fwd(
         "has_initial_state": has_initial_state,
         "cache_stride": cache_stride,
     }
+    unpaged_args = {
+        "state_cache": None,
+        "state_indices": None,
+        "has_initial_state": None,
+        "cache_stride": 0,
+    }
 
-    # Only pass A can go to Gluon, so an unsegmented shape reaches none of it.
-    use_gluon_k2 = AITER_FDA_USE_GLUON_K2 and _gluon_k2_usable(C, K, V) and max_segs > 1
-    _log_route(use_gluon_k1, use_gluon_k2, C, K, V)
+    # Only a segmented shape has a pass A.
+    use_gluon_k2a = use_gluon_k2 and max_segs > 1
+    use_gluon_k2c = use_gluon_k2 and _GLUON_K2C_ARCH_OK
+    _log_route(use_gluon_k1, use_gluon_k2a or use_gluon_k2c, C, K, V)
+    if use_gluon_k2a or use_gluon_k2c:
+        if DEVICE_ARCH == "gfx1250":
+            from aiter.ops.triton._gluon_kernels.gfx1250.kimi_delta_attn import (
+                flash_kda_k2 as _g2,
+            )
+        else:
+            from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn import (
+                flash_kda_k2 as _g2,
+            )
 
     def _launch_k2(*, W, **kw):
-        launch_args = {
-            **common,
-            "state_cache": None,
-            "state_indices": None,
-            "has_initial_state": None,
-            "cache_stride": 0,
-            **kw,
-        }
+        launch_args = {**common, **unpaged_args, **kw}
         return _segment_fast[
             lambda meta, _w=W: (triton.cdiv(_w, meta["BW"]), num_segs * H)
         ](W=W, **launch_args)
@@ -1252,11 +1301,32 @@ def flash_kda_fwd(
         # parallel across segments. Neither writes outputs.
         b_seg = torch.empty(num_segs, H, K, V, dtype=torch.float32, device=dev)
         A_seg = torch.empty(num_segs, H, K, K, dtype=torch.bfloat16, device=dev)
-        if use_gluon_k2:
-            from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn import (
-                flash_kda_k2 as _g2,
+        if use_gluon_k2a and DEVICE_ARCH == "gfx1250":
+            bw, nw = _k2_gluon_schedule(V, num_segs, H)
+            _g2.gluon_k2_ab_fused(
+                ws_kd=ws_kd,
+                ws_kr=ws_kr,
+                ws_gt=ws_gt,
+                ws_inv_mqk=ws_inv_mqk,
+                v_input=v,
+                beta_raw=beta,
+                h_out_b=b_seg,
+                h_out_a=A_seg,
+                seg_chunk_base=seg_chunk_base,
+                seg_nchunks=seg_nchunks,
+                seg_tok_base=seg_tok_base,
+                seg_tok_end=seg_tok_end,
+                TOTAL_TILES=total_tiles,
+                stride_v=stride_v,
+                H=H,
+                K=K,
+                V=V,
+                C=C,
+                num_segs=num_segs,
+                BW=bw,
+                num_warps=nw,
             )
-
+        elif use_gluon_k2a:
             bw, nw = _k2_gluon_schedule(V, num_segs, H)
             _g2.k2_ab_fused_fast[(triton.cdiv(V, bw), num_segs * H)](
                 ws_kd=ws_kd,
@@ -1320,20 +1390,54 @@ def flash_kda_fwd(
         h_in = None if paged else h0
 
     # Pass C: re-run each segment from its true incoming state, writing outputs.
-    _launch_k2(
-        v_input=v,
-        out=o,
-        h_in=h_in,
-        h_out=None,
-        final_state=final_state,
-        W=V,
-        INIT_IDENTITY=False,
-        HAS_H_IN=h_in is not None or paged,
-        HAS_V=True,
-        COMPUTE_OUTPUT=True,
-        STORE_H_OUT=False,
-        STORE_FINAL=store_final,
-        **(paged_args if paged else {}),
-    )
+    if use_gluon_k2c:
+        bw, nw = _k2_gluon_schedule(V, num_segs, H, "k2_c_gluon")
+        _g2.gluon_k2_c(
+            ws_kd=ws_kd,
+            ws_qd=ws_qd,
+            ws_kr=ws_kr,
+            ws_gt=ws_gt,
+            ws_inv_mqk=ws_inv_mqk,
+            v_input=v,
+            beta_raw=beta,
+            out=o,
+            h_in=h_in,
+            final_state=final_state,
+            seg_chunk_base=seg_chunk_base,
+            seg_nchunks=seg_nchunks,
+            seg_tok_base=seg_tok_base,
+            seg_tok_end=seg_tok_end,
+            seg_seq=seg_seq,
+            seg_is_last=seg_is_last,
+            **(paged_args if paged else unpaged_args),
+            TOTAL_TILES=total_tiles,
+            stride_v=stride_v,
+            H=H,
+            K=K,
+            V=V,
+            C=C,
+            num_segs=num_segs,
+            BW=bw,
+            num_warps=nw,
+            STORE_FINAL=store_final,
+            STATE_V_FIRST=state_v_first,
+            CM_OUT=CM_OUT_STORE,
+        )
+    else:
+        _launch_k2(
+            v_input=v,
+            out=o,
+            h_in=h_in,
+            h_out=None,
+            final_state=final_state,
+            W=V,
+            INIT_IDENTITY=False,
+            HAS_H_IN=h_in is not None or paged,
+            HAS_V=True,
+            COMPUTE_OUTPUT=True,
+            STORE_H_OUT=False,
+            STORE_FINAL=store_final,
+            **(paged_args if paged else {}),
+        )
 
     return o, final_state
