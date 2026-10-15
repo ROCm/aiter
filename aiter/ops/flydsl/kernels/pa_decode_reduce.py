@@ -77,13 +77,12 @@ def compile_pa_decode_ps_reduce(
     bounded_logits: bool = False,
     vectorize_plan_logits: bool = False,
     compact_plan: bool = False,
-    parallel_d256: bool = False,
 ):
     """Build PA decode's partitioned-softmax reducer.
 
-    D128/NP>64 shares weights in LDS unless ``compact_plan`` selects
-    a two-wave CTA. ``parallel_d256`` selects the same LDS reducer for D256
-    with NP>64 and four partition groups. Other shapes stay register-only.
+    D128 and D256 with NP>64 share weights in LDS across partition groups,
+    unless ``compact_plan`` (D128 only) selects a two-wave CTA. Other shapes
+    stay register-only.
     Sinks are per-head zero-value logits: include them in the shared maximum
     for stability and add their denominator mass once after summing KV.
     ``query_group_size`` is None for runtime GQA, or a matching positive value.
@@ -115,8 +114,6 @@ def compile_pa_decode_ps_reduce(
         )
     if compact_plan and (head_size != 128 or max_context_partition_num <= 64):
         raise ValueError("compact_plan requires a planned D128 reducer with NP>64")
-    if parallel_d256 and (head_size != 256 or max_context_partition_num <= 64):
-        raise ValueError("parallel_d256 requires a D256 reducer with NP>64")
     static_query_group_size = query_group_size
     planned_elements_per_thread = 2 if vectorize_plan_logits else 1
 
@@ -135,10 +132,11 @@ def compile_pa_decode_ps_reduce(
         offset for offset in (32, 16, 8, 4, 2, 1) if offset < reduce_width
     ]
 
-    # D256 has four head waves; four partition groups stay within 1024 threads.
     use_parallel_lds = (
-        head_size == 128 and max_context_partition_num > warp_size and not compact_plan
-    ) or parallel_d256
+        head_size in (128, 256)
+        and max_context_partition_num > warp_size
+        and not compact_plan
+    )
     if use_parallel_lds and not bounded_logits:
         raise ValueError(
             "the NP>64 LDS reducer requires bounded_logits "
@@ -146,10 +144,8 @@ def compile_pa_decode_ps_reduce(
         )
     parallel_groups = 1
     if use_parallel_lds:
-        if parallel_d256:
-            parallel_groups = 4
-        else:
-            parallel_groups = 2 if max_context_partition_num <= 96 else 8
+        # One wave per 64 outputs; partition groups fill up to 1024 threads.
+        parallel_groups = 2 if max_context_partition_num <= 96 else 1024 // head_size
     head_waves = head_size // warp_size
     worker_waves = head_waves * parallel_groups
     block_shape = (

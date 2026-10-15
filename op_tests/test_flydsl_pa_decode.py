@@ -324,21 +324,24 @@ _PIPE_CASES = [
             "staged": False,
         },
     ),
-    # Above 64 partitions the head-256 reducer splits partitions over four
-    # groups; 130 leaves the last group short, and sequences with few or no
-    # tasks exercise the inactive-partition masking. A dropped row or tile
-    # changes a channel.
-    (
-        "d256-page64-q4-np130",
-        {
-            **_PIPE_BASE,
-            "query_length": 4,
-            "lengths": (0, 1, 257, 66532),
-            "max_partitions": 130,
-            "budget": 130,
-            "pattern": "one_hot_v",
-            "parallel_reduce": True,
-        },
+    # Above 64 partitions the head-256 reducer splits partitions over two
+    # groups up to 96 and four beyond; 81 and 130 leave the last group short,
+    # and sequences with few or no tasks exercise the inactive-partition
+    # masking. A dropped row or tile changes a channel.
+    *(
+        (
+            f"d256-page64-q4-np{partitions}",
+            {
+                **_PIPE_BASE,
+                "query_length": 4,
+                "lengths": (0, 1, 257, 66532),
+                "max_partitions": partitions,
+                "budget": partitions,
+                "pattern": "one_hot_v",
+                "parallel_reduce": True,
+            },
+        )
+        for partitions in (81, 130)
     ),
     # A head-major pool of 2**15 + 1 blocks puts KV head 2 past 2**31 bytes, so
     # the host must select wide addressing and widen the head term. 288 CTAs
@@ -507,7 +510,9 @@ def _check_pipe_policy(case, arch, compile_kwargs, reducer_kwargs):
             if case["nhd_bufs"]:
                 assert nhd_bufs == case["nhd_bufs"]
     if case["parallel_reduce"] is not None:
-        assert reducer_kwargs[-1]["parallel_d256"] == case["parallel_reduce"]
+        # Head 256 reduces in LDS exactly when the plan allows NP>64.
+        parallel = reducer_kwargs[-1]["max_context_partition_num"] > 64
+        assert parallel == case["parallel_reduce"]
 
 
 def _check_nhd_contracts(pa, output, arguments, options, plan, check):
