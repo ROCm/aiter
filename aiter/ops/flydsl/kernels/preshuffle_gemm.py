@@ -990,10 +990,10 @@ def compile_preshuffle_gemm(
                 s_a_vals, s_b_vals, bias_vals = load_epi_operands()
 
             def apply_activation(val_s):
-                # ReLU/SiLU/GeLU : maximumf for relu; exp+rcp for silu;
+                # ReLU/SiLU/GeLU : fx.max for relu; exp+rcp for silu;
                 # tanh-approx gelu expanded through a non-positive exponent (no overflow).
                 if const_expr(_has_relu):
-                    return fx.Float32(val_s).maximumf(fx.Float32(0.0))
+                    return fx.max(fx.Float32(val_s), fx.Float32(0.0))
                 if const_expr(_has_silu):
                     exp_neg = math.exp(val_s * fx.Float32(-1.0))
                     return val_s * (fx.Float32(1.0) / (fx.Float32(1.0) + exp_neg))
@@ -1004,7 +1004,7 @@ def compile_preshuffle_gemm(
                     two_f32 = fx.Float32(2.0)
                     x3 = val_s * val_s * val_s
                     y = fx.Float32(0.7978845608) * (val_s + fx.Float32(0.044715) * x3)
-                    abs_y = fx.Float32(y).maximumf(zero_f32 - y)
+                    abs_y = fx.max(fx.Float32(y), zero_f32 - y)
                     e_neg2abs = math.exp(fx.Float32(-2.0) * abs_y)
                     denom = one_f32 + e_neg2abs
                     numerator = (y > zero_f32).select(two_f32, two_f32 * e_neg2abs)
