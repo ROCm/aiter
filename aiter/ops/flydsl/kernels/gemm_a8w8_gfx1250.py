@@ -331,28 +331,30 @@ def launch_gemm_a8w8(
                 if const_expr(a_scale_preshuffled):
                     sa_off0 = blk_m64 // 32 * k64
                     gSA_full = _gv(arg_scale_a, sa_off0, (sa_oob, i32_k), (k64, 1))
+                    sSA_box = fx.make_layout(SA_SHAPE, (SA_SHAPE[1], 1))
+                    atomSA, coordSA = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                        fx.rocdl.TensorLoad(), gSA_full, sSA_box, SA_SHAPE, num_warps=1
+                    )
+                    atomSA = fx.atom_set_value(atomSA, "workgroup_mask", a_mask)
+                    blkSA = fx.zipped_divide(coordSA, SA_SHAPE)[None, (0, None)]
+                    sSA_lds = fx.Tensor(
+                        fx.make_view(
+                            fx.add_offset(base_ptr, SA_OFF),
+                            fx.make_layout(
+                                (SA_SHAPE, num_buffers), ((SA_SHAPE[1], 1), PITCH)
+                            ),
+                        )
+                    )
+                    tSAsSA, tSAgSA = fx.rocdl.cdna5.tdm_partition(
+                        atomSA, 0, WARP1, sSA_lds, blkSA
+                    )
                 else:
                     sa_off0 = blk_m64 * (k64 // 32)
-                    gSA_full = _gv(
-                        arg_scale_a, sa_off0, (sa_oob, i32_k // 32), (k64 // 32, 1)
-                    )
-                sSA_box = fx.make_layout(SA_SHAPE, (SA_SHAPE[1], 1))
-                atomSA, coordSA = fx.rocdl.cdna5.make_tiled_tdm_atom(
-                    fx.rocdl.TensorLoad(), gSA_full, sSA_box, SA_SHAPE, num_warps=1
-                )
-                atomSA = fx.atom_set_value(atomSA, "workgroup_mask", a_mask)
-                blkSA = fx.zipped_divide(coordSA, SA_SHAPE)[None, (0, None)]
-                sSA_lds = fx.Tensor(
-                    fx.make_view(
-                        fx.add_offset(base_ptr, SA_OFF),
-                        fx.make_layout(
-                            (SA_SHAPE, num_buffers), ((SA_SHAPE[1], 1), PITCH)
-                        ),
-                    )
-                )
-                tSAsSA, tSAgSA = fx.rocdl.cdna5.tdm_partition(
-                    atomSA, 0, WARP1, sSA_lds, blkSA
-                )
+                    gSA = _gv(arg_scale_a, sa_off0, SA_SHAPE, (tile_k // 32, 1))
+                    atomSA = _tdm1(gSA, sa_oob, None, k64 // 32, a_mask)
+
+                    def sa_imm(kt):
+                        return fx.Int64(kt) * (tile_k // 32)
 
                 sb_off0 = blk_n64 // 32 * k64
                 gSB_full = _gv(arg_scale_b, sb_off0, (SB_SHAPE[0], i32_k), (k64, 1))
@@ -413,8 +415,17 @@ def launch_gemm_a8w8(
                 fx.copy(atomB, tBgB[None, kti], tBsB[None, s])
             if const_expr(is_mxscale and not preload):
                 if const_expr(mx32):
-                    if wave == W_SA:
-                        fx.copy(atomSA, tSAgSA[None, kti], tSAsSA[None, s])
+                    if const_expr(a_scale_preshuffled):
+                        if wave == W_SA:
+                            fx.copy(atomSA, tSAgSA[None, kti], tSAsSA[None, s])
+                    else:
+                        _wcopy(
+                            W_SA,
+                            atomSA,
+                            gSA,
+                            _lv(fx.add_offset(pa, SA_OFF), SA_SHAPE, (SA_SHAPE[1], 1)),
+                            sa_imm(ktg),
+                        )
                     if wave == W_SB:
                         fx.copy(atomSB, tSBgSB[None, kti], tSBsSB[None, s])
                 else:
