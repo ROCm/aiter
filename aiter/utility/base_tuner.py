@@ -9,6 +9,7 @@ import tempfile
 import time
 from abc import abstractmethod
 from operator import itemgetter
+from pathlib import Path
 from typing import Any, ClassVar
 
 import pandas as pd
@@ -16,11 +17,14 @@ import torch
 
 from aiter import dtypes, logger
 from aiter.jit.utils import chip_info
+from aiter.utility import selection_proof
 from aiter.utility.tuning_policy import (
     DEFAULT_MEASUREMENT,
     DEFAULT_PROMOTION,
     DEFAULT_RUN,
 )
+
+_REPOSITORY_ROOT = str(Path(__file__).resolve().parents[2])
 
 INVALID_TIME = -1
 
@@ -600,13 +604,76 @@ class TunerCommon:
     def update_tflops_bw(self, tune_file):
         """update tflops and bw from old tune_file"""
 
+    # Fresh-process selection proof (aiter/utility/selection_proof.py). A
+    # family opts in by naming the module whose ``--_selection_probe`` entry
+    # calls run_selection_probe, by recording its dispatch with
+    # record_selection, and by implementing expected_selection.
+    SELECTION_PROBE_MODULE: ClassVar[str | None] = None
+    SELECTION_FAMILY: ClassVar[str | None] = None
+
+    def expected_selection(self, row) -> dict[str, Any] | None:
+        """The selection a fresh process must record when it runs ``row``.
+
+        None checks only that the public operator runs and is correct, which
+        is right for an untuned row that should stay on auto-select.
+        """
+        return None
+
+    def prove_selection(self, row, config_file, args):
+        """Prove in a fresh process that ``config_file`` makes the public
+        operator dispatch ``row`` the way the row says, and time it there.
+        ``config_file=None`` leaves the family's config as the caller has it."""
+        if self.SELECTION_PROBE_MODULE is None:
+            raise NotImplementedError(f"{self.name} has no selection probe")
+        probe_row = {
+            str(key): value.item() if hasattr(value, "item") else value
+            for key, value in row.items()
+            if pd.notna(value)
+        }
+        extra_env = {}
+        if "gpu_model" in probe_row:
+            extra_env["AITER_GPU_MODEL"] = str(probe_row["gpu_model"])
+        return selection_proof.prove_selection(
+            family=self.SELECTION_FAMILY or self.name,
+            probe_module=self.SELECTION_PROBE_MODULE,
+            row=probe_row,
+            expected=self.expected_selection(row),
+            config_env=self.get_arg_defaults().get("config_env_name"),
+            config_file=config_file,
+            warmup=args.warmup,
+            iters=args.iters,
+            timeout=args.timeout,
+            repository_root=_REPOSITORY_ROOT,
+            extra_env=extra_env,
+        )
+
     def run_config(self, args):
         """Run the production operator for each shape in the untuned CSV.
         Subclasses should override this to call the actual production operator.
         Returns a list of dicts: [{"shape": str, "us": float, "status": "ok"/"error"}]
+
+        A family with a selection probe gets this for free: each row is proven
+        in a fresh process against the config file run() points it at.
         """
-        logger.info(f"run_config not implemented for {self.name}, skipping benchmark")
-        return []
+        if self.SELECTION_PROBE_MODULE is None:
+            logger.info(
+                f"run_config not implemented for {self.name}, skipping benchmark"
+            )
+            return []
+        env_name = self.get_arg_defaults().get("config_env_name")
+        config_file = os.environ.get(env_name) if env_name else None
+        results = []
+        for _, row in self.untunedf.iterrows():
+            proof = self.prove_selection(row, config_file, args)
+            verified = proof.status == "verified"
+            results.append(
+                {
+                    "shape": str(tuple(row[key] for key in self.keys)),
+                    "e2e_us": proof.latency_us if verified else -1,
+                    "status": "ok" if verified else f"error: {proof.detail}",
+                }
+            )
+        return results
 
     def _clear_op_caches(self):
         """Clear operator-specific config caches. Subclasses should override this

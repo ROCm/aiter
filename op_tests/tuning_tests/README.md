@@ -12,6 +12,7 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `test_mp_tuner_logic.py` | 1 | No | `mp_tuner` polling: timeout, AcceleratorError, KeyError, pool restart |
 | `test_mp_tuner_fault.py` | 2 | Yes | `mp_tuner` with a candidate that faults in-process, kills its worker, or fails while its inputs are prepared: untyped callers get the whole group failed, `return_status` callers keep what was measured and see `not_run` behind the fault, and a shape queued behind a dead worker still finishes |
 | `test_tuning_policy.py` | 1 | No | `aiter/utility/tuning_policy.py`: measurement, run and promotion defaults reach `ARG_DEFAULTS`, policy validation, `gate_against_incumbent` boundaries |
+| `test_selection_proof.py` | 1 | No | `aiter/utility/selection_proof.py` against a stub family: a fresh process that records the row's selection is verified, a different or missing selection and a wrong output are not, and `TunerCommon.run_config` proves rows for a family that opts in |
 | `test_online_tune.py` | 1 | No | `AITER_ONLINE_TUNE` decision logic, `mp_lock` synchronization, MainFunc CSV write, cfg_2stages reload |
 | `test_tune_pipeline.py` | 2 | Yes | End-to-end: run each tuner on small shapes (mp=1 + mp=default), verify output CSV; `--compare --update_improved`; `AITER_ONLINE_TUNE` e2e |
 | `test_asm_splitk_guard.py` | 1 | No | `GemmTuner.asm_gemm_all_solutions` SplitK semaphore grid guard |
@@ -22,7 +23,8 @@ Minimal test suite for validating the aiter tuning infrastructure.
 Fast deterministic tuning validation is part of the normal pull-request test
 sharding through `.github/scripts/split_tests.sh`. That gate includes CSV
 validation, shape-collision checks, the mixed-MXFP tuner unit tests, the
-tuning policy, and the one-GPU `mp_tuner` fault and worker-death tests.
+tuning policy, the selection proof, and the one-GPU `mp_tuner` fault and
+worker-death tests.
 
 The full Level 0+1 workflow repeats the broader CPU suite on its daily/manual
 schedule. GPU tuner-pipeline and all-shape `--run_config` validation remain
