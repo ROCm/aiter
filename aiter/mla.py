@@ -802,6 +802,54 @@ def _mla_decode_fwd_kv_shuffled(
     return o, final_lse
 
 
+def _check_mla_qh64_shuffled_inputs(q, kv, out, qo, indptr, indices, last, splits):
+    """Check the packed CSR contract without synchronizing GPU metadata."""
+    if get_gfx() != "gfx1250":
+        raise RuntimeError("kv_shuffled QH64 requires gfx1250")
+    if not isinstance(q, torch.Tensor) or not q.is_cuda:
+        raise ValueError("Q must be a GPU tensor")
+    if q.ndim != 3 or q.shape[1:] != (64, 576):
+        raise ValueError("Q must be [B,64,576]")
+    batch = q.shape[0]
+
+    def check(tensor, name, dtype, shape=None, contiguous=True):
+        if not isinstance(tensor, torch.Tensor) or tensor.device != q.device:
+            raise ValueError(f"{name} must be on the Q device")
+        if tensor.dtype != dtype:
+            raise ValueError(f"{name} has an unsupported dtype; expected {dtype}")
+        if shape is not None and tuple(tensor.shape) != shape:
+            raise ValueError(f"{name} must be {shape}")
+        if contiguous and not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+
+    check(q, "Q", dtypes.fp8, contiguous=False)
+    if q.stride() != (64 * 768, 768, 1):
+        raise ValueError(
+            "kv_shuffled QH64 requires Q head stride 768 and dense batches"
+        )
+    check(kv, "KV", dtypes.fp8)
+    if (
+        kv.ndim != 4
+        or kv.shape[1:] not in ((1, 64, 576), (64, 1, 576))
+        or kv.stride(0) != 64 * 576
+    ):
+        raise ValueError("KV must be contiguous [P,1,64,576] or [P,64,1,576]")
+    check(out, "out", torch.bfloat16, (batch, 64, 512))
+    if any(t is None for t in (qo, indptr, indices, last)):
+        raise ValueError(
+            "kv_shuffled QH64 requires CSR metadata "
+            "(qo_indptr/kv_indptr/kv_indices/kv_last_page_lens)"
+        )
+    check(qo, "qo_indptr", torch.int32, (batch + 1,))
+    check(indptr, "kv_indptr", torch.int32, (batch + 1,))
+    check(indices, "kv_indices", torch.int32)
+    if indices.ndim != 1:
+        raise ValueError("kv_indices must be one-dimensional")
+    check(last, "kv_last_page_lens", torch.int32, (batch,))
+    if splits is not None and (not isinstance(splits, int) or splits < 1):
+        raise ValueError("num_kv_splits must be a positive integer or None")
+
+
 def mla_decode_fwd(
     q,
     kv_buffer,
@@ -841,64 +889,136 @@ def mla_decode_fwd(
     seq_lens=None,
     page_table=None,
 ):
-    """MLA decode with explicit KV layout selection.
+    """MLA decode with explicit KV byte-layout selection.
 
-    ``token_major`` preserves the existing dispatch, including gfx1250's
-    segmented page64 cache. ``kv_shuffled`` selects gfx1250 FP8 QH128 ASM:
-    one query per sequence, page64, BF16 O, and dense GPU int32
-    ``seq_lens[B]`` / ``page_table[B,max_pages]``. CSR arguments may be None
-    on that path. KV must already use the shuffled byte layout.
+    ``token_major`` preserves the existing segmented page64 dispatch.
+    ``kv_shuffled`` on gfx1250 supports FP8 Q/KV, BF16 O, one query and
+    page64. QH64 uses page-level CSR metadata, a 768-byte Q head stride,
+    and the existing split-K/reducer. QH128 uses dense ``seq_lens[B]`` /
+    ``page_table[B,max_pages]`` and no splitting; its CSR arguments may be None.
+    The cache writer must already supply shuffled NoPE/RoPE planes.
 
-    Shuffled decode returns ``(o, lse)`` with natural-log FP32 LSE when
-    ``return_lse=True``, otherwise ``(o, None)``. CPU FP32 scalar scales
-    (including 0-D tensors) are cached on Q's device by value; None means 1.
-    Warm up with the same device/values before graph capture, or supply GPU
-    FP32 scales. No MTP, KV splitting, persistent scheduling, or CP on this
-    path. ``causal`` has no effect for its single query per sequence.
+    QH128 returns ``(o, lse)``; QH64 preserves the CSR return contract
+    (partial logits when splitting, final output in ``o``). ``return_lse``
+    requests natural-log FP32 final LSE. CPU FP32 scalar scales are cached
+    on Q's device by value; None means 1. Warm up before graph capture or
+    supply GPU scales. Shuffled kernels do not support MTP, persistent
+    scheduling or CP. ``causal`` has no effect for a single query.
     """
-    # ATOM passes kv_indices=None for shuffled caches, so route before any
-    # CSR shape access, allocation, or default-layout metadata planning.
+    kv_shuffled_flag = 0
+    # ATOM's QH128 dense path must route before accessing any CSR metadata.
     if kv_layout == "kv_shuffled":
+        if q.ndim != 3 or q.shape[1] not in (64, 128):
+            raise ValueError(
+                "kv_shuffled Q must be QH64 (CSR) or QH128 (dense page table)"
+            )
+        if q.shape[1] == 128:
+            if max_seqlen_q != 1 or page_size != 64 or nhead_kv != 1:
+                raise ValueError(
+                    "kv_shuffled MLA ASM requires max_seqlen_q=1, page_size=64, "
+                    "and nhead_kv=1"
+                )
+            if num_kv_splits not in (None, 1):
+                raise ValueError("kv_shuffled MLA ASM does not support KV splitting")
+            if return_logits:
+                raise ValueError("kv_shuffled MLA ASM does not return partial logits")
+            if logit_cap > 0:
+                raise ValueError("kv_shuffled MLA ASM does not support logit_cap")
+            if cp_world_size != 1 or cp_rank != 0 or g_kv_indptr is not None:
+                raise ValueError(
+                    "kv_shuffled MLA ASM does not support context parallelism"
+                )
+            if intra_batch_mode or any(
+                metadata is not None
+                for metadata in (
+                    num_kv_splits_indptr,
+                    work_meta_data,
+                    work_indptr,
+                    work_info_set,
+                    reduce_indptr,
+                    reduce_final_map,
+                    reduce_partial_map,
+                )
+            ):
+                raise ValueError(
+                    "kv_shuffled MLA ASM does not use split/persistent metadata"
+                )
+            return _mla_decode_fwd_kv_shuffled(
+                q,
+                kv_buffer,
+                o,
+                seq_lens,
+                page_table,
+                sm_scale,
+                q_scale,
+                kv_scale,
+                return_lse,
+            )
         if max_seqlen_q != 1 or page_size != 64 or nhead_kv != 1:
             raise ValueError(
-                "kv_shuffled MLA ASM requires max_seqlen_q=1, page_size=64, "
-                "and nhead_kv=1"
+                "kv_shuffled QH64 requires max_seqlen_q=1, page_size=64, and nhead_kv=1"
             )
-        if num_kv_splits not in (None, 1):
-            raise ValueError("kv_shuffled MLA ASM does not support KV splitting")
-        if return_logits:
-            raise ValueError("kv_shuffled MLA ASM does not return partial logits")
         if logit_cap > 0:
-            raise ValueError("kv_shuffled MLA ASM does not support logit_cap")
+            raise ValueError("kv_shuffled QH64 does not support logit_cap")
         if cp_world_size != 1 or cp_rank != 0 or g_kv_indptr is not None:
-            raise ValueError("kv_shuffled MLA ASM does not support context parallelism")
+            raise ValueError("kv_shuffled QH64 does not support context parallelism")
         if intra_batch_mode or any(
             metadata is not None
             for metadata in (
-                num_kv_splits_indptr,
                 work_meta_data,
                 work_indptr,
                 work_info_set,
                 reduce_indptr,
                 reduce_final_map,
                 reduce_partial_map,
+                seq_lens,
+                page_table,
             )
         ):
             raise ValueError(
-                "kv_shuffled MLA ASM does not use split/persistent metadata"
+                "kv_shuffled QH64 requires CSR, without dense/persistent metadata"
             )
-        return _mla_decode_fwd_kv_shuffled(
+        _check_mla_qh64_shuffled_inputs(
             q,
             kv_buffer,
             o,
-            seq_lens,
-            page_table,
-            sm_scale,
-            q_scale,
-            kv_scale,
-            return_lse,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            num_kv_splits,
         )
-    if kv_layout != "token_major":
+        if num_kv_splits_indptr is not None and (
+            num_kv_splits_indptr.device != q.device
+            or num_kv_splits_indptr.dtype != torch.int32
+            or not num_kv_splits_indptr.is_contiguous()
+            or num_kv_splits_indptr.shape != qo_indptr.shape
+        ):
+            raise ValueError(
+                "num_kv_splits_indptr must be contiguous int32 [B+1] on Q device"
+            )
+        q_scale = _mla_scale_on_device(q_scale, q, "q_scale")
+        kv_scale = _mla_scale_on_device(kv_scale, q, "kv_scale")
+        sm_scale = 576**-0.5 if sm_scale is None else float(sm_scale)
+        if not math.isfinite(sm_scale):
+            raise ValueError("softmax_scale must be finite")
+        kv_shuffled_flag = 1
+        if q.shape[0] == 0:
+            return o, (
+                torch.empty((0, 64), dtype=torch.float32, device=q.device)
+                if return_lse
+                else None
+            )
+        # Empty CSR can have no indices at all. The auto heuristic otherwise
+        # caps to zero splits, although stage1 still needs one workgroup.
+        if kv_indices.numel() == 0:
+            num_kv_splits = 1 if num_kv_splits is None else num_kv_splits
+            if num_kv_splits_indptr is None:
+                num_kv_splits_indptr = (
+                    torch.arange(q.shape[0] + 1, dtype=torch.int32, device=q.device)
+                    * num_kv_splits
+                )
+    elif kv_layout != "token_major":
         raise ValueError(f"unknown MLA kv_layout: {kv_layout!r}")
 
     device = q.device
@@ -969,7 +1089,18 @@ def mla_decode_fwd(
         ):
             mgc = 64
 
-        MAYBE_FINAL_OUT = True
+        # QH64's BF16 direct-output epilogue does not write LSE. Request FP32
+        # partials and merge even a single split when the caller needs LSE.
+        fp32_single_split_lse = (
+            return_lse
+            and num_kv_splits == 1
+            and nhead == 64
+            and max_seqlen_q == 1
+            and get_gfx() == "gfx1250"
+            and q.dtype == dtypes.fp8
+            and kv_buffer.dtype == dtypes.fp8
+        )
+        MAYBE_FINAL_OUT = not fp32_single_split_lse
 
         if nhead in [8, 16] and max_seqlen_q == 1:
             MAYBE_FINAL_OUT = False
@@ -978,6 +1109,7 @@ def mla_decode_fwd(
             o.view((total_s, num_kv_splits, nhead, v_head_dim))
             if (
                 num_kv_splits == 1
+                and not fp32_single_split_lse
                 and (
                     q.dtype == dtypes.fp8
                     or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
@@ -1047,18 +1179,25 @@ def mla_decode_fwd(
             valid_split_count,
             use_valid_split_count_reduce,
             causal,
+            kv_shuffled=kv_shuffled_flag,
         )
 
-        if num_kv_splits == 1 and (
-            q.dtype == dtypes.fp8
-            or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
-            or (
-                q.dtype == dtypes.bf16
-                and kv_buffer.dtype == dtypes.bf16
-                and nhead == 32
-            )
-            or (
-                q.dtype == dtypes.bf16 and kv_buffer.dtype == dtypes.bf16 and nhead == 8
+        if (
+            num_kv_splits == 1
+            and not fp32_single_split_lse
+            and (
+                q.dtype == dtypes.fp8
+                or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
+                or (
+                    q.dtype == dtypes.bf16
+                    and kv_buffer.dtype == dtypes.bf16
+                    and nhead == 32
+                )
+                or (
+                    q.dtype == dtypes.bf16
+                    and kv_buffer.dtype == dtypes.bf16
+                    and nhead == 8
+                )
             )
         ):
             lse = final_lse if return_lse else attn_lse
@@ -1108,6 +1247,8 @@ def mla_decode_fwd(
             num_stages=2,
             **extra_kargs,
         )
+        if fp32_single_split_lse:
+            return o, final_lse
     else:
         if num_kv_splits is None:
             num_kv_splits = get_mla_decode_fwd_max_splits(

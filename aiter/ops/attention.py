@@ -887,6 +887,7 @@ def mla_decode_stage1_asm_fwd(
     valid_split_count: torch.Tensor | None = None,
     use_valid_split_count_reduce: int = 0,
     causal: bool = True,
+    kv_shuffled: int = 0,
 ) -> None: ...
 
 

@@ -176,8 +176,8 @@ std::string get_heuristic_kernel_mla(std::string q_type,
             continue;
         const auto& cfg = el.second;
 
-        // Defaults preserve legacy ABI selection; shuffled page64 uses the
-        // dedicated 88-byte QH128 launcher.
+        // Layout and GQA jointly select the ABI: shuffled QH64 uses packed CSR,
+        // while shuffled QH128 uses its dedicated dense-table launcher.
         if (cfg.page_size != page_size || cfg.kv_shuffled != kv_shuffled)
             continue;
 
@@ -306,6 +306,7 @@ static void mla_decode_gfx1250_dispatch(
     aiter_tensor_t* kv_scale,
     aiter_tensor_t* valid_split_count,
     int use_valid_split_count_reduce,
+    int kv_shuffled,
     hipStream_t stream)
 {
     (void)lse;
@@ -391,8 +392,12 @@ static void mla_decode_gfx1250_dispatch(
     }
     // ABI contract with the gfx1250 .co: with out_16_nosplit==1 the passes==1
     // fast-path writes FINAL bf16 output directly into R. For passes>1, R holds
-    // fp32 split partials that Python reduces in stage2.
-    const auto expected_split_dtype = (kv_split == 1) ? AITER_DTYPE_bf16 : AITER_DTYPE_fp32;
+    // fp32 split partials that Python reduces in stage2. QH64 also uses this
+    // mode with one split when LSE is requested: its BF16 epilogue omits LSE.
+    const bool fp32_single_split_lse = kv_split == 1 && gqa_ratio == 64 &&
+                                       max_seqlen_q == 1 && lse != nullptr;
+    const auto expected_split_dtype = (kv_split == 1 && !fp32_single_split_lse)
+                                          ? AITER_DTYPE_bf16 : AITER_DTYPE_fp32;
     AITER_CHECK(splitData->dtype() == expected_split_dtype,
                 __func__,
                 ": gfx1250 gfx1250 MLA splitData (R) dtype mismatch; expected ",
@@ -406,9 +411,24 @@ static void mla_decode_gfx1250_dispatch(
                 ": gfx1250 gfx1250 MLA requires splitLse to be fp32; got ",
                 AiterDtype_to_str(splitLse->dtype()));
 
+    AITER_CHECK(kv_shuffled == 0 || kv_shuffled == 1, __func__, ": kv_shuffled must be 0 or 1");
+    if(kv_shuffled)
+    {
+        AITER_CHECK(gqa_ratio == 64 && max_seqlen_q == 1, __func__,
+                    ": kv_shuffled packed dispatch requires gqa64 x qSeqLen1");
+        AITER_CHECK(Q->stride(1) == 768, __func__,
+                    ": kv_shuffled QH64 requires Q head stride 768");
+        AITER_CHECK(KV->dim() == 4 && KV->is_contiguous() &&
+                        KV->size(3) == 576 && KV->size(1) * KV->size(2) == 64 &&
+                        (KV->size(1) == 1 || KV->size(2) == 1) &&
+                        KV->stride(0) * KV->element_size() == 64 * 576,
+                    __func__, ": kv_shuffled KV requires contiguous page64 storage");
+    }
+
     CFG* config_map = &cfg_mla_asm;
-    std::string kernelName =
-        get_heuristic_kernel_mla("fp8", "fp8", gqa_ratio, 0, 0, 0, max_seqlen_q, arch_id, config_map, 0);
+    std::string kernelName = get_heuristic_kernel_mla(
+        "fp8", "fp8", gqa_ratio, 0, 0, 0, max_seqlen_q, arch_id, config_map,
+        0, 0, kv_shuffled ? 64 : 0, kv_shuffled);
     AITER_CHECK(!kernelName.empty(), __func__, ": cannot find suitable gfx1250 kernel");
 
     static SynchronizedCache<std::string_view, AiterAsmKernel> gfx1250_impl_ptr_map;
@@ -437,7 +457,7 @@ static void mla_decode_gfx1250_dispatch(
         static_cast<unsigned int>(nhead_kv * q_seq_lens_kernel * qk_head_dim * q_elem_size);
     const unsigned int stride_page = static_cast<unsigned int>(KV->stride(0) * KV->element_size());
     const unsigned int log2_page = static_cast<unsigned int>(log2f(static_cast<float>(page_size)));
-    const unsigned int out_16_nosplit = (kv_split == 1) ? 1 : 0;
+    const unsigned int out_16_nosplit = (kv_split == 1 && !fp32_single_split_lse) ? 1 : 0;
 
     MlaGfx1250KernelArgs legacy_args = {};
     MlaGfx1250PackedKernelArgs packed_args = {};
@@ -512,7 +532,7 @@ static void mla_decode_gfx1250_dispatch(
     }
     std::printf("[aiter][gfx1250][debug] inputs: arch=%s batch=%d num_heads=%d nhead_kv=%d "
                 "gqa_ratio=%d max_seqlen_q=%d page_size=%d qk_head_dim=%d q_elem_size=%d "
-                "kv_split=%d softmax_scale=%g\n",
+                "kv_split=%d softmax_scale=%g kv_shuffled=%d\n",
                 arch_id.c_str(),
                 batch,
                 num_heads,
@@ -523,7 +543,8 @@ static void mla_decode_gfx1250_dispatch(
                 qk_head_dim,
                 q_elem_size,
                 kv_split,
-                softmax_scale);
+                softmax_scale,
+                kv_shuffled);
     std::printf("[aiter][gfx1250][debug] tensor shapes: Q=(%ld,%ld,%ld) KV=(%ld,%ld,%ld,%ld) "
                 "splitData=(%ld,%ld,%ld,%ld) splitLse=(%ld,%ld,%ld,%ld) output=(%ld,%ld,%ld)\n",
                 Q->size(0),
@@ -694,9 +715,19 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     aiter_tensor_t* valid_split_count,    //   [batch_size] scratch for packed gfx1250 kernels (nullable)
     int use_valid_split_count_reduce,     //   enable packed-kernel valid split count writeback/reduce
     int causal,                           //   apply the causal mask across the max_seqlen_q query tokens
+    int kv_shuffled,                      //   QH64 page64 shuffled storage (packed CSR ABI)
     hipStream_t stream),
-    (Q, KV, qo_indptr, kv_indptr, kv_page_indices, kv_last_page_lens, num_kv_splits_indptr, work_meta_data, work_indptr, work_info_set, max_seqlen_q, page_size, nhead_kv, softmax_scale, splitData, splitLse, output, lse, q_scale, kv_scale, g_kv_indptr, cp_world_size, cp_rank, valid_split_count, use_valid_split_count_reduce, causal, stream))
-{    
+    (Q, KV, qo_indptr, kv_indptr, kv_page_indices, kv_last_page_lens, num_kv_splits_indptr, work_meta_data, work_indptr, work_info_set, max_seqlen_q, page_size, nhead_kv, softmax_scale, splitData, splitLse, output, lse, q_scale, kv_scale, g_kv_indptr, cp_world_size, cp_rank, valid_split_count, use_valid_split_count_reduce, causal, kv_shuffled, stream))
+{
+    if(kv_shuffled)
+    {
+        AITER_CHECK(Q != nullptr && Q->dim() == 3 && qo_indptr != nullptr &&
+                        kv_indptr != nullptr && kv_page_indices != nullptr &&
+                        kv_last_page_lens != nullptr && splitData != nullptr && nhead_kv == 1,
+                    __func__, ": kv_shuffled QH64 requires Q and CSR metadata");
+        AITER_CHECK(cp_world_size == 1 && cp_rank == 0 && g_kv_indptr == nullptr,
+                    __func__, ": kv_shuffled QH64 does not support context parallelism");
+    }
     int batch           = qo_indptr->size(0) - 1;
     int num_heads       = Q->size(1);
     int head_size       = Q->size(2);
@@ -733,8 +764,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                                          kv_scale,
                                          valid_split_count,
                                          use_valid_split_count_reduce,
+                                         kv_shuffled,
                                          stream);
     }
+
+    AITER_CHECK(kv_shuffled == 0, __func__, ": kv_shuffled requires gfx1250");
 
     int stride_Q       = Q->stride(0) * Q->element_size() * max_seqlen_q;
     int stride_Page    = KV->stride(0) * KV->element_size();
