@@ -68,6 +68,36 @@ def _graph_err(fn, ref, mode):
 _ROTATE_BYTES = 512 * 2**20
 
 
+def _splits_error(T, H, splits):
+    """The validator's complaint about this SPLITS, or None if it takes it.
+
+    Asked of check_config rather than re-derived here, so the rule stays in one place.
+    A caller that passes a config gets BLOCK_M and CHUNK_C from MHC_SEAM_DEFAULTS,
+    which is what both callers below do.
+    """
+    from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+    from aiter.ops.flydsl.kernels import mhc_seam
+    from aiter.ops.flydsl.mhc_seam_kernels import MHC_SEAM_DEFAULTS
+
+    try:
+        mhc_seam.check_config(
+            T,
+            H,
+            4,
+            MHC_SEAM_DEFAULTS["BLOCK_M"],
+            MHC_SEAM_DEFAULTS["CHUNK_C"],
+            splits,
+            lds_bytes=get_lds_capacity_bytes(get_gfx()),
+        )
+    except ValueError as e:
+        return str(e)
+    return None
+
+
+def _smallest_illegal_splits(T, H):
+    return next(sp for sp in range(2, H + 1) if _splits_error(T, H, sp))
+
+
 def _with_fn(op, fn):
     """``op`` with the weight bound outside its arguments. run_perftest's rotation deep-copies
     every argument, and a copied ``fn`` makes the seam repack it on every call, which
@@ -124,18 +154,47 @@ def _graph_us(op, args, kw, T, replays=10):
     return us
 
 
-@benchmark()
-def test_mhc_seam(T, H, mode):
+@functools.lru_cache(maxsize=None)
+def _warn_triton_skip(span, H, T):
+    aiter.logger.warning(
+        "triton seam needs H %% %d == 0; skipping it at H=%d, T=%d", span, H, T
+    )
+
+
+def _seam_ops(T, H):
+    """The seams to time against each other at this shape.
+
+    The triton seam's tuned config fixes NUM_KSPLIT * TILE_K and its k-loop has no column
+    mask, so it only launches where H divides that product: every T at H = 5120, not the
+    small-T configs at 4096 or 7168. Skip it there rather than fail the sweep.
+    """
     from aiter.ops.flydsl import flydsl_mhc_seam
     from aiter.ops.triton.fusions.mhc_fused_post_pre_delayed_rmsnorm import (
+        get_mhc_fused_post_pre_delayed_rmsnorm_config,
         mhc_fused_post_pre_delayed_rmsnorm,
     )
 
+    ops = {"flydsl": flydsl_mhc_seam}
+    if not T:  # the triton seam returns before it reads a config
+        ops["triton_seam"] = mhc_fused_post_pre_delayed_rmsnorm
+        return ops
+
+    cfg = get_mhc_fused_post_pre_delayed_rmsnorm_config(T)
+    span = cfg["NUM_KSPLIT"] * cfg["TILE_K"]
+    if H % span:
+        _warn_triton_skip(span, H, T)  # once per shape, not once per mode
+        return ops
+
+    ops["triton_seam"] = mhc_fused_post_pre_delayed_rmsnorm
+    return ops
+
+
+@benchmark()
+def test_mhc_seam(T, H, mode):
+    from aiter.ops.flydsl import flydsl_mhc_seam
+
     args, kw, ref = _call_kwargs(mode, T, H)
-    ops = {
-        "flydsl": flydsl_mhc_seam,
-        "triton_seam": mhc_fused_post_pre_delayed_rmsnorm,
-    }
+    ops = _seam_ops(T, H)
     ret = {"gfx": get_gfx()}
     for name, op in ops.items():
         if not T:  # empty-batch edge case: the call must return, nothing to time
@@ -154,10 +213,11 @@ def test_mhc_seam(T, H, mode):
         ret[f"{name} kernel us"] = us
         ret[f"{name} err"] = check_outputs(name, out, ref, "bf16", mode)
     if T:
-        ret["graph speedup"] = ret["triton_seam graph us"] / ret["flydsl graph us"]
         ret["flydsl graph err"] = _graph_err(
             lambda: flydsl_mhc_seam(*args, **kw), ref, mode
         )
+    if "triton_seam graph us" in ret and T:
+        ret["graph speedup"] = ret["triton_seam graph us"] / ret["flydsl graph us"]
     return ret
 
 
@@ -290,12 +350,13 @@ def test_mhc_seam_weight_update(H, norm):
     g.replay()
     torch.cuda.synchronize()
 
-    want = flydsl_mhc_seam(*args, config=cfg, **kw)
-    same = all(torch.equal(a, b) for a, b in zip(out[1:5], want[1:5]))
-    if not same:
-        mega_ref._FAILURES.append(
-            f"weight update ({norm}): the replayed graph kept the old fn"
-        )
+    # Against the reference, not an eager call: a stale pack would also make the eager
+    # call stale, and the two would agree on the old fn.
+    ref_kw = {k: v for k, v in kw.items() if k not in ("residual_out", "pre_mix")}
+    ref = mega_ref.run_torch(*args, pre_mix=kw["pre_mix"], **ref_kw)
+    mul_err = check_outputs(
+        f"weight update in place ({norm})", out, ref, "bf16", "post"
+    )
 
     fn = args[1]
     packed = flydsl_mhc_seam_pack_fn(fn)
@@ -309,15 +370,13 @@ def test_mhc_seam_weight_update(H, norm):
     packed.copy_(flydsl_mhc_seam_pack_fn(fn))
     g.replay()
     torch.cuda.synchronize()
-    # Against the reference: a stale pack would also match a stale eager call.
-    ref_kw = {k: v for k, v in kw.items() if k not in ("residual_out", "pre_mix")}
     ref = mega_ref.run_torch(*args, pre_mix=kw["pre_mix"], **ref_kw)
     err = check_outputs(f"weight update via fn.data ({norm})", out, ref, "bf16", "post")
     return {
         "gfx": get_gfx(),
         "T": T,
         "norm": norm,
-        "replay matches eager": same,
+        "in-place replay err": mul_err,
         "fn.data replay err": err,
     }
 
@@ -348,7 +407,11 @@ def test_mhc_seam_errors(H):
         "unknown knob": (with_kw(config={"TILE_K": 64}), ValueError),
         "unknown norm": (with_kw(config={"NORM": "post"}), ValueError),
         "illegal chunk": (with_kw(config={"CHUNK_C": 96}), ValueError),
-        "splits not dividing": (with_kw(config={"SPLITS": 7}), ValueError),
+        # from the validator, not re-derived: a fixed 7 is legal at H = 7168.
+        "splits not dividing": (
+            with_kw(config={"SPLITS": _smallest_illegal_splits(T, H)}),
+            ValueError,
+        ),
         "chunk lanes not 2^k": (with_kw(config={"CHUNK_C": 320}), ValueError),
         "block_m above block": (with_kw(config={"BLOCK_M": 512}), ValueError),
     }
@@ -365,6 +428,28 @@ def test_mhc_seam_errors(H):
     if bad:
         mega_ref._FAILURES.append(f"errors: {bad}")
     return {"gfx": get_gfx(), "cases": len(cases), "failed": "; ".join(bad) or "-"}
+
+
+def _stream_rows(tokens, hidden, stream_splits):
+    """Two-stream rows for each (T, H, SPLITS) the policy's chunk count can take.
+
+    A legal SPLITS divides the chunk count, which follows H: the default 10 fits
+    H = 5120 (20 chunks) but not H = 4096 (16), so a split this shape cannot take is
+    dropped rather than raised on.
+    """
+    rows = []
+    for T, H, sp in itertools.product(
+        [t for t in tokens if 0 < t <= 4096][-2:], hidden, stream_splits
+    ):
+        why = _splits_error(T, H, sp)
+        if why:
+            aiter.logger.warning("stream splits %d at H=%d, T=%d: %s", sp, H, T, why)
+            continue
+
+        rows += [
+            test_mhc_seam_streams(T, H, sp, norm) for norm in ("fused", "separate")
+        ]
+    return rows
 
 
 def main():
@@ -457,19 +542,16 @@ def main():
             best.to_markdown(index=False),
         )
 
-    rows = [
-        test_mhc_seam_streams(T, H, sp, norm)
-        for T, H, sp, norm in itertools.product(
-            [t for t in args.tokens if 0 < t <= 4096][-2:],
-            args.hidden,
-            args.stream_splits,
-            ("fused", "separate"),
+    rows = _stream_rows(args.tokens, args.hidden, args.stream_splits)
+    if rows:
+        aiter.logger.info(
+            "mhc seam two-stream check (markdown):\n%s",
+            pd.DataFrame(rows).to_markdown(index=False),
         )
-    ]
-    aiter.logger.info(
-        "mhc seam two-stream check (markdown):\n%s",
-        pd.DataFrame(rows).to_markdown(index=False),
-    )
+    else:
+        aiter.logger.warning(
+            "no stream splits legal at these hidden sizes; two-stream check skipped"
+        )
 
     rows = [r for H in args.hidden for r in test_mhc_seam_knobs(H)]
     aiter.logger.info(

@@ -16,7 +16,11 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 
-from aiter.jit.utils.chip_info import get_cu_num, get_lds_capacity_bytes
+from aiter.jit.utils.chip_info import (
+    get_cu_num,
+    get_gfx_runtime,
+    get_lds_capacity_bytes,
+)
 from aiter.ops.flydsl.kernels import mhc_seam
 from aiter.ops.flydsl.kernels.kernels_common import ceildiv
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
@@ -100,12 +104,6 @@ def _require(cond: bool, msg: str, exc: type = ValueError) -> None:
     """Input validation that survives ``python -O`` (unlike ``assert``)."""
     if not cond:
         raise exc(f"[flydsl_mhc_seam] {msg}")
-
-
-@functools.lru_cache(maxsize=16)
-def _arch(device_index: int) -> str:
-    """Memoized: ``get_device_properties`` is a per-call host cost of tens of us."""
-    return torch.cuda.get_device_properties(device_index).gcnArchName.split(":")[0]
 
 
 @functools.lru_cache(maxsize=1)
@@ -375,9 +373,7 @@ def _validate_inputs(
     _require(norm_weight.is_contiguous(), "norm_weight must be contiguous")
     _require(int(sinkhorn_repeat) >= 1, "sinkhorn_repeat must be >= 1")
     device = residual.device
-    arch = _arch(
-        device.index if device.index is not None else torch.cuda.current_device()
-    )
+    arch = get_gfx_runtime()
     _require(arch in _GFX, f"supports {_GFX}, got {arch}", RuntimeError)
 
     if sublayer_out is not None:
@@ -469,12 +465,20 @@ _FN_CACHE: dict = {}
 
 
 def _pack_fn(fn: torch.Tensor, capturing: bool) -> torch.Tensor:
-    """``flydsl_mhc_seam_pack_fn`` cached per weight tensor, for calls without ``fn_packed``.
+    """flydsl_mhc_seam_pack_fn cached per weight tensor, for calls without fn_packed.
 
-    Keyed on the tensor object and stamped with its address and version counter, so an
-    in-place update through ``fn`` repacks; a write through ``fn.data`` changes neither and
-    is missed. A repack writes into the buffer captured graphs hold. Packing is eager only,
-    and the host waits for it so no other stream reads it half written.
+    Keyed on the tensor object, stamped with its address and version counter, and
+    dropped when that tensor dies. An in-place update through fn moves the counter and
+    repacks; a write through fn.data moves neither and is missed.
+
+    A repack copies into the buffer captured graphs already hold, so an fn that changed
+    shape in place cannot be followed and raises instead.
+
+    Packing is eager only: a call that must pack during capture raises, and the host
+    waits for the pack so no other stream reads the buffer half written.
+
+    A caller that builds a fresh tensor per call misses every time and pays both costs;
+    that caller wants fn_packed, as flydsl_mhc_seam documents.
     """
     key = id(fn)
     hit = _FN_CACHE.get(key)
@@ -751,23 +755,45 @@ def flydsl_mhc_seam(
     config: dict | None = None,
     fn_packed: torch.Tensor | None = None,
 ):
-    """Delayed mHC seam with RMSNorm for contiguous inputs.
+    """Delayed mHC seam with RMSNorm on gfx942, in two launches.
+    A positional drop-in for
+    aiter.ops.triton.fusions.mhc_fused_post_pre_delayed_rmsnorm, with fn_packed as
+    the one keyword-only extra. config is shared in name only: the knobs below are
+    not the triton op's, and one of its keys raises here.
 
-    Returns ``(residual_out, post_mix, comb_mix, layer_input, next_pre_mix)`` with
-    shapes ``(T, 4, H)``, ``(T, 4, 1)``, ``(T, 4, 4)``, ``(T, H)``, and ``(T, 4)``.
-    Residual and layer input are bf16; gates are fp32. ``pre_mix=None`` collapses
-    stream 0. Without ``sublayer_out``, the residual is returned unchanged and
-    ``residual_out`` must be None; otherwise it is allocated when not supplied.
+    Returns:
+      (residual_out (T, 4, H),
+       post_mix     (T, 4, 1),
+       comb_mix     (T, 4, 4),
+       layer_input  (T, H),
+       next_pre_mix (T, 4)).
+    Residual and layer input are bf16, gates fp32.
+    All inputs are contiguous.
 
-    With ``config=None``, use the launch policy. Explicit configs override
-    ``MHC_SEAM_DEFAULTS``. Fused RMSNorm takes two launches; separate RMSNorm takes
-    three and is preferred above 128 tokens with post-mix and a carried pre gate.
+    pre_mix=None collapses stream 0. With post-mix, residual_out is allocated when not
+    supplied; without it residual_out must not be passed and the returned residual is
+    the input tensor itself, not a copy.
 
-    Scratch is allocated per call. Compile before CUDA-graph capture. Pass
-    ``fn_packed=flydsl_mhc_seam_pack_fn(fn)``, repacked into the same buffer when
-    ``fn`` is reloaded; it is required for an inference-mode ``fn``. Without it, ``fn``
-    is packed on the first eager call, which must precede capture, and repacked after
-    an in-place update through ``fn`` but not through ``fn.data``.
+    config=None takes the launch policy in get_mhc_seam_config, which picks fused or
+    separate RMSNorm; separate adds a third launch through aiter.rms_norm. An explicit
+    config overrides MHC_SEAM_DEFAULTS key by key and rejects unknown keys. Split-K
+    scratch is allocated per call.
+
+    CUDA graphs: compile before capture, with one eager call per shape. fn_packed is
+    fn packed ahead of the call by flydsl_mhc_seam_pack_fn. With it, the kernel reads
+    that buffer instead of fn, and a captured graph follows whatever the caller repacks
+    into it. Without it, fn is packed on the first eager call and repacked by a later
+    one once fn changed in place; a write through fn.data is missed, and packing during
+    capture raises RuntimeError.
+
+    Pass it for model integration, repacked into the same buffer when fn is reloaded.
+    It is required for an inference-mode fn, and for any caller without one long-lived
+    fn: the implicit pack is cached per tensor object, so a fresh w.view(...) or
+    w.float() each call repacks and waits on the stream.
+
+    Invalid inputs raise ValueError / TypeError (not assert). A supported-but-wrong
+    arch, an inference-mode fn without fn_packed, and packing during capture raise
+    RuntimeError; an arch chip_info does not know raises KeyError from the probe.
     """
     T, H, arch = _validate_inputs(
         residual,

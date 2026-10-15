@@ -1328,8 +1328,9 @@ def compile_mhc_seam_finish_nonorm(
         )
         live = raw_token < n_tok
         # The arithmetic runs unconditionally against a clamped token so the three stores
-        # are the kernel's only branches: a value computed in an enclosing `if` body and
-        # read from a nested one comes back permuted, so nesting is not available here.
+        # stay the kernel's only branches; an out-of-range lane computes a duplicate of the
+        # last token and never stores it. The clamp needs n_tok >= 1: the wrapper returns
+        # early for T == 0, which finish_blocks(0) == 1 would otherwise launch with t = -1.
         t = live.select(raw_token, n_tok - fx.Int32(1))
 
         # Lane -> projection row: comb rows 8..23 on lanes 0..15, pre 0..3 on 16..19, post
