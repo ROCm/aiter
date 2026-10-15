@@ -111,6 +111,34 @@ def requires_flydsl_stage2_reduce(
     return int(token_num) * int(model_dim) * int(element_size) > 0xFFFFFFFF
 
 
+def resolve_flydsl_stage2_mode(
+    mode: str,
+    token_num: int,
+    model_dim: int,
+    element_size: int,
+    b_dtype: str,
+    return_per_slot: bool,
+    *,
+    force_reduce: bool | None = None,
+    stage2_fp8: bool | None = None,
+) -> str:
+    """Resolve runtime reduce overrides shared by sorting and stage 2."""
+    if force_reduce is None:
+        force_reduce = os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1"
+    if stage2_fp8 is None:
+        stage2_fp8 = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
+    fp8_reduce = stage2_fp8 and b_dtype in ("fp4", "fp8") and not return_per_slot
+    if force_reduce or fp8_reduce:
+        return "reduce"
+    if (
+        mode != "reduce"
+        and not return_per_slot
+        and requires_flydsl_stage2_reduce(token_num, model_dim, element_size)
+    ):
+        return "reduce"
+    return mode
+
+
 def requires_flydsl_stage2_global_a(a: torch.Tensor) -> bool:
     """Return whether A's stored bytes reach the 4 GiB buffer descriptor limit."""
     return a.numel() * a.element_size() >= (1 << 32)
@@ -2112,17 +2140,14 @@ def _flydsl_moe_stage2_impl(
     model_dim = w2.shape[1]
     inter_dim = inter_states.shape[2]
 
-    # Debug: force stage2 to use the masked reduce epilogue instead of atomic
-    # accumulate. Enabled by default; set AITER_FLYDSL_FORCE_REDUCE=0 to opt out.
-    if os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1":
-        mode = "reduce"
-    elif (
-        mode != "reduce"
-        and not return_per_slot
-        and requires_flydsl_stage2_reduce(token_num, model_dim, 2)
-    ):
-        # Buffer atomics use 32-bit offsets; reduce outputs larger than 4 GiB.
-        mode = "reduce"
+    mode = resolve_flydsl_stage2_mode(
+        mode,
+        token_num,
+        model_dim,
+        2,
+        b_dtype,
+        return_per_slot,
+    )
 
     accumulate = mode != "reduce" and not return_per_slot
 
@@ -2181,7 +2206,8 @@ def _flydsl_moe_stage2_impl(
         _persist_m = -1 if m_blocks > 256 else 1
 
     if a_dtype == "fp8":
-        # FP8 uses non-persistent scheduling, so cap grid.y via persist_m.
+        # Normalize FP8-A grid scheduling from runtime occupancy, even for
+        # legacy tuned names that retain `_persist` as part of their identity.
         _persist_m = resolve_flydsl_grid_y_persist_m(m_blocks)
 
     if bias is not None and bias.dtype != torch.float32:
