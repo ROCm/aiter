@@ -74,7 +74,7 @@ class PaDecodePipeline:
             if self.ctx.part_start < self.ctx.part_end:
                 v_flat0 = []
                 for vh in range_constexpr(self.traits.VHE_CHUNKS):
-                    v_flat0.extend(self.kv.load_v(v_page_pf0, vh))
+                    v_flat0.extend(self.kv.load_v(v_page_pf0, vh, self.ctx.part_start))
                 v_pf0 = fx.Vector.from_elements(v_flat0, dtype=fx.Int64)
             init_state.append(v_pf0)
         # Single-tile plans eliminate loop/history but keep absolute tt for
@@ -137,7 +137,7 @@ class PaDecodePipeline:
                 or (self.traits.prefetch_v and not self.traits.SCALES_BEFORE_CURRENT_V)
             ):
                 v_vh_shared = [
-                    self.kv.load_v(v_page_cur, vh)
+                    self.kv.load_v(v_page_cur, vh, tt1 - 1)
                     for vh in range_constexpr(self.traits.VHE_CHUNKS)
                 ]
 
@@ -272,7 +272,7 @@ class PaDecodePipeline:
             if const_expr(not self.traits.MTP4_PREFETCH_V and not self.traits.trans_v):
                 # Hide plain V's strided loads behind P packing.
                 v_vh_shared = [
-                    self.kv.load_v(v_page_cur, vh)
+                    self.kv.load_v(v_page_cur, vh, tt1 - 1)
                     for vh in range_constexpr(self.traits.VHE_CHUNKS)
                 ]
             # V-scale normalization is shared by all query rows.
@@ -285,7 +285,7 @@ class PaDecodePipeline:
             if const_expr(not self.traits.MTP4_PREFETCH_V and self.traits.trans_v):
                 # Overlap current V with next K and the P barrier.
                 v_vh_shared = [
-                    self.kv.load_v(v_page_cur, vh)
+                    self.kv.load_v(v_page_cur, vh, tt1 - 1)
                     for vh in range_constexpr(self.traits.VHE_CHUNKS)
                 ]
             if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
@@ -355,7 +355,7 @@ class PaDecodePipeline:
                             and tt1 < self.ctx.part_end
                         ):
                             v_next_chunk = fx.Vector.from_elements(
-                                self.kv.load_v(v_page_next, vh), dtype=fx.Int64
+                                self.kv.load_v(v_page_next, vh, tt1), dtype=fx.Int64
                             )
                         v_next_chunks.append(v_next_chunk)
                 next_state.extend([*o_acc, m_new, l_new])
@@ -501,7 +501,7 @@ class PaDecodePipeline:
         if const_expr(self.traits.SCALES_BEFORE_CURRENT_V):
             # Issue V after scale staging so scale waits do not drain V.
             v_vh_shared = [
-                self.kv.load_v(v_page_cur, vh)
+                self.kv.load_v(v_page_cur, vh, tt1 - 1)
                 for vh in range_constexpr(self.traits.VHE_CHUNKS)
             ]
         scale = (
@@ -553,7 +553,7 @@ class PaDecodePipeline:
             v_vh_batch = v_vh_shared
         else:
             v_vh_batch = [
-                self.kv.load_v(v_page_cur, vh)
+                self.kv.load_v(v_page_cur, vh, tt1 - 1)
                 for vh in range_constexpr(self.traits.VHE_CHUNKS)
             ]
         for vh in range_constexpr(self.traits.VHE_CHUNKS):

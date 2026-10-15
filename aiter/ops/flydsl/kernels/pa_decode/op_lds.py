@@ -591,7 +591,50 @@ class PaDecodeKVLoader:
         )
         return self.load_k_from_pages(phys_vec), phys_vec
 
-    def load_v(self, phys_row, vh):
+    @flyc.jit
+    def load_v(self, phys_row, vh, tt):
+        words = fx.Vector.from_elements(self._load_v(phys_row, vh), fx.Int64)
+        if tt * self.traits.TILE_TOK + self.traits.TILE_TOK > self.ctx.context_len:
+            loader = self
+            words = loader.mask_v_tail(words, tt)
+        return [words[i] for i in range_constexpr(self.traits.NVOPS)]
+
+    def mask_v_tail(self, words, tt):
+        elems_per_word = 2 if const_expr(self.traits.is_bf16_kv) else 4
+        bits_per_elem = 32 // elems_per_word
+        # Lane zero supplies zero through a branch-local subgroup operation;
+        # keeping the bound dependent on it prevents full-tile mask setup.
+        lane_zero = fx.Int32(
+            fx.gpu.shuffle_idx(self.ctx.lane, fx.Int32(0), fx.Int32(64))
+        )
+        valid = (
+            self.ctx.context_len
+            - tt * self.traits.TILE_TOK
+            - lane_zero
+            - self.ctx.rgroup * self.traits.TOK_PER_WARP
+        )
+        dwords = words.bitcast(fx.Int32)
+        masked = []
+        for sub in range_constexpr(self.traits.PAGES_PER_CHUNK):
+            for step in range_constexpr(self.traits.STEPS_PER_CHUNK):
+                group = sub * self.traits.STEPS_PER_CHUNK + step
+                token = (
+                    sub * self.traits.block_size + step * self.traits.KV_VECTOR_WIDTH
+                )
+                for word in range_constexpr(4):
+                    count = valid - (token + word * elems_per_word)
+                    value = dwords[group * 4 + word]
+                    # Select payload pieces, not a mask vector live across V loads.
+                    for n in range_constexpr(elems_per_word - 1, 0, -1):
+                        value = (count <= n).select(
+                            value & fx.Int32((1 << (n * bits_per_elem)) - 1),
+                            value,
+                        )
+                    masked.append((count > 0).select(value, fx.Int32(0)))
+        # Preserve every valid payload bit, including NaNs.
+        return fx.Vector.from_elements(masked, fx.Int32).bitcast(fx.Int64)
+
+    def _load_v(self, phys_row, vh):
         head_group = ((vh * self.traits.VHE_SIZE) // 16) + self.ctx.warp
         head_element = head_group * 16 + self.ctx.lane16
         ops = []

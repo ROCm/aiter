@@ -405,9 +405,13 @@ def build_flash_attn_dualwave_swp_fp8_module(
             fx.gpu.barrier()
             rocdl.sched_barrier(0)
             pf = j + fx.Int64(1)
-            page = kv_gmem_to_lds.end_page_ids(kv_gmem_to_lds.begin_page_ids([pf]))[0]
-            kv_gmem_to_lds.load_k(pf * BN, next_buf, page)
-            kv_gmem_to_lds.load_v(pf * BN, next_buf, page)
+            if pf < t_end:
+                prefetch_loader = kv_gmem_to_lds
+                prefetch_page = prefetch_loader.end_page_ids(
+                    prefetch_loader.begin_page_ids([pf])
+                )[0]
+                prefetch_loader.load_k(pf * BN, next_buf, prefetch_page)
+                prefetch_loader.load_v(pf * BN, next_buf, prefetch_page)
             v_k = kv_lds_to_regs.load_k(buf)
             v_s = gemm_helper.qk(v_k, q_wide)
             if const_expr(traits.CAUSAL):

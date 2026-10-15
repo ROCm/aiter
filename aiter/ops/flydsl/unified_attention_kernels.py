@@ -10,7 +10,6 @@ back to the Triton wrapper (Gluon on gfx950).
 
 from __future__ import annotations
 
-import ctypes
 import os
 from functools import lru_cache
 
@@ -146,29 +145,6 @@ def _pa_decode_ok(max_seqlen_q, shuffled_kv_cache, out, num_seqs) -> bool:
 _PA_DECODE_WORKSPACES = {}
 
 
-@lru_cache(maxsize=1)
-def _stream_get_capture_info():
-    lib = ctypes.CDLL("libamdhip64.so")
-    get_info = lib.hipStreamGetCaptureInfo
-    get_info.argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_int),
-        ctypes.POINTER(ctypes.c_ulonglong),
-    ]
-    get_info.restype = ctypes.c_int
-    return get_info
-
-
-def _capture_id(stream):
-    status, capture_id = ctypes.c_int(), ctypes.c_ulonglong()
-    error = _stream_get_capture_info()(
-        stream.cuda_stream, ctypes.byref(status), ctypes.byref(capture_id)
-    )
-    if error:
-        raise RuntimeError(f"hipStreamGetCaptureInfo failed: {error}")
-    return capture_id.value
-
-
 def _route_pa_decode(
     q,
     k,
@@ -214,7 +190,6 @@ def _route_pa_decode(
         if workspace is None:
             if capturing:
                 return None
-            _stream_get_capture_info()
             plan = plan_pa_decode(
                 seqused_k,
                 num_kv_heads,
@@ -233,16 +208,11 @@ def _route_pa_decode(
             }
             _PA_DECODE_WORKSPACES[key] = workspace
         else:
-            refresh_key = (
-                (_capture_id(stream), seqused_k.data_ptr()) if capturing else None
+            # Record every planner launch: lengths can change within a capture.
+            # Same-stream attention/reduction consumes this plan before the next refresh.
+            plan = plan_pa_decode(
+                seqused_k, num_kv_heads, query_length=1, plan=workspace["plan"]
             )
-            plan = workspace["plan"]
-            # vLLM/SGLang keep seqused_k unchanged between layers in a captured step.
-            if not capturing or workspace.get("refresh_key") != refresh_key:
-                plan = plan_pa_decode(
-                    seqused_k, num_kv_heads, query_length=1, plan=plan
-                )
-                workspace["refresh_key"] = refresh_key
         pa_decode(
             out,
             q,
