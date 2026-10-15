@@ -21,7 +21,6 @@ CONFIGS_DIR = os.path.join(AITER_ROOT, "aiter", "configs")
 
 
 class TestCSVValidation(unittest.TestCase):
-
     TUNED_CSVS: ClassVar[dict[str, Any]] = {
         "a8w8": "a8w8_tuned_gemm.csv",
         "a8w8_bpreshuffle": "a8w8_bpreshuffle_tuned_gemm.csv",
@@ -76,6 +75,30 @@ class TestCSVValidation(unittest.TestCase):
             f"{name}: {len(dupes)} duplicate rows (first 10):\n{dupes.head(10)}",
         )
 
+    def _check_gemm_bandwidth_gbps(self, name, bpes):
+        df = self._load_csv(name)
+        lhs_bpe, rhs_bpe, out_bpe = bpes
+        expected = (
+            (
+                df["M"] * df["K"] * lhs_bpe
+                + df["N"] * df["K"] * rhs_bpe
+                + df["M"] * df["N"] * out_bpe
+            )
+            / (df["us"] * 1e-6)
+            / 1e9
+        )
+        error = (df["bw"] - expected.round(2)).abs()
+        self.assertFalse(
+            error.isna().any(),
+            f"{name}: bw validation contains missing values",
+        )
+        self.assertLessEqual(
+            float(error.max()),
+            0.02,
+            f"{name}: bw must be stored in GB/s; largest error:\n"
+            f"{df.loc[error.idxmax()]}",
+        )
+
     def test_a8w8_no_duplicates(self):
         self._check_no_duplicates("a8w8", extra_keys=["q_dtype_w"])
 
@@ -107,6 +130,11 @@ class TestCSVValidation(unittest.TestCase):
 
     def test_a4w6_asm_no_duplicates(self):
         self._check_no_duplicates("a4w6_asm")
+
+    def test_mxfp_gemm_bandwidth_is_gbps(self):
+        self._check_gemm_bandwidth_gbps("a6w6_blockscale", (0.75, 0.75, 2.0))
+        self._check_gemm_bandwidth_gbps("a6w4_asm", (0.75, 0.5, 2.0))
+        self._check_gemm_bandwidth_gbps("a4w6_asm", (0.5, 0.75, 2.0))
 
     def test_a8w8_batched_no_duplicates(self):
         self._check_no_duplicates("a8w8_batched")
