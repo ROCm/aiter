@@ -28,7 +28,7 @@ guard and the optional FP8 epilogue. Do not hand-edit; see build_aiter_kernel.py
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from aiter.ops.triton._triton_kernels.activation import _sigmoid_exp2
+from aiter.ops.triton._triton_kernels.common.activation import _sigmoid_exp2
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 # Config-aware names so a trace row maps to the exact specialization

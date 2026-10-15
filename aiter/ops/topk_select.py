@@ -1430,6 +1430,10 @@ def _stream_scratch(input, dtype=None):
 def _dispatch(
     backend, input, row_lens, idx, topk, rows, ragged, tie=None, deterministic=False
 ):
+    # Every backend puts rows on a grid dimension, and HIP rejects a zero-sized
+    # launch. An empty batch has nothing to select, so `idx` stays [0, topk].
+    if rows == 0:
+        return
     # `row_lens` is None when the caller gave no `end`; the backends that read
     # row ends get `_default_bounds`. plain and the small-reject stream do not.
     starts = None
