@@ -2257,6 +2257,15 @@ __global__ void __launch_bounds__(512, 2) topk_merge_kernel(const DataT* __restr
          end);
 }
 
+// Bytes of per-block partial results (values, then 16-byte aligned indices) that
+// the multi-block path hands from the first pass to topk_merge_kernel.
+template <typename DataT, typename IdxT>
+size_t calc_merge_scratch_size(size_t num_blocks, IdxT k)
+{
+    return utils::round_up_to_multiple_of<16>(sizeof(DataT) * num_blocks * k) +
+           sizeof(IdxT) * num_blocks * k;
+}
+
 template <bool greater,
           template <int, bool, typename, typename>
           class StrategyClass,
@@ -2270,6 +2279,8 @@ void topk_kernel_launcher(int block_per_batch,
                           IdxT k,
                           DataT* __restrict__ out,
                           IdxT* __restrict__ out_idx,
+                          void* workspace,
+                          size_t workspace_bytes,
                           hipStream_t stream)
 {
     using ComputeT = compute_t<DataT>;
@@ -2277,14 +2288,23 @@ void topk_kernel_launcher(int block_per_batch,
     DataT* tmp_val = nullptr;
     IdxT* tmp_idx  = nullptr;
 
-    // Allocate temporary buffers if multi-block reduction is needed
-    // Intermediate buffers use DataT (first-pass outputs DataT, merge reads DataT)
+    // Intermediate buffers for the multi-block reduction (first pass outputs
+    // DataT, merge reads DataT). They come from the caller's workspace so the
+    // call stays graph-capturable; hipMalloc is only a fallback for callers
+    // that pass none.
+    const size_t num_blocks   = static_cast<size_t>(batch_size) * block_per_batch;
+    const size_t scratch_size = calc_merge_scratch_size<DataT, IdxT>(num_blocks, k);
+    const bool own_scratch    = block_per_batch > 1 && workspace_bytes < scratch_size;
     if(block_per_batch > 1)
     {
-        size_t tmp_size = sizeof(DataT) * block_per_batch * k * batch_size;
-        size_t idx_size = sizeof(IdxT) * block_per_batch * k * batch_size;
-        HIP_CHECK(hipMalloc(&tmp_val, tmp_size));
-        HIP_CHECK(hipMalloc(&tmp_idx, idx_size));
+        char* scratch = static_cast<char*>(workspace);
+        if(own_scratch)
+        {
+            HIP_CHECK(hipMalloc(&scratch, scratch_size));
+        }
+        tmp_val = reinterpret_cast<DataT*>(scratch);
+        tmp_idx = reinterpret_cast<IdxT*>(
+            scratch + utils::round_up_to_multiple_of<16>(sizeof(DataT) * num_blocks * k));
     }
 
     // Sentinel in ComputeT space
@@ -2347,9 +2367,29 @@ void topk_kernel_launcher(int block_per_batch,
         topk_merge_kernel<<<batch_size, block_dim, lds_size, stream>>>(
             tmp_val, tmp_idx, batch_size, merge_len, k, out, out_idx, sentinel);
 
-        HIP_CHECK(hipFree(tmp_val));
-        HIP_CHECK(hipFree(tmp_idx));
+        if(own_scratch)
+        {
+            HIP_CHECK(hipFree(tmp_val));
+        }
     }
+}
+
+// Upper bound of calc_merge_scratch_size over every launch AdaptiveTopK can
+// pick for this k. Whenever calc_launch_parameter returns block_per_batch > 1,
+// batch_size * block_per_batch <= min_grid_size of that strategy, so the bound
+// depends on k and the device only.
+template <typename DataT, typename IdxT>
+size_t calc_merge_workspace_size(IdxT k)
+{
+    size_t size       = 0;
+    int block_size    = 0;
+    int min_grid_size = 0;
+    calc_launch_parameter_by_occupancy<BlockTopkSort, DataT, IdxT>(k, &block_size, &min_grid_size);
+    size = std::max(size, calc_merge_scratch_size<DataT, IdxT>(min_grid_size, k));
+    calc_launch_parameter_by_occupancy<BlockTopkFilter, DataT, IdxT>(
+        k, &block_size, &min_grid_size);
+    size = std::max(size, calc_merge_scratch_size<DataT, IdxT>(min_grid_size, k));
+    return size;
 }
 
 // Uniform length version of AdaptiveTopK
@@ -2361,6 +2401,7 @@ void AdaptiveTopK(int batch_size,
                   T* __restrict__ out,
                   IdxT* __restrict__ out_idx,
                   void* workspace,
+                  size_t workspace_bytes,
                   hipStream_t stream = 0)
 {
     assert(k <= buffer_load_helpers::MAX_CAPACITY);
@@ -2388,8 +2429,6 @@ void AdaptiveTopK(int batch_size,
             return;
         }
     }
-    (void)workspace; // only the radix path above consumes the caller workspace
-
     const int capacity  = utils::calc_capacity(k);
     int block_per_batch = 0;
     int wave_per_block  = 0;
@@ -2402,15 +2441,33 @@ void AdaptiveTopK(int batch_size,
     if(len_per_wave <=
        static_cast<IdxT>(capacity) * LaunchThreshold<BlockTopkSort>::choosing_factor)
     {
-        topk_kernel_launcher<greater, BlockTopkSort, T, IdxT>(
-            block_per_batch, wave_per_block, in, batch_size, len, k, out, out_idx, stream);
+        topk_kernel_launcher<greater, BlockTopkSort, T, IdxT>(block_per_batch,
+                                                              wave_per_block,
+                                                              in,
+                                                              batch_size,
+                                                              len,
+                                                              k,
+                                                              out,
+                                                              out_idx,
+                                                              workspace,
+                                                              workspace_bytes,
+                                                              stream);
     }
     else
     {
         calc_launch_parameter<BlockTopkFilter, T, IdxT>(
             batch_size, len, k, &block_per_batch, &wave_per_block);
-        topk_kernel_launcher<greater, BlockTopkFilter, T, IdxT>(
-            block_per_batch, wave_per_block, in, batch_size, len, k, out, out_idx, stream);
+        topk_kernel_launcher<greater, BlockTopkFilter, T, IdxT>(block_per_batch,
+                                                                wave_per_block,
+                                                                in,
+                                                                batch_size,
+                                                                len,
+                                                                k,
+                                                                out,
+                                                                out_idx,
+                                                                workspace,
+                                                                workspace_bytes,
+                                                                stream);
     }
 }
 
@@ -2427,6 +2484,7 @@ void AdaptiveTopK(int batch_size,
                   int64_t stride0,
                   int64_t stride1,
                   void* workspace,
+                  size_t workspace_bytes,
                   hipStream_t stream = 0)
 {
     assert(k <= buffer_load_helpers::MAX_CAPACITY);
@@ -2477,6 +2535,7 @@ void AdaptiveTopK(int batch_size,
                                            out + batch_id * k,
                                            out_idx + batch_id * k,
                                            workspace,
+                                           workspace_bytes,
                                            stream);
         }
     }
@@ -2549,6 +2608,8 @@ void topk_plain(aiter_tensor_t& values,   // [batch, len]
     // Caller-provided device scratch for the radix path (fp32 only); allocated +
     // cached on the Python side and passed in so this host code never allocates.
     void* ws_ptr = workspace.has_value() ? workspace.value().data_ptr() : nullptr;
+    const size_t ws_bytes =
+        workspace.has_value() ? workspace.value().numel() * workspace.value().element_size() : 0;
 
     // Check if we're using variable length mode
     // Empty tensors are conveyed as nullopt or numel()==0, so check both.
@@ -2595,6 +2656,7 @@ void topk_plain(aiter_tensor_t& values,   // [batch, len]
                                                             stride0,
                                                             stride1,
                                                             ws_ptr,
+                                                            ws_bytes,
                                                             stream);
             }
             else
@@ -2610,6 +2672,7 @@ void topk_plain(aiter_tensor_t& values,   // [batch, len]
                                                              stride0,
                                                              stride1,
                                                              ws_ptr,
+                                                             ws_bytes,
                                                              stream);
             }
         }
@@ -2624,6 +2687,7 @@ void topk_plain(aiter_tensor_t& values,   // [batch, len]
                                                             topk_out_kernel_ptr,
                                                             topk_ids_ptr,
                                                             ws_ptr,
+                                                            ws_bytes,
                                                             stream);
             }
             else
@@ -2635,6 +2699,7 @@ void topk_plain(aiter_tensor_t& values,   // [batch, len]
                                                              topk_out_kernel_ptr,
                                                              topk_ids_ptr,
                                                              ws_ptr,
+                                                             ws_bytes,
                                                              stream);
             }
         }
@@ -2649,4 +2714,17 @@ int64_t topk_plain_workspace_size(int64_t numRows, int64_t stride0, int64_t k)
 {
     return invokeComputeTopkLastDimWorkspaceSize<float, aiter::Phase::Prefill>(
         static_cast<int32_t>(numRows), static_cast<int32_t>(stride0), static_cast<int>(k));
+}
+
+// Scratch for the multi-block (Sort/Filter + Merge) path, which every dtype can
+// take when the batch is smaller than the grid. Sized for the widest supported
+// dtype so one value serves fp16, bf16 and fp32; depends on k and the device only.
+int64_t topk_plain_merge_workspace_size(int64_t k)
+{
+    using IdxT      = int32_t;
+    const IdxT topk = static_cast<IdxT>(k);
+    return static_cast<int64_t>(
+        std::max({topk::calc_merge_workspace_size<ck_tile::fp32_t, IdxT>(topk),
+                  topk::calc_merge_workspace_size<ck_tile::fp16_t, IdxT>(topk),
+                  topk::calc_merge_workspace_size<ck_tile::bf16_t, IdxT>(topk)}));
 }

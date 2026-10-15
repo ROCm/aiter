@@ -2513,25 +2513,26 @@ namespace py = pybind11;
           py::arg("final_output"),       \
           py::arg("final_lse") = std::nullopt);
 
-#define TOPK_PLAIN_PYBIND                         \
-    AITER_SET_STREAM_PYBIND;                      \
-    m.def("topk_plain",                           \
-          &topk_plain,                            \
-          py::arg("values"),                      \
-          py::arg("topk_ids"),                    \
-          py::arg("topk_out"),                    \
-          py::arg("topk"),                        \
-          py::arg("largest")   = true,            \
-          py::arg("rowStarts") = std::nullopt,    \
-          py::arg("rowEnds")   = std::nullopt,    \
-          py::arg("stride0")   = -1,              \
-          py::arg("stride1")   = 1,               \
-          py::arg("workspace") = std::nullopt);   \
-    m.def("topk_plain_workspace_size",            \
-          &topk_plain_workspace_size,             \
-          py::arg("numRows"),                     \
-          py::arg("stride0"),                     \
-          py::arg("k"));
+#define TOPK_PLAIN_PYBIND                       \
+    AITER_SET_STREAM_PYBIND;                    \
+    m.def("topk_plain",                         \
+          &topk_plain,                          \
+          py::arg("values"),                    \
+          py::arg("topk_ids"),                  \
+          py::arg("topk_out"),                  \
+          py::arg("topk"),                      \
+          py::arg("largest")   = true,          \
+          py::arg("rowStarts") = std::nullopt,  \
+          py::arg("rowEnds")   = std::nullopt,  \
+          py::arg("stride0")   = -1,            \
+          py::arg("stride1")   = 1,             \
+          py::arg("workspace") = std::nullopt); \
+    m.def("topk_plain_workspace_size",          \
+          &topk_plain_workspace_size,           \
+          py::arg("numRows"),                   \
+          py::arg("stride0"),                   \
+          py::arg("k"));                        \
+    m.def("topk_plain_merge_workspace_size", &topk_plain_merge_workspace_size, py::arg("k"));
 
 #define RMSNORM_QUANT_PYBIND                 \
     AITER_SET_STREAM_PYBIND;                 \
