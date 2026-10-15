@@ -43,7 +43,7 @@ def _bytes_moved(M, W12, W1, elem_size, mode):
     # writes grad_l12 + grad_l4
     n = 2 * W12 + W4
     if mode == "fwd_bwd":
-        n += 2 * W12 + 2 * W4
+        n += 3 * W12 + 2 * W4
     return M * n * elem_size
 
 

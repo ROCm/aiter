@@ -28,15 +28,19 @@ _KERNEL_DTYPES = (torch.float16, torch.bfloat16)
 
 
 def _check_inputs(l12: torch.Tensor, l4: torch.Tensor, l1_width: int):
-    assert l4.device == l12.device, "l12 and l4 must be on the same device"
-    assert l4.dtype == l12.dtype, f"dtype mismatch: {l12.dtype} vs {l4.dtype}"
-    assert (
-        0 <= l1_width <= l12.shape[-1]
-    ), f"l1_width={l1_width} out of range for l12 width {l12.shape[-1]}"
+    # raise, not assert: under python -O a short l4 would reach the kernel and
+    # be read out of bounds
+    if l4.device != l12.device:
+        raise ValueError("l12 and l4 must be on the same device")
+    if l4.dtype != l12.dtype:
+        raise ValueError(f"dtype mismatch: {l12.dtype} vs {l4.dtype}")
+    if not 0 <= l1_width <= l12.shape[-1]:
+        raise ValueError(
+            f"l1_width={l1_width} out of range for l12 width {l12.shape[-1]}"
+        )
     expected = (*l12.shape[:-1], l12.shape[-1] - l1_width)
-    assert (
-        tuple(l4.shape) == expected
-    ), f"l4 shape must be {expected}, got {tuple(l4.shape)}"
+    if tuple(l4.shape) != expected:
+        raise ValueError(f"l4 shape must be {expected}, got {tuple(l4.shape)}")
 
 
 def _use_kernel(t: torch.Tensor) -> bool:

@@ -7,15 +7,11 @@ import triton.language as tl
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
-_block_cat_fused_fwd_repr = make_kernel_repr(
-    "_block_cat_fused_fwd_kernel",
-    ["BLOCK_SIZE_N"],
-)
+_REPR_KEYS = ["W1", "W12", "W4", "SLOPE", "BLOCK_SIZE_N"]
 
-_block_cat_fused_bwd_repr = make_kernel_repr(
-    "_block_cat_fused_bwd_kernel",
-    ["BLOCK_SIZE_N"],
-)
+_block_cat_fused_fwd_repr = make_kernel_repr("_block_cat_fused_fwd_kernel", _REPR_KEYS)
+
+_block_cat_fused_bwd_repr = make_kernel_repr("_block_cat_fused_bwd_kernel", _REPR_KEYS)
 
 
 def _get_config(key: str) -> dict:

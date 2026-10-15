@@ -188,7 +188,10 @@ def test_block_cat_fused_empty():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     l12, l4 = generate_block_cat_fused_inputs((0, 96), 32, torch.bfloat16)
-    assert block_cat_fused(l12, l4, SLOPE, 32).shape == (0, 96)
+    out, grad_l12, grad_l4 = _run_op(l12, l4, torch.empty_like(l12), 32)
+    assert out.shape == (0, 96)
+    assert grad_l12.shape == (0, 96)
+    assert grad_l4.shape == (0, 64)
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -227,5 +230,5 @@ def test_block_cat_fused_rejects_bad_inputs(bad, match):
         l4 = l4.cpu()
     else:
         l4 = l4[:, :-1]
-    with pytest.raises(AssertionError, match=match):
+    with pytest.raises(ValueError, match=match):
         block_cat_fused(l12, l4, SLOPE, 32)
