@@ -8,6 +8,8 @@ import torch
 from .kernels.herd_topk import (
     build_herd_finalize_module,
     build_herd_fused_softmax_module,
+    build_herd_fused_sqrtsoftplus_module,
+    sqrtsoftplus_workspace_elems,
 )
 from .kernels.tensor_shim import _run_compiled, wave_size_of
 from .kernels.topk.topk_per_row_small_k import build_topk_per_row_small_k_module
@@ -18,11 +20,15 @@ _MINIMAX_M3_EXPERTS = 128
 _MINIMAX_M3_TOPK = 4
 _GPT_OSS_EXPERTS = 128
 _GPT_OSS_TOPK = 4
+_DSV4_FLASH_EXPERTS = 256
+_DSV4_FLASH_TOPK = 6
 _HERD_MAX_TOKENS = 128
 _FUSED_ROW_BUCKETS = (32, 64, _HERD_MAX_TOKENS)
 _DEFAULT_FINALIZE_THREADS = 256
 _K3_CANDIDATE_THREADS = 256
 _K3_FINALIZE_THREADS = 1024
+_SQRTSOFTPLUS_ROWS_PER_BLOCK = 4
+_SQRTSOFTPLUS_WORKSPACE: dict[tuple[int, int, str], torch.Tensor] = {}
 
 
 def _run_sigmoid_candidate(
@@ -90,6 +96,52 @@ def _run_fused_softmax(
     )
 
 
+def _run_fused_sqrtsoftplus(
+    packed_gating: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    rows: int,
+    experts: int,
+    topk: int,
+    need_renorm: bool,
+    routed_scaling_factor: float,
+    stream: torch.cuda.Stream,
+) -> None:
+    # Zeroed once; every launch leaves it zeroed again for the next.
+    key = (experts, topk, str(packed_gating.device))
+    workspace = _SQRTSOFTPLUS_WORKSPACE.get(key)
+    if workspace is None:
+        workspace = torch.zeros(
+            sqrtsoftplus_workspace_elems(experts, _HERD_MAX_TOKENS, topk),
+            dtype=torch.int32,
+            device=packed_gating.device,
+        )
+        _SQRTSOFTPLUS_WORKSPACE[key] = workspace
+    launch = build_herd_fused_sqrtsoftplus_module(
+        topk,
+        experts,
+        _HERD_MAX_TOKENS,
+        wave_size_of(packed_gating.device.index),
+        bool(need_renorm),
+        _SQRTSOFTPLUS_ROWS_PER_BLOCK,
+    )
+    _run_compiled(
+        launch,
+        packed_gating,
+        correction_bias,
+        topk_weights,
+        topk_ids,
+        workspace,
+        int(topk_weights.stride(0)),
+        int(topk_ids.stride(0)),
+        rows,
+        -(-rows // _SQRTSOFTPLUS_ROWS_PER_BLOCK),
+        float(routed_scaling_factor),
+        stream,
+    )
+
+
 def _run_finalize(
     candidate_ids: torch.Tensor,
     candidate_values: torch.Tensor,
@@ -144,6 +196,12 @@ def _profile(score_func: str, experts: int, topk: int) -> str | None:
         _GPT_OSS_TOPK,
     ):
         return "gpt_oss"
+    if (score_func, experts, topk) == (
+        "sqrtsoftplus",
+        _DSV4_FLASH_EXPERTS,
+        _DSV4_FLASH_TOPK,
+    ):
+        return "dsv4_flash"
     return None
 
 
@@ -275,6 +333,24 @@ def herd_topk_gating(
             rows,
             experts,
             topk,
+            routed_scaling_factor,
+            stream,
+        )
+        return
+    if (
+        profile == "dsv4_flash"
+        and packed_gating.dtype == torch.bfloat16
+        and correction_bias.dtype == torch.float32
+    ):
+        _run_fused_sqrtsoftplus(
+            packed_gating,
+            correction_bias,
+            topk_weights,
+            topk_ids,
+            rows,
+            experts,
+            topk,
+            need_renorm,
             routed_scaling_factor,
             stream,
         )
