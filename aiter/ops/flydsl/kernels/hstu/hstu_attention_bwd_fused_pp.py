@@ -983,8 +983,16 @@ def build_hstu_attention_bwd_fused_pp(
             return out
 
         # ---- phase M -------------------------------------------------------
-        def mfma_phase(dv, dk, p_prev, ds_prev, q_tile, rm_cur, rm_fill, t_cur, t_prev):
-            """Four GEMMs, the operand feed, this group's DMA and transpose, the mask."""
+        def mfma_phase(dv, dk, p_prev, ds_prev, q_tile, rm_cur, rm_fill, t_cur,
+                       t_prev, kt_packs):
+            """Four GEMMs, the operand feed, this group's DMA and transpose, the mask.
+
+            `kt_packs` is a PARAMETER, unlike every other loop-invariant here
+            (`k_packs`, `v_packs`, ...), because it is built after the prologue
+            fence and so lives inside the `if active:` branch -- which the AST
+            rewriter lowers to its own function scope. Closing over it from out
+            here is a NameError, not a late binding.
+            """
             # dS in the layout the dQ GEMM's A operand needs. Per-tile, unlike
             # kt_packs: one scratch slot per subtile, written and read inside
             # this phase by the owning wave only, so no barrier is involved and
@@ -1079,6 +1087,69 @@ def build_hstu_attention_bwd_fused_pp(
                 transpose_q(rm_cur, t_cur)
             else:
                 transpose_do(rm_cur, t_cur)
+            rocdl.sched_barrier(0)
+
+            # ---- dQ: partial over THIS workgroup's KV range ----------------
+            # dQ[q][d] = sum_kv dS[q][kv].K[kv][d]. Both operands are
+            # register-resident (transposed dS, kt_packs), so this needs no
+            # operand-window group -- at PREFETCH_W=15 every window slot is
+            # live at once and an LDS-fed group would add live registers
+            # one-for-one.
+            #
+            # C[m=q][n=d] over 4 d-chunks x KV_OWNED_SUBTILES kv steps.
+            rocdl.sched_barrier(0)
+            dq_acc = [c_zero_v4f32 for _ in range_constexpr(K_STEPS)]
+            for ks in range_constexpr(K_STEPS):
+                for og in range_constexpr(KV_OWNED_SUBTILES):
+                    dq_acc[ks] = mfma_acc(ds_t[og], kt_packs[ks][og], dq_acc[ks])
+
+            # Scale is 1/N ONLY. kt_packs carries alpha already (transposed
+            # from the alpha-scaled k_packs), and ds.(aK) = a.(ds.K) is exactly
+            # the chain rule, so applying dq_pp's `alpha/max_seq_len` here
+            # would be wrong by a factor of alpha.
+            #
+            # CHECKPOINT LAYOUT: one slot per (batch, kv_tile, WAVE), summed on
+            # the host. The shipping layout reduces the 8 waves in LDS first --
+            # see the plan -- but that reduction spans two barrier intervals
+            # because the groups are never in phase M for the same tile, and it
+            # is worth validating the GEMM before adding it.
+            #
+            # Out-of-range q rows are steered to a reserved TRASH row at the
+            # head of the scratch (the host offsets all start past it) rather
+            # than guarded by `if _qa < seq_len`. Two reasons: a subscript
+            # store inside a dynamic `if` makes the AST rewriter treat
+            # `dq_part` as a branch-assigned local and demand an scf.if result
+            # for it, and the select keeps the M phase branch-free. The trash
+            # row is a full H*D elements, so the per-lane column offset below
+            # cannot spill out of it into real partials.
+            _rows = seq_len - kv_start_row
+            _poff = part_off[fx.Int64(batch_idx * fx.Int32(num_kv_tiles)
+                                      + kv_tile_idx)]
+            # Rows come from tile q_tile-1, NOT q_tile: this phase consumes
+            # `ds_prev`, produced by the PREVIOUS trip's gate phase, in the
+            # same software-pipelined way `p_prev` feeds GEMM2 off `t_prev`.
+            # `q_start` belongs to the S/dA being computed here, one tile later.
+            _qbase = (
+                (fx.Int32(q_tile) - fx.Int32(1)) * fx.Int32(BLOCK_N)
+                + lane_div_16 * fx.Int32(MFMA_LANE_K)
+            )
+            for e in range_constexpr(MFMA_ELEMS_PER_LANE):
+                _qa = _qbase + fx.Int32(e)
+                _ql = wave_id * _rows + (_qa - kv_start_row)
+                _row = fx.Int64(_poff) + fx.Int64(
+                    _ql * fx.Int32(num_heads * head_dim)
+                    + head_idx * fx.Int32(head_dim)
+                )
+                # Both bounds are needed. The upper one is the usual jagged
+                # tail; the lower one catches trip 0, whose `ds_prev` is the
+                # zero pack from `acc_init` and whose nominal tile is
+                # q_tile_start-1 -- an all-zero contribution, but to an address
+                # below this tile's region.
+                _row = (_qa < seq_len).select(_row, fx.Int64(0))
+                _row = (_qa >= kv_start_row).select(_row, fx.Int64(0))
+                for ks in range_constexpr(K_STEPS):
+                    _c = fx.Int32(ks * MFMA_M) + lane_mod_16
+                    dq_part[_row + fx.Int64(_c)] = Vec(dq_acc[ks])[e] * c_inv_n
             rocdl.sched_barrier(0)
 
             rocdl.s_setprio(0)
@@ -1274,8 +1345,9 @@ def build_hstu_attention_bwd_fused_pp(
                     t_cur = u % T_SLOTS
                     t_prev = (u + 1) % T_SLOTS
                     dv, dk, s_accs, da_accs, q_start = mfma_phase(
-                        dv, dk, p_prev, ds_prev, q_tile, rm_cur, rm_fill, t_cur, t_prev
-                    )
+                        dv, dk, p_prev, ds_prev, q_tile, rm_cur, rm_fill, t_cur,
+                        t_prev, kt_packs,
+                    )  # fmt: skip
                     phase_barrier()
                     p_prev, ds_prev = gate_phase(s_accs, da_accs, q_start)
                     if const_expr(u < UNROLL - 1):
