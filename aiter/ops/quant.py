@@ -583,7 +583,7 @@ def per_1x32_mx_quant_hip(
     if scale is None:
         if is_e8m0:
             if shuffle:
-                scale = torch.empty(
+                scale = torch.zeros(
                     (
                         (m + 255) // 256 * 256,
                         ((n + 31) // 32 + 7) // 8 * 8,
@@ -592,7 +592,7 @@ def per_1x32_mx_quant_hip(
                     device=device,
                 ).view(dtypes.fp8_e8m0)
             else:
-                scale = torch.empty(
+                scale = torch.zeros(
                     (m, (n + 31) // 32),
                     dtype=torch.uint8,
                     device=device,
@@ -1158,7 +1158,9 @@ def fused_dynamic_mx_quant_moe_sort(
     # garbage; production GEMM consumers don't read them so this is safe.
     # Tests comparing byte-level equality must mask out those positions.
     scaleN_pad = ((N + group_size - 1) // group_size + 7) // 8 * 8
-    scale = torch.empty(
+    # zeros(): rows past num_valid_ids are never written by the kernel, and
+    # consumers of this scratch read them; an unwritten 0xFF byte is NaN in e8m0.
+    scale = torch.zeros(
         (sorted_ids.shape[0] + 31) // 32 * 32,
         scaleN_pad,
         dtype=dtypes.fp8_e8m0,
