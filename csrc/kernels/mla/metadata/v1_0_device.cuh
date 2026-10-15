@@ -128,7 +128,7 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
             work_info.kv_end =
                 opus::min(work_info.kv_start + payload * params.kv_granularity, kv_end);
             work_info.kv_offset = kv_end - work_info.kv_end;
-            if(work_info.kv_offset <= 4 && split_local > 1)
+            if(work_info.kv_offset <= 4)
             {
                 work_info.kv_end    = kv_end;
                 work_info.kv_offset = 0;
