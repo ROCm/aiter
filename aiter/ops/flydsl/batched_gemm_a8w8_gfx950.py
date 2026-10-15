@@ -36,8 +36,10 @@ from aiter.utility.graph_alloc import persistent_alloc
 
 from .kernels.bmm_a8w8_mxscale_gfx950 import (
     SCALE_BLOCKS,
+    SCALE_GROUP,
     W_SCALE_ROWS,
     check_bmm_config,
+    check_xcd_swizzle,
     launch_bmm_a8w8_mxscale,
 )
 from .kernels.kernels_common import ceildiv
@@ -49,7 +51,8 @@ _BMM_KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(BMM_MFMA_NAME_PREFIX)}"
     r"_t(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)"
     r"_w(?P<m_warp>\d+)x(?P<n_warp>\d+)_nb(?P<num_buffers>\d+)_sk(?P<splits>\d+)"
-    r"(?:_bd(?P<b_ahead>\d+))?(?P<b_nt>_nt)?(?P<xcd_order>_xcd(?P<xcd_swizzle>\d*))?"
+    r"(?:_bd(?P<b_ahead>\d+))?(?P<b_nt>_nt)?"
+    r"(?P<xcd_order>_xcd(?P<xcd_swizzle>[2-9]|[1-9]\d+)?)?"
     r"(?P<per_stage>_sps)?$"
 )
 
@@ -102,9 +105,7 @@ def bmm_kernel_name(
     into registers ``n`` K tiles ahead, ``_nt`` B loaded non-temporal,
     ``_xcd<g>`` the XCD tile order with an xcd_swizzle of ``g``,
     ``_sps`` scales loaded per stage instead of preloaded."""
-    # Without _xcd the swizzle digits would parse back as part of _sk<splits>.
-    if xcd_swizzle < 0 or (xcd_swizzle and not xcd_order):
-        raise ValueError("[FlyDSL gfx950] xcd_swizzle re-tiles the xcd_order run")
+    check_xcd_swizzle(xcd_swizzle, xcd_order, splits)
     return (
         f"{BMM_MFMA_NAME_PREFIX}_t{tile_m}x{tile_n}x{tile_k}"
         f"_w{m_warp}x{n_warp}_nb{num_buffers}_sk{splits}"
@@ -204,8 +205,11 @@ def pick_bmm_kernel_name(
             f"[FlyDSL gfx950 bmm] no kernel config runs B={b} N={n} K={k} "
             f"with 1x{x_scale_k} / {w_scale_n}x{w_scale_k} scale blocks"
         )
-    # The XCD tile order wants the N x batch tiles in 8s, as split K does.
-    xcd = {"xcd_order": True, "xcd_swizzle": 4}
+    # The XCD tile order wants the N x batch tiles in 8s, as split K does. Its
+    # M-major swizzle is measured on 1x32 w_scales only.
+    xcd = {"xcd_order": True}
+    if w_scale_n == 1 and splits == 1:
+        xcd["xcd_swizzle"] = 4
     xcd = xcd if cfg["b_direct"] and runs({**cfg, **xcd}) else {}
     return bmm_kernel_name(**cfg, splits=splits, **xcd)
 
@@ -297,12 +301,12 @@ def compile_bmm_a8w8_mxfp8_gfx950(
     x_scale_transposed: bool = False,
     w_scale_n: int | None = None,
 ) -> None:
-    """Compile ``kernel_name`` for ``[B, N, K]`` with square ``scale_block``
-    e8m0 blocks (1 x block for x_scale, column-major if x_scale_transposed),
-    as run_bmm_a8w8_mxfp8_gfx950 would launch it. M is a runtime argument, so
-    this serves every M. Call it under
-    ``aiter.aot.flydsl.common.compile_only_env``.
-    w_scale_n overrides the w_scale block's rows (1 for a scale per B row)."""
+    """Compile ``kernel_name`` for ``[B, N, K]`` with ``scale_block``-wide
+    e8m0 blocks: 1 x block for x_scale (column-major if x_scale_transposed),
+    w_scale_n x block for w_scale (square unless w_scale_n is given, 1 for a
+    scale per B row), as run_bmm_a8w8_mxfp8_gfx950 would launch it. M is a
+    runtime argument, so this serves every M. Call it under
+    ``aiter.aot.flydsl.common.compile_only_env``."""
     constexprs = _constexprs(
         kernel_name,
         n,
@@ -374,6 +378,11 @@ def run_bmm_a8w8_mxfp8_gfx950(
         _scale_block(k, w_scale.shape[2], "w_scale K"),
         _x_scale_column_major(m, x_scale_transposed),
     )
+    if scale_args[1] == 1 and scale_args[2] != SCALE_GROUP:
+        raise RuntimeError(
+            f"[FlyDSL gfx950 bmm] a 1-row w_scale must be 1x{SCALE_GROUP} blocks, "
+            f"got 1x{scale_args[2]}"
+        )
     if m == 0:
         return Out
 
