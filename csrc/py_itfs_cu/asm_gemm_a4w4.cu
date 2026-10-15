@@ -56,10 +56,40 @@ struct __attribute__((packed)) KernelArgs
     unsigned int stride_ScaleB1;
     p3 _p22;
     int log2_k_split;
-    unsigned int num_cu; // persistent kernels: the device CU count, sizes the grid to min(tiles, num_cu)
+    // p3 _p23;
 };
-// The persistent .co is prebuilt and reads num_cu at this fixed offset.
-static_assert(offsetof(KernelArgs, num_cu) == 372, "persistent f4gemm kernarg layout");
+
+// ps=1 kernels: the same arguments plus the CU count (the grid is min(tiles x K slices, num_cu))
+struct __attribute__((packed)) PsKernelArgs
+{
+    KernelArgs args;
+    unsigned int num_cu;
+};
+// The prebuilt .co files read these offsets.
+static_assert(offsetof(KernelArgs, log2_k_split) == 368 && sizeof(KernelArgs) == 372 &&
+                  offsetof(PsKernelArgs, num_cu) == 372 && sizeof(PsKernelArgs) == 376,
+              "f4gemm kernarg layout");
+
+// What the ps=1 kernels take: B preshuffled and contiguous, K % 64 == 0, N % 16 == 0, scales padded to whole tiles,
+// A and B under 4 GiB and one C tile under 2 GiB (32-bit buffer offsets), no bias and no beta.
+static bool ps_supported(const f4gemmConfig& cfg,
+                         aiter_tensor_t* A,
+                         aiter_tensor_t* B,
+                         aiter_tensor_t* A_scale,
+                         aiter_tensor_t* B_scale,
+                         aiter_tensor_t* out,
+                         aiter_tensor_t* bias,
+                         float beta,
+                         int bpreshuffle)
+{
+    const int64_t M = A->size(0), N = B->size(0), K = A->size(1) * 2;
+    const int64_t a_row = A->stride(0), b_row = B->stride(0); // bytes: fp4_x2 elements
+    const int64_t lim = int64_t(1) << 32;
+    return bpreshuffle && bias == nullptr && beta == 0.f && K % 64 == 0 && N % 16 == 0 && a_row % 16 == 0 &&
+           b_row * 2 == K && A_scale->size(0) >= (M + cfg.tile_M - 1) / cfg.tile_M * cfg.tile_M &&
+           B_scale->size(0) >= (N + cfg.tile_N - 1) / cfg.tile_N * cfg.tile_N && M * a_row < lim &&
+           N * b_row < lim && int64_t(cfg.tile_M) * out->stride(0) * 2 < lim / 2;
+}
 
 static CFG* get_cfg(AiterDtype inp_dtype, AiterDtype out_dtype)
 {
@@ -86,6 +116,7 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
                                                   std::string arch_id,
                                                   int log2_k_split,
                                                   int bpreshuffle,
+                                                  bool ps_ok,
                                                   CFG* cfgs)
 {
     hipDevice_t dev;
@@ -102,11 +133,22 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
     std::string selectedKernelName = "";
     int selectedsplitK             = 1;
 
+    // A ps=1 kernel that takes this call replaces the ps=0 kernel of the same tile; one that does not is skipped.
+    auto has_ps_twin = [&](const f4gemmConfig& cfg) {
+        for(const auto& el : *cfgs)
+            if(el.first.find(arch_id) == 0 && el.second.ps && el.second.tile_M == cfg.tile_M &&
+               el.second.tile_N == cfg.tile_N && el.second.bpreshuffle == cfg.bpreshuffle)
+                return true;
+        return false;
+    };
+
     for(const auto& el : *cfgs)
     {
         if(el.first.find(arch_id) != 0)
             continue;
         const auto& cfg = el.second;
+        if(cfg.ps ? !ps_ok : ps_ok && has_ps_twin(cfg))
+            continue;
         if(cfg.bpreshuffle == bpreshuffle_en &&
            (cfg.splitK >= log2_k_split_en))
         {
@@ -179,8 +221,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     int Mdim = A->size(0);
     int Ndim = B->size(0);
     int Kdim = A->size(1) * 2; // always fp4_x2
-    KernelArgs args;
-    size_t arg_size = sizeof(args);
+    KernelArgs args{};
     args.ptr_D      = out->ptr;
     args.ptr_C      = bias ? bias->ptr : nullptr;
     args.ptr_A      = A->ptr;
@@ -203,14 +244,14 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const HipDeviceGuard device_guard(A->device_id);
 
     CFG* config_map = get_cfg(A->dtype(), out->dtype());
-    using DictKey   = std::tuple<int, int, int, int, int>;
+    using DictKey   = std::tuple<int, int, int, int, int, int>;
     struct SimpleHash
     {
         size_t operator()(const DictKey& key) const
         {
-            const auto& [m, n, k, log2, shuffle] = key;
+            const auto& [m, n, k, log2, shuffle, ps_ok] = key;
             return std::hash<int>()(m) ^ std::hash<int>()(n) ^ std::hash<int>()(k) ^
-                   std::hash<int>()(log2) ^ std::hash<int>()(shuffle);
+                   std::hash<int>()(log2) ^ std::hash<int>()(shuffle) ^ std::hash<int>()(ps_ok << 1);
         }
     };
     static SynchronizedCache<DictKey, std::tuple<std::string, int>, SimpleHash>
@@ -226,10 +267,14 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     int selectedksplit = (log2_k_split >= 0) ? log2_k_split : 0;
     if(kname.empty())
     {
+        bool ps_ok = true; // every ps=1 kernel of this arch takes the call
+        for(const auto& el : *config_map)
+            if(el.first.find(arch_id) == 0 && el.second.ps)
+                ps_ok = ps_ok && ps_supported(el.second, A, B, A_scale, B_scale, out, bias, beta, bpreshuffle);
         std::tie(kname, selectedksplit) = heuristic_kernel_dict.get_or_create(
-            DictKey(Mdim, Ndim, Kdim, log2_k_split, bpreshuffle), [&]() {
+            DictKey(Mdim, Ndim, Kdim, log2_k_split, bpreshuffle, ps_ok), [&]() {
                 return get_heuristic_kernel(
-                    Mdim, Ndim, Kdim, arch_id, log2_k_split, bpreshuffle, config_map);
+                    Mdim, Ndim, Kdim, arch_id, log2_k_split, bpreshuffle, ps_ok, config_map);
             });
     }
 
@@ -237,6 +282,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     int SUBM                 = 0;
     int SUBN                 = 0;
     int gdz                  = 1;
+    uint32_t num_cu          = 0; // ps=1 only
 
     auto it = config_map->find(kname);
     if(it != config_map->end())
@@ -247,16 +293,38 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         SUBM                = cfg.tile_M;
         SUBN                = cfg.tile_N;
 
+        if(cfg.ps)
+        {
+            AITER_CHECK(bias == nullptr && beta == 0.f, __func__, " ", kname, ": bias/beta not supported");
+            AITER_CHECK(ps_supported(cfg, A, B, A_scale, B_scale, out, bias, beta, bpreshuffle),
+                        __func__,
+                        " ",
+                        kname,
+                        ": needs B preshuffled and contiguous, K % 64 == 0, N % 16 == 0, scales padded to whole "
+                        "tiles, A and B under 4 GiB");
+            num_cu = get_num_cu_func();
+        }
+
         if(cfg.splitK == 1)
         {
             args.log2_k_split = selectedksplit;
             int k_num         = 1 << args.log2_k_split;
             AITER_CHECK(Kdim % k_num == 0, __func__, " Kdim % (1 << args.log2_k_split) != 0 !");
+            auto k_slices = [&](int split) {
+                int k_per_tg = Kdim / split;
+                k_per_tg     = ((k_per_tg + 256 - 1) / 256) * 256;
+                return (Kdim + k_per_tg - 1) / k_per_tg;
+            };
+            // ps=1 kernels drop K slices until every work item has its own CU; same rule here, so grid == work
+            const int64_t tiles = int64_t((Mdim + SUBM - 1) / SUBM) * ((Ndim + SUBN - 1) / SUBN);
+            while(cfg.ps && k_num > 1 && tiles * k_slices(k_num) > num_cu)
+            {
+                k_num /= 2;
+                --args.log2_k_split;
+            }
             if(k_num > 1)
                 hipMemsetAsync(out->ptr, 0, out->numel() * out->element_size(), stream);
-            int k_per_tg = Kdim / k_num;
-            k_per_tg     = ((k_per_tg + 256 - 1) / 256) * 256;
-            gdz          = (Kdim + k_per_tg - 1) / k_per_tg;
+            gdz = k_slices(k_num);
         }
 
         impl_ptr =
@@ -267,28 +335,16 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 
     int gdx = (Ndim + SUBN - 1) / SUBN;
     int gdy = (Mdim + SUBM - 1) / SUBM;
-    if(it->second.persistent)
+    if(it->second.ps) // one workgroup per CU at most, each loops over its work items (tile x K slice)
     {
-        // One workgroup per CU loops over the tiles; buffer offsets are 32-bit (A and B under 4 GB, as before). It
-        // ignores bias and beta, like the non-persistent 256x256 kernel before it.
-        const int64_t lim = int64_t(1) << 32;
-        AITER_CHECK(bpreshuffle, __func__, " ", kname, ": B preshuffled");
-        AITER_CHECK(Kdim % 64 == 0 && Ndim % 16 == 0 && args.stride_A0 % 32 == 0 && args.stride_B0 == Kdim &&
-                        A_scale->size(0) >= gdy * SUBM && B_scale->size(0) >= gdx * SUBN &&
-                        int64_t(Mdim) * args.stride_A0 / 2 < lim && int64_t(Ndim) * Kdim / 2 < lim &&
-                        int64_t(SUBM) * args.stride_C0 * 4 < lim,
-                    __func__,
-                    " ",
-                    kname,
-                    ": needs K % 64 == 0, N % 16 == 0, contiguous B, scales padded to 256 rows, A and B "
-                    "tensors under 4 GB");
-        args.num_cu = get_num_cu_func();
-        gdx         = std::min<int64_t>(int64_t(gdx) * gdy * gdz, args.num_cu); // tiles x K slices
-        gdy         = 1;
-        gdz         = 1;
+        gdx = std::min<int64_t>(int64_t(gdx) * gdy * gdz, num_cu);
+        gdy = 1;
+        gdz = 1;
     }
+    PsKernelArgs ps_args{args, num_cu};
+    size_t arg_size = it->second.ps ? sizeof(ps_args) : sizeof(args);
 
-    impl_ptr->launch_kernel({&args,
+    impl_ptr->launch_kernel({it->second.ps ? (void*)&ps_args : (void*)&args,
                              &arg_size,
                              gdx, // gdx
                              gdy, // gdy
