@@ -260,15 +260,6 @@ def _parse_cu_num_rocminfo(output: str) -> list[int]:
     return gpu_compute_units
 
 
-def _parse_cu_num_hipinfo(output: str) -> list[int]:
-    # hipinfo prints one block per device with a line like:
-    #   "multiProcessorCount:           80"
-    # On AMD GPUs this is the compute-unit count.
-    return [
-        int(m.group(1)) for m in re.finditer(r"multiProcessorCount\s*:\s*(\d+)", output)
-    ]
-
-
 @torch_compile_guard()
 def get_cu_num_custom_op() -> int:
     cu_num = int(os.getenv("CU_NUM", "0"))
