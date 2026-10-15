@@ -58,7 +58,7 @@ def _source_rows(table, tile, count, wave, hk):
     lane = fx.thread_idx.x & 63
     index = _min(tile * 16 + (wave & 3) * 4 + (lane & 3), count - 1)
     block = _buffer_words(table, index * 4, 1)[0]
-    return block * (4 * hk * D * 2) + (wave >> 2) * 256
+    return fx.Uint32(block) * (4 * hk * D * 2) + (wave >> 2) * 256
 
 
 def _union_dma(
@@ -95,7 +95,7 @@ def _union_dma(
     base_row, base_channel = _copy_coordinates(wave, 0, 4)
     base_destination = fx.Int32(base_row * 512 + base_channel * 2)
     immediate = destination_offset - offset
-    row, limit = rows[packet // 4], limits[packet & 3]
+    row, limit = fx.Uint32(rows[packet // 4]), limits[packet & 3]
     if read_address is not None:
         # One asm leaf keeps SOFFSET, M0 and the paired LDS read together; split
         # producers get hazard nops between them.
@@ -202,9 +202,9 @@ def _output(
         element = tid * 8 + part * THREADS * 8
         read_row, column = element // 256, element % 256
         query, head = (read_row + row_offset) // gp, (read_row + row_offset) % gp
-        offset = (query * heads * D + head * D + column) * 2
+        offset = fx.Uint32((query * heads * D + head * D + column) * 2)
         valid = (query < qvalid) & (query < bq) & (head < g)
-        offset = valid.select(offset, fx.Int32(extent))
+        offset = valid.select(offset, extent)
         fragment = fx.make_rmem_tensor(8, fx.BFloat16)
         fragment.store(parts[part].bitcast(fx.BFloat16))
         atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.BFloat16)
@@ -231,7 +231,6 @@ def _body(
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
-    NK: fx.Int32,
     CAP: fx.Int32,
     BQ: fx.Constexpr[int],
     GP: fx.Constexpr[int],
@@ -263,22 +262,23 @@ def _body(
     query, head = row // GP, row % GP
     mask_offset = _pin_i32(_min(query, fx.Int32(BQ - 1)) * 8 + (lane >> 4) * 2)
     valid_row = (query < qvalid) & (query < BQ) & (head < (H // HK))
-    qextent = (NQ - q0) * H * D * 2 - hkv * (H // HK) * D * 2
+    # Byte offsets are unsigned 32-bit: Q and each request's K/V may span up to 4 GiB.
+    qextent = fx.Uint32(NQ - q0) * H * D * 2 - hkv * (H // HK) * D * 2
     qptr = fx.get_iter(Q) + fx.Int64(q0) * (H * D) + hkv * (H // HK) * D
     gq = _buffer(fx.make_view(qptr, fx.make_layout(NQ * H * D, 1)), qextent)
-    qoffset = valid_row.select((query * H * D + head * D) * 2, fx.Int32(qextent))
+    qoffset = valid_row.select(fx.Uint32((query * H * D + head * D) * 2), qextent)
     q = _q_fragment(gq, qoffset, lane)
-    extent = (kv_len * HK - hkv) * D * 2
-    limit = (kv_len - 1) * (HK * D * 2) + (wave >> 2) * 256
+    extent = (fx.Uint32(kv_len) * HK - hkv) * D * 2
+    limit = fx.Uint32(kv_len - 1) * (HK * D * 2) + (wave >> 2) * 256
     limits = tuple(
-        (limit > k * HK * D * 2).select(limit - k * HK * D * 2, fx.Int32(0))
+        (limit > k * HK * D * 2).select(limit - k * HK * D * 2, fx.Uint32(0))
         for k in range(4)
     )
     gk = rocdl.get_buffer_rsrc(
         _buffer(
             fx.make_view(
                 fx.get_iter(K) + (fx.Int64(k0) * HK + hkv) * D,
-                fx.make_layout(NK * HK * D, 1),
+                fx.make_layout(extent // 2, 1),
             ),
             extent,
         )
@@ -287,7 +287,7 @@ def _body(
         _buffer(
             fx.make_view(
                 fx.get_iter(V) + (fx.Int64(k0) * HK + hkv) * D,
-                fx.make_layout(NK * HK * D, 1),
+                fx.make_layout(extent // 2, 1),
             ),
             extent,
         )
@@ -583,7 +583,6 @@ def _kernel(
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
-    NK: fx.Int32,
     CAP: fx.Int32,
     BQ: fx.Constexpr[int],
     GP: fx.Constexpr[int],
@@ -622,7 +621,6 @@ def _kernel(
                     H,
                     HK,
                     NQ,
-                    NK,
                     CAP,
                     BQ,
                     GP,
@@ -644,7 +642,6 @@ def _kernel(
                     H,
                     HK,
                     NQ,
-                    NK,
                     CAP,
                     BQ,
                     GP,
@@ -669,7 +666,6 @@ def _launch(
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
-    NK: fx.Int32,
     CAP: fx.Int32,
     BQ: fx.Constexpr[int],
     GP: fx.Constexpr[int],
@@ -693,7 +689,6 @@ def _launch(
             H,
             HK,
             NQ,
-            NK,
             CAP,
             BQ,
             GP,
@@ -713,8 +708,8 @@ _COMPILED = {}
 def _args(inputs, plan, out, stream):
     return (
         inputs.q.view(-1),
-        inputs.k.view(-1),
-        inputs.v.view(-1),
+        inputs.k,
+        inputs.v,
         out.view(-1),
         plan.metadata.view(-1),
         plan.blocks.view(-1),
@@ -725,7 +720,6 @@ def _args(inputs, plan, out, stream):
         inputs.q.shape[1],
         inputs.k.shape[1],
         inputs.q.shape[0],
-        inputs.k.shape[0],
         plan.block_capacity,
         plan.query_tile,
         plan.group_padded,
@@ -739,14 +733,14 @@ def _args(inputs, plan, out, stream):
 
 
 def _compiled(inputs, args, stream):
-    key = (inputs.q.device, args[10], args[11], args[15], args[16], args[19])
+    key = (inputs.q.device, args[10], args[11], args[14], args[15], args[18])
     compiled = _COMPILED.get(key)
     if compiled is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Warm the QSA specialization before graph capture")
         with torch.cuda.device(inputs.q.device), torch.cuda.stream(stream):
             compiled = _COMPILED[key] = flyc.compile(
-                _launch, *args[:18], 0, args[19], stream
+                _launch, *args[:17], 0, args[18], stream
             )
     return compiled
 
@@ -761,7 +755,7 @@ def run(*, inputs, plan, out):
 
 
 def launcher(*, inputs, plan, out):
-    """launch(q, k, v, out) taking flat views, with this plan's other arguments prebuilt.
+    """launch(q, k, v, out) with flat Q/out and unflattened K/V; other arguments prebuilt.
 
     Valid while the plan's scratch bindings and the current stream stay the same.
     """

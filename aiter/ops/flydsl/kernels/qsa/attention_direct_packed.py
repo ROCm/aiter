@@ -101,7 +101,7 @@ def _output(
             head < g
         )
         offset = enabled.select(
-            query * h * 256 + head * 256 + col, fx.Int32(extent // 2)
+            fx.Uint32(query * h * 256 + head * 256 + col), extent // 2
         )
         fragment = fx.make_rmem_tensor(8, fx.BFloat16)
         fragment.store(parts[part].bitcast(fx.BFloat16))
@@ -122,16 +122,19 @@ def _pack_block(
     dim = half * 128 + chunk * 8
     # Tokens past a request's end are masked by the direct kernel.
     source = valid.select(
-        ((start + token) * hk + head) * 512 + dim * 2, fx.Int32(source_extent)
+        fx.Uint32((start + token) * hk + head) * 512 + dim * 2, source_extent
     )
     key = _buffer_words(kr, source)
     target = (
-        ((block * 4 + dim // 64) * hk + head) * 256
-        + (dim % 64 // 32) * 128
-        + (dim % 32 // 8) * 32
-        + token * 8
-    ) * 2
-    target = valid.select(target, fx.Int32(extent))
+        fx.Uint32(
+            ((block * 4 + dim // 64) * hk + head) * 256
+            + (dim % 64 // 32) * 128
+            + (dim % 32 // 8) * 32
+            + token * 8
+        )
+        * 2
+    )
+    target = valid.select(target, extent)
     _buffer_store_words(key, pk, target)
     vector = _buffer_words(vr, source)
     words = [vector[i] for i in range(4)]
@@ -162,8 +165,8 @@ def _pack_block(
     )
     rank = half * 512 + (lane >> 4) * 128 + chunk * 8
     target = valid.select(
-        ((block * 4 + rank // 256) * hk + head) * 512 + rank % 256 * 2,
-        fx.Int32(extent),
+        fx.Uint32((block * 4 + rank // 256) * hk + head) * 512 + rank % 256 * 2,
+        extent,
     )
     _buffer_store_words(output, pv, target)
 
@@ -173,7 +176,8 @@ def _pack_body(K, V, PK, PV, SOURCES, N, PACKED, HK):
     tid = fx.thread_idx.x
     lane, half = tid & 63, (tid >> 6) & 1
     first = fx.block_idx.x * 8 + (tid >> 7)
-    source_extent, extent = N * HK * 512, PACKED * 4 * HK * 512
+    source_extent = fx.Uint32(N) * HK * 512
+    extent = fx.Uint32(PACKED) * 4 * HK * 512
     kr, vr = _buffer(K, source_extent), _buffer(V, source_extent)
     pk, pv = _buffer(PK, extent), _buffer(PV, extent)
     for u in fx.range_constexpr(4):
@@ -228,8 +232,10 @@ def _key_offset(cached, n, visible, extent, hk, topk):
     width = complete * 4 + (visible & 3)
     selector = fx.Int32((_min(n >> 2, fx.Int32(topk - 1)) & 63) * 4)
     block = fx.Int32(rocdl.ds_bpermute(fx.Int32.ir_type, selector, fx.Int32(cached)))
-    base = (n < complete * 4).select(block * (hk * 2048), (visible & -4) * (hk * 512))
-    return (n < width).select(base + (n & 3) * 16, fx.Int32(extent))
+    base = (n < complete * 4).select(
+        fx.Uint32(block) * (hk * 2048), fx.Uint32(visible & -4) * (hk * 512)
+    )
+    return (n < width).select(base + (n & 3) * 16, extent)
 
 
 def _key_load(resource, offset, lane, hk):
@@ -263,7 +269,7 @@ def _mask_value_tail(value, tile, segment, lane, visible, TOPK: fx.Constexpr[int
 
 
 def _value_load(resource, source_base, tile, segment, half, lane, visible, hk, topk):
-    base = source_base + half * 2 * hk * 512 + (lane & 15) * 16
+    base = fx.Uint32(source_base) + half * 2 * hk * 512 + (lane & 15) * 16
     parts = [
         _buffer_words(resource, base + (part // 2) * hk * 512 + (part % 2) * 256)
         for part in range(4)
@@ -364,7 +370,6 @@ def _body(
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
-    NK: fx.Int32,
     SCALE: fx.Constexpr[float],
     TOPK: fx.Constexpr[int],
 ):
@@ -384,25 +389,25 @@ def _body(
     visible = position0 + wave + 1
     count = _min(visible >> 2, fx.Int32(TOPK)) * 4 + (visible & 3)
     tiles = valid_wave.select((count + 31) >> 5, fx.Int32(0))
-    qe = (NQ - first) * H * 512 - hkv * (H // HK) * 512
+    qe = fx.Uint32(NQ - first) * H * 512 - hkv * (H // HK) * 512
     qptr = fx.get_iter(Q) + (fx.Int64(first) * H + hkv * (H // HK)) * 256
     qr = _buffer(fx.make_view(qptr, fx.make_layout(NQ * H * 256, 1)), qe)
     qoffset = (valid_wave & ((lane & 15) < H // HK)).select(
-        (wave * H + (lane & 15)) * 512, fx.Int32(qe)
+        fx.Uint32((wave * H + (lane & 15)) * 512), qe
     )
     q = _load(qr, qoffset, lane)
-    extent = (kv_len * HK - hkv) * 512
+    extent = (fx.Uint32(kv_len) * HK - hkv) * 512
     kr = _buffer(
         fx.make_view(
             fx.get_iter(K) + (fx.Int64(k0) * HK + hkv) * 256,
-            fx.make_layout(NK * HK * 256, 1),
+            fx.make_layout(extent // 2, 1),
         ),
         extent,
     )
     vr = _buffer(
         fx.make_view(
             fx.get_iter(V) + (fx.Int64(k0) * HK + hkv) * 256,
-            fx.make_layout(NK * HK * 256, 1),
+            fx.make_layout(extent // 2, 1),
         ),
         extent,
     )
@@ -416,7 +421,7 @@ def _body(
     cached = fx.Int32(blocks[row * TOPK + lane])
     rocdl.s_waitcnt(vmcnt=0)
     offset0 = _key_offset(cached, lane & 15, visible, extent, HK, TOPK)
-    offset0 = valid_wave.select(offset0, fx.Int32(extent))
+    offset0 = valid_wave.select(offset0, extent)
     kval0 = _key_load(kr, offset0, lane, HK)
     offset1 = _key_offset(
         cached,
@@ -426,7 +431,7 @@ def _body(
         HK,
         TOPK,
     )
-    offset1 = valid_wave.select(offset1, fx.Int32(extent))
+    offset1 = valid_wave.select(offset1, extent)
     kval1 = _key_load(kr, offset1, lane, HK)
     rocdl.s_waitcnt(vmcnt=0)
     rocdl.sched_barrier(0)
@@ -546,7 +551,6 @@ def _kernel(
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
-    NK: fx.Int32,
     GATED: fx.Constexpr[bool],
     SCALE: fx.Constexpr[float],
     TOPK: fx.Constexpr[int],
@@ -569,7 +573,6 @@ def _kernel(
                 H,
                 HK,
                 NQ,
-                NK,
                 SCALE,
                 TOPK,
             )
@@ -586,7 +589,6 @@ def _kernel(
             H,
             HK,
             NQ,
-            NK,
             SCALE,
             TOPK,
         )
@@ -640,7 +642,6 @@ def _launch(
             H,
             HK,
             NQ,
-            PACKED * 4,
             GATED,
             SCALE,
             TOPK,
@@ -667,11 +668,11 @@ def launch_args(inputs, prepared, out, tasks, stream):
     )
     return (
         inputs.q.view(-1),
-        inputs.k.view(-1),
-        inputs.v.view(-1),
+        inputs.k,
+        inputs.v,
         out.view(-1),
-        packed_key.view(-1),
-        packed_value.view(-1),
+        packed_key,
+        packed_value,
         sources,
         prepared.source_blocks.view(-1),
         prepared.metadata.view(-1),

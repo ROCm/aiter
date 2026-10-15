@@ -153,7 +153,11 @@ def prepare(
     q_lens = np.asarray(inputs.query_lens, dtype=np.int64)
     lengths = q_lens + np.asarray(inputs.prefix_lens, dtype=np.int64)
     blocks = np.where(q_lens > 0, -(-lengths // 4), 0)
-    packed = int(blocks.sum()) * 4 * hk * 1024 <= platform().max_packed_kv_bytes
+    # The pack kernel addresses all of K/V and PK/PV with unsigned 32-bit byte offsets.
+    packed = (
+        int(blocks.sum()) * 4 * hk * 1024 <= platform().max_packed_kv_bytes
+        and max(int(lengths.sum()), int(blocks.sum()) * 4) * hk * 512 < 2**32
+    )
     waves = 1 if packed else 4
     k_starts, p_starts = np.cumsum(lengths) - lengths, np.cumsum(blocks) - blocks
     counts = -(-q_lens // waves)
@@ -211,7 +215,7 @@ def _source_offset(cached_blocks, n, visible, extent, hk, topk):
     token = (n < complete * 4).select(
         block * 4 + (n & 3), (visible & -4) + n - complete * 4
     )
-    return (n < width).select(token * (hk * 256 * 2), fx.Int32(extent))
+    return (n < width).select(fx.Uint32(token) * (hk * 256 * 2), extent)
 
 
 def _load_v_global(
@@ -220,10 +224,10 @@ def _load_v_global(
     first = tile * bn + segment * 16 + (lane >> 4) * 4
     complete = _min(visible >> 2, fx.Int32(topk))
     width = complete * 4 + (visible & 3)
-    base = source_base + (lane & 15) * 16 + half * 256
+    base = fx.Uint32(source_base) + (lane & 15) * 16 + half * 256
     parts = []
     for r in range(4):
-        offset = (first + r < width).select(base + r * (hk * 256 * 2), fx.Int32(extent))
+        offset = (first + r < width).select(base + r * (hk * 256 * 2), extent)
         parts.append(_buffer_words(resource, offset))
     return fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
 
@@ -241,7 +245,6 @@ def _body(
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
-    NK: fx.Int32,
     BN: fx.Constexpr[int],
     THREADS: fx.Constexpr[int],
     TASKS: fx.Int32,
@@ -274,25 +277,25 @@ def _body(
     visible = position0 + wave + 1
     count = _min(visible >> 2, fx.Int32(TOPK)) * 4 + (visible & 3)
     tiles = valid_wave.select((count + 31) >> 5, fx.Int32(0))
-    qe = (NQ - first) * H * 256 * 2 - hkv * (H // HK) * 256 * 2
+    qe = fx.Uint32(NQ - first) * H * 256 * 2 - hkv * (H // HK) * 256 * 2
     qptr = fx.get_iter(Q) + (fx.Int64(first) * H + hkv * (H // HK)) * 256
     qr = _buffer(fx.make_view(qptr, fx.make_layout(NQ * H * 256, 1)), qe)
     qoffset = (valid_wave & ((lane & 15) < H // HK)).select(
-        (wave * H + (lane & 15)) * 512, fx.Int32(qe)
+        fx.Uint32((wave * H + (lane & 15)) * 512), qe
     )
     q = load(qr, qoffset, lane)
-    extent = (kv_len * HK - hkv) * 512
+    extent = (fx.Uint32(kv_len) * HK - hkv) * 512
     kr = _buffer(
         fx.make_view(
             fx.get_iter(K) + (fx.Int64(k0) * HK + hkv) * 256,
-            fx.make_layout(NK * HK * 256, 1),
+            fx.make_layout(extent // 2, 1),
         ),
         extent,
     )
     vr = _buffer(
         fx.make_view(
             fx.get_iter(V) + (fx.Int64(k0) * HK + hkv) * 256,
-            fx.make_layout(NK * HK * 256, 1),
+            fx.make_layout(extent // 2, 1),
         ),
         extent,
     )
@@ -307,7 +310,7 @@ def _body(
     cached_blocks = fx.Int32(blocks[row * TOPK + lane])
     rocdl.s_waitcnt(vmcnt=0)
     initial = source_offset(cached_blocks, lane >> 2, visible, extent, HK, TOPK)
-    initial = valid_wave.select(initial, fx.Int32(extent))
+    initial = valid_wave.select(initial, extent)
     kval = load_key(kr, initial, lane)
     key_offset = initial
     key_offset1 = source_offset(
@@ -318,7 +321,7 @@ def _body(
         HK,
         TOPK,
     )
-    key_offset1 = valid_wave.select(key_offset1, fx.Int32(extent))
+    key_offset1 = valid_wave.select(key_offset1, extent)
     kval1 = load_key(kr, key_offset1, lane)
     rocdl.s_waitcnt(vmcnt=0)
     rocdl.sched_barrier(0)
@@ -465,7 +468,6 @@ def _kernel(
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
-    NK: fx.Int32,
     BN: fx.Constexpr[int],
     THREADS: fx.Constexpr[int],
     TASKS: fx.Int32,
@@ -499,7 +501,6 @@ def _kernel(
                 H,
                 HK,
                 NQ,
-                NK,
                 BN,
                 THREADS,
                 TASKS,
@@ -520,7 +521,6 @@ def _kernel(
             H,
             HK,
             NQ,
-            NK,
             BN,
             THREADS,
             TASKS,
@@ -544,7 +544,6 @@ def _launch(
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
-    NK: fx.Int32,
     BN: fx.Constexpr[int],
     THREADS: fx.Constexpr[int],
     TASKS: fx.Int32,
@@ -567,7 +566,6 @@ def _launch(
             H,
             HK,
             NQ,
-            NK,
             BN,
             THREADS,
             TASKS,
@@ -590,8 +588,8 @@ def _bound(inputs, prepared, out, stream):
     tasks = prepared.num_tiles * inputs.k.shape[1]
     args = (
         inputs.q.view(-1),
-        inputs.k.view(-1),
-        inputs.v.view(-1),
+        inputs.k,
+        inputs.v,
         out.view(-1),
         prepared.source_blocks.view(-1),
         prepared.metadata.view(-1),
@@ -601,7 +599,6 @@ def _bound(inputs, prepared, out, stream):
         inputs.q.shape[1],
         inputs.k.shape[1],
         inputs.q.shape[0],
-        inputs.k.shape[0],
         32,
         256,
         tasks,
@@ -625,7 +622,7 @@ def _bound(inputs, prepared, out, stream):
         # Both variants initialize together: a later packed/raw layout switch never JITs.
         with torch.cuda.device(inputs.q.device), torch.cuda.stream(stream):
             compiled = _COMPILED[key] = (
-                flyc.compile(_launch, *args[:15], 0, *args[16:]),
+                flyc.compile(_launch, *args[:14], 0, *args[15:]),
                 packed.compile_launch(inputs, prepared, out, stream),
             )
     if prepared.packed_key is not None:
@@ -644,7 +641,7 @@ def run(*, inputs, prepared: DirectPlan, out: torch.Tensor):
 
 
 def launcher(*, inputs, prepared: DirectPlan, out: torch.Tensor):
-    """launch(q, k, v, out) taking flat views, with this plan's other arguments prebuilt.
+    """launch(q, k, v, out) with flat Q/out and unflattened K/V; other arguments prebuilt.
 
     Valid while the plan's scratch bindings and the current stream stay the same.
     """

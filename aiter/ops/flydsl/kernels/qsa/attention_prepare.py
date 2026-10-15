@@ -438,7 +438,7 @@ def _compact_kernel(
             if bits[k] != 0:
                 BLOCKS[tile * CAPACITY + count + before] = ids[k]
                 MEMBERSHIP[tile * CAPACITY + count + before] = bits[k]
-                DENSE[tile * MAX_BLOCKS + ids[k]] = member(0)
+                row_start[ids[k]] = member(0)
             count = count + waves[0] + waves[1] + waves[2] + waves[3]
         start = start + chunks * THREADS
         parity = parity ^ 1
@@ -447,7 +447,7 @@ def _compact_kernel(
         for k in fx.range_constexpr(4):
             index = rest + k * THREADS + tid
             if index < end:
-                DENSE[tile * MAX_BLOCKS + index] = member(0)
+                row_start[index] = member(0)
         rest = rest + 4 * THREADS
     proposal = (start >= end) & (fx.Float32(((count + 15) >> 4) * 16) <= budget)
     if tid == 0:
@@ -1021,7 +1021,8 @@ def _launches(inputs, plan, stream):
         inputs.kv_lens,
         inputs.query_sequence_ids,
         inputs.block_indices.view(-1),
-        standin if plan is None else plan.dense_membership.view(-1),
+        # 2-D: FlyDSL passes int32 dims, and tiles * max_blocks may exceed 2**31.
+        standin if plan is None else plan.dense_membership,
         standin if plan is None else plan.query_tiles,
         standin if plan is None else plan.metadata.view(-1),
         inputs.q.shape[0],
@@ -1035,7 +1036,7 @@ def _launches(inputs, plan, stream):
         return
     members64 = plan.query_tile > 32
     args = (
-        plan.dense_membership.view(-1),
+        plan.dense_membership,
         plan.blocks.view(-1),
         plan.membership.view(-1),
         plan.counts,

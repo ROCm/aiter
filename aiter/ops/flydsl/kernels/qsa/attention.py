@@ -31,6 +31,10 @@ from .attention_common import (
 
 __all__ = ["qsa_sparse_attention_flydsl"]
 
+# Kernels use unsigned 32-bit buffer byte offsets; the 1 MiB margin keeps out-of-range
+# sentinels plus their lane offsets from wrapping.
+_MAX_SPAN = 2**32 - 2**20
+
 
 def _union_min_rows(group):
     config = platform()
@@ -187,7 +191,8 @@ class _Hot:
             launch()
 
     def compute_call(self, q, k, v, out):
-        views = (q.view(-1), k.view(-1), v.view(-1), out.view(-1))
+        # K/V stay 3-D: FlyDSL passes int32 dims and K/V may exceed 2**31 elements.
+        views = (q.view(-1), k, v, out.view(-1))
         for launch in self.compute:
             launch(*views)
 
@@ -290,8 +295,8 @@ def qsa_sparse_attention_flydsl(
             or tensor.shape[-1] != 256
         ):
             raise ValueError("Q/K/V must be contiguous BF16 [tokens, heads, 256]")
-        if tensor.data_ptr() % 16 or tensor.numel() * tensor.element_size() >= 2**31:
-            raise ValueError("Q/K/V require 16-byte alignment and byte spans < 2**31")
+        if tensor.data_ptr() % 16:
+            raise ValueError("Q/K/V require 16-byte alignment")
     if (
         k.shape != v.shape
         or q.shape[1] <= 0
@@ -303,6 +308,11 @@ def qsa_sparse_attention_flydsl(
         )
     if q.shape[1] // k.shape[1] > 16:
         raise ValueError("At most 16 Q heads per KV head fit the direct fallback wave")
+    # K/V are addressed per request, so only each request's K (or V) span is bounded,
+    # not the packed total: about 8M context tokens at HK1, 4M at HK2.
+    tokens = max(map(sum, zip(query_lens, prefix_lens)), default=0)
+    if max(q.numel(), tokens * k.stride(0)) * q.element_size() > _MAX_SPAN:
+        raise ValueError("Q and each request's K/V require byte spans <= 2**32 - 2**20")
     if get_gfx_runtime() != "gfx942":
         raise ValueError("QSA sparse attention requires gfx942")
     topk = (indices.shape[-1] - 3) // 4 if indices.ndim else 0

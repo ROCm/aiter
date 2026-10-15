@@ -8,19 +8,24 @@ Row ``t`` of request ``r`` attends only to its selected tokens::
     out[t, h] = softmax(scale * q[t, h] @ K_r[sel_t].T) @ V_r[sel_t]
 
 ``sel_t`` is the indexer's selection: up to T complete four-token blocks of the
-row's causal window (ascending block IDs), then its 0..3 causal tail tokens,
-then -1 padding, in an int32 [rows, 4T + 3] tensor (T = 512 unless the case
-name starts with ``topk``). Q is BF16 [rows, H, 256] and K/V are the requests'
-packed BF16 [prefix + new tokens, HK, 256].
+row's causal window, then its 0..3 causal tail tokens, then -1 padding, in an
+int32 [rows, 4T + 3] tensor (T = 512 unless the case name starts with
+``topk``). Q is BF16 [rows, H, 256] and K/V are the requests' packed BF16
+[prefix + new tokens, HK, 256].
 
 Groups (Q heads per KV head) follow Qwen3.8-Flash-Next per TP rank (12/6/3 for
-TP2/4/8, where HK = 1 and H = group); HK = 2/8/16 cases repeat those groups
-over more KV heads. Cases cover a full 12000-row prefill, chunked prefill
-against long cached contexts (including ones whose packed KV exceeds the direct
-kernel's 64 MiB budget), ragged multi-request batches, short extends, one row,
-and T = 256/768/1024 selections. ``shared`` selections let 32-row windows share
-block priorities, as neighbouring queries of the indexer do; ``random`` rows
-choose independently.
+TP2/4/8, where HK = 1 and H = group); HK = 2/16 cases repeat those groups over
+more KV heads. Functional cases cover one row, a short extend and chunked
+prefill against long cached contexts (one whose packed KV exceeds the direct
+kernel's 64 MiB budget), ragged batches with an empty request, HK > 1 and
+T = 256/768/1024 selections. Performance cases are single-request full
+prefills of 1k-32k tokens plus the 12000-token serving prompt (T = 512); they
+are checked as well and are the only cases using the full-prefill BQ21/BQ42
+union tiles. ``shared`` selections let 32-row windows share block priorities;
+``random`` rows choose independently; ``correlated`` (performance cases)
+simulates the real indexer's selection distribution, captured Qwen3.8 layers
+whose neighbouring rows share about half of their blocks (see
+correlated_prefill).
 
 ``triton`` is SGLang's native QSA extend path, copied below and called as its
 backend does: sparse_gqa_fwd_interface_triton when no request has a prefix,
@@ -33,7 +38,9 @@ Usage:
 
 import argparse
 import itertools
+import math
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
@@ -53,37 +60,113 @@ HEAD_DIM = 256
 SCALE = HEAD_DIM**-0.5
 
 # name -> (query_lens, prefix_lens, kv_heads, selection, blocks per row T)
-CASES = {
+# Functional coverage: request layouts, selections, KV heads, T, and the packed
+# direct, raw direct and union paths.
+FUNCTIONAL_CASES = {
     "one_row": ((1,), (0,), 1, "shared", 512),
-    "extend_65": ((65,), (0,), 1, "shared", 512),
-    "prefill_12000": ((12000,), (0,), 1, "shared", 512),
-    "chunk_1024_ctx_31024": ((1024,), (30000,), 1, "shared", 512),
-    "chunk_1024_ctx_31024_random": ((1024,), (30000,), 1, "random", 512),
     "extend_17_ctx_30017": ((17,), (30000,), 1, "random", 512),
+    "chunk_1024_ctx_31024_random": ((1024,), (30000,), 1, "random", 512),
     "ragged_4": ((300, 129, 1001, 63), (0, 517, 4093, 12345), 1, "shared", 512),
     "chunk_1024_ctx_132096": ((1024,), (131072,), 1, "shared", 512),
-    "hk2_extend_9_ctx_2056": ((9,), (2047,), 2, "random", 512),
     "hk2_ragged": ((7, 0, 9), (0, 5, 3000), 2, "shared", 512),
-    "hk8_extend_9_ctx_2056": ((9,), (2047,), 8, "random", 512),
-    "hk8_chunk_1024_ctx_4096": ((1024,), (3072,), 8, "shared", 512),
-    "hk16_ragged": ((7, 0, 9), (0, 5, 3000), 16, "shared", 512),
     "hk16_chunk_1024_ctx_9216": ((1024,), (8192,), 16, "random", 512),
-    "topk1024_prefill_12000": ((12000,), (0,), 1, "shared", 1024),
-    "topk1024_chunk_1024_ctx_31024": ((1024,), (30000,), 1, "random", 1024),
-    "topk1024_ragged_4": (
-        (300, 129, 1001, 63),
-        (0, 517, 4093, 12345),
-        1,
-        "shared",
-        1024,
-    ),
-    "topk1024_chunk_1024_ctx_132096": ((1024,), (131072,), 1, "shared", 1024),
-    "topk768_ragged_4": ((300, 129, 1001, 63), (0, 517, 4093, 12345), 1, "shared", 768),
     "topk256_chunk_1024_ctx_31024": ((1024,), (30000,), 1, "shared", 256),
+    "topk768_ragged_4": ((300, 129, 1001, 63), (0, 517, 4093, 12345), 1, "shared", 768),
+    "topk1024_chunk_1024_ctx_132096": ((1024,), (131072,), 1, "shared", 1024),
 }
+# Performance: one full prefill of 1k-32k tokens, plus the 12000-token serving prompt.
+PERF_CASES = {
+    f"prefill_{tokens}": ((tokens,), (0,), 1, "correlated", 512)
+    for tokens in (1024, 2048, 4096, 8192, 12000, 16384, 32768)
+}
+CASES = {**FUNCTIONAL_CASES, **PERF_CASES}
+
+# Sharing levels of real Qwen3.8 indexer selections at layers 3 and 47.
+CORRELATED_PROFILES = (
+    dict(
+        sharing_fraction=0.25,
+        high_shared_blocks=480,
+        low_shared_blocks=64,
+        high_window_blocks=768,
+        low_window_blocks=4096,
+    ),
+    dict(
+        sharing_fraction=0.29,
+        high_shared_blocks=496,
+        low_shared_blocks=96,
+        high_window_blocks=640,
+        low_window_blocks=4096,
+    ),
+)
+
+
+def correlated_prefill(rows, seed=20260929):
+    """Selections simulating the real indexer distribution, one prefill, T = 512.
+
+    Same draws as PyHIP's make_case(rows, H, seed), which mimics captured Qwen3.8
+    prefill selections: the first 2051 rows select their whole causal prefix.
+    Later rows form 128-row windows, alternating the two profiles; a seeded,
+    balanced ~27% of windows share a core of 480/496 blocks drawn from the last
+    768/640 visible blocks, the others a core of 64/96 from the last 4096. Each
+    row adds private blocks from that span up to 512, shuffled (unsorted, as the
+    indexer emits them), then its causal tail.
+    """
+    rng = np.random.default_rng(seed)
+    fraction = sum(p["sharing_fraction"] for p in CORRELATED_PROFILES) / len(
+        CORRELATED_PROFILES
+    )
+    phase = float(rng.random())
+    indices = np.full((rows, 2051), -1, dtype=np.int32)
+    dense = min(rows, 2051)
+    for row in range(dense):
+        indices[row, : row + 1] = np.arange(row + 1)
+    for window, first in enumerate(range(dense, rows, 128)):
+        high = math.floor((window + 1) * fraction + phase) > math.floor(
+            window * fraction + phase
+        )
+        settings = CORRELATED_PROFILES[window % len(CORRELATED_PROFILES)]
+        sharing = "high" if high else "low"
+        shared = settings[f"{sharing}_shared_blocks"]
+        span = settings[f"{sharing}_window_blocks"]
+        available = (first + 1) // 4
+        start = max(0, available - span)
+        common = rng.choice(np.arange(start, available), shared, replace=False)
+        for row in range(first, min(first + 128, rows)):
+            visible = row + 1
+            blocks = visible // 4
+            pool = np.arange(start, blocks)
+            private = pool[~np.isin(pool, common)]
+            chosen = np.concatenate(
+                (common, rng.choice(private, 512 - shared, replace=False))
+            )
+            rng.shuffle(chosen)
+            indices[row, :2048] = (chosen[:, None] * 4 + np.arange(4)).reshape(-1)
+            indices[row, 2048 : 2048 + visible % 4] = np.arange(blocks * 4, visible)
+    return torch.from_numpy(indices).cuda()
 
 
 def make_indices(query_lens, prefix_lens, selection, generator, topk):
+    """Indexer-like selections of the packed requests.
+
+    Inputs: per-request query rows and cached prefix tokens (host ints), the
+    selection mode ("shared": 32-row windows share block priorities, "random":
+    per row, "correlated": correlated_prefill, one prefill with T = 512 and its own
+    seed), a CUDA generator, and T = topk blocks per row.
+
+    Returns contiguous int32 [sum(query_lens), 4T + 3], one row per query in packed
+    order; requests without queries add no rows. Row values are request-local token
+    IDs. For a row whose causal window holds v tokens (0 .. v - 1, the last being
+    the row's own token) and b = v // 4 complete four-token blocks:
+      - columns [0, 4 * min(b, T)) hold min(b, T) distinct complete blocks, each as
+        its tokens 4j .. 4j + 3: every block when b <= T, else T chosen blocks;
+        block IDs ascend, except that "correlated" keeps them shuffled;
+      - the next v % 4 columns hold the causal tail tokens 4b .. v - 1;
+      - all remaining columns are -1.
+    """
+    if selection == "correlated":
+        if len(query_lens) != 1 or prefix_lens[0] or topk != 512:
+            raise ValueError("correlated selections model one prefill with T = 512")
+        return correlated_prefill(query_lens[0])
     rows = []
     for count, prefix in zip(query_lens, prefix_lens):
         if count == 0:
@@ -532,7 +615,7 @@ def main():
         nargs="*",
         choices=list(CASES),
         default=list(CASES),
-        help="input layouts to run",
+        help="input layouts to run (functional coverage and performance cases)",
     )
     parser.add_argument(
         "-g",
@@ -544,14 +627,19 @@ def main():
     )
     args = parser.parse_args()
 
-    df = []
-    for case, group in itertools.product(args.case, args.group):
-        df.append(test_qsa_sparse_attention(case, group * CASES[case][2]))
-    df = pd.DataFrame(df)
-    aiter.logger.info(
-        "qsa_sparse_attention_flydsl summary (markdown):\n%s",
-        df.to_markdown(index=False),
-    )
+    for suite, cases in (("functional", FUNCTIONAL_CASES), ("performance", PERF_CASES)):
+        selected = [case for case in args.case if case in cases]
+        if not selected:
+            continue
+        df = [
+            test_qsa_sparse_attention(case, group * CASES[case][2])
+            for case, group in itertools.product(selected, args.group)
+        ]
+        aiter.logger.info(
+            "qsa_sparse_attention_flydsl %s summary (markdown):\n%s",
+            suite,
+            pd.DataFrame(df).to_markdown(index=False),
+        )
 
 
 if __name__ == "__main__":
