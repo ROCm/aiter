@@ -523,6 +523,14 @@ def gemm_afp4wfp4_preshuffle(
         y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
         config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
             BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
+            gfx1250 gluon only, opt-in keys: NUM_KSUB (K sub-steps per LDS stage,
+            1 or 2), GROUP_M (grouped tile order), SCALE_MODE, A_DATA_PRESHUFFLE
+            and B2B_WMMA (back-to-back WMMA scheduling). SCALE_MODE=2 needs both
+            scales from shuffle_mxfp8fp4_scale, viewed as (rows // 32, (K // 32) * 32).
+            SCALE_MODE=1 needs both scales in the 128-row packing,
+            (rows // 128, (K // 32) * 128); it needs 4 warps and 128 rows or more
+            per CTA. A_DATA_PRESHUFFLE=1 needs x from shuffle_weight (same shape,
+            contiguous, M % 16 == 0) and NUM_KSUB=2.
         skip_reduce (Optional[bool]): skip reduction, y becomes (SPK, M, N) where SPK is determined by config
 
     Returns:
@@ -603,13 +611,22 @@ def gemm_afp4wfp4_preshuffle(
             f"{config['BLOCK_SIZE_M']}, which num_ctas={num_ctas} splits {ctas_m} ways"
         )
 
+        # SCALE_MODE / NUM_KSUB are opt-in kernel keys; they also select the layouts.
         layouts = get_gemm_afp4wfp4_preshuffle_layouts(
             config["num_warps"],
             config["BLOCK_SIZE_M"],
             config["BLOCK_SIZE_N"],
             config["BLOCK_SIZE_K"],
             num_ctas,
+            config.get("SCALE_MODE", 0),
+            config.get("NUM_KSUB", 1),
+            config.get("A_DATA_PRESHUFFLE", 0),
         )
+        if config.get("A_DATA_PRESHUFFLE", 0):
+            # The kernel reads shuffled A as its raw (M // 16, K_bytes * 16) layout.
+            assert M % 16 == 0 and x_fp4.is_contiguous()
+            assert config.get("NUM_KSUB", 1) >= 2, "A_DATA_PRESHUFFLE needs NUM_KSUB=2"
+            x_fp4 = x_fp4.view(M // 16, K_bytes * 16)
 
         _gluon_gemm_mxfp4_preshuffle_gfx1250[grid](
             x_fp4,
