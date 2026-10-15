@@ -18,13 +18,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
     _attn_fwd_fp8 as _gluon_attn_fwd_fp8,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
-    _attn_fwd_split_head as _gluon_attn_fwd_split_head,
-)
-from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
     _get_config as _get_gluon_config,
-)
-from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
-    head_split as _gluon_head_split,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
     kv_async_copy_ok as _gluon_kv_async_copy_ok,
@@ -508,20 +502,9 @@ def _gluon_flash_attn_forward(
 
     grid = (batch * num_q_heads * triton.cdiv(seqlen_q, BLOCK_M), 1)
 
-    # A padded head dim whose Q@K^T contraction can be issued as two power-of-two
-    # slices for less MFMA work than one padded tile (96 -> 64 + 32, ...) runs the
-    # split-head kernel; same arguments, so only the kernel changes.
-    split_head = (
-        not IS_FP8
-        and pe_head_dim == 0
-        and _gluon_head_split(v_head_dim, BLOCK_DMODEL_POW2, 16) > 0
-    )
-    if IS_FP8:
-        kernel = _gluon_attn_fwd_fp8
-    elif split_head:
-        kernel = _gluon_attn_fwd_split_head
-    else:
-        kernel = _gluon_attn_fwd
+    # A padded head dim that splits into power-of-two slices (96 -> 64 + 32, ...)
+    # is handled inside _attn_fwd (_head_slices); only fp8 has a kernel of its own.
+    kernel = _gluon_attn_fwd_fp8 if IS_FP8 else _gluon_attn_fwd
     kernel[grid](
         q,
         k,

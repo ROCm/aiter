@@ -61,10 +61,10 @@ def _padded_staggered_layout(rows, cols, contig_dim, pad, interval=_PAD_INTERVAL
     across the other one, which is bank-conflict free only when consecutive
     strided-axis entries land far apart in LDS. The offset bases are therefore built
     by hand: the contiguous axis in the low bits, then the *high* bits of the strided
-    index, then its low bits -- that middle group is the stagger. ``pad`` differs per
+    index, then its low bits -- that middle group is the stagger. `pad` differs per
     tile because the reads do: K^T is read along its contiguous axis
-    (``ds_read_b128``) while V is read across it by the hardware-transposing
-    ``ds_read_b64_tr_b16``.
+    (`ds_read_b128`) while V is read across it by the hardware-transposing
+    `ds_read_b64_tr_b16`.
     """
     c, r = _contig_strided(rows, cols, contig_dim)
 
@@ -103,7 +103,7 @@ def _staggered_layout_ok(head_dim_pow2, block_n, elem_bytes, interval=_PAD_INTER
 def _make_kv_shared_layouts(head_dim_pow2, block_n):
     """LDS layouts for the K^T / V staging tiles: the conflict-free row-staggered
     padded layout, which is also what lets the async copy write them coalesced.
-    ``kv_async_copy_ok`` (via ``_staggered_layout_ok``) guarantees it can be built."""
+    `kv_async_copy_ok` (via `_staggered_layout_ok`) guarantees it can be built."""
     return (
         _padded_staggered_layout(head_dim_pow2, block_n, 0, pad=8),
         _padded_staggered_layout(block_n, head_dim_pow2, 1, pad=32),
@@ -111,7 +111,7 @@ def _make_kv_shared_layouts(head_dim_pow2, block_n):
 
 
 # Bits per lane the global->LDS copy's lowering accepts, widest (and fastest) first.
-# 128 is a ``*_dwordx4`` per lane; 32 is the plain-``dword`` form, four times the
+# 128 is a `*_dwordx4` per lane; 32 is the plain-`dword` form, four times the
 # instructions per tile but with a quarter of the per-lane footprint and alignment
 # requirement.
 _ASYNC_COPY_BITS = (128, 32)
@@ -122,8 +122,8 @@ def _async_copy_lane_rows(rows, cols, contig_dim, interval):
     """(first strided-axis bit the lanes take, strided-axis bits available to them).
 
     The copy's lanes have to write consecutive LDS addresses.  The staggered
-    destination (``_padded_staggered_layout``) stores the contiguous axis in its low
-    bits and, right above it, the strided axis starting at bit ``log2(split)`` -- so
+    destination (`_padded_staggered_layout`) stores the contiguous axis in its low
+    bits and, right above it, the strided axis starting at bit `log2(split)` -- so
     that is where the lanes' strided bits must start, and they can run up to the top
     of the axis.
     """
@@ -145,13 +145,13 @@ def _async_copy_vec(
 ):
     """Elements per lane a global->LDS async copy can move for this tile, or 0 if none can.
 
-    ``buffer_load_to_shared`` wants every lane to carry exactly 128 or 32 bits, those
-    bits aligned to their own width in global memory (``stride_align``, in elements,
+    `buffer_load_to_shared` wants every lane to carry exactly 128 or 32 bits, those
+    bits aligned to their own width in global memory (`stride_align`, in elements,
     is what the host verified), and the resulting LDS writes have to coalesce against
     the padded destination.  The widest width that satisfies all three wins; the
     32-bit one is what keeps small tiles (head dim 16/32) and strides that are even
     but not 8-element aligned on the copy.  0 means the tile cannot be copied at
-    all, and ``kv_async_copy_ok`` turns that into a host-side ``.contiguous()``.
+    all, and `kv_async_copy_ok` turns that into a host-side `.contiguous()`.
     """
     c, r = _contig_strided(rows, cols, contig_dim)
     n_threads = num_warps * warp_size
@@ -178,13 +178,13 @@ def _async_copy_vec(
 def _async_copy_layout(
     rows, cols, contig_dim, num_warps, vec, interval=_PAD_INTERVAL, warp_size=64
 ):
-    """Address layout for a global->LDS async copy of a ``[rows, cols]`` tile.
+    """Address layout for a global->LDS async copy of a `[rows, cols]` tile.
 
-    ``buffer_load_to_shared`` needs each lane to name ``vec`` *contiguous* elements
-    and needs the resulting LDS writes to coalesce. The low ``log2(vec)`` bits of the
+    `buffer_load_to_shared` needs each lane to name `vec` *contiguous* elements
+    and needs the resulting LDS writes to coalesce. The low `log2(vec)` bits of the
     contiguous axis go to registers and the rest of that axis to lanes; the lanes
     that axis leaves over take the strided bits the staggered destination stores
-    next (``_async_copy_lane_rows``).  The remaining strided bits split low-to-high
+    next (`_async_copy_lane_rows`).  The remaining strided bits split low-to-high
     across warps, then registers.
     """
     c, r = _contig_strided(rows, cols, contig_dim)
@@ -217,13 +217,13 @@ def _async_copy_layout(
 
 @gluon.constexpr_function
 def _async_copy_ok(head_dim_pow2, block_n, num_warps, elem_bits, stride_align):
-    """Can BOTH the K^T and the V tile be moved by ``buffer_load_to_shared``?
+    """Can BOTH the K^T and the V tile be moved by `buffer_load_to_shared`?
 
-    ``stride_align`` is the largest power of two, in elements, that the host has
+    `stride_align` is the largest power of two, in elements, that the host has
     verified divides every K/V stride -- and 0 when it could not verify anything,
     which is what the host reports for a tensor whose last axis is not contiguous.
     It has to reach the copy's vector width, because that is what makes every lane's
-    chunk aligned to its own size; see the note at the ``gl.multiple_of`` call.
+    chunk aligned to its own size; see the note at the `gl.multiple_of` call.
     Below it the copy would be wrong, so 0 disqualifies.
     """
     if not _staggered_layout_ok(head_dim_pow2, block_n, elem_bits // 8):
@@ -232,7 +232,7 @@ def _async_copy_ok(head_dim_pow2, block_n, num_warps, elem_bits, stride_align):
     if vec == 0:
         return False
     # K^T is [head_dim, block_n] with dim 0 contiguous; V is its transpose.  Both
-    # tiles share one vector width (``KV_VEC`` at the call sites).
+    # tiles share one vector width (`KV_VEC` at the call sites).
     return (
         _async_copy_vec(block_n, head_dim_pow2, 1, num_warps, elem_bits, stride_align)
         == vec
@@ -262,16 +262,16 @@ def _make_load_layout(block_dmodel, load_vec, num_warps, transposed, lanes=64):
 def _async_copy_tile(smem, base, offsets, mask, HAS_MASK: gl.constexpr):
     """Issue one global->LDS async copy tile, WITHOUT closing a commit group.
 
-    The copy never passes through VGPRs, so it needs no ``s_waitcnt vmcnt(0)`` and
-    no ``ds_write``; the wave issues it and walks away.
+    The copy never passes through VGPRs, so it needs no `s_waitcnt vmcnt(0)` and
+    no `ds_write`; the wave issues it and walks away.
 
     A masked lane is zero-filled by the hardware: the lowering turns its offset
     out of bounds, and an out-of-bounds buffer load returns 0, which the copy
-    writes to LDS like any other value.  Do NOT pass ``other``: that sends the
+    writes to LDS like any other value.  Do NOT pass `other`: that sends the
     lowering down its general path, an exec-mask branch around every copy
-    instruction plus a ``ds_write`` of the fill value, and on a padded head the
+    instruction plus a `ds_write` of the fill value, and on a padded head the
     branch predicates stay live across the loop, spill, and their reloads land in
-    front of the copies as ``s_waitcnt vmcnt(0)`` -- draining every copy in flight.
+    front of the copies as `s_waitcnt vmcnt(0)` -- draining every copy in flight.
     """
     if HAS_MASK:
         cdna4_async.buffer_load_to_shared(smem, base, offsets, mask=mask)
@@ -303,15 +303,15 @@ def _async_copy_kv_tile(
     PADDED_HEAD: gl.constexpr,
     HAS_PE: gl.constexpr,
 ):
-    """Stage one K (+PE) and V tile into LDS slot ``slot`` with buffer_load_to_shared.
+    """Stage one K (+PE) and V tile into LDS slot `slot` with buffer_load_to_shared.
 
     The KV-token mask is only built on the masked blocks; the head-dim mask is a
     property of the tensor, so it rides along on every block when the head dim is
-    padded. ``buffer_load_to_shared`` broadcasts a mask against the offsets, so each
+    padded. `buffer_load_to_shared` broadcasts a mask against the offsets, so each
     half is handed over carrying only the axis it constrains.
 
     The PE slice is a third tile with its own LDS buffer but it shares K's commit
-    group, so ``ASYNC_GROUPS`` in the caller stays 2 with or without it.
+    group, so `ASYNC_GROUPS` in the caller stays 2 with or without it.
     """
     HAS_MASK: gl.constexpr = MASK_STEPS or PADDED_HEAD
     if MASK_STEPS:
@@ -366,8 +366,8 @@ def _attn_qk(
     IS_CAUSAL: gl.constexpr = False,
     MASK_STEPS: gl.constexpr = False,
 ):
-    """QK^T + scale + mask for one already-staged key block. ``k`` is already in
-    its MFMA dot-operand layout; returns float32 scores in ``mfmaLayout``. For
+    """QK^T + scale + mask for one already-staged key block. `k` is already in
+    its MFMA dot-operand layout; returns float32 scores in `mfmaLayout`. For
     FP8 the QK^T uses the CDNA4 scaled MFMA (32x32x64).
     """
     qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
@@ -405,10 +405,12 @@ def _attn_qk(
 @gluon.jit
 def _attn_softmax_pv(
     acc,
+    acc2,
     l_i,
     m_i,
     qk,
     v,
+    v_hi,
     sd_base,
     sd_offsets,
     sd_q_mask,
@@ -418,9 +420,10 @@ def _attn_softmax_pv(
     stride_sd_n,
     dotP: gl.constexpr,
     RETURN_SCORES: gl.constexpr,
+    D_HI_PV: gl.constexpr,
 ):
-    """Online-softmax rescale + P@V accumulation for one key block.
-    Returns updated (acc, l_i, m_i)."""
+    """Online-softmax rescale + P@V accumulation for one key block, over both
+    accumulator slices.  Returns updated (acc, acc2, l_i, m_i)."""
 
     m_ij = gl.maximum(m_i, gl.max(qk, 1))
     p = gl.exp2(qk - m_ij[:, None])
@@ -439,13 +442,15 @@ def _attn_softmax_pv(
         )
 
     acc = acc * alpha[:, None]
+    if D_HI_PV > 0:
+        acc2 = acc2 * alpha[:, None]
     p = gl.convert_layout(p.to(v.dtype), layout=dotP, assert_trivial=True)
-    acc = gl.amd.cdna4.mfma(p, v, acc)
+    acc, acc2 = _dot_pv(p, v, v_hi, acc, acc2, D_HI_PV, False)
 
     l_i = l_i * alpha + l_ij
     m_i = m_ij
 
-    return acc, l_i, m_i
+    return acc, acc2, l_i, m_i
 
 
 # ---------------------------------------------------------------------------
@@ -477,9 +482,96 @@ def _attn_softmax_pv(
 _MIN_PIPE_BLOCKS = gl.constexpr(8)
 
 
+@gluon.constexpr_function
+def head_split(head_dim, head_dim_pow2, min_hi):
+    """Width of the upper slice when a padded head dim is issued as
+    `[0, head_dim_pow2 / 2)` plus `[head_dim_pow2 / 2, +hi)`; 0 when that saves
+    nothing over the single padded tile.  Also called by the host to pick this
+    kernel.
+
+    `min_hi` is the narrowest slice the MFMA can take on that side of the product:
+    16 on the Q@K^T contraction, 32 on the P@V output (the 32x32 instruction's N).
+    """
+    if head_dim == head_dim_pow2:
+        return 0
+    lo = head_dim_pow2 // 2
+    hi = max(1 << (head_dim - lo - 1).bit_length(), min_hi)
+    return hi if lo + hi < head_dim_pow2 else 0
+
+
+@gluon.constexpr_function
+def _head_slices(head_dim, head_dim_pow2, has_pe):
+    """`(D_LO, D_HI_QK, D_HI_PV)` -- how `_attn_fwd` issues the head dim.
+
+    A padded head dim run as one power-of-two tile spends part of every MFMA on zero
+    padding (a quarter of it at 96 -> 128).  When it saves work, the head dim is
+    issued as `[0, pow2 / 2)` plus a narrow power-of-two upper slice instead,
+    independently on each side of the product:
+
+    * Q@K^T contraction -- the upper slice is a second MFMA chain into the same
+      score accumulator.  Never with PE: the PE slice is that side's second chain
+      already, and it requires an unpadded head anyway.
+    * P@V output -- the upper slice is a second accumulator, `acc2`.  Only when
+      the contraction side also splits; 40 and 48 split there but not here, their
+      upper slice being narrower than the 32x32 MFMA's N.
+
+    K and V stay one padded LDS tile each; a slice is a `.slice()` sub-view of it.
+    With no split, `D_LO` is the whole padded width and both upper slices are 0.
+    """
+    hi_qk = 0 if has_pe else head_split(head_dim, head_dim_pow2, 16)
+    if hi_qk == 0:
+        return head_dim_pow2, 0, 0
+    return head_dim_pow2 // 2, hi_qk, head_split(head_dim, head_dim_pow2, 32)
+
+
+@gluon.jit
+def _read_k(
+    smemK,
+    smemKpe,
+    slot,
+    dotK: gl.constexpr,
+    D_LO: gl.constexpr,
+    D_HI_QK: gl.constexpr,
+    HAS_PE: gl.constexpr,
+):
+    """K^T of one staged tile, and its PE operand `k_pe`.
+
+    `k_pe` is the PE tile -- or, when the head is split (`_head_slices`), the upper
+    head slice, which takes the PE operand's place in the Q@K^T chain.  With
+    neither, it aliases K: a loop-carried value has to be a real tensor in every
+    instantiation."""
+    if D_HI_QK > 0:
+        k = cdna4_async.load_shared_relaxed(smemK.index(slot).slice(0, D_LO, 0), dotK)
+        k_pe = cdna4_async.load_shared_relaxed(
+            smemK.index(slot).slice(D_LO, D_HI_QK, 0), dotK
+        )
+    else:
+        k = cdna4_async.load_shared_relaxed(smemK.index(slot), dotK)
+        if HAS_PE:
+            k_pe = cdna4_async.load_shared_relaxed(smemKpe.index(slot), dotK)
+        else:
+            k_pe = k
+    return k, k_pe
+
+
+@gluon.jit
+def _read_v(smemV, slot, dotV: gl.constexpr, D_LO: gl.constexpr, D_HI_PV: gl.constexpr):
+    """V of one staged tile: `(v, v_hi)` when the P@V side is split, else the
+    whole padded tile and an alias of it."""
+    if D_HI_PV > 0:
+        v = cdna4_async.load_shared_relaxed(smemV.index(slot).slice(0, D_LO, 1), dotV)
+        v_hi = cdna4_async.load_shared_relaxed(
+            smemV.index(slot).slice(D_LO, D_HI_PV, 1), dotV
+        )
+    else:
+        v = cdna4_async.load_shared_relaxed(smemV.index(slot), dotV)
+        v_hi = v
+    return v, v_hi
+
+
 @gluon.jit
 def _mma(a, b, acc, IS_FP8: gl.constexpr):
-    """One MFMA chain step: bf16/fp16 ``mfma``, or e4m3 ``mfma_scaled`` (unscaled)."""
+    """One MFMA chain step: bf16/fp16 `mfma`, or e4m3 `mfma_scaled` (unscaled)."""
     if IS_FP8:
         return gl.amd.cdna4.mfma_scaled(a, None, "e4m3", b, None, "e4m3", acc)
     else:
@@ -490,7 +582,7 @@ def _mma(a, b, acc, IS_FP8: gl.constexpr):
 def _sc_vec1(qk, m_run, qk_scale, SCALE_ON_Q: gl.constexpr, P_LIFT: gl.constexpr = 0.0):
     """VEC1 -- softmax numerator: new row max, the exp2 burst, and alpha.
 
-    Placed in the ``dot2`` cluster.  ``exp2`` is a TRANS op and issues at half the
+    Placed in the `dot2` cluster.  `exp2` is a TRANS op and issues at half the
     rate of a plain VALU, so it is the most expensive item in the softmax and wants
     the roomier of the two shadows.  Its results are consumed one stage later.
     """
@@ -513,25 +605,66 @@ def _sc_vec1(qk, m_run, qk_scale, SCALE_ON_Q: gl.constexpr, P_LIFT: gl.constexpr
 
 
 @gluon.jit
-def _sc_vec2(acc, l_i, p, alpha, dotP: gl.constexpr, DTYPE: gl.constexpr):
+def _sc_vec2(
+    acc,
+    acc2,
+    l_i,
+    p,
+    alpha,
+    dotP: gl.constexpr,
+    DTYPE: gl.constexpr,
+    D_HI_PV: gl.constexpr,
+):
     """VEC2 -- denominator, accumulator rescale, and the P operand downcast.
 
-    Placed in the ``dot1`` cluster, beside the Q@K^T MFMA; ``p`` and ``alpha`` were
+    Placed in the `dot1` cluster, beside the Q@K^T MFMA; `p` and `alpha` were
     produced by VEC1 in the *previous* iteration.  The rescale goes first: this
     cluster's shadow cannot absorb all of it, and leading with it keeps the uncovered
     remainder ahead of the MFMAs, where an exposed packed op pays no back-to-back
     hazard.
     """
     acc = acc * alpha[:, None]
+    if D_HI_PV > 0:
+        acc2 = acc2 * alpha[:, None]
     l_ij = gl.sum(p, axis=1)
     l_i = l_i * alpha + l_ij
     p_dot = gl.convert_layout(p.to(DTYPE), dotP)
-    return acc, l_i, p_dot
+    return acc, acc2, l_i, p_dot
+
+
+@gluon.jit
+def _dot_qk(
+    q,
+    q_pe,
+    k,
+    k_pe,
+    HAS_PE_DOT: gl.constexpr,
+    IS_FP8: gl.constexpr,
+    mfmaLayout: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+):
+    """Q@K^T for one tile, the PE chain first.  `q_pe` / `k_pe` may be the upper
+    head slice of a split head (`_read_k`); `HAS_PE_DOT` says either is present."""
+    qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
+    if HAS_PE_DOT:
+        qk = _mma(q_pe, k_pe, qk, IS_FP8)
+    return _mma(q, k, qk, IS_FP8)
+
+
+@gluon.jit
+def _dot_pv(p_dot, v, v_hi, acc, acc2, D_HI_PV: gl.constexpr, IS_FP8: gl.constexpr):
+    """P@V for one tile, into `acc` and, when the P@V side is split, `acc2`."""
+    acc = _mma(p_dot, v, acc, IS_FP8)
+    if D_HI_PV > 0:
+        acc2 = _mma(p_dot, v_hi, acc2, IS_FP8)
+    return acc, acc2
 
 
 @gluon.jit
 def _attn_fwd_pipelined(
     acc,
+    acc2,
     l_i,
     m_i,
     q_dot,
@@ -563,15 +696,24 @@ def _attn_fwd_pipelined(
     BUF_DEPTH: gl.constexpr,
     IS_FP8: gl.constexpr = False,
     P_LIFT: gl.constexpr = 0.0,
+    D_LO: gl.constexpr = 0,
+    D_HI_QK: gl.constexpr = 0,
+    D_HI_PV: gl.constexpr = 0,
 ):
-    """Run tiles ``[0, n_full_blocks)`` through the rotated pipeline.
+    """Run tiles `[0, n_full_blocks)` through the rotated pipeline.
 
-    Also runs e4m3 (``IS_FP8``, from ``_attn_fwd_fp8``): the MFMAs become
-    ``mfma_scaled`` and P is lifted by ``P_LIFT`` onto e4m3's range.
+    Also runs e4m3 (`IS_FP8`, from `_attn_fwd_fp8`): the MFMAs become
+    `mfma_scaled` and P is lifted by `P_LIFT` onto e4m3's range.
 
-    ``k_base`` / ``v_base`` point at tile 0 and every tile index is an offset from
+    `k_base` / `v_base` point at tile 0 and every tile index is an offset from
     them, so the address VALU stays out of the loop entirely.
+
+    `q_pe` is the Q operand of the PE chain.  On a split head (`D_HI_QK > 0`,
+    `_head_slices`) it carries the upper head slice instead, as do `k_pe` /
+    `kpe_dot` on the K side; `HAS_PE_DOT` says the chain is issued at all.  `acc2`
+    is the upper P@V accumulator when `D_HI_PV > 0`, an alias of `acc` otherwise.
     """
+    HAS_PE_DOT: gl.constexpr = HAS_PE or D_HI_QK > 0
 
     # -- Prologue: prime the rotation for tile 0 ---------------------------------
     # Compute all of tile 0's ahead-work (qk[0], m[0], p[0], alpha[0]) and the K
@@ -594,12 +736,10 @@ def _attn_fwd_pipelined(
     cdna4_async.commit_group()
 
     cdna4_async.wait_group(2)  # K[0] has landed
-    kt0 = cdna4_async.load_shared_relaxed(smemK.index(0), dotK)
-    qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
-    if HAS_PE:
-        kpe0 = cdna4_async.load_shared_relaxed(smemKpe.index(0), dotK)
-        qk = _mma(q_pe, kpe0, qk, IS_FP8)
-    qk = _mma(q_dot, kt0, qk, IS_FP8)
+    kt0, kpe0 = _read_k(smemK, smemKpe, 0, dotK, D_LO, D_HI_QK, HAS_PE)
+    qk = _dot_qk(
+        q_dot, q_pe, kt0, kpe0, HAS_PE_DOT, IS_FP8, mfmaLayout, BLOCK_M, BLOCK_N
+    )
     m_run, p_c, alpha_c = _sc_vec1(qk, m_i, qk_scale, SCALE_ON_Q, P_LIFT)
 
     gl.barrier()  # WAR: tile 0's ds_read against K[2]'s write into the same slot
@@ -608,11 +748,7 @@ def _attn_fwd_pipelined(
         _async_copy_tile(smemKpe.index(0), k_base + 2 * kt_step, kpe_off, None, False)
     cdna4_async.commit_group()
     cdna4_async.wait_group(1)  # K[1] has landed
-    kt_dot = cdna4_async.load_shared_relaxed(smemK.index(1), dotK)
-    if HAS_PE:
-        kpe_dot = cdna4_async.load_shared_relaxed(smemKpe.index(1), dotK)
-    else:
-        kpe_dot = kt_dot
+    kt_dot, kpe_dot = _read_k(smemK, smemKpe, 1, dotK, D_LO, D_HI_QK, HAS_PE)
     _async_copy_tile(smemV.index(1), v_base + v_step, v_off, v_mask, HAS_MASK)
     cdna4_async.commit_group()  # ACV
 
@@ -626,14 +762,23 @@ def _attn_fwd_pipelined(
 
         # even tile (blk): LDS slots cur=0, next=1
         with warp_pipeline_stage("dot1"):
-            qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
-            if HAS_PE:
-                qk = _mma(q_pe, kpe_dot, qk, IS_FP8)
-            qk = _mma(q_dot, kt_dot, qk, IS_FP8)  # dot_qk
-            acc, l_i, p_dot = _sc_vec2(acc, l_i, p_c, alpha_c, dotP, DTYPE)  # VEC2
+            qk = _dot_qk(
+                q_dot,
+                q_pe,
+                kt_dot,
+                kpe_dot,
+                HAS_PE_DOT,
+                IS_FP8,
+                mfmaLayout,
+                BLOCK_M,
+                BLOCK_N,
+            )  # dot_qk
+            acc, acc2, l_i, p_dot = _sc_vec2(
+                acc, acc2, l_i, p_c, alpha_c, dotP, DTYPE, D_HI_PV
+            )  # VEC2
         cdna4_async.wait_group(1)
         with warp_pipeline_stage("mem1"):
-            v_dot = cdna4_async.load_shared_relaxed(smemV.index(0), dotV)  # LRV
+            v_dot, v_hi = _read_v(smemV, 0, dotV, D_LO, D_HI_PV)  # LRV
             _async_copy_tile(  # ACK
                 smemK.index(1), k_base + (blk + 3) * kt_step, kt_off, k_mask, HAS_MASK
             )
@@ -643,19 +788,17 @@ def _attn_fwd_pipelined(
                 )
             cdna4_async.commit_group()
         with warp_pipeline_stage("dot2"):
-            acc = _mma(p_dot, v_dot, acc, IS_FP8)  # dot_pv
+            acc, acc2 = _dot_pv(
+                p_dot, v_dot, v_hi, acc, acc2, D_HI_PV, IS_FP8
+            )  # dot_pv
             m_run, p_c, alpha_c = _sc_vec1(
                 qk, m_run, qk_scale, SCALE_ON_Q, P_LIFT
             )  # VEC1
         cdna4_async.wait_group(1)
         with warp_pipeline_stage("mem2"):
-            kt_dot = cdna4_async.load_shared_relaxed(smemK.index(0), dotK)  # LRK
-            if HAS_PE:
-                kpe_dot = cdna4_async.load_shared_relaxed(smemKpe.index(0), dotK)
-            else:
-                # A loop-carried value has to be a real tensor in every instantiation,
-                # so without a PE slice this aliases K rather than carrying None.
-                kpe_dot = kt_dot
+            kt_dot, kpe_dot = _read_k(
+                smemK, smemKpe, 0, dotK, D_LO, D_HI_QK, HAS_PE
+            )  # LRK
             _async_copy_tile(  # ACV
                 smemV.index(0), v_base + (blk + 2) * v_step, v_off, v_mask, HAS_MASK
             )
@@ -663,14 +806,23 @@ def _attn_fwd_pipelined(
 
         # odd tile (blk + 1): LDS slots cur=1, next=0
         with warp_pipeline_stage("dot1"):
-            qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
-            if HAS_PE:
-                qk = _mma(q_pe, kpe_dot, qk, IS_FP8)
-            qk = _mma(q_dot, kt_dot, qk, IS_FP8)  # dot_qk
-            acc, l_i, p_dot = _sc_vec2(acc, l_i, p_c, alpha_c, dotP, DTYPE)  # VEC2
+            qk = _dot_qk(
+                q_dot,
+                q_pe,
+                kt_dot,
+                kpe_dot,
+                HAS_PE_DOT,
+                IS_FP8,
+                mfmaLayout,
+                BLOCK_M,
+                BLOCK_N,
+            )  # dot_qk
+            acc, acc2, l_i, p_dot = _sc_vec2(
+                acc, acc2, l_i, p_c, alpha_c, dotP, DTYPE, D_HI_PV
+            )  # VEC2
         cdna4_async.wait_group(1)
         with warp_pipeline_stage("mem1"):
-            v_dot = cdna4_async.load_shared_relaxed(smemV.index(1), dotV)  # LRV
+            v_dot, v_hi = _read_v(smemV, 1, dotV, D_LO, D_HI_PV)  # LRV
             _async_copy_tile(  # ACK
                 smemK.index(0),
                 k_base + (blk + 1 + 3) * kt_step,
@@ -688,19 +840,17 @@ def _attn_fwd_pipelined(
                 )
             cdna4_async.commit_group()
         with warp_pipeline_stage("dot2"):
-            acc = _mma(p_dot, v_dot, acc, IS_FP8)  # dot_pv
+            acc, acc2 = _dot_pv(
+                p_dot, v_dot, v_hi, acc, acc2, D_HI_PV, IS_FP8
+            )  # dot_pv
             m_run, p_c, alpha_c = _sc_vec1(
                 qk, m_run, qk_scale, SCALE_ON_Q, P_LIFT
             )  # VEC1
         cdna4_async.wait_group(1)
         with warp_pipeline_stage("mem2"):
-            kt_dot = cdna4_async.load_shared_relaxed(smemK.index(1), dotK)  # LRK
-            if HAS_PE:
-                kpe_dot = cdna4_async.load_shared_relaxed(smemKpe.index(1), dotK)
-            else:
-                # A loop-carried value has to be a real tensor in every instantiation,
-                # so without a PE slice this aliases K rather than carrying None.
-                kpe_dot = kt_dot
+            kt_dot, kpe_dot = _read_k(
+                smemK, smemKpe, 1, dotK, D_LO, D_HI_QK, HAS_PE
+            )  # LRK
             _async_copy_tile(  # ACV
                 smemV.index(1), v_base + (blk + 1 + 2) * v_step, v_off, v_mask, HAS_MASK
             )
@@ -713,14 +863,23 @@ def _attn_fwd_pipelined(
 
         # tail tile: LDS slots cur=0, next=1
         with warp_pipeline_stage("dot1"):
-            qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
-            if HAS_PE:
-                qk = _mma(q_pe, kpe_dot, qk, IS_FP8)
-            qk = _mma(q_dot, kt_dot, qk, IS_FP8)  # dot_qk
-            acc, l_i, p_dot = _sc_vec2(acc, l_i, p_c, alpha_c, dotP, DTYPE)  # VEC2
+            qk = _dot_qk(
+                q_dot,
+                q_pe,
+                kt_dot,
+                kpe_dot,
+                HAS_PE_DOT,
+                IS_FP8,
+                mfmaLayout,
+                BLOCK_M,
+                BLOCK_N,
+            )  # dot_qk
+            acc, acc2, l_i, p_dot = _sc_vec2(
+                acc, acc2, l_i, p_c, alpha_c, dotP, DTYPE, D_HI_PV
+            )  # VEC2
         cdna4_async.wait_group(1)
         with warp_pipeline_stage("mem1"):
-            v_dot = cdna4_async.load_shared_relaxed(smemV.index(0), dotV)  # LRV
+            v_dot, v_hi = _read_v(smemV, 0, dotV, D_LO, D_HI_PV)  # LRV
             _async_copy_tile(  # ACK
                 smemK.index(1), k_base + (blk + 3) * kt_step, kt_off, k_mask, HAS_MASK
             )
@@ -730,19 +889,17 @@ def _attn_fwd_pipelined(
                 )
             cdna4_async.commit_group()
         with warp_pipeline_stage("dot2"):
-            acc = _mma(p_dot, v_dot, acc, IS_FP8)  # dot_pv
+            acc, acc2 = _dot_pv(
+                p_dot, v_dot, v_hi, acc, acc2, D_HI_PV, IS_FP8
+            )  # dot_pv
             m_run, p_c, alpha_c = _sc_vec1(
                 qk, m_run, qk_scale, SCALE_ON_Q, P_LIFT
             )  # VEC1
         cdna4_async.wait_group(1)
         with warp_pipeline_stage("mem2"):
-            kt_dot = cdna4_async.load_shared_relaxed(smemK.index(0), dotK)  # LRK
-            if HAS_PE:
-                kpe_dot = cdna4_async.load_shared_relaxed(smemKpe.index(0), dotK)
-            else:
-                # A loop-carried value has to be a real tensor in every instantiation,
-                # so without a PE slice this aliases K rather than carrying None.
-                kpe_dot = kt_dot
+            kt_dot, kpe_dot = _read_k(
+                smemK, smemKpe, 0, dotK, D_LO, D_HI_QK, HAS_PE
+            )  # LRK
             _async_copy_tile(  # ACV
                 smemV.index(0), v_base + (blk + 2) * v_step, v_off, v_mask, HAS_MASK
             )
@@ -756,44 +913,41 @@ def _attn_fwd_pipelined(
     s_nm2 = (nm2 % BUF_DEPTH).to(gl.int32)
     s_nm1 = (nm1 % BUF_DEPTH).to(gl.int32)
 
-    qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
-    if HAS_PE:
-        qk = _mma(q_pe, kpe_dot, qk, IS_FP8)
-    qk = _mma(q_dot, kt_dot, qk, IS_FP8)
+    qk = _dot_qk(
+        q_dot, q_pe, kt_dot, kpe_dot, HAS_PE_DOT, IS_FP8, mfmaLayout, BLOCK_M, BLOCK_N
+    )
     cdna4_async.wait_group(2)
-    v_dot = cdna4_async.load_shared_relaxed(smemV.index(s_nm3), dotV)
-    acc, l_i, p_dot = _sc_vec2(acc, l_i, p_c, alpha_c, dotP, DTYPE)
-    acc = _mma(p_dot, v_dot, acc, IS_FP8)
+    v_dot, v_hi = _read_v(smemV, s_nm3, dotV, D_LO, D_HI_PV)
+    acc, acc2, l_i, p_dot = _sc_vec2(acc, acc2, l_i, p_c, alpha_c, dotP, DTYPE, D_HI_PV)
+    acc, acc2 = _dot_pv(p_dot, v_dot, v_hi, acc, acc2, D_HI_PV, IS_FP8)
     m_run, p_c, alpha_c = _sc_vec1(qk, m_run, qk_scale, SCALE_ON_Q, P_LIFT)
     gl.barrier()  # WAR: tile n-3's V read against V[n-1]'s write into that slot
     _async_copy_tile(smemV.index(s_nm1), v_base + nm1 * v_step, v_off, v_mask, HAS_MASK)
     cdna4_async.commit_group()  # ACV
     cdna4_async.wait_group(2)
-    kt_dot = cdna4_async.load_shared_relaxed(smemK.index(s_nm1), dotK)
-    if HAS_PE:
-        kpe_dot = cdna4_async.load_shared_relaxed(smemKpe.index(s_nm1), dotK)
+    kt_dot, kpe_dot = _read_k(smemK, smemKpe, s_nm1, dotK, D_LO, D_HI_QK, HAS_PE)
 
-    qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
-    if HAS_PE:
-        qk = _mma(q_pe, kpe_dot, qk, IS_FP8)
-    qk = _mma(q_dot, kt_dot, qk, IS_FP8)
+    qk = _dot_qk(
+        q_dot, q_pe, kt_dot, kpe_dot, HAS_PE_DOT, IS_FP8, mfmaLayout, BLOCK_M, BLOCK_N
+    )
     cdna4_async.wait_group(1)
-    v_dot = cdna4_async.load_shared_relaxed(smemV.index(s_nm2), dotV)
-    acc, l_i, p_dot = _sc_vec2(acc, l_i, p_c, alpha_c, dotP, DTYPE)
-    acc = _mma(p_dot, v_dot, acc, IS_FP8)
+    v_dot, v_hi = _read_v(smemV, s_nm2, dotV, D_LO, D_HI_PV)
+    acc, acc2, l_i, p_dot = _sc_vec2(acc, acc2, l_i, p_c, alpha_c, dotP, DTYPE, D_HI_PV)
+    acc, acc2 = _dot_pv(p_dot, v_dot, v_hi, acc, acc2, D_HI_PV, IS_FP8)
     m_run, p_c, alpha_c = _sc_vec1(qk, m_run, qk_scale, SCALE_ON_Q, P_LIFT)
 
     cdna4_async.wait_group(0)
-    v_dot = cdna4_async.load_shared_relaxed(smemV.index(s_nm1), dotV)
-    acc, l_i, p_dot = _sc_vec2(acc, l_i, p_c, alpha_c, dotP, DTYPE)
-    acc = _mma(p_dot, v_dot, acc, IS_FP8)
+    v_dot, v_hi = _read_v(smemV, s_nm1, dotV, D_LO, D_HI_PV)
+    acc, acc2, l_i, p_dot = _sc_vec2(acc, acc2, l_i, p_c, alpha_c, dotP, DTYPE, D_HI_PV)
+    acc, acc2 = _dot_pv(p_dot, v_dot, v_hi, acc, acc2, D_HI_PV, IS_FP8)
 
-    return acc, l_i, m_run
+    return acc, acc2, l_i, m_run
 
 
 @gluon.jit
 def _attn_fwd_inner(
     acc,
+    acc2,
     l_i,
     m_i,
     q,
@@ -836,16 +990,21 @@ def _attn_fwd_inner(
     RETURN_SCORES: gl.constexpr,
     SCALE_ON_Q: gl.constexpr,
     BUF_DEPTH: gl.constexpr,
+    D_LO: gl.constexpr,
+    D_HI_QK: gl.constexpr,
+    D_HI_PV: gl.constexpr,
     seqlen_q=None,
     n_extra_tokens=None,
     offs_m=None,
     IS_CAUSAL: gl.constexpr = False,
     MASK_STEPS: gl.constexpr = False,
 ):
-    """
-    Inner loop for attention forward pass computation.
+    """Generic one-tile-at-a-time loop over key blocks `[block_min, block_max)`.
+
+    `q_pe` / `acc2` as in `_attn_fwd_pipelined`.
     """
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
+    HAS_PE_DOT: gl.constexpr = HAS_PE or D_HI_QK > 0
 
     if MASK_STEPS or IS_CAUSAL or WINDOW_MASK or RETURN_SCORES:
         offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfmaLayout))
@@ -919,12 +1078,8 @@ def _attn_fwd_inner(
         )
         # Drain exactly this tile's groups and leave the prefetch in flight.
         cdna4_async.wait_group(ASYNC_GROUPS)
-        k = cdna4_async.load_shared_relaxed(smemK.index(cur), dotK)
-        if HAS_PE:
-            k_pe = cdna4_async.load_shared_relaxed(smemKpe.index(cur), dotK)
-        else:
-            k_pe = None
-        v = cdna4_async.load_shared_relaxed(smemV.index(cur), dotV)
+        k, k_pe = _read_k(smemK, smemKpe, cur, dotK, D_LO, D_HI_QK, HAS_PE)
+        v, v_hi = _read_v(smemV, cur, dotV, D_LO, D_HI_PV)
         qk = _attn_qk(
             q,
             k,
@@ -937,7 +1092,7 @@ def _attn_fwd_inner(
             mfmaLayout=mfmaLayout,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
-            HAS_PE=HAS_PE,
+            HAS_PE=HAS_PE_DOT,  # PE, or a split head's upper slice
             IS_FP8=False,
             WINDOW_MASK=WINDOW_MASK,
             SCALE_ON_Q=SCALE_ON_Q,
@@ -949,12 +1104,14 @@ def _attn_fwd_inner(
             IS_CAUSAL=IS_CAUSAL,
             MASK_STEPS=MASK_STEPS,
         )
-        acc, l_i, m_i = _attn_softmax_pv(
+        acc, acc2, l_i, m_i = _attn_softmax_pv(
             acc,
+            acc2,
             l_i,
             m_i,
             qk,
             v,
+            v_hi,
             sd_base,
             sd_offsets,
             sd_q_mask,
@@ -964,6 +1121,7 @@ def _attn_fwd_inner(
             stride_sd_n,
             dotP,
             RETURN_SCORES,
+            D_HI_PV,
         )
 
         # WAR: this tile's LDS reads against the copy that will overwrite the
@@ -972,7 +1130,7 @@ def _attn_fwd_inner(
 
     cdna4_async.wait_group(0)
 
-    return acc, l_i, m_i
+    return acc, acc2, l_i, m_i
 
 
 @gluon.jit
@@ -1008,12 +1166,12 @@ def _classify_k_blocks(
     IS_CAUSAL: gl.constexpr,
     SLIDING_WINDOW: gl.constexpr,
 ):
-    """Split this M-block's K range into, in order: ``skipped_blocks`` left of the
-    window, ``window_blocks`` cut by the window's edge, ``n_full_blocks`` with no
-    mask at all, and ``masked_blocks`` on the causal diagonal / ragged K end.
+    """Split this M-block's K range into, in order: `skipped_blocks` left of the
+    window, `window_blocks` cut by the window's edge, `n_full_blocks` with no
+    mask at all, and `masked_blocks` on the causal diagonal / ragged K end.
 
-    Returns ``(n_blocks, n_extra_tokens, skipped_blocks, window_blocks,
-    masked_blocks, n_full_blocks)``; ``n_blocks <= 0`` is a causal M-block that sees
+    Returns `(n_blocks, n_extra_tokens, skipped_blocks, window_blocks,
+    masked_blocks, n_full_blocks)`; `n_blocks <= 0` is a causal M-block that sees
     no key at all.
     """
     n_blocks = gl.cdiv(seqlen_k, BLOCK_N)
@@ -1068,6 +1226,42 @@ def _classify_k_blocks(
         masked_blocks,
         n_full_blocks,
     )
+
+
+@gluon.jit
+def _store_out(
+    acc,
+    o_base,
+    row0,
+    seqlen_q,
+    stride_om,
+    stride_on,
+    COL0: gl.constexpr,
+    WIDTH: gl.constexpr,
+    BLOCK_DMODEL_OUT: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    LOAD_VEC: gl.constexpr,
+    num_warps: gl.constexpr,
+):
+    """Store output columns `[COL0, COL0 + WIDTH)` of one M-block, dropping rows
+    past `seqlen_q` and columns past the caller's head dim."""
+    storeLayout: gl.constexpr = _make_load_layout(
+        WIDTH, LOAD_VEC, num_warps, transposed=False
+    )
+    out = gl.convert_layout(acc.to(o_base.dtype.element_ty), layout=storeLayout)
+
+    offs_rm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, storeLayout))
+    offs_od = COL0 + gl.arange(0, WIDTH, layout=gl.SliceLayout(0, storeLayout))
+    o_offsets = (offs_rm[:, None] * stride_om + offs_od[None, :] * stride_on).to(
+        gl.int32
+    )
+
+    out_mask = gl.full([BLOCK_M, 1], True, dtype=gl.int1, layout=storeLayout)
+    if row0 + BLOCK_M > seqlen_q:
+        out_mask = out_mask & ((row0 + offs_rm)[:, None] < seqlen_q)
+    if COL0 + WIDTH > BLOCK_DMODEL_OUT:
+        out_mask = out_mask & (offs_od[None, :] < BLOCK_DMODEL_OUT)
+    gl.amd.cdna4.buffer_store(out, ptr=o_base, offsets=o_offsets, mask=out_mask)
 
 
 _attn_fwd_repr = make_kernel_repr(
@@ -1161,6 +1355,14 @@ def _attn_fwd(
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
     PADDED_HEAD_OUT: gl.constexpr = BLOCK_DMODEL_OUT != BLOCK_DMODEL_POW2
     HAS_PE: gl.constexpr = BLOCK_DMODEL_PE > 0
+    # A padded head is issued as two power-of-two slices where that saves MFMA work
+    # (96 -> 64 + 32, ...): D_LO is the lower slice (the whole padded width when
+    # nothing splits), D_HI_QK / D_HI_PV the upper one on each side of the product.
+    _SLICES: gl.constexpr = _head_slices(BLOCK_DMODEL, BLOCK_DMODEL_POW2, HAS_PE)
+    D_LO: gl.constexpr = _SLICES[0]
+    D_HI_QK: gl.constexpr = _SLICES[1]
+    D_HI_PV: gl.constexpr = _SLICES[2]
+    ACC_WIDTH: gl.constexpr = D_LO if D_HI_PV > 0 else BLOCK_DMODEL_POW2
 
     # NOTE:
     # Base-pointer and seqlen-loop offset arithmetic is performed using the
@@ -1289,6 +1491,9 @@ def _attn_fwd(
 
     LOAD_VEC: gl.constexpr = 8
     qLoadLayout: gl.constexpr = _make_load_layout(
+        D_LO, LOAD_VEC, num_warps, transposed=False
+    )
+    oStoreLayout: gl.constexpr = _make_load_layout(
         BLOCK_DMODEL_POW2, LOAD_VEC, num_warps, transposed=False
     )
 
@@ -1341,7 +1546,7 @@ def _attn_fwd(
 
     # Load Q (stays resident for the whole key loop).
     offs_qm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, qLoadLayout))
-    offs_qd = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, qLoadLayout))
+    offs_qd = gl.arange(0, D_LO, layout=gl.SliceLayout(0, qLoadLayout))
     q_base = (
         q_ptr
         + off_z * stride_qz
@@ -1353,7 +1558,9 @@ def _attn_fwd(
         gl.int32
     )
     q_mask = (start_m * BLOCK_M + offs_qm)[:, None] < seqlen_q
-    if PADDED_HEAD:
+    if PADDED_HEAD and D_HI_QK == 0:
+        # A split head's lower slice is all real head dim; its upper one is masked
+        # below.
         q_mask = q_mask & (offs_qd[None, :] < BLOCK_DMODEL)
     # Cache Q at .cg when a single Q block spans at least one full head.
     if BLOCK_M >= NUM_Q_HEADS:
@@ -1364,7 +1571,7 @@ def _attn_fwd(
         ptr=q_base, offsets=q_offsets, mask=q_mask, other=0.0, cache=q_cache_mod
     )
     q = gl.convert_layout(q, layout=dotQ)
-    if SCALE_ON_Q:
+    if SCALE_ON_Q and D_HI_QK == 0:
         # Fold qk_scale into the Q operand ONCE, here, instead of scaling every
         # tile's [BLOCK_M, BLOCK_N] score matrix inside the loop.  q lives in
         # registers for the whole key loop, so this is a single pass over it, and it
@@ -1393,10 +1600,37 @@ def _attn_fwd(
             cache=q_cache_mod,
         )
         q_pe = gl.convert_layout(q_pe, layout=dotQ)
-        if SCALE_ON_Q:
-            q_pe = (q_pe.to(gl.float32) * qk_scale).to(q_ptr.dtype.element_ty)
+    elif D_HI_QK > 0:
+        # A split head: q_pe carries the upper head slice [D_LO, D_LO + D_HI_QK)
+        # -- it takes the PE operand's place in the Q@K^T chain -- and that slice
+        # carries the head-dim mask.
+        qHiLoadLayout: gl.constexpr = _make_load_layout(
+            D_HI_QK, LOAD_VEC, num_warps, transposed=False
+        )
+        offs_qhm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, qHiLoadLayout))
+        offs_qhd = D_LO + gl.arange(0, D_HI_QK, layout=gl.SliceLayout(0, qHiLoadLayout))
+        q_hi_offsets = (
+            offs_qhm[:, None] * stride_qm + offs_qhd[None, :] * stride_qk
+        ).to(gl.int32)
+        q_hi_mask = ((start_m * BLOCK_M + offs_qhm)[:, None] < seqlen_q) & (
+            offs_qhd[None, :] < BLOCK_DMODEL
+        )
+        q_hi = gl.amd.cdna4.buffer_load(
+            ptr=q_base,
+            offsets=q_hi_offsets,
+            mask=q_hi_mask,
+            other=0.0,
+            cache=q_cache_mod,
+        )
+        q_pe = gl.convert_layout(q_hi, layout=dotQ)
     else:
         q_pe = None
+    if SCALE_ON_Q and D_HI_QK > 0:
+        # Both slices loaded first, then both scaled: scaling the lower one before
+        # the upper one's load measured ~2% slower at short sequences (D=192).
+        q = (q.to(gl.float32) * qk_scale).to(q_ptr.dtype.element_ty)
+    if SCALE_ON_Q and (HAS_PE or D_HI_QK > 0):
+        q_pe = (q_pe.to(gl.float32) * qk_scale).to(q_ptr.dtype.element_ty)
 
     k_base = k_ptr + off_z * stride_kz + kh_off + cu_seqlens_k_start * stride_kn
 
@@ -1486,7 +1720,12 @@ def _attn_fwd(
     l_i = gl.full(
         [BLOCK_M], 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, mfmaLayout)
     )
-    acc = gl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=gl.float32, layout=mfmaLayout)
+    acc = gl.zeros([BLOCK_M, ACC_WIDTH], dtype=gl.float32, layout=mfmaLayout)
+    if D_HI_PV > 0:
+        acc2 = gl.zeros([BLOCK_M, D_HI_PV], dtype=gl.float32, layout=mfmaLayout)
+    else:
+        # Never touched without a P@V split; it only has to be a real tensor.
+        acc2 = acc
 
     # Query positions used for the causal mask, in the MFMA result layout.
     offs_m = start_m * BLOCK_M + gl.arange(
@@ -1551,7 +1790,7 @@ def _attn_fwd(
     )
     if IS_CAUSAL:  # noqa: SIM102
         if n_blocks <= 0:
-            storeLayout: gl.constexpr = qLoadLayout
+            storeLayout: gl.constexpr = oStoreLayout
             offs_od = gl.arange(
                 0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, storeLayout)
             )
@@ -1594,8 +1833,9 @@ def _attn_fwd(
         k_base += skipped_blocks * BLOCK_N * stride_kn
         v_base += skipped_blocks * BLOCK_N * stride_vn
         if window_blocks > 0:
-            acc, l_i, m_i = _attn_fwd_inner(
+            acc, acc2, l_i, m_i = _attn_fwd_inner(
                 acc,
+                acc2,
                 l_i,
                 m_i,
                 q,
@@ -1638,6 +1878,9 @@ def _attn_fwd(
                 RETURN_SCORES=RETURN_SCORES,
                 SCALE_ON_Q=SCALE_ON_Q,
                 BUF_DEPTH=BUF_DEPTH,
+                D_LO=D_LO,
+                D_HI_QK=D_HI_QK,
+                D_HI_PV=D_HI_PV,
             )
             k_base += window_blocks * BLOCK_N * stride_kn
             v_base += window_blocks * BLOCK_N * stride_vn
@@ -1671,8 +1914,9 @@ def _attn_fwd(
         # first M-blocks only a handful.
         if n_full_blocks >= _MIN_PIPE_BLOCKS:
             pipelined = True
-            acc, l_i, m_i = _attn_fwd_pipelined(
+            acc, acc2, l_i, m_i = _attn_fwd_pipelined(
                 acc,
+                acc2,
                 l_i,
                 m_i,
                 q,
@@ -1702,6 +1946,9 @@ def _attn_fwd(
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
                 BUF_DEPTH=BUF_DEPTH,
+                D_LO=D_LO,
+                D_HI_QK=D_HI_QK,
+                D_HI_PV=D_HI_PV,
             )
             block_min = block_min + n_full_blocks * BLOCK_N
             block_max = n_blocks * BLOCK_N
@@ -1711,8 +1958,9 @@ def _attn_fwd(
     # Full blocks: no boundary mask, no causal mask.
     if (not pipelined) and n_full_blocks > 0:
         block_max = block_min + n_full_blocks * BLOCK_N
-        acc, l_i, m_i = _attn_fwd_inner(
+        acc, acc2, l_i, m_i = _attn_fwd_inner(
             acc,
+            acc2,
             l_i,
             m_i,
             q,
@@ -1755,6 +2003,9 @@ def _attn_fwd(
             RETURN_SCORES=RETURN_SCORES,
             SCALE_ON_Q=SCALE_ON_Q,
             BUF_DEPTH=BUF_DEPTH,
+            D_LO=D_LO,
+            D_HI_QK=D_HI_QK,
+            D_HI_PV=D_HI_PV,
         )
         block_min = block_max
         block_max = n_blocks * BLOCK_N
@@ -1763,8 +2014,9 @@ def _attn_fwd(
     if masked_blocks > 0:
         k_base += n_full_blocks * BLOCK_N * stride_kn
         v_base += n_full_blocks * BLOCK_N * stride_vn
-        acc, l_i, m_i = _attn_fwd_inner(
+        acc, acc2, l_i, m_i = _attn_fwd_inner(
             acc,
+            acc2,
             l_i,
             m_i,
             q,
@@ -1807,6 +2059,9 @@ def _attn_fwd(
             RETURN_SCORES=RETURN_SCORES,
             SCALE_ON_Q=SCALE_ON_Q,
             BUF_DEPTH=BUF_DEPTH,
+            D_LO=D_LO,
+            D_HI_QK=D_HI_QK,
+            D_HI_PV=D_HI_PV,
             seqlen_q=seqlen_q,
             n_extra_tokens=n_extra_tokens,
             offs_m=offs_m,
@@ -1818,7 +2073,10 @@ def _attn_fwd(
     # multiply, rather than dividing the [BLOCK_M, BLOCK_DMODEL] accumulator: a full
     # IEEE divide expands to several VALU ops *per accumulator element*, and there are
     # BLOCK_DMODEL of them per row.
-    acc = acc * (1.0 / l_i)[:, None]
+    l_recip = 1.0 / l_i
+    acc = acc * l_recip[:, None]
+    if D_HI_PV > 0:
+        acc2 = acc2 * l_recip[:, None]
 
     # If seqlen_q > seqlen_k but the delta is not a multiple of BLOCK_M,
     # then we have one block with a row of all NaNs which come from computing
@@ -1830,7 +2088,7 @@ def _attn_fwd(
     if IS_CAUSAL:  # noqa: SIM102
         if (causal_start_idx > start_m_idx) and (causal_start_idx < end_m_idx):
             out_mask_boundary = gl.full(
-                [BLOCK_DMODEL_POW2],
+                [ACC_WIDTH],
                 causal_start_idx,
                 dtype=gl.int32,
                 layout=gl.SliceLayout(0, mfmaLayout),
@@ -1840,6 +2098,10 @@ def _attn_fwd(
             )
             out_ptrs_mask = mask_m_offsets[:, None] >= out_mask_boundary[None, :]
             acc = gl.where(out_ptrs_mask, acc, 0.0)
+            if D_HI_PV > 0:
+                acc2 = gl.where(
+                    (mask_m_offsets >= causal_start_idx)[:, None], acc2, 0.0
+                )
 
     # write back LSE(Log Sum Exponents), the log of the normalization constant
     if softmax_lse_ptr is not None:
@@ -1857,1259 +2119,30 @@ def _attn_fwd(
             softmax_lse, ptr=lse_base, offsets=offs_lse, mask=lse_mask
         )
 
-    out = acc.to(o_ptr.dtype.element_ty)
-
-    storeLayout: gl.constexpr = qLoadLayout
-    out = gl.convert_layout(out, layout=storeLayout)
-
-    offs_rm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, storeLayout))
-    offs_om = start_m * BLOCK_M + offs_rm
-    offs_od = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, storeLayout))
-
-    o_base = (
-        o_ptr
-        + off_z * stride_oz
-        + off_q_head * stride_oh
-        + cu_seqlens_q_start * stride_om
-        + start_m * BLOCK_M * stride_om
-    )
-    o_offsets = (offs_rm[:, None] * stride_om + offs_od[None, :] * stride_on).to(
-        gl.int32
-    )
-
-    overflow_size = end_m_idx - seqlen_q
-    out_mask = gl.full([BLOCK_M, 1], True, dtype=gl.int1, layout=storeLayout)
-    if overflow_size > 0:
-        out_mask = out_mask & (offs_om[:, None] < seqlen_q)
-    if PADDED_HEAD_OUT:
-        out_mask = out_mask & (offs_od[None, :] < BLOCK_DMODEL_OUT)
-    gl.amd.cdna4.buffer_store(out, ptr=o_base, offsets=o_offsets, mask=out_mask)
-
-
-# ---------------------------------------------------------------------------
-# Padded head dims, issued as two power-of-two slices.
-#
-# A head dim of 96 run through ``_attn_fwd`` is issued as one 128-wide tile, so a quarter
-# of every MFMA multiplies zero padding.  This kernel issues it as ``[0, 64)`` plus
-# ``[64, 96)`` instead, independently on each side of the product:
-#
-# * Q@K^T contraction -- two chains into one score accumulator, ``q @ k`` and
-#   ``q_hi @ k_hi``.  Always split here; the host only routes a head dim to this
-#   kernel when this side saves work.
-# * P@V output -- two accumulators, ``acc`` and ``acc2``, when that side also saves
-#   work (96, 80, 72, 160 ...; not 40 or 48, whose upper slice would be narrower
-#   than the 32x32 MFMA's N).
-#
-# K and V are staged in LDS exactly as ``_attn_fwd`` stages them -- one padded tile, same
-# layouts, same async copy -- and each slice is read back as a ``.slice()`` sub-view.
-#
-# Everything else is ``_attn_fwd``'s design and largely its code, shared where it
-# can be: the rotated four-cluster pipeline, the VEC1/VEC2 softmax split, the masked
-# async copy, causal reverse-M scheduling, the sliding-window block classification.
-# A split never meets fp8 (whose head dim is padded to 64 anyway) or the PE slice
-# (which requires an unpadded head), so neither is carried here.
-# ---------------------------------------------------------------------------
-
-
-@gluon.constexpr_function
-def head_split(head_dim, head_dim_pow2, min_hi):
-    """Width of the upper slice when a padded head dim is issued as
-    ``[0, head_dim_pow2 / 2)`` plus ``[head_dim_pow2 / 2, +hi)``; 0 when that saves
-    nothing over the single padded tile.  Also called by the host to pick this
-    kernel.
-
-    ``min_hi`` is the narrowest slice the MFMA can take on that side of the product:
-    16 on the Q@K^T contraction, 32 on the P@V output (the 32x32 instruction's N).
-    """
-    if head_dim == head_dim_pow2:
-        return 0
-    lo = head_dim_pow2 // 2
-    hi = max(1 << (head_dim - lo - 1).bit_length(), min_hi)
-    return hi if lo + hi < head_dim_pow2 else 0
-
-
-@gluon.jit
-def _shared_load(smem, layout: gl.constexpr, RELAXED: gl.constexpr):
-    if RELAXED:
-        return cdna4_async.load_shared_relaxed(smem, layout)
-    else:
-        return smem.load(layout)
-
-
-@gluon.jit
-def _read_k_split(
-    smemK,
-    dotK: gl.constexpr,
-    D_LO: gl.constexpr,
-    D_HI: gl.constexpr,
-    RELAXED: gl.constexpr,
-):
-    """The two K^T slices of one staged tile, as sub-views of the padded LDS tile."""
-    k = _shared_load(smemK.slice(0, D_LO, 0), dotK, RELAXED)
-    k_hi = _shared_load(smemK.slice(D_LO, D_HI, 0), dotK, RELAXED)
-    return k, k_hi
-
-
-@gluon.jit
-def _read_v_split(
-    smemV,
-    dotV: gl.constexpr,
-    D_LO: gl.constexpr,
-    D_HI: gl.constexpr,
-    RELAXED: gl.constexpr,
-):
-    """V of one staged tile: ``(v, v_hi)`` when the P@V side is split, else the
-    whole padded tile and an alias of it (a loop-carried value has to be a real
-    tensor in every instantiation)."""
-    if D_HI > 0:
-        v = _shared_load(smemV.slice(0, D_LO, 1), dotV, RELAXED)
-        v_hi = _shared_load(smemV.slice(D_LO, D_HI, 1), dotV, RELAXED)
-    else:
-        v = _shared_load(smemV, dotV, RELAXED)
-        v_hi = v
-    return v, v_hi
-
-
-@gluon.jit
-def _dot_qk_split(
-    q,
-    q_hi,
-    k,
-    k_hi,
-    mfmaLayout: gl.constexpr,
-    BLOCK_M: gl.constexpr,
-    BLOCK_N: gl.constexpr,
-):
-    qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
-    qk = gl.amd.cdna4.mfma(q_hi, k_hi, qk)
-    return gl.amd.cdna4.mfma(q, k, qk)
-
-
-@gluon.jit
-def _dot_pv_split(p_dot, v, v_hi, acc, acc2, D_HI_PV: gl.constexpr):
-    acc = gl.amd.cdna4.mfma(p_dot, v, acc)
     if D_HI_PV > 0:
-        acc2 = gl.amd.cdna4.mfma(p_dot, v_hi, acc2)
-    return acc, acc2
-
-
-@gluon.jit
-def _sc_vec2_split(
-    acc,
-    acc2,
-    l_i,
-    p,
-    alpha,
-    dotP: gl.constexpr,
-    DTYPE: gl.constexpr,
-    D_HI_PV: gl.constexpr,
-):
-    """``_sc_vec2`` over both accumulator slices."""
-    acc = acc * alpha[:, None]
-    if D_HI_PV > 0:
-        acc2 = acc2 * alpha[:, None]
-    l_ij = gl.sum(p, axis=1)
-    l_i = l_i * alpha + l_ij
-    p_dot = gl.convert_layout(p.to(DTYPE), dotP)
-    return acc, acc2, l_i, p_dot
-
-
-@gluon.jit
-def _attn_softmax_pv_split(
-    acc,
-    acc2,
-    l_i,
-    m_i,
-    qk,
-    v,
-    v_hi,
-    sd_base,
-    sd_offsets,
-    sd_q_mask,
-    offs_n,
-    start_n,
-    seqlen_k,
-    stride_sd_n,
-    dotP: gl.constexpr,
-    RETURN_SCORES: gl.constexpr,
-    D_HI_PV: gl.constexpr,
-):
-    """``_attn_softmax_pv`` (bf16/fp16) over both accumulator slices."""
-    m_ij = gl.maximum(m_i, gl.max(qk, 1))
-    p = gl.exp2(qk - m_ij[:, None])
-    alpha = gl.exp2(m_i - m_ij)
-    l_ij = gl.sum(p, 1)
-
-    if RETURN_SCORES:
-        p_mask = sd_q_mask[:, None] & ((start_n + offs_n)[None, :] < seqlen_k)
-        gl.amd.cdna4.buffer_store(
-            p.to(sd_base.dtype.element_ty),
-            ptr=sd_base + start_n * stride_sd_n,
-            offsets=sd_offsets,
-            mask=p_mask,
+        # Two output slices; both go through _store_out against one base pointer
+        # and one row bound.
+        o_base = (
+            o_ptr
+            + off_z * stride_oz
+            + off_q_head * stride_oh
+            + cu_seqlens_q_start * stride_om
+            + start_m * BLOCK_M * stride_om
         )
-
-    acc = acc * alpha[:, None]
-    if D_HI_PV > 0:
-        acc2 = acc2 * alpha[:, None]
-    p = gl.convert_layout(p.to(v.dtype), layout=dotP, assert_trivial=True)
-    acc, acc2 = _dot_pv_split(p, v, v_hi, acc, acc2, D_HI_PV)
-
-    l_i = l_i * alpha + l_ij
-    return acc, acc2, l_i, m_ij
-
-
-# ---------------------------------------------------------------------------
-# The rotated four-cluster pipeline -- see _attn_fwd_pipelined for the derivation.  Identical
-# schedule; the Q@K^T chain in dot1 and the P@V chain in dot2 are each issued as
-# two slices.
-# ---------------------------------------------------------------------------
-
-
-@gluon.jit
-def _attn_fwd_pipelined_split(
-    acc,
-    acc2,
-    l_i,
-    m_i,
-    q_dot,
-    q_hi,
-    smemK,
-    smemV,
-    k_base,
-    v_base,
-    kt_off,
-    v_off,
-    k_mask,
-    v_mask,
-    kt_step,
-    v_step,
-    n_full_blocks,
-    qk_scale,
-    mfmaLayout: gl.constexpr,
-    dotK: gl.constexpr,
-    dotV: gl.constexpr,
-    dotP: gl.constexpr,
-    SCALE_ON_Q: gl.constexpr,
-    DTYPE: gl.constexpr,
-    BLOCK_M: gl.constexpr,
-    BLOCK_N: gl.constexpr,
-    BUF_DEPTH: gl.constexpr,
-    D_LO: gl.constexpr,
-    D_HI_QK: gl.constexpr,
-    D_HI_PV: gl.constexpr,
-):
-    """Run tiles ``[0, n_full_blocks)`` through the rotated pipeline."""
-
-    # -- Prologue (see _attn_fwd_pipelined) ---------------------------------------------------
-    _async_copy_tile(smemK.index(0), k_base, kt_off, k_mask, True)
-    cdna4_async.commit_group()  # ACK
-    _async_copy_tile(smemV.index(0), v_base, v_off, v_mask, True)
-    cdna4_async.commit_group()  # ACV
-    _async_copy_tile(smemK.index(1), k_base + kt_step, kt_off, k_mask, True)
-    cdna4_async.commit_group()  # ACK
-
-    cdna4_async.wait_group(2)  # K[0] has landed
-    kt0, kt0_hi = _read_k_split(smemK.index(0), dotK, D_LO, D_HI_QK, True)
-    qk = _dot_qk_split(q_dot, q_hi, kt0, kt0_hi, mfmaLayout, BLOCK_M, BLOCK_N)
-    m_run, p_c, alpha_c = _sc_vec1(qk, m_i, qk_scale, SCALE_ON_Q)
-
-    gl.barrier()  # WAR: tile 0's ds_read against K[2]'s write into the same slot
-    _async_copy_tile(smemK.index(0), k_base + 2 * kt_step, kt_off, k_mask, True)
-    cdna4_async.commit_group()  # ACK
-    cdna4_async.wait_group(1)  # K[1] has landed
-    kt_dot, kt_hi = _read_k_split(smemK.index(1), dotK, D_LO, D_HI_QK, True)
-    _async_copy_tile(smemV.index(1), v_base + v_step, v_off, v_mask, True)
-    cdna4_async.commit_group()  # ACV
-
-    # -- Main loop, unrolled 2x (see _attn_fwd_pipelined) --------------------------------------
-    pairs = (n_full_blocks - 3) // 2
-    for pair in range(pairs):
-        blk = pair * 2
-
-        # even tile (blk): LDS slots cur=0, next=1
-        with warp_pipeline_stage("dot1"):
-            qk = _dot_qk_split(q_dot, q_hi, kt_dot, kt_hi, mfmaLayout, BLOCK_M, BLOCK_N)
-            acc, acc2, l_i, p_dot = _sc_vec2_split(
-                acc, acc2, l_i, p_c, alpha_c, dotP, DTYPE, D_HI_PV
-            )  # VEC2
-        cdna4_async.wait_group(1)
-        with warp_pipeline_stage("mem1"):
-            v_dot, v_hi = _read_v_split(
-                smemV.index(0), dotV, D_LO, D_HI_PV, True
-            )  # LRV
-            _async_copy_tile(  # ACK
-                smemK.index(1), k_base + (blk + 3) * kt_step, kt_off, k_mask, True
-            )
-            cdna4_async.commit_group()
-        with warp_pipeline_stage("dot2"):
-            acc, acc2 = _dot_pv_split(p_dot, v_dot, v_hi, acc, acc2, D_HI_PV)  # dot_pv
-            m_run, p_c, alpha_c = _sc_vec1(qk, m_run, qk_scale, SCALE_ON_Q)  # VEC1
-        cdna4_async.wait_group(1)
-        with warp_pipeline_stage("mem2"):
-            kt_dot, kt_hi = _read_k_split(
-                smemK.index(0), dotK, D_LO, D_HI_QK, True
-            )  # LRK
-            _async_copy_tile(  # ACV
-                smemV.index(0), v_base + (blk + 2) * v_step, v_off, v_mask, True
-            )
-            cdna4_async.commit_group()
-
-        # odd tile (blk + 1): LDS slots cur=1, next=0
-        with warp_pipeline_stage("dot1"):
-            qk = _dot_qk_split(q_dot, q_hi, kt_dot, kt_hi, mfmaLayout, BLOCK_M, BLOCK_N)
-            acc, acc2, l_i, p_dot = _sc_vec2_split(
-                acc, acc2, l_i, p_c, alpha_c, dotP, DTYPE, D_HI_PV
-            )  # VEC2
-        cdna4_async.wait_group(1)
-        with warp_pipeline_stage("mem1"):
-            v_dot, v_hi = _read_v_split(
-                smemV.index(1), dotV, D_LO, D_HI_PV, True
-            )  # LRV
-            _async_copy_tile(  # ACK
-                smemK.index(0), k_base + (blk + 1 + 3) * kt_step, kt_off, k_mask, True
-            )
-            cdna4_async.commit_group()
-        with warp_pipeline_stage("dot2"):
-            acc, acc2 = _dot_pv_split(p_dot, v_dot, v_hi, acc, acc2, D_HI_PV)  # dot_pv
-            m_run, p_c, alpha_c = _sc_vec1(qk, m_run, qk_scale, SCALE_ON_Q)  # VEC1
-        cdna4_async.wait_group(1)
-        with warp_pipeline_stage("mem2"):
-            kt_dot, kt_hi = _read_k_split(
-                smemK.index(1), dotK, D_LO, D_HI_QK, True
-            )  # LRK
-            _async_copy_tile(  # ACV
-                smemV.index(1), v_base + (blk + 1 + 2) * v_step, v_off, v_mask, True
-            )
-            cdna4_async.commit_group()
-
-    if (n_full_blocks - 3) % 2 == 1:
-        blk = pairs * 2
-
-        # tail tile: LDS slots cur=0, next=1
-        with warp_pipeline_stage("dot1"):
-            qk = _dot_qk_split(q_dot, q_hi, kt_dot, kt_hi, mfmaLayout, BLOCK_M, BLOCK_N)
-            acc, acc2, l_i, p_dot = _sc_vec2_split(
-                acc, acc2, l_i, p_c, alpha_c, dotP, DTYPE, D_HI_PV
-            )  # VEC2
-        cdna4_async.wait_group(1)
-        with warp_pipeline_stage("mem1"):
-            v_dot, v_hi = _read_v_split(
-                smemV.index(0), dotV, D_LO, D_HI_PV, True
-            )  # LRV
-            _async_copy_tile(  # ACK
-                smemK.index(1), k_base + (blk + 3) * kt_step, kt_off, k_mask, True
-            )
-            cdna4_async.commit_group()
-        with warp_pipeline_stage("dot2"):
-            acc, acc2 = _dot_pv_split(p_dot, v_dot, v_hi, acc, acc2, D_HI_PV)  # dot_pv
-            m_run, p_c, alpha_c = _sc_vec1(qk, m_run, qk_scale, SCALE_ON_Q)  # VEC1
-        cdna4_async.wait_group(1)
-        with warp_pipeline_stage("mem2"):
-            kt_dot, kt_hi = _read_k_split(
-                smemK.index(0), dotK, D_LO, D_HI_QK, True
-            )  # LRK
-            _async_copy_tile(  # ACV
-                smemV.index(0), v_base + (blk + 2) * v_step, v_off, v_mask, True
-            )
-            cdna4_async.commit_group()
-
-    # -- Drain: the last three tiles (see _attn_fwd_pipelined) ----------------------------------
-    nm3 = n_full_blocks - 3
-    nm2 = n_full_blocks - 2
-    nm1 = n_full_blocks - 1
-    s_nm3 = (nm3 % BUF_DEPTH).to(gl.int32)
-    s_nm2 = (nm2 % BUF_DEPTH).to(gl.int32)
-    s_nm1 = (nm1 % BUF_DEPTH).to(gl.int32)
-
-    qk = _dot_qk_split(q_dot, q_hi, kt_dot, kt_hi, mfmaLayout, BLOCK_M, BLOCK_N)
-    cdna4_async.wait_group(2)
-    v_dot, v_hi = _read_v_split(smemV.index(s_nm3), dotV, D_LO, D_HI_PV, True)
-    acc, acc2, l_i, p_dot = _sc_vec2_split(
-        acc, acc2, l_i, p_c, alpha_c, dotP, DTYPE, D_HI_PV
-    )
-    acc, acc2 = _dot_pv_split(p_dot, v_dot, v_hi, acc, acc2, D_HI_PV)
-    m_run, p_c, alpha_c = _sc_vec1(qk, m_run, qk_scale, SCALE_ON_Q)
-    gl.barrier()  # WAR: tile n-3's V read against V[n-1]'s write into that slot
-    _async_copy_tile(smemV.index(s_nm1), v_base + nm1 * v_step, v_off, v_mask, True)
-    cdna4_async.commit_group()  # ACV
-    cdna4_async.wait_group(2)
-    kt_dot, kt_hi = _read_k_split(smemK.index(s_nm1), dotK, D_LO, D_HI_QK, True)
-
-    qk = _dot_qk_split(q_dot, q_hi, kt_dot, kt_hi, mfmaLayout, BLOCK_M, BLOCK_N)
-    cdna4_async.wait_group(1)
-    v_dot, v_hi = _read_v_split(smemV.index(s_nm2), dotV, D_LO, D_HI_PV, True)
-    acc, acc2, l_i, p_dot = _sc_vec2_split(
-        acc, acc2, l_i, p_c, alpha_c, dotP, DTYPE, D_HI_PV
-    )
-    acc, acc2 = _dot_pv_split(p_dot, v_dot, v_hi, acc, acc2, D_HI_PV)
-    m_run, p_c, alpha_c = _sc_vec1(qk, m_run, qk_scale, SCALE_ON_Q)
-
-    cdna4_async.wait_group(0)
-    v_dot, v_hi = _read_v_split(smemV.index(s_nm1), dotV, D_LO, D_HI_PV, True)
-    acc, acc2, l_i, p_dot = _sc_vec2_split(
-        acc, acc2, l_i, p_c, alpha_c, dotP, DTYPE, D_HI_PV
-    )
-    acc, acc2 = _dot_pv_split(p_dot, v_dot, v_hi, acc, acc2, D_HI_PV)
-
-    return acc, acc2, l_i, m_run
-
-
-@gluon.jit
-def _attn_fwd_inner_split(
-    acc,
-    acc2,
-    l_i,
-    m_i,
-    q,
-    q_hi,
-    k_base,
-    v_base,
-    smemK,
-    smemV,
-    kt_off,
-    v_off,
-    kt_off_n,
-    kt_off_d,
-    v_off_n,
-    v_off_d,
-    stride_kn,
-    stride_vn,
-    seqlen_k,
-    block_min,
-    block_max,
-    window_min,
-    qk_scale,
-    sd_base,
-    sd_offsets,
-    sd_q_mask,
-    stride_sd_n,
-    mfmaLayout: gl.constexpr,
-    dotK: gl.constexpr,
-    dotP: gl.constexpr,
-    dotV: gl.constexpr,
-    BLOCK_M: gl.constexpr,
-    BLOCK_N: gl.constexpr,
-    BLOCK_DMODEL: gl.constexpr,
-    BLOCK_DMODEL_POW2: gl.constexpr,
-    WINDOW_MASK: gl.constexpr,
-    RETURN_SCORES: gl.constexpr,
-    SCALE_ON_Q: gl.constexpr,
-    BUF_DEPTH: gl.constexpr,
-    D_LO: gl.constexpr,
-    D_HI_QK: gl.constexpr,
-    D_HI_PV: gl.constexpr,
-    seqlen_q=None,
-    n_extra_tokens=None,
-    offs_m=None,
-    IS_CAUSAL: gl.constexpr = False,
-    MASK_STEPS: gl.constexpr = False,
-):
-    """``_attn_fwd_inner`` with the head dim issued as two slices."""
-    if MASK_STEPS or IS_CAUSAL or WINDOW_MASK or RETURN_SCORES:
-        offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfmaLayout))
-    else:
-        offs_n = None
-
-    n_iter = (block_max - block_min) // BLOCK_N
-    ASYNC_GROUPS: gl.constexpr = 2
-
-    _async_copy_kv_tile(
-        smemK,
-        None,
-        smemV,
-        0,
-        k_base,
-        v_base,
-        kt_off,
-        None,
-        v_off,
-        kt_off_n,
-        kt_off_d,
-        None,
-        v_off_n,
-        v_off_d,
-        block_min,
-        seqlen_k,
-        BLOCK_DMODEL,
-        0,
-        MASK_STEPS,
-        True,
-        False,
-    )
-
-    for i in range(n_iter):
-        start_n = block_min + i * BLOCK_N
-
-        cur = i % BUF_DEPTH
-        nxt = BUF_DEPTH - 1 - cur
-        nxt_i = min(i + 1, n_iter - 1)
-        _async_copy_kv_tile(
-            smemK,
-            None,
-            smemV,
-            nxt,
-            k_base + nxt_i * BLOCK_N * stride_kn,
-            v_base + nxt_i * BLOCK_N * stride_vn,
-            kt_off,
-            None,
-            v_off,
-            kt_off_n,
-            kt_off_d,
-            None,
-            v_off_n,
-            v_off_d,
-            block_min + nxt_i * BLOCK_N,
-            seqlen_k,
-            BLOCK_DMODEL,
+        _store_out(
+            acc,
+            o_base,
+            start_m_idx,
+            seqlen_q,
+            stride_om,
+            stride_on,
             0,
-            MASK_STEPS,
-            True,
-            False,
+            D_LO,
+            BLOCK_DMODEL_OUT,
+            BLOCK_M,
+            LOAD_VEC,
+            num_warps,
         )
-        cdna4_async.wait_group(ASYNC_GROUPS)
-        k, k_hi = _read_k_split(smemK.index(cur), dotK, D_LO, D_HI_QK, True)
-        v, v_hi = _read_v_split(smemV.index(cur), dotV, D_LO, D_HI_PV, True)
-        qk = _attn_qk(
-            q,
-            k,
-            q_hi,
-            k_hi,
-            start_n,
-            offs_n,
-            window_min,
-            qk_scale,
-            mfmaLayout=mfmaLayout,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            HAS_PE=True,  # the second Q@K^T chain: here, the upper head slice
-            IS_FP8=False,
-            WINDOW_MASK=WINDOW_MASK,
-            SCALE_ON_Q=SCALE_ON_Q,
-            seqlen_q=seqlen_q,
-            seqlen_k=seqlen_k,
-            block_max=block_max,
-            n_extra_tokens=n_extra_tokens,
-            offs_m=offs_m,
-            IS_CAUSAL=IS_CAUSAL,
-            MASK_STEPS=MASK_STEPS,
-        )
-        acc, acc2, l_i, m_i = _attn_softmax_pv_split(
-            acc,
-            acc2,
-            l_i,
-            m_i,
-            qk,
-            v,
-            v_hi,
-            sd_base,
-            sd_offsets,
-            sd_q_mask,
-            offs_n,
-            start_n,
-            seqlen_k,
-            stride_sd_n,
-            dotP,
-            RETURN_SCORES,
-            D_HI_PV,
-        )
-
-        gl.barrier()
-
-    cdna4_async.wait_group(0)
-
-    return acc, acc2, l_i, m_i
-
-
-@gluon.jit
-def _store_out(
-    acc,
-    o_base,
-    row0,
-    seqlen_q,
-    stride_om,
-    stride_on,
-    COL0: gl.constexpr,
-    WIDTH: gl.constexpr,
-    BLOCK_DMODEL_OUT: gl.constexpr,
-    BLOCK_M: gl.constexpr,
-    LOAD_VEC: gl.constexpr,
-    num_warps: gl.constexpr,
-):
-    """Store output columns ``[COL0, COL0 + WIDTH)`` of one M-block, dropping rows
-    past ``seqlen_q`` and columns past the caller's head dim."""
-    storeLayout: gl.constexpr = _make_load_layout(
-        WIDTH, LOAD_VEC, num_warps, transposed=False
-    )
-    out = gl.convert_layout(acc.to(o_base.dtype.element_ty), layout=storeLayout)
-
-    offs_rm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, storeLayout))
-    offs_od = COL0 + gl.arange(0, WIDTH, layout=gl.SliceLayout(0, storeLayout))
-    o_offsets = (offs_rm[:, None] * stride_om + offs_od[None, :] * stride_on).to(
-        gl.int32
-    )
-
-    out_mask = gl.full([BLOCK_M, 1], True, dtype=gl.int1, layout=storeLayout)
-    if row0 + BLOCK_M > seqlen_q:
-        out_mask = out_mask & ((row0 + offs_rm)[:, None] < seqlen_q)
-    if COL0 + WIDTH > BLOCK_DMODEL_OUT:
-        out_mask = out_mask & (offs_od[None, :] < BLOCK_DMODEL_OUT)
-    gl.amd.cdna4.buffer_store(out, ptr=o_base, offsets=o_offsets, mask=out_mask)
-
-
-_attn_fwd_split_head_repr = make_kernel_repr(
-    "_attn_fwd_gluon_split_head",
-    [
-        "IS_CAUSAL",
-        "NUM_Q_HEADS",
-        "NUM_K_HEADS",
-        "BLOCK_M",
-        "BLOCK_N",
-        "BLOCK_DMODEL",
-        "RETURN_SCORES",
-        "HEAD_STRIDE_ALIGN",
-        "VARLEN",
-        "NUM_XCD",
-        "USE_INT64_STRIDES",
-        "ENABLE_SINK",
-        "SLIDING_WINDOW",
-    ],
-)
-
-
-@gluon.jit(repr=_attn_fwd_split_head_repr)
-def _attn_fwd_split_head(
-    q_ptr,
-    k_ptr,
-    v_ptr,
-    o_ptr,
-    softmax_lse_ptr,
-    s_dmask_ptr,
-    descale_q_ptr,
-    descale_k_ptr,
-    descale_v_ptr,
-    sink_ptr,
-    sm_scale,
-    cu_seqlens_q,
-    cu_seqlens_k,
-    SEQLEN_Q,
-    SEQLEN_K,
-    stride_qz_in,
-    stride_qh_in,
-    stride_qm_in,
-    stride_qk_in,
-    stride_kz_in,
-    stride_kh_in,
-    stride_kn_in,
-    stride_kk_in,
-    stride_vz_in,
-    stride_vh_in,
-    stride_vn_in,
-    stride_vk_in,
-    stride_oz_in,
-    stride_oh_in,
-    stride_om_in,
-    stride_on_in,
-    stride_lse_z_in,
-    stride_lse_h_in,
-    stride_lse_m_in,
-    stride_sd_z_in,
-    stride_sd_h_in,
-    stride_sd_m_in,
-    stride_sd_n_in,
-    stride_descale_q_z_in,
-    stride_descale_k_z_in,
-    stride_descale_v_z_in,
-    NUM_Q_HEADS: gl.constexpr,
-    NUM_K_HEADS: gl.constexpr,
-    IS_CAUSAL: gl.constexpr,
-    VARLEN: gl.constexpr,
-    BATCH,
-    BLOCK_M: gl.constexpr,
-    BLOCK_N: gl.constexpr,
-    BLOCK_DMODEL: gl.constexpr,
-    BLOCK_DMODEL_POW2: gl.constexpr,
-    BLOCK_DMODEL_PE: gl.constexpr,
-    BLOCK_DMODEL_OUT: gl.constexpr,
-    NUM_XCD: gl.constexpr,
-    USE_INT64_STRIDES: gl.constexpr,
-    IS_FP8: gl.constexpr,
-    FP8_MAX: gl.constexpr,
-    ENABLE_SINK: gl.constexpr,
-    SLIDING_WINDOW: gl.constexpr,
-    RETURN_SCORES: gl.constexpr,
-    HEAD_STRIDE_ALIGN: gl.constexpr,
-    KV_STRIDE_ALIGN: gl.constexpr = 1,
-    SCALE_ON_Q: gl.constexpr = False,
-    num_warps: gl.constexpr = 4,
-):
-    """Same arguments as ``_attn_fwd``, so the host launches either one; the fp8
-    descales and the PE head dim are accepted and must be unused."""
-    gl.static_assert(not IS_FP8, "split-head kernel is bf16/fp16 only")
-    gl.static_assert(BLOCK_DMODEL_PE == 0, "split-head kernel takes no PE slice")
-    RCP_LN2: gl.constexpr = 1.4426950408889634
-    D_LO: gl.constexpr = BLOCK_DMODEL_POW2 // 2
-    D_HI_QK: gl.constexpr = head_split(BLOCK_DMODEL, BLOCK_DMODEL_POW2, 16)
-    D_HI_PV: gl.constexpr = head_split(BLOCK_DMODEL, BLOCK_DMODEL_POW2, 32)
-    gl.static_assert(D_HI_QK > 0, "head dim does not split")
-    ACC_WIDTH: gl.constexpr = D_LO if D_HI_PV > 0 else BLOCK_DMODEL_POW2
-
-    if USE_INT64_STRIDES:
-        stride_qz = gl.cast(stride_qz_in, gl.int64)
-        stride_qh = gl.cast(stride_qh_in, gl.int64)
-        stride_qm = gl.cast(stride_qm_in, gl.int64)
-        stride_qk = gl.cast(stride_qk_in, gl.int64)
-        stride_kz = gl.cast(stride_kz_in, gl.int64)
-        stride_kh = gl.cast(stride_kh_in, gl.int64)
-        stride_kn = gl.cast(stride_kn_in, gl.int64)
-        stride_kk = gl.cast(stride_kk_in, gl.int64)
-        stride_vz = gl.cast(stride_vz_in, gl.int64)
-        stride_vh = gl.cast(stride_vh_in, gl.int64)
-        stride_vn = gl.cast(stride_vn_in, gl.int64)
-        stride_vk = gl.cast(stride_vk_in, gl.int64)
-        stride_oz = gl.cast(stride_oz_in, gl.int64)
-        stride_oh = gl.cast(stride_oh_in, gl.int64)
-        stride_om = gl.cast(stride_om_in, gl.int64)
-        stride_on = gl.cast(stride_on_in, gl.int64)
-        stride_lse_z = gl.cast(stride_lse_z_in, gl.int64)
-        stride_lse_h = gl.cast(stride_lse_h_in, gl.int64)
-        stride_lse_m = gl.cast(stride_lse_m_in, gl.int64)
-        stride_sd_z = gl.cast(stride_sd_z_in, gl.int64)
-        stride_sd_h = gl.cast(stride_sd_h_in, gl.int64)
-        stride_sd_m = gl.cast(stride_sd_m_in, gl.int64)
-        stride_sd_n = gl.cast(stride_sd_n_in, gl.int64)
-    else:
-        stride_qz = stride_qz_in
-        stride_qh = stride_qh_in
-        stride_qm = stride_qm_in
-        stride_qk = stride_qk_in
-        stride_kz = stride_kz_in
-        stride_kh = stride_kh_in
-        stride_kn = stride_kn_in
-        stride_kk = stride_kk_in
-        stride_vz = stride_vz_in
-        stride_vh = stride_vh_in
-        stride_vn = stride_vn_in
-        stride_vk = stride_vk_in
-        stride_oz = stride_oz_in
-        stride_oh = stride_oh_in
-        stride_om = stride_om_in
-        stride_on = stride_on_in
-        stride_lse_z = stride_lse_z_in
-        stride_lse_h = stride_lse_h_in
-        stride_lse_m = stride_lse_m_in
-        stride_sd_z = stride_sd_z_in
-        stride_sd_h = stride_sd_h_in
-        stride_sd_m = stride_sd_m_in
-        stride_sd_n = stride_sd_n_in
-
-    # The async copy's alignment proof -- see the note at the same place in _attn_fwd.
-    if KV_STRIDE_ALIGN > 1:
-        stride_kz = gl.multiple_of(stride_kz, KV_STRIDE_ALIGN)
-        stride_kh = gl.multiple_of(stride_kh, KV_STRIDE_ALIGN)
-        stride_kn = gl.multiple_of(stride_kn, KV_STRIDE_ALIGN)
-        stride_vz = gl.multiple_of(stride_vz, KV_STRIDE_ALIGN)
-        stride_vh = gl.multiple_of(stride_vh, KV_STRIDE_ALIGN)
-        stride_vn = gl.multiple_of(stride_vn, KV_STRIDE_ALIGN)
-
-    NUM_BLOCKS_M = gl.cdiv(SEQLEN_Q, BLOCK_M)
-    off_z, off_q_head, start_m = _remap_xcd(
-        NUM_BLOCKS_M, BATCH, NUM_Q_HEADS, NUM_XCD, IS_CAUSAL
-    )
-
-    if VARLEN:
-        cu_seqlens_q_start = gl.load(cu_seqlens_q + off_z)
-        seqlen_q = gl.load(cu_seqlens_q + off_z + 1) - cu_seqlens_q_start
-        if start_m * BLOCK_M >= seqlen_q:
-            return
-        cu_seqlens_k_start = gl.load(cu_seqlens_k + off_z)
-        seqlen_k = gl.load(cu_seqlens_k + off_z + 1) - cu_seqlens_k_start
-    else:
-        cu_seqlens_q_start = 0
-        cu_seqlens_k_start = 0
-        seqlen_q = SEQLEN_Q
-        seqlen_k = SEQLEN_K
-
-    grp_sz: gl.constexpr = NUM_Q_HEADS // NUM_K_HEADS
-    off_k_head = off_q_head // grp_sz
-
-    mfmaLayout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4,
-        instr_shape=[32, 32, 16],
-        transposed=True,
-        warps_per_cta=[num_warps, 1],
-    )
-    K_WIDTH: gl.constexpr = 8
-    PV_K_WIDTH: gl.constexpr = 4
-    dotQ: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=mfmaLayout, k_width=K_WIDTH
-    )
-    dotK: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=mfmaLayout, k_width=K_WIDTH
-    )
-    dotP: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=mfmaLayout, k_width=PV_K_WIDTH
-    )
-    dotV: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=mfmaLayout, k_width=PV_K_WIDTH
-    )
-
-    LOAD_VEC: gl.constexpr = 8
-    qLoadLayout: gl.constexpr = _make_load_layout(
-        D_LO, LOAD_VEC, num_warps, transposed=False
-    )
-    qHiLoadLayout: gl.constexpr = _make_load_layout(
-        D_HI_QK, LOAD_VEC, num_warps, transposed=False
-    )
-    oStoreLayout: gl.constexpr = _make_load_layout(
-        BLOCK_DMODEL_POW2, LOAD_VEC, num_warps, transposed=False
-    )
-
-    # K and V are staged exactly as _attn_fwd stages them: one padded tile each.
-    ELEM_BITS: gl.constexpr = k_ptr.dtype.element_ty.primitive_bitwidth
-    _KV_SHARED: gl.constexpr = _make_kv_shared_layouts(BLOCK_DMODEL_POW2, BLOCK_N)
-    gl.static_assert(
-        kv_async_copy_ok(
-            BLOCK_DMODEL_POW2, 0, BLOCK_N, num_warps, ELEM_BITS, KV_STRIDE_ALIGN
-        ),
-        "K/V cannot be async-copied for this tile; the host must make K/V contiguous",
-    )
-    BUF_DEPTH: gl.constexpr = 2
-    kSharedLayout: gl.constexpr = _KV_SHARED[0]
-    vSharedLayout: gl.constexpr = _KV_SHARED[1]
-
-    qh_off = off_q_head * stride_qh
-    kh_off = off_k_head * stride_kh
-    vh_off = off_k_head * stride_vh
-    if HEAD_STRIDE_ALIGN > 1:
-        qh_off = gl.multiple_of(qh_off, HEAD_STRIDE_ALIGN)
-        kh_off = gl.multiple_of(kh_off, HEAD_STRIDE_ALIGN)
-        vh_off = gl.multiple_of(vh_off, HEAD_STRIDE_ALIGN)
-
-    qk_scale = sm_scale * RCP_LN2
-
-    # Q, as its two slices: [0, D_LO) is all real head dim, [D_LO, D_LO + D_HI_QK)
-    # carries the head-dim mask.
-    q_base = (
-        q_ptr
-        + off_z * stride_qz
-        + qh_off
-        + cu_seqlens_q_start * stride_qm
-        + start_m * BLOCK_M * stride_qm
-    )
-    if BLOCK_M >= NUM_Q_HEADS:
-        q_cache_mod: gl.constexpr = ".cg"
-    else:
-        q_cache_mod: gl.constexpr = ""
-    offs_qm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, qLoadLayout))
-    offs_qd = gl.arange(0, D_LO, layout=gl.SliceLayout(0, qLoadLayout))
-    q_offsets = (offs_qm[:, None] * stride_qm + offs_qd[None, :] * stride_qk).to(
-        gl.int32
-    )
-    q_mask = (start_m * BLOCK_M + offs_qm)[:, None] < seqlen_q
-    q = gl.amd.cdna4.buffer_load(
-        ptr=q_base, offsets=q_offsets, mask=q_mask, other=0.0, cache=q_cache_mod
-    )
-    q = gl.convert_layout(q, layout=dotQ)
-
-    offs_qhm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, qHiLoadLayout))
-    offs_qhd = D_LO + gl.arange(0, D_HI_QK, layout=gl.SliceLayout(0, qHiLoadLayout))
-    q_hi_offsets = (offs_qhm[:, None] * stride_qm + offs_qhd[None, :] * stride_qk).to(
-        gl.int32
-    )
-    q_hi_mask = ((start_m * BLOCK_M + offs_qhm)[:, None] < seqlen_q) & (
-        offs_qhd[None, :] < BLOCK_DMODEL
-    )
-    q_hi = gl.amd.cdna4.buffer_load(
-        ptr=q_base, offsets=q_hi_offsets, mask=q_hi_mask, other=0.0, cache=q_cache_mod
-    )
-    q_hi = gl.convert_layout(q_hi, layout=dotQ)
-    if SCALE_ON_Q:
-        # See _attn_fwd: fold qk_scale into the Q operand once.
-        q = (q.to(gl.float32) * qk_scale).to(q_ptr.dtype.element_ty)
-        q_hi = (q_hi.to(gl.float32) * qk_scale).to(q_ptr.dtype.element_ty)
-
-    k_base = k_ptr + off_z * stride_kz + kh_off + cu_seqlens_k_start * stride_kn
-
-    v_base = v_ptr + off_z * stride_vz + vh_off + cu_seqlens_k_start * stride_vn
-
-    smemK = gl.allocate_shared_memory(
-        k_ptr.dtype.element_ty, [BUF_DEPTH, BLOCK_DMODEL_POW2, BLOCK_N], kSharedLayout
-    )
-    smemV = gl.allocate_shared_memory(
-        v_ptr.dtype.element_ty, [BUF_DEPTH, BLOCK_N, BLOCK_DMODEL_POW2], vSharedLayout
-    )
-
-    KV_VEC: gl.constexpr = _async_copy_vec(
-        BLOCK_DMODEL_POW2, BLOCK_N, 0, num_warps, ELEM_BITS, KV_STRIDE_ALIGN
-    )
-    kt_async_layout: gl.constexpr = _async_copy_layout(
-        BLOCK_DMODEL_POW2, BLOCK_N, 0, num_warps, KV_VEC
-    )
-    v_async_layout: gl.constexpr = _async_copy_layout(
-        BLOCK_N, BLOCK_DMODEL_POW2, 1, num_warps, KV_VEC
-    )
-    kt_off_d = gl.arange(
-        0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(1, kt_async_layout)
-    )
-    kt_off_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, kt_async_layout))
-    kt_off = (kt_off_d[:, None] * stride_kk + kt_off_n[None, :] * stride_kn).to(
-        gl.int32
-    )
-    v_off_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, v_async_layout))
-    v_off_d = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, v_async_layout))
-    v_off = (v_off_n[:, None] * stride_vn + v_off_d[None, :] * stride_vk).to(gl.int32)
-    k_head_mask = kt_off_d[:, None] < BLOCK_DMODEL
-    v_head_mask = v_off_d[None, :] < BLOCK_DMODEL
-    if ENABLE_SINK:
-        m_i_init = gl.load(sink_ptr + off_q_head).to(gl.float32) * RCP_LN2
-    elif SLIDING_WINDOW > 0:
-        m_i_init = -1.0e30  # see _attn_fwd
-    else:
-        m_i_init = float("-inf")
-
-    m_i = gl.full(
-        [BLOCK_M], m_i_init, dtype=gl.float32, layout=gl.SliceLayout(1, mfmaLayout)
-    )
-    l_i = gl.full(
-        [BLOCK_M], 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, mfmaLayout)
-    )
-    acc = gl.zeros([BLOCK_M, ACC_WIDTH], dtype=gl.float32, layout=mfmaLayout)
-    if D_HI_PV > 0:
-        acc2 = gl.zeros([BLOCK_M, D_HI_PV], dtype=gl.float32, layout=mfmaLayout)
-    else:
-        # Never touched without a P@V split; it only has to be a real tensor.
-        acc2 = acc
-
-    offs_m = start_m * BLOCK_M + gl.arange(
-        0, BLOCK_M, layout=gl.SliceLayout(1, mfmaLayout)
-    )
-    if SLIDING_WINDOW > 0:
-        window_min = offs_m + (seqlen_k - seqlen_q - SLIDING_WINDOW)
-    else:
-        window_min = None
-
-    if softmax_lse_ptr is not None:
-        lse_base = (
-            softmax_lse_ptr
-            + off_z * stride_lse_z
-            + off_q_head * stride_lse_h
-            + cu_seqlens_q_start * stride_lse_m
-            + start_m * BLOCK_M * stride_lse_m
-        )
-        offs_lse = (
-            gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, mfmaLayout)) * stride_lse_m
-        ).to(gl.int32)
-        lse_mask = offs_m < seqlen_q
-    else:
-        lse_base = None
-        offs_lse = None
-        lse_mask = None
-
-    if s_dmask_ptr is not None:
-        sd_base = (
-            s_dmask_ptr
-            + off_z * stride_sd_z
-            + off_q_head * stride_sd_h
-            + start_m * BLOCK_M * stride_sd_m
-        )
-        offs_sd_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, mfmaLayout))
-        offs_sd_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfmaLayout))
-        sd_offsets = (
-            offs_sd_m[:, None] * stride_sd_m + offs_sd_n[None, :] * stride_sd_n
-        ).to(gl.int32)
-        sd_q_mask = offs_m < seqlen_q
-    else:
-        sd_base = None
-        sd_offsets = None
-        sd_q_mask = None
-
-    o_base = (
-        o_ptr
-        + off_z * stride_oz
-        + off_q_head * stride_oh
-        + cu_seqlens_q_start * stride_om
-        + start_m * BLOCK_M * stride_om
-    )
-
-    # Classify key blocks exactly as _attn_fwd does.
-    (
-        n_blocks,
-        n_extra_tokens,
-        skipped_blocks,
-        window_blocks,
-        masked_blocks,
-        n_full_blocks,
-    ) = _classify_k_blocks(
-        start_m, seqlen_q, seqlen_k, BLOCK_M, BLOCK_N, IS_CAUSAL, SLIDING_WINDOW
-    )
-    if IS_CAUSAL:  # noqa: SIM102
-        if n_blocks <= 0:
-            offs_od = gl.arange(
-                0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, oStoreLayout)
-            )
-            offs_rm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, oStoreLayout))
-            offs_om = start_m * BLOCK_M + offs_rm
-            o_offsets = (
-                offs_rm[:, None] * stride_om + offs_od[None, :] * stride_on
-            ).to(gl.int32)
-            zeros = gl.zeros(
-                [BLOCK_M, BLOCK_DMODEL_POW2],
-                dtype=o_ptr.dtype.element_ty,
-                layout=oStoreLayout,
-            )
-            o_mask = (offs_om[:, None] < seqlen_q) & (
-                offs_od[None, :] < BLOCK_DMODEL_OUT
-            )
-            gl.amd.cdna4.buffer_store(zeros, ptr=o_base, offsets=o_offsets, mask=o_mask)
-
-            if softmax_lse_ptr is not None:
-                lse = gl.zeros(
-                    [BLOCK_M], dtype=gl.float32, layout=gl.SliceLayout(1, mfmaLayout)
-                )
-                gl.amd.cdna4.buffer_store(
-                    lse, ptr=lse_base, offsets=offs_lse, mask=lse_mask
-                )
-            return
-
-    block_min = skipped_blocks * BLOCK_N
-    block_max = n_blocks * BLOCK_N
-
-    if SLIDING_WINDOW > 0:
-        k_base += skipped_blocks * BLOCK_N * stride_kn
-        v_base += skipped_blocks * BLOCK_N * stride_vn
-        if window_blocks > 0:
-            acc, acc2, l_i, m_i = _attn_fwd_inner_split(
-                acc,
-                acc2,
-                l_i,
-                m_i,
-                q,
-                q_hi,
-                k_base,
-                v_base,
-                smemK,
-                smemV,
-                kt_off,
-                v_off,
-                kt_off_n,
-                kt_off_d,
-                v_off_n,
-                v_off_d,
-                stride_kn,
-                stride_vn,
-                seqlen_k,
-                block_min,
-                block_min + window_blocks * BLOCK_N,
-                window_min,
-                qk_scale,
-                sd_base,
-                sd_offsets,
-                sd_q_mask,
-                stride_sd_n,
-                mfmaLayout=mfmaLayout,
-                dotK=dotK,
-                dotP=dotP,
-                dotV=dotV,
-                BLOCK_M=BLOCK_M,
-                BLOCK_N=BLOCK_N,
-                BLOCK_DMODEL=BLOCK_DMODEL,
-                BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
-                WINDOW_MASK=True,
-                RETURN_SCORES=RETURN_SCORES,
-                SCALE_ON_Q=SCALE_ON_Q,
-                BUF_DEPTH=BUF_DEPTH,
-                D_LO=D_LO,
-                D_HI_QK=D_HI_QK,
-                D_HI_PV=D_HI_PV,
-            )
-            k_base += window_blocks * BLOCK_N * stride_kn
-            v_base += window_blocks * BLOCK_N * stride_vn
-            block_min = block_min + window_blocks * BLOCK_N
-
-    FAST_PATH: gl.constexpr = not RETURN_SCORES
-    pipelined = False
-    if FAST_PATH:  # noqa: SIM102
-        if n_full_blocks >= _MIN_PIPE_BLOCKS:
-            pipelined = True
-            acc, acc2, l_i, m_i = _attn_fwd_pipelined_split(
-                acc,
-                acc2,
-                l_i,
-                m_i,
-                q,
-                q_hi,
-                smemK,
-                smemV,
-                k_base,
-                v_base,
-                kt_off,
-                v_off,
-                k_head_mask,
-                v_head_mask,
-                BLOCK_N * stride_kn,
-                BLOCK_N * stride_vn,
-                n_full_blocks,
-                qk_scale,
-                mfmaLayout=mfmaLayout,
-                dotK=dotK,
-                dotV=dotV,
-                dotP=dotP,
-                SCALE_ON_Q=SCALE_ON_Q,
-                DTYPE=v_ptr.dtype.element_ty,
-                BLOCK_M=BLOCK_M,
-                BLOCK_N=BLOCK_N,
-                BUF_DEPTH=BUF_DEPTH,
-                D_LO=D_LO,
-                D_HI_QK=D_HI_QK,
-                D_HI_PV=D_HI_PV,
-            )
-            block_min = block_min + n_full_blocks * BLOCK_N
-            block_max = n_blocks * BLOCK_N
-            gl.barrier()
-
-    if (not pipelined) and n_full_blocks > 0:
-        block_max = block_min + n_full_blocks * BLOCK_N
-        acc, acc2, l_i, m_i = _attn_fwd_inner_split(
-            acc,
-            acc2,
-            l_i,
-            m_i,
-            q,
-            q_hi,
-            k_base,
-            v_base,
-            smemK,
-            smemV,
-            kt_off,
-            v_off,
-            kt_off_n,
-            kt_off_d,
-            v_off_n,
-            v_off_d,
-            stride_kn,
-            stride_vn,
-            seqlen_k,
-            block_min,
-            block_max,
-            window_min,
-            qk_scale,
-            sd_base,
-            sd_offsets,
-            sd_q_mask,
-            stride_sd_n,
-            mfmaLayout=mfmaLayout,
-            dotK=dotK,
-            dotP=dotP,
-            dotV=dotV,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            BLOCK_DMODEL=BLOCK_DMODEL,
-            BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
-            WINDOW_MASK=False,
-            RETURN_SCORES=RETURN_SCORES,
-            SCALE_ON_Q=SCALE_ON_Q,
-            BUF_DEPTH=BUF_DEPTH,
-            D_LO=D_LO,
-            D_HI_QK=D_HI_QK,
-            D_HI_PV=D_HI_PV,
-        )
-        block_min = block_max
-        block_max = n_blocks * BLOCK_N
-
-    if masked_blocks > 0:
-        k_base += n_full_blocks * BLOCK_N * stride_kn
-        v_base += n_full_blocks * BLOCK_N * stride_vn
-        acc, acc2, l_i, m_i = _attn_fwd_inner_split(
-            acc,
-            acc2,
-            l_i,
-            m_i,
-            q,
-            q_hi,
-            k_base,
-            v_base,
-            smemK,
-            smemV,
-            kt_off,
-            v_off,
-            kt_off_n,
-            kt_off_d,
-            v_off_n,
-            v_off_d,
-            stride_kn,
-            stride_vn,
-            seqlen_k,
-            block_min,
-            block_max,
-            window_min,
-            qk_scale,
-            sd_base,
-            sd_offsets,
-            sd_q_mask,
-            stride_sd_n,
-            mfmaLayout=mfmaLayout,
-            dotK=dotK,
-            dotP=dotP,
-            dotV=dotV,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            BLOCK_DMODEL=BLOCK_DMODEL,
-            BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
-            WINDOW_MASK=SLIDING_WINDOW > 0,
-            RETURN_SCORES=RETURN_SCORES,
-            SCALE_ON_Q=SCALE_ON_Q,
-            BUF_DEPTH=BUF_DEPTH,
-            D_LO=D_LO,
-            D_HI_QK=D_HI_QK,
-            D_HI_PV=D_HI_PV,
-            seqlen_q=seqlen_q,
-            n_extra_tokens=n_extra_tokens,
-            offs_m=offs_m,
-            IS_CAUSAL=IS_CAUSAL,
-            MASK_STEPS=True,
-        )
-
-    # Epilogue: as _attn_fwd, per accumulator slice.
-    l_recip = 1.0 / l_i
-    acc = acc * l_recip[:, None]
-    if D_HI_PV > 0:
-        acc2 = acc2 * l_recip[:, None]
-
-    end_m_idx = (start_m + 1) * BLOCK_M
-    start_m_idx = start_m * BLOCK_M
-    causal_start_idx = seqlen_q - seqlen_k
-    if IS_CAUSAL:  # noqa: SIM102
-        if (causal_start_idx > start_m_idx) and (causal_start_idx < end_m_idx):
-            row_ok = (offs_m >= causal_start_idx)[:, None]
-            acc = gl.where(row_ok, acc, 0.0)
-            if D_HI_PV > 0:
-                acc2 = gl.where(row_ok, acc2, 0.0)
-
-    if softmax_lse_ptr is not None:
-        LN2: gl.constexpr = 0.6931471824645996
-        softmax_lse = (m_i + gl.log2(l_i)) * LN2
-        if IS_CAUSAL:
-            softmax_lse = gl.where(offs_m < causal_start_idx, 0.0, softmax_lse)
-        gl.amd.cdna4.buffer_store(
-            softmax_lse, ptr=lse_base, offsets=offs_lse, mask=lse_mask
-        )
-
-    _store_out(
-        acc,
-        o_base,
-        start_m_idx,
-        seqlen_q,
-        stride_om,
-        stride_on,
-        0,
-        ACC_WIDTH,
-        BLOCK_DMODEL_OUT,
-        BLOCK_M,
-        LOAD_VEC,
-        num_warps,
-    )
-    if D_HI_PV > 0:
         _store_out(
             acc2,
             o_base,
@@ -3124,26 +2157,56 @@ def _attn_fwd_split_head(
             LOAD_VEC,
             num_warps,
         )
+    else:
+        out = acc.to(o_ptr.dtype.element_ty)
+
+        storeLayout: gl.constexpr = _make_load_layout(
+            BLOCK_DMODEL_POW2, LOAD_VEC, num_warps, transposed=False
+        )
+        out = gl.convert_layout(out, layout=storeLayout)
+
+        offs_rm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, storeLayout))
+        offs_om = start_m * BLOCK_M + offs_rm
+        offs_od = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, storeLayout))
+
+        o_base = (
+            o_ptr
+            + off_z * stride_oz
+            + off_q_head * stride_oh
+            + cu_seqlens_q_start * stride_om
+            + start_m * BLOCK_M * stride_om
+        )
+        o_offsets = (offs_rm[:, None] * stride_om + offs_od[None, :] * stride_on).to(
+            gl.int32
+        )
+
+        overflow_size = end_m_idx - seqlen_q
+        out_mask = gl.full([BLOCK_M, 1], True, dtype=gl.int1, layout=storeLayout)
+        if overflow_size > 0:
+            out_mask = out_mask & (offs_om[:, None] < seqlen_q)
+        if PADDED_HEAD_OUT:
+            out_mask = out_mask & (offs_od[None, :] < BLOCK_DMODEL_OUT)
+        gl.amd.cdna4.buffer_store(out, ptr=o_base, offsets=o_offsets, mask=out_mask)
 
 
 # ---------------------------------------------------------------------------
-# fp8 (e4m3) -- a third kernel.
+# fp8 (e4m3) -- a second kernel.
 #
 # fp8 halves the MFMA time of a tile but not its softmax, so the tile that is
 # MFMA-bound in bf16 is VALU-bound here, and the bf16 kernel's fp8 branch pays for
 # P's quantization on top: a workgroup-wide amax of P every tile (a cross-warp
 # reduction through LDS and a barrier), then P@V into a fresh accumulator that is
-# rescaled by ``descale_p * descale_v`` and added to ``acc``.
+# rescaled by `descale_p * descale_v` and added to `acc`.
 #
 # This kernel scales P statically instead.  P = exp2(s - m) is at most 1, so
 # computing it as exp2(s - m + P_LIFT) with P_LIFT = log2(448) puts it on e4m3's
-# full range with no reduction at all; the row sum ``l`` carries the same factor,
-# so it cancels in ``acc / l`` and only the LSE has to take it back out.  P@V then
-# accumulates straight into ``acc`` like bf16, and ``descale_v`` is applied once,
+# full range with no reduction at all; the row sum `l` carries the same factor,
+# so it cancels in `acc / l` and only the LSE has to take it back out.  P@V then
+# accumulates straight into `acc` like bf16, and `descale_v` is applied once,
 # in the epilogue.  (FlyDSL's gfx950 fp8 kernel does the same.)
 #
 # Everything else -- block classification, the sliding-window split, the masked
-# Q@K^T, the copy helpers -- is shared with ``_attn_fwd``.  No PE slice: the host
+# Q@K^T, the copy helpers -- is shared with `_attn_fwd`.  No PE slice: the host
 # rejects fp8 with PE.
 # ---------------------------------------------------------------------------
 
@@ -3165,7 +2228,7 @@ _FP8_PAD_INTERVAL = 1024
 
 @gluon.constexpr_function
 def _fp8_staggered_ok(head_dim_pow2, block_n):
-    """``_staggered_layout_ok`` at 8 bits."""
+    """`_staggered_layout_ok` at 8 bits."""
     if head_dim_pow2 & (head_dim_pow2 - 1) or block_n & (block_n - 1):
         return False
     if head_dim_pow2 < 16 or block_n < 16:
@@ -3188,7 +2251,7 @@ def _fp8_kv_shared_layouts(head_dim_pow2, block_n):
 
 @gluon.constexpr_function
 def _fp8_async_copy_ok(head_dim_pow2, block_n, num_warps, stride_align):
-    """``_async_copy_ok`` at 8 bits: a 16-element (128-bit) or 4-element (32-bit)
+    """`_async_copy_ok` at 8 bits: a 16-element (128-bit) or 4-element (32-bit)
     vector per lane, the staggered destination, and a KV stride alignment reaching
     the vector."""
     if not _fp8_staggered_ok(head_dim_pow2, block_n):
@@ -3209,8 +2272,8 @@ def _fp8_async_copy_ok(head_dim_pow2, block_n, num_warps, stride_align):
 @gluon.constexpr_function
 def _fp8_async_copy_layouts(head_dim_pow2, block_n, num_warps, stride_align):
     """(K^T, V) async-copy address layouts at 8 bits, against the fp8 padding
-    interval.  A constexpr function so the kernel never names ``_FP8_PAD_INTERVAL``,
-    a plain module global that ``@gluon.jit`` code cannot read."""
+    interval.  A constexpr function so the kernel never names `_FP8_PAD_INTERVAL`,
+    a plain module global that `@gluon.jit` code cannot read."""
     vec = _async_copy_vec(
         head_dim_pow2, block_n, 0, num_warps, 8, stride_align, _FP8_PAD_INTERVAL
     )
@@ -3261,7 +2324,7 @@ def _attn_softmax_pv_fp8(
 ):
     """Online softmax + P@V for one key block, P statically scaled to e4m3.
 
-    ``qk`` is unscaled (``qk_scale`` folds the softmax scale and the Q/K descales);
+    `qk` is unscaled (`qk_scale` folds the softmax scale and the Q/K descales);
     the scale rides the exp2 argument's FMA.
     """
     m_ij = gl.maximum(m_i, gl.max(qk, 1) * qk_scale)
@@ -3330,7 +2393,7 @@ def _attn_fwd_inner_fp8(
     IS_CAUSAL: gl.constexpr = False,
     MASK_STEPS: gl.constexpr = False,
 ):
-    """``_attn_fwd_inner`` for fp8: same staging, the fp8 softmax and P@V."""
+    """`_attn_fwd_inner` for fp8: same staging, the fp8 softmax and P@V."""
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
     if MASK_STEPS or IS_CAUSAL or WINDOW_MASK or RETURN_SCORES:
         offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfmaLayout))
@@ -3532,7 +2595,7 @@ def _attn_fwd_fp8(
     SCALE_ON_Q: gl.constexpr = False,
     num_warps: gl.constexpr = 4,
 ):
-    """Same arguments as ``_attn_fwd``, so the host launches either one."""
+    """Same arguments as `_attn_fwd`, so the host launches either one."""
     gl.static_assert(IS_FP8, "fp8 kernel")
     gl.static_assert(BLOCK_DMODEL_PE == 0, "fp8 kernel takes no PE slice")
     RCP_LN2: gl.constexpr = 1.4426950408889634
@@ -3899,7 +2962,8 @@ def _attn_fwd_fp8(
     if FAST_PATH:  # noqa: SIM102
         if n_full_blocks >= _MIN_PIPE_BLOCKS:
             pipelined = True
-            acc, l_i, m_i = _attn_fwd_pipelined(
+            acc, _, l_i, m_i = _attn_fwd_pipelined(
+                acc,
                 acc,
                 l_i,
                 m_i,
@@ -4077,7 +3141,7 @@ def _get_config(
 ):
     """Tile / wave configuration for one masking + dtype mode.
 
-    The MFMA tiling fixes ``BLOCK_M = 32 * num_warps``, so the two knobs move
+    The MFMA tiling fixes `BLOCK_M = 32 * num_warps`, so the two knobs move
     together.  Both masking modes take the wide tile (256 / 8 waves): it amortises
     the per-tile softmax over twice the rows and puts two waves on every SIMD, which
     is what lets a wave's vector work issue in the other wave's MFMA shadow.  The
@@ -4085,17 +3149,17 @@ def _get_config(
     one wave per SIMD, which leaves the pipeline nothing to overlap against.
 
     That holds only while the pipeline gets the work.  A causal workgroup enters it
-    with at least ``_MIN_PIPE_BLOCKS`` unmasked key blocks, and short sequences
+    with at least `_MIN_PIPE_BLOCKS` unmasked key blocks, and short sequences
     rarely have them: at 256 keys the wide tile is one block lying entirely on the
     diagonal, issuing the whole 256x256 square for half of it useful.  Below
-    ``_CAUSAL_WIDE_MIN_SEQLEN_K`` keys the narrow tile therefore wins (1.37x at
+    `_CAUSAL_WIDE_MIN_SEQLEN_K` keys the narrow tile therefore wins (1.37x at
     256, 1.08-1.19x at 1024, still 1.02-1.06x at 3072 across D=56/64/128); past it
     the two are within 5% either way.
 
     A causal sliding window inverts that again.  Every workgroup then walks only
-    ``BLOCK_M + window`` keys, and the window's diagonal edge and the causal one each
-    cost a band of ``BLOCK_M`` masked rows -- a fixed overhead per row that halving
-    ``BLOCK_M`` halves, which outweighs the lost wave.
+    `BLOCK_M + window` keys, and the window's diagonal edge and the causal one each
+    cost a band of `BLOCK_M` masked rows -- a fixed overhead per row that halving
+    `BLOCK_M` halves, which outweighs the lost wave.
     """
     arch = arch_info.get_arch()
     fpath = f"{AITER_TRITON_CONFIGS_PATH}/{arch}/gluon/attention/mha/mha.json"
