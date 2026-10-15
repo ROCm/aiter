@@ -1,345 +1,165 @@
-# AITER Triton Ops — Maintainer Guide
+# AITER Triton ops
 
-This directory contains all Triton- and Gluon-based kernels and their Python
-wrappers used by AITER. This README documents the conventions that every
-change under `aiter/ops/triton/` is expected to follow. For anything touching
-the tuned-config JSON tree, **`configs/CLAUDE.md` is the authoritative
-rulebook** — this README summarizes it; that file wins on any conflict.
+This folder has the Triton and Gluon kernels of AITER and their Python
+wrappers. Every change in `aiter/ops/triton/` must obey the rules below.
+Coding agents find these rules through [`AGENTS.md`](AGENTS.md). Copilot
+uses the same rules to review PRs
+(`.github/instructions/aiter-ops-triton.instructions.md`). The full config
+rules are in [`configs/AGENTS.md`](configs/AGENTS.md).
 
-PR reviews under this directory are additionally checked by Copilot against
-`.github/instructions/aiter-ops-triton.instructions.md`, which encodes the
-rules below. Any cleanup or refactor that changes a convention must update
-both that file and this README in the same PR, so the two stay current.
+## Rules
 
----
+### Kernels
 
-## Directory layout
+1. Before you add a kernel, find kernels with the same or almost the same
+   function. Extend or reuse them. Do not add a duplicate.
+2. Put a new kernel in its own PR, together with its wrapper, unit test and
+   benchmark.
+3. Put the wrapper in the correct category folder. Put the kernel body at the
+   same path under `_triton_kernels/` (Triton) or `_gluon_kernels/<arch>/`
+   (Gluon). Do not add files at the top of `aiter/ops/triton/`.
+4. Launch a kernel only from its public wrapper. Tests, benchmarks and other
+   code call the wrapper.
+5. Give each launchable kernel a `repr=` from `make_kernel_repr`. See
+   [Config-aware kernel names in traces](#config-aware-kernel-names-in-traces).
+6. Use the [shared helpers](#shared-helpers). Do not write local copies of
+   common code, such as activations, shuffles or config loading. Put a new
+   shared helper in the shared module, not in a kernel file. Shared
+   `@triton.jit` device helpers go in `_triton_kernels/common/`.
+7. Use architecture names (`gfx942`, `gfx950`, `gfx1250`) in code and folder
+   names. Do not use product names such as MI300 or MI355.
+8. Allocate tensors on the device of the inputs (`device=x.device`). Do not
+   use `device="cuda"` in library code.
+9. Use absolute imports from the category path, for example
+   `from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16`. Do not
+   use relative imports or the old flat paths.
+10. Do not import `torch` in `utils/_triton/`, in config loading, or in new
+    kernel modules. These parts must also work without PyTorch, for example
+    with JAX-Triton.
+
+### Configs
+
+11. Put tuning values in the JSON files in `configs/`. Do not put tuning
+    values in Python.
+12. Read configs only through the loaders in `utils/`.
+13. In GEMM configs, use only `M_LEQ_<x>` keys and `"any"` for M buckets.
+14. Use `autotune_configs()` for every `@triton.autotune` config list.
+15. Put `kpack` only in gfx942 configs.
+
+### Tests and benchmarks
+
+16. Add a unit test in `op_tests/triton_tests/`. Use the folder that matches
+    the wrapper folder. See the
+    [test rules](../../../op_tests/triton_tests/README.md).
+17. Add a benchmark: `op_tests/op_benchmarks/triton/bench_<op>.py`.
+
+### Comments and docs
+
+18. Keep comments short: one or two sentences that tell what the code does,
+    or why. Do not write long explanations.
+19. Give each public wrapper a docstring: what it computes, its arguments,
+    its return value and its limits.
+20. Log with `%` placeholders. Library code uses `AiterTritonLogger()`, and
+    tests and benchmarks use `from aiter import logger`. Do not use `print`
+    or f-strings in log calls.
+21. Write docs, comments and PR descriptions in
+    [ASD-STE100](https://www.asd-ste100.org/) (Simplified Technical English):
+    short sentences, simple words, one instruction in each sentence.
+    You can use technical terms.
+
+### Pull requests
+
+22. Change one backend in each PR. Triton and Gluon are one backend.
+23. Keep PRs small: one problem in each PR. For work that depends on other
+    work, use stacked PRs.
+24. Write the PR description with these parts: motivation, technical
+    details, test plan and test results.
+25. Assign the PR to yourself and answer the reviewers. Code owners can close
+    PRs that stay inactive.
+26. Make sure that the PR has the `Triton/Gluon` label. Add the
+    `ci:triton-300x` label when you change gfx942 code or configs.
+27. Review your PR yourself before you ask for a review.
+28. Open the PR from the `ROCm/aiter` repository. Use a fork only if you do
+    not have access.
+29. Remove the `Co-authored-by` lines of AI agents from your commits before
+    the merge.
+
+## Reference
+
+### Folder layout
 
 ```text
 aiter/ops/triton/
-├── __init__.py            # public API + _BACKWARD_COMPAT_MAP (legacy flat imports)
-├── gemm/                  # GEMM wrappers: basic/, batched/, feed_forward/, fused/, grouped/
-├── attention/             # MHA, MLA, lean attention, unified attention, ...
-├── moe/                   # Mixture-of-experts ops
-├── normalization/         # RMSNorm / LayerNorm and fused add+norm variants
-├── quant/                 # FP8 / MXFP4 / MXFP8 quantization and fused-quant kernels
-├── rope/                  # RoPE and fused QKV-split + RoPE variants
-├── fusions/               # small fused glue kernels (mul+add, clamp-act-mul, KV-cache fusions, ...)
-├── comms/                 # multi-GPU communication kernels (all-gather, reduce-scatter, comm+compute fusions)
-├── conv/                  # convolution kernels (see conv/README.md and conv/DESIGN.md)
-├── gated_delta_net/       # Gated DeltaNet ops (gated delta rule, causal conv1d prefill/decode)
-├── kimi_delta_attn/       # Kimi Delta Attention (chunked delta attention)
-├── gluon/                 # Gluon-backend wrappers
-├── _triton_kernels/       # @triton.jit kernel bodies (mirrors the wrapper layout)
-├── _gluon_kernels/        # Gluon kernel bodies
-├── configs/               # tuned JSON configs — read configs/CLAUDE.md before editing
-└── utils/                 # shared machinery: config loading, shuffling, repr, arch info
+├── gemm/              GEMM wrappers: basic/, batched/, feed_forward/, fused/, grouped/
+├── attention/         MHA, MLA, lean attention, unified attention
+├── moe/               mixture-of-experts ops
+├── normalization/     RMSNorm, LayerNorm and fused add + norm
+├── quant/             FP8, MXFP4 and MXFP8 quantization
+├── rope/              RoPE and fused RoPE ops
+├── fusions/           small fused kernels
+├── comms/             multi-GPU communication kernels
+├── conv/              convolution kernels
+├── gated_delta_net/   Gated DeltaNet ops
+├── kimi_delta_attn/   Kimi Delta Attention
+├── gluon/             Gluon wrappers
+├── _triton_kernels/   Triton kernel bodies, same paths as the wrappers;
+│                      shared device helpers in common/
+├── _gluon_kernels/    Gluon kernel bodies: <arch>/ and the wrapper path
+├── configs/           tuned JSON configs
+└── utils/             shared code
 ```
 
-Public wrapper modules live in the categorized folders; the kernel bodies live
-in `_triton_kernels/` at the same relative category path, or in
-`_gluon_kernels/<arch>/` at the same relative category path when the Gluon
-implementation is architecture-specific.
-Tests mirror the wrapper folders under `op_tests/triton_tests/`, including
-nested wrapper subpackages (for example,
-`moe/moe_routing/test_moe_routing.py`).
-Kernel bodies are internal: tests, benchmarks, and external code call the
-public wrappers only — never `_triton_kernels/` / `_gluon_kernels/` directly.
+Tests use the same folders under `op_tests/triton_tests/`. Old flat imports
+(`aiter.ops.triton.gemm_a16w16`) still work through `_BACKWARD_COMPAT_MAP` in
+`__init__.py`. They are only for old external code.
 
-Legacy flat imports (`from aiter.ops.triton.gemm_a16w16 import ...`) still
-resolve through `_BACKWARD_COMPAT_MAP` in `__init__.py`, but **new code must
-import from the categorized path** (`aiter.ops.triton.gemm.basic.gemm_a16w16`).
+### Shared helpers
 
----
+| Need | Use |
+| ---- | --- |
+| Activations in a kernel | `_triton_kernels/common/activation.py` |
+| Weight and scale shuffles | `utils/shuffle.py` |
+| Config loading | `utils/config_utils.py` and the `utils/*_config_utils.py` loaders |
+| Autotune config lists | `utils/tuned_config_utils.py::autotune_configs` |
+| Split-K second-stage reduce | `_triton_kernels/common/splitk_reduce.py` |
+| Program ID and XCD remapping | `_triton_kernels/common/pid_preprocessing.py` |
+| Tile lookup for ragged batches | `_triton_kernels/common/segment_tile.py` |
+| Architecture checks | `utils/_triton/arch_info.py::get_arch` |
+| Kernel names in traces | `utils/_triton/kernel_repr.py::make_kernel_repr` |
+| Logging in library code | `utils/logger.py::AiterTritonLogger`, level from `AITER_TRITON_LOG_LEVEL` |
+| Logging in tests and benchmarks | `from aiter import logger`, level from `AITER_LOG_LEVEL` |
 
-## Framework portability — what may import `torch`
+### Configs
 
-`utils/_triton/` is the torch-free half of the shared machinery. The split
-exists so the Triton kernels and their tuned configs can be imported — or
-snapshotted into another repo — by a framework that is not PyTorch. The live
-case is JAX-Triton (ROCm-supported), where the tensors are created by JAX and
-handed to the same `@triton.jit` kernel.
-
-| Layer | May import `torch`? |
-| ----- | ------------------- |
-| `utils/_triton/` — arch info, `kernel_repr`, tuning harnesses | **No** |
-| Config loading (`utils/config_utils.py`, the `*_config_utils.py` family modules) and `configs/*.json` | **No** |
-| Kernel modules under `_triton_kernels/` (including the shared `@triton.jit` device helpers in `_triton_kernels/common/`) and `_gluon_kernels/` | **No** for new modules — a jit body cannot call torch anyway; keep host-side allocation and dtype glue in the wrapper. Modules that already import torch are grandfathered. |
-| `utils/` torch helpers (`shuffle.py`, `types.py`, `common_utils.py`, ...) and every public wrapper | **Yes** — this is where torch belongs |
-
-- A helper both sides need is split, not duplicated: the torch-free part under
-  `utils/_triton/` (or `_triton_kernels/common/` when it is `@triton.jit`
-  code), the torch part in `utils/`. `moe_common.py` exists in both
-  `_triton_kernels/common/` and `utils/` for exactly this reason.
-- `utils/_triton/tuning/` is exempt — those are standalone tuning harnesses
-  that run in a PyTorch environment, not part of the importable surface.
-- Non-PyTorch users still write their own wrappers. Their framework creates
-  the tensors, so allocation, dtype and layout checks, and the launch belong
-  to them; what crosses the boundary from AITER is the kernel plus its tuned
-  config, not the wrapper.
-
----
-
-## Tuned configs
-
-### One layout, one path builder
-
-Every tuned JSON file lives in a single nested tree, keyed by architecture,
-backend, op and config family:
+Each tuned config file is in this path:
 
 ```text
 configs/<arch>/<backend>/<op>/<d_type>/DEFAULT.json
 configs/<arch>/<backend>/<op>/<d_type>/<CONFIG_NAME>-<suffix>.json
-#        gfx950   triton    gemm  gemm_afp4wfp4
-#        gfx1250  gluon     moe   a8w4
 ```
 
-`<op>` is one of `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions`, `quant`.
-The flat, arch-prefixed directories (`configs/gemm/`, `configs/moe/`,
-`configs/conv/`, the loose files at the top of `configs/`) and the fallback
-code that reached them are gone.
+The suffix depends on the family. For example, GEMM files use
+`N=<N>-K=<K>`, batched GEMM files use `B=<B>-N=<N>-K=<K>` and MHC files use
+`C=<C>`. Some families use a custom suffix.
 
-Rules that follow from the layout:
-
-- `<d_type>` is `config_name.lower().replace("-", "_")` (`GEMM-AFP4WFP4` →
-  `gemm_afp4wfp4`, see `config_utils._dtype_dir()`). New config names must
-  stay distinct under that fold — `GEMM-FOO-BAR` and `GEMM-FOO_BAR` collide.
-- Files inside `configs/<arch>/...` carry **no arch prefix**; the default file
-  is named exactly `DEFAULT.json`.
-- A required `DEFAULT.json` that is missing raises naming that exact path.
-  There is no probe to fall through, so a misplaced file surfaces as an error
-  instead of silently resolving somewhere else.
-- Moves and renames go in a pure `git mv` commit (100% rename similarity),
-  with content changes in a follow-up.
-- `kpack` belongs in gfx942 configs only. The Triton AMD backend deprecates it
-  on CDNA4 — it warns and force-overrides `kpack = 1` on gfx950, and the
-  parameter is slated for removal — gfx1250 does not support it, and on the
-  RDNA targets (gfx11xx, gfx120x) it is a no-op. No other arch's tree carries
-  it; do not add it to one.
-
-All of it is built by one function in `utils/config_utils.py`:
-
-```python
-resolve_config_dir(op, config_name, backend="triton", arch=None) -> str
-```
-
-It **builds** the path — no probing, no candidate list, no cross-backend or
-cross-arch search — and validates every argument against a whitelist, so a bad
-value fails closed with an `AssertionError` rather than resolving to an
-escaped or wrong directory. `backend` is declared by the caller (gluon kernels
-and gluon dispatch paths pass `"gluon"`; everything else takes the `"triton"`
-default), because the two backends take disjoint config params and borrowing
-across them would be a bug. `arch=` overrides the running architecture only
-for documented compatibility fallbacks: MHC retries gfx942, and the Triton
-`fused_clamp_act_mul` path retries its legacy gfx950 table.
-
-`config_utils.py` is the shared core; each family keeps its own small loader
-module on top of it, and every function has exactly one home:
-
-| Module | Entry points |
-| ------ | ------------ |
-| `utils/config_utils.py` | `resolve_config_dir`, `load_config_json`, `select_leq_config`, path constants |
-| `utils/gemm_config_utils.py` | `get_gemm_config`, `compute_splitk_params`, `add_default_gemm_config_params`, `pick_gemm_num_stages` |
-| `utils/conv_config_utils.py` | `get_conv_config` + the shape-key formatters and table probes |
-| `utils/mhc_config_utils.py` | `get_mhc_config`, `get_mhc_post_config` |
-| `utils/moe_config_utils.py` | `get_moe_dispatch` — the only MOE config fetcher |
-| `utils/tuned_config_utils.py` | `get_tuned_kernel_config` |
-| `utils/quant_config_utils.py` | `get_quant_config` — Gluon quant launch configs |
-
-Attention and GMM kernels read their single `DEFAULT.json` straight off the
-core (`resolve_config_dir()` + `load_config_json()`); a family module earns
-its place once a family grows real selection logic.
-
-GMM's `get_config()` (`_triton_kernels/gmm.py`) supports an optional
-`"dispatch"` list per variant: each rule is
-`{"config": <name>, "min_K": int, "min_N": int, "min_avg_rows_per_group": int}`
-(omitted thresholds are 0), and the first rule with `K >= min_K`,
-`N >= min_N` and `M >= min_avg_rows_per_group * G` returns the named config
-from the same variant section. Rows are averaged (`M / G`) because the actual
-`group_sizes` stay on the device. Rules are skipped when `accumulate=True`;
-with no match, or no `"dispatch"` key, the variant's `"default"` (or
-`"accumulate"`) config is used.
-
-### How GEMM configs resolve — `get_gemm_config()`
-
-All GEMM-family kernels load configs through one function,
-`utils/gemm_config_utils.py::get_gemm_config(config_name, M, N=None, K=None,
-bounds=None, specialized_filename=None, backend="triton", B=None)`. It reads
-`<arch>/<backend>/gemm/<d_type>/DEFAULT.json` (required), overlays a
-specialized file when one matches, and returns `(config, is_tuned)`:
-
-- the config is a fresh deep copy, safe to mutate;
-- `is_tuned` is `True` only when a specialized (`N=…-K=…`, `B=…-N=…-K=…`, or
-  `specialized_filename`) file was hit. `_get_config()` passes the pair
-  through unchanged; the flag is there so callers and tuning tooling can
-  detect shapes running on untuned defaults (call sites that don't need it
-  may ignore it).
-
-The per-kernel `_get_config()` must stay a thin wrapper:
+Example: `configs/gfx950/triton/gemm/gemm_a16w16/GEMM-A16W16-N=256-K=7168.json`.
+`<d_type>` is the config name in lowercase, with `_` in place of `-`. A GEMM
+kernel loads its config with one call:
 
 ```python
 def _get_config(M: int, N: int, K: int):
-    return get_gemm_config("GEMM-A16W16", M, N, K)
-
-# Split-K kernels:
-def _get_config(M: int, N: int, K: int):
-    config, is_tuned = get_gemm_config("GEMM-A16W16", M, N, K)
-    return compute_splitk_params(config, K), is_tuned
+    return get_gemm_config("GEMM-A16W16", M, N, K)  # returns (config, is_tuned)
 ```
 
-A kernel-level `_get_config()` that takes a `backend` argument defaults it to
-`"triton"`, never to `None` — `None` is not a backend and the resolver rejects
-it. Public wrappers that expose `backend: str | None = None` normalize it
-(typically `"gluon"` on gfx1250, `"triton"` elsewhere) before calling down.
+[`configs/AGENTS.md`](configs/AGENTS.md) has the layout, the file names, the
+loaders, the JSON format and the steps to add a config. To tune a GEMM, use
+the scripts in [`utils/_triton/tuning/`](utils/_triton/tuning/README.md).
+They write the tuned files into `configs/`.
 
-Split-K kernels also share one common second-stage reduce —
-`_gemm_splitk_reduce_kernel` (and `_batched_gemm_splitk_reduce_kernel`) in
-`_triton_kernels/common/splitk_reduce.py` — rather than carrying a per-kernel
-reduce stage, regardless of whether the first-stage kernel uses Triton or
-Gluon. New split-K kernels import it from there.
+### Config-aware kernel names in traces
 
-### Config JSON format
-
-```json
-{
-  "M_LEQ_64":   { "...": "..." },
-  "M_GEQ_4096": { "...": "..." },
-  "any":        { "...": "..." }
-}
-```
-
-- `M_LEQ_x` keys are searched ascending over
-  `STANDARD_M_BOUNDS = (1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)`,
-  then `M_GEQ_x` descending, then `any`. Custom `bounds=(...)` must be strictly
-  increasing positive ints.
-- `any` must exist unless every reachable `M` hits an explicit bound — a
-  `KeyError` at lookup time usually means it's missing.
-- The old `{"small": ..., "large": ...}` shape is **banned**.
-- Each `M_*` entry carries at minimum: `BLOCK_SIZE_M`, `BLOCK_SIZE_N`,
-  `BLOCK_SIZE_K`, `GROUP_SIZE_M`, `num_warps`, `num_stages`, `waves_per_eu`,
-  `matrix_instr_nonkdim`, `cache_modifier`, `NUM_KSPLIT`.
-  (`add_default_gemm_config_params()` backfills `NUM_KSPLIT`/`cache_modifier`
-  as a last resort; that is not a license to omit keys.)
-
-### Tuning values live in JSON, never in Python
-
-No `setdefault(...)` blocks, no inline config dict literals, no
-arch-conditional constants, no hardcoded fallback configs in `.py` files. If a
-value is missing at runtime, the fix is in the JSON. The MOE a8w4 triton
-dispatch still ends in a Python default after its tuned lookup and its
-same-`(N, K)` proxy — that last tier shrinks as coverage grows; do not add
-more like it.
-
-### Loading is unified — `load_config_json()`
-
-Every config-file read goes through
-`utils/config_utils.py::load_config_json(fpath, required=...)`.
-`required=True` (the default) raises `FileNotFoundError` naming the exact
-nested path; `required=False` returns `None` for genuinely optional tables and
-the caller handles it. It is cached per path **including negative results**: a
-config file added at runtime is not picked up without
-`load_config_json.cache_clear()` or a process restart. The dict it returns is
-the shared cached object — copy before mutating (the family loaders already do
-this for their callers).
-
-Do not hand-roll `json.load(open(...))` or function-attribute caches, and
-prefer the family loaders over hand-built
-`f"{AITER_TRITON_CONFIGS_PATH}/..."` paths — a hand-built path is a second
-place the layout is encoded, and it goes stale silently.
-
-Flat dispatch tables whose keys mean “value less than or equal to this upper
-bound” use `select_leq_config(configs, value, prefix="N_LEQ_")`. It selects
-the smallest matching numeric bound and falls back to `any`, returning a copy
-that the caller may consume. Tables keyed on several axes use
-`select_leq_config(table, axes=("M", "N"), M=m, N=n)` with keys such as
-`M_LEQ_32.N_LEQ_1024`. Do not duplicate this selection loop in wrappers.
-
-Kernels that carry a Python autotune search space (opt-in tuning) pin their
-single default tile per arch via
-`utils/tuned_config_utils.py::get_tuned_kernel_config(op, config_name,
-kernel_name, fallback, backend)`, which reads the nested-layout
-`DEFAULT.json`. The `fallback` must be launchable on any arch, not fast on one.
-
-### Autotune search spaces — `autotune_configs()`
-
-Every `@triton.autotune` takes its config list from
-`utils/tuned_config_utils.py::autotune_configs(family, configs,
-default_config=None, env=None, default="0")`. Never hand it a raw list:
-
-```python
-@triton.autotune(
-    configs=autotune_configs("MY_FAMILY", _get_autotune_configs()),
-    key=[...],
-)
-```
-
-It returns every candidate while `<FAMILY>_TRITON_AUTOTUNE=1`, and exactly one
-config otherwise, so nothing benchmarks at launch. A raw list searches on every
-new key: it costs compile time, breaks CUDA-graph capture, and leaves a unit
-test's numerics dependent on whichever config the timing happened to pick that
-run. Which one gets pinned is `configs[0]` unless `default_config=` says
-otherwise, and that default should come from `get_tuned_kernel_config` so
-retuning it is a JSON edit rather than a code change.
-
-`env=` names the variable for a family that published its own before this
-convention existed, and `default=` is what an unset variable means for it —
-together they let such a family route through this helper without changing what
-it did before. `flash_attn_triton_amd/` uses both, for
-`FLASH_ATTENTION_TRITON_AMD_AUTOTUNE`, which is on by default where every other
-family is off. This covers the kernel that applies `triton.autotune()` as a call
-rather than a decorator too (`_triton_kernels/fusions/attn_res.py`, behind
-`ATTN_RES_TRITON_AUTOTUNE=1`) — a grep for the decorator misses that one.
-
-A candidate list published in the config JSON is a **search space**, not a
-launch-time list: handed straight to `@triton.autotune` it still benchmarks
-every entry on every new key. It goes to `configs`, and `default_config=` pins
-what launches — `chunk_delta_attn/flash_kda.py` reads its six K2 candidates
-through `chunk_delta_attn_tuned_config_shortlist` and pins
-`_K2_FALLBACK_CONFIG`. There are no exemptions: all 41 `@triton.autotune` sites
-under `aiter/ops/triton/` go through the helper.
-
-One consequence to know when reading the tuner: Triton consults its autotune
-cache only when the config list holds more than one entry (`autotuner.py:235`);
-with one config it takes `configs[0]` and never reads the `key`. A test about
-the `key` therefore has to hand the autotuner a config space first — see
-`test_tuner_keeps_the_two_schedules_apart`.
-
-The unit tests do not rely on any of it: `op_tests/triton_tests/__init__.py`
-pins one config per kernel for the whole suite, so a test's numerics never
-depend on a benchmark.
-
-### Config naming
-
-| Kind             | Pattern                                                        |
-| ---------------- | -------------------------------------------------------------- |
-| Basic GEMM       | `GEMM-A{x}W{y}` (+ variants `_BLOCKSCALE`, `_PRESHUFFLED`, ...) |
-| Batched GEMM     | `BATCHED_GEMM-A{x}W{y}`, specialized `-B={B}-N={N}-K={K}`       |
-| Fused ops        | `FUSED-GEMM-{operation}`                                        |
-| Feed-forward     | `FF-A{x}W{y}-fused`                                             |
-| MOE              | `A8W4`, `A4W4` — dispatch tables, one `DEFAULT.json` per backend |
-
-- **`K` in AFP4WFP4 filenames is the logical K, i.e. `2 * K_bytes`** — the
-  wrapper doubles K before calling `get_gemm_config`. Tuning output named by
-  the packed byte width will never be found.
-- MOE dispatch tables are keyed `bm<block_m>_n<N>_k<K>` on the triton path and
-  `bm<block_m>_n<N>_k<K>_<bucket>` (plus a `bm<block_m>_any` tier) on the
-  gluon path — a different scheme per backend, which is why `backend` is a
-  caller-declared argument. Never mix a MOE dispatch key with the GEMM
-  `M_LEQ_x`/`M_GEQ_y` scheme in either direction.
-- `configs/gemm/aot/` and `configs/paged_mqa_logits/aot/` are runtime AOT
-  caches, not tuning configs — never check them in or migrate them.
-
-For adding a config, seeding a new arch, and the per-family key schemes, follow
-`configs/CLAUDE.md` (§5 and §6). For the manual tuning flow, see
-`utils/_triton/tuning/README.md`.
-
----
-
-## Config-aware kernel names in traces (`kernel_repr`)
-
-Kernel names in traces embed the compile-time config so a trace row can be
-matched to the exact tuned config
-(`utils/_triton/kernel_repr.py::make_kernel_repr`):
+`make_kernel_repr` puts the config values in the kernel name. Then each trace
+row shows the config that the kernel used.
 
 ```python
 _gemm_a16w16_repr = make_kernel_repr(
@@ -347,193 +167,18 @@ _gemm_a16w16_repr = make_kernel_repr(
     ["BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K", "GROUP_SIZE_M", "NUM_KSPLIT"],
 )
 
-# Triton entry kernel
-@triton.jit(repr=_gemm_a16w16_repr)
+@triton.jit(repr=_gemm_a16w16_repr)  # Gluon: @gluon.jit(repr=_gemm_a16w16_repr)
 def _gemm_a16w16_kernel(...):
     ...
-
-# Gluon uses the same make_kernel_repr callback:
-@gluon.jit(repr=_gemm_a16w16_repr)
-def _gemm_a16w16_gluon_kernel(...):
-    ...
 ```
 
-Values are read from `specialization.constants` and sanitized (`None → NONE`,
-bools → `0/1`, strings uppercased with non-alphanumerics folded to `_`).
-**Every new launchable Triton or Gluon kernel gets a `repr=`** containing its
-meaningful compile-time/tuned config keys. JIT-decorated device helpers that
-cannot be launched independently do not require their own `repr`.
+Put the compile-time and tuned config keys in the list. A device helper that
+you cannot launch alone does not need a `repr`.
 
----
-
-## Weight & scale shuffling — one home: `utils/shuffle.py`
-
-All pre-shuffle/layout-permute helpers for weights and scales were unified
-into `aiter/ops/triton/utils/shuffle.py`. Kernel
-wrappers, Gluon paths, tests, and benchmarks import from there — the
-per-kernel copies that used to live in `moe_op_gemm_*.py` and test files were
-deleted. **Do not re-implement a shuffle** (the telltale is a local
-`view → permute → contiguous` helper); if a new layout is needed, add it here.
-
-| Function                 | Purpose                                                                 |
-| ------------------------ | ----------------------------------------------------------------------- |
-| `shuffle_weight(x, ...)` | Arch-aware weight preshuffle: gfx1250 WMMA/TDM path, otherwise delegates to `aiter.ops.shuffle.shuffle_weight` |
-| `moe_weight_decode_view(w)` | Zero-copy `(E, N, K)` → decode view sharing storage (renamed from `moe_weight_gfx1250_decode_view`) |
-| `shuffle_scale_gemm` / `unshuffle_scale_gemm` | GEMM MX-scale tiles — gfx950 `(32, 8)`, gfx1250 `(16, 4)` |
-| `shuffle_scale_moe`      | MoE MX scales (a8w4/a8w8/a16w4/a4w4); `return_layout=True` also returns the `SWIZZLE_MX_SCALE` label (`CDNA4_SCALE`/`GFX1250_SCALE`); no-op on arches without a native layout (e.g. gfx942) |
-| `shuffle_scale_batched`  | FP4 blockscale16 batched scales, arch-independent                        |
-
-Callers should stay arch-agnostic: pass `arch=None` and let `get_arch()`
-decide, and use `return_layout=True` instead of hardcoding swizzle labels.
-
----
-
-## Architecture naming
-
-Key behavior off GPU architecture identifiers, never product names — in
-directory names (`configs/gfx950/...`) and in code:
-
-```python
-DEVICE_ARCH = arch_info.get_arch()
-
-if DEVICE_ARCH in ("gfx950", "gfx1250"):   # correct
-    ...
-# Never: parsing "MI300"/"MI350" product strings or comparing chip numbers.
-```
-
----
-
-## Docstrings
-
-Every public wrapper carries a docstring stating what the kernel computes, the
-args (including which config parameters apply and what they control), the
-return value, and any special considerations (unsupported options, layout
-expectations such as "weights must be pre-shuffled", etc.).
-
----
-
-## Logging
-
-Use the aiter logger, not `print`, and pass the values rather than formatting
-them into the message:
-
-```python
-from aiter import logger
-
-logger.info("resolved config for M=%d N=%d: %s", M, N, config)   # lazy
-# not: logger.info(f"resolved config for M={M} N={N}: {config}") # built every call
-```
-
-An f-string is evaluated before the level check, so it costs a full format on
-every call even when the record is below the configured level — and for a
-kernel wrapper that can mean formatting a tensor repr per launch. Match the
-placeholder to the value: `%d` for counts and dimensions, `%f` for thresholds
-and real scalars, `%s` for tensors, `torch.Size` shapes, tuples and strings.
-`%d` or `%f` on `None` raises when the record is emitted, which logging
-reports as `--- Logging error ---` on stderr instead of raising, so use `%s`
-for anything optional:
-
-```python
-logger.info("%s", 1.0)    # ok
-logger.info("%s", None)   # ok
-logger.info("%f", 1.0)    # ok
-logger.info("%f", None)   # TypeError: must be real number, not NoneType
-```
-
-The signature is the thing to check: a parameter annotated `float | None` or
-`int | None` takes `%s` even where the call site happens to have resolved it.
-
-An exception is not an argument to format. `logging` renders the traceback
-itself, so pass `exc_info=True` rather than `%s`-ing the caught object.
-`AiterTritonLogger` forwards only `*args`, so reach the stdlib logger for that:
-
-```python
-except Exception:
-    logger.warning("config parse error", exc_info=True)                 # aiter.logger
-    _LOGGER.get_logger().warning("config parse error", exc_info=True)   # AiterTritonLogger
-```
-
-Gate verbose output with `logger.debug(...)`, not with an `if` around the
-call; `AITER_LOG_LEVEL=DEBUG` turns it on, and `aiter/__init__.py` applies
-that to the logger and its handler together. Never lower the level by hand
-after import (`logger.setLevel(...)` leaves the handler where it was) and
-never call `logging.basicConfig(...)` from library code.
-
-## Tests
-
-Tests live under `op_tests/triton_tests/`, mirroring the wrapper folder
-structure in this directory, including nested wrapper subpackages:
+### Run tests and benchmarks
 
 ```bash
-pytest op_tests/triton_tests/              # everything
-pytest op_tests/triton_tests/gemm/basic/   # one subset
+pytest op_tests/triton_tests/              # all tests
+pytest op_tests/triton_tests/gemm/basic/   # one folder
+python op_tests/op_benchmarks/triton/bench_gemm_a16w16.py
 ```
-
----
-
-## Checklist for a new kernel
-
-- Reuse first: check `utils/`, `_triton_kernels/common/`, and existing
-  kernels before writing new helpers — don't duplicate code that already
-  exists in the tree.
-- Wrapper in the right category folder; Triton kernel body under
-  `_triton_kernels/` or Gluon kernel body under `_gluon_kernels/<arch>/` at
-  the same category path, launched only through the wrapper. JIT-decorated
-  device helpers may remain with the entry kernel they support. No new
-  top-level flat files.
-- `_get_config()` is a thin `get_gemm_config(...)` call; split-K goes through
-  `compute_splitk_params()`. No tuning values in Python.
-- Config JSON in the **nested layout** (`configs/<arch>/<backend>/<op>/<d_type>/`),
-  `M_LEQ/M_GEQ/any` keys, all required params present.
-- `make_kernel_repr(...)` + `@triton.jit(repr=...)` for Triton entry kernels,
-  `@gluon.jit(repr=...)` for Gluon entry kernels.
-- Weight/scale shuffling imported from `utils/shuffle.py`.
-- Arch checks against `gfx*` identifiers.
-- Wrapper docstring.
-- Unit test under `op_tests/triton_tests/<category>/` and a benchmark script
-  under `op_tests/op_benchmarks/triton/bench_<op>.py` — a kernel ships as
-  kernel + wrapper + test + benchmark.
-
-## PR Checklist
-
-- The PR must have a clear description covering the following topics:
-  - **Motivation:** What's the purpose of the PR? Are you fixing something that is broken? Why are
-    you adding a new feature? Are you shipping an optimization?
-  - **Technical details:** Describe the implementation details in prose since the diff hunk already
-    has the code changes. You can include important code snippets, but please be brief. It's nice to
-    document edge cases and uncovered scenarios. Focus on the hard parts of the code and provide
-    guidance to the reviewers (what's the trickiest part, what to pay attention to). Add performance
-    data for optimizations, as well as documentation of the benchmark procedures.
-  - **Test plan:** How can you guarantee that the proposed changes are correct, both in terms of
-    functionality and performance? Does everything that worked before still work? Pay attention to
-    GPU architectures other than your target.
-  - **Test results:** Share the outcome of your test plan.
-- Be responsible for your PR:
-  - You, as the PR author, should be listed in the **Assignees** field. Add someone else from your
-    team if you're going to be absent (vacation, PTO, extended holidays) and hand over to them the
-    responsibility for moving the PR forward
-  - Be a responsive collaborator. Answer questions asked by reviewers and address the suggestions
-    that make sense. Code owners can, and will, close the PR if it's stale for a long time.
-  - Do not let your coding agents open a PR and leave it rotting. Please follow along.
-- Add labels:
-  - The **Triton/Gluon** label is added automatically based on the changed files, making related PRs
-    easy for maintainers to find. Please double check if **Triton/Gluon** label is automatically
-    added and do it manually if it's absent.
-  - **gfx942** Triton CI is now opt-in, add **ci:triton-300x** label if you are touching anything
-    **gfx942**-related.
-- PR size:
-  - Do not blindly submit a giant AI-slop mess. Code owners will close the PR if they judge it
-    unreviewable.
-  - Prefer many small PRs over a single giant PR. Structure your code changes in a logical way,
-    starting from the foundations. You can use a series of stacked PRs to build the final desired
-    outcome incrementally.
-- Perform an initial self-review to catch basic mistakes before requesting a review from someone
-  else. Reviewer time is precious in the age of agentic coding tools.
-- Sometimes, as the PR evolves, its title and description get outdated. Please double check if the
-  PR information is up to date before merging.
-- Open the PR from [AITER ROCm fork](https://github.com/ROCm/aiter). Open the PR from your own fork
-  only if you don't have access to AITER ROCm fork.
-- Strip the **Co-authored-by: AI agent** part of your commits before merging.
-
-**Warning:** PRs that don't comply with the checklist won't be reviewed or merged. Please be a good
-AITER citizen and follow best practices.
