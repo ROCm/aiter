@@ -296,11 +296,18 @@ def build_hstu_attention_bwd_fused_pp(
     # giving the waves private addresses or by the bank padding, so it is the
     # instruction and not contention. It cost 1520 ms of a 1915 ms kernel.
     DQW_ELEMS = NUM_WAVES * BLOCK_N * DQ_PAD
-    # Group-exchange buffer. Two rows past the tile: row BLOCK_N is g0's write
-    # sink and row BLOCK_N+1 is a permanently-zero source for g1's read, which
-    # is how the exchange stays branch-free.
-    DQG_SINK, DQG_ZERO = BLOCK_N, BLOCK_N + 1
-    DQG_ELEMS = (BLOCK_N + 2) * DQ_PAD
+    # Group-exchange buffer. Past the tile sit BLOCK_N sink rows for g0's
+    # discarded write and one permanently-zero row for g1's read, which is how
+    # the exchange stays branch-free.
+    #
+    # A SINGLE sink row would be a 4-way bank conflict for half the workgroup:
+    # the row index is then constant across lanes, so all four quarter-waves
+    # address the same 64 dwords (measured 64 of 256 distinct). One sink row
+    # per flush row restores g1's spread -- consecutive rows are DQ_PAD apart,
+    # which is 4 banks.
+    DQG_SINK, DQG_ZERO = BLOCK_N, 2 * BLOCK_N
+    DQG_ROWS = 2 * BLOCK_N + 1
+    DQG_ELEMS = DQG_ROWS * DQ_PAD
     # 4 contiguous outputs per lane: 16 rows x 16 lanes x 4 = BLOCK_N*head_dim.
     DQ_PER_LANE = BLOCK_N * head_dim // (NUM_WAVES // 2 * WARP_SIZE)
     DQ_LANES_PER_ROW = head_dim // DQ_PER_LANE
@@ -525,7 +532,7 @@ def build_hstu_attention_bwd_fused_pp(
         )
         dqg = lds.dqg.view(
             fx.make_layout(
-                (BLOCK_N + 2, head_dim // DQ_PER_LANE, DQ_PER_LANE),
+                (DQG_ROWS, head_dim // DQ_PER_LANE, DQ_PER_LANE),
                 (DQ_PAD, DQ_PER_LANE, 1),
             )
         )
@@ -1067,10 +1074,27 @@ def build_hstu_attention_bwd_fused_pp(
         # g1 writes its group sum to the row g0 will read; g0 writes to the
         # sink row and reads the real one. g1 reads the permanently-zero row,
         # so it adds nothing. No branch, and neither group idles.
-        dq_wrow = is_g0.select(fx.Int32(DQG_SINK), dq_frow)
+        dq_wrow = is_g0.select(fx.Int32(DQG_SINK) + dq_frow, dq_frow)
         dq_rrow = is_g0.select(dq_frow, fx.Int32(DQG_ZERO))
 
-        def dq_reduce_flush(q_tile_v):
+        def dq_flush_issue():
+            """Issue the five flush reads and nothing else.
+
+            Called at the TOP of phase V and consumed at the BOTTOM, so the
+            whole SiLU/SiLU' chain -- ~10 deep per element with two
+            quarter-rate transcendentals -- sits between each read and its
+            `s_waitcnt`. Nothing in the gate touches these registers, so it is
+            free cover; the cost is 20 VGPR live across the phase.
+            """
+            return (
+                [
+                    Vec(dqw[dq_wbase + fx.Int32(w), dq_frow, dq_fvec, None].load())
+                    for w in range_constexpr(NUM_WAVES // 2)
+                ],
+                Vec(dqg[dq_rrow, dq_fvec, None].load()),
+            )
+
+        def dq_reduce_flush(q_tile_v, _issued):
             """Sum the 8 per-wave dQ partials for q tile `q_tile_v - 1` and store.
 
             Runs in phase V, not phase M, and that placement is forced. Within
@@ -1101,22 +1125,14 @@ def build_hstu_attention_bwd_fused_pp(
             # `ds_read_b128` alone (5.7% of all stall, 239/exec). Four live
             # buffers cost 16 VGPR against 46 spare, and push every `lgkmcnt`
             # further from the read it covers.
-            _vs = [
-                Vec(dqw[dq_wbase + fx.Int32(w), dq_frow, dq_fvec, None].load())
-                for w in range_constexpr(NUM_WAVES // 2)
-            ]
-            # FIFTH read, issued with the other four and consumed last. The
-            # group-exchange row depends on nothing computed in this phase --
-            # the other group published it a full barrier ago -- so its only
-            # reason to sit after the write below was program order. Behind the
-            # write it had ZERO cover: the trace showed it immediately followed
-            # by its own `lgkmcnt(0)`. Here the twelve adds cover it.
-            #
-            # Safe in either order, and the backend may not see that: the two
-            # rows are disjoint. g1 writes `dq_frow` and reads the
-            # permanently-zero row; g0 writes the sink row and reads the one g1
-            # published last interval. Neither group ever reads what it wrote.
-            _g = Vec(dqg[dq_rrow, dq_fvec, None].load())
+            # All five reads were issued by `dq_flush_issue` at the top of the
+            # phase. The group-exchange read is one of them: it depends on
+            # nothing computed here -- the other group published that row a
+            # full barrier ago -- and the two rows are disjoint, so it is safe
+            # ahead of the write below. g1 writes `dq_frow` and reads the
+            # permanently-zero row; g0 writes a sink row and reads the one g1
+            # published last interval. Neither group reads what it wrote.
+            _vs, _g = _issued
 
             acc = [fx.Float32(0.0) for _ in range_constexpr(DQ_PER_LANE)]
             for w in range_constexpr(NUM_WAVES // 2):
@@ -1342,7 +1358,7 @@ def build_hstu_attention_bwd_fused_pp(
             are otherwise idle for the whole interval.
             """
             if const_expr(dq_mode in ("full", "dswrite", "notrans")):
-                dq_reduce_flush(q_start // fx.Int32(BLOCK_N))
+                _dq_issued = dq_flush_issue()
             # Batched a stage at a time across ALL KV_OWNED_SUBTILES *
             # MFMA_ELEMS_PER_LANE elements, not one element at a time. The gate
             # is a ~10-deep serial dependency chain per element with two
@@ -1400,6 +1416,9 @@ def build_hstu_attention_bwd_fused_pp(
                 pack_bf16_perm(ds_vals[og * e : og * e + e])
                 for og in range_constexpr(KV_OWNED_SUBTILES)
             ]
+            # Consumed LAST, so the gate above is the reads' cover.
+            if const_expr(dq_mode in ("full", "dswrite", "notrans")):
+                dq_reduce_flush(q_start // fx.Int32(BLOCK_N), _dq_issued)
             return p_packs, ds_packs
 
         # ---- the pipeline ---------------------------------------------------
