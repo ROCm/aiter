@@ -4,7 +4,7 @@ import torch
 import triton
 
 import aiter
-from aiter.ops.triton._triton_kernels.activation import (
+from aiter.ops.triton._triton_kernels.fusions.activation import (
     _act_mul_and_dynamic_fp8_group_quant_kernel,
     _act_mul_and_dynamic_mxfp4_quant_kernel,
     _silu_and_mul_backward_kernel,
