@@ -817,25 +817,33 @@ _LSE_CAPABLE_QV = frozenset(
 )
 
 
-def _check_lse_capable(
+def _lse_unsupported(
     q_format: AttentionFormat, v_format: AttentionFormat, sparse: bool
-) -> None:
-    """Reject LSE where the exported value has not been measured."""
+) -> Optional[str]:  # noqa: UP045
+    """Why MHA v4 cannot export the LSE for these operands, or None if it can."""
     if sparse:
-        raise NotImplementedError(
-            "MHA v4 does not produce LSE on the sorted-sparse path yet"
-        )
+        return "MHA v4 does not produce LSE on the sorted-sparse path yet"
     arch = get_gfx()
     if arch != "gfx950":
         # The gfx942 objects do carry the epilogue, but they predate the frozen-max correction
         # and their LSE has never been compared against torch.logsumexp. O never reads LSE, so
         # passing every output test says nothing about it. Lift this once MI300 is measured.
-        raise NotImplementedError(f"MHA v4 LSE is not validated on {arch} yet")
+        return f"MHA v4 LSE is not validated on {arch} yet"
     if (q_format, v_format) not in _LSE_CAPABLE_QV:
-        raise NotImplementedError(
+        return (
             f"MHA v4 LSE is not implemented for Q={q_format.name} "
             f"V={v_format.name} yet"
         )
+    return None
+
+
+def _check_lse_capable(
+    q_format: AttentionFormat, v_format: AttentionFormat, sparse: bool
+) -> None:
+    """Reject LSE where the exported value has not been measured."""
+    reason = _lse_unsupported(q_format, v_format, sparse)
+    if reason is not None:
+        raise NotImplementedError(reason)
 
 
 # (q_format, v_format) rows whose code object consumes the seqlens_k kernarg. Every dense source
@@ -1207,6 +1215,7 @@ def mha_v4_kv_splits(
 
     A dense launch runs one work-group per (batch, head, 256-row query tile), so a short
     sequence with few heads leaves most CUs idle: [1, 4352, 3] fills 51 of MI355X's 256.
+    The CU count is the device's own, so each SKU and partition mode gets its own split.
     Splitting the keys into n ranges folded into the batch multiplies the grid by n at the cost
     of a merge pass. This takes the largest n that still fits the grid in one wave, divides the
     key length and leaves each range at least _MHA_V4_MIN_KV_SPLIT_TOKENS keys; a grid that
@@ -1224,6 +1233,7 @@ def mha_v4_kv_splits(
 def _resolve_kv_splits(
     kv_splits: Union[int, str],  # noqa: UP007
     recipe: _RawRecipePlan,
+    q_format: AttentionFormat,
     v_format: AttentionFormat,
     q: Tensor,
     k: Tensor,
@@ -1234,7 +1244,14 @@ def _resolve_kv_splits(
         recipe.kind != _RawRecipeKind.FP8 or _is_fp8_format(v_format)
     )
     if kv_splits == "auto":
-        if not capable or sparse or varlen or get_gfx() != "gfx950":
+        # The ranges are merged by their LSE, so auto splits wherever the LSE gate admits these
+        # operands rather than naming an arch: lifting that gate for an arch enables both.
+        if (
+            not capable
+            or sparse
+            or varlen
+            or _lse_unsupported(q_format, v_format, False) is not None
+        ):
             return 1
         return mha_v4_kv_splits(
             q.shape[0], q.shape[1], q.shape[2], k.shape[1], q.device
@@ -1254,7 +1271,7 @@ def _resolve_kv_splits(
             f"kv_splits is implemented for per-tensor operands (BF16, BF16/FP8, INT8/FP8 and "
             f"FP8/FP8), not recipe {recipe.kind.name} with V {v_format.name}"
         )
-    _check_lse_capable()
+    _check_lse_capable(q_format, v_format, False)
     if k.shape[1] % kv_splits:
         raise ValueError(
             f"kv_splits={kv_splits} must divide the key length {k.shape[1]}"
@@ -1395,8 +1412,9 @@ def mha_v4(
     launch and merged by their LSE, for grids too small to fill the GPU: a short sequence with
     few heads. ``"auto"`` picks the count with mha_v4_kv_splits() and falls back to 1 wherever
     splitting is unsupported. Operands are quantized once, before the split, so per-tensor
-    scales stay global. gfx950 only, for BF16, BF16/FP8, INT8/FP8 and FP8/FP8 operands,
-    without ``block_mask`` or ``seqlens_k``; an explicit count must divide the key length.
+    scales stay global. For BF16, BF16/FP8, INT8/FP8 and FP8/FP8 operands wherever MHA v4
+    exports their LSE (gfx950 today), without ``block_mask`` or ``seqlens_k``; an explicit
+    count must divide the key length.
     """
     if return_lse:
         _check_lse_capable(q_format, v_format, block_mask is not None)
@@ -1421,7 +1439,7 @@ def mha_v4(
     )
     q_scale_mode, k_scale_mode, v_scale_mode = recipe.scale_modes
     splits = _resolve_kv_splits(
-        kv_splits, recipe, v_format, q, k, sparse, seqlens_k is not None
+        kv_splits, recipe, q_format, v_format, q, k, sparse, seqlens_k is not None
     )
 
     # Every quantized K path fuses the subtraction into its rotation kernel, except INT8, whose

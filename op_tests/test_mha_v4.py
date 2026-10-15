@@ -1254,6 +1254,36 @@ def test_mha_v4_kv_splits_auto_fills_one_wave(monkeypatch):
     assert mha_v4_kv_splits(1, 256, 1, 1000) == 1
 
 
+@pytest.mark.parametrize(
+    ("cus", "splits"),
+    [(304, 16), (256, 16), (228, 8), (80, 4)],
+    ids=["MI300X", "MI355X", "MI300A", "MI308X"],
+)
+def test_mha_v4_kv_splits_auto_follows_the_cu_count(monkeypatch, cus, splits):
+    """Each SKU sizes the split by its own CU count: 16 work-groups fill a different wave on each."""
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device=None: type("Props", (), {"multi_processor_count": cus})(),
+    )
+    assert mha_v4_kv_splits(1, 4096, 1, 8192) == splits
+
+
+def test_mha_v4_kv_splits_follow_the_lse_gate(monkeypatch):
+    """The ranges merge by their LSE, so where the LSE gate refuses, auto is 1 and a count raises."""
+    monkeypatch.setattr(mha_v4_module, "get_gfx", lambda: "gfx942")
+    q = torch.randn((1, 1024, 1, 128), device="cuda", dtype=torch.bfloat16)
+    bf16 = (AttentionFormat.BF16,) * 3
+    recipe = mha_v4_module._resolve_raw_recipe(*bf16, None, None, None, sparse=False)
+
+    assert (
+        mha_v4_module._resolve_kv_splits("auto", recipe, *bf16[::2], q, q, False, False)
+        == 1
+    )
+    with pytest.raises(NotImplementedError, match="not validated on gfx942"):
+        mha_v4(q, q, q, *bf16, kv_splits=2)
+
+
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
 def test_mha_v4_kv_splits_auto_leaves_unsupported_calls_unsplit():
     """auto is a performance hint: where splitting is unsupported it must run the plain call."""
