@@ -5,14 +5,28 @@
     "BLOCK_SIZE_K": 256,
     "num_warps": 4,
     "NUM_BUFFERS": 2,
-    "num_ctas": 1
+    "num_ctas": 1,
+    "GROUP_M": 1,
+    "B2B_WMMA": 0
   },
-  "any": {
+  "M_LEQ_256": {
     "BLOCK_SIZE_M": 256,
     "BLOCK_SIZE_N": 256,
     "BLOCK_SIZE_K": 256,
     "num_warps": 4,
     "NUM_BUFFERS": 4,
-    "num_ctas": 1
+    "num_ctas": 1,
+    "GROUP_M": 1,
+    "B2B_WMMA": 0
+  },
+  "any": {
+    "BLOCK_SIZE_M": 512,
+    "BLOCK_SIZE_N": 1024,
+    "BLOCK_SIZE_K": 256,
+    "num_warps": 4,
+    "NUM_BUFFERS": 4,
+    "num_ctas": 8,
+    "GROUP_M": 8,
+    "B2B_WMMA": 1
   }
 }
