@@ -710,33 +710,31 @@ def _init_dualwave_thread_mapping(ctx):
     Sets h_idx / q_block_idx / batch_idx / split_idx and the lane decomposition."""
     traits = ctx.traits
     batch_interleave_group = traits.BATCH_INTERLEAVE_GROUP
-    # fx.Index over gpu.block_idx: gpu.block_id is not in the stable gpu.__all__ at
-    # v0.3.4.1, and fx.Int64(gpu.block_idx.*) materializes an i32 first.
     if const_expr(batch_interleave_group > 1):
-        linear_head_batch = fx.Index(gpu.block_idx.x)
+        linear_head_batch = fx.Int64(fx.block_idx.x)
         ctx.h_idx = linear_head_batch % traits.NUM_HEADS_Q
         ctx.batch_idx = (
-            fx.Index(gpu.block_idx.z) * batch_interleave_group
+            fx.Int64(fx.block_idx.z) * batch_interleave_group
             + linear_head_batch // traits.NUM_HEADS_Q
         )
         if const_expr(traits.GQA_PACK_M):
             ctx.h_idx = linear_head_batch % traits.NUM_HEADS_KV
             ctx.batch_idx = (
-                fx.Index(gpu.block_idx.z) * batch_interleave_group
+                fx.Int64(fx.block_idx.z) * batch_interleave_group
                 + linear_head_batch // traits.NUM_HEADS_KV
             )
-        ctx.q_block_idx = fx.Index(gpu.block_idx.y)
+        ctx.q_block_idx = fx.Int64(fx.block_idx.y)
     else:
-        ctx.h_idx = fx.Index(gpu.block_idx.x)
-        ctx.q_block_idx = fx.Index(gpu.block_idx.y)
+        ctx.h_idx = fx.Int64(fx.block_idx.x)
+        ctx.q_block_idx = fx.Int64(fx.block_idx.y)
     if const_expr(traits.SPLITK):
-        ctx.bz_idx = fx.Index(gpu.block_idx.z)
+        ctx.bz_idx = fx.Int64(fx.block_idx.z)
         ctx.batch_idx = ctx.bz_idx // traits.NUM_KV_SPLITS
         ctx.split_idx = ctx.bz_idx % traits.NUM_KV_SPLITS
     elif const_expr(batch_interleave_group > 1):
         ctx.split_idx = None
     else:
-        ctx.batch_idx = fx.Index(gpu.block_idx.z)
+        ctx.batch_idx = fx.Int64(fx.block_idx.z)
         ctx.split_idx = None
     ctx.tid = fx.Index(gpu.thread_idx.x)
 
@@ -778,10 +776,13 @@ def _init_dualwave_q_row(ctx):
     ctx.q_start_pos_i32 = fx.Int32(ctx.q_start + ctx.wave_id_uni * traits.ROWS_PER_WAVE)
     ctx.q_row = ctx.q_start + ctx.q_row_in_block
     if const_expr(traits.GQA_PACK_M):
-        # Manual quotient/remainder: idx2crd would emit a modulo for every mode,
-        # including the outermost, where the plain division suffices.
-        ctx.q_row = ctx.q_start + ctx.q_row_in_block // traits.GQA_GROUP_SIZE
-        ctx.q_head_row = ctx.q_head_idx + ctx.q_row_in_block % traits.GQA_GROUP_SIZE
+        packed_rows = fx.make_layout(
+            (traits.BLOCK_M // traits.GQA_GROUP_SIZE, traits.GQA_GROUP_SIZE),
+            (traits.GQA_GROUP_SIZE, 1),
+        )
+        coord = fx.idx2crd(fx.Int64(ctx.q_row_in_block), packed_rows)
+        ctx.q_row = ctx.q_start + fx.Int64(coord[0].unpack())
+        ctx.q_head_row = ctx.q_head_idx + fx.Int64(coord[1].unpack())
         ctx.q_start_pos_i32 = fx.Int32(
             ctx.q_start
             + ctx.wave_id_uni * traits.ROWS_PER_WAVE // traits.GQA_GROUP_SIZE
@@ -886,7 +887,7 @@ class DualwaveFp8KernelContext:
         if const_expr(traits.GQA_PACK_M):
             block_q = traits.BLOCK_M // traits.GQA_GROUP_SIZE
         num_q_blocks = (self.seq_len_v + block_q - 1) // block_q
-        self.q_block_idx = num_q_blocks - 1 - fx.Index(gpu.block_idx.y)
+        self.q_block_idx = num_q_blocks - 1 - fx.Int64(fx.block_idx.y)
         self.q_start = self.q_block_idx * block_q
 
     def init_lds(self, shared_storage):

@@ -12,6 +12,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
+from aiter.ops.flydsl.kernels.fmha_gfx950.operand_layouts import probability_swap_pairs
 from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
     DualwaveFp8KernelContext,
     _anchor_v_o,
@@ -129,21 +130,23 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
             words = Vec(packed)
             pair_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
             reordered = []
-            for base in range_constexpr(0, 8, 4):
-                for i in range_constexpr(2):
-                    # No stable dual-output lane-swap API at v0.3.4.1; fx.gpu.shuffle_xor
-                    # is not one-for-one (single result, different lowering).
-                    pair = rocdl.permlane32_swap(
-                        pair_ty,
-                        fx.as_ir_value(words[base + i]),
-                        fx.as_ir_value(words[base + i + 2]),
-                        False,
-                        False,
-                    )
-                    reordered += [
-                        fx.Int32(llvm.extractvalue(T.i32, pair, [0])),
-                        fx.Int32(llvm.extractvalue(T.i32, pair, [1])),
-                    ]
+            pairs = probability_swap_pairs()
+            for i in range_constexpr(len(pairs)):
+                first, second = pairs[i]
+                # Raw rocdl op: stable fx.gpu.shuffle_xor returns one value per call, so replacing
+                # the dual-output swap needs extra selects/moves (+~10% main-loop VALU on shuffled
+                # BN64/paged, -5-6% prefill on gfx950). No stable dual-output swap at v0.3.4.1.
+                pair = rocdl.permlane32_swap(
+                    pair_ty,
+                    fx.as_ir_value(words[first]),
+                    fx.as_ir_value(words[second]),
+                    False,
+                    False,
+                )
+                reordered += [
+                    fx.Int32(llvm.extractvalue(T.i32, pair, [0])),
+                    fx.Int32(llvm.extractvalue(T.i32, pair, [1])),
+                ]
             packed = Vec.from_elements(reordered, fx.Int32).ir_value()
         return packed
 

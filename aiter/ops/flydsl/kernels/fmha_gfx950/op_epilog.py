@@ -47,8 +47,9 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
 
     def _swap_half_partner(self, dw):
         pair_i32_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
-        # No stable dual-output lane-swap API at v0.3.4.1; fx.gpu.shuffle_xor is not
-        # one-for-one (single result, different lowering).
+        # Raw rocdl op: stable fx.gpu.shuffle_xor returns one value per call, so replacing
+        # the dual-output swap needs extra selects/moves (+~10% main-loop VALU on shuffled
+        # BN64/paged, -5-6% prefill on gfx950). No stable dual-output swap at v0.3.4.1.
         swapped = rocdl.permlane32_swap(
             pair_i32_ty, as_mlir_value(dw), as_mlir_value(dw), False, False
         )

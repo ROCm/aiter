@@ -10,6 +10,12 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.ops.flydsl.kernels.fmha_gfx950.operand_layouts import (
+    k_stripe_layout,
+    shuffled_v_copy,
+    shuffled_v_layout,
+    shuffled_v_tokens,
+)
 from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
     DualwaveFp8KernelContext,
     _ds_read_tr8_b64_imm,
@@ -132,12 +138,20 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
 
     def _load_k_bn64(self, k_div, tile_start, k_lds_byte_base):
         traits = self.traits
+        ownership = k_stripe_layout(traits.HEAD_DIM, traits.VEC_KV)
+        logical = fx.make_layout((traits.BLOCK_N, traits.HEAD_DIM), (1, traits.BLOCK_N))
         for pas in range_constexpr(2):
             stripe = self.wave_id_uni + pas * traits.NUM_WAVES
-            n_in_tile = (
-                (self.lane_in_warp // 8) * 8 + self.wave_id + pas * traits.NUM_WAVES
+            element = fx.crd2idx(
+                (
+                    fx.Int32(self.lane_in_warp),
+                    fx.Int32(self.wave_id) + pas * traits.NUM_WAVES,
+                ),
+                ownership,
             )
-            global_d = (self.lane_in_warp % 8) * traits.VEC_KV
+            coord = fx.idx2crd(element, logical)
+            n_in_tile = fx.Index(fx.get(coord, 0))
+            global_d = fx.Index(fx.get(coord, 1))
             src_elem = (
                 self.kv_gmem_elem_offset + n_in_tile * self.stride_kv_n_v + global_d
             )
@@ -344,13 +358,29 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
         traits = self.traits
         aligned_base = ((self.lds_vt_base_idx + 127) // 128) * 128
         tile_base = aligned_base + buf_id * traits.BLOCK_N * traits.HEAD_DIM_V
-        d_lane = fx.Int32(self.lane % 32)
-        lane_half = fx.Int32(self.lane // 32)
+        copy_atom, thr_copy = shuffled_v_copy(self.lane)
+        ptr_ty = fx.PointerType.get(
+            fx.Float8E4M3FN.ir_type, fx.AddressSpace.Shared, alignment=16
+        )
+        vt_base = fx.recast_iter(ptr_ty, self.lds.vt.ptr)
+        tile = fx.make_view(
+            fx.add_offset(vt_base, fx.Int32(tile_base - self.lds_vt_base_idx)),
+            shuffled_v_layout(traits.HEAD_DIM_V),
+        )
+        source = thr_copy.partition_S(tile)
+        token_layout = shuffled_v_tokens()
         masks = []
         if const_expr(mask_tail):
             for half in range_constexpr(2):
                 for word in range_constexpr(4):
-                    token = fx.Int32(tile_start) + lane_half * 16 + half * 32 + word * 4
+                    token = fx.Int32(tile_start) + fx.Int32(
+                        fx.get_scalar(
+                            fx.crd2idx(
+                                (fx.Int32(self.lane), half * 16 + word * 4),
+                                token_layout,
+                            )
+                        )
+                    )
                     count = self.seqlen_kv_i32 - token
                     count = (count > 0).select(count, fx.Int32(0))
                     count = (count < 4).select(count, fx.Int32(4))
@@ -360,19 +390,10 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
                     masks.append((count > 0).select(mask, fx.Int32(0)))
         packs = [[None] * traits.D_CHUNKS for _ in range(4)]
         for dc in range_constexpr(traits.D_CHUNKS):
-            d = fx.Int32(32 * dc) + d_lane
             for half in range_constexpr(2):
-                byte_off = fx.Int32(
-                    tile_base + (lane_half + 2 * half) * traits.HEAD_DIM_V * 16 + d * 16
-                )
-                ptr_ty = fx.PointerType.get(
-                    fx.Int8.ir_type, fx.AddressSpace.Shared, alignment=16
-                )
-                vt_base = fx.recast_iter(ptr_ty, self.lds.vt.ptr)
-                ptr = fx.add_offset(
-                    vt_base, fx.Int32(byte_off - fx.Int32(self.lds_vt_base_idx))
-                )
-                words = fx.ptr_load(ptr, result_type=Vec.make_type(4, fx.Int32))
+                fragment = fx.make_rmem_tensor(16, fx.Float8E4M3FN)
+                fx.copy(copy_atom, source[(None, half), dc, 0], fragment)
+                words = Vec(fragment.load()).bitcast(fx.Int32)
                 if const_expr(mask_tail):
                     # Integer masks remove invalid bytes without sanitizing valid NaNs.
                     words = words & Vec.from_elements(

@@ -66,8 +66,8 @@ class DualwaveSplitKCombineContext:
     def init_thread_mapping(self, combine_rows_per_block, combine_lanes_per_row):
         traits = self.traits
         self.tid = fx.Index(gpu.thread_idx.x)
-        self.blk = fx.Index(gpu.block_idx.x)
-        self.batch_idx = fx.Index(gpu.block_idx.y)
+        self.blk = fx.Int64(fx.block_idx.x)
+        self.batch_idx = fx.Int64(fx.block_idx.y)
         self.col = (self.tid % combine_lanes_per_row) * 4
         rows_per_batch = self.seq_len_v * traits.NUM_HEADS_Q
         row_raw = self.blk * combine_rows_per_block + self.tid // combine_lanes_per_row
