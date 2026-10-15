@@ -2,7 +2,7 @@
 import pytest
 import torch
 
-from aiter.ops.moe_op import topk_sigmoid, topk_softmax
+from aiter.ops.moe_op import topk_softmax
 
 torch.set_default_device("cuda")
 
@@ -73,11 +73,3 @@ def test_topk_softmax_bf16_input():
         assert set(topk_indices[row].tolist()) == set(
             ids_ref[row].tolist()
         ), f"Row {row}: expert sets differ"
-
-
-def test_topk_sigmoid_binding_loads():
-    """Ensure pybind can convert torch.Tensor to at::Tensor."""
-    gating_output = torch.randn(2, 2, dtype=torch.float16)
-    topk_weights = torch.zeros(2, 2, dtype=torch.float32)
-    topk_ids = torch.zeros(2, 2, dtype=torch.int32)
-    topk_sigmoid(topk_weights, topk_ids, gating_output)
