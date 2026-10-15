@@ -83,6 +83,7 @@ _ARENA_REGION_ORDER = (
     "compact_hist",
     "compact_done",
     "comb_inp",
+    "comb_scale",
     # Stage-1 flag tiles. Last, so every other region's offset stays put when
     # AITER_MEGA_S1F is off and the region is absent.
     "tile_flag",

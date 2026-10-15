@@ -18,6 +18,7 @@ from ..combine import (
 )
 from ..config import _WAVE_SIZE
 from ..recipe import _COMBINE_WIRE_QUANT, MegaMoEConfig
+from ..types import COMBINE_SCALE_BLOCK as _COMBINE_SCALE_BLOCK
 from ..types import Stage2ScatterContext
 from .base import (
     BatchLayout,
@@ -118,19 +119,27 @@ class _FusedScatterCombine:
                 f"{_COMBINE_CHUNK_ELEMS} == 0, got {config.hidden_dim}"
             )
 
+    @staticmethod
+    def _slot_count(config: MegaMoEConfig) -> int:
+        """comb_inp slots: one a route."""
+        return config.max_tokens_per_rank * config.topk
+
     @classmethod
     def regions(cls, config: MegaMoEConfig, caps=None) -> dict:
-        return {
+        slots = cls._slot_count(config)
+        regions = {
             "cross_device_barrier": config.world_size * 8,
             # Cut to the bf16 pitch whatever wire runs: it is the widest, so this
             # holds a step on any of them and a quantized one just packs into the
             # front of it at its own pitch.
-            "comb_inp": (
-                config.max_tokens_per_rank
-                * config.topk
-                * config.combine_slot_stride_bytes
-            ),
+            "comb_inp": slots * config.combine_slot_stride_bytes,
         }
+        # On a quantized wire the per-rank scatter keeps the slots' e8m0 scales
+        # in a separate [hidden/256][slot] region instead of each slot's tail,
+        # so a peer's run of slots takes them as one contiguous store per block.
+        if config.per_rank_scatter and config.combine_quant_bits:
+            regions["comb_scale"] = slots * (config.hidden_dim // _COMBINE_SCALE_BLOCK)
+        return regions
 
     def build(self, res: _EpResources) -> None:
         self.res = res
@@ -155,8 +164,11 @@ class _FusedScatterCombine:
                 tokens_per_block=toks,
                 chunks_per_iter=chunks,
                 dense_slots=(
-                    config.max_tokens_per_rank * config.topk
-                    if config.per_rank_scatter
+                    self._slot_count(config) if config.per_rank_scatter else 0
+                ),
+                scale_planar_rel=(
+                    res.arena.offset("comb_scale") - res.arena.offset("comb_inp")
+                    if config.per_rank_scatter and bits
                     else 0
                 ),
             )
@@ -179,6 +191,14 @@ class _FusedScatterCombine:
             **(batch.grouping.scatter_fields() if grouped else {}),
             combine_quant_bits=quant_bits,
             per_rank_scatter=config.per_rank_scatter,
+            **(
+                {
+                    "combine_scale_offset": arena.offset("comb_scale"),
+                    "combine_scale_slots": self._slot_count(config),
+                }
+                if config.per_rank_scatter and quant_bits
+                else {}
+            ),
         )
         return _ComputeTarget(
             scatter=scatter, dispatch_context=scatter if grouped else None

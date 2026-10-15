@@ -184,6 +184,8 @@ def build_gemm_a8w4_tdm_task(
     raw_drain=0,
     defer_c_wait=0,
     tdm_snop=0,
+    ep_scale_planar_offset=0,
+    ep_scale_planar_slots=0,
 ):
     """Build the grouped contiguous-M a8w4 TDM GEMM tile body (``gemm_task``).
 
@@ -455,12 +457,30 @@ def build_gemm_a8w4_tdm_task(
     C_ROW_BYTES = tile_n * ep_quant_bits // 8 if ep_quant_bits else tile_n * 2
     EP_SCALE_ROW_BYTES = tile_n // EP_SCALE_BLOCK
     _lds_row_bytes = _lds_pitch(C_ROW_BYTES)
-    _lds_scale_row_bytes = _lds_pitch(EP_SCALE_ROW_BYTES) if ep_quant_bits else 0
+    # The per-rank scatter on a quantized wire keeps the slots' e8m0 slices in a
+    # separate [N/256][slot] x 8 B region (planar), so a peer's run of rows
+    # stores each 256-column block's slices as one contiguous run; the staged
+    # scales are laid out [block][row] x 8 B in LDS to match.
+    _PLANAR_COLS = 256
+    _ep_planar = bool(enable_ep_scatter and ep_quant_bits and ep_scatter_per_rank)
+    if _ep_planar and not (ep_scale_planar_offset and ep_scale_planar_slots):
+        raise ValueError("the per-rank scatter on a quantized wire needs planar scales")
+    _lds_scale_row_bytes = (
+        (EP_SCALE_ROW_BYTES if _ep_planar else _lds_pitch(EP_SCALE_ROW_BYTES))
+        if ep_quant_bits
+        else 0
+    )
     _ep_scale_lds_off = tile_m * _lds_row_bytes
     c_lds_pad_elems = (_lds_row_bytes - C_ROW_BYTES) // 2 if enable_ep_scatter else 0
     store_pad = c_lds_pad_elems if enable_ep_scatter else 16
+    # A planar run store reads one slice past its last row (tdm_group1_run).
+    _scale_tail_b = 8 if _ep_planar else 0
     C_STORE_B = (
-        ((_ep_scale_lds_off + tile_m * _lds_scale_row_bytes + 127) // 128) * 128
+        (
+            (_ep_scale_lds_off + tile_m * _lds_scale_row_bytes + _scale_tail_b + 127)
+            // 128
+        )
+        * 128
         if ep_quant_bits
         else ((tile_m * (tile_n + store_pad) * 2 + 127) // 128) * 128
     )
@@ -520,7 +540,9 @@ def build_gemm_a8w4_tdm_task(
     _explicit_vgpr_partition = "_regpart" if SUPPORT_EXPLICIT_VGPR_PARTITION else ""
     _planar_lds = "_planarlds" if planar_lds_on else ""
     _interleaved_lds_load = "_interleavelds" if interleaved_lds_load_on else ""
-    _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
+    _epq = (
+        f"_epq{ep_quant_bits}{'_planar' if _ep_planar else ''}" if ep_quant_bits else ""
+    )
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
     _malign = f"_ma{m_align}" if m_align else ""
@@ -1920,6 +1942,20 @@ def build_gemm_a8w4_tdm_task(
             stage_fence(0)
             if const_expr(item_hooks is not None):
                 item_hooks[0]["epi_start"]()
+
+            def _ep_scale_lds_at(row, col_byte):
+                """LDS byte (from C's base) of a row's e8m0 scale byte ``col_byte``."""
+                return (
+                    fx.Int32(_ep_scale_lds_off)
+                    + col_byte // 8 * fx.Int32(tile_m * 8)
+                    + row * 8
+                    + col_byte % 8
+                    if const_expr(_ep_planar)
+                    else fx.Int32(_ep_scale_lds_off)
+                    + row * _lds_scale_row_bytes
+                    + col_byte
+                )
+
             is_fp4_quant = bool(stage1_quant_out and a_is_fp4)
             STORE_N = tile_n // (4 if is_fp4_quant else 2) if stage1_act else tile_n
             # Unpadded, a row is STORE_N/2 dwords (a multiple of 32), so the 16
@@ -2240,11 +2276,7 @@ def build_gemm_a8w4_tdm_task(
                         # one masked byte store per block. Each warp owns
                         # warp_tile_n/32 bytes starting at a multiple of that, so
                         # a dword store stays inside this warp's own run.
-                        _sc_byte = (
-                            row_rel * _lds_scale_row_bytes
-                            + wnb // EP_SCALE_BLOCK
-                            + _ep_scale_lds_off
-                        )
+                        _sc_col = wnb // EP_SCALE_BLOCK
                         if _is_kgrp0:
                             if const_expr(_e8m0_pack_dwords):
                                 for dw in range_constexpr(_e8m0_pack_dwords):
@@ -2253,14 +2285,15 @@ def build_gemm_a8w4_tdm_task(
                                     )
                                     lds_store_b32(
                                         stC_idx,
-                                        _sc_byte + dw * 4,
+                                        _ep_scale_lds_at(row_rel, _sc_col + dw * 4),
                                         Vec.from_elements([_packed], fx.Int32),
                                     )
                             else:
                                 for mx_blk in range_constexpr(_n_mx_blks):
                                     fx.ptr_store(
                                         _e8m0_blks[mx_blk],
-                                        _scale_lds + (_sc_byte + mx_blk),
+                                        _scale_lds
+                                        + _ep_scale_lds_at(row_rel, _sc_col + mx_blk),
                                     )
                 else:
                     for wm in range_constexpr(wmma_m_rep):
@@ -2339,9 +2372,7 @@ def build_gemm_a8w4_tdm_task(
                 _comb0 = _ep_lsa0 + fx.Int64(ep_combine_input_offset)
                 _lds_c0 = fx.Int32(fx.Int64(fx.ptrtoint(base_ptr)))
                 if const_expr(ep_quant_bits):
-                    _elem_div = 8 // ep_quant_bits
-                    _gboff = blk_n64 // _elem_div
-                    _gboff_s = n64 // _elem_div + blk_n64 // EP_SCALE_BLOCK
+                    _gboff = blk_n64 // (8 // ep_quant_bits)
                 else:
                     _gboff = fx.Int64(blk_n * elem_bytes)
                 _expert_end = blk_m + mn_oob
@@ -2388,21 +2419,25 @@ def build_gemm_a8w4_tdm_task(
                                 _stride_elems,
                             ),
                         )
-                        if const_expr(ep_quant_bits):
+                        # One contiguous run per 256-column block of the planar
+                        # scale region.
+                        for blk in range_constexpr(
+                            tile_n // _PLANAR_COLS if _ep_planar else 0
+                        ):
                             TDM.tdm_store(
                                 TDM.tdm_group0(
-                                    _lds_c0
-                                    + fx.Int32(_ep_scale_lds_off)
-                                    + r0 * fx.Int32(_lds_scale_row_bytes),
-                                    dst + _gboff_s,
+                                    _lds_c0 + _ep_scale_lds_at(r0, blk * 8),
+                                    _ep_lsa0
+                                    + fx.Int64(p) * _pr
+                                    + fx.Int64(ep_scale_planar_offset)
+                                    + (
+                                        fx.Int64(blk_n // fx.Int32(_PLANAR_COLS) + blk)
+                                        * fx.Int64(ep_scale_planar_slots)
+                                        + fx.Int64(slot)
+                                    )
+                                    * fx.Int64(8),
                                 ),
-                                TDM.tdm_group1_rows(
-                                    run_rows,
-                                    EP_SCALE_ROW_BYTES,
-                                    _lds_scale_row_bytes,
-                                    1,
-                                    ep_slot_stride_bytes,
-                                ),
+                                TDM.tdm_group1_run(run_rows, 8),
                             )
                 tdm_ops.tensor_wait(0)
             elif const_expr(enable_ep_scatter):
@@ -2686,6 +2721,8 @@ def launch_gemm_a8w4_tdm(
     rolled_drain: Constexpr[int] = 0,
     a_preshuffled: Constexpr[int] = 0,
     m_align: Constexpr[int] = 0,
+    ep_scale_planar_offset: Constexpr[int] = 0,
+    ep_scale_planar_slots: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -2750,6 +2787,8 @@ def launch_gemm_a8w4_tdm(
         rolled_drain=rolled_drain,
         a_preshuffled=a_preshuffled,
         m_align=m_align,
+        ep_scale_planar_offset=ep_scale_planar_offset,
+        ep_scale_planar_slots=ep_scale_planar_slots,
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
