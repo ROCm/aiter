@@ -15,7 +15,19 @@ from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
     _attn_fwd as _gluon_attn_fwd,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
+    _attn_fwd_fp8 as _gluon_attn_fwd_fp8,
+)
+from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
+    _attn_fwd_split_head as _gluon_attn_fwd_split_head,
+)
+from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
     _get_config as _get_gluon_config,
+)
+from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
+    head_split as _gluon_head_split,
+)
+from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
+    kv_async_copy_ok as _gluon_kv_async_copy_ok,
 )
 from aiter.ops.triton._triton_kernels.attention.mha import _attn_fwd, _get_config
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
@@ -320,6 +332,8 @@ def _gluon_flash_attn_forward(
             has_pe=pe_head_dim > 0,
             causal=causal,
             v_head_dim=v_head_dim,
+            sliding_window=sliding_window,
+            seqlen_k=int(max_seqlen_k) if varlen else k.shape[1],
         )
     config = dict(config)
     BLOCK_M = config.pop("BLOCK_M")
@@ -439,24 +453,76 @@ def _gluon_flash_attn_forward(
     #     pe_head_dim % 64 == 0
     # ), "FP8 positional encoding requires the PE head size to be a multiple of 64."
 
+    # K and V only ever reach LDS by global->LDS async copy, whose lanes each move one
+    # 128- or 32-bit chunk that has to be aligned to its own size.  kv_stride_align is
+    # the largest power of two, in elements, dividing every K/V stride that reaches a
+    # chunk's address -- batch, head and sequence alike, since all three are summed
+    # into it -- or 0 when the last axis is not contiguous, which the copy's
+    # addressing cannot express at all.  The base pointers have to be 16-byte
+    # aligned too: Triton only proves pointer alignment at that granularity.  A K/V
+    # pair the copy cannot take (an odd-strided, permuted or misaligned view) is
+    # copied into fresh contiguous buffers here, once, rather than giving the kernel
+    # a second, register-staged load path; a fresh contiguous tensor always
+    # qualifies, because the head dim is already padded to a multiple of 8 above.
+    def _kv_stride_align(k_strides, v_strides):
+        if k_strides[3] != 1 or v_strides[3] != 1:
+            return 0
+        return math.gcd(16, *k_strides[:3], *v_strides[:3])
+
+    def _kv_copy_ok(align):
+        return (
+            k.data_ptr() % 16 == 0
+            and v.data_ptr() % 16 == 0
+            and _gluon_kv_async_copy_ok(
+                BLOCK_DMODEL_POW2,
+                BLOCK_DMODEL_PE_POW2,
+                BLOCK_N,
+                config["num_warps"],
+                k.element_size() * 8,
+                align,
+            )
+        )
+
+    kv_stride_align = _kv_stride_align(k_strides, v_strides)
+    if not _kv_copy_ok(kv_stride_align):
+        # clone, not .contiguous(): a contiguous view at a misaligned offset has to
+        # move too, and .contiguous() would hand it back unchanged.
+        k = k.clone(memory_format=torch.contiguous_format)
+        v = v.clone(memory_format=torch.contiguous_format)
+        if varlen:
+            k_strides = (0, k.stride(1), k.stride(0), k.stride(2))
+            v_strides = (0, v.stride(1), v.stride(0), v.stride(2))
+        else:
+            k_strides = (k.stride(0), k.stride(2), k.stride(1), k.stride(3))
+            v_strides = (v.stride(0), v.stride(2), v.stride(1), v.stride(3))
+        kv_stride_align = _kv_stride_align(k_strides, v_strides)
+        assert _kv_copy_ok(kv_stride_align), (
+            f"Gluon MHA cannot async-copy K/V for head_dim={v_head_dim}, "
+            f"BLOCK_N={BLOCK_N}, num_warps={config['num_warps']}"
+        )
+
     # Largest power of two, capped at the 128-bit load width, that divides every
     # head-axis stride. gcd against a power of two can only return a power of two,
     # so this is always a valid alignment hint for the kernel's head offsets.
     head_stride_align = math.gcd(16, q_strides[1], k_strides[1], v_strides[1])
 
-    # Largest power of two, in elements, dividing every K/V stride that reaches the
-    # base pointer of a global->LDS copy -- batch, head and sequence alike, since all
-    # three are summed into it.  This is the alignment the copy's 128-bit-per-lane
-    # chunks depend on.  The last axis must also be contiguous, or the copy's whole
-    # addressing model is wrong; 0 disables the async copy outright in that case.
-    if k_strides[3] == 1 and v_strides[3] == 1:
-        kv_stride_align = math.gcd(16, *k_strides[:3], *v_strides[:3])
-    else:
-        kv_stride_align = 0
-
     grid = (batch * num_q_heads * triton.cdiv(seqlen_q, BLOCK_M), 1)
 
-    _gluon_attn_fwd[grid](
+    # A padded head dim whose Q@K^T contraction can be issued as two power-of-two
+    # slices for less MFMA work than one padded tile (96 -> 64 + 32, ...) runs the
+    # split-head kernel; same arguments, so only the kernel changes.
+    split_head = (
+        not IS_FP8
+        and pe_head_dim == 0
+        and _gluon_head_split(v_head_dim, BLOCK_DMODEL_POW2, 16) > 0
+    )
+    if IS_FP8:
+        kernel = _gluon_attn_fwd_fp8
+    elif split_head:
+        kernel = _gluon_attn_fwd_split_head
+    else:
+        kernel = _gluon_attn_fwd
+    kernel[grid](
         q,
         k,
         v,
