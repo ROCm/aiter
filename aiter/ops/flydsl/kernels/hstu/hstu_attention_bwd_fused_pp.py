@@ -1138,11 +1138,14 @@ def build_hstu_attention_bwd_fused_pp(
             for w in range_constexpr(NUM_WAVES // 2):
                 for j in range_constexpr(DQ_PER_LANE):
                     acc[j] = fadd_scalar(acc[j], _vs[w][j])
-            # Issued once `acc` is ready and AFTER all five reads, so it never
-            # competes with them for the LDS pipe.
-            dqg[dq_wrow, dq_fvec, None].store(
-                Vec.from_elements(acc, fx.Float32)
-            )
+            # The own-group sum is kept aside so the exchange write can be
+            # issued LAST, after the HBM store -- as far from the five reads as
+            # this phase allows. Next to them it stalled 3.06 M cycles (3.8% of
+            # all stall, 142/exec) with no dependency to explain it: its inputs
+            # are two VALU adds old. That is LDS-pipe contention, both with its
+            # own reads and with the partner group's phase M, so distance is
+            # the only lever. Costs 4 VGPR to hold the pre-exchange sum.
+            _own = list(acc)
             for j in range_constexpr(DQ_PER_LANE):
                 acc[j] = fadd_scalar(acc[j], _g[j])
 
@@ -1168,6 +1171,9 @@ def build_hstu_attention_bwd_fused_pp(
                 dq_part[_r, _hc + fx.Int32(j)] = fmul_const_scalar(
                     acc[j], c_inv_n
                 )  # fmt: skip
+            dqg[dq_wrow, dq_fvec, None].store(
+                Vec.from_elements(_own, fx.Float32)
+            )
 
         # ---- phase M -------------------------------------------------------
         def mfma_phase(dv, dk, p_prev, ds_prev, q_tile, rm_cur, rm_fill, t_cur,
