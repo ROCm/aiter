@@ -153,8 +153,12 @@ struct __attribute__((packed)) MlaGfx1250PackedKernelArgs
     unsigned int stride_page;     // dword 26
     unsigned int log2_page;       // dword 27
     unsigned int stride_Q;        // dword 28
-    unsigned int use_valid_split_count_reduce;  // dword 29
+    unsigned int decode_flags;   // dword 29: bit0 valid split count, bit1 QH64 shuffled causal
 };
+static_assert(sizeof(MlaGfx1250PackedKernelArgs) == 120);
+static_assert(offsetof(MlaGfx1250PackedKernelArgs, decode_flags) == 116);
+constexpr unsigned int MLA_DECODE_VALID_SPLIT_COUNT = 1u;
+constexpr unsigned int MLA_DECODE_CAUSAL = 2u;
 
 std::string get_heuristic_kernel_mla(std::string q_type,
                                      std::string kv_type,
@@ -306,6 +310,7 @@ static void mla_decode_gfx1250_dispatch(
     aiter_tensor_t* kv_scale,
     aiter_tensor_t* valid_split_count,
     int use_valid_split_count_reduce,
+    int causal,
     int kv_shuffled,
     hipStream_t stream)
 {
@@ -358,7 +363,7 @@ static void mla_decode_gfx1250_dispatch(
          (max_seqlen_q == 1 || max_seqlen_q == 2 || max_seqlen_q == 3 || max_seqlen_q == 4)) ||
         (gqa_ratio == 16 && (max_seqlen_q == 1 || max_seqlen_q == 2 || max_seqlen_q == 4)) ||
         (gqa_ratio == 32 && max_seqlen_q == 1) ||
-        (gqa_ratio == 64 && max_seqlen_q == 1) ||
+        (gqa_ratio == 64 && (max_seqlen_q == 1 || (kv_shuffled && max_seqlen_q > 0))) ||
         (gqa_ratio == 128 && max_seqlen_q == 1);
     AITER_CHECK(supported_variant,
                 __func__,
@@ -366,9 +371,9 @@ static void mla_decode_gfx1250_dispatch(
                 gqa_ratio,
                 " max_seqlen_q=",
                 max_seqlen_q,
-                " (supported: gqa8 x qSeqLen{1,2,3,4}, gqa16 x qSeqLen{1,2,4}, gqa32 x qSeqLen1, gqa64 x qSeqLen1, "
+                " (supported: gqa8 x qSeqLen{1,2,3,4}, gqa16 x qSeqLen{1,2,4}, gqa32 x qSeqLen1, gqa64 x qSeqLen1 (shuffled accepts multiple queries), "
                 "gqa128 x qSeqLen1)");
-    const int sub_Q = gqa_ratio * max_seqlen_q;
+    const int sub_Q = kv_shuffled ? 64 : gqa_ratio * max_seqlen_q;
     AITER_CHECK(page_size == 64, __func__, ": only support page_size == 64 for minimal smoke");
     AITER_CHECK(Q->size(2) == 576, __func__, ": only support Q head dim 576 for minimal smoke");
     AITER_CHECK(output->size(2) == 512, __func__, ": only support output head dim 512 for minimal smoke");
@@ -395,7 +400,7 @@ static void mla_decode_gfx1250_dispatch(
     // fp32 split partials that Python reduces in stage2. QH64 also uses this
     // mode with one split when LSE is requested: its BF16 epilogue omits LSE.
     const bool fp32_single_split_lse = kv_split == 1 && gqa_ratio == 64 &&
-                                       max_seqlen_q == 1 && lse != nullptr;
+                                       (max_seqlen_q == 1 || kv_shuffled) && lse != nullptr;
     const auto expected_split_dtype = (kv_split == 1 && !fp32_single_split_lse)
                                           ? AITER_DTYPE_bf16 : AITER_DTYPE_fp32;
     AITER_CHECK(splitData->dtype() == expected_split_dtype,
@@ -414,8 +419,9 @@ static void mla_decode_gfx1250_dispatch(
     AITER_CHECK(kv_shuffled == 0 || kv_shuffled == 1, __func__, ": kv_shuffled must be 0 or 1");
     if(kv_shuffled)
     {
-        AITER_CHECK(gqa_ratio == 64 && max_seqlen_q == 1, __func__,
-                    ": kv_shuffled packed dispatch requires gqa64 x qSeqLen1");
+        AITER_CHECK(gqa_ratio == 64 && max_seqlen_q > 0, __func__,
+                    ": kv_shuffled packed dispatch requires gqa64 and positive max_seqlen_q");
+        AITER_CHECK(causal == 0 || causal == 1, __func__, ": causal must be 0 or 1");
         AITER_CHECK(Q->stride(1) == 768, __func__,
                     ": kv_shuffled QH64 requires Q head stride 768");
         AITER_CHECK(KV->dim() == 4 && KV->is_contiguous() &&
@@ -426,8 +432,11 @@ static void mla_decode_gfx1250_dispatch(
     }
 
     CFG* config_map = &cfg_mla_asm;
+    // The config map is keyed by symbol: one canonical entry handles both
+    // runtime causal modes and every query count for shuffled QH64.
     std::string kernelName = get_heuristic_kernel_mla(
-        "fp8", "fp8", gqa_ratio, 0, 0, 0, max_seqlen_q, arch_id, config_map,
+        "fp8", "fp8", gqa_ratio, 0, 0, 0,
+        kv_shuffled ? 1 : max_seqlen_q, arch_id, config_map,
         0, 0, kv_shuffled ? 64 : 0, kv_shuffled);
     AITER_CHECK(!kernelName.empty(), __func__, ": cannot find suitable gfx1250 kernel");
 
@@ -452,7 +461,8 @@ static void mla_decode_gfx1250_dispatch(
     // below is kept only for kernels that have not been rebuilt from sp3 yet.
     const int q_elem_size = Q->element_size();
     const int qk_head_dim = Q->size(2);
-    const int q_seq_lens_kernel = max_seqlen_q * gqa_ratio;
+    // Shuffled QH64 launches a separate workgroup for each query token.
+    const int q_seq_lens_kernel = kv_shuffled ? 64 : max_seqlen_q * gqa_ratio;
     const unsigned int stride_Q =
         static_cast<unsigned int>(nhead_kv * q_seq_lens_kernel * qk_head_dim * q_elem_size);
     const unsigned int stride_page = static_cast<unsigned int>(KV->stride(0) * KV->element_size());
@@ -507,8 +517,9 @@ static void mla_decode_gfx1250_dispatch(
         packed_args.stride_page = stride_page;
         packed_args.log2_page = log2_page;
         packed_args.stride_Q = stride_Q;
-        packed_args.use_valid_split_count_reduce =
-            static_cast<unsigned int>(use_valid_split_count_reduce != 0);
+        packed_args.decode_flags =
+            (use_valid_split_count_reduce ? MLA_DECODE_VALID_SPLIT_COUNT : 0u) |
+            (kv_shuffled && causal ? MLA_DECODE_CAUSAL : 0u);
         kernarg_ptr = &packed_args;
         arg_size = sizeof(packed_args);
     }
@@ -517,7 +528,8 @@ static void mla_decode_gfx1250_dispatch(
     // two workgroups along X: the kernel copies the X id into _s_tg_idx (guarded by
     // _s_MQA > 64) and shifts Q by Q_GROUP_PAD_SIZE * tg_idx. Z is the plain KV
     // split id in every case -- it must not carry the head half as well.
-    const int gdx = (gqa_ratio == 128) ? 2 : (max_seqlen_q * gqa_ratio + sub_Q - 1) / sub_Q;
+    const int gdx = kv_shuffled ? max_seqlen_q :
+        ((gqa_ratio == 128) ? 2 : (max_seqlen_q * gqa_ratio + sub_Q - 1) / sub_Q);
     const int gdy = batch;
     const int gdz = kv_split;
 
@@ -605,7 +617,7 @@ static void mla_decode_gfx1250_dispatch(
                 lse == nullptr ? nullptr : lse->data_ptr(),
                 stream);
     std::printf("[aiter][gfx1250][debug] kernargs: scalar=%g q_seq_lens=%u passes=%u "
-                "stride_Q=%u stride_page=%u log2_page=%u out_16_nosplit=%u use_valid_split_count_reduce=%u\n",
+                "stride_Q=%u stride_page=%u log2_page=%u out_16_nosplit=%u decode_flags=%u\n",
                 softmax_scale,
                 static_cast<unsigned int>(q_seq_lens_kernel),
                 static_cast<unsigned int>(kv_split),
@@ -613,7 +625,7 @@ static void mla_decode_gfx1250_dispatch(
                 stride_page,
                 log2_page,
                 out_16_nosplit,
-                use_packed_gfx1250_args ? packed_args.use_valid_split_count_reduce : 0u);
+                use_packed_gfx1250_args ? packed_args.decode_flags : 0u);
     std::printf("[aiter][gfx1250][debug] launch: grid=(%d,%d,%d) block=(%d,%d,%d)\n",
                 gdx,
                 gdy,
@@ -764,6 +776,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                                          kv_scale,
                                          valid_split_count,
                                          use_valid_split_count_reduce,
+                                         causal,
                                          kv_shuffled,
                                          stream);
     }

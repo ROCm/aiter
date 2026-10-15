@@ -196,6 +196,7 @@ def _fwd_kernel_stage2_asm(
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
     mgc: tl.constexpr,
+    CAUSAL_PER_QUERY: tl.constexpr = False,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -209,8 +210,11 @@ def _fwd_kernel_stage2_asm(
     cur_kv_seq_len = cur_kv_end - cur_kv_start
     if KV_INDPTR_IS_PAGE_LEVEL:
         cur_kv_page_count = cur_kv_seq_len
-        cur_kv_seq_len = (cur_kv_page_count - 1) * page_size + tl.load(
-            kv_last_page_lens + cur_batch
+        cur_kv_seq_len = tl.where(
+            cur_kv_page_count > 0,
+            (cur_kv_page_count - 1) * page_size
+            + tl.load(kv_last_page_lens + cur_batch),
+            0,
         )
     offs_d = tl.arange(0, BLOCK_DV)
     mask_d = offs_d < Lv
@@ -227,6 +231,13 @@ def _fwd_kernel_stage2_asm(
     FINAL_OUT = MAYBE_FINAL_OUT and num_max_kv_splits == BATCH_NUM
 
     for cur_qo in range(cur_qo_start, cur_qo_end):
+        query_valid_splits = num_valid_kv_splits
+        if CAUSAL_PER_QUERY:
+            # Bottom-right alignment: all heads of this query share one KV prefix.
+            visible_kv = tl.maximum(0, cur_kv_seq_len - cur_qo_end + cur_qo + 1)
+            query_valid_splits = tl.minimum(
+                query_valid_splits, tl.cdiv(visible_kv, mgc)
+            )
         if FINAL_OUT:
             input_ptr = Mid_O.to(tl.pointer_type(O.type.element_ty))
             out = tl.load(
@@ -245,7 +256,7 @@ def _fwd_kernel_stage2_asm(
             e_sum = 0.0
             e_max = -float("inf")
             acc = tl.zeros((BLOCK_DV,), dtype=tl.float32)
-            for split_kv_id in range(num_valid_kv_splits):
+            for split_kv_id in range(query_valid_splits):
                 tv = tl.load(
                     Mid_O + offs_v + split_kv_id * stride_mid_os * Lv,
                     mask=mask_d,
@@ -809,8 +820,8 @@ def _check_mla_qh64_shuffled_inputs(q, kv, out, qo, indptr, indices, last, split
     if not isinstance(q, torch.Tensor) or not q.is_cuda:
         raise ValueError("Q must be a GPU tensor")
     if q.ndim != 3 or q.shape[1:] != (64, 576):
-        raise ValueError("Q must be [B,64,576]")
-    batch = q.shape[0]
+        raise ValueError("Q must be [total_q,64,576]")
+    total_q = q.shape[0]
 
     def check(tensor, name, dtype, shape=None, contiguous=True):
         if not isinstance(tensor, torch.Tensor) or tensor.device != q.device:
@@ -834,19 +845,26 @@ def _check_mla_qh64_shuffled_inputs(q, kv, out, qo, indptr, indices, last, split
         or kv.stride(0) != 64 * 576
     ):
         raise ValueError("KV must be contiguous [P,1,64,576] or [P,64,1,576]")
-    check(out, "out", torch.bfloat16, (batch, 64, 512))
+    check(out, "out", torch.bfloat16, (total_q, 64, 512))
     if any(t is None for t in (qo, indptr, indices, last)):
         raise ValueError(
             "kv_shuffled QH64 requires CSR metadata "
             "(qo_indptr/kv_indptr/kv_indices/kv_last_page_lens)"
         )
-    check(qo, "qo_indptr", torch.int32, (batch + 1,))
+    check(qo, "qo_indptr", torch.int32)
+    if qo.ndim != 1 or qo.numel() < 1:
+        raise ValueError("qo_indptr must be one-dimensional [B+1]")
+    batch = qo.numel() - 1
+    if batch == 0 and total_q != 0:
+        raise ValueError("nonempty Q requires at least one batch in qo_indptr")
     check(indptr, "kv_indptr", torch.int32, (batch + 1,))
     check(indices, "kv_indices", torch.int32)
     if indices.ndim != 1:
         raise ValueError("kv_indices must be one-dimensional")
     check(last, "kv_last_page_lens", torch.int32, (batch,))
-    if splits is not None and (not isinstance(splits, int) or splits < 1):
+    if splits is not None and (
+        isinstance(splits, bool) or not isinstance(splits, int) or splits < 1
+    ):
         raise ValueError("num_kv_splits must be a positive integer or None")
 
 
@@ -892,9 +910,10 @@ def mla_decode_fwd(
     """MLA decode with explicit KV byte-layout selection.
 
     ``token_major`` preserves the existing segmented page64 dispatch.
-    ``kv_shuffled`` on gfx1250 supports FP8 Q/KV, BF16 O, one query and
-    page64. QH64 uses page-level CSR metadata, a 768-byte Q head stride,
-    and the existing split-K/reducer. QH128 uses dense ``seq_lens[B]`` /
+    ``kv_shuffled`` on gfx1250 supports FP8 Q/KV, BF16 O and page64.
+    QH64 uses page-level CSR metadata, a 768-byte Q head stride, multiple
+    queries per sequence, and split-K reduction. QH128 uses one query and
+    dense ``seq_lens[B]`` /
     ``page_table[B,max_pages]`` and no splitting; its CSR arguments may be None.
     The cache writer must already supply shuffled NoPE/RoPE planes.
 
@@ -902,8 +921,13 @@ def mla_decode_fwd(
     (partial logits when splitting, final output in ``o``). ``return_lse``
     requests natural-log FP32 final LSE. CPU FP32 scalar scales are cached
     on Q's device by value; None means 1. Warm up before graph capture or
-    supply GPU scales. Shuffled kernels do not support MTP, persistent
-    scheduling or CP. ``causal`` has no effect for a single query.
+    supply GPU scales. Shuffled kernels do not support persistent scheduling
+    or CP. QH64 applies bottom-right causal masking: query i sees
+    max(0, kv_len - q_len + i + 1) tokens; ``causal=False`` sees all KV.
+    Fully masked queries return O=0 and LSE=-inf. Query lengths come from
+    qo_indptr and must not exceed max_seqlen_q; its last entry must equal
+    total_q. CSR contents remain the caller's responsibility, without a GPU
+    synchronization in dispatch. ``causal`` has no effect for one query.
     """
     kv_shuffled_flag = 0
     # ATOM's QH128 dense path must route before accessing any CSR metadata.
@@ -954,10 +978,19 @@ def mla_decode_fwd(
                 kv_scale,
                 return_lse,
             )
-        if max_seqlen_q != 1 or page_size != 64 or nhead_kv != 1:
+        if (
+            isinstance(max_seqlen_q, bool)
+            or not isinstance(max_seqlen_q, int)
+            or max_seqlen_q < 1
+            or page_size != 64
+            or nhead_kv != 1
+        ):
             raise ValueError(
-                "kv_shuffled QH64 requires max_seqlen_q=1, page_size=64, and nhead_kv=1"
+                "kv_shuffled QH64 requires positive integer max_seqlen_q, "
+                "page_size=64, and nhead_kv=1"
             )
+        if not isinstance(causal, bool):
+            raise ValueError("causal must be a bool")
         if logit_cap > 0:
             raise ValueError("kv_shuffled QH64 does not support logit_cap")
         if cp_world_size != 1 or cp_rank != 0 or g_kv_indptr is not None:
@@ -988,8 +1021,11 @@ def mla_decode_fwd(
             kv_last_page_lens,
             num_kv_splits,
         )
+        if q.shape[0] > (qo_indptr.numel() - 1) * max_seqlen_q:
+            raise ValueError("total_q exceeds B * max_seqlen_q")
         if num_kv_splits_indptr is not None and (
-            num_kv_splits_indptr.device != q.device
+            not isinstance(num_kv_splits_indptr, torch.Tensor)
+            or num_kv_splits_indptr.device != q.device
             or num_kv_splits_indptr.dtype != torch.int32
             or not num_kv_splits_indptr.is_contiguous()
             or num_kv_splits_indptr.shape != qo_indptr.shape
@@ -1009,15 +1045,6 @@ def mla_decode_fwd(
                 if return_lse
                 else None
             )
-        # Empty CSR can have no indices at all. The auto heuristic otherwise
-        # caps to zero splits, although stage1 still needs one workgroup.
-        if kv_indices.numel() == 0:
-            num_kv_splits = 1 if num_kv_splits is None else num_kv_splits
-            if num_kv_splits_indptr is None:
-                num_kv_splits_indptr = (
-                    torch.arange(q.shape[0] + 1, dtype=torch.int32, device=q.device)
-                    * num_kv_splits
-                )
     elif kv_layout != "token_major":
         raise ValueError(f"unknown MLA kv_layout: {kv_layout!r}")
 
@@ -1056,7 +1083,28 @@ def mla_decode_fwd(
     qseqlen_folded = False
 
     if not persistent_mode:
-        if num_kv_splits is None or num_kv_splits_indptr is None:
+        if kv_shuffled_flag:
+            if num_kv_splits is None:
+                if total_kv == 0:
+                    num_kv_splits = 1
+                else:
+                    # CSR indices count pages. Each query launches one QH64
+                    # workgroup, so the block size stays 64 for every Q length.
+                    num_kv_splits, num_kv_splits_indptr = get_meta_param(
+                        None,
+                        bs,
+                        total_kv * page_size,
+                        nhead,
+                        1,
+                        q.dtype,
+                        tg_factor=max_seqlen_q,
+                    )
+            if num_kv_splits_indptr is None:
+                num_kv_splits_indptr = (
+                    torch.arange(bs + 1, dtype=torch.int32, device=device)
+                    * num_kv_splits
+                )
+        elif num_kv_splits is None or num_kv_splits_indptr is None:
             num_kv_splits, num_kv_splits_indptr = get_meta_param(
                 num_kv_splits, bs, total_kv, nhead, max_seqlen_q, q.dtype
             )
@@ -1085,7 +1133,7 @@ def mla_decode_fwd(
             nhead == 64
             and q.dtype == dtypes.fp8
             and kv_buffer.dtype == dtypes.fp8
-            and max_seqlen_q == 1
+            and (max_seqlen_q == 1 or kv_shuffled_flag)
         ):
             mgc = 64
 
@@ -1095,7 +1143,7 @@ def mla_decode_fwd(
             return_lse
             and num_kv_splits == 1
             and nhead == 64
-            and max_seqlen_q == 1
+            and (max_seqlen_q == 1 or kv_shuffled_flag)
             and get_gfx() == "gfx1250"
             and q.dtype == dtypes.fp8
             and kv_buffer.dtype == dtypes.fp8
@@ -1240,6 +1288,7 @@ def mla_decode_fwd(
             BLOCK_DV=BLOCK_DV,
             Lv=Lv,
             mgc=mgc,
+            CAUSAL_PER_QUERY=bool(kv_shuffled_flag and causal),
             # One (token, head) per CTA, no cross-lane reduction: the merge is
             # memory-latency bound, so max occupancy (num_warps=1) beats wider
             # tiles. Measured 1.7-1.9x over num_warps=4 on gfx950 decode shapes.
