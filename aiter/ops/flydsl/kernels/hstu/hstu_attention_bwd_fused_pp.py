@@ -272,6 +272,11 @@ def build_hstu_attention_bwd_fused_pp(
     UNROLL = RM_SLOTS
     assert UNROLL % RM_SLOTS == 0 and UNROLL % T_SLOTS == 0
     RM_TILE_ELEMS = BLOCK_N * STRIDE
+    # Fragment-transpose scratch: one 16x16 bf16 region per (wave, subtile).
+    # PER-WAVE PRIVATE -- a wave transposes only its own kv rows -- so it
+    # needs no barrier, only `s_waitcnt lgkmcnt`, and it does not rotate, so
+    # it does not force UNROLL to lcm(...).
+    FT_ELEMS = NUM_WAVES * KV_OWNED_SUBTILES * MFMA_M * MFMA_M
 
     rm_tile_elems_per_pass = GRP_THREADS * DMA_ELEMS
     assert RM_TILE_ELEMS % rm_tile_elems_per_pass == 0
@@ -341,6 +346,7 @@ def build_hstu_attention_bwd_fused_pp(
         q_t1: fx.Array[elem_dtype, T_TILE_ELEMS, 16]
         do_t0: fx.Array[elem_dtype, T_TILE_ELEMS, 16]
         do_t1: fx.Array[elem_dtype, T_TILE_ELEMS, 16]
+        ft: fx.Array[elem_dtype, FT_ELEMS, 16]
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def hstu_attention_bwd_fused_pp(
@@ -469,6 +475,58 @@ def build_hstu_attention_bwd_fused_pp(
         do_t_wr = [lds.do_t0.view(t_wr_layout), lds.do_t1.view(t_wr_layout)]
         q_t_rd = [lds.q_t0.view(t_rd_layout), lds.q_t1.view(t_rd_layout)]
         do_t_rd = [lds.do_t0.view(t_rd_layout), lds.do_t1.view(t_rd_layout)]
+
+        ft_view = lds.ft.view(
+            fx.make_layout(
+                (NUM_WAVES * KV_OWNED_SUBTILES, MFMA_M, MFMA_M // MFMA_LANE_K,
+                 MFMA_LANE_K),
+                (MFMA_M * MFMA_M, MFMA_M, MFMA_LANE_K, 1),
+            )
+        )
+
+        def transpose_frag(frag, slot):
+            """16x16 fragment transpose, A-layout <-> C-layout.
+
+            dQ reduces over kv, but in BOTH MFMA operand layouts a lane's four
+            values run along the reduction index -- so a fragment's "4-value
+            axis" IS its reduction axis and swapping A<->B cannot change it.
+            `ds_packs` reduces over q and `k_packs` over d, so both dQ operands
+            need this. 240 of 256 elements change lane.
+
+            The permutation is IDENTICAL for both (verified exhaustively): a
+            target lane gathers from 4 CONSECUTIVE source lanes, taking the same
+            element index from each. It is also an involution, so one helper
+            serves both directions.
+
+            Scratch is contiguous in the source row, making the write one
+            `ds_write_b64` and the read four strided `ds_read_u16` -- the same
+            shape as the q_t/do_t build. Per-wave private, so `lgkmcnt` alone
+            orders it; the trailing wait lets a caller reuse a slot.
+            """
+            _i = wave_id * fx.Int32(KV_OWNED_SUBTILES) + fx.Int32(slot)
+            ft_view[_i, lane_mod_16, lane_div_16, None].store(Vec(frag))
+            # `s_waitcnt` alone is NOT enough. Unlike the q_t/do_t build --
+            # which writes t_cur and reads t_prev, two different slots -- this
+            # reads back the SAME locations it just wrote, through a different
+            # index expression. Without a scheduling fence the backend is free
+            # to hoist the reads above the write: measured ~78,000 wrong
+            # elements per run, against ~300 for the bug this kernel already
+            # had.
+            rocdl.sched_barrier(0)
+            rocdl.s_waitcnt(lgkmcnt=0)
+            rocdl.sched_barrier(0)
+            _e = []
+            for _j in range_constexpr(MFMA_LANE_K):
+                _r = lane_div_16 * fx.Int32(MFMA_LANE_K) + fx.Int32(_j)
+                _e.append(
+                    ft_view[_i, _r, lane_mod_16 // fx.Int32(MFMA_LANE_K),
+                            lane_mod_16 % fx.Int32(MFMA_LANE_K)]
+                )  # fmt: skip
+            out = Vec.from_elements(_e, elem_dtype).ir_value()
+            rocdl.sched_barrier(0)
+            rocdl.s_waitcnt(lgkmcnt=0)
+            rocdl.sched_barrier(0)
+            return out
 
         def q_swz_col(tile_row, col):
             return swz_col(tile_row, col, K_SWZ_ROWS, K_SWZ_SHIFT)
@@ -927,6 +985,15 @@ def build_hstu_attention_bwd_fused_pp(
         # ---- phase M -------------------------------------------------------
         def mfma_phase(dv, dk, p_prev, ds_prev, q_tile, rm_cur, rm_fill, t_cur, t_prev):
             """Four GEMMs, the operand feed, this group's DMA and transpose, the mask."""
+            # dS in the layout the dQ GEMM's A operand needs. Per-tile, unlike
+            # kt_packs: one scratch slot per subtile, written and read inside
+            # this phase by the owning wave only, so no barrier is involved and
+            # the slots never cross one.
+            ds_t = [
+                transpose_frag(ds_prev[og], og)
+                for og in range_constexpr(KV_OWNED_SUBTILES)
+            ]
+
             rocdl.s_setprio(1)
             q_start = fx.Int32(q_tile) * fx.Int32(BLOCK_N)
             s_accs = [c_zero_v4f32 for _ in range_constexpr(KV_OWNED_SUBTILES)]
@@ -1138,6 +1205,25 @@ def build_hstu_attention_bwd_fused_pp(
             rocdl.s_waitcnt(vmcnt=0)
             rocdl.s_waitcnt(lgkmcnt=0)
             phase_barrier()
+
+            # K in the kv-as-reduction layout, for the dQ GEMM's B operand.
+            # Loop-invariant, so paid ONCE per workgroup -- and it avoids
+            # re-reading K from HBM in a second layout. Transposed from the
+            # ALPHA-SCALED k_packs so alpha rides along: ds.(aK) = a.(ds.K) is
+            # exactly the chain rule, leaving only 1/N for the flush. Do NOT
+            # also apply dq_pp's `alpha/max_seq_len`; that kernel folds alpha
+            # into Q, not K.
+            #
+            # Placed AFTER the prologue fence, not beside k_packs: up there it
+            # runs while the zeroing and the staging DMA are still being set
+            # up, and it corrupted dv/dk (5.4k elements). Here nothing is in
+            # flight.
+            kt_packs = []
+            for ks in range_constexpr(K_STEPS):
+                per_og = []
+                for og in range_constexpr(KV_OWNED_SUBTILES):
+                    per_og.append(transpose_frag(k_packs[ks][og], 0))
+                kt_packs.append(per_og)
 
             acc_init = [c_zero_v4f32 for _ in range_constexpr(N_ACC)] + [
                 c_zero_pack for _ in range_constexpr(2 * N_PACK)
