@@ -83,6 +83,14 @@ B_DISPATCH = NT
 B_LOADER = NT + 64
 B_COMBINE = NT + 128
 
+# GEMM geometry (the compute waves reuse the mega_moe stage1/stage2 MFMA atoms; see
+# gemm.py). The GEMM runs on the NW=4 compute waves (NT=256 threads). TILE_K is the
+# MFMA K-step byte granularity; TILE_N the GEMM1 output column tile over the gate|up
+# halves (2*inter_dim). FP4 activations halve the per-K-step A bytes.
+KCS = 2  # A K-chunks staged together
+TILE_K = 256
+TILE_N = 256
+
 # Up to this many received (token, expert) pairs per rank use the dynamic planner
 # (the one ported here); larger batches want an LB-style two-phase planner (future).
 DYN_MAX = 256
@@ -148,17 +156,34 @@ def mega_moe_ep_consts(
     TODO(compute): grow the A / B / scale / intermediate region into the full ring that
     ``mega_moe_tp_consts`` carries once the GEMM device code lands.
     """
-    RG = MT * 16  # rows per tile
+    RG = MT * 16  # rows per GEMM tile (sort_block_m)
     a_row = H if a8 else H // 2  # activation bytes per row (FP8 vs packed FP4)
     a_scale = H // 32  # E8M0 scale bytes per row
     inter_row = I if a8 else I // 2
     NBW = ceildiv(EPR, 32)  # 32-bit words of the active-local-expert bitmap
+    # GEMM geometry (mirrors compile_gemm1 so the stage1/stage2 atoms stage into the
+    # layout they expect). FP4 halves the per-K-step A bytes; the A LDS pool
+    # double-buffers the K tile (and aliases the cshuffle epilogue).
+    a_k_step = TILE_K if a8 else TILE_K // 2
+    a_lds_size = RG * a_k_step
+    lds_pool = max(2 * a_lds_size, RG * (TILE_N // 2) * 4)
     c = {
         "RG": RG,
         "A_ROW": a_row,
         "A_SCALE": a_scale,
         "INTER_ROW": inter_row,
         "NBW": NBW,
+        "KS1": H // 128,
+        "KS2": I // 128,
+        "G2": H // 64 // NW,
+        "CH1": ceildiv(H // 32, 8),
+        "CH2": ceildiv(I // 32, 8),
+        "M_REPEAT": RG // 16,
+        "N_TILES": (2 * I) // TILE_N,
+        "NUM_ACC_N": (TILE_N // NW) // 16,
+        "A_K_STEP": a_k_step,
+        "K_ITERS": H // TILE_K,
+        "A_LDS_I32": a_lds_size // 4,
     }
     off = 0
 
@@ -168,10 +193,13 @@ def mega_moe_ep_consts(
         start, off = off, off + n
         return start
 
-    # compute staging (one row tile)
-    c["L_A"] = take(RG * a_row)
-    c["L_AS"] = take(RG * a_scale)
-    c["L_INTER"] = take(RG * inter_row)
+    # compute staging (reuses the stage1/stage2 GEMM atoms' expected LDS). The GEMM1
+    # quantized intermediate goes to a GLOBAL buffer (like stage1->stage2), not LDS: a
+    # full RG x inter tile would blow the 160 KB budget for FP8. The cshuffle epilogue
+    # aliases the A pool (compile_gemm1 pattern); GEMM2 reads the intermediate from
+    # global. TODO(tune): keep it per-inter-piece in LDS to drop the global round-trip.
+    c["L_A"] = take(lds_pool)  # A K-tile double-buffer | cshuffle epilogue (aliased)
+    c["L_AS"] = take(RG * a_scale)  # A-scale (E8M0) of one row tile
     # dynamic planner tables
     c["L_DYN"] = take((2 * NBW + EPR) * 4)  # bitmap words | prefix words | dense list
     c["L_DCNT"] = take(EPR * 4)  # received rows per local expert
@@ -215,11 +243,14 @@ def kernel_config(
         swiglu_limit = float("inf")
     c = mega_moe_ep_consts(H, I, MT, EPR, TMAX, a8)
     RG, LDS_BYTES, NBW = c["RG"], c["LDS_BYTES"], c["NBW"]
-    L_A, L_AS, L_INTER = c["L_A"], c["L_AS"], c["L_INTER"]
+    L_A, L_AS = c["L_A"], c["L_AS"]
     L_DYN, L_DCNT, L_WSUM = c["L_DYN"], c["L_DCNT"], c["L_WSUM"]
     L_DCH, L_EOFF, L_RIX, L_CTL = c["L_DCH"], c["L_EOFF"], c["L_RIX"], c["L_CTL"]
+    KS1, KS2, G2 = c["KS1"], c["KS2"], c["G2"]
+    CH1, CH2, M_REPEAT = c["CH1"], c["CH2"], c["M_REPEAT"]
+    N_TILES, NUM_ACC_N = c["N_TILES"], c["NUM_ACC_N"]
+    A_K_STEP, K_ITERS, A_LDS_I32 = c["A_K_STEP"], c["K_ITERS"], c["A_LDS_I32"]
     # GEMM1 inter-piece choices the planner balances over (full inter dim = KS2 blocks).
-    KS2 = I // 128
     DYN_PS = [p for p in range(1, KS2 + 1) if KS2 % p == 0]
     rch = RG  # dynamic row chunk = one row tile (16*mt)
     const_expr = fx.const_expr
