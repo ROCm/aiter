@@ -810,14 +810,17 @@ def gemm_mxfp4_preshuffle_gfx1250(
 
         # --- 5. Final WMMA ---
         if EPI_SPLIT > 1:
+            # the sliced store waits on the TDM counter: keep it out of the arrive->wait window
+            if num_ctas > 1:
+                gl.amd.gfx1250.cluster.wait()
             _sliced_final_wmma_store(acc, cur_A, cur_AS, cur_B, cur_BS, c_ptr, M, N, stride_c_m, stride_c_n, tile_m, tile_n, BLOCK_SIZE_M, BLOCK_SIZE_N, CTAS_N, EPI_SPLIT, wmma_acc_layout, dot_b_layout, b_scale_layout_epi, shared_C_epi)  # fmt: skip
         else:
             acc = gl.amd.gfx1250.wmma_scaled(
                 cur_A, cur_AS, "e2m1", cur_B, cur_BS, "e2m1", acc
             )
 
-        if num_ctas > 1:
-            gl.amd.gfx1250.cluster.wait()
+            if num_ctas > 1:
+                gl.amd.gfx1250.cluster.wait()
     else:
         # K sub-steps per LDS stage: WMMA on sub-step j overlaps the LDS load of j+1
         # (register double-buffering at sub-tile granularity, as in the asm kernel).
@@ -900,10 +903,8 @@ def gemm_mxfp4_preshuffle_gfx1250(
                     gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS - 3 - i)
                 if j == NUM_KSUB - 1 and num_ctas > 1:
                     gl.amd.gfx1250.cluster.arrive()
-                if EPI_SPLIT > 1 and i == NUM_BUFFERS - 2 and j == NUM_KSUB - 1:
-                    # last WMMA in slices, each slice's store issued as soon as it is done
-                    _sliced_final_wmma_store(acc, cur_A, cur_AS, cur_B, cur_BS, c_ptr, M, N, stride_c_m, stride_c_n, tile_m, tile_n, BLOCK_SIZE_M, BLOCK_SIZE_N, CTAS_N, EPI_SPLIT, wmma_acc_layout, dot_b_layout, b_scale_layout_epi, shared_C_epi)  # fmt: skip
-                else:
+                if not (EPI_SPLIT > 1 and i == NUM_BUFFERS - 2 and j == NUM_KSUB - 1):
+                    # (with EPI_SPLIT the last WMMA runs sliced, after the loop)
                     acc = gl.amd.gfx1250.wmma_scaled(
                         cur_A, cur_AS, "e2m1", cur_B, cur_BS, "e2m1", acc
                     )
@@ -914,6 +915,12 @@ def gemm_mxfp4_preshuffle_gfx1250(
         # pair the last arrive, then keep every CTA resident until all peers are done
         if num_ctas > 1:
             gl.amd.gfx1250.cluster.wait()
+        if EPI_SPLIT > 1:
+            # last WMMA in slices, each slice's TDM store issued as soon as it is done. It must
+            # sit outside an arrive->wait window: the store path waits on the TDM counter, and a
+            # CTA stalled on it inside the window can hang the GPU.
+            _sliced_final_wmma_store(acc, cur_A, cur_AS, cur_B, cur_BS, c_ptr, M, N, stride_c_m, stride_c_n, tile_m, tile_n, BLOCK_SIZE_M, BLOCK_SIZE_N, CTAS_N, EPI_SPLIT, wmma_acc_layout, dot_b_layout, b_scale_layout_epi, shared_C_epi)  # fmt: skip
+        if num_ctas > 1:
             gl.amd.gfx1250.cluster.arrive()
             gl.amd.gfx1250.cluster.wait()
 
