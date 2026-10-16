@@ -111,7 +111,9 @@ def _load_mha_fwd_tuning_table(path: str) -> dict[tuple[str, ...], str]:
                         if reason is not None:
                             raise ValueError(reason)
                 key = problem.key()
-            except (KeyError, TypeError, ValueError, OSError) as error:
+            # Any error: the digest check imports and runs Triton's resolver,
+            # and no row may take every MHA call down with it.
+            except Exception as error:  # noqa: BLE001
                 logger.warning("%s:%d: skipping MHA tuned row: %s", path, line, error)
                 continue
             if key in table:
@@ -134,12 +136,26 @@ def clear_mha_fwd_tuning_cache() -> None:
     _mha_fwd_table_path.cache_clear()
     _load_mha_fwd_tuning_table.cache_clear()
     _mha_fwd_hardware_prefixes.cache_clear()
+    _mha_fwd_coarse_keys.cache_clear()
+
+
+_COARSE_FIELDS = ("mode", "hdim_q", "hdim_v", "dtype")
 
 
 @functools.lru_cache(maxsize=8)
 def _mha_fwd_hardware_prefixes(path: str) -> frozenset[tuple[str, ...]]:
     span = len(TUNING_HARDWARE_FIELDS)
     return frozenset(key[:span] for key in _load_mha_fwd_tuning_table(path))
+
+
+@functools.lru_cache(maxsize=8)
+def _mha_fwd_coarse_keys(path: str) -> frozenset[tuple[str, ...]]:
+    span = len(TUNING_HARDWARE_FIELDS)
+    positions = [MHA_FWD_TUNING_KEY_FIELDS.index(f) for f in _COARSE_FIELDS]
+    return frozenset(
+        (*key[:span], *(key[i] for i in positions))
+        for key in _load_mha_fwd_tuning_table(path)
+    )
 
 
 @torch._dynamo.assume_constant_result
@@ -153,8 +169,32 @@ def _mha_fwd_has_rows(prefix: tuple[str, ...] | None = None) -> bool:
     return bool(prefixes) if prefix is None else prefix in prefixes
 
 
+@torch._dynamo.assume_constant_result
+def _mha_fwd_has_coarse_rows(coarse: tuple[str, ...]) -> bool:
+    """Whether any row shares this hardware, mode, head dims and dtype: a
+    cheap screen before the full key is built."""
+    return coarse in _mha_fwd_coarse_keys(_mha_fwd_table_path())
+
+
+@torch._dynamo.assume_constant_result
+def _mha_fwd_local_hardware(device_id: int) -> tuple[str, ...]:
+    """This device's (gfx, gpu_model, cu_num) as row cells, or () when the
+    running arch is not the built one.
+
+    Constant-folded under torch.compile: the probe behind it reads the
+    filesystem and runs rocminfo, which dynamo cannot trace.
+    """
+    hardware = get_tuning_hardware(device_id)
+    # The kernel gates test the built arch, so a row keyed on the running arch
+    # is only safe to apply when the two agree.
+    if hardware["gfx"] != get_gfx():
+        return ()
+    return tuple(csv_scalar(hardware[field]) for field in TUNING_HARDWARE_FIELDS)
+
+
 def _mha_fwd_tuning_key(
     *,
+    hardware: tuple[str, ...] | None = None,
     mode: str,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -178,30 +218,35 @@ def _mha_fwd_tuning_key(
     cu_seqlens_q_padded: torch.Tensor | None,
     cu_seqlens_k_padded: torch.Tensor | None,
 ) -> tuple[str, ...]:
-    device_id = q.device.index if q.device.index is not None else 0
+    if hardware is None:
+        device_id = q.device.index if q.device.index is not None else 0
+        tuning_hardware = get_tuning_hardware(device_id)
+        hardware = tuple(tuning_hardware[field] for field in TUNING_HARDWARE_FIELDS)
+    # Coerced as MhaFwdProblem coerces row cells, so dropout_p=0 and 0.0, or
+    # causal=1 and True, find the same row.
     values = {
-        **get_tuning_hardware(device_id),
+        **dict(zip(TUNING_HARDWARE_FIELDS, hardware)),
         "mode": mode,
-        "batch": batch,
+        "batch": int(batch),
         "total_q": q.shape[0] if mode == "varlen" else batch * q.shape[1],
         "total_k": k.shape[0] if mode == "varlen" else batch * k.shape[1],
-        "max_seqlen_q": max_seqlen_q,
-        "max_seqlen_k": max_seqlen_k,
-        "min_seqlen_q": min_seqlen_q,
+        "max_seqlen_q": int(max_seqlen_q),
+        "max_seqlen_k": int(max_seqlen_k),
+        "min_seqlen_q": int(min_seqlen_q),
         "nhead_q": q.shape[-2],
         "nhead_k": k.shape[-2],
         "hdim_q": q.shape[-1],
         "hdim_v": v.shape[-1],
         "dtype": str(q.dtype).removeprefix("torch."),
-        "causal": causal,
-        "window_left": window_size[0],
-        "window_right": window_size[1],
-        "sink_size": window_size[2] if len(window_size) > 2 else 0,
-        "dropout_p": dropout_p,
-        "logits_soft_cap": logits_soft_cap,
-        "how_v3_bf16_cvt": how_v3_bf16_cvt,
-        "return_lse": return_lse,
-        "return_attn_probs": return_attn_probs,
+        "causal": bool(causal),
+        "window_left": int(window_size[0]),
+        "window_right": int(window_size[1]),
+        "sink_size": int(window_size[2]) if len(window_size) > 2 else 0,
+        "dropout_p": float(dropout_p),
+        "logits_soft_cap": float(logits_soft_cap),
+        "how_v3_bf16_cvt": int(how_v3_bf16_cvt),
+        "return_lse": bool(return_lse),
+        "return_attn_probs": bool(return_attn_probs),
         "has_bias": bias is not None,
         "has_alibi": alibi_slopes is not None,
         "has_sink": sink_ptr is not None,
@@ -237,20 +282,25 @@ def _get_mha_fwd_tuned_backend(**key_args) -> str | None:
     """
     if not ENABLE_CK or not _mha_fwd_has_rows():
         return None
-    q = key_args["q"]
-    device_id = q.device.index if q.device.index is not None else 0
-    hardware = get_tuning_hardware(device_id)
-    # The kernel gates below test the built arch, so a row keyed on the running
-    # arch is only safe to apply when the two agree.
-    if hardware["gfx"] != get_gfx():
+    q, v = key_args["q"], key_args["v"]
+    prefix = _mha_fwd_local_hardware(
+        q.device.index if q.device.index is not None else 0
+    )
+    if not prefix or not _mha_fwd_has_rows(prefix):
         return None
-    prefix = tuple(csv_scalar(hardware[field]) for field in TUNING_HARDWARE_FIELDS)
-    if not _mha_fwd_has_rows(prefix):
+    coarse = (
+        *prefix,
+        key_args["mode"],
+        str(q.shape[-1]),
+        str(v.shape[-1]),
+        str(q.dtype).removeprefix("torch."),
+    )
+    if not _mha_fwd_has_coarse_rows(coarse):
         return None
     # The key is derived outside the constant-folded read, so under
     # torch.compile dynamo specializes on the sizes it reads and a second
     # shape looks itself up instead of inheriting the first shape's row.
-    return _mha_fwd_backend_for_key(_mha_fwd_tuning_key(**key_args))
+    return _mha_fwd_backend_for_key(_mha_fwd_tuning_key(hardware=prefix, **key_args))
 
 
 @functools.cache
@@ -4188,7 +4238,7 @@ def flash_attn_varlen_func(
 
         _record_mha_fwd_selection(tuned_backend)
         # No config: Triton resolves its own tile, the one the row was tuned with.
-        return flash_attn_varlen_func_triton(
+        result = flash_attn_varlen_func_triton(
             q=q,
             k=k,
             v=v,
@@ -4210,6 +4260,12 @@ def flash_attn_varlen_func(
             sink=sink_ptr,
             backend=tuned_backend,
         )
+        # Triton's entry takes out= but returns a tensor of its own, while a
+        # caller of the CK path reads the result from out.
+        if out is not None and result is not out:
+            out.copy_(result)
+            return out
+        return result
 
     if not ENABLE_CK:
         from .triton.attention.mha import (

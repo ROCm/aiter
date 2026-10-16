@@ -73,6 +73,18 @@ MHA_FWD_TRITON_BACKENDS = frozenset({"triton", "gluon"})
 MHA_FWD_BACKENDS = frozenset(
     {"asm_v3", "ck", "flydsl", "opus", *MHA_FWD_TRITON_BACKENDS}
 )
+# torch dtype names an MHA forward query can carry.
+MHA_FWD_DTYPES = frozenset(
+    {
+        "bfloat16",
+        "float16",
+        "float32",
+        "float8_e4m3fn",
+        "float8_e4m3fnuz",
+        "float8_e5m2",
+        "float8_e5m2fnuz",
+    }
+)
 
 
 def csv_scalar(value: Any) -> str:
@@ -150,6 +162,8 @@ class MhaFwdProblem:
             raise ValueError("cu_num must be positive")
         if self.mode not in ("batch", "varlen"):
             raise ValueError(f"unsupported MHA mode {self.mode!r}")
+        if self.dtype not in MHA_FWD_DTYPES:
+            raise ValueError(f"unsupported MHA dtype {self.dtype!r}")
         for name in (
             "batch",
             "total_q",
@@ -240,10 +254,14 @@ def triton_unsupported_reason(problem: MhaFwdProblem, backend: str) -> str | Non
     if problem.is_grad:
         # Rows are tuned on the forward pass; the backward would move with it.
         return "a forward-tuned row must not move the backward pass to Triton"
+    if problem.window_right != -1:
+        return "Triton MHA has no right window"
+    if problem.has_bias:
+        return "Triton MHA has no bias"
+    if problem.has_block_table:
+        return "the Triton varlen entry does not page K/V through block_table"
     if backend != "gluon":
         return None
-    if problem.window_right != -1:
-        return "Gluon MHA has no right window"
     from .triton.attention.mha import gluon_forward_unsupported_reason
 
     return gluon_forward_unsupported_reason(
@@ -285,5 +303,7 @@ def triton_config(problem: MhaFwdProblem, backend: str) -> dict[str, Any]:
 
 
 def config_digest(config: Mapping[str, Any]) -> str:
+    # Prefixed so it never reads as a number: a CSV merge without dtype=str
+    # would turn an all-digit hex digest into an int or a float.
     payload = json.dumps(dict(config), sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode()).hexdigest()[:12]
+    return "sha256:" + hashlib.sha256(payload.encode()).hexdigest()[:12]

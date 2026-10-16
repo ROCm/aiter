@@ -164,6 +164,29 @@ class TestMhaFwdKey(unittest.TestCase):
             key = mha._mha_fwd_tuning_key(**_key_args())
         self.assertEqual(key, MhaFwdProblem.from_mapping(_problem_row()).key())
 
+    def test_int_and_bool_spellings_of_a_call_find_the_same_row(self):
+        with _on():
+            key = mha._mha_fwd_tuning_key(
+                **{
+                    **_key_args(),
+                    "dropout_p": 0,
+                    "logits_soft_cap": 0,
+                    "causal": 0,
+                    "return_lse": 0,
+                    "window_size": [-1, -1, 0],
+                }
+            )
+        self.assertEqual(key, MhaFwdProblem.from_mapping(_problem_row()).key())
+
+    def test_an_unknown_dtype_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "dtype"):
+            MhaFwdProblem.from_mapping(_problem_row(dtype="bfloat17"))
+
+    def test_a_digest_never_reads_as_a_number(self):
+        digest = mha.config_digest({"BLOCK_M": 1})
+        self.assertTrue(digest.startswith("sha256:"))
+        self.assertEqual(len(digest), len("sha256:") + 12)
+
 
 class TestMhaFwdTable(_Table):
     def test_the_runtime_key_finds_a_row(self):
@@ -245,6 +268,24 @@ class TestTritonRows(_Table):
     def test_a_row_without_a_digest_is_skipped(self):
         self.assert_skipped(_tuned_row("triton"), "needs config_digest")
 
+    def test_a_row_whose_digest_check_fails_to_run_is_skipped(self):
+        # A renamed private resolver, or a row Triton cannot resolve, must
+        # cost that row only, not every MHA call.
+        rows = [
+            _tuned_row("triton", config_digest=TRITON_DIGEST),
+            _tuned_row("asm_v3", total_q=2048, max_seqlen_q=2048),
+        ]
+        for error in (ImportError("no _get_config"), AttributeError("bfloat17")):
+            with self.subTest(error=type(error).__name__):
+                mha.clear_mha_fwd_tuning_cache()
+                with (
+                    mock.patch.object(mha, "get_gfx", return_value="gfx942"),
+                    mock.patch.object(mha, "triton_config", side_effect=error),
+                    self.assertLogs("aiter", level="WARNING"),
+                ):
+                    table = mha._load_mha_fwd_tuning_table(self.use(rows))
+                self.assertEqual(list(table.values()), ["asm_v3"])
+
     def test_a_row_triton_cannot_serve_is_skipped(self):
         for key, reason in (
             ({"logits_soft_cap": 30.0}, "soft-cap"),
@@ -252,6 +293,9 @@ class TestTritonRows(_Table):
             ({"has_q_descale": 1}, "FP8"),
             ({"return_lse": 1}, "layout"),
             ({"is_grad": 1}, "backward"),
+            ({"has_block_table": 1}, "block_table"),
+            ({"has_bias": 1}, "bias"),
+            ({"causal": 1, "window_left": 127, "window_right": 0}, "right window"),
         ):
             with self.subTest(**key):
                 mha.clear_mha_fwd_tuning_cache()
@@ -317,6 +361,33 @@ class TestMhaFwdLookup(_Table):
         torch._dynamo.reset()
         compiled = torch.compile(call, fullgraph=True, dynamic=True)
         compiled(args["q"], args["k"], args["v"])
+
+    @unittest.skipUnless(torch.cuda.is_available(), "probes the real GPU")
+    def test_a_table_with_rows_compiles_fullgraph_with_the_real_probe(self):
+        # No hardware mock: the probe reads sysfs and runs rocminfo, which
+        # dynamo cannot trace, so it has to stay outside the graph.
+        self.use([_tuned_row("ck", gpu_model="mi300x")])
+
+        def call(q, k, v):
+            backend = mha._get_mha_fwd_tuned_backend(
+                **{**_key_args(), "q": q, "k": k, "v": v}
+            )
+            return q.sum() if backend is None else q.mean()
+
+        args = _key_args()
+        torch._dynamo.reset()
+        compiled = torch.compile(call, fullgraph=True, dynamic=True)
+        compiled(args["q"], args["k"], args["v"])
+
+    def test_other_head_dims_skip_the_key(self):
+        self.use([_tuned_row("ck", hdim_q=128, hdim_v=128)])
+        with (
+            _on(),
+            mock.patch.object(mha, "get_gfx", return_value="gfx942"),
+            mock.patch.object(mha, "_mha_fwd_tuning_key") as key,
+        ):
+            self.assertIsNone(mha._get_mha_fwd_tuned_backend(**_key_args()))
+        key.assert_not_called()
 
     def test_rows_for_other_hardware_skip_the_key(self):
         self.use([_tuned_row("ck", gpu_model="mi300x")])
@@ -451,6 +522,21 @@ class TestFlashAttnVarlenFunc(unittest.TestCase):
         self.assertEqual(kwargs["backend"], "gluon")
         self.assertNotIn("config", kwargs)
         self.assertEqual(selections, [{"backend": "gluon"}])
+
+    def test_a_triton_row_writes_the_callers_out_buffer(self):
+        q, k, v, cu_q, cu_k = _dummy_varlen_tensors()
+        out = torch.full((q.shape[0], q.shape[1], v.shape[-1]), float("nan"))
+        computed = torch.ones_like(out)
+        with (
+            mock.patch.object(mha, "_get_mha_fwd_tuned_backend", return_value="triton"),
+            mock.patch(
+                "aiter.ops.triton.attention.mha.flash_attn_varlen_func",
+                return_value=computed,
+            ),
+        ):
+            result = mha.flash_attn_varlen_func(q, k, v, cu_q, cu_k, 8, 16, out=out)
+        self.assertIs(result, out)
+        self.assertTrue(torch.equal(out, computed))
 
     def test_a_declined_flydsl_row_continues_as_auto_select(self):
         mha._warn_declined_mha_fwd_row.cache_clear()
