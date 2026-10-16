@@ -11,6 +11,7 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `test_compare_logic.py` | 1 | No | Compare/update_improved: `_build_compare_update_plan`, `_merge_compare_filtered_results` |
 | `test_mp_tuner_logic.py` | 1 | No | `mp_tuner` polling: timeout, AcceleratorError, KeyError, pool restart |
 | `test_mha_fwd_dispatch.py` | 1 | No | MHA forward tuned-row lookup: exact key, a bad row is skipped rather than failing the table, an empty table returns before building a key, a hit pins the backend, a row the backend cannot serve falls back to auto-select, a Triton or Gluon row holds only while Triton resolves the tile it was tuned with, dispatch records what it ran |
+| `test_mha_tuner_logic.py` | 1 | No | MHA forward tuner as a `GatedTuner` family: the chunked reference against plain softmax attention (GQA, causal with unequal lengths, sliding window, LSE), one candidate per backend on each arch with Triton/Gluon dropped where they cannot stand in, `--backends` keeping the incumbent, a Triton row stamped with the digest of the tile it ran, the selection hooks, and one publish through the gate |
 | `test_mp_tuner_fault.py` | 2 | Yes | `mp_tuner` with a candidate that faults in-process, kills its worker, or fails while its inputs are prepared: untyped callers get the whole group failed, `return_status` callers keep what was measured and see `not_run` behind the fault, and a shape queued behind a dead worker still finishes |
 | `test_tuning_policy.py` | 1 | No | `aiter/utility/tuning_policy.py`: measurement, run and promotion defaults reach `ARG_DEFAULTS`, policy validation, `gate_against_incumbent` boundaries |
 | `test_selection_proof.py` | 1 | No | `aiter/utility/selection_proof.py` against a stub family: a fresh process that records the row's selection is verified, a different or missing selection and a wrong output are not, no expectation is reported as unchecked, a row keyed on another GPU fails before spawning, and `TunerCommon.run_config` proves rows for a family that opts in |
@@ -48,6 +49,7 @@ runtime budgets.
 | `fhmoe` | `op_tests/tuners/tune_fhmoe.py` | `tuned_fhmoe.csv` | — | ✓ (HY4 MXFP8/FP8) |
 | `gradlib_bf16` | `gradlib/gradlib/gemm_tuner.py` | `bf16_tuned_gemm.csv` | ✓ | ✓ (hipBLASLt/ASM/FlyDSL) |
 | `gdn_k5_opt` | `csrc/gdn_k5/chunk_gdn_h_opt_tune.py` | `model_configs/*_chunk_gdn_h_opt_tuned.csv` | ✓ | ✓ (shape-only varlen smoke) |
+| `mha_fwd` | `op_tests/tuners/tune_mha_fwd.py` | `tuned_mha_fwd.csv` | skipped until the CSV has rows for the GPU | ✓ (one varlen shape, CK and Triton plus the auto-select incumbent) |
 
 Mixed-MXFP coverage is provided by
 `csrc/gemm_a6w4/gemm_a6w4_tune.py` and

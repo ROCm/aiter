@@ -24,8 +24,11 @@ from typing import Any
 from ..jit.utils.chip_info import TUNING_HARDWARE_FIELDS
 
 MHA_FWD_FAMILY = "mha_fwd"
+MHA_FWD_TUNER_SCRIPT = "op_tests/tuners/tune_mha_fwd.py"
 MHA_FWD_CONFIG_ENV = "AITER_CONFIG_MHA_FWD"
+MHA_FWD_CONFIG_PROPERTY = "AITER_CONFIG_MHA_FWD_FILE"
 MHA_FWD_TUNED_CSV = "tuned_mha_fwd.csv"
+MHA_FWD_UNTUNED_CSV = "untuned_mha_fwd.csv"
 
 MHA_FWD_PROBLEM_KEY_FIELDS = (
     "mode",
