@@ -27,6 +27,7 @@ the decode-sized activation policy to FP8. Plain-SiLU EP selects FP8 directly
 on gfx950, so its regression runs with the default threshold.
 """
 
+import importlib
 import os
 
 import pytest
@@ -129,8 +130,12 @@ def test_passthrough_is_bit_identical_to_internal_quantization(tokens):
     )
 
 
-def test_ep_silu_interleave_uses_a8w4_below_default_threshold(monkeypatch):
-    """Plain-SiLU EP must not fall into unsupported A16W4."""
+@pytest.mark.parametrize("build_gfx", ["gfx950", "gfx942", "gfx1250"])
+def test_ep_silu_interleave_uses_a8w4_below_default_threshold(monkeypatch, build_gfx):
+    """Plain-SiLU EP must select A8W4 using the live GPU, not the build target."""
+    fused_moe_module = importlib.import_module("aiter.fused_moe")
+    monkeypatch.setattr(fused_moe_module, "get_gfx", lambda: build_gfx)
+    get_2stage_cfgs.cache_clear()
     monkeypatch.setenv("AITER_BF16_FP8_MOE_BOUND", "256")
     monkeypatch.setenv("AITER_FLYDSL_FORCE", "0")
     x, w1, w2, kwargs = _build(8)

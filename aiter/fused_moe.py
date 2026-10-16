@@ -1526,7 +1526,7 @@ def _fused_moe_impl(
         and q_dtype_w == dtypes.fp4x2
         and activation == ActivationType.Silu
         and gate_mode == GateMode.INTERLEAVE
-        and get_gfx() == "gfx950"
+        and get_gfx_runtime() == "gfx950"
         and expert_mask is not None
         and getattr(w1, "gate_up_interleave", None) is not False
         and isShuffled
@@ -4269,7 +4269,7 @@ def get_2stage_cfgs(
         and q_dtype_a == dtypes.fp8
         and q_dtype_w == dtypes.fp4x2
         and gate_mode == GateMode.INTERLEAVE
-        and get_gfx() == "gfx950"
+        and get_gfx_runtime() == "gfx950"
         and _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode, gate_up_interleave)
         and is_shuffled
         and use_g1u1
