@@ -579,8 +579,7 @@ def get_mxscale_preshuffle_config(
     )
 
 
-# Pre-shuffled per-1x32 scales. The shared launcher no longer defaults a
-# contract; callers name the block and layout on every call.
+# shuffle_scale_a16w4 scales: one E8M0 byte per 32 K, in MFMA operand order.
 _MXFP8_MFMA_1X32 = (
     ("a_scale_block", "1x32"),
     ("a_scale_layout", "mfma_tile"),
