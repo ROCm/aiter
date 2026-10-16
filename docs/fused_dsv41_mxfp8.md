@@ -32,7 +32,7 @@ is inserted to inspect GPU contents.
 All tensors are contiguous on the same GPU. Q, BF16 extend, quantized output
 and optional debug output require 16-byte alignment. Output buffers must not
 overlap inputs or each other. Pass all three extend tensors together, or omit
-all three for the FP8-only decode path. FP4-tagged cache rows are unsupported.
+all three for pure-cache attention. FP4-tagged cache rows are unsupported.
 
 Q and selected KV values must be finite; sink may also be negative infinity.
 Attention rounds to BF16 before inverse RoPE and quantization. Empty rows
@@ -101,6 +101,32 @@ scales, token-slice output writes and complete model forward are separate
 integration work. Optional `extend_kv` remains BF16. The numerical path still
 rounds attention to BF16 before inverse RoPE and quantization.
 
+## Contiguous BF16 cache / prefill workspace
+
+```python
+from aiter import fused_dsv41_bf16
+
+out, scales, max_logits, lse = fused_dsv41_bf16(
+    q, kv_bf16, row_indices_int32, indptr_int32, cos, sin, positions,
+    q_is_rotated=False, attn_sink=sink,
+)
+```
+
+`kv_bf16` is contiguous, 16-byte-aligned BF16 `[S,512]` or `[S,1,512]` on
+Q's device, with KV RoPE already applied. Indices are flat int32 logical row
+indices with CSR `indptr[T+1]`. Negative/out-of-range indices are masked;
+empty rows use the same zero/max/LSE convention. FP8 page metadata must be
+omitted. The singleton-head view performs no copy. The general
+`fused_dsv41_mxfp8` entry also accepts a two-dimensional BF16 pool.
+
+Optional output buffers and stream/graph behavior match the FP8 entry. No
+gather/dequant or index conversion occurs here; callers can supply a native
+BF16 cache or a previously decoded workspace. Q/RoPE/output formats remain
+the existing AITER formats. This is not the full FlashMLA mega tensor ABI.
+
+See [decode profiling and optimized FP8/BF16 comparison](fused_dsv41_decode_prefill_20261016.md)
+for the measured changes, input reuse assumptions and timing boundaries.
+
 ## Usage and graph replay
 
 ```python
@@ -129,13 +155,13 @@ The convenience entry above selects Q's device automatically.
 Legacy and paged addressing use separate compile-time kernel variants. B32/B128
 pages are specialized; other page sizes use the general paged variant.
 
-H64/H128 with `T <= 1024` and no BF16 extend use raw FP8 prefetch. H64 issues
-the next raw KV loads before QK and decodes after QK; H128 decodes after PV.
-H64 rematerializes bounded lane indices at each phase to shorten address
-register lifetimes and reduce scratch traffic. Scheduling barriers protect
-PV accumulators while KV panels are reused. H8/H16/H32 and BF16 extend use
-the established shared-KV pipelines. H128 switches to its late-load pipeline
-at `T >= 2048`.
+H64/H128 pure-cache attention uses the specialized pipeline for all token
+counts, for either FP8 cache or BF16 workspace. H64 prefetches FP8 before QK
+and commits after QK; H128 commits after PV. BF16 loads directly to LDS at
+the corresponding stage. H64 retains eight lane-specific scale bytes; H128
+reads KV validity flags from LDS. Scheduling barriers protect PV consumers.
+H8/H16/H32 and mixed prefix/extend retain the established shared-KV kernels;
+mixed-source H128 switches to its late loader at `T >= 2048`.
 
 The module uses AITER's `compile_ops(..., develop=True)`, `aiter_tensor_t`,
 pybind and current HIP stream. `-ffp-contract=off` preserves the inverse-RoPE
@@ -150,7 +176,7 @@ timing. The operator does not switch an entire model forward to this path.
 ## Validation
 
 ```bash
-GPU_ARCHS=gfx950 python -m pytest op_tests/test_fused_dsv41_mxfp8.py op_tests/test_fused_dsv41_paged.py -q
+GPU_ARCHS=gfx950 python -m pytest op_tests/test_fused_dsv41_mxfp8.py op_tests/test_fused_dsv41_paged.py op_tests/test_fused_dsv41_bf16.py -q
 GPU_ARCHS=gfx950 python op_tests/test_fused_dsv41_mxfp8.py --benchmark --tokens 560 --heads 64 --kv 640
 ```
 

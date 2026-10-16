@@ -3,8 +3,8 @@
 #include "aiter_stream.h"
 #include "fused_dsv41/kernel_args.hpp"
 #include "fused_dsv41_mxfp8.h"
-#include <climits>
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstring>
 
@@ -69,21 +69,37 @@ void fused_dsv41_mxfp8_fwd(const aiter_tensor_t& q,
     AITER_CHECK(h == 8 || h == 16 || h == 32 || h == 64 || h == 128, "unsupported head count");
     AITER_CHECK(t <= INT_MAX && prefix.numel() <= INT_MAX, "dimensions must fit int32");
     check_tensor(q, "q", AITER_DTYPE_bf16, {t, h, 512}, device, 16);
-    AITER_CHECK(pool.dim() == 1 || (pool.dim() == 2 && pool.size(1) == 1),
-                "pool must be [bytes] or [bytes,1]");
-    AITER_CHECK(pool.is_gpu() && pool.device_id == device && pool.is_contiguous() &&
-                    pool.dtype() == AITER_DTYPE_u8 &&
-                    reinterpret_cast<uintptr_t>(pool.data_ptr()) % 4 == 0,
-                "pool must be contiguous uint8 and 4-byte aligned on q.device");
-    AITER_CHECK(cache_page_size >= 0 && cache_page_size <= INT_MAX &&
-                    cache_num_rows >= 0 && cache_num_rows <= INT_MAX,
+    const bool bf16_cache = pool.dtype() == AITER_DTYPE_bf16;
+    if(bf16_cache)
+    {
+        AITER_CHECK(pool.dim() == 2 && pool.size(0) <= INT_MAX,
+                    "BF16 pool must be [S,512] with S fitting int32");
+        check_tensor(pool, "pool", AITER_DTYPE_bf16, {pool.size(0), 512}, device, 16);
+        AITER_CHECK(cache_page_size == 0 && !cache_scales,
+                    "BF16 pool does not accept FP8 page metadata");
+    }
+    else
+    {
+        AITER_CHECK(pool.dim() == 1 || (pool.dim() == 2 && pool.size(1) == 1),
+                    "pool must be [bytes] or [bytes,1]");
+        AITER_CHECK(pool.is_gpu() && pool.device_id == device && pool.is_contiguous() &&
+                        pool.dtype() == AITER_DTYPE_u8 &&
+                        reinterpret_cast<uintptr_t>(pool.data_ptr()) % 4 == 0,
+                    "pool must be contiguous uint8 and 4-byte aligned on q.device");
+    }
+    AITER_CHECK(cache_page_size >= 0 && cache_page_size <= INT_MAX && cache_num_rows >= 0 &&
+                    cache_num_rows <= INT_MAX,
                 "cache page size and row count must fit nonnegative int32");
     const bool paged = cache_page_size != 0;
     AITER_CHECK(paged == bool(cache_scales), "paged cache requires cache_scales and page size");
     if(paged)
     {
-        check_tensor(*cache_scales, "cache_scales", AITER_DTYPE_u8,
-                     {static_cast<int64_t>(cache_scales->numel())}, device, 4);
+        check_tensor(*cache_scales,
+                     "cache_scales",
+                     AITER_DTYPE_u8,
+                     {static_cast<int64_t>(cache_scales->numel())},
+                     device,
+                     4);
         AITER_CHECK(cache_data_page_stride >= cache_page_size * 512 &&
                         cache_scale_page_stride >= cache_page_size * 16 &&
                         cache_data_page_stride % 4 == 0 && cache_scale_page_stride % 4 == 0,
@@ -93,8 +109,12 @@ void fused_dsv41_mxfp8_fwd(const aiter_tensor_t& q,
         AITER_CHECK(cache_num_rows == 0 && cache_data_page_stride == 0 &&
                         cache_scale_page_stride == 0,
                     "cache metadata requires paged mode");
-    check_tensor(prefix, "prefix", paged ? AITER_DTYPE_i32 : AITER_DTYPE_i64,
-                 {static_cast<int64_t>(prefix.numel())}, device, paged ? 4 : 8);
+    check_tensor(prefix,
+                 "prefix",
+                 (paged || bf16_cache) ? AITER_DTYPE_i32 : AITER_DTYPE_i64,
+                 {static_cast<int64_t>(prefix.numel())},
+                 device,
+                 (paged || bf16_cache) ? 4 : 8);
     check_tensor(prefix_indptr, "prefix_indptr", AITER_DTYPE_i32, {t + 1}, device, 4);
     AITER_CHECK(positions.dtype() == AITER_DTYPE_i32 || positions.dtype() == AITER_DTYPE_i64,
                 "positions must be int32 or int64");
@@ -132,20 +152,29 @@ void fused_dsv41_mxfp8_fwd(const aiter_tensor_t& q,
     AITER_CHECK(std::strncmp(properties.gcnArchName, "gfx950", 6) == 0,
                 "fused_dsv41_mxfp8 requires gfx950");
     FusedDsv41Args a{};
-    a.q             = static_cast<const B*>(q.data_ptr());
-    a.pool          = static_cast<const uint8_t*>(pool.data_ptr());
-    a.prefix        = prefix.data_ptr();
-    a.cache.scales = paged ? static_cast<const uint8_t*>(cache_scales->data_ptr()) : nullptr;
-    a.cache.page_size = cache_page_size;
-    a.cache.num_rows = paged ? std::min(
-        backed_rows(pool.numel(), cache_data_page_stride, cache_page_size, 512, cache_num_rows),
-        backed_rows(cache_scales->numel(), cache_scale_page_stride, cache_page_size, 16, cache_num_rows)) : 0;
-    a.cache.data_page_stride = cache_data_page_stride;
+    a.q               = static_cast<const B*>(q.data_ptr());
+    a.pool            = static_cast<const uint8_t*>(pool.data_ptr());
+    a.prefix          = prefix.data_ptr();
+    a.cache.scales    = paged ? static_cast<const uint8_t*>(cache_scales->data_ptr()) : nullptr;
+    a.cache.page_size = bf16_cache ? -2 : cache_page_size;
+    a.cache.num_rows =
+        bf16_cache ? pool.size(0)
+        : paged
+            ? std::min(
+                  backed_rows(
+                      pool.numel(), cache_data_page_stride, cache_page_size, 512, cache_num_rows),
+                  backed_rows(cache_scales->numel(),
+                              cache_scale_page_stride,
+                              cache_page_size,
+                              16,
+                              cache_num_rows))
+            : 0;
+    a.cache.data_page_stride  = cache_data_page_stride;
     a.cache.scale_page_stride = cache_scale_page_stride;
-    a.prefix_indptr = static_cast<const int*>(prefix_indptr.data_ptr());
-    a.cos           = static_cast<const B*>(cos.data_ptr());
-    a.sin           = static_cast<const B*>(sin.data_ptr());
-    a.positions     = positions.data_ptr();
+    a.prefix_indptr           = static_cast<const int*>(prefix_indptr.data_ptr());
+    a.cos                     = static_cast<const B*>(cos.data_ptr());
+    a.sin                     = static_cast<const B*>(sin.data_ptr());
+    a.positions               = positions.data_ptr();
     if(extend_kv)
     {
         a.extend_kv     = static_cast<const B*>(extend_kv->data_ptr());

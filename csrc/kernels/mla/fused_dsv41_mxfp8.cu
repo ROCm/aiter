@@ -61,7 +61,12 @@ __global__ __launch_bounds__(256, 2) void fused_dsv41_mxfp8_kernel_64(FusedDsv41
     int end   = max(begin, min(a.prefix_capacity, a.prefix_indptr[t + 1]));
     if(end > begin)
     {
-        PackedCacheSource64<true, PageSize> src{a.pool, a.prefix_at<PageSize>(begin), end - begin, a.pool_bytes, a.cache};
+        PackedCacheSource64<(PageSize != -2), PageSize> src{
+            a.pool,
+            a.prefix_at<PageSize>(begin),
+            end - begin,
+            (PageSize == -2 ? a.cache.num_rows : a.pool_bytes),
+            a.cache};
         packed_prefill_accum64<T>(src,
                                   end - begin,
                                   (end - begin + 31) / 32,
@@ -194,8 +199,12 @@ __global__ __launch_bounds__(512, 1) void fused_dsv41_mxfp8_kernel_128(FusedDsv4
     int end   = max(begin, min(a.prefix_capacity, a.prefix_indptr[t + 1]));
     if(end > begin)
     {
-        PackedCacheSource128<true, LateLoad, PageSize> src{
-            a.pool, a.prefix_at<PageSize>(begin), end - begin, a.pool_bytes, a.cache};
+        PackedCacheSource128<(PageSize != -2), LateLoad, PageSize> src{
+            a.pool,
+            a.prefix_at<PageSize>(begin),
+            end - begin,
+            (PageSize == -2 ? a.cache.num_rows : a.pool_bytes),
+            a.cache};
         packed_prefill_accum128<T, LateLoad>(src,
                                              end - begin,
                                              (end - begin + 31) / 32,
@@ -333,7 +342,12 @@ __global__ __launch_bounds__(256, 2) void fused_dsv41_mxfp8_kernel_small(FusedDs
     int end   = max(begin, min(a.prefix_capacity, a.prefix_indptr[t + 1]));
     if(end > begin)
     {
-        PackedCacheSourceSmall<true, PageSize> src{a.pool, a.prefix_at<PageSize>(begin), end - begin, a.pool_bytes, a.cache};
+        PackedCacheSourceSmall<(PageSize != -2), PageSize> src{
+            a.pool,
+            a.prefix_at<PageSize>(begin),
+            end - begin,
+            (PageSize == -2 ? a.cache.num_rows : a.pool_bytes),
+            a.cache};
         packed_prefill_accum_small<T, Parts>(src,
                                              end - begin,
                                              (end - begin + 31) / 32,
@@ -467,7 +481,12 @@ __global__ __launch_bounds__(256, 2) void fused_dsv41_mxfp8_decode_64(FusedDsv41
     int end   = max(begin, min(a.prefix_capacity, a.prefix_indptr[t + 1]));
     if(end > begin)
     {
-        PackedDecodeSource64<true, PageSize> src{a.pool, a.prefix_at<PageSize>(begin), end - begin, a.pool_bytes, a.cache};
+        PackedDecodeSource64<(PageSize != -2), PageSize> src{
+            a.pool,
+            a.prefix_at<PageSize>(begin),
+            end - begin,
+            (PageSize == -2 ? a.cache.num_rows : a.pool_bytes),
+            a.cache};
         packed_decode_accum64<T>(src,
                                  end - begin,
                                  (end - begin + 31) / 32,
@@ -600,8 +619,12 @@ __global__ __launch_bounds__(512, 1) void fused_dsv41_mxfp8_decode_128(FusedDsv4
     int end   = max(begin, min(a.prefix_capacity, a.prefix_indptr[t + 1]));
     if(end > begin)
     {
-        PackedDecodeSource128<true, LateLoad, PageSize> src{
-            a.pool, a.prefix_at<PageSize>(begin), end - begin, a.pool_bytes, a.cache};
+        PackedDecodeSource128<(PageSize != -2), LateLoad, PageSize> src{
+            a.pool,
+            a.prefix_at<PageSize>(begin),
+            end - begin,
+            (PageSize == -2 ? a.cache.num_rows : a.pool_bytes),
+            a.cache};
         packed_decode_accum128<T, LateLoad>(src,
                                             end - begin,
                                             (end - begin + 31) / 32,
@@ -702,9 +725,10 @@ hipError_t launch_cache_mode(const FusedDsv41Args* a, int rotate_q, hipStream_t 
 {
     if(!a->tokens)
         return hipSuccess;
-    // Full-FP8 decode: prefetch raw bytes before QK; commit after QK (H64)
-    // or after PV (H128). Other shapes retain the validated v4 kernels.
-    if(!a->extend_indptr && a->tokens <= 1024 && (a->heads == 64 || a->heads == 128))
+    // Pure-cache attention uses the specialized pipeline for decode and prefill.
+    // FP8 prefetches raw bytes before QK; BF16 loads directly to LDS.
+    // Commit/load is after QK (H64) or PV (H128). Mixed sources keep v4.
+    if(!a->extend_indptr && (a->heads == 64 || a->heads == 128))
     {
         dim3 grid(a->tokens);
         if(a->heads == 64)
@@ -774,6 +798,7 @@ hipError_t launch_fused_dsv41_mxfp8(const FusedDsv41Args* a, int rotate_q, hipSt
 {
     switch(a->cache.page_size)
     {
+    case -2: return launch_cache_mode<-2>(a, rotate_q, stream); // Contiguous BF16 rows.
     case 0: return launch_cache_mode<0>(a, rotate_q, stream);
     case 32: return launch_cache_mode<32>(a, rotate_q, stream);
     case 128: return launch_cache_mode<128>(a, rotate_q, stream);

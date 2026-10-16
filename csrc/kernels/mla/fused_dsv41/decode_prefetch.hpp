@@ -46,7 +46,7 @@ struct PackedDecodeSource64
     struct RawTile
     {
         opus::vector_t<uint32_t, 2> bytes[8];
-        opus::vector_t<uint32_t, 4> scales;
+        opus::vector_t<uint32_t, 2> scales; // Eight lane-specific scale codes.
         bool live;
     };
     __device__ __forceinline__ RawTile prefetch(int tile, int wave, int lane) const
@@ -60,9 +60,14 @@ struct PackedDecodeSource64
         tile_data.live  = valid_row(r);
         if(tile_data.live)
         {
-            const auto* src    = cache.data<PageSize>(pool, r);
-            const auto* scales = reinterpret_cast<const Words4*>(cache.scale<PageSize>(pool, r));
-            tile_data.scales   = {scales->x, scales->y, scales->z, scales->w};
+            const auto* src      = cache.data<PageSize>(pool, r);
+            const auto* scales   = reinterpret_cast<const Words4*>(cache.scale<PageSize>(pool, r));
+            const unsigned shift = ((lane % 8) / 4) * 8;
+            auto pair_codes      = [shift](uint32_t word) {
+                return ((word >> shift) & 255u) | (((word >> (shift + 16)) & 255u) << 8);
+            };
+            tile_data.scales = {pair_codes(scales->x) | (pair_codes(scales->y) << 16),
+                                pair_codes(scales->z) | (pair_codes(scales->w) << 16)};
             opus::static_for<8>([&](auto j) {
                 const auto* values =
                     reinterpret_cast<const Words2*>(src + int(j) * 64 + (lane % 8) * 8);
@@ -82,12 +87,11 @@ struct PackedDecodeSource64
         auto* lds = reinterpret_cast<OPUS_LDS_ADDR bf16_t*>(reinterpret_cast<uintptr_t>(dst));
         if((lane & 7) == 0)
             reinterpret_cast<OPUS_LDS_ADDR uint32_t*>(lds + wave * 528 + 512)[lane / 8] = raw.live;
-        const auto scales = __builtin_bit_cast(opus::vector_t<uint8_t, 16>, raw.scales);
         opus::static_for<8>([&](auto j) {
             opus::vector_t<bf16_t, 8> values{};
             if(raw.live)
             {
-                unsigned code = scales[int(j) * 2 + (lane % 8) / 4];
+                unsigned code = (raw.scales[int(j) / 4] >> ((int(j) % 4) * 8)) & 255u;
                 float scale   = code == 0     ? 0x1p-127f
                                 : code == 255 ? __builtin_nanf("")
                                               : __uint_as_float(code << 23);
@@ -398,10 +402,9 @@ struct PackedDecodeSource128
             // Each lane uses one scale from each four-group chunk.
             // Select before QK/PV so only one scale word remains live.
             const unsigned shift = ((wave / 4) * 2 + (lane % 8) / 4) * 8;
-            tile_data.scales = ((scales->x >> shift) & 255u) |
-                               (((scales->y >> shift) & 255u) << 8) |
-                               (((scales->z >> shift) & 255u) << 16) |
-                               (((scales->w >> shift) & 255u) << 24);
+            tile_data.scales =
+                ((scales->x >> shift) & 255u) | (((scales->y >> shift) & 255u) << 8) |
+                (((scales->z >> shift) & 255u) << 16) | (((scales->w >> shift) & 255u) << 24);
             opus::static_for<4>([&](auto j) {
                 const auto* values = reinterpret_cast<const Words2*>(
                     src + int(j) * 128 + (wave / 4) * 64 + (lane % 8) * 8);
@@ -451,6 +454,9 @@ struct PackedDecodeSource128
         const int i     = tile * 32 + (lane / 8) * 4 + (wave % 4);
         const int64_t r = row(i);
         const bool live = valid_row(r);
+        auto* flags     = reinterpret_cast<OPUS_LDS_ADDR bf16_t*>(reinterpret_cast<uintptr_t>(dst));
+        if(wave < 4 && (lane & 7) == 0)
+            reinterpret_cast<OPUS_LDS_ADDR uint32_t*>(flags + wave * 528 + 512)[lane / 8] = live;
         if constexpr(!Packed)
         {
             const bf16_t* src = live ? static_cast<const bf16_t*>(pool) + r * 512 : fused_zero_kv;
@@ -550,7 +556,7 @@ __device__ void packed_decode_accum128(
 
     int lane_id = thread_id_x() % T::WARP_SIZE;
     asm volatile("" : "+v"(lane_id)); // break CSE
-    lane_id &= 63; // Restore the lane range hidden by the opaque asm.
+    lane_id &= 63;                    // Restore the lane range hidden by the opaque asm.
     const int warp_id =
         __builtin_amdgcn_readfirstlane((thread_id_x() / T::WARP_SIZE) % T::NUM_WARPS);
 
@@ -593,10 +599,18 @@ __device__ void packed_decode_accum128(
 
     int qk_tile      = 0;
     auto mask_scores = [&](auto& s) {
+        // Materialize validity addresses only when scores are masked.
+        int mask_lane = lane_id;
+        asm volatile("" : "+v"(mask_lane));
+        mask_lane &= 63;
         static_for<2>([&](auto n) {
-            int first = qk_tile * 32 + int(n) * 16 + (lane_id / 16) * 4;
+            int first = int(n) * 16 + (mask_lane / 16) * 4;
             static_for<4>([&](auto j) {
-                if(!source.valid(first + int(j)))
+                int k          = first + int(j);
+                auto* flag_lds = reinterpret_cast<OPUS_LDS_ADDR const D_ATTN*>(
+                    reinterpret_cast<uintptr_t>(s_kv.ptr));
+                if(!reinterpret_cast<OPUS_LDS_ADDR const uint32_t*>(flag_lds + (k % 4) * 528 +
+                                                                    512)[k / 4])
                     s[int(n) * 4 + int(j)] = -INFINITY;
             });
         });
