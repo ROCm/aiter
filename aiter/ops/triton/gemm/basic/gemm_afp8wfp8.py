@@ -613,3 +613,184 @@ def gemm_afp8wfp8_preshuffle(
         )
 
     return y
+
+
+# gfx1250 gluon MXFP8 (1x32 e8m0 scales on both operands) scale layouts -> kernel SCALE_MODE
+_MX_SCALE_LAYOUTS = {"128row": 1, "n32k4": 2}
+
+
+def gemm_afp8wfp8_mx_preshuffle(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    x_scales: torch.Tensor,
+    w_scales: torch.Tensor,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    x_preshuffled: bool = False,
+    scale_layout: str = "n32k4",
+) -> torch.Tensor:
+    """
+    gfx1250 (gluon) MXFP8 GEMM: Y = X @ W^T with fp8 e4m3 X and W and standard MX
+    1x32 e8m0 block scales on both operands (one scale per 32 elements along K).
+
+    Args:
+        x (torch.Tensor): e4m3 (or uint8 view) activations, (M, K). With x_preshuffled,
+            shuffle_weight(x) instead (same shape, contiguous, M % 16 == 0).
+        w (torch.Tensor): e4m3 (or uint8 view) weights preshuffled with
+            aiter.ops.shuffle.shuffle_weight and viewed as (N // 16, K * 16).
+        x_scales (torch.Tensor): e8m0 (uint8) scales of x, laid out by scale_layout. For
+            M < 32 they stay un-shuffled row-major (M, K // 32).
+        w_scales (torch.Tensor): e8m0 (uint8) scales of w, laid out by scale_layout.
+        dtype (torch.dtype): output dtype (bf16 or fp16).
+        y (Optional[torch.Tensor]): preallocated (M, N) output.
+        config (Optional[dict]): tuning keys (BLOCK_SIZE_M/N/K, num_warps, NUM_BUFFERS,
+            num_ctas, GROUP_M, B2B_WMMA, NUM_KSUB, EPI_SPLIT); default from the
+            GEMM-AFP8WFP8_MX_PRESHUFFLED config files.
+        x_preshuffled (bool): x is shuffle_weight(x) (16x16 byte shuffle, as w).
+        scale_layout (str): layout of both x_scales and w_scales:
+            "n32k4": aiter.ops.shuffle.shuffle_mxfp8fp4_scale, viewed as
+                (rows // 32, (K // 32) * 32) (default; the MXFP8 asm GEMM's layout).
+            "128row": aiter.ops.triton.utils.shuffle.shuffle_scale_gemm_128row,
+                (ceil(rows / 128), (K // 32) * 128); needs 4 warps and 128 rows (and N
+                columns) per CTA tile.
+
+    Returns:
+        y (torch.Tensor): (M, N) output.
+    """
+    from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+
+    if not _is_gluon_available():
+        raise RuntimeError("gemm_afp8wfp8_mx_preshuffle is gfx1250 (gluon) only")
+    if scale_layout not in _MX_SCALE_LAYOUTS:
+        raise ValueError(
+            f"scale_layout must be one of {list(_MX_SCALE_LAYOUTS)}, got {scale_layout!r}"
+        )
+    scale_mode = _MX_SCALE_LAYOUTS[scale_layout]
+
+    M, K = x.shape
+    N = w.shape[0] * 16
+    assert (
+        w.shape[1] == K * 16
+    ), f"w must be shuffle_weight(w).view(N // 16, K * 16), got {tuple(w.shape)}"
+    assert K % 128 == 0, f"K must be a multiple of 128, got {K}"
+
+    if config is None:
+        config, _ = get_gemm_config(
+            "GEMM-AFP8WFP8_MX_PRESHUFFLED",
+            M,
+            N,
+            K,
+            bounds=(4, 8, 16, 31, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
+            backend="gluon",
+        )
+    else:
+        config = copy.deepcopy(config)
+    for key in ("SCALE_MODE", "A_DATA_PRESHUFFLE"):
+        if key in config:
+            raise ValueError(
+                f"{key} is not a config key; pass scale_layout= / x_preshuffled="
+            )
+    if M < 32:
+        assert (
+            config["BLOCK_SIZE_M"] <= 16
+        ), "for M < 32, BLOCK_SIZE_M must be 16 or less (x_scales un-shuffled)"
+    else:
+        assert (
+            config["BLOCK_SIZE_M"] >= 32
+        ), "for M >= 32, BLOCK_SIZE_M must be 32 or more (x_scales preshuffled)"
+
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp8_mx32 import (
+        cluster_shape,
+        gemm_mxfp8_mx32_preshuffle_gfx1250,
+        get_gemm_afp8wfp8_mx_preshuffle_layouts,
+    )
+
+    if y is None:
+        y = torch.empty((M, N), dtype=dtype, device=x.device)
+    k_tiles = triton.cdiv(K, config["BLOCK_SIZE_K"])
+    config["NUM_BUFFERS"] = min(config["NUM_BUFFERS"], k_tiles)
+
+    num_ctas = config["num_ctas"]
+    ctas_m, ctas_n = cluster_shape(
+        num_ctas, config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"]
+    )
+    # The kernel takes a CTA's x scales as preshuffled iff it has 32+ rows.
+    assert M < 32 or config["BLOCK_SIZE_M"] // ctas_m >= 32, (
+        f"for M >= 32, each CTA needs 32 or more rows of BLOCK_SIZE_M="
+        f"{config['BLOCK_SIZE_M']}, which num_ctas={num_ctas} splits {ctas_m} ways"
+    )
+    if scale_mode == 1:
+        ok = config["num_warps"] == 4 and (config["BLOCK_SIZE_N"] // ctas_n) % 128 == 0
+        ok = ok and (
+            config["BLOCK_SIZE_M"] // ctas_m < 32
+            or (config["BLOCK_SIZE_M"] // ctas_m) % 128 == 0
+        )
+        if not ok:
+            raise ValueError(
+                "scale_layout='128row' needs num_warps=4 and 128 rows per CTA tile in N "
+                f"(and in M when M >= 32); config {config} has "
+                f"{config['BLOCK_SIZE_M'] // ctas_m}x{config['BLOCK_SIZE_N'] // ctas_n} per CTA"
+            )
+    pf = 128 if scale_mode == 1 else 32
+    if w_scales.shape[1] != (K // 32) * pf:
+        raise ValueError(
+            f"w_scales shape {tuple(w_scales.shape)} does not match scale_layout="
+            f"{scale_layout!r}: expected (rows // {pf}, {(K // 32) * pf})"
+        )
+    # The sliced epilogue stores through a (N / BNc, M, BNc) view of y, BNc = per-CTA N.
+    if config.get("EPI_SPLIT", 1) > 1 and (
+        N % (config["BLOCK_SIZE_N"] // ctas_n) != 0 or config["NUM_BUFFERS"] < 2
+    ):
+        config["EPI_SPLIT"] = 1
+
+    layouts = get_gemm_afp8wfp8_mx_preshuffle_layouts(
+        config["num_warps"],
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        num_ctas,
+        scale_mode,
+        config.get("NUM_KSUB", 1),
+        int(x_preshuffled),
+        config.get("EPI_SPLIT", 1),
+    )
+    x_k = x.view(torch.uint8)
+    if x_preshuffled:
+        # The kernel reads shuffled x as its raw (M // 16, K * 16) layout.
+        assert (
+            M % 16 == 0 and x.is_contiguous()
+        ), "x_preshuffled needs M % 16 == 0 and a contiguous x"
+        x_k = x_k.view(M // 16, K * 16)
+    w_k = w.view(torch.uint8)
+    xs, ws = x_scales.view(torch.uint8), w_scales.view(torch.uint8)
+
+    grid = (
+        triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
+    )
+    gemm_mxfp8_mx32_preshuffle_gfx1250[grid](
+        x_k,
+        w_k,
+        y,
+        xs,
+        ws,
+        M,
+        N,
+        K,
+        x_k.stride(0),
+        x_k.stride(1),
+        w_k.stride(0),
+        w_k.stride(1),
+        y.stride(0),
+        y.stride(-2),
+        y.stride(-1),
+        xs.stride(0),
+        xs.stride(1),
+        ws.stride(0),
+        ws.stride(1),
+        SCALE_MODE=scale_mode,
+        A_DATA_PRESHUFFLE=int(x_preshuffled),
+        **config,
+        **layouts,
+    )
+    return y
