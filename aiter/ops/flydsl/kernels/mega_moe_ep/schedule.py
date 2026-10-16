@@ -34,6 +34,7 @@ from .common import (
     _ctpop,
     bld,
     bst,
+    g_add_agent,
     i32,
     lds_atomic_add,
     lds_atomic_or,
@@ -200,11 +201,11 @@ def build_schedule(kc: KernelCtx) -> dict:
                 i32(0),
             )
             r = lds_ld_i32(L, L_DCNT + e * i32(4))
-            # Target rch/2 rows per chunk, not rch: gather chunks by sk%ce (deterministic
-            # but uneven), so a fuller target lets an unlucky bucket exceed rch and drop
-            # rows (the gather caps at rch). Half-full keeps the max bucket well under rch.
-            # TODO(tune): deterministic idx-rank chunking for a hard guarantee.
-            ce = fx.min(fx.max(ceildiv(r, i32(max(rch // 2, 1))), i32(1)), i32(255))
+            # Balanced-gather: full RG-row chunks. position//RG is an EXACT partition of
+            # the expert's 0..R_e-1 rows, so a chunk never exceeds rch (no row drop) and
+            # fills a whole RG MFMA tile (no M-padding). This also halves the chunk count
+            # vs the old sk%ce safety margin -> more CU n-tile shard room (higher P).
+            ce = fx.min(fx.max(ceildiv(r, i32(rch)), i32(1)), i32(255))
             ce = live.select(ce, i32(0))
             pre, tot = _wave_prefix(ce, 8)
             if lane == i32(0):
@@ -250,6 +251,31 @@ def build_schedule(kc: KernelCtx) -> dict:
             lds_st_rel(L, L_CTL + C_PLAN * 4, i32(1))
 
     @flyc.jit
+    def pre_pos(L, tid, a):
+        """Balanced-gather pre-pass: give every received (token,route) pair a GLOBAL
+        per-local-expert position (0..R_e-1 rank) via an agent-scope atomic counter
+        (``ecnt``, host-zeroed each launch), stored to ``rowpos``. Strided across ALL
+        CTAs x threads so each recv slot is visited exactly once -> one global rank per
+        expert; the planner then chunks an expert's rows by position//RG into full RG-row
+        tiles. Scans the same live window as dyn_plan (npes x m x topk -> real slot)."""
+        del L
+        rle = rsrc(a["recv_le"], a["nrecv"] * i32(4))
+        rpos = rsrc(a["rowpos"], a["nrecv"] * i32(4))
+        ecnt = fx.Int64(a["ecnt"])
+        blk = a["m"] * i32(TOPK)
+        stride_p = a["mtpr"] * i32(TOPK)
+        base = i32(gpu.block_id("x")) * i32(NT) + tid
+        gstride = i32(gpu.grid_dim.x) * i32(NT)
+        for c_ in range(base, a["npes"] * blk, gstride):
+            c = i32(c_)
+            p = c // blk
+            idx = p * stride_p + (c - p * blk)
+            le = fx.Int32(bld(rle, idx * i32(4), 0, T.i32, 0))
+            if masked(le) == fx.Boolean(False):
+                pos = g_add_agent(ecnt + fx.Int64(le) * fx.Int64(4), i32(1))
+                bst(pos, rpos, idx * i32(4), 0, 0)
+
+    @flyc.jit
     def dyn_plan(L, tid, a):
         """Scan this rank's received routing -> per-local-expert bitmap + counts ->
         active list -> row-chunk table -> per-CTA unit list [u_lo, u_hi) (XCD-aware)."""
@@ -283,30 +309,29 @@ def build_schedule(kc: KernelCtx) -> dict:
 
     @flyc.jit
     def gather_recv_chunk(L, tid, a, expert, cc, ce):
-        """Scan the received routing; collect the payload rows (source_keys) whose
-        local expert is ``expert`` and that fall in chunk ``cc`` of ``ce`` into L_RIX,
-        and return the chunk's row count. Chunk by source_key % ce (deterministic and
-        balanced). L_RIX stores each row's recv slot idx = source_key*topk + route; the
-        GEMM reads payload row source_key = idx//topk, and combine recovers route =
-        idx%topk (and source_key -> src rank/token) to scatter the result back."""
+        """Collect echunk (``expert``, chunk ``cc``)'s payload rows into L_RIX by their
+        GLOBAL per-expert position (pre-pass ``rowpos``): a row at position p lands at
+        L_RIX[p - cc*RG], so chunk cc holds exactly positions [cc*RG, min((cc+1)*RG, R_e))
+        -- a full RG-row tile, deterministic, NO atomic (vs the old sk%ce + C_CNT race).
+        L_RIX stores the recv slot idx (= source_key*topk + route); the GEMM reads payload
+        row idx//topk and combine recovers route/source from idx. ``ce`` is unused now."""
+        del ce
         rle = rsrc(a["recv_le"], a["nrecv"] * i32(4))
+        rpos = rsrc(a["rowpos"], a["nrecv"] * i32(4))
         blk = a["m"] * i32(TOPK)  # live window per source rank (see dyn_plan)
         stride_p = a["mtpr"] * i32(TOPK)
-        if tid == i32(0):
-            lds_st(L, L_CTL + C_CNT * 4, i32(0))
-        cbar(L, tid)
+        lo = cc * i32(rch)
         for c_ in range(tid, a["npes"] * blk, i32(NT)):
             c = i32(c_)
             p = c // blk
             idx = p * stride_p + (c - p * blk)
             le = fx.Int32(bld(rle, idx * i32(4), 0, T.i32, 0))
-            sk = idx // i32(TOPK)
-            if (le == expert) & ((sk % ce) == cc):
-                pos = lds_atomic_add(L, L_CTL + C_CNT * 4, 1)
-                if pos < i32(rch):
-                    lds_st(L, L_RIX + pos * i32(4), idx)
+            if le == expert:
+                pos = fx.Int32(bld(rpos, idx * i32(4), 0, T.i32, 0))
+                if (pos >= lo) & (pos < lo + i32(rch)):
+                    lds_st(L, L_RIX + (pos - lo) * i32(4), idx)
         cbar(L, tid)
-        return fx.min(lds_ld_i32(L, L_CTL + C_CNT * 4), i32(rch))
+        return fx.min(lds_ld_i32(L, L_DCNT + expert * i32(4)) - lo, i32(rch))
 
     @flyc.jit
     def compute_units(L, tid, a):
@@ -325,6 +350,10 @@ def build_schedule(kc: KernelCtx) -> dict:
             if tid == i32(0):  # post dispatch_wait (slot 4)
                 bst(now(), rsrc(a["dbg"]),
                     (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(4)) * i32(8), 0, 0)
+        # balanced-gather pre-pass: assign global per-expert positions, then a true
+        # cross-CTA barrier (the scan is distributed) publishes rowpos to every CTA.
+        pre_pos(L, tid, a)
+        gbar(L, tid, a, i32(2))  # P=2 forces the full cross-CTA barrier+fence
         dyn_plan(L, tid, a)
         if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
             if tid == i32(0):  # post dyn_plan (slot 5)

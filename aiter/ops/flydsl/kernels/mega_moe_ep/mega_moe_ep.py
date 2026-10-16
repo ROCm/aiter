@@ -261,6 +261,15 @@ class MegaMoeEPEngine:
         self._rowmap = torch.empty(
             self.n_cta * rg_max, dtype=torch.int32, device=self.device
         )
+        # Balanced-gather tables: each received (token,route) pair's GLOBAL per-local-
+        # expert position (0..R_e-1 rank, assigned by the planner's pre-pass via _ecnt
+        # atomics). The planner chunks an expert's rows by position//RG, so every chunk is
+        # a full RG-row tile (no M-padding waste) and -- since that halves the chunk count
+        # vs the sk%ce margin -- more chunks can be N-sharded across CUs (higher P). _ecnt
+        # is the per-expert position counter, zeroed each forward.
+        n_slots = self.world_size * self.mtpr * self.K
+        self._rowpos = torch.empty(n_slots, dtype=torch.int32, device=self.device)
+        self._ecnt = torch.zeros(self.epr, dtype=torch.int32, device=self.device)
         # Per-CTA device-phase timestamps (now() at kernel phase boundaries), only
         # written when EP_PROF_DEV=1; see mega_moe_ep_kernel._PROF.
         self._dbg = torch.zeros(self.n_cta * 9, dtype=torch.int64, device=self.device)
@@ -390,6 +399,8 @@ class MegaMoeEPEngine:
             self._inters.data_ptr(),
             self._gout.data_ptr(),
             self._rowmap.data_ptr(),
+            self._rowpos.data_ptr(),
+            self._ecnt.data_ptr(),
             self._dbg.data_ptr(),
             self.rank,
             self.world_size,
@@ -434,6 +445,7 @@ class MegaMoeEPEngine:
         # No host sync / dist.barrier -> forward() is a pure stream pipeline.
         with torch.cuda.stream(stream):
             self._recv.local.fill_(self.epr)
+            self._ecnt.zero_()  # per-expert position counters for the balanced-gather pre-pass
         if prof is not None:
             torch.cuda.synchronize()
             _t1 = time.perf_counter()

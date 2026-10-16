@@ -86,7 +86,7 @@ def run(bs):
         print(f"  bs={bs:<5d} worst_relL2={worst:.4f} err={anyerr} {tag}  [{per}]", flush=True)
 
 
-for bs in (8, 64, 512):
+for bs in (1, 2, 4, 8, 64, 512):
     run(bs)
 dist.barrier()
 dist.destroy_process_group()

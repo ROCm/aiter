@@ -125,7 +125,7 @@ if RANK == 0:
     print(f"built {ENGINE}", flush=True)
 dist.barrier()
 
-for bs in (8, 64, 256, 512, 1024):
+for bs in (1, 2, 4, 8, 64, 256, 512, 1024):
     try:
         e2e = bench(engine, bs)
         if RANK == 0:
