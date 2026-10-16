@@ -11,10 +11,8 @@ from aiter.fused_moe import fused_moe, get_2stage_cfgs
 from aiter.ops.shuffle import shuffle_weight
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or not torch.version.hip
-    or "gfx942" not in torch.cuda.get_device_properties(0).gcnArchName,
-    reason="Exercises the gfx942 A16W16 CK default dispatch",
+    not torch.cuda.is_available() or not torch.version.hip,
+    reason="Exercises the A16W16 CK default dispatch",
 )
 
 
