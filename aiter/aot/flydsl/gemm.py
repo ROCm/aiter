@@ -1175,7 +1175,6 @@ def compile_one_config(
                 _compile_mxscale_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "8wave":
                 _compile_8wave_to_cache(m=m, n=n, k=k, **kwargs)
-<<<<<<< HEAD
             elif kind == "blockscale_8wave":
                 _compile_blockscale_8wave_to_cache(
                     kernel_name=kernel_name,
@@ -1185,10 +1184,8 @@ def compile_one_config(
                     target_gfx=aot_arch,
                     **kwargs,
                 )
-=======
             elif kind == "mxfp8_8wave":
                 _compile_mxfp8_8wave_to_cache(m=m, n=n, k=k, **kwargs)
->>>>>>> luwei/main
             elif kind == "mxfp8_wmma":
                 _compile_mxfp8_wmma_to_cache(
                     kernel_name=kernel_name,
