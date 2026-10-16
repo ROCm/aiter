@@ -63,6 +63,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
                 "$TEST_DIR/tuning_tests/test_fhmoe_tuner.py" \
                 "$TEST_DIR/tuning_tests/test_gated_tuner.py" \
                 "$TEST_DIR/tuning_tests/test_mha_fwd_dispatch.py" \
+                "$TEST_DIR/tuning_tests/test_mha_tuner_logic.py" \
                 "$TEST_DIR/tuning_tests/test_mixed_mxfp_tuning.py" \
                 "$TEST_DIR/tuning_tests/test_mp_tuner_fault.py" \
                 "$TEST_DIR/tuning_tests/test_selection_proof.py" \

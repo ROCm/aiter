@@ -19,6 +19,15 @@ import subprocess
 import sys
 import unittest
 
+import triton  # noqa: F401  # ROCm environments may require Triton before torch.
+
+from aiter.ops.mha_fwd_policy import (
+    MHA_FWD_CONFIG_PROPERTY,
+    MHA_FWD_FAMILY,
+    MHA_FWD_TUNED_CSV,
+    MHA_FWD_TUNER_SCRIPT,
+)
+
 AITER_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
@@ -143,6 +152,16 @@ def _parse_benchmark_results(lines):
         elif stripped.endswith("SKIP"):
             skip_count += 1
     return error_shapes, mismatch_shapes, ok_count, skip_count
+
+
+def _skip_if_nothing_ran(test, name, output, ok_count):
+    """A run over zero rows proves nothing, so report it as a skip, not a pass.
+
+    run_config keeps only the rows tuned for this GPU, so a table shipped for
+    other hardware is legitimately empty here.
+    """
+    if ok_count == 0 and "No shapes to benchmark" in output:
+        test.skipTest(f"{name}: no tuned rows for this GPU")
 
 
 def _extract_repro_and_reasons(lines):
@@ -346,6 +365,12 @@ TUNER_FAMILIES = {
         "timeout": 1800,
         "config_property": "AITER_CONFIG_GDN_K5_OPT_FILE",
     },
+    MHA_FWD_FAMILY: {
+        "script": MHA_FWD_TUNER_SCRIPT,
+        "csv_pattern": MHA_FWD_TUNED_CSV.removesuffix(".csv"),
+        "exclude_patterns": ["untuned"],
+        "config_property": MHA_FWD_CONFIG_PROPERTY,
+    },
 }
 
 
@@ -394,6 +419,7 @@ class TestRunConfig(unittest.TestCase):
         error_shapes, mismatch_shapes, ok_count, skip_count = _parse_benchmark_results(
             lines
         )
+        _skip_if_nothing_ran(self, name, output, ok_count)
 
         all_results = _parse_all_benchmark_results(lines)
         csv_file = _save_results_csv(name, all_results)
@@ -452,6 +478,9 @@ class TestRunConfig(unittest.TestCase):
 
     def test_gdn_k5_opt(self):
         self._test_family("gdn_k5_opt")
+
+    def test_mha_fwd(self):
+        self._test_family(MHA_FWD_FAMILY)
 
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")
@@ -531,6 +560,7 @@ class TestRunConfigCustom(unittest.TestCase):
         error_shapes, mismatch_shapes, ok_count, skip_count = _parse_benchmark_results(
             lines
         )
+        _skip_if_nothing_ran(self, family, output, ok_count)
 
         all_results = _parse_all_benchmark_results(lines)
         csv_file = _save_results_csv(family, all_results)

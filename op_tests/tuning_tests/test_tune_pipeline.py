@@ -10,6 +10,7 @@ Runs each tuner on small shapes, verifies CSV output, and tests
 import csv
 import glob
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -730,6 +731,75 @@ class TestTunePipeline(unittest.TestCase):
 
     def test_gdn_k5_opt_mp1(self):
         self._run_one("gdn_k5_opt", mp=1)
+
+    def test_mha_fwd_mp1(self):
+        """Measure, gate, publish and prove one shape in a fresh process.
+
+        Not _run_one: a shape where nothing beats auto-select correctly writes
+        no row, so the check is the decision the tuner recorded for the shape
+        and that any row it wrote names a measured backend. The tuner exits
+        non-zero when a shape is left without an answer or a written row
+        fails its fresh-process proof. The field is CK and Triton as shipped,
+        plus the auto-select incumbent the tuner always adds.
+        """
+        from aiter.ops.mha_fwd_policy import (
+            MHA_FWD_PROBLEM_KEY_FIELDS,
+            MHA_FWD_TUNER_SCRIPT,
+        )
+
+        shape = {
+            **dict.fromkeys(MHA_FWD_PROBLEM_KEY_FIELDS, 0),
+            "mode": "varlen",
+            "batch": 2,
+            "total_q": 512,
+            "total_k": 512,
+            "max_seqlen_q": 256,
+            "max_seqlen_k": 256,
+            "nhead_q": 8,
+            "nhead_k": 8,
+            "hdim_q": 128,
+            "hdim_v": 128,
+            "dtype": "bfloat16",
+            "window_left": -1,
+            "window_right": -1,
+            "dropout_p": 0.0,
+            "logits_soft_cap": 0.0,
+            "how_v3_bf16_cvt": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            untuned = os.path.join(tmp, "untuned.csv")
+            tuned = os.path.join(tmp, "tuned.csv")
+            _write_csv(
+                untuned,
+                MHA_FWD_PROBLEM_KEY_FIELDS,
+                [[shape[field] for field in MHA_FWD_PROBLEM_KEY_FIELDS]],
+            )
+            result = _run_tuner(
+                MHA_FWD_TUNER_SCRIPT,
+                untuned,
+                tuned,
+                extra_args=["--backends", "ck,triton"],
+                timeout=900,
+                mp=1,
+            )
+            if result.returncode != 0:
+                print(f"\n=== mha_fwd STDOUT ===\n{result.stdout[-2000:]}")
+                print(f"\n=== mha_fwd STDERR ===\n{result.stderr[-2000:]}")
+            self.assertEqual(result.returncode, 0, "mha_fwd tuner failed")
+            written = (
+                pd.read_csv(tuned, dtype=str, keep_default_na=False)
+                if os.path.exists(tuned)
+                else pd.DataFrame()
+            )
+        decisions = re.findall(
+            r"^(promoted|retain|drop): \(", result.stdout, re.MULTILINE
+        )
+        self.assertEqual(len(decisions), 1, result.stdout[-2000:])
+        self.assertEqual(len(written), int(decisions[0] == "promoted"), written)
+        for _, row in written.iterrows():
+            self.assertIn(row["backend"], ("ck", "triton"))
+            if row["backend"] == "triton":
+                self.assertRegex(row["config_digest"], r"^[0-9a-f]{12}$")
 
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")
