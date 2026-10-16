@@ -336,7 +336,7 @@ def build_hstu_attention_bwd_dq(
 
             The fastmath context gives every add/mul the `fast` flag and turns the
             reciprocal into v_rcp_f32; only exp2 stays on the amdgcn intrinsic. See the
-            dV/dK kernel for why the stable fx.math.exp2 is not used."""
+            dV/dK kernel for why exp2 needs the explicit `afn` flag."""
             with arith.fastmath(arith.FastMathFlags.fast):
                 sc = [s * c_alpha for s in s_list]
                 tt = [s * c_neg_log2e for s in sc]

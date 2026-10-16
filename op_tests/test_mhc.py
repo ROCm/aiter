@@ -869,6 +869,7 @@ def test_mhc_post_pre(
         hip_kwargs["norm_weight"] = norm_weight
 
     from aiter.ops.mhc import (
+        mhc_res_ks,
         mhc_res_shuffle,
         mhc_res_shuffle_enabled,
         mhc_res_unshuffle,
@@ -888,7 +889,11 @@ def test_mhc_post_pre(
         fn_gemm = mhc_shuffle_fn(fn)
     else:
         fn_gemm = fn
-    residual_in_fused = mhc_res_shuffle(residual_in) if shuffled else residual_in
+    # The HIP kernels' shuffle block (the API picks Gluon for some shapes by default).
+    hip_ks = mhc_res_ks(m, hidden_size, backend="hip")
+    residual_in_fused = (
+        mhc_res_shuffle(residual_in, hip_ks) if shuffled else residual_in
+    )
 
     (
         post_mix_unfused,
@@ -925,6 +930,7 @@ def test_mhc_post_pre(
         force_fused=True,
         w_preshuffle_bf16=w_preshuffle_bf16,
         res_preshuffle=res_preshuffle,
+        backend="hip",
         **hip_kwargs,
     )
 
@@ -935,7 +941,7 @@ def test_mhc_post_pre(
     )
     checkAllclose(next_residual_ref, next_residual_unfused, msg="unfused/next_residual")
     if shuffled:
-        next_residual_fused = mhc_res_unshuffle(next_residual_fused)
+        next_residual_fused = mhc_res_unshuffle(next_residual_fused, hip_ks)
     checkAllclose(post_mix_ref, post_mix_fused, msg="fused/post_mix")
     checkAllclose(comb_mix_ref, comb_mix_fused, msg="fused/comb_mix")
     hip_fused_err = checkAllclose(
@@ -949,12 +955,18 @@ def test_mhc_post_pre(
     # print(f"next_residual_ref: {next_residual_ref}")
     # print(f"next_residual_fused: {next_residual_fused}")
 
+    # gfx1250: Triton mhc_post_pre runs the Gluon kernels and takes the same
+    # HIP-side inputs as the fused call above (packed fn, shuffled residual,
+    # fused RMSNorm) -- the ATOM configuration. Other archs: plain fp32 inputs.
+    triton_hip_layouts = get_gfx_runtime() == "gfx1250"
     run_triton = (
-        _HAS_TRITON_MHC_POST_PRE and not fuse_rmsnorm and m <= TRITON_MHC_POST_PRE_MAX_M
+        _HAS_TRITON_MHC_POST_PRE
+        and (triton_hip_layouts or not fuse_rmsnorm)
+        and m <= TRITON_MHC_POST_PRE_MAX_M
     )
-    if fuse_rmsnorm:
+    if fuse_rmsnorm and not triton_hip_layouts:
         aiter.logger.info(
-            "skip Triton mhc_post_pre: fuse_rmsnorm (Triton has no fused RMSNorm)"
+            "skip Triton mhc_post_pre: fuse_rmsnorm (gfx1250 Gluon path only)"
         )
     elif m > TRITON_MHC_POST_PRE_MAX_M:
         aiter.logger.info(
@@ -963,9 +975,32 @@ def test_mhc_post_pre(
             TRITON_MHC_POST_PRE_MAX_M,
         )
 
-    if run_triton:
-        # phi layout (K, N) = (n*C, hc_mult3); fp32 matches HIP ``fn`` for exp-domain SK.
-        phi = fn.T.contiguous()
+    if run_triton and triton_hip_layouts:
+        # The Gluon kernels through aiter.mhc_fused_post_pre(backend="gluon"), with
+        # the HIP-side inputs of the fused call above and the Gluon shuffle block.
+        gluon_ks = mhc_res_ks(m, hidden_size, backend="gluon")
+        gluon_residual_in = (
+            mhc_res_shuffle(residual_in, gluon_ks) if shuffled else residual_in
+        )
+        (h_post_t, h_res_t, layer_input_t, residual_out_t), triton_us = run_perftest(
+            aiter.mhc_fused_post_pre,
+            layer_input,
+            gluon_residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            fn_gemm,
+            hc_scale,
+            hc_base,
+            force_fused=True,
+            w_preshuffle_bf16=bool(packed),
+            res_preshuffle=bool(res_preshuffle),
+            backend="gluon",
+            **hip_kwargs,
+        )
+        if shuffled:
+            residual_out_t = mhc_res_unshuffle(residual_out_t, gluon_ks)
+    elif run_triton:
+        # phi layout (K, N) = (n*C, hc_mult3): the C-contiguous view of fn.
         post_mix_2d = post_layer_mix.squeeze(-1)
         (h_post_t, h_res_t, layer_input_t, residual_out_t), triton_us = run_perftest(
             triton_mhc_post_pre,
@@ -973,7 +1008,7 @@ def test_mhc_post_pre(
             residual_in,
             post_mix_2d,
             comb_res_mix,
-            phi,
+            fn.T,
             hc_scale,
             hc_base,
             hc_mult,
@@ -984,6 +1019,7 @@ def test_mhc_post_pre(
             asymmetric_exp_domain=True,
             hc_sinkhorn_eps=extra_args["hc_sinkhorn_eps"],
         )
+    if run_triton:
         h_post_t = h_post_t.to(post_mix_ref.dtype)
         h_res_t = h_res_t.to(comb_mix_ref.dtype)
         layer_input_t = layer_input_t.to(layer_input_ref.dtype)
@@ -1031,19 +1067,21 @@ def test_mhc_post_pre(
 
 def test_mhc_res_layout(m, hidden_size, hc_mult, dtype):
     from aiter.ops.mhc import (
-        MHC_RES_KS,
+        mhc_res_ks,
         mhc_res_repeat,
         mhc_res_shuffle,
         mhc_res_unshuffle,
     )
 
+    # The block width the ops pick by default for these rows / hidden size.
+    ks = mhc_res_ks(m, hidden_size)
     hidden_states = torch.randn(m, hidden_size, dtype=dtype)
     residual = hidden_states.unsqueeze(1).repeat(1, hc_mult, 1)
 
     def repeat_ref(x, mult):
         rows, width = x.shape
         return (
-            x.view(rows, width // MHC_RES_KS, MHC_RES_KS)
+            x.view(rows, width // ks, ks)
             .permute(1, 0, 2)
             .unsqueeze(1)
             .expand(-1, mult, -1, -1)
@@ -1054,7 +1092,7 @@ def test_mhc_res_layout(m, hidden_size, hc_mult, dtype):
     def shuffle_ref(x):
         rows, mult, width = x.shape
         return (
-            x.view(rows, mult, width // MHC_RES_KS, MHC_RES_KS)
+            x.view(rows, mult, width // ks, ks)
             .permute(2, 1, 0, 3)
             .contiguous()
             .view(rows, mult, width)
@@ -1063,7 +1101,7 @@ def test_mhc_res_layout(m, hidden_size, hc_mult, dtype):
     def unshuffle_ref(x):
         rows, mult, width = x.shape
         return (
-            x.view(width // MHC_RES_KS, mult, rows, MHC_RES_KS)
+            x.view(width // ks, mult, rows, ks)
             .permute(2, 1, 0, 3)
             .contiguous()
             .view(rows, mult, width)
