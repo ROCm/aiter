@@ -104,6 +104,13 @@ def get_kernel_config_triton(m, n, k, routing_data):
         f"bm{block_m}_n{n}_k{k}"
     )
     if tuned is not None:
+        nonkdim = tuned.get("matrix_instr_nonkdim", 16)
+        # Triton 3.6 fails LLVM lowering of bm128_n5120_k768 at nonkdim 16
+        # (unrealized_conversion_cast). 3.8 is faster with 16.
+        if block_m == 128 and n == 5120 and k == 768 and nonkdim == 16:
+            major, minor = (int(p) for p in triton.__version__.split(".")[:2])
+            if (major, minor) < (3, 8):
+                nonkdim = 32
         return {
             "block_m": block_m,
             "block_n": tuned["BLOCK_SIZE_N"],
@@ -115,7 +122,7 @@ def get_kernel_config_triton(m, n, k, routing_data):
             "w_cache_modifier": w_cache_modifier,
             "split_k": split_k,
             "waves_per_eu": tuned.get("waves_per_eu", 0),
-            "matrix_instr_nonkdim": tuned.get("matrix_instr_nonkdim", 16),
+            "matrix_instr_nonkdim": nonkdim,
             "kpack": tuned.get("kpack", 1),
         }
 
@@ -162,7 +169,7 @@ def get_kernel_config_triton(m, n, k, routing_data):
         "split_k": split_k,
         "waves_per_eu": 0,
         "matrix_instr_nonkdim": 16,
-        "kpack": 1,
+        "kpack": 2 if block_m <= 32 else 1,
     }
     return ret
 
