@@ -12,8 +12,8 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.topk_plain import (
     topk_plain,
+    topk_plain_batches_ragged_rows,
     topk_plain_reads_pitch,
-    topk_plain_values_optional,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -181,7 +181,7 @@ def test_uniform_pitch():
 
 
 def test_values_optional():
-    """`topk_out=None` runs where `topk_plain_values_optional` holds and raises
+    """`topk_out=None` runs where `topk_plain_batches_ragged_rows` holds and raises
     TypeError everywhere else, rather than reaching the C++ check, which aborts
     the process."""
     failures = []
@@ -199,7 +199,7 @@ def test_values_optional():
         except TypeError:
             pass
     x = torch.randn(4, n, dtype=dtypes.fp32)
-    if not topk_plain_values_optional(n, k):
+    if not topk_plain_batches_ragged_rows(n, k):
         failures.append(f"{n} wide k={k} is expected to take topk_out=None")
     else:
         topk_plain(x, ids, None, k, True)

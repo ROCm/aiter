@@ -92,23 +92,16 @@ def topk_plain_batches_ragged_rows(width: int, topk: int) -> bool:
     and the cost grows with the row count while this test does not look at the
     row count at all.
 
+    The same answer says whether `topk_out` may be None for this geometry: only
+    the radix path has a build that leaves the selected values unwritten; the
+    block-sort fallback writes them unconditionally. The other two conditions --
+    fp32, largest-first -- are properties of the call rather than the shape, so a
+    caller doing a half-format or smallest-first selection has to pass a buffer
+    whatever this says. Worth asking: writing values a caller discards costs
+    52us of the 741us `topk_plain` takes at 4096 rows of 131072 at k=2048.
+
     Exposed so a caller choosing between kernels can avoid that fallback rather
     than discover it.
-    """
-    return _uses_radix(width, topk)
-
-
-def topk_plain_values_optional(width: int, topk: int) -> bool:
-    """May `topk_out` be None for this geometry?
-
-    Only the radix path has a build that leaves the selected values unwritten;
-    the block-sort fallback writes them unconditionally. The other two
-    conditions -- fp32, largest-first -- are properties of the call rather than
-    the shape, so a caller doing a half-format or smallest-first selection has
-    to pass a buffer whatever this says.
-
-    Worth asking: writing values a caller discards costs 52us of the 741us
-    `topk_plain` takes at 4096 rows of 131072 at k=2048.
     """
     return _uses_radix(width, topk)
 
@@ -118,7 +111,7 @@ def _refuse_no_values(x, largest, topk):
     # pybind; refused here, the caller gets an exception it can handle.
     raise TypeError(
         "topk_plain: topk_out may be None only for float32 input with "
-        "largest=True where topk_plain_values_optional() holds; got "
+        "largest=True where topk_plain_batches_ragged_rows() holds; got "
         f"{x.dtype}, largest={largest}, width={x.shape[-1]}, topk={topk}"
     )
 
@@ -143,7 +136,7 @@ def topk_plain(
     inputs never reach the radix path, so no workspace is allocated for them.
 
     `topk_out` may be None for fp32 input with `largest=True` where
-    `topk_plain_values_optional` holds; elsewhere it raises TypeError, as a
+    `topk_plain_batches_ragged_rows` holds; elsewhere it raises TypeError, as a
     None did before the argument became optional.
 
     `x` may have any layout. With `stride0 < 0` the row pitch is taken from `x`
@@ -153,7 +146,7 @@ def topk_plain(
     their pitch is always `x`'s own.
 
     NaN: on the radix path (fp32, `largest=True`, where
-    `topk_plain_values_optional` holds) +nan ranks above +inf, as in
+    `topk_plain_batches_ragged_rows` holds) +nan ranks above +inf, as in
     `torch.topk`, and a NaN with the sign bit set ranks below -inf, so it is
     selected only when fewer than `topk` other values exist. The block-sort
     fallback, which serves every other call, compares scores as floats and
@@ -161,7 +154,7 @@ def topk_plain(
 
     `nan_high` ranks a NaN of either sign above +inf instead, as `topk_select`
     does. It is served by the radix build that writes no values, so it needs
-    `topk_out=None`, and with it a geometry `topk_plain_values_optional` holds
+    `topk_out=None`, and with it a geometry `topk_plain_batches_ragged_rows` holds
     for.
     """
     if topk > _MAX_CAPACITY:

@@ -7,7 +7,7 @@
 #include <optional>
 #include <string>
 
-// `topk_out` is optional where `topk_plain_values_optional` in topk_plain.py
+// `topk_out` is optional where `topk_plain_batches_ragged_rows` in topk_plain.py
 // says so: the fp32 largest-first radix path has a build that never writes the
 // selected values, and a caller that only wants the indices should not pay for
 // a buffer it discards. Passing nullopt outside that is an error, not silence.

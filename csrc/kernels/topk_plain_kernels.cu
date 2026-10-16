@@ -2600,13 +2600,13 @@ void topk_plain(aiter_tensor_t& values,                  // [batch, len]
         // Only the radix path has a build that skips the values; the block-sort
         // fallback under AdaptiveTopK writes them unconditionally. Asked here
         // rather than left to fail inside a kernel, and asked through the same
-        // predicate `topk_plain_values_optional` answers with so the two cannot
+        // predicate `topk_plain_batches_ragged_rows` answers with so the two cannot
         // drift apart.
         AITER_CHECK(topk_out_kernel_ptr != nullptr ||
                         (std::is_same_v<input_dtype, ck_tile::fp32_t> && largest &&
                          should_use_topk_radix<int64_t>(max_len, topk)),
                     "topk_plain: topk_out may only be omitted where "
-                    "topk_plain_values_optional() is true");
+                    "topk_plain_batches_ragged_rows() is true");
         // NaN of either sign above +inf: the radix build that writes no values.
         AITER_CHECK(!nan_high || topk_out_kernel_ptr == nullptr,
                     "topk_plain: nan_high is served with topk_out omitted only");

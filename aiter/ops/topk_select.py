@@ -72,9 +72,9 @@ from aiter.ops.topk import (
 )
 from aiter.ops.topk_plain import (
     topk_plain,
+    topk_plain_batches_ragged_rows,
     topk_plain_reads_pitch,
     topk_plain_use_mulblocks,
-    topk_plain_values_optional,
     topk_plain_width,
 )
 
@@ -617,7 +617,7 @@ def _available(
         return frozenset(out)
     if topk_per_row_small_k_serves(k, width, wave_size) is None:
         out.add("small_k")
-    if k <= _PLAIN_MAX_K and topk_plain_values_optional(width, k):
+    if k <= _PLAIN_MAX_K and topk_plain_batches_ragged_rows(width, k):
         # plain's radix path only: it is the build that writes no values and
         # ranks a NaN of either sign above +inf, as the other backends do. The
         # block-sort fallback does neither, and for ranged rows it is a
