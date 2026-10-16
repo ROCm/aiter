@@ -293,8 +293,6 @@ _BF16_CASES = _COMMON_CASES + [
         for length, dim, splits in ((4, 512, 2), (4, 1024, 4), (3, 1024, 3))
     ],
     ("graph-workspace", {"query_length": 4, "max_partitions": 7, "capture": True}),
-    # A 48-tile table bound with 1-2 live partitions reaches the register
-    # reducer's smallest rungs at NP 48.
     (
         "loose-bound",
         {
@@ -303,15 +301,8 @@ _BF16_CASES = _COMMON_CASES + [
             "max_partitions": None,
             "table_width": 768,
             "max_context": None,
-            "reducer": {
-                "max_context_partition_num": 48,
-                "parallel_groups": 1,
-                "xcd": False,
-                "pairs": True,
-            },
         },
     ),
-    # Three-wave groups exercise a non-power-of-two 20-partition rung.
     (
         "head192-np80",
         {
@@ -321,8 +312,6 @@ _BF16_CASES = _COMMON_CASES + [
             "max_partitions": 80,
         },
     ),
-    # One sequence takes the LDS path while short ones take the register
-    # branch in the same grid, which is large enough for XCD order.
     *[
         (
             f"head{dim}-mixed-np96",
@@ -334,12 +323,6 @@ _BF16_CASES = _COMMON_CASES + [
                 "lengths": (97 * 256,) + (0, 1, 257, 1027) * 10,
                 "max_partitions": 96,
                 "budget": 4096,
-                "reducer": {
-                    "max_context_partition_num": 96,
-                    "parallel_groups": 1,
-                    "xcd": True,
-                    "pairs": True,
-                },
             },
         )
         for dim in (256, 128)
@@ -393,10 +376,8 @@ _PIPE_CASES = [
             "budget": 1,
         },
     ),
-    # Above 64 partitions the reducer splits partitions over groups; 81 and
-    # 130 leave the last group short, and sequences with few or no tasks
-    # exercise the inactive-partition masking. A dropped row or tile changes
-    # a channel.
+    # 81 and 130 partitions leave a short tail, and sequences with few or no
+    # tasks must not change a channel.
     *(
         (
             f"d256-page64-q4-np{partitions}",
@@ -407,16 +388,6 @@ _PIPE_CASES = [
                 "max_partitions": partitions,
                 "budget": partitions,
                 "pattern": "one_hot_v",
-                "reducer": (
-                    {
-                        "max_context_partition_num": partitions,
-                        "parallel_groups": 8,
-                        "xcd": False,
-                        "pairs": True,
-                    }
-                    if partitions == 81
-                    else None
-                ),
             },
         )
         for partitions in (81, 130)
@@ -630,7 +601,7 @@ def _nhd_caches(key, value, table, context, head_major, pool_blocks=None):
     return rows.transpose(1, 2).split(dim, dim=-1)
 
 
-def _check_pipe_policy(pa, case, arch, compile_kwargs, reducer_kwargs):
+def _check_pipe_policy(pa, case, arch, compile_kwargs):
     """Pin the selected specialization so a case cannot drift off its path."""
     from aiter.ops.flydsl.kernels.pa_decode.traits import PaDecodeSchedule
 
@@ -645,13 +616,6 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs, reducer_kwargs):
             assert (staged > 0) == (case["staged"] is not False)
             if case["nhd_bufs"]:
                 assert nhd_bufs == case["nhd_bufs"]
-    if case["reducer"] is not None:
-        expected = dict(case["reducer"])
-        # XCD order needs a device with several XCDs.
-        xcd = expected.pop("xcd") and pa._num_xcds(torch.cuda.current_device()) > 1
-        selected = reducer_kwargs[-1]
-        assert {key: selected[key] for key in expected} == expected
-        assert (selected["num_xcds"] > 0) == xcd
 
 
 def _check_nhd_contracts(pa, output, arguments, options, plan, check):
@@ -747,7 +711,6 @@ def test_pa_decode(case, device, monkeypatch):
             "staged": None,
             "nhd_bufs": None,
             "nhd_contracts": False,
-            "reducer": None,
         },
         **case,
     )
@@ -866,22 +829,14 @@ def test_pa_decode(case, device, monkeypatch):
         _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch)
         return
 
-    compile_kwargs, reducer_kwargs = [], []
-    compile_tile, compile_reduce = (
-        pa.compile_pa_decode_tile,
-        pa.compile_pa_decode_ps_reduce,
-    )
+    compile_kwargs = []
+    compile_tile = pa.compile_pa_decode_tile
 
     def spy_tile(**kwargs):
         compile_kwargs.append(kwargs)
         return compile_tile(**kwargs)
 
-    def spy_reduce(**kwargs):
-        reducer_kwargs.append(kwargs)
-        return compile_reduce(**kwargs)
-
     monkeypatch.setattr(pa, "compile_pa_decode_tile", spy_tile)
-    monkeypatch.setattr(pa, "compile_pa_decode_ps_reduce", spy_reduce)
 
     output = torch.full_like(query, float("nan"))
     workspace = {}
@@ -913,7 +868,7 @@ def test_pa_decode(case, device, monkeypatch):
 
     launch()
     check()
-    _check_pipe_policy(pa, case, arch, compile_kwargs, reducer_kwargs)
+    _check_pipe_policy(pa, case, arch, compile_kwargs)
     if case["nhd_contracts"]:
         _check_nhd_contracts(pa, output, arguments, options, plan, check)
     if case["capture"]:
