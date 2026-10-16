@@ -54,44 +54,44 @@ def _a16w16_cfg_kwargs(
     g1u1=True,
     activation=ActivationType.Silu,
 ):
-    return dict(
-        token=token,
-        model_dim=256,
-        inter_dim=128,
-        expert=4,
-        topk=2,
-        dtype=dtypes.bf16,
-        q_dtype_a=dtypes.bf16,
-        q_dtype_w=dtypes.bf16,
-        q_type=QuantType.No,
-        use_g1u1=g1u1,
-        activation=activation,
-        doweight_stage1=False,
-        hidden_pad=0,
-        intermediate_pad=0,
-        is_shuffled=shuffled,
-        opus_weights_shuffled=shuffled,
-        swiglu_limit=limit,
-    )
+    return {
+        "token": token,
+        "model_dim": 256,
+        "inter_dim": 128,
+        "expert": 4,
+        "topk": 2,
+        "dtype": dtypes.bf16,
+        "q_dtype_a": dtypes.bf16,
+        "q_dtype_w": dtypes.bf16,
+        "q_type": QuantType.No,
+        "use_g1u1": g1u1,
+        "activation": activation,
+        "doweight_stage1": False,
+        "hidden_pad": 0,
+        "intermediate_pad": 0,
+        "is_shuffled": shuffled,
+        "opus_weights_shuffled": shuffled,
+        "swiglu_limit": limit,
+    }
 
 
 def _reroute_base(**overrides):
-    base = dict(
-        model_dim=256,
-        inter_dim=128,
-        dtype=dtypes.bf16,
-        q_dtype_a=dtypes.bf16,
-        q_dtype_w=dtypes.bf16,
-        q_type=QuantType.No,
-        activation=ActivationType.Swiglu,
-        is_shuffled=True,
-        use_g1u1=True,
-        doweight_stage1=False,
-        swiglu_limit=7.0,
-        has_stage1_bias=False,
-        hidden_pad=0,
-        intermediate_pad=0,
-    )
+    base = {
+        "model_dim": 256,
+        "inter_dim": 128,
+        "dtype": dtypes.bf16,
+        "q_dtype_a": dtypes.bf16,
+        "q_dtype_w": dtypes.bf16,
+        "q_type": QuantType.No,
+        "activation": ActivationType.Swiglu,
+        "is_shuffled": True,
+        "use_g1u1": True,
+        "doweight_stage1": False,
+        "swiglu_limit": 7.0,
+        "has_stage1_bias": False,
+        "hidden_pad": 0,
+        "intermediate_pad": 0,
+    }
     base.update(overrides)
     return base
 
