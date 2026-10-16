@@ -12,8 +12,14 @@ back.
   Other architectures, stream counts and hidden sizes raise `NotImplementedError`.
 - bf16 residual and sub-layer output; fp32 gates and gate projection `fn` [24, 4·H].
 - Any token count; launches are split every 65,536 tokens so every buffer stays under 4 GiB.
-- `pre_mix=None` is the identity pre gate (the collapse is stream 0).
+- `pre_mix=None` is the identity pre gate (the collapse is stream 0). Its buffer is built once per
+  device and never replaced, so CUDA graphs that captured it stay valid across larger eager calls.
+- Gates are fp32, `post_layer_mix` and `pre_mix` (T, 4) or (T, 4, 1), `comb_res_mix` (T, 4, 4); inputs
+  need not be contiguous. A tensor of another shape or on another device raises `ValueError`, of
+  another dtype `TypeError`, before any launch; nothing is reshaped or cast.
 - The RMSNorm that follows the seam is not folded in.
+- The 60-token switch and the fused kernel's grid (CUs / 10 token ranges) were timed on 304-CU
+  parts (MI300X, MI325X). Parts or partitions with fewer CUs get the same results, untuned speed.
 
 Other configurations: `mhc_fused_post_pre_delayed_rmsnorm` (Triton, folds the RMSNorm) or
 `mhc_post` + `mhc_pre`.
@@ -46,8 +52,8 @@ lanes. The switch at 60 tokens is where the two seam kernels cross on 304-CU par
 
 - `residual_out` equals `mhc_post` bit for bit (same fp32 operation order and bf16 truncation).
 - `layer_input` equals a sequential fp32 collapse rounded to bf16, bit for bit.
-- The gates differ from `mhc_pre`'s only in the split-K summation order; their error against fp32
-  gates stays at or below `mhc_pre`'s own.
+- The gates differ from `mhc_pre`'s only in the split-K summation order; they are within 1e-6
+  (post, comb) and 5e-7 (pre) of fp64 gates (measured: below 3e-7).
 
 ## Compile And ABI Rules
 
@@ -61,10 +67,12 @@ lanes. The switch at 60 tokens is where the two seam kernels cross on 304-CU par
 
 ## Validation
 
-Run `python op_tests/test_mhc_seam.py`: T = 1 to 32,768 with carried and identity pre gate,
-bit-exact checks of `residual_out` and `layer_input`, gate bounds, the fused kernel's split-K
-partials against fp64, guard checks for unsupported configurations and loader errors, and timing
-against `mhc_post` + `mhc_pre` and `mhc_fused_post_pre_delayed_rmsnorm`. Kernel changes
+Run `python op_tests/test_mhc_seam.py`: T = 1 to 32,768 and 65,573 (two launches) with carried and
+identity pre gate, bit-exact checks of `residual_out` and `layer_input`, gate bounds against fp64,
+the fused kernel's split-K partials against fp64, CUDA-graph replay after a larger eager call and
+`torch.compile(fullgraph=True)` bit-exact against eager, guard checks for unsupported
+configurations, input errors and loader errors, and timing against `mhc_post` + `mhc_pre` and
+`mhc_fused_post_pre_delayed_rmsnorm`. Kernel changes
 additionally require validation of every code object with negative controls and graph-timed runs
 across the switch point.
 

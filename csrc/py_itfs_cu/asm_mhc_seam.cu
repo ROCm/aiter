@@ -118,12 +118,22 @@ void* checked_ptr(const aiter_tensor_t* t, const char* name)
     return t->data_ptr();
 }
 
+// Every tensor of a launch must be on the GPU `device`; a host tensor would reach the
+// kernel as a host pointer.
 void check_tensor(const aiter_tensor_t* t,
                   const char* name,
+                  int device,
                   AiterDtype dtype,
                   std::initializer_list<int64_t> shape)
 {
     AITER_CHECK(t != nullptr, "mhc_seam: ", name, " is required");
+    AITER_CHECK(t->device_id == device,
+                "mhc_seam: ",
+                name,
+                " is on device ",
+                t->device_id,
+                ", expected GPU ",
+                device);
     AITER_CHECK(t->dtype() == dtype,
                 "mhc_seam: ",
                 name,
@@ -152,14 +162,16 @@ int64_t check_seam_inputs(const aiter_tensor_t* residual_out,
                           const aiter_tensor_t* pre_mix)
 {
     AITER_CHECK(residual != nullptr && residual->dim() == 3, "mhc_seam: residual is (T, 4, H)");
+    AITER_CHECK(residual->is_gpu(), "mhc_seam: residual must be on a GPU");
     const int64_t T = residual->size(0);
-    check_tensor(residual, "residual", AITER_DTYPE_bf16, {T, kHcMult, kHidden});
-    check_tensor(residual_out, "residual_out", AITER_DTYPE_bf16, {T, kHcMult, kHidden});
-    check_tensor(sublayer_out, "sublayer_out", AITER_DTYPE_bf16, {T, kHidden});
-    check_tensor(layer_input, "layer_input", AITER_DTYPE_bf16, {T, kHidden});
-    check_tensor(post_layer_mix, "post_layer_mix", AITER_DTYPE_fp32, {T, kHcMult});
-    check_tensor(comb_res_mix, "comb_res_mix", AITER_DTYPE_fp32, {T, kHcMult, kHcMult});
-    check_tensor(pre_mix, "pre_mix", AITER_DTYPE_fp32, {T, kHcMult});
+    const int dev   = residual->device_id;
+    check_tensor(residual, "residual", dev, AITER_DTYPE_bf16, {T, kHcMult, kHidden});
+    check_tensor(residual_out, "residual_out", dev, AITER_DTYPE_bf16, {T, kHcMult, kHidden});
+    check_tensor(sublayer_out, "sublayer_out", dev, AITER_DTYPE_bf16, {T, kHidden});
+    check_tensor(layer_input, "layer_input", dev, AITER_DTYPE_bf16, {T, kHidden});
+    check_tensor(post_layer_mix, "post_layer_mix", dev, AITER_DTYPE_fp32, {T, kHcMult});
+    check_tensor(comb_res_mix, "comb_res_mix", dev, AITER_DTYPE_fp32, {T, kHcMult, kHcMult});
+    check_tensor(pre_mix, "pre_mix", dev, AITER_DTYPE_fp32, {T, kHcMult});
     AITER_CHECK(residual_out->data_ptr() != residual->data_ptr(),
                 "mhc_seam: residual_out must not alias residual");
     return T;
@@ -235,11 +247,12 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(mhc_seam_fused_asm,
 {
     const int64_t T = check_seam_inputs(
         residual_out, layer_input, residual, sublayer_out, post_layer_mix, comb_res_mix, pre_mix);
-    check_tensor(part, "part", AITER_DTYPE_fp32, {kNumChunks, T, kPartCols});
-    check_tensor(fn, "fn", AITER_DTYPE_fp32, {kMixes, kHcMult * kHidden});
+    const int dev = residual->device_id;
+    check_tensor(part, "part", dev, AITER_DTYPE_fp32, {kNumChunks, T, kPartCols});
+    check_tensor(fn, "fn", dev, AITER_DTYPE_fp32, {kMixes, kHcMult * kHidden});
     if(T == 0)
         return;
-    const HipDeviceGuard device_guard(residual->device_id);
+    const HipDeviceGuard device_guard(dev);
     const auto& cfg      = get_kernel_cfg(get_gpu_arch(), "fused", store_nt ? 1 : 0);
     AiterAsmKernel* impl = get_kernel(cfg);
 
@@ -301,12 +314,13 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(mhc_seam_small_asm,
 {
     const int64_t T = check_seam_inputs(
         residual_out, layer_input, residual, sublayer_out, post_layer_mix, comb_res_mix, pre_mix);
-    check_tensor(part, "part", AITER_DTYPE_fp32, {kNumSlices, T, kPartCols});
-    check_tensor(fn, "fn", AITER_DTYPE_fp32, {kMixes, kHcMult * kHidden});
+    const int dev = residual->device_id;
+    check_tensor(part, "part", dev, AITER_DTYPE_fp32, {kNumSlices, T, kPartCols});
+    check_tensor(fn, "fn", dev, AITER_DTYPE_fp32, {kMixes, kHcMult * kHidden});
     if(T == 0)
         return;
     AITER_CHECK(T < 65536, "mhc_seam_small_asm: T too large for one launch: ", T);
-    const HipDeviceGuard device_guard(residual->device_id);
+    const HipDeviceGuard device_guard(dev);
     const auto& cfg      = get_kernel_cfg(get_gpu_arch(), "small", 0);
     AiterAsmKernel* impl = get_kernel(cfg);
 
@@ -372,20 +386,22 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(mhc_seam_gates_asm,
                                      stream))
 {
     AITER_CHECK(part != nullptr && part->dim() == 3, "mhc_seam: part is (S, T, 32)");
+    AITER_CHECK(part->is_gpu(), "mhc_seam: part must be on a GPU");
     const int64_t S = part->size(0);
     const int64_t T = part->size(1);
-    check_tensor(part, "part", AITER_DTYPE_fp32, {S, T, kPartCols});
-    check_tensor(post_mix, "post_mix", AITER_DTYPE_fp32, {T, kHcMult, 1});
-    check_tensor(comb_mix, "comb_mix", AITER_DTYPE_fp32, {T, kHcMult, kHcMult});
-    check_tensor(pre_mix, "pre_mix", AITER_DTYPE_fp32, {T, kHcMult});
-    check_tensor(hc_scale, "hc_scale", AITER_DTYPE_fp32, {3});
-    check_tensor(hc_base, "hc_base", AITER_DTYPE_fp32, {kMixes});
+    const int dev   = part->device_id;
+    check_tensor(part, "part", dev, AITER_DTYPE_fp32, {S, T, kPartCols});
+    check_tensor(post_mix, "post_mix", dev, AITER_DTYPE_fp32, {T, kHcMult, 1});
+    check_tensor(comb_mix, "comb_mix", dev, AITER_DTYPE_fp32, {T, kHcMult, kHcMult});
+    check_tensor(pre_mix, "pre_mix", dev, AITER_DTYPE_fp32, {T, kHcMult});
+    check_tensor(hc_scale, "hc_scale", dev, AITER_DTYPE_fp32, {3});
+    check_tensor(hc_base, "hc_base", dev, AITER_DTYPE_fp32, {kMixes});
     AITER_CHECK(S >= 1 && S <= 64, "mhc_seam_gates_asm: 1 to 64 splits, got ", S);
     AITER_CHECK(sinkhorn_repeat >= 1, "mhc_seam_gates_asm: sinkhorn_repeat must be >= 1");
     AITER_CHECK(hc_hidden_size > 0, "mhc_seam_gates_asm: hc_hidden_size must be > 0");
     if(T == 0)
         return;
-    const HipDeviceGuard device_guard(part->device_id);
+    const HipDeviceGuard device_guard(dev);
     const auto& cfg      = get_kernel_cfg(get_gpu_arch(), "gates", 0);
     AiterAsmKernel* impl = get_kernel(cfg);
 

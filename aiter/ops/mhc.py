@@ -1078,8 +1078,10 @@ MHC_SEAM_HIDDEN_SIZE = 5120
 # Below this many tokens the few-token kernel runs (one short wave per 128-column slice
 # and token: post, collapse and the pre GEMM partials); from it the persistent fused
 # kernel (512-column chunks, ~11 us fixed cost). Every wave of the few-token kernel reads
-# its fn slice, so its time grows with T; on MI300X-class GPUs the two cross at about 60
-# tokens. Both are followed by the ASM gates.
+# its fn slice, so its time grows with T; on MI300X / MI325X (304 CUs) the two cross at
+# about 60 tokens. Both are followed by the ASM gates. This switch and the fused kernel's
+# grid (CUs / 10 token ranges) were timed on 304-CU parts only; on gfx942 parts or
+# partitions with fewer CUs the results are the same, the speed is not tuned.
 MHC_SEAM_SMALL_MAX_T = 60
 MHC_SEAM_SMALL_SLICE = 128
 MHC_SEAM_FUSED_CHUNK = 512
@@ -1155,22 +1157,40 @@ def mhc_fused_post_pre_delayed_asm_supported(
 _MHC_IDENTITY_PRE: dict = {}
 
 
-def _mhc_identity_pre(m: int, hc_mult: int, device) -> torch.Tensor:
-    """(m, hc_mult) fp32 rows [1, 0, ..., 0]: the identity pre gate. Built once per device
-    for up to MHC_SEAM_MAX_T_PER_LAUNCH rows and sliced, so the identity costs no kernels;
-    built per call while a CUDA graph is being captured (the cached buffer must not be
-    initialised inside a graph)."""
+def _mhc_identity_pre(n: int, hc_mult: int, device) -> torch.Tensor:
+    """(n, hc_mult) fp32 rows [1, 0, ..., 0]: the identity pre gate of one launch
+    (n <= MHC_SEAM_MAX_T_PER_LAUNCH). Built once per device with
+    MHC_SEAM_MAX_T_PER_LAUNCH rows and never replaced, so the identity costs no kernels
+    and a CUDA graph that captured a slice of it keeps reading live memory. Built per
+    call while a CUDA graph is being captured before the buffer exists (the cached
+    buffer must not be initialised inside a graph)."""
     key = (str(device), hc_mult)
     buf = _MHC_IDENTITY_PRE.get(key)
-    if buf is None or buf.shape[0] < m:
+    if buf is None:
         capturing = torch.cuda.is_current_stream_capturing()
-        n = m if capturing else max(m, MHC_SEAM_MAX_T_PER_LAUNCH)
-        buf = torch.zeros(n, hc_mult, dtype=dtypes.fp32, device=device)
+        rows = n if capturing else MHC_SEAM_MAX_T_PER_LAUNCH
+        buf = torch.zeros(rows, hc_mult, dtype=dtypes.fp32, device=device)
         buf[:, 0] = 1.0
         if capturing:
             return buf
         _MHC_IDENTITY_PRE[key] = buf
-    return buf[:m]
+    return buf[:n]
+
+
+def _mhc_seam_check(name: str, t: torch.Tensor, device, dtype, *shapes) -> None:
+    if t.device != device:
+        raise ValueError(
+            f"mhc_fused_post_pre_delayed: {name} is on {t.device}, expected {device}"
+        )
+    if t.dtype != dtype:
+        raise TypeError(
+            f"mhc_fused_post_pre_delayed: {name} has dtype {t.dtype}, expected {dtype}"
+        )
+    if tuple(t.shape) not in shapes:
+        raise ValueError(
+            f"mhc_fused_post_pre_delayed: {name} has shape {tuple(t.shape)}, expected "
+            + " or ".join(str(s) for s in shapes)
+        )
 
 
 def mhc_fused_post_pre_delayed_fake(
@@ -1237,7 +1257,9 @@ def mhc_fused_post_pre_delayed(
     (DeepSeek-V4.1-Flash); anything else raises NotImplementedError. Check with
     ``mhc_fused_post_pre_delayed_asm_supported(hidden_size, hc_mult)`` first. Other
     configurations: ``mhc_fused_post_pre_delayed_rmsnorm`` (Triton, folds the RMSNorm)
-    or ``mhc_post`` + ``mhc_pre``.
+    or ``mhc_post`` + ``mhc_pre``. Tensors with another shape or device raise
+    ValueError, another dtype TypeError; inputs need not be contiguous. The kernel
+    switch and grid were timed on 304-CU parts (MI300X, MI325X).
 
     Args:
         residual: (T, 4, H) bf16 residual streams entering the seam.
@@ -1254,7 +1276,15 @@ def mhc_fused_post_pre_delayed(
         (residual_out (T, 4, H) bf16, post_mix (T, 4, 1), comb_mix (T, 4, 4),
          layer_input (T, H) bf16, next_pre_mix (T, 4)); the gates are fp32.
     """
-    assert residual.dim() == 3 and residual.dtype == dtypes.bf16
+    if residual.dim() != 3 or not residual.is_cuda:
+        raise ValueError(
+            "mhc_fused_post_pre_delayed: residual must be a (T, 4, H) GPU tensor, got "
+            f"shape {tuple(residual.shape)} on {residual.device}"
+        )
+    if residual.dtype != dtypes.bf16:
+        raise TypeError(
+            f"mhc_fused_post_pre_delayed: residual must be bf16, got {residual.dtype}"
+        )
     m, hc_mult, hidden_size = residual.shape
     arch = get_gfx_runtime()
     if not mhc_fused_post_pre_delayed_asm_supported(hidden_size, hc_mult, arch):
@@ -1267,22 +1297,25 @@ def mhc_fused_post_pre_delayed(
         )
     hc_mult3 = 2 * hc_mult + hc_mult * hc_mult
     hc_hidden_size = hc_mult * hidden_size
-    assert fn.shape == (hc_mult3, hc_hidden_size) and fn.dtype == dtypes.fp32
-    assert hc_scale.shape == (3,) and hc_base.shape == (hc_mult3,)
-    assert hc_scale.dtype == hc_base.dtype == dtypes.fp32
-    assert sublayer_out.shape == (m, hidden_size) and sublayer_out.dtype == dtypes.bf16
     device = residual.device
+    fp32, bf16 = dtypes.fp32, dtypes.bf16
+    _mhc_seam_check("fn", fn, device, fp32, (hc_mult3, hc_hidden_size))
+    _mhc_seam_check("hc_scale", hc_scale, device, fp32, (3,))
+    _mhc_seam_check("hc_base", hc_base, device, fp32, (hc_mult3,))
+    _mhc_seam_check("sublayer_out", sublayer_out, device, bf16, (m, hidden_size))
+    gate_shapes = ((m, hc_mult), (m, hc_mult, 1))
+    _mhc_seam_check("post_layer_mix", post_layer_mix, device, fp32, *gate_shapes)
+    _mhc_seam_check("comb_res_mix", comb_res_mix, device, fp32, (m, hc_mult, hc_mult))
+    if pre_mix is not None:
+        _mhc_seam_check("pre_mix", pre_mix, device, fp32, *gate_shapes)
     residual = residual.contiguous()
     sublayer_out = sublayer_out.contiguous()
     fn = fn.contiguous()
     hc_scale = hc_scale.contiguous()
     hc_base = hc_base.contiguous()
-    post_2d = post_layer_mix.reshape(m, hc_mult).to(dtypes.fp32).contiguous()
-    comb_3d = comb_res_mix.reshape(m, hc_mult, hc_mult).to(dtypes.fp32).contiguous()
-    if pre_mix is None:
-        pre_2d = _mhc_identity_pre(m, hc_mult, device)
-    else:
-        pre_2d = pre_mix.reshape(m, hc_mult).to(dtypes.fp32).contiguous()
+    post_2d = post_layer_mix.reshape(m, hc_mult).contiguous()
+    comb_3d = comb_res_mix.contiguous()
+    pre_2d = None if pre_mix is None else pre_mix.reshape(m, hc_mult).contiguous()
 
     residual_out = torch.empty_like(residual)
     layer_input = torch.empty(m, hidden_size, dtype=dtypes.bf16, device=device)
@@ -1308,7 +1341,7 @@ def mhc_fused_post_pre_delayed(
             sublayer_out[t0:t1],
             post_2d[t0:t1],
             comb_3d[t0:t1],
-            pre_2d[t0:t1],
+            _mhc_identity_pre(n, hc_mult, device) if pre_2d is None else pre_2d[t0:t1],
         )
         gates_out = (post_mix[t0:t1], comb_mix[t0:t1], next_pre_mix[t0:t1])
         # part[s, t, 0:24]: the mixes of column slice s, part[s, t, 24]: its sum of

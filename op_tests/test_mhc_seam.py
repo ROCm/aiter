@@ -12,11 +12,10 @@ columns are its mismatch ratios):
                 order, bf16 truncation)
   layer_input   bit-exact against a torch collapse of that residual: fp32 multiply and
                 add over streams 0..3 from 0, rounded to nearest even
-  post, comb    atol = 2 x max |aiter mhc_pre - torch fp32 gates| + 1e-6 against the
-                torch fp32 gates (the same fp32 math; only the split-K summation order
-                differs)
-  pre           the same bound, taken against aiter's post error (mhc_pre has no pre
-                output; pre's sensitivity to the mixes is at most half of post's)
+  post, comb    atol = GATE_ATOL against fp64 gates of that residual (the op computes
+                them in fp32; measured error below 3e-7)
+  pre           atol = PRE_ATOL against the fp64 pre gate (its sensitivity to the mixes
+                is at most half of post's)
 
 Each row times the op and aiter's existing ops on the same seam:
 
@@ -36,11 +35,18 @@ reference of the same w-column slice sums (w = 128 or 512): |err| <= 5e-5 of the
 sum of |terms| (fp32 accumulation), columns 25..31 zero, and a guard band after part
 untouched.
 
+Launch split, graphs and compile: T = 65536 + 37 (two launches, byte offsets past 2^31)
+with carried and identity pre gate against the same references; CUDA graphs captured at
+16 and 128 tokens replay bit-exact after that larger eager call (which must not free a
+buffer a graph reads); ``torch.compile(fullgraph=True, dynamic=True)`` equals eager bit for
+bit.
+
 Guards: m = 0 gives empty results of the right shapes; hidden_size 4096 and 7168,
 hc_mult 2 and another arch raise NotImplementedError pointing to
-mhc_fused_post_pre_delayed_asm_supported; a wrongly shaped or typed tensor passed to the
-ASM bindings directly fails a check in the C loader and raises RuntimeError (the process
-continues).
+mhc_fused_post_pre_delayed_asm_supported; a tensor of the wrong shape or on the wrong
+device raises ValueError and of the wrong dtype TypeError, before any launch; a wrongly
+shaped, typed or placed tensor passed to the ASM bindings directly fails a check in the C
+loader and raises RuntimeError (the process continues).
 """
 
 import argparse
@@ -96,9 +102,26 @@ def collapse_ref(residual_out, pre_mix):
     return acc.to(dtypes.bf16)
 
 
-def gates_ref(residual_out, fn, hc_scale, hc_base):
-    """torch fp32 gates of ``mhc_pre`` (vLLM's mhc_pre_delayed_torch)."""
-    xf = residual_out.flatten(1).float()
+# Gate bounds against the fp64 reference (the op's gates are within 3e-7 of it).
+GATE_ATOL = 1e-6
+PRE_ATOL = 5e-7
+
+
+def gates_ref(residual_out, fn, hc_scale, hc_base, dtype=torch.float64, rows=4096):
+    """Gates of ``mhc_pre`` (vLLM's mhc_pre_delayed_torch) computed in `dtype`, over
+    `rows` tokens at a time; returned in fp32."""
+    outs = [
+        _gates_ref(residual_out[i : i + rows], fn, hc_scale, hc_base, dtype)
+        for i in range(0, residual_out.shape[0], rows)
+    ]
+    if not outs:
+        outs = [_gates_ref(residual_out, fn, hc_scale, hc_base, dtype)]
+    return tuple(torch.cat(o).float() for o in zip(*outs))
+
+
+def _gates_ref(residual_out, fn, hc_scale, hc_base, dtype):
+    fn, hc_scale, hc_base = fn.to(dtype), hc_scale.to(dtype), hc_base.to(dtype)
+    xf = residual_out.flatten(1).to(dtype)
     mixes = (xf @ fn.t()) * torch.rsqrt(xf.square().mean(-1, keepdim=True) + RMS_EPS)
     pre = torch.sigmoid(mixes[:, :HC] * hc_scale[0] + hc_base[:HC]) + HC_EPS
     post = torch.sigmoid(mixes[:, HC : 2 * HC] * hc_scale[1] + hc_base[HC : 2 * HC])
@@ -127,6 +150,33 @@ def part_ref(residual_out, fn, sl=512):
 
 def max_diff(a, b):
     return (a.float() - b.float()).abs().max().item() if a.numel() else 0.0
+
+
+def check_outputs(out, res_ref, pre_ref, g_ref, tag):
+    """checkAllclose mismatch ratios of the op's outputs: residual_out and layer_input
+    bit-exact, the gates within GATE_ATOL / PRE_ATOL of the fp64 gates g_ref."""
+    residual_out, post_mix, comb_mix, layer_input, next_pre = out
+    return {
+        "residual_out err": checkAllclose(
+            residual_out, res_ref, atol=0, rtol=0, msg=tag + "residual_out vs mhc_post "
+        ),
+        "layer_input err": checkAllclose(
+            layer_input,
+            collapse_ref(res_ref, pre_ref),
+            atol=0,
+            rtol=0,
+            msg=tag + "layer_input vs fp32 collapse ",
+        ),
+        "post err": checkAllclose(
+            post_mix, g_ref[0], atol=GATE_ATOL, rtol=0, msg=tag + "post vs fp64 gates "
+        ),
+        "comb err": checkAllclose(
+            comb_mix, g_ref[1], atol=GATE_ATOL, rtol=0, msg=tag + "comb vs fp64 gates "
+        ),
+        "pre err": checkAllclose(
+            next_pre, g_ref[2], atol=PRE_ATOL, rtol=0, msg=tag + "pre vs fp64 gates "
+        ),
+    }
 
 
 def perf(m, hidden_size, us):
@@ -238,30 +288,8 @@ def test_mhc_fused_post_pre_delayed(m, hidden_size=5120, identity_pre=False, see
     g_ref = gates_ref(res_a, inp["fn"], inp["hc_scale"], inp["hc_base"])
     diff_post_a = max_diff(post_a, g_ref[0])
     diff_comb_a = max_diff(comb_a, g_ref[1])
-    tol_post = 2 * diff_post_a + 1e-6
-    tol_comb = 2 * diff_comb_a + 1e-6
     tag = f"m={m} identity_pre={identity_pre} "
-    err = {
-        "residual_out err": checkAllclose(
-            residual_out, res_a, atol=0, rtol=0, msg=tag + "residual_out vs mhc_post "
-        ),
-        "layer_input err": checkAllclose(
-            layer_input,
-            collapse_ref(res_a, pre_ref),
-            atol=0,
-            rtol=0,
-            msg=tag + "layer_input vs fp32 collapse ",
-        ),
-        "post err": checkAllclose(
-            post_mix, g_ref[0], atol=tol_post, rtol=0, msg=tag + "post vs fp32 gates "
-        ),
-        "comb err": checkAllclose(
-            comb_mix, g_ref[1], atol=tol_comb, rtol=0, msg=tag + "comb vs fp32 gates "
-        ),
-        "pre err": checkAllclose(
-            next_pre, g_ref[2], atol=tol_post, rtol=0, msg=tag + "pre vs fp32 gates "
-        ),
-    }
+    err = check_outputs(out, res_a, pre_ref, g_ref, tag)
 
     # the op + rms_norm against the Triton rmsnorm op (residual_out, post, comb,
     # normed layer_input, next pre)
@@ -279,7 +307,7 @@ def test_mhc_fused_post_pre_delayed(m, hidden_size=5120, identity_pre=False, see
         )
         err_t = max(err_t, e)
         diff_t[name] = max_diff(a, b)
-    # the Triton op's own gates against the torch fp32 gates of its residual_out
+    # the Triton op's own gates against the fp64 gates of its residual_out
     g_ref_t = gates_ref(out_t[0], inp["fn"], inp["hc_scale"], inp["hc_base"])
     diff_gates_t = max(
         max_diff(out_t[1], g_ref_t[0]),
@@ -315,7 +343,7 @@ def test_mhc_fused_post_pre_delayed(m, hidden_size=5120, identity_pre=False, see
         "vs Triton residual_out |diff|": diff_t["residual_out"],
         "vs Triton layer_input |diff|": diff_t["layer_input"],
         "vs Triton gates |diff|": max(diff_t["post"], diff_t["comb"], diff_t["pre"]),
-        "Triton gates |diff| vs fp32": diff_gates_t,
+        "Triton gates |diff| vs fp64": diff_gates_t,
         "ok": all(e == 0 for e in err.values()) and err_t <= TRITON_ERR_RATIO,
     }
 
@@ -476,6 +504,17 @@ def check_loader_errors(aiter_mhc):
                 *seam_out, torch.empty(10, m, 32), *seam_in, inp["fn"]
             ),
         ),
+        "fused: fn on the CPU": (
+            "fn is on device -1",
+            lambda: aiter_mhc.mhc_seam_fused_asm(
+                *seam_out,
+                torch.empty(10, m, 32),
+                *seam_in,
+                inp["fn"].cpu(),
+                0,
+                False,
+            ),
+        ),
     }
     failed = 0
     for name, (expect, call) in cases.items():
@@ -500,6 +539,165 @@ def check_loader_errors(aiter_mhc):
         residual_out, res_a, atol=0, rtol=0, msg="seam after loader errors "
     ):
         failed += 1
+    return failed
+
+
+def check_input_errors():
+    """Wrong shapes, dtypes or devices raise ValueError or TypeError in the op, before
+    any launch, instead of being reshaped or cast. Returns the failure count."""
+    m = 16
+    inp = make_inputs(m, 5120, seed=3)
+
+    def call(**over):
+        d = {**inp, **over}
+        return lambda: seam_new(*(d[k] for k in SEAM_ARGS + GATE_ARGS), d["pre_mix"])
+
+    cases = {
+        "residual on the CPU": (
+            ValueError,
+            "residual must be",
+            call(residual=inp["residual"].cpu()),
+        ),
+        "fn on the CPU": (ValueError, "fn is on cpu", call(fn=inp["fn"].cpu())),
+        "hc_scale on the CPU": (
+            ValueError,
+            "hc_scale is on cpu",
+            call(hc_scale=inp["hc_scale"].cpu()),
+        ),
+        "post_layer_mix bf16": (
+            TypeError,
+            "post_layer_mix has dtype",
+            call(post_layer_mix=inp["post_layer_mix"].to(dtypes.bf16)),
+        ),
+        "sublayer_out fp32": (
+            TypeError,
+            "sublayer_out has dtype",
+            call(sublayer_out=inp["sublayer_out"].float()),
+        ),
+        "pre_mix (4, T)": (
+            ValueError,
+            "pre_mix has shape",
+            call(pre_mix=inp["pre_mix"].t().contiguous()),
+        ),
+        "comb_res_mix (T, 16)": (
+            ValueError,
+            "comb_res_mix has shape",
+            call(comb_res_mix=inp["comb_res_mix"].reshape(m, HC * HC)),
+        ),
+    }
+    failed = 0
+    for name, (exc_type, expect, fn) in cases.items():
+        try:
+            fn()
+            torch.cuda.synchronize()
+        except exc_type as exc:
+            if expect in str(exc):
+                aiter.logger.info("input check ok: %s raises: %s", name, exc)
+                continue
+            aiter.logger.error("input check %s: unexpected message: %s", name, exc)
+        except Exception as exc:  # noqa: BLE001
+            aiter.logger.error("input check %s: %s: %s", name, type(exc).__name__, exc)
+        else:
+            aiter.logger.error("input check %s: no error raised", name)
+        failed += 1
+    return failed
+
+
+def identity_gate(m):
+    pre = torch.zeros(m, HC)
+    pre[:, 0] = 1.0
+    return pre
+
+
+def check_against_refs(out, inp, pre_mix, tag):
+    """The op's outputs against mhc_post, the fp32 collapse and the fp64 gates.
+    Returns the failure count."""
+    res_ref = torch.empty_like(inp["residual"])
+    aiter.mhc_post(
+        res_ref,
+        inp["sublayer_out"],
+        inp["residual"],
+        inp["post_layer_mix"],
+        inp["comb_res_mix"],
+    )
+    m = res_ref.shape[0]
+    pre_ref = identity_gate(m) if pre_mix is None else pre_mix
+    g_ref = gates_ref(res_ref, inp["fn"], inp["hc_scale"], inp["hc_base"])
+    err = check_outputs(out, res_ref, pre_ref, g_ref, tag)
+    return sum(e != 0 for e in err.values())
+
+
+def outputs_equal(a, b):
+    return all(torch.equal(x, y) for x, y in zip(a, b))
+
+
+def check_graphs_and_launch_split(aiter_mhc, seed):
+    """CUDA graphs captured at 16 and 128 tokens (carried and identity pre gate), then
+    eager calls of MHC_SEAM_MAX_T_PER_LAUNCH + 37 tokens (two launches, byte offsets past
+    2^31) checked against the references, then the graph replayed with fresh NaN
+    allocations around: every output must equal its eager result bit for bit (the
+    larger call must not free a buffer the graph reads). Returns the failure count."""
+    failed = 0
+    cases = []
+    for m in (16, 128):
+        for identity in (False, True):
+            inp = make_inputs(m, 5120, seed=seed + m)
+            args = [inp[k] for k in SEAM_ARGS + GATE_ARGS]
+            pre = None if identity else inp["pre_mix"]
+            eager = [t.clone() for t in seam_new(*args, pre)]
+            cases.append((f"graph m={m} identity_pre={identity}", args, pre, eager))
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _, args, pre, _ in cases:
+            seam_new(*args, pre)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outs = [seam_new(*args, pre) for _, args, pre, _ in cases]
+
+    m = aiter_mhc.MHC_SEAM_MAX_T_PER_LAUNCH + 37
+    for identity in (False, True):
+        inp = make_inputs(m, 5120, seed=seed + 1)
+        pre = None if identity else inp["pre_mix"]
+        out = seam_new(*(inp[k] for k in SEAM_ARGS + GATE_ARGS), pre)
+        bad = check_against_refs(out, inp, pre, f"m={m} identity_pre={identity} ")
+        if bad:
+            aiter.logger.error("launch split m=%d identity_pre=%s failed", m, identity)
+        failed += bad
+        del inp, out
+    junk = [torch.full((65536, HC), float("nan")) for _ in range(64)]
+
+    graph.replay()
+    torch.cuda.synchronize()
+    for (name, _, _, eager), out in zip(cases, outs):
+        if outputs_equal(out, eager):
+            aiter.logger.info("%s: replay after a larger eager call equals eager", name)
+        else:
+            aiter.logger.error("%s: replay differs from eager", name)
+            failed += 1
+    del junk, graph
+    return failed
+
+
+def check_compile(seed):
+    """torch.compile(fullgraph=True, dynamic=True) equals eager bit for bit. Returns the
+    failure count."""
+    compiled = torch.compile(seam_new, fullgraph=True, dynamic=True)
+    failed = 0
+    for m in (16, 128):
+        for identity in (False, True):
+            inp = make_inputs(m, 5120, seed=seed + 2 * m)
+            args = [inp[k] for k in SEAM_ARGS + GATE_ARGS]
+            pre = None if identity else inp["pre_mix"]
+            if outputs_equal(compiled(*args, pre), seam_new(*args, pre)):
+                aiter.logger.info(
+                    "compile m=%d identity_pre=%s equals eager", m, identity
+                )
+            else:
+                aiter.logger.error("compile m=%d identity_pre=%s differs", m, identity)
+                failed += 1
     return failed
 
 
@@ -579,6 +777,9 @@ def main():
         failed += 1
     failed += check_guards(aiter_mhc)
     failed += check_loader_errors(aiter_mhc)
+    failed += check_input_errors()
+    failed += check_compile(args.seed)
+    failed += check_graphs_and_launch_split(aiter_mhc, args.seed)
     aiter.logger.info("test_mhc_seam: %d failure(s)", failed)
     return 1 if failed else 0
 
