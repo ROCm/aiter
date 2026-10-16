@@ -604,39 +604,6 @@ class FmoeTuner(TunerCommon):
     }
 
     # Columns of an untuned shape list that name a quantization dtype.
-    _QUANT_DTYPE_COLS: ClassVar[tuple[str, ...]] = ("q_dtype_a", "q_dtype_w")
-
-    def get_untuned_gemm_list(self, untuned_gemm_file):
-        """Resolve the fp8 flavor in the shape list to the one this arch runs.
-
-        The shipped untuned_fmoe.csv and a8w8_blockscale_untuned_fmoe_*.csv
-        lists hardcode torch.float8_e4m3fn, but only one e4m3 encoding exists
-        per chip (gfx942 e4m3fnuz, gfx950 e4m3fn). On gfx942 those rows describe
-        an unrunnable configuration and every shape aborts with "Unsupported
-        dtype", which is why no MI300-class rows exist for these models.
-
-        Normalizing on ingest rather than at point of use keeps the shape keys,
-        the tuned rows we emit and the tuner's own tuned/untuned bookkeeping all
-        agreeing on one dtype; otherwise a tuned row lands as e4m3fnuz while the
-        untuned frame still says e4m3fn and the shape is reported as untuned.
-        """
-        untunedf = super().get_untuned_gemm_list(untuned_gemm_file)
-        for col in self._QUANT_DTYPE_COLS:
-            if col not in untunedf.columns:
-                continue
-            untunedf[col] = untunedf[col].map(
-                lambda s: (
-                    str(
-                        dtypes.normalize_fp8_dtype(
-                            getattr(torch, s.strip().removeprefix("torch."))
-                        )
-                    )
-                    if isinstance(s, str) and s.strip().startswith("torch.float8_e4m3")
-                    else s
-                )
-            )
-        return untunedf
-
     def _clear_op_caches(self):
         import aiter.fused_moe as fmoe_module
 
