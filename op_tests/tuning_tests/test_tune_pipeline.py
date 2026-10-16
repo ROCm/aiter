@@ -799,7 +799,7 @@ class TestTunePipeline(unittest.TestCase):
         for _, row in written.iterrows():
             self.assertIn(row["backend"], ("ck", "triton"))
             if row["backend"] == "triton":
-                self.assertRegex(row["config_digest"], r"^[0-9a-f]{12}$")
+                self.assertRegex(row["config_digest"], r"^sha256:[0-9a-f]{12}$")
 
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")
