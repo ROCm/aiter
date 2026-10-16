@@ -1549,7 +1549,7 @@ def _dispatch(
         # write them, which `_available` admits plain only for, with NaN of
         # either sign ranked above +inf.
         if ragged:
-            starts = torch.zeros_like(row_lens)
+            starts = _zero_rows(rows, input.get_device())
             topk_plain(
                 input, idx, None, topk, True, starts, row_lens, -1, 1, nan_high=True
             )
