@@ -40,8 +40,7 @@ with an fp4 dispatch wire; --combine_quant none is the bf16 wire, mxfp8 the fp8 
        torchrun --standalone --nproc_per_node=4 bench_mega_moe.py $COMMON \
          -e 256 -k 8 -hd 7168 -id 2048 -tpr 1536      # and -tpr 16384
   Knobs to compare: AITER_MEGA_PER_RANK_SCATTER=1 (one TDM store per peer),
-  AITER_FLYDSL_PERSISTENT_WORKERS2=<N> (persistent gemm2). A model cannot know
-  the next layer's routing early, so measure with AITER_MEGA_PLAN_PREFETCH=0.
+  AITER_FLYDSL_PERSISTENT_WORKERS2=<N> (persistent gemm2).
 
 Env / CLI: --layers --logits_tol --acc_verify --dispatch_backend
            --stage1_fused --dispatch_wire --combine --combine_quant
@@ -100,10 +99,6 @@ os.environ.setdefault("AITER_BF16_FP8_MOE_BOUND", "0")
 os.environ.setdefault("MORI_V2_KERNEL_BACKEND", "hip")
 
 os.environ.setdefault("FLYDSL_GPU_ARCH", get_gfx())
-
-# 0 withholds next_topk_ids, the way a model does: its next-layer routing depends
-# on this layer's output, so the compact plan lands on the critical path.
-_PLAN_PREFETCH = os.environ.get("AITER_MEGA_PLAN_PREFETCH", "1") != "0"
 
 QUANT_KEYS = ["a8w4_mxfp4", "a4w4_mxfp4"]
 # add_data_init_args' --scale-init default. Kept here so main() can tell whether
@@ -697,11 +692,6 @@ class DeviceMoEPipeline:
         ids, wts = self.routings[layer_idx]
         xn = _rmsnorm(x)  # keep the quantized activations in range across 61 layers
         if self.mega is not None:
-            next_ids = (
-                self.routings[layer_idx + 1][0]
-                if _PLAN_PREFETCH and layer_idx + 1 < self.n_layers
-                else None
-            )
             y = self.mega(
                 xn,
                 wts,
@@ -710,7 +700,6 @@ class DeviceMoEPipeline:
                 w2=self.w2_a,
                 w1_scale=self.w1_s,
                 w2_scale=self.w2_s,
-                next_topk_ids=next_ids,
                 # Named per step, not inherited from construction: building the
                 # reduce and running it are separate decisions now.
                 combine_quant=self.combine_quant,
@@ -759,10 +748,6 @@ class DeviceMoEPipeline:
 
     def _pipeline(self, x0):
         x = x0
-        if self.mega is not None:
-            prefetch = getattr(self.mega, "prefetch_compact_plan", None)
-            if prefetch is not None and _PLAN_PREFETCH:
-                prefetch(self.routings[0][0])
         for layer_idx in range(self.n_layers):
             x = self._layer_step(x, layer_idx)
         return x
