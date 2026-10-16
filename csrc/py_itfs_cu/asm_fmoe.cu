@@ -272,10 +272,10 @@ class FMoeKernel
     };
 };
 
-// The SwiGLU OAI MXFP4 FLAT kernels (16x32/16x128/16x256) cover inter_dim in 128-row
-// blocks; a 16x256 tile whose second half lies past inter_dim (inter_dim % 256 == 128)
-// is masked in-kernel. Other inter_dim values are not supported: reject them here
-// rather than launch a kernel that reads past the expert's weights.
+// The SwiGLU OAI MXFP4 FLAT kernels (16x32/16x128) are validated for inter_dim % 128 == 0
+// (Minimax M3 TP2/TP4/TP8: 1536/768/384). The FLAT grid is ceil(inter_dim / subGU_n)
+// with no partial-tile handling, so reject other sizes here rather than launch a kernel
+// that reads past the expert's weights.
 static void check_swiglu_oai_flat_inter_dim(const CFG* cfgs, int inter_dim)
 {
     if(cfgs == &cfg_fmoe_bf16_pertokenMXfp4_g1u1_swiglu_oai)
