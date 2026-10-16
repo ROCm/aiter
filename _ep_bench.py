@@ -27,7 +27,7 @@ dist.init_process_group("cpu:gloo,cuda:nccl", device_id=DEV)
 H, I, K, SWIGLU = 7168, 3072, 6, 10.0
 EPR = 48  # per-rank experts fixed across world sizes (8-GPU v4_pro value)
 E = EPR * WORLD  # 384 @ world=8, 192 @ world=4 -- keeps per-rank geometry identical
-MTPR = 1024
+MTPR = int(os.environ.get("EP_MTPR", "1024"))  # raise for high-bs probing
 ITERS, WARMUP = 20, 5
 qz = aiter.get_torch_quant(aiter.QuantType.per_1x32)
 
@@ -125,7 +125,7 @@ if RANK == 0:
     print(f"built {ENGINE}", flush=True)
 dist.barrier()
 
-for bs in (1, 2, 4, 8, 64, 256, 512, 1024):
+for bs in [int(b) for b in os.environ.get("EP_BS", "1,2,4,8,64,256,512,1024").split(",")]:
     try:
         e2e = bench(engine, bs)
         if RANK == 0:

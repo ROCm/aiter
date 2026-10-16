@@ -21,6 +21,7 @@ from .mega_moe_ep_config import (
     CTRL_INTS,
     FLAG_INTS,
     MAX_NPES,
+    NCHA,
     ep_shape_supported,
     mega_moe_ep_consts,
 )
@@ -244,23 +245,26 @@ class MegaMoeEPEngine:
         # indexes a strict prefix.
         rg_max = 64
         a_pack = 1 if self.a8 else 2
+        # inter / inters / gout / rowmap / rowidx are indexed by ECHUNK id (0..nch), not
+        # bid: sized for NCHA echunks (the planner's chunk-table capacity) so a launch
+        # whose chunk count exceeds the #CU grid (high bs -> multi-wave) still has distinct
+        # per-echunk storage.
         self._inter = torch.empty(
-            self.n_cta * rg_max * (self.I // a_pack),
-            dtype=torch.uint8,
-            device=self.device,
+            NCHA * rg_max * (self.I // a_pack), dtype=torch.uint8, device=self.device
         )
         self._inters = torch.empty(
-            self.n_cta * rg_max * (self.I // 32), dtype=torch.uint8, device=self.device
+            NCHA * rg_max * (self.I // 32), dtype=torch.uint8, device=self.device
         )
         self._gout = torch.empty(
-            self.n_cta * rg_max * self.H, dtype=torch.bfloat16, device=self.device
+            NCHA * rg_max * self.H, dtype=torch.bfloat16, device=self.device
         )
-        # Per-CTA GEMM1 bridge: the planner's gathered payload rows (L_RIX[r]//topk)
-        # written to global so the V2 ATileLoader / AScaleLoader source-key gather can
-        # read them (indexed_input row_map). Indexed bid*RG+r in the kernel.
-        self._rowmap = torch.empty(
-            self.n_cta * rg_max, dtype=torch.int32, device=self.device
-        )
+        # Per-echunk GEMM1 A-gather source keys written to global by the gather pass:
+        # rowmap = payload row (recv_slot // topk) for the V2 ATileLoader indexed gather;
+        # rowidx = the full recv_slot (the combine pass recovers route = idx % topk and
+        # the source rank/token from it -- read in a later pass so it cannot stay in the
+        # per-CTA LDS L_RIX). Indexed echunk*RG + r.
+        self._rowmap = torch.empty(NCHA * rg_max, dtype=torch.int32, device=self.device)
+        self._rowidx = torch.empty(NCHA * rg_max, dtype=torch.int32, device=self.device)
         # Balanced-gather tables: each received (token,route) pair's GLOBAL per-local-
         # expert position (0..R_e-1 rank, assigned by the planner's pre-pass via _ecnt
         # atomics). The planner chunks an expert's rows by position//RG, so every chunk is
@@ -399,6 +403,7 @@ class MegaMoeEPEngine:
             self._inters.data_ptr(),
             self._gout.data_ptr(),
             self._rowmap.data_ptr(),
+            self._rowidx.data_ptr(),
             self._rowpos.data_ptr(),
             self._ecnt.data_ptr(),
             self._dbg.data_ptr(),

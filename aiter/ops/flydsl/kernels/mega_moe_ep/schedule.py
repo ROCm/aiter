@@ -336,13 +336,13 @@ def build_schedule(kc: KernelCtx) -> dict:
     @flyc.jit
     def compute_units(L, tid, a):
         """Local-expert GEMM as GATHER -> GEMM1 -> GEMM2 -> COMBINE passes separated by
-        device grid barriers (``gbar``), so GEMM1/GEMM2 can be sharded across CUs.
-
-        Inc 2 (structure): P==1 -- CTA ``bid`` owns echunk ``bid`` (the chunk table is a
-        dense list 0..NCH that every CTA built in ``dyn_plan``), so every pass is the same
-        CTA and the shared inter/gout round-trips are same-CTA (cross-CTA coherence is
-        Inc 3). The gather pass keeps the recv-slot list in LDS (``L_RIX``) for combine and
-        publishes the payload-row map to global for GEMM1's A-gather."""
+        device grid barriers (``gbar``).  Each CTA walks its slice of the work with a
+        stride-#CU loop, so a chunk count ``nch`` (or unit count ``nch*P``) that EXCEEDS
+        the grid runs in multiple waves (high bs); when it fits one wave the loop body
+        runs once.  gather/combine iterate echunks (CTA bid owns echunks bid, bid+nblk,
+        ...); GEMM1/GEMM2 iterate (echunk, n-tile shard) units.  The gather pass publishes
+        each row's recv-slot (``rowidx``) + payload-row (``rowmap``) to GLOBAL so the later
+        passes -- on different CTAs once P>1 shards an echunk -- can read them."""
         if tid == i32(0):
             dispatch_wait(a, a["epoch"] & i32(1), i32(0))
         cbar(L, tid)
@@ -353,7 +353,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         # balanced-gather pre-pass: assign global per-expert positions, then a true
         # cross-CTA barrier (the scan is distributed) publishes rowpos to every CTA.
         pre_pos(L, tid, a)
-        gbar(L, tid, a, i32(2))  # P=2 forces the full cross-CTA barrier+fence
+        gbar(L, tid, a, i32(2))  # forced cross-CTA (pre_pos is a distributed scan)
         dyn_plan(L, tid, a)
         if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
             if tid == i32(0):  # post dyn_plan (slot 5)
@@ -362,60 +362,62 @@ def build_schedule(kc: KernelCtx) -> dict:
         bid = i32(gpu.block_id("x"))
         nch = lds_ld_i32(L, L_CTL + C_NCH * 4)
         nblk = i32(gpu.grid_dim.x)
-        # P-way CU split: shard each echunk's GEMM n-tiles across ~nblk/nch CTAs so the
-        # idle CUs join the per-expert GEMM (capped at N_TILES -> >=1 n-tile per shard).
+        # P-way CU split: shard each echunk's GEMM n-tiles across ~nblk/nch CTAs (capped
+        # at N_TILES).  When nch >= nblk (high bs) P collapses to 1 and nch itself spills
+        # into multiple waves via the loops below.
         P = fx.max(fx.min(nblk // fx.max(nch, i32(1)), i32(N_TILES)), i32(1))
-        # gather + combine run per echunk (pass 0 / 3): CTA bid owns echunk bid.
-        live = bid < nch
-        ec = live.select(lds_ld_i32(L, L_DCH + bid * i32(4)), i32(0))
-        expert = ec & i32(0xFFFF)
-        cc = ec.shrui(i32(24))
-        ce = ec.shrui(i32(16)) & i32(0xFF)
-        # GEMM1 + GEMM2 run per (echunk, shard) (pass 1 / 2): CTA bid -> echunk bid//P,
-        # n-tile shard bid%P. The P shards of one echunk share inter[echunk] / gout[echunk]
-        # (published across CTAs by the grid barriers), so no partial-sum reduction.
-        eg = bid // P
-        sg = bid - eg * P
-        liveg = bid < nch * P
-        ecg = liveg.select(lds_ld_i32(L, L_DCH + eg * i32(4)), i32(0))
-        expertg = ecg & i32(0xFFFF)
-        # --- PASS 0 (gather): echunk=bid rows -> L_RIX (LDS, kept for combine) + the
-        #     payload-row map to global (rowmap[bid*RG+r], GEMM1's A-gather source key).
-        R = i32(0)
-        if live:
-            R = gather_recv_chunk(L, tid, a, expert, cc, ce)
-        if tid == i32(0):
-            lds_st(L, L_CTL + C_UROWS * 4, R)  # persist for the combine pass (same CTA)
-        cbar(L, tid)
         r_rowmap = rsrc(a["rowmap"])
-        for r_ in range(tid, i32(rch), i32(NT)):
-            r = i32(r_)
-            v = (live & (r < R)).select(
-                lds_ld_i32(L, L_RIX + r * i32(4)) // i32(TOPK), i32(0)
-            )
-            bst(v, r_rowmap, (bid * i32(rch) + r) * i32(4), 0, 0)
+        r_rowidx = rsrc(a["rowidx"])
+        # --- PASS 0 (gather): walk this CTA's echunks, publish per-row recv-slot (rowidx,
+        #     for combine) + payload-row (rowmap, for GEMM1's A-gather) to global.
+        for ei_ in range(bid, nch, nblk):
+            ei = i32(ei_)
+            ec = lds_ld_i32(L, L_DCH + ei * i32(4))
+            expert = ec & i32(0xFFFF)
+            cc = ec.shrui(i32(24))
+            ce = ec.shrui(i32(16)) & i32(0xFF)
+            R = gather_recv_chunk(L, tid, a, expert, cc, ce)  # -> L_RIX, R; ends in cbar
+            for r_ in range(tid, i32(rch), i32(NT)):
+                r = i32(r_)
+                idx = (r < R).select(lds_ld_i32(L, L_RIX + r * i32(4)), i32(0))
+                off = (ei * i32(rch) + r) * i32(4)
+                bst(idx, r_rowidx, off, 0, 0)
+                bst((r < R).select(idx // i32(TOPK), i32(0)), r_rowmap, off, 0, 0)
+            cbar(L, tid)  # done reading L_RIX before the next echunk's gather overwrites it
         gbar(L, tid, a, P)
-        # --- PASS 1 (GEMM1): echunk eg, n-tile shard sg of P -> inter[eg] col slice.
-        if liveg:
-            gemm1(L, tid, a, expertg, eg, sg, P)
+        # --- PASS 1 (GEMM1): walk this CTA's (echunk, shard) units -> inter[echunk] slice.
+        for gi_ in range(bid, nch * P, nblk):
+            gi = i32(gi_)
+            eg = gi // P
+            gemm1(L, tid, a, lds_ld_i32(L, L_DCH + eg * i32(4)) & i32(0xFFFF),
+                  eg, gi - eg * P, P)
         if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
             if tid == i32(0):  # post gemm1 (slot 7)
                 bst(now(), rsrc(a["dbg"]),
                     (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(7)) * i32(8), 0, 0)
         gbar(L, tid, a, P)
-        # --- PASS 2 (GEMM2): echunk eg, n-tile shard sg of P -> gout[eg] col slice
-        #     (reads the full inter[eg] published by all P GEMM1 shards via the grid bar).
-        if liveg:
-            gemm2(L, tid, a, expertg, eg, sg, P, rsrc(a["gout"]))
+        # --- PASS 2 (GEMM2): walk this CTA's units -> gout[echunk] slice (reads full inter).
+        for gi_ in range(bid, nch * P, nblk):
+            gi = i32(gi_)
+            eg = gi // P
+            gemm2(L, tid, a, lds_ld_i32(L, L_DCH + eg * i32(4)) & i32(0xFFFF),
+                  eg, gi - eg * P, P, rsrc(a["gout"]))
         if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
             if tid == i32(0):  # post gemm2 (slot 8)
                 bst(now(), rsrc(a["dbg"]),
                     (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(8)) * i32(8), 0, 0)
         gbar(L, tid, a, P)
-        # --- PASS 3 (combine): echunk=bid rows (R + L_RIX from pass 0, same CTA).
-        #     All NW compute waves scatter (combine_send strides the rows across waves).
-        if live:
-            rc = lds_ld_i32(L, L_CTL + C_UROWS * 4)
-            combine_send(L, tid, a, rsrc(a["gout"]), bid, rc)
+        # --- PASS 3 (combine): walk this CTA's echunks, scatter each row back to its
+        #     source (recv-slot from rowidx).  Row count recomputed from the per-expert
+        #     count (L_DCNT) + chunk index; all NW compute waves scatter.
+        for ei_ in range(bid, nch, nblk):
+            ei = i32(ei_)
+            ec = lds_ld_i32(L, L_DCH + ei * i32(4))
+            cc = ec.shrui(i32(24))
+            rc = fx.min(
+                lds_ld_i32(L, L_DCNT + (ec & i32(0xFFFF)) * i32(4)) - cc * i32(rch),
+                i32(rch),
+            )
+            combine_send(L, tid, a, rsrc(a["gout"]), ei, rc)
 
     return locals()

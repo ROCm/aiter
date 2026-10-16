@@ -99,7 +99,11 @@ TILE_N = 256
 # (the one ported here); larger batches want an LB-style two-phase planner (future).
 DYN_MAX = 256
 # Chunk-table slots (active-expert row chunks of 16*mt rows) the dynamic planner emits.
-NCHA = 256
+# Also the per-echunk capacity of the global inter/gout/rowmap/rowidx scratch. Larger
+# than the #CU grid (256) so high-bs launches whose chunk count exceeds the grid run the
+# GEMM/combine in multiple CTA waves (overlap room) instead of hanging on overflow.
+# Covers v4_pro up to ~bs 10K/rank (nch ~= epr*ceil(R_e/RG)); raise for larger prefill.
+NCHA = 1024
 
 # Epoch-flag arena: ints in the symmetric arena ``off_flag`` region. Two banks selected
 # by epoch parity so a launch never races the previous one's slots. Each readiness tile

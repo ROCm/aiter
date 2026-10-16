@@ -309,11 +309,12 @@ def build_communication(kc: KernelCtx) -> dict:
         m = a["m"]
         parity = a["epoch"] & i32(1)
         HV = H // 8
+        r_rowidx = rsrc(a["rowidx"])  # echunk e's recv-slot ids (gather pass, global)
         wave = tid // i32(64)
         lane = tid % i32(64)
         for k_ in range(wave, nrows, i32(NW)):
             k = i32(k_)
-            idx = lds_ld_i32(L, L_RIX + k * i32(4))
+            idx = fx.Int32(bld(r_rowidx, (e * i32(RG) + k) * i32(4), 0, T.i32, 0))
             sk = idx // i32(TOPK)
             route = idx - sk * i32(TOPK)
             src_rank = sk // mtpr

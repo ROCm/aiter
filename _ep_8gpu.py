@@ -27,7 +27,7 @@ dist.init_process_group("cpu:gloo,cuda:nccl", device_id=DEV)
 H, I, K = 7168, 3072, 6
 EPR = 48  # per-rank experts fixed across world sizes (8-GPU v4_pro value)
 E = EPR * WORLD  # 384 @ world=8, 192 @ world=4 -- keeps per-rank geometry identical
-MTPR = 1024
+MTPR = int(os.environ.get("EP_MTPR", "1024"))  # raise for high-bs probing
 QUANT = os.environ.get("EP_QUANT", "a8w4")
 TOL = 0.25 if QUANT == "a4w4" else 0.10
 
@@ -86,7 +86,8 @@ def run(bs):
         print(f"  bs={bs:<5d} worst_relL2={worst:.4f} err={anyerr} {tag}  [{per}]", flush=True)
 
 
-for bs in (1, 2, 4, 8, 64, 512):
+_BS = [int(b) for b in os.environ.get("EP_BS", "1,2,4,8,64,512").split(",")]
+for bs in _BS:
     run(bs)
 dist.barrier()
 dist.destroy_process_group()
