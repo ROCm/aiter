@@ -905,15 +905,8 @@ def _grouped_a8w4_tdm_moe(
     )
     _situ_kw = {"situ_beta": situ_beta, "situ_linear_beta": situ_linear_beta}
 
-    def _kernel_bias(bias):
-        if bias is None or bias.numel() == 0:
-            return None
-        if bias.dtype != torch.float32:
-            bias = bias.to(dtype)
-        return bias.contiguous()
-
-    _b1 = _kernel_bias(bias1)
-    _b2 = _kernel_bias(bias2)
+    _b1 = bias1.contiguous() if bias1 is not None and bias1.numel() > 0 else None
+    _b2 = bias2.contiguous() if bias2 is not None and bias2.numel() > 0 else None
     _is_fp4 = data_format == "fp4"
     _quant_mode = "fp4" if _is_fp4 else "fp8"
     _a_is_fp4 = 1 if _is_fp4 else 0
@@ -1057,9 +1050,7 @@ def _grouped_a8w4_tdm_moe(
     disable_gemm1_requant = _as_bool(
         os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_REQUANT"), False
     )
-    _fuse_quant = not disable_gemm1_requant and (
-        _b1 is None or (tile_n // n_warp // 16) % 4 == 0
-    )
+    _fuse_quant = not disable_gemm1_requant
     w1_u8 = _grouped_weight_uint8(w1)
     w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
 
