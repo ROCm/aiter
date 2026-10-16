@@ -242,3 +242,22 @@ def test_loader_does_not_probe_loaded_runtimes_on_windows(fresh_loader, monkeypa
     monkeypatch.setattr(hip_runtime.ctypes, "CDLL", cdll)
     assert hip_runtime.load_hip_runtime() == "dll"
     cdll.assert_called_once_with("amdhip64_7.dll")
+
+
+@pytest.mark.parametrize(
+    "version, attribute", [(70_000_000, 10019), (70_100_000, 10020)]
+)
+def test_pci_chip_id_attribute_follows_runtime_version(hip, version, attribute):
+    hip.archs[0] = "gfx942:sramecc+:xnack-"
+    hip.hipRuntimeGetVersion.side_effect = _hip_result(version)
+    hip.hipDeviceGetAttribute.side_effect = _hip_result(0x74A2)
+    assert chip_info.get_device_name() == "MI308"
+    assert hip.hipDeviceGetAttribute.call_args.args[1:] == (attribute, 0)
+
+
+def test_pci_chip_id_raises_on_unknown_version(hip):
+    hip.archs[0] = "gfx942:sramecc+:xnack-"
+    hip.hipRuntimeGetVersion.side_effect = _hip_result(0, 999)
+    with pytest.raises(RuntimeError, match="PciChipId attribute of device 0"):
+        chip_info.get_device_name()
+    hip.hipDeviceGetAttribute.assert_not_called()

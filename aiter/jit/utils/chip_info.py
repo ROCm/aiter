@@ -581,7 +581,12 @@ def _get_pci_chip_id(device_id=None):
 
     # ROCm 7.1 inserted MaxAvailableVgprsPerThread ahead of PciChipId, shifting it.
     version = get_hip_runtime_version()
-    if version is not None and version[:2] < (7, 1):
+    if version is None:
+        raise RuntimeError(
+            "Could not read the HIP runtime version, so the PciChipId attribute "
+            f"of device {device_id} cannot be located."
+        )
+    if version[:2] < (7, 1):
         hipDeviceAttributePciChipId = 10019
     else:
         hipDeviceAttributePciChipId = 10020
