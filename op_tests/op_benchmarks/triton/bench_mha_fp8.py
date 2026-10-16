@@ -7,12 +7,12 @@ itself. Everything the timed callable touches is preallocated for the same
 reason -- nothing but the launch happens inside the graph.
 
 Usage:
-    python bench_mha.py                          # default seqlen sweep
-    python bench_mha.py --seqlen_q 4096 --batch 2
-    python bench_mha.py --seqlen_q 1024 --seqlen_k 8192  # different q / k lengths
-    python bench_mha.py --seqlen_q 1024 --seqlen_k 8192 --causal  # bottom-right causal
-    python bench_mha.py --q_heads 32 --k_heads 8  # grouped query attention
-    python bench_mha.py --rep 100
+    python bench_mha_fp8.py                          # default seqlen sweep
+    python bench_mha_fp8.py --seqlen_q 4096 --batch 2
+    python bench_mha_fp8.py --seqlen_q 1024 --seqlen_k 8192  # different q / k lengths
+    python bench_mha_fp8.py --seqlen_q 1024 --seqlen_k 8192 --causal  # bottom-right causal
+    python bench_mha_fp8.py --q_heads 32 --k_heads 8  # grouped query attention
+    python bench_mha_fp8.py --rep 100
 """
 
 import argparse
@@ -112,7 +112,7 @@ def main():
         not args.causal or seqlen_k >= args.seqlen_q
     ), f"--causal requires --seqlen_k ({seqlen_k}) >= --seqlen_q ({args.seqlen_q})"
 
-    print(f"fp8 MHA fwd")
+    print("MHA fwd fp8")
     print(
         f"{'B':>4} {'HQ':>4} {'HK':>4} {'SQ':>7} {'SK':>7} {'D':>5} {'us':>10} {'TFLOP/s':>10} {'TB/s':>9}"
     )

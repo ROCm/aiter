@@ -350,36 +350,35 @@ def _mha_fwd_subtiled(
     gl.amd.gfx1250.tdm.async_wait(5)
     qk0 = gl.amd.cdna5.wmma(q, k0, qk_zeros)
     qk1 = gl.amd.cdna5.wmma(q, k1, qk_zeros)
-    if CAUSAL or not EVEN_N:
-        if num_n_iter <= 2:
-            qk0 = apply_mask(
-                qk0,
-                0,
-                pid_m,
-                0,
-                BLOCK_M,
-                BLOCK_N,
-                SEQLEN_K,
-                USE_CAUSAL_OFFSET,
-                CAUSAL_OFFSET,
-                WMMA_LAYOUT_QK,
-                CAUSAL,
-                EVEN_N,
-            )
-            qk1 = apply_mask(
-                qk1,
-                1,
-                pid_m,
-                0,
-                BLOCK_M,
-                BLOCK_N,
-                SEQLEN_K,
-                USE_CAUSAL_OFFSET,
-                CAUSAL_OFFSET,
-                WMMA_LAYOUT_QK,
-                CAUSAL,
-                EVEN_N,
-            )
+    if (CAUSAL or not EVEN_N) and num_n_iter <= 2:
+        qk0 = apply_mask(
+            qk0,
+            0,
+            pid_m,
+            0,
+            BLOCK_M,
+            BLOCK_N,
+            SEQLEN_K,
+            USE_CAUSAL_OFFSET,
+            CAUSAL_OFFSET,
+            WMMA_LAYOUT_QK,
+            CAUSAL,
+            EVEN_N,
+        )
+        qk1 = apply_mask(
+            qk1,
+            1,
+            pid_m,
+            0,
+            BLOCK_M,
+            BLOCK_N,
+            SEQLEN_K,
+            USE_CAUSAL_OFFSET,
+            CAUSAL_OFFSET,
+            WMMA_LAYOUT_QK,
+            CAUSAL,
+            EVEN_N,
+        )
     qk = concat_subtile(qk0, qk1)
     m_ij = fast_maximum(m_i, gl.reduce(qk, 1, fast_maximum) * qk_scale)
     qk0_shifted = qk0 * qk_scale - m_ij[:, None]
