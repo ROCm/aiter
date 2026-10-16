@@ -12,6 +12,7 @@ import aiter
 from aiter import dtypes
 from aiter.jit.core import get_asm_dir
 from aiter.ops.gemm_op_a6w6 import (
+    _ceil,
     _select_gemm_a6w6_kernel,
     dequant_mxfp6_torch,
     gemm_a6w6_asm,
@@ -45,6 +46,8 @@ SPECIALIZED_CASES = (
     ),
 )
 SPECIALIZED_SQUARE_KERNEL = SPECIALIZED_CASES[0][1]
+DMABIG_DS_KERNEL = "f6gemm_dmabig_ds_kernel_func"
+DMABIG_DS_SWZ0_KERNEL = "f6gemm_dmabig_ds_swz0_kernel_func"
 
 
 @perftest(num_iters=5)
@@ -151,6 +154,46 @@ def test_specialized_dispatch_matches_safe_kernel(
     gemm_a6w6_asm(A, B, A_scale, B_scale, baseline, K, safe_kernel)
     gemm_a6w6_asm(A, B, A_scale, B_scale, actual, K, selected)
     assert torch.equal(actual[:M, :N], baseline[:M, :N])
+
+
+@pytest.mark.parametrize(
+    "shape,baseline_kernel,candidate_kernel",
+    (
+        (
+            (257, 513, 129),
+            "f6gemm_dmabig_swz0_kernel_func",
+            DMABIG_DS_SWZ0_KERNEL,
+        ),
+        ((513, 784, 1152), "f6gemm_dmabig_kernel_func", DMABIG_DS_KERNEL),
+        (
+            (256, 256, 6273),
+            "f6gemm_dmabig_swz0_kernel_func",
+            DMABIG_DS_SWZ0_KERNEL,
+        ),
+    ),
+)
+@torch.no_grad()
+def test_direct_scale_dmabig_matches_current_fallback_bitwise(
+    shape, baseline_kernel, candidate_kernel
+):
+    from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+
+    if get_gfx() != "gfx950":
+        pytest.skip("A6W6 assembly requires gfx950")
+    M, N, K = shape
+    padM = _ceil(M, 256)
+    padN = _ceil(N, 256)
+    padK = _ceil(K, 128)
+    torch.manual_seed(M + N + K)
+    x = torch.randn((M, K), dtype=torch.bfloat16)
+    w = torch.randn((N, K), dtype=torch.bfloat16)
+    A, A_scale = quant_mxfp6_gemm(x)
+    B, B_scale = quant_mxfp6_gemm(w)
+    baseline = torch.empty((padM, padN), dtype=torch.bfloat16)
+    actual = torch.empty_like(baseline)
+    gemm_a6w6_asm(A, B, A_scale, B_scale, baseline, padK, baseline_kernel)
+    gemm_a6w6_asm(A, B, A_scale, B_scale, actual, padK, candidate_kernel)
+    assert torch.equal(actual.view(torch.int16), baseline.view(torch.int16))
 
 
 def test_manifest_excludes_shape_guarded_kernels_from_incompatible_sweeps():

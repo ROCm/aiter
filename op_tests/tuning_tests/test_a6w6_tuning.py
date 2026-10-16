@@ -259,7 +259,22 @@ class TestA6W6Manifest(unittest.TestCase):
             self.assertEqual(row.co_name, f"{entrypoint}.co")
         generic = configs[(configs[exact_columns] == 0).all(axis=1)]
         self.assertEqual(len(specialized) + len(generic), len(configs))
+        self.assertEqual(len(generic), 10)
         self.assertTrue((generic[exact_columns] == 0).all().all())
+        self.assertEqual(
+            {
+                name
+                for name in generic["knl_name"]
+                if name.startswith("f6gemm_dmabig_ds")
+            },
+            {
+                "f6gemm_dmabig_ds_kernel_func",
+                "f6gemm_dmabig_ds_swz0_kernel_func",
+                "f6gemm_dmabig_ds_grp16_kernel_func",
+                "f6gemm_dmabig_ds_grp64_kernel_func",
+                "f6gemm_dmabig_ds_allk_kernel_func",
+            },
+        )
         swz0 = configs[
             configs["knl_name"] == gemm_op_a6w6._SAFE_FALLBACK_KERNEL_NAME
         ].iloc[0]
