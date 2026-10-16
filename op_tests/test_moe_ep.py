@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import csv
 import os
 
 import torch
@@ -398,6 +399,70 @@ def _calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
 
 summary_table = []
 
+DEFAULT_EP_CSV_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    "aiter",
+    "configs",
+    "tuned_grouped_fmoe.csv",
+)
+
+
+def run_ep_csv(args):
+    """Check every EP row in the grouped MoE tuning CSV."""
+    if gpu_arch != "gfx1250":
+        raise RuntimeError(f"EP CSV requires gfx1250, got {gpu_arch}")
+    with open(args.csv_path, newline="") as csv_file:
+        rows = list(csv.DictReader(csv_file))
+    ep_rows = [
+        (index, row) for index, row in enumerate(rows) if row["topk"] == "-1"
+    ]
+    if not ep_rows:
+        raise ValueError(f"No EP rows (topk=-1) in {args.csv_path}")
+
+    failures = []
+    for index, row in ep_rows:
+        try:
+            local_experts = int(row["expert"])
+            # The 65-expert configs include one shared expert on each rank.
+            shared_experts = 1 if local_experts == 65 else 0
+            global_experts = (local_experts - shared_experts) * args.csv_ep
+            quant_label = {
+                "torch.float8_e4m3fn": "a8w4_mxfp4",
+                "torch.float4_e2m1fn_x2": "a4w4_mxfp4",
+            }[row["q_dtype_a"]]
+            if row["act_type"] != "ActivationType.Silu":
+                raise ValueError(f"Unsupported activation: {row['act_type']}")
+            print(
+                f"\n[ep-csv] row {index}: {quant_label} token={row['token']} "
+                f"model_dim={row['model_dim']} inter_dim={row['inter_dim']} "
+                f"local_experts={local_experts} ep={args.csv_ep} "
+                f"topk={args.csv_topk}",
+                flush=True,
+            )
+            test_fmoe_ep_mxfp4(
+                quant_label,
+                int(row["token"]),
+                int(row["model_dim"]),
+                int(row["inter_dim"]),
+                global_experts,
+                args.csv_topk,
+                shared_E=shared_experts,
+                ep=args.csv_ep,
+                ep_mode=args.ep_mode,
+                fake_ep_rank=args.fake_ep_rank,
+                const_init=args.const_init,
+            )
+        except Exception as exc:  # Keep checking the remaining CSV rows.
+            failures.append((index, str(exc)))
+            print(f"[ep-csv] row {index}: FAILED: {exc}", flush=True)
+
+    print(
+        f"[ep-csv] {len(ep_rows) - len(failures)}/{len(ep_rows)} rows passed",
+        flush=True,
+    )
+    if failures:
+        raise AssertionError(f"EP CSV failures: {failures}")
+
 
 def test_fmoe_ep_mxfp4(
     quant_label,
@@ -689,7 +754,11 @@ def test_fmoe_ep_mxfp4(
         local_topk_ids = torch.where(
             (ref_topk_ids >= local_expert_start) & (ref_topk_ids < local_expert_end),
             ref_topk_ids - local_expert_start,
-            -1,
+            torch.where(
+                (ref_topk_ids >= E) & (ref_topk_ids < E + shared_E),
+                ref_topk_ids - E + local_E,
+                -1,
+            ),
         )
         a1_q, a1_scale = per_1x32_f4_quant(
             ref_input, quant_dtype=dtypes.fp4x2, shuffle=False
@@ -944,7 +1013,8 @@ parser.add_argument(
           or -t g1u1_int8smoothquant
           or -t g1u1_fp8smoothquant
           or -t g1u1_a8w4_mxfp4          (EP, per_1x32 mxfp4 a8w4, gfx950)
-          or -t g1u1_a4w4_mxfp4          (EP, per_1x32 mxfp4 a4w4, gfx950)""",
+          or -t g1u1_a4w4_mxfp4          (EP, per_1x32 mxfp4 a4w4, gfx950)
+          or -t ep_csv                   (all grouped MoE EP CSV rows, gfx1250)""",
 )
 parser.add_argument(
     "-d",
@@ -1049,9 +1119,35 @@ parser.add_argument(
 parser.add_argument(
     "--seed", type=int, default=0, help="Random input and routing seed."
 )
+parser.add_argument(
+    "--csv-path",
+    default=DEFAULT_EP_CSV_PATH,
+    help="Grouped MoE tuning CSV to sweep with -t ep_csv.",
+)
+parser.add_argument(
+    "--csv-ep",
+    type=int,
+    default=4,
+    help="Number of ranks used to reconstruct global experts for EP CSV rows.",
+)
+parser.add_argument(
+    "--csv-topk",
+    type=int,
+    default=8,
+    help="Actual routing topk; the EP CSV uses -1 as a tuning wildcard.",
+)
 args = parser.parse_args()
 torch.manual_seed(args.seed)
 gpu_arch = get_gfx()
+
+if "ep_csv" in args.test:
+    if len(args.test) != 1:
+        parser.error("ep_csv must be selected alone")
+    if args.csv_ep < 1 or args.csv_topk < 1:
+        parser.error("--csv-ep and --csv-topk must be positive")
+    os.environ["AITER_CONFIG_GROUPED_FMOE"] = args.csv_path
+    run_ep_csv(args)
+    raise SystemExit(0)
 
 for test in args.test:
     print(f"\nRunning test: {test}")
