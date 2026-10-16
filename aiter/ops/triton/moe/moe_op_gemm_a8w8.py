@@ -60,7 +60,9 @@ def allocate_output(
         )  # compressed number of rows
     matmul_shape = (split_k, M, N // reduction_n_matmul)
     final_shape = (y_rows, N // reduction_n_matmul // reduction_n_reduction)
-    matmul_output = torch.empty(matmul_shape, device=x.device, dtype=out_dtype)
+    # Keep split-K partials in fp32 for the reduction.
+    matmul_dtype = torch.float32 if split_k > 1 else out_dtype
+    matmul_output = torch.empty(matmul_shape, device=x.device, dtype=matmul_dtype)
     if scatter_indx is not None or split_k > 1:
         final_output = torch.empty(final_shape, device=x.device, dtype=out_dtype)
     else:
@@ -84,8 +86,8 @@ def get_kernel_config(m, n, k, routing_data, swizzle_mx_scale=None, fnuz_mx=Fals
         else None
     )
     if tuned is not None:
-        assert tuned["BLOCK_SIZE_K"] == 32, (
-            f"bm{block_m}_n{n}_k{k}: fnuz MXFP8 needs BLOCK_SIZE_K=32, "
+        assert tuned["BLOCK_SIZE_K"] in (32, 64, 128), (
+            f"bm{block_m}_n{n}_k{k}: fnuz MXFP8 needs BLOCK_SIZE_K of 32/64/128, "
             f"got {tuned['BLOCK_SIZE_K']}"
         )
         return {
@@ -128,7 +130,7 @@ def get_kernel_config(m, n, k, routing_data, swizzle_mx_scale=None, fnuz_mx=Fals
             elif block_m == 64:
                 num_warps = 4
     if fnuz_mx:
-        # gfx942 has no MX MFMA: one E8M0 scale per K step keeps the dot in FP8.
+        # One E8M0 scale per K step keeps the gfx942 dot in FP8.
         block_k = 32
     num_stages = pick_gemm_num_stages(
         arch, block_m, block_n, block_k, 8, 8, use_async_padding=True
@@ -255,6 +257,12 @@ def moe_gemm_a8w8(
         swizzle_mx_scale,
         fnuz_mx=use_fnuz and (x_has_mx or w_has_mx),
     )
+    if apply_swiglu and gammas is not None and config["split_k"] > 1:
+        # Gammas are applied per partial, before the swiglu in the reduction.
+        config["split_k"] = 1
+    # Split-K slices are not tail-masked.
+    while config["split_k"] > 1 and K % (config["block_k"] * config["split_k"]):
+        config["split_k"] //= 2
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
         reduction_n_matmul = 1

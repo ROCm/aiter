@@ -105,6 +105,44 @@ def unswizzle_mx_scale_cdna4(
     return x
 
 
+@triton.jit
+def _split_k(x, w, a_sc, b_sc):
+    # Halve K: x [M, K], w [K, N], a_sc [M, S], b_sc [S, N].
+    M: tl.constexpr = x.shape[0]
+    K: tl.constexpr = x.shape[1]
+    N: tl.constexpr = w.shape[1]
+    S: tl.constexpr = a_sc.shape[1]
+    x0, x1 = tl.split(tl.permute(tl.reshape(x, (M, 2, K // 2)), (0, 2, 1)))
+    w0, w1 = tl.split(tl.permute(tl.reshape(w, (2, K // 2, N)), (1, 2, 0)))
+    a0, a1 = tl.split(tl.permute(tl.reshape(a_sc, (M, 2, S // 2)), (0, 2, 1)))
+    b0, b1 = tl.split(tl.permute(tl.reshape(b_sc, (2, S // 2, N)), (1, 2, 0)))
+    return x0, x1, w0, w1, a0, a1, b0, b1
+
+
+@triton.jit
+def _fnuz_mx_dot(acc, x, w, x_scales, w_scales, MX_SCALE_BLOCK_K: tl.constexpr):
+    # gfx942 has no MX MFMA: run an FP8 dot per 32-wide K slice and apply its
+    # E8M0 scales to the fp32 result.
+    a_sc = (x_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+    b_sc = tl.trans((w_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True))
+    if MX_SCALE_BLOCK_K == 1:
+        acc += tl.dot(x, w, input_precision="ieee") * a_sc * b_sc
+    elif MX_SCALE_BLOCK_K == 2:
+        x0, x1, w0, w1, a0, a1, b0, b1 = _split_k(x, w, a_sc, b_sc)
+        acc += tl.dot(x0, w0, input_precision="ieee") * a0 * b0
+        acc += tl.dot(x1, w1, input_precision="ieee") * a1 * b1
+    else:
+        tl.static_assert(MX_SCALE_BLOCK_K == 4, "fnuz MXFP8 needs BLOCK_K <= 128")
+        xa, xb, wa, wb, aa, ab, ba, bb = _split_k(x, w, a_sc, b_sc)
+        x0, x1, w0, w1, a0, a1, b0, b1 = _split_k(xa, wa, aa, ba)
+        x2, x3, w2, w3, a2, a3, b2, b3 = _split_k(xb, wb, ab, bb)
+        acc += tl.dot(x0, w0, input_precision="ieee") * a0 * b0
+        acc += tl.dot(x1, w1, input_precision="ieee") * a1 * b1
+        acc += tl.dot(x2, w2, input_precision="ieee") * a2 * b2
+        acc += tl.dot(x3, w3, input_precision="ieee") * a3 * b3
+    return acc
+
+
 _moe_gemm_a8w8_repr = make_kernel_repr(
     "_moe_gemm_a8w8",
     [
@@ -378,44 +416,7 @@ def _moe_gemm_a8w8(
         if USE_FNUZ and not is_x_microscaled and not is_w_microscaled:
             acc += tl.dot(x, w, input_precision="ieee")
         elif USE_FNUZ:
-            # fnuz path (gfx942): manual E8M0→fp32, then tl.dot.
-            # x_scales: [BLOCK_M, MX_SCALE_BLOCK_K], w_scales: [BLOCK_N, MX_SCALE_BLOCK_K]
-            a_sc = (x_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
-            b_sc = (w_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
-            if MX_SCALE_BLOCK_K == 1:
-                # One scale per operand per K-step, so it is constant across the
-                # dot: scaling the result is equivalent to scaling the operands,
-                # and the MFMA stays FP8 instead of being promoted to FP32.
-                acc += (
-                    tl.dot(x, w, input_precision="ieee")
-                    * tl.reshape(a_sc, (BLOCK_M, 1))
-                    * tl.reshape(b_sc, (1, BLOCK_N))
-                )
-            else:
-                # Broadcast each block-scale across its MX_PACK_DIVISOR elements.
-                # a_sc: [BLOCK_M, MX_SCALE_BLOCK_K] -> [BLOCK_M, BLOCK_K]
-                # b_sc: [BLOCK_N, MX_SCALE_BLOCK_K]; w is [K, N], so b_sc_full
-                # is transposed to [BLOCK_K, BLOCK_N].
-                a_f32 = x.to(tl.float32)
-                b_f32 = w.to(tl.float32)
-                a_sc_full = tl.reshape(
-                    tl.broadcast_to(
-                        a_sc[:, :, None], (BLOCK_M, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR)
-                    ),
-                    (BLOCK_M, BLOCK_K),
-                )
-                b_sc_t = tl.reshape(
-                    tl.broadcast_to(
-                        b_sc[:, :, None], (BLOCK_N, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR)
-                    ),
-                    (BLOCK_N, BLOCK_K),
-                )
-                b_sc_full = tl.trans(b_sc_t)  # [BLOCK_K, BLOCK_N]
-                acc += tl.dot(
-                    a_f32 * a_sc_full,
-                    b_f32 * b_sc_full,
-                    input_precision="ieee",
-                )
+            acc = _fnuz_mx_dot(acc, x, w, x_scales, w_scales, MX_SCALE_BLOCK_K)
         else:
             acc = tl.dot_scaled(
                 x, x_scales, "e4m3", w, w_scales, "e4m3", acc=acc, fast_math=True
@@ -461,36 +462,7 @@ def _moe_gemm_a8w8(
         if USE_FNUZ and not is_x_microscaled and not is_w_microscaled:
             acc += tl.dot(x, w, input_precision="ieee")
         elif USE_FNUZ:
-            a_sc = (x_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
-            b_sc = (w_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
-            if MX_SCALE_BLOCK_K == 1:
-                # Same accumulator-side scaling as the EVEN_K branch above.
-                acc += (
-                    tl.dot(x, w, input_precision="ieee")
-                    * tl.reshape(a_sc, (BLOCK_M, 1))
-                    * tl.reshape(b_sc, (1, BLOCK_N))
-                )
-            else:
-                a_f32 = x.to(tl.float32)
-                b_f32 = w.to(tl.float32)
-                a_sc_full = tl.reshape(
-                    tl.broadcast_to(
-                        a_sc[:, :, None], (BLOCK_M, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR)
-                    ),
-                    (BLOCK_M, BLOCK_K),
-                )
-                b_sc_t = tl.reshape(
-                    tl.broadcast_to(
-                        b_sc[:, :, None], (BLOCK_N, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR)
-                    ),
-                    (BLOCK_N, BLOCK_K),
-                )
-                b_sc_full = tl.trans(b_sc_t)  # [BLOCK_K, BLOCK_N]
-                acc += tl.dot(
-                    a_f32 * a_sc_full,
-                    b_f32 * b_sc_full,
-                    input_precision="ieee",
-                )
+            acc = _fnuz_mx_dot(acc, x, w, x_scales, w_scales, MX_SCALE_BLOCK_K)
         else:
             acc = tl.dot_scaled(
                 x, x_scales, "e4m3", w, w_scales, "e4m3", acc=acc, fast_math=True

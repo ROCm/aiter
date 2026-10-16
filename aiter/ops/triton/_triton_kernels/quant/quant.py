@@ -772,6 +772,8 @@ def _dynamic_mxfp8_quant_kernel(
     n_groups: tl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE
 
     for row_idx in tl.range(row_start, M, NUM_PRGMS, num_stages=2):
+        # row_idx * stride_xm can exceed int32 for stacked expert weights.
+        row_idx = row_idx.to(tl.int64)
         x = tl.load(
             x_ptr + row_idx * stride_xm + col_offsets * stride_xn,
             mask=mask,
