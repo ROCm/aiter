@@ -4090,10 +4090,30 @@ def get_2stage_cfgs(
     ):
         kernelName2 = kernelName2.replace("_afp4_", "_afp8_", 1)
 
-    tag = f"({kernelName1=}, {kernelName2=})"
-    logger.info(
-        f"[fused_moe] using {'1stage' if run_1stage else '2stage'}{' xbf16' if run_1stage_xbf16 else ''} {'default' if cfg is None else tag} for {keys} "
-    )
+    reroute_a16wmix_bf16 = _can_reroute_bf16_to_a16wmix(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        dtype=dtype,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w,
+        q_type=q_type,
+        activation=activation,
+        is_shuffled=bool(weights_shuffled),
+        use_g1u1=use_g1u1,
+        doweight_stage1=doweight_stage1,
+        swiglu_limit=swiglu_limit,
+        has_stage1_bias=has_stage1_bias,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+    ) and not (isinstance(kernelName1, str) and kernelName1.startswith("flydsl_"))
+
+    # The a16wmix reroute below logs its own kernel names; this line would name
+    # the CK/1-stage choice it is about to discard.
+    if not reroute_a16wmix_bf16:
+        tag = f"({kernelName1=}, {kernelName2=})"
+        logger.info(
+            f"[fused_moe] using {'1stage' if run_1stage else '2stage'}{' xbf16' if run_1stage_xbf16 else ''} {'default' if cfg is None else tag} for {keys} "
+        )
 
     def get_block_m() -> int:
         if q_dtype_a == dtypes.fp8:
@@ -4114,24 +4134,7 @@ def get_2stage_cfgs(
             has_stage2_bias=has_stage2_bias,
         )
 
-    if _can_reroute_bf16_to_a16wmix(
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        dtype=dtype,
-        q_dtype_a=q_dtype_a,
-        q_dtype_w=q_dtype_w,
-        q_type=q_type,
-        activation=activation,
-        is_shuffled=bool(weights_shuffled),
-        use_g1u1=use_g1u1,
-        doweight_stage1=doweight_stage1,
-        swiglu_limit=swiglu_limit,
-        has_stage1_bias=has_stage1_bias,
-        hidden_pad=hidden_pad,
-        intermediate_pad=intermediate_pad,
-    ) and not (
-        isinstance(kernelName1, str) and kernelName1.startswith("flydsl_")
-    ):
+    if reroute_a16wmix_bf16:
         # Untuned a16w16 fallback (and override of a CK/asm tuned row) when a
         # finite swiglu_limit is configured, or when AITER_FORCE_A16WMIX_BF16=1.
         # Tiles belong in the CSV; this is the shape-safe default until a tuner
@@ -4142,9 +4145,7 @@ def get_2stage_cfgs(
         _out_str = "bf16"
         _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
         _tile_n = _tile_k = 128
-        kn1 = flydsl_kernel_name(
-            1, "bf16", "bf16", _out_str, _tile_m, _tile_n, _tile_k
-        )
+        kn1 = flydsl_kernel_name(1, "bf16", "bf16", _out_str, _tile_m, _tile_n, _tile_k)
         kn2 = flydsl_kernel_name(
             2, "bf16", "bf16", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
         )
