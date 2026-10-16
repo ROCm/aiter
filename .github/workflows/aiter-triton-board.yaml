@@ -12,6 +12,15 @@ name: AITER-triton Kernels board
 #      requirements-triton*);
 #   3. it carries the Triton/Gluon label.
 #
+# A PR's Status follows the PR: a draft sits in "Backlog"; a review request
+# moves it to "In Progress"; an approval from a member of @ROCm/team_aiter
+# moves it to "Approved"; a dismissed review moves it back to "In review";
+# otherwise an open PR sits in "In review" unless someone has already moved it
+# on to "In Progress" or "Approved". Review events from bots (Copilot's
+# automatic reviews) are ignored. Review submissions and dismissals on PRs from
+# forks carry no secrets, so the App token cannot be minted there and those
+# runs are skipped; every pull_request_target event still syncs such PRs.
+#
 # Issues stay label-driven through the board's own auto-add rule. Here they are
 # added when assigned to a team member or labeled (rules 1 and 3), and their
 # Status is left to the board's "Item added" automation.
@@ -33,6 +42,9 @@ on:
       - unassigned
       - labeled
       - unlabeled
+      - review_requested
+  pull_request_review:
+    types: [submitted, dismissed]
   issues:
     types: [opened, reopened, assigned, unassigned, labeled, unlabeled]
 
@@ -44,6 +56,8 @@ concurrency:
 
 jobs:
   board:
+    # pull_request_review runs for fork PRs get no secrets (see the header).
+    if: ${{ github.event_name != 'pull_request_review' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     steps:
       - name: Mint an AITER CI App token
@@ -63,6 +77,7 @@ jobs:
             const ORG = 'ROCm';
             const PROJECT_NUMBER = 232;
             const TEAM_SLUG = 'triton_kernels_team';
+            const APPROVER_TEAM_SLUG = 'team_aiter';  // whose approvals move a PR to "Approved"
             const LABEL = 'Triton/Gluon';
             const TRITON_PATHS = [
               'aiter/ops/triton/',
@@ -82,6 +97,23 @@ jobs:
             const number = (context.payload.pull_request ?? context.payload.issue).number;
             const what = `${isPR ? 'PR' : 'issue'} #${number}`;
 
+            // Members of an org team as lower-case logins, or null when the
+            // App cannot read the team.
+            async function teamMembers(slug) {
+              try {
+                const members = await github.paginate(github.rest.teams.listMembersInOrg, {
+                  org: ORG,
+                  team_slug: slug,
+                  per_page: 100,
+                });
+                return new Set(members.map(m => m.login.toLowerCase()));
+              } catch (e) {
+                core.warning(`Could not list @${ORG}/${slug} members (HTTP ${e.status ?? '?'}: ${e.message}). `
+                  + 'Grant the AITER CI App the organization "Members: read" permission.');
+                return null;
+              }
+            }
+
             // Work from the current state, not the event payload: by the time
             // this runs the PR may have been marked ready, converted to draft,
             // relabeled, reassigned or closed.
@@ -99,26 +131,18 @@ jobs:
             const reasons = [];
 
             // Rule 1: authored by (PRs) or assigned to a team member.
-            // `team` stays null when the lookup fails; the rule is then
-            // skipped for adding, and nothing is removed (see below).
+            // `team` is null when the lookup fails; the rule is then skipped
+            // for adding, and nothing is removed (see below).
             const people = (item.assignees ?? []).map(a => a.login);
             if (pr) people.unshift(pr.user.login);
-            let team = null;
-            try {
-              const members = await github.paginate(github.rest.teams.listMembersInOrg, {
-                org: ORG,
-                team_slug: TEAM_SLUG,
-                per_page: 100,
-              });
-              team = new Set(members.map(m => m.login.toLowerCase()));
+            const team = await teamMembers(TEAM_SLUG);
+            if (team) {
               const ours = people.filter(login => team.has(login.toLowerCase()));
               if (ours.length) {
                 reasons.push(`team: ${[...new Set(ours)].join(', ')}`);
               }
-            } catch (e) {
-              core.warning(`Could not list @${ORG}/${TEAM_SLUG} members (HTTP ${e.status ?? '?'}: ${e.message}). `
-                + 'Grant the AITER CI App the organization "Members: read" permission; '
-                + 'skipping the team rule for this run.');
+            } else {
+              core.warning('Skipping the team rule for this run.');
             }
 
             // Rule 2: the diff itself.
@@ -225,16 +249,37 @@ jobs:
                 return;
               }
 
-              let wanted;
+              // Review-driven transitions. Bots are ignored: Copilot's
+              // automatic review requests itself on every new PR.
+              const review = context.payload.review;
+              const requested = context.payload.requested_reviewer ?? context.payload.requested_team;
+              const isReviewEvent = context.eventName === 'pull_request_review';
+              const reviewRequested = action === 'review_requested' && requested?.type !== 'Bot';
+              const reviewDismissed = isReviewEvent && action === 'dismissed' && review?.user?.type !== 'Bot';
+              let approvedBy = null;
+              if (isReviewEvent && action === 'submitted' && review?.state?.toLowerCase() === 'approved') {
+                const approvers = await teamMembers(APPROVER_TEAM_SLUG);
+                if (approvers?.has(review.user.login.toLowerCase())) {
+                  approvedBy = review.user.login;
+                }
+              }
+
+              let wanted, why;
               if (pr.draft) {
-                wanted = 'Backlog';
+                [wanted, why] = ['Backlog', 'draft'];
+              } else if (approvedBy) {
+                [wanted, why] = ['Approved', `approved by ${approvedBy} (@${ORG}/${APPROVER_TEAM_SLUG})`];
+              } else if (reviewRequested) {
+                [wanted, why] = ['In Progress', 'review requested'];
+              } else if (reviewDismissed) {
+                [wanted, why] = ['In review', 'review dismissed'];
               } else if (KEEP_OPEN.includes((current ?? '').toLowerCase())) {
-                wanted = current;
+                [wanted, why] = [current, 'kept'];
               } else {
-                wanted = 'In review';
+                [wanted, why] = ['In review', 'open PR'];
               }
               if (wanted === current) {
-                core.info(`${what} is on the board with Status "${current}" — nothing to change.`);
+                core.info(`${what} is on the board with Status "${current}" (${why}) — nothing to change.`);
                 return;
               }
               const option = project.field.options.find(o => o.name.toLowerCase() === wanted.toLowerCase());
@@ -248,7 +293,7 @@ jobs:
                     value: { singleSelectOptionId: $option }
                   }) { projectV2Item { id } }
                 }`, { project: project.id, item: boardItem.id, field: project.field.id, option: option.id });
-              core.info(`${what}: Status ${current ?? 'unset'} -> ${option.name}.`);
+              core.info(`${what}: Status ${current ?? 'unset'} -> ${option.name} (${why}).`);
             } catch (e) {
               core.setFailed(`Could not update the board: ${e.message}. `
                 + 'If this is a permission error, grant the AITER CI App the organization '

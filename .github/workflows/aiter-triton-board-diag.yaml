@@ -1,0 +1,48 @@
+name: Board App diagnostics (temporary)
+
+# TEMPORARY — delete before merging. Prints what the GitHub App behind
+# AITER_CI_APP_ID actually is and which permissions each of its installations
+# has accepted, so we can see why aiter-triton-board.yaml gets 404s. Runs on
+# pull_request (not pull_request_target) so this PR's copy of the file is used.
+# The private key is only used to sign a short-lived JWT; nothing secret is
+# printed.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Installation permissions as seen by the App
+        uses: actions/github-script@v7
+        env:
+          APP_ID: ${{ secrets.AITER_CI_APP_ID }}
+          APP_KEY: ${{ secrets.AITER_CI_APP_PRIVATE_KEY }}
+        with:
+          script: |
+            const crypto = require('node:crypto');
+            const b64 = s => Buffer.from(s).toString('base64url');
+            const now = Math.floor(Date.now() / 1000);
+            const header = b64(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+            const payload = b64(JSON.stringify({ iat: now - 60, exp: now + 540, iss: process.env.APP_ID }));
+            const signature = crypto.sign('RSA-SHA256', Buffer.from(`${header}.${payload}`), process.env.APP_KEY).toString('base64url');
+            const jwt = `${header}.${payload}.${signature}`;
+            const headers = { Authorization: `Bearer ${jwt}`, Accept: 'application/vnd.github+json' };
+
+            const appRes = await fetch('https://api.github.com/app', { headers });
+            const app = await appRes.json();
+            core.info(`GET /app -> ${appRes.status}`);
+            core.info(`App: ${app.slug} (id ${app.id}, owner ${app.owner?.login})`);
+            core.info(`Permissions declared on the App: ${JSON.stringify(app.permissions)}`);
+
+            const instRes = await fetch('https://api.github.com/app/installations?per_page=100', { headers });
+            const installations = await instRes.json();
+            core.info(`GET /app/installations -> ${instRes.status}`);
+            for (const i of installations) {
+              core.info(`Installation ${i.id} on ${i.account?.login} (${i.repository_selection} repositories): `
+                + `accepted permissions ${JSON.stringify(i.permissions)}`);
+            }
