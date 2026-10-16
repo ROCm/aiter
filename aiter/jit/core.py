@@ -182,6 +182,11 @@ AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_mxfp8_bpreshuffle_tuned_gemm.csv",
 )
 
+AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a4w4_mxscale_bpreshuffle_tuned_gemm.csv",
+)
+
 AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE = os.getenv(
     "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_abpreshuffle_tuned_gemm.csv",
@@ -356,6 +361,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE",
             AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE,
             "a8w8_mxfp8_bpreshuffle_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE",
+            AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE,
+            "a4w4_mxscale_bpreshuffle_tuned_gemm",
         )
 
     @property
