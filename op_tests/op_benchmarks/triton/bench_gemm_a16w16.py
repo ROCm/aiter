@@ -36,9 +36,32 @@ def bench_gemm_fn(
 ):
     # NOTE: Assume bias and output has the same dtype
     c_dtype = torch.bfloat16
-    x, w, bias, _out_dtype, y = generate_gemm_a16w16_inputs(
-        M, N, K, c_dtype, layout=layout, output=True, bias=True
-    )
+    _p_gen = functools.partial(generate_gemm_a16w16_inputs,
+                               M, N, K, c_dtype, layout=layout, output=True, bias=True)
+    
+    if atomic:
+        # Accumulation in bf16/fp16 leads to precision loss, cast y to fp32 to prevent that
+        assert backend != "gluon", "Atomic kernel is triton-only"
+        assert (
+            activation is None
+        ), "Atomic kernel does not currently support fused activation"   
+        y = y.to(torch.float32).zero_()
+        _out_vals_keys = ["x", "w", "_", "dtype", "y"] #This should match the kwargs for kernel op wrapper
+        kernel_fn = gemm_a16w16_atomic
+    elif persistent:
+        assert not (backend == "gluon" and layout not in ("TN", "TT")), (
+            f"--persistent with --backend gluon requires --layout TN or TT, got "
+            f"'{layout}' (the gluon persistent kernel has no 'N' path for A)"
+        )
+        _out_vals_keys = ["x", "w", "bias", "dtype", "y"] #keys for outputs from the gen function
+        kernel_fn = gemm_a16w16
+    else:
+        _out_vals_keys = ["x", "w", "bias", "dtype", "y"] #keys for outputs from the gen function
+        kernel_fn = gemm_a16w16
+
+    #create rotating buffers pool
+    rot_bufs = generate_rotating_buffers_pool([_p_gen], [_out_vals_keys], target_mb=256, min_pool_len=4)
+
     # flops
     flops = 2.0 * M * N * K
     if activation is not None:

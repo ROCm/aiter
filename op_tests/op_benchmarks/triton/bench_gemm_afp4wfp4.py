@@ -1,3 +1,4 @@
+import functools
 import math
 
 import torch
@@ -16,6 +17,8 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_model_benchmark_object,
     get_shape_benchmark_object,
     print_vgpr,
@@ -35,7 +38,9 @@ def bench_gemm_fn(
     gluon: bool,
 ):
     c_dtype = torch.bfloat16
-    x, _, w, _, _, x_scale, w_scale, _, y = generate_gemm_afp4wfp4_inputs(
+
+    _p_gen = functools.partial(
+        generate_gemm_afp4wfp4_inputs,
         M,
         N,
         K,
@@ -45,37 +50,41 @@ def bench_gemm_fn(
         shuffle_scales_fg=preshuffle,
         shuffle_weight_fg=preshuffle,
     )
+    # (x, w, w_shuffed, x_scales, w_scales, x_scales_shuffled, w_scales_shuffled, out_dtype, y)
+    # gemm_afp4wfp4_preshuffle names its activation/weight kwargs x_fp4/w_preshuf;
+    # the non-preshuffle kernel uses x/w. w_shuffed/*_shuffled already collapse to the
+    # unshuffled tensors when preshuffle is False, so one mapping covers both kernels.
+    x_key = "x_fp4" if preshuffle else "x"
+    w_key = "w_preshuf" if preshuffle else "w"
+    _out_vals_keys = [x_key, "_", w_key, "_", "_", "x_scales", "w_scales", "_", "y"]
+
+    rot_bufs = generate_rotating_buffers_pool(
+        [_p_gen], [_out_vals_keys], target_mb=256, min_pool_len=4
+    )
+
+    if preshuffle:
+        kernel_fn = functools.partial(gemm_afp4wfp4_preshuffle, dtype=c_dtype)
+    elif gluon:
+        kernel_fn = functools.partial(
+            triton_gemm_afp4wfp4, dtype=c_dtype, backend="gluon"
+        )
+    else:
+        kernel_fn = functools.partial(triton_gemm_afp4wfp4, dtype=c_dtype)
+
     # flops
     flops = 2.0 * M * N * K
     # memory transfer
-    mem_read = x.numel() * x.element_size() + w.numel() * w.element_size()
+    mem_read = rot_bufs[0][x_key].numel() * rot_bufs[0][x_key].element_size() + rot_bufs[
+        0
+    ][w_key].numel() * rot_bufs[0][w_key].element_size()
     mem_read += (
-        x_scale.numel() * x_scale.element_size()
-        + w_scale.numel() * w_scale.element_size()
+        rot_bufs[0]["x_scales"].numel() * rot_bufs[0]["x_scales"].element_size()
+        + rot_bufs[0]["w_scales"].numel() * rot_bufs[0]["w_scales"].element_size()
     )
     mem_write = (M * N) * 2  # TODO: Fix for c_dtype != bf16
     mem = mem_read + mem_write
-    if preshuffle:
-        ms = triton.testing.do_bench(
-            lambda: gemm_afp4wfp4_preshuffle(x, w, x_scale, w_scale, c_dtype, y),
-            warmup=25,
-            rep=100,
-        )
-    else:
-        if gluon:
-            ms = triton.testing.do_bench(
-                lambda: triton_gemm_afp4wfp4(
-                    x, w, x_scale, w_scale, c_dtype, y, backend="gluon"
-                ),
-                warmup=25,
-                rep=100,
-            )
-        else:
-            ms = triton.testing.do_bench(
-                lambda: triton_gemm_afp4wfp4(x, w, x_scale, w_scale, c_dtype, y),
-                warmup=25,
-                rep=100,
-            )
+
+    ms = do_bench_aiter_triton(kernel_fn, rot_bufs)
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
         return ms

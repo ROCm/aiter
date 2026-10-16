@@ -1,3 +1,4 @@
+import functools
 import math
 import sys
 
@@ -14,6 +15,8 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     get_model_benchmark_object,
     get_shape_benchmark_object,
@@ -28,7 +31,9 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
     _e5m2_type, e4m3_type = get_fp8_dtypes()
     a_dtype = e4m3_type
     out_dtype = torch.float16
-    x, w, x_scales, w_scales, _, _, y = generate_gemm_a8wfp4_inputs(
+
+    _p_gen = functools.partial(
+        generate_gemm_a8wfp4_inputs,
         M=M,
         N=N,
         K=K,
@@ -37,24 +42,29 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
         layout=layout,
         output=True,
     )
+    # (x, w, x_scales, w_scales, x_fp32, w_fp32, y)
+    _out_vals_keys = ["x", "w", "x_scales", "w_scales", "_", "_", "y"]
+
+    rot_bufs = generate_rotating_buffers_pool(
+        [_p_gen], [_out_vals_keys], target_mb=256, min_pool_len=4
+    )
+
+    kernel_fn = functools.partial(gemm_a8wfp4, dtype=out_dtype)
+
     # flops
     flops = 2.0 * M * N * K
     # memory transfer
-    mem_read = x.numel() * x.element_size() + w.numel() * w.element_size()
+    mem_read = rot_bufs[0]["x"].numel() * rot_bufs[0]["x"].element_size() + rot_bufs[
+        0
+    ]["w"].numel() * rot_bufs[0]["w"].element_size()
     mem_read += (
-        x_scales.numel() * x_scales.element_size()
-        + w_scales.numel() * w_scales.element_size()
+        rot_bufs[0]["x_scales"].numel() * rot_bufs[0]["x_scales"].element_size()
+        + rot_bufs[0]["w_scales"].numel() * rot_bufs[0]["w_scales"].element_size()
     )
     mem_write = (M * N) * 2  # TODO: Fix for c_dtype != bf16
     mem = mem_read + mem_write
 
-    ms = triton.testing.do_bench(
-        lambda: gemm_a8wfp4(
-            x=x, w=w, y=y, x_scales=x_scales, w_scales=w_scales, dtype=out_dtype
-        ),
-        warmup=25,
-        rep=100,
-    )
+    ms = do_bench_aiter_triton(kernel_fn, rot_bufs)
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
         return ms

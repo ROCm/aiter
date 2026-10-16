@@ -42,7 +42,10 @@ def bench_gemm_fn(
         shuffle=shuffle,
     )
 
-    # flops
+    #create rotating buffers pool
+    rot_bufs = generate_rotating_buffers_pool([_p_gen], [_out_vals_keys], target_mb=256, min_pool_len=4)
+
+    #Kernel FLOPS and Mem Accesses(bytes)
     flops = 2.0 * M * N * K
     # memory transfer
     mem_read = (M * K) * x.element_size() + (N * K) * weight.element_size()
