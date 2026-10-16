@@ -1,5 +1,4 @@
 import argparse
-import random
 import sys
 
 import torch
@@ -26,92 +25,91 @@ def input_helper(
     dtype,
     kv_cache_dtype,
     output_type,
-    num_blocks=4,
+    *,
+    backend,
+    value_head_size=None,
+    query_length=1,
+    value_transposed=False,
 ):
-    """Helper function to generate input tensors for paged attention testing."""
+    """Generate distinct full-context pages in the selected backend's layout."""
+    if backend not in ("triton", "gluon"):
+        raise ValueError(f"Unsupported backend: {backend}")
+    max_num_blks_per_seq = triton.cdiv(SEQ_LEN, KV_BLK_SZ)
+    num_blocks = B * max_num_blks_per_seq
+    D_V = D if value_head_size is None else value_head_size
     # Query tensor generation
     if dtype not in (torch.bfloat16, torch.float16, torch.float32):
         query = torch.randn(
-            B, H_Q, D, dtype=torch.float16, device="cuda"
+            B * query_length, H_Q, D, dtype=torch.float16, device="cuda"
         )  # assumption dtype is 8bits or lower
         query = query.to(dtype=dtype, device="cuda")
     else:
-        query = torch.randn(B, H_Q, D, dtype=dtype, device="cuda")
+        query = torch.randn(B * query_length, H_Q, D, dtype=dtype, device="cuda")
 
-    if kv_cache_dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        x = min(D, 16 // torch.tensor([], dtype=kv_cache_dtype).element_size())
-        key_cache = torch.randn(
-            num_blocks, H_KV, D // x, KV_BLK_SZ, x, dtype=torch.float16, device="cuda"
+    def make_cache(shape):
+        source_dtype = (
+            kv_cache_dtype
+            if kv_cache_dtype in (torch.bfloat16, torch.float16, torch.float32)
+            else torch.float16
         )
-        value_cache = torch.randn(
-            num_blocks, H_KV, D, KV_BLK_SZ, dtype=torch.float16, device="cuda"
-        )
-        key_cache = torch.clamp(
-            key_cache, min=1e-3
-        )  # For FP8 case, this is needed to prevent NANs
-        value_cache = torch.clamp(
-            value_cache, min=1e-3
-        )  # For FP8 case, this is needed to prevent NANs
+        cache = torch.randn(shape, dtype=source_dtype, device="cuda")
+        # Preserve the existing FP8 input convention without another full-size copy.
+        cache.clamp_(min=1e-3)
+        return cache.to(kv_cache_dtype)
 
-        # torch doesn't have randn for fp8 data type, so we convert here
-        key_cache = key_cache.to(dtype=kv_cache_dtype)
-        value_cache = value_cache.to(dtype=kv_cache_dtype)
+    if backend == "triton":
+        key_cache = make_cache((num_blocks, H_KV, KV_BLK_SZ, D))
+        value_cache = make_cache((num_blocks, H_KV, KV_BLK_SZ, D_V))
     else:
-        x = min(D, 16 // torch.tensor([], dtype=kv_cache_dtype).element_size())
-        key_cache = torch.randn(
-            num_blocks, H_KV, D // x, KV_BLK_SZ, x, dtype=kv_cache_dtype, device="cuda"
-        )
-        value_cache = torch.randn(
-            num_blocks, H_KV, D, KV_BLK_SZ, dtype=kv_cache_dtype, device="cuda"
-        )
-        key_cache = torch.clamp(
-            key_cache, min=1e-3
-        )  # For FP8 case, this is needed to prevent NANs
-        value_cache = torch.clamp(
-            value_cache, min=1e-3
-        )  # For FP8 case, this is needed to prevent NANs
-
-    key_cache_tri = key_cache.permute(0, 1, 3, 2, 4).flatten(3, 4).contiguous().cuda()
-    value_cache_tri = value_cache.permute(0, 1, 3, 2).contiguous().cuda()
+        x = min(D, 16 // kv_cache_dtype.itemsize)
+        key_cache = make_cache((num_blocks, H_KV, D // x, KV_BLK_SZ, x))
+        if value_transposed:
+            value_cache = make_cache((num_blocks, H_KV, KV_BLK_SZ // x, D_V, x))
+        else:
+            value_cache = make_cache((num_blocks, H_KV, D_V, KV_BLK_SZ))
 
     context_lens = torch.full((B,), SEQ_LEN, device="cuda")
-    max_context_len = max(context_lens)
-    max_num_blks_per_seq = (max_context_len + KV_BLK_SZ - 1) // KV_BLK_SZ
+    # The Triton kernels multiply block IDs by cache strides before pointer addition.
+    cache_elements = num_blocks * H_KV * KV_BLK_SZ * max(D, D_V)
+    block_table_dtype = torch.int64 if cache_elements > 2**31 - 1 else torch.int32
+    block_tables = torch.arange(
+        num_blocks, dtype=block_table_dtype, device="cuda"
+    ).view(B, max_num_blks_per_seq)
 
-    block_tables = []
-    for i in range(B):
-        block_table = [
-            random.randint(0, num_blocks - 1) for _ in range(max_num_blks_per_seq)
-        ]
-        block_tables.append(block_table)
-    block_tables = torch.tensor(block_tables, dtype=torch.int32, device="cuda")
-
-    output = torch.zeros(B, H_Q, D, dtype=output_type, device="cuda")
+    output = torch.zeros(B * query_length, H_Q, D_V, dtype=output_type, device="cuda")
 
     return (
         query,
         output,
         key_cache,
         value_cache,
-        key_cache_tri,
-        value_cache_tri,
         context_lens,
         block_tables,
-        max_context_len,
     )
 
 
 def model_benchmark_configs(args):
-    config_file = args.model_configs
     configs = get_model_configs(
-        config_path=config_file,
+        config_path=args.model_configs,
         models="llama3,deepseek" if args.model is None else args.model,
     )
     fa_configs = []
     BS = args.b if args.b else 1024
     SEQ_LEN = args.sq if args.sq else 8192
     if args.hq:
-        return [("custom", BS, args.hq, args.hk if args.hk else args.hq, SEQ_LEN, 128)]
+        HEAD_DIM = args.head_dim if args.head_dim else 128
+        return [
+            (
+                "custom",
+                BS,
+                args.hq,
+                args.hk or args.hq,
+                SEQ_LEN,
+                HEAD_DIM,
+                args.value_head_dim or HEAD_DIM,
+                args.query_length,
+            )
+        ]
 
     for model_name, config in configs.items():
         HQ = config["num_attention_heads"]
@@ -121,7 +119,18 @@ def model_benchmark_configs(args):
             else config["num_key_value_heads"]
         )
         HEAD_DIM = config["hidden_size"] // HQ
-        fa_configs.append((model_name, BS, HQ, HK, SEQ_LEN, HEAD_DIM))
+        fa_configs.append(
+            (
+                model_name,
+                BS,
+                HQ,
+                HK,
+                SEQ_LEN,
+                HEAD_DIM,
+                args.value_head_dim or HEAD_DIM,
+                args.query_length,
+            )
+        )
 
     return fa_configs
 
@@ -133,23 +142,27 @@ def paged_attn_decode(
     D,
     KV_BLK_SZ,
     SEQ_LEN,
-    num_blocks,
     dtype,
     kv_cache_dtype,
     compute_type,
     output_type,
     backend="triton",
+    value_head_size=None,
+    query_length=1,
 ):
+    if value_head_size is None:
+        value_head_size = D
+    if backend == "triton" and (value_head_size != D or query_length != 1):
+        raise ValueError(
+            "Independent V dimensions and query_length > 1 require --backend gluon"
+        )
     (
         query,
-        triton_output,
+        output,
         key_cache,
         value_cache,
-        key_cache_tri,
-        value_cache_tri,
         context_lens,
         block_tables,
-        max_context_len,
     ) = input_helper(
         BS,
         H_Q,
@@ -160,7 +173,10 @@ def paged_attn_decode(
         dtype,
         kv_cache_dtype,
         output_type,
-        num_blocks,
+        backend=backend,
+        value_head_size=value_head_size,
+        query_length=query_length,
+        value_transposed=backend == "gluon" and KV_BLK_SZ == 64,
     )
     attn_scale = 1.0 / (D**0.5)
 
@@ -173,14 +189,14 @@ def paged_attn_decode(
         context_lens = context_lens.to(torch.int32)
         scale = torch.ones(1, dtype=torch.float32, device="cuda")
         return lambda: pa_decode_gluon(
-            output=triton_output,
+            output=output,
             query=query,
             key_cache=key_cache,
             value_cache=value_cache,
             context_lengths=context_lens,
             block_tables=block_tables,
             softmax_scale=attn_scale,
-            query_length=1,
+            query_length=query_length,
             max_context_partition_num=get_recommended_splits(BS, H_KV),
             compute_type=compute_type,
             key_scale=scale,
@@ -191,14 +207,14 @@ def paged_attn_decode(
     v_scale = torch.tensor([1.0])
 
     return lambda: paged_attention_decode(
-        output=triton_output,
+        output=output,
         query=query,
-        key_cache=key_cache_tri,
-        value_cache=value_cache_tri,
+        key_cache=key_cache,
+        value_cache=value_cache,
         seq_lens=context_lens,
         block_tables=block_tables,
         attn_scale=attn_scale,
-        max_seq_len=max_context_len,
+        max_seq_len=SEQ_LEN,
         compute_type=compute_type,
         k_scale=k_scale,
         v_scale=v_scale,
@@ -214,60 +230,88 @@ def run_benchmark(args):
     output_type = arg_to_torch_dtype[args.output_type]
 
     x_vals_list = model_benchmark_configs(args)
-    x_names = ["model", "BS", "HQ", "HK", "SEQ_LEN", "HEAD_DIM"]
+    x_names = [
+        "model",
+        "BS",
+        "HQ",
+        "HK",
+        "SEQ_LEN",
+        "HEAD_DIM",
+        "VALUE_HEAD_DIM",
+        "QUERY_LEN",
+    ]
 
-    line_names = ["Time_(ms)", "TFLOPS", "Bandwidth_(GB/s)"]
-    line_vals = ["time", "tflops", "bandwidth"]
-
+    plot_name = get_caller_name_no_ext()
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
         x_vals=x_vals_list,
         line_arg="metric",
-        line_vals=line_vals,
-        line_names=line_names,
+        line_vals=["time", "tflops", "bandwidth"],
+        line_names=["Time_(ms)", "TFLOPS", "Bandwidth_(GB/s)"],
         styles=[("red", "-"), ("blue", "-"), ("yellow", "-")],
         ylabel="ms / TFLOPS / GB/s",
-        plot_name=get_caller_name_no_ext(),
+        plot_name=plot_name,
         args={},
     )
 
-    @triton.testing.perf_report([benchmark])
-    def bench_paged_attn_decode(BS, HQ, HK, SEQ_LEN, HEAD_DIM, metric, model=None):
-        # TODO tune this
-        KV_BLK_SZ = 16 if args.backend == "gluon" else 128
-        num_blocks = 4
-        fn = paged_attn_decode(
-            BS,
-            HQ,
-            HK,
-            HEAD_DIM,
-            KV_BLK_SZ,
-            SEQ_LEN,
-            num_blocks,
-            dtype,
-            kv_cache_dtype,
-            compute_type,
-            output_type,
-            args.backend,
-        )
+    timings = {}
 
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+    @triton.testing.perf_report([benchmark])
+    def bench_paged_attn_decode(
+        BS,
+        HQ,
+        HK,
+        SEQ_LEN,
+        HEAD_DIM,
+        VALUE_HEAD_DIM,
+        QUERY_LEN,
+        metric,
+        model=None,
+    ):
+        PAGE_SIZE = args.page_size
+        num_blocks = BS * triton.cdiv(SEQ_LEN, PAGE_SIZE)
+        shape = (BS, HQ, HK, SEQ_LEN, HEAD_DIM, VALUE_HEAD_DIM, QUERY_LEN, PAGE_SIZE)
+        if shape not in timings:
+            fn = paged_attn_decode(
+                BS,
+                HQ,
+                HK,
+                HEAD_DIM,
+                PAGE_SIZE,
+                SEQ_LEN,
+                dtype,
+                kv_cache_dtype,
+                compute_type,
+                output_type,
+                args.backend,
+                value_head_size=VALUE_HEAD_DIM,
+                query_length=QUERY_LEN,
+            )
+            timings[shape] = triton.testing.do_bench(fn, warmup=25, rep=100)
+        ms = timings[shape]
 
         # query and output
-        mem = (BS * HQ * HEAD_DIM) * (
-            get_dtype_bytes(dtype) + get_dtype_bytes(output_type)
+        mem = (BS * QUERY_LEN * HQ) * (
+            HEAD_DIM * get_dtype_bytes(dtype)
+            + VALUE_HEAD_DIM * get_dtype_bytes(output_type)
         )
-        # kv_cache
+        # Effective KV traffic: count each sequence's logical tokens once.
         mem += (
-            num_blocks * HK * KV_BLK_SZ * HEAD_DIM * get_dtype_bytes(kv_cache_dtype) * 2
+            BS
+            * HK
+            * SEQ_LEN
+            * (HEAD_DIM + VALUE_HEAD_DIM)
+            * get_dtype_bytes(kv_cache_dtype)
         )
-        # block_tables int32
-        mem += BS * ((SEQ_LEN + KV_BLK_SZ - 1) // KV_BLK_SZ) * 4
-        # context_lens fp32
-        mem += BS * 4
+        # Large cache offsets require 64-bit block IDs.
+        cache_elements = num_blocks * HK * PAGE_SIZE * max(HEAD_DIM, VALUE_HEAD_DIM)
+        mem += num_blocks * (8 if cache_elements > 2**31 - 1 else 4)
+        # Gluon converts context lengths to int32; Triton keeps int64.
+        mem += BS * (4 if args.backend == "gluon" else 8)
 
-        # bhd bhsd => bhs bhsd => bhs, 2 for multiplication and accumulation. and there are 2 gemms
-        flops = (2.0 * BS * HQ * SEQ_LEN * HEAD_DIM) * 2
+        # QK and PV GEMMs; successive query tokens have a causal frontier.
+        attended_tokens = QUERY_LEN * SEQ_LEN - QUERY_LEN * (QUERY_LEN - 1) // 2
+        flops = 2.0 * BS * HQ * attended_tokens * (HEAD_DIM + VALUE_HEAD_DIM)
 
         bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
         tflops = flops / ms * 1e-9
@@ -282,7 +326,21 @@ def run_benchmark(args):
         else:
             raise ValueError("Unknown metric: " + metric)
 
-    bench_paged_attn_decode.run(save_path="." if args.o else None, print_data=True)
+    frames = bench_paged_attn_decode.run(
+        save_path="." if args.o else None,
+        print_data=False,
+        return_df=True,
+    )
+    result = frames[0]
+    unit_suffix = f" ({benchmark.ylabel})"
+    result.rename(
+        columns={f"{name}{unit_suffix}": name for name in benchmark.line_names},
+        inplace=True,
+    )
+    print(f"{plot_name}:")
+    print(result.to_string())
+    if args.o:
+        result.to_csv(f"{plot_name}.csv", index=False, float_format="%.6f")
 
 
 def parse_args():
@@ -303,10 +361,34 @@ def parse_args():
         + "]. Use 'all' to benchmark all models or leave blank for the default benchmark script."
     )
     parser.add_argument("--model", type=str, default=None, help=model_help)
-    parser.add_argument("-b", type=int, default=0)
+    parser.add_argument("-b", type=int, default=0, help="Batch size; default: 1024")
     parser.add_argument("-hq", type=int, default=0)
     parser.add_argument("-hk", type=int, default=0)
-    parser.add_argument("-sq", type=int, default=0)
+    parser.add_argument(
+        "-sq", type=int, default=0, help="Context length; default: 8192"
+    )
+    parser.add_argument(
+        "--head-dim",
+        type=int,
+        help="Q/K head width; default: selected model width or 128 for custom heads",
+    )
+    parser.add_argument(
+        "--page-size",
+        type=int,
+        help="KV tokens per page; default: 16 for Gluon, 128 for Triton",
+    )
+    parser.add_argument(
+        "--value-head-dim",
+        type=int,
+        help="V/output width; default: selected model width or Q/K width",
+    )
+    parser.add_argument(
+        "--query-length",
+        type=int,
+        choices=[1, 2, 3, 4],
+        default=1,
+        help="Query length; default: 1",
+    )
     parser.add_argument("-dtype", default="fp16")
     parser.add_argument("-kv_cache_dtype", default="fp16")
     parser.add_argument("-compute_type", default="fp16")
@@ -327,6 +409,10 @@ def parse_args():
         help="Print VGPR usage for Triton kernels.",
     )
     args = parser.parse_args()
+    if args.page_size is None:
+        args.page_size = 16 if args.backend == "gluon" else 128
+    if args.page_size <= 0:
+        parser.error("--page-size must be positive")
     return args
 
 
