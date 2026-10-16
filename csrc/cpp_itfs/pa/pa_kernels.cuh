@@ -3,19 +3,25 @@
 #include "pa_common.cuh"
 
 // Target magnitude for the FP8 softmax-probability rescale (see the comment at
-// `logits_fp8_scale` below). Deliberately the largest POWER OF TWO inside the
-// e4m3 normal range rather than the range maximum itself, for two reasons:
-//   * a power-of-two scale is exact in binary, so the multiply before the cast
-//     and the divide after it introduce no rounding of their own;
-//   * it leaves headroom below the maximum, so fp32 rounding of the rescale
-//     cannot push the cast into saturation.
-// gfx950 uses OCP e4m3 (max 448); earlier CDNA uses e4m3fnuz (max 240). Both
-// __builtin_amdgcn_cvt_pk_fp8_f32 and the __hip_fp8_e4m3 mfma follow the
-// per-arch convention, so this constant must too.
-#if defined(__gfx950__)
-constexpr float FP8_E4M3_SCALE = 256.0f;
+// `logits_fp8_scale` below): the largest POWER OF TWO inside the e4m3 normal
+// range, rather than the range maximum itself.
+//
+// Measured on gfx950 -- aggregate relative error against the BF16 path at
+// seq_len 256/512/1024 -- scaling to 256 gives 3.45/3.40/3.56%, scaling to the
+// 448 ceiling gives 3.51/3.48/3.60%. The ceiling is never better, so the
+// tie-break is saturation headroom: putting the partition max at exactly 448
+// leaves nothing for fp32 rounding of the rescale, where 256 leaves 1.75x.
+// A power of two also makes the multiply before the cast and the divide after
+// it exact, though that is far below the e4m3 quantization error either way.
+//
+// Which encoding an arch uses is the table in csrc/include/aiter_enum.h: fnuz
+// is gfx942 alone, while gfx950/gfx1201/gfx1250 are OCP. Keyed on gfx942 as the
+// exception so a new OCP arch gets the right constant by default -- keying on
+// gfx950 instead would silently hand gfx1201 and gfx1250 the fnuz value.
+#if defined(__gfx942__)
+constexpr float FP8_E4M3_SCALE = 128.0f;  // e4m3fnuz, max 240
 #else
-constexpr float FP8_E4M3_SCALE = 128.0f;
+constexpr float FP8_E4M3_SCALE = 256.0f;  // OCP e4m3, max 448
 #endif
 constexpr float FP8_E4M3_SCALE_INV = 1.0f / FP8_E4M3_SCALE;
 
