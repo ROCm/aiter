@@ -32,6 +32,7 @@ from . import tdm_prims as TDM
 from .config import _LANE_MASK as LANE_MASK
 from .config import _LOG2_WAVE_SIZE as LOG2_WAVE
 from .config import _WAVE_SIZE as WAVE
+from .types import COMBINE_SLOT_ALIGN
 
 PLAN_BLOCKS = 1
 PLAN_WAVES = 32
@@ -122,9 +123,23 @@ def compact_comb_tab_dwords(*, npes: int, experts_per_rank: int) -> int:
 
     Entry ``e*npes + src`` is ``(row_start, delta)``: the first compact row this
     rank's local expert ``e`` holds from ``src``, and ``comb_slot - row`` for
-    every row of that run on ``src``'s side.
+    every row of that run on ``src``'s side, a multiple of COMBINE_SLOT_ALIGN.
     """
     return 2 * int(npes) * int(experts_per_rank)
+
+
+def compact_dense_comb_slots(
+    *, max_routes: int, npes: int, experts_per_rank: int
+) -> int:
+    """Slots a ``dense_comb`` comb_inp needs for ``max_routes`` routes a rank.
+
+    Each nonempty segment pads its run by at most ``COMBINE_SLOT_ALIGN - 1``
+    slots in front, to match its first row's residue, and as many behind, to
+    end on a block. Rounded to a whole block so planar planes stay aligned.
+    """
+    a = COMBINE_SLOT_ALIGN
+    n = int(max_routes) + 2 * (a - 1) * int(npes) * int(experts_per_rank)
+    return (n + a - 1) // a * a
 
 
 @functools.cache
@@ -152,9 +167,12 @@ def compile_tdm_compact_plan(
 
     ``dense_comb`` lays this rank's comb_inp out segment-major instead of
     ``tok*topk + k``: the route of segment ``seg`` with intra index ``i`` owns
-    slot ``local_base[seg] + i``, ``local_base`` being the exclusive prefix of
-    this rank's own histogram. A ``(src, dest, e)`` run then sits contiguous on
-    both ends, in the same order, so gemm2 can return it in one plain TDM. The
+    slot ``local_base[seg] + i``. A ``(src, dest, e)`` run then sits contiguous
+    on both ends, in the same order, so gemm2 can return it in one plain TDM.
+    Each nonempty segment takes whole COMBINE_SLOT_ALIGN blocks and starts at
+    its first compact row's residue in them, so ``local_base`` is the exclusive
+    prefix of those padded sizes plus that residue, and slot and row agree
+    modulo the block (:func:`compact_dense_comb_slots` bounds the total). The
     plan writes ``comb_slot[route]`` for the reduce, and the run table of
     :func:`compact_comb_tab_dwords` into ``psum[experts_per_rank:]`` for gemm2.
     """
@@ -243,8 +261,12 @@ def compile_tdm_compact_plan(
             routes_ptr = smem.allocate(max_routes * 4, 16)._ptr
             lds_routes = fx.Int64(fx.ptrtoint(routes_ptr))
         if const_expr(dense_comb):
-            estart_ptr = smem.allocate(epr * 4, 16)._ptr
-            lds_estart = fx.Int64(fx.ptrtoint(estart_ptr))
+            # Per segment, the dest's first compact row of its expert; per
+            # (src, seg), the first compact row of src's run in it.
+            segstart_ptr = smem.allocate(segs * 4, 16)._ptr
+            lds_segstart = fx.Int64(fx.ptrtoint(segstart_ptr))
+            row0_ptr = smem.allocate(npes * segs * 4, 16)._ptr
+            lds_row0 = fx.Int64(fx.ptrtoint(row0_ptr))
         if const_expr(use_sparse):
             pack_ptr = smem.allocate(row_dwords * 4, 128)._ptr
             recv_ptr = smem.allocate(npes * row_dwords * 4, 128)._ptr
@@ -534,11 +556,11 @@ def compile_tdm_compact_plan(
                         send = expert_start + my_prefix
                         if dest == rank:
                             buffer_store(expert_start + total, rsrc_psum, e)
-                            if const_expr(dense_comb):
-                                comm_ops.store_i32_lds(
-                                    lds_estart + fx.Int64(safe_e) * fx.Int64(4),
-                                    expert_start,
-                                )
+                        if const_expr(dense_comb):
+                            comm_ops.store_i32_lds(
+                                lds_segstart + fx.Int64(idx) * fx.Int64(4),
+                                expert_start,
+                            )
                         buffer_store(send, rsrc_base, idx)
                         comm_ops.store_i32_lds(
                             lds_hist + fx.Int64(idx) * fx.Int64(4), send
@@ -548,10 +570,30 @@ def compile_tdm_compact_plan(
             fx.barrier()
 
             if const_expr(dense_comb):
+                # Each count becomes its run's padded size in place: the run
+                # starts at its first row's residue in a fresh block and ends
+                # on one, so its slots and rows agree modulo the block.
+                _a = COMBINE_SLOT_ALIGN
+                for seg in range(tid, segs, plan_threads):
+                    row = comm_ops.load_i32_lds(
+                        lds_segstart + fx.Int64(seg) * fx.Int64(4)
+                    )
+                    for src in range_constexpr(npes):
+                        at = fx.Int64(src * segs) + fx.Int64(seg)
+                        cnt = comm_ops.load_i32_lds(lds_matrix + at * fx.Int64(4))
+                        comm_ops.store_i32_lds(lds_row0 + at * fx.Int64(4), row)
+                        padded = ((row & fx.Int32(_a - 1)) + cnt + fx.Int32(_a - 1)) & (
+                            fx.Int32(-_a)
+                        )
+                        comm_ops.store_i32_lds(
+                            lds_matrix + at * fx.Int64(4),
+                            (cnt > fx.Int32(0)).select(padded, fx.Int32(0)),
+                        )
+                        row = row + cnt
+                fx.barrier()
                 # Each src row of the matrix becomes its inclusive prefix in
-                # place, one warp per row. Row src then gives both src's
-                # local_base (its entry one segment back) and its count in a
-                # segment (the difference of two neighbours).
+                # place, one warp per row. Row src's entry one segment back is
+                # then the padded start of its run there.
                 if warp < npes:
                     row_base = lds_matrix + fx.Int64(warp) * fx.Int64(segs * 4)
                     carry = arith.constant(0)
@@ -582,27 +624,20 @@ def compile_tdm_compact_plan(
                     return has_prev.select(prev, fx.Int32(0))
 
                 # Run table for gemm2: src's rows of local expert e start at
-                # estart[e] + (rows of lower srcs) and map onto src's slots
-                # local_base_src[seg] + i, so their slot is row + delta.
+                # row0[src][seg] and map onto src's slots local_base_src[seg] + i,
+                # so their slot is row + delta.
                 for item in range(tid, epr * npes, plan_threads):
                     e = item // fx.Int32(npes)
                     src = item - e * fx.Int32(npes)
                     seg = fx.Int32(rank * epr) + e
-                    prefix = arith.constant(0)
-                    for lower in range_constexpr(npes):
-                        cnt = incl_at(lower, seg) - excl_at(lower, seg)
-                        prefix = prefix + (fx.Int32(lower) < src).select(
-                            cnt, fx.Int32(0)
-                        )
-                    row_start = (
-                        comm_ops.load_i32_lds(lds_estart + fx.Int64(e) * fx.Int64(4))
-                        + prefix
+                    row_start = comm_ops.load_i32_lds(
+                        lds_row0
+                        + (fx.Int64(src) * fx.Int64(segs) + fx.Int64(seg)) * fx.Int64(4)
                     )
+                    local_base = excl_at(src, seg) + (row_start & fx.Int32(_a - 1))
                     tab = fx.Int32(epr) + item * fx.Int32(2)
                     buffer_store(row_start, rsrc_psum, tab)
-                    buffer_store(
-                        excl_at(src, seg) - row_start, rsrc_psum, tab + fx.Int32(1)
-                    )
+                    buffer_store(local_base - row_start, rsrc_psum, tab + fx.Int32(1))
 
         if const_expr(plan_blocks > 1):
             if tid == 0:
@@ -653,7 +688,10 @@ def compile_tdm_compact_plan(
                     )
                     * fx.Int64(4)
                 )
-                local_base = has_prev.select(local_base, fx.Int32(0))
+                # send_base is this run's first compact row on dest.
+                local_base = has_prev.select(local_base, fx.Int32(0)) + (
+                    send_base & fx.Int32(COMBINE_SLOT_ALIGN - 1)
+                )
                 buffer_store(
                     arith.select(
                         valid & in_cap, local_base + intra, arith.constant(dropped)

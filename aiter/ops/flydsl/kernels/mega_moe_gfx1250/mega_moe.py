@@ -1065,12 +1065,23 @@ class MegaMoEGfx1250:
         from .compact_plan import (
             PLAN_BLOCKS,
             compact_comb_tab_dwords,
+            compact_dense_comb_slots,
             compact_done_nbytes,
             compact_hist_stride,
         )
 
         segs = config.world_size * config.experts_per_rank
         max_routes = config.max_tokens_per_rank * config.topk
+        # comb_inp slots: one a route, or the per-rank scatter's padded runs.
+        self._comb_slots_cap = (
+            compact_dense_comb_slots(
+                max_routes=max_routes,
+                npes=config.world_size,
+                experts_per_rank=config.experts_per_rank,
+            )
+            if self._per_rank_scatter
+            else max_routes
+        )
         hist_stride = compact_hist_stride(
             npes=config.world_size,
             experts_per_rank=config.experts_per_rank,
@@ -1105,9 +1116,7 @@ class MegaMoEGfx1250:
         arena_regions.append(
             (
                 "comb_inp",
-                config.max_tokens_per_rank
-                * config.topk
-                * config.combine_slot_stride_bytes,
+                self._comb_slots_cap * config.combine_slot_stride_bytes,
             )
         )
         # On a quantized wire the per-rank scatter keeps the slots' e8m0 scales
@@ -1117,9 +1126,7 @@ class MegaMoEGfx1250:
             arena_regions.append(
                 (
                     "comb_scale",
-                    config.max_tokens_per_rank
-                    * config.topk
-                    * (config.hidden_dim // _COMBINE_SCALE_BLOCK),
+                    self._comb_slots_cap * (config.hidden_dim // _COMBINE_SCALE_BLOCK),
                 )
             )
         self._arena = SymmetricArena(communicator, arena_regions)
@@ -1281,11 +1288,7 @@ class MegaMoEGfx1250:
                 quant_bits=_bits,
                 tokens_per_block=_toks,
                 chunks_per_iter=_chunks,
-                dense_slots=(
-                    config.max_tokens_per_rank * config.topk
-                    if self._per_rank_scatter
-                    else 0
-                ),
+                dense_slots=(self._comb_slots_cap if self._per_rank_scatter else 0),
                 scale_planar_rel=(
                     self._arena.offset("comb_scale") - self._arena.offset("comb_inp")
                     if self._per_rank_scatter and _bits
@@ -1736,7 +1739,7 @@ class MegaMoEGfx1250:
                 if self._per_rank_scatter and combine_quant_bits
                 else 0
             ),
-            combine_scale_slots=self._config.max_tokens_per_rank * self._config.topk,
+            combine_scale_slots=self._comb_slots_cap,
         )
 
     def _combine(self, routing: Routing, combine_quant_bits: int = 0) -> torch.Tensor:
