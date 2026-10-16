@@ -195,3 +195,50 @@ def test_name_follows_the_current_device_arch(hip):
     hip.hipGetDevice.side_effect = _hip_result(1)
     assert chip_info.get_device_name() == "MI308"
     assert hip.hipDeviceGetAttribute.call_args.args[1:] == (10020, 1)
+
+
+@pytest.fixture
+def fresh_loader():
+    hip_runtime.load_hip_runtime.cache_clear()
+    try:
+        yield
+    finally:
+        hip_runtime.load_hip_runtime.cache_clear()
+
+
+def _fake_cdll(loaded):
+    """ctypes.CDLL stand-in: names in `loaded` resolve under RTLD_NOLOAD."""
+
+    def cdll(name, mode=0):
+        if mode & hip_runtime.os.RTLD_NOLOAD:
+            if name not in loaded:
+                raise OSError(f"{name}: not loaded")
+            return f"loaded:{name}"
+        return f"opened:{name}"
+
+    return mock.Mock(side_effect=cdll)
+
+
+def test_loader_binds_to_the_already_loaded_runtime(fresh_loader, monkeypatch):
+    monkeypatch.setattr(hip_runtime.sys, "platform", "linux")
+    cdll = _fake_cdll({"libamdhip64.so.7"})
+    monkeypatch.setattr(hip_runtime.ctypes, "CDLL", cdll)
+    assert hip_runtime.load_hip_runtime() == "loaded:libamdhip64.so.7"
+    assert all(
+        c.kwargs["mode"] & hip_runtime.os.RTLD_NOLOAD for c in cdll.call_args_list
+    )
+
+
+def test_loader_opens_by_name_when_nothing_is_loaded(fresh_loader, monkeypatch):
+    monkeypatch.setattr(hip_runtime.sys, "platform", "linux")
+    monkeypatch.setattr(hip_runtime.ctypes, "CDLL", _fake_cdll(set()))
+    assert hip_runtime.load_hip_runtime() == "opened:libamdhip64.so"
+
+
+def test_loader_does_not_probe_loaded_runtimes_on_windows(fresh_loader, monkeypatch):
+    monkeypatch.setattr(hip_runtime.sys, "platform", "win32")
+    monkeypatch.setattr(hip_runtime, "_library_names", lambda: ("amdhip64_7.dll",))
+    cdll = mock.Mock(return_value="dll")
+    monkeypatch.setattr(hip_runtime.ctypes, "CDLL", cdll)
+    assert hip_runtime.load_hip_runtime() == "dll"
+    cdll.assert_called_once_with("amdhip64_7.dll")

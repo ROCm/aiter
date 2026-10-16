@@ -30,9 +30,29 @@ def _library_names() -> tuple[str, ...]:
     return (*dlls, "amdhip64.dll")
 
 
+def _loaded_hip_runtime() -> ctypes.CDLL | None:
+    """The HIP runtime already loaded into this process, e.g. torch's."""
+    if sys.platform == "win32":
+        return None
+    for name in _library_names():
+        try:
+            return ctypes.CDLL(name, mode=os.RTLD_NOLOAD | os.RTLD_LAZY)
+        except OSError:
+            continue
+    return None
+
+
 @functools.lru_cache(maxsize=1)
 def load_hip_runtime() -> ctypes.CDLL:
-    """Load the HIP runtime, or raise OSError reporting why each candidate failed."""
+    """Load the HIP runtime, or raise OSError reporting why each candidate failed.
+
+    Binds to the copy already loaded into the process when there is one (Linux
+    only), so the handle shares torch's runtime instead of loading a second one
+    by name. The choice is cached, so call this after torch has initialized HIP.
+    """
+    loaded = _loaded_hip_runtime()
+    if loaded is not None:
+        return loaded
     errors = []
     for soname in _library_names():
         try:
