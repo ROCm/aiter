@@ -19,6 +19,7 @@ from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import (
     _can_reroute_bf16_to_a16wmix,
     _flydsl_stage1_wrapper,
+    ck_moe_stage1,
     fused_moe,
     get_2stage_cfgs,
 )
@@ -162,7 +163,9 @@ def _bind_inputs(tokens, *, seed=0, limit=1.0, negative_gate=False):
     torch.manual_seed(seed)
     experts, model_dim, inter_dim, topk = 4, 256, 128, 2
     x = torch.randn(tokens, model_dim, device="cuda", dtype=dtypes.bf16)
-    w1 = torch.randn(experts, 2 * inter_dim, model_dim, device="cuda", dtype=dtypes.bf16)
+    w1 = torch.randn(
+        experts, 2 * inter_dim, model_dim, device="cuda", dtype=dtypes.bf16
+    )
     w2 = torch.randn(experts, model_dim, inter_dim, device="cuda", dtype=dtypes.bf16)
     if negative_gate:
         # Expert 0: gate ≈ -25 (must stay unclamped on the below-only side).
@@ -266,7 +269,8 @@ def test_sentinels_do_not_select_a16wmix(gfx942, monkeypatch, limit, activation)
             **_a16w16_cfg_kwargs(limit=limit, activation=activation)
         )
         stage1 = getattr(metadata.stage1, "func", metadata.stage1)
-        assert stage1 is not _flydsl_stage1_wrapper
+        assert stage1 is ck_moe_stage1, stage1
+        assert not metadata.run_1stage
     finally:
         get_2stage_cfgs.cache_clear()
 
@@ -281,7 +285,9 @@ def test_force_env_selects_a16wmix_with_sentinel(gfx942, monkeypatch):
         )
         stage1 = getattr(metadata.stage1, "func", metadata.stage1)
         assert stage1 is _flydsl_stage1_wrapper
-        assert metadata.stage1.keywords["kernelName"].startswith("flydsl_moe1_abf16_wbf16_")
+        assert metadata.stage1.keywords["kernelName"].startswith(
+            "flydsl_moe1_abf16_wbf16_"
+        )
     finally:
         get_2stage_cfgs.cache_clear()
 
@@ -362,12 +368,8 @@ def test_a16wmix_silu_asymmetric_clamp_leaves_negative_gate(monkeypatch):
     actual = _run_fused(
         x, w1, w2, weights, ids, limit=limit, activation=ActivationType.Silu
     )
-    asym = _moe_ref(
-        x, w1, w2, ids, weights, act="silu", limit=limit, symmetric=False
-    )
-    sym = _moe_ref(
-        x, w1, w2, ids, weights, act="silu", limit=limit, symmetric=True
-    )
+    asym = _moe_ref(x, w1, w2, ids, weights, act="silu", limit=limit, symmetric=False)
+    sym = _moe_ref(x, w1, w2, ids, weights, act="silu", limit=limit, symmetric=True)
     err_as = (actual.float() - asym).abs().max().item()
     err_sy = (actual.float() - sym).abs().max().item()
     stats = (
@@ -415,3 +417,152 @@ def test_force_env_same_kernel_with_and_without_limit(monkeypatch):
         x, w1, w2, weights, ids, limit=1.0, activation=ActivationType.Silu
     )
     assert not torch.equal(out_none, out_lim), "force-path limit=None vs 1.0 identical"
+
+
+# Per-rank Command A shape the clamped server ran: H=4096, I=512, E=128, top-8.
+_SERVER = {"model_dim": 4096, "inter_dim": 512, "expert": 128, "topk": 8}
+_SERVER_TOKENS = 32
+_SERVER_S1 = "flydsl_moe1_abf16_wbf16_bf16_t16x128x128"
+
+
+def _server_route(limit):
+    get_2stage_cfgs.cache_clear()
+    try:
+        metadata = get_2stage_cfgs(
+            **{
+                **_a16w16_cfg_kwargs(
+                    token=_SERVER_TOKENS, limit=limit, activation=ActivationType.Silu
+                ),
+                **_SERVER,
+            }
+        )
+    finally:
+        get_2stage_cfgs.cache_clear()
+    stage1 = getattr(metadata.stage1, "func", metadata.stage1)
+    assert stage1 is _flydsl_stage1_wrapper, stage1
+    return metadata.stage1.keywords["kernelName"]
+
+
+def _run_fused_shuffled(x, w1s, w2s, weights, ids, *, limit):
+    get_2stage_cfgs.cache_clear()
+    try:
+        return fused_moe(
+            x,
+            w1s,
+            w2s,
+            weights,
+            ids,
+            activation=ActivationType.Silu,
+            quant_type=QuantType.No,
+            swiglu_limit=limit,
+        )
+    finally:
+        get_2stage_cfgs.cache_clear()
+
+
+def _routed_gate_up_absmax(x, w1, ids):
+    gate_max, up_absmax = float("-inf"), 0.0
+    for expert in ids.unique().tolist():
+        rows, _ = torch.where(ids == expert)
+        gate, up = F.linear(x[rows].float(), w1[expert].float()).chunk(2, dim=-1)
+        gate_max = max(gate_max, gate.max().item())
+        up_absmax = max(up_absmax, up.abs().max().item())
+    return gate_max, up_absmax
+
+
+@pytestmark_gpu
+def test_a16wmix_server_shape_clamp_binds(monkeypatch):
+    arch = _arch()
+    if arch not in ("gfx942", "gfx950"):
+        pytest.skip(f"not asserted on {arch}")
+    monkeypatch.setenv("AITER_BYPASS_TUNE_CONFIG", "1")
+    limit = 7.0
+    hidden, inter, experts, topk = (
+        _SERVER[k] for k in ("model_dim", "inter_dim", "expert", "topk")
+    )
+    torch.manual_seed(20261016)
+    x = torch.randn(_SERVER_TOKENS, hidden, device="cuda", dtype=dtypes.bf16)
+    # Gate/up std ~50 against a bound of 7, as in the served checkpoint.
+    w1 = (torch.randn(experts, 2 * inter, hidden, device="cuda") * 0.75).to(dtypes.bf16)
+    w2 = (torch.randn(experts, hidden, inter, device="cuda") / inter**0.5).to(
+        dtypes.bf16
+    )
+    weights, ids = torch.softmax(
+        torch.randn(_SERVER_TOKENS, experts, device="cuda"), dim=-1
+    ).topk(topk, dim=-1)
+    weights = weights / weights.sum(dim=-1, keepdim=True)
+    ids = ids.to(torch.int32)
+
+    kn = _server_route(limit)
+    assert kn == _SERVER_S1, kn
+    gate_max, up_absmax = _routed_gate_up_absmax(x, w1, ids)
+    assert gate_max > 2 * limit and up_absmax > 2 * limit, (gate_max, up_absmax)
+
+    w1s, w2s = shuffle_weight(w1), shuffle_weight(w2)
+    actual = _run_fused_shuffled(x, w1s, w2s, weights, ids, limit=limit).float()
+    loose = _run_fused_shuffled(x, w1s, w2s, weights, ids, limit=1e9).float()
+    clamped = _moe_ref(x, w1, w2, ids, weights, act="silu", limit=limit)
+    unclamped = _moe_ref(x, w1, w2, ids, weights, act="silu", limit=None)
+
+    scale_c = clamped.abs().max().item()
+    scale_u = unclamped.abs().max().item()
+    err_c = (actual - clamped).abs().max().item()
+    err_u = (actual - unclamped).abs().max().item()
+    err_loose_u = (loose - unclamped).abs().max().item()
+    stats = (
+        f"kn={kn} gate_max={gate_max:.4g} up_absmax={up_absmax:.4g} "
+        f"|clamped|={scale_c:.4g} |unclamped|={scale_u:.4g} "
+        f"err_clamped={err_c:.4g} err_unclamped={err_u:.4g} "
+        f"limit1e9_err_unclamped={err_loose_u:.4g}"
+    )
+    print(stats)
+    assert err_c <= 2e-2 * scale_c, stats
+    assert err_u >= 10 * scale_c, stats
+    assert not torch.equal(actual, loose), stats + " limit=7 vs 1e9 identical"
+    assert err_loose_u <= 2e-2 * scale_u, stats
+
+
+@pytestmark_gpu
+def test_a16wmix_server_shape_asymmetric_negative_gate(monkeypatch):
+    """Gate -25 at limit 1.0 must pass through silu(-25), not silu(-1)."""
+    arch = _arch()
+    if arch not in ("gfx942", "gfx950"):
+        pytest.skip(f"not asserted on {arch}")
+    monkeypatch.setenv("AITER_BYPASS_TUNE_CONFIG", "1")
+    limit = 1.0
+    hidden, inter, experts, topk = (
+        _SERVER[k] for k in ("model_dim", "inter_dim", "expert", "topk")
+    )
+    w1 = torch.zeros(experts, 2 * inter, hidden, device="cuda", dtype=dtypes.bf16)
+    w2 = torch.zeros(experts, hidden, inter, device="cuda", dtype=dtypes.bf16)
+    # Expert 0: gate -25 (below-only side must stay unclamped); expert 1: gate +8
+    # so the upper bound binds too. Up is 3 on both, clamped to 1. k/4096 is exact
+    # in bf16, so x=1 gives the pre-activations exactly.
+    w1[0, :inter, :] = -25.0 / hidden
+    w1[0, inter:, :] = 3.0 / hidden
+    w1[1, :inter, :] = 8.0 / hidden
+    w1[1, inter:, :] = 3.0 / hidden
+    w2[:2] = 1.0 / 64
+    x = torch.ones(_SERVER_TOKENS, hidden, device="cuda", dtype=dtypes.bf16)
+    ids = (
+        torch.arange(topk, device="cuda", dtype=torch.int32)
+        .unsqueeze(0)
+        .repeat(_SERVER_TOKENS, 1)
+    )
+    weights = torch.full((_SERVER_TOKENS, topk), 0.5, device="cuda")
+
+    assert _server_route(limit) == _SERVER_S1
+    gate0 = F.linear(x[:1].float(), w1[0].float())[0, :inter]
+    assert gate0.max().item() <= -20.0, gate0.max().item()
+
+    actual = _run_fused_shuffled(
+        x, shuffle_weight(w1), shuffle_weight(w2), weights, ids, limit=limit
+    ).float()
+    asym = _moe_ref(x, w1, w2, ids, weights, act="silu", limit=limit)
+    sym = _moe_ref(x, w1, w2, ids, weights, act="silu", limit=limit, symmetric=True)
+    err_as = (actual - asym).abs().max().item()
+    err_sy = (actual - sym).abs().max().item()
+    stats = f"err_asymmetric={err_as:.4g} err_symmetric={err_sy:.4g}"
+    print(stats)
+    assert err_as < 0.05, stats
+    assert err_sy > 0.5, stats
