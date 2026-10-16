@@ -18,7 +18,7 @@ from aiter.utility.graph_alloc import persistent_alloc
 
 from .gemm_a16w16_gfx1250 import gemm_a16w16 as gemm_a16w16_gfx1250
 from .kernels.gemm_a16w16_gfx942 import gemm_a16w16 as gemm_a16w16_gfx942
-from .kernels.gemm_a16w16_gfx942 import gfx942_auto_config
+from .kernels.gemm_a16w16_gfx942 import gfx942_default_config
 from .kernels.gemm_a16w16_gfx950 import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
     gemm_a16w16,
@@ -171,14 +171,16 @@ def flydsl_hgemm(
             a = a.contiguous()
         if not b.is_contiguous():
             b = b.contiguous()
-        # When the caller leaves tiling at the signature defaults, pick the
-        # best-known per-shape config (Phase-3 tuning); explicit overrides win.
+        # When the caller leaves tiling at the signature defaults, use the
+        # tuned-table row (else the heuristic); explicit overrides win.
         untuned = (
             block_m == 128 and block_n == 128 and block_k == 64 and stages == 2
             and split_k == 1 and m_waves == 2 and n_waves == 2 and group_m == 0
         )
         if untuned:
-            user_kwargs = gfx942_auto_config(a.shape[0], b.shape[0], a.shape[1])
+            user_kwargs = gfx942_default_config(
+                a.shape[0], b.shape[0], a.shape[1], out_dtype or a.dtype, a.device
+            )
         else:
             user_kwargs = {
                 "block_m": block_m,
