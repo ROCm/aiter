@@ -5,6 +5,7 @@
 Benchmark for the fused x * sigmoid(gate) kernel.
 """
 
+import functools
 import sys
 
 import torch
@@ -12,10 +13,14 @@ import triton
 
 from aiter.ops.triton.fusions.fused_sigmoid_mul import fused_sigmoid_mul
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     print_vgpr,
 )
@@ -51,28 +56,44 @@ def get_benchmark_shapes(args):
     return [(n, width) for n in tokens]
 
 
+def _generate_inputs(N, D, dtype, layout, row_stride, x_row_stride):
+    x, gate = generate_fused_sigmoid_mul_inputs((N, D), dtype)
+    if layout == "strided":
+        gate = torch.randn(N, row_stride, dtype=dtype, device=x.device)[:, -D:]
+        if x_row_stride:
+            x = torch.randn(N, x_row_stride, dtype=dtype, device=x.device)[:, :D]
+    out = torch.empty_like(x)
+    return x, gate, out
+
+
 def bench_fused_sigmoid_mul_fn(N, D, provider, metric, args):
     dtype = arg_to_torch_dtype[args.dtype]
-    x, gate = generate_fused_sigmoid_mul_inputs((N, D), dtype)
-    if args.layout == "strided":
-        gate = torch.randn(N, args.row_stride, dtype=dtype, device=x.device)[:, -D:]
-        if args.x_row_stride:
-            x = torch.randn(N, args.x_row_stride, dtype=dtype, device=x.device)[:, :D]
-    elem_size = x.element_size()
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+    _p_gen = functools.partial(
+        _generate_inputs, N, D, dtype, args.layout, args.row_stride, args.x_row_stride
+    )
+    _out_val_keys = ["x", "gate", "out"]
+    rot_bufs = generate_rotating_buffers_pool(
+        [_p_gen], [_out_val_keys], **kwargs_rot_bufs
+    )
+
+    # Shapes/dtypes are identical across the pool, so any entry works for sizing.
+    sample = rot_bufs[0]
+    elem_size = sample["x"].element_size()
     mem = _ARRAYS[provider] * N * D * elem_size
 
     if provider == "fused":
-        out = torch.empty_like(x)
 
-        def fn():
-            return fused_sigmoid_mul(x, gate, out)
+        def _run(x, gate, out):
+            fused_sigmoid_mul(x, gate, out)
 
     else:
 
-        def fn():
-            return x * gate.sigmoid()
+        def _run(x, gate, out):
+            x * gate.sigmoid()
 
-    ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
+    ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
     if metric == "time":
         return ms * 1000  # us
     if metric == "bandwidth":
