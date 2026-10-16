@@ -606,8 +606,8 @@ def _grouped_a8w4_tdm_moe(
     import functools
 
     import torch
-    persistent_workers = 512
-    persistent_workers2 = 512
+    persistent_workers = 256
+    persistent_workers2 = 256
 
     from aiter.ops.flydsl.grouped_gemm_mxfp4 import flydsl_grouped_gemm_a8w4_masked
     from aiter.ops.flydsl.moe_kernels import (
