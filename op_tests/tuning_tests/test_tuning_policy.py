@@ -84,10 +84,14 @@ class TestRacePolicy(unittest.TestCase):
                 policy.RacePolicy(alpha=alpha)
 
     def test_rejects_a_race_that_stops_before_it_may_eliminate(self):
-        with self.assertRaises(ValueError):
-            policy.RacePolicy(min_blocks=5, max_blocks=4)
-        with self.assertRaises(ValueError):
-            policy.RacePolicy(block_calls=0)
+        for kwargs in (
+            {"min_blocks": 5, "max_blocks": 4},
+            {"min_blocks": 1},
+            {"block_calls": 0},
+            {"warmup_calls": -1},
+        ):
+            with self.subTest(**kwargs), self.assertRaises(ValueError):
+                policy.RacePolicy(**kwargs)
 
 
 class TestGateAgainstIncumbent(unittest.TestCase):

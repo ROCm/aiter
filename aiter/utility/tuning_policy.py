@@ -80,15 +80,19 @@ DEFAULT_PROMOTION = PromotionPolicy()
 class RacePolicy:
     """How an interleaved elimination race spends its measurements.
 
-    The race's indifference zone is ``PromotionPolicy.min_improvement_pct``
-    unless a caller narrows or widens it, so by default the race and the gate
-    after it agree on what a tie is.
+    The race's indifference zone is not set here: ``block_race.race`` takes
+    the promotion bar (``min_improvement_pct``) and uses it, so the race and
+    the gate after it agree on what a tie is.
     """
 
-    # Error budget for eliminating a candidate as slower than the leader.
+    # Error budget, split between eliminating the true best and certifying a
+    # winner more than the indifference zone behind it.
     alpha: float = 0.05
-    # Timed calls per candidate per block.
+    # Timed calls per candidate per visit; the visit's median is its sample.
     block_calls: int = 10
+    # Untimed calls at the start of each visit. The previous visit ran a
+    # different kernel, so the first call is cold.
+    warmup_calls: int = 1
     # Blocks before elimination may start, and at which the race stops
     # without certifying a winner.
     min_blocks: int = 3
@@ -99,8 +103,11 @@ class RacePolicy:
             raise ValueError(f"alpha must be in (0, 1), got {self.alpha}")
         if self.block_calls < 1:
             raise ValueError("block_calls must be at least 1")
-        if not 1 <= self.min_blocks <= self.max_blocks:
-            raise ValueError("need 1 <= min_blocks <= max_blocks")
+        if self.warmup_calls < 0:
+            raise ValueError("warmup_calls cannot be negative")
+        if not 2 <= self.min_blocks <= self.max_blocks:
+            # One block gives no spread, so nothing could be eliminated.
+            raise ValueError("need 2 <= min_blocks <= max_blocks")
 
 
 DEFAULT_RACE = RacePolicy()
