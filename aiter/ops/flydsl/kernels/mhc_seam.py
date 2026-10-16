@@ -234,6 +234,19 @@ def _offset(layout: Any, *coord: Any) -> Any:
     return fx.Int32(fx.get_scalar(fx.crd2idx(fx.make_coord(*coord), layout)))
 
 
+def _part_layout(n_tok: Any, block_m: int, splits: int) -> Any:
+    """The published logit lines as (token, segment, slot).
+
+    A line sits at tile, then segment, then the token's row in the tile, so the token mode is
+    divided into (row in tile, tile) and a token coordinate is split by the layout itself.
+    """
+    line = block_m * SPLIT_SLOTS
+    return fx.make_layout(
+        ((block_m, fx.ceildiv(n_tok, fx.Int32(block_m))), splits, SPLIT_SLOTS),
+        ((SPLIT_SLOTS, splits * line), line, 1),
+    )
+
+
 def _narrow_round(value: Any, fast: bool) -> tuple[Any, Any]:
     """Round one fp32 to bf16 and widen it back, as the pair this kernel needs of every element.
 
@@ -553,19 +566,34 @@ def compile_mhc_seam_fused(
         tile = fx.block_idx.y
         token0 = tile * block_m
 
+        # A post-mix slot is `VEC` columns of one token, `groups` consecutive slots per token.
+        slot_map = fx.make_layout((block_m, groups), (groups, 1))
+        # A gate coefficient of one token, staged once per workgroup.
+        gates_map = fx.make_layout((block_m, coeffs), (coeffs, 1))
+        # A projection row of one token, as the publish folds it.
+        fold_map = fx.make_layout((block_m, rows), (rows, 1))
+
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        s_a_flat = lds.a.view(fx.make_layout(block_m * (chunk_c + TILE_PAD), 1))
         s_a = lds.a.view(fx.make_layout((block_m, chunk_c), (chunk_c + TILE_PAD, 1)))
+        # The A tile as the post-mix writes it: (token, slot group, element).
+        s_a_slots = lds.a.view(
+            fx.make_layout((block_m, groups, VEC), (chunk_c + TILE_PAD, VEC, 1))
+        )
         s_acc = lds.acc.view(
             fx.make_layout(
                 (folds, block_m, PACK_ROWS), (block_m * PACK_ROWS, PACK_ROWS, 1)
             )
         )
-        s_acc_flat = lds.acc.view(fx.make_layout(folds * block_m * PACK_ROWS, 1))
+        # The accumulator with its row-products split into (limb, gate row).
+        s_acc_limbs = lds.acc.view(
+            fx.make_layout(
+                (folds, block_m, 2, rows), (block_m * PACK_ROWS, PACK_ROWS, rows, 1)
+            )
+        )
         # The staged gates sit on the accumulator scratch rather than scratch of their own: they
         # are dead by the end of the chunk loop, which is the first thing the fold's barrier
         # separates them from, so the two never want the words at once.
-        s_gates = lds.acc.view(fx.make_layout((block_m, coeffs), (coeffs, 1)))
+        s_gates = lds.acc.view(gates_map)
 
         # residual, residual_out
         res_major = fx.make_layout(
@@ -610,11 +638,15 @@ def compile_mhc_seam_fused(
             fx.make_view(
                 fx.add_offset(
                     fx.rocdl.make_buffer_ptr(part),
-                    (tile * fx.Int32(splits) + seg) * fx.Int32(block_m * SPLIT_SLOTS),
+                    _offset(_part_layout(n_tok, block_m, splits), token0, seg, 0),
                 ),
-                fx.make_layout(block_m * SPLIT_SLOTS, 1),
+                fx.make_layout((block_m, SPLIT_SLOTS), (SPLIT_SLOTS, 1)),
             )
         )
+
+        def slot_coord(g: int) -> tuple[Any, Any]:
+            """(token in the tile, slot group) of this thread's `g`-th post-mix slot."""
+            return fx.idx2crd(fx.Int32(g * BLOCK) + tid, slot_map).unpack()
 
         t_fn = fx.flat_divide(g_fn, fx.make_tile(PACK_ROWS, chunk_c))[
             None, None, 0, None
@@ -645,8 +677,7 @@ def compile_mhc_seam_fused(
             for q in range_constexpr(ceildiv(block_m * coeffs, BLOCK)):
                 idx = fx.Int32(q * BLOCK) + tid
                 if idx < fx.Int32(block_m * coeffs):
-                    token_local = idx // fx.Int32(coeffs)
-                    slot_i = idx - token_local * fx.Int32(coeffs)
+                    token_local, slot_i = fx.idx2crd(idx, gates_map).unpack()
                     token = token0 + token_local
                     safe = (token < n_tok).select(token, fx.Int32(0))
                     # `pre_base` is 0 without the post block, so one expression serves both.
@@ -698,9 +729,7 @@ def compile_mhc_seam_fused(
             collapse, carry both sums of squares, and hand the rounded streams on."""
             held = []
             for g in range_constexpr(slots):
-                slot = fx.Int32(g * BLOCK) + tid
-                token_local = slot // fx.Int32(groups)
-                group = slot - token_local * fx.Int32(groups)
+                token_local, group = slot_coord(g)
                 token = token0 + token_local
                 live = token < n_tok
                 safe = live.select(token, fx.Int32(0))
@@ -794,7 +823,7 @@ def compile_mhc_seam_fused(
                     sqc[g] = sqc[g] + collapse_squares
             return held, sq, sqc
 
-        def project_chunk(chunk: Any, held: list[Any], tile_lds: Any) -> None:
+        def project_chunk(chunk: Any, held: list[Any]) -> None:
             """Contract the chunk's rounded streams against `fn`, one stream at a time.
 
             The A tile holds a single stream, which is what keeps `chunk_c` at the width the
@@ -803,17 +832,12 @@ def compile_mhc_seam_fused(
             for j in range_constexpr(streams):
                 fx.gpu.barrier()
                 for g in range_constexpr(slots):
-                    slot = fx.Int32(g * BLOCK) + tid
-                    token_local = slot // fx.Int32(groups)
-                    group = slot - token_local * fx.Int32(groups)
+                    token_local, group = slot_coord(g)
                     live = (token0 + token_local) < n_tok
-                    base = token_local * fx.Int32(
-                        chunk_c + TILE_PAD
-                    ) + group * fx.Int32(VEC)
                     for e in range_constexpr(VEC):
                         # A dead token's row must contract to zero: its logits are published to a
                         # line the finish pass never reads, but the line is still written.
-                        tile_lds[base + e] = live.select(
+                        s_a_slots[token_local, group, e] = live.select(
                             held[g][j][e], fx.BFloat16(0.0)
                         )
                 fx.gpu.barrier()
@@ -830,13 +854,13 @@ def compile_mhc_seam_fused(
         for c in range(seg_chunks):
             chunk = seg * fx.Int32(seg_chunks) + fx.Int32(c)
             held, sq, sqc = post_mix_chunk(chunk, sq, sqc)
-            project_chunk(chunk, held, s_a_flat)
+            project_chunk(chunk, held)
 
         # ── Publish ──
         # Each wave holds a partial over its share of the contraction, published in `fold_rounds`
         # rounds of `folds` with the running sum carried in registers between them -- which is
         # what lets a wide token tile hold fewer slots than it has waves. A thread owns one gate
-        # row of one token and adds its two limbs, at `row` and `row + rows`. The fused finish
+        # row of one token and adds its two limbs. The fused finish
         # reads nothing of the line past `rows`; the no-norm finish loads all of it but uses
         # only the gate rows and the sum of squares at `rows`.
         fold_steps = ceildiv(block_m * rows, BLOCK)
@@ -846,13 +870,10 @@ def compile_mhc_seam_fused(
             fx.Int32(g * BLOCK) + tid < fx.Int32(block_m * rows)
             for g in range_constexpr(fold_steps)
         ]
-        safe = [
-            keep[g].select(fx.Int32(g * BLOCK) + tid, fx.Int32(0))
-            for g in range_constexpr(fold_steps)
-        ]
-        token_local = [safe[g] // fx.Int32(rows) for g in range_constexpr(fold_steps)]
-        row_local = [
-            safe[g] - token_local[g] * fx.Int32(rows)
+        owned = [
+            fx.idx2crd(
+                keep[g].select(fx.Int32(g * BLOCK) + tid, fx.Int32(0)), fold_map
+            ).unpack()
             for g in range_constexpr(fold_steps)
         ]
         for r in range_constexpr(fold_rounds):
@@ -861,19 +882,17 @@ def compile_mhc_seam_fused(
                 fx.copy(acc_copy, cf_c, p_acc)
             fx.gpu.barrier()
             for g in range_constexpr(fold_steps):
+                token_local, row_local = owned[g]
                 for h in range_constexpr(folds):
-                    hi = (
-                        fx.Int32(h * block_m * PACK_ROWS)
-                        + token_local[g] * fx.Int32(PACK_ROWS)
-                        + row_local[g]
-                    )
                     carried[g] = (
-                        carried[g] + s_acc_flat[hi] + s_acc_flat[hi + fx.Int32(rows)]
+                        carried[g]
+                        + s_acc_limbs[h, token_local, 0, row_local]
+                        + s_acc_limbs[h, token_local, 1, row_local]
                     )
         for g in range_constexpr(fold_steps):
             if keep[g]:
-                line = token_local[g] * fx.Int32(SPLIT_SLOTS)
-                g_part[line + row_local[g]] = carried[g]
+                token_local, row_local = owned[g]
+                g_part[token_local, row_local] = carried[g]
         # The `groups` lanes that share a token are consecutive and aligned, so the sums close
         # in a butterfly inside the wave rather than through LDS and a barrier.
         width = fx.Int32(WAVE_SIZE)
@@ -886,9 +905,9 @@ def compile_mhc_seam_fused(
                 total_sq = total_sq + fx.gpu.shuffle_xor(total_sq, mask, width)
                 if const_expr(norm):
                     total_sqc = total_sqc + fx.gpu.shuffle_xor(total_sqc, mask, width)
-            token_in_tile = (fx.Int32(g * BLOCK) + tid) // fx.Int32(groups)
+            token_in_tile, group = slot_coord(g)
             token = token0 + token_in_tile
-            if (tid % fx.Int32(groups) == fx.Int32(0)) & (token < n_tok):
+            if (group == fx.Int32(0)) & (token < n_tok):
                 # With the norm, the finish pass reads `sum(x1^2)` on its own in every rescale
                 # column step, so both sums go to a buffer it can read densely. Without it, the
                 # finish pass gathers the whole published line once and the one sum rides in it,
@@ -898,9 +917,7 @@ def compile_mhc_seam_fused(
                     _store_f32(sums, base, total_sq)
                     _store_f32(sums, base + 1, total_sqc)
                 else:
-                    g_part[token_in_tile * fx.Int32(SPLIT_SLOTS) + fx.Int32(rows)] = (
-                        total_sq
-                    )
+                    g_part[token_in_tile, rows] = total_sq
 
     # The pass is one kernel; the launchers differ because `sums` is the norm's alone. The
     # no-norm one keeps it out of the host's call and hands the kernel `part` in its place,
@@ -1012,7 +1029,6 @@ def compile_mhc_seam_finish(
     sq_slot, sqc_slot = rows, rows + 1
     inv_wide = 1.0 / float(wide)
     inv_hidden = 1.0 / float(hidden)
-    line = block_m * SPLIT_SLOTS
     # Column steps of the rescale field, the grid's slow axis rather than a loop: the token count
     # alone leaves the pass short of grid.
     col_steps = finish_col_steps(hidden)
@@ -1054,8 +1070,10 @@ def compile_mhc_seam_finish(
         step = fx.block_idx.y
         token0 = fx.block_idx.x * fx.Int32(TOKENS_PER_BLOCK)
 
+        # The folded lines, one `SPLIT_SLOTS`-lane group per token: also the fold's lane map.
+        fold_major = fx.make_layout((TOKENS_PER_BLOCK, SPLIT_SLOTS), (SPLIT_SLOTS, 1))
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        total = lds.total.view(fx.make_layout(TOKENS_PER_BLOCK * SPLIT_SLOTS, 1))
+        total = lds.total.view(fold_major)
 
         # stage, layer_input
         token_major = fx.make_layout((n_tok, hidden), (hidden, 1))
@@ -1066,15 +1084,16 @@ def compile_mhc_seam_finish(
             (n_tok, streams, streams), (streams * streams, streams, 1)
         )
         sums_major = fx.make_layout((splits, n_tok, 2), (n_tok * 2, 2, 1))
-        # the folded lines
-        fold_major = fx.make_layout((TOKENS_PER_BLOCK, SPLIT_SLOTS), (SPLIT_SLOTS, 1))
+        part_major = _part_layout(n_tok, block_m, splits)
+        # The first column a lane rescales: `VEC` per lane, a block's width per column step.
+        step_cols = fx.make_layout((col_steps, BLOCK), (BLOCK * VEC, VEC))
 
         # ── Issue the rescale's loads ──
         # Ahead of the fold, because they depend on neither it nor the barrier, and a compiler
         # will not move a load across `s_barrier`. Left where they read, a rescale block pays the
         # gather's round trip and the staged collapse's one after the other; clamping the address
         # instead of branching puts them in flight together.
-        col_g = ((step - fx.Int32(shift)) * fx.Int32(BLOCK) + tid) * fx.Int32(VEC)
+        col_g = _offset(step_cols, step - fx.Int32(shift), tid)
         live = (step >= fx.Int32(shift)) & (col_g < fx.Int32(hidden))
         safe_col = live.select(col_g, fx.Int32(0))
         weight = [fx.Float32(e) for e in _load_bf16(norm_weight, safe_col, VEC, False)]
@@ -1099,12 +1118,9 @@ def compile_mhc_seam_finish(
         # One lane per published value of the block's whole token group, so every lane is in the
         # gather. A workgroup owning a single token would leave it to 26 lanes and make the rest
         # wait on their latency at a barrier.
-        local = tid // fx.Int32(SPLIT_SLOTS)
-        col = tid - local * fx.Int32(SPLIT_SLOTS)
+        local, col = fx.idx2crd(tid, fold_major).unpack()
         token = token0 + local
         safe = (token < n_tok).select(token, fx.Int32(0))
-        tile = safe // fx.Int32(block_m)
-        row_in_tile = safe - tile * fx.Int32(block_m)
         # The gather lands each value where the gates want it. The two sum slots are their own
         # lane, so `sq_slot` and `sqc_slot` -- and the rescale's read of them -- do not move.
         row = _gate_row(col)
@@ -1116,25 +1132,22 @@ def compile_mhc_seam_finish(
                 folded = fx.Float32(0.0)
                 for seg in range_constexpr(splits):
                     folded = folded + _load_f32(
-                        part,
-                        (tile * fx.Int32(splits) + fx.Int32(seg)) * fx.Int32(line)
-                        + row_in_tile * fx.Int32(SPLIT_SLOTS)
-                        + row,
+                        part, _offset(part_major, safe, seg, row)
                     )
-                total[tid] = folded
+                total[local, col] = folded
             if (col >= fx.Int32(rows)) & (col < fx.Int32(rows + 2)):
                 folded = fx.Float32(0.0)
                 for seg in range_constexpr(splits):
                     folded = folded + _load_f32(
-                        sums, _offset(sums_major, seg, safe, 0) + col - fx.Int32(rows)
+                        sums, _offset(sums_major, seg, safe, col - fx.Int32(rows))
                     )
-                total[tid] = folded
+                total[local, col] = folded
             # A group is `SPLIT_SLOTS` lanes and the fold fills `rows + 2` of them. The rest are
             # read unconditionally below and carried through the gate chain, so they are written
             # rather than left holding whatever the last call put there: under `fast_fp_math` a
             # stale NaN propagates through the chain silently before the guarded stores drop it.
             if col >= fx.Int32(rows + 2):
-                total[tid] = fx.Float32(0.0)
+                total[local, col] = fx.Float32(0.0)
         else:
             # The group's lower 16 lanes are one DPP row, so a row sum and a column sum over it
             # close the whole 16-lane reduction; the segments are dealt round-robin across them.
@@ -1146,15 +1159,15 @@ def compile_mhc_seam_finish(
                     narrow = narrow + in_range.select(
                         _load_f32(
                             sums,
-                            _offset(sums_major, 0, safe, 0)
-                            + in_range.select(idx, fx.Int32(0)) * n_tok * fx.Int32(2)
-                            + fx.Int32(1),
+                            _offset(
+                                sums_major, in_range.select(idx, fx.Int32(0)), safe, 1
+                            ),
                         ),
                         fx.Float32(0.0),
                     )
                 narrow = _col_sum(_row_sum(narrow))
                 if col == fx.Int32(0):
-                    total[local * fx.Int32(SPLIT_SLOTS) + fx.Int32(sqc_slot)] = narrow
+                    total[local, sqc_slot] = narrow
         fx.gpu.barrier()
 
         # ── Gates ──
@@ -1168,11 +1181,8 @@ def compile_mhc_seam_finish(
         # moves, a `v_rcp_f32` and a multiply, and where the token count leaves the part empty
         # there is no co-resident wave to hide the difference.
         if (step == fx.Int32(0)) & (token < n_tok):
-            mine = total[tid]
-            rstd = fmath.rsqrt(
-                total[local * fx.Int32(SPLIT_SLOTS) + fx.Int32(sq_slot)] * inv_wide
-                + rms_eps
-            )
+            mine = total[local, col]
+            rstd = fmath.rsqrt(total[local, sq_slot] * inv_wide + rms_eps)
             scale = (col < fx.Int32(_COMB_LANES)).select(
                 _load_f32(hc_scale, 2),
                 (col < fx.Int32(_PRE_LANES)).select(
@@ -1187,10 +1197,8 @@ def compile_mhc_seam_finish(
             sig = sigmoid_f32(logit)
             comb = _sinkhorn(logit, hc_sinkhorn_eps, sinkhorn_repeat)
 
-            comb_row = _offset(per_pair, token0, 0, 0) + local * fx.Int32(
-                streams * streams
-            )
-            stream_row = _offset(per_stream, token0, 0) + local * fx.Int32(streams)
+            comb_row = _offset(per_pair, token0, 0, 0) + _offset(per_pair, local, 0, 0)
+            stream_row = _offset(per_stream, token0, 0) + _offset(per_stream, local, 0)
             if col < fx.Int32(_COMB_LANES):
                 _store_f32(comb_out, comb_row + col, comb)
             if (col >= fx.Int32(_COMB_LANES)) & (col < fx.Int32(_PRE_LANES)):
@@ -1211,9 +1219,7 @@ def compile_mhc_seam_finish(
             for s in range_constexpr(TOKENS_PER_BLOCK):
                 row_token = token0 + fx.Int32(s)
                 if row_token < n_tok:
-                    norm_rstd = fmath.rsqrt(
-                        total[_offset(fold_major, s, sqc_slot)] * inv_hidden + norm_eps
-                    )
+                    norm_rstd = fmath.rsqrt(total[s, sqc_slot] * inv_hidden + norm_eps)
                     _store_bf16(
                         layer_input,
                         _offset(token_major, row_token, 0) + col_g,
@@ -1307,9 +1313,6 @@ def compile_mhc_seam_finish_nonorm(
     _require(block_m >= 1, f"block_m must be at least 1, got {block_m}")
     rows = gate_rows(STREAMS)
     inv_wide = 1.0 / float(STREAMS * hidden)
-    # The fused pass indexes its slab by token tile, so a line sits at tile, then segment,
-    # then the token's row within the tile.
-    line = block_m * SPLIT_SLOTS
     name = (
         f"mhc_seam_finish_nonorm_h{hidden}_bm{block_m}_s{splits}_r{sinkhorn_repeat}_"
         + _consts_tag(rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value)
@@ -1327,9 +1330,16 @@ def compile_mhc_seam_finish_nonorm(
         n_tok: fx.Int32,
     ) -> None:
         tid = fx.thread_idx.x
-        lane = tid % fx.Int32(SPLIT_SLOTS)
-        token = fx.block_idx.x * fx.Int32(TOKENS_PER_BLOCK) + tid // fx.Int32(
-            SPLIT_SLOTS
+        # A `SPLIT_SLOTS`-lane group per token, as in the fused finish.
+        lane_map = fx.make_layout((TOKENS_PER_BLOCK, SPLIT_SLOTS), (SPLIT_SLOTS, 1))
+        local, lane = fx.idx2crd(tid, lane_map).unpack()
+        token = fx.block_idx.x * fx.Int32(TOKENS_PER_BLOCK) + local
+        part_major = _part_layout(n_tok, block_m, splits)
+        # post_out, next_pre
+        per_stream = fx.make_layout((n_tok, STREAMS), (STREAMS, 1))
+        # comb_out
+        per_pair = fx.make_layout(
+            (n_tok, STREAMS, STREAMS), (STREAMS * STREAMS, STREAMS, 1)
         )
 
         # The sum of squares is on lane `rows`; the lanes past it are inert.
@@ -1338,18 +1348,13 @@ def compile_mhc_seam_finish_nonorm(
         # Dead tokens fold token 0's line, which part_elements always allocates, so the
         # loads stay hoisted out of the branch as the fused finish does.
         safe = (token < n_tok).select(token, fx.Int32(0))
-        tile = safe // fx.Int32(block_m)
-        row_in_tile = safe - tile * fx.Int32(block_m)
         total = fx.Float32(0.0)
         squares = fx.Float32(0.0)
         for s in range_constexpr(splits):
-            base = (tile * fx.Int32(splits) + fx.Int32(s)) * fx.Int32(
-                line
-            ) + row_in_tile * fx.Int32(SPLIT_SLOTS)
-            total = total + _load_f32(part, base + row)
+            total = total + _load_f32(part, _offset(part_major, safe, s, row))
             # The sum of squares shares the lane's own 128 B window, so this is an L1
             # hit and saves a cross-lane broadcast of lane `rows`.
-            squares = squares + _load_f32(part, base + fx.Int32(rows))
+            squares = squares + _load_f32(part, _offset(part_major, safe, s, rows))
 
         # No cross-lane move in this block leaves a token's own 32-lane group, and it holds
         # no barrier or LDS, so one guard can cover the whole gate chain: a token owns a
@@ -1370,17 +1375,17 @@ def compile_mhc_seam_finish_nonorm(
             comb = _sinkhorn(logit, hc_sinkhorn_eps, sinkhorn_repeat)
 
             if lane < fx.Int32(_COMB_LANES):
-                _store_f32(comb_out, token * fx.Int32(STREAMS * STREAMS) + lane, comb)
+                _store_f32(comb_out, _offset(per_pair, token, 0, 0) + lane, comb)
             if (lane >= fx.Int32(_COMB_LANES)) & (lane < fx.Int32(_PRE_LANES)):
                 _store_f32(
                     next_pre,
-                    token * fx.Int32(STREAMS) + lane - fx.Int32(_COMB_LANES),
+                    _offset(per_stream, token, lane - fx.Int32(_COMB_LANES)),
                     sig + hc_pre_eps,
                 )
             if (lane >= fx.Int32(_PRE_LANES)) & (lane < fx.Int32(rows)):
                 _store_f32(
                     post_out,
-                    token * fx.Int32(STREAMS) + lane - fx.Int32(_PRE_LANES),
+                    _offset(per_stream, token, lane - fx.Int32(_PRE_LANES)),
                     sig * hc_post_mult_value,
                 )
 
