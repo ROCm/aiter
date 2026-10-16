@@ -187,6 +187,7 @@ def launch_gemm_a8w4_tdm(
     lds_soa_load_interleave: Constexpr[int] = 0,
     persistent_workers: Constexpr[int] = 0,
     rolled_drain: Constexpr[int] = 0,
+    a_preshuffled: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -264,6 +265,7 @@ def launch_gemm_a8w4_tdm(
         out_is_f16,
         num_buffers,
         a_is_fp4,
+        a_preshuffled,
         n_experts,
         stage1_act,
         has_bias,
@@ -344,7 +346,7 @@ def launch_gemm_a8w4_tdm(
     ACT_ELEM = fx.Float4E2M1FN if a_is_fp4 else fx.Float8E4M3FN
     ACT_NDW = 8 if a_is_fp4 else 16
 
-    LDS_PAD_A = 16
+    LDS_PAD_A = 0 if a_preshuffled else 16
     A_LDS_ROW = A_ROW_B + LDS_PAD_A
     B_LDS_ROW = PACK_TK * 16
     STAGE_A = ceildiv(tile_m * A_LDS_ROW, 16) * 16
@@ -435,6 +437,7 @@ def launch_gemm_a8w4_tdm(
         ), "stage1 quant requires complete four-WMMA N groups"
 
     _afp = "fp4" if a_is_fp4 else "fp8"
+    _a_layout = "_apre" if a_preshuffled else ""
     _act = f"_act{stage1_act}" if stage1_act else ""
     _qout = f"_q{stage1_quant_out}r{quant_wmma_rep}" if stage1_quant_out else ""
     _bias = "_bias" if has_bias else ""
@@ -462,7 +465,7 @@ def launch_gemm_a8w4_tdm(
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
     _kname = (
-        f"a8w4_tdm_{_afp}"
+        f"a8w4_tdm_{_afp}{_a_layout}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
         f"{_grouped}{_act}{_bias}{_qout}{_cl}{_cluster_sync}"
@@ -818,22 +821,42 @@ def launch_gemm_a8w4_tdm(
                 )
             )
 
-        add_tdm_loads(
-            gA_base,
-            a_off0,
-            A_GROW,
-            mn_oob,
-            A_ROW_B,
-            tile_m,
-            on_i32=False,
-            lds_off=A_LDS_OFF,
-            lds_stage=A_LDS_STAGE,
-            lds_row=A_LDS_ROW,
-            k_adv=A_ROW_B,
-            wv=waves[0],
-            pad=(A_ROW_B, LDS_PAD_A),
-            wg_mask=a_mcast_mask,
-        )
+        if const_expr(a_preshuffled):
+            # One M16 group is contiguous across the K32 slabs in the packed
+            # (M/16, K/128, 4, 16, 16-byte) A buffer.
+            add_tdm_loads(
+                gA_base,
+                a_off0,
+                16 * A_GROW,
+                (mn_oob + 15) // 16,
+                16 * A_ROW_B,
+                tile_m // 16,
+                on_i32=False,
+                lds_off=A_LDS_OFF,
+                lds_stage=A_LDS_STAGE,
+                lds_row=16 * A_ROW_B,
+                k_adv=16 * A_ROW_B,
+                wv=waves[0],
+                wg_mask=a_mcast_mask,
+                split_inner=tile_m // 16 < len(waves[0]),
+            )
+        else:
+            add_tdm_loads(
+                gA_base,
+                a_off0,
+                A_GROW,
+                mn_oob,
+                A_ROW_B,
+                tile_m,
+                on_i32=False,
+                lds_off=A_LDS_OFF,
+                lds_stage=A_LDS_STAGE,
+                lds_row=A_LDS_ROW,
+                k_adv=A_ROW_B,
+                wv=waves[0],
+                pad=(A_ROW_B, LDS_PAD_A),
+                wg_mask=a_mcast_mask,
+            )
         add_tdm_loads(
             gB_base,
             b_off0,
@@ -989,7 +1012,11 @@ def launch_gemm_a8w4_tdm(
 
         # Split each region's offset into a lane-varying base, which keepalive
         # can pin, and a compile-time part that folds into ds_load's offset:.
-        lds_a_lane_off = (wmb + lane16) * A_LDS_ROW + kgrp * 16
+        lds_a_lane_off = (
+            (wmb // 16) * 16 * A_ROW_B + lane16 * 16 + kgrp * 256
+            if a_preshuffled
+            else (wmb + lane16) * A_LDS_ROW + kgrp * 16
+        )
         lds_b_lane_off = (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16
         assert wmma_m_rep == 1 or wmma_m_rep % 2 == 0
         sa_lane = lane16 if wmma_m_rep == 1 else lane
@@ -1037,10 +1064,19 @@ def launch_gemm_a8w4_tdm(
             )
 
         def load_a(base, wm, ksl):
-            off = wm * 16 * A_LDS_ROW + ksl * A_KSTEP
+            off = (
+                wm * 16 * A_ROW_B + ksl * 1024
+                if a_preshuffled
+                else wm * 16 * A_LDS_ROW + ksl * A_KSTEP
+            )
             if const_expr(a_is_fp4):
                 return Vec(lds_load_b128(base, fx.Int32(off))).shuffle(
-                    Vec(lds_load_b128(base, fx.Int32(off + 32))), list(range(8))
+                    Vec(
+                        lds_load_b128(
+                            base, fx.Int32(off + (512 if a_preshuffled else 32))
+                        )
+                    ),
+                    list(range(8)),
                 )
             v = [
                 Vec(lds_load_b128(base, fx.Int32(off + 32 * j)))
@@ -1745,6 +1781,19 @@ def launch_gemm_a8w4_tdm(
 
                 v2i32_ty = T.vec(2, T.i32)
                 N_MX_BLKS = output_n_rep // WN_PER_MX_BLOCK
+
+                def quant_byte_offset(row, col):
+                    if const_expr(a_preshuffled):
+                        # TDM reads dense LDS tiles. Stage each K32 slab as
+                        # contiguous M16 x 16B, without row padding.
+                        return (
+                            (row // 16) * 16 * STORE_N
+                            + (col // 16) * 256
+                            + (row % 16) * 16
+                            + col % 16
+                        )
+                    return row * STORE_N + col
+
                 for wm in range_constexpr(wmma_m_rep):
                     # A 16-row block entirely past this expert's valid rows has its
                     # output OOB-clamped away, so skip its work. Wave-uniform, so
@@ -1833,15 +1882,14 @@ def launch_gemm_a8w4_tdm(
                                     )
                                     col_fp4_0 = (wnb + wn0 * 16) // 4 + kgrp * 2
                                     col_fp4_1 = (wnb + wn1 * 16) // 4 + kgrp * 2
-                                    row_byte = row_rel * STORE_N
                                     lds_store_b16(
                                         stC_idx,
-                                        row_byte + col_fp4_0,
+                                        quant_byte_offset(row_rel, col_fp4_0),
                                         packed_i32,
                                     )
                                     lds_store_b16(
                                         stC_idx,
-                                        row_byte + col_fp4_1,
+                                        quant_byte_offset(row_rel, col_fp4_1),
                                         packed_i32 >> fx.Int32(16),
                                     )
                             else:
@@ -2234,35 +2282,54 @@ def launch_gemm_a8w4_tdm(
                 else:
                     oc_store = oc
                     c_iter = fx.recast_iter(oc, arg_c)
-                c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
-                if const_expr(STORE_PAD == 0):
+                if const_expr(a_preshuffled and stage1_quant_out and stage1_act):
+                    # M is allocated in complete M16 blocks. The final block's
+                    # padding rows are unused, so transfer whole K32/M16 slabs.
+                    c_off_rt = blk_m64 * fx.Int64(out_stride) + out_col_off * 16
                     gtC = tensor_view(
-                        c_iter + c_off_rt, (tile_m, STORE_N), (STORE_N, 1)
+                        c_iter + c_off_rt,
+                        (tile_m // 16, STORE_N * 16),
+                        (out_stride * 16, 1),
                     )
-                    atomC = make_tdm_store(gtC, mn_oob, out_stride)
+                    atomC = make_tdm_store(
+                        gtC, (mn_oob + 15) // 16, out_stride * 16
+                    )
                     src = tensor_view(
                         fx.recast_iter(oc_store, base_ptr),
-                        (tile_m, STORE_N),
-                        (STORE_N, 1),
+                        (tile_m // 16, STORE_N * 16),
+                        (STORE_N * 16, 1),
                     )
+                    fx.copy(atomC, src, gtC)
                 else:
-                    # The LDS tile is (tile_m, STORE_PITCH) dense; the per-dim OOB
-                    # extent clamps the inner axis to STORE_N so the pad never lands.
-                    gtC = tensor_view(
-                        c_iter + c_off_rt, (tile_m, STORE_PITCH), (out_stride, 1)
-                    )
-                    atomC = fx.rocdl.make_tdm_atom(
-                        gtC,
-                        [mn_oob, STORE_N],
-                        strides=[out_stride, None],
-                        num_warps=num_waves,
-                    )
-                    src = tensor_view(
-                        fx.recast_iter(oc_store, base_ptr),
-                        (tile_m, STORE_PITCH),
-                        (STORE_PITCH, 1),
-                    )
-                fx.copy(atomC, src, gtC)
+                    c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
+                    if const_expr(STORE_PAD == 0):
+                        gtC = tensor_view(
+                            c_iter + c_off_rt, (tile_m, STORE_N), (STORE_N, 1)
+                        )
+                        atomC = make_tdm_store(gtC, mn_oob, out_stride)
+                        src = tensor_view(
+                            fx.recast_iter(oc_store, base_ptr),
+                            (tile_m, STORE_N),
+                            (STORE_N, 1),
+                        )
+                    else:
+                        # The LDS tile is (tile_m, STORE_PITCH) dense; the per-dim OOB
+                        # extent clamps the inner axis to STORE_N so the pad never lands.
+                        gtC = tensor_view(
+                            c_iter + c_off_rt, (tile_m, STORE_PITCH), (out_stride, 1)
+                        )
+                        atomC = fx.rocdl.make_tdm_atom(
+                            gtC,
+                            [mn_oob, STORE_N],
+                            strides=[out_stride, None],
+                            num_warps=num_waves,
+                        )
+                        src = tensor_view(
+                            fx.recast_iter(oc_store, base_ptr),
+                            (tile_m, STORE_PITCH),
+                            (STORE_PITCH, 1),
+                        )
+                    fx.copy(atomC, src, gtC)
                 if const_expr(stage1_quant_out and stage1_act):
                     rocdl.s_wait_storecnt(0)
                 tdm_ops.tensor_wait(0)

@@ -4,6 +4,9 @@
 
 Supports optional DeepGEMM-style contiguous-M scheduler
 (AITER_GROUPED_DEEPGEMM_CONTIGUOUS=1 or CSV grouped_contiguous_m=1).
+For local A4W4, AITER_GROUPED_A4W4_A_PRESHUFFLE=1 selects packed
+(M/16, K/128, 4, 16, 32) A for both grouped GEMMs. The default remains
+unpreshuffled A.
 """
 
 import csv
@@ -913,6 +916,13 @@ def _grouped_a8w4_tdm_moe(
         torch.uint8,
         dtypes.fp4x2,
     )
+    a_preshuffled = (
+        _is_fp4
+        and not _prequantized
+        and not _is_ep
+        and not _compact
+        and _as_bool(os.environ.get("AITER_GROUPED_A4W4_A_PRESHUFFLE"), False)
+    )
     if src_a1_scale is not None and not _prequantized:
         # Loud rather than silently re-quantizing something already quantized.
         assert hidden_states.dtype == dtype, (
@@ -959,6 +969,7 @@ def _grouped_a8w4_tdm_moe(
     _compact_ascale = (
         not _compact
         and not _prequantized
+        and not a_preshuffled
         and _ep_nvr is None
         and _use_fused_quant_preshuffle(
             model_dim, wmma_rep, _quant_mode, token_num, topk
@@ -1022,6 +1033,7 @@ def _grouped_a8w4_tdm_moe(
             row_to_token=_row_to_token,
             ep_psum_params=ep_psum_params,
             row_major_scale=_row_major_a1,
+            payload_preshuffled=a_preshuffled,
         )
         if _compact_ascale:
             a1_scale = flydsl_moe_scatter_preshuffle_scale(
@@ -1077,6 +1089,7 @@ def _grouped_a8w4_tdm_moe(
             n_warp=n_warp,
             out_is_f16=out_is_f16,
             a_is_fp4=_a_is_fp4,
+            a_preshuffled=int(a_preshuffled),
             stage1_act=stage1_act,
             bias=_b1,
             swiglu_limit=sl,
@@ -1119,6 +1132,7 @@ def _grouped_a8w4_tdm_moe(
             n_warp=n_warp,
             out_is_f16=out_is_f16,
             a_is_fp4=_a_is_fp4,
+            a_preshuffled=int(a_preshuffled),
             stage1_act=stage1_act,
             bias=_b1,
             swiglu_limit=sl,
@@ -1145,6 +1159,7 @@ def _grouped_a8w4_tdm_moe(
             quant_mode=_quant_mode,
             masked_m=None,
             topids_to_rows=None,
+            payload_preshuffled=a_preshuffled,
         )
 
     grouped_out = torch.empty((1, contiguous_m, model_dim), dtype=dtype, device=device)
@@ -1168,6 +1183,7 @@ def _grouped_a8w4_tdm_moe(
         n_warp=n_warp2,
         out_is_f16=out_is_f16,
         a_is_fp4=_a_is_fp4,
+        a_preshuffled=int(a_preshuffled),
         stage1_act=0,
         bias=_b2,
         num_buffers=num_buffers2,
@@ -1202,6 +1218,7 @@ def _grouped_a8w4_tdm_moe(
                     out_payload=a1_payload,
                     out_scale=a1_scale,
                     row_major_scale=_row_major_a1,
+                    payload_preshuffled=a_preshuffled,
                 ),
             )
         )
@@ -1220,6 +1237,7 @@ def _grouped_a8w4_tdm_moe(
                         topids_to_rows=None,
                         out_payload=a2_payload,
                         out_scale=a2_scale,
+                        payload_preshuffled=a_preshuffled,
                     ),
                 )
             )
@@ -1246,6 +1264,7 @@ def _grouped_a8w4_tdm_moe(
                         n_warp=n_warp,
                         out_is_f16=out_is_f16,
                         a_is_fp4=_a_is_fp4,
+                        a_preshuffled=int(a_preshuffled),
                         stage1_act=stage1_act,
                         bias=_b1,
                         swiglu_limit=sl,
@@ -1290,6 +1309,7 @@ def _grouped_a8w4_tdm_moe(
                         n_warp=n_warp,
                         out_is_f16=out_is_f16,
                         a_is_fp4=_a_is_fp4,
+                        a_preshuffled=int(a_preshuffled),
                         stage1_act=stage1_act,
                         bias=_b1,
                         swiglu_limit=sl,
@@ -1330,6 +1350,7 @@ def _grouped_a8w4_tdm_moe(
                     n_warp=n_warp2,
                     out_is_f16=out_is_f16,
                     a_is_fp4=_a_is_fp4,
+                    a_preshuffled=int(a_preshuffled),
                     stage1_act=0,
                     bias=_b2,
                     num_buffers=num_buffers2,

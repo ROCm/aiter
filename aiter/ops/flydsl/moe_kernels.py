@@ -3100,6 +3100,7 @@ def _get_compiled_fused_quant_preshuffle(
     wmma_rep: int,
     quant_mode: str = "fp4",
     skip_padding: bool = False,
+    payload_preshuffled: bool = False,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_quant_preshuffle_module,
@@ -3110,6 +3111,7 @@ def _get_compiled_fused_quant_preshuffle(
         wmma_rep=wmma_rep,
         quant_mode=quant_mode,
         skip_padding=skip_padding,
+        payload_preshuffled=payload_preshuffled,
     )
 
 
@@ -3193,6 +3195,7 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
     src_scale_bytes_per_row: int = 0,
     fuse_ep_psum: bool = False,
     row_major_scale: bool = False,
+    payload_preshuffled: bool = False,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_quant_preshuffle_route_ksplit_module,
@@ -3209,6 +3212,7 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
         src_scale_bytes_per_row=src_scale_bytes_per_row,
         fuse_ep_psum=fuse_ep_psum,
         row_major_scale=row_major_scale,
+        payload_preshuffled=payload_preshuffled,
     )
 
 
@@ -3272,19 +3276,26 @@ def flydsl_moe_fused_quant_preshuffle(
     # the interleaved GEMM layout. The caller must launch gemm1 with
     # row_major_ascale=1. Off for the quantizing path: that still preshuffles.
     row_major_scale: bool = False,
+    payload_preshuffled: bool = False,
 ):
     """Fused grouped quant + e8m0 scale-preshuffle.
 
-    Returns (payload, scale). Pass masked_m to skip padding rows.
+    Returns (payload, scale). Pass masked_m to skip padding rows. When
+    payload_preshuffled is true, FP4 payload bytes follow the logical
+    (M/16, K/128, 4, 16, 32) layout; each final 32-element span is 16 bytes.
     """
     if quant_mode not in ("fp4", "fp8"):
         raise NotImplementedError(
             f"flydsl_moe_fused_quant_preshuffle: quant_mode={quant_mode!r} "
             "unsupported (expected 'fp4' or 'fp8')."
         )
+    if payload_preshuffled and (quant_mode != "fp4" or grouped_in.shape[-1] % 128):
+        raise ValueError("preshuffled payload requires MXFP4 with K divisible by 128")
     # A quantizing EP dispatch (fp8 or fp4) already put the payload and its e8m0
     # row on the wire: nothing left to convert, only scatter + preshuffle.
     prequantized = prequantized_scale is not None
+    if payload_preshuffled and prequantized:
+        raise ValueError("prequantized payload cannot use the blocked A producer")
     if prequantized:
         # torch dtypes, not aiter.dtypes: this module deliberately imports only
         # torch and the tensor shim.
@@ -3326,6 +3337,8 @@ def flydsl_moe_fused_quant_preshuffle(
     ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
 
     n_rows = E * max_m
+    if payload_preshuffled and n_rows % 16:
+        raise ValueError("preshuffled payload requires a multiple of 16 rows")
     Pb = feat_dim if quant_mode == "fp8" else feat_dim // 2
     Ws = feat_dim // 32
     if out_payload is None:
@@ -3385,6 +3398,7 @@ def flydsl_moe_fused_quant_preshuffle(
         token_num = numel // int(source_topk) if source_topk > 0 else 0
         use_token_multidest = (
             not prequantized
+            and not payload_preshuffled
             and not remap_rows
             and not fuse_ep_psum
             and num_valid_routes is None
@@ -3464,6 +3478,7 @@ def flydsl_moe_fused_quant_preshuffle(
             ),
             fuse_ep_psum=fuse_ep_psum,
             row_major_scale=row_major_scale,
+            payload_preshuffled=payload_preshuffled,
         )
         # Dead-tail skip (EP dynamic token count): routes >= num_valid_routes are
         # padding rows of the dispatch buffer and are not gathered/quantized. When
@@ -3502,6 +3517,7 @@ def flydsl_moe_fused_quant_preshuffle(
         wmma_rep=wmma_rep,
         quant_mode=quant_mode,
         skip_padding=skip_padding,
+        payload_preshuffled=payload_preshuffled,
     )
     launch(
         ptr_arg(grouped_in.contiguous().view(-1)),
