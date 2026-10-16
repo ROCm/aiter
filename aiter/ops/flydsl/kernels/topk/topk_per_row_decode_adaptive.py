@@ -108,18 +108,16 @@ CERTIFICATE_MAX_SPINS = 4194304
 # the only thing that needs it -- every other read of the histogram follows a
 # barrier, which has already made it visible.
 CACHE_BYPASS_L1_L2 = 17
-# Group 1 is spare and stays reserved, so the numbering below keeps matching what
-# a workspace dump shows.
-COUNTER_SLOTS = 8 * COUNTER_STRIDE
+COUNTER_SLOTS = 7 * COUNTER_STRIDE
 # Parts of the row that have finished with its control slots; the last clears them.
 COUNTER_EXIT = 0 * COUNTER_STRIDE
-COUNTER_ARRIVALS = 2 * COUNTER_STRIDE
-COUNTER_OUT_FRONT = 3 * COUNTER_STRIDE
-COUNTER_OUT_BACK = 4 * COUNTER_STRIDE
-COUNTER_PASS_DONE = 5 * COUNTER_STRIDE
+COUNTER_ARRIVALS = 1 * COUNTER_STRIDE
+COUNTER_OUT_FRONT = 2 * COUNTER_STRIDE
+COUNTER_OUT_BACK = 3 * COUNTER_STRIDE
+COUNTER_PASS_DONE = 4 * COUNTER_STRIDE
 # Per-workgroup selected/tied counts for ordered emit (reserved for both modes).
-COUNTER_ORDERED_ABOVE = 6 * COUNTER_STRIDE
-COUNTER_ORDERED_EQUAL = 7 * COUNTER_STRIDE
+COUNTER_ORDERED_ABOVE = 5 * COUNTER_STRIDE
+COUNTER_ORDERED_EQUAL = 6 * COUNTER_STRIDE
 
 # Columns of `s_scan`: each wave's total, then its exclusive offset in the block.
 SCAN_TOTAL = 0
