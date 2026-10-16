@@ -1,0 +1,180 @@
+{
+ "triton": {
+  "bm16_n5760_k2880": [
+   {
+    "max_m": 8,
+    "cfg": {
+     "block_n": 128,
+     "block_k": 512,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "tuned_at_tokens": 1
+   },
+   {
+    "max_m": 40,
+    "cfg": {
+     "block_n": 64,
+     "block_k": 512,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "tuned_at_tokens": 4
+   },
+   {
+    "max_m": 160,
+    "cfg": {
+     "block_n": 64,
+     "block_k": 512,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "tuned_at_tokens": 16
+   },
+   {
+    "max_m": 640,
+    "cfg": {
+     "block_n": 64,
+     "block_k": 512,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "tuned_at_tokens": 64
+   },
+   {
+    "max_m": 1073741824,
+    "cfg": {
+     "block_n": 128,
+     "block_k": 512,
+     "num_stages": 2,
+     "num_warps": 8
+    },
+    "tuned_at_tokens": 256
+   }
+  ],
+  "bm32_n5760_k2880": [
+   {
+    "max_m": 1073741824,
+    "cfg": {
+     "block_n": 128,
+     "block_k": 512,
+     "num_stages": 3,
+     "num_warps": 4
+    },
+    "tuned_at_tokens": 1024
+   }
+  ],
+  "bm128_n5760_k2880": [
+   {
+    "max_m": 1073741824,
+    "cfg": {
+     "block_n": 128,
+     "block_k": 256,
+     "num_stages": 3,
+     "num_warps": 4
+    },
+    "tuned_at_tokens": 3072
+   }
+  ],
+  "bm64_n5760_k2880": [
+   {
+    "max_m": 1073741824,
+    "cfg": {
+     "block_n": 128,
+     "block_k": 512,
+     "num_warps": 8,
+     "num_stages": 2
+    },
+    "tuned_at_tokens": 1536
+   }
+  ],
+  "bm16_n2880_k2880": [
+   {
+    "max_m": 8,
+    "cfg": {
+     "block_n": 64,
+     "block_k": 512,
+     "num_stages": 3,
+     "num_warps": 4
+    },
+    "tuned_at_tokens": 1
+   },
+   {
+    "max_m": 40,
+    "cfg": {
+     "block_n": 64,
+     "block_k": 512,
+     "num_stages": 3,
+     "num_warps": 4
+    },
+    "tuned_at_tokens": 4
+   },
+   {
+    "max_m": 160,
+    "cfg": {
+     "block_n": 128,
+     "block_k": 512,
+     "num_stages": 2,
+     "num_warps": 8
+    },
+    "tuned_at_tokens": 16
+   },
+   {
+    "max_m": 640,
+    "cfg": {
+     "block_n": 64,
+     "block_k": 512,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "tuned_at_tokens": 64
+   },
+   {
+    "max_m": 1073741824,
+    "cfg": {
+     "block_n": 128,
+     "block_k": 512,
+     "num_stages": 2,
+     "num_warps": 8
+    },
+    "tuned_at_tokens": 256
+   }
+  ],
+  "bm32_n2880_k2880": [
+   {
+    "max_m": 1073741824,
+    "cfg": {
+     "block_n": 128,
+     "block_k": 512,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "tuned_at_tokens": 1024
+   }
+  ],
+  "bm128_n2880_k2880": [
+   {
+    "max_m": 1073741824,
+    "cfg": {
+     "block_n": 256,
+     "block_k": 512,
+     "num_stages": 2,
+     "num_warps": 8
+    },
+    "tuned_at_tokens": 3072
+   }
+  ],
+  "bm64_n2880_k2880": [
+   {
+    "max_m": 1073741824,
+    "cfg": {
+     "block_n": 128,
+     "block_k": 512,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "tuned_at_tokens": 1536
+   }
+  ]
+ }
+}
