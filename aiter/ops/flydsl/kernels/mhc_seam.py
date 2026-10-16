@@ -67,7 +67,6 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels.act import sigmoid_f32
-from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
 from aiter.ops.flydsl.kernels.kernels_common import LOG2E, ceildiv, get_warp_size
 
 WAVE_SIZE = get_warp_size()
@@ -100,14 +99,12 @@ TOKENS_PER_BLOCK = BLOCK // SPLIT_SLOTS
 # DPP controls. The comb's sixteen entries sit in one 16-lane DPP row of the fold's lane map, so
 # a row of the matrix is four consecutive lanes and a column is a stride-4 class inside that row;
 # neither move leaves the row, so a group's reduction never reads another token's lanes.
-_QUAD_PERM_XOR1 = 0xB1  # quad_perm:[1,0,3,2] -- partner within a pair
-_QUAD_PERM_XOR2 = (
-    0x4E  # quad_perm:[2,3,0,1] -- partner pair; the two together sum a group of 4
-)
+# quad_perm:[1,0,3,2] then quad_perm:[2,3,0,1] sums a group of 4: partner lane, then partner pair.
+_QUAD_PERM_XOR1 = 0xB1
+_QUAD_PERM_XOR2 = 0x4E
+# row_ror:8 then row_ror:4 sums the four lanes of a stride-4 class in a 16-lane row.
+_ROW_ROR8 = 0x128
 _ROW_ROR4 = 0x124
-_ROW_ROR8 = (
-    0x128  # ror 8 then ror 4 sums the four lanes of a stride-4 class in a 16-lane row
-)
 # The CU count a caller passes when it does not know the part's. Only ever read as how many
 # rounds of the part a grid is deep, so a wrong value is a geometry choice and not a wrong answer.
 DEFAULT_CU_COUNT = 304
@@ -132,6 +129,23 @@ def _require(cond: bool, msg: str, exc: type[Exception] = ValueError) -> None:
         raise exc(msg)
 
 
+def _require_streams(streams: int) -> None:
+    """Fixed DPP controls make the gate chain a 4x4 comb and no other shape; every other value
+    compiles and returns a wrong `comb_out`, so it is refused rather than left to a host.
+    """
+    _require(
+        streams == STREAMS,
+        f"the gate lane map is specialised for {STREAMS} residual streams, got {streams}",
+    )
+
+
+def _require_fast_narrow(fast_fp_math: bool, fast_narrow: bool) -> None:
+    _require(
+        fast_narrow or not fast_fp_math,
+        "fast_fp_math folds the bf16 narrow-widen round trip the contract requires; it needs fast_narrow",
+    )
+
+
 def gate_rows(streams: int) -> int:
     """Rows of the `fn` gate projection: `streams` pre + `streams` post + `streams^2` comb."""
     return 2 * streams + streams * streams
@@ -142,15 +156,19 @@ def gate_rows(streams: int) -> int:
 # 16-wide N tiles exactly, so both ride one contraction.
 PACK_ROWS = 2 * gate_rows(STREAMS)
 N_TILES = PACK_ROWS // MFMA_MN
+# The finish pass's lane bands (see `_gate_row`): comb, then pre, then post up to `gate_rows`.
+_COMB_LANES = STREAMS * STREAMS
+_PRE_LANES = _COMB_LANES + STREAMS
 
 
 def _rcp(value: Any) -> Any:
     """`v_rcp_f32`: ~1 ulp, against the ~10-instruction IEEE expansion a `/` lowers to."""
-    return fx.Float32(rocdl.rcp(T.f32, fx.Float32(value)))
+    return fx.Float32(rocdl.rcp(T.f32, value))
 
 
 def _exp2(value: Any) -> Any:
-    return fx.Float32(rocdl.exp2(T.f32, fx.Float32(value).ir_value()))
+    """Bare `v_exp_f32`; `fmath.exp2` adds a denormal range fix-up without `fast_fp_math`."""
+    return fx.Float32(rocdl.exp2(T.f32, value.ir_value()))
 
 
 def _dpp(value: Any, ctrl: int) -> Any:
@@ -158,9 +176,10 @@ def _dpp(value: Any, ctrl: int) -> Any:
     compiler can fold the move into the consuming VALU op. Every control used here stays inside a
     16-lane row, and the fold gives a token a whole 32-lane group, so the bound value is never
     observed and a dead token's group never contributes to a live one's."""
-    src_bits = fx.Float32(value).bitcast(fx.Int32)
-    moved = update_dpp_i32(0, src_bits, ctrl, 0xF, 0xF, True)
-    return fx.Int32(moved).bitcast(fx.Float32)
+    old = fx.Float32(0.0).ir_value()
+    return fx.Float32(
+        rocdl.update_dpp(T.f32, old, value.ir_value(), ctrl, 0xF, 0xF, True)
+    )
 
 
 def _row_sum(value: Any) -> Any:
@@ -178,6 +197,32 @@ def _row_max(value: Any) -> Any:
     partial = (value > first).select(value, first)
     second = _dpp(partial, _QUAD_PERM_XOR2)
     return (partial > second).select(partial, second)
+
+
+def _gate_row(lane: Any) -> Any:
+    """The projection row a finish lane folds, from its lane in the token's group.
+
+    The comb's rows 8..23 land on lanes 0..15, one whole 16-lane DPP row, then pre 0..3 on
+    16..19 and post 4..7 on 20..23. Lanes past the gate rows keep their own index, so the sum
+    slots after them stay where the fused pass published them.
+    """
+    row = (lane < fx.Int32(_COMB_LANES)).select(
+        lane + fx.Int32(2 * STREAMS), lane - fx.Int32(_COMB_LANES)
+    )
+    return (lane < fx.Int32(gate_rows(STREAMS))).select(row, lane)
+
+
+def _sinkhorn(logit: Any, eps: float, repeat: int) -> Any:
+    """Softmax across each comb row, then the `2 * repeat - 1` alternating half-steps, opening
+    on the column pass as the reference does. Every lane of the comb's DPP row runs it.
+    """
+    comb = _exp2((logit - _row_max(logit)) * LOG2E)
+    comb = comb * _rcp(_row_sum(comb)) + eps
+    comb = comb * _rcp(_col_sum(comb) + eps)
+    for _ in range_constexpr(repeat - 1):
+        comb = comb * _rcp(_row_sum(comb) + eps)
+        comb = comb * _rcp(_col_sum(comb) + eps)
+    return comb
 
 
 def _offset(layout: Any, *coord: Any) -> Any:
@@ -202,7 +247,7 @@ def _narrow_round(value: Any, fast: bool) -> tuple[Any, Any]:
     if not fast:
         narrow = fx.BFloat16(value)
         return narrow, fx.Float32(narrow)
-    bits = fx.Float32(value).bitcast(fx.Uint32)
+    bits = value.bitcast(fx.Uint32)
     biased = bits + (bits >> fx.Int32(16) & fx.Uint32(1)) + fx.Uint32(0x7FFF)
     return fx.Uint16(biased >> fx.Int32(16)).bitcast(fx.BFloat16), (
         biased & fx.Uint32(0xFFFF0000)
@@ -231,7 +276,7 @@ def _load_f32(ptr: Any, offset: Any) -> Any:
 
 
 def _store_f32(ptr: Any, offset: Any, value: Any) -> None:
-    fx.generic_store(fx.add_offset(ptr, offset), fx.Float32(value))
+    fx.generic_store(fx.add_offset(ptr, offset), value)
 
 
 def _packed_fn_view(ptr: Any, wide: int) -> Any:
@@ -276,14 +321,8 @@ def check_config(
       - `fast_fp_math` needs `fast_narrow`: the blanket flag folds `fpext(fptrunc x)` away, and
         that round trip is the contract.
     """
-    _require(
-        streams == STREAMS,
-        f"the gate lane map is specialised for {STREAMS} residual streams, got {streams}",
-    )
-    _require(
-        fast_narrow or not fast_fp_math,
-        "fast_fp_math folds the bf16 narrow-widen round trip the contract requires; it needs fast_narrow",
-    )
+    _require_streams(streams)
+    _require_fast_narrow(fast_fp_math, fast_narrow)
     rows = gate_rows(streams)
     _require(
         2 * rows == PACK_ROWS,
@@ -449,16 +488,8 @@ def compile_mhc_seam_fused(
     `fn` needs no such staging: it arrives packed in B-fragment order, so it is read straight
     from global, and the publish adds each gate row's two limbs back together.
     """
-    # Fixed DPP controls make the gate chain a 4x4 comb and no other shape; every other value
-    # compiles and returns a wrong `comb_out`, so it is refused rather than left to a host.
-    _require(
-        streams == STREAMS,
-        f"the gate lane map is specialised for {STREAMS} residual streams, got {streams}",
-    )
-    _require(
-        fast_narrow or not fast_fp_math,
-        "fast_fp_math folds the bf16 narrow-widen round trip the contract requires; it needs fast_narrow",
-    )
+    _require_streams(streams)
+    _require_fast_narrow(fast_fp_math, fast_narrow)
     rows = gate_rows(streams)
     wide = streams * hidden
     chunks = hidden // chunk_c
@@ -536,18 +567,18 @@ def compile_mhc_seam_fused(
         # separates them from, so the two never want the words at once.
         s_gates = lds.acc.view(fx.make_layout((block_m, coeffs), (coeffs, 1)))
 
+        # residual, residual_out
         res_major = fx.make_layout(
             (n_tok, streams, hidden), (streams * hidden, hidden, 1)
-        )  # residual, residual_out
-        token_major = fx.make_layout(
-            (n_tok, hidden), (hidden, 1)
-        )  # sublayer_out, stage
-        per_stream = fx.make_layout(
-            (n_tok, streams), (streams, 1)
-        )  # post_layer_mix, pre_mix
+        )
+        # sublayer_out, stage
+        token_major = fx.make_layout((n_tok, hidden), (hidden, 1))
+        # post_layer_mix, pre_mix
+        per_stream = fx.make_layout((n_tok, streams), (streams, 1))
+        # comb_res_mix
         per_pair = fx.make_layout(
             (n_tok, streams, streams), (streams * streams, streams, 1)
-        )  # comb_res_mix
+        )
         sums_major = fx.make_layout((splits, n_tok, 2), (n_tok * 2, 2, 1))
 
         # ── Matrix core ──
@@ -623,7 +654,7 @@ def compile_mhc_seam_fused(
                         pre_value = (slot_i == fx.Int32(pre_base)).select(
                             fx.Float32(1.0), fx.Float32(0.0)
                         )
-                    if const_expr(not identity_pre):
+                    else:
                         # Both arms of a select are evaluated, so the index is clamped: lanes
                         # below the band would otherwise read before the tensor's base.
                         pre_value = _load_f32(
@@ -657,7 +688,7 @@ def compile_mhc_seam_fused(
                                 pre_value,
                             ),
                         )
-                    if const_expr(not has_post):
+                    else:
                         out_gates[token_local, slot_i] = pre_value
 
         def post_mix_chunk(
@@ -782,8 +813,8 @@ def compile_mhc_seam_fused(
                     for e in range_constexpr(VEC):
                         # A dead token's row must contract to zero: its logits are published to a
                         # line the finish pass never reads, but the line is still written.
-                        tile_lds[base + e] = fx.BFloat16(
-                            live.select(fx.Float32(held[g][j][e]), fx.Float32(0.0))
+                        tile_lds[base + e] = live.select(
+                            held[g][j][e], fx.BFloat16(0.0)
                         )
                 fx.gpu.barrier()
                 k_tile = fx.Int32(j * chunks) + chunk
@@ -852,13 +883,9 @@ def compile_mhc_seam_fused(
                 total_sqc = sqc[g]
             for step in range_constexpr(butterfly):
                 mask = fx.Int32(1 << step)
-                total_sq = total_sq + fx.Float32(
-                    fx.gpu.shuffle_xor(total_sq, mask, width)
-                )
+                total_sq = total_sq + fx.gpu.shuffle_xor(total_sq, mask, width)
                 if const_expr(norm):
-                    total_sqc = total_sqc + fx.Float32(
-                        fx.gpu.shuffle_xor(total_sqc, mask, width)
-                    )
+                    total_sqc = total_sqc + fx.gpu.shuffle_xor(total_sqc, mask, width)
             token_in_tile = (fx.Int32(g * BLOCK) + tid) // fx.Int32(groups)
             token = token0 + token_in_tile
             if (tid % fx.Int32(groups) == fx.Int32(0)) & (token < n_tok):
@@ -870,7 +897,7 @@ def compile_mhc_seam_fused(
                     base = _offset(sums_major, seg, token, 0)
                     _store_f32(sums, base, total_sq)
                     _store_f32(sums, base + 1, total_sqc)
-                if const_expr(not norm):
+                else:
                     g_part[token_in_tile * fx.Int32(SPLIT_SLOTS) + fx.Int32(rows)] = (
                         total_sq
                     )
@@ -979,12 +1006,7 @@ def compile_mhc_seam_finish(
     (`finish_col_steps`); with `gate_only` a leading step carries the gate chain alone
     (`gate_step`).
     """
-    # Fixed DPP controls make the gate chain a 4x4 comb and no other shape; every other value
-    # compiles and returns a wrong `comb_out`, so it is refused rather than left to a host.
-    _require(
-        streams == STREAMS,
-        f"the gate lane map is specialised for {STREAMS} residual streams, got {streams}",
-    )
+    _require_streams(streams)
     rows = gate_rows(streams)
     wide = streams * hidden
     sq_slot, sqc_slot = rows, rows + 1
@@ -1035,17 +1057,17 @@ def compile_mhc_seam_finish(
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         total = lds.total.view(fx.make_layout(TOKENS_PER_BLOCK * SPLIT_SLOTS, 1))
 
-        token_major = fx.make_layout((n_tok, hidden), (hidden, 1))  # stage, layer_input
-        per_stream = fx.make_layout(
-            (n_tok, streams), (streams, 1)
-        )  # post_out, next_pre
+        # stage, layer_input
+        token_major = fx.make_layout((n_tok, hidden), (hidden, 1))
+        # post_out, next_pre
+        per_stream = fx.make_layout((n_tok, streams), (streams, 1))
+        # comb_out
         per_pair = fx.make_layout(
             (n_tok, streams, streams), (streams * streams, streams, 1)
-        )  # comb_out
+        )
         sums_major = fx.make_layout((splits, n_tok, 2), (n_tok * 2, 2, 1))
-        fold_major = fx.make_layout(
-            (TOKENS_PER_BLOCK, SPLIT_SLOTS), (SPLIT_SLOTS, 1)
-        )  # the folded lines
+        # the folded lines
+        fold_major = fx.make_layout((TOKENS_PER_BLOCK, SPLIT_SLOTS), (SPLIT_SLOTS, 1))
 
         # ── Issue the rescale's loads ──
         # Ahead of the fold, because they depend on neither it nor the barrier, and a compiler
@@ -1083,15 +1105,9 @@ def compile_mhc_seam_finish(
         safe = (token < n_tok).select(token, fx.Int32(0))
         tile = safe // fx.Int32(block_m)
         row_in_tile = safe - tile * fx.Int32(block_m)
-        # Lane -> projection row, so the gather lands each value where the gates want it: the
-        # comb's rows 8..23 on the group's lanes 0..15, which is one whole 16-lane DPP row, then
-        # pre 0..3 on 16..19 and post 4..7 on 20..23. The two sum slots are their own lane either
-        # way, so the permutation leaves `sq_slot` and `sqc_slot` -- and the rescale's read of
-        # them -- exactly where they were.
-        row = (col < fx.Int32(streams * streams)).select(
-            col + fx.Int32(2 * streams), col - fx.Int32(streams * streams)
-        )
-        row = (col < fx.Int32(rows)).select(row, col)
+        # The gather lands each value where the gates want it. The two sum slots are their own
+        # lane, so `sq_slot` and `sqc_slot` -- and the rescale's read of them -- do not move.
+        row = _gate_row(col)
         # Only the gate step folds the whole line. A rescale step needs one value per token --
         # `sum(x1^2)` -- so it reads that column alone: `ceil(splits / MFMA_MN)` loads per lane
         # and one 16-lane DPP reduction, against the full line's gather.
@@ -1126,13 +1142,12 @@ def compile_mhc_seam_finish(
                 narrow = fx.Float32(0.0)
                 for seg in range_constexpr(ceildiv(splits, MFMA_MN)):
                     idx = col + fx.Int32(seg * MFMA_MN)
-                    narrow = narrow + (idx < fx.Int32(splits)).select(
+                    in_range = idx < fx.Int32(splits)
+                    narrow = narrow + in_range.select(
                         _load_f32(
                             sums,
                             _offset(sums_major, 0, safe, 0)
-                            + (idx < fx.Int32(splits)).select(idx, fx.Int32(0))
-                            * n_tok
-                            * fx.Int32(2)
+                            + in_range.select(idx, fx.Int32(0)) * n_tok * fx.Int32(2)
                             + fx.Int32(1),
                         ),
                         fx.Float32(0.0),
@@ -1158,9 +1173,9 @@ def compile_mhc_seam_finish(
                 total[local * fx.Int32(SPLIT_SLOTS) + fx.Int32(sq_slot)] * inv_wide
                 + rms_eps
             )
-            scale = (col < fx.Int32(streams * streams)).select(
+            scale = (col < fx.Int32(_COMB_LANES)).select(
                 _load_f32(hc_scale, 2),
-                (col < fx.Int32(streams * streams + streams)).select(
+                (col < fx.Int32(_PRE_LANES)).select(
                     _load_f32(hc_scale, 0), _load_f32(hc_scale, 1)
                 ),
             )
@@ -1170,32 +1185,22 @@ def compile_mhc_seam_finish(
 
             # Sigmoid on every lane; only the pre and post lanes reach a store.
             sig = sigmoid_f32(logit)
-
-            comb = _exp2((logit - _row_max(logit)) * LOG2E)
-            comb = comb * _rcp(_row_sum(comb)) + hc_sinkhorn_eps
-            comb = comb * _rcp(_col_sum(comb) + hc_sinkhorn_eps)
-            for _ in range_constexpr(sinkhorn_repeat - 1):
-                comb = comb * _rcp(_row_sum(comb) + hc_sinkhorn_eps)
-                comb = comb * _rcp(_col_sum(comb) + hc_sinkhorn_eps)
+            comb = _sinkhorn(logit, hc_sinkhorn_eps, sinkhorn_repeat)
 
             comb_row = _offset(per_pair, token0, 0, 0) + local * fx.Int32(
                 streams * streams
             )
             stream_row = _offset(per_stream, token0, 0) + local * fx.Int32(streams)
-            if col < fx.Int32(streams * streams):
+            if col < fx.Int32(_COMB_LANES):
                 _store_f32(comb_out, comb_row + col, comb)
-            if (col >= fx.Int32(streams * streams)) & (
-                col < fx.Int32(streams * streams + streams)
-            ):
+            if (col >= fx.Int32(_COMB_LANES)) & (col < fx.Int32(_PRE_LANES)):
                 _store_f32(
-                    next_pre,
-                    stream_row + col - fx.Int32(streams * streams),
-                    sig + hc_pre_eps,
+                    next_pre, stream_row + col - fx.Int32(_COMB_LANES), sig + hc_pre_eps
                 )
-            if (col >= fx.Int32(streams * streams + streams)) & (col < fx.Int32(rows)):
+            if (col >= fx.Int32(_PRE_LANES)) & (col < fx.Int32(rows)):
                 _store_f32(
                     post_out,
-                    stream_row + col - fx.Int32(streams * streams + streams),
+                    stream_row + col - fx.Int32(_PRE_LANES),
                     sig * hc_post_mult_value,
                 )
 
@@ -1327,10 +1332,8 @@ def compile_mhc_seam_finish_nonorm(
             SPLIT_SLOTS
         )
 
-        # Lane -> projection row: comb rows 8..23 on lanes 0..15, pre 0..3 on 16..19, post
-        # 4..7 on 20..23, the sum of squares on 24; lanes 25..31 are inert.
-        row = (lane < fx.Int32(16)).select(lane + fx.Int32(8), lane - fx.Int32(16))
-        row = (lane < fx.Int32(24)).select(row, lane)
+        # The sum of squares is on lane `rows`; the lanes past it are inert.
+        row = _gate_row(lane)
 
         # Dead tokens fold token 0's line, which part_elements always allocates, so the
         # loads stay hoisted out of the branch as the fused finish does.
@@ -1345,7 +1348,7 @@ def compile_mhc_seam_finish_nonorm(
             ) + row_in_tile * fx.Int32(SPLIT_SLOTS)
             total = total + _load_f32(part, base + row)
             # The sum of squares shares the lane's own 128 B window, so this is an L1
-            # hit and saves a cross-lane broadcast of lane 24.
+            # hit and saves a cross-lane broadcast of lane `rows`.
             squares = squares + _load_f32(part, base + fx.Int32(rows))
 
         # No cross-lane move in this block leaves a token's own 32-lane group, and it holds
@@ -1353,39 +1356,31 @@ def compile_mhc_seam_finish_nonorm(
         # whole group, which makes the branch uniform over every lane `_dpp` can reach.
         if token < n_tok:
             rstd = fmath.rsqrt(squares * inv_wide + rms_eps)
-            s_pre = _load_f32(hc_scale, fx.Int32(0))
-            s_post = _load_f32(hc_scale, fx.Int32(1))
-            s_comb = _load_f32(hc_scale, fx.Int32(2))
-            scale = (lane < fx.Int32(16)).select(
-                s_comb, (lane < fx.Int32(20)).select(s_pre, s_post)
+            s_pre = _load_f32(hc_scale, 0)
+            s_post = _load_f32(hc_scale, 1)
+            s_comb = _load_f32(hc_scale, 2)
+            scale = (lane < fx.Int32(_COMB_LANES)).select(
+                s_comb, (lane < fx.Int32(_PRE_LANES)).select(s_pre, s_post)
             )
             bias_row = (row < fx.Int32(rows)).select(row, fx.Int32(0))
             logit = total * rstd * scale + _load_f32(hc_base, bias_row)
 
-            # Sigmoid on every lane; only 16..23 reach a store.
+            # Sigmoid on every lane; only the pre and post lanes reach a store.
             sig = sigmoid_f32(logit)
+            comb = _sinkhorn(logit, hc_sinkhorn_eps, sinkhorn_repeat)
 
-            # Softmax across each comb row, then the `2 * repeat - 1` alternating
-            # half-steps, opening on the column pass as the reference does.
-            comb = _exp2((logit - _row_max(logit)) * LOG2E)
-            comb = comb * _rcp(_row_sum(comb)) + hc_sinkhorn_eps
-            comb = comb * _rcp(_col_sum(comb) + hc_sinkhorn_eps)
-            for _ in range_constexpr(sinkhorn_repeat - 1):
-                comb = comb * _rcp(_row_sum(comb) + hc_sinkhorn_eps)
-                comb = comb * _rcp(_col_sum(comb) + hc_sinkhorn_eps)
-
-            if lane < fx.Int32(16):
+            if lane < fx.Int32(_COMB_LANES):
                 _store_f32(comb_out, token * fx.Int32(STREAMS * STREAMS) + lane, comb)
-            if (lane >= fx.Int32(16)) & (lane < fx.Int32(20)):
+            if (lane >= fx.Int32(_COMB_LANES)) & (lane < fx.Int32(_PRE_LANES)):
                 _store_f32(
                     next_pre,
-                    token * fx.Int32(STREAMS) + lane - fx.Int32(16),
+                    token * fx.Int32(STREAMS) + lane - fx.Int32(_COMB_LANES),
                     sig + hc_pre_eps,
                 )
-            if (lane >= fx.Int32(20)) & (lane < fx.Int32(24)):
+            if (lane >= fx.Int32(_PRE_LANES)) & (lane < fx.Int32(rows)):
                 _store_f32(
                     post_out,
-                    token * fx.Int32(STREAMS) + lane - fx.Int32(20),
+                    token * fx.Int32(STREAMS) + lane - fx.Int32(_PRE_LANES),
                     sig * hc_post_mult_value,
                 )
 
