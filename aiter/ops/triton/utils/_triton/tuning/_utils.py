@@ -6,7 +6,7 @@ import glob
 import json
 import os
 
-FINAL_STATUSES = ("ok", "error", "crashed", "hung")
+FINAL_STATUSES = ("ok", "error", "crashed", "hung", "skipped")
 TOP_BUCKET_M = 8192  # --all-buckets sweeps the family's M_LEQ buckets up to here
 
 
