@@ -7,6 +7,7 @@ are bound by host launch overhead under do_bench.
 """
 
 import argparse
+import functools
 
 import torch
 import triton
@@ -16,6 +17,8 @@ from aiter.ops.triton.fusions.fused_reduce_qk_norm_rope_swa_write import (
 )
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     print_vgpr,
 )
@@ -51,6 +54,33 @@ def _positive_int(value):
     return n
 
 
+def _generate_inputs(M, heads, splitk, head_dim, rope_dim, win, max_seq, dtype, device):
+    N = heads * head_dim
+    q_shape = (M, N) if splitk == 1 else (splitk, M, N)
+    q = torch.randn(q_shape, dtype=dtype, device=device)
+    kv = torch.randn(M, head_dim, dtype=dtype, device=device)
+    q_out = torch.empty(M, heads, head_dim, dtype=dtype, device=device)
+    cos, sin = _build_cos_sin(rope_dim, max_seq, dtype, device)
+    positions = torch.randperm(max_seq, dtype=torch.int64, device=device)[:M]
+    write_indices = torch.randperm(M, dtype=torch.int32, device=device)
+    batch_id_per_token = torch.randperm(M, dtype=torch.int32, device=device)
+    state_slot_mapping = torch.randperm(M, dtype=torch.int32, device=device)
+    swa_kv = torch.zeros(M, win, head_dim, dtype=dtype, device=device)
+    return (
+        q,
+        kv,
+        q_out,
+        cos,
+        sin,
+        positions,
+        write_indices,
+        batch_id_per_token,
+        state_slot_mapping,
+        swa_kv,
+        win,
+    )
+
+
 def bench_fused_reduce_qk_norm_rope_swa_write_fn(M, heads, splitk, metric, args):
     head_dim = 512
     rope_dim = 64
@@ -58,26 +88,60 @@ def bench_fused_reduce_qk_norm_rope_swa_write_fn(M, heads, splitk, metric, args)
     max_seq = max(32768, M)  # Ensure every requested token has a valid position.
     dtype = str_to_torch_dtype[args.dtype]
     device = torch.device("cuda")
-    N = heads * head_dim
-    q_shape = (M, N) if splitk == 1 else (splitk, M, N)
+
     torch.manual_seed(0)
-    q = torch.randn(q_shape, dtype=dtype, device=device)
-    kv = torch.randn(M, head_dim, dtype=dtype, device=device)
-    q_out = torch.empty(M, heads, head_dim, dtype=dtype, device=device)
-    cos, sin = _build_cos_sin(rope_dim, max_seq, dtype, device)
-    positions = torch.randperm(max_seq, dtype=torch.int64, device=device)[:M]
+    _p_gen = functools.partial(
+        _generate_inputs,
+        M,
+        heads,
+        splitk,
+        head_dim,
+        rope_dim,
+        win,
+        max_seq,
+        dtype,
+        device,
+    )
+    _out_val_keys = [
+        "q",
+        "kv",
+        "q_out",
+        "cos",
+        "sin",
+        "positions",
+        "write_indices",
+        "batch_id_per_token",
+        "state_slot_mapping",
+        "swa_kv",
+        "win",
+    ]
+    rot_bufs = generate_rotating_buffers_pool(
+        [_p_gen], [_out_val_keys], target_mb=256, min_pool_len=4
+    )
+    sample = rot_bufs[0]
 
-    swa_kwargs = {}
-    if not args.no_swa:
-        swa_kwargs = {
-            "write_indices": torch.randperm(M, dtype=torch.int32, device=device),
-            "batch_id_per_token": torch.randperm(M, dtype=torch.int32, device=device),
-            "state_slot_mapping": torch.randperm(M, dtype=torch.int32, device=device),
-            "swa_kv": torch.zeros(M, win, head_dim, dtype=dtype, device=device),
-            "win": win,
-        }
-
-    def fn():
+    def _run(
+        q,
+        kv,
+        q_out,
+        cos,
+        sin,
+        positions,
+        write_indices,
+        batch_id_per_token,
+        state_slot_mapping,
+        swa_kv,
+        win,
+    ):
+        swa_kwargs = {}
+        if not args.no_swa:
+            swa_kwargs = {
+                "write_indices": write_indices,
+                "batch_id_per_token": batch_id_per_token,
+                "state_slot_mapping": state_slot_mapping,
+                "swa_kv": swa_kv,
+                "win": win,
+            }
         return fused_reduce_qk_norm_rope_swa_write(
             q,
             kv,
@@ -95,12 +159,13 @@ def bench_fused_reduce_qk_norm_rope_swa_write_fn(M, heads, splitk, metric, args)
             **swa_kwargs,
         )
 
-    ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
+    ms = do_bench_aiter_triton(_run, rot_bufs)
     if metric == "time":
         return ms
 
     # q_in read + q_out write + kv read/write (+ SWA row write); cos/sin are tiny.
-    elem = torch.tensor([], dtype=dtype).element_size()
+    elem = sample["q"].element_size()
+    N = sample["q"].shape[-1]
     mem = (splitk * M * N + M * N + 2 * M * head_dim) * elem
     if not args.no_swa:
         mem += M * head_dim * elem

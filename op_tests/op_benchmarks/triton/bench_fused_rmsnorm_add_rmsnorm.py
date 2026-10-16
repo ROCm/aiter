@@ -8,6 +8,7 @@ the existing RMSNorm and RMSNorm-plus-add operators separately.
 """
 
 import argparse
+import functools
 
 import torch
 import triton
@@ -15,7 +16,11 @@ import triton
 from aiter.ops.triton.normalization.fused_rmsnorm_add_rmsnorm import (
     fused_rmsnorm_add_rmsnorm,
 )
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
+    get_caller_name_no_ext,
+)
 from op_tests.triton_tests.normalization.test_fused_rmsnorm_add_rmsnorm import (
     generate_fused_rmsnorm_add_rmsnorm_inputs,
 )
@@ -29,20 +34,34 @@ def get_x_vals():
     return [(m, 6656) for m in (1, 8, 32, 64, 128, 256, 1024, 4096)]
 
 
-def bench_fused_rmsnorm_add_rmsnorm_fn(M, N, metric):
+def _generate_inputs(M, N):
     x, residual, post_weight, pre_weight = generate_fused_rmsnorm_add_rmsnorm_inputs(
         M, N
     )
     residual_out = torch.empty_like(x)
+    return x, residual, post_weight, pre_weight, residual_out
 
-    fn = lambda: fused_rmsnorm_add_rmsnorm(
-        x, residual, post_weight, pre_weight, POST_EPS, PRE_EPS, residual_out
+
+def bench_fused_rmsnorm_add_rmsnorm_fn(M, N, metric):
+    _p_gen = functools.partial(_generate_inputs, M, N)
+    _out_val_keys = ["x", "residual", "post_weight", "pre_weight", "residual_out"]
+    rot_bufs = generate_rotating_buffers_pool(
+        [_p_gen], [_out_val_keys], target_mb=256, min_pool_len=4
     )
-    ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+
+    # Shapes/dtypes are identical across the pool, so any entry works for sizing.
+    sample = rot_bufs[0]
+
+    def _run(x, residual, post_weight, pre_weight, residual_out):
+        fused_rmsnorm_add_rmsnorm(
+            x, residual, post_weight, pre_weight, POST_EPS, PRE_EPS, residual_out
+        )
+
+    ms = do_bench_aiter_triton(_run, rot_bufs)
     if metric == "time":
         return ms
     if metric == "bandwidth":
-        bytes_moved = (4 * M * N + 2 * N) * x.element_size()
+        bytes_moved = (4 * M * N + 2 * N) * sample["x"].element_size()
         return bytes_moved / (ms * 1e-3) * 1e-9
     raise ValueError(f"Unknown metric: {metric}")
 
