@@ -1,4 +1,5 @@
 #pragma once
+#include <cfloat>
 #include <hip/hip_runtime.h>
 #include "runner/params.hpp"
 #include "op_lds.hpp"
@@ -341,9 +342,9 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             q_regs[kstep] = v4i{0, 0, 0, 0};
     }
 
-    // Finite rmax seed below any realizable raw score, so a real score always wins
-    // the running max; -inf would make a fully-masked row NaN instead of O=0/LSE=-inf.
-    float rmax = -1e30f;
+    // The lowest finite fp32 value lets every finite score participate while
+    // avoiding (-inf) - (-inf) when a tile is fully masked.
+    float rmax = -FLT_MAX;
     float rsum = 0.0f;
 
     // kv_offset = absolute key row of the current tile's first key.
