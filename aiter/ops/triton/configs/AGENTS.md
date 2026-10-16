@@ -205,6 +205,27 @@ in lowercase (`mhc_fused_sinkhorn`).
 
 `get_mhc_post_config(M, C)` reads `mhc_post/DEFAULT.json`.
 
+## MHA forward (proposal)
+
+`_triton_kernels/attention/mha.py::_get_config` reads
+`<arch>/triton/attention/mha/`. For bf16 without dropout (the harness tunes
+bf16 only), when the caller passes `head_dim_qk`, it first tries the shape
+file `MHA-DQ=<head_dim_qk>-DV=<head_dim_v>-CAUSAL=<0|1>.json`:
+
+- In that file it selects the smallest `SK_LEQ_<x>` that is not less than
+  `max_seqlen_k`. A bucket whose `<x>` is not an integer is skipped with a
+  warning. There is no `"any"`: a key past the largest bucket, like a shape
+  without a file, gets the `DEFAULT.json` rules (`fwd` entries and
+  `mid_head_skip`).
+- The file carries `"DEFAULT_FALLBACK": true`, and its entries have the
+  `DEFAULT.json` `fwd` keys.
+
+The suffix and the `SK_LEQ_` key are a first proposal, open for the owners
+to change: other candidates are `HQ/HK`, and buckets over `max_seqlen_q` or
+the program count that `mid_head_skip` already uses. The harness tunes one
+equal-length shape without a window; whether the lookup should also be
+limited to such calls is part of the same question.
+
 ## Autotune
 
 - Give every `@triton.autotune` its list through

@@ -39,6 +39,20 @@ SEARCH_SPACE = {
     "persistent": [True, False],
 }
 
+# Families outside GEMM sweep their own values for the keys they share with GEMM, and add
+# their own keys. Same rules: the full product is swept, a single value pins the key.
+OP_SEARCH_SPACE = {
+    "attention": {
+        "BLOCK_SIZE_M": [16, 32, 64, 128, 256],
+        "BLOCK_SIZE_N": [16, 32, 64, 128],
+        "PRELOAD_V": [False, True],
+        "num_warps": [2, 4, 8],
+        "waves_per_eu": [0, 1, 2, 4],
+        "num_stages": [1, 2, 3],
+        "num_ctas": [1],
+    },
+}
+
 # Families that spell a key differently share its table row and shape rules;
 # the configs keep the family's own spelling.
 ALIASES = {
@@ -63,23 +77,32 @@ def load_defaults(spec, backend):
     """
     from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
-    config_dir = resolve_config_dir("gemm", spec.config_name, backend=backend)
+    config_dir = resolve_config_dir(spec.op, spec.config_name, backend=backend)
     default_path = f"{config_dir}/DEFAULT.json"
     table = load_config_json(default_path, required=False)
     if table is None:
         raise FileNotFoundError(f"Required config file doesn't exist: {default_path}")
-    buckets = {name: entry for name, entry in table.items() if isinstance(entry, dict)}
+    if spec.default_buckets is not None:
+        buckets = spec.default_buckets(table)
+    else:
+        buckets = {
+            name: entry for name, entry in table.items() if isinstance(entry, dict)
+        }
     keys = list(dict.fromkeys(key for entry in buckets.values() for key in entry))
     return keys, buckets, default_path
 
 
-def default_values(spec, backend, M, keys, buckets):
-    """The DEFAULT.json bucket the loader picks for M, filled up with keys only other buckets have."""
-    from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+def default_values(spec, backend, shape, keys, buckets):
+    """The DEFAULT.json bucket the loader picks for the shape, filled up with keys only other
+    buckets have."""
+    if spec.resolver is not None:
+        values, _ = spec.resolver(shape, backend)
+    else:
+        from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
-    values, _ = get_gemm_config(
-        spec.config_name, M, bounds=spec.bounds, backend=backend
-    )
+        values, _ = get_gemm_config(
+            spec.config_name, shape["M"], bounds=spec.bounds, backend=backend
+        )
     for key in keys:
         if key not in values:
             values[key] = next(entry[key] for entry in buckets.values() if key in entry)
@@ -89,14 +112,15 @@ def default_values(spec, backend, M, keys, buckets):
 def candidate_values(spec, backend, keys, defaults, default_path):
     """Candidate list per key. A one-element list means the key is pinned (not swept)."""
     values, pinned = {}, []
+    space = {**SEARCH_SPACE, **OP_SEARCH_SPACE.get(spec.op, {})}
     for key in keys:
         name = ALIASES.get(key, key)
-        if name not in SEARCH_SPACE:
+        if name not in space:
             raise UnknownConfigKey(
                 f"Unknown config key '{key}' in {default_path}: "
                 "add it to SEARCH_SPACE in space.py first"
             )
-        candidates = SEARCH_SPACE[name]
+        candidates = space[name]
         if backend == "gluon" and key in spec.gluon_candidates:
             candidates = spec.gluon_candidates[key]
         gluon_never_reads = backend == "gluon" and (
@@ -112,22 +136,22 @@ def candidate_values(spec, backend, keys, defaults, default_path):
     return values, pinned
 
 
-def filter_by_shape(key, values, shape, backend, allow_oversized_tiles):
+def filter_by_shape(key, values, shape, backend, allow_oversized_tiles, tile_dims):
     """Drop values the shape makes pointless; always keep at least one.
 
-    Block sizes above the next power of two of their dimension are dropped unless
-    allow_oversized_tiles; NUM_KSPLIT values that do not divide K are always dropped.
+    Block sizes above the next power of two of the dimension they tile (tile_dims) are
+    dropped unless allow_oversized_tiles; NUM_KSPLIT values that do not divide K are always
+    dropped.
     """
     name = ALIASES.get(key, key)
-    M, N, K = shape["M"], shape["N"], shape["K"]
     if name == "NUM_KSPLIT":
-        kept = [v for v in values if K % v == 0]
-    elif name in ("BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K"):
+        kept = [v for v in values if shape["K"] % v == 0]
+    elif name in tile_dims:
         if name == "BLOCK_SIZE_M" and backend == "gluon":
             values = [
                 v for v in values if v >= 16
             ] or values  # gluon tiles start at 16 rows
-        dim = {"BLOCK_SIZE_M": M, "BLOCK_SIZE_N": N, "BLOCK_SIZE_K": K}[name]
+        dim = shape[tile_dims[name]]
         kept = (
             values
             if allow_oversized_tiles
@@ -215,7 +239,7 @@ def exceeds_lds(config, spec, arch, backend):
 def build_space(spec, shape, backend, arch, kernel_should_skip):
     """All configs to benchmark for one shape, plus a report of how the space was built."""
     keys, buckets, default_path = load_defaults(spec, backend)
-    defaults = default_values(spec, backend, shape["M"], keys, buckets)
+    defaults = default_values(spec, backend, shape, keys, buckets)
     values, pinned = candidate_values(spec, backend, keys, defaults, default_path)
 
     def shape_filtered(allow_oversized_tiles):
@@ -223,7 +247,9 @@ def build_space(spec, shape, backend, arch, kernel_should_skip):
             k: (
                 v
                 if k in pinned
-                else filter_by_shape(k, v, shape, backend, allow_oversized_tiles)
+                else filter_by_shape(
+                    k, v, shape, backend, allow_oversized_tiles, spec.tile_dims
+                )
             )
             for k, v in values.items()
         }
@@ -233,7 +259,7 @@ def build_space(spec, shape, backend, arch, kernel_should_skip):
         skipped = {"generic rules": 0, "LDS": 0, "registers": 0, "kernel rules": 0}
         for combination in itertools.product(*candidate_lists.values()):
             config = dict(zip(keys, combination))
-            if should_skip_generic(shape, config, backend):
+            if spec.op == "gemm" and should_skip_generic(shape, config, backend):
                 skipped["generic rules"] += 1
                 continue
             if exceeds_lds(config, spec, arch, backend):

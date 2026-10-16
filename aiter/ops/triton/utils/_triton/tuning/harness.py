@@ -33,6 +33,7 @@ import time
 
 from _utils import add_shape_args, append_record, shape_from_args
 from kernels import (
+    KERNELS,
     check_backend,
     ensure_repo_on_path,
     family_bounds,
@@ -178,7 +179,7 @@ def benchmark(
                 us=round(median, 3),
                 us_min=round(low, 3),
                 us_max=round(high, 3),
-                tflops=round(flops(shape) / median / 1e6, 2),
+                tflops=round(flops(spec, shape) / median / 1e6, 2),
             )
         except Exception as e:  # noqa: BLE001
             # a failing candidate is a result, not a crash
@@ -202,7 +203,7 @@ def main(argv=None):
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("kernel", type=get_spec)
-    add_shape_args(parser)
+    add_shape_args(parser, KERNELS.values())
     parser.add_argument("--backend", choices=("triton", "gluon"))
     parser.add_argument(
         "--plan", action="store_true", help="only build the search space"
@@ -220,7 +221,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     spec = args.kernel
-    shape = shape_from_args(args, spec.dims)
+    shape = shape_from_args(args, spec)
     ensure_repo_on_path()
     from aiter.ops.triton.utils._triton import arch_info
 

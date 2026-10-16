@@ -385,6 +385,198 @@ class TestMeasurement(unittest.TestCase):
         torch.testing.assert_close(out, produced)
 
 
+def _tiles_args(**overrides):
+    return argparse.Namespace(
+        **{
+            "errRatio": 0.0,
+            "triton_runs_dir": "runs",
+            **overrides,
+        }
+    )
+
+
+class TestTritonTiles(unittest.TestCase):
+    """--triton-tiles: the Triton harness tunes the tile, this tuner checks it."""
+
+    def test_the_harness_stands_in_only_for_equal_length_bf16_without_window(self):
+        problem = MhaFwdProblem.from_mapping(_problem_row())
+        self.assertIsNone(_TUNER.harness_reason(problem))
+        for overrides in (
+            {"total_q": 500},
+            {"window_left": 64},
+            {"dtype": "float16"},
+        ):
+            with self.subTest(**overrides):
+                problem = MhaFwdProblem.from_mapping(_problem_row(**overrides))
+                self.assertIsNotNone(_TUNER.harness_reason(problem))
+
+    def test_the_harness_runs_as_its_owners_run_it(self):
+        tuner = _tuner()
+        key = MhaFwdProblem.from_mapping(_problem_row()).key()
+        row = pd.Series(dict(zip(MHA_FWD_TUNING_KEY_FIELDS, key)))
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(tuner, "_measure") as measure,
+            mock.patch.object(
+                _TUNER, "triton_shape_file", return_value=f"{directory}/MHA.json"
+            ),
+            mock.patch.object(_TUNER.subprocess, "run") as run,
+            mock.patch.object(_TUNER, "clear_triton_config_caches"),
+            mock.patch("builtins.print"),
+        ):
+            run.return_value.returncode = 0
+            snapshots, installed = tuner._tune_triton_tiles(
+                pd.DataFrame([row]), _tiles_args()
+            )
+        measure.assert_not_called()
+        command = run.call_args.args[0]
+        self.assertEqual(command[2], "mha_varlen_fwd")
+        self.assertEqual(command[command.index("--SK") + 1], "256")
+        self.assertNotIn("--search", command)
+        self.assertEqual(run.call_args.kwargs["cwd"], _TUNER.TRITON_HARNESS_DIR)
+        self.assertEqual(snapshots, {f"{directory}/MHA.json": None})
+        self.assertEqual(installed, {f"{directory}/MHA.json": [key]})
+
+    def test_the_snapshot_is_the_file_before_the_first_install(self):
+        tuner = _tuner()
+        rows = [
+            pd.Series(
+                dict(
+                    zip(
+                        MHA_FWD_TUNING_KEY_FIELDS,
+                        MhaFwdProblem.from_mapping(_problem_row(**dims)).key(),
+                    )
+                )
+            )
+            for dims in (
+                {},
+                {
+                    "max_seqlen_q": 512,
+                    "total_q": 1024,
+                    "max_seqlen_k": 512,
+                    "total_k": 1024,
+                },
+            )
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "MHA.json")
+            path.write_text("old")
+
+            def harness(*_args, **_kwargs):
+                path.write_text(path.read_text() + "+install")
+                return mock.Mock(returncode=0)
+
+            with (
+                mock.patch.object(
+                    _TUNER, "triton_shape_file", return_value=str(path)
+                ),
+                mock.patch.object(_TUNER.subprocess, "run", side_effect=harness),
+                mock.patch.object(_TUNER, "clear_triton_config_caches"),
+                mock.patch("builtins.print"),
+            ):
+                snapshots, installed = tuner._tune_triton_tiles(
+                    pd.DataFrame(rows), _tiles_args()
+                )
+        self.assertEqual(snapshots, {str(path): "old"})
+        self.assertEqual(len(installed[str(path)]), 2)
+
+    def test_the_harness_keeps_the_callers_pythonpath(self):
+        with mock.patch.dict(os.environ, {"PYTHONPATH": "/elsewhere"}):
+            path = _TUNER.harness_env()["PYTHONPATH"].split(os.pathsep)
+        self.assertEqual(path, [_TUNER.REPO_ROOT, "/elsewhere"])
+
+    def test_rows_sharing_a_shape_file_restore_the_file_from_before_the_run(self):
+        """Every row with the same head dims and mask installs into one file,
+        so restoring per row would put back another row's install."""
+        tuner = _tuner()
+        short, long = ("key", 256), ("key", 2048)
+
+        def ok(key):
+            return ((key, "triton", ""), 9.0, 0.0, "ok", "")
+
+        def bad(key):
+            return ((key, "triton", ""), 9.0, 0.3, "mismatch", "")
+
+        cases = {
+            "both fail": ([bad(short), bad(long)], "old"),
+            "one fails": ([bad(short), ok(long)], "old"),
+            "only ck measured": ([((short, "ck", ""), 9.0, 0.0, "ok", "")], "old"),
+            "both pass": ([ok(short), ok(long)], "both installs"),
+        }
+        for name, (results, expected) in cases.items():
+            with (
+                self.subTest(name),
+                tempfile.TemporaryDirectory() as directory,
+                mock.patch.object(_TUNER, "clear_triton_config_caches"),
+                mock.patch("builtins.print"),
+            ):
+                path = Path(directory, "MHA.json")
+                path.write_text("both installs")
+                tuner._roll_back_wrong_tiles(
+                    results,
+                    {str(path): "old"},
+                    {str(path): [short, long]},
+                    _tiles_args(),
+                )
+                self.assertEqual(path.read_text(), expected)
+
+    def test_a_file_the_run_created_is_removed_when_its_tile_fails(self):
+        tuner = _tuner()
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(_TUNER, "clear_triton_config_caches"),
+            mock.patch("builtins.print"),
+        ):
+            path = Path(directory, "MHA.json")
+            path.write_text("new")
+            tuner._roll_back_wrong_tiles(
+                [], {str(path): None}, {str(path): [("key",)]}, _tiles_args()
+            )
+            self.assertFalse(path.exists())
+
+    def test_a_measurement_that_raises_still_rolls_back(self):
+        tuner = _tuner()
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(_TUNER, "clear_triton_config_caches"),
+            mock.patch("builtins.print"),
+        ):
+            path = Path(directory, "MHA.json")
+            path.write_text("new")
+            with (
+                mock.patch.object(
+                    tuner,
+                    "_tune_triton_tiles",
+                    return_value=({str(path): "old"}, {str(path): [("key",)]}),
+                ),
+                mock.patch.object(tuner, "_measure", side_effect=RuntimeError("boom")),
+                self.assertRaises(RuntimeError),
+            ):
+                tuner.tune(pd.DataFrame(), None, _tiles_args(triton_tiles=True))
+            self.assertEqual(path.read_text(), "old")
+
+    def test_triton_tiles_without_measuring_triton_is_refused(self):
+        check = _TUNER.MhaFwdTuner._check_triton_tiles
+        with self.assertRaisesRegex(ValueError, "--triton-tiles needs triton"):
+            check(argparse.Namespace(backends="ck", triton_tiles=True))
+        check(argparse.Namespace(backends="ck,triton", triton_tiles=True))
+        check(argparse.Namespace(backends="", triton_tiles=True))
+
+    def test_published_rows_whose_tile_moved_are_listed(self):
+        tuner = _tuner()
+        row = {**_problem_row(), "backend": "triton", "config_digest": "sha256:old"}
+        with tempfile.TemporaryDirectory() as directory:
+            tune_file = Path(directory, "tuned.csv")
+            pd.DataFrame([row]).to_csv(tune_file, index=False)
+            with (
+                mock.patch.object(_TUNER, "triton_config", return_value=TILE),
+                mock.patch("builtins.print") as printed,
+            ):
+                tuner._report_moved_digests(_tiles_args(tune_file=str(tune_file)))
+        text = " ".join(str(c.args) for c in printed.call_args_list)
+        self.assertIn("1 published Triton rows", text)
+
+
 class TestPublish(unittest.TestCase):
     """One shape through GatedTuner, with the fresh-process proof stubbed."""
 

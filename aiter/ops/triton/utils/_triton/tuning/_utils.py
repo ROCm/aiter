@@ -5,6 +5,7 @@
 import glob
 import json
 import os
+import sys
 
 FINAL_STATUSES = ("ok", "error", "crashed", "hung")
 TOP_BUCKET_M = 8192  # --all-buckets sweeps the family's M_LEQ buckets up to here
@@ -23,8 +24,14 @@ def config_key(config):
     return "baseline" if config is None else json.dumps(config, sort_keys=True)
 
 
+GEMM_DIMS = ("B", "M", "N", "K")
+
+
 def shape_tag(shape):
-    return "-".join(f"{d}={shape[d]}" for d in ("B", "M", "N", "K") if d in shape)
+    """GEMM dims in B, M, N, K order, then any other family's dims by name."""
+    dims = [d for d in GEMM_DIMS if d in shape]
+    dims += sorted(d for d in shape if d not in GEMM_DIMS)
+    return "-".join(f"{d}={shape[d]}" for d in dims)
 
 
 def results_path(runs_dir, arch, backend, kernel, shape):
@@ -44,23 +51,25 @@ def final_results_path(out):
     return out[: -len(".jsonl")] + ".final.jsonl"
 
 
-def results_files(runs_dir, arch, backend, kernel, shape_nk):
-    """All per-M result files of one (kernel, backend, N, K[, B])."""
-    pattern = results_path(runs_dir, arch, backend, kernel, dict(shape_nk, M="*"))
+def results_files(runs_dir, arch, backend, kernel, shape_nk, bucket_dim="M"):
+    """All per-bucket-value result files of one (kernel, backend, shape without the bucket dim)."""
+    pattern = results_path(
+        runs_dir, arch, backend, kernel, dict(shape_nk, **{bucket_dim: "*"})
+    )
     return sorted(glob.glob(pattern))
 
 
-def specialized_filename(config_name, shape):
+def specialized_filename(config_name, shape, file_dims=("B", "N", "K")):
     """<CONFIG>-[B=..-]N=..-K=..json, the file get_gemm_config() looks up for this shape."""
-    dims = "-".join(f"{d}={shape[d]}" for d in ("B", "N", "K") if d in shape)
+    dims = "-".join(f"{d}={shape[d]}" for d in file_dims if d in shape)
     return f"{config_name}-{dims}.json"
 
 
-def bucket_for(M, bounds):
-    """M_LEQ_<smallest bound >= M>, the bucket get_gemm_config() picks; None above the largest bound."""
+def bucket_for(value, bounds, bucket_dim="M"):
+    """<dim>_LEQ_<smallest bound >= value>, the bucket the loader picks; None above the largest."""
     for bound in bounds:
-        if M <= bound:
-            return f"M_LEQ_{bound}"
+        if value <= bound:
+            return f"{bucket_dim}_LEQ_{bound}"
     return None
 
 
@@ -105,30 +114,54 @@ def read_records(path):
     return records
 
 
-def add_shape_args(parser, with_m=True, multi_m=False):
-    parser.add_argument("--B", type=int, help="batch, batched kernels only")
-    if with_m:
-        parser.add_argument(
-            "--M", type=int, required=True, nargs="+" if multi_m else None
-        )
-    parser.add_argument("--N", type=int, required=True)
-    parser.add_argument(
-        "--K",
-        type=int,
-        required=True,
-        help="logical K, as the input generators take it",
+DIM_HELP = {
+    "B": "batch, batched kernels only",
+    "K": "logical K, as the input generators take it",
+}
+
+
+def add_shape_args(parser, specs, with_bucket=True, multi_bucket=False):
+    """--<dim> for every dim of every kernel; shape_from_args checks the kernel's own.
+
+    A bucket dim (M for GEMM) is left out without with_bucket and takes several values
+    with multi_bucket.
+    """
+    bucket_dims = {spec.bucket_dim for spec in specs}
+    for dim in dict.fromkeys(d for spec in specs for d in spec.dims):
+        if dim in bucket_dims and not with_bucket:
+            continue
+        nargs = "+" if dim in bucket_dims and multi_bucket else None
+        parser.add_argument(f"--{dim}", type=int, nargs=nargs, help=DIM_HELP.get(dim))
+
+
+def shape_from_args(args, spec, value=None, with_bucket=True):
+    """The kernel's shape in its dims order; value replaces the bucket dim.
+
+    Without with_bucket the bucket dim is left out (the installer's shape).
+    """
+    stray = sorted(
+        d
+        for d, v in vars(args).items()
+        if d.isupper() and v is not None and d not in spec.dims
     )
-
-
-def shape_from_args(args, dims, M=None):
-    if ("B" in dims) != (args.B is not None):
-        raise SystemExit(
-            "--B is required for batched kernels and not accepted otherwise"
+    if stray:
+        _usage_error(
+            f"{spec.name} takes --{' --'.join(spec.dims)}, not --{' --'.join(stray)}"
         )
-    shape = {"B": args.B} if "B" in dims else {}
-    if M is not None:
-        shape["M"] = M
-    elif getattr(args, "M", None) is not None:
-        shape["M"] = args.M
-    shape.update(N=args.N, K=args.K)
+    shape = {}
+    for dim in spec.dims:
+        given = getattr(args, dim, None)
+        if dim == spec.bucket_dim:
+            if not with_bucket:
+                continue
+            given = value if value is not None else given
+        if given is None:
+            _usage_error(f"{spec.name} needs --{dim}")
+        shape[dim] = given
     return shape
+
+
+def _usage_error(message):
+    """Exit as argparse does on a usage error (status 2), which scripts check."""
+    print(f"error: {message}", file=sys.stderr)
+    raise SystemExit(2)

@@ -32,17 +32,21 @@ here. Update this file in the same change as any behaviour change.
    `if ...: continue` checks. When the kernel rejects every tile that fits the shape, `build_space`
    allows block sizes above the shape for that M (`oversized_tiles_allowed` in the plan). `gluon_candidates` is only for a key whose meaning differs under
    gluon (gfx1250 a8w8 blockscale `num_stages` is `NUM_BUFFERS`).
-4. Results always install into `resolve_config_dir(op, config_name, backend)`. No export directory,
-   no dry run.
+4. Results always install into `resolve_config_dir(spec.op, config_name, backend)`. No export
+   directory, no dry run.
 5. The installed file is seeded with this shape's file if it exists (keeping every bucket it does
    not replace), else it starts with only `"DEFAULT_FALLBACK": true` and `DEFAULT.json`'s
    `M_BOUNDS`: never copy untuned buckets (another shape's or `DEFAULT.json`'s) into a shape file.
+   M here and below is the family's `bucket_dim` (`SK` for MHA, with `SK_LEQ_*` and
+   `SK_BOUNDS`).
    The loader serves the buckets a `DEFAULT_FALLBACK` file lacks from `DEFAULT.json`. Bounds: the
-   kernel's explicit `bounds`, else the seed's `M_BOUNDS`, else `STANDARD_M_BOUNDS`.
+   kernel's explicit `bounds`, else the seed's `<bucket_dim>_BOUNDS`, else `STANDARD_M_BOUNDS`.
    `--all-buckets` only chooses the M list (the family's buckets up to `TOP_BUCKET_M`, 8192). Ms
-   above the largest bound are not tuned. Every installed file ships an `any`: a copy of
+   above the largest bound are not tuned. Every installed GEMM file ships an `any`: a copy of
    `DEFAULT.json`'s `any`, rewritten on every install (the one bucket copied from `DEFAULT.json`;
-   a tuned small-M tile as fallback breaks kernels such as MXFP4 preshuffle at M >= 32).
+   a tuned small-M tile as fallback breaks kernels such as MXFP4 preshuffle at M >= 32); a GEMM
+   `DEFAULT.json` without one is an error. MHA's `DEFAULT.json` has no `any`, so an MHA file
+   ships none, and a key past its largest bucket gets the `DEFAULT.json` rules.
    `DEFAULT.json` is never written, so its `any` never changes; only `M_LEQ_*` buckets are tuned;
    `kpack` is dropped outside gfx942 and `persistent` always. After writing, clear both loader
    caches and re-resolve every swept M; `is_tuned` must be True, otherwise the previous file is
@@ -84,6 +88,12 @@ generator, preallocates the output, and returns `(call, inputs, should_skip)`;
 resets and derived keys live in `call`. Keep everything about a kernel inside that one function;
 the `kernels.py` docstring has a complete example. Then run the checks below.
 
+A family outside GEMM also sets the spec fields that default to GEMM: `op`, `bucket_dim`,
+`file_dims`, `resolver` (its own loader, returning `(config, is_tuned)`), `default_buckets` (which
+`DEFAULT.json` entries carry the keys), `flop_count` and `tile_dims`, and adds its values to
+`OP_SEARCH_SPACE` in `space.py`. `should_skip_generic` is GEMM's and is not applied to other ops.
+`mha_varlen_fwd` is the example.
+
 ## Adding a key
 
 Add it to `SEARCH_SPACE`; add an alias if a family spells it differently. Nothing else.
@@ -107,6 +117,7 @@ Add it to `SEARCH_SPACE`; add an alias if a family spells it differently. Nothin
     python3 sweep_configs.py gemm_afp4wfp4_preshuffle --M 4 64 --N 256 --K 512 --gpu 0 --runs-dir /tmp/runs
     python3 sweep_configs.py gemm_afp4wfp4_preshuffle --all-buckets --N 256 --K 512 --gpu 0 1 2 3 --runs-dir /tmp/runs2
     python3 verify_configs.py gemm_afp4wfp4_preshuffle --M 64 --N 256 --K 512 --expect-tuned
+    HIP_VISIBLE_DEVICES=0 python3 harness.py mha_varlen_fwd --Z 2 --HQ 8 --HK 8 --SQ 2048 --SK 2048 --DQ 128 --DV 128 --CAUSAL 1 --plan --space-out /tmp/m.json
     # then delete the test file configs/gfx1250/gluon/gemm/gemm_afp4wfp4_preshuffled/GEMM-AFP4WFP4_PRESHUFFLED-N=256-K=512.json
 
 ## Do not

@@ -9,6 +9,7 @@ import sys
 from _utils import add_shape_args, shape_from_args
 from harness import make_cold_copies, time_with_cuda_graph
 from kernels import (
+    KERNELS,
     check_backend,
     ensure_repo_on_path,
     flops,
@@ -20,7 +21,7 @@ from kernels import (
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("kernel", type=get_spec)
-    add_shape_args(parser)
+    add_shape_args(parser, KERNELS.values())
     parser.add_argument("--backend", choices=("triton", "gluon"))
     parser.add_argument("--replays", type=int, default=25)
     parser.add_argument("--calls", type=int, default=24)
@@ -33,7 +34,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     spec = args.kernel
-    shape = shape_from_args(args, spec.dims)
+    shape = shape_from_args(args, spec)
     ensure_repo_on_path()
     from aiter.ops.triton.utils._triton import arch_info
     from aiter.ops.triton.utils.config_utils import resolve_config_dir
@@ -42,7 +43,7 @@ def main(argv=None):
     backend = args.backend or spec.default_backend(arch)
     check_backend(spec, arch, backend)
     config, is_tuned = resolve_installed(spec, shape, backend)
-    config_dir = resolve_config_dir("gemm", spec.config_name, backend=backend)
+    config_dir = resolve_config_dir(spec.op, spec.config_name, backend=backend)
     print(f"config dir: {config_dir}")
     print(f"backend {backend}, arch {arch}, shape {shape}, is_tuned {is_tuned}")
     print(f"config: {json.dumps(config)}")
@@ -53,7 +54,7 @@ def main(argv=None):
         call, None, copies, args.calls, args.replays
     )
     print(
-        f"time: {median:.3f} us (min {low:.3f}, max {high:.3f}), {flops(shape) / median / 1e6:.1f} TFLOPS, "
+        f"time: {median:.3f} us (min {low:.3f}, max {high:.3f}), {flops(spec, shape) / median / 1e6:.1f} TFLOPS, "
         f"{len(copies)} cold copies"
     )
     if args.expect_tuned and not is_tuned:
