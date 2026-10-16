@@ -435,10 +435,9 @@ WorkOrder work_order()
 }
 
 // Order and pack in a single launch, by counting each entry's rank rather than moving entries past
-// each other. The key carries the whole ordering: the count (divided by bucket, 1 for an exact
-// order) is complemented into the high half so longer LUTs come first, and the slot index sits in
-// the low half, which breaks ties toward raster order and so makes uniform counts come out as the
-// identity permutation.
+// each other. The key carries the whole ordering: the count is complemented into the high half so
+// longer LUTs come first, and the slot index sits in the low half, which breaks ties toward raster
+// order and so makes uniform counts come out as the identity permutation.
 //
 // Because the slot index makes every key distinct, an entry's rank is exactly the number of keys
 // below it. That is a permutation with no tie-breaking pass, and it is stable by definition.
@@ -457,14 +456,13 @@ __global__ void rank_and_pack_work_table_kernel(int32_t* __restrict__ table,
                                                 const int32_t total,
                                                 const int32_t q_tiles,
                                                 const int32_t nhead,
-                                                const int32_t bucket,
                                                 const int32_t order)
 {
     __shared__ uint64_t keys[kWorkTableFusedMax];
 
     for(int32_t slot = threadIdx.x; slot < total; slot += blockDim.x)
     {
-        const uint32_t level = static_cast<uint32_t>(lut_count[slot] / bucket);
+        const uint32_t level = static_cast<uint32_t>(lut_count[slot]);
         if(order == static_cast<int32_t>(WorkOrder::HeadLocal))
         {
             // (batch, head) in the top 16 bits, the complemented level below it; batch < 256 and
@@ -503,8 +501,7 @@ at::Tensor
 build_sorted_work_table(const at::Tensor& lut_count,
                         int64_t batch,
                         int64_t nhead,
-                        int64_t q_tiles,
-                        int64_t bucket = 1)
+                        int64_t q_tiles)
 {
     auto flat           = lut_count.reshape({-1}).contiguous();
     const int64_t total = batch * nhead * q_tiles;
@@ -525,9 +522,6 @@ build_sorted_work_table(const at::Tensor& lut_count,
     auto table               = at::empty({total}, flat.options().dtype(at::kInt));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
     const WorkOrder order    = work_order();
-    // Within one head the coarse levels only existed to stop the sort from scattering heads.
-    if(order == WorkOrder::HeadLocal)
-        bucket = 1;
 
     if(total <= kWorkTableFusedMax)
     {
@@ -541,7 +535,6 @@ build_sorted_work_table(const at::Tensor& lut_count,
             static_cast<int32_t>(total),
             static_cast<int32_t>(q_tiles),
             static_cast<int32_t>(nhead),
-            static_cast<int32_t>(bucket),
             static_cast<int32_t>(order));
         return table;
     }
@@ -558,10 +551,7 @@ build_sorted_work_table(const at::Tensor& lut_count,
         permutation      = at::argsort(key, /*stable=*/true, /*dim=*/0, /*descending=*/false);
     }
     else
-        permutation = at::argsort(bucket > 1 ? at::floor_divide(flat, bucket) : flat,
-                                  /*stable=*/true,
-                                  /*dim=*/0,
-                                  /*descending=*/true);
+        permutation = at::argsort(flat, /*stable=*/true, /*dim=*/0, /*descending=*/true);
     constexpr int32_t block_size = 256;
     const dim3 grid(static_cast<uint32_t>((total + block_size - 1) / block_size));
     pack_work_table_kernel<<<grid, dim3(block_size), 0, stream>>>(table.data_ptr<int32_t>(),

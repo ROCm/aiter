@@ -254,6 +254,28 @@ def test_mha_v4_block_mask_without_a_sparse_row_names_the_recipe():
     with pytest.raises(NotImplementedError, match="has no .* row for"):
         mha_v4(q, q, q, foreign, foreign, foreign, block_mask=mask)
 
+    packed = q.cuda()
+    lut = torch.zeros(2, device="cuda", dtype=torch.int32)
+    per_tensor = AttentionScaleMode.F32_PER_TENSOR
+    with pytest.raises(NotImplementedError, match="has no .* row for"):
+        mha_v4_packed(
+            packed,
+            packed,
+            packed,
+            packed,
+            packed,
+            packed,
+            foreign,
+            foreign,
+            foreign,
+            per_tensor,
+            per_tensor,
+            per_tensor,
+            kv_block_indices=lut,
+            lut_start=lut,
+            lut_count=lut,
+        )
+
 
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse schema")
 def test_mha_v4_sparse_schema_mutates_only_out():
@@ -359,6 +381,41 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
 
     visited = _unpack_work_table(table, nhead, q_tiles)
     assert torch.equal(visited, torch.arange(total, device="cuda"))
+
+
+# Either side of the 8192-entry hand-off to ATen, which builds each order separately.
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@pytest.mark.parametrize(("batch", "nhead", "q_tiles"), [(2, 5, 7), (8, 32, 64)])
+@pytest.mark.parametrize("pattern", ["random", "wide_random", "uniform"])
+@pytest.mark.parametrize("order", ["lpt", "head", "raster"])
+def test_mha_v4_sparse_work_table_follows_the_work_order(
+    monkeypatch, batch, nhead, q_tiles, pattern, order
+):
+    """AITER_MHA_V4_WORK_ORDER picks the whole permutation, ties included."""
+    torch.manual_seed(7)
+    total = batch * nhead * q_tiles
+    counts = _work_table_counts(total, pattern)
+    monkeypatch.setenv("AITER_MHA_V4_WORK_ORDER", order)
+
+    table = mha_v4_sparse_work_table(counts, batch, nhead, q_tiles)
+
+    lengths = counts.tolist()
+    key = {
+        "lpt": lambda slot: (-lengths[slot], slot),
+        # (batch, head) groups in raster order, longest LUT first within each.
+        "head": lambda slot: (slot // q_tiles, -lengths[slot], slot),
+        "raster": lambda slot: slot,
+    }[order]
+    visited = _unpack_work_table(table, nhead, q_tiles).tolist()
+    assert visited == sorted(range(total), key=key)
+
+
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+def test_mha_v4_sparse_work_table_rejects_an_unknown_work_order(monkeypatch):
+    monkeypatch.setenv("AITER_MHA_V4_WORK_ORDER", "fastest")
+    counts = torch.ones(4, device="cuda", dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="must be lpt, head or raster"):
+        mha_v4_sparse_work_table(counts, 1, 1, 4)
 
 
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")

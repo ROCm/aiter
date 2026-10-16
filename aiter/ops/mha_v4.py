@@ -241,8 +241,8 @@ def mha_v4_block_tile(operands=None, mode=None) -> tuple[int, int]:
     """Return the default block-sparse (q_tile, kv_tile) for a recipe on the active GPU.
 
     The default is that recipe's geometry at _MHA_V4_Q_TILE. An arch may ship a finer one -- gfx950
-    also has 64x64 FP8, BF16 and BF16/FP8 rows, for models routed more finely than their Q tile --
-    and mha_v4_block_tiles() lists every geometry a recipe has.
+    also has a 64x64 row for every recipe, for models routed more finely than their Q tile -- and
+    mha_v4_block_tiles() lists every geometry a recipe has.
 
     `operands` is not optional in practice on gfx950, because its rows no longer agree on the KV
     tile at this Q tile: BF16 and BF16/FP8 route on 64 tokens and everything else on 128. Asking
@@ -262,12 +262,12 @@ def mha_v4_kv_tile_for_q_tile(q_tile: int, operands=None, mode=None) -> int:
 
     Both filters are optional and both narrow what is being asked:
 
-    operands is what mha_v4_operands() builds -- the three formats and their three scale modes,
-    which together are what picks a manifest row. It matters wherever the answer is not the default
-    geometry, because an arch need not serve every geometry in every precision: gfx950's 64x64 rows
-    are FP8, BF16 and BF16/FP8 only, so asking without operands says 64x64 exists and asking with
-    MX ones says it does not. The scale modes are part of it and not an over-specification, since
-    the FP8 and MXFP8 rows take the same three formats and differ only there.
+    operands is what mha_v4_operands() builds -- the three formats, their three scale modes and V's
+    packing, which together are what picks a manifest row. It matters because an arch need not
+    serve every geometry in every precision: gfx942 has 256x64 rows for FP8 and INT8/FP8 only, so
+    asking without operands says 256x64 exists and asking with BF16 ones says it does not. The
+    scale modes are part of it and not an over-specification, since the FP8 and MXFP8 rows take
+    the same three formats and differ only there.
 
     mode picks one of MHA_V4_BLOCK_SPARSE_MODES instead of answering for all of them. Left None
     the modes are intersected rather than unioned, since a caller shaping a mask has not yet chosen
@@ -1278,7 +1278,12 @@ def mha_v4_packed(
             if block_tile is None
             else tuple(block_tile)
         )
-        if mha_v4_kv_tile_for_q_tile(q_tile, operands, mode) != kv_tile:
+        if block_tile is None and kv_tile == 0:
+            raise NotImplementedError(
+                f"block-sparse MHA v4 has no {get_gfx()} row for "
+                f"Q={q_format.name} K={k_format.name} V={v_format.name}"
+            )
+        if kv_tile <= 0 or mha_v4_kv_tile_for_q_tile(q_tile, operands, mode) != kv_tile:
             raise ValueError(
                 f"sorted-sparse MHA v4 has no {q_tile}x{kv_tile} kernel on this GPU for "
                 f"q={q_format.name} k={k_format.name} v={v_format.name}; those operands have "
