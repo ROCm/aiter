@@ -14,11 +14,16 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.aot.flydsl.common import override_env, run_only_env
+from aiter.fhmoe_contract import FHMOE_BUFFER_MAX_BYTES
 from aiter.fused_moe import (
+    _flydsl_route_output_nbytes,
+    _is_flydsl_stage2,
+    _stage2_runtime_uses_route_reduce,
     fused_moe,
     fused_topk,
     get_2stage_cfgs,
     get_padded_M,
+    resolve_activation_dtype,
     torch_moe_stage1,
     torch_moe_stage2,
 )
@@ -1052,6 +1057,86 @@ def _moe_2stage_reference_workspace_gib(kwargs):
     )
 
 
+def _moe_2stage_route_workspace_skip_reason(kwargs):
+    """Return a reason when effective route-reduce exceeds 32-bit addressing."""
+    token = kwargs["token"]
+    model_dim = kwargs["model_dim"]
+    topk = kwargs["topk"]
+    q_dtype_a = resolve_activation_dtype(
+        kwargs["qType"],
+        kwargs["WQDType"],
+        activation=kwargs["actType"],
+        gate_mode=kwargs["gateMode"],
+        M=token,
+        hidden_dtype=kwargs["dtype"],
+        gfx=get_gfx(),
+    )
+    if q_dtype_a is None:
+        return None
+    is_shuffled = not (
+        kwargs["WQDType"] == dtypes.fp4x2
+        and kwargs["AQDType"] == dtypes.fp4x2
+        and not kwargs.get("preshuffle", False)
+    )
+    supports_expert_bias = (
+        kwargs["qType"] == aiter.QuantType.per_1x32
+        and kwargs["WQDType"] == dtypes.fp4x2
+        and kwargs["AQDType"] in (dtypes.bf16, dtypes.fp16, dtypes.fp8)
+        and kwargs["actType"] != aiter.ActivationType.Situv2
+    )
+    try:
+        metadata = get_2stage_cfgs(
+            get_padded_M(token),
+            model_dim,
+            kwargs["inter_dim"],
+            kwargs["E"],
+            topk,
+            kwargs["dtype"],
+            q_dtype_a,
+            kwargs["WQDType"],
+            kwargs["qType"],
+            kwargs["use_g1u1"],
+            kwargs["actType"],
+            kwargs["doweight_stage1"],
+            kwargs.get("hidden_pad", 0),
+            kwargs.get("intermediate_pad", 0),
+            is_shuffled,
+            kwargs["gateMode"],
+            situ_beta=kwargs.get("beta", 1.0),
+            situ_linear_beta=kwargs.get("linear_beta", 1.0),
+            swiglu_limit=kwargs.get("swiglu_limit"),
+            opus_weights_shuffled=is_shuffled,
+            has_stage1_bias=supports_expert_bias,
+            has_stage2_bias=(
+                supports_expert_bias and not kwargs.get("disable_stage2_bias", False)
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        aiter.logger.warning(
+            "moe_2stage: failed to resolve stage2 mode during preflight; "
+            "continuing to runtime validation: %s",
+            exc,
+        )
+        return None
+    if not _is_flydsl_stage2(metadata.stage2):
+        return None
+    if not _stage2_runtime_uses_route_reduce(metadata.stage2, token, model_dim):
+        return None
+    route_bytes = _flydsl_route_output_nbytes(
+        metadata.stage2,
+        token,
+        topk,
+        model_dim,
+        torch.empty((), dtype=kwargs["dtype"]).element_size(),
+    )
+    if route_bytes <= FHMOE_BUFFER_MAX_BYTES:
+        return None
+    return (
+        f"FlyDSL stage2 reduce workspace {route_bytes / (1024**3):.1f} GiB "
+        "exceeds the current 32-bit buffer-addressing limit"
+    )
+
+
 def _format_moe_2stage_case(kwargs):
     return (
         f"token={kwargs['token']}, dim=({kwargs['model_dim']},{kwargs['inter_dim']}), "
@@ -1062,6 +1147,10 @@ def _format_moe_2stage_case(kwargs):
 
 
 def _moe_2stage_skip_reason(kwargs):
+    route_workspace_reason = _moe_2stage_route_workspace_skip_reason(kwargs)
+    if route_workspace_reason is not None:
+        return route_workspace_reason
+
     # Set AITER_MOE_2STAGE_MAX_FREE_MEMORY_FRACTION=0 to run manually.
     max_free_memory_fraction = float(
         os.environ.get("AITER_MOE_2STAGE_MAX_FREE_MEMORY_FRACTION", "0.8")
