@@ -160,25 +160,7 @@ def _make_inputs(
     ).uniform_(-0.5, 0.5)
     value = torch.empty_like(key).uniform_(-0.5, 0.5)
 
-    if pattern == "token_scales":
-        # Vary K/V scales independently across both tokens and pages. Large
-        # invisible V rows must not set the visible window's FP8 P scale.
-        positions = torch.arange(page_size, device=device)
-        key.mul_(torch.pow(2.0, (positions % 5 - 2).float())[None, None, :, None])
-        value.mul_(torch.pow(2.0, (positions % 7 - 8).float())[None, None, :, None])
-        key[::2].mul_(0.25)
-        value[::2].mul_(4.0)
-    elif pattern == "window_scales":
-        # At window=1 only each query's own token is visible. Poison older
-        # rows in the same compute tile: their V scales must be masked before
-        # selecting the shared normalization for all query rows.
-        query.zero_()
-        key.zero_()
-        value.fill_(2**16)
-        for seq, length in enumerate(lengths):
-            for token in range(max(0, length - query_length), length):
-                value[table[seq, token // page_size], :, token % page_size] = 0.25
-    elif pattern == "constant":
+    if pattern == "constant":
         query.zero_()
         key.zero_()
         value.fill_(0.5)
@@ -357,9 +339,8 @@ _BF16_CASES = _COMMON_CASES + [
         for dim in (256, 128)
     ],
 ]
-# FP8 head 256, page 64, uniform query length with at most 32 query rows:
-# the gfx950 pipe. Packed caches also cover both scale/V modes and windows.
-# CU-count budgets and a plan-independent
+# FP8 per-tensor head 256, page 64, plain V, uniform query length with at most
+# 32 query rows: the gfx950 pipe. Dense CU-count budgets and a plan-independent
 # staging bound select its specialization; other architectures run the same
 # cases on the generic path.
 _PIPE_BASE = {
@@ -373,98 +354,6 @@ _PIPE_BASE = {
 }
 _NHD_BASE = {**_PIPE_BASE, "layout": "nhd"}
 _PIPE_CASES = [
-    *[
-        (
-            f"d256-{mode}-{'transposed' if trans_v else 'plain'}-q{query_length}-w{window}",
-            {
-                **_PIPE_BASE,
-                "scale_mode": mode,
-                "trans_v": trans_v,
-                "query_length": query_length,
-                "window": window,
-                "lengths": (0, 1, 65, 257, 258, 1027, 8258),
-                "max_partitions": 8,
-                "pattern": "token_scales" if mode == "per-token" else "random",
-                "capture": mode == "per-token" and trans_v and query_length == 4,
-            },
-        )
-        for mode, trans_v, query_length, window in product(
-            ("per-tensor", "per-token"), (False, True), (1, 2, 4), (0, 257)
-        )
-    ],
-    *[
-        (
-            f"d256-per-token-transposed-q3-w{window}-low-budget",
-            {
-                **_PIPE_BASE,
-                "scale_mode": "per-token",
-                "trans_v": True,
-                "query_length": 3,
-                "window": window,
-                "lengths": (0, 1, 2, 3, 5, 255, 256, 257, 8258),
-                "max_partitions": 2,
-                "budget": 1,
-                "pattern": "token_scales",
-                "query_dtype": torch.float16,
-            },
-        )
-        for window in (1, 255, 256, 8193)
-    ],
-    *[
-        (
-            f"d256-per-token-hkv2-g{group}-q{qlen}-{'transposed' if trans_v else 'plain'}",
-            {
-                **_PIPE_BASE,
-                "scale_mode": "per-token",
-                "trans_v": trans_v,
-                "query_length": qlen,
-                "group_size": group,
-                "kv_heads": 2,
-                "window": 257,
-                "lengths": (0, 1, 258, 1027),
-                "max_partitions": 4,
-                "pattern": "token_scales",
-                "sink_dtype": torch.float32,
-                "capture": True,
-            },
-        )
-        for group, qlen in ((4, 4), (16, 2), (32, 1))
-        for trans_v in (False, True)
-    ],
-    *[
-        (
-            f"d256-per-token-window-scales-{'transposed' if trans_v else 'plain'}",
-            {
-                **_PIPE_BASE,
-                "scale_mode": "per-token",
-                "trans_v": trans_v,
-                "query_length": 4,
-                "window": 1,
-                "lengths": (0, 1, 258, 1027),
-                "max_partitions": 2,
-                "pattern": "window_scales",
-            },
-        )
-        for trans_v in (False, True)
-    ],
-    *[
-        (
-            f"d256-{mode}-{'transposed' if trans_v else 'plain'}-unstaged-q4",
-            {
-                **_PIPE_BASE,
-                "scale_mode": mode,
-                "trans_v": trans_v,
-                "query_length": 4,
-                "lengths": (0, 1, 65, 257, 1027),
-                "max_partitions": 1,
-                "budget": 1,
-                "table_width": 20000,
-                "max_context": None,
-                "staged": False,
-            },
-        )
-        for mode, trans_v in product(("per-tensor", "per-token"), (False, True))
-    ],
     # At GQA 8, query length q gives 8 * q rows: one M-tile at 1 and 2 (1 pads
     # it), two at 3 and 4 (3 pads the second). Lengths put some row's causal
     # edge on a page or tile boundary, and lengths below q leave rows empty.
@@ -978,15 +867,6 @@ def test_pa_decode(case, device, monkeypatch):
             output.fill_(float("nan"))
             graph.replay()
             check()
-        if case["pipe"] and case["scale_mode"] == "per-token":
-            # Replay must reload scales, including independently changed K/V.
-            key_scale.mul_(0.5)
-            value_scale.mul_(2.0)
-            logical_key.mul_(0.5)
-            logical_value.mul_(2.0)
-            output.fill_(float("nan"))
-            graph.replay()
-            check()
 
 
 def test_stage_bound_covers_plan(device):
@@ -1009,46 +889,6 @@ def test_stage_bound_covers_plan(device):
             batch, plan.capacity, plan.max_partitions, max_length
         )
         assert spans.max().item() <= bound
-
-
-@pytest.mark.parametrize("window", [1, 255, 256, 257, 8193])
-def test_d256_window_stage_bound(device, window):
-    """Staging covers ragged window plans at small budgets and after refresh."""
-    from aiter.ops.flydsl.kernels.pa_decode.traits import stage_page_capacity
-    from aiter.ops.flydsl.kernels.pa_decode_plan import plan_pa_decode
-
-    lengths = torch.tensor([0, 1, 257, 8258, 2**20], dtype=torch.int32, device=device)
-    for budget in (1, 16, 256):
-        plan = plan_pa_decode(
-            lengths,
-            1,
-            max_partitions=8,
-            workgroup_budget=budget,
-            sliding_window=window,
-            query_length=4,
-        )
-        staged = stage_page_capacity(
-            lengths.numel(),
-            plan.capacity,
-            plan.max_partitions,
-            2**20,
-            64,
-            sliding_window=window,
-            query_length=4,
-        )
-        spans = plan.work_info[:, 2] - plan.work_info[:, 1]
-        assert staged > 0
-        assert spans.max().item() * 4 <= staged
-        reversed_lengths = lengths.flip(0)
-        plan_pa_decode(
-            reversed_lengths,
-            1,
-            plan=plan,
-            sliding_window=window,
-            query_length=4,
-        )
-        spans = plan.work_info[:, 2] - plan.work_info[:, 1]
-        assert spans.max().item() * 4 <= staged
 
 
 def test_pa_decode_nhd_rejected(device, monkeypatch):

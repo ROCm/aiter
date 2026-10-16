@@ -662,11 +662,8 @@ def pa_decode(
                 kv_dtype,
                 head_dim,
                 block_size,
-                trans_v,
-                per_token_kv,
                 query_length,
                 query_group_size,
-                sliding_window,
             )
         ):
             raise NotImplementedError(

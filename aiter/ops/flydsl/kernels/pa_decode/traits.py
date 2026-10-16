@@ -46,11 +46,8 @@ def d256_pipe(
     kv_dtype,
     head_dim,
     block_size,
-    trans_v,
-    per_token_kv,
     query_length,
     query_group_size,
-    sliding_window,
 ) -> bool:
     """gfx950 FP8 head 256, page 64, <= two M-tiles.
 
@@ -314,11 +311,8 @@ class PaDecodeSchedule:
             kv_dtype,
             head_dim,
             block_size,
-            trans_v,
-            per_token_kv,
             query_length,
             query_group_size,
-            sliding_window,
         )
         if nhd_layout and (not D256_PIPE or per_token_kv or sliding_window > 0):
             raise NotImplementedError(
