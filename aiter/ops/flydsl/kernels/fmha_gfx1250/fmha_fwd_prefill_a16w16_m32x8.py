@@ -825,9 +825,9 @@ def _core_attention(
         )
         q_frags = q_mgr.load_q_to_vgpr_part2(scale=softmax_scale)
         for _v in k_views:
-            fx.copy_atom_call(*_v)
+            fx.copy(*_v)
         for _v in v_views:
-            fx.copy_atom_call(*_v)
+            fx.copy(*_v)
         rocdl.s_wait_tensorcnt(0)
         gpu.barrier()
     else:
@@ -1030,9 +1030,9 @@ def _core_attention(
                     if USE_TDM_LOADER:
                         k_views, v_views = addr
                         for _v in k_views:
-                            fx.copy_atom_call(*_v)
+                            fx.copy(*_v)
                         for _v in v_views:
-                            fx.copy_atom_call(*_v)
+                            fx.copy(*_v)
                     else:
                         k_g, k_l, k_i, v_g, v_l, v_i = addr
                         _async_load_to_lds(k_g, k_l, cluster=True, imm_offs=k_i)
