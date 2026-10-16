@@ -1,3 +1,5 @@
+import contextlib
+
 import triton
 
 
@@ -25,6 +27,20 @@ def get_arch():
     if _CACHED_ARCH is None:
         _CACHED_ARCH = _probe_arch()
     return _CACHED_ARCH
+
+
+@contextlib.contextmanager
+def no_async_copy_on_gfx1250():
+    # On gfx1250, async copy lowers masked loads to global_load_async_to_lds,
+    # which has no bounds check and faults the GPU. The knob is part of Triton's
+    # compile cache key, so kernels launched outside this scope keep async copy.
+    amd_knobs = getattr(triton.knobs, "amd", None)
+    if get_arch() != "gfx1250" or not hasattr(amd_knobs, "use_async_copy"):
+        yield
+        return
+    with amd_knobs.scope():
+        amd_knobs.use_async_copy = False
+        yield
 
 
 def is_gluon_avail():

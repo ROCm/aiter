@@ -18,7 +18,10 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16 import (
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_persistent import (
     gemm_a16w16_persistent_kernel_ as _triton_persistent_kernel,
 )
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils._triton.arch_info import (
+    get_arch,
+    no_async_copy_on_gfx1250,
+)
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
 from aiter.ops.triton.utils.gemm_config_utils import (
     compute_splitk_params,
@@ -67,6 +70,7 @@ def gemm_a16w16_fake_tensor(
 
 
 @torch_compile_guard(gen_fake=gemm_a16w16_fake_tensor)
+@no_async_copy_on_gfx1250()
 def gemm_a16w16_(
     x: torch.Tensor,
     w: torch.Tensor,

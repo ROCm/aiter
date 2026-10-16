@@ -97,6 +97,14 @@
       "TILE_SIZE_MIN": 32,
       "TILE_SIZE_MAX": 32
     },
+    "D_GEQ_256.DT_bf16_fp8": {
+      "BLOCK_M": 16,
+      "num_warps": 2,
+      "num_stages": 2,
+      "waves_per_eu": 2,
+      "TILE_SIZE_MIN": 16,
+      "TILE_SIZE_MAX": 64
+    },
     "D_GEQ_512": {
       "BLOCK_M": 16,
       "num_warps": 4,
