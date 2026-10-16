@@ -219,6 +219,26 @@ If a width is not built when a capture starts, the fused path declines it
 during the capture and logs a warning. The capture then records the unfused
 path. This is slower but correct.
 
+Step 3 compiles every rung that the family's payload window can select, not only
+the rung of the call itself. A capture at another payload size then finds every
+binary ready.
+
+#### Memory per width
+
+Each (family, hidden size) owns IPC inboxes, one for each rung, and nothing is
+freed until the engine closes. Measured with `inbox_bytes` on MI350P (PCIe), per
+GPU and per width:
+
+| TP | exact one-shot | quantized (mesh and ring) |
+|---|--:|--:|
+| 2 | 6 to 12 MiB | 2 to 8 MiB |
+| 4 | 21 to 42 MiB | 47 to 166 MiB |
+| 8 | 30 to 60 MiB | 10 to 20 MiB |
+
+The ranges cover hidden sizes 4096, 7168 and 8192. The quantized TP4 number at
+7168 is the largest. Set `AITER_FLY_AR_FUSED_HIDDENS` to the widths a model
+uses, so that no other width is built.
+
 
 ## Environment variables
 

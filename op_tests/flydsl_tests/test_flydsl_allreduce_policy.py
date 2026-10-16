@@ -569,6 +569,29 @@ def test_every_platform_has_one_fused_ladder_per_algorithm():
 
 
 @pytest.mark.parametrize("cell", CELLS)
+def test_fused_disabled_ring_is_reachable_by_env_override(cell):
+    """A fused family whose default window is empty keeps its ladder because
+    the window variables can enable it: the ring is off by default on xGMI and
+    at PCIe TP8, and ``AITER_FLY_AR_FUSED_MESH_MAX_BYTES`` plus
+    ``AITER_FLY_AR_FUSED_RING_MIN_BYTES`` turn it on. The ladder it then uses is
+    the table's, so the table must be well formed."""
+    link, ws, arch = cell
+    row = _fused_row(*cell)
+    if row.ring is not None and not row.ring.is_empty:
+        pytest.skip("the ring is on by default here")
+    boundary = 4 * max(row.mesh.min, 1 << 20)
+    env = {
+        f"{P.FUSED_ENV_PREFIX}_MESH_MAX_BYTES": str(boundary),
+        f"{P.FUSED_ENV_PREFIX}_RING_MIN_BYTES": str(boundary),
+    }
+    with mock.patch.dict(os.environ, env):
+        forced = P.resolve_fused_policy(world_size=ws, link=link, arch=arch)
+    assert forced.select(2 * boundary, quantized=True) == RING
+    rungs = fused_ring_st_ladder(world_size=ws, link=link, arch=arch)
+    assert rungs and rungs[0].min_bytes == 0
+
+
+@pytest.mark.parametrize("cell", CELLS)
 def test_fused_dispatch_is_monotone(cell):
     row = _fused_row(*cell)
     order = {ONESHOT: 0, None: 1, MESH: 2, RING: 3}
@@ -770,3 +793,64 @@ def test_resolve_fused_rejects_unknown_keys():
         _resolve_fused(ws=3)
     with pytest.raises(P.NoPolicyError):
         _resolve_fused(link="pcie", arch="gfx942")
+
+
+def _policy_agreement_rank(rank, init_method, queue):
+    """One rank: build the fused backend with a window override that only rank 1
+    has. The arch and link are fixed so the host does not matter; the ranks
+    meet in the agreement check, before any engine is built."""
+    import torch.distributed as dist
+
+    os.environ["AITER_FLY_AR"] = "1"
+    if rank == 1:
+        os.environ["AITER_FLY_AR_FUSED_ONESHOT_MAX_BYTES"] = str(1 << 20)
+    dist.init_process_group("gloo", init_method=init_method, world_size=2, rank=rank)
+    from aiter.dist.device_communicators import flydsl_backends as B
+
+    same = B.all_ranks_same(7, dist.group.WORLD)
+    differ = B.all_ranks_same(7 + rank, dist.group.WORLD)
+    builds = []
+
+    def fake_build(self, family):
+        builds.append(family)
+        raise RuntimeError("no GPU here")
+
+    with (
+        mock.patch("aiter.jit.utils.chip_info.get_gfx_runtime", return_value="gfx950"),
+        mock.patch.object(P, "detect_link", return_value="pcie"),
+        mock.patch.object(B.FlyDSLAllReduceRMSNorm, "_build", fake_build),
+    ):
+        backend = B.FlyDSLAllReduceRMSNorm(
+            group=dist.group.WORLD, device=torch.device("cpu"), quantized=False
+        )
+    queue.put((rank, same, differ, backend.disabled, builds))
+    dist.destroy_process_group()
+
+
+def test_fused_backend_declines_together_when_policies_differ():
+    """Ranks that resolved different windows must all decline, not deadlock in
+    the IPC exchange that building an engine starts."""
+    import torch.multiprocessing as mp
+
+    from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
+
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    init_method = get_distributed_init_method(get_ip(), get_open_port())
+    procs = [
+        ctx.Process(target=_policy_agreement_rank, args=(r, init_method, queue))
+        for r in range(2)
+    ]
+    for p in procs:
+        p.start()
+    got = sorted(queue.get(timeout=120) for _ in procs)
+    for p in procs:
+        p.join(timeout=60)
+        assert p.exitcode == 0
+    assert [(r, same, disabled) for r, same, _d, disabled, _b in got] == [
+        (0, True, True),
+        (1, True, True),
+    ]
+    assert not any(differ for _r, _s, differ, _d, _b in got)
+    # No rank started an engine build, which is the collective that hangs.
+    assert [builds for *_rest, builds in got] == [[], []]

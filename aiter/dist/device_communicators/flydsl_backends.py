@@ -6,6 +6,7 @@ The message size windows come from the fused policy, ``resolve_fused_policy``,
 and ``AITER_FLY_AR_FUSED_<ALG>_{MIN,MAX}_BYTES`` override them.
 """
 
+import hashlib
 import logging
 from typing import Any
 
@@ -36,6 +37,43 @@ def all_ranks_agree(ok: bool, group) -> bool:
     flag = torch.tensor([1 if ok else 0], dtype=torch.int32)
     dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
     return bool(flag.item())
+
+
+def all_ranks_same(value: int, group) -> bool:
+    """Whether every rank in group passes the same integer value."""
+
+    both = torch.tensor([value, -value], dtype=torch.int64)
+    dist.all_reduce(both, op=dist.ReduceOp.MAX, group=group)
+    return int(both[0]) == value == -int(both[1])
+
+
+_POLICY_DECLINED = 0
+
+
+def _policy_digest(
+    *, quantized: bool, link: str, arch: str, policy, world_size: int, hiddens
+) -> int:
+    """A number that is equal on two ranks exactly when they would build the
+    same engines in the same order.
+    """
+    parts = (
+        quantized,
+        link,
+        arch,
+        policy,
+        fly_policy.fused_oneshot_ladder(world_size=world_size, link=link, arch=arch),
+        fly_policy.fused_mesh_st_ladder(world_size=world_size, link=link, arch=arch),
+        fly_policy.fused_ring_st_ladder(world_size=world_size, link=link, arch=arch),
+        *(
+            fly_policy.fused_qr_row_atoms(
+                world_size=world_size, algorithm=alg, link=link, arch=arch
+            )
+            for alg in ("mesh", "ring")
+        ),
+        fly_policy.fused_hiddens(hiddens),
+    )
+    digest = hashlib.sha256(repr(parts).encode()).digest()
+    return int.from_bytes(digest[:8], "little") % ((1 << 62) - 1) + 1
 
 
 def preload_fly_engines(engines, *args) -> None:
@@ -115,18 +153,38 @@ class FlyDSLAllReduceRMSNorm:
             logger.debug("%s disabled: unsupported arch %s.", self._tag, arch)
             return
 
-        # The link and the policy are identical on every rank, so all ranks
-        # decline together.
+        # The link and the policy come from the environment of each process.
+        # Building an engine is a collective, so ranks that resolved different
+        # policies would deadlock in the IPC exchange. Every rank therefore
+        # sends a digest of what it would build (or a declined marker) first,
+        # and all of them proceed only when the digests are the same.
+        digest = _POLICY_DECLINED
         try:
             link = fly_policy.detect_link()
             policy = fly_policy.resolve_fused_policy(
                 world_size=world_size, arch=arch, link=link
             )
+            digest = _policy_digest(
+                quantized=self._quantized,
+                link=link,
+                arch=arch,
+                policy=policy,
+                world_size=world_size,
+                hiddens=hiddens,
+            )
         except fly_policy.NoPolicyError as e:
             logger.debug("%s disabled: %s", self._tag, e)
-            return
         except ValueError as e:
             logger.warning("%s disabled: %s", self._tag, e)
+        if not all_ranks_same(digest, group):
+            if digest != _POLICY_DECLINED:
+                logger.warning(
+                    "%s disabled: the ranks resolved different policies (check "
+                    "that the AITER_FLY_AR* variables are the same on every rank).",
+                    self._tag,
+                )
+            return
+        if digest == _POLICY_DECLINED:
             return
 
         self.group = group
