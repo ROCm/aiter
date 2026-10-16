@@ -30,9 +30,12 @@ import platform
 import subprocess
 from pathlib import Path
 
+import pytest
 import torch
 
 from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
+    compute_varctx_schedule,
+    default_varctx_parallel_unit_num,
     flydsl_pa_mqa_logits_fp4,
 )
 from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
@@ -438,6 +441,82 @@ def run_case(
                 outputs["strided"], outputs["dense"], rtol=0, atol=0
             )
     return records
+
+
+@pytest.mark.parametrize("next_n", (1, 2, 4, 5))
+def test_precomputed_decode_schedule_empty_windows(next_n: int) -> None:
+    """MTP masks preserve caller-owned output across stable-schedule replay."""
+    if get_arch() != "gfx950":
+        pytest.skip("FP4 MQA logits require gfx950")
+
+    batch, context = 2, 65
+    rows = batch * next_n
+    cache, table, q, qs, weights, q_dq, k_dq, _ = make_inputs(rows, context)
+    values, scales = vllm_fp4_cache_views(cache)
+    q = q.reshape(batch, next_n, *q.shape[1:])
+    qs = qs.reshape(batch, next_n, *qs.shape[1:])
+    table = table[:batch]
+    lengths = torch.full((batch,), context, dtype=torch.int32, device=dev)
+    total_ctas = default_varctx_parallel_unit_num(batch, context, next_n)
+    _, schedule, _ = compute_varctx_schedule(
+        lengths, BLOCK_K, total_ctas, context, next_n=next_n
+    )
+    out = torch.full((rows, context), GUARD, device=dev)
+    mapping = torch.arange(batch, device=dev, dtype=torch.int32).repeat_interleave(
+        next_n
+    )
+    offsets = torch.arange(next_n - 1, -1, -1, device=dev, dtype=torch.int32)
+
+    def launch():
+        return flydsl_pa_mqa_logits_fp4(
+            q,
+            qs,
+            values,
+            scales,
+            table,
+            weights,
+            lengths,
+            context,
+            next_n=next_n,
+            out=out,
+            cta_info=schedule,
+            total_ctas=total_ctas,
+        )
+
+    launch()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    for run in (launch, graph.replay):
+        for contexts in (
+            (0, 0),
+            (1, max(1, next_n - 1)),
+            (context, 1),
+            (context, context),
+        ):
+            lengths.copy_(torch.tensor(contexts, dtype=torch.int32, device=dev))
+            # Refresh in place: the captured kernel retains this schedule's address.
+            compute_varctx_schedule(
+                lengths,
+                BLOCK_K,
+                total_ctas,
+                context,
+                next_n=next_n,
+                cta_info_out=schedule,
+            )
+            out.fill_(GUARD)
+            run()
+            torch.cuda.synchronize()
+            ends = (lengths[:, None] - offsets[None, :]).clamp(min=0).flatten()
+            reference = ref_prefill_logits(
+                q_dq, k_dq, weights, mapping, torch.zeros_like(ends), ends, context
+            )
+            valid = torch.isfinite(reference)
+            torch.testing.assert_close(
+                out[valid], reference[valid], rtol=2e-4, atol=2e-3
+            )
+            assert bool((out[~valid] == GUARD).all())
 
 
 def test_small_stride_prefill_decode(graph: bool = False) -> None:
