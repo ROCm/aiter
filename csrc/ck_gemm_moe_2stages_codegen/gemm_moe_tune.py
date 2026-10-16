@@ -6718,6 +6718,22 @@ class FhmoeTuner(FmoeTuner):
         if hasattr(fmoe_module, "cfg_2stages_by_file"):
             fmoe_module.cfg_2stages_by_file.clear()
 
+    # _kernel_pairs only builds MXFP4-weight pairs; tuned_fhmoe.csv also holds
+    # HY4 FP8-weight rows owned by op_tests/tuners/tune_fhmoe.py.
+    _OWNED_Q_DTYPE_W = "torch.float4_e2m1fn_x2"
+
+    @classmethod
+    def _owned_rows(cls, df):
+        owned = df["q_dtype_w"].astype(str) == cls._OWNED_Q_DTYPE_W
+        skipped = int((~owned).sum())
+        if skipped:
+            print(
+                f"[fhmoe] skipping {skipped} non-MXFP4-weight rows "
+                "(tuned by op_tests/tuners/tune_fhmoe.py)",
+                flush=True,
+            )
+        return df[owned].reset_index(drop=True)
+
     @staticmethod
     def _parse_fhmoe_row(row):
         return {
@@ -7303,7 +7319,7 @@ class FhmoeTuner(FmoeTuner):
         from aiter.test_common import run_perftest
 
         results = []
-        for _, row in self.untunedf.iterrows():
+        for _, row in self._owned_rows(self.untunedf).iterrows():
             shape = self._parse_fhmoe_row(row)
             shape_str = (
                 f"(token={shape['token']}, dim={shape['model_dim']}, "
@@ -7404,7 +7420,7 @@ class FhmoeTuner(FmoeTuner):
 
     def tune(self, untunedf, tunedf, args):
         del tunedf
-        tasks, in_datas = self._fhmoe_tune_tasks(untunedf, args)
+        tasks, in_datas = self._fhmoe_tune_tasks(self._owned_rows(untunedf), args)
         if not tasks:
             return []
         return mp_tuner(
@@ -7496,9 +7512,12 @@ class FhmoeTuner(FmoeTuner):
                 flush=True,
             )
             bests.append(row)
+        # us selects valid rows in result_to_csv; update_tunedf keeps only
+        # self.columns, so it is not written to tuned_fhmoe.csv.
+        columns = self.columns + ["us"]
         if not bests:
-            return pd.DataFrame(columns=self.columns)
-        return pd.DataFrame(bests, columns=self.columns)
+            return pd.DataFrame(columns=columns)
+        return pd.DataFrame(bests, columns=columns)
 
     def result_to_csv(self, results, file, concat=False):
         del concat
@@ -8593,7 +8612,6 @@ if __name__ == "__main__":
         "ksplit",
         "kernelName1",
         "kernelName2",
-        "us",
     ]
     grouped_result_list = [
         "max_m",
