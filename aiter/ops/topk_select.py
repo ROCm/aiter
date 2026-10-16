@@ -41,7 +41,8 @@ import triton
 import triton.language as tl
 
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, wave_size_of
+from aiter.ops.flydsl.kernels.tensor_shim import wave_size_of
+from aiter.ops.flydsl.kernels.topk.topk_launch import run_topk_launcher
 from aiter.ops.flydsl.kernels.topk.topk_per_row_radix_stream import (
     _lds_budgets,
     build_topk_per_row_radix_stream_module,
@@ -1274,11 +1275,6 @@ def topk_select(
     # of and reads as dense. `topk_select_backend` derives from it the pitch
     # each backend that reads rows in place would launch at.
     stride0 = strides[0] if rows > 1 else width
-    if rows == 1 and strides[0] != width:
-        # And is handed on as dense: a FlyDSL launcher keeps the build of its
-        # first call, and a row stride of 1 there builds one that reads every
-        # later call's rows at a pitch of 1.
-        input = input.as_strided((1, width), (width, 1))
     backend = _choose(
         rows,
         width,
@@ -1590,7 +1586,7 @@ def _dispatch(
                 rows, parts * topk, dtype=input.dtype, device=input.device
             )
             stream = torch.cuda.current_stream(input.device)
-            _run_compiled(
+            run_topk_launcher(
                 build_topk_per_row_radix_stream_module(
                     topk,
                     wave,
@@ -1618,7 +1614,7 @@ def _dispatch(
             # so its answer is the unsplit answer rather than merely a valid
             # one -- and it writes those columns straight out, with no slot-to
             # -column gather to undo afterwards.
-            _run_compiled(
+            run_topk_launcher(
                 build_topk_per_row_radix_stream_module(
                     topk,
                     wave,
@@ -1644,7 +1640,7 @@ def _dispatch(
             return
         block_threads = topk_per_row_radix_stream_block_threads(rows, topk)
         lds_plan = topk_per_row_radix_stream_lds_plan(rows, input.shape[1], topk)
-        _run_compiled(
+        run_topk_launcher(
             # The block width follows the ROW COUNT and k, not the row width --
             # see the sweep behind `topk_per_row_radix_stream_block_threads`.
             # Costs a mean 1.001x against choosing per cell, where holding one

@@ -446,58 +446,76 @@ def test_row_pitch():
     return failures
 
 
-# One shape per FlyDSL backend, each served on every supported part.
-_SINGLE_ROW_ROUTES = (
-    ("decode", 64, 131072, 1024),
-    ("stream", 64, 32768, 512),
-    ("small_k", 64, 4096, 16),
-    ("argmax", 64, 4096, 1),
+# One shape per FlyDSL backend, with the first call that puts a stride of 1 on
+# the leading axis: a (1, n) row, or for k = 1 an (m, 1) column, strides (1, 1).
+_UNIT_STRIDE_ROUTES = (
+    ("decode", 64, 131072, 1024, "row"),
+    ("stream", 64, 32768, 512, "row"),
+    ("small_k", 64, 4096, 16, "row"),
+    ("argmax", 64, 4096, 1, "row"),
+    ("argmax", 64, 4096, 1, "column"),
 )
+# Where every route above is served; elsewhere one that is not is reported.
+_UNIT_STRIDE_ARCHES = ("gfx942", "gfx950")
 
 
-def test_single_row_stride():
-    """A single row whose row stride is 1, then many rows, on each FlyDSL backend.
+def test_unit_stride_first():
+    """A first call whose stride-1 axis is not the last, then dense rows, on
+    each FlyDSL backend.
 
-    A FlyDSL launcher keeps the build of its first call, and a row stride of 1
-    there built one that read every later call's rows at a pitch of 1: after
-    one such row, 63 of 64 dense rows came back wrong from decode. Each launcher
-    has to meet that row first, so this runs in a process of its own.
+    FlyDSL holds a tensor's first stride-1 axis static and the other strides
+    dynamic, so a (1, n) row or an (m, 1) column with strides (1, 1) builds a
+    kernel that reads rows at a pitch of 1. A launcher that reused that build
+    for the dense rows after it returned 63 of 64 of them wrong. The odd call has
+    to be each launcher's first, so this runs in a process of its own.
     """
     here = os.path.dirname(os.path.abspath(__file__))
     script = (
         f"import sys; sys.path.insert(0, {here!r}); import test_topk_select as t; "
-        "print('SINGLE_ROW', repr(t._single_row_stride_failures()))"
+        "print('UNIT_STRIDE', repr(t._unit_stride_failures()))"
     )
     done = subprocess.run(
         [sys.executable, "-c", script], capture_output=True, text=True, check=False
     )
-    lines = [ln for ln in done.stdout.splitlines() if ln.startswith("SINGLE_ROW ")]
+    lines = [ln for ln in done.stdout.splitlines() if ln.startswith("UNIT_STRIDE ")]
     if done.returncode != 0 or not lines:
         tail = (done.stderr or done.stdout).strip().splitlines()[-3:]
         return [f"exit {done.returncode}: {' | '.join(tail)}"]
-    failures = ast.literal_eval(lines[-1][len("SINGLE_ROW ") :])
+    failures, not_served = ast.literal_eval(lines[-1][len("UNIT_STRIDE ") :])
     for label in failures:
-        aiter.logger.error("SINGLE ROW STRIDE FAILED: %s", label)
+        aiter.logger.error("UNIT STRIDE FIRST FAILED: %s", label)
+    if not_served:
+        aiter.logger.warning(
+            "unit stride first: %d routes not served on %s, skipped: %s",
+            len(not_served),
+            get_gfx(),
+            not_served,
+        )
     return failures
 
 
-def _single_row_stride_failures():
-    failures = []
-    for backend, m, n, k in _SINGLE_ROW_ROUTES:
+def _unit_stride_failures():
+    failures, not_served = [], []
+    for backend, m, n, k, first in _UNIT_STRIDE_ROUTES:
         torch.manual_seed(m * n + k)
+        odd = torch.randn(n, 1).T if first == "row" else torch.randn(m, 1)
         for label, x in (
-            ("1 row, stride (1, 1)", torch.randn(n, 1).T),
-            (f"{m} rows after it", torch.randn(m, n)),
+            (f"{tuple(odd.shape)} strides {odd.stride()}", odd),
+            (f"{m}x{n} after it", torch.randn(m, n)),
         ):
-            lens = torch.full((x.shape[0],), n, dtype=dtypes.i32)
+            lens = torch.full((x.shape[0],), x.shape[1], dtype=dtypes.i32)
             try:
                 idx = _run_single_backend(x, lens, k, backend)
             except _NotServed:
+                if get_gfx() in _UNIT_STRIDE_ARCHES:
+                    failures.append(f"{backend} {label}: not served")
+                else:
+                    not_served.append(f"{backend} {label}")
                 break
             torch.cuda.synchronize()
             if not torch.equal(_sorted_values(x, idx), run_torch(x, lens, k)):
                 failures.append(f"{backend} {label}: wrong selection")
-    return failures
+    return failures, not_served
 
 
 def test_rejections():
@@ -806,33 +824,32 @@ _CROSS_DEVICE_SHAPES = (
 
 
 def test_cross_device():
-    """The input on a GPU that is not the current one.
+    """The input on a GPU that is not the current one, in a process that has
+    run the same shapes on the current one, which runs them again after.
 
     Every launch has to land on the input's GPU, under every output option,
-    and the call has to leave the current device as it found it.
-
-    In a process of its own: a FlyDSL launcher keeps to the GPU of its first
-    launch, so a process that already ran these selectors on the current GPU
-    cannot run them on another one.
+    and the call has to leave the current device as it found it. A launcher
+    used on both GPUs has to keep serving each.
     """
     if torch.cuda.device_count() < 2:
         return []
-    here = os.path.dirname(os.path.abspath(__file__))
-    script = (
-        f"import sys; sys.path.insert(0, {here!r}); import test_topk_select as t; "
-        "print('CROSS_DEVICE', repr(t._cross_device_failures()))"
-    )
-    done = subprocess.run(
-        [sys.executable, "-c", script], capture_output=True, text=True, check=False
-    )
-    lines = [ln for ln in done.stdout.splitlines() if ln.startswith("CROSS_DEVICE ")]
-    if done.returncode != 0 or not lines:
-        tail = (done.stderr or done.stdout).strip().splitlines()[-3:]
-        return [f"exit {done.returncode}: {' | '.join(tail)}"]
-    failures = ast.literal_eval(lines[-1][len("CROSS_DEVICE ") :])
+    failures = _cross_device_failures()
     for label in failures:
         aiter.logger.error("CROSS DEVICE FAILED: %s", label)
     return failures
+
+
+def _on_current_failures(m, n, k, when):
+    x = torch.randn(m, n, dtype=dtypes.fp32)
+    lens = torch.full((m,), n, dtype=dtypes.i32)
+    try:
+        idx = topk_select(x, k)[1]
+        torch.cuda.synchronize()
+    except Exception as e:  # noqa: BLE001
+        return [f"{m}x{n} k={k} on the current GPU {when}: {type(e).__name__}: {e}"]
+    if not torch.equal(_sorted_values(x, idx), run_torch(x, lens, k)):
+        return [f"{m}x{n} k={k} on the current GPU {when}: wrong selection"]
+    return []
 
 
 def _cross_device_failures():
@@ -842,6 +859,7 @@ def _cross_device_failures():
     on = torch.device("cuda", other)
     for m, n, k in _CROSS_DEVICE_SHAPES:
         torch.manual_seed(m * n + k)
+        failures += _on_current_failures(m, n, k, "before")
         x = torch.randn(m, n, dtype=dtypes.fp32, device=on)
         off = torch.arange(m, dtype=dtypes.i32, device=on) * n
         for ragged in (False, True):
@@ -892,6 +910,7 @@ def _cross_device_failures():
                     (i[:, :-1] <= i[:, 1:]).all()
                 ):
                     failures.append(f"{label}: indices not ascending")
+        failures += _on_current_failures(m, n, k, "after")
     return failures
 
 
@@ -1071,12 +1090,12 @@ def main():
         "row pitch: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
     )
     assert not bad, f"row pitch: {len(bad)} failed"
-    bad = test_single_row_stride()
+    bad = test_unit_stride_first()
     aiter.logger.info(
-        "single row stride: %s",
+        "unit stride first: %s",
         "all hold" if not bad else f"{len(bad)} FAILED: {bad}",
     )
-    assert not bad, f"single row stride: {len(bad)} failed"
+    assert not bad, f"unit stride first: {len(bad)} failed"
     bad = test_rejections()
     aiter.logger.info(
         "rejections: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"

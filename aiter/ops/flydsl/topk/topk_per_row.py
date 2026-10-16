@@ -10,12 +10,12 @@ import torch
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
 from ..kernels.kernels_common import get_warp_size
-from ..kernels.tensor_shim import _run_compiled
 from ..kernels.topk.radix_topk_one_block import (
     _COMPACT_CAPACITY,
     _MAX_ROW_ELEMENTS,
     build_radix_topk_one_block_module,
 )
+from ..kernels.topk.topk_launch import run_topk_launcher
 from ..kernels.topk.topk_per_row_decode import (
     clear_topk_per_row_decode_workspace_cache,  # noqa: F401 -- public re-export
     launch_topk_per_row_decode,
@@ -372,7 +372,7 @@ def flydsl_top_k_per_row_decode(
             write_values=values is not None,
             packed_rows=packed,
         )
-        _run_compiled(
+        run_topk_launcher(
             launcher,
             logits,
             starts,
@@ -474,7 +474,7 @@ def flydsl_radix_topk_one_block(
         arch=arch,
         packed_rows=packed_rows,
     )
-    _run_compiled(
+    run_topk_launcher(
         launcher,
         logits,
         row_starts,
