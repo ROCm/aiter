@@ -8,7 +8,14 @@ import sys
 # from aiter.jit import core
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/../../../aiter/")
-from jit.core import AITER_CSRC_DIR, AITER_META_DIR, CK_DIR, compile_ops
+from jit.core import (
+    AITER_CSRC_DIR,
+    AITER_META_DIR,
+    CK_DIR,
+    ck_fmha_batch_prefill_gen_targets,
+    ck_fmha_targets,
+    compile_ops,
+)
 
 FWD_CODEGEN_CMD = [f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_fwd --output_dir {{}}"]
 BWD_CODEGEN_CMD = [f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}"]
@@ -25,9 +32,9 @@ def cmdGenFunc_mha_fwd(ck_exclude: bool):
             f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_batch_prefill.cu",
         ]
         blob_gen_cmd = [
-            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}",
-            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --output_dir {{}}",
-            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill --receipt 600 --output_dir {{}}",
+            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --targets {ck_fmha_targets()} --output_dir {{}}",
+            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --targets {ck_fmha_targets()} --output_dir {{}}",
+            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill --receipt 600 --targets {ck_fmha_batch_prefill_gen_targets()} --output_dir {{}}",
         ]
     blob_gen_cmd.extend(FWD_CODEGEN_CMD)
     flag_use_v3 = (
@@ -56,7 +63,7 @@ def cmdGenFunc_mha_bwd(ck_exclude: bool):
         blob_gen_cmd = []
     else:
         blob_gen_cmd = [
-            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 600 --output_dir {{}}",
+            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 600 --targets {ck_fmha_targets()} --output_dir {{}}",
         ]
     blob_gen_cmd.extend(BWD_CODEGEN_CMD)
     flags_extra_cc = ["-DONLY_FAV3", "-DENABLE_CK=0"] if ck_exclude else []
