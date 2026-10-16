@@ -3843,8 +3843,8 @@ def flash_attn_varlen_func(
         )
 
     if (
-        _FLYDSL_AVAILABLE and
-        not has_all_descales
+        _FLYDSL_AVAILABLE
+        and not has_all_descales
         and (len(window_size) < 3 or window_size[2] == 0)
         and cu_seqlens_q_padded is None
         and cu_seqlens_k_padded is None
