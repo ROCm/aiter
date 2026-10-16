@@ -29,7 +29,8 @@ void fmha_v4_fwd(const at::Tensor& q,
                  std::optional<at::Tensor> lse = std::nullopt);
 
 // Sorted block-sparse sibling. Same packed operands as fmha_v4_fwd, plus a ragged LUT.
-// Builds the work table internally (identity raster if lut_count is uniform, else LPT).
+// Builds the work table internally: longest LUT first unless AITER_MHA_V4_WORK_ORDER says
+// otherwise, and raster order when lut_count is uniform.
 void fmha_v4_fwd_sparse(const at::Tensor& q,
                         const at::Tensor& k,
                         const at::Tensor& v,
@@ -49,13 +50,10 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                         const at::Tensor& lut_start,
                         const at::Tensor& lut_count,
                         // Tile geometry of the manifest row to dispatch. The LUT is in units of
-                        // kv_tile, so this must match what the caller routed with; gfx950 ships
-                        // both a 256x128 and a 64x64 FP8 block-sparse row.
+                        // kv_tile, so it must be the geometry the caller routed with.
                         int64_t q_tile,
                         int64_t kv_tile,
-                        // As above. The LSE a sparse row writes covers the blocks its LUT
-                        // selected, which is exactly the mass it computed, so ranks holding
-                        // different KV shards can still be merged by it.
+                        // As fmha_v4_fwd's, over only the KV blocks the LUT selects.
                         std::optional<at::Tensor> lse = std::nullopt);
 
 // The work table fmha_v4_fwd_sparse builds internally, exposed so its ordering can be tested.
