@@ -1405,8 +1405,7 @@ namespace aiter {
         float hc_sinkhorn_eps = 1e-6,
         float hc_post_mult_value = 1.0,
         int sinkhorn_repeat = 20,
-        int res_preshuffle = 0
-    )
+        int res_preshuffle = 0)
     {
         int m = residual.size(0);
         int residual_stride = residual.stride(0);
@@ -1906,7 +1905,7 @@ namespace aiter {
     }
 
 
-    template <typename DTYPE_I, int num_warps, int hc_mult, int num_rows, int hidden_size, int residual_block, int norm_block, bool use_nt>
+    template <typename DTYPE_I, int num_warps, int hc_mult, int num_rows, int hidden_size, int residual_block, int norm_block, bool use_nt, bool fuse_quant = false>
     __global__ __launch_bounds__(num_warps * opus::get_warp_size(), 2)
     void mhc_pre_big_fuse_rmsnorm_kernel(
         float* post_mix,
@@ -1918,6 +1917,8 @@ namespace aiter {
         float* hc_base,
         DTYPE_I* residual,
         DTYPE_I* norm_weight,
+        opus::fp8_t* quant_out,
+        float* quant_scale,
         int m,
         int n_splits,
         int gemm_out_mul_stride,
@@ -2096,6 +2097,7 @@ namespace aiter {
         }
         __syncthreads();
 
+        float quant_absmax[num_rows] = {0.0f};
         if (threadIdx.x < pre_thread_num) {
             // _pre_split_mixes_fwd (pre)
             static_assert(pre_thread_num % (num_rows * hc_mult) == 0, "pre_thread_num must be divisible by num_rows * hc_mult");
@@ -2307,6 +2309,20 @@ namespace aiter {
                             v_layer_input_f[k] = static_cast<float>(v_layer_input[k]) * v_norm_weight_f[k] * rms[r];
                         }
                         store_vector_nbytes<DTYPE_I, float, norm_block_vecs, norm_load_bytes, 0, false>(buffer_out, v_layer_input_f, r * hidden_size + norm_block_id * norm_block + lane_id * norm_block_vecs);
+                        if constexpr(fuse_quant) {
+                            halfblock_t v_layer_input_bf;
+                            #pragma unroll
+                            for(int k = 0; k < norm_block_vecs; k++) {
+                                v_layer_input_bf[k] = opus::cast<DTYPE_I>(v_layer_input_f[k]);
+                                quant_absmax[r] = max(
+                                    quant_absmax[r],
+                                    abs(static_cast<float>(v_layer_input_bf[k])));
+                            }
+                            store<norm_block_vecs>(
+                                buffer_layer_input_smem,
+                                v_layer_input_bf,
+                                r * hidden_size + norm_block_id * norm_block + lane_id * norm_block_vecs);
+                        }
                     }
                 }
             };
@@ -2364,6 +2380,87 @@ namespace aiter {
                 comb_mix[(m_idx + lane_id / hc_mult2) * hc_mult2 + lane_id % hc_mult2] = comb_mix_v;
             }
         }
+
+        if constexpr(fuse_quant) {
+            static constexpr int pre_warp_num = pre_thread_num / warp_size;
+            static constexpr float fp8_inv_max =
+                1.0f / static_cast<float>(opus::finfo<opus::fp8_t>::max());
+            // The final mHC/RMSNorm output is rounded to BF16 in LDS above.
+            // Reduce its per-row amax so this is byte-identical to quantizing
+            // the materialized BF16 output.
+            __syncthreads();
+            if (threadIdx.x < pre_thread_num) {
+                #pragma unroll
+                for(int r = 0; r < num_rows; r++) {
+                    float wave_max = wave_reduce<float, aiter::Max, warp_size, false>(
+                        quant_absmax[r], aiter::Max());
+                    if(lane_id == warp_size - 1) {
+                        s_hc_mult3[r * pre_warp_num + warp_id] = wave_max;
+                    }
+                }
+            }
+            __syncthreads();
+            if(threadIdx.x < num_rows) {
+                const int r = threadIdx.x;
+                float row_max = 0.0f;
+                #pragma unroll
+                for(int w = 0; w < pre_warp_num; w++) {
+                    row_max = max(row_max, s_hc_mult3[r * pre_warp_num + w]);
+                }
+                float row_scale = row_max * fp8_inv_max;
+                s_hc_mult3[num_rows * pre_warp_num + r] = row_scale;
+                if(r < m_oob) {
+                    quant_scale[m_idx + r] = row_scale;
+                }
+            }
+            __syncthreads();
+
+            if(threadIdx.x < pre_thread_num) {
+                constexpr int norm_block_vecs = norm_block / warp_size;
+                constexpr int norm_loop = hidden_size / norm_block;
+                constexpr int avg_norm_loop = norm_loop / pre_warp_num;
+                int local_norm_loop =
+                    (warp_id < norm_loop % pre_warp_num) ? avg_norm_loop + 1 : avg_norm_loop;
+                using halfblock_t = opus::vector_t<DTYPE_I, norm_block_vecs>;
+                auto buffer_layer_input_smem = opus::make_smem<DTYPE_I>(s_layer_input);
+                opus::fp8_t* quant_ptr =
+                    quant_out + static_cast<int64_t>(m_idx) * hidden_size;
+                auto buffer_quant = opus::make_gmem<opus::fp8_t>(
+                    quant_ptr, m_oob * hidden_size * sizeof(opus::fp8_t));
+
+                auto quantize_norm_block = [&](int norm_block_id) {
+                    #pragma unroll
+                    for(int r = 0; r < num_rows; r++) {
+                        if(r < m_oob) {
+                            const int offset =
+                                r * hidden_size + norm_block_id * norm_block
+                                + lane_id * norm_block_vecs;
+                            halfblock_t values =
+                                load<norm_block_vecs>(buffer_layer_input_smem, offset);
+                            float inverted_scale = __builtin_amdgcn_rcpf(
+                                s_hc_mult3[num_rows * pre_warp_num + r]);
+                            store_vector<
+                                opus::fp8_t,
+                                DTYPE_I,
+                                norm_block_vecs,
+                                RT,
+                                false,
+                                warp_size,
+                                1,
+                                opus::fp8_t>(
+                                    buffer_quant,
+                                    values,
+                                    offset,
+                                    inverted_scale);
+                        }
+                    }
+                };
+
+                for(int norm_i = 0; norm_i < local_norm_loop; norm_i++) {
+                    quantize_norm_block(norm_i * pre_warp_num + warp_id);
+                }
+            }
+        }
     }
 
 #define MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(num_warps, hc_mult, num_rows, hidden_size, residual_block, norm_block, use_nt) \
@@ -2392,6 +2489,47 @@ namespace aiter {
             reinterpret_cast<float*>(hc_base.data_ptr()), \
             reinterpret_cast<DTYPE_I*>(residual.data_ptr()), \
             reinterpret_cast<DTYPE_I*>(norm_weight.data_ptr()), \
+            nullptr, \
+            nullptr, \
+            m, \
+            n_splits, \
+            gemm_out_mul_stride, \
+            residual_stride, \
+            rms_eps, \
+            hc_pre_eps, \
+            hc_sinkhorn_eps, \
+            norm_eps, \
+            hc_post_mult_value, \
+            sinkhorn_repeat, \
+            res_preshuffle \
+        ); \
+    });
+
+#define MHC_PRE_BIG_FUSE_RM_QUANT_KERNEL_IMPL() \
+    int m_blocks = (m + 1) / 2; \
+    int block_size = 5 * WARP_SIZE; \
+    constexpr int hc_mult3 = 4 * 4 + 2 * 4; \
+    constexpr int hc_mult3_threads = 2 * hc_mult3 / 4; \
+    int reduce_splits_per_round = block_size / hc_mult3_threads; \
+    size_t layer_input_smem_bytes = static_cast<size_t>(2) * static_cast<size_t>(4096) * out.element_size(); \
+    size_t hc_partial_smem_bytes = static_cast<size_t>(reduce_splits_per_round) * static_cast<size_t>(2) * static_cast<size_t>(hc_mult3) * sizeof(float); \
+    size_t smem_bytes = layer_input_smem_bytes > hc_partial_smem_bytes ? layer_input_smem_bytes : hc_partial_smem_bytes; \
+    dim3 grid(m_blocks); \
+    dim3 block(block_size); \
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(out.dtype(), "mhc_pre_big_fuse_rmsnorm_quant", [&] { \
+        using DTYPE_I = typename hip2opus<scalar_t>::type; \
+        mhc_pre_big_fuse_rmsnorm_kernel<DTYPE_I, 5, 4, 2, 4096, 512, 512, true, true><<<grid, block, smem_bytes, stream>>>( \
+            reinterpret_cast<float*>(post_mix.data_ptr()), \
+            reinterpret_cast<float*>(comb_mix.data_ptr()), \
+            reinterpret_cast<DTYPE_I*>(out.data_ptr()), \
+            reinterpret_cast<float*>(gemm_out_mul.data_ptr()), \
+            reinterpret_cast<float*>(gemm_out_sqrsum.data_ptr()), \
+            reinterpret_cast<float*>(hc_scale.data_ptr()), \
+            reinterpret_cast<float*>(hc_base.data_ptr()), \
+            reinterpret_cast<DTYPE_I*>(residual.data_ptr()), \
+            reinterpret_cast<DTYPE_I*>(norm_weight.data_ptr()), \
+            reinterpret_cast<opus::fp8_t*>(quant_out.data_ptr()), \
+            reinterpret_cast<float*>(quant_scale.data_ptr()), \
             m, \
             n_splits, \
             gemm_out_mul_stride, \
@@ -2536,7 +2674,54 @@ namespace aiter {
         // Both dispatches launch kernels that support the requested layout.
         MHC_PRE_BIG_FUSE_RM_KERNEL_DISPATCH(m);
     }
+
+    void mhc_pre_big_fuse_rmsnorm_quant(
+        aiter_tensor_t& post_mix,
+        aiter_tensor_t& comb_mix,
+        aiter_tensor_t& out,
+        aiter_tensor_t& quant_out,
+        aiter_tensor_t& quant_scale,
+        aiter_tensor_t& gemm_out_mul,
+        aiter_tensor_t& gemm_out_sqrsum,
+        aiter_tensor_t& hc_scale,
+        aiter_tensor_t& hc_base,
+        aiter_tensor_t& residual,
+        aiter_tensor_t& norm_weight,
+        float rms_eps = 1e-6,
+        float hc_pre_eps = 1e-6,
+        float hc_sinkhorn_eps = 1e-6,
+        float norm_eps = 1e-6,
+        float hc_post_mult_value = 1.0,
+        int sinkhorn_repeat = 20,
+        int res_preshuffle = 0
+    )
+    {
+        const int m = residual.size(0);
+        const int hidden_size = residual.size(2);
+        const int residual_stride = residual.stride(0);
+        const int gemm_out_mul_stride = gemm_out_mul.stride(1);
+        const int hc_mult = residual.size(1);
+        const int n_splits = gemm_out_mul.dim() > 2 ? gemm_out_mul.size(0) : 1;
+        AITER_CHECK(get_gpu_arch() == "gfx950", "mhc quant only supports gfx950");
+        AITER_CHECK(hc_mult == 4, "mhc quant only supports hc_mult=4");
+        AITER_CHECK(hidden_size == 4096, "mhc quant only supports hidden_size=4096");
+        const bool supported_m =
+            m == 1024 || m == 2048 || m == 4096 || m == 8192
+            || m == 16384 || m == 32768 || m == 65536 || m == 131072;
+        AITER_CHECK(supported_m, "unsupported M for gfx950 mHC quant");
+        AITER_CHECK(!res_preshuffle, "mhc quant does not support pre-shuffled residual");
+        AITER_CHECK(out.dtype() == AITER_DTYPE_bf16, "mhc quant out must be bf16");
+        AITER_CHECK(quant_out.dtype() == AITER_DTYPE_fp8, "mhc quant output must be fp8");
+        AITER_CHECK(quant_scale.dtype() == AITER_DTYPE_fp32, "mhc quant scale must be fp32");
+        AITER_CHECK(quant_out.numel() == out.numel(), "quant_out must match out");
+        AITER_CHECK(quant_scale.numel() == m, "quant_scale must contain one value per row");
+
+        const HipDeviceGuard device_guard(out.device_id);
+        const hipStream_t stream = aiter::getCurrentHIPStream();
+        MHC_PRE_BIG_FUSE_RM_QUANT_KERNEL_IMPL();
+    }
 #undef MHC_PRE_BIG_FUSE_RM_SHUFFLED_DISPATCH
+#undef MHC_PRE_BIG_FUSE_RM_QUANT_KERNEL_IMPL
 
     template <typename DTYPE_I, int num_warps, int hc_mult, int tile_m, int tile_n, int tile_k, bool store_nt, bool w_preshuffle_bf16 = false, bool decode_direct_store = false, bool res_preshuffle = false>
     __global__ __launch_bounds__(num_warps * opus::get_warp_size(), 1)
