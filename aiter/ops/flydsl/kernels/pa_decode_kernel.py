@@ -40,6 +40,8 @@ import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
+
 from .pa_decode import implementation_cache_tag
 from .pa_decode.context import PaDecodeContext
 from .pa_decode.pipeline import PaDecodePipeline
@@ -70,6 +72,7 @@ _PA_DECODE_TILE_CACHE = {}
 
 def compile_pa_decode_tile(
     *,
+    architecture: str | None = None,
     head_dim: int,
     query_group_size: int,
     block_size: int,
@@ -89,6 +92,7 @@ def compile_pa_decode_tile(
     query_splits: int | None = None,
     max_context_length: int | None = None,
     sliding_window: int = 0,
+    direct_output: bool = False,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -113,8 +117,10 @@ def compile_pa_decode_tile(
     ``work_capacity`` is a positive host integer matching the work plan.
     Positive ``sliding_window`` includes the query token.
     Plans cover the MTP window union; scores are masked per query row.
-    All tasks write packed partials; the reducer applies sinks once and writes
-    final output, including when the plan allows only one partition.
+    gfx1250 uses wave32 WMMA, native BF16 or OCP FP8, and its larger LDS budget.
+    A one-partition gfx1250 plan can write final output directly when sinks
+    are absent and query/output strides match. Other tasks write packed partials
+    for the shared reducer, which applies sinks once.
 
     Masked V bytes must remain finite because ``0 * NaN == NaN`` in PV MFMA.
     Pages past the sequence are pinned to block 0; callers must leave the
@@ -122,6 +128,44 @@ def compile_pa_decode_tile(
     offsets at 2 GiB; ``kv_buffer_u32`` proves both FP8 caches are below 4 GiB
     and permits unsigned buffer offsets instead of i64.
     """
+    architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
+    if architecture == "gfx1250":
+        from .pa_decode.gfx1250 import compile_gfx1250_pa_decode
+
+        if direct_output and num_partitions != 1:
+            raise ValueError("direct_output requires a one-partition plan")
+        if query_splits is None:
+            # Split the measured spilling BF16 specialization into one Q tile
+            # per CTA. Other shapes retain fused queries and their KV reuse.
+            query_splits = (
+                4
+                if kv_dtype == "bf16"
+                and head_dim == 1024
+                and query_group_size == 16
+                and query_length == 4
+                and block_size == 128
+                and trans_v
+                and sliding_window == 0
+                else 1
+            )
+        return compile_gfx1250_pa_decode(
+            head_dim=head_dim,
+            query_group_size=query_group_size,
+            block_size=block_size,
+            softmax_scale=softmax_scale,
+            query_dtype=query_dtype,
+            per_token_kv=per_token_kv,
+            query_length=query_length,
+            trans_v=trans_v,
+            sliding_window=sliding_window,
+            compute_dtype=kv_dtype,
+            direct_output=direct_output,
+            query_splits=query_splits,
+        )
+    if architecture not in ("gfx942", "gfx950"):
+        raise NotImplementedError(f"PA decode does not support {architecture}")
+    if direct_output:
+        raise NotImplementedError("direct_output requires gfx1250")
     schedule = PaDecodeSchedule.select(
         head_dim=head_dim,
         query_group_size=query_group_size,

@@ -17,6 +17,7 @@ from pathlib import Path
 import torch
 from flydsl.autotune import Config, autotune
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.pa_decode import implementation_cache_tag
 from aiter.ops.flydsl.kernels.pa_decode_plan import PADecodePlan, plan_pa_decode
 from aiter.ops.flydsl.pa_decode import pa_decode
@@ -236,7 +237,7 @@ def prepare_pa_decode_plan(
     softmax_scale: float,
     query_length: int,
     *,
-    compute_type: torch.dtype = torch.bfloat16,
+    compute_type: torch.dtype | None = None,
     key_scale: torch.Tensor | float | None = None,
     value_scale: torch.Tensor | float | None = None,
     sinks: torch.Tensor | None = None,
@@ -305,7 +306,7 @@ def prepare_pa_decode_plan(
             limit,
         )
 
-        arch = properties.gcnArchName.split(":", 1)[0]
+        arch = get_gfx_runtime()
         config_dir = None if config_dir is None else Path(config_dir)
         tuner = _get_pa_decode_autotuner(arch, config_dir)
         tuning_args = {
@@ -417,10 +418,8 @@ def _parse_args(argv=None):
         parser.error("FP8 --head-dim must be 64 or a multiple of 128")
     if args.scale_mode is None:
         args.scale_mode = "per-token" if args.kv_dtype == "fp8" else "none"
-    if args.kv_dtype == "bf16" and (
-        args.query_dtype != "bf16" or not args.trans_v or args.scale_mode != "none"
-    ):
-        parser.error("BF16 KV requires BF16 queries, --trans-v 1 and --scale-mode none")
+    if args.kv_dtype == "bf16" and args.scale_mode != "none":
+        parser.error("BF16 KV requires --scale-mode none")
     if len(args.context_length) == 1:
         args.context_length *= args.batch_size
     elif len(args.context_length) != args.batch_size:
@@ -524,9 +523,19 @@ def main(argv=None):
     torch.cuda.set_device(args.device)
     device = torch.device("cuda", args.device)
     properties = torch.cuda.get_device_properties(device)
-    arch = properties.gcnArchName.split(":", 1)[0]
-    if arch not in ("gfx942", "gfx950"):
-        raise RuntimeError(f"PA decode tuning only supports gfx942/gfx950, got {arch}")
+    arch = get_gfx_runtime()
+    if arch not in ("gfx942", "gfx950", "gfx1250"):
+        raise RuntimeError(
+            f"PA decode tuning only supports gfx942/gfx950/gfx1250, got {arch}"
+        )
+    if args.kv_dtype == "bf16":
+        if arch == "gfx1250":
+            if args.head_dim != 64 and args.head_dim % 128:
+                raise ValueError(
+                    "gfx1250 BF16 head-dim must be 64 or a multiple of 128"
+                )
+        elif args.query_dtype != "bf16" or not args.trans_v:
+            raise ValueError("BF16 KV requires BF16 queries and --trans-v 1 on gfx9")
     if (
         args.max_partitions is not None
         and args.max_partitions > properties.multi_processor_count
@@ -536,7 +545,7 @@ def main(argv=None):
         )
     kv_dtype = torch.bfloat16
     if args.kv_dtype == "fp8":
-        kv_dtype = torch.float8_e4m3fn if arch == "gfx950" else torch.float8_e4m3fnuz
+        kv_dtype = torch.float8_e4m3fnuz if arch == "gfx942" else torch.float8_e4m3fn
     print(
         f"Tuning {arch}: batch={args.batch_size}, Q heads={args.num_query_heads}, "
         f"KV heads={args.num_kv_heads}, dim={args.head_dim}, "
