@@ -511,10 +511,6 @@ class QuickAllReduce:
     ):
         if self.disabled:
             return False
-        # Prefer the FlyDSL fused schedules where they apply; otherwise fall
-        # through to the HIP quick-reduce fused kernel.
-        if self.should_fly_allreduce_rmsnorm(inp, residual_inp, weight):
-            return True
         if not self._should_hip(inp):
             return False
         if inp.dtype != residual_inp.dtype or inp.dtype != weight.dtype:
@@ -537,11 +533,6 @@ class QuickAllReduce:
         hidden_dim: int,
     ):
         """Performs QR allreduce fused with residual add and RMSNorm."""
-        # The FlyDSL fused path handles the call when its predicate says yes,
-        # mirroring the plain all-reduce dispatch. The predicate is
-        # deterministic, so re-checking here matches should_quick_allreduce_rmsnorm.
-        if self.should_fly_allreduce_rmsnorm(inp, residual_inp, weight):
-            return self.fly_allreduce_rmsnorm(inp, residual_inp, weight, eps)
         out = torch.empty_like(inp)
         residual_out = torch.empty_like(residual_inp)
         ops.qr_all_reduce_rmsnorm(

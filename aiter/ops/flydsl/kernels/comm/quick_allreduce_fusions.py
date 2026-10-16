@@ -697,7 +697,7 @@ def rms_rstd(rows, eps, hidden: int, *, tid, block: int, lds=None):
 # so the word is ``2**10 * (sum of fixed partials) + 2**5 * (poisoned) +
 # (arrivals)`` as a single integer. Integer addition is order-independent, so
 # every rank and every wave decodes bit-identical sums whatever order the waves
-# arrive in. Count and sum move in one atomic op, so a reader that sees the count 
+# arrive in. Count and sum move in one atomic op, so a reader that sees the count
 # complete sees the sum complete: no fence needed.
 #
 # A partial that is not finite, or too large for the fixed point, is "poisoned":
@@ -744,7 +744,7 @@ def xchg_contribution(partial, n_writers: int):
     ``partial`` is a sum of squares, so ``>= 0``. Below ``xchg_clamp_units`` it
     is rounded to the nearest fixed-point unit. Otherwise -- too large, or NaN
     or Inf, which compare false -- the writer is marked poisoned, and the
-    float-to-int conversion never sees the value. Both arms are computed and selected, 
+    float-to-int conversion never sees the value. Both arms are computed and selected,
     so there is no branching.
     """
     clamp = fx.Float32(xchg_clamp_units(n_writers) * 2.0**-XCHG_FIX_BITS)

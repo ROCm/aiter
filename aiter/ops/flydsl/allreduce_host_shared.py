@@ -193,6 +193,39 @@ class _StEngine:
             self._buf_ptr = None
 
 
+def check_fused_aliasing(inp, residual_in, out, residual_out, live_bytes: int) -> None:
+    """Raise unless the fused call's destinations are safe to write.
+
+    ``out`` and ``residual_out`` are written, ``inp`` and ``residual_in`` are
+    only read. Two ways to overlap are allowed:
+
+    * ``inp`` with ``residual_in``: both are read-only.
+    * ``residual_out`` is ``residual_in``: each thread reads
+      its residual atoms before it stores the sum back to the same bytes.
+    """
+
+    def span(t):
+        p = int(t.data_ptr())
+        return p, p + live_bytes
+
+    def overlap(a, b):
+        (a0, a1), (b0, b1) = span(a), span(b)
+        return max(a0, b0) < min(a1, b1)
+
+    in_place = residual_out.data_ptr() == residual_in.data_ptr()
+    for wname, w in (("out", out), ("residual_out", residual_out)):
+        for rname, r in (("inp", inp), ("residual_in", residual_in)):
+            if in_place and wname == "residual_out" and rname == "residual_in":
+                continue
+            if overlap(w, r):
+                raise ValueError(
+                    f"{wname} overlaps {rname}; only residual_out aliasing "
+                    "residual_in exactly is allowed"
+                )
+    if overlap(out, residual_out):
+        raise ValueError("out and residual_out overlap")
+
+
 def require_arch(*, owner: str) -> str:
     """This device's ``gfx`` arch. Raises if the kernels do not support it."""
     from aiter.jit.utils.chip_info import get_gfx_runtime

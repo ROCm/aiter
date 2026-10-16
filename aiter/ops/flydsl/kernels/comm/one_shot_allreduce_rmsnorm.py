@@ -152,8 +152,8 @@ def _xchg_join(word, wave_sum, prev_same, n_writers, tid):
     instead, and the row's total decodes as NaN), with a relaxed
     agent-scope 64-bit atomic whose result is left unused. Count and sum
     move in one atomic op, so a wave that sees the count complete sees the sum
-    complete, and no fence orders anything. Integer addition is order-independent, 
-    so every wave on every rank decodes the same bits whatever order the writers 
+    complete, and no fence orders anything. Integer addition is order-independent,
+    so every wave on every rank decodes the same bits whatever order the writers
     arrived in.
 
     The word rotates with the inbox colour, so the group's workgroups, which

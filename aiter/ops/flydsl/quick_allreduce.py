@@ -37,6 +37,7 @@ from .allreduce_host_shared import (
     _resolve_inbox_flags,
     _StEngine,
     _validate_ipc_process_group,
+    check_fused_aliasing,
     check_payload,
     check_world_size,
     kernel_symbol,
@@ -790,13 +791,13 @@ class FlyQuickAllReduceRMSNorm:
                 and apr != self.atoms_per_row
                 and hidden not in self._apr_substituted
             ):
-                # The width has no block for the requested atoms_per_row, 
+                # The width has no block for the requested atoms_per_row,
                 # so it takes the earest it has.
                 self._apr_substituted.add(hidden)
                 logger.info(
                     "FlyDSL fused %s: hidden=%d has no native atoms_per_row=%d at "
                     "world_size=%d; building atoms_per_row=%d (block=%d) instead.",
-                    self._algo,
+                    self._algo.name,
                     hidden,
                     self.atoms_per_row,
                     self.world_size,
@@ -991,36 +992,15 @@ class FlyQuickAllReduceRMSNorm:
         if live_bytes > PAD_MASK_MAX_BYTES and self.pads_hidden(hidden) != hidden:
             raise ValueError(
                 f"a padded fused build (hidden={hidden} runs at "
-                f"h_pad={self.pads_hidden(hidden)}) masks its pad lanes with an "
-                f"offset of {PAD_MASK_MAX_BYTES} B, so the payload must not "
-                f"exceed that; got {live_bytes} B"
+                f"h_pad={self.pads_hidden(hidden)}) takes payloads of at most "
+                f"{PAD_MASK_MAX_BYTES} B; got {live_bytes} B"
             )
 
-        # Aliasing. ``residual_out is residual_in`` is allowed: a thread writes
-        # only the bytes it read, and vLLM's fused_add_rmsnorm is in-place on
-        # the residual. Anything else that overlaps is a race -- out and
-        # residual_out are written from the same thread, and the input is still
-        # being read by peers when the epilogue runs.
-        spans = {
-            "inp": inp,
-            "out": out,
-            "residual_in": residual_in,
-        }
-        if residual_out.data_ptr() != residual_in.data_ptr():
-            spans["residual_out"] = residual_out
-        elif tuple(residual_out.shape) != tuple(residual_in.shape):
+        if residual_out.data_ptr() == residual_in.data_ptr() and tuple(
+            residual_out.shape
+        ) != tuple(residual_in.shape):
             raise ValueError("an in-place residual must have residual_in's shape")
-        items = [
-            (n, int(t.data_ptr()), int(t.data_ptr()) + live_bytes)
-            for n, t in spans.items()
-        ]
-        for i in range(len(items)):
-            for j in range(i + 1, len(items)):
-                if max(items[i][1], items[j][1]) < min(items[i][2], items[j][2]):
-                    raise ValueError(
-                        f"{items[i][0]} and {items[j][0]} overlap; only "
-                        "residual_out aliasing residual_in exactly is allowed"
-                    )
+        check_fused_aliasing(inp, residual_in, out, residual_out, live_bytes)
         return hidden, live_bytes
 
     @staticmethod

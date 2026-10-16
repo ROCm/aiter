@@ -286,6 +286,12 @@ the one-shot serves without quantization, set `AITER_FLY_AR_ONESHOT_MAX_BYTES`.
 
 ### Fused all-reduce + RMSNorm
 
+With `AITER_FLY_AR=1`, `CudaCommunicator.fused_allreduce_rmsnorm` tries the
+FlyDSL fused path before the HIP kernels. A call that FlyDSL serves is not
+subject to `AITER_AR_1STAGE`, `AITER_AR_1STAGE_MAX_KB` or `prefill_support`; the
+fused windows below decide. Calls it declines take the existing dispatch,
+overrides included.
+
 | Variable | Effect |
 |---|---|
 | `AITER_FLY_AR_FUSED_HIDDENS` | Comma-separated hidden sizes to build at startup, for example `4096,7168`. |

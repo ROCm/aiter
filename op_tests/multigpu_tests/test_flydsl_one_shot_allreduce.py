@@ -328,9 +328,23 @@ FUSED_HIDDENS = (2048, 4096, 7168, 8192)
 FUSED_M = (1, 2, 5, 8, 32)
 RMS_EPS = 1e-6
 
+# 5120 and 6144 are widths the shipped models use that the list above lacks;
+# decode and a small batch are enough to cover their geometry.
+FUSED_EXTRA_HIDDENS = (5120, 6144)
+FUSED_EXTRA_M = (1, 8)
 _FUSED_SHAPE_CASES = tuple(
     (m, hidden, f"{m}x{hidden}") for hidden in FUSED_HIDDENS for m in FUSED_M
+) + tuple(
+    (m, hidden, f"{m}x{hidden}")
+    for hidden in FUSED_EXTRA_HIDDENS
+    for m in FUSED_EXTRA_M
 )
+
+# An eps that is large against the row's mean square at this scale (about 0.05
+# at TP2 to 2 at TP8), so a kernel that ignored it or kept 1e-6 is visibly off.
+# 1e-6 is invisible to every other test here.
+FUSED_LARGE_EPS = 0.5
+FUSED_EPS_SCALE = 0.1
 
 # Widths with no native row geometry, which run on a *padded* workgroup: BLOCK
 # covers h_pad and the lanes past the real row are masked off.
@@ -1659,6 +1673,51 @@ def _capture_ready_failures(rank, tp, hidden, device, dist) -> list[str]:
     return []
 
 
+def _alias_failures(eng, rank, tp, m, hidden, device) -> list[str]:
+    """What the fused call allows and rejects of its operands' memory."""
+    bad = []
+    eng.preload(hidden)
+    parts, residual, weight = _fused_inputs(m, hidden, tp, device)
+    inp = parts[rank].contiguous()
+
+    def graded(out, res_out, res_ref, out_ref, what):
+        torch.cuda.synchronize()
+        if not torch.equal(res_out.view(torch.int16), res_ref.view(torch.int16)):
+            bad.append(f"{what}: residual_out differs from the reference")
+        if _sqnr_db(out_ref.float(), out.float()) < SQNR_FLOOR_DB:
+            bad.append(f"{what}: out is below the SQNR floor")
+
+    out_ref, res_ref = _fused_reference(parts, residual, weight, RMS_EPS)
+    res = residual.clone()
+    out = torch.empty_like(inp)
+    eng.allreduce_rmsnorm(inp, res, weight, RMS_EPS, out=out, residual_out=res)
+    graded(out, res, res_ref, out_ref, "residual_out is residual_in")
+
+    out_ref, res_ref = _fused_reference(parts, inp, weight, RMS_EPS)
+    out = torch.empty_like(inp)
+    res_out = torch.empty_like(inp)
+    eng.allreduce_rmsnorm(inp, inp, weight, RMS_EPS, out=out, residual_out=res_out)
+    graded(out, res_out, res_ref, out_ref, "residual_in is inp")
+
+    flat = torch.empty(2 * inp.numel(), dtype=inp.dtype, device=device)
+    overlapping = flat[8 : 8 + inp.numel()].view_as(inp)
+    for what, kwargs in (
+        ("out is inp", {"out": inp, "residual_out": torch.empty_like(inp)}),
+        (
+            "residual_out partly over residual_in",
+            {"out": torch.empty_like(inp), "residual_out": overlapping},
+        ),
+    ):
+        residual_in = flat[: inp.numel()].view_as(inp)
+        try:
+            eng.allreduce_rmsnorm(inp, residual_in, weight, RMS_EPS, **kwargs)
+        except ValueError:
+            continue
+        bad.append(f"{what} was not rejected")
+    torch.cuda.synchronize()
+    return bad
+
+
 def _log_path(world_size: int, rank: int, mode: str, tag: str) -> str:
     """One log per (world size, rank, mode, knobs) so concurrent spawn
     configurations cannot overwrite each other's failure tails.
@@ -1682,6 +1741,7 @@ def _fused_spawn(
     split: int | None = None,
     input_scale: float = 1.0,
     repeat: int = 1,
+    eps: float = RMS_EPS,
 ) -> list:
     """Subprocess-based spawn for fused (``OneShotAllReduceRMSNorm``) tests.
 
@@ -1718,6 +1778,8 @@ def _fused_spawn(
         tag += f"_g{grid_cap}"
     if input_scale != 1.0:
         tag += f"_x{input_scale:g}"
+    if eps != RMS_EPS:
+        tag += f"_e{eps:g}"
     procs = []
     logs = []
     for rank in range(world_size):
@@ -1753,6 +1815,8 @@ def _fused_spawn(
             cmd += ["--input-scale", repr(float(input_scale))]
         if repeat != 1:
             cmd += ["--repeat", str(repeat)]
+        if eps != RMS_EPS:
+            cmd += ["--eps", repr(float(eps))]
         if rank == 0:
             cmd += ["--out", out_path]
         log = open(  # noqa: SIM115
@@ -1839,14 +1903,14 @@ def _run_rank_fused(args, rank, device, dist) -> None:
         # never the one that compiles.
         eng.preload(hidden)
 
-        out, res_out = eng.allreduce_rmsnorm(inp, residual, weight, RMS_EPS)
+        out, res_out = eng.allreduce_rmsnorm(inp, residual, weight, args.eps)
         torch.cuda.synchronize()
 
         # Later calls must reproduce the first one's bits exactly: a split
         # build carries its exchange state across launches, and only a
         # second call reads what the first one left behind.
         for i in range(1, args.repeat):
-            o2, r2 = eng.allreduce_rmsnorm(inp, residual, weight, RMS_EPS)
+            o2, r2 = eng.allreduce_rmsnorm(inp, residual, weight, args.eps)
             torch.cuda.synchronize()
             if not (
                 torch.equal(o2.view(torch.int16), out.view(torch.int16))
@@ -1855,7 +1919,7 @@ def _run_rank_fused(args, rank, device, dist) -> None:
                 bad.append(f"{tag}: call {i} differs from call 0")
                 break
 
-        out_ref, res_ref = _fused_reference(parts, residual, weight, RMS_EPS)
+        out_ref, res_ref = _fused_reference(parts, residual, weight, args.eps)
 
         db = _sqnr_db(out_ref.float(), out.float())
         # A NaN makes the SQNR NaN, which no comparison with the floor catches.
@@ -1919,6 +1983,9 @@ def _run_rank_fused(args, rank, device, dist) -> None:
         failures.extend(
             _fused_fresh_inputs(eng, rank, args.tp, args.hiddens[0], device)
         )
+    elif args.mode == "fused_alias":
+        for m, hidden in zip(args.tokens, args.hiddens, strict=True):
+            failures.append(_alias_failures(eng, rank, args.tp, m, hidden, device))
     elif args.mode == "fused_capture_ready":
         failures.extend(
             _capture_ready_failures(rank, args.tp, args.hiddens[0], device, dist)
@@ -2006,6 +2073,37 @@ def test_one_shot_allreduce_rmsnorm(m, hidden, label, world_size):
     batch = _batch_cache_lookup((world_size, "fused"), group_pairs)
     for rank, bad in enumerate(batch[(m, hidden)]):
         assert not bad, f"{label}, tp={world_size}, rank {rank}: " + "; ".join(bad)
+
+
+@_graded_benchmark
+def test_one_shot_allreduce_rmsnorm_eps(world_size):
+    """The fused one-shot with a large ``eps`` on small-magnitude inputs, graded
+    like every fused case: ``out`` on SQNR, ``residual_out`` bit-exact."""
+    pairs = [(1, 4096), (5, 7168)]
+    batch = _batch_cache_lookup(
+        (world_size, "fused", "eps"),
+        pairs,
+        atoms=None,
+        input_scale=FUSED_EPS_SCALE,
+        eps=FUSED_LARGE_EPS,
+    )
+    for m, hidden in pairs:
+        for rank, bad in enumerate(batch[(m, hidden)]):
+            assert not bad, (
+                f"{m}x{hidden} eps={FUSED_LARGE_EPS}, tp={world_size}, rank {rank}: "
+                + "; ".join(bad)
+            )
+
+
+@_graded_benchmark
+def test_one_shot_allreduce_rmsnorm_alias(world_size):
+    """In-place residual and a shared input are allowed, the unsafe overlaps are
+    rejected (see ``_alias_failures``)."""
+    pairs = [(3, 4096), (2, 7168)]
+    ranks = _fused_spawn(world_size, pairs, mode="fused_alias")
+    for rank, shapes in enumerate(ranks):
+        for bad in shapes:
+            assert not bad, f"tp={world_size}, rank {rank}: " + "; ".join(bad)
 
 
 @_graded_benchmark
@@ -2654,6 +2752,8 @@ def _verify_fused(tps) -> None:
                 test_one_shot_allreduce_rmsnorm_split_magnitude(scale, tp)
                 for scale in FUSED_SPLIT_SCALES
             ]
+            + [test_one_shot_allreduce_rmsnorm_eps(tp)]
+            + [test_one_shot_allreduce_rmsnorm_alias(tp)]
             + [test_one_shot_allreduce_rmsnorm_split_exchange(tp)]
             + [test_fused_allreduce_rmsnorm_capture_ready(tp)]
         )
@@ -3139,6 +3239,7 @@ if __name__ == "__main__":
     _rank_parser.add_argument("--split", type=int, default=None)
     _rank_parser.add_argument("--input-scale", type=float, default=1.0)
     _rank_parser.add_argument("--repeat", type=int, default=1)
+    _rank_parser.add_argument("--eps", type=float, default=RMS_EPS)
     _rank_parser.add_argument(
         "--mode",
         default="fused",
@@ -3148,6 +3249,7 @@ if __name__ == "__main__":
             "fused_fresh",
             "fused_split_exchange",
             "fused_capture_ready",
+            "fused_alias",
         ),
     )
     _rank_parser.add_argument("--tokens", default="")

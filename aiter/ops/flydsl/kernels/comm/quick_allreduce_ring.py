@@ -589,8 +589,9 @@ def make_quick_allreduce_ring_kernel(
                     else:
                         pass  # the last op receives only
                     if const_expr(k >= world_size):
-                        # After the fanout: the successor is already unblocked,
-                        # so the epilogue runs off the ring's critical path.
+                        # After the fanout, but before this group's _publish: the
+                        # successor's flag waits for the epilogue's stores too,
+                        # since _publish drains every store of this wave.
                         _end_chunk(tile, _chunk_of(k), recv)
                     else:
                         pass

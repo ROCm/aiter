@@ -22,6 +22,7 @@ from .allreduce_host_shared import (
     _resolve_inbox_flags,
     _StEngine,
     _validate_ipc_process_group,
+    check_fused_aliasing,
     check_payload,
     check_world_size,
     kernel_symbol,
@@ -652,22 +653,10 @@ class OneShotAllReduceRMSNorm:
         if live_bytes > PAD_MASK_MAX_BYTES and self.pads_hidden(hidden) != hidden:
             raise ValueError(
                 f"a padded fused build (hidden={hidden} runs at "
-                f"h_pad={self.pads_hidden(hidden)}) masks its pad lanes with an "
-                f"offset of {PAD_MASK_MAX_BYTES} B, so the payload must not "
-                f"exceed that; got {live_bytes} B"
+                f"h_pad={self.pads_hidden(hidden)}) takes payloads of at most "
+                f"{PAD_MASK_MAX_BYTES} B; got {live_bytes} B"
             )
-        # Distinct destinations: the kernel writes out and residual_out from the
-        # same thread and reads residual_in after, so aliasing any pair is a race.
-        spans = [
-            (int(t.data_ptr()), int(t.data_ptr()) + live_bytes)
-            for t in (inp, residual_in, out, residual_out)
-        ]
-        for i in range(len(spans)):
-            for j in range(i + 1, len(spans)):
-                if max(spans[i][0], spans[j][0]) < min(spans[i][1], spans[j][1]):
-                    raise ValueError(
-                        "inp/residual_in/out/residual_out must not overlap"
-                    )
+        check_fused_aliasing(inp, residual_in, out, residual_out, live_bytes)
         return hidden, live_bytes
 
     def _launch_args(self, eng, spec, ptrs, eps, stream, *, hidden, live_bytes):

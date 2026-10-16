@@ -1649,6 +1649,7 @@ def _run_rank_fused(
     codecs: tuple[str | None, str | None],
     solo: bool,
     engine_kw: dict | None = None,
+    eps: float = 1e-6,
 ) -> list[dict]:
     """One rank of a fused run, over every case in one spawn.
 
@@ -1716,7 +1717,7 @@ def _run_rank_fused(
             out = guard[0, :tokens].view(dtypes.bf16)
             res_out = guard[1, :tokens].view(dtypes.bf16)
             eng.allreduce_rmsnorm(
-                inp, residual, weight, RMS_EPS, out=out, residual_out=res_out
+                inp, residual, weight, eps, out=out, residual_out=res_out
             )
             torch.cuda.synchronize()
             dist.barrier()
@@ -1727,7 +1728,7 @@ def _run_rank_fused(
             dist.all_reduce(ar, group=dist.group.WORLD)
             x = ar.to(dtypes.bf16).to(torch.float32) + residual.to(torch.float32)
             res_ref = x.to(dtypes.bf16)
-            rstd = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + RMS_EPS)
+            rstd = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
             out_ref = (x * rstd * weight.to(torch.float32)).to(dtypes.bf16)
 
             # The epilogue judged on its own, with the codec noise factored
@@ -1735,7 +1736,7 @@ def _run_rank_fused(
             xr = res_out.to(torch.float32)
             out_self = (
                 xr
-                * torch.rsqrt(xr.pow(2).mean(-1, keepdim=True) + RMS_EPS)
+                * torch.rsqrt(xr.pow(2).mean(-1, keepdim=True) + eps)
                 * weight.to(torch.float32)
             ).to(dtypes.bf16)
 
@@ -1775,31 +1776,21 @@ def _run_rank_fused(
     return rows
 
 
-def _spawn_fused(
-    world_size: int,
-    cases: list[tuple[int, int]],
-    *,
-    algorithm: str = "ring",
-    codecs: tuple[str | None, str | None] = (None, None),
-    solo: bool = False,
-    engine_kw: dict | None = None,
-) -> list[list[dict]]:
+def _spawn_ranks(worker, world_size: int, **kwds):
+    """*worker* once per rank in a spawn pool, with ``rank``, ``tp`` and
+    ``init_method`` added to *kwds*. Returns each rank's result."""
     init_method = get_distributed_init_method(get_ip(), get_open_port())
     timeout = float(os.environ.get("FLYDSL_QR_TIMEOUT", "3600"))
     pool = get_context("spawn").Pool(processes=world_size)
     try:
         futs = [
             pool.apply_async(
-                _run_rank_fused,
+                worker,
                 kwds={
                     "rank": rank,
                     "tp": world_size,
                     "init_method": init_method,
-                    "cases": cases,
-                    "algorithm": algorithm,
-                    "codecs": codecs,
-                    "solo": solo,
-                    "engine_kw": engine_kw,
+                    **kwds,
                 },
             )
             for rank in range(world_size)
@@ -1817,6 +1808,28 @@ def _spawn_fused(
     finally:
         pool.join()
     return ranks
+
+
+def _spawn_fused(
+    world_size: int,
+    cases: list[tuple[int, int]],
+    *,
+    algorithm: str = "ring",
+    codecs: tuple[str | None, str | None] = (None, None),
+    solo: bool = False,
+    engine_kw: dict | None = None,
+    eps: float = RMS_EPS,
+) -> list[list[dict]]:
+    return _spawn_ranks(
+        _run_rank_fused,
+        world_size,
+        cases=cases,
+        algorithm=algorithm,
+        codecs=codecs,
+        solo=solo,
+        engine_kw=engine_kw,
+        eps=eps,
+    )
 
 
 _FUSED_BATCH_CACHE: dict[tuple, dict[tuple[int, int], list[dict]]] = {}
@@ -1883,8 +1896,9 @@ _FUSED_PAD_CASES = (
 # (tp, tokens, hidden) of the lossless one-live-rank residual equality.
 _FUSED_EXACT_CASES = ((2, 512, 4096),)
 
-# (tp, tokens, hidden) of the mesh cross-rank bit-identity check.
-_FUSED_MESH_AGREE_CASES = ((4, 1024, 5120),)
+# (tp, tokens, hidden) of the cross-rank bit-identity check, run for each of
+# the mesh and the ring.
+_FUSED_AGREE_CASES = ((4, 1024, 5120),)
 
 #: ``tokens`` is large enough that a pinned ST=8 really runs ST=8 at every
 #: world size and inbox type here; the test checks it.
@@ -2068,21 +2082,197 @@ def test_quick_allreduce_rmsnorm_residual_is_bit_exact(tp, tokens, hidden, algor
 
 
 @benchmark()
-def test_quick_allreduce_rmsnorm_mesh_ranks_agree(tp, tokens, hidden):
-    """Every mesh rank must compute the same bits.
+def test_quick_allreduce_rmsnorm_ranks_agree(tp, tokens, hidden, algorithm):
+    """Every rank must compute the same bits, in the mesh and in the ring.
 
-    The mesh dequantizes the same wire bytes for every atom, so its output is a
-    pure function of what went over the wire and the ranks cannot diverge. The
-    **ring** deliberately can: at the seam op it stores its own chunk from the
-    unquantized accumulator, which is a better value than the one its peers
-    receive -- so this gate is mesh-only, and a ring that passed it would mean
-    that optimization had been lost.
+    A rank's own share never goes through the codec on its way out, and in the
+    ring its own chunk is stored from the accumulator at the seam op -- but the
+    value is the dequant of the very packet its peers receive, so the output is
+    still a pure function of what went over the wire. A rank that used its
+    unquantized accumulator instead would disagree, and this is what catches it.
     """
-    rows = _fused_batch((tp, "sqnr", "mesh"), [(tokens, hidden)], algorithm="mesh")[
-        (tokens, hidden)
-    ]
-    _check(f"tp{tp} {tokens}x{hidden} mesh", _fused_disagree_fails(rows))
+    rows = _fused_batch(
+        (tp, "sqnr", algorithm), [(tokens, hidden)], algorithm=algorithm
+    )[(tokens, hidden)]
+    _check(f"tp{tp} {tokens}x{hidden} {algorithm}", _fused_disagree_fails(rows))
     return _fused_summary(rows)
+
+
+#: Large next to the oracle's mean square (about 0.3 to 0.5 here), so a kernel
+#: that dropped ``eps`` or kept 1e-6 has an rstd that is off by tens of percent.
+#: ``1e-6`` is invisible to every other test in this file.
+_FUSED_LARGE_EPS = 0.5
+
+#: (tokens, hidden) with a partial last tile on a native width: a tile holds up
+#: to ATOMS (8) rows, and none of ``_FUSED_CASES`` leaves a remainder.
+_FUSED_PARTIAL_TILE_CASES = ((1001, 4096), (37, 7168))
+
+
+@benchmark()
+def test_quick_allreduce_rmsnorm_eps(tp, tokens, hidden, label, algorithm):
+    """The fused epilogue with a large ``eps``, against the fp32 oracle."""
+    cases = [(t, h) for w, t, h, _ in _FUSED_CASES if w == tp]
+    batch = _fused_batch(
+        (tp, "eps", algorithm), cases, algorithm=algorithm, eps=_FUSED_LARGE_EPS
+    )
+    rows = batch[(tokens, hidden)]
+    _check(f"{label}/{algorithm}/eps={_FUSED_LARGE_EPS}", _fused_sqnr_fails(rows))
+    return _fused_summary(rows)
+
+
+@benchmark()
+def test_quick_allreduce_rmsnorm_production_geometry(
+    tp, tokens, hidden, label, algorithm
+):
+    """The fused epilogue on the geometry ``FlyDSLAllReduceRMSNorm`` builds.
+
+    Production pins ``atoms_per_row`` from ``FUSED_QR_ROW_ATOMS``; the other
+    tests leave it to the default, the widest block, which is a different build
+    at most widths. Skipped (``skipped`` in the row) where the table has no
+    entry for this (arch, link, tp, algorithm).
+    """
+    apr = fly_policy.fused_qr_row_atoms(
+        world_size=tp, algorithm=algorithm, link=fly_policy.detect_link()
+    )
+    if apr is None:
+        return {"gfx": ARCH, "skipped": True}
+    cases = [(t, h) for w, t, h, _ in _FUSED_CASES if w == tp]
+    batch = _fused_batch(
+        (tp, "production", algorithm),
+        cases,
+        algorithm=algorithm,
+        engine_kw={"atoms_per_row": apr},
+    )
+    rows = batch[(tokens, hidden)]
+    fails = _fused_sqnr_fails(rows) + _fused_disagree_fails(rows)
+    _check(f"{label}/{algorithm}/atoms_per_row={apr}", fails)
+    return _fused_summary(rows)
+
+
+@benchmark()
+def test_quick_allreduce_rmsnorm_partial_tile(tp, tokens, hidden, algorithm):
+    """A native width whose last tile is partial: the dead rows must not store
+    (the guard rows after each output) and the live ones must be right."""
+    batch = _fused_batch(
+        (tp, "partial", algorithm),
+        list(_FUSED_PARTIAL_TILE_CASES),
+        algorithm=algorithm,
+    )
+    rows = batch[(tokens, hidden)]
+    _check(
+        f"tp{tp} {tokens}x{hidden} {algorithm}",
+        _fused_sqnr_fails(rows) + _fused_disagree_fails(rows),
+    )
+    return _fused_summary(rows)
+
+
+#: Calls in the run-ahead loop, and how often a call's bits are checked.
+_FUSED_RUN_AHEAD_ITERS = 300
+_FUSED_RUN_AHEAD_CHECK = 25
+
+
+def _run_rank_fused_run_ahead(
+    rank: int, tp: int, init_method: str, tokens: int, hidden: int, algorithm: str
+) -> dict:
+    """One rank of the run-ahead and graph check of the fused mesh or ring.
+
+    Calls the engine back to back with no sync, rank 0 delayed every third call
+    by a GEMM, so the others run ahead into the next lap of the inbox flags --
+    the case a quiescent call never reaches. A lossy wire is deterministic, so
+    every call must reproduce call 0's bits. Then the same call is captured in
+    a HIP graph, the outputs are poisoned, and every replay must reproduce them
+    again.
+    """
+    import torch.distributed as dist
+
+    from aiter.ops.flydsl.quick_allreduce import FlyQuickAllReduceRMSNorm
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=init_method,
+        world_size=tp,
+        rank=rank,
+        device_id=device,
+    )
+    gloo = dist.new_group(backend="gloo")
+    eng = FlyQuickAllReduceRMSNorm(
+        group=gloo,
+        device=device,
+        rank=rank,
+        world_size=tp,
+        algorithm=algorithm,
+        atoms_per_row=fly_policy.fused_qr_row_atoms(
+            world_size=tp, algorithm=algorithm, link=fly_policy.detect_link()
+        ),
+    )
+    eng.min_bytes = 0
+    fails = []
+    try:
+        inp, residual, weight = _fused_inputs(tokens, hidden, rank, device)
+        eng.preload(hidden)
+        out = torch.empty_like(inp)
+        res_out = torch.empty_like(inp)
+
+        def call():
+            eng.allreduce_rmsnorm(
+                inp, residual, weight, RMS_EPS, out=out, residual_out=res_out
+            )
+
+        call()
+        torch.cuda.synchronize()
+        first = (out.clone(), res_out.clone())
+
+        def same():
+            return torch.equal(out, first[0]) and torch.equal(res_out, first[1])
+
+        drag = torch.randn(4096, 4096, device=device, dtype=torch.float32)
+        bad = 0
+        for it in range(_FUSED_RUN_AHEAD_ITERS):
+            if rank == 0 and it % 3 == 0:
+                for _ in range(3):
+                    drag = drag @ drag.T * 1e-6
+            call()
+            if it % _FUSED_RUN_AHEAD_CHECK == 0:
+                torch.cuda.synchronize()
+                bad += not same()
+        torch.cuda.synchronize()
+        bad += not same()
+        if bad:
+            fails.append(f"run-ahead: {bad} calls differ from call 0")
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for _ in range(4):
+                call()
+        for replay in range(3):
+            out.view(torch.int16).fill_(_GUARD_BITS)
+            res_out.view(torch.int16).fill_(_GUARD_BITS)
+            graph.replay()
+            torch.cuda.synchronize()
+            if not same():
+                fails.append(f"graph replay {replay} differs from call 0")
+    finally:
+        eng.close()
+        dist.destroy_process_group()
+    return {"rank": rank, "fails": fails}
+
+
+@benchmark()
+def test_quick_allreduce_rmsnorm_run_ahead(tp, tokens, hidden, algorithm):
+    """The fused mesh or ring under rank skew and in a HIP graph (see
+    ``_run_rank_fused_run_ahead``)."""
+    ranks = _spawn_ranks(
+        _run_rank_fused_run_ahead,
+        tp,
+        tokens=tokens,
+        hidden=hidden,
+        algorithm=algorithm,
+    )
+    fails = [f"rank {r['rank']}: {m}" for r in ranks for m in r["fails"]]
+    _check(f"tp{tp} {tokens}x{hidden} {algorithm}", fails)
+    return {"gfx": ARCH, "failed": bool(fails)}
 
 
 @benchmark()
@@ -2667,11 +2857,47 @@ def _verify_fused(tps, algos) -> None:
         ],
     )
     _summarize(
-        "flydsl quick allreduce rmsnorm mesh rank agreement",
+        "flydsl quick allreduce rmsnorm rank agreement",
         [
-            test_quick_allreduce_rmsnorm_mesh_ranks_agree(tp, tokens, hidden)
-            for tp, tokens, hidden in _FUSED_MESH_AGREE_CASES
-            if mesh and tp in tps
+            test_quick_allreduce_rmsnorm_ranks_agree(tp, tokens, hidden, algorithm)
+            for (tp, tokens, hidden), algorithm in itertools.product(
+                [c for c in _FUSED_AGREE_CASES if c[0] in tps], algos
+            )
+        ],
+    )
+    _summarize(
+        f"flydsl quick allreduce rmsnorm eps={_FUSED_LARGE_EPS}",
+        [
+            test_quick_allreduce_rmsnorm_eps(tp, tokens, hidden, label, algorithm)
+            for (tp, tokens, hidden, label), algorithm in itertools.product(
+                fused, algos
+            )
+        ],
+    )
+    _summarize(
+        "flydsl quick allreduce rmsnorm production geometry (atoms_per_row)",
+        [
+            test_quick_allreduce_rmsnorm_production_geometry(
+                tp, tokens, hidden, label, algorithm
+            )
+            for (tp, tokens, hidden, label), algorithm in itertools.product(
+                fused, algos
+            )
+        ],
+    )
+    _summarize(
+        "flydsl quick allreduce rmsnorm partial last tile",
+        [
+            test_quick_allreduce_rmsnorm_partial_tile(tp, tokens, hidden, algorithm)
+            for tp, algorithm in itertools.product(sorted({c[0] for c in fused}), algos)
+            for tokens, hidden in _FUSED_PARTIAL_TILE_CASES
+        ],
+    )
+    _summarize(
+        "flydsl quick allreduce rmsnorm run-ahead and graph replay",
+        [
+            test_quick_allreduce_rmsnorm_run_ahead(tp, 512, 4096, algorithm)
+            for tp, algorithm in itertools.product(sorted({c[0] for c in fused}), algos)
         ],
     )
     _summarize(
