@@ -708,13 +708,14 @@ def launch_gemm_a8w4_tdm(
             # Number of rotating A/B/A-scale/B-scale loads issued by each wave.
             TDM_PER = 4 * num_waves_per_tensor_tdm // num_waves
         nw = 1
+        WARP1 = fx.make_layout(1, 1)
         base_i32 = fx.recast_iter(p32_shared, base_ptr)
 
         # Waves in one ``wv`` differ only in runtime atom state, so the whole list
         # collapses to one atom: ``wv`` is the smallest unit needing its own code.
         Job = namedtuple(
             "Job",
-            "atom gt on_i32 lds_off lds_stage lds_row inner outer k_adv waves",
+            "atom blk on_i32 lds_off lds_stage lds_row inner outer k_adv waves",
         )
         jobs = []
         as_prologue_jobs = []
@@ -749,6 +750,10 @@ def launch_gemm_a8w4_tdm(
             inner_seg = inner // len(wv) if split_i else inner
             wave_outer_off = 0 if split_i or len(wv) == 1 else (wave - wv[0]) * seg
             wave_inner_off = (wave - wv[0]) * inner_seg if split_i else 0
+            ext = None if oob is None else oob - wave_outer_off
+            # The coordinate rest carries the K tile number, so the view spans
+            # every K tile rather than one; k_adv == 0 means a single tile.
+            tile = (seg, inner_seg)
             gt = tensor_view(
                 g_base
                 + (
@@ -756,22 +761,17 @@ def launch_gemm_a8w4_tdm(
                     + fx.Int64(wave_outer_off) * g_stride
                     + fx.Int64(wave_inner_off)
                 ),
-                (seg, inner_seg),
+                (seg if ext is None else ext, inner_seg * (K_TILES if k_adv else 1)),
                 (g_stride, 1),
             )
-            ext = None if oob is None else oob - wave_outer_off
-            pad_kw = {"pad_interval": pad[0], "pad_amount": pad[1]} if pad else {}
-            atom = fx.rocdl.make_tdm_atom(
+            atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                fx.rocdl.TensorLoad(cache_modifier=cache_modifier),
                 gt,
-                [ext, None],
-                strides=[g_stride, None],
+                fx.make_layout(tile, (lds_row, 1)),
+                tile,
                 num_warps=nw,
-                # Descriptor bit 21: release to the peers already present and
-                # re-broadcast later, so early arrivals are not held for a merge.
-                early_timeout=bool(wg_mask is not None),
-                cache_modifier=cache_modifier,
-                **pad_kw,
             )
+            blk = fx.zipped_divide(coord, tile)[None, (0, None)]
             if const_expr(wg_mask is not None):
                 # A runtime zero mask keeps a partial-M tail on the ordinary
                 # global-load path; nonzero masks select CLUSTER_LOAD_ASYNC.
@@ -779,7 +779,7 @@ def launch_gemm_a8w4_tdm(
             (jobs if target_jobs is None else target_jobs).append(
                 Job(
                     atom,
-                    gt,
+                    blk,
                     on_i32,
                     lds_off + wave_outer_off * lds_row + wave_inner_off,
                     lds_stage,
@@ -925,10 +925,11 @@ def launch_gemm_a8w4_tdm(
                 base = base_i32 if j.on_i32 else base_i8
                 dst = lds_view(
                     base + j.lds_off + s * j.lds_stage,
-                    (j.outer, j.inner),
-                    (j.lds_row, 1),
+                    ((j.outer, j.inner), 1),
+                    ((j.lds_row, 1), j.outer * j.lds_row),
                 )
-                fx.copy(j.atom, j.gt, dst, imm_offset=fx.Int64(kt * j.k_adv))
+                ts, tg = fx.rocdl.cdna5.tdm_partition(j.atom, 0, WARP1, dst, j.blk)
+                fx.copy(j.atom, tg[None, fx.Int32(kt) if j.k_adv else 0], ts[None, 0])
 
             if const_expr(my_jobs is not None):
                 for j in my_jobs:
@@ -952,10 +953,13 @@ def launch_gemm_a8w4_tdm(
                 if owns(job.waves):
                     destination = tensor_view(
                         base_i32 + job.lds_off,
-                        (job.outer, job.inner),
-                        (job.lds_row, 1),
+                        ((job.outer, job.inner), 1),
+                        ((job.lds_row, 1), job.outer * job.lds_row),
                     )
-                    fx.copy(job.atom, job.gt, destination)
+                    ts, tg = fx.rocdl.cdna5.tdm_partition(
+                        job.atom, 0, WARP1, destination, job.blk
+                    )
+                    fx.copy(job.atom, tg[None, 0], ts[None, 0])
 
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
