@@ -269,12 +269,19 @@ def topk_per_row_radix_stream_block_threads(rows: int, k: int) -> int:
     return _BLOCK_THREADS
 
 
+def _held_entries(k: int, terminal: bool) -> int:
+    """Entries of the winner buffer: k, or one for a `terminal` build, whose
+    winners go straight to the output."""
+    return 1 if terminal else k
+
+
 def _resolve_lds(
     k: int,
     block_threads: int,
     lds_budgets: tuple[int, int],
     vec: int,
     plan: tuple[int, int] | None = None,
+    terminal: bool = False,
 ):
     """The (unroll, soft_trigger) the LDS budget allows, or None if none does.
 
@@ -296,12 +303,16 @@ def _resolve_lds(
 
     Takes the budgets rather than reading them so it stays arithmetic: the
     sizing for a card this box does not have has to be testable without it.
+
+    A `terminal` build writes its winners straight to the output, so its winner
+    buffer is counted at the size it has, `_held_entries`.
     """
     tile = block_threads * vec
+    held = _held_entries(k, terminal)
 
     def fits(unroll, soft, budget):
         cap = k + soft + unroll * tile
-        return (cap + k) * 8 + _NUM_BUCKETS * 4 + 4096 <= budget
+        return (cap + held) * 8 + _NUM_BUCKETS * 4 + 4096 <= budget
 
     budgets = dict.fromkeys(lds_budgets)
     if plan is not None and any(fits(*plan, budget) for budget in budgets):
@@ -369,12 +380,16 @@ def topk_per_row_radix_stream_window_cap(
     lds_budgets: tuple[int, int] | None = None,
     vec: int = _VEC,
     lds_plan: tuple[int, int] | None = None,
+    terminal: bool = False,
 ) -> int:
-    """Maximum row width that completes in the initial candidate window, the
-    widest a `terminal` build may be given; its `topk_stream_config` reports
-    the same `window_cap`."""
+    """Maximum row width that completes in the initial candidate window of a
+    build sized as `terminal` says; with `terminal`, the widest a `terminal`
+    build may be given. Its `topk_stream_config` reports the same
+    `window_cap`."""
     lds_budgets = lds_budgets or _lds_budgets()
-    resolved = _resolve_lds(k, block_threads, lds_budgets, vec, plan=lds_plan)
+    resolved = _resolve_lds(
+        k, block_threads, lds_budgets, vec, plan=lds_plan, terminal=terminal
+    )
     if resolved is None:
         raise ValueError(
             "[FlyDSL topk_per_row_radix_stream] no LDS plan for "
@@ -405,7 +420,7 @@ def build_topk_per_row_radix_stream_module_for_width(
         and width > k
         and width
         <= topk_per_row_radix_stream_window_cap(
-            k, block_threads, lds_budgets, lds_plan=lds_plan
+            k, block_threads, lds_budgets, lds_plan=lds_plan, terminal=True
         )
     )
     return build_topk_per_row_radix_stream_module(
@@ -520,7 +535,7 @@ def build_topk_per_row_radix_stream_module(
     buckets_per_thread = _NUM_BUCKETS // block_threads
     tile = block_threads * vec
     unroll, soft_trigger = _resolve_lds(
-        k, block_threads, lds_budgets, vec, plan=lds_plan
+        k, block_threads, lds_budgets, vec, plan=lds_plan, terminal=terminal
     )
     arrivals_cap = soft_trigger + unroll * tile
     capacity = k + arrivals_cap
@@ -534,12 +549,16 @@ def build_topk_per_row_radix_stream_module(
     # Rounding down rather than up keeps it inside the buffer.
     window_cap = _window_cap(k, block_threads, vec, unroll, soft_trigger)
 
+    # Winners of a terminal build go straight to the output; its winner buffer
+    # keeps one slot only so the stores that never run there still have one.
+    held = _held_entries(k, terminal)
+
     @fx.struct
     class SharedStorage:
         cand_key: fx.Array[Int32, capacity, 16]
         cand_col: fx.Array[Int32, capacity, 16]
-        keep_key: fx.Array[Int32, k, 16]
-        keep_col: fx.Array[Int32, k, 16]
+        keep_key: fx.Array[Int32, held, 16]
+        keep_col: fx.Array[Int32, held, 16]
         hist: fx.Array[Int32, _NUM_BUCKETS, 16]
         scan: fx.Array[Int32, num_waves, 16]
         state: fx.Array[Int32, _ST_SLOTS, 16]
@@ -579,8 +598,8 @@ def build_topk_per_row_radix_stream_module(
         storage = fx.SharedAllocator().allocate(SharedStorage)
         cand_key = storage.cand_key.peek().view(fx.make_layout(capacity, 1))
         cand_col = storage.cand_col.peek().view(fx.make_layout(capacity, 1))
-        keep_key = storage.keep_key.peek().view(fx.make_layout(k, 1))
-        keep_col = storage.keep_col.peek().view(fx.make_layout(k, 1))
+        keep_key = storage.keep_key.peek().view(fx.make_layout(held, 1))
+        keep_col = storage.keep_col.peek().view(fx.make_layout(held, 1))
         hist = storage.hist.peek().view(fx.make_layout(_NUM_BUCKETS, 1))
         scan = storage.scan.peek().view(fx.make_layout(num_waves, 1))
         state = storage.state.peek().view(fx.make_layout(_ST_SLOTS, 1))
@@ -1115,7 +1134,7 @@ def build_topk_per_row_radix_stream_module(
         "capacity": capacity,
         "window_cap": window_cap,
         "arrivals_cap": arrivals_cap,
-        "lds_bytes": (capacity + k) * 8 + _NUM_BUCKETS * 4,
+        "lds_bytes": (capacity + held) * 8 + _NUM_BUCKETS * 4,
         "labelled": labelled,
         "terminal": terminal,
     }

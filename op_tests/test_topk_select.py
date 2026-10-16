@@ -684,7 +684,9 @@ def test_terminal_window():
     for rows in (8, 64, 512):
         bt = st.topk_per_row_radix_stream_block_threads(rows, k)
         plan = st.topk_per_row_radix_stream_lds_plan(rows, 4 * k, k)
-        cap = st.topk_per_row_radix_stream_window_cap(k, bt, budgets, lds_plan=plan)
+        cap = st.topk_per_row_radix_stream_window_cap(
+            k, bt, budgets, lds_plan=plan, terminal=True
+        )
         cfg = st.build_topk_per_row_radix_stream_module(
             k, 64, terminal=True, block_threads=bt, lds_budgets=budgets, lds_plan=plan
         ).topk_stream_config
