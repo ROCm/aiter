@@ -121,8 +121,17 @@ class _FusedScatterCombine:
 
     @staticmethod
     def _slot_count(config: MegaMoEConfig) -> int:
-        """comb_inp slots: one a route."""
-        return config.max_tokens_per_rank * config.topk
+        """comb_inp slots: one a route, or the per-rank scatter's padded runs."""
+        max_routes = config.max_tokens_per_rank * config.topk
+        if not config.per_rank_scatter:
+            return max_routes
+        from ..compact_plan import compact_dense_comb_slots
+
+        return compact_dense_comb_slots(
+            max_routes=max_routes,
+            npes=config.world_size,
+            experts_per_rank=config.experts_per_rank,
+        )
 
     @classmethod
     def regions(cls, config: MegaMoEConfig, caps=None) -> dict:

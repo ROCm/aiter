@@ -16,6 +16,13 @@ import torch
 # Both plane bases stay cache-line aligned -- the payload plane is a multiple of
 # 128 bytes and the slot stride is a power of two -- and that must not slip.
 COMBINE_SCALE_BLOCK = 32
+# The per-rank scatter's dense comb_inp starts every (src, dest, expert) run of
+# slots on a fresh block of this many slots, at the residue of its first compact
+# row, so ``slot - row`` is a multiple of it. gemm2's planar scale stores (8 B a
+# slot) then cover whole 128 B lines and never share one with another run: TDM
+# commits whole lines, so a shared one can land a run's stale bytes over its
+# neighbour's, and a partial line over the fabric costs several times a whole.
+COMBINE_SLOT_ALIGN = 16
 
 _DTYPE_INFO = {
     torch.int8: ("|i1", 1, None),
@@ -101,7 +108,7 @@ class Stage2ScatterContext:
     # [N/256][slot] x 8 B e8m0 region that replaces the slots' scale plane, so a
     # peer's run of slots takes its 8-byte scale slices as one contiguous store.
     combine_scale_offset: int = 0
-    # Slots per N/256 column block of that region (max_tokens_per_rank * topk).
+    # Slots per N/256 column block of that region (compact_dense_comb_slots).
     combine_scale_slots: int = 0
 
     def __post_init__(self):
