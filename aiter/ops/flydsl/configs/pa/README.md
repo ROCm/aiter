@@ -31,7 +31,7 @@ below. Each invocation searches the requested shape and retains cached results
 for other shapes. `--context-length` accepts one length for all batch rows or one
 length per row; lengths include query tokens. Use `--kv-dtype bf16` for unscaled
 BF16 K/V and `--help` for all shape, layout, window, sink, and device options.
-`--layout nhd` tunes the `[pages, 64, KV heads, 256]` FP8 per-tensor cache.
+`--layout nhd` tunes the `[pages, 64, KV heads, 256]` FP8 cache.
 
 Python callers can import `prepare_pa_decode_plan` from
 `aiter.ops.flydsl.pa_decode_tuning` (or `aiter.ops.flydsl`) and pass their actual

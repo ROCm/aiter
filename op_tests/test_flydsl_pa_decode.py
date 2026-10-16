@@ -189,6 +189,12 @@ def _make_inputs(
         # Give both quantization modes the same V absmax; the other channels
         # still isolate the probability-tail mass.
         value[first_page, :, 0, 0] = 3.5
+    elif pattern == "varied":
+        # Uniform draws quantize to nearly one per-token scale, so a shifted
+        # scale still matches the oracle. Token magnitudes spanning about a
+        # decade make a wrong scale index fail it.
+        key.mul_(torch.randn_like(key[..., :1]).mul_(0.4).exp_())
+        value.mul_(torch.randn_like(value[..., :1]).mul_(0.4).exp_())
 
     context = torch.tensor(lengths, dtype=torch.int32, device=device)
     return query, key, value, table, context
@@ -339,10 +345,10 @@ _BF16_CASES = _COMMON_CASES + [
         for dim in (256, 128)
     ],
 ]
-# FP8 per-tensor head 256, page 64, plain V, uniform query length with at most
-# 32 query rows: the gfx950 pipe. Dense CU-count budgets and a plan-independent
-# staging bound select its specialization; other architectures run the same
-# cases on the generic path.
+# FP8 head 256, page 64, plain V, uniform query length with at most 32 query
+# rows: the gfx950 pipe, for per-tensor and per-token scales. Dense CU-count
+# budgets and a plan-independent staging bound select its specialization;
+# other architectures run the same cases on the generic path.
 _PIPE_BASE = {
     "kv_dtype": "fp8",
     "scale_mode": "per-tensor",
@@ -357,7 +363,7 @@ _PIPE_CASES = [
     # At GQA 8, query length q gives 8 * q rows: one M-tile at 1 and 2 (1 pads
     # it), two at 3 and 4 (3 pads the second). Lengths put some row's causal
     # edge on a page or tile boundary, and lengths below q leave rows empty.
-    # P is FP8, so random rows see 0, 1 or at least 6 tokens; the per-token
+    # P is FP8, so random rows see 0, 1 or at least 6 tokens; the token
     # one-hot query-length-3 case covers 2 to 5 exactly. Packed plain V takes
     # the same pipe as NHD.
     #
@@ -464,6 +470,64 @@ _PIPE_CASES = [
             "max_partitions": 8,
             "nhd_bufs": 2,
             "capture": True,
+        },
+    ),
+    # Per-token scales take the same pipe. The wide grid takes the one-buffer
+    # NHD path, whose V gather must not be replaced by a plain-V reload.
+    (
+        "d256-page64-per-token",
+        {
+            **_PIPE_BASE,
+            "scale_mode": "per-token",
+            "lengths": (1, 65, 257, 1027),
+            "max_partitions": 4,
+            "pattern": "varied",
+        },
+    ),
+    (
+        "d256-page64-q4-per-token",
+        {
+            **_PIPE_BASE,
+            "scale_mode": "per-token",
+            "query_length": 4,
+            "lengths": (0, 1, 65, 257, 2049),
+            "max_partitions": 4,
+            "pattern": "varied",
+        },
+    ),
+    (
+        "nhd-d256-page64-per-token",
+        {
+            **_NHD_BASE,
+            "scale_mode": "per-token",
+            "lengths": (1, 65, 257, 1027),
+            "max_partitions": 4,
+            "pattern": "varied",
+            "nhd_bufs": 2,
+        },
+    ),
+    (
+        "nhd-d256-page64-q4-per-token",
+        {
+            **_NHD_BASE,
+            "scale_mode": "per-token",
+            "query_length": 4,
+            "lengths": (0, 1, 65, 257, 2049),
+            "max_partitions": 4,
+            "pattern": "varied",
+            "nhd_bufs": 2,
+        },
+    ),
+    (
+        "nhd-d256-page64-per-token-wide",
+        {
+            **_NHD_BASE,
+            "scale_mode": "per-token",
+            "kv_heads": 3,
+            "lengths": (1, 65, 32600),
+            "max_partitions": 32,
+            "pattern": "varied",
+            "nhd_bufs": 1,
         },
     ),
 ]
@@ -892,12 +956,12 @@ def test_stage_bound_covers_plan(device):
 
 
 def test_pa_decode_nhd_rejected(device, monkeypatch):
-    """NHD is the gfx950 FP8 per-tensor dense page-64 path, at most 32 query rows."""
+    """NHD is the gfx950 FP8 dense page-64 path, at most 32 query rows."""
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
     fp8 = (
         torch.float8_e4m3fn if get_gfx_runtime() == "gfx950" else torch.float8_e4m3fnuz
     )
-    variants = ["bf16", "per-token", "mtp", "window", "page128"]
+    variants = ["bf16", "mtp", "window", "page128"]
     if get_gfx_runtime() != "gfx950":
         variants.insert(0, "arch")
 
@@ -915,11 +979,7 @@ def test_pa_decode_nhd_rejected(device, monkeypatch):
         cache = torch.zeros((2, page, 1, 256), dtype=dtype, device=device)
         context = torch.tensor([page], dtype=torch.int32, device=device)
         table = torch.zeros((1, 1), dtype=torch.int32, device=device)
-        scale = torch.ones(
-            (2, 1, page) if variant == "per-token" else (1,),
-            dtype=torch.float32,
-            device=device,
-        )
+        scale = torch.ones(1, dtype=torch.float32, device=device)
         plan = pa.plan_pa_decode(
             context,
             1,

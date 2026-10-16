@@ -228,13 +228,12 @@ def pa_decode(
     A 4D ``key_cache`` selects the NHD layout: K and V are equally shaped
     [num_blocks, 64, num_kv_heads, 256] views with a contiguous head axis and
     arbitrary other strides, e.g. both halves of one 512-byte token row. NHD
-    requires gfx950, FP8 KV, head 256, page 64, per-tensor scales, no sliding
-    window, and a uniform query_length whose rows (query_length times the GQA
-    group size) fit two 16-row M-tiles, e.g. query_length 1-4 at GQA 8. Each
-    view must be 16-byte
-    aligned with 16-byte multiple strides, its token rows must not overlap, and
-    its strides and in-page span must fit int32; heads-outermost storage with
-    several KV heads is thus limited to 2 GiB per head.
+    requires gfx950, FP8 KV, head 256, page 64, no sliding window, and a
+    uniform query_length whose rows (query_length times the GQA group size)
+    fit two 16-row M-tiles, e.g. query_length 1-4 at GQA 8. Each view must be
+    16-byte aligned with 16-byte multiple strides, its token rows must not
+    overlap, and its strides and in-page span must fit int32; heads-outermost
+    storage with several KV heads is thus limited to 2 GiB per head.
 
     BF16 K/V requires BF16 queries, compute_type=torch.bfloat16, no K/V scales,
     and vectorized 5D caches with x=8; FP8 uses x=16. BF16 Q/P operands stay
@@ -675,15 +674,14 @@ def pa_decode(
             head_dim,
             block_size,
             trans_v,
-            per_token_kv,
             query_length,
             query_group_size,
             sliding_window,
         ):
             raise NotImplementedError(
-                "NHD pa_decode requires gfx950, FP8 KV, head 256, page 64, "
-                "per-tensor scales, no sliding window, and a uniform "
-                "query_length * query_group_size of at most 32 rows"
+                "NHD pa_decode requires gfx950, FP8 KV, head 256, page 64, no "
+                "sliding window, and a uniform query_length * query_group_size "
+                "of at most 32 rows"
             )
         stride_k_block, stride_k_token, stride_k_head = _nhd_strides(key_cache)
         stride_v_block, stride_v_token, stride_v_head = _nhd_strides(value_cache)

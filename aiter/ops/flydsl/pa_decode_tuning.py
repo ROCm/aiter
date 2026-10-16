@@ -166,7 +166,6 @@ def _default_workgroup_budget(
     head_dim,
     block_size,
     kv_dtype,
-    per_token_kv,
     trans_v,
     query_length,
     query_group_size,
@@ -179,7 +178,6 @@ def _default_workgroup_budget(
         head_dim,
         block_size,
         trans_v,
-        per_token_kv,
         query_length,
         query_group_size,
         sliding_window,
@@ -198,7 +196,6 @@ def _pa_decode_default(*args, **kwargs):
                     "head_dim",
                     "block_size",
                     "kv_dtype",
-                    "per_token_kv",
                     "trans_v",
                     "query_length",
                     "query_group_size",
@@ -352,9 +349,6 @@ def prepare_pa_decode_plan(
             head_dim=query.shape[-1],
             block_size=block_size,
             kv_dtype=str(key_cache.dtype),
-            per_token_kv=(
-                isinstance(key_scale, torch.Tensor) and key_scale.numel() > 1
-            ),
             trans_v=value_cache.ndim == 5,
             query_length=query_length,
             query_group_size=query.shape[1] // num_kv_heads,
@@ -484,7 +478,7 @@ def _parse_args(argv=None):
         "--layout",
         choices=("packed", "nhd"),
         default="packed",
-        help="nhd: [pages, 64, KV heads, 256] FP8 per-tensor K/V; implies --trans-v 0.",
+        help="nhd: [pages, 64, KV heads, 256] FP8 K/V; implies --trans-v 0.",
     )
     parser.add_argument("--trans-v", type=int, choices=(0, 1))
     parser.add_argument("--sliding-window", type=int, default=0)
@@ -511,14 +505,11 @@ def _parse_args(argv=None):
     if args.layout == "nhd":
         if args.trans_v == 1:
             parser.error("--layout nhd requires --trans-v 0")
-        if args.scale_mode not in (None, "per-tensor"):
-            parser.error("--layout nhd requires --scale-mode per-tensor")
         if (args.kv_dtype, args.head_dim, args.block_size) != ("fp8", 256, 64):
             parser.error(
                 "--layout nhd requires --kv-dtype fp8 --head-dim 256 --block-size 64"
             )
         args.trans_v = 0
-        args.scale_mode = "per-tensor"
     elif args.trans_v is None:
         args.trans_v = 1
     if args.scale_mode is None:
