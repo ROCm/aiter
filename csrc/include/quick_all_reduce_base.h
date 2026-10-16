@@ -50,10 +50,11 @@ static constexpr int kTileSize = kBlockSize * kAtoms * sizeof(int32x4_t);
 // Max number of blocks. 304 CUs on MI300
 static constexpr int kMaxNumBlocks = 304 * 4;
 
-// Keep launch geometry architecture-independent. Device code derives its
-// linear thread id from blockDim.x, so this works for wave32 and wave64.
-static constexpr int kBlockX        = 64;
-static dim3 constexpr kBlockTwoShot = {kBlockX, kBlockSize / kBlockX, 1};
+// Standard CDNA wavefront size.
+static constexpr int kWavefront = 64;
+
+// 256 thread, 4 wavefronts.
+static dim3 constexpr kBlockTwoShot = {kWavefront, kBlockSize / kWavefront, 1};
 
 // Number of threads in a group for quantization
 // It corresponds to 32 F16 elements in quantization block
