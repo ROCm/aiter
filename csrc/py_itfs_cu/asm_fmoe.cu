@@ -233,7 +233,7 @@ class FMoeKernel
         {
 
             bdx = 256;
-            gdx = this->num_persistent_tgs;
+            gdx = args.total_tgs;
             gdy = 1;
             gdz = 1;
         }
