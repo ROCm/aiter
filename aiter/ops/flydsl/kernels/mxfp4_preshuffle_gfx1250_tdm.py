@@ -1678,11 +1678,8 @@ def launch_gemm_a8w4_tdm(
             # Unpadded, a row is STORE_N/2 dwords (a multiple of 32), so the 16
             # rows one b128 writes all hit one bank -- 16-way. +16 cols spreads
             # them to 4-way, the b128 floor. Pad cols never reach global.
-            STORE_PAD = (
-                c_lds_pad_elems
-                if const_expr(enable_ep_scatter)
-                else (16 if not stage1_act else 0)
-            )
+            # The scatter path keeps its pad; the TDM store cannot drain one.
+            STORE_PAD = c_lds_pad_elems if const_expr(enable_ep_scatter) else 0
             STORE_PITCH = STORE_N + STORE_PAD
             neg_limit = fx.Float32(0.0) - f32_swiglu_limit
             is_swiglu = stage1_act == 2
@@ -2208,46 +2205,25 @@ def launch_gemm_a8w4_tdm(
                     oc_store = oc
                     c_iter = fx.recast_iter(oc, arg_c)
                 c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
-                if const_expr(STORE_PAD == 0):
-                    c_tile = (tile_m, STORE_N)
-                    gtC = tensor_view(
-                        c_iter + c_off_rt, (mn_oob, STORE_N), (out_stride, 1)
-                    )
-                    atomC, coordC = fx.rocdl.cdna5.make_tiled_tdm_atom(
-                        fx.rocdl.TensorStore(),
-                        gtC,
-                        fx.make_layout(c_tile, (STORE_N, 1)),
-                        c_tile,
-                        num_warps=num_waves,
-                    )
-                    blkC = fx.zipped_divide(coordC, c_tile)[None, (0, None)]
-                    src = tensor_view(
-                        fx.recast_iter(oc_store, base_ptr),
-                        (c_tile, 1),
-                        ((STORE_N, 1), tile_m * STORE_N),
-                    )
-                    tCs, tCg = fx.rocdl.cdna5.tdm_partition(
-                        atomC, wave, fx.make_layout(num_waves, 1), src, blkC
-                    )
-                    fx.copy(atomC, tCs[None, 0], tCg[None, 0])
-                else:
-                    # The LDS tile is (tile_m, STORE_PITCH) dense; the per-dim OOB
-                    # extent clamps the inner axis to STORE_N so the pad never lands.
-                    gtC = tensor_view(
-                        c_iter + c_off_rt, (tile_m, STORE_PITCH), (out_stride, 1)
-                    )
-                    atomC = fx.rocdl.make_tdm_atom(
-                        gtC,
-                        [mn_oob, STORE_N],
-                        strides=[out_stride, None],
-                        num_warps=num_waves,
-                    )
-                    src = tensor_view(
-                        fx.recast_iter(oc_store, base_ptr),
-                        (tile_m, STORE_PITCH),
-                        (STORE_PITCH, 1),
-                    )
-                    fx.copy(atomC, src, gtC)
+                c_tile = (tile_m, STORE_N)
+                gtC = tensor_view(c_iter + c_off_rt, (mn_oob, STORE_N), (out_stride, 1))
+                atomC, coordC = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                    fx.rocdl.TensorStore(),
+                    gtC,
+                    fx.make_layout(c_tile, (STORE_N, 1)),
+                    c_tile,
+                    num_warps=num_waves,
+                )
+                blkC = fx.zipped_divide(coordC, c_tile)[None, (0, None)]
+                src = tensor_view(
+                    fx.recast_iter(oc_store, base_ptr),
+                    (c_tile, 1),
+                    ((STORE_N, 1), tile_m * STORE_N),
+                )
+                tCs, tCg = fx.rocdl.cdna5.tdm_partition(
+                    atomC, wave, fx.make_layout(num_waves, 1), src, blkC
+                )
+                fx.copy(atomC, tCs[None, 0], tCg[None, 0])
                 if const_expr(stage1_quant_out and stage1_act):
                     rocdl.s_wait_storecnt(0)
                 rocdl.s_wait_tensorcnt(0)
