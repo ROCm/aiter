@@ -49,6 +49,7 @@ SHAPES = [
     (129, 6144, 768, 5),  # MiniMax-M3
     (129, 6144, 1536, 5),  # MiniMax-M3 TP=2
     (128, 6144, 768, 4),  # MiniMax-M3 shared expert not fused, TP=4
+    (128, 6144, 1536, 4),  # MiniMax-M3 shared expert not fused, TP=2
     (256, 3072, 256, 8),  # MiniMax-M2.5 TP=6
     (256, 3072, 512, 8),  # MiniMax-M2.5 (INTER 384 pads to 512)
     (256, 7168, 256, 8),  # DSV3/Kimi-K2 E256
