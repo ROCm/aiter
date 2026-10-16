@@ -1124,6 +1124,8 @@ def fused_moe(
     quant_type_a: QuantType | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    herd_topk: int = 0,
+    herd_routed_scaling_factor: float = 1.0,
     # False explicitly selects unclamped shared-expert SiLU semantics.
     clamp_shared: bool = True,
 ):
@@ -1151,6 +1153,8 @@ def fused_moe(
     if not clamp_shared and not has_shared_expert:
         raise ValueError("clamp_shared=False requires FHMoE shared-expert dispatch")
     if has_shared_expert:
+        if herd_topk:
+            raise ValueError("herd_topk does not support fused shared experts")
         routed_mxfp8 = w1 is not None and w1.dtype == dtypes.fp8
         unsupported = []
         if stage2_scatter is not None:
@@ -1268,6 +1272,8 @@ def fused_moe(
         quant_type_a=None if quant_type_a is None else quant_type_a.value,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        herd_topk=herd_topk,
+        herd_routed_scaling_factor=herd_routed_scaling_factor,
     )
 
 
@@ -1310,6 +1316,8 @@ def fused_moe_fake(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    herd_topk: int = 0,
+    herd_routed_scaling_factor: float = 1.0,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -1371,6 +1379,8 @@ def fused_moe_(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    herd_topk: int = 0,
+    herd_routed_scaling_factor: float = 1.0,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -1414,6 +1424,8 @@ def fused_moe_(
         quant_type_a=quant_type_a,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        herd_topk=herd_topk,
+        herd_routed_scaling_factor=herd_routed_scaling_factor,
     )
 
 
@@ -1448,6 +1460,8 @@ def _fused_moe_impl(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    herd_topk: int = 0,
+    herd_routed_scaling_factor: float = 1.0,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1559,10 +1573,17 @@ def _fused_moe_impl(
             situ_beta=1.0 if beta is None else float(beta),
             situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
             stage2_scatter=stage2_scatter,
+            herd_topk=herd_topk,
+            herd_routed_scaling_factor=herd_routed_scaling_factor,
         )
 
     if grouped_a8w4_out is not None:
         return _return_output(grouped_a8w4_out, output)
+    if herd_topk:
+        raise ValueError(
+            "herd_topk needs the gfx1250 grouped MoE path (per_1x32 MXFP4 weights, "
+            "gate_mode=INTERLEAVE), which this call does not take"
+        )
 
     # a16w4-SiTUv2 (bf16 A x MXFP4 W); SiTUv2 gate distinguishes gpt-oss (Swiglu -> cktile).
     _is_a16w4_situv2 = (
