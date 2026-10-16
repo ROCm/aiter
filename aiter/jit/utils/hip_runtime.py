@@ -43,23 +43,30 @@ def load_hip_runtime() -> ctypes.CDLL:
 
 
 @functools.lru_cache(maxsize=1)
-def get_hip_runtime_version() -> tuple[int, int, int] | None:
-    """(major, minor, patch) of the loaded runtime, or None if unavailable.
-
-    The loaded library, not the ROCm installed on disk or the one torch was built
-    against; only it can say how an attribute ordinal will be read.
-    """
-    try:
-        libhip = load_hip_runtime()
-        val = ctypes.c_int(0)
-        if libhip.hipRuntimeGetVersion(ctypes.byref(val)) != 0:
-            return None
-    except Exception:  # noqa: BLE001
-        return None
+def _query_hip_runtime_version() -> tuple[int, int, int]:
+    """Cache successful version reads; exceptions are not cached."""
+    libhip = load_hip_runtime()
+    val = ctypes.c_int(0)
+    err = libhip.hipRuntimeGetVersion(ctypes.byref(val))
+    if err != 0:
+        raise RuntimeError(f"hipRuntimeGetVersion failed with error {err}")
 
     # HIP_VERSION = major * 10000000 + minor * 100000 + patch
     raw = val.value
     return raw // 10_000_000, (raw // 100_000) % 100, raw % 100_000
+
+
+def get_hip_runtime_version() -> tuple[int, int, int] | None:
+    """(major, minor, patch) of the loaded runtime, or None if unavailable.
+
+    The loaded library, not the ROCm installed on disk or the one torch was built
+    against; only it can say how an attribute ordinal will be read. Successful
+    reads are cached; failures return None and can be retried.
+    """
+    try:
+        return _query_hip_runtime_version()
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def get_current_hip_device() -> int | None:

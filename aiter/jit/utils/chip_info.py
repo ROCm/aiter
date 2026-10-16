@@ -624,7 +624,7 @@ def get_device_name():
         raise RuntimeError("Unsupported gfx")
 
 
-def _query_num_xccs(device_id: int, default: int) -> int:
+def _query_num_xccs(device_id: int) -> int:
     """Ask HIP how many XCCs the given device has."""
     import ctypes
 
@@ -638,16 +638,10 @@ def _query_num_xccs(device_id: int, default: int) -> int:
         device_id,
     )
     if err != 0:
-        # An attribute this runtime cannot answer is treated the same as a
-        # runtime too old to have it, so it takes the same default.
-        logger.warning(
-            "hipDeviceGetAttribute(NumberOfXccs) failed with error %d for "
-            "device %d; assuming %d XCDs.",
-            err,
-            device_id,
-            default,
+        raise RuntimeError(
+            f"hipDeviceGetAttribute(NumberOfXccs) failed with error {err} "
+            f"for device {device_id}"
         )
-        return default
 
     # A shifted ordinal resolves to an unrelated attribute, whose value lands well
     # outside this range. Loose because MI300A has 6 dies and partitions vary.
@@ -662,17 +656,15 @@ def _query_num_xccs(device_id: int, default: int) -> int:
 
 @functools.cache
 def _num_xcds_for_device(device_id: int) -> int:
-    """XCD count for one device ordinal, warning once per device on fallback."""
+    """Cache counts and legacy fallbacks per device; failures remain retryable."""
     default_xcd_count = 8
 
     version = get_hip_runtime_version()
     if version is None:
-        logger.warning(
-            "Could not read the HIP runtime version for device %d; assuming %d XCDs.",
-            device_id,
-            default_xcd_count,
+        raise RuntimeError(
+            f"Could not read the HIP runtime version for device {device_id}, "
+            "so the XCD count cannot be determined."
         )
-        return default_xcd_count
 
     # Below ROCm 7.0 the ordinal names a different attribute and returns a
     # plausible integer, so this gate has to precede the query.
@@ -687,14 +679,15 @@ def _num_xcds_for_device(device_id: int) -> int:
         )
         return default_xcd_count
 
-    return _query_num_xccs(device_id, default_xcd_count)
+    return _query_num_xccs(device_id)
 
 
 def get_num_xcds() -> int:
     """XCD (accelerator die) count of the device this thread is bound to.
 
-    Raises when there is no current device to ask, or when the count comes back
-    outside a plausible range.
+    Uses the historical eight-XCD fallback only for a known pre-7.0 HIP runtime.
+    Raises on device, version, or attribute query failures, or when the count
+    comes back outside a plausible range. Failed lookups can be retried.
     """
     device_id = get_current_hip_device()
     if device_id is None:
