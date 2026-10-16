@@ -5,6 +5,7 @@
 import ctypes
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -31,7 +32,12 @@ def hip(monkeypatch):
     lib.hipDeviceGetAttribute.side_effect = _hip_result(4)
     monkeypatch.setattr(hip_runtime, "load_hip_runtime", lambda: lib)
     monkeypatch.setattr(chip_info, "load_hip_runtime", lambda: lib)
-    monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx950")
+    archs = {0: "gfx950:sramecc+:xnack-", 1: "gfx950:sramecc+:xnack-"}
+    monkeypatch.setattr(
+        "torch.cuda.get_device_properties",
+        lambda device: SimpleNamespace(gcnArchName=archs[device]),
+    )
+    lib.archs = archs
     chip_info._num_xcds_for_device.cache_clear()
     hip_runtime._query_hip_runtime_version.cache_clear()
     try:
@@ -175,3 +181,17 @@ def test_default_is_returned_on_failure_without_caching(hip):
     assert chip_info.get_num_xcds() == 4
     assert chip_info.get_num_xcds(default=None) == 4
     assert hip.hipDeviceGetAttribute.call_count == 3
+
+
+def test_name_follows_the_current_device_arch(hip):
+    hip.archs[1] = "gfx942:sramecc+:xnack-"
+
+    def attribute(output, attribute, device):
+        value = {10018: 4, 10020: 0x74A2}[attribute]
+        return _hip_result(value)(output)
+
+    hip.hipDeviceGetAttribute.side_effect = attribute
+    assert chip_info.get_device_name() == "MI350P"
+    hip.hipGetDevice.side_effect = _hip_result(1)
+    assert chip_info.get_device_name() == "MI308"
+    assert hip.hipDeviceGetAttribute.call_args.args[1:] == (10020, 1)

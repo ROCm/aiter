@@ -604,18 +604,36 @@ MI308_CHIP_IDS = {0x74A2, 0x74A8, 0x74B6, 0x74BC}
 def get_device_name():
     """Name of the device this thread is bound to.
 
-    Needs a live GPU: the arch comes from the device rather than from GPU_ARCHS.
+    Needs a live GPU: the arch, PCI id and XCD count all come from that device.
     """
-    gfx = get_gfx_runtime()
+    device_id = get_current_hip_device()
+    if device_id is None:
+        raise RuntimeError(
+            "hipGetDevice failed, so there is no current device to name."
+        )
+    return _get_device_name(device_id)
+
+
+def _get_device_name(device_id: int) -> str:
+    import torch
+
+    gfx = torch.cuda.get_device_properties(device_id).gcnArchName
+    gfx = gfx.split(":", 1)[0].lower()
 
     if gfx == "gfx942":
-        chip_id = _get_pci_chip_id()
+        chip_id = _get_pci_chip_id(device_id)
         if chip_id in MI308_CHIP_IDS:
             return "MI308"
         return "MI300"
     elif gfx == "gfx950":
+        num_xcds = _num_xcds_for_device(device_id)
+        if num_xcds is None:
+            raise RuntimeError(
+                "HIP runtime predates hipDeviceAttributeNumberOfXccs, so the XCD "
+                f"count of device {device_id} cannot be determined."
+            )
         # MI350P is a half-size gfx950: 4 XCDs against 8 on MI350X and MI355X.
-        if get_num_xcds(default=None) == 4:
+        if num_xcds == 4:
             return "MI350P"
         return "MI350"
     elif gfx == "gfx1250":
