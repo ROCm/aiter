@@ -10,20 +10,18 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from .allreduce_policy import resolve_link
-from .kernels.comm.allreduce_shared import (
+from .allreduce_policy import (
+    INBOX_MEMORY_MODES,
     MAX_PAYLOAD_BYTES,
     PAYLOAD_ALIGN_BYTES,
     SUPPORTED_ARCHS,
     SUPPORTED_WORLDS,
+    default_inbox_memory,
+    resolve_link,
 )
-from .quick_allreduce_int4_ipc import UncachedIpcHeap
+from .quick_allreduce_ipc import UncachedIpcHeap
 
 logger = logging.getLogger("aiter")
-
-# How the IPC inbox is allocated. The wire protocol is identical in every
-# mode; only the memory type changes.
-INBOX_MEMORY_MODES = ("auto", "uncached", "finegrained")
 
 
 def _cuda_index(device, *, owner: str) -> int:
@@ -44,21 +42,14 @@ def _resolve_inbox_flags(
 ) -> tuple[int, str]:
     """(hipExtMallocWithFlags mode, resolved name) for an ``inbox_memory``.
 
-    ``"auto"`` is ``uncached`` on xGMI and ``finegrained`` on PCIe, except at
-    TP2, where it is ``uncached`` on PCIe too. The PCIe rule exists because
-    uncached peer writes serialize per destination and collapse as the fanout
-    widens. At TP2 every schedule writes to a single remote peer,
-    so there is nothing to collapse, and an uncached inbox skips the L2 writeback.
+    ``"auto"`` resolves to ``default_inbox_memory``.
     """
     if mode not in INBOX_MEMORY_MODES:
         raise ValueError(
             f"inbox_memory must be one of {INBOX_MEMORY_MODES}, got {mode!r}"
         )
     if mode == "auto":
-        single_peer = int(world_size) == 2
-        mode = (
-            "uncached" if single_peer or resolve_link(link) == "xgmi" else "finegrained"
-        )
+        mode = default_inbox_memory(world_size, resolve_link(link))
     flags = {
         "uncached": UncachedIpcHeap._HIP_DEVICE_MALLOC_UNCACHED,
         "finegrained": UncachedIpcHeap._HIP_DEVICE_MALLOC_FINEGRAINED,
@@ -94,6 +85,8 @@ class _StEngine:
         self._meta_ptr = None
         self._gpu_peer_ptrs = None
         self._colors = None
+        # Split-build exchange state inside the meta block; 0 when there is none.
+        self._xchg = 0
         # Setup has two collectives, the handle exchange and a final agreement.
         # A rank that fails must still take part in both, and report the
         # failure through them. If it raised at once, its peers would wait in a
@@ -151,7 +144,15 @@ class _StEngine:
         # and by this rank's own kernel, never by a peer. Stays uncached in
         # every mode -- no cross-GPU visibility question, and it is a few
         # KiB.
-        self._meta_ptr = UncachedIpcHeap.alloc_uncached(peer_bytes + color_bytes)
+        #
+        # A split fused one-shot's exchange words and per-workgroup ``prev``
+        # values follow, line-aligned after the colours. Like them, only this
+        # rank's own kernel touches it; ``alloc`` zeroes it, and zero words with
+        # zero ``prev`` are a consistent start.
+        xchg_bytes = int(self.spec.get("xchg_bytes", 0))
+        xchg_off = (peer_bytes + color_bytes + 127) // 128 * 128
+        meta_bytes = xchg_off + xchg_bytes if xchg_bytes else peer_bytes + color_bytes
+        self._meta_ptr = UncachedIpcHeap.alloc_uncached(meta_bytes)
         self._gpu_peer_ptrs = self._meta_ptr
         self._colors = self._meta_ptr + peer_bytes
         UncachedIpcHeap.copy_host_to_device(
@@ -164,6 +165,8 @@ class _StEngine:
             (ctypes.c_int32 * self.grid)(*([1] * self.grid)),
             color_bytes,
         )
+        if xchg_bytes:
+            self._xchg = self._meta_ptr + xchg_off
 
     def close(self):
         for b in self._peer_bases:
@@ -181,12 +184,46 @@ class _StEngine:
             self._meta_ptr = None
             self._gpu_peer_ptrs = None
             self._colors = None
+            self._xchg = 0
         if self._buf_ptr:
             try:
                 UncachedIpcHeap.free_device_mem(self._buf_ptr)
             except RuntimeError:
                 pass
             self._buf_ptr = None
+
+
+def check_fused_aliasing(inp, residual_in, out, residual_out, live_bytes: int) -> None:
+    """Raise unless the fused call's destinations are safe to write.
+
+    ``out`` and ``residual_out`` are written, ``inp`` and ``residual_in`` are
+    only read. Two ways to overlap are allowed:
+
+    * ``inp`` with ``residual_in``: both are read-only.
+    * ``residual_out`` is ``residual_in``: each thread reads
+      its residual atoms before it stores the sum back to the same bytes.
+    """
+
+    def span(t):
+        p = int(t.data_ptr())
+        return p, p + live_bytes
+
+    def overlap(a, b):
+        (a0, a1), (b0, b1) = span(a), span(b)
+        return max(a0, b0) < min(a1, b1)
+
+    in_place = residual_out.data_ptr() == residual_in.data_ptr()
+    for wname, w in (("out", out), ("residual_out", residual_out)):
+        for rname, r in (("inp", inp), ("residual_in", residual_in)):
+            if in_place and wname == "residual_out" and rname == "residual_in":
+                continue
+            if overlap(w, r):
+                raise ValueError(
+                    f"{wname} overlaps {rname}; only residual_out aliasing "
+                    "residual_in exactly is allowed"
+                )
+    if overlap(out, residual_out):
+        raise ValueError("out and residual_out overlap")
 
 
 def require_arch(*, owner: str) -> str:

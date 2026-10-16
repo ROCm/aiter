@@ -13,7 +13,11 @@ from torch.distributed import ProcessGroup
 import aiter as ops
 
 from ..parallel_state import in_the_same_node_as
-from .flydsl_utils import all_ranks_agree, preload_fly_engines
+from .flydsl_backends import (
+    FlyDSLAllReduceRMSNorm,
+    all_ranks_agree,
+    preload_fly_engines,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +47,9 @@ except Exception:  # noqa: BLE001
 # checked at import time.
 try:
     from aiter.ops.flydsl import allreduce_policy as fly_policy
-    from aiter.ops.flydsl.quick_allreduce_int4 import QuickAllReduceInt4
+    from aiter.ops.flydsl.quick_allreduce import (
+        FlyQuickAllReduce as QuickAllReduceInt4,
+    )
 
     _FLY_IMPORT_OK = True
 except Exception:  # noqa: BLE001
@@ -127,6 +133,7 @@ class QuickAllReduce:
         self.disabled = True
         self._fly_policy = None
         self._fly_engines: dict[str, Any] = {}
+        self._fly_rms = None
         if not qr_rocm_arch_available():
             logger.debug(
                 "Custom quick allreduce is only supported on ROCm MI300 series."
@@ -201,6 +208,28 @@ class QuickAllReduce:
 
         self.init_quick_all_reduce()
         self._init_fly_backend()
+        self._init_fly_rms_backend()
+
+    def _init_fly_rms_backend(self):
+        """Build the quantized FlyDSL fused all-reduce+RMSNorm engines."""
+        if not _FLY_IMPORT_OK or not fly_policy.enabled():
+            return
+        if getattr(self, "qr_quant_level", None) not in _FLY_REGIMES:
+            return
+        try:
+            rms = FlyDSLAllReduceRMSNorm(
+                group=self.group, device=self.device, quantized=True
+            )
+        except Exception:
+            logger.warning(
+                "FlyDSL fused AR+RMSNorm (quantized) disabled: construction failed.",
+                exc_info=True,
+            )
+            return
+        if rms.disabled:
+            rms.close()
+            return
+        self._fly_rms = rms
 
     def _init_fly_backend(self):
         """Build the FlyDSL mesh/ring engines that will serve plain all-reduce,
@@ -450,6 +479,29 @@ class QuickAllReduce:
         )
         return out
 
+    def should_fly_allreduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> bool:
+        """Whether the quantized FlyDSL fused AR+RMSNorm backend can serve
+        this call.
+        """
+        if self._fly_rms is None:
+            return False
+        return self._fly_rms.should_fly_fused_ar_rms(inp, residual_inp, weight)
+
+    def fly_allreduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(out, residual_out)`` on the quantized FlyDSL fused backend."""
+        return self._fly_rms.fly_fused_ar_rms(inp, residual_inp, weight, eps)
+
     def should_quick_allreduce_rmsnorm(
         self,
         inp: torch.Tensor,
@@ -457,6 +509,8 @@ class QuickAllReduce:
         weight: torch.Tensor,
         hidden_dim: int,
     ):
+        if self.disabled:
+            return False
         if not self._should_hip(inp):
             return False
         if inp.dtype != residual_inp.dtype or inp.dtype != weight.dtype:
@@ -500,6 +554,12 @@ class QuickAllReduce:
         # IPC inboxes opened against every peer, which have to be released
         # before the process group goes away even if the slot is disabled.
         self._close_fly_engines()
+        if getattr(self, "_fly_rms", None) is not None:
+            try:
+                self._fly_rms.close()
+            except (AttributeError, RuntimeError):
+                pass
+            self._fly_rms = None
         if getattr(self, "_ptr", None):
             if ops is not None:
                 ops.qr_destroy(self._ptr)
