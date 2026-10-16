@@ -867,6 +867,7 @@ def _compile_mxfp8_8wave_to_cache(
     # The 8-wave launcher takes (A, B, C, ...), as _compile_8wave_to_cache.
     _compile_executable_to_cache(exe, a, b, out, scale_a, scale_b, m, n, fx.Stream(0))
 
+
 def _compile_blockscale_8wave_to_cache(
     *,
     kernel_name: str,
