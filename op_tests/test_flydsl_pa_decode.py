@@ -375,6 +375,18 @@ _PIPE_CASES = [
             "staged": False,
         },
     ),
+    # max_context_length below the real context used to index past the staged
+    # page ids and fault. The tail must still match a full-context reference.
+    (
+        "d256-page64-short-bound",
+        {
+            **_PIPE_BASE,
+            "lengths": (128 * 1024,),
+            "max_partitions": 1,
+            "max_context": 8192,
+            "budget": 1,
+        },
+    ),
     # Above 64 partitions the reducer splits partitions over groups; 81 and
     # 130 leave the last group short, and sequences with few or no tasks
     # exercise the inactive-partition masking. A dropped row or tile changes
@@ -768,7 +780,13 @@ def test_pa_decode(case, device, monkeypatch):
         "sinks": sinks,
         "sliding_window": window,
         "max_context_length": (
-            context.max().item() if case["max_context"] == "lengths" else None
+            None
+            if case["max_context"] is None
+            else (
+                context.max().item()
+                if case["max_context"] == "lengths"
+                else case["max_context"]
+            )
         ),
     }
     arguments = (query, key_cache, value_cache, context, table, dim**-0.5, query_length)

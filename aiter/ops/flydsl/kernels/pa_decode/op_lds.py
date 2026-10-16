@@ -470,21 +470,40 @@ class PaDecodeKVLoader:
         )
         return fx.Vector(fx.memref_load_vec(self.v_scale_reg))
 
+    def _table_page(self, page):
+        element_offset = self.ctx.seq * self.ctx.max_blocks_per_seq + page
+        result = self.bt_buf[element_offset]
+        return (page < self.ctx.num_pages).select(fx.Int32(result), fx.Int32(0))
+
+    @flyc.jit
+    def _staged_page(self, page):
+        """Page id from LDS, or the block table when the index is outside it.
+
+        A task can own more pages than ``max_context_length`` staged. The
+        table load stays in the other branch so an in-window page does not
+        wait on it.
+        """
+        rel = page - self.ctx.part_start * (
+            self.traits.TILE_TOK // self.traits.block_size
+        )
+        page_id = fx.Int32(0)
+        if (rel >= 0) & (rel < self.traits.stage_page_capacity):
+            page_id = fx.Int32(
+                self.lds.load(self.traits.sPages_off + rel * 4, fx.Int32, 1)[0]
+            )
+        else:
+            page_id = self._table_page(page)
+        return page_id
+
     def load_pages(self, page, vec_width=1):
         # Even an in-bounds table entry can contain a stale page ID beyond
         # this context. Pin those pages to block 0 before loading K/V.
         # Staged ids were pinned the same way when they were stored.
         if const_expr(self.traits.stage_page_capacity and vec_width == 1):
-            rel = page - self.ctx.part_start * (
-                self.traits.TILE_TOK // self.traits.block_size
-            )
-            return fx.Int32(
-                self.lds.load(self.traits.sPages_off + rel * 4, fx.Int32, 1)[0]
-            )
-        element_offset = self.ctx.seq * self.ctx.max_blocks_per_seq + page
+            return self._staged_page(page)
         if const_expr(vec_width == 1):
-            result = self.bt_buf[element_offset]
-            return (page < self.ctx.num_pages).select(fx.Int32(result), fx.Int32(0))
+            return self._table_page(page)
+        element_offset = self.ctx.seq * self.ctx.max_blocks_per_seq + page
         bt_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
         frag = fx.make_fragment_like(fx.slice(self.bt_buf, (0, None)))
         fx.copy(
