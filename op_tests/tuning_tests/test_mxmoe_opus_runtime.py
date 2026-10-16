@@ -134,6 +134,38 @@ class TestMxmoeOpusRuntime(unittest.TestCase):
         self.assertTrue(native.stage1.keywords["native_scale_layout"])
         self.assertEqual(selected.block_m, 16)
 
+    def test_bm32_sort_selects_bm64_gemm2_without_changing_its_compute_policy(self):
+        self.g2 = "opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm32_rbn3584"
+        self.write_csv()
+        selected = self.select()
+        launch = selected.stage2.keywords["launch"]
+        original = self.fm._opus_a8w4.parse_stage2_config(
+            {"kernelName2": "opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3584"},
+            64,
+        )
+        self.assertEqual(selected.block_m, 32)
+        self.assertEqual(launch.sort_block_m, 32)
+        self.assertEqual(launch.instance.block_m, 64)
+        self.assertEqual(launch.reduce_block_n, original.reduce_block_n)
+        for field in (
+            "block_n",
+            "block_threads",
+            "min_blocks_per_cu",
+            "pair_slots",
+            "steady_pair_slots",
+            "cachectl_b",
+            "cachectl_wscale",
+            "out_mode",
+        ):
+            self.assertEqual(
+                getattr(launch.instance, field), getattr(original.instance, field)
+            )
+        self.write_csv(block_m=64, kernelName1="flydsl_mxmoe_g1_a8w4_64x256x256_fp8out")
+        self.fm.cfg_2stages = None
+        self.fm.get_2stage_cfgs.cache_clear()
+        rejected = self.select()
+        self.assertNotEqual(rejected.stage2.keywords.get("kernelName"), self.g2)
+
     def test_stage1_regular_scales_expose_padded_stride_and_reader_capacity(self):
         torch, a = self.torch, self.aiter
         launcher = importlib.import_module("aiter.ops.flydsl.mxfp4_gemm1_kernels")
