@@ -4132,7 +4132,12 @@ def get_2stage_cfgs(
         and q_dtype_w == dtypes.fp4x2
         and is_shuffled
         and cktile_mxfp4_ok
-        and gate_up_interleave is False
+        and (
+            gate_up_interleave is False
+            # Callers that never tag w1.gate_up_interleave (None) keep the rule
+            # from before #6478: bf16/fp16 activations on the standard layout.
+            or (gate_up_interleave is None and q_dtype_a in [dtypes.bf16, dtypes.fp16])
+        )
     )
     if (
         activation == ActivationType.Relu2
