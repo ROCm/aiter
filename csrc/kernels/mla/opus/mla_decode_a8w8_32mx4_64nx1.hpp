@@ -51,7 +51,7 @@
 #if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
 
 template <class Traits>
-__global__ void opus_mla_decode_a8w8_32mx4_64nx1_kernel(opus_mla_decode_kargs)
+__global__ void opus_mla_decode_a8w8_32mx4_64nx1_kernel(opus_mla_decode_a8w8_kargs)
 {
 }
 
@@ -555,7 +555,7 @@ __device__ inline opus::smem<X> smem_at(const S& base, size_t off)
 // ============================================================================================
 template <class Traits, class VQ, class OT>
 __device__ __attribute__((always_inline)) void
-mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
+mla_decode_fwd_pipelined(opus_mla_decode_a8w8_kargs kargs,
                          int kv_ind_ptr_s,
                          int valid_kv_len,
                          int tile_begin,
@@ -1169,10 +1169,8 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
 // this item owns the whole request and writes the real output; otherwise it is one split-KV
 // partial and writes o_accum / lse_accum for the reduce kernel to merge.
 template <class Traits>
-__device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(opus_mla_decode_kargs kargs,
-                                                                      int w,
-                                                                      char* smem_buffer,
-                                                                      float temperature_scale)
+__device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(
+    opus_mla_decode_a8w8_kargs kargs, int w, char* smem_buffer, float temperature_scale)
 {
     using namespace opus;
     using T     = opus::remove_cvref_t<Traits>;
@@ -1319,7 +1317,7 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(opus_mla_d
 // work -- one wave per SIMD gets the whole 512-register file (Q 72 + O 256 + S 64 + KV ring).
 template <class Traits>
 __device__ __attribute__((always_inline)) void
-mla_decode_fwd_persistent(opus_mla_decode_kargs kargs)
+mla_decode_fwd_persistent(opus_mla_decode_a8w8_kargs kargs)
 {
     using namespace opus;
     using T = opus::remove_cvref_t<Traits>;
@@ -1353,7 +1351,7 @@ mla_decode_fwd_persistent(opus_mla_decode_kargs kargs)
 template <class Traits>
 __global__
 __launch_bounds__(Traits::BLOCK_SIZE,
-                  1) void opus_mla_decode_a8w8_32mx4_64nx1_kernel(opus_mla_decode_kargs kargs)
+                  1) void opus_mla_decode_a8w8_32mx4_64nx1_kernel(opus_mla_decode_a8w8_kargs kargs)
 {
     mla_decode_fwd_32mx4_64nx1_a8w8::mla_decode_fwd_persistent<Traits>(kargs);
 }

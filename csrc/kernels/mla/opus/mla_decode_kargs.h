@@ -22,6 +22,7 @@ struct opus_mla_decode_work_info
     int _pad;
 };
 
+// The merged d=576 decode (bf16 and fp8 Q/KV).
 struct opus_mla_decode_kargs
 {
     const void* __restrict__ q_ptr;
@@ -45,20 +46,22 @@ struct opus_mla_decode_kargs
     int stride_o_h;
     int stride_kv_page;
     float softmax_scale;
-    const void* __restrict__ q_scale_ptr;
-    const void* __restrict__ kv_scale_ptr;
-    const int* __restrict__ kv_last_page_lens;
-    // Round-robin context parallel (fp8 only): this rank holds a request's local KV token j
-    // at global position j * cp_world_size + cp_rank, and g_kv_indptr is the GLOBAL
-    // per-request kv_indptr the causal mask is taken against. cp_world_size == 1 is plain
-    // decode, with g_kv_indptr null.
+
     const int* __restrict__ g_kv_indptr;
     int cp_world_size;
     int cp_rank;
 };
 
 // The bf16 code objects have no source in this tree, so their prefix cannot move.
-constexpr size_t opus_mla_decode_bf16_kargs_bytes = offsetof(opus_mla_decode_kargs, q_scale_ptr);
+constexpr size_t opus_mla_decode_bf16_kargs_bytes = offsetof(opus_mla_decode_kargs, g_kv_indptr);
+
+// fp8 Q/KV: the common arguments plus the per-tensor descales (float[1] each). The base has
+// no tail padding, so the descales start at sizeof(opus_mla_decode_kargs).
+struct opus_mla_decode_a8w8_kargs : opus_mla_decode_kargs
+{
+    const void* __restrict__ q_scale_ptr;
+    const void* __restrict__ kv_scale_ptr;
+};
 
 struct opus_mla_decode_mxfp8_kargs
 {
@@ -96,11 +99,14 @@ struct opus_mla_decode_mxfp8_kargs
 };
 
 static_assert(sizeof(opus_mla_decode_work_info) == 32);
-static_assert(sizeof(opus_mla_decode_kargs) == 160);
+static_assert(sizeof(opus_mla_decode_kargs) == 136);
 static_assert(offsetof(opus_mla_decode_kargs, work_info_set) == 80);
 static_assert(offsetof(opus_mla_decode_kargs, softmax_scale) == 116);
 static_assert(opus_mla_decode_bf16_kargs_bytes == 120);
-static_assert(offsetof(opus_mla_decode_kargs, cp_rank) == 156);
+static_assert(offsetof(opus_mla_decode_kargs, cp_rank) == 132);
+// offsetof is not defined on a derived class with members of its own; the size pins the two
+// descales at 136 and 144.
+static_assert(sizeof(opus_mla_decode_a8w8_kargs) == sizeof(opus_mla_decode_kargs) + 16);
 static_assert(sizeof(opus_mla_decode_mxfp8_kargs) == 176);
 static_assert(offsetof(opus_mla_decode_mxfp8_kargs, work_info_set) == 112);
 static_assert(offsetof(opus_mla_decode_mxfp8_kargs, softmax_scale) == 172);

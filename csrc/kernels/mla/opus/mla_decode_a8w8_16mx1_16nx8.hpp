@@ -130,7 +130,7 @@
 #if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
 
 template <class Traits>
-__global__ void opus_mla_decode_a8w8_16mx1_16nx8_kernel(opus_mla_decode_kargs)
+__global__ void opus_mla_decode_a8w8_16mx1_16nx8_kernel(opus_mla_decode_a8w8_kargs)
 {
 }
 
@@ -967,7 +967,7 @@ attn_mask_kv_tile(V& v_s, int last_valid_kv_pos, int kv_base_pos, opus::u32_t ne
 // the same accumulator.
 template <class Traits, bool STAGGER, class VO>
 __device__ __attribute__((always_inline)) void
-mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
+mla_decode_fwd_pipelined(opus_mla_decode_a8w8_kargs kargs,
                          int kv_ind_ptr_s,
                          int valid_kv_len,
                          int tile_begin,
@@ -1348,10 +1348,8 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
 // means this item owns the whole request and writes the real output; otherwise it is one
 // split-KV partial and writes o_accum / lse_accum for the reduce kernel to merge.
 template <class Traits, bool STAGGER>
-__device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(opus_mla_decode_kargs kargs,
-                                                                      int w,
-                                                                      char* smem_buffer,
-                                                                      float temperature_scale)
+__device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(
+    opus_mla_decode_a8w8_kargs kargs, int w, char* smem_buffer, float temperature_scale)
 {
     using namespace opus;
     using T     = opus::remove_cvref_t<Traits>;
@@ -1378,13 +1376,10 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(opus_mla_d
     // -- counts tokens. At PAGE_SIZE 1 the two coincide and this all folds away. Above it,
     // the batch's last page is partial, and kv_offset == 0 is the metadata's marker for
     // "this item ends at the batch tail", i.e. the only case where that page is in range.
-    // One scalar load, not one per use: both the token count and the causal diagonal convert
-    // a page count to tokens the same way, and loading it twice cost 2 spilled SGPRs.
-    int last_page_len = T::PAGE_SIZE;
-    if constexpr(T::PAGE_SIZE > 1)
-    {
-        last_page_len = __builtin_amdgcn_readfirstlane(kargs.kv_last_page_lens[batch_idx]);
-    }
+    // The partial page's length was kv_last_page_lens, which the kargs no longer carry: only
+    // the PAGE_SIZE 1 build is left.
+    static_assert(T::PAGE_SIZE == 1, "a paged build needs the batch's last page length");
+    constexpr int last_page_len = T::PAGE_SIZE;
     // pages -> tokens for a run that ends at the batch tail, where the last page is partial.
     auto pages_to_tokens = [&](int pages) {
         if constexpr(T::PAGE_SIZE == 1)
@@ -1498,7 +1493,7 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(opus_mla_d
 template <class Traits>
 __global__
 __launch_bounds__(Traits::BLOCK_SIZE,
-                  2) void opus_mla_decode_a8w8_16mx1_16nx8_kernel(opus_mla_decode_kargs kargs)
+                  2) void opus_mla_decode_a8w8_16mx1_16nx8_kernel(opus_mla_decode_a8w8_kargs kargs)
 {
     using namespace opus;
     using namespace opus_mla_decode_a8w8_16mx1_16nx8;

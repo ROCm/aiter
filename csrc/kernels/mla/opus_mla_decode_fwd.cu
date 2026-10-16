@@ -135,7 +135,7 @@ struct OpusLaunch16mx1x32nx4
 {
     template <class Traits>
     static void
-    launch(int num_workers, hipStream_t stream, const opus_mla_decode_kargs& kargs)
+    launch(int num_workers, hipStream_t stream, const opus_mla_decode_a8w8_kargs& kargs)
     {
         opus_mla_decode_a8w8_16mx1_32nx4_kernel<Traits>
             <<<dim3(num_workers, 1, 1), dim3(Traits::BLOCK_SIZE), 0, stream>>>(kargs);
@@ -149,7 +149,7 @@ void launch_opus_16mx1(bool causal,
                        bool large_kv,
                        int num_workers,
                        hipStream_t stream,
-                       const opus_mla_decode_kargs& kargs)
+                       const opus_mla_decode_a8w8_kargs& kargs)
 {
     const bool use_causal = causal && max_seqlen_q > 1;
     auto launch           = [&](auto traits) {
@@ -209,7 +209,7 @@ void opus_mla_decode_bf16(opus_mla_decode_kargs kargs, int num_workers, hipStrea
 // here addresses a block table: the 16mx1 shape's rope DMA deals a 16-token line and so
 // cannot carry a per-lane within-page offset, so page_size > 1 belongs to the asm path and
 // the python gate keeps it there.
-void opus_mla_decode_a8w8(opus_mla_decode_kargs kargs,
+void opus_mla_decode_a8w8(const opus_mla_decode_kargs& base,
                          const aiter_tensor_t* q_scale,
                          const aiter_tensor_t* kv_scale,
                          int max_seqlen_q,
@@ -218,11 +218,11 @@ void opus_mla_decode_a8w8(opus_mla_decode_kargs kargs,
                          hipStream_t stream)
 {
     AITER_CHECK(max_seqlen_q >= 1, kFwdName, ": fp8 needs max_seqlen_q, got ", max_seqlen_q);
-    const OpusA8W8Route route = opus_a8w8_route(kargs.H, max_seqlen_q);
+    const OpusA8W8Route route = opus_a8w8_route(base.H, max_seqlen_q);
     AITER_CHECK(route != OpusA8W8Route::kNone,
                 kFwdName,
                 ": no opus fp8 build for nhead ",
-                kargs.H,
+                base.H,
                 " x max_seqlen_q ",
                 max_seqlen_q,
                 " (the python gate keeps such shapes on the asm path)");
@@ -234,11 +234,7 @@ void opus_mla_decode_a8w8(opus_mla_decode_kargs kargs,
                 kFwdName,
                 ": kv_scale must be a float scalar tensor");
 
-    kargs.q_scale_ptr  = q_scale->data_ptr();
-    kargs.kv_scale_ptr = kv_scale->data_ptr();
-    // Only a paged build would read it, and there is none left; null so nothing can quietly
-    // start depending on it.
-    kargs.kv_last_page_lens = nullptr;
+    opus_mla_decode_a8w8_kargs kargs{base, q_scale->data_ptr(), kv_scale->data_ptr()};
     const int total_tokens = kargs.total_tokens;
 
     // A buffer descriptor's num_records is 32 bits, so it cannot span a KV cache of 4 GiB

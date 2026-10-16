@@ -58,7 +58,7 @@
 #if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
 
 template <class Traits>
-__global__ void opus_mla_decode_a8w8_16mx1_32nx4_kernel(opus_mla_decode_kargs)
+__global__ void opus_mla_decode_a8w8_16mx1_32nx4_kernel(opus_mla_decode_a8w8_kargs)
 {
 }
 
@@ -734,19 +734,20 @@ attn_mask_kv_tile(V& v_s, int last_valid_kv_pos, int kv_base_pos, opus::u32_t ne
 // and passed by reference, so a split-KV request can run several tile ranges into the same
 // accumulator.
 template <class Traits, class VO>
-__device__ __attribute__((always_inline)) void mla_decode_fwd_simple(opus_mla_decode_kargs kargs,
-                                                                     int kv_ind_ptr_s,
-                                                                     int valid_kv_len,
-                                                                     int tile_begin,
-                                                                     int tile_end,
-                                                                     char* smem_buffer,
-                                                                     int q_len_ptr_s,
-                                                                     int q_len,
-                                                                     VO& v_o,
-                                                                     typename Traits::D_ACC& m_row,
-                                                                     typename Traits::D_ACC& l_row,
-                                                                     float temperature_scale,
-                                                                     int causal_diagonal)
+__device__ __attribute__((always_inline)) void
+mla_decode_fwd_simple(opus_mla_decode_a8w8_kargs kargs,
+                      int kv_ind_ptr_s,
+                      int valid_kv_len,
+                      int tile_begin,
+                      int tile_end,
+                      char* smem_buffer,
+                      int q_len_ptr_s,
+                      int q_len,
+                      VO& v_o,
+                      typename Traits::D_ACC& m_row,
+                      typename Traits::D_ACC& l_row,
+                      float temperature_scale,
+                      int causal_diagonal)
 {
     using namespace opus;
     using T     = opus::remove_cvref_t<Traits>;
@@ -1202,10 +1203,8 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_simple(opus_mla_de
 // this item owns the whole request and writes the real output; otherwise it is one split-KV
 // partial and writes o_accum / lse_accum for the reduce kernel to merge.
 template <class Traits>
-__device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(opus_mla_decode_kargs kargs,
-                                                                      int w,
-                                                                      char* smem_buffer,
-                                                                      float temperature_scale)
+__device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(
+    opus_mla_decode_a8w8_kargs kargs, int w, char* smem_buffer, float temperature_scale)
 {
     using namespace opus;
     using T     = opus::remove_cvref_t<Traits>;
@@ -1324,7 +1323,7 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(opus_mla_d
 template <class Traits>
 __global__
 __launch_bounds__(Traits::BLOCK_SIZE,
-                  1) void opus_mla_decode_a8w8_16mx1_32nx4_kernel(opus_mla_decode_kargs kargs)
+                  1) void opus_mla_decode_a8w8_16mx1_32nx4_kernel(opus_mla_decode_a8w8_kargs kargs)
 {
     using namespace opus;
     using namespace opus_mla_decode_a8w8_16mx1_32nx4;

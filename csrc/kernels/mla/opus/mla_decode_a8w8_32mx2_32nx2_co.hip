@@ -20,14 +20,14 @@ using mla32mx2_traits_t =
 #error "build this code object with the amdgpu-named-reg-pin-std toolchain (see the build script)"
 #endif
 #define MLA32MX2_CO_ENTRY(name, causal, large, cp)                                                 \
-    extern "C" __global__ __launch_bounds__(256, 1) void name(opus_mla_decode_kargs kargs) \
+    extern "C" __global__ __launch_bounds__(256, 1) void name(opus_mla_decode_a8w8_kargs kargs) \
     {                                                                                           \
         mla_decode_fwd_32mx2_32nx2_a8w8::mla_decode_fwd_persistent<                            \
             mla32mx2_traits_t<causal, large, cp>>(kargs);                                       \
     }
 #else
 #define MLA32MX2_CO_ENTRY(name, causal, large, cp) \
-    extern "C" __global__ void name(opus_mla_decode_kargs) {}
+    extern "C" __global__ void name(opus_mla_decode_a8w8_kargs) {}
 #endif
 
 MLA32MX2_CO_ENTRY(opus_mla_decode_a8w8_32mx2_32nx2_nc, false, false, false)
@@ -39,11 +39,11 @@ MLA32MX2_CO_ENTRY(opus_mla_decode_a8w8_32mx2_32nx2_causal_large_cprr, true, true
 
 // The code object is frozen against this layout; a wrong offset is a compile error here
 // rather than garbage output.
-static_assert(sizeof(opus_mla_decode_kargs) == 160 &&
+static_assert(sizeof(opus_mla_decode_kargs) == 136 &&
+                  sizeof(opus_mla_decode_a8w8_kargs) == 152 &&
                   offsetof(opus_mla_decode_kargs, work_indptr) == 72 &&
                   offsetof(opus_mla_decode_kargs, H) == 88 &&
                   offsetof(opus_mla_decode_kargs, softmax_scale) == 116 &&
-                  offsetof(opus_mla_decode_kargs, q_scale_ptr) == 120 &&
-                  offsetof(opus_mla_decode_kargs, kv_last_page_lens) == 136 &&
-                  offsetof(opus_mla_decode_kargs, cp_rank) == 156,
-              "opus_mla_decode_kargs changed: rebuild the code object and update this check");
+                  offsetof(opus_mla_decode_kargs, g_kv_indptr) == 120 &&
+                  offsetof(opus_mla_decode_kargs, cp_rank) == 132,
+              "opus_mla_decode_a8w8_kargs changed: rebuild the code object and update this check");
