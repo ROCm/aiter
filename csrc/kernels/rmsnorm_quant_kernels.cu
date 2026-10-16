@@ -399,6 +399,69 @@ __global__ void add_rmsnorm_n64_kernel(
     }
 }
 
+// Each lane owns 8 consecutive elements (16 bytes) of one row, so a 64-thread
+// block covers 8 rows and each row sum is reduced across 8 lanes. Requires
+// every row and the weight to be 16-byte aligned.
+template <typename DTYPE_I>
+__global__ void add_rmsnorm_n64_vec_kernel(
+    DTYPE_I* out,
+    DTYPE_I* residual_out,
+    const DTYPE_I* input,
+    const DTYPE_I* residual_in,
+    const DTYPE_I* weight,
+    float epsilon,
+    bool gemma_norm,
+    int m,
+    int input_stride,
+    int residual_in_stride,
+    int residual_out_stride,
+    int out_stride)
+{
+    static constexpr int lanes_per_row  = 8;
+    static constexpr int vec_size       = 64 / lanes_per_row;
+    static constexpr int rows_per_block = 64 / lanes_per_row;
+    using vec_i = opus::vector_t<DTYPE_I, vec_size>;
+    using vec_f = opus::vector_t<float, vec_size>;
+
+    const int row = blockIdx.x * rows_per_block + threadIdx.x / lanes_per_row;
+    const int col = threadIdx.x % lanes_per_row * vec_size;
+    const bool valid = row < m;
+    const vec_i weight_values = *reinterpret_cast<const vec_i*>(weight + col);
+    auto sum_f = [](float a, float b) { return a + b; };
+
+    vec_i in_values{};
+    vec_i residual_values{};
+    if (valid)
+    {
+        in_values = *reinterpret_cast<const vec_i*>(
+            input + row * static_cast<int64_t>(input_stride) + col);
+        residual_values = *reinterpret_cast<const vec_i*>(
+            residual_in + row * static_cast<int64_t>(residual_in_stride) + col);
+    }
+    const vec_f values = __builtin_convertvector(in_values, vec_f) +
+                         __builtin_convertvector(residual_values, vec_f);
+    float square_sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < vec_size; ++i)
+    {
+        square_sum += values[i] * values[i];
+    }
+    square_sum = multithread_reduce(square_sum, sum_f, lanes_per_row);
+    const float inv_rms = rsqrtf(square_sum * (1.0f / 64.0f) + epsilon);
+    const vec_f weight_f = __builtin_convertvector(weight_values, vec_f) +
+                           (gemma_norm ? 1.0f : 0.0f);
+    const vec_i residual_out_values = __builtin_convertvector(values, vec_i);
+    const vec_i out_values = __builtin_convertvector(values * inv_rms * weight_f, vec_i);
+    if (valid)
+    {
+        *reinterpret_cast<vec_i*>(
+            residual_out + row * static_cast<int64_t>(residual_out_stride) + col) =
+            residual_out_values;
+        *reinterpret_cast<vec_i*>(out + row * static_cast<int64_t>(out_stride) + col) =
+            out_values;
+    }
+}
+
 #define ADD_RMSNORM_QUANT_KERNEL_IMPL_ROWS_(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave, NUM_ROWS) \
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "quant_kernel", [&] {                    \
     using DTYPE_I = typename hip2opus<scalar_t>::type;                                        \
@@ -450,6 +513,21 @@ __global__ void add_rmsnorm_n64_kernel(
         reinterpret_cast<DTYPE_I*>(weight.data_ptr()), \
         epsilon, gemma_norm, m, input_stride, residual_in_stride, \
         residual_out_stride, out_stride); \
+    });
+
+#define ADD_RMSNORM_N64_VEC_KERNEL_IMPL() \
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "add_rmsnorm_n64_vec_kernel", [&] { \
+    using DTYPE_I = typename hip2opus<scalar_t>::type; \
+    dim3 grid((m + 7) / 8); \
+    dim3 block(64); \
+    add_rmsnorm_n64_vec_kernel<DTYPE_I><<<grid, block, 0, stream>>>( \
+        reinterpret_cast<DTYPE_I*>(out.data_ptr()), \
+        reinterpret_cast<DTYPE_I*>(residual_out.data_ptr()), \
+        reinterpret_cast<DTYPE_I*>(input.data_ptr()), \
+        reinterpret_cast<DTYPE_I*>(residual_in.data_ptr()), \
+        reinterpret_cast<DTYPE_I*>(weight.data_ptr()), \
+        static_cast<float>(epsilon), gemma_norm, m, input_stride, \
+        residual_in_stride, residual_out_stride, out_stride); \
     });
 
 #define ADD_RMSNORM_QUANT_KERNEL_DISPATCH(DTYPE_O, ADD_RESIDUAL, FUSE_QUANT) \
@@ -616,7 +694,11 @@ __global__ void add_rmsnorm_n64_kernel(
 #define ADD_RMSNORM_KERNEL_DISPATCH(DTYPE_O, ADD_RESIDUAL, FUSE_QUANT) \
     if (n == 64) { \
         if (m >= cu_num * 32) { \
-            ADD_RMSNORM_N64_KERNEL_IMPL(8); \
+            if (n64_rows_aligned) { \
+                ADD_RMSNORM_N64_VEC_KERNEL_IMPL(); \
+            } else { \
+                ADD_RMSNORM_N64_KERNEL_IMPL(8); \
+            } \
         } else { \
             ADD_RMSNORM_N64_KERNEL_IMPL(1); \
         } \
@@ -661,6 +743,16 @@ __global__ void add_rmsnorm_n64_kernel(
         const HipDeviceGuard device_guard(input.device_id);
         const hipStream_t stream = aiter::getCurrentHIPStream();
         const int cu_num = get_num_cu_func();
+
+        auto aligned_16b = [](const void* ptr) {
+            return reinterpret_cast<uintptr_t>(ptr) % 16 == 0;
+        };
+        // 8 elements of a 16-bit dtype are 16 bytes.
+        const bool n64_rows_aligned =
+            n == 64 && aligned_16b(out.data_ptr()) && aligned_16b(input.data_ptr()) &&
+            aligned_16b(residual_in.data_ptr()) && aligned_16b(residual_out.data_ptr()) &&
+            aligned_16b(weight.data_ptr()) && input_stride % 8 == 0 &&
+            residual_in_stride % 8 == 0 && residual_out_stride % 8 == 0 && out_stride % 8 == 0;
 
         if(out.dtype() == AITER_DTYPE_bf16)
         {
