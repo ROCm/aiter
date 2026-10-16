@@ -1,8 +1,10 @@
 import math
+from pathlib import Path
 
 import torch
 import triton
 
+from aiter import logger
 from aiter.ops.triton.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
 )
@@ -24,6 +26,21 @@ from op_tests.triton_tests.gemm.batched.test_batched_gemm_a8w8_a_per_token_group
 )
 
 
+def prepare_batched_gemm_input(
+    x: torch.Tensor, transpose_bm_in: bool = False, input_pad: int = 0
+) -> torch.Tensor:
+    """Prepare the input layout while retaining optional padded row strides."""
+    assert input_pad >= 0
+    if transpose_bm_in:
+        x = x.transpose(0, 1).contiguous()
+    if input_pad:
+        k = x.shape[-1]
+        storage = x.new_zeros((*x.shape[:-1], k + input_pad))
+        storage[..., :k].copy_(x)
+        x = storage[..., :k]
+    return x
+
+
 def bench_gemm_fn(
     batch: int,
     M: int,
@@ -35,6 +52,10 @@ def bench_gemm_fn(
     has_bias: bool,
     transpose_bm: bool,
     backend: str | None = None,
+    transpose_bm_in: bool = False,
+    profile_path: str | None = None,
+    supplied_output: bool = True,
+    input_pad: int = 0,
 ):
     c_dtype = torch.bfloat16
     x, weight, w_scale, bias, y = generate_batched_gemm_a8w8_per_token_group_inputs(
@@ -44,10 +65,11 @@ def bench_gemm_fn(
         K,
         c_dtype,
         has_bias=has_bias,
-        output=True,
+        output=supplied_output,
         layout=layout,
         transpose_bm=transpose_bm,
     )
+    x = prepare_batched_gemm_input(x, transpose_bm_in, input_pad)
     # flops
     flops = 2.0 * batch * M * N * K
     # memory transfer
@@ -57,7 +79,7 @@ def bench_gemm_fn(
         + w_scale.numel() * w_scale.element_size()
         + (bias.numel() * bias.element_size() if bias is not None else 0)
     )
-    mem_write = y.numel() * y.element_size()
+    mem_write = batch * M * N * (torch.finfo(c_dtype).bits // 8)
     mem = mem_read + mem_write
 
     def fn():
@@ -71,9 +93,29 @@ def bench_gemm_fn(
             YQ=y,
             transpose_bm=transpose_bm,
             backend=backend,
+            transpose_bm_in=transpose_bm_in,
         )
 
-    ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+    if profile_path is not None:
+        path = Path(profile_path)
+        if path.exists():
+            raise FileExistsError(f"Refusing to overwrite profile: {path}")
+        fn()
+        torch.cuda.synchronize()
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+        ) as profile:
+            fn()
+            torch.cuda.synchronize()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        profile.export_chrome_trace(str(path))
+        logger.info("Profile only: %s; no clean timing reported.", path)
+        return float("nan")
+
+    ms = triton.testing.do_bench(fn, warmup=25, rep=100, return_mode="median")
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
@@ -123,6 +165,10 @@ def run_model_benchmark(args):
             not args.no_bias,
             args.transpose_bm,
             args.backend,
+            transpose_bm_in=args.transpose_bm_in,
+            profile_path=args.profile,
+            supplied_output=not args.allocate_output,
+            input_pad=args.input_pad,
         )
 
     bench_batched_gemm_a8w8_per_token_group_prequant_w_per_batched_tensor_quant.run(
@@ -150,6 +196,10 @@ def run_shape_benchmark(args):
             not args.no_bias,
             args.transpose_bm,
             args.backend,
+            transpose_bm_in=args.transpose_bm_in,
+            profile_path=args.profile,
+            supplied_output=not args.allocate_output,
+            input_pad=args.input_pad,
         )
 
     bench_batched_gemm_a8w8_per_token_group_prequant_w_per_batched_tensor_quant.run(
@@ -158,6 +208,8 @@ def run_shape_benchmark(args):
 
 
 def run_benchmark(args, defaults):
+    if args.profile and (args.model or args.shape is None or len(args.shape) != 4):
+        raise ValueError("--profile requires one --shape B M N K and no --model")
     if args.model:
         run_model_benchmark(args)
     else:
@@ -170,6 +222,28 @@ def parse_args(args: list[str] | None = None):
     )
     parser = add_argparse_ff(parser)
     parser.add_argument("-B", type=int, default=None, help="Batch size")
+    parser.add_argument(
+        "--transpose-bm-in",
+        action="store_true",
+        default=False,
+        help="Transpose batch and M dimensions in the input tensor.",
+    )
+    parser.add_argument(
+        "--profile",
+        default=None,
+        help="Export one separate eager Chrome trace; no clean timing is reported.",
+    )
+    parser.add_argument(
+        "--allocate-output",
+        action="store_true",
+        help="Allocate output inside each native operator call instead of supplying it.",
+    )
+    parser.add_argument(
+        "--input-pad",
+        type=int,
+        default=0,
+        help="Extra elements in input row storage; pass a last-dimension slice view.",
+    )
     parser.add_argument(
         "--group-size",
         type=int,
