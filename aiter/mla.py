@@ -991,12 +991,13 @@ def mla_decode_fwd(
     kv_layout="token_major",
     seq_lens=None,
     page_table=None,
+    kv_csr_layout="page",
 ):
     """MLA decode with explicit KV byte-layout selection.
 
     ``token_major`` preserves the existing segmented page64 dispatch.
     ``kv_shuffled`` on gfx1250 supports FP8 Q/KV, BF16 O and page64.
-    QH64 uses page-level CSR metadata, a 768-byte Q head stride, multiple
+    QH64 uses CSR metadata, a 768-byte Q head stride, multiple
     queries per sequence, and split-K reduction. QH128 uses one query and
     dense ``seq_lens[B]`` /
     ``page_table[B,max_pages]`` and no splitting; its CSR arguments may be None.
@@ -1013,7 +1014,25 @@ def mla_decode_fwd(
     qo_indptr and must not exceed max_seqlen_q; its last entry must equal
     total_q. CSR contents remain the caller's responsibility, without a GPU
     synchronization in dispatch. ``causal`` has no effect for one query.
+
+    For shuffled QH64, ``kv_csr_layout="page"`` (default) counts physical
+    page IDs in CSR and uses ``kv_last_page_lens`` for the final page length.
+    ``"token"`` counts tokens and stores slot IDs ``page_id * 64 + offset``.
+    Each sequence starts at offset zero and has consecutive slots within
+    each logical page; arbitrary sparse token gathers are unsupported. CSR
+    rows are packed without rounding their starts or lengths to 64. The
+    kernel reads one slot per logical page and derives exact lengths from
+    indptr, ignoring last-page values (the tensor is still required).
+    Physical ``page_size`` remains 64. Token CSR is only supported by the
+    shuffled QH64 path; it does not change the KV byte layout.
     """
+    if kv_csr_layout not in ("page", "token"):
+        raise ValueError(f"unknown MLA kv_csr_layout: {kv_csr_layout!r}")
+    kv_indptr_is_token_level = kv_csr_layout == "token"
+    if kv_indptr_is_token_level and (
+        kv_layout != "kv_shuffled" or q.ndim != 3 or q.shape[1] != 64
+    ):
+        raise ValueError("token CSR requires kv_shuffled QH64")
     kv_shuffled_flag = 0
     # ATOM's QH128 dense path must route before accessing any CSR metadata.
     if kv_layout == "kv_shuffled":
@@ -1173,12 +1192,12 @@ def mla_decode_fwd(
                 if total_kv == 0:
                     num_kv_splits = 1
                 else:
-                    # CSR indices count pages. Each query launches one QH64
+                    # Convert CSR capacity to tokens. Each query launches one QH64
                     # workgroup, so the block size stays 64 for every Q length.
                     num_kv_splits, num_kv_splits_indptr = get_meta_param(
                         None,
                         bs,
-                        total_kv * page_size,
+                        total_kv if kv_indptr_is_token_level else total_kv * page_size,
                         nhead,
                         1,
                         q.dtype,
@@ -1313,6 +1332,7 @@ def mla_decode_fwd(
             use_valid_split_count_reduce,
             causal,
             kv_shuffled=kv_shuffled_flag,
+            kv_indptr_is_token_level=kv_indptr_is_token_level,
         )
 
         if (
@@ -1365,7 +1385,7 @@ def mla_decode_fwd(
             o.stride(1),
             final_lse_buf.stride(0) if has_final_lse else 0,
             page_size=page_size,
-            KV_INDPTR_IS_PAGE_LEVEL=page_size > 1,
+            KV_INDPTR_IS_PAGE_LEVEL=page_size > 1 and not kv_indptr_is_token_level,
             MAYBE_FINAL_OUT=MAYBE_FINAL_OUT,
             HAS_FINAL_LSE=has_final_lse,
             USE_VALID_SPLIT_COUNT_REDUCE=use_valid_split_count_reduce,

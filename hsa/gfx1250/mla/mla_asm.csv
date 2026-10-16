@@ -4,6 +4,7 @@
 // QH64 keeps the 120-byte split-K ABI; QH128 uses the dedicated 88-byte ABI.
 // Shuffled QH64 qSeqLen=1 is the per-workgroup query count; grid.x carries max_seqlen_q.
 // QH64 causal=0 is the canonical lookup; decode_flags bit1 selects either causal mode.
+// QH64 decode_flags bit2 selects token CSR (page64 slot IDs); default is page CSR.
 qType,kvType,Gqa,ps,qSeqLen,prefill,causal,lse,page_size,kv_shuffled,knl_name,co_name
 fp8,fp8,8,0,1,0,0,0,0,0,_ZN5aiter32mla_a8w8_qh8_1tg_8mx1_32nx4_np_3pE,mla_a8w8_qh8_1tg_8mx1_32nx4_np_3p.co
 fp8,fp8,8,0,2,0,0,0,0,0,_ZN5aiter32mla_a8w8_qh8_1tg_8mx2_32nx4_np_3pE,mla_a8w8_qh8_1tg_8mx2_32nx4_np_3p.co

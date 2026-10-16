@@ -153,12 +153,13 @@ struct __attribute__((packed)) MlaGfx1250PackedKernelArgs
     unsigned int stride_page;     // dword 26
     unsigned int log2_page;       // dword 27
     unsigned int stride_Q;        // dword 28
-    unsigned int decode_flags;   // dword 29: bit0 valid split count, bit1 QH64 shuffled causal
+    unsigned int decode_flags;   // dword 29: bit0 valid split count, bit1 causal, bit2 token CSR
 };
 static_assert(sizeof(MlaGfx1250PackedKernelArgs) == 120);
 static_assert(offsetof(MlaGfx1250PackedKernelArgs, decode_flags) == 116);
 constexpr unsigned int MLA_DECODE_VALID_SPLIT_COUNT = 1u;
 constexpr unsigned int MLA_DECODE_CAUSAL = 2u;
+constexpr unsigned int MLA_DECODE_TOKEN_CSR = 4u;
 
 std::string get_heuristic_kernel_mla(std::string q_type,
                                      std::string kv_type,
@@ -312,6 +313,7 @@ static void mla_decode_gfx1250_dispatch(
     int use_valid_split_count_reduce,
     int causal,
     int kv_shuffled,
+    int kv_indptr_is_token_level,
     hipStream_t stream)
 {
     (void)lse;
@@ -519,7 +521,8 @@ static void mla_decode_gfx1250_dispatch(
         packed_args.stride_Q = stride_Q;
         packed_args.decode_flags =
             (use_valid_split_count_reduce ? MLA_DECODE_VALID_SPLIT_COUNT : 0u) |
-            (kv_shuffled && causal ? MLA_DECODE_CAUSAL : 0u);
+            (kv_shuffled && causal ? MLA_DECODE_CAUSAL : 0u) |
+            (kv_indptr_is_token_level ? MLA_DECODE_TOKEN_CSR : 0u);
         kernarg_ptr = &packed_args;
         arg_size = sizeof(packed_args);
     }
@@ -728,9 +731,21 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     int use_valid_split_count_reduce,     //   enable packed-kernel valid split count writeback/reduce
     int causal,                           //   apply the causal mask across the max_seqlen_q query tokens
     int kv_shuffled,                      //   QH64 page64 shuffled storage (packed CSR ABI)
+    int kv_indptr_is_token_level,          //   QH64 shuffled token indptr and page64 slot IDs
     hipStream_t stream),
-    (Q, KV, qo_indptr, kv_indptr, kv_page_indices, kv_last_page_lens, num_kv_splits_indptr, work_meta_data, work_indptr, work_info_set, max_seqlen_q, page_size, nhead_kv, softmax_scale, splitData, splitLse, output, lse, q_scale, kv_scale, g_kv_indptr, cp_world_size, cp_rank, valid_split_count, use_valid_split_count_reduce, causal, kv_shuffled, stream))
+    (Q, KV, qo_indptr, kv_indptr, kv_page_indices, kv_last_page_lens, num_kv_splits_indptr, work_meta_data, work_indptr, work_info_set, max_seqlen_q, page_size, nhead_kv, softmax_scale, splitData, splitLse, output, lse, q_scale, kv_scale, g_kv_indptr, cp_world_size, cp_rank, valid_split_count, use_valid_split_count_reduce, causal, kv_shuffled, kv_indptr_is_token_level, stream))
 {
+    AITER_CHECK(kv_indptr_is_token_level == 0 || kv_indptr_is_token_level == 1,
+                __func__, ": kv_indptr_is_token_level must be 0 or 1");
+    if(kv_indptr_is_token_level)
+    {
+        AITER_CHECK(kv_shuffled == 1 && Q != nullptr && Q->dim() == 3 &&
+                        Q->size(1) == 64 && nhead_kv == 1 && page_size == 64 &&
+                        max_seqlen_q > 0 && num_kv_splits_indptr != nullptr &&
+                        work_meta_data == nullptr && work_indptr == nullptr &&
+                        work_info_set == nullptr,
+                    __func__, ": token CSR requires non-persistent kv_shuffled QH64 page64");
+    }
     if(kv_shuffled)
     {
         AITER_CHECK(Q != nullptr && Q->dim() == 3 && qo_indptr != nullptr &&
@@ -778,6 +793,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                                          use_valid_split_count_reduce,
                                          causal,
                                          kv_shuffled,
+                                         kv_indptr_is_token_level,
                                          stream);
     }
 

@@ -889,6 +889,8 @@ def mla_decode_stage1_asm_fwd(
     # QH64 shuffled: right-aligned mask per query from qo_indptr.
     causal: bool = True,
     kv_shuffled: int = 0,
+    # Shuffled QH64 only: indptr counts tokens, indices contain page64 slot IDs.
+    kv_indptr_is_token_level: bool = False,
 ) -> None: ...
 
 
