@@ -29,6 +29,20 @@ Launch (4x gfx1250; every env knob below is already the script's default):
       -q a4w4_mxfp4 -e 384 -k 6 -hd 7168 -id 3072 --layers 61 --combine both
     # Set MORI_CCO_BC to a prebuilt libmori_cco_device.bc to skip CCO JIT.
 
+Key cases (gemm2 scatter work). All of them run the compact-plan flydsl path
+with an fp4 dispatch wire; --combine_quant none is the bf16 wire, mxfp8 the fp8 one:
+    COMMON="-q a4w4_mxfp4 --combine fused --stage1_fused 1 \
+      --dispatch_backend flydsl --dispatch_wire fp4 --combine_quant none --layers 4"
+  1. DeepSeek-V4-Pro, tpr 16384 and 512:
+       torchrun --standalone --nproc_per_node=4 bench_mega_moe.py $COMMON \
+         -e 384 -k 6 -hd 7168 -id 3072 -tpr 16384     # and -tpr 512
+  2. DeepSeek-R1, tpr 1536 and 16384:
+       torchrun --standalone --nproc_per_node=4 bench_mega_moe.py $COMMON \
+         -e 256 -k 8 -hd 7168 -id 2048 -tpr 1536      # and -tpr 16384
+  Knobs to compare: AITER_MEGA_PER_RANK_SCATTER=1 (one TDM store per peer),
+  AITER_FLYDSL_PERSISTENT_WORKERS2=<N> (persistent gemm2). A model cannot know
+  the next layer's routing early, so measure with AITER_MEGA_PLAN_PREFETCH=0.
+
 Env / CLI: --layers --logits_tol --acc_verify --dispatch_backend
            --stage1_fused --dispatch_wire --combine --combine_quant
            -tpr -hd -id -e -k --shared_E -q
