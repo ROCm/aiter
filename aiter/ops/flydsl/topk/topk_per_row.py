@@ -37,21 +37,34 @@ _ONE_WORKGROUP_MAX_ROW_WIDTH = 20_000
 _SHORT_ROWS_1024_THREAD_MAX_ROWS = 256
 
 
-@lru_cache(maxsize=16)
-def _get_cached_adaptive_workspace(
-    device: torch.device, stream_id: int, slots: int
-) -> torch.Tensor:
-    return torch.zeros(slots, device=device, dtype=torch.int32)
+# One adaptive control buffer per (device, stream), zeroed once: every launch
+# leaves it zero. A buffer a larger one replaced stays alive, since a captured
+# graph may still replay over it.
+_adaptive_control: dict[tuple[torch.device, int], torch.Tensor] = {}
+_retired_adaptive_control: list[torch.Tensor] = []
 
 
-def _get_adaptive_workspace(
-    device: torch.device, stream_id: int, slots: int
+def _get_adaptive_control(
+    device: torch.device, stream_id: int, rows: int
 ) -> torch.Tensor:
-    # Do not let graph-pool allocations escape through the process cache. Left
-    # uninitialised: the config's `clear_row_slots` alone decides what replay zeroes.
+    """The zeroed control buffer for `rows` rows, grown in powers of two."""
+    need = _adaptive.decode_control_slots(rows)
+    buf = _adaptive_control.get((device, stream_id))
+    if buf is not None and buf.numel() >= need:
+        return buf
     if torch.cuda.is_current_stream_capturing():
-        return torch.empty(slots, device=device, dtype=torch.int32)
-    return _get_cached_adaptive_workspace(device, stream_id, slots)
+        # Allocated here it would come from the graph's pool. A graph-private
+        # buffer zeroed on every replay is correct, one memset slower.
+        return torch.zeros(need, device=device, dtype=torch.int32)
+    if buf is not None:
+        _retired_adaptive_control.append(buf)
+    buf = torch.zeros(
+        _adaptive.decode_control_slots(1 << (rows - 1).bit_length()),
+        device=device,
+        dtype=torch.int32,
+    )
+    _adaptive_control[(device, stream_id)] = buf
+    return buf
 
 
 @lru_cache(maxsize=16)
@@ -84,8 +97,10 @@ def _get_topk_workspace(
 
 
 def clear_topk_per_row_decode_workspace_cache() -> None:
+    """Free the cached workspaces; no graph captured over them may replay after."""
     _get_cached_workspace.cache_clear()
-    _get_cached_adaptive_workspace.cache_clear()
+    _adaptive_control.clear()
+    _retired_adaptive_control.clear()
 
 
 @lru_cache(maxsize=128)
@@ -407,8 +422,8 @@ def _run_adaptive(
     `cfg_width` is the longest row this launch can contain and `width` is how
     wide the buffer holding it is; they differ when a caller passed a
     `max_row_len`. The config takes the former, because every quantity it picks
-    -- the tier, the blocks per row, the parts, the compact path, and whether
-    the workspace needs zeroing -- is sized for the work, and the padding is not
+    -- the tier, the blocks per row, the parts and the compact path -- is sized
+    for the work, and the padding is not
     work. The kernel still folds each row onto as many of the launch's
     workgroups as that row's own `seq_lens` entry needs.
 
@@ -430,11 +445,12 @@ def _run_adaptive(
     launcher = _adaptive.create_topk_per_row_decode_adaptive_kernel(
         top_k=k, packed_rows=packed, **cfg.kw
     )
-    workspace = _get_adaptive_workspace(
-        logits.device, stream.cuda_stream, cfg.workspace_slots
+    control = _get_adaptive_control(logits.device, stream.cuda_stream, rows)
+    scratch = (
+        torch.empty(cfg.scratch_slots, device=logits.device, dtype=torch.int32)
+        if cfg.scratch_slots
+        else control  # unread without compact
     )
-    if cfg.clear_row_slots:
-        workspace.view(rows, -1)[:, : cfg.clear_row_slots].zero_()
     _run_compiled(
         launcher,
         logits,
@@ -443,7 +459,8 @@ def _run_adaptive(
         # unread unless packed; seq_lens keeps the launch's signature
         row_starts if packed else seq_lens,
         indices,
-        workspace,
+        control,
+        scratch,
         rows,
         width,
         stride0,

@@ -829,54 +829,120 @@ def test_decode_bound_entry_points(card):
     )
 
 
-def test_adaptive_compact_garbage(card):
-    """The adaptive launch clears only the leading slots of each workspace row, so
-    run a compact cell twice on a workspace whose every slot is garbage first."""
-    rows, width, top_k = next(
-        (m, n, 2048)
-        for m in (64, 128, 256)
-        for n in (65536, 131072)
-        if adaptive_kernel.decode_adaptive_config(
-            m, n, 2048, ordered=False, cu_count=card[1]
-        ).compact
-    )
-    cfg = adaptive_kernel.decode_adaptive_config(
-        rows, width, top_k, ordered=False, cu_count=card[1]
-    )
-    workspace = flydsl_decode_host._get_adaptive_workspace(
-        torch.device("cuda", torch.cuda.current_device()),
-        torch.cuda.current_stream().cuda_stream,
-        cfg.workspace_slots,
-    )
-    assert cfg.clear_row_slots, "a compact multi-part launch must clear its counters"
-    seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
-    row_starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
-    for seed in (1, 2):
+def test_adaptive_control_stays_zero(card):
+    """Every launch leaves the control buffer all zero, eager and under replay, with
+    nothing on the host clearing it. Cells cover the multi-part tiers with and without
+    the candidate buffer and the certificate, and a one-workgroup grid; short rows
+    share each launch with long ones."""
+    top_k = 2048
+    device = torch.device("cuda", torch.cuda.current_device())
+
+    def cfg(rows, width, stable):
+        return adaptive_kernel.decode_adaptive_config(
+            rows, width, top_k, ordered=stable, cu_count=card[1]
+        )
+
+    picks = {
+        "compact": lambda c: c.compact and c.parts > 1,
+        "certified": lambda c: not c.compact
+        and c.parts > 1
+        and c.kw.get("histogram_certificate", False),
+        "uncertified": lambda c: not c.compact
+        and c.parts > 1
+        and not c.kw.get("histogram_certificate", False),
+        "one workgroup": lambda c: c.grid == 1,
+    }
+    candidates = [
+        (m, n) for m in (4, 8, 32, 64, 256) for n in (49152, 65536, 131072, 262144)
+    ]
+
+    def case(rows, width, seed):
         torch.manual_seed(seed)
-        logits = torch.randn(rows, width, device="cuda")
-        indices = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
-        workspace.fill_(-1)
+        seq_lens = torch.randint(
+            top_k + 1, width + 1, (rows,), dtype=torch.int32, device="cuda"
+        )
+        seq_lens[0] = width
+        if rows >= 3:
+            seq_lens[1] = adaptive_kernel.decode_adaptive_short_max(rows)
+            seq_lens[2] = top_k
+        logits = torch.randint(0, 50, (rows, width), device="cuda").float()
+        return logits, seq_lens
+
+    def decode(logits, seq_lens, out, stable):
         flydsl_decode_host._decode_with_backend(
             logits,
             1,
             seq_lens,
-            indices,
-            rows,
-            *logits.stride(),
+            out,
+            *(logits.shape[0], *logits.stride()),
             top_k,
-            False,
+            stable,
             None,
             topk.BACKEND_ADAPTIVE,
-            width,
+            logits.shape[1],
         )
+
+    def check(logits, seq_lens, out, stable, stream, what):
         torch.cuda.synchronize()
-        # The launch cleared this buffer's leading slots, so it is the one it used.
-        assert (workspace.view(rows, -1)[:, : cfg.clear_row_slots] >= 0).all()
-        torch_indices = logits.topk(top_k, dim=-1)[1]
-        assert compare_topk_results(
-            logits, indices, torch_indices, row_starts, seq_lens, top_k
-        ), f"compact garbage mismatch at rows={rows} width={width} seed={seed}"
-    print(f"[adaptive_compact_garbage] PASS: rows={rows} width={width} k={top_k}")
+        rows, width = logits.shape
+        live = torch.arange(width, device="cuda")[None, :] < seq_lens[:, None]
+        masked = torch.where(live, logits, float("-inf"))
+        if stable:
+            ok = torch.equal(out.long(), stable_reference(masked, top_k))
+        else:
+            ok = compare_topk_results(
+                masked,
+                out,
+                masked.topk(top_k, dim=-1)[1],
+                torch.zeros(rows, dtype=torch.int32, device="cuda"),
+                seq_lens,
+                top_k,
+            )
+        assert ok, f"{what}: wrong indices"
+        control = flydsl_decode_host._adaptive_control[(device, stream.cuda_stream)]
+        assert not control.any(), f"{what}: control left dirty"
+
+    seen = []
+    for stable in (False, True):
+        for name, pick in picks.items():
+            cell = next(
+                ((m, n) for m, n in candidates if pick(cfg(m, n, stable))), None
+            )
+            if cell is None:
+                assert name == "one workgroup", f"no {name} cell, stable={stable}"
+                continue
+            seen.append((name, stable, *cell))
+            for seed in (1, 2):
+                logits, seq_lens = case(*cell, seed)
+                out = torch.full((cell[0], top_k), -7, dtype=torch.int32, device="cuda")
+                decode(logits, seq_lens, out, stable)
+                what = f"{name} stable={stable} cell={cell} seed={seed}"
+                check(logits, seq_lens, out, stable, torch.cuda.current_stream(), what)
+
+    # Replay over the cached buffer: warmed up on the stream the graph captures on.
+    rows, width = next(
+        (m, n) for m, n in candidates if picks["compact"](cfg(m, n, True))
+    )
+    logits, seq_lens = case(rows, width, 3)
+    out = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        decode(logits, seq_lens, out, True)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        decode(logits, seq_lens, out, True)
+    for seed in (4, 5):
+        fresh_logits, fresh_lens = case(rows, width, seed)
+        logits.copy_(fresh_logits)
+        seq_lens.copy_(fresh_lens)
+        out.fill_(-7)
+        graph.replay()
+        check(logits, seq_lens, out, True, stream, f"replay seed={seed}")
+    print(
+        f"[adaptive_control_stays_zero] PASS: {seen}, replay rows={rows} width={width}"
+    )
 
 
 def test_adaptive_row_past_width(card):
@@ -1091,7 +1157,9 @@ def test_adaptive_ordered_early_stop(card):
 
 def test_adaptive_compact_cells(card):
     """The compact builds no band corner reaches, stable, packed and both: stable
-    index for index the stable reference, unstable the set torch.topk picks."""
+    index for index the stable reference, unstable the set torch.topk picks. Rows
+    either side of short_max share the launch, so the buffer and the row both emit,
+    and random stable rows reach the early stop the short ones alone take."""
     top_k = 2048
     rows, width = next(
         (m, n)
@@ -1104,10 +1172,13 @@ def test_adaptive_compact_cells(card):
         top_k + 1, width + 1, (rows,), dtype=torch.int32, device="cuda"
     )
     seq_lens[0] = width
+    short_max = adaptive_kernel.decode_adaptive_short_max(rows)
+    seq_lens[1:5] = torch.tensor([short_max, short_max + 1, top_k + 1, top_k])
     live = torch.arange(width, device="cuda")[None, :] < seq_lens[:, None]
     row_starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
     for data, stable, packed in (
         ("ties", True, False),
+        ("random", True, False),
         ("random", False, True),
         ("ties", True, True),
     ):
@@ -1443,7 +1514,7 @@ def run_adaptive():
         "123"
     ), f"short-row decode does not reach every radix pass exit:\n{df_md}"
     test_decode_bound_entry_points(card)
-    test_adaptive_compact_garbage(card)
+    test_adaptive_control_stays_zero(card)
     test_adaptive_row_past_width(card)
     test_adaptive_bound_below_rows(card)
     test_adaptive_nan_ranks_first(card)

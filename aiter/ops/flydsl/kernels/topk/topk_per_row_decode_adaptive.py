@@ -21,10 +21,12 @@ Inputs/outputs:
   - indices: flattened int32 output with shape (num_rows, top_k); each row writes its
     unordered Top-K index set. A row with fewer than top_k valid entries is
     identity-filled and padded with -1.
-  - workspace: row-major int32 scratch sized by topk_workspace_slots(num_rows).
-    The multi-block tiers merge per-block LDS histograms into its
-    pass-private global histograms over an inter-workgroup acquire/release barrier and
-    coordinate through its counters; the single-workgroup tier never touches it.
+  - control: int32, decode_control_slots(num_rows), CONTROL_ROW_SLOTS per row. The
+    multi-block tiers merge per-block LDS histograms into its pass-private global
+    histograms over an inter-workgroup acquire/release barrier and coordinate
+    through its counters; the single-workgroup tier never touches it.
+  - scratch: int32, decode_scratch_slots(num_rows, ...), the candidate buffer under
+    compact; any contents, since every entry is written before it is read.
 
 Paths (per row, by valid length row_len):
   - short (row_len <= short_max): active_parts = 1; part 0 runs the whole radix-select
@@ -35,9 +37,9 @@ Paths (per row, by valid length row_len):
 Constraints:
   - logits are fp32; the order-preserving radix key twiddle is fp32-specific.
   - BLOCK_THREADS is fixed at 1024 (wave64); the histogram/scan layout relies on it.
-  - workspace must be zeroed before any launch that enters a multi-block tier; its
-    counters and histograms accumulate from zero (needs_workspace_zero reports when).
-    Only the leading workspace_zero_row_slots of each row need it.
+  - control must be all zero at launch, and is left all zero on exit: the last part
+    out of each row clears the row. Allocate it zeroed once and reuse it only on
+    the same stream; a launch that does not finish leaves it dirty.
   - The row barrier spins (s_sleep), so a row's active parts must be co-resident.
     This is a regular launch, not a cooperative one, which FlyDSL does not offer.
     A multi-part launch stays within one workgroup per CU, and rows are independent
@@ -106,9 +108,11 @@ CERTIFICATE_MAX_SPINS = 4194304
 # the only thing that needs it -- every other read of the histogram follows a
 # barrier, which has already made it visible.
 CACHE_BYPASS_L1_L2 = 17
-# Groups 0 and 1 are spare and stay reserved, so the numbering below keeps
-# matching what a workspace dump shows.
+# Group 1 is spare and stays reserved, so the numbering below keeps matching what
+# a workspace dump shows.
 COUNTER_SLOTS = 8 * COUNTER_STRIDE
+# Parts of the row that have finished with its control slots; the last clears them.
+COUNTER_EXIT = 0 * COUNTER_STRIDE
 COUNTER_ARRIVALS = 2 * COUNTER_STRIDE
 COUNTER_OUT_FRONT = 3 * COUNTER_STRIDE
 COUNTER_OUT_BACK = 4 * COUNTER_STRIDE
@@ -125,17 +129,16 @@ SMEM_META_K = 0
 SMEM_META_LEN = 1
 SMEM_META_THRESHOLD = 2
 SMEM_META_ABOVE = 3
-# Slot 4 is spare.
+# tid 0's COUNTER_EXIT arrival, broadcast so the whole part agrees it is the last.
+SMEM_META_EXIT = 4
 # The live length a certified merge has to see the histogram sum to. In LDS rather
 # than an SSA value because it is written by the region that knows the count and
 # read by the re-read loop, which that value would not dominate.
 SMEM_META_TOTAL = 5
 
-# Compact candidate buffer, one region per row after the histograms. Entry i is the
-# pair (column, twiddled key) at 2*i, so the later passes read a candidate without
-# touching the row. The header is a full 128B group so the data stays aligned.
-COMPACT_HDR_OVERFLOW = 1
-COMPACT_HDR_SLOTS = COUNTER_STRIDE
+# Compact candidate buffer, one region per row in `scratch`. Entry i is the pair
+# (column, twiddled key) at 2*i, so the later passes read a candidate without
+# touching the row.
 
 # Short-tier one-workgroup metadata reuses the same 8-int LDS block after zeroing.
 SMEM_META_SHORT_FIRST_ABOVE = 0
@@ -339,8 +342,7 @@ class DecodeAdaptiveConfig:
     grid: int
     parts: int
     compact: bool
-    workspace_slots: int
-    clear_row_slots: int  # leading slots of each row to zero; 0 clears nothing
+    scratch_slots: int  # 0 when the build keeps no candidate buffer
 
 
 def decode_adaptive_config(
@@ -372,60 +374,34 @@ def decode_adaptive_config(
         "short_max": short_max,
         "ordered": ordered,
     }
-    # Left out where the build cannot reach it, which would only split the JIT cache.
-    # The short tier reaches it under `compact` too, since it never uses the buffer;
-    # `ordered` has no short tier, so there `compact` leaves nothing to reach.
-    if early_stop and not (ordered and compact):
+    # Every build reaches it under `compact` too: unordered short rows on the short
+    # tier, ordered ones on the rows that keep no buffer.
+    if early_stop:
         kw["early_stop"] = True
     if decode_adaptive_certificate(seq, parts):
         kw["histogram_certificate"] = True
     if compact:
         kw["compact"] = True
-    clear = needs_workspace_zero(seq, k, short_max, tier_mode=kw["tier_mode"])
     return DecodeAdaptiveConfig(
         kw=kw,
         grid=grid,
         parts=parts,
         compact=compact,
-        workspace_slots=topk_workspace_slots(
-            rows, compact=compact, compact_cap=COMPACT_CAP_MULT * k
-        ),
-        clear_row_slots=workspace_zero_row_slots(compact) if clear else 0,
+        scratch_slots=decode_scratch_slots(rows, compact, COMPACT_CAP_MULT * k),
     )
 
 
-def _compact_row_slots(compact: bool, compact_cap: int) -> int:
-    """Extra per-row int32 slots for the candidate buffer (header + col/key pairs)."""
-    return COMPACT_HDR_SLOTS + 2 * int(compact_cap) if compact else 0
+CONTROL_ROW_SLOTS = COUNTER_SLOTS + NUM_PASSES * NUM_BUCKETS
 
 
-def topk_workspace_slots(
-    num_rows: int,
-    compact: bool = False,
-    compact_cap: int = 0,
-) -> int:
-    """Return int32 workspace slots for the multi-block tiers (row-major, per row)."""
-    row_slots = COUNTER_SLOTS + NUM_PASSES * NUM_BUCKETS
-    row_slots += _compact_row_slots(compact, compact_cap)
-    return int(num_rows) * row_slots
+def decode_control_slots(num_rows: int) -> int:
+    """int32 slots of the control buffer, which every launch leaves all zero."""
+    return int(num_rows) * CONTROL_ROW_SLOTS
 
 
-def workspace_zero_row_slots(compact: bool = False) -> int:
-    """Leading int32 slots of each row that must start at zero; compact data may not."""
-    slots = COUNTER_SLOTS + NUM_PASSES * NUM_BUCKETS
-    return slots + (COMPACT_HDR_SLOTS if compact else 0)
-
-
-def needs_workspace_zero(
-    max_row_len: int,
-    top_k: int,
-    short_max: int,
-    tier_mode: str = "auto",
-) -> bool:
-    """Return whether any row can enter the persistent multi-block path."""
-    if tier_mode == "short":
-        return False
-    return max_row_len > max(short_max, top_k)
+def decode_scratch_slots(num_rows: int, compact: bool, compact_cap: int) -> int:
+    """int32 slots of the candidate buffer, (column, key) pairs per row."""
+    return int(num_rows) * 2 * int(compact_cap) if compact else 0
 
 
 @cache
@@ -450,8 +426,9 @@ def create_topk_per_row_decode_adaptive_kernel(
     from the shape. Constraints a caller can otherwise get wrong:
 
     - `early_stop` is silently dropped from the multi-block tiers under `compact`,
-      where the last pass reads the candidate buffer rather than the row. The
-      short tier takes it whenever it is compiled in.
+      where the last pass reads the candidate buffer rather than the row, but
+      for ordered rows short enough to keep no buffer. The short tier takes it
+      whenever it is compiled in.
     - `part_cap` is clamped to `blocks_per_row`.
     - `packed_rows` reads row r from element row_starts[r] of a flat input, with
       `width` then the plane's; otherwise row_starts is not read.
@@ -476,9 +453,13 @@ def create_topk_per_row_decode_adaptive_kernel(
     # after any pass whose boundary bucket falls whole.
     short_early_stop = bool(early_stop) and short_tier
     meta_slots = SMEM_META_SLOTS if short_early_stop else 8
+    # Ordered short rows reach the cooperating path at one part, where they read
+    # the row rather than the candidate buffer; unordered ones never reach it.
+    short_rows_read_row = compact and ordered and tier_mode == "auto"
     # Early stop replaces the last pass with one row walk, so it needs that pass to
-    # be reading the row: under `compact` it reads the candidate buffer instead.
-    early_stop = early_stop and not compact
+    # be reading the row: under `compact` it reads the candidate buffer instead,
+    # except on the ordered short rows, which alone take it there.
+    early_stop = early_stop and (not compact or short_rows_read_row)
     ordered_early_stop = early_stop and ordered
     # At one block per row "auto" cannot tell a short row from a row the grid could
     # only give one workgroup: `active_parts` folds to a compile-time one either
@@ -526,9 +507,7 @@ def create_topk_per_row_decode_adaptive_kernel(
     emit_barrier_token = 1 + sum(not certified_pass(q) for q in range(num_passes))
 
     compact_cap = COMPACT_CAP_MULT * top_k if compact else 0
-    compact_base = COUNTER_SLOTS + num_passes * num_buckets
-    compact_data = compact_base + COMPACT_HDR_SLOTS
-    row_workspace_slots = compact_base + _compact_row_slots(compact, compact_cap)
+    scratch_row_slots = 2 * compact_cap
 
     # Caps/thresholds only affect codegen for modes that use them; include them in
     # the name for those modes so distinct configs cache separately.
@@ -562,7 +541,8 @@ def create_topk_per_row_decode_adaptive_kernel(
         seq_lens: fx.Tensor,
         row_starts: fx.Tensor,
         indices: fx.Tensor,
-        workspace: fx.Tensor,
+        control: fx.Tensor,
+        scratch: fx.Tensor,
         stride0: fx.Int32,
         width: fx.Int32,
     ) -> None:
@@ -590,7 +570,7 @@ def create_topk_per_row_decode_adaptive_kernel(
         c_parts = fx.Int32(blocks_per_row)
         c_sign_bit = fx.Int32(-2147483648)
         c_nan_turn = fx.Int32(0x7FFFFF)  # keys from -inf past the -NaNs
-        c_row_ws = fx.Int32(row_workspace_slots)
+        c_row_ws = fx.Int32(CONTROL_ROW_SLOTS)
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         s_hist = lds.s_hist.view(fx.make_layout(num_buckets, 1))
@@ -606,7 +586,8 @@ def create_topk_per_row_decode_adaptive_kernel(
         indices_rsrc = buffer_ops.create_buffer_resource(
             indices, max_size=False, num_records_bytes=indices_bytes
         )
-        workspace_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
+        workspace_rsrc = buffer_ops.create_buffer_resource(control, max_size=True)
+        scratch_rsrc = buffer_ops.create_buffer_resource(scratch, max_size=True)
 
         hist_ptr = lds.s_hist.ptr
         meta_ptr = lds.s_meta.ptr
@@ -640,6 +621,7 @@ def create_topk_per_row_decode_adaptive_kernel(
         )
         row_out = row * c_top_k
         row_ws_base = row * c_row_ws
+        row_scratch_base = row * fx.Int32(scratch_row_slots)
 
         # Active cooperating workgroups per row over the fixed grid (excess blocks
         # return immediately). "auto" picks per row by length; "short" gives every
@@ -674,17 +656,19 @@ def create_topk_per_row_decode_adaptive_kernel(
                 row_ws_base + fx.Int32(COUNTER_SLOTS + pass_id * num_buckets) + bin_i32
             )
 
-        def compact_hdr_slot(field: int):
-            return row_ws_base + fx.Int32(compact_base + field)
-
         def compact_col_slot(entry_i32):
-            return row_ws_base + fx.Int32(compact_data) + entry_i32 * fx.Int32(2)
+            return row_scratch_base + entry_i32 * fx.Int32(2)
 
         def compact_key_slot(entry_i32):
-            return row_ws_base + fx.Int32(compact_data + 1) + entry_i32 * fx.Int32(2)
+            return row_scratch_base + fx.Int32(1) + entry_i32 * fx.Int32(2)
 
         def ws_ptr(elem_i32):
-            return fx.get_iter(workspace) + fx.Int32(elem_i32)
+            return fx.get_iter(control) + fx.Int32(elem_i32)
+
+        def scratch_load(elem_i32):
+            return buffer_ops.buffer_load(
+                scratch_rsrc, elem_i32, vec_width=1, dtype=T.i32
+            )
 
         def ws_load(elem_i32):
             return buffer_ops.buffer_load(
@@ -983,9 +967,9 @@ def create_topk_per_row_decode_adaptive_kernel(
             for col_i32, key, keep in keeps:
                 if (keep == c_one) & (slot < part_slice_end):
                     buffer_ops.buffer_store(
-                        col_i32, workspace_rsrc, compact_col_slot(slot)
+                        col_i32, scratch_rsrc, compact_col_slot(slot)
                     )
-                    buffer_ops.buffer_store(key, workspace_rsrc, compact_key_slot(slot))
+                    buffer_ops.buffer_store(key, scratch_rsrc, compact_key_slot(slot))
                 slot = slot + keep
 
         def scan_vec_block(
@@ -1142,7 +1126,9 @@ def create_topk_per_row_decode_adaptive_kernel(
             The early stop passes, as runtime values, a mask of the bits its row has
             settled and the token of the barriers that row actually reached.
             """
-            assert not (compact and key_mask is not None), "early stop reads the row"
+            assert short_rows_read_row or not (
+                compact and key_mask is not None
+            ), "early stop reads the row"
             c_block_log2 = fx.Int32(int.bit_length(block_threads) - 1)
             # Trip count is uniform across workgroups; tail runs predicate columns away.
             row_steps_all = fx.Index(
@@ -1444,8 +1430,8 @@ def create_topk_per_row_decode_adaptive_kernel(
                 # Clamp rather than predicate the load: out-of-slice entries would
                 # otherwise read a neighbouring part's candidates.
                 safe = in_buf.select(entry, part_slice_base)
-                col_i32 = ws_load(compact_col_slot(safe))
-                key = ws_load(compact_key_slot(safe))
+                col_i32 = scratch_load(compact_col_slot(safe))
+                key = scratch_load(compact_key_slot(safe))
                 selected = in_buf.select(
                     ((key ^ c_sign_bit) < biased_kth).select(c_one, c_zero), c_zero
                 )
@@ -1494,14 +1480,6 @@ def create_topk_per_row_decode_adaptive_kernel(
                 )
                 yield [fill_state[0]]
 
-            # Surface overflow to the host: the buffer is per part, so a row is only
-            # trustworthy if no part ran out of slice.
-            if (tid == c_zero) & (s_run[fx.Int32(SMEM_RUN_COMPACT_SPILLED)] == c_one):
-                fx.atomic_add(
-                    ws_ptr(compact_hdr_slot(COMPACT_HDR_OVERFLOW)),
-                    c_one,
-                    syncscope=_AGENT,
-                )
             gpu.barrier()
 
         def compact_rescan(
@@ -1521,7 +1499,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                 c_block_idx,
                 init=[c_zero],
             ):
-                key = ws_load(compact_key_slot(fx.Int32(entry)))
+                key = scratch_load(compact_key_slot(fx.Int32(entry)))
                 if prefix_for_key(key, previous_start_bit) == current_bits:
                     fx.atomic_add(
                         hist_ptr + bucket_for_key(key, start_bit),
@@ -1655,16 +1633,35 @@ def create_topk_per_row_decode_adaptive_kernel(
 
             clear_local_histogram()
             if const_expr(compact and pass_id == compact_fill_pass):
-                compact_fill(start_bit, previous_start_bit, current_bits)
-                return finish_pass(
-                    pass_id, current_k, current_bits, barrier_token, current_len
-                )
-            if const_expr(compact and pass_id > compact_fill_pass):
+                if const_expr(short_rows_read_row):
+                    # A short row keeps no buffer, as the host decides for a launch
+                    # whose rows are all short: it marks itself spilled, which sends
+                    # the rescans and the emit back to the row.
+                    if row_len <= fx.Int32(short_max):
+                        if tid == c_zero:
+                            fx.memref_store(
+                                c_zero, s_run, fx.Int32(SMEM_RUN_COMPACT_COUNT)
+                            )
+                            fx.memref_store(
+                                c_one, s_run, fx.Int32(SMEM_RUN_COMPACT_SPILLED)
+                            )
+                        row_scan(pass_id, start_bit, previous_start_bit, current_bits)
+                    else:
+                        compact_fill(start_bit, previous_start_bit, current_bits)
+                else:
+                    compact_fill(start_bit, previous_start_bit, current_bits)
+            elif const_expr(compact and pass_id > compact_fill_pass):
                 compact_rescan(pass_id, start_bit, previous_start_bit, current_bits)
-                return finish_pass(
-                    pass_id, current_k, current_bits, barrier_token, current_len
-                )
+            else:
+                row_scan(pass_id, start_bit, previous_start_bit, current_bits)
+            return finish_pass(
+                pass_id, current_k, current_bits, barrier_token, current_len
+            )
 
+        def row_scan(
+            pass_id: int, start_bit: int, previous_start_bit: int, current_bits
+        ):
+            """Histogram this part's share of the row."""
             scan_step_idx = scan_run_stride_idx if ordered else active_stride_idx
             scan_start_idx = run_first_idx + tid_idx if ordered else global_vec_tid_idx
             scan_stop_idx = run_end_idx if ordered else vec_blocks_idx
@@ -1697,9 +1694,6 @@ def create_topk_per_row_decode_adaptive_kernel(
                 )
                 pass_results = yield [pass_state[0]]
             gpu.barrier()
-            return finish_pass(
-                pass_id, current_k, current_bits, barrier_token, current_len
-            )
 
         def finish_pass(
             pass_id: int, current_k, current_bits, barrier_token: int, current_len
@@ -2048,6 +2042,9 @@ def create_topk_per_row_decode_adaptive_kernel(
                 last_pass = num_passes - 1
                 settled_bit = max(32 - last_pass * BITS_PER_PASS, 0)
                 early = local_len == local_k
+                if const_expr(compact):
+                    # Row-uniform, so the row's blocks still agree on `early`.
+                    early = early & (row_len <= fx.Int32(short_max))
                 if const_expr(not ordered):  # noqa: SIM102 - constexpr guard
                     if early:
                         early_write_all(settled_bit, kth_bits, local_k)
@@ -2081,6 +2078,38 @@ def create_topk_per_row_decode_adaptive_kernel(
                         local_len,
                     )
 
+            # Leave the row's control slots zero for the next launch. A one-part
+            # row touched only the emit's output counters. On a multi-part row the
+            # last part out clears the row: every peer arrives only after its last
+            # use of the slots, so nothing lands behind the clear.
+            gpu.barrier()
+            if single_part_active:
+                if tid == c_zero:
+                    for counter in (COUNTER_OUT_FRONT, COUNTER_OUT_BACK):
+                        buffer_ops.buffer_store(
+                            c_zero, workspace_rsrc, counter_slot(counter)
+                        )
+            else:
+                if tid == c_zero:
+                    arrived = fx.atomic_add(
+                        ws_ptr(counter_slot(COUNTER_EXIT)),
+                        c_one,
+                        syncscope=_AGENT,
+                        ordering=fx.AtomicOrdering.Monotonic,
+                    )
+                    fx.memref_store(arrived, s_meta, fx.Int32(SMEM_META_EXIT))
+                gpu.barrier()
+                if s_meta[fx.Int32(SMEM_META_EXIT)] == active_parts - c_one:
+                    if tid == c_zero:
+                        ws_poll(counter_slot(COUNTER_EXIT), fx.AtomicOrdering.Acquire)
+                    gpu.barrier()
+                    for slot in range(
+                        tid_idx, fx.Index(CONTROL_ROW_SLOTS), c_block_idx
+                    ):
+                        buffer_ops.buffer_store(
+                            c_zero, workspace_rsrc, row_ws_base + fx.Int32(slot)
+                        )
+
     @flyc.jit
     def launcher(
         logits: fx.Tensor,
@@ -2088,7 +2117,8 @@ def create_topk_per_row_decode_adaptive_kernel(
         seq_lens: fx.Tensor,
         row_starts: fx.Tensor,
         indices: fx.Tensor,
-        workspace: fx.Tensor,
+        control: fx.Tensor,
+        scratch: fx.Tensor,
         num_rows: fx.Int32,
         width: fx.Int32,
         stride0: fx.Int32,
@@ -2097,7 +2127,15 @@ def create_topk_per_row_decode_adaptive_kernel(
     ) -> None:
         grid_y = fx.Index(num_rows)
         topk_per_row_decode_adaptive_kernel(
-            logits, next_n, seq_lens, row_starts, indices, workspace, stride0, width
+            logits,
+            next_n,
+            seq_lens,
+            row_starts,
+            indices,
+            control,
+            scratch,
+            stride0,
+            width,
         ).launch(
             grid=(blocks_per_row, grid_y, 1),
             block=(block_threads, 1, 1),
