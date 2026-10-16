@@ -186,9 +186,16 @@ def _run_isolated(op):
         )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.parametrize("op", list(CHECKS))
 def test_jit_op(op):
+    # Assert rather than skip. This suite only runs on the Windows GPU runner,
+    # where an invisible GPU is a fault, not an unmet precondition -- and five
+    # skips and five passes both exit 0, so skipping would leave the job green
+    # with nothing exercised. A CPU-only torch wheel, a driver that failed to
+    # load amdhip64, or a runner whose GPU is not attached all land here.
+    assert (
+        torch.cuda.is_available()
+    ), "no GPU visible to torch; expected the gfx1201 Windows runner"
     proc = _run_isolated(op)
     print(proc.stdout, end="")
     assert proc.returncode == 0, f"{op} failed:\n{proc.stdout}\n{proc.stderr}"
