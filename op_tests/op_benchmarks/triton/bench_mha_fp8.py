@@ -10,6 +10,7 @@ Usage:
     python bench_mha.py                          # default seqlen sweep
     python bench_mha.py --seqlen_q 4096 --batch 2
     python bench_mha.py --seqlen_q 1024 --seqlen_k 8192  # different q / k lengths
+    python bench_mha.py --seqlen_q 1024 --seqlen_k 8192 --causal  # bottom-right causal
     python bench_mha.py --q_heads 32 --k_heads 8  # grouped query attention
     python bench_mha.py --rep 100
 """
@@ -51,9 +52,16 @@ def bench_case(b, hq, hk, sq, sk, d, causal, rep, device):
     ms = triton.testing.do_bench_cudagraph(run, rep=rep)
 
     # Two SQ x SK x D matmuls per (batch, query head): Q @ K^T and P @ V.
-    flops = 2 * (2.0 * b * hq * sq * sk * d)
-    if causal:
-        flops = flops // 2
+    # With the bottom-right causal mask, query i sees i + (SK - SQ) + 1 keys,
+    # so only SQ * SK - SQ * (SQ - 1) / 2 (query, key) pairs are computed.
+    #num_pairs = sq * sk - sq * (sq - 1) / 2 if causal else sq * sk
+    if causal and sk > sq:
+        num_pairs = sq * sk - sq * (sq - 1) / 2
+    elif causal:
+        num_pairs = sq * sk / 2
+    else:
+        num_pairs = sq * sk
+    flops = 2 * (2.0 * b * hq * num_pairs * d)
     # fp8 q (hq heads, sq) and k/v (hk heads, sk) in, bf16 o (hq heads, sq) out.
     num_bytes = (b * hq * sq * d) + 2 * (b * hk * sk * d) + 2 * (b * hq * sq * d)
     return {
@@ -91,8 +99,8 @@ def main():
     )
 
     seqlen_k = args.seqlen_q if args.seqlen_k is None else args.seqlen_k
-    assert not args.causal or args.seqlen_q == seqlen_k, (
-        f"--causal requires --seqlen_q ({args.seqlen_q}) == --seqlen_k ({seqlen_k})"
+    assert not args.causal or seqlen_k >= args.seqlen_q, (
+        f"--causal requires --seqlen_k ({seqlen_k}) >= --seqlen_q ({args.seqlen_q})"
     )
 
     print(f"fp8 MHA fwd")

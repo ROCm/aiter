@@ -55,9 +55,13 @@ def concat_subtile(x, y):
 
 
 @gluon.jit
-def apply_mask(qk, subtile: gl.constexpr, tile_m, tile_n, BLOCK_M, BLOCK_N, SEQLEN_K, LAYOUT, CAUSAL, EVEN_N):
+def apply_mask(qk, subtile: gl.constexpr, tile_m, tile_n, BLOCK_M, BLOCK_N, SEQLEN_K, USE_CAUSAL_OFFSET, CAUSAL_OFFSET, LAYOUT, CAUSAL, EVEN_N):
+    # CAUSAL_OFFSET = SEQLEN_K - SEQLEN_Q aligns the causal diagonal to the
+    # bottom-right corner: query i attends to keys j <= i + CAUSAL_OFFSET.
     if CAUSAL:
         offs_m = tile_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LAYOUT))
+        if USE_CAUSAL_OFFSET:
+            offs_m += CAUSAL_OFFSET
 
     if subtile == 0:
         offs_n = tile_n * BLOCK_N + gl.arange(0, BLOCK_N // 2, layout=gl.SliceLayout(0, LAYOUT))
@@ -108,6 +112,9 @@ def _mha_fwd_subtiled(
     NUM_K_HEADS: gl.constexpr,
     SEQLEN_Q,
     SEQLEN_K,
+    USE_CAUSAL_OFFSET: gl.constexpr,
+    CAUSAL_OFFSET,
+    grid_m,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     HEAD_DIM: gl.constexpr,
@@ -115,10 +122,10 @@ def _mha_fwd_subtiled(
     NUM_BUFFERS: gl.constexpr,
     EVEN_N: gl.constexpr,
     PRESHUFFLE_FACTOR_K: gl.constexpr,
-    PRESHUFFLE_FACTOR_V: gl.constexpr
+    PRESHUFFLE_FACTOR_V: gl.constexpr,
+    WMMA_LAYOUT_QK: gl.constexpr,
+    WMMA_LAYOUT_O: gl.constexpr
 ):
-    #PRESHUFFLE_FACTOR_K: gl.constexpr = 2 if HEAD_DIM == HEAD_DIM_POW2 else 1
-    #PRESHUFFLE_FACTOR_V: gl.constexpr = 1
 
     SHARED_LAYOUT_Q: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[256, 16]], [BLOCK_M, HEAD_DIM_POW2], [1, 0]
@@ -133,20 +140,6 @@ def _mha_fwd_subtiled(
         [[HEAD_DIM_POW2, 16]], [BLOCK_M, HEAD_DIM_POW2], [1, 0]
     )
 
-    WMMA_LAYOUT_QK: gl.constexpr = gl.amd.AMDWMMALayout(
-        3,
-        transposed=True,
-        warp_bases=[[4, 0], [8, 0]],
-        reg_bases=[[1, 0], [2, 0]],
-        instr_shape=[16, 16, 128],
-    )
-    WMMA_LAYOUT_O: gl.constexpr = gl.amd.AMDWMMALayout(
-        3,
-        transposed=True,
-        warp_bases=[[4, 0], [8, 0]],
-        reg_bases=[[1, 0], [2, 0]],
-        instr_shape=[16, 16, 128],
-    )
     DOT_LAYOUT_Q: gl.constexpr = gl.DotOperandLayout(0, WMMA_LAYOUT_QK, k_width=16)
     DOT_LAYOUT_K: gl.constexpr = gl.DotOperandLayout(1, WMMA_LAYOUT_QK, k_width=16)
     DOT_LAYOUT_P: gl.constexpr = gl.DotOperandLayout(0, WMMA_LAYOUT_O, k_width=8)
@@ -156,7 +149,6 @@ def _mha_fwd_subtiled(
     h_q = gl.program_id(1)
     z = gl.program_id(2)
     if CAUSAL:
-        grid_m = gl.cdiv(SEQLEN_Q, BLOCK_M)
         pid_m = grid_m - 1 - pid_m
     GQA_SIZE: gl.constexpr = NUM_Q_HEADS // NUM_K_HEADS
     h_k = h_q // GQA_SIZE
@@ -257,7 +249,7 @@ def _mha_fwd_subtiled(
     write_idx_k += 1
 
     if CAUSAL:
-        num_n_iter = gl.cdiv((pid_m + 1) * BLOCK_M, BLOCK_N)
+        num_n_iter = gl.cdiv((pid_m + 1) * BLOCK_M + CAUSAL_OFFSET, BLOCK_N)
     else:
         num_n_iter = gl.cdiv(SEQLEN_K, BLOCK_N)
 
@@ -265,9 +257,9 @@ def _mha_fwd_subtiled(
     qk0 = gl.amd.cdna5.wmma(q, k0, qk_zeros)
     qk1 = gl.amd.cdna5.wmma(q, k1, qk_zeros)
     if CAUSAL or not EVEN_N:
-        if num_n_iter <= 2:
-            qk0 = apply_mask(qk0, 0, pid_m, 0, BLOCK_M, BLOCK_N, SEQLEN_K, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
-            qk1 = apply_mask(qk1, 1, pid_m, 0, BLOCK_M, BLOCK_N, SEQLEN_K, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
+        if num_n_iter <= 2: 
+            qk0 = apply_mask(qk0, 0, pid_m, 0, BLOCK_M, BLOCK_N, SEQLEN_K, USE_CAUSAL_OFFSET, CAUSAL_OFFSET, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
+            qk1 = apply_mask(qk1, 1, pid_m, 0, BLOCK_M, BLOCK_N, SEQLEN_K, USE_CAUSAL_OFFSET, CAUSAL_OFFSET, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
     qk = concat_subtile(qk0, qk1)
     m_ij = fast_maximum(m_i, gl.reduce(qk, 1, fast_maximum) * qk_scale)
     qk0_shifted = qk0 * qk_scale - m_ij[:, None]
@@ -328,7 +320,7 @@ def _mha_fwd_subtiled(
         qk0 = gl.amd.cdna5.wmma(q, k0, qk_zeros)
         if CAUSAL or not EVEN_N:
             num_n_iter = gl.maximum(num_n_iter, 3)
-            qk0 = apply_mask(qk0, 0, pid_m, num_n_iter - 2, BLOCK_M, BLOCK_N, SEQLEN_K, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
+            qk0 = apply_mask(qk0, 0, pid_m, num_n_iter - 2, BLOCK_M, BLOCK_N, SEQLEN_K, USE_CAUSAL_OFFSET, CAUSAL_OFFSET, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
         k1 = local_load_k(k1_buffer, read_idx_k, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K)
         read_idx_k += 1
         p1 = gl.exp2(qk1_shifted)
@@ -343,7 +335,7 @@ def _mha_fwd_subtiled(
     with gl.amd.warp_pipeline_stage("ep0_1"):
         qk1 = gl.amd.cdna5.wmma(q, k1, qk_zeros)
         if CAUSAL or not EVEN_N:
-            qk1 = apply_mask(qk1, 1, pid_m, num_n_iter - 2, BLOCK_M, BLOCK_N, SEQLEN_K, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
+            qk1 = apply_mask(qk1, 1, pid_m, num_n_iter - 2, BLOCK_M, BLOCK_N, SEQLEN_K, USE_CAUSAL_OFFSET, CAUSAL_OFFSET, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
         v0 = local_load_v(v0_buffer, read_idx_v, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V)
         p = concat_subtile(p0, p1)
         l_ij = gl.sum(p, 1)
@@ -378,7 +370,7 @@ def _mha_fwd_subtiled(
     with gl.amd.warp_pipeline_stage("ep1_0"):
         qk0 = gl.amd.cdna5.wmma(q, k0, qk_zeros)
         if CAUSAL or not EVEN_N:
-            qk0 = apply_mask(qk0, 0, pid_m, num_n_iter - 1, BLOCK_M, BLOCK_N, SEQLEN_K, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
+            qk0 = apply_mask(qk0, 0, pid_m, num_n_iter - 1, BLOCK_M, BLOCK_N, SEQLEN_K, USE_CAUSAL_OFFSET, CAUSAL_OFFSET, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
         k1 = local_load_k(k1_buffer, read_idx_k, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K)
         read_idx_k += 1
         p1 = gl.exp2(qk1_shifted)
@@ -391,7 +383,7 @@ def _mha_fwd_subtiled(
     with gl.amd.warp_pipeline_stage("ep1_1"):
         qk1 = gl.amd.cdna5.wmma(q, k1, qk_zeros)
         if CAUSAL or not EVEN_N:
-            qk1 = apply_mask(qk1, 1, pid_m, num_n_iter - 1, BLOCK_M, BLOCK_N, SEQLEN_K, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
+            qk1 = apply_mask(qk1, 1, pid_m, num_n_iter - 1, BLOCK_M, BLOCK_N, SEQLEN_K, USE_CAUSAL_OFFSET, CAUSAL_OFFSET, WMMA_LAYOUT_QK, CAUSAL, EVEN_N)
         v0 = local_load_v(v0_buffer, read_idx_v, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V)
         p = concat_subtile(p0, p1)
         l_ij = gl.sum(p, 1)
@@ -431,12 +423,10 @@ def _mha_fwd_subtiled(
     p_quant = gl.convert_layout(p_quant, layout=DOT_LAYOUT_P)
 
     gl.amd.gfx1250.tdm.async_wait(0)
-    #acc0 = gl.amd.cdna5.wmma_scaled(p_quant, 0, "e4m3", v0, 0, "e4m3", acc0) 
     acc0 = gl.amd.cdna5.wmma(p_quant, v0, acc0) 
     acc0 = acc0 * ep_norm   
     acc0 = acc0.to(gl.bfloat16)
     v1 = local_load_v(v1_buffer, read_idx_v, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V)
-    #acc1 = gl.amd.cdna5.wmma_scaled(p_quant, 0, "e4m3", v1, 0, "e4m3", acc1) 
     acc1 = gl.amd.cdna5.wmma(p_quant, v1, acc1) 
     acc1 = acc1 * ep_norm
     acc1 = acc1.to(gl.bfloat16)

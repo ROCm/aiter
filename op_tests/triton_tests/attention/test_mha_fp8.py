@@ -389,7 +389,9 @@ def mha_torch(q, k, v, sm_scale, causal):
     qk = q @ k.transpose(-2, -1)
     qk = qk * sm_scale
     if causal:
-        M = torch.tril(torch.ones((q.shape[2], k.shape[2]), device=q.device))
+        # bottom-right aligned: query i attends to keys j <= i + (SK - SQ)
+        sq, sk = q.shape[2], k.shape[2]
+        M = torch.tril(torch.ones((sq, sk), device=q.device), diagonal=sk - sq)
         qk[:, :, M == 0] = float("-inf")
     p = torch.exp(qk - qk.amax(-1, keepdim=True))
     l = p.sum(-1, keepdim=True)
@@ -458,6 +460,7 @@ class Case:
             Case(1, 48, 8, 2048, 2048, 128),
             # seqlen_q < seqlen_k
             Case(2, 8, 2, 512, 1024, 128),
+            Case(2, 4, 4, 600, 700, 128),
             # seqlen_q > seqlen_k
             Case(1, 8, 8, 2048, 512, 128),
         ]
@@ -465,8 +468,8 @@ class Case:
 )
 @pytest.mark.parametrize("causal", [False, True])
 def test_mha_fwd_gluon_gfx1250(b, hq, hk, sq, sk, d, causal, device="cuda"):
-    if causal and sq != sk:
-        pytest.skip("causal with seqlen_q != seqlen_k is not supported yet")
+    if causal and sq > sk:
+        pytest.skip("causal requires seqlen_k >= seqlen_q")
     torch.manual_seed(0)
 
     q_tri, k_tri, v_tri, q_scale, k_scale, v_scale = init_qkv(
