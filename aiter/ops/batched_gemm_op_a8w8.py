@@ -320,7 +320,8 @@ def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
 
     The preshuffle table holds both backends' kernels -- each row names the
     faster of opus and flydsl for its shape and w_scale block -- so the row's
-    libtype picks the backend. A shape without a row runs flydsl's heuristic.
+    libtype picks the backend. A shape without a row runs flydsl's heuristic,
+    or OPUS for 1x32 on gfx950.
     """
     m, g, k = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
     n = int(wo_a.shape[1])
@@ -410,8 +411,9 @@ def batched_gemm_a8w8_mxscale_bpreshuffle(
 
     The arch and the w_scale block select the kernels:
 
-    * gfx950, 1x32: OPUS, with weight scales [G,N,K/32] and activation
-      scales [M,G,K/32]. Requires N divisible by 16 and K divisible by 128.
+    * gfx950, 1x32: weight scales [G,N,K/32] and activation scales
+      [M,G,K/32]. The tuned row's libtype, opus or flydsl; OPUS off the table,
+      which requires N divisible by 16 and K divisible by 128.
     * gfx950, 32x32 or 128x128: the tuned row's libtype, opus or flydsl,
       whichever was faster at that shape; flydsl's heuristic off the table.
       DeepSeek-V4.1's original wo_a weight (32x32) and V4's (128x128) both run
