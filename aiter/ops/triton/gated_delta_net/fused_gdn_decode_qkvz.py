@@ -17,9 +17,9 @@ counts and no conv bias. Qwen3-Next GDN uses a per-head
 Qwen3.5/3.8-27B) and a biased convolution. The head topology alone (KDA's
 ``lp = H*K`` offsets) cannot express ``VH == ratio*KH``.
 
-Ratio 2 runs the generated, batch-specialised kernels; any other ratio runs the
-hand-written ``_decode_group_ratio`` kernel, which walks a group's value heads
-one state tile at a time.
+Ratio 2 with an fp32 state runs the generated, batch-specialised kernels; any
+other ratio, and any bf16 state, runs the hand-written ``_decode_group_ratio``
+kernel, which walks a group's value heads one state tile at a time.
 
 Support is deliberately narrow and is reported by
 :func:`fused_gdn_decode_qkvz_supported` rather than asserted, so callers fall
@@ -57,10 +57,12 @@ _LARGE_BATCH = 128
 _CONV_WIDTH = 4
 
 
-def _uses_ratio_generic_kernel(ratio: int, flat: bool, has_qsl: bool) -> bool:
-    """Ratio 2 in the interleaved layout without padding runs the generated pair
-    kernels; every other call runs the ratio-generic kernel."""
-    return ratio != 2 or flat or has_qsl
+def _uses_ratio_generic_kernel(
+    ratio: int, flat: bool, has_qsl: bool, state_dtype: torch.dtype
+) -> bool:
+    """Ratio 2 in the interleaved layout with an fp32 state and no padding runs the
+    generated pair kernels; every other call runs the ratio-generic kernel."""
+    return ratio != 2 or flat or has_qsl or state_dtype is not torch.float32
 
 
 def _arch_supported() -> tuple[bool, str]:
@@ -211,8 +213,8 @@ def fused_gdn_decode_qkvz_supported(
     if conv_bias is None:
         return False, "conv bias is required (pass zeros if the model has none)"
 
-    if ssm_state.dtype is not torch.float32:
-        return False, f"ssm_state must be fp32, got {ssm_state.dtype}"
+    if ssm_state.dtype not in (torch.float32, torch.bfloat16):
+        return False, f"ssm_state must be fp32 or bf16, got {ssm_state.dtype}"
     bf16_args = (projected_qkvz, projected_ba, conv_state, conv_weight, conv_bias)
     if not all(t.dtype is torch.bfloat16 for t in bf16_args):
         return False, "packed projections, conv state/weight/bias must be bf16"
@@ -288,12 +290,16 @@ def fused_gdn_decode_qkvz_supported(
         if not query_start_loc.is_contiguous():
             return False, "query_start_loc must be contiguous"
     generic = _uses_ratio_generic_kernel(
-        v_heads // k_heads, qkvz_layout == "flat", query_start_loc is not None
+        v_heads // k_heads,
+        qkvz_layout == "flat",
+        query_start_loc is not None,
+        ssm_state.dtype,
     )
     if not generic and not (conv_state.is_contiguous() and ssm_state.is_contiguous()):
         return False, (
             "strided state pools are only supported by the ratio-generic kernel "
-            "(num_v_heads / num_k_heads != 2, the flat layout or query_start_loc); "
+            "(num_v_heads / num_k_heads != 2, the flat layout, query_start_loc or a "
+            "bf16 state); "
             f"got conv strides {conv_state.stride()}, ssm strides {ssm_state.stride()}"
         )
 
@@ -331,8 +337,9 @@ def fused_gdn_decode_qkvz(
         projected_ba: [T, 2*VH] bf16, packed ``in_proj_ba`` output (betas then a's
             per key-head group).
         conv_state: [N, channels, 3] bf16, rolling conv window. **Mutated in place.**
-        ssm_state: [N, VH, VD, KD] fp32, delta-rule state. **Mutated in place.**
-            On the ratio-generic path (``ratio != 2`` or the flat layout) both
+        ssm_state: [N, VH, VD, KD] fp32 or bf16, delta-rule state. **Mutated in
+            place.** The update runs in fp32 either way; a bf16 state runs the
+            ratio-generic kernel. On the ratio-generic path both
             may be strided along N and ``conv_state`` may be any strided view
             (e.g. the transpose of a width-major [N, 3, channels] buffer);
             ``ssm_state`` stays dense within a slot.
@@ -435,9 +442,11 @@ def fused_gdn_decode_qkvz(
         k_heads,
         v_heads,
     )
-    if _uses_ratio_generic_kernel(ratio, flat, query_start_loc is not None):
+    if _uses_ratio_generic_kernel(
+        ratio, flat, query_start_loc is not None, ssm_state.dtype
+    ):
         # Ratio-generic kernel at every batch size; the bands below hardcode
-        # ratio 2, the interleaved layout and dense pools.
+        # ratio 2, the interleaved layout, dense pools and an fp32 state.
         from aiter.ops.triton._gluon_kernels.gfx950.gated_delta_net.fused_gdn_decode_qkvz_ratio import (
             _decode_group_ratio,
         )
@@ -456,11 +465,11 @@ def fused_gdn_decode_qkvz(
             head_v_dim,
             ratio,
             1 << (conv_width - 1).bit_length(),
-            # NW, KL, KS: 16 lanes x 4 fp32 per tile row = one contiguous 16 B
-            # access per lane (wider per-lane chunks cost 2-4x in bandwidth).
+            # NW, KL, KS: 16 lanes per tile row, KS elements = one contiguous 16 B
+            # access per lane (4 fp32 or 8 bf16; wider chunks cost 2-4x in bandwidth).
             8,
             16,
-            4,
+            16 // ssm_state.element_size(),
             PAD_SLOT_ID=pad_slot_id,
             HAS_FP8=has_fp8,
             FLAT=flat,
