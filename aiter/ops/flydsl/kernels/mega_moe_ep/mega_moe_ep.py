@@ -21,6 +21,7 @@ from .mega_moe_ep_config import (
     FLAG_INTS,
     MAX_NPES,
     ep_shape_supported,
+    mega_moe_ep_consts,
 )
 from .mega_moe_ep_kernel import compile_mega_moe_ep
 
@@ -238,8 +239,9 @@ class MegaMoeEPEngine:
         # Per-CTA GEMM scratch (local, NOT peer-visible): GEMM1 writes the E8M0-quantized
         # intermediate (inter / inters), GEMM2 reads it + writes model-dim bf16 (gout) for
         # combine_send. Indexed bid*RG*row in the kernel; sized for the largest row tile
-        # (mt=3 -> RG=48) so a smaller-RG launch indexes a strict prefix.
-        rg_max = 48
+        # (pipelined GEMM1 uses mt in {2,4} -> RG in {32,64}) so a smaller-RG launch
+        # indexes a strict prefix.
+        rg_max = 64
         a_pack = 1 if self.a8 else 2
         self._inter = torch.empty(
             self.n_cta * rg_max * (self.I // a_pack),
@@ -280,11 +282,22 @@ class MegaMoeEPEngine:
 
     def _fit_mt(self, m):
         # The V2 pipelined GEMM1 packs rows in pairs (MfmaScaleGU / AScaleLoader use
-        # m_repeat//2 scale groups), so the row tile mt (=m_repeat) must be EVEN. mt=2
-        # (RG=32) fits the rg_max=48 per-CTA scratch and all shapes' LDS; larger even
-        # tiles (mt=4) are a perf follow-up (they need rg_max>=64).
-        del m
-        return 2
+        # m_repeat//2 scale groups), so the row tile mt (=m_repeat) must be EVEN.
+        # mt=2 (RG=32) for small/mid batches; mt=4 (RG=64) for large batches so the
+        # per-expert row-chunk count (~received_rows/(RG/2)) stays under the planner's
+        # NCHA LDS chunk table -- otherwise the chunk table overflows past L_EOFF into
+        # L_CTL and corrupts the compute-wave cbar slots (a 2^24-chunk hang).
+        mt = 2 if m <= 512 else 4
+        while mt > 2:
+            if (
+                mega_moe_ep_consts(
+                    self.H, self.I, mt, self.epr, self.mtpr * self.world_size, self.a8
+                )["LDS_BYTES"]
+                <= LDS_LIMIT
+            ):
+                break
+            mt -= 2
+        return mt
 
     def config(self, m):
         cfg = self._cfgs.get(m)
