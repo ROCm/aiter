@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -427,16 +426,24 @@ def tl_mark(ctrl, base_int, slot):
     """s_memrealtime -> this CTA's int64 timeline slot after the ctrl ints."""
     bid = i32(gpu.block_id("x"))
     t = now()
-    addr = fx.Int64(ctrl) + fx.Int64((i32(base_int) + (bid * i32(24) + i32(slot)) * i32(2)) * i32(4))
+    addr = fx.Int64(ctrl) + fx.Int64(
+        (i32(base_int) + (bid * i32(24) + i32(slot)) * i32(2)) * i32(4)
+    )
     g_st_sys(addr, fx.Int32(t))
     g_st_sys(addr + fx.Int64(4), fx.Int32(t >> fx.Int64(32)))
 
 
 def tl_slot(ctrl, base_int, slot):
     bid = i32(gpu.block_id("x"))
-    return fx.Int64(ctrl) + fx.Int64((i32(base_int) + (bid * i32(24) + i32(slot)) * i32(2)) * i32(4))
+    return fx.Int64(ctrl) + fx.Int64(
+        (i32(base_int) + (bid * i32(24) + i32(slot)) * i32(2)) * i32(4)
+    )
 
 
 def tl_add(ctrl, base_int, slot, t0):
     """Accumulate now() - t0 (10 ns ticks) into the low int32 of a timeline slot."""
-    fx.atomic_add(gptr(tl_slot(ctrl, base_int, slot)), i32(fx.Int32(now() - t0)), syncscope="agent")
+    fx.atomic_add(
+        gptr(tl_slot(ctrl, base_int, slot)),
+        i32(fx.Int32(now() - t0)),
+        syncscope="agent",
+    )

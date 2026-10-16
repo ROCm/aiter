@@ -85,7 +85,9 @@ def build_gemm(kc: KernelCtx) -> dict:
     ag_wait_chunk, cbar, const_expr = kc.get("ag_wait_chunk cbar const_expr")
     ll_pkt, npp, nsk, route_fp8 = kc.get("ll_pkt npp nsk route_fp8")
     TL, CTRL_INTS_, SOL = kc.get("TL CTRL_INTS_ SOL")
-    G1PRE = os.environ.get("AITER_MEGAMOE_TP_G1PRE", "0") == "1"  # [exp] fence after the A reads
+    G1PRE = (
+        os.environ.get("AITER_MEGAMOE_TP_G1PRE", "0") == "1"
+    )  # [exp] fence after the A reads
     ASC_CACHED = kc.get("ASC_CACHED")[0]
     route_region_bytes = kc.route_region_bytes
 
@@ -188,12 +190,17 @@ def build_gemm(kc: KernelCtx) -> dict:
         for m in range_constexpr(MTE):
             row = i32(m * 16) + lane % i32(16)
             if const_expr("NA" in SOL):
-                afs.append(fx.Vector.from_elements([lane + i32(m * 4 + i) for i in range(4)], fx.Int32))
+                afs.append(
+                    fx.Vector.from_elements(
+                        [lane + i32(m * 4 + i) for i in range(4)], fx.Int32
+                    )
+                )
                 sas.append(i32(127))
             else:
                 afs.append(a_frag(abuf, row, k, lane // i32(16)))
                 sas.append(
-                    fx.Int32(lds_ld(asbuf, row * i32(4) + lane // i32(16), T.i8, 1)) & i32(0xFF)
+                    fx.Int32(lds_ld(asbuf, row * i32(4) + lane // i32(16), T.i8, 1))
+                    & i32(0xFF)
                 )
         if const_expr(G1PRE):
             rocdl.sched_barrier(0)
@@ -261,7 +268,9 @@ def build_gemm(kc: KernelCtx) -> dict:
                         slot = ring + i32((s_ % nsk) * SLOT)
                         if const_expr("NB" in SOL):
                             b = [
-                                fx.Vector.from_elements([lane + i32(t * 4 + i) for i in range(4)], fx.Int32)
+                                fx.Vector.from_elements(
+                                    [lane + i32(t * 4 + i) for i in range(4)], fx.Int32
+                                )
                                 for t in range(4)
                             ]
                             sgw = i32(0x7F7F7F7F)
@@ -391,7 +400,13 @@ def build_gemm(kc: KernelCtx) -> dict:
                             + b * i32(KCS * NSC_BLK * 64 * 4)
                             + i32((k * NSC_BLK + j) * 64 * 4)
                         )
-                        dma4(dst, rxs, ascl[j], cc * i32(8) + i32(k * 4), sys=not ASC_CACHED)
+                        dma4(
+                            dst,
+                            rxs,
+                            ascl[j],
+                            cc * i32(8) + i32(k * 4),
+                            sys=not ASC_CACHED,
+                        )
                 _loader_advance(L, lane, q, a)
             wait_vm(0)
             _loader_flush(L, lane)

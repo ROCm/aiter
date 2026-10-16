@@ -17,8 +17,6 @@ vmcnt: every wave issues the same ops in the same order every step, so the wait
 counts are compile-time (see the issue order notes at each wait).
 """
 
-
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import gpu, range_constexpr, rocdl
@@ -34,6 +32,7 @@ from .common import (
     dma4,
     dma16,
     fp4_pack,
+    fp8x4_pack,
     i32,
     lds_ld,
     lds_ld_i32,
@@ -43,7 +42,6 @@ from .common import (
     rsrc,
     swap16,
     swap32,
-    fp8x4_pack,
     wait_lgkm0,
     wait_vm,
 )
@@ -58,7 +56,11 @@ def _opaque(v):
     from flydsl._mlir.dialects import llvm as _llvm
     from flydsl.expr import arith
 
-    return fx.Int32(_llvm.inline_asm(T.i32, [arith.unwrap(v)], "v_mov_b32 $0, $1", "=v,v", has_side_effects=True))
+    return fx.Int32(
+        _llvm.inline_asm(
+            T.i32, [arith.unwrap(v)], "v_mov_b32 $0, $1", "=v,v", has_side_effects=True
+        )
+    )
 
 
 def bigm_lds(RG, NAB, I, NW=NW, MODE=0, KCK=2, PFD=0):
@@ -74,12 +76,18 @@ def bigm_lds(RG, NAB, I, NW=NW, MODE=0, KCK=2, PFD=0):
         o += n
         return r
 
-    c["LA"] = take(NAB * RG * 64 * KCK) if MODE != 4 else 0  # A codes: [buf][row][64 KCK B], 16 B columns swizzled
-    c["LAS"] = take(NAB * NW * 64 * 4) if MODE != 4 else 0  # A scales: [buf][wave][lane] words (dma4 order)
+    c["LA"] = (
+        take(NAB * RG * 64 * KCK) if MODE != 4 else 0
+    )  # A codes: [buf][row][64 KCK B], 16 B columns swizzled
+    c["LAS"] = (
+        take(NAB * NW * 64 * 4) if MODE != 4 else 0
+    )  # A scales: [buf][wave][lane] words (dma4 order)
     c["LRIX"] = take(RG * 4)
     c["LWT"] = take(RG * 4)
     if MODE == 3:
-        c["SIS"] = NW * 16 + 16  # one pass: NW * 32 columns (+16: rows on different banks)
+        c["SIS"] = (
+            NW * 16 + 16
+        )  # one pass: NW * 32 columns (+16: rows on different banks)
         c["LINT"] = c["LA"]
         assert RG * c["SIS"] <= NAB * RG * 64 * KCK
         c["ISS"] = NW  # scale bytes per row
@@ -89,15 +97,39 @@ def bigm_lds(RG, NAB, I, NW=NW, MODE=0, KCK=2, PFD=0):
         c["LINT"] = take(RG * c["SIS"])  # intermediate MXFP4 rows
         c["ISS"] = I // 32
         c["LINTS"] = take(RG * (I // 32))  # their E8M0 scales
-    c["LPF"] = take(NW * 256) if PFD else 0  # per-wave scratch of the L2 prefetch DMAs (never read)
+    c["LPF"] = (
+        take(NW * 256) if PFD else 0
+    )  # per-wave scratch of the L2 prefetch DMAs (never read)
     c["LCTL"] = take(64)
     c["BYTES"] = (o + 15) // 16 * 16
     return c
 
 
 def build_bigm_unit(
-    H, I, TOPK, RG=128, NAB=4, BST=3, BS2=3, act="swiglu", swiglu_limit=7.0, dbg=0, st_aux=0, ISPL=1,
-    PACKED=0, NWU=NW, NRS=1, UNRP=0, SWZ=0, LRG=None, MODE=0, G2N=1, PFD=0, R8=0, KCK=2, CAUX=AUX_SYS,
+    H,
+    I,
+    TOPK,
+    RG=128,
+    NAB=4,
+    BST=3,
+    BS2=3,
+    act="swiglu",
+    swiglu_limit=7.0,
+    dbg=0,
+    st_aux=0,
+    ISPL=1,
+    PACKED=0,
+    NWU=NW,
+    NRS=1,
+    UNRP=0,
+    SWZ=0,
+    LRG=None,
+    MODE=0,
+    G2N=1,
+    PFD=0,
+    R8=0,
+    KCK=2,
+    CAUX=AUX_SYS,
 ):
     """The fused unit device function: unit_body(L, tid, e, r0, rows, rr, rwt, rx, rxs, w1,
     w2, rws1, rws2, r_routes, oob): rows rr / rwt[r0 : r0 + rows] (route index, weight) of expert
@@ -116,7 +148,13 @@ def build_bigm_unit(
     the LDS of a 256-row unit fits; one chunk = 16 row tiles x 4 column tiles x 1 k-step).
     Returns (LDS layout, unit_body)."""
     assert KCK in (1, 2)
-    assert RG % 16 == 0 and RG <= (256 if KCK == 1 else 128) and H % 256 == 0 and I % 128 == 0 and RG <= (LRG or RG)
+    assert (
+        RG % 16 == 0
+        and RG <= (256 if KCK == 1 else 128)
+        and H % 256 == 0
+        and I % 128 == 0
+        and RG <= (LRG or RG)
+    )
     MTE = RG // 16
     KH = H // 2  # A / w1 row bytes
     KCH = H // (128 * KCK)  # GEMM1 chunks (KCK k-steps of 128)
@@ -164,10 +202,20 @@ def build_bigm_unit(
     # STG (R8): a group's MXFP8 route rows staged in LDS (the A ring, idle in GEMM2; 2 buffers), then
     # stored as whole 256-column row segments: 8 + 1 stores per wave (full lines) instead of 2 x MTEW
     STG = False
-    STGB = RG * NW * 64 + RG * NW * 2  # one staging buffer: codes [RG][NW x 64] + scales [RG][2 NW]
-    assert not STG or (RG * NW * 64) % (NTHU * 16) == 0 and (RG * NW * 2) % (NTHU * 4) == 0
-    assert not STG or lay["LRIX"] - lay["LA"] >= 2 * STGB, "STG: the A ring + scales hold 2 buffers"
-    NST2 = (RG * NW * 64 // (NTHU * 16) + RG * NW * 2 // (NTHU * 4)) if STG else 2 * MTEW * G2W  # route stores per wave per group
+    STGB = (
+        RG * NW * 64 + RG * NW * 2
+    )  # one staging buffer: codes [RG][NW x 64] + scales [RG][2 NW]
+    assert (
+        not STG or (RG * NW * 64) % (NTHU * 16) == 0 and (RG * NW * 2) % (NTHU * 4) == 0
+    )
+    assert (
+        not STG or lay["LRIX"] - lay["LA"] >= 2 * STGB
+    ), "STG: the A ring + scales hold 2 buffers"
+    NST2 = (
+        (RG * NW * 64 // (NTHU * 16) + RG * NW * 2 // (NTHU * 4))
+        if STG
+        else 2 * MTEW * G2W
+    )  # route stores per wave per group
     # steady-state GEMM1 issue order per chunk c: B(c + BST), then A(c + NAB - 1)
     WAIT1 = min(NA + (NA + NB) * (BST - 1), (NA + NB) * (NAB - 2))
     VSP = False
@@ -202,7 +250,6 @@ def build_bigm_unit(
     if EPP:
         WAIT2 = [_wait2e(kk) for kk in range(KS2)]
 
-
     def act_batch(gs, us):
         return _activation_mul_batch(gs, us, act=act, swiglu_limit=swiglu_limit)
 
@@ -213,13 +260,28 @@ def build_bigm_unit(
             rc = (tid < rows).select(tid, i32(0))
             if const_expr(PACKED):
                 v_ = fx.Int32(bld(rr, (r0 + rc) * i32(4), 0, T.i32, AUX_SYS))
-                lds_st(L, i32(LRIX) + tid * i32(4), (v_ & i32(0xFFFFFF)) * i32(TOPK) + (v_ >> i32(24)))
-                lds_st(L, i32(LWT) + tid * i32(4), fx.Int32(bld(rwt, (r0 + rc) * i32(4), 0, T.i32, AUX_SYS)))
+                lds_st(
+                    L,
+                    i32(LRIX) + tid * i32(4),
+                    (v_ & i32(0xFFFFFF)) * i32(TOPK) + (v_ >> i32(24)),
+                )
+                lds_st(
+                    L,
+                    i32(LWT) + tid * i32(4),
+                    fx.Int32(bld(rwt, (r0 + rc) * i32(4), 0, T.i32, AUX_SYS)),
+                )
             else:
-                lds_st(L, i32(LRIX) + tid * i32(4), fx.Int32(bld(rr, (r0 + rc) * i32(4), 0, T.i32)))
-                lds_st(L, i32(LWT) + tid * i32(4), fx.Int32(bld(rwt, (r0 + rc) * i32(4), 0, T.i32)))
+                lds_st(
+                    L,
+                    i32(LRIX) + tid * i32(4),
+                    fx.Int32(bld(rr, (r0 + rc) * i32(4), 0, T.i32)),
+                )
+                lds_st(
+                    L,
+                    i32(LWT) + tid * i32(4),
+                    fx.Int32(bld(rwt, (r0 + rc) * i32(4), 0, T.i32)),
+                )
         gpu.barrier()
-
 
     @flyc.jit
     def part_g1(L, tid, e, rows, rx, rxs, w1, rws1, ih, plo, phi):
@@ -240,7 +302,9 @@ def build_bigm_unit(
         arow = []
         for j in range_constexpr(NAJ):
             row = w * i32(AR) + i32(j * RPJ) + lane // i32(LPR)
-            col = (lane % i32(LPR)) ^ (((row >> i32(1)) if const_expr(SWZ) else row) & i32(LPR - 1))
+            col = (lane % i32(LPR)) ^ (
+                ((row >> i32(1)) if const_expr(SWZ) else row) & i32(LPR - 1)
+            )
             tok = lds_ld_i32(L, i32(LRIX) + row * i32(4)) // i32(TOPK)
             arow.append(tok * i32(KH) + col * i32(16))
         # scales: lane -> (row w * AR + lane % AR, k-step (lane // AR) % KCK)
@@ -251,21 +315,37 @@ def build_bigm_unit(
         def issue_a(c, buf):
             base = L + i32(LA + buf * RG * RBA)
             for j in range_constexpr(NAJ):
-                dma16(base + (w * i32(AR) + i32(j * RPJ)) * i32(RBA), rx, i32(0) if const_expr(dbg & 2) else arow[j], c * i32(RBA))
-            dma4(L + i32(LAS + buf * NWT * 256) + w * i32(256), rxs, i32(0) if const_expr(dbg & 2) else soff, c * i32(4 * KCK))
+                dma16(
+                    base + (w * i32(AR) + i32(j * RPJ)) * i32(RBA),
+                    rx,
+                    i32(0) if const_expr(dbg & 2) else arow[j],
+                    c * i32(RBA),
+                )
+            dma4(
+                L + i32(LAS + buf * NWT * 256) + w * i32(256),
+                rxs,
+                i32(0) if const_expr(dbg & 2) else soff,
+                c * i32(4 * KCK),
+            )
             if const_expr(SCB):  # no reordering across issue groups
                 rocdl.sched_barrier(SCM)
 
         def a_frag(buf, row, k):
             # SWZ: rows r, r + 8 (one 16-lane phase of ds_read_b128) on different banks
-            col = (i32(k * 4) + q4) ^ (((row >> i32(1)) if const_expr(SWZ) else row) & i32(LPR - 1))
-            return lds_ld(L, i32(LA + buf * RG * RBA) + row * i32(RBA) + col * i32(16), V4I, 16)
+            col = (i32(k * 4) + q4) ^ (
+                ((row >> i32(1)) if const_expr(SWZ) else row) & i32(LPR - 1)
+            )
+            return lds_ld(
+                L, i32(LA + buf * RG * RBA) + row * i32(RBA) + col * i32(16), V4I, 16
+            )
 
         def a_scale(buf, row, k):
             if const_expr(dbg & 16):  # [dbg] no A scale LDS reads
                 return i32(127)
             wd = (row // i32(AR)) * i32(64) + i32(k * AR) + row % i32(AR)
-            return fx.Int32(lds_ld(L, i32(LAS + buf * NWT * 256) + wd * i32(4) + q4, T.i8, 1)) & i32(0xFF)
+            return fx.Int32(
+                lds_ld(L, i32(LAS + buf * NWT * 256) + wd * i32(4) + q4, T.i8, 1)
+            ) & i32(0xFF)
 
         # AFC: one per-lane base + compile-time offsets (row tile m, k-step, ring buffer) for the A
         # fragment / scale reads (one wave's rows are every row: the swizzle depends on the lane
@@ -274,7 +354,10 @@ def build_bigm_unit(
         if const_expr(AFC):
             l16 = lane % i32(16)
             swz = ((l16 >> i32(1)) if const_expr(SWZ) else l16) & i32(LPR - 1)
-            abase = [L + i32(LA) + l16 * i32(RBA) + ((i32(k * 4) + q4) ^ swz) * i32(16) for k in range(KCK)]
+            abase = [
+                L + i32(LA) + l16 * i32(RBA) + ((i32(k * 4) + q4) ^ swz) * i32(16)
+                for k in range(KCK)
+            ]
             sbase = L + i32(LAS) + l16 * i32(4) + q4
 
         def a_frag_m(buf, m, k):
@@ -287,7 +370,9 @@ def build_bigm_unit(
                 return i32(127)
             if const_expr(AFC):
                 wd0 = (m * 16) // AR * 64 + k * AR + (m * 16) % AR
-                return fx.Int32(lds_ld(sbase, buf * NWT * 256 + wd0 * 4, T.i8, 1)) & i32(0xFF)
+                return fx.Int32(
+                    lds_ld(sbase, buf * NWT * 256 + wd0 * 4, T.i8, 1)
+                ) & i32(0xFF)
             return a_scale(buf, rb + i32(m * 16) + lane % i32(16), k)
 
         # ---- GEMM1 B (w1 of expert e): pass p, chunk c ----
@@ -301,13 +386,30 @@ def build_bigm_unit(
             for k in range_constexpr(KCK):
                 for t in range_constexpr(4):
                     if const_expr(dbg & 1):
-                        b.append(fx.Vector(bld(rw1, lane * i32(16) + i32(t * 1024), i32(k * 4096), V4I)))
+                        b.append(
+                            fx.Vector(
+                                bld(
+                                    rw1,
+                                    lane * i32(16) + i32(t * 1024),
+                                    i32(k * 4096),
+                                    V4I,
+                                )
+                            )
+                        )
                     else:
-                        b.append(fx.Vector(bld(rw1, vs[t], (c * i32(KCK) + i32(k)) * i32(1024), V4I)))
+                        b.append(
+                            fx.Vector(
+                                bld(
+                                    rw1, vs[t], (c * i32(KCK) + i32(k)) * i32(1024), V4I
+                                )
+                            )
+                        )
             # one scale word = 2 k-steps (KCK 1: two chunks read it -- separate loads, opaque offset)
             cw = (c * i32(KCK)) // i32(2)
             sg = ((e * i32(2 * I) + icol0) // i32(32)) * i32(CH1 * 256) + cw * i32(256)
-            su = ((e * i32(2 * I) + i32(I) + icol0) // i32(32)) * i32(CH1 * 256) + cw * i32(256)
+            su = ((e * i32(2 * I) + i32(I) + icol0) // i32(32)) * i32(
+                CH1 * 256
+            ) + cw * i32(256)
             vso = _opaque(lane * i32(4)) if const_expr(KCK == 1) else lane * i32(4)
             b.append(fx.Int32(bld(rws1, vso, sg, T.i32)))
             b.append(fx.Int32(bld(rws1, vso, su, T.i32)))
@@ -318,7 +420,13 @@ def build_bigm_unit(
                 pq = fx.min(p + cq // i32(KCH), i32(PASSES - 1))
                 blk = lane // i32(8)
                 t_ = blk % i32(4)
-                pf = ((pg0 + pq) * i32(NW * 32) + wc * i32(32)) * i32(KH) + (t_ % i32(2)) * i32(16 * KH) + (t_ // i32(2)) * i32(I * KH) + (blk // i32(4)) * i32(1024) + (lane % i32(8)) * i32(128)
+                pf = (
+                    ((pg0 + pq) * i32(NW * 32) + wc * i32(32)) * i32(KH)
+                    + (t_ % i32(2)) * i32(16 * KH)
+                    + (t_ // i32(2)) * i32(I * KH)
+                    + (blk // i32(4)) * i32(1024)
+                    + (lane % i32(8)) * i32(128)
+                )
                 dma4(L + i32(LPF) + w * i32(256), rw1, pf, (cq % i32(KCH)) * i32(2048))
             if const_expr(SCB):
                 rocdl.sched_barrier(SCM)
@@ -334,7 +442,11 @@ def build_bigm_unit(
                 sak = [[a_scale_m(buf, m, k) for m in range(MTEW)] for k in range(KCK)]
             for k in range_constexpr(KCK):
                 kp = (c * KCK + k) % 2  # the global k-step's half of the scale word
-                sc = [(x >> i32(8 * (kp * 2 + h))) & i32(0xFF) for x in (sgw, suw) for h in (0, 1)]
+                sc = [
+                    (x >> i32(8 * (kp * 2 + h))) & i32(0xFF)
+                    for x in (sgw, suw)
+                    for h in (0, 1)
+                ]
                 if const_expr(APF):
                     afs, sas = afk[k], sak[k]
                 else:
@@ -351,21 +463,44 @@ def build_bigm_unit(
                 row = rb + i32(m * 16) + lane % i32(16)
                 gs, us_ = [], []
                 for t in range_constexpr(2):
-                    ga, ua = fx.Vector(acc[m * 2 + t]), fx.Vector(acc[2 * MTEW + m * 2 + t])
+                    ga, ua = fx.Vector(acc[m * 2 + t]), fx.Vector(
+                        acc[2 * MTEW + m * 2 + t]
+                    )
                     for v in range_constexpr(4):
                         gs.append(fx.Float32(ga[v]))
                         us_.append(fx.Float32(ua[v]))
-                xs_ = [fx.Float32(x).to(fx.BFloat16).to(fx.Float32) for x in act_batch(gs, us_)]
+                xs_ = [
+                    fx.Float32(x).to(fx.BFloat16).to(fx.Float32)
+                    for x in act_batch(gs, us_)
+                ]
                 am = amax(xs_)
                 am = am.maximumf(am.shuffle_xor(i32(16), i32(64)))
                 am = am.maximumf(am.shuffle_xor(i32(32), i32(64)))
                 e8, qs = _e8m0_from_amax(am, max_norm=6.0)
                 for t in range_constexpr(2):
-                    col = (i32(0) if const_expr(P1) else p * i32(NW * 32)) + wc * i32(32) + i32(t * 16) + q4 * i32(4)
+                    col = (
+                        (i32(0) if const_expr(P1) else p * i32(NW * 32))
+                        + wc * i32(32)
+                        + i32(t * 16)
+                        + q4 * i32(4)
+                    )
                     pk = fp4_pack(xs_[t * 4 : t * 4 + 4], qs)
-                    lds_st(L, i32(LINT) + row * i32(SIS) + col // i32(2), fx.Int16(pk & i32(0xFFFF)), align=2)
+                    lds_st(
+                        L,
+                        i32(LINT) + row * i32(SIS) + col // i32(2),
+                        fx.Int16(pk & i32(0xFFFF)),
+                        align=2,
+                    )
                 if q4 == i32(0):
-                    lds_st(L, i32(LINTS) + row * i32(ISS) + (i32(0) if const_expr(P1) else p * i32(NW)) + wc, fx.Int8(e8), align=1)
+                    lds_st(
+                        L,
+                        i32(LINTS)
+                        + row * i32(ISS)
+                        + (i32(0) if const_expr(P1) else p * i32(NW))
+                        + wc,
+                        fx.Int8(e8),
+                        align=1,
+                    )
 
         # ---- GEMM1: PASSES x KCH chunks, A ring NAB, B ring BST (carried over passes) ----
         # prologue = the steady-state issue order of the BST virtual steps before c = 0
@@ -401,7 +536,9 @@ def build_bigm_unit(
                     seq.append(("a", c + NAB - 1, NA))
             gpu.barrier()  # every wave's last A reads done: the intermediate reuses the A ring
             act_store(acc, plo)
-        for i in range_constexpr(-max(BST, NAB - 1), 0 if MODE != 3 else -max(BST, NAB - 1)):
+        for i in range_constexpr(
+            -max(BST, NAB - 1), 0 if MODE != 3 else -max(BST, NAB - 1)
+        ):
             if const_expr(i + BST >= 0):
                 bpre.append(issue_b(plo, i32(i + BST)))
             else:
@@ -435,12 +572,24 @@ def build_bigm_unit(
         # (sched_group_barrier): a burst of loads stalls the in-order wave at a full VMEM queue
         RS = BST + 1 if VSP else BST
         assert KCH % RS == 0
-        init = [zero] * (4 * MTEW) + [v for b in bpre for v in b] + ([v for v in bpre[0]] if VSP else [])
+        init = (
+            [zero] * (4 * MTEW)
+            + [v for b in bpre for v in b]
+            + ([v for v in bpre[0]] if VSP else [])
+        )
         # (the straight-line / unrolled paths above run the passes: the loop is then empty, 0 .. 0)
-        for p_, stt in range(i32(0) if (UNRP or MODE == 3) else plo, i32(0) if (UNRP or MODE == 3) else phi, i32(1), init=init):
+        for p_, stt in range(
+            i32(0) if (UNRP or MODE == 3) else plo,
+            i32(0) if (UNRP or MODE == 3) else phi,
+            i32(1),
+            init=init,
+        ):
             p = i32(p_)
             acc = [zero] * (4 * MTEW)
-            ring = [list(stt[4 * MTEW + s * NBV : 4 * MTEW + (s + 1) * NBV]) for s in range(RS)]
+            ring = [
+                list(stt[4 * MTEW + s * NBV : 4 * MTEW + (s + 1) * NBV])
+                for s in range(RS)
+            ]
             for c in range_constexpr(KCH):
                 if const_expr(PINB):
                     rocdl.sched_barrier(0)
@@ -466,7 +615,10 @@ def build_bigm_unit(
                     rocdl.sched_group_barrier(0x008, 64, 0)
                     rocdl.sched_barrier(0)
             act_store(acc, p)
-            res = yield [zero] * (4 * MTEW) + [v for s in range(RS) for v in ring[s]]
+            # (the yield's value binding is FlyDSL's loop-carried form)
+            res = yield [zero] * (4 * MTEW) + [  # noqa: F841
+                v for s in range(RS) for v in ring[s]
+            ]
         wait_vm(0)
         wait_lgkm0()  # the intermediate's LDS writes land before other waves read them
         gpu.barrier()
@@ -487,7 +639,9 @@ def build_bigm_unit(
             b = []
             for hw in range_constexpr(G2W):
                 b += issue_b2h(gi * i32(G2W) + i32(hw), kk)
-            if const_expr(SCB or SCB2):  # the loads stay where the ring issues them (no sinking)
+            if const_expr(
+                SCB or SCB2
+            ):  # the loads stay where the ring issues them (no sinking)
                 rocdl.sched_barrier(SCM)
             return b
 
@@ -495,7 +649,18 @@ def build_bigm_unit(
             n0 = (wc + i32(NW) * gi) * i32(64)
             kg = kg0 + kk  # global k-step
             b = [
-                fx.Vector(bld(rw2, lane * i32(16), i32(t * 1024) if const_expr(dbg & 4) else (n0 + i32(t * 16)) * i32(I // 2) + kg * i32(1024), V4I))
+                fx.Vector(
+                    bld(
+                        rw2,
+                        lane * i32(16),
+                        (
+                            i32(t * 1024)
+                            if const_expr(dbg & 4)
+                            else (n0 + i32(t * 16)) * i32(I // 2) + kg * i32(1024)
+                        ),
+                        V4I,
+                    )
+                )
                 for t in range(4)
             ]
             for pp in range_constexpr(2):
@@ -503,7 +668,11 @@ def build_bigm_unit(
                 # k-steps 2j, 2j + 1 read the same scale word: kept as separate loads (an opaque
                 # offset), else CSE merges them and the static counts force a vmcnt(0) drain
                 vo = _opaque(lane * i32(4)) if const_expr(G2OPQ) else lane * i32(4)
-                b.append(fx.Int32(bld(rws2, vo, (rb * i32(CH2) + kg // i32(2)) * i32(256), T.i32)))
+                b.append(
+                    fx.Int32(
+                        bld(rws2, vo, (rb * i32(CH2) + kg // i32(2)) * i32(256), T.i32)
+                    )
+                )
             return b
 
         row_meta = []
@@ -519,10 +688,11 @@ def build_bigm_unit(
                 )
             )
 
-
         def epi2(acc, gi, valid, mset):
             # route rows of row tiles mset of group gi (valid False: stores dropped, counts kept)
-            sbuf = L + i32(LA) + (gi & i32(1)) * i32(STGB)  # STG: the group's staging buffer
+            sbuf = (
+                L + i32(LA) + (gi & i32(1)) * i32(STGB)
+            )  # STG: the group's staging buffer
             for hw in range_constexpr(G2W):
                 n0 = (wc + i32(NW) * (gi * i32(G2W) + i32(hw))) * i32(64)
                 aoff = hw * 4 * MTEW
@@ -533,7 +703,12 @@ def build_bigm_unit(
                     ok = ok & valid
                     d, e8s = [], []
                     for half in range_constexpr(2):
-                        f = [fx.Float32(fx.Vector(acc[aoff + m * 4 + 2 * half + h])[i]) * wt for h in range(2) for i in range(4)]
+                        f = [
+                            fx.Float32(fx.Vector(acc[aoff + m * 4 + 2 * half + h])[i])
+                            * wt
+                            for h in range(2)
+                            for i in range(4)
+                        ]
                         am = amax(f)
                         am = am.maximumf(am.shuffle_xor(i32(16), i32(64)))
                         am = am.maximumf(am.shuffle_xor(i32(32), i32(64)))
@@ -548,13 +723,35 @@ def build_bigm_unit(
                     sc = fx.Int16(e8s[0] | (e8s[1] << i32(8)))
                     if const_expr(STG):
                         R = rb + i32(m * 16) + lane % i32(16)
-                        lds_st(sbuf, R * i32(NW * 64) + wc * i32(64) + q4 * i32(16), ov, align=16)
+                        lds_st(
+                            sbuf,
+                            R * i32(NW * 64) + wc * i32(64) + q4 * i32(16),
+                            ov,
+                            align=16,
+                        )
                         if q4 == i32(0):
-                            lds_st(sbuf + i32(RG * NW * 64), R * i32(2 * NW) + wc * i32(2), sc, align=2)
+                            lds_st(
+                                sbuf + i32(RG * NW * 64),
+                                R * i32(2 * NW) + wc * i32(2),
+                                sc,
+                                align=2,
+                            )
                     else:
-                        bst(ov, r_routes, ok.select(rix * i32(H) + n0 + q4 * i32(16), oob), 0, RSAUX)
+                        bst(
+                            ov,
+                            r_routes,
+                            ok.select(rix * i32(H) + n0 + q4 * i32(16), oob),
+                            0,
+                            RSAUX,
+                        )
                         soff = oob // i32(2) + rix * i32(H // 32) + n0 // i32(32)
-                        bst(sc, r_routes, (ok & (q4 == i32(0))).select(soff, oob), 0, RSAUX)
+                        bst(
+                            sc,
+                            r_routes,
+                            (ok & (q4 == i32(0))).select(soff, oob),
+                            0,
+                            RSAUX,
+                        )
                 if const_expr(STG):
                     # every wave's 64 columns of the group in LDS: whole 256-column row segments out
                     wait_lgkm0()
@@ -566,14 +763,29 @@ def build_bigm_unit(
                         c16 = x - row * i32(NW * 4)
                         v = lds_ld(sbuf, row * i32(NW * 64) + c16 * i32(16), V4I, 16)
                         rixr = lds_ld_i32(L, i32(LRIX) + row * i32(4))
-                        bst(v, r_routes, (row < rows).select(rixr * i32(H) + gcol0 + c16 * i32(16), oob), 0, RSAUX)
+                        bst(
+                            v,
+                            r_routes,
+                            (row < rows).select(
+                                rixr * i32(H) + gcol0 + c16 * i32(16), oob
+                            ),
+                            0,
+                            RSAUX,
+                        )
                     for j in range_constexpr(RG * NW * 2 // (NTHU * 4)):
                         x = tid + i32(j * NTHU)
                         row = x // i32(NW // 2)
                         dw = x - row * i32(NW // 2)
-                        v = lds_ld_i32(sbuf, i32(RG * NW * 64) + row * i32(2 * NW) + dw * i32(4))
+                        v = lds_ld_i32(
+                            sbuf, i32(RG * NW * 64) + row * i32(2 * NW) + dw * i32(4)
+                        )
                         rixr = lds_ld_i32(L, i32(LRIX) + row * i32(4))
-                        so = oob // i32(2) + rixr * i32(H // 32) + gcol0 // i32(32) + dw * i32(4)
+                        so = (
+                            oob // i32(2)
+                            + rixr * i32(H // 32)
+                            + gcol0 // i32(32)
+                            + dw * i32(4)
+                        )
                         bst(v, r_routes, (row < rows).select(so, oob), 0, RSAUX)
                 for m in (() if R8 else mset):
                     ok, wt, rix = row_meta[m]
@@ -582,7 +794,13 @@ def build_bigm_unit(
                     for t in range_constexpr(4):
                         av = fx.Vector(acc[aoff + m * 4 + t])
                         pk.append(
-                            [pack_bf16x2(fx.Float32(av[2 * h]) * wt, fx.Float32(av[2 * h + 1]) * wt) for h in range(2)]
+                            [
+                                pack_bf16x2(
+                                    fx.Float32(av[2 * h]) * wt,
+                                    fx.Float32(av[2 * h + 1]) * wt,
+                                )
+                                for h in range(2)
+                            ]
                         )
                     for half in range_constexpr(2):
                         ta, tb = 2 * half, 2 * half + 1
@@ -593,8 +811,18 @@ def build_bigm_unit(
                             hi.append(y)
                         ov = fx.Vector.from_elements(lo + hi, fx.Int32)
                         col = n0 + i32(half * 32) + ccol
-                        rixd = (rix & i32(15)) if const_expr(dbg & 64) else rix  # [dbg] 64: stores hit 16 rows (L2)
-                        bst(ov, r_routes, (ok & (i32(dbg & 32) == i32(0))).select((rixd * i32(H) + col) * i32(2), oob), 0, RSAUX)
+                        rixd = (
+                            (rix & i32(15)) if const_expr(dbg & 64) else rix
+                        )  # [dbg] 64: stores hit 16 rows (L2)
+                        bst(
+                            ov,
+                            r_routes,
+                            (ok & (i32(dbg & 32) == i32(0))).select(
+                                (rixd * i32(H) + col) * i32(2), oob
+                            ),
+                            0,
+                            RSAUX,
+                        )
 
         # prologue = the steady issue order of the BS2 steps before (0, 0): their B2 loads,
         # then (the previous group's last step) NST2 route stores, here dropped (OOB)
@@ -619,7 +847,9 @@ def build_bigm_unit(
         for gi_, st2 in range(glo, ghi, i32(1), init=init2):
             gi = i32(gi_)
             ring2 = [list(st2[s * NB2 : (s + 1) * NB2]) for s in range(BS2)]
-            accp = list(st2[BS2 * NB2 :]) if EPP else None  # EPP: the previous group's accumulators
+            accp = (
+                list(st2[BS2 * NB2 :]) if EPP else None
+            )  # EPP: the previous group's accumulators
             acc = [zero] * (4 * MTEW * G2W)
             for kk in range_constexpr(KS2):
                 wait_vm(WAIT2[kk])
@@ -628,9 +858,23 @@ def build_bigm_unit(
                 afs, sas = [], []
                 for m in range_constexpr(MTEW):
                     row = rb + i32(m * 16) + lane % i32(16)
-                    afs.append(lds_ld(L, i32(LINT) + row * i32(SIS) + i32(kk * 64) + q4 * i32(16), V4I, 16))
+                    afs.append(
+                        lds_ld(
+                            L,
+                            i32(LINT) + row * i32(SIS) + i32(kk * 64) + q4 * i32(16),
+                            V4I,
+                            16,
+                        )
+                    )
                     sas.append(
-                        fx.Int32(lds_ld(L, i32(LINTS) + row * i32(I // 32) + i32(kk * 4) + q4, T.i8, 1))
+                        fx.Int32(
+                            lds_ld(
+                                L,
+                                i32(LINTS) + row * i32(I // 32) + i32(kk * 4) + q4,
+                                T.i8,
+                                1,
+                            )
+                        )
                         & i32(0xFF)
                     )
                 for hw in range_constexpr(G2W):
@@ -654,7 +898,9 @@ def build_bigm_unit(
                 ring2[kk % BS2] = issue_b2(gn, i32(sn % KS2))
             if const_expr(not EPP):
                 epi2(acc, gi, gi >= glo, tuple(range(MTEW)))
-            res2 = yield [v for s in range(BS2) for v in ring2[s]] + (acc if EPP else [])
+            res2 = yield [v for s in range(BS2) for v in ring2[s]] + (
+                acc if EPP else []
+            )
         if const_expr(EPP):
             epi2(list(res2[BS2 * NB2 :]), ghi - i32(1), ghi > glo, tuple(range(MTEW)))
         wait_vm(0)
@@ -679,13 +925,36 @@ def build_bigm_unit(
                 r_ = x // i32(CB)
                 c_ = x - r_ * i32(CB)
                 if r_ < rows:
-                    bst(lds_ld(L, i32(LINT) + r_ * i32(SIS) + (i32(0) if const_expr(P1) else pp * i32(PCB)) + c_ * i32(16), V4I, 16), rint,
-                        ub + (pp * i32(RG) + r_) * i32(PCB) + c_ * i32(16), 0, AUX_SYS)
+                    bst(
+                        lds_ld(
+                            L,
+                            i32(LINT)
+                            + r_ * i32(SIS)
+                            + (i32(0) if const_expr(P1) else pp * i32(PCB))
+                            + c_ * i32(16),
+                            V4I,
+                            16,
+                        ),
+                        rint,
+                        ub + (pp * i32(RG) + r_) * i32(PCB) + c_ * i32(16),
+                        0,
+                        AUX_SYS,
+                    )
         for it in range_constexpr((RG + NTHU - 1) // NTHU):
             r_ = tid + i32(it * NTHU)
             if r_ < rows:
-                bst(lds_ld_i32(L, i32(LINTS) + r_ * i32(ISS) + (i32(0) if const_expr(P1) else pp * i32(PSB))), rint,
-                    ub + i32(SC0) + (pp * i32(RG) + r_) * i32(PSB), 0, AUX_SYS)
+                bst(
+                    lds_ld_i32(
+                        L,
+                        i32(LINTS)
+                        + r_ * i32(ISS)
+                        + (i32(0) if const_expr(P1) else pp * i32(PSB)),
+                    ),
+                    rint,
+                    ub + i32(SC0) + (pp * i32(RG) + r_) * i32(PSB),
+                    0,
+                    AUX_SYS,
+                )
 
     @flyc.jit
     def store_inter(L, tid, rows, rint, uid):
@@ -707,13 +976,43 @@ def build_bigm_unit(
             r_ = y // i32(CB)
             c_ = y - r_ * i32(CB)
             rs = (r_ < rows).select(r_, i32(0))
-            ldc.append((x, pq, r_, c_, fx.Vector(bld(rint, ub + (pq * i32(RG) + rs) * i32(PCB) + c_ * i32(16), 0, V4I, AUX_SYS))))
+            ldc.append(
+                (
+                    x,
+                    pq,
+                    r_,
+                    c_,
+                    fx.Vector(
+                        bld(
+                            rint,
+                            ub + (pq * i32(RG) + rs) * i32(PCB) + c_ * i32(16),
+                            0,
+                            V4I,
+                            AUX_SYS,
+                        )
+                    ),
+                )
+            )
         for it in range_constexpr(NS):
             x = fx.min(tid + i32(it * NTHU), i32(PASSES * RG - 1))
             pq = x // i32(RG)
             r_ = x - pq * i32(RG)
             rs = (r_ < rows).select(r_, i32(0))
-            lds_.append((pq, r_, fx.Int32(bld(rint, ub + i32(SC0) + (pq * i32(RG) + rs) * i32(PSB), 0, T.i32, AUX_SYS))))
+            lds_.append(
+                (
+                    pq,
+                    r_,
+                    fx.Int32(
+                        bld(
+                            rint,
+                            ub + i32(SC0) + (pq * i32(RG) + rs) * i32(PSB),
+                            0,
+                            T.i32,
+                            AUX_SYS,
+                        )
+                    ),
+                )
+            )
         for it in range_constexpr(NC):
             x, pq, r_, c_, v_ = ldc[it]
             lds_st(L, i32(LINT) + r_ * i32(SIS) + pq * i32(PCB) + c_ * i32(16), v_)
@@ -723,35 +1022,160 @@ def build_bigm_unit(
         wait_lgkm0()
         gpu.barrier()
 
-    if MODE == 3:  # G1 item: one GEMM1 pass (NW * 32 gate + up columns) -> its intermediate columns
+    if (
+        MODE == 3
+    ):  # G1 item: one GEMM1 pass (NW * 32 gate + up columns) -> its intermediate columns
+
         @flyc.jit
-        def unit_body(L, tid, e, r0, rows, rr, rwt, rx, rxs, w1, w2, rws1, rws2, r_routes, oob, ih=None, rint=None, sub=None, uid=None):
+        def unit_body(
+            L,
+            tid,
+            e,
+            r0,
+            rows,
+            rr,
+            rwt,
+            rx,
+            rxs,
+            w1,
+            w2,
+            rws1,
+            rws2,
+            r_routes,
+            oob,
+            ih=None,
+            rint=None,
+            sub=None,
+            uid=None,
+        ):
             part_fill(L, tid, r0, rows, rr, rwt)
             part_g1(L, tid, e, rows, rx, rxs, w1, rws1, i32(0), sub, sub + i32(1))
             store_inter_pass(L, tid, rows, rint, uid, sub)
-    elif MODE == 4:  # G2 item: GEMM2 column groups [sub * G2N, ..) of the unit from its global intermediate
+
+    elif (
+        MODE == 4
+    ):  # G2 item: GEMM2 column groups [sub * G2N, ..) of the unit from its global intermediate
+
         @flyc.jit
-        def unit_body(L, tid, e, r0, rows, rr, rwt, rx, rxs, w1, w2, rws1, rws2, r_routes, oob, ih=None, rint=None, sub=None, uid=None):
+        def unit_body(
+            L,
+            tid,
+            e,
+            r0,
+            rows,
+            rr,
+            rwt,
+            rx,
+            rxs,
+            w1,
+            w2,
+            rws1,
+            rws2,
+            r_routes,
+            oob,
+            ih=None,
+            rint=None,
+            sub=None,
+            uid=None,
+        ):
             part_fill(L, tid, r0, rows, rr, rwt)
             load_inter(L, tid, rows, rint, uid)
-            part_g2(L, tid, e, rows, w2, rws2, r_routes, oob, i32(0), sub * i32(G2N), sub * i32(G2N) + i32(G2N))
+            part_g2(
+                L,
+                tid,
+                e,
+                rows,
+                w2,
+                rws2,
+                r_routes,
+                oob,
+                i32(0),
+                sub * i32(G2N),
+                sub * i32(G2N) + i32(G2N),
+            )
+
     elif MODE == 1:  # G1: GEMM1 + act -> intermediate rows in global
+
         @flyc.jit
-        def unit_body(L, tid, e, r0, rows, rr, rwt, rx, rxs, w1, w2, rws1, rws2, r_routes, oob, ih=None, rint=None, sub=None, uid=None):
+        def unit_body(
+            L,
+            tid,
+            e,
+            r0,
+            rows,
+            rr,
+            rwt,
+            rx,
+            rxs,
+            w1,
+            w2,
+            rws1,
+            rws2,
+            r_routes,
+            oob,
+            ih=None,
+            rint=None,
+            sub=None,
+            uid=None,
+        ):
             ih = i32(0) if ih is None else ih
             part_fill(L, tid, r0, rows, rr, rwt)
             part_g1(L, tid, e, rows, rx, rxs, w1, rws1, ih, i32(0), i32(PASSES))
             store_inter(L, tid, rows, rint, uid)
+
     elif MODE == 2:  # G2: intermediate rows from global -> GEMM2 -> route rows
+
         @flyc.jit
-        def unit_body(L, tid, e, r0, rows, rr, rwt, rx, rxs, w1, w2, rws1, rws2, r_routes, oob, ih=None, rint=None, sub=None, uid=None):
+        def unit_body(
+            L,
+            tid,
+            e,
+            r0,
+            rows,
+            rr,
+            rwt,
+            rx,
+            rxs,
+            w1,
+            w2,
+            rws1,
+            rws2,
+            r_routes,
+            oob,
+            ih=None,
+            rint=None,
+            sub=None,
+            uid=None,
+        ):
             ih = i32(0) if ih is None else ih
             part_fill(L, tid, r0, rows, rr, rwt)
             load_inter(L, tid, rows, rint, uid)
             part_g2(L, tid, e, rows, w2, rws2, r_routes, oob, ih, i32(0), i32(NG2))
+
     else:
+
         @flyc.jit
-        def unit_body(L, tid, e, r0, rows, rr, rwt, rx, rxs, w1, w2, rws1, rws2, r_routes, oob, ih=None, rint=None, sub=None, uid=None):
+        def unit_body(
+            L,
+            tid,
+            e,
+            r0,
+            rows,
+            rr,
+            rwt,
+            rx,
+            rxs,
+            w1,
+            w2,
+            rws1,
+            rws2,
+            r_routes,
+            oob,
+            ih=None,
+            rint=None,
+            sub=None,
+            uid=None,
+        ):
             ih = i32(0) if ih is None else ih
             part_fill(L, tid, r0, rows, rr, rwt)
             part_g1(L, tid, e, rows, rx, rxs, w1, rws1, ih, i32(0), i32(PASSES))

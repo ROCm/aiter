@@ -366,7 +366,9 @@ def case_varying_m(shape, wt, ctx, S, mode):
 
 
 def case_layers(shape, wt, ctx, S, mode):
-    layers = [new_layer(shape, wt, ctx, mode, max_local(mode, shape, wt)) for _ in range(3)]
+    layers = [
+        new_layer(shape, wt, ctx, mode, max_local(mode, shape, wt)) for _ in range(3)
+    ]
     worst = 0.0
     for rnd in range(2):
         for i, layer in enumerate(layers):
@@ -376,7 +378,10 @@ def case_layers(shape, wt, ctx, S, mode):
             )
         del layers[:2]
         gc.collect()
-        layers += [new_layer(shape, wt, ctx, mode, max_local(mode, shape, wt)) for _ in range(2)]
+        layers += [
+            new_layer(shape, wt, ctx, mode, max_local(mode, shape, wt))
+            for _ in range(2)
+        ]
     return worst
 
 
@@ -437,7 +442,12 @@ def case_dynamic(shape, wt, ctx, S, mode, lb):
     # counts and a narrow routing
     kw = {"lb_min": 1, "lb_mt": 3, "lb_mt_small": 3, "lb_npp": 2, "lb_q": 3}
     layer = new_layer(
-        shape, wt, ctx, mode, max_local(mode, shape, wt), **(kw if lb else {"lb_min": 0})
+        shape,
+        wt,
+        ctx,
+        mode,
+        max_local(mode, shape, wt),
+        **(kw if lb else {"lb_min": 0}),
     )
     worst = 0.0
     tokens = sorted({ctx.world, 3 * ctx.world, 33 * ctx.world, S.max_tokens})
@@ -479,7 +489,6 @@ def case_tail(shape, wt, ctx, S):
     xn, s_ref = gather
     fp8 = torch.float8_e4m3fn
     q_ref = (xn.to(dtypes.bf16).float() / s_ref[:, None]).clamp(-448, 448).to(fp8)
-    e_ref = float((q_ref.float() * s_ref[:, None] - xn).norm() / xn.norm())
     m = c.x.shape[0]
     own = slice(ctx.rank * m, (ctx.rank + 1) * m)
     # tn_local (the default): only this rank's rows of q / scales / bf16 rows are written
@@ -488,7 +497,9 @@ def case_tail(shape, wt, ctx, S):
         eng.tn_local = local
         rows = own if local else slice(None)
         xn_, s_ref_ = xn[rows], s_ref[rows]
-        e_ref_ = float((q_ref[rows].float() * s_ref_[:, None] - xn_).norm() / xn_.norm())
+        e_ref_ = float(
+            (q_ref[rows].float() * s_ref_[:, None] - xn_).norm() / xn_.norm()
+        )
         for bf16 in (False, True):
             r = res.clone()
             outs = layer(c.x, c.w, c.ids, tail=(r, r, nw), bf16=bf16)
@@ -513,7 +524,9 @@ def case_tail(shape, wt, ctx, S):
                 if not ok
             ]
             if not ctx.all_ok(not bad):
-                raise CaseFailure(f"tail tn_local={local} bf16={bf16}: {bad or 'other rank'}")
+                raise CaseFailure(
+                    f"tail tn_local={local} bf16={bf16}: {bad or 'other rank'}"
+                )
     eng.tn_local = True
     return e_q
 
@@ -733,7 +746,9 @@ def test_mega_moe_tp(model: str, mode: str, tokens: int, route: str, seed: int):
     CUDA-graph latency and roofline numbers per candidate."""
     ctx, shape, wt = S.ctx, MODELS[model], S.weights[model]
     if tokens // ctx.world > max_local(mode, shape, wt):
-        raise CaseSkip(f"{mode}: up to {max_local(mode, shape, wt)} local tokens (no big-M path)")
+        raise CaseSkip(
+            f"{mode}: up to {max_local(mode, shape, wt)} local tokens (no big-M path)"
+        )
     c = make_case(shape, wt, ctx, mode, tokens, route, SEED + 1000 * seed + tokens)
     # name -> (comm_dtype, ar_gather, rel_l2 gate)
     candidates = {
@@ -885,7 +900,9 @@ def _run(fn, *args) -> dict:
             traceback.print_exc()
     ok = S.ctx.all_ok(ok)
     row = row if row is not None else {"case": fn.__name__, "args": args}
-    row["status"] = f"SKIP {skip}" if ok and skip else "PASS" if ok else f"FAIL {msg}".strip()
+    row["status"] = (
+        f"SKIP {skip}" if ok and skip else "PASS" if ok else f"FAIL {msg}".strip()
+    )
     return row
 
 
@@ -986,7 +1003,12 @@ def main() -> int:
 
     for name, r in rows.items():
         summarize(f"MegaMoE TP tp{ctx.world} {name}", r)
-    failed = [r for rs in rows.values() for r in rs if not r["status"].startswith(("PASS", "SKIP"))]
+    failed = [
+        r
+        for rs in rows.values()
+        for r in rs
+        if not r["status"].startswith(("PASS", "SKIP"))
+    ]
     total = sum(len(rs) for rs in rows.values())
     if ctx.rank == 0:
         aiter.logger.info("MegaMoE TP: %d/%d passed", total - len(failed), total)

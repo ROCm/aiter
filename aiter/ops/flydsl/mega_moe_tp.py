@@ -143,9 +143,14 @@ class MegaMoeTP:
         # local tokens from which forward runs the big-M kernel (0: never)
         self.bigm_m = -(-bmin // cfg.world_size) if bmin and big_ok else 0
         self._bigm = None
-        self._bigm_args = dict(
-            w1=w1, w1_scale=w1_scale, w2=w2, w2_scale=w2_scale, group=group, device=device
-        )
+        self._bigm_args = {
+            "w1": w1,
+            "w1_scale": w1_scale,
+            "w2": w2,
+            "w2_scale": w2_scale,
+            "group": group,
+            "device": device,
+        }
         small_max = cfg.max_local_tokens
         if self.bigm_m and cfg.max_local_tokens >= self.bigm_m:
             small_max = self.bigm_m - 1
@@ -203,7 +208,9 @@ class MegaMoeTP:
         False: every rank's."""
         if self._big(x_local.shape[0]):
             local = bool(self.engine.tn_local)
-            res = self.bigm().moe(x_local, topk_weights, topk_ids, out=out, tail=tail, local=local)
+            res = self.bigm().moe(
+                x_local, topk_weights, topk_ids, out=out, tail=tail, local=local
+            )
             if tail is not None and bf16:
                 res = (*res, self._bigm_rows(tail[1], tail[2], local))
             return res
@@ -290,7 +297,8 @@ class MegaMoeTP:
         and every big-M kernel a batch up to max_local_tokens can launch is compiled (or loaded
         from the disk cache) and (warmup) run once: with tail / tail_bf16 its fused-tail
         variant (what a fused caller launches), else the plain one. No big-M batch compiles
-        while serving (a compile stalls every rank) and none inside CUDA graph capture."""
+        while serving (a compile stalls every rank) and none inside CUDA graph capture.
+        """
         ts = [local_tokens] if isinstance(local_tokens, int) else list(local_tokens)
         small = [t for t in ts if not self._big(t)]
         if small:
@@ -301,16 +309,28 @@ class MegaMoeTP:
         hi = max([self.cfg.max_local_tokens, *ts])
         rows = b.io_rows_per_kernel(self.bigm_m, hi)
         if warmup:
-            b.precompile(rows, (2 if self.engine.tn_local else 1) if tail or tail_bf16 else 0)
+            b.precompile(
+                rows, (2 if self.engine.tn_local else 1) if tail or tail_bf16 else 0
+            )
         for m in rows if warmup else ():
             cfg, dev = self.cfg, b.device
             x = torch.zeros((m, cfg.model_dim), dtype=torch.bfloat16, device=dev)
             # balanced routing: token i's slot j to expert (i (topk - 1) + j) % (experts - 1),
             # the shared expert (experts - 1) last
-            r = torch.arange(m, device=dev)[:, None] * (cfg.topk - 1) + torch.arange(cfg.topk - 1, device=dev)
-            ids = torch.cat([r % (cfg.experts - 1), torch.full((m, 1), cfg.experts - 1, device=dev)], 1)
+            r = torch.arange(m, device=dev)[:, None] * (cfg.topk - 1) + torch.arange(
+                cfg.topk - 1, device=dev
+            )
+            ids = torch.cat(
+                [
+                    r % (cfg.experts - 1),
+                    torch.full((m, 1), cfg.experts - 1, device=dev),
+                ],
+                1,
+            )
             ids = ids.to(torch.int32).contiguous()
-            tw = torch.full((m, cfg.topk), 1.0 / cfg.topk, dtype=torch.float32, device=dev)
+            tw = torch.full(
+                (m, cfg.topk), 1.0 / cfg.topk, dtype=torch.float32, device=dev
+            )
             if tail or tail_bf16:
                 res = torch.zeros_like(x)
                 self.forward(x, tw, ids, tail=(res, res, x[0]), bf16=tail_bf16)
@@ -346,7 +366,9 @@ class MegaMoeTP:
         """Raise RuntimeError (and clear) if a wait gave up since the last check."""
         if self._bigm is not None and self._bigm.poll_errors():
             self._bigm.clear_errors()
-            raise RuntimeError("MegaMoeTP: a big-M wait on a peer gave up (results invalid)")
+            raise RuntimeError(
+                "MegaMoeTP: a big-M wait on a peer gave up (results invalid)"
+            )
         self.engine.check_errors()
 
     def clear_errors(self) -> None:

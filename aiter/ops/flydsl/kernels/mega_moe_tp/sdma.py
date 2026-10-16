@@ -28,7 +28,7 @@ def _mori():
     if path and path not in sys.path:
         sys.path.insert(0, path)
     os.environ.setdefault("MORI_ENABLE_SDMA", "1")
-    from mori.cco import CCODevCommRequirements, Communicator, GDA_CONNECTION_NONE
+    from mori.cco import GDA_CONNECTION_NONE, CCODevCommRequirements, Communicator
 
     return Communicator, CCODevCommRequirements, GDA_CONNECTION_NONE, sdma_bitcode
 
@@ -65,18 +65,22 @@ class SdmaComm:
     def reserve(self, name: str, nbytes: int) -> None:
         if self._committed or name in self._slices:
             raise RuntimeError(f"SdmaComm: cannot reserve {name!r}")
-        self._slices[name] = self.arena.reserve(name, (max(int(nbytes), 1),), torch.uint8)
+        self._slices[name] = self.arena.reserve(
+            name, (max(int(nbytes), 1),), torch.uint8
+        )
 
     def offset(self, name: str) -> int:
         return self._slices[name].offset
 
-    def commit(self) -> "SdmaComm":
+    def commit(self) -> SdmaComm:
         uid = [self._comm_cls.get_unique_id() if self.rank == 0 else None]
         src0 = dist.get_global_rank(self.group, 0) if self.group else 0
         dist.broadcast_object_list(uid, src=src0, group=self.group)
         err = ""
         try:
-            self.comm = self._comm_cls.init(self.world, self.rank, uid[0], per_rank_vmm=1 << 30)
+            self.comm = self._comm_cls.init(
+                self.world, self.rank, uid[0], per_rank_vmm=1 << 30
+            )
             reqs = self._reqs_cls()
             reqs.gda_connection_type = self._gda_none
             reqs.gda_signal_count = 0
@@ -93,16 +97,26 @@ class SdmaComm:
         self.arena.commit()  # (raises on every rank if any rank fails)
         self.storage = self.arena.storage
         self.base = int(self.storage.data_ptr())
-        self.bases = torch.tensor(self.arena._base_ptrs, dtype=torch.int64, device=self.device)
-        self.consumed = torch.zeros(self.world * self.nq, dtype=torch.int32, device=self.device)
+        self.bases = torch.tensor(
+            self.arena._base_ptrs, dtype=torch.int64, device=self.device
+        )
+        self.consumed = torch.zeros(
+            self.world * self.nq, dtype=torch.int32, device=self.device
+        )
         self._committed = True
         torch.cuda.synchronize(self.device)
         dist.barrier(group=self.group)
         return self
 
-    def view(self, name: str, shape, dtype: torch.dtype, offset: int = 0) -> torch.Tensor:
+    def view(
+        self, name: str, shape, dtype: torch.dtype, offset: int = 0
+    ) -> torch.Tensor:
         """A torch view of region ``name`` (plus a byte offset into it)."""
         sl = self._slices[name]
         n = torch.Size(shape).numel() * torch.empty((), dtype=dtype).element_size()
         assert offset + n <= sl.nbytes, (name, offset, n, sl.nbytes)
-        return self.storage[sl.offset + offset : sl.offset + offset + n].view(dtype).view(shape)
+        return (
+            self.storage[sl.offset + offset : sl.offset + offset + n]
+            .view(dtype)
+            .view(shape)
+        )

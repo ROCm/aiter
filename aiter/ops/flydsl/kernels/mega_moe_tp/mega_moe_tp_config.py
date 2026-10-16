@@ -72,6 +72,7 @@ NCHLB_MAX = 2048
 def _lds_nap():
     return 0
 
+
 # LB intermediate row pad: 16 keeps every row 16B-aligned for the 128-bit LDS ops (8: unaligned stalls)
 _SIPAD = 16
 G1C_STRIDE = 16
@@ -345,7 +346,9 @@ def kernel_config(
     MTSKIP = lb and MT >= 4
     TL = False  # [dbg] phase timestamps
     CTRL_INTS_ = CTRL_INTS
-    ASC_CACHED = False  # A-scale loads of the A loader through the caches (like the A rows)
+    ASC_CACHED = (
+        False  # A-scale loads of the A loader through the caches (like the A rows)
+    )
     SOL = []  # [dbg] speed-of-light probes (wrong results)
     # tail rows stay local (no peer writes / waits): the caller gathers q itself
     TNL = TN and tn_local

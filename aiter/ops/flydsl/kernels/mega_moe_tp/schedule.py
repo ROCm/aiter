@@ -14,13 +14,9 @@ from flydsl.expr.typing import T
 
 from ..kernels_common import ceildiv
 from .common import (
-    LDS_NAP,
-    now,
-    tl_add,
-    tl_slot,
-    tl_mark,
     ACQ,
     AUX_SYS,
+    LDS_NAP,
     V4I,
     _ctpop,
     bld,
@@ -36,16 +32,19 @@ from .common import (
     lds_ld_i32,
     lds_st,
     lds_st_rel,
+    now,
     rsrc,
     spin0,
     spin_lds_ge,
+    tl_add,
+    tl_mark,
+    tl_slot,
     uni,
     wait_lgkm0,
     wait_vm,
     wave_rank,
 )
 from .mega_moe_tp_config import (
-    CTRL_INTS,
     C_CDONE,
     C_CLAIM,
     C_DYNP,
@@ -71,6 +70,7 @@ from .mega_moe_tp_config import (
     C_USEQ,
     CTRL_COLC,
     CTRL_G1C,
+    CTRL_INTS,
     CTRL_LBR,
     CTRL_LBSEQ,
     CTRL_XF,

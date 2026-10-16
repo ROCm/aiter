@@ -15,12 +15,12 @@ from flydsl.expr.typing import T
 from ..kernels_common import ceildiv
 from ..mxfp4_gemm_common import _activation_mul_batch, _e8m0_from_amax
 from .common import (
-    LDS_NAP,
     ACQ,
     ACQ_REL,
     AUX_SC1,
     AUX_SYS,
     DEADLINE,
+    LDS_NAP,
     MAX_TP,
     REL,
     V2I,

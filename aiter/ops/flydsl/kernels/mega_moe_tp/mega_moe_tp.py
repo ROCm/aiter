@@ -251,10 +251,24 @@ class MegaMoeTPLDSError(ValueError):
 # per-token tuned launch configs (op_tests/op_benchmarks/flydsl/tune_mega_moe_tp.py);
 # AITER_MEGAMOE_TP_TUNED: csv path, "0" disables; AITER_MEGAMOE_TP_FORCE="mt=4,npp=2":
 # fields forced for every batch (tuning)
-_TUNED_KEY = ("gfx", "model_dim", "inter_dim", "experts", "topk", "tp", "comm_mode", "act")
+_TUNED_KEY = (
+    "gfx",
+    "model_dim",
+    "inter_dim",
+    "experts",
+    "topk",
+    "tp",
+    "comm_mode",
+    "act",
+)
 _TUNED_FIELDS = ("mt", "npp", "q", "pf", "lp", "ll", "llr")
 _TUNED_DEFAULT = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "configs",
+    os.path.dirname(os.path.abspath(__file__)),
+    "..",
+    "..",
+    "..",
+    "..",
+    "configs",
     "mega_moe_tp_tuned.csv",
 )
 
@@ -345,15 +359,9 @@ class MegaMoeTPEngine:
         lb_min = int(_lb_param(lb.get("min"), 256))
         lb_min = lb_min if 0 < lb_min <= DYN_MAX else DYN_MAX + 1
         self.lb_min = 0 if self.a8 else lb_min
-        self.lb_mt, self.lb_mt_table = _mt_table(
-            _lb_param(lb.get("mt"), 5)
-        )
-        self.lb_mt_small = int(
-            _lb_param(lb.get("mt_small"), 3)
-        )
-        self.lb_small_max = int(
-            _lb_param(lb.get("small_max"), 512)
-        )
+        self.lb_mt, self.lb_mt_table = _mt_table(_lb_param(lb.get("mt"), 5))
+        self.lb_mt_small = int(_lb_param(lb.get("mt_small"), 3))
+        self.lb_small_max = int(_lb_param(lb.get("small_max"), 512))
         self.lb_npp = int(_lb_param(lb.get("npp"), 2))
         lb_q = int(_lb_param(lb.get("q"), 3))
         nck = mega_moe_tp_consts(model_dim, inter_dim, 1, 1)["NCK"]
@@ -553,9 +561,19 @@ class MegaMoeTPEngine:
         if path != "0":
             from aiter.jit.utils.chip_info import get_gfx
 
-            key = (get_gfx(), self.H, self.I, self.E, self.K, self.tp, self.mode,
-                   "fp8" if self.a8 else "fp4")
-            rows = _tuned_table(os.path.abspath(path)).get(tuple(str(k) for k in key), {})
+            key = (
+                get_gfx(),
+                self.H,
+                self.I,
+                self.E,
+                self.K,
+                self.tp,
+                self.mode,
+                "fp8" if self.a8 else "fp4",
+            )
+            rows = _tuned_table(os.path.abspath(path)).get(
+                tuple(str(k) for k in key), {}
+            )
             ts = sorted(t for b, t in rows if b == int(lb))
             if ts:
                 t = max((x for x in ts if x <= tot), default=ts[0])
@@ -568,11 +586,26 @@ class MegaMoeTPEngine:
 
         out = []
         for m, c in self._cfgs.items():
-            key = (get_gfx(), self.H, self.I, self.E, self.K, self.tp, self.mode,
-                   "fp8" if self.a8 else "fp4")
+            key = (
+                get_gfx(),
+                self.H,
+                self.I,
+                self.E,
+                self.K,
+                self.tp,
+                self.mode,
+                "fp8" if self.a8 else "fp4",
+            )
             row = dict(zip(_TUNED_KEY, key), lb=int(c.lb), tot=m * self.tp)
-            row.update(mt=c.mt, npp=c.npp, q=c.q or (self.lb_q if c.lb else 0), pf=int(c.pf),
-                       lp=c.lp, ll=int(c.ll), llr=int(c.llr))
+            row.update(
+                mt=c.mt,
+                npp=c.npp,
+                q=c.q or (self.lb_q if c.lb else 0),
+                pf=int(c.pf),
+                lp=c.lp,
+                ll=int(c.ll),
+                llr=int(c.llr),
+            )
             out.append(row)
         return out
 
@@ -597,7 +630,8 @@ class MegaMoeTPEngine:
                 q = tu.get("q", 0)
                 cfg = LaunchCfg(
                     self._fit_mt(
-                        self._lb_mt_ok(tu.get("mt", self.lb_mt_small if small else mt)), lb=True
+                        self._lb_mt_ok(tu.get("mt", self.lb_mt_small if small else mt)),
+                        lb=True,
                     ),
                     npp=self._fit_npp(tu.get("npp", 2 if small else self.lb_npp)),
                     ag8=self.ar and bool(self.ag_auto) and tot >= self.ag_auto,
@@ -608,7 +642,9 @@ class MegaMoeTPEngine:
                 )
             elif tot <= self.dyn_max:
                 cfg = LaunchCfg(
-                    self._fit_mt(tu.get("mt", 1 if tot <= 32 else 2 if tot <= 64 else 3)),
+                    self._fit_mt(
+                        tu.get("mt", 1 if tot <= 32 else 2 if tot <= 64 else 3)
+                    ),
                     # LL packets carry FP8 rows only (the tuned rows are fp8-comm tunings)
                     ll=fp8 and bool(tu.get("ll", tot <= 256)),
                     llr=fp8 and bool(tu.get("llr", tot <= 128)),

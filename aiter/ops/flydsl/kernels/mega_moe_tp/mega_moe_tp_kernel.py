@@ -16,8 +16,6 @@ from flydsl.expr import math as fmath
 
 from ..kernels_common import ceildiv
 from .common import (
-    tl_mark,
-    tl_slot,
     AUX_SYS,
     MAX_TP,
     V4I,
@@ -35,6 +33,8 @@ from .common import (
     lds_st,
     pack_bf16x8,
     rsrc,
+    tl_mark,
+    tl_slot,
     uni,
     wait_vm,
     wave_red,
@@ -42,9 +42,9 @@ from .common import (
 from .communication import build_communication
 from .gemm import build_gemm
 from .mega_moe_tp_config import (
-    CTRL_INTS,
     C_EPOCH,
     C_TNL,
+    CTRL_INTS,
     CTRL_TNC,
     ERR_YAG,
     FLAG_TN,
@@ -274,7 +274,11 @@ def compile_mega_moe_tp(
             for p in range_constexpr(1 if TNL else TPC):
                 bst(
                     scale.bitcast(fx.Int32),
-                    rsrc(a["mine"] + fx.Int64(a["off_sall"])) if TNL else peer_rs(a, p, "off_sall"),
+                    (
+                        rsrc(a["mine"] + fx.Int64(a["off_sall"]))
+                        if TNL
+                        else peer_rs(a, p, "off_sall")
+                    ),
                     grow * i32(4),
                     0,
                     0 if TNL else AUX_SYS,
