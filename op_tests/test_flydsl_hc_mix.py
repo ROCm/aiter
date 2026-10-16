@@ -100,12 +100,31 @@ def test_hc_mix(m, k, r):
 test_hc_mix.__test__ = False
 
 
-@pytest.mark.parametrize("m", [1, 2, 4, 7, 15, 16])
+@pytest.mark.parametrize("m", [1, 2, 4, 7, 15, 16, 17, 32, 33, 64, 100, 128])
 @pytest.mark.parametrize("k,r", [(2048, 32), (8192, 128), (10240, 320)])
 def test_correctness(m, k, r):
     torch.manual_seed(SEED)
     x, d, u = make_inputs(m, k, r)
     assert check(x, d, u, hc_mix(x, *pack_hc_weights(d, u))) == 0
+
+
+@pytest.mark.parametrize("m", [5, 128])
+def test_unstaged_operand(monkeypatch, m):
+    # Tiles too large for LDS make the up projection read T from global memory.
+    import aiter.ops.flydsl.hc_mix as mod
+
+    monkeypatch.setattr(mod, "_LDS_BYTES", 0)
+    torch.manual_seed(SEED)
+    x, d, u = make_inputs(m)
+    assert check(x, d, u, hc_mix(x, *pack_hc_weights(d, u))) == 0
+
+
+@pytest.mark.parametrize("m", [1, 7, 16])
+@pytest.mark.parametrize("k,r", [(2048, 32), (10240, 320)])
+def test_fused_reduce(m, k, r):
+    torch.manual_seed(SEED)
+    x, d, u = make_inputs(m, k, r)
+    assert check(x, d, u, hc_mix(x, *pack_hc_weights(d, u), fuse_reduce=True)) == 0
 
 
 @pytest.mark.parametrize("scale", [0.0, 0.1, 1.0])
@@ -114,13 +133,16 @@ def test_gate_range(scale):
     assert check(x, d, u, hc_mix(x, *pack_hc_weights(d, u)), atol=0.005) == 0
 
 
-def test_graph_and_stream_isolation():
+@pytest.mark.parametrize("m", [4, 64])
+def test_graph_and_stream_isolation(m):
     # Different concurrent calls must never share split-K scratch or counters.
-    data = [make_inputs(4), make_inputs(4)]
+    data = [make_inputs(m), make_inputs(m)]
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
-    graphs, outputs = [], []
+    graphs, outputs, packed = [], [], []
     for (x, d, u), stream in zip(data, streams):
         dp, up = pack_hc_weights(d, u)
+        # Graphs don't own their inputs: keep the packed weights alive for replay.
+        packed.append((dp, up))
         hc_mix(x, dp, up)
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
@@ -143,7 +165,7 @@ def test_graph_and_stream_isolation():
         assert torch.equal(a, b)
 
 
-@pytest.mark.parametrize("m", [0, 17])
+@pytest.mark.parametrize("m", [0, 129])
 def test_reject_rows(m):
     x, d, u = make_inputs(m)
     with pytest.raises(ValueError):
@@ -160,6 +182,8 @@ def test_reject_invalid_arguments():
         hc_mix(x.half(), *packed)
     with pytest.raises(ValueError):
         hc_mix(x, packed[0], packed[1][:-1])
+    with pytest.raises(ValueError):
+        hc_mix(torch.cat([x] * 17), *packed, fuse_reduce=True)
     with pytest.raises(ValueError):
         pack_hc_weights(d, u, hc=5)
 
@@ -179,7 +203,7 @@ def main():
         type=int,
         nargs="*",
         default=[1, 2, 4, 8, 16],
-        help="""Tokens (1..16).
+        help="""Tokens (1..128).
     e.g.: -m 1 4""",
     )
     parser.add_argument(
