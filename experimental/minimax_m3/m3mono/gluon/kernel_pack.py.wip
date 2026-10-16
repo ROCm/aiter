@@ -1,0 +1,1243 @@
+# SPDX-License-Identifier: MIT
+"""The Gluon MiniMax-M3 decode step kernel (gfx950, TP4, S <= 4 rows, contexts <= 2048).
+
+One persistent launch of 256 CTAs x 512 threads runs every sparse layer (3..59) of a
+decode step; layer i's tasks hand off through tagged pairs (tag = epoch * 64 + i + 1)
+in the parity-(i % 2) halves of the scratch and peer buffers. Per layer, task t of a
+stage on its CTA, every CTA walking the stages in order:
+
+    qkv    (160 / 144, CTAs 0 ..): 16 rows of q | k | v | index q | index k; the
+           layer's input (ar + res: vLLM's tensors at layer 0, the previous layer's
+           mailboxes after) -> gemma RMSNorm -> per-token FP8 -> FP8 GEMV; the weights
+           are issued before the input wait. CTA k < S also publishes token k's h.
+    ik     (CTA 160, selecting layers): index k -> norm / rope -> the bf16 index cache
+    split  (8 S, top CTAs): one 256-key partition x 16 heads; q's per-head norm and
+           RoPE made here from the GEMV rows (no head hop); K / V issued before q
+           lands; the partition holding the token's own key makes K / V itself,
+           inserts them in the cache and re-reads that key
+    o      (192, CTAs 0 ..): every token's partitions merged -> per-token FP8 ->
+           o_proj (32 rows, weights issued at the layer's start) -> bf16 partials
+           to every rank -> rank-ordered sum -> a, h_mid
+    router (16 S, CTAs 192 ..): gemma RMSNorm(a + h) -> bf16 gate GEMV (weights
+           issued early) -> (routing key, sigmoid) x 8 copies; its xn slice as MXFP8
+    moe    every CTA routes every token itself (top-4 + the fused shared expert);
+           shared up / gate (48, CTAs 192 ..), routed up / gate (192 S, CTAs 0 ..),
+           down (192, CTAs 0 ..): route-weighted MXFP4 x MXFP8 -> bf16 partials to
+           every rank -> rank-ordered sum -> ar (the next layer's input)
+
+Numerics follow ATOM's FlyDSL M3 mono (ported in ``..kernels``) stage by stage; the
+reductions differ in split and order only.
+"""
+
+import triton
+from triton.experimental import gluon
+import triton.experimental.gluon.language as gl
+from triton.experimental.gluon.language.amd import cdna4
+
+from . import layout as LY
+from .prims import (
+    BLOCKS, THREADS, as_ptr, bf_hi, bf_lo, bf_pair, bf16_round, clamp_fp8, code_ceil, drain, hw_exp2, hw_rcp,
+    hw_rsq, note_err, pin, pollv1, put, rcp_pow2, route_key, scale_index, stamp, tids, uniform, uniform64,
+)
+
+HIDDEN = gl.constexpr(LY.HIDDEN)
+HPAIRS = gl.constexpr(LY.HIDDEN // 2)
+HEAD_DIM = gl.constexpr(LY.HEAD_DIM)
+HEADS = gl.constexpr(LY.HEADS)
+QKV_PAIRS = gl.constexpr(LY.QKV_ROWS // 2)
+O_K = gl.constexpr(LY.O_K)
+INTER = gl.constexpr(LY.INTER)
+N_SPLIT = gl.constexpr(LY.N_SPLIT)
+SPLIT_KEYS = gl.constexpr(LY.SPLIT_KEYS)
+MAX_S = gl.constexpr(LY.MAX_S)
+N_ROUTED = gl.constexpr(LY.N_ROUTED)
+TOP_K = gl.constexpr(LY.TOP_K)
+SLOTS = gl.constexpr(LY.SLOTS)
+SCORE_COPIES = gl.constexpr(LY.SCORE_COPIES)
+TAGS = gl.constexpr(LY.TAGS_PER_STEP)
+EP_MARK_PAIRS = gl.constexpr(LY.EP_MARKS // 2)
+LOG2E = gl.constexpr(1.4426950408889634)
+NEG = gl.constexpr(-3.4e38)
+FP8_MAX = gl.constexpr(448.0)
+NPTR = gl.constexpr(20)  # pointer-table entries a layer (runner.LAYER_PTRS)
+
+# error codes (errors[cta]): which wait's watchdog fired
+E_X, E_QKV, E_SPLIT, E_ATTN, E_H, E_A, E_SC, E_XN, E_MID, E_FFN, E_EPOCH = (gl.constexpr(i) for i in range(1, 12))
+
+# ---------------------------------------------------------------- layouts
+# GEMV tiles: 8 waves stacked along M (16 rows each), N = 16 P columns
+MFMA = gl.constexpr(cdna4.AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[8, 1]))
+A_L = gl.constexpr(gl.DotOperandLayout(operand_index=0, parent=MFMA, k_width=16))
+B_L = gl.constexpr(gl.DotOperandLayout(operand_index=1, parent=MFMA, k_width=16))
+# attention: 8 waves side by side along N (keys for QK, dims for PV)
+MFMA2 = gl.constexpr(cdna4.AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[1, 8]))
+A2 = gl.constexpr(gl.DotOperandLayout(operand_index=0, parent=MFMA2, k_width=16))
+B2 = gl.constexpr(gl.DotOperandLayout(operand_index=1, parent=MFMA2, k_width=16))
+X_SH3 = gl.constexpr(gl.SwizzledSharedLayout(vec=16, per_phase=1, max_phase=16, order=[2, 1, 0]))
+FLAT4 = gl.constexpr(gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[3, 2, 1, 0]))
+FLAT1 = gl.constexpr(gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0]))
+FLAT2 = gl.constexpr(gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0]))
+FLAT3 = gl.constexpr(gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[2, 1, 0]))
+# an FP8 weight tile [128 rows, 8 chunks, 16 B] of aiter's (16, 16) shuffle: lane = chunk %
+# 4 * 16 + row % 16 holds 16 B chunks c and c + 4 of a 128-k step -- A_L once reshaped
+W8_L = gl.constexpr(gl.DistributedLinearLayout(
+    reg_bases=[[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 0, 8], [0, 4, 0]],
+    lane_bases=[[1, 0, 0], [2, 0, 0], [4, 0, 0], [8, 0, 0], [0, 1, 0], [0, 2, 0]],
+    warp_bases=[[16, 0, 0], [32, 0, 0], [64, 0, 0]], block_bases=[], shape=[128, 8, 16]))
+# an MXFP4 weight tile [128 rows, 4 chunks, 16 B] (one 128-k step): A_L once reshaped
+W4_L = gl.constexpr(gl.DistributedLinearLayout(
+    reg_bases=[[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 0, 8]],
+    lane_bases=[[1, 0, 0], [2, 0, 0], [4, 0, 0], [8, 0, 0], [0, 1, 0], [0, 2, 0]],
+    warp_bases=[[16, 0, 0], [32, 0, 0], [64, 0, 0]], block_bases=[], shape=[128, 4, 16]))
+# K^T [8 d-chunks, 16 B, 256 keys] of a partition (B2 once reshaped): a lane's 16 d of
+# one key are 16 contiguous bytes of a page-16 K page [d / 16][t][16]
+KT_L = gl.constexpr(gl.DistributedLinearLayout(
+    reg_bases=[[0, 1, 0], [0, 2, 0], [0, 4, 0], [0, 8, 0], [4, 0, 0], [0, 0, 128]],
+    lane_bases=[[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 0, 8], [1, 0, 0], [2, 0, 0]],
+    warp_bases=[[0, 0, 16], [0, 0, 32], [0, 0, 64]], block_bases=[], shape=[8, 16, 256]))
+# V [16 pages, 16 t, 128 d] (B2 once reshaped): a lane's 16 keys of one dim are 16
+# contiguous bytes of a page-16 V page [d][t]
+VT_L = gl.constexpr(gl.DistributedLinearLayout(
+    reg_bases=[[0, 1, 0], [0, 2, 0], [0, 4, 0], [0, 8, 0], [4, 0, 0], [8, 0, 0]],
+    lane_bases=[[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 0, 8], [1, 0, 0], [2, 0, 0]],
+    warp_bases=[[0, 0, 16], [0, 0, 32], [0, 0, 64]], block_bases=[], shape=[16, 16, 128]))
+# a [16 rows, 16 tokens] epilogue tile, and the [8 pairs, 16 tokens] one
+EP_L = gl.constexpr(gl.BlockedLayout([1, 1], [4, 16], [4, 2], [1, 0]))
+PR_L = gl.constexpr(gl.BlockedLayout([1, 1], [8, 8], [1, 8], [0, 1]))
+
+
+# scratch regions (byte offsets in a half)
+R_QKV = gl.constexpr(LY.region("qkv"))
+R_SPO = gl.constexpr(LY.region("spo"))
+R_SPM = gl.constexpr(LY.region("spm"))
+R_SPL = gl.constexpr(LY.region("spl"))
+R_A = gl.constexpr(LY.region("a"))
+R_H = gl.constexpr(LY.region("h"))
+R_HM = gl.constexpr(LY.region("hm"))
+R_SC = gl.constexpr(LY.region("sc"))
+R_XN8 = gl.constexpr(LY.region("xn8"))
+R_XSC = gl.constexpr(LY.region("xsc"))
+R_MID = gl.constexpr(LY.region("mid"))
+R_AR = gl.constexpr(LY.region("ar"))
+ROWS16 = gl.constexpr(LY.ROWS16)
+NQ_REUSE = gl.constexpr(LY.NQ_REUSE)
+N_O = gl.constexpr(LY.N_O)
+N_DN = gl.constexpr(LY.N_DN)
+UG_TASKS = gl.constexpr(LY.UG_TASKS)
+ROUTER_BASE = gl.constexpr(LY.ROUTER_BASE)
+SHARED_BASE = gl.constexpr(LY.SHARED_BASE)
+
+
+# ---------------------------------------------------------------- small helpers
+@gluon.jit
+def opq():
+    """An opaque 0 (a side-effecting s_mov), asserted a multiple of 2^16: added to every
+    index tensor so that LLVM cannot hoist a stage's index math out of the layer loop
+    (it would hold every stage's indices live across all of them: hundreds of spills)."""
+    return gl.multiple_of(gl.inline_asm_elementwise("s_mov_b32 $0, 0", "=s", [], dtype=gl.int32, is_pure=False,
+                                                    pack=1), 65536)
+
+
+@gluon.jit
+def ar(n: gl.constexpr, layout: gl.constexpr):
+    """``gl.arange(0, n, layout)``, loop-variant (``opq``)."""
+    return gl.arange(0, n, layout=layout) + opq()
+
+
+@gluon.jit
+def zacc(shape: gl.constexpr, layout: gl.constexpr):
+    """Zeros for an MFMA accumulator, opaque (``opq``): with an inline-constant 0 as src C,
+    LLVM gives v_mfma_scale a destination partially overlapping its A / scale sources and
+    reuses those registers right after it -- the late result write then clobbers them
+    (seen as memory faults at random addresses)."""
+    return gl.full(shape, 0.0, gl.float32, layout) + opq().to(gl.float32)
+
+
+@gluon.jit
+def lptr(ptab, li, j: gl.constexpr, ty: gl.constexpr):
+    """Layer li's pointer-table entry j as a ``*ty`` (CTA-uniform; every table pointer is
+    a torch allocation's or a 16 B aligned view's: told to the alignment analysis, else
+    every buffer load of it goes out byte by byte)."""
+    return gl.multiple_of(uniform64(gl.load(ptab + li * NPTR + j)).to(gl.pointer_type(ty), bitcast=True), 16)
+
+
+@gluon.jit
+def lscalar(ptab, li, j: gl.constexpr):
+    return uniform(gl.load(ptab + li * NPTR + j).to(gl.int32))
+
+
+@gluon.jit
+def rgn(base, off: gl.constexpr):
+    """A pair region of a scratch half (``base``: *u8; ``off``: an R_* offset)."""
+    return as_ptr(base, off, gl.int64)
+
+
+@gluon.jit
+def i32p(p):
+    return p.to(gl.pointer_type(gl.int32), bitcast=True)
+
+
+@gluon.jit
+def u8p(p):
+    return p.to(gl.pointer_type(gl.uint8), bitcast=True)
+
+
+@gluon.jit
+def w8_rows():
+    return ar(128, layout=gl.SliceLayout(1, gl.SliceLayout(2, W8_L)))
+
+
+@gluon.jit
+def w8_tile(base, row_term):
+    """An FP8 A tile [128, 128] (A_L) of a (16, 16)-shuffled weight: virtual row m's
+    16-row group and step folded into ``row_term[m]`` (bytes, + (m % 16) * 16)."""
+    c = ar(8, layout=gl.SliceLayout(0, gl.SliceLayout(2, W8_L)))[None, :, None]
+    b = ar(16, layout=gl.SliceLayout(0, gl.SliceLayout(1, W8_L)))[None, None, :]
+    v = cdna4.buffer_load(base, row_term[:, None, None] + c * 256 + b)
+    return gl.convert_layout(gl.reshape(v, [128, 128]), A_L)
+
+
+@gluon.jit
+def w4_rows():
+    return ar(128, layout=gl.SliceLayout(1, gl.SliceLayout(2, W4_L)))
+
+
+@gluon.jit
+def w4_tile(base, row_term, mask=None):
+    """An MXFP4 A tile [128, 64 B] (A_L) of aiter's shuffled layout (one 128-k step)."""
+    c = ar(4, layout=gl.SliceLayout(0, gl.SliceLayout(2, W4_L)))[None, :, None]
+    b = ar(16, layout=gl.SliceLayout(0, gl.SliceLayout(1, W4_L)))[None, None, :]
+    off = row_term[:, None, None] + c * 256 + b
+    if mask is None:
+        v = cdna4.buffer_load(base, off)
+    else:
+        v = cdna4.buffer_load(base, off, mask=mask[:, None, None], other=0)
+    return gl.convert_layout(gl.reshape(v, [128, 64]), A_L)
+
+
+@gluon.jit
+def a_scales(ws, srow, col, cols: gl.constexpr):
+    """A's E8M0 codes [128, 4] (one 128-k step) from an aiter shuffle_scale tensor."""
+    b = scale_index(srow, col, cols)
+    dw = cdna4.buffer_load(i32p(ws), b >> 2)
+    return ((dw >> ((b & 3) * 8)) & 0xFF).to(gl.uint8)
+
+
+@gluon.jit
+def rounds(buf):
+    """A flat 4-D LDS buffer [rounds, P, 16, cols] (stored through rank-4 slices) seen
+    with a rank-3 layout, the view ``index(r)`` takes (same bytes)."""
+    return buf._reinterpret(buf.dtype, buf.shape, FLAT3)
+
+
+@gluon.jit
+def unit_scales(shape: gl.constexpr, layout: gl.constexpr):
+    return gl.full(shape, 127, gl.uint8, cdna4.get_mfma_scale_layout(layout, shape))
+
+
+@gluon.jit
+def bd_reduce(acc, T: gl.constexpr, P: gl.constexpr, sm):
+    """A block-diagonal accumulator [128, 4 P] (wave w = t P + p: columns 4 p + token
+    valid, the lanes 16 p .. of the wave) -> (lo, hi) [8 row pairs, 4 tokens] a tile
+    (PR_L layout): rows 2 j, 2 j + 1 of tile t, the K slices summed in order p = 0 ..
+    P - 1. ``sm``: LDS [128, 4 P] f32."""
+    gl.barrier()
+    sm.store(acc)
+    gl.barrier()
+    j = ar(8, layout=gl.SliceLayout(1, PR_L))[:, None]
+    n = ar(MAX_S, layout=gl.SliceLayout(0, PR_L))[None, :]
+    outs_lo = ()
+    outs_hi = ()
+    for t in gl.static_range(T):
+        lo = gl.zeros([8, MAX_S], gl.float32, PR_L)
+        hi = gl.zeros([8, MAX_S], gl.float32, PR_L)
+        for p in gl.static_range(P):
+            blk = sm.slice(p * MAX_S, MAX_S, dim=1)
+            lo = lo + blk.gather((t * P + p) * 16 + 2 * j + n * 0, 0)
+            hi = hi + blk.gather((t * P + p) * 16 + 2 * j + 1 + n * 0, 0)
+        outs_lo = outs_lo + (lo,)
+        outs_hi = outs_hi + (hi,)
+    return outs_lo, outs_hi
+
+
+@gluon.jit
+def poll_pairs(ptr, idx, tag, pred, errors, bid, code: gl.constexpr):
+    """Tagged pairs ``ptr[idx]`` (bf16 pairs) -> (lo, hi) f32; a watchdog error is noted."""
+    v, err = pollv1(ptr, idx, tag, pred)
+    note_err(errors, bid, err, code)
+    return bf_lo(v), bf_hi(v)
+
+
+@gluon.jit
+def layer_in_pairs(li, idx, pred, hid_in, res_in, psc, ptag, errors, bid):
+    """The layer's input at pair index ``idx`` (token * HPAIRS + pair): (ar, res) as
+    (lo, hi) f32 each -- vLLM's tensors at the first layer, the previous layer's ar /
+    hm mailboxes (``psc``: its scratch half, tag ``ptag``) after."""
+    if li == 0:
+        aw = cdna4.buffer_load(i32p(hid_in), idx, mask=pred, other=0)
+        rw = cdna4.buffer_load(i32p(res_in), idx, mask=pred, other=0)
+        a_lo = bf_lo(aw)
+        a_hi = bf_hi(aw)
+        r_lo = bf_lo(rw)
+        r_hi = bf_hi(rw)
+    else:
+        a_lo, a_hi = poll_pairs(rgn(psc, R_AR), idx, ptag, pred, errors, bid, E_X)
+        r_lo, r_hi = poll_pairs(rgn(psc, R_HM), idx, ptag, pred, errors, bid, E_X)
+    return a_lo, a_hi, r_lo, r_hi
+
+
+# ============================================================ qkv GEMV (+ input norm)
+# x tiles [S, steps, 64 pairs] (pair (k, st, q) = elements st * 128 + 2 q, + 1), the 48
+# 128-k steps of a row as a 32-step part and a 16-step part (shapes are powers of two)
+XL3 = gl.constexpr(gl.BlockedLayout([1, 1, 2], [1, 2, 32], [1, 8, 1], [2, 1, 0]))
+
+
+@gluon.jit
+def qkv_in(li, st0: gl.constexpr, NST: gl.constexpr, SP: gl.constexpr, S: gl.constexpr, hid_in, res_in, psc,
+           ptag, errors, bid, g_in):
+    """Steps st0 .. st0 + NST of every token's input row: (x = ar + res lo / hi, gamma
+    pairs, pair index, live mask)."""
+    k3 = ar(SP, layout=gl.SliceLayout(1, gl.SliceLayout(2, XL3)))[:, None, None]
+    st3 = st0 + ar(NST, layout=gl.SliceLayout(0, gl.SliceLayout(2, XL3)))[None, :, None]
+    q3 = ar(64, layout=gl.SliceLayout(0, gl.SliceLayout(1, XL3)))[None, None, :]
+    ok = (k3 < S) & (st3 < 48)
+    pidx = k3 * HPAIRS + st3 * 64 + q3
+    a_lo, a_hi, r_lo, r_hi = layer_in_pairs(li, pidx, ok, hid_in, res_in, psc, ptag, errors, bid)
+    gw = cdna4.buffer_load(g_in, st3 * 64 + q3 + k3 * 0, mask=ok, other=0)
+    return a_lo + r_lo, a_hi + r_hi, gw, pidx, ok
+
+
+@gluon.jit
+def sum3(x):
+    return gl.sum(gl.sum(x, axis=2), axis=1)
+
+
+@gluon.jit
+def max3(x):
+    return gl.max(gl.max(x, axis=2), axis=1)
+
+
+@gluon.jit
+def qkv_quant(x_lo, x_hi, gw, rstd, x_scale, xs, NST: gl.constexpr, SP: gl.constexpr):
+    # xs: LDS [NST / 8 rounds, 8, 16 tokens, 128]
+    """A part's normed rows -> FP8 (x / x_scale, correctly rounded) -> its LDS buffer."""
+    r3 = rstd[:, None, None]
+    n_lo = x_lo * r3 * (bf_lo(gw) + 1.0)
+    n_hi = x_hi * r3 * (bf_hi(gw) + 1.0)
+    xs3 = x_scale[:, None, None]
+    q_lo = gl.div_rn(n_lo, xs3 + n_lo * 0).to(gl.float8e4nv).to(gl.uint8, bitcast=True)
+    q_hi = gl.div_rn(n_hi, xs3 + n_hi * 0).to(gl.float8e4nv).to(gl.uint8, bitcast=True)
+    x8 = gl.reshape(gl.join(q_lo, q_hi), [SP, NST // 8, 8, 128])
+    xs.slice(0, SP, dim=2).store(gl.permute(x8, (1, 2, 0, 3)))
+
+
+@gluon.jit
+def qkv_amax(x_lo, x_hi, gw, rstd):
+    r3 = rstd[:, None, None]
+    n_lo = x_lo * r3 * (bf_lo(gw) + 1.0)
+    n_hi = x_hi * r3 * (bf_hi(gw) + 1.0)
+    return max3(gl.maximum(gl.abs(n_lo), gl.abs(n_hi)))
+
+
+@gluon.jit
+def stage_qkv(t, li, ptab, hid_in, res_in, sc, psc, tag, ptag, errors, bid, eps, S: gl.constexpr):
+    """GEMV task t: rows 16 t .. + 16 of the fused projection for every token."""
+    w_qkv = lptr(ptab, li, 0, gl.uint8)
+    s_qkv = lptr(ptab, li, 1, gl.float32)
+    g_in = lptr(ptab, li, 2, gl.int32)
+    # weights first: round r, wave w takes 128-k step 8 r + w of the task's 16 rows
+    m = w8_rows()
+    aq = ()
+    for r in gl.static_range(6):
+        aq = aq + (w8_tile(w_qkv, t * (16 * 6144) + (8 * r + m // 16) * 2048 + (m % 16) * 16),)
+    rr = ar(8, layout=gl.SliceLayout(1, PR_L))[:, None]
+    ws_lo = gl.load(s_qkv + 16 * t + 2 * rr)
+    ws_hi = gl.load(s_qkv + 16 * t + 2 * rr + 1)
+    m = pin(m)
+    SP: gl.constexpr = triton.next_power_of_2(S)
+    xa_lo, xa_hi, ga, pa, oka = qkv_in(li, 0, 32, SP, S, hid_in, res_in, psc, ptag, errors, bid, g_in)
+    xb_lo, xb_hi, gb, pb, okb = qkv_in(li, 32, 16, SP, S, hid_in, res_in, psc, ptag, errors, bid, g_in)
+    ss = sum3(xa_lo * xa_lo + xa_hi * xa_hi) + sum3(xb_lo * xb_lo + xb_hi * xb_hi)
+    rstd = hw_rsq(ss / 6144.0 + eps)
+    amax = gl.maximum(qkv_amax(xa_lo, xa_hi, ga, rstd), qkv_amax(xb_lo, xb_hi, gb, rstd))
+    x_scale = gl.where(amax == 0.0, 1.0, gl.div_rn(amax, gl.full(amax.shape, 448.0, gl.float32, amax.type.layout)))
+    # token k's h = bf16(ar + res), from CTA k
+    if t < S:
+        k3 = ar(SP, layout=gl.SliceLayout(1, gl.SliceLayout(2, XL3)))[:, None, None]
+        put(rgn(sc, R_H), pa, bf_pair(xa_lo, xa_hi), tag, mask=(k3 == t) & oka)
+        put(rgn(sc, R_H), pb, bf_pair(xb_lo, xb_hi), tag, mask=(k3 == t) & okb)
+    # FP8 x -> LDS [steps, 16 tokens, 128] (steps 0..31, 32..47): the B operand, round
+    # r = steps 8 r .. + 8
+    xsa = gl.allocate_shared_memory(gl.uint8, [4, 8, MAX_S, 128], FLAT4)
+    xsb = gl.allocate_shared_memory(gl.uint8, [2, 8, MAX_S, 128], FLAT4)
+    qkv_quant(xa_lo, xa_hi, ga, rstd, x_scale, xsa, 32, SP)
+    qkv_quant(xb_lo, xb_hi, gb, rstd, x_scale, xsb, 16, SP)
+    gl.barrier()
+    acc = zacc([128, 32], MFMA)
+    one_a = unit_scales([128, 4], A_L)
+    one_b = unit_scales([32, 4], B_L)
+    for r in gl.static_range(6):
+        if r < 4:
+            bv = rounds(xsa).index(r).reshape([32, 128]).permute((1, 0)).load(B_L)
+        else:
+            bv = rounds(xsb).index(r - 4).reshape([32, 128]).permute((1, 0)).load(B_L)
+        acc = cdna4.mfma_scaled(aq[r].to(gl.float8e4nv, bitcast=True), one_a, "e4m3",
+                                bv.to(gl.float8e4nv, bitcast=True), one_b, "e4m3", acc)
+    red = gl.allocate_shared_memory(gl.float32, [128, 32], FLAT2)
+    los, his = bd_reduce(acc, 1, 8, red)
+    # the tokens' x scales in the epilogue layout
+    nn = ar(MAX_S, layout=gl.SliceLayout(0, PR_L))[None, :]
+    kq = ar(SP, layout=gl.SliceLayout(1, gl.SliceLayout(2, XL3)))
+    xsc = gl.zeros([8, MAX_S], gl.float32, PR_L)
+    for k in gl.static_range(S):
+        xsc = gl.where(nn == k, gl.sum(gl.where(kq == k, x_scale, 0.0), axis=0), xsc)
+    lo = bf16_round(los[0] * xsc * ws_lo)
+    hi = bf16_round(his[0] * xsc * ws_hi)
+    put(rgn(sc, R_QKV), nn * QKV_PAIRS + 8 * t + rr, bf_pair(lo, hi), tag, mask=nn < S)
+
+
+# ============================================================ head math (norm + rope)
+@gluon.jit
+def head_rows(qkv, tok, pair0, npairs: gl.constexpr, layout: gl.constexpr, tag, errors, bid, code: gl.constexpr):
+    """``npairs`` / 64 heads of token tok's GEMV rows from pair pair0, each with its RoPE
+    partner (dim d +- 32 of the head; d >= 64 none): [heads, 64 pairs] (lo, hi, plo, phi)."""
+    NH: gl.constexpr = npairs // 64
+    h = ar(NH, layout=gl.SliceLayout(1, layout))[:, None]
+    j = ar(64, layout=gl.SliceLayout(0, layout))[None, :]
+    base = tok * QKV_PAIRS + pair0 + h * 64
+    ok = h < NH
+    lo, hi = poll_pairs(qkv, base + j, tag, ok, errors, bid, code)
+    pj = gl.where(j < 16, j + 16, j - 16)
+    plo, phi = poll_pairs(qkv, base + pj, tag, ok & (j < 32), errors, bid, code)
+    return lo, hi, plo, phi
+
+
+@gluon.jit
+def head_norm_rope(lo, hi, plo, phi, gamma, cos_sin, pos, eps):
+    """Gemma RMSNorm over each head's 128 dims + partial NeoX RoPE (dims < 64): ->
+    (lo, hi) f32 of [heads, 64 pairs] (pair j = dims 2 j, 2 j + 1)."""
+    layout: gl.constexpr = lo.type.layout
+    j = ar(64, layout=gl.SliceLayout(0, layout))[None, :]
+    ss = gl.sum(lo * lo + hi * hi, axis=1)
+    rr = hw_rsq(ss / 128.0 + eps)[:, None]
+    gw = gl.load(gamma + j)
+    pjj = gl.where(j < 16, j + 16, j - 16)
+    pgw = gl.load(gamma + pjj, mask=j < 32, other=0)
+    n_lo = lo * rr * (bf_lo(gw) + 1.0)
+    n_hi = hi * rr * (bf_hi(gw) + 1.0)
+    p_lo = plo * rr * (bf_lo(pgw) + 1.0)
+    p_hi = phi * rr * (bf_hi(pgw) + 1.0)
+    # cos / sin of dim d % 32 at this position: cos_sin row [cos 32 | sin 32] bf16
+    i = j % 16
+    cw = gl.load(cos_sin + pos * 32 + i)  # i32 pairs: cos dims 2 i, 2 i + 1
+    sw = gl.load(cos_sin + pos * 32 + 16 + i)
+    first = j < 16
+    ps_lo = p_lo * bf_lo(sw)
+    ps_hi = p_hi * bf_hi(sw)
+    r_lo = gl.fma(n_lo, bf_lo(cw), gl.where(first, -ps_lo, ps_lo))
+    r_hi = gl.fma(n_hi, bf_hi(cw), gl.where(first, -ps_hi, ps_hi))
+    rope = j < 32
+    return gl.where(rope, r_lo, n_lo), gl.where(rope, r_hi, n_hi)
+
+
+HL = gl.constexpr(gl.BlockedLayout([1, 2], [2, 32], [8, 1], [1, 0]))  # [16 heads, 64 pairs]
+H1 = gl.constexpr(gl.BlockedLayout([1, 1], [1, 64], [1, 8], [1, 0]))  # [1 head, 64 pairs]
+
+
+@gluon.jit
+def stage_ik(li, ptab, cos_sin, positions, slots, sc, tag, errors, bid, eps, S: gl.constexpr):
+    """Every token's index k -> norm / rope -> vLLM's bf16 index cache at its slot."""
+    g_ik = lptr(ptab, li, 6, gl.int32)
+    icache = lptr(ptab, li, 18, gl.int32)
+    for k in gl.static_range(S):
+        pos = uniform(gl.load(positions + k).to(gl.int32))
+        slot = uniform(gl.load(slots + k).to(gl.int32))
+        lo, hi, plo, phi = head_rows(rgn(sc, R_QKV), k, (HEADS + 3) * 64, 64, H1, tag, errors, bid, E_QKV)
+        o_lo, o_hi = head_norm_rope(lo, hi, plo, phi, g_ik, cos_sin, pos, eps)
+        j = ar(64, layout=gl.SliceLayout(0, H1))[None, :]
+        cdna4.buffer_store(bf_pair(o_lo, o_hi), icache, slot * 64 + j, mask=slot >= 0)
+
+
+# ============================================================ split attention
+@gluon.jit
+def stage_split(task, li, ptab, cos_sin, positions, slots, block_table, bt_stride, seq_lens, sc, tag, errors, bid,
+                sm_scale, eps):
+    """Token k's partition p (keys 256 p .. + 256) x 16 heads -> (o, m, l)."""
+    k = task // N_SPLIT
+    p = task % N_SPLIT
+    k_cache = lptr(ptab, li, 16, gl.uint8)
+    v_cache = lptr(ptab, li, 17, gl.uint8)
+    seq = gl.maximum(uniform(gl.load(seq_lens + k)), 1)
+    pos = uniform(gl.load(positions + k).to(gl.int32))
+    key0 = p * SPLIT_KEYS
+    spo = rgn(sc, R_SPO)
+    tid = tids()
+    if key0 >= seq:
+        # past the context: m = NEG, l = 0 (the merge weighs it 0)
+        put(rgn(sc, R_SPM), task * HEADS + tid, gl.full(tid.shape, NEG, gl.float32, tid.type.layout), tag,
+            mask=tid < HEADS)
+        put(rgn(sc, R_SPL), task * HEADS + tid, gl.full(tid.shape, 0.0, gl.float32, tid.type.layout), tag,
+            mask=tid < HEADS)
+        put(spo, task * (O_K // 2) + tid, tid * 0, tag)
+        put(spo, task * (O_K // 2) + THREADS + tid, tid * 0, tag)
+    else:
+        bt = block_table + k * bt_stride
+        b0 = uniform(gl.load(bt + 2 * p))
+        b1 = uniform(gl.load(bt + gl.minimum(2 * p + 1, (seq - 1) // 128)))
+        # K^T [128 d, 256 keys], V [256 keys, 128 d] of the partition, masked past the context
+        kc = ar(8, layout=gl.SliceLayout(1, gl.SliceLayout(2, KT_L)))[:, None, None]
+        kb = ar(16, layout=gl.SliceLayout(0, gl.SliceLayout(2, KT_L)))[None, :, None]
+        kn = ar(256, layout=gl.SliceLayout(0, gl.SliceLayout(1, KT_L)))[None, None, :]
+        kpg = gl.where(kn < 128, b0, b1) * 16 + (kn % 128) // 16
+        kok = key0 + kn < seq
+        k_off = kpg * 2048 + kc * 256 + (kn % 16) * 16 + kb
+        kt = cdna4.buffer_load(k_cache, k_off, mask=kok, other=0)
+        vp = ar(16, layout=gl.SliceLayout(1, gl.SliceLayout(2, VT_L)))[:, None, None]
+        vt = ar(16, layout=gl.SliceLayout(0, gl.SliceLayout(2, VT_L)))[None, :, None]
+        vd = ar(128, layout=gl.SliceLayout(0, gl.SliceLayout(1, VT_L)))[None, None, :]
+        vpg = gl.where(vp < 8, b0, b1) * 16 + vp % 8
+        vok = key0 + vp * 16 + vt < seq
+        v_off = vpg * 2048 + vd * 16 + vt
+        # whole pages (16 B loads), the keys past the context zeroed after: P is 0 there,
+        # but a NaN byte would still poison the MFMA
+        vv = cdna4.buffer_load(v_cache, v_off, mask=key0 + vp * 16 < seq, other=0)
+        vv = gl.where(vok, vv, 0)
+        pin(tids())  # the K / V loads stay issued before the q wait
+        # q: the token's 16 heads from the GEMV rows, normed and roped here
+        qkv = rgn(sc, R_QKV)
+        lo, hi, plo, phi = head_rows(qkv, k, 0, 1024, HL, tag, errors, bid, E_QKV)
+        q_lo, q_hi = head_norm_rope(lo, hi, plo, phi, lptr(ptab, li, 3, gl.int32), cos_sin, pos, eps)
+        q8 = gl.reshape(gl.join(bf16_round(q_lo).to(gl.float8e4nv), bf16_round(q_hi).to(gl.float8e4nv)),
+                        [16, 128])
+        tail = (seq - 1) // SPLIT_KEYS == p
+        if tail:
+            # the token's own key: K = norm / rope of the k rows, V raw -> the cache
+            # (vLLM's: unit scale, page-16 slot), then that key re-read
+            slot = uniform(gl.load(slots + k).to(gl.int32))
+            klo, khi, kplo, kphi = head_rows(qkv, k, HEADS * 64, 64, H1, tag, errors, bid, E_QKV)
+            ko_lo, ko_hi = head_norm_rope(klo, khi, kplo, kphi, lptr(ptab, li, 4, gl.int32), cos_sin, pos, eps)
+            vlo, vhi = poll_pairs(qkv, k * QKV_PAIRS + (HEADS + 1) * 64 + ar(64, layout=gl.SliceLayout(
+                0, H1))[None, :], tag, slot >= 0, errors, bid, E_QKV)
+            j = ar(64, layout=gl.SliceLayout(0, H1))[None, :]
+            p16 = slot + (slot // 128) * 128
+            pb = p16 // 16
+            pt = p16 % 16
+            k8lo = clamp_fp8(bf16_round(ko_lo)).to(gl.float8e4nv).to(gl.uint8, bitcast=True).to(gl.int32)
+            k8hi = clamp_fp8(bf16_round(ko_hi)).to(gl.float8e4nv).to(gl.uint8, bitcast=True).to(gl.int32)
+            d = 2 * j
+            kw16 = (k8lo | (k8hi << 8)).to(gl.int16)
+            kdst = (pb * 2048 + (d // 16) * 256 + pt * 16 + d % 16) // 2
+            cdna4.buffer_store(kw16, k_cache.to(gl.pointer_type(gl.int16), bitcast=True), kdst,
+                               mask=slot >= 0, cache=".wt")
+            v8lo = clamp_fp8(vlo).to(gl.float8e4nv).to(gl.uint8, bitcast=True)
+            v8hi = clamp_fp8(vhi).to(gl.float8e4nv).to(gl.uint8, bitcast=True)
+            cdna4.buffer_store(v8lo, v_cache, pb * 2048 + d * 16 + pt, mask=slot >= 0, cache=".wt")
+            cdna4.buffer_store(v8hi, v_cache, pb * 2048 + (d + 1) * 16 + pt, mask=slot >= 0, cache=".wt")
+            drain(tid)
+            own = seq - 1 - key0  # the key's index in the partition
+            kt2 = cdna4.buffer_load(k_cache, k_off, mask=kok & (kn == own), other=0, cache=".cv")
+            kt = gl.where(kn == own, kt2, kt)
+            vv2 = cdna4.buffer_load(v_cache, v_off, mask=vp == own // 16, other=0, cache=".cv")
+            vv = gl.where(vp * 16 + vt == own, vv2, vv)
+        # QK: [16 heads, 128] x [128, 256 keys]
+        qa = gl.convert_layout(q8, A2)
+        kb2 = gl.convert_layout(gl.reshape(kt, [128, 256]), B2)
+        s = cdna4.mfma_scaled(qa, unit_scales([16, 4], A2), "e4m3", kb2.to(gl.float8e4nv, bitcast=True),
+                              unit_scales([256, 4], B2), "e4m3", zacc([16, 256], MFMA2))
+        kidx = ar(256, layout=gl.SliceLayout(0, MFMA2))[None, :]
+        s = gl.where(key0 + kidx < seq, sm_scale * s, NEG)
+        mx = gl.max(s, axis=1)
+        pj = hw_exp2((s - mx[:, None]) * LOG2E)
+        ls = gl.sum(pj, axis=1)
+        p8 = gl.where(key0 + kidx < seq, 448.0 * pj, 0.0).to(gl.float8e4nv)
+        pa = gl.convert_layout(p8, A2)
+        vb2 = gl.convert_layout(gl.reshape(vv, [256, 128]), B2)
+        o = cdna4.mfma_scaled(pa, unit_scales([16, 8], A2), "e4m3", vb2.to(gl.float8e4nv, bitcast=True),
+                              unit_scales([128, 8], B2), "e4m3", zacc([16, 128], MFMA2))
+        inv_l = 1.0 / gl.where(ls > 0.0, ls, 1.0)
+        o = (o * (1.0 / 448.0)) * inv_l[:, None]
+        # publish: bf16 pairs [16 heads, 64], m, l
+        OL: gl.constexpr = gl.BlockedLayout([1, 2], [1, 64], [8, 1], [1, 0])
+        o2 = gl.convert_layout(o, OL)
+        o_lo, o_hi = gl.split(gl.reshape(o2, [16, 64, 2]))
+        hh = ar(16, layout=gl.SliceLayout(1, o_lo.type.layout))[:, None]
+        jj = ar(64, layout=gl.SliceLayout(0, o_lo.type.layout))[None, :]
+        put(spo, task * (O_K // 2) + hh * 64 + jj, bf_pair(o_lo, o_hi), tag)
+        h1 = ar(16, layout=gl.SliceLayout(1, MFMA2))
+        put(rgn(sc, R_SPM), task * HEADS + h1, mx, tag)
+        put(rgn(sc, R_SPL), task * HEADS + h1, ls, tag)
+
+
+# ============================================================ merge + o_proj + attention all-reduce
+ML = gl.constexpr(gl.BlockedLayout([1, 1, 2], [1, 2, 32], [1, 8, 1], [2, 1, 0]))  # [8 parts, 16 heads, 64 pairs]
+
+
+@gluon.jit
+def stage_o(t, li, ptab, n_layers, sc, peers, peer_local, pbase, rank, hm_out, tag, errors, bid, S: gl.constexpr,
+            FFN_OFF: gl.constexpr):
+    """o task t: hidden rows 32 t .. + 32."""
+    w_o = lptr(ptab, li, 7, gl.uint8)
+    s_o = lptr(ptab, li, 8, gl.float32)
+    # weights first: tile tt = rows 16 (2 t + tt) .., round r, wave (tt, p) step 4 r + p
+    m = w8_rows()
+    wv = m // 16
+    aq = ()
+    for r in gl.static_range(4):
+        aq = aq + (w8_tile(w_o, (2 * t + wv // 4) * (16 * 2048) + (4 * r + wv % 4) * 2048 + (m % 16) * 16),)
+    jr = ar(8, layout=gl.SliceLayout(1, PR_L))[:, None]
+    ws = ()
+    for tt in gl.static_range(2):
+        ws = ws + ((gl.load(s_o + 32 * t + 16 * tt + 2 * jr), gl.load(s_o + 32 * t + 16 * tt + 2 * jr + 1)),)
+    m = pin(m)
+    # every token's partitions merged -> per-token FP8 rows in LDS [16 heads, 16 tokens, 128]
+    xs = gl.allocate_shared_memory(gl.uint8, [4, 4, MAX_S, 128], FLAT4)
+    pi = ar(8, layout=gl.SliceLayout(1, gl.SliceLayout(2, ML)))[:, None, None]
+    hi3 = ar(16, layout=gl.SliceLayout(0, gl.SliceLayout(2, ML)))[None, :, None]
+    ji = ar(64, layout=gl.SliceLayout(0, gl.SliceLayout(1, ML)))[None, None, :]
+    MH: gl.constexpr = gl.SliceLayout(2, ML)
+    pm = ar(8, layout=gl.SliceLayout(1, MH))[:, None]
+    hm2 = ar(16, layout=gl.SliceLayout(0, MH))[None, :]
+    nn = ar(MAX_S, layout=gl.SliceLayout(0, PR_L))[None, :]
+    xsc = gl.zeros([8, MAX_S], gl.float32, PR_L)
+    for k in gl.static_range(S):
+        sp0 = k * N_SPLIT
+        mw, e1 = pollv1(rgn(sc, R_SPM), (sp0 + pm) * HEADS + hm2, tag, pm < 8)
+        lw, e2 = pollv1(rgn(sc, R_SPL), (sp0 + pm) * HEADS + hm2, tag, pm < 8)
+        note_err(errors, bid, e1 | e2, E_SPLIT)
+        m_i = mw.to(gl.float32, bitcast=True)
+        l_i = lw.to(gl.float32, bitcast=True)
+        gm = gl.max(m_i, axis=0)
+        sl = l_i * hw_exp2((m_i - gm[None, :]) * LOG2E)
+        gs = gl.sum(sl, axis=0)
+        gs = gl.where(gs > 0.0, gs, 1.0)
+        wgt = (sl / gs[None, :])[:, :, None]
+        o_lo, o_hi = poll_pairs(rgn(sc, R_SPO), (sp0 + pi) * (O_K // 2) + hi3 * 64 + ji, tag, pi < 8, errors, bid,
+                                E_SPLIT)
+        av_lo = bf16_round(gl.sum(wgt * o_lo, axis=0))
+        av_hi = bf16_round(gl.sum(wgt * o_hi, axis=0))
+        amax = gl.max(gl.max(gl.maximum(gl.abs(av_lo), gl.abs(av_hi)), axis=1), axis=0)
+        x_scale = amax * (1.0 / 448.0)
+        inv = gl.where(amax == 0.0, 0.0, hw_rcp(x_scale))
+        q8 = gl.reshape(gl.join((av_lo * inv).to(gl.float8e4nv), (av_hi * inv).to(gl.float8e4nv)), [16, 128])
+        xs.slice(k, 1, dim=2).store(gl.reshape(q8.to(gl.uint8, bitcast=True), [4, 4, 1, 128]))
+        xsc = gl.where(nn == k, x_scale, xsc)
+    gl.barrier()
+    acc = zacc([128, 16], MFMA)
+    one_a = unit_scales([128, 4], A_L)
+    one_b = unit_scales([16, 4], B_L)
+    for r in gl.static_range(4):
+        bv = rounds(xs).index(r).reshape([16, 128]).permute((1, 0)).load(B_L)
+        acc = cdna4.mfma_scaled(aq[r].to(gl.float8e4nv, bitcast=True), one_a, "e4m3",
+                                bv.to(gl.float8e4nv, bitcast=True), one_b, "e4m3", acc)
+    red = gl.allocate_shared_memory(gl.float32, [128, 16], FLAT2)
+    los, his = bd_reduce(acc, 2, 4, red)
+    attn_peer, _, attn_own, _ = peer_regions(peers, peer_local, pbase, FFN_OFF)
+    live = nn < S
+    for tt in gl.static_range(2):
+        lo = bf16_round(los[tt] * xsc * ws[tt][0])
+        hi = bf16_round(his[tt] * xsc * ws[tt][1])
+        word = bf_pair(lo, hi)
+        at = (rank * MAX_S + nn) * HPAIRS + 16 * t + 8 * tt + jr
+        for r in gl.static_range(4):
+            put(attn_peer[r], at, word, tag, mask=live)
+    # this task's rows of the all-reduce: every rank's partials in rank order
+    for tt in gl.static_range(2):
+        pw = nn * HPAIRS + 16 * t + 8 * tt + jr
+        t_lo, t_hi = poll_pairs(attn_own, pw, tag, live, errors, bid, E_ATTN)
+        for r in gl.static_range(1, 4):
+            r_lo, r_hi = poll_pairs(attn_own, r * (MAX_S * HPAIRS) + pw, tag, live, errors, bid, E_ATTN)
+            t_lo = t_lo + r_lo
+            t_hi = t_hi + r_hi
+        h_lo, h_hi = poll_pairs(rgn(sc, R_H), pw, tag, live, errors, bid, E_H)
+        put(rgn(sc, R_A), pw, bf_pair(t_lo, t_hi), tag, mask=live)
+        hmw = bf_pair(bf16_round(t_lo) + h_lo, bf16_round(t_hi) + h_hi)
+        put(rgn(sc, R_HM), pw, hmw, tag, mask=live)
+        if li == n_layers - 1:
+            cdna4.buffer_store(hmw, i32p(hm_out), pw, mask=live)
+
+
+# ============================================================ router
+RL = gl.constexpr(gl.BlockedLayout([8, 2], [1, 64], [1, 8], [1, 0]))  # [8 experts, pairs]
+
+
+@gluon.jit
+def router_part(gate, pair0: gl.constexpr, NP: gl.constexpr, e0):
+    """The gate rows of experts e0 .. e0 + 8, pairs pair0 .. pair0 + NP (bf16 pairs)."""
+    e = ar(8, layout=gl.SliceLayout(1, RL))[:, None]
+    q = ar(NP, layout=gl.SliceLayout(0, RL))[None, :]
+    gw = gl.load(gate + (e0 + e) * HPAIRS + pair0 + q)
+    return gw
+
+
+@gluon.jit
+def router_in(pair0: gl.constexpr, NP: gl.constexpr, sc, k, tag, errors, bid):
+    q = ar(NP, layout=gl.SliceLayout(0, RL))
+    pw = k * HPAIRS + pair0 + q
+    a_lo, a_hi = poll_pairs(rgn(sc, R_A), pw, tag, q < NP, errors, bid, E_A)
+    h_lo, h_hi = poll_pairs(rgn(sc, R_H), pw, tag, q < NP, errors, bid, E_A)
+    return a_lo + h_lo, a_hi + h_hi
+
+
+@gluon.jit
+def stage_router(tr, li, ptab, sc, tag, errors, bid, eps, S: gl.constexpr):
+    """Router task tr = (token k, experts 8 (tr % 16) ..)."""
+    k = tr // 16
+    e0 = (tr % 16) * 8
+    gate = lptr(ptab, li, 10, gl.int32)
+    bias = lptr(ptab, li, 11, gl.float32)
+    g_post = lptr(ptab, li, 9, gl.int32)
+    gA = router_part(gate, 0, 2048, e0)
+    gB = router_part(gate, 2048, 1024, e0)
+    gA = pin(gA)
+    vA_lo, vA_hi = router_in(0, 2048, sc, k, tag, errors, bid)
+    vB_lo, vB_hi = router_in(2048, 1024, sc, k, tag, errors, bid)
+    ss = gl.sum(vA_lo * vA_lo + vA_hi * vA_hi, axis=0) + gl.sum(vB_lo * vB_lo + vB_hi * vB_hi, axis=0)
+    rstd = hw_rsq(ss / 6144.0 + eps)
+    qA = ar(2048, layout=gl.SliceLayout(0, RL))
+    qB = ar(1024, layout=gl.SliceLayout(0, RL))
+    gpA = gl.load(g_post + qA)
+    gpB = gl.load(g_post + 2048 + qB)
+    xA_lo = bf16_round(vA_lo * rstd * (bf_lo(gpA) + 1.0))
+    xA_hi = bf16_round(vA_hi * rstd * (bf_hi(gpA) + 1.0))
+    xB_lo = bf16_round(vB_lo * rstd * (bf_lo(gpB) + 1.0))
+    xB_hi = bf16_round(vB_hi * rstd * (bf_hi(gpB) + 1.0))
+    logit = (gl.sum(bf_lo(gA) * xA_lo[None, :] + bf_hi(gA) * xA_hi[None, :], axis=1)
+             + gl.sum(bf_lo(gB) * xB_lo[None, :] + bf_hi(gB) * xB_hi[None, :], axis=1))
+    e1 = ar(8, layout=gl.SliceLayout(1, RL))
+    sig = hw_rcp(1.0 + hw_exp2(-bf16_round(logit) * LOG2E))
+    rk = route_key(sig + gl.load(bias + e0 + e1), e0 + e1)
+    scr = rgn(sc, R_SC)
+    for c in gl.static_range(SCORE_COPIES):
+        at = ((c * MAX_S + k) * N_ROUTED + e0 + e1) * 2
+        put(scr, at, rk, tag)
+        put(scr, at + 1, sig, tag)
+    # this task's slice of xn as MXFP8 (aiter's rule): blocks 12 (tr % 16) .. + 12
+    tq = tr % 16
+    mxfp8_publish(xA_lo, xA_hi, xB_lo, xB_hi, tq, sc, k, tag)
+
+
+@gluon.jit
+def mxfp8_publish(xA_lo, xA_hi, xB_lo, xB_hi, tq, sc, k, tag):
+    """Blocks 12 tq .. + 12 (32 elements each) of the token's xn -> MXFP8 words (4 fp8
+    a pair) and E8M0 codes (one a pair)."""
+    XQ: gl.constexpr = gl.BlockedLayout([1, 16], [64, 1], [8, 1], [1, 0])  # [128 blocks, 16 pairs]
+    # blocks 0..127 of A (pairs 0..2047), 128..191 of B
+    a_lo = gl.convert_layout(gl.reshape(xA_lo, [128, 16]), XQ)
+    a_hi = gl.convert_layout(gl.reshape(xA_hi, [128, 16]), XQ)
+    BQ: gl.constexpr = gl.BlockedLayout([1, 16], [64, 1], [8, 1], [1, 0])
+    b_lo = gl.convert_layout(gl.reshape(xB_lo, [64, 16]), BQ)
+    b_hi = gl.convert_layout(gl.reshape(xB_hi, [64, 16]), BQ)
+    mx8_put(a_lo, a_hi, 0, tq, sc, k, tag)
+    mx8_put(b_lo, b_hi, 128, tq, sc, k, tag)
+
+
+@gluon.jit
+def mx8_put(lo, hi, blk0: gl.constexpr, tq, sc, k, tag):
+    layout: gl.constexpr = lo.type.layout
+    NB: gl.constexpr = lo.shape[0]
+    b = blk0 + ar(NB, layout=gl.SliceLayout(1, layout))
+    amax = gl.max(gl.maximum(gl.abs(lo), gl.abs(hi)), axis=1)
+    code = code_ceil(amax * (1.0 / 448.0))
+    inv = hw_rcp(((code << 23).to(gl.float32, bitcast=True)))[:, None]
+    q_lo = clamp_fp8(lo * inv).to(gl.float8e4nv).to(gl.uint8, bitcast=True).to(gl.int32)
+    q_hi = clamp_fp8(hi * inv).to(gl.float8e4nv).to(gl.uint8, bitcast=True).to(gl.int32)
+    w2 = q_lo | (q_hi << 8)  # [NB, 16]: pair j's two fp8
+    a, c = gl.split(gl.reshape(w2, [NB, 8, 2]))
+    word = a | (c << 16)  # [NB, 8]: 4 fp8 a word
+    mine = (b >= 12 * tq) & (b < 12 * tq + 12)
+    jj = ar(8, layout=gl.SliceLayout(0, word.type.layout))[None, :]
+    bw = gl.convert_layout(b, gl.SliceLayout(1, word.type.layout))[:, None]
+    mw = gl.convert_layout(mine, gl.SliceLayout(1, word.type.layout))[:, None]
+    put(rgn(sc, R_XN8), k * (HIDDEN // 4) + bw * 8 + jj, word, tag, mask=mw)
+    put(rgn(sc, R_XSC), k * (HIDDEN // 32) + b, code, tag, mask=mine)
+
+
+# ============================================================ MoE (narrow: S <= 4)
+RT = gl.constexpr(gl.BlockedLayout([1, 2], [1, 64], [8, 1], [1, 0]))  # [8 tokens, 128 experts]
+UG_DEPTH = gl.constexpr(8)  # up / gate rounds in flight (16 B a lane each)
+REP8 = gl.constexpr(gl.BlockedLayout([8], [64], [8], [0]))  # [8], every thread holding all 8
+XW3 = gl.constexpr(gl.BlockedLayout([1, 1, 1], [1, 2, 32], [1, 8, 1], [2, 1, 0]))  # [S, steps, 32 words]
+CL3 = gl.constexpr(gl.BlockedLayout([1, 1, 1], [1, 16, 4], [1, 8, 1], [2, 1, 0]))  # [S, steps, 4 codes]
+MD3 = gl.constexpr(gl.BlockedLayout([1, 1, 2], [1, 2, 32], [1, 8, 1], [2, 1, 0]))  # [S, 32 entries, 64 pairs]
+INT_MIN = gl.constexpr(-2147483648)
+
+
+@gluon.jit
+def route_all(sc, bid, tag, errors, route_scale, pred, S: gl.constexpr):
+    """Every token's top-4 routed experts from the router's (key, sigmoid) pairs (copy
+    bid % SCORE_COPIES) -> (ids, weights): a [8] tensor (token rows) a slot. The weights
+    are the picks' sigmoids renormalized and scaled by route_scale (ATOM's)."""
+    kk = ar(8, layout=gl.SliceLayout(1, RT))[:, None]
+    e = ar(128, layout=gl.SliceLayout(0, RT))[None, :]
+    at = (((bid % SCORE_COPIES) * MAX_S + kk) * N_ROUTED + e) * 2
+    ok = (kk < S) & pred
+    scr = rgn(sc, R_SC)
+    rk, e1 = pollv1(scr, at, tag, ok)
+    sw, e2 = pollv1(scr, at + 1, tag, ok)
+    note_err(errors, bid, e1 | e2, E_SC)
+    sig = sw.to(gl.float32, bitcast=True)
+    keys = gl.where(ok, rk, INT_MIN)
+    ids = ()
+    ws = ()
+    for p in gl.static_range(TOP_K):
+        mx = gl.max(keys, axis=1)
+        keys = gl.where(keys == mx[:, None], INT_MIN, keys)
+        idp = 127 - (mx & 127)
+        ids = ids + (idp,)
+        ws = ws + (gl.sum(gl.where(e == idp[:, None], sig, 0.0), axis=1),)
+    scale = route_scale / gl.maximum((ws[0] + ws[1]) + (ws[2] + ws[3]), 1e-20)
+    # token k's slot s as CTA-uniform scalars E[4 k + s], W[4 k + s]: a lookup is then a
+    # scalar select (a reduction over the token rows crosses waves: an LDS round trip)
+    E = ()
+    W = ()
+    for k in gl.static_range(S):
+        for p in gl.static_range(TOP_K):
+            ik = gl.convert_layout(ids[p], REP8)
+            wk = gl.convert_layout(ws[p] * scale, REP8)
+            E = E + (gl.minimum(gl.maximum(uniform(tok_of(ik, k)), 0), N_ROUTED - 1),)
+            W = W + (uniform(tok_of(wk.to(gl.int32, bitcast=True), k)).to(gl.float32, bitcast=True),)
+    return E, W
+
+
+@gluon.jit
+def tok_of(vec, k):
+    """Row k of a [8] route tensor (REP8: in every thread), as a scalar."""
+    kk = gl.arange(0, 8, layout=REP8)
+    return gl.sum(gl.where(kk == k, vec, 0 * vec), axis=0)
+
+
+@gluon.jit
+def expert_of(E, k, slot, S: gl.constexpr):
+    """Token k's slot-``slot`` expert (k, slot runtime scalars)."""
+    e = E[0]
+    for i in gl.static_range(1, 4 * S):
+        e = gl.where((k == i // 4) & (slot == i % 4), E[i], e)
+    return uniform(e)
+
+
+@gluon.jit
+def stage_xn(sc, tag, errors, bid, xsa, xsb, csa, csb, pred, S: gl.constexpr):
+    """Every token's MXFP8 xn -> LDS [steps, 16 tokens, 128 B] (steps 0..31 in xsa,
+    32..47 in xsb), its codes -> [steps, 16, 4] (csa, csb)."""
+    SP: gl.constexpr = triton.next_power_of_2(S)
+    xn_part(sc, tag, errors, bid, xsa, csa, pred, 0, 32, SP, S)
+    xn_part(sc, tag, errors, bid, xsb, csb, pred, 32, 16, SP, S)
+
+
+@gluon.jit
+def xn_part(sc, tag, errors, bid, xs8, cs8, pred, st0: gl.constexpr, NST: gl.constexpr, SP: gl.constexpr,
+            S: gl.constexpr):
+    k3 = ar(SP, layout=gl.SliceLayout(1, gl.SliceLayout(2, XW3)))[:, None, None]
+    st3 = st0 + ar(NST, layout=gl.SliceLayout(0, gl.SliceLayout(2, XW3)))[None, :, None]
+    w3 = ar(32, layout=gl.SliceLayout(0, gl.SliceLayout(1, XW3)))[None, None, :]
+    wv, err = pollv1(rgn(sc, R_XN8), k3 * (HIDDEN // 4) + st3 * 32 + w3, tag, (k3 < S) & pred)
+    note_err(errors, bid, err, E_XN)
+    b0 = (wv & 255).to(gl.uint8)
+    b1 = ((wv >> 8) & 255).to(gl.uint8)
+    b2 = ((wv >> 16) & 255).to(gl.uint8)
+    b3 = ((wv >> 24) & 255).to(gl.uint8)
+    x = gl.reshape(gl.join(gl.join(b0, b2), gl.join(b1, b3)), [SP, NST // 4, 4, 128])
+    xs8.slice(0, SP, dim=2).store(gl.permute(x, (1, 2, 0, 3)))
+    kc = ar(SP, layout=gl.SliceLayout(1, gl.SliceLayout(2, CL3)))[:, None, None]
+    sc3 = st0 + ar(NST, layout=gl.SliceLayout(0, gl.SliceLayout(2, CL3)))[None, :, None]
+    g3 = ar(4, layout=gl.SliceLayout(0, gl.SliceLayout(1, CL3)))[None, None, :]
+    cv, err2 = pollv1(rgn(sc, R_XSC), kc * (HIDDEN // 32) + sc3 * 4 + g3, tag, (kc < S) & pred)
+    note_err(errors, bid, err2, E_XN)
+    cs8.slice(0, SP, dim=2).store(gl.permute(gl.reshape(cv.to(gl.uint8), [SP, NST // 4, 4, 4]), (1, 2, 0, 3)))
+
+
+@gluon.jit
+def ug_round(e, cg, r: gl.constexpr, w13, s13, pred):
+    """Round r of up / gate tile pair (expert e, gate rows 16 cg .., up rows 768 + 16 cg ..):
+    wave (tile, p) takes 128-k step 4 r + p -> (A tile, A scales), in flight."""
+    w13e = w13 + e.to(gl.int64) * (2 * INTER * (HIDDEN // 2))
+    m = w4_rows()
+    wv = m // 16
+    g16 = (wv // 4) * (INTER // 16) + cg
+    AS_L: gl.constexpr = cdna4.get_mfma_scale_layout(A_L, [128, 4])
+    sm = ar(128, layout=gl.SliceLayout(1, AS_L))[:, None]
+    sg = ar(4, layout=gl.SliceLayout(0, AS_L))[None, :]
+    a = w4_tile(w13e, g16 * (16 * (HIDDEN // 2)) + (4 * r + wv % 4) * 1024 + (m % 16) * 16, (m >= 0) & pred)
+    # aiter's shuffle_scale byte of (row e 1536 + 16 g + r16, col (4 r + p) 4 + sg), 192 cols:
+    # (e 48 + g / 2) 6144 + r 512 + (p / 2) 256 + (p % 2) 2 + sg 64 + r16 4 + g % 2
+    sp = (sm // 16) % 4
+    sgr = ((sm // 16) // 4) * (INTER // 16) + cg
+    b = (e * 48 + sgr // 2) * 6144 + r * 512 + (sp // 2) * 256 + (sp % 2) * 2 + sg * 64 + (sm % 16) * 4 + sgr % 2
+    dw = cdna4.buffer_load(i32p(s13), b >> 2, mask=(sm >= 0) & pred, other=0x7F7F7F7F)
+    return a, ((dw >> ((b & 3) * 8)) & 0xFF).to(gl.uint8)
+
+
+@gluon.jit
+def ug_bround(r: gl.constexpr, xsa, xsb, csa, csb):
+    """Round r's B operand (every token's xn, 4 steps) and its scales, from LDS."""
+    BS: gl.constexpr = cdna4.get_mfma_scale_layout(B_L, [16, 4])
+    if r < 8:
+        bv = rounds(xsa).index(r).reshape([16, 128]).permute((1, 0)).load(B_L)
+        bs = rounds(csa).index(r).reshape([16, 4]).load(BS)
+    else:
+        bv = rounds(xsb).index(r - 8).reshape([16, 128]).permute((1, 0)).load(B_L)
+        bs = rounds(csb).index(r - 8).reshape([16, 4]).load(BS)
+    return bv, bs
+
+
+@gluon.jit
+def ug_loads(e, cg, w13, s13, pred):
+    """Up / gate tile pair of expert e: gate rows 16 cg .. + 16 (tile 0), up rows 768 +
+    16 cg .. (tile 1); round r, wave (tile, p) takes 128-k step 4 r + p (in flight)."""
+    w13e = w13 + e.to(gl.int64) * (2 * INTER * (HIDDEN // 2))
+    m = w4_rows()
+    wv = m // 16
+    g16 = (wv // 4) * (INTER // 16) + cg
+    mk = (m >= 0) & pred
+    AS_L: gl.constexpr = cdna4.get_mfma_scale_layout(A_L, [128, 4])
+    sm = ar(128, layout=gl.SliceLayout(1, AS_L))[:, None]
+    sg = ar(4, layout=gl.SliceLayout(0, AS_L))[None, :]
+    swv = sm // 16
+    srow = e * (2 * INTER) + ((swv // 4) * (INTER // 16) + cg) * 16 + sm % 16
+    aq = ()
+    sq = ()
+    for r in gl.static_range(12):
+        aq = aq + (w4_tile(w13e, g16 * (16 * (HIDDEN // 2)) + (4 * r + wv % 4) * 1024 + (m % 16) * 16, mk),)
+        b = scale_index(srow, (4 * r + swv % 4) * 4 + sg, HIDDEN // 32)
+        dw = cdna4.buffer_load(i32p(s13), b >> 2, mask=(sm >= 0) & pred, other=0x7F7F7F7F)
+        sq = sq + (((dw >> ((b & 3) * 8)) & 0xFF).to(gl.uint8),)
+    return aq, sq
+
+
+@gluon.jit
+def ug_mma(aq, sq, xsa, xsb, csa, csb, red):
+    """The tile pair against every token's xn -> (gate (lo, hi), up (lo, hi)) [8 pairs, 16 t]."""
+    acc = zacc([128, 16], MFMA)
+    BS: gl.constexpr = cdna4.get_mfma_scale_layout(B_L, [16, 4])
+    for r in gl.static_range(12):
+        if r < 8:
+            bv = rounds(xsa).index(r).reshape([16, 128]).permute((1, 0)).load(B_L)
+            bs = rounds(csa).index(r).reshape([16, 4]).load(BS)
+        else:
+            bv = rounds(xsb).index(r - 8).reshape([16, 128]).permute((1, 0)).load(B_L)
+            bs = rounds(csb).index(r - 8).reshape([16, 4]).load(BS)
+        acc = cdna4.mfma_scaled(aq[r], sq[r], "e2m1", bv.to(gl.float8e4nv, bitcast=True), bs, "e4m3", acc)
+    los, his = bd_reduce(acc, 2, 4, red)
+    return los[0], his[0], los[1], his[1]
+
+
+@gluon.jit
+def swiglu(g, u, limit):
+    """aiter's swiglu_mul: min(g, L) * sigmoid(1.702 min(g, L)) * (clamp(u, -L, L) + 1)."""
+    gc = gl.minimum(g, limit)
+    uc = gl.maximum(gl.minimum(u, limit), -limit)
+    sig = hw_rcp(1.0 + hw_exp2((1.702 * gc) * -LOG2E))
+    return gc * sig * (uc + 1.0)
+
+
+MD2 = gl.constexpr(gl.BlockedLayout([1, 2], [2, 32], [8, 1], [1, 0]))  # [entries, 64 pairs]
+
+
+@gluon.jit
+def mids_part(sc, tag, errors, bid, k, slot0: gl.constexpr, NE: gl.constexpr, buf, cbuf):
+    """Token k's mid chunks of slots slot0 .., entry 8 (slot - slot0) + chunk (chunks 6, 7
+    zero) -> MXFP8 -> LDS ``buf`` [NE / 4, 4, MAX_S, 128] row k (codes ``cbuf``)."""
+    en = ar(NE, layout=gl.SliceLayout(1, MD2))[:, None]
+    j = ar(64, layout=gl.SliceLayout(0, MD2))[None, :]
+    sl = slot0 + en // 8
+    ch = en % 8
+    ok = (sl < SLOTS) & (ch < 6)
+    lo, hi = poll_pairs(rgn(sc, R_MID), (k * SLOTS + sl) * (INTER // 2) + ch * 64 + j, tag, ok, errors, bid, E_MID)
+    lo4 = gl.reshape(gl.where(ok, lo, 0.0), [NE, 4, 16])
+    hi4 = gl.reshape(gl.where(ok, hi, 0.0), [NE, 4, 16])
+    amax = gl.max(gl.maximum(gl.abs(lo4), gl.abs(hi4)), axis=2)
+    code = code_ceil(amax * (1.0 / 448.0))
+    inv = hw_rcp((code << 23).to(gl.float32, bitcast=True))[:, :, None]
+    q_lo = clamp_fp8(lo4 * inv).to(gl.float8e4nv).to(gl.uint8, bitcast=True)
+    q_hi = clamp_fp8(hi4 * inv).to(gl.float8e4nv).to(gl.uint8, bitcast=True)
+    buf.slice(k, 1, dim=2).store(gl.reshape(gl.join(q_lo, q_hi), [NE // 4, 4, 1, 128]))
+    cbuf.slice(k, 1, dim=2).store(gl.reshape(code.to(gl.uint8), [NE // 4, 4, 1, 4]))
+
+
+@gluon.jit
+def stage_mids(sc, tag, errors, bid, ms8, mc8, msh, mch, S: gl.constexpr):
+    """Every token's mid rows -> MXFP8 (aiter's rule) in LDS [entries, 16 tokens, 128 B]
+    (codes [entries, 4, 4]): routed slot s's 128-k chunk c at entry 8 s + c of ms8 (c < 6;
+    chunks 6, 7 zero), the shared slot's at entry c of msh. A token at a time."""
+    for k in gl.static_range(S):
+        mids_part(sc, tag, errors, bid, k, 0, 32, ms8, mc8)
+        mids_part(sc, tag, errors, bid, k, TOP_K, 8, msh, mch)
+
+
+@gluon.jit
+def down_round(i: gl.constexpr, t, ids, w2, s2, S: gl.constexpr, DBG: gl.constexpr = 0):
+    """Round i's A tiles and scales of down task t (rows 32 t .. + 32): token i // 8's
+    routed slot (i % 8) // 2, chunks 4 (i % 2) + q on wave (tile, q) for i < 8 S, then
+    the shared expert's chunks 4 (i - 8 S) + q; chunks past 6 zero."""
+    m = w4_rows()
+    wv = m // 16
+    AS_L: gl.constexpr = cdna4.get_mfma_scale_layout(A_L, [128, 4])
+    sm = ar(128, layout=gl.SliceLayout(1, AS_L))[:, None]
+    sg = ar(4, layout=gl.SliceLayout(0, AS_L))[None, :]
+    if i < 8 * S:
+        e = ids[4 * (i // 8) + (i % 8) // 2]
+        half = i % 2
+    else:
+        e = ids[0] * 0 + N_ROUTED
+        half = i - 8 * S
+    c = 4 * half + wv % 4
+    sc_ = 4 * half + (sm // 16) % 4
+    a = w4_tile(w2, e * (HIDDEN * (INTER // 2)) + (2 * t + wv // 4) * (16 * (INTER // 2)) + c * 1024 + (m % 16) * 16,
+                (c < 6) & ((DBG & 512) == 0))
+    # aiter's shuffle_scale byte of (row e 6144 + 32 t + 16 tt + r16, col c 4 + sg), 24 cols:
+    # (e 192 + t) 768 + (c / 2) 256 + (c % 2) 2 + sg 64 + r16 4 + tt
+    b = (e * 192 + t) * 768 + (sc_ // 2) * 256 + (sc_ % 2) * 2 + sg * 64 + (sm % 16) * 4 + (sm // 16) // 4
+    dw = cdna4.buffer_load(i32p(s2), b >> 2, mask=(sc_ < 6) & ((DBG & 512) == 0), other=0x7F7F7F7F)
+    return a, ((dw >> ((b & 3) * 8)) & 0xFF).to(gl.uint8)
+
+
+@gluon.jit
+def down_wcol(i: gl.constexpr, wts, shared_weight, S: gl.constexpr):
+    """Round i's route weight of each accumulator column (token n = column % 4); only
+    the diagonal blocks are read (``bd_reduce``)."""
+    n = ar(16, layout=gl.SliceLayout(0, MFMA)) % MAX_S
+    if i < 8 * S:
+        w = gl.where(n == i // 8, wts[4 * (i // 8) + (i % 8) // 2], 0.0)
+    else:
+        w = gl.where(n < S, shared_weight, 0.0)
+    return w[None, :]
+
+
+@gluon.jit
+def stage_down(t, li, n_layers, ids, wts, w2, s2, ms8, mc8, msh, mch, red, sc, peers, peer_local, pbase, rank, ar_out,
+               tag, errors, bid, shared_weight, S: gl.constexpr, FFN_OFF: gl.constexpr, DBG: gl.constexpr = 0):
+    """Down task t: rows 32 t .. + 32, every token's route-weighted units -> bf16
+    partials to every rank -> rank-ordered sum -> ar."""
+    NRND: gl.constexpr = 8 * S + 2
+    DEPTH: gl.constexpr = 8
+    aw = ()
+    asc = ()
+    for i in gl.static_range(DEPTH):
+        if i < NRND:
+            a, sca = down_round(i, t, ids, w2, s2, S, DBG)
+            aw = aw + (a,)
+            asc = asc + (sca,)
+    pin(tids())
+    if (DBG & 1024) == 0:
+        stage_mids(sc, tag, errors, bid, ms8, mc8, msh, mch, S)
+    gl.barrier()
+    acc = gl.zeros([128, 16], gl.float32, MFMA)
+    BS: gl.constexpr = cdna4.get_mfma_scale_layout(B_L, [16, 4])
+    for i in gl.static_range(NRND if (DBG & 16384) == 0 else 0):
+        pin(tids())  # a round's LDS reads and next loads stay in it (else all hoisted: spills)
+        if i + DEPTH < NRND:
+            a, sca = down_round(i + DEPTH, t, ids, w2, s2, S, DBG)
+            aw = aw + (a,)
+            asc = asc + (sca,)
+        if DBG & 32768:
+            bv = gl.full([128, 16], 0x38, gl.uint8, B_L)
+            bs = gl.full([16, 4], 127, gl.uint8, BS)
+        elif i < 8 * S:
+            bv = rounds(ms8).index(i % 8).reshape([16, 128]).permute((1, 0)).load(B_L)
+            bs = rounds(mc8).index(i % 8).reshape([16, 4]).load(BS)
+        else:
+            bv = rounds(msh).index(i - 8 * S).reshape([16, 128]).permute((1, 0)).load(B_L)
+            bs = rounds(mch).index(i - 8 * S).reshape([16, 4]).load(BS)  # 2 rounds of msh
+        res = cdna4.mfma_scaled(aw[i], asc[i], "e2m1", bv.to(gl.float8e4nv, bitcast=True), bs, "e4m3",
+                                zacc([128, 16], MFMA))
+        acc = acc + res * down_wcol(i, wts, shared_weight, S)
+    if DBG & 8192:
+        return
+    los, his = bd_reduce(acc, 2, 4, red)
+    if DBG & 2048:
+        return
+    _, ffn_peer, _, ffn_own = peer_regions(peers, peer_local, pbase, FFN_OFF)
+    jr = ar(8, layout=gl.SliceLayout(1, PR_L))[:, None]
+    nn = ar(MAX_S, layout=gl.SliceLayout(0, PR_L))[None, :]
+    live = nn < S
+    for tt in gl.static_range(2):
+        word = bf_pair(bf16_round(los[tt]), bf16_round(his[tt]))
+        at = (rank * MAX_S + nn) * HPAIRS + 16 * t + 8 * tt + jr
+        for r in gl.static_range(4):
+            put(ffn_peer[r], at, word, tag, mask=live)
+    for tt in gl.static_range(2):
+        pw = nn * HPAIRS + 16 * t + 8 * tt + jr
+        t_lo, t_hi = poll_pairs(ffn_own, pw, tag, live, errors, bid, E_FFN)
+        for r in gl.static_range(1, 4):
+            r_lo, r_hi = poll_pairs(ffn_own, r * (MAX_S * HPAIRS) + pw, tag, live, errors, bid, E_FFN)
+            t_lo = t_lo + r_lo
+            t_hi = t_hi + r_hi
+        word = bf_pair(t_lo, t_hi)
+        put(rgn(sc, R_AR), pw, word, tag, mask=live)
+        if li == n_layers - 1:
+            cdna4.buffer_store(word, i32p(ar_out), pw, mask=live)
+
+
+@gluon.jit
+def mid_put(sc, k_or_all, slot, cg, g_lo, g_hi, u_lo, u_hi, limit, tag, S: gl.constexpr):
+    """A task's 16 mid values (rows 16 cg ..) -> bf16 pairs of token k (k_or_all >= 0)
+    or of every token (the shared expert, k_or_all < 0)."""
+    jr = ar(8, layout=gl.SliceLayout(1, PR_L))[:, None]
+    nn = ar(MAX_S, layout=gl.SliceLayout(0, PR_L))[None, :]
+    word = bf_pair(bf16_round(swiglu(g_lo, u_lo, limit)), bf16_round(swiglu(g_hi, u_hi, limit)))
+    mine = gl.where(k_or_all < 0, nn < S, nn == k_or_all)
+    put(rgn(sc, R_MID), (nn * SLOTS + slot) * (INTER // 2) + 8 * cg + jr, word, tag, mask=mine)
+
+
+@gluon.jit
+def stage_moe(li, ptab, n_layers, sc, peers, peer_local, pbase, rank, ar_out, tag, errors, bid, route_scale,
+              shared_weight, swiglu_limit, S: gl.constexpr, FFN_OFF: gl.constexpr, STAGES: gl.constexpr = 511):
+    NR: gl.constexpr = 4 * UG_TASKS * S  # routed up / gate tasks
+    MAXT: gl.constexpr = (NR + BLOCKS - 1) // BLOCKS
+    has_r = (bid < NR) & ((STAGES & 128) != 0)
+    has_dn = (bid < N_DN) & ((STAGES & 256) != 0) & ((bid > 0) | ((STAGES & 65536) == 0))
+    sh_j = bid - SHARED_BASE
+    has_sh = (sh_j >= 0) & (sh_j < UG_TASKS) & ((STAGES & 64) != 0)
+    if has_r | has_dn | has_sh:
+        w13 = lptr(ptab, li, 12, gl.uint8)
+        s13 = lptr(ptab, li, 13, gl.uint8)
+        xsa = gl.allocate_shared_memory(gl.uint8, [8, 4, MAX_S, 128], FLAT4)
+        xsb = gl.allocate_shared_memory(gl.uint8, [4, 4, MAX_S, 128], FLAT4)
+        csa = gl.allocate_shared_memory(gl.uint8, [8, 4, MAX_S, 4], FLAT4)
+        csb = gl.allocate_shared_memory(gl.uint8, [4, 4, MAX_S, 4], FLAT4)
+        red = gl.allocate_shared_memory(gl.float32, [128, 16], FLAT2)
+        if has_sh:
+            # the shared expert needs no routing: its weights, then every token's xn
+            shj = gl.minimum(gl.maximum(sh_j, 0), UG_TASKS - 1)
+            aq_s, sq_s = ug_loads(sh_j * 0 + N_ROUTED, shj, w13, s13, sh_j >= 0)
+            stage_xn(sc, tag, errors, bid, xsa, xsb, csa, csb, sh_j >= 0, S)
+            gl.barrier()
+            g_lo, g_hi, up_lo, up_hi = ug_mma(aq_s, sq_s, xsa, xsb, csa, csb, red)
+            mid_put(sc, -1, TOP_K, shj, g_lo, g_hi, up_lo, up_hi, swiglu_limit, tag, S)
+        if has_r | has_dn:
+            ids, wts = route_all(sc, bid, tag, errors, route_scale, bid >= 0, S)
+            if has_r:
+                # the CTA's routed tasks bid, bid + 256, .. as one stream of 12-round tile
+                # pairs, UG_DEPTH rounds in flight across task boundaries
+                TOT: gl.constexpr = MAXT * 12
+                aw = ()
+                asc = ()
+                for j in gl.static_range(UG_DEPTH):
+                    if j < TOT:
+                        uj = gl.minimum(bid + (j // 12) * BLOCKS, NR - 1)
+                        a, sca = ug_round(expert_of(ids, uj // 192, (uj % 192) // 48, S), uj % 48, j % 12, w13, s13,
+                                          bid + (j // 12) * BLOCKS < NR)
+                        aw = aw + (a,)
+                        asc = asc + (sca,)
+                pin(tids())
+                if not has_sh:
+                    stage_xn(sc, tag, errors, bid, xsa, xsb, csa, csb, bid >= 0, S)
+                    gl.barrier()
+                acc = zacc([128, 16], MFMA)
+                for j in gl.static_range(TOT):
+                    pin(tids())
+                    if j + UG_DEPTH < TOT:
+                        jn = j + UG_DEPTH
+                        un = gl.minimum(bid + (jn // 12) * BLOCKS, NR - 1)
+                        a, sca = ug_round(expert_of(ids, un // 192, (un % 192) // 48, S), un % 48, jn % 12, w13, s13,
+                                          bid + (jn // 12) * BLOCKS < NR)
+                        aw = aw + (a,)
+                        asc = asc + (sca,)
+                    if j % 12 == 0:
+                        acc = zacc([128, 16], MFMA)
+                    bv, bs = ug_bround(j % 12, xsa, xsb, csa, csb)
+                    acc = cdna4.mfma_scaled(aw[j], asc[j], "e2m1", bv.to(gl.float8e4nv, bitcast=True), bs, "e4m3",
+                                            acc)
+                    if j % 12 == 11:
+                        u = bid + (j // 12) * BLOCKS
+                        los, his = bd_reduce(acc, 2, 4, red)
+                        if u < NR:
+                            mid_put(sc, u // 192, (u % 192) // 48, u % 48, los[0], his[0], los[1], his[1],
+                                    swiglu_limit, tag, S)
+            if has_dn:
+                w2 = lptr(ptab, li, 14, gl.uint8)
+                s2 = lptr(ptab, li, 15, gl.uint8)
+                ms8 = gl.allocate_shared_memory(gl.uint8, [8, 4, MAX_S, 128], FLAT4)
+                mc8 = gl.allocate_shared_memory(gl.uint8, [8, 4, MAX_S, 4], FLAT4)
+                msh = gl.allocate_shared_memory(gl.uint8, [2, 4, MAX_S, 128], FLAT4)
+                mch = gl.allocate_shared_memory(gl.uint8, [2, 4, MAX_S, 4], FLAT4)
+                if (STAGES & 4096) == 0:
+                    stage_down(bid, li, n_layers, ids, wts, w2, s2, ms8, mc8, msh, mch, red, sc, peers, peer_local, pbase,
+                               rank, ar_out, tag, errors, bid, shared_weight, S, FFN_OFF, STAGES & 65024)
+
+
+# ============================================================ the launch
+@gluon.jit
+def peer_regions(peers, peer_local, pbase, FFN_OFF: gl.constexpr):
+    attn_b = ()
+    ffn_b = ()
+    for r in gl.static_range(4):
+        pb = uniform64(gl.load(peers + r)) + pbase
+        attn_b = attn_b + (pb.to(gl.pointer_type(gl.int64), bitcast=True),)
+        ffn_b = ffn_b + ((pb + FFN_OFF).to(gl.pointer_type(gl.int64), bitcast=True),)
+    own = peer_local + pbase
+    return attn_b, ffn_b, own.to(gl.pointer_type(gl.int64), bitcast=True), \
+        (own + FFN_OFF).to(gl.pointer_type(gl.int64), bitcast=True)
+
+
+@gluon.jit
+def layer_body(li, ptab, n_layers, cos_sin, positions, slots, block_table, bt_stride, seq_lens, hid_in, res_in,
+               ar_out, hm_out, scratch, peer_local, peers, errors, trace, rank, sm_scale, eps, route_scale,
+               shared_weight, swiglu_limit, ep, bid,
+               S: gl.constexpr, HALF: gl.constexpr, PHALF: gl.constexpr, FFN_OFF: gl.constexpr, STAGES: gl.constexpr):
+    """Sparse layer li of the step (tag ep * TAGS + li + 1, scratch / peer half li % 2)."""
+    tag = ep * TAGS + li + 1
+    ptag = tag - 1
+    par = li % 2
+    sc = scratch + par * HALF
+    psc = scratch + (1 - par) * HALF
+    pbase = (par * PHALF).to(gl.int64)
+    tr_ = trace + li * (BLOCKS * 32)
+    topk = lscalar(ptab, li, 19)
+    nq = gl.where(topk != 0, ROWS16, NQ_REUSE)
+    if (STAGES & 1) and bid < nq:
+        stage_qkv(bid, li, ptab, hid_in, res_in, sc, psc, tag, ptag, errors, bid, eps, S)
+    stamp(tr_, bid, 1)
+    if (STAGES & 2) and (bid == ROWS16) & (topk != 0):
+        stage_ik(li, ptab, cos_sin, positions, slots, sc, tag, errors, bid, eps, S)
+    st = BLOCKS - 1 - bid
+    if (STAGES & 4) and st < N_SPLIT * S:
+        stage_split(st, li, ptab, cos_sin, positions, slots, block_table, bt_stride, seq_lens, sc, tag, errors,
+                    bid, sm_scale, eps)
+    stamp(tr_, bid, 2)
+    if (STAGES & 8) and bid < N_O:
+        stage_o(bid, li, ptab, n_layers, sc, peers, peer_local, pbase, rank, hm_out, tag, errors, bid, S, FFN_OFF)
+    stamp(tr_, bid, 3)
+    tr = (bid + BLOCKS - ROUTER_BASE) % BLOCKS
+    if (STAGES & 16) and tr < 16 * S:
+        stage_router(tr, li, ptab, sc, tag, errors, bid, eps, S)
+    stamp(tr_, bid, 4)
+    if STAGES & 32:
+        stage_moe(li, ptab, n_layers, sc, peers, peer_local, pbase, rank, ar_out, tag, errors, bid, route_scale,
+                  shared_weight, swiglu_limit, S, FFN_OFF, STAGES)
+    stamp(tr_, bid, 5)
+
+
+@gluon.jit
+def m3_step_kernel(ptab, n_layers, cos_sin, positions, slots, block_table, bt_stride, seq_lens, hid_in, res_in,
+                   ar_out, hm_out, scratch, peer_local, peers, epoch, errors, trace, rank, sm_scale, eps,
+                   route_scale, shared_weight, swiglu_limit, li0,
+                   S: gl.constexpr, HALF: gl.constexpr, PHALF: gl.constexpr, FFN_OFF: gl.constexpr,
+                   STAGES: gl.constexpr = 511, LOOP: gl.constexpr = False):
+    """LOOP: every layer in this launch; else layer li0 only (a launch a layer, the step's
+    last moving the epoch on)."""
+    bid = gl.program_id(0)
+    tid = tids()
+    cos_sin = i32p(cos_sin)  # [positions, 64] bf16 as pairs
+    ep = uniform(gl.load(epoch))
+    marks = epoch.to(gl.pointer_type(gl.int64), bitcast=True) + EP_MARK_PAIRS
+    if LOOP:
+        put(marks, bid + tid * 0, tid * 0 + 1, ep + 1, mask=tid == 0)
+        for li in range(n_layers):
+            layer_body(li, ptab, n_layers, cos_sin, positions, slots, block_table, bt_stride, seq_lens, hid_in,
+                       res_in, ar_out, hm_out, scratch, peer_local, peers, errors, trace, rank, sm_scale, eps,
+                       route_scale, shared_weight, swiglu_limit, ep, bid, S, HALF, PHALF, FFN_OFF, STAGES)
+        last = bid >= 0
+    else:
+        layer_body(li0, ptab, n_layers, cos_sin, positions, slots, block_table, bt_stride, seq_lens, hid_in,
+                   res_in, ar_out, hm_out, scratch, peer_local, peers, errors, trace, rank, sm_scale, eps,
+                   route_scale, shared_weight, swiglu_limit, ep, bid, S, HALF, PHALF, FFN_OFF, STAGES)
+        last = li0 == n_layers - 1
+        if last:
+            put(marks, bid + tid * 0, tid * 0 + 1, ep + 1, mask=tid == 0)
+    # every CTA read this step's epoch: CTA 0 moves it on
+    if last & (bid == 0):
+        _, err = pollv1(marks, tid, ep + 1, tid < BLOCKS)
+        note_err(errors, bid, err, E_EPOCH)
+        gl.barrier()
+        gl.store(epoch + tid * 0, ep + 1 + tid * 0, mask=tid == 0)
