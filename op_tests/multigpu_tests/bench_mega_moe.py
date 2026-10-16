@@ -40,8 +40,9 @@ Launch (4x gfx1250; every env knob below is already the script's default):
     # the ROCm torch profiler (roctracer) pins the names on the wrong kernels
     # once the graph has a parallel branch (stage1_fused=true), and loses more
     # kernel records. --profile_table 1 (the default) therefore restarts each
-    # rank with DEBUG_HIP_GRAPH_CLASSIC_PATH=1 unless that is already set. It
-    # costs ~1% end to end; --profile_table 0 times the default path.
+    # rank with DEBUG_HIP_GRAPH_CLASSIC_PATH=1 when --stage1_fused 1, unless
+    # that is already set. It costs ~1% end to end; --profile_table 0 or
+    # DEBUG_HIP_GRAPH_CLASSIC_PATH=0 times the default path.
 
 Env / CLI: --layers --logits_tol --acc_verify --dispatch_backend
            --stage1_fused --dispatch_wire --combine --combine_quant
@@ -657,12 +658,27 @@ class DeviceMoEPipeline:
         # identical). max_num_inp_token_per_rank = ct.
         uid = Communicator.get_unique_id() if r == 0 else None
         uid = self.dist_ctx.bcast_uid(uid)
-        self.comm = Communicator.init(
-            self.dist_ctx.world, r, uid, per_rank_vmm=16 * 1024**3
-        )
+        # The MoE's own view: the fused shared experts are experts and columns too.
+        moe_E = self.E + self.n_shared * self.dist_ctx.world
+        moe_topk = self.topk + self.n_shared
         if self.combine_mode == "fused":
             from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import MegaMoEGfx1250
 
+            # The arena is the only thing MegaMoE puts on the communicator.
+            per_rank_vmm = MegaMoEGfx1250.required_vmm_bytes(
+                world_size=self.dist_ctx.world,
+                hidden_dim=self.hdim,
+                max_tokens_per_rank=self.ct,
+                experts=moe_E,
+                topk=moe_topk,
+                stage1_fused=self.spec["stage1_fused"],
+            )
+        else:
+            per_rank_vmm = 16 * 1024**3
+        self.comm = Communicator.init(
+            self.dist_ctx.world, r, uid, per_rank_vmm=per_rank_vmm
+        )
+        if self.combine_mode == "fused":
             # Geometry + the expert-GEMM recipe are per-model, so they are fixed
             # here; the weights are per-layer and go to each forward() call.
             self.mega = MegaMoEGfx1250(
@@ -671,8 +687,8 @@ class DeviceMoEPipeline:
                 world_size=self.dist_ctx.world,
                 model_dim=self.hdim,
                 inter_dim=self.idim,
-                experts=self.E + self.n_shared * self.dist_ctx.world,
-                topk=self.topk + self.n_shared,
+                experts=moe_E,
+                topk=moe_topk,
                 max_tokens_per_rank=self.ct,
                 activation=self.spec["activation"],
                 gate_mode=self.spec["gate_mode"].value,
@@ -713,7 +729,7 @@ class DeviceMoEPipeline:
                 hidden_dim=self.hdim,
                 max_num_inp_token_per_rank=self.ct,
                 num_experts_per_rank=local_E,
-                num_experts_per_token=self.topk + self.n_shared,
+                num_experts_per_token=moe_topk,
                 data_type=self.transport_dtype,
                 combine_mode="gather",  # mori's name for the `base` combine
                 **wire_kw,
@@ -1038,7 +1054,10 @@ def _aggregate_prof_table(prof, dist_ctx, per_layer_denom=1.0, row_limit=200):
     dev_per_layer = total_self / per_layer_denom if per_layer_denom else 0.0
     # Every kernel runs a whole number of times per layer, so a count off that
     # grid means the profiler lost records: avg_us is per recorded call and
-    # holds, the totals undercount.
+    # holds, the totals undercount. That premise is the graph's: a kernel that
+    # runs once per replay rather than per layer (the layer-0 plan prefetch
+    # gets away with it only because the per-layer prefetches skip the last
+    # layer) reads as lost records here.
     complete = True
     for avg_self, _name, _per_call, _pc_avg, avg_count in rows:
         per_layer = avg_count / per_layer_denom if per_layer_denom else 1.0
@@ -1169,8 +1188,14 @@ def main():
     args = _parse_args()
     # HIP reads its debug flags once, when the runtime starts, and importing
     # aiter has already started it -- so the flag only takes in a fresh
-    # interpreter. Same pid, so torchrun keeps tracking the rank.
-    if args.profile_table and "DEBUG_HIP_GRAPH_CLASSIC_PATH" not in os.environ:
+    # interpreter. Same pid, so torchrun keeps tracking the rank. Only the
+    # stage1_fused graph has the parallel branch that gets mislabelled, so the
+    # other runs keep timing the default path.
+    if (
+        args.profile_table
+        and args.stage1_fused
+        and "DEBUG_HIP_GRAPH_CLASSIC_PATH" not in os.environ
+    ):
         os.environ["DEBUG_HIP_GRAPH_CLASSIC_PATH"] = "1"
         os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
     dist_ctx = Dist()
@@ -1225,7 +1250,8 @@ def main():
             print(
                 "# note: HIP classic graph path (DEBUG_HIP_GRAPH_CLASSIC_PATH=1) "
                 "labels the kernel table right but times ~1% slower than the "
-                "default path -- --profile_table 0 times that one",
+                "default path -- --profile_table 0 or "
+                "DEBUG_HIP_GRAPH_CLASSIC_PATH=0 times that one",
                 flush=True,
             )
         if list(args.scale_init) != [_DEFAULT_SCALE_INIT]:

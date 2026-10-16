@@ -262,7 +262,14 @@ class SymmetricArena:
             self._sizes[name] = size
             offset += size
         self._total_bytes = max(_align_up(offset, self._ALIGNMENT), self._ALIGNMENT)
-        self._memory = communicator.alloc_mem(self._total_bytes)
+        try:
+            self._memory = communicator.alloc_mem(self._total_bytes)
+        except RuntimeError as error:
+            raise RuntimeError(
+                f"MegaMoE arena needs {self._total_bytes} B of the communicator's "
+                "per-rank VMM; size per_rank_vmm with "
+                "MegaMoEGfx1250.required_vmm_bytes()"
+            ) from error
         self._window = communicator.register_window(self._memory.ptr, self._total_bytes)
 
     @property
@@ -365,16 +372,6 @@ class MegaMoEConfig:
             raise ValueError("stage1_fused requires dispatch_backend='flydsl'")
         if self.stage1_fused and not self.is_quant_dispatch_wire:
             raise ValueError("stage1_fused requires an fp8 or fp4 dispatch wire")
-        # required_vmm_bytes() sizes every compact row at the bf16 pitch.
-        if (
-            self.stage1_fused
-            and _align_up(self.dispatch_token_nbytes + self.dispatch_scale_nbytes, 128)
-            > 2 * self.hidden_dim
-        ):
-            raise ValueError(
-                "a compact wire row must fit in a bf16 row, got hidden_dim="
-                f"{self.hidden_dim} on the {self.dispatch_wire} wire"
-            )
         if not 0 <= self.rank < self.world_size:
             raise ValueError(f"rank={self.rank} must be in [0, {self.world_size})")
         if self.world_size > _MAX_WORLD_SIZE:
@@ -557,9 +554,11 @@ class Routing:
         return self.reverse_source_view
 
 
-# Tallest compact tile required_vmm_bytes() reserves for. compact_row_capacity
-# grows with the tile, so this bounds every tile the CSV or AITER_TDM_TILE_M
-# can pick at or below it.
+# Tallest compact tile required_vmm_bytes() reserves for. Doubling a tile t adds
+# experts_per_rank * t rows to compact_row_capacity, more than the t - 1 that
+# alignment can, so this bounds every power-of-two tile below it. Any other
+# tile can overshoot it at a small experts_per_rank; the constructor checks its
+# arena against the bound either way.
 _MAX_COMPACT_TILE_M = 256
 # mori rounds each allocation up to its VMM granularity, then to 2 MiB past
 # 2 GiB; the arena is one allocation.
@@ -629,9 +628,10 @@ def _arena_bound_nbytes(
 ) -> int:
     """Arena bytes for this geometry with every dispatch row at the bf16 pitch.
 
-    A quantized row (payload plus its e8m0 scale) never outgrows a bf16 one,
-    so this covers every dispatch wire; compact rows are counted at
-    _MAX_COMPACT_TILE_M, which covers every smaller tile.
+    A quantized row (payload plus its e8m0 scale) does not outgrow a bf16 one
+    at any hidden_dim a model uses, so this covers every dispatch wire; compact
+    rows are counted at _MAX_COMPACT_TILE_M, which covers every smaller
+    power-of-two tile.
     """
     from .compact_plan import compact_hist_stride, compact_row_capacity
 
@@ -820,8 +820,13 @@ class MegaMoEGfx1250:
         wires: every row is counted at the bf16 pitch. stage1_fused still
         matters, since compact rows are one per route rather than one per token.
         Only VA is reserved; the arena itself is allocated at its exact size.
+
+        ``experts`` and ``topk`` are what the constructor gets: with shared
+        experts fused in as per-rank replicas they already count them.
         """
-        if world_size <= 0 or experts % world_size:
+        if world_size <= 0:
+            raise ValueError(f"world_size must be positive, got {world_size}")
+        if experts % world_size:
             raise ValueError(
                 f"experts={experts} must be divisible by world_size={world_size}"
             )
@@ -1307,18 +1312,11 @@ class MegaMoEGfx1250:
             stage1_fused=config.stage1_fused,
         )
         if arena_bytes > bound_bytes:
-            raise AssertionError(
+            raise RuntimeError(
                 f"arena needs {arena_bytes} B, more than the {bound_bytes} B "
                 "required_vmm_bytes() reserves for"
             )
-        try:
-            self._arena = SymmetricArena(communicator, arena_regions)
-        except RuntimeError as error:
-            raise RuntimeError(
-                f"MegaMoE arena needs {arena_bytes} B of the communicator's "
-                "per-rank VMM; size per_rank_vmm with "
-                "MegaMoEGfx1250.required_vmm_bytes()"
-            ) from error
+        self._arena = SymmetricArena(communicator, arena_regions)
         self._compact_scale_row = (
             config.dispatch_scale_nbytes
             if self._compact_plan
