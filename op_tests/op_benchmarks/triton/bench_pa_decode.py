@@ -39,7 +39,7 @@ def input_helper(
         query = torch.randn(B, H_Q, D, dtype=dtype, device="cuda")
 
     if kv_cache_dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        x = min(D, 16 // torch.tensor([], dtype=torch.float16).element_size())
+        x = min(D, 16 // torch.tensor([], dtype=kv_cache_dtype).element_size())
         key_cache = torch.randn(
             num_blocks, H_KV, D // x, KV_BLK_SZ, x, dtype=torch.float16, device="cuda"
         )
@@ -109,6 +109,9 @@ def model_benchmark_configs(args):
     )
     fa_configs = []
     BS = args.b if args.b else 1024
+    SEQ_LEN = args.sq if args.sq else 8192
+    if args.hq:
+        return [("custom", BS, args.hq, args.hk if args.hk else args.hq, SEQ_LEN, 128)]
 
     for model_name, config in configs.items():
         HQ = config["num_attention_heads"]
@@ -117,7 +120,6 @@ def model_benchmark_configs(args):
             if config["num_key_value_heads"] is None
             else config["num_key_value_heads"]
         )
-        SEQ_LEN = args.sq if args.sq else 8192
         HEAD_DIM = config["hidden_size"] // HQ
         fa_configs.append((model_name, BS, HQ, HK, SEQ_LEN, HEAD_DIM))
 
@@ -136,12 +138,13 @@ def paged_attn_decode(
     kv_cache_dtype,
     compute_type,
     output_type,
+    backend="triton",
 ):
     (
         query,
         triton_output,
-        _,
-        _,
+        key_cache,
+        value_cache,
         key_cache_tri,
         value_cache_tri,
         context_lens,
@@ -160,6 +163,30 @@ def paged_attn_decode(
         num_blocks,
     )
     attn_scale = 1.0 / (D**0.5)
+
+    if backend == "gluon":
+        from aiter.ops.triton.gluon.pa_decode_gluon import (
+            get_recommended_splits,
+            pa_decode_gluon,
+        )
+
+        context_lens = context_lens.to(torch.int32)
+        scale = torch.ones(1, dtype=torch.float32, device="cuda")
+        return lambda: pa_decode_gluon(
+            output=triton_output,
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            context_lengths=context_lens,
+            block_tables=block_tables,
+            softmax_scale=attn_scale,
+            query_length=1,
+            max_context_partition_num=get_recommended_splits(BS, H_KV),
+            compute_type=compute_type,
+            key_scale=scale,
+            value_scale=scale,
+        )
+
     k_scale = torch.tensor([1.0])
     v_scale = torch.tensor([1.0])
 
@@ -181,7 +208,9 @@ def paged_attn_decode(
 def run_benchmark(args):
     dtype = arg_to_torch_dtype[args.dtype]
     kv_cache_dtype = arg_to_torch_dtype[args.kv_cache_dtype]
-    compute_type = torch_to_triton_dtype[arg_to_torch_dtype[args.compute_type]]
+    compute_type = arg_to_torch_dtype[args.compute_type]
+    if args.backend == "triton":
+        compute_type = torch_to_triton_dtype[compute_type]
     output_type = arg_to_torch_dtype[args.output_type]
 
     x_vals_list = model_benchmark_configs(args)
@@ -205,7 +234,7 @@ def run_benchmark(args):
     @triton.testing.perf_report([benchmark])
     def bench_paged_attn_decode(BS, HQ, HK, SEQ_LEN, HEAD_DIM, metric, model=None):
         # TODO tune this
-        KV_BLK_SZ = 128
+        KV_BLK_SZ = 16 if args.backend == "gluon" else 128
         num_blocks = 4
         fn = paged_attn_decode(
             BS,
@@ -219,6 +248,7 @@ def run_benchmark(args):
             kv_cache_dtype,
             compute_type,
             output_type,
+            args.backend,
         )
 
         ms = triton.testing.do_bench(fn, warmup=25, rep=100)
@@ -282,6 +312,12 @@ def parse_args():
     parser.add_argument("-compute_type", default="fp16")
     parser.add_argument("-output_type", default="fp16")
     parser.add_argument(
+        "--backend",
+        choices=["triton", "gluon"],
+        default="triton",
+        help="triton: paged_attention_decode; gluon: pa_decode_gluon (PS mode).",
+    )
+    parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
     )
     parser.add_argument(
@@ -300,6 +336,7 @@ arg_to_torch_dtype = {
     "fp32": torch.float32,
     "e5m2fnuz": torch.float8_e5m2fnuz,
     "e4m3fnuz": torch.float8_e4m3fnuz,
+    "e4m3fn": torch.float8_e4m3fn,
 }
 
 

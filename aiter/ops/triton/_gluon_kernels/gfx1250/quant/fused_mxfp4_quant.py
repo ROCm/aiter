@@ -1,7 +1,12 @@
+from functools import partial
+
 import triton
 import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.mxfp4_heuristics import even_m_n as _even_m_n
 
 
 # rms norm op copied from triton
@@ -124,13 +129,35 @@ def _mxfp4_quant_op(
     return x_fp4, bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
 
 
+_gluon_fused_rms_mxfp4_quant_repr = make_kernel_repr(
+    "_gluon_fused_rms_mxfp4_quant_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_N2",
+        "MXFP4_QUANT_BLOCK_SIZE",
+        "HAS_SECOND_INPUT",
+        "FIRST_INPUT_RES",
+        "FIRST_INPUT_OUT",
+        "SCALE_N",
+        "SCALE_M_PAD",
+        "SCALE_N_PAD",
+        "SHUFFLE",
+        "SHUFFLE_PAD",
+        "EVEN_M_N",
+        "ROWS_PER_CTA",
+    ],
+)
+
+
 @triton.heuristics(
     {
-        "EVEN_M_N": lambda args: args["M"] % args["ROWS_PER_CTA"] == 0
-        and args["N1"] % (args["BLOCK_SIZE_N"]) == 0,
+        "EVEN_M_N": partial(
+            _even_m_n, block_m="ROWS_PER_CTA", n="N1", block_n="BLOCK_SIZE_N"
+        ),
     }
 )
-@gluon.jit
+@gluon.jit(repr=_gluon_fused_rms_mxfp4_quant_repr)
 def _gluon_fused_rms_mxfp4_quant_kernel(
     x1_ptr,
     w1_ptr,
@@ -423,12 +450,15 @@ def _gluon_fused_rms_mxfp4_quant_kernel(
 
 @triton.heuristics(
     {
-        "EVEN_M_N": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
-        and args["N1"] % (args["BLOCK_SIZE_N"]) == 0,
-        "EVEN_M_N2": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
-        and args["N2"] % (args["BLOCK_SIZE_N2"]) == 0,
-        "EVEN_M_N3": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
-        and args["N3"] % (args["BLOCK_SIZE_N3"]) == 0,
+        "EVEN_M_N": partial(
+            _even_m_n, block_m="BLOCK_SIZE_M", n="N1", block_n="BLOCK_SIZE_N"
+        ),
+        "EVEN_M_N2": partial(
+            _even_m_n, block_m="BLOCK_SIZE_M", n="N2", block_n="BLOCK_SIZE_N2"
+        ),
+        "EVEN_M_N3": partial(
+            _even_m_n, block_m="BLOCK_SIZE_M", n="N3", block_n="BLOCK_SIZE_N3"
+        ),
     }
 )
 @gluon.jit
@@ -879,7 +909,19 @@ def _gluon_fused_reduce_rms_mxfp4_quant_kernel(
     gl.amd.gfx1250.tdm.async_wait(0)
 
 
-@gluon.jit
+_gluon_fused_dynamic_mxfp4_quant_moe_sort_repr = make_kernel_repr(
+    "_gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel",
+    [
+        "MXFP4_QUANT_BLOCK_SIZE",
+        "BLOCK_SIZE_Mx",
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "TOPK",
+    ],
+)
+
+
+@gluon.jit(repr=_gluon_fused_dynamic_mxfp4_quant_moe_sort_repr)
 def _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel(
     x_ptr,
     x_fp4_ptr,

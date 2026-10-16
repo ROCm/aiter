@@ -25,6 +25,8 @@ from aiter.utility.mx_types import (
     MxDtypeInt as _D,
 )
 
+from .act import clamp_gate_up, sigmoid_f32, situ_mul, tanh_via_sigmoid_f32
+
 BLOCK_THREADS = 256
 WARP_SIZE = 64
 
@@ -300,43 +302,7 @@ def build_silu_and_mul_fq_module(
                     gate_f32 = gate_bf16.extf(vec_f32_ty)
                     up_f32 = up_bf16.extf(vec_f32_ty)
 
-                    neg_log2e = fx.Float32(-1.4426950408889634)
-                    swiglu_neg_alpha_log2e = fx.Float32(-1.4426950408889634 * 1.702)
-                    # swiglu_limit is a runtime f32 scalar (clamp bound, or +inf to
-                    # disable); min(x, lim) via maximumf + negation so the limit is
-                    # never baked as a compile-time constant.
                     _neg_limit = -swiglu_limit_f
-
-                    # Helpers are re-defined per unrolled iter_idx to close over the
-                    # SSA values at this insertion point; bind as defaults so each
-                    # captures its own iteration's values (also silences B023).
-                    def _fmin(x, _neg_limit=_neg_limit):
-                        # min(x, lim) == -max(-x, -lim)
-                        return -((-x).maximumf(_neg_limit))
-
-                    def _sigmoid_s(x, neg_log2e=neg_log2e):
-                        emu = fx.Float32(fx.rocdl.exp2(f32, (x * neg_log2e).ir_value()))
-                        return fx.Float32(fx.rocdl.rcp(f32, (c1_f32 + emu).ir_value()))
-
-                    def _tanh_s(x):
-                        # tanh(x) = 2*sigmoid(2x) - 1
-                        two = fx.Float32(2.0)
-                        return two * _sigmoid_s(two * x) - c1_f32
-
-                    def _situv2_elem(
-                        g,
-                        u,
-                        _sv2_beta_f32=situ_beta_f,
-                        _sv2_beta_rcp=situ_beta_rcp_f,
-                        _sv2_linbeta_f32=situ_linear_beta_f,
-                        _sv2_linbeta_rcp=situ_linear_beta_rcp_f,
-                    ):
-                        # beta*tanh(g/beta)*sigmoid(g) * linear_beta*tanh(u/linear_beta)
-                        situ_g = (
-                            _sv2_beta_f32 * _tanh_s(g * _sv2_beta_rcp) * _sigmoid_s(g)
-                        )
-                        up_sc = _sv2_linbeta_f32 * _tanh_s(u * _sv2_linbeta_rcp)
-                        return situ_g * up_sc
 
                     act_vals = []
                     for vi in range_constexpr(VEC):
@@ -349,19 +315,21 @@ def build_silu_and_mul_fq_module(
                             u = u + _load_bias_scalar(bias_row + inter_dim + bias_col)
                         if const_expr(act == "situv2"):
                             # SiTUv2: no clamp (tanh self-saturates).
-                            act_vals.append(_situv2_elem(g, u))
+                            act_vals.append(
+                                situ_mul(
+                                    g,
+                                    u,
+                                    situ_beta_f,
+                                    situ_beta_rcp_f,
+                                    situ_linear_beta_f,
+                                    situ_linear_beta_rcp_f,
+                                    tanh=tanh_via_sigmoid_f32,
+                                )
+                            )
                             continue
                         # gate: upper-clamped only; linear: clamped to [-lim, lim].
-                        gate = _fmin(g)
-                        linear = _fmin(u).maximumf(_neg_limit)
-                        if const_expr(act == "swiglu"):
-                            t = gate * swiglu_neg_alpha_log2e
-                        else:
-                            t = gate * neg_log2e
-
-                        emu = fx.Float32(fx.rocdl.exp2(f32, t.ir_value()))
-                        den = c1_f32 + emu
-                        sig = fx.Float32(fx.rocdl.rcp(f32, den.ir_value()))
+                        gate, linear = clamp_gate_up(g, u, _neg_limit)
+                        sig = sigmoid_f32(gate, alpha=1.702 if act == "swiglu" else 1.0)
                         if const_expr(act == "swiglu"):
                             act_v = gate * sig * (linear + c1_f32)
                         else:

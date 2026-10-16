@@ -26,7 +26,6 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -102,11 +101,11 @@ def _load_kernels():
         gdn_prepare_flydsl_supported,
         gdn_prepare_fwd_flydsl,
     )
-    from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill import (
+    from aiter.ops.triton._triton_kernels.gated_delta_net.prefill import (
         fused_chunk_local_cumsum_scaled_dot_kkt_fwd,
         fused_solve_tril_recompute_w_u,
     )
-    from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
+    from aiter.ops.triton._triton_kernels.gated_delta_net.utils import (
         build_gated_delta_rule_prefill_metadata,
     )
     from aiter.ops.triton.gated_delta_net import chunk_gated_delta_rule_opt_vk
@@ -953,9 +952,6 @@ def main():
         aiter.logger.warning(
             "FlyDSL GDN prepare unsupported on %s; skipping", get_gfx()
         )
-        return
-    if not is_flydsl_available():
-        aiter.logger.warning("FlyDSL is unavailable; skipping GDN prepare")
         return
 
     _configure_noise_filters()

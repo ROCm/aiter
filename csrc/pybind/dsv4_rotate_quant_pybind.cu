@@ -4,7 +4,7 @@
 #include "aiter_stream.h"
 #include "dsv4_rotate_quant.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     AITER_SET_STREAM_PYBIND
     DSV4_ROTATE_QUANT_PYBIND;

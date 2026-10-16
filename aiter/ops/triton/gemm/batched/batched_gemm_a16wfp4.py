@@ -95,7 +95,10 @@ def batched_gemm_a16wfp4_(
         y (torch.Tensor): Output batch with shape (B, M, N).
     """
     _LOGGER.info(
-        f"BATCHED_GEMM_AFP4WFP_PREQUANT: x={tuple(x.shape)} w={tuple(w.shape)} w_scale={tuple(w.shape)}"
+        "BATCHED_GEMM_A16WFP4: x=%s w=%s w_scale=%s",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(w.shape),
     )
 
     assert prequant is True, "prequant = False is not yet supported"

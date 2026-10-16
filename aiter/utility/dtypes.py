@@ -4,8 +4,6 @@ import argparse
 
 import torch
 
-from ..jit.utils.chip_info import get_gfx_runtime
-from ..ops.enum import ActivationType, QuantType
 from .aiter_types import aiter_dtypes, aiter_tensor_t
 
 defaultDtypes = {
@@ -14,6 +12,7 @@ defaultDtypes = {
     "gfx1100": {"fp8": torch.float8_e4m3fn},
     "gfx1101": {"fp8": torch.float8_e4m3fn},
     "gfx1102": {"fp8": torch.float8_e4m3fn},
+    "gfx1150": {"fp8": torch.float8_e4m3fn},
     "gfx1151": {"fp8": torch.float8_e4m3fn},
     "gfx1200": {"fp8": torch.float8_e4m3fn},
     "gfx1201": {"fp8": torch.float8_e4m3fn},
@@ -24,7 +23,12 @@ _8bit_fallback = torch.uint8
 
 
 def get_dtype_fp8():
-    return defaultDtypes.get(get_gfx_runtime(), {"fp8": _8bit_fallback})["fp8"]
+    if torch.version.hip is None or not torch.cuda.is_available():
+        return _8bit_fallback
+    from ..jit.utils.chip_info import get_gfx_runtime
+
+    gfx = get_gfx_runtime()
+    return defaultDtypes.get(gfx, {"fp8": _8bit_fallback})["fp8"]
 
 
 # The two e4m3 encodings are mutually exclusive in hardware: gfx942 implements
@@ -195,6 +199,8 @@ def str2Dtype(v):
         elif s in d_dtypes:
             return d_dtypes[s]
         else:
+            from ..ops.enum import QuantType
+
             # Case-insensitive lookup for QuantType
             s_lower = s.lower()
             for name in dir(QuantType):
@@ -213,6 +219,8 @@ def str2Dtype(v):
 
 
 def str2ActivationType(s):
+    from ..ops.enum import ActivationType
+
     s = str(s)
     members = getattr(ActivationType, "__members__", None)
     if members is not None:

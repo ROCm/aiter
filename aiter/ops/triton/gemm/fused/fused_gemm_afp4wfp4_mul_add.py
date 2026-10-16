@@ -31,6 +31,10 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
     # heuristics for make "EVEN_K == True" as much as possible
     NUM_KSPLIT_STEP = 2
     BLOCK_SIZE_K_STEP = 2
+    # Both decrements floor-divide, so they must be clamped: a NUM_KSPLIT below
+    # NUM_KSPLIT_STEP would go to 0 and the next cdiv(K, NUM_KSPLIT) would
+    # divide by zero, and BLOCK_SIZE_K can fall under the 16 that
+    # compute_splitk_params() enforces everywhere else.
     SPLITK_BLOCK_SIZE = (
         triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
     )
@@ -42,14 +46,14 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
         ):
             break
         elif K % (SPLITK_BLOCK_SIZE // 2) != 0 and NUM_KSPLIT > 1:
-            NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
+            NUM_KSPLIT = max(NUM_KSPLIT // NUM_KSPLIT_STEP, 1)
         elif SPLITK_BLOCK_SIZE % BLOCK_SIZE_K != 0:
             if NUM_KSPLIT > 1:
-                NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
+                NUM_KSPLIT = max(NUM_KSPLIT // NUM_KSPLIT_STEP, 1)
             elif BLOCK_SIZE_K > 16:
-                BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
+                BLOCK_SIZE_K = max(BLOCK_SIZE_K // BLOCK_SIZE_K_STEP, 16)
         elif K % (BLOCK_SIZE_K // 2) != 0 and BLOCK_SIZE_K > 16:
-            BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
+            BLOCK_SIZE_K = max(BLOCK_SIZE_K // BLOCK_SIZE_K_STEP, 16)
         else:
             break
 
@@ -96,7 +100,11 @@ def fused_gemm_afp4wfp4_mul_add(
     """
 
     _LOGGER.info(
-        f"FUSED_GEMM_AFPWFP4_MUL_ADD: x.shape={tuple(x.shape)} w.shape={tuple(w.shape)} x_scale={tuple(x_scales.shape)} w_scale={tuple(w_scales.shape)} "
+        "FUSED_GEMM_AFP4WFP4_MUL_ADD: x.shape=%s w.shape=%s x_scale=%s w_scale=%s ",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(x_scales.shape),
+        tuple(w_scales.shape),
     )
 
     if isinstance(a, (float, int)):
@@ -152,6 +160,11 @@ def fused_gemm_afp4wfp4_mul_add(
     else:
         config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
+
+    # The scale loads are unmasked, so BLOCK_SIZE_K must not run past K.
+    if config["BLOCK_SIZE_K"] >= 2 * K:
+        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
 
     grid = lambda META: (
         (

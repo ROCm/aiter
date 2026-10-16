@@ -2,9 +2,8 @@ name: AITER Release Automation
 
 on:
   schedule:
-    # GitHub cron cannot express "every 14 days" directly. Trigger weekly and
-    # gate the release jobs below against a fixed 14-day cadence.
-    - cron: '0 6 * * 1'
+    - cron: '0 1 * * 1'
+      timezone: 'America/Chicago'
   push:
     tags:
       - 'v*'
@@ -31,10 +30,6 @@ on:
         description: 'Build and upload even if the GitHub Release already has the expected wheel assets.'
         type: boolean
         default: false
-      skip_biweekly_gate:
-        description: 'For manual testing only, ignore the every-two-week schedule gate.'
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -49,7 +44,7 @@ jobs:
     name: Prepare release target
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     outputs:
       should_run: ${{ steps.resolve.outputs.should_run }}
       skip_reason: ${{ steps.resolve.outputs.skip_reason }}
@@ -60,15 +55,25 @@ jobs:
       previous_tag: ${{ steps.resolve.outputs.previous_tag }}
       expected_wheel_count: ${{ steps.resolve.outputs.expected_wheel_count }}
     steps:
+      - name: Generate release GitHub App token
+        id: release_app_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.AITER_CI_APP_ID }}
+          private-key: ${{ secrets.AITER_CI_APP_PRIVATE_KEY }}
+          owner: ROCm
+          repositories: aiter
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          token: ${{ steps.release_app_token.outputs.token }}
           fetch-depth: 0
 
       - name: Resolve release target
         id: resolve
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.release_app_token.outputs.token }}
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
           INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag || '' }}
@@ -76,48 +81,12 @@ jobs:
           INPUT_RELEASE_REF: ${{ github.event.inputs.release_ref || 'main' }}
           CREATE_MISSING_REFS: ${{ github.event.inputs.create_missing_refs || true }}
           FORCE_REBUILD: ${{ github.event.inputs.force_rebuild || false }}
-          SKIP_BIWEEKLY_GATE: ${{ github.event.inputs.skip_biweekly_gate || false }}
           EXPECTED_WHEEL_COUNT: '6'
-          RELEASE_CADENCE_ANCHOR: '2026-08-31'
         run: |
           set -euo pipefail
 
           should_run=true
           skip_reason=""
-
-          if [ "${EVENT_NAME}" = "schedule" ] && [ "${SKIP_BIWEEKLY_GATE}" != "true" ]; then
-            today="$(date -u +%Y-%m-%d)"
-            anchor_seconds="$(date -u -d "${RELEASE_CADENCE_ANCHOR}" +%s)"
-            today_seconds="$(date -u -d "${today}" +%s)"
-            days_since_anchor=$(( (today_seconds - anchor_seconds) / 86400 ))
-            cadence_offset=$(( days_since_anchor % 14 ))
-
-            if [ "${cadence_offset}" -ne 0 ]; then
-              should_run=false
-              skip_reason="Not on the 14-day release cadence anchored at ${RELEASE_CADENCE_ANCHOR}."
-            fi
-          fi
-
-          if [ "${should_run}" != "true" ]; then
-            {
-              echo "should_run=${should_run}"
-              echo "skip_reason=${skip_reason}"
-              echo "release_tag="
-              echo "release_branch="
-              echo "release_version="
-              echo "release_kind="
-              echo "previous_tag="
-              echo "expected_wheel_count=${EXPECTED_WHEEL_COUNT}"
-            } >> "${GITHUB_OUTPUT}"
-
-            {
-              echo "## Release Target"
-              echo "- Should run: ${should_run}"
-              echo "- Skip reason: ${skip_reason}"
-            } >> "${GITHUB_STEP_SUMMARY}"
-
-            exit 0
-          fi
 
           git fetch --force --tags origin
           git fetch --force origin '+refs/heads/*:refs/remotes/origin/*'
@@ -309,6 +278,7 @@ jobs:
       actions: read
     env:
       GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
       RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
       RELEASE_VERSION: ${{ needs.prepare.outputs.release_version }}
       RELEASE_KIND: ${{ needs.prepare.outputs.release_kind }}
@@ -359,7 +329,7 @@ jobs:
             heading="AITER ${RELEASE_TAG} - post release"
             scope="Post release on top of the ${RELEASE_BRANCH} release line."
           else
-            heading="AITER ${RELEASE_TAG} - bi-weekly release"
+            heading="AITER ${RELEASE_TAG} - weekly release"
             scope="Scheduled release from ${RELEASE_BRANCH}."
           fi
 
@@ -465,7 +435,7 @@ jobs:
               heading = f"AITER {release_tag} - post release"
               scope = f"Post release on top of the `{release_branch}` release line."
           else:
-              heading = f"AITER {release_tag} - bi-weekly release"
+              heading = f"AITER {release_tag} - weekly release"
               scope = f"Scheduled release from `{release_branch}`."
 
           lines = [

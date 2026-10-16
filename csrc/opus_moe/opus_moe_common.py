@@ -38,6 +38,9 @@ OPUS_A8W4_KID_ROUTE_FP8_BM64_BT128_SBM64_RBN3072 = 2015
 OPUS_A8W4_KID_ROUTE_FP8_BM64_BT128_SBM128_RBN3584 = 2016
 OPUS_A8W4_KID_ROUTE_FP8_BM64_BT128_SBM128_RBN3072 = 2017
 OPUS_A8W4_KID_ATOMIC_BM32_BN128_OCC1_B3_WS2_RING4 = 2018
+OPUS_A8W4_KID_ROUTE_BF16_BM64_RBN3072 = 2019
+OPUS_A8W4_KID_ROUTE_BF16_BM64_RBN3584 = 2020
+OPUS_A8W4_KID_ROUTE_BF16_BM64_RBN6144 = 2021
 
 _OPUS_A8W4_STAGE2_PREFIX = "opus_moe2_"
 _OPUS_A8W4_STAGE2_LAYOUT_PREFIX = "opus_moe2_layout_"
@@ -157,6 +160,11 @@ def _opus_a8w4_k_step_packed() -> int:
 
 
 OPUS_A8W4_ROUTE_REDUCE_INSTANCES = (
+    OpusA8W4RouteReduceInstance(
+        name="rbn6144",
+        block_n=6144,
+        threads=384,
+    ),
     OpusA8W4RouteReduceInstance(
         name="full_model_n7168",
         block_n=7168,
@@ -871,6 +879,45 @@ OPUS_A8W4_DECODE_STAGE2_INSTANCES = (
         cachectl_wscale=2,
         min_tuner_token=1,
         max_tuner_token=2048,
+    ),
+    _route_stage2_instance(
+        kid=OPUS_A8W4_KID_ROUTE_BF16_BM64_RBN3072,
+        name="opus_moe2_afp8_wfp4_bf16_t64x256x256_sbm64_rbn3072",
+        out_mode=OPUS_A8W4_OUT_MODE_BF16,
+        block_m=64,
+        sort_block_m=64,
+        route_reduce="rbn3072",
+        block_threads=256,
+        min_blocks_per_cu=4,
+        pair_slots=2,
+        steady_pair_slots=1,
+        min_tuner_token=128,
+    ),
+    _route_stage2_instance(
+        kid=OPUS_A8W4_KID_ROUTE_BF16_BM64_RBN3584,
+        name="opus_moe2_afp8_wfp4_bf16_t64x256x256_sbm64_rbn3584",
+        out_mode=OPUS_A8W4_OUT_MODE_BF16,
+        block_m=64,
+        sort_block_m=64,
+        route_reduce="rbn3584",
+        block_threads=256,
+        min_blocks_per_cu=4,
+        pair_slots=2,
+        steady_pair_slots=1,
+        min_tuner_token=128,
+    ),
+    _route_stage2_instance(
+        kid=OPUS_A8W4_KID_ROUTE_BF16_BM64_RBN6144,
+        name="opus_moe2_afp8_wfp4_bf16_t64x256x256_sbm64_rbn6144",
+        out_mode=OPUS_A8W4_OUT_MODE_BF16,
+        block_m=64,
+        sort_block_m=64,
+        route_reduce="rbn6144",
+        block_threads=256,
+        min_blocks_per_cu=4,
+        pair_slots=2,
+        steady_pair_slots=1,
+        min_tuner_token=128,
     ),
 )
 
