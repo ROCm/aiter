@@ -65,11 +65,36 @@ def pack_i32x4_i32x8(lo, hi):
 
 
 def wait_barrier(count):
+    """``s_waitcnt vmcnt(count)`` then ``s_barrier``.
+
+    The VM wait constrains only the requests *this* wave issued; the barrier is
+    what the workgroup rendezvouses on. A bare ``s_barrier`` is neither -- it
+    does not drain anything, so it cannot stand in for a completion wait.
+    """
     _llvm.inline_asm(
         res=None,
         operands_=[],
         asm_string=f"s_waitcnt vmcnt({count})\ns_barrier",
         constraints="",
+        has_side_effects=True,
+    )
+
+
+def read_done_barrier():
+    """``s_waitcnt lgkmcnt(0)`` then ``s_barrier``: reads done before refill.
+
+    The leading wave group refills B0 one stage after the barrier the lagging
+    group's S0 pairs with, so the two groups need an explicit
+    read-complete -> rendezvous -> overwrite order on that slot. LDS reads
+    retire under LGKM, which the VM waits elsewhere in this kernel say nothing
+    about. The memory clobber keeps the compiler from sinking a DS read past
+    the barrier.
+    """
+    _llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string="s_waitcnt lgkmcnt(0)\ns_barrier",
+        constraints="~{memory}",
         has_side_effects=True,
     )
 
@@ -454,7 +479,9 @@ def compile_fp8_gemm_8w(
             b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
             a0_frag = a_s2r.load(a_cur0)
             a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
-            rocdl.s_barrier()
+            # The B0 slot just read is refilled by the peer group right after
+            # this rendezvous; make the reads complete before advertising it.
+            read_done_barrier()
 
             c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
 
@@ -471,9 +498,7 @@ def compile_fp8_gemm_8w(
             c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
 
             b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * B_K_STEP)
-            # Letting 2 * A + B loads stay outstanding here crosses the barrier
-            # with LDS writes still in flight that the next iteration reads.
-            wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B - 1)
+            wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
 
             c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
 
@@ -487,7 +512,12 @@ def compile_fp8_gemm_8w(
         k = K_ITERS - 2
         b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
         a0_frag = a_s2r.load(a_cur0)
-        rocdl.s_barrier()
+        # The peeled steps below pre-read step K_ITERS - 1's B0 and A0 -- B0 at
+        # the end of this step, A0 at the top of the next -- both *before* the
+        # last step's wait_barrier(0). Those tiles were issued two steps back,
+        # so drain them here, where the peer group's reads pair. The last
+        # step's wait stays: it still covers the final A1, issued below.
+        wait_barrier(0)
 
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
 

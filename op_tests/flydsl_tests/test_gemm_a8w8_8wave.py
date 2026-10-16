@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Correctness of the 8-wave a8w8 bpreshuffle GEMM at large grids.
+"""Correctness of the 8-wave a8w8 bpreshuffle GEMM.
 
-The main-loop barrier that ends each K step admits a bounded number of
-outstanding global->LDS loads. Admitting too many lets the barrier pass while
-writes the next step reads are still in flight, which shows up as a handful of
-wrong rows rather than a NaN -- small enough to pass for quantisation noise.
-Whether it happens at all depends on how the waves interleave, so a shape can
-be clean on one launch and wrong on the next; each shape is therefore run
-several times.
+The peeled tail pre-reads the last K step's B0 and A0 before the wait that
+covers their producers, so it can read LDS the producing loads have not
+finished writing. It shows up as a handful of wrong rows rather than a NaN --
+small enough to pass for quantisation noise. Whether it happens at all depends
+on how the waves interleave, so a shape can be clean on one launch and wrong on
+the next; each shape is therefore run several times.
+
+``K=256`` is the shape that pins the fix to the tail: ``K_ITERS == 2`` makes the
+main loop run zero times, so no amount of tightening *there* can cover it.
 """
 
 import argparse
@@ -24,9 +26,12 @@ torch.set_default_device("cuda")
 
 SUPPORTED_GFX = ["gfx950"]
 
-# (M, N, K, block_m, block_n), drawn from the tuned configs that select this
-# kernel. The two large ones are where the barrier count actually bites.
+# (M, N, K, block_m, block_n). Most are drawn from the tuned configs that
+# select this kernel; K=256 and K=512 are not tuned shapes but are legal, and
+# the first is the one the main loop cannot reach.
 SHAPES = [
+    (4096, 7168, 256, 256, 256),
+    (4096, 7168, 512, 256, 256),
     (1472, 3584, 7168, 128, 256),
     (3392, 2176, 7168, 128, 256),
     (3456, 7168, 4224, 128, 256),
