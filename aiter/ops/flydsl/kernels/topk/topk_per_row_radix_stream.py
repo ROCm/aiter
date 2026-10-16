@@ -384,6 +384,7 @@ def topk_per_row_radix_stream_window_cap(
     return _window_cap(k, block_threads, vec, unroll, soft_trigger)
 
 
+@lru_cache(maxsize=1024)
 def build_topk_per_row_radix_stream_module_for_width(
     k: int,
     wave_size: int,
