@@ -9,6 +9,7 @@ from flydsl.expr.typing import T, as_ir_value
 
 from ..mxfp4_kname import MXFP4_G1_VARIANTS
 from . import dpp_utils
+from .mxmoe_routes8 import expert_group, reset_index, route_row
 from .mxfp4_gemm_common import (
     _activation_mul_batch,
     _e8m0_from_amax,
@@ -31,6 +32,7 @@ from .mxfp4_gemm_common import (
     _umod,
     bq_bytes_for,
     bscale_bytes_for,
+    global_typed_ptr,
     k_half_for,
     kas_per_chunk_dw_for,
     kbs_per_expert_dw_for,
@@ -95,6 +97,8 @@ def _gemm1_body(
     k_wave=1,
     epi_splits=1,
     k_stages=kStages,
+    route_expert=None,
+    route_row_inline=None,
 ):
     # A-code tile bytes/row: fp4 packs 2 codes/byte (BK/2); fp8 is 1 B/elem (BK).
     KH_TILE = BK if a_dtype == "fp8" else BK // 2
@@ -145,7 +149,12 @@ def _gemm1_body(
 
     n_block_idx = bx_i32 % fx.Int32(NUM_N_BLOCKS)
     m_block_idx = bx_i32 // fx.Int32(NUM_N_BLOCKS)
-    e = rocdl.readfirstlane(T.i32, as_ir_value(_global_i32_at(arg_eids, m_block_idx)))
+    if const_expr(route_expert is None):
+        e = rocdl.readfirstlane(
+            T.i32, as_ir_value(_global_i32_at(arg_eids, m_block_idx))
+        )
+    else:
+        e = route_expert
     m_row = m_block_idx * fx.Int32(BM)
 
     lane_div_16 = lane // fx.Int32(16)
@@ -188,7 +197,11 @@ def _gemm1_body(
     cached_row_inline = None
     if const_expr(inline_quant):
         rcls = wave_n * fx.Int32(4) + lane_div_16
-        cached_row_inline = _global_i32_at(arg_mind, m_row + rcls)
+        cached_row_inline = (
+            _global_i32_at(arg_mind, m_row + rcls)
+            if route_row_inline is None
+            else route_row_inline
+        )
     elif const_expr(num_waves == 2):
         for load_group in range_constexpr(2):
             idx = (
@@ -1517,8 +1530,14 @@ def compile_gemm1_a4w4_port(
     native_scale_layout=False,
     num_waves=4,
     k_wave=1,
+    merge_routes8=False,
 ):
     """Compile GEMM1 with expert-sorted output."""
+    if merge_routes8:
+        assert (BM, D_HIDDEN, D_INTER, NE, BN, BK) == (16, 6144, 256, 257, 256, 256)
+        assert inline_quant and native_scale_layout and not interleave
+        assert a_dtype == out_dtype == "fp4" and act == "silu"
+        assert not enable_bias and num_waves == 4 and k_wave == 1
     if a_dtype not in ("fp4", "fp8"):
         raise AssertionError(f"a_dtype must be 'fp4' or 'fp8', got {a_dtype!r}")
     if (BM, use_nt, inline_quant) not in MXFP4_G1_VARIANTS[a_dtype]:
@@ -1623,6 +1642,8 @@ def compile_gemm1_a4w4_port(
     )
     if native_scale_layout:
         name_suffix += "_native_scale"
+    if merge_routes8:
+        name_suffix += "_merge8_reset"
     if out_dtype != "fp4":
         name_suffix += f"_o{out_dtype}"
     if act != "silu":
@@ -1671,8 +1692,11 @@ def compile_gemm1_a4w4_port(
         bx_i32 = fx.Int32(bx)
         lane = tx_i32 % fx.Int32(64)
         wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
-        cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
-        total_m_blocks = cumsum0 // fx.Int32(BM)
+        if const_expr(merge_routes8):
+            total_m_blocks = fx.Int32(65)
+        else:
+            cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
+            total_m_blocks = cumsum0 // fx.Int32(BM)
         bound = total_m_blocks * fx.Int32(NUM_N_BLOCKS)
 
         NXCD = 8
@@ -1693,51 +1717,71 @@ def compile_gemm1_a4w4_port(
             n_block = wig // group_size_m
             return m_block * fx.Int32(NUM_N_BLOCKS) + n_block
 
+        if const_expr(merge_routes8):
+            # Every launched CTA participates, including nonleaders: reset is
+            # complete before the following G2 kernel issues its BF16 atomics.
+            # Inline G1 does not read arg_aq, so its pointer carries the output.
+            reset_word, reset_valid = reset_index(bx_i32, tx_i32)
+            if reset_valid:
+                global_typed_ptr(arg_aq, T.i32)[reset_word] = fx.Int32(0)
+
         if bx_i32 < bound:
             if const_expr(xcd_swizzle > 0):
                 tile = _xcd(bx_i32)
             else:
                 tile = bx_i32
-            _gemm1_body(
-                lds_raw_ptr,
-                arg_aq,
-                arg_ascale,
-                arg_bq,
-                arg_bscale,
-                arg_eids,
-                arg_mind,
-                arg_aqout,
-                arg_ascaleout,
-                arg_hidden,
-                arg_bias,
-                tile,
-                lane,
-                wave,
-                use_nt,
-                i32_ntok,
-                total_m_blocks,
-                BM=BM,
-                BN=BN,
-                BK=BK,
-                inline_quant=inline_quant,
-                prefetch_hidden=prefetch_hidden,
-                a_dtype=a_dtype,
-                out_dtype=out_dtype,
-                act=act,
-                situ_beta=situ_beta,
-                situ_linear_beta=situ_linear_beta,
-                swiglu_limit=swiglu_limit,
-                enable_bias=enable_bias,
-                K=D_HIDDEN,
-                N_OUT=N_OUT,
-                NE=NE,
-                interleave=interleave,
-                native_scale_layout=native_scale_layout,
-                num_waves=num_waves,
-                k_wave=k_wave,
-                epi_splits=epi_splits,
-                k_stages=k_stages,
-            )
+            route_expert, route_row_inline = None, None
+            active = fx.Int32(1) == fx.Int32(1)
+            if const_expr(merge_routes8):
+                slot = tile // fx.Int32(NUM_N_BLOCKS)
+                route_expert, matches, active = expert_group(arg_mind, slot, lane)
+                packed, _, _ = route_row(
+                    matches, slot, wave * fx.Int32(4) + lane // fx.Int32(16)
+                )
+                route_row_inline = packed & fx.Int32(0x00FFFFFF)
+            if active:
+                _gemm1_body(
+                    lds_raw_ptr,
+                    arg_aq,
+                    arg_ascale,
+                    arg_bq,
+                    arg_bscale,
+                    arg_eids,
+                    arg_mind,
+                    arg_aqout,
+                    arg_ascaleout,
+                    arg_hidden,
+                    arg_bias,
+                    tile,
+                    lane,
+                    wave,
+                    use_nt,
+                    i32_ntok,
+                    total_m_blocks,
+                    BM=BM,
+                    BN=BN,
+                    BK=BK,
+                    inline_quant=inline_quant,
+                    prefetch_hidden=prefetch_hidden,
+                    a_dtype=a_dtype,
+                    out_dtype=out_dtype,
+                    act=act,
+                    situ_beta=situ_beta,
+                    situ_linear_beta=situ_linear_beta,
+                    swiglu_limit=swiglu_limit,
+                    enable_bias=enable_bias,
+                    K=D_HIDDEN,
+                    N_OUT=N_OUT,
+                    NE=NE,
+                    interleave=interleave,
+                    native_scale_layout=native_scale_layout,
+                    num_waves=num_waves,
+                    k_wave=k_wave,
+                    epi_splits=epi_splits,
+                    k_stages=k_stages,
+                    route_expert=route_expert,
+                    route_row_inline=route_row_inline,
+                )
 
     @flyc.jit
     def launch_gemm1(
