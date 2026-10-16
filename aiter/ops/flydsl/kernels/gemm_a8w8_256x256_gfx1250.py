@@ -133,7 +133,7 @@ def launch_gemm_a8w8_256x256(
     A_LDS_ROWS = tile_m // A_PAIR
     A_TDM_ROW = A_PAIR * SUPER_K
     A_LDS_ROW = A_TDM_ROW + LDS_PAD_A
-    C_LDS_ROW = tile_n  # TDM store cannot drain a padded LDS tile
+    C_LDS_ROW = tile_n + 8
     B_LDS_ROW = PACK_TK * 16 * KPAIR
     STAGE_A = A_LDS_ROWS * A_LDS_ROW
     STAGE_B = (tile_n // 16) * B_LDS_ROW
@@ -1131,22 +1131,16 @@ def launch_gemm_a8w8_256x256(
                 bounded_m=bounded_m,
             )
         else:
-            c_tile = (tile_m, tile_n)
-            gC_full = _gv(
-                gC_base,
-                c_off_rt - blk_m64 * ldc64 - blk_n64,
-                (i32_m, i32_n),
-                (ldc64, 1),
-            )
+            c_tile = (tile_m, C_LDS_ROW)
+            gtC = _gv(gC_base, c_off_rt, (mn_oob, tile_n), (ldc64, 1))
             atomC, coordC = fx.rocdl.cdna5.make_tiled_tdm_atom(
                 fx.rocdl.TensorStore(),
-                gC_full,
+                gtC,
                 fx.make_layout(c_tile, (C_LDS_ROW, 1)),
                 c_tile,
                 num_warps=num_waves,
             )
-            m_tile_idx = m_chunk * fx.Int32(fx.grid_dim.x) + bid_x
-            blkC = fx.zipped_divide(coordC, c_tile)[None, (m_tile_idx, None)]
+            blkC = fx.zipped_divide(coordC, c_tile)[None, (0, None)]
             sC = _view(
                 fx.recast_iter(partial_elem, base_ptr),
                 (c_tile, 1),
@@ -1155,7 +1149,7 @@ def launch_gemm_a8w8_256x256(
             tCs, tCg = fx.rocdl.cdna5.tdm_partition(
                 atomC, wave, fx.make_layout(num_waves, 1), sC, blkC
             )
-            fx.copy(atomC, tCs[None, 0], tCg[None, bid_y])
+            fx.copy(atomC, tCs[None, 0], tCg[None, 0])
             if const_expr(persistent_n_tiles == 1):
                 rocdl.s_wait_tensorcnt(0)
 

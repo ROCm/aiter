@@ -75,9 +75,11 @@ def emit_fused_splitk_epilogue(
     # Each scratch plane holds only the rotated peer rows, including on an M
     # tail; the output descriptor discards the invalid logical rows.
     partial_out = partial_base + fx.Int64(split_idx) * plane
-    out_tile = (peer_m, tile_n)
+    out_tile = (peer_m, c_lds_row)
     dst = fx.Tensor(
-        fx.make_view(partial_out, fx.make_layout(out_tile, (fx.Int64(tile_n), 1)))
+        fx.make_view(
+            partial_out, fx.make_layout((peer_m, tile_n), (fx.Int64(tile_n), 1))
+        )
     )
     store, out_coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
         fx.rocdl.TensorStore(cache_modifier=CPOL_STORE_DEVICE),
@@ -214,7 +216,7 @@ def emit_fused_splitk_epilogue(
 
     if const_expr(not lean):
         workgroup_barrier(use_cluster=False)
-        out_tile2 = (reduce_m, tile_n)
+        out_tile2 = (reduce_m, c_lds_row)
         tile_out = fx.Tensor(
             fx.make_view(output_base, fx.make_layout((valid_rows, tile_n), (ldc64, 1)))
         )
