@@ -123,10 +123,11 @@ def build_gemm(kc: KernelCtx) -> dict:
     cs_tile_n = TILE_N // 2  # intermediate cols produced by one n-tile
     N_ACC = M_REPEAT * NUM_ACC_N
     # GEMM2 (down-proj) pipeline geometry: A = the quantized intermediate [RG, I]
-    # (K-dim = I), B = W2 [H, I] (N-dim = H), output bf16 [RG, H]. tile_n2=128 keeps the
-    # cshuffle C tile (RG*tile_n2*f32) within the GEMM1-sized L_A pool. A's K tile step
-    # (A_K_STEP) and the A-ring stride (A_LDS_I32) are identical to GEMM1 (same TILE_K).
-    TILE_N2 = 128
+    # (K-dim = I), B = W2 [H, I] (N-dim = H), output bf16 [RG, H]. tile_n2=TILE_N=256
+    # (the L_A pool is sized RG*TILE_N*f32 for exactly this cshuffle) halves the n-tile
+    # count (-> fewer cbars) vs 128. A's K tile step (A_K_STEP) and the A-ring stride
+    # (A_LDS_I32) are identical to GEMM1 (same TILE_K).
+    TILE_N2 = TILE_N
     n_per_wave2 = TILE_N2 // NW
     cs_tile_n2 = TILE_N2  # no gate|up pairing -> output cols == n cols
     N_TILES2 = H // TILE_N2

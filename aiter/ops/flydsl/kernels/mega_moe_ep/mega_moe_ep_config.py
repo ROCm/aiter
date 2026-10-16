@@ -169,10 +169,13 @@ def mega_moe_ep_consts(
     NBW = ceildiv(EPR, 32)  # 32-bit words of the active-local-expert bitmap
     # GEMM geometry (mirrors compile_gemm1 so the stage1/stage2 atoms stage into the
     # layout they expect). FP4 halves the per-K-step A bytes; the A LDS pool
-    # double-buffers the K tile (and aliases the cshuffle epilogue).
+    # double-buffers the K tile (and aliases the cshuffle epilogue). The pool is sized
+    # for the LARGER of the two cshuffle tiles: GEMM1 writes RG*(TILE_N/2) f32 (gate|up
+    # paired), GEMM2 writes RG*TILE_N f32 (down-proj, tile_n2=TILE_N, no pairing) -- so
+    # the pool uses the GEMM2 cshuffle (RG*TILE_N*4), which also fits GEMM1's.
     a_k_step = TILE_K if a8 else TILE_K // 2
     a_lds_size = RG * a_k_step
-    lds_pool = max(2 * a_lds_size, RG * (TILE_N // 2) * 4)
+    lds_pool = max(2 * a_lds_size, RG * TILE_N * 4)
     c = {
         "RG": RG,
         "A_ROW": a_row,
