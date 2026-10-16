@@ -1,17 +1,28 @@
 {
-    "module_sparse_mla_bf16": {
+    "module_sparse_mla_fp8": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/kernels/mla/sparse_mla_bf16.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/hk/sparse_mla_bf16_common.cuh'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/hk/sparse_mla_bf16_full_lds.cuh'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/hk/sparse_mla_bf16_full_lds_pv.cuh'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/hk/sparse_mla_bf16_headtiles.cuh'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/hk/sparse_mla_bf16_reduce.cuh'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/hk/sparse_mla_bf16_wave4.cuh'"
+            "f'{AITER_CSRC_DIR}/kernels/mla/sparse_mla_fp8.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/kv_layout.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/layout.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/online_common.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/order.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/pad16_factored.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/params.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/partial_io.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/partial_layout.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/prefetch.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/pv_pipe.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/q_encode.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/reduce.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/rotating.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/small.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/softmax_lane.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/streaming.cu'"
         ],
-        "flags_extra_cc": ["'-DENABLE_CK=0'"],
+        "flags_extra_cc": [
+            "'-DENABLE_CK=0'"
+        ],
         "flags_extra_hip": [
-            "'-DKITTENS_CDNA4'",
             "'-fno-gpu-flush-denormals-to-zero'"
         ],
         "extra_ldflags": "None",
@@ -19,9 +30,7 @@
         "verbose": "False",
         "torch_exclude": "True",
         "blob_gen_cmd": "''",
-        "third_party": [
-            "'HipKittens'"
-        ],
+        "third_party": [],
         "is_experimental": "True"
     },
     "module_aiter_core": {
