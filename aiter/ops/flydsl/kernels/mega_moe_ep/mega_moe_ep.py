@@ -277,9 +277,13 @@ class MegaMoeEPEngine:
         self.w1s = shuffle_scale_a16w4(
             w1_scale.reshape(-1, self.H // 32).contiguous(), self.epr, True
         ).contiguous()
-        self.w2, self.w2s = (
-            t if t.is_contiguous() else t.contiguous() for t in (w2, w2_scale)
-        )
+        # GEMM2 is now the V2 pipelined path too: shuffle W2 + its scale into the
+        # down-proj (gate_up=False) B-layout the BWeightLoader / BScaleLoader read.
+        w2 = w2 if w2.is_contiguous() else w2.contiguous()
+        self.w2 = shuffle_weight_a16w4(w2, 16, False).contiguous()
+        self.w2s = shuffle_scale_a16w4(
+            w2_scale.reshape(-1, self.I // 32).contiguous(), self.epr, False
+        ).contiguous()
 
     def set_weights(self, w1, w1_scale, w2, w2_scale):
         self._bind_weights(w1, w1_scale, w2, w2_scale)

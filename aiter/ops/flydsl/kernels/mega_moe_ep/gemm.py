@@ -62,6 +62,7 @@ from .mega_moe_ep_config import (
     C_BARGEN,
     NT,
     NW,
+    TILE_K,
     TILE_N,
     KernelCtx,
 )
@@ -121,6 +122,18 @@ def build_gemm(kc: KernelCtx) -> dict:
     n_per_wave = TILE_N // NW  # GEMM1 output cols per wave of one n-tile
     cs_tile_n = TILE_N // 2  # intermediate cols produced by one n-tile
     N_ACC = M_REPEAT * NUM_ACC_N
+    # GEMM2 (down-proj) pipeline geometry: A = the quantized intermediate [RG, I]
+    # (K-dim = I), B = W2 [H, I] (N-dim = H), output bf16 [RG, H]. tile_n2=128 keeps the
+    # cshuffle C tile (RG*tile_n2*f32) within the GEMM1-sized L_A pool. A's K tile step
+    # (A_K_STEP) and the A-ring stride (A_LDS_I32) are identical to GEMM1 (same TILE_K).
+    TILE_N2 = 128
+    n_per_wave2 = TILE_N2 // NW
+    cs_tile_n2 = TILE_N2  # no gate|up pairing -> output cols == n cols
+    N_TILES2 = H // TILE_N2
+    NUM_ACC_N2 = (TILE_N2 // NW) // 16
+    K_ITERS2 = I // TILE_K
+    N_ACC2 = M_REPEAT * NUM_ACC_N2
+    INTER_NBYTES = 256 * 64 * inter_row_bytes  # cosmetic x_tensor extent (NCTA*rg_max)
 
     def _act_batch(gs, us):
         return _activation_mul_batch(
@@ -409,8 +422,143 @@ def build_gemm(kc: KernelCtx) -> dict:
         for nt_ in range(i32(0), i32(N_TILES), i32(1)):
             _run_ntile(i32(nt_))
 
+    # ============================ GEMM2 (pipelined) ==============================
+    def _epilogue_g2(L, tid, acc, n_tile, cptr, r_gout):
+        """CShuffle the GEMM2 accumulators -> bf16 -> ``gout`` (row-major
+        [bid*RG+row, H]) with ``cbar`` syncs.  No activation / quant (combine_final
+        applies the top-k weight).  All RG rows are written (combine_send reads only the
+        valid prefix), so no dynamic per-row guard is needed."""
+        bid = i32(gpu.block_id("x"))
+        wave = tid // i32(64)
+        lane = tid % i32(64)
+        l16 = lane % i32(16)
+        ld4 = (lane // i32(16)) * i32(4)
+        cbase = wave * i32(cs_tile_n2 // NW)
+        for mi in range_constexpr(M_REPEAT):
+            for ni in range_constexpr(NUM_ACC_N2):
+                v4 = fx.Vector(acc[mi * NUM_ACC_N2 + ni])
+                col = cbase + i32(ni * 16) + l16
+                for ii in range_constexpr(4):
+                    row = i32(mi * 16) + ld4 + i32(ii)
+                    idx = row * i32(cs_tile_n2) + col
+                    ptr = fx.add_offset(cptr, fx.make_int_tuple(idx))
+                    fx.ptr_store(fx.Vector.from_elements([v4[ii]], fx.Float32), ptr)
+        cbar(L, tid)
+        EVEC2 = 8
+        NLANE2 = cs_tile_n2 // EVEC2
+        rows_per_iter = NW * 64 // NLANE2
+        mlane = tid // i32(NLANE2)
+        nlane = tid % i32(NLANE2)
+        m_reps = RG // rows_per_iter
+        n_reps = cs_tile_n2 // (NLANE2 * EVEC2)
+        for mr in range_constexpr(m_reps):
+            row = i32(mr * rows_per_iter) + mlane
+            obase = (bid * i32(RG) + row) * i32(H)  # gout bf16 row base
+            for nr in range_constexpr(n_reps):
+                col0 = i32(nr * NLANE2 * EVEC2) + nlane * i32(EVEC2)
+                idx = row * i32(cs_tile_n2) + col0
+                f32_iter = fx.recast_iter(
+                    fx.Float32, fx.add_offset(cptr, fx.make_int_tuple(idx))
+                )
+                frag = fx.make_view(f32_iter, fx.make_layout(EVEC2, 1)).load()
+                gcol = i32(n_tile) * i32(cs_tile_n2) + col0
+                ov = fx.Vector.from_elements(
+                    [fx.Float32(frag[v]).to(fx.BFloat16) for v in range(EVEC2)],
+                    fx.BFloat16,
+                )
+                bst(ov, r_gout, (obase + gcol) * i32(2), 0, 0)
+        wait_lgkm0()
+        cbar(L, tid)
+
     @flyc.jit
-    def gemm2(L, tid, a, expert, rows, src_out):
+    def gemm2_pipe(L, tid, a, expert, rows, src_out):
+        """GEMM2 (intermediate x W2 -> bf16 gout), pipelined via the gemm_util atoms:
+        A = this CTA's quantized intermediate (non-indexed row tile at bid*RG, A-scale
+        = ``inters``), B = W2 (shuffled, gate_up=False), cshuffle -> bf16 -> gout."""
+        del rows
+        bid = i32(gpu.block_id("x"))
+        inter_tensor = _global_byte_tensor(fx.Int64(a["inter"]), INTER_NBYTES)
+        a_gather = ATileLoader(
+            row_bytes=inter_row_bytes,
+            sort_block_m=RG,
+            k_step_bytes=A_K_STEP,
+            total_threads=NT,
+            swizzle=True,
+            x_tensor=inter_tensor,
+            async_copy=False,
+            indexed_input=False,
+            a_dtype=a_dtype,
+        )
+        a_s2r = AS2RLoader(k_step_bytes=A_K_STEP, swizzle=True, a_dtype=a_dtype)
+        w_rsrc = ptr_buf_tensor(
+            fx.Int64(a["w2"]) + fx.Int64(expert) * fx.Int64(H * (I // 2)),
+            fx.Int32,
+            unit_elems=4,
+        )
+        b_loader = BWeightLoader(w_rsrc=w_rsrc, num_acc_n=NUM_ACC_N2, model_dim=I)
+        sw_rsrc = ptr_buf_tensor(
+            fx.Int64(a["w2s"]) + fx.Int64(expert) * fx.Int64(H * (I // 32)), fx.Int32
+        )
+        b_scale = BScaleLoader(scale_rsrc=sw_rsrc, num_acc_n=NUM_ACC_N2, model_dim=I)
+        sx_rsrc = ptr_buf_tensor(fx.Int64(a["inters"]), fx.Int32, unit_elems=4)
+        a_scale = AScaleLoader(
+            scale_rsrc=sx_rsrc,
+            m_repeat=M_REPEAT,
+            model_dim=I,
+            sort_block_m=RG,
+            total_threads=NT,
+            indexed_input=False,
+        )
+        mfma_gu = MfmaScaleGU(m_repeat=M_REPEAT, num_acc_n=NUM_ACC_N2, a_dtype=a_dtype)
+        a_buf = _LdsView(_lds_byte_ptr(L, L_A))
+        a_scale_lds = _LdsView(_lds_byte_ptr(L, L_AS))
+        cptr = _lds_f32_ptr(L, L_A)
+        wave_id = tid // i32(64)
+        tib = bid * i32(RG)
+        a_gather.for_tile(tib)
+
+        def _run_ntile(nt):
+            cbar(L, tid)
+            b_row = wave_id * i32(n_per_wave2) + nt * i32(TILE_N2)
+            a_gather.store(a_buf, a_gather.load_regs(i32(0)), i32(0))
+            a_scale.stage(a_scale_lds, tib)
+            cbar(L, tid)
+            b_prev = b_loader.load_step(b_row, i32(0))
+            acc = [mfma_gu.zero_value for _ in range(N_ACC2)]
+            for sp in range_constexpr(K_ITERS2 - 1):
+                cur_off = (sp & 1) * A_LDS_I32
+                nxt_off = ((sp + 1) & 1) * A_LDS_I32
+                spn = sp + 1
+                sb = b_scale.load_step(b_row, i32(sp))
+                sa = a_scale.load_step(a_scale_lds, i32(sp))
+
+                def _al(mi, ks, _b=cur_off):
+                    return a_s2r.load_operand(a_buf, mi, ks, i32(_b))
+
+                a_regs = a_gather.load_regs(i32(spn * A_K_STEP))
+
+                def _ln(ni, _k=spn, _br=b_row):
+                    return b_loader.load_ni(_br, ni, i32(_k))
+
+                acc, b_prev = mfma_gu.call_pipe(_al, b_prev, acc, sa, sb, _ln)
+                a_gather.store(a_buf, a_regs, i32(nxt_off))
+                cbar(L, tid)
+            final_off = ((K_ITERS2 - 1) & 1) * A_LDS_I32
+
+            def _alf(mi, ks, _b=final_off):
+                return a_s2r.load_operand(a_buf, mi, ks, i32(_b))
+
+            sb = b_scale.load_step(b_row, i32(K_ITERS2 - 1))
+            sa = a_scale.load_step(a_scale_lds, i32(K_ITERS2 - 1))
+            acc = mfma_gu.call_pipe_am_final(_alf, b_prev, acc, sa, sb)
+            cbar(L, tid)
+            _epilogue_g2(L, tid, acc, nt, cptr, src_out)
+
+        for nt_ in range(i32(0), i32(N_TILES2), i32(1)):
+            _run_ntile(i32(nt_))
+
+    @flyc.jit
+    def _gemm2_naive(L, tid, a, expert, rows, src_out):
         """GEMM2 (intermediate x W2) -> model_dim bf16 rows into ``src_out`` (gout)."""
         del L
         lane = tid % i32(64)
@@ -456,5 +604,8 @@ def build_gemm(kc: KernelCtx) -> dict:
                         )
                         bst(ov, src_out, (obase + row * i32(H) + col) * i32(2), 0, 0)
         del rows
+
+    # Select the pipelined GEMM2 (the naive path is kept as a fallback for debugging).
+    gemm2 = gemm2_pipe
 
     return locals()
