@@ -26,10 +26,15 @@ here. Update this file in the same change as any behaviour change.
    `Unknown config key 'X' in <DEFAULT.json>: add it to SEARCH_SPACE in space.py first`. Never pin
    or skip it silently.
 3. The whole `SEARCH_SPACE` is swept. No CLI overrides, no caps, no sampling. Pruning is: the
-   shape filters, `should_skip_generic`, `exceeds_lds` and `exceeds_registers` (fp32 accumulator per
-   thread above `MAX_ACC_PER_THREAD`: 512 on gfx1250, 256 elsewhere) in `space.py`, then the kernel's own
-   `should_skip(config)`. Every rule returns True to reject; `build_space` reads as separate
-   `if ...: continue` checks. When the kernel rejects every tile that fits the shape, `build_space`
+   shape filters, `drop_repeated_load_policies` (a `cache_modifier` value that sets the same load
+   policy as another value on the arch, from `SAME_LOAD_POLICY`), `should_skip_generic`,
+   `exceeds_lds`, `exceeds_registers` (fp32 accumulator per thread above `MAX_ACC_PER_THREAD`:
+   512 on gfx1250, 256 elsewhere) and, for Triton only, `exceeds_operand_registers` (operands +
+   accumulator above twice that) in `space.py`, then the kernel's own `should_skip(config)`.
+   Every rule returns True to reject; `build_space` reads as separate `if ...: continue` checks.
+   The worker then compiles each candidate without a launch and records it as `skipped` (with
+   the `reason`) when the compiled kernels overflow LDS or spill registers
+   (`exceeds_compiled_resources`); the baseline is always timed. When the kernel rejects every tile that fits the shape, `build_space`
    allows block sizes above the shape for that M (`oversized_tiles_allowed` in the plan). `gluon_candidates` is only for a key whose meaning differs under
    gluon (gfx1250 a8w8 blockscale `num_stages` is `NUM_BUFFERS`).
 4. Results always install into `resolve_config_dir(op, config_name, backend)`. No export directory,
@@ -63,7 +68,13 @@ here. Update this file in the same change as any behaviour change.
    the baseline and the ten fastest candidates of the current plan on the first GPU into
    `<results>.final.jsonl`, with the same crash/hang recovery as the sweep; when that file exists
    the installer uses only it, so a later run (even on one GPU) always refreshes it, and an M timed
-   on several GPUs without it is skipped. Never two drivers on one GPU.
+   on several GPUs without it is skipped. Never two drivers on one GPU. Each timing worker times
+   the installed config on its own GPU first (`reference`) and records `rel` = time / that
+   reference; screening and the final-round shortlist compare `rel`, so GPU-to-GPU differences
+   do not decide. `--screen X` stops a candidate after one replay when its `rel` is above X
+   times the lowest `rel` of its M so far (at most 1, the installed config) (`screened`); it
+   never applies to the baseline or the final round, and screened records stay in the
+   final-round shortlist.
 9. Call the public wrappers (`aiter.ops.triton.gemm...`) only, never `_triton_kernels` or
    `_gluon_kernels`; pass `backend=` where the wrapper takes it and refuse a backend the wrapper
    cannot select (`KernelSpec.supports`).

@@ -4,14 +4,17 @@
 
 Flow: set the kernel up once (inputs, call, should_skip), then
   --plan     build the space (space.build_space) and write it as JSON for the driver
-  --configs  for each candidate: warm up (compiles) -> capture a CUDA graph over cold input
-             copies -> replay -> append one record to --out
+  --configs  for each candidate: compile without launching -> skip it when the compiled
+             kernels overflow LDS or spill registers -> warm up -> capture a CUDA graph over
+             cold input copies -> replay -> append one record to --out
 
 --configs is a JSON list of config dicts; null is the baseline, the wrapper called with
 config=None (the installed config). Records are appended as soon as a candidate finishes.
 
 Record fields:
-  status    ready (worker is set up), start (candidate began), ok, error
+  status    ready (worker is set up), reference (us: the installed config on this GPU, timed
+            before the candidates), start (candidate began), ok, error, skipped (the compiled
+            kernels overflow LDS or spill registers; reason says which)
   baseline  true for the installed config
   config    the raw candidate, never the mutated copy; for the baseline the installed config
             (launched through the wrapper's own config=None path unless keys DEFAULT.json does
@@ -19,6 +22,10 @@ Record fields:
   gpu       HIP_VISIBLE_DEVICES of the worker
   is_tuned  baseline only: a specialized file served this shape
   us, us_min, us_max, tflops   per-launch time from graph replay (median, min, max)
+  rel       us / the reference (the installed config on the same GPU): GPUs differ by a few
+            percent, so screening and the final-round shortlist compare rel, not us
+  screened  true when one replay was already above --screen x the lowest rel of this M (the
+            reference is 1): the candidate stopped there and us is that replay
   error     the exception text when status is error
   dur_s     wall time of the candidate
 """
@@ -30,8 +37,9 @@ import json
 import os
 import sys
 import time
+from collections import namedtuple
 
-from _utils import add_shape_args, append_record, shape_from_args
+from _utils import add_shape_args, append_record, read_records, shape_from_args
 from kernels import (
     check_backend,
     ensure_repo_on_path,
@@ -40,7 +48,12 @@ from kernels import (
     get_spec,
     resolve_installed,
 )
-from space import UnknownConfigKey, build_space, load_defaults
+from space import (
+    UnknownConfigKey,
+    build_space,
+    exceeds_compiled_resources,
+    load_defaults,
+)
 
 
 def make_cold_copies(inputs, cold_mb):
@@ -62,18 +75,34 @@ def make_cold_copies(inputs, cold_mb):
     return [tuple(inputs)] + [tuple(clone(a) for a in inputs) for _ in range(n - 1)]
 
 
-def time_with_cuda_graph(call, config, copies, calls=24, replays=25):
+Timing = namedtuple("Timing", "median low high screened")
+
+
+def time_with_cuda_graph(call, config, copies, calls=24, replays=25, abort_above=None):
     """Median/min/max microseconds per launch: one eager warm-up (compiles), then graph replay.
 
-    Every launch gets a deep copy of config because the wrappers mutate it.
+    Every launch gets a deep copy of config because the wrappers mutate it. With abort_above
+    (microseconds per launch), one replay after the first warm-up replay decides: a candidate
+    slower than that stops there (screened), so a far-off candidate costs a few launches. A
+    candidate whose eager warm-up alone takes over 1 ms and 1.25x abort_above stops right
+    there: at that length the launch overhead in the eager time does not matter, and the
+    margin covers the cold caches of a first launch.
     """
     import torch
 
     stream = torch.cuda.Stream()
     n_calls = max(calls, len(copies))
     with torch.cuda.stream(stream):
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
+            enable_timing=True
+        )
+        start.record()
         call(copy.deepcopy(config), *copies[0])
+        end.record()
         torch.cuda.synchronize()
+        eager = start.elapsed_time(end) * 1e3
+        if abort_above is not None and eager > max(1.25 * abort_above, 1000):
+            return Timing(eager, eager, eager, True)
         graph = torch.cuda.CUDAGraph()
         gc.disable()
         try:
@@ -83,11 +112,8 @@ def time_with_cuda_graph(call, config, copies, calls=24, replays=25):
         finally:
             gc.enable()
     torch.cuda.synchronize()
-    for _ in range(3):
-        graph.replay()
-    torch.cuda.synchronize()
-    times = []
-    for _ in range(replays):
+
+    def timed_replay():
         start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
             enable_timing=True
         )
@@ -95,9 +121,38 @@ def time_with_cuda_graph(call, config, copies, calls=24, replays=25):
         graph.replay()
         end.record()
         end.synchronize()
-        times.append(start.elapsed_time(end) * 1e3 / n_calls)
-    times.sort()
-    return times[len(times) // 2], times[0], times[-1]
+        return start.elapsed_time(end) * 1e3 / n_calls
+
+    graph.replay()
+    if abort_above is not None:
+        first = timed_replay()
+        if first > abort_above:
+            return Timing(first, first, first, True)
+    for _ in range(2):
+        graph.replay()
+    torch.cuda.synchronize()
+    times = sorted(timed_replay() for _ in range(replays))
+    return Timing(times[len(times) // 2], times[0], times[-1], False)
+
+
+def compile_only(call, config, inputs):
+    """Run the wrapper with every kernel launch turned into a compile; returns the compiled kernels."""
+    from triton.runtime import jit
+
+    compiled = []
+    launch = jit.JITFunction.run
+
+    def compile_instead(self, *args, grid, warmup, **kwargs):
+        kernel = launch(self, *args, grid=grid, warmup=True, **kwargs)
+        compiled.append(kernel)
+        return kernel
+
+    jit.JITFunction.run = compile_instead
+    try:
+        call(copy.deepcopy(config), *inputs)
+    finally:
+        jit.JITFunction.run = launch
+    return [kernel for kernel in compiled if kernel is not None]
 
 
 def gpu_alive():
@@ -131,8 +186,41 @@ def plan(spec, shape, backend, arch, should_skip, space_out):
     return 0
 
 
+def fastest_rel(out):
+    """Lowest rel of the fully timed ok records of this results file (all GPUs), or None."""
+    rels = [
+        r["rel"]
+        for r in read_records(out).values()
+        if r["status"] == "ok" and not r.get("screened") and "rel" in r
+    ]
+    return min(rels, default=None)
+
+
+def reference_time(spec, shape, backend, keys, call, copies, calls, replays):
+    """This GPU's time for the installed config, or None when it does not run."""
+    installed, _ = resolve_installed(spec, shape, backend)
+    config = None
+    if any(k not in keys for k in installed):  # launch it as the baseline record does
+        config = {k: v for k, v in installed.items() if k in keys}
+    try:
+        return time_with_cuda_graph(call, config, copies, calls, replays).median
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def benchmark(
-    spec, shape, backend, arch, call, inputs, candidates, out, calls, replays, cold_mb
+    spec,
+    shape,
+    backend,
+    arch,
+    call,
+    inputs,
+    candidates,
+    out,
+    calls,
+    replays,
+    cold_mb,
+    screen,
 ):
     keys, _, _ = load_defaults(spec, backend)
     copies = make_cold_copies(inputs, cold_mb)
@@ -154,6 +242,10 @@ def benchmark(
             cold_mb=cold_mb,
         ),
     )
+    reference = reference_time(spec, shape, backend, keys, call, copies, calls, replays)
+    append_record(out, dict(common, status="reference", us=reference))
+    # the best rel so far: the installed config is 1, and rel makes every GPU's records count
+    best_rel = min(fastest_rel(out) or 1.0, 1.0) if screen and reference else None
     print("ready", flush=True)  # the driver's watchdog reads the worker's log
     for candidate in candidates:
         is_baseline = candidate is None
@@ -171,15 +263,33 @@ def benchmark(
                     record["dropped_keys"] = dropped
                     candidate = record["config"]
                 # otherwise candidate stays None: the wrapper's own installed-config path
-            median, low, high = time_with_cuda_graph(
-                call, candidate, copies, calls, replays
-            )
-            record.update(
-                us=round(median, 3),
-                us_min=round(low, 3),
-                us_max=round(high, 3),
-                tflops=round(flops(shape) / median / 1e6, 2),
-            )
+            else:
+                # the baseline is always timed; a candidate only when its kernels fit
+                reason = exceeds_compiled_resources(
+                    compile_only(call, candidate, copies[0])
+                )
+                if reason:
+                    record.update(status="skipped", reason=reason)
+            if record["status"] == "ok":
+                # the baseline is never screened
+                abort_above = None
+                if best_rel and not is_baseline:
+                    abort_above = screen * best_rel * reference  # in this GPU's us
+                timing = time_with_cuda_graph(
+                    call, candidate, copies, calls, replays, abort_above
+                )
+                record.update(
+                    us=round(timing.median, 3),
+                    us_min=round(timing.low, 3),
+                    us_max=round(timing.high, 3),
+                    tflops=round(flops(shape) / timing.median / 1e6, 2),
+                )
+                if reference:
+                    record["rel"] = round(timing.median / reference, 4)
+                if timing.screened:
+                    record["screened"] = True
+                elif best_rel:
+                    best_rel = min(best_rel, record["rel"])
         except Exception as e:  # noqa: BLE001
             # a failing candidate is a result, not a crash
             record.update(
@@ -217,6 +327,13 @@ def main(argv=None):
     parser.add_argument(
         "--cold-mb", type=int, default=1024, help="byte budget for cold input copies"
     )
+    parser.add_argument(
+        "--screen",
+        type=float,
+        default=0,
+        help="stop a candidate after one replay when its rel is above this x the lowest rel "
+        "so far (0: off)",
+    )
     args = parser.parse_args(argv)
 
     spec = args.kernel
@@ -245,6 +362,7 @@ def main(argv=None):
         args.calls,
         args.replays,
         args.cold_mb,
+        args.screen,
     )
     return 0
 
