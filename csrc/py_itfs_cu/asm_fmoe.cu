@@ -272,6 +272,19 @@ class FMoeKernel
     };
 };
 
+// The SwiGLU OAI MXFP4 FLAT kernels (16x32/16x128/16x256) cover inter_dim in 128-row
+// blocks; a 16x256 tile whose second half lies past inter_dim (inter_dim % 256 == 128)
+// is masked in-kernel. Other inter_dim values are not supported: reject them here
+// rather than launch a kernel that reads past the expert's weights.
+static void check_swiglu_oai_flat_inter_dim(const CFG* cfgs, int inter_dim)
+{
+    if(cfgs == &cfg_fmoe_bf16_pertokenMXfp4_g1u1_swiglu_oai)
+        AITER_CHECK(inter_dim % 128 == 0,
+                    __func__,
+                    " SwiGLU OAI MXFP4 FLAT asm kernels need inter_dim % 128 == 0, got " +
+                        std::to_string(inter_dim));
+}
+
 FMoeKernel* get_heuristic_kernel(
     int inter_dim, int sub_X_cnt, CFG* cfgs, int smf = 0, std::string kernel_name = "", int block_size_M = 32)
 {
@@ -644,6 +657,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_swiglu_oai;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1. ");
+        check_swiglu_oai_flat_inter_dim(config_map, inter_dim);
         impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
         impl_ptr->set_4bit(true);
         is_mxfp4 = true;
@@ -668,6 +682,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_swiglu_oai;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1 (bf16 X). ");
+        check_swiglu_oai_flat_inter_dim(config_map, inter_dim);
         impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
         impl_ptr->set_4bit(true);
         is_mxfp4 = true;
