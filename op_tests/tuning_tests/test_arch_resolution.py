@@ -19,6 +19,8 @@ Covers:
   - shipped untuned shape lists are tunable on the running arch
 """
 
+import collections
+import glob
 import os
 import unittest
 from unittest import mock
@@ -99,10 +101,27 @@ class TestPciChipId(unittest.TestCase):
     MaxAvailableVgprsPerThread and returns 512 on every device.
     """
 
-    def test_returns_none_when_hip_unavailable(self):
+    # _load_hip_runtime() is lru_cached, so patching ctypes.CDLL underneath it
+    # does nothing once the real library has been loaded by any earlier call.
+    # Patch the loader itself, which is also the contract these tests care about.
+    LOADER = "aiter.jit.utils.chip_info._load_hip_runtime"
+
+    def test_returns_none_when_hip_cannot_be_loaded(self):
         from aiter.jit.utils import chip_info
 
-        with mock.patch("ctypes.CDLL", side_effect=OSError("no libamdhip64")):
+        # OSError on Linux (missing .so); RuntimeError is how _load_hip_runtime
+        # reports "no amdhip64*.dll found" on Windows. Both must degrade, not raise.
+        for exc in (OSError("no libamdhip64"), RuntimeError("no HIP runtime")):
+            with self.subTest(exc=type(exc).__name__):
+                with mock.patch(self.LOADER, side_effect=exc):
+                    self.assertIsNone(chip_info._get_pci_chip_id())
+
+    def test_returns_none_when_symbol_is_missing(self):
+        from aiter.jit.utils import chip_info
+
+        lib = mock.MagicMock()
+        del lib.hipDeviceGetPCIBusId  # attribute lookup raises AttributeError
+        with mock.patch(self.LOADER, return_value=lib):
             self.assertIsNone(chip_info._get_pci_chip_id())
 
     def test_returns_none_when_query_fails(self):
@@ -110,21 +129,33 @@ class TestPciChipId(unittest.TestCase):
 
         lib = mock.MagicMock()
         lib.hipDeviceGetPCIBusId.return_value = 1  # non-zero == failure
-        with mock.patch("ctypes.CDLL", return_value=lib):
+        with mock.patch(self.LOADER, return_value=lib):
             self.assertIsNone(chip_info._get_pci_chip_id())
+
+    def test_returns_none_when_sysfs_is_absent(self):
+        # Windows has no /sys/bus/pci; the id is simply unknown there.
+        from aiter.jit.utils import chip_info
+
+        lib = mock.MagicMock()
+        lib.hipDeviceGetPCIBusId.side_effect = self._fill_bus_id
+        with mock.patch(self.LOADER, return_value=lib), mock.patch(
+            "builtins.open", side_effect=FileNotFoundError
+        ):
+            self.assertIsNone(chip_info._get_pci_chip_id())
+
+    @staticmethod
+    def _fill_bus_id(buf, size, device_id):
+        buf.value = b"0000:01:00.0"
+        return 0
 
     def test_reads_the_id_from_sysfs_via_the_bus_id(self):
         from aiter.jit.utils import chip_info
 
-        def _fill_bus_id(buf, size, device_id):
-            buf.value = b"0000:01:00.0"
-            return 0
-
         lib = mock.MagicMock()
-        lib.hipDeviceGetPCIBusId.side_effect = _fill_bus_id
+        lib.hipDeviceGetPCIBusId.side_effect = self._fill_bus_id
         opener = mock.mock_open(read_data="0x74a0\n")
 
-        with mock.patch("ctypes.CDLL", return_value=lib), mock.patch(
+        with mock.patch(self.LOADER, return_value=lib), mock.patch(
             "builtins.open", opener
         ):
             self.assertEqual(chip_info._get_pci_chip_id(), MI300A_CHIP_ID)
@@ -268,10 +299,21 @@ class TestShippedShapeListsAreTunable(unittest.TestCase):
     otherwise it aborts with "Unsupported dtype" and cannot be tuned."""
 
     DTYPE_COLUMNS = ("q_dtype_a", "q_dtype_w", "dtype")
-    SHAPE_LISTS = (
+    # Globs rather than fixed names so a newly added model shape list is
+    # covered automatically. a8w8_bpreshuffle is included deliberately: its
+    # tuner drops any row whose q_dtype_w != dtypes.fp8, so an unresolved
+    # e4m3fn there is silently skipped rather than loudly rejected.
+    SHAPE_LIST_GLOBS = (
         "aiter/configs/untuned_fmoe.csv",
         "aiter/configs/a8w8_untuned_gemm.csv",
+        "aiter/configs/*bpreshuffle_untuned_gemm*.csv",
+        "aiter/configs/model_configs/*bpreshuffle_untuned_gemm*.csv",
+        "aiter/configs/model_configs/*untuned_fmoe*.csv",
     )
+
+    def _shape_lists(self, root):
+        for pattern in self.SHAPE_LIST_GLOBS:
+            yield from sorted(glob.glob(os.path.join(root, pattern)))
 
     def test_normalization_makes_every_fp8_shape_arch_native(self):
         import csv
@@ -280,70 +322,150 @@ class TestShippedShapeListsAreTunable(unittest.TestCase):
 
         from aiter import dtypes
         from aiter.jit.core import AITER_ROOT_DIR
+        from aiter.utility.base_tuner import TunerCommon
 
         if dtypes.fp8 not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
             self.skipTest("arch has no native e4m3 (fp8 falls back to uint8)")
-        foreign = (
-            torch.float8_e4m3fn
-            if dtypes.fp8 is torch.float8_e4m3fnuz
-            else torch.float8_e4m3fnuz
-        )
+        native = str(dtypes.fp8)
 
-        checked = 0
-        for rel in self.SHAPE_LISTS:
-            path = os.path.join(AITER_ROOT_DIR, rel)
-            if not os.path.exists(path):
-                continue
+        checked = collections.Counter()
+        for path in self._shape_lists(AITER_ROOT_DIR):
+            name = os.path.basename(path)
             with open(path) as f:
-                for row in csv.DictReader(f):
-                    for col in self.DTYPE_COLUMNS:
+                reader = csv.DictReader(f)
+                cols = [c for c in self.DTYPE_COLUMNS if c in (reader.fieldnames or [])]
+                if not cols:
+                    continue
+                for row in reader:
+                    for col in cols:
                         raw = (row.get(col) or "").strip()
                         if not raw.startswith("torch.float8_e4m3"):
                             continue
-                        resolved = dtypes.normalize_fp8_dtype(eval(raw))
-                        self.assertIsNot(
+                        # Exercise the shared loader's resolver, which is what
+                        # every tuner family now runs on ingest.
+                        resolved = TunerCommon._resolve_fp8_name(raw)
+                        self.assertEqual(
                             resolved,
-                            foreign,
-                            f"{rel}:{col}={raw} still names the non-native e4m3 "
-                            f"encoding after normalization",
+                            native,
+                            f"{name}:{col}={raw} does not resolve to the "
+                            f"arch-native encoding {native}",
                         )
-                        self.assertIs(resolved, dtypes.fp8)
-                        checked += 1
-        self.assertGreater(checked, 0, "no fp8 shapes found to check")
+                        checked[name] += 1
+        self.assertTrue(checked, "no fp8 shapes found to check")
+
+    def test_bpreshuffle_lists_are_covered(self):
+        """The bpreshuffle family is the one that fails silently.
+
+        Its tuner returns [] for any row whose q_dtype_w is not dtypes.fp8, so
+        on gfx942 an unresolved e4m3fn shape is skipped with a warning rather
+        than raising. Guard that at least one such list is actually in scope.
+        """
+        from aiter.jit.core import AITER_ROOT_DIR
+
+        lists = [p for p in self._shape_lists(AITER_ROOT_DIR) if "bpreshuffle" in p]
+        self.assertTrue(lists, "no bpreshuffle shape lists matched the globs")
+
+    def test_resolver_handles_whitespace_and_unknown_names(self):
+        import torch
+
+        from aiter import dtypes
+        from aiter.utility.base_tuner import TunerCommon
+
+        if dtypes.fp8 not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            self.skipTest("arch has no native e4m3 (fp8 falls back to uint8)")
+        native = str(dtypes.fp8)
+        # Leading/trailing whitespace must not defeat the match.
+        self.assertEqual(
+            TunerCommon._resolve_fp8_name("  torch.float8_e4m3fn "), native
+        )
+        self.assertEqual(TunerCommon._resolve_fp8_name("torch.float8_e4m3fnuz"), native)
+        # Anything else is returned untouched, including values that would be
+        # dangerous to eval().
+        for passthrough in (
+            "torch.int8",
+            "torch.bfloat16",
+            "torch.float8_e5m2",
+            "torch.float8_e4m3_not_a_dtype",
+            "__import__('os').system('true')",
+            "",
+            None,
+            3,
+        ):
+            self.assertEqual(TunerCommon._resolve_fp8_name(passthrough), passthrough)
 
 
 class TestTunedConfigArchConsistency(unittest.TestCase):
-    """Every tuned row keyed on cu_num=228 must also be keyed gfx942, or the
-    build-time filter and the runtime lookup will disagree."""
+    """Every tuned row keyed on cu_num=228 must resolve to gfx942, or the
+    build-time codegen filter and the runtime lookup will disagree.
 
-    def test_cu228_rows_are_gfx942(self):
+    Not every tuned family carries a gfx column: the older ones (tuned_fmoe.csv
+    among them) are keyed on cu_num alone and have their arch backfilled by
+    gfx_from_cu_num at load time. Assert on the *resolved* arch, which is what
+    dispatch actually keys on, rather than requiring a literal column.
+    """
+
+    def test_cu228_rows_resolve_to_gfx942(self):
         import csv
         import glob
 
         from aiter.jit.core import AITER_ROOT_DIR
+        from aiter.jit.utils.chip_info import gfx_from_cu_num
 
         cfg = os.path.join(AITER_ROOT_DIR, "aiter/configs")
-        found = 0
+        found = collections.Counter()
         for path in glob.glob(os.path.join(cfg, "**", "*.csv"), recursive=True):
             if "untuned" in os.path.basename(path):
                 continue
             try:
                 with open(path) as f:
-                    rows = list(csv.DictReader(f))
+                    # Stream rather than materializing; some tuned CSVs are
+                    # thousands of rows and this is a Level 1 test.
+                    reader = csv.DictReader(f)
+                    if not reader.fieldnames or "cu_num" not in reader.fieldnames:
+                        continue
+                    has_gfx = "gfx" in reader.fieldnames
+                    for row in reader:
+                        if str(row.get("cu_num", "")).strip() != "228":
+                            continue
+                        name = os.path.basename(path)
+                        declared = (row.get("gfx") or "").strip() if has_gfx else ""
+                        resolved = declared or gfx_from_cu_num(row["cu_num"])
+                        self.assertEqual(
+                            resolved,
+                            "gfx942",
+                            f"{name}: cu_num=228 row resolves to {resolved!r}",
+                        )
+                        found[name] += 1
             except (OSError, UnicodeDecodeError):
                 continue
-            if not rows or "cu_num" not in rows[0]:
-                continue
-            for row in rows:
-                if str(row.get("cu_num", "")).strip() != "228":
-                    continue
-                found += 1
-                self.assertEqual(
-                    (row.get("gfx") or "").strip(),
-                    "gfx942",
-                    f"{os.path.basename(path)}: cu_num=228 row is not gfx942",
-                )
-        self.assertGreater(found, 0, "no MI300A (cu_num=228) tuned rows found")
+        self.assertTrue(found, "no MI300A (cu_num=228) tuned rows found")
+
+    def test_legacy_cu_only_families_still_resolve(self):
+        """A tuned family without a gfx column must still land on gfx942.
+
+        This is the case the previous version of this test got wrong: it
+        required a literal gfx column, which tuned_fmoe.csv does not have.
+        """
+        import csv
+
+        from aiter.jit.core import AITER_ROOT_DIR
+        from aiter.jit.utils.chip_info import gfx_from_cu_num
+
+        path = os.path.join(AITER_ROOT_DIR, "aiter/configs/tuned_fmoe.csv")
+        if not os.path.exists(path):
+            self.skipTest("tuned_fmoe.csv not present")
+        with open(path) as f:
+            reader = csv.DictReader(f)
+            self.assertNotIn(
+                "gfx",
+                reader.fieldnames or [],
+                "tuned_fmoe.csv grew a gfx column; fold it into the main check",
+            )
+            cu228 = sum(
+                1 for row in reader if str(row.get("cu_num", "")).strip() == "228"
+            )
+        self.assertGreater(cu228, 0, "no cu_num=228 rows in tuned_fmoe.csv")
+        self.assertEqual(gfx_from_cu_num(228), "gfx942")
 
 
 if __name__ == "__main__":
