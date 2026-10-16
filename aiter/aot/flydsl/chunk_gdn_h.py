@@ -45,6 +45,8 @@ from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.kernels.gdr_prefill import compile_chunk_gated_delta_h
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
+# Matches the MI355X device query; a device reporting another count JIT-compiles on first use.
+AOT_NUM_XCDS = 8
 CHUNK_GDN_H_AOT_ARCH_DEFAULT = "gfx950"
 _KERNEL_NAME = "chunk_gdn_fwd_h_flydsl_opt"
 
@@ -263,6 +265,7 @@ def _compile_to_cache(
         SCHED_GFX942=arch.startswith("gfx942"),
         G_HEAD_MAJOR=g_head_major,
         BF16_CONVERT_TRUNC=bf16_convert_trunc,
+        NUM_XCDS=AOT_NUM_XCDS,
     )
 
     with compile_only_env():
