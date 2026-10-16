@@ -456,6 +456,48 @@ def test_mxscale_bpreshuffle_mid_dword_scale_rows(monkeypatch, m, k, config):
     _assert_matches(*_mxscale_gemm_vs_dequant(m, 7168, k, 128))
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or gemm_op_a8w8.get_gfx() != "gfx950",
+    reason="the preshuffled e8m0 GEMM runs on gfx950",
+)
+@pytest.mark.parametrize(
+    "m,n,k,block",
+    [
+        (1, 1152, 5120, 32),
+        (37, 5120, 1536, 32),
+        (300, 512, 5120, 32),
+        (1, 6144, 7168, 128),
+        (37, 7168, 768, 128),
+        (300, 1536, 1024, 128),
+        (300, 7168, 384, 128),
+    ],
+)
+@pytest.mark.parametrize("kernel", ["mxpsh", "8wave"])
+def test_mxscale_bpreshuffle_mxfp8_rows(monkeypatch, m, n, k, block, kernel):
+    """A kernelId "mxfp8" row runs gfx950's mxpsh / 8-wave GEMM on the raw
+    scales bmm reads (32x32, or 128x128 with the column-major x_scale)."""
+    from aiter.ops.flydsl import batched_gemm_a8w8
+    from aiter.ops.flydsl.gemm_a8w8_mxfp8_8wave import make_mxfp8_8wave_kernel_name
+    from aiter.ops.flydsl.mxscale_preshuffle_kernels import (
+        pick_mxfp8_kernel_name_gfx950,
+    )
+
+    if kernel == "8wave":
+        if k % 256 or (block == 128 and k < 512):
+            pytest.skip("the 8-wave kernel needs K % 256 == 0 (and K >= 512 at 128)")
+        name = make_mxfp8_8wave_kernel_name(2, 0)
+    else:
+        name = pick_mxfp8_kernel_name_gfx950(m, n, k, f"{block}x{block}")
+    row = {"libtype": "flydsl", "kernelId": "mxfp8", "kernelName": name}
+    monkeypatch.setattr(gemm_op_a8w8, "get_mxscale_bpreshuffle_config", lambda *a: row)
+
+    def no_bmm(*a, **kw):
+        raise AssertionError("an mxfp8 row must not run bmm")
+
+    monkeypatch.setattr(batched_gemm_a8w8, "run_bmm_a8w8_mxfp8", no_bmm)
+    _assert_matches(*_mxscale_gemm_vs_dequant(m, n, k, block))
+
+
 def _bmm_legal(n, k, block, **cfg):
     from aiter.ops.flydsl.kernels.bmm_a8w8_mxscale_gfx950 import check_bmm_config
 
