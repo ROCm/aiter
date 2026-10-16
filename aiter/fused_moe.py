@@ -1731,7 +1731,7 @@ def fused_moe_1stage(
             )
             return moe_buf
 
-        if kernelName == _Q256_KERNEL:
+        if kernelName in (_Q256_KERNEL, _Q256_KERNEL + "_route_weighted"):
             if a2_scale is not None:
                 raise ValueError("Q256 does not support caller-provided hidden scales")
             from aiter.ops.moe_op import fmoe_q256
@@ -1754,6 +1754,7 @@ def fused_moe_1stage(
                 w1_scale,
                 w2_scale,
                 topk,
+                kernelName=kernelName,
             )
             return moe_buf
 
@@ -3469,7 +3470,7 @@ def get_2stage_cfgs(
             has_stage2_bias=has_stage2_bias,
         )
 
-    if kernelName1 == _Q256_KERNEL and not (
+    if kernelName1 in (_Q256_KERNEL, _Q256_KERNEL + "_route_weighted") and not (
         get_gfx() == "gfx950"
         and inter_dim == 256
         and model_dim >= 512
@@ -3523,7 +3524,11 @@ def get_2stage_cfgs(
             ksplit,
             run_1stage,
             flat=cfg_flat,
-            output_aux=AUX_SORT_OPUS if kernelName1 == _Q256_KERNEL else False,
+            output_aux=(
+                AUX_SORT_OPUS
+                if kernelName1 in (_Q256_KERNEL, _Q256_KERNEL + "_route_weighted")
+                else False
+            ),
             **route_bucket_metadata,
         )
     is_flydsl1 = isinstance(kernelName1, str) and kernelName1.startswith("flydsl_")

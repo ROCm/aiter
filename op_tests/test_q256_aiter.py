@@ -73,6 +73,7 @@ def main():
                 partial_bytes=partial_bytes,
                 sorted_partial_bytes=sorted_bytes,
                 contribution_saving_gib=(sorted_bytes - partial_bytes) / 2**30,
+                kernel_name=native_kwargs.get("kernelName", ""),
             )
             print("Q256_STORAGE " + json.dumps(storage), flush=True)
         result = native(*native_args, **native_kwargs)
@@ -85,7 +86,10 @@ def main():
             baseline_args = list(native_args)
             baseline_args[0] = torch.empty_like(out)
             baseline_args[1] = sorted_partials
-            moe_op.fmoe_q256_producer(*baseline_args, **native_kwargs)
+            baseline_kwargs = {
+                key: value for key, value in native_kwargs.items() if key != "kernelName"
+            }
+            moe_op.fmoe_q256_producer(*baseline_args, **baseline_kwargs)
             route_rows = partials.view(-1, model)
             # AITER reserves worst-case sorter capacity; the unused suffix
             # has unspecified IDs and is outside the producer's work count.

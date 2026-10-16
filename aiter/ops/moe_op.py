@@ -703,12 +703,22 @@ def fmoe_q256(
     gate_scale: Tensor,
     down_scale: Tensor,
     topk: int,
+    *,
+    kernelName: str = "",
 ) -> None:
     """Run the universal assembly producer and its supplied FP32 reducer."""
 
     tokens, model = out.shape
     job_map = None
-    if (tokens, model, topk, gate.shape[0], partials.ndim) == (8192, 8192, 11, 513, 3):
+    if kernelName.endswith("_route_weighted"):
+        if (tokens, model, topk, gate.shape[0], partials.ndim) != (
+            8192,
+            8192,
+            11,
+            513,
+            3,
+        ):
+            raise ValueError("Q256 weighted scheduling requires compact Qwen 8K geometry")
         from aiter.ops.triton._triton_kernels.moe.q256_schedule import make_job_map
 
         job_map = torch.empty(1024, dtype=torch.int32, device=out.device)
