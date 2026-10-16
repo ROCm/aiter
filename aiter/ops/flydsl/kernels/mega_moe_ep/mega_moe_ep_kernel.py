@@ -45,6 +45,8 @@ from .mega_moe_ep_config import (
     B_LOADER,
     C_BARCNT,
     C_BARGEN,
+    C_COMM,
+    C_GREADY,
     C_PLAN,
     NT,
     NTT,
@@ -97,6 +99,7 @@ def compile_mega_moe_ep(
     NBW, L_DYN, L_DCNT, L_CTL = kc.get("NBW L_DYN L_DCNT L_CTL")
     compute_units, dispatch_send = kc.get("compute_units dispatch_send")
     combine_final, barrier_init = kc.get("combine_final barrier_init")
+    comm_combine = kc.get("comm_combine")[0]
 
     @flyc.jit
     def init_lds(L, tid, a):
@@ -110,6 +113,8 @@ def compile_mega_moe_ep(
             lds_st(L, L_CTL + C_BARCNT * 4, i32(0))
             lds_st(L, L_CTL + C_BARGEN * 4, i32(0))
             lds_st(L, L_CTL + C_PLAN * 4, i32(0))
+            lds_st(L, L_CTL + C_GREADY * 4, i32(0))  # comm-band overlap: echunks GEMM2-done
+            lds_st(L, L_CTL + C_COMM * 4, i32(0))  # comm-band overlap: plan+P published
 
     @flyc.jit
     def comm_help(L, tid, a, epoch):
@@ -118,16 +123,14 @@ def compile_mega_moe_ep(
 
     @flyc.jit
     def roles(L, tid, a, epoch):
-        if tid < i32(NT):
+        del epoch
+        if tid < i32(NT):  # compute band: planner + GEMM (+ combine itself when P>1)
             compute_units(L, tid, a)
-            comm_help(L, tid, a, epoch)
-        elif tid < i32(B_LOADER):  # [NT, NT+64)
+        elif tid < i32(B_LOADER):  # [NT, NT+64): dispatch, then join the P==1 overlap combine
             dispatch_send(L, tid % i32(64), a)
-            comm_help(L, tid, a, epoch)
-        elif tid < i32(B_COMBINE):  # [NT+64, NT+128)
-            comm_help(L, tid, a, epoch)
-        else:  # [NT+128, NTT)
-            comm_help(L, tid, a, epoch)
+            comm_combine(L, tid, a)
+        else:  # [NT+64, NTT): comm bands -> overlap combine (P==1) else return at once
+            comm_combine(L, tid, a)
 
     Shared = fx.struct(
         type(

@@ -22,7 +22,7 @@ dist.init_process_group("cpu:gloo,cuda:nccl", device_id=DEV)
 H, I, K = 7168, 3072, 6
 EPR = 48
 E = EPR * WORLD
-MTPR = 1024
+MTPR = int(os.environ.get("EP_MTPR", "1024"))
 qz = aiter.get_torch_quant(aiter.QuantType.per_1x32)
 gw = torch.Generator(device=DEV).manual_seed(1234 + RANK)
 w1 = torch.randn(EPR, 2 * I, H, dtype=torch.bfloat16, device=DEV, generator=gw) * (H**-0.25)
@@ -48,7 +48,7 @@ def inp(bs):
     return x, wts.float().contiguous(), ids.int().contiguous()
 
 
-for bs in (8, 512):
+for bs in [int(b) for b in os.environ.get("EP_BS", "8,512").split(",")]:
     x, wts, ids = inp(bs)
     for _ in range(5):
         eng.forward(x, wts, ids)

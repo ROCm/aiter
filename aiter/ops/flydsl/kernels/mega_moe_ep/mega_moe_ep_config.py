@@ -34,8 +34,10 @@ __all__ = [
     "C_BARCNT",
     "C_BARGEN",
     "C_CNT",
+    "C_COMM",
     "C_DYNP",
     "C_GEXP",
+    "C_GREADY",
     "C_NACT",
     "C_NCH",
     "C_PLAN",
@@ -142,6 +144,10 @@ CTRL_INTS = 64
 C_BARCNT, C_BARGEN = 0, 1  # 4-compute-wave LDS generation barrier
 C_NACT, C_NCH, C_PLAN, C_DYNP = 2, 3, 4, 5  # #active experts, #units, plan-ready, P
 C_UROWS, C_USEQ, C_GEXP, C_CNT = 6, 7, 8, 9  # current unit rows / seq / gather cache
+# comm-band overlap (P==1 high-bs): C_COMM = plan+P published to the comm band; C_GREADY
+# = count of echunks whose GEMM2 the compute band has finished (comm band combines them
+# concurrently with the compute band's next-wave GEMM). Both LDS, reset by init_lds.
+C_GREADY, C_COMM = 10, 11
 C_UNIT = 12  # [C_UNIT, C_UNIT+1): this CTA's unit range [lo, hi)
 C_UL = 16  # per-CTA unit list base (records of 4 ints: expert_chunk, i0, icnt, kind)
 UL_MAX = (128 - C_UL) // 4
