@@ -458,9 +458,10 @@ def test_precomputed_decode_schedule_empty_windows(next_n: int) -> None:
     table = table[:batch]
     lengths = torch.full((batch,), context, dtype=torch.int32, device=dev)
     total_ctas = default_varctx_parallel_unit_num(batch, context, next_n)
-    _, schedule, _ = compute_varctx_schedule(
-        lengths, BLOCK_K, total_ctas, context, next_n=next_n
+    _, schedule, scheduled_ctas = compute_varctx_schedule(
+        lengths, BLOCK_K, None, context, next_n=next_n
     )
+    assert scheduled_ctas == total_ctas
     out = torch.full((rows, context), GUARD, device=dev)
     mapping = torch.arange(batch, device=dev, dtype=torch.int32).repeat_interleave(
         next_n

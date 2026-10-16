@@ -86,6 +86,7 @@ from opus_gemm_common import gfx1250_4wave_co_kernels_declared
 _PIPELINE_HEADERS = {
     "a16w16_4wave_co": "opus_gemm_pipeline_a16w16_4wave_compute_gfx1250.cuh",
     "a16w16_4wave_wl_co": "opus_gemm_pipeline_a16w16_4wave_wl_gfx1250.cuh",
+    "a16w16_4wave_wlr_co": "opus_gemm_pipeline_a16w16_4wave_wlr_gfx1250.cuh",
 }
 
 # Stub TU. Mirrors the standalone kernel's own stub: the host pass gets an empty

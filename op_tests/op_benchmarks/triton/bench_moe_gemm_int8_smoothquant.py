@@ -190,7 +190,7 @@ def bench_mlp_single_weight_init(
             out_dtype=torch.float32,
             apply_activation=True,
             limit=None,
-            add_residual=False,
+            swiglu_add_residual=False,
         )
         x, x_scale = smoothquant_quantize(x, fc2_smooth_scale)
         x = moe_gemm_int8_smoothquant(
@@ -205,7 +205,7 @@ def bench_mlp_single_weight_init(
             preshuffled=preshuffled,
             out_dtype=torch.bfloat16,
             apply_activation=False,
-            add_residual=False,
+            swiglu_add_residual=False,
         )
 
     proton.finalize()

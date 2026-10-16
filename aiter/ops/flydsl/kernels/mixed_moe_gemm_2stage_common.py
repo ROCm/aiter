@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""Shared MXFP4/FP8 MoE and heterogeneous MoE kernel builders."""
+"""Shared MXFP4/MXFP8 MoE and heterogeneous MoE kernel builders."""
 
 """MoE GEMM stage1/stage2 kernel implementations (FlyDSL MFMA FP8/FP16/FP4).
 
@@ -138,6 +138,7 @@ def compile_mixed_moe_gemm1_common(
     xcd_swizzle: int = 0,
     k_wave: int = 1,
     shared_expert_id: int | None = None,
+    clamp_shared: bool = True,
     v2_output_layout: bool = False,
 ):
     """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim]."""
@@ -147,6 +148,8 @@ def compile_mixed_moe_gemm1_common(
             "FHMoE stage1 requires shared_expert_id == experts - 1; "
             f"got {shared_expert_id=} and {experts=}"
         )
+    if heterogeneous_b and not clamp_shared and act != "silu":
+        raise ValueError("clamp_shared=False is supported only with act='silu'")
     gpu_arch = get_hip_arch()
 
     def _al(x, a):
@@ -160,9 +163,6 @@ def compile_mixed_moe_gemm1_common(
     is_f4_a = a_dtype == "fp4"
     is_f4_b = b_dtype == "fp4"
     is_f8_b = b_dtype == "fp8"
-    if heterogeneous_b and not is_f4_b:
-        raise ValueError("Heterogeneous B requires MXFP4 routed weights")
-
     sort_block_m = tile_m
     num_waves = min(4, tile_n // 32)
     # K-wave groups reduce accumulators in LDS before the epilogue.
@@ -272,12 +272,17 @@ def compile_mixed_moe_gemm1_common(
     # therefore must not be part of the on-disk symbol/cache identity.
     act_tag = "" if act == "silu" else f"_{act}"
     heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else ""
-    # ABI v33 adds four runtime SiTUv2 beta scalars; heterogeneous ABI tracks one
-    # version ahead of the ordinary kernel.
-    kernel_version = 34 if heterogeneous_b else 33
+    # Keep the existing MXFP4/FP8 DSV4 cache identity unchanged. The no-clamp
+    # tag is HY4-specific; heterogeneous MXFP8 kernels use the v35 revision.
+    shared_clamp_tag = "_shared_noclamp" if heterogeneous_b and not clamp_shared else ""
+    # ABI v33 adds four runtime SiTUv2 beta scalars. Heterogeneous MXFP4 keeps
+    # v34; v35 identifies the MXFP8 routed/shared K-offset implementation.
+    kernel_version = (
+        35 if heterogeneous_b and is_f8_b else (34 if heterogeneous_b else 33)
+    )
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}{shared_clamp_tag}_v{kernel_version}"
     ).replace("-", "_")
 
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
@@ -928,7 +933,10 @@ def compile_mixed_moe_gemm1_common(
                         ku * b_cells_per_ku, index=True
                     )
                     if const_expr(shared_b):
-                        shared_k0_base = (base_k * arith.index(2)) // c64
+                        # ``base_k`` is expressed in routed-weight storage
+                        # elements. Convert it back to the logical K offset
+                        # before indexing the always-FP8 shared weights.
+                        shared_k0_base = (base_k * arith.index(b_byte_div)) // c64
                         shared_k0_base += arith.constant(ku * 2, index=True)
                         s0, s1 = load_cell(
                             shared_w_rsrc,
@@ -1951,7 +1959,15 @@ def compile_mixed_moe_gemm1_common(
 
                 def activate_pair(g, u):
                     if const_expr(act == "silu"):
-                        g, u = clamp_gate_up(g, u, swiglu_neg_limit)
+                        # Some models leave the dense shared expert unclamped.
+                        # ``shared_b`` specializes the whole tile, so
+                        # disabling the clamp here adds no per-lane divergence.
+                        activation_neg_limit = (
+                            fx.Float32(float("-inf"))
+                            if const_expr(shared_b and not clamp_shared)
+                            else swiglu_neg_limit
+                        )
+                        g, u = clamp_gate_up(g, u, activation_neg_limit)
                         return silu_mul_batch([g], [u])[0]
                     return gate_up_act(act, [g], [u], activation_params)[0]
 
@@ -3154,6 +3170,7 @@ def compile_mixed_moe_gemm2_common(
     b_nt: int = 0,
     xcd_swizzle: int = 0,
     shared_expert_id: int | None = None,
+    use_global_a: bool = True,
 ):
     """Compile stage2 kernel (moe_gemm2): A2 @ W2.T -> [tokens, model_dim], atomic-add."""
     heterogeneous_b = shared_expert_id is not None
@@ -3188,8 +3205,6 @@ def compile_mixed_moe_gemm2_common(
     is_f4_a = a_dtype == "fp4"
     is_f4_b = b_dtype == "fp4"
     is_f8_b = b_dtype == "fp8"
-    if heterogeneous_b and not is_f4_b:
-        raise ValueError("Heterogeneous B requires MXFP4 routed weights")
     serial_shared_n = heterogeneous_b and tile_n == 256
 
     scale_pack_m = 2
@@ -3331,7 +3346,12 @@ def compile_mixed_moe_gemm2_common(
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else ""
     serial_n_tag = "_serialn128" if serial_shared_n else ""
-    if heterogeneous_b:
+    if heterogeneous_b and is_f8_b:
+        variant_tags = (
+            f"_vscale_fix3_fp4opt_v3{pm_tag}{sbm_tag}{wpe_tag}{async_tag}"
+            f"{cumul_tag}{acc_tag}{xcd_tag}{heterogeneous_tag}{serial_n_tag}"
+        )
+    elif heterogeneous_b:
         variant_tags = (
             f"_vscale_fix3_fp4opt_v2{pm_tag}{sbm_tag}{wpe_tag}{async_tag}"
             f"{cumul_tag}{acc_tag}{xcd_tag}{heterogeneous_tag}{serial_n_tag}"
@@ -3341,6 +3361,7 @@ def compile_mixed_moe_gemm2_common(
             f"_vscale_fix3_fp4opt_v1{pm_tag}{sbm_tag}{wpe_tag}{async_tag}"
             f"{cumul_tag}{xcd_tag}{acc_tag}"
         )
+    variant_tags += "_aglobal" if use_global_a else "_abuffer"
     module_name = (
         f"mfma_moe2_a{a_dtype}_w{b_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}{variant_tags}"
@@ -3380,18 +3401,15 @@ def compile_mixed_moe_gemm2_common(
         ):
 
             tokens_in = fx.Index(i32_tokens_in)
-            x_rows = fx.Index(i32_x_rows)
             n_in = fx.Index(i32_n_in)
             k_in = fx.Index(i32_k_in)
             size_expert_ids_in = fx.Index(i32_size_expert_ids_in)
-            x_elem = default_f8_type()
             f32 = T.f32
             i32 = T.i32
             i64 = T.i64
             i32_t = fx.Numeric.from_ir_type(i32)
             i64_t = fx.Numeric.from_ir_type(i64)
             vec4_f32 = T.vec(4, f32)
-            vec16_elems = 16 if a_elem_bytes == 1 else 8
 
             acc_init = arith.constant_vector(0.0, vec4_f32)
 
@@ -3496,11 +3514,18 @@ def compile_mixed_moe_gemm2_common(
 
             c_topk = arith.constant(topk, index=True)
 
-            c_elem_bytes = arith.constant(int(a_elem_bytes), index=True)
             c_a_pack = arith.constant(int(a_elem_vec_pack), index=True)
-            x_nbytes_idx = _div_pow2(x_rows * k_in * c_elem_bytes, int(a_elem_vec_pack))
-            x_nbytes_i32 = fx.Int32(x_nbytes_idx)
-            x_rsrc = ptr_rsrc(arg_x, x_nbytes_i32)
+            x_elem = default_f8_type()
+            vec16_elems = 16 if a_elem_bytes == 1 else 8
+            x_rsrc = None
+            if const_expr(not use_global_a):
+                x_rows = fx.Index(i32_x_rows)
+                c_elem_bytes = arith.constant(int(a_elem_bytes), index=True)
+                x_nbytes_idx = _div_pow2(
+                    x_rows * k_in * c_elem_bytes, int(a_elem_vec_pack)
+                )
+                x_nbytes_i32 = fx.Int32(x_nbytes_idx)
+                x_rsrc = ptr_rsrc(arg_x, x_nbytes_i32)
 
             w_rsrc = ptr_rsrc(arg_w, w_nbytes)
             shared_w_rsrc = ptr_rsrc(arg_shared_w, shared_w_nbytes)
@@ -3704,31 +3729,41 @@ def compile_mixed_moe_gemm2_common(
                 )
 
                 def load_x(idx_i32):
-                    """Load `x_load_bytes` bytes from X (gmem) into regs.
-
-                    For 16B, keep the fast dwordx4 path. For 8B/4B, use byte offsets.
-                    """
-                    if const_expr(x_load_bytes == 16):
-                        idx_elem = (
-                            idx_i32 if a_elem_bytes == 1 else (idx_i32 * arith.index(2))
+                    if const_expr(use_global_a):
+                        # Gather rows can span more than a 4 GiB buffer resource.
+                        # Invalid routes already use row 0; K loads stay within a row.
+                        ptr_type = fx.PointerType.get(
+                            T.i32, address_space=fx.AddressSpace.Global, alignment=4
                         )
-                        return buffer_copy_gmem16_dwordx4(
+                        return fx.ptr_load(
+                            fx.recast_iter(ptr_type, arg_x) + fx.Int64(idx_i32),
+                            result_type=fx.Vector.make_type(chunk_i32, fx.Int32),
+                        )
+                    else:
+                        # The 16B path uses element offsets; 8B/4B use bytes.
+                        if const_expr(x_load_bytes == 16):
+                            idx_elem = (
+                                idx_i32
+                                if a_elem_bytes == 1
+                                else (idx_i32 * arith.index(2))
+                            )
+                            return buffer_copy_gmem16_dwordx4(
+                                buffer_ops,
+                                elem_type=x_elem,
+                                idx_i32=idx_elem,
+                                rsrc=x_rsrc,
+                                vec_elems=vec16_elems,
+                            )
+                        idx_bytes = idx_i32 * arith.index(4)
+                        return _buffer_load_vec(
                             buffer_ops,
+                            x_rsrc,
+                            idx_bytes,
                             elem_type=x_elem,
-                            idx_i32=idx_elem,
-                            rsrc=x_rsrc,
-                            vec_elems=vec16_elems,
+                            vec_elems=x_load_vec_elems,
+                            elem_bytes=a_elem_bytes,
+                            offset_in_bytes=True,
                         )
-                    idx_bytes = idx_i32 * arith.index(4)
-                    return _buffer_load_vec(
-                        buffer_ops,
-                        x_rsrc,
-                        idx_bytes,
-                        elem_type=x_elem,
-                        vec_elems=x_load_vec_elems,
-                        elem_bytes=a_elem_bytes,
-                        offset_in_bytes=True,
-                    )
 
                 if const_expr(use_async_copy and a_elem_vec_pack > 1):
                     dma_bytes_pre = 16
@@ -3870,7 +3905,9 @@ def compile_mixed_moe_gemm2_common(
                         )
 
                     if const_expr(shared_b):
-                        shared_k0_base = _div_pow2(base_k * arith.index(2), 64)
+                        # ``base_k`` uses the routed-weight storage width;
+                        # recover the logical K offset for FP8 shared weights.
+                        shared_k0_base = _div_pow2(base_k * arith.index(b_byte_div), 64)
                         shared_k0_base += arith.constant(ku * 2, index=True)
                         s0, s1 = load_cell(
                             shared_w_rsrc,
@@ -4093,34 +4130,50 @@ def compile_mixed_moe_gemm2_common(
                             )
                             row_k_dw = x_row_base_div4[i] + base_k_div4
                             global_byte_idx = row_k_dw * c4_idx + col_local_sw
-                            global_offset = fx.Int32(global_byte_idx)
-
-                            if const_expr(i == 0):
-                                lds_addr = (
-                                    fx.ptrtoint(lds_x)
-                                    + lds_base * c_a_elem_bytes_dma
-                                    + wave_id * c_wave_dma_bytes
+                            if const_expr(use_global_a):
+                                src = fx.recast_iter(fx.Uint8, arg_x) + fx.Int64(
+                                    global_byte_idx
                                 )
-                                lds_ptr_i64 = rocdl.readfirstlane(
-                                    T.i64, fx.Int64(lds_addr)
+                                # global_load_lds needs each lane's explicit LDS address.
+                                dst = lds_x + fx.Int64(
+                                    lds_base * c_a_elem_bytes_dma
+                                    + (tx + i * total_threads) * dma_bytes
+                                )
+                                rocdl.global_load_lds(
+                                    fx.to_llvm_ptr(src),
+                                    fx.to_llvm_ptr(dst),
+                                    dma_bytes,
+                                    0,
                                 )
                             else:
-                                lds_ptr_i64 = lds_ptr_i64 + arith.constant(
-                                    total_threads * dma_bytes, type=T.i64
+                                global_offset = fx.Int32(global_byte_idx)
+
+                                if const_expr(i == 0):
+                                    lds_addr = (
+                                        fx.ptrtoint(lds_x)
+                                        + lds_base * c_a_elem_bytes_dma
+                                        + wave_id * c_wave_dma_bytes
+                                    )
+                                    lds_ptr_i64 = rocdl.readfirstlane(
+                                        T.i64, fx.Int64(lds_addr)
+                                    )
+                                else:
+                                    lds_ptr_i64 = lds_ptr_i64 + arith.constant(
+                                        total_threads * dma_bytes, type=T.i64
+                                    )
+
+                                lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
+                                lds_ptr = llvm.inttoptr(lds_ptr_type, lds_ptr_i64)
+
+                                rocdl.raw_ptr_buffer_load_lds(
+                                    x_rsrc,
+                                    lds_ptr,
+                                    arith.constant(dma_bytes, type=T.i32),
+                                    global_offset,
+                                    arith.constant(0, type=T.i32),
+                                    arith.constant(0, type=T.i32),
+                                    arith.constant(0, type=T.i32),
                                 )
-
-                            lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
-                            lds_ptr = llvm.inttoptr(lds_ptr_type, lds_ptr_i64)
-
-                            rocdl.raw_ptr_buffer_load_lds(
-                                x_rsrc,
-                                lds_ptr,
-                                arith.constant(dma_bytes, type=T.i32),
-                                global_offset,
-                                arith.constant(0, type=T.i32),
-                                arith.constant(0, type=T.i32),
-                                arith.constant(0, type=T.i32),
-                            )
 
                     def prefetch_x_to_lds(base_k, lds_base):
                         dma_x_tile_to_lds(base_k, lds_base)
@@ -4444,8 +4497,10 @@ def compile_mixed_moe_gemm2_common(
                                 & (fx.Uint32(t_pre) < fx.Uint32(tokens_i32_guard))
                                 & (s_pre < fx.Uint32(topk))
                             )
+                            # OOB under the output < 4 GiB - 1 MiB contract.
+                            # Reserve 64 KiB for columns without uint32 wrap.
                             stored_val = valid.select(
-                                fx.Int32(row_byte_off), fx.Int32(0x7FFF0000)
+                                fx.Int32(row_byte_off), fx.Int32(0xFFFF0000)
                             )
                         else:
                             stored_val = tid_val
@@ -5148,6 +5203,7 @@ def compile_mixed_moe_gemm2_common(
         cu_num if persistent else 0,
         waves_per_eu,
         use_async_copy,
+        use_global_a,
         xcd_swizzle,
     )
     if heterogeneous_b:

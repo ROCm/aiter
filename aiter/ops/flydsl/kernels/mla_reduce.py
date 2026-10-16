@@ -1167,7 +1167,10 @@ def plan_splitk_capture_safe(
 def _get_splitk_scratch(num_slots: int, K: int, Dv: int, device_index: int):
     """Pre-allocate (once) the split-K scratch: partial weighted-output
     accumulators + (m_j, l_j) per partial. Cached so CUDA-graph replays reuse
-    the same device buffers (capture-safe). Zero-initialized (partials fully
+    the same device buffers. The key carries no stream, so unlike the
+    stream-keyed scratch caches a first miss inside a capture needs a shape
+    combination no eager launch has used; see aiter.utility.graph_alloc if that
+    ever changes. Zero-initialized (partials fully
     overwrite their own rows every launch)."""
     import torch
 

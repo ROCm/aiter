@@ -10,6 +10,7 @@ import triton
 from aiter.benchmark_data_init import fill, make_generator
 from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -455,13 +456,13 @@ def test_pa_decode_sparse_vs_reference(
 # ---------------------------------------------------------------------------
 
 _FP8_GROUP_SIZE = 64
-_FP8_DTYPE = torch.float8_e4m3fnuz
+_FP8_DTYPE = get_fp8_e4m3_dtype()
 
 
 def _quantize_kv_fp8(unified_kv, group_size=_FP8_GROUP_SIZE):
     """Quantize bf16/fp16 unified_kv to (fp8, scales) with 1xGROUP_SIZE block scaling.
 
-    Returns (kv_fp8, kv_scales) where kv_fp8 is float8_e4m3fnuz and
+    Returns (kv_fp8, kv_scales) where kv_fp8 is _FP8_DTYPE and
     kv_scales is [total_pages, D // group_size] fp32.
     """
     total_pages, D = unified_kv.shape

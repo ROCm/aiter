@@ -114,13 +114,30 @@ idx  = tx
 - A real cast (`fx.Int64(i32)` widen, `fx.Int32(index)` narrow) is not redundant —
   it replaces `arith.index_cast`.
 
+### 1c. Thread and block IDs
+
+In pinned FlyDSL 0.3.4.1, `fx.thread_idx.x` and `fx.block_idx.x` return
+`fx.Int32` values. `gpu.thread_idx.x` and `gpu.block_idx.x` are the same
+typed accessors. Direct `gpu.thread_id("x")` / `gpu.block_id("x")` calls
+return raw MLIR values, so wrap those calls with `fx.Int32(...)` before typed
+arithmetic. Do not label the typed accessors legacy or remove a cast from a
+direct call merely because both spellings refer to the same GPU ID.
+
+```python
+tid = fx.thread_idx.x                 # already fx.Int32
+bid = fx.block_idx.x                  # already fx.Int32
+raw_tid = gpu.thread_id("x")          # raw MLIR value
+tid_from_raw = fx.Int32(raw_tid)      # typed boundary
+```
+
 ---
 
 ## 2. `buffer_ops` → `make_buffer_tensor` + copy atoms
 
 `create_buffer_resource` + manual offsets is legacy. Build a buffer-resource view
-with `fx.rocdl.make_buffer_tensor()`, then use layout ops + `fx.copy` (§7b);
-the OOB-checked V# descriptor is built for you.
+with `fx.rocdl.make_buffer_tensor()`, then use layout ops + `fx.copy` (§7b).
+Its default `max_size=True` leaves the record bound effectively unlimited;
+choose `max_size=False` or `num_records_bytes=` for hardware OOB checking.
 
 ```python
 # Before (manual offsets — see PA //4 offset bugs)
@@ -162,9 +179,12 @@ fx.copy(copy, fx.slice(tA, (None, tid)), rA)   # after partitioning tA (§7b: pr
 | `arith.maxsi/maxui/minsi/minui(a,b)` | `fx.max(a, b)` / `fx.min(a, b)` |
 | `arith.maxnumf(a,b)` | `fx.maxnumf(a, b)` — different NaN semantics from `fx.max` |
 | `arith.ceildivsi/ceildivui(a,b)` | `fx.ceildiv(a, b)` |
+| `math.fma(a,b,c)` | `fx.fma(a, b, c)` — preserves fused rounding |
+| `math.absf(v)` | `fx.absf(v)` — check signed-zero/NaN behavior if replacing a select |
 
 Keep `arith.cmpf` / explicit `*FOp` only where no operator exists or fastmath is
-needed.
+needed. Do not replace separate `a * b + c` operations with `fx.fma` unless
+fused rounding is intended.
 
 ### `scf`
 | Raw | Preferred |
@@ -172,7 +192,7 @@ needed.
 | `scf.ForOp` | `range_constexpr(N)` (unrolled) or `range(lo, hi, step, init=[...])` (runtime, loop-carried) |
 | `scf.IfOp(_raw(cond))` | Python `if cond:` (runtime) / `if const_expr(flag):` (compile-time) |
 
-Check the rewriter's loop contract in the pinned version. In FlyDSL 0.3.2:
+Check the rewriter's loop contract in pinned FlyDSL 0.3.4.1:
 
 - `range_constexpr` requests Python unrolling.
 - `range(..., init=[...])` emits an `scf.for` with explicit carried state and
@@ -218,8 +238,16 @@ p = ptr.llvm_ptr          # property on an fx pointer
 p = fx.to_llvm_ptr(ptr)   # equivalent free function; backend resolves the AS
 ```
 
-- Applies only when you already have a `fly.ptr`. A raw int/index address (e.g. an
-  LDS byte offset with no pointer form) still needs manual construction — note it.
+- For a raw integer address, construct a semantic `fly.ptr` with public
+  `fx.inttoptr`, then convert it with `fx.to_llvm_ptr` only if the downstream
+  operation truly needs `!llvm.ptr`:
+  ```python
+  ty = fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4)
+  ptr = fx.inttoptr(ty, fx.Int64(address))
+  llvm_ptr = fx.to_llvm_ptr(ptr)
+  ```
+  Choose the correct address space, element type, and proven alignment. A raw
+  byte address for LDS uses `fx.AddressSpace.Shared` instead.
 - `mem_ops.get_llvm_ptr` / `element_ptr` also fold in `+ offset*dtype_bytes`
   arithmetic; keep the offset math (layout views / `get_element_ptr`) and only swap
   the final ptr cast for `.llvm_ptr`.
@@ -232,8 +260,11 @@ p = fx.to_llvm_ptr(ptr)   # equivalent free function; backend resolves the AS
 Hand-encoding a wait-counter bitfield (or calling `rocdl.s_waitcnt(magic)` with a
 raw number) is arch-fragile — the field widths differ per arch (CDNA3 `lgkmcnt`
 max 15 vs RDNA 63). The keyword form of `fx.rocdl.s_waitcnt`
-(`expr/rocdl/universal.py`) is arch-dispatched across gfx942/gfx950/gfx11xx/gfx120x
-and packs the correct bitfield for you.
+(`expr/rocdl/universal.py`) packs target-specific bitfields for gfx942,
+gfx950, gfx11xx, and gfx120x. **Pinned 0.3.4.1 rejects gfx1250** here; do
+not migrate a gfx1250 wait to this API. Use the target's supported wait ops
+(`fx.rocdl.s_wait_loadcnt` / `s_wait_storecnt`, or async wait where applicable)
+only after checking their ordering and generated ISA.
 
 ```python
 # Before
@@ -329,6 +360,10 @@ dispatch()
 - For branches returning or updating values, check that the rewriter preserves
   their structure and types. Keep manual `scf.IfOp` only for a demonstrated
   unsupported control-flow contract; localize it.
+- Before deleting a private AST-rewriting decorator, search all imports and
+  decorator uses across aiter. Decorators execute at module import time;
+  update every caller to `@flyc.jit` and import the affected modules as part
+  of validation.
 
 ---
 
@@ -540,7 +575,7 @@ _run_compiled(compiled["launch"],
 | `buffer_ops.*` + offsets | `fx.rocdl.make_buffer_tensor` + layout + `fx.copy` |
 | raw `llvm`/`memref` access | `fx.make_view` / `fx.get_iter` / `SharedAllocator` |
 | `create_llvm_ptr(v, address_space=N)` / manual `IntToPtrOp` | `ptr.llvm_ptr` / `fx.to_llvm_ptr(ptr)` (backend-resolved AS) |
-| `rocdl.s_waitcnt(_encode_waitcnt(...))` / magic bitfield | `fx.rocdl.s_waitcnt(vmcnt=/lgkmcnt=/expcnt=)` (arch-dispatched) |
+| `rocdl.s_waitcnt(_encode_waitcnt(...))` / magic bitfield | `fx.rocdl.s_waitcnt(vmcnt=/lgkmcnt=/expcnt=)` on supported targets; pinned 0.3.4.1 excludes gfx1250 |
 | `SmemAllocator`/`SmemPtr` + `finalize()` | `@fx.struct` + `fx.SharedAllocator().allocate(...).peek().view(...)` |
 | raw SCF or AST-rewriter calls in a plain helper | local `@flyc.jit` with Python `if` and typed carried state |
 | `fx.Int32(fx.Int32(x))` / wrapping const ints | plain Python int; wrap once |

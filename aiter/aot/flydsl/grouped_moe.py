@@ -214,6 +214,16 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
                 # would not fail loudly -- compile_one_config swallows the
                 # TypeError and the routeks kernels just stop being precompiled.
                 ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                ptr_arg(torch.empty(0, dtype=bf16, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                0,
+                1,
+                1,
+                1,
+                1,
                 grid,
                 stream=0,
             )

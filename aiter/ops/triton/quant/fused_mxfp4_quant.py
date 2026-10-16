@@ -9,7 +9,7 @@ from aiter.ops.triton._gluon_kernels.gfx1250.quant.fused_mxfp4_quant import (
     _gluon_fused_reduce_rms_mxfp4_quant_kernel,
     _gluon_fused_rms_mxfp4_quant_kernel,
 )
-from aiter.ops.triton._triton_kernels.activation import (
+from aiter.ops.triton._triton_kernels.common.activation import (
     _get_activation_from_str,
 )
 from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
@@ -58,7 +58,7 @@ def fused_rms_mxfp4_quant(
 
         always returns (out1_fp4, out1_bs), out1, out2, out_res1
     """
-    _LOGGER.info(f"FUSED_RMS_MXFP4_QUANT: inp1={tuple(x1.shape)}")
+    _LOGGER.info("FUSED_RMS_MXFP4_QUANT: inp1=%s", tuple(x1.shape))
 
     MXFP4_QUANT_BLOCK_SIZE = 32
     M, N1 = x1.shape
@@ -202,7 +202,7 @@ def fused_flatten_mxfp4_quant(
     - out: The output matrix with shape (M, (N1 * N2) // 2).
     - out_block_scales: The output matrix with shape (M, cdiv(N1 * N2, MXFP4_QUANT_BLOCK_SIZE)).
     """
-    _LOGGER.info(f"FUSED_FLATTEN_MXFP4_QUANT: x={tuple(x.shape)}")
+    _LOGGER.info("FUSED_FLATTEN_MXFP4_QUANT: x=%s", tuple(x.shape))
     M, N1, N2 = x.shape
 
     MXFP4_QUANT_BLOCK_SIZE = 32
@@ -255,7 +255,7 @@ def fused_reduce_act_mul_and_mxfp4_quant(
         if x is 2-dim,
             x: (M, 2*N1), dtype = fp16 or bf16.
             x2 must be None
-            the kernel is essentially identical to aiter.ops.triton.activation.act_mul_and_mxfp4_group_quant
+            the kernel is essentially identical to aiter.ops.triton.fusions.activation.act_mul_and_mxfp4_group_quant
 
         activation: activation function to apply before quantization.
             - It splits the features into two parts and applies the activation to the first part.
@@ -287,7 +287,10 @@ def fused_reduce_act_mul_and_mxfp4_quant(
         A tuple of (y, y_scale).
     """
     _LOGGER.info(
-        f"ACT_MUL_MXFP4_QUANT: x={tuple(x.shape)} activation={activation} shuffle={shuffle}"
+        "FUSED_REDUCE_ACT_MUL_MXFP4_QUANT: x=%s activation=%s shuffle=%s",
+        tuple(x.shape),
+        activation,
+        shuffle,
     )
 
     assert (
@@ -447,7 +450,7 @@ def fused_reduce_rms_mxfp4_quant(
 
         always returns (out1_fp4, out1_bs), out1, out2, out_res1, out3
     """
-    _LOGGER.info(f"FUSED_RMS_MXFP4_QUANT: inp1={tuple(x1.shape)}")
+    _LOGGER.info("FUSED_RMS_MXFP4_QUANT: inp1=%s", tuple(x1.shape))
 
     out_dtype = dtype if dtype is not None else x1.dtype
     MXFP4_QUANT_BLOCK_SIZE = 32

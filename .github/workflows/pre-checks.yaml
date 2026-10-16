@@ -17,9 +17,9 @@ jobs:
         with:
           submodules: 'recursive'
 
-      - name: Temporarily skip 3rdparty commit verification
+      - name: Verify 3rdparty commits
         if: github.ref != 'refs/heads/main'
-        run: echo "Temporarily skipping dependency check while the CK submodule pin is resolved."
+        run: ./.github/scripts/check_deps.sh
 
       - name: Skip check on main branch
         if: github.ref == 'refs/heads/main'

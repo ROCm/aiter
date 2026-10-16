@@ -32,9 +32,11 @@ class OpKind(enum.Enum):
     MOE = "moe"
     MXFP4_MOE = "mxfp4_moe"
     GEMM = "gemm"
+    CONV = "conv"
     GROUPED_MOE = "grouped_moe"
     CHUNK_GDN_H = "chunk_gdn_h"
     MEGA_MOE = "mega_moe"
+    FMHA_FP8 = "fmha_fp8"
 
 
 @dataclass(frozen=True)
@@ -138,7 +140,12 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
     ``flydsl.expr``). Job collection is therefore not free in the
     parent process, just shifted once out of every child."""
     if kind is OpKind.MEGA_MOE:
-        from .mega_moe import default_jobs
+        from .mega_moe import production_jobs
+
+        # Ships both V4-Pro and Kimi-K3 so neither JITs online at serving time.
+        return production_jobs()
+    if kind is OpKind.FMHA_FP8:
+        from .fmha_fp8 import default_jobs
 
         return default_jobs()
     if kind is OpKind.MOE:
@@ -147,6 +154,8 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
         from .mxfp4_moe import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.GEMM:
         from .gemm import DEFAULT_CSVS, parse_csv
+    elif kind is OpKind.CONV:
+        from .conv import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.GROUPED_MOE:
         from .grouped_moe import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.CHUNK_GDN_H:
@@ -159,12 +168,16 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
 def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
     if kind is OpKind.MEGA_MOE:
         from .mega_moe import compile_one_config
+    elif kind is OpKind.FMHA_FP8:
+        from .fmha_fp8 import compile_one_config
     elif kind is OpKind.MOE:
         from .moe import compile_one_config
     elif kind is OpKind.MXFP4_MOE:
         from .mxfp4_moe import compile_one_config
     elif kind is OpKind.GEMM:
         from .gemm import compile_one_config
+    elif kind is OpKind.CONV:
+        from .conv import compile_one_config
     elif kind is OpKind.GROUPED_MOE:
         from .grouped_moe import compile_one_config
     elif kind is OpKind.CHUNK_GDN_H:
@@ -260,8 +273,9 @@ def _run_file_pool(
     kernel_timeout: float,
     max_retries: int,
     result_dir: str,
+    start_method: str = "fork",
 ) -> list[dict[str, Any] | None]:
-    ctx = multiprocessing.get_context("fork")
+    ctx = multiprocessing.get_context(start_method)
     n = len(specs)
     results: list[dict[str, Any] | None] = [None] * n
     attempts = [0] * n
@@ -388,6 +402,8 @@ def _run_file_pool(
 def run_jobs_parallel(
     worker: Callable[..., dict[str, Any]],
     jobs: list[dict[str, Any]],
+    *,
+    start_method: str = "fork",
 ) -> list[dict[str, Any]]:
     if not jobs:
         return []
@@ -400,7 +416,12 @@ def run_jobs_parallel(
     try:
         specs = [(worker, job, str(job.get("kernel_name", "?"))) for job in jobs]
         raw = _run_file_pool(
-            specs, max_workers, get_kernel_timeout(), get_max_retries(), result_dir
+            specs,
+            max_workers,
+            get_kernel_timeout(),
+            get_max_retries(),
+            result_dir,
+            start_method,
         )
     finally:
         shutil.rmtree(result_dir, ignore_errors=True)

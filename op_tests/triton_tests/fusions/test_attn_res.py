@@ -6,6 +6,7 @@ import torch
 
 import aiter.ops.triton.fusions.attn_res as attn_res_module
 from aiter.ops.triton.fusions.attn_res import attn_res_fwd, attn_res_gate
+from aiter.ops.triton.utils import config_utils
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 # (dtype -> (atol, rtol)) for comparing against the fp32 torch reference.
@@ -781,6 +782,20 @@ def test_attn_res_separate_bl_is_pinned_to_one_without_close_block():
             # ... while the gated-on path still has live BL>1 buckets, so this
             # test cannot pass just because the table went flat everywhere.
     assert pick(4096, 8, True) == 4
+
+
+@pytest.mark.parametrize("arch", ["gfx950", "gfx942"])
+@pytest.mark.parametrize("close_block", [False, True])
+@pytest.mark.parametrize("tokens", [257, 2048, 2049])
+def test_attn_res_separate_num_warps_boundaries(monkeypatch, arch, close_block, tokens):
+    """gfx950 overrides the packed num_warps from B >= 3, except close_block at
+    N <= 2048; arches without the config keep the packed pick."""
+    monkeypatch.setattr(config_utils.arch_info, "get_arch", lambda: arch)
+    pick = attn_res_module._pick_attn_res_separate_num_warps
+    keep = -1  # stands in for the packed table's pick
+    assert pick(tokens, 2, close_block, keep) == keep
+    overridden = arch == "gfx950" and (not close_block or tokens > 2048)
+    assert (pick(tokens, 3, close_block, keep) != keep) == overridden
 
 
 @pytest.mark.parametrize("N", [512, 4096])
