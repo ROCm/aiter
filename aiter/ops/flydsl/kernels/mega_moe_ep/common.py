@@ -29,6 +29,7 @@ from ..mega_moe_tp.common import (  # noqa: F401  (re-exported device primitives
     bf16x8_to_f32,
     bld,
     bst,
+    cat8,
     dma4,
     dma16,
     e8_scale,

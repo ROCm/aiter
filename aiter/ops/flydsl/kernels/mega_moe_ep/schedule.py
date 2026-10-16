@@ -70,6 +70,11 @@ def build_schedule(kc: KernelCtx) -> dict:
     L_CTL, L_DCH, L_DCNT, L_DYN = kc.get("L_CTL L_DCH L_DCNT L_DYN")
     L_EOFF, L_RIX, L_WSUM, NBW = kc.get("L_EOFF L_RIX L_WSUM NBW")
     const_expr, rch = kc.get("const_expr rch")
+    # GEMM1/GEMM2 + the per-unit A stager (gemm.build_gemm) and the combine epilogue
+    # (communication.build_communication) are added to kc before build_schedule.
+    a_loader, gemm1, gemm2 = kc.get("a_loader gemm1 gemm2")
+    combine_send = kc.get("combine_send")[0]
+    dispatch_wait = kc.get("dispatch_wait")[0]
     assert L_EOFF is not None and const_expr  # L_EOFF: gather offsets (future)
 
     @flyc.jit
@@ -161,7 +166,11 @@ def build_schedule(kc: KernelCtx) -> dict:
                 i32(0),
             )
             r = lds_ld_i32(L, L_DCNT + e * i32(4))
-            ce = fx.min(fx.max(ceildiv(r, i32(rch)), i32(1)), i32(255))
+            # Target rch/2 rows per chunk, not rch: gather chunks by sk%ce (deterministic
+            # but uneven), so a fuller target lets an unlucky bucket exceed rch and drop
+            # rows (the gather caps at rch). Half-full keeps the max bucket well under rch.
+            # TODO(tune): deterministic idx-rank chunking for a hard guarantee.
+            ce = fx.min(fx.max(ceildiv(r, i32(max(rch // 2, 1))), i32(1)), i32(255))
             ce = live.select(ce, i32(0))
             pre, tot = _wave_prefix(ce, 8)
             if lane == i32(0):
@@ -210,10 +219,17 @@ def build_schedule(kc: KernelCtx) -> dict:
     def dyn_plan(L, tid, a):
         """Scan this rank's received routing -> per-local-expert bitmap + counts ->
         active list -> row-chunk table -> per-CTA unit list [u_lo, u_hi) (XCD-aware)."""
-        n = a["nrecv"]
-        rle = rsrc(a["recv_le"], n * i32(4))
-        for idx_ in range(tid, n, i32(NT)):
-            idx = i32(idx_)
+        rle = rsrc(a["recv_le"], a["nrecv"] * i32(4))
+        # Scan only the LIVE window -- npes source ranks x m tokens x topk routes -- not
+        # the full mtpr capacity, mapping the compact index back to the real recv_le slot
+        # (p*mtpr*topk + within-block). Assumes a uniform per-rank token count m (true for
+        # the EP tests / balanced serving); TODO: carry a global max-m for skewed ranks.
+        blk = a["m"] * i32(TOPK)
+        stride_p = a["mtpr"] * i32(TOPK)
+        for c_ in range(tid, a["npes"] * blk, i32(NT)):
+            c = i32(c_)
+            p = c // blk
+            idx = p * stride_p + (c - p * blk)
             le = fx.Int32(bld(rle, idx * i32(4), 0, T.i32, 0))
             if masked(le) == fx.Boolean(False):
                 lds_atomic_or(
@@ -239,13 +255,16 @@ def build_schedule(kc: KernelCtx) -> dict:
         balanced). L_RIX stores each row's recv slot idx = source_key*topk + route; the
         GEMM reads payload row source_key = idx//topk, and combine recovers route =
         idx%topk (and source_key -> src rank/token) to scatter the result back."""
-        n = a["nrecv"]
-        rle = rsrc(a["recv_le"], n * i32(4))
+        rle = rsrc(a["recv_le"], a["nrecv"] * i32(4))
+        blk = a["m"] * i32(TOPK)  # live window per source rank (see dyn_plan)
+        stride_p = a["mtpr"] * i32(TOPK)
         if tid == i32(0):
             lds_st(L, L_CTL + C_CNT * 4, i32(0))
         cbar(L, tid)
-        for idx_ in range(tid, n, i32(NT)):
-            idx = i32(idx_)
+        for c_ in range(tid, a["npes"] * blk, i32(NT)):
+            c = i32(c_)
+            p = c // blk
+            idx = p * stride_p + (c - p * blk)
             le = fx.Int32(bld(rle, idx * i32(4), 0, T.i32, 0))
             sk = idx // i32(TOPK)
             if (le == expert) & ((sk % ce) == cc):
@@ -255,14 +274,28 @@ def build_schedule(kc: KernelCtx) -> dict:
         cbar(L, tid)
         return fx.min(lds_ld_i32(L, L_CTL + C_CNT * 4), i32(rch))
 
+    @flyc.jit
     def unit_tile(L, tid, a, expert, i0, icnt, r0, rows, sig):
-        # TODO(compute): local-expert GEMM1(expert, i0, icnt) + act + GEMM2 on these
-        # `rows` received tokens, then combine_send the weighted partial (signal on sig).
-        del L, tid, a, expert, i0, icnt, r0, rows, sig
+        # One row tile per unit chunk (R <= rch == RG, so the r0 loop is a single pass):
+        # stage A -> GEMM1 (A x W1 gate|up + act -> global intermediate) -> GEMM2
+        # (intermediate x W2 -> gout) -> combine_send scatters gout back to the sources.
+        del r0, sig
+        a_loader(L, tid, a)
+        cbar(L, tid)
+        gemm1(L, tid, a, expert, i0, icnt, rows)
+        cbar(L, tid)
+        gemm2(L, tid, a, expert, rows, rsrc(a["gout"]))
+        cbar(L, tid)
+        if tid < i32(64):
+            combine_send(L, tid, a, rsrc(a["gout"]), rows)
 
     @flyc.jit
     def compute_units(L, tid, a):
-        """Run the planner, then walk this CTA's unit list (GEMM body is a stub)."""
+        """Wait for the all-to-all dispatch to finish filling this rank's recv_le, then
+        run the planner and walk this CTA's unit list."""
+        if tid == i32(0):
+            dispatch_wait(a, a["epoch"] & i32(1), i32(0))
+        cbar(L, tid)
         dyn_plan(L, tid, a)
         ub = lds_ld_i32(L, L_CTL + C_UNIT * 4)
         ue = lds_ld_i32(L, L_CTL + (C_UNIT + 1) * 4)

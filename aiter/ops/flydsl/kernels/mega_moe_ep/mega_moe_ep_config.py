@@ -51,6 +51,8 @@ __all__ = [
     "FLAG_COMB_CNT",
     "FLAG_DISPATCH",
     "FLAG_DISP_CNT",
+    "FLAG_INIT",
+    "FLAG_INIT_CNT",
     "FLAG_INTS",
     "MAX_NPES",
     "NCHA",
@@ -113,7 +115,11 @@ FLAG_DISPATCH = 0
 FLAG_DISP_CNT = FLAG_DISPATCH + 2 * NCTA_MAX
 FLAG_COMBINE = FLAG_DISP_CNT + 2 * NCTA_MAX
 FLAG_COMB_CNT = FLAG_COMBINE + 2 * NCTA_MAX
-FLAG_INTS = FLAG_COMB_CNT + 2 * NCTA_MAX
+# FLAG_INIT + parity*NCTA_MAX + 0        post-init all-to-all barrier ready (epoch)
+# FLAG_INIT_CNT + parity*NCTA_MAX + 0    post-init arrival counter (npes*n_cta)
+FLAG_INIT = FLAG_COMB_CNT + 2 * NCTA_MAX
+FLAG_INIT_CNT = FLAG_INIT + 2 * NCTA_MAX
+FLAG_INTS = FLAG_INIT_CNT + 2 * NCTA_MAX
 
 # Global control ints (device tensor): a sticky watchdog error word plus room.
 CTRL_ERR = 0
@@ -250,8 +256,12 @@ def kernel_config(
     CH1, CH2, M_REPEAT = c["CH1"], c["CH2"], c["M_REPEAT"]
     N_TILES, NUM_ACC_N = c["N_TILES"], c["NUM_ACC_N"]
     A_K_STEP, K_ITERS, A_LDS_I32 = c["A_K_STEP"], c["K_ITERS"], c["A_LDS_I32"]
-    # GEMM1 inter-piece choices the planner balances over (full inter dim = KS2 blocks).
-    DYN_PS = [p for p in range(1, KS2 + 1) if KS2 % p == 0]
+    # GEMM1 inter-piece choices the planner balances over. BRING-UP: fixed at P=1 (no
+    # inter split). unit_tile fuses GEMM1->GEMM2 per unit and GEMM2 contracts the full
+    # inter dim, so one unit must own the whole inter dim; P>1 would feed GEMM2 an
+    # incomplete intermediate. TODO(tune): separate GEMM1/GEMM2 phases over a shared full
+    # intermediate to re-enable P>1 ([p for p in range(1, KS2+1) if KS2 % p == 0]).
+    DYN_PS = [1]
     rch = RG  # dynamic row chunk = one row tile (16*mt)
     const_expr = fx.const_expr
     name = (

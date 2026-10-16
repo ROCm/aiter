@@ -26,10 +26,11 @@ import inspect
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import gpu
+from flydsl.expr import gpu, range_constexpr
 
 from .common import i32, lds_st, uni
 from .communication import build_communication
+from .gemm import build_gemm
 from .mega_moe_ep_config import (
     B_COMBINE,
     B_LOADER,
@@ -81,11 +82,12 @@ def compile_mega_moe_ep(
         indexed_payload=indexed_payload,
     )
     kc.add(build_communication(kc))
+    kc.add(build_gemm(kc))
     kc.add(build_schedule(kc))
     name, LDS_BYTES = kc.get("name LDS_BYTES")
     NBW, L_DYN, L_DCNT, L_CTL = kc.get("NBW L_DYN L_DCNT L_CTL")
     compute_units, dispatch_send = kc.get("compute_units dispatch_send")
-    init_recv, combine_final = kc.get("init_recv combine_final")
+    combine_final, barrier_init = kc.get("combine_final barrier_init")
 
     @flyc.jit
     def init_lds(L, tid, a):
@@ -101,12 +103,6 @@ def compile_mega_moe_ep(
             lds_st(L, L_CTL + C_PLAN * 4, i32(0))
 
     @flyc.jit
-    def a_loader(L, tid, a):
-        # TODO(compute): stage the gathered payload rows (L_RIX -> a["payload"]) into
-        # LDS for the GEMM, like TP a_loader.
-        del L, tid, a
-
-    @flyc.jit
     def comm_help(L, tid, a, epoch):
         # TODO(tune): assist dispatch / combine (drain pending a2a packets, poll flags).
         del L, tid, a, epoch
@@ -120,7 +116,6 @@ def compile_mega_moe_ep(
             dispatch_send(L, tid % i32(64), a)
             comm_help(L, tid, a, epoch)
         elif tid < i32(B_COMBINE):  # [NT+64, NT+128)
-            a_loader(L, tid, a)
             comm_help(L, tid, a, epoch)
         else:  # [NT+128, NTT)
             comm_help(L, tid, a, epoch)
@@ -156,6 +151,9 @@ def compile_mega_moe_ep(
         off_part: fx.Int64,
         off_flag: fx.Int64,
         off_out: fx.Int64,
+        inter: fx.Int64,
+        inters: fx.Int64,
+        gout: fx.Int64,
         rank: fx.Int32,
         npes: fx.Int32,
         epr: fx.Int32,
@@ -170,7 +168,7 @@ def compile_mega_moe_ep(
         L = uni(fx.Int32(fx.ptrtoint(lds.buf.ptr)))
         peers = [p0, p1, p2, p3, p4, p5, p6, p7]
         mine = peers[0]
-        for j in range(1, 8):
+        for j in range_constexpr(1, 8):
             mine = (rank == i32(j)).select(peers[j], mine)
         a["peer"] = peers
         a["mine"] = fx.Int64(mine)
@@ -179,10 +177,11 @@ def compile_mega_moe_ep(
             npes * mtpr * i32(TOPK)
         )  # dynamic-planner scan bound (indexed recv)
         init_lds(L, tid, a)
-        init_recv(L, tid, a)
         gpu.barrier()
-        # TODO(bring-up): a cross-rank "inited" barrier here so a peer's dispatch_send
-        # cannot race this rank's init_recv (sentinel) write.
+        # recv_le is sentinel'd on the host on THIS stream before the launch (stream
+        # order); barrier_init is the cross-rank wait so a peer only dispatches once every
+        # rank's fill is done -- no host sync/barrier, so forward() stays a stream pipeline.
+        barrier_init(L, tid, a)
         roles(L, tid, a, epoch)
         gpu.barrier()
         combine_final(L, tid, a)
@@ -217,6 +216,9 @@ def compile_mega_moe_ep(
         off_part: fx.Int64,
         off_flag: fx.Int64,
         off_out: fx.Int64,
+        inter: fx.Int64,
+        inters: fx.Int64,
+        gout: fx.Int64,
         rank: fx.Int32,
         npes: fx.Int32,
         epr: fx.Int32,

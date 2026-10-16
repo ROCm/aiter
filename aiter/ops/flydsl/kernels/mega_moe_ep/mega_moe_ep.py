@@ -13,7 +13,9 @@ import torch.nn.functional as F
 
 from aiter.utility import fp4_utils
 
+from ..mega_moe.quant import per_1x32_mx_quant
 from ..mega_moe_tp.mega_moe_tp import SymmetricArena
+from ..tensor_shim import _run_compiled
 from .mega_moe_ep_config import (
     CTRL_INTS,
     FLAG_INTS,
@@ -229,7 +231,28 @@ class MegaMoeEPEngine:
         arena.commit()
         self.arena = arena
         self.ctrl = torch.zeros(CTRL_INTS, dtype=torch.int32, device=self.device)
-        self.epoch = 0
+        # Epoch starts at 1: the arena ready-flags are zero-initialized and the waits are
+        # serial-number ``flag >= epoch`` (wrap-safe ``before``), so epoch 0 would make
+        # every dispatch_wait / combine_wait pass instantly (0 >= 0) and all cross-wave /
+        # cross-rank ordering would collapse into a race.
+        self.epoch = 1
+        # Per-CTA GEMM scratch (local, NOT peer-visible): GEMM1 writes the E8M0-quantized
+        # intermediate (inter / inters), GEMM2 reads it + writes model-dim bf16 (gout) for
+        # combine_send. Indexed bid*RG*row in the kernel; sized for the largest row tile
+        # (mt=3 -> RG=48) so a smaller-RG launch indexes a strict prefix.
+        rg_max = 48
+        a_pack = 1 if self.a8 else 2
+        self._inter = torch.empty(
+            self.n_cta * rg_max * (self.I // a_pack),
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        self._inters = torch.empty(
+            self.n_cta * rg_max * (self.I // 32), dtype=torch.uint8, device=self.device
+        )
+        self._gout = torch.empty(
+            self.n_cta * rg_max * self.H, dtype=torch.bfloat16, device=self.device
+        )
 
     def _bind_weights(self, w1, w1_scale, w2, w2_scale):
         self.w1, self.w1s, self.w2, self.w2s = (
@@ -244,7 +267,9 @@ class MegaMoeEPEngine:
         mt = 1 if m <= 32 else 2 if m <= 64 else 3
         while mt > 1:
             if (
-                mega_moe_ep_consts(self.H, self.I, mt, self.a8)["LDS_BYTES"]
+                mega_moe_ep_consts(
+                    self.H, self.I, mt, self.epr, self.mtpr * self.world_size, self.a8
+                )["LDS_BYTES"]
                 <= LDS_LIMIT
             ):
                 break
@@ -330,6 +355,9 @@ class MegaMoeEPEngine:
             self._part.offset,
             self._flag.offset,
             self._out.offset,
+            self._inter.data_ptr(),
+            self._inters.data_ptr(),
+            self._gout.data_ptr(),
             self.rank,
             self.world_size,
             self.epr,
@@ -352,16 +380,26 @@ class MegaMoeEPEngine:
         run_tokens = int(x_bf16.shape[0])
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
-        # Select + compile the launcher and advance the launch epoch (host plumbing is
-        # live even while the device roles are stubs) so config / compile errors surface.
-        self._launcher(self.config(run_tokens))
-        self.epoch += 1
-        raise NotImplementedError(
-            "MegaMoeEP: the one-launch EP kernel is not assembled yet (device roles are "
-            "stubs -- dispatch_send / compute / combine / roles_entry milestones). "
-            "_launch_args is wired; use reference_forward(...) / ep_reference(...) as "
-            "the oracle meanwhile."
+        del mask_invalid_slots  # TODO(C): expected-route masking in combine_final
+        fn = self._launcher(self.config(run_tokens))
+        # Dynamic MX quant of the activations (same per-1x32 MX path as MegaMoEV2); the
+        # scales are natural [m, H/32], which dispatch copies verbatim into pscale.
+        x_q, xs = per_1x32_mx_quant(
+            x_bf16.contiguous(), quant_mode="fp8" if self.a8 else "fp4"
         )
+        out = torch.zeros((self.mtpr, self.H), dtype=torch.bfloat16, device=self.device)
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        # recv_le init (SENTINEL = epr, masked by the planner) on the kernel stream, so it
+        # is ordered before the launch; the kernel's barrier_init orders it cross-rank.
+        # No host sync / dist.barrier -> forward() is a pure stream pipeline.
+        with torch.cuda.stream(stream):
+            self._recv.local.fill_(self.epr)
+        _run_compiled(
+            fn, *self._launch_args(run_tokens, x_q, xs, topk_ids, wts, out), stream
+        )
+        self.epoch += 1
+        return out[:run_tokens] if slice_output else out
 
     __call__ = forward
 

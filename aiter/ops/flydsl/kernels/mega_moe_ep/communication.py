@@ -50,6 +50,8 @@ from .mega_moe_ep_config import (
     FLAG_COMBINE,
     FLAG_DISP_CNT,
     FLAG_DISPATCH,
+    FLAG_INIT,
+    FLAG_INIT_CNT,
     MAX_NPES,
     NCTA_MAX,
     NT,
@@ -64,6 +66,7 @@ def build_communication(kc: KernelCtx) -> dict:
     """The arena / flag / watchdog device functions of one instance (added to kc)."""
     const_expr = kc.get("const_expr")[0]
     TOPK, E, H, a8, EPR = kc.get("TOPK E H a8 EPR")
+    RG = kc.get("RG")[0]  # gout row tile per CTA (combine_send reads this CTA's rows)
     L_RIX = kc.get("L_RIX")[0]  # the compute wave's gathered recv-slot list (per unit)
     ROW_BYTES = H if a8 else H // 2  # quantized activation bytes per row (FP8 vs FP4)
     N_VEC = ROW_BYTES // 16  # 16-byte (V4I) copy units per payload row
@@ -81,7 +84,9 @@ def build_communication(kc: KernelCtx) -> dict:
         return v
 
     def peer_rs(a, p, key, nbytes=None):
-        return rsrc(fx.Int64(a["peer"][p]) + fx.Int64(a[key]), nbytes)
+        # p (source rank) is a runtime value: select the peer base with peer_sel, never
+        # index the Python peer list.
+        return rsrc(peer_sel(a, p) + fx.Int64(a[key]), nbytes)
 
     def own_rs(a, key, nbytes=None):
         return rsrc(a["mine"] + fx.Int64(a[key]), nbytes)
@@ -137,6 +142,32 @@ def build_communication(kc: KernelCtx) -> dict:
         )
 
     @flyc.jit
+    def init_arrive(a, p, parity, expected):
+        old = g_add_agent(peer_flag(a, p, FLAG_INIT_CNT, parity, i32(0)), i32(1))
+        if old + i32(1) == expected:
+            g_st_sys(peer_flag(a, p, FLAG_INIT_CNT, parity, i32(0)), i32(0))
+            g_st_sys(peer_flag(a, p, FLAG_INIT, parity, i32(0)), a["epoch"])
+
+    @flyc.jit
+    def barrier_init(L, tid, a):
+        """Cross-rank init barrier: recv_le is host-filled on this stream before the
+        launch, so "this rank is ready" is a per-RANK fact -- only block 0 arrives (one
+        signal per rank, expected=npes), while every CTA waits the stamp. That is an
+        npes-way barrier instead of a (#CU * npes)-way single-counter atomic storm."""
+        del L
+        parity = a["epoch"] & i32(1)
+        npes = a["npes"]
+        if (i32(gpu.block_id("x")) == i32(0)) & (tid == i32(0)):
+            for p in range_constexpr(MAX_NPES):
+                if i32(p) < npes:
+                    init_arrive(a, i32(p), parity, npes)
+        if tid == i32(0):
+            spin_sys_ge(
+                own_flag(a, FLAG_INIT, parity, i32(0)), a["epoch"], a, ERR_DISPATCH
+            )
+        gpu.barrier()
+
+    @flyc.jit
     def combine_arrive(a, p, parity, tile, delta, expected):
         """Mirror of ``dispatch_arrive`` for GEMM2 partials scattered back to source."""
         old = g_add_agent(peer_flag(a, p, FLAG_COMB_CNT, parity, tile), delta)
@@ -158,6 +189,9 @@ def build_communication(kc: KernelCtx) -> dict:
         rle = own_rs(a, "off_recv", n * i32(4))
         for s_ in range(tid, n, i32(NT)):
             bst(i32(SENTINEL), rle, i32(s_) * i32(4), 0, 0)
+        # commit the sentinels to HBM before barrier_init signals peers -- otherwise an
+        # in-flight sentinel can land AFTER a peer's post-barrier dispatch write and clobber it.
+        wait_vm(0)
 
     @flyc.jit
     def dispatch_send(L, lane, a):
@@ -168,10 +202,17 @@ def build_communication(kc: KernelCtx) -> dict:
         each rank signals every owner it is done (an all-to-all dispatch barrier)."""
         m, mtpr, rank, epr, npes = a["m"], a["mtpr"], a["rank"], a["epr"], a["npes"]
         parity = a["epoch"] & i32(1)
+        nblk = i32(gpu.grid_dim.x)
         rids = rsrc(a["ids"], m * i32(TOPK) * i32(4))
         rx = rsrc(a["x"])
         rxs = rsrc(a["xs"])
-        for wk_ in range(i32(0), m * i32(TOPK), i32(1)):
+        # block-strided over (token, route): every CTA scatters a DISJOINT slice (no
+        # redundant a2a). recv_le is host-initialized + barriered before launch, so the
+        # P2P writes have no init race to land into. The arrival count below is npes*nblk
+        # (every CTA of every rank arrives once), so the owner only stamps DISPATCH after
+        # all senders finish -- compute never reads recv_le early.
+        bid = i32(gpu.block_id("x"))
+        for wk_ in range(bid, m * i32(TOPK), nblk):
             wk = i32(wk_)
             t = wk // i32(TOPK)
             r = wk - t * i32(TOPK)
@@ -211,11 +252,18 @@ def build_communication(kc: KernelCtx) -> dict:
                             0,
                             AUX_SYS,
                         )
+            else:
+                # dropped/invalid route: this rank is the source, so pre-count it into
+                # this rank's single combine counter now -- combine_send only arrives for
+                # valid routes later, and combine_wait expects m*TOPK total.
+                if lane == i32(0):
+                    combine_arrive(a, rank, parity, i32(0), i32(1), m * i32(TOPK))
         wait_vm(0)
         if lane == i32(0):
             for p in range_constexpr(MAX_NPES):
                 if i32(p) < npes:
-                    dispatch_arrive(a, i32(p), parity, i32(0), i32(1), npes)
+                    # one arrival per (sender rank, CTA): owner stamps at npes*nblk.
+                    dispatch_arrive(a, i32(p), parity, i32(0), i32(1), npes * nblk)
 
     # --- combine (GEMM2 epilog scatter back to source + source-side weighted sum) --
     @flyc.jit
@@ -226,6 +274,7 @@ def build_communication(kc: KernelCtx) -> dict:
         source (combine_arrive). ``src_out`` / ``nrows`` are the compute wave's GEMM2
         output + row count, wired at bring-up."""
         mtpr = a["mtpr"]
+        m = a["m"]
         parity = a["epoch"] & i32(1)
         HV = H // 8
         for k_ in range(i32(0), nrows, i32(1)):
@@ -237,12 +286,13 @@ def build_communication(kc: KernelCtx) -> dict:
             src_tok = sk - src_rank * mtpr
             slot = src_tok * i32(TOPK) + route
             dpart = peer_rs(a, src_rank, "off_part")
+            obase = i32(gpu.block_id("x")) * i32(RG * HV)  # this CTA's gout rows
             for g_ in range(lane, i32(HV), i32(64)):
                 g = i32(g_)
-                v = bld(src_out, (k * i32(HV) + g) * i32(16), 0, V4I, 0)
+                v = bld(src_out, (obase + k * i32(HV) + g) * i32(16), 0, V4I, 0)
                 bst(v, dpart, (slot * i32(HV) + g) * i32(16), 0, AUX_SYS)
             if lane == i32(0):
-                combine_arrive(a, src_rank, parity, src_tok, i32(1), i32(TOPK))
+                combine_arrive(a, src_rank, parity, i32(0), i32(1), m * i32(TOPK))
         wait_vm(0)
 
     @flyc.jit
@@ -256,21 +306,27 @@ def build_communication(kc: KernelCtx) -> dict:
         parity = a["epoch"] & i32(1)
         rpart = own_rs(a, "off_part")
         rwts = rsrc(a["wts"], m * i32(TOPK) * i32(4))
+        rids = rsrc(a["ids"], m * i32(TOPK) * i32(4))
         rout = rsrc(a["out"])
         HV = H // 8
         nblk = i32(gpu.grid_dim.x)
+        # one per-rank combine barrier: wait until all m*TOPK partials for this rank's
+        # tokens have been scattered back (single tile-0 counter, no per-token flags).
+        if tid == i32(0):
+            combine_wait(a, parity, i32(0))
+        gpu.barrier()
         for t_ in range(i32(gpu.block_id("x")), m, nblk):
             t = i32(t_)
-            if tid == i32(0):
-                combine_wait(a, parity, t)
-            gpu.barrier()
             for g_ in range(tid, i32(HV), i32(NTT)):
                 g = i32(g_)
                 acc = [fx.Float32(0.0) for _ in range(8)]
                 for r in range_constexpr(TOPK):
+                    e = fx.Int32(bld(rids, (t * i32(TOPK) + i32(r)) * i32(4), 0, T.i32, 0))
                     w = fx.Int32(
                         bld(rwts, (t * i32(TOPK) + i32(r)) * i32(4), 0, T.i32, 0)
                     ).bitcast(fx.Float32)
+                    # drop invalid routes (their part slot was never scattered)
+                    w = ((e >= i32(0)) & (e < i32(E))).select(w, fx.Float32(0.0))
                     pv = bld(
                         rpart,
                         ((t * i32(TOPK) + i32(r)) * i32(HV) + g) * i32(16),
@@ -279,9 +335,8 @@ def build_communication(kc: KernelCtx) -> dict:
                         0,
                     )
                     fv = bf16x8_to_f32(pv)
-                    for i in range(8):
+                    for i in range_constexpr(8):
                         acc[i] = acc[i] + w * fv[i]
                 bst(pack_bf16x8(acc), rout, (t * i32(HV) + g) * i32(16), 0, 0)
-            gpu.barrier()
 
     return locals()
