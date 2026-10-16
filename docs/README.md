@@ -1,225 +1,50 @@
-# AITER Documentation
+# Building AITER documentation
 
-This directory contains the source files for AITER's documentation, built with [Sphinx](https://www.sphinx-doc.org/).
-
-## Quick Start
-
-### Build Locally
+Use Python 3.10+ in an isolated environment. The build requires no GPU, ROCm,
+PyTorch, AITER installation or initialized kernel submodules.
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Build HTML documentation
-make html
-
-# Open in browser
-open _build/html/index.html  # macOS
-xdg-open _build/html/index.html  # Linux
+python -m venv .venv-docs
+. .venv-docs/bin/activate
+python -m pip install -r docs/requirements.txt
+python docs/check_examples.py
+sphinx-build -n -W --keep-going -b html docs docs/_build/html
 ```
 
-### Live Preview (Recommended)
+Open `docs/_build/html/index.html`. Both reStructuredText and Markdown are
+published. Add user-facing pages to a toctree; repository-only maintenance
+notes are explicitly excluded in `conf.py`.
+
+## Source-backed API references
+
+Use `.. aiter-function:: aiter.ops.module.function` to render a signature and
+revision-pinned source link. The directive parses Python syntax without
+executing imports and fails on a missing function. It deliberately does not
+pretend to validate runtime exports or kernel support. Check those on a matched
+ROCm stack. Handwritten explanations must document layouts, dtype restrictions,
+return values and mutation behavior alongside the generated signature.
+
+The quickstart includes regions from `docs/examples/quickstart.py`. Its static
+check verifies direct AITER imports and call signatures without importing GPU
+packages. On a supported CDNA ROCm stack, run:
 
 ```bash
-# Install sphinx-autobuild
-pip install sphinx-autobuild
-
-# Start live server (auto-rebuilds on changes)
-make livehtml
-
-# Open http://127.0.0.1:8000 in your browser
+python docs/examples/quickstart.py
 ```
 
-## Documentation Structure
+This validates actual imports, dispatch and numerical results. Record the script
+output, source commit and environment with the result; a successful CPU docs
+build is not a GPU validation result.
 
-```
-docs/
-├── conf.py              # Sphinx configuration
-├── index.rst            # Homepage
-├── installation.rst     # Installation guide
-├── quickstart.rst       # Quick start tutorial
-├── api/                 # API reference
-│   ├── attention.rst    # Attention operations
-│   ├── gemm.rst         # GEMM operations
-│   ├── operators.rst    # Core operators
-│   └── ...
-├── tutorials/           # Tutorials
-│   ├── index.rst
-│   ├── basic_usage.rst
-│   ├── attention_tutorial.rst
-│   └── ...
-├── _static/             # Static files (images, CSS, JS)
-└── _build/              # Built documentation (generated)
-```
+## CI and deployment
 
-## Writing Documentation
+`.github/workflows/docs.yml` builds pull requests and publishes successful main
+builds to GitHub Pages. Strict Sphinx warnings fail the job. No package install
+failure is swallowed. Public API and dependency changes trigger docs checks as
+well as edits under `docs/`.
 
-### Adding a New Page
-
-1. Create a new `.rst` file in the appropriate directory
-2. Add it to the `toctree` in `index.rst` or relevant section index
-3. Build and verify: `make html`
-
-### reStructuredText Syntax
-
-#### Headers
-
-```rst
-Page Title
-==========
-
-Section
--------
-
-Subsection
-^^^^^^^^^^
-```
-
-#### Code Blocks
-
-```rst
-.. code-block:: python
-
-   import aiter
-   output = aiter.flash_attn_func(q, k, v)
-```
-
-#### Links
-
-```rst
-:doc:`installation`              # Link to another document
-:ref:`my-label`                  # Link to a label
-`External Link <https://...>`_   # External URL
-```
-
-#### API Documentation
-
-```rst
-.. autofunction:: aiter.flash_attn_func
-.. autoclass:: aiter.FlashAttention
-   :members:
-```
-
-### Style Guide
-
-- **Headings**: Use sentence case (not title case)
-- **Code**: Use inline code for function names: ``` ``aiter.flash_attn_func()`` ```
-- **Examples**: Always include runnable code examples
-- **Links**: Use relative links for internal references
-- **Line length**: Keep lines under 100 characters when possible
-
-## Building Options
-
-### Check for Warnings
-
-```bash
-make html SPHINXOPTS="-W --keep-going"
-```
-
-This treats warnings as errors and shows all issues.
-
-### Check Links
-
-```bash
-make linkcheck
-```
-
-Validates all external links (may take a few minutes).
-
-### Clean Build
-
-```bash
-make clean
-make html
-```
-
-### PDF Output
-
-```bash
-make latexpdf
-```
-
-Requires LaTeX installation.
-
-## Deployment
-
-Documentation is automatically deployed to `https://rocm.github.io/aiter/` via GitHub Actions on every push to `main`.
-
-See [DEPLOYMENT.md](DEPLOYMENT.md) for details.
-
-## Contributing
-
-### Before Submitting
-
-1. ✅ Build locally and check for warnings
-2. ✅ Verify all links work (`make linkcheck`)
-3. ✅ Test code examples
-4. ✅ Check spelling and grammar
-5. ✅ Follow the style guide
-
-### Pull Request
-
-Documentation changes should be submitted via PR with:
-- Clear description of what's changed
-- Screenshots if adding new pages
-- Link to preview build (GitHub Actions provides artifacts)
-
-## Troubleshooting
-
-### "Module not found" errors
-
-Install AITER in development mode:
-
-```bash
-cd ..  # Go to repository root
-pip install -e .
-```
-
-### Missing dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-### Broken links in API docs
-
-Ensure the module is importable:
-
-```python
-import aiter
-print(dir(aiter))
-```
-
-### Build is slow
-
-Use `make html` instead of `make clean html` for incremental builds.
-
-## Tools
-
-### Useful Sphinx Extensions
-
-Already included:
-- `sphinx.ext.autodoc` - Auto-generate API docs from docstrings
-- `sphinx.ext.napoleon` - Support Google/NumPy docstring styles
-- `sphinx.ext.viewcode` - Add links to source code
-- `sphinx.ext.intersphinx` - Link to PyTorch docs
-- `sphinx_copybutton` - Copy button for code blocks
-
-### Theme
-
-We use `sphinx_rtd_theme` (Read the Docs theme) with AMD branding:
-- Primary color: AMD Red (#C00000)
-- Custom logo in `_static/`
-
-## Resources
-
-- [Sphinx Documentation](https://www.sphinx-doc.org/)
-- [reStructuredText Primer](https://www.sphinx-doc.org/en/master/usage/restructuredtext/basics.html)
-- [Read the Docs Theme](https://sphinx-rtd-theme.readthedocs.io/)
-- [Example: FlashInfer Docs](https://docs.flashinfer.ai/)
-
-## Support
-
-- **Documentation issues**: Open issue with `documentation` label
-- **Build problems**: Check GitHub Actions logs
-- **Content questions**: Ask in GitHub Discussions
+The reference currently needs no external Sphinx inventories, so builds do not
+contact third-party inventory endpoints. External hyperlinks remain explicit
+links; verify changed links separately rather than suppressing local warnings.
+The footer shows the source version and build date, and API links use the
+checkout's exact commit.

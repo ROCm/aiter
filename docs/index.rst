@@ -1,127 +1,36 @@
-.. AITER documentation master file
-
 AITER Documentation
 ===================
 
-**AITER** (AMD Inference and Training Enhanced Repository) is AMD's high-performance AI operator library for ROCm, providing optimized kernels for inference and training workloads.
+**AITER (AI Tensor Engine for ROCm)** provides optimized GPU operators for
+inference and training. Its HIP, Composable Kernel (CK), assembly, Triton and
+FlyDSL implementations cover attention, GEMM, MoE, normalization, quantization
+and communication.
 
-.. image:: https://img.shields.io/badge/ROCm-Compatible-red
-   :target: https://rocm.docs.amd.com/
-   :alt: ROCm Compatible
+This site follows **main**; it can describe changes newer than a published
+release. Source: |source_revision|. Built: |build_date|. For a released wheel,
+consult its `release notes <https://github.com/ROCm/aiter/releases>`_ and matching
+source tag. A source signature is not a claim that every backend, dtype and
+GPU combination has been validated.
 
-.. image:: https://img.shields.io/github/license/ROCm/aiter
-   :target: https://github.com/ROCm/aiter/blob/main/LICENSE
-   :alt: License
-
-Why AITER?
+Start here
 ----------
 
-* **High Performance**: Optimized kernels using Triton, Composable Kernel (CK), and hand-written assembly
-* **Comprehensive**: Supports both inference and training workloads
-* **Flexible**: C++ and Python APIs for easy integration
-* **AMD Optimized**: Built specifically for AMD GPUs and the ROCm platform
+* :doc:`installation`: choose a release wheel or a development checkout.
+* :doc:`quickstart`: compare attention, RMSNorm and MoE with reference results.
+* :doc:`tutorials/add_new_op`: trace an operator from Python through its HIP binding.
+* :doc:`autotuning_pipeline`: tune and validate configurations for your workload.
 
-Quick Start
------------
+Hardware
+--------
 
-Installation
-^^^^^^^^^^^^
-
-.. code-block:: bash
-
-   pip install aiter  # Coming soon!
-
-   # For now, install from source:
-   git clone --recursive https://github.com/ROCm/aiter.git
-   cd aiter
-   python3 setup.py develop
-
-Quick Example
-^^^^^^^^^^^^^
-
-.. code-block:: python
-
-   import aiter
-   import torch
-
-   # Example: Flash Attention
-   # TODO: Add actual example code
-
-Core Features
--------------
-
-Attention Kernels
-^^^^^^^^^^^^^^^^^
-
-* **Multi-Head Attention (MHA)**: Standard attention with optimized implementations
-* **Multi-Latent Attention (MLA)**: DeepSeek-style latent attention
-* **Paged Attention**: Efficient KV-cache management for serving
-
-GEMM Operations
-^^^^^^^^^^^^^^^
-
-* **Mixed Precision GEMM**: FP16, BF16, FP8, INT4 support
-* **Tuned GEMM**: Pre-tuned configurations for common shapes
-* **Fused Operations**: GEMM with activation fusion
-
-Mixture of Experts (MoE)
-^^^^^^^^^^^^^^^^^^^^^^^^^
-
-* **Fused MoE**: Optimized expert routing and computation
-* **Multiple Routing**: Support for various routing strategies
-* **Quantized Experts**: FP8 and INT4 expert weights
-
-Normalization
-^^^^^^^^^^^^^
-
-* **RMSNorm**: Root mean square normalization
-* **LayerNorm**: Standard layer normalization
-* **Fused Variants**: Combined with other operations
-
-Other Operators
-^^^^^^^^^^^^^^^
-
-* **RoPE**: Rotary position embeddings
-* **Quantization**: BF16/FP16 → FP8/INT4 conversion
-* **Element-wise**: Optimized basic operations
-* **Communication**: AllReduce and collective operations via Triton/Iris
-
-GPU Support
------------
-
-AITER supports AMD GPUs with the following architectures:
-
-.. list-table::
-   :header-rows: 1
-   :widths: 20 20 30 30
-
-   * - Architecture
-     - gfx Target
-     - Example GPUs
-     - ROCm Version
-   * - CDNA 2
-     - gfx90a
-     - MI210, MI250, MI250X
-     - ROCm 5.0+
-   * - CDNA 3
-     - gfx942
-     - MI300A, MI300X
-     - ROCm 6.0+
-   * - CDNA 3.5
-     - gfx950
-     - MI350X (upcoming)
-     - ROCm 6.3+
-
-Quick Links
------------
-
-* 🚀 :doc:`quickstart` - Get started in 5 minutes
-* 📖 :doc:`tutorials/add_new_op` - **How to add a new operator** (step-by-step)
-* 🔧 :doc:`api/attention` - Flash Attention API
-* 💡 :doc:`tutorials/basic_usage` - Basic usage examples
-
-Table of Contents
------------------
+The project lists CDNA3 (gfx942: MI300X/MI325X) and CDNA4 (gfx950:
+MI350/MI355X) support. RDNA3 (gfx1100), RDNA3.5 (gfx1151) and RDNA4
+(gfx1201) support is experimental: Triton and most FlyDSL kernels run there,
+along with many HIP kernels; most CK and assembly kernels are CDNA-only.
+Check the `maintained hardware table
+<https://github.com/ROCm/aiter#supported-hardware>`_ and the specific operator's
+tests before choosing a backend. Installing a package does not make all its
+operators portable to every target.
 
 .. toctree::
    :maxdepth: 2
@@ -142,24 +51,21 @@ Table of Contents
    api/operators
 
 .. toctree::
-   :maxdepth: 2
-   :caption: Advanced Topics
-
-   performance/benchmarks
-   performance/profiling
-   advanced/triton_kernels
-   advanced/ck_integration
-
-.. toctree::
    :maxdepth: 1
-   :caption: Development
+   :caption: Development and Operations
 
-   contributing
-   changelog
+   jit_cache
+   autotuning_pipeline
+   triton_comms
+   isa_kernel_optimization
+   examples/isa_optimization/README
+   aiter_container_nonroot_setup
+   newsletter/2026-05
 
-Indices and tables
-==================
+Related projects
+----------------
 
-* :ref:`genindex`
-* :ref:`modindex`
-* :ref:`search`
+`ATOM <https://rocm.github.io/ATOM/>`_ uses AITER for model serving;
+`FlyDSL <https://rocm.github.io/FlyDSL/>`_ supports kernel authoring;
+`MORI <https://rocm.github.io/mori/>`_ provides communication primitives.
+Use the dependency versions selected by your framework's tested stack.

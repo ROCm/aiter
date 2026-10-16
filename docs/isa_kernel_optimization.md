@@ -4,7 +4,7 @@ How to inspect, extract, modify, reassemble, test and profile the pre-built
 assembly kernels that AITER ships as code objects (`hsa/<arch>/<family>/*.co`),
 using only the LLVM tools bundled with ROCm.
 
-> **Scripts and Dockerfile:** [`docs/examples/isa_optimization/`](examples/isa_optimization/).
+> **Scripts and Dockerfile:** [`docs/examples/isa_optimization/`](examples/isa_optimization/README.md).
 > Everything below can be reproduced with `bash docs/examples/isa_optimization/roundtrip.sh <kernel.co>`.
 
 ## Overview
@@ -213,7 +213,7 @@ python3 docs/examples/isa_optimization/extract_asm.py $CO -o kernel.s
 
 `kernel.s` has three parts:
 
-```asm
+```text
         .amdgcn_target "amdgcn-amd-amdhsa--gfx942"
         .text
         .globl  _ZN5aiter32pa_bf16_pertokenFp8_gqa16_2tg_4wE
