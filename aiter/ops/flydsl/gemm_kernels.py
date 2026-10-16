@@ -8,12 +8,13 @@ from __future__ import annotations
 import functools
 import re
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from torch import Tensor
 
 from aiter import logger
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.utility.graph_alloc import persistent_alloc
 
 from .gemm_a16w16_gfx1250 import gemm_a16w16 as gemm_a16w16_gfx1250
@@ -301,8 +302,15 @@ def flydsl_preshuffle_gemm_a8(
     lds_stage: int = 2,
     enable_scheduler: bool = True,
     split_k: int = 1,
+    *,
+    scale_mode: str = "epilogue",
 ) -> Tensor:
-    """Compile and run FlyDSL preshuffle GEMM, optionally with fp32 split-K."""
+    """Run preshuffle GEMM with per-row/column or per-128-K FP32 scales.
+
+    Blockscale reads x_scale in K-block-major storage: contiguous [K/128, M],
+    or [M, K/128] with quantizer-transposed storage or column-major strides.
+    w_scale is contiguous [ceil(N/128), K/128], with FP8 on gfx942 or gfx950.
+    """
     compile_fn = _get_compile_fn()
     from aiter.utility import dtypes
 
@@ -322,13 +330,11 @@ def flydsl_preshuffle_gemm_a8(
         raise RuntimeError(
             f"[FlyDSL] ragged N ({n}) does not support split_k ({split_k})."
         )
-    if split_k < 1 or k % split_k != 0:
+    if split_k < 1:
+        raise RuntimeError(f"[FlyDSL] split_k ({split_k}) must be positive.")
+    if tile_k <= 0 or k % tile_k != 0:
         raise RuntimeError(
-            f"[FlyDSL] K ({k}) must be divisible by split_k ({split_k})."
-        )
-    if (k // split_k) % tile_k != 0:
-        raise RuntimeError(
-            f"[FlyDSL] K/split_k ({k // split_k}) is not a multiple of "
+            f"[FlyDSL] K ({k}) is not a multiple of "
             f"tile_k ({tile_k}). "
             f"Arguments not supported! Skipping gemm!"
         )
@@ -339,6 +345,61 @@ def flydsl_preshuffle_gemm_a8(
         in_dtype = "int8"
     else:
         raise ValueError(f"[FlyDSL] unsupported input dtype {XQ.dtype}")
+
+    if scale_mode not in ("epilogue", "blockscale"):
+        raise ValueError(f"scale_mode must be epilogue/blockscale, got {scale_mode!r}")
+    if scale_mode == "blockscale":
+        arch = get_gfx_runtime()
+        if (
+            in_dtype != "fp8"
+            or WQ.dtype != XQ.dtype
+            or arch not in ("gfx942", "gfx950")
+            or tile_k % 128
+        ):
+            raise ValueError(
+                "blockscale requires FP8 inputs, gfx942 or gfx950, "
+                "and tile_k divisible by 128"
+            )
+        for name, scale, shape in (
+            ("x_scale", x_scale, (k // 128, m)),
+            ("w_scale", w_scale, ((n + 127) // 128, k // 128)),
+        ):
+            valid_layout = tuple(scale.shape) == shape and scale.is_contiguous()
+            if name == "x_scale" and tuple(scale.shape) == (m, k // 128):
+                valid_layout = scale.is_contiguous() or all(
+                    extent == 1 or stride == expected
+                    for extent, stride, expected in zip(
+                        scale.shape, scale.stride(), (1, m)
+                    )
+                )
+            if scale.dtype != torch.float32 or not valid_layout:
+                raise ValueError(
+                    f"blockscale {name} must be FP32 {shape} in K-block-major storage"
+                )
+            if (
+                scale.numel() * scale.element_size()
+                >= PRESHUFFLE_FLAT_BUFFER_LIMIT_BYTES
+            ):
+                raise ValueError(f"blockscale {name} buffer must be smaller than 4 GiB")
+
+    if scale_mode == "epilogue":
+        # Scalar scales are broadcast inside the GEMM, without materialization.
+        def _norm_scale(name, scale, rows):
+            if scale.numel() not in (1, rows):
+                raise ValueError(
+                    f"[FlyDSL] {name} shape {tuple(scale.shape)} must have 1 "
+                    f"(per-tensor) or {rows} elements"
+                )
+            return scale
+
+        x_scale = _norm_scale("x_scale", x_scale, m)
+        w_scale = _norm_scale("w_scale", w_scale, n)
+
+    if scale_mode == "blockscale":
+        # Flatten storage, not logical metadata: contiguous() would reorder the
+        # supported column-major x-scale view instead of preserving kb*M+row.
+        x_scale = x_scale.as_strided((x_scale.numel(),), (1,))
+        w_scale = w_scale.view(-1)
 
     wpe = None if waves_per_eu <= 0 else waves_per_eu
 
@@ -374,6 +435,7 @@ def flydsl_preshuffle_gemm_a8(
         xcd_swizzle=int(xcd_swizzle),
         lds_stage=int(lds_stage),
         split_k=int(split_k),
+        scale_mode=scale_mode,
     )
 
     def _as_i8(t):
@@ -394,8 +456,8 @@ def flydsl_preshuffle_gemm_a8(
         # dtype is part of the executable's cache signature, so this must match
         # what the AOT pre-compile passes or every non-split-K kernel misses it.
         semaphore = torch.empty(0, dtype=torch.int32, device=Out.device)
-    # The layout-API launcher takes fx.Tensor args, so pass flat tensors
-    # directly rather than raw pointers.
+    # Explicit scale adaptors retain static sizes for scalar specialization;
+    # bare torch arguments have dynamic layouts.
     _run_compiled(
         exe,
         workspace.view(-1),
@@ -403,12 +465,13 @@ def flydsl_preshuffle_gemm_a8(
         semaphore,
         _as_i8(XQ.contiguous()).view(-1),
         _as_i8(WQ.contiguous()).view(-1),
-        x_scale.contiguous().view(-1),
-        w_scale.contiguous().view(-1),
+        flyc.from_torch_tensor(x_scale.contiguous().view(-1)),
+        flyc.from_torch_tensor(w_scale.contiguous().view(-1)),
         dummy_bias,
         m,
         n,
         fx.Stream(torch.cuda.current_stream()),
+        specialization_key=(x_scale.numel() == 1, w_scale.numel() == 1),
     )
     if out_contig is not Out:
         Out.copy_(out_contig)

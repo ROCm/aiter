@@ -89,11 +89,11 @@ EXPECTED = [
         False,
     ),
     (
-        # no tune script writes to the bpreshuffle blockscale CSV
+        # FlyDSL split-K blockscale tuner writes the bpreshuffle blockscale CSV
         "module_gemm_a8w8_blockscale_bpreshuffle_tune",
-        None,
+        "csrc/ck_gemm_a8w8_blockscale_bpreshuffle/gemm_a8w8_blockscale_bpreshuffle_tune.py",
         "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE",
-        True,
+        False,
     ),
     (
         "module_gemm_a8w8_blockscale_bpreshuffle_cktile_tune",
