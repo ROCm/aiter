@@ -74,6 +74,28 @@ _TUNED = [
     (32, 2880, 2048, 32, 32, 64, 8, 2, 1, 2, 1, 0, False),
 ]
 
+# Skinny ("sk") policy: one workgroup per block_n columns with the full K, which
+# k_waves waves split; no split_k, M/N waves or group_m.
+# (m, n, k, block_m, block_n, block_k, stages, k_waves)
+_SKINNY = [
+    # GLM-5.2 o_proj decode (N=6144, K=2048): each block_m tier the tuned rows use,
+    # at its top and with m well below it (rows >= m are masked, not computed)
+    (1, 6144, 2048, 8, 24, 64, 4, 4),
+    (8, 6144, 2048, 8, 24, 64, 4, 4),
+    (9, 6144, 2048, 16, 24, 64, 4, 4),
+    (16, 6144, 2048, 16, 24, 64, 4, 4),
+    (18, 6144, 2048, 24, 24, 64, 3, 4),
+    (24, 6144, 2048, 24, 24, 64, 3, 4),
+    (17, 6144, 2048, 32, 24, 64, 3, 4),
+    (32, 6144, 2048, 32, 24, 64, 3, 4),
+    # 171 slabs: not a multiple of the 8 XCDs, so the linear slab mapping runs
+    (5, 4104, 2048, 8, 24, 64, 4, 4),
+    # other slab widths, deeper K, two waves
+    (16, 4096, 7168, 16, 32, 64, 4, 4),
+    (32, 7168, 4096, 32, 16, 64, 3, 4),
+    (3, 2048, 8192, 8, 32, 128, 2, 2),
+]
+
 
 def _policy(hti):
     return "hti" if hti else "ft"
@@ -110,11 +132,31 @@ def _unpack(row):
     return m, n, k, _policy(hti), split_k, tile
 
 
+def _unpack_skinny(row):
+    m, n, k, block_m, block_n, block_k, stages, k_waves = row
+    tile = {
+        "block_m": block_m,
+        "block_n": block_n,
+        "block_k": block_k,
+        "stages": stages,
+        "split_k": 1,
+        "m_waves": 1,
+        "n_waves": 1,
+        "k_waves": k_waves,
+        "group_m": 0,
+        "use_half_tile_interleaved": False,
+    }
+    return m, n, k, "sk", 1, tile
+
+
+def _all_rows():
+    return [_unpack(row) for row in _TUNED] + [_unpack_skinny(row) for row in _SKINNY]
+
+
 def _default_mnk():
     seen = []
     got = set()
-    for row in _TUNED:
-        m, n, k, *_rest = _unpack(row)
+    for m, n, k, *_rest in _all_rows():
         key = (m, n, k)
         if key not in got:
             got.add(key)
@@ -123,8 +165,7 @@ def _default_mnk():
 
 
 def _tile_for(m, n, k, policy, split_k):
-    for row in _TUNED:
-        rm, rn, rk, rpolicy, rsplit_k, tile = _unpack(row)
+    for rm, rn, rk, rpolicy, rsplit_k, tile in _all_rows():
         if (rm, rn, rk, rpolicy, rsplit_k) == (m, n, k, policy, split_k):
             return tile
     return None
@@ -154,22 +195,21 @@ def test_hgemm(m, n, k, dtype, policy, split_k):
     out = torch.randn((m, n), dtype=dtype, device="cuda")
     ref = run_torch(a, w, dtype)
 
+    kwargs = {
+        "block_m": tile["block_m"],
+        "block_n": tile["block_n"],
+        "block_k": tile["block_k"],
+        "stages": tile["stages"],
+        "split_k": tile["split_k"],
+        "m_waves": tile["m_waves"],
+        "n_waves": tile["n_waves"],
+        "k_waves": tile["k_waves"],
+        "group_m": tile["group_m"],
+        "policy": policy,
+    }
+
     def _run_flydsl():
-        return flydsl_hgemm(
-            a,
-            w,
-            out=out,
-            block_m=tile["block_m"],
-            block_n=tile["block_n"],
-            block_k=tile["block_k"],
-            stages=tile["stages"],
-            split_k=tile["split_k"],
-            m_waves=tile["m_waves"],
-            n_waves=tile["n_waves"],
-            k_waves=tile["k_waves"],
-            group_m=tile["group_m"],
-            policy=policy,
-        )
+        return flydsl_hgemm(a, w, out=out, **kwargs)
 
     out_mm = torch.empty_like(out)
 
@@ -178,12 +218,31 @@ def test_hgemm(m, n, k, dtype, policy, split_k):
         return out_mm
 
     candidates = {"flydsl": _run_flydsl, "torch_mm": _run_torch_mm}
+    if policy == "sk":
+        # Decode GEMMs run inside a CUDA graph: capture one call and replay it.
+        # The eager call first compiles the kernel outside the capture.
+        out_graph = torch.randn((m, n), dtype=dtype, device="cuda")
+        flydsl_hgemm(a, w, out=out_graph, **kwargs)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            flydsl_hgemm(a, w, out=out_graph, **kwargs)
+        out_graph.normal_()
+
+        def _run_flydsl_graph():
+            graph.replay()
+            return out_graph
+
+        candidates["flydsl_graph"] = _run_flydsl_graph
 
     flops = 2 * m * n * k
     nbytes = (
         m * k * a.element_size() + n * k * w.element_size() + m * n * out.element_size()
     )
-    atol, rtol = _atol_rtol(k, split_k, tile["k_waves"], dtype)
+    if policy == "sk":
+        # partials are summed in fp32 inside the workgroup: one bf16 rounding
+        atol, rtol = _atol_rtol(k, 1, 1, dtype)
+    else:
+        atol, rtol = _atol_rtol(k, split_k, tile["k_waves"], dtype)
     ret = {
         "gfx": get_gfx(),
         "tile": (
@@ -207,6 +266,40 @@ def test_hgemm(m, n, k, dtype, policy, split_k):
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
     return ret
+
+
+def check_skinny_rejects():
+    """Shapes the skinny policy cannot run must raise, not compute a wrong C."""
+    sk = {
+        "block_m": 8,
+        "block_n": 24,
+        "block_k": 64,
+        "stages": 4,
+        "split_k": 1,
+        "m_waves": 1,
+        "n_waves": 1,
+        "k_waves": 4,
+        "group_m": 0,
+        "policy": "sk",
+    }
+    cases = {
+        "N not a multiple of block_n": {"m": 4, "n": 6148, "k": 2048},
+        "K not a multiple of k_waves*block_k": {"m": 4, "n": 6144, "k": 2000},
+        "M above block_m": {"m": 9, "n": 6144, "k": 2048},
+        "bias": {"m": 4, "n": 6144, "k": 2048, "bias": True},
+        "fp16 input": {"m": 4, "n": 6144, "k": 2048, "dtype": dtypes.fp16},
+    }
+    for what, c in cases.items():
+        dtype = c.get("dtype", dtypes.bf16)
+        a = torch.randn((c["m"], c["k"]), dtype=dtype)
+        w = torch.randn((c["n"], c["k"]), dtype=dtype)
+        bias = torch.randn((c["n"],), dtype=dtype) if c.get("bias") else None
+        try:
+            flydsl_hgemm(a, w, bias=bias, **sk)
+        except ValueError:
+            continue
+        raise AssertionError(f"skinny policy accepted an unsupported input: {what}")
+    aiter.logger.info("skinny policy rejects all %d unsupported inputs", len(cases))
 
 
 def summarize(title, rows):
@@ -251,12 +344,12 @@ def main():
 
     for dtype in args.dtype:
         rows = []
-        for row in _TUNED:
-            m, n, k, policy, split_k, _tile = _unpack(row)
+        for m, n, k, policy, split_k, _tile in _all_rows():
             if (m, n, k) not in wanted:
                 continue
             rows.append(test_hgemm(m, n, k, dtype, policy, split_k))
         summarize(f"flydsl_hgemm {dtype}", rows)
+    check_skinny_rejects()
 
 
 if __name__ == "__main__":
