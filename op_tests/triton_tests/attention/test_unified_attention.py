@@ -548,6 +548,202 @@ def test_triton_unified_attn_3d(
     )
 
 
+def per_token_quant_kv_cache(key_cache, value_cache, kv_lens, block_tables):
+    """Quantize each cached token to fp8 with its own scale per KV head.
+
+    Returns the fp8 caches and the scales, [num_blocks, num_kv_heads, block_size].
+    Scale slots past each sequence are NaN: the kernel must not read them.
+    """
+    fp8_max = torch.finfo(e4m3_dtype).max
+    k_scale = key_cache.abs().amax(dim=-1).clamp(min=1e-6) / fp8_max
+    v_scale = value_cache.abs().amax(dim=-1).clamp(min=1e-6) / fp8_max
+    key_fp8 = (key_cache / k_scale[..., None]).to(e4m3_dtype)
+    value_fp8 = (value_cache / v_scale[..., None]).to(e4m3_dtype)
+    # [num_blocks, block_size, num_kv_heads] -> [num_blocks, num_kv_heads, block_size]
+    k_scale = k_scale.transpose(1, 2).contiguous()
+    v_scale = v_scale.transpose(1, 2).contiguous()
+
+    block_size = key_cache.shape[1]
+    for seq, kv_len in enumerate(kv_lens.tolist()):
+        if kv_len % block_size:
+            last_block = block_tables[seq, kv_len // block_size]
+            k_scale[last_block, :, kv_len % block_size :] = float("nan")
+            v_scale[last_block, :, kv_len % block_size :] = float("nan")
+    return key_fp8, value_fp8, k_scale, v_scale
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(1, 1328)],
+        [(1, 523), (1, 37), (1, 2011), (1, 16), (1, 1)],
+        [(1, 4096)] * 8,
+    ],
+)
+@pytest.mark.parametrize("num_heads", [(16, 1), (64, 8)])
+@pytest.mark.parametrize("block_size", [16, 128])
+@torch.inference_mode()
+def test_unified_attention_per_token_kv_scale(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    block_size: int,
+) -> None:
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("per-token KV scales are read only by the gfx1250 Gluon kernel")
+
+    head_size = 128
+    (
+        query,
+        key_cache,
+        value_cache,
+        _shuffled_key_cache,
+        _shuffled_value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        _q_descale,
+        _k_descale,
+        _v_descale,
+        _output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=4096,
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.float32,
+        out_dtype=torch.bfloat16,
+        use_kv_descale=False,
+        device="cuda",
+    )
+    # Token magnitudes that differ by up to 20x, so a kernel that reads only
+    # one scale fails the check.
+    key_cache = key_cache * torch.exp(
+        torch.empty(*key_cache.shape[:3], 1, device="cuda").uniform_(-1.5, 1.5)
+    )
+    value_cache = value_cache * torch.exp(
+        torch.empty(*value_cache.shape[:3], 1, device="cuda").uniform_(-1.5, 1.5)
+    )
+    key_fp8, value_fp8, k_scale, v_scale = per_token_quant_kv_cache(
+        key_cache, value_cache, kv_lens, block_tables
+    )
+    shuffled_key_fp8, shuffled_value_fp8 = shuffle_kv_cache(key_fp8, value_fp8)
+
+    unified_attention(
+        q=query,
+        k=shuffled_key_fp8,
+        v=shuffled_value_fp8,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=k_scale,
+        v_descale=v_scale,
+        shuffled_kv_cache=True,
+        backend="gluon",
+    )
+
+    query_lens = [x[0] for x in seq_lens]
+    ref_args = {
+        "query": query,
+        "query_lens": query_lens,
+        "kv_lens": kv_lens,
+        "block_tables": block_tables,
+        "scale": scale,
+        "out_dtype": torch.float32,
+    }
+    dequant_ref = ref_paged_attn(
+        key_cache=key_fp8.float() * k_scale.nan_to_num().transpose(1, 2)[..., None],
+        value_cache=value_fp8.float() * v_scale.nan_to_num().transpose(1, 2)[..., None],
+        **ref_args,
+    )
+    unquantized_ref = ref_paged_attn(
+        key_cache=key_cache, value_cache=value_cache, **ref_args
+    )
+
+    def cosine(a, b):
+        return torch.nn.functional.cosine_similarity(
+            a.float().flatten(), b.float().flatten(), dim=0
+        ).item()
+
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output.float(), dequant_ref, atol=2e-2, rtol=2e-2)
+    assert cosine(output, dequant_ref) >= 0.9999
+    # The kernel may lose no more than the fp8 rounding of the cache itself.
+    fp8_floor = cosine(dequant_ref, unquantized_ref)
+    assert cosine(output, unquantized_ref) >= fp8_floor - 1e-4, (
+        f"cosine vs unquantized reference {cosine(output, unquantized_ref):.6f}, "
+        f"fp8 rounding alone gives {fp8_floor:.6f}"
+    )
+
+
+@torch.inference_mode()
+def test_unified_attention_per_token_kv_scale_rejects_prefill() -> None:
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("per-token KV scales are read only by the gfx1250 Gluon kernel")
+
+    num_blocks, block_size, num_kv_heads, head_size = 64, 128, 1, 128
+    query = torch.randn(4, 16, head_size, dtype=torch.bfloat16, device="cuda")
+    key_cache = torch.zeros(
+        num_blocks,
+        num_kv_heads,
+        head_size // 16,
+        block_size,
+        16,
+        dtype=e4m3_dtype,
+        device="cuda",
+    )
+    value_cache = torch.zeros(
+        num_blocks,
+        num_kv_heads,
+        block_size // 16,
+        head_size,
+        16,
+        dtype=e4m3_dtype,
+        device="cuda",
+    )
+    kv_scale = torch.ones(
+        num_blocks, num_kv_heads, block_size, dtype=torch.float32, device="cuda"
+    )
+    with pytest.raises(NotImplementedError, match="per-token KV scales"):
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=torch.empty_like(query),
+            cu_seqlens_q=torch.tensor([0, 4], dtype=torch.int32, device="cuda"),
+            seqused_k=torch.tensor([200], dtype=torch.int32, device="cuda"),
+            max_seqlen_q=4,
+            max_seqlen_k=200,
+            softmax_scale=head_size**-0.5,
+            causal=True,
+            window_size=(-1, -1),
+            block_table=torch.arange(2, dtype=torch.int32, device="cuda")[None],
+            softcap=0,
+            q_descale=None,
+            k_descale=kv_scale,
+            v_descale=kv_scale,
+            shuffled_kv_cache=True,
+            backend="gluon",
+        )
+
+
 @pytest.mark.parametrize(
     "seq_lens",
     [
