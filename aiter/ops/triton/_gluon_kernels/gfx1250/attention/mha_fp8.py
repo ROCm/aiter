@@ -1,5 +1,3 @@
-import torch
-import triton
 import triton.experimental.gluon.language as gl
 import triton.language as tl
 from triton.experimental import gluon
@@ -136,13 +134,13 @@ def apply_mask(
 
 @gluon.jit
 def _mha_fwd_subtiled(
-    q_ptr: torch.Tensor,
-    k_ptr: torch.Tensor,
-    v_ptr: torch.Tensor,
-    q_scale_ptr: torch.Tensor,
-    k_scale_ptr: torch.Tensor,
-    v_scale_ptr: torch.Tensor,
-    o_ptr: torch.Tensor,
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    q_scale_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
+    o_ptr,
     stride_q_z,
     stride_q_h,
     stride_q_m,
