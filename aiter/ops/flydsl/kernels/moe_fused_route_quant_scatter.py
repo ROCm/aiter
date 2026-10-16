@@ -746,10 +746,15 @@ def _emit_prequant_copy_preshuffle(c: SimpleNamespace) -> None:
     dst = c.dests[0]
 
     payload_bytes_per_row = c.payload_bytes_per_row
-    dst_addr = c.payload_base + fx.Uint64(dst.payload_row_i32) * payload_bytes_per_row
+    payload_preshuffled = bool(getattr(c, "payload_preshuffled", False))
+    dst_row = fx.Uint64(dst.payload_row_i32)
+    if const_expr(payload_preshuffled):
+        dst_row = dst_row // 16 * 16
+    dst_addr = c.payload_base + dst_row * payload_bytes_per_row
     src_addr = c.hidden_base + fx.Uint64(c.feat_row_i32) * c.feat_bytes_per_row
     dst_rsrc = buffer_ops.create_buffer_resource_from_addr(
-        dst_addr, num_records_bytes=payload_bytes_per_row
+        dst_addr,
+        num_records_bytes=payload_bytes_per_row * (16 if payload_preshuffled else 1),
     )
     src_rsrc = buffer_ops.create_buffer_resource_from_addr(
         src_addr, num_records_bytes=c.feat_bytes_per_row
@@ -792,10 +797,16 @@ def _emit_prequant_copy_preshuffle(c: SimpleNamespace) -> None:
         scale_chunks.append((g, src_dword))
 
     for chunk_idx, v in payload_chunks:
+        payload_byte_off = chunk_idx * c16
+        if const_expr(payload_preshuffled):
+            payload_byte_off = (
+                chunk_idx * fx.Int32(256)
+                + (fx.Uint32(dst.payload_row_i32) % 16) * c16
+            )
         buffer_ops.buffer_store(
             v,
             dst_rsrc,
-            chunk_idx * c16,
+            payload_byte_off,
             offset_is_bytes=True,
             cache_modifier=_PREQUANT_NT_STORE,
         )
@@ -1659,8 +1670,6 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
     if payload_preshuffled and (quant_mode != "fp4" or feat_dim % 128):
         raise ValueError("preshuffled payload requires MXFP4 and K divisible by 128")
-    if payload_preshuffled and prequantized:
-        raise ValueError("prequantized copy does not support preshuffled payload")
     if not L.use_pk8:
         raise NotImplementedError(
             "route-indexed K-split is currently enabled only for gfx1250 pk8"

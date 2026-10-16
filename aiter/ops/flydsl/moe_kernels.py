@@ -3294,8 +3294,6 @@ def flydsl_moe_fused_quant_preshuffle(
     # A quantizing EP dispatch (fp8 or fp4) already put the payload and its e8m0
     # row on the wire: nothing left to convert, only scatter + preshuffle.
     prequantized = prequantized_scale is not None
-    if payload_preshuffled and prequantized:
-        raise ValueError("prequantized payload cannot use the blocked A producer")
     if prequantized:
         # torch dtypes, not aiter.dtypes: this module deliberately imports only
         # torch and the tensor shim.

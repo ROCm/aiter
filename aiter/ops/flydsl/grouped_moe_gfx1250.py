@@ -4,9 +4,10 @@
 
 Supports optional DeepGEMM-style contiguous-M scheduler
 (AITER_GROUPED_DEEPGEMM_CONTIGUOUS=1 or CSV grouped_contiguous_m=1).
-For local A4W4, AITER_GROUPED_A4W4_A_PRESHUFFLE=1 selects packed
-(M/16, K/128, 4, 16, 32) A for both grouped GEMMs. The default remains
-unpreshuffled A.
+For A4W4, the tuned CSV ``a_preshuffle`` field selects packed
+(M/16, K/128, 4, 16, 32) A for both grouped GEMMs. When set, the
+``AITER_GROUPED_A4W4_A_PRESHUFFLE`` environment variable explicitly overrides
+the CSV selection.
 """
 
 import csv
@@ -596,6 +597,7 @@ def _grouped_a8w4_tdm_moe(
     tdm_b_th=0,
     lds_soa_load_interleave=0,
     rolled_drain=0,
+    a_preshuffle=0,
     persistent_workers=0,
     persistent_workers2=0,
     data_format="a8w4",
@@ -626,6 +628,9 @@ def _grouped_a8w4_tdm_moe(
     )
     if _compact:
         stage2_scatter = _compact_ctx
+    _a_preshuffle_requested = data_format == "fp4" and _as_bool(
+        os.environ.get("AITER_GROUPED_A4W4_A_PRESHUFFLE"), bool(a_preshuffle)
+    )
     if tile_m2 is None:
         tile_m2 = tile_m
     if tile_n2 is None:
@@ -733,6 +738,7 @@ def _grouped_a8w4_tdm_moe(
         _fuse_ep_route_quant = (
             _direct_ep_mask
             and enable_ep_scatter
+            and not _a_preshuffle_requested
             and int(E) <= 256
             and a1_scale is not None
             and hidden_states.dtype
@@ -918,10 +924,8 @@ def _grouped_a8w4_tdm_moe(
     )
     a_preshuffled = (
         _is_fp4
-        and not _prequantized
-        and not _is_ep
         and not _compact
-        and _as_bool(os.environ.get("AITER_GROUPED_A4W4_A_PRESHUFFLE"), False)
+        and _a_preshuffle_requested
     )
     if src_a1_scale is not None and not _prequantized:
         # Loud rather than silently re-quantizing something already quantized.
@@ -1643,6 +1647,14 @@ def grouped_gemm_gfx1250_a8w4(
                 cfg_row.get("lds_soa_load_interleave"), 0
             )
             _tdm_kw["rolled_drain"] = _as_int(cfg_row.get("rolled_drain"), 0)
+            # Config lookup uses padded token buckets (for example 6144 ->
+            # 8192). A-preshuffle is intentionally enabled for the DSR1
+            # prefill range only, so do not let bucket fallback turn it on for
+            # a smaller real input. An explicit environment override is still
+            # applied later by _grouped_a8w4_tdm_moe.
+            _tdm_kw["a_preshuffle"] = int(
+                _as_int(cfg_row.get("a_preshuffle"), 0) and token_num >= 8192
+            )
             # GEMM1 always has a local epilogue; stage2_scatter only changes
             # GEMM2, so it does not restrict GEMM1's persistent scheduler.
             _tdm_kw["persistent_workers"] = _as_int(
