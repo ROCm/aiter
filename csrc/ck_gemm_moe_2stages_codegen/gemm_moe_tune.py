@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import tempfile
+import uuid
 from argparse import ArgumentTypeError
 from pathlib import Path
 from typing import Any, ClassVar
@@ -87,6 +88,7 @@ from aiter.utility.base_tuner import TunerCommon, _read_csv
 from aiter.utility.dtypes import str2ActivationType, str2Dtype
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 from aiter.utility.mp_tuner import mp_tuner
+from csrc.ck_gemm_moe_2stages_codegen.mxfp4_tune_errors import is_fatal_gpu_error
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
     build_v2_inputs as _v2_build_inputs,
 )
@@ -7330,7 +7332,9 @@ class Mxfp4FlydslTuner(FmoeTuner):
         precision = self._row_precision(row)
         candidates = self._candidate_rows(row, full_search=search_mode == "full")
         best, profiles, failures = None, [], []
-        for candidate in candidates:
+        search_id = uuid.uuid4().hex
+        fatal_reason = ""
+        for candidate_index, candidate in enumerate(candidates, 1):
             status, reason = "ok", ""
             if timeout > 0:
                 signal.alarm(timeout)
@@ -7348,13 +7352,17 @@ class Mxfp4FlydslTuner(FmoeTuner):
                     candidate["us"] = candidate["us1"] = us
                     best = candidate
             except Exception as exc:  # noqa: BLE001
-                status = (
-                    "timeout"
-                    if isinstance(exc, _CandidateTimeout)
-                    else "execution_failed"
-                )
                 reason = f"{type(exc).__name__}: {exc}"
-                if "error" in candidate:
+                if is_fatal_gpu_error(exc):
+                    status = "fatal_gpu_error"
+                    fatal_reason = reason
+                else:
+                    status = (
+                        "timeout"
+                        if isinstance(exc, _CandidateTimeout)
+                        else "execution_failed"
+                    )
+                if not fatal_reason and "error" in candidate:
                     error = float(candidate["error"])
                     if not math.isfinite(error) or error > args.errRatio:
                         status = "accuracy_failed"
@@ -7372,6 +7380,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 error=candidate.get("error", float("nan")),
                 status=status,
                 failure_reason=reason,
+                search_id=search_id,
+                worker_pid=os.getpid(),
+                candidate_index=candidate_index,
+                candidate_count=len(candidates),
             )
             profiles.append(profile)
             profile_journal = getattr(args, "_mxfp4_profile_journal", None)
@@ -7392,7 +7404,14 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 failures.append(
                     f"{candidate['kernelName1']}/{candidate['kernelName2']}: {reason}"
                 )
-        if best is None:
+            if fatal_reason:
+                # This process's HIP context is no longer usable. Keep the
+                # journal, but never publish a winner from the aborted search.
+                break
+        if fatal_reason:
+            best = _mxfp4_failed_row(self.keys, row, fatal_reason)
+            best["status"] = "incomplete"
+        elif best is None:
             reason = (
                 "no valid coupled candidate"
                 if candidates
@@ -7409,6 +7428,18 @@ class Mxfp4FlydslTuner(FmoeTuner):
         else:
             best.update(status="ok", failure_reason="")
         best["_profile"] = profiles
+        best["_search"] = {
+            **{key: row[key] for key in self.keys},
+            "precision": precision,
+            "search_mode": search_mode,
+            "search_id": search_id,
+            "worker_pid": os.getpid(),
+            "candidate_count": len(candidates),
+            "evaluated_count": len(profiles),
+            "valid_count": sum(profile["status"] == "ok" for profile in profiles),
+            "search_complete": not fatal_reason,
+            "termination_reason": fatal_reason,
+        }
         return best
 
     def tune(self, untunedf, tunedf, args):
@@ -7427,19 +7458,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
             ngpu = 1
         mp_num = max(1, min(mp_num, ngpu, len(rows)))
 
-        if mp_num <= 1:
-            results = []
-            for row in rows:
-                try:
-                    results.append(self._tune_one_shape(row, args))
-                except Exception as exc:  # noqa: BLE001
-                    reason = f"{type(exc).__name__}: {exc}"
-                    print(f"[mxfp4-port] shape failed: {reason}", flush=True)
-                    results.append(_mxfp4_failed_row(self.keys, row, reason))
-            return results
-
         # One fresh process per shape (memory fully released between shapes),
-        # spread across mp_num GPUs, each on a distinct device.
+        # including mp=1, so a failed context cannot affect the next shape.
         import multiprocessing as _mp
 
         print(
@@ -7465,6 +7485,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                     result = _mxfp4_failed_row(
                         self.keys, row, "worker died mid-shape without a result"
                     )
+                    result["status"] = "incomplete"
                 journal = Path(journal_dir) / f"{index}.csv"
                 if journal.exists():
                     result["_profile"] = pd.read_csv(journal).to_dict("records")
@@ -7484,6 +7505,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 "error",
                 "status",
                 "failure_reason",
+                "search_id",
+                "worker_pid",
+                "candidate_index",
+                "candidate_count",
             ]
             profiles = pd.DataFrame(
                 [
@@ -7498,6 +7523,39 @@ class Mxfp4FlydslTuner(FmoeTuner):
                     [pd.read_csv(args.profile_file), profiles], ignore_index=True
                 )
             profiles.to_csv(args.profile_file, index=False)
+        # Keep the public tuned CSV schema unchanged. This sidecar describes
+        # the latest search for each shape, including aborted/dead workers.
+        summaries = []
+        for result in results:
+            summary = result.get("_search")
+            if summary is None:
+                profiles = result.get("_profile", [])
+                summary = {
+                    **{key: result[key] for key in self.keys},
+                    "precision": self._row_precision(result),
+                    "search_mode": self._effective_search_mode(result, args),
+                    "search_id": profiles[0].get("search_id", "") if profiles else "",
+                    "worker_pid": profiles[0].get("worker_pid", "") if profiles else "",
+                    "candidate_count": (
+                        profiles[0].get("candidate_count", "") if profiles else ""
+                    ),
+                    "evaluated_count": len(profiles),
+                    "valid_count": sum(p["status"] == "ok" for p in profiles),
+                    "search_complete": False,
+                    "termination_reason": result["failure_reason"],
+                }
+            summaries.append(summary)
+        summary_path = Path(self.get_out_file(args.tune_file)).with_suffix(
+            ".search_summary.csv"
+        )
+        summary_df = pd.DataFrame(summaries)
+        if summary_path.exists():
+            summary_df = pd.concat(
+                [pd.read_csv(summary_path), summary_df], ignore_index=True
+            )
+        summary_df.drop_duplicates(subset=self.keys, keep="last").to_csv(
+            summary_path, index=False
+        )
         return pd.DataFrame(
             results, columns=self.columns + ["status", "failure_reason"]
         )
@@ -7566,6 +7624,14 @@ class Mxfp4FlydslTuner(FmoeTuner):
         # Keys compare as raw tuples, as in update_tunedf, so legacy 1.0/True
         # values match the normalized 1 of the same shape.
         if not old_tunedf.empty and not results.empty:
+            incomplete_keys = set(
+                results.loc[results["status"].eq("incomplete"), self.keys].apply(
+                    tuple, axis=1
+                )
+            )
+            old_tunedf = old_tunedf[
+                ~old_tunedf[self.keys].apply(tuple, axis=1).isin(incomplete_keys)
+            ].copy()
             retuned_keys = set(results[self.keys].apply(tuple, axis=1))
             retuned = old_tunedf[self.keys].apply(tuple, axis=1).isin(retuned_keys)
             if retuned.any():
@@ -7606,7 +7672,10 @@ def _mxfp4_tune_shape_worker(payload):
         # Catastrophic (non per-candidate) failure: record as a failed shape so
         # the run keeps going instead of aborting.
         print(f"[mxfp4-port] shape failed on GPU{gpu}: {exc}", flush=True)
-        return _mxfp4_failed_row(keys, row, f"FAILED(GPU{gpu}): {exc}")
+        result = _mxfp4_failed_row(keys, row, f"FAILED(GPU{gpu}): {exc}")
+        if is_fatal_gpu_error(exc):
+            result["status"] = "incomplete"
+        return result
 
 
 def _mxfp4_failed_row(keys, row, reason):

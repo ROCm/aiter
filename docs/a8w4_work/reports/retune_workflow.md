@@ -81,6 +81,23 @@ G1/G2 parsers, and continues subsequent ended models after a failed model.
 Partial results retain nonzero aggregate status. Existing output files require
 a new output directory; they are not silently overwritten/resumed.
 
+Coupled tuning uses a fresh process for every shape, including `--mp 1`.
+An illegal memory access, device-side assert, or other fatal GPU context error
+stops that shape immediately. Its earlier candidate observations remain in the
+profile, but the aborted search does not publish a winner. The shape is recorded
+as `incomplete` in failed_shapes; subsequent shapes use fresh workers. A worker
+that dies without returning a result is also incomplete. Ordinary candidate
+compilation/accuracy failures still allow the remaining candidates to run.
+
+Each tuned output also has a `*.search_summary.csv` sidecar. It contains the
+latest search for each shape: search ID, worker PID, candidate count, evaluated
+count, valid count, completion flag and termination reason. Profiles carry the
+same search ID plus candidate index/count. The public tuned CSV schema remains
+unchanged. Coverage checks match the latest search to its profiles and reject
+incomplete searches; historical profiles without search IDs are still checked
+for fatal GPU errors. A single valid candidate is acceptable when the full
+candidate evaluation completed normally. No automatic candidate retry is added.
+
 After each complete retune, run the public CSV harness against its final new
 CSV in a centrally assigned idle slot. Final acceptance requires that report
 as well as scheduler coverage. Source status and full logs remain evidence;
