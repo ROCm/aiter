@@ -743,13 +743,14 @@ template<int BLOCK_SIZE_,
         typename VEC_,
         typename GROUP_,
         int WG_PER_CU_,
+        int NUM_XCD_ = 8,
         bool B_DIRECT_REG_ = false,
         bool ALL_WAVE_ = false,
         bool TILE_N_ = false>
 struct opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_traits_gfx950
-    : opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950<BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, B_DIRECT_REG_, ALL_WAVE_, TILE_N_> {
+    : opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950<BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, NUM_XCD_, B_DIRECT_REG_, ALL_WAVE_, TILE_N_> {
     using base = opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950<
-        BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, B_DIRECT_REG_, ALL_WAVE_, TILE_N_>;
+        BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, NUM_XCD_, B_DIRECT_REG_, ALL_WAVE_, TILE_N_>;
 
     static constexpr bool B_PRESHUFFLE = true;
     static constexpr bool SCALE_OPSEL  = true;
@@ -778,13 +779,14 @@ template<int BLOCK_SIZE_,
         typename VEC_,
         typename GROUP_,
         int WG_PER_CU_,
+        int NUM_XCD_ = 8,
         bool B_DIRECT_REG_ = false,
         bool ALL_WAVE_ = false,
         bool TILE_N_ = false>
 struct opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_bcast_traits_gfx950
-    : opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950<BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, B_DIRECT_REG_, ALL_WAVE_, TILE_N_> {
+    : opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950<BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, NUM_XCD_, B_DIRECT_REG_, ALL_WAVE_, TILE_N_> {
     using base = opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950<
-        BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, B_DIRECT_REG_, ALL_WAVE_, TILE_N_>;
+        BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, NUM_XCD_, B_DIRECT_REG_, ALL_WAVE_, TILE_N_>;
 
     static constexpr bool B_PRESHUFFLE = true;
     // SCALE_OPSEL stays false, i.e. the base's MXSCALE_ACCUM_MODE pack.
@@ -817,11 +819,12 @@ template<int BLOCK_SIZE_,
         typename VEC_,
         typename GROUP_,
         int WG_PER_CU_,
+        int NUM_XCD_ = 8,
         bool TILE_N_ = false>
 struct opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_bdirect_traits_gfx950
-    : opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_traits_gfx950<BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, true, false, TILE_N_> {
+    : opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_traits_gfx950<BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, NUM_XCD_, true, false, TILE_N_> {
     using base = opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_traits_gfx950<
-        BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, true, false, TILE_N_>;
+        BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, NUM_XCD_, true, false, TILE_N_>;
 
     // buffer_loads per consumer per K tile: one dwordx4 per (n-rep, k-rep, half).
     static constexpr int b_direct_load_insts = base::COM_REP_N * base::COM_REP_K * 2;
@@ -846,12 +849,13 @@ template<int BLOCK_SIZE_,
         typename DTYPE_,
         typename VEC_,
         typename GROUP_,
-        int WG_PER_CU_>
+        int WG_PER_CU_,
+        int NUM_XCD_ = 8>
 struct opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_bdirect_tilen_traits_gfx950
     : opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_bdirect_traits_gfx950<
-          BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, true> {
+          BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, NUM_XCD_, true> {
     using base = opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_bdirect_traits_gfx950<
-        BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, true>;
+        BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, NUM_XCD_, true>;
 
     static_assert(base::IS_TILE_N && base::T_M == 1 && base::T_N == 2,
                   "tilen traits must land on the T_M=1 consumer grid");
@@ -872,8 +876,12 @@ template<int BLOCK_SIZE_,
         int T_M_,
         // Stage B through the LDS ring beside A instead of loading it straight
         // into registers (see B_LDS below).
-        bool B_LDS_ = false>
+        bool B_LDS_ = false,
+        // Last rather than after WG_PER_CU_: T_M_ has no default, and a defaulted
+        // parameter cannot precede it.
+        int NUM_XCD_ = 8>
 struct opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950 {
+    static constexpr int NUM_XCD = NUM_XCD_;
     using BLOCK = opus::remove_cvref_t<BLOCK_>;
     using DTYPE = opus::remove_cvref_t<DTYPE_>;
     using VEC   = opus::remove_cvref_t<VEC_>;
@@ -1193,10 +1201,11 @@ template<int BLOCK_SIZE_,
         typename DTYPE_,
         typename VEC_,
         typename GROUP_,
-        int WG_PER_CU_>
+        int WG_PER_CU_,
+        int NUM_XCD_ = 8>
 struct opus_gemm_a8w8_mxscale_bpreshuffle_wave8n4_traits_gfx950
     : opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950<
-          BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, 2> {};
+          BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, 2, false, NUM_XCD_> {};
 
 // T_M=1 assigns each N range to one wave. Its A fragments span the tile's
 // M range, so B_M is constrained by the fragment and accumulator register
@@ -1206,10 +1215,11 @@ template<int BLOCK_SIZE_,
         typename DTYPE_,
         typename VEC_,
         typename GROUP_,
-        int WG_PER_CU_>
+        int WG_PER_CU_,
+        int NUM_XCD_ = 8>
 struct opus_gemm_a8w8_mxscale_bpreshuffle_wavetm1_traits_gfx950
     : opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950<
-          BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, 1> {
+          BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, 1, false, NUM_XCD_> {
     static_assert(opus::get<0>(opus::remove_cvref_t<BLOCK_>{}) == 128
                       || opus::get<0>(opus::remove_cvref_t<BLOCK_>{}) == 64,
                   "one wave owns all B_M rows here, and A only stays resident up "
@@ -1223,10 +1233,11 @@ template<int BLOCK_SIZE_,
         typename DTYPE_,
         typename VEC_,
         typename GROUP_,
-        int WG_PER_CU_>
+        int WG_PER_CU_,
+        int NUM_XCD_ = 8>
 struct opus_gemm_a8w8_mxscale_bpreshuffle_wavetm1_blds_traits_gfx950
     : opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950<
-          BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, 1, true> {
+          BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, 1, true, NUM_XCD_> {
     // An upper bound, written as one. The reason is residency, and residency
     // only bites from above: one wave owns all B_M rows, so A stays resident up
     // to B_M=128 and no further. Spelling it as a two-value whitelist was what
@@ -1244,11 +1255,12 @@ template<int BLOCK_SIZE_,
         typename DTYPE_,
         typename VEC_,
         typename GROUP_,
-        int WG_PER_CU_>
+        int WG_PER_CU_,
+        int NUM_XCD_ = 8>
 struct opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_allwave_traits_gfx950
-    : opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_traits_gfx950<BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, false, true> {
+    : opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_traits_gfx950<BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, NUM_XCD_, false, true> {
     using base = opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_traits_gfx950<
-        BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, false, true>;
+        BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, NUM_XCD_, false, true>;
 
     static_assert(base::ALL_WAVE && base::T_M == 2 && base::T_N == 2);
     // Each wave owns COM_REP_N*W_N contiguous columns and loads exactly the scale
@@ -1279,6 +1291,9 @@ template<int BLOCK_SIZE_,
         typename VEC_,
         typename GROUP_,
         int WG_PER_CU_,
+        // Unused: the wave1 fused split-K grid groups tiles by 8, which the
+        // launcher pads to and every gfx950 die count divides.
+        int NUM_XCD_ = 8,
         int RING_ = 0>
 struct opus_gemm_a8w8_mxscale_bpreshuffle_wave1_traits_gfx950 {
     using BLOCK = opus::remove_cvref_t<BLOCK_>;
