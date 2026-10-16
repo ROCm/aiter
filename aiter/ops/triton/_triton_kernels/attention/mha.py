@@ -937,6 +937,36 @@ def _attn_fwd(
     tl.store(out_ptr + offs_out, op, mask=out_mask)
 
 
+def _shape_config_name(head_dim_qk: int, head_dim_v: int, causal: bool) -> str:
+    return f"MHA-DQ={head_dim_qk}-DV={head_dim_v}-CAUSAL={int(causal)}.json"
+
+
+def _get_shape_config(
+    cfg_dir: str,
+    head_dim_qk: int,
+    head_dim_v: int,
+    causal: bool,
+    max_seqlen_k: int,
+) -> dict | None:
+    """The tuned bucket of this shape's file, or None to use DEFAULT.json.
+
+    A shape file is keyed on the head dims and causality and holds
+    ``SK_LEQ_<bound>`` buckets over ``max_seqlen_k``; a key past its largest
+    bucket, like a shape without a file, is served by DEFAULT.json.
+    """
+    table = load_config_json(
+        f"{cfg_dir}/{_shape_config_name(head_dim_qk, head_dim_v, causal)}",
+        required=False,
+    )
+    if table is None:
+        return None
+    bounds = sorted(
+        int(key[len("SK_LEQ_") :]) for key in table if key.startswith("SK_LEQ_")
+    )
+    bound = next((b for b in bounds if max_seqlen_k <= b), None)
+    return None if bound is None else table[f"SK_LEQ_{bound}"]
+
+
 @functools.lru_cache(maxsize=1024)
 def _get_config(
     enable_dropout: bool,
@@ -947,8 +977,19 @@ def _get_config(
     max_seqlen_q: int | None = None,
     max_seqlen_k: int | None = None,
     batch_heads: int | None = None,
+    head_dim_qk: int | None = None,
 ):
     cfg_dir = resolve_config_dir("attention", "MHA", backend="triton")
+    if (
+        None not in (head_dim_qk, head_dim_v, max_seqlen_k)
+        and not enable_dropout
+        and dtype in (torch.float16, torch.bfloat16)
+    ):
+        tuned = _get_shape_config(
+            cfg_dir, head_dim_qk, head_dim_v, causal, max_seqlen_k
+        )
+        if tuned is not None:
+            return tuned
     config = load_config_json(f"{cfg_dir}/DEFAULT.json")
     fwd_cfg = config["fwd"]
     has_dropout_or_fp32 = enable_dropout or dtype == torch.float32

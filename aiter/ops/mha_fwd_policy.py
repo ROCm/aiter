@@ -301,6 +301,7 @@ def triton_config(problem: MhaFwdProblem, backend: str) -> dict[str, Any]:
             max_seqlen_q=problem.max_seqlen_q,
             max_seqlen_k=problem.max_seqlen_k,
             batch_heads=problem.batch * problem.nhead_q,
+            head_dim_qk=problem.hdim_q,
         )
     )
 

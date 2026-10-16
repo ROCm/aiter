@@ -333,6 +333,7 @@ class TestTritonRows(_Table):
             max_seqlen_q=4096,
             max_seqlen_k=42700,
             batch_heads=12,
+            head_dim_qk=192,
         )
         self.assertEqual(mha.triton_config(problem, "triton"), dict(expected))
 
