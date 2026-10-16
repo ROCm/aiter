@@ -25,10 +25,7 @@
 # ============================================================================
 
 import argparse
-import csv
-import functools
 import itertools
-from pathlib import Path
 
 import pandas as pd
 import torch
@@ -41,7 +38,7 @@ from aiter.benchmark_data_init import (
     fill_scale_e8m0,
     make_generator,
 )
-from aiter.jit.core import get_asm_dir
+from aiter.jit.utils.asm_guard import is_gfx1250_asm_supported
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a4w4 import (
     MXFP8_OUT_SCALE_BLOCK,
@@ -60,7 +57,7 @@ from aiter.test_common import (
 )
 from aiter.utility import fp4_utils
 
-# This is a CLI benchmark; pytest coverage lives in test_f4gemm_dispatch.py.
+# Run this CLI directly; --mode func includes the API regression checks.
 __test__ = False
 
 SUPPORTED_GFX = ["gfx1250"]
@@ -70,121 +67,27 @@ _NOT_SUPPORTED_MARKERS = (
     "cannot get heuristic kernel",
     "kernel not in cfg_f4gemm",
     "no kernel registered for f4gemm",
-    "selected kernel not in f4gemm manifest",
 )
-
-# gfx1250 F4GEMM persistent shaders always launch PERSISTENT_TG
-# threadgroups regardless of problem size (must match the .co's WG_MAX).
-PERSISTENT_TG = 256
+_PS_KERNEL = "_ZN5aiter44f4gemm_bf16_mxfp4_BpreShuffle_256x256_4x4_psE"
 
 
-@functools.lru_cache(None)
-def _manifest_configs():
-    with (Path(get_asm_dir()) / "f4gemm/f4gemm.csv").open() as f:
-        return list(
-            csv.DictReader(line for line in f if not line.lstrip().startswith("#"))
-        )
-
-
-def _kernel_config(M, N, K, intype, outtype, apre, knl_name=None):
-    from op_tests._f4gemm_test_utils import get_launch_config
-
-    knl = knl_name if knl_name and knl_name != "auto" else ""
-    launch = get_launch_config(M, N, K, intype, outtype, apre, knl)
-    for cfg in _manifest_configs():
-        if knl and cfg["knl_name"] != knl:
-            continue
-        if (cfg["intype"], cfg["outtype"], int(cfg["a_preshuffle"])) != (
-            intype,
-            outtype,
-            apre,
-        ):
-            continue
-        if all(int(cfg[key]) == launch[key] for key in ("tile_m", "tile_n", "ps_mode")):
-            return {**cfg, **launch}
-    raise ValueError("selected kernel not in f4gemm manifest")
-
-
-def _report_active_tg(M, N, tile_m, tile_n, label, geometry, ps_mode=1):
-    """Report useful TGs using the shader's cluster/column-band tile walk.
-
-    Whole tiles added by cluster padding still execute in the shader. Counting
-    only (M_tiles * N_tiles) % 256 misreports both the tail and that extra work.
-    These are logical scheduling counts, not measured hardware CU occupancy.
-    """
-    tg_m = (M + tile_m - 1) // tile_m
-    tg_n = (N + tile_n - 1) // tile_n
-    cx, cy, gx, gy = geometry
-    if ps_mode == 0:
-        aiter.logger.info(
-            "dispatch to %s: PS mode=0, cluster=%dx%d, HIP-grid=%dx%d, %d TG",
-            label,
-            cx,
-            cy,
-            gx * cx,
-            gy * cy,
-            tg_m * tg_n,
-        )
-        return {
-            "cluster": f"{cx}x{cy}",
-            "cluster grid": f"{gx}x{gy}",
-            "TG waves": None,
-            "padding tiles": 0,
-            "first active TG": None,
-            "last active TG": None,
-        }
-    rows = (tg_m + cy - 1) // cy
-    cols = (tg_n + cx - 1) // cx
-    clusters = rows * cols
-    persistent_clusters = gx * gy
-    waves = (clusters + persistent_clusters - 1) // persistent_clusters
-    interior_cols = cols // gx * gx
-    interior_clusters = interior_cols * rows
-
-    def useful_tg(wave):
-        active = 0
-        start = wave * persistent_clusters
-        for flat in range(start, min(start + persistent_clusters, clusters)):
-            if flat < interior_clusters:
-                band, within_band = divmod(flat, gx * rows)
-                y, x = divmod(within_band, gx)
-                x += band * gx
-            else:
-                y, x = divmod(flat - interior_clusters, cols - interior_cols)
-                x += interior_cols
-            active += min(cx, tg_n - x * cx) * min(cy, tg_m - y * cy)
-        return active
-
-    first = useful_tg(0) if waves else 0
-    last = useful_tg(waves - 1) if waves else 0
-    padding = clusters * cx * cy - tg_m * tg_n
-    aiter.logger.info(
-        "dispatch to %s: cluster=%dx%d, cluster-grid=%dx%d, HIP-grid=%dx%d, "
-        "%d persistent wave(s), useful TG first/last=%d/%d of %d, "
-        "%d cluster-padding tile(s) (%d M-tiles x %d N-tiles)",
-        label,
-        cx,
-        cy,
-        gx,
-        gy,
-        gx * cx,
-        gy * cy,
-        waves,
-        first,
-        last,
-        PERSISTENT_TG,
-        padding,
-        tg_m,
-        tg_n,
-    )
-    return {
-        "cluster": f"{cx}x{cy}",
-        "cluster grid": f"{gx}x{gy}",
-        "TG waves": waves,
-        "padding tiles": padding,
-        "first active TG": first,
-        "last active TG": last,
+def _observed_kernel(fn, args):
+    """Observe one warmed-up launch outside timing; selection stays in C++."""
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+    ) as prof:
+        fn(*args)
+        torch.cuda.synchronize()
+    names = {
+        event.name.removeprefix("aiter::")
+        for event in prof.events()
+        if str(event.device_type).endswith("CUDA") and "f4gemm_" in event.name
     }
+    assert len(names) == 1, f"expected one F4GEMM kernel in the trace, got {names}"
+    return names.pop()
 
 
 PERF_SHAPES = [
@@ -194,12 +97,29 @@ PERF_SHAPES = [
     (16384, 16384, 16384),  # Persistent throughput baseline.
 ]
 FUNC_SHAPES = [
+    # Small/partial tiles and runtime cluster shapes along both axes.
+    (1, 256, 256),
+    (17, 256, 256),
+    (32, 256, 256),
+    (768, 256, 256),
+    (512, 512, 256),
+    (1024, 256, 256),
+    (512, 1024, 256),
+    (1024, 512, 256),
+    (1024, 1024, 256),
     # NPS: one cluster, the K6 boundary, and the production shape.
     (768, 1024, 256),
     (768, 1024, 1536),
     (768, 1024, 1792),
     (1536, 24576, 1536),
     (1536, 7168, 16384),
+    # Alignment and automatic-selection size boundaries.
+    (767, 1024, 256),
+    (768, 1008, 256),
+    (768, 1024, 288),
+    (768, 49152, 256),
+    (768, 50176, 256),
+    (12288, 16384, 16384),
     # pure_compute
     (256, 2048, 8192),
     (2048, 8192, 8192),
@@ -323,10 +243,8 @@ def _verdict(err):
 
 
 def _support_reason(outtype, apre, M, N, K):
-    """Support matrix gate. Returns None if the (outtype,apre,M,N,K) combo is
-    supported, else a short reason string (row marked "not support"). Mirrors
-    the dispatch heuristic in asm_f4gemm.cu so shapes are skipped before the
-    shuffle/prep step rather than crashing on an assert."""
+    """Check data-preparation and reference constraints before allocating tensors.
+    Kernel selection remains in the C++ entrypoint."""
     if M <= 0 or N <= 0 or K <= 0:
         return "M/N/K must be positive"
     if outtype not in _OUT_DTYPE:
@@ -501,6 +419,83 @@ def _prep_nvfp4(M, N, K, apre, data_init, scale_init, gen):
     return inp, ref
 
 
+def _check_output_contracts(intypes, outtypes, apres, seed):
+    """Exercise output reuse, invalid buffers and empty batches through the public API."""
+    M, N, K = 32, 128, 256
+    checked = 0
+    for intype, apre in itertools.product(intypes, apres):
+        prep = _prep_mxfp4 if intype == "mxfp4" else _prep_nvfp4
+        gemm = getattr(aiter, f"gemm_{intype}_asm")
+        inp, _ = prep(M, N, K, apre, "uniform", "auto", make_generator(seed))
+        args = (inp["A"], inp["B"], inp["sA"], inp["sB"])
+        if intype == "nvfp4":
+            args += (inp["gA"], inp["gB"])
+        device = inp["A"].device
+        for outtype in outtypes:
+            dtype = _OUT_DTYPE[outtype]
+            kwargs = {"dtype": dtype, "a_preshuffle": bool(apre)}
+            expected = gemm(*args, **kwargs)
+            y = torch.empty((M, N), dtype=dtype, device=device)
+            y.view(torch.uint8).fill_(0xFF)
+            result = gemm(*args, **kwargs, y=y)
+            if outtype == "fp8":
+                out, scale = result
+                expected, expected_scale = expected
+                assert torch.equal(
+                    unpack_mxfp8_out_scale(scale, M, N).view(torch.uint8),
+                    unpack_mxfp8_out_scale(expected_scale, M, N).view(torch.uint8),
+                ), "preallocated FP8 output changed its scales"
+            else:
+                out = result
+            assert out is y, "GEMM must return the supplied y"
+            assert torch.equal(out.view(torch.uint8), expected.view(torch.uint8))
+
+            for invalid, bad_y in (
+                ("shape", torch.empty((M, N + 1), dtype=dtype, device=device)),
+                ("dtype", torch.empty((M, N), dtype=torch.float32, device=device)),
+                ("device", torch.empty((M, N), dtype=dtype, device="cpu")),
+                ("strides", y.t().contiguous().t()),
+            ):
+                try:
+                    gemm(*args, **kwargs, y=bad_y)
+                except ValueError as error:
+                    assert "y must be contiguous" in str(error), error
+                else:
+                    raise AssertionError(f"GEMM accepted an invalid y: {invalid}")
+
+            empty_args = (args[0][:0], args[1], args[2][:0], args[3], *args[4:])
+            for empty_y in (None, torch.empty((0, N), dtype=dtype, device=device)):
+                result = gemm(*empty_args, **kwargs, y=empty_y)
+                empty_out = result[0] if outtype == "fp8" else result
+                assert empty_out.shape == (0, N) and empty_out.dtype == dtype
+                assert empty_out.device == device
+                if empty_y is not None:
+                    assert empty_out is empty_y
+                if outtype == "fp8":
+                    assert result[1].shape == (0, 1)
+                    assert result[1].dtype == dtypes.fp8_e8m0
+
+            public_args = (
+                args[0][:0].view(2, 0, K // 2),
+                args[1],
+                args[2][:0],
+                args[3],
+            )
+            public_kwargs = {"apreshuffle": bool(apre)}
+            if intype == "nvfp4":
+                public_kwargs["global_A_scale"] = torch.tensor(1.0, device=device)
+            if outtype == "fp8":
+                empty_out, scale = aiter.gemm_a4w4o8(*public_args, **public_kwargs)
+                assert scale.shape == (0, 1)
+            else:
+                empty_out = aiter.gemm_a4w4(*public_args, **public_kwargs)
+            assert empty_out.shape == (2, 0, N) and empty_out.dtype == dtype
+            checked += 1
+    aiter.logger.info(
+        "F4GEMM output and empty-batch contracts passed (%d cases)", checked
+    )
+
+
 @benchmark()  # intype, M, N, K, apre, outtype, data_init, ... -> table columns
 def test_gemm(
     intype,
@@ -539,8 +534,6 @@ def test_gemm(
         result = {
             "gfx": get_gfx(),
             "knl_name": knl_name or "auto",
-            "tile": "n/a",
-            "cluster": "n/a",
             "asm us": float("nan"),
             "asm TFLOPS": float("nan"),
             "asm TB/s": float("nan"),
@@ -551,19 +544,14 @@ def test_gemm(
             result["gluon bitmatch"] = "not checked"
         return result
 
-    # Resolve support and the selected .co before allocating or shuffling data.
-    # Missing registrations, including an explicit unavailable --knl-name, are
-    # reported as unsupported rows so a sweep can continue.
+    # Check only the preparation/reference contract here. C++ selects the kernel.
     reason = _support_reason(outtype, apre, M, N, K)
     if reason is not None:
         return not_supported(reason)
-    try:
-        cfg = _kernel_config(M, N, K, intype, outtype, apre, knl_name)
-    except Exception as e:
-        if not any(marker in str(e) for marker in _NOT_SUPPORTED_MARKERS):
-            raise
-        return not_supported(str(e))
-    base = Path(cfg["co_name"]).stem
+    knl = "" if knl_name in (None, "", "auto") else knl_name
+    compare_gluon = check_gluon or (
+        mode == "func" and _gluon_support_reason(intype, outtype, apre, M, N, K) is None
+    )
 
     block = MXFP4_SCALE_BLOCK if intype == "mxfp4" else NVFP4_SCALE_BLOCK
     assert K % block == 0, f"K must be a multiple of {block}"
@@ -572,7 +560,7 @@ def test_gemm(
     gen = make_generator(seed)  # fixed seed -> bit-identical buffers
     if intype == "mxfp4":
         inp, ref_f32 = _prep_mxfp4(
-            M, N, K, apre, data_init, scale_init, gen, check_gluon=check_gluon
+            M, N, K, apre, data_init, scale_init, gen, check_gluon=compare_gluon
         )
     else:
         inp, ref_f32 = _prep_nvfp4(M, N, K, apre, data_init, scale_init, gen)
@@ -585,17 +573,6 @@ def test_gemm(
     needTrace = mode == "profile"
     # --iters overrides; unset keeps the mode default (func=5, perf/profile=101).
     num_iters = num_iters if num_iters is not None else (5 if mode == "func" else 101)
-
-    # Dispatch mode. Default (knl_name=None) is heuristic: kernelName="" lets the
-    # aiter op pick the .co from f4gemm.csv by shape and input/output formats,
-    # so the test validates the op's dispatch. Explicit is opt-in via --knl-name:
-    # "auto" uses the per-config derived name below; any other value is used verbatim.
-    if knl_name is None:
-        knl = ""
-    elif knl_name == "auto":
-        knl = f"_ZN5aiter{len(base)}{base}E"
-    else:
-        knl = knl_name
 
     # Pass inputs as ARGS so run_perftest can rotate them (defeats the L2 hot-cache).
     y = torch.empty((M, N), dtype=out_dtype, device=inp["A"].device)
@@ -648,21 +625,10 @@ def test_gemm(
     scale_bytes = (M + N) * (K // block)
     nbytes = inp["A"].nbytes + inp["B"].nbytes + scale_bytes + out_bytes
 
-    # Report the actual .co in the table: readable base name for heuristic/"auto",
-    # the verbatim knl_name otherwise (kept in the table, see main()).
-    actual_knl = knl_name if (knl_name and knl_name != "auto") else base
-    ret = {"gfx": get_gfx(), "knl_name": actual_knl}
-    if check_gluon:
+    ret = {"gfx": get_gfx(), "knl_name": knl or "auto"}
+    if compare_gluon:
         # Missing ASM kernels must not silently pass a requested comparison.
         ret["gluon bitmatch"] = "not checked"
-    ret["tile"] = f'{cfg["tile_m"]}x{cfg["tile_n"]}'
-    ret["ps_mode"] = cfg["ps_mode"]
-    geometry = tuple(cfg[key] for key in ("cluster_x", "cluster_y", "grid_x", "grid_y"))
-    ret.update(
-        _report_active_tg(
-            M, N, cfg["tile_m"], cfg["tile_n"], base, geometry, cfg["ps_mode"]
-        )
-    )
     # Only a missing .co is reported as "not support"; any other failure (OOM,
     # memory fault, shape assert, ...) must propagate, not show as a green cell.
     for name, (fn, fn_args) in candidates.items():
@@ -682,14 +648,14 @@ def test_gemm(
             # No .co for this config; mark unsupported, keep going.
             aiter.logger.warning(
                 "f4gemm not supported: intype=%s outtype=%s apre=%s "
-                "M=%s N=%s K=%s [%s.co]: %s",
+                "M=%s N=%s K=%s [%s]: %s",
                 intype,
                 outtype,
                 apre,
                 M,
                 N,
                 K,
-                base,
+                knl or "auto",
                 e,
             )
             ret[f"{name} us"] = float("nan")
@@ -698,10 +664,23 @@ def test_gemm(
             ret[f"{name} err"] = float("nan")
             ret[f"{name} result"] = "not support"
             continue
+        ret["knl_name"] = _observed_kernel(fn, fn_args)
         # Func-mode only: check the high-level op contracts by outtype -- bf16 ->
         # gemm_a4w4 (single tensor), fp8 -> gemm_a4w4o8 ((data, scale) tuple).
         # Not timed/tabled.
         if mode == "func":
+            if "f4gemm_bf16_mxfp4_BpreShuffle_192x256" in ret["knl_name"]:
+                persistent = aiter.gemm_mxfp4_asm(
+                    inp["A"],
+                    inp["B"],
+                    inp["sA"],
+                    inp["sB"],
+                    a_preshuffle=False,
+                    kernelName=_PS_KERNEL,
+                )
+                assert torch.equal(
+                    out.view(torch.uint8), persistent.view(torch.uint8)
+                ), f"NPS/PS bit mismatch for M,N,K={M},{N},{K}"
             a4_kwargs = {"apreshuffle": bool(apre)}
             if intype == "nvfp4":
                 # global scales are Optional[Tensor] (schema); a non-None value
@@ -764,7 +743,7 @@ def test_gemm(
         ret[f"{name} TB/s"] = round(nbytes / us / 1e6, 2)
         ret[f"{name} err"] = err
         ret[f"{name} result"] = _verdict(err)
-        if check_gluon:
+        if compare_gluon:
             # Gluon compilation, shuffling, execution and comparison are outside
             # ASM's timed region. This uses the same entry/config as the Gluon
             # benchmark, with the UT's --data-init/--scale-init/--seed buffers.
@@ -788,7 +767,8 @@ def main():
         "--mode",
         choices=["func", "perf", "profile"],
         default="perf",
-        help="func=acc+timing table (fewer iters), perf=acc+timing table, profile=perf+trace",
+        help="func=API checks, accuracy, timing and supported MXFP4/Gluon bit-match; "
+        "perf=accuracy+timing; profile=perf+trace",
     )
     parser.add_argument(
         "--check-gluon",
@@ -900,7 +880,7 @@ def main():
         default=None,
         help="dispatch mode. Default (unset) = heuristic: the aiter op picks the "
         ".co from f4gemm.csv by shape and input/output formats, validating dispatch. "
-        "'auto' = force the per-config derived knl_name (explicit). Any other value "
+        "'auto' also uses the heuristic. Any other value "
         "= use that exact mangled knl_name for all runs (developer experiment/debug).",
     )
     parser.add_argument(
@@ -917,6 +897,9 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.iters is not None and args.iters < 2:
+        parser.error("--iters must be at least 2 for profiler-based timing")
+
     # @benchmark always returns the call-args dict, so gate before emitting rows.
     if get_gfx() not in SUPPORTED_GFX:
         if args.check_gluon:
@@ -924,6 +907,11 @@ def main():
         aiter.logger.warning(
             "gemm_a4w4 (F4GEMM) unsupported on %s; skipping", get_gfx()
         )
+        return
+    if not torch.cuda.is_available() or not is_gfx1250_asm_supported():
+        if args.check_gluon:
+            parser.error("--check-gluon requires an available gfx1250 B0+ GPU")
+        aiter.logger.warning("F4GEMM requires an available gfx1250 B0+ GPU; skipping")
         return
 
     # DATA and SCALE init are paired position-wise (NOT crossed). Mode-aware
@@ -968,6 +956,9 @@ def main():
             if reason is not None:
                 parser.error(f"--check-gluon: {reason} (M,N,K={M},{N},{K})")
 
+    if args.mode == "func":
+        _check_output_contracts(args.intype, args.outtype, apre_list, args.seed)
+
     rows = [
         test_gemm(
             intype,
@@ -1000,7 +991,7 @@ def main():
         aiter.logger.info(
             "wrote JSON summary (%d rows) to %s", len(df_full), args.json_out
         )
-    # Keep the actual kernel and runtime geometry; detailed TG counts stay in JSON.
+    # Keep the observed kernel name; no Python copy of dispatch/geometry rules.
     df = df_full.drop(
         columns=[
             "seed",
@@ -1011,8 +1002,6 @@ def main():
             "test_graph",
             "num_rotate",
             "check_gluon",
-            "first active TG",
-            "last active TG",
         ],
         errors="ignore",
     )
@@ -1022,13 +1011,15 @@ def main():
     )
     if args.mode == "profile":
         aiter.logger.info("profiler traces written under ./aiter_logs/")
-    if args.check_gluon:
-        failed = sum(row.get("gluon bitmatch") != "pass" for row in rows)
-        if failed:
-            aiter.logger.error(
-                "ASM/Gluon bit-match did not pass for %d case(s)", failed
-            )
-            raise SystemExit(1)
+    failed = sum(
+        row.get("asm result") == "failed"
+        or row.get("gluon bitmatch") == "failed"
+        or (args.check_gluon and row.get("gluon bitmatch") != "pass")
+        for row in rows
+    )
+    if failed:
+        aiter.logger.error("F4GEMM validation failed for %d case(s)", failed)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
