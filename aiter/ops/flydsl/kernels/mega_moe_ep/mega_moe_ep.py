@@ -21,7 +21,6 @@ from .mega_moe_ep_config import (
     FLAG_INTS,
     MAX_NPES,
     ep_shape_supported,
-    mega_moe_ep_consts,
 )
 from .mega_moe_ep_kernel import compile_mega_moe_ep
 
@@ -253,28 +252,39 @@ class MegaMoeEPEngine:
         self._gout = torch.empty(
             self.n_cta * rg_max * self.H, dtype=torch.bfloat16, device=self.device
         )
+        # Per-CTA GEMM1 bridge: the planner's gathered payload rows (L_RIX[r]//topk)
+        # written to global so the V2 ATileLoader / AScaleLoader source-key gather can
+        # read them (indexed_input row_map). Indexed bid*RG+r in the kernel.
+        self._rowmap = torch.empty(
+            self.n_cta * rg_max, dtype=torch.int32, device=self.device
+        )
 
     def _bind_weights(self, w1, w1_scale, w2, w2_scale):
-        self.w1, self.w1s, self.w2, self.w2s = (
-            t if t.is_contiguous() else t.contiguous()
-            for t in (w1, w1_scale, w2, w2_scale)
+        # GEMM1 is the V2 pipelined path: its BWeightLoader / BScaleLoader read W1 and
+        # its E8M0 scale in the shuffle_weight_a16w4 / shuffle_scale_a16w4 (gate|up
+        # interleave) B-layout, so shuffle them host-side (natural weights are fed by
+        # the tests / oracle). GEMM2 stays the naive natural-layout read -> W2 natural.
+        from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+
+        w1 = w1 if w1.is_contiguous() else w1.contiguous()
+        self.w1 = shuffle_weight_a16w4(w1, 16, True).contiguous()
+        self.w1s = shuffle_scale_a16w4(
+            w1_scale.reshape(-1, self.H // 32).contiguous(), self.epr, True
+        ).contiguous()
+        self.w2, self.w2s = (
+            t if t.is_contiguous() else t.contiguous() for t in (w2, w2_scale)
         )
 
     def set_weights(self, w1, w1_scale, w2, w2_scale):
         self._bind_weights(w1, w1_scale, w2, w2_scale)
 
     def _fit_mt(self, m):
-        mt = 1 if m <= 32 else 2 if m <= 64 else 3
-        while mt > 1:
-            if (
-                mega_moe_ep_consts(
-                    self.H, self.I, mt, self.epr, self.mtpr * self.world_size, self.a8
-                )["LDS_BYTES"]
-                <= LDS_LIMIT
-            ):
-                break
-            mt -= 1
-        return mt
+        # The V2 pipelined GEMM1 packs rows in pairs (MfmaScaleGU / AScaleLoader use
+        # m_repeat//2 scale groups), so the row tile mt (=m_repeat) must be EVEN. mt=2
+        # (RG=32) fits the rg_max=48 per-CTA scratch and all shapes' LDS; larger even
+        # tiles (mt=4) are a perf follow-up (they need rg_max>=64).
+        del m
+        return 2
 
     def config(self, m):
         cfg = self._cfgs.get(m)
@@ -358,6 +368,7 @@ class MegaMoeEPEngine:
             self._inter.data_ptr(),
             self._inters.data_ptr(),
             self._gout.data_ptr(),
+            self._rowmap.data_ptr(),
             self.rank,
             self.world_size,
             self.epr,

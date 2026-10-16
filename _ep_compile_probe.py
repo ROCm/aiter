@@ -21,15 +21,15 @@ args = [
     Z,                       # ctrl
     Z, Z, Z, Z, Z, Z, Z, Z,  # p0..p7
     Z, Z, Z, Z, Z, Z,        # off_payload off_pscale off_recv off_part off_flag off_out
-    Z, Z, Z,                 # inter inters gout
+    Z, Z, Z, Z,              # inter inters gout rowmap
     0, 8, 48, 8, 32768, 1,   # rank npes epr m mtpr epoch
     304,                     # i32_grid (#CU)
 ]
 stream = torch.cuda.current_stream()
 for a8, label in [(False, "a4w4"), (True, "a8w4")]:
     fn = compile_mega_moe_ep(
-        H=7168, I=3072, TOPK=6, MT=1, TMAX=262144, E=384, EPR=48, NPES=8,
+        H=7168, I=3072, TOPK=6, MT=2, TMAX=262144, E=384, EPR=48, NPES=8,
         act="silu", swiglu_limit=10.0, a8=a8, indexed_payload=True,
     )
     _preload_compiled(fn, *args, stream)
-    print(f"COMPILE OK: v4_pro {label} MT=1")
+    print(f"COMPILE OK: v4_pro {label} MT=2")
