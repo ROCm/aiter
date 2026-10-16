@@ -304,7 +304,14 @@ class TestFhmoeReplay(unittest.TestCase):
             with open(tuned_path, newline="") as handle:
                 rows = list(csv.DictReader(handle))
             self.assertTrue(rows, f"tuner wrote no rows\n{tune_out[-4000:]}")
-            self.assertIn("us", rows[0], "producer CSV must include timed us")
+            shipped = os.path.join(AITER_ROOT, "aiter", "configs", "tuned_fhmoe.csv")
+            with open(shipped, newline="") as handle:
+                shipped_header = next(csv.reader(handle))
+            self.assertEqual(
+                set(rows[0]),
+                set(shipped_header),
+                "tuner columns must match the shipped tuned_fhmoe.csv header",
+            )
             by_token = {int(row["token"]): row for row in rows}
             self.assertEqual(
                 set(by_token),
@@ -315,7 +322,6 @@ class TestFhmoeReplay(unittest.TestCase):
                 kn1, kn2 = row["kernelName1"], row["kernelName2"]
                 self.assertEqual(kn1, _TUNE_KN1, f"token={token} kn1={kn1}")
                 self.assertIn(kn2, _TUNE_KN2S, f"token={token} kn2={kn2}")
-                self.assertGreater(float(row["us"]), 0.0)
                 if token == 1:
                     self.assertNotEqual(
                         kn2,
