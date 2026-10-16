@@ -1,145 +1,229 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Host launch for gfx942/gfx950 TP∈{2,4,8} INT4 two-shot all-reduce."""
+"""Host launch for gfx942/gfx950 TP∈{2,4,8} INT4/INT6 all-reduce.
+
+Public type ``QuickAllReduceInt4``, with two interchangeable schedules selected
+by ``algorithm``. Both are two-shot -- reduce-scatter then all-gather -- so
+they are named for the topology of each lap instead:
+
+* ``"mesh"`` the default: fanout to all N-1 peers, twice.
+* ``"ring"`` 2(N-1) single-destination hops.
+
+Super-tile ST∈{1,8} on the mesh, ST∈{1,8,16,32} on the ring. INT4 nibble or
+INT6 bit-plane pair, both with group-16 E4M3 scales. Payload HBM is bf16.
+
+The kernel configuration comes from a tuning ladder of ``TwoShotRung``, keyed
+on ``(arch, link, world_size)`` in ``allreduce_policy``.
+"""
 
 from __future__ import annotations
 
-import ctypes
+import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
 from flydsl.expr.typing import Int32, Int64, Stream
 
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
-from .kernels.quick_allreduce_int4 import (
-    DEFAULT_GRID_CAP,
-    SUPER_TILES,
-    SUPPORTED_WORLDS,
-    TILE_BYTES,
+from .allreduce_host_shared import (
+    _cuda_index,
+    _resolve_inbox_flags,
+    _StEngine,
+    _validate_ipc_process_group,
+    check_payload,
+    check_world_size,
+    kernel_symbol,
+    payload_probes,
+    require_arch,
+)
+from .allreduce_policy import (
+    MIN_BATCH_BLOCKS,
+    RS_INT6_MIN_WORLD,
+    mesh_st_ladder,
+    resolve_link,
+    ring_st_ladder,
+)
+from .kernels.comm.allreduce_shared import (
+    ATOMS,
+    QUANT_MIN_PAYLOAD_BYTES,
     WORLD,
+    TwoShotRung,
+    has_release_fence,
+    select_rung,
+)
+from .kernels.comm.quick_allreduce_int4 import (
+    MESH_CODECS,
+    SUPER_TILES,
     clamp_grid_cap,
     make_quick_allreduce_int4_kernel,
 )
-from .kernels.tensor_shim import _run_compiled
-from .quick_allreduce_int4_ipc import UncachedIpcHeap
+from .kernels.comm.quick_allreduce_int4_ring import (
+    AG_CODECS,
+    RING_SUPER_TILES,
+    RS_CODECS,
+    make_quick_allreduce_ring_kernel,
+)
+from .kernels.tensor_shim import _preload_compiled, _run_compiled
 
-_SUPPORTED_ARCHS = ("gfx942", "gfx950")
-
-
-def _cuda_index(device) -> int:
-    if isinstance(device, str):
-        device = torch.device(device)
-    if isinstance(device, torch.device):
-        if device.type != "cuda":
-            raise ValueError(f"QuickAllReduceInt4 requires a CUDA device, got {device}")
-        if device.index is None:
-            return int(torch.cuda.current_device())
-        return int(device.index)
-    return int(device)
+logger = logging.getLogger("aiter")
 
 
-def _validate_ipc_process_group(group, *, rank: int) -> None:
-    """Reject groups that cannot exchange HIP IPC handles or CPU-side metadata."""
-    # Keep parallel_state lazy: this module is imported while aiter's AOT setup
-    # is still initializing the top-level package.
-    from aiter.dist.parallel_state import in_the_same_node_as
+@dataclass(frozen=True)
+class _Algorithm:
+    """One all-reduce schedule, plus the host-side policy that tunes it."""
 
-    backend = dist.get_backend(group)
-    if backend == dist.Backend.NCCL:
+    name: str
+    build: Callable[..., dict]
+    super_tiles: tuple[int, ...]
+    rs_codecs: tuple[str, ...]
+    ag_codecs: tuple[str, ...]
+    # ``(*, world_size, link, arch) -> (TwoShotRung, ...)``: the tuning ladder.
+    st_ladder: Callable[..., tuple[TwoShotRung, ...]]
+
+
+def _build_mesh(
+    *,
+    world_size,
+    rank,
+    super_tile,
+    grid,
+    inbox_memory,
+    rs_codec,
+    ag_codec,
+    block,
+):
+    if rs_codec != ag_codec:
         raise ValueError(
-            f"QuickAllReduceInt4 does not support NCCL process groups (got {backend!r} on "
-            f"group rank {rank}): IPC handle exchange requires CPU-side "
-            "broadcast_object_list."
+            f"mesh algorithm has one wire format for both laps, got "
+            f"rs_codec={rs_codec!r} != ag_codec={ag_codec!r}"
         )
+    return make_quick_allreduce_int4_kernel(
+        world_size=world_size,
+        super_tile=super_tile,
+        grid=grid,
+        inbox_memory=inbox_memory,
+        codec=rs_codec,
+        block=block,
+        rank=rank,
+    )
 
-    same_node = in_the_same_node_as(group, source_rank=0)
-    if not all(same_node):
-        off_node = [r for r, ok in enumerate(same_node) if not ok]
-        raise RuntimeError(
-            "QuickAllReduceInt4 does not support multi-node process groups: HIP IPC "
-            f"handles are node-local (ranks not on rank 0's node: {off_node})."
-        )
+
+ALGORITHMS = {
+    "mesh": _Algorithm(
+        name="mesh",
+        build=_build_mesh,
+        super_tiles=SUPER_TILES,
+        rs_codecs=MESH_CODECS,
+        ag_codecs=MESH_CODECS,
+        st_ladder=mesh_st_ladder,
+    ),
+    "ring": _Algorithm(
+        name="ring",
+        build=make_quick_allreduce_ring_kernel,
+        super_tiles=RING_SUPER_TILES,
+        rs_codecs=RS_CODECS,
+        ag_codecs=AG_CODECS,
+        st_ladder=ring_st_ladder,
+    ),
+}
+DEFAULT_ALGORITHM = "mesh"
 
 
-class _StEngine:
-    """One compile-time SUPER inbox + launch."""
+def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
+    """Codecs for one engine: explicit argument > per-N default.
 
-    def __init__(self, *, spec, group, rank: int, world_size: int):
-        self.spec = spec
-        self.launch = spec["launch"]
-        self.super_tile = spec["super_tile"]
-        self.grid = spec["grid"]
-        self.buf_bytes = spec["flags_bytes"] + spec["data_bytes"]
-        self.lds_bytes = spec["lds_bytes"]
-        self.tile_bytes = spec["tile_bytes"]
-        self.tile_fp16 = spec["tile_fp16"]
-        self.rank_tile_bytes = spec["rank_tile_bytes"]
-        self.wire_tile_bytes = spec["wire_tile_bytes"]
-        self._peer_bases = [None] * world_size
-        self._buf_ptr = None
-        self._meta_ptr = None
-        try:
-            self._buf_ptr = UncachedIpcHeap.alloc_uncached(self.buf_bytes)
-            my_handle = UncachedIpcHeap.get_mem_handle_bytes(self._buf_ptr)
-            all_meta = UncachedIpcHeap.gather_object_list_via_broadcast(
-                group, (my_handle, 0)
-            )
+    ``None`` means "not specified", and the caller is expected to pass it
+    whenever it wants the schedule's own default rather than a pinned wire
+    format. That distinction matters at TP8, where the ring's reduce-scatter
+    lap defaults to INT6: an explicit ``rs_codec="int4"`` there is a real
+    downgrade, not a restatement of the default.
 
-            peer_ptrs = [0] * world_size
-            for r in range(world_size):
-                handle, off = all_meta[r]
-                if r == rank:
-                    peer_ptrs[r] = self._buf_ptr + off
-                else:
-                    base = int(UncachedIpcHeap.open_mem_handle(bytes(handle)))
-                    self._peer_bases[r] = base
-                    peer_ptrs[r] = base + off
+    A codec the selected schedule cannot build raises. The per-N *default*
+    silently narrows to what the schedule supports -- the mesh has no INT6
+    path, so TP8's INT6 reduce-scatter default does not leak into it.
 
-            peer_bytes = world_size * 8
-            color_bytes = self.grid * 4
-            self._meta_ptr = UncachedIpcHeap.alloc_uncached(peer_bytes + color_bytes)
-            UncachedIpcHeap.copy_host_to_device(
-                self._meta_ptr,
-                (ctypes.c_int64 * world_size)(*peer_ptrs),
-                peer_bytes,
-            )
-            UncachedIpcHeap.copy_host_to_device(
-                self._meta_ptr + peer_bytes,
-                (ctypes.c_int32 * self.grid)(*([1] * self.grid)),
-                color_bytes,
-            )
-        except Exception:
-            self.close()
-            raise
+    The mesh has one wire format for both laps, so there ``rs_codec`` and
+    ``ag_codec`` follow each other: give either one and the other takes the
+    same value. Giving two different values raises when the kernel is built.
+    """
+    if algo.name == "mesh" and (rs_codec is None) != (ag_codec is None):
+        rs_codec = ag_codec = rs_codec if rs_codec is not None else ag_codec
 
-    def close(self):
-        for b in self._peer_bases:
-            if b is not None:
-                try:
-                    UncachedIpcHeap.close_mem_handle(int(b))
-                except RuntimeError:
-                    pass
-        self._peer_bases = []
-        if self._meta_ptr:
-            try:
-                UncachedIpcHeap.free_device_mem(self._meta_ptr)
-            except RuntimeError:
-                pass
-            self._meta_ptr = None
-        if self._buf_ptr:
-            try:
-                UncachedIpcHeap.free_device_mem(self._buf_ptr)
-            except RuntimeError:
-                pass
-            self._buf_ptr = None
+    rs_default = "int6" if world_size >= RS_INT6_MIN_WORLD else "int4"
+
+    # The all-gather lap forwards bytes verbatim and so contributes exactly one
+    # quantization. It is the dominant error term if the RS lap is INT6.
+    ag_default = "int4"
+
+    def _pick(requested, default, supported, label):
+        if requested is not None:
+            if requested not in supported:
+                raise ValueError(
+                    f"{label} must be one of {supported} for "
+                    f"algorithm={algo.name!r}, got {requested!r}"
+                )
+            return requested
+        # The default is a property of the world size, not of the schedule.
+        if default not in supported:
+            default = supported[0]
+        return default
+
+    resolved_rs = _pick(rs_codec, rs_default, algo.rs_codecs, "rs_codec")
+    resolved_ag = _pick(ag_codec, ag_default, algo.ag_codecs, "ag_codec")
+    return resolved_rs, resolved_ag
+
+
+def batches_publishes(inbox_memory: str, algorithm: str, link: str) -> bool:
+    """Whether ``QuickAllReduceInt4`` batches publishes into super-tiles.
+
+    Always with a release fence, where every publish is an L2 writeback. The
+    PCIe ring batches without one too: each of its ``2(N-1)`` hops ends in a
+    handshake that is a PCIe round trip whether or not a writeback precedes it.
+    """
+    return has_release_fence(inbox_memory) or (algorithm == "ring" and link == "pcie")
 
 
 class QuickAllReduceInt4:
     """IPC inbox + flag buffer and launch wrapper for ``quick_allreduce_int4``.
 
     Requires a non-NCCL, single-node process group for IPC metadata exchange.
+
+    ``algorithm`` selects the schedule. Both are two-shot -- reduce-scatter
+    then all-gather -- so they are named for the topology of each lap:
+
+    * ``"mesh"`` (default): each rank pushes to every one of the ``N-1``
+      peers, twice. Two hops. Optimal on a meshed xGMI node.
+    * ``"ring"``: ``2(N-1)`` hops, each a single contiguous run into exactly
+      one peer's inbox. Same wire volume (``2(N-1)/N`` of the payload), traded
+      for per-destination locality. Optimal for large messages on PCIe.
+
+    ``rs_codec`` and ``ag_codec`` are the wire formats of the ring's two laps.
+    The reduce-scatter lap requantizes ``N-1`` times and it defaults to ``"int6"``
+    at TP8, where INT4 would cost too much accuracy. The all-gather lap forwards
+    bytes verbatim and contributes a single quantization, so it defaults to ``"int4"``
+    everywhere.
+
+    ``inbox_memory`` selects how the IPC inbox is allocated:
+
+    * ``"auto"`` (default) -- ``uncached`` on hosts with xGMI peer links,
+      ``finegrained`` on PCIe-attached hosts, decided from the KFD topology.
+      TP2 is ``uncached`` on PCIe too: one remote peer cannot collapse.
+    * ``"uncached"`` -- correct everywhere, but peer writes collapse on PCIe.
+    * ``"finegrained"`` -- device-coherent, full PCIe rate. Cacheable, so each
+      publish writes the payload back from the writer's L2 with a release fence
+      before the flag goes out write-through (``sc0 sc1``).
+
+    ``min_bytes`` is the payload below which ``allreduce`` refuses to run,
+    defaulting to ``QUANT_MIN_PAYLOAD_BYTES``.
+
+    ``link`` selects the tuning ladder and is detected from the KFD topology
+    when not given. ``ladder`` replaces the tuning ladder of the policy, for
+    tests that run other configurations. Both schedules specialise their
+    binary to this rank, so the JIT symbol carries an ``_r<n>_`` field.
     """
 
     def __init__(
@@ -149,77 +233,130 @@ class QuickAllReduceInt4:
         device,
         rank: int,
         world_size: int = WORLD,
-        super_tile: int = 8,
-        grid_cap: int | None = None,
+        inbox_memory: str = "auto",
+        min_bytes: int | None = None,
+        algorithm: str = DEFAULT_ALGORITHM,
+        rs_codec: str | None = None,
+        ag_codec: str | None = None,
+        link: str | None = None,
+        ladder: tuple[TwoShotRung, ...] | None = None,
     ):
-        if world_size not in SUPPORTED_WORLDS:
+        check_world_size(world_size)
+        if algorithm not in ALGORITHMS:
             raise ValueError(
-                f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
+                f"algorithm must be one of {tuple(ALGORITHMS)}, got {algorithm!r}"
             )
-        if super_tile not in SUPER_TILES:
-            raise ValueError(
-                f"super_tile must be one of {SUPER_TILES}, got {super_tile!r}"
-            )
-        group_world = dist.get_world_size(group=group)
-        group_rank = dist.get_rank(group=group)
-        if group_world != int(world_size):
-            raise ValueError(
-                f"world_size={world_size} does not match group size {group_world}"
-            )
-        if group_rank != int(rank):
-            raise ValueError(f"rank={rank} does not match group rank {group_rank}")
-        _validate_ipc_process_group(group, rank=int(rank))
-        arch = get_gfx_runtime()
-        if arch not in _SUPPORTED_ARCHS:
-            raise RuntimeError(
-                f"QuickAllReduceInt4 supports {', '.join(_SUPPORTED_ARCHS)}, got {arch}"
-            )
-        cap = DEFAULT_GRID_CAP if grid_cap is None else int(grid_cap)
-        if cap < 1:
-            raise ValueError(f"grid_cap must be positive, got {cap}")
-        self._device_index = _cuda_index(device)
+        algo = ALGORITHMS[algorithm]
+        link = resolve_link(link)
+        rs_codec, ag_codec = _resolve_codecs(algo, int(world_size), rs_codec, ag_codec)
+        _validate_ipc_process_group(
+            group, rank=int(rank), world_size=world_size, owner="QuickAllReduceInt4"
+        )
+        arch = require_arch(owner="QuickAllReduceInt4")
+        if ladder is None:
+            ladder = algo.st_ladder(world_size=world_size, link=link, arch=arch)
+        if not ladder:
+            raise ValueError("ladder must have at least one rung")
+        inbox_flags, resolved_inbox = _resolve_inbox_flags(
+            inbox_memory, world_size, link
+        )
+        self._device_index = _cuda_index(device, owner="QuickAllReduceInt4")
         self.group = group
         self.device = torch.device("cuda", self._device_index)
         self.rank = int(rank)
         self.world_size = int(world_size)
-        self.super_tile = int(super_tile)
+        self.link = link
+        self.inbox_memory = resolved_inbox
+        self.algorithm = algorithm
+        self.rs_codec = rs_codec
+        self.ag_codec = ag_codec
+        self._algo = algo
         self._has_launched = False
         cu_count = int(
             torch.cuda.get_device_properties(self._device_index).multi_processor_count
         )
+        lds_capacity = get_lds_capacity_bytes(arch)
 
-        sts = [1]
-        if self.super_tile != 1:
-            sts.append(self.super_tile)
-        self._by_st = {}
+        self._batch_publishes = batches_publishes(resolved_inbox, algorithm, link)
+
+        self.min_bytes = (
+            QUANT_MIN_PAYLOAD_BYTES if min_bytes is None else int(min_bytes)
+        )
+        if self.min_bytes < 0:
+            raise ValueError(f"min_bytes must be non-negative, got {self.min_bytes}")
+
+        # One engine per distinct ``(super_tile, block)``, keyed that way in
+        # ``_by_cfg``. Each ``block`` also gets an ST=1 engine: _pick_cfg falls
+        # back to it when a payload has fewer tiles than the chosen super-tile,
+        # and the fallback has to share the rung's block -- a different tile
+        # size would change the tile count it was picked for. Engines are built
+        # in a fixed order because each does its own IPC handle exchange, which
+        # is a collective -- ranks disagreeing on the order would deadlock.
+        #
+        # The rungs go in first so an ST=1 that the ladder *sites* keeps its own
+        # cap. Only then is the fallback filled in, and at the smallest cap
+        # among its rungs rather than at the global default: the fallback fires
+        # only when a payload has fewer tiles than the super-tile it would
+        # otherwise take, so ``_grid_x`` there is bounded by that super-tile
+        # (<= 32) with a release fence, and by the chosen rung's own cap without
+        # one -- under 128 either way. Seeding it with the 1216 default instead
+        # built a 194 MiB inbox to launch at most 32 blocks into, and did it on
+        # every object ever constructed.
+        caps = {}
+        for r in ladder:
+            caps.setdefault((r.super_tile, r.block), r.grid_cap)
+        for b in {b for _st, b in list(caps)}:
+            caps.setdefault((1, b), min(c for (_st, cb), c in caps.items() if cb == b))
+        self._ladder = ladder
+        self._by_cfg = {}
         try:
             with torch.cuda.device(self._device_index):
-                for st in sts:
+                for key in sorted(caps):
+                    st, b = key
+                    # A persistent kernel deadlocks if it launches more workgroups
+                    # than fit, and the ranks have to agree on the number: take the
+                    # minimum across the group so a heterogeneous node converges.
                     grid = clamp_grid_cap(
-                        cap,
+                        caps[key],
                         arch=arch,
                         world_size=self.world_size,
                         super_tile=st,
                         cu_count=cu_count,
+                        block=b,
                     )
                     shared_grid = torch.tensor(grid, dtype=torch.int64)
                     dist.all_reduce(shared_grid, op=dist.ReduceOp.MIN, group=group)
-                    spec = make_quick_allreduce_int4_kernel(
+                    spec = algo.build(
                         world_size=self.world_size,
+                        rank=self.rank,
                         super_tile=st,
                         grid=int(shared_grid.item()),
+                        inbox_memory=resolved_inbox,
+                        rs_codec=rs_codec,
+                        ag_codec=ag_codec,
+                        block=b,
                     )
-                    self._by_st[st] = _StEngine(
+                    if spec["lds_bytes"] > lds_capacity:
+                        raise ValueError(
+                            f"{algorithm} (rs_codec={rs_codec}, ag_codec={ag_codec}) "
+                            f"at block={b} needs "
+                            f"{spec['lds_bytes']} B of LDS, over the "
+                            f"{lds_capacity} B {arch} has"
+                        )
+                    self._by_cfg[key] = _StEngine(
                         spec=spec,
                         group=self.group,
                         rank=self.rank,
                         world_size=self.world_size,
+                        inbox_flags=inbox_flags,
                     )
         except Exception:
             self.close()
             raise
 
-        primary = self._by_st[self.super_tile]
+        # The first rung's shape, reported as this object's own.
+        self.super_tile, self.block = ladder[0].super_tile, ladder[0].block
+        primary = self._by_cfg[(self.super_tile, self.block)]
         self.buf_bytes = primary.buf_bytes
         self.lds_bytes = primary.lds_bytes
         self.tile_bytes = primary.tile_bytes
@@ -227,58 +364,74 @@ class QuickAllReduceInt4:
         self.rank_tile_bytes = primary.rank_tile_bytes
         self.wire_tile_bytes = primary.wire_tile_bytes
 
-    def _pick_st(self, num_tiles: int) -> int:
-        if self.super_tile == 1:
-            return 1
-        st1 = self._by_st.get(1)
-        if st1 is not None and num_tiles <= st1.grid:
-            return 1
-        return self.super_tile
+    @property
+    def inbox_bytes(self) -> int:
+        """IPC inbox bytes this object holds on *this* rank, across every rung.
 
-    def _check_payload(self, inp, out) -> int:
-        if not isinstance(inp, torch.Tensor) or not isinstance(out, torch.Tensor):
-            raise TypeError("QuickAllReduceInt4 requires torch.Tensor input/output")
-        if inp.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
-            raise ValueError("QuickAllReduceInt4 supports bf16 input/output")
-        if not inp.is_cuda or not out.is_cuda:
-            raise ValueError("QuickAllReduceInt4 requires CUDA tensors")
-        if (
-            inp.device.index != self._device_index
-            or out.device.index != self._device_index
-        ):
-            raise ValueError(
-                f"inp/out must be on cuda:{self._device_index}, "
-                f"got {inp.device} / {out.device}"
-            )
-        if not inp.is_contiguous() or not out.is_contiguous():
-            raise ValueError("QuickAllReduceInt4 requires contiguous input/output")
-        inp_ptr = int(inp.data_ptr())
-        out_ptr = int(out.data_ptr())
-        if inp_ptr % 16 != 0 or out_ptr % 16 != 0:
-            raise ValueError("QuickAllReduceInt4 requires 16-byte-aligned input/output")
-        live_bytes = int(inp.numel()) * int(inp.element_size())
-        if live_bytes > 0xFFFFFFFF:
-            raise ValueError(
-                "QuickAllReduceInt4 payload must not exceed the 4 GiB buffer window"
-            )
-        if live_bytes % 16 != 0:
-            raise ValueError("byte size must be a multiple of 16 (8 bf16)")
-        if int(out.numel()) * int(out.element_size()) != live_bytes:
-            raise ValueError("inp/out byte size mismatch")
-        if max(inp_ptr, out_ptr) < min(inp_ptr + live_bytes, out_ptr + live_bytes):
-            raise ValueError("QuickAllReduceInt4 requires non-overlapping input/output")
-        return live_bytes
+        ``buf_bytes`` is the primary engine's alone, which understates a
+        ladder-driven object by however many rungs it built. The total is what
+        actually has to fit: the wire buffer is
+        ``2(N-1) * grid * (ST * rank_atoms * tile + 64)``, so a high rung is
+        large on its own and a sweep holding several tuning variants live at
+        once is the realistic way to exhaust a device.
+        """
+        return sum(eng.buf_bytes for eng in self._by_cfg.values())
+
+    def _ladder_cfg(self, live_bytes: int) -> tuple[int, int]:
+        """``(super_tile, block)`` the ladder assigns to *live_bytes*.
+
+        Publishes per rank are ``num_tiles / ST * 2(N-1)`` and cost a full L2
+        writeback each, so a bigger payload wants a bigger ST -- but ST also
+        divides the block count, so it cannot simply be maximised. The rungs
+        and the measurements behind them are in ``MESH_ST_LADDER`` and
+        ``RING_ST_LADDER``.
+        """
+        rung = select_rung(self._ladder, live_bytes)
+        return (rung.super_tile, rung.block)
+
+    @staticmethod
+    def _num_tiles(live_bytes: int, block: int) -> int:
+        tile_bytes = int(block) * ATOMS * 16
+        return max(1, (live_bytes + tile_bytes - 1) // tile_bytes)
+
+    def _pick_cfg(self, live_bytes: int) -> tuple[tuple[int, int], int]:
+        """Engine key for a *live_bytes* payload, and its tile count.
+
+        The ladder chooses the rung, which fixes the block and so the tile
+        count; the tile count then only has to confirm there is a whole
+        super-tile to take, falling back to the same block's ST=1 engine when
+        there is not.
+        """
+
+        want, b = self._ladder_cfg(live_bytes)
+        num_tiles = self._num_tiles(live_bytes, b)
+        if want == 1:
+            st = 1
+        elif self._batch_publishes:
+            st = want if num_tiles >= want else 1
+        else:
+            st = want if num_tiles > self._by_cfg[(want, b)].grid else 1
+        return (st, b), num_tiles
+
+    def _grid_x(self, num_tiles: int, super_tile: int, grid: int) -> int:
+        """Blocks to launch for *num_tiles* tiles under *super_tile*.
+
+        *grid* is the compile-time cap of the engine that will run, which is
+        per-super-tile once a ladder is in play -- the wire buffer scales with
+        ``ST * grid``, so a high rung pairs a large ST with a small cap.
+
+        Batching publishes only pays if a block actually owns a super-tile's
+        worth of work: ST=8 across 448 blocks holding one tile each still
+        publishes per tile. Hand each block a full super-tile instead, which
+        cuts publishes to ``num_tiles / ST`` per phase.
+        """
+        if self._batch_publishes and super_tile != 1:
+            batched = max(-(-num_tiles // super_tile), MIN_BATCH_BLOCKS)
+            num_tiles = min(num_tiles, batched)
+        return max(1, min(num_tiles, grid))
 
     def _launch_args(
-        self,
-        eng: _StEngine,
-        inp,
-        out,
-        stream,
-        *,
-        live_bytes: int,
-        num_tiles: int,
-        grid_x: int,
+        self, eng: _StEngine, inp_ptr, out_ptr, stream, *, live_bytes, num_tiles
     ):
         if stream is None:
             stream = Stream(torch.cuda.current_stream(self._device_index))
@@ -288,32 +441,23 @@ class QuickAllReduceInt4:
             Int32(self.rank),
             Int64(live_bytes),
             Int32(num_tiles),
-            Int64(int(inp.data_ptr())),
-            Int64(int(out.data_ptr())),
-            Int64(int(eng._meta_ptr)),
-            Int64(int(eng._meta_ptr + self.world_size * 8)),
-            Int32(grid_x),
+            Int64(inp_ptr),
+            Int64(out_ptr),
+            Int64(int(eng._gpu_peer_ptrs)),
+            Int64(int(eng._colors)),
+            Int32(self._grid_x(num_tiles, eng.super_tile, eng.grid)),
             stream,
         )
 
-    def _launch_eng(
-        self,
-        eng: _StEngine,
-        inp,
-        out,
-        stream,
-        *,
-        live_bytes: int,
-    ) -> None:
-        num_tiles = max(1, (live_bytes + TILE_BYTES - 1) // TILE_BYTES)
+    def _launch_eng(self, eng: _StEngine, inp, out, stream, *, live_bytes: int) -> None:
+        num_tiles = max(1, (live_bytes + eng.tile_bytes - 1) // eng.tile_bytes)
         args = self._launch_args(
             eng,
-            inp,
-            out,
+            int(inp.data_ptr()),
+            int(out.data_ptr()),
             stream,
             live_bytes=live_bytes,
             num_tiles=num_tiles,
-            grid_x=min(num_tiles, eng.grid),
         )
         # A launch may still be using the raw HIP allocations when Python drops
         # the communicator. Keep cleanup conservative even if launch raises.
@@ -321,19 +465,35 @@ class QuickAllReduceInt4:
         with torch.cuda.device(self._device_index):
             _run_compiled(eng.launch, *args)
 
-    def compile(self, inp, out, stream=None) -> None:
-        """Eager-JIT every ST binary.
+    def cfgs_for(self, lo: int, hi: int) -> list[tuple[int, int]]:
+        """``_by_cfg`` keys a payload of ``lo..hi`` bytes (inclusive) can
+        select, in build order."""
+        floors = [rung.min_bytes for rung in self._ladder]
+        picked = {self._pick_cfg(n)[0] for n in payload_probes(floors, lo, hi)}
+        return [key for key in self._by_cfg if key in picked]
 
-        Default ST=8 also builds an ST=1 engine for small payloads.
-        Every rank must call this with the same ``inp``/``out`` shape.
-        ``out`` is overwritten.
+    def preload(self, *, payload_range=None) -> None:
+        """JIT-compile engine binaries without launching any of them.
+
+        ``payload_range=(lo, hi)`` takes only the binaries ``allreduce`` would
+        run for a payload of ``lo..hi`` bytes (inclusive); ``None`` takes every
+        one. The ladder builds engines for the whole size range, while a
+        dispatcher routes only its own window here, so the rest never run.
+
+        Local to this rank, not a collective. ``QuickAllReduce`` calls it once
+        at init, via ``preload_fly_engines``, to keep JIT compiles out of CUDA
+        graph capture; the op tests call it before timing or correctness
+        checks begin. The HIP module load still happens on each binary's first
+        launch.
         """
-        live_bytes = self._check_payload(inp, out)
-        for eng in self._by_st.values():
-            self._launch_eng(eng, inp, out, stream, live_bytes=live_bytes)
+        keys = self._by_cfg if payload_range is None else self.cfgs_for(*payload_range)
+        for key in keys:
+            eng = self._by_cfg[key]
+            args = self._launch_args(eng, 0, 0, None, live_bytes=0, num_tiles=0)
+            _preload_compiled(eng.launch, *args)
 
     def close(self):
-        engines = getattr(self, "_by_st", None)
+        engines = getattr(self, "_by_cfg", None)
         if not engines:
             return
         with torch.cuda.device(self._device_index):
@@ -351,13 +511,38 @@ class QuickAllReduceInt4:
             # Destructors must not raise, especially during interpreter shutdown.
             return
 
+    def variant(self, nbytes: int) -> str:
+        """Identity of the binary an *nbytes* payload would actually run."""
+        cfg, num_tiles = self._pick_cfg(int(nbytes))
+        eng = self._by_cfg[cfg]
+        grid_x = self._grid_x(num_tiles, eng.super_tile, eng.grid)
+        return f"{kernel_symbol(eng.launch)}/grid_x{grid_x}"
+
+    def is_beneficial(self, nbytes: int) -> bool:
+        """Whether *nbytes* is large enough for this kernel to be worth using.
+
+        Callers with a fallback should route anything smaller to it; see
+        ``QUANT_MIN_PAYLOAD_BYTES``. ``allreduce`` refuses payloads below the
+        threshold rather than silently running them slowly.
+        """
+        return int(nbytes) >= self.min_bytes
+
     def allreduce(self, inp, out, stream=None):
         """Two-shot INT4 all-reduce into ``out``.
 
         ``stream=None`` uses the current PyTorch stream on this device.
         """
-        live_bytes = self._check_payload(inp, out)
-        num_tiles = max(1, (live_bytes + TILE_BYTES - 1) // TILE_BYTES)
-        st = self._pick_st(num_tiles)
-        eng = self._by_st[st]
-        self._launch_eng(eng, inp, out, stream, live_bytes=live_bytes)
+        live_bytes = check_payload(
+            inp, out, device_index=self._device_index, owner="QuickAllReduceInt4"
+        )
+        if not self.is_beneficial(live_bytes):
+            raise ValueError(
+                f"QuickAllReduceInt4.allreduce got a {live_bytes} B payload, "
+                f"below the {self.min_bytes} B floor: at decode sizes this "
+                "kernel saves a few microseconds on a collective that is not "
+                "the bottleneck, and charges ~36 dB of SQNR for them. Route "
+                "small messages to an exact all-reduce, or pass min_bytes=0 "
+                "to override."
+            )
+        cfg, _num_tiles = self._pick_cfg(live_bytes)
+        self._launch_eng(self._by_cfg[cfg], inp, out, stream, live_bytes=live_bytes)
