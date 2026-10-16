@@ -712,6 +712,8 @@ def test_terminal_window():
             try:
                 idx = _run_single_backend(x, lens, k, "stream")
             except _NotServed:
+                # This test runs on gfx950 only, where stream serves these.
+                failures.append(f"{rows}x{width} (cap {cap}): not served")
                 continue
             if not torch.equal(_sorted_values(x, idx), run_torch(x, lens, k)):
                 failures.append(f"{rows}x{width} (cap {cap}): wrong selection")
@@ -803,7 +805,7 @@ def test_nan_order():
     Checked as the property rather than against torch: indices in range and
     distinct, and no unselected live element ranked above a selected one.
     """
-    failures = []
+    failures, not_served = [], []
     for backend, m, n, k, ragged in _NAN_ROUTES:
         tag = f"{backend} {m}x{n} k={k}{' end' if ragged else ''}"
         if ragged:
@@ -822,6 +824,8 @@ def test_nan_order():
             # The routes are gfx950 shapes; elsewhere some are not served.
             if get_gfx() == "gfx950":
                 failures.append(f"{tag}: not served")
+            else:
+                not_served.append(tag)
             continue
         torch.cuda.synchronize()
         live = torch.arange(n).view(1, n) < ends.view(m, 1)
@@ -841,6 +845,13 @@ def test_nan_order():
             failures.append(f"{tag}: rows {bad[:4]} rank a NaN or a value wrongly")
     for label in failures:
         aiter.logger.error("NAN ORDER FAILED: %s", label)
+    if not_served:
+        aiter.logger.warning(
+            "nan order: %d routes not served on %s, skipped: %s",
+            len(not_served),
+            get_gfx(),
+            not_served,
+        )
     return failures
 
 
