@@ -1962,7 +1962,23 @@ def build_partial_offsets(
     return off, int(flat.sum()) + TRASH_ROWS
 
 
-def balanced_tile_groups(seq_offsets, block_m, max_seq_len, groups):
+def tile_partial_counts(seq_offsets, block_m, max_seq_len):
+    """Partial ROWS each kv tile contributes, as host ints.
+
+    Costs ONE device sync, and is the only thing the kv-chunking search needs:
+    a span's scratch is just the sum of its tiles' counts. Computing this once
+    lets every candidate G be priced in host arithmetic, instead of building a
+    full offset table per candidate to discover it does not fit.
+    """
+    device = seq_offsets.device
+    lengths = (seq_offsets[1:] - seq_offsets[:-1]).to(torch.int64)
+    max_tiles = (max_seq_len + block_m - 1) // block_m
+    t_idx = torch.arange(max_tiles, dtype=torch.int64, device=device)
+    counts = (lengths[:, None] - t_idx[None, :] * block_m).clamp(min=0).sum(0)
+    return counts.tolist()
+
+
+def balanced_tile_groups(counts, groups):
     """Split the kv tiles into `groups` spans of roughly equal PARTIAL COUNT.
 
     kv tile t serves `S_b - t*block_m` q rows, so low tiles produce far more
@@ -1970,15 +1986,14 @@ def balanced_tile_groups(seq_offsets, block_m, max_seq_len, groups):
     group 0's scratch while the last group sits half empty; at the production
     shape the equal-count split puts only about the first 29% of tiles in
     group 0.
+
+    `counts` comes from `tile_partial_counts`; this is pure host arithmetic.
     """
-    device = seq_offsets.device
-    lengths = (seq_offsets[1:] - seq_offsets[:-1]).to(torch.int64)
-    max_tiles = (max_seq_len + block_m - 1) // block_m
-    t_idx = torch.arange(max_tiles, dtype=torch.int64, device=device)
-    counts = (lengths[:, None] - t_idx[None, :] * block_m).clamp(min=0).sum(0)
-    # One sync, then all the searching happens on host ints: the spans are
-    # kernel scalars, so they have to reach the host either way.
-    cum = torch.cumsum(counts, 0).tolist()
+    max_tiles = len(counts)
+    cum, running = [], 0
+    for c in counts:
+        running += c
+        cum.append(running)
     total = cum[-1]
 
     spans, lo = [], 0
@@ -1993,6 +2008,11 @@ def balanced_tile_groups(seq_offsets, block_m, max_seq_len, groups):
         spans.append((lo, hi))
         lo = hi
     return spans
+
+
+def span_scratch_rows(counts, spans):
+    """Rows the largest pass needs, trash row included. Host arithmetic."""
+    return max(sum(counts[lo:hi]) for lo, hi in spans) + TRASH_ROWS
 
 
 def build_reduce_map(seq_offsets, device):

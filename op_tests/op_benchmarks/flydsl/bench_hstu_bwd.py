@@ -74,6 +74,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.hstu_attention import (
     _make_bwd_fused_runners,
     _make_bwd_kernel_runners,
+    flydsl_hstu_attention_bwd,
 )
 from op_tests.test_flydsl_hstu_attention_bwd import (
     SUPPORTED_GFX,
@@ -126,6 +127,7 @@ DISPLAY_COLS = [
     "min_ms",
     "TFLOPS",
     "vs split",
+    "G",
 ]
 
 # gfx942 budgets, per SIMD lane-slot and per workgroup.
@@ -197,6 +199,7 @@ def bench_cell(regime, b, h, mask, target_size, iters, names):
         split_runners = _make_bwd_kernel_runners(*args)
         arms["dvdk"] = split_runners["dvdk"][0]
         arms["dq"] = split_runners["dq"][0]
+        arms["split e2e"] = lambda: flydsl_hstu_attention_bwd(*args, fused=False)
     if "fused" in names:
         runners = _make_bwd_fused_runners(*args)
         arms["fused"] = runners["fused"]
@@ -206,10 +209,35 @@ def bench_cell(regime, b, h, mask, target_size, iters, names):
         meta["reduce_GB"] = runners["reduce_bytes"] / 1e9
         meta["scratch_GB"] = runners["scratch_bytes"] / 1e9
         meta["carry_GB"] = runners["carry_bytes"] / 1e9
+        # The PUBLIC entry point, planner and allocation included -- what
+        # autograd actually calls. The arms above time launch closures built
+        # once outside the loop, which is right for comparing kernels but is
+        # not what a caller pays. Keeping both makes the per-call planning cost
+        # visible; it was 6.8% and went unnoticed because nothing measured it.
+        arms["fused e2e"] = lambda: flydsl_hstu_attention_bwd(*args, fused=True)
 
     # One pass per arm. `time_arm`'s warmup absorbs the JIT compile, so no
     # separate compile pass is needed to keep it out of the timed window.
+    e2e_arms = {k: arms.pop(k) for k in ("split e2e", "fused e2e") if k in arms}
     results = {name: time_arm(fn, iters) for name, fn in arms.items()}
+
+    if e2e_arms:
+        # Time the public entry point only AFTER releasing the phase runners.
+        # They hold the fp32 scratch alive, so otherwise each public call
+        # allocates a SECOND one beside it -- tens of GB of pure measurement
+        # artifact, which showed up as 18 ms of phantom overhead against a real
+        # 6.8 ms. The warmup inside `time_arm` absorbs the one-time allocation,
+        # which is correct: a training loop pays it once, not per step.
+        # Drop every reference the phase arms hold. The fused runner owns the
+        # fp32 scratch, so otherwise each public call allocates a SECOND one
+        # beside it -- tens of GB of pure measurement artifact, which showed up
+        # as 18 ms of phantom overhead against a real 6.8 ms.
+        arms.clear()
+        runners = split_runners = None
+        gc.collect()
+        torch.cuda.empty_cache()
+        for name, fn in e2e_arms.items():
+            results[name] = time_arm(fn, iters)
 
     # Causal pairs per sequence = L*(L+1)/2; bwd = 3*f1 + 2*f2 with
     # f1 = 2*attn_dim (S recompute / dK / dQ share the attn-dim contraction),
@@ -226,8 +254,11 @@ def bench_cell(regime, b, h, mask, target_size, iters, names):
             "targets": target_size, "backend": name,
             "median_ms": median, "min_ms": float(times.min()),
             # `flops` counts the WHOLE backward, so dividing it by one phase's
-            # time would overstate that phase. Only the totals get a roofline.
-            "TFLOPS": float("nan"),
+            # time would overstate that phase. Phases get no roofline; the e2e
+            # arms are complete backwards, so they do.
+            "TFLOPS": (
+                flops / median / 1e9 if name.endswith(" e2e") else float("nan")
+            ),
             "L": total_tokens,
             "G": meta.get("G", float("nan")),
         })  # fmt: skip
@@ -250,16 +281,26 @@ def bench_cell(regime, b, h, mask, target_size, iters, names):
     if "dq_reduce" in results:
         meta["reduce_TBs"] = meta["reduce_GB"] / float(np.median(results["dq_reduce"]))
 
-    base = next(
-        (r["median_ms"] for r in rows if r["backend"] == BASELINE), float("nan")
-    )
+    # Compare like with like: the `* total` rows are launch closures with setup
+    # hoisted out, the `* e2e` rows are the public entry point with setup
+    # included. Dividing one family by the other charges the fused path for
+    # overhead the baseline never paid.
+    base_by_family = {
+        " total": next(
+            (r["median_ms"] for r in rows if r["backend"] == BASELINE), float("nan")
+        ),
+        " e2e": next(
+            (r["median_ms"] for r in rows if r["backend"] == "split e2e"), float("nan")
+        ),
+    }
     for r in rows:
         # `dvdk`/`dq` and `fused`/`dq_reduce` are PHASES of one backward, not
         # backwards of their own, so a speedup column on them would invite
         # reading a phase as a complete result. Only the two whole backwards
         # carry it.
-        whole = r["backend"].endswith(" total")
-        r["vs split"] = base / r["median_ms"] if whole else float("nan")
+        family = next((f for f in base_by_family if r["backend"].endswith(f)), None)
+        base = base_by_family.get(family, float("nan"))
+        r["vs split"] = base / r["median_ms"] if family else float("nan")
 
     # q k v dO dq dv dk, all bf16. The fp32 scratch and carry come from the
     # runner, which allocated them.
@@ -267,7 +308,7 @@ def bench_cell(regime, b, h, mask, target_size, iters, names):
 
     # Each cell holds a full set of activations plus the fp32 scratch; drop them
     # before the next cell builds its own.
-    del q, k, v, dout, seq_offsets, num_targets, arms
+    del q, k, v, dout, seq_offsets, num_targets
     gc.collect()
     torch.cuda.empty_cache()
     return rows, meta
@@ -422,6 +463,7 @@ def format_table(df):
         out[col] = out[col].map(lambda v: _fmt(v, ".1f"))
     out["TFLOPS"] = out["TFLOPS"].map(lambda v: _fmt(v, ".1f"))
     out["vs split"] = out["vs split"].map(lambda v: _suffix(v, ".2f", "x"))
+    out["G"] = out["G"].map(lambda v: _fmt(v, ".0f"))
     # `disable_numparse` keeps tabulate from re-parsing these formatted strings
     # and dropping trailing zeros, which otherwise prints 45.0 ms as "45".
     return out.to_markdown(index=False, disable_numparse=True)
@@ -455,6 +497,11 @@ def parse_args():
         "--mask", nargs="*", default=["causal", "hstu"],
         choices=["causal", "hstu"],
         help="""Mask presets to keep.""",
+    )  # fmt: skip
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="""Also print a table and device footprint per cell. The summary
+        table at the end carries the same latencies and G.""",
     )  # fmt: skip
     parser.add_argument(
         "--meta", action="store_true",
@@ -495,11 +542,28 @@ def main():
     ]  # fmt: skip
 
     rows = []
-    for cell in cells:
-        cell_rows, meta = bench_cell(*cell, names)
-        rows += cell_rows
+    for index, cell in enumerate(cells, 1):
         regime, b, h, mask, target_size = cell[:5]
         tag = f"{regime} B={b} H={h} {mask} targets={target_size}"
+        # Printed BEFORE the cell runs and completed after, so a sweep that
+        # spends minutes compiling is not silent. One line per cell, and it
+        # reads the same redirected to a file as it does on a terminal.
+        print(f"[{index}/{len(cells)}] {tag} ... ", end="", flush=True)
+
+        cell_rows, meta = bench_cell(*cell, names)
+        rows += cell_rows
+
+        done = {r["backend"]: r["median_ms"] for r in cell_rows}
+        parts = [
+            f"{label} {done[key]:.1f}"
+            for key, label in (("split total", "split"), ("fused total", "fused"))
+            if key in done
+        ]
+        if "split total" in done and "fused total" in done:
+            parts.append(f"{done['split total'] / done['fused total']:.2f}x")
+        if "G" in meta:
+            parts.append(f"G={meta['G']}")
+        print("  ".join(parts), flush=True)
         extra = f"L={meta['L']:,}"
         if "G" in meta:
             extra += f"  G={meta['G']}  spans={meta['spans']}"
@@ -508,18 +572,19 @@ def main():
                 f"  reduction {meta['reduce_GB']:.0f} GB "
                 f"@ {meta['reduce_TBs']:.2f} TB/s"
             )
-        aiter.logger.info(
-            "hstu bwd %s (%s) (markdown):\n%s",
-            tag,
-            extra,
-            format_table(pd.DataFrame(cell_rows)),
-        )
-        if args.meta and "scratch_GB" in meta:
+        if args.verbose:
             aiter.logger.info(
-                "hstu bwd %s device footprint (markdown):\n%s",
+                "hstu bwd %s (%s) (markdown):\n%s",
                 tag,
-                format_footprint(meta),
+                extra,
+                format_table(pd.DataFrame(cell_rows)),
             )
+            if args.meta and "scratch_GB" in meta:
+                aiter.logger.info(
+                    "hstu bwd %s device footprint (markdown):\n%s",
+                    tag,
+                    format_footprint(meta),
+                )
 
     df = pd.DataFrame(rows)
     aiter.logger.info("hstu bwd, all cells (markdown):\n%s", format_table(df))

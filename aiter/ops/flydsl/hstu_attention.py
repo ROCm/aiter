@@ -30,6 +30,8 @@ from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd_fused_pp import (
     build_hstu_attention_bwd_fused_pp,
     build_partial_offsets,
     build_reduce_map,
+    span_scratch_rows,
+    tile_partial_counts,
     validate_hstu_attention_bwd_fused_pp,
 )
 from aiter.ops.flydsl.kernels.hstu.hstu_attention_fwd import (
@@ -903,22 +905,35 @@ def _plan_fused_groups(
     max_seq_len: int,
     total_tokens: int,
     groups: int | str,
-) -> tuple[int, list, list, list]:
-    """Split the kv tiles into passes that fit, returning (G, spans, offs, totals).
+    device: torch.device,
+) -> tuple[int, list, torch.Tensor, torch.Tensor]:
+    """Chunk the kv tiles into passes that fit, and allocate the scratch.
 
-    The fp32 partials are the dominant cost of the fused path -- 168 GB in one
-    pass at B=1024/H=8/N=16384 against a 206 GB card -- so the kv tiles are
-    chunked into G passes over ONE reused scratch buffer.
+    Returns `(G, spans, dq_part, dq_carry)`.
 
-    `groups="auto"` takes the SMALLEST G that fits, not the safest: every extra
+    The fp32 partials dominate the fused path -- 168 GB in one pass at
+    B=1024/H=8/N=16384 -- so the kv tiles are chunked into G passes over ONE
+    reused buffer. `groups="auto"` takes the SMALLEST G that fits: every extra
     pass adds a fully serialised reduction (reduce(g) must finish before
     fused(g+1) overwrites the scratch) plus carry traffic, which exists only at
     G > 1 and costs 2*(G-1) passes over L*H*D fp32.
+
+    Memory is settled by ATTEMPTING, not by predicting. Two predictions were
+    tried and both failed: `mem_get_info` alone sees only driver-free memory
+    and over-chunks (G=12 instead of 4 once a caller had cycled tensors), while
+    adding `memory_reserved - memory_allocated` back counts the right bytes but
+    not their LAYOUT -- the scratch is one contiguous tens-of-GB block and
+    cached blocks are fragmented, so it planned a size torch then failed to
+    allocate, dependent on allocator history and reproducible only sometimes.
+    So: estimate, try, and on OOM release the cache and step G up.
+
+    `empty_cache()` is deliberately NOT on the fast path. It hands the scratch
+    back to the driver, so the next call cannot reuse it and must re-enter
+    hipMalloc -- which was itself the largest component of this function's
+    per-call cost.
     """
-    device = seq_offsets.device
     n_kv_tiles = (max_seq_len + block_m - 1) // block_m
     elems = num_heads * head_dim
-
     if groups != "auto" and not 1 <= int(groups) <= n_kv_tiles:
         # Past n_kv_tiles the split cannot give every group a tile, and the
         # spans come back overlapping rather than empty -- a silently wrong
@@ -928,58 +943,58 @@ def _plan_fused_groups(
             f"max_seq_len={max_seq_len}, block_m={block_m}), got {groups}"
         )
 
-    def _spans_offsets(g):
-        spans = balanced_tile_groups(seq_offsets, block_m, max_seq_len, g)
-        planned = [
-            build_partial_offsets(
-                seq_offsets,
-                block_m,
-                max_seq_len=max_seq_len,
-                tile_lo=lo,
-                tile_hi=hi,
-            )
-            for lo, hi in spans
-        ]
-        return spans, [p[0] for p in planned], [p[1] for p in planned]
+    # One sync; every candidate G is then priced in host arithmetic.
+    counts = tile_partial_counts(seq_offsets, block_m, max_seq_len)
 
-    def _pass_bytes(totals, g):
-        # The carry only exists at G > 1; at G == 1 nothing reads or writes it.
-        carry = 0 if g == 1 else total_tokens * elems * 4
-        return max(totals) * elems * 4 + carry
+    def _plan(g):
+        spans = balanced_tile_groups(counts, g)
+        rows = span_scratch_rows(counts, spans)
+        carry_rows = 0 if g == 1 else total_tokens
+        return spans, rows, (rows + carry_rows) * elems * 4
 
     if groups != "auto":
-        spans, offs, totals = _spans_offsets(int(groups))
-        return int(groups), spans, offs, totals
+        candidates = [int(groups)]
+    else:
+        free, _total = torch.cuda.mem_get_info(device)
+        cached = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(
+            device
+        )
+        budget = (free + cached) * _BWD_FUSED_MEM_BUDGET
+        first = next(
+            (g for g in range(1, n_kv_tiles + 1) if _plan(g)[2] <= budget),
+            n_kv_tiles,
+        )
+        candidates = list(range(first, n_kv_tiles + 1))
 
-    # Release torch's cached-but-unallocated blocks BEFORE asking how much is
-    # free. Two ways to get this wrong, both measured:
-    #
-    #   * `mem_get_info` alone reports only what the DRIVER has free, so every
-    #     block torch is holding looks unavailable and the plan over-chunks: at
-    #     B=1024/H=8 the same shape planned G=2 when it ran first and G=12 once
-    #     a previous caller had cycled a few tensors, and each extra pass adds
-    #     two carry traversals of L*H*D fp32 to a fully exposed reduction.
-    #   * adding `memory_reserved - memory_allocated` back fixes the count but
-    #     not the LAYOUT. The scratch is one contiguous allocation of tens of
-    #     GB; cached blocks are fragmented and cannot serve it. That plans a
-    #     size torch then fails to allocate -- observed as a 107 GiB request
-    #     against 92.6 GiB driver-free plus 45.9 GiB cached, and it depends on
-    #     allocator history, so it reproduces only sometimes.
-    #
-    # `empty_cache()` costs a synchronize, which this planner already pays
-    # (the scratch element count has to reach the host to size the buffer), and
-    # it makes the number both accurate and actually allocatable.
-    torch.cuda.empty_cache()
-    free, _total = torch.cuda.mem_get_info(device)
-    budget = free * _BWD_FUSED_MEM_BUDGET
-    for g in range(1, n_kv_tiles + 1):
-        spans, offs, totals = _spans_offsets(g)
-        if _pass_bytes(totals, g) <= budget:
-            return g, spans, offs, totals
+    last_error = None
+    for g in candidates:
+        spans, rows, _nbytes = _plan(g)
+        try:
+            # `empty`, not `zeros`: the reduction reads only elements the fused
+            # kernel wrote -- slots are sized to exactly the q rows their tile
+            # serves and row indices are clamped to seq_len-1 -- so the memset
+            # is pure cost. Verified by poisoning the scratch with NaN at the
+            # production shape: dq came back bitwise identical at G=2 and G=5
+            # with zero NaNs. Zeroing 86 GB was ~17 ms per call.
+            dq_part = torch.empty(rows, elems, dtype=torch.float32, device=device)
+            dq_carry = (
+                torch.zeros(1, 1, dtype=torch.float32, device=device)
+                if g == 1
+                else torch.zeros(
+                    total_tokens, elems, dtype=torch.float32, device=device
+                )
+            )
+        except torch.cuda.OutOfMemoryError as exc:
+            last_error = exc
+            # Only now is it worth handing fragmented blocks back to the driver.
+            torch.cuda.empty_cache()
+            continue
+        return g, spans, dq_part, dq_carry
+
     raise MemoryError(
-        f"hstu bwd fused: no kv-chunking in 1..{n_kv_tiles} fits -- even one "
-        f"tile per pass needs {_pass_bytes(totals, n_kv_tiles) / 1e9:.1f} GB of "
-        f"{budget / 1e9:.1f} GB usable."
+        f"hstu bwd fused: no kv-chunking in 1..{n_kv_tiles} fits -- the "
+        f"smallest pass still needs {_plan(n_kv_tiles)[2] / 1e9:.1f} GB "
+        f"({last_error})"
     )
 
 
@@ -1084,7 +1099,7 @@ def _make_bwd_fused_runners(
         **config,
     )
 
-    n_groups, spans, offs, totals = _plan_fused_groups(
+    n_groups, spans, dq_part, dq_carry = _plan_fused_groups(
         so_c,
         block_m=block_m,
         num_heads=num_heads,
@@ -1092,24 +1107,23 @@ def _make_bwd_fused_runners(
         max_seq_len=N,
         total_tokens=total_tokens,
         groups=groups,
+        device=device,
     )
     max_tiles = (N + block_m - 1) // block_m
+    # Offset tables for the CHOSEN spans only. These genuinely depend on the
+    # sequence lengths, which change every training step, so they are rebuilt
+    # per call -- but only once, not once per candidate G.
+    planned = [
+        build_partial_offsets(so_c, block_m, max_seq_len=N, tile_lo=lo, tile_hi=hi)
+        for lo, hi in spans
+    ]
+    offs = [p[0] for p in planned]
+    totals = [p[1] for p in planned]
 
     dv = torch.empty_like(v_c)
     dk = torch.empty_like(k_c)
     dq = torch.empty_like(q_c)
 
-    # One buffer, REUSED by every pass -- that is the point of chunking. Zeroed
-    # rather than `empty`: a tile writes only the q rows it serves AND only the
-    # rows passing the `< seq_len` guard, so the tail of each slot is never
-    # written and would otherwise sum garbage.
-    dq_part = torch.zeros(max(totals), elems, dtype=torch.float32, device=device)
-    # fp32 carry across passes. At G == 1 nothing reads or writes it.
-    dq_carry = (
-        torch.zeros(1, 1, dtype=torch.float32, device=device)
-        if n_groups == 1
-        else torch.zeros(total_tokens, elems, dtype=torch.float32, device=device)
-    )
     red_map, n_blocks = build_reduce_map(so_c, device)
 
     reduce_launchers = [
