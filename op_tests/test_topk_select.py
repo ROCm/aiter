@@ -446,6 +446,39 @@ def test_row_pitch():
     return failures
 
 
+def test_pitch_routing():
+    """On gfx950, rows at a pitch past their width route as their dense twin
+    wherever plain reads them in place, and away from plain wherever it would
+    copy them first; plain's copy measured slower there than the backends that
+    read in place."""
+    import aiter.ops.topk_select as ts
+
+    failures = []
+    if get_gfx() != "gfx950":
+        return failures
+    dev = torch.cuda.current_device()
+    wave = wave_size_of(dev)
+    for rows in (8, 64, 192, 256, 4096):
+        for width in (3000, 8192, 32768, 81920, 98304, 131072, 200000):
+            for k in (1024, 2048):
+                route = [
+                    ts._choose.__wrapped__(
+                        rows, width, pitch, k, wave, False, None, False, True, dev, True
+                    )
+                    for pitch in (width, width + 64)
+                ]
+                in_place = ts._plain_reads_pitch(rows, width, k, dev)
+                if in_place and route[1] != route[0]:
+                    failures.append(
+                        f"{rows}x{width} k={k}: {route[1]}, dense {route[0]}"
+                    )
+                if not in_place and route[1] == "plain":
+                    failures.append(f"{rows}x{width} k={k}: plain copies the rows")
+    for label in failures:
+        aiter.logger.error("PITCH ROUTING FAILED: %s", label)
+    return failures
+
+
 # One shape per FlyDSL backend, with the first call that puts a stride of 1 on
 # the leading axis: a (1, n) row, or for k = 1 an (m, 1) column, strides (1, 1).
 _UNIT_STRIDE_ROUTES = (
@@ -1090,6 +1123,11 @@ def main():
         "row pitch: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
     )
     assert not bad, f"row pitch: {len(bad)} failed"
+    bad = test_pitch_routing()
+    aiter.logger.info(
+        "pitch routing: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
+    )
+    assert not bad, f"pitch routing: {len(bad)} failed"
     bad = test_unit_stride_first()
     aiter.logger.info(
         "unit stride first: %s",

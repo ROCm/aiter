@@ -2,13 +2,19 @@
 # Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import gc
+import os
 
 import pandas as pd
 import torch
 
 import aiter
 from aiter import dtypes
-from aiter.ops.topk_plain import topk_plain, topk_plain_values_optional
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.topk_plain import (
+    topk_plain,
+    topk_plain_reads_pitch,
+    topk_plain_values_optional,
+)
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -91,8 +97,9 @@ def run_topk_case(batch_size, hiddensize, topk, largest, dtype):
 def test_strided_rows():
     """Rows that are not dense, through both forms, with stride0 left at -1 and
     given explicitly: padded rows (a column slice of a wider tensor) and
-    broadcast rows (stride 0). The uniform form takes no row pitch at all, and
-    a padded row used to be read as the start of the next one."""
+    broadcast rows (stride 0). With the values asked for, the uniform form
+    reads no row pitch of its own, and a padded row used to be read as the
+    start of the next one."""
     failures = []
     for m, n, k in ((64, 8192, 2048), (8, 32768, 2048), (64, 4096, 16)):
         torch.manual_seed(0)
@@ -126,6 +133,50 @@ def test_strided_rows():
                         )
     for label in failures:
         aiter.logger.error("STRIDED ROWS FAILED: %s", label)
+    return failures
+
+
+def test_uniform_pitch():
+    """Uniform rows at a pitch past their width, indices only: read in place
+    where `topk_plain_reads_pitch` says so, copied first elsewhere, and right
+    either way -- on both sides of each one-block kernel's reach and of one row
+    per CU, at a pitch that misaligns every other row. On gfx950 the answer is
+    also held to those kernels' reach."""
+    failures = []
+    k = 2048
+    num_cu = torch.cuda.get_device_properties(0).multi_processor_count
+    overridden = "TOPK_FORCE_PATH" in os.environ or "TOPK_DISPATCH_FACTOR" in os.environ
+    for m in (8, 256, 3000):
+        for n in (2049, 16383, 16384, 22529, 81920, 81921, 131840, 131841):
+            in_place = bool(topk_plain_reads_pitch(m, n, k))
+            if get_gfx() == "gfx950" and not overridden:
+                expected = n <= 80 * 1024 or (m >= num_cu and n <= 128 * 1024 + 768)
+                if in_place != expected:
+                    failures.append(f"{m}x{n}: reads the pitch {in_place}")
+            for pad in (64, 1):
+                torch.manual_seed(m + n + pad)
+                src = torch.randn(m, n + pad, dtype=dtypes.fp32)[:, :n]
+                ref = torch.topk(src, k, dim=1).values.sort(dim=1).values
+                for nan_high in (False, True):
+                    label = f"{m}x{n} pitch {n + pad} nan_high={nan_high}"
+                    ids = torch.full((m, k), -1, dtype=dtypes.i32)
+                    topk_plain(src, ids, None, k, True, nan_high=nan_high)
+                    torch.cuda.synchronize()
+                    before = torch.cuda.memory_allocated()
+                    torch.cuda.reset_peak_memory_stats()
+                    topk_plain(src, ids, None, k, True, nan_high=nan_high)
+                    torch.cuda.synchronize()
+                    grew = torch.cuda.max_memory_allocated() - before
+                    got = src.gather(1, ids.long().clamp_min(0)).sort(dim=1).values
+                    if not torch.equal(got, ref):
+                        failures.append(f"{label}: wrong selection")
+                    # Where the rows dwarf the radix scratch, a copy shows.
+                    copied = grew >= src.numel() * src.element_size()
+                    if m * n >= 1 << 24 and copied == in_place:
+                        failures.append(f"{label}: in place {in_place}, grew {grew} B")
+                del src, ref
+    for label in failures:
+        aiter.logger.error("UNIFORM PITCH FAILED: %s", label)
     return failures
 
 
@@ -169,6 +220,8 @@ largest = True
 def main():
     bad = test_strided_rows()
     assert not bad, f"strided rows: {len(bad)} failed: {bad}"
+    bad = test_uniform_pitch()
+    assert not bad, f"uniform pitch: {len(bad)} failed: {bad}"
     bad = test_values_optional()
     assert not bad, f"values optional: {len(bad)} failed: {bad}"
     rows = []

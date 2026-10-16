@@ -2455,6 +2455,7 @@ template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES, int 
 __global__ void radix_topk_one_block_reg_kernel(T const* in,
                                                 const int64_t len,
                                                 const IdxT k,
+                                                const int pitch,
                                                 T* out,
                                                 IdxT* out_idx,
                                                 bool const select_min,
@@ -2609,7 +2610,7 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
         }
     }
 
-    in += batch_id * len;
+    in += batch_id * pitch;
     out_idx += batch_id * k;
     if constexpr(WRITE_TOPK_VALUES)
     {
@@ -3872,6 +3873,7 @@ template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES,
 __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
                                                      const int64_t len,
                                                      const IdxT k,
+                                                     const int pitch,
                                                      T* out,
                                                      IdxT* out_idx,
                                                      bool const select_min)
@@ -3963,7 +3965,7 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     }
     if(threadIdx.x == 0) staged_count = 0;
 
-    in += batch_id * len;
+    in += batch_id * pitch;
     out_idx += batch_id * k;
     if constexpr(WRITE_TOPK_VALUES)
     {
@@ -5122,7 +5124,8 @@ template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES, int 
           int TailBits, int MinEPT, int MaxEPT, bool WaveSelect, bool Placeable = false,
           bool WideDigit = false, bool NanHigh = false>
 inline bool topk_oneblock_reg_launch(int ept, int batch_size, hipStream_t stream, T const* in,
-                                     int64_t len, IdxT k, T* out, IdxT* out_idx, bool select_min)
+                                     int64_t len, int64_t pitch, IdxT k, T* out, IdxT* out_idx,
+                                     bool select_min)
 {
     if constexpr(MinEPT > MaxEPT)
     {
@@ -5134,7 +5137,7 @@ inline bool topk_oneblock_reg_launch(int ept, int batch_size, hipStream_t stream
             return topk_oneblock_reg_launch<T, IdxT, BlockSize, WRITE_TOPK_VALUES, MainBits,
                                             TailBits, MinEPT + 1, MaxEPT, WaveSelect, Placeable,
                                             WideDigit, NanHigh>(
-                ept, batch_size, stream, in, len, k, out, out_idx, select_min);
+                ept, batch_size, stream, in, len, pitch, k, out, out_idx, select_min);
         constexpr bool Wave = WaveSelect && topk_oneblock_reg_wave_select_fits(MinEPT);
         constexpr bool Wide = WideDigit && Wave && topk_oneblock_reg_wide_digit_fits(MinEPT);
         if constexpr(Placeable)
@@ -5147,14 +5150,15 @@ inline bool topk_oneblock_reg_launch(int ept, int batch_size, hipStream_t stream
                 radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES, MinEPT,
                                                 MainBits, TailBits, Wave, Wave, Wave, Wide, NanHigh>
                     <<<groups * static_cast<unsigned>(place.period), BlockSize, 0, stream>>>(
-                        in, len, k, out, out_idx, select_min, place);
+                        in, len, k, static_cast<int>(pitch), out, out_idx, select_min, place);
                 HIP_CALL_LAUNCH(hipGetLastError());
                 return true;
             }
         }
         radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES, MinEPT, MainBits,
                                         TailBits, Wave, Wave, Wave, Wide, NanHigh>
-            <<<batch_size, BlockSize, 0, stream>>>(in, len, k, out, out_idx, select_min);
+            <<<batch_size, BlockSize, 0, stream>>>(
+                in, len, k, static_cast<int>(pitch), out, out_idx, select_min);
         HIP_CALL_LAUNCH(hipGetLastError());
         return true;
     }
@@ -5194,8 +5198,9 @@ constexpr int64_t kTopkPlainGfx950AnyRowsMaxLen = 80 * 1024;
 constexpr int64_t kTopkPlainGfx950LdsTailMaxLen = 128 * 1024 + 768;
 
 template <typename T, typename IdxT, bool WRITE_TOPK_VALUES, bool NanHigh = false>
-inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len, IdxT k, T* out,
-                                       IdxT* out_idx, bool select_min, hipStream_t stream)
+inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len, int64_t pitch,
+                                       IdxT k, T* out, IdxT* out_idx, bool select_min,
+                                       hipStream_t stream)
 {
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx950__)
     // A device pass for another target. The kernels below are wave64 code that
@@ -5221,22 +5226,23 @@ inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len,
             int const ept = static_cast<int>((len + 511) / 512);
             return topk_oneblock_reg_launch<T, IdxT, 512, WRITE_TOPK_VALUES, 11, 10, kEpt512Min,
                                             kEpt512Max, true, false, false, NanHigh>(
-                ept, batch_size, stream, in, len, k, out, out_idx, select_min);
+                ept, batch_size, stream, in, len, pitch, k, out, out_idx, select_min);
         }
         int const ept = static_cast<int>((len + 1023) / 1024);
         if(2 * batch_size <= num_cu && len > 4 * 1024 && len <= 4 * 1024 + 768)
             return topk_oneblock_reg_launch<T, IdxT, 1024, WRITE_TOPK_VALUES, 11, 10, 5, 5, true,
                                             false, false, NanHigh>(
-                ept, batch_size, stream, in, len, k, out, out_idx, select_min);
+                ept, batch_size, stream, in, len, pitch, k, out, out_idx, select_min);
         return topk_oneblock_reg_launch<T, IdxT, 1024, WRITE_TOPK_VALUES, 12, 8, kEpt1024Min,
                                         kEpt1024Max, true, true, true, NanHigh>(
-            ept, batch_size, stream, in, len, k, out, out_idx, select_min);
+            ept, batch_size, stream, in, len, pitch, k, out, out_idx, select_min);
     }
     if(len <= 22 * 1024)
     {
         radix_topk_one_block_lds_tail_kernel<T, IdxT, 1024, WRITE_TOPK_VALUES, true, 270, true, 2,
                                              4096, NanHigh>
-            <<<batch_size, 1024, 0, stream>>>(in, len, k, out, out_idx, select_min);
+            <<<batch_size, 1024, 0, stream>>>(
+                in, len, k, static_cast<int>(pitch), out, out_idx, select_min);
         HIP_CALL_LAUNCH(hipGetLastError());
         return true;
     }
@@ -5244,7 +5250,8 @@ inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len,
     {
         radix_topk_one_block_lds_tail_kernel<T, IdxT, 1024, WRITE_TOPK_VALUES, false, 270, true, 2,
                                              4096, NanHigh>
-            <<<batch_size, 1024, 0, stream>>>(in, len, k, out, out_idx, select_min);
+            <<<batch_size, 1024, 0, stream>>>(
+                in, len, k, static_cast<int>(pitch), out, out_idx, select_min);
         HIP_CALL_LAUNCH(hipGetLastError());
         return true;
     }
@@ -5252,7 +5259,8 @@ inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len,
     {
         radix_topk_one_block_lds_tail_kernel<T, IdxT, 1024, WRITE_TOPK_VALUES, false, 270, false,
                                              4, 4608, NanHigh>
-            <<<batch_size, 1024, 0, stream>>>(in, len, k, out, out_idx, select_min);
+            <<<batch_size, 1024, 0, stream>>>(
+                in, len, k, static_cast<int>(pitch), out, out_idx, select_min);
         HIP_CALL_LAUNCH(hipGetLastError());
         return true;
     }
@@ -5293,14 +5301,35 @@ constexpr int64_t kTopkPlainRegWindowMaxLen = 8194;
 #define TOPK_PER_ROW_PLAIN_KERNELS 0
 #endif
 
-// Thin wrapper dispatching to the correct BPP at runtime.
+// Whether dispatch_topk_oneblock serves an indices-only, largest-first call over
+// `batch_size` uniform rows of `len` from a kernel that reads them `pitch`
+// apart: on gfx950 the register copies and the LDS tail of
+// dispatch_topk_plain_gfx950, which serve every row count over the any-rows
+// range and at least one row per CU past it, and elsewhere the register window.
+// Every other kernel reads rows `len` apart.
+inline bool topk_oneblock_plain_reads_pitch(int batch_size, int64_t len, int k)
+{
+    if(!TOPK_PER_ROW_PLAIN_KERNELS || !topk_oneblock_plain_specialized(false, false, k))
+        return false;
+    if(topk_oneblock_is_gfx950())
+        return (len >= kTopkPlainGfx950AnyRowsMinLen && len <= kTopkPlainGfx950AnyRowsMaxLen) ||
+               (batch_size >= topk_oneblock_num_cu() && len > kTopkPlainGfx950AnyRowsMaxLen &&
+                len <= kTopkPlainGfx950LdsTailMaxLen);
+    return len >= kTopkPlainRegWindowMinLen && len <= kTopkPlainRegWindowMaxLen &&
+           get_warp_size_func() == 64;
+}
+
+// Thin wrapper dispatching to the correct BPP at runtime. A `pitch` other than
+// `len` is honoured only where topk_oneblock_plain_reads_pitch holds.
 template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES,
           Phase phase = Phase::Prefill, bool STABLE = false, bool NanHigh = false>
 inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, IdxT const* in_idx,
                                     int batch_size, int64_t len, IdxT* rowStarts, IdxT* rowEnds,
                                     IdxT k, T* out, IdxT* out_idx, bool select_min,
-                                    hipStream_t stream, bool sorted = false, int next_n = 0)
+                                    hipStream_t stream, bool sorted = false, int next_n = 0,
+                                    int64_t pitch = -1)
 {
+    int64_t const row_pitch = pitch < 0 ? len : pitch;
     // Keep the normal workspace query unchanged (buf == nullptr), and isolate
     // the extra LDS allocation in a separate kernel specialization.  This
     // avoids imposing its occupancy cost on any non-target shape.
@@ -5314,7 +5343,7 @@ inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, Idx
         if(specialized && topk_oneblock_is_gfx950())
         {
             if(dispatch_topk_plain_gfx950<T, IdxT, WRITE_TOPK_VALUES, NanHigh>(
-                   in, batch_size, len, k, out, out_idx, select_min, stream))
+                   in, batch_size, len, row_pitch, k, out, out_idx, select_min, stream))
                 return;
         }
         else if(specialized)
@@ -5333,12 +5362,16 @@ inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, Idx
                 int const ept = static_cast<int>((len + BlockSize - 1) / BlockSize);
                 if(topk_oneblock_reg_launch<T, IdxT, BlockSize, WRITE_TOPK_VALUES, 12, 8, 4, 9, false,
                                             false, false, NanHigh>(
-                       ept, batch_size, stream, in, len, k, out, out_idx, select_min))
+                       ept, batch_size, stream, in, len, row_pitch, k, out, out_idx,
+                       select_min))
                     return;
             }
 #endif
         }
     }
+    AITER_CHECK(row_pitch == len,
+                "dispatch_topk_oneblock: rows ", len, " wide at a pitch of ", row_pitch,
+                " reached a kernel that reads them ", len, " apart");
 
     if (topk_oneblock_use_large_bpp()) {
         standalone_stable_radix_topk_one_block_<T, IdxT, 12, BlockSize, WRITE_TOPK_VALUES, phase, STABLE,
@@ -5563,7 +5596,17 @@ int64_t topk_plain_width(const std::string& name)
     return -1;
 }
 
+// Whether radix_topk_dispatch reads uniform rows at a pitch other than their
+// width for an indices-only, largest-first call: one-block, from a kernel that
+// takes the pitch (ob::topk_oneblock_plain_reads_pitch).
+bool radix_topk_reads_pitch(int batch_size, int64_t len, int k)
+{
+    return !aiter::plain_should_use_mulblocks(batch_size, len, k, false, false, false) &&
+           aiter::ob::topk_oneblock_plain_reads_pitch(batch_size, len, k);
+}
+
 // Raw-pointer entry called by topk_plain_kernels.cu via topk_per_row_kernel_launcher.
+// Uniform rows are `len` wide and `pitch` apart, a negative `pitch` meaning `len`.
 void radix_topk_dispatch(void* buf,
                          size_t& buf_size,
                          float const* in,
@@ -5576,10 +5619,16 @@ void radix_topk_dispatch(void* buf,
                          int* out_idx,
                          bool greater,
                          hipStream_t stream,
-                         bool nan_high)
+                         bool nan_high,
+                         int64_t pitch)
 {
     const bool select_min = !greater;
     const bool ranged     = rowStarts != nullptr || rowEnds != nullptr;
+    AITER_CHECK(pitch < 0 || pitch == len ||
+                    (!ranged && out == nullptr && greater && pitch <= INT32_MAX &&
+                     radix_topk_reads_pitch(batch_size, len, k)),
+                "radix_topk_dispatch: no kernel reads ", batch_size, " rows of ", len,
+                " at a pitch of ", pitch, " for k=", k);
 
     if (!nan_high && aiter::plain_should_use_mulblocks(batch_size, len, k, ranged, out != nullptr, select_min)) {
         if (out) {
@@ -5599,13 +5648,13 @@ void radix_topk_dispatch(void* buf,
                 aiter::ob::Phase::Prefill>(
                 buf, buf_size, in, static_cast<int*>(nullptr),
                 batch_size, len, rowStarts, rowEnds,
-                k, out, out_idx, select_min, stream, true);
+                k, out, out_idx, select_min, stream, true, 0, pitch);
         } else {
             aiter::ob::dispatch_topk_oneblock<float, int, 1024, false,
                 aiter::ob::Phase::Prefill>(
                 buf, buf_size, in, static_cast<int*>(nullptr),
                 batch_size, len, rowStarts, rowEnds,
-                k, nullptr, out_idx, select_min, stream, true);
+                k, nullptr, out_idx, select_min, stream, true, 0, pitch);
         }
     } else {
         // NaN of either sign above +inf, for topk_select: indices only, largest
@@ -5622,7 +5671,7 @@ void radix_topk_dispatch(void* buf,
             aiter::ob::dispatch_topk_oneblock<float, int, 1024, false, aiter::ob::Phase::Prefill,
                                               false, true>(
                 buf, buf_size, in, static_cast<int*>(nullptr), batch_size, len, rowStarts,
-                rowEnds, k, nullptr, out_idx, select_min, stream, true);
+                rowEnds, k, nullptr, out_idx, select_min, stream, true, 0, pitch);
 #else
         AITER_CHECK(false, "radix_topk_dispatch: nan_high is built into module_topk_plain only");
 #endif

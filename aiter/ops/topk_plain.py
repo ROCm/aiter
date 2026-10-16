@@ -47,6 +47,10 @@ def topk_plain_width(name: str) -> int: ...
 def topk_plain_uses_radix(width: int, k: int) -> bool: ...
 
 
+@compile_ops("module_topk_plain")
+def topk_plain_reads_pitch(numRows: int, width: int, k: int) -> bool: ...
+
+
 @functools.lru_cache(maxsize=1024)
 def _workspace_plan(device, rows: int, stride0: int, width: int, topk: int):
     # A size query costs a call several microseconds. The size depends on
@@ -69,6 +73,13 @@ def _uses_radix(width: int, topk: int) -> bool:
     really this one.
     """
     return bool(topk_plain_uses_radix(width, topk))
+
+
+@functools.lru_cache(maxsize=1024)
+def _reads_pitch(device, rows: int, width: int, topk: int) -> bool:
+    """`topk_plain_reads_pitch`, asked once per shape and GPU: the answer reads
+    the CU count and architecture of the current device."""
+    return bool(topk_plain_reads_pitch(rows, width, topk))
 
 
 def topk_plain_batches_ragged_rows(width: int, topk: int) -> bool:
@@ -136,7 +147,10 @@ def topk_plain(
     None did before the argument became optional.
 
     `x` may have any layout. With `stride0 < 0` the row pitch is taken from `x`
-    itself, not assumed to be the width.
+    itself, not assumed to be the width. Uniform rows, without a row range, are
+    read in place at their pitch only by the indices-only, largest-first fp32
+    kernels `topk_plain_reads_pitch` names, and copied densely first elsewhere;
+    their pitch is always `x`'s own.
 
     NaN: on the radix path (fp32, `largest=True`, where
     `topk_plain_values_optional` holds) +nan ranks above +inf, as in
@@ -162,21 +176,35 @@ def topk_plain(
         raise ValueError(
             "topk_plain: nan_high selects indices only; pass topk_out=None"
         )
-    if not x.is_contiguous():
-        # Only the ranged form reads row r at `r * stride0`, and it also sizes
-        # its launch and scratch by `stride0`, so a strided row is read in place
-        # only there, at unit inner stride and a pitch at least the width. The
-        # uniform form reads rows `width` apart and takes no pitch at all; it,
-        # and every other layout, gets the rows densely.
+    ranged = False
+    if stride0 >= 0 or not x.is_contiguous():
         ranged = (
             rowStarts is not None
             and rowEnds is not None
             and rowStarts.numel() > 0
             and rowEnds.numel() > 0
         )
-        if ranged and x.stride(-1) == 1 and x.stride(0) >= x.shape[-1]:
+        if not ranged:
+            stride0 = -1
+    if not x.is_contiguous():
+        # The ranged form reads row r at `r * stride0`, and it also sizes its
+        # launch and scratch by `stride0`. The uniform form sizes both by the
+        # width, and only the kernels `topk_plain_reads_pitch` names read its
+        # rows at a pitch of their own. Either needs unit inner stride and a
+        # pitch at least the width; every other call gets the rows densely.
+        pitched = x.stride(-1) == 1 and x.stride(0) >= x.shape[-1]
+        if pitched and ranged:
             if stride0 < 0:
                 stride0 = x.stride(0)
+        elif (
+            pitched
+            and x.dim() == 2
+            and x.dtype == torch.float32
+            and topk_out is None
+            and largest
+            and _reads_pitch(x.device, x.shape[0], x.shape[-1], topk)
+        ):
+            stride0 = x.stride(0)
         else:
             x = x.contiguous()
             stride0 = -1
@@ -184,7 +212,7 @@ def topk_plain(
     if x.dtype == torch.float32:
         device, width = x.device, x.shape[-1]
         # Mirror the C++ default: stride0 < 0 means a contiguous last dim.
-        s0 = stride0 if stride0 >= 0 else width
+        s0 = stride0 if ranged and stride0 >= 0 else width
         size, radix = _workspace_plan(device, x.shape[0], s0, width, topk)
         if topk_out is None and not (largest and radix):
             _refuse_no_values(x, largest, topk)

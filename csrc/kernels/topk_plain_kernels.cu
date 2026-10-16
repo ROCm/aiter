@@ -79,7 +79,12 @@ extern void radix_topk_dispatch(void* buf,
                                 int* out_idx,
                                 bool greater,
                                 hipStream_t stream,
-                                bool nan_high);
+                                bool nan_high,
+                                int64_t pitch);
+
+// Whether radix_topk_dispatch reads `batch_size` uniform rows of `len` at a pitch
+// of their own (defined in topk_per_row_kernels.cu).
+extern bool radix_topk_reads_pitch(int batch_size, int64_t len, int k);
 
 // Forward declaration of workspace size calculation function (at global scope)
 template <typename T, aiter::Phase phase = aiter::Phase::Prefill>
@@ -104,7 +109,8 @@ void topk_per_row_kernel_launcher(const float* in,
                                   int k,
                                   void* workspace,
                                   hipStream_t stream,
-                                  bool nan_high = false);
+                                  bool nan_high  = false,
+                                  int64_t pitch = -1);
 
 // Helper function to determine if topk_per_row kernel should be used
 // Based on: n + K log²K ≥ 3 × Factor(n) × n
@@ -2348,7 +2354,9 @@ void topk_kernel_launcher(int block_per_batch,
     }
 }
 
-// Uniform length version of AdaptiveTopK
+// Uniform length version of AdaptiveTopK: rows `len` wide and `pitch` apart, a
+// negative `pitch` meaning `len`. Only the radix path reads a pitch of its own,
+// and only where radix_topk_reads_pitch holds.
 template <bool greater, typename T, typename IdxT>
 void AdaptiveTopK(int batch_size,
                   IdxT len,
@@ -2358,7 +2366,8 @@ void AdaptiveTopK(int batch_size,
                   IdxT* __restrict__ out_idx,
                   void* workspace,
                   hipStream_t stream = 0,
-                  bool nan_high      = false)
+                  bool nan_high      = false,
+                  int64_t pitch      = -1)
 {
     assert(k <= buffer_load_helpers::MAX_CAPACITY);
 
@@ -2381,12 +2390,15 @@ void AdaptiveTopK(int batch_size,
                                                k,
                                                workspace,
                                                stream,
-                                               nan_high);
+                                               nan_high,
+                                               pitch);
 
             return;
         }
     }
     (void)workspace; // only the radix path above consumes the caller workspace
+    AITER_CHECK(pitch < 0 || pitch == len,
+                "topk_plain: the block-sort fallback reads rows ", len, " apart, not ", pitch);
 
     const int capacity  = utils::calc_capacity(k);
     int block_per_batch = 0;
@@ -2500,7 +2512,8 @@ void topk_per_row_kernel_launcher(const float* in,
                                   int k,
                                   void* workspace,
                                   hipStream_t stream,
-                                  bool nan_high)
+                                  bool nan_high,
+                                  int64_t pitch)
 {
     AITER_CHECK(workspace != nullptr,
                 "topk_plain: the radix top-k path requires a caller-provided workspace");
@@ -2521,7 +2534,8 @@ void topk_per_row_kernel_launcher(const float* in,
         out_idx,
         is_largest,
         stream,
-        nan_high);
+        nan_high,
+        pitch);
 }
 
 // Map the hip runtime element type bound by the dispatch macro to the ck_tile
@@ -2561,6 +2575,8 @@ void topk_plain(aiter_tensor_t& values,                  // [batch, len]
     // Set default stride values if not specified
     if(stride0 < 0)
         stride0 = max_len;
+    AITER_CHECK(use_variable_length || stride0 >= max_len,
+                "topk_plain: uniform rows of ", max_len, " at a pitch of ", stride0);
 
     // Dispatch based on value tensor dtype
     VLLM_DISPATCH_FLOATING_TYPES_rmTorch(values.dtype(), "topk_plain", [&] {
@@ -2645,7 +2661,8 @@ void topk_plain(aiter_tensor_t& values,                  // [batch, len]
                                                             topk_ids_ptr,
                                                             ws_ptr,
                                                             stream,
-                                                            nan_high);
+                                                            nan_high,
+                                                            stride0);
             }
             else
             {
@@ -2656,7 +2673,9 @@ void topk_plain(aiter_tensor_t& values,                  // [batch, len]
                                                              topk_out_kernel_ptr,
                                                              topk_ids_ptr,
                                                              ws_ptr,
-                                                             stream);
+                                                             stream,
+                                                             false,
+                                                             stride0);
             }
         }
     });
@@ -2673,3 +2692,9 @@ int64_t topk_plain_workspace_size(int64_t numRows, int64_t stride0, int64_t k)
 }
 
 bool topk_plain_uses_radix(int64_t width, int64_t k) { return should_use_topk_radix(width, k); }
+
+bool topk_plain_reads_pitch(int64_t numRows, int64_t width, int64_t k)
+{
+    return should_use_topk_radix(width, k) &&
+           radix_topk_reads_pitch(static_cast<int>(numRows), width, static_cast<int>(k));
+}

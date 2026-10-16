@@ -2573,6 +2573,11 @@ namespace py = pybind11;
     m.def("topk_plain_uses_radix",                \
           &topk_plain_uses_radix,                 \
           py::arg("width"),                       \
+          py::arg("k"));                          \
+    m.def("topk_plain_reads_pitch",               \
+          &topk_plain_reads_pitch,                \
+          py::arg("numRows"),                     \
+          py::arg("width"),                       \
           py::arg("k"));
 
 #define RMSNORM_QUANT_PYBIND                 \

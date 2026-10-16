@@ -11,6 +11,8 @@
 // says so: the fp32 largest-first radix path has a build that never writes the
 // selected values, and a caller that only wants the indices should not pay for
 // a buffer it discards. Passing nullopt outside that is an error, not silence.
+// `stride0` is the row pitch, ranged or not; uniform rows at a pitch past their
+// width are served where `topk_plain_reads_pitch` holds.
 void topk_plain(aiter_tensor_t& values,
                 aiter_tensor_t& topk_ids,
                 std::optional<aiter_tensor_t> topk_out,
@@ -43,3 +45,8 @@ int64_t topk_plain_width(const std::string& name);
 // Whether rows of `width` at `k` take the radix path rather than the block-sort
 // fallback (should_use_topk_radix), the one path with an indices-only build.
 bool topk_plain_uses_radix(int64_t width, int64_t k);
+
+// Whether an indices-only, largest-first call over `numRows` uniform rows of
+// `width` reads them in place at a `stride0` past their width. Elsewhere uniform
+// rows are read `width` apart, and a `stride0` other than that is refused.
+bool topk_plain_reads_pitch(int64_t numRows, int64_t width, int64_t k);

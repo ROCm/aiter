@@ -71,6 +71,7 @@ from aiter.ops.topk import (
 )
 from aiter.ops.topk_plain import (
     topk_plain,
+    topk_plain_reads_pitch,
     topk_plain_use_mulblocks,
     topk_plain_values_optional,
     topk_plain_width,
@@ -722,6 +723,14 @@ def _plain_multiblock(
     return bool(topk_plain_use_mulblocks(rows, stride0, k, ragged))
 
 
+@lru_cache(maxsize=1024)
+def _plain_reads_pitch(rows: int, width: int, k: int, device: int) -> bool:
+    """Whether plain reads uniform rows in place at a pitch past their width
+    (`topk_plain_reads_pitch`); where it does not, `topk_plain` copies them
+    first. `device` keys the memo per GPU, as in `_plain_multiblock`."""
+    return bool(topk_plain_reads_pitch(rows, width, k))
+
+
 @lru_cache(maxsize=8)
 def _plain_width(name: str) -> int:
     """A row length bounding plain's one-block kernels (`topk_plain_width`),
@@ -732,17 +741,25 @@ def _plain_width(name: str) -> int:
     return width
 
 
-def _plain_k2048_lds_tail_takes(rows: int, width: int, k: int, device: int) -> bool:
+def _plain_k2048_lds_tail_takes(
+    rows: int, width: int, k: int, device: int, stride0: int | None = None
+) -> bool:
     """Whether uniform rows past sampled's width door go to plain's LDS tail.
 
     Only asked where `sampled` could serve, which is what it was measured
-    against; see `_PLAIN_K2048_LDS_TAIL_MIN_ROWS`.
+    against; see `_PLAIN_K2048_LDS_TAIL_MIN_ROWS`. Rows at a pitch past their
+    width only where plain reads them in place; see `_plain_takes`.
     """
     return (
         k == 2048
         and _device_arch(device) == "gfx950"
         and rows >= _PLAIN_K2048_LDS_TAIL_MIN_ROWS
         and _SAMPLED_MIN_WIDTH <= width <= _plain_width("lds_tail_max")
+        and (
+            stride0 is None
+            or stride0 == width
+            or _plain_reads_pitch(rows, width, k, device)
+        )
     )
 
 
@@ -803,9 +820,9 @@ def _sampled_takes(
     to plain's band when `yield_to_plain` -- uniform rows, plain available. The
     doors added for that k point the other way: rows in plain's band that its
     own dispatch hands to its multi-block kernel (`_plain_multiblock`, asked at
-    the pitch plain reads at: `stride0` for ragged rows, the width otherwise,
-    since plain copies other strided rows dense), and the few-row band's rows
-    past its width, which decode served 1.47x-2.56x slower. See
+    the length plain launches with: `stride0` for ragged rows, the width for
+    uniform ones, whose launch is sized by it at any pitch), and the few-row
+    band's rows past its width, which decode served 1.47x-2.56x slower. See
     `_PLAIN_K2048_LDS_TAIL_MIN_ROWS`.
 
     `stride0` is the row pitch `_dispatch` launches `sampled` at, so the
@@ -823,7 +840,7 @@ def _sampled_takes(
     if device is None:
         device = torch.cuda.current_device()
     if k == 2048 and width < _SAMPLED_MIN_WIDTH and _device_arch(device) == "gfx950":
-        plain_band = _plain_takes(rows, width, k, device, ragged)
+        plain_band = _plain_takes(rows, width, k, device, ragged, stride0)
         plain_pitch = pitch if ragged else width
         if (plain_band and _plain_multiblock(rows, plain_pitch, k, ragged, device)) or (
             rows <= _PLAIN_K2048_FEW_ROWS and width > _plain_width("any_rows_max")
@@ -852,7 +869,12 @@ def _device_cu_num(device: int) -> int:
 
 
 def _plain_takes(
-    rows: int, width: int, k: int, device: int | None = None, ragged: bool = False
+    rows: int,
+    width: int,
+    k: int,
+    device: int | None = None,
+    ragged: bool = False,
+    stride0: int | None = None,
 ) -> bool:
     """Enough rows for the row-scaling selector, on a width it is tuned for.
 
@@ -861,7 +883,22 @@ def _plain_takes(
     band was not measured on. Ragged, that kernel was the fastest backend on 2
     of 288 measured cells and up to 3.09x off it on the others; see
     `_RAGGED_K2048_STREAM_MAX_WIDTH`.
+
+    Uniform rows at a pitch past their width (`stride0`) are read in place
+    only where `_plain_reads_pitch` holds -- gfx950's k=2048 one-block kernels
+    and the register window -- and copied first elsewhere. On gfx950 the
+    backends that read them in place measured faster than that copy and plain
+    on every such cell plain was routed (165 of 165, 0.78x, at most 0.99x), so
+    plain declines them there. Elsewhere that was not measured, and plain keeps
+    them.
     """
+    if not ragged and stride0 is not None and stride0 != width:
+        if device is None:
+            device = torch.cuda.current_device()
+        if _device_arch(device) == "gfx950" and not _plain_reads_pitch(
+            rows, width, k, device
+        ):
+            return False
     if k == 2048 and device is None:
         device = torch.cuda.current_device()
     if k == 2048 and not ragged and _device_arch(device) == "gfx950":
@@ -951,8 +988,9 @@ def topk_select_backend(
 
     `stride0` is the input's row pitch, the width for dense rows or a single
     row, and the default. `sampled` reads every row in place at it; plain's
-    ranged form reads a row-strided view in place at it too, and plain's
-    launcher sizes its multi-block choice by the pitch it reads at.
+    ranged form reads a row-strided view in place at it too, as do its uniform
+    one-block kernels where `_plain_reads_pitch` holds, and plain's launcher
+    sizes its multi-block choice by the length it launches with.
 
     The shape of the answer: `plain` takes the many-row middle, where it is the
     only one that scales with rows rather than against them; the small-k selector
@@ -995,7 +1033,7 @@ def topk_select_backend(
         "sampled" in available
         and "plain" in available
         and not ragged
-        and _plain_k2048_lds_tail_takes(rows, width, k, device)
+        and _plain_k2048_lds_tail_takes(rows, width, k, device, stride0)
     ):
         return "plain"
     if ragged and k == 2048 and _device_arch(device) == "gfx950":
@@ -1016,7 +1054,7 @@ def topk_select_backend(
         stride0=stride0,
     ):
         return "sampled"
-    if "plain" in available and _plain_takes(rows, width, k, device, ragged):
+    if "plain" in available and _plain_takes(rows, width, k, device, ragged, stride0):
         return "plain"
     if "small_k" in available and k <= _SMALL_K_MAX_K:
         return "small_k"
