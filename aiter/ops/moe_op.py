@@ -684,6 +684,7 @@ def fmoe_q256_producer(
     gate_scale: Tensor,
     down_scale: Tensor,
     topk: int,
+    job_map: Tensor | None = None,
 ) -> None: ...
 
 
@@ -704,7 +705,14 @@ def fmoe_q256(
     topk: int,
 ) -> None:
     """Run the universal assembly producer and its supplied FP32 reducer."""
-    from aiter.ops.triton._triton_kernels.moe.reduce import _reduce_q256_routes
+
+    tokens, model = out.shape
+    job_map = None
+    if (tokens, model, topk, gate.shape[0], partials.ndim) == (8192, 8192, 11, 513, 3):
+        from aiter.ops.triton._triton_kernels.moe.q256_schedule import make_job_map
+
+        job_map = torch.empty(1024, dtype=torch.int32, device=out.device)
+        make_job_map[(8,)](sorted_ids, sorted_experts, counts, job_map, STYLE=0)
 
     fmoe_q256_producer(
         out,
@@ -721,8 +729,8 @@ def fmoe_q256(
         gate_scale,
         down_scale,
         topk,
+        job_map,
     )
-    tokens, model = out.shape
     if partials.ndim == 3:
         from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
 
@@ -736,6 +744,8 @@ def fmoe_q256(
             streaming_loads=(model, topk) == (8192, 11),
         )
         return
+    from aiter.ops.triton._triton_kernels.moe.reduce import _reduce_q256_routes
+
     _reduce_q256_routes[(tokens, (model + 8191) // 8192)](
         partials,
         reverse_sorted,
