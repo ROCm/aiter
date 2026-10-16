@@ -9,7 +9,7 @@ import os
 import torch
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from ..utility import dtypes
 from ..utility.graph_alloc import persistent_alloc
 
@@ -30,6 +30,76 @@ def topk_gating_fwd(
 
 
 _VALID_SCORE_FUNCS = {"sqrtsoftplus", "sigmoid", "softmax"}
+_GFX1250_SIGMOID_EXPERTS = {512, 768, 896, 900, 1024}
+_GFX1250_SIGMOID_TOPKS = {4, 8, 16}
+
+
+def _can_use_gfx1250_exact_sigmoid_topk(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> bool:
+    """Whether tensors satisfy a measured gfx1250 sigmoid top-k contract."""
+    if not gating_output.is_cuda or gating_output.ndim != 2:
+        return False
+    rows, experts = gating_output.shape
+    if topk_ids.ndim != 2 or topk_ids.shape[0] != rows:
+        return False
+    topk = topk_ids.shape[1]
+    if (
+        rows == 0
+        or experts not in _GFX1250_SIGMOID_EXPERTS
+        or topk not in _GFX1250_SIGMOID_TOPKS
+    ):
+        return False
+    input_ok = (
+        gating_output.dtype == torch.bfloat16
+        and gating_output.stride(1) == 1
+        and gating_output.stride(0) >= experts
+    )
+    bias_ok = (
+        correction_bias.shape == (experts,)
+        and correction_bias.dtype == torch.bfloat16
+        and correction_bias.stride(0) == 1
+    )
+    outputs_ok = (
+        topk_weights.shape == topk_ids.shape == (rows, topk)
+        and (topk_weights.dtype, topk_ids.dtype) == (torch.float32, torch.int32)
+        and topk_weights.stride(1) == topk_ids.stride(1) == 1
+        and topk_weights.stride(0) >= topk
+        and topk_ids.stride(0) >= topk
+    )
+    same_device = (
+        correction_bias.device
+        == topk_weights.device
+        == topk_ids.device
+        == gating_output.device
+    )
+    if not input_ok or not bias_ok or not outputs_ok or not same_device:
+        return False
+    return get_gfx_runtime() == "gfx1250"
+
+
+def _gfx1250_exact_sigmoid_topk(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    need_renorm: bool,
+    routed_scaling_factor: float,
+) -> None:
+    from .triton.moe.moe_routing.topk_gating import exact_sigmoid_biased_topk
+
+    exact_sigmoid_biased_topk(
+        gating_output,
+        correction_bias,
+        topk_weights,
+        topk_ids,
+        need_renorm,
+        routed_scaling_factor,
+    )
+
 
 _FLYDSL_USE_HERD = os.environ.get("AITER_FLYDSL_USE_HERD", "0") == "1"
 _FLYDSL_HERD_MIN_M = int(
@@ -280,6 +350,24 @@ def biased_grouped_topk(
             "sigmoid",
         )
         return
+    if (
+        num_expert_group == 1
+        and topk_group == 1
+        and _can_use_gfx1250_exact_sigmoid_topk(
+            gating_output,
+            correction_bias,
+            topk_weights,
+            topk_ids,
+        )
+    ):
+        return _gfx1250_exact_sigmoid_topk(
+            gating_output,
+            correction_bias,
+            topk_weights,
+            topk_ids,
+            need_renorm,
+            routed_scaling_factor,
+        )
     cu_num = get_cu_num()
     if token_num <= cu_num * 212 or num_experts // num_expert_group > 32:
         return biased_grouped_topk_hip(

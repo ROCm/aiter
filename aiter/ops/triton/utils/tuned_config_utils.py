@@ -82,6 +82,7 @@ def get_tuned_kernel_config(
     kernel_name: str,
     fallback: triton.Config,
     backend: str = "triton",
+    warn_on_miss: bool = True,
 ) -> triton.Config:
     """The tile pinned for this device, or ``fallback`` where none is published.
 
@@ -96,6 +97,8 @@ def get_tuned_kernel_config(
         kernel_name: Key of the kernel's entry within the config file.
         fallback: Config to register when this device has no published entry.
         backend: ``"triton"`` or ``"gluon"``.
+        warn_on_miss: Log a warning when no entry is published. Pass ``False``
+            where a miss is expected, e.g. a lookup keyed by shape.
     """
     try:
         config_path, entry = _get_tuned_kernel_entry(
@@ -113,6 +116,8 @@ def get_tuned_kernel_config(
         )
         return fallback
     if not entry:
+        if not warn_on_miss:
+            return fallback
         logger.warning(
             "No tuned Triton config for kernel '%s' in '%s'; using fallback %s",
             kernel_name,
