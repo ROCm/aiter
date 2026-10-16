@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import re
 
-from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+from aiter.jit.utils.chip_info import get_gfx_runtime, get_lds_capacity_bytes
 
 # The parser is imported by AOT enumeration and the tuner; torch and the
 # compiled-kernel modules stay lazy inside the functions that need them.
@@ -28,6 +29,7 @@ def flydsl_decode_name(tile_n, k_waves, num_buffers, split_k):
     )
 
 
+@functools.cache
 def parse_flydsl_decode_name(name):
     """Parse flydsl_decode_t{TM}x{tile_n}x{TK}_kw{k_waves}_nb{num_buffers}_sk{split_k}.
 
@@ -127,9 +129,8 @@ def flydsl_decode_gemm_mxfp4(
     padded_k = -(-K // DECODE_K_TILE) * 256
     if A_scale.numel() < padded_k or B_scale.numel() < N * padded_k // 32:
         raise ValueError("requires padded shuffled A scales and shuffled B scales")
-    arch = torch.cuda.get_device_properties(A.device).gcnArchName.split(":")[0]
-    if arch != "gfx950":
-        raise ValueError(f"decode MXFP4 supports gfx950, got {arch}")
+    if get_gfx_runtime() != "gfx950":
+        raise ValueError(f"decode MXFP4 supports gfx950, got {get_gfx_runtime()}")
     target = out
     if split_k > 1:
         if workspace is None:

@@ -9,9 +9,6 @@ from torch import Tensor
 
 from aiter import logger
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.flydsl.decode_gemm_mxfp4 import (
-    parse_flydsl_decode_name as _parse_flydsl_decode_name,
-)
 
 from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
 from ..jit.utils.asm_guard import require_gfx1250_asm
@@ -232,9 +229,23 @@ def gemm_a4w4(
         splitK = ck_config.get("splitK", None)
         kernelName = ck_config["kernelName"]
     if kernelName.startswith("flydsl_"):
-        fly = _parse_flydsl_decode_name(kernelName)
         reason = None
-        if fly is None:
+        fly = None
+        try:
+            # Lazy: flydsl is optional and must not break `import aiter`.
+            from .flydsl.decode_gemm_mxfp4 import (
+                DECODE_GEMM_MXFP4_LDS_LIMIT,
+                decode_gemm_mxfp4_lds_bytes,
+                flydsl_decode_gemm_mxfp4,
+                parse_flydsl_decode_name,
+            )
+
+            fly = parse_flydsl_decode_name(kernelName)
+        except ImportError:
+            reason = "flydsl unavailable"
+        if reason is not None:
+            pass
+        elif fly is None:
             reason = "unparsable name"
         elif gfx_arch not in _FLYDSL_DECODE_ARCHS:
             reason = f"unsupported arch {gfx_arch}"
@@ -250,12 +261,6 @@ def gemm_a4w4(
         ):
             reason = "unsupported gemm_a4w4 arguments"
         if reason is None:
-            from .flydsl.decode_gemm_mxfp4 import (
-                DECODE_GEMM_MXFP4_LDS_LIMIT,
-                decode_gemm_mxfp4_lds_bytes,
-                flydsl_decode_gemm_mxfp4,
-            )
-
             try:
                 lds = decode_gemm_mxfp4_lds_bytes(
                     m, k, fly["tile_n"], fly["k_waves"], fly["split_k"]

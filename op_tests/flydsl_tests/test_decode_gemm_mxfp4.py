@@ -11,6 +11,7 @@ from aiter.ops import gemm_op_a4w4
 from aiter.ops.flydsl.decode_gemm_mxfp4 import (
     decode_gemm_mxfp4_lds_bytes,
     flydsl_decode_gemm_mxfp4,
+    parse_flydsl_decode_name,
 )
 from aiter.ops.shuffle import shuffle_weight
 from aiter.utility import fp4_utils
@@ -58,6 +59,9 @@ def metrics(actual, reference):
         (8, 128, 2880, 64, 1, "structured"),
         (8, 96, 7232, 32, 2, "structured"),
         (8, 64, 192, 64, 1, "structured"),
+        (3, 64, 2880, 64, 1, "random"),
+        (9, 5120, 8704, 32, 2, "random"),
+        (13, 64, 2880, 64, 1, "random"),
     ],
 )
 def test_decode_gemm_mxfp4(
@@ -206,7 +210,7 @@ def test_decode_gemm_mxfp4_lds_guard():
 
 
 def test_parse_flydsl_decode_name():
-    parse = gemm_op_a4w4._parse_flydsl_decode_name
+    parse = parse_flydsl_decode_name
     assert parse("flydsl_decode_t16x32x512_kw2_nb4_sk1") == {
         "tile_n": 32,
         "k_waves": 2,
@@ -261,7 +265,7 @@ def clean_a4w4_config(monkeypatch):
         (8, 8192, 5120, "flydsl_decode_t16x32x512_kw2_nb4_sk1", True),
         (16, 5120, 8704, "flydsl_decode_t16x32x512_kw2_nb4_sk4", True),
         # Infeasible for FlyDSL (A residency exceeds LDS): must fall back to asm.
-        (16, 16384, 53248, "flydsl_decode_t16x32x512_kw2_nb4_sk1", False),
+        (16, 256, 20480, "flydsl_decode_t16x32x512_kw2_nb4_sk1", False),
     ],
 )
 def test_gemm_a4w4_dispatch_flydsl(

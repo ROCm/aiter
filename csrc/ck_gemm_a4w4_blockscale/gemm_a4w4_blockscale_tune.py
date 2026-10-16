@@ -294,6 +294,14 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
             for num_buffers in (2, 4, 6, 8, 12):
                 # Like CK/asm, partitions beyond 1 are opt-in via -k/--splitK.
                 for split_k in (1, 2, 4, 8) if args.splitK else (1,):
+                    # The kernel clamps depth = min(num_buffers, group_tiles), so
+                    # candidates past the first saturating one are duplicates.
+                    k_tiles = (((K + 255) // 256) + split_k - 1) // split_k
+                    group_tiles = (k_tiles + k_waves - 1) // k_waves
+                    if num_buffers > group_tiles and any(
+                        nb >= group_tiles for nb in (2, 4, 6, 8, 12) if nb < num_buffers
+                    ):
+                        continue
                     try:
                         lds_bytes = decode_gemm_mxfp4_lds_bytes(
                             M, K, tile_n, k_waves, split_k
