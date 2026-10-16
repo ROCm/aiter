@@ -645,18 +645,32 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
 
     if IS_GFX1250:
         NUM_BUFFERS: gl.constexpr = 2
+        # The WMMA B tile is 16 tokens wide. A page shorter than that (8, the
+        # only short page a caller asks for) is shuffled in groups of its own
+        # length -- `shuffle_weight(kv, layout=(8, 16))` -- so a tile is
+        # assembled from 16 // KVBlockSize pages, each its own TDM load.
+        TileRows: gl.constexpr = max(KVBlockSize, 16)
+        PagesPerTile: gl.constexpr = TileRows // KVBlockSize
+        TileShuffleRows: gl.constexpr = min(KVBlockSize, 16)
         KV_SHARED: gl.constexpr = gl.SwizzledSharedLayout(
             vec=1, per_phase=1, max_phase=1, order=[1, 0]
         )
+        # Slot buf * PagesPerTile + p holds page p of the tile in buffer buf.
         kv_shared = gl.allocate_shared_memory(
             KV_buffer.type.element_ty,
-            [NUM_BUFFERS, 1, KVBlockSize * HiddenDim],
+            [NUM_BUFFERS * PagesPerTile, 1, KVBlockSize * HiddenDim],
             KV_SHARED,
         )
         kv_scale_shared = gl.allocate_shared_memory(
             scale_buffer.type.element_ty,
-            [NUM_BUFFERS, 1, KVBlockSize * HiddenDim // 128],
+            [NUM_BUFFERS * PagesPerTile, 1, KVBlockSize * HiddenDim // 128],
             KV_SHARED,
+        )
+        # The same bytes a buffer at a time: a buffer's pages are adjacent, so
+        # indexing a buffer reads its whole tile.
+        kv_tiles = kv_shared.reinterpret(shape=[NUM_BUFFERS, 1, TileRows * HiddenDim])
+        kv_scale_tiles = kv_scale_shared.reinterpret(
+            shape=[NUM_BUFFERS, 1, TileRows * HiddenDim // 128]
         )
 
         pid = tl.program_id(0)
@@ -696,17 +710,17 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
         )
 
         mfma_q = gl.convert_layout(q, mfma_layout_a)
-        zero_acc = gl.zeros((ChunkQ, KVBlockSize), dtype=tl.float32, layout=mfma_layout)
-        col = gl.arange(0, KVBlockSize, layout=gl.SliceLayout(0, mfma_layout))
+        zero_acc = gl.zeros((ChunkQ, TileRows), dtype=tl.float32, layout=mfma_layout)
+        col = gl.arange(0, TileRows, layout=gl.SliceLayout(0, mfma_layout))
 
-        n_blocks = tl.cdiv(split_context_length, KVBlockSize)
+        # split_context_start is a multiple of ChunkK, hence of TileRows.
+        n_tiles = tl.cdiv(split_context_length, TileRows)
         cblk_base = split_context_start // KVBlockSize
         kv_idx_base = kv_indices + pid_batch * max_block_len + cblk_base
+        # Pages past the split's last one are clamped onto it: their columns
+        # are masked below, and the page table holds nothing valid beyond it.
+        save_blk_idx: gl.int32 = tl.cdiv(split_context_length, KVBlockSize) - 1
 
-        # Prologue: kick off the async_load for block 0 into buffer 0.
-        save_blk_idx: gl.int32 = n_blocks - 1
-        blk_cur = gl.load(kv_idx_base)
-        blk_next = gl.load(kv_idx_base + gl.minimum(1, save_blk_idx))
         desc_cur = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=KV_buffer,
             shape=(num_block, KVBlockSize * HiddenDim),
@@ -723,64 +737,95 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
             block_shape=(1, KVBlockSize * HiddenDim // BLOCKSCALE_SIZE),
             layout=KV_SHARED,
         )
-        gl.amd.gfx1250.tdm.async_load(desc_cur, [blk_cur, 0], kv_shared.index(0))
+
+        # A tile is 2 * PagesPerTile TDM loads, values first and then scales,
+        # so waiting down to a count retires a tile's values before its scales.
+        # Page ids are read a tile ahead of their loads (two scalars at most).
+        gl.static_assert(PagesPerTile <= 2)
+        cur0 = gl.load(kv_idx_base)
+        cur1 = cur0
+        if PagesPerTile == 2:
+            cur1 = gl.load(kv_idx_base + gl.minimum(1, save_blk_idx))
+        nxt0 = gl.load(kv_idx_base + gl.minimum(PagesPerTile, save_blk_idx))
+        nxt1 = nxt0
+        if PagesPerTile == 2:
+            nxt1 = gl.load(kv_idx_base + gl.minimum(PagesPerTile + 1, save_blk_idx))
+
+        # Prologue: tile 0 into buffer 0.
+        gl.amd.gfx1250.tdm.async_load(desc_cur, [cur0, 0], kv_shared.index(0))
+        if PagesPerTile == 2:
+            gl.amd.gfx1250.tdm.async_load(desc_cur, [cur1, 0], kv_shared.index(1))
         gl.amd.gfx1250.tdm.async_load(
-            desc_scale_cur, [blk_cur, 0], kv_scale_shared.index(0)
+            desc_scale_cur, [cur0, 0], kv_scale_shared.index(0)
         )
+        if PagesPerTile == 2:
+            gl.amd.gfx1250.tdm.async_load(
+                desc_scale_cur, [cur1, 0], kv_scale_shared.index(1)
+            )
 
-        for j in range(n_blocks):
+        for j in range(n_tiles):
             buf = j % NUM_BUFFERS
-            context_idx = split_context_start + j * KVBlockSize
-            # blk = blk_cur
-            # k_scale_f = gl.amd.cdna3.buffer_load(
-            #     ptr=scale_buffer,
-            #     offsets=blk * stride_scale_seq + col,
-            # )
+            context_idx = split_context_start + j * TileRows
 
-            # Prefetch block j+1 into the other buffer before waiting on block j.
-            if j + 1 < n_blocks:
-                blk_cur = blk_next
-                blk_next = gl.load(kv_idx_base + gl.minimum(j + 2, save_blk_idx))
-                gl.amd.gfx1250.tdm.async_load(
-                    desc_cur, [blk_cur, 0], kv_shared.index((j + 1) % NUM_BUFFERS)
+            # Prefetch tile j+1 into the other buffer before waiting on tile j.
+            if j + 1 < n_tiles:
+                slot = (j + 1) % NUM_BUFFERS * PagesPerTile
+                cur0 = nxt0
+                cur1 = nxt1
+                nxt0 = gl.load(
+                    kv_idx_base + gl.minimum((j + 2) * PagesPerTile, save_blk_idx)
                 )
+                if PagesPerTile == 2:
+                    nxt1 = gl.load(
+                        kv_idx_base
+                        + gl.minimum((j + 2) * PagesPerTile + 1, save_blk_idx)
+                    )
                 gl.amd.gfx1250.tdm.async_load(
-                    desc_scale_cur,
-                    [blk_cur, 0],
-                    kv_scale_shared.index((j + 1) % NUM_BUFFERS),
+                    desc_cur, [cur0, 0], kv_shared.index(slot)
                 )
-                # Leave exactly the just-issued load (block j+1) in flight.
-                gl.amd.gfx1250.tdm.async_wait(3)
+                if PagesPerTile == 2:
+                    gl.amd.gfx1250.tdm.async_load(
+                        desc_cur, [cur1, 0], kv_shared.index(slot + 1)
+                    )
+                gl.amd.gfx1250.tdm.async_load(
+                    desc_scale_cur, [cur0, 0], kv_scale_shared.index(slot)
+                )
+                if PagesPerTile == 2:
+                    gl.amd.gfx1250.tdm.async_load(
+                        desc_scale_cur, [cur1, 0], kv_scale_shared.index(slot + 1)
+                    )
+                # Leave tile j's scales and all of tile j+1 in flight.
+                gl.amd.gfx1250.tdm.async_wait(3 * PagesPerTile)
             else:
-                gl.amd.gfx1250.tdm.async_wait(1)
+                gl.amd.gfx1250.tdm.async_wait(PagesPerTile)
 
             K_WIDTH: gl.constexpr = 16
             mfma_k = (
-                kv_shared.index(buf)
+                kv_tiles.index(buf)
                 .reshape(
                     (
-                        KVBlockSize // 16,
+                        TileRows // TileShuffleRows,
                         HiddenDim // (2 * K_WIDTH),
                         2,
-                        16,
+                        TileShuffleRows,
                         K_WIDTH,
                     )
                 )
                 .permute((0, 3, 1, 2, 4))
-                .reshape((KVBlockSize, HiddenDim))
+                .reshape((TileRows, HiddenDim))
                 .permute([1, 0])
                 .load(layout=mfma_layout_b)
             )
             o = gl.amd.gfx1250.wmma(mfma_q, mfma_k, zero_acc)
 
-            if j + 1 < n_blocks:
-                gl.amd.gfx1250.tdm.async_wait(2)
+            if j + 1 < n_tiles:
+                gl.amd.gfx1250.tdm.async_wait(2 * PagesPerTile)
             else:
                 gl.amd.gfx1250.tdm.async_wait(0)
 
             k_scale_f = (
-                kv_scale_shared.index(buf)
-                .reshape((1, KVBlockSize))
+                kv_scale_tiles.index(buf)
+                .reshape((1, TileRows))
                 .load(layout=mfma_layout)
             )
             o = o * k_scale_f
