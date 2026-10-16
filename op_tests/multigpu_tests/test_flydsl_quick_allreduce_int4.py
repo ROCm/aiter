@@ -12,8 +12,9 @@ fp32 NCCL all-reduce of the same per-rank inputs. INT4 is lossy, so
 validity uses SQNR, a calibrated mismatch ratio, and a per-tile SQNR
 floor.
 
-The divisor case runs an outlier fill at TP 8 that clips the E4M3 scale
-at divisor 1 and must recover SQNR at the default divisor.
+The divisor cases run at TP 8: an outlier fill that clips the E4M3 scale
+at divisor 1 must recover SQNR at divisor 8, and a small-magnitude fill
+must keep full SQNR at the default divisor.
 
 hidden=5120 is the width the kernel was tuned on, not a shape the kernel
 requires. QuickAllReduceInt4 runs on gfx942/gfx950 at TP∈{2,4,8}; other
@@ -69,6 +70,7 @@ TP = WORLD
 _FILLS = (
     "normal",
     "outlier",
+    "small",
     "pos_underflow",
     "neg_underflow",
     "overflow_512",
@@ -82,6 +84,8 @@ _CODEC_FILL_CASES = (
 )
 # (512, 5120) runs ST=1 and (32768, 5120) runs ST=8.
 _DIVISOR_SHAPES = [(512, 5120), (32768, 5120)]
+# Recommended opt-in divisor for inputs that clip at divisor 1.
+_OUTLIER_DIVISOR = 8.0
 # One spawn per world size so compile happens once. hidden=4096 is a width
 # the ST pick was not fitted to; (8, 1024) is smaller than one 32 KiB tile.
 _VALIDITY_SHAPES = {
@@ -95,9 +99,9 @@ def _make_inp(
     tokens: int, hidden: int, fill: str, *, rank: int, device: torch.device
 ) -> torch.Tensor:
     shape = (tokens, hidden)
-    if fill in ("normal", "outlier"):
+    if fill in ("normal", "outlier", "small"):
         gen = torch.Generator().manual_seed(1234 + rank)
-        std = 0.1 if fill == "normal" else 100.0
+        std = {"normal": 0.1, "outlier": 100.0, "small": 0.005}[fill]
         return (torch.randn(shape, generator=gen, dtype=torch.float32) * std).to(
             device=device, dtype=torch.bfloat16
         )
@@ -444,14 +448,8 @@ def main():
     else:
         codec_pairs = [(16, 1024)]
         for fill, label in _CODEC_FILL_CASES:
-            # Divisor 1 so these hit the E4M3 encoder bounds directly.
             ranks = _spawn(
-                2,
-                codec_pairs,
-                time_it=False,
-                fill=fill,
-                grid_cap=args.grid_cap,
-                divisor=1.0,
+                2, codec_pairs, time_it=False, fill=fill, grid_cap=args.grid_cap
             )
             _assert_validity(ranks, pairs=codec_pairs, world_size=2, label=label)
 
@@ -474,8 +472,15 @@ def main():
             n_gpu,
         )
     else:
+        ranks = _spawn(
+            TP, _DIVISOR_SHAPES, time_it=False, fill="small", grid_cap=args.grid_cap
+        )
+        _assert_validity(
+            ranks, pairs=_DIVISOR_SHAPES, world_size=TP, label="small default divisor"
+        )
+
         outlier = {}
-        for divisor in (1.0, DEFAULT_DIVISOR):
+        for divisor in (1.0, _OUTLIER_DIVISOR):
             outlier[divisor] = _spawn(
                 TP,
                 _DIVISOR_SHAPES,
@@ -486,15 +491,15 @@ def main():
             )
         # CLOSE_ATOL is calibrated to the 0.1-std fill, not to std 100.
         _assert_validity(
-            outlier[DEFAULT_DIVISOR],
+            outlier[_OUTLIER_DIVISOR],
             pairs=_DIVISOR_SHAPES,
             world_size=TP,
-            label=f"outlier divisor={DEFAULT_DIVISOR}",
+            label=f"outlier divisor={_OUTLIER_DIVISOR}",
             check_close=False,
         )
         for k, (tokens, hidden) in enumerate(_DIVISOR_SHAPES):
             base = min(r[k]["sqnr_db"] for r in outlier[1.0])
-            fixed = min(r[k]["sqnr_db"] for r in outlier[DEFAULT_DIVISOR])
+            fixed = min(r[k]["sqnr_db"] for r in outlier[_OUTLIER_DIVISOR])
             aiter.logger.info(
                 "outlier tokens=%s hidden=%s: SQNR %.2f dB at divisor 1, "
                 "%.2f dB at divisor %s",
@@ -502,12 +507,12 @@ def main():
                 hidden,
                 base,
                 fixed,
-                DEFAULT_DIVISOR,
+                _OUTLIER_DIVISOR,
             )
             if fixed - base < 3.0:
                 raise AssertionError(
                     f"outlier tokens={tokens} hidden={hidden}: divisor "
-                    f"{DEFAULT_DIVISOR} gives {fixed:.2f} dB vs {base:.2f} dB "
+                    f"{_OUTLIER_DIVISOR} gives {fixed:.2f} dB vs {base:.2f} dB "
                     "at divisor 1; expected the E4M3 clip to be recovered"
                 )
 

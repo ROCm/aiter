@@ -28,10 +28,11 @@ from .kernels.tensor_shim import _run_compiled
 from .quick_allreduce_int4_ipc import UncachedIpcHeap
 
 _SUPPORTED_ARCHS = ("gfx942", "gfx950")
-# The kernel holds both the divisor and its reciprocal in fp16 (normals start
-# at 2**-14), and restores the sum in fp16 before the bf16 store, so
-# 480 * divisor must stay below the fp16 max of 65504.
-DIVISOR_MIN = 2.0**-14
+# The sum is restored in fp16 before the bf16 store, by scaling each group's
+# dequant scale (at least 2**-10) by the divisor; restored values reach
+# 480 * divisor. Both must stay normal fp16: 2**-10 * divisor >= 2**-14 and
+# 480 * divisor < 65504.
+DIVISOR_MIN = 2.0**-4
 DIVISOR_MAX = 128.0
 
 
@@ -381,10 +382,11 @@ class QuickAllReduceInt4:
         """Two-shot INT4 all-reduce into ``out``.
 
         ``stream=None`` uses the current PyTorch stream on this device.
-        ``divisor`` is the same on every GPU and defaults to
-        ``DEFAULT_DIVISOR`` (8); ``1`` disables the scaling. Loaded values
-        are divided by it before the first pack, and the finished sum is
-        multiplied by it once.
+        ``divisor`` defaults to 1, which keeps the previous INT4 result.
+        Loaded values are divided by it before the first pack, and the
+        finished sum is multiplied by it once. Every rank must pass the same
+        divisor; this is not checked, and a mismatch silently gives each rank
+        a different result.
         """
         divisor = _check_divisor(divisor)
         live_bytes = self._check_payload(inp, out)

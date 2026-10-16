@@ -28,9 +28,8 @@ WORLD = 8
 SUPPORTED_WORLDS = (2, 4, 8)
 SUPER_TILES = (1, 8)
 DEFAULT_GRID_CAP = 304 * 4
-# Power of two, so the fp16 divide and multiply are exact. Covers a per-GPU
-# max up to 480 at TP 8 (TP * max / 480).
-DEFAULT_DIVISOR = 8.0
+# 1 keeps the previous INT4 result; larger divisors are opt-in.
+DEFAULT_DIVISOR = 1.0
 
 # Shared by host tile math, LDS PackStorage, and the kernel factory.
 BLOCK = 256
