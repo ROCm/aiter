@@ -1,13 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import csv
+import functools
 import os
 from typing import Any
 
 import torch
 from torch import Generator, Tensor
 
+from .. import logger
 from ..jit.core import (
+    AITER_CONFIGS,
+    AITER_LOG_TUNED_CONFIG,
     AITER_META_DIR,
     CK_DIR,
     ENABLE_CK,
@@ -15,13 +20,299 @@ from ..jit.core import (
     is_experimental_enabled,
 )
 from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
-from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..jit.utils.chip_info import (
+    TUNING_HARDWARE_FIELDS,
+    get_cu_num,
+    get_gfx,
+    get_tuning_hardware,
+)
 from ..jit.utils.mha_recipes import (
     compose_mha_fwd_variant_suffix_and_filter,
     get_mha_varlen_prebuild_variants_by_names,
 )
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
+from ..utility.selection_proof import record_selection
+from .mha_fwd_policy import (
+    MHA_FWD_BACKENDS,
+    MHA_FWD_CONFIG_ENV,
+    MHA_FWD_FAMILY,
+    MHA_FWD_TRITON_BACKENDS,
+    MHA_FWD_TUNING_KEY_FIELDS,
+    MhaFwdProblem,
+    config_digest,
+    csv_scalar,
+    triton_config,
+    triton_unsupported_reason,
+)
+
+
+def _triton_row_rejection(row: dict, problem: MhaFwdProblem) -> str | None:
+    """Why a Triton or Gluon row must not be honored on this GPU, else None.
+
+    Triton keeps its tiles in its own JSON, so a row only names the backend.
+    It stays valid while Triton still resolves the tile it was tuned with.
+    """
+    backend = row["backend"].strip()
+    reason = triton_unsupported_reason(problem, backend)
+    if reason is not None:
+        return reason
+    expected = (row.get("config_digest") or "").strip()
+    if not expected:
+        return f"a {backend} row needs config_digest"
+    actual = config_digest(triton_config(problem, backend))
+    if actual != expected:
+        return (
+            f"Triton now resolves another {backend} config for this shape "
+            f"(digest {actual}, row tuned with {expected}); retune it"
+        )
+    return None
+
+
+@functools.lru_cache(maxsize=8)
+def _load_mha_fwd_tuning_table(path: str) -> dict[tuple[str, ...], str]:
+    """Exact key -> backend.
+
+    A row that does not parse is skipped with a warning rather than failing
+    the load, so one bad row cannot break every MHA call. Triton and Gluon
+    rows for this GPU's arch are also checked against Triton's own configs;
+    rows for other arches can never match here and are left alone.
+    """
+    table: dict[tuple[str, ...], str] = {}
+    if not os.path.isfile(path):
+        if os.environ.get(MHA_FWD_CONFIG_ENV):
+            logger.warning(
+                "%s=%s does not exist; MHA forward runs untuned",
+                MHA_FWD_CONFIG_ENV,
+                path,
+            )
+        return table
+    with open(path, encoding="utf-8", newline="") as file:
+        reader = csv.DictReader(file)
+        missing = [
+            field
+            for field in (*MHA_FWD_TUNING_KEY_FIELDS, "backend")
+            if field not in (reader.fieldnames or ())
+        ]
+        if missing:
+            logger.warning("%s is missing MHA columns %s; ignoring it", path, missing)
+            return table
+        local_gfx = None
+        for line, row in enumerate(reader, start=2):
+            try:
+                backend = str(row["backend"]).strip()
+                if backend not in MHA_FWD_BACKENDS:
+                    raise ValueError(f"unknown backend {backend!r}")
+                problem = MhaFwdProblem.from_mapping(row)
+                if backend in MHA_FWD_TRITON_BACKENDS:
+                    local_gfx = local_gfx or get_gfx()
+                    if problem.gfx == local_gfx:
+                        reason = _triton_row_rejection(row, problem)
+                        if reason is not None:
+                            raise ValueError(reason)
+                key = problem.key()
+            # Any error: the digest check imports and runs Triton's resolver,
+            # and no row may take every MHA call down with it.
+            except Exception as error:  # noqa: BLE001
+                logger.warning("%s:%d: skipping MHA tuned row: %s", path, line, error)
+                continue
+            if key in table:
+                logger.warning(
+                    "%s:%d: duplicate MHA key; keeping the first", path, line
+                )
+                continue
+            table[key] = backend
+    return table
+
+
+@functools.lru_cache(maxsize=1)
+def _mha_fwd_table_path() -> str:
+    # Resolving the property globs and merges model_configs, so do it once.
+    return os.path.abspath(AITER_CONFIGS.AITER_CONFIG_MHA_FWD_FILE)
+
+
+def clear_mha_fwd_tuning_cache() -> None:
+    """Re-read the tuned table (and its path) on the next call."""
+    _mha_fwd_table_path.cache_clear()
+    _load_mha_fwd_tuning_table.cache_clear()
+    _mha_fwd_hardware_prefixes.cache_clear()
+    _mha_fwd_coarse_keys.cache_clear()
+
+
+_COARSE_FIELDS = ("mode", "hdim_q", "hdim_v", "dtype")
+
+
+@functools.lru_cache(maxsize=8)
+def _mha_fwd_hardware_prefixes(path: str) -> frozenset[tuple[str, ...]]:
+    span = len(TUNING_HARDWARE_FIELDS)
+    return frozenset(key[:span] for key in _load_mha_fwd_tuning_table(path))
+
+
+@functools.lru_cache(maxsize=8)
+def _mha_fwd_coarse_keys(path: str) -> frozenset[tuple[str, ...]]:
+    span = len(TUNING_HARDWARE_FIELDS)
+    positions = [MHA_FWD_TUNING_KEY_FIELDS.index(f) for f in _COARSE_FIELDS]
+    return frozenset(
+        (*key[:span], *(key[i] for i in positions))
+        for key in _load_mha_fwd_tuning_table(path)
+    )
+
+
+@torch._dynamo.assume_constant_result
+def _mha_fwd_has_rows(prefix: tuple[str, ...] | None = None) -> bool:
+    """Whether the table has rows at all, or for one (gfx, gpu_model, cu_num).
+
+    Constant-folded under torch.compile, so an empty table costs a traced
+    call nothing.
+    """
+    prefixes = _mha_fwd_hardware_prefixes(_mha_fwd_table_path())
+    return bool(prefixes) if prefix is None else prefix in prefixes
+
+
+@torch._dynamo.assume_constant_result
+def _mha_fwd_has_coarse_rows(coarse: tuple[str, ...]) -> bool:
+    """Whether any row shares this hardware, mode, head dims and dtype: a
+    cheap screen before the full key is built."""
+    return coarse in _mha_fwd_coarse_keys(_mha_fwd_table_path())
+
+
+@torch._dynamo.assume_constant_result
+def _mha_fwd_local_hardware(device_id: int) -> tuple[str, ...]:
+    """This device's (gfx, gpu_model, cu_num) as row cells, or () when the
+    running arch is not the built one.
+
+    Constant-folded under torch.compile: the probe behind it reads the
+    filesystem and runs rocminfo, which dynamo cannot trace.
+    """
+    hardware = get_tuning_hardware(device_id)
+    # The kernel gates test the built arch, so a row keyed on the running arch
+    # is only safe to apply when the two agree.
+    if hardware["gfx"] != get_gfx():
+        return ()
+    return tuple(csv_scalar(hardware[field]) for field in TUNING_HARDWARE_FIELDS)
+
+
+def _mha_fwd_tuning_key(
+    *,
+    hardware: tuple[str, ...] | None = None,
+    mode: str,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    batch: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    min_seqlen_q: int,
+    causal: bool,
+    window_size: tuple[int, ...],
+    dropout_p: float,
+    logits_soft_cap: float,
+    how_v3_bf16_cvt: int,
+    return_lse: bool,
+    return_attn_probs: bool,
+    bias: torch.Tensor | None,
+    alibi_slopes: torch.Tensor | None,
+    sink_ptr: torch.Tensor | None,
+    block_table: torch.Tensor | None,
+    q_descale: torch.Tensor | None,
+    cu_seqlens_q_padded: torch.Tensor | None,
+    cu_seqlens_k_padded: torch.Tensor | None,
+) -> tuple[str, ...]:
+    if hardware is None:
+        device_id = q.device.index if q.device.index is not None else 0
+        tuning_hardware = get_tuning_hardware(device_id)
+        hardware = tuple(tuning_hardware[field] for field in TUNING_HARDWARE_FIELDS)
+    # Coerced as MhaFwdProblem coerces row cells, so dropout_p=0 and 0.0, or
+    # causal=1 and True, find the same row.
+    values = {
+        **dict(zip(TUNING_HARDWARE_FIELDS, hardware)),
+        "mode": mode,
+        "batch": int(batch),
+        "total_q": q.shape[0] if mode == "varlen" else batch * q.shape[1],
+        "total_k": k.shape[0] if mode == "varlen" else batch * k.shape[1],
+        "max_seqlen_q": int(max_seqlen_q),
+        "max_seqlen_k": int(max_seqlen_k),
+        "min_seqlen_q": int(min_seqlen_q),
+        "nhead_q": q.shape[-2],
+        "nhead_k": k.shape[-2],
+        "hdim_q": q.shape[-1],
+        "hdim_v": v.shape[-1],
+        "dtype": str(q.dtype).removeprefix("torch."),
+        "causal": bool(causal),
+        "window_left": int(window_size[0]),
+        "window_right": int(window_size[1]),
+        "sink_size": int(window_size[2]) if len(window_size) > 2 else 0,
+        "dropout_p": float(dropout_p),
+        "logits_soft_cap": float(logits_soft_cap),
+        "how_v3_bf16_cvt": int(how_v3_bf16_cvt),
+        "return_lse": bool(return_lse),
+        "return_attn_probs": bool(return_attn_probs),
+        "has_bias": bias is not None,
+        "has_alibi": alibi_slopes is not None,
+        "has_sink": sink_ptr is not None,
+        "has_block_table": block_table is not None,
+        "has_q_descale": q_descale is not None,
+        "has_physical_padding": (
+            cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None
+        ),
+        "is_grad": torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v)),
+    }
+    return tuple(csv_scalar(values[field]) for field in MHA_FWD_TUNING_KEY_FIELDS)
+
+
+@torch._dynamo.assume_constant_result
+def _mha_fwd_backend_for_key(key: tuple[str, ...]) -> str | None:
+    """Read the table for one already-derived key.
+
+    Constant-folded under torch.compile: it reads the filesystem, and its
+    result depends only on its argument, which the caller has specialized on.
+    """
+    path = _mha_fwd_table_path()
+    backend = _load_mha_fwd_tuning_table(path).get(key)
+    if backend is not None and AITER_LOG_TUNED_CONFIG:
+        logger.info("MHA fwd matched a tuned row in %s: %s", path, backend)
+    return backend
+
+
+def _get_mha_fwd_tuned_backend(**key_args) -> str | None:
+    """The backend a tuned row pins for this call, or None to auto-select.
+
+    Rows only apply to CK-enabled builds; without CK, dispatch goes to Triton,
+    which keeps its own configs.
+    """
+    if not ENABLE_CK or not _mha_fwd_has_rows():
+        return None
+    q, v = key_args["q"], key_args["v"]
+    prefix = _mha_fwd_local_hardware(
+        q.device.index if q.device.index is not None else 0
+    )
+    if not prefix or not _mha_fwd_has_rows(prefix):
+        return None
+    coarse = (
+        *prefix,
+        key_args["mode"],
+        str(q.shape[-1]),
+        str(v.shape[-1]),
+        str(q.dtype).removeprefix("torch."),
+    )
+    if not _mha_fwd_has_coarse_rows(coarse):
+        return None
+    # The key is derived outside the constant-folded read, so under
+    # torch.compile dynamo specializes on the sizes it reads and a second
+    # shape looks itself up instead of inheriting the first shape's row.
+    return _mha_fwd_backend_for_key(_mha_fwd_tuning_key(hardware=prefix, **key_args))
+
+
+@functools.cache
+def _warn_declined_mha_fwd_row(backend: str) -> None:
+    logger.warning(
+        "a tuned MHA row pins %r for a call it cannot serve; using auto-select",
+        backend,
+    )
+
+
+def _record_mha_fwd_selection(backend: str) -> None:
+    record_selection(MHA_FWD_FAMILY, backend=backend)
 
 
 def _fmha_kv_byte_extent_ge_u32(
@@ -2934,6 +3225,7 @@ def _flash_attn_varlen_forward(
     out: torch.Tensor | None = None,
     zero_tensors: bool = False,
     sink_ptr: Tensor | None = None,
+    selected_backend: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     _, nhead_q, hdim_q = q.shape
     batch_size = cu_seqlens_q.numel() - 1
@@ -3065,7 +3357,24 @@ def _flash_attn_varlen_forward(
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
 
-    if can_impl_fmha_fwd_hd192_v128_bf16_opus_varlen():
+    can_serve = {
+        "opus": can_impl_fmha_fwd_hd192_v128_bf16_opus_varlen,
+        "asm_v3": lambda: can_impl_fmha_fwd_with_sink_varlen_asm()
+        or can_impl_fmha_v3_fwd(),
+        "ck": lambda: True,
+    }
+    if (
+        selected_backend is not None
+        and not can_serve.get(selected_backend, lambda: False)()
+    ):
+        _warn_declined_mha_fwd_row(selected_backend)
+        selected_backend = None
+
+    if (
+        selected_backend in (None, "opus")
+        and can_impl_fmha_fwd_hd192_v128_bf16_opus_varlen()
+    ):
+        _record_mha_fwd_selection("opus")
         # OPUS gfx950 group/varlen D=192 path. cu_seqlens_* are the REAL cumulative
         # lengths (masks / tile counts); cu_seqlens_*_padded are the PHYSICAL row
         # offsets (KV padding). When no padded arrays are given, physical == real.
@@ -3091,7 +3400,11 @@ def _flash_attn_varlen_forward(
         )
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
-    elif can_impl_fmha_fwd_with_sink_varlen_asm():
+    elif (
+        selected_backend in (None, "asm_v3")
+        and can_impl_fmha_fwd_with_sink_varlen_asm()
+    ):
+        _record_mha_fwd_selection("asm_v3")
         # gfx1250 packed/varlen ASM bf16 path.  q/k/v are packed THD; the kernel
         # requires dense packing (the wrapper calls `.contiguous()` defensively)
         # and carries no strides.  softmax_scale is forwarded as-is (the kernel
@@ -3118,7 +3431,8 @@ def _flash_attn_varlen_forward(
         softmax_lse = lse_asm.squeeze(-1).transpose(0, 1).contiguous()
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
-    elif can_impl_fmha_v3_fwd():
+    elif selected_backend in (None, "asm_v3") and can_impl_fmha_v3_fwd():
+        _record_mha_fwd_selection("asm_v3")
         out, softmax_lse, S_dmask, rng_state = fmha_v3_varlen_fwd(
             q,
             k,
@@ -3151,6 +3465,8 @@ def _flash_attn_varlen_forward(
             # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
     else:
+        _record_mha_fwd_selection("ck")
+
         # Input validation for padded cumulative arrays if provided
         def _validate(name: str, t: torch.Tensor):
             assert t.dim() == 1, f"{name} must be 1D"
@@ -3485,6 +3801,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         q_descale=None,
         k_descale=None,
         v_descale=None,
+        selected_backend: str | None = None,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -3525,6 +3842,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             block_table=block_table,
             out=out,
             sink_ptr=sink_ptr,
+            selected_backend=selected_backend,
         )
         if is_grad:
             assert return_lse
@@ -3630,6 +3948,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         # (fwd-only inputs; not differentiable via autograd.
         #           bwd sink gradient d_sink is computed inside mha_varlen_bwd kernel,
         #           not returned here as a positional gradient.)
+        # selected_backend (forward dispatch only)
         # We only have gradients for q,k,v (dq,dk,dv) and possibly bias (dbias). Others are None.
         return (
             dq,  # q
@@ -3661,6 +3980,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             None,  # q_descale
             None,  # k_descale
             None,  # v_descale
+            None,  # selected_backend
         )
 
 
@@ -3767,6 +4087,30 @@ def flash_attn_varlen_func(
         raise RuntimeError(
             "prequantized FP8 attention with descales requires ENABLE_CK=1"
         )
+    tuned_backend = _get_mha_fwd_tuned_backend(
+        mode="varlen",
+        q=q,
+        k=k,
+        v=v,
+        batch=cu_seqlens_q.numel() - 1,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        min_seqlen_q=min_seqlen_q,
+        causal=causal,
+        window_size=window_size,
+        dropout_p=dropout_p,
+        logits_soft_cap=logits_soft_cap,
+        how_v3_bf16_cvt=how_v3_bf16_cvt,
+        return_lse=return_lse,
+        return_attn_probs=return_attn_probs,
+        bias=bias,
+        alibi_slopes=alibi_slopes,
+        sink_ptr=sink_ptr,
+        block_table=block_table,
+        q_descale=q_descale,
+        cu_seqlens_q_padded=cu_seqlens_q_padded,
+        cu_seqlens_k_padded=cu_seqlens_k_padded,
+    )
 
     # Try the PR3039 gfx1250 prefill ASM path before FlyDSL can claim it.
     def can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
@@ -3807,7 +4151,11 @@ def flash_attn_varlen_func(
             return sink_ptr is not None
         return sink_ptr is None
 
-    if not has_all_descales and can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
+    if (
+        not has_all_descales
+        and tuned_backend in (None, "asm_v3")
+        and can_try_gfx1250_fmha_fwd_with_sink_varlen_asm()
+    ):
         return FlashAttnVarlenFunc.apply(
             q,
             k,
@@ -3838,6 +4186,7 @@ def flash_attn_varlen_func(
             q_descale,
             k_descale,
             v_descale,
+            tuned_backend,
         )
 
     # FlyDSL path returns result if supported, None otherwise. window_size[2] (sink
@@ -3845,7 +4194,11 @@ def flash_attn_varlen_func(
     # the path so a sink-token request is never silently dropped.
     # FlyDSL also does not consume precomputed Q/K/V descales, so keep
     # prequantized FP8 attention on the CK path.
-    if not has_all_descales and (len(window_size) < 3 or window_size[2] == 0):
+    if (
+        not has_all_descales
+        and tuned_backend in (None, "flydsl")
+        and (len(window_size) < 3 or window_size[2] == 0)
+    ):
         from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
 
         _flydsl_result = flydsl_flash_attn_varlen_func(
@@ -3870,7 +4223,49 @@ def flash_attn_varlen_func(
             sink=sink_ptr,
         )
         if _flydsl_result is not None:
+            _record_mha_fwd_selection("flydsl")
             return _flydsl_result
+        if tuned_backend == "flydsl":
+            # FlyDSL screens things the key does not carry, such as the layout
+            # of out, so a row can pin it for a call it then declines.
+            _warn_declined_mha_fwd_row("flydsl")
+            tuned_backend = None
+
+    if tuned_backend in MHA_FWD_TRITON_BACKENDS:
+        from .triton.attention.mha import (
+            flash_attn_varlen_func as flash_attn_varlen_func_triton,
+        )
+
+        _record_mha_fwd_selection(tuned_backend)
+        # No config: Triton resolves its own tile, the one the row was tuned with.
+        result = flash_attn_varlen_func_triton(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size[:2],
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            return_lse=return_lse,
+            return_attn_probs=return_attn_probs,
+            block_table=block_table,
+            out=out,
+            sink=sink_ptr,
+            backend=tuned_backend,
+        )
+        # Triton's entry takes out= but returns a tensor of its own, while a
+        # caller of the CK path reads the result from out.
+        if out is not None and result is not out:
+            out.copy_(result)
+            return out
+        return result
 
     if not ENABLE_CK:
         from .triton.attention.mha import (
@@ -3928,6 +4323,7 @@ def flash_attn_varlen_func(
         q_descale,
         k_descale,
         v_descale,
+        tuned_backend,
     )
 
 
