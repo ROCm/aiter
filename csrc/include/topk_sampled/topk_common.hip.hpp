@@ -295,10 +295,15 @@ using vfloat4 = opus::fp32x4_t;
 // vfloat4 typedef. Declaring the typedef `aligned(4)` was tried and changed
 // nothing, which is the other half of the same evidence.
 //
-// RAGGED=false cannot over-read -- the slice is the whole row, len == pitch, and
-// the vector count is an exact division -- so that instantiation keeps the plain
-// load and byte-identical codegen. The aiter entry always instantiates
-// RAGGED=true, so the path that ships gets the clamp.
+// RAGGED=false cannot over-read here -- the slice is the whole row, len == pitch
+// -- so that instantiation keeps the plain load and byte-identical codegen. The
+// aiter entry runs it only for rows whose pitch is their width: _sampled_run
+// (topk.py) runs a row-strided call as ragged, a width that is not a multiple of
+// FP32_EPT takes the bounded small_n build (ragged_small), and on the fused path
+// phases B and C read a row's partial last vector themselves: phase_b_filter_coop
+// picks the tail up in its last-chunk block, and phase_c_select_contig's fallback
+// re-reads such a row through the bounds-checked loader. Every row that needs
+// the clamp gets it only while all three hold.
 // Measured cost on the ragged path, interleaved A/B against the pre-fix binary,
 // 2 rounds each. Three forms of the same clamp were tried and this one, the
 // simplest, is also the cheapest:

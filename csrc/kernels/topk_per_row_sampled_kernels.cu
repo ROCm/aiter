@@ -1573,10 +1573,17 @@ static bool sampled_args_ok(int64_t numRows, int64_t stride0, int64_t k, int64_t
 
 bool topk_sampled_supports(int64_t numRows, int64_t stride0, int64_t k, int64_t device_id = -1)
 {
-    // stride0 need not be a multiple of FP32_EPT. This entry always
-    // instantiates RAGGED=true, where the vector count is n4_cover(len) and
-    // load_row_f4 loads the final partial vector element-wise, so an odd pitch
-    // only makes the row base unaligned -- which gfx950 serves natively.
+    // stride0 need not be a multiple of FP32_EPT: an odd pitch only makes a row
+    // base unaligned, which gfx950 serves natively. What keeps every read
+    // inside its row is the instantiation each call gets, and three things
+    // pick it: _sampled_run (topk.py) runs a row-strided call as ragged, so the
+    // RAGGED=true kernels bound each row by its length and load the final
+    // partial vector element-wise; a width that is not a multiple of FP32_EPT
+    // takes the bounded small_n build (ragged_small below); and on the fused
+    // path phases B and C read a row's partial last vector themselves --
+    // phase_b_filter_coop's last-chunk block, and phase_c_select_contig's
+    // fallback through the bounds-checked loader (topk_generalize.hip.hpp). A
+    // change to any of them has to keep that.
     return sampled_args_ok(numRows, stride0, k, device_id) &&
            sampled::params_for(
                static_cast<int>(numRows), static_cast<int>(stride0), static_cast<int>(k))
@@ -1663,7 +1670,8 @@ void top_k_per_row_prefill_sampled(
                 "(see top_k_per_row_prefill_sampled in topk.py)");
 
     // A plain row whose width is not a multiple of FP32_EPT is safe on the fused
-    // path: phase_b_filter_coop reads the tail, and the tests cover every N % 4
+    // path: phase_b_filter_coop reads the tail, phase_c_select_contig's fallback
+    // re-reads the row bounds-checked, and the tests cover every N % 4
     // residue on both entries. topk_small_n truncates `pitch / FP32_EPT` with no
     // tail handling, so odd widths keep its bounds-checked instantiation.
     const hipStream_t stream = aiter::getCurrentHIPStream();
