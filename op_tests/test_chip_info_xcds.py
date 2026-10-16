@@ -62,7 +62,7 @@ def test_attribute_failure_is_retried_before_caching_topology(hip, error):
 def test_unknown_version_does_not_query_or_cache_topology(hip):
     hip.hipRuntimeGetVersion.side_effect = _hip_result(0, 999)
     with pytest.raises(RuntimeError, match="Could not read the HIP runtime version"):
-        chip_info.get_num_xcds()
+        chip_info.get_num_xcds(default=None)
     hip.hipDeviceGetAttribute.assert_not_called()
     assert chip_info._num_xcds_for_device.cache_info().currsize == 0
 
@@ -102,6 +102,7 @@ def test_legacy_runtime_falls_back_without_querying_attribute(hip, version):
     with mock.patch.object(chip_info.logger, "warning") as warning:
         assert chip_info.get_num_xcds() == 8
         assert chip_info.get_num_xcds() == 8
+        assert chip_info.get_num_xcds(default=7) == 7
     warning.assert_called_once()
     assert "predates hipDeviceAttributeNumberOfXccs" in warning.call_args.args[0]
     hip.hipDeviceGetAttribute.assert_not_called()
@@ -119,7 +120,7 @@ def test_supported_runtime_queries_attribute(hip, version):
 def test_invalid_count_is_not_cached(hip, count):
     hip.hipDeviceGetAttribute.side_effect = _hip_result(count)
     with pytest.raises(RuntimeError, match="not a usable XCD count"):
-        chip_info.get_num_xcds()
+        chip_info.get_num_xcds(default=None)
 
     hip.hipDeviceGetAttribute.side_effect = _hip_result(4)
     assert chip_info.get_num_xcds() == 4
@@ -144,9 +145,33 @@ def test_counts_are_cached_per_current_device(hip):
 def test_current_device_failure_does_not_cache_topology(hip):
     hip.hipGetDevice.side_effect = _hip_result(0, 999)
     with pytest.raises(RuntimeError, match="hipGetDevice failed"):
-        chip_info.get_num_xcds()
+        chip_info.get_num_xcds(default=None)
     hip.hipDeviceGetAttribute.assert_not_called()
 
     hip.hipGetDevice.side_effect = _hip_result(0)
     assert chip_info.get_num_xcds() == 4
     hip.hipDeviceGetAttribute.assert_called_once()
+
+
+def test_legacy_runtime_raises_without_default(hip):
+    hip.hipRuntimeGetVersion.side_effect = _hip_result(60_400_000)
+    with pytest.raises(RuntimeError, match="predates hipDeviceAttributeNumberOfXccs"):
+        chip_info.get_num_xcds(default=None)
+    with pytest.raises(RuntimeError, match="predates hipDeviceAttributeNumberOfXccs"):
+        chip_info.get_device_name()
+    hip.hipDeviceGetAttribute.assert_not_called()
+
+
+def test_default_is_returned_on_failure_without_caching(hip):
+    chip_info._warn_xcd_fallback.cache_clear()
+    hip.hipDeviceGetAttribute.side_effect = _hip_result(4, 1)
+    with mock.patch.object(chip_info.logger, "warning") as warning:
+        assert chip_info.get_num_xcds() == 8
+        assert chip_info.get_num_xcds() == 8
+    warning.assert_called_once()
+    assert chip_info._num_xcds_for_device.cache_info().currsize == 0
+
+    hip.hipDeviceGetAttribute.side_effect = _hip_result(4)
+    assert chip_info.get_num_xcds() == 4
+    assert chip_info.get_num_xcds(default=None) == 4
+    assert hip.hipDeviceGetAttribute.call_count == 3

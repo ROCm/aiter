@@ -615,7 +615,7 @@ def get_device_name():
         return "MI300"
     elif gfx == "gfx950":
         # MI350P is a half-size gfx950: 4 XCDs against 8 on MI350X and MI355X.
-        if get_num_xcds() == 4:
+        if get_num_xcds(default=None) == 4:
             return "MI350P"
         return "MI350"
     elif gfx == "gfx1250":
@@ -655,10 +655,8 @@ def _query_num_xccs(device_id: int) -> int:
 
 
 @functools.cache
-def _num_xcds_for_device(device_id: int) -> int:
-    """Cache counts and legacy fallbacks per device; failures remain retryable."""
-    default_xcd_count = 8
-
+def _num_xcds_for_device(device_id: int) -> int | None:
+    """XCD count of a device, or None for a HIP runtime that lacks the attribute."""
     version = get_hip_runtime_version()
     if version is None:
         raise RuntimeError(
@@ -670,29 +668,47 @@ def _num_xcds_for_device(device_id: int) -> int:
     # plausible integer, so this gate has to precede the query.
     if version[:2] < (7, 0):
         logger.warning(
-            "HIP %d.%d predates hipDeviceAttributeNumberOfXccs; assuming %d "
-            "XCDs for device %d.",
-            version[0],
-            version[1],
-            default_xcd_count,
-            device_id,
+            "HIP %d.%d predates hipDeviceAttributeNumberOfXccs.", *version[:2]
         )
-        return default_xcd_count
+        return None
 
     return _query_num_xccs(device_id)
 
 
-def get_num_xcds() -> int:
+@functools.cache
+def _warn_xcd_fallback(reason: str, default: int) -> None:
+    logger.warning(
+        "%s; assuming %d XCDs until a later query succeeds.", reason, default
+    )
+
+
+def get_num_xcds(default: int | None = 8) -> int:
     """XCD (accelerator die) count of the device this thread is bound to.
 
-    Uses the historical eight-XCD fallback only for a known pre-7.0 HIP runtime.
-    Raises on device, version, or attribute query failures, or when the count
-    comes back outside a plausible range. Failed lookups can be retried.
+    Only the first successful lookup per device id is cached; a failed one is
+    retried on the next call. On failure, the default is returned and the
+    failure logged once; pass default=None to raise instead, as any caller whose
+    correctness or identity depends on the count must. A HIP runtime that lacks
+    the attribute (before 7.0) also returns the default, or raises without one.
     """
-    device_id = get_current_hip_device()
-    if device_id is None:
-        raise RuntimeError(
-            "hipGetDevice failed, so there is no current device to read the "
-            "XCD count from."
-        )
-    return _num_xcds_for_device(device_id)
+    try:
+        device_id = get_current_hip_device()
+        if device_id is None:
+            raise RuntimeError(
+                "hipGetDevice failed, so there is no current device to read the "
+                "XCD count from."
+            )
+        xcds = _num_xcds_for_device(device_id)
+    except (RuntimeError, OSError) as e:
+        if default is None:
+            raise
+        _warn_xcd_fallback(str(e), default)
+        return default
+    if xcds is None:
+        if default is None:
+            raise RuntimeError(
+                "HIP runtime predates hipDeviceAttributeNumberOfXccs, so the XCD "
+                f"count of device {device_id} cannot be determined."
+            )
+        return default
+    return xcds
