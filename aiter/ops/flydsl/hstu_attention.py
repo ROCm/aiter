@@ -970,12 +970,18 @@ def _plan_fused_groups(
     for g in candidates:
         spans, rows, _nbytes = _plan(g)
         try:
-            # `empty`, not `zeros`: the reduction reads only elements the fused
-            # kernel wrote -- slots are sized to exactly the q rows their tile
-            # serves and row indices are clamped to seq_len-1 -- so the memset
-            # is pure cost. Verified by poisoning the scratch with NaN at the
+            # `empty`, not `zeros`: for the masks this kernel accepts, the
+            # reduction reads only elements the fused kernel wrote -- slots are
+            # sized to exactly the q rows their tile serves and row indices are
+            # clamped to seq_len-1 -- so the memset is pure cost (~17 ms per
+            # call at 86 GB). Verified by poisoning the scratch with NaN at the
             # production shape: dq came back bitwise identical at G=2 and G=5
-            # with zero NaNs. Zeroing 86 GB was ~17 ms per call.
+            # with zero NaNs.
+            #
+            # This depends on the validator gating out sliding windows: a
+            # windowed mask DOES leave partials unwritten, and summing garbage
+            # there is silent. If windows are ever supported, this has to go
+            # back to `zeros` (or zero just the unwritten tails).
             dq_part = torch.empty(rows, elems, dtype=torch.float32, device=device)
             dq_carry = (
                 torch.zeros(1, 1, dtype=torch.float32, device=device)

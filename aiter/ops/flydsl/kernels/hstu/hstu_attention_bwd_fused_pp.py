@@ -245,12 +245,26 @@ def validate_hstu_attention_bwd_fused_pp(
         raise ValueError(f"waves_per_eu must be non-negative, got {waves_per_eu}")
     if not host_math.isfinite(alpha):
         raise ValueError(f"alpha must be finite, got {alpha}")
-    if contextual_seq_len < 0:
+    if contextual_seq_len != 0:
+        # Measured wrong, not merely untested: at B=32/H=4/N=1024 with
+        # contextual_seq_len=64 the fused dQ misses the fp32 oracle by 0.85
+        # relative against a 0.03 tolerance, with a ZEROED scratch so it is the
+        # mask arithmetic, not uninitialised partials.
         raise ValueError(
-            f"contextual_seq_len must be non-negative, got {contextual_seq_len}"
+            "hstu bwd fused does not support a contextual prefix, got "
+            f"contextual_seq_len={contextual_seq_len}. The dvdk + dq pair does."
         )
-    if max_attn_len < 0:
-        raise ValueError(f"max_attn_len must be non-negative, got {max_attn_len}")
+    if max_attn_len != 0:
+        # The window arithmetic itself is correct, but a windowed mask leaves
+        # some dQ partials unwritten, and the split-K scratch is allocated with
+        # `empty` precisely because the unwindowed masks write every element
+        # the reduction reads. Supporting windows means zeroing the scratch
+        # again -- ~17 ms per call at the production shape -- so it is gated
+        # out rather than paid for on every shape.
+        raise ValueError(
+            "hstu bwd fused does not support a sliding window, got "
+            f"max_attn_len={max_attn_len}. The dvdk + dq pair does."
+        )
 
 
 @functools.lru_cache(maxsize=16384)

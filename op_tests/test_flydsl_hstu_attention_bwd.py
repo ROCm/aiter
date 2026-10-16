@@ -547,6 +547,42 @@ def test_flydsl_bwd_fused_rejects_unsupported_shape():
     assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref)
 
 
+@requires_fused
+@pytest.mark.parametrize(
+    "max_attn_len,contextual_seq_len",
+    [(64, 0), (256, 0), (0, 64)],
+)
+def test_flydsl_bwd_fused_rejects_masked_variants(max_attn_len, contextual_seq_len):
+    """Windows and contextual prefixes must RAISE, not return wrong gradients.
+
+    Both were silently accepted once, and both were wrong in different ways.
+    With a zeroed scratch a contextual prefix missed the fp32 oracle by 0.85
+    relative against a 0.03 tolerance -- broken mask arithmetic. The sliding
+    window's arithmetic is right, but it leaves dQ partials unwritten, and the
+    split-K scratch is allocated with `empty` on the strength of the accepted
+    masks writing everything the reduction reads. Either way the dvdk + dq pair
+    handles these, so the gate sends them there.
+    """
+    b, h, n, d = 32, 4, 1024, 64
+    alpha = 1.0 / d * 10000
+    q, k, v, dout, seq_offsets, num_targets = _fused_inputs(b, h, n, d)
+    args = (
+        n, alpha, q, k, v, dout, seq_offsets, True, num_targets,
+        max_attn_len, contextual_seq_len,
+    )  # fmt: skip
+
+    with pytest.raises(ValueError, match="sliding window|contextual prefix"):
+        flydsl_hstu_attention_bwd(*args, fused=True)
+
+    # The fallback must still be CORRECT, which a bare `raises` would miss.
+    dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
+        n, alpha, q, k, v, seq_offsets, True, num_targets,
+        max_attn_len, contextual_seq_len, dout,
+    )  # fmt: skip
+    dq, dk, dv = flydsl_hstu_attention_bwd(*args, fused=None)
+    assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref)
+
+
 def test_bwd_tuned_csv_accepts_fused_discriminator(tmp_path):
     """A `fused` row resolves like any other kernel's, independently of dvdk/dq."""
     path = _write_bwd_csv(
