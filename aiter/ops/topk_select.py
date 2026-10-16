@@ -1238,9 +1238,13 @@ def topk_select(
             ``sorted=True`` or ``sorted_index=True`` if the returned tensor
             itself has to be reproducible, not just its contents.
 
-            Weaker than ``tie`` and cheaper than it: it only excludes ``plain``,
-            keeping the small-k selector that ``tie='low'`` has to give up. Costs
-            up to 1.9x where ``plain`` would have won.
+            Weaker than ``tie`` and cheaper than it: it excludes ``plain`` and
+            ``sampled`` (`_NONDETERMINISTIC`), keeping the small-k selector that
+            ``tie='low'`` has to give up. Measured on gfx950, it costs up to 3.4x
+            where ``plain`` would have won (k=2048, m=4096 n=16384: 75 against
+            258us on ``stream``) and up to 3.7x on the wide rows where
+            ``sampled`` would have (k=2048, m=64 n=1M: 57 against 210us on
+            ``decode``).
 
     Returns:
         ``(values, indices)``; ``values`` is None when ``return_value`` is False.
