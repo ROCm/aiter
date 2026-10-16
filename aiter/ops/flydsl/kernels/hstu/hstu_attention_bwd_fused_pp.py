@@ -1863,12 +1863,18 @@ def build_hstu_attention_bwd_dq_reduce(
         # only work avoided. Truncating division is fine: the clamp at 0 covers
         # the negative case either way.
         t_start = fx.Int32(tile_lo)
-        if const_expr(max_attn_len > 0 and not has_targets):
-            # Only safe without targets: a clamped target row is served by
-            # tiles arbitrarily far below it, so there is no contiguous span to
-            # skip into. With targets this stays at `tile_lo` and the predicate
-            # does the whole job.
-            _wlo = (row0 - fx.Int32(max_attn_len)) // fx.Int32(block_m)
+        if const_expr(max_attn_len > 0):
+            # Anchor the span on the CLAMPED id, not the raw row. A target row
+            # has id == max_id, so it is served from (max_id - window) upward --
+            # still one contiguous span, just anchored lower down than the row
+            # itself. Taking the raw row would skip the tiles it actually needs;
+            # giving up and starting at tile_lo (as this did) reads the whole
+            # causal span and throws most of it away, which cost 50.4 ms of
+            # reduction against 12.6 for the same window without targets.
+            _idr = row0
+            if const_expr(has_targets):
+                _idr = (row0 < max_id).select(row0, max_id)
+            _wlo = (_idr - fx.Int32(max_attn_len)) // fx.Int32(block_m)
             _wlo = (_wlo > fx.Int32(0)).select(_wlo, fx.Int32(0))
             t_start = (_wlo > t_start).select(_wlo, t_start)
 

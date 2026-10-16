@@ -175,7 +175,7 @@ def time_arm(fn, iters, warmup=2) -> np.ndarray:
     return np.array([s.elapsed_time(e) for s, e in zip(starts, ends)])
 
 
-def bench_cell(regime, b, h, mask, target_size, iters, names):
+def bench_cell(regime, b, h, mask, target_size, iters, names, max_attn_len=0):
     """Time the selected backends on one cell. Returns (rows, meta)."""
     alpha = 1.0 / HEAD_DIM * 10000
     q, k, v, seq_offsets, num_targets = build_bwd_inputs(
@@ -186,7 +186,8 @@ def bench_cell(regime, b, h, mask, target_size, iters, names):
     total_tokens = int(seq_offsets[-1].item())
 
     args = (
-        SEQ_LEN, alpha, q, k, v, dout, seq_offsets, True, num_targets, 0, 0,
+        SEQ_LEN, alpha, q, k, v, dout, seq_offsets, True, num_targets,
+        max_attn_len, 0,
     )  # fmt: skip
 
     # Both arms are built ONCE, outside any timed window, and reuse their
@@ -245,6 +246,11 @@ def bench_cell(regime, b, h, mask, target_size, iters, names):
     lengths = (seq_offsets[1:] - seq_offsets[:-1]).to(torch.float64)
     pairs = float((lengths * (lengths + 1) / 2).sum().item()) * h
     flops = (3 * 2 * HEAD_DIM + 2 * 2 * HEAD_DIM) * pairs
+    if max_attn_len:
+        # A window cuts the pair count, and targets cut it further by clamping
+        # ids, so the causal formula above would overstate the roofline. Rather
+        # than publish a wrong number, leave it blank under a window.
+        flops = float("nan")
 
     rows = []
     for name, times in results.items():
@@ -499,6 +505,12 @@ def parse_args():
         help="""Mask presets to keep.""",
     )  # fmt: skip
     parser.add_argument(
+        "--max-attn-len", type=int, default=0,
+        help="""Sliding-window width. 0 (default) is the unwindowed mask.
+        No tuned row exists for windowed shapes, so BOTH paths fall back to
+        default tiles -- see the note the run prints.""",
+    )  # fmt: skip
+    parser.add_argument(
         "-v", "--verbose", action="store_true",
         help="""Also print a table and device footprint per cell. The summary
         table at the end carries the same latencies and G.""",
@@ -536,6 +548,13 @@ def main():
     if not names:
         return
 
+    if args.max_attn_len:
+        aiter.logger.warning(
+            "max_attn_len=%d: no tuned CSV row exists for a windowed shape, so "
+            "the split arm runs DEFAULT tiles rather than its tuned ones. The "
+            "comparison is not tuned-vs-tuned.",
+            args.max_attn_len,
+        )
     cells = [
         c for c in CELLS
         if c[0] in args.regime and c[2] in args.heads and c[3] in args.mask
@@ -545,12 +564,14 @@ def main():
     for index, cell in enumerate(cells, 1):
         regime, b, h, mask, target_size = cell[:5]
         tag = f"{regime} B={b} H={h} {mask} targets={target_size}"
+        if args.max_attn_len:
+            tag += f" window={args.max_attn_len}"
         # Printed BEFORE the cell runs and completed after, so a sweep that
         # spends minutes compiling is not silent. One line per cell, and it
         # reads the same redirected to a file as it does on a terminal.
         print(f"[{index}/{len(cells)}] {tag} ... ", end="", flush=True)
 
-        cell_rows, meta = bench_cell(*cell, names)
+        cell_rows, meta = bench_cell(*cell, names, args.max_attn_len)
         rows += cell_rows
 
         done = {r["backend"]: r["median_ms"] for r in cell_rows}
