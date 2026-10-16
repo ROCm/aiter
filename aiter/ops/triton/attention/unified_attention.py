@@ -122,6 +122,7 @@ class _UAParams(NamedTuple):
     v_descale: torch.Tensor | None = None
     output_scale: torch.Tensor | None = None
     skip_reduce: bool = False
+    per_token_kv_scales: bool = False
 
 
 def _gfx950_gluon_supported(params: _UAParams):
@@ -204,6 +205,10 @@ def unified_attention(
     skip_reduce: bool = False,
     # backend
     backend: str | None = None,  # "triton" | "gluon"
+    # FP8 scales indexed by physical [page, KV head, token]. Scalar descales
+    # remain separate; using these keywords also detects an older caller ABI.
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
 ):
     assert causal, "Only causal attention is supported"
 
@@ -215,9 +220,9 @@ def unified_attention(
         "gluon",
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
     if backend == "gluon":
-        assert (
-            _is_gluon_available()
-        ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
+        assert _is_gluon_available(), (
+            f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
+        )
 
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
@@ -271,14 +276,45 @@ def unified_attention(
             "size to match the query/key head size"
         )
 
+    if k_scale_cache is not None or v_scale_cache is not None:
+        if k_descale is not None or v_descale is not None:
+            raise ValueError("Pass scalar descales or per-token scale caches, not both")
+        if k_scale_cache is None or v_scale_cache is None:
+            raise ValueError("Both K and V scale caches are required")
+        k_descale, v_descale = k_scale_cache, v_scale_cache
+    if shuffled_kv_cache and v.ndim == 4:
+        if tuple(v.shape) != (num_blocks, num_kv_heads, head_size, block_size):
+            raise ValueError("Legacy paged V must be [page, head, dim, token]")
+        backend = "triton"  # Gluon expects SHUFFLE V.
+
+    # A scalar descale is shared by the cache; a 3-D descale follows each
+    # physical (page, KV head, token). Gluon currently supports scalars only.
+    per_token_kv_scales = k_scale_cache is not None or any(
+        scale is not None and scale.numel() > 1 for scale in (k_descale, v_descale)
+    )
+    if per_token_kv_scales:
+        expected = (num_blocks, num_kv_heads, block_size)
+        if kv_cache_dtype != e4m3_dtype or q_dtype not in (
+            torch.bfloat16,
+            torch.float16,
+        ):
+            raise ValueError("Per-token KV scales require FP8 KV and BF16/FP16 queries")
+        for scale in (k_descale, v_descale):
+            if (
+                scale is None
+                or tuple(scale.shape) != expected
+                or scale.dtype != torch.float32
+            ):
+                raise ValueError(f"Per-token K/V descales must be float32 {expected}")
+        backend = "triton"
+
     num_seqs = len(seqused_k)
     num_queries_per_kv = num_query_heads // num_kv_heads
     # only the plain layout exposes v's head size as its last dimension; a
     # shuffled value cache carries the vectorization width there instead.
     head_size_v = head_size if shuffled_kv_cache else v.shape[-1]
     assert out.shape[-1] == head_size_v, (
-        f"out last dim must be the value head size {head_size_v}, "
-        f"got {out.shape[-1]}"
+        f"out last dim must be the value head size {head_size_v}, got {out.shape[-1]}"
     )
 
     BLOCK_M = (
@@ -350,6 +386,7 @@ def unified_attention(
         v_descale=v_descale,
         output_scale=output_scale,
         skip_reduce=skip_reduce,
+        per_token_kv_scales=per_token_kv_scales,
     )
 
     # if batch contains a prefill
@@ -536,9 +573,9 @@ def _unified_attention_2d_triton(params: _UAParams):
     if params.shuffled_kv_cache and (
         params.q_dtype == e4m3_dtype and params.kv_cache_dtype == e4m3_dtype
     ):
-        assert (
-            params.block_size >= 32
-        ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
+        assert params.block_size >= 32, (
+            "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
+        )
 
     config = get_unified_attention_config("attn_2d", params, backend="triton")
     config["BLOCK_M"] = max(
@@ -548,6 +585,9 @@ def _unified_attention_2d_triton(params: _UAParams):
     assert config["BLOCK_Q"] >= 1
     if params.shuffled_kv_cache:
         config["TILE_SIZE"] = params.block_size
+    if params.per_token_kv_scales:
+        # The unmasked fast loop has scalar-only dequantization.
+        config["SPLIT_UNMASKED_LOOP"] = False
     if params.all_decode:
         total_num_q_blocks = params.num_seqs
     else:
@@ -605,6 +645,26 @@ def _unified_attention_2d_triton(params: _UAParams):
         ALL_DECODE=params.all_decode,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
+        V_CACHE_NHD=params.shuffled_kv_cache and params.v.ndim == 4,
+        PER_TOKEN_KV_SCALES=params.per_token_kv_scales,
+        stride_k_scale_0=params.k_descale.stride(0)
+        if params.per_token_kv_scales
+        else 0,
+        stride_k_scale_1=params.k_descale.stride(1)
+        if params.per_token_kv_scales
+        else 0,
+        stride_k_scale_2=params.k_descale.stride(2)
+        if params.per_token_kv_scales
+        else 0,
+        stride_v_scale_0=params.v_descale.stride(0)
+        if params.per_token_kv_scales
+        else 0,
+        stride_v_scale_1=params.v_descale.stride(1)
+        if params.per_token_kv_scales
+        else 0,
+        stride_v_scale_2=params.v_descale.stride(2)
+        if params.per_token_kv_scales
+        else 0,
         **config,
         enable_fp_fusion=True,
     )
@@ -683,6 +743,26 @@ def _unified_attention_3d_triton(
         ALL_DECODE=params.all_decode,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
+        V_CACHE_NHD=params.shuffled_kv_cache and params.v.ndim == 4,
+        PER_TOKEN_KV_SCALES=params.per_token_kv_scales,
+        stride_k_scale_0=params.k_descale.stride(0)
+        if params.per_token_kv_scales
+        else 0,
+        stride_k_scale_1=params.k_descale.stride(1)
+        if params.per_token_kv_scales
+        else 0,
+        stride_k_scale_2=params.k_descale.stride(2)
+        if params.per_token_kv_scales
+        else 0,
+        stride_v_scale_0=params.v_descale.stride(0)
+        if params.per_token_kv_scales
+        else 0,
+        stride_v_scale_1=params.v_descale.stride(1)
+        if params.per_token_kv_scales
+        else 0,
+        stride_v_scale_2=params.v_descale.stride(2)
+        if params.per_token_kv_scales
+        else 0,
         IS_Q_FP8=(params.q_dtype == e4m3_dtype),
         IS_KV_FP8=(params.kv_cache_dtype == e4m3_dtype),
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
@@ -779,9 +859,9 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
     if not params.shuffled_kv_cache or TILE_SIZE < params.block_size:
         TILE_SIZE = params.block_size
     num_kv_blocks = TILE_SIZE // params.block_size
-    assert (
-        num_kv_blocks & (num_kv_blocks - 1) == 0
-    ), f"TILE_SIZE={TILE_SIZE} must be a power-of-2 multiple of PAGE_SIZE={params.block_size}"
+    assert num_kv_blocks & (num_kv_blocks - 1) == 0, (
+        f"TILE_SIZE={TILE_SIZE} must be a power-of-2 multiple of PAGE_SIZE={params.block_size}"
+    )
 
     # the loop variants other than 0 mask at most twice at the end of the loop,
     # and need a tile wider than 32

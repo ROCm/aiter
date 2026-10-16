@@ -132,6 +132,14 @@ def kernel_unified_attention_2d(
     SHUFFLED_KV_CACHE: tl.constexpr = False,  # bool
     SPLIT_UNMASKED_LOOP: tl.constexpr = False,  # bool
     K_WIDTH: tl.constexpr = 0,  # int
+    V_CACHE_NHD: tl.constexpr = False,
+    PER_TOKEN_KV_SCALES: tl.constexpr = False,
+    stride_k_scale_0: tl.int64 = 0,
+    stride_k_scale_1: tl.int64 = 0,
+    stride_k_scale_2: tl.int64 = 0,
+    stride_v_scale_0: tl.int64 = 0,
+    stride_v_scale_1: tl.int64 = 0,
+    stride_v_scale_2: tl.int64 = 0,
 ):
     # SPLIT_UNMASKED_LOOP does not support SHUFFLED_KV_CACHE or SLIDING_WINDOW.
     tl.static_assert(
@@ -293,7 +301,11 @@ def kernel_unified_attention_2d(
         qk_scale = qk_scale * q_descale
     else:
         q_descale = None
-    if k_descale_ptr is not None and v_descale_ptr is not None:
+    if (
+        not PER_TOKEN_KV_SCALES
+        and k_descale_ptr is not None
+        and v_descale_ptr is not None
+    ):
         k_descale = tl.load(k_descale_ptr)
         v_descale = tl.load(v_descale_ptr)
         qk_scale = qk_scale * k_descale
@@ -451,7 +463,9 @@ def kernel_unified_attention_2d(
         )
 
         V = V_load.to(Q.dtype)
-        if SHUFFLED_KV_CACHE:
+        if SHUFFLED_KV_CACHE and V_CACHE_NHD:
+            V = V.reshape(HEAD_SIZE_PADDED, TILE_SIZE).trans(1, 0)
+        elif SHUFFLED_KV_CACHE:
             V = (
                 V.reshape(
                     TILE_SIZE // K_WIDTH,
@@ -461,6 +475,40 @@ def kernel_unified_attention_2d(
                 .permute(0, 2, 1)
                 .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
             )
+
+        if SHUFFLED_KV_CACHE:
+            # The last physical page can contain unwritten FP8 NaNs. A zero
+            # attention probability does not make 0 * NaN safe in the PV dot.
+            V = tl.where((seq_offset < seq_len)[:, None], V, 0.0)
+
+        if PER_TOKEN_KV_SCALES:
+            # Scale lookup follows the same physical page map as the KV load,
+            # including shared prefix pages and a partially filled final page.
+            valid_scale = seq_offset < seq_len
+            scale_page = tl.load(
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE,
+                mask=valid_scale,
+                other=0,
+            ).to(tl.int64)
+            scale_slot = seq_offset % BLOCK_SIZE
+            ks = tl.load(
+                k_descale_ptr
+                + scale_page * stride_k_scale_0
+                + kv_head_idx * stride_k_scale_1
+                + scale_slot * stride_k_scale_2,
+                mask=valid_scale,
+                other=1.0,
+            )
+            vs = tl.load(
+                v_descale_ptr
+                + scale_page * stride_v_scale_0
+                + kv_head_idx * stride_v_scale_1
+                + scale_slot * stride_v_scale_2,
+                mask=valid_scale,
+                other=1.0,
+            )
+            K = (K.to(tl.float32) * ks[None, :]).to(Q.dtype)
+            V = (V.to(tl.float32) * vs[:, None]).to(Q.dtype)
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
@@ -632,6 +680,14 @@ def kernel_unified_attention_3d(
     K_WIDTH: tl.constexpr = 0,  # int
     IS_Q_FP8: tl.constexpr = False,  # bool
     IS_KV_FP8: tl.constexpr = False,  # bool
+    V_CACHE_NHD: tl.constexpr = False,
+    PER_TOKEN_KV_SCALES: tl.constexpr = False,
+    stride_k_scale_0: tl.int64 = 0,
+    stride_k_scale_1: tl.int64 = 0,
+    stride_k_scale_2: tl.int64 = 0,
+    stride_v_scale_0: tl.int64 = 0,
+    stride_v_scale_1: tl.int64 = 0,
+    stride_v_scale_2: tl.int64 = 0,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -771,14 +827,14 @@ def kernel_unified_attention_3d(
     else:
         q_descale = None
 
-    if k_descale_ptr is not None:
+    if not PER_TOKEN_KV_SCALES and k_descale_ptr is not None:
         k_scale = tl.load(k_descale_ptr)
         qk_scale = qk_scale * k_scale
     else:
         k_scale = None
 
     out_factor: tl.float32 = 1.0
-    if v_descale_ptr is not None:
+    if not PER_TOKEN_KV_SCALES and v_descale_ptr is not None:
         out_factor = tl.load(v_descale_ptr)
 
     if out_scale_ptr is not None:
@@ -865,7 +921,9 @@ def kernel_unified_attention_3d(
         )
 
         V = V_load.to(Q.dtype)
-        if SHUFFLED_KV_CACHE:
+        if SHUFFLED_KV_CACHE and V_CACHE_NHD:
+            V = V.reshape(HEAD_SIZE_PADDED, TILE_SIZE).trans(1, 0)
+        elif SHUFFLED_KV_CACHE:
             V = (
                 V.reshape(
                     TILE_SIZE // K_WIDTH,
@@ -875,6 +933,40 @@ def kernel_unified_attention_3d(
                 .permute(0, 2, 1)
                 .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
             )
+
+        if SHUFFLED_KV_CACHE:
+            # The last physical page can contain unwritten FP8 NaNs. A zero
+            # attention probability does not make 0 * NaN safe in the PV dot.
+            V = tl.where((seq_offset < seq_len)[:, None], V, 0.0)
+
+        if PER_TOKEN_KV_SCALES:
+            # Scale lookup follows the same physical page map as the KV load,
+            # including shared prefix pages and a partially filled final page.
+            valid_scale = seq_offset < seq_len
+            scale_page = tl.load(
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE,
+                mask=valid_scale,
+                other=0,
+            ).to(tl.int64)
+            scale_slot = seq_offset % BLOCK_SIZE
+            ks = tl.load(
+                k_descale_ptr
+                + scale_page * stride_k_scale_0
+                + kv_head_idx * stride_k_scale_1
+                + scale_slot * stride_k_scale_2,
+                mask=valid_scale,
+                other=1.0,
+            )
+            vs = tl.load(
+                v_descale_ptr
+                + scale_page * stride_v_scale_0
+                + kv_head_idx * stride_v_scale_1
+                + scale_slot * stride_v_scale_2,
+                mask=valid_scale,
+                other=1.0,
+            )
+            K = (K.to(tl.float32) * ks[None, :]).to(Q.dtype)
+            V = (V.to(tl.float32) * vs[:, None]).to(Q.dtype)
 
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
