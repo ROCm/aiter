@@ -1890,6 +1890,10 @@ _FUSED_MESH_AGREE_CASES = ((4, 1024, 5120),)
 #: world size and inbox type here; the test checks it.
 _FUSED_MESH_ST_EXACT_CASES = ((2, 4096, 4096), (4, 4096, 4096), (2, 4096, 1536))
 
+#: (tokens, hidden) with more tiles than the persistent grid at every world
+#: size and inbox type, for the ST=8 coverage check.
+_ST_COVERAGE_CASE = (4096, 4096)
+
 # Off the row-sized-block grid: 2560 and 640 are not multiples of 128 threads
 # per block, 12288 is wider than 1024.
 _FUSED_REJECTED_HIDDENS = (2560, 640, 12288)
@@ -2110,11 +2114,19 @@ def test_quick_allreduce_rmsnorm_mesh_pinned_st(tp, tokens, hidden, label, super
 
 @benchmark()
 def test_quick_allreduce_rmsnorm_mesh_st8_is_exercised(tp):
-    """At least one case per world size really takes the ST>1 path, so the
-    pinned-ST=8 rows above are not all silently ST=1."""
-    cases = [(t, h) for w, t, h, _ in _FUSED_CASES if w == tp]
+    """Each world size really takes the ST>1 path at a payload that reaches it,
+    so the pinned-ST=8 rows above are not all silently ST=1.
+
+    ST>1 needs more tiles than the persistent grid. On an uncached inbox (xGMI)
+    there is no publish batching to make up for it, so ``_FUSED_CASES`` -- sized
+    for the batched case, with 64 to 128 tiles against a grid of 128 -- do not
+    qualify; the payload here is 33 MiB, a few hundred tiles at every world size.
+    """
     batch = _fused_batch(
-        (tp, "st", "mesh", 8), cases, algorithm="mesh", engine_kw=_pinned_st_kw(8)
+        (tp, "st-coverage", "mesh", 8),
+        [_ST_COVERAGE_CASE],
+        algorithm="mesh",
+        engine_kw=_pinned_st_kw(8),
     )
     variants = sorted({r["variant"] for rows in batch.values() for r in rows})
     fails = []

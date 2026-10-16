@@ -112,14 +112,19 @@ world size when fewer GPUs are visible than TP.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
+import functools
+import inspect
 import itertools
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from multiprocessing import Pool, freeze_support, set_start_method
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -132,7 +137,6 @@ for _path in (_REPO_ROOT, _HERE):
 
 import flydsl_allreduce_bench as fab
 import pandas as pd
-import pytest
 import torch
 
 import aiter
@@ -383,8 +387,18 @@ FUSED_SPLIT_M = (1, 2, 3, 5)
 # call's bits.
 FUSED_SPLIT_REPEAT = 50
 # Input magnitudes at the two ends of the fixed-point exchange: its resolution
-# (2**-16 per writer) against a small row, and its range against a large one.
-FUSED_SPLIT_SCALES = (1e-2, 300.0)
+# (2**-22 per writer) against a small row, and its range against a large one.
+FUSED_SPLIT_SCALES = (1e-2, 10.0)
+# The exchange's fidelity to the unsplit build, ``fused_split_exchange``: a
+# split row is checked against the same call on an unsplit engine. Row RMS is
+# about 1e-3 at this scale, where eps dominates and the exchange's resolution
+# shows in the output, so the share of bf16 lanes that differ by an ulp is the
+# measure. The cap holds with margin over the current fixed point (0.1-0.4%) and is far
+# below what the former 2**-16 gave (8-16%).
+SPLIT_EXCHANGE_SCALE = 1e-4
+SPLIT_EXCHANGE_MAX_ULP_LANES = 0.01
+SPLIT_EXCHANGE_SPLIT = 2
+SPLIT_EXCHANGE_CASES = ((3, 4096), (2, 7168))
 
 
 def _production_payloads(tp: int, link: str) -> tuple[list[int], tuple[int, int]]:
@@ -986,6 +1000,43 @@ def _check(label: str, fails: list[str]) -> None:
         _FAILURES.append(msg)
 
 
+def _graded_benchmark(fn):
+    """``@benchmark()`` for a test written with plain ``assert``.
+
+    A failed assert is recorded through ``_check`` instead of raised, so one bad
+    case does not stop the sweep and ``main`` reports every failure at the end.
+    The row ``benchmark`` builds (the arguments by name, which is what the
+    summary table shows) gains ``passed``.
+    """
+    bench = benchmark()(fn)
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            row = bench(*args, **kwargs)
+        except AssertionError as e:
+            frame = traceback.extract_tb(e.__traceback__)[-1]
+            row = inspect.getcallargs(fn, *args, **kwargs)
+            given = ", ".join(f"{k}={v}" for k, v in row.items())
+            where = f"{os.path.basename(frame.filename)}:{frame.lineno}"
+            _check(f"{fn.__name__}({given})", [f"{e or frame.line} [{where}]"])
+            return {**row, "passed": False}
+        return {**row, "passed": True}
+
+    return wrapper
+
+
+@contextlib.contextmanager
+def _raises(exc, match):
+    """The body must raise *exc* with a message matching the regex *match*."""
+    try:
+        yield
+    except exc as e:
+        assert re.search(match, str(e)), f"{e!r} does not match {match!r}"
+    else:
+        raise AssertionError(f"expected {exc.__name__} matching {match!r}")
+
+
 @benchmark()
 def test_one_shot_allreduce(
     tokens,
@@ -1440,8 +1491,7 @@ def _fused_fresh_inputs(eng, rank: int, tp: int, hidden: int, device) -> list[st
     Same skew and sentinel pattern as ``_fresh_inputs``. ``residual_out`` must
     match the reference bit for bit wherever the reference is not NaN, and be
     NaN where it is. ``out`` goes through ``rsqrt``, so it is graded on SQNR,
-    over the rows the sentinel left finite: a split build clamps a NaN partial
-    in its exchange, so a NaN row's norm need not be NaN.
+    over the rows the sentinel left finite.
     """
     eng.preload(hidden)
     torch.manual_seed(5)
@@ -1480,6 +1530,135 @@ def _fused_fresh_inputs(eng, rank: int, tp: int, hidden: int, device) -> list[st
     return bad
 
 
+def _split_exchange_failures(eng, unsplit, rank, tp, m, hidden, device) -> list[str]:
+    """What a split build's integer exchange must keep from the unsplit build.
+
+    *eng* is the split engine, *unsplit* the same call with every row on one
+    workgroup.
+
+    - NaN propagates: A NaN in a row makes the whole ``out`` row NaN, as in the unsplit
+      build and the reference.
+    - Small rows keep their resolution: At row RMS ~1e-3 the sum of squares
+      is a few units of a coarse fixed point, and the rounding reaches ``out``.
+      Only a small share of lanes may differ from the unsplit build's.
+    """
+    bad = []
+    eng.preload(hidden)
+    unsplit.preload(hidden)
+
+    parts, residual, weight = _fused_inputs(m, hidden, tp, device)
+    residual[0, 5] = float("nan")
+    residual[m - 1, hidden - 1] = float("nan")
+    inp = parts[rank].contiguous()
+    out, _ = eng.allreduce_rmsnorm(inp, residual, weight, RMS_EPS)
+    out_ref, _ = _fused_reference(parts, residual, weight, RMS_EPS)
+    torch.cuda.synchronize()
+    want = out_ref.isnan().all(-1)
+    got = out.isnan().all(-1)
+    if not torch.equal(want, got):
+        bad.append(
+            f"{m}x{hidden}: {int(want.sum())} rows of the reference are all-NaN, "
+            f"the split build's out has {int(got.sum())} (and "
+            f"{int((out.isnan().any(-1) & ~got).sum())} partly NaN)"
+        )
+    finite = ~want
+    if finite.any() and _sqnr_db(out_ref[finite].float(), out[finite].float()) < (
+        SQNR_FLOOR_DB
+    ):
+        bad.append(f"{m}x{hidden}: out of the finite rows is below the SQNR floor")
+
+    parts, residual, weight = _fused_inputs(
+        m, hidden, tp, device, scale=SPLIT_EXCHANGE_SCALE
+    )
+    inp = parts[rank].contiguous()
+    out, _ = eng.allreduce_rmsnorm(inp, residual, weight, RMS_EPS)
+    out_unsplit, _ = unsplit.allreduce_rmsnorm(inp, residual, weight, RMS_EPS)
+    torch.cuda.synchronize()
+    share = float(
+        (out.view(torch.int16) != out_unsplit.view(torch.int16)).float().mean()
+    )
+    if share > SPLIT_EXCHANGE_MAX_ULP_LANES:
+        bad.append(
+            f"{m}x{hidden} x{SPLIT_EXCHANGE_SCALE:g}: {share:.2%} of out's bf16 "
+            f"lanes differ from the unsplit build's (limit "
+            f"{SPLIT_EXCHANGE_MAX_ULP_LANES:.2%})"
+        )
+    return bad
+
+
+def _capture_ready_failures(rank, tp, hidden, device, dist) -> list[str]:
+    """No rung is built or compiled inside a graph capture, whatever the warmup."""
+    from flydsl.compiler import jit_function as jf
+
+    from aiter.dist.device_communicators.flydsl_backends import FlyDSLAllReduceRMSNorm
+
+    os.environ["AITER_FLY_AR"] = "1"
+    backend = FlyDSLAllReduceRMSNorm(
+        group=dist.group.WORLD, device=device, quantized=False
+    )
+    if backend.disabled:
+        return ["the exact fused backend is disabled"]
+    eng = backend._engines[fly_policy.AllReduceAlgorithm.OneShot.value]
+    lo, hi = backend._windows[
+        fly_policy.AllReduceAlgorithm.OneShot.value
+    ].inclusive_range()
+    row_bytes = hidden * 2
+    eng._build_hidden(hidden)  # builds the width without compiling any rung
+    rows_lo, rows_hi = max(-(-lo // row_bytes), 1), hi // row_bytes
+    by_cfg = {}
+    for m in range(rows_lo, min(rows_hi, 4096) + 1):
+        by_cfg.setdefault(eng._pick_cfg(hidden, m * row_bytes), m)
+    if len(by_cfg) < 2:
+        return []  # a single rung in the window: nothing to tell apart
+    rows = list(by_cfg.values())
+    m_warm, m_capture = rows[0], rows[-1]
+
+    def run(m):
+        parts, residual, weight = _fused_inputs(m, hidden, tp, device)
+        assert backend.should_fly_fused_ar_rms(parts[rank], residual, weight)
+        return backend.fly_fused_ar_rms(
+            parts[rank].contiguous(), residual, weight, RMS_EPS
+        )
+
+    run(m_warm)
+    torch.cuda.synchronize()
+
+    events = []
+    orig_trace = jf.JitFunction._trace_and_compile
+    orig_get = jf.JitCacheManager.get
+
+    def watch(name, orig):
+        def wrapped(self, *args, **kwargs):
+            if torch.cuda.is_current_stream_capturing():
+                events.append(name)
+            return orig(self, *args, **kwargs)
+
+        return wrapped
+
+    jf.JitFunction._trace_and_compile = watch("compile", orig_trace)
+    jf.JitCacheManager.get = watch("cache load", orig_get)
+    try:
+        # Warm the inputs, so only the call itself is inside the capture.
+        parts, residual, weight = _fused_inputs(m_capture, hidden, tp, device)
+        inp = parts[rank].contiguous()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            backend.fly_fused_ar_rms(inp, residual, weight, RMS_EPS)
+    finally:
+        jf.JitFunction._trace_and_compile = orig_trace
+        jf.JitCacheManager.get = orig_get
+    torch.cuda.synchronize()
+    backend.close()
+    if events:
+        kinds = "/".join(sorted(set(events)))
+        msg = (
+            f"capture at {m_capture} rows after a warmup at {m_warm} rows: "
+            f"{len(events)} FlyDSL {kinds} event(s) inside it"
+        )
+        return [msg]
+    return []
+
+
 def _log_path(world_size: int, rank: int, mode: str, tag: str) -> str:
     """One log per (world size, rank, mode, knobs) so concurrent spawn
     configurations cannot overwrite each other's failure tails.
@@ -1514,9 +1693,9 @@ def _fused_spawn(
         raise ValueError(f"unsupported world_size={world_size}")
     n_gpu = torch.cuda.device_count()
     if n_gpu < world_size:
-        import pytest
-
-        pytest.skip(f"OneShotAllReduceRMSNorm needs {world_size} GPUs, have {n_gpu}")
+        raise RuntimeError(
+            f"OneShotAllReduceRMSNorm needs {world_size} GPUs, have {n_gpu}"
+        )
     init_method = get_distributed_init_method(get_ip(), get_open_port())
     out_path = os.path.join(
         tempfile.mkdtemp(prefix="flydsl_one_shot_fused_"), "rank0.json"
@@ -1679,7 +1858,10 @@ def _run_rank_fused(args, rank, device, dist) -> None:
         out_ref, res_ref = _fused_reference(parts, residual, weight, RMS_EPS)
 
         db = _sqnr_db(out_ref.float(), out.float())
-        if db < SQNR_FLOOR_DB:
+        # A NaN makes the SQNR NaN, which no comparison with the floor catches.
+        if out.isnan().any() and not out_ref.isnan().any():
+            bad.append(f"{tag}: out has NaNs, the reference has none")
+        elif db < SQNR_FLOOR_DB:
             bad.append(
                 f"{tag}: out SQNR {db:.2f} dB below the {SQNR_FLOOR_DB} dB floor"
             )
@@ -1737,6 +1919,24 @@ def _run_rank_fused(args, rank, device, dist) -> None:
         failures.extend(
             _fused_fresh_inputs(eng, rank, args.tp, args.hiddens[0], device)
         )
+    elif args.mode == "fused_capture_ready":
+        failures.extend(
+            _capture_ready_failures(rank, args.tp, args.hiddens[0], device, dist)
+        )
+    elif args.mode == "fused_split_exchange":
+        unsplit = OneShotAllReduceRMSNorm(
+            group=dist.group.WORLD,
+            device=device,
+            rank=rank,
+            world_size=args.tp,
+            split=1,
+            max_bytes=1 << 30,
+        )
+        for m, hidden in zip(args.tokens, args.hiddens, strict=True):
+            failures.append(
+                _split_exchange_failures(eng, unsplit, rank, args.tp, m, hidden, device)
+            )
+        unsplit.close()
     else:
         for m, hidden in zip(args.tokens, args.hiddens, strict=True):
             failures.append(_check(m, hidden, f"{m}x{hidden}"))
@@ -1794,8 +1994,7 @@ def _batch_cache_lookup(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
-@pytest.mark.parametrize("m,hidden,label", _FUSED_SHAPE_CASES)
+@_graded_benchmark
 def test_one_shot_allreduce_rmsnorm(m, hidden, label, world_size):
     """``OneShotAllReduceRMSNorm`` against an fp32 reference of the C++ contract.
 
@@ -1809,8 +2008,7 @@ def test_one_shot_allreduce_rmsnorm(m, hidden, label, world_size):
         assert not bad, f"{label}, tp={world_size}, rank {rank}: " + "; ".join(bad)
 
 
-@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
-@pytest.mark.parametrize("m,hidden,label", _FUSED_PAD_SHAPE_CASES)
+@_graded_benchmark
 def test_one_shot_allreduce_rmsnorm_padded(m, hidden, label, world_size):
     """Widths that only exist because the workgroup is padded past the row.
 
@@ -1833,6 +2031,7 @@ def test_one_shot_allreduce_rmsnorm_padded(m, hidden, label, world_size):
         assert not bad, f"{label}, tp={world_size}, rank {rank}: " + "; ".join(bad)
 
 
+@_graded_benchmark
 def test_one_shot_allreduce_rmsnorm_padding_is_least_wire():
     """The padded pick is the narrowest legal width at or above hidden dim.
 
@@ -1877,6 +2076,7 @@ def test_one_shot_allreduce_rmsnorm_padding_is_least_wire():
             )
 
 
+@_graded_benchmark
 def test_one_shot_allreduce_rmsnorm_padded_hidden_limits():
     """What padding can and cannot address on the fused one-shot.
 
@@ -1899,14 +2099,15 @@ def test_one_shot_allreduce_rmsnorm_padded_hidden_limits():
     assert widest == ceiling, f"widest padded hidden {widest}, not {ceiling}"
 
     for hidden in (ceiling + 8, 2 * ceiling):
-        with pytest.raises(ValueError, match="no padded fused build"):
+        with _raises(ValueError, match="no padded fused build"):
             fused_padded_block(hidden)
     for hidden in (2884, 1001, 2879):
         assert not fused_padded_block_options(hidden)
-        with pytest.raises(ValueError, match="multiple of 8"):
+        with _raises(ValueError, match="multiple of 8"):
             fused_padded_block(hidden)
 
 
+@_graded_benchmark
 def test_one_shot_allreduce_rmsnorm_geom_for_pinned_block_pads():
     """A pinned block a width lacks natively resolves through the padded set.
 
@@ -1963,8 +2164,7 @@ def test_one_shot_allreduce_rmsnorm_geom_for_pinned_block_pads():
             assert split == 1, (block, split)
 
 
-@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
-@pytest.mark.parametrize("atoms,hidden", FUSED_ATOMS_CASES)
+@_graded_benchmark
 def test_one_shot_allreduce_rmsnorm_atoms(atoms, hidden, world_size):
     """Narrower blocks: ``atoms`` sets BLOCK = hidden/(8*atoms) in a fused build.
 
@@ -1984,8 +2184,7 @@ def test_one_shot_allreduce_rmsnorm_atoms(atoms, hidden, world_size):
             )
 
 
-@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
-@pytest.mark.parametrize("block,hidden", FUSED_BLOCK_CASES)
+@_graded_benchmark
 def test_one_shot_allreduce_rmsnorm_block(block, hidden, world_size):
     """Pinning ``block`` instead of ``atoms``, which is the tuner's currency.
 
@@ -2009,8 +2208,7 @@ def test_one_shot_allreduce_rmsnorm_block(block, hidden, world_size):
             )
 
 
-@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
-@pytest.mark.parametrize("split", FUSED_FRESH_SPLITS)
+@_graded_benchmark
 def test_one_shot_allreduce_rmsnorm_fresh_inputs(split, world_size):
     """The fused kernel on a new input every call, at varying sizes and under
     rank skew, checked against the reference call by call.
@@ -2032,7 +2230,7 @@ def test_one_shot_allreduce_rmsnorm_fresh_inputs(split, world_size):
         assert not bad, f"tp={world_size} split={split}, rank {rank}: " + "; ".join(bad)
 
 
-@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
+@_graded_benchmark
 def test_one_shot_allreduce_rmsnorm_run_ahead(world_size):
     """The fused kernel under deliberate rank skew.
 
@@ -2047,8 +2245,7 @@ def test_one_shot_allreduce_rmsnorm_run_ahead(world_size):
         assert not bad, f"tp={world_size}, rank {rank}: " + "; ".join(bad)
 
 
-@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
-@pytest.mark.parametrize("split,hidden", FUSED_SPLIT_CASES)
+@_graded_benchmark
 def test_one_shot_allreduce_rmsnorm_split(split, hidden, world_size):
     """A token row spread over ``split`` workgroups.
 
@@ -2081,12 +2278,11 @@ def test_one_shot_allreduce_rmsnorm_split(split, hidden, world_size):
             )
 
 
-@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
-@pytest.mark.parametrize("scale", FUSED_SPLIT_SCALES)
+@_graded_benchmark
 def test_one_shot_allreduce_rmsnorm_split_magnitude(scale, world_size):
     """The fixed-point exchange at both ends of its range.
 
-    A small row puts weight on the exchange's resolution (2**-16 per writer)
+    A small row puts weight on the exchange's resolution (2**-22 per writer)
     and a large one on its range (the per-writer clamp). Both have to stay on
     the same SQNR floor. split=4 at 7168 also exercises the host's fallback to
     the nearest split the width has (2).
@@ -2107,6 +2303,34 @@ def test_one_shot_allreduce_rmsnorm_split_magnitude(scale, world_size):
             )
 
 
+@_graded_benchmark
+def test_fused_allreduce_rmsnorm_capture_ready(world_size):
+    """A warmup at one payload must prepare every rung a capture can pick (see
+    ``_capture_ready_failures``)."""
+    ranks = _fused_spawn(
+        world_size, [(1, FUSED_FRESH_HIDDEN)], mode="fused_capture_ready"
+    )
+    for rank, bad in enumerate(ranks):
+        assert not bad, f"tp={world_size}, rank {rank}: " + "; ".join(bad)
+
+
+@_graded_benchmark
+def test_one_shot_allreduce_rmsnorm_split_exchange(world_size):
+    """A split build's exchange against the unsplit build: NaN rows stay NaN,
+    and small rows keep the resolution the output sees (see
+    ``_split_exchange_failures``)."""
+    ranks = _fused_spawn(
+        world_size,
+        list(SPLIT_EXCHANGE_CASES),
+        mode="fused_split_exchange",
+        split=SPLIT_EXCHANGE_SPLIT,
+    )
+    for rank, shapes in enumerate(ranks):
+        for bad in shapes:
+            assert not bad, f"tp={world_size}, rank {rank}: " + "; ".join(bad)
+
+
+@_graded_benchmark
 def test_one_shot_allreduce_rmsnorm_split_options():
     """``fused_split_options`` is the geometry every split build draws from.
 
@@ -2120,7 +2344,9 @@ def test_one_shot_allreduce_rmsnorm_split_options():
         fused_block_options,
         fused_split_options,
     )
-    from aiter.ops.flydsl.kernels.comm.quick_allreduce_fusions import XCHG_COUNT_BITS
+    from aiter.ops.flydsl.kernels.comm.quick_allreduce_fusions import (
+        XCHG_ARRIVAL_BITS,
+    )
 
     def splits(hidden):
         return {k for k, _b, _a in fused_split_options(hidden)}
@@ -2138,9 +2364,10 @@ def test_one_shot_allreduce_rmsnorm_split_options():
             assert k in SUPPORTED_SPLITS
             assert k * b * a * 8 == hidden and b % 64 == 0, (hidden, k, b, a)
             if k > 1:
-                assert k * (b // 64) < 1 << XCHG_COUNT_BITS, (hidden, k, b, a)
+                assert k * (b // 64) < 1 << XCHG_ARRIVAL_BITS, (hidden, k, b, a)
 
 
+@_graded_benchmark
 def test_one_shot_allreduce_rmsnorm_split_factory():
     """The factory's split contract, GPU-free: what it rejects and what it
     reports.
@@ -2162,7 +2389,7 @@ def test_one_shot_allreduce_rmsnorm_split_factory():
         "hidden": 7168,
         "atoms": 1,
     }
-    with pytest.raises(ValueError, match="only meaningful for a fused"):
+    with _raises(ValueError, match="only meaningful for a fused"):
         mk(
             world_size=4,
             atoms=1,
@@ -2173,16 +2400,16 @@ def test_one_shot_allreduce_rmsnorm_split_factory():
             rank=0,
             split=2,
         )
-    with pytest.raises(ValueError, match="split must be one of"):
+    with _raises(ValueError, match="split must be one of"):
         mk(**base, split=3)
-    with pytest.raises(ValueError, match="needs a native geometry"):
+    with _raises(ValueError, match="needs a native geometry"):
         mk(**{**base, "hidden": 3072, "atoms": 2}, h_pad=4096, split=2)
-    with pytest.raises(ValueError, match="does not divide"):
+    with _raises(ValueError, match="does not divide"):
         mk(**{**base, "grid": 63, "hidden": 4096}, split=7)
-    with pytest.raises(ValueError, match="not a multiple of split"):
+    with _raises(ValueError, match="not a multiple of split"):
         mk(**base, split=7)  # 64 % 7
     # 16 slices of 16 waves: 256 writers, one more than the arrival count holds.
-    with pytest.raises(ValueError, match="counts arrivals"):
+    with _raises(ValueError, match="counts arrivals"):
         mk(**{**base, "hidden": 131072}, split=16)
 
     spec = mk(**base, split=2)
@@ -2196,6 +2423,7 @@ def test_one_shot_allreduce_rmsnorm_split_factory():
     assert unsplit["lds_bytes"] > 0
 
 
+@_graded_benchmark
 def test_one_shot_allreduce_rmsnorm_split_host_resolution():
     """The host side of split, GPU-free: ``_geom_for``, ``_cfg_key`` and the
     launch geometry.
@@ -2244,19 +2472,22 @@ def test_one_shot_allreduce_rmsnorm_split_host_resolution():
     assert E._tiles_and_grid({"grid": 64}, 7168, 3 * row(7168)) == (3, 3)  # unsplit
 
 
+@_graded_benchmark
 def test_one_shot_allreduce_rmsnorm_split_exchange_word():
     """The exchange word's arithmetic, mirrored in Python.
 
     The kernel never resets the word and decodes ``cur - prev`` modulo 2**64,
     so this checks, for writer counts up to the limit and start values that
     wrap: a call is never seen complete before its last writer; a complete
-    call decodes to exactly the sum of its contributions; and no call's sum
-    can carry into the sign bit, whatever the partials -- the per-writer clamp
-    bounds infinities and NaNs too.
+    call decodes to exactly the sum of its contributions; no call's sum can
+    carry into the sign bit, whatever the partials; and a call is poisoned
+    exactly when some partial is not finite or is at or above the per-writer
+    clamp.
     """
     import random
 
     from aiter.ops.flydsl.kernels.comm.quick_allreduce_fusions import (
+        XCHG_ARRIVAL_BITS,
         XCHG_COUNT_BITS,
         XCHG_FIX_BITS,
         XCHG_SUM_BITS,
@@ -2264,18 +2495,19 @@ def test_one_shot_allreduce_rmsnorm_split_exchange_word():
     )
 
     mask = (1 << 64) - 1
-    count_mask = (1 << XCHG_COUNT_BITS) - 1
+    arrival_mask = (1 << XCHG_ARRIVAL_BITS) - 1
 
     def contribution(partial, n):
-        # Mirrors xchg_contribution: a select-based clamp (a NaN compares false
-        # and clamps), then round to the nearest fixed-point unit.
+        # Mirrors xchg_contribution: a partial below the clamp is rounded to
+        # the nearest fixed-point unit; anything else (a NaN compares false)
+        # adds a poison mark and no sum.
         clamp = xchg_clamp_units(n) * 2.0**-XCHG_FIX_BITS
-        u = min(clamp, partial)
-        q = int(u * 2.0**XCHG_FIX_BITS + 0.5)
-        return (q << XCHG_COUNT_BITS) + 1
+        if partial < clamp:
+            return (int(partial * 2.0**XCHG_FIX_BITS + 0.5) << XCHG_COUNT_BITS) + 1
+        return (1 << XCHG_ARRIVAL_BITS) + 1
 
     rng = random.Random(0)
-    for n in (1, 2, 7, 14, 16, 64, 255):
+    for n in (1, 2, 7, 14, 16, 31):
         c = xchg_clamp_units(n)
         assert c & (c - 1) == 0 and n * c < 1 << XCHG_SUM_BITS
         for start in (0, (1 << 64) - (3 << 40), rng.getrandbits(64)):
@@ -2285,7 +2517,7 @@ def test_one_shot_allreduce_rmsnorm_split_exchange_word():
                     rng.choice(
                         (
                             0.0,
-                            rng.random() * 10.0 ** rng.randint(-6, 12),
+                            rng.random() * 10.0 ** rng.randint(-6, 6),
                             1e30,
                             float("inf"),
                             float("nan"),
@@ -2296,10 +2528,14 @@ def test_one_shot_allreduce_rmsnorm_split_exchange_word():
                 adds = [contribution(p, n) for p in partials]
                 rng.shuffle(adds)  # arrival order must not matter
                 for arrived, a in enumerate(adds):
-                    assert ((word - prev) & mask) & count_mask == arrived
+                    assert ((word - prev) & mask) & arrival_mask == arrived
                     word = (word + a) & mask
                 d = (word - prev) & mask
-                assert d & count_mask == n and d < 1 << 63
+                assert d & arrival_mask == n and d < 1 << 63
+                poisoned = (d >> XCHG_ARRIVAL_BITS) & arrival_mask
+                assert poisoned == sum(
+                    not p < xchg_clamp_units(n) * 2.0**-XCHG_FIX_BITS for p in partials
+                )
                 assert d >> XCHG_COUNT_BITS == sum(a >> XCHG_COUNT_BITS for a in adds)
                 prev = word
 
@@ -2373,38 +2609,55 @@ def _verify(args, tps, dts, configs, given, link) -> None:
 
 
 def _verify_fused(tps) -> None:
-    """The fused verify sweep: the shipped engine on ``_FUSED_SHAPE_CASES``,
-    and fresh inputs on the shipped ladder and on a split build."""
+    """The fused verify sweep: the host-side checks once, then every GPU case
+    at each world size, the shipped engine and the pinned and split builds."""
+    _summarize(
+        "fused host-side checks",
+        [
+            test_one_shot_allreduce_rmsnorm_padding_is_least_wire(),
+            test_one_shot_allreduce_rmsnorm_padded_hidden_limits(),
+            test_one_shot_allreduce_rmsnorm_geom_for_pinned_block_pads(),
+            test_one_shot_allreduce_rmsnorm_split_options(),
+            test_one_shot_allreduce_rmsnorm_split_factory(),
+            test_one_shot_allreduce_rmsnorm_split_host_resolution(),
+            test_one_shot_allreduce_rmsnorm_split_exchange_word(),
+        ],
+    )
     for tp in tps:
-        fused_pairs = [(m, h) for m, h, _ in _FUSED_SHAPE_CASES]
-        fused_ranks = _fused_spawn(
-            tp,
-            fused_pairs,
-            mode="fused",
-        )
-        fused_fails = [
-            f"fused tp={tp} rank {r}: {bad}"
-            for r, shape_bads in enumerate(fused_ranks)
-            for bad in shape_bads
-            if bad
-        ]
-        for split in FUSED_FRESH_SPLITS:
-            fresh_ranks = _fused_spawn(
-                tp,
-                [(1, FUSED_FRESH_HIDDEN)],
-                atoms=None,
-                grid_cap=None,
-                fanout=None,
-                split=split,
-                mode="fused_fresh",
-            )
-            fused_fails += [
-                f"fused fresh tp={tp} split={split} rank {r}: {bad}"
-                for r, bad in enumerate(fresh_ranks)
-                if bad
+        rows = (
+            [
+                test_one_shot_allreduce_rmsnorm(m, h, label, tp)
+                for m, h, label in _FUSED_SHAPE_CASES
             ]
-        _FAILURES.extend(fused_fails)
-        aiter.logger.info("fused tp=%s: %d failures", tp, len(fused_fails))
+            + [
+                test_one_shot_allreduce_rmsnorm_padded(m, h, label, tp)
+                for m, h, label in _FUSED_PAD_SHAPE_CASES
+            ]
+            + [
+                test_one_shot_allreduce_rmsnorm_atoms(atoms, h, tp)
+                for atoms, h in FUSED_ATOMS_CASES
+            ]
+            + [
+                test_one_shot_allreduce_rmsnorm_block(block, h, tp)
+                for block, h in FUSED_BLOCK_CASES
+            ]
+            + [
+                test_one_shot_allreduce_rmsnorm_fresh_inputs(split, tp)
+                for split in FUSED_FRESH_SPLITS
+            ]
+            + [test_one_shot_allreduce_rmsnorm_run_ahead(tp)]
+            + [
+                test_one_shot_allreduce_rmsnorm_split(split, h, tp)
+                for split, h in FUSED_SPLIT_CASES
+            ]
+            + [
+                test_one_shot_allreduce_rmsnorm_split_magnitude(scale, tp)
+                for scale in FUSED_SPLIT_SCALES
+            ]
+            + [test_one_shot_allreduce_rmsnorm_split_exchange(tp)]
+            + [test_fused_allreduce_rmsnorm_capture_ready(tp)]
+        )
+        _summarize(f"fused allreduce + rmsnorm tp={tp}", rows)
     _summarize(
         "fused allreduce + rmsnorm production dispatch",
         [
@@ -2889,7 +3142,13 @@ if __name__ == "__main__":
     _rank_parser.add_argument(
         "--mode",
         default="fused",
-        choices=("fused", "fused_run_ahead", "fused_fresh"),
+        choices=(
+            "fused",
+            "fused_run_ahead",
+            "fused_fresh",
+            "fused_split_exchange",
+            "fused_capture_ready",
+        ),
     )
     _rank_parser.add_argument("--tokens", default="")
     _rank_parser.add_argument("--hiddens", default="")

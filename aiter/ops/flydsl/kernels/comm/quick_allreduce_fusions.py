@@ -691,41 +691,49 @@ def rms_rstd(rows, eps, hidden: int, *, tid, block: int, lds=None):
 # A row split over K workgroups joins its sum of squares through one i64 word
 # per (parity, row group) in HBM. Every contributing wave atomically adds
 #
-#     fixed(partial) * 2**XCHG_COUNT_BITS + 1
+#     fixed(partial) * 2**XCHG_COUNT_BITS + 1          a finite partial
+#     (1 << XCHG_ARRIVAL_BITS) + 1                     a poisoned one
 #
-# so the word is ``2**8 * (sum of fixed partials) + (arrivals)`` as a single
-# integer. Integer addition is order-independent, so every rank and every wave
-# decodes bit-identical sums whatever order the waves arrive in -- the property
-# a float atomic_add cannot give. Count and sum move in one atomic op, so a
-# reader that sees the count complete sees the sum complete: no fence needed.
+# so the word is ``2**10 * (sum of fixed partials) + 2**5 * (poisoned) +
+# (arrivals)`` as a single integer. Integer addition is order-independent, so
+# every rank and every wave decodes bit-identical sums whatever order the waves
+# arrive in. Count and sum move in one atomic op, so a reader that sees the count 
+# complete sees the sum complete: no fence needed.
+#
+# A partial that is not finite, or too large for the fixed point, is "poisoned":
+# it adds no sum, only a mark, and a row with any mark decodes as NaN.
 #
 # The word is never reset. A reader keeps the value it last saw complete on
 # this parity (``prev``); ``d = cur - prev`` is this call's contribution, done
-# when ``d % 2**8 == n_writers``, and its sum is ``d >> 8``. Wrap-around of the
+# when ``d % 2**5 == n_writers``, and its sum is ``d >> 10``. Wrap-around of the
 # 64-bit word is harmless: the deltas are exact modulo 2**64.
 
 #: Fixed-point fraction bits of a partial sum of squares.
-XCHG_FIX_BITS = 16
-#: Low bits of the word counting arrivals; one call's writers must fit.
-XCHG_COUNT_BITS = 8
+XCHG_FIX_BITS = 22
+#: Bits of the arrival count, and of the poison count above it. One call's
+#: writers must fit each, since a full field would carry into the next.
+XCHG_ARRIVAL_BITS = 5
+#: Low bits of the word that are not the sum: arrivals, then poisoned writers.
+XCHG_COUNT_BITS = 2 * XCHG_ARRIVAL_BITS
 #: One call's summed fixed-point partials stay below ``2**XCHG_SUM_BITS``, so
-#: ``d`` stays a positive i64 (``2**8 * 2**55 = 2**63``).
-XCHG_SUM_BITS = 55
+#: ``d`` stays a positive i64 (``2**10 * 2**53 = 2**63``).
+XCHG_SUM_BITS = 63 - XCHG_COUNT_BITS
 #: Words live one per cache line, so row groups never share one.
 XCHG_LINE_BYTES = 128
 
 
 def xchg_clamp_units(n_writers: int) -> int:
-    """Largest fixed-point partial one of *n_writers* may contribute.
+    """Largest fixed-point partial, in units, that one of *n_writers* may
+    contribute; a partial at or above it is poisoned instead.
 
-    A power of two, so it is exact in f32 and the clamp cannot round past it;
-    ``n_writers`` of them sum below ``2**XCHG_SUM_BITS``.
+    A power of two, so it is exact in f32; ``n_writers`` of them sum below
+    ``2**XCHG_SUM_BITS``.
     """
     n = int(n_writers)
-    if not 0 < n < (1 << XCHG_COUNT_BITS):
+    if not 0 < n < (1 << XCHG_ARRIVAL_BITS):
         raise ValueError(
-            f"a split-row exchange counts arrivals in {XCHG_COUNT_BITS} bits, so "
-            f"it takes 1..{(1 << XCHG_COUNT_BITS) - 1} writers, got {n}"
+            f"a split-row exchange counts arrivals in {XCHG_ARRIVAL_BITS} bits, so "
+            f"it takes 1..{(1 << XCHG_ARRIVAL_BITS) - 1} writers, got {n}"
         )
     return 1 << (((1 << XCHG_SUM_BITS) - 1) // n).bit_length() - 1
 
@@ -733,26 +741,35 @@ def xchg_clamp_units(n_writers: int) -> int:
 def xchg_contribution(partial, n_writers: int):
     """The i64 a writer adds to the exchange word for its fp32 *partial*.
 
-    ``partial`` is a sum of squares, so ``>= 0``. It is clamped to
-    ``xchg_clamp_units`` first -- with a select on ``partial < clamp``, so a
-    NaN clamps too instead of reaching the float-to-int conversion -- then
-    rounded to the nearest fixed-point unit.
+    ``partial`` is a sum of squares, so ``>= 0``. Below ``xchg_clamp_units`` it
+    is rounded to the nearest fixed-point unit. Otherwise -- too large, or NaN
+    or Inf, which compare false -- the writer is marked poisoned, and the
+    float-to-int conversion never sees the value. Both arms are computed and selected, 
+    so there is no branching.
     """
     clamp = fx.Float32(xchg_clamp_units(n_writers) * 2.0**-XCHG_FIX_BITS)
-    u = (partial < clamp).select(partial, clamp)
+    ok = partial < clamp
+    u = ok.select(partial, fx.Float32(0.0))
     q = fx.Int64(u * fx.Float32(2.0**XCHG_FIX_BITS) + fx.Float32(0.5))
-    return q * fx.Int64(1 << XCHG_COUNT_BITS) + fx.Int64(1)
+    fixed = q * fx.Int64(1 << XCHG_COUNT_BITS) + fx.Int64(1)
+    poison = fx.Int64((1 << XCHG_ARRIVAL_BITS) + 1)
+    return ok.select(fixed, poison)
 
 
 def xchg_arrivals(delta):
-    """Writers that have arrived, from ``cur - prev`` (mod ``2**8``)."""
-    return delta & fx.Int64((1 << XCHG_COUNT_BITS) - 1)
+    """Writers that have arrived, from ``cur - prev`` (mod ``2**5``)."""
+    return delta & fx.Int64((1 << XCHG_ARRIVAL_BITS) - 1)
 
 
 def xchg_total(delta):
-    """The fp32 sum of squares a *complete* ``cur - prev`` carries."""
+    """The fp32 sum of squares a *complete* ``cur - prev`` carries: NaN if any
+    writer was poisoned."""
+    poisoned = (delta >> fx.Int64(XCHG_ARRIVAL_BITS)) & fx.Int64(
+        (1 << XCHG_ARRIVAL_BITS) - 1
+    )
     units = delta // fx.Int64(1 << XCHG_COUNT_BITS)
-    return fx.Float32(units) * fx.Float32(2.0**-XCHG_FIX_BITS)
+    total = fx.Float32(units) * fx.Float32(2.0**-XCHG_FIX_BITS)
+    return (poisoned == fx.Int64(0)).select(total, fx.Float32(float("nan")))
 
 
 def scale_by_weight(values, rstd, w_atoms):

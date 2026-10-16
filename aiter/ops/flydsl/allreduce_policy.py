@@ -57,7 +57,8 @@ have their own tables of both levels: ``FUSED_FAMILY_POLICIES`` and
 ``FUSED_ONESHOT_LADDER``, ``FUSED_MESH_ST_LADDER``, ``FUSED_RING_ST_LADDER``
 plus ``FUSED_QR_ROW_ATOMS``. All three fused families live in one slot
 (``QuickAllReduce``). The overrides are
-``AITER_FLY_AR_FUSED_<ALG>_{MIN,MAX}_BYTES``.
+``AITER_FLY_AR_FUSED_<ALG>_{MIN,MAX}_BYTES``. The one-shot ladder's ``split``
+rungs run unsplit unless ``AITER_FLY_AR_FUSED_SPLIT=1``.
 """
 
 from __future__ import annotations
@@ -1174,8 +1175,17 @@ def fused_oneshot_ladder(
     *, world_size: int, link: str, arch: str | None = None
 ) -> tuple[FusedOneShotRung, ...]:
     """The fused one-shot rungs for *(arch, link, world_size)*. *arch*
-    defaults to this host's."""
-    return _ladder(FUSED_ONESHOT_LADDER, "fused one-shot", arch, link, world_size)
+    defaults to this host's.
+
+    A split rung (``split > 1``) is returned as the same rung unsplit unless
+    ``AITER_FLY_AR_FUSED_SPLIT=1`` (``fused_split_enabled``): its atoms, grid cap
+    and fanout stay, so the unsplit build is the rung's own geometry with the
+    whole row on one workgroup.
+    """
+    rungs = _ladder(FUSED_ONESHOT_LADDER, "fused one-shot", arch, link, world_size)
+    if fused_split_enabled():
+        return rungs
+    return tuple(dataclasses.replace(r, split=1) for r in rungs)
 
 
 def fused_mesh_st_ladder(
@@ -1211,6 +1221,16 @@ FUSED_HIDDENS_ENV = "AITER_FLY_AR_FUSED_HIDDENS"
 
 # The prefix of the fused window overrides, ``<prefix>_<ALG>_{MIN,MAX}_BYTES``.
 FUSED_ENV_PREFIX = "AITER_FLY_AR_FUSED"
+
+# ``1`` lets the fused one-shot ladder split a token row over several
+# workgroups (its ``split`` rungs). Opt-in: unset, ``0`` and anything else run
+# every rung unsplit, one workgroup per row.
+FUSED_SPLIT_ENV = "AITER_FLY_AR_FUSED_SPLIT"
+
+
+def fused_split_enabled() -> bool:
+    """Whether ``AITER_FLY_AR_FUSED_SPLIT=1`` allows split fused one-shot rows."""
+    return os.environ.get(FUSED_SPLIT_ENV, "").strip() == "1"
 
 
 def fused_hiddens(extra: tuple[int, ...] = ()) -> tuple[int, ...]:

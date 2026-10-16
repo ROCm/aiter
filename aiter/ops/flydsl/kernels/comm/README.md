@@ -162,6 +162,24 @@ because the FlyDSL AST rewriter sees only the `@flyc.kernel` body and
 `@flyc.jit` functions. The one-shot's split-row exchange is a `@flyc.jit`
 helper for that reason.
 
+A split row (one token row over several workgroups; opt-in with
+`AITER_FLY_AR_FUSED_SPLIT=1`) joins its sum of squares
+through an integer atomic in HBM, so that every rank decodes the same bits. The
+sum is therefore a fixed-point number, not an fp32 one:
+
+* Resolution is 2**-22 per wave partial. Rows with a tiny RMS (about 1e-3, where
+  `eps` dominates) can differ from the unsplit build in a bf16 ulp on a small
+  share of lanes (under 1%). Ranks still agree bit for bit.
+* A wave partial that is not finite, or too large for the fixed point, makes the
+  row's `out` NaN.
+* The largest sum of squares one wave may contribute depends on the writer
+  count `n = hidden / (512 * atoms)`. With 512 elements per wave that is an element 
+  RMS of about 510 and 360. It bounds a single large element as well: one element 
+  above about 11k (`n <= 15`) or 8k poisons the row even when the row's RMS is small.
+* A split row takes at most 31 writers (5-bit arrival and poison counts), so
+  hidden is limited to about 15.9k at `atoms=1` and 31.7k at `atoms=2`. A wider
+  one has no split build and runs unsplit.
+
 `CudaCommunicator.fused_allreduce_rmsnorm` uses the fused kernels with the
 same split as the plain all-reduce:
 
@@ -271,6 +289,7 @@ the one-shot serves without quantization, set `AITER_FLY_AR_ONESHOT_MAX_BYTES`.
 | Variable | Effect |
 |---|---|
 | `AITER_FLY_AR_FUSED_HIDDENS` | Comma-separated hidden sizes to build at startup, for example `4096,7168`. |
+| `AITER_FLY_AR_FUSED_SPLIT` | `1` lets the fused one-shot split a token row over several workgroups, where its ladder has a split rung. Not set (the default): every rung runs unsplit. Set it the same on every rank. |
 | `AITER_FLY_AR_FUSED_ONESHOT_MIN_BYTES` | The minimum of the fused one-shot window. |
 | `AITER_FLY_AR_FUSED_ONESHOT_MAX_BYTES` | The maximum of the fused one-shot window. |
 | `AITER_FLY_AR_FUSED_MESH_MIN_BYTES` | The minimum of the fused mesh window. |

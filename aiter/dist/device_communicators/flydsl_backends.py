@@ -72,6 +72,8 @@ class FlyDSLAllReduceRMSNorm:
          builds up front and is the deployment answer.
       2. :meth:`prime`, for a caller that learns its widths later.
       3. The first ordinary call at that width, which every warmup pass makes.
+         It primes the whole payload window of the family it runs, not only
+         the rung its own payload selects.
 
       If none of those happened, :meth:`should_fly_fused_ar_rms` **declines
       while a capture is open** rather than building inside it. The capture then
@@ -88,8 +90,9 @@ class FlyDSLAllReduceRMSNorm:
     ):
         self.disabled = True
         self._engines: dict[str, Any] = {}
-        # (family, hidden) pairs that are built *and* JIT-compiled, so a
-        # call on them is a pure launch and safe inside a capture.
+        # (family, hidden) pairs that are built and have every rung of their
+        # payload window JIT-compiled, so a call on them is a pure launch and
+        # safe inside a graph capture.
         self._ready: set[tuple[str, int]] = set()
         self._warned_capture = False
         self._quantized = bool(quantized)
@@ -275,12 +278,19 @@ class FlyDSLAllReduceRMSNorm:
         ]
         if not usable:
             return False
+        for fam, _eng in usable:
+            self._prime_family(fam, hidden)
+        return True
+
+    def _prime_family(self, family: str, hidden: int) -> None:
+        """Build family at hidden and JIT every rung binary its payload
+        window can select."""
+
         preload_fly_engines(
-            ((eng, self._windows[fam].inclusive_range()) for fam, eng in usable),
+            [(self._engines[family], self._windows[family].inclusive_range())],
             hidden,
         )
-        self._ready.update((fam, hidden) for fam, _eng in usable)
-        return True
+        self._ready.add((family, int(hidden)))
 
     def _capture_blocked(self, family: str, hidden: int) -> bool:
         """Whether this call would have to build, with a capture already open.
@@ -344,12 +354,15 @@ class FlyDSLAllReduceRMSNorm:
         nbytes = inp.numel() * inp.element_size()
         family = self.family_for(nbytes)
         eng = self._engines[family]
+        hidden = int(inp.shape[-1])
+        if (family, hidden) not in self._ready:
+            # The first call at a width is eager (the predicate declines inside
+            # a capture), so compile every rung the window can reach now, not
+            # just the one this payload picks.
+            self._prime_family(family, hidden)
         got = eng.allreduce_rmsnorm(
             inp, residual, weight, eps, out=out, residual_out=res_out
         )
-        # Built and JIT-compiled by getting here, so a later call on this
-        # (family, width) is a pure launch and may sit inside a capture.
-        self._ready.add((family, int(inp.shape[-1])))
         return got
 
     def close(self):

@@ -146,16 +146,15 @@ def _xchg_join(word, wave_sum, prev_same, n_writers, tid):
     """Join this wave's sum of squares with every other wave of the row.
 
     ``n_writers`` waves -- every wave of every slice of the row -- each add
-    ``fixed(wave_sum) << 8 | 1`` to the row group's *word* for this colour
-    (``quick_allreduce_fusions.xchg_contribution``), with a relaxed
-    agent-scope 64-bit atomic whose result is left *unused*: that is the
-    no-return form, and a returning one measured ~0.25 us slower. Count and sum
+    their fixed-point sum of squares and an arrival to the row group's *word*
+    for this colour (``quick_allreduce_fusions.xchg_contribution``; a wave
+    whose partial is not finite or is out of range marks the word poisoned
+    instead, and the row's total decodes as NaN), with a relaxed
+    agent-scope 64-bit atomic whose result is left unused. Count and sum
     move in one atomic op, so a wave that sees the count complete sees the sum
-    complete, and no fence orders anything. (On gfx950 the release/acquire
-    fences would be ``buffer_wbl2 sc1`` / ``buffer_inv sc1``: a whole-L2
-    writeback and invalidate.) Integer addition is order-independent, so every
-    wave on every rank decodes the same bits whatever order the writers arrived
-    in.
+    complete, and no fence orders anything. Integer addition is order-independent, 
+    so every wave on every rank decodes the same bits whatever order the writers 
+    arrived in.
 
     The word rotates with the inbox colour, so the group's workgroups, which
     run the same rows from the same colour, agree on it. It is never reset.
@@ -165,10 +164,6 @@ def _xchg_join(word, wave_sum, prev_same, n_writers, tid):
     must pass the other two colours' exchanges, which need every wave's
     contribution there, which each wave makes only after it has finished
     reading this one.
-
-    A ``@flyc.jit`` helper because the leader branch and the spin are runtime
-    control flow, which only a rewritten function may hold. Returns ``(row sum
-    of squares, cur)``; *cur* becomes ``prev`` for this colour's next use.
     """
     if (tid & fx.Int32(WAVE - 1)) == fx.Int32(0):
         fx.atomic_add(

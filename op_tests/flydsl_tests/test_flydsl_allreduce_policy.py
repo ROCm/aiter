@@ -9,6 +9,7 @@ Run with ``pytest op_tests/flydsl_tests/test_flydsl_allreduce_policy.py``.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from types import SimpleNamespace
 from unittest import mock
@@ -621,6 +622,24 @@ def test_fused_ladders_are_well_formed(cell):
         assert r.grid_cap >= 1, r
         assert r.fanout in ("peer", "atom"), r
         assert r.split in SUPPORTED_SPLITS, r
+
+
+def test_fused_oneshot_split_is_opt_in():
+    """Without ``AITER_FLY_AR_FUSED_SPLIT=1`` every fused one-shot rung is
+    unsplit and otherwise the table's rung; with it, the table's splits."""
+    for link, ws, arch in CELLS:
+        kw = {"world_size": ws, "link": link, "arch": arch}
+        table = P.FUSED_ONESHOT_LADDER[(arch, link, ws)]
+        with mock.patch.dict(os.environ):
+            os.environ.pop(P.FUSED_SPLIT_ENV, None)
+            off = P.fused_oneshot_ladder(**kw)
+            os.environ[P.FUSED_SPLIT_ENV] = "0"
+            assert P.fused_oneshot_ladder(**kw) == off
+            os.environ[P.FUSED_SPLIT_ENV] = "1"
+            on = P.fused_oneshot_ladder(**kw)
+        assert on == table
+        assert all(r.split == 1 for r in off)
+        assert off == tuple(dataclasses.replace(r, split=1) for r in table)
 
 
 def test_fused_row_atoms_divide_the_chunk():

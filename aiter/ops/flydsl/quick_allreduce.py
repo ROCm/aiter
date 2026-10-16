@@ -682,6 +682,8 @@ class FlyQuickAllReduceRMSNorm:
             raise ValueError("pin block or atoms_per_row, not both")
         self.block = None if block is None else int(block)
         self.atoms_per_row = None if atoms_per_row is None else int(atoms_per_row)
+        # Widths whose requested ``atoms_per_row`` was substituted, logged once.
+        self._apr_substituted: set[int] = set()
         self._algo = algo
         self._inbox_flags = inbox_flags
         self._has_launched = False
@@ -783,6 +785,24 @@ class FlyQuickAllReduceRMSNorm:
                 block=self.block,
                 atoms_per_row=self.atoms_per_row,
             )
+            if (
+                self.atoms_per_row is not None
+                and apr != self.atoms_per_row
+                and hidden not in self._apr_substituted
+            ):
+                # The width has no block for the requested atoms_per_row, 
+                # so it takes the earest it has.
+                self._apr_substituted.add(hidden)
+                logger.info(
+                    "FlyDSL fused %s: hidden=%d has no native atoms_per_row=%d at "
+                    "world_size=%d; building atoms_per_row=%d (block=%d) instead.",
+                    self._algo,
+                    hidden,
+                    self.atoms_per_row,
+                    self.world_size,
+                    apr,
+                    block,
+                )
             return block, apr, hidden
         opts = self._padded_opts(hidden)
         if not opts:
