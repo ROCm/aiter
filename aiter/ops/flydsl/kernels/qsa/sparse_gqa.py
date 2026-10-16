@@ -143,24 +143,20 @@ def _launch_config(
     return block_n, threads, min(max_useful_splits, target_splits)
 
 
-def _merge_threads(head_dim: int, n_splits: int) -> int:
-    """Workgroup width of the split merge.
+def _merge_slice(head_dim: int) -> int:
+    """D elements one merge workgroup owns.
 
-    Each thread walks every split for its own D element. Past ~128 deep the
-    scheduler serializes that chain, so the workgroup widens instead. It
-    stops at one element per thread: further threads would own no D.
+    The merge is one wave per (row, head, D slice), one element per lane, so
+    the grid scales with D instead of leaving most CUs idle at small batches.
+    Each lane walks every split for its element; ``n_splits`` is at most 128.
     """
-    merge_threads = min(128, head_dim)
-    while merge_threads < head_dim and n_splits * (head_dim // merge_threads) > 128:
-        merge_threads *= 2
-    return merge_threads
+    return 64 if head_dim % 64 == 0 else 32
 
 
 def _k2_coverage_reason(
     head_dim: int,
     block_n: int,
     block_threads: int,
-    n_splits: int,
 ) -> str | None:
     """Why this launch drops a tail of D, or None when every dimension is covered.
 
@@ -168,9 +164,8 @@ def _k2_coverage_reason(
     them per round, and integer division drops a short round (D=32 has no
     round and the builder's ``next`` raises; D=96 gathers 64). The K image
     splits those rounds by a quarter radix of at most 4, so a remainder
-    aliases. A split merge writes ``head_dim // merge_threads`` strides of
-    its workgroup; a one-split launch stores from the split kernel and
-    skips that merge.
+    aliases. The PV tile makes D a multiple of 32, which ``_merge_slice``
+    always divides, so the merge has no tail of its own.
     """
     col_owners = block_threads // block_n
     d_chunks = head_dim // 8
@@ -183,10 +178,6 @@ def _k2_coverage_reason(
     num_waves = block_threads // 64
     if num_waves < 1 or head_dim % (num_waves * 16):
         return f"head_dim {head_dim} does not fill the PV tile"
-    if n_splits > 1:
-        merge_threads = _merge_threads(head_dim, n_splits)
-        if merge_threads < 1 or head_dim % merge_threads:
-            return f"head_dim {head_dim} leaves a merge tail at {merge_threads} threads"
     return None
 
 
@@ -239,11 +230,11 @@ def build_qsa_sparse_gqa_module(
     # The merge reduces LSE in one wave, so a lane owns this many splits.
     merge_per_lane = (n_splits + 63) // 64
     merge_slots = merge_per_lane * 64
-    merge_threads = _merge_threads(head_dim, n_splits)
+    merge_slice = _merge_slice(head_dim)
     # Same predicate qsa_sparse_gqa_supported applies to the selected launch. Raising
     # here keeps a direct builder call from StopIteration on an empty gather
     # or from compiling a kernel that writes only a prefix of D.
-    coverage = _k2_coverage_reason(head_dim, block_n, block_threads, n_splits)
+    coverage = _k2_coverage_reason(head_dim, block_n, block_threads)
     if coverage is not None:
         raise ValueError(coverage)
 
@@ -339,7 +330,6 @@ def build_qsa_sparse_gqa_module(
     @fx.struct
     class MergeStorage:
         weights: fx.Array[Float32, merge_slots, 16]
-        denominator: fx.Array[Float32, 1, 16]
 
     @flyc.kernel(
         name="qsa_sparse_gqa_split_"
@@ -1250,8 +1240,8 @@ def build_qsa_sparse_gqa_module(
 
     @flyc.kernel(
         name="qsa_sparse_gqa_merge_"
-        + kernel_signature(ns=n_splits, blk=merge_threads, d=head_dim),
-        known_block_size=[merge_threads, 1, 1],
+        + kernel_signature(ns=n_splits, ds=merge_slice, d=head_dim),
+        known_block_size=[64, 1, 1],
     )
     def merge_kernel(
         partial_out: fx.Tensor,
@@ -1260,10 +1250,10 @@ def build_qsa_sparse_gqa_module(
     ):
         row = Int32(gpu.block_id("x"))
         head = Int32(gpu.block_id("y"))
-        tid = Int32(gpu.thread_id("x"))
-        lane = tid % Int32(64)
+        d_slice = Int32(gpu.block_id("z"))
+        lane = Int32(gpu.thread_id("x"))
         zero_f = Float32(0.0)
-        # One wave reduces the LSEs, so past 64 splits a lane owns several.
+        # The wave reduces the LSEs, so past 64 splits a lane owns several.
         lses = []
         for j in range_constexpr(merge_per_lane):
             s = lane + Int32(j * 64)
@@ -1280,29 +1270,23 @@ def build_qsa_sparse_gqa_module(
 
         merge_storage = fx.SharedAllocator().allocate(MergeStorage).peek()
         weights = merge_storage.weights.view(fx.make_layout(merge_slots, 1))
-        denominator = merge_storage.denominator.view(fx.make_layout(1, 1))
 
         den = zero_f
         for j in range_constexpr(merge_per_lane):
             w = (lses[j] > Float32(_LSE_EMPTY)).select(_exp2(lses[j] - lse_max), zero_f)
-            if tid < Int32(64):
-                weights[lane + Int32(j * 64)] = w
+            weights[lane + Int32(j * 64)] = w
             den = den + w
         for sh in (32, 16, 8, 4, 2, 1):
             den = den + den.shuffle_xor(Int32(sh), Int32(64))
-
-        if tid == Int32(0):
-            denominator[0] = den
         gpu.barrier()
 
-        for di in range_constexpr(head_dim // merge_threads):
-            d = tid + Int32(di * merge_threads)
+        if lane < Int32(merge_slice):
+            d = d_slice * Int32(merge_slice) + lane
             merged = zero_f
             for s in range_constexpr(n_splits):
                 part = Float32(partial_out[Int32(s), row, head, d])
                 merged = merged + weights[Int32(s)] * part
-            den_f = denominator[0]
-            value = (den_f > zero_f).select(merged / den_f, zero_f)
+            value = (den > zero_f).select(merged / den, zero_f)
             out[row, head, d] = value.to(BFloat16)
 
     @flyc.jit
@@ -1348,8 +1332,8 @@ def build_qsa_sparse_gqa_module(
         )
         if n_splits > 1:
             merge_kernel(partial_out, partial_lse, out).launch(
-                grid=(rows, n_heads, 1),
-                block=(merge_threads, 1, 1),
+                grid=(rows, n_heads, head_dim // merge_slice),
+                block=(64, 1, 1),
                 stream=stream,
             )
 
