@@ -7,6 +7,10 @@ Separated rope by default; --qk_rope_head_dim 0 runs the rope-free geometry.
 The cache is flushed between iterations by default. Leaving it warm lets the loop
 re-read its KV and flatters decode shapes badly.
 
+On an arch that takes the fp8_scalar cache the plot has three series: the bf16
+cache with bf16 dots, the fp8 cache with bf16 dots, and the fp8 cache with fp8
+dots. Elsewhere only the bf16 cache is run.
+
 Usage:
   python op_tests/op_benchmarks/triton/bench_sparse_mla.py
   python op_tests/op_benchmarks/triton/bench_sparse_mla.py --num_seqs 1 --num_tokens 8192
@@ -23,6 +27,7 @@ from torch.profiler import ProfilerActivity, profile
 
 from aiter.ops.triton.attention.sparse_mla import (
     FP8_ARCHS,
+    FP8_SCALAR_ARCHS,
     SUPPORTED_ARCHS,
     sparse_mla_fwd,
 )
@@ -76,7 +81,7 @@ def device_time_ms(func, warmup=25, rep=100, flush=True):
     return total / rep / 1e3
 
 
-def bytes_moved(num_tokens, num_heads, nnz, kv_elem_bytes, d_qk=D_QK):
+def bytes_moved(num_tokens, num_heads, nnz, kv_elem_bytes, q_elem_bytes, d_qk=D_QK):
     """Bytes the launch actually moves, counting rows as gathered.
 
     Split-K partials are left out: the split count is the kernel's own decision,
@@ -84,7 +89,7 @@ def bytes_moved(num_tokens, num_heads, nnz, kv_elem_bytes, d_qk=D_QK):
     """
     kv = nnz * d_qk * kv_elem_bytes  # the gather, and the bulk of it
     idx = nnz * 4  # int32 index stream, read once
-    q = num_tokens * num_heads * d_qk * kv_elem_bytes
+    q = num_tokens * num_heads * d_qk * q_elem_bytes
     out = num_tokens * num_heads * KV_LORA_RANK * 2
     return kv + idx + q + out
 
@@ -130,7 +135,8 @@ def build_case(
     indptr = torch.zeros(len(lens) + 1, dtype=torch.int32)
     indptr[1:] = torch.tensor(lens, dtype=torch.int32).cumsum(0)
 
-    # fp8 dots want the flat per-tensor format; bf16 dots read kv as it is.
+    # The two fp8-cache series read this per-tensor encoding. The bf16-cache
+    # series reads kv as it is.
     scale = (kv.float().abs().amax() / E4M3_MAX).clamp_min(1e-30).reshape(1)
     kv_fp8 = ((kv.float() / scale).clamp(-E4M3_MAX, E4M3_MAX).to(E4M3_DTYPE)).view(
         torch.uint8
@@ -160,19 +166,21 @@ def run_benchmark(args):
         for tokens in args.num_tokens
     ]
 
-    # sparse_mla_fwd raises on fp8 where the arch's native fp8 is not OCP e4m3,
-    # and triton's harness does not catch it, so drop the series instead.
+    # sparse_mla_fwd raises on an fp8 cache outside FP8_SCALAR_ARCHS, and
+    # triton's harness does not catch it, so drop those series instead.
+    # "bf16" is the bf16 cache. "fp8-bf16" is the fp8 cache with bf16 dots,
+    # the middle of the three; "fp8" is the fp8 cache with fp8 dots.
     dot_vals = ["bf16"]
-    dot_names = ["bf16 dots"]
+    dot_names = ["bf16 cache"]
     dot_styles = [("green", "-")]
-    if arch_info.get_arch() in FP8_ARCHS:
-        dot_vals.append("fp8")
-        dot_names.append("fp8 dots")
-        dot_styles.append(("blue", "-"))
+    if arch_info.get_arch() in FP8_SCALAR_ARCHS:
+        dot_vals += ["fp8-bf16", "fp8"]
+        dot_names += ["fp8 cache, bf16 dots", "fp8 cache, fp8 dots"]
+        dot_styles += [("darkorange", "-"), ("blue", "-")]
     else:
         print(
-            f"note: skipping the fp8-dot series, {arch_info.get_arch()}'s native "
-            "fp8 is fnuz and the kernel reads OCP e4m3"
+            f"note: skipping the fp8-cache series, {arch_info.get_arch()} has no "
+            "fp8 cache"
         )
 
     benchmark = triton.testing.Benchmark(
@@ -204,11 +212,17 @@ def run_benchmark(args):
             dtype=torch.bfloat16,
             device=q.device,
         )
-        if dots == "fp8":
-            # Hand q over already quantized, the way production does.
-            cache, scale = kv_fp8, kv_scale
-            q_scale = (q.float().abs().amax() / E4M3_MAX).clamp_min(1e-30).reshape(1)
-            q = (q.float() / q_scale).clamp(-E4M3_MAX, E4M3_MAX).to(E4M3_DTYPE)
+        fp8_cache = dots != "bf16"
+        precision = "fp8" if dots == "fp8" else "bf16"
+        if fp8_cache:
+            cache, scale, q_scale = kv_fp8, kv_scale, None
+            if precision == "fp8" and arch_info.get_arch() in FP8_ARCHS:
+                # Hand q over already quantized, the way production does. The
+                # other archs take bf16 q only and quantize it inside the kernel.
+                q_scale = (
+                    (q.float().abs().amax() / E4M3_MAX).clamp_min(1e-30).reshape(1)
+                )
+                q = (q.float() / q_scale).clamp(-E4M3_MAX, E4M3_MAX).to(E4M3_DTYPE)
         else:
             cache, scale, q_scale = kv, None, None
 
@@ -223,7 +237,7 @@ def run_benchmark(args):
                 kv_scale=scale,
                 qk_rope_head_dim=rope,
                 q_scale=q_scale,
-                dot_precision=dots,
+                dot_precision=precision,
                 out=out,
             )
 
@@ -234,7 +248,12 @@ def run_benchmark(args):
         # QK reads the whole row, PV only the latent half
         flops = 2.0 * num_heads * nnz * (d_qk + KV_LORA_RANK)
         moved = bytes_moved(
-            num_tokens, num_heads, nnz, 1 if dots == "fp8" else 2, d_qk=d_qk
+            num_tokens,
+            num_heads,
+            nnz,
+            cache.element_size(),
+            q.element_size(),
+            d_qk=d_qk,
         )
 
         if metric == "time":
