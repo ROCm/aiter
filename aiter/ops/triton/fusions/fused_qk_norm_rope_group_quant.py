@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-
 import torch
 
 from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_qk_norm_rope_group_quant import (
@@ -57,9 +54,7 @@ def fused_qk_norm_rope_group_quant(
     assert head_dim == HEAD_DIM and num_heads % 8 == 0
     assert kv.shape == (num_tokens, head_dim)
     assert cos.shape[1] == ROPE_DIM // 2 and cos.is_contiguous() and sin.is_contiguous()
-    # The kernel uses fixed row strides for q and the SWA cache.
     assert q.is_contiguous() and swa_nope.is_contiguous() and swa_rope.is_contiguous()
-    # The TDM loads need contiguous rows on 16-byte boundaries.
     assert kv.stride(1) == 1 and kv.stride(0) * kv.element_size() % 16 == 0
     assert q.data_ptr() % 16 == 0 and kv.data_ptr() % 16 == 0
 
@@ -73,10 +68,7 @@ def fused_qk_norm_rope_group_quant(
     k_rope = torch.empty((num_tokens, ROPE_DIM), dtype=q.dtype, device=q.device)
     _LOGGER.info("FUSED_QK_NORM_ROPE_GROUP_QUANT: T=%d H=%d", num_tokens, num_heads)
 
-    # Measured on gfx1250. waves_per_eu is the number of waves on each SIMD that the
-    # register use must allow. Up to T = 512, steps of 4 rows fit 9 waves. Above
-    # T = 512, steps of 8 rows run fewer instructions and fit 6 waves. T <= 256
-    # needs 4 heads per program to make enough programs.
+
     if num_tokens <= 256:
         heads_per_program, rows_per_step, waves_per_eu = 4, 4, 9
     elif num_tokens <= 512:
