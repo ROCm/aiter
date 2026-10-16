@@ -36,7 +36,7 @@ def dispatch(monkeypatch):
         state.norms.append((stage, weight, eps, out))
         return out
 
-    monkeypatch.setattr(seam, "_arch", lambda index: "gfx942")
+    monkeypatch.setattr(seam, "get_gfx_runtime", lambda: "gfx942")
     monkeypatch.setattr(seam, "_cu_num", lambda: 304)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda device: state.stream)
