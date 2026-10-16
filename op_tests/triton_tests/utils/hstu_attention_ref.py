@@ -78,7 +78,7 @@ def jagged_to_padded_dense(
 def pad_sequence(q: torch.Tensor, seq_offsets: torch.Tensor, N: int, padding_value):
     L, D = q.shape
     padded_q = jagged_to_padded_dense(
-        q.reshape(L, D), offsets=seq_offsets, max_seq_len=N, padding_value=0.0
+        q.reshape(L, D), offsets=seq_offsets, max_seq_len=N, padding_value=padding_value
     )
 
     return padded_q
