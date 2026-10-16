@@ -185,7 +185,7 @@ def _reference_regions(config, tile_m):
         )
         regions += [
             ("ep_rowmap", (rows + 1) * 8),
-            ("compact_hist", 2 * hist * 4),
+            ("compact_hist", hist * 4),
             ("compact_done", compact_done_nbytes()),
         ]
     if recipe.combine is C.FUSED_SCATTER:
@@ -488,10 +488,6 @@ def test_recv_token_bound_out_of_range(mori, dispatch, wire):
         stage.dispatch(x, wts, ids, recv_token_bound=over)
     with pytest.raises(ValueError, match="^" + message):
         stage.dispatch(x, wts, ids, recv_token_bound=0)
-    with pytest.raises(ValueError, match="^next_" + message):
-        stage.dispatch(x, wts, ids, next_topk_ids=ids, next_recv_token_bound=over)
-    with pytest.raises(ValueError, match="^" + message):
-        stage.prefetch(ids, over)
     with pytest.raises(ValueError, match="^" + message):
         stage.warmup(over)
 
@@ -511,14 +507,3 @@ def test_compact_default_bound_is_the_capacity(mori):
     # What a rank receives depends on its peers' token counts, not its own.
     assert stage._recv_bound(None) == config.max_recv
     assert stage._recv_bound(5) == 5
-
-
-def test_compact_refuses_a_plan_started_for_another_alignment(mori):
-    config = _config(D.COMPACT, C.FUSED_SCATTER, "fp4", ("bf16",), 4, 7168, 8, 16, 8)
-    stage = recipe._stage_classes(config.recipe)[0](config, None)
-    stage._plan_pending, stage._pending_align = True, COMPACT_TILE // 2
-    x = torch.zeros(4, 7168, dtype=torch.bfloat16)
-    ids = torch.zeros(4, 8, dtype=torch.int32)
-    wts = torch.zeros(4, 8, dtype=torch.float32)
-    with pytest.raises(ValueError, match="the compact plan already started"):
-        stage.dispatch(x, wts, ids, recv_token_bound=8)

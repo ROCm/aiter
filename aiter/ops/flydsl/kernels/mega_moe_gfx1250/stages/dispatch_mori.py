@@ -140,16 +140,12 @@ class _MoriDispatch(_Dispatch):
         topk_ids: torch.Tensor,
         *,
         recv_token_bound: int | None = None,
-        next_topk_ids: torch.Tensor | None = None,
-        next_recv_token_bound: int | None = None,
         begin_step: bool = True,
     ) -> _DispatchBatch:
-        """``recv_token_bound`` cuts the recv rows the GEMM is shown. There is no
-        plan to run ahead, so the next layer's ids go unused."""
+        """``recv_token_bound`` cuts the recv rows the GEMM is shown."""
         config, res = self.config, self.res
         token_count = hidden_states.shape[0]
         _check_recv_token_bound(config, "recv_token_bound", recv_token_bound)
-        _check_recv_token_bound(config, "next_recv_token_bound", next_recv_token_bound)
         plan = self._plans[_pick(self.schedule, token_count)]
         payload, scales_ptr = self._quantize(hidden_states, token_count)
         # No total_recv.zero_(): the dispatch overwrites it (see
@@ -187,10 +183,6 @@ class _MoriDispatch(_Dispatch):
             routing=self._routing(token_count),
             layout=BatchLayout.TOKEN_MAJOR,
         )
-
-    def prefetch(self, topk_ids, recv_token_bound=None) -> None:
-        """Nothing to run ahead: the plan is the dispatch."""
-        _check_recv_token_bound(self.config, "recv_token_bound", recv_token_bound)
 
     def warmup(self, recv_token_bound=None, token_count=None) -> None:
         """Nothing to compile ahead: every plan was built with the arena."""

@@ -176,9 +176,9 @@ class _CompactDispatch(_Dispatch):
     expert and padded to the GEMM tile, the layout the grouped GEMM reads in
     place.
 
-    The plan needs only topk_ids, so it runs on a side stream ahead of the
-    dispatch. Two hist/done slots and local tok_map/psum buffers let the next
-    layer's plan overlap this layer's expert GEMM.
+    The plan needs this layer's topk_ids, so it runs on a side stream and can
+    only overlap what the main stream does before the dispatch (the activation
+    quant).
 
     Recv slots are reserved one atomic per (block, peer) and handed out
     block-local. The TDM staging arrays stand in for the HIP kernel's
@@ -192,7 +192,6 @@ class _CompactDispatch(_Dispatch):
     uses_mori = False
     # The plan reserves the recv slots itself.
     provides_aggregated_reservation = False
-    _PLAN_SLOTS = 2
 
     def __init__(self, config: MegaMoEConfig, caps=None):
         # Decode walks routes, prefill tokens (see _DISPATCH_COMPACT).
@@ -210,9 +209,6 @@ class _CompactDispatch(_Dispatch):
             align_m=self.compact.tile_m,
             rows=self.compact.cap,
         )
-        self._slot = 0
-        self._plan_pending = False
-        self._pending_align = None  # the alignment the pending plan writes
         self._plan_launches = {}
 
     @classmethod
@@ -257,7 +253,7 @@ class _CompactDispatch(_Dispatch):
             "out_wts": max_recv * topk * 4,
             "disp_out": geo.cap * geo.wire_row,
             "ep_rowmap": (geo.cap + 1) * 8,
-            "compact_hist": 2 * geo.hist_stride * 4,
+            "compact_hist": geo.hist_stride * 4,
             "compact_done": compact_done_nbytes(),
         }
 
@@ -269,43 +265,27 @@ class _CompactDispatch(_Dispatch):
         device = res.total_recv.device
         epr = config.experts_per_rank
         segs = config.world_size * epr
-        slots = range(self._PLAN_SLOTS)
-        # Slot 0 writes the shared map, slot 1 its own.
-        self._tok_maps = [res.token_destination_map] + [
-            torch.full_like(res.token_destination_map, -1) for _ in slots[1:]
-        ]
-        self._masked_ms = [
-            torch.zeros(epr, dtype=torch.int32, device=device) for _ in slots
-        ]
+        self._masked_m = torch.zeros(epr, dtype=torch.int32, device=device)
         # The per-rank scatter's run table rides behind psum, so gemm2 finds it
-        # through the m-tile map it already takes, double-buffered with it.
+        # through the m-tile map it already takes.
         psum_tail = (
             compact_comb_tab_dwords(npes=config.world_size, experts_per_rank=epr)
             if config.per_rank_scatter
             else 0
         )
-        self._psums = [
-            torch.zeros(epr + psum_tail, dtype=torch.int32, device=device)[:epr]
-            for _ in slots
+        self._psum = torch.zeros(epr + psum_tail, dtype=torch.int32, device=device)[
+            :epr
         ]
-        self._comb_slots = [
-            (
-                torch.full_like(res.token_destination_map, -1)
-                if config.per_rank_scatter
-                else None
-            )
-            for _ in slots
-        ]
-        self._block_hists = [
-            torch.empty(PLAN_BLOCKS * segs, dtype=torch.int32, device=device)
-            for _ in slots
-        ]
-        self._send_bases = [
-            torch.empty(segs, dtype=torch.int32, device=device) for _ in slots
-        ]
-        self._barriers = [
-            torch.zeros(4, dtype=torch.int32, device=device) for _ in slots
-        ]
+        self._comb_slot = (
+            torch.full_like(res.token_destination_map, -1)
+            if config.per_rank_scatter
+            else None
+        )
+        self._block_hist = torch.empty(
+            PLAN_BLOCKS * segs, dtype=torch.int32, device=device
+        )
+        self._send_base = torch.empty(segs, dtype=torch.int32, device=device)
+        self._barrier = torch.zeros(4, dtype=torch.int32, device=device)
         # The grouped GEMM reads the compact rows' experts off the plan, so it
         # is handed placeholders for the per-row routing.
         self._dummy_ids = torch.zeros(
@@ -316,10 +296,9 @@ class _CompactDispatch(_Dispatch):
         )
         self._plan_stream = torch.cuda.Stream()
         self._plan_event = torch.cuda.Event()
-        # Warm both hist/done slots and the capacity bucket: compiling inside
-        # graph capture is not allowed.
-        for slot in slots:
-            self._plan_for(geo.tile_m, slot)
+        # Warm the capacity bucket: compiling inside graph capture is not
+        # allowed.
+        self._plan_for(geo.tile_m)
         self._kernels = self._build_kernels()
         # Width in whatever recv_dtype counts: bytes on both quantizing wires.
         width = (
@@ -429,42 +408,30 @@ class _CompactDispatch(_Dispatch):
         topk_ids: torch.Tensor,
         *,
         recv_token_bound: int | None = None,
-        next_topk_ids: torch.Tensor | None = None,
-        next_recv_token_bound: int | None = None,
         begin_step: bool = True,
     ) -> _DispatchBatch:
         """Compact cannot slice recv_x -- the rows are grouped per expert, not
         token-major -- so ``recv_token_bound`` is spent on the step's geometry
         instead: it picks the plan's alignment, the GEMM's tile and the GEMM's
-        grid. ``next_topk_ids`` starts the next layer's plan once this dispatch
-        is issued."""
+        grid."""
         config, res = self.config, self.res
         token_count = int(hidden_states.shape[0])
         _check_recv_token_bound(config, "recv_token_bound", recv_token_bound)
-        _check_recv_token_bound(config, "next_recv_token_bound", next_recv_token_bound)
         if begin_step:
             self._step = self._step_for(self._recv_bound(recv_token_bound))
-        if self._plan_pending and self._pending_align != self._step.align_m:
-            raise ValueError(
-                "the compact plan already started for this step aligns each "
-                f"expert's rows to {self._pending_align}, but "
-                f"recv_token_bound={recv_token_bound} needs {self._step.align_m}; "
-                "pass the bound the plan was started with"
-            )
         kernel = self._kernels[_pick(self.schedule, token_count)]
-        if not self._plan_pending:
-            self._launch_plan(topk_ids, token_count, self._slot, self._step.align_m)
+        step = self._step
+        self._launch_plan(topk_ids, token_count, step.align_m)
         stream = fx.Stream(torch.cuda.current_stream())
         payload, scales_ptr = self._quantize(hidden_states, token_count)
         self._wait_plan()
-        slot, step = self._slot, self._step
         _run_compiled(
             kernel,
             res.arena.handle,
             payload.data_ptr(),
             topk_ids.data_ptr(),
             topk_weights.data_ptr(),
-            self._tok_maps[slot].data_ptr(),
+            res.token_destination_map.data_ptr(),
             res.destination_peer_counter.data_ptr(),
             res.dispatch_barrier.data_ptr(),
             res.total_recv.data_ptr(),
@@ -481,11 +448,11 @@ class _CompactDispatch(_Dispatch):
             topk_ids=self._dummy_ids,
             scales=self.recv_scales,
             num_local_tokens=None,
-            routing=self._routing(token_count, self._comb_slots[slot]),
+            routing=self._routing(token_count, self._comb_slot),
             layout=BatchLayout.EXPERT_GROUPED,
             grouping=ExpertGrouping(
-                masked_m=self._masked_ms[slot],
-                psum=self._psums[slot],
+                masked_m=self._masked_m,
+                psum=self._psum,
                 ep_rowmap=self._ep_rowmap,
                 wire_row_stride=self.compact.wire_row,
                 recv_bound=step.recv_bound,
@@ -493,31 +460,14 @@ class _CompactDispatch(_Dispatch):
                 rows=step.rows,
             ),
         )
-        if next_topk_ids is not None and int(next_topk_ids.shape[0]) > 0:
-            # Dispatch of this layer is done, so tok_map[slot] is free. GEMM
-            # still reads psum/masked_m of this slot; the next plan writes the
-            # other slot and overlaps the expert GEMM (and later combine/RMS).
-            nxt = 1 - slot
-            count = int(next_topk_ids.shape[0])
-            ahead = self._step_for(self._recv_bound(next_recv_token_bound))
-            self._launch_plan(next_topk_ids, count, nxt, ahead.align_m)
-            self._slot = nxt
         return batch
 
-    def prefetch(self, topk_ids, recv_token_bound=None) -> None:
-        """Launch the plan for ``topk_ids`` on the side stream, into this step."""
-        _check_recv_token_bound(self.config, "recv_token_bound", recv_token_bound)
-        token_count = int(topk_ids.shape[0])
-        self._step = self._step_for(self._recv_bound(recv_token_bound))
-        self._launch_plan(topk_ids, token_count, self._slot, self._step.align_m)
-
     def warmup(self, recv_token_bound=None, token_count=None) -> None:
-        """Compile the plan this bound's tile needs, in both slots.
+        """Compile the plan this bound's tile needs.
         ``token_count`` is unused: the bound alone picks the tile."""
         _check_recv_token_bound(self.config, "recv_token_bound", recv_token_bound)
         self._step = self._step_for(self._recv_bound(recv_token_bound))
-        for slot in range(self._PLAN_SLOTS):
-            self._plan_for(self._step.align_m, slot)
+        self._plan_for(self._step.align_m)
 
     def _recv_bound(self, recv_token_bound: int | None) -> int:
         """This step's recv bound: the caller's, already checked, else the
@@ -545,23 +495,21 @@ class _CompactDispatch(_Dispatch):
         )
         return _CompactStep(recv_bound=bound, align_m=align_m, rows=min(rows, geo.cap))
 
-    def _plan_for(self, align_m: int, slot: int):
+    def _plan_for(self, align_m: int):
         """The compact-plan launch that aligns each expert's rows to ``align_m``.
 
-        Compiled per alignment and hist/done slot, because the plan and the
-        expert GEMM must agree on the tile, and double-buffered plans must not
-        share a done counter.
+        Compiled per alignment, because the plan and the expert GEMM must agree
+        on the tile.
         """
         from ..compact_plan import compile_tdm_compact_plan
 
-        key = (int(align_m), int(slot))
-        launch = self._plan_launches.get(key)
+        align_m = int(align_m)
+        launch = self._plan_launches.get(align_m)
         if launch is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
-                    f"compact plan for align_m={key[0]} slot={key[1]} was not "
-                    "compiled before graph capture; warm this token bucket "
-                    "eagerly first"
+                    f"compact plan for align_m={align_m} was not compiled "
+                    "before graph capture; warm this token bucket eagerly first"
                 )
             config, geo, arena = self.config, self.compact, self.res.arena
             launch = compile_tdm_compact_plan(
@@ -569,33 +517,33 @@ class _CompactDispatch(_Dispatch):
                 npes=config.world_size,
                 experts_per_rank=config.experts_per_rank,
                 topk=config.topk,
-                tile_m=key[0],
+                tile_m=align_m,
                 # The arena's row count, not this step's: the plan bounds what it
                 # may write against the region it writes into.
                 compact_cap=geo.cap,
-                off_hist=arena.offset("compact_hist") + key[1] * geo.hist_stride * 4,
-                off_done=arena.offset("compact_done") + key[1] * 4,
+                off_hist=arena.offset("compact_hist"),
+                off_done=arena.offset("compact_done"),
                 hist_stride=geo.hist_stride,
                 max_routes=geo.max_routes,
                 hist_pingpong=False,
                 dense_comb=config.per_rank_scatter,
             )
             # Compiled now, without a launch, so a graph capture never has to.
-            _preload_compiled(launch, *self._plan_args(0, 0, key[1]))
-            self._plan_launches[key] = launch
+            _preload_compiled(launch, *self._plan_args(0, 0))
+            self._plan_launches[align_m] = launch
         return launch
 
-    def _plan_args(self, topk_ids_ptr: int, token_count: int, slot: int) -> tuple:
-        comb_slot = self._comb_slots[slot]
+    def _plan_args(self, topk_ids_ptr: int, token_count: int) -> tuple:
+        comb_slot = self._comb_slot
         return (
             self.res.arena.handle,
             topk_ids_ptr,
-            self._tok_maps[slot].data_ptr(),
-            self._block_hists[slot].data_ptr(),
-            self._send_bases[slot].data_ptr(),
-            self._masked_ms[slot].data_ptr(),
-            self._psums[slot].data_ptr(),
-            self._barriers[slot].data_ptr(),
+            self.res.token_destination_map.data_ptr(),
+            self._block_hist.data_ptr(),
+            self._send_base.data_ptr(),
+            self._masked_m.data_ptr(),
+            self._psum.data_ptr(),
+            self._barrier.data_ptr(),
             comb_slot.data_ptr() if comb_slot is not None else 0,
             self.config.rank,
             token_count,
@@ -603,24 +551,22 @@ class _CompactDispatch(_Dispatch):
         )
 
     def _launch_plan(
-        self, topk_ids: torch.Tensor, token_count: int, slot: int, align_m: int
+        self, topk_ids: torch.Tensor, token_count: int, align_m: int
     ) -> None:
+        """Launch the plan on a side stream. It needs this layer's ``topk_ids``,
+        so it can only overlap what the main stream does before the dispatch
+        (the activation quant)."""
         plan_stream = self._plan_stream
         plan_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(plan_stream):
             _run_compiled(
-                self._plan_for(align_m, slot),
-                *self._plan_args(topk_ids.data_ptr(), token_count, slot),
+                self._plan_for(align_m),
+                *self._plan_args(topk_ids.data_ptr(), token_count),
             )
         self._plan_event.record(plan_stream)
-        self._plan_pending = True
-        self._pending_align = align_m
 
     def _wait_plan(self) -> None:
-        if not self._plan_pending:
-            return
         torch.cuda.current_stream().wait_event(self._plan_event)
-        self._plan_pending = False
 
     def close(self) -> None:
         """Nothing to release: its kernels and buffers are not held by mori."""
