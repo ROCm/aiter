@@ -144,6 +144,17 @@ def _sparse_recipe_params(names=None, block_tile=None):
     ]
 
 
+def _sparse_recipe_tile_params():
+    """_sparse_recipe_params() plus a block_tile: None for each recipe's default, then 64x64."""
+    return [
+        pytest.param(*p.values, None, marks=p.marks, id=p.id)
+        for p in _sparse_recipe_params()
+    ] + [
+        pytest.param(*p.values, _MHA_V4_FINE_TILE, marks=p.marks, id=f"{p.id}-64x64")
+        for p in _sparse_recipe_params(block_tile=_MHA_V4_FINE_TILE)
+    ]
+
+
 def _recipe_name_params(names):
     """pytest params of recipe names, each skipped where its row is not shipped."""
     return [
@@ -351,20 +362,29 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
 
 
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
-@pytest.mark.parametrize(("q_format", "v_format", "kwargs"), _sparse_recipe_params())
-def test_mha_v4_sparse_all_true_mask_matches_dense(q_format, v_format, kwargs):
+@pytest.mark.parametrize(
+    ("q_format", "v_format", "kwargs", "block_tile"), _sparse_recipe_tile_params()
+)
+def test_mha_v4_sparse_all_true_mask_matches_dense(
+    q_format, v_format, kwargs, block_tile
+):
     torch.manual_seed(41)
     q = torch.randn((1, 511, 5, 128), device="cuda", dtype=torch.bfloat16)
     k = torch.randn((1, 512, 5, 128), device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
+    if block_tile is None:
+        block_tile = mha_v4_block_tile(
+            _recipe_operands(q_format, v_format, kwargs), MHA_V4_SPARSE_MODE
+        )
+    q_tile, kv_tile = block_tile
     mask = torch.ones(
-        (1, 5, 2, 512 // _default_kv_tile(q_format, v_format)),
+        (1, 5, -(-511 // q_tile), 512 // kv_tile),
         device="cuda",
         dtype=torch.bool,
     )
     formats = (q_format, q_format, v_format)
     dense = mha_v4(q, k, v, *formats, **kwargs)
-    sparse = mha_v4(q, k, v, *formats, block_mask=mask, **kwargs)
+    sparse = mha_v4(q, k, v, *formats, block_mask=mask, block_tile=block_tile, **kwargs)
     torch.cuda.synchronize()
     _assert_sparse_matches_dense(sparse, dense)
 
@@ -372,15 +392,7 @@ def test_mha_v4_sparse_all_true_mask_matches_dense(q_format, v_format, kwargs):
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 rows are ragged")
 @pytest.mark.parametrize("tail", [44, 5])
 @pytest.mark.parametrize(
-    ("q_format", "v_format", "kwargs", "block_tile"),
-    [
-        pytest.param(*p.values, None, marks=p.marks, id=p.id)
-        for p in _sparse_recipe_params()
-    ]
-    + [
-        pytest.param(*p.values, _MHA_V4_FINE_TILE, marks=p.marks, id=f"{p.id}-64x64")
-        for p in _sparse_recipe_params(block_tile=_MHA_V4_FINE_TILE)
-    ],
+    ("q_format", "v_format", "kwargs", "block_tile"), _sparse_recipe_tile_params()
 )
 def test_mha_v4_sparse_masks_a_ragged_last_block(
     q_format, v_format, kwargs, block_tile, tail
@@ -1147,10 +1159,28 @@ _LSE_FP6_P_IDS = ("mxfp4_fp6p", "mxfp6_fp6p", "f8f6_fp6p", "f6f4_fp6p")
 _LSE_SPARSE_IDS = ("bf16", "bf16fp8", "fp8", "i8fp8", "mxfp8", "f6f8", *_LSE_FP6_P_IDS)
 
 
+_LSE_GFX950 = pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
+
+
 def _lse_ids(ids):
     """MHA v4 exports a validated LSE on gfx950 only."""
-    gfx950 = pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
-    return [pytest.param(i, marks=gfx950) for i in ids]
+    return [pytest.param(i, marks=_LSE_GFX950) for i in ids]
+
+
+def _lse_sparse_tile_params():
+    """(row id, block_tile) for every sparse LSE row: None for its default tile, then 64x64."""
+    return [pytest.param(i, None, marks=_LSE_GFX950, id=i) for i in _LSE_SPARSE_IDS] + [
+        pytest.param(
+            i,
+            _MHA_V4_FINE_TILE,
+            marks=[
+                _LSE_GFX950,
+                _requires_sparse_row(i.removesuffix("_fp6p"), _MHA_V4_FINE_TILE),
+            ],
+            id=f"{i}-64x64",
+        )
+        for i in _LSE_SPARSE_IDS
+    ]
 
 
 def _lse_row(row_id):
@@ -1221,8 +1251,8 @@ def test_mha_v4_asking_for_the_lse_does_not_change_the_output(row_id):
 
 
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
-@pytest.mark.parametrize("row_id", _lse_ids(_LSE_SPARSE_IDS))
-def test_mha_v4_sparse_lse_covers_only_the_selected_blocks(row_id):
+@pytest.mark.parametrize(("row_id", "block_tile"), _lse_sparse_tile_params())
+def test_mha_v4_sparse_lse_covers_only_the_selected_blocks(row_id, block_tile):
     """The property a ring merge rests on.
 
     An LSE over all keys would be wrong here in a way no output comparison catches: the outputs
@@ -1237,14 +1267,16 @@ def test_mha_v4_sparse_lse_covers_only_the_selected_blocks(row_id):
     )
     k, v = torch.randn_like(q), torch.randn_like(q)
     scale = head_dim**-0.5
-    q_tile, kv_tile = mha_v4_block_tile(
-        mha_v4_operands(
-            *formats,
-            *_lse_scale_modes(row_id),
-            _v_pack(formats[0], formats[2]),
-        ),
-        MHA_V4_SPARSE_MODE,
-    )
+    if block_tile is None:
+        block_tile = mha_v4_block_tile(
+            mha_v4_operands(
+                *formats,
+                *_lse_scale_modes(row_id),
+                _v_pack(formats[0], formats[2]),
+            ),
+            MHA_V4_SPARSE_MODE,
+        )
+    q_tile, kv_tile = block_tile
 
     mask = torch.zeros(
         (batch, heads, -(-sequence // q_tile), sequence // kv_tile),
@@ -1253,7 +1285,14 @@ def test_mha_v4_sparse_lse_covers_only_the_selected_blocks(row_id):
     )
     mask[..., ::2] = True
     _, lse = _lse_launch(
-        row_id, q, k, v, softmax_scale=scale, block_mask=mask, return_lse=True
+        row_id,
+        q,
+        k,
+        v,
+        softmax_scale=scale,
+        block_mask=mask,
+        block_tile=block_tile,
+        return_lse=True,
     )
     torch.cuda.synchronize()
 
