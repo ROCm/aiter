@@ -189,3 +189,7 @@ def test_torch_compile():
     expected = run(q, kv, ids)
     compiled = torch.compile(run, backend="eager", fullgraph=True)
     assert torch.equal(compiled(q, kv, ids), expected)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))
