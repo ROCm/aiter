@@ -15,6 +15,7 @@
 
 #include "dpp_scan.h"
 #include "opus/opus.hpp"
+#include "topk_fp32_key.h"
 
 constexpr int WAVE_SIZE = opus::get_warp_size();
 // The kernels are wave64 code tuned for gfx950, and their launch plan assumes
@@ -222,14 +223,8 @@ __device__ __forceinline__ void clear_hist(uint32_t* __restrict__ s_hist)
         s_hist[i] = 0u;
 }
 
-// IEEE-754 fp32 -> monotone uint32, the "distort" trick from DeepSelect
-// (csrc/hip_kernels/bit_utils_hip.cuh): a positive NaN lands above +INF, a
-// negative one below -INF.
-__host__ __device__ __forceinline__ uint32_t fp32_to_sortable_bits(uint32_t u)
-{
-    return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
-}
-
+// The bit-level keys -- fp32_to_sortable_bits, sortable_key_bits, NAN_HIGH_SHIFT
+// -- are topk_fp32_key.h's, which the radix selector ranks by too.
 __device__ __forceinline__ uint32_t fp32_to_sortable(float v)
 {
     return fp32_to_sortable_bits(__float_as_uint(v));
@@ -239,22 +234,6 @@ __device__ __forceinline__ uint32_t fp32_to_sortable(float v)
 // decode and small_k selectors. top_k_per_row_prefill's radix and FlyDSL paths
 // keep the sign instead: a negative NaN sits below -inf, as
 // fp32_to_sortable_bits orders it. NAN_HIGH picks topk_select's order.
-//
-// Under fp32_to_sortable_bits the negative NaNs are exactly the keys
-// [0, NAN_HIGH_SHIFT) and -inf is NAN_HIGH_SHIFT, so subtracting NAN_HIGH_SHIFT
-// rotates them to the top of the key space, above the positive NaNs, which are
-// already above +inf. Every other key moves down by the same amount, so their
-// order is unchanged and the map stays a bijection with an exact inverse. One
-// add per key: the fallback's full-row passes are bound by VALU work per key,
-// and a compare-and-select there cost 20% more phase_c on a falling-back row.
-constexpr uint32_t NAN_HIGH_SHIFT = 0x007FFFFFu;
-
-template <bool NAN_HIGH>
-__device__ __forceinline__ uint32_t sortable_key_bits(uint32_t u)
-{
-    return fp32_to_sortable_bits(u) - (NAN_HIGH ? NAN_HIGH_SHIFT : 0u);
-}
-
 template <bool NAN_HIGH>
 __device__ __forceinline__ uint32_t sortable_key(float v)
 {
@@ -263,8 +242,7 @@ __device__ __forceinline__ uint32_t sortable_key(float v)
 
 __device__ __forceinline__ float sortable_to_fp32(uint32_t s)
 {
-    uint32_t u = (s & 0x80000000u) ? (s ^ 0x80000000u) : ~s;
-    return __uint_as_float(u);
+    return __uint_as_float(sortable_to_fp32_bits(s));
 }
 
 template <bool NAN_HIGH>

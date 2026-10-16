@@ -7,6 +7,7 @@
 #include "dpp_scan.h"
 #include "hip_reduce.h"
 #include "opus/opus.hpp"
+#include "topk_fp32_key.h"
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
 
@@ -102,28 +103,17 @@ __device__ constexpr unsigned calc_mask(int pass)
     return (1 << num_bits) - 1;
 }
 
-/**
- * Map a value to an unsigned integer that preserves comparison order.
- * Uses (bits >> 31) instead of (key < 0) to correctly handle -0.0f,
- * whose sign bit is 1 but compares equal to +0.0f under IEEE 754.
- */
-// NanHigh ranks a NaN of either sign above +inf, as topk_select and torch.topk
-// do; otherwise a NaN ranks by its sign, a negative one below -inf.
+// The radix key of a value: topk_fp32_key.h's fp32 order, which the sampled
+// selector ranks by too, reversed. NanHigh ranks a NaN of either sign above
+// +inf, as topk_select and torch.topk do; otherwise a NaN ranks by its sign.
 template <bool NanHigh = false, typename T>
 __device__ typename aiter::radix_traits<T>::UnsignedBits twiddle_in(T key, bool select_min)
 {
     static_assert(std::is_same_v<T, float>, "radix top-k only supports fp32");
-    // select_min never mattered for float: the mask below is symmetric, so the
+    // select_min never mattered for float: the key's order is symmetric, so the
     // ordering flip is handled by the comparison direction at the call sites.
     (void)select_min;
-    auto bits = reinterpret_cast<typename aiter::radix_traits<T>::UnsignedBits&>(key);
-    if constexpr(NanHigh)
-    {
-        uint32_t const magnitude = bits & 0x7fffffffu;
-        bits                     = magnitude > 0x7f800000u ? magnitude : bits;
-    }
-    uint32_t mask = (bits >> 31) ? 0 : 0x7fffffff;
-    return bits ^ mask;
+    return radix_key_bits<NanHigh>(__float_as_uint(key));
 }
 
 // Compute bucket index using v_bfe_u32 (single-instruction bit field extract).
@@ -983,24 +973,16 @@ __device__ constexpr unsigned calc_mask(int pass)
     return (1 << num_bits) - 1;
 }
 
-// Map value to order-preserving unsigned bits; uses (bits >> 31) for correct -0.0f handling.
-// NanHigh ranks a NaN of either sign above +inf, as topk_select and torch.topk
-// do; otherwise a NaN ranks by its sign, a negative one below -inf.
+// The radix key of a value: topk_fp32_key.h's fp32 order, reversed. NanHigh
+// ranks a NaN of either sign above +inf; otherwise a NaN ranks by its sign.
 template <bool NanHigh = false, typename T>
 __device__ typename aiter::radix_traits<T>::UnsignedBits twiddle_in(T key, bool select_min)
 {
     static_assert(std::is_same_v<T, float>, "radix top-k only supports fp32");
-    // select_min never mattered for float: the mask below is symmetric, so the
+    // select_min never mattered for float: the key's order is symmetric, so the
     // ordering flip is handled by the comparison direction at the call sites.
     (void)select_min;
-    auto bits = reinterpret_cast<typename aiter::radix_traits<T>::UnsignedBits&>(key);
-    if constexpr(NanHigh)
-    {
-        uint32_t const magnitude = bits & 0x7fffffffu;
-        bits                     = magnitude > 0x7f800000u ? magnitude : bits;
-    }
-    uint32_t mask = (bits >> 31) ? 0 : 0x7fffffff;
-    return bits ^ mask;
+    return radix_key_bits<NanHigh>(__float_as_uint(key));
 }
 
 // Compute bucket index using v_bfe_u32.
@@ -2983,10 +2965,8 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
                     T value;
                     if constexpr(CacheTwiddledBits)
                     {
-                        // twiddle_in is an involution for fp32: sign-bit-clear
-                        // patterns flip the low 31 bits; sign-bit-set patterns do not.
-                        Bits const raw_bits =
-                            bits ^ ((bits >> 31) ? 0u : 0x7fffffffu);
+                        // radix_key_bits<false> is its own inverse.
+                        Bits const raw_bits = radix_key_bits<false>(bits);
                         value = __builtin_bit_cast(T, raw_bits);
                     }
                     else
@@ -3435,7 +3415,7 @@ __device__ __forceinline__ bool lds_tail_sampled_stage_n(T const* in,
         uint32_t const end_bin = bin_through - rank <= rank - bin_before ? bin + 1u : bin;
         stage_last             = (end_bin << FineShift) - 1u;
     }
-    Bits const raw_bound = (stage_last >> 31) ? stage_last : (stage_last ^ 0x7fffffffu);
+    Bits const raw_bound = radix_key_to_fp32_bits(stage_last);
     // A NaN or empty bound stages nothing useful; the full-row form handles it.
     if((raw_bound & 0x7fffffffu) > 0x7f800000u || stage_last == ~0u) return fall_back();
     T const bound = __uint_as_float(raw_bound);
