@@ -68,7 +68,6 @@ def fused_qk_norm_rope_group_quant(
     k_rope = torch.empty((num_tokens, ROPE_DIM), dtype=q.dtype, device=q.device)
     _LOGGER.info("FUSED_QK_NORM_ROPE_GROUP_QUANT: T=%d H=%d", num_tokens, num_heads)
 
-
     if num_tokens <= 256:
         heads_per_program, rows_per_step, waves_per_eu = 4, 4, 9
     elif num_tokens <= 512:
