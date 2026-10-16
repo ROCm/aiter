@@ -230,3 +230,48 @@ candidate's H128 legacy mode is also slower than the standalone baseline.
 Correctness is established; performance parity is not claimed. B128 paged
 raw/rotated-Q scratch is 84/96 bytes per thread for H64 and 16/8 for H128;
 both have 256 VGPRs, 0 AGPRs and 67,584 bytes LDS per block.
+
+
+### H128 load-stage and scale-lifetime optimization (2026-10-16)
+
+H128 restores the lane range after opaque inline assembly, keeps lane address
+calculation local to prefetch/commit, and retains only four lane-specific scale
+bytes across QK/PV instead of all sixteen scale bytes. Cache addressing and
+the public/numerical contracts are unchanged. B32/B128 raw/rotated-Q scratch
+falls from 16/8 to 0/0 bytes per thread; VGPRs fall from 256/256 to 254/252.
+Generic-page scratch falls from 48/48 to 8/8. H64 resources are unchanged.
+LDS remains 67,584 bytes per block; no occupancy increase is claimed.
+
+The selected source and fresh JIT passed 183 native tests. The source and
+binary were unchanged for this final run, so that regression was retained
+and checked by hash rather than rerun. A fresh pinned vLLM writer run passes
+all 20 cases with zero error, including the low-level legacy defaults check.
+All six fixtures pass bit-exact quantized-output/scale comparisons, max/LSE
+checks and 18 sampled dense oracles; 300 poison/replay checks pass.
+
+The following same-run comparison uses MI355X HIP6, five implementations,
+ten forward/reverse cyclic execution orders and 1,500 event samples total.
+Each sample contains eight calls per graph and ten replays. Medians are the
+median of each visit's five-sample median. Clocks were not locked. Scope is
+the single B128 page-partition cache, including Q RoPE and excluding GEMM
+and Q rearrangement; it is not a dual-cache mega/model-forward measurement.
+Fixed means the independent-address repair at `8983a1026`.
+
+| T | H | K | S | Standalone us | Fixed paged us | Optimized paged us | Paged latency reduction | TFLOPS |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 560 | 64 | 640 | 8192 | 206.60 | 206.86 | 207.54 | -0.33% | 226.35 |
+| 560 | 64 | 640 | 32768 | 209.85 | 211.37 | 211.26 | 0.05% | 222.36 |
+| 960 | 64 | 640 | 8192 | 258.04 | 253.30 | 253.01 | 0.11% | 318.29 |
+| 960 | 64 | 640 | 32768 | 261.84 | 256.02 | 255.99 | 0.01% | 314.58 |
+| 320 | 128 | 1152 | 8192 | 286.93 | 313.98 | 281.35 | 10.39% | 343.47 |
+| 320 | 128 | 1152 | 32768 | 296.25 | 333.66 | 293.52 | 12.03% | 329.24 |
+
+H128 paged latency drops by 10.39%/12.03% relative to the address repair and
+is 1.94%/0.92% below the standalone baseline. H64 paged varies from -0.11%
+to +0.33% in latency relative to the repair. H128 legacy mode also improves,
+but remains about 8.8-9.2% slower than the standalone baseline:
+
+| S | Standalone us | Fixed legacy us | Optimized legacy us |
+|---:|---:|---:|---:|
+| 8192 | 286.93 | 333.35 | 313.36 |
+| 32768 | 296.25 | 341.98 | 322.27 |

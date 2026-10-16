@@ -380,11 +380,14 @@ struct PackedDecodeSource128
     struct RawTile
     {
         opus::vector_t<uint32_t, 2> bytes[4];
-        opus::vector_t<uint32_t, 4> scales;
+        uint32_t scales; // Four group codes consumed by this lane, one per j.
         bool live;
     };
     __device__ __forceinline__ RawTile prefetch(int tile, int wave, int lane) const
     {
+        // Materialize lane addresses in the load stage, not across QK/PV.
+        asm volatile("" : "+v"(lane));
+        lane &= 63;
         RawTile tile_data{};
         const int64_t r = row(tile * 32 + (lane / 8) * 4 + (wave % 4));
         tile_data.live  = valid_row(r);
@@ -392,7 +395,13 @@ struct PackedDecodeSource128
         {
             const auto* src    = cache.data<PageSize>(pool, r);
             const auto* scales = reinterpret_cast<const Words4*>(cache.scale<PageSize>(pool, r));
-            tile_data.scales   = {scales->x, scales->y, scales->z, scales->w};
+            // Each lane uses one scale from each four-group chunk.
+            // Select before QK/PV so only one scale word remains live.
+            const unsigned shift = ((wave / 4) * 2 + (lane % 8) / 4) * 8;
+            tile_data.scales = ((scales->x >> shift) & 255u) |
+                               (((scales->y >> shift) & 255u) << 8) |
+                               (((scales->z >> shift) & 255u) << 16) |
+                               (((scales->w >> shift) & 255u) << 24);
             opus::static_for<4>([&](auto j) {
                 const auto* values = reinterpret_cast<const Words2*>(
                     src + int(j) * 128 + (wave / 4) * 64 + (lane % 8) * 8);
@@ -405,15 +414,17 @@ struct PackedDecodeSource128
     __device__ __forceinline__ void
     commit(const RawTile& raw, Pointer dst, int wave, int lane) const
     {
+        // Keep decode/store addresses local to the commit stage.
+        asm volatile("" : "+v"(lane));
+        lane &= 63;
         auto* lds = reinterpret_cast<OPUS_LDS_ADDR bf16_t*>(reinterpret_cast<uintptr_t>(dst));
         if(wave < 4 && (lane & 7) == 0)
             reinterpret_cast<OPUS_LDS_ADDR uint32_t*>(lds + wave * 528 + 512)[lane / 8] = raw.live;
-        const auto scales = __builtin_bit_cast(opus::vector_t<uint8_t, 16>, raw.scales);
         opus::static_for<4>([&](auto j) {
             opus::vector_t<bf16_t, 8> values{};
             if(raw.live)
             {
-                unsigned code = scales[int(j) * 4 + (wave / 4) * 2 + (lane % 8) / 4];
+                unsigned code = (raw.scales >> (int(j) * 8)) & 255u;
                 float scale   = code == 0     ? 0x1p-127f
                                 : code == 255 ? __builtin_nanf("")
                                               : __uint_as_float(code << 23);
@@ -539,6 +550,7 @@ __device__ void packed_decode_accum128(
 
     int lane_id = thread_id_x() % T::WARP_SIZE;
     asm volatile("" : "+v"(lane_id)); // break CSE
+    lane_id &= 63; // Restore the lane range hidden by the opaque asm.
     const int warp_id =
         __builtin_amdgcn_readfirstlane((thread_id_x() / T::WARP_SIZE) % T::NUM_WARPS);
 
