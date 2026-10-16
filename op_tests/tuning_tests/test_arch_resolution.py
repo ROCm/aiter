@@ -112,9 +112,10 @@ class TestPciChipId(unittest.TestCase):
         # OSError on Linux (missing .so); RuntimeError is how _load_hip_runtime
         # reports "no amdhip64*.dll found" on Windows. Both must degrade, not raise.
         for exc in (OSError("no libamdhip64"), RuntimeError("no HIP runtime")):
-            with self.subTest(exc=type(exc).__name__):
-                with mock.patch(self.LOADER, side_effect=exc):
-                    self.assertIsNone(chip_info._get_pci_chip_id())
+            with self.subTest(exc=type(exc).__name__), mock.patch(
+                self.LOADER, side_effect=exc
+            ):
+                self.assertIsNone(chip_info._get_pci_chip_id())
 
     def test_returns_none_when_symbol_is_missing(self):
         from aiter.jit.utils import chip_info
