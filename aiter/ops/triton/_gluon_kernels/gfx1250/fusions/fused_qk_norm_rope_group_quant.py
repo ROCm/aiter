@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Q/K RMSNorm, RoPE, fp8 group quant and SWA write for gfx1250."""
+# Q/K RMSNorm, RoPE, fp8 group quant and SWA write
 
 import functools
 
@@ -37,7 +37,6 @@ def get_fused_qk_norm_rope_group_quant_layouts():
         warps_per_cta=[1, 1],
         order=[1, 0],
     )
-    # The TDM descriptor needs a shared layout without swizzle.
     shared_layout = gl.SwizzledSharedLayout(
         vec=1, per_phase=1, max_phase=1, order=[1, 0]
     )
@@ -92,8 +91,6 @@ def load_norm_weight(weight_ptr, row_layout: gl.constexpr, rope_layout: gl.const
 @gluon.jit
 def load_cos_sin(pos_ptr, cos_ptr, sin_ptr, max_pos, rope_layout: gl.constexpr):
     """cos and sin of the token position, in the layout of the RoPE rows."""
-    # A pad token can have a position outside the table. Clamp it, as HIP does, so
-    # that the cos and sin loads stay in the table.
     pos = gl.load(pos_ptr).to(gl.int32)
     pos = gl.minimum(gl.maximum(pos, 0), max_pos - 1)
     # The RoPE rows have only the RoPE columns, so NUM_COLS is ROPE_DIM.
@@ -111,8 +108,8 @@ def norm_quant_rope(x, x_rope, weight, rope_weight, cos, sin, EPS: gl.constexpr)
     normed = x * inv_rms[:, None] * weight
 
     # --- 2. fp8 quant ---
-    # The quant also converts the RoPE columns. The store does not write them.
-    # SCALING_MODE=1 rounds each scale up and floors the amax at 1e-8, as HIP does.
+    # The quant also converts the RoPE columns.
+    # SCALING_MODE=1 rounds each scale up and floors the amax at 1e-8
     nope, scales = _mxfp8_downcast_op(
         normed,
         BLOCK_SIZE_N=HEAD_DIM,
@@ -180,8 +177,6 @@ def rows_program(
     """RMSNorm, fp8 quant and RoPE of the rows in tile. The caller waits for the
     TDM load of tile and stores the results."""
     x = tile.load(row_layout)
-    # A RoPE on the full row costs many instructions. Load the RoPE part again,
-    # with one pair in each lane.
     x_rope = tile.slice(NOPE_DIM, ROPE_DIM, dim=1).load(rope_layout)
 
     nope, scales, rope = norm_quant_rope(x, x_rope, weight, rope_weight, cos, sin, EPS)
@@ -225,10 +220,8 @@ def fused_qk_norm_rope_group_quant_gfx1250(
     rope_layout: gl.constexpr,
     shared_layout: gl.constexpr,
 ):
-    # Arguments after the first 30 dwords cost a memory load. Most programs are Q
-    # programs, so the Q arguments come first.
 
-    # Compile-time constants
+
     Q_PROGRAMS_PER_TOKEN: gl.constexpr = NUM_HEADS // HEADS_PER_PROGRAM
     NUM_STEPS: gl.constexpr = HEADS_PER_PROGRAM // ROWS_PER_STEP
     gl.static_assert(NUM_HEADS % HEADS_PER_PROGRAM == 0)
@@ -258,8 +251,6 @@ def fused_qk_norm_rope_group_quant_gfx1250(
             rope_layout,
         )
         store_rows(nope_ptr, rope_ptr, nope, scales, rope)
-        # A pad token or a token without a row has no SWA row. Skip the write
-        # when the row or the batch id is negative.
         swa_dest_row = gl.load(swa_dest_rows_ptr + token).to(gl.int64)
         batch_id = gl.load(batch_ids_ptr + token)
         if (swa_dest_row >= 0) & (batch_id >= 0):
