@@ -372,8 +372,6 @@ def launch_gemm_a8w4_tdm(
     SB_LDS_STAGE = STAGE_SB if planar_lds_on else PITCH
     INPUT_LDS_B = PLANAR_END if planar_lds_on else num_buffers * PITCH
 
-    out_elem = T.f16 if out_is_f16 else T.bf16
-
     # The bf16 passthrough epilogue stages C with a padded row pitch to break the
     # ds_store bank conflict; reserve it so the padded tile fits.  On gfx1250's
     # 64-bank LDS, scatter uses the smallest 16B-aligned row that is not a
@@ -415,8 +413,8 @@ def launch_gemm_a8w4_tdm(
     _afp = "fp4" if a_is_fp4 else "fp8"
     _act = f"_act{stage1_act}" if stage1_act else ""
     _qout = f"_q{stage1_quant_out}r{quant_wmma_rep}" if stage1_quant_out else ""
-    assert has_bias in (0, 1, 2), "has_bias: 0 none, 1 output-dtype, 2 fp32"
-    _bias = {0: "", 1: "_bias", 2: "_biasf32"}[has_bias]
+    assert has_bias in (0, 1, 2, 3), "has_bias: 0 none, 1 bf16, 2 fp32, 3 fp16"
+    _bias = {0: "", 1: "_bias", 2: "_biasf32", 3: "_biasf16"}[has_bias]
     _grouped = f"_e{n_experts}" if n_experts > 0 else ""
     _cl = f"_cluster{cluster_m}x{cluster_n}" if cluster_m > 1 or cluster_n > 1 else ""
     _cluster_sync = "_nosync" if (cluster_m > 1 and DISABLE_CLUSTER_SYNC) else ""
@@ -1703,7 +1701,7 @@ def launch_gemm_a8w4_tdm(
             oc = fx.Float16 if out_is_f16 else fx.BFloat16
 
             if const_expr(has_bias):
-                bias_elem = T.f32 if has_bias == 2 else out_elem
+                bias_elem = {1: T.bf16, 2: T.f32, 3: T.f16}[has_bias]
                 bias_ptr_type = fx.PointerType.get(
                     elem_ty=bias_elem,
                     address_space=fx.AddressSpace.Global,
