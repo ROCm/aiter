@@ -22,7 +22,10 @@ struct alignas(16) ProducerArgs {
     std::uint64_t reserved_after_gate_up_scales;
     void* down_scales;
     std::uint64_t reserved_after_down_scales;
-    void* smoothing_scales;
+    union {
+        void* smoothing_scales;
+        const void* job_map;
+    };
     std::uint64_t reserved_after_smoothing_scales;
     void* sorted_token_ids;
     std::uint64_t reserved_after_sorted_token_ids;
@@ -78,6 +81,7 @@ static_assert(offsetof(ProducerArgs, activation_scales) == 80);
 static_assert(offsetof(ProducerArgs, gate_up_scales) == 96);
 static_assert(offsetof(ProducerArgs, down_scales) == 112);
 static_assert(offsetof(ProducerArgs, smoothing_scales) == 128);
+static_assert(offsetof(ProducerArgs, job_map) == 128);
 static_assert(offsetof(ProducerArgs, sorted_token_ids) == 144);
 static_assert(offsetof(ProducerArgs, routing_weights) == 160);
 static_assert(offsetof(ProducerArgs, sorted_expert_ids) == 176);

@@ -13,10 +13,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* sorted_weights, aiter_tensor_t* sorted_experts,
      aiter_tensor_t* counts, aiter_tensor_t* reverse_sorted,
      aiter_tensor_t* input_scale, aiter_tensor_t* gate_scale,
-     aiter_tensor_t* down_scale, int topk, hipStream_t stream),
+     aiter_tensor_t* down_scale, int topk, aiter_tensor_t* job_map, hipStream_t stream),
     (out, partials, input, gate, down, sorted_ids, sorted_weights,
      sorted_experts, counts, reverse_sorted, input_scale, gate_scale,
-     down_scale, topk, stream))
+     down_scale, topk, job_map, stream))
 {
     const HipDeviceGuard guard(input->device_id);
     AITER_CHECK(get_gpu_arch() == "gfx950", "Q256 requires gfx950");
@@ -57,7 +57,15 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                           uint64_t(model * 512)})
         AITER_CHECK(bytes < (uint64_t(1) << 32), "Q256 input/scale offsets exceed 32 bits");
 
+    if(job_map) {
+        AITER_CHECK(compact_routes && tokens == 8192 && model == 8192 && experts == 513 && topk == 11,
+                    "Q256 weighted scheduling requires compact Qwen 8K geometry");
+        AITER_CHECK(job_map->is_contiguous() && job_map->device_id == input->device_id &&
+                    job_map->dtype() == AITER_DTYPE_i32 && job_map->numel() == 1024,
+                    "Q256 job map must be 1024 contiguous int32 entries on the input GPU");
+    }
     q256::ProducerArgs args{};
+    args.job_map = job_map ? job_map->ptr : nullptr;
     args.output = partials->ptr;
     args.activations = input->ptr;
     args.gate_up_weights = gate->ptr;
@@ -85,7 +93,13 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.top_k = topk;
     args.total_workgroups = 256;
     args.hidden_tiles = 1;
-    const auto select_producer = [compact_routes]() -> AiterAsmKernel& {
+    const auto select_producer = [compact_routes, job_map]() -> AiterAsmKernel& {
+        if(job_map) {
+            static AiterAsmKernel weighted_producer(
+                "fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate_route_weighted",
+                "fmoe/silu/fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate_route_weighted.co");
+            return weighted_producer;
+        }
         if(compact_routes) {
             static AiterAsmKernel compact_producer(
                 "fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate_route",
