@@ -188,6 +188,7 @@ def shuffle_weight(
             x_ = x_.permute(0, 1, 3, 4, 2, 5).contiguous()
         x_ = x_.view(*x.shape).contiguous().view(x_type)
         x_.is_shuffled = True
+        x_.gate_up_interleave = gate_up
         return x_
 
     IN, IK = layout
