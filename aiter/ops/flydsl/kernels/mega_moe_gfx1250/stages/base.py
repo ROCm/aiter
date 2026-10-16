@@ -197,12 +197,8 @@ class DispatchStage(Protocol):
         topk_ids: torch.Tensor,
         *,
         recv_token_bound: int | None = None,
-        next_topk_ids: torch.Tensor | None = None,
-        next_recv_token_bound: int | None = None,
         begin_step: bool = True,
     ) -> _DispatchBatch: ...
-
-    def prefetch(self, topk_ids, recv_token_bound=None) -> None: ...
 
     def warmup(self, recv_token_bound=None, token_count=None) -> None: ...
 

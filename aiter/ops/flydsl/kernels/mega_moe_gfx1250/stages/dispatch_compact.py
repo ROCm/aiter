@@ -188,9 +188,9 @@ class _CompactDispatch(_Dispatch):
     expert and padded to the GEMM tile, the layout the grouped GEMM reads in
     place.
 
-    The plan needs only topk_ids, so it runs on a side stream ahead of the
-    dispatch. Two hist/done slots and local tok_map/psum buffers let the next
-    layer's plan overlap this layer's expert GEMM.
+    The plan needs this layer's topk_ids, so it runs on a side stream and can
+    only overlap what the main stream does before the dispatch (the activation
+    quant).
 
     Recv slots are reserved one atomic per (block, peer) and handed out
     block-local. The TDM staging arrays stand in for the HIP kernel's
@@ -204,7 +204,7 @@ class _CompactDispatch(_Dispatch):
     uses_mori = False
     # The plan reserves the recv slots itself.
     provides_aggregated_reservation = False
-    _PLAN_SLOTS = 2
+    _PLAN_SLOTS = 1
 
     def __init__(self, config: MegaMoEConfig, caps=None):
         # Decode walks routes, prefill tokens (see _DISPATCH_COMPACT).
@@ -287,7 +287,7 @@ class _CompactDispatch(_Dispatch):
             "out_wts": max_recv * topk * 4,
             "disp_out": geo.cap * geo.wire_row,
             "ep_rowmap": (geo.cap + 1) * 8,
-            "compact_hist": 2 * geo.hist_stride * 4,
+            "compact_hist": geo.hist_stride * 4,
             "compact_done": compact_done_nbytes(),
         }
         if s1f is None:
@@ -321,7 +321,7 @@ class _CompactDispatch(_Dispatch):
             torch.zeros(epr, dtype=torch.int32, device=device) for _ in slots
         ]
         # The per-rank scatter's run table rides behind psum, so gemm2 finds it
-        # through the m-tile map it already takes, double-buffered with it.
+        # through the m-tile map it already takes.
         psum_tail = (
             compact_comb_tab_dwords(npes=config.world_size, experts_per_rank=epr)
             if config.per_rank_scatter
@@ -363,11 +363,10 @@ class _CompactDispatch(_Dispatch):
         )
         self._plan_stream = torch.cuda.Stream()
         self._plan_event = torch.cuda.Event()
-        self._prefetch_events = [torch.cuda.Event() for _ in slots]
         # Buffers the stage-1 plan variants capture, before any of them compile.
         self.fusion.arm()
-        # Warm both hist/done slots and the capacity bucket: compiling inside
-        # graph capture is not allowed.
+        # Warm the capacity bucket: compiling inside graph capture is not
+        # allowed.
         for slot in slots:
             self._plan_for(geo.tile_m, slot)
             if self.fusion.plan_mode(geo.tile_m):
@@ -494,16 +493,13 @@ class _CompactDispatch(_Dispatch):
         topk_ids: torch.Tensor,
         *,
         recv_token_bound: int | None = None,
-        next_topk_ids: torch.Tensor | None = None,
-        next_recv_token_bound: int | None = None,
         begin_step: bool = True,
         s1f: bool = False,
     ) -> _DispatchBatch:
         """Compact cannot slice recv_x -- the rows are grouped per expert, not
         token-major -- so ``recv_token_bound`` is spent on the step's geometry
         instead: it picks the plan's alignment, the GEMM's tile and the GEMM's
-        grid. ``next_topk_ids`` starts the next layer's plan once this dispatch
-        is issued.
+        grid.
 
         ``s1f`` skips the dispatch kernel: the stage-1 kernel, launched in place
         of GEMM1, ships the rows off the plan's run table.
@@ -511,25 +507,8 @@ class _CompactDispatch(_Dispatch):
         config, res = self.config, self.res
         token_count = int(hidden_states.shape[0])
         _check_recv_token_bound(config, "recv_token_bound", recv_token_bound)
-        _check_recv_token_bound(config, "next_recv_token_bound", next_recv_token_bound)
         if begin_step:
             self.prepare_step(recv_token_bound)
-        if self._plan_pending and self._pending_align != self._step.align_m:
-            raise ValueError(
-                "the compact plan already started for this step aligns each "
-                f"expert's rows to {self._pending_align}, but "
-                f"recv_token_bound={recv_token_bound} needs {self._step.align_m}; "
-                "pass the bound the plan was started with"
-            )
-        overlap_next = (
-            next_topk_ids is not None
-            and int(next_topk_ids.shape[0]) > 0
-            and token_count <= _DECODE_PLAN_OVERLAP_TOKENS
-        )
-        if overlap_next:
-            # Recorded before the payload copy so a decode prefetch can wait
-            # for routing without also waiting for that copy.
-            self._prefetch_events[self._slot].record(torch.cuda.current_stream())
         kernel = self._kernels[_pick(self.schedule, token_count)]
         # Launch the plan before the quant so the two overlap, unless the plan
         # itself is quantizing (then there is no second kernel to overlap).
@@ -599,47 +578,10 @@ class _CompactDispatch(_Dispatch):
                 rows=step.rows,
             ),
         )
-        if next_topk_ids is not None and int(next_topk_ids.shape[0]) > 0:
-            # Dispatch of this layer is queued, so tok_map[slot] is free once
-            # it finishes. GEMM still reads psum/masked_m of this slot; the
-            # next plan writes the other slot. Prefill overlaps that plan with
-            # the GEMM only. Decode also overlaps it with this dispatch.
-            nxt = 1 - slot
-            count = int(next_topk_ids.shape[0])
-            ahead = self._step_for(self._recv_bound(next_recv_token_bound))
-            ready = self._prefetch_events[slot] if overlap_next else None
-            # tok_map follows the NEXT step's tile, then this step is restored:
-            # GEMM1 still reads the alignment just dispatched.
-            saved = self._step
-            self._step = ahead
-            drop_tok_map = self.fusion.step_will_run()
-            self._step = saved
-            self._launch_plan(
-                next_topk_ids,
-                count,
-                nxt,
-                ahead.align_m,
-                ready_event=ready,
-                tok_map=not drop_tok_map,
-            )
-            self._slot = nxt
         return batch
 
-    def prefetch(self, topk_ids, recv_token_bound=None) -> None:
-        """Launch the plan for ``topk_ids`` on the side stream, into this step."""
-        _check_recv_token_bound(self.config, "recv_token_bound", recv_token_bound)
-        token_count = int(topk_ids.shape[0])
-        self._step = self._step_for(self._recv_bound(recv_token_bound))
-        self._launch_plan(
-            topk_ids,
-            token_count,
-            self._slot,
-            self._step.align_m,
-            tok_map=not self.fusion.step_will_run(),
-        )
-
     def warmup(self, recv_token_bound=None, token_count=None) -> None:
-        """Compile the plan this bound's tile needs, in both slots.
+        """Compile the plan this bound's tile needs.
 
         ``token_count`` selects the launch width. A captured batch whose width
         never ran eagerly would otherwise reach the JIT inside the capture.

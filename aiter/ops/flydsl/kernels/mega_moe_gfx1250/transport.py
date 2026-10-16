@@ -90,8 +90,8 @@ class _EpDispatcher:
         return self._dispatch.recv_views()
 
     def dispatch(self, hidden_states, topk_weights, topk_ids, **step) -> _DispatchBatch:
-        """``step`` is recv_token_bound, next_topk_ids, next_recv_token_bound
-        and begin_step, as the dispatch stage takes them."""
+        """``step`` is recv_token_bound and begin_step, as the dispatch stage
+        takes them."""
         return self._dispatch.dispatch(hidden_states, topk_weights, topk_ids, **step)
 
     def prepare(self, batch: _DispatchBatch, quant_bits: int) -> _ComputeTarget:
@@ -99,9 +99,6 @@ class _EpDispatcher:
 
     def combine(self, routing: Routing, quant_bits: int, expert_out=None):
         return self._combine.finish(routing, quant_bits, expert_out)
-
-    def prefetch(self, topk_ids, recv_token_bound=None) -> None:
-        self._dispatch.prefetch(topk_ids, recv_token_bound)
 
     def warmup(self, recv_token_bound=None, token_count=None) -> None:
         self._dispatch.warmup(recv_token_bound, token_count)
