@@ -647,10 +647,17 @@ def _device_arch(device: int) -> str:
     return torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
 
 
+def _sampled_min_width(device: int) -> int | None:
+    """The row width from which `sampled` routes on this GPU, or None where it
+    does not route at all. top_k_per_row_prefill and topk_select both open their
+    width door here, so the two cannot be retuned apart."""
+    return _SAMPLED_MIN_STRIDE0.get(_device_arch(device)) if device >= 0 else None
+
+
 def _sampled_on_device(device: int) -> bool:
     """Whether `sampled` may route on this GPU at all: its architecture has a
     measured floor above. topk_sampled_supports() stays the capability check."""
-    return device >= 0 and _device_arch(device) in _SAMPLED_MIN_STRIDE0
+    return _sampled_min_width(device) is not None
 
 
 # Below this k the sampled threshold rests on a handful of sample hits, and
@@ -674,10 +681,18 @@ def _should_use_sampled_prefill(
     while the `sampled` entry rejects stride1 != 1; routing such a call there
     would turn a working call into an error purely because `sampled` became
     available.
+
+    The width door and the k floor are topk_select's too (`_sampled_min_width`,
+    `_SAMPLED_MIN_K`); the rest of its rule is not. Past the door it gives
+    gfx950 k=2048 rows at 3000+ to plain's LDS-tail kernel, which serves no row
+    bounds, and this entry always passes them. Below it, it also opens `sampled`
+    on total work and at some gfx950 k=2048 shapes; those doors were measured
+    against topk_select's backends, not against the per-row kernels this entry
+    falls back to, so it does not take them.
     """
-    if stable or stride1 != 1 or k < _SAMPLED_MIN_K or device < 0:
+    if stable or stride1 != 1 or k < _SAMPLED_MIN_K:
         return False
-    floor = _SAMPLED_MIN_STRIDE0.get(_device_arch(device))
+    floor = _sampled_min_width(device)
     if floor is None or stride0 < floor:
         return False
     # Last: the environment lookup costs more than every test above together.

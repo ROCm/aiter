@@ -64,6 +64,7 @@ from aiter.ops.flydsl.topk.topk_per_row_small_k import (
 from aiter.ops.topk import (
     _SAMPLED_MIN_K,
     _device_arch,
+    _sampled_min_width,
     _sampled_on_device,
     _sampled_run,
     _sampled_supports_cached,
@@ -154,13 +155,11 @@ _STREAM_BLOCK_WIDTHS = (512, 1024)
 # rows * width at which `sampled` becomes the fastest backend here. See
 # `_sampled_takes` for the measurement and for what it was measured on.
 _SAMPLED_MIN_WORK = 1 << 28
-# The second door into `sampled`, on the width rather than on the product,
+# The second door into `sampled` is on the width rather than on the product,
 # because the product cannot express the wide few-row corner at all: 128 rows of
-# N=1M is 2**27, under the work threshold above. See
-# `_sampled_takes` for what was measured.
-#
-# There is no row floor; see `_sampled_takes`.
-_SAMPLED_MIN_WIDTH = 131072
+# N=1M is 2**27, under the work threshold above. It is top_k_per_row_prefill's,
+# `_sampled_min_width`; see `_sampled_takes` for what was measured. There is no
+# row floor; see `_sampled_takes`.
 _PLAIN_MANY_ROWS = 256
 _PLAIN_MANY_ROWS_BAND = (8192, 65536)
 _PLAIN_MIN_K = 1024
@@ -754,7 +753,7 @@ def _plain_k2048_lds_tail_takes(
         k == 2048
         and _device_arch(device) == "gfx950"
         and rows >= _PLAIN_K2048_LDS_TAIL_MIN_ROWS
-        and _SAMPLED_MIN_WIDTH <= width <= _plain_width("lds_tail_max")
+        and _sampled_min_width(device) <= width <= _plain_width("lds_tail_max")
         and (
             stride0 is None
             or stride0 == width
@@ -839,7 +838,10 @@ def _sampled_takes(
         return False
     if device is None:
         device = torch.cuda.current_device()
-    if k == 2048 and width < _SAMPLED_MIN_WIDTH and _device_arch(device) == "gfx950":
+    min_width = _sampled_min_width(device)
+    if min_width is None:
+        return False
+    if k == 2048 and width < min_width and _device_arch(device) == "gfx950":
         plain_band = _plain_takes(rows, width, k, device, ragged, stride0)
         plain_pitch = pitch if ragged else width
         if (plain_band and _plain_multiblock(rows, plain_pitch, k, ragged, device)) or (
@@ -848,7 +850,7 @@ def _sampled_takes(
             return _sampled_supports_cached(rows, pitch, k, device)
         if yield_to_plain and plain_band:
             return False
-    if not (rows * width >= _SAMPLED_MIN_WORK or width >= _SAMPLED_MIN_WIDTH):
+    if not (rows * width >= _SAMPLED_MIN_WORK or width >= min_width):
         return False
     return _sampled_supports_cached(rows, pitch, k, device)
 
