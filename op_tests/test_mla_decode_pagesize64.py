@@ -2509,7 +2509,9 @@ class TestMlaQh64TokenCsr:
         assert ptr.tolist() == [0, 1, 66, 66, 195]
         # Neither shader length calculation nor stage2 may use these values.
         last.copy_(torch.tensor([-123, 0, 999, 17], device=last.device))
-        _check_qh64_token_case(case, token_csr=(ptr, slots, last), return_lse=return_lse)
+        _check_qh64_token_case(
+            case, token_csr=(ptr, slots, last), return_lse=return_lse
+        )
 
     @pytest.mark.parametrize("splits", [1, 3])
     @pytest.mark.parametrize("return_lse", [False, True])
@@ -2674,7 +2676,9 @@ class TestMlaQh64TokenCsr:
         ):
             _run_qh64_case(case, kv_csr_layout="token", **overrides[variant])
 
-    @pytest.mark.parametrize("variant", ["token_major", "page_size", "persistent", "cp"])
+    @pytest.mark.parametrize(
+        "variant", ["token_major", "page_size", "persistent", "cp"]
+    )
     def test_native_token_scope_rejected(self, variant, monkeypatch):
         case = _make_qh64_case(1, 1, 1)
         original = aiter.mla_decode_stage1_asm_fwd
