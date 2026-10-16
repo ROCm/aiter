@@ -10,8 +10,8 @@ from numbers import Integral, Real
 
 import torch
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
-    _gpu_arch,
     _is_valid_softmax_scale,
 )
 from aiter.ops.flydsl.kernels.fmha_gfx950.paged_pipeline import (
@@ -173,7 +173,7 @@ def flydsl_flash_attn_paged_fp8_func(
         raise ValueError("paged FP8 Q/K/V must use OCP float8_e4m3fn")
     if not causal:
         raise NotImplementedError("paged FP8 currently requires causal attention")
-    if _gpu_arch(q.device) != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         raise NotImplementedError("paged FP8 requires gfx950")
     if softmax_scale is not None and not isinstance(softmax_scale, Real):
         raise ValueError("softmax_scale must be a positive finite Python scalar")
