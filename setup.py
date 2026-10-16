@@ -571,6 +571,8 @@ setup(
         # Install with: pip install -r requirements-triton-comms.txt
         # (See requirements-triton-comms.txt for pinned Iris version)
         "triton_comms": [],
+        # Offline IQ2R checkpoint tools (aiter.quantization.iq2r)
+        "iq2r": ["safetensors"],
         # Install all optional dependencies
         "all": [],
     },

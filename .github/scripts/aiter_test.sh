@@ -86,6 +86,9 @@ for file in "${sharded_files[@]}"; do
     test_cmd=(timeout 60m python3 "$file")
     case "$file" in
         op_tests/test_flydsl_paged_fmha.py)
+        op_tests/test_fhmoe.py|op_tests/tuning_tests/test_fhmoe_tuner.py)
+            # These files contain pytest-style test functions and intentionally
+            # have no script entry point; direct execution would only import them.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
         op_tests/multigpu_tests/bench_mega_moe.py)
