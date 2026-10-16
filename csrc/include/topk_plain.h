@@ -20,3 +20,7 @@ void topk_plain(aiter_tensor_t& values,
 // Workspace sizing for the fp32 radix path, exposed to Python so the scratch can
 // be allocated + cached on the Python side and passed into topk_plain.
 int64_t topk_plain_workspace_size(int64_t numRows, int64_t stride0, int64_t k);
+
+// Workspace sizing for the multi-block path (any dtype); topk_plain uses it for
+// the per-block partial results instead of allocating them itself.
+int64_t topk_plain_merge_workspace_size(int64_t k);

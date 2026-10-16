@@ -3,6 +3,7 @@
 
 # user interface
 
+import functools
 import math
 
 import torch
@@ -30,6 +31,18 @@ def _topk_plain(
 
 @compile_ops("module_topk_plain")
 def topk_plain_workspace_size(numRows: int, stride0: int, k: int) -> int: ...
+
+
+@compile_ops("module_topk_plain")
+def topk_plain_merge_workspace_size(k: int) -> int: ...
+
+
+@functools.cache
+def _merge_workspace_size(device: torch.device, k: int) -> int:
+    # The bound comes from occupancy queries against the current device, so it
+    # is cached per device rather than recomputed on every call.
+    with torch.cuda.device(device):
+        return topk_plain_merge_workspace_size(k)
 
 
 # Mirrors buffer_load_helpers::MAX_CAPACITY in csrc/kernels/topk_plain_kernels.cu.
@@ -70,10 +83,13 @@ def topk_plain(
 ) -> None:
     """Plain top-k over the last dim.
 
-    The fp32 radix path needs a device scratch workspace; it is allocated (and
-    cached) here on the Python side via torch's caching allocator and passed into
-    the kernel, so the C++ side never allocates device memory itself. Non-fp32
-    inputs never reach the radix path, so no workspace is allocated for them.
+    Two kernel paths need device scratch: the fp32 radix path, and the
+    multi-block path (any dtype) that splits each row across several blocks when
+    there are fewer rows than the grid holds and merges their partial results.
+    The workspace is allocated here on the Python side via torch's caching
+    allocator and passed into the kernel, so the C++ side never allocates device
+    memory itself and the call stays capturable in a CUDA graph. One call takes
+    at most one of the two paths, so they share the buffer.
     """
     if topk > _MAX_CAPACITY:
         # `AdaptiveTopK` asserts this at its entry, ahead of any dtype branch,
@@ -83,12 +99,12 @@ def topk_plain(
         raise ValueError(
             f"topk={topk} exceeds this kernel's capacity of {_MAX_CAPACITY}"
         )
-    workspace = None
+    size = _merge_workspace_size(x.device, topk)
     if x.dtype == torch.float32:
         # Mirror the C++ default: stride0 < 0 means a contiguous last dim.
         s0 = stride0 if stride0 >= 0 else x.shape[-1]
-        size = topk_plain_workspace_size(x.shape[0], s0, topk)
-        workspace = get_topk_scratch_workspace(x.device, size)
+        size = max(size, topk_plain_workspace_size(x.shape[0], s0, topk))
+    workspace = get_topk_scratch_workspace(x.device, size)
     return _topk_plain(
         x,
         topk_ids,
