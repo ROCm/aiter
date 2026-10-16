@@ -548,37 +548,50 @@ def test_flydsl_bwd_fused_rejects_unsupported_shape():
 
 
 @requires_fused
-@pytest.mark.parametrize(
-    "max_attn_len,contextual_seq_len",
-    [(64, 0), (256, 0), (0, 64)],
-)
-def test_flydsl_bwd_fused_rejects_masked_variants(max_attn_len, contextual_seq_len):
-    """Windows and contextual prefixes must RAISE, not return wrong gradients.
+@pytest.mark.parametrize("max_attn_len", [64, 256])
+@pytest.mark.parametrize("target_size", [0, 300])
+def test_flydsl_bwd_fused_sliding_window(max_attn_len, target_size):
+    """A windowed mask leaves dQ partials unwritten; the reduction skips them.
 
-    Both were silently accepted once, and both were wrong in different ways.
-    With a zeroed scratch a contextual prefix missed the fp32 oracle by 0.85
-    relative against a 0.03 tolerance -- broken mask arithmetic. The sliding
-    window's arithmetic is right, but it leaves dQ partials unwritten, and the
-    split-K scratch is allocated with `empty` on the strength of the accepted
-    masks writing everything the reduction reads. Either way the dvdk + dq pair
-    handles these, so the gate sends them there.
+    The split-K scratch is allocated with `empty`, so a window is only safe
+    because the reduction reads an element exactly when the fused pass served
+    it. Both halves of that predicate are exercised here: without targets the
+    served tiles form a contiguous span below the row, and with targets the
+    clamped rows are served by tiles arbitrarily far below, which is the case
+    that a span-only bound silently drops.
     """
     b, h, n, d = 32, 4, 1024, 64
     alpha = 1.0 / d * 10000
-    q, k, v, dout, seq_offsets, num_targets = _fused_inputs(b, h, n, d)
-    args = (
-        n, alpha, q, k, v, dout, seq_offsets, True, num_targets,
-        max_attn_len, contextual_seq_len,
-    )  # fmt: skip
+    q, k, v, dout, seq_offsets, num_targets = _fused_inputs(b, h, n, d, target_size)
+    args = (n, alpha, q, k, v, dout, seq_offsets, True, num_targets, max_attn_len, 0)
 
-    with pytest.raises(ValueError, match="sliding window|contextual prefix"):
+    dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
+        n, alpha, q, k, v, seq_offsets, True, num_targets, max_attn_len, 0, dout
+    )
+    dq, dk, dv = flydsl_hstu_attention_bwd(*args, fused=True)
+    assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref)
+
+
+@requires_fused
+def test_flydsl_bwd_fused_rejects_contextual():
+    """A contextual prefix must RAISE, not return wrong gradients.
+
+    It was silently accepted once and was wrong by 0.85 relative against a 0.03
+    tolerance -- with a ZEROED scratch, so it is the mask arithmetic rather
+    than uninitialised partials, and unrelated to the window handling above.
+    """
+    b, h, n, d = 32, 4, 1024, 64
+    alpha = 1.0 / d * 10000
+    q, k, v, dout, seq_offsets, num_targets = _fused_inputs(b, h, n, d, 0)
+    args = (n, alpha, q, k, v, dout, seq_offsets, True, num_targets, 0, 64)
+
+    with pytest.raises(ValueError, match="contextual prefix"):
         flydsl_hstu_attention_bwd(*args, fused=True)
 
     # The fallback must still be CORRECT, which a bare `raises` would miss.
     dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
-        n, alpha, q, k, v, seq_offsets, True, num_targets,
-        max_attn_len, contextual_seq_len, dout,
-    )  # fmt: skip
+        n, alpha, q, k, v, seq_offsets, True, num_targets, 0, 64, dout
+    )
     dq, dk, dv = flydsl_hstu_attention_bwd(*args, fused=None)
     assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref)
 

@@ -978,10 +978,10 @@ def _plan_fused_groups(
             # production shape: dq came back bitwise identical at G=2 and G=5
             # with zero NaNs.
             #
-            # This depends on the validator gating out sliding windows: a
-            # windowed mask DOES leave partials unwritten, and summing garbage
-            # there is silent. If windows are ever supported, this has to go
-            # back to `zeros` (or zero just the unwritten tails).
+            # A WINDOWED mask does leave partials unwritten -- the fused pass
+            # only serves the tiles inside the window -- so the reduction
+            # carries a per-row predicate that skips exactly those. Keep the
+            # two in step: dropping that predicate means restoring the memset.
             dq_part = torch.empty(rows, elems, dtype=torch.float32, device=device)
             dq_carry = (
                 torch.zeros(1, 1, dtype=torch.float32, device=device)
@@ -1139,6 +1139,8 @@ def _make_bwd_fused_runners(
             block_m,
             max_tiles,
             dtype_str,
+            max_attn_len=max_attn_len,
+            has_targets=has_targets,
             first_pass=(g == 0),
             last_pass=(g == n_groups - 1),
         )
@@ -1159,7 +1161,7 @@ def _make_bwd_fused_runners(
         with torch.cuda.device(device.index):
             _run_compiled(
                 reduce_launchers[g], fx.Int32(n_blocks), dq_part, offs[g],
-                red_map, so_c, dq_carry, dq,
+                red_map, so_c, nt_c, dq_carry, dq,
                 fx.Int32(lo), fx.Int32(hi), fx.Stream(launch_stream),
             )  # fmt: skip
 
@@ -1194,6 +1196,11 @@ def _make_bwd_fused_runners(
         "spans": spans,
         # The scratch is allocated ONCE and reused by every pass, so this is
         # the footprint at any instant, not the sum over passes.
+        # The scratch and its per-pass offset tables, for inspection: which
+        # elements a pass leaves unwritten is a property worth being able to
+        # measure rather than derive.
+        "scratch": dq_part,
+        "offsets": offs,
         "scratch_bytes": dq_part.numel() * dq_part.element_size(),
         "carry_bytes": dq_carry.numel() * dq_carry.element_size(),
         "reduce_bytes": (

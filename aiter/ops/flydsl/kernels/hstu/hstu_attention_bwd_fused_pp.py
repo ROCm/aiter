@@ -254,17 +254,8 @@ def validate_hstu_attention_bwd_fused_pp(
             "hstu bwd fused does not support a contextual prefix, got "
             f"contextual_seq_len={contextual_seq_len}. The dvdk + dq pair does."
         )
-    if max_attn_len != 0:
-        # The window arithmetic itself is correct, but a windowed mask leaves
-        # some dQ partials unwritten, and the split-K scratch is allocated with
-        # `empty` precisely because the unwindowed masks write every element
-        # the reduction reads. Supporting windows means zeroing the scratch
-        # again -- ~17 ms per call at the production shape -- so it is gated
-        # out rather than paid for on every shape.
-        raise ValueError(
-            "hstu bwd fused does not support a sliding window, got "
-            f"max_attn_len={max_attn_len}. The dvdk + dq pair does."
-        )
+    if max_attn_len < 0:
+        raise ValueError(f"max_attn_len must be non-negative, got {max_attn_len}")
 
 
 @functools.lru_cache(maxsize=16384)
@@ -1782,6 +1773,8 @@ def build_hstu_attention_bwd_dq_reduce(
     max_tiles,
     dtype_str,
     *,
+    max_attn_len=0,
+    has_targets=False,
     first_pass=True,
     last_pass=True,
 ):
@@ -1812,6 +1805,7 @@ def build_hstu_attention_bwd_dq_reduce(
         part_off: fx.Tensor,
         red_map: fx.Tensor,
         seq_offsets: fx.Tensor,
+        num_targets: fx.Tensor,
         dq_acc: fx.Tensor,
         out_dq: fx.Tensor,
         tile_lo: fx.Int32,
@@ -1830,6 +1824,13 @@ def build_hstu_attention_bwd_dq_reduce(
         seq_start = fx.Int32(seq_offsets[fx.Int32(b)])
         seq_len = fx.Int32(seq_offsets[fx.Int32(b) + fx.Int32(1)]) - seq_start
         row0 = fx.Int32(blk) * fx.Int32(ROWS)
+        # Target rows have their position id CLAMPED to max_id, so they attend
+        # to kv near max_id however far down the sequence they sit. Only read
+        # num_targets when a window makes the distinction matter.
+        max_id = seq_len
+        if const_expr(max_attn_len > 0 and has_targets):
+            _nt = fx.Int32(num_targets[fx.Int32(b)])
+            max_id = (_nt > fx.Int32(0)).select(seq_len - _nt, seq_len)
 
         row_sub = tid // fx.Int32(LANES_PER_ROW)
         col = (tid % fx.Int32(LANES_PER_ROW)) * fx.Int32(VEC)
@@ -1851,6 +1852,26 @@ def build_hstu_attention_bwd_dq_reduce(
         n_t = row0 // fx.Int32(block_m) + fx.Int32(1)
         n_t = (n_t < tile_hi).select(n_t, tile_hi)
 
+        # Under a sliding window a q row is served by a CONTIGUOUS span of kv
+        # tiles, not by every tile below it, and the fused kernel writes a
+        # partial only for the tiles it serves. Both bounds matter: this one
+        # skips tiles that contribute nothing, and the per-row predicate below
+        # keeps the sum off elements that were never written.
+        #
+        # `row0` is the workgroup's FIRST row, so this bound is the loosest any
+        # of its rows needs -- correctness comes from the predicate, this is
+        # only work avoided. Truncating division is fine: the clamp at 0 covers
+        # the negative case either way.
+        t_start = fx.Int32(tile_lo)
+        if const_expr(max_attn_len > 0 and not has_targets):
+            # Only safe without targets: a clamped target row is served by
+            # tiles arbitrarily far below it, so there is no contiguous span to
+            # skip into. With targets this stays at `tile_lo` and the predicate
+            # does the whole job.
+            _wlo = (row0 - fx.Int32(max_attn_len)) // fx.Int32(block_m)
+            _wlo = (_wlo > fx.Int32(0)).select(_wlo, fx.Int32(0))
+            t_start = (_wlo > t_start).select(_wlo, t_start)
+
         acc0 = [fx.Float32(0.0) for _ in range_constexpr(SLICES * VEC)]
         if const_expr(not first_pass):
             for s in range_constexpr(SLICES):
@@ -1860,7 +1881,7 @@ def build_hstu_attention_bwd_dq_reduce(
                     ]
 
         for _t, it in range(
-            fx.Int64(tile_lo), fx.Int64(n_t), fx.Int64(1), init=acc0
+            fx.Int64(t_start), fx.Int64(n_t), fx.Int64(1), init=acc0
         ):  # ty: ignore
             # The loop-carried state comes back as raw ArithValue, which has
             # none of the DSL numeric methods; re-wrap before using it.
@@ -1874,11 +1895,26 @@ def build_hstu_attention_bwd_dq_reduce(
             nxt = []
             for s in range_constexpr(SLICES):
                 _ri = row_in_slot + (rr[s] - row0)
-                for j in range_constexpr(VEC):
-                    nxt.append(
-                        acc[s * VEC + j]
-                        + dq_part[base + fx.Int64(_ri), col + fx.Int32(j)]
+                if const_expr(max_attn_len > 0):
+                    # Written iff this tile serves the row. Measured, not
+                    # assumed: NaN-poisoning the scratch found every unwritten
+                    # element inside what this excludes (3,826 unwritten, all
+                    # within the 4,034 excluded). A `select`, not a multiply --
+                    # an unwritten slot may hold a NaN and 0 * NaN is NaN.
+                    _hi = (t_i + fx.Int32(1)) * fx.Int32(block_m) + fx.Int32(
+                        max_attn_len
                     )
+                    _served = rr[s] < _hi
+                    if const_expr(has_targets):
+                        # Mirrors the fused kernel's `q_upper` reopening: once
+                        # a tile's window reaches past max_id it serves EVERY
+                        # row, because the clamped target rows land there.
+                        _served = _served | (_hi > max_id)
+                for j in range_constexpr(VEC):
+                    _val = dq_part[base + fx.Int64(_ri), col + fx.Int32(j)]
+                    if const_expr(max_attn_len > 0):
+                        _val = _served.select(_val, fx.Float32(0.0))
+                    nxt.append(acc[s * VEC + j] + _val)
             acc = yield nxt
 
         res = [
@@ -1903,6 +1939,7 @@ def build_hstu_attention_bwd_dq_reduce(
         part_off: fx.Tensor,
         red_map: fx.Tensor,
         seq_offsets: fx.Tensor,
+        num_targets: fx.Tensor,
         dq_acc: fx.Tensor,
         out_dq: fx.Tensor,
         tile_lo: fx.Int32,
@@ -1914,6 +1951,7 @@ def build_hstu_attention_bwd_dq_reduce(
             part_off,
             red_map,
             seq_offsets,
+            num_targets,
             dq_acc,
             out_dq,
             tile_lo,
