@@ -157,7 +157,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         if float(situ_linear_beta) <= 0.0:
             raise ValueError(f"situ_linear_beta must be > 0, got {situ_linear_beta!r}")
     num_buffers = min(num_buffers, max(1, K // tile_k))
-    has_bias = 1 if bias is not None else 0
+    has_bias = 0 if bias is None else (2 if bias.dtype == torch.float32 else 1)
     bias_ptr = ptr_arg(bias) if bias is not None else ptr_arg(a)
     quant_scale_tensor = out if quant_scale is None else quant_scale.view(torch.uint8)
     n_tiles = (N + tile_n - 1) // tile_n
