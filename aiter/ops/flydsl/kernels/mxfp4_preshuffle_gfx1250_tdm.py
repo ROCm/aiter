@@ -35,7 +35,7 @@ from .mega_moe_gfx1250.tdm_gather_shim import (
     make_tensor_gather_descriptor,
     tensor_store_gather,
 )
-from .mega_moe_gfx1250.types import COMBINE_SCALE_BLOCK
+from .mega_moe_gfx1250.types import COMBINE_SCALE_BLOCK, COMBINE_SLOT_ALIGN
 from .quant_utils import (
     emit_amax_e8m0_native_scale,
     emit_cvt_scalef32_pk8_fp4_bf16,
@@ -404,6 +404,11 @@ def launch_gemm_a8w4_tdm(
     _ep_planar = bool(enable_ep_scatter and ep_quant_bits and ep_scatter_per_rank)
     if _ep_planar and not (ep_scale_planar_offset and ep_scale_planar_slots):
         raise ValueError("the per-rank scatter on a quantized wire needs planar scales")
+    if _ep_planar and (tile_m | ep_scale_planar_slots) % COMBINE_SLOT_ALIGN:
+        raise ValueError(
+            f"planar scale stores need tile_m ({tile_m}) and planar slots "
+            f"({ep_scale_planar_slots}) in whole {COMBINE_SLOT_ALIGN}-slot blocks"
+        )
     _lds_scale_row_bytes = (
         (EP_SCALE_ROW_BYTES if _ep_planar else _lds_pitch(EP_SCALE_ROW_BYTES))
         if ep_quant_bits
@@ -2189,24 +2194,34 @@ def launch_gemm_a8w4_tdm(
                             ),
                         )
                         # One contiguous run per 256-column block of the planar
-                        # scale region.
+                        # scale region, widened to whole COMBINE_SLOT_ALIGN
+                        # blocks: the plan pads the run's slots out to them and
+                        # keeps slot - row a multiple, so the extra rows only
+                        # land in that padding.
+                        if const_expr(_ep_planar):
+                            s_r0 = r0 & fx.Int32(-COMBINE_SLOT_ALIGN)
+                            s_rows = (
+                                (r0 + run_rows + fx.Int32(COMBINE_SLOT_ALIGN - 1))
+                                & fx.Int32(-COMBINE_SLOT_ALIGN)
+                            ) - s_r0
+                            s_slot = slot - (r0 - s_r0)
                         for blk in range_constexpr(
                             tile_n // _PLANAR_COLS if _ep_planar else 0
                         ):
                             TDM.tdm_store(
                                 TDM.tdm_group0(
-                                    _lds_c0 + _ep_scale_lds_at(r0, blk * 8),
+                                    _lds_c0 + _ep_scale_lds_at(s_r0, blk * 8),
                                     _ep_lsa0
                                     + fx.Int64(p) * _pr
                                     + fx.Int64(ep_scale_planar_offset)
                                     + (
                                         fx.Int64(blk_n // fx.Int32(_PLANAR_COLS) + blk)
                                         * fx.Int64(ep_scale_planar_slots)
-                                        + fx.Int64(slot)
+                                        + fx.Int64(s_slot)
                                     )
                                     * fx.Int64(8),
                                 ),
-                                TDM.tdm_group1_run(run_rows, 8),
+                                TDM.tdm_group1_run(s_rows, 8),
                             )
                 tdm_ops.tensor_wait(0)
             elif const_expr(enable_ep_scatter):
