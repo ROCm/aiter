@@ -221,7 +221,6 @@ def fused_qk_norm_rope_group_quant_gfx1250(
     shared_layout: gl.constexpr,
 ):
 
-
     Q_PROGRAMS_PER_TOKEN: gl.constexpr = NUM_HEADS // HEADS_PER_PROGRAM
     NUM_STEPS: gl.constexpr = HEADS_PER_PROGRAM // ROWS_PER_STEP
     gl.static_assert(NUM_HEADS % HEADS_PER_PROGRAM == 0)
