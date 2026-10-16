@@ -413,9 +413,9 @@ def build_schedule(kc: KernelCtx) -> dict:
                     (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(8)) * i32(8), 0, 0)
         gbar(L, tid, a, P)
         # --- PASS 3 (combine): echunk=bid rows (R + L_RIX from pass 0, same CTA).
+        #     All NW compute waves scatter (combine_send strides the rows across waves).
         if live:
             rc = lds_ld_i32(L, L_CTL + C_UROWS * 4)
-            if tid < i32(64):
-                combine_send(L, tid, a, rsrc(a["gout"]), bid, rc)
+            combine_send(L, tid, a, rsrc(a["gout"]), bid, rc)
 
     return locals()

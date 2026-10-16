@@ -60,6 +60,7 @@ from .mega_moe_ep_config import (
     NCTA_MAX,
     NT,
     NTT,
+    NW,
     KernelCtx,
 )
 
@@ -294,17 +295,23 @@ def build_communication(kc: KernelCtx) -> dict:
 
     # --- combine (GEMM2 epilog scatter back to source + source-side weighted sum) --
     @flyc.jit
-    def combine_send(L, lane, a, src_out, e, nrows):
+    def combine_send(L, tid, a, src_out, e, nrows):
         """Combine pass (per echunk ``e``): scatter the echunk's ``nrows`` output rows
         (row k's recv slot = L_RIX[k], its H bf16 output at ``src_out`` row e*RG+k) back
         to each row's SOURCE rank's ``part`` region at (source_token*topk + route), then
         signal that source (combine_arrive). ``src_out`` is the shared gout; ``nrows`` the
-        echunk's gathered row count (L_RIX holds the recv-slot ids from the gather pass)."""
+        echunk's gathered row count (L_RIX holds the recv-slot ids from the gather pass).
+
+        Runs on ALL ``NW`` compute waves (not one): the scatter is a latency-bound
+        cross-rank P2P stream, so striding the rows across the waves (each a 64-lane
+        row scatter) multiplies the outstanding writes to better fill xGMI."""
         mtpr = a["mtpr"]
         m = a["m"]
         parity = a["epoch"] & i32(1)
         HV = H // 8
-        for k_ in range(i32(0), nrows, i32(1)):
+        wave = tid // i32(64)
+        lane = tid % i32(64)
+        for k_ in range(wave, nrows, i32(NW)):
             k = i32(k_)
             idx = lds_ld_i32(L, L_RIX + k * i32(4))
             sk = idx // i32(TOPK)
