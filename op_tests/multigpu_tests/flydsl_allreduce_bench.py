@@ -599,7 +599,6 @@ def provenance(args, link: str, extra: list[str] = ()) -> list[str]:
     return [
         f"- generated: {datetime.now().astimezone():%Y-%m-%d %H:%M:%S %Z}",
         (
-            #f"- device: {torch.cuda.get_device_name(0)} [{p.gcnArchName}, "
             f"- device: {torch.cuda.get_device_name(0)} [{get_gfx()}, "
             f"{p.multi_processor_count} CU, {p.total_memory / 2**30:.0f} GiB]"
         ),

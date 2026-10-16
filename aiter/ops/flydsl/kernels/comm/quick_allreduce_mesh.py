@@ -198,12 +198,12 @@ def make_quick_allreduce_mesh_kernel(
         raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
 
     if fusion == "none":
-        epi = QuickReducePlainEpilogue(block=block, world_size=world_size)
+        epilogue = QuickReducePlainEpilogue(block=block, world_size=world_size)
     else:
-        epi = MeshRMSNormEpilogue(
+        epilogue = MeshRMSNormEpilogue(
             hidden=hidden, h_pad=h_pad, block=block, world_size=world_size
         )
-    block = epi.block
+    block = epilogue.block
     tile_i32 = block * ATOMS * 4
     tile_bytes = tile_i32 * 4
 
@@ -269,7 +269,7 @@ def make_quick_allreduce_mesh_kernel(
     lds_bytes = pack_rows * c.rank_tile_bytes
 
     # The epilogue's per-wave LDS partials, if any, follow the pack staging.
-    lds_bytes += epi.partial_floats * 4
+    lds_bytes += epilogue.partial_floats * 4
     PackStorage = make_pack_storage(pack_i32)
 
     # flags_i32 is also the i32 offset of the wire area, so the flag prefix has
@@ -348,7 +348,7 @@ def make_quick_allreduce_mesh_kernel(
         # moves whole tiles through ``_payload_io``, a fused one reaches the
         # same rows as raw bf16 atoms. Its LDS, if any, comes from this kernel's
         # one allocator, after the pack staging.
-        ep = epi.bind(
+        ep = epilogue.bind(
             tid=tid,
             nbytes=nbytes,
             num_tiles=num_tiles,
@@ -802,10 +802,10 @@ def make_quick_allreduce_mesh_kernel(
     # both have to be part of the symbol name -- two variants that differ only
     # in cache bits or wire format must not collide in the JIT cache.
     tag = f"ws{world_size}_r{self_rank}_st{super_tile}_g{grid}_{inbox_memory}"
-    tag += f"_{codec}_b{block}" + epi.tag
+    tag += f"_{codec}_b{block}" + epilogue.tag
     launcher = (
         launch_quick_allreduce_mesh_fused
-        if epi.takes_operands
+        if epilogue.takes_operands
         else launch_quick_allreduce_mesh
     )
     launcher.func.__name__ = f"launch_quick_allreduce_mesh_{tag}"
@@ -823,7 +823,7 @@ def make_quick_allreduce_mesh_kernel(
         # from. Equal to tile_bytes unless the build is padded, where the wire
         # tile is rows_per_tile rows of h_pad but the footprint is
         # rows_per_tile rows of hidden.
-        "hbm_tile_bytes": epi.hbm_tile_bytes,
+        "hbm_tile_bytes": epilogue.hbm_tile_bytes,
         "tile_fp16": tile_bytes // 2,
         "rank_tile_bytes": c.rank_tile_bytes,
         "wire_tile_bytes": wire_tile_bytes,
@@ -838,5 +838,5 @@ def make_quick_allreduce_mesh_kernel(
         "grid": grid,
         "block": block,
         "rank": self_rank,
-        **epi.spec(),
+        **epilogue.spec(),
     }

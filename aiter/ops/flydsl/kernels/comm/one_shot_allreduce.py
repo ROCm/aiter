@@ -223,9 +223,9 @@ def make_one_shot_allreduce_kernel(
     release_scope = policy["release"]
 
     if fusion == "none":
-        epi = _PlainEpilogue(block=block, atoms=atoms)
+        epilogue = _PlainEpilogue(block=block, atoms=atoms)
     else:
-        epi = OneShotRMSNormEpilogue(
+        epilogue = OneShotRMSNormEpilogue(
             hidden=hidden,
             h_pad=h_pad,
             split=split,
@@ -234,8 +234,8 @@ def make_one_shot_allreduce_kernel(
             grid=grid,
             n_colors=INBOX_BUFFERS,
         )
-    block = epi.block
-    padded = epi.padded
+    block = epilogue.block
+    padded = epilogue.padded
 
     tile_bytes = block * atoms * ATOM_BYTES
     tile_i32 = tile_bytes // 4
@@ -295,9 +295,9 @@ def make_one_shot_allreduce_kernel(
             block=block,
             atoms_per_row=atoms,
             rows_per_tile=1,
-            row_stride_i32=epi.row_stride_i32,
+            row_stride_i32=epilogue.row_stride_i32,
             padded=padded,
-            hidden=epi.hidden,
+            hidden=epilogue.hidden,
             bound_rows=False,
         )
 
@@ -316,7 +316,7 @@ def make_one_shot_allreduce_kernel(
                 color = color - fx.Int32(INBOX_BUFFERS)
             return color
 
-        ep = epi.bind(
+        ep = epilogue.bind(
             tid=tid,
             bid=bid,
             io=io,
@@ -460,13 +460,8 @@ def make_one_shot_allreduce_kernel(
 
             Rank order, not a rotated order: every rank must accumulate in the
             same sequence or the results differ in the last bit across ranks.
-            ``cross_device_reduce`` makes the same promise for the same reason.
             Our own contribution comes out of the registers; the peers' come
             from *polled*, ``_poll``'s result.
-
-            Left unrounded: the epilogue rounds -- the plain one once, at the
-            end of the sum, and the fused one needs the fp32 accumulator for
-            the norm.
             """
             outs = []
             for atom in range_constexpr(atoms):
@@ -564,7 +559,7 @@ def make_one_shot_allreduce_kernel(
     tag = f"ws{world_size}_r{self_rank}_a{atoms}_g{grid}_{inbox_memory}_b{block}"
     if atoms > 1:
         tag += f"_{fanout}"
-    tag += epi.tag
+    tag += epilogue.tag
     launch_one_shot_allreduce.func.__name__ = f"launch_one_shot_allreduce_{tag}"
     try:
         one_shot_allreduce.func.__name__ = f"one_shot_allreduce_{tag}"
@@ -574,7 +569,7 @@ def make_one_shot_allreduce_kernel(
         "launch": launch_one_shot_allreduce,
         "flags_bytes": 0,
         "data_bytes": data_bytes,
-        "lds_bytes": epi.lds_bytes,
+        "lds_bytes": epilogue.lds_bytes,
         "tile_bytes": tile_bytes,
         # No handshake sector: a wire slot is just the payload.
         "wire_tile_bytes": tile_bytes,
@@ -594,5 +589,5 @@ def make_one_shot_allreduce_kernel(
         "inbox_fill": SENTINEL_FILL_BYTE,
         "grid": grid,
         "block": block,
-        **epi.spec(),
+        **epilogue.spec(),
     }

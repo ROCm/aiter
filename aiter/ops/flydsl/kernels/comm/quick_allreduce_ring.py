@@ -166,12 +166,12 @@ def make_quick_allreduce_ring_kernel(
     nxt = (rank + 1) % world_size
 
     if fusion == "none":
-        epi = QuickReducePlainEpilogue(block=block, world_size=world_size)
+        epilogue = QuickReducePlainEpilogue(block=block, world_size=world_size)
     else:
-        epi = RingRMSNormEpilogue(
+        epilogue = RingRMSNormEpilogue(
             hidden=hidden, h_pad=h_pad, block=block, world_size=world_size
         )
-    block = epi.block
+    block = epilogue.block
     quads_per_block = block // QUAD_LANES
     tile_i32 = block * ATOMS * 4
     tile_bytes = tile_i32 * 4
@@ -208,7 +208,7 @@ def make_quick_allreduce_ring_kernel(
     PackStorage = make_pack_storage(pack_i32)
 
     # The epilogue's per-wave LDS partials, if any, follow the pack staging.
-    lds_bytes = pack_i32 * 4 + epi.partial_floats * 4
+    lds_bytes = pack_i32 * 4 + epilogue.partial_floats * 4
 
     def _chunk_of(k: int) -> int:
         """Which chunk op *k* carries, following the standard ring schedule.
@@ -268,7 +268,7 @@ def make_quick_allreduce_ring_kernel(
         # moves atoms through ``_payload_io``, a fused one reaches the same rows
         # as raw bf16 atoms. Its LDS, if any, comes from this kernel's one
         # allocator, after the pack staging.
-        ep = epi.bind(
+        ep = epilogue.bind(
             tid=tid,
             nbytes=nbytes,
             num_tiles=num_tiles,
@@ -701,10 +701,10 @@ def make_quick_allreduce_ring_kernel(
         f"ws{world_size}_r{rank}_st{super_tile}_g{grid}_{inbox_memory}"
         f"_{rs_codec}_{ag_codec}"
     )
-    tag += f"_b{block}" + epi.tag
+    tag += f"_b{block}" + epilogue.tag
     launcher = (
         launch_quick_allreduce_ring_fused
-        if epi.takes_operands
+        if epilogue.takes_operands
         else launch_quick_allreduce_ring
     )
     launcher.func.__name__ = f"launch_quick_allreduce_ring_{tag}"
@@ -720,7 +720,7 @@ def make_quick_allreduce_ring_kernel(
         "tile_bytes": tile_bytes,
         # HBM bytes one tile spans -- what a tile *count* has to come from.
         # Equal to tile_bytes unless the build is padded.
-        "hbm_tile_bytes": epi.hbm_tile_bytes,
+        "hbm_tile_bytes": epilogue.hbm_tile_bytes,
         "tile_fp16": tile_bytes // 2,
         "rank_tile_bytes": rs.rank_tile_bytes,
         "wire_tile_bytes": wire_tile_i32[0] * 4,
@@ -739,6 +739,6 @@ def make_quick_allreduce_ring_kernel(
         "steps": steps,
         "grid": grid,
         "block": block,
-        "rows_per_chunk": epi.rows_per_chunk,
-        **epi.spec(),
+        "rows_per_chunk": epilogue.rows_per_chunk,
+        **epilogue.spec(),
     }
