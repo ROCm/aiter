@@ -382,8 +382,9 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
             return [(tasks[0] if tasks else "unknown", float("inf"), 1.0)]
 
 
-def get_pid():
-    time.sleep(3)
+def get_pid(delay=3):
+    if delay:
+        time.sleep(delay)
     return mp.current_process().pid
 
 
@@ -491,7 +492,10 @@ def mp_tuner(
         initializer=_init_task_start_times,
         initargs=(task_start_times, task_pids),
     )
-    pids = [pool.apply_async(get_pid) for i in range(start_idx, mp_num)]
+    pid_delay = 0 if mp_num == 1 else 3
+    pids = [
+        pool.apply_async(get_pid, args=(pid_delay,)) for i in range(start_idx, mp_num)
+    ]
     gpu_map = {el.get(): i + start_idx for i, el in enumerate(pids)}
     rets_dict = submit_tasks(pool, gpu_map, range(len(task_group)))
     # Convert to list for compatibility with existing code

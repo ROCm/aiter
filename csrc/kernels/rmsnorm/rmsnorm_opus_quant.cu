@@ -6,7 +6,11 @@
 
 #include "rmsnorm.h"
 
+#ifdef _WIN32
+#define OPUS_EXPORT extern "C" __declspec(dllexport)
+#else
 #define OPUS_EXPORT extern "C" __attribute__((visibility("default")))
+#endif
 
 // Fused rmsnorm + quant. residual/residual_out/xscale/unquant = 0 to disable.
 // residual_out != residual => out-of-place fused add (no host staging copy). out_code: 0=int8,1=fp8.

@@ -1,9 +1,9 @@
 # FlyDSL AOT Pre-compilation & Tests
 
 This directory holds the **AOT (Ahead-Of-Time) pre-compilation entry points** for
-FlyDSL kernels. Each module extracts every unique FlyDSL kernel name from aiter's
-tuned CSV configs and compiles them into the cache up front, so that at runtime
-the JIT path hits the cache instead of compiling again.
+FlyDSL kernels. Each module derives the runtime-reachable jobs from aiter's
+tuned CSV configs—including ABI/cache variants that share a kernel name—and
+compiles them up front so the runtime JIT path hits the cache.
 
 | Module | OpKind | Description |
 | --- | --- | --- |
@@ -61,6 +61,11 @@ python -m aiter.aot.flydsl.mega_moe
 python -m aiter.aot.flydsl.mega_moe --experts-per-rank 48
 ```
 
+FHMoE stage-1 kernels use distinct cache identities for clamped and unclamped
+shared SiLU. MXFP8/FP8 shared-expert rows automatically emit both
+`clamp_shared=True` and `False` jobs; existing MXFP4/FP8 DSV4 rows remain
+clamped-only.
+
 The FP8 flash-attention kernel picks its tile, rescale threshold and split-K
 factor per call, so a serving process JIT-compiles each new combination on the
 request path. `fmha_fp8` enumerates every combination the wrapper's heuristics
@@ -98,14 +103,15 @@ python -m aiter.aot.flydsl.chunk_gdn_h --csv /path/to/tuned.csv
 | `AITER_FLYDSL_AOT_TIMEOUT` | Per-kernel wall-clock cap (seconds). A worker stuck *alive* past this is killed (and retried); `0` disables. | `1200` |
 | `AITER_FLYDSL_AOT_MAX_RETRIES` | Retries for a worker that **died abnormally** (OOM-kill / segfault / timeout-kill). A clean compile error is never retried. `0` disables. | `2` |
 | `AITER_CONFIGS` | Resolves the default CSV lookup path (same as the runtime JIT) | repo built-in |
-| `ARCH` / `GPU_ARCHS` | Selects which jobs to build, not what arch a job compiles *for* (that comes from the CSV's `cu_num`). `conv.py` applies it inside `parse_csv`, so both `python -m` and the `setup.py` path (`run_aot`) honour it. `gemm.py` still filters in `main()` only, so `run_aot` builds all of its archs. | auto-detect |
+| `ARCH` / `GPU_ARCHS` | Selects which jobs to build, not what arch a job compiles *for* (that comes from the CSV's `gfx`, with legacy `cu_num` fallback). `conv.py` applies it inside `parse_csv`, so both `python -m` and the `setup.py` path (`run_aot`) honour it. `gemm.py` still filters in `main()` only, so `run_aot` builds all of its archs. | auto-detect |
 
 > **About the compile target arch.** The arch each kernel is actually compiled
-> for is derived per-job from the CSV's `cu_num` column (`cu_num_to_arch(...)`)
-> and applied internally via `FLYDSL_GPU_ARCH`. That internal var is overwritten
+> for is taken from the CSV's `gfx` column, with `cu_num_to_arch(...)` retained
+> as a fallback for legacy rows, and applied internally via `FLYDSL_GPU_ARCH`.
+> That internal var is overwritten
 > for every job, so setting `ARCH` / `GPU_ARCHS` / `FLYDSL_GPU_ARCH` in your shell
-> does **not** change what gets built. To cross-compile, edit the `cu_num`
-> column in the CSV.
+> does **not** change what gets built. To cross-compile, use the target `gfx` and
+> `cu_num` values in the CSV.
 
 Example:
 

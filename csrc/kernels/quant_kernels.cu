@@ -1344,6 +1344,165 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
     }
 }
 
+// MXFP8 1x32 quant whose e8m0 scale is written straight into the gfx1250 MXFP8 ASM GEMM's
+// A-scale layout ("m32k4", the byte layout of shuffle_mxfp8fp4_scale):
+//     scale[(m / 32) * K + (g / 4) * 128 + (m % 32) * 4 + g % 4],   g = k / 32
+// i.e. one contiguous 128B block per 32 rows x 128 columns. Rows are padded to a multiple of
+// 32; the pad rows' scales are written as 0x7F (2^0, the shuffle_mxfp8fp4_scale pad value),
+// so the caller only allocates (pad32(M), K/32) bytes and never pre-fills it.
+//
+// A lane holds 16 contiguous elements (32B load, 16B fp8 store) and two lanes form a group, so
+// a 32-lane slice covers four rows of a 32x128 tile per step. A slice runs kSteps steps and
+// 32 / (4 * kSteps) slices share a tile; all of a slice's loads are issued before its first
+// convert. The only cross-lane op is a quad-perm DPP, so nothing depends on the wave size. The
+// amax / e8m0 rounding / saturation below mirror the g32 path of
+// dynamic_per_group_scaled_quant_kernel, so the fp8 output and the unshuffled scale are
+// bit-identical to that path.
+template <typename DTYPE_I, int kWaves, int kSteps>
+__global__ void __launch_bounds__(kWaves * 32)
+dynamic_per_group_quant_m32k4_kernel(opus::fp8_t* __restrict__ out,
+                                     uint8_t* __restrict__ scale,
+                                     DTYPE_I const* __restrict__ input,
+                                     int64_t rows,
+                                     int32_t cols,
+                                     int64_t row_stride)
+{
+    static constexpr int kElems = 16; // per lane: two lanes per 32-element group
+    // A slice covers 4 * kSteps rows of one 128-column tile; kSlices slices cover its 32 rows.
+    static constexpr int kSlices = 32 / (4 * kSteps);
+    static_assert(kSteps * 4 * kSlices == 32 && kWaves % kSlices == 0);
+    using vec_i = opus::vector_t<DTYPE_I, kElems>;
+    using vec_o = opus::vector_t<opus::fp8_t, kElems>;
+#if defined(__gfx1250__)
+    static constexpr bool kHwConvertDiv = std::is_same_v<DTYPE_I, opus::bf16_t>;
+#else
+    static constexpr bool kHwConvertDiv = false;
+#endif
+    static constexpr bool kScaleMayClip =
+        aiter::kDefaultMxScaleRoundMode == aiter::MxScaleRoundMode::RoundDown ||
+        aiter::kDefaultMxScaleRoundMode == aiter::MxScaleRoundMode::Even;
+#if defined(__gfx942__)
+    static constexpr aiter::MxDtype kMxDtype = aiter::MxDtype::FP8_E4M3_FNUZ;
+#else
+    static constexpr aiter::MxDtype kMxDtype = aiter::MxDtype::FP8_E4M3;
+#endif
+
+    const int lane     = threadIdx.x % 32;
+    const int slice    = threadIdx.x / 32;
+    const int32_t kt   = blockIdx.x * (kWaves / kSlices) + slice / kSlices; // 128-column tile
+    if(kt * 128 >= cols)
+        return;
+    const int64_t row0 = static_cast<int64_t>(blockIdx.y) * 32;
+    const int rbase    = (slice % kSlices) * 4 * kSteps; // first row of this slice in the tile
+    const int rsub     = rbase + lane / 8;
+    const int32_t col  = kt * 128 + (lane % 8) * kElems;
+
+    vec_i data[kSteps];
+    opus::static_for<kSteps>([&](auto s) {
+        const int64_t row = row0 + 4 * s.value + rsub;
+        if(row < rows)
+            data[s.value] = *reinterpret_cast<vec_i const*>(input + row * row_stride + col);
+    });
+
+    uint8_t* scale_blk = scale + (row0 / 32) * cols + kt * 128;
+    opus::static_for<kSteps>([&](auto s) {
+        const int r        = 4 * s.value + rsub; // row within the 32-row block
+        const bool valid   = row0 + r < rows;
+        vec_i thread_data  = data[s.value];
+        float absMax       = 1e-10f;
+        for(int j = 0; j < kElems; ++j)
+            absMax = max(absMax, abs(static_cast<float>(thread_data[j])));
+        absMax = multithread_reduce(absMax, aiter::Max(), 2);
+        bool degenerate_group = false;
+        if constexpr(kHwConvertDiv)
+        {
+            degenerate_group = !(absMax < __builtin_inff());
+            absMax           = fminf(absMax, 448.0f * 0x1.0p119f);
+        }
+        const float row_scale =
+            aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, kMxDtype>(absMax);
+        if(lane % 2 == 0)
+            scale_blk[r * 4 + (lane % 8) / 2] =
+                valid ? static_cast<uint8_t>((__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0xFF)
+                      : uint8_t{0x7F};
+        if(!valid)
+            return;
+        if constexpr(kHwConvertDiv)
+        {
+            if(kScaleMayClip || degenerate_group)
+            {
+                const float hi = 448.0f * row_scale;
+                for(int j = 0; j < kElems; ++j)
+                {
+                    const float v = static_cast<float>(thread_data[j]);
+                    if(v > hi)
+                        thread_data[j] = static_cast<DTYPE_I>(hi);
+                    if(v < -hi)
+                        thread_data[j] = static_cast<DTYPE_I>(-hi);
+                }
+            }
+        }
+        const vec_o q = scaled_cast_div<opus::fp8_t>(thread_data, row_scale);
+        *reinterpret_cast<vec_o*>(out + (row0 + r) * cols + col) = q;
+    });
+}
+
+static void dynamic_per_group_quant_m32k4(aiter_tensor_t& out,
+                                          const aiter_tensor_t& input,
+                                          aiter_tensor_t& scales,
+                                          int group_size,
+                                          const std::optional<aiter_tensor_t>& num_rows,
+                                          hipStream_t stream)
+{
+    int const cols       = input.size(-1);
+    int64_t const rows   = input.numel() / cols;
+    int64_t const rstride = input.ndim > 1 ? input.stride(-2) : cols;
+    AITER_CHECK(group_size == 32, __func__, " m32k4 scale layout needs group_size 32, got ", group_size);
+    AITER_CHECK(out.dtype() == AITER_DTYPE_fp8, __func__, " m32k4 scale layout needs fp8 output, got ",
+                AiterDtype_to_str(out.dtype()));
+    AITER_CHECK(scales.dtype() == AITER_DTYPE_fp8_e8m0 || scales.dtype() == AITER_DTYPE_u8, __func__,
+                " m32k4 scale layout needs an e8m0/u8 scale, got ", AiterDtype_to_str(scales.dtype()));
+    AITER_CHECK(!num_rows.has_value(), __func__, " m32k4 scale layout does not support num_rows");
+    AITER_CHECK(input.dtype() == AITER_DTYPE_bf16 || input.dtype() == AITER_DTYPE_fp16, __func__,
+                " m32k4 scale layout needs bf16/fp16 input, got ", AiterDtype_to_str(input.dtype()));
+    AITER_CHECK(cols % 128 == 0, __func__, " m32k4 scale layout needs K % 128 == 0, got ", cols);
+    AITER_CHECK(input.stride(-1) == 1 && rstride % 16 == 0 &&
+                    reinterpret_cast<uintptr_t>(input.data_ptr()) % 32 == 0,
+                __func__, " m32k4 quant needs 32B-aligned contiguous input rows");
+    AITER_CHECK(out.is_contiguous() && scales.is_contiguous(), __func__,
+                " m32k4 quant needs contiguous out and scales");
+    const int64_t rows_pad = (rows + 31) / 32 * 32;
+    AITER_CHECK(scales.numel() >= rows_pad * (cols / 32), __func__,
+                " m32k4 scale needs (pad32(M), K/32) = (", rows_pad, ", ", cols / 32,
+                ") bytes, got numel ", scales.numel());
+    AITER_CHECK(rows_pad / 32 <= 65535, __func__, " m32k4 quant supports M <= 2097120, got ", rows);
+    if(rows == 0)
+        return;
+
+    const int ktiles = cols / 128;
+    auto launch = [&](auto waves_tag, auto steps_tag) {
+        constexpr int kWaves  = decltype(waves_tag)::value;
+        constexpr int kSteps  = decltype(steps_tag)::value;
+        constexpr int kTilesPerBlock = kWaves / (32 / (4 * kSteps));
+        dim3 const grid((ktiles + kTilesPerBlock - 1) / kTilesPerBlock,
+                        static_cast<uint32_t>(rows_pad / 32));
+        dim3 const block(kWaves * 32);
+        AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "dynamic_per_group_quant_m32k4", [&] {
+            using input_dtype = typename aiter::hip2opus<scalar_t>::type;
+            dynamic_per_group_quant_m32k4_kernel<input_dtype, kWaves, kSteps>
+                <<<grid, block, 0, stream>>>(reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
+                                             reinterpret_cast<uint8_t*>(scales.data_ptr()),
+                                             reinterpret_cast<input_dtype const*>(input.data_ptr()),
+                                             rows,
+                                             cols,
+                                             rstride);
+        });
+    };
+    // One 4-row step per wave, eight waves per 32x128 tile.
+    // Fewer rows per wave means more waves in flight; 8x1 gives 8 waves/SIMD at this shape.
+    launch(std::integral_constant<int, 8>{}, std::integral_constant<int, 1>{});
+}
+
 // Canonical dynamic per-group scaled quant. Accepts fp8 / i8 / fp4x2 output;
 // the per-group scale layout is selected by ``scales.dtype()``:
 //   * AITER_DTYPE_fp8_e8m0 / u8 -> e8m0 byte scale (one byte per group of
@@ -1359,8 +1518,17 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                                     int group_size,
                                     bool shuffle_scale,
                                     std::optional<aiter_tensor_t> num_rows,
-                                    int num_rows_factor)
+                                    int num_rows_factor,
+                                    bool scale_layout_m32k4)
 {
+    if(scale_layout_m32k4)
+    {
+        // Separate kernel; shuffle_scale / num_rows_factor do not apply to this layout.
+        HipDeviceGuard device_guard(input.device_id);
+        dynamic_per_group_quant_m32k4(
+            out, input, scales, group_size, num_rows, aiter::getCurrentHIPStream());
+        return;
+    }
     AITER_CHECK(group_size == 32 || group_size == 64 || group_size == 128,
                 __func__,
                 " only support group_size [32, 64 , 128]");
