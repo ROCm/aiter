@@ -1,0 +1,67 @@
+# A/B baseline: use image vllm-aiter-main and drop the AITER_FLY_AR* envs. Set TP=2|4|8 (and limit the visible GPUs accordingly).
+docker run \
+  --rm \
+  --name vllm-openai-rocm \
+  -e HSA_NO_SCRATCH_RECLAIM="1" \
+  -e VLLM_ROCM_QUICK_REDUCE_QUANTIZATION="INT4" \
+  -e VLLM_ROCM_USE_AITER="1" \
+  -e VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS="1" \
+  -e SAFETENSORS_FAST_GPU="1" \
+  -e AITER_FLY_AR="1" \
+  -e AITER_FLY_AR_LINK="pcie" \
+  -e AITER_QUICK_REDUCE_QUANTIZATION="INT4" \
+  -e AITER_FLY_AR_FUSED_HIDDENS="7168" \
+  -e HF_TOKEN="*************************************" \
+  --entrypoint "" \
+  --network host \
+  --ipc host \
+  -v /raid/huggingface/hub/:/root/.cache/huggingface/hub \
+  --device /dev/dri:/dev/dri \
+  --device /dev/kfd:/dev/kfd \
+  --security-opt seccomp=unconfined \
+  --shm-size 128G \
+  vllm-aiter-ar \
+  vllm serve deepseek-ai/DeepSeek-V4-Pro-0813 \
+    --async_scheduling \
+    --no-enable_log_requests \
+    --block_size 256 \
+    --max-num-batched-tokens 8192 \
+    --compilation_config '{"mode": 3, "cudagraph_mode": "FULL_DECODE_ONLY"}' \
+    --distributed-executor-backend mp \
+    --gpu_memory_utilization 0.95 \
+    --no_enable_prefix_caching \
+    --port 8001 \
+    --tensor_parallel_size ${TP:-8} \
+    --trust_remote_code \
+    --kv-cache-dtype fp8_e4m3 \
+    --tokenizer-mode deepseek_v4 \
+    --tool-call-parser deepseek_v4 \
+    --enable-auto-tool-choice \
+    --reasoning-parser deepseek_v4 \
+    --profiler-config.profiler torch \
+    --profiler-config.torch_profiler_dir /tmp/traces \
+    --profiler-config.torch_profiler_record_shapes true \
+    --profiler-config.torch_profiler_with_stack false
+
+
+
+# ============================================================
+# COMMANDS (run against the server)
+# ============================================================
+
+# Command 1: sglang_bench_serve
+python -m sglang.bench_serving \
+  --backend vllm \
+  --dataset-name random \
+  --model deepseek-ai/DeepSeek-V4-Pro-0813 \
+  --port 8001 \
+  --random-range-ratio 0.8 \
+  --ready-check-timeout-sec 7200 \
+  --request-rate inf \
+  --profile \
+  --random-input-len 60000 \
+  --random-output-len 100 \
+  --max-concurrency 4 \
+  --seed 15 \
+  --warmup-requests 4 \
+  --num-prompts 2
