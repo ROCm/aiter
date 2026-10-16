@@ -115,7 +115,7 @@ def test_legacy_runtime_falls_back_without_querying_attribute(hip, version):
     hip.hipRuntimeGetVersion.assert_called_once()
 
 
-@pytest.mark.parametrize("version", [70_000_000, 70_100_000])
+@pytest.mark.parametrize("version", [70_000_000, 70_100_000, 71_526_333])
 def test_supported_runtime_queries_attribute(hip, version):
     hip.hipRuntimeGetVersion.side_effect = _hip_result(version)
     assert chip_info.get_num_xcds() == 4
@@ -245,7 +245,8 @@ def test_loader_does_not_probe_loaded_runtimes_on_windows(fresh_loader, monkeypa
 
 
 @pytest.mark.parametrize(
-    "version, attribute", [(70_000_000, 10019), (70_100_000, 10020)]
+    "version, attribute",
+    [(70_000_000, 10019), (70_100_000, 10020), (71_526_333, 10020)],
 )
 def test_pci_chip_id_attribute_follows_runtime_version(hip, version, attribute):
     hip.archs[0] = "gfx942:sramecc+:xnack-"
@@ -261,3 +262,18 @@ def test_pci_chip_id_raises_on_unknown_version(hip):
     with pytest.raises(RuntimeError, match="PciChipId attribute of device 0"):
         chip_info.get_device_name()
     hip.hipDeviceGetAttribute.assert_not_called()
+
+
+def test_windows_library_names_search_the_rocm_home(monkeypatch, tmp_path):
+    monkeypatch.setattr(hip_runtime.sys, "platform", "win32")
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "amdhip64_7.dll").touch()
+    rocm_home = SimpleNamespace(_find_rocm_home=lambda: str(tmp_path))
+    monkeypatch.setitem(sys.modules, "cpp_extension", rocm_home)
+    assert hip_runtime._library_names() == (
+        str(tmp_path / "bin" / "amdhip64_7.dll"),
+        "amdhip64.dll",
+    )
+
+    rocm_home._find_rocm_home = lambda: None
+    assert hip_runtime._library_names() == ("amdhip64.dll",)
