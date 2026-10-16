@@ -29,25 +29,6 @@ def has_mori() -> bool:
     return _has_module("mori")
 
 
-@cache
-def _mori_cco_communicator_cls():
-    """Import the optional CCO binding only when the v2 backend is requested."""
-    from mori.cco import Communicator
-
-    return Communicator
-
-
-@cache
-def _mori_v2_op_types():
-    """Return MORI v2's config and op classes without importing them at startup."""
-    from mori.ops.dispatch_combine_v2 import (
-        EpDispatchCombineConfig,
-        EpDispatchCombineOp,
-    )
-
-    return EpDispatchCombineConfig, EpDispatchCombineOp
-
-
 def _is_gfx125x() -> bool:
     """Runtime arch check for the EP backend.
 
@@ -205,7 +186,8 @@ class MoriV2All2AllManager(All2AllManagerBase):
         self._cco_lock = threading.RLock()
 
     def _create_cco_communicator(self, per_rank_vmm: int):
-        Communicator = _mori_cco_communicator_cls()
+        from mori.cco import Communicator
+
         uid = Communicator.get_unique_id() if self.rank == 0 else None
         objects = [uid]
         root_global_rank = torch.distributed.get_global_rank(self.cpu_group, 0)
@@ -276,9 +258,13 @@ class MoriV2All2AllManager(All2AllManagerBase):
             return comm
 
     def _make_handle(self, comm, **kwargs):
-        config_cls, op_cls = _mori_v2_op_types()
-        config = config_cls(**kwargs)
-        return op_cls(config, comm)
+        from mori.ops.dispatch_combine_v2 import (
+            EpDispatchCombineConfig,
+            EpDispatchCombineOp,
+        )
+
+        config = EpDispatchCombineConfig(**kwargs)
+        return EpDispatchCombineOp(config, comm)
 
     def get_handle(self, kwargs, index: int = 0):
         """Return a cached MORI v2 dispatch/combine op.

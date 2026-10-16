@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import sys
+from types import ModuleType
 from typing import ClassVar
 
 import pytest
@@ -80,16 +82,23 @@ def manager(monkeypatch):
 
     monkeypatch.setattr(All2AllManagerBase, "__init__", init_base)
     monkeypatch.setattr(all2all, "has_mori", lambda: True)
-    monkeypatch.setattr(
-        all2all,
-        "_mori_cco_communicator_cls",
-        lambda: FakeCcoCommunicator,
-    )
-    monkeypatch.setattr(
-        all2all,
-        "_mori_v2_op_types",
-        lambda: (FakeConfig, FakeOp),
-    )
+
+    mori_module = ModuleType("mori")
+    mori_module.__path__ = []
+    cco_module = ModuleType("mori.cco")
+    cco_module.Communicator = FakeCcoCommunicator
+    ops_module = ModuleType("mori.ops")
+    ops_module.__path__ = []
+    v2_module = ModuleType("mori.ops.dispatch_combine_v2")
+    v2_module.EpDispatchCombineConfig = FakeConfig
+    v2_module.EpDispatchCombineOp = FakeOp
+    mori_module.cco = cco_module
+    mori_module.ops = ops_module
+    ops_module.dispatch_combine_v2 = v2_module
+    monkeypatch.setitem(sys.modules, "mori", mori_module)
+    monkeypatch.setitem(sys.modules, "mori.cco", cco_module)
+    monkeypatch.setitem(sys.modules, "mori.ops", ops_module)
+    monkeypatch.setitem(sys.modules, "mori.ops.dispatch_combine_v2", v2_module)
     monkeypatch.setattr(
         all2all.torch.distributed,
         "get_global_rank",
@@ -245,7 +254,11 @@ def test_destroy_closes_handles_before_communicator(manager, monkeypatch):
         def close(self):
             events.append("handle-close")
 
-    monkeypatch.setattr(all2all, "_mori_v2_op_types", lambda: (FakeConfig, OrderedOp))
+    monkeypatch.setattr(
+        sys.modules["mori.ops.dispatch_combine_v2"],
+        "EpDispatchCombineOp",
+        OrderedOp,
+    )
     monkeypatch.setattr(
         all2all.torch.distributed,
         "broadcast_object_list",
