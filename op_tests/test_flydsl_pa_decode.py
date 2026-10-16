@@ -695,7 +695,7 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs, reducer_kwargs):
     if case["reducer"] is not None:
         expected = dict(case["reducer"])
         # XCD order needs a device with several XCDs.
-        xcd = expected.pop("xcd") and pa._num_xcds(torch.cuda.current_device()) > 1
+        xcd = expected.pop("xcd") and pa.get_num_xcds() > 1
         selected = reducer_kwargs[-1]
         assert {key: selected[key] for key in expected} == expected
         assert (selected["num_xcds"] > 0) == xcd
