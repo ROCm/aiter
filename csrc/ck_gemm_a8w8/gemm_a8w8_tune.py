@@ -132,7 +132,11 @@ class GemmA8W8Tuner(GemmCommonTuner):
         if "q_dtype_w" in untunedf.columns:
             untunedf["q_dtype_w"] = untunedf["q_dtype_w"].map(
                 lambda s: (
-                    str(dtypes.normalize_fp8_dtype(eval(s)))
+                    str(
+                        dtypes.normalize_fp8_dtype(
+                            getattr(torch, s.strip().removeprefix("torch."))
+                        )
+                    )
                     if isinstance(s, str) and s.strip().startswith("torch.float8_e4m3")
                     else s
                 )
