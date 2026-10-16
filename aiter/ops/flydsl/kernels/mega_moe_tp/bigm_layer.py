@@ -238,6 +238,7 @@ def compile_bigm_layer(
     chunk runs next, outside the kernels).
     ext=1 (MoE kernel): each chunk's units (one per sorted block, after its gathered rows
     landed), the topk sums, the MoE-output RS, the final reduce + norm + FP8 and the q gather."""
+    spec = repr(sorted(locals().items()))  # every compile argument (the disk cache key, _bigm_cached)
     K1, NE = K + 1, E + 1
     PIT = H // 8 // NTH
 
@@ -956,10 +957,10 @@ def compile_bigm_layer(
 
         bc = _mori()[3](6)
         put_ptr = link_extern(
-            ffi("aiter_cco_sdma_put_ptr_rsig__thread", ["uint64", "int32", "uint64", "uint64", "uint64", "int32"], "int32"),
+            ffi("cco_sdma_put_ptr_rsig__thread", ["uint64", "int32", "uint64", "uint64", "uint64", "int32"], "int32"),
             bitcode_path=bc,
         )
-        sig_slot = link_extern(ffi("aiter_cco_sdma_signal_slot", ["uint64", "int32", "int32"], "uint64"), bitcode_path=bc)
+        sig_slot = link_extern(ffi("cco_sdma_signal_slot", ["uint64", "int32", "int32"], "uint64"), bitcode_path=bc)
 
         @flyc.jit
         def take_turn(q, nth):
@@ -2185,7 +2186,119 @@ def compile_bigm_layer(
 
     if CPU > 1:
         launch.compile_hints = {"waves_per_eu": CPU}  # CPU CTAs (of NW waves) per CU: <= 512 / CPU registers
+    launch._bigm_spec = spec
     return launch
+
+
+# ---- disk cache of the compiled big-M kernels ----
+# FlyDSL keeps kernels that link external bitcode (link_extern: the SDMA device functions here)
+# out of its disk cache -- its key does not cover the bitcode -- so every process would compile
+# every big-M variant again (~86 s each, all ranks waiting). The artifact itself pickles fine
+# (no post-load processors), so this keeps it on disk keyed by the compile arguments plus the
+# digest of everything else it is built from: these kernel sources, the SDMA bitcode, the
+# FlyDSL compiler (its own cache key) and the GPU arch.
+_DIGEST = None
+
+
+def _bigm_digest():
+    global _DIGEST
+    if _DIGEST is None:
+        import glob
+        import hashlib
+
+        from aiter.jit.utils.chip_info import get_gfx
+
+        from .sdma import sdma_bitcode
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        h = hashlib.sha256(get_gfx().encode())
+        srcs = sorted(glob.glob(os.path.join(here, "*.py"))) + sorted(glob.glob(os.path.join(here, "..", "*.py")))
+        for f in srcs + [sdma_bitcode(6)]:
+            with open(f, "rb") as fh:
+                h.update(fh.read())
+        try:
+            from flydsl.compiler.jit_function import _flydsl_key
+
+            h.update(_flydsl_key().encode())
+        except Exception:  # noqa: BLE001 (older / newer FlyDSL: its version instead)
+            import flydsl
+
+            h.update(str(getattr(flydsl, "__version__", "")).encode())
+        _DIGEST = h.hexdigest()
+    return _DIGEST
+
+
+def _bigm_cache_dir():
+    """FlyDSL's cache root (FLYDSL_RUNTIME_CACHE_DIR) / aiter_bigm; None when FlyDSL caching is off."""
+    try:
+        from flydsl.compiler.jit_function import env as fenv
+
+        root = fenv.runtime.cache_dir if fenv.runtime.enable_cache else None
+    except Exception:  # noqa: BLE001
+        root = os.environ.get("FLYDSL_RUNTIME_CACHE_DIR") or os.path.expanduser("~/.flydsl/cache")
+    return os.path.join(root, "aiter_bigm") if root else None
+
+
+def _bigm_cached(launch, args):
+    """Collective-free: make launch(*args)'s compiled artifact resident -- from this process's
+    memory, else the disk cache, else compiled (no kernel dispatch) and written to the disk
+    cache -- and its code object loaded. Returns how it was obtained."""
+    import hashlib
+    import pickle
+    import re
+    import tempfile
+
+    from ..tensor_shim import _preload_compiled
+
+    try:  # FlyDSL's in-process key of these arguments (private API: on any change, just compile)
+        launch._ensure_sig()
+        launch._ensure_cache_manager()
+        bound = launch._sig.bind(*args)
+        bound.apply_defaults()
+        ck = launch._build_full_cache_key(bound.arguments, effective_hints=launch._effective_compile_hints())
+        mem = launch._mem_cache
+    except Exception:  # noqa: BLE001
+        _preload_compiled(launch, *args)
+        return "compiled (no disk cache)"
+    if ck in mem:
+        mem[ck]._get_func_exe()
+        return "memory"
+    d = _bigm_cache_dir()
+    path = None
+    if d:
+        sig = re.sub(r" at 0x[0-9a-f]+", "", str(ck))
+        name = hashlib.sha256(f"{launch._bigm_spec}|{_bigm_digest()}|{sig}".encode()).hexdigest()[:32]
+        path = os.path.join(d, f"bigm_{name}.pkl")
+        if os.path.isfile(path):
+            try:
+                with open(path, "rb") as f:
+                    art = pickle.load(f)
+                art._get_func_exe()  # code object loaded here, not in the first launch
+                mem[ck] = art
+                return "disk"
+            except Exception as e:  # noqa: BLE001 (stale / corrupt entry: compile again)
+                import logging
+
+                logging.getLogger("aiter").warning("MegaMoeTP big-M: disk cache %s unusable (%s)", path, e)
+    _preload_compiled(launch, *args)
+    art = mem.get(ck)
+    if art is None and launch._last_compiled is not None and launch._last_compiled[0] == ck:
+        art = launch._last_compiled[1]
+    if art is None:
+        return "compiled (artifact not found)"
+    art._get_func_exe()
+    if path:
+        try:
+            os.makedirs(d, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
+            with os.fdopen(fd, "wb") as f:
+                pickle.dump(art, f)
+            os.replace(tmp, path)  # atomic: concurrent ranks write the same bytes
+        except Exception as e:  # noqa: BLE001
+            import logging
+
+            logging.getLogger("aiter").warning("MegaMoeTP big-M: disk cache write %s failed (%s)", path, e)
+    return "compiled"
 
 
 # per-batch tuned big-M configs (op_tests/op_benchmarks/flydsl/tune_mega_moe_tp_bigm.py):
@@ -2301,7 +2414,7 @@ class MegaMoeTPBigM:
         self.C = CMAX if self.weights is None else len(self.weights)
         assert self.C <= CMAX
         self._plans = {}
-        self._pads = {}
+        self._pads = None
         self.cfg = (float(eps), bool(gemma), float(scale), float(shared_w), float(swiglu_limit))
         self.opts = tuple(sorted((opts or {}).items()))  # tuned AITER_BIGM_* options
         od = dict(self.opts)
@@ -2372,6 +2485,17 @@ class MegaMoeTPBigM:
             self.ctrl2 = torch.zeros(CTRL_INTS + 32, dtype=torch.int32, device=dev)
             self._ws = {}
         self.chunks_t = {}
+        if self.io:  # moe()'s padding buffers (m not a multiple of PAD), the largest padded size
+            mpx = T // tp
+            self._pads = (
+                torch.zeros((mpx, H), dtype=bf, device=dev),
+                torch.zeros((mpx, K1), dtype=torch.float32, device=dev),
+                torch.full((mpx, K1), -1, dtype=torch.int32, device=dev),
+                torch.zeros((mpx, H), dtype=bf, device=dev),
+                torch.empty((tp * mpx, H), dtype=torch.uint8, device=dev),
+                torch.empty((tp * mpx,), dtype=torch.float32, device=dev),
+            )
+            self._pad_dirty = 0  # rows below may hold an earlier call's tokens / routes
         self._ready = set()
         self.cu = cu or torch.cuda.get_device_properties(dev).multi_processor_count
         # deepest A ring (dividing the GEMM1 chunk count) whose LDS fits a CU
@@ -2571,13 +2695,11 @@ class MegaMoeTPBigM:
         from ..tensor_shim import _run_compiled
 
         if launch not in self._ready:
-            # compile on every rank first: the kernel's waits on peers have a 2 s watchdog,
-            # a launch must not start while a peer is still compiling
+            # compile (or load) on every rank first: the kernel's waits on peers have a 2 s
+            # watchdog, a launch must not start while a peer is still compiling
             import torch.distributed as dist
 
-            from ..tensor_shim import _preload_compiled
-
-            _preload_compiled(launch, *args)
+            _bigm_cached(launch, args)
             torch.cuda.synchronize()
             dist.barrier(group=self.sd.group)
             self._ready.add(launch)
@@ -2651,28 +2773,18 @@ class MegaMoeTPBigM:
         assert mp * self.tp <= self.Tmax, (m, self.Tmax)
         if mp == m:
             return self._moe(x, topk_weights, topk_ids, out, tail, local)
-        pb = self._pads.get(mp)
-        if pb is None:
-            H, K1, dev = self.H, self.K1, self.device
-            pb = self._pads[mp] = [
-                torch.zeros((mp, H), dtype=torch.bfloat16, device=dev),
-                torch.zeros((mp, K1), dtype=torch.float32, device=dev),
-                torch.full((mp, K1), -1, dtype=torch.int32, device=dev),
-                torch.zeros((mp, H), dtype=torch.bfloat16, device=dev),
-                # q / scales of [rank][m] rows: sized for the largest m of this mp
-                torch.empty((self.tp * mp, H), dtype=torch.uint8, device=dev),
-                torch.empty((self.tp * mp,), dtype=torch.float32, device=dev),
-                mp,  # rows m.. hold no stale token / route from here on
-            ]
-        if pb[6] < m:
-            pb[6] = m
-        elif pb[6] > m:  # a smaller m than an earlier call of this mp: clear rows m..
-            pb[0][m:].zero_()
-            pb[1][m:].zero_()
-            pb[2][m:].fill_(-1)
-            pb[3][m:].zero_()
-            pb[6] = m
-        xp, twp, idp, rp, qc, qsc = pb[:6]
+        # one set of padded buffers (allocated at init, the largest padded size), sliced to mp:
+        # rows m.. of x / tw / ids / res must be zero / no route; rows below _pad_dirty may hold
+        # an earlier call's tokens
+        xp, twp, idp, rp, qc, qsc = self._pads
+        lo_, hi_ = m, min(self._pad_dirty, mp)
+        if hi_ > lo_:
+            xp[lo_:hi_].zero_()
+            twp[lo_:hi_].zero_()
+            idp[lo_:hi_].fill_(-1)
+            rp[lo_:hi_].zero_()
+        self._pad_dirty = max(m, self._pad_dirty) if self._pad_dirty > mp else m
+        xp, twp, idp, rp = xp[:mp], twp[:mp], idp[:mp], rp[:mp]
         qc, qsc = qc[: self.tp * m], qsc[: self.tp * m]
         xp[:m].copy_(x)
         twp[:m].copy_(topk_weights)
@@ -2695,6 +2807,49 @@ class MegaMoeTPBigM:
             y = out.copy_(y)
         return y if tail is None else (y, q, qs)
 
+    def _io_launch(self, m, tailq):
+        """the io kernel of m (a multiple of PAD) local rows"""
+        T = m * self.tp
+        eps, gemma, scale, shared_w, lim = self.cfg
+        w_, opts = self._plan(T)
+        rg, cpu, nab = self._geom(T)
+        order = 4 if self.tp * max(self._split(m)) >= 8192 else 3
+        return compile_bigm_layer(
+            self.H, self.I, self.E, self.K, self.tp, len(w_), eps, gemma, scale, shared_w, lim,
+            NAB=nab, order=order, opts=opts, RG=rg, CPU=cpu, io=1, tailq=tailq,
+        )
+
+    def io_rows_per_kernel(self, lo, hi):
+        """One local row count per distinct io kernel (whatever the tail) among the batches of
+        lo .. hi local rows (padded to PAD as moe() does): warming these up compiles every big-M
+        kernel such batches can launch."""
+        reps = {}
+        for m in range(-(-max(lo, 1) // PAD) * PAD, -(-hi // PAD) * PAD + 1, PAD):
+            reps.setdefault(self._io_launch(m, 0), m)
+        return sorted(reps.values())
+
+    def precompile(self, rows, tailq):
+        """Collective: the io kernels of these local row counts (tailq: 0 / 1 / 2 as moe()) into
+        the disk cache, split over the ranks -- rank r compiles every tp-th -- so a cold cache
+        costs about one compile, not one per kernel; the moe() warm-ups then load them. No-op
+        without a disk cache."""
+        import inspect
+
+        import torch
+        import torch.distributed as dist
+
+        if not _bigm_cache_dir():
+            return
+        mine = [m for i, m in enumerate(rows) if i % self.tp == self.rank]
+        for m in mine:
+            launch = self._io_launch(m, tailq)
+            if launch in self._ready:
+                continue
+            # (compile only: the argument values do not matter, their types are the launch's)
+            n = len(inspect.signature(launch.func).parameters)
+            _bigm_cached(launch, (0,) * (n - 1) + (torch.cuda.current_stream(),))
+        dist.barrier(group=self.sd.group)
+
     def _moe(self, x, topk_weights, topk_ids, out, tail, local):
         """moe() of m (a multiple of PAD) rows"""
         import torch
@@ -2708,14 +2863,8 @@ class MegaMoeTPBigM:
             res_in, res_out, norm_w = tail
         else:
             res_in, res_out, norm_w = x, self.resout, x
-        w_, opts = self._plan(T)
-        rg, cpu, nab = self._geom(T)
-        order = 4 if self.tp * max(self._split(m)) >= 8192 else 3
-        launch = compile_bigm_layer(
-            self.H, self.I, self.E, self.K, self.tp, len(w_), eps, gemma, scale, shared_w, lim,
-            NAB=nab, order=order, opts=opts, RG=rg, CPU=cpu, io=1,
-            tailq=0 if tail is None else 2 if local else 1,
-        )
+        launch = self._io_launch(m, 0 if tail is None else 2 if local else 1)
+        cpu = self._geom(T)[1]
         chunks = self._chunks(T)  # (first: it may grow the unit table)
         self.ctrl[:CTRL_INTS].zero_()
         self._run(

@@ -8,9 +8,8 @@ torch caching-allocator memory), not in a MORI window. A MORI window is a VMM al
 (hipMemCreate), which ROCm can refuse after a pageable host copy pinned a low heap address
 (KFD's SVM-range overlap check, reported as out of memory); hipMalloc'd memory is not affected.
 
-Needs MORI built with ``BUILD_CCO_SDMA=ON`` (unmodified: the device functions come from
-cco_sdma_rsig.cpp next to this file, compiled against MORI's installed CCO headers by
-``sdma_bitcode``) and ``MORI_ENABLE_SDMA=1``.
+Needs MORI built with ``BUILD_CCO_SDMA=ON`` whose CCO device wrapper (libmori_cco_device.bc)
+provides ``cco_sdma_put_ptr_rsig__thread`` / ``cco_sdma_signal_slot``, and ``MORI_ENABLE_SDMA=1``.
 """
 
 from __future__ import annotations
@@ -34,46 +33,12 @@ def _mori():
     return Communicator, CCODevCommRequirements, GDA_CONNECTION_NONE, sdma_bitcode
 
 
-_SDMA_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cco_sdma_rsig.cpp")
-_sdma_bc: dict = {}
-
-
 def sdma_bitcode(cov: int = 6) -> str:
-    """cco_sdma_rsig.cpp (aiter_cco_sdma_put_rsig__thread / aiter_cco_sdma_signal_slot) as LLVM
-    bitcode for code object version cov: compiled by MORI's JIT toolchain (the hipcc flags and
-    include dirs of MORI's own device wrapper) against the installed MORI headers, cached in
-    MORI's JIT cache (keyed by this source and those headers)."""
-    got = _sdma_bc.get(cov)
-    if got is not None:
-        return got
-    import tempfile
-    from pathlib import Path
-
+    """MORI's CCO device bitcode (code object version cov), which the big-M kernel links."""
     _mori()  # (AITER_MORI_PATH on sys.path)
-    from mori.jit.cache import get_cache_dir
-    from mori.jit.config import detect_build_config, detect_nic_type, get_mori_source_root
-    from mori.jit.core import FileBaton, _collect_include_dirs, _hipcc_device_bc, _strip_lifetime_intrinsics
+    from mori.cco.device.bitcode import find_cco_bitcode
 
-    root = get_mori_source_root()
-    if root is None:
-        raise RuntimeError("MegaMoE TP big-M: MORI's device sources (mori/_jit-sources) not found")
-    src = Path(_SDMA_SRC)
-    cfg = detect_build_config()
-    deps = [src, root / "include" / "mori" / "cco", root / "include" / "mori" / "core"]
-    cache = get_cache_dir(cfg.arch, deps, detect_nic_type(), cov=cov) / "aiter_sdma"
-    cache.mkdir(parents=True, exist_ok=True)
-    bc = cache / "aiter_cco_sdma.bc"
-    if not bc.is_file():
-        with FileBaton(cache / ".aiter_cco_sdma.bc.lock", wait_for=str(bc)) as baton:
-            if not (baton.skipped or bc.is_file()):
-                with tempfile.TemporaryDirectory() as td:
-                    raw = Path(td) / "raw.bc"
-                    _hipcc_device_bc(
-                        cfg, src, _collect_include_dirs(root), raw, cov=cov, extra_defines=["-DBUILD_CCO_SDMA=1"]
-                    )
-                    _strip_lifetime_intrinsics(cfg, raw, bc)
-    _sdma_bc[cov] = str(bc)
-    return str(bc)
+    return find_cco_bitcode(cov)
 
 
 class SdmaComm:

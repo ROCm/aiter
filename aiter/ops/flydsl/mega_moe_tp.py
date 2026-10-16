@@ -285,23 +285,25 @@ class MegaMoeTP:
         warmup: bool = True,
     ) -> None:
         """Collective: compile, arm and (warmup) run once and check the launch configs
-        of these local token counts (tail / tail_bf16: their fused-tail variants); counts on
-        the big-M path set up its SDMA window and (warmup) compile and run its kernels once
-        (a first launch inside CUDA graph capture could not)."""
+        of these local token counts (tail / tail_bf16: their fused-tail variants). When the
+        big-M path is reachable (max_local_tokens >= bigm_m) it is set up (SDMA queues, arena)
+        and every big-M kernel a batch up to max_local_tokens can launch is compiled (or loaded
+        from the disk cache) and (warmup) run once: with tail / tail_bf16 its fused-tail
+        variant (what a fused caller launches), else the plain one. No big-M batch compiles
+        while serving (a compile stalls every rank) and none inside CUDA graph capture."""
         ts = [local_tokens] if isinstance(local_tokens, int) else list(local_tokens)
         small = [t for t in ts if not self._big(t)]
         if small:
             self.engine.prepare(small, tail, tail_bf16, warmup)
-        big = [t for t in ts if self._big(t)]
-        if not big and self._big(self.cfg.max_local_tokens):
-            # the big-M path is reachable: set it up (MORI communicator, SDMA queues, arena)
-            # and compile it here, collectively at init, not lazily inside the first big
-            # forward (where its 85-90 s compile and the setup interleave with the model)
-            big = [self.cfg.max_local_tokens]
-        if big:
-            self.bigm()
-        for m in big if warmup else ():
-            cfg, dev = self.cfg, self.bigm().device
+        if not self._big(max([self.cfg.max_local_tokens, *ts])):
+            return
+        b = self.bigm()
+        hi = max([self.cfg.max_local_tokens, *ts])
+        rows = b.io_rows_per_kernel(self.bigm_m, hi)
+        if warmup:
+            b.precompile(rows, (2 if self.engine.tn_local else 1) if tail or tail_bf16 else 0)
+        for m in rows if warmup else ():
+            cfg, dev = self.cfg, b.device
             x = torch.zeros((m, cfg.model_dim), dtype=torch.bfloat16, device=dev)
             # balanced routing: token i's slot j to expert (i (topk - 1) + j) % (experts - 1),
             # the shared expert (experts - 1) last
@@ -309,10 +311,11 @@ class MegaMoeTP:
             ids = torch.cat([r % (cfg.experts - 1), torch.full((m, 1), cfg.experts - 1, device=dev)], 1)
             ids = ids.to(torch.int32).contiguous()
             tw = torch.full((m, cfg.topk), 1.0 / cfg.topk, dtype=torch.float32, device=dev)
-            self.forward(x, tw, ids)
             if tail or tail_bf16:
                 res = torch.zeros_like(x)
                 self.forward(x, tw, ids, tail=(res, res, x[0]), bf16=tail_bf16)
+            else:
+                self.forward(x, tw, ids)
             torch.cuda.synchronize()
 
     @property
