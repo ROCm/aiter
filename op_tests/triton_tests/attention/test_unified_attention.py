@@ -427,7 +427,7 @@ def test_triton_unified_attn_3d(
         "gfx1250",
     ):
         # gfx1250 -> Gluon
-        # gfx950 -> Triton
+        # gfx950 -> Gluon
         pytest.skip(f"skip {DEVICE_ARCH}")
 
     if kv_dtype == torch.uint8:

@@ -159,16 +159,11 @@ def _gfx950_split_params(params: _UAParams):
 
 
 def _gfx950_split_grid(params: _UAParams):
-    """Decode, short sliding-window queries, and batches too small to fill the
-    GPU take the split grid."""
+    """Decode, and batches too small to fill the GPU, take the split grid."""
     if params.all_decode:
         return True
     if params.sliding_window > 0:
-        return (
-            params.max_seqlen_q <= 8
-            and params.max_seqlen_k >= 512
-            and params.num_tokens <= 1024
-        )
+        return False
     # unsplit, the 2d grid is faster
     config = get_unified_attention_config(
         "kv_split", _gfx950_split_params(params), backend="gluon"
@@ -1135,14 +1130,39 @@ def _unified_attention_2d_gfx950(params: _UAParams):
     """Prefill and mixed batches: one program per (kv head, query block)."""
 
     config = get_unified_attention_config("attn_2d", params, backend="gluon")
-    BLOCK_M = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
+    TILE_SIZE = config["TILE_SIZE"]
+    q_rows = triton.next_power_of_2(params.max_seqlen_q * params.num_queries_per_kv)
+    if params.sliding_window > 0 and q_rows <= 128 and params.num_tokens <= 1024:
+        # SWA spec-decode verify never splits; take the unsplit 3d query block
+        config = get_unified_attention_config("attn_3d", params, backend="gluon")
+        BLOCK_M = _gfx950_3d_block_m(params, config, NUM_SEGMENTS=1)
+        num_warps = BLOCK_M // config["MFMA_DIM"]
+    else:
+        BLOCK_M = max(
+            config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
+        )
+        num_warps = config["num_warps"]
     _unified_attention_gfx950(
         params,
         config,
         BLOCK_M=BLOCK_M,
-        TILE_SIZE=config["TILE_SIZE"],
-        num_warps=config["num_warps"],
+        TILE_SIZE=TILE_SIZE,
+        num_warps=num_warps,
     )
+
+
+def _gfx950_3d_block_m(params: _UAParams, config, NUM_SEGMENTS):
+    MFMA_DIM = config["MFMA_DIM"]
+    BLOCK_M = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
+    q_rows = triton.next_power_of_2(params.max_seqlen_q * params.num_queries_per_kv)
+    if not params.all_decode and q_rows <= 128:
+        # short queries: one block covers the sequence
+        BLOCK_M = max(BLOCK_M, q_rows)
+    # An unsplit launch that already leaves CUs idle can afford a wider query
+    # block, which buys back the warps the missing split axis would have used.
+    if NUM_SEGMENTS == 1 and params.num_2d_prgms <= 2 * params.num_sms:
+        BLOCK_M = max(config.get("WIDE_BLOCK_M_MULT", 1) * MFMA_DIM, BLOCK_M)
+    return BLOCK_M
 
 
 def _unified_attention_3d_gfx950(
@@ -1161,15 +1181,7 @@ def _unified_attention_3d_gfx950(
 
     config = get_unified_attention_config("attn_3d", params, backend="gluon")
     MFMA_DIM = config["MFMA_DIM"]
-    BLOCK_M = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
-    q_rows = triton.next_power_of_2(params.max_seqlen_q * params.num_queries_per_kv)
-    if not params.all_decode and q_rows <= 128:
-        # short queries: one block covers the sequence
-        BLOCK_M = max(BLOCK_M, q_rows)
-    # An unsplit launch that already leaves CUs idle can afford a wider query
-    # block, which buys back the warps the missing split axis would have used.
-    if NUM_SEGMENTS == 1 and params.num_2d_prgms <= 2 * params.num_sms:
-        BLOCK_M = max(config.get("WIDE_BLOCK_M_MULT", 1) * MFMA_DIM, BLOCK_M)
+    BLOCK_M = _gfx950_3d_block_m(params, config, NUM_SEGMENTS)
 
     split = NUM_SEGMENTS > 1
     _unified_attention_gfx950(
