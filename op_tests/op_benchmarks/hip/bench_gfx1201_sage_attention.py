@@ -7,7 +7,7 @@ Providers run in interleaved rounds on the same inputs; the reported time is the
 median over rounds of the per-round mean. With --compare_to_ref every provider is
 also checked against an FP32 reference (computed in query chunks). ``sage``/``sage_core``
 use the code object (default backend), ``sage_hip``/``sage_core_hip`` the HIP kernel,
-``sage_h3``/``sage_core_h3`` the H3 bm256 code object (backend="asm_h3", Q quantized
+``sage_h3``/``sage_core_h3`` the H3 bm512 code object (backend="asm_h3", Q quantized
 in-kernel); ``*_core`` times the attention kernel alone on prepared inputs.
 """
 

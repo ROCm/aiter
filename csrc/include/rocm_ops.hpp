@@ -2930,13 +2930,3 @@ namespace py = pybind11;
           py::arg("out"),                                           \
           py::arg("seq_len"));
 
-#define GFX1201_SAGE_PREPARE_H3_PYBIND                              \
-    m.def("gfx1201_sage_prepare_h3_hip",                            \
-          &gfx1201_sage_prepare_h3_hip,                             \
-          py::arg("key"),                                           \
-          py::arg("value"),                                         \
-          py::arg("key_mean"),                                      \
-          py::arg("key_out"),                                       \
-          py::arg("key_scale"),                                     \
-          py::arg("value_out"),                                     \
-          py::arg("value_scale"));

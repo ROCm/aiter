@@ -1,11 +1,13 @@
-// SPDX-License-Identifier: MIT
-// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-#include "aiter_stream.h"
-#include "gfx1201_sage_prepare_h3.h"
-#include "rocm_ops.hpp"
+// SPDX-License-Identifier: Apache-2.0
+// Binding for the third-party H3 prepare; see kernels/gfx1201_sage_prepare_h3/NOTICE.
+#include <torch/extension.h>
+#include <vector>
+
+std::vector<torch::Tensor> prepare_key_int8_nhd_gfx12(torch::Tensor key, torch::Tensor mean);
+std::vector<torch::Tensor> prepare_value_fp8_nhd_fused_gfx12(torch::Tensor key, torch::Tensor value);
 
 PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
-    AITER_SET_STREAM_PYBIND
-    GFX1201_SAGE_PREPARE_H3_PYBIND;
+    m.def("gfx1201_sage_prepare_h3_key", &prepare_key_int8_nhd_gfx12);
+    m.def("gfx1201_sage_prepare_h3_value", &prepare_value_fp8_nhd_fused_gfx12);
 }

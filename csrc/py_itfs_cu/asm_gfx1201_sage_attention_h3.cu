@@ -18,7 +18,7 @@ struct __attribute__((packed)) KernelArgs
     const void* k_int8;
     const void* v_fp8;
     void* out;
-    const void* unused;
+    const void* v_residual;
     const void* k_scale;
     const void* v_scale;
     int64_t batch;
@@ -44,8 +44,8 @@ static_assert(offsetof(KernelArgs, mode) == 224 && offsetof(KernelArgs, softmax_
                   offsetof(KernelArgs, causal) == 232,
               "scalar kernarg offsets of the code object");
 
-static constexpr int kBlockM    = 256; // query rows per workgroup
-static constexpr int kBlockSize = 512; // 8 waves x wave64
+static constexpr int kBlockM    = 512; // query rows per workgroup
+static constexpr int kBlockSize = 1024; // 16 waves x wave64
 
 AITER_CTYPES_ERROR_DEF
 
@@ -56,10 +56,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* k_scale,
      aiter_tensor_t* v_fp8,
      aiter_tensor_t* v_scale,
+     aiter_tensor_t* v_residual,
      aiter_tensor_t* out,
      float softmax_scale,
      hipStream_t stream),
-    (query, k_int8, k_scale, v_fp8, v_scale, out, softmax_scale, stream))
+    (query, k_int8, k_scale, v_fp8, v_scale, v_residual, out, softmax_scale, stream))
 {
     const HipDeviceGuard device_guard(query->device_id);
     const int head_dim            = (int)query->size(3);
@@ -89,7 +90,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.k_int8  = k_int8->ptr;
     args.v_fp8   = v_fp8->ptr;
     args.out     = out->ptr;
-    args.unused  = nullptr;
+    args.v_residual = v_residual->ptr;
     args.k_scale = k_scale->ptr;
     args.v_scale = v_scale->ptr;
 

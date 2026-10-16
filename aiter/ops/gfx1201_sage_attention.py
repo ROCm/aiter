@@ -52,6 +52,7 @@ def gfx1201_sage_attention_h3_fwd_asm(
     k_scale: Tensor,
     v_fp8: Tensor,
     v_scale: Tensor,
+    v_residual: Tensor,
     out: Tensor,
     softmax_scale: float,
 ) -> None: ...
@@ -103,6 +104,7 @@ def gfx1201_sage_attention_h3_fwd(
     k_scale: Tensor,
     v_fp8: Tensor,
     v_scale: Tensor,
+    v_residual: Tensor,
     softmax_scale: float,
 ) -> Tensor:
     """H3 attention over raw BF16 ``query`` and the tensors from ``gfx1201_sage_prepare_h3``.
@@ -112,7 +114,7 @@ def gfx1201_sage_attention_h3_fwd(
     """
     out = torch.empty_like(query)
     gfx1201_sage_attention_h3_fwd_asm(
-        query, k_int8, k_scale, v_fp8, v_scale, out, softmax_scale
+        query, k_int8, k_scale, v_fp8, v_scale, v_residual, out, softmax_scale
     )
     return out
 
@@ -145,7 +147,7 @@ def gfx1201_sage_attention(
     shape. Lossy by design (Q/K quantized per 32-row block, V per channel).
     The optional norm/RoPE arguments are applied to Q and K first, see
     ``gfx1201_sage_prepare``. ``backend`` selects the attention kernel, see
-    ``gfx1201_sage_attention_fwd``; ``"asm_h3"`` runs the bm256 code object, which quantizes
+    ``gfx1201_sage_attention_fwd``; ``"asm_h3"`` runs the bm512 code object, which quantizes
     Q inside the kernel and does not support the fused norm/RoPE arguments.
     """
     _check(query, key, value)

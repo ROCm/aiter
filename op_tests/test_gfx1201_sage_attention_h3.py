@@ -21,7 +21,7 @@ BACKEND = "asm_h3"
 # Same tolerance band as test_gfx1201_sage_attention.py.
 ATOL, RTOL, MAX_FAIL_PERCENT = 0.3, 0.25, 0.5
 MIN_COSINE, MIN_ROW_COSINE_MEDIAN = 0.998, 0.99
-MAX_REL_L2_VS_ASM = 1.3
+MAX_REL_L2_VS_ASM = 1.15
 
 
 def accuracy(out, ref):
@@ -145,7 +145,7 @@ def test_vs_block_quant_backend():
 
     asm_h3 is the less accurate of the two: it shares one INT8 scale across 64 key
     rows where "asm" uses 32, and mean-centring K only partly pays that back. The
-    measured ratio is ~1.14, so a regression past MAX_REL_L2_VS_ASM means the H3
+    measured ratio is ~1.07, so a regression past MAX_REL_L2_VS_ASM means the H3
     quantization changed, not that the two simply differ.
     """
     ok = True
