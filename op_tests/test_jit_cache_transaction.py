@@ -849,42 +849,123 @@ class TestModuleBuildLock(unittest.TestCase):
                     baton.release.assert_called_once()
 
 
+def _wait_for_state(child, state):
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        with open(f"/proc/{child.pid}/stat", "rb") as stat_file:
+            if baton_module._stat_state(stat_file.read()) == state:
+                return child
+        time.sleep(0.01)
+    child.kill()
+    child.wait()
+    raise AssertionError(f"child never reached state {state!r}")
+
+
+def _spawn_zombie():
+    """A child that has exited but has not been reaped.
+
+    Its PID stays allocated, so signal 0 still succeeds against it even
+    though it will never run again. Popen rather than os.fork, so the
+    test does not fork a multi-threaded interpreter; the child stays a
+    zombie until the returned handle is waited on.
+    """
+    return _wait_for_state(subprocess.Popen([sys.executable, "-c", ""]), b"Z")
+
+
+@unittest.skipUnless(sys.platform == "linux", "reads Linux procfs")
 class TestStaleLockDetection(unittest.TestCase):
     """A builder that dies must not wedge its module's build forever."""
 
-    @staticmethod
-    def _spawn_zombie():
-        """A child that has exited but has not been reaped.
-
-        Its PID stays allocated, so signal 0 still succeeds against it even
-        though it will never run again. Popen rather than os.fork, so the
-        test does not fork a multi-threaded interpreter; the child stays a
-        zombie until the returned handle is waited on.
-        """
-        child = subprocess.Popen([sys.executable, "-c", ""])
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            with open(f"/proc/{child.pid}/stat", "rb") as stat_file:
-                if stat_file.read().rpartition(b")")[2].split()[0] == b"Z":
-                    return child
-            time.sleep(0.01)
-        child.kill()
-        child.wait()
-        raise AssertionError("child did not become a zombie")
-
     def test_a_zombie_holder_is_treated_as_dead(self):
-        child = self._spawn_zombie()
+        child = _spawn_zombie()
         try:
             os.kill(child.pid, 0)  # the trap: a zombie answers this
             self.assertFalse(FileBaton._pid_alive(child.pid))
+            self.assertFalse(jit_cache._pid_alive(child.pid))
         finally:
             child.wait()
 
     def test_a_live_holder_is_left_alone(self):
         self.assertTrue(FileBaton._pid_alive(os.getpid()))
+        self.assertTrue(jit_cache._pid_alive(os.getpid()))
+
+    def test_the_state_is_read_after_the_last_paren_of_the_name(self):
+        line = b"123 (x) Z (y z) S 1 123 123 0 -1"
+        self.assertEqual(baton_module._stat_state(line), b"S")
+        self.assertEqual(jit_cache._stat_state(line), b"S")
+
+    def test_a_live_process_named_like_a_zombie_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            # The kernel takes the name from the path that was executed.
+            disguised = os.path.join(directory, "x) Z (y")
+            os.symlink(sys.executable, disguised)
+            child = subprocess.Popen([disguised, "-c", "import time; time.sleep(60)"])
+            try:
+                _wait_for_state(child, b"S")
+                with open(f"/proc/{child.pid}/stat", "rb") as stat_file:
+                    self.assertIn(b"(x) Z (y)", stat_file.read())
+                self.assertTrue(FileBaton._pid_alive(child.pid))
+                self.assertTrue(jit_cache._pid_alive(child.pid))
+            finally:
+                child.kill()
+                child.wait()
+
+    def test_a_process_whose_main_thread_exited_is_alive_while_threads_run(self):
+        # State Z only means the main thread is gone; this one keeps a worker.
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import ctypes, threading, time\n"
+                    "threading.Thread(target=time.sleep, args=(60,)).start()\n"
+                    "ctypes.CDLL(None).pthread_exit(None)\n"
+                ),
+            ]
+        )
+        try:
+            _wait_for_state(child, b"Z")
+            self.assertTrue(FileBaton._pid_alive(child.pid))
+            self.assertTrue(jit_cache._pid_alive(child.pid))
+        finally:
+            child.kill()
+            child.wait()
+
+    def test_codegen_left_incomplete_by_a_zombie_is_redone(self):
+        child = _spawn_zombie()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                op_dir = os.path.join(tmp, "module")
+                _write(os.path.join(op_dir, "blob", "complete.cpp"), "// good\n")
+                staging_dir = os.path.join(op_dir, jit_cache.STAGING_DIRECTORY_NAME)
+                _write(
+                    os.path.join(staging_dir, jit_cache.CODEGEN_INCOMPLETE_MARKER),
+                    f"{child.pid}\n{socket.gethostname()}\n",
+                )
+                generator = _write_generator(
+                    tmp,
+                    """import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument("--output_dir", required=True)
+args = parser.parse_args()
+with open(args.output_dir + "/complete.cpp", "w") as source:
+    source.write("// regenerated\\n")
+""",
+                )
+                # Without the zombie check this raises "already active" on
+                # every retry until something reaps the zombie.
+                jit_cache.stage_blob_sources(
+                    f"{generator} --output_dir {{}}", op_dir, sys.executable
+                )
+                self.assertEqual(
+                    _read(os.path.join(staging_dir, "complete.cpp")),
+                    "// regenerated\n",
+                )
+        finally:
+            child.wait()
 
     def test_a_lock_held_by_a_zombie_is_stale_and_can_be_broken(self):
-        child = self._spawn_zombie()
+        child = _spawn_zombie()
         try:
             with tempfile.TemporaryDirectory() as directory:
                 path = os.path.join(directory, "module.lock")

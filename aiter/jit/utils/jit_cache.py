@@ -112,6 +112,32 @@ def _pid_alive(pid):
         return False
     except PermissionError:
         return True  # exists but owned by another user
+    # A zombie never finishes codegen, so its marker would block every retry.
+    return not _exited_unreaped(pid)
+
+
+def _stat_state(stat_line):
+    # comm may contain spaces and parens; state follows the last ')'
+    return stat_line.rpartition(b")")[2].split()[0]
+
+
+def _exited_unreaped(pid):
+    """Whether ``pid`` is a zombie: exited, but its parent has not reaped it.
+
+    A zombie answers signal 0 until it is reaped, but will never run again.
+    State Z alone only says the main thread exited, so a process whose other
+    threads still run is not one. False when procfs cannot tell.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as stat_file:
+            if _stat_state(stat_file.read()) != b"Z":
+                return False
+        with open(f"/proc/{pid}/status", "rb") as status_file:
+            for line in status_file:
+                if line.startswith(b"Threads:"):
+                    return int(line.split()[1]) <= 1
+    except (OSError, IndexError, ValueError):
+        return False
     return True
 
 
