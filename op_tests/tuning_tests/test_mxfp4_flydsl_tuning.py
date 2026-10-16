@@ -71,6 +71,18 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
         self.tuner.keys = KEYS
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
+        self.isolated = mock.patch.object(
+            self.module, "_run_shapes_isolated", side_effect=self.cpu_workers
+        )
+        self.isolated.start()
+        self.addCleanup(self.isolated.stop)
+
+    def cpu_workers(self, payloads, _mp_num, _ctx):
+        with mock.patch.object(torch.cuda, "set_device"):
+            return [
+                self.module._mxfp4_tune_shape_worker((*payload[:3], 0))
+                for payload in payloads
+            ]
 
     def read_rows(self, rows: list[dict[str, Any]]) -> pd.DataFrame:
         path = Path(self.directory.name) / "input.csv"
@@ -614,6 +626,7 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
             mp=1,
             errRatio=0.1,
             profile_file=str(Path(self.directory.name) / "profile.csv"),
+            tune_file=str(Path(self.directory.name) / "winner.csv"),
         )
 
         def evaluate(

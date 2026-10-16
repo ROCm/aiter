@@ -54,6 +54,141 @@ def shape(token: int) -> dict[str, Any]:
 
 
 class TestRetuneInputs(unittest.TestCase):
+    def test_legacy_winner_is_rejected_when_later_profiles_have_fatal_gpu_errors(self):
+        workflow = load_workflow()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = [
+                root / n
+                for n in ("input.csv", "tuned.csv", "failed.csv", "profile.csv")
+            ]
+            input_path, tuned, failed, profile = paths
+            row = dict(
+                shape(3),
+                gfx="gfx950",
+                cu_num=256,
+                block_m=16,
+                us=2.0,
+                kernelName1="flydsl_mxmoe_g1_a8w4_16x128x256_f16in_nt_fp8out_swiglu",
+                kernelName2="flydsl_moe2_layout_afp8_wfp4_bf16_t16x128x128_atomic_sbm16",
+            )
+            write_csv(input_path, [shape(3)])
+            write_csv(tuned, [row])
+            failed.write_text(
+                ",".join(workflow.SHAPE_FIELDS) + ",status,failure_reason\n"
+            )
+            observation = dict(
+                row,
+                precision="A8W4",
+                search_mode="full",
+                status="ok",
+                pipeline_us=2.0,
+                error=0.01,
+                failure_reason="",
+            )
+            write_csv(
+                profile,
+                [
+                    observation,
+                    dict(
+                        observation,
+                        status="execution_failed",
+                        pipeline_us="",
+                        error="",
+                        failure_reason="HIP error: an illegal memory access was encountered",
+                    ),
+                ],
+            )
+            coverage = workflow.check_coverage(*paths)
+            self.assertEqual(coverage["status"], "failed")
+            self.assertEqual(len(coverage["incomplete_searches"]), 1)
+
+    def test_coverage_requires_complete_summary_and_matches_current_search(self):
+        workflow = load_workflow()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = [
+                root / n
+                for n in ("input.csv", "tuned.csv", "failed.csv", "profile.csv")
+            ]
+            input_path, tuned, failed, profile = paths
+            row = dict(
+                shape(3),
+                gfx="gfx950",
+                cu_num=256,
+                block_m=16,
+                us=2.0,
+                kernelName1="flydsl_mxmoe_g1_a8w4_16x128x256_f16in_nt_fp8out_swiglu",
+                kernelName2="flydsl_moe2_layout_afp8_wfp4_bf16_t16x128x128_atomic_sbm16",
+            )
+            write_csv(input_path, [shape(3)])
+            write_csv(tuned, [row])
+            failed.write_text(
+                ",".join(workflow.SHAPE_FIELDS) + ",status,failure_reason\n"
+            )
+            observation = dict(
+                row,
+                precision="A8W4",
+                search_mode="full",
+                status="ok",
+                pipeline_us=2.0,
+                error=0.01,
+                failure_reason="",
+                search_id="new",
+                candidate_count=2,
+                candidate_index=1,
+            )
+            old = dict(
+                observation,
+                search_id="old",
+                status="fatal_gpu_error",
+                failure_reason="HIP error: an illegal memory access was encountered",
+            )
+            summary = dict(
+                shape(3),
+                search_id="new",
+                candidate_count=2,
+                evaluated_count=1,
+                valid_count=1,
+                search_complete=False,
+                termination_reason="fatal GPU error",
+                precision="A8W4",
+                search_mode="full",
+            )
+            summary_path = tuned.with_suffix(".search_summary.csv")
+            write_csv(summary_path, [summary])
+            write_csv(profile, [old, observation])
+            self.assertEqual(workflow.check_coverage(*paths)["status"], "failed")
+            write_csv(
+                summary_path,
+                [
+                    dict(
+                        summary,
+                        evaluated_count=2,
+                        valid_count=1,
+                        search_complete=True,
+                        termination_reason="",
+                    )
+                ],
+            )
+            write_csv(
+                profile,
+                [
+                    old,
+                    observation,
+                    dict(
+                        observation,
+                        candidate_index=2,
+                        status="accuracy_failed",
+                        error=0.5,
+                        failure_reason="numeric error",
+                    ),
+                ],
+            )
+            self.assertEqual(workflow.check_coverage(*paths)["status"], "passed")
+            write_csv(profile, [old, observation])
+            self.assertEqual(workflow.check_coverage(*paths)["status"], "failed")
+
     def test_union_preserves_tuned_only_shape_and_tag_provenance_once(self) -> None:
         workflow = load_workflow()
         with tempfile.TemporaryDirectory() as directory:

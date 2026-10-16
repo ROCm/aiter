@@ -418,6 +418,7 @@ def source_state(repo: str | Path) -> dict[str, Any]:
         repo / "aiter/fused_moe.py",
         repo / "aiter/jit/core.py",
         repo / "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
+        repo / "csrc/ck_gemm_moe_2stages_codegen/mxfp4_tune_errors.py",
         repo / "aiter/ops/moe_mxfp4_aux.py",
         repo / "csrc/kernels/mxfp4_moe/moe_aux/codegen/gen_instances.py",
     ]
@@ -451,10 +452,63 @@ def check_coverage(
     actual = [shape_key(row, fields) for row in winners]
     failed = {shape_key(row, fields) for row in failures}
     profiles = read_csv(profile_path) if Path(profile_path).is_file() else []
-    observations = {}
+    profiles_by_shape = {}
     for row in profiles:
-        key = (shape_key(row, fields), row["kernelName1"], row["kernelName2"])
-        observations.setdefault(key, []).append(row)
+        profiles_by_shape.setdefault(shape_key(row, fields), []).append(row)
+    error_spec = importlib.util.spec_from_file_location(
+        "a8w4_tune_errors",
+        Path(__file__).resolve().parents[3]
+        / "csrc/ck_gemm_moe_2stages_codegen/mxfp4_tune_errors.py",
+    )
+    errors = importlib.util.module_from_spec(error_spec)
+    error_spec.loader.exec_module(errors)
+    summary_path = Path(tuned_path).with_suffix(".search_summary.csv")
+    summaries = (
+        {shape_key(row, fields): row for row in read_csv(summary_path)}
+        if summary_path.is_file()
+        else {}
+    )
+    current_profiles = {}
+    incomplete = []
+    for key in expected:
+        summary = summaries.get(key)
+        records = profiles_by_shape.get(key, [])
+        complete = True
+        if summary is not None:
+            records = [
+                r
+                for r in records
+                if r.get("search_id", "") == summary.get("search_id", "")
+            ]
+            try:
+                total = int(summary["candidate_count"])
+                evaluated = int(summary["evaluated_count"])
+                valid_count = int(summary["valid_count"])
+                complete = (
+                    summary["search_complete"].lower() == "true"
+                    and bool(summary.get("search_id"))
+                    and not summary["termination_reason"]
+                    and total > 0
+                    and total == evaluated == len(records)
+                    and valid_count == sum(r["status"] == "ok" for r in records)
+                    and {int(r["candidate_index"]) for r in records}
+                    == set(range(1, total + 1))
+                    and all(int(r["candidate_count"]) == total for r in records)
+                    and summary.get("precision") == "A8W4"
+                    and summary.get("search_mode") == "full"
+                )
+            except (KeyError, TypeError, ValueError):
+                complete = False
+        elif summary_path.is_file() or any(r.get("search_id") for r in records):
+            complete = False
+        fatal = any(
+            r["status"] == "fatal_gpu_error"
+            or errors.is_fatal_gpu_error(r.get("failure_reason", ""))
+            for r in records
+        )
+        if not complete or fatal:
+            incomplete.append(dict(zip(fields, key)))
+        current_profiles[key] = records
     # This parser module has only a stdlib re import. Load its exact shared
     # code without importing aiter's HIP/JIT package during CPU preparation.
     parser_path = (
@@ -484,9 +538,12 @@ def check_coverage(
                 == (g2["sort_block_m"] or g2["tile_m"])
             )
             valid &= math.isfinite(float(row["us"])) and float(row["us"]) > 0
-            completed = observations.get(
-                (shape_key(row, fields), row["kernelName1"], row["kernelName2"]), []
-            )
+            completed = [
+                item
+                for item in current_profiles.get(shape_key(row, fields), [])
+                if item["kernelName1"] == row["kernelName1"]
+                and item["kernelName2"] == row["kernelName2"]
+            ]
             valid &= any(
                 item["status"] == "ok"
                 and item["precision"] == "A8W4"
@@ -518,6 +575,8 @@ def check_coverage(
         "unexpected_winners": len(set(actual) - expected),
         "profile_exists": Path(profile_path).is_file(),
         "failure_file_exists": Path(failure_path).is_file(),
+        "search_summary_exists": summary_path.is_file(),
+        "incomplete_searches": incomplete,
         "status": (
             "passed"
             if (
@@ -525,6 +584,7 @@ def check_coverage(
                 and len(actual) == len(expected)
                 and not failures
                 and not invalid
+                and not incomplete
                 and Path(profile_path).is_file()
                 and Path(failure_path).is_file()
             )
@@ -589,7 +649,8 @@ def run_models(
             tuned = output_dir / f"{name}_tuned_fmoe.csv"
             profile = output_dir / f"{name}_profile.csv"
             failure = tuned.with_suffix(".failed_shapes.csv")
-            if any(path.exists() for path in (tuned, profile, failure)):
+            summary = tuned.with_suffix(".search_summary.csv")
+            if any(path.exists() for path in (tuned, profile, failure, summary)):
                 raise FileExistsError(
                     f"retune artifacts already exist for {name}; use a fresh output directory"
                 )

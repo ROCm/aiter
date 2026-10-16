@@ -41,6 +41,7 @@ OPUS_A8W4_KID_ATOMIC_BM32_BN128_OCC1_B3_WS2_RING4 = 2018
 OPUS_A8W4_KID_ROUTE_BF16_BM64_RBN3072 = 2019
 OPUS_A8W4_KID_ROUTE_BF16_BM64_RBN3584 = 2020
 OPUS_A8W4_KID_ROUTE_BF16_BM64_RBN6144 = 2021
+OPUS_A8W4_KID_ROUTE_FP8_BM64_SBM32_RBN3584 = 2022
 
 _OPUS_A8W4_STAGE2_PREFIX = "opus_moe2_"
 _OPUS_A8W4_STAGE2_LAYOUT_PREFIX = "opus_moe2_layout_"
@@ -806,6 +807,19 @@ OPUS_A8W4_DECODE_STAGE2_INSTANCES = (
         out_mode=OPUS_A8W4_OUT_MODE_FP8,
         block_m=64,
         sort_block_m=64,
+        route_reduce="rbn3584",
+        block_threads=256,
+        min_blocks_per_cu=4,
+        pair_slots=2,
+        steady_pair_slots=1,
+        min_tuner_token=128,
+    ),
+    _route_stage2_instance(
+        kid=OPUS_A8W4_KID_ROUTE_FP8_BM64_SBM32_RBN3584,
+        name="opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm32_rbn3584",
+        out_mode=OPUS_A8W4_OUT_MODE_FP8,
+        block_m=64,
+        sort_block_m=32,
         route_reduce="rbn3584",
         block_threads=256,
         min_blocks_per_cu=4,
