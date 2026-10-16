@@ -15,8 +15,16 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 
 
 def check_case(
-    layout, mode, split, *, page=16, dim=128, heads=16, kv_heads=None,
-    q_lens=None, k_lens=None,
+    layout,
+    mode,
+    split,
+    *,
+    page=16,
+    dim=128,
+    heads=16,
+    kv_heads=None,
+    q_lens=None,
+    k_lens=None,
 ):
     torch.manual_seed(125)
     device = "cuda"
@@ -154,7 +162,12 @@ if __name__ == "__main__":
         ("shuffle", "scalar", 128, 128, 16),
     ):
         check_case(
-            layout, mode, False, page=page, dim=dim, kv_heads=kv_heads,
+            layout,
+            mode,
+            False,
+            page=page,
+            dim=dim,
+            kv_heads=kv_heads,
             q_lens=[1, 17, 255, 256, 513],
             k_lens=[257, 273, 1023, 1037, 2049],
         )

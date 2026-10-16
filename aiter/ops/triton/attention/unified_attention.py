@@ -220,9 +220,9 @@ def unified_attention(
         "gluon",
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
     if backend == "gluon":
-        assert _is_gluon_available(), (
-            f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
-        )
+        assert (
+            _is_gluon_available()
+        ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
 
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
@@ -313,9 +313,9 @@ def unified_attention(
     # only the plain layout exposes v's head size as its last dimension; a
     # shuffled value cache carries the vectorization width there instead.
     head_size_v = head_size if shuffled_kv_cache else v.shape[-1]
-    assert out.shape[-1] == head_size_v, (
-        f"out last dim must be the value head size {head_size_v}, got {out.shape[-1]}"
-    )
+    assert (
+        out.shape[-1] == head_size_v
+    ), f"out last dim must be the value head size {head_size_v}, got {out.shape[-1]}"
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
@@ -593,7 +593,9 @@ def _triton_attention_config(params: _UAParams, op: str):
         # Reuse prefill's query tile across KV splits. A decode-sized tile
         # would undo the reuse that made the 2-D launch under-occupied.
         prefill = get_unified_attention_config("attn_2d", params, backend="triton")
-        config["BLOCK_M"] = prefill["BLOCK_M"]
+        for key in ("BLOCK_M", "num_warps", "num_stages", "waves_per_eu"):
+            if key in prefill:
+                config[key] = prefill[key]
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
     )
@@ -621,9 +623,9 @@ def _unified_attention_2d_triton(params: _UAParams, config: dict | None = None):
     if params.shuffled_kv_cache and (
         params.q_dtype == e4m3_dtype and params.kv_cache_dtype == e4m3_dtype
     ):
-        assert params.block_size >= 32, (
-            "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
-        )
+        assert (
+            params.block_size >= 32
+        ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
 
     config = _triton_attention_config(params, "attn_2d") if config is None else config
     if params.all_decode:
@@ -685,24 +687,24 @@ def _unified_attention_2d_triton(params: _UAParams, config: dict | None = None):
         K_WIDTH=params.k_width,
         V_CACHE_NHD=params.shuffled_kv_cache and params.v.ndim == 4,
         PER_TOKEN_KV_SCALES=params.per_token_kv_scales,
-        stride_k_scale_0=params.k_descale.stride(0)
-        if params.per_token_kv_scales
-        else 0,
-        stride_k_scale_1=params.k_descale.stride(1)
-        if params.per_token_kv_scales
-        else 0,
-        stride_k_scale_2=params.k_descale.stride(2)
-        if params.per_token_kv_scales
-        else 0,
-        stride_v_scale_0=params.v_descale.stride(0)
-        if params.per_token_kv_scales
-        else 0,
-        stride_v_scale_1=params.v_descale.stride(1)
-        if params.per_token_kv_scales
-        else 0,
-        stride_v_scale_2=params.v_descale.stride(2)
-        if params.per_token_kv_scales
-        else 0,
+        stride_k_scale_0=(
+            params.k_descale.stride(0) if params.per_token_kv_scales else 0
+        ),
+        stride_k_scale_1=(
+            params.k_descale.stride(1) if params.per_token_kv_scales else 0
+        ),
+        stride_k_scale_2=(
+            params.k_descale.stride(2) if params.per_token_kv_scales else 0
+        ),
+        stride_v_scale_0=(
+            params.v_descale.stride(0) if params.per_token_kv_scales else 0
+        ),
+        stride_v_scale_1=(
+            params.v_descale.stride(1) if params.per_token_kv_scales else 0
+        ),
+        stride_v_scale_2=(
+            params.v_descale.stride(2) if params.per_token_kv_scales else 0
+        ),
         **config,
         enable_fp_fusion=True,
     )
@@ -779,24 +781,24 @@ def _unified_attention_3d_triton(
         K_WIDTH=params.k_width,
         V_CACHE_NHD=params.shuffled_kv_cache and params.v.ndim == 4,
         PER_TOKEN_KV_SCALES=params.per_token_kv_scales,
-        stride_k_scale_0=params.k_descale.stride(0)
-        if params.per_token_kv_scales
-        else 0,
-        stride_k_scale_1=params.k_descale.stride(1)
-        if params.per_token_kv_scales
-        else 0,
-        stride_k_scale_2=params.k_descale.stride(2)
-        if params.per_token_kv_scales
-        else 0,
-        stride_v_scale_0=params.v_descale.stride(0)
-        if params.per_token_kv_scales
-        else 0,
-        stride_v_scale_1=params.v_descale.stride(1)
-        if params.per_token_kv_scales
-        else 0,
-        stride_v_scale_2=params.v_descale.stride(2)
-        if params.per_token_kv_scales
-        else 0,
+        stride_k_scale_0=(
+            params.k_descale.stride(0) if params.per_token_kv_scales else 0
+        ),
+        stride_k_scale_1=(
+            params.k_descale.stride(1) if params.per_token_kv_scales else 0
+        ),
+        stride_k_scale_2=(
+            params.k_descale.stride(2) if params.per_token_kv_scales else 0
+        ),
+        stride_v_scale_0=(
+            params.v_descale.stride(0) if params.per_token_kv_scales else 0
+        ),
+        stride_v_scale_1=(
+            params.v_descale.stride(1) if params.per_token_kv_scales else 0
+        ),
+        stride_v_scale_2=(
+            params.v_descale.stride(2) if params.per_token_kv_scales else 0
+        ),
         IS_Q_FP8=(params.q_dtype == e4m3_dtype),
         IS_KV_FP8=(params.kv_cache_dtype == e4m3_dtype),
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
@@ -893,9 +895,9 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
     if not params.shuffled_kv_cache or TILE_SIZE < params.block_size:
         TILE_SIZE = params.block_size
     num_kv_blocks = TILE_SIZE // params.block_size
-    assert num_kv_blocks & (num_kv_blocks - 1) == 0, (
-        f"TILE_SIZE={TILE_SIZE} must be a power-of-2 multiple of PAGE_SIZE={params.block_size}"
-    )
+    assert (
+        num_kv_blocks & (num_kv_blocks - 1) == 0
+    ), f"TILE_SIZE={TILE_SIZE} must be a power-of-2 multiple of PAGE_SIZE={params.block_size}"
 
     # the loop variants other than 0 mask at most twice at the end of the loop,
     # and need a tile wider than 32
