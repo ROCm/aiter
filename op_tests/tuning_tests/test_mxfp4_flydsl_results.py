@@ -163,6 +163,27 @@ def _cpu_shape_process(
         out_q.put((index, tuner._tune_one_shape(row, args)))
 
 
+def _cpu_fatal_shape_process(payload, out_q, index):
+    keys, row, args, _gpu = payload
+    with cpu_tuner_environment():
+        module = _tuner_module()
+
+        class WorkerTuner(_controlled_tuner_class(module)):
+            def _run_candidate(self, row, candidate, args):
+                if row["token"] == 1:
+                    if candidate["kernelName2"].endswith("_atomic_nt_sbm16"):
+                        candidate.update(error=0.01, us=9.0)
+                        return 9.0
+                    raise RuntimeError(
+                        "HIP error: an illegal memory access was encountered"
+                    )
+                return super()._run_candidate(row, candidate, args)
+
+        tuner = WorkerTuner.__new__(WorkerTuner)
+        tuner.keys = keys
+        out_q.put((index, tuner._tune_one_shape(row, args)))
+
+
 class TestCoupledTuningResults(unittest.TestCase):
     def setUp(self) -> None:
         environment = cpu_tuner_environment()
@@ -189,6 +210,29 @@ class TestCoupledTuningResults(unittest.TestCase):
         self.stack.enter_context(
             patch.object(moe_mxfp4_aux, "prepare_mxfp4_moe_aux", return_value=None)
         )
+        # Most CSV tests replace only process execution; the dedicated spawn
+        # tests below exercise the real isolation and aggregation.
+        self.real_run_isolated = self.module._run_shapes_isolated
+        self.stack.enter_context(
+            patch.object(
+                self.module, "_run_shapes_isolated", side_effect=self.cpu_workers
+            )
+        )
+
+    def cpu_workers(self, payloads, _mp_num, _ctx):
+        results = []
+        for keys, row, args, _gpu in payloads:
+            tuner = self.active_tuner_class.__new__(self.active_tuner_class)
+            tuner.keys = keys
+            try:
+                results.append(tuner._tune_one_shape(row, args))
+            except Exception as exc:  # noqa: BLE001 - mirror the shape-worker boundary
+                results.append(
+                    self.module._mxfp4_failed_row(
+                        keys, row, f"{type(exc).__name__}: {exc}"
+                    )
+                )
+        return results
 
     def run_csv(
         self,
@@ -215,6 +259,7 @@ class TestCoupledTuningResults(unittest.TestCase):
             )
             old_results.reindex(columns=columns).to_csv(self.output_file, index=False)
         tuner_class = tuner_class or _controlled_tuner_class(self.module)
+        self.active_tuner_class = tuner_class
         tuner = tuner_class("test", KEYS, RESULT_COLUMNS)
         args = tuner.parser.parse_args(
             [
@@ -429,6 +474,142 @@ class TestCoupledTuningResults(unittest.TestCase):
         self.assertTrue(failed_shapes.empty)
         self.assertEqual(failed_shapes.columns.tolist(), FAILURE_COLUMNS)
 
+    def test_fatal_gpu_error_stops_search_and_does_not_publish_earlier_winner(
+        self,
+    ) -> None:
+        calls = []
+
+        class FatalCandidate(_controlled_tuner_class(self.module)):
+            def _run_candidate(self, row, candidate, args):
+                calls.append(candidate["kernelName2"])
+                if len(calls) == 1:
+                    candidate.update(error=0.01, us=9.0)
+                    return 9.0
+                candidate["error"] = float("nan")
+                raise RuntimeError(
+                    "HIP error: an illegal memory access was encountered"
+                )
+
+        with self.assertRaises(SystemExit) as stopped:
+            self.run_csv([_input_row()], FatalCandidate)
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(pd.read_csv(self.output_file).empty)
+        profile = pd.read_csv(self.profile_file)
+        self.assertEqual(profile.status.tolist(), ["ok", "fatal_gpu_error"])
+        failures = pd.read_csv(self.output_file.with_suffix(".failed_shapes.csv"))
+        self.assertEqual(failures.status.tolist(), ["incomplete"])
+        self.assertIn("illegal memory access", failures.iloc[0].failure_reason)
+        summary = pd.read_csv(self.output_file.with_suffix(".search_summary.csv"))
+        self.assertEqual(summary.candidate_count.tolist(), [8])
+        self.assertEqual(summary.evaluated_count.tolist(), [2])
+        self.assertEqual(summary.valid_count.tolist(), [1])
+        self.assertFalse(summary.iloc[0].search_complete)
+
+    def test_fatal_retune_removes_existing_winner_without_profile_output(self):
+        class FatalCandidate(_controlled_tuner_class(self.module)):
+            def _run_candidate(self, row, candidate, args):
+                raise RuntimeError("HIP error: device-side assert triggered")
+
+        old = _input_row()
+        old.update(dict.fromkeys(RESULT_COLUMNS, 0))
+        old.update(
+            us=7.0,
+            us1=7.0,
+            block_m=16,
+            kernelName1=G1,
+            kernelName2=G2_PREFIX + "_reduce_sbm16",
+            err1="1.0%",
+            err2="1.0%",
+        )
+        with self.assertRaises(SystemExit) as stopped:
+            self.run_csv(
+                [_input_row()],
+                FatalCandidate,
+                profile=False,
+                existing_rows=[old],
+                all_shapes=True,
+            )
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertTrue(pd.read_csv(self.output_file).empty)
+        self.assertFalse(self.profile_file.exists())
+        summary = pd.read_csv(self.output_file.with_suffix(".search_summary.csv"))
+        self.assertFalse(summary.iloc[0].search_complete)
+        self.assertEqual(summary.evaluated_count.tolist(), [1])
+
+    def test_fatal_error_classifier_does_not_reject_ordinary_candidate_failures(self):
+        for message in (
+            "HIP error: an illegal memory access was encountered",
+            "HIP error: device-side assert triggered",
+            "hipErrorLaunchFailure",
+            "HIP error: context is destroyed",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(self.module.is_fatal_gpu_error(RuntimeError(message)))
+        for message in (
+            "compiler refused candidate",
+            "HIP out of memory",
+            "cosine err_ratio 0.5 > 0.1",
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(self.module.is_fatal_gpu_error(RuntimeError(message)))
+
+    def test_single_gpu_uses_fresh_shape_workers_after_fatal_error(self) -> None:
+        run_isolated = self.real_run_isolated
+
+        def cpu_workers(payloads, mp_num, _ctx):
+            self.assertEqual(mp_num, 1)
+            return run_isolated(
+                payloads,
+                mp_num,
+                multiprocessing.get_context("spawn"),
+                entry=_cpu_fatal_shape_process,
+            )
+
+        with (
+            patch.object(self.module, "_run_shapes_isolated", side_effect=cpu_workers),
+            self.assertRaises(SystemExit) as stopped,
+        ):
+            self.run_csv([_input_row(1), _input_row(2)], mp=1)
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertEqual(pd.read_csv(self.output_file).token.tolist(), [2])
+        summary = pd.read_csv(self.output_file.with_suffix(".search_summary.csv"))
+        self.assertEqual(summary.search_complete.tolist(), [False, True])
+        profile = pd.read_csv(self.profile_file)
+        pids = profile.groupby("token").worker_pid.first()
+        self.assertNotEqual(pids.loc[1], pids.loc[2])
+
+    def test_nonfatal_failure_keeps_searching_and_records_complete_summary(
+        self,
+    ) -> None:
+        class CompilationFailure(_controlled_tuner_class(self.module)):
+            def _run_candidate(self, row, candidate, args):
+                if candidate["kernelName2"].endswith("_atomic_nt_sbm16"):
+                    raise RuntimeError("compiler refused candidate")
+                return super()._run_candidate(row, candidate, args)
+
+        self.run_csv([_input_row()], CompilationFailure)
+        self.assertEqual(pd.read_csv(self.output_file).us.tolist(), [7.0])
+        summary = pd.read_csv(self.output_file.with_suffix(".search_summary.csv"))
+        self.assertTrue(summary.iloc[0].search_complete)
+        self.assertEqual(summary.evaluated_count.tolist(), [8])
+        self.assertEqual(summary.valid_count.tolist(), [2])
+
+    def test_one_valid_candidate_is_accepted_after_all_others_are_evaluated(self):
+        class OneValidCandidate(_controlled_tuner_class(self.module)):
+            def _run_candidate(self, row, candidate, args):
+                if candidate["kernelName2"] != G2_PREFIX + "_reduce_sbm16":
+                    candidate["error"] = 0.5
+                    return 1.0
+                return super()._run_candidate(row, candidate, args)
+
+        self.run_csv([_input_row()], OneValidCandidate)
+        self.assertEqual(pd.read_csv(self.output_file).us.tolist(), [7.0])
+        summary = pd.read_csv(self.output_file.with_suffix(".search_summary.csv"))
+        self.assertTrue(summary.iloc[0].search_complete)
+        self.assertEqual(summary.evaluated_count.tolist(), [8])
+        self.assertEqual(summary.valid_count.tolist(), [1])
+
     def test_shape_exception_preserves_later_winners_profile_and_full_failure_reason(
         self,
     ) -> None:
@@ -462,7 +643,7 @@ class TestCoupledTuningResults(unittest.TestCase):
     def test_dead_worker_preserves_completed_profiles_and_other_shapes_finish(
         self,
     ) -> None:
-        run_isolated = self.module._run_shapes_isolated
+        run_isolated = self.real_run_isolated
 
         def cpu_workers(
             payloads: list[tuple], mp_num: int, _ctx: Any
