@@ -308,7 +308,7 @@ def _unsupported_arch() -> str | None:
 
 
 @lru_cache(maxsize=8)
-def _cached_bounds(rows: int, width: int, device: int):
+def _cached_bounds(rows: int, width: int, device: int, stream: int):
     return (
         torch.zeros(rows, dtype=torch.int32, device=device),
         torch.full((rows,), width, dtype=torch.int32, device=device),
@@ -331,10 +331,17 @@ def _default_bounds(rows: int, width: int, device: int):
     Not cached while a CUDA graph is capturing: there the fills are only
     recorded, so a pair cached then would stay unfilled for the eager calls
     after it, and a graph must not hold tensors the cache can later free.
+
+    Cached per stream as well: a pair is filled on the stream of the call that
+    builds it and read only by calls on that stream, after the fill, and one
+    the cache drops goes back to that stream's pool, which no other stream's
+    kernels read from.
     """
     if torch.cuda.is_current_stream_capturing():
-        return _cached_bounds.__wrapped__(rows, width, device)
-    return _cached_bounds(rows, width, device)
+        return _cached_bounds.__wrapped__(rows, width, device, 0)
+    return _cached_bounds(
+        rows, width, device, torch._C._cuda_getCurrentRawStream(device)
+    )
 
 
 class _GrowDuringCapture(Exception):
@@ -353,7 +360,11 @@ def _cached_zero_rows(rows: int, device: int) -> torch.Tensor:
         if torch.cuda.is_current_stream_capturing():
             raise _GrowDuringCapture
         size = max(rows, 2 * buffers[-1].numel()) if buffers else rows
-        buffers.append(torch.zeros(size, dtype=torch.int32, device=device))
+        grown = torch.zeros(size, dtype=torch.int32, device=device)
+        # Every stream reads these, so the fill has to be done before any can:
+        # a wait on the growth, which doubles, rather than a fence per call.
+        torch.cuda.current_stream(device).synchronize()
+        buffers.append(grown)
     return buffers[-1][:rows]
 
 
