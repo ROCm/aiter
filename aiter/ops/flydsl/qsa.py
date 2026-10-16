@@ -722,10 +722,10 @@ def qsa_sparse_gqa_supported(
         return (
             f"page_table must be int32 [n_req, n_pages], got {tuple(page_table.shape)}"
         )
-    block_n, block_threads, n_splits = _launch_config(
+    block_n, block_threads, _ = _launch_config(
         int(q.shape[0]), int(indices.shape[1]), n_kv_heads, head_dim
     )
-    return _k2_coverage_reason(head_dim, block_n, block_threads, n_splits)
+    return _k2_coverage_reason(head_dim, block_n, block_threads)
 
 
 def _take_k2_workspace(workspace, n_splits, rows, n_q_heads, head_dim, device):

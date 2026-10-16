@@ -49,7 +49,11 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import qsa as qsa_k1_host
-from aiter.ops.flydsl.kernels.qsa.sparse_gqa import build_qsa_sparse_gqa_module
+from aiter.ops.flydsl.kernels.qsa.sparse_gqa import (
+    _launch_config,
+    _merge_slice,
+    build_qsa_sparse_gqa_module,
+)
 from aiter.ops.flydsl.qsa import (
     qsa_indexer_block_ids,
     qsa_layer,
@@ -1539,6 +1543,50 @@ def test_k2_flash_next_decode_matches_oracle():
         raise AssertionError(f"K2 decode diverged from the oracle (err={err})")
 
 
+def test_k2_merge_covers_every_head_dim_slice():
+    """A split launch merges every D slice, at 64 and at 32 elements wide.
+
+    D=192 decode splits into three 64-wide merge slices. D=96 prefill
+    splits too, and 96 is not a multiple of 64, so each slice is 32 wide
+    and half the wave stores nothing.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    device = torch.device("cuda")
+    seq_len, page_size = 256, 16
+    # (Hq, Hkv, D, rows, width, merge slice)
+    cases = ((16, 1, 192, 1, 32, 64), (16, 1, 96, 32, 64, 32))
+    for hq, hkv, d, m, width, slice_d in cases:
+        _, _, n_splits = _launch_config(m, width, hkv, d)
+        if n_splits < 2 or _merge_slice(d) != slice_d:
+            raise AssertionError(
+                f"D={d} M={m} W={width} launches {n_splits} splits with a "
+                f"{_merge_slice(d)}-wide merge"
+            )
+        torch.manual_seed(0)
+        q = torch.randn(m, hq, d, dtype=dtypes.bf16, device=device)
+        k = torch.randn(seq_len, hkv, d, dtype=dtypes.bf16, device=device)
+        v = torch.randn(seq_len, hkv, d, dtype=dtypes.bf16, device=device)
+        indices = torch.randint(0, seq_len, (m, width), dtype=dtypes.i32, device=device)
+        indices[:, -1] = -1
+        token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+        gen = torch.Generator(device=device)
+        gen.manual_seed(2)
+        k_cache, kv_table = pack_paged_cache(k, page_size, generator=gen)
+        v_cache, _ = pack_paged_cache(v, page_size, physical=kv_table[0])
+        ref = sparse_gqa_ref(q, k, v, indices)
+        out = qsa_sparse_gqa(q, k_cache, v_cache, indices, kv_table, token_to_req)
+        err = checkAllclose(
+            ref.to(dtypes.fp32),
+            out.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=f"flydsl K2 D={d} merge vs oracle",
+        )
+        if err != 0:
+            raise AssertionError(f"D={d} split merge diverged (err={err})")
+
+
 def test_k2_flash_next_prefill_matches_oracle():
     """The BLOCK_N=64/two-wave K2 specialization matches at prefill M=512."""
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
@@ -2445,7 +2493,7 @@ def bench_qsa_flash_next_k2(
     """Flash-Next FlyDSL sparse GQA vs the oracle.
 
     Live-AMD-shaped BLOCK_N/threads/split policy, tiled MFMA QK/PV,
-    log2 online softmax, direct output at one split, and a two-wave merge.
+    log2 online softmax, direct output at one split, and a D-sliced merge.
     Expand and sigmoid stay unfused. Same ``rotate`` on every GQA column.
     ``cache_layout="wide"`` gives K and V the serving cache span. Sparse GQA
     reads V with K's strides, so the two views share one page stride.
@@ -2906,10 +2954,12 @@ def test_k2_supported_rejects_shapes_the_builder_rejects():
         raise AssertionError("Flash-Next GQA was rejected")
     if qsa_sparse_gqa_supported(*tensors(16, 1, 128, 16)) is not None:
         raise AssertionError("a group of 16 at head_dim 128 was rejected")
+    # D=192 at W=32 splits; the merge tiles it into three 64-wide slices.
+    if qsa_sparse_gqa_supported(*tensors(16, 1, 192, 16, 1, 32)) is not None:
+        raise AssertionError("a split decode at head_dim 192 was rejected")
     # (Hq, Hkv, D, page, rows, width, needle). D=32/D=96 are the decode
-    # gather (BN16 x 128). D=192 at W=32 splits, so the merge runs and
-    # writes 128 of 192. The same D at 32 rows is prefill, whose K map
-    # radix does not divide 6 rounds.
+    # gather (BN16 x 128). D=192 at 32 rows is prefill, whose K map radix
+    # does not divide 6 rounds.
     rejected = (
         (24, 5, 256, 16, 1, 8, "do not group"),
         (24, 0, 256, 16, 1, 8, "do not group"),
@@ -2919,7 +2969,6 @@ def test_k2_supported_rejects_shapes_the_builder_rejects():
         (24, 2, 256, 0, 1, 8, "page_size"),
         (16, 1, 32, 16, 1, 8, "gather"),
         (16, 1, 96, 16, 1, 8, "gather"),
-        (16, 1, 192, 16, 1, 32, "merge"),
         (24, 2, 192, 16, 32, 8, "K LDS"),
     )
     for hq, hkv, d, page, rows, width, needle in rejected:
