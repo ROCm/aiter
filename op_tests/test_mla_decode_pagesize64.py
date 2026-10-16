@@ -1665,9 +1665,22 @@ def _check_qh64_case(case, *, compare_layouts=None):
     return out, lse
 
 
-def _check_qh64_bigraw(offset, splits, ctx_len, q_len=1):
+def _check_qh64_bigraw(offset, splits, ctx_len, q_len=1, *, kv_csr_layout="page"):
     case = _make_qh64_case(2, ctx_len, splits, q_len=q_len)
-    expected, expected_lse = _run_qh64_case(case)[:2]
+
+    def run():
+        if kv_csr_layout == "token":
+            ptr, slots, last = _make_qh64_token_csr(case)
+            return _run_qh64_case(
+                case,
+                kv_csr_layout="token",
+                kv_indptr=ptr,
+                kv_indices=slots,
+                kv_last_page_lens=last,
+            )
+        return _run_qh64_case(case)
+
+    expected, expected_lse = run()[:2]
     pages = case["kv_shuffled"].shape[0]
     nbytes = (offset + pages) * 64 * 576
     if torch.cuda.mem_get_info()[0] < nbytes + (1 << 30):
@@ -1681,7 +1694,7 @@ def _check_qh64_bigraw(offset, splits, ctx_len, q_len=1):
     storage[offset:].copy_(case["kv_shuffled"])
     case["kv_shuffled"] = storage
     case["kv_indices"] = case["kv_indices"] + offset
-    out, lse, _ = _run_qh64_case(case)
+    out, lse, _ = run()
     assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
     assert torch.equal(lse.view(torch.int32), expected_lse.view(torch.int32))
 
@@ -2277,6 +2290,473 @@ class TestMlaQh64ShuffledCausal:
     @pytest.mark.parametrize("ctx_len", [129, 4096])
     def test_bigraw_causal(self, splits, ctx_len):
         _check_qh64_bigraw((1 << 32) // (64 * 576) + 1, splits, ctx_len, q_len=4)
+
+
+def _qh64_page_inputs(case):
+    starts = case["kv_indptr"].tolist()
+    width = max((b - a for a, b in itertools.pairwise(starts)), default=0)
+    table = torch.full(
+        (case["batch"], width + 2), -1, dtype=torch.int32, device="cuda"
+    )[:, :width]
+    for row in range(case["batch"]):
+        table[row, : starts[row + 1] - starts[row]] = case["kv_indices"][
+            starts[row] : starts[row + 1]
+        ]
+    lengths = torch.tensor(case["lengths"], dtype=torch.int32, device="cuda")
+    indptr = torch.empty_like(case["kv_indptr"])
+    indices = torch.full(
+        (case["batch"] * width,), -123, dtype=torch.int32, device="cuda"
+    )
+    last = torch.empty_like(case["kv_last_page_lens"])
+    return lengths, table, indptr, indices, last
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] != "gfx1250",
+    reason="requires gfx1250",
+)
+class TestMlaQh64PageMetadata:
+    @pytest.mark.parametrize("batch", [1, 3])
+    @pytest.mark.parametrize("q_len", [1, 4])
+    @pytest.mark.parametrize("ctx_len", [64, 128])
+    @pytest.mark.parametrize("splits", [1, 3, None])
+    def test_page_csr_same_input_reference_and_gluon(
+        self, batch, q_len, ctx_len, splits
+    ):
+        case = _make_qh64_case(batch, ctx_len, 1, q_len=q_len)
+        args = _qh64_page_inputs(case)
+        indptr, indices, last = aiter.mla.mla_decode_prepare_page_csr(*args)
+        torch.testing.assert_close(indptr, case["kv_indptr"], atol=0, rtol=0)
+        torch.testing.assert_close(last, case["kv_last_page_lens"], atol=0, rtol=0)
+        count = int(indptr[-1])
+        torch.testing.assert_close(
+            indices[:count], case["kv_indices"][:count], atol=0, rtol=0
+        )
+        case.update(kv_indptr=indptr, kv_indices=indices, kv_last_page_lens=last)
+        out, lse, _ = _run_qh64_case(
+            case, num_kv_splits=splits, num_kv_splits_indptr=None
+        )
+        expected, expected_lse = _ref_qh64_case(case)
+        gluon = _run_qh64_gluon_case(case)
+        torch.testing.assert_close(out, expected, atol=0.06, rtol=0.06)
+        torch.testing.assert_close(out, gluon, atol=0.06, rtol=0.06)
+        torch.testing.assert_close(lse, expected_lse, atol=0.02, rtol=0.002)
+
+    @pytest.mark.parametrize("lengths", [[0, 65, 129], [0, 0, 0], [1, 2, 0]])
+    @pytest.mark.parametrize("causal", [False, True])
+    @pytest.mark.parametrize("splits", [1, 3])
+    def test_ragged_empty_and_poisoned_tail(self, lengths, causal, splits):
+        case = _make_qh64_case(
+            3, max(lengths), splits, lengths=lengths, q_lengths=[0, 4, 2], causal=causal
+        )
+        args = _qh64_page_inputs(case)
+        indptr, indices, last = aiter.mla.mla_decode_prepare_page_csr(*args)
+        count = int(indptr[-1])
+        assert (indices[count:] == -123).all()
+        case.update(kv_indptr=indptr, kv_indices=indices, kv_last_page_lens=last)
+        _check_qh64_case(case, compare_layouts=False)
+
+    def test_graph_replay_rebuilds_csr_without_reallocating(self):
+        case = _make_qh64_case(2, 129, 3, q_len=4)
+        args = _qh64_page_inputs(case)
+        lengths, _table, indptr, indices, last = args
+        case.update(kv_indptr=indptr, kv_indices=indices, kv_last_page_lens=last)
+        out = torch.empty((8, 64, 512), dtype=torch.bfloat16, device="cuda")
+
+        def run():
+            aiter.mla.mla_decode_prepare_page_csr(*args)
+            _run_qh64_case(case, o=out)
+
+        run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        for new_lengths in ([129, 129], [65, 0], [0, 0]):
+            case["lengths"] = list(new_lengths)
+            lengths.copy_(torch.tensor(new_lengths, dtype=torch.int32, device="cuda"))
+            out.fill_(float("nan"))
+            graph.replay()
+            expected, _ = _ref_qh64_case(case)
+            torch.testing.assert_close(out, expected, atol=0.06, rtol=0.06)
+            assert torch.equal(
+                indptr,
+                torch.tensor(
+                    [
+                        0,
+                        (new_lengths[0] + 63) // 64,
+                        sum((x + 63) // 64 for x in new_lengths),
+                    ],
+                    dtype=torch.int32,
+                    device="cuda",
+                ),
+            )
+
+    @pytest.mark.parametrize(
+        "kind", ["seq_dtype", "table_stride", "capacity", "last_shape", "device"]
+    )
+    def test_invalid_metadata_rejected(self, kind):
+        args = list(_qh64_page_inputs(_make_qh64_case(2, 128, 1)))
+        if kind == "seq_dtype":
+            args[0] = args[0].long()
+        elif kind == "table_stride":
+            args[1] = args[1][:, ::2]
+        elif kind == "capacity":
+            args[3] = args[3][:0]
+        elif kind == "last_shape":
+            args[4] = args[4][:1]
+        else:
+            args[1] = args[1].cpu()
+        with pytest.raises(ValueError):
+            aiter.mla.mla_decode_prepare_page_csr(*args)
+
+    def test_empty_batch(self):
+        empty = torch.empty(0, dtype=torch.int32, device="cuda")
+        ptr = torch.full((1,), -1, dtype=torch.int32, device="cuda")
+        aiter.mla.mla_decode_prepare_page_csr(
+            empty, empty.view(0, 1), ptr, empty, empty
+        )
+        assert ptr.item() == 0
+
+
+def _make_qh64_token_csr(case, *, capacity=None):
+    """Expand the page fixture into ATOM slot IDs without changing its reference.
+
+    Returns (token_indptr, slots, last). Rows are packed without page padding;
+    unused capacity is poisoned. Last-page values deliberately contain ones,
+    as in token/page_size=1 metadata, and must be ignored by token mode.
+    """
+    lengths = case["lengths"]
+    starts = case["kv_indptr"].tolist()
+    total = sum(lengths)
+    capacity = total if capacity is None else capacity
+    if capacity < total:
+        raise ValueError("token CSR capacity is smaller than the token count")
+    device = case["kv_indices"].device
+    ptr = torch.tensor(
+        [0] + list(itertools.accumulate(lengths)), dtype=torch.int32, device=device
+    )
+    slots = torch.full((capacity,), -1, dtype=torch.int32, device=device)
+    offsets = torch.arange(64, dtype=torch.int32, device=device)
+    end = 0
+    for row, length in enumerate(lengths):
+        pages = case["kv_indices"][starts[row] : starts[row + 1]]
+        slots[end : end + length] = (pages[:, None] * 64 + offsets).flatten()[:length]
+        end += length
+    return ptr, slots, torch.ones_like(case["kv_last_page_lens"])
+
+
+def _check_qh64_token_case(case, *, token_csr=None, return_lse=True):
+    expected, expected_lse = _ref_qh64_case(case)
+    page_out, page_lse, _ = _run_qh64_case(case, return_lse=return_lse)
+    ptr, slots, last = _make_qh64_token_csr(case) if token_csr is None else token_csr
+    out, lse, _ = _run_qh64_case(
+        case,
+        kv_indptr=ptr,
+        kv_indices=slots,
+        kv_last_page_lens=last,
+        kv_csr_layout="token",
+        return_lse=return_lse,
+    )
+    assert torch.equal(out.view(torch.int16), page_out.view(torch.int16))
+    assert torch.isfinite(out).all()
+    err = checkAllclose(expected.float(), out.float(), rtol=0.06, atol=0.06)
+    assert err <= 0.05
+    if return_lse:
+        assert torch.equal(lse.view(torch.int32), page_lse.view(torch.int32))
+        torch.testing.assert_close(lse, expected_lse, atol=0.02, rtol=0.002)
+    empty = torch.tensor(_effective_qh64_kv_lengths(case), device=out.device) == 0
+    assert (out[empty] == 0).all()
+    if return_lse:
+        assert torch.isneginf(lse[empty]).all()
+    return out, lse
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] != "gfx1250",
+    reason="requires gfx1250",
+)
+class TestMlaQh64TokenCsr:
+    def test_default_page_mode_is_unchanged(self):
+        case = _make_qh64_case(2, 65, 3, q_lengths=[1, 3])
+        default = _run_qh64_case(case)
+        explicit = _run_qh64_case(case, kv_csr_layout="page")
+        for before, after in zip(default, explicit):
+            assert torch.equal(before, after)
+
+    @pytest.mark.parametrize("ctx_len", [0, 1, 63, 64, 65, 127, 128, 129, 4096])
+    @pytest.mark.parametrize("splits", [1, 3])
+    @pytest.mark.parametrize("causal", [False, True])
+    def test_page_parity_and_reference(self, ctx_len, splits, causal):
+        case = _make_qh64_case(
+            3,
+            ctx_len,
+            splits,
+            lengths=[1, ctx_len, 0],
+            q_lengths=[4, 2, 1],
+            causal=causal,
+        )
+        _check_qh64_token_case(case)
+
+    @pytest.mark.parametrize("splits", [1, 3])
+    @pytest.mark.parametrize("return_lse", [False, True])
+    def test_ragged_queries_last_values_and_capacity(self, splits, return_lse):
+        case = _make_qh64_case(
+            4, 129, splits, lengths=[1, 65, 0, 129], q_lengths=[0, 4, 2, 3]
+        )
+        ptr, slots, last = _make_qh64_token_csr(case, capacity=512)
+        assert ptr.tolist() == [0, 1, 66, 66, 195]
+        # Neither shader length calculation nor stage2 may use these values.
+        last.copy_(torch.tensor([-123, 0, 999, 17], device=last.device))
+        _check_qh64_token_case(case, token_csr=(ptr, slots, last), return_lse=return_lse)
+
+    @pytest.mark.parametrize("splits", [1, 3])
+    @pytest.mark.parametrize("return_lse", [False, True])
+    def test_empty_kv_and_physical_pool(self, splits, return_lse):
+        case = _make_qh64_case(3, 0, splits, q_lengths=[0, 4, 2])
+        case["kv_shuffled"] = case["kv_shuffled"][:0]
+        _check_qh64_token_case(case, return_lse=return_lse)
+
+    @pytest.mark.parametrize("lengths", [[0, 65, 1], [1024, 17, 0], [0, 0, 0]])
+    @pytest.mark.parametrize("padding", [0, 257])
+    def test_auto_uses_token_capacity(self, lengths, padding, monkeypatch):
+        case = _make_qh64_case(3, max(lengths), 1, lengths=lengths, q_len=4)
+        ptr, slots, last = _make_qh64_token_csr(case, capacity=sum(lengths) + padding)
+        original = aiter.mla.get_meta_param
+        observed_capacity = []
+
+        def observe(*args, **kwargs):
+            observed_capacity.append(args[2])
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(aiter.mla, "get_meta_param", observe)
+        expected, expected_lse = _ref_qh64_case(case)
+        out, lse, _ = _run_qh64_case(
+            case,
+            kv_indptr=ptr,
+            kv_indices=slots,
+            kv_last_page_lens=last,
+            kv_csr_layout="token",
+            num_kv_splits=None,
+            num_kv_splits_indptr=None,
+        )
+        assert observed_capacity == ([slots.numel()] if slots.numel() else [])
+        err = checkAllclose(expected.float(), out.float(), rtol=0.06, atol=0.06)
+        assert err <= 0.05 and torch.isfinite(out).all()
+        torch.testing.assert_close(lse, expected_lse, atol=0.02, rtol=0.002)
+
+    @pytest.mark.parametrize("splits", [1, 3])
+    @pytest.mark.parametrize("causal", [False, True])
+    def test_raw_partials_and_valid_count(self, splits, causal):
+        case = _make_qh64_case(
+            3, 129, splits, lengths=[1, 129, 0], q_lengths=[4, 2, 1], causal=causal
+        )
+        ptr, slots, last = _make_qh64_token_csr(case)
+        results = []
+        for is_token in (False, True):
+            r = torch.full((7, splits, 64, 512), 12345.0, device="cuda")
+            lse = torch.full((7, splits, 64, 1), 12345.0, device="cuda")
+            valid = torch.full((3,), -1, dtype=torch.int32, device="cuda")
+            aiter.mla_decode_stage1_asm_fwd(
+                case["q"],
+                case["kv_shuffled"],
+                case["qo_indptr"],
+                ptr if is_token else case["kv_indptr"],
+                slots if is_token else case["kv_indices"],
+                last if is_token else case["kv_last_page_lens"],
+                case["num_kv_splits_indptr"],
+                None,
+                None,
+                None,
+                case["max_q"],
+                64,
+                1,
+                1 / 24,
+                r,
+                lse,
+                torch.empty((7, 64, 512), dtype=torch.bfloat16, device="cuda"),
+                torch.empty((7, 64), device="cuda"),
+                case["q_scale"],
+                case["kv_scale"],
+                valid_split_count=valid,
+                use_valid_split_count_reduce=int(splits > 1),
+                causal=causal,
+                kv_shuffled=1,
+                kv_indptr_is_token_level=is_token,
+            )
+            results.append((r, lse, valid))
+        for page, token in zip(*results):
+            assert torch.equal(page.view(torch.int32), token.view(torch.int32))
+        assert results[1][2].tolist() == [1, min(splits, 3), 0]
+
+    def test_graph_replay_reads_token_metadata(self):
+        case = _make_qh64_case(2, 129, 3, q_lengths=[1, 3])
+        ptr, slots, last = _make_qh64_token_csr(case, capacity=258)
+
+        def run():
+            return _run_qh64_case(
+                case,
+                kv_indptr=ptr,
+                kv_indices=slots,
+                kv_last_page_lens=last,
+                kv_csr_layout="token",
+            )
+
+        run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out, lse, _ = run()
+        for lengths, q_lengths in (
+            ([129, 129], [1, 3]),
+            ([1, 65], [2, 2]),
+            ([0, 0], [3, 1]),
+        ):
+            case["lengths"] = lengths
+            case["q_lengths"] = q_lengths
+            case["qo_indptr"].copy_(
+                torch.tensor([0] + list(itertools.accumulate(q_lengths)), device="cuda")
+            )
+            # Compact the page reference rows, then regenerate the matching
+            # token CSR into the same graph-owned pointers.
+            counts = [(n + 63) // 64 for n in lengths]
+            case["kv_indptr"].copy_(
+                torch.tensor([0] + list(itertools.accumulate(counts)), device="cuda")
+            )
+            case["kv_last_page_lens"].copy_(
+                torch.tensor(
+                    [((n - 1) % 64 + 1) if n else 0 for n in lengths], device="cuda"
+                )
+            )
+            next_ptr, next_slots, _ = _make_qh64_token_csr(case, capacity=slots.numel())
+            ptr.copy_(next_ptr)
+            slots.copy_(next_slots)
+            last.fill_(-123)
+            expected, expected_lse = _ref_qh64_case(case)
+            out.fill_(float("nan"))
+            lse.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            err = checkAllclose(expected.float(), out.float(), rtol=0.06, atol=0.06)
+            assert err <= 0.05 and torch.isfinite(out).all()
+            torch.testing.assert_close(lse, expected_lse, atol=0.02, rtol=0.002)
+
+    @pytest.mark.parametrize("mode", ["invalid", None, 1])
+    def test_unknown_layout_rejected(self, mode, monkeypatch):
+        case = _make_qh64_case(1, 1, 1)
+
+        def unexpected(*args, **kwargs):
+            pytest.fail("invalid layout reached stage1")
+
+        monkeypatch.setattr(aiter, "mla_decode_stage1_asm_fwd", unexpected)
+        with pytest.raises(ValueError, match="kv_csr_layout"):
+            _run_qh64_case(case, kv_csr_layout=mode)
+
+    @pytest.mark.parametrize(
+        "variant", ["token_major", "qh128", "page_size", "persistent", "cp"]
+    )
+    def test_unsupported_scope_rejected(self, variant, monkeypatch):
+        case = _make_qh64_case(1, 1, 1)
+        overrides = {
+            "token_major": {"kv_layout": "token_major"},
+            "qh128": {"q": torch.empty((1, 128, 576), device="cuda")},
+            "page_size": {"page_size": 1},
+            "persistent": {"work_meta_data": torch.empty(1, device="cuda")},
+            "cp": {"cp_world_size": 2},
+        }
+
+        def unexpected(*args, **kwargs):
+            pytest.fail("unsupported token CSR reached stage1")
+
+        monkeypatch.setattr(aiter, "mla_decode_stage1_asm_fwd", unexpected)
+        with pytest.raises(
+            ValueError, match="token CSR|page_size=64|persistent|context parallelism"
+        ):
+            _run_qh64_case(case, kv_csr_layout="token", **overrides[variant])
+
+    @pytest.mark.parametrize("variant", ["token_major", "page_size", "persistent", "cp"])
+    def test_native_token_scope_rejected(self, variant, monkeypatch):
+        case = _make_qh64_case(1, 1, 1)
+        original = aiter.mla_decode_stage1_asm_fwd
+
+        def invalid_native(*args, **kwargs):
+            args = list(args)
+            kwargs["kv_indptr_is_token_level"] = True
+            if variant == "token_major":
+                kwargs["kv_shuffled"] = 0
+            elif variant == "page_size":
+                args[11] = 1
+            elif variant == "persistent":
+                args[7] = torch.empty(1, device="cuda")
+            else:
+                args[21] = 2
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(aiter, "mla_decode_stage1_asm_fwd", invalid_native)
+        with pytest.raises(RuntimeError, match="token CSR|context parallelism"):
+            _run_qh64_case(case, kv_csr_layout="token")
+
+    @pytest.mark.parametrize("splits", [1, 3])
+    @pytest.mark.parametrize(
+        "offset",
+        [
+            (1 << 32) // (64 * 576) - 1,
+            (1 << 32) // (64 * 576) + 1,
+            (1 << 19) + 1,
+        ],
+    )
+    def test_bigraw_token_hot_loop(self, offset, splits):
+        # All 64 logical pages come from token slots; both bootstrap and rolling
+        # page loads must retain the high half of physical byte offsets.
+        _check_qh64_bigraw(offset, splits, 4096, q_len=4, kv_csr_layout="token")
+
+    @pytest.mark.parametrize(
+        "ctx_len,splits",
+        [(0, 3), (1, 1), (63, 3), (64, 1), (65, 3), (129, 3), (4096, 3)],
+    )
+    def test_oob_guarded_token_slots(self, ctx_len, splits):
+        code = (
+            "import sys; sys.path.insert(0, 'op_tests'); "
+            "from test_mla_decode_pagesize64 import _run_qh64_token_oob_worker; "
+            f"_run_qh64_token_oob_worker({ctx_len}, {splits})"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=Path(__file__).resolve().parents[1],
+            env=dict(
+                os.environ, PYTORCH_NO_HIP_MEMORY_CACHING="1", HSA_ENABLE_COREDUMP="0"
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=180,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _run_qh64_token_oob_worker(ctx_len, splits):
+    lengths = [1, ctx_len, 0] if ctx_len else [0, 0, 0]
+    case = _guard_qh64_case(
+        _make_qh64_case(3, ctx_len, splits, lengths=lengths, q_lengths=[4, 2, 1])
+    )
+    token_csr = tuple(_tail_guarded(t) for t in _make_qh64_token_csr(case))
+    original = aiter.mla_decode_stage1_asm_fwd
+
+    def guarded(*args, **kwargs):
+        args = list(args)
+        replacements = {}
+        for index in (14, 15, 16, 17, 23):
+            if args[index] is not None:
+                replacements[index] = args[index]
+                args[index] = _tail_guarded(args[index])
+        original(*args, **kwargs)
+        torch.cuda.synchronize()
+        for index, target in replacements.items():
+            target.copy_(args[index])
+
+    aiter.mla_decode_stage1_asm_fwd = guarded
+    _check_qh64_token_case(case, token_csr=token_csr)
+    torch.cuda.synchronize()
 
 
 def _run_qh64_oob_worker(ctx_len, splits, q_len=1):
