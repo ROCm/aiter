@@ -25,6 +25,7 @@ namespace py = pybind11;
         .value("per_128x128", QuantType::per_128x128)                                       \
         .value("per_256x128", QuantType::per_256x128)                                       \
         .value("per_1024x128", QuantType::per_1024x128)                                     \
+        .value("iq2r_2bit", QuantType::iq2r_2bit)                                           \
         .export_values();                                                                   \
     pybind11::enum_<ActivationType>(m, "ActivationType")                                    \
         .value("No", ActivationType::No)                                                    \
@@ -33,6 +34,7 @@ namespace py = pybind11;
         .value("Swiglu", ActivationType::Swiglu)                                            \
         .value("Situv2", ActivationType::Situv2)                                            \
         .value("GeluTanh", ActivationType::GeluTanh)                                        \
+        .value("Relu2", ActivationType::Relu2)                                              \
         .export_values();                                                                   \
     pybind11::enum_<MlaVersion>(m, "MlaVersion")                                            \
         .value("V32", MlaVersion::V32)                                                      \
@@ -636,7 +638,8 @@ namespace py = pybind11;
           py::arg("reg_bytes"),                                                      \
           py::arg("use_1stage"),                                                     \
           py::arg("bf16_out_ptr")    = static_cast<int64_t>(0),                      \
-          py::arg("transpose_scale") = false);                                       \
+          py::arg("transpose_scale") = false,                                        \
+          py::arg("gemma_norm")      = false);                                       \
     m.def("fused_allreduce_rmsnorm_mxfp4_quant",                                     \
           &aiter::fused_allreduce_rmsnorm_mxfp4_quant,                               \
           py::arg("_fa"),                                                            \
@@ -1496,7 +1499,20 @@ namespace py = pybind11;
           py::arg("dispatch_policy")   = 0,            \
           py::arg("local_topk_ids")    = std::nullopt, \
           py::arg("m_indices")         = std::nullopt, \
-          py::arg("reverse_sorted")    = std::nullopt);
+          py::arg("reverse_sorted")    = std::nullopt); \
+    m.def("mxfp4_moe_sort_quant_fwd",                  \
+          &mxfp4_moe_sort_quant_fwd,                   \
+          py::arg("hidden_states"),                    \
+          py::arg("topk_ids"),                         \
+          py::arg("topk_weights"),                     \
+          py::arg("sorted_token_ids"),                 \
+          py::arg("sorted_weights"),                   \
+          py::arg("sorted_expert_ids"),                \
+          py::arg("num_valid_ids"),                    \
+          py::arg("moe_buf"),                          \
+          py::arg("activation_quant"),                 \
+          py::arg("activation_scale_token"),           \
+          py::arg("num_experts"));
 
 #define MLA_V4_PREFILL_OPUS_PYBIND                  \
     m.def("pa_sparse_prefill_gfx950_opus_fwd",      \
