@@ -48,7 +48,12 @@ _retired_adaptive_control: list[torch.Tensor] = []
 def _get_adaptive_control(
     device: torch.device, stream_id: int, rows: int
 ) -> torch.Tensor:
-    """The zeroed control buffer for `rows` rows, grown in powers of two."""
+    """The zeroed control buffer for `rows` rows, grown in powers of two.
+
+    Per device and stream, live and retired buffers together stay under four times
+    `decode_control_slots(rows)` for the largest `rows` seen, until
+    `clear_topk_per_row_decode_workspace_cache()`.
+    """
     need = _adaptive.decode_control_slots(rows)
     buf = _adaptive_control.get((device, stream_id))
     if buf is not None and buf.numel() >= need:
