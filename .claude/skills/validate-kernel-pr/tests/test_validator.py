@@ -29,7 +29,13 @@ def review_skill_text():
     Step 1 moved out of the document into a program, so a contract test that reads only
     SKILL.md now sees the prose and none of the implementation it is asserting about. The
     seam between the two skills is the code, wherever it lives."""
-    return (REVIEW_DIR / "SKILL.md").read_text() + "\n" + (REVIEW_DIR / "fetch.sh").read_text()
+    return (
+        (REVIEW_DIR / "SKILL.md").read_text()
+        + "\n"
+        + (REVIEW_DIR / "fetch.sh").read_text()
+    )
+
+
 REQUIRED_STAGES = {
     "merge_sim",
     "gpu_claim",
@@ -37,7 +43,6 @@ REQUIRED_STAGES = {
     "test_policy",
     "baseline_control",
     "correctness_repo_tests",
-    "correctness_s1_grid",
     "execution_receipt",
     "index_width_scan",
 }
@@ -118,9 +123,6 @@ class ValidatorFixture:
         (self.repo / "aiter" / "kernel.py").write_text("VALUE = 1\n")
         (self.repo / "tests" / "test_sample.py").write_text(
             "import os\n"
-            '_GRID = os.environ.get("VALIDATOR_TEST_GRID", "")\n'
-            'if _GRID == "__VALIDATOR_INVALID_GRID__":\n'
-            '    raise ValueError("invalid validator grid probe")\n'
             '# (7, 257, "f32")\n'
             "def run_kernel(M, N, dtype_str):\n"
             "    assert M > 0 and N > 0 and dtype_str\n"
@@ -132,7 +134,7 @@ class ValidatorFixture:
             "    if phase:\n"
             "        expected = f\"/{phase.split('-')[0]}/aiter-jit\"\n"
             '        assert expected in os.environ["AITER_JIT_DIR"]\n'
-            '    shapes = _GRID or "7,257,f32"\n'
+            '    shapes = "7,257,f32"\n'
             "    for shape in shapes.split(';'):\n"
             "        M, N, dtype_str = shape.split(',')\n"
             "        run_kernel(int(M), int(N), dtype_str)\n"
@@ -231,21 +233,25 @@ class ValidatorFixture:
         picker=None,
         path_prefix=None,
         pylib=None,
-        grid=True,
         expected_route="test_sample:run_kernel",
-        grid_value="7,257,f32",
         python_bin=None,
         perf=True,
-        shape_env="VALIDATOR_TEST_GRID",
-        shape_arg=None,
-        shape_argnames=None,
         shape_vars="M,N,dtype_str",
         tol_table="f32=1e-5,f16=2e-3,bf16=1e-2",
         use_picker_env=True,
         cwd=None,
-        axes=(),
         perf_control_column=None,
-        runner=None,
+        # The validator no longer classifies the target; the caller declares how to run it. This
+        # default matches the fixture target, and a test whose subject is a script target says so
+        # explicitly -- the same obligation a real caller now has.
+        runner="pytest",
+        # The caller's declaration that they looked and no test exercises the change. Mutually
+        # exclusive with `tests`, exactly as the two flags are on the command line.
+        no_target=None,
+        # The file to TIME, when it is not the file to run. Defaults to None so every existing
+        # test keeps exercising the fallback, which is still the common case.
+        perf_target=None,
+        extra_env=None,
     ):
         report = self.root / f"{patch.stem}-report.json"
         # `cwd` exists for one reason: the validator has to accept RELATIVE --patch/--out from
@@ -261,8 +267,7 @@ class ValidatorFixture:
             patch_arg,
             "--head-sha",
             "b" * 40,
-            "--target",
-            tests,
+            *(["--no-target", no_target] if no_target else ["--target", tests]),
             "--expected-route",
             expected_route,
             "--shape-vars",
@@ -274,18 +279,10 @@ class ValidatorFixture:
             "--out",
             report_arg,
         ]
-        if grid:
-            if shape_env:
-                command.extend(["--shape-env", shape_env])
-            command.extend(["--grid", grid_value])
-        if shape_arg:
-            command.extend(["--shape-arg", shape_arg])
-        if shape_argnames:
-            command.extend(["--shape-argnames", shape_argnames])
-        for axis in axes:
-            command.extend(["--axis", axis])
         if perf_control_column:
             command.extend(["--perf-control-column", perf_control_column])
+        if perf_target:
+            command.extend(["--perf-target", perf_target])
         if runner:
             command.extend(["--runner", runner])
         if not perf:
@@ -305,6 +302,7 @@ class ValidatorFixture:
             environment["PYLIB"] = str(pylib)
         if path_prefix:
             environment["PATH"] = f"{path_prefix}:{environment['PATH']}"
+        environment.update(extra_env or {})
         result = run(command, env=environment, cwd=cwd, check=False)
         if not report.exists():
             raise AssertionError(
@@ -366,6 +364,54 @@ class ValidatorFixture:
             cwd=self.repo,
         )
 
+    #: A bench that is ALREADY in the repository and reaches the kernel through an import.
+    #: This is the ordinary aiter shape -- op_benchmarks/triton/bench_gemm_a8w8.py imports
+    #: aiter.ops.triton.gemm.basic.gemm_a8w8 -- and it is the edge discovery follows.
+    REPO_BENCH = "tests/bench_repo.py"
+
+    def add_repo_bench(self):
+        (self.repo / self.REPO_BENCH).write_text(
+            "import argparse\n"
+            "import os\n"
+            "import sys\n"
+            "\n"
+            "sys.path.insert(0, os.path.dirname(os.path.dirname(\n"
+            "    os.path.abspath(__file__))))\n"
+            "\n"
+            "from aiter.kernel import VALUE\n"
+            "\n"
+            "\n"
+            "def main():\n"
+            "    parser = argparse.ArgumentParser()\n"
+            "    parser.add_argument('--scenario', default='test',\n"
+            "                        choices=['test', 'bench'])\n"
+            "    parser.parse_args()\n"
+            "    print('| dim | kernel us | reference us |')\n"
+            "    print('|---|---|---|')\n"
+            "    for dim in (1024, 2048, 4096, 8192):\n"
+            "        print(f'| {dim} | {dim * VALUE / 100.0} | {dim / 50.0} |')\n"
+            "    print('4/4 cases passed')\n"
+            "\n"
+            "\n"
+            "if __name__ == '__main__':\n"
+            "    main()\n"
+        )
+        run(["git", "add", "-A"], cwd=self.repo)
+        run(
+            [
+                "git",
+                "-c",
+                "user.name=Validator Test",
+                "-c",
+                "user.email=validator@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "add repo bench",
+            ],
+            cwd=self.repo,
+        )
+
     def rewrite_bench(self, body):
         """Return a mutate() that replaces the bench target wholesale."""
 
@@ -400,6 +446,7 @@ class ConcurrentRunGuard(unittest.TestCase):
         """
         import fcntl
         import glob
+
         held = []
         for path in sorted(glob.glob("/tmp/gpu-*.lock")):
             try:
@@ -414,11 +461,13 @@ class ConcurrentRunGuard(unittest.TestCase):
             finally:
                 os.close(fd)
         self.assertEqual(
-            [], held,
+            [],
+            held,
             "another validator holds %s. It will keep holding the GPU while this suite "
             "runs, so the runtime stages degrade to NO_GPU and every test expecting PASS "
             "reports INCONCLUSIVE. These are not regressions -- wait for the other run."
-            % ", ".join(held))
+            % ", ".join(held),
+        )
 
 
 class ValidateKernelPrTests(unittest.TestCase):
@@ -452,6 +501,80 @@ class ValidateKernelPrTests(unittest.TestCase):
             self.assertIsInstance(stage, dict)
             self.assertIn("status", stage)
 
+    def test_a_change_with_no_test_at_all_is_a_blocker_not_a_usage_error(self):
+        # It used to be a usage error: the caller who looked and found nothing had no way to say
+        # so, the run died before writing anything, and the PR went unvalidated rather than red.
+        patch = self.fixture.make_patch(self.harmless_change, "no-test.patch")
+        result, report = self.fixture.validate(
+            patch, no_target="nothing under tests/ imports the changed entry point"
+        )
+
+        self.assertEqual(1, result.returncode)
+        self.assertEqual("BLOCK", report["verdict"])
+        self.assertEqual("none", report["test_selection"]["test_provenance"])
+        self.assertIsNone(report["test_selection"]["target"])
+        self.assertTrue(
+            any(
+                finding["severity"] == "blocker"
+                and "nothing under tests/" in finding["detail"]
+                for finding in report["findings"]
+            ),
+            report["findings"],
+        )
+        accepted = self.run_review_gate(report, patch)
+        self.assertEqual(0, accepted.returncode, accepted.stdout + accepted.stderr)
+
+    def test_the_no_test_blocker_still_names_the_head_it_is_about(self):
+        # A report review-pr cannot bind to the PR head is not evidence about that PR, so the
+        # blocker is published after the merge simulation rather than at argument parsing.
+        patch = self.fixture.make_patch(self.harmless_change, "no-test-head.patch")
+        _, report = self.fixture.validate(patch, no_target="no test exercises this")
+
+        self.assertEqual("b" * 40, report["repo"]["head"])
+        self.assertEqual("pass", report["stages"]["merge_sim"]["status"])
+
+    def test_a_forgotten_target_is_a_usage_error_and_never_a_blocker(self):
+        # The one substitution this must not make: a caller's slip published as a finding against
+        # the author. The absence has to be declared, with a reason, like the runner is.
+        patch = self.fixture.make_patch(self.harmless_change, "forgotten.patch")
+        report_path = self.fixture.root / "forgotten-report.json"
+        result = run(
+            [
+                str(VALIDATOR),
+                "--repo",
+                str(self.fixture.repo),
+                "--patch",
+                str(patch),
+                "--out",
+                str(report_path),
+            ],
+            check=False,
+        )
+
+        self.assertEqual(2, result.returncode)
+        self.assertIn("--target or --no-target", result.stderr)
+        self.assertFalse(report_path.exists())
+
+    def test_declaring_both_a_target_and_its_absence_is_refused(self):
+        patch = self.fixture.make_patch(self.harmless_change, "both.patch")
+        result = run(
+            [
+                str(VALIDATOR),
+                "--repo",
+                str(self.fixture.repo),
+                "--patch",
+                str(patch),
+                "--target",
+                "tests/test_sample.py",
+                "--no-target",
+                "there is no test",
+            ],
+            check=False,
+        )
+
+        self.assertEqual(2, result.returncode)
+        self.assertIn("contradict", result.stderr)
+
     def test_no_gpu_is_inconclusive_and_every_skip_is_declared(self):
         patch = self.fixture.make_patch(self.harmless_change, "no-gpu.patch")
         no_gpu_picker = self.fixture.tools / "no-gpu-picker"
@@ -471,13 +594,10 @@ class ValidateKernelPrTests(unittest.TestCase):
         # architecture, so a clearance would be a claim no stage established.
         self.assertEqual("not-required", report["test_selection"]["gpu_requirement"])
         self.assertEqual("pass", report["stages"]["correctness_repo_tests"]["status"])
-        self.assertEqual("pass", report["stages"]["correctness_s1_grid"]["status"])
         self.assert_complete_stage_objects(report)
 
     def test_no_gpu_withholds_correctness_from_a_target_that_needs_a_device(self):
-        patch = self.fixture.make_patch(
-            self.gpu_requiring_change, "needs-device.patch"
-        )
+        patch = self.fixture.make_patch(self.gpu_requiring_change, "needs-device.patch")
         no_gpu_picker = self.fixture.tools / "no-gpu-picker"
         write_executable(no_gpu_picker, "#!/usr/bin/env bash\nexit 1\n")
 
@@ -485,7 +605,6 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests="tests/test_needs_device.py",
             picker=no_gpu_picker,
-            grid=False,
             expected_route="test_needs_device:run_kernel",
         )
 
@@ -501,7 +620,6 @@ class ValidateKernelPrTests(unittest.TestCase):
 
         result, report = self.fixture.validate(
             patch,
-            grid_value="7,257,f32;8,513,bf16",
         )
 
         self.assertEqual(0, result.returncode)
@@ -528,14 +646,13 @@ class ValidateKernelPrTests(unittest.TestCase):
     def test_new_failing_test_is_not_mislabeled_preexisting(self):
         def add_failing_test(repo):
             (repo / "tests" / "test_new.py").write_text(
-                "def test_new():\n" "    assert False, 'candidate failure'\n"
+                "def test_new():\n    assert False, 'candidate failure'\n"
             )
 
         patch = self.fixture.make_patch(add_failing_test, "new-test.patch")
         result, report = self.fixture.validate(
             patch,
             tests="tests/test_new.py",
-            grid=False,
         )
 
         self.assertEqual(1, result.returncode)
@@ -561,7 +678,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         result, report = self.fixture.validate(
             patch,
             tests="tests/verify_kernel.py",
-            grid=False,
+            runner="script",
         )
 
         self.assertEqual(2, result.returncode)
@@ -597,7 +714,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         result, report = self.fixture.validate(
             patch,
             tests="tests/verify_kernel.py",
-            grid=False,
+            runner="script",
         )
 
         self.assertEqual(1, result.returncode)
@@ -608,7 +725,7 @@ class ValidateKernelPrTests(unittest.TestCase):
     def test_target_without_entry_point_is_skipped(self):
         def add_library_only_target(repo):
             (repo / "tests" / "kernel_helpers.py").write_text(
-                "def verify_kernel():\n" "    return True\n"
+                "def verify_kernel():\n    return True\n"
             )
 
         patch = self.fixture.make_patch(
@@ -618,7 +735,9 @@ class ValidateKernelPrTests(unittest.TestCase):
         result, report = self.fixture.validate(
             patch,
             tests="tests/kernel_helpers.py",
-            grid=False,
+            # Neither runner can execute a library-only file, so a caller reading it declares
+            # nothing -- and a target nobody can run is a skip, never a test failure.
+            runner=None,
         )
 
         self.assertEqual(2, result.returncode)
@@ -656,7 +775,6 @@ class ValidateKernelPrTests(unittest.TestCase):
 
         self.assertEqual("INCONCLUSIVE", report["verdict"])
         self.assertEqual("skip", report["stages"]["correctness_repo_tests"]["status"])
-        self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
         self.assertEqual({}, report["arch_coverage"])
         self.assert_complete_stage_objects(report)
 
@@ -737,28 +855,6 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual("INCONCLUSIVE", report["verdict"])
         self.assertEqual("skip", report["stages"]["execution_receipt"]["status"])
 
-    def test_incomplete_shape_receipt_prevents_pass(self):
-        def omit_shape(repo):
-            path = repo / "tests" / "test_sample.py"
-            path.write_text(
-                path.read_text().replace(
-                    "    for shape in shapes.split(';'):\n",
-                    "    for shape in shapes.split(';')[:1]:\n",
-                )
-            )
-
-        patch = self.fixture.make_patch(omit_shape, "missing-shape.patch")
-        result, report = self.fixture.validate(
-            patch,
-            grid_value="7,257,f32;8,513,bf16",
-        )
-
-        self.assertEqual(2, result.returncode)
-        self.assertEqual("INCONCLUSIVE", report["verdict"])
-        receipt = report["stages"]["execution_receipt"]
-        self.assertEqual("skip", receipt["status"])
-        self.assertIn("missing required shapes", receipt["note"])
-
     def test_wrong_route_receipt_prevents_pass(self):
         patch = self.fixture.make_patch(self.harmless_change, "wrong-route.patch")
         result, report = self.fixture.validate(
@@ -827,49 +923,6 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual("INCONCLUSIVE", report["verdict"])
         self.assertIn(
             "trusted build provenance", report["stages"]["runtime_compat"]["note"]
-        )
-
-    def test_grid_pass_cannot_ignore_shape_environment(self):
-        def remove_grid_hook(repo):
-            path = repo / "tests" / "test_sample.py"
-            path.write_text(
-                path.read_text().replace("VALIDATOR_TEST_GRID", "UNRELATED_ENV")
-                + '\nUNUSED_GRID_NAME = "VALIDATOR_TEST_GRID"\n'
-                + "\n# VALIDATOR_TEST_GRID is intentionally not consumed.\n"
-            )
-
-        patch = self.fixture.make_patch(remove_grid_hook, "ignored-grid.patch")
-        _, report = self.fixture.validate(patch)
-
-        self.assertEqual("INCONCLUSIVE", report["verdict"])
-        self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
-        self.assertIn(
-            "not referenced",
-            report["stages"]["correctness_s1_grid"]["note"],
-        )
-
-    def test_grid_pass_requires_runtime_shape_handshake(self):
-        def ignore_grid_value(repo):
-            path = repo / "tests" / "test_sample.py"
-            source = path.read_text().replace(
-                'if _GRID == "__VALIDATOR_INVALID_GRID__":',
-                "if False and _GRID:",
-            )
-            path.write_text(
-                source.replace(
-                    '    shapes = _GRID or "7,257,f32"',
-                    '    _ = _GRID\n    shapes = "7,257,f32"',
-                )
-            )
-
-        patch = self.fixture.make_patch(ignore_grid_value, "unused-grid.patch")
-        _, report = self.fixture.validate(patch)
-
-        self.assertEqual("INCONCLUSIVE", report["verdict"])
-        self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
-        self.assertIn(
-            "ignores",
-            report["stages"]["correctness_s1_grid"]["note"],
         )
 
     def test_base_artifact_prevents_contaminated_head_run(self):
@@ -1014,51 +1067,6 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual("INCONCLUSIVE", report["verdict"])
         self.assertEqual("skip", report["stages"]["merge_sim"]["status"])
 
-    def test_unfound_shape_arg_reports_a_missing_hook_not_an_absent_grid(self):
-        # A --shape-arg naming a flag the target does not accept used to reach the branch that
-        # says "no shape grid was configured" -- a fact about the caller, when what happened is
-        # a fact about the target. Both skip, so only the reason distinguishes a validator that
-        # could not find the hook from a caller that never asked for one, and that reason is
-        # the whole point of a stage that reports its own limits.
-        def add_script_target(repo):
-            (repo / "tests" / "verify_kernel.py").write_text(
-                "def verify_kernel():\n"
-                "    return True\n"
-                "\n"
-                "if __name__ == '__main__':\n"
-                "    assert verify_kernel()\n"
-                "    print('56/56 cases passed')\n"
-            )
-
-        patch = self.fixture.make_patch(add_script_target, "unfound-shape-arg.patch")
-        _, report = self.fixture.validate(
-            patch,
-            tests="tests/verify_kernel.py",
-            shape_env=None,
-            shape_arg="--shapes",
-        )
-
-        # Asserted before the grid_channel field below, so that this test fails on the reason
-        # the skip gives rather than on the field that was added to carry it.
-        self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
-        note = report["stages"]["correctness_s1_grid"]["note"]
-        self.assertNotIn("no configured shape override", note)
-        self.assertIn("is not passed to add_argument", note)
-        self.assertIn("tests/verify_kernel.py", note)
-        self.assertIn("--shapes", note)
-        self.assertEqual(
-            "hook-not-found",
-            report["stages"]["baseline_control"]["s1_grid"]["state"],
-        )
-        # `grid_channel` names the channel that actually CARRIED the grid, so a hook
-        # that was requested and not found leaves it empty; the reason field is where
-        # the request survives, and it distinguishes a validator limit from a target
-        # property.
-        self.assertEqual("", report["test_selection"]["grid_channel"])
-        self.assertIn(
-            "--shapes", report["test_selection"]["grid_channel_reason"]
-        )
-
     def bench_body(self, scale, trailer=""):
         self.fixture.add_bench_target()
         source = (self.fixture.repo / self.fixture.BENCH_TARGET).read_text()
@@ -1070,7 +1078,6 @@ class ValidateKernelPrTests(unittest.TestCase):
         return self.fixture.validate(
             patch,
             tests=self.fixture.BENCH_TARGET,
-            grid=False,
             expected_route="test_bench:run_kernel",
         )
 
@@ -1080,7 +1087,6 @@ class ValidateKernelPrTests(unittest.TestCase):
                 self.fixture.rewrite_bench(self.bench_body("1.25")), "perf-slow.patch"
             ),
             tests=self.fixture.BENCH_TARGET,
-            grid=False,
             expected_route="test_bench:run_kernel",
         )
         perf = report["stages"]["perf"]
@@ -1153,7 +1159,6 @@ class ValidateKernelPrTests(unittest.TestCase):
         result, report = self.fixture.validate(
             patch,
             tests=self.fixture.BENCH_TARGET,
-            grid=False,
             expected_route="test_bench:run_kernel",
             perf=False,
         )
@@ -1170,8 +1175,11 @@ class ValidateKernelPrTests(unittest.TestCase):
         SKILL.md rather than restating it means the two cannot drift apart silently.
         """
         skill = review_skill_text()
-        blocks = [b for b in re.findall(r"<<'PY'\n(.*?)\nPY\n", skill, re.DOTALL)
-                  if "expected_verdict" in b]
+        blocks = [
+            b
+            for b in re.findall(r"<<'PY'\n(.*?)\nPY\n", skill, re.DOTALL)
+            if "expected_verdict" in b
+        ]
         # Selected by what the block IS, not by its position. Indexing into the heredocs
         # made this test depend on how many unrelated Python blocks happened to precede
         # the gate, which is not a property anyone maintains.
@@ -1179,8 +1187,9 @@ class ValidateKernelPrTests(unittest.TestCase):
         gate = self.fixture.root / "gate.py"
         gate.write_text(blocks[0])
         meta = self.fixture.root / "gate-meta.json"
-        meta.write_text(json.dumps(
-            {"headRefOid": head_override or report["repo"]["head"]}))
+        meta.write_text(
+            json.dumps({"headRefOid": head_override or report["repo"]["head"]})
+        )
         base = self.fixture.root / "gate-base.txt"
         base.write_text(report["repo"]["base"] + "\n")
         target = self.fixture.root / "gate-report.json"
@@ -1212,14 +1221,14 @@ class ValidateKernelPrTests(unittest.TestCase):
         _, report = self.fixture.validate(
             patch,
             tests=self.fixture.BENCH_TARGET,
-            grid=False,
             expected_route="test_bench:run_kernel",
         )
         other_head = "0" * 40
         self.assertNotEqual(other_head, report["repo"]["head"])
         result = self.run_review_gate(report, patch, head_override=other_head)
-        self.assertNotEqual(0, result.returncode,
-                            "gate accepted a report naming a different head")
+        self.assertNotEqual(
+            0, result.returncode, "gate accepted a report naming a different head"
+        )
         combined = (result.stdout or "") + (result.stderr or "")
         self.assertIn("stale or for another checkout", combined)
 
@@ -1230,7 +1239,6 @@ class ValidateKernelPrTests(unittest.TestCase):
         _, report = self.fixture.validate(
             patch,
             tests=self.fixture.BENCH_TARGET,
-            grid=False,
             expected_route="test_bench:run_kernel",
         )
         self.assertEqual("fail", report["stages"]["perf"]["status"])
@@ -1247,7 +1255,6 @@ class ValidateKernelPrTests(unittest.TestCase):
         _, report = self.fixture.validate(
             patch,
             tests=self.fixture.BENCH_TARGET,
-            grid=False,
             expected_route="test_bench:run_kernel",
         )
 
@@ -1318,7 +1325,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         )
 
         patch = self.fixture.make_patch(self.harmless_change, "perf-artifacts.patch")
-        result, report = self.fixture.validate(patch, grid_value="7,257,f32;8,513,bf16")
+        result, report = self.fixture.validate(patch)
 
         self.assertEqual("PASS", report["verdict"])
         self.assertEqual(0, result.returncode)
@@ -1383,7 +1390,6 @@ class ValidateKernelPrTests(unittest.TestCase):
         return self.fixture.validate(
             patch,
             tests=self.PERF_LINE_TARGET,
-            grid=False,
             expected_route="test_perfline:main",
         )
 
@@ -1430,7 +1436,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         # it must still be able to reach PASS on correctness alone. If a skipped perf
         # stage could hold a verdict at INCONCLUSIVE, the stage would be unshippable.
         patch = self.fixture.make_patch(self.harmless_change, "perf-skip-pass.patch")
-        result, report = self.fixture.validate(patch, grid_value="7,257,f32;8,513,bf16")
+        result, report = self.fixture.validate(patch)
         self.assertEqual("skip", report["stages"]["perf"]["status"])
         self.assertEqual("PASS", report["verdict"])
         self.assertEqual(0, result.returncode)
@@ -1502,158 +1508,15 @@ class ValidateKernelPrTests(unittest.TestCase):
         return self.fixture.make_patch(mutate, name)
 
     def _validate_axis_target(self, patch, **kwargs):
+        # This target takes its shapes on its own CLI flag and runs from __main__: a script, and
+        # the caller is the one who has to say so now.
+        kwargs.setdefault("runner", "script")
         return self.fixture.validate(
             patch,
             tests=self.AXIS_TARGET_PATH,
             expected_route="axis_kernel:run_kernel",
-            shape_env=None,
-            shape_arg="--shapes",
             perf=False,
             **kwargs,
-        )
-
-    def test_a_grid_that_duplicates_the_targets_own_defaults_is_not_a_control(self):
-        # SKILL.md calls the S1 grid "a positive control against reporting the same default
-        # test run twice under different stage names". On aiter#4538 all three requested
-        # shapes were already in the target's own --shapes default list, so the stage
-        # reported `pass` for re-running a strict subset of correctness_repo_tests, and the
-        # verdict was PASS. A duplicate grid proves nothing the repository run did not
-        # already prove, so it cannot be credited.
-        patch = self._axis_patch("grid-duplicate.patch")
-        result, report = self._validate_axis_target(patch, grid_value="7,257,f32")
-
-        selection = report["test_selection"]
-        self.assertEqual("duplicates-target-defaults", selection["grid_independence"])
-        self.assertIn("--shapes", selection["grid_independence_reason"])
-        grid_stage = report["stages"]["correctness_s1_grid"]
-        self.assertEqual("skip", grid_stage["status"])
-        self.assertEqual(0, grid_stage["exit"])
-        self.assertEqual("INCONCLUSIVE", report["verdict"])
-        self.assertEqual(2, result.returncode)
-
-    def test_a_duplicate_grid_rescued_by_an_axis_says_so_in_one_place(self):
-        # A duplicate shape grid is rescued when a PROVEN axis asks for values the target
-        # does not run by default -- the configuration reaching the kernel is genuinely new.
-        # But test_selection carries the same two fields and is written before the axes are
-        # proven, so it kept the pre-override answer and the report contradicted itself:
-        # test_selection said "duplicates-target-defaults" while the stage said
-        # "adds-coverage". Observed on ROCm/aiter#5081. One question, one answer.
-        patch = self._axis_patch("duplicate-rescued.patch")
-        _, report = self._validate_axis_target(
-            patch,
-            grid_value="7,257,f32",
-            axes=("num_heads=--num-heads:32;64",),
-        )
-
-        stage = report["stages"]["correctness_s1_grid"]
-        selection = report["test_selection"]
-        self.assertEqual("proven", selection["axis_state"])
-        self.assertEqual("adds-coverage", stage["independence"])
-        self.assertEqual(
-            stage["independence"], selection["grid_independence"]
-        )
-        self.assertEqual(
-            stage["independence_reason"], selection["grid_independence_reason"]
-        )
-        self.assertEqual("pass", stage["status"])
-
-    def test_a_grid_outside_the_targets_defaults_still_counts_as_coverage(self):
-        # The control case for the test above: the fix must not turn every grid into a skip.
-        patch = self._axis_patch("grid-novel.patch")
-        _, report = self._validate_axis_target(patch, grid_value="9,1023,f32")
-
-        self.assertEqual(
-            "adds-coverage", report["test_selection"]["grid_independence"]
-        )
-        self.assertEqual("pass", report["stages"]["correctness_s1_grid"]["status"])
-
-    def test_each_head_run_keeps_its_own_execution_receipt(self):
-        # head-repo and head-grid both ran inside the head phase and shared one receipt
-        # path, so the second run erased the first. With the grid shapes a subset of the
-        # target's defaults -- aiter#4538's case -- a receipt written by EITHER run satisfies
-        # --grid, which makes the grid's own evidence unfalsifiable.
-        patch = self._axis_patch("receipt-split.patch")
-        _, report = self._validate_axis_target(patch, grid_value="9,1023,f32")
-
-        work = Path(report["stages"]["correctness_repo_tests"]["log"]).parent
-        repo_receipt = work / "head" / "execution-receipt-head-repo.json"
-        grid_receipt = work / "head" / "execution-receipt-head-grid.json"
-        self.assertTrue(repo_receipt.exists(), f"missing {repo_receipt}")
-        self.assertTrue(grid_receipt.exists(), f"missing {grid_receipt}")
-
-        repo_shapes = set(json.loads(repo_receipt.read_text())["executed_shapes"])
-        grid_shapes = set(json.loads(grid_receipt.read_text())["executed_shapes"])
-        # The repo run executes the target's defaults; the grid run executes the grid.
-        # Neither may contain the other's shapes, which is only checkable once they are
-        # separate files.
-        self.assertIn("7,257,f32", repo_shapes)
-        self.assertNotIn("9,1023,f32", repo_shapes)
-        self.assertEqual({"9,1023,f32"}, grid_shapes)
-        self.assertIn("head-grid", report["stages"]["execution_receipt"]["receipt_scope"])
-
-    def test_an_extra_axis_reaches_a_configuration_the_shape_grid_cannot_express(self):
-        # The shape channel is one ordered tuple bound to --shape-vars, so on aiter#4538 it
-        # could only ever vary (seq_len, seq_len_kv). num_heads is a separate flag whose
-        # default is [64, 128], and the kernel asserts at num_heads=16 -- a real blocker the
-        # validator had no way to request. --axis is that way.
-        patch = self._axis_patch("axis-blocker.patch")
-        result, report = self._validate_axis_target(
-            patch,
-            grid_value="9,1023,f32",
-            axes=("num_heads=--num-heads:16;32",),
-        )
-
-        selection = report["test_selection"]
-        self.assertEqual("proven", selection["axis_state"])
-        axis = selection["axes"][0]
-        self.assertEqual("num_heads", axis["name"])
-        self.assertEqual("flag-declared-in-add_argument", axis["hook_proof"])
-        self.assertEqual(["16", "32"], axis["values"])
-        self.assertEqual("adds-coverage", axis["independence"])
-        # The configuration the grid alone could never request now fails, loudly, and is
-        # attributed to the PR that adds the target.
-        self.assertEqual("fail", report["stages"]["correctness_s1_grid"]["status"])
-        self.assertEqual(1, result.returncode)
-        self.assertEqual("BLOCK", report["verdict"])
-        self.assertTrue(
-            any(
-                item["severity"] == "blocker" and "shape grid" in item["detail"]
-                for item in report["findings"]
-            ),
-            report["findings"],
-        )
-
-    def test_an_axis_the_target_ignores_is_named_not_silently_dropped(self):
-        # A flag the target declares but does not constrain would let the report claim
-        # coverage of head counts that never reached the kernel. The runtime refusal probe
-        # is what separates "declared" from "consumed", exactly as for --shape-arg, and a
-        # dropped axis has to be visible or the test space narrowed silently.
-        permissive = self.AXIS_TARGET.replace(
-            "parser.add_argument('--num-heads', type=int, nargs='*',\n"
-            "                        default=[64, 128])\n",
-            "parser.add_argument('--num-heads', type=str, nargs='*',\n"
-            "                        default=['64', '128'])\n",
-        ).replace(
-            "            run_kernel(M, N, dtype_str, num_heads)\n",
-            "            run_kernel(M, N, dtype_str, 64)\n",
-        )
-        self.assertNotEqual(permissive, self.AXIS_TARGET)
-        patch = self._axis_patch("axis-ignored.patch", body=permissive)
-        _, report = self._validate_axis_target(
-            patch,
-            grid_value="9,1023,f32",
-            axes=("num_heads=--num-heads:16;32",),
-        )
-
-        selection = report["test_selection"]
-        self.assertEqual("hook-not-consumed", selection["axis_state"])
-        self.assertIn("--num-heads", selection["axis_state_reason"])
-        self.assertTrue(
-            any(
-                "requested test axes were dropped" in item["detail"]
-                for item in report["findings"]
-            ),
-            report["findings"],
         )
 
     def test_a_script_that_returns_without_working_earns_no_architecture_credit(self):
@@ -1681,10 +1544,8 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests=self.AXIS_TARGET_PATH,
             expected_route="axis_kernel:run_kernel",
-            shape_env=None,
-            shape_arg="--shapes",
             perf=False,
-            grid=False,
+            runner="script",
         )
 
         stats = report["stages"]["correctness_repo_tests"]["stats"]
@@ -1744,7 +1605,6 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests=self.NEW_BENCH_TARGET,
             expected_route="aiter.kernel:main",
-            grid=False,
             perf=True,
             perf_control_column="reference us",
         )
@@ -1760,9 +1620,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         # while the reference column sits at exactly 1.0. median_ratio is the WORST column
         # by design, so the improvement is read off the kernel column itself.
         kernel_column = next(
-            stats
-            for name, stats in perf["columns"].items()
-            if "kernel" in name.lower()
+            stats for name, stats in perf["columns"].items() if "kernel" in name.lower()
         )
         self.assertGreater(kernel_column["median_ratio"], 1.5)
         self.assertGreaterEqual(perf["median_ratio"], 0.95)
@@ -1778,7 +1636,6 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests=self.NEW_BENCH_TARGET,
             expected_route="aiter.kernel:main",
-            grid=False,
             perf=True,
             perf_control_column="reference us",
         )
@@ -1843,7 +1700,6 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests=self.NEW_BENCH_TARGET,
             expected_route="aiter.kernel:main",
-            grid=False,
             perf=True,
             perf_control_column="reference us",
         )
@@ -1863,7 +1719,6 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests=self.NEW_BENCH_TARGET,
             expected_route="aiter.kernel:main",
-            grid=False,
             perf=True,
         )
 
@@ -1871,6 +1726,352 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual("skip", perf["status"])
         self.assertIn("--perf-control-column", perf["note"])
         self.assertNotIn("nothing to time against", perf["note"])
+
+    def test_the_timed_file_is_named_even_when_it_is_the_one_that_was_run(self):
+        # The fallback is still an answer, and a reader of a skip needs it most. Before this,
+        # the only file named anywhere in a report was the correctness target, so a reader
+        # inferred the timed file from it -- an inference that is about to stop being true.
+        self.fixture.add_bench_target()
+        patch = self.fixture.make_patch(
+            self.fixture.rewrite_bench(
+                (self.fixture.repo / self.fixture.BENCH_TARGET)
+                .read_text()
+                .replace("SCALE = 1.0", "SCALE = 1.0  # untouched")
+            ),
+            "named-fallback.patch",
+        )
+        _, report = self.fixture.validate(
+            patch,
+            tests=self.fixture.BENCH_TARGET,
+            expected_route="test_bench:run_kernel",
+            runner="script",
+        )
+
+        perf = report["stages"]["perf"]
+        self.assertEqual(self.fixture.BENCH_TARGET, perf["target"])
+        self.assertEqual("same-as-correctness-target", perf["target_basis"])
+
+    def test_the_file_that_is_timed_need_not_be_the_file_that_is_run(self):
+        # Both halves of the divergence at once, and each is a guard the old spelling failed.
+        #
+        # The correctness target is PRE-EXISTING while the perf target is one the patch ADDS.
+        # BASE_REPO_STATE therefore reads `ran` -- so a perf stage keyed to it would take the
+        # ordinary same-worktree branch and time a file that is not in the base tree. Asking
+        # about the perf target instead reaches the transplant, which is the correct baseline
+        # for a bench the PR ships.
+        #
+        # And the transplant's cleanup, `rm -f`, is the reason this pair is one test. It exists
+        # to remove the file the transplant WROTE. Spelled with the correctness target it
+        # deletes tests/test_sample.py -- a tracked file, present on base, that nothing in this
+        # run put there. The tree goes dirty, the cleanliness check guarding the head phase
+        # fails, and the entire head correctness run is skipped. The perf stage would have
+        # silently disabled correctness validation, which is far worse than no perf stage.
+        patch = self._new_bench_patch("split-targets.patch", scale="0.5")
+        _, report = self.fixture.validate(
+            patch,
+            tests="tests/test_sample.py",
+            perf_target=self.NEW_BENCH_TARGET,
+            expected_route="test_sample:run_kernel",
+            perf_control_column="reference us",
+        )
+
+        perf = report["stages"]["perf"]
+        self.assertEqual(self.NEW_BENCH_TARGET, perf["target"])
+        self.assertEqual("declared-by-caller", perf["target_basis"])
+        self.assertEqual("pr-added", perf["target_provenance"])
+        # The correctness target was not written by this patch, and says so independently.
+        self.assertEqual("pre-existing", report["test_selection"]["test_provenance"])
+        # Asserted FIRST, ahead of everything it would take down with it. Under the old
+        # spelling this file is gone, and the assertions below then fail on a missing
+        # baseline_method -- a KeyError that names the wreckage instead of the cause.
+        self.assertTrue(
+            (self.fixture.repo / "tests" / "test_sample.py").is_file(),
+            "the transplant cleanup deleted a tracked base file it did not write",
+        )
+        self.assertNotEqual(
+            "skip", report["stages"]["correctness_repo_tests"]["status"]
+        )
+        # Keyed to the perf target: BASE_REPO_STATE said `ran`.
+        self.assertEqual("target-transplant", perf["baseline_method"])
+
+    def test_a_bench_the_pr_ships_is_timed_without_being_asked_for(self):
+        # The same divergence as above, reached without --perf-target. The caller named only
+        # the unit test; the patch brought a bench along, and a PR that means to be faster
+        # usually says so exactly that way. Nothing here is a new capability -- it is the
+        # previous commit's plumbing, driven by the diff instead of by a flag.
+        patch = self._new_bench_patch("shipped-bench.patch", scale="0.5")
+        _, report = self.fixture.validate(
+            patch,
+            tests="tests/test_sample.py",
+            expected_route="test_sample:run_kernel",
+            perf_control_column="reference us",
+        )
+
+        perf = report["stages"]["perf"]
+        self.assertEqual(self.NEW_BENCH_TARGET, perf["target"])
+        self.assertEqual("discovered-pr-shipped", perf["target_basis"])
+        self.assertEqual("pr-added", perf["target_provenance"])
+        self.assertEqual([self.NEW_BENCH_TARGET], perf["candidates"])
+        self.assertEqual("target-transplant", perf["baseline_method"])
+        # And it measured something: base VALUE = 1 against head VALUE = 0.5.
+        self.assertEqual("pass", perf["status"])
+
+    def test_a_bench_already_in_the_repo_times_a_change_that_brought_none(self):
+        # The ordinary kernel PR, and the case that motivated all of this. The author changed
+        # a kernel and shipped no bench; the repository already owns one that imports it --
+        # aiter's usual shape, where op_benchmarks/triton/bench_gemm_a8w8.py imports
+        # aiter.ops.triton.gemm.basic.gemm_a8w8. Before this the perf stage asked only whether
+        # the CORRECTNESS target happened to be timeable, so it reported `skip` with the bench
+        # sitting unread in the tree.
+        self.fixture.add_repo_bench()
+        patch = self.fixture.make_patch(
+            lambda repo: (repo / "aiter" / "kernel.py").write_text("VALUE = 2.0\n"),
+            "repo-bench.patch",
+        )
+        result, report = self.fixture.validate(
+            patch,
+            tests="tests/test_sample.py",
+            expected_route="test_sample:run_kernel",
+        )
+
+        perf = report["stages"]["perf"]
+        self.assertEqual(self.fixture.REPO_BENCH, perf["target"])
+        self.assertEqual("discovered-repo-bench", perf["target_basis"])
+        # Why it is preferred: the bench is on both sides of the patch, so no transplant and
+        # no control column are needed to make the comparison attributable.
+        self.assertEqual("pre-existing", perf["target_provenance"])
+        self.assertEqual("patch-reversed-same-worktree", perf["baseline_method"])
+        # VALUE 1 -> 2 doubles the kernel column's cost, and nothing else in this PR says so.
+        self.assertEqual("fail", perf["status"])
+        self.assertLess(perf["median_ratio"], 0.95)
+        self.assertEqual(1, result.returncode)
+
+    def _both_paths_patch(self, name, scale):
+        """A patch that changes the kernel AND ships a bench, so both paths resolve.
+
+        The shipped bench deliberately does not read VALUE -- it prints a fixed table. That
+        is the shape worth defending against: a PR arrives with a benchmark of its own that
+        cannot move under its own change, while the bench the repository already owns is the
+        one that would see it.
+        """
+
+        def mutate(repo):
+            (repo / "aiter" / "kernel.py").write_text(f"VALUE = {scale}\n")
+            (repo / self.NEW_BENCH_TARGET).write_text(
+                "import argparse\n"
+                "\n"
+                "\n"
+                "def main():\n"
+                "    parser = argparse.ArgumentParser()\n"
+                "    parser.add_argument('--scenario', default='test',\n"
+                "                        choices=['test', 'bench'])\n"
+                "    parser.parse_args()\n"
+                "    print('| dim | kernel us | reference us |')\n"
+                "    print('|---|---|---|')\n"
+                "    for dim in (1024, 2048, 4096, 8192):\n"
+                "        print(f'| {dim} | {dim / 100.0} | {dim / 50.0} |')\n"
+                "    print('4/4 cases passed')\n"
+                "\n"
+                "\n"
+                "if __name__ == '__main__':\n"
+                "    main()\n"
+            )
+
+        return self.fixture.make_patch(mutate, name)
+
+    def test_both_benches_are_timed_and_the_worse_one_decides(self):
+        # The PR ships a bench and the repository already owns one. Timing only the shipped
+        # bench takes the author's word for which numbers matter -- here it prints a constant
+        # table and reports `pass` while the kernel it ships alongside got twice as slow.
+        self.fixture.add_repo_bench()
+        patch = self._both_paths_patch("both-paths-regress.patch", scale="2.0")
+        result, report = self.fixture.validate(
+            patch,
+            tests="tests/test_sample.py",
+            expected_route="test_sample:run_kernel",
+            perf_control_column="reference us",
+        )
+
+        perf = report["stages"]["perf"]
+        self.assertEqual(
+            [
+                (self.fixture.REPO_BENCH, "discovered-repo-bench", "fail"),
+                (self.NEW_BENCH_TARGET, "discovered-pr-shipped", "pass"),
+            ],
+            [
+                (entry["target"], entry["target_basis"], entry["status"])
+                for entry in perf["measurements"]
+            ],
+        )
+        # The top of the stage mirrors the measurement that gates, so review-pr and
+        # validate_evidence.py read median_ratio from where they always read it.
+        self.assertEqual("fail", perf["status"])
+        self.assertEqual(self.fixture.REPO_BENCH, perf["target"])
+        self.assertLess(perf["median_ratio"], 0.95)
+        # One should-fix, not two: a second finding would double the count of one problem.
+        self.assertEqual(
+            1,
+            len(
+                [
+                    item
+                    for item in report["findings"]
+                    if item["stage"] == "perf" and item["severity"] == "should-fix"
+                ]
+            ),
+        )
+        self.assertEqual(1, result.returncode)
+
+    def test_a_measurement_nobody_can_attribute_is_reported_and_does_not_gate(self):
+        # Same two targets, no --perf-control-column. The shipped bench is absent from base,
+        # so its only baseline is the cross-tree transplant, and without a column the patch
+        # does not touch reproducing across the two trees that comparison means nothing. It
+        # skips -- and a skip made no claim, so it cannot be what a verdict rests on.
+        self.fixture.add_repo_bench()
+        patch = self._both_paths_patch("both-paths-unattributable.patch", scale="1.0")
+        result, report = self.fixture.validate(
+            patch,
+            tests="tests/test_sample.py",
+            expected_route="test_sample:run_kernel",
+        )
+
+        perf = report["stages"]["perf"]
+        shipped = perf["measurements"][1]
+        self.assertEqual(self.NEW_BENCH_TARGET, shipped["target"])
+        self.assertEqual("skip", shipped["status"])
+        self.assertIn("--perf-control-column", shipped["note"])
+        # Still listed, and that is the point of listing it: a reader can tell a path that
+        # was never tried from one that was tried and could not be measured. Its reason is a
+        # finding too, not only a field -- a note never gates, so there is nothing to protect
+        # by swallowing it, and a reader scanning findings would otherwise never learn that a
+        # second bench existed and went unmeasured.
+        self.assertTrue(
+            any(
+                item["stage"] == "perf"
+                and item["severity"] == "note"
+                and "--perf-control-column" in item["detail"]
+                for item in report["findings"]
+            ),
+            report["findings"],
+        )
+        self.assertEqual("pass", perf["status"])
+        self.assertEqual(self.fixture.REPO_BENCH, perf["target"])
+        self.assertEqual(0, result.returncode)
+
+    def test_a_correctness_bench_is_timed_alongside_the_other_discovery_path(self):
+        self.fixture.add_repo_bench()
+        for target in (self.fixture.REPO_BENCH, self.NEW_BENCH_TARGET):
+            with self.subTest(target=target):
+                patch = self._both_paths_patch("correctness-bench.patch", scale="2.0")
+                result, report = self.fixture.validate(
+                    patch,
+                    tests=target,
+                    runner="script",
+                    expected_route="__main__:main",
+                    shape_vars="dim",
+                    perf_control_column="reference us",
+                )
+                perf = report["stages"]["perf"]
+                self.assertEqual(
+                    [self.fixture.REPO_BENCH, self.NEW_BENCH_TARGET],
+                    [item["target"] for item in perf["measurements"]],
+                )
+                measured = next(
+                    item for item in perf["measurements"] if item["target"] == target
+                )
+                self.assertEqual("same-as-correctness-target", measured["target_basis"])
+                self.assertEqual(
+                    "pass", report["stages"]["correctness_repo_tests"]["status"]
+                )
+                self.assertEqual(
+                    "pass", report["stages"]["execution_receipt"]["status"]
+                )
+                self.assertEqual("fail", perf["status"])
+                self.assertEqual(0.5, perf["median_ratio"])
+                self.assertEqual("NEEDS_WORK", report["verdict"])
+                self.assertEqual(1, result.returncode)
+
+    def test_a_blank_control_does_not_authorize_a_transplanted_baseline(self):
+        self.fixture.add_repo_bench()
+        patch = self._both_paths_patch("blank-control.patch", scale="1.0")
+        _, report = self.fixture.validate(patch, perf_control_column=" \t ")
+        shipped = report["stages"]["perf"]["measurements"][1]
+        self.assertEqual("skip", shipped["status"])
+        self.assertIn("--perf-control-column is required", shipped["note"])
+        self.assertNotIn("median_ratio", shipped)
+
+    def perf_findings(self, report, severity):
+        return [
+            item["detail"]
+            for item in report["findings"]
+            if item["stage"] == "perf" and item["severity"] == severity
+        ]
+
+    def test_a_kernel_change_with_nothing_timing_it_is_named(self):
+        # The gap this whole discovery layer exists to expose. The author changed a kernel,
+        # shipped no benchmark, and the repository owns none that imports it -- so no
+        # base-vs-head number exists for a reviewer to weigh. It used to report `skip` and
+        # change nothing, which is what a stage says when there was nothing to measure.
+        patch = self.fixture.make_patch(
+            lambda repo: (repo / "aiter" / "kernel.py").write_text("VALUE = 2.0\n"),
+            "unmeasured-kernel.patch",
+        )
+        result, report = self.fixture.validate(
+            patch,
+            tests="tests/test_sample.py",
+            expected_route="test_sample:run_kernel",
+        )
+
+        self.assertEqual("skip", report["stages"]["perf"]["status"])
+        self.assertEqual(
+            "same-as-correctness-target", report["stages"]["perf"]["target_basis"]
+        )
+        detail = self.perf_findings(report, "should-fix")
+        self.assertEqual(1, len(detail), report["findings"])
+        self.assertIn("aiter.kernel", detail[0])
+        # should-fix, so finish_report turns it into NEEDS_WORK. A note is what this stage
+        # said for years while shipping no number, and nobody acted on it.
+        self.assertEqual(1, result.returncode)
+
+    def test_a_native_only_change_is_a_note_and_still_passes(self):
+        # AITER_TRITON_ONLY=1 is on every target this validator launches, so nothing it can
+        # time reaches csrc/. The author cannot close that by writing a bench.
+        def mutate(repo):
+            (repo / "csrc").mkdir(exist_ok=True)
+            (repo / "csrc" / "gemm.cu").write_text("// faster\n")
+
+        patch = self.fixture.make_patch(mutate, "native-only.patch")
+        result, report = self.fixture.validate(
+            patch,
+            tests="tests/test_sample.py",
+            expected_route="test_sample:run_kernel",
+        )
+
+        self.assertEqual([], self.perf_findings(report, "should-fix"))
+        self.assertTrue(
+            any(
+                "AITER_TRITON_ONLY" in detail
+                for detail in self.perf_findings(report, "note")
+            ),
+            report["findings"],
+        )
+        self.assertEqual(0, result.returncode)
+
+    def test_no_perf_asks_no_question_and_so_names_no_gap(self):
+        # A caller who turned the stage off is not owed a finding about what it would have
+        # found. Discovery never runs, so there is nothing to report either way.
+        patch = self.fixture.make_patch(
+            lambda repo: (repo / "aiter" / "kernel.py").write_text("VALUE = 2.0\n"),
+            "unmeasured-kernel-no-perf.patch",
+        )
+        result, report = self.fixture.validate(
+            patch,
+            tests="tests/test_sample.py",
+            expected_route="test_sample:run_kernel",
+            perf=False,
+        )
+
+        self.assertEqual([], self.perf_findings(report, "should-fix"))
+        self.assertEqual(0, result.returncode)
 
     #: A pytest-named file that ALSO parses argv in its module body. Found on
     #: ROCm/aiter#5172: pytest wins the runner selection, imports the module at collection
@@ -1942,18 +2143,14 @@ class ValidateKernelPrTests(unittest.TestCase):
         )
         result, report = self._validate_axis_target(
             patch,
-            grid_value="9,1023,f32",
-            axes=("num_heads=--num-heads:32;64",),
         )
 
         selection = report["test_selection"]
-        # "Defines a test* function" is not the same as "pytest can collect it".
+        # "Defines a test* function" is not the same as "pytest can collect it" -- that
+        # judgement now lives in SKILL.md and arrives as a declaration, which the report marks
+        # as one so a reader can weigh it.
         self.assertEqual("script", selection["runner"])
-        self.assertIn("pytest cannot collect them", selection["runner_reason"])
-        # And because it is a script, the shape grid and the axis both reach it.
-        self.assertEqual("cli", selection["grid_channel"])
-        self.assertEqual("proven", selection["axis_state"])
-        self.assertEqual("pass", report["stages"]["correctness_s1_grid"]["status"])
+        self.assertEqual("declared-by-caller", selection["runner_basis"])
         self.assertGreater(
             report["stages"]["correctness_repo_tests"]["stats"]["observed_work"], 0
         )
@@ -1996,17 +2193,23 @@ class ValidateKernelPrTests(unittest.TestCase):
             (repo / self.AXIS_TARGET_PATH).write_text(self.AXIS_TARGET)
 
         patch = self.fixture.make_patch(mutate, "wrapped-route.patch")
-        _, report = self._validate_axis_target(patch, grid_value="9,1023,f32")
+        _, report = self._validate_axis_target(patch)
 
         receipt = report["stages"]["execution_receipt"]
         self.assertEqual("pass", receipt["status"])
         self.assertEqual("axis_kernel:run_kernel", receipt["route"])
-        self.assertEqual(["9,1023,f32"], sorted(set(receipt["executed_shapes"])))
+        # The target's own shapes, because they are the only ones there are.
+        self.assertEqual(
+            ["7,257,f32", "8,64,f32"], sorted(set(receipt["executed_shapes"]))
+        )
         self.assertGreater(
             report["stages"]["correctness_repo_tests"]["stats"]["observed_work"], 0
         )
 
-    def test_the_caller_can_force_a_runner_the_classifier_got_wrong(self):
+    def test_a_declared_runner_is_recorded_as_a_declaration(self):
+        # The validator does not classify the target any more, so the runner in the report is
+        # the caller's claim. A reader who cannot tell a claim from a measurement cannot weigh
+        # a runner-caused failure, and that failure lands on the PR author.
         patch = self._axis_patch(
             "forced-runner.patch", body=self.UNCOLLECTABLE_WORKER_TARGET
         )
@@ -2014,66 +2217,40 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests=self.AXIS_TARGET_PATH,
             expected_route="axis_kernel:run_kernel",
-            shape_env=None,
-            shape_arg="--shapes",
             perf=False,
-            grid=False,
             runner="pytest",
         )
 
         selection = report["test_selection"]
         self.assertEqual("pytest", selection["runner"])
-        self.assertIn("caller forced --runner pytest", selection["runner_reason"])
-        self.assertIn("structural selection said script", selection["runner_reason"])
+        self.assertEqual("declared-by-caller", selection["runner_basis"])
 
-    def test_a_runner_that_cannot_run_the_target_is_named_as_such(self):
-        # "Red on both sides" is an attribution, not an explanation. When the target carries
-        # a structural reason the SELECTED runner cannot run it, a reader who is not told so
-        # concludes the code is broken when the runner choice is.
-        patch = self._axis_patch("argv-at-import.patch", body=self.ARGV_AT_IMPORT_TARGET)
-        _, report = self.fixture.validate(
+    def test_an_undeclared_runner_runs_nothing_rather_than_guessing(self):
+        # The guess is what this replaced: classifying an op_tests script as pytest published
+        # a collection error as "the PR's own test fails on head" (ROCm/aiter#5081). Refusing
+        # is inconclusive, which is the honest word for it.
+        patch = self._axis_patch(
+            "undeclared-runner.patch", body=self.UNCOLLECTABLE_WORKER_TARGET
+        )
+        result, report = self.fixture.validate(
             patch,
             tests=self.AXIS_TARGET_PATH,
             expected_route="axis_kernel:run_kernel",
-            shape_env=None,
-            shape_arg="--shapes",
-            grid_value="9,1023,f32",
-            axes=("num_heads=--num-heads:16;32",),
             perf=False,
+            runner=None,
         )
 
         selection = report["test_selection"]
-        self.assertEqual("pytest", selection["runner"])
-        self.assertIn("parses argv in its module body", selection["runner_risk"])
-        self.assertTrue(
-            any(
-                "under the selected pytest runner" in item["detail"]
-                for item in report["findings"]
-            ),
+        self.assertEqual("none", selection["runner"])
+        self.assertEqual("undeclared", selection["runner_basis"])
+        self.assertIn("no --runner was declared", selection["runner_reason"])
+        self.assertEqual("INCONCLUSIVE", report["verdict"])
+        self.assertEqual(2, result.returncode)
+        # Refusing to run is not the same as finding a defect, and must never be charged to
+        # the author as one.
+        self.assertFalse(
+            any(item["severity"] == "blocker" for item in report["findings"]),
             report["findings"],
-        )
-
-        # A requested axis that could not be honoured must still appear. Publishing an empty
-        # `axes` beside a non-`none` axis_state loses the request itself, which is exactly
-        # the silently narrowed test space these fields exist to make visible.
-        self.assertEqual("unusable", selection["axis_state"])
-        self.assertEqual(1, len(selection["axes"]))
-        self.assertEqual("num_heads", selection["axes"][0]["name"])
-        self.assertEqual(["16", "32"], selection["axes"][0]["values"])
-        self.assertEqual("not-evaluated", selection["axes"][0]["hook_proof"])
-
-        # And the grid-independence reason must describe THIS run. The old default claimed
-        # "the channel exposes no declared defaults to compare against" whenever the
-        # comparison did not happen - a statement about the target that this run never
-        # established, and false here: the target declares a default for --shapes.
-        self.assertEqual("unknown", selection["grid_independence"])
-        self.assertNotIn(
-            "no declared defaults", selection["grid_independence_reason"]
-        )
-        # The channel this run established, named -- rather than a claim about the target.
-        self.assertIn(
-            "independence is only computed for the CLI-flag channel",
-            selection["grid_independence_reason"],
         )
 
     def test_a_killed_run_leaves_no_stale_verdict_at_the_output_path(self):
@@ -2136,6 +2313,55 @@ class ValidateKernelPrTests(unittest.TestCase):
             + (report_path.read_text() if report_path.exists() else ""),
         )
 
+    def test_runtime_import_and_identity_share_the_isolated_environment(self):
+        for kind in ("aiter", "flydsl"):
+            with self.subTest(kind=kind):
+                if kind == "flydsl":
+                    self.fixture.convert_to_flydsl()
+                observations = self.fixture.root / f"{kind}-imports.jsonl"
+                module = (
+                    "aiter/__init__.py"
+                    if kind == "aiter"
+                    else "python/flydsl/__init__.py"
+                )
+
+                def mutate(repo):
+                    path = repo / module
+                    path.write_text(
+                        path.read_text()
+                        + "import json, os, sys\n"
+                        + f"with open({str(observations)!r}, 'a') as observed:\n"
+                        + "    observed.write(json.dumps({'program': sys.argv[0], "
+                        + "'token_visible': 'GITHUB_TOKEN' in os.environ, "
+                        + "'home': os.environ.get('HOME', ''), "
+                        + "'jit': os.environ.get('AITER_JIT_DIR', '')}) + '\\n')\n"
+                    )
+
+                patch = self.fixture.make_patch(mutate, f"{kind}-import-env.patch")
+                _, report = self.fixture.validate(
+                    patch,
+                    perf=False,
+                    extra_env={"GITHUB_TOKEN": "synthetic-test-canary"},
+                )
+                self.assertEqual("pass", report["stages"]["runtime_compat"]["status"])
+                records = [
+                    json.loads(line) for line in observations.read_text().splitlines()
+                ]
+                self.assertTrue(
+                    any(item["program"] == "-" for item in records), records
+                )
+                self.assertTrue(
+                    any(
+                        item["program"].endswith("validate_evidence.py")
+                        for item in records
+                    ),
+                    records,
+                )
+                for item in records:
+                    self.assertFalse(item["token_visible"], item)
+                    self.assertTrue(item["home"].endswith("/head/home"), item)
+                    self.assertTrue(item["jit"].endswith("/head/aiter-jit"), item)
+
     def test_the_target_cannot_read_the_reviewers_credentials(self):
         # `env VAR=... cmd` ADDS to the inherited environment. The target is arbitrary code
         # from an unmerged PR, so every token in the reviewer's shell was readable from
@@ -2168,6 +2394,8 @@ class ValidateKernelPrTests(unittest.TestCase):
             str(patch),
             "--target",
             self.AXIS_TARGET_PATH,
+            "--runner",
+            "script",
             "--expected-route",
             "axis_kernel:run_kernel",
             "--shape-vars",
@@ -2187,7 +2415,11 @@ class ValidateKernelPrTests(unittest.TestCase):
         log = Path(report["stages"]["correctness_repo_tests"]["log"]).read_text()
         for canary in ("leakcanary-token", "leakcanary-key", "leakcanary-unrelated"):
             self.assertNotIn(canary, log)
-        for name in ("VALIDATOR_TEST_GITHUB_TOKEN", "MY_API_KEY", "UNRELATED_HOME_DECOR"):
+        for name in (
+            "VALIDATOR_TEST_GITHUB_TOKEN",
+            "MY_API_KEY",
+            "UNRELATED_HOME_DECOR",
+        ):
             self.assertNotIn(name, log)
         # The policy is a reported fact, not an implicit one.
         policy = report["isolation"]["target_environment"]
@@ -2214,16 +2446,28 @@ class ValidateKernelPrTests(unittest.TestCase):
         head_log = self.fixture.root / "rowkey-head.log"
         base_log.write_text(
             table.format(
-                a=10.0, b=20.0, c=40.0,
-                r1=1.11e-5, r2=2.22e-5, r3=3.33e-5,
-                s1=1.0101, s2=1.0202, s3=1.0303,
+                a=10.0,
+                b=20.0,
+                c=40.0,
+                r1=1.11e-5,
+                r2=2.22e-5,
+                r3=3.33e-5,
+                s1=1.0101,
+                s2=1.0202,
+                s3=1.0303,
             )
         )
         head_log.write_text(
             table.format(
-                a=5.0, b=10.0, c=20.0,
-                r1=1.19e-5, r2=2.28e-5, r3=3.37e-5,
-                s1=2.0404, s2=2.0505, s3=2.0606,
+                a=5.0,
+                b=10.0,
+                c=20.0,
+                r1=1.19e-5,
+                r2=2.28e-5,
+                r3=3.37e-5,
+                s1=2.0404,
+                s2=2.0505,
+                s3=2.0606,
             )
         )
 
@@ -2266,353 +2510,6 @@ def new_file_diff(path, source):
         f"+++ b/{path}\n"
         f"@@ -0,0 +1,{len(lines)} @@\n"
     ) + "".join(f"+{line}\n" for line in lines)
-
-
-class GridChannelTests(unittest.TestCase):
-    """The S1 grid needs a delivery channel; there are three, probed independently."""
-
-    def setUp(self):
-        self.fixture = ValidatorFixture()
-
-    def tearDown(self):
-        self.fixture.close()
-
-    @staticmethod
-    def add_cli_shape_script(repo):
-        """A script target whose shapes arrive on its own CLI flag, and which
-        never reads an environment variable."""
-        (repo / "tests" / "run_shapes.py").write_text(
-            "import argparse\n"
-            "\n"
-            "def run_kernel(M, N, dtype_str):\n"
-            "    assert M > 0 and N > 0 and dtype_str\n"
-            "\n"
-            "def main():\n"
-            "    parser = argparse.ArgumentParser()\n"
-            '    parser.add_argument("--shape", nargs="*", default=["7,257,f32"])\n'
-            "    args = parser.parse_args()\n"
-            "    for shape in args.shape:\n"
-            "        M, N, dtype_str = shape.split(',')\n"
-            "        run_kernel(int(M), int(N), dtype_str)\n"
-            "    print(f'{len(args.shape)}/{len(args.shape)} shapes passed')\n"
-            "\n"
-            "if __name__ == '__main__':\n"
-            "    main()\n"
-        )
-
-    @staticmethod
-    def add_parametrized_target(repo):
-        """A pytest target whose shapes are literals inside its own parametrize mark --
-        the dominant shape in the real repository, and the case neither of the older two
-        channels can reach."""
-        (repo / "tests" / "test_parametrized.py").write_text(
-            "import pytest\n"
-            "\n"
-            "def run_kernel(M, N, dtype_str):\n"
-            "    assert M > 0 and N > 0 and dtype_str\n"
-            "\n"
-            '@pytest.mark.parametrize("M,N,dtype_str", [(3, 5, "f32")])\n'
-            "def test_shapes(M, N, dtype_str):\n"
-            "    run_kernel(M, N, dtype_str)\n"
-        )
-
-    @staticmethod
-    def add_single_name_parametrized_target(repo):
-        """One shape parameter -- the dominant shape in the targets this channel exists for.
-
-        `run_kernel` requires an int so that the invalid-grid probe fails INSIDE the target:
-        the sentinel arrives as a string and the assertion is what rejects it.
-        """
-        (repo / "tests" / "test_one_name.py").write_text(
-            "import pytest\n"
-            "\n"
-            "def run_kernel(m):\n"
-            "    assert isinstance(m, int) and m > 0\n"
-            "\n"
-            '@pytest.mark.parametrize("m", [3])\n'
-            "def test_one_shape(m):\n"
-            "    run_kernel(m)\n"
-        )
-
-    @staticmethod
-    def add_target_with_an_unrelated_parametrize(repo):
-        """Two tests in one file: one the grid replaces, one it must not touch.
-
-        `test_unrelated` binds `m` together with `other`, so the grid cannot be substituted
-        into it without leaving `other` unfilled. Its assertion on its OWN values is what
-        proves the plugin left it alone.
-        """
-        (repo / "tests" / "test_two_marks.py").write_text(
-            "import pytest\n"
-            "\n"
-            "def run_kernel(m, n):\n"
-            "    assert isinstance(m, int) and isinstance(n, int)\n"
-            "    assert m > 0 and n > 0\n"
-            "\n"
-            '@pytest.mark.parametrize("m,n", [(3, 5)])\n'
-            "def test_shapes(m, n):\n"
-            "    run_kernel(m, n)\n"
-            "\n"
-            '@pytest.mark.parametrize("m,other", [(11, "keep")])\n'
-            "def test_unrelated(m, other):\n"
-            "    assert (m, other) == (11, 'keep')\n"
-        )
-
-    @staticmethod
-    def add_target_that_rejects_the_grid_after_the_route_ran(repo):
-        """The repository run reaches the route; the grid run dies before it.
-
-        The guard is on the TEST, ahead of the call, so the grid phase produces a receipt
-        that observed nothing while the repository phase produced one that proved the route.
-        """
-        (repo / "tests" / "test_late_grid.py").write_text(
-            "import pytest\n"
-            "\n"
-            "def run_kernel(m):\n"
-            "    assert m > 0\n"
-            "\n"
-            '@pytest.mark.parametrize("m", [3])\n'
-            "def test_shape(m):\n"
-            '    assert m < 100, "shape unsupported by this target"\n'
-            "    run_kernel(m)\n"
-        )
-
-    def test_single_shape_argname_is_delivered_and_not_published_as_a_defect(self):
-        """The most consequential regression of the batch.
-
-        The plugin unwrapped one-name rows to scalars but passed `argnames` as a LIST, and
-        pytest sets force_tuple only for a `str` argnames. Collection died with "object of
-        type 'int' has no len()", the grid run exited non-zero, and the executor published
-        that crash as `[blocker] the PR adds this target and its independent shape grid
-        fails` -- a BLOCK verdict against three real authors for a fault in the injector.
-        """
-        patch = self.fixture.make_patch(
-            self.add_single_name_parametrized_target, "one-name.patch"
-        )
-
-        _, report = self.fixture.validate(
-            patch,
-            tests="tests/test_one_name.py",
-            expected_route="test_one_name:run_kernel",
-            shape_env=None,
-            shape_argnames="m",
-            shape_vars="m",
-            grid_value="128;256",
-        )
-
-        self.assertEqual("pytest", report["test_selection"]["grid_channel"])
-        self.assertNotEqual("BLOCK", report["verdict"])
-        self.assertEqual(
-            [], [item for item in report["findings"] if item["severity"] == "blocker"]
-        )
-        grid_stage = report["stages"]["correctness_s1_grid"]
-        self.assertEqual("pass", grid_stage["status"])
-        # Both grid rows collected and ran -- not one collection error counted as a test.
-        self.assertEqual(2, grid_stage["stats"]["executed"])
-        # And the injected values, not the target's own literal 3, are what reached the route.
-        receipt = report["stages"]["execution_receipt"]
-        self.assertEqual("pass", receipt["status"])
-        self.assertEqual(["128", "256"], sorted(receipt["executed_shapes"]))
-
-    def test_an_unrelated_parametrize_does_not_disable_the_channel(self):
-        """The partial-overlap guard belongs to a test function, not to a file.
-
-        Evaluated file-wide, `test_unrelated`'s `(m, other)` mark -- which overlaps the
-        requested names without being contained in them -- switched the channel off for every
-        test in the file, and the skip text then blamed the target for taking parameters it
-        demonstrably takes. The plugin has always decided per metafunc; only the executor's
-        reachability probe was file-scoped.
-        """
-        patch = self.fixture.make_patch(
-            self.add_target_with_an_unrelated_parametrize, "two-marks.patch"
-        )
-
-        _, report = self.fixture.validate(
-            patch,
-            tests="tests/test_two_marks.py",
-            expected_route="test_two_marks:run_kernel",
-            shape_env=None,
-            shape_argnames="m,n",
-            shape_vars="m,n",
-            grid_value="128,7;256,9",
-        )
-
-        self.assertEqual("pytest", report["test_selection"]["grid_channel"])
-        self.assertEqual("", report["test_selection"]["grid_channel_reason"])
-        grid_stage = report["stages"]["correctness_s1_grid"]
-        self.assertEqual("pass", grid_stage["status"])
-        # Two grid rows for test_shapes plus the one unrelated case, which kept its own
-        # parametrization: it asserts (11, 'keep') and would have failed had the grid been
-        # substituted into it.
-        self.assertEqual(3, grid_stage["stats"]["executed"])
-        receipt = report["stages"]["execution_receipt"]
-        self.assertEqual(["128,7", "256,9"], sorted(receipt["executed_shapes"]))
-
-    def test_a_failed_grid_run_does_not_erase_the_repository_run_receipt(self):
-        """Receipts are per label, because evidence already collected must not be deleted.
-
-        `head-repo` and `head-grid` shared `$WORK/head/execution-receipt.json`. The grid run
-        starts by removing that path, so a grid phase that observed nothing overwrote a
-        receipt that had already proved the route, and the report then said the route never
-        executed -- an erasure reported as an absence.
-        """
-        patch = self.fixture.make_patch(
-            self.add_target_that_rejects_the_grid_after_the_route_ran,
-            "receipt-erasure.patch",
-        )
-
-        _, report = self.fixture.validate(
-            patch,
-            tests="tests/test_late_grid.py",
-            expected_route="test_late_grid:run_kernel",
-            shape_env=None,
-            shape_argnames="m",
-            shape_vars="m",
-            grid_value="128;256",
-        )
-
-        # The grid phase really did fail; that is the premise, not the thing under test.
-        self.assertEqual("fail", report["stages"]["correctness_s1_grid"]["status"])
-        receipt = report["stages"]["execution_receipt"]
-        self.assertEqual("pass", receipt["status"])
-        self.assertEqual("test_late_grid:run_kernel", receipt["route"])
-        # The receipt that speaks is the repository run's, which observed the route.
-        self.assertEqual(["3"], receipt["executed_shapes"])
-
-    def test_invalid_grid_probe_needs_a_passing_control_before_it_proves_anything(self):
-        """A non-zero probe exit is evidence about the GRID only if the target works without it.
-
-        On a held-out PR whose module could not be imported, the invalid-grid probe failed for
-        that reason and the channel was credited although no shape ever reached the kernel.
-        The break is planted on BASE, so the base control run is red before the grid is ever
-        involved.
-        """
-        path = self.fixture.repo / "tests" / "test_sample.py"
-        path.write_text(
-            "raise ImportError('the module under test cannot be imported')\n"
-            + path.read_text()
-        )
-        run(["git", "add", "-A"], cwd=self.fixture.repo)
-        run(
-            [
-                "git",
-                "-c",
-                "user.name=Validator Test",
-                "-c",
-                "user.email=validator@example.com",
-                "commit",
-                "-q",
-                "-m",
-                "broken base",
-            ],
-            cwd=self.fixture.repo,
-        )
-        patch = self.fixture.make_patch(
-            ValidateKernelPrTests.harmless_change, "broken-control.patch"
-        )
-
-        _, report = self.fixture.validate(patch)
-
-        baseline_grid = report["stages"]["baseline_control"]["s1_grid"]
-        self.assertEqual("hook-not-consumed", baseline_grid["state"])
-        # No base grid run was attempted, so there is no exit code to report for one.
-        self.assertNotIn("exit", baseline_grid)
-        self.assertNotEqual("pass", report["stages"]["correctness_s1_grid"]["status"])
-
-    def test_working_cli_channel_survives_a_second_shape_flag(self):
-        """Supplying --shape-arg AND --shape-env must not discard the CLI channel.
-
-        The two probes describe one target that may have both hooks. An earlier version
-        assigned the env probe's result over the CLI probe's unconditionally, so a
-        caller who named both flags lost a working CLI channel and was then told the env
-        variable's absence was the reason no grid ran.
-        """
-        patch = self.fixture.make_patch(self.add_cli_shape_script, "cli-channel.patch")
-
-        _, report = self.fixture.validate(
-            patch,
-            tests="tests/run_shapes.py",
-            expected_route="__main__:run_kernel",
-            shape_env="UNREAD_GRID_ENV",
-            shape_arg="--shape",
-            # Deliberately NOT the target's own `--shape` default of 7,257,f32. This test is
-            # about which channel carries the grid, but a grid that only re-runs the
-            # target's defaults is now downgraded to `skip` on independence grounds, and
-            # that would mask the channel result this test exists to check.
-            grid_value="9,1023,f32",
-        )
-
-        self.assertEqual("cli", report["test_selection"]["grid_channel"])
-        self.assertEqual("", report["test_selection"]["grid_channel_reason"])
-        self.assertEqual(
-            "adds-coverage", report["test_selection"]["grid_independence"]
-        )
-        grid_stage = report["stages"]["correctness_s1_grid"]
-        self.assertNotEqual("skip", grid_stage["status"])
-        self.assertEqual("pass", grid_stage["status"])
-
-    def test_parametrized_target_runs_the_grid_through_the_pytest_channel(self):
-        """The third channel: pytest's own parametrization.
-
-        The target exposes neither a flag nor an environment variable, so before this
-        channel existed the stage was inert and the skip text blamed the kernel for a
-        limit that belonged to the injector.
-        """
-        patch = self.fixture.make_patch(
-            self.add_parametrized_target, "pytest-channel.patch"
-        )
-
-        _, report = self.fixture.validate(
-            patch,
-            tests="tests/test_parametrized.py",
-            expected_route="test_parametrized:run_kernel",
-            shape_env=None,
-            shape_argnames="M,N,dtype_str",
-            grid_value="7,257,f32;8,513,bf16",
-        )
-
-        self.assertEqual("pytest", report["test_selection"]["grid_channel"])
-        grid_stage = report["stages"]["correctness_s1_grid"]
-        self.assertNotEqual("skip", grid_stage["status"])
-        self.assertEqual("pass", grid_stage["status"])
-        self.assertEqual(2, grid_stage["stats"]["executed"])
-        # The grid actually reached the kernel: the receipt carries the injected shapes,
-        # not the (3, 5, "f32") literal the target parametrizes for itself.
-        receipt = report["stages"]["execution_receipt"]
-        self.assertEqual("pass", receipt["status"])
-        self.assertEqual(
-            ["7,257,f32", "8,513,bf16"], sorted(receipt["executed_shapes"])
-        )
-        # The invalid-grid probe must fail INSIDE THE TARGET. A poisoned row of the
-        # wrong arity would raise in the plugin instead, and its non-zero exit would
-        # credit the channel without the target ever having consumed a shape.
-        probe_log = Path(grid_stage["hook_probe_log"]).read_text()
-        self.assertNotIn("grid rows must have", probe_log)
-        self.assertIn("__VALIDATOR_INVALID_GRID__", probe_log)
-
-    def test_undeliverable_grid_names_the_channel_and_blames_the_right_party(self):
-        """A skip has to say which channel was tried and what was found there.
-
-        --shape-arg against a pytest target is a gap in the validator's own wiring, and
-        publishing it as a property of the target would send a reviewer to fix a kernel
-        that is not broken.
-        """
-        patch = self.fixture.make_patch(
-            ValidateKernelPrTests.harmless_change, "no-channel.patch"
-        )
-
-        _, report = self.fixture.validate(
-            patch,
-            shape_env="UNREAD_GRID_ENV",
-            shape_arg="--shape",
-        )
-
-        self.assertEqual("", report["test_selection"]["grid_channel"])
-        reason = report["test_selection"]["grid_channel_reason"]
-        self.assertIn("a validator limit, not a target property", reason)
-        self.assertIn("--shape", reason)
-        self.assertIn("does not read $UNREAD_GRID_ENV", reason)
-        self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
 
 
 class ExecutionReceiptTests(unittest.TestCase):
@@ -2760,8 +2657,6 @@ class ProbeReceiptTests(unittest.TestCase):
                     str(receipt_path),
                     "--expected-route",
                     route,
-                    "--grid",
-                    "",
                 ]
             ).stdout
         )
@@ -2819,56 +2714,6 @@ class EvidenceCheckerTests(unittest.TestCase):
         self.assertEqual(1, stats["tests"])
         self.assertEqual(1, stats["errors"])
         self.assertEqual(0, stats["executed"])
-
-    def test_pytest_channel_receipt_does_not_assert_across_namespaces(self):
-        """The grid is delivered as test PARAMETERS; the receipt records the ROUTE's locals.
-
-        Requiring one to contain the other produced "execution receipt is missing required
-        shapes" on a run whose every grid case passed. The requirement is still recorded and
-        the mismatch is named; only the cross-namespace containment assertion is dropped.
-        """
-        path = self.directory / "receipt.json"
-        path.write_text(json.dumps(self.RECEIPT))
-
-        result = self.evidence(
-            "receipt",
-            str(path),
-            "--expected-route",
-            "test_route:run_kernel",
-            "--grid",
-            "128,7;256,9",
-            "--grid-channel",
-            "pytest",
-        )
-
-        self.assertEqual("pass", result["status"])
-        # The grid's requirement is not discarded, only its containment assertion.
-        self.assertEqual(["128,7", "256,9"], result["required_shapes"])
-        self.assertEqual(["3,5"], result["executed_shapes"])
-        self.assertIn("different vocabularies", result["shape_namespace"])
-
-    def test_a_channel_that_shares_the_receipt_namespace_still_must_contain_the_grid(self):
-        """The control for the test above: without the pytest channel, nothing is relaxed.
-
-        The env and CLI channels put the grid into the same vocabulary the receipt records,
-        so a missing shape there is still a real gap in coverage.
-        """
-        path = self.directory / "receipt.json"
-        path.write_text(json.dumps(self.RECEIPT))
-
-        result = self.evidence(
-            "receipt",
-            str(path),
-            "--expected-route",
-            "test_route:run_kernel",
-            "--grid",
-            "128,7;256,9",
-            "--grid-channel",
-            "env",
-        )
-
-        self.assertEqual("skip", result["status"])
-        self.assertIn("missing required shapes", result["note"])
 
     def test_empty_native_artifact_list_states_what_it_does_not_mean(self):
         """`native_artifacts: []` was published as though it were a measurement.
@@ -3264,79 +3109,287 @@ class ScannerScopeTests(unittest.TestCase):
         self.assertEqual(1, payload["host_scope_candidates"], payload)
 
 
-class ShapeGridPluginTests(unittest.TestCase):
-    """The plugin is what substitutes the grid, so its refusals are what keep a target the
-    grid cannot express from being reported as a failing PR."""
+class SkillProseContractTests(unittest.TestCase):
+    """SKILL.md is the prose a model acts on, so a stale sentence is a live defect.
 
-    def _run_target(self, argnames, grid, target_source):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            plugin = root / "sgp.py"
-            plugin.write_text(
-                (SKILL_DIR / "shape_grid_plugin.py").read_text()
-                + f"\n_VALIDATION_SHAPE_ARGNAMES = {argnames!r}\n"
-                + f"_VALIDATION_SHAPE_GRID = {grid!r}\n"
-            )
-            target = root / "test_target.py"
-            target.write_text(target_source)
-            return subprocess.run(
-                [sys.executable, "-m", "pytest", "-p", "sgp", str(target), "-q"],
-                cwd=root, capture_output=True, text=True,
-            )
+    The refactor that deleted the source-reading checks left three kinds of drift behind at
+    once: the schema still admitted a verdict nothing writes, the prose still named a state
+    the code no longer reached, and the invocation example had gone missing entirely while
+    every flag it used stayed real. None of that could fail a run, which is exactly why it
+    needs a test -- a wrong SKILL.md misleads silently and forever.
+    """
 
-    def test_dict_valued_parametrize_is_refused_rather_than_poisoned(self):
-        # A target parametrizing one `case: dict` passed the argnames-only gate, the grid
-        # substituted integers, and the target raised TypeError -- which the executor
-        # published as "the PR adds this target and its independent shape grid fails", a
-        # BLOCK against an author whose own suite was green in the same report.
-        result = self._run_target(
-            ("case",),
-            [(1,), (513,)],
-            "import pytest\n"
-            '@pytest.mark.parametrize("case", [{"m": 1}, {"m": 3}])\n'
-            "def test_case(case):\n"
-            "    assert case['m'] > 0\n",
+    def setUp(self):
+        self.skill = (SKILL_DIR / "SKILL.md").read_text()
+        self.script = VALIDATOR.read_text()
+        self.schema = json.loads((SKILL_DIR / "report_schema.json").read_text())
+        # The whole command surface, not just the entry point. Values used to be reachable only
+        # from bash, so searching one file was the same as searching the code; now a decision
+        # that moved into a tool would have read as unreachable and failed a test that was
+        # right about nothing. What the check is FOR is a value no code path writes.
+        self.code = self.script + "\n".join(
+            path.read_text() for path in sorted(SKILL_DIR.glob("*.py"))
+        )
+
+    # The fields that separate a caller's claim from a measurement. These are the ones a
+    # reader has to be able to look up, and the ones the refactor churned.
+    DECLARATION_FIELDS = (
+        "runner_basis",
+        "test_provenance",
+    )
+    # The same distinction, asked about the file that gets TIMED rather than the one that gets
+    # run. These live under stages.perf, not test_selection -- test_selection.target is
+    # required and is written about the correctness target throughout -- so a check that reads
+    # only test_selection would admit a whole family of enums unexamined.
+    PERF_DECLARATION_FIELDS = (
+        "target_basis",
+        "target_provenance",
+    )
+
+    def declaration_fields(self):
+        selection = self.schema["properties"]["test_selection"]["properties"]
+        perf = self.schema["properties"]["stages"]["properties"]["perf"]["properties"]
+        fields = {name: selection[name] for name in self.DECLARATION_FIELDS}
+        fields.update(
+            {f"perf.{name}": perf[name] for name in self.PERF_DECLARATION_FIELDS}
+        )
+        return fields
+
+    def test_every_value_the_schema_admits_is_one_the_code_can_write(self):
+        # A schema that allows a value nothing produces is a promise to a reader that some
+        # run, somewhere, might report it. `duplicates-target-defaults` outlived the AST
+        # check that derived it and sat here for a full refactor saying the validator still
+        # compared an injected shape grid against the target's defaults, which it no longer
+        # does -- and the injection layer that would have done the comparing is now gone too.
+        for field, spec in self.declaration_fields().items():
+            for value in spec.get("enum", []):
+                if not value:
+                    continue
+                with self.subTest(field=field, value=value):
+                    self.assertIn(value, self.code, f"{field}: {value} is unreachable")
+
+    def test_every_value_the_schema_admits_is_one_the_prose_explains(self):
+        # Backticked, not merely present: `declared` occurs inside `declared-by-caller`, so a
+        # bare substring check would let the runner_basis row vanish and still pass on a
+        # sentence about a different field entirely.
+        for field, spec in self.declaration_fields().items():
+            for value in spec.get("enum", []):
+                if not value:
+                    continue
+                with self.subTest(field=field, value=value):
+                    self.assertIn(
+                        f"`{value}`", self.skill, f"{field}: {value} is undocumented"
+                    )
+
+    def test_the_skill_still_shows_how_to_invoke_the_validator(self):
+        # It briefly did not. The prose described the boundary, the stages and every field
+        # of the report, and never once showed the command -- a skill that explains what a
+        # run means but not how to start one.
+        self.assertIn("validate_pr.sh \\", self.skill)
+
+    def accepted_flags(self):
+        parser = re.search(r'\n  case "\$1" in\n(.*?)\n  esac', self.script, re.DOTALL)
+        self.assertIsNotNone(parser)
+        return set(re.findall(r"--[a-z][a-z-]*", parser.group(1)))
+
+    def test_every_flag_the_script_accepts_is_documented(self):
+        # The direction that actually caught the missing flag table. Checking only that the
+        # documented flags exist passes trivially when the documentation is empty.
+        #
+        # Whole-token, not substring: `--target` occurs inside `--no-target`, so a plain
+        # `in` check would let the `--no-target` row vanish and pass on a sentence about
+        # a different flag. The same trap as `declared` inside `declared-by-caller`.
+        for flag in sorted(self.accepted_flags()):
+            with self.subTest(flag=flag):
+                self.assertRegex(
+                    self.skill,
+                    re.escape(flag) + r"(?![a-z-])",
+                    f"{flag} is accepted but undocumented",
+                )
+
+    def test_every_host_setting_is_in_the_host_table(self):
+        # A setting read from the environment and named nowhere is unreachable in practice:
+        # nobody sets a variable they have not been told about. PERF_CONTROL_TOL spent the
+        # refactor explained in the perf prose but absent from the table a caller reads.
+        settings = set(re.findall(r'\n([A-Z_]+)="\$\{([A-Z_]+):-', self.script))
+        table = re.search(r"\n## Host settings\n(.*?)\n---", self.skill, re.DOTALL)
+        self.assertIsNotNone(table)
+        documented = set(re.findall(r"^\| `([A-Z_]+)`", table.group(1), re.MULTILINE))
+        for _, name in sorted(settings):
+            with self.subTest(setting=name):
+                self.assertIn(name, documented, f"{name} is read but not in the table")
+
+    def test_every_flag_the_prose_shows_is_one_the_script_accepts(self):
+        accepted = self.accepted_flags()
+        # Only the flags shown in the skill's own invocation block, so an example the model
+        # copies cannot name a flag that exits 2.
+        block = re.search(r"validate_pr\.sh \\\n(.*?)\n```", self.skill, re.DOTALL)
+        self.assertIsNotNone(block)
+        for flag in sorted(set(re.findall(r"--[a-z][a-z-]*", block.group(1)))):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, accepted)
+
+
+class ReviewFetchIntegrationTests(unittest.TestCase):
+    """Exercise the real caller, validator and consumer with local Git/GitHub fixtures."""
+
+    def setUp(self):
+        self.fixture = ValidatorFixture()
+        self.addCleanup(self.fixture.close)
+
+    def fetch(self, runner, declared=True, route=True):
+        fixture = self.fixture
+        target = "op_tests/test_review.py"
+        (fixture.repo / "op_tests").mkdir()
+        if runner == "pytest":
+            source = (fixture.repo / "tests/test_sample.py").read_text()
+            expected_route = "test_review:run_kernel"
+        else:
+            # A script can be named test_*.py. Its caller must read it, not infer pytest.
+            source = (
+                "def run_kernel(dim):\n    assert dim > 0\n"
+                "if __name__ == '__main__':\n"
+                "    run_kernel(7)\n    print('case passed')\n"
+            )
+            expected_route = "__main__:run_kernel"
+        (fixture.repo / target).write_text(source)
+        run(["git", "config", "user.name", "Validator Test"], cwd=fixture.repo)
+        run(["git", "config", "user.email", "validator@example.com"], cwd=fixture.repo)
+        run(["git", "add", "."], cwd=fixture.repo)
+        run(["git", "commit", "-qm", "review target"], cwd=fixture.repo)
+        base = run(["git", "rev-parse", "HEAD"], cwd=fixture.repo).stdout.strip()
+
+        def mutate(repo):
+            ValidateKernelPrTests.harmless_change(repo)
+            (repo / target).write_text(source + "# candidate test comment\n")
+
+        patch = fixture.make_patch(mutate, "fetch.patch")
+        run(["git", "apply", str(patch)], cwd=fixture.repo)
+        run(["git", "add", "."], cwd=fixture.repo)
+        run(["git", "commit", "-qm", "candidate"], cwd=fixture.repo)
+        head = run(["git", "rev-parse", "HEAD"], cwd=fixture.repo).stdout.strip()
+        run(["git", "update-ref", "refs/pull/5308/head", head], cwd=fixture.repo)
+        run(["git", "reset", "--hard", "-q", base], cwd=fixture.repo)
+        # Every fetch stays inside this fixture; no GitHub network or credentials are used.
+        run(
+            [
+                "git",
+                "config",
+                f"url.{fixture.repo}.insteadOf",
+                "https://github.com/fixture/aiter",
+            ],
+            cwd=fixture.repo,
+        )
+        meta = fixture.root / "pr.json"
+        meta.write_text(
+            json.dumps(
+                {
+                    "number": 5308,
+                    "title": "validation handoff fixture",
+                    "body": "",
+                    "labels": [],
+                    "author": {"login": "fixture"},
+                    "comments": [],
+                    "reviews": [],
+                    "baseRefName": "main",
+                    "baseRefOid": base,
+                    "headRefOid": head,
+                    "files": [{"path": "aiter/kernel.py"}, {"path": target}],
+                }
+            )
+        )
+        write_executable(
+            fixture.tools / "gh",
+            (
+                f"#!{sys.executable}\nimport pathlib, sys\nargs = sys.argv[1:]\n"
+                f"if args[:2] == ['pr', 'view']: print(pathlib.Path({str(meta)!r}).read_text())\n"
+                f"elif args[:2] == ['pr', 'diff']: sys.stdout.write(pathlib.Path({str(patch)!r}).read_text())\n"
+                f"elif args[0] == 'api' and '/branches/' in args[1]: print({base!r})\n"
+                "elif args[0] == 'api' and args[1].endswith('/comments'): print('[]')\n"
+                "else: raise SystemExit('unexpected gh call: ' + repr(args))\n"
+            ),
+        )
+        (fixture.repo / ".claude").mkdir()
+        (fixture.repo / ".claude/skills").symlink_to(
+            SKILL_DIR.parent, target_is_directory=True
+        )
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("REVIEW_")
+        }
+        environment.update(
+            {
+                "PATH": f"{fixture.tools}:{environment['PATH']}",
+                "PICKER": str(fixture.picker),
+                "PYTHONPATH": str(fixture.fake_modules),
+                "TIMEOUT": "30",
+                "REVIEW_SHAPE_VARS": "",
+                # Obsolete caller settings must not leak removed flags into the invocation.
+                "REVIEW_GRID": "7,257,f32",
+                "REVIEW_SHAPE_ENV": "OLD_GRID",
+                "REVIEW_SHAPE_ARG": "--old-grid",
+                "REVIEW_SHAPE_ARGNAMES": "M,N,dtype_str",
+            }
+        )
+        if declared:
+            environment.update(
+                REVIEW_RUNNER=runner, REVIEW_RUNNER_REASON="read fixture target"
+            )
+        if route:
+            environment["REVIEW_EXPECTED_ROUTE"] = expected_route
+        result = run(
+            [str(REVIEW_DIR / "fetch.sh"), "5308", "fixture/aiter"],
+            cwd=fixture.repo,
+            env=environment,
+            check=False,
         )
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
-        self.assertIn("2 passed", result.stdout)
-        self.assertNotIn("TypeError", result.stdout + result.stderr)
-
-    def test_grid_arity_mismatch_is_rejected_at_invocation(self):
-        # The arity check lived in the plugin generator, whose exit status run_pytest never
-        # read: the stale plugin from the previous phase survived, head-grid re-ran the
-        # invalid-grid sentinel, and its failure was published as "the PR adds this target and
-        # its independent shape grid fails" -- a blocker produced by a caller's typo. It is
-        # now refused at argument parsing, before any phase can run.
-        fixture = ValidatorFixture()
-        try:
-            result = subprocess.run(
-                [
-                    str(VALIDATOR),
-                    "--repo", str(fixture.repo),
-                    "--target", "tests/test_sample.py",
-                    "--shape-argnames", "m",
-                    "--grid", "255,3;512,4",
-                ],
-                capture_output=True, text=True,
-            )
-        finally:
-            fixture.close()
-        self.assertEqual(2, result.returncode, result.stdout + result.stderr)
-        self.assertIn("--grid", result.stderr)
-
-    def test_a_single_scalar_argname_is_substituted(self):
-        # The same code path with scalar values must still replace the target's own literals,
-        # or the refusal above would have been bought by disabling the channel.
-        result = self._run_target(
-            ("m",),
-            [(3,), (15,), (32,)],
-            "import pytest\n"
-            '@pytest.mark.parametrize("m", [1, 2])\n'
-            "def test_m(m):\n"
-            "    assert m in (3, 15, 32)\n",
+        match = re.search(r"^WORK=(.+)$", result.stdout, re.M)
+        self.assertIsNotNone(match, result.stdout)
+        work = Path(match.group(1))
+        self.assertEqual(Path("/tmp"), work.parent)
+        self.assertTrue(work.name.startswith("review-pr-"))
+        self.addCleanup(shutil.rmtree, work, ignore_errors=True)
+        self.assertEqual(
+            base, run(["git", "rev-parse", "HEAD"], cwd=fixture.repo).stdout.strip()
         )
-        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
-        self.assertIn("3 passed", result.stdout)
+        self.assertEqual("", run(["git", "diff"], cwd=fixture.repo).stdout)
+        return result, work
+
+    def assert_report(self, result, work, runner, verdict):
+        report = json.loads((work / "validation_report.json").read_text())
+        self.assertEqual(verdict, report["verdict"])
+        self.assertEqual(runner, report["test_selection"]["runner"])
+        self.assertEqual("declared-by-caller", report["test_selection"]["runner_basis"])
+        self.assertEqual(
+            "read fixture target", report["test_selection"]["runner_reason"]
+        )
+        self.assertEqual("", report["test_selection"]["shape_vars"])
+        self.assertNotIn("correctness_s1_grid", report["stages"])
+        self.assertIn("validation report accepted for head", result.stdout)
+        return report
+
+    def test_fetch_validates_and_consumes_a_declared_pytest_target(self):
+        result, work = self.fetch("pytest")
+        self.assert_report(result, work, "pytest", "PASS")
+
+    def test_fetch_validates_and_consumes_a_script_named_test(self):
+        result, work = self.fetch("script")
+        self.assert_report(result, work, "script", "PASS")
+
+    def test_fetch_explains_an_undeclared_runner_before_launching_the_validator(self):
+        result, work = self.fetch("script", declared=False)
+        self.assertFalse((work / "auto_validation_report.json").exists())
+        self.assertIn(
+            "runner not declared", (work / "auto_validation_outcome.txt").read_text()
+        )
+        self.assertIn("validation REQUIRED but not run", result.stdout)
+
+    def test_fetch_consumes_inconclusive_evidence_without_a_route(self):
+        result, work = self.fetch("script", route=False)
+        report = self.assert_report(result, work, "script", "INCONCLUSIVE")
+        self.assertEqual("skip", report["stages"]["execution_receipt"]["status"])
 
 
 class ReviewSkillContractTests(unittest.TestCase):
@@ -3367,15 +3420,24 @@ class ReviewSkillContractTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
 
         review_skill = (REVIEW_DIR / "SKILL.md").read_text()
-        match = re.search(r"## Step 1 — Fetch.*?```bash\n(.*?)\n```", review_skill, re.DOTALL)
+        match = re.search(
+            r"## Step 1 — Fetch.*?```bash\n(.*?)\n```", review_skill, re.DOTALL
+        )
         self.assertIsNotNone(match, "Step 1 no longer carries a bash block")
         # A comment mentioning fetch.sh satisfied `assertIn` on the whole block, so
         # breaking the call site left this test green. Require an executable line.
-        invocations = [ln for ln in match.group(1).split("\n")
-                       if "fetch.sh" in ln and not ln.lstrip().startswith("#")]
+        invocations = [
+            ln
+            for ln in match.group(1).split("\n")
+            if "fetch.sh" in ln and not ln.lstrip().startswith("#")
+        ]
         self.assertTrue(invocations, "Step 1 mentions fetch.sh but never calls it")
         called = subprocess.run(
-            ["bash", "-n"], input=match.group(1), capture_output=True, text=True, check=False
+            ["bash", "-n"],
+            input=match.group(1),
+            capture_output=True,
+            text=True,
+            check=False,
         )
         self.assertEqual(0, called.returncode, called.stderr)
 
@@ -3388,28 +3450,1374 @@ class ReviewSkillContractTests(unittest.TestCase):
         point" for a target the validator happily timed.
         """
         review_skill = review_skill_text()
-        validator = VALIDATOR.read_text()
+        validator = (SKILL_DIR / "scrape_perf.py").read_text()
 
         review_body = re.search(
             r"def perf_command\(path\):(.*?)\n\n", review_skill, re.DOTALL
         )
         validator_body = re.search(
-            r"perf_detect\(\).*?<<'PY'\n(.*?)\nPY", validator, re.DOTALL
+            r"def detect_harness\(text\):(.*?)\n    return None", validator, re.DOTALL
         )
         self.assertIsNotNone(review_body)
         self.assertIsNotNone(validator_body)
 
         for name, body in (
             ("review-pr", review_body.group(1)),
-            ("validate_pr.sh", validator_body.group(1)),
+            ("scrape_perf.py", validator_body.group(1)),
         ):
             self.assertIn('"--scenario" in text', body, name)
             self.assertIn('"bench" in text', body, name)
             self.assertIn('"perftest" in text', body, name)
+            # aiter's fourth convention. The three above were blind to 58 of the 67 files in
+            # op_tests/op_benchmarks/ -- the directory whose entire purpose is timing -- and
+            # this check listed exactly the rules that shared the blind spot.
+            self.assertIn('"triton.testing.perf_report" in text', body, name)
+            self.assertIn('"triton.testing.do_bench" in text', body, name)
             # `run_perftest` is a strict subset of `perftest`, so testing the longer name
             # only narrows coverage. It missed 12 of aiter's 123 op_tests/ targets, every
             # one of which does have a timing harness.
             self.assertNotIn('"run_perftest" in text', body, name)
+
+
+class ReportToolTests(unittest.TestCase):
+    """The verdict rule, exercised directly.
+
+    Reached only through a full validation run, each branch of this rule cost minutes to
+    observe, so most of them never were. These are the cases that decide whether a PASS means
+    anything.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, str(SKILL_DIR))
+        self.addCleanup(sys.path.remove, str(SKILL_DIR))
+        import report
+
+        self.report = report
+        self.required = report.required_stages(REPORT_SCHEMA)
+
+    def complete_report(self):
+        return {
+            "runtime_identity": {"module_path": "/somewhere/aiter"},
+            "stages": {
+                name: {
+                    "status": report_module_status(self.report, name),
+                    "note": "recorded",
+                }
+                for name in self.required
+            },
+            "findings": [],
+        }
+
+    def test_required_stages_come_from_the_schema(self):
+        # The list existed in four copies and nothing compared them. This test is the
+        # comparison, so a stage added to the schema alone can no longer leave the verdict
+        # rule behind.
+        self.assertEqual(set(self.required), REQUIRED_STAGES)
+
+    def test_a_complete_run_passes(self):
+        self.assertEqual(
+            self.report.compute_verdict(self.complete_report(), self.required), "PASS"
+        )
+
+    def test_each_required_stage_can_withhold_a_pass(self):
+        # Asserting one stage would leave the other eight untested, which is how a term can
+        # be dropped from the rule without any test noticing.
+        for name in self.required:
+            with self.subTest(stage=name):
+                data = self.complete_report()
+                data["stages"][name] = {"status": "skip", "note": "did not run"}
+                self.assertEqual(
+                    self.report.compute_verdict(data, self.required), "INCONCLUSIVE"
+                )
+
+    def test_the_scan_passes_on_info_and_not_on_pass(self):
+        # index_width_scan is informational: it reports "info", and a "pass" there would mean
+        # some other stage had written it.
+        data = self.complete_report()
+        data["stages"]["index_width_scan"] = {"status": "pass", "note": "wrong status"}
+        self.assertEqual(
+            self.report.compute_verdict(data, self.required), "INCONCLUSIVE"
+        )
+
+    def test_a_missing_runtime_identity_withholds_a_pass(self):
+        data = self.complete_report()
+        data["runtime_identity"] = {}
+        self.assertEqual(
+            self.report.compute_verdict(data, self.required), "INCONCLUSIVE"
+        )
+
+    def test_findings_outrank_completeness(self):
+        for severity, expected in (("blocker", "BLOCK"), ("should-fix", "NEEDS_WORK")):
+            with self.subTest(severity=severity):
+                data = self.complete_report()
+                data["findings"].append(
+                    {"severity": severity, "stage": "correctness", "detail": "d"}
+                )
+                self.assertEqual(
+                    self.report.compute_verdict(data, self.required), expected
+                )
+
+    def test_a_blocker_outranks_a_should_fix(self):
+        data = self.complete_report()
+        data["findings"] = [
+            {"severity": "should-fix", "stage": "perf", "detail": "d"},
+            {"severity": "blocker", "stage": "correctness", "detail": "d"},
+        ]
+        self.assertEqual(self.report.compute_verdict(data, self.required), "BLOCK")
+
+    def test_an_absent_stage_is_recorded_as_a_skip(self):
+        # A stage that never ran and never appears reads exactly like one that passed.
+        data = {"stages": {}, "findings": []}
+        self.report.backfill_missing_stages(data, self.required)
+        self.assertEqual(set(data["stages"]), set(self.required))
+        for name in self.required:
+            self.assertEqual(data["stages"][name]["status"], "skip")
+        self.assertEqual(len(data["findings"]), len(self.required))
+
+    def test_exit_codes_follow_the_verdict(self):
+        self.assertEqual(self.report.exit_code_for("PASS"), 0)
+        self.assertEqual(self.report.exit_code_for("INCONCLUSIVE"), 2)
+        self.assertEqual(self.report.exit_code_for("BLOCK"), 1)
+        self.assertEqual(self.report.exit_code_for("NEEDS_WORK"), 1)
+
+    def test_a_schema_violation_is_detected(self):
+        # The producer never checked the schema, so this is the first thing standing between
+        # a malformed report and a consumer reading a field that is no longer written.
+        broken = {"label": "x", "stages": {}, "findings": []}
+        self.assertIsNotNone(self.report._schema_violation(broken, REPORT_SCHEMA))
+
+    def test_a_schema_violation_downgrades_a_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, out = root / "report.json", root / "out.json"
+            data = self.complete_report()
+            # Complete enough to earn PASS from the verdict rule, and nowhere near what the
+            # schema requires -- which is the combination the gate exists for.
+            source.write_text(json.dumps(data))
+            result = run(
+                [sys.executable, str(SKILL_DIR / "report.py"), "finish"]
+                + [str(source), str(out)],
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            published = json.loads(out.read_text())
+            self.assertEqual(published["verdict"], "INCONCLUSIVE")
+            self.assertEqual(published["process_exit_code"], 2)
+            self.assertEqual((root / "verdict").read_text().strip(), "INCONCLUSIVE")
+            self.assertTrue(
+                any(f["stage"] == "report" for f in published["findings"]),
+                published["findings"],
+            )
+
+
+class RuntimeCreditTests(unittest.TestCase):
+    """When a run may claim it exercised an architecture.
+
+    These three refusals lived inside a shell heredoc, where no test could reach them, and had
+    none. Each one exists because a run once took credit it had not earned.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, str(SKILL_DIR))
+        self.addCleanup(sys.path.remove, str(SKILL_DIR))
+        import report
+
+        self.report = report
+
+    def stats(self, **overrides):
+        base = {"executed": 4, "failures": 0, "observed_work": 12, "basis": "receipt"}
+        base.update(overrides)
+        return base
+
+    def refusal(self, stats, runner="script", log_size=100):
+        return self.report.runtime_credit_refusal(stats, runner, log_size)
+
+    def test_work_earns_credit(self):
+        self.assertIsNone(self.refusal(self.stats()))
+        self.assertIsNone(self.refusal(self.stats(), runner="pytest", log_size=0))
+
+    def test_nothing_executed_earns_nothing(self):
+        self.assertIsNotNone(self.refusal(self.stats(executed=0), runner="pytest"))
+
+    def test_a_silent_script_earns_nothing(self):
+        # aiter#4538: the target returns exit 0 on an unsupported arch. An exit code is not
+        # evidence that work reached the device.
+        self.assertIsNotNone(self.refusal(self.stats(), log_size=0))
+
+    def test_a_named_route_never_called_earns_nothing(self):
+        self.assertIsNotNone(self.refusal(self.stats(observed_work=0)))
+
+    def test_an_unnamed_route_is_not_a_refusal(self):
+        # Absent is not zero: with no route named, nothing was observed either way, and the
+        # basis string says so rather than implying a measurement.
+        stats = self.stats()
+        del stats["observed_work"]
+        self.assertIsNone(self.refusal(stats))
+
+    def test_the_basis_names_the_count_not_the_exit_code(self):
+        self.assertEqual(
+            self.report.runtime_credit_basis(self.stats(), "pytest"),
+            "pytest-junit-executed:4",
+        )
+        self.assertIn(
+            "observed-work:12", self.report.runtime_credit_basis(self.stats(), "script")
+        )
+        self.assertIn(
+            "nonzero",
+            self.report.runtime_credit_basis(self.stats(failures=2), "script"),
+        )
+
+    def test_credit_is_withheld_end_to_end(self):
+        for label, stats, expected in [
+            ("earned", self.stats(), {"gfx942": "runtime"}),
+            ("refused", self.stats(observed_work=0), {}),
+        ]:
+            with self.subTest(label), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "report.json"
+                log = Path(directory) / "run.log"
+                log.write_text("output\n")
+                path.write_text(
+                    json.dumps(
+                        {
+                            "stages": {
+                                "gpu_claim": {"status": "pass", "arch": "gfx942"}
+                            },
+                            "findings": [],
+                            "arch_coverage": {},
+                        }
+                    )
+                )
+                run(
+                    [sys.executable, str(SKILL_DIR / "report.py"), "coverage", "--"]
+                    + [str(path), json.dumps(stats), "script", str(log)],
+                    check=True,
+                )
+                self.assertEqual(
+                    json.loads(path.read_text())["arch_coverage"], expected
+                )
+
+    def test_credit_needs_a_claimed_gpu(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            log = Path(directory) / "run.log"
+            log.write_text("output\n")
+            path.write_text(
+                json.dumps(
+                    {
+                        "stages": {"gpu_claim": {"status": "fail", "arch": "gfx942"}},
+                        "findings": [],
+                        "arch_coverage": {},
+                    }
+                )
+            )
+            run(
+                [sys.executable, str(SKILL_DIR / "report.py"), "coverage", "--"]
+                + [str(path), json.dumps(self.stats()), "script", str(log)],
+                check=True,
+            )
+            self.assertEqual(json.loads(path.read_text())["arch_coverage"], {})
+
+
+class ReportWriterTests(unittest.TestCase):
+    """The four write paths the shell used to own a heredoc apiece."""
+
+    def setUp(self):
+        sys.path.insert(0, str(SKILL_DIR))
+        self.addCleanup(sys.path.remove, str(SKILL_DIR))
+        import report
+
+        self.report = report
+
+    def test_a_dotted_key_creates_the_path(self):
+        data = {}
+        self.report.assign(data, "stages.gpu_claim.arch", "gfx942")
+        self.assertEqual(data, {"stages": {"gpu_claim": {"arch": "gfx942"}}})
+
+    def test_a_dotted_key_keeps_its_siblings(self):
+        data = {"stages": {"gpu_claim": {"status": "pass"}}}
+        self.report.assign(data, "stages.gpu_claim.arch", "gfx942")
+        self.assertEqual(data["stages"]["gpu_claim"]["status"], "pass")
+
+    def test_writes_survive_a_leading_dash(self):
+        # The call sites pass notes and numbers verbatim; a value beginning with "-" must not
+        # be read as an option by the tool that replaced the heredocs.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            path.write_text(json.dumps({"stages": {}, "findings": []}))
+            tool = [sys.executable, str(SKILL_DIR / "report.py")]
+            run(tool + ["set", "--", str(path), "note", "-dashed"], check=True)
+            run(tool + ["set", "--json", "--", str(path), "count", "-1"], check=True)
+            run(
+                tool + ["stage", "--", str(path), "merge_sim", "fail", "-dashed"],
+                check=True,
+            )
+            run(
+                tool + ["finding", "--", str(path), "note", "merge_sim", "-dashed"],
+                check=True,
+            )
+            data = json.loads(path.read_text())
+            self.assertEqual(data["note"], "-dashed")
+            self.assertEqual(data["count"], -1)
+            self.assertEqual(data["stages"]["merge_sim"]["note"], "-dashed")
+            self.assertEqual(data["findings"][0]["detail"], "-dashed")
+
+    def test_a_stage_replaces_rather_than_merges(self):
+        # stage_note has always overwritten the whole entry; keys set under a stage before it
+        # records a status do not survive, and callers order their writes accordingly.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            path.write_text(
+                json.dumps(
+                    {"stages": {"gpu_claim": {"arch": "gfx942"}}, "findings": []}
+                )
+            )
+            run(
+                [sys.executable, str(SKILL_DIR / "report.py"), "stage", "--"]
+                + [str(path), "gpu_claim", "pass", "claimed"],
+                check=True,
+            )
+            self.assertEqual(
+                json.loads(path.read_text())["stages"]["gpu_claim"],
+                {"status": "pass", "note": "claimed"},
+            )
+
+
+class StubAmdSmi:
+    """Enough amd-smi to answer the two questions gpu_probe asks."""
+
+    def __init__(self, devices):
+        self.devices = devices
+
+    def amdsmi_get_processor_handles(self):
+        return list(range(len(self.devices)))
+
+    def amdsmi_get_gpu_enumeration_info(self, handle):
+        return {"hip_id": self.devices[handle]["hip_id"]}
+
+    def amdsmi_get_gpu_asic_info(self, handle):
+        return self.devices[handle].get("asic", {})
+
+    def amdsmi_get_gpu_device_bdf(self, handle):
+        return self.devices[handle].get("bdf", "0000:00:00.0")
+
+
+class StubPicker:
+    def __init__(self, gfx):
+        self.gfx = gfx
+
+    def read_activity(self, amdsmi, handle):
+        return self.gfx, None
+
+
+class GpuProbeTests(unittest.TestCase):
+    """What the report is told about the device this run claimed.
+
+    Both queries lived in heredocs and could only be exercised on a host with the hardware, so
+    on any other host they were never exercised at all.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, str(SKILL_DIR))
+        self.addCleanup(sys.path.remove, str(SKILL_DIR))
+        import gpu_probe
+
+        self.probe = gpu_probe
+        # amd-smi orders devices independently of HIP, so the two indices differ here on
+        # purpose: a probe that returned one where the report wants the other would look
+        # correct on any machine whose orders happen to agree.
+        self.amdsmi = StubAmdSmi(
+            [
+                {"hip_id": 3},
+                {"hip_id": 0},
+                {
+                    "hip_id": 1,
+                    "asic": {
+                        "market_name": "MI300X",
+                        "target_graphics_version": "gfx942",
+                    },
+                    "bdf": "0000:c5:00.0",
+                },
+            ]
+        )
+
+    def test_the_device_is_found_by_hip_index_not_position(self):
+        info = self.probe.describe(self.amdsmi, StubPicker(7), 1, "host-a")
+        self.assertEqual(info["hip_index"], 1)
+        self.assertEqual(info["amd_smi_index"], 2)
+        self.assertEqual(info["arch"], "gfx942")
+        self.assertEqual(info["model"], "MI300X")
+        self.assertEqual(info["bdf"], "0000:c5:00.0")
+        self.assertEqual(info["gfx_activity_before_pct"], 7)
+        self.assertEqual(info["host"], "host-a")
+        self.assertEqual(info["status"], "pass")
+
+    def test_an_unmapped_hip_index_raises(self):
+        # The shell turns a nonzero exit into "GPU identity could not be verified" and makes no
+        # runtime claim. Returning a device that is not the one locked would be worse than
+        # failing.
+        with self.assertRaises(RuntimeError):
+            self.probe.describe(self.amdsmi, StubPicker(0), 9, "host-a")
+
+    def test_a_device_missing_asic_fields_says_unknown(self):
+        info = self.probe.describe(self.amdsmi, StubPicker(0), 3, "host-a")
+        self.assertEqual(info["arch"], "unknown")
+        self.assertEqual(info["model"], "unknown")
+
+    def test_unreadable_activity_is_not_reported_as_idle(self):
+        # The distinction the whole probe exists to preserve: a query that failed must not
+        # arrive at the report as a measured 0.
+        self.assertEqual(
+            self.probe.activity(self.amdsmi, StubPicker(None), 1),
+            self.probe.ACTIVITY_UNAVAILABLE,
+        )
+        self.assertEqual(self.probe.activity(self.amdsmi, StubPicker(0), 1), "0")
+
+    def test_a_measured_zero_survives_as_a_number(self):
+        # "0" and "unavailable" take different branches in the shell; only the first is
+        # recorded as a percentage.
+        self.assertRegex(
+            self.probe.activity(self.amdsmi, StubPicker(0), 1), r"^[0-9]+$"
+        )
+        self.assertNotRegex(
+            self.probe.activity(self.amdsmi, StubPicker(None), 1), r"^[0-9]+$"
+        )
+
+    def test_the_shipped_picker_is_the_one_borrowed(self):
+        # The picker is the thing that knows how to read activity without reporting unknown as
+        # idle; loading a different copy from PATH is the substitution stage 2 already records
+        # having been burned by.
+        self.assertEqual(self.probe.PICKER_PATH.parent, SKILL_DIR)
+        self.assertTrue(self.probe.PICKER_PATH.exists())
+        picker = self.probe.load_picker()
+        self.assertTrue(hasattr(picker, "read_activity"))
+        self.assertTrue(hasattr(picker, "import_amdsmi"))
+
+    def test_borrowing_the_picker_leaves_no_artifact_beside_it(self):
+        # The skill ships inside the repository it validates, so bytecode written next to the
+        # picker is bytecode written into the worktree under test -- and stage 1 reads an
+        # ignored artifact as a dirty tree, which skips merge simulation and every stage after
+        # it. This is the one import the shell does not launch, so PYTHONDONTWRITEBYTECODE on
+        # the command line cannot cover it; the guarantee has to live in load_picker itself.
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        elsewhere = Path(tempdir.name) / "pick-idle-gpu.py"
+        shutil.copy(self.probe.PICKER_PATH, elsewhere)
+        self.addCleanup(setattr, self.probe, "PICKER_PATH", self.probe.PICKER_PATH)
+        self.probe.PICKER_PATH = elsewhere
+        # Without this the test would pass for the wrong reason under an interpreter already
+        # started with -B, which is exactly the workaround this pins the fix in place of.
+        self.addCleanup(setattr, sys, "dont_write_bytecode", sys.dont_write_bytecode)
+        sys.dont_write_bytecode = False
+
+        self.probe.load_picker()
+
+        self.assertEqual([], list(Path(tempdir.name).glob("__pycache__/*")))
+        self.assertFalse(
+            sys.dont_write_bytecode, "the flag was left flipped for the process"
+        )
+
+
+class TargetRunTests(unittest.TestCase):
+    """The decisions around one target run, which used to live inside bash heredocs.
+
+    Each of these had end-to-end coverage only, through a full validator run that took four
+    minutes and could not say which of a dozen decisions had gone wrong.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, str(SKILL_DIR))
+        self.addCleanup(sys.path.remove, str(SKILL_DIR))
+        import target_run
+
+        self.tool = target_run
+
+    def test_a_target_the_patch_adds_is_not_independent_evidence(self):
+        # `git apply` never stages, so a file the patch creates is untracked.
+        result = self.tool.provenance(
+            "?? tests/test_new.py\n", "tests/test_new.py", True
+        )
+        self.assertEqual("pr-added", result["provenance"])
+        self.assertIn("same author", result["reason"])
+
+    def test_a_target_the_patch_edits_is_not_independent_evidence(self):
+        result = self.tool.provenance(
+            " M tests/test_gemm.py\n", "tests/test_gemm.py", True
+        )
+        self.assertEqual("pr-modified", result["provenance"])
+
+    def test_a_target_the_patch_leaves_alone_is_independent_evidence(self):
+        result = self.tool.provenance(
+            " M aiter/ops/gemm.py\n?? tests/test_new.py\n", "tests/test_gemm.py", True
+        )
+        self.assertEqual("pre-existing", result["provenance"])
+
+    def test_no_patch_means_unknown_and_never_pre_existing(self):
+        # A checkout validated directly cannot tell a test the author wrote from one they did
+        # not. Answering "pre-existing" there would claim an independence nobody established --
+        # the same substitution of "not checked" for "checked and fine" refused everywhere else.
+        result = self.tool.provenance("", "tests/test_gemm.py", False)
+        self.assertEqual("unknown", result["provenance"])
+        self.assertIn("no patch", result["reason"])
+
+    def test_a_path_git_cannot_spell_plainly_is_reported_not_guessed_at(self):
+        # git quotes what it cannot spell. Comparing the quoted form against the caller's plain
+        # one yields a confident wrong answer, and "pre-existing" is the answer that overclaims.
+        result = self.tool.provenance(
+            '?? "tests/t\\303\\251st.py"\n', "tests/tést.py", True
+        )
+        self.assertEqual("unknown", result["provenance"])
+        self.assertIn("could not spell", result["reason"])
+
+    def test_a_quoted_path_elsewhere_does_not_hide_a_target_the_patch_touches(self):
+        # The unspellable path only matters if it could have BEEN the target. Bailing out on
+        # sight would turn every patch carrying one non-ASCII filename into "unknown".
+        result = self.tool.provenance(
+            '?? "tests/t\\303\\251st.py"\n M tests/test_gemm.py\n',
+            "tests/test_gemm.py",
+            True,
+        )
+        self.assertEqual("pr-modified", result["provenance"])
+
+    def test_a_script_run_reports_observed_work_not_a_case_count(self):
+        # aiter#4538's target returns 0 with log output when the arch is unsupported, so a run
+        # that graded 56 cases and one that graded none both reported executed=1. The count
+        # that is backed by evidence is published beside it.
+        with tempfile.TemporaryDirectory() as root:
+            receipt = Path(root) / "receipt.json"
+            receipt.write_text(
+                json.dumps(
+                    {"kernel_symbols": ["a", "b"], "executed_shapes": [1, 2, 3, 4]}
+                )
+            )
+            stats = self.tool.script_stats(0, str(receipt), "mod:run")
+        self.assertEqual(1, stats["executed"])
+        self.assertEqual(4, stats["observed_work"])
+        self.assertIn("execution receipt", stats["basis"])
+
+    def test_a_named_route_that_wrote_no_receipt_observed_zero_not_nothing(self):
+        # Zero is a finding: a route was named and the run never reached it. That is different
+        # from no route having been named, where there is nothing to observe either way.
+        stats = self.tool.script_stats(0, "/nonexistent/receipt.json", "mod:run")
+        self.assertEqual(0, stats["observed_work"])
+        self.assertIn("wrote no execution receipt", stats["basis"])
+
+        unnamed = self.tool.script_stats(0, "/nonexistent/receipt.json", "")
+        self.assertIsNone(unnamed["observed_work"])
+        self.assertIn("no route was named", unnamed["basis"])
+
+    def test_a_credential_in_the_calling_shell_is_not_readable_from_the_target(self):
+        # `env VAR=... <cmd>` ADDS to the inherited environment. The target is unmerged
+        # third-party code, and anything in the reviewer's shell was readable from os.environ
+        # inside it -- and would land in a log the moment a target printed its environment.
+        environ = {
+            "ROCM_PATH": "/opt/rocm",
+            "HIP_VISIBLE_DEVICES": "3",
+            "GITHUB_TOKEN": "ghp_secret",
+            "AITER_API_KEY": "sk-secret",
+            "TORCH_AUTH_COOKIE": "c",
+            "SSH_AUTH_SOCK": "/tmp/agent",
+            "EDITOR": "vim",
+        }
+        kept = self.tool.passthrough(environ)
+        self.assertIn("ROCM_PATH=/opt/rocm", kept)
+        self.assertIn("HIP_VISIBLE_DEVICES=3", kept)
+        # AITER_ and TORCH_ are on the allowlist; the denylist is about consequence and wins.
+        for leaked in (
+            "GITHUB_TOKEN",
+            "AITER_API_KEY",
+            "TORCH_AUTH_COOKIE",
+            "SSH_AUTH_SOCK",
+        ):
+            self.assertFalse(
+                any(pair.startswith(leaked + "=") for pair in kept), f"{leaked} leaked"
+            )
+        # And nothing outside the allowlist rides along just because it looks harmless.
+        self.assertFalse(any(pair.startswith("EDITOR=") for pair in kept))
+
+    def test_the_isolation_record_names_what_was_passed(self):
+        summary = self.tool.environment_summary(["B=2", "A=1"])
+        self.assertEqual(["A", "B"], summary["passed_through"])
+        self.assertIn("env -i", summary["policy"])
+
+
+class PerfDecisionTests(unittest.TestCase):
+    """The decisions around a timing run, which used to live inside bash heredocs.
+
+    The timing runs themselves stay in the entry point -- they need the locked GPU and the
+    warm cache root -- but what the runs MEAN was untestable where it was.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, str(SKILL_DIR))
+        self.addCleanup(sys.path.remove, str(SKILL_DIR))
+        import scrape_perf
+
+        self.perf = scrape_perf
+
+    def context(self, **overrides):
+        base = {
+            "base_log": "/w/base.log",
+            "head_log": "/w/head.log",
+            "base_sha": "abc123",
+            "command": "--scenario bench",
+            "basis": "target exposes --scenario bench",
+            "baseline_method": "patch-reversed-same-worktree",
+            "control_column": "",
+            "control_tol": "0.10",
+        }
+        base.update(overrides)
+        return base
+
+    # ---- which harness the target has
+
+    def test_the_bare_perftest_decorator_counts_as_a_harness(self):
+        # Matching only `run_perftest` missed 12 of the 123 targets in op_tests/, and
+        # reported them as "there was nothing to measure" when the detector was the problem.
+        harness = self.perf.detect_harness("@perftest\ndef test_x():\n    pass\n")
+        self.assertEqual("", harness["args"])
+        self.assertIn("perftest", harness["basis"])
+
+    def test_a_scenario_sweep_is_detected_with_its_arguments(self):
+        harness = self.perf.detect_harness("parser.add_argument('--scenario')  # bench")
+        self.assertEqual("--scenario bench", harness["args"])
+
+    def test_a_target_with_no_harness_is_not_given_one(self):
+        self.assertIsNone(self.perf.detect_harness("def test_x():\n    assert True\n"))
+
+    def test_every_registered_subcommand_is_one_main_will_route_to(self):
+        # SUBCOMMANDS is the hand-written list main() dispatches on, and it went stale the
+        # first time one was added. The failure is quiet in the worst way: `discover` was
+        # registered on the subparser, missed this list, and fell through to the bare
+        # comparison parser, which exits 2 complaining about a missing --base. Nobody reading
+        # that has any reason to suspect the subcommand exists.
+        #
+        # Read out of the source rather than off the parser: argparse exposes its subparser
+        # choices only through private attributes, and a test that reaches into those breaks
+        # on a Python upgrade for reasons that have nothing to do with this skill.
+        source = (SKILL_DIR / "scrape_perf.py").read_text()
+        registered = set(re.findall(r'sub\.add_parser\(\s*"([a-z-]+)"', source))
+        self.assertEqual(registered, set(self.perf.SUBCOMMANDS))
+
+    #: Everything a patch might plausibly touch. Exactly one of these is a bench.
+    SHIPPED = {
+        "op_tests/bench_new.py": "import argparse\n# --scenario bench\n",
+        "op_tests/test_new.py": "def test_x():\n    assert True\n",
+        "aiter/ops/triton/k.py": "VALUE = 1\n",
+        "docs/notes.md": "# not python\n",
+    }
+
+    def shipped(self, status, files=None):
+        return self.perf.discover_shipped(status, (files or self.SHIPPED).get)
+
+    def choose_all(self, status, correctness_target, repo_benches=()):
+        return self.perf.choose_perf_targets(
+            self.shipped(status), list(repo_benches), correctness_target
+        )
+
+    def choose(self, status, correctness_target, repo_benches=()):
+        """The first target, flattened -- the shape a single-target choice always had."""
+        decision = self.choose_all(status, correctness_target, repo_benches)
+        return {**decision["targets"][0], "candidates": decision["candidates"]}
+
+    def test_a_changed_kernel_file_becomes_the_module_a_bench_would_import(self):
+        modules = self.perf.changed_kernel_modules(
+            "M  aiter/ops/triton/gemm/basic/gemm_a8w8.py\n"
+            "M  aiter/ops/triton/attention/__init__.py\n"
+            "D  aiter/ops/triton/gone.py\n"
+            "M  op_tests/triton_tests/test_gemm.py\n"
+            "M  setup.py\n"
+        )
+        # A package's __init__ is the package. A deletion is not on head and nothing we are
+        # about to run can import it. And a change under op_tests/ is not a kernel change --
+        # otherwise editing a test's input generator would match the bench importing that
+        # test, and the stage would report on a kernel nobody touched.
+        self.assertEqual(
+            [
+                "aiter.ops.triton.attention",
+                "aiter.ops.triton.gemm.basic.gemm_a8w8",
+            ],
+            modules,
+        )
+
+    def test_the_three_ways_a_bench_spells_an_import_all_count(self):
+        # Parsed, not matched. aiter benches use all three, and the third -- where the
+        # imported NAME is itself a module -- is common enough in op_benchmarks/ that a regex
+        # over the dotted path alone misses it.
+        found = self.perf.imported_modules(
+            "import aiter.ops.mha\n"
+            "from aiter.ops.triton.attention.mla import mla_decode_fwd\n"
+            "from aiter.ops.triton.attention import extend_attention\n"
+            "from . import sibling\n"
+        )
+        self.assertIn("aiter.ops.mha", found)
+        self.assertIn("aiter.ops.triton.attention.mla", found)
+        self.assertIn("aiter.ops.triton.attention.extend_attention", found)
+
+    def test_a_near_miss_module_name_is_not_an_import_of_the_changed_one(self):
+        # The reason this is a parse and not a regex. A pattern loose enough to catch the
+        # parent-package form above also matches the longer name here, and the perf stage
+        # would time a bench for a kernel the patch never touched.
+        found = self.perf.imported_modules(
+            "from aiter.ops.triton.gemm.gemm_a8w8_preshuffle import go\n"
+        )
+        self.assertNotIn("aiter.ops.triton.gemm.gemm_a8w8", found)
+
+    def test_a_file_that_does_not_parse_contributes_no_candidate(self):
+        # The safe direction: it costs a candidate, where a wrong candidate costs a finding
+        # against a PR author.
+        self.assertEqual(set(), self.perf.imported_modules("def broken(:\n"))
+
+    REPO = {
+        "op_tests/op_benchmarks/triton/bench_k.py": (
+            "# --scenario bench\nfrom aiter.ops.triton.k import go\n"
+        ),
+        "op_tests/triton_tests/test_k.py": "from aiter.ops.triton.k import go\n",
+        "op_tests/op_benchmarks/triton/bench_other.py": (
+            "# --scenario bench\nfrom aiter.ops.triton.other import go\n"
+        ),
+        # A harness AND a module whose dotted name has the changed one as a prefix. This one
+        # is here rather than in the imported_modules tests above because that is not where
+        # the mistake gets made: a substring check inside discover_repo_benches never calls
+        # imported_modules at all, so a unit test of the parser cannot see it.
+        "op_tests/op_benchmarks/triton/bench_near.py": (
+            "# --scenario bench\nfrom aiter.ops.triton.k_preshuffle import go\n"
+        ),
+    }
+
+    def repo_benches(self, modules, files=None):
+        files = files or self.REPO
+        return self.perf.discover_repo_benches(
+            modules, lambda: sorted(files), files.get
+        )
+
+    def test_a_bench_is_found_by_the_import_it_makes_not_by_its_name(self):
+        # The whole premise. A matching filename is a resemblance; an import is an edge that
+        # can be checked. test_k.py imports the same module but carries no harness,
+        # bench_other.py carries a harness but imports something else, and bench_near.py
+        # imports aiter.ops.triton.k_preshuffle -- which a substring check reads as an import
+        # of aiter.ops.triton.k, and times a bench for a kernel the patch never touched.
+        self.assertEqual(
+            ["op_tests/op_benchmarks/triton/bench_k.py"],
+            self.repo_benches(["aiter.ops.triton.k"]),
+        )
+
+    def gap(
+        self,
+        status="skip",
+        basis=None,
+        modules=(),
+        native=(),
+        candidates=(),
+        phases_reached=1,
+    ):
+        return self.perf.coverage_gap(
+            status,
+            self.perf.BASIS_FALLBACK if basis is None else basis,
+            list(modules),
+            list(native),
+            list(candidates),
+            phases_reached=phases_reached,
+        )
+
+    def test_a_run_that_never_got_both_phases_cannot_call_anything_missing(self):
+        # No GPU, or a base tree that would not come clean. The report is INCONCLUSIVE and a
+        # should-fix would overwrite that with the more confident NEEDS_WORK -- on a run that
+        # could not have timed a benchmark had one been sitting right there.
+        self.assertIsNone(
+            self.gap(modules=["aiter.ops.triton.k"], phases_reached=0),
+        )
+
+    def test_a_comment_only_kernel_edit_is_not_a_kernel_change_to_time(self):
+        # The false positive this filter exists for. A PR that adds a docstring to a kernel
+        # cannot have made it slower, and asking its author for a benchmark is charging them
+        # for touching the file at all.
+        patch = (
+            "--- a/aiter/ops/triton/k.py\n"
+            "+++ b/aiter/ops/triton/k.py\n"
+            "@@ -1,2 +1,3 @@\n"
+            " VALUE = 1\n"
+            "+# a note for the next reader\n"
+            "+\n"
+        )
+        self.assertEqual(
+            [], self.perf.substantive_modules(["aiter.ops.triton.k"], patch)
+        )
+
+    def test_a_kernel_edit_with_one_real_line_in_it_still_counts(self):
+        patch = (
+            "--- a/aiter/ops/triton/k.py\n"
+            "+++ b/aiter/ops/triton/k.py\n"
+            "@@ -1,2 +1,3 @@\n"
+            "+# explain the constant\n"
+            "-VALUE = 1\n"
+            "+VALUE = 2\n"
+        )
+        self.assertEqual(
+            ["aiter.ops.triton.k"],
+            self.perf.substantive_modules(["aiter.ops.triton.k"], patch),
+        )
+
+    def test_a_real_change_to_one_file_does_not_vouch_for_another(self):
+        # Per file, not per patch. A PR that rewrites one kernel and comments another owes a
+        # benchmark for the first only, and crediting both would put the second author's name
+        # on a finding about code they documented.
+        patch = (
+            "--- a/aiter/ops/triton/a.py\n"
+            "+++ b/aiter/ops/triton/a.py\n"
+            "+VALUE = 2\n"
+            "--- a/aiter/ops/triton/b.py\n"
+            "+++ b/aiter/ops/triton/b.py\n"
+            "+# documented\n"
+        )
+        self.assertEqual(
+            ["aiter.ops.triton.a"],
+            self.perf.substantive_modules(
+                ["aiter.ops.triton.a", "aiter.ops.triton.b"], patch
+            ),
+        )
+
+    def test_a_kernel_change_nothing_measures_is_the_authors_gap(self):
+        found = self.gap(modules=["aiter.ops.triton.gemm.basic.gemm_a8w8"])
+        self.assertEqual("should-fix", found["severity"])
+        self.assertIn("gemm_a8w8", found["detail"])
+
+    def test_a_native_only_change_is_the_instruments_blind_spot(self):
+        # Pointedly not a should-fix. Every target here runs under AITER_TRITON_ONLY=1, so no
+        # timing run this validator can launch reaches csrc/ -- the author cannot close that
+        # gap by writing a bench, and charging them for it charges them for the tool.
+        found = self.gap(native=["csrc/kernels/gemm.cu"])
+        self.assertEqual("note", found["severity"])
+        self.assertIn("AITER_TRITON_ONLY", found["detail"])
+
+    def test_discovery_declining_is_the_callers_move_not_a_defect(self):
+        # Nothing is missing here: several files could measure the change and choosing is a
+        # reading of the diff. A should-fix would charge the author for the validator's own
+        # refusal to guess.
+        found = self.gap(
+            modules=["aiter.ops.triton.utils.types"],
+            candidates=["op_tests/bench_a.py", "op_tests/bench_b.py"],
+        )
+        self.assertEqual("note", found["severity"])
+        self.assertIn("--perf-target", found["detail"])
+
+    def test_a_measured_kernel_change_has_no_gap_to_name(self):
+        for status in ("pass", "fail"):
+            with self.subTest(status=status):
+                self.assertIsNone(self.gap(status, modules=["aiter.ops.triton.k"]))
+
+    def test_a_chosen_target_that_measured_nothing_speaks_for_itself(self):
+        # It already carries a skip reason saying what went wrong with it. A second finding
+        # claiming nothing measures this change would contradict the measurement beside it.
+        self.assertIsNone(
+            self.gap(basis="discovered-repo-bench", modules=["aiter.ops.triton.k"])
+        )
+        self.assertIsNone(
+            self.gap(basis="declared-by-caller", modules=["aiter.ops.triton.k"])
+        )
+
+    def test_a_change_that_touches_no_kernel_at_all_earns_nothing(self):
+        self.assertIsNone(self.gap())
+
+    def test_native_sources_are_read_off_the_patch_the_same_way_modules_are(self):
+        paths = self.perf.changed_native(
+            "M  csrc/kernels/gemm.cu\n"
+            "A  csrc/include/gemm.h\n"
+            "D  csrc/kernels/gone.cu\n"
+            'A  "csrc/odd\\tname.cu"\n'
+            "M  aiter/ops/triton/k.py\n"
+        )
+        # A deletion is not on head. A path git could not spell plainly is held out for the
+        # same reason discover_shipped holds one out: the name in the report would be a guess.
+        self.assertEqual(["csrc/include/gemm.h", "csrc/kernels/gemm.cu"], paths)
+
+    def entry(self, status, target, ratio=None):
+        measurement = {"status": status, "target": target}
+        if ratio is not None:
+            measurement["median_ratio"] = ratio
+        return {"measurement": measurement, "findings": []}
+
+    def test_the_worse_attributable_measurement_is_the_one_that_gates(self):
+        # The same rule median_ratio already follows across the columns of one table: the
+        # minimum, not the mean. A kernel that got slower on one bench got slower.
+        chosen = self.perf.gate(
+            [
+                self.entry("pass", "bench_clean.py", 1.02),
+                self.entry("fail", "bench_slow.py", 0.80),
+            ]
+        )
+        self.assertEqual("bench_slow.py", chosen["measurement"]["target"])
+
+    def test_a_measurement_that_made_no_claim_cannot_gate(self):
+        # A skip is not a bad result, it is the absence of one -- an unattributable cross-tree
+        # comparison lands here. Letting it gate would publish "we could not measure" as the
+        # stage's own status while a real measurement sat beside it unread.
+        chosen = self.perf.gate(
+            [
+                self.entry("skip", "bench_untimed.py"),
+                self.entry("pass", "bench_clean.py", 1.02),
+            ]
+        )
+        self.assertEqual("bench_clean.py", chosen["measurement"]["target"])
+
+    def test_two_regressions_are_ranked_by_how_bad_they_are(self):
+        chosen = self.perf.gate(
+            [
+                self.entry("fail", "bench_a.py", 0.90),
+                self.entry("fail", "bench_b.py", 0.40),
+            ]
+        )
+        self.assertEqual("bench_b.py", chosen["measurement"]["target"])
+
+    def test_nothing_separating_them_falls_to_the_repository_bench(self):
+        # choose_perf_targets orders the repository's bench first, and the tie-break inherits
+        # that order rather than inventing one: it is the comparison that needed no transplant
+        # to be believable, so it is the one to quote when both say the same thing.
+        chosen = self.perf.gate(
+            [
+                self.entry("pass", "bench_repo.py", 1.0),
+                self.entry("pass", "bench_shipped.py", 1.0),
+            ]
+        )
+        self.assertEqual("bench_repo.py", chosen["measurement"]["target"])
+
+    def compose(self, entries):
+        """Run the stage composer over a hand-built manifest and return the report."""
+        with tempfile.TemporaryDirectory() as work:
+            report = Path(work) / "report.json"
+            manifest = Path(work) / "manifest.json"
+            report.write_text(json.dumps({"stages": {}, "findings": []}))
+            manifest.write_text(json.dumps(entries))
+            self.assertEqual(
+                0,
+                self.perf.main(
+                    ["stage", "--report", str(report), "--manifest", str(manifest)]
+                ),
+            )
+            return json.loads(report.read_text())
+
+    def test_two_regressions_earn_one_should_fix_between_them(self):
+        # finish_report counts should-fix findings. Two targets that both saw the same kernel
+        # get slower is one problem seen twice, and letting each file its own would report it
+        # as two -- while the rows of both are already in measurements[] either way.
+        def regressed(target, ratio):
+            entry = self.entry("fail", target, ratio)
+            entry["findings"] = [
+                {
+                    "severity": "should-fix",
+                    "stage": "perf",
+                    "detail": f"{target} slower",
+                }
+            ]
+            return entry
+
+        report = self.compose(
+            [regressed("bench_a.py", 0.9), regressed("bench_b.py", 0.4)]
+        )
+        self.assertEqual(
+            ["bench_b.py slower"],
+            [
+                item["detail"]
+                for item in report["findings"]
+                if item["severity"] == "should-fix"
+            ],
+        )
+
+    def test_a_target_that_could_not_be_timed_still_says_so_out_loud(self):
+        # The other half of the same rule. A note cannot gate, so there is nothing to protect
+        # by dropping it, and a reader scanning findings would otherwise never learn that a
+        # second bench existed and went unmeasured.
+        skipped = self.entry("skip", "bench_shipped.py")
+        skipped["findings"] = [
+            {"severity": "note", "stage": "perf", "detail": "nothing to transplant"}
+        ]
+        report = self.compose([self.entry("pass", "bench_repo.py", 1.01), skipped])
+        self.assertEqual("bench_repo.py", report["stages"]["perf"]["target"])
+        self.assertIn(
+            "nothing to transplant",
+            [item["detail"] for item in report["findings"]],
+        )
+
+    def test_every_target_that_was_tried_is_reported_whether_or_not_it_measured(self):
+        # An untimed target is still a measurement. Dropping it would leave the report
+        # describing only the targets that happened to work, which reads as though the others
+        # were never tried.
+        entry = self.perf.measurement(
+            {
+                "target": "bench_x.py",
+                "skip_reason": "no harness",
+                "base_log": "/w/b.log",
+            },
+            read_text=lambda name: self.fail(f"a skip read {name}"),
+        )
+        self.assertEqual("skip", entry["measurement"]["status"])
+        self.assertEqual("bench_x.py", entry["measurement"]["target"])
+        self.assertEqual("/w/b.log", entry["measurement"]["base_log"])
+        self.assertEqual("note", entry["findings"][0]["severity"])
+
+    def test_both_paths_resolving_means_both_get_timed(self):
+        # Not a tie to be broken. A bench the repository already owns and a bench the PR wrote
+        # measure different things, and the second is the one whose author chose what it would
+        # say; timing only one of them takes somebody's word for something.
+        decision = self.choose_all(
+            "A  op_tests/bench_new.py\n",
+            "op_tests/test_old.py",
+            repo_benches=["op_tests/op_benchmarks/triton/bench_k.py"],
+        )
+        self.assertEqual(
+            [
+                ("discovered-repo-bench", "op_tests/op_benchmarks/triton/bench_k.py"),
+                ("discovered-pr-shipped", "op_tests/bench_new.py"),
+            ],
+            [(entry["basis"], entry["target"]) for entry in decision["targets"]],
+        )
+        # The repository's bench is first, and the order is load-bearing: it is what gate()
+        # falls back on when nothing separates the two measurements, and that comparison is
+        # the one that needed no transplant to be believable.
+        self.assertIn("op_tests/bench_new.py", decision["candidates"])
+
+    def test_a_shipped_bench_does_not_claim_the_repository_offered_nothing(self):
+        # The shipped path's reason used to say the repository offers none, because reaching
+        # it meant the repository path had declined. Both can resolve now, and a reason that
+        # is only true on one route is worse than no reason at all.
+        decision = self.choose_all(
+            "A  op_tests/bench_new.py\n",
+            "op_tests/test_old.py",
+            repo_benches=["op_tests/op_benchmarks/triton/bench_k.py"],
+        )
+        self.assertNotIn("offers none", decision["targets"][1]["reason"])
+        alone = self.choose("A  op_tests/bench_new.py\n", "op_tests/test_old.py")
+        self.assertIn("offers none", alone["reason"])
+
+    def test_a_shared_helper_matches_too_much_to_choose_from(self):
+        # aiter.ops.triton.utils.types is imported by 13 benches. A dtype alias added to it
+        # would otherwise pick one of them, and GPU noise below the threshold would become a
+        # should-fix against an author who touched a dict literal.
+        many = [f"op_tests/op_benchmarks/triton/bench_{n}.py" for n in range(13)]
+        decision = self.choose("", "op_tests/test_old.py", repo_benches=many)
+        self.assertEqual("same-as-correctness-target", decision["basis"])
+        self.assertIn("--perf-target", decision["reason"])
+
+    def test_one_bench_among_test_files_that_share_its_import_is_still_the_bench(self):
+        # A real decline that should not have been one: three files import
+        # aiter.ops.triton.attention.fp8_mqa_logits and carry a harness, but only one of them
+        # lives where the project keeps its benchmarks. That is a fact about how aiter is
+        # organised, not the filename resemblance the import edge exists to replace.
+        decision = self.choose(
+            "",
+            "op_tests/test_old.py",
+            repo_benches=[
+                "op_tests/flydsl_tests/test_flydsl_fp8_mqa_logits.py",
+                "op_tests/op_benchmarks/triton/bench_fp8_mqa_logits.py",
+                "op_tests/test_flydsl_pa_mqa_logits_fp4_prefill.py",
+            ],
+        )
+        self.assertEqual("discovered-repo-bench", decision["basis"])
+        self.assertEqual(
+            "op_tests/op_benchmarks/triton/bench_fp8_mqa_logits.py", decision["target"]
+        )
+
+    def test_the_tie_break_breaks_ties_and_does_not_settle_them(self):
+        # Two candidates in the benchmark directory is still a tie. This is the guard that
+        # keeps the shared-helper case above declining: 13 of its 14 candidates live there.
+        decision = self.choose(
+            "",
+            "op_tests/test_old.py",
+            repo_benches=[
+                "op_tests/op_benchmarks/triton/bench_a.py",
+                "op_tests/op_benchmarks/triton/bench_b.py",
+            ],
+        )
+        self.assertEqual("same-as-correctness-target", decision["basis"])
+
+    def test_the_dedicated_benchmark_directorys_own_convention_is_recognised(self):
+        # 58 of the 67 files under op_tests/op_benchmarks/ time themselves this way and only
+        # one of the 59 repo-wide matches any earlier rule -- so every rule this detector had
+        # was blind to almost the whole of the directory whose entire purpose is timing.
+        # Pointing --perf-target straight at bench_gemm_a8w8.py reported "no benchmark entry
+        # point", which reads as "there was nothing to measure".
+        for source in (
+            "@triton.testing.perf_report([benchmark])\ndef bench(x):\n    pass\n",
+            "ms = triton.testing.do_bench(lambda: fn())\n",
+        ):
+            with self.subTest(source=source.split("\n")[0]):
+                self.assertIsNotNone(self.perf.detect_harness(source))
+
+    def test_a_bench_the_patch_ships_is_found_and_the_rest_of_it_is_not(self):
+        found = self.shipped(
+            "A  op_tests/bench_new.py\n"
+            "A  op_tests/test_new.py\n"
+            "M  aiter/ops/triton/k.py\n"
+            "A  docs/notes.md\n"
+        )
+        self.assertEqual(["op_tests/bench_new.py"], found["candidates"])
+
+    def test_a_bench_the_patch_deletes_is_not_offered_as_something_to_time(self):
+        # It is not on head. Timing it fails with a `no such file`, which reaches the reader
+        # as a mysterious perf skip rather than as the plain fact that the PR removed a bench.
+        self.assertEqual([], self.shipped("D  op_tests/bench_new.py\n")["candidates"])
+
+    def test_a_shipped_path_git_cannot_spell_plainly_is_held_out_of_the_list(self):
+        # This list feeds a `cp` and a `rm -f`. A path we cannot spell is one we must not act
+        # on -- the rule restore_worktree already follows, for the same reason.
+        found = self.shipped(
+            'A  "op_tests/bench\\303\\251.py"\nA  op_tests/bench_new.py\n'
+        )
+        self.assertEqual(["op_tests/bench_new.py"], found["candidates"])
+        self.assertEqual(1, len(found["unspellable"]))
+
+    def test_one_shipped_bench_that_is_not_the_correctness_target_is_taken(self):
+        decision = self.choose("A  op_tests/bench_new.py\n", "op_tests/test_old.py")
+        self.assertEqual("discovered-pr-shipped", decision["basis"])
+        self.assertEqual("op_tests/bench_new.py", decision["target"])
+
+    def test_a_bench_that_is_already_the_correctness_target_is_not_a_discovery(self):
+        # Nothing was learned. The caller named this file and it happens to be timeable, which
+        # is the case the perf stage has always handled; reporting it as discovered would tell
+        # a reader the validator read the diff when it did not.
+        decision = self.choose("A  op_tests/bench_new.py\n", "op_tests/bench_new.py")
+        self.assertEqual("same-as-correctness-target", decision["basis"])
+
+    def test_overlapping_discoveries_time_each_file_once(self):
+        for correctness in ("op_tests/test_old.py", "op_tests/bench_new.py"):
+            with self.subTest(correctness=correctness):
+                decisions = self.choose_all(
+                    "M  op_tests/bench_new.py\n",
+                    correctness,
+                    repo_benches=["op_tests/bench_new.py"],
+                )["targets"]
+                self.assertEqual(1, len(decisions))
+                self.assertEqual("op_tests/bench_new.py", decisions[0]["target"])
+
+    def test_several_shipped_benches_are_named_rather_than_chosen_between(self):
+        # The safety argument for discovery, in one test. A target declined costs a
+        # measurement; a target chosen WRONG spends a should-fix on an author whose code may
+        # be innocent, and nothing downstream can tell the two apart -- run_perf injects no
+        # probe, so no evidence exists that the bench executed the changed line at all.
+        files = dict(self.SHIPPED, **{"op_tests/bench_two.py": "# --scenario bench\n"})
+        decision = self.perf.choose_perf_targets(
+            self.shipped(
+                "A  op_tests/bench_new.py\nA  op_tests/bench_two.py\n", files=files
+            ),
+            [],
+            "op_tests/test_old.py",
+        )
+        self.assertEqual(1, len(decision["targets"]))
+        decision = {**decision["targets"][0], "candidates": decision["candidates"]}
+        self.assertEqual("same-as-correctness-target", decision["basis"])
+        self.assertEqual("op_tests/test_old.py", decision["target"])
+        self.assertIn("--perf-target", decision["reason"])
+        # Named, not swallowed. A reader told only "the fallback stood" cannot tell an empty
+        # search from one that found two benches and refused to pick between them.
+        self.assertEqual(
+            ["op_tests/bench_new.py", "op_tests/bench_two.py"], decision["candidates"]
+        )
+
+    def test_no_harness_exits_three_so_a_crash_is_distinguishable(self):
+        target = Path(self.enterContext(tempfile.TemporaryDirectory())) / "t.py"
+        target.write_text("def test_x():\n    assert True\n")
+        completed = run(
+            [sys.executable, str(SKILL_DIR / "scrape_perf.py"), "detect", str(target)],
+            check=False,
+        )
+        self.assertEqual(3, completed.returncode)
+
+    def test_the_empty_argument_line_survives_the_round_trip(self):
+        # The decorator harness takes no arguments, so `detect` prints an empty first line.
+        # It goes first because command substitution strips a trailing newline and not a
+        # leading one -- with the order reversed, the caller reads the basis as the args.
+        target = Path(self.enterContext(tempfile.TemporaryDirectory())) / "t.py"
+        target.write_text("@perftest\ndef test_x():\n    pass\n")
+        script = SKILL_DIR / "validate_pr.sh"
+        probe = (
+            f'harness=$("{SKILL_DIR / "scrape_perf.py"}" detect "{target}")\n'
+            'printf "[%s][%s]" "${harness%%$\'\\n\'*}" "${harness#*$\'\\n\'}"\n'
+        )
+        self.assertTrue(script.exists())
+        out = run(["bash", "-c", probe]).stdout
+        self.assertEqual("[][target uses the perftest/@benchmark harness]", out)
+
+    # ---- what a timing run may leave behind
+
+    def restore(self, before, current, root="/repo"):
+        calls = {"unlink": [], "rmtree": [], "checkout": []}
+        outcome = self.perf.restore_worktree(
+            root,
+            before,
+            current,
+            unlink=lambda p: calls["unlink"].append(str(p)),
+            rmtree=lambda p: calls["rmtree"].append(str(p)),
+            checkout=lambda p: calls["checkout"].append(p),
+        )
+        return outcome, calls
+
+    def test_an_artifact_the_timing_run_dropped_is_removed(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (root / "tuned_op_bench.csv").write_text("x\n")
+        outcome, calls = self.restore("", "?? tuned_op_bench.csv\n", root)
+        self.assertEqual(["tuned_op_bench.csv"], outcome["removed"])
+        self.assertEqual(1, len(calls["unlink"]))
+
+    def test_a_file_that_was_already_dirty_is_left_alone(self):
+        # It is somebody else's edit. Reverting it would silently destroy uncommitted work
+        # that has nothing to do with this run.
+        outcome, calls = self.restore(" M kernel.py\n", " M kernel.py\n")
+        self.assertEqual([], outcome["removed"] + outcome["reverted"])
+        self.assertEqual([], calls["unlink"] + calls["checkout"])
+
+    def test_a_path_that_escapes_the_worktree_is_reported_not_deleted(self):
+        outcome, calls = self.restore("", "?? ../../etc/passwd\n")
+        self.assertEqual(["../../etc/passwd"], outcome["skipped"])
+        self.assertEqual([], calls["unlink"] + calls["rmtree"])
+
+    def test_a_git_quoted_path_is_reported_not_guessed_at(self):
+        # Un-quoting git's escapes correctly is fiddly and this code deletes files.
+        outcome, calls = self.restore("", '?? "od\\303\\251.csv"\n')
+        self.assertEqual(1, len(outcome["skipped"]))
+        self.assertEqual([], calls["unlink"] + calls["rmtree"])
+
+    # ---- whether a difference can be charged to the patch
+
+    def test_a_same_worktree_baseline_needs_no_control_column(self):
+        result = {"status": "ok", "reason": "fine", "median_ratio": 1.02, "columns": {}}
+        stage, findings = self.perf.perf_stage(result, self.context())
+        self.assertEqual("pass", stage["status"])
+        self.assertNotIn("control_note", stage)
+
+    def test_a_cross_tree_comparison_without_its_control_makes_no_claim(self):
+        result = {
+            "status": "regression",
+            "reason": "slower",
+            "median_ratio": 0.8,
+            "worst_column": "aiter us",
+            "regressed_rows": [{"row": "128", "base": 1.0, "head": 2.0}],
+            "columns": {"aiter us": {"median_ratio": 0.8}},
+        }
+        stage, findings = self.perf.perf_stage(
+            result,
+            self.context(baseline_method="target-transplant", control_column="torch"),
+        )
+        self.assertEqual("skip", stage["status"])
+        # The numbers the gate rejected must not ship beside the skip: a median_ratio next
+        # to `status: skip` reads as a regression somebody chose not to act on.
+        self.assertNotIn("median_ratio", stage)
+        self.assertNotIn("regressed_rows", stage)
+        self.assertEqual(["note"], [f["severity"] for f in findings])
+
+    def test_a_control_column_that_moved_disqualifies_the_comparison(self):
+        result = {
+            "status": "regression",
+            "reason": "slower",
+            "median_ratio": 0.8,
+            "columns": {"torch us": {"median_ratio": 0.6}, "aiter us": {}},
+        }
+        stage, _ = self.perf.perf_stage(
+            result,
+            self.context(baseline_method="target-transplant", control_column="torch"),
+        )
+        self.assertEqual("skip", stage["status"])
+        self.assertIn("40.0%", stage["control_note"])
+        self.assertEqual(0.6, stage["control_ratio"])
+
+    def test_a_control_column_that_held_lets_the_regression_stand(self):
+        result = {
+            "status": "regression",
+            "reason": "aiter us: median head/base speedup 0.800 < 0.95",
+            "median_ratio": 0.8,
+            "regressed_rows": [{"row": "128", "base": 1.0, "head": 2.0}],
+            "columns": {"torch us": {"median_ratio": 1.01}, "aiter us": {}},
+        }
+        stage, findings = self.perf.perf_stage(
+            result,
+            self.context(baseline_method="target-transplant", control_column="torch"),
+        )
+        self.assertEqual("fail", stage["status"])
+        self.assertEqual(0.8, stage["median_ratio"])
+        self.assertIn("reproduced within", stage["control_note"])
+        self.assertEqual(["should-fix"], [f["severity"] for f in findings])
+        self.assertIn("128: 1 -> 2", findings[0]["detail"])
+
+    def test_blank_or_ambiguous_controls_cannot_attribute_a_comparison(self):
+        for control in ("", " ", "\t\n", "us"):
+            with self.subTest(control=control):
+                result = {
+                    "status": "regression",
+                    "median_ratio": 0.5,
+                    "columns": {
+                        "kernel us": {"median_ratio": 1.0},
+                        "reference us": {"median_ratio": 0.5},
+                    },
+                }
+                stage, _ = self.perf.perf_stage(
+                    result,
+                    self.context(
+                        baseline_method="target-transplant", control_column=control
+                    ),
+                )
+                self.assertEqual("skip", stage["status"])
+                self.assertNotIn("median_ratio", stage)
+
+    def test_control_matching_prefers_an_exact_name_then_a_unique_substring(self):
+        for control in (" Reference Us ", "reference us", "REFERENCE"):
+            with self.subTest(control=control):
+                columns = {
+                    "kernel us": {"median_ratio": 0.8},
+                    "reference us": {"median_ratio": 1.0},
+                }
+                if control != "REFERENCE":
+                    columns["other reference us"] = {"median_ratio": 0.5}
+                result = {
+                    "status": "regression",
+                    "reason": "kernel regressed",
+                    "median_ratio": 0.8,
+                    "columns": columns,
+                }
+                stage, _ = self.perf.perf_stage(
+                    result,
+                    self.context(
+                        baseline_method="target-transplant", control_column=control
+                    ),
+                )
+                self.assertEqual("fail", stage["status"])
+                self.assertEqual(1.0, stage["control_ratio"])
+
+    def test_only_a_measured_regression_can_fail_the_stage(self):
+        # A timeout, a crash, a missing harness and a one-row table must all land on skip:
+        # a false regression blocks a good PR and gets the stage switched off within a week.
+        for status in ("insufficient", "error", "unknown"):
+            with self.subTest(status=status):
+                stage, _ = self.perf.perf_stage(
+                    {"status": status, "reason": "nope", "columns": {}}, self.context()
+                )
+                self.assertEqual("skip", stage["status"])
+
+    def test_the_repeat_count_ships_with_the_claim(self):
+        # The threshold is only defensible because each cell is a best-of-N, so N has to be
+        # visible to a reader.
+        stage, _ = self.perf.perf_stage(
+            {
+                "status": "ok",
+                "reason": "",
+                "columns": {},
+                "base_runs": 3,
+                "head_runs": 3,
+            },
+            self.context(),
+        )
+        self.assertEqual(3, stage["repeats"]["base"])
+        self.assertIn("best sample", stage["repeats"]["reduction"])
+
+    def test_a_missing_measurement_is_omitted_rather_than_nulled(self):
+        # report_schema.json types median_ratio as a number; a null fails validation at
+        # review-pr's identity gate, turning "we could not measure" into "this is malformed".
+        stage, _ = self.perf.perf_stage(
+            {"status": "insufficient", "reason": "no rows", "median_ratio": None},
+            self.context(),
+        )
+        self.assertNotIn("median_ratio", stage)
+
+
+def report_module_status(report, stage):
+    return report.SATISFYING_STATUS.get(stage, report.DEFAULT_SATISFYING_STATUS)
 
 
 if __name__ == "__main__":

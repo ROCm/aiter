@@ -36,12 +36,7 @@ def pytest_stats(path: pathlib.Path) -> dict:
     return totals
 
 
-def validate_receipt(
-    path: pathlib.Path,
-    expected_route: str,
-    grid: str,
-    grid_channel: str = "",
-) -> dict:
+def validate_receipt(path: pathlib.Path, expected_route: str) -> dict:
     if not expected_route:
         return {
             "status": "skip",
@@ -85,13 +80,6 @@ def validate_receipt(
             "status": "skip",
             "note": "expected route is absent from observed kernel_symbols",
         }
-    expected_shapes = [shape.strip() for shape in grid.split(";") if shape.strip()]
-    # The pytest channel substitutes the grid into the TEST's parameters, while the receipt
-    # records locals inside the ROUTE. The two vocabularies need not coincide, and requiring
-    # one to contain the other reported "execution receipt is missing required shapes" for a
-    # run whose every grid case passed. What the grid required is still recorded; only the
-    # cross-namespace containment assertion is dropped, and the note says so.
-    cross_namespace = grid_channel == "pytest"
     observed_shapes = receipt.get("executed_shapes")
     if not isinstance(observed_shapes, list) or not all(
         isinstance(shape, str) and shape for shape in observed_shapes
@@ -100,18 +88,11 @@ def validate_receipt(
             "status": "skip",
             "note": "execution receipt has no executed_shapes list",
         }
-    missing = sorted(set(expected_shapes) - set(observed_shapes))
-    if missing and not cross_namespace:
-        return {
-            "status": "skip",
-            "note": f"execution receipt is missing required shapes: {missing}",
-        }
     result = {
         "status": "pass",
         "route": expected_route,
         "producer": receipt["producer"],
         "kernel_symbols": sorted(set(symbols)),
-        "required_shapes": expected_shapes,
         "executed_shapes": observed_shapes,
         "receipt": str(path),
         "receipt_sha256": file_sha256(path),
@@ -121,12 +102,6 @@ def validate_receipt(
     # every observed case was a route deriving its shapes in its body, where the requested
     # names never became locals the probe could see. Name the gap in the report so no consumer
     # can read the empty list as evidence that no shapes were needed.
-    if cross_namespace:
-        result["shape_namespace"] = (
-            "the grid was delivered as pytest parameters and executed_shapes records the "
-            "route's own locals; the two are different vocabularies, so this receipt attests "
-            "route execution and the grid's own evidence is correctness_s1_grid"
-        )
     requested_vars = [name for name in receipt.get("shape_vars") or [] if name]
     if requested_vars and not observed_shapes:
         result["shape_capture"] = {
@@ -251,8 +226,6 @@ def parse_args() -> argparse.Namespace:
     receipt = subparsers.add_parser("receipt")
     receipt.add_argument("path", type=pathlib.Path)
     receipt.add_argument("--expected-route", default="")
-    receipt.add_argument("--grid", default="")
-    receipt.add_argument("--grid-channel", default="")
 
     runtime = subparsers.add_parser("runtime")
     runtime.add_argument("module")
@@ -267,9 +240,7 @@ def main() -> int:
     if args.command == "pytest-stats":
         result = pytest_stats(args.junit_xml)
     elif args.command == "receipt":
-        result = validate_receipt(
-            args.path, args.expected_route, args.grid, args.grid_channel
-        )
+        result = validate_receipt(args.path, args.expected_route)
     else:
         result = runtime_identity(
             args.module,

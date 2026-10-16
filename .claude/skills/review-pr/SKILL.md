@@ -1,19 +1,17 @@
 ---
 name: review-pr
-description: Advisory AI code review for aiter and FlyDSL PRs. Catches perf regressions, silent correctness bugs, dispatch gate holes, and AI-generated code patterns, but never acts as a merge gate. Invoke with a PR number (optionally owner/repo#N) and, when one exists, a validation report path. Step 1 triages whether the PR changes runtime surface at all and, when it does and the PR ships a single test target, runs validate-kernel-pr itself; a PR with no runtime surface is reported N/A rather than unvalidated. That run also times the target on base and head back to back on one locked GPU, so a kernel PR's latency is measured rather than assumed. The review line stays advisory; deterministic correctness and perf results are judged only from a head-matched report.
+description: Advisory AI code review for aiter and FlyDSL PRs. Catches perf regressions, silent correctness bugs, dispatch gate holes, and AI-generated code patterns, but never acts as a merge gate. Invoke with a PR number (optionally owner/repo#N) and, when one exists, a validation report path. Step 1 triages whether the PR changes runtime surface at all and, when it does and the caller declares a runner for the selected target, runs validate-kernel-pr itself; a PR with no runtime surface is reported N/A rather than unvalidated. That run also times the target on base and head back to back on one locked GPU, so a kernel PR's latency is measured rather than assumed. The review line stays advisory; deterministic correctness and perf results are judged only from a head-matched report.
 argument-hint: <PR number> [owner/repo] [validation-report]
 ---
 
 # aiter PR Review — advisory tier
 
 This skill supplies hints to a human reviewer. Its judgement is stochastic and never blocks a
-merge. Only a reproducible blocker from an explicitly supplied, head-matched
-`validation_report.json` may be used as a deterministic gate.
+merge. Only a reproducible blocker from an explicitly supplied, head-matched `validation_report.json` may be used as a deterministic gate.
 
 ## Promotion bar
 
-The two conditions under which this could stop being advisory, and why neither
-holds yet: `rules.md` § Promotion bar.
+The two conditions under which this could stop being advisory, and why neither holds yet: `rules.md` § Promotion bar.
 
 ---
 
@@ -24,7 +22,9 @@ holds yet: `rules.md` § Promotion bar.
 "$(git rev-parse --show-toplevel)/.claude/skills/review-pr/fetch.sh" "$@"
 ```
 
-Read the diff and PR body before proceeding.
+Read the diff, PR body and selected target before declaring `REVIEW_RUNNER=pytest` or `script`, then rerun the command above. `REVIEW_RUNNER_REASON` records why; a file name does not declare its runner.
+`REVIEW_EXPECTED_ROUTE` enables route evidence; optional `REVIEW_SHAPE_VARS` captures the target's own shapes. Without a runner, fetch records NOT RUN before claiming a GPU. Without a route, the run is INCONCLUSIVE unless findings require BLOCK/NEEDS_WORK.
+`REVIEW_AUTO_VALIDATE=0` fetches static evidence only. `REVIEW_PERF_TARGET` and `REVIEW_PERF_CONTROL_COLUMN` forward explicit performance choices; otherwise the validator discovers benchmarks. Grid injection was removed.
 
 ### Step 1b — Derive the applicable rules, and collect the evidence they need
 
@@ -410,7 +410,7 @@ failure, because not writing it was the cheapest way past this check. Whether a 
 - **At most 5 findings, ordered most-severe first.** Rank by (severity, then blast radius), keep the top 5, and drop the rest — do not append them as a tail. This is a readability limit, not a measured recall claim; no committed replay corpus currently establishes recall@5.
 - **State the validation evidence** on the line under the verdict, using the state Step 1's triage
   actually reached. The three no-report states are different facts and must not be merged:
-  - with an accepted exact-head report: `Validation (deterministic): <verdict>` plus selected target/runner, runtime arch, and failed/skipped stages. Say when the report came from the auto-run, because its ceiling is lower: with no route supplied the receipt and grid stages skip, so `INCONCLUSIVE` there describes what a diff can tell you and is not a finding against the PR.
+  - with an accepted exact-head report: `Validation (deterministic): <verdict>` plus selected target/runner, runtime arch, and failed/skipped stages. Say when the report came from the auto-run, because its ceiling is lower: with no route supplied the receipt stage skips, so `INCONCLUSIVE` there describes what a diff can tell you and is not a finding against the PR.
   - triage said not required: `Validation (deterministic): N/A — no runtime surface changed`. Do not write `NOT RUN`; there is no gap to report, and a docs or tooling PR carrying an alarming evidence line is what makes the line ignorable.
   - required, but no target existed to run: `Validation (deterministic): NOT RUN — <triage reason>`. A runtime change shipping no test target is a finding in its own right **only when the changed path is executed at run time**. Triage calls anything under `aiter/` a runtime surface, and a tuner input CSV, a tuned-config table or a codegen list is not: nothing loads it in the serving path, so there is nothing a test target could have covered. Say which of the two it is on that line; do not report the absence as a defect on a data-only diff.
   - required and a target existed, but the run could not happen (no idle GPU, validator missing, `REVIEW_AUTO_VALIDATE=0`): `Validation (deterministic): NOT RUN — <reason>`. This is an environment gap, not a PR defect.

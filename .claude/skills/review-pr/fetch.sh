@@ -207,8 +207,7 @@ for line in diff_path.read_text(errors="replace").splitlines():
 def is_candidate_target(path):
     name = pathlib.PurePosixPath(path).name
     # op_benchmarks/ holds bench_*.py perf harnesses. They are excluded because they are
-    # not correctness targets; the validator's perf stage times the correctness target it
-    # already selected, so it does not need one of these either.
+    # not correctness targets. The validator discovers them separately for timing.
     return (
         path.startswith("op_tests/")
         and "/op_benchmarks/" not in f"/{path}"
@@ -246,7 +245,7 @@ else:
 # The measurement itself belongs to the validator's `perf` stage, which times base and head
 # back to back on one locked GPU and gates on the result. What is computed HERE is only the
 # fallback: which command a human would run if that stage could not. Keep the detection below
-# in step with perf_detect() in validate-kernel-pr/validate_pr.sh -- if the two disagree, this
+# in step with detect_harness() in validate-kernel-pr/scrape_perf.py -- if the two disagree, this
 # step prints a recipe for a harness the validator declined to use, or vice versa.
 #
 # `perf_claimed` only separates two reports ("the PR's own claim is unverified" vs "no claim
@@ -297,12 +296,14 @@ def perf_command(path):
     # a substring test and not a parse. That direction is the safe one: an over-eager match
     # runs the target, finds no timing table, and the perf stage reports `skip` -- the same
     # outcome as not matching, one wasted run later. The opposite error stays silent.
-    # Keep this in step with perf_detect() in validate-kernel-pr/validate_pr.sh.
+    # Keep this in step with detect_harness() in validate-kernel-pr/scrape_perf.py.
     if "perftest" in text or "@benchmark" in text:
         return f"python3 {path}", "target uses the perftest/@benchmark harness"
+    if "triton.testing.perf_report" in text or "triton.testing.do_bench" in text:
+        return f"python3 {path}", "target uses the triton.testing benchmark harness"
     return None, (
         "target exposes no benchmark entry point "
-        "(no --scenario bench, no perftest/@benchmark harness)"
+        "(no --scenario bench, no perftest/@benchmark, no triton.testing harness)"
     )
 
 
@@ -380,6 +381,14 @@ if [ -z "$VALIDATION_REPORT" ] \
   AUTO_TARGET=$(python3 -c \
     'import json,sys; print(json.load(open(sys.argv[1]))["target"])' \
     "$WORK/validation_requirement.json")
+  if [ -z "${REVIEW_RUNNER:-}" ] && [[ "$AUTO_TARGET" != *::* ]]; then
+    echo "runner not declared for $AUTO_TARGET; read the target and rerun with REVIEW_RUNNER=pytest or script (and REVIEW_EXPECTED_ROUTE for route evidence)" \
+      >"$WORK/auto_validation_outcome.txt"
+  else
+  case "${REVIEW_RUNNER:-}" in
+    ""|pytest|script|none) ;;
+    *) echo "REVIEW_RUNNER must be pytest, script, or none" >&2; exit 2 ;;
+  esac
   # The validator is invoked directly, with the base and head this step already holds. A
   # PR-number front end that re-fetched the diff and re-resolved the base tip would reopen the
   # window the gate below closes: main can advance between the two `gh api` calls, and the report
@@ -418,25 +427,15 @@ if [ -z "$VALIDATION_REPORT" ] \
       git -C "$PROJECT_ROOT" worktree prune
     }
     trap remove_auto_worktree EXIT
-    # Route and shape knowledge cannot be derived from a diff, so without these the receipt
-    # and grid stages skip and the run tops out at INCONCLUSIVE by construction. That is a
-    # limit of what a diff tells you, not a defect in the PR -- Step 8 must say so.
-    # When a grid is supplied and no channel carries it, the report's
-    # test_selection.grid_channel_reason names each channel tried, what was found in the
-    # target, and which channels the target does offer -- so a wrong guess costs one run
-    # rather than a reading of the target's source.
+    # The caller declares how the target runs. Route evidence needs an expected route;
+    # shape capture is optional and observes the target's own cases.
     AUTO_ARGS=()
+    [ -n "${REVIEW_RUNNER:-}" ] && AUTO_ARGS+=(--runner "$REVIEW_RUNNER")
+    [ -n "${REVIEW_RUNNER_REASON:-}" ] && AUTO_ARGS+=(--runner-reason "$REVIEW_RUNNER_REASON")
     [ -n "${REVIEW_EXPECTED_ROUTE:-}" ] && AUTO_ARGS+=(--expected-route "$REVIEW_EXPECTED_ROUTE")
     [ -n "${REVIEW_SHAPE_VARS:-}" ] && AUTO_ARGS+=(--shape-vars "$REVIEW_SHAPE_VARS")
-    [ -n "${REVIEW_SHAPE_ENV:-}" ] && AUTO_ARGS+=(--shape-env "$REVIEW_SHAPE_ENV")
-    [ -n "${REVIEW_SHAPE_ARG:-}" ] && AUTO_ARGS+=(--shape-arg "$REVIEW_SHAPE_ARG")
-    # The pytest-parametrization channel reaches targets neither of the other two can: none of
-    # the seven files in op_tests/flydsl_tests/ reads a shape env var or parses a shape flag,
-    # and all of them declare shapes as literals in @pytest.mark.parametrize. Without this the
-    # channel exists but no auto-validated review can use it.
-    [ -n "${REVIEW_SHAPE_ARGNAMES:-}" ] \
-      && AUTO_ARGS+=(--shape-argnames "$REVIEW_SHAPE_ARGNAMES")
-    [ -n "${REVIEW_GRID:-}" ] && AUTO_ARGS+=(--grid "$REVIEW_GRID")
+    [ -n "${REVIEW_PERF_TARGET:-}" ] && AUTO_ARGS+=(--perf-target "$REVIEW_PERF_TARGET")
+    [ -n "${REVIEW_PERF_CONTROL_COLUMN:-}" ] && AUTO_ARGS+=(--perf-control-column "$REVIEW_PERF_CONTROL_COLUMN")
     echo "auto-validation: running $AUTO_TARGET for PR #$PR (minutes, needs an idle GPU)"
     # BLOCK, NEEDS_WORK and INCONCLUSIVE all still write a report worth consuming, so the
     # exit code must not abort the review; only a missing file means there is nothing to read.
@@ -454,6 +453,7 @@ if [ -z "$VALIDATION_REPORT" ] \
         >"$WORK/auto_validation_outcome.txt"
       echo "auto-validation exited $AUTO_RC and wrote no report; the review stays static-only" >&2
     fi
+  fi
   fi
 fi
 
@@ -503,7 +503,6 @@ required_stages = {
     "test_policy",
     "baseline_control",
     "correctness_repo_tests",
-    "correctness_s1_grid",
     "execution_receipt",
     "index_width_scan",
 }
@@ -533,18 +532,14 @@ for finding in findings:
     ):
         raise SystemExit(f"validation report has a malformed finding: {finding!r}")
 selection = report.get("test_selection", {})
-if not selection.get("target"):
+if not selection.get("target") and selection.get("runner") not in {"none", "unresolved"}:
     raise SystemExit("validation report does not name the test target it selected")
-if not selection.get("expected_route"):
-    raise SystemExit("validation report does not name the expected kernel route")
-if not selection.get("shape_vars"):
-    raise SystemExit("validation report does not name the route-call shape variables")
 if selection.get("runner") not in {"pytest", "script", "none", "unresolved"}:
     raise SystemExit("validation report has no supported target runner")
 if not selection.get("runner_reason"):
     raise SystemExit("validation report does not explain its runner selection")
 identity = report.get("runtime_identity")
-if (
+if (identity is not None or report["stages"]["runtime_compat"]["status"] == "pass") and (
     not isinstance(identity, dict)
     or not identity.get("module_path")
     or not identity.get("python_executable")
@@ -563,12 +558,7 @@ if set(coverage_basis) != set(coverage):
 if coverage:
     basis = coverage_basis[gpu_arch]
     if selection["runner"] == "pytest":
-        grid_stats = report["stages"]["correctness_s1_grid"].get("stats", {})
-        basis_stage = (
-            report["stages"]["correctness_s1_grid"]
-            if grid_stats.get("executed", 0) > 0
-            else report["stages"]["correctness_repo_tests"]
-        )
+        basis_stage = report["stages"]["correctness_repo_tests"]
         expected_basis = (
             f"pytest-junit-executed:{basis_stage.get('stats', {}).get('executed', 0)}"
         )
@@ -576,7 +566,7 @@ if coverage:
             raise SystemExit("pytest architecture coverage basis is inconsistent")
     elif selection["runner"] == "script" and not basis.startswith("script-"):
         raise SystemExit("script architecture coverage basis is inconsistent")
-for stage_name in ("correctness_repo_tests", "correctness_s1_grid"):
+for stage_name in ("correctness_repo_tests",):
     stage = report["stages"][stage_name]
     stats = stage.get("stats")
     if stats is not None:
@@ -599,26 +589,13 @@ for stage_name in ("correctness_repo_tests", "correctness_s1_grid"):
     ):
         raise SystemExit(f"{stage_name} has a hollow or contradictory pass")
 receipt = report["stages"]["execution_receipt"]
-# Only a grid that was actually DELIVERED imposes required shapes. A grid the caller supplied
-# for a target with no channel to receive it was still being turned into a requirement here,
-# so the receipt's honest empty list read as a contradiction and the report was rejected --
-# discarding exactly the runs that carried the accurate "no channel" diagnostic.
-required_shapes = (
-    [shape.strip() for shape in selection.get("grid", "").split(";") if shape.strip()]
-    if selection.get("grid_channel")
-    else []
-)
 if receipt.get("status") == "pass" and (
-    receipt.get("producer") != "validate-kernel-pr.validation_probe"
+    not selection.get("expected_route")
+    or receipt.get("producer") != "validate-kernel-pr.validation_probe"
     or receipt.get("route") != selection["expected_route"]
     or selection["expected_route"] not in receipt.get("kernel_symbols", [])
-    or sorted(set(receipt.get("required_shapes", []))) != sorted(set(required_shapes))
-    or (
-        selection.get("grid_channel") != "pytest"
-        and not set(required_shapes).issubset(set(receipt.get("executed_shapes", [])))
-    )
 ):
-    raise SystemExit("execution receipt contradicts the selected route/grid")
+    raise SystemExit("execution receipt contradicts the selected route")
 severities = {
     finding.get("severity")
     for finding in findings
@@ -633,7 +610,6 @@ complete = (
     and report["stages"]["test_policy"]["status"] == "pass"
     and report["stages"]["baseline_control"]["status"] == "pass"
     and report["stages"]["correctness_repo_tests"]["status"] == "pass"
-    and report["stages"]["correctness_s1_grid"]["status"] == "pass"
     and report["stages"]["execution_receipt"]["status"] == "pass"
     and report["stages"]["index_width_scan"]["status"] == "info"
 )
@@ -695,7 +671,7 @@ out_path.write_text(json.dumps(report, indent=2) + "\n")
 print(
     f"validation report accepted for head {expected_head}; "
     f"target={selection['target']}; "
-    f"grid={selection.get('grid') or 'not configured'}"
+    f"runner={selection['runner']}"
 )
 # Printed separately and unconditionally, because Step 8 must state a perf line either way:
 # a silent absence here is what produced a card with no numbers on aiter#4538.
@@ -709,6 +685,13 @@ elif perf["status"] in {"pass", "fail"}:
     )
 else:
     print(f"perf stage: skip — {perf.get('note', 'no reason recorded')}")
+if perf:
+    for measurement in perf.get("measurements", []):
+        print(
+            f"perf measurement: {measurement['target']} "
+            f"({measurement['target_basis']}): {measurement['status']}; "
+            f"{measurement.get('note', '')}"
+        )
 PY
 else
   # Distinguish the reasons there is no report. "Not applicable" and "required but missing"
