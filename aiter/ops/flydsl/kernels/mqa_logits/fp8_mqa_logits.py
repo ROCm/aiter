@@ -10,7 +10,8 @@ inside that row's window ``[cu_starts[m], cu_ends[m])``::
 
 Low-level ``@flyc.kernel``/``@flyc.jit`` builders only. The public host-facing
 API (``flydsl_fp8_mqa_logits``, variant selection/registry) lives in
-``aiter.ops.flydsl.fp8_mqa_logits_kernels``.
+``aiter.ops.flydsl.fp8_mqa_logits_kernels``; the gfx942 LDS-staged builder
+is in ``fp8_mqa_logits_gfx942_lds``.
 """
 
 # No `from __future__ import annotations`: FlyDSL arg typing needs real
@@ -114,6 +115,32 @@ def _emit_col_sum(mfma, mma, gemm_kw, a_row, b_pack, w_row, kv_scale, f32_0):
     for sh in mfma.shuffle_offsets:
         col_sum = col_sum + col_sum.shuffle_xor(sh, 64)
     return col_sum
+
+
+def _fn_to_fnuz_i64(raw_i64):
+    """Map FN byte 0x80 (neg-zero) -> 0x00 in 8 packed fp8 bytes."""
+
+    def _fix_i32(src):
+        """Zero every 0x80 byte of one dword of 4 packed fp8 bytes.
+
+        ``>>`` on a signed Int32 is arithmetic, but the ``& 0xFF`` immediately
+        after keeps only the byte being examined, so this matches a logical
+        shift.
+        """
+        result = fx.Int32(0)
+        for byte_idx in range_constexpr(4):
+            shift = fx.Int32(byte_idx * 8)
+            byte_val = (src >> shift) & fx.Int32(0xFF)
+            cleaned = (byte_val == fx.Int32(0x80)).select(fx.Int32(0), byte_val)
+            result = result | (cleaned << shift)
+        return result
+
+    # The widen/narrow steps stay unsigned: they move a bit pattern, so a
+    # sign-extending ext would corrupt the high dword.
+    raw = fx.Uint64(raw_i64)
+    lo_64 = fx.Int64(fx.Uint32(_fix_i32(fx.Int32(raw))))
+    hi_64 = fx.Int64(fx.Uint32(_fix_i32(fx.Int32(raw >> 32)))) << fx.Int64(32)
+    return (lo_64 | hi_64).ir_value()
 
 
 def _emit_row_neg_inf_fill(
@@ -483,33 +510,6 @@ def _build_kernel_mfma_r_w(
             raw = _load_pack_i64(i32_view, off)
             return mfma.make_frag(_fn_to_fnuz_i64(raw) if convert_fn else raw)
 
-        def _fn_to_fnuz_i64(raw_i64):
-            """Map FN byte 0x80 (neg-zero) -> 0x00 in 8 packed fp8 bytes."""
-
-            def _fix_i32(src):
-                """Zero every 0x80 byte of one dword of 4 packed fp8 bytes.
-
-                ``>>`` on a signed Int32 is arithmetic, but the ``& 0xFF``
-                immediately after keeps only the byte being examined, so this
-                matches the logical shift it replaced.
-                """
-                result = fx.Int32(0)
-                for byte_idx in range_constexpr(4):
-                    shift = fx.Int32(byte_idx * 8)
-                    byte_val = (src >> shift) & fx.Int32(0xFF)
-                    cleaned = (byte_val == fx.Int32(0x80)).select(fx.Int32(0), byte_val)
-                    result = result | (cleaned << shift)
-                return result
-
-            # The widen/narrow steps stay unsigned: they move a bit pattern, so
-            # a sign-extending ext would corrupt the high dword.
-            raw = fx.Uint64(raw_i64)
-            lo_fix = _fix_i32(fx.Int32(raw))
-            hi_fix = _fix_i32(fx.Int32(raw >> 32))
-            lo_64 = fx.Int64(fx.Uint32(lo_fix))
-            hi_64 = fx.Int64(fx.Uint32(hi_fix)) << fx.Int64(32)
-            return (lo_64 | hi_64).ir_value()
-
         # ---- Preload window bounds, Q frags, and weights for all RPB rows ----
         # A-operand layout is per in-wave lane, so `lane` (not `tid`) indexes Q.
         starts = [None] * RPB
@@ -540,11 +540,14 @@ def _build_kernel_mfma_r_w(
             )
 
         # ---- Union window across all RPB rows ----
-        tile_start = starts[0]
-        tile_end = ends[0]
-        for j in range_constexpr(1, RPB):
-            tile_start = fx.min(tile_start, starts[j])
-            tile_end = fx.max(tile_end, ends[j])
+        # Empty rows (host padding, or cu_ends <= cu_starts) are left out of
+        # the union so they cannot widen it.
+        tile_start = seq_len_kv
+        tile_end = fx.Int32(0)
+        for j in range_constexpr(RPB):
+            nonempty = ends[j] > starts[j]
+            tile_start = fx.min(tile_start, nonempty.select(starts[j], seq_len_kv))
+            tile_end = fx.max(tile_end, nonempty.select(ends[j], fx.Int32(0)))
         # Align tile_start down to BKV boundary.
         tile_start = (tile_start // fx.Int32(BKV)) * fx.Int32(BKV)
         # Collapse an empty union window to a zero-width one at tile_start.
