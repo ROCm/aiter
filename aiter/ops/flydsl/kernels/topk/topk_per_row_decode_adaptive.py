@@ -315,8 +315,8 @@ def _next_pow2(n: int) -> int:
 def decode_adaptive_short_max(rows: int) -> int:
     """The length below which a row runs on the single-workgroup short tier.
 
-    Not `_ONE_WORKGROUP_MAX_ROW_WIDTH`, which was fitted on the chunked kernel; do
-    not reconcile the two without re-measuring. k does not enter: the crossover
+    Not `_ONE_WORKGROUP_MAX_ROW_WIDTH`, which is the single-launch path's own
+    crossover; do not reconcile the two without re-measuring. k does not enter: the crossover
     barely moves.
     """
     return min(SHORT_MAX_CAP, SHORT_MAX_BASE + _next_pow2(rows) * SHORT_MAX_SLOPE)

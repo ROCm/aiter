@@ -470,8 +470,8 @@ def flydsl_top_k_per_row_decode(
     `row_starts` [rows] i32: row r's scores start at element row_starts[r]
     of `logits`' first row (a packed buffer viewed with stride0 0), the
     indices still relative to that start. `plane_width` (default the
-    logits' width) bounds every row and picks the kernel and its chunking,
-    as that plane's width would.
+    logits' width) bounds every row and picks the kernel, as that plane's
+    width would.
     """
     _decode_with_backend(
         logits,
@@ -510,7 +510,7 @@ def _decode_with_backend(
 ) -> None:
     """Run the decode on `backend`, which must be the gate's answer or None to ask it.
 
-    A `default` answer still runs the chunked pair here, because this entry
+    A `default` answer still runs the single-launch kernel here, because this entry
     point has no one-block dispatch below it.
     """
     _validate_flydsl_topk_call(

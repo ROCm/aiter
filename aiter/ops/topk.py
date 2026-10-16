@@ -700,7 +700,7 @@ _FLYDSL_TOPK_DECODE_KS = (512, 1024, 2048, 4096)
 # point's own dispatch, which runs the FlyDSL one-block kernel where that is
 # enabled and the C++ one-block kernel elsewhere.
 BACKEND_DEFAULT = "default"
-BACKEND_CHUNKED = "chunked"
+BACKEND_SINGLE = "single"
 BACKEND_ADAPTIVE = "adaptive"
 
 # Which shapes the adaptive kernel is fastest for. One entry, with names in
@@ -723,10 +723,10 @@ BACKEND_ADAPTIVE = "adaptive"
 #
 # Keyed by CU count as well as arch: one arch name spans several, and the grid
 # these were measured against is built from that count. A pair the table does
-# not name is routed by the chunked gate below alone.
+# not name is routed by the single-launch gate below alone.
 #
 # A cell is admitted only when this kernel is the fastest of the four decode
-# kernels (adaptive, chunked, FlyDSL one-block, C++ one-block) and at least
+# kernels (adaptive, single-launch, FlyDSL one-block, C++ one-block) and at least
 # 1.05x faster than the kernel the gate would pick without it, on a full buffer
 # and on a padded one alike, which the gate cannot tell apart. Every entry
 # assumes the caller declares `max_row_len`.
@@ -961,8 +961,9 @@ def _decode_backend(
     The two tables read different lengths and must keep doing so. The adaptive
     bands read `adaptive_width`, the caller's bound, because that kernel is
     configured from it; `None` means no bound was stated and declines them. The
-    chunked bands read the physical `width` they were fitted on, so a bound
-    never moves a call between the chunked kernel and the one-block path.
+    single-launch bands read the physical `width` they were fitted on, so a
+    bound never moves a call between the single-launch kernel and the one-block
+    path.
 
     Both entry points ask this one function rather than deciding again further
     down, which is what keeps them from disagreeing.
@@ -983,7 +984,7 @@ def _decode_backend(
             num_rows,
         )
     ):
-        return BACKEND_CHUNKED
+        return BACKEND_SINGLE
     return BACKEND_DEFAULT
 
 
@@ -1076,7 +1077,7 @@ def decode_backend_for_call(
         k,
         values is None,
         # No bound means the host cannot size the adaptive config, so decline it;
-        # the chunked bands still see the physical width.
+        # the single-launch bands still see the physical width.
         None if max_row_len is None else decode_adaptive_width(width, max_row_len),
     )
     if backend == BACKEND_DEFAULT:
