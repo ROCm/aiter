@@ -10,6 +10,7 @@ import triton
 
 from aiter.ops.triton.fusions.fused_qk_concat import fused_qk_cat, fused_qk_rope_cat
 from aiter.ops.triton.utils.types import str_to_torch_dtype
+from op_tests.op_benchmarks.triton.utils.argparse import positive_int, pow2_int
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
@@ -22,7 +23,7 @@ from op_tests.triton_tests.fusions.test_fused_qk_concat import (
 
 def get_benchmark_shapes(args):
     """Return [(B, QH, KH, D_pe), ...] for the current CLI args."""
-    tokens = args.B if args.B is not None else (1, 4, 8, 16, 32)
+    tokens = args.B if args.B is not None else (1, 4, 8, 16, 32, 4096)
     qh_per_kh = args.qh_per_kh if args.qh_per_kh is not None else (1, 2, 4, 8, 16)
     kv_heads = args.kh if args.kh is not None else (1, 4)
     pe_dims = args.d_pe if args.d_pe is not None else (64, 128)
@@ -33,20 +34,6 @@ def get_benchmark_shapes(args):
         for r in qh_per_kh
         for b in tokens
     ]
-
-
-def _positive_int(value):
-    n = int(value)
-    if n < 1:
-        raise argparse.ArgumentTypeError(f"must be >= 1, got {n}")
-    return n
-
-
-def _pow2_int(value):
-    n = _positive_int(value)
-    if n < 2 or n & (n - 1):
-        raise argparse.ArgumentTypeError(f"must be a power of 2 >= 2, got {n}")
-    return n
 
 
 def bench_fused_qk_concat_fn(B, QH, KH, D_pe, metric, args):
@@ -93,7 +80,6 @@ def run_benchmark(args):
         line_arg="metric",
         line_vals=[args.metric],
         line_names=[args.metric],
-        styles=[("red", "-")],
         ylabel=units[args.metric],
         plot_name=f"{get_caller_name_no_ext()}_{args.op}_{args.dtype}",
         args={},
@@ -108,7 +94,7 @@ def run_benchmark(args):
         df.to_csv(f"{benchmark.plot_name}.csv", index=False)
 
 
-def parse_args():
+def parse_args(args: list[str] | None = None):
     parser = argparse.ArgumentParser(
         prog="Benchmark fused_qk_concat",
         description="Benchmark the Triton fused q/k concat (and RoPE + concat) kernels",
@@ -124,34 +110,34 @@ def parse_args():
     )
     parser.add_argument(
         "-B",
-        type=_positive_int,
+        type=positive_int,
         nargs="+",
         default=None,
-        help="Number of tokens (default: 1 4 8 16 32)",
+        help="Number of tokens (default: 1 4 8 16 32 4096)",
     )
     parser.add_argument(
         "--kh",
-        type=_positive_int,
+        type=positive_int,
         nargs="+",
         default=None,
         help="Number of KV heads (default: 1 4)",
     )
     parser.add_argument(
         "--qh-per-kh",
-        type=_positive_int,
+        type=positive_int,
         nargs="+",
         default=None,
         help="Query heads per KV head (default: 1 2 4 8 16)",
     )
     parser.add_argument(
         "--d-nope",
-        type=_pow2_int,
+        type=pow2_int,
         default=512,
         help="nope head dim (default: 512)",
     )
     parser.add_argument(
         "--d-pe",
-        type=_pow2_int,
+        type=pow2_int,
         nargs="+",
         default=None,
         help="pe (RoPE) head dim (default: 64 128)",
@@ -177,7 +163,7 @@ def parse_args():
     )
     parser.add_argument(
         "--max-embed-positions",
-        type=_positive_int,
+        type=positive_int,
         default=131072,
         help="Rows in the cos/sin cache (qk_rope_cat only, default: 131072)",
     )
@@ -190,7 +176,7 @@ def parse_args():
     )
     parser.add_argument(
         "--rep",
-        type=_positive_int,
+        type=positive_int,
         default=20,
         help="do_bench_cudagraph measurement budget in ms (default: 20)",
     )
@@ -206,16 +192,16 @@ def parse_args():
         default=False,
         help="Write performance results to CSV file",
     )
-    return parser.parse_args()
+    return parser.parse_args(args=args)
 
 
-def main():
-    args = parse_args()
-    if args.print_vgpr:
+def main(args: list[str] | None = None) -> None:
+    parsed_args = parse_args(args=args)
+    if parsed_args.print_vgpr:
         print("Retrieving VGPR usage for fused_qk_concat kernels...")
-        print_vgpr(lambda: run_benchmark(args), get_caller_name_no_ext())
+        print_vgpr(lambda: run_benchmark(parsed_args), get_caller_name_no_ext())
         return
-    run_benchmark(args)
+    run_benchmark(parsed_args)
 
 
 if __name__ == "__main__":
