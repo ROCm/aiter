@@ -21,4 +21,9 @@ void fused_dsv41_mxfp8_fwd(const aiter_tensor_t& q,
                            const std::optional<aiter_tensor_t>& attn_sink,
                            const std::optional<aiter_tensor_t>& debug_out,
                            float softmax_scale,
-                           bool q_is_rotated);
+                           bool q_is_rotated,
+                           const std::optional<aiter_tensor_t>& cache_scales,
+                           int64_t cache_page_size,
+                           int64_t cache_num_rows,
+                           int64_t cache_data_page_stride,
+                           int64_t cache_scale_page_stride);

@@ -1,32 +1,34 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
+#include "cache_layout.hpp"
 #include "pipeline_common.hpp"
 #include <cstdint>
 
-// Physical ATOM FP8 rows: 512 E4M3FN bytes, then 16 E8M0 group32 scales.
-// Prefix ids are (byte_offset << 1) | 1. Extend ids address BF16 rows.
-template <bool Packed>
+// FP8 sources support legacy tagged addresses and independent paged data/scales.
+// Extend ids address BF16 rows.
+template <bool Packed, int PageSize = 0>
 struct PackedCacheSource64
 {
     const void* pool;
     const void* indices;
     int length;
     int64_t extent; // bytes for packed, rows for BF16
+    Fp8CacheLayout cache{};
 
     __device__ __forceinline__ int64_t row(int i) const
     {
         if(i < 0 || i >= length)
             return -1;
         if constexpr(Packed)
-            return static_cast<const int64_t*>(indices)[i];
+            return cache.row<PageSize>(indices, i);
         else
             return static_cast<const int*>(indices)[i];
     }
     __device__ __forceinline__ bool valid_row(int64_t r) const
     {
         if constexpr(Packed)
-            return r >= 0 && (r & 7) == 1 && extent >= 528 && (r >> 1) <= extent - 528;
+            return cache.valid<PageSize>(r, extent);
         else
             return r >= 0 && r < extent;
     }
@@ -59,9 +61,9 @@ struct PackedCacheSource64
                 opus::vector_t<bf16_t, 8> values{};
                 if(live)
                 {
-                    const uint8_t* src  = static_cast<const uint8_t*>(pool) + (r >> 1);
+                    const uint8_t* src  = cache.data<PageSize>(pool, r);
                     const int d         = (j * 64 + (lane % 8) * 8);
-                    const unsigned code = src[512 + d / 32];
+                    const unsigned code = cache.scale<PageSize>(pool, r)[d / 32];
                     const float scale   = code == 0     ? 0x1p-127f
                                           : code == 255 ? __builtin_nanf("")
                                                         : __uint_as_float(code << 23);
@@ -84,27 +86,28 @@ struct PackedCacheSource64
     }
 };
 
-template <bool Packed, bool BoundedDecode>
+template <bool Packed, bool BoundedDecode, int PageSize = 0>
 struct PackedCacheSource128
 {
     const void* pool;
     const void* indices;
     int length;
     int64_t extent; // bytes for packed, rows for BF16
+    Fp8CacheLayout cache{};
 
     __device__ __forceinline__ int64_t row(int i) const
     {
         if(i < 0 || i >= length)
             return -1;
         if constexpr(Packed)
-            return static_cast<const int64_t*>(indices)[i];
+            return cache.row<PageSize>(indices, i);
         else
             return static_cast<const int*>(indices)[i];
     }
     __device__ __forceinline__ bool valid_row(int64_t r) const
     {
         if constexpr(Packed)
-            return r >= 0 && (r & 7) == 1 && extent >= 528 && (r >> 1) <= extent - 528;
+            return cache.valid<PageSize>(r, extent);
         else
             return r >= 0 && r < extent;
     }
@@ -135,9 +138,9 @@ struct PackedCacheSource128
                 opus::vector_t<bf16_t, 8> values{};
                 if(live)
                 {
-                    const uint8_t* src  = static_cast<const uint8_t*>(pool) + (r >> 1);
+                    const uint8_t* src  = cache.data<PageSize>(pool, r);
                     const int d         = j * 128 + (wave / 4) * 64 + (lane % 8) * 8;
-                    const unsigned code = src[512 + d / 32];
+                    const unsigned code = cache.scale<PageSize>(pool, r)[d / 32];
                     const float scale   = code == 0     ? 0x1p-127f
                                           : code == 255 ? __builtin_nanf("")
                                                         : __uint_as_float(code << 23);
@@ -168,9 +171,9 @@ struct PackedCacheSource128
                 opus::vector_t<bf16_t, 8> values{};
                 if(live)
                 {
-                    const uint8_t* src  = static_cast<const uint8_t*>(pool) + (r >> 1);
+                    const uint8_t* src  = cache.data<PageSize>(pool, r);
                     const int d         = go[j.value];
-                    const unsigned code = src[512 + d / 32];
+                    const unsigned code = cache.scale<PageSize>(pool, r)[d / 32];
                     const float scale   = code == 0     ? 0x1p-127f
                                           : code == 255 ? __builtin_nanf("")
                                                         : __uint_as_float(code << 23);
@@ -195,7 +198,7 @@ struct PackedCacheSource128
 };
 
 // Small-head path: staged FP8 prefetch and shared validity flags.
-template <bool Packed>
+template <bool Packed, int PageSize = 0>
 struct PackedCacheSourceSmall
 {
     static constexpr bool is_packed = Packed;
@@ -203,20 +206,21 @@ struct PackedCacheSourceSmall
     const void* indices;
     int length;
     int64_t extent; // bytes for packed, rows for BF16
+    Fp8CacheLayout cache{};
 
     __device__ __forceinline__ int64_t row(int i) const
     {
         if(i < 0 || i >= length)
             return -1;
         if constexpr(Packed)
-            return static_cast<const int64_t*>(indices)[i];
+            return cache.row<PageSize>(indices, i);
         else
             return static_cast<const int*>(indices)[i];
     }
     __device__ __forceinline__ bool valid_row(int64_t r) const
     {
         if constexpr(Packed)
-            return r >= 0 && (r & 7) == 1 && extent >= 528 && (r >> 1) <= extent - 528;
+            return cache.valid<PageSize>(r, extent);
         else
             return r >= 0 && r < extent;
     }
@@ -245,8 +249,8 @@ struct PackedCacheSourceSmall
         tile_data.live  = valid_row(r);
         if(tile_data.live)
         {
-            const auto* src    = static_cast<const uint8_t*>(pool) + (r >> 1);
-            const auto* scales = reinterpret_cast<const Words4*>(src + 512);
+            const auto* src    = cache.data<PageSize>(pool, r);
+            const auto* scales = reinterpret_cast<const Words4*>(cache.scale<PageSize>(pool, r));
             tile_data.scales   = {scales->x, scales->y, scales->z, scales->w};
             opus::static_for<8>([&](auto j) {
                 const auto* values =
@@ -316,9 +320,9 @@ struct PackedCacheSourceSmall
                 opus::vector_t<bf16_t, 8> values{};
                 if(live)
                 {
-                    const uint8_t* src  = static_cast<const uint8_t*>(pool) + (r >> 1);
+                    const uint8_t* src  = cache.data<PageSize>(pool, r);
                     const int d         = go[j.value];
-                    const unsigned code = src[512 + d / 32];
+                    const unsigned code = cache.scale<PageSize>(pool, r)[d / 32];
                     const float scale   = code == 0     ? 0x1p-127f
                                           : code == 255 ? __builtin_nanf("")
                                                         : __uint_as_float(code << 23);

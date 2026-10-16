@@ -34,6 +34,11 @@ def fused_dsv41_mxfp8_fwd(
     debug_out: torch.Tensor | None,
     softmax_scale: float,
     q_is_rotated: bool,
+    cache_scales: torch.Tensor | None = None,
+    cache_page_size: int = 0,
+    cache_num_rows: int = 0,
+    cache_data_page_stride: int = 0,
+    cache_scale_page_stride: int = 0,
 ) -> None:
     """Write caller-allocated outputs; see :func:`fused_dsv41_mxfp8`."""
 
@@ -47,6 +52,11 @@ def fused_dsv41_mxfp8(
     sin: torch.Tensor,
     positions: torch.Tensor,
     *,
+    cache_scales: torch.Tensor | None = None,
+    cache_page_size: int = 0,
+    cache_num_rows: int = 0,
+    cache_data_page_stride: int = 0,
+    cache_scale_page_stride: int = 0,
     extend_kv: torch.Tensor | None = None,
     extend: torch.Tensor | None = None,
     extend_indptr: torch.Tensor | None = None,
@@ -65,7 +75,18 @@ def fused_dsv41_mxfp8(
     ordinary head-major layout. Set ``q_is_rotated=False`` to apply forward
     RoPE to its final 64 channels. KV rows must already have RoPE applied.
 
-    ``pool`` is contiguous uint8 ``[bytes]`` or ``[bytes,1]``. Each packed
+    Paged mode: set ``cache_page_size=B>0`` and provide contiguous uint8
+    ``cache_scales`` (a flat view or independent allocation), ``cache_num_rows``,
+    and byte strides ``cache_data_page_stride`` / ``cache_scale_page_stride``.
+    ``prefix`` then contains int32 physical slots with the same CSR. For slot s,
+    data is pool[s//B * data_page_stride + s%B * 512]; scales start at
+    cache_scales[s//B * scale_page_stride + s%B * 16]. Bases and page strides
+    must be 4-byte aligned; strides must cover B rows. Negative slots, slots
+    >= cache_num_rows, and rows not fully backed by either view are masked.
+    Same-page partitions use cache_scales=pool[B*512:] and equal page strides.
+    No data/scale copy is performed. This is a single-cache CSR interface.
+
+    Legacy mode (cache_page_size=0): ``pool`` is contiguous uint8 ``[bytes]`` or ``[bytes,1]``. Each packed
     row has 512 E4M3FN bytes followed by 16 finite E8M0 group32 scales.
     ``prefix`` is int64 packed addresses ``(byte_offset << 1) | 1`` with
     int32 CSR ``prefix_indptr[T+1]``. Addresses are relative to pool.data_ptr;
@@ -133,5 +154,10 @@ def fused_dsv41_mxfp8(
             debug_out,
             scale,
             q_is_rotated,
+            cache_scales,
+            cache_page_size,
+            cache_num_rows,
+            cache_data_page_stride,
+            cache_scale_page_stride,
         )
     return out, out_scale, max_logits, lse

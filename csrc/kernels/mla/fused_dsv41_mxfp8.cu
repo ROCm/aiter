@@ -24,7 +24,7 @@ __device__ __forceinline__ float packed_row_max(float x)
 // H64 bounds FP8 decode live ranges and shares CSR validity in LDS.
 // H128 uses eight waves so all heads share one decoded KV tile.
 // Both keep head-major Q and the original output layout.
-template <bool RotateQ>
+template <bool RotateQ, int PageSize>
 __global__ __launch_bounds__(256, 2) void fused_dsv41_mxfp8_kernel_64(FusedDsv41Args a)
 {
 #if defined(__gfx950__)
@@ -61,7 +61,7 @@ __global__ __launch_bounds__(256, 2) void fused_dsv41_mxfp8_kernel_64(FusedDsv41
     int end   = max(begin, min(a.prefix_capacity, a.prefix_indptr[t + 1]));
     if(end > begin)
     {
-        PackedCacheSource64<true> src{a.pool, a.prefix + begin, end - begin, a.pool_bytes};
+        PackedCacheSource64<true, PageSize> src{a.pool, a.prefix_at<PageSize>(begin), end - begin, a.pool_bytes, a.cache};
         packed_prefill_accum64<T>(src,
                                   end - begin,
                                   (end - begin + 31) / 32,
@@ -157,7 +157,7 @@ __global__ __launch_bounds__(256, 2) void fused_dsv41_mxfp8_kernel_64(FusedDsv41
 #endif
 }
 
-template <bool RotateQ, bool LateLoad>
+template <bool RotateQ, bool LateLoad, int PageSize>
 __global__ __launch_bounds__(512, 1) void fused_dsv41_mxfp8_kernel_128(FusedDsv41Args a)
 {
 #if defined(__gfx950__)
@@ -194,8 +194,8 @@ __global__ __launch_bounds__(512, 1) void fused_dsv41_mxfp8_kernel_128(FusedDsv4
     int end   = max(begin, min(a.prefix_capacity, a.prefix_indptr[t + 1]));
     if(end > begin)
     {
-        PackedCacheSource128<true, LateLoad> src{
-            a.pool, a.prefix + begin, end - begin, a.pool_bytes};
+        PackedCacheSource128<true, LateLoad, PageSize> src{
+            a.pool, a.prefix_at<PageSize>(begin), end - begin, a.pool_bytes, a.cache};
         packed_prefill_accum128<T, LateLoad>(src,
                                              end - begin,
                                              (end - begin + 31) / 32,
@@ -294,7 +294,7 @@ __global__ __launch_bounds__(512, 1) void fused_dsv41_mxfp8_kernel_128(FusedDsv4
 // Small-head kernels reuse a common KV panel and compute disjoint PV
 // dimensions. QK repeats for each output partition, as it did for padded heads.
 // No weight/channel permutation or extra launch is required.
-template <bool RotateQ, int Parts = 1>
+template <bool RotateQ, int Parts, int PageSize>
 __global__ __launch_bounds__(256, 2) void fused_dsv41_mxfp8_kernel_small(FusedDsv41Args a)
 {
 #if defined(__gfx950__)
@@ -333,7 +333,7 @@ __global__ __launch_bounds__(256, 2) void fused_dsv41_mxfp8_kernel_small(FusedDs
     int end   = max(begin, min(a.prefix_capacity, a.prefix_indptr[t + 1]));
     if(end > begin)
     {
-        PackedCacheSourceSmall<true> src{a.pool, a.prefix + begin, end - begin, a.pool_bytes};
+        PackedCacheSourceSmall<true, PageSize> src{a.pool, a.prefix_at<PageSize>(begin), end - begin, a.pool_bytes, a.cache};
         packed_prefill_accum_small<T, Parts>(src,
                                              end - begin,
                                              (end - begin + 31) / 32,
@@ -430,7 +430,7 @@ __global__ __launch_bounds__(256, 2) void fused_dsv41_mxfp8_kernel_small(FusedDs
 #endif
 }
 
-template <bool RotateQ>
+template <bool RotateQ, int PageSize>
 __global__ __launch_bounds__(256, 2) void fused_dsv41_mxfp8_decode_64(FusedDsv41Args a)
 {
 #if defined(__gfx950__)
@@ -467,7 +467,7 @@ __global__ __launch_bounds__(256, 2) void fused_dsv41_mxfp8_decode_64(FusedDsv41
     int end   = max(begin, min(a.prefix_capacity, a.prefix_indptr[t + 1]));
     if(end > begin)
     {
-        PackedDecodeSource64<true> src{a.pool, a.prefix + begin, end - begin, a.pool_bytes};
+        PackedDecodeSource64<true, PageSize> src{a.pool, a.prefix_at<PageSize>(begin), end - begin, a.pool_bytes, a.cache};
         packed_decode_accum64<T>(src,
                                  end - begin,
                                  (end - begin + 31) / 32,
@@ -563,7 +563,7 @@ __global__ __launch_bounds__(256, 2) void fused_dsv41_mxfp8_decode_64(FusedDsv41
 #endif
 }
 
-template <bool RotateQ, bool LateLoad>
+template <bool RotateQ, bool LateLoad, int PageSize>
 __global__ __launch_bounds__(512, 1) void fused_dsv41_mxfp8_decode_128(FusedDsv41Args a)
 {
 #if defined(__gfx950__)
@@ -600,8 +600,8 @@ __global__ __launch_bounds__(512, 1) void fused_dsv41_mxfp8_decode_128(FusedDsv4
     int end   = max(begin, min(a.prefix_capacity, a.prefix_indptr[t + 1]));
     if(end > begin)
     {
-        PackedDecodeSource128<true, LateLoad> src{
-            a.pool, a.prefix + begin, end - begin, a.pool_bytes};
+        PackedDecodeSource128<true, LateLoad, PageSize> src{
+            a.pool, a.prefix_at<PageSize>(begin), end - begin, a.pool_bytes, a.cache};
         packed_decode_accum128<T, LateLoad>(src,
                                             end - begin,
                                             (end - begin + 31) / 32,
@@ -697,7 +697,8 @@ __global__ __launch_bounds__(512, 1) void fused_dsv41_mxfp8_decode_128(FusedDsv4
 #endif
 }
 
-hipError_t launch_fused_dsv41_mxfp8(const FusedDsv41Args* a, int rotate_q, hipStream_t stream)
+template <int PageSize>
+hipError_t launch_cache_mode(const FusedDsv41Args* a, int rotate_q, hipStream_t stream)
 {
     if(!a->tokens)
         return hipSuccess;
@@ -709,16 +710,16 @@ hipError_t launch_fused_dsv41_mxfp8(const FusedDsv41Args* a, int rotate_q, hipSt
         if(a->heads == 64)
         {
             if(rotate_q)
-                fused_dsv41_mxfp8_decode_64<true><<<grid, 256, 0, stream>>>(*a);
+                fused_dsv41_mxfp8_decode_64<true, PageSize><<<grid, 256, 0, stream>>>(*a);
             else
-                fused_dsv41_mxfp8_decode_64<false><<<grid, 256, 0, stream>>>(*a);
+                fused_dsv41_mxfp8_decode_64<false, PageSize><<<grid, 256, 0, stream>>>(*a);
         }
         else
         {
             if(rotate_q)
-                fused_dsv41_mxfp8_decode_128<true, false><<<grid, 512, 0, stream>>>(*a);
+                fused_dsv41_mxfp8_decode_128<true, false, PageSize><<<grid, 512, 0, stream>>>(*a);
             else
-                fused_dsv41_mxfp8_decode_128<false, false><<<grid, 512, 0, stream>>>(*a);
+                fused_dsv41_mxfp8_decode_128<false, false, PageSize><<<grid, 512, 0, stream>>>(*a);
         }
         return hipGetLastError();
     }
@@ -726,25 +727,25 @@ hipError_t launch_fused_dsv41_mxfp8(const FusedDsv41Args* a, int rotate_q, hipSt
     {
         dim3 grid(a->tokens);
         if(rotate_q)
-            fused_dsv41_mxfp8_kernel_small<true, 4><<<grid, 256, 0, stream>>>(*a);
+            fused_dsv41_mxfp8_kernel_small<true, 4, PageSize><<<grid, 256, 0, stream>>>(*a);
         else
-            fused_dsv41_mxfp8_kernel_small<false, 4><<<grid, 256, 0, stream>>>(*a);
+            fused_dsv41_mxfp8_kernel_small<false, 4, PageSize><<<grid, 256, 0, stream>>>(*a);
     }
     else if(a->heads == 32)
     {
         dim3 grid(a->tokens);
         if(rotate_q)
-            fused_dsv41_mxfp8_kernel_small<true, 2><<<grid, 256, 0, stream>>>(*a);
+            fused_dsv41_mxfp8_kernel_small<true, 2, PageSize><<<grid, 256, 0, stream>>>(*a);
         else
-            fused_dsv41_mxfp8_kernel_small<false, 2><<<grid, 256, 0, stream>>>(*a);
+            fused_dsv41_mxfp8_kernel_small<false, 2, PageSize><<<grid, 256, 0, stream>>>(*a);
     }
     else if(a->heads == 64)
     {
         dim3 grid(a->tokens);
         if(rotate_q)
-            fused_dsv41_mxfp8_kernel_64<true><<<grid, 256, 0, stream>>>(*a);
+            fused_dsv41_mxfp8_kernel_64<true, PageSize><<<grid, 256, 0, stream>>>(*a);
         else
-            fused_dsv41_mxfp8_kernel_64<false><<<grid, 256, 0, stream>>>(*a);
+            fused_dsv41_mxfp8_kernel_64<false, PageSize><<<grid, 256, 0, stream>>>(*a);
     }
     else
     {
@@ -754,17 +755,28 @@ hipError_t launch_fused_dsv41_mxfp8(const FusedDsv41Args* a, int rotate_q, hipSt
         if(a->tokens >= 2048)
         {
             if(rotate_q)
-                fused_dsv41_mxfp8_kernel_128<true, true><<<grid, 512, 0, stream>>>(*a);
+                fused_dsv41_mxfp8_kernel_128<true, true, PageSize><<<grid, 512, 0, stream>>>(*a);
             else
-                fused_dsv41_mxfp8_kernel_128<false, true><<<grid, 512, 0, stream>>>(*a);
+                fused_dsv41_mxfp8_kernel_128<false, true, PageSize><<<grid, 512, 0, stream>>>(*a);
         }
         else
         {
             if(rotate_q)
-                fused_dsv41_mxfp8_kernel_128<true, false><<<grid, 512, 0, stream>>>(*a);
+                fused_dsv41_mxfp8_kernel_128<true, false, PageSize><<<grid, 512, 0, stream>>>(*a);
             else
-                fused_dsv41_mxfp8_kernel_128<false, false><<<grid, 512, 0, stream>>>(*a);
+                fused_dsv41_mxfp8_kernel_128<false, false, PageSize><<<grid, 512, 0, stream>>>(*a);
         }
     }
     return hipGetLastError();
+}
+
+hipError_t launch_fused_dsv41_mxfp8(const FusedDsv41Args* a, int rotate_q, hipStream_t stream)
+{
+    switch(a->cache.page_size)
+    {
+    case 0: return launch_cache_mode<0>(a, rotate_q, stream);
+    case 32: return launch_cache_mode<32>(a, rotate_q, stream);
+    case 128: return launch_cache_mode<128>(a, rotate_q, stream);
+    default: return launch_cache_mode<-1>(a, rotate_q, stream);
+    }
 }

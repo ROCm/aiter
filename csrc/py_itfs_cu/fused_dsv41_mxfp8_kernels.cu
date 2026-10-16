@@ -4,6 +4,7 @@
 #include "fused_dsv41/kernel_args.hpp"
 #include "fused_dsv41_mxfp8.h"
 #include <climits>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -26,6 +27,15 @@ void check_tensor(const aiter_tensor_t& x,
                 name,
                 ": unaligned pointer");
 }
+// Number of complete rows addressable through a possibly truncated view.
+// Clamp before multiplication so even enormous strides/capacities cannot overflow.
+int backed_rows(int64_t bytes, int64_t stride, int64_t block, int64_t width, int64_t requested)
+{
+    const int64_t pages = bytes / stride;
+    if(pages >= (requested + block - 1) / block)
+        return requested;
+    return std::min(requested, pages * block + std::min(block, (bytes % stride) / width));
+}
 } // namespace
 
 void fused_dsv41_mxfp8_fwd(const aiter_tensor_t& q,
@@ -45,7 +55,12 @@ void fused_dsv41_mxfp8_fwd(const aiter_tensor_t& q,
                            const std::optional<aiter_tensor_t>& attn_sink,
                            const std::optional<aiter_tensor_t>& debug_out,
                            float softmax_scale,
-                           bool q_is_rotated)
+                           bool q_is_rotated,
+                           const std::optional<aiter_tensor_t>& cache_scales,
+                           int64_t cache_page_size,
+                           int64_t cache_num_rows,
+                           int64_t cache_data_page_stride,
+                           int64_t cache_scale_page_stride)
 {
     aiter_detail::AiterThrowGuard errors;
     AITER_CHECK(q.is_gpu() && q.dim() == 3, "q must be a GPU tensor [T,H,512]");
@@ -60,8 +75,26 @@ void fused_dsv41_mxfp8_fwd(const aiter_tensor_t& q,
                     pool.dtype() == AITER_DTYPE_u8 &&
                     reinterpret_cast<uintptr_t>(pool.data_ptr()) % 4 == 0,
                 "pool must be contiguous uint8 and 4-byte aligned on q.device");
-    check_tensor(
-        prefix, "prefix", AITER_DTYPE_i64, {static_cast<int64_t>(prefix.numel())}, device, 8);
+    AITER_CHECK(cache_page_size >= 0 && cache_page_size <= INT_MAX &&
+                    cache_num_rows >= 0 && cache_num_rows <= INT_MAX,
+                "cache page size and row count must fit nonnegative int32");
+    const bool paged = cache_page_size != 0;
+    AITER_CHECK(paged == bool(cache_scales), "paged cache requires cache_scales and page size");
+    if(paged)
+    {
+        check_tensor(*cache_scales, "cache_scales", AITER_DTYPE_u8,
+                     {static_cast<int64_t>(cache_scales->numel())}, device, 4);
+        AITER_CHECK(cache_data_page_stride >= cache_page_size * 512 &&
+                        cache_scale_page_stride >= cache_page_size * 16 &&
+                        cache_data_page_stride % 4 == 0 && cache_scale_page_stride % 4 == 0,
+                    "cache page strides must cover rows and be 4-byte aligned");
+    }
+    else
+        AITER_CHECK(cache_num_rows == 0 && cache_data_page_stride == 0 &&
+                        cache_scale_page_stride == 0,
+                    "cache metadata requires paged mode");
+    check_tensor(prefix, "prefix", paged ? AITER_DTYPE_i32 : AITER_DTYPE_i64,
+                 {static_cast<int64_t>(prefix.numel())}, device, paged ? 4 : 8);
     check_tensor(prefix_indptr, "prefix_indptr", AITER_DTYPE_i32, {t + 1}, device, 4);
     AITER_CHECK(positions.dtype() == AITER_DTYPE_i32 || positions.dtype() == AITER_DTYPE_i64,
                 "positions must be int32 or int64");
@@ -101,7 +134,14 @@ void fused_dsv41_mxfp8_fwd(const aiter_tensor_t& q,
     FusedDsv41Args a{};
     a.q             = static_cast<const B*>(q.data_ptr());
     a.pool          = static_cast<const uint8_t*>(pool.data_ptr());
-    a.prefix        = static_cast<const int64_t*>(prefix.data_ptr());
+    a.prefix        = prefix.data_ptr();
+    a.cache.scales = paged ? static_cast<const uint8_t*>(cache_scales->data_ptr()) : nullptr;
+    a.cache.page_size = cache_page_size;
+    a.cache.num_rows = paged ? std::min(
+        backed_rows(pool.numel(), cache_data_page_stride, cache_page_size, 512, cache_num_rows),
+        backed_rows(cache_scales->numel(), cache_scale_page_stride, cache_page_size, 16, cache_num_rows)) : 0;
+    a.cache.data_page_stride = cache_data_page_stride;
+    a.cache.scale_page_stride = cache_scale_page_stride;
     a.prefix_indptr = static_cast<const int*>(prefix_indptr.data_ptr());
     a.cos           = static_cast<const B*>(cos.data_ptr());
     a.sin           = static_cast<const B*>(sin.data_ptr());

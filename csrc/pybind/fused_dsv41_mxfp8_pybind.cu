@@ -26,5 +26,10 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("attn_sink"),
           py::arg("debug_out"),
           py::arg("softmax_scale"),
-          py::arg("q_is_rotated"));
+          py::arg("q_is_rotated"),
+          py::arg("cache_scales") = py::none(),
+          py::arg("cache_page_size") = 0,
+          py::arg("cache_num_rows") = 0,
+          py::arg("cache_data_page_stride") = 0,
+          py::arg("cache_scale_page_stride") = 0);
 }
