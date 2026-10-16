@@ -14,13 +14,15 @@ from aiter.ops.triton.attention.unified_attention import unified_attention
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 
-def check_case(layout, mode, split):
+def check_case(
+    layout, mode, split, *, page=16, dim=128, heads=16, kv_heads=None,
+    q_lens=None, k_lens=None,
+):
     torch.manual_seed(125)
     device = "cuda"
-    page, dim = 16, 128
-    q_lens = [1, 1] if split else [2, 7, 19]
-    k_lens = [2049, 2071] if split else [39, 145, 273]
-    heads, kv_heads = 16, 1 if split else 16
+    q_lens = q_lens or ([1, 1] if split else [2, 7, 19])
+    k_lens = k_lens or ([2049, 2071] if split else [39, 145, 273])
+    kv_heads = (1 if split else 16) if kv_heads is None else kv_heads
     pages_per_request = [math.ceil(n / page) for n in k_lens]
     num_pages = sum(pages_per_request) + 4
     kv_dtype = torch.bfloat16 if mode == "bf16" else e4m3_dtype
@@ -139,3 +141,20 @@ def test_unified_attention_scale_cache():
 
 if __name__ == "__main__":
     test_unified_attention_scale_cache()
+    # Mixed request lengths and the 255/256 query tile boundary. The broader
+    # layouts/scales retain their original paths; no model-specific dispatch.
+    for layout, mode, page, dim, kv_heads in (
+        ("shuffle", "token", 128, 128, 1),
+        ("shuffle", "token", 128, 128, 16),
+        ("shuffle", "token", 64, 64, 4),
+        ("shuffle", "token", 256, 256, 4),
+        ("nhd", "token", 128, 128, 1),
+        ("flash", "token", 16, 96, 4),
+        ("shuffle", "bf16", 128, 128, 1),
+        ("shuffle", "scalar", 128, 128, 16),
+    ):
+        check_case(
+            layout, mode, False, page=page, dim=dim, kv_heads=kv_heads,
+            q_lens=[1, 17, 255, 256, 513],
+            k_lens=[257, 273, 1023, 1037, 2049],
+        )

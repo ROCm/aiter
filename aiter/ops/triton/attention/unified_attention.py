@@ -389,6 +389,13 @@ def unified_attention(
         per_token_kv_scales=per_token_kv_scales,
     )
 
+    # Use the launch tile, not the provisional BLOCK_M=16 above. Configured
+    # prefill tiles can cover eight times as many queries per workgroup.
+    if not is_2d_gluon_available(params, backend):
+        params = _with_triton_program_count(
+            params, _triton_attention_config(params, "attn_2d")
+        )
+
     # if batch contains a prefill
     if use_2d_kernel(params, backend):
         # The gfx1250 Gluon 2d kernel only handles bf16/fp8 q+kv (with optional
@@ -405,6 +412,11 @@ def unified_attention(
             _unified_attention_2d_triton(params)
     else:
         use_gluon_3d = is_3d_gluon_available(params, backend)
+        if not use_gluon_3d:
+            # Segment count must use the tile of the split kernel as well.
+            params = _with_triton_program_count(
+                params, _triton_attention_config(params, "attn_3d")
+            )
         config = get_unified_attention_config(
             "kv_split", params, backend="gluon" if use_gluon_3d else "triton"
         )
@@ -569,7 +581,43 @@ def is_reduce_gluon_available(params: _UAParams, NUM_SEGMENTS, backend: str):
     return use_gluon and use_gluon_arch
 
 
-def _unified_attention_2d_triton(params: _UAParams):
+def _triton_attention_config(params: _UAParams, op: str):
+    """Resolve the exact query tile shared by dispatch and the kernel launch."""
+    config = get_unified_attention_config(op, params, backend="triton")
+    if (
+        op == "attn_3d"
+        and DEVICE_ARCH == "gfx950"
+        and params.per_token_kv_scales
+        and not params.all_decode
+    ):
+        # Reuse prefill's query tile across KV splits. A decode-sized tile
+        # would undo the reuse that made the 2-D launch under-occupied.
+        prefill = get_unified_attention_config("attn_2d", params, backend="triton")
+        config["BLOCK_M"] = prefill["BLOCK_M"]
+    config["BLOCK_M"] = max(
+        config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
+    )
+    config["BLOCK_Q"] = config["BLOCK_M"] // params.num_queries_per_kv
+    if op == "attn_2d":
+        if params.shuffled_kv_cache:
+            config["TILE_SIZE"] = params.block_size
+        if params.per_token_kv_scales:
+            config["SPLIT_UNMASKED_LOOP"] = False
+    return config
+
+
+def _with_triton_program_count(params: _UAParams, config: dict):
+    blocks = (
+        params.num_seqs
+        if params.all_decode
+        else params.num_tokens // config["BLOCK_Q"] + params.num_seqs
+    )
+    return params._replace(
+        total_num_q_blocks=blocks, num_2d_prgms=blocks * params.num_kv_heads
+    )
+
+
+def _unified_attention_2d_triton(params: _UAParams, config: dict | None = None):
     if params.shuffled_kv_cache and (
         params.q_dtype == e4m3_dtype and params.kv_cache_dtype == e4m3_dtype
     ):
@@ -577,17 +625,7 @@ def _unified_attention_2d_triton(params: _UAParams):
             "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
         )
 
-    config = get_unified_attention_config("attn_2d", params, backend="triton")
-    config["BLOCK_M"] = max(
-        config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
-    )
-    config["BLOCK_Q"] = config["BLOCK_M"] // params.num_queries_per_kv
-    assert config["BLOCK_Q"] >= 1
-    if params.shuffled_kv_cache:
-        config["TILE_SIZE"] = params.block_size
-    if params.per_token_kv_scales:
-        # The unmasked fast loop has scalar-only dequantization.
-        config["SPLIT_UNMASKED_LOOP"] = False
+    config = _triton_attention_config(params, "attn_2d") if config is None else config
     if params.all_decode:
         total_num_q_blocks = params.num_seqs
     else:
@@ -677,13 +715,9 @@ def _unified_attention_3d_triton(
     segm_expsum,
     NUM_SEGMENTS,
     TILE_SIZE,
+    config: dict | None = None,
 ):
-    config = get_unified_attention_config("attn_3d", params, backend="triton")
-    config["BLOCK_M"] = max(
-        config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
-    )
-    config["BLOCK_Q"] = config["BLOCK_M"] // params.num_queries_per_kv
-    assert config["BLOCK_Q"] >= 1
+    config = _triton_attention_config(params, "attn_3d") if config is None else config
 
     if params.all_decode:
         total_num_q_blocks = params.num_seqs

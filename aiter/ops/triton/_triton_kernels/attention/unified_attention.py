@@ -345,7 +345,7 @@ def kernel_unified_attention_2d(
                 other=0.0,
                 cache_modifier=KV_cache_modifier,
             )
-            K = K_load.to(Q.dtype)
+            K = K_load if PER_TOKEN_KV_SCALES else K_load.to(Q.dtype)
 
             V_load = tl.load(
                 value_cache_ptr + v_offset,
@@ -353,7 +353,7 @@ def kernel_unified_attention_2d(
                 other=0.0,
                 cache_modifier=KV_cache_modifier,
             )
-            V = V_load.to(Q.dtype)
+            V = V_load if PER_TOKEN_KV_SCALES else V_load.to(Q.dtype)
 
             S = qk_scale * tl.dot(Q, K)
 
@@ -441,7 +441,7 @@ def kernel_unified_attention_2d(
             cache_modifier=KV_cache_modifier,
         )
 
-        K = K_load.to(Q.dtype)
+        K = K_load if PER_TOKEN_KV_SCALES else K_load.to(Q.dtype)
         if SHUFFLED_KV_CACHE:
             K = (
                 K.reshape(
@@ -462,7 +462,7 @@ def kernel_unified_attention_2d(
             cache_modifier=KV_cache_modifier,
         )
 
-        V = V_load.to(Q.dtype)
+        V = V_load if PER_TOKEN_KV_SCALES else V_load.to(Q.dtype)
         if SHUFFLED_KV_CACHE and V_CACHE_NHD:
             V = V.reshape(HEAD_SIZE_PADDED, TILE_SIZE).trans(1, 0)
         elif SHUFFLED_KV_CACHE:
@@ -476,20 +476,16 @@ def kernel_unified_attention_2d(
                 .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
             )
 
-        if SHUFFLED_KV_CACHE:
-            # The last physical page can contain unwritten FP8 NaNs. A zero
-            # attention probability does not make 0 * NaN safe in the PV dot.
-            V = tl.where((seq_offset < seq_len)[:, None], V, 0.0)
-
         if PER_TOKEN_KV_SCALES:
             # Scale lookup follows the same physical page map as the KV load,
             # including shared prefix pages and a partially filled final page.
             valid_scale = seq_offset < seq_len
-            scale_page = tl.load(
-                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE,
-                mask=valid_scale,
-                other=0,
-            ).to(tl.int64)
+            # The KV loader already resolved these physical pages. A shuffled
+            # tile is exactly one page; the plain layout has a page per token.
+            if SHUFFLED_KV_CACHE:
+                scale_page = physical_block_idx_shfl
+            else:
+                scale_page = physical_block_idx
             scale_slot = seq_offset % BLOCK_SIZE
             ks = tl.load(
                 k_descale_ptr
@@ -509,6 +505,10 @@ def kernel_unified_attention_2d(
             )
             K = (K.to(tl.float32) * ks[None, :]).to(Q.dtype)
             V = (V.to(tl.float32) * vs[:, None]).to(Q.dtype)
+
+        if SHUFFLED_KV_CACHE:
+            # Zero probability does not make 0 * NaN safe in the PV dot.
+            V = tl.where((seq_offset < seq_len)[:, None], V, 0.0)
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
@@ -899,7 +899,7 @@ def kernel_unified_attention_3d(
             cache_modifier=KV_cache_modifier,
         )
 
-        K = K_load.to(Q.dtype)
+        K = K_load if PER_TOKEN_KV_SCALES else K_load.to(Q.dtype)
         if SHUFFLED_KV_CACHE:
             K = (
                 K.reshape(
@@ -920,7 +920,7 @@ def kernel_unified_attention_3d(
             cache_modifier=KV_cache_modifier,
         )
 
-        V = V_load.to(Q.dtype)
+        V = V_load if PER_TOKEN_KV_SCALES else V_load.to(Q.dtype)
         if SHUFFLED_KV_CACHE and V_CACHE_NHD:
             V = V.reshape(HEAD_SIZE_PADDED, TILE_SIZE).trans(1, 0)
         elif SHUFFLED_KV_CACHE:
@@ -934,20 +934,16 @@ def kernel_unified_attention_3d(
                 .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
             )
 
-        if SHUFFLED_KV_CACHE:
-            # The last physical page can contain unwritten FP8 NaNs. A zero
-            # attention probability does not make 0 * NaN safe in the PV dot.
-            V = tl.where((seq_offset < seq_len)[:, None], V, 0.0)
-
         if PER_TOKEN_KV_SCALES:
             # Scale lookup follows the same physical page map as the KV load,
             # including shared prefix pages and a partially filled final page.
             valid_scale = seq_offset < seq_len
-            scale_page = tl.load(
-                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE,
-                mask=valid_scale,
-                other=0,
-            ).to(tl.int64)
+            # The KV loader already resolved these physical pages. A shuffled
+            # tile is exactly one page; the plain layout has a page per token.
+            if SHUFFLED_KV_CACHE:
+                scale_page = physical_block_idx_shfl
+            else:
+                scale_page = physical_block_idx
             scale_slot = seq_offset % BLOCK_SIZE
             ks = tl.load(
                 k_descale_ptr
@@ -967,6 +963,10 @@ def kernel_unified_attention_3d(
             )
             K = (K.to(tl.float32) * ks[None, :]).to(Q.dtype)
             V = (V.to(tl.float32) * vs[:, None]).to(Q.dtype)
+
+        if SHUFFLED_KV_CACHE:
+            # Zero probability does not make 0 * NaN safe in the PV dot.
+            V = tl.where((seq_offset < seq_len)[:, None], V, 0.0)
 
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
