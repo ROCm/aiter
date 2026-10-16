@@ -454,11 +454,13 @@ __global__ void add_rmsnorm_n64_vec_kernel(
     const vec_i out_values = __builtin_convertvector(values * inv_rms * weight_f, vec_i);
     if (valid)
     {
-        *reinterpret_cast<vec_i*>(
-            residual_out + row * static_cast<int64_t>(residual_out_stride) + col) =
-            residual_out_values;
-        *reinterpret_cast<vec_i*>(out + row * static_cast<int64_t>(out_stride) + col) =
-            out_values;
+        __builtin_nontemporal_store(
+            residual_out_values,
+            reinterpret_cast<vec_i*>(
+                residual_out + row * static_cast<int64_t>(residual_out_stride) + col));
+        __builtin_nontemporal_store(
+            out_values,
+            reinterpret_cast<vec_i*>(out + row * static_cast<int64_t>(out_stride) + col));
     }
 }
 
