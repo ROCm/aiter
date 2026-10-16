@@ -53,6 +53,25 @@ def is_fx_set_register_available():
     return callable(getattr(fx, "set_register", None))
 
 
+def _is_schedule_vgpr_available():
+    """Return whether this FlyDSL build has rocdl.schedule_vgpr."""
+    return hasattr(rocdl, "schedule_vgpr") or hasattr(rocdl, "ScheduleVGPR")
+
+
+def schedule_vgpr_rmem(rmem, regnum, soft=False):
+    """Hint an rmem_tensor to a specific starting VGPR.
+
+    Loads the current value, wraps it with rocdl.schedule_vgpr, and stores back.
+    Requires the custom LLVM build with B512 pseudo support for wide vectors.
+    """
+    from flydsl.expr.typing import Vector as _Vec
+
+    val = rmem.load()
+    val_ir = val.ir_value() if hasattr(val, "ir_value") else val
+    hinted = rocdl.schedule_vgpr(val_ir, regnum=regnum, soft=soft)
+    rmem.store(_Vec(hinted))
+
+
 TDM_DESCRIPTOR_VERSION = 1
 MMA_GROUP = int(os.environ.get("AITER_FLYDSL_MMA_GROUP", "10"))
 MMA_FIRST_GROUP = int(os.environ.get("AITER_FLYDSL_MMA_FIRST_GROUP", MMA_GROUP))
@@ -85,8 +104,10 @@ if DISABLE_CLUSTER_SYNC not in (0, 1):
     raise ValueError("AITER_FLYDSL_DISABLE_CLUSTER_SYNC must be 0 or 1")
 
 SUPPORT_EXPLICIT_VGPR_PARTITION = bool(
-    EXPLICIT_VGPR_PARTITION and is_fx_set_register_available()
+    EXPLICIT_VGPR_PARTITION
+    and (is_fx_set_register_available() or _is_schedule_vgpr_available())
 )
+_USE_SCHEDULE_VGPR = SUPPORT_EXPLICIT_VGPR_PARTITION and _is_schedule_vgpr_available()
 
 # MXFP8 combine wire format (``ep_quant_bits``): a slot holds two planes, N
 # payload bytes followed by N/32 e8m0 scale bytes. The block is 32 elements,
@@ -1090,14 +1111,18 @@ def launch_gemm_a8w4_tdm(
         ]
         if const_expr(SUPPORT_EXPLICIT_VGPR_PARTITION):
             assert n_acc * WMMA_VECTOR_DWORDS <= 512
-            for idx in range_constexpr(n_acc):
-                fx.set_register(
-                    c_frags[idx],
-                    register_class=fx.rocdl.VGPR,
-                    start=512 + idx * WMMA_VECTOR_DWORDS,
-                )
+            if const_expr(not _USE_SCHEDULE_VGPR):
+                for idx in range_constexpr(n_acc):
+                    fx.set_register(
+                        c_frags[idx],
+                        register_class=fx.rocdl.VGPR,
+                        start=512 + idx * WMMA_VECTOR_DWORDS,
+                    )
         for cf in c_frags:
             cf.store(fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32)))
+        if const_expr(_USE_SCHEDULE_VGPR):
+            for idx in range_constexpr(n_acc):
+                schedule_vgpr_rmem(c_frags[idx], regnum=512 + idx * WMMA_VECTOR_DWORDS)
 
         front_wm = (wmma_m_rep + 1) // 2
         FRONT = list(range(front_wm))
@@ -1120,18 +1145,21 @@ def launch_gemm_a8w4_tdm(
                     if const_expr(a_is_fp4):
                         wt_value = wt[wn].load()
                         act_value = act[i].load()
-                        c_frags[idx].store(
-                            rocdl.wmma_scale_f32_32x16x128_f4(
-                                T.vec(16, T.f32),
-                                wt_value.ir_value(),
-                                act_value.ir_value(),
-                                c_frags[idx].load().ir_value(),
-                                scale_a,
-                                scale_b,
-                                scaleAType=0,
-                                scaleBType=wm % 2,
-                            )
+                        wmma_result = rocdl.wmma_scale_f32_32x16x128_f4(
+                            T.vec(16, T.f32),
+                            wt_value.ir_value(),
+                            act_value.ir_value(),
+                            c_frags[idx].load().ir_value(),
+                            scale_a,
+                            scale_b,
+                            scaleAType=0,
+                            scaleBType=wm % 2,
                         )
+                        if const_expr(_USE_SCHEDULE_VGPR):
+                            wmma_result = rocdl.schedule_vgpr(
+                                wmma_result, regnum=512 + idx * WMMA_VECTOR_DWORDS,
+                            )
+                        c_frags[idx].store(wmma_result)
                     else:
                         fx.gemm(
                             wmma_atoms[wn % 2][wm % 2],
@@ -1151,7 +1179,7 @@ def launch_gemm_a8w4_tdm(
         STATE_DS = wmma_m_rep * DS_A + BS_DS
 
         SA_WIDTH, SB_WIDTH = max(2, sa_pairs), max(2, sb_pairs)
-        RmemSlot = namedtuple("RmemSlot", "a b sa sb")
+        RmemSlot = namedtuple("RmemSlot", "a b sa sb vgpr_base")
 
         def make_rmem_slot(slot_idx):
             """Registers holding one k128 of A/B/scales, like c_frags.
@@ -1172,24 +1200,38 @@ def launch_gemm_a8w4_tdm(
             if const_expr(SUPPORT_EXPLICIT_VGPR_PARTITION):
                 slot_width = wmma_m_rep * ACT_NDW + wmma_n_rep * WMMA_VECTOR_DWORDS
                 assert slot_width <= 128
-                reg = 256 + slot_idx * 128
-                for wm in range_constexpr(wmma_m_rep):
-                    fx.set_register(a[wm], register_class=fx.rocdl.VGPR, start=reg)
-                    reg += ACT_NDW
-                for wn in range_constexpr(wmma_n_rep):
-                    fx.set_register(b[wn], register_class=fx.rocdl.VGPR, start=reg)
-                    reg += WMMA_VECTOR_DWORDS
-                assert reg <= 256 + (slot_idx + 1) * 128
+                if const_expr(not _USE_SCHEDULE_VGPR):
+                    reg = 256 + slot_idx * 128
+                    for wm in range_constexpr(wmma_m_rep):
+                        fx.set_register(a[wm], register_class=fx.rocdl.VGPR, start=reg)
+                        reg += ACT_NDW
+                    for wn in range_constexpr(wmma_n_rep):
+                        fx.set_register(b[wn], register_class=fx.rocdl.VGPR, start=reg)
+                        reg += WMMA_VECTOR_DWORDS
+                    assert reg <= 256 + (slot_idx + 1) * 128
             return RmemSlot(
                 a=a,
                 b=b,
                 sa=fx.make_rmem_tensor(SA_WIDTH, fx.Int32),
                 sb=fx.make_rmem_tensor(SB_WIDTH, fx.Int32),
+                vgpr_base=256 + slot_idx * 128,
             )
 
         # Two slots: the k-tile loop is a runtime scf.for, so the tile boundary
         # cannot carry a Python value, and a prefetch needs a slot no WMMA reads.
         rmem_slots = [make_rmem_slot(i) for i in range_constexpr(2)]
+
+        def _hint_slot_ab(slot):
+            """Apply schedule_vgpr hints to A/B operands after LDS load."""
+            if const_expr(not _USE_SCHEDULE_VGPR):
+                return
+            reg = slot.vgpr_base
+            for wm in range_constexpr(wmma_m_rep):
+                schedule_vgpr_rmem(slot.a[wm], regnum=reg)
+                reg += ACT_NDW
+            for wn in range_constexpr(wmma_n_rep):
+                schedule_vgpr_rmem(slot.b[wn], regnum=reg)
+                reg += WMMA_VECTOR_DWORDS
 
         def load_lds_data(slot, lds_addr, ksl, kt, interleaved_lds_load=False):
             """Load one k128 from precomputed LDS bases into ``slot``."""
@@ -1228,6 +1270,7 @@ def launch_gemm_a8w4_tdm(
                         slot.a[i].store(load_a(lds_addr.a, i, ksl))
                     if const_expr(i < wmma_n_rep):
                         slot.b[i].store(load_b(lds_addr.b, i, ksl))
+            _hint_slot_ab(slot)
 
         def k_step(
             cur_rmem,
