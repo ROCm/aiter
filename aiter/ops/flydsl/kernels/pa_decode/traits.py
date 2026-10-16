@@ -52,19 +52,17 @@ def d256_pipe(
     query_group_size,
     sliding_window,
 ) -> bool:
-    """gfx950 FP8 head 256, page 64, plain V, per-tensor, dense, <= two M-tiles.
+    """gfx950 FP8 head 256, page 64, <= two M-tiles.
 
     Uniform query length; rows = query_length * query_group_size fit two
-    16-row M-tiles that share one K/V stream.
+    16-row M-tiles that share one K/V stream. Packed caches support both V
+    layouts, per-tensor/per-token scales and causal sliding windows.
     """
     return (
         "gfx95" in arch
         and kv_dtype == "fp8"
         and head_dim == 256
         and block_size == 64
-        and not trans_v
-        and not per_token_kv
-        and sliding_window == 0
         and query_length * query_group_size <= D256_PIPE_MAX_ROWS
     )
 
@@ -107,12 +105,21 @@ def stage_page_capacity(
     max_context_length,
     block_size,
     from_table_width=False,
+    sliding_window=0,
+    query_length=1,
 ) -> int:
     """Page ids to stage per task, or 0 to keep table reads in the tile loop.
 
     The warning fires only when the block-table width set the bound. A caller
     who passed ``max_context_length`` already chose that bound.
     """
+    if sliding_window > 0:
+        # Planning apportions the visible MTP window union, rather than the
+        # whole context. Its unaligned tile bound also bounds staged ids.
+        window_tiles = (
+            sliding_window + query_length - 2 + KV_COMPUTE_BLOCK - 1
+        ) // KV_COMPUTE_BLOCK + 1
+        max_context_length = min(max_context_length, window_tiles * KV_COMPUTE_BLOCK)
     tiles = max_tiles_per_task(
         num_seqs, work_capacity, num_partitions, max_context_length
     )
@@ -313,7 +320,7 @@ class PaDecodeSchedule:
             query_group_size,
             sliding_window,
         )
-        if nhd_layout and not D256_PIPE:
+        if nhd_layout and (not D256_PIPE or per_token_kv or sliding_window > 0):
             raise NotImplementedError(
                 "NHD pa_decode is the gfx950 FP8 head-256 page-64 per-tensor "
                 "dense decode path for uniform query lengths of at most 32 "
@@ -332,6 +339,8 @@ class PaDecodeSchedule:
                 max_context_length,
                 block_size,
                 from_table_width,
+                sliding_window,
+                query_length,
             )
         # Two V buffers overlap the next tile's DMA with PV. One buffer is
         # faster only when the grid is wider than the CU count and two
@@ -630,12 +639,12 @@ class PaDecodeTraits:
         )
         TUNE_PAGE128 = block_size == 128 and (PER_TOKEN_M1 or TUNED_SCALAR)
         PAGE16_VPIPE = prefetch_v and block_size == 16
-        REUSE_KV_PAGES = PER_TOKEN_M1
+        REUSE_KV_PAGES = PER_TOKEN_M1 or (D256_PIPE and per_token_kv)
         SCALES_BEFORE_CURRENT_V = (
             WIDE_FP8_MFMA and PER_TOKEN_M1 and (block_size == 16 or not trans_v)
         )
         # Scale before masking to avoid -inf * 0 and a second mask.
-        M1_SCALE_BEFORE_MASK = REUSE_KV_PAGES or is_bf16_kv
+        M1_SCALE_BEFORE_MASK = REUSE_KV_PAGES or D256_PIPE or is_bf16_kv
         # The d256 pipe gives each M-tile a private P and Lsum slot so one barrier
         # publishes all of them.
         P_BUFFERS = (
