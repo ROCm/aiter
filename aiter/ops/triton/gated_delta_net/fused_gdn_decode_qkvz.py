@@ -57,6 +57,12 @@ _LARGE_BATCH = 128
 _CONV_WIDTH = 4
 
 
+def _uses_ratio_generic_kernel(ratio: int, flat: bool, has_qsl: bool) -> bool:
+    """Ratio 2 in the interleaved layout without padding runs the generated pair
+    kernels; every other call runs the ratio-generic kernel."""
+    return ratio != 2 or flat or has_qsl
+
+
 def _arch_supported() -> tuple[bool, str]:
     """gfx950 probe, guarded so architecture detection never raises at import.
 
@@ -145,8 +151,13 @@ def fused_gdn_decode_qkvz_supported(
         dt_bias,
         norm_weight,
     )
-    if not all(isinstance(t, torch.Tensor) and t.is_cuda for t in tensors):
-        return False, "every launch operand must be a CUDA tensor"
+    device = projected_qkvz.device
+    optional = tuple(t for t in (query_start_loc, out) if t is not None)
+    if not all(
+        isinstance(t, torch.Tensor) and t.is_cuda and t.device == device
+        for t in tensors + optional
+    ):
+        return False, "every launch operand must be a CUDA tensor on one device"
     if ssm_state.ndim != 4 or conv_state.ndim != 3:
         return (
             False,
@@ -276,18 +287,14 @@ def fused_gdn_decode_qkvz_supported(
             )
         if not query_start_loc.is_contiguous():
             return False, "query_start_loc must be contiguous"
-        if v_heads // k_heads == 2 and qkvz_layout == "interleaved":
-            return False, (
-                "query_start_loc padding is only supported by the ratio-generic "
-                "kernel (num_v_heads / num_k_heads != 2 or the flat layout)"
-            )
-    if not (conv_state.is_contiguous() and ssm_state.is_contiguous()) and (
-        v_heads // k_heads == 2 and qkvz_layout == "interleaved"
-    ):
+    generic = _uses_ratio_generic_kernel(
+        v_heads // k_heads, qkvz_layout == "flat", query_start_loc is not None
+    )
+    if not generic and not (conv_state.is_contiguous() and ssm_state.is_contiguous()):
         return False, (
             "strided state pools are only supported by the ratio-generic kernel "
-            f"(num_v_heads / num_k_heads != 2 or the flat layout); got conv "
-            f"strides {conv_state.stride()}, ssm strides {ssm_state.stride()}"
+            "(num_v_heads / num_k_heads != 2, the flat layout or query_start_loc); "
+            f"got conv strides {conv_state.stride()}, ssm strides {ssm_state.stride()}"
         )
 
     if quant_dtype is not None and quant_dtype not in _FP8_QUANT_MAX:
@@ -428,7 +435,7 @@ def fused_gdn_decode_qkvz(
         k_heads,
         v_heads,
     )
-    if ratio != 2 or flat or query_start_loc is not None:
+    if _uses_ratio_generic_kernel(ratio, flat, query_start_loc is not None):
         # Ratio-generic kernel at every batch size; the bands below hardcode
         # ratio 2, the interleaved layout and dense pools.
         from aiter.ops.triton._gluon_kernels.gfx950.gated_delta_net.fused_gdn_decode_qkvz_ratio import (
