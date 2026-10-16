@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""AOT profile bundles for MegaMoE A8W4 deployment shapes."""
+"""AOT profile bundles for MegaMoE A8W4 and A4W4 deployment shapes."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
 )
 
 DEFAULT_MTPRS = (8192, 16384, 32768)
-DEFAULT_QUANTS = ("a8w4",)
+DEFAULT_QUANTS = ("a8w4", "a4w4")
 # DeepSeek-V4-Pro deployment profiles: r0, r32, and r64 redundant experts.
 # Keep all three in the default AOT job set so the service never falls back to
 # an online compile merely because EPLB changes the physical expert count.
@@ -235,6 +235,7 @@ def _compile_stage1(
                 num_prepare_cu=prepare_blocks,
                 num_quant_cu=num_quant_cu,
                 quant_cu_capacity=NUM_CU,
+                quant_mode=a_dtype,
                 model_dim=model_dim,
                 payload_chunk_rows=config.payload_chunk_rows,
                 tile_state_stride=tile_state_stride,
@@ -245,9 +246,11 @@ def _compile_stage1(
     # the validation/per-stage benchmark invokes it to isolate Stage1 timing.
     quant_rows = 2
     quant_groups = quant_rows * scale_dim
+    output_dtype = torch.uint8 if a_dtype == "fp4" else torch.float8_e4m3fn
+    output_dim = model_dim // 2 if a_dtype == "fp4" else model_dim
     _get_launcher(model_dim, a_dtype)(
         _tensor((quant_rows, model_dim), torch.bfloat16),
-        _tensor((quant_rows, model_dim), torch.float8_e4m3fn),
+        _tensor((quant_rows, output_dim), output_dtype),
         _tensor((quant_rows, scale_dim), torch.uint8),
         quant_rows,
         (quant_groups + 63) // 64,
@@ -272,16 +275,22 @@ def _compile_stage1(
         act=act,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        a_dtype=a_dtype,
+        out_dtype=a_dtype,
     )
     launch(
-        _tensor((1, inter_dim), torch.float8_e4m3fn),
-        _tensor((1, model_dim), torch.float8_e4m3fn),
+        _tensor((1, inter_dim // 2 if a_dtype == "fp4" else inter_dim), output_dtype),
+        _tensor((1, output_dim), output_dtype),
         # Keep every non-unit dimension larger than one so FlyDSL records the
         # same contiguous-stride signature as the runtime weight tensor.  An
         # all-ones placeholder makes the first dimension look unit-strided and
         # produces an AOT cache key that the real tensor can never reuse.
         _tensor((2, 2, 2), torch.uint8),
-        _tensor((1, model_dim // 128), torch.int32),
+        (
+            _tensor((1, model_dim // 32), torch.uint8)
+            if a_dtype == "fp4"
+            else _tensor((1, model_dim // 128), torch.int32)
+        ),
         _tensor((2, 2), torch.uint8),
         _tensor((1,), torch.int32),
         _tensor((1,), torch.int32),
@@ -484,9 +493,10 @@ def compile_one_config(**job):
         act = job.get("act", "silu")
         situ_beta = job.get("situ_beta", 1.0)
         situ_linear_beta = job.get("situ_linear_beta", 1.0)
-        a_dtype = "fp8"
+        a_dtype = "fp4" if job["quant"] == "a4w4" else "fp8"
         plan = build_mega_moe_bundle_plan(
             job["mtpr"],
+            a_dtype=a_dtype,
             experts_per_rank=job["experts_per_rank"],
             model_dim=model_dim,
             inter_dim=inter_dim,
