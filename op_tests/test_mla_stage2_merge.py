@@ -24,6 +24,10 @@ Two candidates:
     (2-4), equal/worse for large N (register pressure). Kept here as a validated
     alternative; NOT wired into production (the absolute win is <~1.3us on a
     ~1ms decode and it would need a second kernel + a per-N dispatch).
+  ``dchunk`` -- ``_fwd_kernel_stage2_dchunk``, what ``mla_decode_fwd_v4_nm`` runs
+    when num_seqs * num_heads <= 2048: ``vec`` with Lv split across a third grid
+    axis, so the tile shrinks to [MAX_KV_SPLITS, D_CHUNK] (no register pressure
+    at large N) and the CTA count grows by Lv / D_CHUNK.
 """
 
 import argparse
@@ -37,7 +41,7 @@ import triton.language as tl
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.mla import _fwd_kernel_stage2_asm
+from aiter.mla import _fwd_kernel_stage2_asm, _launch_stage2_dchunk
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -192,6 +196,7 @@ def test_stage2_merge(
 
     out_base = torch.empty((T, H, Lv), dtype=out_dtype)
     out_vec = torch.empty((T, H, Lv), dtype=out_dtype)
+    out_dchunk = torch.empty((T, H, Lv), dtype=out_dtype)
     max_kv_splits = 1 << (N - 1).bit_length()  # next_power_of_2(N)
 
     ref = run_torch(logits, attn_lse, num_valid, out_dtype)
@@ -257,6 +262,23 @@ def test_stage2_merge(
         )
         return out_vec
 
+    def run_dchunk():
+        _launch_stage2_dchunk(
+            logits,
+            attn_lse,
+            out_dchunk,
+            qo_indptr,
+            kv_indptr,
+            num_kv_splits_indptr,
+            valid_split_count,
+            T,
+            H,
+            N,
+            Lv,
+            MGC,
+        )
+        return out_dchunk
+
     # Merge reads N partial (V + lse) per (token, head), writes one V row.
     read_bytes = T * H * N * (Lv + 1) * 4
     write_bytes = T * H * Lv * out_base.element_size()
@@ -264,7 +286,7 @@ def test_stage2_merge(
     ref_fp32 = ref.to(dtypes.fp32)
 
     ret = {"gfx": get_gfx(), "warps": warps, "stages": stages, "wpe": wpe}
-    for name, fn in (("base", run_base), ("vec", run_vec)):
+    for name, fn in (("base", run_base), ("vec", run_vec), ("dchunk", run_dchunk)):
         o, us = run_perftest(fn)
         err = checkAllclose(
             ref_fp32,
