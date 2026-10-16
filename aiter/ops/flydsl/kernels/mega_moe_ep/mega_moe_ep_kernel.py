@@ -23,12 +23,21 @@ from __future__ import annotations
 
 import functools
 import inspect
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 
-from .common import i32, lds_st, uni
+from .common import bst, i32, lds_st, now, rsrc, uni
+
+# Device-phase profiling: when EP_PROF_DEV=1, each CTA's tid0 stamps now() into a
+# per-CTA global `dbg` buffer at the kernel phase boundaries (entry / post-barrier_init
+# / post-roles / post-combine_final). Off by default (zero runtime cost -- the writes
+# are compile-time gated and the `dbg` arg is just an unused pointer).
+_PROF = bool(int(os.environ.get("EP_PROF_DEV", "0")))
+_PROF_SLOTS = 9  # 0:entry 1:post-barrier_init 2:post-roles 3:post-combine_final
+#   4:post-dispatch_wait 5:post-dyn_plan 6:unit-count 7:post-gemm1 8:post-gemm2 (schedule)
 from .communication import build_communication
 from .gemm import build_gemm
 from .mega_moe_ep_config import (
@@ -155,6 +164,7 @@ def compile_mega_moe_ep(
         inters: fx.Int64,
         gout: fx.Int64,
         rowmap: fx.Int64,
+        dbg: fx.Int64,
         rank: fx.Int32,
         npes: fx.Int32,
         epr: fx.Int32,
@@ -177,20 +187,37 @@ def compile_mega_moe_ep(
         a["nrecv"] = (
             npes * mtpr * i32(TOPK)
         )  # dynamic-planner scan bound (indexed recv)
+
+        def _ts(slot):
+            if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
+                if tid == i32(0):
+                    bst(
+                        now(),
+                        rsrc(dbg),
+                        (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(slot))
+                        * i32(8),
+                        0,
+                        0,
+                    )
+
         init_lds(L, tid, a)
         gpu.barrier()
+        _ts(0)
         # recv_le is sentinel'd on the host on THIS stream before the launch (stream
         # order); barrier_init is the cross-rank wait so a peer only dispatches once every
         # rank's fill is done -- no host sync/barrier, so forward() stays a stream pipeline.
         barrier_init(L, tid, a)
+        _ts(1)
         roles(L, tid, a, epoch)
+        _ts(2)
         gpu.barrier()
         combine_final(L, tid, a)
+        _ts(3)
 
     kargs = list(inspect.signature(mega_moe_ep_kernel).parameters)
-    mega_moe_ep_kernel = flyc.kernel(name=name, known_block_size=[NTT, 1, 1])(
-        mega_moe_ep_kernel
-    )
+    mega_moe_ep_kernel = flyc.kernel(
+        name=name + ("_prof" if _PROF else ""), known_block_size=[NTT, 1, 1]
+    )(mega_moe_ep_kernel)
 
     def launch(
         w1: fx.Int64,
@@ -221,6 +248,7 @@ def compile_mega_moe_ep(
         inters: fx.Int64,
         gout: fx.Int64,
         rowmap: fx.Int64,
+        dbg: fx.Int64,
         rank: fx.Int32,
         npes: fx.Int32,
         epr: fx.Int32,

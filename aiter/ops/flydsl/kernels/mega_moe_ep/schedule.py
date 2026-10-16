@@ -21,6 +21,8 @@ planner only needs the per-expert row counts the route scan already wrote to ``L
 
 from __future__ import annotations
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import gpu, range_constexpr, rocdl
@@ -31,6 +33,7 @@ from .common import (
     ACQ_REL,
     _ctpop,
     bld,
+    bst,
     i32,
     lds_atomic_add,
     lds_atomic_or,
@@ -38,10 +41,16 @@ from .common import (
     lds_ld_i32,
     lds_st,
     lds_st_rel,
+    now,
     rsrc,
     wait_lgkm0,
     wave_rank,
 )
+
+# Device-phase profiling (matches mega_moe_ep_kernel._PROF): slots 4,5 are stamped in
+# compute_units (post dispatch_wait / post dyn_plan) to split the `roles` phase.
+_PROF = bool(int(os.environ.get("EP_PROF_DEV", "0")))
+_PROF_SLOTS = 9  # +7 post-gemm1, +8 post-gemm2 (per-unit; <=1 unit/CTA)
 from .mega_moe_ep_config import (
     C_BARCNT,
     C_BARGEN,
@@ -284,8 +293,16 @@ def build_schedule(kc: KernelCtx) -> dict:
         cbar(L, tid)
         gemm1(L, tid, a, expert, i0, icnt, rows)
         cbar(L, tid)
+        if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
+            if tid == i32(0):  # post gemm1 (slot 7)
+                bst(now(), rsrc(a["dbg"]),
+                    (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(7)) * i32(8), 0, 0)
         gemm2(L, tid, a, expert, rows, rsrc(a["gout"]))
         cbar(L, tid)
+        if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
+            if tid == i32(0):  # post gemm2 (slot 8)
+                bst(now(), rsrc(a["dbg"]),
+                    (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(8)) * i32(8), 0, 0)
         if tid < i32(64):
             combine_send(L, tid, a, rsrc(a["gout"]), rows)
 
@@ -296,9 +313,21 @@ def build_schedule(kc: KernelCtx) -> dict:
         if tid == i32(0):
             dispatch_wait(a, a["epoch"] & i32(1), i32(0))
         cbar(L, tid)
+        if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
+            if tid == i32(0):  # post dispatch_wait (slot 4)
+                bst(now(), rsrc(a["dbg"]),
+                    (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(4)) * i32(8), 0, 0)
         dyn_plan(L, tid, a)
+        if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
+            if tid == i32(0):  # post dyn_plan (slot 5)
+                bst(now(), rsrc(a["dbg"]),
+                    (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(5)) * i32(8), 0, 0)
         ub = lds_ld_i32(L, L_CTL + C_UNIT * 4)
         ue = lds_ld_i32(L, L_CTL + (C_UNIT + 1) * 4)
+        if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
+            if tid == i32(0):  # unit count for this CTA (slot 6, stored as a raw count)
+                bst(fx.Int64(ue - ub), rsrc(a["dbg"]),
+                    (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(6)) * i32(8), 0, 0)
         for u_ in range(ub, ue, i32(1)):
             u = i32(u_)
             expert_chunk, i0, icnt, _kind = unit_fields(L, u)

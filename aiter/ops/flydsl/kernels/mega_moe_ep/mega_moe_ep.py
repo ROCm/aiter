@@ -5,6 +5,7 @@ pure-torch reference oracle used to validate the kernel (对拍)."""
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import torch
@@ -260,6 +261,9 @@ class MegaMoeEPEngine:
         self._rowmap = torch.empty(
             self.n_cta * rg_max, dtype=torch.int32, device=self.device
         )
+        # Per-CTA device-phase timestamps (now() at kernel phase boundaries), only
+        # written when EP_PROF_DEV=1; see mega_moe_ep_kernel._PROF.
+        self._dbg = torch.zeros(self.n_cta * 9, dtype=torch.int64, device=self.device)
 
     def _bind_weights(self, w1, w1_scale, w2, w2_scale):
         # GEMM1 is the V2 pipelined path: its BWeightLoader / BScaleLoader read W1 and
@@ -382,6 +386,7 @@ class MegaMoeEPEngine:
             self._inters.data_ptr(),
             self._gout.data_ptr(),
             self._rowmap.data_ptr(),
+            self._dbg.data_ptr(),
             self.rank,
             self.world_size,
             self.epr,
@@ -406,6 +411,12 @@ class MegaMoeEPEngine:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
         del mask_invalid_slots  # TODO(C): expected-route masking in combine_final
         fn = self._launcher(self.config(run_tokens))
+        # Optional host-phase decomposition (set engine._prof = [] to collect
+        # (prep, launch->sync) seconds per call; purely diagnostic, off by default).
+        prof = getattr(self, "_prof", None)
+        if prof is not None:
+            torch.cuda.synchronize()
+            _t0 = time.perf_counter()
         # Dynamic MX quant of the activations (same per-1x32 MX path as MegaMoEV2); the
         # scales are natural [m, H/32], which dispatch copies verbatim into pscale.
         x_q, xs = per_1x32_mx_quant(
@@ -419,9 +430,16 @@ class MegaMoeEPEngine:
         # No host sync / dist.barrier -> forward() is a pure stream pipeline.
         with torch.cuda.stream(stream):
             self._recv.local.fill_(self.epr)
+        if prof is not None:
+            torch.cuda.synchronize()
+            _t1 = time.perf_counter()
         _run_compiled(
             fn, *self._launch_args(run_tokens, x_q, xs, topk_ids, wts, out), stream
         )
+        if prof is not None:
+            torch.cuda.synchronize()
+            _t2 = time.perf_counter()
+            prof.append((_t1 - _t0, _t2 - _t1))
         self.epoch += 1
         return out[:run_tokens] if slice_output else out
 

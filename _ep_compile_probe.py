@@ -21,7 +21,7 @@ args = [
     Z,                       # ctrl
     Z, Z, Z, Z, Z, Z, Z, Z,  # p0..p7
     Z, Z, Z, Z, Z, Z,        # off_payload off_pscale off_recv off_part off_flag off_out
-    Z, Z, Z, Z,              # inter inters gout rowmap
+    Z, Z, Z, Z, Z,           # inter inters gout rowmap dbg
     0, 8, 48, 8, 32768, 1,   # rank npes epr m mtpr epoch
     304,                     # i32_grid (#CU)
 ]
