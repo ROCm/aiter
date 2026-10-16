@@ -125,7 +125,10 @@ def model_benchmark_configs(args):
     BS = args.b if args.b else 1024
     SEQ_LEN = args.sq if args.sq else 8192
     if args.hq:
-        return [("custom", BS, args.hq, args.hk if args.hk else args.hq, SEQ_LEN, 128)]
+        HEAD_DIM = args.d if args.d else 128
+        return [
+            ("custom", BS, args.hq, args.hk if args.hk else args.hq, SEQ_LEN, HEAD_DIM)
+        ]
 
     for model_name, config in configs.items():
         HQ = config["num_attention_heads"]
@@ -153,6 +156,7 @@ def paged_attn_decode(
     compute_type,
     output_type,
     backend="triton",
+    output_gate="none",
 ):
     (
         query,
@@ -189,20 +193,33 @@ def paged_attn_decode(
         num_splits = get_recommended_splits(
             BS, H_KV, max_context_length=max_context_len
         )
-        return lambda: pa_decode_gluon(
-            output=triton_output,
-            query=query,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            context_lengths=context_lens,
-            block_tables=block_tables,
-            softmax_scale=attn_scale,
-            query_length=1,
-            max_context_partition_num=num_splits,
-            compute_type=compute_type,
-            key_scale=scale,
-            value_scale=scale,
-        )
+        # The gate is the second half of each head of a fused [B, H, 2 * D] projection.
+        gate = torch.randn(BS, H_Q, 2 * D, dtype=output_type, device="cuda")[..., D:]
+
+        def decode(**gate_kwargs):
+            return pa_decode_gluon(
+                output=triton_output,
+                query=query,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                context_lengths=context_lens,
+                block_tables=block_tables,
+                softmax_scale=attn_scale,
+                query_length=1,
+                max_context_partition_num=num_splits,
+                compute_type=compute_type,
+                key_scale=scale,
+                value_scale=scale,
+                **gate_kwargs,
+            )
+
+        if output_gate == "fused":
+            return lambda: decode(output_gate=gate)
+        if output_gate == "separate":
+            # What an engine runs without the fusion: one compiled elementwise kernel.
+            gate_mul = torch.compile(lambda out, g: out * torch.sigmoid(g))
+            return lambda: (decode(), gate_mul(triton_output, gate))
+        return decode
 
     # Keep on the CPU: the wrapper calls .item() on the scales in CUDA graph capture.
     k_scale = torch.tensor([1.0], dtype=torch.float32, device="cpu")
@@ -283,6 +300,7 @@ def run_benchmark(args):
             compute_type,
             output_type,
             args.backend,
+            args.output_gate,
         )
 
         fn()
@@ -299,6 +317,11 @@ def run_benchmark(args):
         mem += BS * ((SEQ_LEN + KV_BLK_SZ - 1) // KV_BLK_SZ) * 4
         # context_lens fp32
         mem += BS * 4
+        # output gate read; the separate kernel also re-reads and re-writes the output
+        if args.output_gate != "none":
+            mem += BS * HQ * HEAD_DIM * get_dtype_bytes(output_type)
+        if args.output_gate == "separate":
+            mem += 2 * BS * HQ * HEAD_DIM * get_dtype_bytes(output_type)
 
         # bhd bhsd => bhs bhsd => bhs, 2 for multiplication and accumulation. and there are 2 gemms
         flops = (2.0 * BS * HQ * SEQ_LEN * HEAD_DIM) * 2
@@ -332,6 +355,9 @@ def parse_args():
     parser.add_argument("-hk", type=int, default=0)
     parser.add_argument("-sq", type=int, default=0)
     parser.add_argument(
+        "-d", type=int, default=0, help="Head size for -hq (default 128)."
+    )
+    parser.add_argument(
         "-num_blocks",
         type=int,
         default=0,
@@ -341,7 +367,13 @@ def parse_args():
     parser.add_argument("-kv_cache_dtype", default="fp16")
     parser.add_argument("-compute_type", default="fp16")
     parser.add_argument("-output_type", default="fp16")
-    override_parser_action(parser, "backend", default="triton")
+    override_parser_action(parser, "--backend", default="triton")
+    parser.add_argument(
+        "--output_gate",
+        choices=["none", "fused", "separate"],
+        default="none",
+        help="gluon only: out * sigmoid(gate) fused into pa_decode_gluon, or as a separate kernel.",
+    )
 
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
@@ -353,6 +385,8 @@ def parse_args():
         help="Print VGPR usage for Triton kernels.",
     )
     args = parser.parse_args()
+    if args.output_gate != "none" and args.backend != "gluon":
+        parser.error("--output_gate needs --backend gluon")
     return args
 
 
