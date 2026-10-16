@@ -17,6 +17,12 @@ theirs, so host launch cost does not decide between backends. A Triton
 candidate's time includes copying its result into the caller's ``out``
 buffer, which dispatch does for a Triton row.
 
+``--triton-tiles`` (proposal) first runs the Triton harness for each shape,
+unchanged and exhaustive. The harness installs into Triton's config tree, by
+its own rules; this tuner then measures every backend, Triton as installed,
+and puts the shape file back when that tile fails the reference, since the
+harness checks no numerics.
+
 What is MHA-specific lives here: the data generator, the chunked reference,
 the candidate field and the probe. Deciding what reaches the table (the
 incumbent, the promotion bar, the fresh-process proof) is ``GatedTuner``'s.
@@ -25,8 +31,10 @@ incumbent, the promotion bar, the fresh-process proof) is ``GatedTuner``'s.
 import json
 import math
 import os
+import subprocess
 import sys
 import zlib
+from pathlib import Path
 from typing import Any, ClassVar
 
 import triton  # noqa: F401  # isort: skip  # Must precede torch on this ROCm environment.
@@ -496,6 +504,20 @@ class MhaFwdTuner(GatedTuner):
                 "shape today (default: all). The incumbent is always measured"
             ),
         )
+        self.parser.add_argument(
+            "--triton-tiles",
+            action="store_true",
+            help=(
+                "before measuring, tune the Triton tile of each shape with the "
+                "Triton harness (sweep_configs.py mha_varlen_fwd), which installs "
+                "into Triton's config tree"
+            ),
+        )
+        self.parser.add_argument(
+            "--triton-runs-dir",
+            default="triton_tile_runs",
+            help="the harness's --runs-dir for --triton-tiles (resumable)",
+        )
 
     def _setup_common_arguments(self):
         super()._setup_common_arguments()
@@ -621,6 +643,61 @@ class MhaFwdTuner(GatedTuner):
         return field
 
     def tune(self, untunedf, tunedf, args):
+        installed = {}
+        if args.triton_tiles:
+            installed = self._tune_triton_tiles(untunedf, args)
+        results = self._measure(untunedf, args)
+        self._roll_back_wrong_tiles(results, installed, args)
+        return results
+
+    def _tune_triton_tiles(self, untunedf, args) -> dict[tuple, tuple[str, str | None]]:
+        """Have the Triton harness install a tile per shape. Returns
+        key -> (shape file, previous text)."""
+        installed = {}
+        for _, row in untunedf.iterrows():
+            problem = _problem(row)
+            reason = triton_unsupported_reason(problem, "triton") or harness_reason(
+                problem
+            )
+            if reason is not None:
+                print(f"not tuning a Triton tile for {problem.key()}: {reason}")
+                continue
+            path = triton_shape_file(problem)
+            previous = Path(path).read_text() if os.path.exists(path) else None
+            command = harness_command(problem, args)
+            print("triton tiles:", " ".join(command[1:]), flush=True)
+            returncode = subprocess.run(
+                command,
+                cwd=TRITON_HARNESS_DIR,
+                env=dict(os.environ, PYTHONPATH=REPO_ROOT),
+                check=False,
+            ).returncode
+            if returncode != 0:
+                print(f"the Triton harness failed ({returncode}) for {problem.key()}")
+            installed[problem.key()] = (path, previous)
+        clear_triton_config_caches()
+        return installed
+
+    def _roll_back_wrong_tiles(self, results, installed, args) -> None:
+        """The harness checks no numerics: put back a shape file whose tile
+        fails the reference here."""
+        for (key, backend, _), _, err_ratio, status, _ in results:
+            if backend != "triton" or key not in installed:
+                continue
+            if status == "ok" and err_ratio <= args.errRatio:
+                continue
+            path, previous = installed[key]
+            if previous is None:
+                if os.path.exists(path):
+                    os.remove(path)
+            else:
+                Path(path).write_text(previous)
+            print(
+                f"{key}: the installed Triton tile failed ({status}); {path} restored"
+            )
+        clear_triton_config_caches()
+
+    def _measure(self, untunedf, args):
         tasks, group_sizes = [], []
         for _, row in untunedf.iterrows():
             problem = _problem(row)
@@ -722,6 +799,58 @@ class MhaFwdTuner(GatedTuner):
 
     def _clear_op_caches(self):
         clear_mha_fwd_tuning_cache()
+
+
+REPO_ROOT = str(Path(__file__).resolve().parents[2])
+TRITON_HARNESS_DIR = os.path.join(
+    REPO_ROOT, "aiter", "ops", "triton", "utils", "_triton", "tuning"
+)
+
+
+def harness_reason(problem: MhaFwdProblem) -> str | None:
+    """Why the Triton harness's mha_varlen_fwd cannot stand for this shape."""
+    if problem.dtype != "bfloat16":
+        return "the harness times bf16"
+    if (problem.window_left, problem.window_right) != (-1, -1):
+        return "the harness times no sliding window"
+    if (
+        problem.total_q != problem.batch * problem.max_seqlen_q
+        or problem.total_k != problem.batch * problem.max_seqlen_k
+    ):
+        return "the harness times equal-length sequences"
+    return None
+
+
+def triton_shape_file(problem: MhaFwdProblem) -> str:
+    from aiter.ops.triton._triton_kernels.attention.mha import _shape_config_name
+    from aiter.ops.triton.utils.config_utils import resolve_config_dir
+
+    return os.path.join(
+        resolve_config_dir("attention", "MHA", backend="triton"),
+        _shape_config_name(problem.hdim_q, problem.hdim_v, problem.causal),
+    )
+
+
+def harness_command(problem: MhaFwdProblem, args) -> list[str]:
+    gpu = os.environ.get("HIP_VISIBLE_DEVICES", "0").split(",")[0]
+    return [
+        sys.executable,
+        os.path.join(TRITON_HARNESS_DIR, "sweep_configs.py"),
+        "mha_varlen_fwd",
+        *("--Z", str(problem.batch), "--HQ", str(problem.nhead_q)),
+        *("--HK", str(problem.nhead_k), "--SQ", str(problem.max_seqlen_q)),
+        *("--SK", str(problem.max_seqlen_k), "--DQ", str(problem.hdim_q)),
+        *("--DV", str(problem.hdim_v), "--CAUSAL", str(int(problem.causal))),
+        *("--gpu", gpu, "--runs-dir", os.path.abspath(args.triton_runs_dir)),
+    ]
+
+
+def clear_triton_config_caches() -> None:
+    from aiter.ops.triton._triton_kernels.attention.mha import _get_config
+    from aiter.ops.triton.utils.config_utils import load_config_json
+
+    _get_config.cache_clear()
+    load_config_json.cache_clear()
 
 
 def selection_probe(row, warmup: int, iters: int) -> dict[str, Any]:
