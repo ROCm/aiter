@@ -3,7 +3,11 @@
 #if FAV3_ON
 #include "asm_fmha_v3_fwd_configs.hpp"
 #endif
+#if FAV2_ON
+#include "fmha_fwd_head_grouping.hpp"
+#endif
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace aiter {
@@ -285,6 +289,55 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
 #endif
 
 #if FAV2_ON
+#if CK_TILE_FMHA_ENABLE_HEAD_GROUPING
+namespace {
+
+// Group size and per-group launch both come from CK. aiter contributes only
+// the runtime-string -> type-tag dispatch, because fmha_fwd_ck carries dtype
+// as a std::string while run_fwd_head_grouped is templated on the element
+// types (it needs them for pointer arithmetic; BiasDataType and ODataType do
+// not follow the input dtype).
+template <typename Tag>
+std::optional<float> try_head_grouped(const fmha_fwd_traits& traits,
+                                      const fmha_fwd_args& args,
+                                      const mha_fwd_args& a,
+                                      const ck_tile::stream_config& s)
+{
+    using C = FmhaFwdTypeConfig<Tag>;
+
+    const auto group_size =
+        fmha_fwd_head_grouping::get_head_group_size(a.nhead_q,
+                                                    a.nhead_k,
+                                                    a.batch,
+                                                    a.seqlen_k,
+                                                    a.hdim_q,
+                                                    a.hdim_v,
+                                                    sizeof(typename C::KDataType),
+                                                    sizeof(typename C::VDataType));
+    if(!group_size.has_value())
+        return std::nullopt;
+
+    return fmha_fwd_head_grouping::run_fwd_head_grouped<
+        typename C::QDataType,
+        typename C::KDataType,
+        typename C::VDataType,
+        typename C::ODataType,
+        typename C::BiasDataType,
+        typename C::LSEDataType,
+        typename C::RandValOutputDataType>(
+        s,
+        traits,
+        args,
+        a.nhead_q,
+        a.nhead_k,
+        group_size.value(),
+        static_cast<quant_scale_enum>(a.qscale_type) == quant_scale_enum::blockscale,
+        [](const auto& t, auto& ar, const auto& sc) { return fmha_fwd(t, ar, sc); });
+}
+
+} // namespace
+#endif
+
 float fmha_fwd_ck(mha_fwd_args a, const ck_tile::stream_config& s)
 {
     fmha_fwd_traits traits{.hdim_q              = a.hdim_q,
@@ -372,6 +425,25 @@ float fmha_fwd_ck(mha_fwd_args a, const ck_tile::stream_config& s)
                        .drop_seed_offset           = a.drop_seed_offset,
                        .block_scale_size_q         = a.block_scale_size_q,
                        .block_scale_size_kv        = a.block_scale_size_kv};
+
+#if CK_TILE_FMHA_ENABLE_HEAD_GROUPING
+    // Batch mode only. The other two aiter::mha_fwd call sites
+    // (mha_varlen_fwd_kernels.cu:670, asm_mha_varlen_fwd.cu:493) are group
+    // mode and are out of scope for this change.
+    if(!a.is_group_mode)
+    {
+        std::optional<float> grouped;
+        if(a.data_type == "fp16")
+            grouped = try_head_grouped<FmhaFwdFp16>(traits, args, a, s);
+        else if(a.data_type == "bf16")
+            grouped = try_head_grouped<FmhaFwdBf16>(traits, args, a, s);
+        else if(a.data_type == "fp8bf16")
+            grouped = try_head_grouped<FmhaFwdFp8Bf16>(traits, args, a, s);
+
+        if(grouped.has_value())
+            return grouped.value();
+    }
+#endif
 
     return fmha_fwd(traits, args, s);
 }
