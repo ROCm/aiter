@@ -1605,28 +1605,31 @@ def _flydsl_moe_stage1_impl(
     _gui_sk_fused = _gui_sk and _fuse_any_quant
 
     if out is None:
+        # zeros(), not empty(): the GEMM writes only the rows of valid sorted
+        # slots, while stage 2 reads whole blocks. Padded slots would keep
+        # allocator garbage, and a garbage 0xFF byte is NaN in fp8/fp4.
         if _v2_output_layout:
             _sorted_rows = max(
                 sorted_token_ids.shape[0], sorted_expert_ids.shape[0] * tile_m
             )
             if _need_fp4:
-                out = torch.empty(
+                out = torch.zeros(
                     (_sorted_rows, inter_dim // 2), dtype=dtypes.fp4x2, device=dev
                 )
             else:
-                out = torch.empty(
+                out = torch.zeros(
                     (_sorted_rows, inter_dim), dtype=dtypes.fp8, device=dev
                 )
         elif _need_fp4 or (_gui_sk_fused and _need_fp4):
-            out = torch.empty(
+            out = torch.zeros(
                 (token_num, topk, inter_dim // 2), dtype=dtypes.fp4x2, device=dev
             )
         elif _need_fp8 or (_gui_sk_fused and _need_fp8):
-            out = torch.empty(
+            out = torch.zeros(
                 (token_num, topk, inter_dim), dtype=dtypes.fp8, device=dev
             )
         else:
-            out = torch.empty(
+            out = torch.zeros(
                 (token_num, topk, inter_dim), dtype=torch_out_dtype, device=dev
             )
 
@@ -1671,7 +1674,9 @@ def _flydsl_moe_stage1_impl(
     padded_rows = (sorted_size + 255) // 256 * 256
     padded_cols = (scale_cols + 7) // 8 * 8
     out_scale_sorted_flat = (
-        torch.empty(padded_rows * padded_cols, dtype=torch.uint8, device=dev)
+        # zeros(): rows/cols added by the 256/8 padding above are never
+        # written, and stage 2 reads this scale as e8m0, where 0xFF is NaN.
+        torch.zeros(padded_rows * padded_cols, dtype=torch.uint8, device=dev)
         if _need_sort
         else torch.empty(0, dtype=torch.uint8, device=dev)
     )

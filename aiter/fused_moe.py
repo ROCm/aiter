@@ -4795,7 +4795,9 @@ def fused_moe_2stages(
         )
     else:
         _a2_dtype = dtype
-        a2 = torch.empty(
+        # zeros(): stage 1 leaves the rows of padded sorted slots untouched and
+        # stage 2 reads them.
+        a2 = torch.zeros(
             (token_num, topk, inter_dim),
             dtype=_a2_dtype,
             device=device,
