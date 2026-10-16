@@ -145,8 +145,8 @@ def _mha_fwd_subtiled(
     DOT_LAYOUT_P: gl.constexpr = gl.DotOperandLayout(0, WMMA_LAYOUT_O, k_width=8)
     DOT_LAYOUT_V: gl.constexpr = gl.DotOperandLayout(1, WMMA_LAYOUT_O, k_width=8)
 
-    pid_m = gl.program_id(0)
-    h_q = gl.program_id(1)
+    pid_m = gl.program_id(1)
+    h_q = gl.program_id(0)
     z = gl.program_id(2)
     if CAUSAL:
         pid_m = grid_m - 1 - pid_m

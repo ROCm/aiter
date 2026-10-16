@@ -38,19 +38,24 @@ def get_wmma_layouts(BLOCK_M, head_dim_pow2, num_warps):
         warp_bases.append([base, 0])
         base *= 2
 
+    if head_dim_pow2 == 64:
+        wmma_kwidth = 64
+    else:
+        wmma_kwidth = 128
+
     WMMA_LAYOUT_QK = gl.amd.AMDWMMALayout(
         3,
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=reg_bases,
-        instr_shape=[16, 16, 128],
+        instr_shape=[16, 16, wmma_kwidth],
     )
     WMMA_LAYOUT_O = gl.amd.AMDWMMALayout(
         3,
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=reg_bases,
-        instr_shape=[16, 16, 128],
+        instr_shape=[16, 16, wmma_kwidth],
     )
     return WMMA_LAYOUT_QK, WMMA_LAYOUT_O
 
@@ -149,7 +154,7 @@ def mha_fwd(
     WMMA_LAYOUT_QK, WMMA_LAYOUT_O = get_wmma_layouts(BLOCK_M, head_dim_pow2, config["num_warps"])
 
     grid_m = triton.cdiv(seqlen_q, BLOCK_M)
-    grid = (grid_m, num_q_heads, batch)
+    grid = (num_q_heads, grid_m, batch)
     _mha_fwd_subtiled[grid](
         q_ptr=q,
         k_ptr=k,
