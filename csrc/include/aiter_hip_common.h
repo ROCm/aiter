@@ -2,7 +2,11 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
+#ifdef _WIN32
+#define AITER_C_ITFS extern "C" __declspec(dllexport)
+#else
 #define AITER_C_ITFS extern "C" __attribute__((visibility("default")))
+#endif
 
 #include "aiter_enum.h"
 #include "aiter_logger.h"
@@ -30,6 +34,23 @@
 namespace aiter_detail {
 
 inline thread_local bool g_aiter_can_throw = false;
+
+// Makes AITER_CHECK throw instead of abort() for the duration of a scope, and
+// restores the previous mode on exit. Use at entry points that are reached from
+// a language binding, where a failed check has to surface as a catchable error
+// rather than take the process down. Save/restore rather than a plain store:
+// the flag is thread-local, and a binding thread is shared with other ops.
+class AiterThrowGuard
+{
+    public:
+    AiterThrowGuard() : prev_(g_aiter_can_throw) { g_aiter_can_throw = true; }
+    ~AiterThrowGuard() noexcept { g_aiter_can_throw = prev_; }
+    AiterThrowGuard(const AiterThrowGuard&)            = delete;
+    AiterThrowGuard& operator=(const AiterThrowGuard&) = delete;
+
+    private:
+    bool prev_;
+};
 
 template <typename... Args>
 [[noreturn, gnu::noinline]] inline void
@@ -154,6 +175,8 @@ struct AiterAsmKernelArgs
     int cluster_x = 1;
     int cluster_y = 1;
     int cluster_z = 1;
+
+    unsigned int smem = 0;
 };
 
 static const std::string get_gpu_arch();
@@ -350,7 +373,7 @@ class AiterAsmKernelFast
             launch_config.blockDimX     = static_cast<unsigned int>(kargs.bdx);
             launch_config.blockDimY     = static_cast<unsigned int>(kargs.bdy);
             launch_config.blockDimZ     = static_cast<unsigned int>(kargs.bdz);
-            launch_config.sharedMemBytes = 0;
+            launch_config.sharedMemBytes = kargs.smem;
             launch_config.hStream       = kargs.stream;
             launch_config.attrs         = attrs;
             launch_config.numAttrs      = 1;
@@ -378,7 +401,7 @@ class AiterAsmKernelFast
                                               kargs.bdx,
                                               kargs.bdy,
                                               kargs.bdz,
-                                              0,
+                                              kargs.smem,
                                               kargs.stream,
                                               nullptr,
                                               (void**)&config));
@@ -582,17 +605,7 @@ static uint32_t get_num_cu_func()
     return num_cu;
 }
 
-static uint32_t get_warp_size_func()
-{
-    static const uint32_t warp_size = []() {
-        hipDevice_t dev;
-        hipDeviceProp_t dev_prop;
-        HIP_CALL(hipGetDevice(&dev));
-        HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
-        return static_cast<uint32_t>(dev_prop.warpSize);
-    }();
-    return warp_size;
-}
+static uint32_t get_warp_size_func();
 
 struct WarpSizeValue
 {
@@ -677,3 +690,27 @@ struct SynchronizedCache
     std::mutex map_mu;
     std::unordered_map<Key, T, Hash, KeyEqual> map;
 };
+
+static uint32_t get_warp_size_func()
+{
+    static SynchronizedCache<int, uint32_t> cache;
+    int device = -1;
+    HIP_CALL(hipGetDevice(&device));
+    return cache.get_or_create(device, [device]() {
+        hipDeviceProp_t prop{};
+        HIP_CALL(hipGetDeviceProperties(&prop, device));
+        return static_cast<uint32_t>(prop.warpSize);
+    });
+}
+
+static size_t get_smem_size_func()
+{
+    static SynchronizedCache<int, size_t> cache;
+    int device = -1;
+    HIP_CALL(hipGetDevice(&device));
+    return cache.get_or_create(device, [device]() {
+        hipDeviceProp_t prop{};
+        HIP_CALL(hipGetDeviceProperties(&prop, device));
+        return prop.sharedMemPerBlock;
+    });
+}

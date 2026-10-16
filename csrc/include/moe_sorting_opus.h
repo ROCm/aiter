@@ -9,7 +9,8 @@
 #include "aiter_tensor.h"
 #include <optional>
 
-int moe_sorting_opus_get_workspace_size(int tokens, int num_experts, int topk, int dispatch_policy);
+int moe_sorting_opus_get_workspace_size(
+    int tokens, int num_experts, int topk, int dispatch_policy, int device_id = -1);
 
 void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           aiter_tensor_t& topk_weights,
@@ -28,6 +29,24 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           std::optional<aiter_tensor_t> m_indices        = std::nullopt,
                           std::optional<aiter_tensor_t> reverse_sorted   = std::nullopt);
 
+// Narrow gfx950 decode helper. It fuses route sorting, BF16->MXFP4 activation
+// quantization and routed-output zeroing for H=4096, block_m=32 batches of
+// M in [1, 128]. (num_experts, topk) must be one of (512,10) or
+// (513,11) -- the expert histogram is a template parameter. Emits compact
+// per-token E8M0 scales, which FlyDSL GEMM1 can consume directly; callers that
+// need the sorted-row layout run the conventional conversion afterwards.
+void mxfp4_moe_sort_quant_fwd(aiter_tensor_t& hidden_states,
+                              aiter_tensor_t& topk_ids,
+                              aiter_tensor_t& topk_weights,
+                              aiter_tensor_t& sorted_token_ids,
+                              aiter_tensor_t& sorted_weights,
+                              aiter_tensor_t& sorted_expert_ids,
+                              aiter_tensor_t& num_valid_ids,
+                              aiter_tensor_t& moe_buf,
+                              aiter_tensor_t& activation_quant,
+                              aiter_tensor_t& activation_scale_token,
+                              int num_experts);
+
 #ifdef MOE_SORTING_OPUS_IMPL
 // ============================================================================
 // Implementation section - only compiled in the .cu translation unit
@@ -36,9 +55,11 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <hip/hip_runtime.h>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "opus/opus.hpp"
 
@@ -1130,6 +1151,14 @@ struct MoeSortingKernel
             return;
         }
 
+        if(kargs.p_reverse_sorted)
+        {
+            opus::index_t* p_reverse_sorted = static_cast<opus::index_t*>(kargs.p_reverse_sorted);
+            const opus::index_t routes      = kargs.tokens * kargs.topk_mdiv.divisor;
+            for(opus::index_t i = threadIdx.x; i < routes; i += kBlockSize)
+                p_reverse_sorted[i] = -1;
+        }
+
         extern __shared__ char smem[];
 
         return moe_align_block_size_kernel_ex(
@@ -1368,6 +1397,22 @@ OPUS_D void moe_buf_set_zero_kernel_2d(void* buf,
     }
 }
 
+template <opus::index_t kBlockSize>
+OPUS_D void moe_sorting_reverse_sorted_set_invalid(void* p_reverse_sorted,
+                                                   opus::index_t tokens,
+                                                   opus::index_t topk)
+{
+    if(p_reverse_sorted == nullptr)
+        return;
+    opus::index_t* p_buf       = reinterpret_cast<opus::index_t*>(p_reverse_sorted);
+    const opus::index_t routes = tokens * topk;
+    for(opus::index_t i = blockIdx.x * kBlockSize + threadIdx.x; i < routes;
+        i += gridDim.x * kBlockSize)
+    {
+        p_buf[i] = -1;
+    }
+}
+
 } // namespace impl
 
 // TODO: tokens could be from
@@ -1387,6 +1432,42 @@ OPUS_H bool moe_sorting_is_oneshot(int tokens_, int num_experts_)
     return is_sub_token_onshot;
 }
 
+OPUS_H bool moe_sorting_device_is_gfx950(int device_id_ = -1)
+{
+    static const std::vector<unsigned char> gfx950_by_device = [] {
+        int device_count = 0;
+        OPUS_HIP_CHECK_ERROR(hipGetDeviceCount(&device_count));
+        std::vector<unsigned char> result(device_count, 0);
+        for(int device_id = 0; device_id < device_count; ++device_id)
+        {
+            hipDeviceProp_t dev_prop;
+            OPUS_HIP_CHECK_ERROR(hipGetDeviceProperties(&dev_prop, device_id));
+            result[device_id] =
+                std::strncmp(dev_prop.gcnArchName, "gfx950", 6) == 0;
+        }
+        return result;
+    }();
+
+    hipDevice_t dev = device_id_;
+    if(dev < 0)
+        OPUS_HIP_CHECK_ERROR(hipGetDevice(&dev));
+    if(dev >= static_cast<hipDevice_t>(gfx950_by_device.size()))
+        throw std::out_of_range("invalid HIP device id");
+    return gfx950_by_device[dev] != 0;
+}
+
+OPUS_H bool
+moe_sorting_auto_is_oneshot(int tokens_, int num_experts_, int device_id_ = -1)
+{
+    bool is_oneshot = moe_sorting_is_oneshot(tokens_, num_experts_);
+    if(!is_oneshot)
+        return false;
+
+    // gfx950 crossover measured with E=256/257 at M>=8 and E=385 at all M.
+    bool prefer_mp = num_experts_ >= 385 || (num_experts_ >= 256 && tokens_ >= 8);
+    return !(moe_sorting_device_is_gfx950(device_id_) && prefer_mp);
+}
+
 // return size in byte
 OPUS_H opus::index_t moe_sorting_mp_get_workspace_size(int tokens_, int num_experts_, int topk_)
 {
@@ -1404,13 +1485,14 @@ OPUS_H opus::index_t moe_sorting_mp_get_workspace_size(int tokens_, int num_expe
 // dispatch_policy: 0-automatically pick up kerel. 1-always use single kernel, 2-always use mp
 // kernel
 OPUS_H opus::index_t
-moe_sorting_get_workspace_size(int tokens_, int num_experts_, int topk_, int dispatch_policy_)
+moe_sorting_get_workspace_size(
+    int tokens_, int num_experts_, int topk_, int dispatch_policy_, int device_id_ = -1)
 {
 #if 1
     // return 0;
     if(dispatch_policy_ == 0)
     {
-        if(moe_sorting_is_oneshot(tokens_, num_experts_))
+        if(moe_sorting_auto_is_oneshot(tokens_, num_experts_, device_id_))
         {
             return 0;
         }
@@ -1589,6 +1671,7 @@ struct MoeSortingMultiPhaseKernel_P0_v1
         const void* p_topk_ids;     // [tokens, topk]
         const void* p_local_tokens; // [1], if not nullptr, use this as actual tokens
         void* p_expert_mesh;        // [expert, tokens]
+        void* p_reverse_sorted;
         opus::index_t tokens; // if p_local_tokens is not nullptr, this indicate the max possible
                               // tokens used for ws/LDS calculation
         opus::index_t num_experts;
@@ -1614,6 +1697,7 @@ struct MoeSortingMultiPhaseKernel_P0_v1
         k.p_topk_ids     = h.p_topk_ids;
         k.p_local_tokens = h.p_local_tokens;
         k.p_expert_mesh  = h.p_ws;
+        k.p_reverse_sorted = h.p_reverse_sorted;
         k.tokens         = h.tokens;
         k.num_experts    = h.num_experts;
         k.mesh_stride    = impl::moe_sorting_mp_mesh_stride(h.tokens);
@@ -1630,6 +1714,9 @@ struct MoeSortingMultiPhaseKernel_P0_v1
 
     OPUS_D void operator()(Kargs kargs) const
     {
+        impl::moe_sorting_reverse_sorted_set_invalid<kBlockSize>(
+            kargs.p_reverse_sorted, kargs.tokens, kargs.topk_mdiv.divisor);
+
         using topk_id_t = opus::vector_t<IndexType, Problem::SubTokenTile>;
 
         const topk_id_t* p_topk_ids = reinterpret_cast<const topk_id_t*>(kargs.p_topk_ids);
@@ -1718,6 +1805,7 @@ struct MoeSortingMultiPhaseKernel_P0_v2
 
         const void* p_local_expert_mask; // [expert]
         void* p_expert_cumsum;           // [expert]
+        void* p_reverse_sorted;
         opus::index_t num_experts;
     };
 
@@ -1746,6 +1834,7 @@ struct MoeSortingMultiPhaseKernel_P0_v2
         k.mesh_stride         = impl::moe_sorting_mp_mesh_stride(h.tokens);
         k.topk_mdiv           = opus::mdiv{static_cast<uint32_t>(h.topk)};
         k.p_local_expert_mask = h.p_local_expert_mask;
+        k.p_reverse_sorted    = h.p_reverse_sorted;
         k.num_experts         = h.num_experts;
         return k;
     }
@@ -1762,6 +1851,9 @@ struct MoeSortingMultiPhaseKernel_P0_v2
 
     OPUS_D void operator()(Kargs kargs) const
     {
+        impl::moe_sorting_reverse_sorted_set_invalid<kBlockSize>(
+            kargs.p_reverse_sorted, kargs.tokens, kargs.topk_mdiv.divisor);
+
         constexpr opus::index_t index_pack = Problem::SubTokenTile; // always packed
         __shared__ char smem[GetSmemSize()];
         using topk_id_t             = opus::vector_t<IndexType, index_pack>;
@@ -3295,9 +3387,11 @@ struct moe_sorting_opus_args : public aiter::MoeSortingHostArgs
 };
 
 int
-moe_sorting_opus_get_workspace_size(int tokens, int num_experts, int topk, int dispatch_policy)
+moe_sorting_opus_get_workspace_size(
+    int tokens, int num_experts, int topk, int dispatch_policy, int device_id)
 {
-    return aiter::moe_sorting_get_workspace_size(tokens, num_experts, topk, dispatch_policy);
+    return aiter::moe_sorting_get_workspace_size(
+        tokens, num_experts, topk, dispatch_policy, device_id);
 }
 
 // Forward declaration

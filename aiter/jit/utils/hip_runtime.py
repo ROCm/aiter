@@ -2,22 +2,39 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #
 # Thin access to the loaded HIP runtime. ctypes and stdlib only, no torch and no
-# aiter imports, so aiter.jit.utils and aiter.dist can both use it.
+# aiter imports, so aiter.jit.utils and aiter.dist can both use it. The one
+# exception is the Windows DLL search, which reuses cpp_extension's ROCm lookup.
 
 import ctypes
 import functools
+import glob
+import os
+import sys
 
-# The unversioned symlink ships in the -devel package, which need not be on
-# LD_LIBRARY_PATH at runtime; split rocm-sdk pip layouts carry only the versioned
-# soname.
-_SONAMES = ("libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6")
+
+def _library_names() -> tuple[str, ...]:
+    if sys.platform != "win32":
+        # The unversioned symlink ships in the -devel package, which need not be
+        # on LD_LIBRARY_PATH at runtime; split rocm-sdk pip layouts carry only the
+        # versioned soname.
+        return ("libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6")
+
+    # Windows ROCm ships a version-suffixed DLL, e.g. `amdhip64_7.dll`.
+    from cpp_extension import _find_rocm_home
+
+    rocm_home = _find_rocm_home()
+    if not rocm_home:
+        return ("amdhip64.dll",)
+
+    dlls = sorted(glob.glob(os.path.join(rocm_home, "bin", "amdhip64*.dll")))
+    return (*dlls, "amdhip64.dll")
 
 
 @functools.lru_cache(maxsize=1)
 def load_hip_runtime() -> ctypes.CDLL:
-    """Load libamdhip64, or raise OSError reporting why each candidate failed."""
+    """Load the HIP runtime, or raise OSError reporting why each candidate failed."""
     errors = []
-    for soname in _SONAMES:
+    for soname in _library_names():
         try:
             return ctypes.CDLL(soname)
         except OSError as e:

@@ -41,16 +41,23 @@ def mxscale_w_scale_block(w_scale_shape: tuple[int, ...], n: int, k: int) -> str
     return block
 
 
-def with_mxscale_w_scale_block(df, path: str):
+def with_mxscale_w_scale_block(df, path: str, default: str = "128x128"):
     """A tuned mxscale table with a checked w_scale_block column; a table from
-    before the column holds only 128x128 rows."""
+    before the column holds only ``default`` rows, and so do the blank cells a
+    merge of such a table with a newer one leaves."""
     if "w_scale_block" not in df.columns:
         logger.warning(
-            "%s has no 'w_scale_block' column; reading its rows as 128x128. "
+            "%s has no 'w_scale_block' column; reading its rows as %s. "
             "Re-run the tuner or migrate the CSV.",
             path,
+            default,
         )
-        df = df.assign(w_scale_block="128x128")
+        df = df.assign(w_scale_block=default)
+    elif df["w_scale_block"].isna().any():
+        logger.warning(
+            "%s has rows without a w_scale_block; reading them as %s.", path, default
+        )
+        df = df.assign(w_scale_block=df["w_scale_block"].fillna(default))
     unknown = set(df["w_scale_block"]) - set(MXSCALE_W_SCALE_BLOCKS)
     if unknown:
         raise ValueError(

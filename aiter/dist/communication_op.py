@@ -197,6 +197,9 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
     ``transpose_scale`` (per-group only) writes the per-group scale in
     column-major layout ``(num_groups, M)`` viewed as ``(M, num_groups)``,
     matching what ``gemm_a8w8_blockscale_preshuffle`` expects.
+
+    ``gemma_norm`` (per-token and per-group) normalizes with ``x * (1 + w)``
+    from the raw ``weight_``; MXFP4 does not support it.
     """
     _assert_no_custom_group("tensor_model_parallel_fused_allreduce_rmsnorm_quant")
 
@@ -216,6 +219,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
             prefill_support=prefill_support,
             emit_bf16=emit_bf16,
             transpose_scale=transpose_scale,
+            gemma_norm=gemma_norm,
         )
 
     return get_tp_group().fused_allreduce_rmsnorm_quant(
