@@ -12,10 +12,10 @@ from typing import TypeAlias
 
 import matplotlib.pyplot as plt
 import pandas as pd
-from op_tests.op_benchmarks.triton.bench_moe_gemm_a4w4 import (
+from op_tests.op_benchmarks.triton.bench_moe_gemm_a4w4_proton import (
     main as bench_moe_gemm_a4w4_main,
 )
-from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w4 import (
+from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w4_proton import (
     main as bench_moe_gemm_a8w4_main,
 )
 from triton.runtime.errors import OutOfResources
