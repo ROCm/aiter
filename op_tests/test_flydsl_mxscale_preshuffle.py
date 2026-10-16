@@ -3,7 +3,7 @@
 
 """Correctness + perf for FlyDSL MX-scale preshuffle GEMM (gfx950).
 
-MiniMax-M3 TP4 dense MXFP8 (``gemm_mxscale_preshuffle``, shuffled B):
+MiniMax-M3 TP4 dense MXFP8 (``gemm_a8w8_mxscale_preshuffle_1x32_flydsl``, shuffled B):
 
     a    : [M, K] packed MXFP8, M = tokens
     w    : shuffled [N, K] MXFP8
@@ -26,7 +26,9 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.mxscale_preshuffle_kernels import gemm_mxscale_preshuffle
+from aiter.ops.flydsl.mxscale_preshuffle_kernels import (
+    gemm_a8w8_mxscale_preshuffle_1x32_flydsl,
+)
 from aiter.ops.quant import per_1x32_f4_quant, per_1x32_f8_scale_f8_quant
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -152,7 +154,7 @@ def test_mxscale_tuned(m, n, k, dtype):
     a, b, a_scale, b_scale, out, ref = _prepare(m, n, k, "fp8", "fp8", dtype)
 
     def _run():
-        return gemm_mxscale_preshuffle(
+        return gemm_a8w8_mxscale_preshuffle_1x32_flydsl(
             a,
             b,
             a_scale,
@@ -177,7 +179,7 @@ def test_mxscale_explicit(
     a, b, a_scale, b_scale, out, ref = _prepare(m, n, k, a_dtype, b_dtype, dtype)
 
     def _run():
-        return gemm_mxscale_preshuffle(
+        return gemm_a8w8_mxscale_preshuffle_1x32_flydsl(
             a,
             b,
             a_scale,

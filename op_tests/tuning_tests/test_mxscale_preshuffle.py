@@ -18,7 +18,7 @@ from aiter.ops.flydsl.mxscale_preshuffle_kernels import (
     _TUNED_CACHE,
     _heuristic_tile,
     flydsl_mxscale_preshuffle_gemm,
-    gemm_mxscale_preshuffle,
+    gemm_a8w8_mxscale_preshuffle_1x32_flydsl,
     get_mxscale_preshuffle_config,
 )
 
@@ -138,7 +138,13 @@ def test_runtime_lookup_is_exact_signature_only(tmp_path):
 
 
 def test_heuristic_keeps_split_k_one_when_the_grid_fills_the_cus():
-    instance = _heuristic_tile("fp8", "fp8", 8192, 6144, 6144)
+    scales = (
+        ("a_scale_block", "1x32"),
+        ("a_scale_layout", "mfma_tile"),
+        ("b_scale_block", "1x32"),
+        ("b_scale_layout", "mfma_tile"),
+    )
+    instance = _heuristic_tile("fp8", "fp8", 8192, 6144, 6144, scales)
     assert instance is not None
     assert instance.split_k == 1
 
@@ -165,6 +171,10 @@ def test_rejects_unknown_dtype():
             tile_m=32,
             tile_n=16,
             tile_k=256,
+            a_scale_block="1x32",
+            b_scale_block="1x32",
+            a_scale_layout="mfma_tile",
+            b_scale_layout="mfma_tile",
         )
     except ValueError as err:
         assert "fp7" in str(err)
@@ -176,7 +186,7 @@ def test_per_1x32_rejects_blockscale_tile_m():
     dummy = torch.empty(0)
     out = torch.empty((16, 128), dtype=torch.bfloat16)
     try:
-        gemm_mxscale_preshuffle(
+        gemm_a8w8_mxscale_preshuffle_1x32_flydsl(
             dummy,
             dummy,
             dummy,
@@ -202,7 +212,7 @@ def test_rejects_unshuffled_scale_nbytes():
     b_scale = torch.empty((32, K // 32), dtype=torch.uint8)
     out = torch.empty((M, N), dtype=torch.bfloat16)
     try:
-        gemm_mxscale_preshuffle(
+        gemm_a8w8_mxscale_preshuffle_1x32_flydsl(
             A,
             B,
             a_scale,

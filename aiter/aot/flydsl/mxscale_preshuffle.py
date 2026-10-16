@@ -7,7 +7,7 @@
 
 ``aiter.aot.flydsl.gemm`` compiles the same ``flydsl_mxpsh_*`` names with
 ``blockscale=True``. These rows are the other constexpr: packed A, shuffled B,
-and ``shuffle_scale_a16w4`` scales (``blockscale=False``).
+and ``shuffle_scale_a16w4`` scales (per-1x32 ``mfma_tile``).
 """
 
 from __future__ import annotations
@@ -127,8 +127,11 @@ def _compile_to_cache(
             waves_per_eu=waves_per_eu,
             xcd_swizzle=xcd_swizzle,
             split_k=split_k,
-            blockscale=False,
             stream=fx.Stream(0),
+            a_scale_block="1x32",
+            b_scale_block="1x32",
+            a_scale_layout="mfma_tile",
+            b_scale_layout="mfma_tile",
         )
 
 

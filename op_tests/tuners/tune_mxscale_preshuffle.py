@@ -14,7 +14,9 @@ from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
     candidates_for,
     kernels_list,
 )
-from aiter.ops.flydsl.mxscale_preshuffle_kernels import gemm_mxscale_preshuffle
+from aiter.ops.flydsl.mxscale_preshuffle_kernels import (
+    gemm_a8w8_mxscale_preshuffle_1x32_flydsl,
+)
 from aiter.ops.quant import per_1x32_f4_quant, per_1x32_f8_scale_f8_quant
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight
 from aiter.utility import fp4_utils
@@ -81,7 +83,7 @@ def generate_data(
 
 def run_gemm_flydsl(A, B, a_scale, b_scale, out, kernel_id, a_dtype, b_dtype):
     instance = kernels_list[kernel_id]
-    gemm_mxscale_preshuffle(
+    gemm_a8w8_mxscale_preshuffle_1x32_flydsl(
         A,
         B,
         a_scale,
@@ -254,7 +256,7 @@ class MxscalePreShuffleTuner(GemmCommonTuner):
                     a_dtype=a_dtype,
                     b_dtype=b_dtype,
                 ):
-                    return gemm_mxscale_preshuffle(
+                    return gemm_a8w8_mxscale_preshuffle_1x32_flydsl(
                         A,
                         B,
                         a_scale,

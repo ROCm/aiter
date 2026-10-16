@@ -118,7 +118,9 @@ from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
 from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     parse_wmma_kernel_name as parse_mxfp8_128_wmma_kernel_name,
 )
-from aiter.ops.flydsl.mxscale_preshuffle_kernels import MXFP8_ROW_SCALES
+from aiter.ops.flydsl.mxscale_preshuffle_kernels import (
+    MXFP8_ROW_SCALES_BY_W_SCALE_BLOCK,
+)
 
 # Keep the default AOT coverage aligned with runtime config resolution.
 DEFAULT_CSVS = [
@@ -235,8 +237,10 @@ def parse_csv(csv_path: str):
     jobs = []
     seen = set()
     batched_skipped = set()
-    # The mxfp8 1x32 table's gfx950 rows name mxpsh kernels that read the
-    # unshuffled per-1x32 scales; every other table's mxpsh rows are blockscale.
+    # The mxfp8 table's gfx950 rows, and the e8m0 blockscale table's kernelId
+    # "mxfp8" rows, name mxpsh / 8-wave kernels that read the raw (unshuffled)
+    # scales of the row's w_scale_block. No runtime path reads the shuffled-scale
+    # mxpsh rows any other table may still hold.
     mxfp8_table = "a8w8_mxfp8_bpreshuffle" in os.path.basename(csv_path)
 
     with open(csv_path, newline="") as f:
@@ -265,8 +269,15 @@ def parse_csv(csv_path: str):
             k = int(row["K"])
             cu_num = int(row.get("cu_num", "0"))
             gfx = row.get("gfx", "").strip()
-            # Its kernels read 1x32 row scales; a row from before the column is one.
-            if mxfp8_table and (row.get("w_scale_block") or "1x32").strip() != "1x32":
+            # Their kernels read the row's raw w_scale block: the mxfp8 table is
+            # 1x32 (a row from before the column is one), the blockscale table's
+            # "mxfp8" rows 32x32 / 128x128 too.
+            raw_scales = mxfp8_table or row.get("kernelId", "").strip() == "mxfp8"
+            mxfp8_block = (row.get("w_scale_block") or "1x32").strip()
+            if raw_scales and (
+                mxfp8_block not in MXFP8_ROW_SCALES_BY_W_SCALE_BLOCK
+                or (mxfp8_table and mxfp8_block != "1x32")
+            ):
                 continue
 
             if row.get("kernelId", "").strip() == "bmm":  # the batched GEMM, B = 1
@@ -287,14 +298,13 @@ def parse_csv(csv_path: str):
             if kernel_name.startswith("flydsl_bpreshuflle_"):
                 params = _parse_preshuffle_kernel_name(kernel_name)
             elif kernel_name.startswith("flydsl_mxpsh_"):
+                if not raw_scales:
+                    continue  # a shuffled-scale row: nothing reads it
                 params = parse_mxscale_preshuffle_kernel_name(kernel_name)
                 if params is not None:
                     params = dict(params)
                     params["kind"] = "mxscale_preshuffle"
-                    if mxfp8_table:
-                        params.update(dict(MXFP8_ROW_SCALES))
-                    else:  # the a8w8 blockscale contract
-                        params.update(a_scale_block="1x128", b_scale_block="128x128")
+                    params.update(dict(MXFP8_ROW_SCALES_BY_W_SCALE_BLOCK[mxfp8_block]))
             elif kernel_name.startswith("flydsl_bpreshuffle_8w_"):
                 params = parse_8wave_kernel_name(kernel_name)
                 if params is not None:
@@ -305,6 +315,7 @@ def parse_csv(csv_path: str):
                 if params is not None:
                     params = dict(params)
                     params["kind"] = "mxfp8_8wave"
+                    params["w_scale_block"] = mxfp8_block if raw_scales else "1x32"
             elif kernel_name.startswith(
                 (
                     f"{MXFP8_128_WMMA_PREFIX}_",
@@ -707,18 +718,20 @@ def _compile_mxscale_preshuffle_to_cache(
     waves_per_eu: int,
     xcd_swizzle: int = 0,
     split_k: int = 1,
-    a_scale_block: str = "1x128",
-    b_scale_block: str = "128x128",
-    a_scale_layout: str = "mfma_tile",
-    b_scale_layout: str = "mfma_tile",
+    a_scale_block: str,
+    b_scale_block: str,
+    a_scale_layout: str,
+    b_scale_layout: str,
     fused_split_k: bool = False,
     **kwargs,
 ):
     """gfx950 MX-microscale preshuffle GEMM (``flydsl_mxpsh_*``).
 
     Each operand's scale block and layout are distinct Constexprs and therefore
-    distinct binaries, so each combination is its own job: the a8w8 blockscale
-    tables' 1x128 / 128x128 mfma_tile, and gemm_a8w8_mxfp8_bpreshuffle's 1x32 row.
+    distinct binaries, so each combination is its own job: gemm_a8w8_mxfp8_
+    bpreshuffle's 1x32 row scales, and the e8m0 blockscale table's "mxfp8" rows
+    (32x32 / 128x128 row). The mfma_tile layouts still compile, though no table
+    row names them.
     Keep the CSV's logical M so the M<=16 fused split-K specializations are also
     AOT'd.
     """
@@ -746,6 +759,9 @@ def _compile_mxscale_preshuffle_to_cache(
         ("1x128", "mfma_tile"): (rows * 2 * K1,),
         ("128x128", "mfma_tile"): ((n // 128) * 4 * K1,),
         ("1x32", "row"): None,  # per operand below: (rows, K // 32)
+        ("32x32", "row"): (n // 32, k // 32),
+        ("1x128", "row"): (m, k // 128),  # its column-major bytes
+        ("128x128", "row"): (n // 128, k // 128),
     }
     scales = []
     for block, layout, nrows in (
@@ -827,10 +843,11 @@ def _compile_mxfp8_8wave_to_cache(
     k: int,
     waves_per_eu: int,
     xcd_swizzle: int,
+    w_scale_block: str = "1x32",
     **kwargs,
 ):
-    """gfx950 8-wave mxfp8 GEMM (``flydsl_mxfp8_8w_*``) on 1x32 row scales,
-    with the dtypes flydsl_mxfp8_8wave_gemm launches it with."""
+    """gfx950 8-wave mxfp8 GEMM (``flydsl_mxfp8_8w_*``) on row scales (a 1x32
+    or 32x32 w_scale), with the dtypes flydsl_mxfp8_8wave_gemm launches it with."""
     del kwargs
 
     import torch
@@ -839,14 +856,18 @@ def _compile_mxfp8_8wave_to_cache(
     a = torch.empty((m * k,), device=dev, dtype=torch.uint8)
     b = torch.empty((n * k,), device=dev, dtype=torch.uint8)
     out = torch.empty((m * n,), device=dev, dtype=torch.bfloat16)
-    scale_a = torch.empty((m * k // 32,), device=dev, dtype=torch.uint8)
-    scale_b = torch.empty((n * k // 32,), device=dev, dtype=torch.uint8)
+    w_rows, kb = {"32x32": (n // 32, 32), "128x128": (n // 128, 128)}.get(
+        w_scale_block, (n, 32)
+    )
+    scale_a = torch.empty((m * k // kb,), device=dev, dtype=torch.uint8)
+    scale_b = torch.empty((w_rows * k // kb,), device=dev, dtype=torch.uint8)
 
     exe = compile_mxfp8_8wave_gemm(
         K=k,
         waves_per_eu=waves_per_eu,
         xcd_swizzle=int(xcd_swizzle),
         scale_preshuffled=False,
+        w_scale_block=w_scale_block,
     )
     # The 8-wave launcher takes (A, B, C, ...), as _compile_8wave_to_cache.
     _compile_executable_to_cache(exe, a, b, out, scale_a, scale_b, m, n, fx.Stream(0))
