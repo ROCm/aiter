@@ -17,7 +17,7 @@ from aiter.fused_moe import (
 )
 from aiter.fused_moe_bf16_asm import asm_moe
 from aiter.ops.flydsl.moe_common import GateMode
-from aiter.ops.quant import per_1x32_f4_quant
+from aiter.ops.quant import per_1x32_f4_quant, per_1x32_f8_scale_f8_quant
 from aiter.ops.shuffle import (
     moe_shuffle_scale,
     moe_shuffle_weight,
@@ -399,6 +399,58 @@ def _calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
 summary_table = []
 
 
+def torch_moe_ep_a8w4_reference(
+    hidden_states,
+    w1,
+    w2,
+    topk_weights,
+    topk_ids,
+    expert_mask,
+    w1_scale,
+    w2_scale,
+):
+    """Match the gfx950 A8W4 quantization points, using unshuffled MXFP4 weights."""
+    local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32) - 1
+    local_expert_hash[expert_mask == 0] = -1
+    local_ids = local_expert_hash[topk_ids]
+    out = torch.empty_like(hidden_states)
+    # Bound the torch references' [rows, topk, channels] FP32 intermediates.
+    for start in range(0, hidden_states.shape[0], 512):
+        rows = slice(start, start + 512)
+        a1, a1_scale = per_1x32_f8_scale_f8_quant(
+            hidden_states[rows], quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
+        # The fused FlyDSL stage1 rounds SiLU(gate) * up to BF16 before Q8.
+        inter = torch_moe_stage1(
+            a1,
+            w1,
+            w2,
+            topk_weights[rows],
+            local_ids[rows],
+            dtype=hidden_states.dtype,
+            activation=ActivationType.Silu,
+            quant_type=QuantType.per_1x32,
+            a1_scale=a1_scale,
+            w1_scale=w1_scale,
+        )
+        a2, a2_scale = per_1x32_f8_scale_f8_quant(
+            inter, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
+        out[rows] = torch_moe_stage2(
+            a2,
+            w1,
+            w2,
+            topk_weights[rows],
+            local_ids[rows],
+            dtype=hidden_states.dtype,
+            quant_type=QuantType.per_1x32,
+            w2_scale=w2_scale,
+            a2_scale=a2_scale,
+            doweight=True,
+        )
+    return out
+
+
 def test_fmoe_ep_mxfp4(
     quant_label,
     token,
@@ -680,9 +732,23 @@ def test_fmoe_ep_mxfp4(
         sf = sf.unsqueeze(-1).expand(-1, -1, -1, 32).reshape(*orig_shape)
         return (wf * sf).to(dtype)
 
-    w1_deq = _dequant(w1_qt, w1_scale, w1.shape)
-    w2_deq = _dequant(w2_qt, w2_scale, w2.shape)
-    if _gfx == "gfx1250" and quant_label == "a4w4_mxfp4":
+    if not (_gfx == "gfx950" and quant_label == "a8w4_mxfp4"):
+        w1_deq = _dequant(w1_qt, w1_scale, w1.shape)
+        w2_deq = _dequant(w2_qt, w2_scale, w2.shape)
+
+    if _gfx == "gfx950" and quant_label == "a8w4_mxfp4":
+        # A weight-only reference compares this A8W4 kernel to A16W4 instead.
+        ref = torch_moe_ep_a8w4_reference(
+            ref_input,
+            w1_qt,
+            w2_qt,
+            ref_topk_weights,
+            ref_topk_ids,
+            expert_mask,
+            w1_scale,
+            w2_scale,
+        )
+    elif _gfx == "gfx1250" and quant_label == "a4w4_mxfp4":
         # Match both activation quantization points in the grouped A4W4 path.
         # The generic BF16 reference above otherwise compares against A16W4
         # and overstates the numerical error from the two MXFP4 round trips.
