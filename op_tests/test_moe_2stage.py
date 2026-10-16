@@ -1653,15 +1653,15 @@ def test_swiglu_mxfp4_nonsplit_nobias_dispatch():
 def test_swiglu_mxfp4_untagged_layout_dispatch():
     """Callers that never tag w1.gate_up_interleave (None) -- ATOM's MiniMax-M3, for
     one -- must keep the CK-Tile split-k route with the standard post-activation
-    layout for bf16 activations. MiniMax-M3-MXFP4 at TP8 (inter_dim 384 padded to
-    512) fell through to the unshuffled-weights fallback instead and decoded garbage
-    until max tokens."""
+    layout for bf16 activations. MiniMax-M3-MXFP4 at TP8 (per-rank MoE call:
+    model_dim 6144, inter_dim 512, intermediate_pad 0) fell through to the
+    unshuffled-weights fallback instead and decoded garbage until max tokens."""
     if get_gfx() != "gfx950":
         aiter.logger.info(
             "skip SwiGLU MXFP4 untagged-layout dispatch test on %s", get_gfx()
         )
         return
-    model_dim, inter_dim, intermediate_pad, E, topk = 6144, 512, 128, 129, 5
+    model_dim, inter_dim, intermediate_pad, E, topk = 6144, 512, 0, 129, 5
     for token in (1, 8, 32, 128):
         metadata = get_2stage_cfgs(
             get_padded_M(token),
