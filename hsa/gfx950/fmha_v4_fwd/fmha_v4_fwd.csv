@@ -1,22 +1,15 @@
-# mode: 0 = dense 3-D grid, 1 = sorted block-sparse (flat grid + 752-byte kernarg, work_table @ 0x2D0)
-# lut_max: how many LUT entries a block-sparse row can stage, or 0 for a dense row, which stages
-# no LUT. A row longer than this reads back garbage rather than failing, so the launcher rejects a
-# sequence whose ceil(seqlen_k / ts_kv) could exceed it. The value is per row; take it from this
-# column rather than assuming a family-wide ceiling.
-# lse: 1 if the row's code object writes the per-row log-sum-exp when handed a buffer at kernarg
-# 0x40 with the flag at 0x100 set, 0 if the store is absent and the pointer would be ignored. A
-# capability rather than a request: the launcher only honours return_lse on a row that declares it,
-# because a row without the store returns whatever the caller allocated, which reads as a valid
-# LSE of zero. On gfx950 every dense and every block-sparse row has it.
-# ragged_kv: 1 if the row's block-sparse walk masks the keys past seqlen_k in a short last KV
-# block, so the key length need not be a multiple of ts_kv. A row without it would read the
-# zero-filled overhang as real keys of score 0, so the launcher requires the padding there. Dense
-# rows always mask the tail and leave this 0. Every block-sparse row here has it.
-# v_pack: V's layout within v_format (AttentionPack), part of the row key. 0 is the format's
-# default packing; 1 is an MXFP6 or MXFP4 V packed in the token order an FP6 P operand contracts
-# over (quantize_v_mxfp6_fp6_p / quantize_v_mxfp4_fp6_p).
+# mode: 0 = dense, 1 = sorted block-sparse.
+# ts_qo, ts_kv: the row's tile geometry. A block-sparse mask and LUT are in units of these tiles.
+# lut_max: the most KV tiles per sequence a block-sparse row accepts, or 0 for a dense row. The
+# launcher rejects a key length whose ceil(seqlen_k / ts_kv) exceeds it.
+# lse: 1 if the row can return the per-row log-sum-exp. The launcher refuses return_lse on a row
+# without it.
+# ragged_kv: 1 if a block-sparse row accepts a key length that is not a multiple of ts_kv. Dense
+# rows always accept one and leave this 0.
+# v_pack: V's layout within v_format (AttentionPack). 0 is the format's default packing; 1 is MXFP6
+# or MXFP4 V in FP6-P order (quantize_v_mxfp6_fp6_p / quantize_v_mxfp4_fp6_p).
 q_format,k_format,v_format,v_pack,o_format,q_scale_mode,k_scale_mode,v_scale_mode,o_scale_mode,hdim_q,hdim_v,mask,mode,ts_qo,ts_kv,lut_max,lse,ragged_kv,knl_name,co_name
-# DENSE kernels
+# Dense
 2,2,2,0,2,0,0,0,0,128,128,0,0,256,64,0,1,0,_ZN5aiter19fmha_fwd_hd128_bf16E,fwd_hd128_bf16.co
 2,2,3,0,2,0,0,1,0,128,128,0,0,256,64,0,1,0,_ZN5aiter22fmha_fwd_hd128_bf16fp8E,fwd_hd128_bf16fp8.co
 10,10,3,0,2,1,1,1,0,128,128,0,0,256,128,0,1,0,_ZN5aiter28fmha_fwd_hd128_i8fp8_gfx950E,fwd_hd128_i8fp8.co
@@ -27,64 +20,24 @@ q_format,k_format,v_format,v_pack,o_format,q_scale_mode,k_scale_mode,v_scale_mod
 7,7,7,1,2,5,5,5,0,128,128,0,0,256,128,0,1,0,_ZN5aiter27fmha_fwd_hd128_mxfp6_gfx950E,fwd_hd128_mxfp6.co
 7,7,9,1,2,5,5,5,0,128,128,0,0,256,128,0,1,0,_ZN5aiter28fmha_fwd_hd128_f6f4_gfx950E,fwd_hd128_f6f4.co
 9,9,9,1,2,5,5,5,0,128,128,0,0,256,128,0,1,0,_ZN5aiter28fmha_fwd_hd128_mxfp4_gfx950E,fwd_hd128_mxfp4.co
-# f4f4 disabled: mxfp4 now covers this row and claims the same v_pack=1 FP6-P V order.
-#9,9,9,1,2,5,5,5,0,128,128,0,0,256,128,0,1,0,_ZN5aiter28fmha_fwd_hd128_f4f4_gfx950E,fwd_hd128_f4f4.co
-# SPARSE kernels
-# The BF16 rows route on 64-token blocks, which is finer than every other 256x* row here. They
-# stage a 64-token KV tile either way -- the other recipes genuinely tile at 128 -- so this is the
-# granularity their walk already had, and one LUT entry is now one staged tile. lut_max stays the
-# 8192-entry LDS staging capacity, which at 64 tokens an entry reaches 524,288 keys.
+# Block-sparse
 2,2,2,0,2,0,0,0,0,128,128,0,1,256,64,8192,1,1,_ZN5aiter33fmha_fwd_hd128_bf16_sparse_gfx950E,fwd_hd128_bf16_sparse_256x64.co
 2,2,3,0,2,0,0,1,0,128,128,0,1,256,64,8192,1,1,_ZN5aiter36fmha_fwd_hd128_bf16fp8_sparse_gfx950E,fwd_hd128_bf16fp8_sparse_256x64.co
 10,10,3,0,2,1,1,1,0,128,128,0,1,256,128,7680,1,1,_ZN5aiter34fmha_fwd_hd128_i8fp8_sparse_gfx950E,fwd_hd128_i8fp8_sparse_256x128.co
 3,3,3,0,2,5,5,1,0,128,128,0,1,256,128,7680,1,1,_ZN5aiter34fmha_fwd_hd128_mxfp8_sparse_gfx950E,fwd_hd128_mxfp8_sparse_256x128.co
 3,3,3,0,2,1,1,1,0,128,128,0,1,256,128,7680,1,1,_ZN5aiter32fmha_fwd_hd128_fp8_sparse_gfx950E,fwd_hd128_fp8_sparse_256x128.co
-# f6f8 (MXFP6 Q/K, per-channel FP8 V) stages its LUT in LDS (8192 entries). Its LUT base takes the
-# registers the dense build's LSE V# holds, so the sparse build addresses its LSE row in the
-# epilogue instead.
 7,7,3,0,2,5,5,4,0,128,128,0,1,256,128,8192,1,1,_ZN5aiter33fmha_fwd_hd128_f6f8_sparse_gfx950E,fwd_hd128_f6f8_sparse_256x128.co
-# 64x64 FP8 rows. Same recipe and mode as the 256x128 FP8 sparse row above; they differ
-# only in tile geometry, so find_config keys on ts_qo/ts_kv to tell them apart and the caller picks
-# a geometry explicitly. For models whose routing is finer than a 128-token block (MiniMax-H3
-# video): a 64-token block quadruples routing resolution, but dense attention is 1.1-1.5x slower
-# per token, so these only win when the finer blocks cut enough kept mass to pay for it --
-# measure before routing here. Like the BF16 64x64 rows below, these walk the LUT straight out of
-# memory, so their sparse and dense builds both declare 33280 B and lut_max is the same
-# 65536 placeholder rather than a staging capacity.
 3,3,3,0,2,1,1,1,0,128,128,0,1,64,64,65536,1,1,_ZN5aiter38fmha_fwd_hd128_fp8_sparse_64x64_gfx950E,fwd_hd128_fp8_sparse_64x64.co
-# 64x64 BF16 rows, the same geometry tradeoff as the FP8 pair above but on the BF16 recipe.
-# Their lut_max is not a staging capacity: this kernel walks the LUT straight out of memory
-# instead of copying it into LDS, which is also why its sparse and dense builds both
-# declare the same 34048 B. There is therefore no buffer to overrun and no length that reads back
-# garbage; 65536 is written here only because find_config rejects 0, and it is far past any
-# reachable sequence (4M tokens at 64 per block).
 2,2,2,0,2,0,0,0,0,128,128,0,1,64,64,65536,1,1,_ZN5aiter39fmha_fwd_hd128_bf16_64x64_sparse_gfx950E,fwd_hd128_bf16_sparse_64x64.co
-# 64x64 BF16/FP8 rows: the BF16 64x64 kernel with the 256x64 BF16/FP8 row's PV side (FP8 P and V,
-# per-tensor V descale, approximate PKNORM softmax), so its dense output is bitwise the 256x64
-# row's. lut_max as in the BF16 pair above: the LUT is walked from memory, never staged.
 2,2,3,0,2,0,0,1,0,128,128,0,1,64,64,65536,1,1,_ZN5aiter42fmha_fwd_hd128_bf16fp8_64x64_sparse_gfx950E,fwd_hd128_bf16fp8_sparse_64x64.co
-# MXFP4 and MXFP6 with an MX V in FP6-P order (v_pack 1): Q/K rotated and block-scaled, P quantized
-# to FP6, V packed so one FP6 P operand contracts over its tokens. These sparse rows serve LSE and
-# mask a ragged last KV block. The MXFP4 sparse walks stage their LUT in
-# LDS (8192 entries); the MXFP6 ones read it from memory, so 65536 is the usual placeholder.
 9,9,9,1,2,5,5,5,0,128,128,0,1,256,128,8192,1,1,_ZN5aiter39fmha_fwd_hd128_mxfp4_fp6p_sparse_gfx950E,fwd_hd128_mxfp4_fp6p_sparse_256x128.co
 7,7,7,1,2,5,5,5,0,128,128,0,1,256,128,65536,1,1,_ZN5aiter39fmha_fwd_hd128_mxfp6_fp6p_sparse_gfx950E,fwd_hd128_mxfp6_fp6p_sparse_256x128.co
-# f8f6 and f6f4 with their MX V in FP6-P order (v_pack 1), with the same LSE and ragged KV options
-# as the MXFP4/MXFP6 FP6-P rows. f8f6 stages its LUT in LDS (8192 entries); f6f4 reads it from
-# memory, so 65536 is the placeholder.
 3,3,7,1,2,1,1,5,0,128,128,0,1,256,128,8192,1,1,_ZN5aiter38fmha_fwd_hd128_f8f6_fp6p_sparse_gfx950E,fwd_hd128_f8f6_fp6p_sparse_256x128.co
 7,7,9,1,2,5,5,5,0,128,128,0,1,256,128,65536,1,1,_ZN5aiter38fmha_fwd_hd128_f6f4_fp6p_sparse_gfx950E,fwd_hd128_f6f4_fp6p_sparse_256x128.co
-# 64x64 f8f6 rows: the 64x64 FP8 rows' schedule with the 256x128 f8f6 rows' PV side (FP6 P, MXFP6 V
-# in the same FP6-P order, a 64-token tile being one half of a packed 128-token record), so they
-# take the same V. lut_max as in the 64x64 FP8 pair: the LUT is walked from memory.
 3,3,7,1,2,1,1,5,0,128,128,0,1,64,64,65536,1,1,_ZN5aiter44fmha_fwd_hd128_f8f6_fp6p_sparse_64x64_gfx950E,fwd_hd128_f8f6_fp6p_sparse_64x64.co
 7,7,7,1,2,5,5,5,0,128,128,0,1,64,64,65536,1,1,_ZN5aiter45fmha_fwd_hd128_mxfp6_fp6p_sparse_64x64_gfx950E,fwd_hd128_mxfp6_fp6p_sparse_64x64.co
 7,7,9,1,2,5,5,5,0,128,128,0,1,64,64,65536,1,1,_ZN5aiter44fmha_fwd_hd128_f6f4_fp6p_sparse_64x64_gfx950E,fwd_hd128_f6f4_fp6p_sparse_64x64.co
 9,9,9,1,2,5,5,5,0,128,128,0,1,64,64,65536,1,1,_ZN5aiter45fmha_fwd_hd128_mxfp4_fp6p_sparse_64x64_gfx950E,fwd_hd128_mxfp4_fp6p_sparse_64x64.co
 3,3,3,0,2,5,5,1,0,128,128,0,1,64,64,65536,1,1,_ZN5aiter40fmha_fwd_hd128_mxfp8_sparse_64x64_gfx950E,fwd_hd128_mxfp8_sparse_64x64.co
-# 64x64 f6f8: the 64x64 mxfp6 rows' Q and K with the 64x64 FP8 rows' V, its per-channel descale
-# folded into 1/L after the LSE store.
 7,7,3,0,2,5,5,4,0,128,128,0,1,64,64,65536,1,1,_ZN5aiter39fmha_fwd_hd128_f6f8_sparse_64x64_gfx950E,fwd_hd128_f6f8_sparse_64x64.co
-# 64x64 INT8/FP8: the 64x64 FP8 rows with the 256x128 INT8/FP8 rows' per-tensor INT8 Q and K. The
-# integer QK cannot fold the softmax affine, so it converts its scores and runs it on the VALU.
 10,10,3,0,2,1,1,1,0,128,128,0,1,64,64,65536,1,1,_ZN5aiter40fmha_fwd_hd128_i8fp8_sparse_64x64_gfx950E,fwd_hd128_i8fp8_sparse_64x64.co
