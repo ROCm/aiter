@@ -269,13 +269,22 @@ def mla_prefill_fwd(
 
 
 def _pipelined_unshuffled_lds_bytes(
-    block_size, block_m, kv_lora_rank, qk_rope_head_dim, kv_elem_size, q_elem_size
+    block_size,
+    block_m,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    kv_elem_size,
+    q_elem_size,
+    num_stages=2,
+    q_from_lds=False,
 ):
-    # Two TDM stages of KV, whose LoRA and RoPE rows are each padded by 16 bytes,
-    # plus the Q tile, whose rows are padded by 8 elements.
+    # num_stages TDM stages of KV, whose LoRA and RoPE rows are each padded by
+    # 16 bytes, plus the Q tile, whose LoRA and RoPE rows are each padded by 8
+    # elements, or by 16 when the kernel reads Q from LDS inside the loop.
     kv_row = (kv_lora_rank + qk_rope_head_dim) * kv_elem_size + 2 * 16
-    q_row = (kv_lora_rank + 8 + qk_rope_head_dim + 8) * q_elem_size
-    return 2 * block_size * kv_row + block_m * q_row
+    q_pad = 16 if q_from_lds else 8
+    q_row = (kv_lora_rank + qk_rope_head_dim + 2 * q_pad) * q_elem_size
+    return num_stages * block_size * kv_row + block_m * q_row
 
 
 def _tuned_decode_config(
@@ -507,6 +516,19 @@ def mla_decode_fwd(
             )
             reduce_config["NUM_SEGMENTS_PER_SEQ"] = tuned["NUM_SEGMENTS_PER_SEQ"]
         attn_config.update(tuned)
+        assert (
+            _pipelined_unshuffled_lds_bytes(
+                block_size,
+                BLOCK_M,
+                kv_lora_rank,
+                qk_rope_head_dim,
+                kv_buffer.element_size(),
+                q.element_size(),
+                attn_config["num_stages"],
+                attn_config.get("Q_FROM_LDS", False),
+            )
+            <= 256 * 1024
+        ), f"tuned config {tuned} exceeds the pipelined kernel's LDS budget"
         selected_num_segments = attn_config["NUM_SEGMENTS_PER_SEQ"]
     NUM_SEGMENTS = 1 if use_lds_pipeline else selected_num_segments
     if NUM_SEGMENTS > 1:
