@@ -831,7 +831,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
     def _get_triton_tasks(
         self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
     ):
-        if scaleAB or is_shuffle or outdtype == dtypes.fp32 or indtype != dtypes.bf16:
+        if scaleAB or is_shuffle or indtype != dtypes.bf16:
             return []
         M, N, K = info_keys[2], info_keys[3], info_keys[4]
         rtol, _ = _default_tol(outdtype)

@@ -3,6 +3,7 @@
 
 import glob
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -14,15 +15,37 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
-FLYDSL_VERSION = "flydsl==0.3.4.1"
+FLYDSL_VERSION = "flydsl==0.4.0"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", "0"))
+# Opt-in: tag a wheel without compiled modules py3-none (see
+# _python_agnostic_bdist_wheel). Unset, wheels are tagged as before.
+AITER_PY3_WHEEL = os.environ.get("AITER_PY3_WHEEL", "0") == "1"
 PRETUNE_MODULES = os.environ.get("PRETUNE_MODULES", "")
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
 IS_WINDOWS = sys.platform == "win32"
-# Single skip-C++/HIP-build gate; Windows enables it automatically.
-AITER_TRITON_ONLY = os.environ.get("AITER_TRITON_ONLY", "0") == "1" or IS_WINDOWS
+# flydsl publishes Linux-only wheels.
+FLYDSL_REQUIRES = [] if IS_WINDOWS else [FLYDSL_VERSION]
+# Single skip-C++/HIP-build gate.
+AITER_TRITON_ONLY = os.environ.get("AITER_TRITON_ONLY", "0") == "1"
+
+
+def has_rocm_toolchain():
+    """Whether a ROCm install the JIT can build against was found."""
+    sys.path.insert(0, os.path.join(this_dir, "aiter", "jit", "utils"))
+    from cpp_extension import IS_HIP_EXTENSION
+
+    return IS_HIP_EXTENSION
+
+
+# The HIP SDK is a separate, optional install on Windows, and a Triton-only
+# install is the supported fallback without it. Linux keeps failing loudly
+# instead, where ROCm is a hard prerequisite and its absence is a broken
+# install.
+if not AITER_TRITON_ONLY and IS_WINDOWS and not has_rocm_toolchain():
+    print("No ROCm install found, building the Triton ops only", file=sys.stderr)
+    AITER_TRITON_ONLY = True
 if AITER_TRITON_ONLY:
     ENABLE_CK = False
     PREBUILD_KERNELS = False
@@ -54,7 +77,7 @@ def is_develop_mode():
     return False
 
 
-if not AITER_TRITON_ONLY and is_develop_mode():
+if not AITER_TRITON_ONLY and not IS_WINDOWS and is_develop_mode():
     try:
         from importlib.metadata import version as pkg_version
 
@@ -209,7 +232,7 @@ if not _is_metadata_only() and not AITER_TRITON_ONLY:
     import json
     from concurrent.futures import ThreadPoolExecutor
 
-    sys.path.insert(0, f"{this_dir}/aiter/")
+    sys.path.insert(0, os.path.join(this_dir, "aiter"))
     from jit import core
     from jit.utils.cpp_extension import IS_HIP_EXTENSION
 
@@ -224,7 +247,9 @@ if not _is_metadata_only() and not AITER_TRITON_ONLY:
     if not IS_ROCM:
         raise NotImplementedError("Only ROCM is supported")
 
-    ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
+    ck_dir = os.environ.get(
+        "CK_DIR", os.path.join(this_dir, "3rdparty", "composable_kernel")
+    )
     if ENABLE_CK:
         assert os.path.exists(ck_dir), (
             "CK is needed by aiter, please make sure clone by "
@@ -394,18 +419,21 @@ if PREBUILD_KERNELS != 0:
         os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
         # --- FlyDSL AOT pre-compilation (MOE + GEMM, before CK) ---
-        _prev_aot_import = os.environ.get("AITER_AOT_IMPORT")
-        os.environ["AITER_AOT_IMPORT"] = "1"
-        try:
-            from aiter.aot.flydsl.common import run_aot
+        if not IS_WINDOWS:
+            _prev_aot_import = os.environ.get("AITER_AOT_IMPORT")
+            os.environ["AITER_AOT_IMPORT"] = "1"
+            try:
+                from aiter.aot.flydsl.common import run_aot
 
-            flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
-            run_aot(flydsl_cache_dir)
-        finally:
-            if _prev_aot_import is None:
-                os.environ.pop("AITER_AOT_IMPORT", None)
-            else:
-                os.environ["AITER_AOT_IMPORT"] = _prev_aot_import
+                flydsl_cache_dir = os.path.join(
+                    this_dir, "aiter", "jit", "flydsl_cache"
+                )
+                run_aot(flydsl_cache_dir)
+            finally:
+                if _prev_aot_import is None:
+                    os.environ.pop("AITER_AOT_IMPORT", None)
+                else:
+                    os.environ["AITER_AOT_IMPORT"] = _prev_aot_import
 
         # --- CK kernel builds ---
         with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
@@ -449,6 +477,41 @@ class NinjaBuildExtension(build_ext):
         super().run()
 
 
+def _python_agnostic_bdist_wheel():
+    """Return a bdist_wheel that tags wheels without compiled modules py3-none.
+
+    Used only with AITER_PY3_WHEEL=1. A wheel without compiled modules carries
+    only Python, C++/CK sources and ASM code objects, and every host module is
+    JIT-built on first use against the running interpreter, so it is valid for
+    any CPython 3 on the platform. The decision is made from the files staged
+    for the wheel, not from PREBUILD_KERNELS: modules from a targeted prebuild,
+    or JIT output left in aiter/jit/ by an in-tree run, are packaged too and
+    keep the interpreter-specific tag.
+    """
+    try:
+        from setuptools.command.bdist_wheel import bdist_wheel
+    except ImportError:  # setuptools < 70.1
+        from wheel.bdist_wheel import bdist_wheel
+
+    # Compiled files: .so (also versioned, .so.N) on Linux; .pyd modules and
+    # .dll libraries on Windows.
+    compiled = re.compile(r"\.(so(\.\d+)*|pyd|dll)$")
+
+    class PythonAgnosticBdistWheel(bdist_wheel):
+        def get_tag(self):
+            impl, abi, plat = super().get_tag()
+            # bdist_wheel stages the wheel's files in bdist_dir before asking
+            # for the tag; if they are not there, keep the interpreter tag.
+            if not (self.bdist_dir and os.path.isdir(self.bdist_dir)):
+                return impl, abi, plat
+            for _, _, files in os.walk(self.bdist_dir):
+                if any(compiled.search(name) for name in files):
+                    return impl, abi, plat
+            return "py3", "none", plat
+
+    return PythonAgnosticBdistWheel
+
+
 setup_requires = [
     "packaging",
     "psutil",
@@ -475,7 +538,7 @@ else:
         "einops",
         "psutil",
         "packaging",
-        FLYDSL_VERSION,
+        *FLYDSL_REQUIRES,
     ]
 
 setup(
@@ -490,8 +553,12 @@ setup(
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: BSD License",
         "Operating System :: Unix",
+        "Operating System :: Microsoft :: Windows",
     ],
-    cmdclass={"build_ext": NinjaBuildExtension},
+    cmdclass={
+        "build_ext": NinjaBuildExtension,
+        **({"bdist_wheel": _python_agnostic_bdist_wheel()} if AITER_PY3_WHEEL else {}),
+    },
     # 3.8/3.9 have not actually worked for a long time: 81 modules already use
     # PEP 604 annotations (`X | None`) without `from __future__ import
     # annotations`, so they raise TypeError at import time on <3.10. Keep in sync
@@ -504,6 +571,8 @@ setup(
         # Install with: pip install -r requirements-triton-comms.txt
         # (See requirements-triton-comms.txt for pinned Iris version)
         "triton_comms": [],
+        # Offline IQ2R checkpoint tools (aiter.quantization.iq2r)
+        "iq2r": ["safetensors"],
         # Install all optional dependencies
         "all": [],
     },
