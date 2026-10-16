@@ -469,16 +469,26 @@ __global__ void radix_topk_one_block_kernel(
     }
     __syncthreads();
 
-    in += batch_id * len;
+    // Point in/in_idx at the row window. Indices stay row-local until
+    // add_row_start() shifts them back before each exit.
+    in += batch_id * len + rowStart;
     if (out) out += batch_id * k;
     if (out_idx) out_idx += batch_id * k;
-    if (in_idx) in_idx += batch_id * len;
+    if (in_idx) in_idx += batch_id * len + rowStart;
+
+    auto add_row_start = [&]() {
+        if (rowStart != 0 && out_idx) {
+            __syncthreads();
+            for (IdxT i = threadIdx.x; i < k_actual; i += BlockSize)
+                out_idx[i] += rowStart;
+        }
+    };
 
     if (row_len <= k_actual) {
         if (out_idx) {
             for (int i = threadIdx.x; i < k_actual; i += BlockSize) {
                 out_idx[i] = i < row_len ? i + rowStart : -1;
-                if (WRITE_TOPK_VALUES && out) out[i] = i < row_len ? in[i + rowStart] : 0;
+                if (WRITE_TOPK_VALUES && out) out[i] = i < row_len ? in[i] : 0;
             }
         }
         if (renorm_pivot) {
@@ -532,6 +542,7 @@ __global__ void radix_topk_one_block_kernel(
                     renorm_normalizer[batch_id] = __frcp_rn(fmaxf(total_sum, 1e-8f));
                 }
             }
+            add_row_start();
             return;
         }
     }
@@ -599,6 +610,7 @@ __global__ void radix_topk_one_block_kernel(
                     renorm_normalizer[batch_id] = __frcp_rn(fmaxf(total_sum, 1e-8f));
                 }
             }
+            add_row_start();
             return;
         }
     }
@@ -667,6 +679,7 @@ __global__ void radix_topk_one_block_kernel(
             break;
         }
     }
+    add_row_start();
 }
 
 inline size_t calc_aligned_size(std::vector<size_t> const& sizes) {
