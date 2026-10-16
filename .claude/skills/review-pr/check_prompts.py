@@ -141,6 +141,20 @@ def check_owner_fallbacks():
     return 1 if bad else 0
 
 
+def check_no_self_trigger():
+    """The bot's own comments are issue_comment events like any other. Without an explicit
+    exclusion every card and queue notice starts a run of this workflow, which is gated off a
+    moment later -- but only after taking a hosted-runner slot the real requests are waiting
+    for. The guard is one line and leaves no trace when removed, so assert it."""
+    wf = WORKFLOW.read_text(encoding="utf-8")
+    if not re.search(r"github\.event\.comment\.user\.login != 'aiter-bot'", wf):
+        print("\u274c the gate does not exclude the bot's own comments; every notice it posts "
+              "will start a run that competes with real requests")
+        return 1
+    print("\u2705 the gate excludes the bot's own comments")
+    return 0
+
+
 def check_notified_handoff():
     """The report job stays quiet when the review job says it already spoke. That answer travels
     _notify.py -> step output -> job output -> the report job's env, and every link is a string
@@ -202,6 +216,7 @@ def main():
     bad += check_fail_classes()
     bad += check_budget_fits()
     bad += check_owner_fallbacks()
+    bad += check_no_self_trigger()
     bad += check_notified_handoff()
     bad += check_runner_label_exclusive()
     print(f"{'OK' if bad == 0 else 'DRIFT'}: {bad} drift(s)")

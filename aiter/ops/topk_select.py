@@ -720,6 +720,10 @@ def _dispatch(
     deterministic=False,
     max_row_len=None,
 ):
+    # Every backend puts rows on a grid dimension, and HIP rejects a zero-sized
+    # launch. An empty batch has nothing to select, so `idx` stays [0, topk].
+    if rows == 0:
+        return
     if backend == "argmax":
         topk_per_row_argmax(input, row_lens, idx)
     elif backend == "small_k":
