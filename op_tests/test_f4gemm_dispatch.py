@@ -12,19 +12,43 @@ separately for each backend, and require identical BF16 storage bits.
 
 import ctypes
 import itertools
+import json
 import os
-import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+from op_tests._f4gemm_test_utils import (
+    get_dispatch_lib,
+)
+from op_tests._f4gemm_test_utils import (
+    query_launch_config as _launch_config,
+)
 
 _NPS_KERNEL = "_ZN5aiter41f4gemm_bf16_mxfp4_BpreShuffle_192x256_4x4E"
 _PS_KERNEL = "_ZN5aiter44f4gemm_bf16_mxfp4_BpreShuffle_256x256_4x4_psE"
 
 
+@pytest.fixture(scope="module", autouse=True)
+def default_dispatch_environment():
+    # Overrides are cached on first use; test them in fresh subprocesses below.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.delenv("AITER_F4GEMM_TUNE", raising=False)
+        yield
+
+
 @pytest.fixture(scope="module")
-def f4gemm_ut():
+def f4gemm_module():
+    pytest.importorskip("torch")
+    from op_tests import test_f4gemm
+
+    return test_f4gemm
+
+
+@pytest.fixture(scope="module")
+def f4gemm_ut(request):
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("ASM/Gluon bit-match requires a gfx1250 GPU")
@@ -39,15 +63,10 @@ def f4gemm_ut():
     if not is_gfx1250_asm_supported():
         pytest.skip("F4GEMM ASM requires gfx1250 B0 or newer")
 
-    # The CLI module selects CUDA as its default device; restore the caller's
-    # default when this module's tests finish.
-    previous_device = torch.get_default_device()
-    from op_tests import test_f4gemm
-
-    try:
-        yield test_f4gemm
-    finally:
-        torch.set_default_device(previous_device)
+    # Importing the CLI module has no default-device side effect. Scope the
+    # CUDA default to this fixture, even when pytest collected that file first.
+    with torch.device("cuda"):
+        yield request.getfixturevalue("f4gemm_module")
 
 
 @pytest.mark.parametrize(
@@ -93,8 +112,10 @@ def test_asm_gluon_bitmatch(f4gemm_ut, M, N, K, apre, data_init, scale_init):
         pytest.param([0x3F80], [0x3F81], 1, id="one-bf16-ulp"),
     ],
 )
-def test_bitmatch_storage_bits(f4gemm_ut, asm_bits, gluon_bits, expected_mismatches):
-    ut = f4gemm_ut
+def test_bitmatch_storage_bits(
+    f4gemm_module, asm_bits, gluon_bits, expected_mismatches
+):
+    ut = f4gemm_module
     torch = ut.torch
     asm_out = torch.tensor([asm_bits], dtype=torch.uint16, device="cpu").view(
         torch.bfloat16
@@ -136,16 +157,21 @@ def test_nps_asm_gluon_bitmatch(f4gemm_ut, K, data_init, scale_init, seed):
 
 @pytest.mark.parametrize("apre", [0, 1])
 @pytest.mark.parametrize("outtype", ["bf16", "fp8"])
-def test_preallocated_output(f4gemm_ut, apre, outtype):
+@pytest.mark.parametrize("intype", ["mxfp4", "nvfp4"])
+def test_preallocated_output(f4gemm_ut, apre, outtype, intype):
     ut = f4gemm_ut
     M, N, K = 32, 128, 256
-    inp, _ = ut._prep_mxfp4(M, N, K, apre, "uniform", "auto", ut.make_generator(0))
+    prep = ut._prep_mxfp4 if intype == "mxfp4" else ut._prep_nvfp4
+    gemm = getattr(ut.aiter, f"gemm_{intype}_asm")
+    inp, _ = prep(M, N, K, apre, "uniform", "auto", ut.make_generator(0))
     args = (inp["A"], inp["B"], inp["sA"], inp["sB"])
+    if intype == "nvfp4":
+        args += (inp["gA"], inp["gB"])
     dtype = ut._OUT_DTYPE[outtype]
-    expected = ut.aiter.gemm_mxfp4_asm(*args, dtype=dtype, a_preshuffle=bool(apre))
+    expected = gemm(*args, dtype=dtype, a_preshuffle=bool(apre))
     y = ut.torch.empty((M, N), dtype=dtype, device=inp["A"].device)
     y.view(ut.torch.uint8).fill_(0xFF)
-    result = ut.aiter.gemm_mxfp4_asm(*args, dtype=dtype, a_preshuffle=bool(apre), y=y)
+    result = gemm(*args, dtype=dtype, a_preshuffle=bool(apre), y=y)
     if outtype == "fp8":
         out, scale = result
         expected, expected_scale = expected
@@ -164,10 +190,16 @@ def test_preallocated_output(f4gemm_ut, apre, outtype):
 
 
 @pytest.mark.parametrize("invalid", ["shape", "dtype", "device", "strides"])
-def test_reject_invalid_output(f4gemm_ut, invalid):
+@pytest.mark.parametrize("intype", ["mxfp4", "nvfp4"])
+def test_reject_invalid_output(f4gemm_ut, invalid, intype):
     ut = f4gemm_ut
     M, N, K = 32, 128, 256
-    inp, _ = ut._prep_mxfp4(M, N, K, 0, "constant", "constant", ut.make_generator(0))
+    prep = ut._prep_mxfp4 if intype == "mxfp4" else ut._prep_nvfp4
+    gemm = getattr(ut.aiter, f"gemm_{intype}_asm")
+    inp, _ = prep(M, N, K, 0, "constant", "constant", ut.make_generator(0))
+    args = (inp["A"], inp["B"], inp["sA"], inp["sB"])
+    if intype == "nvfp4":
+        args += (inp["gA"], inp["gB"])
     shape = (M, N + 1) if invalid == "shape" else (M, N)
     dtype = ut.torch.float32 if invalid == "dtype" else ut.dtypes.bf16
     device = "cpu" if invalid == "device" else inp["A"].device
@@ -175,59 +207,159 @@ def test_reject_invalid_output(f4gemm_ut, invalid):
     if invalid == "strides":
         y = y.t().contiguous().t()
     with pytest.raises(ValueError, match="y must be contiguous"):
-        ut.aiter.gemm_mxfp4_asm(
-            inp["A"], inp["B"], inp["sA"], inp["sB"], a_preshuffle=False, y=y
-        )
+        gemm(*args, a_preshuffle=False, y=y)
+
+
+@pytest.mark.parametrize("intype", ["mxfp4", "nvfp4"])
+@pytest.mark.parametrize("outtype", ["bf16", "fp8"])
+@pytest.mark.parametrize("apre", [False, True])
+@pytest.mark.parametrize("preallocated", [False, True])
+def test_empty_batch(f4gemm_module, monkeypatch, intype, outtype, apre, preallocated):
+    ut = f4gemm_module
+    torch = ut.torch
+    from aiter.ops import gemm_op_a4w4 as ops
+
+    def unexpected_launch(*args, **kwargs):
+        pytest.fail("an empty batch must not launch an ASM kernel")
+
+    monkeypatch.setattr(ops, "require_gfx1250_asm", lambda name: None)
+    monkeypatch.setattr(ops, "get_gfx", lambda: "gfx1250")
+    monkeypatch.setattr(ops, "_mxfp4_gemm_asm", unexpected_launch)
+    monkeypatch.setattr(ops, "_nvfp4_gemm_asm", unexpected_launch)
+    N, K = 128, 256
+    A = torch.empty((0, K // 2), dtype=torch.uint8, device="cpu")
+    B = torch.empty((N, K // 2), dtype=torch.uint8, device="cpu")
+    block = 32 if intype == "mxfp4" else 16
+    sA = torch.empty((0, K // block), dtype=torch.uint8, device="cpu")
+    sB = torch.empty((N, K // block), dtype=torch.uint8, device="cpu")
+    dtype = ut._OUT_DTYPE[outtype]
+    y = torch.empty((0, N), dtype=dtype, device="cpu") if preallocated else None
+    args = (A, B, sA, sB)
+    scales = (1.0, 1.0) if intype == "nvfp4" else ()
+    result = getattr(ops, f"gemm_{intype}_asm")(
+        *args, *scales, dtype=dtype, a_preshuffle=apre, y=y
+    )
+    out = result[0] if outtype == "fp8" else result
+    assert out.shape == (0, N) and out.dtype == dtype and out.device == A.device
+    if preallocated:
+        assert out is y
+    if outtype == "fp8":
+        assert result[1].shape == (0, 1) and result[1].dtype == ut.dtypes.fp8_e8m0
+
+    # Also cover the public dispatch and preservation of empty batch dimensions.
+    kwargs = {"apreshuffle": apre}
+    if intype == "nvfp4":
+        kwargs["global_A_scale"] = torch.tensor(1.0, device="cpu")
+    for leading in [(0,), (2, 0)]:
+        args = (A.reshape(*leading, K // 2), B, sA, sB)
+        if outtype == "fp8":
+            out, scale = ops.gemm_a4w4o8(*args, **kwargs)
+            assert scale.shape == (0, 1)
+        else:
+            out = ops.gemm_a4w4(*args, **kwargs)
+        assert out.shape == (*leading, N) and out.dtype == dtype
+
+
+@pytest.mark.parametrize("knl_name", [None, "unregistered_kernel"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        "cannot get heuristic kernel",
+        "kernel not in cfg_f4gemm",
+        "no kernel registered for f4gemm",
+        "selected kernel not in f4gemm manifest",
+    ],
+)
+def test_missing_config_is_reported(f4gemm_module, monkeypatch, knl_name, message):
+    ut = f4gemm_module
+
+    def missing_config(*args, **kwargs):
+        raise RuntimeError(message)
+
+    def unexpected_prep(*args, **kwargs):
+        pytest.fail("unsupported configs must be rejected before input preparation")
+
+    monkeypatch.setattr(ut, "get_gfx", lambda: "gfx1250")
+    monkeypatch.setattr(ut, "_kernel_config", missing_config)
+    monkeypatch.setattr(ut, "_prep_mxfp4", unexpected_prep)
+    row = ut.test_gemm("mxfp4", 32, 128, 256, 0, knl_name=knl_name, check_gluon=True)
+    assert row["asm result"] == f"not support ({message})"
+    assert row["knl_name"] == (knl_name or "auto")
+    assert row["tile"] == "n/a"
+    assert row["gluon bitmatch"] == "not checked"
+
+
+def test_config_errors_propagate(f4gemm_module, monkeypatch):
+    def broken_config(*args, **kwargs):
+        raise RuntimeError("unexpected dispatch failure")
+
+    monkeypatch.setattr(f4gemm_module, "_kernel_config", broken_config)
+    with pytest.raises(RuntimeError, match="unexpected dispatch failure"):
+        f4gemm_module.test_gemm("mxfp4", 32, 128, 256, 0)
+
+
+@pytest.mark.parametrize(
+    "shape,cluster",
+    [
+        ((32, 256, 256), (2, 1)),
+        ((768, 256, 256), (1, 2)),
+        ((768, 1024, 256), (4, 1)),
+        ((512, 512, 256), (2, 2)),
+        ((1024, 256, 256), (1, 4)),
+        ((512, 1024, 256), (4, 2)),
+        ((1024, 512, 256), (2, 4)),
+        ((1024, 1024, 256), (4, 4)),
+    ],
+)
+@pytest.mark.parametrize("intype", ["mxfp4", "nvfp4"])
+@pytest.mark.parametrize("outtype", ["bf16", "fp8"])
+@pytest.mark.parametrize("apre", [0, 1])
+def test_persistent_cluster_outputs(f4gemm_ut, shape, cluster, intype, outtype, apre):
+    ut = f4gemm_ut
+    pre = "ABpreShuffle" if apre else "BpreShuffle"
+    base = f"f4gemm_{outtype}_{intype}_{pre}_256x256_4x4_ps"
+    kernel = f"_ZN5aiter{len(base)}{base}E"
+    row = ut.test_gemm(
+        intype,
+        *shape,
+        apre,
+        outtype,
+        mode="func",
+        knl_name=kernel,
+        num_iters=3,
+        num_warmup=0,
+        num_rotate=1,
+        check_gluon=intype == "mxfp4" and outtype == "bf16",
+    )
+    assert row["ps_mode"] == 1 and row["cluster"] == f"{cluster[0]}x{cluster[1]}"
+    assert row["asm result"] == "pass", row
+    if intype == "mxfp4" and outtype == "bf16":
+        assert row["gluon bitmatch"] == "pass", row
+
+
+def test_gemm_defaults_use_preshuffled_a(f4gemm_ut):
+    ut = f4gemm_ut
+    M, N, K = 768, 1024, 256
+    cfg = ut._kernel_config(M, N, K, "mxfp4", "bf16", 1)
+    assert (cfg["tile_m"], cfg["tile_n"], cfg["ps_mode"]) == (256, 256, 1)
+    inp, _ = ut._prep_mxfp4(
+        M, N, K, 1, "uniform", "auto", ut.make_generator(0), check_gluon=True
+    )
+    out = ut.aiter.gemm_mxfp4_asm(inp["A"], inp["B"], inp["sA"], inp["sB"])
+    result = ut._compare_gluon_output(out, ut.run_gluon_mxfp4(*inp["gluon_args"]))
+    assert result["gluon mismatches"] == 0, result
 
 
 @pytest.fixture(scope="module")
-def dispatch_lib():
-    jit_dir = Path(
-        os.environ.get(
-            "AITER_JIT_DIR", Path(__file__).resolve().parents[1] / "aiter/jit"
-        )
-    )
-    path = jit_dir / "module_f4gemm_asm_nps_dispatch.so"
-    if not path.is_file():
-        pytest.skip(
-            "build module_f4gemm_asm_nps_dispatch to check the dispatch metadata"
-        )
-    lib = ctypes.CDLL(str(path))
-    lib.f4gemm_launch_config.argtypes = [
-        ctypes.c_int64,
-        ctypes.c_int64,
-        ctypes.c_int64,
-        ctypes.c_char_p,
-        ctypes.c_char_p,
-        ctypes.c_int64,
-        ctypes.c_char_p,
-        ctypes.c_int64,
-        ctypes.c_void_p,
-    ]
-    lib.f4gemm_launch_config.restype = ctypes.c_int
-    lib.aiter_get_last_error.argtypes = []
-    lib.aiter_get_last_error.restype = ctypes.c_char_p
+def dispatch_lib(geometry_lib):
+    lib = geometry_lib
+    try:
+        _launch_config(lib, 768, 1024, 256, kernel=_PS_KERNEL)
+    except RuntimeError as e:
+        if "no kernel registered for f4gemm" in str(e):
+            pytest.skip("the dispatch module was built without gfx1250 F4GEMM kernels")
+        raise
     return lib
-
-
-def _launch_config(lib, M, N, K, intype="mxfp4", outtype="bf16", apre=0, kernel=None):
-    values = []
-    for field in range(7):
-        value = lib.f4gemm_launch_config(
-            M,
-            N,
-            K,
-            intype.encode(),
-            outtype.encode(),
-            apre,
-            kernel.encode() if kernel else None,
-            field,
-            None,
-        )
-        if value < 0:
-            raise RuntimeError(lib.aiter_get_last_error().decode())
-        values.append(value)
-    return tuple(values)
 
 
 @pytest.mark.parametrize(
@@ -238,6 +370,10 @@ def _launch_config(lib, M, N, K, intype="mxfp4", outtype="bf16", apre=0, kernel=
         ((768, 1024, 1792), "mxfp4", "bf16", 0, (4, 4, 1, 1, 192, 256, 0)),
         ((1536, 24576, 1536), "mxfp4", "bf16", 0, (4, 4, 24, 2, 192, 256, 0)),
         ((1536, 7168, 16384), "mxfp4", "bf16", 0, (4, 4, 7, 2, 192, 256, 0)),
+        ((3072, 8192, 8192), "mxfp4", "bf16", 0, (4, 4, 8, 4, 192, 256, 0)),
+        ((2304, 16384, 16384), "mxfp4", "bf16", 0, (4, 4, 16, 3, 192, 256, 0)),
+        ((768, 50176, 256), "mxfp4", "bf16", 0, (4, 1, 16, 4, 256, 256, 1)),
+        ((12288, 16384, 16384), "mxfp4", "bf16", 0, (4, 4, 4, 4, 256, 256, 1)),
         ((767, 1024, 256), "mxfp4", "bf16", 0, (4, 1, 16, 4, 256, 256, 1)),
         ((768, 1008, 256), "mxfp4", "bf16", 0, (4, 1, 16, 4, 256, 256, 1)),
         ((768, 1024, 288), "mxfp4", "bf16", 0, (4, 1, 16, 4, 256, 256, 1)),
@@ -246,11 +382,35 @@ def _launch_config(lib, M, N, K, intype="mxfp4", outtype="bf16", apre=0, kernel=
         ((768, 1024, 256), "nvfp4", "bf16", 0, (4, 1, 16, 4, 256, 256, 1)),
     ],
 )
-def test_launch_config(
-    dispatch_lib, monkeypatch, shape, intype, outtype, apre, expected
-):
-    monkeypatch.delenv("AITER_F4GEMM_TUNE", raising=False)
+def test_launch_config(dispatch_lib, shape, intype, outtype, apre, expected):
     assert _launch_config(dispatch_lib, *shape, intype, outtype, apre) == expected
+
+
+def test_query_cache_is_scoped_by_architecture(dispatch_lib):
+    expected = _launch_config(dispatch_lib, 768, 1024, 256)
+    with pytest.raises(RuntimeError, match="cannot get heuristic kernel"):
+        _launch_config(dispatch_lib, 768, 1024, 256, arch="gfx950")
+    assert _launch_config(dispatch_lib, 768, 1024, 256) == expected
+
+
+def test_explicit_nps_bypasses_heuristic_size_bound(dispatch_lib):
+    assert _launch_config(dispatch_lib, 12288, 16384, 16384, kernel=_NPS_KERNEL) == (
+        4,
+        4,
+        16,
+        16,
+        192,
+        256,
+        0,
+    )
+
+
+def test_persistent_alignment_error(dispatch_lib):
+    with pytest.raises(
+        RuntimeError, match="persistent kernels require N%16=0"
+    ) as error:
+        _launch_config(dispatch_lib, 768, 1000, 256, kernel=_PS_KERNEL)
+    assert "NPS" not in str(error.value)
 
 
 @pytest.mark.parametrize(
@@ -271,83 +431,62 @@ def test_reject_nps_format_mismatch(dispatch_lib, intype, outtype, apre):
 
 
 @pytest.mark.parametrize(
-    "shape", [(0, 1024, 256), (768, -1, 256), (768, 1024, 0), (2**31, 1024, 256)]
+    "tune,expected,error",
+    [
+        (None, (4, 1, 16, 4, 256, 256, 1), ""),
+        ("4,4,4", (4, 4, 4, 4, 256, 256, 1), ""),
+        ("3,2,4", None, "cluster axes"),
+        ("4,4", None, "must be cluster_x,cluster_y,grid_y"),
+    ],
 )
-def test_reject_invalid_dimensions(dispatch_lib, shape):
-    with pytest.raises(RuntimeError, match="positive int32 dimensions"):
-        _launch_config(dispatch_lib, *shape)
+def test_persistent_override_preserves_nps(dispatch_lib, tune, expected, error):
+    source = r"""
+import json
+import os
+import sys
+import pytest
+from op_tests._f4gemm_test_utils import load_dispatch_lib, query_launch_config as _launch_config
+from op_tests.test_f4gemm_dispatch import _PS_KERNEL
 
-
-def test_persistent_override_preserves_nps(dispatch_lib, monkeypatch):
-    monkeypatch.setenv("AITER_F4GEMM_TUNE", "4,4,4")
-    assert _launch_config(dispatch_lib, 768, 1024, 256) == (4, 4, 1, 1, 192, 256, 0)
-    assert _launch_config(dispatch_lib, 768, 1024, 256, kernel=_PS_KERNEL) == (
-        4,
-        4,
-        4,
-        4,
-        256,
-        256,
-        1,
+lib = load_dispatch_lib(sys.argv[1])
+assert _launch_config(lib, 768, 1024, 256) == (4, 4, 1, 1, 192, 256, 0)
+if sys.argv[2]:
+    with pytest.raises(RuntimeError, match=sys.argv[2]):
+        _launch_config(lib, 768, 1024, 256, kernel=_PS_KERNEL)
+else:
+    expected = tuple(json.loads(sys.argv[3]))
+    assert _launch_config(lib, 768, 1024, 256, kernel=_PS_KERNEL) == expected
+    os.environ["AITER_F4GEMM_TUNE"] = "invalid-after-first-use"
+    assert _launch_config(lib, 768, 1024, 256, kernel=_PS_KERNEL) == expected
+"""
+    env = dict(os.environ)
+    if tune is None:
+        env.pop("AITER_F4GEMM_TUNE", None)
+    else:
+        env["AITER_F4GEMM_TUNE"] = tune
+    proc = subprocess.run(
+        [sys.executable, "-c", source, dispatch_lib._name, error, json.dumps(expected)],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        check=False,
+        text=True,
+        capture_output=True,
+        timeout=60,
     )
-    monkeypatch.setenv("AITER_F4GEMM_TUNE", "3,2,4")
-    with pytest.raises(RuntimeError, match="cluster axes"):
-        _launch_config(dispatch_lib, 768, 1024, 256, kernel=_PS_KERNEL)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
 @pytest.fixture(scope="module")
-def geometry_lib(tmp_path_factory):
-    compiler = shutil.which("c++")
-    if compiler is None:
-        pytest.skip("a C++ compiler is required to exercise the dispatch header")
-    output = tmp_path_factory.mktemp("f4gemm_geometry") / "geometry.so"
-    include = Path(__file__).resolve().parents[1] / "csrc" / "include"
-    source = r"""
-        #include "asm_f4gemm_dispatch.hpp"
-        extern "C" void select_geometry(int m, int n, int* out) {
-            const auto g = aiter::f4gemm::select_launch_geometry(m, n);
-            out[0] = g.cluster_x; out[1] = g.cluster_y;
-            out[2] = g.grid_x; out[3] = g.grid_y;
-        }
-        extern "C" bool valid_geometry(int x, int y, int grid_y) {
-            try { aiter::f4gemm::make_launch_geometry(x, y, grid_y); return true; }
-            catch(const std::invalid_argument&) { return false; }
-        }
-    """
-    subprocess.run(
-        [
-            compiler,
-            "-std=c++17",
-            "-shared",
-            "-fPIC",
-            "-O2",
-            f"-I{include}",
-            "-x",
-            "c++",
-            "-",
-            "-o",
-            str(output),
-        ],
-        input=source,
-        text=True,
-        check=True,
-        capture_output=True,
-    )
-    lib = ctypes.CDLL(str(output))
-    lib.select_geometry.argtypes = [
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.POINTER(ctypes.c_int),
-    ]
-    lib.select_geometry.restype = None
-    lib.valid_geometry.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
-    lib.valid_geometry.restype = ctypes.c_bool
-    return lib
+def geometry_lib():
+    try:
+        return get_dispatch_lib()
+    except FileNotFoundError as error:
+        pytest.skip(str(error))
 
 
 def _geometry(lib, M, N):
     values = (ctypes.c_int * 4)()
-    lib.select_geometry(M, N, values)
+    lib.f4gemm_test_geometry(M, N, values)
     return tuple(values)
 
 
@@ -381,7 +520,7 @@ def test_representative_geometry(geometry_lib, shape, expected):
     ],
 )
 def test_reject_invalid_geometry(geometry_lib, geometry):
-    assert not geometry_lib.valid_geometry(*geometry)
+    assert not geometry_lib.f4gemm_test_valid_geometry(*geometry)
 
 
 def test_persistent_walk_covers_every_tile_once(geometry_lib):
@@ -391,7 +530,7 @@ def test_persistent_walk_covers_every_tile_once(geometry_lib):
         M, N = mt * 256 - 255, nt * 256 - 240
         cx, cy, gx, gy = _geometry(geometry_lib, M, N)
         assert cx * cy * gx * gy == 256
-        assert geometry_lib.valid_geometry(cx, cy, gy)
+        assert geometry_lib.f4gemm_test_valid_geometry(cx, cy, gy)
         rows, cols = (mt + cy - 1) // cy, (nt + cx - 1) // cx
         total = rows * cols
         interior_cols = cols // gx * gx

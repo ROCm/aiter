@@ -303,7 +303,7 @@ def gemm_a4w4_asm(
 
 
 @compile_ops(
-    "module_f4gemm_asm_nps_dispatch",
+    "module_f4gemm_asm",
     fc_name="mxfp4_gemm_asm",
     ffi_type="ctypes",
 )
@@ -320,7 +320,7 @@ def _mxfp4_gemm_asm(
 
 
 @compile_ops(
-    "module_f4gemm_asm_nps_dispatch",
+    "module_f4gemm_asm",
     fc_name="nvfp4_gemm_asm",
     ffi_type="ctypes",
 )
@@ -341,54 +341,6 @@ def _nvfp4_gemm_asm(
 # gfx1250 f4gemm mxfp8-output block size along N: the kernel dynamically
 # quantizes each 128-wide output block to fp8 e4m3 and emits one E8M0 scale.
 MXFP8_OUT_SCALE_BLOCK = 128
-
-
-@compile_ops(
-    "module_f4gemm_asm_nps_dispatch",
-    fc_name="f4gemm_launch_config",
-    ffi_type="ctypes",
-)
-def _f4gemm_launch_config(
-    M: int,
-    N: int,
-    K: int,
-    intype: str,
-    outtype: str,
-    a_preshuffle: int,
-    kernelName: str | None,
-    field: int,
-) -> int: ...
-
-
-def get_f4gemm_launch_config(
-    M: int,
-    N: int,
-    K: int,
-    *,
-    intype: str = "mxfp4",
-    outtype: str = "bf16",
-    a_preshuffle: bool = False,
-    kernelName: str = "",
-) -> dict[str, int]:
-    """Return the selected tile, PS mode and launch geometry for gfx1250 F4GEMM.
-
-    Grid dimensions count clusters. Use this query outside the timed GEMM path.
-    """
-    fields = (
-        "cluster_x",
-        "cluster_y",
-        "grid_x",
-        "grid_y",
-        "tile_m",
-        "tile_n",
-        "ps_mode",
-    )
-    return {
-        name: _f4gemm_launch_config(
-            M, N, K, intype, outtype, int(a_preshuffle), kernelName or None, field
-        )
-        for field, name in enumerate(fields)
-    }
 
 
 def _is_mxfp8_out(dtype: torch.dtype) -> bool:
@@ -458,12 +410,15 @@ def gemm_mxfp4_asm(
     ``(out_fp8 [M,N], scale_e8m0)``. ``scale_e8m0`` is in the PACKED
     ``(M/64,N//128,16,4)`` layout -- unpack via
     :func:`unpack_mxfp8_out_scale`. Optional ``y`` supplies a contiguous
-    ``[M,N]`` output with the requested dtype on A's device, as in Gluon."""
+    ``[M,N]`` output with the requested dtype on A's device, as in Gluon.
+    An empty batch returns empty output buffers without launching a kernel."""
     require_gfx1250_asm("gemm_mxfp4_asm")
     M = A.shape[0]
     N = B.shape[0]
     out = _alloc_f4gemm_out(M, N, dtype, A.device, y)
     out_scale = _alloc_f4gemm_out_scale(M, N, dtype, A.device)
+    if M == 0:
+        return (out, out_scale) if out_scale is not None else out
     _mxfp4_gemm_asm(
         A,
         B,
@@ -487,17 +442,23 @@ def gemm_nvfp4_asm(
     dtype: torch.dtype = dtypes.bf16,  # output dtype: bf16 or fp8 (mxfp8)
     a_preshuffle: bool = True,
     kernelName: str = "",
+    *,
+    y: Tensor | None = None,
 ) -> Tensor | tuple[Tensor, Tensor]:
     """NVFP4 GEMM (preload SGPR mode). D = A * B with e4m3 scales + global alphas.
     ``dtype``: bf16 ``[M,N]`` or mxfp8 (``dtypes.fp8``) returning
     ``(out_fp8 [M,N], scale_e8m0)``. ``scale_e8m0`` is in the PACKED
     ``(M/64,N//128,16,4)`` layout -- unpack via
-    :func:`unpack_mxfp8_out_scale`."""
+    :func:`unpack_mxfp8_out_scale`. Optional ``y`` supplies a contiguous
+    ``[M,N]`` output with the requested dtype on A's device.
+    An empty batch returns empty output buffers without launching a kernel."""
     require_gfx1250_asm("gemm_nvfp4_asm")
     M = A.shape[0]
     N = B.shape[0]
-    out = _alloc_f4gemm_out(M, N, dtype, A.device)
+    out = _alloc_f4gemm_out(M, N, dtype, A.device, y)
     out_scale = _alloc_f4gemm_out_scale(M, N, dtype, A.device)
+    if M == 0:
+        return (out, out_scale) if out_scale is not None else out
     _nvfp4_gemm_asm(
         A,
         B,

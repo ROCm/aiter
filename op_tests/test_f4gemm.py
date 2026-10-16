@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #
 # ============================================================================
-# gfx1250 F4GEMM ASM Support Matrix
+# gfx1250 F4GEMM ASM Support Matrix (256x256 persistent kernels)
 # ----------------------------------------------------------------------------
 #  OUTTYPE | A_PRESHUFFLE | B_PRESHUFFLE | INTYPE |   M    |   N    |   K
 # ---------+--------------+--------------+--------+--------+--------+--------
@@ -19,6 +19,9 @@
 #  - B_PRESHUFFLE is always 1 (B is always pre-shuffled).
 #  - A_PRESHUFFLE=1 tightens the M constraint from %1==0 to %16==0.
 #  - K is always a multiple of 32.
+#  - The current 192x256 NPS path requires MXFP4/BF16/AP0, M%768==0,
+#    N%1024==0 and K%256==0, with a fixed 4x4 cluster. Automatic NPS
+#    selection is limited to 48 clusters; larger shapes use persistent kernels.
 # ============================================================================
 
 import argparse
@@ -42,7 +45,6 @@ from aiter.jit.core import get_asm_dir
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a4w4 import (
     MXFP8_OUT_SCALE_BLOCK,
-    get_f4gemm_launch_config,
     unpack_mxfp8_out_scale,
 )
 from aiter.ops.shuffle import (
@@ -58,14 +60,18 @@ from aiter.test_common import (
 )
 from aiter.utility import fp4_utils
 
-torch.set_default_device("cuda")
-torch.set_printoptions(sci_mode=False)
-pd.set_option("display.max_columns", 30)
-pd.set_option("display.width", 1000)
+# This is a CLI benchmark; pytest coverage lives in test_f4gemm_dispatch.py.
+__test__ = False
 
 SUPPORTED_GFX = ["gfx1250"]
 
 _OUT_DTYPE = {"bf16": dtypes.bf16, "fp8": dtypes.fp8}
+_NOT_SUPPORTED_MARKERS = (
+    "cannot get heuristic kernel",
+    "kernel not in cfg_f4gemm",
+    "no kernel registered for f4gemm",
+    "selected kernel not in f4gemm manifest",
+)
 
 # gfx1250 F4GEMM persistent shaders always launch PERSISTENT_TG
 # threadgroups regardless of problem size (must match the .co's WG_MAX).
@@ -81,10 +87,10 @@ def _manifest_configs():
 
 
 def _kernel_config(M, N, K, intype, outtype, apre, knl_name=None):
+    from op_tests._f4gemm_test_utils import get_launch_config
+
     knl = knl_name if knl_name and knl_name != "auto" else ""
-    launch = get_f4gemm_launch_config(
-        M, N, K, intype=intype, outtype=outtype, a_preshuffle=bool(apre), kernelName=knl
-    )
+    launch = get_launch_config(M, N, K, intype, outtype, apre, knl)
     for cfg in _manifest_configs():
         if knl and cfg["knl_name"] != knl:
             continue
@@ -181,7 +187,12 @@ def _report_active_tg(M, N, tile_m, tile_n, label, geometry, ps_mode=1):
     }
 
 
-PERF_SHAPES = [(16384, 16384, 16384)]
+PERF_SHAPES = [
+    (1536, 24576, 1536),
+    (1536, 7168, 16384),
+    (12288, 16384, 16384),  # Large aligned shape checks persistent fallback.
+    (16384, 16384, 16384),  # Persistent throughput baseline.
+]
 FUNC_SHAPES = [
     # NPS: one cluster, the K6 boundary, and the production shape.
     (768, 1024, 256),
@@ -513,13 +524,8 @@ def test_gemm(
         reason = _gluon_support_reason(intype, outtype, apre, M, N, K)
         if reason is not None:
             raise ValueError(f"--check-gluon: {reason}")
-    # Skip unsupported combos up front (before prep/shuffle) so they show as
-    # "not support" rather than crashing on a shape assert.
-    pre = "ABpreShuffle" if apre else "BpreShuffle"
-    reason = _support_reason(outtype, apre, M, N, K)
-    if reason is not None:
-        base = f"f4gemm_{outtype}_{intype}_{pre}_256x256_4x4_ps"
-        actual_knl = knl_name if (knl_name and knl_name != "auto") else base
+
+    def not_supported(reason):
         aiter.logger.warning(
             "f4gemm not supported (%s): intype=%s outtype=%s apre=%s M=%s N=%s K=%s",
             reason,
@@ -530,10 +536,10 @@ def test_gemm(
             N,
             K,
         )
-        return {
+        result = {
             "gfx": get_gfx(),
-            "knl_name": actual_knl,
-            "tile": "256x256",
+            "knl_name": knl_name or "auto",
+            "tile": "n/a",
             "cluster": "n/a",
             "asm us": float("nan"),
             "asm TFLOPS": float("nan"),
@@ -541,6 +547,23 @@ def test_gemm(
             "asm err": float("nan"),
             "asm result": f"not support ({reason})",
         }
+        if check_gluon:
+            result["gluon bitmatch"] = "not checked"
+        return result
+
+    # Resolve support and the selected .co before allocating or shuffling data.
+    # Missing registrations, including an explicit unavailable --knl-name, are
+    # reported as unsupported rows so a sweep can continue.
+    reason = _support_reason(outtype, apre, M, N, K)
+    if reason is not None:
+        return not_supported(reason)
+    try:
+        cfg = _kernel_config(M, N, K, intype, outtype, apre, knl_name)
+    except Exception as e:
+        if not any(marker in str(e) for marker in _NOT_SUPPORTED_MARKERS):
+            raise
+        return not_supported(str(e))
+    base = Path(cfg["co_name"]).stem
 
     block = MXFP4_SCALE_BLOCK if intype == "mxfp4" else NVFP4_SCALE_BLOCK
     assert K % block == 0, f"K must be a multiple of {block}"
@@ -563,15 +586,9 @@ def test_gemm(
     # --iters overrides; unset keeps the mode default (func=5, perf/profile=101).
     num_iters = num_iters if num_iters is not None else (5 if mode == "func" else 101)
 
-    # Kernel/.co base name for this config (used for logging, and to derive the
-    # mangled knl_name when an explicit dispatch is requested). See
-    # hsa/gfx1250/f4gemm/f4gemm.csv. (`pre` is set above.)
-    cfg = _kernel_config(M, N, K, intype, outtype, apre, knl_name)
-    base = Path(cfg["co_name"]).stem
-
     # Dispatch mode. Default (knl_name=None) is heuristic: kernelName="" lets the
-    # aiter op pick the .co from f4gemm.csv by (intype, a_preshuffle, outtype), so
-    # the test validates the op's dispatch. Explicit is opt-in via --knl-name:
+    # aiter op pick the .co from f4gemm.csv by shape and input/output formats,
+    # so the test validates the op's dispatch. Explicit is opt-in via --knl-name:
     # "auto" uses the per-config derived name below; any other value is used verbatim.
     if knl_name is None:
         knl = ""
@@ -581,9 +598,10 @@ def test_gemm(
         knl = knl_name
 
     # Pass inputs as ARGS so run_perftest can rotate them (defeats the L2 hot-cache).
+    y = torch.empty((M, N), dtype=out_dtype, device=inp["A"].device)
     if intype == "nvfp4":
 
-        def run_asm(A, B, sA, sB, gA, gB):
+        def run_asm(A, B, sA, sB, gA, gB, y):
             return aiter.gemm_nvfp4_asm(
                 A,
                 B,
@@ -594,9 +612,10 @@ def test_gemm(
                 dtype=out_dtype,
                 a_preshuffle=bool(apre),
                 kernelName=knl,
+                y=y,
             )
 
-        asm_args = (inp["A"], inp["B"], inp["sA"], inp["sB"], inp["gA"], inp["gB"])
+        asm_args = (inp["A"], inp["B"], inp["sA"], inp["sB"], inp["gA"], inp["gB"], y)
     else:
 
         def run_asm(A, B, sA, sB, y):
@@ -611,7 +630,6 @@ def test_gemm(
                 y=y,
             )
 
-        y = torch.empty((M, N), dtype=out_dtype, device=inp["A"].device)
         asm_args = (inp["A"], inp["B"], inp["sA"], inp["sB"], y)
 
     # Only the low-level asm entry is timed/tabled. (fn, args); args are rotated.
@@ -647,11 +665,6 @@ def test_gemm(
     )
     # Only a missing .co is reported as "not support"; any other failure (OOM,
     # memory fault, shape assert, ...) must propagate, not show as a green cell.
-    # An explicit --knl-name that isn't in the cfg is a real error (typo / missing
-    # build), so "kernel not in cfg" is benign ONLY on the heuristic path (knl == "").
-    _NOT_SUPPORTED_MARKERS = ("cannot get heuristic kernel",)
-    if not knl:
-        _NOT_SUPPORTED_MARKERS += ("kernel not in cfg_f4gemm",)
     for name, (fn, fn_args) in candidates.items():
         try:
             out, us = run_perftest(
@@ -763,6 +776,10 @@ def test_gemm(
 
 
 def main():
+    torch.set_default_device("cuda")
+    torch.set_printoptions(sci_mode=False)
+    pd.set_option("display.max_columns", 30)
+    pd.set_option("display.width", 1000)
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
         description="Test/benchmark gfx1250 A4W4 (F4GEMM) via the low-level asm entry",
@@ -795,7 +812,7 @@ def main():
         choices=[1, 0],
         default=None,
         help="A-preshuffle sweep list: 1 preshuffles A (M%%16), 0 sends it "
-        "row-major (M%%1). Default (unset): perf/profile = [1], func = [1, 0].",
+        "row-major (M%%1). Default: [1, 0], covering persistent and NPS dispatch.",
     )
     parser.add_argument(
         "--outtype",
@@ -882,7 +899,7 @@ def main():
         dest="knl_name",
         default=None,
         help="dispatch mode. Default (unset) = heuristic: the aiter op picks the "
-        ".co from f4gemm.csv by (intype, a_preshuffle, outtype), validating dispatch. "
+        ".co from f4gemm.csv by shape and input/output formats, validating dispatch. "
         "'auto' = force the per-config derived knl_name (explicit). Any other value "
         "= use that exact mangled knl_name for all runs (developer experiment/debug).",
     )
@@ -892,7 +909,7 @@ def main():
         "--shape",
         type=dtypes.str2tuple,
         nargs="*",
-        # Unset -> per-mode defaults: perf=PERF_SHAPES (one big square, throughput),
+        # Unset -> per-mode defaults: perf=PERF_SHAPES (NPS and PS throughput),
         # func=FUNC_SHAPES (many small/odd shapes, correctness). K must be %32.
         default=None,
         help="(M,N,K) tuples, e.g. -mnk 2048,2048,2048 16384,16384,16384; "
@@ -932,20 +949,14 @@ def main():
     init_pairs = list(zip(di_list, si_list))
 
     # Shapes: explicit --shape wins; otherwise func sweeps the many small/odd
-    # correctness shapes and perf/profile sweep the single throughput square.
+    # correctness shapes and perf/profile cover aligned NPS shapes and PS.
     if args.shape is not None:
         shapes = args.shape
     else:
         shapes = FUNC_SHAPES if args.mode == "func" else PERF_SHAPES
 
-    # A-preshuffle sweep. Mode-aware default when unset: perf/profile exercise only
-    # the preshuffled path ([1]); func sweeps both ([1, 0]).
-    if args.apre is not None:
-        apre_list = args.apre
-    elif args.mode in ("perf", "profile"):
-        apre_list = [1]
-    else:
-        apre_list = [1, 0]
+    # Both layouts are needed to exercise the NPS and persistent choices.
+    apre_list = args.apre if args.apre is not None else [1, 0]
 
     if args.check_gluon:
         if not (shapes and apre_list and args.intype and args.outtype):
