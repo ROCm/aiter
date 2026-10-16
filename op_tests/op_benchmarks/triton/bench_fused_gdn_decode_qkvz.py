@@ -38,7 +38,15 @@ _HEAD_DIM = 128
 _CONV_WIDTH = 4
 
 
-def make_inputs(batch, num_k_heads, head_dim, slots, device="cuda", ratio=2):
+def make_inputs(
+    batch,
+    num_k_heads,
+    head_dim,
+    slots,
+    device="cuda",
+    ratio=2,
+    state_dtype=torch.float32,
+):
     num_v_heads = ratio * num_k_heads
     group_width = 2 * head_dim + 2 * ratio * head_dim
     channels = 2 * num_k_heads * head_dim + num_v_heads * head_dim
@@ -49,7 +57,7 @@ def make_inputs(batch, num_k_heads, head_dim, slots, device="cuda", ratio=2):
         "projected_ba": torch.randn(batch, 2 * num_v_heads, **bf16),
         "conv_state": torch.randn(slots, channels, _CONV_WIDTH - 1, **bf16),
         "ssm_state": torch.randn(
-            slots, num_v_heads, head_dim, head_dim, dtype=torch.float32, device=device
+            slots, num_v_heads, head_dim, head_dim, dtype=state_dtype, device=device
         ),
         "ssm_state_indices": torch.arange(
             1, batch + 1, dtype=torch.int32, device=device
@@ -62,11 +70,11 @@ def make_inputs(batch, num_k_heads, head_dim, slots, device="cuda", ratio=2):
     }
 
 
-def bytes_moved(batch, num_k_heads, head_dim, fp8, ratio=2):
+def bytes_moved(batch, num_k_heads, head_dim, fp8, ratio=2, state_bytes=4):
     """Compulsory traffic for one launch."""
     num_v_heads = ratio * num_k_heads
     channels = 2 * num_k_heads * head_dim + num_v_heads * head_dim
-    state = batch * num_v_heads * head_dim * head_dim * 4  # fp32
+    state = batch * num_v_heads * head_dim * head_dim * state_bytes
     total = 2 * state  # read + write, the dominant term
     total += 2 * batch * channels * (_CONV_WIDTH - 1) * 2  # conv window r+w, bf16
     total += (
@@ -89,8 +97,11 @@ def bench_one(
     warmup=25,
     ratio=2,
     layout="interleaved",
+    state_dtype=torch.float32,
 ):
-    inp = make_inputs(batch, num_k_heads, head_dim, slots, ratio=ratio)
+    inp = make_inputs(
+        batch, num_k_heads, head_dim, slots, ratio=ratio, state_dtype=state_dtype
+    )
     args = (
         inp["projected_qkvz"],
         inp["projected_ba"],
@@ -159,7 +170,14 @@ def main():
     ap.add_argument("--slots", type=int, default=512)
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--no-fp8", action="store_true", help="bf16 output only")
+    ap.add_argument(
+        "--state-dtype",
+        choices=("fp32", "bf16"),
+        default="fp32",
+        help="recurrent state pool dtype (bf16 runs the ratio-generic kernel)",
+    )
     args = ap.parse_args()
+    state_dtype = {"fp32": torch.float32, "bf16": torch.bfloat16}[args.state_dtype]
 
     arch = get_arch()
     if arch != "gfx950":
@@ -171,7 +189,8 @@ def main():
     print(
         f"fused_gdn_decode_qkvz on {torch.cuda.get_device_name(0)} ({arch}), "
         f"num_k_heads={args.num_k_heads} head_dim={args.head_dim} "
-        f"slots={args.slots} fp8={not args.no_fp8} ratio={args.ratio} layout={args.layout}"
+        f"slots={args.slots} fp8={not args.no_fp8} ratio={args.ratio} layout={args.layout} "
+        f"state={args.state_dtype}"
     )
     # us per call; this op is always a single launch, so also per launch.
     print(f"{'batch':>7}{'us/call':>10}{'GB moved':>11}{'TB/s':>9}{'% peak':>9}")
@@ -185,9 +204,15 @@ def main():
             args.iters,
             ratio=args.ratio,
             layout=args.layout,
+            state_dtype=state_dtype,
         )
         nbytes = bytes_moved(
-            b, args.num_k_heads, args.head_dim, quant_dtype is not None, args.ratio
+            b,
+            args.num_k_heads,
+            args.head_dim,
+            quant_dtype is not None,
+            args.ratio,
+            state_bytes=state_dtype.itemsize,
         )
         tbs = nbytes / (us * 1e-6) / 1e12
         pct = 100.0 * tbs * 1e12 / peak if peak else float("nan")
