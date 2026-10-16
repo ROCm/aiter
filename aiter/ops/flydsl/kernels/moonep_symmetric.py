@@ -10,7 +10,8 @@ P2P base addresses, so the backend is a host-side choice:
   ``register_window``, with the table filled on device by ``Window.lsa_ptr``.
 
 The cco communicator is the caller's.  Its ``per_rank_vmm`` must cover every
-MoonEP buffer, weight pools included.
+MoonEP buffer, weight pools included: sum ``MoonEPPlanner.vmm_bytes`` and
+``MoonEPWeightPool.vmm_bytes``.
 """
 
 from __future__ import annotations
@@ -32,7 +33,21 @@ def device_gfx(device: torch.device | None = None) -> str:
 
 
 def device_wave_size(device: torch.device | None = None) -> int:
-    return 32 if device_gfx(device).startswith("gfx12") else 64
+    props = torch.cuda.get_device_properties(device)
+    warp_size = getattr(props, "warp_size", None)
+    if warp_size:
+        return int(warp_size)
+    return 32 if device_gfx(device).startswith(("gfx10", "gfx11", "gfx12")) else 64
+
+
+# cco maps each alloc_mem in whole pages of this size (2 MiB on gfx1250).
+CCO_ALLOC_GRANULARITY = 2 << 20
+
+
+def cco_vmm_bytes(*nbytes: int) -> int:
+    """``per_rank_vmm`` that the ``alloc_mem`` calls of these sizes occupy."""
+    g = CCO_ALLOC_GRANULARITY
+    return sum(-(-n // g) * g for n in nbytes)
 
 
 @functools.cache
@@ -75,7 +90,7 @@ class MoonEPSymmetric:
         """``communicator`` selects cco; without it Mori shmem must be up.
 
         ``group`` is the EP process group used for host barriers on the cco
-        path (default: the world group).
+        path; it may be omitted only when the EP group is the whole world.
         """
         self.rank, self.world_size = rank, world_size
         self.device = torch.device("cuda", torch.cuda.current_device())
@@ -101,6 +116,11 @@ class MoonEPSymmetric:
                 raise ValueError(
                     f"cco communicator is rank {communicator.rank} of "
                     f"{communicator.nranks}, expected {rank} of {world_size}"
+                )
+            if group is None and world_size != dist.get_world_size():
+                raise ValueError(
+                    f"EP{world_size} inside a world of {dist.get_world_size()} "
+                    "ranks: pass the EP process group as group="
                 )
             self._memory = communicator.alloc_mem(nbytes)
             self._window = communicator.register_window(self._memory.ptr, nbytes)
@@ -128,6 +148,10 @@ class MoonEPSymmetric:
             dist.barrier(group=self._group)
 
     def close(self) -> None:
+        """Collective.  On cco ``storage`` does not own the memory, so views
+        taken from it (e.g. weight windows bound to MegaMoE) die here too."""
+        if self.storage is None:
+            return
         self.barrier()
         self.storage = self.peer_bases = None
         if self._communicator is not None:
@@ -135,4 +159,10 @@ class MoonEPSymmetric:
             self._memory.close()
 
 
-__all__ = ["MoonEPSymmetric", "device_gfx", "device_wave_size"]
+__all__ = [
+    "CCO_ALLOC_GRANULARITY",
+    "MoonEPSymmetric",
+    "cco_vmm_bytes",
+    "device_gfx",
+    "device_wave_size",
+]

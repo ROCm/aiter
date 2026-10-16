@@ -14,6 +14,7 @@ one MegaMoE uses.  Outputs must match.
 
 import argparse
 import os
+import sys
 
 import torch
 import torch.distributed as dist
@@ -72,6 +73,26 @@ def _routing(tokens, rank, world, epr, step, device, *, hot):
     return x, values.softmax(-1).contiguous(), ids.to(torch.int32).contiguous()
 
 
+def _stale_slots(layer_index, layer, rank, epr, spec, device):
+    """Slots of this rank whose bytes differ from their owner's home rows."""
+    by_owner = {}
+    for slot, expert in enumerate(layer["state"]["held"][rank].tolist()):
+        if expert >= 0:
+            by_owner.setdefault(expert // epr, []).append((slot, expert % epr))
+    stale = []
+    for owner, slots in sorted(by_owner.items()):
+        # Rebuilt from the owner's seed: the weights are deterministic.
+        home = _home_weights(layer_index, owner, epr, spec, device)
+        for i, t in enumerate(home):
+            rows = t.view(epr, *_expert_rows(t, epr))
+            for slot, local in slots:
+                got = layer["pool"].prefetched[i][slot].contiguous().view(torch.uint8)
+                if not torch.equal(got, rows[local].contiguous().view(torch.uint8)):
+                    stale.append(slot)
+        del home
+    return sorted(set(stale))
+
+
 def _communicator(ctx, per_rank_vmm):
     uid = ctx.bcast_uid(Communicator.get_unique_id() if ctx.rank == 0 else None)
     return Communicator.init(ctx.world, ctx.rank, uid, per_rank_vmm=per_rank_vmm)
@@ -120,6 +141,13 @@ def main():
         action="store_true",
         help="control: compare plain against itself (MegaMoE's own run-to-run noise)",
     )
+    parser.add_argument(
+        "--max-flaky-rate",
+        type=float,
+        default=0.3,
+        help="largest share of comparisons that may pass only on the rerun "
+        "(plain against itself fails ~9%% of them on one rank)",
+    )
     args = parser.parse_args()
     if args.quant == "a8w4":
         os.environ["AITER_FORCE_A8W4"] = "1"
@@ -129,18 +157,20 @@ def main():
     epr = EXPERTS // world
     B = args.slots
     spec = resolve_spec(f"{args.quant}_mxfp4")
-    mega_comm = moonep_comm = None
+    mega_comm = moonep_comm = planner = None
+    layers = []
     try:
         mega_comm = _communicator(ctx, 16 * 1024**3)
         layers = [
             {"home": _home_weights(layer, rank, epr, spec, device)}
             for layer in range(args.layers)
         ]
-        home0 = layers[0]["home"]
-        parts = [(_expert_rows(t, epr), t.dtype) for t in home0]
-        pool_bytes = sum((epr + B) * t.numel() // epr * t.element_size() for t in home0)
-        # Planner buffers are a few KiB; leave 1 GiB of headroom per rank.
-        moonep_comm = _communicator(ctx, args.layers * pool_bytes + (1 << 30))
+        parts = [(_expert_rows(t, epr), t.dtype) for t in layers[0]["home"]]
+        moonep_comm = _communicator(
+            ctx,
+            MoonEPPlanner.vmm_bytes(world, EXPERTS)
+            + args.layers * MoonEPWeightPool.vmm_bytes(epr, B, parts),
+        )
 
         common = {
             "rank": rank,
@@ -214,7 +244,7 @@ def main():
             scale = ref.float().abs().max().clamp(min=1e-6)
             return float(diff.max() / scale), bool(torch.equal(out, ref))
 
-        ok, flakes = True, 0
+        ok, flakes, compares = True, 0, 0
         for step in range(args.steps):
             for index, layer in enumerate(layers):
                 for balance in (True, False) if step == 0 else (True,):
@@ -238,29 +268,41 @@ def main():
                     prefetched = int((placed >= 0).sum())
                     kept = int(((placed >= 0) & (placed == prev)).sum())
                     # Every rank computes the same placement; the tables must agree.
-                    tables = tuple(layer["state"]["held"].flatten().tolist())
+                    tables = tuple(
+                        tuple(layer["state"][name].flatten().tolist())
+                        for name in ("held", "placed")
+                    )
                     stats = ctx.gather_objects(
                         (max_rel, exact, prefetched, kept, tables)
                     )
                     rels = [s[0] for s in stats]
                     step_ok = max(rels) < 2e-2
                     agree = len({s[4] for s in stats}) == 1
+                    compares += 1
                     retry, flaky = "", False
                     if not step_ok:
-                        # Same ids, no new plan: a pass means the plan and the
-                        # slots were right and the first run itself went wrong.
-                        # MegaMoEGfx1250 alone does that now and then (--aa),
-                        # so the reference is recomputed as well.
+                        # A mismatch is MegaMoE's own noise (--aa shows it)
+                        # only if every slot holds its owner's bytes and the
+                        # same ids, with no new plan or prefetch, then pass.
+                        stale = []
+                        if balance and not args.aa:
+                            stale = _stale_slots(index, layer, rank, epr, spec, device)
+                        slots = ctx.gather_objects(stale)
                         ref = forward(plain, layer["home"], x, wts, ids)
                         dist.barrier()
                         again = compare(rerun(layer, x, wts, ran), ref)
                         torch.cuda.synchronize(device)
                         redo = ctx.gather_objects(again)
-                        flaky = max(m for m, _ in redo) < 2e-2
+                        slots_ok = not any(slots)
+                        flaky = slots_ok and max(m for m, _ in redo) < 2e-2
                         retry = " retry=" + ",".join(
                             f"r{r}:{'exact' if e else f'{m:.2e}'}"
                             for r, (m, e) in enumerate(redo)
                         )
+                        if not slots_ok:
+                            retry += " stale_slots=" + ",".join(
+                                f"r{r}:{s}" for r, s in enumerate(slots) if s
+                            )
                     if rank == 0:
                         exacts = sum(int(s[1]) for s in stats)
                         ok &= (step_ok or flaky) and agree
@@ -284,16 +326,25 @@ def main():
                             flush=True,
                         )
         if rank == 0:
-            print(f"flaky_steps={flakes}", flush=True)
+            limit = int(args.max_flaky_rate * compares)
+            print(f"flaky_steps={flakes}/{compares} limit={limit}", flush=True)
+            ok &= flakes <= limit
             print("ALL_OK" if ok else "SOME_FAILED", flush=True)
     finally:
         torch.cuda.synchronize(device)
         dist.barrier()
+        for layer in layers:
+            layer.pop("windows", None)
+            if "pool" in layer:
+                layer.pop("pool").close()
+        if planner is not None:
+            planner.close()
         for comm in (moonep_comm, mega_comm):
             if comm is not None:
                 comm.destroy()
         ctx.shutdown()
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

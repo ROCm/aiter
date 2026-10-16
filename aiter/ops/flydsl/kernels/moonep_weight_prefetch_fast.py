@@ -154,8 +154,8 @@ def make_moonep_weight_prefetch_fast_jit(
         for step in range(0, prefetch_slots, 1):
             slot = (fx.Int32(fx.block_idx.x) + step) % fx.Int32(prefetch_slots)
             expert = buffer_load(experts_rsrc, slot, vec_width=1, dtype=T.i32)
-            # Depends only on the slot, so this is block-uniform and compiles to
-            # a scalar branch -- an idle slot issues no memory traffic at all.
+            # Block-uniform in value, but loaded into a VGPR, so the compiler
+            # cannot prove it; an idle slot still issues no copy traffic.
             if expert >= fx.Int32(0):
                 owner = expert // fx.Int32(experts_per_rank)
                 local_expert = expert % fx.Int32(experts_per_rank)

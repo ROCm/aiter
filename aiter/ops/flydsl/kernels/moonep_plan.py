@@ -21,7 +21,12 @@ from flydsl.expr import rocdl as fly_rocdl
 from flydsl.expr.typing import Stream, T
 
 from . import communication_ops_utils as comm_ops
-from .moonep_symmetric import MoonEPSymmetric, device_gfx, device_wave_size
+from .moonep_symmetric import (
+    MoonEPSymmetric,
+    cco_vmm_bytes,
+    device_gfx,
+    device_wave_size,
+)
 from .tensor_shim import _run_compiled, buf_copy_load, ptr_buf_tensor
 
 # The sticky settle keeps one bit per slot in an int64.
@@ -731,21 +736,20 @@ class MoonEPPlanner:
         def i32(n, fill=0):
             return torch.full((n,), fill, dtype=torch.int32, device=dev)
 
-        def symmetric(n):
-            return MoonEPSymmetric(
-                4 * n,
-                rank=rank,
-                world_size=R,
-                communicator=communicator,
-                group=group,
-            )
-
-        self._counts_buf = symmetric(2 * R * E)
-        self._arrive_buf = symmetric(2 * R)
-        self._counts = self._counts_buf.storage.view(torch.int32)
-        self._arrive = self._arrive_buf.storage.view(torch.int32)
-        self._peer_counts = self._counts_buf.peer_bases
-        self._peer_arrive = self._arrive_buf.peer_bases
+        # One symmetric allocation: [2][R][E] counts, then [2][R] arrive flags.
+        arrive_at = self._arrive_offset(R, E)
+        self._symmetric = MoonEPSymmetric(
+            self.symmetric_bytes(R, E),
+            rank=rank,
+            world_size=R,
+            communicator=communicator,
+            group=group,
+        )
+        words = self._symmetric.storage.view(torch.int32)
+        self._counts = words[: 2 * R * E]
+        self._arrive = words[arrive_at // 4 : arrive_at // 4 + 2 * R]
+        self._peer_counts = self._symmetric.peer_bases
+        self._peer_arrive = self._symmetric.peer_bases + arrive_at
         self._hist = i32(E)
         self._epoch = i32(1)
         self._local_index = i32(max_routes)
@@ -753,7 +757,7 @@ class MoonEPPlanner:
         self._alloc_cumsum = i32(E * R)
         self._expert_to_slot = i32(R * E)
         self._virtual_ids = i32(max_routes)
-        self._arrive_buf.barrier()
+        self._symmetric.barrier()
 
         grid = max(1, min(304, -(-max_routes // _BLOCK)))
         self._jit = make_moonep_plan_jit(
@@ -765,6 +769,28 @@ class MoonEPPlanner:
             wave_size=device_wave_size(dev),
             gfx12=device_gfx(dev).startswith("gfx12"),
         )
+
+    @staticmethod
+    def _arrive_offset(world_size: int, experts: int) -> int:
+        return -(-2 * world_size * experts * 4 // 256) * 256
+
+    @classmethod
+    def symmetric_bytes(cls, world_size: int, experts: int) -> int:
+        return cls._arrive_offset(world_size, experts) + 2 * world_size * 4
+
+    @classmethod
+    def vmm_bytes(cls, world_size: int, experts: int) -> int:
+        """cco ``per_rank_vmm`` one planner takes."""
+        return cco_vmm_bytes(cls.symmetric_bytes(world_size, experts))
+
+    def close(self) -> None:
+        """Collective; releases the symmetric buffer."""
+        if self._symmetric is None:
+            return
+        self._counts = self._arrive = None
+        self._peer_counts = self._peer_arrive = None
+        self._symmetric.close()
+        self._symmetric = None
 
     def new_slot_state(self) -> dict:
         """``held``/``prev``/``placed`` int32 ``[R, B]`` tables for one layer."""

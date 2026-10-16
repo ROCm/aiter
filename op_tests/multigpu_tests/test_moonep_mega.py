@@ -13,6 +13,7 @@ wrote, the way a production weight pool would.  Outputs must match.
 
 import argparse
 import os
+import sys
 
 os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "40G")
 
@@ -262,7 +263,8 @@ def main():
     finally:
         _barrier()
         _cleanup()
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

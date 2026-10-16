@@ -26,7 +26,7 @@ import math
 import flydsl.expr as fx
 import torch
 
-from aiter.ops.flydsl.kernels.moonep_symmetric import MoonEPSymmetric
+from aiter.ops.flydsl.kernels.moonep_symmetric import MoonEPSymmetric, cco_vmm_bytes
 from aiter.ops.flydsl.kernels.moonep_weight_prefetch_fast import (
     make_moonep_weight_prefetch_fast_jit,
 )
@@ -63,10 +63,7 @@ class MoonEPWeightPool:
                 "experts_per_rank must be positive and prefetch_slots non-negative"
             )
 
-        row_bytes = tuple(
-            math.prod(shape) * torch.empty(0, dtype=dtype).element_size()
-            for shape, dtype in parts
-        )
+        row_bytes = self._row_bytes(parts)
         if not row_bytes or any(b <= 0 or b % 16 for b in row_bytes):
             raise ValueError(
                 f"expert rows must be positive 16-byte multiples, got {row_bytes}"
@@ -126,6 +123,24 @@ class MoonEPWeightPool:
         self._no_resident = torch.full(
             (prefetch_slots,), -1, dtype=torch.int32, device=self.device
         )
+
+    @staticmethod
+    def _row_bytes(parts) -> tuple[int, ...]:
+        return tuple(
+            math.prod(shape) * torch.empty(0, dtype=dtype).element_size()
+            for shape, dtype in parts
+        )
+
+    @classmethod
+    def vmm_bytes(
+        cls,
+        experts_per_rank: int,
+        prefetch_slots: int,
+        parts: list[tuple[tuple[int, ...], torch.dtype]],
+    ) -> int:
+        """cco ``per_rank_vmm`` one pool of these arguments takes."""
+        window = experts_per_rank + prefetch_slots
+        return cco_vmm_bytes(sum(window * b for b in cls._row_bytes(parts)))
 
     def _part(
         self, index: int, dtype: torch.dtype, row_shape: tuple[int, ...]
