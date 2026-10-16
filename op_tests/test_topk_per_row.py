@@ -1,4 +1,5 @@
 import argparse
+import ctypes
 import itertools
 import os
 import subprocess
@@ -14,6 +15,7 @@ import aiter
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.cpp_extension import executable_path
 from aiter.ops import topk
+from aiter.ops.asm.asm_utils import load_hip
 from aiter.ops.flydsl.kernels.tensor_shim import wave_size_of
 from aiter.ops.flydsl.kernels.topk import (
     topk_per_row_decode_adaptive as adaptive_kernel,
@@ -957,6 +959,138 @@ def test_adaptive_control_stays_zero(card):
     )
 
 
+def test_adaptive_control_unwarmed_capture(card):
+    """A capture on a stream the op never ran on records one zeroing per graph, not
+    per call, and its buffer is zero for every replay order and for an eager launch
+    before any replay, whatever the pool left in it."""
+    top_k, width, calls = 2048, 262144, 3
+    device = torch.device("cuda", torch.cuda.current_device())
+    multi = [
+        m
+        for m in (2, 4, 8, 16)
+        if adaptive_kernel.decode_adaptive_config(
+            m, width, top_k, ordered=True, cu_count=card[1]
+        ).parts
+        > 1
+    ]
+    assert len(multi) >= 2, f"no two multi-part row counts at width {width}"
+    rows, grown = multi[0], multi[-1]
+    hip = load_hip()
+    hip.hipGraphGetNodes.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+
+    def nodes(graph):
+        n = ctypes.c_size_t()
+        assert hip.hipGraphGetNodes(graph.raw_cuda_graph(), None, ctypes.byref(n)) == 0
+        return n.value
+
+    def inputs(m, seed):
+        torch.manual_seed(seed)
+        logits = torch.randint(0, 50, (m, width), device="cuda").float()
+        seq_lens = torch.full((m,), width, dtype=torch.int32, device="cuda")
+        out = torch.full((m, top_k), -7, dtype=torch.int32, device="cuda")
+        return logits, seq_lens, out
+
+    def decode(logits, seq_lens, out):
+        m = logits.shape[0]
+        flydsl_decode_host._decode_with_backend(
+            logits,
+            1,
+            seq_lens,
+            out,
+            m,
+            width,
+            1,
+            top_k,
+            True,
+            None,
+            topk.BACKEND_ADAPTIVE,
+            width,
+        )
+
+    def check(case, what):
+        torch.cuda.synchronize()
+        logits, _, out = case
+        assert torch.equal(out.long(), stable_reference(logits, top_k)), what
+
+    def capture(stream, cases):
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.graph(graph, stream=stream):
+            for case in cases:
+                decode(*case)
+        graph.instantiate()
+        return graph
+
+    def replay(graph, stream, cases, seed, what):
+        for i, case in enumerate(cases):
+            case[0].copy_(inputs(case[0].shape[0], seed + i)[0])
+            case[2].fill_(-7)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            graph.replay()
+        for case in cases:
+            check(case, what)
+
+    def control(stream):
+        return flydsl_decode_host._adaptive_control[(device, stream.cuda_stream)]
+
+    def poison(stream):
+        # Until a graph that zeroes it replays, the buffer holds whatever the pool
+        # left there; make that garbage rather than trust it to be zero.
+        key = (device, stream.cuda_stream)
+        assert key in flydsl_decode_host._unzeroed_adaptive_control, "not unzeroed"
+        control(stream).fill_(0x01010101)
+        torch.cuda.synchronize()
+
+    flydsl_decode_host.clear_topk_per_row_decode_workspace_cache()
+
+    warm = torch.cuda.Stream()
+    warm_cases = [inputs(rows, 10 + i) for i in range(calls)]
+    with torch.cuda.stream(warm):
+        decode(*warm_cases[0])
+    check(warm_cases[0], "eager warm-up")
+    baseline = nodes(capture(warm, warm_cases))
+
+    # Two graphs on one cold stream, the later one replayed first.
+    cold = torch.cuda.Stream()
+    a_cases = [inputs(rows, 20 + i) for i in range(calls)]
+    b_cases = [inputs(rows, 30 + i) for i in range(calls)]
+    graph_a, graph_b = capture(cold, a_cases), capture(cold, b_cases)
+    poison(cold)
+    assert nodes(graph_a) == baseline + 1, (nodes(graph_a), baseline)
+    assert nodes(graph_b) == baseline + 1, (nodes(graph_b), baseline)
+    replay(graph_b, cold, b_cases, 40, "graph B replayed before graph A")
+    replay(graph_a, cold, a_cases, 50, "graph A after graph B")
+    assert not control(cold).any(), "control left dirty after replay"
+
+    # An eager launch on a cold stream before its graph ever replays.
+    early = torch.cuda.Stream()
+    c_cases = [inputs(rows, 60 + i) for i in range(calls)]
+    graph_c = capture(early, c_cases)
+    poison(early)
+    eager = inputs(rows, 70)
+    with torch.cuda.stream(early):
+        decode(*eager)
+    check(eager, "eager launch before the first replay")
+    replay(graph_c, early, c_cases, 80, "graph C after the eager launch")
+
+    # Growing inside a capture zeroes the new buffer once more.
+    grow = torch.cuda.Stream()
+    g_cases = [inputs(rows, 90), inputs(grown, 91), inputs(grown, 92)]
+    graph_g = capture(grow, g_cases)
+    assert nodes(graph_g) == baseline + 2, (nodes(graph_g), baseline)
+    replay(graph_g, grow, g_cases, 100, "graph grown inside the capture")
+    assert not control(grow).any(), "grown control left dirty after replay"
+    print(
+        f"[adaptive_control_unwarmed_capture] PASS: rows {rows} and {grown}, "
+        f"width {width}, {calls} calls per graph, {baseline} nodes warm"
+    )
+
+
 def test_adaptive_row_past_width(card):
     """A `seq_lens` entry past the buffer width reads the row to its width, as the
     other decode kernels do, and not into the outranking padding behind it."""
@@ -1676,6 +1810,7 @@ def run_adaptive():
     ), f"short-row decode does not reach every radix pass exit:\n{df_md}"
     test_decode_bound_entry_points(card)
     test_adaptive_control_stays_zero(card)
+    test_adaptive_control_unwarmed_capture(card)
     test_adaptive_row_past_width(card)
     test_adaptive_bound_below_rows(card)
     test_adaptive_nan_ranks_first(card)

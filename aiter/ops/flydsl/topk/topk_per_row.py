@@ -3,17 +3,20 @@
 
 """FlyDSL decode TopK interface."""
 
+import ctypes
 from functools import lru_cache
 
 import torch
 
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+from aiter.ops.asm.asm_utils import load_hip
 from aiter.ops.topk import (
     BACKEND_ADAPTIVE,
     _decode_cu_count,
     decode_adaptive_width,
     decode_backend_for_call,
 )
+from aiter.utility.graph_alloc import ROUTES_INSIDE_CAPTURE, persistent_alloc
 
 from ..kernels.kernels_common import get_warp_size
 from ..kernels.tensor_shim import _run_compiled
@@ -38,38 +41,78 @@ _ONE_WORKGROUP_MAX_ROW_WIDTH = 20_000
 _SHORT_ROWS_1024_THREAD_MAX_ROWS = 256
 
 
-# One adaptive control buffer per (device, stream), zeroed once: every launch
-# leaves it zero. A buffer a larger one replaced stays alive, since a captured
-# graph may still replay over it.
+# One adaptive control buffer per (device, stream). Every launch leaves it zero, so
+# only its first launch needs it zeroed. A buffer a larger one replaced stays alive,
+# since a captured graph may still replay over it.
 _adaptive_control: dict[tuple[torch.device, int], torch.Tensor] = {}
 _retired_adaptive_control: list[torch.Tensor] = []
+# Buffers whose zeroing exists only as a node in captured graphs, mapped to the
+# capture that recorded it last. Until one of those replays the buffer is garbage,
+# so every other capture records its own zeroing and an eager launch zeroes it.
+_unzeroed_adaptive_control: dict[tuple[torch.device, int], int] = {}
+_hip_stream_get_capture_info = None
+
+
+def _capture_id(stream_id: int) -> int | None:
+    """Id of the graph capture `stream_id` is recording, or None."""
+    global _hip_stream_get_capture_info
+    if _hip_stream_get_capture_info is None:
+        fn = load_hip().hipStreamGetCaptureInfo
+        fn.restype = ctypes.c_int
+        fn.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_ulonglong),
+        ]
+        _hip_stream_get_capture_info = fn
+    status, capture = ctypes.c_int(), ctypes.c_ulonglong()
+    err = _hip_stream_get_capture_info(
+        ctypes.c_void_p(stream_id), ctypes.byref(status), ctypes.byref(capture)
+    )
+    if err != 0:
+        raise RuntimeError(f"hipStreamGetCaptureInfo failed with error {err}")
+    return capture.value if status.value != 0 else None
 
 
 def _get_adaptive_control(
     device: torch.device, stream_id: int, rows: int
 ) -> torch.Tensor:
-    """The zeroed control buffer for `rows` rows, grown in powers of two.
+    """The control buffer for `rows` rows, zero when the launch runs.
 
-    Per device and stream, live and retired buffers together stay under four times
-    `decode_control_slots(rows)` for the largest `rows` seen, until
-    `clear_topk_per_row_decode_workspace_cache()`.
+    Grown in powers of two: per device and stream, live and retired buffers stay
+    under four times `decode_control_slots(rows)` for the largest `rows` seen,
+    until `clear_topk_per_row_decode_workspace_cache()`.
     """
     need = _adaptive.decode_control_slots(rows)
-    buf = _adaptive_control.get((device, stream_id))
-    if buf is not None and buf.numel() >= need:
+    key = (device, stream_id)
+    buf = _adaptive_control.get(key)
+    if (
+        buf is not None
+        and buf.numel() >= need
+        and key not in _unzeroed_adaptive_control
+    ):
         return buf
-    if torch.cuda.is_current_stream_capturing():
-        # Allocated here it would come from the graph's pool. A graph-private
-        # buffer zeroed on every replay is correct, one memset slower.
+    capture = _capture_id(stream_id)
+    if capture is not None and not ROUTES_INSIDE_CAPTURE:
+        # This torch serves a capture from the graph's pool, where a cached buffer
+        # could share an address with an intermediate; keep it graph-private.
         return torch.zeros(need, device=device, dtype=torch.int32)
-    if buf is not None:
-        _retired_adaptive_control.append(buf)
-    buf = torch.zeros(
-        _adaptive.decode_control_slots(1 << (rows - 1).bit_length()),
-        device=device,
-        dtype=torch.int32,
-    )
-    _adaptive_control[(device, stream_id)] = buf
+    if buf is None or buf.numel() < need:
+        if buf is not None:
+            _retired_adaptive_control.append(buf)
+        with persistent_alloc(device):
+            buf = torch.zeros(
+                _adaptive.decode_control_slots(1 << (rows - 1).bit_length()),
+                device=device,
+                dtype=torch.int32,
+            )
+        _adaptive_control[key] = buf
+    elif capture is None or _unzeroed_adaptive_control[key] != capture:
+        buf.zero_()
+    if capture is None:
+        _unzeroed_adaptive_control.pop(key, None)
+    else:
+        _unzeroed_adaptive_control[key] = capture
     return buf
 
 
@@ -78,6 +121,7 @@ def clear_topk_per_row_decode_workspace_cache() -> None:
     _clear_split_workspace_cache()
     _adaptive_control.clear()
     _retired_adaptive_control.clear()
+    _unzeroed_adaptive_control.clear()
 
 
 @lru_cache(maxsize=128)
