@@ -121,6 +121,21 @@ through `get_gemm_config` and must come back `is_tuned`; if not, the previous fi
 the command fails.
 Config reads are cached per process, so restart Python to pick up a new file.
 
+## MHA forward (proposal)
+
+`mha_varlen_fwd` tunes the bf16 Triton varlen forward through the same driver, worker and
+installer:
+
+    python3 sweep_configs.py mha_varlen_fwd --Z 2 --HQ 8 --HK 8 --SQ 2048 --SK 2048 \
+        --DQ 128 --DV 128 --CAUSAL 1 --gpu 0
+
+`SK` (`max_seqlen_k`) plays the part of M: `--SK` takes the values to sweep and the installer
+writes `SK_LEQ_<bound>` buckets into `configs/<arch>/triton/attention/mha/MHA-DQ=..-DV=..-CAUSAL=..json`,
+the file `_get_config` looks up before `DEFAULT.json` (see `configs/AGENTS.md`). The keys come from
+`DEFAULT.json`'s `fwd` entries, and their values from `OP_SEARCH_SPACE["attention"]` in `space.py`
+(1,440 tiles). There is no `any`: a shape past the file's buckets gets the `DEFAULT.json` rules.
+The GEMM-only rules (`should_skip_generic`, the LDS and register checks) do not apply.
+
 ## Adding a kernel or a key
 
 Kernel: add one function to `kernels.py`, decorated with `@kernel(<config family>, ...)` giving the

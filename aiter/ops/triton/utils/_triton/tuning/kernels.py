@@ -79,6 +79,27 @@ class KernelSpec:
     gluon_candidates: dict = field(default_factory=dict)
     # (config) -> (ctas_m, ctas_n): how the kernel splits BLOCK_SIZE_M/N over a CTA cluster
     cta_split: Callable | None = None
+    # The fields below default to GEMM; a non-GEMM family (MHA) sets them.
+    # op directory of the family in the config layout
+    op: str = "gemm"
+    # the dim the family's buckets are keyed on: <bucket_dim>_LEQ_<bound>
+    bucket_dim: str = "M"
+    # the dims in a specialized file name, in name order
+    file_dims: tuple = ("B", "N", "K")
+    # (shape, backend) -> (installed config, is_tuned); None: get_gemm_config
+    resolver: Callable | None = None
+    # DEFAULT.json table -> {bucket name: entry}; None: its top-level dict entries
+    default_buckets: Callable | None = None
+    # (shape) -> FLOPs of one launch; None: 2*B*M*N*K
+    flop_count: Callable | None = None
+    # block-size key (SEARCH_SPACE spelling) -> the shape dim it tiles
+    tile_dims: dict = field(
+        default_factory=lambda: {
+            "BLOCK_SIZE_M": "M",
+            "BLOCK_SIZE_N": "N",
+            "BLOCK_SIZE_K": "K",
+        }
+    )
 
     def default_backend(self, arch):
         return "gluon" if arch in self.gluon_default_archs else "triton"
@@ -119,12 +140,16 @@ def check_backend(spec, arch, backend):
         raise SystemExit(f"{spec.name}: backend '{backend}' is not available on {arch}")
 
 
-def flops(shape):
+def flops(spec, shape):
+    if spec.flop_count is not None:
+        return spec.flop_count(shape)
     return 2.0 * shape.get("B", 1) * shape["M"] * shape["N"] * shape["K"]
 
 
 def resolve_installed(spec, shape, backend):
     """The installed config for this shape (raw JSON bucket) and is_tuned, through the real loader."""
+    if spec.resolver is not None:
+        return spec.resolver(shape, backend)
     from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
     return get_gemm_config(
@@ -142,8 +167,8 @@ def seed_table(spec, backend, shape_nk):
     """(path, table) to install into: this shape's own file, else a new DEFAULT_FALLBACK table."""
     from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
-    config_dir = resolve_config_dir("gemm", spec.config_name, backend=backend)
-    path = f"{config_dir}/{specialized_filename(spec.config_name, shape_nk)}"
+    config_dir = resolve_config_dir(spec.op, spec.config_name, backend=backend)
+    path = f"{config_dir}/{shape_filename(spec, shape_nk)}"
     table = load_config_json(path, required=False)
     if table is not None:
         return path, table
@@ -151,21 +176,27 @@ def seed_table(spec, backend, shape_nk):
     default = load_config_json(default_path, required=False)
     if default is None:
         raise SystemExit(f"Required config file doesn't exist: {default_path}")
+    bounds_key = f"{spec.bucket_dim}_BOUNDS"
     return default_path, {
         "DEFAULT_FALLBACK": True,
-        **{k: v for k, v in default.items() if k == "M_BOUNDS"},
+        **{k: v for k, v in default.items() if k == bounds_key},
     }
 
 
+def shape_filename(spec, shape):
+    return specialized_filename(spec.config_name, shape, spec.file_dims)
+
+
 def family_bounds(spec, backend, shape_nk):
-    """The M bounds the loader walks for this shape: the kernel's explicit bounds, else the
-    served file's M_BOUNDS, else the standard list."""
+    """The bucket bounds the loader walks for this shape: the kernel's explicit bounds, else
+    the served file's <bucket_dim>_BOUNDS, else the standard GEMM list."""
     from aiter.ops.triton.utils.gemm_config_utils import STANDARD_M_BOUNDS
 
     if spec.bounds:
         return tuple(spec.bounds)
     return tuple(
-        seed_table(spec, backend, shape_nk)[1].get("M_BOUNDS") or STANDARD_M_BOUNDS
+        seed_table(spec, backend, shape_nk)[1].get(f"{spec.bucket_dim}_BOUNDS")
+        or STANDARD_M_BOUNDS
     )
 
 
@@ -819,3 +850,92 @@ def gemm_afp8wfp8_preshuffle(shape, backend):
         )  # clusters only there
 
     return call, (x, w_kernel, x_scales_kernel, w_scales, y), should_skip
+
+
+def mha_resolve(shape, backend):
+    """What the varlen entry resolves with config=None, and whether a shape file served it."""
+    import torch
+
+    from aiter.ops.triton._triton_kernels.attention import mha
+    from aiter.ops.triton.utils.config_utils import resolve_config_dir
+
+    causal = bool(shape["CAUSAL"])
+    # __wrapped__: _get_config's own cache would still hold the file before this install
+    config = mha._get_config.__wrapped__(
+        False,
+        torch.bfloat16,
+        has_pe=shape["DQ"] > shape["DV"],
+        head_dim_v=shape["DV"],
+        causal=causal,
+        max_seqlen_q=shape["SQ"],
+        max_seqlen_k=shape["SK"],
+        batch_heads=shape["Z"] * shape["HQ"],
+        head_dim_qk=shape["DQ"],
+    )
+    tuned = mha._get_shape_config(
+        resolve_config_dir("attention", "MHA", backend=backend),
+        shape["DQ"],
+        shape["DV"],
+        causal,
+        shape["SK"],
+    )
+    return dict(config), tuned is not None
+
+
+def mha_flops(shape):
+    pairs = shape["SQ"] * shape["SK"] * (0.5 if shape["CAUSAL"] else 1.0)
+    return 2.0 * shape["Z"] * shape["HQ"] * pairs * (shape["DQ"] + shape["DV"])
+
+
+@kernel(
+    "MHA",
+    op="attention",
+    dims=("Z", "HQ", "HK", "SQ", "SK", "DQ", "DV", "CAUSAL"),
+    bucket_dim="SK",
+    file_dims=("DQ", "DV", "CAUSAL"),
+    bounds=(256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072),
+    resolver=mha_resolve,
+    default_buckets=lambda table: {
+        name: entry for name, entry in table["fwd"].items() if isinstance(entry, dict)
+    },
+    flop_count=mha_flops,
+    tile_dims={"BLOCK_SIZE_M": "SQ", "BLOCK_SIZE_N": "SK"},
+)
+def mha_varlen_fwd(shape, backend):
+    """bf16 varlen forward, Z sequences of SQ queries and SK keys, no dropout."""
+    import torch
+
+    from aiter.ops.triton.attention.mha import flash_attn_varlen_func
+
+    Z, SQ, SK = shape["Z"], shape["SQ"], shape["SK"]
+    causal = bool(shape["CAUSAL"])
+    generator = torch.Generator(device="cuda").manual_seed(0)
+
+    def randn(*size):
+        return torch.randn(
+            size, dtype=torch.bfloat16, device="cuda", generator=generator
+        )
+
+    q = randn(Z * SQ, shape["HQ"], shape["DQ"])
+    k = randn(Z * SK, shape["HK"], shape["DQ"])
+    v = randn(Z * SK, shape["HK"], shape["DV"])
+    out = torch.empty((Z * SQ, shape["HQ"], shape["DV"]), dtype=q.dtype, device="cuda")
+    cu_q = torch.arange(Z + 1, dtype=torch.int32, device="cuda") * SQ
+    cu_k = torch.arange(Z + 1, dtype=torch.int32, device="cuda") * SK
+
+    def call(config, q, k, v, cu_q, cu_k, out):
+        return flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            SQ,
+            SK,
+            causal=causal,
+            out=out,
+            config=config,
+            backend=backend,
+        )
+
+    return call, (q, k, v, cu_q, cu_k, out), None

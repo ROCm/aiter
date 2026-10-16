@@ -2,12 +2,15 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Install step: pick the fastest config per swept M and write the family's config file.
 
+M stands for the family's bucket dim (spec.bucket_dim): M for GEMM, SK for MHA.
+
 Flow:  load_winners    fastest ok record per M; the installed baseline competes too
        assign_buckets  M -> M_LEQ_<smallest family bound >= M>; the largest M wins a shared bucket;
                        an M above the largest bound is not written
        build_table     seeded with this shape's file if it exists, else a new file marked
                        DEFAULT_FALLBACK (the loader serves its missing buckets from DEFAULT.json);
-                       "any" is a copy of DEFAULT.json's; DEFAULT.json is never written
+                       "any" is a copy of DEFAULT.json's, when DEFAULT.json has one;
+                       DEFAULT.json is never written
        write, confirm  write the file, re-resolve every assigned M through the real loader, and
                        put the previous file back if the loader disagrees
 
@@ -31,9 +34,15 @@ from _utils import (
     read_records,
     results_files,
     shape_from_args,
-    specialized_filename,
 )
-from kernels import ensure_repo_on_path, get_spec, resolve_installed, seed_table
+from kernels import (
+    KERNELS,
+    ensure_repo_on_path,
+    get_spec,
+    resolve_installed,
+    seed_table,
+    shape_filename,
+)
 from space import load_defaults
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -51,12 +60,14 @@ def load_winners(runs_dir, arch, backend, spec, shape_nk):
     so records of candidates that are no longer in the search space are ignored.
     """
     winners = {}
-    for path in results_files(runs_dir, arch, backend, spec.name, shape_nk):
+    for path in results_files(
+        runs_dir, arch, backend, spec.name, shape_nk, spec.bucket_dim
+    ):
         records = read_records(path)
         ok = [r for r in records.values() if r["status"] == "ok"]
         if not ok:
             continue
-        M = ok[0]["shape"]["M"]
+        M = ok[0]["shape"][spec.bucket_dim]
         if os.path.exists(final_results_path(path)):
             records = read_records(final_results_path(path))
             ok = [r for r in records.values() if r["status"] == "ok"]
@@ -67,7 +78,9 @@ def load_winners(runs_dir, arch, backend, spec, shape_nk):
                 f"  M={M}: timed on several GPUs but the final round is missing; rerun the sweep. Skipped."
             )
             continue
-        plan_file = plan_path(runs_dir, arch, backend, spec.name, dict(shape_nk, M=M))
+        plan_file = plan_path(
+            runs_dir, arch, backend, spec.name, dict(shape_nk, **{spec.bucket_dim: M})
+        )
         if os.path.exists(plan_file):
             with open(plan_file) as f:
                 current = {config_key(c) for c in json.load(f)["configs"]}
@@ -86,11 +99,11 @@ def load_winners(runs_dir, arch, backend, spec, shape_nk):
     return winners
 
 
-def assign_buckets(winners, bounds):
+def assign_buckets(winners, bounds, bucket_dim="M"):
     """bucket name -> Winner. Several swept Ms in one bucket: the largest M wins."""
     assignments = {}
     for M in sorted(winners):
-        bucket = bucket_for(M, bounds)
+        bucket = bucket_for(M, bounds, bucket_dim)
         if bucket is None:
             print(
                 f"  M={M}: above the largest bound {bounds[-1]}, not written ('any' is DEFAULT.json's)"
@@ -128,16 +141,17 @@ def build_table(seed, assignments, arch, keys):
     return table
 
 
-def ordered(table):
+def ordered(table, bucket_dim="M"):
     """M_BOUNDS, M_LEQ ascending, M_GEQ descending, any, rest: the order get_gemm_config walks."""
+    leq, geq = f"{bucket_dim}_LEQ_", f"{bucket_dim}_GEQ_"
 
     def rank(key):
-        if key in ("DEFAULT_FALLBACK", "M_BOUNDS"):
+        if key in ("DEFAULT_FALLBACK", f"{bucket_dim}_BOUNDS"):
             return (0, 0)
-        if key.startswith("M_LEQ_"):
-            return (1, int(key[6:]))
-        if key.startswith("M_GEQ_"):
-            return (2, -int(key[6:]))
+        if key.startswith(leq):
+            return (1, int(key[len(leq) :]))
+        if key.startswith(geq):
+            return (2, -int(key[len(geq) :]))
         return (3, 0) if key == "any" else (4, 0)
 
     return {k: table[k] for k in sorted(table, key=rank)}
@@ -158,16 +172,23 @@ def install(spec, backend, shape_nk, runs_dir):
     seed_path, seed = seed_table(spec, backend, shape_nk)
     print(f"seeding from {seed_path}")
     # the loader walks the kernel's explicit bounds, else the M_BOUNDS of the file it picks
-    bounds = spec.bounds or seed.get("M_BOUNDS") or gemm_config_utils.STANDARD_M_BOUNDS
+    bounds = (
+        spec.bounds
+        or seed.get(f"{spec.bucket_dim}_BOUNDS")
+        or gemm_config_utils.STANDARD_M_BOUNDS
+    )
     keys, default_buckets, _ = load_defaults(spec, backend)
-    assignments = assign_buckets(winners, bounds)
+    assignments = assign_buckets(winners, bounds, spec.bucket_dim)
     if not assignments:
         sys.exit(
-            f"no swept M is within the bounds (largest {bounds[-1]}); nothing installed"
+            f"no swept {spec.bucket_dim} is within the bounds (largest {bounds[-1]}); "
+            "nothing installed"
         )
     table = build_table(seed, assignments, arch, keys)
-    # every file ships DEFAULT.json's "any": a tuned small-M tile must never become the fallback
-    table["any"] = copy.deepcopy(default_buckets["any"])
+    # every file ships DEFAULT.json's "any": a tuned small-M tile must never become the fallback;
+    # a family without one (MHA) serves what its file lacks by the DEFAULT.json rules
+    if "any" in default_buckets:
+        table["any"] = copy.deepcopy(default_buckets["any"])
     for bucket, winner in sorted(assignments.items(), key=lambda kv: kv[1].M):
         gain = ""
         if winner.baseline is not None:
@@ -176,11 +197,11 @@ def install(spec, backend, shape_nk, runs_dir):
             f"  M={winner.M:<6} {bucket:<12} {winner.record['us']:10.3f} us  {gain:<36} {json.dumps(table[bucket])}"
         )
 
-    config_dir = resolve_config_dir("gemm", spec.config_name, backend=backend)
-    target = f"{config_dir}/{specialized_filename(spec.config_name, shape_nk)}"
+    config_dir = resolve_config_dir(spec.op, spec.config_name, backend=backend)
+    target = f"{config_dir}/{shape_filename(spec, shape_nk)}"
     previous = Path(target).read_text() if os.path.exists(target) else None
     with open(target, "w") as f:
-        json.dump(ordered(table), f, indent=4)
+        json.dump(ordered(table, spec.bucket_dim), f, indent=4)
         f.write("\n")
     print(f"installed {target}")
 
@@ -188,7 +209,9 @@ def install(spec, backend, shape_nk, runs_dir):
     load_config_json.cache_clear()
     gemm_config_utils._get_gemm_config_cached.cache_clear()
     for bucket, winner in assignments.items():
-        got, is_tuned = resolve_installed(spec, dict(shape_nk, M=winner.M), backend)
+        got, is_tuned = resolve_installed(
+            spec, dict(shape_nk, **{spec.bucket_dim: winner.M}), backend
+        )
         if got != table[bucket] or not is_tuned:
             if previous is None:  # never leave a bad file in the tree
                 os.remove(target)
@@ -207,14 +230,14 @@ def main(argv=None):
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("kernel", type=get_spec)
-    add_shape_args(parser, with_m=False)
+    add_shape_args(parser, KERNELS.values(), with_bucket=False)
     parser.add_argument("--backend", choices=("triton", "gluon"))
     parser.add_argument("--runs-dir", default=os.path.join(HERE, "runs"))
     args = parser.parse_args(argv)
     install(
         args.kernel,
         args.backend,
-        shape_from_args(args, args.kernel.dims),
+        shape_from_args(args, args.kernel, with_bucket=False),
         args.runs_dir,
     )
     return 0
