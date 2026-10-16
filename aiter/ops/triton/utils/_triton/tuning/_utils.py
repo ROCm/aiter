@@ -5,6 +5,7 @@
 import glob
 import json
 import os
+import sys
 
 FINAL_STATUSES = ("ok", "error", "crashed", "hung")
 TOP_BUCKET_M = 8192  # --all-buckets sweeps the family's M_LEQ buckets up to here
@@ -144,7 +145,7 @@ def shape_from_args(args, spec, value=None, with_bucket=True):
         if d.isupper() and v is not None and d not in spec.dims
     )
     if stray:
-        raise SystemExit(
+        _usage_error(
             f"{spec.name} takes --{' --'.join(spec.dims)}, not --{' --'.join(stray)}"
         )
     shape = {}
@@ -155,6 +156,12 @@ def shape_from_args(args, spec, value=None, with_bucket=True):
                 continue
             given = value if value is not None else given
         if given is None:
-            raise SystemExit(f"{spec.name} needs --{dim}")
+            _usage_error(f"{spec.name} needs --{dim}")
         shape[dim] = given
     return shape
+
+
+def _usage_error(message):
+    """Exit as argparse does on a usage error (status 2), which scripts check."""
+    print(f"error: {message}", file=sys.stderr)
+    raise SystemExit(2)

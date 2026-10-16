@@ -185,9 +185,10 @@ def install(spec, backend, shape_nk, runs_dir):
             "nothing installed"
         )
     table = build_table(seed, assignments, arch, keys)
-    # every file ships DEFAULT.json's "any": a tuned small-M tile must never become the fallback;
-    # a family without one (MHA) serves what its file lacks by the DEFAULT.json rules
-    if "any" in default_buckets:
+    # every GEMM file ships DEFAULT.json's "any" (a KeyError if it has none): a tuned small-M
+    # tile must never become the fallback. MHA's DEFAULT.json has no "any"; its loader serves
+    # what the file lacks by the DEFAULT.json rules
+    if spec.op == "gemm" or "any" in default_buckets:
         table["any"] = copy.deepcopy(default_buckets["any"])
     for bucket, winner in sorted(assignments.items(), key=lambda kv: kv[1].M):
         gain = ""

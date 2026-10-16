@@ -16,6 +16,9 @@ from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
 )
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 @triton.jit
@@ -952,19 +955,26 @@ def _get_shape_config(
 
     A shape file is keyed on the head dims and causality and holds
     ``SK_LEQ_<bound>`` buckets over ``max_seqlen_k``; a key past its largest
-    bucket, like a shape without a file, is served by DEFAULT.json.
+    bucket, like a shape without a file, is served by DEFAULT.json. A bucket
+    whose bound is not an integer is skipped with a warning.
     """
-    table = load_config_json(
-        f"{cfg_dir}/{_shape_config_name(head_dim_qk, head_dim_v, causal)}",
-        required=False,
-    )
+    name = _shape_config_name(head_dim_qk, head_dim_v, causal)
+    table = load_config_json(f"{cfg_dir}/{name}", required=False)
     if table is None:
         return None
-    bounds = sorted(
-        int(key[len("SK_LEQ_") :]) for key in table if key.startswith("SK_LEQ_")
-    )
-    bound = next((b for b in bounds if max_seqlen_k <= b), None)
-    return None if bound is None else table[f"SK_LEQ_{bound}"]
+    buckets = {}
+    for key in table:
+        if not key.startswith("SK_LEQ_"):
+            continue
+        bound = key[len("SK_LEQ_") :]
+        if not bound.isdigit():
+            _LOGGER.warning(
+                f"{name}: skipping bucket {key!r}, its bound is not an integer"
+            )
+            continue
+        buckets[int(bound)] = table[key]
+    bound = next((b for b in sorted(buckets) if max_seqlen_k <= b), None)
+    return None if bound is None else buckets[bound]
 
 
 @functools.lru_cache(maxsize=1024)
@@ -980,10 +990,11 @@ def _get_config(
     head_dim_qk: int | None = None,
 ):
     cfg_dir = resolve_config_dir("attention", "MHA", backend="triton")
+    # Shape files hold tiles the harness tuned, and it times bf16 only.
     if (
         None not in (head_dim_qk, head_dim_v, max_seqlen_k)
         and not enable_dropout
-        and dtype in (torch.float16, torch.bfloat16)
+        and dtype == torch.bfloat16
     ):
         tuned = _get_shape_config(
             cfg_dir, head_dim_qk, head_dim_v, causal, max_seqlen_k

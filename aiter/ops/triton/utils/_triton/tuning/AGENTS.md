@@ -38,13 +38,15 @@ here. Update this file in the same change as any behaviour change.
    not replace), else it starts with only `"DEFAULT_FALLBACK": true` and `DEFAULT.json`'s
    `M_BOUNDS`: never copy untuned buckets (another shape's or `DEFAULT.json`'s) into a shape file.
    M here and below is the family's `bucket_dim` (`SK` for MHA, with `SK_LEQ_*` and
-   `SK_BOUNDS`); a family whose `DEFAULT.json` has no `any` (MHA) ships none.
+   `SK_BOUNDS`).
    The loader serves the buckets a `DEFAULT_FALLBACK` file lacks from `DEFAULT.json`. Bounds: the
    kernel's explicit `bounds`, else the seed's `<bucket_dim>_BOUNDS`, else `STANDARD_M_BOUNDS`.
    `--all-buckets` only chooses the M list (the family's buckets up to `TOP_BUCKET_M`, 8192). Ms
-   above the largest bound are not tuned. Every installed file ships an `any`: a copy of
+   above the largest bound are not tuned. Every installed GEMM file ships an `any`: a copy of
    `DEFAULT.json`'s `any`, rewritten on every install (the one bucket copied from `DEFAULT.json`;
-   a tuned small-M tile as fallback breaks kernels such as MXFP4 preshuffle at M >= 32).
+   a tuned small-M tile as fallback breaks kernels such as MXFP4 preshuffle at M >= 32); a GEMM
+   `DEFAULT.json` without one is an error. MHA's `DEFAULT.json` has no `any`, so an MHA file
+   ships none, and a key past its largest bucket gets the `DEFAULT.json` rules.
    `DEFAULT.json` is never written, so its `any` never changes; only `M_LEQ_*` buckets are tuned;
    `kpack` is dropped outside gfx942 and `persistent` always. After writing, clear both loader
    caches and re-resolve every swept M; `is_tuned` must be True, otherwise the previous file is

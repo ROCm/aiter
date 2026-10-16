@@ -18,23 +18,26 @@ DEFAULT = (
     Path(kernels.__file__).parents[2]
     / "configs/gfx950/triton/attention/mha/DEFAULT.json"
 )
-TUNED = {
-    "BLOCK_M": 64,
-    "BLOCK_N": 32,
-    "PRELOAD_V": False,
-    "waves_per_eu": 1,
-    "num_warps": 8,
-    "num_ctas": 1,
-    "num_stages": 2,
-}
+FWD = json.loads(DEFAULT.read_text())["fwd"]
+# Real DEFAULT.json entries that DEFAULT.json does not serve this shape, so
+# a bucket's tile is a tile the kernel runs and can only come from the file.
+SMALL, LARGE = dict(FWD["small_head"]), dict(FWD["pe"])
+SHAPE_FILE = "MHA-DQ=128-DV=128-CAUSAL=1.json"
 
 
 @pytest.fixture
 def config_dir():
     with tempfile.TemporaryDirectory() as directory:
         shutil.copy(DEFAULT, directory)
-        (Path(directory) / "MHA-DQ=128-DV=128-CAUSAL=1.json").write_text(
-            json.dumps({"DEFAULT_FALLBACK": True, "SK_LEQ_4096": TUNED})
+        (Path(directory) / SHAPE_FILE).write_text(
+            json.dumps(
+                {
+                    "DEFAULT_FALLBACK": True,
+                    "SK_LEQ_4096": LARGE,
+                    "SK_LEQ_1024": SMALL,
+                    "SK_LEQ_4k": SMALL,
+                }
+            )
         )
         kernels._get_config.cache_clear()
         load_config_json.cache_clear()
@@ -63,12 +66,30 @@ def default_bucket(**overrides):
     return resolve(**overrides, head_dim_qk=None)
 
 
-def test_a_shape_inside_a_tuned_bucket_gets_its_tile(config_dir):
-    assert resolve() == TUNED
+def test_the_tuned_tiles_are_not_what_default_json_serves(config_dir):
+    assert SMALL != LARGE
+    for max_seqlen_k in (1, 1024, 1025, 4096, 4097):
+        assert default_bucket(max_seqlen_k=max_seqlen_k) not in (SMALL, LARGE)
+
+
+@pytest.mark.parametrize(
+    "max_seqlen_k, expected",
+    [(1, SMALL), (1024, SMALL), (1025, LARGE), (4096, LARGE)],
+)
+def test_the_smallest_bucket_that_holds_the_shape_serves_it(
+    config_dir, max_seqlen_k, expected
+):
+    assert resolve(max_seqlen_k=max_seqlen_k) == expected
 
 
 def test_a_shape_past_the_largest_bucket_gets_default_json(config_dir):
-    assert resolve(max_seqlen_k=8192) == default_bucket(max_seqlen_k=8192)
+    assert resolve(max_seqlen_k=4097) == default_bucket(max_seqlen_k=4097)
+
+
+def test_a_bucket_whose_bound_is_not_an_integer_is_skipped(config_dir):
+    with mock.patch.object(kernels._LOGGER, "warning") as warning:
+        assert resolve(max_seqlen_k=2048) == LARGE
+    assert "SK_LEQ_4k" in warning.call_args.args[0]
 
 
 def test_another_head_dim_or_mask_has_no_file(config_dir):
@@ -76,6 +97,11 @@ def test_another_head_dim_or_mask_has_no_file(config_dir):
     assert resolve(head_dim_qk=192, has_pe=True) == default_bucket(has_pe=True)
 
 
-def test_dropout_and_fp32_keep_their_default_json_buckets(config_dir):
+def test_only_bf16_reads_the_shape_file(config_dir):
+    # The harness tunes bf16; other dtypes keep the DEFAULT.json rules.
+    for dtype in (torch.float16, torch.float32):
+        assert resolve(dtype=dtype) == default_bucket(dtype=dtype)
+
+
+def test_dropout_keeps_its_default_json_bucket(config_dir):
     assert resolve(enable_dropout=True) == default_bucket(enable_dropout=True)
-    assert resolve(dtype=torch.float32) == default_bucket(dtype=torch.float32)

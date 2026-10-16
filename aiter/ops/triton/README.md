@@ -140,7 +140,9 @@ configs/<arch>/<backend>/<op>/<d_type>/<CONFIG_NAME>-<suffix>.json
 
 The suffix depends on the family. For example, GEMM files use
 `N=<N>-K=<K>`, batched GEMM files use `B=<B>-N=<N>-K=<K>` and MHC files use
-`C=<C>`. Some families use a custom suffix.
+`C=<C>`. Some families use a custom suffix. MHA forward files use
+`DQ=<head_dim_qk>-DV=<head_dim_v>-CAUSAL=<0|1>` with `SK_LEQ_<x>` buckets and
+no `"any"` (a proposal; see [`configs/AGENTS.md`](configs/AGENTS.md)).
 
 Example: `configs/gfx950/triton/gemm/gemm_a16w16/GEMM-A16W16-N=256-K=7168.json`.
 `<d_type>` is the config name in lowercase, with `_` in place of `-`. A GEMM

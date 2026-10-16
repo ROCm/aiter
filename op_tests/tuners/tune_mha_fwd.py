@@ -33,6 +33,7 @@ import math
 import os
 import subprocess
 import sys
+import tempfile
 import zlib
 from pathlib import Path
 from typing import Any, ClassVar
@@ -509,13 +510,13 @@ class MhaFwdTuner(GatedTuner):
             action="store_true",
             help=(
                 "before measuring, tune the Triton tile of each shape with the "
-                "Triton harness (sweep_configs.py mha_varlen_fwd), which installs "
-                "into Triton's config tree"
+                "Triton harness (sweep_configs.py mha_varlen_fwd, on the first "
+                "visible GPU), which installs into Triton's config tree"
             ),
         )
         self.parser.add_argument(
             "--triton-runs-dir",
-            default="triton_tile_runs",
+            default=os.path.join(tempfile.gettempdir(), "aiter_triton_tile_runs"),
             help="the harness's --runs-dir for --triton-tiles (resumable)",
         )
 
@@ -592,6 +593,7 @@ class MhaFwdTuner(GatedTuner):
             raise ValueError(
                 f"unknown --backends {unknown}; choose from {sorted(MHA_FWD_BACKENDS)}"
             )
+        self._check_triton_tiles(args)
         frame = self.stamp_hardware(frame)
         if self.get_gfx() not in TUNABLE_GFX:
             raise ValueError(
@@ -643,17 +645,35 @@ class MhaFwdTuner(GatedTuner):
         return field
 
     def tune(self, untunedf, tunedf, args):
-        installed = {}
-        if args.triton_tiles:
-            installed = self._tune_triton_tiles(untunedf, args)
-        results = self._measure(untunedf, args)
-        self._roll_back_wrong_tiles(results, installed, args)
+        if not getattr(args, "triton_tiles", False):
+            return self._measure(untunedf, args)
+        snapshots, installed = self._tune_triton_tiles(untunedf, args)
+        results = []
+        try:
+            results = self._measure(untunedf, args)
+        finally:
+            self._roll_back_wrong_tiles(results, snapshots, installed, args)
+        self._report_moved_digests(args)
         return results
 
-    def _tune_triton_tiles(self, untunedf, args) -> dict[tuple, tuple[str, str | None]]:
-        """Have the Triton harness install a tile per shape. Returns
-        key -> (shape file, previous text)."""
-        installed = {}
+    @staticmethod
+    def _check_triton_tiles(args) -> None:
+        """An installed tile is only checked by measuring Triton here."""
+        restricted = _names(getattr(args, "backends", ""))
+        tiles = getattr(args, "triton_tiles", False)
+        if tiles and restricted and "triton" not in restricted:
+            raise ValueError("--triton-tiles needs triton in --backends")
+
+    def _tune_triton_tiles(self, untunedf, args):
+        """Have the Triton harness install a tile per shape.
+
+        Returns (shape file -> its text before the first install, or None
+        when it did not exist) and (shape file -> keys installed into it).
+        Rows that share a head dim and mask share one file, so the snapshot
+        is taken once per file.
+        """
+        snapshots: dict[str, str | None] = {}
+        installed: dict[str, list[tuple]] = {}
         for _, row in untunedf.iterrows():
             problem = _problem(row)
             reason = triton_unsupported_reason(problem, "triton") or harness_reason(
@@ -663,39 +683,70 @@ class MhaFwdTuner(GatedTuner):
                 print(f"not tuning a Triton tile for {problem.key()}: {reason}")
                 continue
             path = triton_shape_file(problem)
-            previous = Path(path).read_text() if os.path.exists(path) else None
+            if path not in snapshots:
+                snapshots[path] = (
+                    Path(path).read_text() if os.path.exists(path) else None
+                )
             command = harness_command(problem, args)
             print("triton tiles:", " ".join(command[1:]), flush=True)
             returncode = subprocess.run(
                 command,
                 cwd=TRITON_HARNESS_DIR,
-                env=dict(os.environ, PYTHONPATH=REPO_ROOT),
+                env=harness_env(),
                 check=False,
             ).returncode
             if returncode != 0:
                 print(f"the Triton harness failed ({returncode}) for {problem.key()}")
-            installed[problem.key()] = (path, previous)
+            installed.setdefault(path, []).append(problem.key())
         clear_triton_config_caches()
-        return installed
+        return snapshots, installed
 
-    def _roll_back_wrong_tiles(self, results, installed, args) -> None:
-        """The harness checks no numerics: put back a shape file whose tile
-        fails the reference here."""
-        for (key, backend, _), _, err_ratio, status, _ in results:
-            if backend != "triton" or key not in installed:
+    def _roll_back_wrong_tiles(self, results, snapshots, installed, args) -> None:
+        """The harness checks no numerics: put a shape file back as it was
+        before this run unless every row installed into it measured ``ok``
+        on Triton here. A row with no Triton result counts as failed."""
+        passed = {
+            key
+            for (key, backend, _), _, err_ratio, status, _ in results
+            if backend == "triton" and status == "ok" and err_ratio <= args.errRatio
+        }
+        for path, keys in installed.items():
+            failed = [key for key in keys if key not in passed]
+            if not failed:
                 continue
-            if status == "ok" and err_ratio <= args.errRatio:
-                continue
-            path, previous = installed[key]
+            previous = snapshots[path]
             if previous is None:
                 if os.path.exists(path):
                     os.remove(path)
             else:
                 Path(path).write_text(previous)
             print(
-                f"{key}: the installed Triton tile failed ({status}); {path} restored"
+                f"{path} restored: {len(failed)} of {len(keys)} installed Triton "
+                f"tiles did not pass the reference, first {failed[0]}"
             )
         clear_triton_config_caches()
+
+    def _report_moved_digests(self, args) -> None:
+        """List published Triton rows whose tile an install changed. Dispatch
+        drops such a row (its digest no longer matches) until it is re-tuned."""
+        if not os.path.exists(args.tune_file):
+            return
+        table = pd.read_csv(args.tune_file, dtype=str, keep_default_na=False)
+        moved = []
+        for _, row in table.iterrows():
+            if row.get("backend") not in MHA_FWD_TRITON_BACKENDS:
+                continue
+            problem = MhaFwdProblem.from_mapping(row)
+            now = config_digest(triton_config(problem, row["backend"]))
+            if now != row["config_digest"]:
+                moved.append(problem.key())
+        if moved:
+            print(
+                f"{len(moved)} published Triton rows now resolve another tile and "
+                "fall back to auto-select until re-tuned:"
+            )
+            for key in moved:
+                print(f"  {key}")
 
     def _measure(self, untunedf, args):
         tasks, group_sizes = [], []
@@ -831,7 +882,16 @@ def triton_shape_file(problem: MhaFwdProblem) -> str:
     )
 
 
+def harness_env() -> dict[str, str]:
+    path = os.environ.get("PYTHONPATH")
+    return dict(
+        os.environ, PYTHONPATH=os.pathsep.join(p for p in (REPO_ROOT, path) if p)
+    )
+
+
 def harness_command(problem: MhaFwdProblem, args) -> list[str]:
+    # One sweep per GPU is the harness's design; this runs it on the first
+    # visible one.
     gpu = os.environ.get("HIP_VISIBLE_DEVICES", "0").split(",")[0]
     return [
         sys.executable,
