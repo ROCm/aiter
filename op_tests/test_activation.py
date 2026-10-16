@@ -76,19 +76,19 @@ def test_scaled_silu_and_mul_edge_cases():
     for d, pad in [(3, 0), (4098, 0), (14336, 8), (14338, 3)]:
         # One extra row and `pad` extra columns that the kernel must not write.
         x_buf = torch.randn(65, 2 * d + pad, dtype=torch.bfloat16, device="cuda") * 8
-        out_buf = torch.zeros(65, d + pad, dtype=torch.uint8, device="cuda")
+        out_buf = torch.full((65, d + pad), 0x5A, dtype=torch.uint8, device="cuda")
         x = x_buf[:64, : 2 * d]
         out = out_buf[:64, :d].view(dtypes.fp8)
         scale = torch.tensor([0.01], device="cuda")
         aiter.scaled_silu_and_mul(out, x, scale)
+        assert (out_buf[:64, d:] == 0x5A).all() and (
+            out_buf[64:] == 0x5A
+        ).all(), f"d={d}: write outside the output rows"
         ref = torch_silu_and_mul(x.float()) / scale
         ref = ref.clamp(fp8_info.min, fp8_info.max).to(dtypes.fp8).float()
         err = (out.float() - ref).abs()
         assert not out.float().isnan().any(), f"d={d}: NaN instead of saturation"
         assert (err <= ref.abs() * 0.125 + 2**-9).all(), f"d={d}: wrong values"
-        assert (out_buf[:64, d:] == 0).all() and (
-            out_buf[64:] == 0
-        ).all(), f"d={d}: write outside the output rows"
 
     x = torch.randn(64, 8192, dtype=torch.bfloat16, device="cuda")
     out = torch.empty(64, 4096, dtype=dtypes.fp8, device="cuda")
