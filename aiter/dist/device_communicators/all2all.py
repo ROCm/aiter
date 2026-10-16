@@ -248,13 +248,13 @@ class MoriV2All2AllManager(All2AllManagerBase):
             comm = self._create_cco_communicator(per_rank_vmm)
             self._cco_communicator = comm
             self._cco_per_rank_vmm = per_rank_vmm
-            logger.info(
-                "MORI v2 CCO communicator ready: rank=%d world_size=%d "
-                "per_rank_vmm=%.2f GiB",
-                self.rank,
-                self.world_size,
-                per_rank_vmm / (1 << 30),
-            )
+            if self.rank == 0:
+                logger.info(
+                    "MORI v2 CCO communicator ready: world_size=%d "
+                    "per_rank_vmm=%.2f GiB",
+                    self.world_size,
+                    per_rank_vmm / (1 << 30),
+                )
             return comm
 
     def _make_handle(self, comm, **kwargs):
