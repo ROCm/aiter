@@ -2,30 +2,21 @@ import math
 import torch
 import triton
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.mha_fp8 import _mha_fwd_subtiled
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 import triton.experimental.gluon.language as gl
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 
 def get_mha_fwd_config(seqlen_q, seqlen_k, causal) -> dict:
-    """Returns the default config for the fp8 MHA forward kernel."""
-    if causal and seqlen_q < seqlen_k:
-        return {
-            "BLOCK_M": 128,
-            "BLOCK_N": 256, 
-            "NUM_BUFFERS": 2,
-            "num_warps": 4,
-        }
-    else:
-        return {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128, 
-            "NUM_BUFFERS": 2,
-            "num_warps": 4,
-        }
+    cfg_dir = resolve_config_dir("attention", "MHA", backend="gluon")
+    configs = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    key = "causal_unequal_seqs" if causal and seqlen_q < seqlen_k else "default"
+    return dict(configs[key])
 
 
 def get_wmma_layouts(BLOCK_M, head_dim_pow2, num_warps):
     tiles_per_warp = BLOCK_M // num_warps // 16
-    assert(tiles_per_warp > 0)
+    assert tiles_per_warp > 0
     num_warps_log2 = int(math.log2(num_warps))
     tiles_per_warp_log2 = int(math.log2(tiles_per_warp))
     base = 1
@@ -90,6 +81,10 @@ def mha_fwd(
     Returns:
     o:         same shape as q, dtype bfloat16.
     """
+
+    arch = get_arch()
+    assert arch == "gfx1250", "Only supported on gfx1250"
+
     for t, name in zip((q, k, v), ("q", "k", "v")):
         assert t.dtype == torch.float8_e4m3fn, f"{name} must be float8_e4m3fn"
         assert t.dim() == 4, f"{name} must be 4D, got {t.dim()}D"
@@ -97,17 +92,17 @@ def mha_fwd(
     batch, num_q_heads, seqlen_q, head_dim = q.shape
     _, num_k_heads, seqlen_k, _ = k.shape
     assert k.shape == v.shape, "k and v must have the same shape"
-    assert k.shape[0] == batch and k.shape[3] == head_dim, (
-        "k/v must match q in batch and head_dim"
-    )
-    assert num_q_heads % num_k_heads == 0, (
-        f"num_q_heads ({num_q_heads}) must be a multiple of num_k_heads ({num_k_heads})"
-    )
+    assert (
+        k.shape[0] == batch and k.shape[3] == head_dim
+    ), "k/v must match q in batch and head_dim"
+    assert (
+        num_q_heads % num_k_heads == 0
+    ), f"num_q_heads ({num_q_heads}) must be a multiple of num_k_heads ({num_k_heads})"
     # With the bottom-right causal alignment, SQ > SK would leave the first
     # SQ - SK query rows without any visible key.
-    assert not causal or seqlen_k >= seqlen_q, (
-        f"causal requires seqlen_k ({seqlen_k}) >= seqlen_q ({seqlen_q})"
-    )
+    assert (
+        not causal or seqlen_k >= seqlen_q
+    ), f"causal requires seqlen_k ({seqlen_k}) >= seqlen_q ({seqlen_q})"
 
     config = get_mha_fwd_config(seqlen_q, seqlen_k, causal)
     BLOCK_M = config["BLOCK_M"]
@@ -115,7 +110,7 @@ def mha_fwd(
     NUM_BUFFERS = config["NUM_BUFFERS"]
 
     head_dim_pow2 = triton.next_power_of_2(head_dim)
-    assert head_dim_pow2 >= 64
+    assert head_dim_pow2 >= 64, "tested only on head_dim_pow2 >= 64"
     causal_offset = seqlen_k - seqlen_q
     use_causal_offset = causal_offset > 0
 
@@ -149,9 +144,11 @@ def mha_fwd(
         preshuffle_factor_k = 1
     preshuffle_factor_v = 1
     stride_k_n *= preshuffle_factor_k
-    #stride_v_n *= preshuffle_factor_v
+    # stride_v_n *= preshuffle_factor_v
 
-    WMMA_LAYOUT_QK, WMMA_LAYOUT_O = get_wmma_layouts(BLOCK_M, head_dim_pow2, config["num_warps"])
+    WMMA_LAYOUT_QK, WMMA_LAYOUT_O = get_wmma_layouts(
+        BLOCK_M, head_dim_pow2, config["num_warps"]
+    )
 
     grid_m = triton.cdiv(seqlen_q, BLOCK_M)
     grid = (num_q_heads, grid_m, batch)
@@ -194,8 +191,8 @@ def mha_fwd(
         HEAD_DIM_POW2=head_dim_pow2,
         NUM_BUFFERS=NUM_BUFFERS,
         EVEN_N=(seqlen_k % BLOCK_N == 0) and (triton.cdiv(seqlen_k, BLOCK_N) >= 3),
-        PRESHUFFLE_FACTOR_K = preshuffle_factor_k,
-        PRESHUFFLE_FACTOR_V = preshuffle_factor_v,
+        PRESHUFFLE_FACTOR_K=preshuffle_factor_k,
+        PRESHUFFLE_FACTOR_V=preshuffle_factor_v,
         WMMA_LAYOUT_QK=WMMA_LAYOUT_QK,
         WMMA_LAYOUT_O=WMMA_LAYOUT_O,
         num_warps=config["num_warps"],
