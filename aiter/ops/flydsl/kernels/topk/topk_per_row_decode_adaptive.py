@@ -759,6 +759,43 @@ def create_topk_per_row_decode_adaptive_kernel(
         def wave_inclusive_scan_i32(value):
             return warp_inclusive_scan(fx.Int32(value), ReductionOp.ADD)
 
+        # Not fx.coop.BlockScan: it folds the wave totals linearly in every thread,
+        # where here wave 0 scans them once.
+        def block_exclusive_scan_i32(
+            value, *, leading_barrier=False, with_total=False, wave0_last=None
+        ):
+            """Exclusive prefix over tid of one i32 per thread, and the block total.
+
+            `wave0_last(block_total)` runs on one lane of wave 0 before the closing
+            barrier. A scan following a `with_total` one with no barrier between
+            needs `leading_barrier`, since that read of TOTAL may still be in flight.
+            """
+            if const_expr(leading_barrier):
+                gpu.barrier()
+            wave_incl = wave_inclusive_scan_i32(value)
+            wave_excl_thread = wave_incl - value
+            if lane == c_last_lane:
+                fx.memref_store(wave_incl, s_scan, (wave, SCAN_TOTAL))
+            gpu.barrier()
+            if wave == c_zero:
+                in_slots = lane < c_red_slots
+                lane_safe = in_slots.select(lane, c_zero)
+                wtot = in_slots.select(s_scan[lane_safe, SCAN_TOTAL], c_zero)
+                wincl = wave_inclusive_scan_i32(wtot)
+                if in_slots:
+                    fx.memref_store(wincl - wtot, s_scan, (lane, SCAN_OFFSET))
+                if const_expr(wave0_last is not None) and lane == c_last_wave:
+                    wave0_last(wincl)
+            gpu.barrier()
+            wave_off = s_scan[wave, SCAN_OFFSET]
+            total = (
+                s_scan[c_last_wave, SCAN_OFFSET] + s_scan[c_last_wave, SCAN_TOTAL]
+                if with_total
+                else None
+            )
+            exclusive = wave_off + wave_excl_thread
+            return (exclusive, total) if with_total else exclusive
+
         def choose_bucket_prefix(target_k):
             # Multi-block ascending block scan over the LDS histogram; each thread owns a bin pair.
             first_bin = tid * fx.Int32(2)
@@ -769,32 +806,17 @@ def create_topk_per_row_decode_adaptive_kernel(
             safe1 = bin1_valid.select(bin1, c_zero)
             c0 = bin0_valid.select(s_hist[safe0], c_zero)
             c1 = bin1_valid.select(s_hist[safe1], c_zero)
-            local_total = c0 + c1
 
-            wave_incl = wave_inclusive_scan_i32(local_total)
-            wave_excl_thread = wave_incl - local_total
+            # The scan already carries the histogram's grand total, so the
+            # certificate's test costs a store here and a compare there, not a
+            # second pass over the bins.
+            def store_certificate_total(total):
+                fx.memref_store(total, s_meta, fx.Int32(SMEM_META_TOTAL))
 
-            if lane == c_last_lane:
-                fx.memref_store(wave_incl, s_scan, (wave, SCAN_TOTAL))
-            gpu.barrier()
-
-            if wave == c_zero:
-                in16 = lane < c_red_slots
-                lane_safe = in16.select(lane, c_zero)
-                wtot = in16.select(s_scan[lane_safe, SCAN_TOTAL], c_zero)
-                wincl = wave_inclusive_scan_i32(wtot)
-                wexcl = wincl - wtot
-                if in16:
-                    fx.memref_store(wexcl, s_scan, (lane, SCAN_OFFSET))
-                # The scan already carries the histogram's grand total in the last
-                # wave's inclusive value, so the certificate's test costs a store
-                # here and a compare there, not a second pass over the bins.
-                if const_expr(histogram_certificate) and lane == c_last_wave:
-                    fx.memref_store(wincl, s_meta, fx.Int32(SMEM_META_TOTAL))
-            gpu.barrier()
-
-            wave_off = s_scan[wave, SCAN_OFFSET]
-            excl0 = wave_off + wave_excl_thread
+            excl0 = block_exclusive_scan_i32(
+                c0 + c1,
+                wave0_last=(store_certificate_total if histogram_certificate else None),
+            )
             incl0 = excl0 + c0
             incl1 = incl0 + c1
 
@@ -960,7 +982,14 @@ def create_topk_per_row_decode_adaptive_kernel(
                     n_keep = n_keep + keep
 
             carried = s_run[fx.Int32(SMEM_RUN_COMPACT_COUNT)]
-            my_excl = compact_early_carry_scan_i32(n_keep, carried)
+
+            def publish_next_carry(tile_total):
+                total = carried + tile_total
+                fx.memref_store(total, s_run, fx.Int32(SMEM_RUN_COMPACT_COUNT))
+                if total > part_slice_cap:
+                    fx.memref_store(c_one, s_run, fx.Int32(SMEM_RUN_COMPACT_SPILLED))
+
+            my_excl = block_exclusive_scan_i32(n_keep, wave0_last=publish_next_carry)
             slot = part_slice_base + carried + my_excl
             for col_i32, key, keep in keeps:
                 if (keep == c_one) & (slot < part_slice_end):
@@ -1000,52 +1029,6 @@ def create_topk_per_row_decode_adaptive_kernel(
                     cb, vc, pass_id, start_bit, previous_start_bit, current_bits
                 )
 
-        def block_exclusive_scan_i32(value):
-            """Exclusive prefix over tid and block total for one i32 per thread."""
-            gpu.barrier()
-            wave_incl = wave_inclusive_scan_i32(value)
-            wave_excl_thread = wave_incl - value
-            if lane == c_last_lane:
-                fx.memref_store(wave_incl, s_scan, (wave, SCAN_TOTAL))
-            gpu.barrier()
-            if wave == c_zero:
-                in_slots = lane < c_red_slots
-                lane_safe = in_slots.select(lane, c_zero)
-                wtot = in_slots.select(s_scan[lane_safe, SCAN_TOTAL], c_zero)
-                wincl = wave_inclusive_scan_i32(wtot)
-                if in_slots:
-                    fx.memref_store(wincl - wtot, s_scan, (lane, SCAN_OFFSET))
-            gpu.barrier()
-            wave_off = s_scan[wave, SCAN_OFFSET]
-            last_off = s_scan[c_last_wave, SCAN_OFFSET]
-            last_tot = s_scan[c_last_wave, SCAN_TOTAL]
-            return wave_off + wave_excl_thread, last_off + last_tot
-
-        def compact_early_carry_scan_i32(value, carried):
-            """Prefix scan that publishes the next tile's carry at barrier 2."""
-            wave_incl = wave_inclusive_scan_i32(value)
-            wave_excl_thread = wave_incl - value
-            if lane == c_last_lane:
-                fx.memref_store(wave_incl, s_scan, (wave, SCAN_TOTAL))
-            gpu.barrier()
-            if wave == c_zero:
-                in_slots = lane < c_red_slots
-                lane_safe = in_slots.select(lane, c_zero)
-                wtot = in_slots.select(s_scan[lane_safe, SCAN_TOTAL], c_zero)
-                wincl = wave_inclusive_scan_i32(wtot)
-                if in_slots:
-                    fx.memref_store(wincl - wtot, s_scan, (lane, SCAN_OFFSET))
-                if lane == c_last_wave:
-                    total = carried + wincl
-                    fx.memref_store(total, s_run, fx.Int32(SMEM_RUN_COMPACT_COUNT))
-                    if total > part_slice_cap:
-                        fx.memref_store(
-                            c_one, s_run, fx.Int32(SMEM_RUN_COMPACT_SPILLED)
-                        )
-            gpu.barrier()
-            wave_off = s_scan[wave, SCAN_OFFSET]
-            return wave_off + wave_excl_thread
-
         # Bins each thread owns when reducing a whole histogram. num_buckets is
         # 1024 or 2048 against 1024 threads, so this divides exactly.
         bins_per_thread = num_buckets // block_threads
@@ -1064,7 +1047,9 @@ def create_topk_per_row_decode_adaptive_kernel(
                     bin_i32 = tid + fx.Int32(i * block_threads)
                     count = s_own_hist[bin_i32]
                     mine = mine + (bin_i32 < chosen_bucket).select(count, c_zero)
-                run_total = block_exclusive_scan_i32(mine)[1]
+                _, run_total = block_exclusive_scan_i32(
+                    mine, leading_barrier=True, with_total=True
+                )
                 if tid == c_zero:
                     carried = (
                         c_zero
@@ -1266,7 +1251,7 @@ def create_topk_per_row_decode_adaptive_kernel(
         def ordered_place(cols, n_selected, n_tied, base_selected, base_tied, need):
             """Place one classified tile at its column-ordered output positions."""
             packed_excl, packed_total = block_exclusive_scan_i32(
-                (n_selected << 16) + n_tied
+                (n_selected << 16) + n_tied, leading_barrier=True, with_total=True
             )
             carried_selected = s_run[fx.Int32(SMEM_RUN_TILE_SELECTED)]
             carried_tied = s_run[fx.Int32(SMEM_RUN_TILE_TIED)]
@@ -1311,7 +1296,7 @@ def create_topk_per_row_decode_adaptive_kernel(
             checked against that bound.
             """
             packed_excl, packed_total = block_exclusive_scan_i32(
-                (n_selected << 16) + n_tied
+                (n_selected << 16) + n_tied, leading_barrier=True, with_total=True
             )
             if tid == c_zero:
                 fx.memref_store(
@@ -1785,32 +1770,8 @@ def create_topk_per_row_decode_adaptive_kernel(
                 two_tid = tid * fx.Int32(2)
                 c0 = s_hist[two_tid]
                 c1 = s_hist[two_tid + c_one]
-                local_total = c0 + c1
-
-                wave_incl = wave_inclusive_scan_i32(local_total)
-                wave_excl_thread = wave_incl - local_total
-
-                if lane == c_last_lane:
-                    fx.memref_store(wave_incl, s_scan, (wave, SCAN_TOTAL))
-                gpu.barrier()
-
-                if wave == c_zero:
-                    in16 = lane < c_red_slots
-                    lane_safe = in16.select(lane, c_zero)
-                    wtot = in16.select(s_scan[lane_safe, SCAN_TOTAL], c_zero)
-                    wincl = wave_inclusive_scan_i32(wtot)
-                    wexcl = wincl - wtot
-                    if in16:
-                        fx.memref_store(wexcl, s_scan, (lane, SCAN_OFFSET))
-                gpu.barrier()
-
-                wave_off = s_scan[wave, SCAN_OFFSET]
-                last_off = s_scan[c_last_wave, SCAN_OFFSET]
-                last_tot = s_scan[c_last_wave, SCAN_TOTAL]
-                total = last_off + last_tot
+                excl0, total = block_exclusive_scan_i32(c0 + c1, with_total=True)
                 kprime = total - target_k
-
-                excl0 = wave_off + wave_excl_thread
                 incl0 = excl0 + c0
                 incl1 = incl0 + c1
 
