@@ -9,6 +9,9 @@ MFMA specialization details. Native BF16 uses unscaled, 8-element vectorized
 K/V caches and BF16 queries.
 """
 
+import glob
+from functools import cache
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -18,7 +21,13 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
 from .kernels.pa_decode_plan import PADecodePlan
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
-from .kernels.pa_decode_reduce import compile_pa_decode_ps_reduce
+from .kernels.pa_decode_reduce import (
+    DUAL_REGISTER_PARTITIONS,
+    MAX_CTA_WAVES,
+    REGISTER_PARTITIONS,
+    WAVE,
+    compile_pa_decode_ps_reduce,
+)
 from .kernels.tensor_shim import _run_compiled, get_dtype_str, ptr_arg
 
 
@@ -31,6 +40,23 @@ def _flydsl_pointer_dtype(dtype: torch.dtype):
         torch.float8_e4m3fnuz: fx.Float8E4M3FNUZ,
         torch.int32: fx.Int32,
     }[dtype]
+
+
+@cache
+def _num_xcds(device_index: int) -> int:
+    """XCDs of a device from the KFD topology; 1 when it cannot be matched."""
+    props = torch.cuda.get_device_properties(device_index)
+    location = props.pci_bus_id << 8 | props.pci_device_id << 3
+    for path in glob.glob("/sys/class/kfd/kfd/topology/nodes/*/properties"):
+        with open(path) as f:
+            node = dict(line.split() for line in f if len(line.split()) == 2)
+        if (
+            node.get("simd_count", "0") != "0"
+            and int(node.get("domain", -1)) == props.pci_domain_id
+            and int(node.get("location_id", -1)) == location
+        ):
+            return max(1, int(node.get("num_xcc", 1)))
+    return 1
 
 
 def launch_pa_decode_ps_reduce(
@@ -52,64 +78,83 @@ def launch_pa_decode_ps_reduce(
     query_seq_len: int,
     query_group_size: int,
     head_size: int,
-    context_partition_num: int,
+    partition_bound: int,
+    max_partitions: int,
     stream: torch.cuda.Stream,
     reduce_info: torch.Tensor,
 ) -> None:
-    partition_limit = torch.cuda.get_device_properties(
-        output.device
-    ).multi_processor_count
-    if context_partition_num > partition_limit:
+    """Reduce packed partials; every sequence has at most ``partition_bound``."""
+    props = torch.cuda.get_device_properties(output.device)
+    if max_partitions > props.multi_processor_count:
         raise ImportError(
-            f"FlyDSL pa_decode reduce supports at most {partition_limit} partitions"
+            "FlyDSL pa_decode reduce supports at most "
+            f"{props.multi_processor_count} partitions"
         )
-    use_sinks = sink_token is not None
-    # Bound all attempted i32 byte offsets, including inactive partitions,
-    # so out-of-bounds reads cannot wrap back into valid data.
-    bounded_plan_logits = (
-        context_partition_num <= 64
-        and query_seq_len > 0
-        and query_group_size > 0
+    batch, kv_heads = output.shape[0], output.shape[2]
+    rows = query_seq_len * query_group_size
+    # Exact bounds keep the register ladder short; above 64 a power of two
+    # bounds the specialization count.
+    partitions = min(partition_bound, max_partitions)
+    if partitions > REGISTER_PARTITIONS:
+        partitions = min(max_partitions, 1 << (partitions - 1).bit_length())
+    # A per-sequence span <= INT32_MAX keeps every attempted byte offset,
+    # including inactive partitions, below 2**32, so out-of-bounds reads
+    # cannot wrap back into valid data.
+    if not (
+        stride_logits_group == head_size
+        and stride_logits_part == rows * head_size
         and 0 <= stride_logits_head <= 2**31 - 1
-        and stride_logits_group == head_size
-        and stride_logits_part == query_seq_len * query_group_size * head_size
-        and 0
-        < context_partition_num * stride_logits_part * logits.element_size()
-        <= 2**31 - 1
-    )
-    # Paired loads need dword alignment; scalar output stores do not.
-    vectorize_plan_logits = (
-        bounded_plan_logits
-        and head_size == 128
+        and partitions * stride_logits_part * logits.element_size() <= 2**31 - 1
+    ):
+        raise NotImplementedError(
+            "FlyDSL pa_decode reduce requires packed partial rows spanning at "
+            "most 2**31 - 1 bytes per sequence"
+        )
+    # Paired loads need dword alignment; scalar output stores do not. The
+    # register-only kernel pairs only D128/D256: at larger heads, halving its
+    # waves costs more latency hiding than the wider loads save.
+    dual = partitions > REGISTER_PARTITIONS
+    pairs = (
+        (head_size % 128 == 0 if dual else head_size in (128, 256))
         and logits.dtype in (torch.bfloat16, torch.float16)
         and logits.data_ptr() % 4 == 0
         and stride_logits_head % 2 == 0
-        and stride_logits_part % 2 == 0
-        and stride_logits_group % 2 == 0
     )
+    ctas = batch * kv_heads * rows
+    groups, num_xcds = 1, 0
+    if dual:
+        # Partition groups fill the CTA while the grid stays within 16 waves
+        # per CU. D128 sequences averaging at most 32 partitions keep one.
+        group_waves = head_size // WAVE // (2 if pairs else 1)
+        budget = MAX_CTA_WAVES * props.multi_processor_count
+        if head_size != 128 or exp_sums.shape[1] > DUAL_REGISTER_PARTITIONS * batch:
+            while (
+                2 * groups * group_waves <= MAX_CTA_WAVES
+                and 2 * groups * group_waves * ctas <= budget
+            ):
+                groups *= 2
+        per_seq = rows * kv_heads
+        if ctas * group_waves >= budget and batch * per_seq * per_seq <= 2**30:
+            num_xcds = _num_xcds(output.device.index)
+    num_xcds = num_xcds if num_xcds > 1 else 0
     compiled = compile_pa_decode_ps_reduce(
-        max_context_partition_num=context_partition_num,
+        max_context_partition_num=partitions,
         head_size=head_size,
         output_dtype_str=get_dtype_str(output.dtype),
         logits_dtype_str=get_dtype_str(logits.dtype),
         sink_dtype_str=get_dtype_str(
             output.dtype if sink_token is None else sink_token.dtype
         ),
-        use_sinks=use_sinks,
+        use_sinks=sink_token is not None,
         query_group_size=query_group_size,
-        bounded_plan_logits=bounded_plan_logits,
-        vectorize_plan_logits=vectorize_plan_logits,
-        compact_plan=(
-            head_size == 128
-            and context_partition_num > 64
-            and exp_sums.ndim == 3
-            and exp_sums.shape[1] <= 32 * output.shape[0]
-        ),
+        pairs=pairs,
+        parallel_groups=groups,
+        num_xcds=num_xcds,
     )
     sink_ptr = (
-        ptr_arg(sink_token, _flydsl_pointer_dtype(sink_token.dtype))
-        if use_sinks
-        else flyc.from_c_void_p(_flydsl_pointer_dtype(output.dtype), 0)
+        flyc.from_c_void_p(_flydsl_pointer_dtype(output.dtype), 0)
+        if sink_token is None
+        else ptr_arg(sink_token, _flydsl_pointer_dtype(sink_token.dtype))
     )
     _run_compiled(
         compiled["launch"],
@@ -128,10 +173,11 @@ def launch_pa_decode_ps_reduce(
         stride_logits_part,
         stride_logits_group,
         query_seq_len,
-        query_group_size,
-        output.shape[0],
-        output.shape[2],
+        batch,
+        kv_heads,
         ptr_arg(reduce_info, fx.Int32),
+        -(-(1 << 30) // rows),
+        -(-(1 << 30) // (rows * kv_heads)),
         stream,
     )
 
@@ -670,13 +716,17 @@ def pa_decode(
         output_5d = output.reshape(
             num_seqs, query_length, num_kv_heads, query_group_size, head_dim
         )
-        reduce_partitions = num_partitions
+        # Bound the reducer without shrinking the reusable plan or scratch.
+        partition_bound = min(
+            work_plan.capacity,
+            max(1, -(-schedule_context_length // KV_COMPUTE_BLOCK)),
+        )
         if sliding_window > 0:
             # Bound the unaligned MTP window without shrinking the reusable plan.
             window_tiles = (
                 sliding_window + query_length - 2 + KV_COMPUTE_BLOCK - 1
             ) // KV_COMPUTE_BLOCK + 1
-            reduce_partitions = min(reduce_partitions, window_tiles)
+            partition_bound = min(partition_bound, window_tiles)
         launch_pa_decode_ps_reduce(
             output_5d,
             psum,
@@ -695,7 +745,8 @@ def pa_decode(
             query_seq_len=query_length,
             query_group_size=query_group_size,
             head_size=head_dim,
-            context_partition_num=reduce_partitions,
+            partition_bound=partition_bound,
+            max_partitions=num_partitions,
             stream=s,
             reduce_info=work_plan.reduce_info,
         )
