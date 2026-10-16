@@ -8,9 +8,17 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
+from op_tests.op_benchmarks.triton.utils.profiler_bench import do_bench_profiler
 from op_tests.triton_tests.attention.test_fp8_mqa_logits import (
     per_custom_dims_cast_to_fp8,
 )
+
+# Matches both the triton (_fp8_mqa_logits_kernel) and the gluon
+# (_gluon_fp8_mqa_logits_kernel) variant of the op.
+KERNEL_NAME = "fp8_mqa_logits_kernel"
+# With clean_logits the op pre-fills its fp32 output with -inf via torch.full,
+# which is a real part of its cost.
+FILL_KERNEL_NAME = "FillFunctor<float>"
 
 
 def calculate_tflops(start_inds, end_inds, num_heads_q, head_dim, time_ms):
@@ -65,7 +73,7 @@ def run_benchmark(args):
         styles=[("green", "-")],
         ylabel=ylabel,
         plot_name=get_caller_name_no_ext(),
-        args={"metric": args.metric},
+        args={"metric": args.metric, "flush_l2": args.flush_l2},
     )
 
     @triton.testing.perf_report([benchmark])
@@ -77,6 +85,7 @@ def run_benchmark(args):
         head_dim,
         clean_logits,
         metric,
+        flush_l2,
         **kwargs,
     ):
         s_q = batch_size * seq_q_l
@@ -102,7 +111,18 @@ def run_benchmark(args):
         def func():
             return fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits)
 
-        time_ms = triton.testing.do_bench(func, warmup=25, rep=100)
+        kernel_names = [KERNEL_NAME]
+        if clean_logits:
+            kernel_names.append(FILL_KERNEL_NAME)
+
+        time_ms = do_bench_profiler(
+            func,
+            kernel_names,
+            num_warmup=25,
+            num_iters=100,
+            flush_l2=flush_l2,
+            return_mode="median",
+        )
         tflops = calculate_tflops(ks, ke, num_heads_q, head_dim, time_ms)
 
         # Return exactly one scalar depending on which metric is active
@@ -132,6 +152,12 @@ def main():
     )
     parser.add_argument(
         "--clean_logits", type=int, default=1, help="Clean the untouched logits"
+    )
+    parser.add_argument(
+        "--flush_l2",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Flush the L2 cache before every benchmark iteration",
     )
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
