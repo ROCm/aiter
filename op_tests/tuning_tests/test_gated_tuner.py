@@ -135,7 +135,7 @@ class _Run(unittest.TestCase):
             tuner.incumbents(problem(m))
             rets.extend(measured(m, **timings))
         winners = tuner.post_process(rets, args)
-        tuner.result_to_csv(winners, self.tune_file)
+        tuner.result_to_csv(winners, args.tune_file)
         return tuner
 
     def table(self):
@@ -241,6 +241,60 @@ class TestPublishedRows(_Run):
         self.publish("opus")
         self.run_tuner(StubTuner(), {128: {"ck": 8.0, "opus": 9.0}}, all=True)
         self.assertTrue(self.table().empty)
+
+    def test_a_published_row_whose_candidate_never_ran_is_kept(self):
+        # An earlier candidate's fault stops the group (not_run), or the group
+        # times out: neither says the published candidate cannot serve.
+        key = (*HARDWARE, "128")
+        for status in ("not_run", "timeout"):
+            with self.subTest(status=status):
+                self.publish("opus")
+                tuner = StubTuner()
+                args = self.args(all=True)
+                tuner.untunedf = pd.DataFrame([problem(128)])
+                tuner.load_published(args)
+                tuner.incumbents(problem(128))
+                rets = [
+                    ((key, "ck"), 10.0, 0.0, "ok", ""),
+                    ((key, "asm_v3"), float("inf"), 1.0, "crash", "worker died"),
+                    ((key, "opus"), float("inf"), 1.0, status, "not reached"),
+                ]
+                tuner.result_to_csv(tuner.post_process(rets, args), self.tune_file)
+                self.assertEqual(self.table()["backend"].tolist(), ["opus"])
+                self.assertEqual(self.statuses(tuner), {"128": "unverified"})
+
+
+class TestTheTableFile(_Run):
+    def test_columns_the_family_does_not_know_survive_a_rewrite(self):
+        other = {**problem(64).to_dict(), "backend": "ck", "us": "7.0"}
+        other.update(kernelName1="moe_a", block_m="32")
+        pd.DataFrame([other]).to_csv(self.tune_file, index=False)
+        self.run_tuner(StubTuner(), {128: {"ck": 10.0, "asm_v3": 9.0}})
+        table = pd.read_csv(self.tune_file, dtype=str, keep_default_na=False)
+        rows = {row["m"]: row for _, row in table.iterrows()}
+        self.assertEqual(rows["64"]["kernelName1"], "moe_a")
+        self.assertEqual(rows["64"]["block_m"], "32")
+        self.assertEqual(rows["128"]["backend"], "asm_v3")
+        self.assertEqual(rows["128"]["kernelName1"], "")
+
+    def test_a_rewrite_keeps_the_file_mode_and_writes_through_a_symlink(self):
+        os.chmod(self.tune_file, 0o644)
+        link = os.path.join(os.path.dirname(self.tune_file), "linked.csv")
+        os.symlink(self.tune_file, link)
+        self.run_tuner(StubTuner(), {128: {"ck": 10.0, "asm_v3": 9.0}}, tune_file=link)
+        self.assertTrue(os.path.islink(link))
+        self.assertEqual(os.stat(self.tune_file).st_mode & 0o777, 0o644)
+        self.assertEqual(self.table()["backend"].tolist(), ["asm_v3"])
+
+
+class TestArguments(unittest.TestCase):
+    def test_an_out_of_range_bar_is_refused_when_parsing(self):
+        tuner = StubTuner()
+        for value in ("-1", "100"):
+            with self.subTest(value=value), self.assertRaises(SystemExit):
+                tuner.parser.parse_args(["--min_improvement_pct", value])
+        args = tuner.parser.parse_args(["--min_improvement_pct", "5"])
+        self.assertEqual(args.min_improvement_pct, 5.0)
 
 
 if __name__ == "__main__":

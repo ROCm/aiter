@@ -142,6 +142,40 @@ def normalize_gpu_model(device_name: str) -> str:
     return normalized or "unknown"
 
 
+# Products whose HIP device name carries no MI token, by PCI product ID; the
+# same table comm-fused MoE keys its winner rows with.
+_GPU_MODELS_BY_PCI_ID = {
+    0x75A0: "mi350x",
+    0x75A3: "mi355x",
+    0x75A8: "mi350p",
+}
+
+
+def _gpu_model_from_pci(properties) -> str | None:
+    try:
+        bdf = (
+            f"{properties.pci_domain_id:04x}:{properties.pci_bus_id:02x}:"
+            f"{properties.pci_device_id:02x}.0"
+        )
+        device_path = f"/sys/bus/pci/devices/{bdf}"
+        # Prefer the subsystem product ID: virtual functions may expose a VF
+        # device ID while retaining the physical product in subsystem_device.
+        product_ids = []
+        for name in ("subsystem_device", "device"):
+            with open(f"{device_path}/{name}", encoding="utf-8") as handle:
+                product_ids.append(int(handle.read(), 0))
+    except (AttributeError, OSError, ValueError):
+        return None
+    return next(
+        (
+            model
+            for product_id in product_ids
+            if (model := _GPU_MODELS_BY_PCI_ID.get(product_id)) is not None
+        ),
+        None,
+    )
+
+
 @functools.lru_cache(maxsize=8)
 def get_gpu_model(device_id: int = 0) -> str:
     """Return the live GPU model used to isolate per-SKU tuning rows.
@@ -157,7 +191,14 @@ def get_gpu_model(device_id: int = 0) -> str:
     try:
         import torch
 
-        return normalize_gpu_model(torch.cuda.get_device_name(int(device_id)))
+        name = torch.cuda.get_device_name(int(device_id))
+        if _GPU_MODEL_PATTERN.search(name) is None:
+            from_pci = _gpu_model_from_pci(
+                torch.cuda.get_device_properties(int(device_id))
+            )
+            if from_pci is not None:
+                return from_pci
+        return normalize_gpu_model(name)
     except Exception as error:  # noqa: BLE001 - callers fail closed to "unknown"
         logger.debug("GPU model detection failed, keying as unknown: %s", error)
         return "unknown"

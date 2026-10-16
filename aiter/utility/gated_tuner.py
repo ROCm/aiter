@@ -30,14 +30,16 @@ from typing import Any, ClassVar, NamedTuple
 import pandas as pd
 
 from aiter import logger
-from aiter.utility.base_tuner import TunerCommon
+from aiter.utility.base_tuner import TunerCommon, _write_csv
 from aiter.utility.tuning_policy import (
     PROMOTE,
     PromotionPolicy,
     gate_against_incumbent,
 )
 
-HARDWARE_FIELDS = ("gfx", "gpu_model", "cu_num")
+# Statuses that show the candidate itself cannot serve the shape. Anything
+# else that is not ok (not_run, timeout, oom) says nothing about it.
+_RAN_AND_FAILED = ("crash", "mismatch", "unsupported")
 
 
 class Incumbents(NamedTuple):
@@ -198,7 +200,22 @@ class GatedTuner(TunerCommon):
             return measured.get(self.candidate_identity(candidate))
 
         serving = timed(found.published)
-        stale = found.published is not None and serving is None
+        stale = False
+        if found.published is not None and serving is None:
+            identity = self.candidate_identity(found.published)
+            statuses = {
+                str(row["status"])
+                for _, row in group.iterrows()
+                if self.candidate_identity(row) == identity
+            }
+            if not statuses & {*_RAN_AND_FAILED, "ok"}:
+                return "fail", _settle(
+                    fastest,
+                    "unverified",
+                    "published row not measured "
+                    f"({', '.join(sorted(statuses)) or 'absent'}); kept",
+                )
+            stale = True
         if serving is None:
             serving = timed(found.autoselect)
         if serving is None:
@@ -254,7 +271,7 @@ class GatedTuner(TunerCommon):
         kept = table[
             [self._key_or_none(row) not in replaced for _, row in table.iterrows()]
         ]
-        staged = pd.concat([kept, new], ignore_index=True)
+        staged = _concat_rows(table, [kept, new])
 
         failed_keys = set()
         if not new.empty:
@@ -280,7 +297,7 @@ class GatedTuner(TunerCommon):
                 [self._key_or_none(row) in failed_keys for _, row in table.iterrows()]
             ]
             proven = new[[key not in failed_keys for key in new_keys]]
-            staged = pd.concat([kept, restored, proven], ignore_index=True)
+            staged = _concat_rows(table, [kept, restored, proven])
             self._mark_proof_failures(failed_keys)
         if not new.empty or self._dropped:
             _atomic_write_csv(staged, file)
@@ -355,14 +372,29 @@ def _settle(row, status, detail) -> pd.Series:
 
 
 def _read_table(path, fields) -> pd.DataFrame:
-    """The tuned table as text, so keys compare the way they were written."""
+    """The tuned table as text, so keys compare the way they were written.
+
+    Every column is kept, ``fields`` first: the table may be shared with
+    tuners that write columns this family does not know, and a rewrite must
+    not strip them from their rows.
+    """
     if not path or not os.path.exists(path):
         return pd.DataFrame(columns=list(fields))
     table = pd.read_csv(path, dtype=str, keep_default_na=False)
     missing = [field for field in fields if field not in table.columns]
     if missing:
         raise ValueError(f"{path} is missing columns: {missing}")
-    return table[list(fields)]
+    extra = [column for column in table.columns if column not in fields]
+    return table[[*fields, *extra]]
+
+
+def _concat_rows(table: pd.DataFrame, parts) -> pd.DataFrame:
+    """``parts`` stacked in ``table``'s columns; a column a row lacks is empty."""
+    frames = [part for part in parts if not part.empty]
+    if not frames:
+        return pd.DataFrame(columns=table.columns)
+    stacked = pd.concat(frames, ignore_index=True)
+    return stacked.reindex(columns=table.columns).fillna("")
 
 
 def _staging_path(path) -> str:
@@ -376,15 +408,5 @@ def _staging_path(path) -> str:
 
 
 def _atomic_write_csv(frame: pd.DataFrame, path) -> None:
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(
-        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
-    )
-    os.close(descriptor)
-    try:
-        frame.to_csv(temporary, index=False)
-        os.replace(temporary, destination)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    _write_csv(frame, path, index=False)

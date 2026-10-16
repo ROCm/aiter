@@ -53,6 +53,48 @@ def _read_csv(filepath, **kwargs):
     return df
 
 
+def _write_csv(df, filepath, **kwargs):
+    """Write df to filepath so readers see either the old or the new file.
+
+    Tuned CSVs are read by inference; a run killed mid-write must not leave a
+    truncated one. Writes a temp file in the same directory, then os.replace().
+    The result keeps the old file's mode (mkstemp alone would publish it 0600,
+    unreadable to an inference user other than the tuner's), and a symlinked
+    path is written through rather than replaced.
+    """
+    filepath = os.path.realpath(filepath)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=os.path.dirname(filepath),
+        prefix=f".{os.path.basename(filepath)}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", newline="") as f:
+            df.to_csv(f, **kwargs)
+        if os.path.exists(filepath):
+            shutil.copymode(filepath, tmp_path)
+        else:
+            os.chmod(tmp_path, 0o666 & ~_current_umask())
+        os.replace(tmp_path, filepath)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+def _current_umask():
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
+def _improvement_pct(text):
+    value = float(text)
+    if not 0.0 <= value < 100.0:
+        raise argparse.ArgumentTypeError(f"must be in [0, 100), got {text}")
+    return value
+
+
 class TunerCommon:
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         "verbose": False,
@@ -250,7 +292,7 @@ class TunerCommon:
         self.parser.add_argument(
             "--min_improvement_pct",
             dest="min_improvement_pct",
-            type=float,
+            type=_improvement_pct,
             default=defaults.get(
                 "min_improvement_pct", DEFAULT_PROMOTION.min_improvement_pct
             ),
