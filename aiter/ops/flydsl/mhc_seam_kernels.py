@@ -464,27 +464,29 @@ def flydsl_mhc_seam_pack_fn(fn: torch.Tensor) -> torch.Tensor:
 _FN_CACHE: dict = {}
 
 
-def _pack_fn(fn: torch.Tensor, capturing: bool) -> torch.Tensor:
+def _pack_fn(
+    fn: torch.Tensor, capturing: bool, stream: torch.cuda.Stream
+) -> torch.Tensor:
     """flydsl_mhc_seam_pack_fn cached per weight tensor, for calls without fn_packed.
 
-    Keyed on the tensor object, stamped with its address and version counter, and
-    dropped when that tensor dies. An in-place update through fn moves the counter and
-    repacks; a write through fn.data moves neither and is missed.
+    Keyed on the tensor object, dropped when it dies, and stamped with its address and
+    version counter: an in-place update repacks, a write through fn.data is missed. A
+    repack copies into the buffer captured graphs hold, so a shape change raises.
 
-    A repack copies into the buffer captured graphs already hold, so an fn that changed
-    shape in place cannot be followed and raises instead.
+    Packing is eager only, runs outside inference mode and autograd, and is waited for
+    so no other stream reads it half written. A call that finds an entry records its
+    stream on the pack, so the buffer outlives fn until that stream is done; the stream
+    must outlive fn too (an external stream destroyed first faults when fn is freed).
 
-    Packing is eager only: a call that must pack during capture raises, and the host
-    waits for the pack so no other stream reads the buffer half written.
-
-    A caller that builds a fresh tensor per call misses every time and pays both costs;
-    that caller wants fn_packed, as flydsl_mhc_seam documents.
+    A caller that builds a fresh tensor per call misses every time; it wants fn_packed.
     """
     key = id(fn)
     hit = _FN_CACHE.get(key)
     stamp = (fn.data_ptr(), fn._version)
-    if hit is not None and hit[0] == stamp:
-        return hit[1]
+    if hit is not None:
+        hit[1].record_stream(stream)
+        if hit[0] == stamp:
+            return hit[1]
     _require(
         not capturing,
         "fn is not packed during CUDA-graph capture: pass fn_packed, "
@@ -492,18 +494,20 @@ def _pack_fn(fn: torch.Tensor, capturing: bool) -> torch.Tensor:
         "updating it in place",
         RuntimeError,
     )
-    packed = flydsl_mhc_seam_pack_fn(fn)
-    if hit is None:
-        weakref.finalize(fn, _FN_CACHE.pop, key, None)
-    else:
-        # A fresh buffer would leave captured graphs on the old one.
-        _require(
-            hit[1].shape == packed.shape,
-            "fn changed shape in place; the pack captured graphs hold cannot follow it",
-            RuntimeError,
-        )
-        packed = hit[1].copy_(packed)
-    torch.cuda.current_stream(fn.device).synchronize()
+    with torch.inference_mode(False), torch.no_grad():
+        packed = flydsl_mhc_seam_pack_fn(fn)
+        if hit is None:
+            weakref.finalize(fn, _FN_CACHE.pop, key, None)
+        else:
+            # A fresh buffer would leave captured graphs on the old one.
+            _require(
+                hit[1].shape == packed.shape,
+                "fn changed shape in place; "
+                "the pack captured graphs hold cannot follow it",
+                RuntimeError,
+            )
+            packed = hit[1].copy_(packed)
+    stream.synchronize()
     _FN_CACHE[key] = (stamp, packed)
     return packed
 
@@ -544,7 +548,7 @@ def _make_fused_norm_runner(
         bf16, f32 = fx.BFloat16, fx.Float32
         packed = fn_packed
         if packed is None:
-            packed = _pack_fn(fn, torch.cuda.is_current_stream_capturing())
+            packed = _pack_fn(fn, torch.cuda.is_current_stream_capturing(), stream)
         part = torch.empty(part_size, dtype=torch.float32, device=residual.device)
         sums = torch.empty(sums_size, dtype=torch.float32, device=residual.device)
         part_p, sums_p = ptr_arg(part, f32), ptr_arg(sums, f32)
@@ -620,7 +624,7 @@ def _make_separate_norm_runner(
         bf16, f32 = fx.BFloat16, fx.Float32
         packed = fn_packed
         if packed is None:
-            packed = _pack_fn(fn, torch.cuda.is_current_stream_capturing())
+            packed = _pack_fn(fn, torch.cuda.is_current_stream_capturing(), stream)
         part = torch.empty(part_size, dtype=torch.float32, device=residual.device)
         part_p = ptr_arg(part, f32)
         _run_compiled(

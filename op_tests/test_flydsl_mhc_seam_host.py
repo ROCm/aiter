@@ -26,9 +26,9 @@ def dispatch(monkeypatch):
 
         return build
 
-    def pack(fn, capturing):
+    def pack(fn, capturing, stream):
         packed = fn.to(torch.bfloat16)
-        state.packs.append((fn, capturing, packed))
+        state.packs.append((fn, capturing, packed, stream))
         return packed
 
     def norm(stage, weight, eps):
@@ -149,6 +149,8 @@ def test_cached_runner_uses_each_calls_tensors_scratch_and_stream(dispatch, norm
     assert dispatch.packs[1][1] is True
     assert first_fused[5] is dispatch.packs[0][2]
     assert second_fused[5] is dispatch.packs[1][2]
+    assert dispatch.packs[0][3] is first_stream
+    assert dispatch.packs[1][3] is dispatch.stream
 
     if norm == "separate":
         assert first_out[3] is dispatch.norms[0][3]
