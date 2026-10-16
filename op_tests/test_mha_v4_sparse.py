@@ -68,15 +68,12 @@ def isolate_dynamo_cache():
 
 
 def _mha_v4_co_available(co_stem: str) -> bool:
-    """Whether this arch deploys fwd_hd128_<co_stem>.co, with an _<ts_qo>x<ts_kv> suffix or none.
-
-    The gfx942 objects carry no tile suffix: that arch ships a single geometry.
-    """
+    """Whether this arch deploys fwd_hd128_<co_stem>_<ts_qo>x<ts_kv>.co at any tile."""
     asm_dir = os.environ.get("AITER_ASM_DIR", os.path.join(AITER_ROOT_DIR, "hsa"))
     fwd_dir = os.path.join(asm_dir, get_gfx(), "fmha_v4_fwd")
     if get_gfx() == "gfx942":
         fwd_dir = os.path.join(fwd_dir, "MI300")
-    return os.path.isfile(os.path.join(fwd_dir, f"fwd_hd128_{co_stem}.co")) or bool(
+    return bool(
         glob.glob(os.path.join(fwd_dir, f"fwd_hd128_{co_stem}_[0-9]*x[0-9]*.co"))
     )
 
