@@ -76,6 +76,11 @@ def _launch_config(name: str) -> MappingProxyType | None:
     cfg["xcd_order"] = xcd_order is not None
     cfg["xcd_swizzle"] = int(xcd_swizzle or 0)
     cfg["scale_preload"] = per_stage is None
+    # Split K ignores the swizzle, so bmm_kernel_name never builds _sk<n>_xcd<g>.
+    try:
+        check_xcd_swizzle(cfg["xcd_swizzle"], cfg["xcd_order"], cfg["splits"])
+    except ValueError:
+        return None
     return MappingProxyType(cfg)
 
 

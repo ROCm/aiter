@@ -54,7 +54,7 @@ b,m,n,k,w_scale_block
 For `32x32`, activation scales have shape `[m,b,k/32]` and weight scales
 have shape `[b,n/32,k/32]`. Per-row weight quantization (`1x32`) uses
 weight scales `[b,n,k/32]` and activation scales `[m,b,k/32]`. It is supported
-by OPUS kids 9700--9710 and 9713; the joint tuner skips FlyDSL candidates for this block.
+by OPUS kids 9700--9710 and 9713, and by FlyDSL.
 Compact OPUS kernels support `128x128` weight scales only; the existing
 OPUS families provide the `32x32` candidates.
 
@@ -178,6 +178,10 @@ export AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE=/tmp/bmm_tu
 This selects that CSV for `aiter.batched_gemm_a8w8_mxscale_bpreshuffle` calls.
 The same environment override can select the pre-tune baseline for `--compare`.
 When a config lookup misses, the existing FlyDSL fallback remains in effect.
+A 2-D `gemm_a8w8_blockscale_bpreshuffle` call with E8M0 scales runs the `b=1`
+FlyDSL kernel but reads the `kernelId=bmm` rows of
+`a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv`, not this CSV; to use a
+`b=1` FlyDSL result there, add it as such a row.
 
 ## Other useful options
 

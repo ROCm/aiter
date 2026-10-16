@@ -15,7 +15,8 @@ This test pins the a8w4 path the model will run:
   3. ``flydsl_batched_gemm_a8w4_v2`` (layout='mbn', preallocated ``out=``),
 and the a8w8 path ``batched_gemm_a8w8_mxscale_bpreshuffle`` with each e8m0
 block the arch runs: 1x32 / 32x32 and 1x128 / 128x128 on gfx950, 1x128 /
-128x128 on gfx1250. gfx950 also runs 1x32 / 1x32.
+128x128 on gfx1250. gfx950 also runs 1x32 / 1x32 on FlyDSL's
+``run_bmm_a8w8_mxfp8``, since the public entry runs it on opus untuned.
 
 Input magnitudes change every 32 K (and every 32 weight rows), so the e8m0
 scales differ block to block and a scale applied to the wrong block shows up
@@ -44,6 +45,7 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale_bpreshuffle
+from aiter.ops.flydsl.batched_gemm_a8w8 import run_bmm_a8w8_mxfp8
 from aiter.ops.flydsl.batched_gemm_mxfp4 import (
     flydsl_batched_gemm_a8w4_v2,
     preshuffle_a8w4_weight_mbn,
@@ -127,6 +129,13 @@ def _a8w8(x8, w8_shuf, xs8, ws8, dtype):
     return batched_gemm_a8w8_mxscale_bpreshuffle(
         x8, w8_shuf, xs8, ws8, dtype=dtype
     ).transpose(0, 1)
+
+
+def _a8w8_flydsl(x8, w8_shuf, xs8, ws8, dtype):
+    """FlyDSL's kernel itself, for a block the public entry sends to opus."""
+    m, b, _ = x8.shape
+    out = torch.empty(m, b, w8_shuf.shape[1], dtype=dtype)
+    return run_bmm_a8w8_mxfp8(x8, w8_shuf, xs8, ws8, out).transpose(0, 1)
 
 
 def run_torch_wo_a(o_mbn: torch.Tensor, w_bnk: torch.Tensor, dtype=dtypes.bf16):
@@ -238,8 +247,9 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
         refs[name] = run_torch_wo_a(o_mbn, w_blk, dtype)
         x8, xs8 = quant_act_e8m0(o_mbn, block)
         w8, ws8 = quant_weight_e8m0(w_blk, rows, block)
+        run = _a8w8_flydsl if rows == 1 else _a8w8
         candidates[name] = functools.partial(
-            _a8w8, x8, shuffle_weight(w8), xs8, ws8, dtype
+            run, x8, shuffle_weight(w8), xs8, ws8, dtype
         )
         nbytes[name] = (
             m * b * k  # fp8 A

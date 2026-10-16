@@ -69,7 +69,7 @@ class _LdsLayout(NamedTuple):
     off_pa: int  # A-scale panel: past the stages, or past B within a stage
     c_rows: int  # C rows staged at a time in the epilogue
     flag_off: int  # split-K last-arrival flag, past everything else
-    arena: int  # bytes allocated, the flag included
+    arena: int  # bytes allocated: flag_off, plus the flag with split K
 
 
 def _lds_layout(
@@ -79,7 +79,7 @@ def _lds_layout(
     num_buffers,
     threads,
     K,
-    k_span,
+    splits,
     b_direct,
     x_scale_k,
     w_scale_n,
@@ -87,15 +87,15 @@ def _lds_layout(
     scale_preload,
     x_scale_transposed,
 ):
-    """Stages, then the scale panels of one split's k_span when preloaded;
+    """Stages, then the scale panels of one split's K range when preloaded;
     per-stage panels (one K tile of scales) follow each stage's B instead. The
-    epilogue reuses the arena for C, c_rows rows at a time; the split-K flag
-    takes the last 16 bytes."""
+    epilogue reuses the arena for C, c_rows rows at a time; with split K, the
+    flag takes 16 bytes at flag_off, past both."""
     panel_a, panel_b = _scale_panels(
         tile_m,
         tile_n,
         K,
-        k_span if scale_preload else tile_k,
+        _padded_k(K) // splits if scale_preload else tile_k,
         threads,
         x_scale_k,
         w_scale_n,
@@ -118,7 +118,6 @@ def _lds_layout(
         tile_m,  # no whole MFMA row: check_bmm_config rejects the tile
     )
     flag_off = max(main, c_rows * (tile_n + 8) * 2)
-    split = k_span < _padded_k(K)
     return _LdsLayout(
         stage_a,
         stage_b,
@@ -128,7 +127,7 @@ def _lds_layout(
         num_buffers * pitch if scale_preload else stage_a + stage_b,
         c_rows,
         flag_off,
-        flag_off + (16 if split else 0),
+        flag_off + (16 if splits > 1 else 0),
     )
 
 
@@ -182,7 +181,7 @@ def check_bmm_config(
         num_buffers,
         threads,
         K,
-        k_span,
+        splits,
         b_direct,
         x_scale_k,
         w_scale_n,
@@ -378,7 +377,7 @@ def launch_bmm_a8w8_mxscale(
             num_buffers,
             threads,
             K,
-            k_span,
+            splits,
             b_direct,
             x_scale_k,
             w_scale_n,
