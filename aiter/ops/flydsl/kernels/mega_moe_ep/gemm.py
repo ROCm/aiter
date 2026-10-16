@@ -204,13 +204,12 @@ def build_gemm(kc: KernelCtx) -> dict:
         del L, tid, a
 
     # ============================ GEMM1 (pipelined) ==============================
-    def _epilogue(L, tid, acc, n_tile, cptr, r_inter, r_inters):
+    def _epilogue(L, tid, acc, n_tile, cptr, r_inter, r_inters, e):
         """CShuffle the gate|up accumulators -> silu(gate)*up -> E8M0-quant -> the
-        row-major intermediate (natural col order), using ``cbar`` for the two LDS
-        syncs.  Mirrors ``SiluQuantEpilogue.store`` (evec==2) but stores the E8M0
-        out-scale ROW-MAJOR (``row_g*inter_scols + col_s``) so the naive GEMM2 reader
-        is unchanged."""
-        bid = i32(gpu.block_id("x"))
+        row-major intermediate (natural col order) of echunk ``e`` (rows e*RG..), using
+        ``cbar`` for the two LDS syncs.  Mirrors ``SiluQuantEpilogue.store`` (evec==2) but
+        stores the E8M0 out-scale ROW-MAJOR (``row_g*inter_scols + col_s``) so the GEMM2
+        reader is unchanged."""
         wave = tid // i32(64)
         lane = tid % i32(64)
         l16 = lane % i32(16)
@@ -256,7 +255,7 @@ def build_gemm(kc: KernelCtx) -> dict:
         c64 = i32(64)
         for mr in range_constexpr(m_reps):
             row = i32(mr * rows_per_iter) + mlane
-            row_g = bid * i32(RG) + row
+            row_g = e * i32(RG) + row
             out_row = row_g * i32(inter_row_bytes)
             s_row = row_g * i32(inter_scols)
             for nr in range_constexpr(n_reps):
@@ -303,22 +302,13 @@ def build_gemm(kc: KernelCtx) -> dict:
         cbar(L, tid)
 
     @flyc.jit
-    def gemm1(L, tid, a, expert, i0, icnt, rows):
-        """GEMM1 (A x W1 gate|up) + activation -> E8M0-quantized global intermediate,
-        pipelined via the gemm_util atoms.  ``i0``/``icnt`` are ignored (P==1: the unit
-        owns the whole inter dim; the n-tile loop covers all 2*I gate|up cols)."""
-        del i0, icnt
-        bid = i32(gpu.block_id("x"))
-        # --- planner -> per-CTA GLOBAL row_map bridge (payload row = L_RIX[r]//topk) --
-        r_rowmap = rsrc(a["rowmap"])
-        for r_ in range(tid, i32(RG), i32(NT)):
-            r = i32(r_)
-            v = (r < rows).select(
-                lds_ld_i32(L, L_RIX + r * i32(4)) // i32(TOPK), i32(0)
-            )
-            bst(v, r_rowmap, (bid * i32(RG) + r) * i32(4), 0, 0)
-        wait_vm(0)
-        cbar(L, tid)
+    def gemm1(L, tid, a, expert, e, s, P):
+        """GEMM1 (A x W1 gate|up) + activation -> E8M0-quantized global intermediate of
+        echunk ``e`` (inter[e*RG..]), pipelined via the gemm_util atoms.  ``s``/``P``
+        select this CTA's n-tile shard ``[s*N_TILES//P, (s+1)*N_TILES//P)`` of the 2*I
+        gate|up cols (P-way CU split; P==1 computes the whole inter).  The A-gather
+        row_map (payload row per tile row) is written to global by the gather pass
+        (compute_units pass 0), indexed e*RG+r, so GEMM1 only reads it here."""
         # --- atoms (constructed per launch with the runtime arena pointers) ----------
         payload = _global_byte_tensor(
             fx.Int64(a["mine"]) + fx.Int64(a["off_payload"]), TMAX * a_row_bytes
@@ -373,10 +363,12 @@ def build_gemm(kc: KernelCtx) -> dict:
         r_inter = rsrc(a["inter"])
         r_inters = rsrc(a["inters"])
         wave_id = tid // i32(64)
-        tib = bid * i32(RG)
+        tib = e * i32(RG)
         # The A row tile (gather + scale) is the same across all n-tiles, so precompute
         # the per-chunk gather offsets once (hoisted out of the runtime n-tile loop).
         a_gather.for_tile(tib)
+        nt_lo = s * i32(N_TILES) // P  # this CTA's n-tile shard (P-way CU split)
+        nt_hi = (s + i32(1)) * i32(N_TILES) // P
 
         # The per-n-tile body is a plain closure: a runtime ``range`` loop that invokes
         # a *method* on an atom treats that atom as scf.for loop-carried state (and
@@ -418,18 +410,17 @@ def build_gemm(kc: KernelCtx) -> dict:
             sa = a_scale.load_step(a_scale_lds, i32(K_ITERS - 1))
             acc = mfma_gu.call_pipe_am_final(_alf, b_prev, acc, sa, sb)
             cbar(L, tid)
-            _epilogue(L, tid, acc, nt, cptr, r_inter, r_inters)
+            _epilogue(L, tid, acc, nt, cptr, r_inter, r_inters, e)
 
-        for nt_ in range(i32(0), i32(N_TILES), i32(1)):
+        for nt_ in range(nt_lo, nt_hi, i32(1)):
             _run_ntile(i32(nt_))
 
     # ============================ GEMM2 (pipelined) ==============================
-    def _epilogue_g2(L, tid, acc, n_tile, cptr, r_gout):
+    def _epilogue_g2(L, tid, acc, n_tile, cptr, r_gout, e):
         """CShuffle the GEMM2 accumulators -> bf16 -> ``gout`` (row-major
-        [bid*RG+row, H]) with ``cbar`` syncs.  No activation / quant (combine_final
+        [e*RG+row, H]) with ``cbar`` syncs.  No activation / quant (combine_final
         applies the top-k weight).  All RG rows are written (combine_send reads only the
         valid prefix), so no dynamic per-row guard is needed."""
-        bid = i32(gpu.block_id("x"))
         wave = tid // i32(64)
         lane = tid % i32(64)
         l16 = lane % i32(16)
@@ -454,7 +445,7 @@ def build_gemm(kc: KernelCtx) -> dict:
         n_reps = cs_tile_n2 // (NLANE2 * EVEC2)
         for mr in range_constexpr(m_reps):
             row = i32(mr * rows_per_iter) + mlane
-            obase = (bid * i32(RG) + row) * i32(H)  # gout bf16 row base
+            obase = (e * i32(RG) + row) * i32(H)  # gout bf16 row base
             for nr in range_constexpr(n_reps):
                 col0 = i32(nr * NLANE2 * EVEC2) + nlane * i32(EVEC2)
                 idx = row * i32(cs_tile_n2) + col0
@@ -472,12 +463,12 @@ def build_gemm(kc: KernelCtx) -> dict:
         cbar(L, tid)
 
     @flyc.jit
-    def gemm2_pipe(L, tid, a, expert, rows, src_out):
-        """GEMM2 (intermediate x W2 -> bf16 gout), pipelined via the gemm_util atoms:
-        A = this CTA's quantized intermediate (non-indexed row tile at bid*RG, A-scale
-        = ``inters``), B = W2 (shuffled, gate_up=False), cshuffle -> bf16 -> gout."""
-        del rows
-        bid = i32(gpu.block_id("x"))
+    def gemm2_pipe(L, tid, a, expert, e, s, P, src_out):
+        """GEMM2 (intermediate x W2 -> bf16 gout) for echunk ``e``, pipelined via the
+        gemm_util atoms: A = inter[e*RG..] (non-indexed row tile, A-scale = ``inters``),
+        B = W2 (shuffled, gate_up=False), cshuffle -> bf16 -> gout[e*RG..].  ``s``/``P``
+        select this CTA's n-tile shard ``[s*N_TILES2//P, (s+1)*N_TILES2//P)`` of the H
+        output cols (P-way CU split; P==1 computes the whole row)."""
         inter_tensor = _global_byte_tensor(fx.Int64(a["inter"]), INTER_NBYTES)
         a_gather = ATileLoader(
             row_bytes=inter_row_bytes,
@@ -515,8 +506,10 @@ def build_gemm(kc: KernelCtx) -> dict:
         a_scale_lds = _LdsView(_lds_byte_ptr(L, L_AS))
         cptr = _lds_f32_ptr(L, L_A)
         wave_id = tid // i32(64)
-        tib = bid * i32(RG)
+        tib = e * i32(RG)
         a_gather.for_tile(tib)
+        nt_lo = s * i32(N_TILES2) // P  # this CTA's n-tile shard (P-way CU split)
+        nt_hi = (s + i32(1)) * i32(N_TILES2) // P
 
         def _run_ntile(nt):
             cbar(L, tid)
@@ -553,9 +546,9 @@ def build_gemm(kc: KernelCtx) -> dict:
             sa = a_scale.load_step(a_scale_lds, i32(K_ITERS2 - 1))
             acc = mfma_gu.call_pipe_am_final(_alf, b_prev, acc, sa, sb)
             cbar(L, tid)
-            _epilogue_g2(L, tid, acc, nt, cptr, src_out)
+            _epilogue_g2(L, tid, acc, nt, cptr, src_out, e)
 
-        for nt_ in range(i32(0), i32(N_TILES2), i32(1)):
+        for nt_ in range(nt_lo, nt_hi, i32(1)):
             _run_ntile(i32(nt_))
 
     @flyc.jit

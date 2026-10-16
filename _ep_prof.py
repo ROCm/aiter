@@ -19,8 +19,9 @@ torch.cuda.set_device(LR)
 DEV = torch.device("cuda", LR)
 dist.init_process_group("cpu:gloo,cuda:nccl", device_id=DEV)
 
-H, I, E, K = 7168, 3072, 384, 6
-EPR = E // WORLD
+H, I, K = 7168, 3072, 6
+EPR = 48
+E = EPR * WORLD
 MTPR = 1024
 qz = aiter.get_torch_quant(aiter.QuantType.per_1x32)
 gw = torch.Generator(device=DEV).manual_seed(1234 + RANK)
@@ -69,6 +70,9 @@ for bs in (8, 512):
     # for the single active unit per CTA, isolate gemm1/gemm2/combine_send using the
     # per-unit stamps (slots 7,8); only CTAs that ran a unit (slot7>slot5) count.
     act = ts[:, 7] > ts[:, 5]
+    bi = (ts[:, 1] - ts[:, 0]) / 1e5  # barrier_init (cross-rank init)
+    dw = (ts[:, 4] - ts[:, 1]) / 1e5  # dispatch_wait (compute idle until a2a done)
+    dp = (ts[:, 5] - ts[:, 4]) / 1e5  # dyn_plan
     g1 = ((ts[:, 7] - ts[:, 5]) / 1e5)[act]  # gather + GEMM1
     g2 = ((ts[:, 8] - ts[:, 7]) / 1e5)[act]  # GEMM2
     cs = ((ts[:, 2] - ts[:, 8]) / 1e5)[act]  # combine_send + loop tail
@@ -78,16 +82,19 @@ for bs in (8, 512):
     def mx(a):
         return float(a.max()) if a.size else 0.0
 
-    dev = torch.tensor([prep, ker, mx(g1), mx(g2), mx(cs), cf.max(), tot.max()], device=DEV)
+    dev = torch.tensor(
+        [prep, ker, bi.max(), dw.max(), dp.max(), mx(g1), mx(g2), mx(cs),
+         cf.max(), tot.max()], device=DEV)
     gath = [torch.empty_like(dev) for _ in range(WORLD)]
     dist.all_gather(gath, dev)
     if RANK == 0:
         g = np.array([v.cpu().numpy() for v in gath])
         print(
-            f"[PROF] bs={bs:<5d} prep={g[:, 0].max():.3f} kernel={g[:, 1].max():.3f}ms | "
-            f"per-unit(ms) gemm1={g[:, 2].max():.3f} gemm2={g[:, 3].max():.3f} "
-            f"combine_send={g[:, 4].max():.3f} | combine_final={g[:, 5].max():.3f} "
-            f"dev_total={g[:, 6].max():.3f}",
+            f"[PROF] bs={bs:<5d} prep={g[:, 0].max():.3f} kernel={g[:, 1].max():.3f}ms || "
+            f"barrier_init={g[:, 2].max():.3f} dispatch_wait={g[:, 3].max():.3f} "
+            f"dyn_plan={g[:, 4].max():.3f} | gemm1={g[:, 5].max():.3f} gemm2={g[:, 6].max():.3f} "
+            f"combine_send={g[:, 7].max():.3f} combine_final={g[:, 8].max():.3f} "
+            f"|| dev_total={g[:, 9].max():.3f}",
             flush=True,
         )
     dist.barrier()

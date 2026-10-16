@@ -32,6 +32,7 @@ from .common import (
     bld,
     bst,
     g_add_agent,
+    g_ld_sys,
     g_or_agent,
     g_st_sys,
     i32,
@@ -45,6 +46,7 @@ from .common import (
 from .mega_moe_ep_config import (
     CTRL_ERR,
     ERR_COMBINE,
+    ERR_COMPUTE,
     ERR_DISPATCH,
     FLAG_COMB_CNT,
     FLAG_COMBINE,
@@ -52,6 +54,8 @@ from .mega_moe_ep_config import (
     FLAG_DISPATCH,
     FLAG_INIT,
     FLAG_INIT_CNT,
+    GBAR_CNT,
+    GBAR_GEN,
     MAX_NPES,
     NCTA_MAX,
     NT,
@@ -124,6 +128,29 @@ def build_communication(kc: KernelCtx) -> dict:
         cur = poll_sys_ge(addr, target)
         if const_expr(a is not None):
             _report_if(a, before(cur, target), err)
+
+    # --- device grid barrier (all CTAs of THIS rank, between GEMM passes) --------
+    @flyc.jit
+    def grid_bar(a, tid):
+        """Cross-CTA handshake over all ``grid_dim.x`` CTAs of this rank's GPU, via an
+        agent-scope counter + generation in the local ctrl tensor (device-local; NOT
+        cross-rank). Mirrors the LDS ``cbar``: tid0 of each CTA arrives, the last one
+        zeroes the counter and bumps the generation to release the spinners.
+
+        tid0 ONLY -- there is deliberately no ``gpu.barrier()`` here: this is called from
+        the compute band (tid<NT) while the dispatch/idle bands are elsewhere, so a block
+        barrier would deadlock. The caller wraps this with ``cbar`` (compute-wave barrier)
+        to hold the other compute lanes until tid0's handshake returns (see schedule.gbar)."""
+        if tid == i32(0):
+            cnt_a = ctrl_at(a, GBAR_CNT)
+            gen_a = ctrl_at(a, GBAR_GEN)
+            g = g_ld_sys(gen_a)
+            old = g_add_agent(cnt_a, i32(1))
+            if old == i32(gpu.grid_dim.x) - i32(1):
+                g_st_sys(cnt_a, i32(0))
+                g_st_sys(gen_a, g + i32(1))
+            else:
+                spin_sys_ge(gen_a, g + i32(1), a, ERR_COMPUTE)
 
     # --- EP dispatch / combine readiness -----------------------------------------
     @flyc.jit
@@ -267,12 +294,12 @@ def build_communication(kc: KernelCtx) -> dict:
 
     # --- combine (GEMM2 epilog scatter back to source + source-side weighted sum) --
     @flyc.jit
-    def combine_send(L, lane, a, src_out, nrows):
-        """GEMM2 epilog (per unit): scatter the unit's ``nrows`` output rows (row k's
-        recv slot = L_RIX[k], its H bf16 output at ``src_out`` row k) back to each row's
-        SOURCE rank's ``part`` region at (source_token*topk + route), then signal that
-        source (combine_arrive). ``src_out`` / ``nrows`` are the compute wave's GEMM2
-        output + row count, wired at bring-up."""
+    def combine_send(L, lane, a, src_out, e, nrows):
+        """Combine pass (per echunk ``e``): scatter the echunk's ``nrows`` output rows
+        (row k's recv slot = L_RIX[k], its H bf16 output at ``src_out`` row e*RG+k) back
+        to each row's SOURCE rank's ``part`` region at (source_token*topk + route), then
+        signal that source (combine_arrive). ``src_out`` is the shared gout; ``nrows`` the
+        echunk's gathered row count (L_RIX holds the recv-slot ids from the gather pass)."""
         mtpr = a["mtpr"]
         m = a["m"]
         parity = a["epoch"] & i32(1)
@@ -286,7 +313,7 @@ def build_communication(kc: KernelCtx) -> dict:
             src_tok = sk - src_rank * mtpr
             slot = src_tok * i32(TOPK) + route
             dpart = peer_rs(a, src_rank, "off_part")
-            obase = i32(gpu.block_id("x")) * i32(RG * HV)  # this CTA's gout rows
+            obase = e * i32(RG * HV)  # echunk e's gout rows
             for g_ in range(lane, i32(HV), i32(64)):
                 g = i32(g_)
                 v = bld(src_out, (obase + k * i32(HV) + g) * i32(16), 0, V4I, 0)

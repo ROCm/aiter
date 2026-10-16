@@ -24,8 +24,9 @@ torch.cuda.set_device(LR)
 DEV = torch.device("cuda", LR)
 dist.init_process_group("cpu:gloo,cuda:nccl", device_id=DEV)
 
-H, I, E, K, SWIGLU = 7168, 3072, 384, 6, 10.0
-EPR = E // WORLD
+H, I, K, SWIGLU = 7168, 3072, 6, 10.0
+EPR = 48  # per-rank experts fixed across world sizes (8-GPU v4_pro value)
+E = EPR * WORLD  # 384 @ world=8, 192 @ world=4 -- keeps per-rank geometry identical
 MTPR = 1024
 ITERS, WARMUP = 20, 5
 qz = aiter.get_torch_quant(aiter.QuantType.per_1x32)

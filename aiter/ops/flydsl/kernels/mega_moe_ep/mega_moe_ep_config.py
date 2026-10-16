@@ -54,6 +54,8 @@ __all__ = [
     "FLAG_INIT",
     "FLAG_INIT_CNT",
     "FLAG_INTS",
+    "GBAR_CNT",
+    "GBAR_GEN",
     "MAX_NPES",
     "NCHA",
     "NCTA_MAX",
@@ -124,6 +126,11 @@ FLAG_INTS = FLAG_INIT_CNT + 2 * NCTA_MAX
 # Global control ints (device tensor): a sticky watchdog error word plus room.
 CTRL_ERR = 0
 ERR_DISPATCH, ERR_COMPUTE, ERR_COMBINE = 1, 2, 4
+# Device grid-barrier slots (agent-scope counter + generation in the local ctrl tensor;
+# the multi-pass GEMM syncs ALL CTAs of this rank between passes). Self-resetting like
+# the LDS cbar: the last arriver zeroes the counter and bumps the generation. Zeroed
+# once at engine init; the generation grows monotonically (wrap-safe == compare).
+GBAR_CNT, GBAR_GEN = 16, 17
 CTRL_INTS = 64
 
 # LDS control slots (ints at ``L_CTL``; see schedule.py). The cbar generation barrier,
