@@ -21,7 +21,7 @@ from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 
 from ..jit.core import compile_ops, is_experimental_enabled
 from ..jit.utils.asm_guard import require_gfx1250_asm
-from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 
 MD_NAME = "module_attention"
 
@@ -366,6 +366,8 @@ def pa_ps_fwd_asm(
     quant_type: Enum | None = QuantType.per_Token.value,
 ) -> torch.Tensor:
     output = out_ if out_ is not None else torch.empty_like(Q)
+    if K.dtype in (dtypes.bf16, dtypes.fp16):
+        quant_type = QuantType.No.value
     _pa_ps_fwd_asm(
         Q,
         K,
@@ -546,6 +548,28 @@ def pa_reduce_v1(
     )
 
 
+@compile_ops(
+    "module_attention_ps_reduce_asm", fc_name="attention_ps_reduce", ffi_type="ctypes"
+)
+def _attention_ps_reduce_asm(
+    partial_output: torch.Tensor,
+    partial_lse: torch.Tensor,
+    reduce_indptr: torch.Tensor,
+    reduce_final_map: torch.Tensor,
+    reduce_partial_map: torch.Tensor,
+    max_seqlen_q: int,
+    final_output: torch.Tensor,
+    final_lse: torch.Tensor | None = None,
+) -> None:
+    """Merge compatible PS-mode split-attention outputs and LSE on gfx950.
+
+    Partial output/LSE must be contiguous FP32 tensors with compatible int32
+    reduction maps on the output device. Output is BF16/FP16 [queries, heads,
+    128]; optional final LSE is FP32. The producer must follow the same partial
+    layout and LSE convention. No paged-KV or causal-mask inputs are consumed.
+    """
+
+
 def pa_persistent_fwd(
     Q: torch.Tensor,  # [sum_qlen, kv_heads * gqa + kv_heads * 2, head_dim]
     K: torch.Tensor,  # [num_blocks, kv_heads, head_dim / x, block_size, x]
@@ -567,7 +591,15 @@ def pa_persistent_fwd(
     softmax_scale: float | None = None,
     mask: int = 0,
     quant_type: QuantType = QuantType.per_Token,
+    high_precision: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run persistent attention and merge only materialized partial outputs.
+
+    Work records with partial index -1 write directly to output. Their final
+    LSE is undefined and must not be read; the forward kernel does not produce it.
+    Empty reduction maps skip the reducer; preallocated GPU maps are handled on
+    device without reading metadata back to the host.
+    """
     device = Q.device
     total_s, nhead, v_head_dim = output.shape
     if softmax_scale is None:
@@ -602,9 +634,22 @@ def pa_persistent_fwd(
         logits,
         splitLse,
         mask,
+        high_precision=high_precision,
         quant_type=quant_type,
     )
-    pa_reduce_v1(
+    if reduce_partial_map.numel() == 0 or reduce_indptr.numel() == 1:
+        return logits, final_lse
+
+    reduce_fn = pa_reduce_v1
+    if (
+        K.shape[3] == 16
+        and v_head_dim == 128
+        and output.dtype in (dtypes.bf16, dtypes.fp16)
+        and reduce_final_map is not None
+        and get_gfx_runtime() == "gfx950"
+    ):
+        reduce_fn = _attention_ps_reduce_asm
+    reduce_fn(
         logits,
         splitLse,
         reduce_indptr,
@@ -786,6 +831,20 @@ MD_NAME = "module_mla_asm"
 
 
 @compile_ops(MD_NAME, ffi_type="ctypes")
+def mla_ps64_qh128_fp8_asm_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor | None,
+    q_scale: torch.Tensor,
+    kv_scale: torch.Tensor,
+    softmax_scale: float,
+) -> None: ...
+
+
+@compile_ops(MD_NAME, ffi_type="ctypes")
 def mla_decode_stage1_asm_fwd(
     # [num_seqs, num_heads, head_size]
     Q: torch.Tensor,
@@ -831,56 +890,34 @@ def mla_decode_stage1_asm_fwd(
 ) -> None: ...
 
 
-MD_NAME_V4 = "module_mla_v4_asm"
-
-
-@compile_ops(MD_NAME_V4, ffi_type="ctypes")
-def mla_decode_v4_asm(
-    # [total_query_len, num_heads, head_size]   FP8 packed Q + e8m0 scale region
-    Q: torch.Tensor,
-    # [total_query_len, num_heads, kv_rotary]   BF16
-    qrope: torch.Tensor,
-    # [num_page, page_size, num_kv_heads, head_size]  FP8
-    KV: torch.Tensor,
-    # [num_page, page_size, num_kv_heads, kv_rotary]  BF16
-    kvrope: torch.Tensor,
-    # [num_seqs+1]
-    qo_indptr: torch.Tensor,
-    # [num_seqs+1]
-    kv_indptr: torch.Tensor,
-    # [num_page_used]
+@compile_ops(MD_NAME, ffi_type="ctypes")
+def mla_ps1_fp8_asm_fwd(
+    # [num_partials, num_heads, 512] fp32
+    split_data: torch.Tensor,
+    # [num_partials, num_heads] fp32
+    split_lse: torch.Tensor,
+    # [total_q, num_heads, 512] bf16
+    final_output: torch.Tensor,
+    # [total_q, num_heads] fp32; None skips the un-split rows' LSE
+    final_lse: torch.Tensor | None,
+    # [total_q, num_heads, 576] fp8
+    q: torch.Tensor,
+    # [num_pages, 1, 1, 576] fp8
+    kv_buffer: torch.Tensor,
     kv_page_indices: torch.Tensor,
-    # [num_seqs+1]
-    split_indptr: torch.Tensor,
-    # [num_heads] FP32 -- attention sink logit. Loaded by the kernel via
-    # kernarg slot 18 (byte offset 0x120). Caller must ALWAYS pass a real
-    # tensor; there is no nullable-sink convention on the C ABI. Pass
-    # torch.full((num_heads,), float("-inf")) for "no sink" math.
-    sink: torch.Tensor,
-    max_seqlen_q: int,
-    # ignored on v4 nm; kernel hardcodes 1/sqrt(kV4DimNope+kV4DimRope)=1/sqrt(512)
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
     softmax_scale: float,
-    # 0 = fp32 split-out path; 1 = bf16 nosplit reduce path
-    out_16_nosplit: int,
-    num_kv_splits: int,
-    # outputs
-    # [num_seqs, num_kv_splits, num_kv_heads, gqa*max_seqlen_q, v_head_dim] FP32
-    splitData: torch.Tensor,
-    # [num_seqs, num_kv_splits, num_kv_heads, gqa*max_seqlen_q, 1]          FP32
-    splitLse: torch.Tensor,
-    # [total_query_len, num_heads, v_head_dim] BF16 (used when out_16_nosplit==1)
-    output: torch.Tensor,
-    # [num_seqs] int32 scratch for gfx1250 packed MLA kernels. Holds the
-    # per-request valid kv-split count the kernel writes (slot 19). Pass a
-    # real tensor when use_valid_split_count_reduce != 0; otherwise the
-    # kernel skips the write and nullptr is fine.
-    valid_split_count: torch.Tensor | None = None,
-    use_valid_split_count_reduce: int = 0,
-    # [num_seqs] int32. Unused on the v4 nm path (page_size=1 -> the kernel derives
-    # kv_seq_len from the token-level kv_indptr). Optional/nullable: None sends a
-    # nullptr; the host guards the deref (asm_mla_v4.cu) and the kernel never loads
-    # through it. Placed at the tail because it carries no data on this path.
-    kv_last_page_lens: torch.Tensor | None = None,
+    q_scale: torch.Tensor,
+    kv_scale: torch.Tensor,
+    max_seqlen_q: int,
+    causal: bool,
+    # round-robin CP only (cp_world_size > 1 and causal)
+    qo_indptr: torch.Tensor | None = None,
+    kv_indptr: torch.Tensor | None = None,
+    g_kv_indptr: torch.Tensor | None = None,
+    cp_world_size: int = 1,
+    cp_rank: int = 0,
 ) -> None: ...
 
 
@@ -1270,6 +1307,13 @@ def get_mla_metadata_info_v1(
             and num_head_qo == 12
             and packed_qo_len <= 128
             and fast_mode
+        )
+        or (
+            get_gfx() == "gfx1250"
+            and os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") == "1"
+            and q_dtype == dtypes.fp8
+            and kv_dtype == dtypes.fp8
+            and num_head_qo == 96
         )
     ):
         if num_head_qo * 2 > 128:
@@ -1897,8 +1941,8 @@ def opus_mla_decode_mxfp8_fwd(
 
 @compile_ops("module_mla_decode_opus", ffi_type="ctypes")
 def opus_mla_decode_fwd(
-    q: torch.Tensor,  # [total_q, H, 576] bf16
-    kv: torch.Tensor,  # [num_page, 1, 1, 576] bf16, page_size == 1
+    q: torch.Tensor,  # [total_q, H, 576] bf16 or fp8 (merged nope+rope)
+    kv: torch.Tensor,  # [total_tokens, ..., 576] same dtype as q, page_size == 1
     qo_indptr: torch.Tensor,
     kv_indptr: torch.Tensor,
     kv_indices: torch.Tensor,
@@ -1910,28 +1954,11 @@ def opus_mla_decode_fwd(
     attn_lse: torch.Tensor,  # aiter split_lse    [num_partials,1,H,1]   fp32
     out: torch.Tensor,  # final [total_q, H, 512] bf16
     final_lse: torch.Tensor | None = None,  # [total_q, H] fp32
-) -> None: ...
-
-
-@compile_ops("module_mla_decode_opus", ffi_type="ctypes")
-def opus_mla_decode_fp8_fwd(
-    q: torch.Tensor,  # [B, H, 576]           fp8 (merged nope+rope)
-    kv: torch.Tensor,  # [total_tokens, 576]   fp8 (merged nope+rope)
-    qo_indptr: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    kv_indices: torch.Tensor,
-    kv_last_page_lens: torch.Tensor,
-    work_indptr: torch.Tensor,
-    work_info_set: torch.Tensor,
-    max_seqlen_q: int,
-    page_size: int,
-    nhead_kv: int,
-    softmax_scale: float,
-    logits: torch.Tensor,  # aiter split_output [num_partials,1,H,512] fp32
-    attn_lse: torch.Tensor,  # aiter split_lse    [num_partials,1,H,1]   fp32
-    out: torch.Tensor,  # final [B, H, 512] bf16
-    final_lse: torch.Tensor | None = None,  # [B, H] fp32
-    q_scale: torch.Tensor | None = None,  # float[1] per-tensor descale
-    kv_scale: torch.Tensor | None = None,  # float[1] per-tensor descale
-    causal: bool = True,  # mask across the max_seqlen_q query tokens
+    q_scale: torch.Tensor | None = None,  # fp8: float[1] per-tensor descale
+    kv_scale: torch.Tensor | None = None,  # fp8: float[1] per-tensor descale
+    max_seqlen_q: int = -1,  # fp8: required, picks the kernel; bf16: unused
+    causal: bool = True,  # fp8: mask across the max_seqlen_q query tokens
+    g_kv_indptr: torch.Tensor | None = None,  # fp8 round-robin CP: GLOBAL kv_indptr
+    cp_world_size: int = 1,  # fp8 round-robin CP: number of ranks, 1 = no CP
+    cp_rank: int = 0,  # fp8 round-robin CP: this rank
 ) -> None: ...

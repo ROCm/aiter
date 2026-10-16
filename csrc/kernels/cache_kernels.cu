@@ -1305,7 +1305,6 @@ template <typename scalar_t,
           typename cache_t,
           vllm::Fp8KVCacheDataType kv_dt,
           int BLOCK_X_SIZE,
-          int BLOCK_Y_SIZE,
           int VEC_SIZE>
 __global__ void indexer_k_quant_and_cache_kernel(
     const scalar_t* __restrict__ k,           // [num_tokens, head_dim]
@@ -1320,6 +1319,7 @@ __global__ void indexer_k_quant_and_cache_kernel(
     const bool preshuffle       // use MFMA 16x16 preshuffled layout
 )
 {
+    constexpr int BLOCK_Y_SIZE     = WARP_SIZE / BLOCK_X_SIZE;
     const int quant_block_per_head = head_dim / quant_block_size;
     const int64_t token_idx = (blockIdx.x * BLOCK_Y_SIZE + threadIdx.y) / quant_block_per_head;
     if(token_idx >= num_tokens)
@@ -3871,7 +3871,6 @@ void reshape_and_cache_flash(
                                             CACHE_T,                                              \
                                             KV_DTYPE,                                             \
                                             blockDimx,                                            \
-                                            blockDimy,                                            \
                                             vec_size>                                             \
         <<<grid, block, 0, stream>>>(reinterpret_cast<KV_T*>(k.data_ptr()),                       \
                                      reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),             \
@@ -4422,7 +4421,7 @@ void indexer_k_quant_and_cache(aiter_tensor_t& k,        // [num_tokens, head_di
     int quant_blocks    = num_tokens * head_dim / quant_block_size;
     const int vec_size  = 16;
     const int blockDimx = 8;
-    const int blockDimy = opus::get_warp_size() / blockDimx;
+    int blockDimy       = WARP_SIZE / blockDimx;
     dim3 grid((quant_blocks + blockDimy - 1) / (blockDimy));
     dim3 block(blockDimx, blockDimy);
     HipDeviceGuard device_guard(k.device_id);
