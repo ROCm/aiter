@@ -87,14 +87,17 @@ __device__ __forceinline__ int32_t mla_v12_num_qo_tiles(const MlaMetadataV1Kerne
 {
     if constexpr(Traits::kQoSplits)
     {
+        // An empty request (graph padding) still needs one tile; zero tiles never advance the
+        // planner past it.
         const int32_t seqlen_qo = qo_state.get_seqlen(batch_idx);
         if(params.num_heads * 2 > Traits::kPackedQoLenPerWg)
         {
-            return seqlen_qo;
+            return max(seqlen_qo, 1);
         }
         const int32_t packed_qo_len = seqlen_qo * params.num_heads;
-        return integer_divide_ceil_power2(
-            packed_qo_len, Traits::kPackedQoLenPerWg, Traits::kPackedQoLenPerWg_log2);
+        return max(integer_divide_ceil_power2(
+                       packed_qo_len, Traits::kPackedQoLenPerWg, Traits::kPackedQoLenPerWg_log2),
+                   1);
     }
     else
     {
@@ -127,17 +130,18 @@ mla_v12_compute_sum_blocks(const MlaMetadataV1KernelParameter& params,
             p_lds_seqlens_kv[bid] = seqlen_kv;
         }
 
-        const int32_t num_blocks = integer_divide_ceil_power2(
-            seqlen_kv, params.kv_granularity, params.kv_granularity_log2);
-        const int32_t num_qo_tiles = mla_v12_num_qo_tiles<Traits>(params, qo_state, bid);
-        const int32_t unit_blocks  = num_blocks + params.fixed_over_head_num_blocks;
-        sum_blocks += unit_blocks * num_qo_tiles;
-
+        // mla_v12_num_qo_tiles reads this slot back through qo_state.get_seqlen.
         if constexpr(QoState<Traits>::is_unique() == false)
         {
             p_lds_seqlens_qo[bid] =
                 params.p_seqlens_qo_indptr[bid_ori + 1] - params.p_seqlens_qo_indptr[bid_ori];
         }
+
+        const int32_t num_blocks = integer_divide_ceil_power2(
+            seqlen_kv, params.kv_granularity, params.kv_granularity_log2);
+        const int32_t num_qo_tiles = mla_v12_num_qo_tiles<Traits>(params, qo_state, bid);
+        const int32_t unit_blocks  = num_blocks + params.fixed_over_head_num_blocks;
+        sum_blocks += unit_blocks * num_qo_tiles;
     }
 
     return aiter::warpReduce<aiter::AddFunctor, decltype(sum_blocks), opus::get_warp_size()>(
@@ -184,7 +188,11 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
     int32_t* p_lds_partial_before = p_lds_reduce_before + kBatchChunk;
 
     QoState qo_state(
-        params.uni_seqlen_qo, ori_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
+        params.uni_seqlen_qo,
+        ori_seqlen_qo,
+        params.qk_batch_ratio,
+        p_lds_seqlens_qo,
+        params.p_seqlens_qo_indptr);
 
     MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
 
@@ -513,7 +521,11 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
     int32_t* p_lds_seqlens_kv = p_lds_seqlens_qo + (QoState::is_unique() ? 0 : num_batches);
 
     QoState qo_state(
-        params.uni_seqlen_qo, ori_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
+        params.uni_seqlen_qo,
+        ori_seqlen_qo,
+        params.qk_batch_ratio,
+        p_lds_seqlens_qo,
+        params.p_seqlens_qo_indptr);
 
     const int32_t lane_idx = opus::lane_id();
 
@@ -909,7 +921,11 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
     int32_t* p_lds_wb          = p_lds_j0 + num_xcd * (rows + 1);
 
     QoState qo_state(
-        params.uni_seqlen_qo, params.ori_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
+        params.uni_seqlen_qo,
+        params.ori_seqlen_qo,
+        params.qk_batch_ratio,
+        p_lds_seqlens_qo,
+        params.p_seqlens_qo_indptr);
 
     MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
 
