@@ -9,6 +9,11 @@ choice, filtered by shape compatibility and requested candidate scope.
 
 The output records one backend/kernel selection per shape and scale group.
 See README.md for CSV templates and the shared GEMM tuning workflow.
+
+A 2-D gemm_a8w8_blockscale_bpreshuffle call with e8m0 scales runs the b = 1
+FlyDSL kernel on gfx950, but reads its kernelName from the kernelId=bmm
+rows of a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv, not this table;
+to use a b = 1 flydsl result there, add it as such a row.
 """
 
 import csv
@@ -25,17 +30,23 @@ from aiter import dtypes
 
 FLYDSL_KERNEL_ID = -1
 _SPLITS = (1, 2, 4, 8, 16)
-# The preshuffled kids each group's flydsl operands are generated with. Any
-# plain-scale preshuffled kid of the group gives the same tensors; these are
-# just ones every build has.
-_DATA_KID = opus_tune.BMM_DATA_KIDS
+# The preshuffled kids each w_scale block's flydsl operands are generated
+# with. Any plain-scale preshuffled kid of the block gives the same tensors;
+# these are just ones every build has.
+_DATA_KID = opus_tune.BMM_BLOCK_DATA_KIDS
+
+
+def _scale_blocks(block):
+    """(x_scale_k, w_scale_n, w_scale_k) of a w_scale block such as 1x32."""
+    rows, cols = (int(v) for v in block.split("x"))
+    return cols, rows, cols
 
 
 # --- mp_tuner hooks (module level so the spawned workers import them) -------
-def gen_flydsl_bmm_data(b, m, n, k, seed, out_dtype, group, device="cuda"):
+def gen_flydsl_bmm_data(b, m, n, k, seed, out_dtype, block, device="cuda"):
     """Generate shared token-major operands and a preshuffled weight."""
     data = opus_tune.gen_bmm_mxscale_data(
-        b, m, n, k, seed, out_dtype, _DATA_KID[group], 1, device=device
+        b, m, n, k, seed, out_dtype, _DATA_KID[block], 1, device=device
     )
     A_mx, _W_mx, Y, A_scale, ws_mx, _ws, ref, W_sh = data
     return A_mx, W_sh, A_scale, ws_mx, Y, ref
@@ -47,12 +58,19 @@ def run_flydsl_bmm_bench(x, w, x_scale, w_scale, y, kernel_name):
     return run_bmm_a8w8_mxfp8(x, w, x_scale, w_scale, y, kernel_name=kernel_name)
 
 
-def _runs(b, n, k, group, cfg):
+def _runs(b, n, k, block, cfg):
     from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import check_bmm_config
 
+    x_scale_k, w_scale_n, w_scale_k = _scale_blocks(block)
     try:
         check_bmm_config(
-            n, k, b, **cfg, x_scale_k=group, w_scale_n=group, w_scale_k=group
+            n,
+            k,
+            b,
+            **cfg,
+            x_scale_k=x_scale_k,
+            w_scale_n=w_scale_n,
+            w_scale_k=w_scale_k,
         )
     except ValueError:
         return False
@@ -110,8 +128,6 @@ class BmmA8W8MxscaleBpreshuffleTuner(opus_tune.OpusBmmMxscaleTuner):
                 self.fly_seed.setdefault(key, []).append((int(r["m"]), r["kernelName"]))
         args.bpreshuffle = True
         super().pre_process(args)
-        if self.libs == {"flydsl"} and self.untunedf["w_scale_block"].eq("1x32").any():
-            raise ValueError("1x32 is supported by OPUS; use --libtype opus or all")
         if args.opus_candidates == "all":
             if args.pool != "preb":
                 raise ValueError("--opus_candidates all requires --pool preb")
@@ -125,19 +141,16 @@ class BmmA8W8MxscaleBpreshuffleTuner(opus_tune.OpusBmmMxscaleTuner):
             }
 
     def _flydsl_names(self, b, m, n, k, block, how):
-        if block == "1x32":
-            return []
         from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
             bmm_kernel_name,
             parse_bmm_kernel_name,
             pick_bmm_kernel_name,
         )
 
-        group = int(block.split("x")[1])
         seed = self.fly_seed.get((b, block), [])
         names = {r for mm, r in seed if how == "all" or m / 2 <= mm <= m * 2}
         try:
-            names.add(pick_bmm_kernel_name(b, m, n, k, group, group, group))
+            names.add(pick_bmm_kernel_name(b, m, n, k, *_scale_blocks(block)))
         except ValueError:
             pass
         out = set()
@@ -148,7 +161,7 @@ class BmmA8W8MxscaleBpreshuffleTuner(opus_tune.OpusBmmMxscaleTuner):
                 if sp != base and not (base / 2 <= sp <= base * 2):
                     continue
                 c = {**cfg, "splits": sp}
-                if _runs(b, n, k, group, c):
+                if _runs(b, n, k, block, c):
                     out.add(bmm_kernel_name(**c))
         return sorted(out)
 
@@ -169,19 +182,17 @@ class BmmA8W8MxscaleBpreshuffleTuner(opus_tune.OpusBmmMxscaleTuner):
             return super()._saved_benchmark(row, seed)
         if str(row["libtype"]).lower() != "flydsl":
             raise ValueError(f"Unsupported BMM backend {row['libtype']!r}")
-        if row["w_scale_block"] == "1x32":
-            raise ValueError("FlyDSL BMM does not support 1x32 weight scales")
         from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import parse_bmm_kernel_name
 
         b, m, n, k = (int(row[name]) for name in ("b", "m", "n", "k"))
-        group = int(row["w_scale_block"].split("x")[0])
+        block = row["w_scale_block"]
         name = str(row["kernelName"])
         cfg = parse_bmm_kernel_name(name)
-        if cfg is None or not _runs(b, n, k, group, cfg):
+        if cfg is None or not _runs(b, n, k, block, cfg):
             raise ValueError(f"FlyDSL config {name!r} cannot run this shape")
         if int(row["splitK"]) != cfg["splits"]:
             raise ValueError("FlyDSL splitK does not match kernelName")
-        data = gen_flydsl_bmm_data(b, m, n, k, seed, dtypes.bf16, group)
+        data = gen_flydsl_bmm_data(b, m, n, k, seed, dtypes.bf16, block)
         data[4].fill_(float("nan"))
         return run_flydsl_bmm_bench, data[:5] + (name,), data[5]
 
@@ -194,7 +205,6 @@ class BmmA8W8MxscaleBpreshuffleTuner(opus_tune.OpusBmmMxscaleTuner):
 
         b, m, n, k = (int(row[name]) for name in ("b", "m", "n", "k"))
         block = row["w_scale_block"]
-        group = int(block.split("x")[0])
         for name in self._flydsl_names(b, m, n, k, block, args.flydsl_candidates):
             splits = parse_bmm_kernel_name(name)["splits"]
             yield opus_tune.make_bmm_tuning_task(
@@ -205,7 +215,7 @@ class BmmA8W8MxscaleBpreshuffleTuner(opus_tune.OpusBmmMxscaleTuner):
                     name,
                 ),
                 gen_flydsl_bmm_data,
-                (b, m, n, k, seed, dtypes.bf16, group),
+                (b, m, n, k, seed, dtypes.bf16, block),
                 run_flydsl_bmm_bench,
                 ((0, 1, 2, 3, 4), name),
                 self._perf_kwargs(args, m),

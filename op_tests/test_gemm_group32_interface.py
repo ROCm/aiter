@@ -591,6 +591,8 @@ def test_bmm_xcd_swizzle_names():
     assert parse_bmm_kernel_name(f"{base}12")["xcd_swizzle"] == 12
     for swizzle in ("0", "1", "04"):
         assert parse_bmm_kernel_name(base + swizzle) is None
+    assert parse_bmm_kernel_name(base.replace("_sk1", "_sk2")) is not None
+    assert parse_bmm_kernel_name(base.replace("_sk1", "_sk2") + "4") is None
     cfg = parse_bmm_kernel_name(f"{base}4")
     assert bmm_kernel_name(**cfg) == f"{base}4"
     for bad in ({"xcd_order": False}, {"xcd_swizzle": 1}, {"splits": 2}):
