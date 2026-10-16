@@ -11,6 +11,7 @@ family in test_gated_tuner.py.
 import argparse
 import importlib.util
 import json
+import math
 import os
 import tempfile
 import unittest
@@ -28,6 +29,7 @@ from aiter.ops.mha_fwd_policy import (
     MhaFwdProblem,
     config_digest,
 )
+from aiter.test_mha_common import attention_ref
 from aiter.utility.selection_proof import SelectionProof
 
 _TUNER_PATH = Path(__file__).parents[2] / MHA_FWD_TUNER_SCRIPT
@@ -76,7 +78,7 @@ def _problem_row(**overrides):
     }
 
 
-def _naive_attention(q, k, v, cu_q, cu_k, scale, causal, left, right):
+def _naive_attention(q, k, v, cu_q, cu_k, scale, causal, left, right, cap=0.0):
     """softmax(QK^T)V one sequence and one head at a time, masks bottom-right."""
     out = torch.zeros((*q.shape[:-1], v.shape[-1]), dtype=torch.float32)
     lse = torch.zeros((q.shape[1], q.shape[0]), dtype=torch.float32)
@@ -95,6 +97,8 @@ def _naive_attention(q, k, v, cu_q, cu_k, scale, causal, left, right):
             allowed &= col <= row + right
         for h in range(q.shape[1]):
             scores = q[qs:qe, h].float() @ k[ks:ke, h // groups].float().T * scale
+            if cap > 0:
+                scores = cap * torch.tanh(scores / cap)
             scores = scores.masked_fill(~allowed, float("-inf"))
             out[qs:qe, h] = (
                 torch.softmax(scores, -1).nan_to_num(0.0)
@@ -118,17 +122,62 @@ class TestChunkedReference(unittest.TestCase):
         causal = mask.get("causal", False)
         left = mask.get("left", -1)
         right = mask.get("right", -1)
+        cap = mask.get("cap", 0.0)
         out, lse = _TUNER._chunked_reference(
-            q, k, v, cu_q, cu_k, 0.125, causal, left, right, True
+            q, k, v, cu_q, cu_k, 0.125, causal, left, right, True, cap
         )
         want_out, want_lse = _naive_attention(
-            q, k, v, cu_q, cu_k, 0.125, causal, left, right
+            q, k, v, cu_q, cu_k, 0.125, causal, left, right, cap
         )
         torch.testing.assert_close(out, want_out, rtol=1e-4, atol=1e-4)
         torch.testing.assert_close(lse, want_lse, rtol=1e-4, atol=1e-4)
+        # And against an oracle written outside this tuner, one sequence at a
+        # time. attention_ref scales by 1/sqrt(head_dim), so q is rescaled.
+        rescale = 0.125 * math.sqrt(q.shape[-1])
+        for b in range(len(q_lengths)):
+            qs, qe = int(cu_q[b]), int(cu_q[b + 1])
+            ks, ke = int(cu_k[b]), int(cu_k[b + 1])
+            want, _, _ = attention_ref(
+                q[None, qs:qe] * rescale,
+                k[None, ks:ke],
+                v[None, ks:ke],
+                causal=causal,
+                window_size=(left, right),
+                softcap=cap,
+            )
+            torch.testing.assert_close(out[qs:qe], want[0], rtol=1e-4, atol=1e-4)
 
     def test_plain_varlen(self):
         self.check(q_lengths=[7, 3], k_lengths=[7, 3])
+
+    def test_logits_soft_cap(self):
+        self.check(q_lengths=[7, 3], k_lengths=[7, 3], cap=2.0)
+
+    def test_causal_soft_cap_against_attention_ref(self):
+        self.check(q_lengths=[6, 9], k_lengths=[6, 9], causal=True, cap=1.5)
+
+    def test_a_reference_split_into_many_chunks_is_unchanged(self):
+        # Chunks of one or two query rows, so every boundary is exercised.
+        for budget in (4, 4 * 4 * 11 * 2):
+            with (
+                self.subTest(budget=budget),
+                mock.patch.object(_TUNER, "REFERENCE_CHUNK_BYTES", budget),
+            ):
+                self.check(q_lengths=[3, 4], k_lengths=[11, 6], causal=True)
+                self.check(q_lengths=[12, 5], k_lengths=[12, 5], left=3, right=1)
+
+    def test_the_score_budget_sets_the_chunk_size(self):
+        q, k, v = torch.randn(7, 4, 32), torch.randn(17, 4, 32), torch.randn(17, 4, 16)
+        cu_q, cu_k = torch.tensor([0, 3, 7]), torch.tensor([0, 11, 17])
+        with (
+            mock.patch.object(_TUNER, "REFERENCE_CHUNK_BYTES", 4),
+            mock.patch.object(torch, "einsum", wraps=torch.einsum) as einsum,
+        ):
+            _TUNER._chunked_reference(q, k, v, cu_q, cu_k, 0.125, False, -1, -1, False)
+        score_products = [
+            c for c in einsum.call_args_list if c.args[0] == "qhgd,khd->hgqk"
+        ]
+        self.assertEqual(len(score_products), 7)  # one query row per chunk
 
     def test_grouped_query_attention(self):
         self.check(q_lengths=[5, 9], k_lengths=[5, 9], nhead_q=8, nhead_k=2)
@@ -181,6 +230,12 @@ class TestCandidateField(unittest.TestCase):
         self.assertNotIn("triton", field)
         self.assertNotIn("gluon", field)
 
+    def test_kernels_without_a_soft_cap_are_not_measured_on_a_capped_shape(self):
+        # asm_v3 ignores the cap and would be judged on a different function.
+        self.assertEqual(
+            self.field(_problem_row(logits_soft_cap=30.0)), ["ck", "flydsl"]
+        )
+
     def test_a_restricted_field_still_measures_the_incumbent(self):
         self.assertEqual(
             self.field(_problem_row(), incumbents=["asm_v3"], backends="ck"),
@@ -232,7 +287,7 @@ class TestSelectionHooks(unittest.TestCase):
 
 
 class TestPreProcess(unittest.TestCase):
-    def run_pre_process(self, **overrides):
+    def run_pre_process(self, backends="", gfx="gfx950", **overrides):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         untuned = os.path.join(directory.name, "untuned.csv")
@@ -245,10 +300,10 @@ class TestPreProcess(unittest.TestCase):
             untune_file=untuned,
             tune_file=os.path.join(directory.name, "tuned.csv"),
             all=False,
-            backends="",
+            backends=backends,
         )
         with (
-            mock.patch.object(tuner, "get_gfx", return_value="gfx950"),
+            mock.patch.object(tuner, "get_gfx", return_value=gfx),
             mock.patch.object(tuner, "get_gpu_model", return_value="mi355x"),
             mock.patch.object(tuner, "get_cu_num", return_value=256),
         ):
@@ -265,9 +320,69 @@ class TestPreProcess(unittest.TestCase):
         )
 
     def test_inputs_the_tuner_cannot_build_are_refused(self):
-        for overrides in ({"dropout_p": 0.1}, {"has_bias": 1}, {"sink_size": 4}):
+        for overrides in (
+            {"dropout_p": 0.1},
+            {"has_bias": 1},
+            {"sink_size": 4},
+            {"min_seqlen_q": 16},
+            # 512 queries over two sequences with one of 512 leaves one empty.
+            {"max_seqlen_q": 512},
+            {"backends": "ck,cutlass"},
+            {"gfx": "gfx1250"},
+        ):
             with self.subTest(**overrides), self.assertRaises(ValueError):
                 self.run_pre_process(**overrides)
+
+    def test_named_backends_are_accepted(self):
+        self.run_pre_process(backends="ck, triton")
+
+
+class TestMeasurement(unittest.TestCase):
+    def tasks(self, **overrides):
+        tuner = _tuner()
+        args = argparse.Namespace(
+            warmup=3, iters=7, mp=1, errRatio=0.0, timeout=60, verbose=False
+        )
+        row = pd.Series(
+            dict(
+                zip(
+                    MHA_FWD_TUNING_KEY_FIELDS,
+                    MhaFwdProblem.from_mapping(_problem_row(**overrides)).key(),
+                )
+            )
+        )
+        with (
+            mock.patch.object(tuner, "candidate_field", return_value=["ck"]),
+            mock.patch.object(_TUNER, "mp_tuner", return_value=[]) as run,
+            mock.patch("builtins.print"),
+        ):
+            tuner.tune(pd.DataFrame([row]), None, args)
+        return run.call_args.args[0]
+
+    def test_candidates_are_timed_on_kernel_time(self):
+        (task,) = self.tasks()
+        self.assertEqual(
+            task.kwargs, {"num_warmup": 3, "num_iters": 7, "use_cuda_event": False}
+        )
+
+    def test_the_reference_applies_the_soft_cap_the_kernels_run(self):
+        (task,) = self.tasks(logits_soft_cap=30.0)
+        self.assertEqual(task.ref_args[-1], 30.0)
+
+    def test_a_triton_result_is_copied_into_a_fresh_out_buffer(self):
+        q = torch.randn(4, 2, 8)
+        cu = torch.tensor([0, 4])
+        produced = torch.randn(4, 2, 8)
+        with mock.patch(
+            "aiter.ops.triton.attention.mha.flash_attn_varlen_func",
+            return_value=produced,
+        ):
+            result = _TUNER._run_candidate(
+                q, q, q, cu, cu, "triton", 4, 4, 0, 0.0, 0.1, 0.0, 1, 0, -1, -1, 0
+            )
+        out = result[0] if isinstance(result, tuple) else result
+        self.assertIsNot(out, produced)
+        torch.testing.assert_close(out, produced)
 
 
 class TestPublish(unittest.TestCase):

@@ -12,6 +12,11 @@ Triton's JSON configs, so this tuner never enumerates or writes a tile. A
 Triton or Gluon row records the digest of the tile Triton resolved while it
 was measured, and dispatch drops the row once Triton resolves another.
 
+Candidates are timed on device kernel time, as the other aiter tuners time
+theirs, so host launch cost does not decide between backends. A Triton
+candidate's time includes copying its result into the caller's ``out``
+buffer, which dispatch does for a Triton row.
+
 What is MHA-specific lives here: the data generator, the chunked reference,
 the candidate field and the probe. Deciding what reaches the table (the
 incumbent, the promotion bar, the fresh-process proof) is ``GatedTuner``'s.
@@ -90,11 +95,19 @@ UNSYNTHESIZED_FIELDS = (
     "is_grad",
 )
 # errRatio is the fraction of output elements outside these tolerances, and
-# none may be.
+# none may be. Stricter than op_tests/test_mha_varlen.py (rtol 0.02, atol 0.5).
 ERROR_RTOL = 2e-2
 ERROR_ATOL = 2e-2
 MAX_ERROR_RATIO = 0.0
 TASK_TIMEOUT_S = 7200
+# Score storage the reference may hold at once.
+REFERENCE_CHUNK_BYTES = 64 << 20
+# Kernels that ignore logits_soft_cap; dispatch never routes a soft-capped
+# call to them, so they cannot serve such a shape.
+SOFT_CAP_BLIND_BACKENDS = ("asm_v3", "opus")
+# Architectures whose incumbent kernels this tuner can time as dispatch runs
+# them; gfx1250 dispatch picks an asm sink-varlen kernel it does not.
+TUNABLE_GFX = ("gfx942", "gfx950")
 
 
 def candidate_backends(gfx: str) -> tuple[str, ...]:
@@ -112,6 +125,12 @@ def candidate_backends(gfx: str) -> tuple[str, ...]:
 
 
 def _balanced_lengths(total: int, batch: int, maximum: int) -> list[int]:
+    """Sequence lengths for a key: the first is ``maximum``, the rest share
+    what is left as evenly as possible.
+
+    The key holds only totals and maxima, so this one distribution stands in
+    for every batch with the same key.
+    """
     if batch < 1 or maximum < 1:
         raise ValueError("batch and max sequence lengths must be positive")
     if total < maximum or total > batch * maximum:
@@ -127,6 +146,11 @@ def _balanced_lengths(total: int, batch: int, maximum: int) -> list[int]:
         remaining -= length
     if remaining != 0 or max(lengths) != maximum:
         raise ValueError("failed to construct the requested packed-varlen shape")
+    if min(lengths) < 1:
+        raise ValueError(
+            f"total={total} over batch={batch} with maximum={maximum} "
+            "leaves a sequence empty"
+        )
     return lengths
 
 
@@ -194,12 +218,16 @@ def _chunked_reference(
     window_left,
     window_right,
     return_lse,
+    logits_soft_cap=0.0,
 ):
-    """Bounded-memory fp32 oracle; score storage stays below roughly 64 MiB.
+    """Bounded-memory fp32 oracle; score storage stays below
+    ``REFERENCE_CHUNK_BYTES``.
 
     Masks are bottom-right aligned, as the kernels align them, and LSE is
-    (nhead_q, total_q), CK's layout.
+    (nhead_q, total_q), CK's layout. A soft-cap applies ``cap * tanh(s / cap)``
+    to the scaled scores before masking, as ``attention_ref`` does.
     """
+    cap = float(logits_soft_cap)
     output = torch.empty((*q.shape[:-1], v.shape[-1]), dtype=q.dtype, device=q.device)
     lse = (
         torch.empty((q.shape[1], q.shape[0]), dtype=torch.float32, device=q.device)
@@ -216,7 +244,7 @@ def _chunked_reference(
         k_seq = k[k_begin:k_end].float()
         v_seq = v[k_begin:k_end].float()
         sq, sk, heads = q_seq.shape[0], k_seq.shape[0], q_seq.shape[1]
-        rows = max(1, (64 << 20) // max(4, 4 * heads * sk))
+        rows = max(1, REFERENCE_CHUNK_BYTES // max(4, 4 * heads * sk))
         key_positions = torch.arange(sk, device=q.device)
         offset = sk - sq
         for row_begin in range(0, sq, rows):
@@ -230,6 +258,8 @@ def _chunked_reference(
                 heads, row_end - row_begin, sk
             )
             scores.mul_(float(softmax_scale))
+            if cap > 0.0:
+                scores = torch.tanh(scores / cap).mul_(cap)
             query_positions = torch.arange(
                 row_begin, row_end, device=q.device
             ).unsqueeze(1)
@@ -361,6 +391,11 @@ def _run_candidate(
             return_lse=bool(return_lse),
             backend=backend,
         )
+        if not return_lse:
+            # Dispatch copies a Triton result into the caller's out buffer.
+            out = torch.empty_like(result)
+            out.copy_(result)
+            result = out
         return _normalize_result(result, return_lse, total_q, nhead_q)
     if backend == "flydsl":
         from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
@@ -396,6 +431,10 @@ def _run_candidate(
         )
         return _normalize_result(result, return_lse, total_q, nhead_q)
     raise ValueError(f"unknown backend {backend!r}")
+
+
+def _names(value) -> list[str]:
+    return [name.strip() for name in (value or "").split(",") if name.strip()]
 
 
 def _problem(row) -> MhaFwdProblem:
@@ -476,15 +515,20 @@ class MhaFwdTuner(GatedTuner):
 
     def calculate(self, result, inbpe=2, outbpe=2):
         info, us, _ = result
-        key = dict(zip(MHA_FWD_TUNING_KEY_FIELDS, info[0]))
-        flop = (
-            2
-            * int(key["nhead_q"])
-            * int(key["total_q"])
-            * int(key["total_k"])
-            * (int(key["hdim_q"]) + int(key["hdim_v"]))
-            / max(1, int(key["batch"]))
+        problem = MhaFwdProblem.from_mapping(
+            dict(zip(MHA_FWD_TUNING_KEY_FIELDS, info[0]))
         )
+        q_lengths = _balanced_lengths(
+            problem.total_q, problem.batch, problem.max_seqlen_q
+        )
+        k_lengths = _balanced_lengths(
+            problem.total_k, problem.batch, problem.max_seqlen_k
+        )
+        # Score entries of the generated batch; causal masks about half.
+        scores = sum(sq * sk for sq, sk in zip(q_lengths, k_lengths))
+        if problem.causal:
+            scores /= 2
+        flop = 2 * problem.nhead_q * scores * (problem.hdim_q + problem.hdim_v)
         return 0.0 if us <= 0 or not math.isfinite(us) else flop / us / 1e6
 
     def pre_process(self, args):
@@ -508,7 +552,30 @@ class MhaFwdTuner(GatedTuner):
             raise ValueError("dropout tuning requires a reproducible dropout mask")
         if (frame["sink_size"].astype(int) != 0).any():
             raise ValueError("sink-token tuning requires explicit sink-token payloads")
+        if (frame["min_seqlen_q"].astype(int) != 0).any():
+            # CK skips sequences no longer than min_seqlen_q and other backends
+            # do not, so their outputs cannot be judged against one reference.
+            raise ValueError("min_seqlen_q tuning is not supported; use 0")
+        for _, row in frame.iterrows():
+            _balanced_lengths(
+                int(row["total_q"]), int(row["batch"]), int(row["max_seqlen_q"])
+            )
+            _balanced_lengths(
+                int(row["total_k"]), int(row["batch"]), int(row["max_seqlen_k"])
+            )
+        unknown = sorted(
+            set(_names(getattr(args, "backends", ""))) - set(MHA_FWD_BACKENDS)
+        )
+        if unknown:
+            raise ValueError(
+                f"unknown --backends {unknown}; choose from {sorted(MHA_FWD_BACKENDS)}"
+            )
         frame = self.stamp_hardware(frame)
+        if self.get_gfx() not in TUNABLE_GFX:
+            raise ValueError(
+                f"MHA forward tuning supports {', '.join(TUNABLE_GFX)}, "
+                f"not {self.get_gfx()}"
+            )
         # Canonical spelling, so a row written as bf16 is the shape dispatch
         # looks up and the summary matches results against it.
         keys = [self.lookup_key(row) for _, row in frame.iterrows()]
@@ -544,6 +611,9 @@ class MhaFwdTuner(GatedTuner):
                 if reason is not None:
                     print(f"not measuring {backend}: {reason}", flush=True)
                     continue
+            if backend in SOFT_CAP_BLIND_BACKENDS and problem.logits_soft_cap:
+                print(f"not measuring {backend}: no logits soft-cap", flush=True)
+                continue
             field.append(backend)
         for incumbent in self.incumbents(row):
             if incumbent["backend"] not in field:
@@ -579,7 +649,7 @@ class MhaFwdTuner(GatedTuner):
                         gen_args=_data_args(problem),
                         func=_run_candidate,
                         args=(["q", "k", "v", "cu_q", "cu_k"], backend, *launch),
-                        kwargs=self.measurement_kwargs(args, use_cuda_event=True),
+                        kwargs=self.measurement_kwargs(args),
                         ref_func=_chunked_reference,
                         ref_args=(
                             ["q", "k", "v", "cu_q", "cu_k"],
@@ -588,6 +658,7 @@ class MhaFwdTuner(GatedTuner):
                             problem.window_left,
                             problem.window_right,
                             problem.return_lse,
+                            problem.logits_soft_cap,
                         ),
                         ref_kwargs={},
                         ref=None,
@@ -647,8 +718,7 @@ class MhaFwdTuner(GatedTuner):
         return pd.DataFrame(rows, columns=self.columns)
 
     def _restricted_backends(self) -> list[str] | None:
-        value = (getattr(self._args, "backends", "") or "").strip()
-        return [name.strip() for name in value.split(",") if name.strip()] or None
+        return _names(getattr(self._args, "backends", "")) or None
 
     def _clear_op_caches(self):
         clear_mha_fwd_tuning_cache()
@@ -675,6 +745,7 @@ def selection_probe(row, warmup: int, iters: int) -> dict[str, Any]:
         problem.window_left,
         problem.window_right,
         problem.return_lse,
+        problem.logits_soft_cap,
     )
 
     def invoke():
