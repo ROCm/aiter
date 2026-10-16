@@ -78,13 +78,13 @@ def a4w4_operands_aligned(
     A: Tensor, B: Tensor, A_scale: Tensor, B_scale: Tensor
 ) -> bool:
     """Whether A / B / the scales meet the kernels' 16-byte alignment, so a caller
-    can fall back to another kernel instead of reading past a misaligned view."""
-    return (
-        all(t.data_ptr() % ALIGN_BYTES == 0 for t in (A, B, A_scale, B_scale))
-        and (A.dim() != 2 or A.stride(0) % ALIGN_BYTES == 0)
-        and (A_scale.dim() != 2 or A_scale.stride(0) % ALIGN_BYTES == 0)
-        and (B_scale.dim() != 2 or B_scale.stride(0) % ALIGN_BYTES == 0)
-    )
+    can fall back to another kernel instead of reading past a misaligned view.
+
+    The scales are read in 32-row groups of K bytes (aligned, as K % 128 == 0), not
+    by their K / 32 byte row stride, so only their base addresses are checked."""
+    if any(t.data_ptr() % ALIGN_BYTES for t in (A, B, A_scale, B_scale)):
+        return False
+    return A.dim() != 2 or A.stride(0) % ALIGN_BYTES == 0
 
 
 def is_compute_a4w4_kernel_name(name: str) -> bool:
@@ -348,7 +348,7 @@ def run_gemm_a4w4_mxscale_bpreshuffle_gfx1250(
     row; writes into ``Out`` ([M, N] bf16 / fp16) and returns it.
 
     A: ``[M, K / 2]`` fp4x2, B: ``[N, K / 2]`` fp4x2 16x16-preshuffled,
-    A_scale / B_scale: e8m0 ``[pad32(M), K / 32]`` / ``[N, K / 32]`` in 32x4
+    A_scale / B_scale: e8m0 ``[pad32(M), K / 32]`` / ``[pad32(N), K / 32]`` in 32x4
     shuffled storage.
     """
     cfg = parse_a4w4_kernel_name(kernel_name)
@@ -395,7 +395,7 @@ def run_gemm_a4w4_mxscale_bpreshuffle_gfx1250(
     if not a4w4_operands_aligned(A, B, A_scale, B_scale):
         raise RuntimeError(
             f"[FlyDSL gfx1250 a4w4] A, B and the scales need {ALIGN_BYTES}-byte aligned "
-            "base addresses and row pitches"
+            "base addresses, and A an aligned row pitch"
         )
     if (
         Out.data_ptr() % ALIGN_BYTES
@@ -408,7 +408,7 @@ def run_gemm_a4w4_mxscale_bpreshuffle_gfx1250(
 
     k_blocks = K // SCALE_BLOCK
     a_scale = _require_scale(A_scale, (M + 31) // 32 * 32, k_blocks, "A_scale")
-    b_scale = _require_scale(B_scale, N, k_blocks, "B_scale")
+    b_scale = _require_scale(B_scale, (N + 31) // 32 * 32, k_blocks, "B_scale")
 
     _lazy_import()
     torch_stream = torch.cuda.current_stream(device=A.device)
