@@ -55,6 +55,10 @@ MHA_V4_MXFP6_V_PACKED_ROW_BYTES = 96
 MHA_V4_MXFP6_V_TILE_BYTES = MHA_V4_MXFP6_V_TILE_TOKENS * MHA_V4_MXFP6_V_PACKED_ROW_BYTES
 MHA_V4_MXFP6_V_SCALE_TILE_BYTES = 512
 MHA_V4_MXFP6_V_BUFFER_SLACK_BYTES = 256
+# The FP6-P block-sparse kernels gather each V-scale tile one tile ahead through a raw pointer
+# with no record bound, so the last tile of the last (batch, head) reads past the image. A short
+# V is small enough for that read to leave its allocation, so it lands on zeroed slack.
+MHA_V4_MXFP6_FP6_P_V_SCALE_SLACK_BYTES = 1024
 
 
 def mha_v4_q_multiplier(softmax_scale: float) -> float:
@@ -665,6 +669,17 @@ def _quantize_v_mxfp6_fake(input: Tensor) -> tuple[Tensor, Tensor]:
     )
 
 
+def _mxfp6_fp6_p_v_scale(input: Tensor, batch: int, heads: int, tiles: int) -> Tensor:
+    elements = batch * heads * tiles * MHA_V4_MXFP6_V_SCALE_TILE_BYTES
+    storage = input.new_empty(
+        (elements + MHA_V4_MXFP6_FP6_P_V_SCALE_SLACK_BYTES,), dtype=torch.uint8
+    )
+    storage[elements:].zero_()
+    return storage[:elements].view(
+        batch, heads, tiles * MHA_V4_MXFP6_V_SCALE_TILE_BYTES
+    )
+
+
 @torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp6_fp6_p", mutates_args=())
 def quantize_v_mxfp6_fp6_p(input: Tensor) -> tuple[Tensor, Tensor]:
     """Pack MXFP6 V in the contraction order required by an FP6 P operand."""
@@ -676,9 +691,7 @@ def quantize_v_mxfp6_fp6_p(input: Tensor) -> tuple[Tensor, Tensor]:
     raw = input.new_empty(
         (mxfp6_v_raw_buffer_size(batch, sequence, heads),), dtype=torch.uint8
     )
-    scale = input.new_empty(
-        (batch, heads, tiles * MHA_V4_MXFP6_V_SCALE_TILE_BYTES), dtype=torch.uint8
-    )
+    scale = _mxfp6_fp6_p_v_scale(input, batch, heads, tiles)
     _quantize_v_mxfp6_fp6_p_hip(raw, scale, input)
     quantized = torch.as_strided(
         raw,
@@ -690,7 +703,9 @@ def quantize_v_mxfp6_fp6_p(input: Tensor) -> tuple[Tensor, Tensor]:
 
 @quantize_v_mxfp6_fp6_p.register_fake
 def _quantize_v_mxfp6_fp6_p_fake(input: Tensor) -> tuple[Tensor, Tensor]:
-    return _quantize_v_mxfp6_fake(input)
+    batch, sequence, heads, _ = input.shape
+    quantized, _ = _quantize_v_mxfp6_fake(input)
+    return quantized, _mxfp6_fp6_p_v_scale(input, batch, heads, mxfp6_v_tiles(sequence))
 
 
 def mxfp4_v_view(raw: Tensor, scale: Tensor, sequence: int) -> Tensor:
