@@ -134,6 +134,7 @@ def _wrapped():
         fk._seg_scan_fast,
         flash_kda_k1._k1_fast,
         flash_kda_k2.k2_ab_fused_fast,
+        flash_kda_k2.k2_c_fast,
     )
     return [c for c in candidates if isinstance(c, fast_launch._FastLaunch)]
 
