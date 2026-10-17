@@ -6,14 +6,16 @@
 from __future__ import annotations
 
 import ctypes
+import math
 
 import torch
 import torch.distributed as dist
-from flydsl.expr.typing import Int32, Int64, Stream
+from flydsl.expr.typing import Float32, Int32, Int64, Stream
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .kernels.quick_allreduce_int4 import (
+    DEFAULT_DIVISOR,
     DEFAULT_GRID_CAP,
     SUPER_TILES,
     SUPPORTED_WORLDS,
@@ -26,6 +28,27 @@ from .kernels.tensor_shim import _run_compiled
 from .quick_allreduce_int4_ipc import UncachedIpcHeap
 
 _SUPPORTED_ARCHS = ("gfx942", "gfx950")
+# The sum is restored in fp16 before the bf16 store, by scaling each group's
+# dequant scale (at least 2**-10) by the divisor; restored values reach
+# 480 * divisor. Both must stay normal fp16: 2**-10 * divisor >= 2**-14 and
+# 480 * divisor < 65504.
+DIVISOR_MIN = 2.0**-4
+DIVISOR_MAX = 128.0
+
+
+def _check_divisor(divisor: float) -> float:
+    """One shared positive divisor. ``1`` disables the scaling."""
+    msg = (
+        f"QuickAllReduceInt4 divisor must be a finite float in "
+        f"[{DIVISOR_MIN:g}, {DIVISOR_MAX:g}], got {divisor!r}"
+    )
+    try:
+        value = float(divisor)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(msg) from exc
+    if not math.isfinite(value) or not DIVISOR_MIN <= value <= DIVISOR_MAX:
+        raise ValueError(msg)
+    return value
 
 
 def _cuda_index(device) -> int:
@@ -279,6 +302,7 @@ class QuickAllReduceInt4:
         live_bytes: int,
         num_tiles: int,
         grid_x: int,
+        divisor: float = DEFAULT_DIVISOR,
     ):
         if stream is None:
             stream = Stream(torch.cuda.current_stream(self._device_index))
@@ -293,6 +317,7 @@ class QuickAllReduceInt4:
             Int64(int(eng._meta_ptr)),
             Int64(int(eng._meta_ptr + self.world_size * 8)),
             Int32(grid_x),
+            Float32(divisor),
             stream,
         )
 
@@ -304,6 +329,7 @@ class QuickAllReduceInt4:
         stream,
         *,
         live_bytes: int,
+        divisor: float = DEFAULT_DIVISOR,
     ) -> None:
         num_tiles = max(1, (live_bytes + TILE_BYTES - 1) // TILE_BYTES)
         args = self._launch_args(
@@ -314,6 +340,7 @@ class QuickAllReduceInt4:
             live_bytes=live_bytes,
             num_tiles=num_tiles,
             grid_x=min(num_tiles, eng.grid),
+            divisor=divisor,
         )
         # A launch may still be using the raw HIP allocations when Python drops
         # the communicator. Keep cleanup conservative even if launch raises.
@@ -351,13 +378,19 @@ class QuickAllReduceInt4:
             # Destructors must not raise, especially during interpreter shutdown.
             return
 
-    def allreduce(self, inp, out, stream=None):
+    def allreduce(self, inp, out, stream=None, divisor: float = DEFAULT_DIVISOR):
         """Two-shot INT4 all-reduce into ``out``.
 
         ``stream=None`` uses the current PyTorch stream on this device.
+        ``divisor`` defaults to 1, which keeps the previous INT4 result.
+        Loaded values are divided by it before the first pack, and the
+        finished sum is multiplied by it once. Every rank must pass the same
+        divisor; this is not checked, and a mismatch silently gives each rank
+        a different result.
         """
+        divisor = _check_divisor(divisor)
         live_bytes = self._check_payload(inp, out)
         num_tiles = max(1, (live_bytes + TILE_BYTES - 1) // TILE_BYTES)
         st = self._pick_st(num_tiles)
         eng = self._by_st[st]
-        self._launch_eng(eng, inp, out, stream, live_bytes=live_bytes)
+        self._launch_eng(eng, inp, out, stream, live_bytes=live_bytes, divisor=divisor)
