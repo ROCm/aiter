@@ -11,10 +11,11 @@ prefill scores 16 query rows per workgroup. The indexer head count is 4 or
 8, each a separate compile.
 
 ``qsa_sparse_gqa`` writes sparse GQA ``o [M, Hq, D]`` from paged K/V at the
-selected token ids. Decode runs a BLOCK_N=16 two-wave tile with split-K and
-an LSE merge; prefill runs BLOCK_N=32 two waves and writes output directly
-once the grid alone fills the machine. Softmax is online in log2 space and the
-split
+selected token ids. ``n_sel`` is the packed live prefix; the default walks the
+allocated row. Decode runs a BLOCK_N=16 two-wave tile with split-K and an LSE
+merge; gfx942 widens that tile to four waves when the grid fits in the CUs.
+Prefill runs BLOCK_N=32 two waves and writes output directly once the grid
+alone fills the machine. Softmax is online in log2 space and the split
 partials are FP32. Expand+tail and the sigmoid gate stay unfused.
 
 The fp32 reference, the paged-cache fixtures, and the concrete shapes
@@ -49,6 +50,8 @@ from .kernels.qsa.indexer_select import (
     build_qsa_indexer_prefill_scores_module,
 )
 from .kernels.qsa.sparse_gqa import (
+    _TINY_SPLITS,
+    _gfx942_reg_qk,
     _k2_coverage_reason,
     _launch_config,
     build_qsa_sparse_gqa_module,
@@ -225,11 +228,16 @@ def _k1_uses_prefill_scorer(
     """Whether this launch uses the 16-row scorer.
 
     gfx942 H=8 stays on the one-row scorer. That tile is 73920 bytes and
-    gfx942 has 65536. gfx950 H=8 keeps the 16-row tile.
+    gfx942 has 65536. gfx950 H=8 keeps the 16-row tile, and still starts
+    at 16 rows. gfx942 H=4 fits the tile, so an 8-row decode uses one
+    16-row workgroup with the tail masked.
     """
-    if n_requests != 1 or rows < 16:
+    if n_requests != 1:
         return False
-    return not (arch.startswith("gfx942") and n_heads == 8)
+    if arch.startswith("gfx942") and n_heads == 8:
+        return False
+    min_rows = 8 if arch.startswith("gfx942") and n_heads == 4 else 16
+    return rows >= min_rows
 
 
 @functools.lru_cache(maxsize=1)
@@ -305,8 +313,8 @@ def qsa_indexer_score_and_select(
     """Score long rows into ``[M, n_columns]`` and write top-512 ids into ``out``.
 
     ``n_heads`` is 4 or 8, each a separate compile. One request with
-    ``M >= 16`` uses the 16-row scorer, except gfx942 H=8, which stays
-    on the one-row scorer. ``live_columns`` is
+    ``M >= 16`` uses the 16-row scorer. gfx942 H=4 starts that tile at
+    8 rows. gfx942 H=8 stays on the one-row scorer. ``live_columns`` is
     the widest visible row. The score buffer stays the width of the
     table, and the selector sees that prefix. A padded table with at
     most 64 rows and at most 20000 live columns uses the one-workgroup
@@ -768,12 +776,18 @@ def qsa_sparse_gqa(
     out: torch.Tensor | None = None,
     softmax_scale: float | None = None,
     workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
+    n_sel: int | None = None,
 ) -> torch.Tensor:
     """Write sparse GQA ``o [M, Hq, D]`` from paged K/V.
 
     ``workspace`` is ``(partial_out, partial_lse)`` for a split launch.
     ``None`` allocates that pair. A one-split launch writes ``out``
     directly and does not read ``workspace``.
+
+    ``n_sel`` is the packed live prefix of ``indices``. ``None`` walks
+    every allocated column. A shorter prefix is the split count and the
+    gather width, so a ``-1`` suffix is not scanned and does not launch
+    an empty workgroup. A live token at or past ``n_sel`` is not read.
     """
     reason = qsa_sparse_gqa_supported(q, k_cache, v_cache, indices, page_table)
     if reason is not None:
@@ -800,7 +814,14 @@ def qsa_sparse_gqa(
     arch = _qsa_arch()
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
-    if not rows or not indices.shape[1]:
+    width = int(indices.shape[1])
+    if n_sel is None:
+        n_sel = width
+    elif isinstance(n_sel, bool) or not isinstance(n_sel, int):
+        raise TypeError(f"n_sel must be a host int, got {type(n_sel).__name__}")
+    elif n_sel < 0 or n_sel > width:
+        raise ValueError(f"n_sel must be in 0..{width}, got {n_sel}")
+    if not rows or n_sel == 0:
         return out.zero_()
     # Nothing to gather. Clamping the index to 0 would still load, including
     # a table that has columns but no request row for safe_req.
@@ -818,8 +839,22 @@ def qsa_sparse_gqa(
     kv_strides = tuple(int(s) for s in k_cache.stride()[:3]) if wide_cache else None
     page_size = k_cache.shape[1]
     use_k32 = arch == "gfx950"
-    n_sel = int(indices.shape[1])
-    block_n, block_threads, n_splits = _launch_config(rows, n_sel, n_kv_heads, head_dim)
+    # gfx950 keeps the fitted 128-split tiny band. On gfx942, 129 BN16
+    # tiles at 64 splits leave one workgroup with 3 tiles, and that group
+    # sets M=1. 65 splits caps every group at 2. The merge widens to 256
+    # threads at that point; 128 splits widened it further and lost.
+    tiny_splits = _TINY_SPLITS if use_k32 else 65
+    block_n, block_threads, n_splits = _launch_config(
+        rows, n_sel, n_kv_heads, head_dim, tiny_splits
+    )
+    # gfx950 stays on the fitted 128-thread schedule. gfx942 BN16 with one
+    # workgroup per CU has two idle SIMDs at 128 threads; 256 threads fills
+    # them, and the register QK split keeps that from redoing every K step.
+    if arch == "gfx942" and _gfx942_reg_qk(head_dim, block_n):
+        from aiter.jit.utils.chip_info import get_cu_num
+
+        if int(rows) * n_kv_heads * n_splits <= get_cu_num():
+            block_threads = 256
     if n_splits == 1:
         # The split kernel stores straight into out. A caller workspace
         # is not a second buffer on this path.
