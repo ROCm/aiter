@@ -17,8 +17,12 @@ aiter/install_mode
 *.gch
 *.pch
 
-# Local Claude Code settings (per-user, not for VCS)
-.claude/
+# Local Claude Code settings (per-user, not for VCS). Scoped to everything BUT the skills:
+# `.claude/` ignored wholesale also silences `git add` for NEW files under
+# .claude/skills/, which are version-controlled -- a file could be written, committed and
+# pushed without ever entering the repository, in silence.
+.claude/*
+!.claude/skills/
 
 # Compiled Dynamic libraries
 *.so

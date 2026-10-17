@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import functools
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
@@ -33,7 +34,6 @@ from .common import (
     rsrc,
     spin0,
     spin_lds_ge,
-    traced,
     uni,
     wait_lgkm0,
     wait_vm,
@@ -98,14 +98,14 @@ def build_schedule(kc: KernelCtx) -> dict:
     rch, report_chunk, spin_sys_ge = kc.get("rch report_chunk spin_sys_ge")
     unit_fields, zero_masked = kc.get("unit_fields zero_masked")
 
-    @traced
+    @flyc.jit
     def gemm2_dispatch(L, tid, a, expert, ks0, icnt, r0, rows, signal):
         for q in DYN_PS:
             if icnt == i32(I // q):
                 n = KS2 // q
                 gemm2(L, tid, a, expert, ks0, r0, rows, signal, n, ks0 // i32(n))
 
-    @traced
+    @flyc.jit
     def _drop_stale(tid, a):
         if tid < i32(64):
             fx.memory_fence(syncscope="agent", ordering=ACQ)  # drop stale L1 lines
@@ -115,7 +115,7 @@ def build_schedule(kc: KernelCtx) -> dict:
             if tid == i32(0):
                 g_st_sys(ctrl_at(a, i32(CTRL_XF) + bid), a["epoch"])
 
-    @traced
+    @flyc.jit
     def _stale_dropped(tid, a):
         if (tid == i32(0)) & (a["epoch"] == i32(1)):
             x = i32(gpu.block_id("x")) % i32(N_XCD)
@@ -125,7 +125,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         gemm1(L, tid, a, expert, i0, icnt // i32(128))
         gemm2_dispatch(L, tid, a, expert, i0 // i32(128), icnt, r0, rows, sig)
 
-    @traced
+    @flyc.jit
     def compute_units(L, tid, a):
         lane = tid % i32(64)
         w = tid // i32(64)
@@ -185,7 +185,7 @@ def build_schedule(kc: KernelCtx) -> dict:
             if tid == i32(0):
                 lds_st_rel(L, L_CTL + C_CDONE * 4, i32(1))
 
-    @traced
+    @flyc.jit
     def dyn_plan(L, tid, a):
         n = a["ttot"] * i32(TOPK)
         rid = rsrc(a["ids"], n * i32(16 if MLL else 4))
@@ -208,7 +208,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         _dyn_units(L, tid)
         cbar(L, tid)
 
-    @traced
+    @flyc.jit
     def _dyn_prefix(L, tid):
         if tid == i32(0):
             acc = i32(0)
@@ -217,7 +217,7 @@ def build_schedule(kc: KernelCtx) -> dict:
                 acc = acc + _ctpop(lds_ld_i32(L, L_DYN + i32(w * 4)))
             lds_st(L, L_CTL + C_NACT * 4, acc)
 
-    @traced
+    @flyc.jit
     def _dyn_list(L, e):
         if e < i32(E):
             wv = lds_ld_i32(L, L_DYN + (e >> i32(5)) * i32(4))
@@ -244,7 +244,7 @@ def build_schedule(kc: KernelCtx) -> dict:
             (bid % i32(N_XCD)) * (C // i32(N_XCD)) + bid // i32(N_XCD), bid
         )
 
-    @traced
+    @flyc.jit
     def _dyn_units(L, tid):
         if tid == i32(0):
             nun = lds_ld_i32(L, L_CTL + C_NCH * 4)
@@ -281,20 +281,20 @@ def build_schedule(kc: KernelCtx) -> dict:
         nblk = i32(gpu.grid_dim.x)
         spin_sys_ge(lb_lbr(a, bank, x), ceildiv(nblk - x, i32(N_XCD)), a)
 
-    @traced
+    @flyc.jit
     def lb_none(L, tid, a, nun):
         if (nun == i32(0)) & (tid == i32(0)) & (i32(gpu.block_id("x")) == i32(0)):
             lb_lists_wait(a, lb_bank(L))
             for c in range_constexpr(NCK):
                 g_st_sys(lrdy_at(a, i32(c)), a["epoch"])
 
-    @traced
+    @flyc.jit
     def lb_col_done(L, a, cc, nun, bank):
         if g_add_agent(lb_colc(a, cc, bank), 1) == nun - i32(1):
             for q_ in range(cg_lo(cc), cg_lo(cc + i32(1)), i32(1)):
                 g_st_sys(lrdy_at(a, i32(q_)), a["epoch"])
 
-    @traced
+    @flyc.jit
     def lb_lists_wait(a, bank):
         for x in range_constexpr(N_XCD):
             lb_lbr_wait(a, bank, i32(x))
@@ -306,7 +306,7 @@ def build_schedule(kc: KernelCtx) -> dict:
     def lb_bank(L):
         return lds_ld_i32(L, L_CTL + C_LBB * 4)
 
-    @traced
+    @flyc.jit
     def lb_plan(L, tid, a):
         n = a["ttot"] * i32(TOPK)
         nblk = i32(gpu.grid_dim.x)
@@ -361,7 +361,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         _lb_units(L, tid)
         cbar(L, tid)
 
-    @traced
+    @flyc.jit
     def _lb_bitmap(L, tid):
         lane = tid % i32(64)
         w = tid // i32(64)
@@ -380,7 +380,7 @@ def build_schedule(kc: KernelCtx) -> dict:
                         i32((b >> fx.Int64(32 * h)) & fx.Int64(0xFFFFFFFF)),
                     )
 
-    @traced
+    @flyc.jit
     def lb_zero_next(tid, a, bank):
         nb = bank ^ i32(1)
         bid = i32(gpu.block_id("x"))
@@ -402,7 +402,7 @@ def build_schedule(kc: KernelCtx) -> dict:
             tot = tot + (cnt << i32(b))
         return pre, tot
 
-    @traced
+    @flyc.jit
     def _chunk_table(L, tid, offs=False):
         nact = lds_ld_i32(L, L_CTL + C_NACT * 4)
         w = tid // i32(64)
@@ -451,7 +451,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         if const_expr(offs):
             cbar(L, tid)
 
-    @traced
+    @flyc.jit
     def lb_scatter(L, tid, a, lo, hi):
         n = a["ttot"] * i32(TOPK)
         rid = rsrc(a["ids"], n * i32(4))
@@ -471,7 +471,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         if tid == i32(0):
             g_add_agent(lb_lbr(a, lb_bank(L), i32(gpu.block_id("x")) % i32(N_XCD)), 1)
 
-    @traced
+    @flyc.jit
     def _lb_units(L, tid):
         if tid == i32(0):
             nun = lds_ld_i32(L, L_CTL + C_NCH * 4)
@@ -527,7 +527,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         lds_st(L, ul + i32(8), icnt)
         lds_st(L, ul + i32(12), kind)
 
-    @traced
+    @flyc.jit
     def _lb_units_mix(L, r, C, nun, K, M, X):
         J2 = nun - K
         if r < M:
@@ -571,7 +571,7 @@ def build_schedule(kc: KernelCtx) -> dict:
             )
             lds_st(L, L_CTL + (C_UNIT + 1) * 4, nn + i32(1))
 
-    @traced
+    @flyc.jit
     def lb_routes(L, tid, a, ent):
         e = ent & i32(0xFFFF)
         r0 = ent.shrui(i32(24)) * i32(rch)
@@ -607,7 +607,7 @@ def build_schedule(kc: KernelCtx) -> dict:
     def lb_g2_cap(U2, nblk):
         return ceildiv(U2, nblk) * i32(4) + i32(4)
 
-    @traced
+    @flyc.jit
     def lb_g2_consume(L, tid, a):
         nun = lds_ld_i32(L, L_CTL + C_NCH * 4)
         nblk = i32(gpu.grid_dim.x)
@@ -618,7 +618,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         for it_ in range(i32(0), cap, i32(1)):
             _lb_g2_take(L, tid, a, nun, i32(it_))
 
-    @traced
+    @flyc.jit
     def spin_g2(L, target):
         cur = lds_ld_acq(L, L_CTL + C_G2RDY * 4)
         end = lds_ld_acq(L, L_CTL + C_G2END * 4)
@@ -627,7 +627,7 @@ def build_schedule(kc: KernelCtx) -> dict:
             cur = lds_ld_acq(L, L_CTL + C_G2RDY * 4)
             end = lds_ld_acq(L, L_CTL + C_G2END * 4)
 
-    @traced
+    @flyc.jit
     def _lb_g2_take(L, tid, a, nun, n):
         if tid == i32(0):
             spin_g2(L, n + i32(1))
@@ -660,12 +660,12 @@ def build_schedule(kc: KernelCtx) -> dict:
                 lds_st_rel(L, L_CTL + C_G2FREE * 4, n + i32(1))
                 lb_col_done(L, a, cc, nun, lb_bank(L))
 
-    @traced
+    @flyc.jit
     def _g2_last(L, tid, n):
         if tid == i32(0):
             lds_st_rel(L, L_CTL + C_G2LAST * 4, n + i32(1))
 
-    @traced
+    @flyc.jit
     def lb_g2_prefetch(L, lane, a):
         spin0(L, lane, L_CTL + C_G1FIN * 4, i32(1))
         nun = lds_ld_i32(L, L_CTL + C_NCH * 4)
@@ -680,7 +680,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         if lane == i32(0):
             lds_st_rel(L, L_CTL + C_G2END * 4, i32(1))
 
-    @traced
+    @flyc.jit
     def _lb_g2_fetch(L, lane, a, nun, U2, bank, n):
         if lds_ld_acq(L, L_CTL + C_G2END * 4) == i32(0):
             if (lane == i32(0)) & (n > i32(0)):
@@ -697,7 +697,7 @@ def build_schedule(kc: KernelCtx) -> dict:
             else:
                 _lb_g2_load(L, lane, a, nun, bank, n, v)
 
-    @traced
+    @flyc.jit
     def _lb_g2_load(L, lane, a, nun, bank, n, v):
         b = n % i32(2)
         if lane == i32(0):
@@ -772,7 +772,7 @@ def build_schedule(kc: KernelCtx) -> dict:
             lds_st_rel(L, L_CTL + C_G2RDY * 4, n + i32(1))
         rocdl.sched_barrier(0)
 
-    @traced
+    @flyc.jit
     def lb_g2_phase(L, tid, a):
         nun = lds_ld_i32(L, L_CTL + C_NCH * 4)
         U2 = nun * i32(NCG)
@@ -783,7 +783,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         for it_ in range(i32(0), cap, i32(1)):
             _lb_g2_unit(L, tid, a, nun, U2, i32(it_) < cap - i32(1))
 
-    @traced
+    @flyc.jit
     def _lb_g2_unit(L, tid, a, nun, U2, more):
         v = lds_ld_i32(L, L_CTL + C_CLAIM * 4)
         if v < U2:
@@ -792,7 +792,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         if more:
             col_claim(L, tid, a)
 
-    @traced
+    @flyc.jit
     def _lb_g2_run(L, tid, a, nun, cc, j):
         ent = lds_ld_i32(L, L_DCH + j * i32(4))
         bank = lb_bank(L)
@@ -818,7 +818,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         if tid == i32(0):
             lb_col_done(L, a, cc, nun, bank)
 
-    @traced
+    @flyc.jit
     def lb_import(L, tid, a, rows):
         ag_stage_free(L, tid % i32(64), a)
         cbar(L, tid)
@@ -849,7 +849,7 @@ def build_schedule(kc: KernelCtx) -> dict:
             lds_st(L, i32(L_INTERS) + row * i32(I // 32) + c * i32(4), fx.Int32(sv))
         cbar(L, tid)
 
-    @traced
+    @flyc.jit
     def lb_finish(tid, a, L):
         lb_zero_next(tid, a, lb_bank(L))
         if (tid == i32(0)) & (i32(gpu.block_id("x")) == i32(0)):
@@ -861,7 +861,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         rxs = rsrc(fx.Int64(a["xg"]) + fx.Int64(a["ttot"] * i32(TOPK * (I // 2))))
         return rx, rxs
 
-    @traced
+    @flyc.jit
     def xq_export(L, tid, a, i0, icnt, r0, rows):
         u16 = icnt // i32(32)
         rx, rxs = xg_rs(a)

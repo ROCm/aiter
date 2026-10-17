@@ -50,6 +50,11 @@ from aiter.ops.triton._triton_kernels.fusions.attn_res import (
     ATTN_RES_TRITON_AUTOTUNE,
     attnres_fwd_kernel,
 )
+from aiter.ops.triton.utils.config_utils import (
+    load_config_json,
+    resolve_config_dir,
+    select_leq_config,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import get_dtype_max
 
@@ -268,7 +273,26 @@ def _pick_attn_res_separate_bl(tokens: int, l2: int, close_block: bool) -> int:
     return max(1, min(bl, l2))
 
 
+def _get_attn_res_config(config_name: str, *args, **kwargs) -> dict | None:
+    config_dir = resolve_config_dir("fusions", config_name)
+    table = load_config_json(f"{config_dir}/DEFAULT.json", required=False)
+    return None if table is None else select_leq_config(table, *args, **kwargs)
+
+
+def _pick_attn_res_separate_num_warps(
+    tokens: int, block_rows: int, close_block: bool, num_warps: int
+) -> int:
+    family = "ATTN_RES_GATE_SEPARATE" + ("_CLOSE_BLOCK" if close_block else "")
+    config = _get_attn_res_config(family, axes=("B", "N"), B=block_rows, N=tokens)
+    if config is None or config["num_warps"] is None:
+        return num_warps
+    return config["num_warps"]
+
+
 def _pick_attn_res_seq_config(tokens: int) -> tuple[int, int]:
+    config = _get_attn_res_config("ATTN_RES_SEQUENCE", tokens)
+    if config is not None:
+        return config["num_warps"], config["num_stages"]
     for max_tokens, num_warps, num_stages in _ATTN_RES_SEQ_CONFIGS:
         if tokens <= max_tokens:
             return num_warps, num_stages
@@ -786,6 +810,7 @@ def attn_res_gate(
     separate = N > _ATTN_RES_PREFILL_T
     if separate:
         bl = _pick_attn_res_separate_bl(N, _next_pow2(max(L - 1, 1)), close_block)
+        num_warps = _pick_attn_res_separate_num_warps(N, B, close_block, num_warps)
 
     res_stride_n, res_stride_l, _ = br.stride()
     bo_stride_n, bo_stride_l, _ = bo.stride()
