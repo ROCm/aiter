@@ -202,13 +202,18 @@ def run_torch_mrope_3d_rms_set_kv_shuffle(
     page_size: int = 0,  # Page size (block_size) for shuffle layout
     rotary_dim: int = 0,  # Partial rotary dim (0 = full rotary = head_size)
     gemma_norm: bool = False,
+    q_head_stride: int = 0,  # Q head stride in qkv (0 = dense = head_size)
 ):
     rotary_dim_ = rotary_dim if rotary_dim > 0 else head_size
-    q_size = num_heads_q * head_size
+    q_head_stride_ = q_head_stride if q_head_stride > 0 else head_size
+    q_size = num_heads_q * q_head_stride_
     k_size = num_heads_k * head_size
     v_size = num_heads_v * head_size
     qkv = qkv.view(num_tokens, q_size + k_size + v_size)
     q, k, v = qkv.split([q_size, k_size, v_size], dim=-1)
+    # Strided Q (e.g. Qwen3.5 [q | gate] per head): keep only the first head_size.
+    q = q.view(num_tokens, num_heads_q, q_head_stride_)[..., :head_size]
+    q = q.reshape(num_tokens, num_heads_q * head_size)
 
     q_by_head = q.view(num_tokens, num_heads_q, head_size)
     norm_fn = gemma_rms_norm_forward if gemma_norm else rms_norm_forward
@@ -347,6 +352,7 @@ def run_fused_mrope_3d_rms_set_kv_shuffle(
     page_size: int = 0,  # Page size (block_size) for shuffle layout
     rotary_dim: int = 0,  # Partial rotary dim (0 = full rotary = head_size)
     gemma_norm: bool = False,
+    q_head_stride: int = 0,  # Q head stride in qkv (0 = dense = head_size)
 ):
     # qkv = qkv.clone()  # inplace op
     # Calculate x for shuffle layout: x = 16 // k_cache.element_size()
@@ -385,8 +391,10 @@ def run_fused_mrope_3d_rms_set_kv_shuffle(
             x,
             rotary_dim,
             gemma_norm,
+            q_head_stride,
         )
     else:
+        assert q_head_stride == 0, "q_head_stride is only supported by the mrope op"
         aiter.fused_qk_norm_rope_cache_pts_quant_shuffle(
             qkv,
             qw,
@@ -437,11 +445,16 @@ def test_mrope_3d_rms_set_kv_shuffle(
     max_positions=10000,
     rotary_dim=0,  # Partial rotary dim (0 = full rotary = head_size)
     gemma_norm: bool = False,
+    q_head_stride: int = 0,  # Q head stride in qkv (0 = dense = head_size)
 ):
     rotary_dim_ = rotary_dim if rotary_dim > 0 else head_size
     cos_sin_dim = rotary_dim_
+    q_head_stride_ = q_head_stride if q_head_stride > 0 else head_size
     qkv = torch.randn(
-        (num_tokens, num_heads_q + num_heads_k + num_heads_v, head_size),
+        (
+            num_tokens,
+            num_heads_q * q_head_stride_ + (num_heads_k + num_heads_v) * head_size,
+        ),
         dtype=dtype,
         device="cuda",
     )
@@ -579,6 +592,7 @@ def test_mrope_3d_rms_set_kv_shuffle(
         page_size,
         rotary_dim,
         gemma_norm,
+        q_head_stride,
     )
     _, avg_cu = run_fused_mrope_3d_rms_set_kv_shuffle(
         qkv,
@@ -610,6 +624,7 @@ def test_mrope_3d_rms_set_kv_shuffle(
         page_size,
         rotary_dim,
         gemma_norm,
+        q_head_stride,
     )
 
     if use_strided_layout:
@@ -646,6 +661,7 @@ def test_mrope_3d_rms_set_kv_shuffle(
             0,
             rotary_dim,
             gemma_norm,
+            q_head_stride,
         )
         torch.testing.assert_close(
             k_cache.reshape(-1, num_heads_k, head_size)[kv_loc].float(),
@@ -671,6 +687,10 @@ def test_mrope_3d_rms_set_kv_shuffle(
         info += f", use_strided_layout:{use_strided_layout}, page_size:{page_size}"
     if rotary_dim > 0:
         info += f", rotary_dim:{rotary_dim}"
+    if gemma_norm:
+        info += ", gemma_norm:True"
+    if q_head_stride > 0:
+        info += f", q_head_stride:{q_head_stride}"
     msg = f"[perf] === {info} === torch avg: {avg_torch:<8.2f} us, cu avg: {avg_cu:<8.2f} us, uplift: {avg_torch/avg_cu-1:<5.1%}"
 
     checkAllclose(q_out_ref, q_out, msg="q_out", rtol=1e-2, atol=0.05)
@@ -1025,4 +1045,35 @@ if __name__ == "__main__":
                                 max_positions=args.max_positions,
                                 rotary_dim=rotary_dim,
                                 gemma_norm=True,
+                            )
+
+    # Strided Q ([q | gate] heads, stride 2 * head_size); Qwen3.8-27B layer geometry.
+    print("\n=== Strided Q (q_head_stride=2*head_size) MRoPE Tests ===", flush=True)
+    for kv_cache_dtype in args.kv_cache_dtypes:
+        for use_shuffle_layout in use_shuffle_layouts:
+            page_size_list = page_sizes if use_shuffle_layout else [0]
+            for page_size in page_size_list:
+                for num_token in args.token:
+                    for num_head_q, num_head_kv in [(24, 4), (16, 2)]:
+                        for gemma_norm in [True, False]:
+                            test_mrope_3d_rms_set_kv_shuffle(
+                                args.dtype,
+                                num_token,
+                                num_head_q,
+                                num_head_kv,
+                                num_head_kv,
+                                256,
+                                True,  # is_neox_style
+                                [11, 11, 10],
+                                True,  # is_interleaved
+                                eps=1e-6,
+                                is_mrope=True,
+                                kv_cache_dtype=kv_cache_dtype,
+                                test_return_kv=True,
+                                use_shuffle_layout=use_shuffle_layout,
+                                page_size=page_size,
+                                max_positions=args.max_positions,
+                                rotary_dim=64,
+                                gemma_norm=gemma_norm,
+                                q_head_stride=512,
                             )

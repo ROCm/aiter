@@ -2048,7 +2048,8 @@ namespace py = pybind11;
           py::arg("block_size"),                            \
           py::arg("x"),                                     \
           py::arg("rotary_dim") = 0,                        \
-          py::arg("gemma_norm") = false)
+          py::arg("gemma_norm") = false,                    \
+          py::arg("q_head_stride") = 0)
 
 #define FUSED_QKNORM_IDXRQKNORM_PYBIND                 \
     m.def("fused_qknorm_idxrqknorm",                   \

@@ -37,7 +37,8 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                                                     int64_t block_size,
                                                     int64_t x,
                                                     int64_t rotary_dim,
-                                                    bool gemma_norm)
+                                                    bool gemma_norm,
+                                                    int64_t q_head_stride)
 {
     AITER_CHECK(mrope_section_.size() == 3);
     AITER_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() &&
@@ -119,7 +120,8 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                     k_token_stride_,
                     k_head_stride_,
                     v_token_stride_,
-                    v_head_stride_);
+                    v_head_stride_,
+                    q_head_stride);
             }
             else
             {
@@ -171,7 +173,8 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                             k_token_stride_,
                             k_head_stride_,
                             v_token_stride_,
-                            v_head_stride_);
+                            v_head_stride_,
+                            q_head_stride);
                     }
                     else
                     {
@@ -221,7 +224,8 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                             k_token_stride_,
                             k_head_stride_,
                             v_token_stride_,
-                            v_head_stride_);
+                            v_head_stride_,
+                            q_head_stride);
                     }
                 }
                 else
