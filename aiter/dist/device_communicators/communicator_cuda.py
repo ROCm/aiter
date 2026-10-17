@@ -15,7 +15,7 @@ from aiter.utility.dtypes import fp8
 from .base_device_communicator import All2AllManagerBase, DeviceCommunicatorBase
 
 should_nccl_symm_mem_allreduce = False
-_SUPPORTED_ALL2ALL_MANAGER_BACKENDS = ("flydsl", "mori")
+_SUPPORTED_ALL2ALL_MANAGER_BACKENDS = ("flydsl", "mori", "mori_v2")
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -141,6 +141,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             from .all2all import MoriAll2AllManager
 
             return MoriAll2AllManager(self.cpu_group)
+        if backend == "mori_v2":
+            from .all2all import MoriV2All2AllManager
+
+            return MoriV2All2AllManager(self.cpu_group)
         if backend == "flydsl":
             from .all2all import FlyDSLAll2AllManager
 

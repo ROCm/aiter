@@ -1,6 +1,9 @@
 import importlib.util
 import os
+import threading
 from functools import cache
+from typing import Any
+from weakref import WeakSet
 
 import torch
 
@@ -154,6 +157,174 @@ class MoriAll2AllManager(All2AllManagerBase):
         return self.handle_cache.get_or_create(
             mori_kwargs, self._make_handle, index=index
         )
+
+
+class MoriV2All2AllManager(All2AllManagerBase):
+    """MORI v2 EP backend backed by a manager-owned CCO communicator.
+
+    The communicator is created lazily because its symmetric VMM reservation is
+    model/transport dependent.  MORI's regular v2 dispatch/combine op is cached
+    through :meth:`get_handle`; higher-level users such as ``MegaMoEGfx1250``
+    may borrow the same communicator through
+    :meth:`get_or_create_cco_communicator`, but remain responsible for
+    constructing and caching their own compute object.
+    """
+
+    def __init__(self, cpu_group):
+        if not has_mori():
+            raise ImportError(
+                "MoRI kernels not found. Please follow "
+                "https://github.com/ROCm/mori/blob/main/README.md to install "
+                "MoRI kernels."
+            )
+
+        super().__init__(cpu_group)
+        self.handle_cache = Cache()
+        self._live_handles: WeakSet = WeakSet()
+        self._cco_communicator: Any | None = None
+        self._cco_per_rank_vmm = 0
+        self._cco_lock = threading.RLock()
+
+    def _create_cco_communicator(self, per_rank_vmm: int):
+        from mori.cco import Communicator
+
+        uid = Communicator.get_unique_id() if self.rank == 0 else None
+        objects = [uid]
+        root_global_rank = torch.distributed.get_global_rank(self.cpu_group, 0)
+        torch.distributed.broadcast_object_list(
+            objects,
+            src=root_global_rank,
+            group=self.cpu_group,
+        )
+
+        comm = Communicator.init(
+            self.world_size,
+            self.rank,
+            objects[0],
+            per_rank_vmm=per_rank_vmm,
+        )
+        try:
+            comm.barrier()
+        except Exception:
+            # Do not publish a communicator that failed its collective setup.
+            try:
+                comm.destroy()
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Failed to destroy a MORI v2 CCO communicator after "
+                    "collective initialization failed"
+                )
+            raise
+        return comm
+
+    def get_or_create_cco_communicator(self, per_rank_vmm: int):
+        """Return the manager-owned CCO communicator with at least this capacity.
+
+        CCO reserves its symmetric virtual address range at communicator
+        creation, so an existing communicator cannot be grown in place.  Callers
+        must request their maximum requirement before constructing any object
+        that retains the communicator.
+        """
+        if not isinstance(per_rank_vmm, int) or isinstance(per_rank_vmm, bool):
+            raise TypeError(
+                f"per_rank_vmm must be an integer, got {type(per_rank_vmm).__name__}"
+            )
+        if per_rank_vmm <= 0:
+            raise ValueError(f"per_rank_vmm must be > 0, got {per_rank_vmm}")
+
+        with self._cco_lock:
+            comm = self._cco_communicator
+            if comm is not None:
+                if per_rank_vmm > self._cco_per_rank_vmm:
+                    raise RuntimeError(
+                        "MORI v2 CCO communicator is already initialized with "
+                        f"per_rank_vmm={self._cco_per_rank_vmm}, which cannot "
+                        f"satisfy the requested {per_rank_vmm}; request the "
+                        "maximum capacity before creating any v2 handles"
+                    )
+                return comm
+
+            # Publish only after communicator creation and its barrier succeed.
+            comm = self._create_cco_communicator(per_rank_vmm)
+            self._cco_communicator = comm
+            self._cco_per_rank_vmm = per_rank_vmm
+            if self.rank == 0:
+                logger.info(
+                    "MORI v2 CCO communicator ready: world_size=%d "
+                    "per_rank_vmm=%.2f GiB",
+                    self.world_size,
+                    per_rank_vmm / (1 << 30),
+                )
+            return comm
+
+    def _make_handle(self, comm, **kwargs):
+        from mori.ops.dispatch_combine_v2 import (
+            EpDispatchCombineConfig,
+            EpDispatchCombineOp,
+        )
+
+        config = EpDispatchCombineConfig(**kwargs)
+        return EpDispatchCombineOp(config, comm)
+
+    def get_handle(self, kwargs, index: int = 0):
+        """Return a cached MORI v2 dispatch/combine op.
+
+        ``per_rank_vmm`` is a manager resource requirement and is deliberately
+        removed before constructing ``EpDispatchCombineConfig``.  Rank and world
+        size come from the process group; callers may provide matching values for
+        compatibility, but a mismatch is rejected before creating collective
+        resources.
+        """
+        op_kwargs = dict(kwargs)
+        try:
+            per_rank_vmm = op_kwargs.pop("per_rank_vmm")
+        except KeyError as exc:
+            raise ValueError(
+                "MORI v2 all2all arguments must include per_rank_vmm"
+            ) from exc
+
+        for name, expected in (("rank", self.rank), ("world_size", self.world_size)):
+            supplied = op_kwargs.pop(name, expected)
+            if supplied != expected:
+                raise ValueError(
+                    f"{name}={supplied} does not match the EP group value {expected}"
+                )
+            op_kwargs[name] = expected
+
+        comm = self.get_or_create_cco_communicator(per_rank_vmm)
+
+        def create_handle(**config_kwargs):
+            return self._make_handle(comm, **config_kwargs)
+
+        handle = self.handle_cache.get_or_create(
+            op_kwargs,
+            create_handle,
+            index=index,
+        )
+        self._live_handles.add(handle)
+        return handle
+
+    def destroy(self):
+        """Close live v2 ops before releasing their shared CCO communicator."""
+        with self._cco_lock:
+            for handle in list(self._live_handles):
+                close = getattr(handle, "close", None)
+                if close is None:
+                    continue
+                try:
+                    close()
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed to close a MORI v2 all2all handle")
+            self._live_handles.clear()
+            self.handle_cache = Cache()
+
+            if self._cco_communicator is not None:
+                comm = self._cco_communicator
+                try:
+                    comm.destroy()
+                finally:
+                    self._cco_communicator = None
+                    self._cco_per_rank_vmm = 0
 
 
 class FlyDSLAll2AllManager(All2AllManagerBase):
