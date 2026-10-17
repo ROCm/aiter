@@ -54,6 +54,7 @@ class PaDecodeSchedule:
         num_partitions: int = 1,
         softmax_scale: float | None = None,
         query_dtype: str = "f16",
+        output_dtype: str | None = None,
         kv_dtype: str = "fp8",
         per_token_kv: bool = False,
         query_length: int = 1,
@@ -85,6 +86,14 @@ class PaDecodeSchedule:
                 raise ValueError("BF16 KV does not use quantization scales")
             if not trans_v:
                 raise ValueError("BF16 KV requires a vectorized-5D value cache")
+        if output_dtype is None:
+            output_dtype = query_dtype
+        if query_dtype not in ("f16", "bf16", "fp8"):
+            raise ValueError(f"Unsupported query dtype {query_dtype!r}")
+        if output_dtype not in ("f16", "bf16"):
+            raise ValueError("FP8 queries require BF16/FP16 output_dtype")
+        if query_dtype != "fp8" and output_dtype != query_dtype:
+            raise ValueError("output_dtype must match non-FP8 query dtype")
         IS_BF16 = query_dtype == "bf16"
         TUNED_SHAPE = (
             not is_bf16_kv and is_gfx950 and head_dim == 128 and block_size in (16, 128)
@@ -246,6 +255,7 @@ class PaDecodeSchedule:
             batch_first_plan_grid,
             sliding_window,
             kv_dtype,
+            output_dtype,
         )
         return cls(
             cache_key=cache_key,
@@ -283,6 +293,8 @@ class PaDecodeTraits:
     # Element formats and instruction policy.
     FP8: type
     FP8_MAX: float
+    FP8_QUERY: bool
+    Q_INPUT_DTYPE: type
     Q_DTYPE: type
     is_bf16_kv: bool
     KV_DTYPE: type
@@ -378,6 +390,7 @@ class PaDecodeTraits:
             batch_first_plan_grid,
             sliding_window,
             kv_dtype,
+            output_dtype,
         ) = cache_key
         is_gfx950 = schedule.is_gfx950
         is_bf16_kv = kv_dtype == "bf16"
@@ -414,8 +427,11 @@ class PaDecodeTraits:
         assert query_dtype in (
             "f16",
             "bf16",
-        ), f"pa_decode_tile only supports query_dtype in ('f16', 'bf16'), got {query_dtype}"
-        Q_DTYPE = fx.BFloat16 if IS_BF16 else fx.Float16
+            "fp8",
+        ), f"pa_decode_tile only supports query_dtype in ('f16', 'bf16', 'fp8'), got {query_dtype}"
+        FP8_QUERY = query_dtype == "fp8"
+        Q_DTYPE = fx.BFloat16 if output_dtype == "bf16" else fx.Float16
+        Q_INPUT_DTYPE = FP8 if FP8_QUERY else Q_DTYPE
         KV_DTYPE = fx.BFloat16 if is_bf16_kv else FP8
         KV_VECTOR_WIDTH = 8 if is_bf16_kv else 16
         QP_ELEM_BYTES = 2 if is_bf16_kv else 1
@@ -532,7 +548,7 @@ class PaDecodeTraits:
         SP_ROW_BYTES = TILE_TOK * QP_ELEM_BYTES + 16
         sP_bytes = P_BUFFERS * MFMA_MNK * SP_ROW_BYTES
         sQscale_off = max(sQ_bytes, sP_bytes)
-        sQscale_bytes = 0 if is_bf16_kv else ROWS_PADDED * f32
+        sQscale_bytes = 0 if is_bf16_kv or FP8_QUERY else ROWS_PADDED * f32
         # Tuned rows need 16-byte vector alignment; other paths use bank padding.
         NWARP_PAD = NWARP if TUNE_PAGE128 or PER_TOKEN_M1 or MTP4_FUSED else NWARP + 1
         # Phase-split slices sLmax per M-tile so all pass-1 writes share one barrier.
@@ -573,6 +589,8 @@ class PaDecodeTraits:
             FP8=FP8,
             FP8_MAX=FP8_MAX,
             Q_DTYPE=Q_DTYPE,
+            Q_INPUT_DTYPE=Q_INPUT_DTYPE,
+            FP8_QUERY=FP8_QUERY,
             is_bf16_kv=is_bf16_kv,
             KV_DTYPE=KV_DTYPE,
             KV_VECTOR_WIDTH=KV_VECTOR_WIDTH,

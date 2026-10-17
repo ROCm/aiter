@@ -1,18 +1,809 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tests for the FlyDSL flash-attention kernels: gfx1201 bf16/f16 and gfx950 fp8."""
+"""FlyDSL flash attention: gfx1201 bf16/f16 and gfx950 fp8 correctness and timing sweeps.
 
-from __future__ import annotations
+Timings use warm, fixed buffers; TB/s is logical traffic, not measured HBM bandwidth.
+The fp8 reference dequantizes the same e4m3fn tensors the kernel reads, so the error
+measured is the kernel's, not the quantizer's.
+"""
 
+import argparse
+import itertools
+import os
+import sys
 from contextlib import nullcontext
+from functools import partial
 from itertools import pairwise
 
+import pandas as pd
 import pytest
 import torch
 import torch.nn.functional as F
 
+# Plain-script CI invocation must select this checkout, not another editable install.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import aiter
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.flydsl import flydsl_flash_attn_func
+from aiter.ops.quant import per_tensor_quant
+from aiter.test_common import benchmark, checkAllclose, run_perftest
+
+FP8_DTYPE = torch.float8_e4m3fn
+FP8_REL_ERR = {dtypes.bf16: 8e-2, dtypes.fp16: 7.6e-2}
+FP8_MIN_COS = 0.98
+FP8_LSE_REL_ERR = 1e-4
+FP8_UNIFORM_RANGE = (-1.0, 1.0)
+FP8_SEED = 123
+
+
+def visible_pairs(q, k, causal):
+    # Bottom-right-aligned causal: query i sees k - q + i + 1 keys.
+    if not causal:
+        return q * k
+    return q * k - q * (q - 1) // 2 if k >= q else k * (k + 1) // 2
+
+
+# ---------------------------------------------------------------- gfx1201 bf16/f16
+
+
+def _ref_sdpa_bshd(q, k, v, causal=False):
+    """SDPA reference with BSHD inputs/outputs."""
+    out_bhsd = F.scaled_dot_product_attention(
+        q.transpose(1, 2).contiguous(),
+        k.transpose(1, 2).contiguous(),
+        v.transpose(1, 2).contiguous(),
+        is_causal=causal,
+    )
+    return out_bhsd.transpose(1, 2).contiguous()
+
+
+# (dtype, causal, batch, seq_len, num_heads, head_dim)
+RDNA_CASES = [
+    # Aligned production-like Wan2.1 1.3B shape, padded to a multiple of 128.
+    (dtypes.bf16, False, 1, 32768, 12, 128),
+    (dtypes.bf16, False, 2, 1024, 8, 128),
+    # Unaligned shape exercises the auto-padding path: 32760 -> 32768.
+    (dtypes.bf16, False, 1, 32760, 12, 128),
+    (dtypes.fp16, False, 1, 32768, 12, 128),
+    (dtypes.bf16, True, 2, 4096, 8, 128),
+]
+
+
+@benchmark()
+def test_fmha_rdna(dtype, causal, batch, seq_len, num_heads, head_dim):
+    from aiter.ops.flydsl import flydsl_flash_attn_func
+
+    g = torch.Generator(device="cuda").manual_seed(0)
+    shape = (batch, seq_len, num_heads, head_dim)
+    q, k, v = (
+        torch.randn(shape, generator=g, dtype=dtype, device="cuda") for _ in range(3)
+    )
+    want = _ref_sdpa_bshd(q, k, v, causal)
+    candidates = {"flydsl": lambda: flydsl_flash_attn_func(q, k, v, causal=causal)}
+
+    flops = 4 * batch * num_heads * head_dim * visible_pairs(seq_len, seq_len, causal)
+    nbytes = 4 * q.numel() * q.element_size()
+    ret = {"gfx": get_gfx_runtime()}
+    for name, fn in candidates.items():
+        got = fn()
+        assert got.shape == want.shape and got.dtype == dtype
+        # bf16 attention is noisy; cosine is the correctness signal, not elementwise.
+        cos = F.cosine_similarity(
+            got.float().reshape(-1, head_dim),
+            want.float().reshape(-1, head_dim),
+            dim=1,
+        )
+        assert cos.min().item() > 0.99, f"{name}: min_cos={cos.min().item():.6f}"
+        assert cos.mean().item() > 0.999, f"{name}: mean_cos={cos.mean().item():.6f}"
+        if seq_len % 128:
+            # Padded zero keys must not move the output: the production-shape gate.
+            assert cos.min().item() > 0.9999, f"{name}: min_cos={cos.min().item():.6f}"
+        _, us = run_perftest(fn, num_rotate_args=1)
+        assert us > 0, f"{name}: empty timing"
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = 1 - cos.min().item()
+    return ret
+
+
+# ---------------------------------------------------------------- gfx950 fp8
+
+
+def _fp8_quant(x):
+    """Per-tensor e4m3fn quantization: descale = amax / fp8_max, floored at 1e-12."""
+    fp8_max = torch.finfo(FP8_DTYPE).max
+    descale = (x.abs().amax().float() / fp8_max).clamp(min=1e-12)
+    y, scale = per_tensor_quant(x, scale=descale, quant_dtype=FP8_DTYPE)
+    return y.contiguous(), scale.contiguous()
+
+
+def _fp8_dequant(x, descale):
+    return x.to(torch.float32) * descale.to(torch.float32)
+
+
+def _fp8_rel_err(got, ref, floor=0.0):
+    scale = max(ref.abs().max().item(), floor)
+    err = (got - ref).abs().max().item()
+    return (err / scale if scale > 0 else err), err, scale
+
+
+def _ref_attention(q, k, v, causal, softmax_scale=None):
+    """fp32 SDPA over BSHD/THD-with-batch inputs, GQA-aware, bottom-right causal.
+
+    ``F.scaled_dot_product_attention(is_causal=True)`` aligns the mask top-left,
+    which differs from this kernel (and from aiter's documented convention) as
+    soon as Sq != Skv, so the mask is built explicitly from ``delta``.
+    """
+    q_t, k_t, v_t = (t.transpose(1, 2).float() for t in (q, k, v))
+    nh_q, nh_kv = q_t.shape[1], k_t.shape[1]
+    if nh_q != nh_kv:
+        rep = nh_q // nh_kv
+        k_t = k_t.repeat_interleave(rep, dim=1)
+        v_t = v_t.repeat_interleave(rep, dim=1)
+    Sq, D = q_t.shape[2], q_t.shape[3]
+    Skv = k_t.shape[2]
+    scale = D**-0.5 if softmax_scale is None else softmax_scale
+    scores = torch.matmul(q_t, k_t.transpose(-1, -2)) * scale
+    if causal:
+        delta = Skv - Sq
+        q_idx = torch.arange(Sq, device=q.device).view(-1, 1)
+        k_idx = torch.arange(Skv, device=q.device).view(1, -1)
+        scores = scores.masked_fill(k_idx > q_idx + delta, float("-inf"))
+    probs = torch.softmax(scores, dim=-1)
+    # A fully-masked row softmaxes to NaN; the kernel writes zeros there.
+    probs = torch.nan_to_num(probs, nan=0.0)
+    return torch.matmul(probs, v_t).transpose(1, 2)
+
+
+def _ref_lse(q, k, causal, softmax_scale=None):
+    """fp64 log-sum-exp of the same logits ``_ref_attention`` softmaxes, as [B, H, Sq]."""
+    q_t, k_t = (t.transpose(1, 2).double() for t in (q, k))
+    nh_q, nh_kv = q_t.shape[1], k_t.shape[1]
+    if nh_q != nh_kv:
+        k_t = k_t.repeat_interleave(nh_q // nh_kv, dim=1)
+    Sq, D = q_t.shape[2], q_t.shape[3]
+    Skv = k_t.shape[2]
+    scale = D**-0.5 if softmax_scale is None else softmax_scale
+    scores = torch.matmul(q_t, k_t.transpose(-1, -2)) * scale
+    if causal:
+        delta = Skv - Sq
+        q_idx = torch.arange(Sq, device=q.device).view(-1, 1)
+        k_idx = torch.arange(Skv, device=q.device).view(1, -1)
+        scores = scores.masked_fill(k_idx > q_idx + delta, float("-inf"))
+    return torch.logsumexp(scores, dim=-1).float()
+
+
+def _assert_lse_matches(got, ref):
+    """Compare LSE against the fp64 reference, treating fully-masked rows exactly.
+
+    A row that sees no key at all (bottom-right causal with Skv < Sq, or a
+    zero-length varlen KV entry) has LSE = -inf, and ``-inf - -inf`` is NaN, so
+    those rows are asserted as an exact bit match instead of a tolerance.
+    """
+    dead = torch.isinf(ref) & (ref < 0)
+    assert not torch.isnan(got).any(), (
+        f"LSE has {int(torch.isnan(got).sum())} NaN entries "
+        f"({int((torch.isnan(got) & dead).sum())} of them on fully-masked rows)"
+    )
+    assert torch.equal(got[dead], ref[dead]), (
+        f"{int((got[dead] != float('-inf')).sum())} of {int(dead.sum())} "
+        "fully-masked rows are not -inf"
+    )
+    live = ~dead
+    if live.any():
+        rel, err, scale = _fp8_rel_err(got[live], ref[live], floor=1.0)
+        assert rel < FP8_LSE_REL_ERR, (
+            f"fp8 LSE gate: rel_err={rel:.3e} (< {FP8_LSE_REL_ERR}), "
+            f"abs_err={err:.3e}, |lse|max={scale:.3e}"
+        )
+
+
+def _case(**kw):
+    base = {
+        "causal": (False, True),
+        "varlen": False,
+        "B": 1,
+        "S": 1,
+        "Skv": None,
+        "vl_q": None,
+        "vl_kv": None,
+        "H": 12,
+        "HKV": None,
+        "D": 192,
+        "Dv": 128,
+        "splits": None,
+        "out_dtype": dtypes.bf16,
+        "dist": "uniform",
+        "k_scale": 1.0,
+        "scale": None,
+        "block_m": None,
+        "entry": "kernel",
+        "checks": (),
+    }
+    base.update(kw)
+    return base
+
+
+VL_Q = {1: [2614], 2: [1024, 1590], 3: [1024, 512, 1078], 4: [1024, 512, 256, 822]}
+VL_KV = {
+    1: [16384],
+    2: [8192, 8192],
+    3: [8192, 4096, 4096],
+    4: [8192, 4096, 2048, 2048],
+}
+SPLIT_MODES = {"dense": 1, "auto": None}
+FP8_CASES = {}
+
+
+def _add(name, **kw):
+    assert name not in FP8_CASES, name
+    FP8_CASES[name] = _case(**kw)
+
+
+# Explicit 256-row tiles and group-2 GQA cover branches missed by auto-tiling.
+for varlen in (False, True):
+    for dtype in (dtypes.bf16, dtypes.fp16):
+        _add(
+            f"gqa_group2_bm256_{'varlen' if varlen else 'dense'}_{dtype}",
+            S=385,
+            H=8,
+            HKV=4,
+            D=128,
+            splits=1,
+            block_m=256,
+            out_dtype=dtype,
+            varlen=varlen,
+            vl_q=[257, 129] if varlen else None,
+            vl_kv=[513, 257] if varlen else None,
+        )
+for S in (4096, 8192):
+    for H, HKV in ((16, 1), (32, 8), (12, 12)):
+        _add(f"gqa_dense_s{S}_h{H}_kv{HKV}", S=S, H=H, HKV=HKV, D=128)
+for H, HKV in ((16, 1), (32, 8)):
+    _add(
+        f"gqa_varlen_h{H}_kv{HKV}",
+        varlen=True,
+        vl_q=VL_Q[2],
+        vl_kv=VL_KV[2],
+        H=H,
+        HKV=HKV,
+        D=128,
+    )
+# fp16 output buffer: the same kernel with a non-default out dtype.
+_add("out_f16_dense", S=4096, H=16, HKV=1, D=128, splits=1, out_dtype=dtypes.fp16)
+_add(
+    "out_f16_varlen",
+    varlen=True,
+    vl_q=VL_Q[2],
+    vl_kv=VL_KV[2],
+    H=16,
+    HKV=1,
+    D=128,
+    splits=1,
+    out_dtype=dtypes.fp16,
+)
+for mode, sp in SPLIT_MODES.items():
+    for B, S in ((1, 4096), (2, 4096), (3, 4096), (4, 4096), (1, 8192)):
+        _add(f"d192_dense_b{B}_s{S}_{mode}", B=B, S=S, splits=sp)
+    for B in (1, 2, 3, 4):
+        _add(f"d192_varlen_b{B}_{mode}", varlen=True, vl_q=VL_Q[B], splits=sp)
+        _add(
+            f"d192_varlen_cross_b{B}_{mode}",
+            varlen=True,
+            vl_q=VL_Q[B],
+            vl_kv=VL_KV[B],
+            splits=sp,
+        )
+# The 128/128 pair isolates the split from the head-dim pair.
+for D in (128, 192):
+    for sp in (2, 4, 8, 16):
+        _add(f"split_kv_d{D}_n{sp}", S=8192, D=D, splits=sp)
+for B in (1, 2, 3, 4):
+    _add(f"split_kv_batched_b{B}", B=B, S=8192, splits=4)
+for sq, skv, sp in ((512, 16384, 8), (2614, 16384, 8), (1024, 32768, 16)):
+    _add(f"split_kv_cross_s{sq}_kv{skv}_n{sp}", S=sq, Skv=skv, splits=sp)
+# Short cached-prefix queries are eligible only without causal masking.
+for sq, skv, sp in (
+    (1, 257, 4),
+    (70, 16384, 2),
+    (70, 16384, 4),
+    (70, 16384, 16),
+    (70, 16384, None),
+    (127, 11008, 4),
+    (129, 257, 4),
+    (255, 513, 4),
+    (383, 11008, 4),
+):
+    _add(
+        f"split_kv_short_q_s{sq}_kv{skv}_n{sp}",
+        S=sq,
+        Skv=skv,
+        splits=sp,
+        causal=(False,),
+    )
+for S, sp in ((4096, 2), (8192, 4), (16384, 8), (32768, 16)):
+    _add(f"split_kv_long_s{S}_n{sp}", S=S, splits=sp)
+for Dv in (64, 96, 128, 160, 192):
+    _add(f"v_head_dim_{Dv}", S=512, H=4, D=128, Dv=Dv, causal=(False,))
+for S in (1, 385, 1000, 4097):
+    _add(f"ragged_s{S}", B=2, S=S, H=4, causal=(True,))
+# Every output row must be written (the output buffer is NaN-prefilled): the shapes
+# leave a tail in the split combine grid.
+for B, S, H in ((1, 4097, 1), (1, 4097, 3), (1, 2050, 7), (1, 8193, 1)):
+    _add(f"auto_split_tail_s{S}_h{H}", B=B, S=S, H=H, D=128, causal=(False,))
+# Varlen split-K must not mix batches inside a combine wave.
+for S, H, Dv in ((385, 1, 128), (385, 3, 128), (1155, 1, 128), (386, 1, 64)):
+    _add(
+        f"varlen_split_batch_s{S}_h{H}_dv{Dv}",
+        varlen=True,
+        vl_q=[S] * 8,
+        H=H,
+        Dv=Dv,
+        splits=2,
+        causal=(False,),
+    )
+# Softmax normalisation under peaked attention: k_scale widens the score range, which
+# is invisible on near-uniform attention. Lazy and eager rescale are both candidates.
+for S in (1024, 12288):
+    for ks in (1.0, 200.0):
+        _add(
+            f"peaked_s{S}_k{ks:g}",
+            B=2,
+            S=S,
+            H=8,
+            D=128,
+            dist="normal",
+            k_scale=ks,
+            causal=(False,),
+        )
+# Public wrappers must route fp8 to the gfx950 kernel.
+for sc in (None, 0.37):
+    _add(f"dispatch_batch_sc{sc}", B=2, S=1024, H=8, D=128, scale=sc, entry="batch")
+    _add(
+        f"dispatch_varlen_sc{sc}",
+        varlen=True,
+        vl_q=[400, 1648],
+        H=8,
+        D=128,
+        scale=sc,
+        entry="varlen",
+    )
+# The accuracy gate must track the kernel, not the magnitude of the inputs.
+for dist in ("uniform", "normal", "normal_x8"):
+    _add(f"scale_invariant_{dist}", S=2048, H=8, D=128, dist=dist, checks=("lse",))
+for i, (causal, B, S, Skv, H, HKV, D, Dv, sp) in enumerate(
+    [
+        (True, 2, 256, 256, 8, 8, 128, 128, None),
+        (False, 2, 256, 256, 8, 8, 128, 128, None),
+        (True, 1, 512, 1024, 16, 2, 128, 128, None),
+        (True, 1, 384, 384, 12, 12, 192, 128, None),
+        (True, 1, 128, 512, 8, 8, 192, 192, None),
+        (True, 1, 1024, 4096, 8, 1, 128, 128, 4),
+        (False, 2, 512, 512, 8, 8, 128, 128, 2),
+        (True, 1, 512, 2048, 12, 12, 192, 128, 4),
+        (False, 1, 70, 16384, 12, 12, 192, 128, 4),
+        (False, 1, 70, 16384, 12, 12, 192, 128, None),
+        # Skv < Sq: bottom-right causal leaves the leading Sq-Skv rows with no
+        # visible key, so their LSE must be -inf rather than NaN.
+        (True, 1, 1024, 128, 8, 8, 128, 128, None),
+        (True, 1, 2048, 256, 16, 4, 128, 128, None),
+        (True, 1, 1024, 128, 8, 8, 192, 128, None),
+        (True, 1, 1024, 128, 8, 8, 128, 128, 4),
+    ]
+):
+    _add(
+        f"lse_dense_{i}",
+        causal=(causal,),
+        B=B,
+        S=S,
+        Skv=Skv,
+        H=H,
+        HKV=HKV,
+        D=D,
+        Dv=Dv,
+        splits=sp,
+        checks=("lse",),
+    )
+for i, (vl_q, vl_kv, H, HKV, D, Dv, sp) in enumerate(
+    [
+        ([300, 500], [300, 500], 8, 8, 128, 128, None),
+        ([300, 500], [1024, 2048], 12, 2, 192, 128, None),
+        ([512, 512], [4096, 4096], 8, 8, 128, 128, 4),
+    ]
+):
+    _add(
+        f"lse_varlen_{i}",
+        varlen=True,
+        vl_q=vl_q,
+        vl_kv=vl_kv,
+        H=H,
+        HKV=HKV,
+        D=D,
+        Dv=Dv,
+        splits=sp,
+        checks=("lse",),
+    )
+# Dead rows (Skv < Sq) must be -inf on every tile/split configuration. The race that
+# wrote NaN in a varying handful of rows is per-launch, hence the repeat loop.
+for S, Skv in ((1024, 128), (2048, 256)):
+    for bm in (128, 256):
+        for sp in (1, 4):
+            _add(
+                f"dead_rows_s{S}_kv{Skv}_bm{bm}_n{sp}",
+                S=S,
+                Skv=Skv,
+                H=32,
+                D=128,
+                splits=sp,
+                block_m=bm,
+                causal=(True,),
+                checks=("lse", "dead_lse"),
+            )
+# MLA chunked prefill produces seqlen_kv == 0 entries routinely, and the downstream
+# merge consumes LSE, so NaN here spreads across the whole layer.
+for i, (vl_q, vl_kv) in enumerate(
+    [
+        ([256, 128, 64], [512, 0, 300]),
+        ([256, 128], [0, 384]),
+        ([256, 128], [0, 0]),
+    ]
+):
+    _add(
+        f"zero_kv_{i}",
+        varlen=True,
+        vl_q=vl_q,
+        vl_kv=vl_kv,
+        H=8,
+        D=128,
+        Dv=128,
+        checks=("lse", "zero_kv"),
+    )
+# Runtime softmax_scale: updates O and LSE on the cached launcher, leaves the
+# descales untouched, and the default scale is bit-identical to an explicit D**-0.5.
+for i, (S, Skv, HKV, D, sp) in enumerate(
+    [
+        (512, 512, 12, 128, 1),
+        (70, 2048, 12, 192, 1),  # cached-chunk prefill
+        (512, 2048, 2, 192, 4),  # split-K + GQA
+        (512, 128, 12, 192, 1),  # fully masked leading rows when causal
+        (512, 128, 12, 192, 4),  # empty splits
+    ]
+):
+    _add(
+        f"scale_dense_{i}",
+        S=S,
+        Skv=Skv,
+        HKV=HKV,
+        D=D,
+        splits=sp,
+        dist="normal",
+        scale=0.37,
+        checks=("lse", "scale"),
+    )
+for sp in (1, 4, None):
+    for tag, cuq, cukv, causal in (
+        ("a", [0, 512, 582, 838], [0, 2048, 2048, 2176], (False, True)),
+        ("zero_kv", [0, 70, 71, 198, 198], [0, 16384, 16384, 16641, 16769], (False,)),
+    ):
+        _add(
+            f"scale_varlen_{tag}_n{sp}",
+            varlen=True,
+            vl_q=[b - a for a, b in pairwise(cuq)],
+            vl_kv=[b - a for a, b in pairwise(cukv)],
+            splits=sp,
+            dist="normal",
+            scale=0.37,
+            causal=causal,
+            checks=("lse", "scale"),
+        )
+# A custom runtime scalar needs no scale-preparation kernel during graph capture.
+_add(
+    "scale_graph_s512",
+    S=512,
+    scale=0.137,
+    causal=(True,),
+    checks=("lse", "graph"),
+)
+_add(
+    "scale_graph_s70_kv16384",
+    S=70,
+    Skv=16384,
+    splits=4,
+    scale=0.137,
+    causal=(False,),
+    checks=("lse", "graph"),
+)
+# A caller-supplied out= comes back filled and is the same tensor.
+for sc in (None, 0.37):
+    _add(
+        f"out_returned_sc{sc}",
+        B=2,
+        S=512,
+        H=8,
+        D=128,
+        scale=sc,
+        causal=(False,),
+        checks=("out_returned",),
+    )
+
+
+def _uniform(shape, c):
+    if c["dist"] == "uniform":
+        return torch.empty(shape, dtype=dtypes.bf16, device="cuda").uniform_(
+            *FP8_UNIFORM_RANGE
+        )
+    x = torch.randn(shape, dtype=dtypes.bf16, device="cuda")
+    return x * 8 if c["dist"] == "normal_x8" else x
+
+
+def _cu(lens):
+    return [0] + list(itertools.accumulate(lens))
+
+
+def make_fp8_inputs(c):
+    torch.manual_seed(FP8_SEED)
+    H, D, Dv = c["H"], c["D"], c["Dv"]
+    HKV = c["HKV"] or H
+    if c["varlen"]:
+        vl_q = c["vl_q"]
+        vl_kv = c["vl_kv"] if c["vl_kv"] is not None else vl_q
+        cuq, cukv = _cu(vl_q), _cu(vl_kv)
+        # k/v still need a real allocation when every entry is empty.
+        tkv = max(cukv[-1], 1)
+        shapes = ((cuq[-1], H, D), (tkv, HKV, D), (tkv, HKV, Dv))
+    else:
+        B, S = c["B"], c["S"]
+        Skv = S if c["Skv"] is None else c["Skv"]
+        shapes = ((B, S, H, D), (B, Skv, HKV, D), (B, Skv, HKV, Dv))
+    q_bf, k_bf, v_bf = (_uniform(s, c) for s in shapes)
+    k_bf = k_bf * c["k_scale"]
+    q, qs = _fp8_quant(q_bf)
+    k, ks = _fp8_quant(k_bf)
+    v, vs = _fp8_quant(v_bf)
+    return q, k, v, {"q_descale": qs, "k_descale": ks, "v_descale": vs}
+
+
+def fp8_reference(c, causal, q, k, v, descales, scale):
+    """fp32 torch attention and fp64 LSE over the dequantized tensors."""
+    qd, kd, vd = (
+        _fp8_dequant(t, descales[n])
+        for t, n in ((q, "q_descale"), (k, "k_descale"), (v, "v_descale"))
+    )
+    if not c["varlen"]:
+        return _ref_attention(qd, kd, vd, causal, scale), _ref_lse(
+            qd, kd, causal, scale
+        )
+    vl_q = c["vl_q"]
+    vl_kv = c["vl_kv"] if c["vl_kv"] is not None else vl_q
+    cuq, cukv = _cu(vl_q), _cu(vl_kv)
+    ref = torch.zeros(q.shape[:-1] + (c["Dv"],), dtype=torch.float32, device="cuda")
+    lse = torch.full((c["H"], cuq[-1]), float("-inf"), device="cuda")
+    for b in range(len(vl_q)):
+        if vl_kv[b] == 0:
+            continue  # no softmax support: O == 0 and LSE == -inf
+        sl_q, sl_kv = slice(cuq[b], cuq[b + 1]), slice(cukv[b], cukv[b + 1])
+        args = (qd[sl_q].unsqueeze(0), kd[sl_kv].unsqueeze(0), vd[sl_kv].unsqueeze(0))
+        ref[sl_q] = _ref_attention(*args, causal, scale).squeeze(0)
+        lse[:, sl_q] = _ref_lse(args[0], args[1], causal, scale)[0]
+    return ref, lse
+
+
+def compare(want, got, name):
+    atol = FP8_REL_ERR[got.dtype] * want.abs().max().item()
+    got = got.float()
+    assert not torch.isnan(
+        got
+    ).any(), (
+        f"{name}: {int(torch.isnan(got).any(-1).sum())} output rows were never written"
+    )
+    err = checkAllclose(want, got, rtol=0, atol=atol, tol_err_ratio=0, msg=name)
+    cos = F.cosine_similarity(
+        got.reshape(-1, want.shape[-1]), want.reshape(-1, want.shape[-1]), dim=1
+    )
+    # Fully masked or empty-KV rows are zero in both; cosine is undefined there.
+    both_zero = (got == 0).all(-1).reshape(-1) & (want == 0).all(-1).reshape(-1)
+    cos = cos.masked_fill(both_zero, 1.0)
+    assert err == 0 and cos.min().item() > FP8_MIN_COS, (
+        f"{name}: fp8 gate: {err:.3%} elements exceed atol={atol:.3e}, "
+        f"min_cos={cos.min().item():.5f} (> {FP8_MIN_COS})"
+    )
+    return err
+
+
+@benchmark()
+def test_fmha_fp8(name, causal):
+    from aiter.ops.flydsl.fmha_kernels import (
+        flydsl_flash_attn_batch_func,
+        flydsl_flash_attn_varlen_func,
+    )
+    from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
+        flydsl_flash_attn_fp8_func,
+    )
+
+    c = FP8_CASES[name]
+    H, D, Dv = c["H"], c["D"], c["Dv"]
+    HKV = c["HKV"] or H
+    q, k, v, descales = make_fp8_inputs(c)
+    scale = c["scale"]
+    ref, ref_lse = fp8_reference(
+        c, causal, q, k, v, descales, D**-0.5 if scale is None else scale
+    )
+    want_lse = "lse" in c["checks"]
+    # NaN-prefilled so an unwritten row fails the comparison.
+    out = torch.full(
+        q.shape[:-1] + (Dv,), float("nan"), device="cuda", dtype=c["out_dtype"]
+    )
+    kw = dict(causal=causal, softmax_scale=scale, **descales)
+    if c["varlen"]:
+        vl_q = c["vl_q"]
+        vl_kv = c["vl_kv"] if c["vl_kv"] is not None else vl_q
+        cuq, cukv = _cu(vl_q), _cu(vl_kv)
+        cu_q = torch.tensor(cuq, dtype=torch.int32, device="cuda")
+        cu_kv = torch.tensor(cukv, dtype=torch.int32, device="cuda")
+        vkw = {
+            "cu_seqlens_q": cu_q,
+            "cu_seqlens_kv": cu_kv,
+            "max_seqlen_q": max(vl_q),
+            "max_seqlen_kv": max(max(vl_kv), 1),
+            "cross_seqlen": vl_q != vl_kv,
+        }
+    else:
+        vkw = {}
+    kernel_kw = dict(
+        kw,
+        **vkw,
+        num_kv_heads=HKV,
+        num_kv_splits=c["splits"],
+        fp8_block_m=c["block_m"],
+        return_lse=want_lse,
+    )
+    if c["entry"] == "kernel":
+        # Lazy and eager rescale lift P differently; both must match the same reference.
+        candidates = {
+            tag: partial(
+                flydsl_flash_attn_fp8_func,
+                q,
+                k,
+                v,
+                out=out,
+                dualwave_swp_lazy_rescale=lazy,
+                **kernel_kw,
+            )
+            for tag, lazy in (("lazy", True), ("eager", False))
+        }
+    elif c["entry"] == "batch":
+        candidates = {
+            "dispatch": lambda: flydsl_flash_attn_batch_func(q, k, v, **kw),
+        }
+    else:
+        candidates = {
+            "dispatch": lambda: flydsl_flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_q,
+                cu_kv,
+                vkw["max_seqlen_q"],
+                vkw["max_seqlen_kv"],
+                **kw,
+            ),
+        }
+
+    if c["varlen"]:
+        pairs = sum(visible_pairs(a, b, causal) for a, b in zip(vl_q, vl_kv))
+    else:
+        skv = c["S"] if c["Skv"] is None else c["Skv"]
+        pairs = c["B"] * visible_pairs(c["S"], skv, causal)
+    flops = 2 * H * (D + Dv) * pairs
+    tq = q.shape[0] if c["varlen"] else q.shape[0] * q.shape[1]
+    tkv = k.shape[0] if c["varlen"] else k.shape[0] * k.shape[1]
+    nbytes = tq * H * D + tkv * HKV * (D + Dv) + out.numel() * out.element_size()
+
+    ret = {"gfx": get_gfx_runtime()}
+    for tag, fn in candidates.items():
+        got = fn()
+        got_lse = None
+        if isinstance(got, tuple):
+            got, got_lse = got
+        assert got is not None, "gfx950 fp8 must not fall through to CK/Triton"
+        torch.cuda.synchronize()
+        assert got.shape == ref.shape and got.dtype == c["out_dtype"]
+        err = compare(ref, got, tag)
+        if got_lse is not None:
+            want_shape = (H, q.shape[0]) if c["varlen"] else (c["B"], H, c["S"])
+            assert got_lse.shape == want_shape and got_lse.dtype == torch.float32
+            _assert_lse_matches(got_lse, ref_lse)
+        _, us = run_perftest(fn, num_rotate_args=1)
+        assert us > 0, f"{tag}: empty timing"
+        ret[f"{tag} us"] = us
+        ret[f"{tag} TFLOPS"] = flops / us / 1e6
+        ret[f"{tag} TB/s"] = nbytes / us / 1e6
+        ret[f"{tag} err"] = err
+
+    if c["entry"] != "kernel":
+        return ret
+    checks = c["checks"]
+    plain = dict(kernel_kw, return_lse=False)
+    if "lse" in checks:
+        # RETURN_LSE is a compile-time trait: asking for LSE must not perturb O.
+        o_lse, _ = flydsl_flash_attn_fp8_func(
+            q, k, v, **dict(kernel_kw, return_lse=True)
+        )
+        o_only = flydsl_flash_attn_fp8_func(q, k, v, **plain)
+        assert torch.equal(o_lse, o_only), "return_lse must not perturb O"
+    if "dead_lse" in checks:
+        S, Skv = c["S"], c["Skv"]
+        for _ in range(4):
+            # Sentinel-filled so "never written" is distinguishable from "wrote NaN".
+            lse = torch.full((1, H, S), 1.2345e-7, dtype=torch.float32, device="cuda")
+            o, lse = flydsl_flash_attn_fp8_func(
+                q, k, v, **dict(kernel_kw, return_lse=True, lse=lse)
+            )
+            torch.cuda.synchronize()
+            dead = lse[:, :, : S - Skv]
+            assert (dead == float("-inf")).all(), (
+                f"{int((dead != float('-inf')).sum())} of {dead.numel()} "
+                f"fully-masked rows are not -inf (NaN={int(torch.isnan(dead).sum())}, "
+                f"unwritten={int((dead == 1.2345e-7).sum())})"
+            )
+            assert torch.isfinite(
+                lse[:, :, S - Skv :]
+            ).all(), "live rows must be finite"
+            assert (
+                o[:, : S - Skv].float() == 0
+            ).all(), "fully-masked rows of O are zero"
+    if "zero_kv" in checks:
+        for b, n_kv in enumerate(vl_kv):
+            if n_kv:
+                continue
+            o_b = out[cuq[b] : cuq[b + 1]].float()
+            assert (o_b == 0).all(), f"entry {b} has non-zero O"
+            _, lse_chk = flydsl_flash_attn_fp8_func(
+                q, k, v, **dict(kernel_kw, return_lse=True)
+            )
+            assert (lse_chk[:, cuq[b] : cuq[b + 1]] == float("-inf")).all()
+    if "scale" in checks:
+        saved = [d.clone() for d in descales.values()]
+        o_def = flydsl_flash_attn_fp8_func(
+            q, k, v, **dict(kernel_kw, softmax_scale=None, return_lse=True)
+        )
+        o_exp = flydsl_flash_attn_fp8_func(
+            q, k, v, **dict(kernel_kw, softmax_scale=D**-0.5, return_lse=True)
+        )
+        assert torch.equal(o_def[0], o_exp[0]) and torch.equal(o_def[1], o_exp[1])
+        for d, s in zip(descales.values(), saved):
+            assert torch.equal(d, s), "softmax_scale must not mutate descales"
+    if "out_returned" in checks:
+        fresh = torch.empty_like(out)
+        got = flydsl_flash_attn_fp8_func(q, k, v, **dict(kernel_kw, out=fresh))
+        torch.cuda.synchronize()
+        no_out = flydsl_flash_attn_fp8_func(q, k, v, **kernel_kw)
+        assert got is fresh, "out must be returned, not a copy"
+        assert torch.equal(fresh, no_out)
+    if "graph" in checks:
+        graph_kw = dict(kernel_kw, return_lse=True)
+        flydsl_flash_attn_fp8_func(q, k, v, **graph_kw)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            g_out, g_lse = flydsl_flash_attn_fp8_func(q, k, v, **graph_kw)
+        q_descale = descales["q_descale"]
+        saved_q = q_descale.clone()
+        for factor in (0.5, 2.0):
+            q_descale.mul_(factor)
+            graph.replay()
+            expected, expected_lse = flydsl_flash_attn_fp8_func(q, k, v, **graph_kw)
+            torch.cuda.synchronize()
+            assert torch.equal(g_out, expected) and torch.equal(g_lse, expected_lse)
+        q_descale.copy_(saved_q)
+    return ret
+
+
+# ---------------------------------------------------------------- pytest contract tests
 
 
 def _arch() -> str:
@@ -83,22 +874,6 @@ _gfx950_only = pytest.mark.skipif(
 )
 
 
-def _ref_sdpa_bshd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    causal: bool = False,
-) -> torch.Tensor:
-    """SDPA reference with BSHD inputs/outputs."""
-    out_bhsd = F.scaled_dot_product_attention(
-        q.transpose(1, 2).contiguous(),
-        k.transpose(1, 2).contiguous(),
-        v.transpose(1, 2).contiguous(),
-        is_causal=causal,
-    )
-    return out_bhsd.transpose(1, 2).contiguous()
-
-
 def _make_qkv(
     batch: int,
     seq_len: int,
@@ -114,36 +889,6 @@ def _make_qkv(
     k = torch.randn(shape, generator=g, dtype=dtype, device=device)
     v = torch.randn(shape, generator=g, dtype=dtype, device=device)
     return q, k, v
-
-
-@_gfx1201_only
-@pytest.mark.parametrize(
-    "batch,seq_len,num_heads,head_dim",
-    [
-        # Aligned production-like Wan2.1 1.3B shape, padded to multiple of 128.
-        (1, 32768, 12, 128),
-        # Smaller aligned shape (sanity).
-        (2, 1024, 8, 128),
-        # Unaligned shape — exercises the auto-padding path. 32760 → 32768.
-        (1, 32760, 12, 128),
-    ],
-)
-def test_flydsl_fmha_correctness_bf16(batch, seq_len, num_heads, head_dim):
-    q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
-    out = flydsl_flash_attn_func(q, k, v, causal=False)
-    ref = _ref_sdpa_bshd(q, k, v)
-
-    assert out.shape == ref.shape == (batch, seq_len, num_heads, head_dim)
-    assert out.dtype == ref.dtype == torch.bfloat16
-
-    cos = F.cosine_similarity(
-        out.float().reshape(-1, head_dim),
-        ref.float().reshape(-1, head_dim),
-        dim=1,
-    )
-    # bf16 attention is noisy; cosine is the right correctness signal.
-    assert cos.min().item() > 0.99, f"min_cos={cos.min().item():.6f}"
-    assert cos.mean().item() > 0.999, f"mean_cos={cos.mean().item():.6f}"
 
 
 @_gfx1201_only
@@ -169,46 +914,6 @@ def test_flydsl_fmha_rejects_dtype_mismatch():
     v = torch.randn(1, 1024, 8, 128, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError, match="dtype"):
         flydsl_flash_attn_func(q, k, v)
-
-
-@_gfx1201_only
-def test_flydsl_fmha_correctness_f16():
-    """f16 dtype coverage — Wan2.1 1.3B-style shape, non-causal."""
-    batch, seq_len, num_heads, head_dim = 1, 32768, 12, 128
-    q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.float16)
-    out = flydsl_flash_attn_func(q, k, v, causal=False)
-    ref = _ref_sdpa_bshd(q, k, v, causal=False)
-
-    assert out.shape == ref.shape == (batch, seq_len, num_heads, head_dim)
-    assert out.dtype == ref.dtype == torch.float16
-
-    cos = F.cosine_similarity(
-        out.float().reshape(-1, head_dim),
-        ref.float().reshape(-1, head_dim),
-        dim=1,
-    )
-    assert cos.min().item() > 0.99, f"min_cos={cos.min().item():.6f}"
-    assert cos.mean().item() > 0.999, f"mean_cos={cos.mean().item():.6f}"
-
-
-@_gfx1201_only
-def test_flydsl_fmha_correctness_causal_small():
-    """Causal masking coverage — small bf16 shape."""
-    batch, seq_len, num_heads, head_dim = 2, 4096, 8, 128
-    q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
-    out = flydsl_flash_attn_func(q, k, v, causal=True)
-    ref = _ref_sdpa_bshd(q, k, v, causal=True)
-
-    assert out.shape == ref.shape == (batch, seq_len, num_heads, head_dim)
-    assert out.dtype == ref.dtype == torch.bfloat16
-
-    cos = F.cosine_similarity(
-        out.float().reshape(-1, head_dim),
-        ref.float().reshape(-1, head_dim),
-        dim=1,
-    )
-    assert cos.min().item() > 0.99, f"min_cos={cos.min().item():.6f}"
-    assert cos.mean().item() > 0.999, f"mean_cos={cos.mean().item():.6f}"
 
 
 @_gfx1201_only
@@ -310,30 +1015,6 @@ def test_flydsl_fmha_rejects_excessive_padding():
 
 
 @_gfx1201_only
-def test_flydsl_fmha_allows_tight_padding():
-    """Wan2.1 production case (S_real=32760 -> S_pad=32768, ratio 0.024%)
-    must pass the 0.5% threshold and produce SDPA-equivalent output.
-
-    Regression guard for option (d) — protects the production hot path
-    from a future, stricter threshold accidentally rejecting it.
-    """
-    batch, seq_len, num_heads, head_dim = 1, 32760, 12, 128
-    q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
-    out = flydsl_flash_attn_func(q, k, v, causal=False)
-    ref = _ref_sdpa_bshd(q, k, v, causal=False)
-
-    assert out.shape == ref.shape == (batch, seq_len, num_heads, head_dim)
-    cos = F.cosine_similarity(
-        out.float().reshape(-1, head_dim),
-        ref.float().reshape(-1, head_dim),
-        dim=1,
-    )
-    # Wan2.1 production cos_min was empirically 0.999992 in the RCA;
-    # 0.9999 is the conservative regression bound (bf16 noise floor).
-    assert cos.min().item() > 0.9999, f"min_cos={cos.min().item():.6f}"
-
-
-@_gfx1201_only
 def test_flydsl_fmha_rejects_device_mismatch():
     """Same-device check (#6) — q on device 0, k/v on device 1 must raise."""
     if torch.cuda.device_count() < 2:
@@ -348,19 +1029,6 @@ def test_flydsl_fmha_rejects_device_mismatch():
 
 # gfx950 fp8 (e4m3fn). The reference dequantizes the *same* fp8 tensors, so the
 # error measured is the kernel's, not the quantizer's.
-
-FP8_DTYPE = torch.float8_e4m3fn
-FP8_REL_ERR = 8e-2
-FP8_MIN_COS = 0.98
-FP8_LSE_REL_ERR = 1e-4
-FP8_UNIFORM_RANGE = (-1.0, 1.0)
-FP8_SEED = 123
-
-
-def _fp8_rel_err(got, ref, floor=0.0):
-    scale = max(ref.abs().max().item(), floor)
-    err = (got - ref).abs().max().item()
-    return (err / scale if scale > 0 else err), err, scale
 
 
 _FP8_HEADS = 12
@@ -382,88 +1050,6 @@ FP8_VARLEN_BATCHES = (1, 2, 3, 4)
 FP8_SPLITKV_SPLITS = (2, 4, 8, 16)
 FP8_SPLITKV_SEQLENS = (4096, 8192, 16384, 32768)
 FP8_SPLIT_MODES = [pytest.param(1, id="dense"), pytest.param(None, id="autosplit")]
-
-
-def _fp8_quant(x):
-    """Per-tensor e4m3fn quantization: descale = amax / fp8_max."""
-    fp8_max = torch.finfo(FP8_DTYPE).max
-    descale = (x.abs().amax().float() / fp8_max).clamp(min=1e-12).view(1)
-    return (x.float() / descale).to(FP8_DTYPE).contiguous(), descale.contiguous()
-
-
-def _fp8_dequant(x, descale):
-    return x.to(torch.float32) * descale.to(torch.float32)
-
-
-def _ref_attention(q, k, v, causal, softmax_scale=None):
-    """fp32 SDPA over BSHD/THD-with-batch inputs, GQA-aware, bottom-right causal.
-
-    ``F.scaled_dot_product_attention(is_causal=True)`` aligns the mask top-left,
-    which differs from this kernel (and from aiter's documented convention) as
-    soon as Sq != Skv, so the mask is built explicitly from ``delta``.
-    """
-    q_t, k_t, v_t = (t.transpose(1, 2).float() for t in (q, k, v))
-    nh_q, nh_kv = q_t.shape[1], k_t.shape[1]
-    if nh_q != nh_kv:
-        rep = nh_q // nh_kv
-        k_t = k_t.repeat_interleave(rep, dim=1)
-        v_t = v_t.repeat_interleave(rep, dim=1)
-    Sq, D = q_t.shape[2], q_t.shape[3]
-    Skv = k_t.shape[2]
-    scale = D**-0.5 if softmax_scale is None else softmax_scale
-    scores = torch.matmul(q_t, k_t.transpose(-1, -2)) * scale
-    if causal:
-        delta = Skv - Sq
-        q_idx = torch.arange(Sq, device=q.device).view(-1, 1)
-        k_idx = torch.arange(Skv, device=q.device).view(1, -1)
-        scores = scores.masked_fill(k_idx > q_idx + delta, float("-inf"))
-    probs = torch.softmax(scores, dim=-1)
-    # A fully-masked row softmaxes to NaN; the kernel writes zeros there.
-    probs = torch.nan_to_num(probs, nan=0.0)
-    return torch.matmul(probs, v_t).transpose(1, 2)
-
-
-def _ref_lse(q, k, causal, softmax_scale=None):
-    """fp64 log-sum-exp of the same logits ``_ref_attention`` softmaxes, as [B, H, Sq]."""
-    q_t, k_t = (t.transpose(1, 2).double() for t in (q, k))
-    nh_q, nh_kv = q_t.shape[1], k_t.shape[1]
-    if nh_q != nh_kv:
-        k_t = k_t.repeat_interleave(nh_q // nh_kv, dim=1)
-    Sq, D = q_t.shape[2], q_t.shape[3]
-    Skv = k_t.shape[2]
-    scale = D**-0.5 if softmax_scale is None else softmax_scale
-    scores = torch.matmul(q_t, k_t.transpose(-1, -2)) * scale
-    if causal:
-        delta = Skv - Sq
-        q_idx = torch.arange(Sq, device=q.device).view(-1, 1)
-        k_idx = torch.arange(Skv, device=q.device).view(1, -1)
-        scores = scores.masked_fill(k_idx > q_idx + delta, float("-inf"))
-    return torch.logsumexp(scores, dim=-1).float()
-
-
-def _assert_lse_matches(got, ref):
-    """Compare LSE against the fp64 reference, treating fully-masked rows exactly.
-
-    A row that sees no key at all (bottom-right causal with Skv < Sq, or a
-    zero-length varlen KV entry) has LSE = -inf, and ``-inf - -inf`` is NaN, so
-    those rows are asserted as an exact bit match instead of a tolerance.
-    """
-    dead = torch.isinf(ref) & (ref < 0)
-    assert not torch.isnan(got).any(), (
-        f"LSE has {int(torch.isnan(got).sum())} NaN entries "
-        f"({int((torch.isnan(got) & dead).sum())} of them on fully-masked rows)"
-    )
-    assert torch.equal(got[dead], ref[dead]), (
-        f"{int((got[dead] != float('-inf')).sum())} of {int(dead.sum())} "
-        "fully-masked rows are not -inf"
-    )
-    live = ~dead
-    if live.any():
-        rel, err, scale = _fp8_rel_err(got[live], ref[live], floor=1.0)
-        assert rel < FP8_LSE_REL_ERR, (
-            f"fp8 LSE gate: rel_err={rel:.3e} (< {FP8_LSE_REL_ERR}), "
-            f"abs_err={err:.3e}, |lse|max={scale:.3e}"
-        )
 
 
 def _run_fp8_shape(
@@ -572,8 +1158,8 @@ def _run_fp8_shape(
         .min()
         .item()
     )
-    assert rel_err < FP8_REL_ERR and min_cos > FP8_MIN_COS, (
-        f"fp8 gate: rel_err={rel_err:.3e} (< {FP8_REL_ERR}), "
+    assert rel_err < FP8_REL_ERR[out.dtype] and min_cos > FP8_MIN_COS, (
+        f"fp8 gate: rel_err={rel_err:.3e} (< {FP8_REL_ERR[out.dtype]}), "
         f"max_err={max_err:.3e}, ref_amax={scale:.3e}, "
         f"min_cos={min_cos:.5f} (> {FP8_MIN_COS})"
     )
@@ -604,6 +1190,584 @@ def _run_fp8_into_nan_out(q, k, v, head_dim_v, **kwargs):
         qq, kq, vq, out=out, q_descale=d[0], k_descale=d[1], v_descale=d[2], **kwargs
     )
     return out
+
+
+@_gfx950_only
+def test_fp8_short_causal_split_kv_rejected():
+    with pytest.raises(ValueError, match="split-K requires seq_len>=384"):
+        _run_fp8_shape(True, seq_len=70, seqlen_kv=16384, num_kv_splits=4)
+
+
+@_gfx950_only
+@pytest.mark.parametrize(
+    "head_dim,head_dim_v,match",
+    [
+        # D_CHUNKS < 2 aborts LLVM; D_CHUNKS > 6 miscomputes the high chunks.
+        (128, 32, "head_dim_v"),
+        (128, 224, "head_dim_v"),
+        (128, 256, "head_dim_v"),
+        (96, 96, "head_dim"),
+        (256, 192, "LDS"),
+        (320, 128, "LDS"),
+        (384, 64, "LDS"),
+    ],
+)
+def test_fp8_rejected_head_dims_raise_before_launch(head_dim, head_dim_v, match):
+    """Unsupported head dims must name the shape, not abort or fault the GPU."""
+    B, S, H = 1, 512, 4
+    torch.manual_seed(0)
+    q = torch.randn(B, S, H, head_dim, device="cuda", dtype=torch.bfloat16) * 0.1
+    k = torch.randn(B, S, H, head_dim, device="cuda", dtype=torch.bfloat16) * 0.1
+    v = torch.randn(B, S, H, head_dim_v, device="cuda", dtype=torch.bfloat16) * 0.1
+    with pytest.raises((RuntimeError, ValueError), match=match):
+        _run_fp8_into_nan_out(q, k, v, head_dim_v, causal=False, num_kv_heads=H)
+
+
+@_gfx950_only
+def test_fp8_default_is_the_lazy_rescale():
+    """Every other fp8 case passes the flag, so the default would go untested.
+
+    V is all ones, so the exact output is 1.0 and the two runs must also agree
+    bit for bit.
+    """
+    from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
+        flydsl_flash_attn_fp8_func,
+    )
+
+    B, S, H, D = 1, 4096, 8, 128
+    fp8_max = torch.finfo(FP8_DTYPE).max
+    torch.manual_seed(0)
+    q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    k = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1 * 200.0
+    q_s = q.abs().amax().float() / fp8_max
+    k_s = k.abs().amax().float() / fp8_max
+    v_s = torch.tensor(1.0 / fp8_max, device="cuda")
+    v = (torch.ones(B, S, H, D, device="cuda", dtype=torch.bfloat16) / v_s).to(
+        FP8_DTYPE
+    )
+    kw = {
+        "causal": False,
+        "q_descale": q_s.reshape(1).contiguous(),
+        "k_descale": k_s.reshape(1).contiguous(),
+        "v_descale": v_s.reshape(1).contiguous(),
+        "num_kv_splits": 1,
+    }
+    qq, kk = (q / q_s).to(FP8_DTYPE), (k / k_s).to(FP8_DTYPE)
+
+    default = flydsl_flash_attn_fp8_func(qq, kk, v, **kw)
+    lazy = flydsl_flash_attn_fp8_func(qq, kk, v, dualwave_swp_lazy_rescale=True, **kw)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(default.float(), lazy.float(), rtol=0, atol=0)
+
+
+@_gfx950_only
+def test_fp8_rescale_threshold_drops_past_the_long_sequence_bound():
+    """fp8 picks its rescale threshold from the KV length.
+
+    Below the bound 6 and 4 are equally accurate and 6 is cheaper; above it the
+    running max spans enough tiles that 4's extra two log2 units of P lift are
+    worth its ~0.3%. The kernel is not specialised on S, so this widens the
+    build cache to two variants -- keep it two.
+    """
+    from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
+
+    f = fa._fp8_rescale_threshold
+    assert f(1024) == 6.0
+    assert f(fa._FP8_LONG_SEQ) == 6.0
+    assert f(fa._FP8_LONG_SEQ + 1) == 4.0
+    assert f(131072) == 4.0
+    assert {f(s) for s in (1, 1024, 4096, 4097, 8192, 131072)} == {6.0, 4.0}
+
+
+@_gfx950_only
+@pytest.mark.parametrize(
+    "batch,num_heads,seqlen_q,seqlen_kv,expect",
+    [
+        (1, 8, 512, 512, 128),
+        (1, 8, 2048, 2048, 128),
+        (8, 32, 2048, 2048, 256),
+        (16, 32, 1024, 1024, 256),
+        (32, 32, 512, 512, 256),
+        (1, 8, 4096, 4096, 256),
+        (1, 8, 4096, 16384, 256),
+        (2, 8, 4096, 4096, 256),
+    ],
+)
+def test_fp8_auto_block_m_picks(batch, num_heads, seqlen_q, seqlen_kv, expect):
+    """Pin what ``_fp8_auto_block_m`` chooses; correctness tests pass either way."""
+    from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
+
+    assert fa._fp8_auto_block_m(batch, num_heads, seqlen_q, seqlen_kv, 256) == expect
+
+
+@_gfx950_only
+@pytest.mark.parametrize(
+    "case", ["b1_too_large", "per_slice_still_too_large", "kv_only_over_limit"]
+)
+def test_fp8_flat_overflow_guard_covers_every_tensor(monkeypatch, case):
+    """The int32 flat-dim guard has to see K and V, and to give up loudly.
+
+    Splitting divides the flat dim by B, so it only helps while B > 1 and while
+    one entry fits. Cross-attention can also put the excess in K/V rather than
+    Q. Each case lowers the bound rather than allocating 2**31 elements.
+    """
+    from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
+
+    torch.manual_seed(0)
+    H, D = 8, 128
+    B, Sq, Skv = (1, 1024, 1024) if case == "b1_too_large" else (2, 1024, 1024)
+    if case == "kv_only_over_limit":
+        Sq = 256
+    q = torch.randn(B, Sq, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    k = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    v = torch.randn_like(k)
+    qq, qs = _fp8_quant(q)
+    kq, ks = _fp8_quant(k)
+    vq, vs = _fp8_quant(v)
+    kw = {
+        "causal": False,
+        "q_descale": qs,
+        "k_descale": ks,
+        "v_descale": vs,
+        "fp8_block_m": 256,
+        "num_kv_splits": 1,
+    }
+
+    if case == "kv_only_over_limit":
+        # Between q's count and k's, so only the K/V check can fire. B=2 splits.
+        ref = fa.flydsl_flash_attn_fp8_func(qq, kq, vq, **kw)
+        monkeypatch.setattr(fa, "_FP8_MAX_FLAT_ELEMS", kq.numel())
+        got = fa.flydsl_flash_attn_fp8_func(qq, kq, vq, **kw)
+        torch.testing.assert_close(got.float(), ref.float(), rtol=0, atol=0)
+        return
+
+    # b1_too_large has no batch to divide; per_slice_still_too_large has B=2 but
+    # a bound low enough that one entry is still over, so the recursion hits the
+    # same wall. Both must raise rather than launch.
+    bound = qq.numel() if case == "b1_too_large" else qq.numel() // 2
+    monkeypatch.setattr(fa, "_FP8_MAX_FLAT_ELEMS", bound)
+    with pytest.raises(NotImplementedError, match="int32"):
+        fa.flydsl_flash_attn_fp8_func(qq, kq, vq, **kw)
+
+
+@_gfx950_only
+def test_fp8_split_result_survives_a_non_current_stream(monkeypatch):
+    """The split must not be consumed on a stream that is not the one it ran on.
+
+    Every launch goes to ``stream``; building the result on the ambient stream
+    reads it while those kernels are still queued, and the damage survives a
+    later synchronize because the copy already happened.
+    """
+    from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
+
+    B, S, H, D = 2, 512, 8, 128
+    torch.manual_seed(0)
+    q = (torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1).to(
+        FP8_DTYPE
+    )
+    k, v = q.clone(), q.clone()
+    scale = torch.ones(1, device="cuda")
+    kw = {"causal": False, "q_descale": scale, "k_descale": scale, "v_descale": scale}
+
+    ref = fa.flydsl_flash_attn_fp8_func(q, k, v, **kw)
+    torch.cuda.synchronize()
+
+    monkeypatch.setattr(fa, "_FP8_MAX_FLAT_ELEMS", B * S * H * D * 3 // 4)
+    side = torch.cuda.Stream()
+    # Elementwise, not a matmul: the point is only to keep `side` busy, and a
+    # GEMM would drag in a hipBLAS handle this test has no reason to need.
+    filler = torch.randn(8192, 8192, device="cuda")
+    with torch.cuda.stream(side):
+        for _ in range(40):  # keep the stream busy so the attention starts late
+            filler = torch.sin(filler)
+    got = fa.flydsl_flash_attn_fp8_func(q, k, v, stream=side, **kw)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(got.float(), ref.float(), rtol=0, atol=0)
+
+
+def _fp8_dispatch_inputs(B=2, S=1024, H=8, D=128, varlen=False, Skv=None):
+    """Quantized inputs for the dispatch tests."""
+    torch.manual_seed(0)
+    Skv = S if Skv is None else Skv
+
+    def _t(seq_len):
+        shape = (B * seq_len, H, D) if varlen else (B, seq_len, H, D)
+        return torch.empty(shape, device="cuda", dtype=torch.bfloat16).uniform_(
+            *FP8_UNIFORM_RANGE
+        )
+
+    q, qs = _fp8_quant(_t(S))
+    k, ks = _fp8_quant(_t(Skv))
+    v, vs = _fp8_quant(_t(Skv))
+    return q, k, v, {"q_descale": qs, "k_descale": ks, "v_descale": vs}
+
+
+@_gfx950_only
+@pytest.mark.parametrize(
+    "unsupported",
+    [
+        pytest.param({}, id="no_descales"),
+        pytest.param({"softmax_scale": 0.0}, id="zero_softmax_scale"),
+        pytest.param({"softmax_scale": -0.5}, id="negative_softmax_scale"),
+        pytest.param({"softmax_scale": float("nan")}, id="nan_softmax_scale"),
+        pytest.param({"softmax_scale": float("inf")}, id="inf_softmax_scale"),
+        pytest.param({"dropout_p": 0.1}, id="dropout"),
+        pytest.param({"window_size": (128, 0)}, id="sliding_window"),
+        pytest.param({"window_size": (-1, -1, 4)}, id="sink_size"),
+        pytest.param({"alibi_slopes": "H_f32"}, id="alibi"),
+        pytest.param({"sink": "H_f32"}, id="sink"),
+        pytest.param({"out": "fp8_out"}, id="non_bf16_out"),
+        pytest.param({"q_descale": "cpu_scale"}, id="descale_on_cpu"),
+        pytest.param({"k_descale": "cpu_scale"}, id="k_descale_on_cpu"),
+    ],
+)
+def test_fp8_dispatch_rejects_unsupported(unsupported):
+    """Anything the fp8 kernel cannot express returns None, not a wrong answer.
+
+    Falling through is what lets the caller reach CK/Triton; raising or silently
+    dropping the feature would both be wrong.
+    """
+    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_func
+
+    B, S, H, D = 2, 512, 8, 128
+    q, k, v, d = _fp8_dispatch_inputs(B, S, H, D)
+    kw = dict(d)
+    materialise = {
+        "H_f32": lambda: torch.zeros(H, device="cuda", dtype=torch.float32),
+        "fp8_out": lambda: torch.empty(B, S, H, D, device="cuda", dtype=FP8_DTYPE),
+        "cpu_scale": lambda: torch.ones(1, device="cpu", dtype=torch.float32),
+    }
+    for key, val in unsupported.items():
+        kw[key] = materialise[val]() if val in materialise else val
+    if not unsupported:  # the no_descales case
+        kw = {}
+
+    assert flydsl_flash_attn_batch_func(q, k, v, causal=True, **kw) is None
+
+
+@_gfx950_only
+def test_fp8_dispatch_rejects_descale_on_another_device():
+    """A descale on a different CUDA device falls through instead of raising."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires >=2 visible GPUs")
+
+    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_func
+
+    B, S, H, D = 2, 512, 8, 128
+    q, k, v, d = _fp8_dispatch_inputs(B, S, H, D)
+    d["q_descale"] = d["q_descale"].to("cuda:1")
+    assert flydsl_flash_attn_batch_func(q, k, v, causal=True, **d) is None
+
+
+@_gfx950_only
+@pytest.mark.parametrize("causal", [False, True])
+def test_fp8_dispatch_return_lse(causal):
+    """``return_lse`` now routes to gfx950 fp8 instead of falling through."""
+    from aiter.ops.flydsl.fmha_kernels import (
+        flydsl_flash_attn_batch_func,
+        flydsl_flash_attn_varlen_func,
+    )
+
+    B, S, H, D = 2, 1024, 8, 128
+    q, k, v, d = _fp8_dispatch_inputs(B, S, H, D)
+    out, lse = flydsl_flash_attn_batch_func(
+        q, k, v, causal=causal, return_lse=True, **d
+    )
+    assert out.shape == (B, S, H, D)
+    assert lse.shape == (B, H, S)
+    ref = _ref_lse(
+        _fp8_dequant(q, d["q_descale"]), _fp8_dequant(k, d["k_descale"]), causal
+    )
+    assert _fp8_rel_err(lse, ref, floor=1.0)[0] < FP8_LSE_REL_ERR
+
+    qv, kv, vv, dv = _fp8_dispatch_inputs(B, S, H, D, varlen=True)
+    cu = torch.tensor([0, 400, B * S], dtype=torch.int32, device="cuda")
+    out_v, lse_v = flydsl_flash_attn_varlen_func(
+        qv,
+        kv,
+        vv,
+        cu,
+        cu,
+        B * S - 400,
+        B * S - 400,
+        causal=causal,
+        return_lse=True,
+        **dv,
+    )
+    assert out_v.shape == (B * S, H, D)
+    assert lse_v.shape == (H, B * S)
+
+
+@_gfx950_only
+def test_fp8_dispatch_rejects_bf16_inputs():
+    """bf16 on gfx950 has no FlyDSL kernel here and must fall through."""
+    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_func
+
+    q = torch.randn(2, 512, 8, 128, device="cuda", dtype=torch.bfloat16)
+    assert flydsl_flash_attn_batch_func(q, q.clone(), q.clone(), causal=True) is None
+
+
+@_gfx950_only
+def test_fp8_dispatch_matches_direct_call():
+    """The dispatch wrapper must not perturb the kernel it routes to."""
+    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_func
+    from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
+        flydsl_flash_attn_fp8_func,
+    )
+
+    q, k, v, d = _fp8_dispatch_inputs()
+    via_dispatch = flydsl_flash_attn_batch_func(q, k, v, causal=True, **d)
+    direct = flydsl_flash_attn_fp8_func(q, k, v, causal=True, **d)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(via_dispatch.float(), direct.float(), rtol=0, atol=0)
+
+
+@_gfx950_only
+@pytest.mark.parametrize("scale", [0.0, -0.5, float("nan"), float("inf")])
+def test_fp8_softmax_scale_rejects_invalid(scale):
+    from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
+        flydsl_flash_attn_fp8_func,
+    )
+
+    q, k, v, descales = _fp8_dispatch_inputs(B=1, S=70, H=12, D=192)
+    with pytest.raises(ValueError, match="softmax_scale must be positive and finite"):
+        flydsl_flash_attn_fp8_func(q, k, v, softmax_scale=scale, **descales)
+
+
+@pytest.mark.parametrize("varlen", [False, True])
+@pytest.mark.parametrize(
+    "scale,valid",
+    [
+        (None, True),
+        (192**-0.5, True),
+        (0.137, True),
+        (0.0, False),
+        (-0.5, False),
+        (float("nan"), False),
+        (float("inf"), False),
+        (float("-inf"), False),
+    ],
+)
+def test_fp8_softmax_scale_cpu_dispatch_contract(monkeypatch, varlen, scale, valid):
+    """Exercise both public APIs with fake tensors; no GPU or compilation."""
+    from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+
+    from aiter.jit.utils import chip_info
+    from aiter.ops.flydsl import fmha_kernels as dispatch
+    from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
+
+    launches = []
+    monkeypatch.setattr(chip_info, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(fa, "_gpu_arch", lambda device: "gfx950")
+    monkeypatch.setattr(fa, "_num_cu", lambda device: 256)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: None)
+    monkeypatch.setattr(
+        fa, "_build_fp8", lambda **kw: lambda *args, **kw: launches.append(kw)
+    )
+    with FakeTensorMode() as mode:
+
+        def fake(shape, dtype=torch.float8_e4m3fn):
+            return FakeTensor(
+                mode,
+                torch.empty(shape, dtype=dtype, device="meta"),
+                torch.device("cuda:0"),
+            )
+
+        shape = (70, 12, 192) if varlen else (1, 70, 12, 192)
+        q, k, v = fake(shape), fake(shape), fake((*shape[:-1], 128))
+        descale = fake((1,), torch.float32)
+        kw = {
+            "softmax_scale": scale,
+            "q_descale": descale,
+            "k_descale": descale,
+            "v_descale": descale,
+        }
+        direct_kw = {}
+        if varlen:
+            cu = fake((2,), torch.int32)
+            direct_kw = {
+                "cu_seqlens_q": cu,
+                "cu_seqlens_kv": cu,
+                "max_seqlen_q": 70,
+                "max_seqlen_kv": 70,
+                "cross_seqlen": False,
+            }
+            out = dispatch.flydsl_flash_attn_varlen_func(q, k, v, cu, cu, 70, 70, **kw)
+        else:
+            out = dispatch.flydsl_flash_attn_batch_func(q, k, v, **kw)
+        if not valid:
+            assert out is None
+            with pytest.raises(
+                ValueError, match="softmax_scale must be positive and finite"
+            ):
+                fa.flydsl_flash_attn_fp8_func(q, k, v, **direct_kw, **kw)
+            assert not launches
+        else:
+            direct = fa.flydsl_flash_attn_fp8_func(q, k, v, **direct_kw, **kw)
+            assert out.shape == direct.shape == (*shape[:-1], 128)
+            assert out.dtype == direct.dtype == torch.bfloat16
+            assert len(launches) == 2
+            assert all(
+                z["softmax_scale"] == (192**-0.5 if scale is None else scale)
+                for z in launches
+            )
+
+
+@pytest.mark.parametrize("head_dim", [128, 192])
+@pytest.mark.parametrize("scale", [None, 0.137])
+@pytest.mark.parametrize("compile_only", [False, True])
+def test_fp8_softmax_scale_cpu_launch_arguments(
+    monkeypatch, head_dim, scale, compile_only
+):
+    """Run and compile use the built head dimension for the default scale."""
+    from aiter.ops.flydsl.kernels.fmha_gfx950 import flash_attn_fp8_gfx950 as kernel
+
+    monkeypatch.setattr(kernel, "get_hip_arch", lambda: "gfx950")
+    monkeypatch.setattr(kernel.fx, "Stream", lambda stream: stream)
+    monkeypatch.setattr(kernel, "_run_compiled", lambda fn, *args: args)
+    monkeypatch.setattr(kernel.flyc, "compile", lambda fn, *args: args)
+    launch = kernel.build_flash_attn_dualwave_swp_fp8_module(
+        12, head_dim, head_dim_v=128
+    )
+    call = launch.compile if compile_only else launch
+    args = call(object(), object(), object(), object(), 1, 70, softmax_scale=scale)
+    assert args[-3] == (head_dim**-0.5 if scale is None else scale)
+
+
+@_gfx950_only
+def test_fp8_repeat_launch_is_bit_exact_under_load():
+    """Identical inputs must give identical bits while the GPU is contended."""
+    from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
+        flydsl_flash_attn_fp8_func,
+    )
+
+    torch.manual_seed(0)
+    q, qs = _fp8_quant(torch.randn(2, 256, 8, 128, device="cuda", dtype=torch.bfloat16))
+    k, ks = _fp8_quant(
+        torch.randn(2, 1024, 8, 128, device="cuda", dtype=torch.bfloat16)
+    )
+    v, vs = _fp8_quant(
+        torch.randn(2, 1024, 8, 128, device="cuda", dtype=torch.bfloat16)
+    )
+    kw = {
+        "causal": False,
+        "q_descale": qs,
+        "k_descale": ks,
+        "v_descale": vs,
+        "num_kv_splits": 1,
+        "fp8_block_m": 128,
+    }
+
+    load = torch.cuda.Stream()
+    filler = torch.randn(8192, 8192, device="cuda", dtype=torch.bfloat16)
+    outs = []
+    for i in range(200):
+        if i % 10 == 0:
+            with torch.cuda.stream(load):
+                for _ in range(6):
+                    filler = filler @ filler
+        outs.append(flydsl_flash_attn_fp8_func(q, k, v, **kw).clone())
+    torch.cuda.synchronize()
+
+    base = outs[100]
+    bad = sum(1 for o in outs if not torch.equal(o, base))
+    assert bad == 0, f"{bad}/200 launches differed bitwise from the reference launch"
+
+
+@_gfx1201_only
+@pytest.mark.parametrize(
+    "batch,seq_len,num_heads,head_dim",
+    [
+        # Aligned production-like Wan2.1 1.3B shape, padded to multiple of 128.
+        (1, 32768, 12, 128),
+        # Smaller aligned shape (sanity).
+        (2, 1024, 8, 128),
+        # Unaligned shape — exercises the auto-padding path. 32760 → 32768.
+        (1, 32760, 12, 128),
+    ],
+)
+def test_flydsl_fmha_correctness_bf16(batch, seq_len, num_heads, head_dim):
+    q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
+    out = flydsl_flash_attn_func(q, k, v, causal=False)
+    ref = _ref_sdpa_bshd(q, k, v)
+
+    assert out.shape == ref.shape == (batch, seq_len, num_heads, head_dim)
+    assert out.dtype == ref.dtype == torch.bfloat16
+
+    cos = F.cosine_similarity(
+        out.float().reshape(-1, head_dim),
+        ref.float().reshape(-1, head_dim),
+        dim=1,
+    )
+    # bf16 attention is noisy; cosine is the right correctness signal.
+    assert cos.min().item() > 0.99, f"min_cos={cos.min().item():.6f}"
+    assert cos.mean().item() > 0.999, f"mean_cos={cos.mean().item():.6f}"
+
+
+@_gfx1201_only
+def test_flydsl_fmha_correctness_f16():
+    """f16 dtype coverage — Wan2.1 1.3B-style shape, non-causal."""
+    batch, seq_len, num_heads, head_dim = 1, 32768, 12, 128
+    q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.float16)
+    out = flydsl_flash_attn_func(q, k, v, causal=False)
+    ref = _ref_sdpa_bshd(q, k, v, causal=False)
+
+    assert out.shape == ref.shape == (batch, seq_len, num_heads, head_dim)
+    assert out.dtype == ref.dtype == torch.float16
+
+    cos = F.cosine_similarity(
+        out.float().reshape(-1, head_dim),
+        ref.float().reshape(-1, head_dim),
+        dim=1,
+    )
+    assert cos.min().item() > 0.99, f"min_cos={cos.min().item():.6f}"
+    assert cos.mean().item() > 0.999, f"mean_cos={cos.mean().item():.6f}"
+
+
+@_gfx1201_only
+def test_flydsl_fmha_correctness_causal_small():
+    """Causal masking coverage — small bf16 shape."""
+    batch, seq_len, num_heads, head_dim = 2, 4096, 8, 128
+    q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
+    out = flydsl_flash_attn_func(q, k, v, causal=True)
+    ref = _ref_sdpa_bshd(q, k, v, causal=True)
+
+    assert out.shape == ref.shape == (batch, seq_len, num_heads, head_dim)
+    assert out.dtype == ref.dtype == torch.bfloat16
+
+    cos = F.cosine_similarity(
+        out.float().reshape(-1, head_dim),
+        ref.float().reshape(-1, head_dim),
+        dim=1,
+    )
+    assert cos.min().item() > 0.99, f"min_cos={cos.min().item():.6f}"
+    assert cos.mean().item() > 0.999, f"mean_cos={cos.mean().item():.6f}"
+
+
+@_gfx1201_only
+def test_flydsl_fmha_allows_tight_padding():
+    """Wan2.1 production case (S_real=32760 -> S_pad=32768, ratio 0.024%)
+    must pass the 0.5% threshold and produce SDPA-equivalent output.
+
+    Regression guard for option (d) — protects the production hot path
+    from a future, stricter threshold accidentally rejecting it.
+    """
+    batch, seq_len, num_heads, head_dim = 1, 32760, 12, 128
+    q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
+    out = flydsl_flash_attn_func(q, k, v, causal=False)
+    ref = _ref_sdpa_bshd(q, k, v, causal=False)
+
+    assert out.shape == ref.shape == (batch, seq_len, num_heads, head_dim)
+    cos = F.cosine_similarity(
+        out.float().reshape(-1, head_dim),
+        ref.float().reshape(-1, head_dim),
+        dim=1,
+    )
+    # Wan2.1 production cos_min was empirically 0.999992 in the RCA;
+    # 0.9999 is the conservative regression bound (bf16 noise floor).
+    assert cos.min().item() > 0.9999, f"min_cos={cos.min().item():.6f}"
 
 
 @_gfx950_only
@@ -744,12 +1908,6 @@ def test_fp8_split_kv_cross_length(causal, seq_len, seqlen_kv, num_kv_splits):
 
 
 @_gfx950_only
-def test_fp8_short_causal_split_kv_rejected():
-    with pytest.raises(ValueError, match="split-K requires seq_len>=384"):
-        _run_fp8_shape(True, seq_len=70, seqlen_kv=16384, num_kv_splits=4)
-
-
-@_gfx950_only
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize(
     "seq_len,num_kv_splits", list(zip(FP8_SPLITKV_SEQLENS, FP8_SPLITKV_SPLITS))
@@ -775,31 +1933,6 @@ def test_fp8_dense_ragged_seq_lens(seq_len):
     _run_fp8_shape(
         True, batch=2, seq_len=seq_len, num_heads=4, head_dim=192, head_dim_v=128
     )
-
-
-@_gfx950_only
-@pytest.mark.parametrize(
-    "head_dim,head_dim_v,match",
-    [
-        # D_CHUNKS < 2 aborts LLVM; D_CHUNKS > 6 miscomputes the high chunks.
-        (128, 32, "head_dim_v"),
-        (128, 224, "head_dim_v"),
-        (128, 256, "head_dim_v"),
-        (96, 96, "head_dim"),
-        (256, 192, "LDS"),
-        (320, 128, "LDS"),
-        (384, 64, "LDS"),
-    ],
-)
-def test_fp8_rejected_head_dims_raise_before_launch(head_dim, head_dim_v, match):
-    """Unsupported head dims must name the shape, not abort or fault the GPU."""
-    B, S, H = 1, 512, 4
-    torch.manual_seed(0)
-    q = torch.randn(B, S, H, head_dim, device="cuda", dtype=torch.bfloat16) * 0.1
-    k = torch.randn(B, S, H, head_dim, device="cuda", dtype=torch.bfloat16) * 0.1
-    v = torch.randn(B, S, H, head_dim_v, device="cuda", dtype=torch.bfloat16) * 0.1
-    with pytest.raises((RuntimeError, ValueError), match=match):
-        _run_fp8_into_nan_out(q, k, v, head_dim_v, causal=False, num_kv_heads=H)
 
 
 @_gfx950_only
@@ -910,83 +2043,6 @@ def test_fp8_softmax_normalises(S, k_scale, lazy_rescale, atol):
 
 
 @_gfx950_only
-def test_fp8_default_is_the_lazy_rescale():
-    """Every other fp8 case passes the flag, so the default would go untested.
-
-    V is all ones, so the exact output is 1.0 and the two runs must also agree
-    bit for bit.
-    """
-    from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
-        flydsl_flash_attn_fp8_func,
-    )
-
-    B, S, H, D = 1, 4096, 8, 128
-    fp8_max = torch.finfo(FP8_DTYPE).max
-    torch.manual_seed(0)
-    q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
-    k = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1 * 200.0
-    q_s = q.abs().amax().float() / fp8_max
-    k_s = k.abs().amax().float() / fp8_max
-    v_s = torch.tensor(1.0 / fp8_max, device="cuda")
-    v = (torch.ones(B, S, H, D, device="cuda", dtype=torch.bfloat16) / v_s).to(
-        FP8_DTYPE
-    )
-    kw = {
-        "causal": False,
-        "q_descale": q_s.reshape(1).contiguous(),
-        "k_descale": k_s.reshape(1).contiguous(),
-        "v_descale": v_s.reshape(1).contiguous(),
-        "num_kv_splits": 1,
-    }
-    qq, kk = (q / q_s).to(FP8_DTYPE), (k / k_s).to(FP8_DTYPE)
-
-    default = flydsl_flash_attn_fp8_func(qq, kk, v, **kw)
-    lazy = flydsl_flash_attn_fp8_func(qq, kk, v, dualwave_swp_lazy_rescale=True, **kw)
-    torch.cuda.synchronize()
-    torch.testing.assert_close(default.float(), lazy.float(), rtol=0, atol=0)
-
-
-@_gfx950_only
-def test_fp8_rescale_threshold_drops_past_the_long_sequence_bound():
-    """fp8 picks its rescale threshold from the KV length.
-
-    Below the bound 6 and 4 are equally accurate and 6 is cheaper; above it the
-    running max spans enough tiles that 4's extra two log2 units of P lift are
-    worth its ~0.3%. The kernel is not specialised on S, so this widens the
-    build cache to two variants -- keep it two.
-    """
-    from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
-
-    f = fa._fp8_rescale_threshold
-    assert f(1024) == 6.0
-    assert f(fa._FP8_LONG_SEQ) == 6.0
-    assert f(fa._FP8_LONG_SEQ + 1) == 4.0
-    assert f(131072) == 4.0
-    assert {f(s) for s in (1, 1024, 4096, 4097, 8192, 131072)} == {6.0, 4.0}
-
-
-@_gfx950_only
-@pytest.mark.parametrize(
-    "batch,num_heads,seqlen_q,seqlen_kv,expect",
-    [
-        (1, 8, 512, 512, 128),
-        (1, 8, 2048, 2048, 128),
-        (8, 32, 2048, 2048, 256),
-        (16, 32, 1024, 1024, 256),
-        (32, 32, 512, 512, 256),
-        (1, 8, 4096, 4096, 256),
-        (1, 8, 4096, 16384, 256),
-        (2, 8, 4096, 4096, 256),
-    ],
-)
-def test_fp8_auto_block_m_picks(batch, num_heads, seqlen_q, seqlen_kv, expect):
-    """Pin what ``_fp8_auto_block_m`` chooses; correctness tests pass either way."""
-    from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
-
-    assert fa._fp8_auto_block_m(batch, num_heads, seqlen_q, seqlen_kv, 256) == expect
-
-
-@_gfx950_only
 @pytest.mark.parametrize("split", [False, True])
 @pytest.mark.parametrize("softmax_scale", [None, 0.37])
 def test_fp8_out_tensor_is_filled_and_returned(monkeypatch, split, softmax_scale):
@@ -1029,109 +2085,6 @@ def test_fp8_out_tensor_is_filled_and_returned(monkeypatch, split, softmax_scale
 
 
 @_gfx950_only
-@pytest.mark.parametrize(
-    "case", ["b1_too_large", "per_slice_still_too_large", "kv_only_over_limit"]
-)
-def test_fp8_flat_overflow_guard_covers_every_tensor(monkeypatch, case):
-    """The int32 flat-dim guard has to see K and V, and to give up loudly.
-
-    Splitting divides the flat dim by B, so it only helps while B > 1 and while
-    one entry fits. Cross-attention can also put the excess in K/V rather than
-    Q. Each case lowers the bound rather than allocating 2**31 elements.
-    """
-    from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
-
-    torch.manual_seed(0)
-    H, D = 8, 128
-    B, Sq, Skv = (1, 1024, 1024) if case == "b1_too_large" else (2, 1024, 1024)
-    if case == "kv_only_over_limit":
-        Sq = 256
-    q = torch.randn(B, Sq, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
-    k = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
-    v = torch.randn_like(k)
-    qq, qs = _fp8_quant(q)
-    kq, ks = _fp8_quant(k)
-    vq, vs = _fp8_quant(v)
-    kw = {
-        "causal": False,
-        "q_descale": qs,
-        "k_descale": ks,
-        "v_descale": vs,
-        "fp8_block_m": 256,
-        "num_kv_splits": 1,
-    }
-
-    if case == "kv_only_over_limit":
-        # Between q's count and k's, so only the K/V check can fire. B=2 splits.
-        ref = fa.flydsl_flash_attn_fp8_func(qq, kq, vq, **kw)
-        monkeypatch.setattr(fa, "_FP8_MAX_FLAT_ELEMS", kq.numel())
-        got = fa.flydsl_flash_attn_fp8_func(qq, kq, vq, **kw)
-        torch.testing.assert_close(got.float(), ref.float(), rtol=0, atol=0)
-        return
-
-    # b1_too_large has no batch to divide; per_slice_still_too_large has B=2 but
-    # a bound low enough that one entry is still over, so the recursion hits the
-    # same wall. Both must raise rather than launch.
-    bound = qq.numel() if case == "b1_too_large" else qq.numel() // 2
-    monkeypatch.setattr(fa, "_FP8_MAX_FLAT_ELEMS", bound)
-    with pytest.raises(NotImplementedError, match="int32"):
-        fa.flydsl_flash_attn_fp8_func(qq, kq, vq, **kw)
-
-
-@_gfx950_only
-def test_fp8_split_result_survives_a_non_current_stream(monkeypatch):
-    """The split must not be consumed on a stream that is not the one it ran on.
-
-    Every launch goes to ``stream``; building the result on the ambient stream
-    reads it while those kernels are still queued, and the damage survives a
-    later synchronize because the copy already happened.
-    """
-    from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
-
-    B, S, H, D = 2, 512, 8, 128
-    torch.manual_seed(0)
-    q = (torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1).to(
-        FP8_DTYPE
-    )
-    k, v = q.clone(), q.clone()
-    scale = torch.ones(1, device="cuda")
-    kw = {"causal": False, "q_descale": scale, "k_descale": scale, "v_descale": scale}
-
-    ref = fa.flydsl_flash_attn_fp8_func(q, k, v, **kw)
-    torch.cuda.synchronize()
-
-    monkeypatch.setattr(fa, "_FP8_MAX_FLAT_ELEMS", B * S * H * D * 3 // 4)
-    side = torch.cuda.Stream()
-    # Elementwise, not a matmul: the point is only to keep `side` busy, and a
-    # GEMM would drag in a hipBLAS handle this test has no reason to need.
-    filler = torch.randn(8192, 8192, device="cuda")
-    with torch.cuda.stream(side):
-        for _ in range(40):  # keep the stream busy so the attention starts late
-            filler = torch.sin(filler)
-    got = fa.flydsl_flash_attn_fp8_func(q, k, v, stream=side, **kw)
-    torch.cuda.synchronize()
-
-    torch.testing.assert_close(got.float(), ref.float(), rtol=0, atol=0)
-
-
-def _fp8_dispatch_inputs(B=2, S=1024, H=8, D=128, varlen=False, Skv=None):
-    """Quantized inputs for the dispatch tests."""
-    torch.manual_seed(0)
-    Skv = S if Skv is None else Skv
-
-    def _t(seq_len):
-        shape = (B * seq_len, H, D) if varlen else (B, seq_len, H, D)
-        return torch.empty(shape, device="cuda", dtype=torch.bfloat16).uniform_(
-            *FP8_UNIFORM_RANGE
-        )
-
-    q, qs = _fp8_quant(_t(S))
-    k, ks = _fp8_quant(_t(Skv))
-    v, vs = _fp8_quant(_t(Skv))
-    return q, k, v, {"q_descale": qs, "k_descale": ks, "v_descale": vs}
-
-
-@_gfx950_only
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("softmax_scale", [None, 0.37])
 def test_fp8_dispatch_batch_routes_to_gfx950(causal, softmax_scale):
@@ -1155,7 +2108,7 @@ def test_fp8_dispatch_batch_routes_to_gfx950(causal, softmax_scale):
         softmax_scale,
     )
     cos = F.cosine_similarity(out.float().reshape(-1, D), ref.reshape(-1, D), dim=1)
-    assert _fp8_rel_err(out.float(), ref)[0] < FP8_REL_ERR
+    assert _fp8_rel_err(out.float(), ref)[0] < FP8_REL_ERR[out.dtype]
     assert cos.min().item() > FP8_MIN_COS
 
 
@@ -1200,51 +2153,8 @@ def test_fp8_dispatch_varlen_routes_to_gfx950(causal, softmax_scale):
             softmax_scale,
         ).squeeze(0)
     cos = F.cosine_similarity(out.float().reshape(-1, D), ref.reshape(-1, D), dim=1)
-    assert _fp8_rel_err(out.float(), ref)[0] < FP8_REL_ERR
+    assert _fp8_rel_err(out.float(), ref)[0] < FP8_REL_ERR[out.dtype]
     assert cos.min().item() > FP8_MIN_COS
-
-
-@_gfx950_only
-@pytest.mark.parametrize(
-    "unsupported",
-    [
-        pytest.param({}, id="no_descales"),
-        pytest.param({"softmax_scale": 0.0}, id="zero_softmax_scale"),
-        pytest.param({"softmax_scale": -0.5}, id="negative_softmax_scale"),
-        pytest.param({"softmax_scale": float("nan")}, id="nan_softmax_scale"),
-        pytest.param({"softmax_scale": float("inf")}, id="inf_softmax_scale"),
-        pytest.param({"dropout_p": 0.1}, id="dropout"),
-        pytest.param({"window_size": (128, 0)}, id="sliding_window"),
-        pytest.param({"window_size": (-1, -1, 4)}, id="sink_size"),
-        pytest.param({"alibi_slopes": "H_f32"}, id="alibi"),
-        pytest.param({"sink": "H_f32"}, id="sink"),
-        pytest.param({"out": "fp8_out"}, id="non_bf16_out"),
-        pytest.param({"q_descale": "cpu_scale"}, id="descale_on_cpu"),
-        pytest.param({"k_descale": "cpu_scale"}, id="k_descale_on_cpu"),
-    ],
-)
-def test_fp8_dispatch_rejects_unsupported(unsupported):
-    """Anything the fp8 kernel cannot express returns None, not a wrong answer.
-
-    Falling through is what lets the caller reach CK/Triton; raising or silently
-    dropping the feature would both be wrong.
-    """
-    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_func
-
-    B, S, H, D = 2, 512, 8, 128
-    q, k, v, d = _fp8_dispatch_inputs(B, S, H, D)
-    kw = dict(d)
-    materialise = {
-        "H_f32": lambda: torch.zeros(H, device="cuda", dtype=torch.float32),
-        "fp8_out": lambda: torch.empty(B, S, H, D, device="cuda", dtype=FP8_DTYPE),
-        "cpu_scale": lambda: torch.ones(1, device="cpu", dtype=torch.float32),
-    }
-    for key, val in unsupported.items():
-        kw[key] = materialise[val]() if val in materialise else val
-    if not unsupported:  # the no_descales case
-        kw = {}
-
-    assert flydsl_flash_attn_batch_func(q, k, v, causal=True, **kw) is None
 
 
 @_gfx950_only
@@ -1297,27 +2207,13 @@ def test_fp8_gate_is_scale_invariant(dist, causal):
     cos = F.cosine_similarity(
         out.float().reshape(-1, D), ref.reshape(-1, D), dim=1
     ).min()
-    assert rel_err < FP8_REL_ERR and cos.item() > FP8_MIN_COS, (
+    assert rel_err < FP8_REL_ERR[out.dtype] and cos.item() > FP8_MIN_COS, (
         f"fp8 gate ({dist}, causal={causal}): rel_err={rel_err:.3e} "
-        f"(< {FP8_REL_ERR}), max_err={max_err:.3e}, ref_amax={scale:.3e}, "
+        f"(< {FP8_REL_ERR[out.dtype]}), max_err={max_err:.3e}, ref_amax={scale:.3e}, "
         f"min_cos={cos.item():.5f}"
     )
 
     _assert_lse_matches(lse, _ref_lse(q_r, k_r, causal))
-
-
-@_gfx950_only
-def test_fp8_dispatch_rejects_descale_on_another_device():
-    """A descale on a different CUDA device falls through instead of raising."""
-    if torch.cuda.device_count() < 2:
-        pytest.skip("requires >=2 visible GPUs")
-
-    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_func
-
-    B, S, H, D = 2, 512, 8, 128
-    q, k, v, d = _fp8_dispatch_inputs(B, S, H, D)
-    d["q_descale"] = d["q_descale"].to("cuda:1")
-    assert flydsl_flash_attn_batch_func(q, k, v, causal=True, **d) is None
 
 
 @_gfx950_only
@@ -1572,69 +2468,6 @@ def test_fp8_varlen_zero_length_kv_entry(causal, vl_q, vl_kv):
 
 @_gfx950_only
 @pytest.mark.parametrize("causal", [False, True])
-def test_fp8_dispatch_return_lse(causal):
-    """``return_lse`` now routes to gfx950 fp8 instead of falling through."""
-    from aiter.ops.flydsl.fmha_kernels import (
-        flydsl_flash_attn_batch_func,
-        flydsl_flash_attn_varlen_func,
-    )
-
-    B, S, H, D = 2, 1024, 8, 128
-    q, k, v, d = _fp8_dispatch_inputs(B, S, H, D)
-    out, lse = flydsl_flash_attn_batch_func(
-        q, k, v, causal=causal, return_lse=True, **d
-    )
-    assert out.shape == (B, S, H, D)
-    assert lse.shape == (B, H, S)
-    ref = _ref_lse(
-        _fp8_dequant(q, d["q_descale"]), _fp8_dequant(k, d["k_descale"]), causal
-    )
-    assert _fp8_rel_err(lse, ref, floor=1.0)[0] < FP8_LSE_REL_ERR
-
-    qv, kv, vv, dv = _fp8_dispatch_inputs(B, S, H, D, varlen=True)
-    cu = torch.tensor([0, 400, B * S], dtype=torch.int32, device="cuda")
-    out_v, lse_v = flydsl_flash_attn_varlen_func(
-        qv,
-        kv,
-        vv,
-        cu,
-        cu,
-        B * S - 400,
-        B * S - 400,
-        causal=causal,
-        return_lse=True,
-        **dv,
-    )
-    assert out_v.shape == (B * S, H, D)
-    assert lse_v.shape == (H, B * S)
-
-
-@_gfx950_only
-def test_fp8_dispatch_rejects_bf16_inputs():
-    """bf16 on gfx950 has no FlyDSL kernel here and must fall through."""
-    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_func
-
-    q = torch.randn(2, 512, 8, 128, device="cuda", dtype=torch.bfloat16)
-    assert flydsl_flash_attn_batch_func(q, q.clone(), q.clone(), causal=True) is None
-
-
-@_gfx950_only
-def test_fp8_dispatch_matches_direct_call():
-    """The dispatch wrapper must not perturb the kernel it routes to."""
-    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_func
-    from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
-        flydsl_flash_attn_fp8_func,
-    )
-
-    q, k, v, d = _fp8_dispatch_inputs()
-    via_dispatch = flydsl_flash_attn_batch_func(q, k, v, causal=True, **d)
-    direct = flydsl_flash_attn_fp8_func(q, k, v, causal=True, **d)
-    torch.cuda.synchronize()
-    torch.testing.assert_close(via_dispatch.float(), direct.float(), rtol=0, atol=0)
-
-
-@_gfx950_only
-@pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize(
     "S, Skv, H_KV, D, splits",
     [
@@ -1677,7 +2510,7 @@ def test_fp8_softmax_scale_dense(causal, S, Skv, H_KV, D, splits):
             assert torch.equal(out, default_out)
             assert torch.equal(lse, default_lse)
         ref = _ref_attention(qd, kd, vd, causal, scale)
-        assert _fp8_rel_err(out.float(), ref)[0] < FP8_REL_ERR
+        assert _fp8_rel_err(out.float(), ref)[0] < FP8_REL_ERR[out.dtype]
         _assert_lse_matches(lse, _ref_lse(qd, kd, causal, scale))
     for scale, saved in zip((qs, ks, vs), saved_descales):
         assert torch.equal(scale, saved), "softmax_scale must not mutate descales"
@@ -1728,7 +2561,10 @@ def test_fp8_softmax_scale_varlen(causal, cuq, cukv, splits):
             kr = kd[cukv[i] : cukv[i + 1]].unsqueeze(0)
             vr = vd[cukv[i] : cukv[i + 1]].unsqueeze(0)
             ref = _ref_attention(qr, kr, vr, causal, scale)[0]
-            assert _fp8_rel_err(out[cuq[i] : cuq[i + 1]].float(), ref)[0] < FP8_REL_ERR
+            assert (
+                _fp8_rel_err(out[cuq[i] : cuq[i + 1]].float(), ref)[0]
+                < FP8_REL_ERR[out.dtype]
+            )
             _assert_lse_matches(
                 lse[:, cuq[i] : cuq[i + 1]], _ref_lse(qr, kr, causal, scale)[0]
             )
@@ -1766,154 +2602,52 @@ def test_fp8_softmax_scale_graph_replay(S, Skv, causal, splits):
         assert torch.equal(lse, expected_lse)
 
 
-@_gfx950_only
-@pytest.mark.parametrize("scale", [0.0, -0.5, float("nan"), float("inf")])
-def test_fp8_softmax_scale_rejects_invalid(scale):
-    from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
-        flydsl_flash_attn_fp8_func,
+def main():
+    arch, build = get_gfx_runtime(), get_gfx()
+    if build != arch or arch not in ("gfx1201", "gfx950"):
+        aiter.logger.warning(
+            "FlyDSL flash attention requires gfx1201 or gfx950; skipping "
+            "(build=%s, attached=%s)",
+            build,
+            arch,
+        )
+        return
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="FlyDSL flash attention correctness and warm-buffer timing sweep",
     )
-
-    q, k, v, descales = _fp8_dispatch_inputs(B=1, S=70, H=12, D=192)
-    with pytest.raises(ValueError, match="softmax_scale must be positive and finite"):
-        flydsl_flash_attn_fp8_func(q, k, v, softmax_scale=scale, **descales)
-
-
-@pytest.mark.parametrize("varlen", [False, True])
-@pytest.mark.parametrize(
-    "scale,valid",
-    [
-        (None, True),
-        (192**-0.5, True),
-        (0.137, True),
-        (0.0, False),
-        (-0.5, False),
-        (float("nan"), False),
-        (float("inf"), False),
-        (float("-inf"), False),
-    ],
-)
-def test_fp8_softmax_scale_cpu_dispatch_contract(monkeypatch, varlen, scale, valid):
-    """Exercise both public APIs with fake tensors; no GPU or compilation."""
-    from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
-
-    from aiter.jit.utils import chip_info
-    from aiter.ops.flydsl import fmha_kernels as dispatch
-    from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
-
-    launches = []
-    monkeypatch.setattr(chip_info, "get_gfx", lambda: "gfx950")
-    monkeypatch.setattr(fa, "_gpu_arch", lambda device: "gfx950")
-    monkeypatch.setattr(fa, "_num_cu", lambda device: 256)
-    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: None)
-    monkeypatch.setattr(
-        fa, "_build_fp8", lambda **kw: lambda *args, **kw: launches.append(kw)
+    parser.add_argument("--causal", type=int, choices=[0, 1], nargs="+", default=[0, 1])
+    parser.add_argument(
+        "--cases",
+        nargs="+",
+        default=None,
+        help="gfx950 fp8 case names to sweep (default: all)",
     )
-    with FakeTensorMode() as mode:
+    args = parser.parse_args()
+    causals = [bool(c) for c in args.causal]
+    if arch == "gfx1201":
+        label = "gfx1201 bf16/f16"
+        rows = [test_fmha_rdna(*c) for c in RDNA_CASES if c[1] in causals]
+    else:
+        from aiter.ops.flydsl.unified_attention_kernels import is_flydsl_available
 
-        def fake(shape, dtype=torch.float8_e4m3fn):
-            return FakeTensor(
-                mode,
-                torch.empty(shape, dtype=dtype, device="meta"),
-                torch.device("cuda:0"),
-            )
-
-        shape = (70, 12, 192) if varlen else (1, 70, 12, 192)
-        q, k, v = fake(shape), fake(shape), fake((*shape[:-1], 128))
-        descale = fake((1,), torch.float32)
-        kw = {
-            "softmax_scale": scale,
-            "q_descale": descale,
-            "k_descale": descale,
-            "v_descale": descale,
-        }
-        direct_kw = {}
-        if varlen:
-            cu = fake((2,), torch.int32)
-            direct_kw = {
-                "cu_seqlens_q": cu,
-                "cu_seqlens_kv": cu,
-                "max_seqlen_q": 70,
-                "max_seqlen_kv": 70,
-                "cross_seqlen": False,
-            }
-            out = dispatch.flydsl_flash_attn_varlen_func(q, k, v, cu, cu, 70, 70, **kw)
-        else:
-            out = dispatch.flydsl_flash_attn_batch_func(q, k, v, **kw)
-        if not valid:
-            assert out is None
-            with pytest.raises(
-                ValueError, match="softmax_scale must be positive and finite"
-            ):
-                fa.flydsl_flash_attn_fp8_func(q, k, v, **direct_kw, **kw)
-            assert not launches
-        else:
-            direct = fa.flydsl_flash_attn_fp8_func(q, k, v, **direct_kw, **kw)
-            assert out.shape == direct.shape == (*shape[:-1], 128)
-            assert out.dtype == direct.dtype == torch.bfloat16
-            assert len(launches) == 2
-            assert all(
-                z["softmax_scale"] == (192**-0.5 if scale is None else scale)
-                for z in launches
-            )
+        if not is_flydsl_available(torch.cuda.current_device()):
+            aiter.logger.warning("FlyDSL fp8 attention requires FlyDSL; skipping")
+            return
+        label = "gfx950 fp8"
+        selected = args.cases or list(FP8_CASES)
+        unknown = [n for n in selected if n not in FP8_CASES]
+        if unknown:
+            parser.error(f"unknown cases: {unknown}")
+        rows = [
+            test_fmha_fp8(n, c)
+            for n, c in itertools.product(selected, causals)
+            if c in FP8_CASES[n]["causal"]
+        ]
+    df = pd.DataFrame(rows)
+    aiter.logger.info("%s summary (markdown):\n%s", label, df.to_markdown(index=False))
+    aiter.logger.info("PASS: all %s cases; all candidate timings non-zero", label)
 
 
-@pytest.mark.parametrize("head_dim", [128, 192])
-@pytest.mark.parametrize("scale", [None, 0.137])
-@pytest.mark.parametrize("compile_only", [False, True])
-def test_fp8_softmax_scale_cpu_launch_arguments(
-    monkeypatch, head_dim, scale, compile_only
-):
-    """Run and compile use the built head dimension for the default scale."""
-    from aiter.ops.flydsl.kernels.fmha_gfx950 import flash_attn_fp8_gfx950 as kernel
-
-    monkeypatch.setattr(kernel, "get_hip_arch", lambda: "gfx950")
-    monkeypatch.setattr(kernel.fx, "Stream", lambda stream: stream)
-    monkeypatch.setattr(kernel, "_run_compiled", lambda fn, *args: args)
-    monkeypatch.setattr(kernel.flyc, "compile", lambda fn, *args: args)
-    launch = kernel.build_flash_attn_dualwave_swp_fp8_module(
-        12, head_dim, head_dim_v=128
-    )
-    call = launch.compile if compile_only else launch
-    args = call(object(), object(), object(), object(), 1, 70, softmax_scale=scale)
-    assert args[-3] == (head_dim**-0.5 if scale is None else scale)
-
-
-@_gfx950_only
-def test_fp8_repeat_launch_is_bit_exact_under_load():
-    """Identical inputs must give identical bits while the GPU is contended."""
-    from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
-        flydsl_flash_attn_fp8_func,
-    )
-
-    torch.manual_seed(0)
-    q, qs = _fp8_quant(torch.randn(2, 256, 8, 128, device="cuda", dtype=torch.bfloat16))
-    k, ks = _fp8_quant(
-        torch.randn(2, 1024, 8, 128, device="cuda", dtype=torch.bfloat16)
-    )
-    v, vs = _fp8_quant(
-        torch.randn(2, 1024, 8, 128, device="cuda", dtype=torch.bfloat16)
-    )
-    kw = {
-        "causal": False,
-        "q_descale": qs,
-        "k_descale": ks,
-        "v_descale": vs,
-        "num_kv_splits": 1,
-        "fp8_block_m": 128,
-    }
-
-    load = torch.cuda.Stream()
-    filler = torch.randn(8192, 8192, device="cuda", dtype=torch.bfloat16)
-    outs = []
-    for i in range(200):
-        if i % 10 == 0:
-            with torch.cuda.stream(load):
-                for _ in range(6):
-                    filler = filler @ filler
-        outs.append(flydsl_flash_attn_fp8_func(q, k, v, **kw).clone())
-    torch.cuda.synchronize()
-
-    base = outs[100]
-    bad = sum(1 for o in outs if not torch.equal(o, base))
-    assert bad == 0, f"{bad}/200 launches differed bitwise from the reference launch"
+if __name__ == "__main__":
+    main()

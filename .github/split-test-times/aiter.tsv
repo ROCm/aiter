@@ -20,7 +20,7 @@ op_tests/test_flydsl_causal_conv1d_update.py	90
 op_tests/test_flydsl_compress_attn.py	62
 op_tests/test_flydsl_conv_implicit.py	291
 op_tests/test_flydsl_dcp_topk_merge.py	15
-op_tests/test_flydsl_fmha.py	4
+op_tests/test_flydsl_fmha.py	273
 op_tests/test_flydsl_fp8_mqa_logits.py	65
 op_tests/test_flydsl_fp8_paged_mqa_logits.py	8
 op_tests/test_flydsl_gather_kv_b_proj.py	7
@@ -164,6 +164,7 @@ op_tests/test_topk_row_prefill.py	5
 op_tests/test_topk_select.py	45
 op_tests/test_topk_softmax.py	4
 op_tests/test_topk_softmax_shared_gate.py	26
+op_tests/test_unified_attention.py	33
 op_tests/test_vsa_sparse_attention.py	4
 op_tests/tuning_tests/test_config_shape_collision.py	4
 op_tests/tuning_tests/test_csv_validation.py	1

@@ -6,10 +6,10 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl.expr import as_ir_value as as_mlir_value
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
@@ -66,8 +66,8 @@ class DualwaveSplitKCombineContext:
     def init_thread_mapping(self, combine_rows_per_block, combine_lanes_per_row):
         traits = self.traits
         self.tid = fx.Index(gpu.thread_idx.x)
-        self.blk = fx.Index(gpu.block_idx.x)
-        self.batch_idx = fx.Index(gpu.block_idx.y)
+        self.blk = fx.Int64(fx.block_idx.x)
+        self.batch_idx = fx.Int64(fx.block_idx.y)
         self.col = (self.tid % combine_lanes_per_row) * 4
         rows_per_batch = self.seq_len_v * traits.NUM_HEADS_Q
         row_raw = self.blk * combine_rows_per_block + self.tid // combine_lanes_per_row
@@ -187,7 +187,7 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
         @flyc.jit
         def _accum_split(acc, den):
             if fx.Float32(l_i) > fx.Float32(0.0):
-                w = fx.Float32(m_i - m_max).exp2(fastmath="afn").ir_value()
+                w = fx.math.exp2(fx.Float32(m_i - m_max), fastmath="afn").ir_value()
                 wl = w * l_i
                 den = den + wl
                 o2_raw = buffer_ops.buffer_load(
@@ -210,6 +210,7 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
         return acc, den
 
     def pack_output(self, acc, den):
+        # No stable approximate-reciprocal API at v0.4.0: 1.0 / x lowers to arith.divf (IEEE).
         inv_rcp = rocdl.rcp(T.f32, den)
         inv = (fx.Float32(den) > self.c_zero_f).select(inv_rcp, self.c_zero_f)
         inv4 = Vec.from_elements([fx.Float32(inv)], fx.Float32).broadcast_to(4)
