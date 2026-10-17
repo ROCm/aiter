@@ -22,6 +22,7 @@ from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
     gemm_afp8wfp8_preshuffle,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.test_common import run_perftest
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
     get_ff_args,
@@ -69,6 +70,8 @@ def bench_gemm_fn(
     cudagraph: bool = False,
     w_scale_group_size: tuple[int, int] = (128, 128),
     test: bool = False,
+    perftest: bool = False,
+    num_rotate_args: int = 0,
 ):
     group_n, group_k = w_scale_group_size
     if K % x_scale_group_size or K % group_k or (preshuffle and N % 128):
@@ -94,26 +97,32 @@ def bench_gemm_fn(
     mem_write = y.numel() * y.element_size()
     mem = mem_read + mem_write
 
-    kwargs = {
-        "dtype": dtype,
-        "y": y,
-        "x_scale_group_size": x_scale_group_size,
-        "is_x_scale_transposed": transpose_x_scale,
-    }
-    if preshuffle:
-        fn = lambda: gemm_afp8wfp8_preshuffle(
-            x, w_kernel, x_scales_kernel, w_scales, backend=backend, **kwargs
-        )
-    else:
-        # Only the preshuffle wrapper has a gluon backend.
-        fn = lambda: gemm_afp8wfp8(
+    def call(x, w_kernel, x_scales_kernel, w_scales, y):
+        kwargs = {
+            "dtype": dtype,
+            "y": y,
+            "x_scale_group_size": x_scale_group_size,
+            "is_x_scale_transposed": transpose_x_scale,
+        }
+        if preshuffle:
+            return gemm_afp8wfp8_preshuffle(
+                x, w_kernel, x_scales_kernel, w_scales, backend=backend, **kwargs
+            )
+        # gemm_afp8wfp8 keeps triton unless gluon is asked for explicitly.
+        return gemm_afp8wfp8(
             x,
             w_kernel,
             x_scales_kernel,
             w_scales,
             w_scale_group_size=w_scale_group_size,
+            backend=backend,
             **kwargs,
         )
+
+    # Every tensor the GEMM touches is positional so perftest's rotation copies
+    # (and sizes its rotation count from) all of them, output included.
+    bench_args = (x, w_kernel, x_scales_kernel, w_scales, y)
+    fn = lambda: call(*bench_args)
 
     if test:
         a = x.double() * torch.exp2(xs.double() - 127).repeat_interleave(
@@ -132,11 +141,23 @@ def bench_gemm_fn(
             atol=5e-5 * expected.abs().max().item(),
         )
 
-    bench_fn = (
-        triton.testing.do_bench_cudagraph if cudagraph else triton.testing.do_bench
-    )
-    bench_kwargs = {"rep": 100} if cudagraph else {"warmup": 25, "rep": 100}
-    ms = bench_fn(fn, **bench_kwargs)
+    if perftest:
+        # aiter's perftest: rotating copies of the inputs and output, timed from
+        # the profiler's device kernel times (no CPU launch gaps); with
+        # --cudagraph, from one replay of a graph of the same rotation.
+        _, us = run_perftest(
+            call,
+            *bench_args,
+            num_rotate_args=num_rotate_args,
+            testGraph=cudagraph,
+        )
+        ms = us * 1e-3
+    else:
+        bench_fn = (
+            triton.testing.do_bench_cudagraph if cudagraph else triton.testing.do_bench
+        )
+        bench_kwargs = {"rep": 100} if cudagraph else {"warmup": 25, "rep": 100}
+        ms = bench_fn(fn, **bench_kwargs)
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
@@ -161,6 +182,8 @@ def _bench_args(args):
         "cudagraph": args.cudagraph,
         "w_scale_group_size": tuple(args.w_scale_group_size),
         "test": args.test,
+        "perftest": args.perftest,
+        "num_rotate_args": args.num_rotate_args,
     }
 
 
@@ -253,7 +276,7 @@ def parse_args(args: list[str] | None = None):
         type=str,
         choices=["triton", "gluon"],
         default=None,
-        help="Backend for the preshuffle kernel. Default auto-detects (gluon on gfx1250, else triton). Ignored without --shuffle.",
+        help="Backend. With --shuffle the default auto-detects (gluon on gfx1250, else triton); without it the default is triton and gluon selects gemm_afp8wfp8's gluon kernels.",
     )
     parser.add_argument(
         "--dtype",
@@ -283,6 +306,21 @@ def parse_args(args: list[str] | None = None):
         action="store_true",
         default=False,
         help="Use do_bench_cudagraph instead of do_bench to reduce CPU overhead for bandwidth-bound kernels.",
+    )
+    parser.add_argument(
+        "--perftest",
+        action="store_true",
+        help="Time with aiter.test_common.run_perftest instead: rotating copies of every "
+        "input and the output, device kernel time from the profiler (no CPU launch "
+        "gaps). With --cudagraph, perftest's graph mode (testGraph).",
+    )
+    parser.add_argument(
+        "--num-rotate-args",
+        "--num_rotate_args",
+        type=int,
+        default=0,
+        help="[--perftest] Buffer sets to rotate through; 0 lets perftest size it "
+        "from the cache and free memory (capped at its 101 iterations).",
     )
     parser.add_argument(
         "--w-scale-group-size",
