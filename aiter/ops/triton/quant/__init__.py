@@ -1,3 +1,7 @@
+from aiter.ops.triton.quant.dequant_hadamard_quant_mxfp4 import (
+    dequant_hadamard_quant_mxfp4,
+)
+from aiter.ops.triton.quant.dual_layout_mxfp4 import dual_layout_quant_mxfp4
 from aiter.ops.triton.quant.fast_transpose import (
     fast_transpose_2d,
     transpose_packed_fp4,
@@ -59,6 +63,8 @@ __all__ = [
     # fast_transpose.py exports
     "convert_from_mxfp8",
     "convert_to_mxfp8",
+    "dequant_hadamard_quant_mxfp4",
+    "dual_layout_quant_mxfp4",
     "dynamic_mxfp4_quant",
     "dynamic_mxfp4_quant_blockscale",
     "dynamic_mxfp8_quant",
