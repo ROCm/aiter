@@ -1242,6 +1242,7 @@ def _unified_attention_gfx950(
         BLOCK_Q=BLOCK_Q,
         BLOCK_M=BLOCK_M,
         MFMA_DIM=config["MFMA_DIM"],
+        WARPS_N=config.get("WARPS_N", 1),
         ARCH_NAME=DEVICE_ARCH,
         waves_per_eu=config["waves_per_eu"],
         USE_LOAD_BUFFER_OP=USE_LOAD_BUFFER_OP,

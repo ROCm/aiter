@@ -363,6 +363,7 @@ class AttentionConfig:
         stride_v_cache_1,
         stride_v_cache_2,
         stride_v_cache_3,
+        WARPS_N=1,
     ):
         self.HEAD_SIZE = gl.constexpr(HEAD_SIZE)
         self.BLOCK_SIZE = gl.constexpr(BLOCK_SIZE)
@@ -424,12 +425,13 @@ class AttentionConfig:
         self.NUM_MASKED_TILES = gl.constexpr(
             max(1, ((QUERY_SPAN + self.TILE_SIZE - 1) // self.TILE_SIZE))
         )
+        assert NUM_WARPS % WARPS_N == 0
         self.qk_layout = gl.constexpr(
             gl.amd.AMDMFMALayout(
                 version=4,
                 transposed=True,
                 instr_shape=mfma_instr,
-                warps_per_cta=[NUM_WARPS, 1],
+                warps_per_cta=[NUM_WARPS // WARPS_N, WARPS_N],
             )
         )
 
@@ -438,7 +440,7 @@ class AttentionConfig:
                 version=4,
                 transposed=True,
                 instr_shape=mfma_instr,
-                warps_per_cta=[NUM_WARPS, 1],
+                warps_per_cta=[NUM_WARPS // WARPS_N, WARPS_N],
             )
         )
         self.q_layout = gl.constexpr(
@@ -1884,6 +1886,7 @@ def _unified_attention_gluon_kernel(
     REMOVE_INDIRECT_ACCESS: gl.constexpr = False,
     NUM_BUFFERS: gl.constexpr = 2,
     MFMA_DIM: gl.constexpr = 32,
+    WARPS_N: gl.constexpr = 1,
     USE_SOFTCAP: gl.constexpr = False,
     SHUFFLED_KV_CACHE: gl.constexpr = False,
     KV_SHUFFLE_WIDTH: gl.constexpr = 0,
@@ -1943,6 +1946,7 @@ def _unified_attention_gluon_kernel(
         stride_v_cache_1,
         stride_v_cache_2,
         stride_v_cache_3,
+        WARPS_N,
     )
 
     if not USE_STORE_BUFFER_OP:
