@@ -26,8 +26,10 @@ Notes on the fla-compatible surface:
     * ``allow_neg_eigval`` / ``return_intermediate_states`` / ``cp_context`` /
       ``cu_seqlens_cpu`` have no counterpart yet and are rejected rather than
       silently ignored.
-    * Tensor arguments are made contiguous here, as fla's ``@input_guard``
-      does, because some kernels below assume contiguous strides.
+    * Tensor arguments are made contiguous, as fla's ``@input_guard`` does,
+      because some kernels below assume contiguous strides. On gfx1250 the
+      FlashKDA kernels read q, k, v and g at their own token stride instead,
+      so the bands of a fused projection reach them without a copy.
     * This path is forward-only, so the output carries no ``grad_fn`` even
       when the inputs require grad, whereas fla returns a differentiable
       tensor.
@@ -257,10 +259,11 @@ def chunk_kimi_delta_attn(
     # Match fla, which puts `@input_guard` on its autograd Function. Several
     # kernels below index their operands with contiguous strides rather than
     # reading the tensor's own, so a view would be read as garbage instead of
-    # raising: `q`/`k` reach the unguarded l2norm, `initial_state` the
-    # unguarded state kernel. No-op for the contiguous inputs serving stacks
-    # normally pass.
-    q, k, v, g, beta = (t.contiguous() for t in (q, k, v, g, beta))
+    # raising: `initial_state` reaches the unguarded state kernel, for one.
+    # q, k, v and g are left to `chunk_delta_attn_fwd`, which packs them where
+    # the route needs it: on gfx1250 the FlashKDA kernels read the bands of a
+    # fused projection in place.
+    beta = beta.contiguous()
     if A_log is not None:
         A_log = A_log.contiguous()
     if dt_bias is not None:

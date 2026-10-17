@@ -192,6 +192,11 @@ def chunk_delta_attn_fwd(
         )
         return o, final_state, None, None, None, None, None, None, None
 
+    # FlashKDA packs these for itself, since some of its kernels read strided
+    # ones in place; the kernels below index them with packed strides, and
+    # l2norm is not guarded.
+    q, k, v, g = (t.contiguous() for t in (q, k, v, g))
+
     # ------------------------------------------------------------------
     # Step 0 — Optional QK L2 normalization (matches FLA API)
     # ------------------------------------------------------------------
