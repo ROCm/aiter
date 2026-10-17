@@ -3,10 +3,10 @@
 
 """Experimental gfx950 D256 PA with wave-local online softmax.
 
-Four waves own (16 query rows, 32 KV tokens) each. QL4 uses all rows;
-QL1-3 mask unused rows and retain the four-wave schedule.
-Each wave computes the full D256 output; head_splits=2 instead duplicates
-QK across two D128 PV slices using eight waves. Token halves are merged
+Four waves own (16 query rows, 32 KV tokens) each. QL1/2 share one
+query group and split PV into D128 slices, avoiding a masked second query
+group. QL3/4 use two query groups and full D256 output per wave. Explicit
+head_splits=2 retains the eight-wave per-tensor experiment. Token halves are merged
 once in the epilogue. P and softmax statistics stay wave-local in the loop.
 K/V are copied directly into an LDS ring, with non-temporal loads and
 page descriptors in SGPRs. Ring slots are expanded at compile time. K for
@@ -59,7 +59,8 @@ def compile_pa_decode_d256_pipeline(
 
     K is [pages, heads, 16, 16, 16]; V is [pages, heads, 16, 256].
     K/V scales are device-resident FP32 scalars or contiguous per-token
-    arrays [pages, heads, 16, 1]; K/V scale strides must match. The launch ABI
+    arrays [pages, heads, 16, 1]; K/V scale strides must match. QL1/2
+    automatically share one query group across two D128 output slices. The launch ABI
     matches the general tile kernel, but the V layout does not.
     """
     if not (
@@ -84,9 +85,13 @@ def compile_pa_decode_d256_pipeline(
         raise ValueError("num_buffers must be in [2, 4]")
     if head_splits not in (1, 2):
         raise ValueError("head_splits must be 1 or 2")
-    waves = 4 * head_splits
+    # Reuse all four page-owning waves for the single QL1/2 query group.
+    short_query = kwargs["query_length"] <= 2 and head_splits == 1
+    output_splits = 2 if short_query else head_splits
+    waves = 4 if short_query else 4 * head_splits
+    pv_group = 4 if short_query else 1
     block_threads = waves * 64
-    d_chunks = 16 // head_splits
+    d_chunks = 16 // output_splits
     if k_swizzle not in (1, 2, 4, 8):
         raise ValueError("k_swizzle must be 1, 2, 4, or 8")
     if cache_modifier not in (0, 2):
@@ -122,8 +127,8 @@ def compile_pa_decode_d256_pipeline(
     p_stride = max(64, half_tokens)
     p_wave = 16 * p_stride
     q_off = num_buffers * slot_bytes
-    qs_off = q_off + 8192
-    p_off = qs_off + 128
+    qs_off = q_off + (4096 if short_query else 8192)
+    p_off = qs_off + (64 if short_query else 128)
     page_off = p_off + waves * p_wave
     total_bytes = max(page_off, 65536 + 512)
 
@@ -153,8 +158,8 @@ def compile_pa_decode_d256_pipeline(
         tid = fx.Int32(gpu.thread_id("x"))
         wave, lane = (tid // 64, tid % 64)
         l16, rg = (lane % 16, lane // 16)
-        qgroup, half = (wave // (2 * head_splits), wave % 2)
-        dhalf = wave // 2 % head_splits
+        qgroup, half = (wave // (2 * output_splits), wave % 2)
+        dhalf = wave // 2 % output_splits
         task_id, kv_head = (fx.Int32(gpu.block_id("x")), fx.Int32(gpu.block_id("y")))
         capacity, kv_heads = (fx.Int32(gpu.grid_dim.x), fx.Int32(gpu.grid_dim.y))
         task = fx.ptr_load(
@@ -282,7 +287,7 @@ def compile_pa_decode_d256_pipeline(
                 # Each page-owning wave copies its 16 FP32 K/V scales to LDS.
                 # The scale arrays share block/head strides and token stride 1.
                 if fx.const_expr(per_token_kv and copy_k):  # noqa: SIM102
-                    if lane < 16 and dhalf == 0:
+                    if lane < 16:
                         scale_idx = physical * ks_block + kv_head * ks_head + lane
                         scale_dest = slot * slot_bytes + scale_offset + page * 64
                         async_dma(ks_rsrc, scale_idx * 4, scale_dest, byte_count=4)
@@ -576,10 +581,11 @@ def compile_pa_decode_d256_pipeline(
                         ]
                         next_state = [new_m, old_l + l]
                         vt = half * 32 + rg * 8 + l16 // 2
-                        for group in range_constexpr(d_chunks):
+                        # Read several V fragments before consuming them in MFMA.
+                        for group in range_constexpr(d_chunks // pv_group):
                             vops = []
-                            for within in range_constexpr(1):
-                                d = group + within
+                            for within in range_constexpr(pv_group):
+                                d = group * pv_group + within
                                 band = d + dhalf * d_chunks ^ vt % 8 ^ vt // 16 % 2 * 8
                                 voff = (
                                     slot * slot_bytes
@@ -598,8 +604,8 @@ def compile_pa_decode_d256_pipeline(
                                         ).result
                                     ).bitcast(fx.Int64)[0]
                                 )
-                            for within in range_constexpr(1):
-                                d = group + within
+                            for within in range_constexpr(pv_group):
+                                d = group * pv_group + within
                                 previous = fx.Vector.from_elements(
                                     [old_o[d * 4 + r] for r in range_constexpr(4)],
                                     dtype=fx.Float32,
@@ -638,7 +644,7 @@ def compile_pa_decode_d256_pipeline(
             gpu.barrier()
             if half == 0:
                 row = qgroup * 16 + l16
-                w0 = qgroup * 2 * head_splits + dhalf * 2
+                w0 = qgroup * 2 * output_splits + dhalf * 2
                 w1 = w0 + 1
                 sw0, sw1 = (qgroup * 2, qgroup * 2 + 1)
                 m0 = fx.Float32(load(65536 + (sw0 * 16 + l16) * 4, fx.Float32, 1)[0])
@@ -667,7 +673,7 @@ def compile_pa_decode_d256_pipeline(
                             out,
                             fx.recast_iter(fx.BFloat16, pout_ptr)
                             + partial * 256
-                            + dhalf * (256 // head_splits)
+                            + dhalf * (256 // output_splits)
                             + h,
                         )
                     if rg == 0 and dhalf == 0:
