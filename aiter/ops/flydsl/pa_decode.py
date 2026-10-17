@@ -9,14 +9,12 @@ MFMA specialization details. Native BF16 uses unscaled, 8-element vectorized
 K/V caches and BF16 queries.
 """
 
-import glob
-from functools import cache
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.triton.utils.device_info import get_num_xcds
 
 from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
 from .kernels.pa_decode_plan import PADecodePlan
@@ -40,23 +38,6 @@ def _flydsl_pointer_dtype(dtype: torch.dtype):
         torch.float8_e4m3fnuz: fx.Float8E4M3FNUZ,
         torch.int32: fx.Int32,
     }[dtype]
-
-
-@cache
-def _num_xcds(device_index: int) -> int:
-    """XCDs of a device from the KFD topology; 1 when it cannot be matched."""
-    props = torch.cuda.get_device_properties(device_index)
-    location = props.pci_bus_id << 8 | props.pci_device_id << 3
-    for path in glob.glob("/sys/class/kfd/kfd/topology/nodes/*/properties"):
-        with open(path) as f:
-            node = dict(line.split() for line in f if len(line.split()) == 2)
-        if (
-            node.get("simd_count", "0") != "0"
-            and int(node.get("domain", -1)) == props.pci_domain_id
-            and int(node.get("location_id", -1)) == location
-        ):
-            return max(1, int(node.get("num_xcc", 1)))
-    return 1
 
 
 def launch_pa_decode_ps_reduce(
@@ -135,7 +116,7 @@ def launch_pa_decode_ps_reduce(
                 groups *= 2
         per_seq = rows * kv_heads
         if ctas * group_waves >= budget and batch * per_seq * per_seq <= 2**30:
-            num_xcds = _num_xcds(output.device.index)
+            num_xcds = get_num_xcds(output.device.index)
     num_xcds = num_xcds if num_xcds > 1 else 0
     compiled = compile_pa_decode_ps_reduce(
         max_context_partition_num=partitions,
