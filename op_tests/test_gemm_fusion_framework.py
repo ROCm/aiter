@@ -199,3 +199,114 @@ def test_capabilities_never_raise():
     assert isinstance(detect_capabilities(arch="gfx950"), frozenset)
     assert "gfx950_sc_bypass" in detect_capabilities(arch="gfx950")
     assert "gfx950_sc_bypass" not in detect_capabilities(arch="gfx942")
+
+
+# ---- capability probe (CCO shared library via ctypes path; the `mori` Python package is never imported) ----
+def _fake_elf(symbols):
+    """Minimal little-endian ELF64 with one .dynsym (defined FUNC symbols) + .dynstr + .shstrtab (not dlopen-able)."""
+    import struct as st
+
+    dynstr = b"\0" + b"".join(s.encode() + b"\0" for s in symbols)
+    offs, o = [], 1
+    for s in symbols:
+        offs.append(o)
+        o += len(s) + 1
+    dynsym = b"\0" * 24 + b"".join(st.pack("<IBBHQQ", off, 0x12, 0, 1, 0, 0) for off in offs)
+    shstr = b"\0.dynsym\0.dynstr\0.shstrtab\0"
+    body = dynsym + dynstr + shstr
+    base = 64
+    o_dynsym, o_dynstr, o_shstr = base, base + len(dynsym), base + len(dynsym) + len(dynstr)
+    shoff = base + len(body)
+
+    def sh(name, typ, off, size, link=0, entsize=0):
+        return st.pack("<IIQQQQIIQQ", name, typ, 0, 0, off, size, link, 0, 8, entsize)
+
+    shdrs = b"\0" * 64 + sh(1, 11, o_dynsym, len(dynsym), link=2, entsize=24) + sh(9, 3, o_dynstr, len(dynstr)) + sh(17, 3, o_shstr, len(shstr))
+    ehdr = b"\x7fELF" + bytes([2, 1, 1, 0]) + b"\0" * 8 + st.pack("<HHIQQQIHHHHHH", 3, 0xE0, 1, 0, 0, shoff, 0, 64, 0, 0, 64, 4, 3)
+    return ehdr + body + shdrs
+
+
+def _mangle(f):  # mori::cco::<f>(...) -> _ZN4mori3cco<len><name>E...
+    return f"_ZN4mori3cco{len(f)}{f}EPv"
+
+
+@pytest.fixture
+def mori_tree(tmp_path):
+    root = tmp_path / "mori"
+    (root / "include" / "mori" / "cco").mkdir(parents=True)
+    (root / "include" / "mori" / "cco" / "cco.hpp").write_text("// fake")
+    (root / "build" / "src" / "cco").mkdir(parents=True)
+    return root
+
+
+def _write_lib(path, extra=(), drop=()):
+    from aiter.gemm_fusion.capabilities import CCO_REQUIRED_SYMBOLS
+
+    syms = [_mangle(f) for f in CCO_REQUIRED_SYMBOLS if f not in drop] + list(extra)
+    path.write_bytes(_fake_elf(syms))
+
+
+def test_capabilities_probe_cco_library(mori_tree):
+    from aiter.gemm_fusion import capabilities as cap
+
+    so = mori_tree / "build" / "src" / "cco" / "libmori_cco.so"
+    _write_lib(so, extra=["_ZN4mori3cco16ccoSdmaQueueInitEv"])
+    env = {"MORI_ROOT": str(mori_tree)}
+    # symbols present, library not dlopen-able (fake ELF) -> dlopen check fails; with the check off it passes
+    assert cap.probe_mori_cco(env, check_dlopen=True)[0] is False
+    ok, sdma, why = cap.probe_mori_cco(env, check_dlopen=False)
+    assert ok and sdma, why
+    assert cap.detect_capabilities(arch="gfx950", env=env, check_dlopen=False) == frozenset({"gfx950_sc_bypass", "mori_cco", "sdma"})
+    # no SDMA symbols -> mori_cco only
+    _write_lib(so)
+    cap._SYM_CACHE.clear()
+    assert cap.detect_capabilities(arch="gfx950", env=env, check_dlopen=False) == frozenset({"gfx950_sc_bypass", "mori_cco"})
+    # a missing required symbol -> no capability at all
+    _write_lib(so, drop=("ccoWindowRegister",), extra=["_ZN4mori3cco10ccoSdmaFooEv"])
+    cap._SYM_CACHE.clear()
+    ok, sdma, why = cap.probe_mori_cco(env, check_dlopen=False)
+    assert not ok and not sdma and "ccoWindowRegister" in why
+    # explicit MORI_CCO_SO wins over MORI_ROOT and a bad explicit path does not fall through
+    good = mori_tree / "alt.so"
+    _write_lib(good, extra=["sdma_marker"])
+    cap._SYM_CACHE.clear()
+    env2 = {"MORI_ROOT": str(mori_tree), "MORI_CCO_SO": str(good)}
+    assert cap.resolve_cco_library(env2) == str(good) and cap.probe_mori_cco(env2, check_dlopen=False)[:2] == (True, True)
+    assert cap.resolve_cco_library({"MORI_ROOT": str(mori_tree), "MORI_CCO_SO": str(mori_tree / "nope.so")}) is None
+    # MORI_ROOT/lib is preferred over build/src/cco
+    (mori_tree / "lib").mkdir()
+    libp = mori_tree / "lib" / "libmori_cco.so"
+    _write_lib(libp)
+    assert cap.resolve_cco_library({"MORI_ROOT": str(mori_tree)}) == str(libp)
+
+
+def test_capabilities_probe_failures_never_raise(mori_tree, tmp_path):
+    from aiter.gemm_fusion import capabilities as cap
+
+    so = mori_tree / "build" / "src" / "cco" / "libmori_cco.so"
+    so.write_bytes(b"not an elf")
+    env = {"MORI_ROOT": str(mori_tree)}
+    ok, sdma, why = cap.probe_mori_cco(env)
+    assert not ok and not sdma and "ELF" in why
+    so.write_bytes(b"\x7fELF" + b"\x02\x01" + b"\0" * 10)  # truncated
+    cap._SYM_CACHE.clear()
+    assert cap.probe_mori_cco(env)[0] is False
+    # header missing -> no capability even with a good library
+    _write_lib(so, extra=["sdma_x"])
+    cap._SYM_CACHE.clear()
+    (mori_tree / "include" / "mori" / "cco" / "cco.hpp").unlink()
+    ok, _s, why = cap.probe_mori_cco(env, check_dlopen=False)
+    assert not ok and "header" in why
+    # nothing at all
+    assert cap.probe_mori_cco({"MORI_ROOT": str(tmp_path / "empty")}, check_dlopen=False)[0] is False
+    assert "mori_cco" not in cap.detect_capabilities(arch="gfx942", env={"MORI_ROOT": str(tmp_path / "empty")})
+
+
+def test_capabilities_never_imports_mori_python_package(mori_tree):
+    import sys
+
+    from aiter.gemm_fusion import capabilities as cap
+
+    before = "mori" in sys.modules
+    cap.detect_capabilities(arch="gfx950", env={"MORI_ROOT": str(mori_tree)}, check_dlopen=False)
+    assert ("mori" in sys.modules) == before
