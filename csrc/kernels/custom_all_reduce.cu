@@ -191,58 +191,68 @@ static void _all_gather(fptr_t _fa, void* inp, void* out,
 }
 
 static void _fused_allreduce_rmsnorm(fptr_t _fa,
-                                     void* inp, void* residual_inp,
-                                     void* residual_out, void* out,
-                                     void* scale_out, void* w,
-                                     AiterDtype dtype, float eps,
-                                     int m, int input_n, int n, int out_n,
+                                     void* inp,
+                                     void* residual_inp,
+                                     void* residual_out,
+                                     void* out,
+                                     void* scale_out,
+                                     void* w,
+                                     AiterDtype dtype,
+                                     float eps,
+                                     int m,
+                                     int input_n,
+                                     int n,
+                                     int out_n,
                                      bool use_1stage,
                                      bool gemma_norm,
-                                     void* bf16_out = nullptr)
+                                     void* bf16_out     = nullptr,
+                                     int num_norm_rows  = -1,
+                                     bool skip_residual = false)
 {
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     bool use_fp8_per_token_quant = (scale_out != nullptr);
 
-#define DISPATCH_AR_FUSION(DTYPE)                                \
-    if(!use_fp8_per_token_quant)                                 \
-    {                                                            \
-        fa->dispatchFusedAllReduceRMSNorm<DTYPE>(                \
-            stream,                                              \
-            reinterpret_cast<DTYPE*>(inp),                       \
-            reinterpret_cast<DTYPE*>(residual_inp),              \
-            reinterpret_cast<DTYPE*>(residual_out),              \
-            reinterpret_cast<DTYPE*>(out),                       \
-            reinterpret_cast<DTYPE*>(w),                         \
-            eps,                                                 \
-            m,                                                   \
-            input_n,                                             \
-            n,                                                   \
-            out_n,                                               \
-            use_1stage,                                          \
-            gemma_norm);                                         \
-    }                                                            \
-    else                                                         \
-    {                                                            \
-        if(input_n != n)                                         \
-        {                                                        \
-            throw std::runtime_error(                            \
-                "fused allreduce rmsnorm quant requires input width == weight width"); \
-        }                                                        \
-        fa->dispatchFusedAllReduceRMSNormQuant<DTYPE, fp8_type>( \
-            stream,                                              \
-            reinterpret_cast<DTYPE*>(inp),                       \
-            reinterpret_cast<DTYPE*>(residual_inp),              \
-            reinterpret_cast<DTYPE*>(residual_out),              \
-            reinterpret_cast<fp8_type*>(out),                    \
-            reinterpret_cast<float*>(scale_out),                 \
-            reinterpret_cast<DTYPE*>(w),                         \
-            eps,                                                 \
-            m,                                                   \
-            n,                                                   \
-            use_1stage,                                          \
-            gemma_norm,                                          \
-            reinterpret_cast<DTYPE*>(bf16_out));                 \
+#define DISPATCH_AR_FUSION(DTYPE)                                                        \
+    if(!use_fp8_per_token_quant)                                                         \
+    {                                                                                    \
+        fa->dispatchFusedAllReduceRMSNorm<DTYPE>(stream,                                 \
+                                                 reinterpret_cast<DTYPE*>(inp),          \
+                                                 reinterpret_cast<DTYPE*>(residual_inp), \
+                                                 reinterpret_cast<DTYPE*>(residual_out), \
+                                                 reinterpret_cast<DTYPE*>(out),          \
+                                                 reinterpret_cast<DTYPE*>(w),            \
+                                                 eps,                                    \
+                                                 m,                                      \
+                                                 input_n,                                \
+                                                 n,                                      \
+                                                 out_n,                                  \
+                                                 use_1stage,                             \
+                                                 gemma_norm,                             \
+                                                 num_norm_rows,                          \
+                                                 skip_residual);                         \
+    }                                                                                    \
+    else                                                                                 \
+    {                                                                                    \
+        if(input_n != n)                                                                 \
+        {                                                                                \
+            throw std::runtime_error(                                                    \
+                "fused allreduce rmsnorm quant requires input width == weight width");   \
+        }                                                                                \
+        fa->dispatchFusedAllReduceRMSNormQuant<DTYPE, fp8_type>(                         \
+            stream,                                                                      \
+            reinterpret_cast<DTYPE*>(inp),                                               \
+            reinterpret_cast<DTYPE*>(residual_inp),                                      \
+            reinterpret_cast<DTYPE*>(residual_out),                                      \
+            reinterpret_cast<fp8_type*>(out),                                            \
+            reinterpret_cast<float*>(scale_out),                                         \
+            reinterpret_cast<DTYPE*>(w),                                                 \
+            eps,                                                                         \
+            m,                                                                           \
+            n,                                                                           \
+            use_1stage,                                                                  \
+            gemma_norm,                                                                  \
+            reinterpret_cast<DTYPE*>(bf16_out));                                         \
     }
 
     switch(dtype)
@@ -455,6 +465,63 @@ void all_reduce(fptr_t _fa,
                 use_new, open_fp8_quant, is_broadcast_reg_outptr);
 }
 
+void all_reduce_residual(fptr_t _fa,
+                         const aiter_tensor_t& inp,
+                         const aiter_tensor_t& out,
+                         const aiter_tensor_t& residual,
+                         int64_t reg_inp_ptr,
+                         int64_t reg_inp_bytes)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto dtype         = inp.dtype();
+    int64_t numel      = inp.numel();
+    int64_t data_bytes = numel * inp.element_size();
+
+    // The kernels index out and residual densely by inp's extent, on inp's device.
+    for(auto [t, name] : {std::pair{&residual, "residual"}, std::pair{&out, "out"}})
+    {
+        if(t->numel() != numel || t->dtype() != dtype || t->device_id != inp.device_id)
+            throw std::runtime_error(std::string("all_reduce_residual: ") + name +
+                                     " must match the input's numel, dtype and device");
+        if(!t->is_contiguous())
+            throw std::runtime_error(std::string("all_reduce_residual: ") + name +
+                                     " must be contiguous");
+    }
+
+    void* actual_inp             = inp.data_ptr();
+    bool is_broadcast_reg_outptr = (reg_inp_ptr == 0);
+    if(reg_inp_ptr != 0)
+    {
+        if(data_bytes > reg_inp_bytes)
+            throw std::runtime_error("registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync(
+            (void*)reg_inp_ptr, actual_inp, data_bytes, hipMemcpyDeviceToDevice, stream));
+        actual_inp = (void*)reg_inp_ptr;
+    }
+
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+#define DISPATCH_AR_RESIDUAL(DTYPE)                                                    \
+    fa->allreduce_residual<DTYPE>(stream,                                              \
+                                  reinterpret_cast<DTYPE*>(actual_inp),                \
+                                  reinterpret_cast<DTYPE*>(out.data_ptr()),            \
+                                  reinterpret_cast<const DTYPE*>(residual.data_ptr()), \
+                                  numel,                                               \
+                                  is_broadcast_reg_outptr)
+    switch(dtype)
+    {
+    case AITER_DTYPE_fp32: DISPATCH_AR_RESIDUAL(opus::fp32_t); break;
+    case AITER_DTYPE_fp16: DISPATCH_AR_RESIDUAL(opus::fp16_t); break;
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    case AITER_DTYPE_bf16: DISPATCH_AR_RESIDUAL(opus::bf16_t); break;
+#endif
+    default:
+        throw std::runtime_error(
+            "custom allreduce residual only supports float32, float16 and bfloat16");
+    }
+#undef DISPATCH_AR_RESIDUAL
+}
+
 void reduce_scatter(fptr_t _fa,
                     const aiter_tensor_t& inp,
                     const aiter_tensor_t& out,
@@ -524,9 +591,12 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              const aiter_tensor_t& out,
                              const aiter_tensor_t& w,
                              double eps,
-                             int64_t reg_ptr, int64_t reg_bytes,
+                             int64_t reg_ptr,
+                             int64_t reg_bytes,
                              bool use_1stage,
-                             bool gemma_norm)
+                             bool gemma_norm,
+                             int64_t num_norm_rows,
+                             bool skip_residual)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
@@ -546,21 +616,76 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
         throw std::runtime_error(
             "fused allreduce rmsnorm requires residual input/output width == weight width");
     }
+    // The kernels write the first norm_rows rows of out and all m rows of
+    // res_out, and read all m rows of res_inp unless skip_residual.
+    const int64_t norm_rows = (num_norm_rows < 0 || num_norm_rows > m) ? m : num_norm_rows;
+    const int64_t all_elems = static_cast<int64_t>(m) * n;
+    if(static_cast<int64_t>(out.numel()) < norm_rows * n)
+        throw std::runtime_error(
+            "fused allreduce rmsnorm: out is smaller than the normalized rows");
+    if(static_cast<int64_t>(res_out.numel()) < all_elems)
+        throw std::runtime_error("fused allreduce rmsnorm: res_out must hold every input row");
+    if(!skip_residual && static_cast<int64_t>(res_inp.numel()) < all_elems)
+        throw std::runtime_error("fused allreduce rmsnorm: res_inp must hold every input row");
+    // The dispatcher casts every buffer by inp's dtype, on inp's device, and
+    // the kernels address them as dense rows of n.
+    for(auto [t, name] : {std::pair{&out, "out"},
+                          std::pair{&res_out, "res_out"},
+                          std::pair{&res_inp, "res_inp"},
+                          std::pair{&w, "w"}})
+    {
+        if(t == &res_inp && skip_residual)
+            continue;
+        if(t->dtype() != dtype || t->device_id != inp.device_id)
+            throw std::runtime_error(std::string("fused allreduce rmsnorm: ") + name +
+                                     " must match the input's dtype and device");
+        if(!t->is_contiguous())
+            throw std::runtime_error(std::string("fused allreduce rmsnorm: ") + name +
+                                     " must be contiguous");
+    }
 
     if(reg_ptr != 0)
     {
         _copy_input_to_registered_buffer(inp, m, input_n, stream, reg_ptr, reg_bytes);
         _fused_allreduce_rmsnorm(_fa,
-                                 (void*)reg_ptr, res_inp.data_ptr(), res_out.data_ptr(),
-                                 out.data_ptr(), nullptr, w.data_ptr(),
-                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage, gemma_norm);
+                                 (void*)reg_ptr,
+                                 res_inp.data_ptr(),
+                                 res_out.data_ptr(),
+                                 out.data_ptr(),
+                                 nullptr,
+                                 w.data_ptr(),
+                                 dtype,
+                                 (float)eps,
+                                 m,
+                                 input_n,
+                                 n,
+                                 out_n,
+                                 use_1stage,
+                                 gemma_norm,
+                                 nullptr,
+                                 (int)num_norm_rows,
+                                 skip_residual);
     }
     else
     {
         _fused_allreduce_rmsnorm(_fa,
-                                 inp.data_ptr(), res_inp.data_ptr(), res_out.data_ptr(),
-                                 out.data_ptr(), nullptr, w.data_ptr(),
-                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage, gemma_norm);
+                                 inp.data_ptr(),
+                                 res_inp.data_ptr(),
+                                 res_out.data_ptr(),
+                                 out.data_ptr(),
+                                 nullptr,
+                                 w.data_ptr(),
+                                 dtype,
+                                 (float)eps,
+                                 m,
+                                 input_n,
+                                 n,
+                                 out_n,
+                                 use_1stage,
+                                 gemma_norm,
+                                 nullptr,
+                                 (int)num_norm_rows,
+                                 skip_residual);
     }
 }
 
