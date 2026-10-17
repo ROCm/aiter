@@ -719,6 +719,125 @@ class TestGroupedFmoeResultToCsv(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def _retune_production_row(self):
+        """Re-tune the first row of a copy of aiter/configs/tuned_grouped_fmoe.csv
+        with a different tile_m; return the old lines, the new lines and tile_m."""
+        tuner = self._tuner()
+        production = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..",
+            "..",
+            "aiter",
+            "configs",
+            "tuned_grouped_fmoe.csv",
+        )
+        with open(production) as f:
+            old_lines = f.read().splitlines()
+        header = old_lines[0].split(",")
+        first = dict(zip(header, old_lines[1].split(",")))
+        tile_m = "64" if first["tile_m"] != "64" else "32"
+        candidate = {c: first.get(c, "") for c in tuner.columns}
+        candidate.update(
+            gate_mode="GateMode.INTERLEAVE",
+            max_m=first["token"],
+            tile_m=tile_m,
+            grouped_persistent_m=1,
+            us=1.5,
+            tflops=0,
+            bw=0,
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+            f.write("\n".join(old_lines) + "\n")
+            path = f.name
+        try:
+            tuner.result_to_csv(pd.DataFrame([candidate], columns=tuner.columns), path)
+            with open(path) as f:
+                new_lines = f.read().splitlines()
+        finally:
+            os.unlink(path)
+        return old_lines, new_lines, tile_m
+
+    def test_production_layout_keeps_its_columns(self):
+        # #6269 dropped max_m and grouped_persistent_m from the production file;
+        # writing one row must not add them back, blank in every other row.
+        old_lines, new_lines, tile_m = self._retune_production_row()
+        self.assertEqual(new_lines[0], old_lines[0])
+        self.assertEqual(len(new_lines), len(old_lines))
+        changed = [i for i, (a, b) in enumerate(zip(old_lines, new_lines)) if a != b]
+        self.assertEqual(changed, [1])
+        new = dict(zip(old_lines[0].split(","), new_lines[1].split(",")))
+        self.assertEqual(new["tile_m"], tile_m)
+
+    def test_production_layout_gets_no_new_blank_cell(self):
+        # A blank cell in a filled column makes the config merge write the whole
+        # column as floats, which the AOT parser's int() rejects.
+        old_lines, new_lines, _ = self._retune_production_row()
+        header = old_lines[0].split(",")
+        old_rows = [dict(zip(header, line.split(","))) for line in old_lines[1:]]
+        filled = [c for c in header if all(row[c].strip() for row in old_rows)]
+        new = dict(zip(header, new_lines[1].split(",")))
+        self.assertEqual([c for c in filled if not new[c].strip()], [])
+        for column in ("rolled_drain", "persistent_workers2"):
+            if column in header:
+                self.assertEqual(new[column], "0")
+
+    def _file_with_unknown_column(self):
+        header = f"{self.HEADER},new_knob"
+        old_4096 = f"gfx1250,256,4096,{self.SHAPE},4096,16,256,256,16,1,4,2,1,0,,k1,k2,468.0528,0,0,7"
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+            f.write(f"{header}\n{old_4096}\n")
+            return f.name
+
+    def test_unknown_filled_column_is_rejected_before_writing(self):
+        tuner = self._tuner()
+        path = self._file_with_unknown_column()
+        try:
+            with open(path) as f:
+                before = f.read()
+            results = pd.DataFrame(
+                [self._candidate(4096, 64, 300.5)], columns=tuner.columns
+            )
+            with self.assertRaisesRegex(ValueError, "new_knob"):
+                tuner.result_to_csv(results, path)
+            with open(path) as f:
+                self.assertEqual(f.read(), before)
+        finally:
+            os.unlink(path)
+
+    def test_unknown_filled_column_stops_tuning_before_timing(self):
+        from types import SimpleNamespace
+
+        tuner = self._tuner()
+        path = self._file_with_unknown_column()
+        timed = []
+        try:
+            tuner._run_candidate = lambda *a: timed.append(a) or 1.0
+            with self.assertRaisesRegex(ValueError, "new_knob"):
+                tuner.tune(
+                    pd.DataFrame([self._candidate(4096, 64, 0)]),
+                    None,
+                    SimpleNamespace(tune_file=path),
+                )
+            self.assertEqual(timed, [])
+        finally:
+            os.unlink(path)
+
+    def test_csv_text_writes_integral_numbers_exactly(self):
+        tuner = self._tuner()
+        cases = {
+            "16.0": "16",
+            "1e5": "100000",
+            "1.5e2": "150",
+            "9007199254740993.0": "9007199254740993",
+            "300.5": "300.5",
+            "-1": "-1",
+            "nan": "",
+            "": "",
+            "torch.bfloat16": "torch.bfloat16",
+            "grouped_gemm1_a8w4_gugu": "grouped_gemm1_a8w4_gugu",
+        }
+        self.assertEqual({k: tuner._csv_text(k) for k in cases}, cases)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
