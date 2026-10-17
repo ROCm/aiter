@@ -39,6 +39,7 @@ from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.conv_kernels import (
     AITER_CONV3D_DYN_HW,
     LIBTYPE_FLYDSL,
+    TUNED_BLOCK_ROWS_COLUMN,
     TUNED_KEY_COLUMNS,
     TUNED_LIBTYPE_COLUMN,
     TUNED_RESULT_COLUMNS,
@@ -47,6 +48,7 @@ from aiter.ops.flydsl.conv_kernels import (
     _implicit_param_from_problem,
     _is_matmul_fast_path,
     _pad_channels,
+    _parse_block_rows,
     _parse_tuned_bool,
     _resolve_splitk,
 )
@@ -59,7 +61,10 @@ from aiter.ops.flydsl.kernels.conv.conv3d_gfx950_utils import (
     out_extent,
     unit_divisors,
 )
-from aiter.ops.flydsl.kernels.conv.conv3d_im2col import make_im2col_plan
+from aiter.ops.flydsl.kernels.conv.conv3d_im2col import (
+    grid_out_block,
+    make_im2col_plan,
+)
 from aiter.ops.flydsl.kernels.conv.conv3d_implicit_gfx950 import (
     _dyn_hw_closure_key,
     compile_conv3d_implicit,
@@ -128,13 +133,15 @@ def _conv_dedupe_key(job):
             job["out_ndhwc"],
             "zeros",
             True,
+            block_rows=job.get("block_rows", 1),
         )
         cfg = make_tile_config(param.tile)
         geom = make_conv_geometry(param)
-        grid = make_launch_grid(param, geom, cfg)
+        im2col_plan = make_im2col_plan(param, geom, cfg)
+        grid = make_launch_grid(param, geom, cfg, grid_out_block(im2col_plan))
         closure = _dyn_hw_closure_key(
             grid._replace(grid_x=0, grid_z=0, grid_m=0),
-            make_im2col_plan(param, geom, cfg),
+            im2col_plan,
             make_output_scatter_plan(param, geom, cfg, grid),
             unit_divisors(param, geom),
         )
@@ -188,6 +195,10 @@ def parse_csv(csv_path: str):
             try:
                 shape = {c: int(row[c]) for c in _INT_COLS}
                 config = {c: int(row[c]) for c in _CONFIG_COLS}
+                # Optional column; tables tuned before it existed are all 1.
+                config["block_rows"] = _parse_block_rows(
+                    row.get(TUNED_BLOCK_ROWS_COLUMN)
+                )
                 has_bias = _parse_tuned_bool(row.get("bias"))
                 # Missing splitK is resolved like the runtime, not defaulted to 1.
                 raw_splitk = row.get("splitK", "")
@@ -368,6 +379,7 @@ def _compile_conv3d_to_cache(
     wgm: int,
     out_ndhwc: bool = False,
     dyn_hw: bool = False,
+    block_rows: int = 1,
 ):
     # No **kwargs: a job field this does not name is a compile-time parameter
     # being dropped, which would cache an artifact under the default and leave
@@ -400,6 +412,7 @@ def _compile_conv3d_to_cache(
             out_ndhwc,
             "zeros",
             dyn_hw,
+            block_rows=block_rows,
         )
     )
     with compile_only_env():

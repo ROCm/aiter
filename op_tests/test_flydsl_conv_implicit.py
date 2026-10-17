@@ -381,6 +381,17 @@ KW_CASES = [
         {"padding": 1},
         False,
     ),
+    # B's last DMA round is half full (384 vecs over 256 threads), on the kW
+    # reuse path (Wo >= TILE_M).
+    (
+        "2d_tile_256x96",
+        2,
+        (1, 96, 20, 300),
+        _W2,
+        {"padding": 1, "tile": (256, 96, 4, 1)},
+        {"padding": 1},
+        True,
+    ),
 ]
 
 # -c labels, read back off the sweep builders so the choices cannot drift from the
