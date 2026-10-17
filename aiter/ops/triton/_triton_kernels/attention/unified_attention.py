@@ -647,6 +647,8 @@ def kernel_unified_attention_3d(
     block_table_stride: tl.int64,  # int
     query_stride_0: tl.int64,  # int
     query_stride_1: tl.int64,  # int, should be equal to head_size
+    output_stride_0: tl.int64,
+    output_stride_1: tl.int64,
     qq_bias_stride_0: tl.int64,  # int
     BLOCK_SIZE: tl.constexpr,  # int
     TILE_SIZE: tl.constexpr,  # int, must be power of 2
@@ -1039,13 +1041,22 @@ def kernel_unified_attention_3d(
         one_over_L = 1.0 / L[:, None]
         acc = acc * one_over_L
 
-    segm_output_offset = (
-        query_offset_0[:, None].to(tl.int64)
-        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
-        + query_offset_1[:, None] * (NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
-        + segm_idx * V_HEAD_SIZE_PADDED
-        + offs_vd[None, :]
-    )
+    if NUM_SEGMENTS_PER_SEQ == 1:
+        # The single-segment launch writes the caller's output directly, which
+        # has logical (not padded) head dimensions and may have non-dense strides.
+        segm_output_offset = (
+            query_offset_0[:, None].to(tl.int64) * output_stride_0
+            + query_offset_1[:, None] * output_stride_1
+            + offs_vd[None, :]
+        )
+    else:
+        segm_output_offset = (
+            query_offset_0[:, None].to(tl.int64)
+            * (num_query_heads * NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
+            + query_offset_1[:, None] * (NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
+            + segm_idx * V_HEAD_SIZE_PADDED
+            + offs_vd[None, :]
+        )
     tl.store(
         segm_output_ptr + segm_output_offset,
         acc,

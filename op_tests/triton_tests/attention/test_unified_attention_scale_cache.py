@@ -282,7 +282,17 @@ def check_case(
         expected.append(torch.einsum("hqk,khd->qhd", scores.softmax(-1), values))
         begin += qlen
     expected = torch.cat(expected).bfloat16()
-    out = torch.full_like(q, float("nan"))
+    # Guard the padded-head span so a wrong single-segment output pitch is
+    # detected without corrupting the query, cache, or subsequent diagnostics.
+    padded_dim = 1 << (dim - 1).bit_length()
+    output_storage = torch.full(
+        (q.shape[0] * heads * padded_dim + 256,),
+        123.0,
+        dtype=q.dtype,
+        device=q.device,
+    )
+    out = output_storage[: q.numel()].view_as(q)
+    out.fill_(float("nan"))
     print(
         f"[paged-prefill-check] start layout={layout} scale={mode} page={page} "
         f"dim={dim} heads={heads}/{kv_heads} q={q_lens} kv={k_lens}",
@@ -309,6 +319,12 @@ def check_case(
         shuffled_kv_cache=layout != "flash",
         backend="triton",
         **kwargs,
+    )
+    torch.testing.assert_close(
+        output_storage[q.numel() :],
+        torch.full_like(output_storage[q.numel() :], 123.0),
+        atol=0,
+        rtol=0,
     )
     try:
         torch.testing.assert_close(out, expected, atol=0.02, rtol=0.02)
