@@ -3077,6 +3077,11 @@ def _opus_stage2_fp8_enabled():
     return os.environ.get("AITER_OPUS_STAGE2_FP8", "1") == "1"
 
 
+# Compile-time model_dim cap of the layout-v2 gemm2; _mxmoe_cfg_shape_reason
+# rejects tuned rows above it.
+_FLYDSL_V2_GEMM2_HIDDEN_MAX = 8192
+
+
 def _flydsl_v2_stage2_wrapper(
     inter_states,
     w1,
@@ -3228,6 +3233,7 @@ def _flydsl_v2_stage2_wrapper(
         g2_bf16_lds=cfg["bf16_lds"],
         g2_spart=cfg["spart"],
         out_dtype="fp8" if _s2_fp8_inter else ("fp4" if _s2_fp4_scatter else "bf16"),
+        HIDDEN_MAX=_FLYDSL_V2_GEMM2_HIDDEN_MAX,
         bias=bias2,
         is_ep=expert_mask is not None,
         out_scale=target_scale,
@@ -3333,7 +3339,8 @@ def _mxmoe_cfg_shape_reason(kernelName1, kernelName2, model_dim, inter_dim):
                 f"native mxmoe gemm2 {kernelName2!r} needs model_dim % "
                 f"{p2['BN']} == 0, got {model_dim}"
             )
-    # v2 layout gemm2 (mxmoe_dispatcher.mxfp4_moe_gemm2): K % tile_k and N % tile_n.
+    # v2 layout gemm2 (mxmoe_dispatcher.mxfp4_moe_gemm2): K % tile_k, N % tile_n
+    # and N <= HIDDEN_MAX.
     if v2 is not None:
         if inter_dim % v2["tile_k"] != 0:
             return (
@@ -3344,6 +3351,11 @@ def _mxmoe_cfg_shape_reason(kernelName1, kernelName2, model_dim, inter_dim):
             return (
                 f"gemm2 {kernelName2!r} needs model_dim % {v2['tile_n']} == 0, "
                 f"got {model_dim}"
+            )
+        if model_dim > _FLYDSL_V2_GEMM2_HIDDEN_MAX:
+            return (
+                f"gemm2 {kernelName2!r} needs model_dim <= "
+                f"{_FLYDSL_V2_GEMM2_HIDDEN_MAX}, got {model_dim}"
             )
     return None
 

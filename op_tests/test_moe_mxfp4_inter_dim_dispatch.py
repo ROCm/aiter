@@ -314,9 +314,12 @@ _V2_G2_N256 = "flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x128_atomic_sbm16"
         ("", _MXMOE_G2_BK128, 3584, 448, "inter_dim % 128"),
         ("", _MXMOE_G2_BK128, 3712, 384, "model_dim % 256"),
         ("", "flydsl_mxmoe_g2_a4w4_16x128x128_atomic", 3584, 384, "unsupported BN/BK"),
-        # Layout-v2 gemm2: K = inter_dim by tile_k and N = model_dim by tile_n.
+        # Layout-v2 gemm2: K = inter_dim by tile_k and N = model_dim by tile_n,
+        # with N capped by the launcher's HIDDEN_MAX.
         (_MXMOE_G1, _V2_G2_K256, 3584, 384, "inter_dim % 256"),
         ("", _V2_G2_N256, 3712, 384, "model_dim % 256"),
+        ("", _V2_G2_K128, 8192, 384, None),
+        ("", _V2_G2_K128, 8448, 384, "model_dim <= 8192"),
     ],
 )
 def test_mxmoe_cfg_shape_reason(kn1, kn2, model_dim, inter_dim, reason):
