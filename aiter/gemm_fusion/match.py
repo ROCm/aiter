@@ -53,6 +53,22 @@ def _check_contract(info, sub: FusionSpec, ctx: MatchCtx, row):
         )
 
 
+_BUILTIN = {"sp_qkv.": "aiter.ops.gemm_fusion.sp_qkv.variants"}
+
+
+def _load_builtin(vid: str):
+    """Import the module that registers a built-in variant family (lazy; only when a profile row names it)."""
+    import importlib
+
+    for prefix, mod in _BUILTIN.items():
+        if vid.startswith(prefix):
+            try:
+                importlib.import_module(mod)
+            except ImportError as e:  # surfaces as an unregistered variant (ContractError)
+                log.warning("event=variant_load_failed vid=%s err=%s", vid, e)
+            return
+
+
 def match_prefix(
     spec: FusionSpec, ctx: MatchCtx, profile: Optional[str] = None
 ) -> Tuple[Optional[object], int]:
@@ -63,6 +79,8 @@ def match_prefix(
         row = prof.lookup(sub.signature(), ctx.arch, ctx.cu, ctx.world, ctx.m)
         if row is None:
             continue
+        if row.vid not in catalog._CATALOG:
+            _load_builtin(row.vid)
         info = catalog.get_variant(row.vid) if row.vid in catalog._CATALOG else None
         if info is None:
             raise ContractError(f"profile row references unregistered variant {row.vid!r}")

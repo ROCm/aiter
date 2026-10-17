@@ -1,0 +1,105 @@
+{
+  "profile": "minimax_m3_sp4_gfx950_v1",
+  "generated_by": {
+    "tool": "aiter.ops.gemm_fusion.sp_qkv.gen_profile",
+    "ledger": "sp4-opus-mori-playground records/branch-ledger.md r165 (small), r152 (large)",
+    "note": "m is local tokens per rank (T/4); exact rows only"
+  },
+  "rows": [
+    {
+      "sig": "a5785b1dee0db51e",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 16,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r17",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1
+      },
+      "cell": "dense_T64"
+    },
+    {
+      "sig": "a5785b1dee0db51e",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 32,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r18",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "b_rowsplit": 1,
+        "rx_bypass": 1
+      },
+      "cell": "dense_T128"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 16,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r17",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "push8": 1
+      },
+      "cell": "indexer_T64"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 32,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r17",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1
+      },
+      "cell": "indexer_T128"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 16,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r18",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "reuse_no_idx": 1
+      },
+      "cell": "reuse_T64"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 32,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r17",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "push_halves": 1
+      },
+      "cell": "reuse_T128"
+    }
+  ]
+}
