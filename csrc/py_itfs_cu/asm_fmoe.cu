@@ -200,10 +200,6 @@ class FMoeKernel
         }
         else if(this->flat_mode == 2)
         {
-            AITER_CHECK(static_cast<uint64_t>(token_cnt) * topk <= 512,
-                        __func__,
-                        ": EMSORT supports token_cnt*topk <= 512; got ",
-                        static_cast<uint64_t>(token_cnt) * topk);
             AITER_CHECK(eprt <= 1024,
                         __func__,
                         ": EMSORT supports at most 1024 experts; got ",
