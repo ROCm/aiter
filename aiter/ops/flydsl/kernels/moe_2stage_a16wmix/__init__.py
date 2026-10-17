@@ -37,6 +37,17 @@ __all__ = [
 ]
 
 
+def _bias_f32(bias, shape):
+    """Per-expert bias as contiguous f32 of ``shape``, or None."""
+    if bias is None:
+        return None
+    if bias.numel() != shape[0] * shape[1]:
+        raise ValueError(
+            f"a16w4 bias must have {shape[0]}x{shape[1]} elements, got {tuple(bias.shape)}"
+        )
+    return bias.to(torch.float32).contiguous().view(-1)
+
+
 # gfx942 (CDNA3) lacks K=32 mfma_f32_16x16x32_bf16 + v_cvt_pk_bf16_f32 -> K=16 MFMA +
 # scalar dequant fallback; gfx950 (CDNA4) uses the K=32 path. compile_gemm{1,2}_a16w4_port
 # are @functools.cache'd, so building through them directly (all-keyword) shares one
@@ -72,6 +83,7 @@ def flydsl_a16w4_gemm1(
     swiglu_limit=float("inf"),
     w_dtype="fp4",
     w_layout="standard",
+    bias=None,
     stream=None,
 ):
     """a16w4/a16wi4/a16w16 fused stage1: gate+up GEMM + SiLU -> bf16 intermediate.
@@ -97,6 +109,9 @@ def flydsl_a16w4_gemm1(
     the W-load cache modifier (0=cached, 2=nt), taken as-is (nt when unset).
 
     ``situ_beta``/``situ_linear_beta`` (SiTUv2 only) are runtime f32 scalars (nothing baked).
+
+    ``bias``: optional per-expert ``[NE, 2*D_INTER]`` (gate | up) bias, added before the
+    activation (computed in f32).
     """
     if k_batch != 1:
         raise NotImplementedError(f"a16w4 gemm1 only supports k_batch=1, got {k_batch}")
@@ -140,7 +155,9 @@ def flydsl_a16w4_gemm1(
         w_layout=w_layout,
         k_wave=k_wave,
         rocm_arch=str(get_rocm_arch()),
+        has_bias=bias is not None,
     )
+    bias_f32 = _bias_f32(bias, (NE, 2 * D_INTER))
     max_m_blocks = int(sorted_expert_ids.numel())
     grid = gemm1_a16w4_grid(BM, INTER=D_INTER, TILE_N=TILE_N, max_m_blocks=max_m_blocks)
     # SiTUv2 beta/linear_beta + swiglu_limit -> runtime f32 scalars (host precomputes
@@ -167,6 +184,7 @@ def flydsl_a16w4_gemm1(
         _lbeta,
         1.0 / _lbeta,
         float(swiglu_limit),
+        bias_f32.data_ptr() if bias_f32 is not None else 0,
         inter_sorted_bf16.data_ptr(),
         torch.cuda.current_stream() if stream is None else stream,
     )
@@ -199,6 +217,7 @@ def flydsl_a16w4_gemm2(
     w_dtype="fp4",
     persist=None,
     epilog="atomic",
+    bias=None,
     stream=None,
 ):
     """a16w4/a16wi4/a16w16 fused stage2 (down-proj). Consumes the bf16 [sorted_size,
@@ -208,6 +227,10 @@ def flydsl_a16w4_gemm2(
     rocdl.waves_per_eu, ``b_nt`` -> W-load cache modifier, ``xcd_swizzle`` -> XCD/HBM
     grid remap. ``k_batch`` for parity (must be 1). ``b_nt`` is the W-load cache
     modifier (0=cached, 2=nt), taken as-is (cached when unset).
+
+    ``epilog="reduce"`` writes unique ``[M_logical*topk, D_HIDDEN]`` rows (no atomics)
+    for a fixed-order ``moe_reduce``. ``bias``: optional per-expert ``[NE, D_HIDDEN]``
+    bias, added before the routing weight (computed in f32).
     """
     if k_batch != 1:
         raise NotImplementedError(f"a16w4 gemm2 only supports k_batch=1, got {k_batch}")
@@ -249,7 +272,9 @@ def flydsl_a16w4_gemm2(
         rocm_arch=str(get_rocm_arch()),
         epilog=epilog,
         topk=topk,
+        has_bias=bias is not None,
     )
+    bias_f32 = _bias_f32(bias, (NE, D_HIDDEN))
     grid = gemm2_a16w4_grid(
         BM, N_OUT=D_HIDDEN, TILE_N=TILE_N, max_m_blocks=max_m_blocks, persist=_persist
     )
@@ -265,6 +290,7 @@ def flydsl_a16w4_gemm2(
         int(M_logical),
         int(max_m_blocks),
         int(grid),
+        bias_f32.data_ptr() if bias_f32 is not None else 0,
         flat_out.data_ptr(),
         torch.cuda.current_stream() if stream is None else stream,
     )
