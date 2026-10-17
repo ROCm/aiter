@@ -37,6 +37,8 @@ SEARCH_SPACE = {
     "B_SCALE_TDM": [True, False],
     "kpack": [1, 2],
     "persistent": [True, False],
+    "B2B_WMMA": [0, 1],
+    "EPI_SPLIT": [1, 2],
 }
 
 # Families that spell a key differently share its table row and shape rules;
@@ -45,6 +47,7 @@ ALIASES = {
     "BLOCK_M": "BLOCK_SIZE_M",
     "BLOCK_N": "BLOCK_SIZE_N",
     "BLOCK_K": "BLOCK_SIZE_K",
+    "GROUP_M": "GROUP_SIZE_M",
 }
 
 # The gluon compiler ignores these launch options, so under gluon they stay at the default.
