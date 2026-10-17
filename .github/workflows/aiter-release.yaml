@@ -97,6 +97,21 @@ on:
         type: boolean
         required: false
         default: false
+      docker_login:
+        description: 'Log in to Docker Hub before pulling the build image'
+        type: boolean
+        required: false
+        default: false
+      commit:
+        description: 'Git ref, tag, or commit hash to build'
+        type: string
+        required: false
+        default: ''
+      artifact_suffix:
+        description: 'Optional suffix for uploaded wheel artifact names'
+        type: string
+        required: false
+        default: ''
       torch_pin:
         description: 'Optional torch version pin for the manylinux build (e.g. 2.10.0+rocm7.1). Empty = latest.'
         type: string
@@ -107,13 +122,18 @@ on:
         type: string
         required: false
         default: ''
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: false
+      DOCKERHUB_PASSWORD:
+        required: false
     outputs:
       wheel_names:
         description: 'Space-separated list of built wheel filenames'
         value: ${{ jobs.collect.outputs.wheel_names }}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.artifact_suffix || 'default' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/v') }}
 
 jobs:
@@ -147,8 +167,11 @@ jobs:
       USE_MANYLINUX: ${{ inputs.use_manylinux || github.event.inputs.use_manylinux || (startsWith(matrix.docker_image, 'pytorch/manylinux') && 'true') || 'false' }}
       TORCH_PIN: ${{ inputs.torch_pin || '' }}
       TORCH_INDEX_URL: ${{ inputs.torch_index_url || '' }}
-      DOCKER_USERNAME_SECRET: ${{ github.event_name == 'workflow_dispatch' && needs.ci_config.outputs.docker_username_secret || '' }}
-      DOCKER_PASSWORD_SECRET: ${{ github.event_name == 'workflow_dispatch' && needs.ci_config.outputs.docker_password_secret || '' }}
+      DOCKER_USERNAME_SECRET: ${{ inputs.docker_login && needs.ci_config.outputs.docker_username_secret || '' }}
+      DOCKER_PASSWORD_SECRET: ${{ inputs.docker_login && needs.ci_config.outputs.docker_password_secret || '' }}
+      BUILD_REF: ${{ inputs.commit || github.event.inputs.commit || '' }}
+      ARTIFACT_SUFFIX: ${{ inputs.artifact_suffix || '' }}
+      DOCKER_LOGIN: ${{ inputs.docker_login }}
 
     steps:
       - name: Checkout aiter repo
@@ -161,10 +184,10 @@ jobs:
         if: ${{ matrix.build_enabled }}
         run: |
           set -ex
-          if [ -n "${{ github.event.inputs.commit }}" ]; then
-            echo "Checking out to commit: ${{ github.event.inputs.commit }}"
-            git fetch --all
-            git checkout ${{ github.event.inputs.commit }}
+          if [ -n "${BUILD_REF}" ]; then
+            echo "Checking out to ref: ${BUILD_REF}"
+            git fetch --all --tags
+            git checkout "${BUILD_REF}"
             git submodule update --init --recursive --depth 1 --jobs 4
           else
             echo "No commit input provided, using current commit: $(git rev-parse HEAD)"
@@ -178,7 +201,7 @@ jobs:
           git submodule update --init --recursive --depth 1 --jobs 4
 
       - name: Docker login
-        if: ${{ matrix.build_enabled && env.DOCKER_USERNAME_SECRET != '' && env.DOCKER_PASSWORD_SECRET != '' }}
+        if: ${{ matrix.build_enabled && env.DOCKER_LOGIN == 'true' && env.DOCKER_USERNAME_SECRET != '' && env.DOCKER_PASSWORD_SECRET != '' }}
         env:
           DOCKER_USERNAME: ${{ secrets[env.DOCKER_USERNAME_SECRET] }}
           DOCKER_PASSWORD: ${{ secrets[env.DOCKER_PASSWORD_SECRET] }}
@@ -421,25 +444,20 @@ jobs:
               # ROCm libs ship in the consumer container; torch libs are
               # provided by the user-installed PyTorch wheel.
               EXCLUDES=(
-                --exclude libamdhip64.so.7
-                --exclude libamdhip64.so
-                --exclude libhsa-runtime64.so.1
-                --exclude libhsa-runtime64.so
-                --exclude librocblas.so
-                --exclude librocsparse.so
-                --exclude librocsolver.so
-                --exclude libhipblas.so
-                --exclude libhipblaslt.so
-                --exclude librccl.so.1
-                --exclude librccl.so
-                --exclude libMIOpen.so.1
-                --exclude libMIOpen.so
-                --exclude libtorch.so
-                --exclude libtorch_cpu.so
-                --exclude libtorch_hip.so
-                --exclude libtorch_python.so
-                --exclude libc10.so
-                --exclude libc10_hip.so
+                --exclude "libamdhip64.so*"
+                --exclude "libhsa-runtime64.so*"
+                --exclude "libamd_comgr.so*"
+                --exclude "librocblas.so*"
+                --exclude "librocsparse.so*"
+                --exclude "librocsolver.so*"
+                --exclude "librocroller.so*"
+                --exclude "libroctx64.so*"
+                --exclude "libhipblas.so*"
+                --exclude "libhipblaslt.so*"
+                --exclude "librccl.so*"
+                --exclude "libMIOpen.so*"
+                --exclude "libtorch*.so*"
+                --exclude "libc10*.so*"
               )
               for whl in dist/*.whl; do
                 echo "=== auditwheel show (raw) ==="
@@ -450,6 +468,20 @@ jobs:
               done
               echo "=== Repaired wheels ==="
               ls -lh dist-repaired/
+              # Guard: nothing should have been grafted. auditwheel copies any
+              # non-excluded external lib into <pkg>.libs/ inside the wheel, so
+              # a non-empty .libs/ means an exclude pattern stopped matching
+              # (e.g. a de-torched module gained a direct ROCm DT_NEEDED, or a
+              # ROCm bump changed a SONAME major).
+              for whl in dist-repaired/*.whl; do
+                grafted=$(${PYBIN}/python -m zipfile -l "${whl}" | grep "\.libs/" || true)
+                if [ -n "${grafted}" ]; then
+                  echo "ERROR: auditwheel grafted external libs into ${whl}:"
+                  echo "${grafted}"
+                  echo "Add the missing SONAME glob to EXCLUDES above."
+                  exit 1
+                fi
+              done
               # Replace original dist with repaired copies (keeps existing
               # downstream upload logic untouched).
               rm -f dist/*.whl
@@ -516,7 +548,7 @@ jobs:
         if: ${{ matrix.build_enabled }}
         uses: actions/upload-artifact@v4
         with:
-          name: aiter-whl-packages-py${{ matrix.python_version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: aiter-whl-packages-py${{ matrix.python_version }}${{ env.ARTIFACT_SUFFIX != '' && format('-{0}', env.ARTIFACT_SUFFIX) || '' }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist/*.whl
           retention-days: 14
 

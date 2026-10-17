@@ -31,7 +31,11 @@ def fused_qk_cat(
     - k_out: The output matrix with shape (B, KH, D1+D2).
     """
     _LOGGER.info(
-        f"FUSED_QK_CAT: q1={tuple(q1.shape)} q2={tuple(q2.shape)} k1={tuple(k1.shape)} k2={tuple(k2.shape)} "
+        "FUSED_QK_CAT: q1=%s q2=%s k1=%s k2=%s ",
+        tuple(q1.shape),
+        tuple(q2.shape),
+        tuple(k1.shape),
+        tuple(k2.shape),
     )
     b, qh, d1 = q1.shape
     b2, qh2, d2 = q2.shape
@@ -98,8 +102,14 @@ def fused_qk_rope_cat(
     - k_out: The output matrix with shape (B, KH, D1+D2).
     """
     _LOGGER.info(
-        f"FUSED_QK_ROPE_CAT: q_nope={tuple(q_nope.shape)} q_pe={tuple(q_pe.shape)} k_nope={tuple(k_nope.shape)} k_pe={tuple(k_pe.shape)} "
-        + f"pos={tuple(pos.shape)} cos={tuple(cos.shape)} sin={tuple(sin.shape)}"
+        "FUSED_QK_ROPE_CAT: q_nope=%s q_pe=%s k_nope=%s k_pe=%s pos=%s cos=%s sin=%s",
+        tuple(q_nope.shape),
+        tuple(q_pe.shape),
+        tuple(k_nope.shape),
+        tuple(k_pe.shape),
+        tuple(pos.shape),
+        tuple(cos.shape),
+        tuple(sin.shape),
     )
     b, qh, d_nope = q_nope.shape
     b2, qh2, d_pe = q_pe.shape

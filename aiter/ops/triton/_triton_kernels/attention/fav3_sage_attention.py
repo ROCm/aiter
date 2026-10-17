@@ -4,6 +4,7 @@ import triton.language as tl
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.common import (
     compute_alibi_block,
 )
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 def map_dims(shape, indices):
@@ -1219,7 +1220,26 @@ def compute_block_masking(
         )
 
 
-@triton.jit
+_sage_fwd_repr = make_kernel_repr(
+    "sage_fwd",
+    [
+        "RETURN_LSE",
+        "HQ",
+        "HK",
+        "ACTUAL_BLOCK_DMODEL_QK",
+        "ACTUAL_BLOCK_DMODEL_V",
+        "IS_CAUSAL",
+        "USE_SLIDING_WINDOW",
+        "BLOCK_M",
+        "BLOCK_N",
+        "PRE_LOAD_V",
+        "USE_BIAS",
+        "USE_BLOCK_SPARSE",
+    ],
+)
+
+
+@triton.jit(repr=_sage_fwd_repr)
 def sage_fwd(
     Q,
     K,

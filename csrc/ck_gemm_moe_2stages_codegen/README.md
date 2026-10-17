@@ -30,6 +30,60 @@ If you have built moe kernels before tuning new MoE shapes, please add `AITER_RE
 
 ### Tuning Scope
 
+#### `--mxfp4-flydsl` and `--mxfp4-search-mode`
+
+The dedicated gfx950 A4W4 MXMOE tuner prunes legal GEMM1 candidates by default
+using `M_est = ceil(token * topk / expert)`, before generating routing data.
+It keeps overlapping BM families: BM16 for `M_est < 16`, BM32 for
+`4 <= M_est <= 128`, BM64 for `M_est >= 16`, and BM128 for `M_est >= 64`.
+Above `M_est = 32`, BM32 keeps only 4-wave, `k_wave=1`, non-NT candidates.
+Above `M_est = 64`, BM64 keeps only non-NT candidates. All legal BN,
+`xcd_swizzle`, and BM16 `prefetch_hidden` choices remain available.
+
+`--mxfp4-search-mode {prune,full}` selects the GEMM1 search mode. It defaults
+to `prune`; `full` enumerates every statically supported GEMM1 candidate:
+
+```bash
+python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
+  -i <untuned.csv> -o <tuned.csv> --mxfp4-flydsl --mxfp4-search-mode prune
+
+python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
+  -i <untuned.csv> -o <tuned.csv> --mxfp4-flydsl --mxfp4-search-mode full
+```
+
+Switching the mode alone does not re-tune shapes already written to the output
+CSV: `pre_process` skips them by shape key, and the search mode does not change
+that dedup rule. To re-check tuned shapes with full search, either add `--all`
+to re-tune and overwrite them, or point `-o` at a new file to keep the pruned
+results for comparison:
+
+```bash
+python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
+  -i <untuned.csv> -o <tuned.csv> --mxfp4-flydsl --mxfp4-search-mode full --all
+
+python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
+  -i <untuned.csv> -o <tuned_full.csv> --mxfp4-flydsl --mxfp4-search-mode full
+```
+
+An explicit `--mxfp4-search-mode` requires `--mxfp4-flydsl` and cannot be
+combined with `--grouped-gemm`. Both serial and multi-GPU shape workers use the same choice.
+When pruning removes candidates, the tuner prints one summary containing the
+pid, the shape fields that identify the row, `M_est`, the legal G1 count, and
+the retained G1 count, even without `--verbose`. The pid and shape fields keep
+the line attributable when `--mp` workers interleave their stdout.
+Full search and shapes with no removed candidates omit that summary.
+
+Pruning reduces candidate evaluation work and is expected to shorten tuning
+wall time. The actual wall time of `full` and `prune` has not been compared, so
+no measured speedup is reported. The performance of the selected kernels and
+winner retention on unseen shapes require separate validation; use full search
+to investigate those shapes. GEMM2 enumeration and the same-BM pairing rule are
+unchanged, but dropping a GEMM1 BM family also drops every pipeline pair under
+it.
+
+See [the pruning method and tuner changes](../../docs/a4w4_mxmoe_gemm1_pruning.md)
+for a worked example and static validation results.
+
 #### `--last`
 - **Type**: Flag (boolean)
 - **Default**: `False`
@@ -133,6 +187,60 @@ python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
 # benchmark default kernels using shapes from -i
 python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
   -i aiter/configs/untuned_fmoe.csv --run_config
+```
+
+#### Fast MXFP4 FlyDSL scan
+
+Use `--fast-scan` with `--mxfp4-flydsl` to scan each legal coupled G1/G2
+candidate using the profiler-summed active GPU-kernel time, excluding launch
+overhead and idle gaps. The scan prepares one input fixture per shape and
+builds one shared torch reference. Candidates that exceed
+`--errRatio`, return a non-finite error, or fail to launch are rejected
+individually, and the remaining candidates continue. A shared
+`--fast-scan-warmup-accuracy-checks` control (default 1) runs an untimed launch
+and validates its output before the coarse stage. The remaining candidates are
+profiled for `--fast-scan-iters` launches (default 10, for 11 coarse launches
+including warm-up; the value must be at least 2). The five lowest-latency
+`--fast-scan-finalists` candidates (default 5), always including the coarse
+global fastest candidate, plus the most accurate candidate not already in that
+performance set are revalidated and retimed for `--fast-scan-final-iters`
+profiled launches (default 100; the value must be at least 2) without another
+warm-up. If a finalist fails final accuracy validation, the next-lowest-latency
+unselected coarse survivor is retimed as a backfill until the target number of
+successful final retimes is reached or the candidate pool is exhausted. The
+accuracy-bucket ordering is diagnostic only: it ranks the printed summary but
+never reorders the latency-ordered backfill queue. The accuracy promotion
+itself is not diagnostic, and picks the most accurate unselected coarse
+survivor by the unrounded error, with latency breaking an exact tie. If the
+globally most accurate candidate is already a performance finalist, the
+next-most-accurate unselected candidate is promoted instead, so one independent
+accuracy candidate always reaches the final stage when one is available. Every
+requested profiler sample counts toward the active-kernel average except the
+warm-up iterations and, once the sample count exceeds 30, the IQR outliers that
+`get_trace_perf` drops. With `AITER_MXFP4_TUNE_SWIGLU_LIMIT` set, the limit is
+applied to the shared reference, to every candidate launch, and to the parallel
+precompile, so the scan neither compares different clamps nor JITs during
+scoring. The final measured output is checked after timing as an additional
+stability guard. Final-winner selection finds the globally fastest finalist,
+includes every finalist within 1% of that latency, and selects the lowest
+worst-case cosine error in that global performance-equivalent set. Latency
+breaks an exact accuracy tie. A shape is marked failed only when no candidate
+survives its accuracy and launch checks; otherwise the best valid final retime
+is emitted.
+
+The funnel checks kernel-level correctness at every stage. Still validate the
+selected rows through the production operator before using or committing the
+table, because that also covers runtime dispatch and integration:
+
+```bash
+python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
+  -i aiter/configs/model_configs/model_fp4_untuned_fmoe.csv \
+  -o aiter/configs/model_configs/model_fp4_tuned_fmoe.csv \
+  --mxfp4-flydsl --fast-scan --mp 1 --batch 1
+
+python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
+  --mxfp4-flydsl \
+  --run_config aiter/configs/model_configs/model_fp4_tuned_fmoe.csv
 ```
 
 #### `--compare`

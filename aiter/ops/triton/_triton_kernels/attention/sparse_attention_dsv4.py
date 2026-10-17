@@ -2,6 +2,9 @@ import torch
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
+
 # =====================================================================
 # Utility
 # =====================================================================
@@ -224,6 +227,13 @@ def _combine_topk_swa_indices_ragged_kernel(
 # ---------------------------------------------------------------------------
 
 
+@triton.jit
+def _exp(x, USE_EXP2: tl.constexpr):
+    if USE_EXP2:
+        return tl.math.exp2(x)
+    return tl.exp(x)
+
+
 def _prefill_prune_configs(configs, named_args, **kwargs):
     BLOCK_D = kwargs.get("BLOCK_D", named_args.get("BLOCK_D"))
     pruned = []
@@ -261,12 +271,26 @@ def _get_prefill_autotune_configs():
     ]
 
 
+_sparse_attn_prefill_kernel_repr = make_kernel_repr(
+    "_sparse_attn_prefill_kernel",
+    [
+        "HAS_ATTN_SINK",
+        "BLOCK_H",
+        "BLOCK_D",
+        "BLOCK_K",
+        "USE_EXP2",
+        "EVEN_H",
+        "EVEN_D",
+    ],
+)
+
+
 @triton.autotune(
-    configs=_get_prefill_autotune_configs(),
+    configs=autotune_configs("SPARSE_ATTENTION_DSV4", _get_prefill_autotune_configs()),
     key=["num_heads", "head_dim", "HAS_ATTN_SINK"],
     prune_configs_by={"early_config_prune": _prefill_prune_configs},
 )
-@triton.jit
+@triton.jit(repr=_sparse_attn_prefill_kernel_repr)
 def _sparse_attn_prefill_kernel(
     q_ptr,  # [num_queries, num_heads, head_dim]
     kv_ptr,  # [num_kv, head_dim]
@@ -290,6 +314,11 @@ def _sparse_attn_prefill_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    USE_EXP2: tl.constexpr = False,
+    # num_heads % BLOCK_H == 0: no head mask.
+    EVEN_H: tl.constexpr = False,
+    # head_dim == BLOCK_D: no dim mask; the KV gather is masked by row only.
+    EVEN_D: tl.constexpr = False,
 ):
     # 64-bit before the multiply, same reasoning as `slot_off` below: the
     # program id fits 32 bits, but `query_idx * q_stride_t` does not once
@@ -304,6 +333,11 @@ def _sparse_attn_prefill_kernel(
     head_mask = head_offsets < num_heads
     dim_mask = dim_offsets < head_dim
 
+    # Constant all-true masks fold away in the loads and the out store.
+    if EVEN_H:
+        head_mask = tl.full((BLOCK_H,), True, tl.int1)
+    if EVEN_D:
+        dim_mask = tl.full((BLOCK_D,), True, tl.int1)
     q = tl.load(
         q_ptr
         + query_idx * q_stride_t
@@ -313,6 +347,8 @@ def _sparse_attn_prefill_kernel(
         other=0.0,
     )
 
+    if USE_EXP2:
+        scale = scale * 1.4426950408889634  # log2(e): softmax runs in base 2
     m_i = tl.full((BLOCK_H,), float("-inf"), dtype=tl.float32)
     l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
@@ -332,20 +368,24 @@ def _sparse_attn_prefill_kernel(
         in_range = k_pos < kv_len
         valid = in_range & (slot >= 0) & (slot < num_kv)
 
-        # 64-bit before the multiply, same as the decode kernel: a slot index
-        # fits 32 bits (the index buffer is int32 by ABI) but `slot *
+        # 64-bit before the multiply, same as the decode kernel: an int32
+        # slot index fits 32 bits but `slot *
         # kv_stride_n` does not once the unified V4 pool runs to ~150M rows.
         # The wrapped offset still lands inside the same allocation, so the
         # bad read is silent.
         slot_off = slot.to(tl.int64)
 
-        kv = tl.load(
+        kv_ptrs = (
             kv_ptr
             + slot_off[:, None] * kv_stride_n
-            + dim_offsets[None, :] * kv_stride_d,
-            mask=valid[:, None] & dim_mask[None, :],
-            other=0.0,
+            + dim_offsets[None, :] * kv_stride_d
         )
+        # Invalid rows are never loaded: a zero softmax weight does not
+        # neutralize a non-finite value in the PV dot (0 * NaN = NaN).
+        if EVEN_D:
+            kv = tl.load(kv_ptrs, mask=valid[:, None], other=0.0)
+        else:
+            kv = tl.load(kv_ptrs, mask=valid[:, None] & dim_mask[None, :], other=0.0)
 
         # Prefetch next tile's indices before heavy compute on current tile.
         next_k_pos = k_start + BLOCK_K + k_offsets
@@ -360,9 +400,11 @@ def _sparse_attn_prefill_kernel(
 
         m_block = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, m_block)
-        alpha = tl.where(m_new == float("-inf"), 0.0, tl.exp(m_i - m_new))
+        alpha = tl.where(m_new == float("-inf"), 0.0, _exp(m_i - m_new, USE_EXP2))
         p = tl.where(
-            m_new[:, None] == float("-inf"), 0.0, tl.exp(scores - m_new[:, None])
+            m_new[:, None] == float("-inf"),
+            0.0,
+            _exp(scores - m_new[:, None], USE_EXP2),
         )
         p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
         l_new = l_i * alpha + tl.sum(p, axis=1)
@@ -375,9 +417,11 @@ def _sparse_attn_prefill_kernel(
         sink = tl.load(
             attn_sink_ptr + head_offsets, mask=head_mask, other=float("-inf")
         ).to(tl.float32)
+        if USE_EXP2:
+            sink = sink * 1.4426950408889634
         m_final = tl.maximum(m_i, sink)
-        alpha = tl.where(m_final == float("-inf"), 0.0, tl.exp(m_i - m_final))
-        exp_sink = tl.where(sink == float("-inf"), 0.0, tl.exp(sink - m_final))
+        alpha = tl.where(m_final == float("-inf"), 0.0, _exp(m_i - m_final, USE_EXP2))
+        exp_sink = tl.where(sink == float("-inf"), 0.0, _exp(sink - m_final, USE_EXP2))
         l_final = l_i * alpha + exp_sink
         denom = tl.maximum(l_final, 1.0e-30)
         out = tl.where(

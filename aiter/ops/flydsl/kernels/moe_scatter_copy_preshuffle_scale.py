@@ -56,24 +56,22 @@ Block : (BLOCK_THREADS, 1, 1)
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import scf
-from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, range_constexpr
-from flydsl.expr.arith import ArithValue, CmpIPredicate
-from flydsl.expr.typing import Int32, T
+from flydsl.expr import gpu, range_constexpr
+from flydsl.expr.typing import Int32
 
-from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
-    ptr_rsrc,
+    ptr_buf_tensor,
 )
 
 BLOCK_THREADS = 256
+# LDS a staged row-tile may take. Past this the tile is written straight out,
+# which costs the scattered source reads but needs no scratch.
+_STAGE_LDS = 32768
 
 
-def _emit_preshuffle_dword(gather, map_rsrc, src_rsrc, grow, sd, c_src_dwords, c0):
+def _emit_preshuffle_dword(gather, map_p, src_p, grow, sd, src_dwords):
     """Emit the load of one preshuffled source dword (grouped row ``grow``, scale
     dword ``sd``).
 
@@ -83,18 +81,15 @@ def _emit_preshuffle_dword(gather, map_rsrc, src_rsrc, grow, sd, c_src_dwords, c
     through ``rows_to_tokens`` (padding -> 0); ``gather=False`` reads the grouped
     row directly (identity, pure preshuffle).
     """
-    i32 = T.i32
     if gather:
-        srow = ArithValue(
-            buffer_ops.buffer_load(map_rsrc, grow, vec_width=1, dtype=i32)
-        )
-        valid = arith.cmpi(CmpIPredicate.sge, srow, c0)
+        srow = map_p[grow]
+        # -1 marks a padding row, so the test is signed.
+        valid = fx.Int32(srow) >= fx.Int32(0)
         # Clamp offset in-bounds when padding, then zero the result.
-        src_off = arith.select(valid, srow * c_src_dwords + sd, c0)
-        v_raw = buffer_ops.buffer_load(src_rsrc, src_off, vec_width=1, dtype=i32)
-        return arith.select(valid, v_raw, c0)
-    src_off = grow * c_src_dwords + sd
-    return buffer_ops.buffer_load(src_rsrc, src_off, vec_width=1, dtype=i32)
+        src_off = valid.select(fx.Uint32(srow) * src_dwords + sd, fx.Uint32(0))
+        v_raw = src_p[src_off]
+        return valid.select(fx.Uint32(v_raw), fx.Uint32(0))
+    return src_p[grow * src_dwords + sd]
 
 
 def build_moe_scatter_copy_preshuffle_scale_module(
@@ -132,6 +127,19 @@ def build_moe_scatter_copy_preshuffle_scale_module(
     rows_per_tile = wmma_rep * 16  # grouped rows per row-tile
     units_per_tile = 16 * src_dwords * wmma_rep
 
+    # Written straight out, adjacent lanes read adjacent grouped ROWS, so the
+    # source side moves one dword per line. Staging through LDS lets the load
+    # walk a row instead, leaving both sides on whole lines. The odd pitch keeps
+    # the store pass's LDS column off one bank.
+    lds_pitch = src_dwords + 1
+    stage_in_lds = rows_per_tile * lds_pitch * 4 <= _STAGE_LDS
+    VEC = 4 if src_dwords % 4 == 0 else 1
+    stage_iters = ((units_per_tile // VEC) + BLOCK_THREADS - 1) // BLOCK_THREADS
+
+    @fx.struct
+    class _ScaleTileStorage:
+        buf: fx.Array[fx.Int32, rows_per_tile * lds_pitch, 16]
+
     _g = "g" if gather else "p"
     module_name = f"moe_scatter_preshuffle_scale_b{row_bytes}_r{wmma_rep}_k{scale_k_per_tile}_{_g}"
 
@@ -143,52 +151,74 @@ def build_moe_scatter_copy_preshuffle_scale_module(
         max_m: Int32,
     ):
         """Write scales as ``(E, M//(wmma_rep*16), K//128, wmma_rep, 16, 4)``."""
-        i32 = T.i32
-        tile = ArithValue(fx.block_idx.x)
-        e = ArithValue(fx.block_idx.y)
-        tid = ArithValue(fx.thread_idx.x)
-        max_m_i32 = ArithValue(max_m)
-
-        c_rows_per_tile = arith.constant(rows_per_tile, type=i32)
-        c_src_dwords = arith.constant(src_dwords, type=i32)
-        c_wmma_rep = arith.constant(wmma_rep, type=i32)
-        c_units = arith.constant(units_per_tile, type=i32)
-        c16 = arith.constant(16, type=i32)
-        c0 = arith.constant(0, type=i32)
+        # Uint32: every value here is a non-negative count/index, so `<`, `%` and
+        # `//` lower to ult/remui/divui rather than their signed forms.
+        tile = fx.Uint32(fx.block_idx.x)
+        e = fx.Uint32(fx.block_idx.y)
+        tid = fx.Uint32(fx.thread_idx.x)
+        max_m_i32 = fx.Uint32(max_m)
 
         # Per-tile bases (runtime e/tile/max_m, compile-time geometry).
         # grouped src-row base of this tile's first row.
-        row_base = e * max_m_i32 + tile * c_rows_per_tile
-        # dst dword base of this expert+tile (out_row 0 of the tile).
-        # expert stride (dwords) = max_m * src_dwords; tile adds 16 out-rows.
-        expert_dword_base = e * (max_m_i32 * c_src_dwords)
-        tile_out_row0 = tile * c16
+        row_base = e * max_m_i32 + tile * rows_per_tile
+        # dst dword base of this expert+tile.
+        # expert stride (dwords) = max_m * src_dwords; each tile owns one full
+        # row-tile block of units_per_tile = 16 * src_dwords * wmma_rep dwords.
+        expert_dword_base = e * (max_m_i32 * src_dwords)
+        tile_dword_base = expert_dword_base + tile * units_per_tile
 
         # Created unconditionally (no in-body `if`): for gather=False the launcher
         # passes a placeholder for rows_to_tokens and the helper never reads it.
-        map_rsrc = ptr_rsrc(rows_to_tokens)
-        src_rsrc = ptr_rsrc(src)
-        dst_rsrc = ptr_rsrc(dst)
+        map_p = ptr_buf_tensor(rows_to_tokens)
+        src_p = ptr_buf_tensor(src)
+        dst_p = ptr_buf_tensor(dst)
 
-        for it in range_constexpr(
-            (units_per_tile + BLOCK_THREADS - 1) // BLOCK_THREADS
-        ):
-            unit = tid + arith.constant(it * BLOCK_THREADS, type=i32)
-            u_ok = arith.cmpi(CmpIPredicate.ult, unit, c_units)
-            _if_u = scf.IfOp(u_ok)
-            with ir.InsertionPoint(_if_u.then_block):
-                lane = unit % c16
-                t2 = unit // c16
-                w = t2 % c_wmma_rep
-                sd = t2 // c_wmma_rep
-                grow = row_base + w * c16 + lane
-                value = _emit_preshuffle_dword(
-                    gather, map_rsrc, src_rsrc, grow, sd, c_src_dwords, c0
-                )
-                tile_dword_base = expert_dword_base + tile_out_row0 * c_src_dwords
-                dst_off = tile_dword_base + (sd * c_wmma_rep + w) * c16 + lane
-                buffer_ops.buffer_store(value, dst_rsrc, dst_off)
-                scf.YieldOp([])
+        if stage_in_lds:
+            tile_lds = fx.SharedAllocator().allocate(_ScaleTileStorage).peek().buf.ptr
+
+            for it in range_constexpr(stage_iters):
+                unit = (tid + it * BLOCK_THREADS) * VEC
+                if unit < fx.Uint32(units_per_tile):
+                    row = unit // src_dwords
+                    sd = unit - row * src_dwords
+                    grow = row_base + row
+                    for j in range_constexpr(VEC):
+                        tile_lds[row * lds_pitch + sd + j] = fx.Int32(
+                            _emit_preshuffle_dword(
+                                gather, map_p, src_p, grow, sd + j, src_dwords
+                            )
+                        )
+
+            gpu.barrier()
+
+            for it in range_constexpr(stage_iters):
+                unit = (tid + it * BLOCK_THREADS) * VEC
+                if unit < fx.Uint32(units_per_tile):
+                    lane = unit % 16
+                    t2 = unit // 16
+                    w = t2 % wmma_rep
+                    sd = t2 // wmma_rep
+                    dst_off = tile_dword_base + (sd * wmma_rep + w) * 16 + lane
+                    for j in range_constexpr(VEC):
+                        dst_p[dst_off + j] = tile_lds[
+                            (w * 16 + lane + j) * lds_pitch + sd
+                        ]
+        else:
+            for it in range_constexpr(
+                (units_per_tile + BLOCK_THREADS - 1) // BLOCK_THREADS
+            ):
+                unit = tid + it * BLOCK_THREADS
+                if unit < fx.Uint32(units_per_tile):
+                    lane = unit % 16
+                    t2 = unit // 16
+                    w = t2 % wmma_rep
+                    sd = t2 // wmma_rep
+                    grow = row_base + w * 16 + lane
+                    value = _emit_preshuffle_dword(
+                        gather, map_p, src_p, grow, sd, src_dwords
+                    )
+                    dst_off = tile_dword_base + (sd * wmma_rep + w) * 16 + lane
+                    dst_p[dst_off] = value
 
     if gather:
 
@@ -202,15 +232,9 @@ def build_moe_scatter_copy_preshuffle_scale_module(
             tiles_per_expert: fx.Int32,
             stream: fx.Stream,
         ):
-            ctx = CompilationContext.get_current()
-            with ir.InsertionPoint(ctx.gpu_module_body):
-                pass
-
-            idx_tiles = arith.index_cast(T.index, tiles_per_expert)
-            idx_e = arith.index_cast(T.index, E)
             launcher = scatter_preshuffle_kernel(src, dst, rows_to_tokens, max_m)
             launcher.launch(
-                grid=(idx_tiles, idx_e, 1),
+                grid=(fx.Int64(tiles_per_expert), fx.Int64(E), 1),
                 block=(BLOCK_THREADS, 1, 1),
                 stream=stream,
             )
@@ -232,16 +256,10 @@ def build_moe_scatter_copy_preshuffle_scale_module(
         tiles_per_expert: fx.Int32,
         stream: fx.Stream,
     ):
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            pass
-
-        idx_tiles = arith.index_cast(T.index, tiles_per_expert)
-        idx_e = arith.index_cast(T.index, E)
         # rows_to_tokens is unused when gather=False; pass src as a placeholder.
         launcher = scatter_preshuffle_kernel(src, dst, src, max_m)
         launcher.launch(
-            grid=(idx_tiles, idx_e, 1),
+            grid=(fx.Int64(tiles_per_expert), fx.Int64(E), 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )

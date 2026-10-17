@@ -9,6 +9,8 @@ try:
     import triton
     import triton.language as tl
 
+    from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
     _HAVE_TRITON = True
 except ImportError:
     _HAVE_TRITON = False
@@ -278,7 +280,17 @@ if _HAVE_TRITON:
         sign = (value.to(tl.int32, bitcast=True) < 0).to(tl.int32) * 32
         return magnitude_code | sign
 
-    @triton.jit
+    _pack_v_fp6_repr = make_kernel_repr(
+        "_pack_v_fp6_kernel",
+        [
+            "CLAMP_TAIL",
+            "FIXED_E8M0",
+            "SEPARATE_OUTPUT",
+            "BLOCK_N",
+        ],
+    )
+
+    @triton.jit(repr=_pack_v_fp6_repr)
     def _pack_v_fp6_kernel(
         v_ptr,  # fp8 V [b, sk, h_kv, d] (any strides)
         out_ptr,  # uint8 [b*h_kv*nT*12800]
@@ -376,7 +388,15 @@ def _qk_field_perm() -> np.ndarray:
 
 if _HAVE_TRITON:
 
-    @triton.jit
+    _pack_qk_fp6_repr = make_kernel_repr(
+        "_pack_qk_fp6_kernel",
+        [
+            "BLOCK_N",
+            "num_warps",
+        ],
+    )
+
+    @triton.jit(repr=_pack_qk_fp6_repr)
     def _pack_qk_fp6_kernel(
         x_ptr,  # float [N, D] row-major (D % 32 == 0)
         packed_ptr,  # uint8 [N, NB*24]
@@ -424,7 +444,15 @@ if _HAVE_TRITON:
         sb = ((E + 127) & 0xFF).to(tl.uint8)
         tl.store(scale_ptr + scale_off, sb, mask=m)
 
-    @triton.jit
+    _gather_k_lds_repr = make_kernel_repr(
+        "_gather_k_lds_kernel",
+        [
+            "DATA_TILE_BYTES",
+            "BLOCK",
+        ],
+    )
+
+    @triton.jit(repr=_gather_k_lds_repr)
     def _gather_k_lds_kernel(
         packed_ptr,  # uint8 packed K [b, sk, h, 96] flattened (contiguous)
         buf_ptr,  # uint8 LDS-order output buffer [b, h, k_hs] flattened
@@ -458,7 +486,16 @@ if _HAVE_TRITON:
         )
         tl.store(buf_ptr + dst_addr, byte)
 
-    @triton.jit
+    _fill_k_scale_tail_repr = make_kernel_repr(
+        "_fill_k_scale_tail_kernel",
+        [
+            "TILE_BYTES",
+            "SCALE_TAIL_OFFSET",
+            "BLOCK",
+        ],
+    )
+
+    @triton.jit(repr=_fill_k_scale_tail_repr)
     def _fill_k_scale_tail_kernel(
         scale_ptr,  # uint8 scale [b, sk, h, 4] flattened
         buf_ptr,  # uint8 packed K buffer [b,h,nt*17408] flattened

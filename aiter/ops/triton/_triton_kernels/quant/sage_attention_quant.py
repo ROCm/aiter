@@ -1,10 +1,18 @@
 import triton
 import triton.language as tl
 
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid_3d
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
+_mha_v4_per_tensor_amax_repr = make_kernel_repr(
+    "mha_v4_per_tensor_amax_kernel",
+    [
+        "BLOCK_SIZE",
+    ],
+)
 
 
-@triton.jit
+@triton.jit(repr=_mha_v4_per_tensor_amax_repr)
 def mha_v4_per_tensor_amax_kernel(
     input_ptr,
     partial_ptr,
@@ -19,7 +27,15 @@ def mha_v4_per_tensor_amax_kernel(
     tl.store(partial_ptr + block, tl.max(tl.abs(values), axis=0))
 
 
-@triton.jit
+_mha_v4_per_tensor_scale_repr = make_kernel_repr(
+    "mha_v4_per_tensor_scale_kernel",
+    [
+        "BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_mha_v4_per_tensor_scale_repr)
 def mha_v4_per_tensor_scale_kernel(
     partial_ptr,
     scale_ptr,
@@ -35,7 +51,16 @@ def mha_v4_per_tensor_scale_kernel(
     tl.store(scale_ptr, scale)
 
 
-@triton.jit
+_mha_v4_per_tensor_quant_repr = make_kernel_repr(
+    "mha_v4_per_tensor_quant_kernel",
+    [
+        "IS_INT8",
+        "BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_mha_v4_per_tensor_quant_repr)
 def mha_v4_per_tensor_quant_kernel(
     input_ptr,
     output_ptr,
@@ -182,7 +207,16 @@ def _compute_mx_quant_and_scale_rne(
     return out_tensor, dequant_scale_exponent
 
 
-@triton.jit
+_sage_quant_v_repr = make_kernel_repr(
+    "sage_quant_v_kernel",
+    [
+        "D",
+        "BLK_K",
+    ],
+)
+
+
+@triton.jit(repr=_sage_quant_v_repr)
 def sage_quant_v_kernel(
     V_Input,
     V_Output,
@@ -191,6 +225,10 @@ def sage_quant_v_kernel(
     stride_kh,
     stride_kn,
     stride_kd,
+    stride_voz,
+    stride_voh,
+    stride_von,
+    stride_vod,
     stride_vsz,
     stride_vsh,
     BATCH,
@@ -215,9 +253,15 @@ def sage_quant_v_kernel(
         + offs_kn[:, None] * stride_kn
         + offs_d[None, :] * stride_kd
     )
+    v_out_offs = (
+        off_b * stride_voz
+        + off_h * stride_voh
+        + offs_kn[:, None] * stride_von
+        + offs_d[None, :] * stride_vod
+    )
 
     v_input_ptrs = V_Input + v_offs
-    v_output_ptrs = V_Output + v_offs
+    v_output_ptrs = V_Output + v_out_offs
 
     # just apply the per channel v_scales that have been computed outside
     v_scale_ptrs = V_Scale + off_b * stride_vsz + off_h * stride_vsh + offs_d[None, :]
@@ -229,7 +273,16 @@ def sage_quant_v_kernel(
     tl.store(v_output_ptrs, v_quant, mask=offs_kn[:, None] < SEQLEN_K)
 
 
-@triton.jit
+_sage_quant_v_amax_partial_repr = make_kernel_repr(
+    "sage_quant_v_amax_partial_kernel",
+    [
+        "D",
+        "BLOCK_K",
+    ],
+)
+
+
+@triton.jit(repr=_sage_quant_v_amax_partial_repr)
 def sage_quant_v_amax_partial_kernel(
     V_Input,
     Partial_Max,
@@ -266,7 +319,17 @@ def sage_quant_v_amax_partial_kernel(
     tl.store(Partial_Max + out, partial)
 
 
-@triton.jit
+_sage_quant_v_amax_finalize_repr = make_kernel_repr(
+    "sage_quant_v_amax_finalize_kernel",
+    [
+        "D",
+        "BLOCK_N",
+        "BLOCK_D",
+    ],
+)
+
+
+@triton.jit(repr=_sage_quant_v_amax_finalize_repr)
 def sage_quant_v_amax_finalize_kernel(
     Partial_Max,
     V_Scale,
@@ -286,7 +349,9 @@ def sage_quant_v_amax_finalize_kernel(
         mask=(offs_n[:, None] < NUM_SEQ_BLKS) & (offs_d[None, :] < D),
         other=0.0,
     )
-    scale = tl.max(partial, axis=0) * (1.0 / FP8_MAX)
+    # An all-zero channel would otherwise give scale 0, and dividing by it turns the whole
+    # channel into NaN rather than zero. Sequence-parallel head padding produces exactly that.
+    scale = tl.maximum(tl.max(partial, axis=0), 1e-12) * (1.0 / FP8_MAX)
     tl.store(V_Scale + bh * D + offs_d, scale, mask=offs_d < D)
 
 
@@ -496,7 +561,19 @@ def sage_quant_v_mxfp4_colmajor_kernel(
     )
 
 
-@triton.jit
+_rotate_quantize_q_repr = make_kernel_repr(
+    "_rotate_quantize_q_kernel",
+    [
+        "q_smoothing",
+        "hadamard_rotation",
+        "BLOCK_M",
+        "BLOCK_R",
+        "D",
+    ],
+)
+
+
+@triton.jit(repr=_rotate_quantize_q_repr)
 def _rotate_quantize_q_kernel(
     Q,
     Q_q,
@@ -620,7 +697,19 @@ def _rotate_quantize_q_kernel(
     )
 
 
-@triton.jit
+_rotate_quantize_k_repr = make_kernel_repr(
+    "_rotate_quantize_k_kernel",
+    [
+        "q_smoothing",
+        "hadamard_rotation",
+        "BLOCK_M",
+        "BLOCK_R",
+        "D",
+    ],
+)
+
+
+@triton.jit(repr=_rotate_quantize_k_repr)
 def _rotate_quantize_k_kernel(
     Q,
     Q_q,
@@ -922,7 +1011,17 @@ def _rotate_quantize_qk_kernel(
     )
 
 
-@triton.jit
+_rot_q_repr = make_kernel_repr(
+    "_rot_q_kernel",
+    [
+        "q_smoothing",
+        "BLOCK_M",
+        "BLOCK_D",
+    ],
+)
+
+
+@triton.jit(repr=_rot_q_repr)
 def _rot_q_kernel(
     Q,
     Q_rot,
@@ -1022,7 +1121,16 @@ def _rot_q_kernel(
     )
 
 
-@triton.jit
+_rot_k_only_repr = make_kernel_repr(
+    "_rot_k_only_kernel",
+    [
+        "BLOCK_M",
+        "BLOCK_D",
+    ],
+)
+
+
+@triton.jit(repr=_rot_k_only_repr)
 def _rot_k_only_kernel(
     K,
     K_rot,
@@ -1090,7 +1198,15 @@ def _rot_k_only_kernel(
     )
 
 
-@triton.jit
+_compute_delta_s_repr = make_kernel_repr(
+    "_compute_delta_s_kernel",
+    [
+        "BLOCK_N",
+    ],
+)
+
+
+@triton.jit(repr=_compute_delta_s_repr)
 def _compute_delta_s_kernel(
     Q_mean,
     K_rot,
@@ -1165,7 +1281,16 @@ def _compute_delta_s_kernel(
     tl.store(s_ptr, acc, mask=offs_n < seq_k)
 
 
-@triton.jit
+_q_smooth_int8_repr = make_kernel_repr(
+    "_q_smooth_int8_kernel",
+    [
+        "BLOCK_M",
+        "BLOCK_D",
+    ],
+)
+
+
+@triton.jit(repr=_q_smooth_int8_repr)
 def _q_smooth_int8_kernel(
     Q,
     Q_out,
@@ -1239,7 +1364,19 @@ def _q_smooth_int8_kernel(
     )
 
 
-@triton.jit
+_sage_quant_repr = make_kernel_repr(
+    "sage_quant_kernel",
+    [
+        "SEQLEN_K_PADDED",
+        "INT8_MAX",
+        "D",
+        "BLK_Q",
+        "BLK_K",
+    ],
+)
+
+
+@triton.jit(repr=_sage_quant_repr)
 def sage_quant_kernel(
     Q_Input,
     Q_Output,
@@ -1253,9 +1390,27 @@ def sage_quant_kernel(
     stride_qz,
     stride_qh,
     stride_qn,
+    stride_qd,
+    stride_qoz,
+    stride_qoh,
+    stride_qon,
+    stride_qod,
     stride_kz,
     stride_kh,
     stride_kn,
+    stride_kd,
+    stride_koz,
+    stride_koh,
+    stride_kon,
+    stride_kod,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vd,
+    stride_voz,
+    stride_voh,
+    stride_von,
+    stride_vod,
     stride_qsz,
     stride_qsh,
     stride_ksz,
@@ -1294,11 +1449,17 @@ def sage_quant_kernel(
             off_b * stride_qz
             + off_h * stride_qh
             + offs_qn[:, None] * stride_qn
-            + offs_d[None, :]
+            + offs_d[None, :] * stride_qd
+        )
+        q_out_offs = (
+            off_b * stride_qoz
+            + off_h * stride_qoh
+            + offs_qn[:, None] * stride_qon
+            + offs_d[None, :] * stride_qod
         )
 
         q_input_ptrs = Q_Input + q_offs
-        q_output_ptrs = Q_Output + q_offs
+        q_output_ptrs = Q_Output + q_out_offs
         q_scale_ptrs = Q_Scale + off_b * stride_qsz + off_h * stride_qsh + off_blk
 
         _general_quant_kernel(
@@ -1320,11 +1481,17 @@ def sage_quant_kernel(
             off_b * stride_kz
             + off_h * stride_kh
             + offs_kn[:, None] * stride_kn
-            + offs_d[None, :]
+            + offs_d[None, :] * stride_kd
+        )
+        k_out_offs = (
+            off_b * stride_koz
+            + off_h * stride_koh
+            + offs_kn[:, None] * stride_kon
+            + offs_d[None, :] * stride_kod
         )
 
         k_input_ptrs = K_Input + k_offs
-        k_output_ptrs = K_Output + k_offs
+        k_output_ptrs = K_Output + k_out_offs
         k_scale_ptrs = K_Scale + off_b * stride_ksz + off_h * stride_ksh + off_blk
 
         _general_quant_kernel(
@@ -1341,14 +1508,20 @@ def sage_quant_kernel(
         offs_kn = off_blk * BLK_K + offs_blk_k
 
         v_offs = (
-            off_b * stride_kz
-            + off_h * stride_kh
-            + offs_kn[:, None] * stride_kn
-            + offs_d[None, :]
+            off_b * stride_vz
+            + off_h * stride_vh
+            + offs_kn[:, None] * stride_vn
+            + offs_d[None, :] * stride_vd
+        )
+        v_out_offs = (
+            off_b * stride_voz
+            + off_h * stride_voh
+            + offs_kn[:, None] * stride_von
+            + offs_d[None, :] * stride_vod
         )
 
         v_input_ptrs = V_Input + v_offs
-        v_output_ptrs = V_Output + v_offs
+        v_output_ptrs = V_Output + v_out_offs
 
         # just apply the per channel v_scales that have been computed outside
         v_scale_ptrs = (

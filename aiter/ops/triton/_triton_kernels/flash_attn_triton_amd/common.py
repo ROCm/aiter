@@ -12,7 +12,12 @@ import torch
 import triton
 import triton.language as tl
 
-from .utils import DEBUG, get_shape_from_layout, get_stride_from_layout, is_fp8
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
+    DEBUG,
+    get_shape_from_layout,
+    get_stride_from_layout,
+    is_fp8,
+)
 
 
 @triton.jit
