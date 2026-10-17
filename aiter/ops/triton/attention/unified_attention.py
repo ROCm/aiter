@@ -1201,7 +1201,7 @@ def _unified_attention_gfx950(
     USE_LOAD_BUFFER_OP = params.k.nelement() * params.k.element_size() <= MAX_INT32
     USE_STORE_BUFFER_OP = params.out.nelement() * params.out.element_size() <= MAX_INT32
 
-    _unified_attention_kernel_gfx950[grid](
+    return _unified_attention_kernel_gfx950[grid](
         query_ptr=params.q,
         key_cache_ptr=params.k,
         value_cache_ptr=params.v,
