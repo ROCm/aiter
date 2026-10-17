@@ -29,12 +29,14 @@ import sys
 import time
 
 from aiter.aot.flydsl.common import (
+    DEFAULT_NUM_XCDS,
     collect_aot_jobs,
     compile_only_env,
     cu_num_to_arch,
     job_identity,
     override_env,
     run_jobs_parallel,
+    target_num_xcds,
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg as _ptr_view_safe
@@ -266,6 +268,7 @@ def _precompile_to_cache(
     inter_dim_pad: int = 0,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
+    num_xcds: int = DEFAULT_NUM_XCDS,
     enable_bias: bool = False,
     stage1_fuse_quant=None,
     k_wave: int = 1,
@@ -650,6 +653,7 @@ def _precompile_to_cache(
                 "enable_bias": (kernel_bias is not None),
                 "a_scale_one": a_scale_one,
                 "xcd_swizzle": xcd_swizzle,
+                "num_xcds": num_xcds,
                 "k_wave": k_wave,
                 "v2_output_layout": _v2_output_layout,
             }
@@ -846,6 +850,7 @@ def _precompile_to_cache(
                 model_dim_pad=model_dim_pad,
                 inter_dim_pad=inter_dim_pad,
                 xcd_swizzle=xcd_swizzle,
+                num_xcds=num_xcds,
                 enable_bias=enable_bias,
             )
             _run_compiled(exe, args)
@@ -883,6 +888,7 @@ def _precompile_a16w4_to_cache(
     act: str = "silu",
     b_nt: int = 2,
     xcd_swizzle: int = 0,
+    num_xcds: int = DEFAULT_NUM_XCDS,
     k_wave: int = 1,
     waves_per_eu: int | None = None,
     b_dtype: str = "fp4",
@@ -920,6 +926,7 @@ def _precompile_a16w4_to_cache(
         "tile_m": tile_m,
         "b_nt": b_nt,
         "xcd_swizzle": xcd_swizzle,
+        "num_xcds": num_xcds,
         "stream": 0,
     }
     with compile_only_env():
@@ -1061,6 +1068,7 @@ def compile_one_config(
     Returns a dict with timing info.
     """
     aot_arch = gfx or cu_num_to_arch(cu_num, default=MOE_AOT_ARCH_DEFAULT)
+    num_xcds = target_num_xcds(aot_arch, cu_num)
     is_epilogue = kwargs.get("stage") == "epilogue"
     shape_str = (
         f"{kernel_name}  inter_dim={inter_dim} topk={topk}"
@@ -1100,6 +1108,7 @@ def compile_one_config(
                     experts=experts,
                     topk=topk,
                     cu_num=cu_num,
+                    num_xcds=num_xcds,
                     **kwargs,
                 )
         else:
@@ -1131,6 +1140,7 @@ def compile_one_config(
                         experts=experts,
                         topk=topk,
                         cu_num=cu_num,
+                        num_xcds=num_xcds,
                         **kwargs,
                     )
         elapsed = time.time() - t0
