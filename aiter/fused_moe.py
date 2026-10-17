@@ -1223,7 +1223,9 @@ def fused_moe(
             if quant_type_a is not None:
                 unsupported.append("quant_type_a")
             fhmoe_quant_dtype_a = (
-                dtypes.fp8 if GateMode(gate_mode) == GateMode.INTERLEAVE else dtypes.fp4x2
+                dtypes.fp8
+                if GateMode(gate_mode) == GateMode.INTERLEAVE
+                else dtypes.fp4x2
             )
             if quant_dtype_a is not None and quant_dtype_a != fhmoe_quant_dtype_a:
                 unsupported.append("quant_dtype_a")
@@ -1287,7 +1289,9 @@ def fused_moe(
         if not block_size_M:
             block_size_M = -1
         enable_ep_scatter = stage2_scatter is not None
-        scatter_source_map = stage2_scatter.source_token_map if enable_ep_scatter else None
+        scatter_source_map = (
+            stage2_scatter.source_token_map if enable_ep_scatter else None
+        )
         return fused_moe_(
             hidden_states=hidden_states,
             w1=w1,
