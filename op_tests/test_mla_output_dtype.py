@@ -6,13 +6,11 @@
 import argparse
 import ctypes
 import hashlib
-import inspect
 import itertools
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import get_type_hints
 
 import pandas as pd
 import pytest
@@ -72,13 +70,25 @@ def _raw_stage1_call(arguments):
     assert lib.aiter_ctypes_abi_version() >= 2
     lib.aiter_get_last_error.restype = ctypes.c_char_p
     lib.aiter_clear_last_error.restype = None
-    signature = inspect.signature(aiter.mla_decode_stage1_asm_fwd)
-    hints = get_type_hints(aiter.mla_decode_stage1_asm_fwd)
-    bound = signature.bind(**arguments)
-    bound.apply_defaults()
+    # Explicit ABI order: unlike the public API this call must not depend on
+    # compile_ops preserving Python signatures after lazy loading.
+    parameters = dict(
+        arguments,
+        lse=None,
+        q_scale=None,
+        kv_scale=None,
+        g_kv_indptr=None,
+        cp_world_size=1,
+        cp_rank=0,
+        valid_split_count=None,
+        use_valid_split_count_reduce=0,
+        causal=True,
+        kv_shuffled=0,
+        kv_indptr_is_token_level=False,
+    )
     argtypes, values, keepalive = [], [], []
     tensor_pointer = ctypes.POINTER(aiter_tensor_t)
-    for name, value in bound.arguments.items():
+    for name, value in parameters.items():
         if isinstance(value, torch.Tensor):
             tensor = torch_to_aiter(value)
             keepalive.append(tensor)
@@ -87,14 +97,14 @@ def _raw_stage1_call(arguments):
         elif value is None:
             argtypes.append(tensor_pointer)
             values.append(None)
-        elif hints[name] is bool:
+        elif isinstance(value, bool):
             argtypes.append(ctypes.c_int)
             values.append(value)
-        elif hints[name] is float:
+        elif isinstance(value, float):
             argtypes.append(ctypes.c_float)
             values.append(value)
         else:
-            assert hints[name] is int, (name, hints[name])
+            assert isinstance(value, int), (name, type(value))
             argtypes.append(ctypes.c_int64)
             values.append(value)
     function = lib.mla_decode_stage1_asm_fwd
