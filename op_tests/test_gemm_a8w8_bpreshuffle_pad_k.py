@@ -299,19 +299,33 @@ def test_gemm_a8w8_bpreshuffle_pad_k(m, n, k, w_k, dtype):
 test_gemm_a8w8_bpreshuffle_pad_k.__test__ = False
 
 
-# gfx950 rows reaching each CK/CKTile/FlyDSL path with a K-padded weight, either
+# (case id, expected (libtype, split-K?), (m, n, k, w_k)) per (gfx, cu_num) tuned
+# table: rows reaching each CK/CKTile/FlyDSL path with a K-padded weight, either
 # through the logical-K row or the padded-K fallback lookup, plus untuned shapes.
-# (case id, expected (libtype, split-K?) on a 256-CU gfx950, (m, n, k, w_k))
-_PADDED_K_CASES = [
+_UNTUNED_CASES = [
     ("untuned", None, (37, 1280, 448, 512)),
     ("untuned-half", None, (37, 1280, 256, 512)),
-    ("ck-logical-k", ("ck", False), (1, 64, 4096, 4224)),
-    ("ck-splitk-logical-k", ("ck", True), (4, 64, 4096, 4224)),
-    ("cktile-logical-k", ("cktile", False), (1, 1536, 128, 256)),
-    ("ck-padded-k-row", ("ck", False), (32, 384, 7040, 7168)),
-    ("cktile-padded-k-row", ("cktile", False), (2048, 384, 7040, 7168)),
-    ("flydsl-padded-k-row", ("flydsl", False), (512, 384, 7040, 7168)),
 ]
+_PADDED_K_CASES = {
+    ("gfx950", 256): _UNTUNED_CASES
+    + [
+        ("ck-logical-k", ("ck", False), (1, 64, 4096, 4224)),
+        ("ck-splitk-logical-k", ("ck", True), (4, 64, 4096, 4224)),
+        ("cktile-logical-k", ("cktile", False), (1, 1536, 128, 256)),
+        ("ck-padded-k-row", ("ck", False), (32, 384, 7040, 7168)),
+        ("cktile-padded-k-row", ("cktile", False), (2048, 384, 7040, 7168)),
+        ("flydsl-padded-k-row", ("flydsl", False), (512, 384, 7040, 7168)),
+    ],
+    # The 304-CU gfx942 table has no fp8 rows, so only the untuned fallback runs.
+    ("gfx942", 304): _UNTUNED_CASES,
+    ("gfx942", 80): _UNTUNED_CASES
+    + [
+        ("ck-logical-k", ("ck", False), (1, 64, 7168, 7296)),
+        ("cktile-logical-k", ("cktile", False), (1, 2048, 2048, 2176)),
+        ("ck-padded-k-row", ("ck", False), (1, 64, 7040, 7168)),
+        ("cktile-padded-k-row", ("cktile", False), (1, 2048, 1920, 2048)),
+    ],
+}
 
 # Cards the CK/CKTile bpreshuffle paths are built for. gfx1250 has no CK path,
 # and its untuned FlyDSL fallback is not covered by these shapes.
@@ -321,16 +335,20 @@ TOL_ERR_RATIO = 0.05
 
 
 @pytest.mark.parametrize(
-    "backend,mnk",
-    [c[1:] for c in _PADDED_K_CASES],
-    ids=[c[0] for c in _PADDED_K_CASES],
+    "device,backend,mnk",
+    [(dev, *c[1:]) for dev, cases in _PADDED_K_CASES.items() for c in cases],
+    ids=[
+        f"{gfx}-cu{cu}-{c[0]}"
+        for (gfx, cu), cases in _PADDED_K_CASES.items()
+        for c in cases
+    ],
 )
-def test_gemm_a8w8_bpreshuffle_padded_k_matches_reference(backend, mnk):
+def test_gemm_a8w8_bpreshuffle_padded_k_matches_reference(device, backend, mnk):
     # Dispatch keys the tuned CSV with (get_gfx(), get_cu_num()), and the
-    # untuned fallback is arch-specific too, so every row only holds for a
-    # full 256-CU gfx950 device, not a partitioned one.
-    if (get_gfx(), get_cu_num()) != ("gfx950", 256):
-        pytest.skip("rows are picked from the gfx950 cu_num=256 tuned tables")
+    # untuned fallback is arch-specific too, so a row only holds on the full
+    # device its table was picked from, not on a partitioned one.
+    if (get_gfx(), get_cu_num()) != device:
+        pytest.skip(f"rows are picked from the {device[0]} cu_num={device[1]} table")
     m, n, k, w_k = mnk
     assert (
         _padded_k_backend(m, n, k, w_k) == backend
@@ -364,7 +382,9 @@ def main():
         "--mnk",
         type=dtypes.str2tuple,
         nargs="*",
-        default=[c[2] for c in _PADDED_K_CASES],
+        default=[
+            c[2] for c in _PADDED_K_CASES.get((get_gfx(), get_cu_num()), _UNTUNED_CASES)
+        ],
         help="""Shape m,n,k,w_k: k is the activation K, w_k the padded weight K.
     e.g.: -s 37,1280,448,512""",
     )
