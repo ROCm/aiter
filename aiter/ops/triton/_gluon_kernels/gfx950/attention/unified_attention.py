@@ -320,6 +320,7 @@ class AttentionConfig:
     SHUFFLED_KV_CACHE: gl.constexpr
     KV_SHUFFLE_WIDTH: gl.constexpr
     USE_SOFTCAP: gl.constexpr
+    SCALE_AFTER_DOT: gl.constexpr
     # constexpr so the allocated-once vLLM cache strides constant-fold into addressing
     stride_k_cache_0: gl.constexpr
     stride_k_cache_1: gl.constexpr
@@ -364,7 +365,9 @@ class AttentionConfig:
         stride_v_cache_2,
         stride_v_cache_3,
         WARPS_N=1,
+        SCALE_AFTER_DOT=False,
     ):
+        self.SCALE_AFTER_DOT = gl.constexpr(SCALE_AFTER_DOT)
         self.HEAD_SIZE = gl.constexpr(HEAD_SIZE)
         self.BLOCK_SIZE = gl.constexpr(BLOCK_SIZE)
         self.BLOCK_M = gl.constexpr(BLOCK_M)
@@ -1119,6 +1122,32 @@ class ScaledKVLoader:
         self.base.load_v_to_shared(offset, buffer_id)
 
     @gluon.jit
+    def load_scales(self, tile_index):
+        cfg = self.base.cfg
+        slots = gl.arange(0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.qk_layout))
+        start = tile_index * cfg.TILE_SIZE
+        valid = start + slots < self.seq_len
+        page = gl.load(self.base.block_tables_ptr_shifted + start // cfg.BLOCK_SIZE).to(
+            gl.int64
+        )
+        within = start % cfg.BLOCK_SIZE + slots
+        ks = gl.load(
+            self.k_scale_ptr
+            + page * self.scale_strides[0]
+            + within * self.scale_strides[1],
+            mask=valid,
+            other=1.0,
+        )
+        vs = gl.load(
+            self.v_scale_ptr
+            + page * self.scale_strides[2]
+            + within * self.scale_strides[3],
+            mask=valid,
+            other=1.0,
+        )
+        return ks, vs
+
+    @gluon.jit
     def dequantize(self, value, tile_index, target_dtype, is_key: gl.constexpr):
         cfg = self.base.cfg
         # Load the token scales in the same lane/register ownership as the
@@ -1169,6 +1198,10 @@ class ScaledKVLoader:
         RELAXED: gl.constexpr = False,
         tile_index=0,
     ):
+        if self.base.cfg.SCALE_AFTER_DOT:
+            return self.base.load_k_from_shared(
+                wait_count, target_dtype, buffer_id, skip_wait, RELAXED
+            )
         raw = self.base.load_k_from_shared(
             wait_count, gl.float32, buffer_id, skip_wait, RELAXED
         )
@@ -1184,6 +1217,17 @@ class ScaledKVLoader:
         RELAXED: gl.constexpr = False,
         tile_index=0,
     ):
+        if self.base.cfg.SCALE_AFTER_DOT:
+            raw = self.base.load_v_from_shared(
+                wait_count, target_dtype, buffer_id, skip_wait, RELAXED
+            )
+            slots = gl.arange(
+                0,
+                self.base.cfg.TILE_SIZE,
+                layout=gl.SliceLayout(1, self.base.cfg.v_layout),
+            )
+            valid = tile_index * self.base.cfg.TILE_SIZE + slots < self.seq_len
+            return gl.where(valid[:, None], raw, 0.0).to(target_dtype)
         raw = self.base.load_v_from_shared(
             wait_count, gl.float32, buffer_id, skip_wait, RELAXED
         )
@@ -1372,7 +1416,7 @@ class AttentionProgram:
         )
 
     @gluon.jit
-    def compute_qk(self, k):
+    def compute_qk(self, k, k_scale=None):
         S = gl.zeros(
             [self.cfg.BLOCK_M, self.cfg.TILE_SIZE],
             dtype=gl.float32,
@@ -1390,6 +1434,8 @@ class AttentionProgram:
                 b_format="e4m3",
                 acc=S,
             )
+        if k_scale is not None:
+            S = S * k_scale[None, :]
         if self.cfg.USE_SOFTCAP:
             # before any mask: tanh(-inf) is -1, which would undo it
             S = self.apply_softcap(S)
@@ -1449,9 +1495,13 @@ class AttentionProgram:
         return p, alpha, m_ij
 
     @gluon.jit
-    def softmax_part1(self, p, L, acc, alpha, target_dtype=gl.bfloat16):
+    def softmax_part1(self, p, L, acc, alpha, target_dtype=gl.bfloat16, v_scale=None):
         acc = acc * alpha[:, None]
         l_ij = gl.sum(p, 1)
+        # The normalization uses unscaled probabilities. Applying the V scale
+        # only to the PV operand leaves the attention denominator unchanged.
+        if v_scale is not None:
+            p = p * v_scale[None, :]
         if target_dtype != gl.bfloat16:
             p = p.to(target_dtype)
         else:
@@ -1577,12 +1627,20 @@ class AttentionProgram:
 
 
 @gluon.jit
+def attention_token_scales(pgm, kv_loader, tile_index):
+    if pgm.cfg.SCALE_AFTER_DOT:
+        return kv_loader.load_scales(tile_index)
+    return None, None
+
+
+@gluon.jit
 def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
     # One shared buffer, and every warp reads the whole tile because operand B is
     # replicated across warps
     # barriers are needed for correctness but I expect compiler to insert them automatically.
     # Not sure why that doesnt happen
     for j in range(pgm.tile_start, pgm.safe_tile_end):
+        k_scale, v_scale = attention_token_scales(pgm, kv_loader, j)
         blk = kv_loader.load_block_ids(j)
         kv_loader.load_k_to_shared(blk, buffer_id=0)
         kv_loader.load_v_to_shared(blk, buffer_id=0)
@@ -1595,12 +1653,14 @@ def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
             buffer_id=0,
             skip_wait=True,
         )
-        S = pgm.compute_qk(k)
+        S = pgm.compute_qk(k, k_scale)
         if pgm.cfg.SLIDING_WINDOW > 0:
             S = pgm.apply_mask_qk(S, j)
         S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
         p, alpha, M = pgm.softmax_part0(S, M)
-        p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
+        p, L, acc = pgm.softmax_part1(
+            p, L, acc, alpha, v_scale=v_scale, target_dtype=q.dtype
+        )
         gl.amd.cdna4.async_copy.wait_group(0)
         _barrier()
         v = kv_loader.load_v_from_shared(
@@ -1615,6 +1675,7 @@ def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
 
     if not pgm.cfg.ALL_DECODE:
         for j in range(pgm.safe_tile_end, pgm.tile_end - 1):
+            k_scale, v_scale = attention_token_scales(pgm, kv_loader, j)
             blk = kv_loader.load_block_ids(j)
             kv_loader.load_k_to_shared(blk, buffer_id=0)
             kv_loader.load_v_to_shared(blk, buffer_id=0)
@@ -1627,11 +1688,13 @@ def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
                 buffer_id=0,
                 skip_wait=True,
             )
-            S = pgm.compute_qk(k)
+            S = pgm.compute_qk(k, k_scale)
             S = pgm.apply_mask_qk(S, j)
             S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
             p, alpha, M = pgm.softmax_part0(S, M)
-            p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
+            p, L, acc = pgm.softmax_part1(
+                p, L, acc, alpha, v_scale=v_scale, target_dtype=q.dtype
+            )
             gl.amd.cdna4.async_copy.wait_group(0)
             _barrier()
             v = kv_loader.load_v_from_shared(
@@ -1646,6 +1709,7 @@ def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
 
     # Last tile is always masked
     j = pgm.tile_end - 1
+    k_scale, v_scale = attention_token_scales(pgm, kv_loader, j)
     blk = kv_loader.load_block_ids(j)
     kv_loader.load_k_to_shared(blk, buffer_id=0)
     kv_loader.load_v_to_shared(blk, buffer_id=0)
@@ -1654,11 +1718,13 @@ def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
     k = kv_loader.load_k_from_shared(
         tile_index=j, wait_count=1, target_dtype=q.dtype, buffer_id=0, skip_wait=True
     )
-    S = pgm.compute_qk(k)
+    S = pgm.compute_qk(k, k_scale)
     S = pgm.apply_mask_qk(S, j)
     S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
     p, alpha, M = pgm.softmax_part0(S, M)
-    p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
+    p, L, acc = pgm.softmax_part1(
+        p, L, acc, alpha, v_scale=v_scale, target_dtype=q.dtype
+    )
     gl.amd.cdna4.async_copy.wait_group(0)
     _barrier()
     v = kv_loader.load_v_from_shared(
@@ -1683,6 +1749,7 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
     kv_loader.load_v_to_shared(physical_block_idx, buffer_id=buffer_id)
     # ---- Safe tiles (no mask) ----
     for j in range(pgm.tile_start, pgm.safe_tile_end):
+        k_scale, v_scale = attention_token_scales(pgm, kv_loader, j)
         if pgm.cfg.NUM_WARPS == 1:
             next2_physical_block_idx = kv_loader.load_block_ids(j + 2)
             k = kv_loader.load_k_from_shared(
@@ -1707,12 +1774,14 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
         kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
         kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
 
-        S = pgm.compute_qk(k)
+        S = pgm.compute_qk(k, k_scale)
         if pgm.cfg.SLIDING_WINDOW > 0:
             S = pgm.apply_mask_qk(S, j)
         S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
         p, alpha, M = pgm.softmax_part0(S, M)
-        p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
+        p, L, acc = pgm.softmax_part1(
+            p, L, acc, alpha, v_scale=v_scale, target_dtype=q.dtype
+        )
 
         if pgm.cfg.NUM_WARPS == 1:
             v = kv_loader.load_v_from_shared(
@@ -1734,6 +1803,7 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
     if not pgm.cfg.ALL_DECODE:
         # ---- Masked tiles (causal boundary) ----
         for j in range(pgm.safe_tile_end, pgm.tile_end - 1):
+            k_scale, v_scale = attention_token_scales(pgm, kv_loader, j)
             if pgm.cfg.NUM_WARPS == 1:
                 next2_physical_block_idx = kv_loader.load_block_ids(j + 2)
                 k = kv_loader.load_k_from_shared(
@@ -1758,11 +1828,13 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
             kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
             kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
 
-            S = pgm.compute_qk(k)
+            S = pgm.compute_qk(k, k_scale)
             S = pgm.apply_mask_qk(S, j)
             S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
             p, alpha, M = pgm.softmax_part0(S, M)
-            p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
+            p, L, acc = pgm.softmax_part1(
+                p, L, acc, alpha, v_scale=v_scale, target_dtype=k.dtype
+            )
 
             if pgm.cfg.NUM_WARPS == 1:
                 v = kv_loader.load_v_from_shared(
@@ -1785,6 +1857,7 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
             next_physical_block_idx = next2_physical_block_idx
 
     # Last tile is always masked
+    k_scale, v_scale = attention_token_scales(pgm, kv_loader, pgm.tile_end - 1)
     if pgm.cfg.NUM_WARPS > 1:
         gl.amd.cdna4.async_copy.wait_group(0)
         _barrier()
@@ -1795,11 +1868,13 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
         buffer_id=buffer_id,
         RELAXED=pgm.cfg.NUM_WARPS > 1,
     )
-    S = pgm.compute_qk(k)
+    S = pgm.compute_qk(k, k_scale)
     S = pgm.apply_mask_qk(S, pgm.tile_end - 1)
     S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
     p, alpha, M = pgm.softmax_part0(S, M)
-    p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
+    p, L, acc = pgm.softmax_part1(
+        p, L, acc, alpha, v_scale=v_scale, target_dtype=k.dtype
+    )
     if pgm.cfg.NUM_WARPS == 1:
         v = kv_loader.load_v_from_shared(
             tile_index=pgm.tile_end - 1,
@@ -1893,6 +1968,7 @@ def _unified_attention_gluon_kernel(
     NUM_BUFFERS: gl.constexpr = 2,
     MFMA_DIM: gl.constexpr = 32,
     WARPS_N: gl.constexpr = 1,
+    SCALE_AFTER_DOT: gl.constexpr = False,
     USE_SOFTCAP: gl.constexpr = False,
     SHUFFLED_KV_CACHE: gl.constexpr = False,
     KV_SHUFFLE_WIDTH: gl.constexpr = 0,
@@ -1909,6 +1985,7 @@ def _unified_attention_gluon_kernel(
     stride_v_scale_1: gl.constexpr = 0,
     stride_v_scale_2: gl.constexpr = 0,
 ):
+    gl.static_assert(not SCALE_AFTER_DOT or PER_TOKEN_KV_SCALES)
     NUM_WARPS: gl.constexpr = gl.num_warps()
     if ALL_DECODE:
         q_block_global_idx = gl.num_programs(0) - 1 - gl.program_id(0)
@@ -1953,6 +2030,7 @@ def _unified_attention_gluon_kernel(
         stride_v_cache_2,
         stride_v_cache_3,
         WARPS_N,
+        SCALE_AFTER_DOT,
     )
 
     if not USE_STORE_BUFFER_OP:
