@@ -412,6 +412,12 @@ def _require_gfx950():
         pytest.skip("CDNA4 scaled MFMA requires gfx950")
 
 
+@pytest.fixture
+def _require_group32_arch():
+    if not torch.cuda.is_available() or get_gfx() not in ("gfx950", "gfx1250"):
+        pytest.skip("gemm_a8w8_blockscale_group32 runs on gfx950 and gfx1250")
+
+
 def _execution_config(packed=False, fused=False, splits=3, n_first=False):
     config = {
         "BLOCK_SIZE_M": 16,
@@ -662,7 +668,7 @@ def run_group32_reference(x, weight, xs, ws, weight_group_rows=32):
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.usefixtures("_require_gfx950")
+@pytest.mark.usefixtures("_require_group32_arch")
 def test_group32_projection_panel_scales_and_tails(m, n, k, dtype):
     x, weight, xs, ws = generate_group32_inputs(m, n, k)
     actual = gemm_a8w8_blockscale_group32(x, weight, xs, ws, dtype=dtype)
@@ -701,7 +707,7 @@ def test_tuned_variants_use_production_config(m, packed, dtype):
 @pytest.mark.parametrize(
     "a_code,b_code", [(0, 254), (254, 0), (128, 0), (255, 127), (127, 255)]
 )
-@pytest.mark.usefixtures("_require_gfx950")
+@pytest.mark.usefixtures("_require_group32_arch")
 def test_group32_projection_extreme_scale_codes(a_code, b_code):
     x = torch.ones(3, 1280, device="cuda").to(torch.float8_e4m3fn)
     weight = torch.ones(2048, 1280, device="cuda").to(torch.float8_e4m3fn)
@@ -722,7 +728,7 @@ def test_group32_projection_extreme_scale_codes(a_code, b_code):
 @pytest.mark.parametrize(
     "rows,n,k,split_k", [(3, 4096, 1280, None), (33, 8193, 576, 3)]
 )
-@pytest.mark.usefixtures("_require_gfx950")
+@pytest.mark.usefixtures("_require_group32_arch")
 def test_group32_projection_graph_reads_live_inputs_and_scales(rows, n, k, split_k):
     x, weight, xs, ws = generate_group32_inputs(2 * rows, n, k)
     gemm_a8w8_blockscale_group32(
@@ -748,7 +754,7 @@ def test_group32_projection_graph_reads_live_inputs_and_scales(rows, n, k, split
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.usefixtures("_require_gfx950")
+@pytest.mark.usefixtures("_require_group32_arch")
 def test_row_scaled_fp8_projection_with_token_and_column_tails(dtype):
     x, weight, xs, ws = generate_group32_inputs(97, 8193, 576)
     # Per-row scales share the scheduling kernel but not the compact weight grid.
@@ -773,7 +779,7 @@ def test_row_scaled_fp8_projection_with_token_and_column_tails(dtype):
 @pytest.mark.parametrize("group_n", [1, 32])
 @pytest.mark.parametrize("configured", [False, True])
 @pytest.mark.parametrize("raw_views", [False, True])
-@pytest.mark.usefixtures("_require_gfx950")
+@pytest.mark.usefixtures("_require_group32_arch")
 def test_public_group32_dispatch(m, n, k, group_n, configured, raw_views, monkeypatch):
     if configured:
         monkeypatch.setattr(
@@ -791,7 +797,7 @@ def test_public_group32_dispatch(m, n, k, group_n, configured, raw_views, monkey
 
 
 @pytest.mark.parametrize("split_k", [None, 1, 3, 100])
-@pytest.mark.usefixtures("_require_gfx950")
+@pytest.mark.usefixtures("_require_group32_arch")
 def test_raw_views_and_preallocated_output(split_k):
     x, w, xs, ws = generate_group32_inputs(63, 8193, 576)
     output = torch.empty((63, 8193), dtype=torch.bfloat16, device="cuda")
@@ -817,7 +823,7 @@ def test_raw_views_and_preallocated_output(split_k):
 @pytest.mark.parametrize(
     "invalid", ["stride", "scale_shape", "scale_dtype", "output", "split"]
 )
-@pytest.mark.usefixtures("_require_gfx950")
+@pytest.mark.usefixtures("_require_group32_arch")
 def test_invalid_group32_contract(invalid):
     x, w, xs, ws = generate_group32_inputs(3, 2053, 1280)
     kwargs = {}

@@ -657,9 +657,6 @@ def deepgemm_fp8_paged_mqa_logits(
             "Preshuffle needs the KV page to be a multiple of the 16-token MFMA "
             f"tile, or to be 8. Got KVBlockSize={KVBlockSize}."
         )
-        assert not (
-            KVBlockSize < 16 and get_gfx() == "gfx1250"
-        ), f"gfx1250 preshuffle (TDM block-load) needs KVBlockSize>=16; got {KVBlockSize}."
 
     kv_cache = kv_cache.view(-1, KVBlockSize * index_dim)
     num_block = kv_cache.shape[0]

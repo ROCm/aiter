@@ -266,12 +266,14 @@ def test_paged_mqa_logits_non_preshuffle(
 
 
 @pytest.mark.skipif(
-    get_gfx() not in ("gfx942", "gfx950") or not enable_jit_gluon_pa_mqa_logits_kernel,
-    reason="Requires the CDNA Gluon JIT paged MQA kernel",
+    get_gfx() not in ("gfx942", "gfx950", "gfx1250")
+    or not enable_jit_gluon_pa_mqa_logits_kernel,
+    reason="Requires the Gluon JIT paged MQA kernel",
 )
 # Page 8 is half the 16-token MFMA tile, 16 is exactly one, and 32 through 128
 # are several row groups per page. 256 exceeds ChunkK // 2 and so takes the
-# one-page-per-stage branch instead.
+# one-page-per-stage branch instead. On gfx1250 a page below 16 is assembled
+# into a WMMA tile from 16 // block_size TDM loads.
 @pytest.mark.parametrize("block_size", [8, 16, 32, 64, 128, 256])
 # The two ChunkK the callers ask for: the bench runs preshuffle at 128, the
 # indexer at 256.
@@ -300,6 +302,8 @@ def test_paged_mqa_logits_preshuffle(
     how the tile is assembled: below 16 it spans several pages, at 16 it is one
     group, and above 16 the kernel walks row groups inside a single page.
     """
+    if get_gfx() == "gfx1250" and chunk_k % block_size:
+        pytest.skip("gfx1250 preshuffle needs ChunkK to be a multiple of the page")
     device = "cuda"
     generator = torch.Generator(device=device).manual_seed(5614)
     fp8_dtype = dtypes.fp8
