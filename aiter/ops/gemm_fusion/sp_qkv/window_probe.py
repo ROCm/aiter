@@ -9,7 +9,14 @@ Sequences (each creates a FRESH comm, registers windows in order, prints per-ran
   small_then_big : 12 x 4 MiB then 40 MiB         (the gate02 failing layout)
   uniform        : N x <window MiB>               (the uniform policy; default 39 x 164 MiB)
   descending     : big windows first, then 4 MiB  (alignment hypothesis)
-  custom         : --mib a,b,c,... explicit list\n  gate03_prefix  : 4,4,4,4,40 MiB (the real per_owner failing prefix: window #5 = 40 MiB at offset 16 MiB)\nOptions that reproduce the real process state: --torch-gib N (allocate N GiB with torch on this rank BEFORE the comm is created and keep it\nalive), --init-dist-nccl (also create an NCCL group), --stagger-ms K (rank r sleeps r*K ms before each registration: tests the\nconcurrent-registration hypothesis; the default 0 = lockstep like the real run), --repeat R (R fresh comms in a row).
+  custom         : --mib a,b,c,... explicit list
+  gate03_prefix  : 4,4,4,4,40 MiB (the real per_owner failing prefix: window #5 = 40 MiB at offset 16 MiB; same as --sequence custom --mib 4,4,4,4,40)
+  aligned_gate03 : what the 'aligned' policy registers for that prefix: 4,4,4,4,[48 MiB spacer],40 -> the 40 MiB window starts at 64 MiB
+  aligned_all    : the 'aligned' layout of the real 15-plan sequence (per_owner sizes, all windows, spacers included; heap needs ~ --heap-gib 16)
+  largest_first  : the same windows sorted by descending size, no padding (the other layout hypothesis)
+Options that reproduce the real process state: --torch-gib N (allocate N GiB with torch on this rank BEFORE the comm is created and keep it
+alive), --init-dist-nccl (also create an NCCL group), --stagger-ms K (rank r sleeps r*K ms before each registration: tests the
+concurrent-registration hypothesis; the default 0 = lockstep like the real run), --repeat R (R fresh comms in a row).
 Output lines: PROBE rank=R seq=S idx=I size=B cumulative=C result=OK|FAIL
 Comparing sequences from ONE run isolates the failing condition without guessing (size vs. offset alignment vs. count vs. heap).
 """
@@ -20,7 +27,24 @@ import argparse
 import sys
 from typing import List
 
+from aiter.gemm_fusion.resources import aligned_plan
+
 MiB = 1 << 20
+
+
+def real_sequence_sizes() -> List[int]:
+    """The per_owner window sizes of the 15-plan gate sequence in registration order: small owners (2 x 4 MiB) first, then large owners
+    (S, R, C of equal size per owner). Taken from the generated profile's window_budget when available (sorted desc there), else rebuilt."""
+    from aiter.ops.gemm_fusion.sp_qkv import specs, variants, variants_large
+    from aiter.gemm_fusion.resources import round_up
+
+    out = []
+    for (mode, T), (_v, params) in specs.SMALL_CELLS.items():
+        b = variants.small_window_bytes(mode)
+        out += [round_up(max(b["rx"], b["ctl"], 8192))] * 2
+    for (mode, T), _ in specs.LARGE_CELLS.items():
+        out += [variants_large.large_window_bytes(mode, T // 4)] * 3
+    return out
 
 
 def sequence(name: str, mib: str = "", n: int = 39, window_mib: int = 164) -> List[int]:
@@ -32,7 +56,16 @@ def sequence(name: str, mib: str = "", n: int = 39, window_mib: int = 164) -> Li
         return [window_mib * MiB] * n
     if name == "descending":
         return [164 * MiB, 160 * MiB, 80 * MiB, 40 * MiB] + [4 * MiB] * 12
-    if name == "gate03_prefix":\n        return [4 * MiB] * 4 + [40 * MiB]\n    if name == "custom":
+    if name == "aligned_gate03":
+        return [s for _k, s, _o in aligned_plan([4 * MiB] * 4 + [40 * MiB])]
+    if name in ("aligned_all", "largest_first"):
+        sizes = real_sequence_sizes()
+        if name == "largest_first":
+            return sorted(sizes, reverse=True)
+        return [s for _k, s, _o in aligned_plan(sizes)]
+    if name == "gate03_prefix":
+        return [4 * MiB] * 4 + [40 * MiB]
+    if name == "custom":
         return [int(x) * MiB for x in mib.split(",") if x]
     raise SystemExit(f"unknown sequence {name!r}")
 
@@ -79,7 +112,11 @@ def main(argv=None):
     ap.add_argument("--heap-gib", type=int, default=4)
     ap.add_argument("--mib", default="")
     ap.add_argument("--n", type=int, default=39)
-    ap.add_argument("--window-mib", type=int, default=164)\n    ap.add_argument("--torch-gib", type=float, default=0.0)\n    ap.add_argument("--init-dist-nccl", action="store_true")\n    ap.add_argument("--stagger-ms", type=int, default=0)\n    ap.add_argument("--repeat", type=int, default=1)
+    ap.add_argument("--window-mib", type=int, default=164)
+    ap.add_argument("--torch-gib", type=float, default=0.0)
+    ap.add_argument("--init-dist-nccl", action="store_true")
+    ap.add_argument("--stagger-ms", type=int, default=0)
+    ap.add_argument("--repeat", type=int, default=1)
     a = ap.parse_args(argv)
     import os
 

@@ -47,7 +47,9 @@ def window_budget():
         small[(mode, tuple(sorted(params.items())))] = round_up(max(b["rx"], b["ctl"], 8192))
     large = {(mode, T // WORLD): variants_large.large_window_bytes(mode, T // WORLD) for (mode, T) in specs.LARGE_CELLS}
     wb = max(list(small.values()) + list(large.values()))
-    return {"window_bytes": wb, "max_windows": 2 * len(small) + 3 * len(large), "small_owners": len(small), "large_owners": len(large)}
+    sizes = sorted([s for s in small.values() for _ in range(2)] + [s for s in large.values() for _ in range(3)], reverse=True)
+    return {"window_bytes": wb, "max_windows": 2 * len(small) + 3 * len(large), "small_owners": len(small), "large_owners": len(large),
+            "window_sizes": sizes}
 
 
 def build_profile():

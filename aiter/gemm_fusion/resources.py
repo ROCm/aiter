@@ -34,6 +34,8 @@ PER_RANK_VMM_BYTES = 4294967296  # 4 GiB, as in the Phase-1 drivers (ccoCommCrea
 HEAP_SLACK_BYTES = 256 << 20  # ccoDevCommCreate allocates its own resource window from the same heap
 ENV_POLICY = "AITER_GEMM_FUSION_WINDOW_POLICY"  # "uniform" (default) | "per_owner"
 ENV_WINDOW_MIB = "AITER_GEMM_FUSION_WINDOW_MIB"  # override the uniform window size (MiB)
+ENV_ALIGN_CAP_MIB = "AITER_GEMM_FUSION_ALIGN_CAP_MIB"  # aligned policy: cap of the start alignment (default 256 MiB)
+POLICIES = ("uniform", "per_owner", "aligned")
 
 
 class ResourceError(RuntimeError):
@@ -42,6 +44,35 @@ class ResourceError(RuntimeError):
 
 def round_up(n: int, g: int = GRANULE) -> int:
     return ((int(n) + g - 1) // g) * g
+
+
+def next_pow2(n: int) -> int:
+    return 1 << max(0, (int(n) - 1).bit_length())
+
+
+def start_alignment(size: int, cap: int = 256 << 20) -> int:
+    """Alignment of a window's slot offset under the 'aligned' policy: next_pow2(size), at least the 4 MiB granule, at most cap."""
+    return max(GRANULE, min(next_pow2(size), cap))
+
+
+def aligned_plan(sizes: List[int], cap: int = 256 << 20, start: int = 0) -> List[Tuple[str, int, int]]:
+    """Pure: the registration sequence the 'aligned' policy performs for `sizes` (in order), assuming a monotonic first-fit allocator
+    that places each registration at the current top. Returns [(kind, size, offset)] with kind in {"window", "spacer"}."""
+    out, top = [], start
+    for s in sizes:
+        a = start_alignment(s, cap)
+        if top % a:
+            pad = a - top % a
+            out.append(("spacer", pad, top))
+            top += pad
+        out.append(("window", s, top))
+        top += s
+    return out
+
+
+def aligned_total_bytes(sizes: List[int], cap: int = 256 << 20) -> int:
+    """Worst-case heap use of `sizes` registered in ANY order under the aligned policy (every window may need a full-alignment pad)."""
+    return sum(s + max(0, start_alignment(s, cap) - GRANULE) for s in sizes)
 
 
 def heap_bytes_for(window_bytes: int, max_windows: int, floor: int = PER_RANK_VMM_BYTES) -> int:
@@ -140,13 +171,25 @@ class FusionResources:
         self.caps = frozenset(caps)
         self.backend = backend or CcoBackend()
         self.policy = (policy or os.environ.get(ENV_POLICY) or "uniform").lower()
-        if self.policy not in ("uniform", "per_owner"):
-            raise ResourceError(f"{ENV_POLICY} must be uniform or per_owner, got {self.policy!r}")
+        if self.policy not in POLICIES:
+            raise ResourceError(f"{ENV_POLICY} must be one of {POLICIES}, got {self.policy!r}")
+        self.align_cap = int(os.environ.get(ENV_ALIGN_CAP_MIB, "256")) << 20
+        self._window_sizes: List[int] = []
         self.window_bytes, self.max_windows = self._budget(window_bytes, max_windows)
         if vmm_bytes is None:
-            vmm_bytes = heap_bytes_for(self.window_bytes, self.max_windows) if self.window_bytes and self.policy == "uniform" else PER_RANK_VMM_BYTES
+            if self.policy == "uniform" and self.window_bytes:
+                vmm_bytes = heap_bytes_for(self.window_bytes, self.max_windows)
+            elif self.policy == "aligned" and self._window_sizes:
+                g = 4 << 30
+                need = aligned_total_bytes(self._window_sizes, self.align_cap) + HEAP_SLACK_BYTES
+                vmm_bytes = max(PER_RANK_VMM_BYTES, (need + g - 1) // g * g)
+            else:
+                vmm_bytes = PER_RANK_VMM_BYTES
         self._vmm = vmm_bytes
         self._reg_log: List[Tuple[str, str, int, int]] = []  # (owner, name, bytes, cumulative) in registration order
+        self._slot_base: Optional[int] = None  # local pointer of the first registration (slot offset 0 of this rank's heap)
+        self._top = 0  # measured end offset of the last registration (monotonic first-fit assumption, verified per registration)
+        self._spacers: List[Tuple[object, int, int]] = []  # (handle, local, bytes) of alignment pads, never used, freed at release
         self.comm = None
         self.devcomm = None
         self.windows: Dict[str, Dict[str, Window]] = {}  # owner -> name -> Window
@@ -170,6 +213,7 @@ class FusionResources:
                 wb = dict(load_profile().meta.get("window_budget") or {})
                 window_bytes = window_bytes if window_bytes is not None else wb.get("window_bytes")
                 max_windows = max_windows if max_windows is not None else wb.get("max_windows")
+                self._window_sizes = [int(x) for x in (wb.get("window_sizes") or [])]
             except Exception:  # no profile configured here: first-request sizing (see ensure)
                 pass
         if window_bytes is not None:
@@ -193,6 +237,43 @@ class FusionResources:
         return 0
 
     # -- window management ---------------------------------------------------
+    def _offset_of(self, loc: int) -> Optional[int]:
+        if self._slot_base is None:
+            return None
+        return int(loc) - int(self._slot_base)
+
+    def _register(self, owner: str, name: str, size: int, spacer: bool = False):
+        """One collective window registration with measured-offset logging and a rich failure message."""
+        cum = (self._reg_log[-1][3] if self._reg_log else 0) + size
+        expect = self._top
+        try:
+            h, loc = self.backend.win_register(self.comm, size)
+        except ResourceError as e:
+            raise ResourceError(
+                f"{e} while registering {owner}/{name}{' (alignment spacer)' if spacer else ''}: size={size} B, "
+                f"window #{len(self._reg_log) + 1}, expected offset {expect} B, {cum - size} B already registered on this rank, "
+                f"heap={self._vmm} B, policy={self.policy}; layout so far: {self._reg_log[-8:]}") from e
+        if self._slot_base is None:
+            self._slot_base = int(loc)
+        off = self._offset_of(loc)
+        if off != expect:
+            log.warning("event=resources offset_mismatch rank=%d owner=%s name=%s expected_offset=%d measured_offset=%s "
+                        "(allocator is not the monotonic first-fit the aligned policy assumes)", self.rank, owner, name, expect, off)
+        self._top = (off if off is not None else expect) + size
+        self._reg_log.append((owner, name + ("[spacer]" if spacer else ""), size, cum))
+        log.info("event=resources window rank=%d owner=%s name=%s bytes=%d n=%d cumulative=%d offset=%s heap=%d%s",
+                 self.rank, owner, name, size, len(self._reg_log), cum, off, self._vmm, " spacer=1" if spacer else "")
+        return h, loc
+
+    def _pad_to_alignment(self, owner: str, name: str, align: int):
+        """Aligned policy: ccoMemAlloc has no alignment argument (HeapVAManager::Allocate(size, granule)), so pad the heap top
+        with an unused spacer window until the NEXT registration starts at a multiple of `align`."""
+        rem = self._top % align
+        if rem:
+            pad = align - rem
+            h, loc = self._register(owner, name + ".pad", pad, spacer=True)
+            self._spacers.append((h, loc, pad))
+
     def ensure(self, owner: str, reqs: List[WindowReq]) -> Dict[str, Window]:
         """Register this owner's windows once (idempotent per owner; collective on first call)."""
         if owner in self.windows:
@@ -215,19 +296,11 @@ class FusionResources:
                     f"pre-size via the profile window_budget or {ENV_WINDOW_MIB}")
             size = self.window_bytes
         else:
-            size = need
+            size = need  # per_owner and aligned: per-plan sizes (4 MiB multiples)
         for r in wreqs:
-            cum = (self._reg_log[-1][3] if self._reg_log else 0) + size
-            try:
-                h, loc = self.backend.win_register(self.comm, size)
-            except ResourceError as e:
-                raise ResourceError(
-                    f"{e} while registering {owner}/{r.name}: size={size} B, window #{len(self._reg_log) + 1}, "
-                    f"{cum - size} B already registered on this rank, heap={self._vmm} B, policy={self.policy}; "
-                    f"layout so far: {self._reg_log[-8:]}") from e
-            self._reg_log.append((owner, r.name, size, cum))
-            log.info("event=resources window rank=%d owner=%s name=%s bytes=%d n=%d cumulative=%d heap=%d",
-                     self.rank, owner, r.name, size, len(self._reg_log), cum, self._vmm)
+            if self.policy == "aligned":
+                self._pad_to_alignment(owner, r.name, start_alignment(size, self.align_cap))
+            h, loc = self._register(owner, r.name, size)
             wins[r.name] = Window(owner, r.name, r.kind, size, h, loc)
         self._sdma = getattr(self, "_sdma", 0) + sum(1 for r in reqs if r.kind == "sdma_queue")
         self.windows[owner] = wins
@@ -316,5 +389,8 @@ class FusionResources:
         for wins in self.windows.values():
             for w in wins.values():
                 self.backend.win_deregister(self.comm, w.handle)
+        for h, _loc, _n in self._spacers:
+            self.backend.win_deregister(self.comm, h)
+        self._spacers.clear()
         self.backend.comm_destroy(self.comm)
         self.windows.clear()

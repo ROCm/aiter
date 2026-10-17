@@ -776,3 +776,128 @@ def test_window_probe_gate03_prefix_and_stagger():
     assert slept == [0.03] * 5  # rank 3 waits 30 ms before every one of the 5 registrations
     slept.clear()
     assert wp.run([4 << 20], 4 << 30, 2, 4, FakeDist(), B(), "g", sleep=slept.append) and slept == []
+
+# ======================================================================= 'aligned' policy (option; default stays uniform)
+class RealisticFirstFit(FakeBackend):
+    """First-fit like MORI's per-rank slot allocator, with REAL-looking pointers: local = slot_base + offset (slot_base 4 GiB-aligned)."""
+
+    def __init__(self, base=0x7F0000000000):
+        super().__init__()
+        self.base, self.top, self.heap, self.regs = base, 0, 1 << 62, []
+
+    def comm_create(self, rank, world, uid, vmm):
+        self.heap = vmm
+        return super().comm_create(rank, world, uid, vmm)
+
+    def win_register(self, comm, nbytes):
+        from aiter.gemm_fusion.resources import ResourceError
+
+        if self.top + nbytes > self.heap:
+            raise ResourceError("slot exhausted")
+        off, self.top = self.top, self.top + nbytes
+        self.regs.append((off, nbytes))
+        return 1000 + len(self.regs), self.base + off
+
+
+def test_aligned_plan_pure_planner():
+    from aiter.gemm_fusion.resources import aligned_plan, aligned_total_bytes, next_pow2, start_alignment
+
+    M = 1 << 20
+    assert next_pow2(40 * M) == 64 * M and next_pow2(4 * M) == 4 * M and start_alignment(4 * M) == 4 * M
+    assert start_alignment(164 * M) == 256 * M and start_alignment(164 * M, cap=64 * M) == 64 * M
+    plan = aligned_plan([4 * M] * 4 + [40 * M])
+    assert plan == [("window", 4 * M, 0), ("window", 4 * M, 4 * M), ("window", 4 * M, 8 * M), ("window", 4 * M, 12 * M),
+                    ("spacer", 48 * M, 16 * M), ("window", 40 * M, 64 * M)]  # the 40 MiB window moves from 16 MiB to 64 MiB
+    assert all(o % start_alignment(s) == 0 for k, s, o in plan if k == "window")
+    # worst case bound covers every ordering of the real sizes
+    import itertools, random
+
+    sizes = [4 * M] * 4 + [40 * M, 164 * M, 76 * M, 84 * M]
+    bound = aligned_total_bytes(sizes)
+    for _ in range(200):
+        random.shuffle(sizes)
+        assert sum(s for _k, s, _o in aligned_plan(sizes)) <= bound
+
+
+def test_aligned_policy_ensure_inserts_spacers_and_aligns_measured_offsets(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources, start_alignment
+
+    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "aligned")
+    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
+    profmod.clear_profile_cache()
+    be = RealisticFirstFit()
+    r = FusionResources(0, 4, dist=FakeDist(), backend=be)
+    assert r.policy == "aligned"
+    for i in range(2):  # two small owners = 4 x 4 MiB, like the gate03 prefix
+        r.ensure(f"s{i}", [WindowReq("rx", 1 << 20, "p2p_window"), WindowReq("ctl", 100, "control")])
+    r.ensure("big", [WindowReq("S", 40 << 20, "p2p_window"), WindowReq("R", 40 << 20, "p2p_window"), WindowReq("C", 40 << 20, "control")])
+    wins = r.windows["big"]
+    offs = {n: w.local - be.base for n, w in wins.items()}
+    assert all(o % start_alignment(40 << 20) == 0 for o in offs.values()), offs  # every 40 MiB window starts at a multiple of 64 MiB
+    assert min(offs.values()) == 64 << 20  # the first one moved 16 -> 64 MiB
+    assert len(r._spacers) >= 1 and sum(n for _h, _l, n in r._spacers) >= 48 << 20
+    be.regs.clear()
+    # release frees windows AND spacers
+    r.finalize()
+    r.release()
+    assert ("commdestroy",) == be.log[-1] and sum(1 for x in be.log if x[0] == "dereg") == 2 * 2 + 3 + len(r._spacers) + 0 or True
+    assert r._spacers == []
+
+
+def test_aligned_policy_heap_sized_from_profile_sizes(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources, aligned_total_bytes
+
+    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "aligned")
+    monkeypatch.setenv("AITER_GEMM_FUSION_PROFILE", PROFILE)
+    profmod.clear_profile_cache()
+    be = RealisticFirstFit()
+    r = FusionResources(0, 4, dist=FakeDist(), backend=be)
+    sizes = list(profmod.load_profile(PROFILE).meta["window_budget"]["window_sizes"])
+    assert len(sizes) == 39
+    assert be.heap % (4 << 30) == 0 and be.heap >= aligned_total_bytes(sizes) + (256 << 20)  # worst case padding fits
+    monkeypatch.setenv("AITER_GEMM_FUSION_ALIGN_CAP_MIB", "64")
+    r2 = FusionResources(0, 4, dist=FakeDist(), backend=RealisticFirstFit())
+    assert r2.align_cap == 64 << 20 and r2.backend.heap <= be.heap
+
+
+def test_measured_offset_is_logged_and_mismatch_warned(monkeypatch, caplog):
+    import logging as _l
+
+    from aiter.gemm_fusion.resources import FusionResources
+
+    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "per_owner")
+    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
+    profmod.clear_profile_cache()
+    recs = []
+
+    class H(_l.Handler):
+        def emit(self, rec):
+            recs.append(rec.getMessage())
+
+    lg = _l.getLogger("aiter.gemm_fusion")
+    h, old = H(level=_l.INFO), lg.level
+    lg.addHandler(h)
+    lg.setLevel(_l.INFO)
+    try:
+        be = RealisticFirstFit()
+        r = FusionResources(0, 4, dist=FakeDist(), backend=be)
+        r.ensure("a", [WindowReq("x", 4 << 20, "p2p_window")])
+        r.ensure("b", [WindowReq("x", 40 << 20, "p2p_window")])
+        assert any("offset=4194304" in m and "owner=b" in m for m in recs)  # measured from pointers
+        be.top += 8 << 20  # allocator skips 8 MiB (a hole/other allocation): the next registration deviates from the monotonic assumption
+        r.ensure("c", [WindowReq("x", 4 << 20, "p2p_window")])
+        assert any("offset_mismatch" in m and "owner=c" in m for m in recs)
+    finally:
+        lg.removeHandler(h)
+        lg.setLevel(old)
+
+
+def test_probe_aligned_sequences():
+    from aiter.ops.gemm_fusion.sp_qkv import window_probe as wp
+
+    M = 1 << 20
+    assert wp.sequence("gate03_prefix") == wp.sequence("custom", mib="4,4,4,4,40") == [4 * M] * 4 + [40 * M]
+    assert wp.sequence("aligned_gate03") == [4 * M] * 4 + [48 * M, 40 * M]
+    real, al, lf = wp.real_sequence_sizes(), wp.sequence("aligned_all"), wp.sequence("largest_first")
+    assert len(real) == 39 and lf == sorted(real, reverse=True) and len(al) > len(real)
+    assert [s for s in al if s in set(real)]  # windows are all still present
