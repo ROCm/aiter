@@ -161,7 +161,8 @@ def atom_like(a, torch, dist, rank: int, world: int) -> bool:
     print(f"ATOMLIKE rank={rank} caps={sorted(caps)} device={dev0} policy={a.policy or 'default'}", flush=True)
 
     def build():
-        box["res"] = FusionResources(rank=rank, world=world, group=None, device=dev0, caps=caps, policy=a.policy or None)
+        # profile= is passed EXPLICITLY (as ATOM's wrapper now does from config.gemm_fusion.profile): the window budget never comes from the env
+        box["res"] = FusionResources(rank=rank, world=world, group=None, device=dev0, caps=caps, policy=a.policy or None, profile=a.profile)
 
     stage("FusionResources_init", build)
     res = box.get("res")
@@ -196,6 +197,7 @@ def main(argv=None):
     ap.add_argument("--sequence", default="")
     ap.add_argument("--atom-like", action="store_true")
     ap.add_argument("--policy", default="")
+    ap.add_argument("--profile", default="minimax_m3_sp4_gfx950_v1", help="profile name/path given to FusionResources(profile=...) in --atom-like mode")
     ap.add_argument("--torch-first-gib", type=float, default=1.0)
     ap.add_argument("--large-empty-gib", type=float, default=0.5)
     ap.add_argument("--heap-gib", type=int, default=4)

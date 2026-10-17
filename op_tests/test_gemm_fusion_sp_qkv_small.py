@@ -675,9 +675,9 @@ def test_uniform_policy_reproduces_phase1_equal_layout(monkeypatch):
     assert wb["max_windows"] == sum(len([r for r in v if r.kind in ("p2p_window", "control")]) for v in reqs.values()) == 39
     assert wb["window_bytes"] % (4 << 20) == 0 and wb["window_bytes"] == max(r.bytes for v in reqs.values() for r in v)
     be, d = FirstFitBackend(0), FakeDist()
-    monkeypatch.setenv("AITER_GEMM_FUSION_PROFILE", PROFILE)
+    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)  # the budget must come from the EXPLICIT profile=, never from the env
     profmod.clear_profile_cache()
-    r = FusionResources(0, 4, dist=d, backend=be)
+    r = FusionResources(0, 4, dist=d, backend=be, profile=PROFILE)
     assert r.window_bytes == wb["window_bytes"] and r.max_windows == 39
     assert be.heap == heap_bytes_for(wb["window_bytes"], 39) and be.heap % (4 << 30) == 0 and be.heap >= 39 * wb["window_bytes"] + (256 << 20)
     for owner, rq in reqs.items():  # register ALL 15 plans (the gate02 sequence), in any order
@@ -848,15 +848,15 @@ def test_aligned_policy_heap_sized_from_profile_sizes(monkeypatch):
     from aiter.gemm_fusion.resources import FusionResources, aligned_total_bytes
 
     monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "aligned")
-    monkeypatch.setenv("AITER_GEMM_FUSION_PROFILE", PROFILE)
+    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
     profmod.clear_profile_cache()
     be = RealisticFirstFit()
-    r = FusionResources(0, 4, dist=FakeDist(), backend=be)
+    r = FusionResources(0, 4, dist=FakeDist(), backend=be, profile=PROFILE)
     sizes = list(profmod.load_profile(PROFILE).meta["window_budget"]["window_sizes"])
     assert len(sizes) == 39
     assert be.heap % (4 << 30) == 0 and be.heap >= aligned_total_bytes(sizes) + (256 << 20)  # worst case padding fits
     monkeypatch.setenv("AITER_GEMM_FUSION_ALIGN_CAP_MIB", "64")
-    r2 = FusionResources(0, 4, dist=FakeDist(), backend=RealisticFirstFit())
+    r2 = FusionResources(0, 4, dist=FakeDist(), backend=RealisticFirstFit(), profile=PROFILE)
     assert r2.align_cap == 64 << 20 and r2.backend.heap <= be.heap
 
 
@@ -1335,3 +1335,113 @@ def test_window_probe_atom_like_mode_pure_pieces(monkeypatch):
             raise RuntimeError("HIP error: operation not supported")
 
     assert "operation not supported" in wp.e2_trigger(Boom, 0, 0.001)
+
+# ======================================================================= explicit profile= for FusionResources (E2: env unset on ATOM's CLI path)
+def _spy_dist_backend():
+    return FakeDist(), FirstFitBackend(0)
+
+
+def test_fusion_resources_budget_from_explicit_profile_with_env_unset(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources, heap_bytes_for
+
+    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
+    monkeypatch.delenv("AITER_GEMM_FUSION_WINDOW_MIB", raising=False)
+    monkeypatch.delenv("AITER_GEMM_FUSION_WINDOW_POLICY", raising=False)
+    profmod.clear_profile_cache()
+    for prof in (PROFILE, profmod.load_profile(PROFILE)):  # a path AND a Profile object
+        d, be = _spy_dist_backend()
+        r = FusionResources(0, 4, dist=d, backend=be, profile=prof)
+        assert r.window_bytes == 171966464 == 164 << 20 and r.max_windows == 39  # the shipped profile's own numbers
+        assert r.profile is not None and r.profile.name == "minimax_m3_sp4_gfx950_v1"
+        assert be.heap == heap_bytes_for(171966464, 39) and be.heap >= 39 * 171966464 + (256 << 20)
+        # the failing ATOM sequence: a 4 MiB small plan first, then a 40 MiB large plan: both fit the 164 MiB uniform window
+        r.ensure("small", [WindowReq("rx", 1 << 20, "p2p_window"), WindowReq("ctl", 100, "control")])
+        r.ensure("large", [WindowReq("S", 40 << 20, "p2p_window"), WindowReq("R", 40 << 20, "p2p_window"), WindowReq("C", 40 << 20, "control")])
+        assert set(be.sizes) == {171966464}
+
+
+def test_profile_name_resolves_without_env(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources
+
+    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
+    profmod.clear_profile_cache()
+    r = FusionResources(0, 4, dist=FakeDist(), backend=FirstFitBackend(0), profile="minimax_m3_sp4_gfx950_v1")  # a bare name -> configs/gemm_fusion/<name>.json
+    assert r.window_bytes == 171966464 and r.max_windows == 39
+
+
+def test_env_profile_is_never_read_by_fusion_resources(monkeypatch):
+    """Even with AITER_GEMM_FUSION_PROFILE pointing at a valid profile, FusionResources(profile=None) must NOT use it silently."""
+    from aiter.gemm_fusion.resources import FusionResources
+
+    monkeypatch.setenv("AITER_GEMM_FUSION_PROFILE", PROFILE)
+    profmod.clear_profile_cache()
+    r = FusionResources(0, 4, dist=FakeDist(), backend=FirstFitBackend(0))
+    assert r.profile is None and r.window_bytes is None and r.max_windows == 0  # unknown budget -> first-request sizing, with a warning
+
+
+def test_precedence_explicit_args_over_env_over_profile(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources
+
+    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
+    profmod.clear_profile_cache()
+    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_MIB", "100")
+    r = FusionResources(0, 4, dist=FakeDist(), backend=FirstFitBackend(0), profile=PROFILE)
+    assert r.window_bytes == 100 << 20 and r.max_windows == 39  # tuning env overrides the SIZE only; the count still comes from the profile
+    r = FusionResources(0, 4, dist=FakeDist(), backend=FirstFitBackend(0), profile=PROFILE, window_bytes=8 << 20, max_windows=5)
+    assert r.window_bytes == 8 << 20 and r.max_windows == 5  # explicit args beat both
+
+
+def test_profile_without_window_budget_warns_and_falls_back_to_first_request(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources
+
+    monkeypatch.delenv("AITER_GEMM_FUSION_WINDOW_MIB", raising=False)
+    msgs = []
+
+    class H(logging.Handler):
+        def emit(self, rec):
+            msgs.append(rec.getMessage())
+
+    lg = logging.getLogger("aiter.gemm_fusion")
+    h, old = H(level=logging.WARNING), lg.level
+    lg.addHandler(h)
+    lg.setLevel(logging.WARNING)
+    try:
+        bare = profmod.parse_profile({"profile": "nobudget", "rows": []})
+        r = FusionResources(0, 4, dist=FakeDist(), backend=FirstFitBackend(0), profile=bare)  # must NOT raise
+        r2 = FusionResources(0, 4, dist=FakeDist(), backend=FirstFitBackend(0))
+    finally:
+        lg.removeHandler(h)
+        lg.setLevel(old)
+    assert r.window_bytes is None and r.max_windows == 0 and r.profile is bare
+    assert any("event=resources no_budget" in m and "profile has no window_budget" in m for m in msgs)
+    assert any("event=resources no_budget" in m and "built without profile=" in m for m in msgs)
+
+
+def test_bad_profile_argument_is_an_error():
+    from aiter.gemm_fusion.resources import FusionResources
+
+    with pytest.raises(profmod.ProfileError):
+        FusionResources(0, 4, dist=FakeDist(), backend=FirstFitBackend(0), profile=123)
+    with pytest.raises(profmod.ProfileError):
+        FusionResources(0, 4, dist=FakeDist(), backend=FirstFitBackend(0), profile="/no/such/profile.json")
+
+
+def test_no_implicit_env_profile_lookup_in_the_gemm_fusion_runtime():
+    """Audit pin: the only reader of AITER_GEMM_FUSION_PROFILE is profile.load_profile(None) (documented top-level convenience, used by
+    match_prefix(profile=None)); resources.py and every variant take the profile explicitly."""
+    import re
+
+    root = os.path.join(os.path.dirname(profmod.__file__), "..")
+    hits = []
+    for base in (os.path.join(root, "gemm_fusion"), os.path.join(root, "ops", "gemm_fusion")):
+        for dp, _dn, fns in os.walk(base):
+            for fn in fns:
+                if fn.endswith(".py"):
+                    src = open(os.path.join(dp, fn), encoding="utf-8").read()
+                    code = re.sub(r"#[^\n]*", "", src)
+                    for m in re.finditer(r"ENV_PROFILE|AITER_GEMM_FUSION_PROFILE|load_profile\(\s*\)", code):
+                        hits.append((fn, m.group(0)))
+    files = {f for f, _ in hits}
+    assert files <= {"profile.py", "window_probe.py"}, hits  # resources.py / variants*.py / match.py must not read the env profile
+    pr = open(os.path.join(root, "gemm_fusion", "resources.py"), encoding="utf-8").read()
+    assert "load_profile()" not in pr and "ENV_PROFILE" not in pr

@@ -173,7 +173,7 @@ class FusionResources:
 
     def __init__(self, rank: int, world: int, group=None, dist=None, backend=None, device: Optional[int] = None,
                  caps: frozenset = frozenset(), vmm_bytes: Optional[int] = None, window_bytes: Optional[int] = None,
-                 max_windows: Optional[int] = None, policy: Optional[str] = None):
+                 max_windows: Optional[int] = None, policy: Optional[str] = None, profile=None):
         if dist is None:
             import torch.distributed as dist  # type: ignore
         self.rank, self.world, self.group, self.dist = rank, world, group, dist
@@ -185,6 +185,7 @@ class FusionResources:
             raise ResourceError(f"{ENV_POLICY} must be one of {POLICIES}, got {self.policy!r}")
         self.align_cap = int(os.environ.get(ENV_ALIGN_CAP_MIB, "256")) << 20
         self._window_sizes: List[int] = []
+        self.profile = self._resolve_profile(profile)  # explicit only: a Profile object or a name/path; NEVER the AITER_GEMM_FUSION_PROFILE env
         self.window_bytes, self.max_windows = self._budget(window_bytes, max_windows)
         if vmm_bytes is None:
             if self.policy == "uniform" and self.window_bytes:
@@ -227,20 +228,32 @@ class FusionResources:
             pass
         return rank
 
+    @staticmethod
+    def _resolve_profile(profile):
+        if profile is None:
+            return None
+        from .profile import resolve_profile
+
+        return resolve_profile(profile)
+
     def _budget(self, window_bytes, max_windows):
-        """Uniform window size / count: explicit args, then env MiB override, then the loaded profile\x27s window_budget. (None, N) if unknown."""
+        """Uniform window size / count. Precedence: explicit args, then the tuning env AITER_GEMM_FUSION_WINDOW_MIB (size only), then the EXPLICIT
+        ``profile=`` window_budget. There is no implicit profile lookup (the process env var that selects a profile is not read here).
+        (None, 0) when unknown: the first request then sizes the uniform window (a warning is logged; see ensure)."""
         if window_bytes is None and os.environ.get(ENV_WINDOW_MIB):
             window_bytes = int(os.environ[ENV_WINDOW_MIB]) << 20
-        if window_bytes is None or max_windows is None:
-            try:
-                from .profile import load_profile
+        if self.profile is not None:
+            from .profile import window_budget_of
 
-                wb = dict(load_profile().meta.get("window_budget") or {})
-                window_bytes = window_bytes if window_bytes is not None else wb.get("window_bytes")
-                max_windows = max_windows if max_windows is not None else wb.get("max_windows")
-                self._window_sizes = [int(x) for x in (wb.get("window_sizes") or [])]
-            except Exception:  # no profile configured here: first-request sizing (see ensure)
-                pass
+            wb = window_budget_of(self.profile)
+            window_bytes = window_bytes if window_bytes is not None else wb.get("window_bytes")
+            max_windows = max_windows if max_windows is not None else wb.get("max_windows")
+            self._window_sizes = [int(x) for x in (wb.get("window_sizes") or [])]
+        if window_bytes is None:
+            log.warning("event=resources no_budget rank=%d profile=%s: no window budget available (%s); the uniform window size will be taken "
+                        "from the FIRST ensure() request and a later larger plan will be rejected. Pass profile=<name|path|Profile> whose "
+                        "window_budget is set, or window_bytes=/max_windows=.", self.rank, getattr(self.profile, "name", None),
+                        "profile has no window_budget" if self.profile is not None else "FusionResources built without profile=")
         if window_bytes is not None:
             window_bytes = round_up(window_bytes)
         return window_bytes, int(max_windows or 0)
@@ -318,7 +331,7 @@ class FusionResources:
             if need > self.window_bytes:
                 raise ResourceError(
                     f"ensure({owner!r}): window need {need} B exceeds the uniform window size {self.window_bytes} B; "
-                    f"pre-size via the profile window_budget or {ENV_WINDOW_MIB}")
+                    f"pre-size by constructing FusionResources(profile=<the active profile>) (its window_budget), window_bytes=, or {ENV_WINDOW_MIB}")
             size = self.window_bytes
         else:
             size = need  # per_owner and aligned: per-plan sizes (4 MiB multiples)
