@@ -525,3 +525,99 @@ def test_binding_rejects_wrong_cache_page_before_any_driver_call(monkeypatch):
     meta.update(k_cache=T((4, 1, 8, 128, 16), (16384, 16384, 2048, 16, 1)), v_cache=T((4, 1, 8, 128, 16), (16384, 16384, 2048, 16, 1)))
     blk = plan._binding(x, xs, ws, outs, meta, res)  # correct page -> reaches the driver bind
     assert "bind" in calls
+
+def test_package_exports_everything_atom_uses():
+    """ATOM's wrapper calls gf.FusionResources / gf.detect_* / gf.MatchCtx / ... on the PACKAGE (Evidence GPU gate AttributeError).
+    Scan the ATOM worktree (if present) for every gf.<name> and require it to be exported; plus a pinned minimum list."""
+    import re
+
+    import aiter.gemm_fusion as g
+
+    required = {"FusionResources", "ResourceError", "CcoBackend", "FusionSpec", "GemmSpec", "Field", "SPExchange", "HeadNormRopeCache",
+                "MatchCtx", "ContractError", "match_prefix", "load_profile", "ProfileError", "detect_capabilities", "detect_arch",
+                "detect_cu", "WindowReq", "Plan", "register_variant", "Contract", "qkv_fields"}
+    assert not [n for n in required if not hasattr(g, n)]
+    atom = os.environ.get("ATOM_WORKTREE") or os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "atom-gemm-fusion"))
+    used = set()
+    root = os.path.join(atom, "atom", "model_ops", "gemm_fusion")
+    if os.path.isdir(root):
+        for fn in os.listdir(root):
+            if fn.endswith(".py"):
+                used |= set(re.findall(r"\bgf\.([A-Za-z_]\w*)", open(os.path.join(root, fn), encoding="utf-8").read()))
+        # `gf.profile` in hooks.py is the ATOM config's profile string, not a package attribute: only names that look like aiter API
+        missing = sorted(n for n in used if not hasattr(g, n) and n != "profile")
+        assert not missing, f"ATOM uses gf.{missing} which aiter.gemm_fusion does not export"
+
+
+def test_fusion_resources_constructible_via_package_with_atom_kwargs():
+    """Exact call shape of atom FusionResourcesWrapper: gf.FusionResources(rank=, world=, group=, device=, caps=)."""
+    import aiter.gemm_fusion as g
+
+    res = g.FusionResources(rank=0, world=4, group=None, device=0, caps=frozenset({"mori_cco"}), dist=FakeDist(), backend=FakeBackend())
+    assert res.caps == frozenset({"mori_cco"}) and not res.finalized and res.windows == {}
+    for attr in ("ensure", "finalize", "quiesce_and_reset", "release", "poison_local", "set_init", "set_drain", "set_close", "set_poison"):
+        assert callable(getattr(res, attr))
+
+def _plan_for(vid_mode, T, large):
+    from aiter.gemm_fusion import catalog
+
+    catalog._CATALOG.clear()  # callers monkeypatch _CATALOG to a scratch dict; re-register fresh each call
+    sys.modules.pop("aiter.ops.gemm_fusion.sp_qkv.variants", None)
+    sys.modules.pop("aiter.ops.gemm_fusion.sp_qkv.variants_large", None)
+    import aiter.ops.gemm_fusion.sp_qkv.variants as v
+
+    caps = frozenset({"mori_cco", "sdma", "gfx950_sc_bypass"})
+    sp = specs.sp_qkv_spec(vid_mode)
+    if large:
+        sp = sp.prefix(1)
+        return v.variants_large.SpQkvLarge(sp, specs.LARGE_CELLS[(vid_mode, T)][1], MatchCtx("gfx950", 256, 4, T // 4, caps))
+    return v.SpQkvSmall(sp, specs.SMALL_CELLS[(vid_mode, T)][1], MatchCtx("gfx950", 256, 4, T // 4, caps))
+
+
+def test_atom_cross_repo_api_audit(monkeypatch):
+    """Everything ATOM (atom/model_ops/gemm_fusion) touches on aiter objects, mirrored from its call sites (audit list in the notes):
+      resources.py: plan_owner(plan) = plan.build_key or plan.vid; inner.windows / inner.finalized / ensure(owner, plan.resources()) /
+                    finalize / quiesce_and_reset / release / poison_local; plan.resources().
+      site.py     : Plan.run(x=,x_scale=,w=,w_scale=,outs=,meta=,res=,stream=); plan.mode in ('reuse') -> reuse_view(res), else recv_view(res);
+                    plan.prepare(res=) for 1-stage; plan.prepare(x=,x_scale=,w_scale=,outs=,meta=,res=) for 2-stage; r.plan.vid / n_stages.
+    """
+    import inspect
+
+    from aiter.gemm_fusion import catalog
+
+    monkeypatch.setattr(catalog, "_CATALOG", {})
+    small = _plan_for("dense", 64, False)
+    large = _plan_for("reuse", 8192, True)
+    for plan in (small, large):
+        # ATOM's plan_owner(): getattr(plan, "build_key", None) or getattr(plan, "vid", "plan") -> must be the window owner key
+        owner = getattr(plan, "build_key", None) or getattr(plan, "vid", "plan")
+        assert owner == plan.owner and owner not in ("", "plan")
+        assert all(r.name.startswith(owner + "/") for r in plan.resources())
+        assert hasattr(plan, "mode") and callable(plan.run) and callable(plan.prepare)
+    assert small.build_key != large.build_key
+    # two plans of the same vid but different build must NOT share an owner (ATOM would otherwise collide their windows)
+    assert _plan_for("dense", 64, False).build_key != _plan_for("indexer", 64, False).build_key
+    assert _plan_for("dense", 64, False).build_key != _plan_for("dense", 128, False).build_key
+    # signatures match ATOM's call shapes
+    run_p = set(inspect.signature(small.run).parameters)
+    assert {"x", "x_scale", "w", "w_scale", "outs", "meta", "res", "stream"} <= run_p
+    assert {"x", "x_scale", "w", "w_scale", "outs", "meta", "res", "stream"} <= set(inspect.signature(large.run).parameters)
+    assert {"x", "x_scale", "w_scale", "outs", "meta", "res"} <= set(inspect.signature(small.prepare).parameters)
+    prep_l = inspect.signature(large.prepare)
+    assert "res" in prep_l.parameters and any(p.kind is inspect.Parameter.VAR_KEYWORD for p in prep_l.parameters.values())  # tolerates extra kwargs
+    # reuse_view / recv_view exist exactly where ATOM looks for them
+    assert large.mode == "reuse" and callable(large.reuse_view) and callable(large.recv_view)
+    assert not hasattr(small, "recv_view")  # ATOM only calls them for n_fused < 2
+    assert small.n_stages == 2 and large.n_stages == 1
+    # FusionResources surface used through wrapper.inner / bound
+    import aiter.gemm_fusion as g
+
+    r = g.FusionResources(rank=0, world=4, group=None, device=0, caps=frozenset(), dist=FakeDist(), backend=FakeBackend())
+    assert r.windows == {} and r.finalized is False
+    r.ensure(small.build_key, small.resources())
+    assert small.build_key in r.windows  # wrapper.can_ensure() after finalize relies on `owner in inner.windows`
+    r.finalize()
+    assert r.finalized and small.build_key in r.windows
+    assert r.poison_local() == 0
+    r.quiesce_and_reset()
+    r.release()

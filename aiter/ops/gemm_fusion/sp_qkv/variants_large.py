@@ -70,6 +70,7 @@ class SpQkvLarge(Plan):
                 raise ContractError("half-first needs n >= 2")
         self.F = _F[self.mode]
         self.owner = f"sp_qkv.large/{self.mode}/M{self.M}"
+        self.build_key = self.owner  # the key ATOM's plan_owner() uses for FusionResources.ensure / windows
         self._ctx = None
         self._epochs = 0
 

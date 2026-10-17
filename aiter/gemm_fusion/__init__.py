@@ -8,3 +8,4 @@ from .profile import Profile, ProfileError, load_profile, parse_profile, clear_p
 from .match import MatchCtx, ContractError, match_prefix  # noqa: F401
 from .plan import Plan, WindowReq  # noqa: F401
 from .capabilities import detect_capabilities, detect_arch, detect_cu  # noqa: F401
+from .resources import CcoBackend, FusionResources, ResourceError, Window, round_up  # noqa: F401

@@ -82,6 +82,7 @@ class SpQkvSmall(Plan):
         self.eps, self.block = hn.eps, int(re.search(r"page(\d+)", hn.kv_cache).group(1))
         # owner key: plans with identical build + mode share windows/context/epoch domain (runtime M may differ only if flags allow)
         self.owner = "sp_qkv.small/" + self.mode + "/" + ",".join(f"{k}={v}" for k, v in sorted(self.params.items()))
+        self.build_key = self.owner  # the key ATOM's plan_owner() uses for FusionResources.ensure / windows
         self._bindings: Dict[tuple, object] = {}
         self._ctx = None
 
