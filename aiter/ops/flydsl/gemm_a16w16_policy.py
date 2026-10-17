@@ -89,6 +89,11 @@ class GemmConfigPruner:
             return configs
         ious = [self._iou(config) for config in configs]
         keep_ratio = max(0.625, 1 - self.m / 160, 1 - 120 / self.m)
+        # Large-M tuning must retain wider N tiles for ragged model dimensions
+        # such as 2112 and 2880. Their 6-9% N padding can be cheaper than the
+        # poor MFMA efficiency of an exactly-dividing BN64 tile.
+        if self.m >= 4096:
+            keep_ratio = min(keep_ratio, 0.90)
         min_iou = max(ious) * keep_ratio
         num_cus = self.device_props.multi_processor_count
         max_tiles = (
@@ -203,6 +208,8 @@ def get_flydsl_a16w16_configs(
     dtype: torch.dtype,
     out_dtype: torch.dtype,
     has_bias: bool,
+    *,
+    use_large_gemm_fast_path: bool = True,
 ):
     """Generate and validate the shape-aware policy catalog used by tuning."""
 
@@ -235,24 +242,12 @@ def get_flydsl_a16w16_configs(
         dict(zip(selections, combo))
         for combo in itertools.product(*selections.values())
     ]
-    device_props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    configs = GemmConfigPruner(
-        m,
-        n,
-        k,
-        device_props,
-        2,
-    ).prune(configs)
-
-    in_dtype_id = (
-        GEMM_A16W16_DTYPE_FP16 if dtype == torch.float16 else GEMM_A16W16_DTYPE_BF16
-    )
-    out_dtype_id = GEMM_A16W16_DTYPE_FP32 if out_dtype == torch.float32 else in_dtype_id
-    valid_configs = []
-    is_large_gemm = m >= 4096 and n >= 4096 and k >= 4096
-    for config in configs:
-        if is_large_gemm:
-            if not (
+    is_large_gemm = use_large_gemm_fast_path and m >= 4096 and n >= 4096 and k >= 4096
+    if is_large_gemm:
+        configs = [
+            config
+            for config in configs
+            if (
                 config["use_half_tile_interleaved"]
                 and config["block_m"] == 256
                 and config["block_n"] == 256
@@ -262,9 +257,34 @@ def get_flydsl_a16w16_configs(
                 and config["m_waves"] == 2
                 and config["n_waves"] == 4
                 and config["k_waves"] == 1
-            ):
-                continue
-        elif not config["use_half_tile_interleaved"]:
+            )
+        ]
+    device_props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    if not is_large_gemm:
+        configs = GemmConfigPruner(
+            m,
+            n,
+            k,
+            device_props,
+            2,
+        ).prune(configs)
+
+    in_dtype_id = (
+        GEMM_A16W16_DTYPE_FP16 if dtype == torch.float16 else GEMM_A16W16_DTYPE_BF16
+    )
+    out_dtype_id = GEMM_A16W16_DTYPE_FP32 if out_dtype == torch.float32 else in_dtype_id
+    valid_configs = []
+    for config in configs:
+        # The small-BM half-tile path corrupts ragged-N output because its
+        # second N half uses a full-tile async-load layout. Keep ragged N on
+        # full-tile or BM>=128 policies until that kernel path is fixed.
+        if (
+            config["use_half_tile_interleaved"]
+            and config["block_m"] < 128
+            and n % config["block_n"] != 0
+        ):
+            continue
+        if not is_large_gemm and not config["use_half_tile_interleaved"]:
             mma_m_iters = config["block_m"] // config["m_waves"] // 16
             mma_n_iters = config["block_n"] // config["n_waves"] // 16
             if mma_m_iters > 4 or mma_n_iters > 4:

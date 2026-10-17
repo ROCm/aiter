@@ -116,5 +116,149 @@ class TestGfx1250FlydslCandidates(unittest.TestCase):
                         self.assertEqual(params["target_gfx"], target_gfx)
 
 
+class TestGfx950FlydslCandidates(unittest.TestCase):
+    def test_ragged_large_n_keeps_the_required_large_tile(self):
+        from types import SimpleNamespace
+
+        import aiter.ops.flydsl.gemm_a16w16_policy as policy
+
+        props = SimpleNamespace(
+            multi_processor_count=256,
+            warp_size=64,
+            max_threads_per_multi_processor=2048,
+        )
+        with (
+            mock.patch.object(policy, "get_gfx", lambda: "gfx950"),
+            mock.patch.object(torch.cuda, "current_device", lambda: 0),
+            mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
+            mock.patch.object(
+                policy, "make_gemm_a16w16_param_and_validate", lambda *args: object()
+            ),
+        ):
+            configs = policy.get_flydsl_a16w16_configs(
+                16384, 6288, 7168, torch.bfloat16, torch.bfloat16, False
+            )
+
+        self.assertEqual(len(configs), 2)
+        self.assertEqual({config["group_m"] for config in configs}, {0, 4})
+        for config in configs:
+            self.assertEqual(
+                (
+                    config["block_m"],
+                    config["block_n"],
+                    config["block_k"],
+                    config["stages"],
+                    config["m_waves"],
+                    config["n_waves"],
+                    config["k_waves"],
+                ),
+                (256, 256, 64, 2, 2, 4, 1),
+            )
+            self.assertTrue(config["use_half_tile_interleaved"])
+
+    def test_large_gemm_full_search_exposes_multiple_tiles(self):
+        from types import SimpleNamespace
+
+        import aiter.ops.flydsl.gemm_a16w16_policy as policy
+
+        props = SimpleNamespace(
+            multi_processor_count=256,
+            warp_size=64,
+            max_threads_per_multi_processor=2048,
+        )
+        with (
+            mock.patch.object(policy, "get_gfx", lambda: "gfx950"),
+            mock.patch.object(torch.cuda, "current_device", lambda: 0),
+            mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
+            mock.patch.object(
+                policy, "make_gemm_a16w16_param_and_validate", lambda *args: object()
+            ),
+        ):
+            configs = policy.get_flydsl_a16w16_configs(
+                16384,
+                6288,
+                7168,
+                torch.bfloat16,
+                torch.bfloat16,
+                False,
+                use_large_gemm_fast_path=False,
+            )
+
+        self.assertGreater(len(configs), 2)
+        self.assertGreater(
+            len(
+                {
+                    (config["block_m"], config["block_n"], config["block_k"])
+                    for config in configs
+                }
+            ),
+            1,
+        )
+
+    def test_small_bm_half_tile_rejects_ragged_n(self):
+        from types import SimpleNamespace
+
+        import aiter.ops.flydsl.gemm_a16w16_policy as policy
+
+        props = SimpleNamespace(
+            multi_processor_count=256,
+            warp_size=64,
+            max_threads_per_multi_processor=2048,
+        )
+        with (
+            mock.patch.object(policy, "get_gfx", lambda: "gfx950"),
+            mock.patch.object(torch.cuda, "current_device", lambda: 0),
+            mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
+            mock.patch.object(
+                policy, "make_gemm_a16w16_param_and_validate", lambda *args: object()
+            ),
+        ):
+            configs = policy.get_flydsl_a16w16_configs(
+                1798,
+                6288,
+                7168,
+                torch.bfloat16,
+                torch.bfloat16,
+                False,
+            )
+
+        assert not any(
+            config["use_half_tile_interleaved"]
+            and config["block_m"] < 128
+            and 6288 % config["block_n"] != 0
+            for config in configs
+        )
+
+    def test_large_m_full_search_keeps_wide_ragged_n_tiles(self):
+        from types import SimpleNamespace
+
+        import aiter.ops.flydsl.gemm_a16w16_policy as policy
+
+        props = SimpleNamespace(
+            multi_processor_count=256,
+            warp_size=64,
+            max_threads_per_multi_processor=2048,
+        )
+        with (
+            mock.patch.object(policy, "get_gfx", lambda: "gfx950"),
+            mock.patch.object(torch.cuda, "current_device", lambda: 0),
+            mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
+            mock.patch.object(
+                policy, "make_gemm_a16w16_param_and_validate", lambda *args: object()
+            ),
+        ):
+            configs = policy.get_flydsl_a16w16_configs(
+                15360,
+                2112,
+                7168,
+                torch.bfloat16,
+                torch.bfloat16,
+                False,
+                use_large_gemm_fast_path=False,
+            )
+
+        assert any(config["block_n"] == 256 for config in configs)
+
+
 if __name__ == "__main__":
     unittest.main()
