@@ -301,6 +301,7 @@ void pa_decode_gluon_aot(
 
     std::string key = pa_decode_cache_key(
         compute_type_str, query_length, query_group_size, head_size_pow2,
+        head_size != head_size_pow2,
         kv_block_size, context_partition_size, query_quant_mode, kv_quant_mode,
         fp8_max_val, static_cast<int>(value_transposed),
         static_cast<int>(is_causal), static_cast<int>(use_sinks_flag),

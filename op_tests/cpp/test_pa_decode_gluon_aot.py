@@ -7,6 +7,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+import torch
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
@@ -56,6 +58,34 @@ def test_normal_accuracy_aot() -> None:
         pa_decode_test.normal_accuracy_test()
 
 
+def test_head_padding_aot_cache_reuse() -> None:
+    """D256 and D192 must not share an AOT padding specialization."""
+    with _use_aot_backend():
+        for block_size in (64, 1024):
+            # Both dimensions round to 256. Compile the unmasked variant first,
+            # then check padded storage and reuse the unmasked variant again.
+            for head_size in (256, 192, 256):
+                result = pa_decode_test.run_pa_gluon_test(
+                    context_length=1025,
+                    batch_size=2,
+                    num_heads=(4, 1),
+                    head_size=head_size,
+                    block_size=block_size,
+                    compute_type=torch.bfloat16,
+                    query_length=4,
+                    quant_mode="per_tensor",
+                    context_partition_size=256,
+                    trans_v=True,
+                    kv_varlen=False,
+                    quant_q=False,
+                    quant_kv=False,
+                    use_sinks=False,
+                    sliding_window=0,
+                    ps=False,
+                )
+                assert result["err_gluon"] == 0
+
+
 def run_normal_performance_aot() -> None:
     prebuild_normal_performance_cases_aot_so()
     get_so_files_size_and_count()
@@ -65,3 +95,4 @@ def run_normal_performance_aot() -> None:
 
 if __name__ == "__main__":
     test_normal_accuracy_aot()
+    test_head_padding_aot_cache_reuse()

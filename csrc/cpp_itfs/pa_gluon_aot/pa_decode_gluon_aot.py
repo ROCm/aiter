@@ -137,6 +137,7 @@ def compile(
                 query_seq_len,
                 one_query_group_size,
                 head_size_pow2,
+                head_size != head_size_pow2,
                 kv_block_size,
                 context_partition_size,
                 query_quant_mode,
@@ -261,6 +262,8 @@ def compile(
             f"{value_transposed}",
             f"{is_causal}",
             f"{cdna_version}",
+            f"{int(head_size != head_size_pow2)}",  # KEY_HEAD_PADDED
+            f"{int(head_size != head_size_pow2)}",  # VALUE_HEAD_PADDED
             "0",
         ]
         signature = ",".join(signature_parts)
@@ -314,6 +317,7 @@ def compile(
             f"{head_size_pow2}",
             f"{context_partition_size}",
             f"{use_sinks}",
+            f"{int(head_size != head_size_pow2)}",  # VALUE_HEAD_PADDED
         ]
         reduce_signature = ",".join(reduce_signature_parts)
         reduce_kernel_name = "paged_attention_decode_v2_reduce_kernel"
