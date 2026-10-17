@@ -1955,21 +1955,16 @@ def test_a8w4_fused_sort_quant_e2e(
         return float(1 - 2 * (x * y).sum() / (x * x + y * y).sum())
 
     fm = aiter.fused_moe
-
-    def unfused():
-        fm._MOE_A8W4_FUSED_SORT_QUANT = False
-        try:
-            return fused_moe(hidden, *args, **kwargs)
-        finally:
-            fm._MOE_A8W4_FUSED_SORT_QUANT = True
-
     candidates = {
         "fused": lambda: fused_moe(hidden, *args, **kwargs),
-        "unfused": unfused,
+        "unfused": lambda: fused_moe(hidden, *args, **kwargs),
         "fp8_input": lambda: fused_moe(
             a1, *args, a1_scale=a1_scale, dtype=dtype, **kwargs
         ),
     }
+    # Set per candidate so AITER_MOE_A8W4_FUSED_SORT_QUANT=0 cannot skew them;
+    # fp8_input keeps fusion on so only its dtype gate excludes it.
+    fusion_enabled = {"fused": True, "unfused": False, "fp8_input": True}
 
     flops = 2 * token * topk * model_dim * inter_dim * 3
     n_experts = int(topk_ids.unique().numel())
@@ -1981,6 +1976,7 @@ def test_a8w4_fused_sort_quant_e2e(
     )
 
     real_fused = fm._a8w4_fused_sort_quant
+    real_fusion_enabled = fm._MOE_A8W4_FUSED_SORT_QUANT
     calls = []
 
     def counting_fused(*a, **kw):
@@ -1995,6 +1991,7 @@ def test_a8w4_fused_sort_quant_e2e(
         try:
             fm._a8w4_fused_sort_quant = counting_fused
             for name, fn in candidates.items():
+                fm._MOE_A8W4_FUSED_SORT_QUANT = fusion_enabled[name]
                 calls.clear()
                 out, us = run_perftest(fn)
                 torch.cuda.synchronize()
@@ -2022,6 +2019,7 @@ def test_a8w4_fused_sort_quant_e2e(
                 ret[f"{name} logits_diff"] = diff
         finally:
             fm._a8w4_fused_sort_quant = real_fused
+            fm._MOE_A8W4_FUSED_SORT_QUANT = real_fusion_enabled
 
     for name in ("unfused", "fp8_input"):
         other = outs[name]
