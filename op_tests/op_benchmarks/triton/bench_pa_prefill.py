@@ -1,3 +1,4 @@
+import functools
 import math
 import random
 import sys
@@ -9,6 +10,8 @@ from aiter.ops.triton.attention.pa_prefill import context_attention_fwd
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     get_dtype_bytes,
     get_model_configs,
@@ -239,8 +242,47 @@ def run_benchmark(args):
             torch_kv_cache_dtype = str_to_torch_dtype[kv_cache_dtype]
 
         num_queries_per_kv = HQ // HK
+        device = next(
+            f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
+        )
 
-        (
+        _p_gen = functools.partial(
+            input_helper,
+            BS=BS,
+            MAX_SEQ_LEN=MAX_SEQ_LEN,
+            MAX_CTX_LEN=MAX_CTX_LEN,
+            cache_size=cache_size,
+            block_size=block_size,
+            max_block_per_request=max_block_per_request,
+            num_heads=HQ,
+            head_size=HEAD_DIM,
+            num_queries_per_kv=num_queries_per_kv,
+            dtype=dtype,
+            kv_cache_dtype=kv_cache_dtype,
+            device=device,
+            use_alibi_slope=use_alibi_slope,
+        )
+        _out_val_keys = [
+            "query",
+            "k",
+            "v",
+            "output",
+            "k_cache",
+            "v_cache",
+            "block_table",
+            "b_start_loc",
+            "b_seq_len",
+            "max_input_len",
+            "k_scale",
+            "v_scale",
+            "alibi_slopes",
+        ]
+        rot_bufs = generate_rotating_buffers_pool(
+            [_p_gen], [_out_val_keys], target_mb=256, min_pool_len=4
+        )
+        num_tokens = rot_bufs[0]["query"].shape[0]
+
+        def _run(
             query,
             k,
             v,
@@ -254,42 +296,25 @@ def run_benchmark(args):
             k_scale,
             v_scale,
             alibi_slopes,
-        ) = input_helper(
-            BS=BS,
-            MAX_SEQ_LEN=MAX_SEQ_LEN,
-            MAX_CTX_LEN=MAX_CTX_LEN,
-            cache_size=cache_size,
-            block_size=block_size,
-            max_block_per_request=max_block_per_request,
-            num_heads=HQ,
-            head_size=HEAD_DIM,
-            num_queries_per_kv=num_queries_per_kv,
-            dtype=dtype,
-            kv_cache_dtype=kv_cache_dtype,
-            device=next(
-                f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
-            ),
-            use_alibi_slope=use_alibi_slope,
-        )
+        ):
+            context_attention_fwd(
+                query,
+                k,
+                v,
+                output,
+                kv_cache_dtype,
+                k_cache,
+                v_cache,
+                block_table,
+                b_start_loc,
+                b_seq_len,
+                max_input_len,
+                k_scale,
+                v_scale,
+                alibi_slopes=alibi_slopes,
+            )
 
-        num_tokens = query.shape[0]
-        fn = lambda: context_attention_fwd(
-            query,
-            k,
-            v,
-            output,
-            kv_cache_dtype,
-            k_cache,
-            v_cache,
-            block_table,
-            b_start_loc,
-            b_seq_len,
-            max_input_len,
-            k_scale,
-            v_scale,
-            alibi_slopes=alibi_slopes,
-        )
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+        ms = do_bench_aiter_triton(_run, rot_bufs)
 
         # query and output
         mem = (num_tokens * HQ * HEAD_DIM) * get_dtype_bytes(dtype) * 2
