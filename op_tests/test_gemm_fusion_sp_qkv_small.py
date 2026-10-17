@@ -755,3 +755,24 @@ def test_window_probe_sequences_and_first_failure_report(capsys):
 def test_profile_window_budget_is_regenerated_consistently():
     prof = profmod.load_profile(PROFILE)
     assert dict(prof.meta["window_budget"]) == gen_profile.window_budget()
+
+def test_window_probe_gate03_prefix_and_stagger():
+    from aiter.ops.gemm_fusion.sp_qkv import window_probe as wp
+
+    assert wp.sequence("gate03_prefix") == [4 << 20] * 4 + [40 << 20]
+    slept = []
+
+    class B(FakeBackend):
+        def uid(self, rank):
+            return b"u"
+
+        def win_deregister(self, comm, w):
+            pass
+
+        def comm_destroy(self, comm):
+            pass
+
+    assert wp.run(wp.sequence("gate03_prefix"), 4 << 30, 3, 4, FakeDist(), B(), "g", stagger_ms=10, sleep=slept.append)
+    assert slept == [0.03] * 5  # rank 3 waits 30 ms before every one of the 5 registrations
+    slept.clear()
+    assert wp.run([4 << 20], 4 << 30, 2, 4, FakeDist(), B(), "g", sleep=slept.append) and slept == []

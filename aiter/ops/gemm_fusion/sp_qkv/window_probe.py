@@ -9,7 +9,7 @@ Sequences (each creates a FRESH comm, registers windows in order, prints per-ran
   small_then_big : 12 x 4 MiB then 40 MiB         (the gate02 failing layout)
   uniform        : N x <window MiB>               (the uniform policy; default 39 x 164 MiB)
   descending     : big windows first, then 4 MiB  (alignment hypothesis)
-  custom         : --mib a,b,c,... explicit list
+  custom         : --mib a,b,c,... explicit list\n  gate03_prefix  : 4,4,4,4,40 MiB (the real per_owner failing prefix: window #5 = 40 MiB at offset 16 MiB)\nOptions that reproduce the real process state: --torch-gib N (allocate N GiB with torch on this rank BEFORE the comm is created and keep it\nalive), --init-dist-nccl (also create an NCCL group), --stagger-ms K (rank r sleeps r*K ms before each registration: tests the\nconcurrent-registration hypothesis; the default 0 = lockstep like the real run), --repeat R (R fresh comms in a row).
 Output lines: PROBE rank=R seq=S idx=I size=B cumulative=C result=OK|FAIL
 Comparing sequences from ONE run isolates the failing condition without guessing (size vs. offset alignment vs. count vs. heap).
 """
@@ -32,19 +32,25 @@ def sequence(name: str, mib: str = "", n: int = 39, window_mib: int = 164) -> Li
         return [window_mib * MiB] * n
     if name == "descending":
         return [164 * MiB, 160 * MiB, 80 * MiB, 40 * MiB] + [4 * MiB] * 12
-    if name == "custom":
+    if name == "gate03_prefix":\n        return [4 * MiB] * 4 + [40 * MiB]\n    if name == "custom":
         return [int(x) * MiB for x in mib.split(",") if x]
     raise SystemExit(f"unknown sequence {name!r}")
 
 
-def run(seq: List[int], heap_bytes: int, rank: int, world: int, dist, backend, tag: str) -> bool:
+def run(seq: List[int], heap_bytes: int, rank: int, world: int, dist, backend, tag: str, stagger_ms: int = 0, sleep=None) -> bool:
     """Register `seq` on a fresh comm; returns True if all succeeded. Pure function of the injected dist/backend (unit-tested)."""
     uid = [backend.uid(rank) if rank == 0 else None]
     dist.broadcast_object_list(uid, src=0)
     comm = backend.comm_create(rank, world, uid[0], heap_bytes)
     cum, ok = 0, True
     wins = []
+    if sleep is None:
+        import time
+
+        sleep = time.sleep
     for i, size in enumerate(seq):
+        if stagger_ms:
+            sleep(rank * stagger_ms / 1000.0)
         try:
             w = backend.win_register(comm, size)
             wins.append(w)
@@ -73,7 +79,7 @@ def main(argv=None):
     ap.add_argument("--heap-gib", type=int, default=4)
     ap.add_argument("--mib", default="")
     ap.add_argument("--n", type=int, default=39)
-    ap.add_argument("--window-mib", type=int, default=164)
+    ap.add_argument("--window-mib", type=int, default=164)\n    ap.add_argument("--torch-gib", type=float, default=0.0)\n    ap.add_argument("--init-dist-nccl", action="store_true")\n    ap.add_argument("--stagger-ms", type=int, default=0)\n    ap.add_argument("--repeat", type=int, default=1)
     a = ap.parse_args(argv)
     import os
 
@@ -85,7 +91,17 @@ def main(argv=None):
     dist.init_process_group("gloo")
     from aiter.gemm_fusion.resources import CcoBackend
 
-    ok = run(sequence(a.sequence, a.mib, a.n, a.window_mib), a.heap_gib << 30, rank, world, dist, CcoBackend(), a.sequence)
+    hold = None
+    if a.torch_gib > 0:  # real runs hold model weights / KV cache in the torch caching allocator before the comm exists
+        hold = torch.empty(int(a.torch_gib * (1 << 30)), dtype=torch.uint8, device=f"cuda:{rank}")
+        hold.fill_(1)
+        torch.cuda.synchronize()
+    if a.init_dist_nccl:
+        dist.new_group(backend="nccl")
+    ok = True
+    for rep in range(a.repeat):
+        ok &= run(sequence(a.sequence, a.mib, a.n, a.window_mib), a.heap_gib << 30, rank, world, dist, CcoBackend(), f"{a.sequence}#{rep}", a.stagger_ms)
+    del hold
     sys.exit(0 if ok else 3)
 
 
