@@ -1258,6 +1258,25 @@ def _unified_attention_gfx950(
         partial_m_ptr=partial_m,
         partial_l_ptr=partial_l,
         partial_acc_ptr=partial_acc,
+        PER_TOKEN_KV_SCALES=params.per_token_kv_scales,
+        stride_k_scale_0=(
+            params.k_descale.stride(0) if params.per_token_kv_scales else 0
+        ),
+        stride_k_scale_1=(
+            params.k_descale.stride(1) if params.per_token_kv_scales else 0
+        ),
+        stride_k_scale_2=(
+            params.k_descale.stride(2) if params.per_token_kv_scales else 0
+        ),
+        stride_v_scale_0=(
+            params.v_descale.stride(0) if params.per_token_kv_scales else 0
+        ),
+        stride_v_scale_1=(
+            params.v_descale.stride(1) if params.per_token_kv_scales else 0
+        ),
+        stride_v_scale_2=(
+            params.v_descale.stride(2) if params.per_token_kv_scales else 0
+        ),
         enable_fp_fusion=True,
     )
 
