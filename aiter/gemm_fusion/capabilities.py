@@ -7,11 +7,10 @@ mori_cco         : the CCO shared library resolves (MORI_CCO_SO, then MORI_ROOT/
                    library search), is a loadable ELF (dlopen succeeds) whose .dynsym defines every symbol gf_comm.cpp calls
                    (ccoGetUniqueId, ccoCommCreate, ccoWindowRegister, ccoGetPeerPtr, ccoDevCommCreate, ccoDevCommDestroy,
                    ccoWindowDeregister, ccoCommDestroy), AND the JIT header MORI_ROOT/include/mori/cco/cco.hpp exists.
-sdma             : mori_cco AND the library exports SDMA support symbols. CCO's SDMA host side lives behind ccoDevCommCreate
-                   (sdmaQueueCount -> queue handles + signal pool; the device-side API is header-only and gated by
-                   BUILD_CCO_SDMA=1 at JIT time), so there is no separate public host entry to look up: the probe requires at least one
-                   exported dynamic symbol whose name contains "sdma"/"Sdma"/"SDMA"/"anvil" (queue creation code linked into the library).
-                   HEURISTIC: Evidence must confirm it against the real library (documented limit, see aiter-integration-notes.md).
+sdma             : mori_cco AND the installed header defines the SDMA device API the large-M kernels compile against (BUILD_CCO_SDMA gate,
+                   ccoSdmaContext, sdmaQueueCount; the r11 device/host sources include only <mori/cco/cco.hpp>) and ccoDevCommCreate is exported
+                   (already required by mori_cco). The installed libmori_cco.so exports NO sdma/anvil symbol names (Evidence, nm -D, lib 87b7322f),
+                   so no symbol heuristic is used; lg_attach_v1 additionally fails hard if devcomm sdmaNumQueue != the requested count.
 gfx950_sc_bypass : arch is gfx950 (sc0/sc1 cache-control semantics of that ISA).
 CCO functions are C++ (Itanium-mangled in namespace mori::cco), so symbols are matched by their mangled `<len><name>` token.
 """
@@ -28,7 +27,8 @@ CCO_REQUIRED_SYMBOLS = (
     "ccoGetUniqueId", "ccoCommCreate", "ccoCommDestroy", "ccoWindowRegister", "ccoWindowDeregister",
     "ccoGetPeerPtr", "ccoDevCommCreate", "ccoDevCommDestroy",
 )
-SDMA_MARKERS = ("sdma", "Sdma", "SDMA", "anvil", "Anvil")
+# Header tokens the SDMA path of the large-M kernels is compiled against (cco.hpp: BUILD_CCO_SDMA gate, ccoSdmaContext, sdmaQueueCount).
+SDMA_HEADER_TOKENS = ("BUILD_CCO_SDMA", "ccoSdmaContext", "sdmaQueueCount")
 CCO_HEADER_REL = os.path.join("include", "mori", "cco", "cco.hpp")
 _DEFAULT_ROOT = "/reference-mori"
 _SYM_CACHE: Dict[Tuple[str, int, int], Optional[Set[str]]] = {}
@@ -113,6 +113,15 @@ def cco_header_available(env=None) -> bool:
     return os.path.isfile(os.path.join(mori_root(env), CCO_HEADER_REL))
 
 
+def cco_header_has_sdma(env=None) -> bool:
+    try:
+        with open(os.path.join(mori_root(env), CCO_HEADER_REL), "r", encoding="utf-8", errors="replace") as f:
+            txt = f.read()
+        return all(tok in txt for tok in SDMA_HEADER_TOKENS)
+    except OSError:
+        return False
+
+
 def _dlopen_ok(path: str) -> bool:
     try:
         ctypes.CDLL(path)  # loads the library and its DT_NEEDED deps; CCO runtime state is created only by ccoCommCreate
@@ -137,8 +146,8 @@ def probe_mori_cco(env=None, check_dlopen: bool = True) -> Tuple[bool, bool, str
             return False, False, f"{lib}: missing symbols {missing}"
         if check_dlopen and not _dlopen_ok(lib):
             return False, False, f"{lib}: dlopen failed"
-        sdma = any(m in n for n in names for m in SDMA_MARKERS)
-        return True, sdma, "ok" if sdma else f"{lib}: no SDMA symbols exported"
+        sdma = cco_header_has_sdma(env)
+        return True, sdma, "ok" if sdma else "cco.hpp lacks the SDMA device API (BUILD_CCO_SDMA / ccoSdmaContext / sdmaQueueCount)"
     except Exception as e:  # noqa: BLE001  (probe contract: never raise)
         return False, False, f"probe error {e!r}"
 

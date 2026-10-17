@@ -230,11 +230,14 @@ def _mangle(f):  # mori::cco::<f>(...) -> _ZN4mori3cco<len><name>E...
     return f"_ZN4mori3cco{len(f)}{f}EPv"
 
 
+SDMA_HDR = "#ifndef BUILD_CCO_SDMA\n#define BUILD_CCO_SDMA 0\n#endif\nstruct ccoSdmaContext {};\nint sdmaQueueCount;\n"
+
+
 @pytest.fixture
 def mori_tree(tmp_path):
     root = tmp_path / "mori"
     (root / "include" / "mori" / "cco").mkdir(parents=True)
-    (root / "include" / "mori" / "cco" / "cco.hpp").write_text("// fake")
+    (root / "include" / "mori" / "cco" / "cco.hpp").write_text(SDMA_HDR)
     (root / "build" / "src" / "cco").mkdir(parents=True)
     return root
 
@@ -250,25 +253,28 @@ def test_capabilities_probe_cco_library(mori_tree):
     from aiter.gemm_fusion import capabilities as cap
 
     so = mori_tree / "build" / "src" / "cco" / "libmori_cco.so"
-    _write_lib(so, extra=["_ZN4mori3cco16ccoSdmaQueueInitEv"])
+    _write_lib(so)  # NO sdma/anvil symbol names (like the real libmori_cco.so 87b7322f): sdma must still be detected via the header
     env = {"MORI_ROOT": str(mori_tree)}
     # symbols present, library not dlopen-able (fake ELF) -> dlopen check fails; with the check off it passes
     assert cap.probe_mori_cco(env, check_dlopen=True)[0] is False
     ok, sdma, why = cap.probe_mori_cco(env, check_dlopen=False)
     assert ok and sdma, why
     assert cap.detect_capabilities(arch="gfx950", env=env, check_dlopen=False) == frozenset({"gfx950_sc_bypass", "mori_cco", "sdma"})
-    # no SDMA symbols -> mori_cco only
-    _write_lib(so)
-    cap._SYM_CACHE.clear()
+    # header without the SDMA device API -> mori_cco only
+    hdr = mori_tree / "include" / "mori" / "cco" / "cco.hpp"
+    hdr.write_text("// no sdma here\nint ccoDevCommCreate();\n")
     assert cap.detect_capabilities(arch="gfx950", env=env, check_dlopen=False) == frozenset({"gfx950_sc_bypass", "mori_cco"})
+    hdr.write_text("#define BUILD_CCO_SDMA 0\nstruct ccoSdmaContext;\n")  # a token missing (sdmaQueueCount) -> not enough
+    assert "sdma" not in cap.detect_capabilities(arch="gfx950", env=env, check_dlopen=False)
+    hdr.write_text(SDMA_HDR)
     # a missing required symbol -> no capability at all
-    _write_lib(so, drop=("ccoWindowRegister",), extra=["_ZN4mori3cco10ccoSdmaFooEv"])
+    _write_lib(so, drop=("ccoWindowRegister",))
     cap._SYM_CACHE.clear()
     ok, sdma, why = cap.probe_mori_cco(env, check_dlopen=False)
     assert not ok and not sdma and "ccoWindowRegister" in why
     # explicit MORI_CCO_SO wins over MORI_ROOT and a bad explicit path does not fall through
     good = mori_tree / "alt.so"
-    _write_lib(good, extra=["sdma_marker"])
+    _write_lib(good)
     cap._SYM_CACHE.clear()
     env2 = {"MORI_ROOT": str(mori_tree), "MORI_CCO_SO": str(good)}
     assert cap.resolve_cco_library(env2) == str(good) and cap.probe_mori_cco(env2, check_dlopen=False)[:2] == (True, True)
@@ -292,7 +298,7 @@ def test_capabilities_probe_failures_never_raise(mori_tree, tmp_path):
     cap._SYM_CACHE.clear()
     assert cap.probe_mori_cco(env)[0] is False
     # header missing -> no capability even with a good library
-    _write_lib(so, extra=["sdma_x"])
+    _write_lib(so)
     cap._SYM_CACHE.clear()
     (mori_tree / "include" / "mori" / "cco" / "cco.hpp").unlink()
     ok, _s, why = cap.probe_mori_cco(env, check_dlopen=False)
