@@ -440,3 +440,88 @@ def test_dense_page128_signature_differs_from_page16():
 
     wrong = type(d)(d.gemm, (d.stages[0], dataclasses.replace(d.stages[1], kv_cache="shuffle_page16_fp8_ptok")))
     assert wrong.signature() != d.signature()  # a page16 dense spec must NOT hit the shipped dense row
+
+def test_cache_page_contract_check():
+    from types import SimpleNamespace as NS
+
+    from aiter.ops.gemm_fusion.sp_qkv.variants import check_cache_page
+
+    def caches(page, blocks=4):
+        return NS(shape=(blocks, 1, 8, page, 16)), NS(shape=(blocks, 1, page // 16, 128, 16))
+
+    for page in (128, 16):
+        check_cache_page(*caches(page), page)  # matches
+    with pytest.raises(ContractError, match="page mismatch"):
+        check_cache_page(*caches(16), 128)  # dense spec (page128) given page16 caches
+    with pytest.raises(ContractError, match="page mismatch"):
+        check_cache_page(*caches(128), 16)
+    with pytest.raises(ContractError):
+        check_cache_page(NS(shape=(4, 1, 128, 16)), NS(shape=(4, 1, 8, 128, 16)), 128)  # not the SHUFFLE rank
+
+
+def test_plan_block_comes_from_spec_page(monkeypatch):
+    """The binding block_size equals the page in the matched spec: dense 128, indexer/reuse 16 (real golden pages)."""
+    from aiter.gemm_fusion import catalog
+
+    monkeypatch.setattr(catalog, "_CATALOG", {})
+    sys.modules.pop("aiter.ops.gemm_fusion.sp_qkv.variants", None)
+    sys.modules.pop("aiter.ops.gemm_fusion.sp_qkv.variants_large", None)
+    import aiter.ops.gemm_fusion.sp_qkv.variants as v
+
+    caps = frozenset({"mori_cco", "gfx950_sc_bypass"})
+    for mode, T, page in (("dense", 64, 128), ("dense", 128, 128), ("indexer", 64, 16), ("reuse", 128, 16)):
+        plan = v.SpQkvSmall(specs.sp_qkv_spec(mode), specs.SMALL_CELLS[(mode, T)][1], MatchCtx("gfx950", 256, 4, T // 4, caps))
+        assert plan.block == page, (mode, T)
+
+def test_binding_rejects_wrong_cache_page_before_any_driver_call(monkeypatch):
+    """_binding must raise the page ContractError BEFORE it touches the driver (a dense spec with page16 caches must not bind)."""
+    import types as _t
+
+    from aiter.gemm_fusion import catalog
+    from types import SimpleNamespace as NS
+
+    monkeypatch.setattr(catalog, "_CATALOG", {})
+    sys.modules.pop("aiter.ops.gemm_fusion.sp_qkv.variants", None)
+    sys.modules.pop("aiter.ops.gemm_fusion.sp_qkv.variants_large", None)
+    import aiter.ops.gemm_fusion.sp_qkv.variants as v
+
+    class T:  # minimal tensor stand-in
+        def __init__(self, shape, stride=None, dtype="f32"):
+            self.shape, self._stride, self.dtype, self.device = tuple(shape), stride, dtype, "cuda:0"
+            self.ptr = id(self) * 16
+
+        def data_ptr(self):
+            return self.ptr
+
+        def stride(self, i=None):
+            s = self._stride or tuple(1 for _ in self.shape)
+            return s if i is None else s[i]
+
+        def element_size(self):
+            return 1
+
+    fake_torch = _t.ModuleType("torch")
+    fake_torch.zeros = lambda *a, **k: T((128,))
+    fake_torch.float32 = "f32"
+    fake_torch.finfo = lambda dt: NS(max=448.0)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    plan = v.SpQkvSmall(specs.sp_qkv_spec("dense"), specs.SMALL_CELLS[("dense", 64)][1],
+                        MatchCtx("gfx950", 256, 4, 16, frozenset({"mori_cco"})))
+    assert plan.block == 128
+    res = NS(__dict__={})
+    res = type("R", (), {})()  # plain object with a __dict__
+    calls = []
+    plan._context = lambda r: calls.append("context") or NS(bind=lambda sb: calls.append("bind"))
+    x, xs, ws = T((16, 6144), (6144, 1)), T((16, 1)), T((9216,))
+    meta = {n: T((128,)) for n in ("q_norm_w", "k_norm_w")}
+    meta.update(cos_cache=T((1024, 32), (32, 1)), sin_cache=T((1024, 32), (32, 1)), positions=T((64,)), slot_mapping=T((64,)),
+                k_scale=T((4, 1, 128), (128, 128, 1)), v_scale=T((4, 1, 128), (128, 128, 1)))
+    outs = {"q": T((64, 16, 128)), "k": T((64, 1, 128)), "v": T((64, 1, 128))}
+    meta.update(k_cache=T((4, 1, 8, 16, 16)), v_cache=T((4, 1, 1, 128, 16)))  # page16 caches vs a page128 dense spec
+    with pytest.raises(ContractError, match="page mismatch"):
+        plan._binding(x, xs, ws, outs, meta, res)
+    assert "bind" not in calls
+    meta.update(k_cache=T((4, 1, 8, 128, 16), (16384, 16384, 2048, 16, 1)), v_cache=T((4, 1, 8, 128, 16), (16384, 16384, 2048, 16, 1)))
+    blk = plan._binding(x, xs, ws, outs, meta, res)  # correct page -> reaches the driver bind
+    assert "bind" in calls

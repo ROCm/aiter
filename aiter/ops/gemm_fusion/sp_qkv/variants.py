@@ -46,6 +46,15 @@ def small_window_bytes(mode: str) -> Dict[str, int]:
     return {"rx": rx, "ctl": ctl}
 
 
+def check_cache_page(k_cache, v_cache, page: int):
+    """Contract: the golden SHUFFLE caches must have the page the spec was matched with.
+    K [blocks, kvh, head_dim/x(8), page, x(16)] -> shape[3]; V [blocks, kvh, page/x, head_dim, x(16)] -> shape[2]*16."""
+    kp = k_cache.shape[3] if len(k_cache.shape) == 5 else None
+    vp = v_cache.shape[2] * 16 if len(v_cache.shape) == 5 else None
+    if kp != page or vp != page:
+        raise ContractError(f"sp_qkv.small.v1: cache page mismatch: spec page={page}, k_cache page={kp}, v_cache page={vp} "
+                            f"(k {tuple(k_cache.shape)}, v {tuple(v_cache.shape)})")
+
 @register_variant(
     vid="sp_qkv.small.v1", family="gemm_ep.sp_qkv", stage_kinds=("sp_exchange", "head_norm_rope_cache"),
     contract=Contract(arch=("gfx950",), world=4, topology="single_node_xgmi_p2p", graph="capture_safe_epoch_state",
@@ -135,6 +144,7 @@ class SpQkvSmall(Plan):
             raise RuntimeError("sp_qkv.small: new binding required during graph capture; call plan.prepare() before capture")
         if len(self._bindings) >= _MAX_BINDINGS:
             raise RuntimeError("sp_qkv.small: too many distinct bindings (pointers must be stable)")
+        check_cache_page(caches["k_cache"], caches["v_cache"], self.block)  # spec page vs actual cache layout
         sb = rt.SmBindingV1()
         sb.Ascale, sb.Wscale = x_scale.data_ptr(), w_scale.data_ptr()
         sb.qw, sb.kw = meta["q_norm_w"].data_ptr(), meta["k_norm_w"].data_ptr()
