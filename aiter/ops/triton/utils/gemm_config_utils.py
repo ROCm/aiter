@@ -301,3 +301,61 @@ def pick_gemm_num_stages(
         block_m, block_n, block_k, bits_a, bits_b, 2, use_async_padding
     )
     return 2 if lds <= cap else 1
+
+
+def pick_gemm_tile(
+    config: dict, M: int, N: int, cu_count: int
+) -> tuple[int, int] | None:
+    """
+    The (BLOCK_M, BLOCK_N) tile a gluon GEMM runs a shape with.
+
+    A tuned config names its tile (``BLOCK_M``, ``BLOCK_N``). A default config
+    carries the candidate ``TILES`` (largest first) and picks by a cost model:
+    the workgroups of a tile (ragged last tiles included) run in waves of
+    ``cu_count``; a full wave costs the tile's work (BLOCK_M * BLOCK_N) over its
+    throughput ``TILE_TFLOPS[i]`` (measured at one workgroup per CU), and a
+    partial last wave costs ``TAIL_WAVE_COST`` of a full wave plus the rest in
+    proportion to its fill. The lowest cost wins; costs within 1% are a tie,
+    which the earlier (larger) tile in ``TILES`` takes.
+    A config without ``TILE_TFLOPS`` falls back to the largest tile that launches
+    at least ``WORKGROUPS_PER_CU`` workgroups per CU, else the one with the most
+    workgroups.
+
+    Args:
+        config: a gluon GEMM config, as returned by ``get_gemm_config``.
+        M, N: the output shape.
+        cu_count: compute units of the device.
+
+    Returns:
+        (BLOCK_M, BLOCK_N), or None when the config lists no tile.
+    """
+    if "BLOCK_M" in config and "BLOCK_N" in config:
+        return int(config["BLOCK_M"]), int(config["BLOCK_N"])
+    tiles = [(int(bm), int(bn)) for bm, bn in config["TILES"]]
+    if not tiles:
+        return None
+
+    def workgroups(t):
+        return triton.cdiv(M, t[0]) * triton.cdiv(N, t[1])
+
+    if "TILE_TFLOPS" in config:
+        tail_cost = float(config.get("TAIL_WAVE_COST", 0.5))
+
+        def cost(tile, tflops):
+            full, rem = divmod(workgroups(tile), cu_count)
+            waves = full + (
+                0 if rem == 0 else tail_cost + (1 - tail_cost) * rem / cu_count
+            )
+            return waves * tile[0] * tile[1] / float(tflops)
+
+        costs = [cost(t, f) for t, f in zip(tiles, config["TILE_TFLOPS"])]
+        best = min(costs)
+        return next(t for t, c in zip(tiles, costs) if c <= 1.01 * best)
+
+    target = cu_count * int(config.get("WORKGROUPS_PER_CU", 1))
+    for bm, bn in tiles:
+        if workgroups((bm, bn)) >= target:
+            return bm, bn
+    return max(
+        tiles, key=lambda t: (workgroups(t), -(workgroups(t) * t[0] * t[1] - M * N))
+    )
