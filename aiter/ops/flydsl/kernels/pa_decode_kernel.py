@@ -6,7 +6,8 @@
 K/V use e4m3 (FNUZ on gfx942, OCP on gfx950); BF16/FP16 Q and probabilities P
 are quantized to FP8. Q/key scales fold into QK, value scale and 1/FP8_MAX into
 the epilogue; softmax max/sum stay f32. Tuned gfx950 BF16 per-token MTP3/MTP4
-uses K128 MFMA instead of K32, preserving normalized Q/P and operand layouts.
+and the head-256 page-64 pipe use K128 MFMA instead of K32, preserving normalized
+Q/P and operand layouts.
 Every FP8-path Q row uses absmax normalization; per-tensor and per-token K/V scales
 retain range normalization for P.
 BF16 K/V use vector-8 caches and native BF16 Q/K/P/V MFMA operands, with
@@ -16,9 +17,13 @@ Logical layouts (not preshuffled):
 
 * ``query``        [num_seqs * query_length, num_q_heads, head_dim]  f16/bf16
 * ``key_cache``    [num_blocks, num_kv_heads, head_dim//x, block_size, x]
+                   or NHD [num_blocks, 64, num_kv_heads, 256] (strided, head contiguous;
+                   gfx950 FP8 head 256, page 64, at most two query M-tiles)
 * ``value_cache``  [num_blocks, num_kv_heads, block_size//x, head_dim, x] (trans_v)
                    or [num_blocks, num_kv_heads, head_dim, block_size] (FP8 plain)
-                   where x=16 for FP8 and x=8 for BF16
+                   where x=16 for FP8 and x=8 for BF16; with NHD K, an NHD view of
+                   the same shape: head_dim contiguous bytes per token, often the
+                   head_dim bytes after K in one token row
 * ``block_tables`` [num_seqs, max_blocks_per_seq]  int32
 * ``work_info``    [capacity, 4]  int32 sequence/tile bounds/context length
 * ``pmax``, ``psum`` [num_kv_heads, capacity, query_length * query_group_size] f32
@@ -89,6 +94,8 @@ def compile_pa_decode_tile(
     query_splits: int | None = None,
     max_context_length: int | None = None,
     sliding_window: int = 0,
+    nhd_layout: bool = False,
+    from_table_width: bool = False,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -98,7 +105,10 @@ def compile_pa_decode_tile(
     for example D512/MTP4/GQA16 splits twice and D1024/MTP3/GQA16 splits three
     ways. Explicit BF16 splits must fit that limit as well.
     ``max_context_length`` bounds dense planned work for scheduling only; it does not
-    change the launch capacity, scratch layout, or single-tile guarantee.
+    change the launch capacity, scratch layout, or single-tile guarantee. Every
+    context length, including later graph replays, should be at most this value.
+    A smaller value still covers the real context: page ids outside the staged
+    window are read from the block table.
     CTAs receive equal groups of MTP positions, flattened with GQA into 16-row
     M-tiles. Partial output stays unsplit for the shared reducer.
 
@@ -120,7 +130,8 @@ def compile_pa_decode_tile(
     Pages past the sequence are pinned to block 0; callers must leave the
     unwritten tail of the last owned page finite. ``wide_kv_addressing`` protects
     offsets at 2 GiB; ``kv_buffer_u32`` proves both FP8 caches are below 4 GiB
-    and permits unsigned buffer offsets instead of i64.
+    and permits unsigned buffer offsets instead of i64. For NHD it also widens
+    the head term, and the in-page term stays i32.
     """
     schedule = PaDecodeSchedule.select(
         head_dim=head_dim,
@@ -142,6 +153,8 @@ def compile_pa_decode_tile(
         work_capacity=work_capacity,
         max_context_length=max_context_length,
         sliding_window=sliding_window,
+        nhd_layout=nhd_layout,
+        from_table_width=from_table_width,
     )
     cached = _PA_DECODE_TILE_CACHE.get(schedule.cache_key)
     if cached is not None:
@@ -173,6 +186,12 @@ def compile_pa_decode_tile(
         stride_ks_head: fx.Int32,
         stride_q_row: fx.Int32,
         stride_q_head: fx.Int32,
+        stride_k_block: fx.Int32,
+        stride_k_token: fx.Int32,
+        stride_k_head: fx.Int32,
+        stride_v_block: fx.Int32,
+        stride_v_token: fx.Int32,
+        stride_v_head: fx.Int32,
         num_sequences: fx.Int32,
         planned_seq: fx.Int32,
         planned_start: fx.Int32,
@@ -197,6 +216,12 @@ def compile_pa_decode_tile(
             stride_ks_head,
             stride_q_row,
             stride_q_head,
+            stride_k_block,
+            stride_k_token,
+            stride_k_head,
+            stride_v_block,
+            stride_v_token,
+            stride_v_head,
             num_sequences,
             planned_seq,
             planned_start,
@@ -221,6 +246,12 @@ def compile_pa_decode_tile(
         stride_ks_head: fx.Int32,
         stride_q_row: fx.Int32,
         stride_q_head: fx.Int32,
+        stride_k_block: fx.Int32,
+        stride_k_token: fx.Int32,
+        stride_k_head: fx.Int32,
+        stride_v_block: fx.Int32,
+        stride_v_token: fx.Int32,
+        stride_v_head: fx.Int32,
         work_info_ptr: fx.Pointer,
         num_sequences: fx.Int32,
     ):
@@ -240,6 +271,12 @@ def compile_pa_decode_tile(
                 stride_ks_head,
                 stride_q_row,
                 stride_q_head,
+                stride_k_block,
+                stride_k_token,
+                stride_k_head,
+                stride_v_block,
+                stride_v_token,
+                stride_v_head,
                 num_sequences,
                 seq,
                 start,
@@ -284,6 +321,12 @@ def compile_pa_decode_tile(
         stride_ks_head: fx.Int32,
         stride_q_row: fx.Int32,
         stride_q_head: fx.Int32,
+        stride_k_block: fx.Int32,
+        stride_k_token: fx.Int32,
+        stride_k_head: fx.Int32,
+        stride_v_block: fx.Int32,
+        stride_v_token: fx.Int32,
+        stride_v_head: fx.Int32,
         work_info: fx.Pointer,
         work_capacity: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
@@ -306,6 +349,12 @@ def compile_pa_decode_tile(
                 stride_ks_head,
                 stride_q_row,
                 stride_q_head,
+                stride_k_block,
+                stride_k_token,
+                stride_k_head,
+                stride_v_block,
+                stride_v_token,
+                stride_v_head,
                 work_info,
                 num_seqs,
             ).launch(
