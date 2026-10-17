@@ -2438,7 +2438,7 @@ def _flydsl_stage1_wrapper(
         w1_scale=w1_scale,
         a1_scale=a1_scale,
         sorted_weights=sorted_weights,
-        persist_m=parsed.get("persist_m", 0),
+        persist_m=parsed.get("persist_m", 1),
         use_async_copy=True,
         k_batch=parsed.get("k_batch", 1),
         # None, matching stage 2: the int4 registry emits no waves_per_eu key.

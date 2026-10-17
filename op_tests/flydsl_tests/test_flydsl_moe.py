@@ -13,6 +13,7 @@ Usage:
 
 from __future__ import annotations
 
+import importlib
 import os
 
 import pytest
@@ -198,6 +199,27 @@ def test_pick_flydsl_stage2_tile_k():
     assert resolve_flydsl_stage2_tile_k(512, 128) == 128
 
 
+@pytest.mark.parametrize(
+    "kernel_name,persist_m",
+    [
+        ("flydsl_moe1_afp8_wfp4_bf16_t64x128x256_w3_gui_fp8", 1),
+        ("flydsl_moe1_afp8_wfp4_bf16_t64x128x256_w3_gui_persist_fp8", -1),
+    ],
+)
+def test_flydsl_stage1_wrapper_preserves_scheduling(
+    monkeypatch, kernel_name, persist_m
+):
+    """Ordinary kernels default to one tile; explicit live-grid names keep -1."""
+    fused_moe_module = importlib.import_module("aiter.fused_moe")
+    moe_kernels = importlib.import_module("aiter.ops.flydsl.moe_kernels")
+    monkeypatch.setattr(moe_kernels, "flydsl_moe_stage1", lambda **kwargs: kwargs)
+
+    launch = fused_moe_module._flydsl_stage1_wrapper(
+        None, None, None, None, None, None, None, 2, kernelName=kernel_name
+    )
+    assert launch["persist_m"] == persist_m
+
+
 @pytest.mark.parametrize("token", [128, 32768])
 @_SKIP_GFX950_FLYDSL
 def test_flydsl_stage1_a8w4_live_grid_matches_standard(token):
@@ -237,11 +259,13 @@ def test_flydsl_stage1_a8w4_live_grid_matches_standard(token):
     slot_ids = sorted_ids >> 24
     valid = (token_ids < token) & (slot_ids < topk)
     route_ids = token_ids[valid] * topk + slot_ids[valid]
-    torch.testing.assert_close(
-        live_grid.view(-1, inter_dim)[route_ids],
-        standard.view(-1, inter_dim)[route_ids],
+    _check_close(
+        standard.view(-1, inter_dim)[route_ids].to(dtypes.fp32),
+        live_grid.view(-1, inter_dim)[route_ids].to(dtypes.fp32),
+        "persistent GEMM1 versus regular GEMM1",
         atol=0,
         rtol=0,
+        max_err_ratio=0,
     )
 
 
