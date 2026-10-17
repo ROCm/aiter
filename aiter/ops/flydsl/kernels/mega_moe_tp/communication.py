@@ -20,6 +20,7 @@ from .common import (
     AUX_SC1,
     AUX_SYS,
     DEADLINE,
+    LDS_NAP,
     MAX_TP,
     REL,
     V2I,
@@ -224,7 +225,7 @@ def build_communication(kc: KernelCtx) -> dict:
             else:
                 cur = lds_ld_acq(L, L_CTL + C_BARGEN * 4)
                 while cur == g:
-                    rocdl.s_sleep(0)
+                    rocdl.s_sleep(LDS_NAP)
                     cur = lds_ld_acq(L, L_CTL + C_BARGEN * 4)
         rocdl.sched_barrier(0)
 
