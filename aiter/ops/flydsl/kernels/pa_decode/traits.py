@@ -652,7 +652,7 @@ class PaDecodeTraits:
             and not nhd_layout
         )
         # Scale before masking to avoid -inf * 0 and a second mask.
-        M1_SCALE_BEFORE_MASK = REUSE_KV_PAGES or D256_PIPE or is_bf16_kv
+        M1_SCALE_BEFORE_MASK = PER_TOKEN_M1 or D256_PIPE or is_bf16_kv
         # The d256 pipe gives each M-tile a private P and Lsum slot so one barrier
         # publishes all of them.
         P_BUFFERS = (
