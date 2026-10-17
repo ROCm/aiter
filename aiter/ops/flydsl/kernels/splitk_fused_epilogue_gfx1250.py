@@ -37,6 +37,7 @@ def emit_fused_splitk_epilogue(
     mn_oob,
     flat_tile,
     bounded_m=False,
+    n_oob=None,
 ):
     """Reduce disjoint row ranges using all of a tile's split-K workgroups.
 
@@ -95,7 +96,7 @@ def emit_fused_splitk_epilogue(
     )
     remaining = mn_oob - reduce_row
     valid_rows = (remaining > 0).select(remaining, fx.Int32(0))
-    if const_expr(lean and bounded_m):
+    if const_expr(lean and bounded_m and n_oob is None):
         output_buffer = ptr_buf_tensor(
             output_base,
             elem,
@@ -189,6 +190,17 @@ def emit_fused_splitk_epilogue(
             row = row0 + (batch * unroll + u) * rows_per_iter
             if const_expr(not lean):
                 fx.ptr_store(acc.to(elem), lds_out + row * c_lds_row + col)
+            elif const_expr(n_oob is not None):
+                if row < valid_rows:
+                    if col + vec <= n_oob:
+                        fx.ptr_store(acc.to(elem), output_base + row * ldc64 + col)
+                    else:
+                        for j in range_constexpr(vec):
+                            if col + j < n_oob:
+                                fx.ptr_store(
+                                    acc[j].to(elem),
+                                    output_base + row * ldc64 + col + j,
+                                )
             elif const_expr(bounded_m):
                 buf_copy_store(
                     output_buffer,
@@ -206,7 +218,10 @@ def emit_fused_splitk_epilogue(
         tile_out = fx.Tensor(fx.make_view(output_base, out_layout))
         store_atom = fx.rocdl.make_tdm_atom(
             tile_out,
-            [valid_rows, tile_n],
+            [
+                valid_rows,
+                tile_n if n_oob is None else fx.max(0, fx.min(n_oob, tile_n)),
+            ],
             strides=[ldc64, None],
             num_warps=block // 32,
         )
