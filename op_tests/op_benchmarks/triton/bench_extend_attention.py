@@ -1,10 +1,18 @@
+import functools
+
 import torch
 import triton
 
 from aiter.ops.triton.attention import extend_attention, prefill_attention
 from aiter.ops.triton.utils.types import str_to_torch_dtype
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     get_model_configs,
     print_vgpr,
@@ -69,7 +77,7 @@ def prefill_forward(
         b_start_loc,
         b_seq_len,
         max_len_extend,
-        causal=causal,
+        is_causal=causal,
     )
     return out
 
@@ -158,6 +166,8 @@ def model_benchmark_configs(args):
 def benchmark(args):
     dtype = str_to_torch_dtype[args.dtype]
     torch.set_default_dtype(dtype)
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     configs = []
 
@@ -194,7 +204,7 @@ def benchmark(args):
     )
 
     @triton.testing.perf_report(configs)
-    def bench_MLA(
+    def bench_extend_or_prefill_attention(
         B,
         H,
         prefix,
@@ -210,24 +220,8 @@ def benchmark(args):
         model=None,
         **kwargs,
     ):
-        warmup = 25
-        rep = 100
-        (
-            q_extend,
-            k_extend,
-            v_extend,
-            k_buffer,
-            v_buffer,
-            kv_indptr,
-            kv_indices,
-            qo_indptr,
-            custom_mask,
-            mask_indptr,
-            max_len_extend,
-            _,
-            _,
-            _,
-        ) = input_helper(
+        _p_gen = functools.partial(
+            input_helper,
             B,
             H,
             prefix,
@@ -239,9 +233,44 @@ def benchmark(args):
             device,
             attn_impl=args.attn_impl,
         )
+        _out_val_keys = [
+            "q_extend",
+            "k_extend",
+            "v_extend",
+            "k_buffer",
+            "v_buffer",
+            "kv_indptr",
+            "kv_indices",
+            "qo_indptr",
+            "custom_mask",
+            "mask_indptr",
+            "max_len_extend",
+            "b_start_loc",
+            "b_loc",
+            "b_seqlen",
+        ]
+        rot_bufs = generate_rotating_buffers_pool(
+            [_p_gen], [_out_val_keys], **kwargs_rot_bufs
+        )
 
-        def fn():
-            return extend_forward(
+        if args.mode == "prefill":
+
+            def _run(
+                q_extend, k_extend, v_extend, b_start_loc, b_seqlen, max_len_extend, **_
+            ):
+                prefill_forward(
+                    q_extend,
+                    k_extend,
+                    v_extend,
+                    b_start_loc,
+                    b_seqlen,
+                    max_len_extend,
+                    causal,
+                )
+
+        else:
+
+            def _run(
                 q_extend,
                 k_extend,
                 v_extend,
@@ -253,15 +282,31 @@ def benchmark(args):
                 custom_mask,
                 mask_indptr,
                 max_len_extend,
-                causal,
-                sm_scale,
-                logit_cap,
-            )
+                **_,
+            ):
+                extend_forward(
+                    q_extend,
+                    k_extend,
+                    v_extend,
+                    k_buffer,
+                    v_buffer,
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    custom_mask,
+                    mask_indptr,
+                    max_len_extend,
+                    causal,
+                    sm_scale,
+                    logit_cap,
+                )
 
-        ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+        ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
         return ms
 
-    bench_MLA.run(save_path="." if args.o else None, print_data=True, show_plots=False)
+    bench_extend_or_prefill_attention.run(
+        save_path="." if args.o else None, print_data=True, show_plots=False
+    )
     return x_vals_list, x_names, line_vals
 
 

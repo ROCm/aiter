@@ -1,3 +1,4 @@
+import functools
 import random
 import sys
 
@@ -7,10 +8,14 @@ import triton
 from aiter.ops.triton.attention.pa_decode import paged_attention_decode
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     get_dtype_bytes,
     get_model_configs,
@@ -109,6 +114,58 @@ def input_helper(
     )
 
 
+def _generate_pa_decode_pool_inputs(
+    B,
+    H_Q,
+    H_KV,
+    D,
+    KV_BLK_SZ,
+    SEQ_LEN,
+    dtype,
+    kv_cache_dtype,
+    output_type,
+    num_blocks,
+    backend,
+):
+    (
+        query,
+        output,
+        key_cache,
+        value_cache,
+        key_cache_tri,
+        value_cache_tri,
+        context_lens,
+        block_tables,
+        _max_context_len,
+    ) = input_helper(
+        B,
+        H_Q,
+        H_KV,
+        D,
+        KV_BLK_SZ,
+        SEQ_LEN,
+        dtype,
+        kv_cache_dtype,
+        output_type,
+        num_blocks,
+    )
+    if backend == "gluon":
+        context_lens = context_lens.to(torch.int32)
+    # max_context_len is a GPU scalar and is always == SEQ_LEN here (context_lens
+    # is uniformly filled); callers use the plain SEQ_LEN int instead so nothing
+    # forces a device sync inside the captured region.
+    return (
+        query,
+        output,
+        key_cache,
+        value_cache,
+        key_cache_tri,
+        value_cache_tri,
+        context_lens,
+        block_tables,
+    )
+
+
 def model_benchmark_configs(args):
     config_file = args.model_configs
     configs = get_model_configs(
@@ -134,88 +191,6 @@ def model_benchmark_configs(args):
     return fa_configs
 
 
-def paged_attn_decode(
-    BS,
-    H_Q,
-    H_KV,
-    D,
-    KV_BLK_SZ,
-    SEQ_LEN,
-    num_blocks,
-    dtype,
-    kv_cache_dtype,
-    compute_type,
-    output_type,
-    backend="triton",
-):
-    (
-        query,
-        triton_output,
-        key_cache,
-        value_cache,
-        key_cache_tri,
-        value_cache_tri,
-        context_lens,
-        block_tables,
-        max_context_len,
-    ) = input_helper(
-        BS,
-        H_Q,
-        H_KV,
-        D,
-        KV_BLK_SZ,
-        SEQ_LEN,
-        dtype,
-        kv_cache_dtype,
-        output_type,
-        num_blocks,
-    )
-    attn_scale = 1.0 / (D**0.5)
-
-    if backend == "gluon":
-        from aiter.ops.triton.gluon.pa_decode_gluon import (
-            get_recommended_splits,
-            pa_decode_gluon,
-        )
-
-        context_lens = context_lens.to(torch.int32)
-        scale = torch.ones(1, dtype=torch.float32, device="cuda")
-        num_splits = get_recommended_splits(
-            BS, H_KV, max_context_length=max_context_len
-        )
-        return lambda: pa_decode_gluon(
-            output=triton_output,
-            query=query,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            context_lengths=context_lens,
-            block_tables=block_tables,
-            softmax_scale=attn_scale,
-            query_length=1,
-            max_context_partition_num=num_splits,
-            compute_type=compute_type,
-            key_scale=scale,
-            value_scale=scale,
-        )
-
-    k_scale = torch.tensor([1.0])
-    v_scale = torch.tensor([1.0])
-
-    return lambda: paged_attention_decode(
-        output=triton_output,
-        query=query,
-        key_cache=key_cache_tri,
-        value_cache=value_cache_tri,
-        seq_lens=context_lens,
-        block_tables=block_tables,
-        attn_scale=attn_scale,
-        max_seq_len=max_context_len,
-        compute_type=compute_type,
-        k_scale=k_scale,
-        v_scale=v_scale,
-    )
-
-
 def run_benchmark(args):
     dtype = arg_to_torch_dtype[args.dtype]
     kv_cache_dtype = arg_to_torch_dtype[args.kv_cache_dtype]
@@ -223,6 +198,8 @@ def run_benchmark(args):
     if args.backend == "triton":
         compute_type = torch_to_triton_dtype[compute_type]
     output_type = arg_to_torch_dtype[args.output_type]
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     x_vals_list = model_benchmark_configs(args)
     x_names = ["model", "BS", "HQ", "HK", "SEQ_LEN", "HEAD_DIM"]
@@ -263,24 +240,99 @@ def run_benchmark(args):
                     "to keep Triton cache offsets within signed int32."
                 )
             num_blocks = min(num_blocks, max_blocks)
-        fn = paged_attn_decode(
+        attn_scale = 1.0 / (HEAD_DIM**0.5)
+
+        _p_gen = functools.partial(
+            _generate_pa_decode_pool_inputs,
             BS,
             HQ,
             HK,
             HEAD_DIM,
             KV_BLK_SZ,
             SEQ_LEN,
-            num_blocks,
             dtype,
             kv_cache_dtype,
-            compute_type,
             output_type,
+            num_blocks,
             args.backend,
         )
+        _out_val_keys = [
+            "query",
+            "output",
+            "key_cache",
+            "value_cache",
+            "key_cache_tri",
+            "value_cache_tri",
+            "context_lens",
+            "block_tables",
+        ]
+        rot_bufs = generate_rotating_buffers_pool(
+            [_p_gen], [_out_val_keys], **kwargs_rot_bufs
+        )
 
-        fn()
-        torch.cuda.synchronize()
-        ms = triton.testing.do_bench_cudagraph(fn, rep=100)
+        if args.backend == "gluon":
+            from aiter.ops.triton.gluon.pa_decode_gluon import (
+                get_recommended_splits,
+                pa_decode_gluon,
+            )
+
+            gluon_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+            num_splits = get_recommended_splits(BS, HK, max_context_length=SEQ_LEN)
+
+            def _run(
+                query,
+                output,
+                key_cache,
+                value_cache,
+                key_cache_tri,
+                value_cache_tri,
+                context_lens,
+                block_tables,
+            ):
+                pa_decode_gluon(
+                    output=output,
+                    query=query,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    context_lengths=context_lens,
+                    block_tables=block_tables,
+                    softmax_scale=attn_scale,
+                    query_length=1,
+                    max_context_partition_num=num_splits,
+                    compute_type=compute_type,
+                    key_scale=gluon_scale,
+                    value_scale=gluon_scale,
+                )
+
+        else:
+            k_scale = torch.tensor([1.0])
+            v_scale = torch.tensor([1.0])
+
+            def _run(
+                query,
+                output,
+                key_cache,
+                value_cache,
+                key_cache_tri,
+                value_cache_tri,
+                context_lens,
+                block_tables,
+            ):
+                paged_attention_decode(
+                    output=output,
+                    query=query,
+                    key_cache=key_cache_tri,
+                    value_cache=value_cache_tri,
+                    seq_lens=context_lens,
+                    block_tables=block_tables,
+                    attn_scale=attn_scale,
+                    max_seq_len=SEQ_LEN,
+                    compute_type=compute_type,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                )
+
+        ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
 
         # query and output
         mem = (BS * HQ * HEAD_DIM) * (
@@ -334,7 +386,7 @@ def parse_args():
     parser.add_argument("-kv_cache_dtype", default="fp16")
     parser.add_argument("-compute_type", default="fp16")
     parser.add_argument("-output_type", default="fp16")
-    override_parser_action(parser, "backend", default="triton")
+    override_parser_action(parser, "--backend", default="triton")
 
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
