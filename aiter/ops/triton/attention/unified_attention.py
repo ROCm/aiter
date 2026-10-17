@@ -584,6 +584,16 @@ def is_reduce_gluon_available(params: _UAParams, NUM_SEGMENTS, backend: str):
 def _triton_attention_config(params: _UAParams, op: str):
     """Resolve the exact query tile shared by dispatch and the kernel launch."""
     config = get_unified_attention_config(op, params, backend="triton")
+    if DEVICE_ARCH == "gfx950" and params.shuffled_kv_cache:
+        # A page-sized operand is staged in the query dtype. Leave LDS space
+        # for dot-layout conversions rather than double buffering a large page.
+        operand_bytes = (
+            params.block_size
+            * triton.next_power_of_2(max(params.head_size, params.head_size_v))
+            * params.q.element_size()
+        )
+        if operand_bytes * config["num_stages"] > 128 * 1024:
+            config["num_stages"] = 1
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
     )
