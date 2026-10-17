@@ -22,7 +22,7 @@ mfma count) is the same, so the timing is a fair performance baseline, but do
 not read it as two implementations computing the same thing.
 """
 
-import argparse
+import functools
 import sys
 
 import torch
@@ -31,7 +31,15 @@ import triton
 from aiter.ops.triton.attention.paged_attention_output_gate import (
     paged_attention_output_gate_group_fp8_quant,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+    override_parser_action,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     print_vgpr,
 )
@@ -43,113 +51,43 @@ HEAD_DIM = 256
 _PARTITION_SIZE = 256
 
 
-def _time_us(call, iters, reps):
-    """Median per-invocation microseconds, capturing `reps` calls in one graph.
+def _generate_stock_pool_inputs(tokens, context, heads, dtype, seed):
+    """Buffers for the three launches `_stock_composition`'s `_run` replaces.
 
-    `triton.testing.do_bench` in this Triton has no CUDA-graph mode, and at
-    decode shapes the launch overhead dominates: measured here, bs=8 / ctx 8192
-    reads as 26.6 us under do_bench against 8.0 us graph-captured. Worse for a
-    comparison, the distortion is not common-mode -- the fused op is two
-    launches and the stock composition is three, so do_bench flatters the one
-    with fewer launches and understates the speedup.
-
-    Capturing many invocations per graph amortises the per-replay setup (~9.3 us
-    for a single-kernel graph on MI355X, ~1.7 us at reps=50). Pass --do-bench to
-    fall back to the conventional path.
+    `out`/`ws`/`gated_buf` are write destinations, not random inputs -- they
+    still need a fresh instance per rotating-buffer pool entry so repeated
+    writes across the pool don't collapse onto one hot cache line.
     """
-    for _ in range(25):
-        call()
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        for _ in range(reps):
-            call()
-    torch.cuda.synchronize()
-    for _ in range(3):
-        graph.replay()
-    torch.cuda.synchronize()
-
-    samples = []
-    for _ in range(5):
-        start, end = torch.cuda.Event(True), torch.cuda.Event(True)
-        start.record()
-        for _ in range(iters):
-            graph.replay()
-        end.record()
-        torch.cuda.synchronize()
-        samples.append(start.elapsed_time(end) * 1000.0 / iters / reps)
-    samples.sort()
-    return samples[len(samples) // 2]
-
-
-def _stock_composition(q, kc, vc, indptr, indices, gate, scale, max_context):
-    """The three launches this op replaces, as one callable.
-
-    The gate step uses aiter's own `fused_sigmoid_mul`, NOT `flat *
-    torch.sigmoid(gate)`. The torch spelling is two kernels rather than one, and
-    the caller this op targets (SGLang's Qwen3-Next decode) runs a single fused
-    sigmoid-gate multiply -- so timing the torch spelling would inflate the
-    baseline by a launch this op does not actually remove, and overstate the
-    speedup (measured: +4% at bs=64 and +21% at bs=1, ctx 8192).
-    """
-    from aiter import paged_attention_ragged
-    from aiter.ops.triton.fusions.fused_sigmoid_mul import fused_sigmoid_mul
-    from aiter.ops.triton.quant.fused_fp8_quant import fused_flatten_fp8_group_quant
-
-    rows, heads, _ = q.shape
-    out = torch.empty(rows, heads, HEAD_DIM, dtype=torch.bfloat16, device=q.device)
-    parts = (max_context + _PARTITION_SIZE - 1) // _PARTITION_SIZE
-    nbytes = (rows * heads * parts * HEAD_DIM) * 4 + 2 * (rows * heads * parts) * 4
+    q, kc, vc, indptr, indices, gate = _make_inputs(
+        tokens, context, heads, dtype, seed=seed
+    )
+    out = torch.empty(tokens, heads, HEAD_DIM, dtype=torch.bfloat16, device=q.device)
+    parts = (context + _PARTITION_SIZE - 1) // _PARTITION_SIZE
+    nbytes = (tokens * heads * parts * HEAD_DIM) * 4 + 2 * (tokens * heads * parts) * 4
     ws = torch.empty(nbytes, dtype=torch.uint8, device=q.device)
-    last_page = torch.ones(rows, dtype=torch.int32, device=q.device)
+    last_page = torch.ones(tokens, dtype=torch.int32, device=q.device)
     one = torch.ones(1, dtype=torch.float32, device=q.device)
-    flat = out.view(rows, heads * HEAD_DIM)
+    flat = out.view(tokens, heads * HEAD_DIM)
     # Separate destination: fused_sigmoid_mul defaults to writing in place, which
     # would compound across the invocations captured in one graph.
     gated_buf = torch.empty_like(flat)
-
-    def call():
-        paged_attention_ragged(
-            out,
-            ws,
-            q,
-            kc.view(-1, 1, 1, HEAD_DIM),
-            vc.view(-1, 1, 1, HEAD_DIM),
-            scale,
-            indptr,
-            indices,
-            last_page,
-            1,
-            parts,
-            None,
-            "fp8_e4m3",
-            "NHD",
-            0.0,
-            one,
-            one,
-            None,
-            _PARTITION_SIZE,
-        )
-        gated = fused_sigmoid_mul(flat, gate, out=gated_buf)
-        return fused_flatten_fp8_group_quant(gated.view(rows, heads, HEAD_DIM), 128)
-
-    return call
+    return q, kc, vc, indptr, indices, gate, out, ws, last_page, one, flat, gated_buf
 
 
 def bench_fn(tokens, context, heads, provider, args):
     dtype = torch.float8_e4m3fn
-    q, kc, vc, indptr, indices, gate = _make_inputs(
-        tokens, context, heads, dtype, seed=tokens
-    )
     scale = HEAD_DIM**-0.5
-    k_scale = torch.ones(1, dtype=torch.float32, device="cuda")
-    v_scale = torch.ones(1, dtype=torch.float32, device="cuda")
     impl, metric = provider.rsplit("_", 1)
 
-    if impl == "fused":
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
-        def call():
-            return paged_attention_output_gate_group_fp8_quant(
+    if impl == "fused":
+        k_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+        v_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+
+        def _run(q, kc, vc, indptr, indices, gate):
+            paged_attention_output_gate_group_fp8_quant(
                 q,
                 kc,
                 vc,
@@ -163,19 +101,85 @@ def bench_fn(tokens, context, heads, provider, args):
                 quant_dtype=dtype,
             )
 
+        _p_gen = functools.partial(
+            _make_inputs, tokens, context, heads, dtype, seed=tokens
+        )
+        _out_val_keys = ["q", "kc", "vc", "indptr", "indices", "gate"]
     else:
-        call = _stock_composition(q, kc, vc, indptr, indices, gate, scale, context)
+        # The gate step uses aiter's own `fused_sigmoid_mul`, NOT `flat *
+        # torch.sigmoid(gate)`. The torch spelling is two kernels rather than
+        # one, and the caller this op targets (SGLang's Qwen3-Next decode)
+        # runs a single fused sigmoid-gate multiply -- so timing the torch
+        # spelling would inflate the baseline by a launch this op does not
+        # actually remove, and overstate the speedup (measured: +4% at bs=64
+        # and +21% at bs=1, ctx 8192).
+        from aiter import paged_attention_ragged
+        from aiter.ops.triton.fusions.fused_sigmoid_mul import fused_sigmoid_mul
+        from aiter.ops.triton.quant.fused_fp8_quant import (
+            fused_flatten_fp8_group_quant,
+        )
 
-    if args.do_bench:
-        us = triton.testing.do_bench(call, warmup=args.warmup, rep=args.rep) * 1e3
-    else:
-        us = _time_us(call, args.iters, args.reps)
+        parts = (context + _PARTITION_SIZE - 1) // _PARTITION_SIZE
+
+        def _run(
+            q, kc, vc, indptr, indices, gate, out, ws, last_page, one, flat, gated_buf
+        ):
+            paged_attention_ragged(
+                out,
+                ws,
+                q,
+                kc.view(-1, 1, 1, HEAD_DIM),
+                vc.view(-1, 1, 1, HEAD_DIM),
+                scale,
+                indptr,
+                indices,
+                last_page,
+                1,
+                parts,
+                None,
+                "fp8_e4m3",
+                "NHD",
+                0.0,
+                one,
+                one,
+                None,
+                _PARTITION_SIZE,
+            )
+            gated = fused_sigmoid_mul(flat, gate, out=gated_buf)
+            fused_flatten_fp8_group_quant(gated.view(tokens, heads, HEAD_DIM), 128)
+
+        _p_gen = functools.partial(
+            _generate_stock_pool_inputs, tokens, context, heads, dtype, tokens
+        )
+        _out_val_keys = [
+            "q",
+            "kc",
+            "vc",
+            "indptr",
+            "indices",
+            "gate",
+            "out",
+            "ws",
+            "last_page",
+            "one",
+            "flat",
+            "gated_buf",
+        ]
+
+    # Generate rotating buffer pool
+    rot_bufs = generate_rotating_buffers_pool(
+        [_p_gen], [_out_val_keys], **kwargs_rot_bufs
+    )
+
+    # Run benchmark
+    ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
+
     if metric == "time":
-        return us
+        return ms * 1e3  # us
     if metric == "bandwidth":
         # K and V, one byte per element, streamed once per decode step.
         kv_bytes = tokens * context * HEAD_DIM * 2
-        return kv_bytes / (us * 1e-6) * 1e-9
+        return kv_bytes / (ms * 1e-3) * 1e-9  # GB/s
     raise ValueError(f"Unknown metric: {metric}")
 
 
@@ -217,23 +221,20 @@ def run_benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark paged attention with output gate",
-        description=(
-            "Benchmark the Gluon paged-decode attention with sigmoid output "
-            "gate and group-128 FP8 epilogue"
-        ),
+    parser = get_parser(
+        kernel_name="Gluon paged-decode attention with sigmoid output gate and group-128 FP8 epilogue"
     )
+
     parser.add_argument("--tokens", type=int, default=None, help="Decode batch size")
     parser.add_argument(
         "--context", type=int, default=None, help="Context length per sequence"
     )
     parser.add_argument("--heads", type=int, default=4, help="Query heads (1..16)")
-    parser.add_argument(
-        "--metric",
-        type=str,
-        default="all",
+    override_parser_action(
+        parser,
+        action="--metric",
         choices=["time", "bandwidth", "all"],
+        default="all",
         help="time is microseconds; bandwidth is KV GB/s",
     )
     parser.add_argument(
@@ -242,19 +243,6 @@ def parse_args():
         default=False,
         help="also time the three stock launches this op replaces",
     )
-    parser.add_argument("--warmup", type=int, default=25)
-    parser.add_argument("--rep", type=int, default=100)
-    parser.add_argument(
-        "--do-bench",
-        action="store_true",
-        default=False,
-        help=(
-            "use triton.testing.do_bench instead of graph capture; "
-            "launch-overhead dominated at decode shapes, see _time_us"
-        ),
-    )
-    parser.add_argument("--iters", type=int, default=100)
-    parser.add_argument("--reps", type=int, default=50, help="invocations per graph")
     parser.add_argument(
         "--print_vgpr",
         action="store_true",
