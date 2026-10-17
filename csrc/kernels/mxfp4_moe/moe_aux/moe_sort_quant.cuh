@@ -66,6 +66,12 @@ __device__ __forceinline__ int dpp_inclusive_scan_wave(int x) {
     return x;
 }
 
+// Routes outside [0, NUM_EXPERTS), e.g. the -1 padding sentinel, are dropped.
+template <int NUM_EXPERTS>
+__device__ __forceinline__ bool is_valid_expert(int eid) {
+    return static_cast<unsigned>(eid) < static_cast<unsigned>(NUM_EXPERTS);
+}
+
 template <int NUM_EXPERTS, int THREADS_PER_CTA>
 __device__ __forceinline__ void count_tokens_per_expert(int *__restrict__ count, const int32_t *__restrict__ topk_ids,
                                                         int total_pairs) {
@@ -81,14 +87,19 @@ __device__ __forceinline__ void count_tokens_per_expert(int *__restrict__ count,
 
     for (int i = tid * 4; i < total_aligned; i += THREADS_PER_CTA * 4) {
         int4 ids = topk_vec[i / 4];
-        atomicAdd(&count[ids.x], 1);
-        atomicAdd(&count[ids.y], 1);
-        atomicAdd(&count[ids.z], 1);
-        atomicAdd(&count[ids.w], 1);
+        if (is_valid_expert<NUM_EXPERTS>(ids.x))
+            atomicAdd(&count[ids.x], 1);
+        if (is_valid_expert<NUM_EXPERTS>(ids.y))
+            atomicAdd(&count[ids.y], 1);
+        if (is_valid_expert<NUM_EXPERTS>(ids.z))
+            atomicAdd(&count[ids.z], 1);
+        if (is_valid_expert<NUM_EXPERTS>(ids.w))
+            atomicAdd(&count[ids.w], 1);
     }
     for (int i = total_aligned + tid; i < total_pairs; i += THREADS_PER_CTA) {
         int eid = topk_ids[i];
-        atomicAdd(&count[eid], 1);
+        if (is_valid_expert<NUM_EXPERTS>(eid))
+            atomicAdd(&count[eid], 1);
     }
 
     __syncthreads();
@@ -131,7 +142,7 @@ __device__ __forceinline__ void parallel_cumsum(int *__restrict__ count, int *__
     __syncthreads();
 }
 
-template <int TOPK, int THREADS_PER_CTA>
+template <int NUM_EXPERTS, int TOPK, int THREADS_PER_CTA>
 __device__ __forceinline__ void place_tokens(int *__restrict__ cumsum, int *__restrict__ counter,
                                              const int *__restrict__ topk_ids,
                                              const float *__restrict__ topk_weight,
@@ -148,12 +159,16 @@ __device__ __forceinline__ void place_tokens(int *__restrict__ cumsum, int *__re
 
     for (int i = tid; i < total_pairs; i += THREADS_PER_CTA) {
         int eid = topk_ids[i];
-        int pos = atomicAdd(&counter[eid], 1);
-        int sp = cumsum[eid] + pos;
-        sorted_token_ids[sp] = (token_id & 0x00FFFFFF) | ((topk_id & 0xFF) << 24);
-        m_indices[sp] = token_id & 0x00FFFFFF;
-        sorted_weights[sp] = topk_weight[i];
-        reverse_sorted[i] = sp;
+        if (is_valid_expert<NUM_EXPERTS>(eid)) {
+            int pos = atomicAdd(&counter[eid], 1);
+            int sp = cumsum[eid] + pos;
+            sorted_token_ids[sp] = (token_id & 0x00FFFFFF) | ((topk_id & 0xFF) << 24);
+            m_indices[sp] = token_id & 0x00FFFFFF;
+            sorted_weights[sp] = topk_weight[i];
+            reverse_sorted[i] = sp;
+        } else {
+            reverse_sorted[i] = -1;
+        }
 
         token_id += stride_tok;
         topk_id += stride_rem;
@@ -204,7 +219,7 @@ sort_subkernel(const int32_t *topk_ids, const float *topk_weight, int32_t *sorte
 
     count_tokens_per_expert<NUM_EXPERTS, THREADS_PER_CTA>(count, topk_ids, total_pairs);
     parallel_cumsum<NUM_EXPERTS, THREADS_PER_CTA, M_PER_BLOCK>(count, cumsum, counter);
-    place_tokens<TOPK, THREADS_PER_CTA>(cumsum, counter, topk_ids, topk_weight, sorted_token_ids, sorted_weights, reverse_sorted, m_indices, total_pairs);
+    place_tokens<NUM_EXPERTS, TOPK, THREADS_PER_CTA>(cumsum, counter, topk_ids, topk_weight, sorted_token_ids, sorted_weights, reverse_sorted, m_indices, total_pairs);
     fill_padding_gaps<NUM_EXPERTS, THREADS_PER_CTA, M_PER_BLOCK>(count, cumsum, sorted_token_ids, sorted_expert_ids, m_indices, sorted_weights, M);
 
     if (tid == 0) {

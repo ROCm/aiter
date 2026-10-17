@@ -1714,6 +1714,7 @@ _KIMI_A8W4_E, _KIMI_A8W4_TOPK, _KIMI_A8W4_MODEL_DIM = 896, 16, 3584
 def test_a8w4_sort_quant_kernel(
     token,
     row_stride,
+    routing,
     E=_KIMI_A8W4_E,
     topk=_KIMI_A8W4_TOPK,
     model_dim=_KIMI_A8W4_MODEL_DIM,
@@ -1724,6 +1725,7 @@ def test_a8w4_sort_quant_kernel(
     routing (order within an expert block is not deterministic), its quant must
     match per_1x32_f8_scale_f8_quant, it must read a row-strided input
     (row_stride > model_dim), and it must zero moe_buf for the atomic stage2.
+    routing="mixed" pads every other route with -1, which both sorts must skip.
     """
     mb = 32
     alloc = aiter.fused_moe._alloc_aux_sort_buffers
@@ -1765,6 +1767,16 @@ def test_a8w4_sort_quant_kernel(
     hidden = torch.randn((token, row_stride), dtype=dtypes.bf16)[:, :model_dim]
     gating = torch.randn((token, E), dtype=dtypes.bf16)
     topk_weights, topk_ids = fused_topk(hidden, gating, topk, True)
+    if routing == "mixed":
+        # moe_sorting accepts -1 padding routes (test_moe_sorting.py "mixed").
+        invalid = torch.arange(token * topk).view(token, topk) % 2 == 1
+        topk_ids = topk_ids.masked_fill(invalid, -1)
+        topk_weights = topk_weights.masked_fill(invalid, 0)
+    flat_ids = topk_ids.flatten().long()
+    valid = flat_ids >= 0
+    n_routes = int(valid.sum())
+    counts = torch.bincount(flat_ids[valid], minlength=E)
+    expected_n_valid = int(((counts + mb - 1) // mb * mb).sum())
     # The MXFP4 sort_quant needs dense rows. At token=1, .contiguous() keeps the
     # row-strided one-row view, which it must still accept: one row has no
     # row stride to honor.
@@ -1780,24 +1792,29 @@ def test_a8w4_sort_quant_kernel(
     def check(bufs):
         ids8, experts8, nv8, w8, rev, m_idx, q8, s8, buf8 = bufs
         n_valid = int(nv8[0].item())
+        assert n_valid == expected_n_valid, f"M={token}: num_valid_ids {n_valid}"
         assert torch.equal(nv8, nv4), f"M={token}: num_valid_ids differ"
         n_blocks = n_valid // mb
         assert torch.equal(
             experts8[:n_blocks], experts4[:n_blocks]
         ), f"M={token}: expert blocks differ"
-        # Every route lands once, in a block of its expert, with its weight.
-        route = rev[: token * topk].long()
-        tok = torch.arange(token).repeat_interleave(topk)
-        slot = torch.arange(topk).repeat(token)
+        rev_all = rev[: token * topk]
+        assert torch.all(rev_all[~valid] == -1), f"M={token}: -1 route was placed"
+        # Every valid route lands once, in a block of its expert, with its weight.
+        route = rev_all[valid].long()
+        tok = torch.arange(token).repeat_interleave(topk)[valid]
+        slot = torch.arange(topk).repeat(token)[valid]
         assert torch.equal(ids8[route].long(), slot << 24 | tok), f"M={token}: ids"
-        assert torch.equal(w8[route], topk_weights.flatten()), f"M={token}: bad weights"
         assert torch.equal(
-            experts8[route // mb].long(), topk_ids.flatten().long()
+            w8[route], topk_weights.flatten()[valid]
+        ), f"M={token}: bad weights"
+        assert torch.equal(
+            experts8[route // mb].long(), flat_ids[valid]
         ), f"M={token}: route in the wrong expert block"
         assert torch.equal(m_idx[route].long(), tok), f"M={token}: bad m_indices"
         # The rest of the valid region is padding.
         assert (
-            int((ids8[:n_valid] != token).sum()) == token * topk
+            int((ids8[:n_valid] != token).sum()) == n_routes
         ), f"M={token}: bad padding"
         assert torch.equal(
             s8, ref_s.view(torch.uint8)
@@ -2037,9 +2054,9 @@ def run_a8w4_sort_quant_tests():
     _log_summary(
         "a8w4 sort_quant kernel",
         [
-            test_a8w4_sort_quant_kernel(token, row_stride)
-            for token, row_stride in itertools.product(
-                (1, 7, 32), (_KIMI_A8W4_MODEL_DIM, 4096)
+            test_a8w4_sort_quant_kernel(token, row_stride, routing)
+            for token, row_stride, routing in itertools.product(
+                (1, 7, 32), (_KIMI_A8W4_MODEL_DIM, 4096), ("valid", "mixed")
             )
         ],
     )
