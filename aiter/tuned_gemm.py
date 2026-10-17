@@ -42,6 +42,64 @@ def _get_flydsl_gemm_kernels():
     return gemm_kernels
 
 
+def _gfx1250_gluon_a16w16_has_config(N, K):
+    """Whether Triton (gluon) has a gfx1250 A16W16 config made for this (N, K)."""
+    from aiter.ops.triton.utils.config_utils import resolve_config_dir
+
+    # The file's "any" entry covers the M buckets it does not list, so a file for (N, K), not
+    # get_gemm_config's is_tuned for this M, tells whether Triton runs a config made for this shape.
+    cfg_dir = resolve_config_dir("gemm", "GEMM-A16W16", backend="gluon")
+    return os.path.isfile(f"{cfg_dir}/GEMM-A16W16-N={N}-K={K}.json")
+
+
+def _gfx1250_flydsl_default_kernel(M, N, K, bias, dtype, otype):
+    """The FlyDSL kernel for a gfx1250 BF16 GEMM without a tuned row, or None.
+
+    Against Triton's gluon DEFAULT.json, these two FlyDSL configs took 0.81 of Triton's time in geomean (0.50 to
+    1.11) for M from 512 to 1024 or above 4096, N >= 4096 and K >= 512 (the shapes of the untuned BF16 CSVs), and 1.01
+    (0.79 to 1.84) for 1024 < M <= 4096, the M_LEQ_2048 and M_LEQ_4096 buckets of that file, which that range leaves to
+    Triton wherever Triton can write C. With fewer tiles Triton was faster, and K < 512 is too short for the 4-stage
+    pipeline.
+    """
+    if dtype != dtypes.bf16 or otype not in (dtypes.bf16, dtypes.fp32):
+        return None
+    # flydsl_gemm adds a bias it cannot fuse in the bias dtype, so a BF16 bias would round an FP32 output.
+    if bias and otype == dtypes.fp32:
+        return None
+    if M < 512 or N < 4096 or K < 512:
+        return None
+    # Tied to the gfx1250 gluon DEFAULT.json buckets; measure again when that file changes. Past byte 2^31 of C,
+    # Triton's default config leaves rows unwritten, so FlyDSL keeps those shapes.
+    if 1024 < M <= 4096 and M * N * otype.itemsize <= 1 << 31:
+        return None
+    big = M > 768
+    config = {
+        "block_m": 256 if big else 128,
+        "block_n": 128,
+        "block_k": 64,
+        "stages": 4,
+        "split_k": 1,
+        "m_waves": 4 if big else 2,
+        "n_waves": 2,
+        "k_waves": 1,
+        "group_m": 0,
+        "use_half_tile_interleaved": False,
+    }
+    return _get_flydsl_gemm_kernels().flydsl_hgemm_kernel_name(
+        dtype=dtype, out_dtype=otype, config=config, has_bias=bias, target_gfx="gfx1250"
+    )
+
+
+def _gfx1250_flydsl_c_fits(M, N, kernel_name):
+    """Whether the gfx1250 FlyDSL kernel can write all of a contiguous M x N output C."""
+    params = _get_flydsl_gemm_kernels().get_flydsl_hgemm_kernel_params(kernel_name)
+    block_m = params["block_m"]
+    out_bytes = 4 if params["out_dtype"] == "fp32" else 2
+    # C takes 32-bit byte offsets and a 32-bit record count, which alone drops the last tile's rows past M;
+    # those rows wrap onto the first rows of C once they reach 2^32.
+    return -(-M // block_m) * block_m * N * out_bytes < 1 << 32
+
+
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
 extensions_created = False
@@ -283,8 +341,28 @@ def get_GEMM_A16W16_config(
                 and not scaleAB
                 and eval(dtype) in (dtypes.bf16, dtypes.fp16)
             ):
-                default_config["libtype"] = "triton"
-                default_config["solidx"] = 0
+                # An (N, K) with its own Triton config can beat FlyDSL, so FlyDSL
+                # only replaces Triton's default config.
+                has_config = _gfx1250_gluon_a16w16_has_config(N, K)
+                kernel_name = None
+                if not has_config:
+                    kernel_name = _gfx1250_flydsl_default_kernel(
+                        M, N, K, bias, eval(dtype), eval(otype)
+                    )
+                if kernel_name is not None and _gfx1250_flydsl_c_fits(
+                    M, N, kernel_name
+                ):
+                    default_config["libtype"] = "flydsl"
+                    default_config["solidx"] = 0
+                    default_config["splitK"] = 1
+                    default_config["kernelName"] = kernel_name
+                elif has_config or M * N * eval(otype).itemsize <= 1 << 31:
+                    default_config["libtype"] = "triton"
+                    default_config["solidx"] = 0
+                else:
+                    # Triton's default config leaves the rows of C past byte 2^31 unwritten.
+                    default_config["libtype"] = "torch"
+                    default_config["solidx"] = 0
             else:
                 default_config["libtype"] = "torch"
                 default_config["solidx"] = 0
