@@ -471,6 +471,7 @@ def topk_select(
     abort_when_nan_found: bool = False,
     tie: str | None = None,
     deterministic: bool = False,
+    max_row_len: int | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """Per-row top-k, dispatched across aiter's four selectors.
 
@@ -550,6 +551,9 @@ def topk_select(
             Weaker than ``tie`` and cheaper than it: it only excludes ``plain``,
             keeping the small-k selector that ``tie='low'`` has to give up. Costs
             up to 1.9x where ``plain`` would have won.
+        max_row_len: an upper bound on every entry of ``end``. It opts the call
+            into the adaptive decode kernel and changes only its speed, never
+            the result (see ``top_k_per_row_decode``). ``None`` declines it.
 
     Returns:
         ``(values, indices)``; ``values`` is None when ``return_value`` is False.
@@ -572,7 +576,6 @@ def topk_select(
     rows, width = input.shape
     if not 1 <= topk <= width:
         raise ValueError(f"topk must be in [1, {width}], got {topk}")
-
     row_lens = _full_rows(rows, width, input.device) if end is None else end
     if row_lens.shape != (rows,) or row_lens.dtype != torch.int32:
         raise ValueError(f"end must be int32 [{rows}], got {tuple(row_lens.shape)}")
@@ -597,7 +600,16 @@ def topk_select(
         input.dtype is torch.float32,
     )
     _dispatch(
-        backend, input, row_lens, idx, topk, rows, end is not None, tie, deterministic
+        backend,
+        input,
+        row_lens,
+        idx,
+        topk,
+        rows,
+        end is not None,
+        tie,
+        deterministic,
+        max_row_len=max_row_len,
     )
 
     values = None
@@ -697,7 +709,16 @@ def _stream_scratch(input, dtype=None):
 
 
 def _dispatch(
-    backend, input, row_lens, idx, topk, rows, ragged, tie=None, deterministic=False
+    backend,
+    input,
+    row_lens,
+    idx,
+    topk,
+    rows,
+    ragged,
+    tie=None,
+    deterministic=False,
+    max_row_len=None,
 ):
     # Every backend puts rows on a grid dimension, and HIP rejects a zero-sized
     # launch. An empty batch has nothing to select, so `idx` stays [0, topk].
@@ -747,6 +768,7 @@ def _dispatch(
             1,
             topk,
             stable=tie == "low" or deterministic,
+            max_row_len=max_row_len,
         )
     elif backend == "stream":
         wave = wave_size_of(input.device.index)

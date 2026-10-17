@@ -1,0 +1,2104 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""FlyDSL decode TopK-per-row kernel, with a per-row candidate buffer
+
+Computes an unordered Top-K index set per decode row from one persistent launch,
+grid=(blocks_per_row, num_rows), picking a per-row strategy by valid length --
+which is what a decode batch needs, since its sequences differ in length. Each row
+derives how many of its blocks_per_row workgroups cooperate (active_parts); the
+rest return immediately. A per-row candidate buffer holds the elements that
+survive the settled digit, and the passes behind it read those instead of the row.
+
+Inputs/outputs:
+  - logits: fp32, logical shape (num_rows, L), strides (stride0, stride1) with
+    stride1 == 1 (contiguous within a row).
+  - seq_lens: int32 causal lengths per sequence; row r scores sequence r // next_n at
+    decode slot r % next_n, valid length seq_len - next_n + slot + 1 clamped to
+    [0, L].
+  - row_starts: int32 element offset of each row in a flat logits buffer, read only
+    under packed_rows (stride0 is then ignored).
+  - indices: flattened int32 output with shape (num_rows, top_k); each row writes its
+    unordered Top-K index set. A row with fewer than top_k valid entries is
+    identity-filled and padded with -1.
+  - control: int32, decode_control_slots(num_rows), CONTROL_ROW_SLOTS per row. The
+    multi-block tiers merge per-block LDS histograms into its pass-private global
+    histograms over an inter-workgroup acquire/release barrier and coordinate
+    through its counters; the single-workgroup tier never touches it.
+  - scratch: int32, decode_scratch_slots(num_rows, ...), the candidate buffer under
+    compact; any contents, since every entry is written before it is read.
+
+Paths (per row, by valid length row_len):
+  - short (row_len <= short_max): active_parts = 1; part 0 runs the whole radix-select
+    in one workgroup — LDS-only histograms, no inter-workgroup barrier, no workspace
+    round-trip.
+  - multi-part (row_len > short_max): active_parts = min(blocks_per_row, part_cap).
+
+Constraints:
+  - logits are fp32; the order-preserving radix key twiddle is fp32-specific.
+  - BLOCK_THREADS is fixed at 1024 (wave64); the histogram/scan layout relies on it.
+  - control must be all zero at launch, and is left all zero on exit: the last part
+    out of each row clears the row. Allocate it zeroed once and reuse it only on
+    the same stream; a launch that does not finish leaves it dirty.
+  - The row barrier spins (s_sleep), so a row's active parts must be co-resident.
+    This is a regular launch, not a cooperative one, which FlyDSL does not offer.
+    A multi-part launch stays within one workgroup per CU, and rows are independent
+    and flattened x-fastest, so the earliest rows finish and free CUs for the rest.
+    That relies on in-order dispatch rather than a guarantee: a row stalls only
+    while other work leaves fewer free slots than it has parts. Do not reorder the
+    grid.
+"""
+
+import math
+from dataclasses import dataclass
+from functools import cache
+from typing import Any, Literal
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl.expr import (
+    const_expr,
+    gpu,
+    range_constexpr,
+    rocdl,
+)
+from flydsl.expr.typing import ReductionOp, T
+from flydsl.extension.coop.warp import warp_inclusive_scan
+
+# buffer_ops comes from aiter's own shim; flydsl.expr's stable interface lacks it.
+from aiter.ops.flydsl.kernels import buffer_ops
+
+# A row's parts run on different CUs and meet only in the workspace, so its
+# atomics are agent-scoped; the LDS histogram is private to one workgroup.
+_AGENT = rocdl.SyncScope.Agent
+_WORKGROUP = rocdl.SyncScope.Workgroup
+
+# HW max block size; also assumed by the bucket scan (2 bins/thread -> 2048 bins).
+BLOCK_THREADS = 1024
+# Radix digit width. The short tier's LDS histogram is the 2048-bin scan above.
+BITS_PER_PASS = 11
+NUM_PASSES = -(-32 // BITS_PER_PASS)
+NUM_BUCKETS = 1 << BITS_PER_PASS
+WARP_SIZE = 64
+LOAD_VEC = 4
+# log2(LOAD_VEC); LOAD_VEC must be a power of two. vec_blocks = ceil(row_len/LOAD_VEC)
+# is a right shift, so the shift amount must track LOAD_VEC, not a hardcoded width.
+LOAD_VEC_LOG2 = LOAD_VEC.bit_length() - 1
+# Load staging width for ordered emit (matches unordered last-pass unroll).
+ORDERED_STAGES = 4
+# vec-loads a thread takes per compact-fill tile. The fill's block scan costs two
+# barriers and drains the loads in flight, so it wants to be paid as rarely as the
+# register budget allows; each step holds COMPACT_FILL_VECS * LOAD_VEC keys live.
+COMPACT_FILL_VECS = 4
+# Candidate buffer slots per row, in units of k. Trades workspace for how often the
+# buffer path is taken, never correctness: a part that overflows rescans instead.
+COMPACT_CAP_MULT = 16
+
+# 128B-spaced inter-workgroup counter groups (32 int32 == 128B each), kept in the int32 workspace.
+COUNTER_STRIDE = 32
+# s_sleep units between barrier polls, about 64 clocks each.
+SPIN_SLEEP = 1
+# Bound on the certificate's re-read loop, so a bug cannot hang the GPU. It is a
+# liveness guard, not a schedule: the loop exits when the bins sum to the row's
+# live length, which every part's atomics make inevitable. Sized far past any
+# real wait -- the loop is a scan of 2048 bins, so this is minutes.
+CERTIFICATE_MAX_SPINS = 4194304
+# buffer_load cache policy: sc0 (bit 0) and sc1 (bit 4) together, so the load is
+# system-scope coherent and reads past both L1 and L2. The certificate's re-read is
+# the only thing that needs it -- every other read of the histogram follows a
+# barrier, which has already made it visible.
+CACHE_BYPASS_L1_L2 = 17
+COUNTER_SLOTS = 7 * COUNTER_STRIDE
+# Parts of the row that have finished with its control slots; the last clears them.
+COUNTER_EXIT = 0 * COUNTER_STRIDE
+COUNTER_ARRIVALS = 1 * COUNTER_STRIDE
+COUNTER_OUT_FRONT = 2 * COUNTER_STRIDE
+COUNTER_OUT_BACK = 3 * COUNTER_STRIDE
+COUNTER_PASS_DONE = 4 * COUNTER_STRIDE
+# Per-workgroup selected/tied counts for ordered emit (reserved for both modes).
+COUNTER_ORDERED_ABOVE = 5 * COUNTER_STRIDE
+COUNTER_ORDERED_EQUAL = 6 * COUNTER_STRIDE
+
+# Columns of `s_scan`: each wave's total, then its exclusive offset in the block.
+SCAN_TOTAL = 0
+SCAN_OFFSET = 1
+
+SMEM_META_K = 0
+SMEM_META_LEN = 1
+SMEM_META_THRESHOLD = 2
+SMEM_META_ABOVE = 3
+# tid 0's COUNTER_EXIT arrival, broadcast so the whole part agrees it is the last.
+SMEM_META_EXIT = 4
+# The live length a certified merge has to see the histogram sum to. In LDS rather
+# than an SSA value because it is written by the region that knows the count and
+# read by the re-read loop, which that value would not dominate.
+SMEM_META_TOTAL = 5
+
+# Compact candidate buffer, one region per row in `scratch`. Entry i is the pair
+# (column, twiddled key) at 2*i, so the later passes read a candidate without
+# touching the row.
+
+# Short-tier one-workgroup metadata reuses the same 8-int LDS block after zeroing.
+SMEM_META_SHORT_FIRST_ABOVE = 0
+SMEM_META_SHORT_FIRST_THRESHOLD = 1
+SMEM_META_SHORT_SECOND_ABOVE = 2
+SMEM_META_SHORT_SECOND_THRESHOLD = 3
+SMEM_META_SHORT_THIRD_ABOVE = 4
+SMEM_META_SHORT_THIRD_THRESHOLD = 5
+SMEM_META_SHORT_FRONT_COUNT = 6
+SMEM_META_SHORT_BACK_COUNT = 7
+# Size of the boundary bucket each of the first two passes settled on. When it
+# equals the count still needed, the whole bucket is the rest of the top k.
+SMEM_META_SHORT_FIRST_LEN = 8
+SMEM_META_SHORT_SECOND_LEN = 9
+SMEM_META_SLOTS = 10
+
+# `s_run`, this workgroup's running output counts.
+# Where the current tile's selected / tied outputs start.
+SMEM_RUN_TILE_SELECTED = 0
+SMEM_RUN_TILE_TIED = 1
+# Selected / tied totals of the parts before this one.
+SMEM_RUN_PART_SELECTED = 2
+SMEM_RUN_PART_TIED = 3
+# This part's own selected / tied totals.
+SMEM_RUN_SELECTED = 4
+SMEM_RUN_TIED = 5
+# Compact only: candidates this part wrote, and whether its slice overflowed.
+SMEM_RUN_COMPACT_COUNT = 6
+SMEM_RUN_COMPACT_SPILLED = 7
+
+
+# --- the host-side rule -----------------------------------------------------
+#
+# Everything below picks the launch width and path from the batch shape alone.
+# Every number was measured against this kernel, so callers take them from
+# `decode_adaptive_config` rather than choosing their own.
+
+PARTS_CAP = 32
+# A row shorter than this reads its candidates from the row, not the buffer.
+# Fitted jointly with `MEASURED_PARTS`; neither can be re-fitted alone.
+COMPACT_MIN = ((32, 262144), (1, 1048576))
+
+COMPACT_SLICE = 40960
+"""Past 32 rows, the slice length a part needs before compacting it pays.
+
+There a row has at most four parts, so the floor moves from the row
+(`COMPACT_MIN`) onto each part's slice.
+"""
+
+# parts = sqrt(c2 * seq / (c1 * rows)); only the ratio decides a width. Fitted
+# with the barrier polling monotonically and acquiring once.
+PARTS_C1 = {False: 187.979e-3, True: 153.875e-3}
+PARTS_C2 = {False: 1.87979e-3, True: 464.695e-6}
+
+# The measured best width per (rows, seq), read at every admitted k. A table
+# because no smooth model reproduces it; off the grid the square root above runs,
+# which is poor at narrow rows. (32, 32768) only sets the launch width, since its
+# rows are all short-tier; keep it, or the fallback widens and recompiles.
+MEASURED_PARTS = {
+    (1, 32768): 8,
+    (1, 65536): 16,
+    (1, 131072): 32,
+    (1, 262144): 32,
+    (1, 1048576): 32,
+    (2, 32768): 8,
+    (2, 65536): 16,
+    (2, 131072): 32,
+    (2, 262144): 32,
+    (2, 1048576): 32,
+    (4, 32768): 8,
+    (4, 65536): 16,
+    (4, 131072): 16,
+    (4, 262144): 24,
+    (4, 1048576): 32,
+    (8, 32768): 8,
+    (8, 65536): 16,
+    (8, 131072): 16,
+    (8, 262144): 24,
+    (8, 1048576): 24,
+    (16, 32768): 8,
+    (16, 65536): 8,
+    (16, 131072): 12,
+    (16, 262144): 14,
+    (16, 1048576): 14,
+    (32, 32768): 2,
+    (32, 65536): 6,
+    (32, 131072): 7,
+    (32, 262144): 6,
+    (32, 1048576): 7,
+}
+# Only `decode_adaptive_config`'s default k; the table is read at every k.
+MEASURED_PARTS_K = 2048
+
+WIDE_SPLIT_WORK = 28416
+"""Elements a split must take off a row's critical path to pay for its barrier.
+
+Splitting G ways removes seq*(G-1)/G; below this, past 32 rows, the row runs alone.
+"""
+
+# The CU count the tables were fitted at. A default, not a device read: the
+# caller knows the device, so pass `decode_cu_count`.
+FITTED_CU = 256
+
+
+def decode_adaptive_grid(
+    rows: int, want: int, seq: int | None = None, cu_count: int = FITTED_CU
+) -> int:
+    """The launch width, from the batch size and the width the row wants.
+
+    A narrowed width is odd so each row starts on the next XCD while its parts stay
+    contiguous. Do not reorder the grid: a row's parts must be co-resident to clear
+    the spin barrier, and overshooting `cu_count` leaves them spinning. Always pass
+    `seq`; without it a short row past 32 rows takes a split it should not.
+    """
+    widest = min(32, cu_count // max(1, rows))
+    if widest < 2:
+        return 1
+    grid = (
+        widest if want >= widest else max(3, widest - 1 if widest % 2 == 0 else widest)
+    )
+    if (
+        seq is not None
+        and rows > 32
+        and grid > 1
+        and seq * (grid - 1) <= WIDE_SPLIT_WORK * grid
+    ):
+        return 1
+    return grid
+
+
+def decode_compact_uses_buffer(rows: int, seq: int) -> bool:
+    """`COMPACT_MIN` read as a floor on the row. The width table is fitted to it."""
+    floor = next(f for at, f in COMPACT_MIN if rows >= at)
+    return seq >= floor
+
+
+def decode_compact_compacts(rows: int, seq: int, parts: int, short_max: int) -> bool:
+    """Whether the passes behind the first read candidates back from the buffer.
+
+    `COMPACT_MIN` on the row up to 32 rows, `COMPACT_SLICE` on each part past it;
+    the short tier keeps no buffer. `decode_adaptive_want` must keep reading
+    `decode_compact_uses_buffer` instead, the floor the width table was fitted on.
+    """
+    if seq <= short_max:
+        return False
+    if rows > 32:
+        return seq >= COMPACT_SLICE * parts
+    return decode_compact_uses_buffer(rows, seq)
+
+
+def decode_adaptive_want(rows: int, seq: int) -> int:
+    """The width the row wants, before the grid gets a say."""
+    if (rows, seq) in MEASURED_PARTS:
+        return MEASURED_PARTS[(rows, seq)]
+    compact = decode_compact_uses_buffer(rows, seq)
+    ratio = PARTS_C2[compact] / PARTS_C1[compact]
+    # Floored at two: a row that wants one workgroup is already on the short tier.
+    return max(2, min(PARTS_CAP, round(math.sqrt(ratio * seq / rows))))
+
+
+def decode_adaptive_parts(rows: int, seq: int, cu_count: int = FITTED_CU) -> int:
+    """How many of the grid's workgroups per row actually take part."""
+    want = decode_adaptive_want(rows, seq)
+    return min(decode_adaptive_grid(rows, want, seq, cu_count), want)
+
+
+SHORT_MAX_BASE, SHORT_MAX_SLOPE, SHORT_MAX_CAP = 28416, 160, 40960
+
+
+def _next_pow2(n: int) -> int:
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
+def decode_adaptive_short_max(rows: int) -> int:
+    """The length below which a row runs on the single-workgroup short tier.
+
+    Not `_ONE_WORKGROUP_MAX_ROW_WIDTH`, which is the single-launch path's own
+    crossover; do not reconcile the two without re-measuring. k does not enter: the crossover
+    barely moves.
+    """
+    return min(SHORT_MAX_CAP, SHORT_MAX_BASE + _next_pow2(rows) * SHORT_MAX_SLOPE)
+
+
+def decode_adaptive_certificate(seq: int, parts: int) -> bool:
+    """Whether pass 0 settles its digit from the histogram's own total.
+
+    Trades the contended arrival counter for a fixed 2048-bin uncached re-read.
+    """
+    if seq >= 65536:
+        return True
+    return seq >= 32768 and parts >= 4
+
+
+@dataclass(frozen=True)
+class DecodeAdaptiveConfig:
+    """One shape's build and launch plan, so the host recomputes none of it."""
+
+    kw: dict[str, Any]  # create_topk_per_row_decode_adaptive_kernel keywords
+    grid: int
+    parts: int
+    compact: bool
+    scratch_slots: int  # 0 when the build keeps no candidate buffer
+
+
+def decode_adaptive_config(
+    rows: int,
+    seq: int,
+    k: int = MEASURED_PARTS_K,
+    *,
+    short_max: int | None = None,
+    ordered: bool = True,
+    early_stop: bool = True,
+    cu_count: int = FITTED_CU,
+) -> DecodeAdaptiveConfig:
+    """Everything `create_topk_per_row_decode_adaptive_kernel` and its launch need.
+
+    Pass `cu_count` for the device that will run it. The caps stay at least two
+    even on a one-wide grid: they are upper bounds, and a cap of one is rejected.
+    """
+    parts = decode_adaptive_parts(rows, seq, cu_count)
+    grid = decode_adaptive_grid(rows, decode_adaptive_want(rows, seq), seq, cu_count)
+    if short_max is None:
+        short_max = decode_adaptive_short_max(rows)
+    compact = decode_compact_compacts(rows, seq, parts, short_max)
+    kw = {
+        "blocks_per_row": grid,
+        # Not "auto" when every row fits: at one part the cooperating path folds
+        # away at compile time and "auto" has nowhere to send a long row.
+        "tier_mode": "short" if seq <= short_max else "auto",
+        "part_cap": max(2, parts),
+        "short_max": short_max,
+        "ordered": ordered,
+    }
+    # Every build reaches it under `compact` too: unordered short rows on the short
+    # tier, ordered ones on the rows that keep no buffer.
+    if early_stop:
+        kw["early_stop"] = True
+    if decode_adaptive_certificate(seq, parts):
+        kw["histogram_certificate"] = True
+    if compact:
+        kw["compact"] = True
+    return DecodeAdaptiveConfig(
+        kw=kw,
+        grid=grid,
+        parts=parts,
+        compact=compact,
+        scratch_slots=decode_scratch_slots(rows, compact, COMPACT_CAP_MULT * k),
+    )
+
+
+CONTROL_ROW_SLOTS = COUNTER_SLOTS + NUM_PASSES * NUM_BUCKETS
+
+
+def decode_control_slots(num_rows: int) -> int:
+    """int32 slots of the control buffer, which every launch leaves all zero."""
+    return int(num_rows) * CONTROL_ROW_SLOTS
+
+
+def decode_scratch_slots(num_rows: int, compact: bool, compact_cap: int) -> int:
+    """int32 slots of the candidate buffer, (column, key) pairs per row."""
+    return int(num_rows) * 2 * int(compact_cap) if compact else 0
+
+
+@cache
+def create_topk_per_row_decode_adaptive_kernel(
+    top_k: int,
+    *,
+    blocks_per_row: int = 8,
+    tier_mode: Literal["auto", "short"] = "auto",
+    short_max: int = 16384,
+    part_cap: int = 32,
+    early_stop: bool = False,
+    ordered: bool = False,
+    compact: bool = False,
+    histogram_certificate: bool = False,
+    packed_rows: bool = False,
+) -> Any:
+    """Build a launcher selecting the Top-K largest values' column indices per decode
+    row, matching torch.topk by value -- an unordered set by default, ascending with
+    deterministic tie-breaking under ``ordered``. The launcher is cached.
+
+    Prefer `decode_adaptive_config` to choosing these by hand; it answers every knob
+    from the shape. Constraints a caller can otherwise get wrong:
+
+    - `early_stop` is silently dropped from the multi-block tiers under `compact`,
+      where the last pass reads the candidate buffer rather than the row, but
+      for ordered rows short enough to keep no buffer. The short tier takes it
+      whenever it is compiled in.
+    - `part_cap` is clamped to `blocks_per_row`.
+    - `packed_rows` reads row r from element row_starts[r] of a flat input, with
+      `width` then the plane's; otherwise row_starts is not read.
+
+    The module docstring describes what each tier, the candidate buffer and the
+    histogram certificate actually do.
+    """
+    # blocks_per_row == 1 collapses the launch to grid=(1, num_rows): every row runs
+    # the barrier-free single-workgroup short tier (no cooperative parts, so no dead
+    # blocks hogging co-resident slots).
+    if not 1 <= blocks_per_row <= 32:
+        raise ValueError(f"blocks_per_row must be in [1, 32], got {blocks_per_row}")
+
+    if part_cap < 2:
+        raise ValueError(f"part_cap must be >= 2, got {part_cap}")
+    if tier_mode not in ("auto", "short"):
+        raise ValueError(f"tier_mode must be auto or short, got {tier_mode!r}")
+
+    # ordered=True drops the short tier; it assumes the unordered emit.
+    short_tier = not ordered
+    # The short tier reads the row on every pass and never orders, so it can stop
+    # after any pass whose boundary bucket falls whole.
+    short_early_stop = bool(early_stop) and short_tier
+    meta_slots = SMEM_META_SLOTS if short_early_stop else 8
+    # Ordered short rows reach the cooperating path at one part, where they read
+    # the row rather than the candidate buffer; unordered ones never reach it.
+    short_rows_read_row = compact and ordered and tier_mode == "auto"
+    # Early stop replaces the last pass with one row walk, so it needs that pass to
+    # be reading the row: under `compact` it reads the candidate buffer instead,
+    # except on the ordered short rows, which alone take it there.
+    early_stop = early_stop and (not compact or short_rows_read_row)
+    ordered_early_stop = early_stop and ordered
+    # At one block per row "auto" cannot tell a short row from a row the grid could
+    # only give one workgroup: `active_parts` folds to a compile-time one either
+    # way, so a long row has nowhere to go but the single-workgroup tier. Only
+    # there is the length read at runtime; every other build keeps its
+    # cooperating path fixed at compile time.
+    short_tier_by_len = short_tier and tier_mode == "auto" and blocks_per_row == 1
+    if ordered and blocks_per_row > WARP_SIZE:
+        raise ValueError(
+            f"ordered=True scans slice bases within one wave, so blocks_per_row "
+            f"must be <= {WARP_SIZE}, got {blocks_per_row}"
+        )
+    block_threads = BLOCK_THREADS
+    red_slots = (block_threads + WARP_SIZE - 1) // WARP_SIZE
+    num_passes = NUM_PASSES
+    num_buckets = NUM_BUCKETS
+    # Pass 0 settles the digit that defines a candidate, so pass 1 is the earliest
+    # that can fill the buffer; every pass after it reads the buffer instead of the row.
+    compact_fill_pass = 1
+
+    def certified_pass(pass_id: int) -> bool:
+        """Whether this pass's merge can prove its own completion.
+
+        A pass histograms exactly the count its predecessor settled on, so the
+        conservation argument carries past pass 0. The candidate buffer is what
+        ends it: from the pass after the fill, a part whose slice overflowed
+        histograms its row slice instead of its candidates, and the row's total is
+        then no longer the count anyone expects. An overflowing part at the fill
+        itself still counts every candidate it found, it just cannot store them
+        all, so the fill's histogram is conserved and the fill can certify.
+        """
+        if not histogram_certificate:
+            return False
+        if not compact:
+            return True
+        return pass_id <= compact_fill_pass
+
+    def barrier_token_for(pass_id: int) -> int:
+        # The token a pass waits on is a count of the barriers actually reached,
+        # not of the passes behind it: a certified pass never arrives, so it must
+        # not advance the counter the uncertified ones agree on.
+        return 1 + sum(not certified_pass(q) for q in range(pass_id))
+
+    # The emit waits behind every barrier the passes reached, for the same reason.
+    emit_barrier_token = 1 + sum(not certified_pass(q) for q in range(num_passes))
+
+    compact_cap = COMPACT_CAP_MULT * top_k if compact else 0
+    scratch_row_slots = 2 * compact_cap
+
+    # Caps/thresholds only affect codegen for modes that use them; include them in
+    # the name for those modes so distinct configs cache separately.
+    _cap_tag = "" if tier_mode == "short" else f"_s{short_max}_pc{part_cap}"
+    kernel_name = (
+        f"topk_per_row_decode_adaptive_k{top_k}_"
+        f"g{blocks_per_row}"
+        f"_{tier_mode}"
+        f"{_cap_tag}"
+        f"{'_1wg' if short_tier else ''}"
+        f"{'_es' if early_stop else ''}"
+        f"{'_ses' if short_early_stop else ''}"
+        f"{'_ord' if ordered else ''}"
+        f"{'_cert' if histogram_certificate else ''}"
+        f"{'_packed' if packed_rows else ''}"
+    )
+
+    @fx.struct
+    class SharedStorage:
+        s_hist: fx.Array[fx.Int32, num_buckets, 16]
+        s_scan: fx.Array[fx.Int32, red_slots * 2, 16]
+        s_meta: fx.Array[fx.Int32, meta_slots, 16]
+        # 0..5 ordered emit carry / run bases; 6..7 compact append carry / overflow
+        s_run: fx.Array[fx.Int32, 8 if compact else 6, 16]
+        s_own_hist: fx.Array[fx.Int32, num_buckets if ordered else 1, 16]
+
+    @flyc.kernel(name=kernel_name, known_block_size=[block_threads, 1, 1])
+    def topk_per_row_decode_adaptive_kernel(
+        logits: fx.Tensor,
+        next_n: fx.Int32,
+        seq_lens: fx.Tensor,
+        row_starts: fx.Tensor,
+        indices: fx.Tensor,
+        control: fx.Tensor,
+        scratch: fx.Tensor,
+        stride0: fx.Int32,
+        width: fx.Int32,
+    ) -> None:
+        block_x = gpu.block_id("x")
+        block_y = gpu.block_id("y")
+        thread_x = gpu.thread_id("x")
+        part = fx.Int32(block_x)
+        row = fx.Int32(block_y)
+        tid = fx.Int32(thread_x)
+        tid_idx = fx.Index(thread_x)
+        lane = tid % fx.Int32(WARP_SIZE)
+        wave = tid // fx.Int32(WARP_SIZE)
+
+        c_zero = fx.Int32(0)
+        c_one = fx.Int32(1)
+        c_red_slots = fx.Int32(red_slots)
+        c_last_wave = fx.Int32(red_slots - 1)
+        c_last_lane = fx.Int32(WARP_SIZE - 1)
+        c_vec = fx.Int32(LOAD_VEC)
+        c_top_k = fx.Int32(top_k)
+        c_block_i32 = fx.Int32(block_threads)
+        c_block_idx = fx.Index(block_threads)
+        c_bins_i32 = fx.Int32(num_buckets)
+        c_bins_idx = fx.Index(num_buckets)
+        c_parts = fx.Int32(blocks_per_row)
+        c_sign_bit = fx.Int32(-2147483648)
+        c_nan_turn = fx.Int32(0x7FFFFF)  # keys from -inf past the -NaNs
+        c_row_ws = fx.Int32(CONTROL_ROW_SLOTS)
+
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        s_hist = lds.s_hist.view(fx.make_layout(num_buckets, 1))
+        s_scan = lds.s_scan.view(fx.make_layout((red_slots, 2), (1, red_slots)))
+        s_meta = lds.s_meta.view(fx.make_layout(meta_slots, 1))
+        s_run = lds.s_run.view(fx.make_layout(8 if compact else 6, 1))
+        s_own_hist = lds.s_own_hist.view(
+            fx.make_layout(num_buckets if ordered else 1, 1)
+        )
+
+        seq_lens_rsrc = buffer_ops.create_buffer_resource(seq_lens, max_size=True)
+        indices_bytes = fx.Int64(gpu.grid_dim.y) * fx.Int64(top_k) * fx.Int64(4)
+        indices_rsrc = buffer_ops.create_buffer_resource(
+            indices, max_size=False, num_records_bytes=indices_bytes
+        )
+        workspace_rsrc = buffer_ops.create_buffer_resource(control, max_size=True)
+        scratch_rsrc = buffer_ops.create_buffer_resource(scratch, max_size=True)
+
+        hist_ptr = lds.s_hist.ptr
+        meta_ptr = lds.s_meta.ptr
+
+        # Decode row geometry.
+        seq_row = row // next_n
+        slot = row - seq_row * next_n
+        seq_len = fx.Int32(
+            buffer_ops.buffer_load(seq_lens_rsrc, seq_row, vec_width=1, dtype=T.i32)
+        )
+        row_len = seq_len - next_n + slot + c_one
+        row_len = (row_len > c_zero).select(row_len, c_zero)
+        row_len = (row_len < width).select(row_len, width)
+        # One descriptor per row, based at the row and sized to its live length, so
+        # no stride0 can move the bound and the vec4 tail reads zeros past the row.
+        # The base is 64-bit, which keeps a tensor past 4 GiB addressable.
+        if const_expr(packed_rows):
+            row_starts_rsrc = buffer_ops.create_buffer_resource(
+                row_starts, max_size=True
+            )
+            row_base = fx.Int64(
+                buffer_ops.buffer_load(row_starts_rsrc, row, vec_width=1, dtype=T.i32)
+            )
+        else:
+            row_base = fx.Int64(row) * fx.Int64(stride0)
+        logits_rsrc = buffer_ops.create_buffer_resource(
+            logits,
+            max_size=False,
+            num_records_bytes=fx.Int64(row_len) * fx.Int64(4),
+            base_byte_offset=row_base * fx.Int64(4),
+        )
+        row_out = row * c_top_k
+        row_ws_base = row * c_row_ws
+        row_scratch_base = row * fx.Int32(scratch_row_slots)
+
+        # Active cooperating workgroups per row over the fixed grid (excess blocks
+        # return immediately). "auto" picks per row by length; "short" gives every
+        # row one part. The cap is clamped to the grid.
+        c_part_cap = fx.Int32(part_cap)
+        capped_parts = (c_parts < c_part_cap).select(c_parts, c_part_cap)
+        if const_expr(tier_mode == "short"):
+            active_parts = c_one
+        else:  # "auto": pick per row by valid length
+            c_short = fx.Int32(short_max)
+            active_parts = (row_len <= c_short).select(c_one, capped_parts)
+        active_threads = active_parts * c_block_i32
+        single_part_active = active_parts == c_one
+        if const_expr(short_tier_by_len):
+            short_row = row_len <= fx.Int32(short_max)
+        else:
+            short_row = single_part_active
+
+        def active_stride_idx(mult: int = 1):
+            """Vec-block stride covering `mult` rounds of the active workgroups."""
+            return fx.Index(active_threads * fx.Int32(mult))
+
+        def scan_run_stride_idx(mult: int = 1):
+            """Vec-block stride within one workgroup's ordered run."""
+            return fx.Index(c_block_i32 * fx.Int32(mult))
+
+        def counter_slot(slot_const: int):
+            return row_ws_base + fx.Int32(slot_const)
+
+        def histogram_slot(pass_id: int, bin_i32):
+            return (
+                row_ws_base + fx.Int32(COUNTER_SLOTS + pass_id * num_buckets) + bin_i32
+            )
+
+        def compact_col_slot(entry_i32):
+            return row_scratch_base + entry_i32 * fx.Int32(2)
+
+        def compact_key_slot(entry_i32):
+            return row_scratch_base + fx.Int32(1) + entry_i32 * fx.Int32(2)
+
+        def ws_ptr(elem_i32):
+            return fx.get_iter(control) + fx.Int32(elem_i32)
+
+        def scratch_load(elem_i32):
+            return buffer_ops.buffer_load(
+                scratch_rsrc, elem_i32, vec_width=1, dtype=T.i32
+            )
+
+        def ws_load(elem_i32):
+            return buffer_ops.buffer_load(
+                workspace_rsrc, elem_i32, vec_width=1, dtype=T.i32
+            )
+
+        def ws_poll(elem_i32, ordering):
+            # Volatile, so the spin re-reads the slot rather than a hoisted value;
+            # a load rather than an RMW, so polling peers do not contend on it.
+            return fx.generic_load(
+                ws_ptr(elem_i32),
+                memory_order=ordering,
+                syncscope=_AGENT,
+                volatile=True,
+            )
+
+        def spin_until_slot_ge(elem_i32, target):
+            cur = c_zero
+            while cur < target:
+                rocdl.s_sleep(SPIN_SLEEP)
+                cur = ws_poll(elem_i32, fx.AtomicOrdering.Monotonic)
+            # The loop's monotonic observation only decides when to stop. This
+            # acquire re-reads the same monotonically increasing token and pairs
+            # with the last workgroup's release publish before any histogram
+            # data is consumed.
+            ws_poll(elem_i32, fx.AtomicOrdering.Acquire)
+
+        def row_barrier(token):
+            # Waves 1-15 do not drain their flush atomics before gpu.barrier(); peers
+            # still see them because the barrier's workgroup release and tid 0's
+            # agent-scope arrival are cumulative under the LLVM AMDGPU memory model.
+            # The token doubles as the arrival count, so it may be a value the
+            # row settles at runtime: skip a barrier and every later token has to
+            # come down by one, or the last arrival never lands and the row hangs.
+            token_value = fx.Int32(token) if isinstance(token, int) else token
+            target_arrivals = token_value * active_parts
+            gpu.barrier()
+            if tid == c_zero:
+                prev = fx.atomic_add(
+                    ws_ptr(counter_slot(COUNTER_ARRIVALS)),
+                    c_one,
+                    syncscope=_AGENT,
+                    ordering=fx.AtomicOrdering.AcqRel,
+                )
+                last = (prev + c_one) == target_arrivals
+                if last:
+                    fx.atomic_xchg(
+                        ws_ptr(counter_slot(COUNTER_PASS_DONE)),
+                        token_value,
+                        syncscope=_AGENT,
+                        ordering=fx.AtomicOrdering.Release,
+                    )
+                else:
+                    spin_until_slot_ge(counter_slot(COUNTER_PASS_DONE), token_value)
+            gpu.barrier()
+
+        def radix_twiddle_key(val):
+            # Map larger fp32 values to smaller unsigned keys so ascending bucket
+            # scans select descending values -- the bitwise complement of the
+            # ascending twiddle, which is why the mask is a nor rather than an or.
+            # Signed zero is left alone: torch.topk and the C++ one-block kernel
+            # both rank -0.0 strictly below +0.0, so collapsing the two here would
+            # change which tied index is emitted.
+            # The wrapping add rotates the -NaNs, which twiddle past -inf, round to
+            # the top, so every NaN ranks above +inf as torch.topk ranks it.
+            bits = val.bitcast(fx.Int32)
+            return (bits ^ ~((bits >> 31) | c_sign_bit)) + c_nan_turn
+
+        def bucket_for_key(key, start_bit: int):
+            return (key.shrui(fx.Int32(start_bit))) & fx.Int32(num_buckets - 1)
+
+        def prefix_for_key(key, previous_start_bit: int):
+            return key.shrui(fx.Int32(previous_start_bit)) << previous_start_bit
+
+        def load_row_vec(col_base_i32):
+            return fx.Vector(
+                buffer_ops.buffer_load(
+                    logits_rsrc,
+                    col_base_i32,
+                    vec_width=LOAD_VEC,
+                    dtype=T.f32,
+                )
+            )
+
+        def clear_local_histogram():
+            for hist_idx in range(tid_idx, c_bins_idx, c_block_idx):
+                fx.memref_store(c_zero, s_hist, fx.Int32(hist_idx))
+            gpu.barrier()
+
+        def wave_inclusive_scan_i32(value):
+            return warp_inclusive_scan(fx.Int32(value), ReductionOp.ADD)
+
+        # Not fx.coop.BlockScan: it folds the wave totals linearly in every thread,
+        # where here wave 0 scans them once.
+        def block_exclusive_scan_i32(
+            value, *, leading_barrier=False, with_total=False, wave0_last=None
+        ):
+            """Exclusive prefix over tid of one i32 per thread, and the block total.
+
+            `wave0_last(block_total)` runs on one lane of wave 0 before the closing
+            barrier. A scan following a `with_total` one with no barrier between
+            needs `leading_barrier`, since that read of TOTAL may still be in flight.
+            """
+            if const_expr(leading_barrier):
+                gpu.barrier()
+            wave_incl = wave_inclusive_scan_i32(value)
+            wave_excl_thread = wave_incl - value
+            if lane == c_last_lane:
+                fx.memref_store(wave_incl, s_scan, (wave, SCAN_TOTAL))
+            gpu.barrier()
+            if wave == c_zero:
+                in_slots = lane < c_red_slots
+                lane_safe = in_slots.select(lane, c_zero)
+                wtot = in_slots.select(s_scan[lane_safe, SCAN_TOTAL], c_zero)
+                wincl = wave_inclusive_scan_i32(wtot)
+                if in_slots:
+                    fx.memref_store(wincl - wtot, s_scan, (lane, SCAN_OFFSET))
+                if const_expr(wave0_last is not None) and lane == c_last_wave:
+                    wave0_last(wincl)
+            gpu.barrier()
+            wave_off = s_scan[wave, SCAN_OFFSET]
+            total = (
+                s_scan[c_last_wave, SCAN_OFFSET] + s_scan[c_last_wave, SCAN_TOTAL]
+                if with_total
+                else None
+            )
+            exclusive = wave_off + wave_excl_thread
+            return (exclusive, total) if with_total else exclusive
+
+        def choose_bucket_prefix(target_k):
+            # Multi-block ascending block scan over the LDS histogram; each thread owns a bin pair.
+            first_bin = tid * fx.Int32(2)
+            bin0_valid = first_bin < c_bins_i32
+            bin1 = first_bin + c_one
+            bin1_valid = bin1 < c_bins_i32
+            safe0 = bin0_valid.select(first_bin, c_zero)
+            safe1 = bin1_valid.select(bin1, c_zero)
+            c0 = bin0_valid.select(s_hist[safe0], c_zero)
+            c1 = bin1_valid.select(s_hist[safe1], c_zero)
+
+            # The scan already carries the histogram's grand total, so the
+            # certificate's test costs a store here and a compare there, not a
+            # second pass over the bins.
+            def store_certificate_total(total):
+                fx.memref_store(total, s_meta, fx.Int32(SMEM_META_TOTAL))
+
+            excl0 = block_exclusive_scan_i32(
+                c0 + c1,
+                wave0_last=(store_certificate_total if histogram_certificate else None),
+            )
+            incl0 = excl0 + c0
+            incl1 = incl0 + c1
+
+            def emit_find(bucket, excl, incl, count):
+                crosses = (excl < target_k) & (incl >= target_k)
+                if crosses:
+                    fx.memref_store(
+                        target_k - excl,
+                        s_meta,
+                        fx.Int32(SMEM_META_K),
+                    )
+                    fx.memref_store(count, s_meta, fx.Int32(SMEM_META_LEN))
+                    fx.memref_store(bucket, s_meta, fx.Int32(SMEM_META_THRESHOLD))
+                    fx.memref_store(excl, s_meta, fx.Int32(SMEM_META_ABOVE))
+
+            emit_find(first_bin, excl0, incl0, c0)
+            emit_find(bin1, incl0, incl1, c1)
+            gpu.barrier()
+
+        def certified_merge(pass_id: int, target_k, expected_total):
+            """Merge without a row barrier, using the histogram's own total as proof.
+
+            Re-reads the bins and re-runs the bucket scan until the scan's total
+            equals the row's live cardinality.
+
+            The attempt cap is a liveness guard, not a recovery: a row that reaches
+            it settles its digit from an incomplete histogram and returns a wrong
+            answer that nothing catches, because no caller inspects the result.
+            Reaching the cap means a bug elsewhere.
+            """
+            load_global_histogram(pass_id, coherent=True)
+            choose_bucket_prefix(target_k)
+            spins = c_zero
+            while (s_meta[fx.Int32(SMEM_META_TOTAL)] != expected_total) & (
+                spins < fx.Int32(CERTIFICATE_MAX_SPINS)
+            ):
+                rocdl.s_sleep(SPIN_SLEEP)
+                load_global_histogram(pass_id, coherent=True)
+                choose_bucket_prefix(target_k)
+                spins = spins + c_one
+
+        def flush_local_histogram(pass_id: int):
+            for hist_idx in range(tid_idx, c_bins_idx, c_block_idx):
+                hist_i32 = fx.Int32(hist_idx)
+                count = s_hist[hist_i32]
+                if count != c_zero:
+                    fx.atomic_add(
+                        ws_ptr(histogram_slot(pass_id, hist_i32)),
+                        count,
+                        syncscope=_AGENT,
+                    )
+            # s_hist is read here and written by load_global_histogram, which follows
+            # with no barrier of its own on the certified path -- the uncertified one
+            # has the row barrier in between. Without this, a thread still walking its
+            # bins reads back the merged global counts a faster thread has already
+            # stored over them and adds those to the histogram instead of its own.
+            gpu.barrier()
+
+        def load_global_histogram(pass_id: int, coherent: bool = False):
+            # Vectorized reload. `coherent` bypasses the caches, which the
+            # certificate's re-read needs and nothing else does: a barrier has
+            # already made the histogram visible everywhere it is read after one.
+            n_vec = num_buckets // LOAD_VEC
+            c_nvec_idx = fx.Index(n_vec)
+            for grp in range(tid_idx, c_nvec_idx, c_block_idx):
+                base_bin = fx.Int32(grp) * c_vec
+                vec = fx.Vector(
+                    buffer_ops.buffer_load(
+                        workspace_rsrc,
+                        histogram_slot(pass_id, base_bin),
+                        vec_width=LOAD_VEC,
+                        dtype=T.i32,
+                        cache_modifier=CACHE_BYPASS_L1_L2 if coherent else 0,
+                    )
+                )
+                for j in range_constexpr(LOAD_VEC):
+                    total = vec[j]
+                    fx.memref_store(total, s_hist, base_bin + fx.Int32(j))
+            gpu.barrier()
+
+        def over_chunk(col_base, body):
+            """Run `body(j, col_base + j)` on each element of the vec inside the row.
+
+            A chunk wholly inside the row, which is every chunk but the last,
+            skips the per-element bounds test.
+            """
+            if col_base + c_vec <= row_len:
+                for j in range_constexpr(LOAD_VEC):
+                    body(j, col_base + fx.Int32(j))
+            else:
+                for j in range_constexpr(LOAD_VEC):
+                    col_i32 = col_base + fx.Int32(j)
+                    if col_i32 < row_len:
+                        body(j, col_i32)
+
+        def process_loaded_scan_vec(
+            col_base,
+            vec,
+            pass_id: int,
+            start_bit: int,
+            previous_start_bit: int,
+            current_bits,
+        ):
+            def body(j, col_i32):
+                val = vec[j]
+                key = radix_twiddle_key(val)
+                matches_prefix = True
+                if const_expr(pass_id != 0):
+                    matches_prefix = (
+                        prefix_for_key(key, previous_start_bit) == current_bits
+                    )
+                if matches_prefix:
+                    fx.atomic_add(
+                        hist_ptr + bucket_for_key(key, start_bit),
+                        c_one,
+                        syncscope=_WORKGROUP,
+                    )
+
+            over_chunk(col_base, body)
+
+        def compact_scan_append_tile(
+            col_base, vecs, start_bit: int, previous_start_bit: int, current_bits
+        ):
+            """Histogram this tile and append its candidates in column order.
+
+            A candidate is any element ranking at or above pass 0's digit, not only
+            the ties: the elements strictly better are already in the top-k and the
+            emit still has to place them, so a buffer of ties alone would lose them.
+            Only the ties feed the next histogram.
+
+            The emit reads this buffer back in column order, so the append must
+            preserve it. That is why each thread takes `COMPACT_FILL_VECS`
+            *contiguous* vec-loads rather than a strided share -- one scan over
+            per-thread totals orders candidates by thread, and only a contiguous
+            share makes thread order the same thing as column order.
+            """
+            biased_current = current_bits ^ c_sign_bit
+            keeps = []
+            n_keep = c_zero
+            for v in range_constexpr(COMPACT_FILL_VECS):
+                vec = vecs[v]
+                for j in range_constexpr(LOAD_VEC):
+                    col_i32 = col_base + fx.Int32(v * LOAD_VEC + j)
+                    # Bound by the run, not the row: the tile count is rounded up to
+                    # whole blocks, so the last tile of a part reaches past its run
+                    # into the next part's columns, which would append and histogram
+                    # them twice.
+                    in_run = col_i32 < run_col_hi
+                    val = vec[j]
+                    key = radix_twiddle_key(val)
+                    prefix = prefix_for_key(key, previous_start_bit)
+                    keep = in_run.select(
+                        ((prefix ^ c_sign_bit) <= biased_current).select(c_one, c_zero),
+                        c_zero,
+                    )
+                    if (prefix == current_bits) & in_run:
+                        fx.atomic_add(
+                            hist_ptr + bucket_for_key(key, start_bit),
+                            c_one,
+                            syncscope=_WORKGROUP,
+                        )
+                    keeps.append((col_i32, key, keep))
+                    n_keep = n_keep + keep
+
+            carried = s_run[fx.Int32(SMEM_RUN_COMPACT_COUNT)]
+
+            def publish_next_carry(tile_total):
+                total = carried + tile_total
+                fx.memref_store(total, s_run, fx.Int32(SMEM_RUN_COMPACT_COUNT))
+                if total > part_slice_cap:
+                    fx.memref_store(c_one, s_run, fx.Int32(SMEM_RUN_COMPACT_SPILLED))
+
+            my_excl = block_exclusive_scan_i32(n_keep, wave0_last=publish_next_carry)
+            slot = part_slice_base + carried + my_excl
+            for col_i32, key, keep in keeps:
+                if (keep == c_one) & (slot < part_slice_end):
+                    buffer_ops.buffer_store(
+                        col_i32, scratch_rsrc, compact_col_slot(slot)
+                    )
+                    buffer_ops.buffer_store(key, scratch_rsrc, compact_key_slot(slot))
+                slot = slot + keep
+
+        def scan_vec_block(
+            vblk, pass_id: int, start_bit: int, previous_start_bit: int, current_bits
+        ):
+            col_base = fx.Int32(vblk) * c_vec
+            process_loaded_scan_vec(
+                col_base,
+                load_row_vec(col_base),
+                pass_id,
+                start_bit,
+                previous_start_bit,
+                current_bits,
+            )
+
+        def staged_scan_vec_blocks(
+            vblk,
+            pass_id: int,
+            start_bit: int,
+            previous_start_bit: int,
+            current_bits,
+            stride_idx=None,
+        ):
+            stride_idx = stride_idx or active_stride_idx
+            strides = [fx.Index(0), stride_idx()]
+            cols_v = [fx.Int32(vblk + s) * c_vec for s in strides]
+            vecs = [load_row_vec(cb) for cb in cols_v]
+            for cb, vc in zip(cols_v, vecs):
+                process_loaded_scan_vec(
+                    cb, vc, pass_id, start_bit, previous_start_bit, current_bits
+                )
+
+        # Bins each thread owns when reducing a whole histogram. num_buckets is
+        # 1024 or 2048 against 1024 threads, so this divides exactly.
+        bins_per_thread = num_buckets // block_threads
+
+        def save_own_histogram():
+            """Copy this workgroup's histogram before the row-wide merge."""
+            for i in range_constexpr(bins_per_thread):
+                bin_i32 = tid + fx.Int32(i * block_threads)
+                fx.memref_store(s_hist[bin_i32], s_own_hist, bin_i32)
+
+        def accumulate_run_counts(pass_id: int, chosen_bucket):
+            """Fold s_own_hist lower bins into this run's selected/tied totals."""
+            if ~single_part_active:
+                mine = c_zero
+                for i in range_constexpr(bins_per_thread):
+                    bin_i32 = tid + fx.Int32(i * block_threads)
+                    count = s_own_hist[bin_i32]
+                    mine = mine + (bin_i32 < chosen_bucket).select(count, c_zero)
+                _, run_total = block_exclusive_scan_i32(
+                    mine, leading_barrier=True, with_total=True
+                )
+                if tid == c_zero:
+                    carried = (
+                        c_zero
+                        if const_expr(pass_id == 0)
+                        else s_run[fx.Int32(SMEM_RUN_SELECTED)]
+                    )
+                    fx.memref_store(
+                        carried + run_total, s_run, fx.Int32(SMEM_RUN_SELECTED)
+                    )
+                    # The early stop emits after the pass before the last, taking
+                    # that pass's whole bucket as the ties.
+                    if const_expr(
+                        pass_id == num_passes - 1
+                        or (ordered_early_stop and pass_id == num_passes - 2)
+                    ):
+                        fx.memref_store(
+                            s_own_hist[chosen_bucket], s_run, fx.Int32(SMEM_RUN_TIED)
+                        )
+                gpu.barrier()
+
+        def ordered_classify(col_base, vec, col_hi, kth_bits, key_mask=None):
+            """Classify one loaded vec-block vs the settled kth key.
+
+            A `key_mask` that clears the unsettled low bits compares key prefixes
+            instead, so every key in the boundary bucket counts as tied.
+            """
+            biased_kth = kth_bits ^ c_sign_bit
+            cols = []
+            n_selected = c_zero
+            n_tied = c_zero
+            for j in range_constexpr(LOAD_VEC):
+                col_i32 = col_base + fx.Int32(j)
+                val = vec[j]
+                key = radix_twiddle_key(val)
+                if const_expr(key_mask is not None):
+                    key = key & key_mask
+                in_run = col_i32 < col_hi
+                selected = in_run.select(
+                    ((key ^ c_sign_bit) < biased_kth).select(c_one, c_zero), c_zero
+                )
+                tied = in_run.select((key == kth_bits).select(c_one, c_zero), c_zero)
+                cols.append((col_i32, selected, tied))
+                n_selected = n_selected + selected
+                n_tied = n_tied + tied
+            return cols, n_selected, n_tied
+
+        def ordered_emit(
+            need, kth_bits, key_mask=None, barrier_token=emit_barrier_token
+        ):
+            """Write k ascending indices; ties on the kth value keep smallest column.
+
+            Under compact this emits both a buffer-sourced and a row-sourced placement
+            loop and gives the unused one zero trips, rather than branching around
+            them. Both would otherwise have to run the cross-part base exchange, and
+            that exchange contains a row barrier every part must reach exactly once.
+
+            The early stop passes, as runtime values, a mask of the bits its row has
+            settled and the token of the barriers that row actually reached.
+            """
+            assert short_rows_read_row or not (
+                compact and key_mask is not None
+            ), "early stop reads the row"
+            c_block_log2 = fx.Int32(int.bit_length(block_threads) - 1)
+            # Trip count is uniform across workgroups; tail runs predicate columns away.
+            row_steps_all = fx.Index(
+                (vblks_per_run + c_block_i32 - c_one).shrui(c_block_log2)
+            )
+            steps_idx = row_steps_all
+            if const_expr(compact):
+                # A part that overflowed its slice has no usable buffer, so it falls
+                # back to its row and the buffer loop is skipped; a part that fits
+                # skips the row.
+                spilled = s_run[fx.Int32(SMEM_RUN_COMPACT_SPILLED)] == c_one
+                steps_idx = spilled.select(fx.Int32(row_steps_all), c_zero)
+                steps_idx = fx.Index(steps_idx)
+            col_hi = run_col_hi
+            run_selected = s_run[fx.Int32(SMEM_RUN_SELECTED)]
+            run_tied = s_run[fx.Int32(SMEM_RUN_TIED)]
+
+            stages = ORDERED_STAGES
+            c_stage_idx = fx.Index(stages)
+            staged_limit_idx = steps_idx - fx.Index(stages - 1)
+
+            def stage_col_base(step_i32, stage: int):
+                return (
+                    run_first_vblk + (step_i32 + fx.Int32(stage)) * c_block_i32 + tid
+                ) * c_vec
+
+            def stage_loads(step_i32):
+                bases = [stage_col_base(step_i32, s) for s in range_constexpr(stages)]
+                return bases, [load_row_vec(b) for b in bases]
+
+            base_selected, base_tied = ordered_emit_bases(
+                run_selected, run_tied, barrier_token
+            )
+
+            # Phase 2: place.
+            def place_tile(col_base, vec):
+                cols, n_selected, n_tied = ordered_classify(
+                    col_base, vec, col_hi, kth_bits, key_mask
+                )
+                ordered_place(cols, n_selected, n_tied, base_selected, base_tied, need)
+
+            if const_expr(not compact):
+                for step_b, place_state in range(
+                    fx.Index(0), staged_limit_idx, c_stage_idx, init=[fx.Index(0)]
+                ):
+                    bases, vecs = stage_loads(fx.Int32(step_b))
+                    for s in range_constexpr(stages):
+                        place_tile(bases[s], vecs[s])
+                    place_results = yield [step_b + c_stage_idx]
+                for step_b, place_state in range(
+                    place_results, steps_idx, fx.Index(1), init=[c_zero]
+                ):
+                    col_base = stage_col_base(fx.Int32(step_b), 0)
+                    place_tile(col_base, load_row_vec(col_base))
+                    place_results = yield [place_state[0]]
+            else:
+                # Staging is dropped here: the trip count is usually zero, and a
+                # staged prologue would have to be predicated against that anyway.
+                for step_b, place_state in range(
+                    fx.Index(0), steps_idx, fx.Index(1), init=[c_zero]
+                ):
+                    col_base = stage_col_base(fx.Int32(step_b), 0)
+                    place_tile(col_base, load_row_vec(col_base))
+                    place_results = yield [place_state[0]]
+
+                count = s_run[fx.Int32(SMEM_RUN_COMPACT_COUNT)]
+                count_hi = part_slice_base + count
+                c_tile = c_block_i32 * c_vec
+                buf_steps = spilled.select(c_zero, (count + c_tile - c_one) // c_tile)
+                for step_b, buf_state in range(
+                    fx.Index(0), fx.Index(buf_steps), fx.Index(1), init=[c_zero]
+                ):
+                    entry_base = (
+                        part_slice_base + (fx.Int32(step_b) * c_block_i32 + tid) * c_vec
+                    )
+                    cols, n_selected, n_tied = compact_ordered_classify(
+                        entry_base, count_hi, kth_bits
+                    )
+                    ordered_place(
+                        cols, n_selected, n_tied, base_selected, base_tied, need
+                    )
+                    yield [buf_state[0]]
+
+        def ordered_emit_bases(run_selected, run_tied, barrier_token):
+            """Exclusive scan of selected/tied counts over the parts before this one."""
+            # Single-workgroup rows skip the cross-part exchange; bases stay zero.
+            if tid == c_zero:
+                fx.memref_store(c_zero, s_run, fx.Int32(SMEM_RUN_TILE_SELECTED))
+                fx.memref_store(c_zero, s_run, fx.Int32(SMEM_RUN_TILE_TIED))
+                if single_part_active:
+                    fx.memref_store(c_zero, s_run, fx.Int32(SMEM_RUN_PART_SELECTED))
+                    fx.memref_store(c_zero, s_run, fx.Int32(SMEM_RUN_PART_TIED))
+
+            exchange = ~single_part_active
+
+            if exchange:
+                if tid == c_zero:
+                    buffer_ops.buffer_store(
+                        run_selected,
+                        workspace_rsrc,
+                        counter_slot(COUNTER_ORDERED_ABOVE) + part,
+                    )
+                    buffer_ops.buffer_store(
+                        run_tied,
+                        workspace_rsrc,
+                        counter_slot(COUNTER_ORDERED_EQUAL) + part,
+                    )
+                row_barrier(barrier_token)
+                if wave == c_zero:
+                    in_runs = lane < active_parts
+                    lane_safe = in_runs.select(lane, c_zero)
+                    peer_selected = in_runs.select(
+                        ws_load(counter_slot(COUNTER_ORDERED_ABOVE) + lane_safe),
+                        c_zero,
+                    )
+                    peer_tied = in_runs.select(
+                        ws_load(counter_slot(COUNTER_ORDERED_EQUAL) + lane_safe),
+                        c_zero,
+                    )
+                    selected_incl = wave_inclusive_scan_i32(peer_selected)
+                    tied_incl = wave_inclusive_scan_i32(peer_tied)
+                    if lane == part:
+                        fx.memref_store(
+                            selected_incl - peer_selected,
+                            s_run,
+                            fx.Int32(SMEM_RUN_PART_SELECTED),
+                        )
+                        fx.memref_store(
+                            tied_incl - peer_tied, s_run, fx.Int32(SMEM_RUN_PART_TIED)
+                        )
+            gpu.barrier()
+            return (
+                s_run[fx.Int32(SMEM_RUN_PART_SELECTED)],
+                s_run[fx.Int32(SMEM_RUN_PART_TIED)],
+            )
+
+        def ordered_place(cols, n_selected, n_tied, base_selected, base_tied, need):
+            """Place one classified tile at its column-ordered output positions."""
+            packed_excl, packed_total = block_exclusive_scan_i32(
+                (n_selected << 16) + n_tied, leading_barrier=True, with_total=True
+            )
+            carried_selected = s_run[fx.Int32(SMEM_RUN_TILE_SELECTED)]
+            carried_tied = s_run[fx.Int32(SMEM_RUN_TILE_TIED)]
+            gpu.barrier()
+
+            my_selected = (
+                base_selected + carried_selected + packed_excl.shrui(fx.Int32(16))
+            )
+            my_tied = base_tied + carried_tied + (packed_excl & fx.Int32(0xFFFF))
+            for col_i32, selected, tied in cols:
+                accepted = (my_tied < need).select(my_tied, need)
+                out_pos = my_selected + accepted
+                keep = selected + tied * (my_tied < need).select(c_one, c_zero)
+                if (keep == c_one) & (out_pos < c_top_k):
+                    buffer_ops.buffer_store(col_i32, indices_rsrc, row_out + out_pos)
+                my_selected = my_selected + selected
+                my_tied = my_tied + tied
+
+            if tid == c_zero:
+                fx.memref_store(
+                    carried_selected + packed_total.shrui(fx.Int32(16)),
+                    s_run,
+                    fx.Int32(SMEM_RUN_TILE_SELECTED),
+                )
+                fx.memref_store(
+                    carried_tied + (packed_total & fx.Int32(0xFFFF)),
+                    s_run,
+                    fx.Int32(SMEM_RUN_TILE_TIED),
+                )
+            gpu.barrier()
+
+        def unordered_place(cols, n_selected, n_tied, need):
+            """Place one classified tile, reserving its output range in one atomic.
+
+            The counters stay global and per-row, which is what lets parts emit
+            without agreeing on who owns which slot; the tile scans its own counts
+            so only the block total costs an atomic.
+
+            Winners and ties share one scan as high and low halves. That is safe
+            because a tile holds at most block_threads * LOAD_VEC * ORDERED_STAGES
+            of either, far inside 16 bits -- raising any of the three has to be
+            checked against that bound.
+            """
+            packed_excl, packed_total = block_exclusive_scan_i32(
+                (n_selected << 16) + n_tied, leading_barrier=True, with_total=True
+            )
+            if tid == c_zero:
+                fx.memref_store(
+                    fx.atomic_add(
+                        ws_ptr(counter_slot(COUNTER_OUT_FRONT)),
+                        packed_total.shrui(fx.Int32(16)),
+                        syncscope=_AGENT,
+                    ),
+                    s_run,
+                    fx.Int32(SMEM_RUN_TILE_SELECTED),
+                )
+                fx.memref_store(
+                    fx.atomic_add(
+                        ws_ptr(counter_slot(COUNTER_OUT_BACK)),
+                        packed_total & fx.Int32(0xFFFF),
+                        syncscope=_AGENT,
+                    ),
+                    s_run,
+                    fx.Int32(SMEM_RUN_TILE_TIED),
+                )
+            gpu.barrier()
+            my_selected = s_run[fx.Int32(SMEM_RUN_TILE_SELECTED)] + packed_excl.shrui(
+                fx.Int32(16)
+            )
+            my_tied = s_run[fx.Int32(SMEM_RUN_TILE_TIED)] + (
+                packed_excl & fx.Int32(0xFFFF)
+            )
+            for col_i32, selected, tied in cols:
+                if (selected == c_one) & (my_selected < c_top_k):
+                    buffer_ops.buffer_store(
+                        col_i32, indices_rsrc, row_out + my_selected
+                    )
+                if (tied == c_one) & (my_tied < need):
+                    buffer_ops.buffer_store(
+                        col_i32, indices_rsrc, row_out + c_top_k - c_one - my_tied
+                    )
+                my_selected = my_selected + selected
+                my_tied = my_tied + tied
+
+        def unordered_emit(need, kth_bits):
+            """Row walk for the unordered emit, over a uniform number of tiles.
+
+            The block scan inside is a barrier every thread must reach, so every
+            thread runs the same tile count and `col_hi` predicates the tail away,
+            as in `ordered_emit`.
+            """
+            stages = ORDERED_STAGES
+            tile_stride = active_threads * fx.Int32(stages)
+            tiles_i32 = (vec_blocks_i32 + tile_stride - c_one) // tile_stride
+            for tile, place_state in range(
+                fx.Index(0), fx.Index(tiles_i32), fx.Index(1), init=[c_zero]
+            ):
+                # The whole tile is classified under one scan, so the staging also
+                # amortises the scan and the atomic over `stages` times the columns.
+                tile_first = global_vec_tid + fx.Int32(tile) * tile_stride
+                spans = []
+                for s in range_constexpr(stages):
+                    vblk_i32 = tile_first + fx.Int32(s) * active_threads
+                    in_row = vblk_i32 < vec_blocks_i32
+                    spans.append(
+                        (
+                            in_row.select(vblk_i32 * c_vec, c_zero),
+                            in_row.select(row_len, c_zero),
+                        )
+                    )
+                vecs = [load_row_vec(col_base) for col_base, _ in spans]
+                cols = []
+                n_selected = c_zero
+                n_tied = c_zero
+                for (col_base, col_hi), vec in zip(spans, vecs):
+                    stage_cols, stage_selected, stage_tied = ordered_classify(
+                        col_base, vec, col_hi, kth_bits
+                    )
+                    cols = cols + stage_cols
+                    n_selected = n_selected + stage_selected
+                    n_tied = n_tied + stage_tied
+                unordered_place(cols, n_selected, n_tied, need)
+                yield [place_state[0]]
+
+        global_vec_tid = part * c_block_i32 + tid
+        global_vec_tid_idx = fx.Index(global_vec_tid)
+        vec_blocks_i32 = (row_len + c_vec - c_one).shrui(fx.Int32(LOAD_VEC_LOG2))
+        vec_blocks_idx = fx.Index(vec_blocks_i32)
+
+        # ordered=True: one contiguous vec-block range per workgroup.
+        vblks_per_run = (vec_blocks_i32 + active_parts - c_one) // active_parts
+        run_first_vblk = part * vblks_per_run
+        run_last_vblk = run_first_vblk + vblks_per_run
+        run_end_vblk = (run_last_vblk < vec_blocks_i32).select(
+            run_last_vblk, vec_blocks_i32
+        )
+        run_end_col = run_end_vblk * c_vec
+        run_col_hi = (run_end_col < row_len).select(run_end_col, row_len)
+        run_first_idx = fx.Index(run_first_vblk)
+        run_end_idx = fx.Index(run_end_vblk)
+
+        # Compact: each part appends only into its own equal slice of the candidate
+        # buffer. Parts own ascending column runs, so slice order is column order and
+        # the emit needs no cross-part compaction step -- each part reads back exactly
+        # the slice it wrote.
+        part_slice_cap = fx.Int32(compact_cap) // active_parts if compact else c_zero
+        part_slice_base = part * part_slice_cap if compact else c_zero
+        part_slice_end = part_slice_base + part_slice_cap if compact else c_zero
+
+        def compact_ordered_classify(entry_base, count_hi, kth_bits):
+            """Classify LOAD_VEC consecutive candidates against the settled kth key."""
+            biased_kth = kth_bits ^ c_sign_bit
+            cols = []
+            n_selected = c_zero
+            n_tied = c_zero
+            for j in range_constexpr(LOAD_VEC):
+                entry = entry_base + fx.Int32(j)
+                in_buf = entry < count_hi
+                # Clamp rather than predicate the load: out-of-slice entries would
+                # otherwise read a neighbouring part's candidates.
+                safe = in_buf.select(entry, part_slice_base)
+                col_i32 = scratch_load(compact_col_slot(safe))
+                key = scratch_load(compact_key_slot(safe))
+                selected = in_buf.select(
+                    ((key ^ c_sign_bit) < biased_kth).select(c_one, c_zero), c_zero
+                )
+                tied = in_buf.select((key == kth_bits).select(c_one, c_zero), c_zero)
+                cols.append((col_i32, selected, tied))
+                n_selected = n_selected + selected
+                n_tied = n_tied + tied
+            return cols, n_selected, n_tied
+
+        def compact_steps_idx():
+            """Tile count over a part's run, uniform across threads.
+
+            The append block-scans, so every thread has to reach every barrier the
+            same number of times. A tid-keyed loop bound would not; this walks a
+            uniform trip count and predicates the tail columns away instead.
+            """
+            per_tile = c_block_i32 * fx.Int32(COMPACT_FILL_VECS)
+            return fx.Index((vblks_per_run + per_tile - c_one) // per_tile)
+
+        def compact_fill(start_bit: int, previous_start_bit: int, current_bits):
+            """Scan the row once more, this time also writing the candidates out."""
+            if tid == c_zero:
+                fx.memref_store(c_zero, s_run, fx.Int32(SMEM_RUN_COMPACT_COUNT))
+                fx.memref_store(c_zero, s_run, fx.Int32(SMEM_RUN_COMPACT_SPILLED))
+            gpu.barrier()
+
+            steps_idx = compact_steps_idx()
+            c_fill_span = fx.Int32(COMPACT_FILL_VECS) * c_vec
+            for step_b, fill_state in range(
+                fx.Index(0), steps_idx, fx.Index(1), init=[c_zero]
+            ):
+                col_base = (
+                    run_first_vblk * c_vec
+                    + (fx.Int32(step_b) * c_block_i32 + tid) * c_fill_span
+                )
+                vecs = [
+                    load_row_vec(col_base + fx.Int32(v * LOAD_VEC))
+                    for v in range_constexpr(COMPACT_FILL_VECS)
+                ]
+                compact_scan_append_tile(
+                    col_base,
+                    vecs,
+                    start_bit,
+                    previous_start_bit,
+                    current_bits,
+                )
+                yield [fill_state[0]]
+
+            gpu.barrier()
+
+        def compact_rescan(
+            pass_id: int, start_bit: int, previous_start_bit: int, current_bits
+        ):
+            """Histogram this part's candidates, or its row if the slice overflowed.
+
+            Both loops are always emitted and the unused one is given zero trips, so
+            that a part which spilled and a part which did not stay in lockstep at
+            the barrier that follows.
+            """
+            spilled = s_run[fx.Int32(SMEM_RUN_COMPACT_SPILLED)] == c_one
+            count = spilled.select(c_zero, s_run[fx.Int32(SMEM_RUN_COMPACT_COUNT)])
+            for entry, rescan_state in range(
+                fx.Index(part_slice_base + tid),
+                fx.Index(part_slice_base + count),
+                c_block_idx,
+                init=[c_zero],
+            ):
+                key = scratch_load(compact_key_slot(fx.Int32(entry)))
+                if prefix_for_key(key, previous_start_bit) == current_bits:
+                    fx.atomic_add(
+                        hist_ptr + bucket_for_key(key, start_bit),
+                        c_one,
+                        syncscope=_WORKGROUP,
+                    )
+                yield [rescan_state[0]]
+
+            row_stop = spilled.select(fx.Int32(run_end_idx), fx.Int32(run_first_idx))
+            for vblk, fallback_state in range(
+                run_first_idx + tid_idx,
+                fx.Index(row_stop),
+                scan_run_stride_idx(),
+                init=[c_zero],
+            ):
+                scan_vec_block(
+                    vblk, pass_id, start_bit, previous_start_bit, current_bits
+                )
+                yield [fallback_state[0]]
+            gpu.barrier()
+
+        def compact_write_entries(local_k, kth_bits):
+            """Unordered last-pass emit over this part's candidate slice.
+
+            The buffer holds everything ranking at or above pass 0's digit, which is
+            why this never looks at the row again. Parts partition the row and both
+            output counters are global, so no part needs to know what another wrote.
+
+            A part that overflowed its slice walks its run instead. Both loops are
+            always emitted with the unused one given zero trips, and both step by
+            whole tiles: `unordered_place` scans the block, and a scan is a barrier
+            every thread must reach the same number of times. `spilled` is
+            row-uniform within a part, which is what keeps the two trip counts
+            block-uniform even when one is zero.
+            """
+            spilled = s_run[fx.Int32(SMEM_RUN_COMPACT_SPILLED)] == c_one
+            count = spilled.select(c_zero, s_run[fx.Int32(SMEM_RUN_COMPACT_COUNT)])
+            count_hi = part_slice_base + count
+            c_tile = c_block_i32 * c_vec
+            buf_steps = spilled.select(c_zero, (count + c_tile - c_one) // c_tile)
+            for step_b, write_state in range(
+                fx.Index(0), fx.Index(buf_steps), fx.Index(1), init=[c_zero]
+            ):
+                entry_base = (
+                    part_slice_base + (fx.Int32(step_b) * c_block_i32 + tid) * c_vec
+                )
+                cols, n_selected, n_tied = compact_ordered_classify(
+                    entry_base, count_hi, kth_bits
+                )
+                unordered_place(cols, n_selected, n_tied, local_k)
+                yield [write_state[0]]
+
+            c_block_log2 = fx.Int32(int.bit_length(block_threads) - 1)
+            row_steps = spilled.select(
+                (vblks_per_run + c_block_i32 - c_one).shrui(c_block_log2), c_zero
+            )
+            for step_b, fallback_state in range(
+                fx.Index(0), fx.Index(row_steps), fx.Index(1), init=[c_zero]
+            ):
+                col_base = (
+                    run_first_vblk + fx.Int32(step_b) * c_block_i32 + tid
+                ) * c_vec
+                cols, n_selected, n_tied = ordered_classify(
+                    col_base, load_row_vec(col_base), run_col_hi, kth_bits
+                )
+                unordered_place(cols, n_selected, n_tied, local_k)
+                yield [fallback_state[0]]
+
+        def early_classify(col_base, vec, col_hi, previous_start_bit: int, kth_bits):
+            """Classify one loaded vec-block against the previous pass's prefix.
+
+            The boundary bucket is taken whole, so `prefix <= kth_bits` is exactly
+            the top-k and nothing ties. The bias makes the DSL's signed compare
+            answer the unsigned one, as `ordered_classify` does, and the arms are
+            swapped because the test is the complement of a `<`.
+            """
+            biased_kth = kth_bits ^ c_sign_bit
+            cols = []
+            n_selected = c_zero
+            for j in range_constexpr(LOAD_VEC):
+                col_i32 = col_base + fx.Int32(j)
+                val = vec[j]
+                prefix = prefix_for_key(radix_twiddle_key(val), previous_start_bit)
+                above = biased_kth < (prefix ^ c_sign_bit)
+                selected = (col_i32 < col_hi).select(
+                    above.select(c_zero, c_one), c_zero
+                )
+                cols.append((col_i32, selected, c_zero))
+                n_selected = n_selected + selected
+            return cols, n_selected
+
+        def early_write_all(previous_start_bit: int, kth_bits, need):
+            # Same tiled walk and block scan as `unordered_emit`, which is what
+            # keeps the scan's barrier at a uniform trip count and costs one atomic
+            # per tile rather than one per winner -- the winners are exactly top_k,
+            # so a per-winner atomic would scale with k.
+            stages = ORDERED_STAGES
+            tile_stride = active_threads * fx.Int32(stages)
+            tiles_i32 = (vec_blocks_i32 + tile_stride - c_one) // tile_stride
+            for tile, place_state in range(
+                fx.Index(0), fx.Index(tiles_i32), fx.Index(1), init=[c_zero]
+            ):
+                tile_first = global_vec_tid + fx.Int32(tile) * tile_stride
+                spans = []
+                for s in range_constexpr(stages):
+                    vblk_i32 = tile_first + fx.Int32(s) * active_threads
+                    in_row = vblk_i32 < vec_blocks_i32
+                    spans.append(
+                        (
+                            in_row.select(vblk_i32 * c_vec, c_zero),
+                            in_row.select(row_len, c_zero),
+                        )
+                    )
+                vecs = [load_row_vec(col_base) for col_base, _ in spans]
+                cols = []
+                n_selected = c_zero
+                for (col_base, col_hi), vec in zip(spans, vecs):
+                    stage_cols, stage_selected = early_classify(
+                        col_base, vec, col_hi, previous_start_bit, kth_bits
+                    )
+                    cols = cols + stage_cols
+                    n_selected = n_selected + stage_selected
+                unordered_place(cols, n_selected, c_zero, need)
+                yield [place_state[0]]
+
+        def scan_pass(
+            pass_id: int, current_k, current_bits, barrier_token: int, current_len
+        ):
+            start_bit = max(32 - (pass_id + 1) * BITS_PER_PASS, 0)
+            previous_start_bit = max(32 - pass_id * BITS_PER_PASS, 0)
+
+            clear_local_histogram()
+            if const_expr(compact and pass_id == compact_fill_pass):
+                if const_expr(short_rows_read_row):
+                    # A short row keeps no buffer, as the host decides for a launch
+                    # whose rows are all short: it marks itself spilled, which sends
+                    # the rescans and the emit back to the row.
+                    if row_len <= fx.Int32(short_max):
+                        if tid == c_zero:
+                            fx.memref_store(
+                                c_zero, s_run, fx.Int32(SMEM_RUN_COMPACT_COUNT)
+                            )
+                            fx.memref_store(
+                                c_one, s_run, fx.Int32(SMEM_RUN_COMPACT_SPILLED)
+                            )
+                        row_scan(pass_id, start_bit, previous_start_bit, current_bits)
+                    else:
+                        compact_fill(start_bit, previous_start_bit, current_bits)
+                else:
+                    compact_fill(start_bit, previous_start_bit, current_bits)
+            elif const_expr(compact and pass_id > compact_fill_pass):
+                compact_rescan(pass_id, start_bit, previous_start_bit, current_bits)
+            else:
+                row_scan(pass_id, start_bit, previous_start_bit, current_bits)
+            return finish_pass(
+                pass_id, current_k, current_bits, barrier_token, current_len
+            )
+
+        def row_scan(
+            pass_id: int, start_bit: int, previous_start_bit: int, current_bits
+        ):
+            """Histogram this part's share of the row."""
+            scan_step_idx = scan_run_stride_idx if ordered else active_stride_idx
+            scan_start_idx = run_first_idx + tid_idx if ordered else global_vec_tid_idx
+            scan_stop_idx = run_end_idx if ordered else vec_blocks_idx
+            # Two loads in flight per step; the loop below takes the odd one out.
+            unroll_limit_idx = scan_stop_idx - scan_step_idx()
+            staged_stride_idx = scan_step_idx(2)
+            for vblk, pass_state in range(
+                scan_start_idx,
+                unroll_limit_idx,
+                staged_stride_idx,
+                init=[scan_start_idx],
+            ):
+                staged_scan_vec_blocks(
+                    vblk,
+                    pass_id,
+                    start_bit,
+                    previous_start_bit,
+                    current_bits,
+                    scan_step_idx,
+                )
+                pass_results = yield [vblk + staged_stride_idx]
+            for vblk, pass_state in range(
+                pass_results,
+                scan_stop_idx,
+                scan_step_idx(),
+                init=[c_zero],
+            ):
+                scan_vec_block(
+                    vblk, pass_id, start_bit, previous_start_bit, current_bits
+                )
+                pass_results = yield [pass_state[0]]
+            gpu.barrier()
+
+        def finish_pass(
+            pass_id: int, current_k, current_bits, barrier_token: int, current_len
+        ):
+            """Merge the pass histogram, settle its digit, and emit on the last one.
+
+            Separate from scan_pass because the compact passes reach it after reading
+            the candidate buffer rather than the row; everything from the merge on is
+            the same work either way.
+            """
+            start_bit = max(32 - (pass_id + 1) * BITS_PER_PASS, 0)
+
+            merged_locally = single_part_active
+            certified = certified_pass(pass_id)
+
+            if merged_locally:
+                choose_bucket_prefix(current_k)
+            if ~merged_locally:
+                if const_expr(ordered):
+                    save_own_histogram()
+                flush_local_histogram(pass_id)
+                # A certified pass proves the merge finished instead of waiting to
+                # be told, so it takes neither the barrier nor the read-back after
+                # it -- certified_merge does its own, uncached.
+                if const_expr(certified):
+                    certified_merge(pass_id, current_k, current_len)
+                if const_expr(not certified):
+                    row_barrier(barrier_token)
+                    load_global_histogram(pass_id)
+                    choose_bucket_prefix(current_k)
+
+            chosen_bucket = s_meta[fx.Int32(SMEM_META_THRESHOLD)]
+            if const_expr(ordered):
+                accumulate_run_counts(pass_id, chosen_bucket)
+            next_k = s_meta[fx.Int32(SMEM_META_K)]
+            next_len = s_meta[fx.Int32(SMEM_META_LEN)]
+            next_bits = current_bits | fx.Int32(chosen_bucket << start_bit)
+            if const_expr(pass_id == num_passes - 1):
+                if const_expr(ordered_early_stop):
+                    pass  # the driver emits once for both of its exits
+                elif const_expr(ordered):
+                    ordered_emit(next_k, next_bits)
+                elif const_expr(compact and pass_id > compact_fill_pass):
+                    compact_write_entries(next_k, next_bits)
+                else:
+                    unordered_emit(next_k, next_bits)
+            return next_k, next_len, next_bits
+
+        def one_workgroup_short_tier():
+            # Part 0 selects the whole row alone and emits unordered. Its keys ascend
+            # (`ordered_key`), the reverse of `radix_twiddle_key`, so the two never mix.
+            c_shift = fx.Int32(32 - 11)
+            c_mid_shift = fx.Int32(10)
+            c_bin_mask = fx.Int32((1 << 11) - 1)
+            c_low_mask = fx.Int32((1 << 10) - 1)
+            c_bin_bits = fx.Int32(11)
+            c_low_bits = fx.Int32(10)
+
+            def ordered_key(val):
+                # The arithmetic shift broadcasts the sign, so the mask flips only
+                # the sign bit of a positive value and every bit of a negative one.
+                # An unsigned compare of two keys then orders the floats, which is
+                # what makes the histogram's bins ascend.
+                # The same NaN rotation as `radix_twiddle_key`, mirrored.
+                bits = val.bitcast(fx.Int32)
+                return (bits ^ ((bits >> 31) | c_sign_bit)) - c_nan_turn
+
+            def signed_key(val):
+                # `ordered_key` biased by the sign bit, so a *signed* compare
+                # answers the same ordering. Keep the two in step: the scatter
+                # compares this against a threshold assembled from digits the
+                # histogram produced under `ordered_key`.
+                return ordered_key(val) ^ c_sign_bit
+
+            def ordered_bucket(val):
+                return ordered_key(val).shrui(c_shift)
+
+            def radix_bucket(val, shift, mask):
+                return ordered_key(val).shrui(shift) & mask
+
+            def clear_hist():
+                for h in range(tid_idx, c_bins_idx, c_block_idx):
+                    fx.memref_store(c_zero, s_hist, fx.Int32(h))
+                gpu.barrier()
+
+            def choose_threshold(target_k, above_slot, threshold_slot, len_slot=None):
+                # Hierarchical inclusive block scan over the 2048-bin histogram;
+                # each thread owns the contiguous bin pair (2*tid, 2*tid+1). The
+                # kth-largest boundary is the first bucket whose inclusive prefix
+                # passes ``K' = total - target_k`` (excl <= K' < incl).
+                two_tid = tid * fx.Int32(2)
+                c0 = s_hist[two_tid]
+                c1 = s_hist[two_tid + c_one]
+                excl0, total = block_exclusive_scan_i32(c0 + c1, with_total=True)
+                kprime = total - target_k
+                incl0 = excl0 + c0
+                incl1 = incl0 + c1
+
+                def emit_find(b, excl, incl):
+                    crosses = (excl <= kprime) & (incl > kprime)
+                    if crosses:
+                        fx.memref_store(b, s_meta, threshold_slot)
+                        fx.memref_store(total - incl, s_meta, above_slot)
+                        if const_expr(len_slot is not None):
+                            fx.memref_store(incl - excl, s_meta, len_slot)
+
+                emit_find(two_tid, excl0, incl0)
+                emit_find(two_tid + c_one, incl0, incl1)
+                gpu.barrier()
+
+            if tid == c_zero:
+                for meta_slot in range_constexpr(8):
+                    fx.memref_store(c_zero, s_meta, fx.Int32(meta_slot))
+            gpu.barrier()
+
+            # Per-chunk bodies for the three radix passes plus the final scatter.
+            # Each takes the chunk's first column index and its already-loaded
+            # vec4 and feeds a fresh HBM load through the exact same logic.
+            def hist_pass1_chunk(col_base, vec):
+                def body(j, col_i32):
+                    val = vec[j]
+                    fx.atomic_add(
+                        hist_ptr + ordered_bucket(val), c_one, syncscope=_WORKGROUP
+                    )
+
+                over_chunk(col_base, body)
+
+            def hist_pass2_chunk(col_base, vec, first_threshold):
+                def body(j, col_i32):
+                    val = vec[j]
+                    if ordered_bucket(val) == first_threshold:
+                        fx.atomic_add(
+                            hist_ptr + radix_bucket(val, c_mid_shift, c_bin_mask),
+                            c_one,
+                            syncscope=_WORKGROUP,
+                        )
+
+                over_chunk(col_base, body)
+
+            def hist_pass3_chunk(col_base, vec, high_mid_prefix):
+                def body(j, col_i32):
+                    val = vec[j]
+                    key = ordered_key(val)
+                    if key.shrui(c_mid_shift) == high_mid_prefix:
+                        fx.atomic_add(
+                            hist_ptr + (key & c_low_mask), c_one, syncscope=_WORKGROUP
+                        )
+
+                over_chunk(col_base, body)
+
+            def final_scatter_chunk(col_base, vec, kth_signed, num_needed):
+                def body(j, col_i32):
+                    val = vec[j]
+                    key = signed_key(val)
+                    strictly_above = key > kth_signed
+                    at_boundary = key == kth_signed
+                    if strictly_above:
+                        pos = fx.atomic_add(
+                            meta_ptr + SMEM_META_SHORT_FRONT_COUNT,
+                            c_one,
+                            syncscope=_WORKGROUP,
+                        )
+                        buffer_ops.buffer_store(col_i32, indices_rsrc, row_out + pos)
+                    if at_boundary:
+                        back = fx.atomic_add(
+                            meta_ptr + SMEM_META_SHORT_BACK_COUNT,
+                            c_one,
+                            syncscope=_WORKGROUP,
+                        )
+                        if back < num_needed:
+                            out_pos = c_top_k - c_one - back
+                            buffer_ops.buffer_store(
+                                col_i32, indices_rsrc, row_out + out_pos
+                            )
+
+                over_chunk(col_base, body)
+
+            # Reread driver: stream the whole valid row from HBM once per pass.
+            # This keeps the short tier's VGPR footprint low while sharing the
+            # same per-chunk logic across radix passes and final scatter.
+            def reread_pass(chunk_fn):
+                for vblk in range(
+                    tid_idx,
+                    vec_blocks_idx,
+                    c_block_idx,
+                ):
+                    col_base = fx.Int32(vblk) * c_vec
+                    chunk_fn(col_base, load_row_vec(col_base))
+
+            # Pass 1: high 11 bits over the whole valid row.
+            clear_hist()
+            reread_pass(lambda cb, v: hist_pass1_chunk(cb, v))
+            gpu.barrier()
+            choose_threshold(
+                c_top_k,
+                fx.Int32(SMEM_META_SHORT_FIRST_ABOVE),
+                fx.Int32(SMEM_META_SHORT_FIRST_THRESHOLD),
+                fx.Int32(SMEM_META_SHORT_FIRST_LEN) if short_early_stop else None,
+            )
+            first_threshold = s_meta[fx.Int32(SMEM_META_SHORT_FIRST_THRESHOLD)]
+            # A boundary bucket holding exactly the count still needed ends the
+            # selection: every key from the bucket's first one up is top k and none
+            # ties, so the scatter takes the key below it and no boundary slots.
+            # That first key is never zero, since the short tier has row_len > top_k.
+            # The test reads LDS after the scan's barrier, so the workgroup agrees
+            # and the barriers in the passes it skips stay uniform.
+            never = c_one == c_zero
+            first_settled = never
+            kth_signed = c_zero
+            num_needed = c_zero
+            if const_expr(short_early_stop):
+                need_after_first = (
+                    c_top_k - s_meta[fx.Int32(SMEM_META_SHORT_FIRST_ABOVE)]
+                )
+                first_settled = (
+                    s_meta[fx.Int32(SMEM_META_SHORT_FIRST_LEN)] == need_after_first
+                )
+                kth_signed = ((first_threshold << c_shift) ^ c_sign_bit) - c_one
+            if ~first_settled:
+                # Pass 2: mid 11 bits within the high boundary bucket.
+                clear_hist()
+                reread_pass(lambda cb, v: hist_pass2_chunk(cb, v, first_threshold))
+                gpu.barrier()
+                if const_expr(not short_early_stop):
+                    need_after_first = (
+                        c_top_k - s_meta[fx.Int32(SMEM_META_SHORT_FIRST_ABOVE)]
+                    )
+                choose_threshold(
+                    need_after_first,
+                    fx.Int32(SMEM_META_SHORT_SECOND_ABOVE),
+                    fx.Int32(SMEM_META_SHORT_SECOND_THRESHOLD),
+                    fx.Int32(SMEM_META_SHORT_SECOND_LEN) if short_early_stop else None,
+                )
+                second_threshold = s_meta[fx.Int32(SMEM_META_SHORT_SECOND_THRESHOLD)]
+                # Bits 10..31 of the key that pass 3 must match, assembled once so
+                # the scan compares one field instead of two digits.
+                high_mid_prefix = (first_threshold << c_bin_bits) | second_threshold
+                second_settled = never
+                if const_expr(short_early_stop):
+                    need_after_second = (
+                        need_after_first
+                        - s_meta[fx.Int32(SMEM_META_SHORT_SECOND_ABOVE)]
+                    )
+                    second_settled = (
+                        s_meta[fx.Int32(SMEM_META_SHORT_SECOND_LEN)]
+                        == need_after_second
+                    )
+                    kth_signed = ((high_mid_prefix << c_low_bits) ^ c_sign_bit) - c_one
+                if ~second_settled:
+                    # Pass 3: low 10 bits within the high+mid boundary.
+                    clear_hist()
+                    reread_pass(lambda cb, v: hist_pass3_chunk(cb, v, high_mid_prefix))
+                    gpu.barrier()
+                    if const_expr(not short_early_stop):
+                        need_after_second = (
+                            need_after_first
+                            - s_meta[fx.Int32(SMEM_META_SHORT_SECOND_ABOVE)]
+                        )
+                    choose_threshold(
+                        need_after_second,
+                        fx.Int32(SMEM_META_SHORT_THIRD_ABOVE),
+                        fx.Int32(SMEM_META_SHORT_THIRD_THRESHOLD),
+                    )
+                    third_threshold = s_meta[fx.Int32(SMEM_META_SHORT_THIRD_THRESHOLD)]
+                    third_above = s_meta[fx.Int32(SMEM_META_SHORT_THIRD_ABOVE)]
+                    num_needed = need_after_second - third_above
+                    # The three settled digits are the three fields of one key.
+                    # Biasing it the way `signed_key` biases an element turns the
+                    # scatter's ranking test into a single compare.
+                    kth_signed = (
+                        (high_mid_prefix << c_low_bits) | third_threshold
+                    ) ^ c_sign_bit
+
+            # Final phase: direct atomic-append write (LDS counters only).
+            reread_pass(
+                lambda cb, v: final_scatter_chunk(cb, v, kth_signed, num_needed)
+            )
+
+        # Direct-fill: rows with row_len <= top_k (part 0 only) emit identity indices + -1.
+        direct_fill = row_len <= c_top_k
+        direct_fill_active = (part == c_zero) & direct_fill
+        direct_fill_iters = direct_fill_active.select(fx.Index(top_k), fx.Index(0))
+        for out_col in range(tid_idx, direct_fill_iters, c_block_idx):
+            out_col_i32 = fx.Int32(out_col)
+            valid = out_col_i32 < row_len
+            out_val = valid.select(out_col_i32, fx.Int32(-1))
+            buffer_ops.buffer_store(out_val, indices_rsrc, row_out + out_col_i32)
+
+        if const_expr(short_tier):
+            short_active = short_row & (part == c_zero) & (row_len > c_top_k)
+            if short_active:
+                one_workgroup_short_tier()
+            if const_expr(short_tier_by_len):
+                persistent_active = (
+                    (row_len > c_top_k) & (part < active_parts) & (~short_active)
+                )
+            else:
+                persistent_active = (
+                    (row_len > c_top_k) & (part < active_parts) & (~single_part_active)
+                )
+        else:
+            persistent_active = (row_len > c_top_k) & (part < active_parts)
+
+        if persistent_active:
+            local_k = c_top_k
+            local_len = row_len
+            kth_bits = c_zero
+            if early_stop:
+                # `early` is read off the row's merged histogram, so every block on
+                # the row computes the same value and they skip the last pass
+                # together. Nothing here may make it block-local: where the
+                # certificate is off that last pass carries a row_barrier, and a row
+                # whose blocks disagreed about reaching it would hang.
+                for pass_id in range_constexpr(num_passes - 1):
+                    local_k, local_len, kth_bits = scan_pass(
+                        pass_id,
+                        local_k,
+                        kth_bits,
+                        barrier_token_for(pass_id),
+                        local_len,
+                    )
+                last_pass = num_passes - 1
+                settled_bit = max(32 - last_pass * BITS_PER_PASS, 0)
+                early = local_len == local_k
+                if const_expr(compact):
+                    # Row-uniform, so the row's blocks still agree on `early`.
+                    early = early & (row_len <= fx.Int32(short_max))
+                if const_expr(not ordered):  # noqa: SIM102 - constexpr guard
+                    if early:
+                        early_write_all(settled_bit, kth_bits, local_k)
+                if ~early:
+                    local_k, local_len, kth_bits = scan_pass(
+                        last_pass,
+                        local_k,
+                        kth_bits,
+                        barrier_token_for(last_pass),
+                        local_len,
+                    )
+                if const_expr(ordered):
+                    # Both exits share this emit; the key mask and the barrier
+                    # token tell it which pass settled the row.
+                    ordered_emit(
+                        local_k,
+                        kth_bits,
+                        early.select(fx.Int32(-(1 << settled_bit)), fx.Int32(-1)),
+                        early.select(
+                            fx.Int32(barrier_token_for(last_pass)),
+                            fx.Int32(emit_barrier_token),
+                        ),
+                    )
+            else:
+                for pass_id in range_constexpr(num_passes):
+                    local_k, local_len, kth_bits = scan_pass(
+                        pass_id,
+                        local_k,
+                        kth_bits,
+                        barrier_token_for(pass_id),
+                        local_len,
+                    )
+
+            # Leave the row's control slots zero for the next launch. A one-part
+            # row touched only the emit's output counters. On a multi-part row the
+            # last part out clears the row: every peer arrives only after its last
+            # use of the slots, so nothing lands behind the clear.
+            gpu.barrier()
+            if single_part_active:
+                if tid == c_zero:
+                    for counter in (COUNTER_OUT_FRONT, COUNTER_OUT_BACK):
+                        buffer_ops.buffer_store(
+                            c_zero, workspace_rsrc, counter_slot(counter)
+                        )
+            else:
+                if tid == c_zero:
+                    arrived = fx.atomic_add(
+                        ws_ptr(counter_slot(COUNTER_EXIT)),
+                        c_one,
+                        syncscope=_AGENT,
+                        ordering=fx.AtomicOrdering.Monotonic,
+                    )
+                    fx.memref_store(arrived, s_meta, fx.Int32(SMEM_META_EXIT))
+                gpu.barrier()
+                if s_meta[fx.Int32(SMEM_META_EXIT)] == active_parts - c_one:
+                    if tid == c_zero:
+                        ws_poll(counter_slot(COUNTER_EXIT), fx.AtomicOrdering.Acquire)
+                    gpu.barrier()
+                    for slot in range(
+                        tid_idx, fx.Index(CONTROL_ROW_SLOTS), c_block_idx
+                    ):
+                        buffer_ops.buffer_store(
+                            c_zero, workspace_rsrc, row_ws_base + fx.Int32(slot)
+                        )
+
+    @flyc.jit
+    def launcher(
+        logits: fx.Tensor,
+        next_n: fx.Int32,
+        seq_lens: fx.Tensor,
+        row_starts: fx.Tensor,
+        indices: fx.Tensor,
+        control: fx.Tensor,
+        scratch: fx.Tensor,
+        num_rows: fx.Int32,
+        width: fx.Int32,
+        stride0: fx.Int32,
+        stride1: fx.Int32,
+        stream: fx.Stream,
+    ) -> None:
+        grid_y = fx.Index(num_rows)
+        topk_per_row_decode_adaptive_kernel(
+            logits,
+            next_n,
+            seq_lens,
+            row_starts,
+            indices,
+            control,
+            scratch,
+            stride0,
+            width,
+        ).launch(
+            grid=(blocks_per_row, grid_y, 1),
+            block=(block_threads, 1, 1),
+            stream=stream,
+        )
+
+    return launcher
