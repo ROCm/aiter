@@ -35,7 +35,7 @@ def load_driver(path: str):
     sig = [
         ("sm_attach_v1", [u32, vp, vp, vp, vp, vp, C.c_char_p, C.c_char_p, C.POINTER(vp)]),
         ("sm_bind_new_v1", [vp, vp, C.POINTER(vp)]), ("sm_launch_blk_v1", [vp, vp, vp, vp, vp]),
-        ("sm_blk_free_v1", [vp]), ("sm_info_v1", [vp]), ("sm_poison_v1", [vp, vp]), ("sm_last_hip_error_v1", [vp]),
+        ("sm_blk_free_v1", [vp]), ("sm_free_v1", [vp]), ("sm_poison_fast_v1", [vp, vp, C.POINTER(u32)]), ("sm_info_v1", [vp]), ("sm_poison_v1", [vp, vp]), ("sm_last_hip_error_v1", [vp]),
     ]
     for n, a in sig:
         f = getattr(lib, n)
@@ -66,6 +66,24 @@ class SmallContext:
 
     def __init__(self, lib, ctx):
         self.lib, self.ctx = lib, ctx
+        self.blks = []
+
+    def poison_fast(self, stream=None) -> int:
+        """Cheap per-step host check: 4-byte D2H of the poison word + stream sync (not capture-safe; call outside capture)."""
+        v = C.c_uint32()
+        rc = self.lib.sm_poison_fast_v1(self.ctx, stream if stream is not None else C.c_void_p(None), C.byref(v))
+        if rc != OK:
+            raise RuntimeError(f"sm_poison_fast rc={rc}")
+        return v.value
+
+    def close(self):
+        """L-5: free every binding block, then P/modules/context. After a device sync, before comm teardown. Idempotent."""
+        if self.ctx:
+            for b in self.blks:
+                self.lib.sm_blk_free_v1(b)
+            self.blks.clear()
+            self.lib.sm_free_v1(self.ctx)
+            self.ctx = None
 
     def poison(self) -> int:
         v = C.c_uint32()
@@ -81,6 +99,7 @@ class SmallContext:
         rc = self.lib.sm_bind_new_v1(self.ctx, C.byref(sb), C.byref(blk))
         if rc != OK:
             raise RuntimeError(f"sm_bind_new rc={rc}")
+        self.blks.append(blk)
         return blk
 
     def launch(self, blk, A_ptr: int, W_ptr: int, stream):

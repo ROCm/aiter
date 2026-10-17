@@ -323,3 +323,56 @@ def test_reset_order_with_drain_hook():
     d.barrier = lambda group=None: ev2.append("barrier")
     r2.quiesce_and_reset()
     assert ev2 == ["sync", "barrier", "zero", "sync", "barrier"]
+
+
+def test_release_runs_close_hooks_before_comm_teardown_and_poison_or():
+    be, d = FakeBackend(), FakeDist()
+    r = FusionResources(0, 4, dist=d, backend=be)
+    r.ensure("p", [WindowReq("a", 100, "p2p_window")])
+    r.finalize()
+    seen = []
+    r.set_close("p", lambda: seen.append(("close", len(be.log))))
+    r.set_poison("p", lambda: 0)
+    r.set_poison("q", lambda: 6)
+    assert r.poison_local() == 6
+    n_before = len(be.log)
+    r.release()
+    assert seen and seen[0][0] == "close"
+    tail = [x[0] for x in be.log[n_before:]]
+    assert tail.index("sync") < tail.index("devdestroy") < tail.index("dereg") < tail.index("commdestroy")
+    assert seen[0][1] == n_before + 1  # exactly after the leading device sync, before devcomm/window/comm teardown
+
+
+def test_logger_capture_independent_of_propagate():
+    """The dispatch log must be observable when aiter's logger has propagate=False (real aiter) -- same mechanism as the framework test."""
+    parent = logging.getLogger("aiter")
+    old = parent.propagate
+    parent.propagate = False
+    try:
+        got = []
+
+        class _H(logging.Handler):
+            def emit(self, rec):
+                got.append(rec.getMessage())
+
+        lg = logging.getLogger("aiter.gemm_fusion")
+        h = _H(level=logging.INFO)
+        lg.addHandler(h)
+        lg.setLevel(logging.INFO)
+        lg.info("event=dispatch probe")
+        lg.removeHandler(h)
+        assert got == ["event=dispatch probe"]
+    finally:
+        parent.propagate = old
+
+
+def test_cpp_h1_h3_l5_present():
+    base = os.path.join(jit.CSRC, "host")
+    sm = open(os.path.join(base, "sm_fusion_driver.cpp"), encoding="utf-8").read()
+    lg = open(os.path.join(base, "lg_fusion_driver.cpp"), encoding="utf-8").read()
+    assert "own_ctx" in sm and "g_swap_mu" in sm and "single-thread contract" in sm  # H-1
+    assert "sm_free_v1" in sm and "sm_poison_fast_v1" in sm                            # L-5 / poison
+    assert "sm_image_matches(hsaco_path, expected_hsaco_sha256_hex)" in lg             # H-3
+    assert lg.index("sm_image_matches") < lg.index("hipModuleLoad")                    # gate before any module action
+    assert "lg_free_v1" in lg and "lg_poison_v1" in lg
+    assert os.path.exists(os.path.join(base, "sha256_image.hpp"))

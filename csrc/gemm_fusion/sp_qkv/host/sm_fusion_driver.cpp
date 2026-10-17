@@ -9,8 +9,24 @@
 //      (windows+epoch); each owns its device-resident SmDev block. A and W are passed per launch (as kernargs, like Phase-1).
 //   D3 sm_info_v1: exports Rx/control byte sizes so the runtime sizes windows from the compiled geometry.
 #include "driver_sm.cpp"
+#include <mutex>
+#include <thread>
+#include <unordered_map>
 
 namespace {
+// H-1: bind/launch temporarily swap fields of the shared Ctx. Contract: ONE host thread per Ctx (the model-runner thread). Enforced:
+// the first thread that touches a Ctx owns it; any other thread gets E_STATE (never a silent race). The mutex additionally makes the
+// swap atomic w.r.t. a second thread that nevertheless got past the owner check (defence in depth; e.g. owner migration after free).
+std::mutex g_ctx_mu;
+std::unordered_map<const void*, std::thread::id> g_ctx_owner;
+bool own_ctx(const void* c) {
+    std::lock_guard<std::mutex> lk(g_ctx_mu);
+    auto it = g_ctx_owner.find(c);
+    if (it == g_ctx_owner.end()) { g_ctx_owner.emplace(c, std::this_thread::get_id()); return true; }
+    if (it->second != std::this_thread::get_id()) { std::fprintf(stderr, "SM_FUSION rc=FAIL ctx used from a second host thread (single-thread contract, H-1)\n"); return false; }
+    return true;
+}
+std::mutex g_swap_mu;
 struct Blk { SmDev* dblk = nullptr; SmBindingV1 b{}; };
 bool bind_ok(Ctx* c, const SmBindingV1* b) {
     // identical checks to sm_bind_v1
@@ -58,7 +74,9 @@ int32_t sm_attach_v1(uint32_t rank, void* comm, void* rwin, void* rlocal, void* 
 int32_t sm_bind_new_v1(void* ctx, const SmBindingV1* b, void** out_blk) {
     auto* c = static_cast<Ctx*>(ctx); if (!c || !b || !out_blk) return E_ARG;
     *out_blk = nullptr;
+    if (!own_ctx(c)) return E_STATE;
     if (!bind_ok(c, b)) return E_ARG;
+    std::lock_guard<std::mutex> swap_lk(g_swap_mu);
     SmBindingV1 saved_b = c->b; bool saved_bound = c->bound; SmDev* saved_dblk = c->dblk;
     c->b = *b; c->dblk = nullptr;
     const int32_t rc = build_dev_block(c);
@@ -71,6 +89,8 @@ int32_t sm_bind_new_v1(void* ctx, const SmBindingV1* b, void** out_blk) {
 // Enqueue sm_gemm then RAN on `stream` for this binding (capturable by torch.cuda.graph: plain kernel launches).
 int32_t sm_launch_blk_v1(void* ctx, void* blk_, const void* A, const void* W, void* stream) {
     auto* c = static_cast<Ctx*>(ctx); auto* blk = static_cast<Blk*>(blk_); if (!c || !blk || !blk->dblk) return E_STATE;
+    if (!own_ctx(c)) return E_STATE;
+    std::lock_guard<std::mutex> swap_lk(g_swap_mu);
     SmBindingV1 saved_b = c->b; SmDev* saved_dblk = c->dblk;
     c->b = blk->b; c->b.A = A; c->b.W = W; c->dblk = blk->dblk;
     const hipError_t e = enqueue(c, static_cast<hipStream_t>(stream));
@@ -88,5 +108,26 @@ int32_t sm_info_v1(uint64_t* out7) {
     if (!out7) return E_ARG;
     out7[0] = RX_BYTES; out7[1] = SM_C_BYTES; out7[2] = SM_N; out7[3] = SM_F; out7[4] = RAN_GRID; out7[5] = SM_RAN_THREADS; out7[6] = SM_GEMM_NTILES;
     return OK;
+}
+// L-5: release everything this driver allocated for a context (P partials, modules, the Ctx itself). Call after hipDeviceSynchronize,
+// after every binding of this ctx was freed with sm_blk_free_v1, and BEFORE ccoCommDestroy. The windows belong to the runtime.
+int32_t sm_free_v1(void* ctx) {
+    auto* c = static_cast<Ctx*>(ctx); if (!c) return E_ARG;
+    if (hipSetDevice(c->rank) != hipSuccess) return E_HIP;
+    if (c->P) hipFree(c->P);
+    if (c->dblk) hipFree(c->dblk);
+    if (c->dbg) hipFree(c->dbg);
+    if (c->mg) hipModuleUnload(c->mg);
+    if (c->mr) hipModuleUnload(c->mr);
+    { std::lock_guard<std::mutex> lk(g_ctx_mu); g_ctx_owner.erase(c); }
+    delete c;
+    return OK;
+}
+// Poison word (u32 at SM_C_POISON of the control window): 4-byte D2H on `stream` + stream sync (cheap; the legacy sm_poison_v1 is a blocking hipMemcpy).
+int32_t sm_poison_fast_v1(void* ctx, void* stream, uint32_t* out) {
+    auto* c = static_cast<Ctx*>(ctx); if (!c || !out) return E_ARG;
+    const hipStream_t s = static_cast<hipStream_t>(stream);
+    if (hipMemcpyAsync(out, static_cast<uint8_t*>(c->clocal) + SM_C_POISON, 4, hipMemcpyDeviceToHost, s) != hipSuccess) return E_HIP;
+    return hipStreamSynchronize(s) == hipSuccess ? OK : E_HIP;
 }
 }

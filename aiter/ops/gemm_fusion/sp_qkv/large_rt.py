@@ -20,7 +20,11 @@ def load_driver(path: str):
     lib = C.CDLL(path)
     vp, u32, u64, i32 = C.c_void_p, C.c_uint32, C.c_uint64, C.c_int32
     lib.lg_attach_v1.restype = vp
-    lib.lg_attach_v1.argtypes = [u32, u32, vp, vp, vp, vp, vp, vp, vp, vp, C.c_char_p, u32]
+    lib.lg_attach_v1.argtypes = [u32, u32, vp, vp, vp, vp, vp, vp, vp, vp, C.c_char_p, C.c_char_p, u32]
+    lib.lg_free_v1.restype = i32
+    lib.lg_free_v1.argtypes = [vp]
+    lib.lg_poison_v1.restype = i32
+    lib.lg_poison_v1.argtypes = [vp, vp, C.POINTER(u32)]
     lib.lg_window_bytes_v1.restype = u64
     lib.lg_window_bytes_v1.argtypes = [u32]
     lib.lg_info_v1.restype = i32
@@ -73,3 +77,18 @@ class LargeContext:
 
     def recv_ptr(self) -> int:
         return int(self.lib.lg_comm_R_ptr(self.h))
+
+    def poison(self, stream=None) -> int:
+        """Cheap per-step host check: 4-byte D2H of the poison word on `stream` (null = default stream) + that stream's sync.
+        NOT capture-safe (host sync): call outside graph capture, e.g. once per model step."""
+        v = C.c_uint32()
+        rc = self.lib.lg_poison_v1(self.h, stream if stream is not None else C.c_void_p(None), C.byref(v))
+        if rc != 0:
+            raise RuntimeError(f"lg_poison rc={rc}")
+        return int(v.value)
+
+    def close(self):
+        """L-5: unload the module and free the context (after a device sync, before comm teardown). Idempotent."""
+        if self.h:
+            self.lib.lg_free_v1(self.h)
+            self.h = None

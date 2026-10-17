@@ -112,10 +112,25 @@ def test_exact_match_and_dispatch_log(tmp_path, reg, caplog):
     reg("v.full", ("sp_exchange", "head_norm_rope_cache"))
     s = mkspec()
     p = write_prof(tmp_path, [row(s.signature(), 16, "v.full", sk=3)])
-    with caplog.at_level(logging.INFO, logger="aiter.gemm_fusion"):
+    # The real aiter logger sets propagate=False (aiter/__init__.py), so caplog (root handler) never sees child records:
+    # capture "aiter.gemm_fusion" explicitly with our own handler, independent of the aiter logging convention/level.
+    records = []
+
+    class _H(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    lg = logging.getLogger("aiter.gemm_fusion")
+    h, old_level = _H(level=logging.INFO), lg.level
+    lg.addHandler(h)
+    lg.setLevel(logging.INFO)
+    try:
         plan, n = match_prefix(s, CTX(16), p)
+    finally:
+        lg.removeHandler(h)
+        lg.setLevel(old_level)
     assert n == 2 and plan.vid == "v.full" and plan.params == {"sk": 3}
-    assert any("event=dispatch" in r.message and "vid=v.full" in r.message for r in caplog.records)
+    assert any("event=dispatch" in r.getMessage() and "vid=v.full" in r.getMessage() for r in records)
     # exact rows only: other M -> native
     assert match_prefix(s, CTX(32), p) == (None, 0)
 

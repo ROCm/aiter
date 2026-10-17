@@ -27,6 +27,7 @@ from aiter.gemm_fusion.resources import round_up
 from . import large_rt as lrt
 from . import specs
 from .jit import build_large, large_defs
+from .small_rt import stream_handle
 
 _F = {"dense": 2304, "indexer": 2560, "reuse": 2304}
 LG_R_PAD = 4096
@@ -98,10 +99,12 @@ class SpQkvLarge(Plan):
 
             S, R, Cw = wins[self.owner + "/S"], wins[self.owner + "/R"], wins[self.owner + "/C"]
             h = lib.lg_attach_v1(res.rank, self.M, C.c_void_p(res.comm), C.c_void_p(res.devcomm), C.c_void_p(S.handle), C.c_void_p(S.local),
-                                 C.c_void_p(R.handle), C.c_void_p(R.local), C.c_void_p(Cw.handle), C.c_void_p(Cw.local), built.hsaco.encode(), 1)
+                                 C.c_void_p(R.handle), C.c_void_p(R.local), C.c_void_p(Cw.handle), C.c_void_p(Cw.local), built.hsaco.encode(), built.hsaco_sha256.encode(), 1)  # H-3: C++ exact-image gate
             if not h:
-                raise RuntimeError("lg_attach_v1 failed")
+                raise RuntimeError("lg_attach_v1 failed (image hash gate / topology / module load)")
             got = sc[self.owner] = lrt.LargeContext(lib, C.c_void_p(h), self.M, self.F, res.rank)
+            res.set_close(self.owner, got.close)  # L-5
+            res.set_poison(self.owner, lambda c=got: c.poison(stream_handle(None)))  # cheap per-step check on the CURRENT torch stream (4-byte D2H + that stream sync)
             res.set_drain(self.owner, lambda c=got: c.drain_all(C.c_void_p(None)))  # A2-H: quietQueue on all peer queues before any reset
             res.set_init(self.owner, got.init_control)  # epoch=1 + magic; re-run after every reset
         self._ctx = got
@@ -141,4 +144,5 @@ class SpQkvLarge(Plan):
         return torch.as_strided(base, (4 * self.M, 2560), (2304, 1))
 
     def poison(self, res) -> int:
-        return int(self._context(res).report()["poison"])
+        """Cheap host read of the device poison word (4-byte D2H on the current torch stream + that stream sync). Outside capture only; all-reduce MAX across ranks, then res.quiesce_and_reset()."""
+        return self._context(res).poison(stream_handle(None))

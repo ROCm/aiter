@@ -133,6 +133,8 @@ class FusionResources:
         self.windows: Dict[str, Dict[str, Window]] = {}  # owner -> name -> Window
         self._init_hooks: Dict[str, Callable[[], None]] = {}  # owner -> control-block initializer (re-run after every zeroing)
         self._drain_hooks: Dict[str, Callable[[], None]] = {}  # owner -> pre-reset SDMA drain
+        self._close_hooks: Dict[str, Callable[[], None]] = {}  # owner -> free host/driver objects (L-5), run at release()
+        self._poison_hooks: Dict[str, Callable[[], int]] = {}  # owner -> cheap poison word read (host, outside capture)
         self.finalized = False
         self._released = False
         self._init_comm()
@@ -185,6 +187,23 @@ class FusionResources:
         complete, with a device sync, on EVERY rank before any window is zeroed). Small-M plans have no SDMA queues: no hook."""
         self._drain_hooks[owner] = fn
 
+    def set_close(self, owner: str, fn: Callable[[], None]):
+        """Register the owner's teardown (free binding blocks, P, modules, driver ctx). Runs in release() after a device sync
+        and BEFORE devcomm/window/comm teardown (L-5)."""
+        self._close_hooks[owner] = fn
+
+    def set_poison(self, owner: str, fn: Callable[[], int]):
+        self._poison_hooks[owner] = fn
+
+    def poison_local(self) -> int:
+        """OR of every plan's device poison word on THIS rank (cheap: a 4-byte D2H + stream sync per plan; NOT capture-safe,
+        call outside graph capture, e.g. once per model step). The caller must all-reduce(MAX) across ranks before deciding on
+        the collective quiesce_and_reset (a poison on any rank requires recovery on all)."""
+        p = 0
+        for fn in self._poison_hooks.values():
+            p |= int(fn())
+        return p
+
     def peers(self, win: Window) -> List[int]:
         return [self.backend.peer_ptr(self.comm, win.local, p) for p in range(self.world)]
 
@@ -227,6 +246,12 @@ class FusionResources:
             return
         self._released = True
         self.backend.device_sync(self.device)
+        for fn in self._close_hooks.values():  # L-5: free Blk / P / modules / driver ctx before any comm teardown
+            fn()
+        self._close_hooks.clear()
+        self._poison_hooks.clear()
+        self._drain_hooks.clear()
+        self._init_hooks.clear()
         self._barrier()
         if self.devcomm is not None:
             self.backend.devcomm_destroy(self.comm, self.devcomm)

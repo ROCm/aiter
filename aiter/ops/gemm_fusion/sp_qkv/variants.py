@@ -100,8 +100,12 @@ class SpQkvSmall(Plan):
             rc = lib.sm_attach_v1(res.rank, res.comm, rx.handle, rx.local, ct.handle, ct.local,
                                   built.gemm_hsaco.encode(), built.ran_hsaco.encode(), C.byref(h))
             if rc != 0:
+                if h.value:  # driver keeps a quarantined ctx on failure (Phase-1 convention); free it, never use it
+                    rt.SmallContext(lib, h).close()
                 raise RuntimeError(f"sm_attach rc={rc}")
             got = sc[self.owner] = rt.SmallContext(lib, h)
+            res.set_close(self.owner, got.close)  # L-5: frees Blk, P, modules, ctx before comm teardown
+            res.set_poison(self.owner, lambda c=got: c.poison_fast(rt.stream_handle(None)))  # cheap per-step check on the CURRENT torch stream (4-byte D2H + that stream sync)
         self._ctx = got
         return got
 
@@ -179,3 +183,11 @@ class SpQkvSmall(Plan):
 
 
 from . import variants_large  # noqa: E402,F401  (registers sp_qkv.large.v1)
+
+
+def _small_poison(self, res) -> int:
+    """Cheap host read of the device poison word (4-byte D2H on the current torch stream + that stream sync). Outside capture only; all-reduce MAX across ranks, then res.quiesce_and_reset()."""
+    return self._context(res).poison_fast(rt.stream_handle(None))
+
+
+SpQkvSmall.poison = _small_poison
