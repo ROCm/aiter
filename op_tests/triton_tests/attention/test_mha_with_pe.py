@@ -52,6 +52,8 @@ def test_mha_with_pe(
     skip_if_gluon_unsupported(
         backend,
         dropout_p=DROPOUT,
+        head_dim=HEAD_SZ_QK,
+        v_head_dim=HEAD_SZ_V,
     )
 
     # TODO: Enable these test cases once this is fixed
@@ -133,6 +135,8 @@ def test_mha_varlen_with_pe(
     skip_if_gluon_unsupported(
         backend,
         dropout_p=DROPOUT,
+        head_dim=HEAD_SZ_QK,
+        v_head_dim=HEAD_SZ_V,
     )
 
     # TODO: Enable these test cases once this is fixed

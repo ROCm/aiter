@@ -1,18 +1,11 @@
 import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
-from triton.language.core import PropagateNan
 from triton.language.core import _aggregate as aggregate
 
+from aiter.ops.triton._gluon_kernels.common.utils import elementwise_max_prop_nan
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.common_utils import strip_annotate
-
-_MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
-
-
-@gluon.jit
-def elementwise_max_prop_nan(a, b):
-    return gl.maximum(a, b, propagate_nan=_MAX_PROPAGATE_NAN_ALL)
 
 
 @gluon.jit
