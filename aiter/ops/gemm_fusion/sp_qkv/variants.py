@@ -7,7 +7,7 @@ plan.run(x, x_scale, w, w_scale, outs, meta, res, stream) contract (small):
   x        fp8 [Ml, K] row-major (Ml = local tokens), w fp8 preshuffled (16,16) [N, K], x_scale fp32 [Ml,1], w_scale fp32 [N]
   outs     {"q": bf16 [T,16,128]; dense/reuse: "k","v": bf16 [T,1,128]; indexer: "index_q": bf16 [T,1,128]}
   meta     {"q_norm_w","k_norm_w" (fp32 [128]); "cos_cache","sin_cache" (bf16 [max_pos,32]); "positions","slot_mapping" (int64 [T]);
-            "k_cache","v_cache","k_scale","v_scale" (golden SHUFFLE page16 fp8 caches + fp32 scales);
+            "k_cache","v_cache","k_scale","v_scale" (golden SHUFFLE fp8 caches + fp32 scales; page = 128 dense, 16 indexer/reuse, per case_config.cache_page_size);
             indexer only: "index_q_norm_w","index_k_norm_w" (fp32 [128]), "index_cache" (fp8 flat page128)}
   Binding (one device-resident SmDev block) is created lazily on the first run() with a given set of pointers; this MUST
   happen outside graph capture (call plan.prepare(...) from before_graph_capture/bind_kv_cache). Pointers (scales, outs,

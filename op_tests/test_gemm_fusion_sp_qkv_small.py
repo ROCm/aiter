@@ -376,3 +376,67 @@ def test_cpp_h1_h3_l5_present():
     assert lg.index("sm_image_matches") < lg.index("hipModuleLoad")                    # gate before any module action
     assert "lg_free_v1" in lg and "lg_poison_v1" in lg
     assert os.path.exists(os.path.join(base, "sha256_image.hpp"))
+
+
+# ---- exact golden CaseSpec cross-check (case_config.py is importable without torch/GPU) ----
+def _golden_case_config():
+    import importlib.util
+
+    cands = [os.environ.get("SP4_GOLDEN_DIR", "")] + [
+        os.path.abspath(os.path.join(os.path.dirname(__file__), *([".."] * n), "sp4-attention-fusion-cases-20261009")) for n in (2, 3)
+    ]
+    for d in cands:
+        p = os.path.join(d, "case_config.py") if d else ""
+        if p and os.path.isfile(p):
+            spec = importlib.util.spec_from_file_location("golden_case_config", p)
+            m = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(m)
+            return m
+    return None
+
+
+def test_specs_match_actual_golden_casespec_for_every_cell():
+    """Page size / N / F / local M come from the REAL golden CaseSpec (dense page128, indexer+reuse page16); a fake
+    cache_page_size must not be able to mask the dense row (Evidence V0 finding)."""
+    cc = _golden_case_config()
+    if cc is None:
+        pytest.skip("golden case_config.py not found (set SP4_GOLDEN_DIR)")
+    mode_map = {"qkv_dense": "dense", "qkv_indexer": "indexer", "qkv_indexer_reuse": "reuse"}
+    profmod.clear_profile_cache()
+    prof = profmod.load_profile(PROFILE)
+    seen = 0
+    for gmode, mode in mode_map.items():
+        for T in (64, 128, 8192, 16384, 32768):
+            case = cc.CaseSpec(gmode, T)
+            sp = specs.sp_qkv_spec(mode)
+            hn = sp.stages[1]
+            assert hn.kv_cache == f"shuffle_page{case.cache_page_size}_fp8_ptok", (gmode, T)
+            assert sp.gemm.n == case.gemm_nk[0] and sp.gemm.k == case.gemm_nk[1], (gmode, T)
+            f_exch = sum(x.width // x.shards for x in sp.stages[0].fields if x.name not in sp.stages[0].drop)
+            golden_f = case.describe()["exchange_shape"][1]  # 2304 dense, 2560 indexer AND reuse (the receiver sees a [T,2560] tensor)
+            assert golden_f == (2304 if mode == "dense" else 2560), (gmode, T)
+            # approved reuse transfer is COMPACT (q/k/v only, F=2304) and is presented to the receiver as a [T,2560] view with row stride 2304
+            assert f_exch == (2560 if mode == "indexer" else 2304), (gmode, T)
+            small = T in (64, 128)
+            full = sp if small else sp.prefix(1)  # small: GEMM+exchange+norm/rope/cache; large: GEMM+exchange only
+            row = prof.lookup(full.signature(), "gfx950", 256, 4, case.local_tokens)
+            assert row is not None, f"no profile row for {gmode} T={T} (page {case.cache_page_size})"
+            assert row.vid == ("sp_qkv.small.v1" if small else "sp_qkv.large.v1")
+            seen += 1
+    assert seen == 15
+    # the BlockSize the runtime derives for the binding equals the golden page
+    import re
+
+    for gmode, mode in mode_map.items():
+        case = cc.CaseSpec(gmode, 64)
+        assert int(re.search(r"page(\d+)", specs.sp_qkv_spec(mode).stages[1].kv_cache).group(1)) == case.cache_page_size
+
+
+def test_dense_page128_signature_differs_from_page16():
+    d = specs.sp_qkv_spec("dense")
+    assert d.stages[1].kv_cache == "shuffle_page128_fp8_ptok"
+    assert specs.sp_qkv_spec("indexer").stages[1].kv_cache == specs.sp_qkv_spec("reuse").stages[1].kv_cache == "shuffle_page16_fp8_ptok"
+    import dataclasses
+
+    wrong = type(d)(d.gemm, (d.stages[0], dataclasses.replace(d.stages[1], kv_cache="shuffle_page16_fp8_ptok")))
+    assert wrong.signature() != d.signature()  # a page16 dense spec must NOT hit the shipped dense row

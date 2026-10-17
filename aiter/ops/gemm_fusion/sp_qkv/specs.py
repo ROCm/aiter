@@ -14,7 +14,12 @@ from aiter.gemm_fusion.spec import FusionSpec, GemmSpec, HeadNormRopeCache, SPEx
 MODES = ("dense", "indexer", "reuse")
 WORLD = 4
 HIDDEN_K = 6144
-KV_PAGE_SHUFFLE = "shuffle_page16_fp8_ptok"
+# Golden case_config.cache_page_size = 16 if has_indexer else 128: dense -> page128; indexer AND reuse (N=9856) -> page16.
+KV_PAGE = {"dense": 128, "indexer": 16, "reuse": 16}
+
+
+def kv_cache_str(mode: str) -> str:
+    return f"shuffle_page{KV_PAGE[mode]}_fp8_ptok"
 
 
 def sp_qkv_spec(mode: str, world: int = WORLD, eps: float = 1e-6) -> FusionSpec:
@@ -35,7 +40,7 @@ def sp_qkv_spec(mode: str, world: int = WORLD, eps: float = 1e-6) -> FusionSpec:
         (
             SPExchange(world=world, fields=fields, drop=drop),
             HeadNormRopeCache(head_dim=128, q_heads=16, kv_heads=1, rotary_dim=64, eps=eps, numerics=num,
-                              kv_cache=KV_PAGE_SHUFFLE, index=idx),
+                              kv_cache=kv_cache_str(mode), index=idx),
         ),
     )
 

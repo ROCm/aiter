@@ -7,7 +7,7 @@
   },
   "rows": [
     {
-      "sig": "a5785b1dee0db51e",
+      "sig": "50b7acf9943802c2",
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
@@ -22,7 +22,7 @@
       "cell": "dense_T64"
     },
     {
-      "sig": "a5785b1dee0db51e",
+      "sig": "50b7acf9943802c2",
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
