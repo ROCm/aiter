@@ -231,3 +231,100 @@ def build_comm(tool: Dict[str, str] = None) -> str:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
     return so
+
+
+# ======================================================================= large-M (LG-QSDMA-r11)
+LARGE_SRC = "r11"
+
+
+@dataclass(frozen=True)
+class LargeBuild:
+    key: str
+    dir: str
+    hsaco: str
+    hsaco_sha256: str
+    driver_so: str
+
+
+def large_defs(params: dict, mode: str) -> List[str]:
+    """-D flags (identical on device and host where the host reads them). mode in {dense, indexer, reuse}: reuse uses the DENSE build
+    (LG_X_INDEXER=0, compact F=2304). params: no_gridread (0|1|2, default 1 = r11/r10 default). Everything else is the r11 recipe default."""
+    if mode not in ("dense", "indexer", "reuse"):
+        raise ValueError(f"mode {mode!r}")
+    allowed = {"plan", "n", "half_first", "quarter_first", "no_gridread"}
+    extra = set(params) - allowed
+    if extra:
+        raise ValueError(f"unknown large-M params {sorted(extra)}")
+    ng = int(params.get("no_gridread", 1))
+    if ng not in (0, 1, 2):
+        raise ValueError("no_gridread")
+    return [
+        f"-DLG_X_INDEXER={1 if mode == 'indexer' else 0}", f"-DLG_NO_GRIDREAD={ng}", "-DBUILD_CCO_SDMA=1", "-DLG_REMOTE_HALF=0",
+        "-DLG_R6_POSTER=1", "-DLG_R6_ARRIVAL_ACQ=0", "-DLG_X_FORCE_TIMEOUT_G1=0", "-DLG_X_FORCE_TIMEOUT_G0=0", "-DLG_R8_FOLD=0",
+        "-DLG_X_NEG_DOUBLE_PUT=0", "-DLG_X_POSTER_LAST=0", "-DLG_DEBUG_POSTCOUNT=0", "-DLG_NEGCTRL_NOCAS=0", "-DLG_L1C_SWIZZLE=0",
+        "-DLG_L2A_BYPASS=0", "-DLG_L2B_ONE_RELEASE=1", "-DLG_STAMPS=0", "-DLG_NEGCTRL_NOWB=0", "-DLG_NEGCTRL_NOWAIT=0", "-DLG_NEGCTRL_ISO=0", "-DLG_ISO_DELAY_ITERS=0",
+    ]
+
+
+def large_cache_key(defs: List[str], tool: Dict[str, str]) -> str:
+    h = hashlib.sha256()
+    h.update(_sha(os.path.join(CSRC, "large", LARGE_SRC, "SOURCE_SHA256.txt")).encode())
+    h.update(_sha(os.path.join(CSRC, "host", "lg_fusion_driver.cpp")).encode())
+    h.update(repr((sorted(defs), sorted(tool.items()))).encode())
+    return h.hexdigest()[:20]
+
+
+def large_device_cmd(defs: List[str], tool: Dict[str, str], out: str) -> List[str]:
+    ldir = os.path.join(CSRC, "large", LARGE_SRC)
+    flags = defs + [
+        f"-I{os.path.join(ldir, 'device')}", f"-I{os.path.join(ldir, 'interface')}",
+        f"-I{os.path.join(CSRC, 'third_party', 'opus_phase1')}", f"-I{tool['mori_root']}/include",
+        "-D__HIPCC_RTC__", "-DOPUS_TILE_CONTAINER=0", "-std=c++20", "-O3", "-fno-fast-math", "--offload-arch=gfx950",
+    ]
+    return [tool["hipcc"], *flags, "-fPIC", "-shared", os.path.join(ldir, "device", "gemm_quad_fp8_comm.cu"),
+            "-o", os.path.join(out, "img", "lg_gemm_quad_fp8_comm.so")]
+
+
+def large_host_cmd(defs: List[str], tool: Dict[str, str], out: str) -> List[str]:
+    ldir = os.path.join(CSRC, "large", LARGE_SRC)
+    hostdefs = [d for d in defs if d.split("=")[0] in ("-DLG_REMOTE_HALF", "-DLG_R6_POSTER", "-DLG_X_INDEXER", "-DLG_R8_FOLD", "-DLG_DEBUG_POSTCOUNT")]
+    flags = hostdefs + ["-x", "c++", "-D__HIP_PLATFORM_AMD__=1", f"-I{tool['rocm']}/include", f"-I{os.path.join(ldir, 'interface')}",
+                        f"-I{os.path.join(ldir, 'host')}", f"-I{tool['mori_root']}/include", "-std=c++20", "-O2", "-fno-fast-math", "-fPIC", "-pthread"]
+    libs = ["-x", "none", tool["mori_so"], f"-L{tool['rocm']}/lib", "-lamdhip64", "-ldl", "-Wl,--no-undefined"]
+    return [tool["clangxx"], *flags, "-shared", os.path.join(CSRC, "host", "lg_fusion_driver.cpp"), "-o", os.path.join(out, "liblg_comm.so"), *libs]
+
+
+def build_large(params: dict, mode: str, tool: Dict[str, str] = None) -> LargeBuild:
+    """Build (or reuse) the large-M HSACO (all plan entries n1/n2/n4/n2h/n4h/n3q + quiet_ready + drain) and host driver for one mode."""
+    tool = tool or toolchain()
+    defs = large_defs(params, mode)
+    key = large_cache_key(defs, tool)
+    final = os.path.join(jit_root(), "lg_" + key)
+    mk = lambda d, sha="": LargeBuild(key, d, os.path.join(d, "img", "lg_gemm_quad_fp8_comm.hsaco"), sha, os.path.join(d, "liblg_comm.so"))  # noqa: E731
+    ok = os.path.join(final, "BUILD_OK")
+    if os.path.exists(ok):
+        return mk(final, open(ok).read().split()[-1])
+    os.makedirs(jit_root(), exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix="lg_" + key + ".", dir=jit_root())
+    log: List[str] = []
+    try:
+        os.makedirs(os.path.join(tmp, "img"))
+        _run(large_device_cmd(defs, tool, tmp), log)
+        so = os.path.join(tmp, "img", "lg_gemm_quad_fp8_comm.so")
+        _unbundle(tool, so, os.path.join(tmp, "img", "lg.fatbin"), os.path.join(tmp, "img", "lg_gemm_quad_fp8_comm.hsaco"), log)
+        sha = _sha(os.path.join(tmp, "img", "lg_gemm_quad_fp8_comm.hsaco"))
+        _run(large_host_cmd(defs, tool, tmp), log)
+        with open(os.path.join(tmp, "build-command.txt"), "w") as f:
+            f.write("\n".join(log) + "\n")
+        with open(os.path.join(tmp, "BUILD_OK"), "w") as f:
+            f.write(key + " " + sha + "\n")
+        try:
+            os.rename(tmp, final)
+        except OSError:
+            if not os.path.exists(ok):
+                raise
+            shutil.rmtree(tmp, ignore_errors=True)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    return mk(final, open(ok).read().split()[-1])

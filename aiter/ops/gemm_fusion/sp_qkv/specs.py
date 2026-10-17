@@ -58,3 +58,20 @@ SMALL_CELLS = {
     ("reuse", 64): ("sp_qkv.small.v1", {"src": "r18", "sk": 3, "nh": 1, "no_credit": 1, "reuse_no_idx": 1}),
     ("reuse", 128): ("sp_qkv.small.v1", {"src": "r17", "sk": 3, "nh": 1, "no_credit": 1, "push_halves": 1}),
 }
+
+
+# Large cells: (mode, tokens T) -> (vid, params). local M = T/4 in {2048, 4096, 8192}. Ledger r152 + r154 (gcnasm 822c1d1, r11 recipe).
+# DEVIATION (recorded): all nine cells use the single LG-QSDMA-r11 code base (NO_GRIDREAD=1 default) with the per-cell plan below,
+# instead of the individual r6b/r6x4/r7/r8g candidates of ledger r152 (r11 plans reproduce them; gcnasm 822c1d1 README: all 2-12 us faster, same numerics).
+#   plan: n = SDMA puts per peer; half_first 0 = r6x plan, 1 = half-N first group (r7), 2 = quarter-first n3q (r9, dense M=2048 only, n=3).
+LARGE_CELLS = {
+    ("dense", 8192): ("sp_qkv.large.v1", {"n": 3, "half_first": 2, "no_gridread": 1}),      # r11 n3q
+    ("dense", 16384): ("sp_qkv.large.v1", {"n": 2, "half_first": 0, "no_gridread": 1}),     # r6b n2
+    ("dense", 32768): ("sp_qkv.large.v1", {"n": 4, "half_first": 0, "no_gridread": 1}),     # r6b n4
+    ("indexer", 8192): ("sp_qkv.large.v1", {"n": 2, "half_first": 1, "no_gridread": 1}),    # r7 n2h
+    ("indexer", 16384): ("sp_qkv.large.v1", {"n": 4, "half_first": 0, "no_gridread": 1}),   # r6x4 n4
+    ("indexer", 32768): ("sp_qkv.large.v1", {"n": 4, "half_first": 0, "no_gridread": 1}),   # r6x4 n4
+    ("reuse", 8192): ("sp_qkv.large.v1", {"n": 2, "half_first": 1, "no_gridread": 1}),      # r8g F0 n2h (dense build, compact)
+    ("reuse", 16384): ("sp_qkv.large.v1", {"n": 4, "half_first": 0, "no_gridread": 1}),     # r6x4 n4
+    ("reuse", 32768): ("sp_qkv.large.v1", {"n": 4, "half_first": 0, "no_gridread": 1}),     # r6x4 n4
+}

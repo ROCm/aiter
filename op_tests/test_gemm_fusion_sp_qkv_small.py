@@ -205,3 +205,93 @@ def test_small_variant_registers_and_contract(monkeypatch):
     assert match_prefix(spec, MatchCtx("gfx950", 256, 4, 48, frozenset({"mori_cco"})), PROFILE) == (None, 0)
     # a spec with a different eps has a different signature -> native
     assert match_prefix(specs.sp_qkv_spec("dense", eps=1e-5), ok, PROFILE) == (None, 0)
+
+
+# ======================================================================= large-M (S2-2b-iii)
+def test_profile_has_15_rows_and_large_prefix_signatures():
+    profmod.clear_profile_cache()
+    prof = profmod.load_profile(PROFILE)
+    assert len(prof) == 15
+    for (mode, T), (vid, params) in specs.LARGE_CELLS.items():
+        sig = specs.sp_qkv_spec(mode).prefix(1).signature()
+        r = prof.lookup(sig, "gfx950", 256, 4, T // 4)
+        assert r is not None and r.vid == "sp_qkv.large.v1" and dict(r.params) == params
+    # reuse and dense large rows have different signatures (reuse drops iq/ik in the exchange)
+    assert specs.sp_qkv_spec("dense").prefix(1).signature() != specs.sp_qkv_spec("reuse").prefix(1).signature()
+    # 2-stage and 1-stage signatures differ
+    assert specs.sp_qkv_spec("dense").signature() != specs.sp_qkv_spec("dense").prefix(1).signature()
+
+
+def test_large_defs_and_commands():
+    d = jit.large_defs({"n": 2, "half_first": 1, "no_gridread": 1}, "indexer")
+    assert "-DLG_X_INDEXER=1" in d and "-DLG_NO_GRIDREAD=1" in d and "-DBUILD_CCO_SDMA=1" in d and "-DLG_R8_FOLD=0" in d
+    assert "-DLG_X_INDEXER=0" in jit.large_defs({}, "reuse") and "-DLG_X_INDEXER=0" in jit.large_defs({}, "dense")
+    assert "-DLG_NEGCTRL_NOWAIT=0" in d and len([x for x in d if x.startswith("-DLG_NEGCTRL_NOWAIT")]) == 1
+    with pytest.raises(ValueError):
+        jit.large_defs({"bogus": 1}, "dense")
+    with pytest.raises(ValueError):
+        jit.large_defs({"no_gridread": 3}, "dense")
+    tool = {"hipcc": "/rocm/bin/hipcc", "clangxx": "/rocm/llvm/bin/clang++", "bundler": "b", "rocm": "/rocm", "mori_root": "/m", "mori_so": "/m/libmori_cco.so"}
+    dc = jit.large_device_cmd(d, tool, "/out")
+    assert "--offload-arch=gfx950" in dc and "-D__HIPCC_RTC__" in dc and dc[-3].endswith("gemm_quad_fp8_comm.cu")
+    hc = jit.large_host_cmd(d, tool, "/out")
+    assert "-DLG_X_INDEXER=1" in hc and "-DLG_NO_GRIDREAD=1" not in hc and "/m/libmori_cco.so" in hc
+    assert jit.large_cache_key(d, tool) != jit.large_cache_key(jit.large_defs({}, "dense"), tool)
+
+
+def test_large_vendored_manifest():
+    import hashlib
+
+    base = os.path.join(jit.CSRC, "large", "r11")
+    n = 0
+    for line in open(os.path.join(base, "SOURCE_SHA256.txt")):
+        h, f = line.split(None, 1)
+        f = f.strip()
+        if f.startswith("tests/") or f == "host/bridge_comm.py":
+            continue
+        assert hashlib.sha256(open(os.path.join(base, f), "rb").read()).hexdigest() == h, f
+        n += 1
+    assert n >= 10
+
+
+def test_large_variant_contract_and_sizes(monkeypatch):
+    from aiter.gemm_fusion import catalog
+
+    monkeypatch.setattr(catalog, "_CATALOG", {})
+    sys.modules.pop("aiter.ops.gemm_fusion.sp_qkv.variants", None)
+    sys.modules.pop("aiter.ops.gemm_fusion.sp_qkv.variants_large", None)
+    import aiter.ops.gemm_fusion.sp_qkv.variants_large as vl  # noqa: F401
+
+    profmod.clear_profile_cache()
+    caps = frozenset({"mori_cco", "sdma"})
+    spec = specs.sp_qkv_spec("dense")
+    plan, n = match_prefix(spec, MatchCtx("gfx950", 256, 4, 2048, caps), PROFILE)
+    assert n == 1 and plan.vid == "sp_qkv.large.v1" and plan.half_first == 2 and plan.n == 3
+    reqs = plan.resources()
+    assert [r.kind for r in reqs] == ["p2p_window", "p2p_window", "control", "sdma_queue"]
+    assert all(r.bytes % (4 << 20) == 0 for r in reqs[:3]) and reqs[0].bytes == reqs[1].bytes == reqs[2].bytes
+    # M=2048 dense: P = 8*2048*2304 = 37748736 -> + pad -> 40 MiB multiple of 4 MiB
+    assert vl.large_window_bytes("dense", 2048) == 40 << 20
+    assert vl.large_window_bytes("indexer", 8192) == round_up(8 * 8192 * 2560 + 4096)
+    with pytest.raises(ContractError, match="sdma"):
+        match_prefix(spec, MatchCtx("gfx950", 256, 4, 2048, frozenset({"mori_cco"})), PROFILE)
+    # 2-stage prefix has no row at large M -> falls to the 1-stage row (n == 1) ; at M=16 the small variant would apply
+    assert match_prefix(spec, MatchCtx("gfx950", 256, 4, 1024, caps), PROFILE) == (None, 0)
+    # invalid plan params are contract errors, not silent
+    sp = specs.sp_qkv_spec("indexer").prefix(1)
+    with pytest.raises(ContractError):
+        vl.SpQkvLarge(sp, {"n": 3, "half_first": 2}, MatchCtx("gfx950", 256, 4, 2048, caps))
+    with pytest.raises(ContractError):
+        vl.SpQkvLarge(specs.sp_qkv_spec("dense").prefix(1), {"n": 1, "half_first": 1}, MatchCtx("gfx950", 256, 4, 2048, caps))
+
+
+def test_reset_runs_init_hooks():
+    be, d = FakeBackend(), FakeDist()
+    r = FusionResources(0, 4, dist=d, backend=be)
+    r.ensure("p", [WindowReq("a", 100, "p2p_window")])
+    calls = []
+    r.set_init("p", lambda: calls.append(1))
+    assert calls == [1]
+    r.finalize()
+    r.quiesce_and_reset()
+    assert calls == [1, 1]

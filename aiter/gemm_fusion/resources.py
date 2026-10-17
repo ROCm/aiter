@@ -131,6 +131,7 @@ class FusionResources:
         self.comm = None
         self.devcomm = None
         self.windows: Dict[str, Dict[str, Window]] = {}  # owner -> name -> Window
+        self._init_hooks: Dict[str, Callable[[], None]] = {}  # owner -> control-block initializer (re-run after every zeroing)
         self.finalized = False
         self._released = False
         self._init_comm()
@@ -172,6 +173,12 @@ class FusionResources:
         self._zero_windows(wins.values())  # local only; ranks barrier before first launch (finalize)
         return wins
 
+    def set_init(self, owner: str, fn: Callable[[], None]):
+        """Register + run the owner's control-block initializer (e.g. the large-M epoch=1/magic image); it is re-run after
+        every zeroing in quiesce_and_reset. Local only: ranks barrier (finalize()/quiesce_and_reset()) before the first launch."""
+        self._init_hooks[owner] = fn
+        fn()
+
     def peers(self, win: Window) -> List[int]:
         return [self.backend.peer_ptr(self.comm, win.local, p) for p in range(self.world)]
 
@@ -192,8 +199,11 @@ class FusionResources:
         """A2-H: device sync -> barrier -> reset control/Rx windows -> device sync -> barrier. All ranks must call it."""
         self.backend.device_sync(self.device)
         self._barrier()
-        for wins in self.windows.values():
+        for owner, wins in self.windows.items():
             self._zero_windows(wins.values())
+            hook = self._init_hooks.get(owner)
+            if hook is not None:
+                hook()
         self.backend.device_sync(self.device)
         self._barrier()
         log.info("event=resources quiesce_and_reset rank=%d windows=%d", self.rank, sum(len(w) for w in self.windows.values()))

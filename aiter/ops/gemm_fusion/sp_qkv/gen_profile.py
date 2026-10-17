@@ -26,7 +26,12 @@ def build_rows():
 
 
 def build_large_rows():
-    return []  # S2-2b-iii
+    rows = []
+    for (mode, T), (vid, params) in specs.LARGE_CELLS.items():
+        sp = specs.sp_qkv_spec(mode).prefix(1)  # GEMM + SPExchange only; HeadNormRopeCache runs natively in ATOM
+        rows.append({"sig": sp.signature(), "arch": ARCH, "cu": CU, "world": WORLD, "m": T // WORLD,
+                     "vid": vid, "params": dict(params), "cell": f"{mode}_T{T}"})
+    return rows
 
 
 def build_profile():

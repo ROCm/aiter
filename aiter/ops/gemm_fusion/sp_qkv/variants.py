@@ -176,3 +176,6 @@ class SpQkvSmall(Plan):
         sc = self._context(res)
         blk = self._binding(x, x_scale, w_scale, outs, meta, res, in_capture=torch.cuda.is_current_stream_capturing())
         sc.launch(blk, x.data_ptr(), w.data_ptr(), rt.stream_handle(stream))
+
+
+from . import variants_large  # noqa: E402,F401  (registers sp_qkv.large.v1)

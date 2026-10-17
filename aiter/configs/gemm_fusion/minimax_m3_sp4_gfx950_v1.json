@@ -100,6 +100,132 @@
         "push_halves": 1
       },
       "cell": "reuse_T128"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2048,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 3,
+        "half_first": 2,
+        "no_gridread": 1
+      },
+      "cell": "dense_T8192"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4096,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1
+      },
+      "cell": "dense_T16384"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 8192,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1
+      },
+      "cell": "dense_T32768"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2048,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 1,
+        "no_gridread": 1
+      },
+      "cell": "indexer_T8192"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4096,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1
+      },
+      "cell": "indexer_T16384"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 8192,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1
+      },
+      "cell": "indexer_T32768"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2048,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 1,
+        "no_gridread": 1
+      },
+      "cell": "reuse_T8192"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4096,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1
+      },
+      "cell": "reuse_T16384"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 8192,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1
+      },
+      "cell": "reuse_T32768"
     }
   ]
 }
