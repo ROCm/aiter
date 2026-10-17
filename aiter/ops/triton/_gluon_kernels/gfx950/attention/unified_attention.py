@@ -799,9 +799,12 @@ class ScaledKVLoader:
     @gluon.jit
     def dequantize(self, value, tile_index, target_dtype, is_key: gl.constexpr):
         cfg = self.base.cfg
-        slots = gl.arange(
-            0, cfg.TILE_SIZE, layout=gl.BlockedLayout([1], [64], [cfg.NUM_WARPS], [0])
-        )
+        if is_key:
+            scale_layout: gl.constexpr = self.base.kv_cfg.blocked_k
+            slots = gl.arange(0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, scale_layout))
+        else:
+            scale_layout: gl.constexpr = self.base.kv_cfg.blocked_v
+            slots = gl.arange(0, cfg.TILE_SIZE, layout=gl.SliceLayout(1, scale_layout))
         valid = tile_index * cfg.TILE_SIZE + slots < self.seq_len
         page = gl.load(self.base.block_tables_ptr_shifted + tile_index).to(gl.int64)
         if is_key:
@@ -812,7 +815,10 @@ class ScaledKVLoader:
                 mask=valid,
                 other=1.0,
             )
-            scales = gl.broadcast_to(scale[None, :], (cfg.HEAD_SIZE, cfg.TILE_SIZE))
+            empty = gl.full(
+                (cfg.HEAD_SIZE, cfg.TILE_SIZE), 0, gl.float32, layout=scale_layout
+            )
+            scales, _ = gl.broadcast(scale[None, :], empty)
             scales = gl.convert_layout(scales, cfg.k_layout)
         else:
             scale = gl.load(
@@ -822,12 +828,16 @@ class ScaledKVLoader:
                 mask=valid,
                 other=1.0,
             )
-            scales = gl.broadcast_to(scale[:, None], (cfg.TILE_SIZE, cfg.HEAD_SIZE))
-            scales = gl.convert_layout(scales, cfg.v_layout)
-            mask = gl.convert_layout(
-                gl.broadcast_to(valid[:, None], (cfg.TILE_SIZE, cfg.HEAD_SIZE)),
-                cfg.v_layout,
+            empty = gl.full(
+                (cfg.TILE_SIZE, cfg.HEAD_SIZE), 0, gl.float32, layout=scale_layout
             )
+            scales, _ = gl.broadcast(scale[:, None], empty)
+            scales = gl.convert_layout(scales, cfg.v_layout)
+            empty_mask = gl.full(
+                (cfg.TILE_SIZE, cfg.HEAD_SIZE), False, gl.int1, layout=scale_layout
+            )
+            mask, _ = gl.broadcast(valid[:, None], empty_mask)
+            mask = gl.convert_layout(mask, cfg.v_layout)
             # Invalid slots may contain NaNs, so multiplying by zero is unsafe.
             value = gl.where(mask, value, 0.0)
         return (value * scales).to(target_dtype)
