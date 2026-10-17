@@ -1153,19 +1153,17 @@ def _build_kernel(
                             fx.Int8,
                         )
                         if const_expr(preshuffle):
-                            # scale [NB, k_tiles, 4, kvbs] u8, with the slot axis
-                            # INTERLEAVED so the mqa-logits reader's packed-dword
-                            # load (4 nt-bytes adjacent) is contiguous:
-                            #   sflat = (slot % 16) * KVS_NTPW + (slot // 16)
-                            # (KVS_NTPW == 4). Matches the op-test reference
-                            # writer `indexer_k_fp4_paged_preshuffle` and the
-                            # packed N_PHYS==1 readers in pa_mqa_logits_fp4*.
+                            # scale [NB, k_tiles, 4, kvbs] u8, with four
+                            # equally-sized token groups interleaved so the
+                            # mqa-logits reader can assemble one packed scale
+                            # dword for each 64-token warp tile.
                             sg_u = fx.Uint32(scale_group_idx)
                             k_tile_s = fx.Int32(sg_u // fx.Uint32(4))
                             group4_s = fx.Int32(sg_u % fx.Uint32(4))
                             slot_u = fx.Uint32(slot_in_block)
-                            sflat = fx.Int32(slot_u % fx.Uint32(16)) * 4 + fx.Int32(
-                                slot_u // fx.Uint32(16)
+                            scale_group_size = fx.Uint32(KVBS // 4)
+                            sflat = fx.Int32(slot_u % scale_group_size) * 4 + fx.Int32(
+                                slot_u // scale_group_size
                             )
                             cs_off = k_tile_s * (4 * KVBS) + group4_s * KVBS + sflat
                         else:
