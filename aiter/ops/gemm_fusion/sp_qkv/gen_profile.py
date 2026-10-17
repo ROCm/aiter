@@ -34,9 +34,26 @@ def build_large_rows():
     return rows
 
 
+def window_budget():
+    """Uniform-window policy numbers (see aiter.gemm_fusion.resources): every window registered on the shared comm gets
+    window_bytes (max over all plans, 4 MiB multiple), and max_windows bounds how many are registered (2 per small owner,
+    3 per large owner; owners are keyed per (mode, params) small / (mode, M) large)."""
+    from . import variants, variants_large
+    from aiter.gemm_fusion.resources import round_up
+
+    small = {}
+    for (mode, T), (vid, params) in specs.SMALL_CELLS.items():
+        b = variants.small_window_bytes(mode)
+        small[(mode, tuple(sorted(params.items())))] = round_up(max(b["rx"], b["ctl"], 8192))
+    large = {(mode, T // WORLD): variants_large.large_window_bytes(mode, T // WORLD) for (mode, T) in specs.LARGE_CELLS}
+    wb = max(list(small.values()) + list(large.values()))
+    return {"window_bytes": wb, "max_windows": 2 * len(small) + 3 * len(large), "small_owners": len(small), "large_owners": len(large)}
+
+
 def build_profile():
     return {
         "profile": "minimax_m3_sp4_gfx950_v1",
+        "window_budget": window_budget(),
         "generated_by": {"tool": "aiter.ops.gemm_fusion.sp_qkv.gen_profile", "ledger": "sp4-opus-mori-playground records/branch-ledger.md r165 (small), r152 (large)",
                          "note": "m is local tokens per rank (T/4); exact rows only"},
         "rows": build_rows(),

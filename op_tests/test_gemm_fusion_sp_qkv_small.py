@@ -441,9 +441,14 @@ def test_dense_page128_signature_differs_from_page16():
     wrong = type(d)(d.gemm, (d.stages[0], dataclasses.replace(d.stages[1], kv_cache="shuffle_page16_fp8_ptok")))
     assert wrong.signature() != d.signature()  # a page16 dense spec must NOT hit the shipped dense row
 
-def test_cache_page_contract_check():
+def test_cache_page_contract_check(monkeypatch):
     from types import SimpleNamespace as NS
 
+    from aiter.gemm_fusion import catalog
+
+    monkeypatch.setattr(catalog, "_CATALOG", {})
+    sys.modules.pop("aiter.ops.gemm_fusion.sp_qkv.variants", None)
+    sys.modules.pop("aiter.ops.gemm_fusion.sp_qkv.variants_large", None)
     from aiter.ops.gemm_fusion.sp_qkv.variants import check_cache_page
 
     def caches(page, blocks=4):
@@ -621,3 +626,132 @@ def test_atom_cross_repo_api_audit(monkeypatch):
     assert r.poison_local() == 0
     r.quiesce_and_reset()
     r.release()
+
+# ======================================================================= window policy (gate02 hipMemSetAccess failure)
+class FirstFitBackend(FakeBackend):
+    """FakeBackend that mimics MORI's per-rank first-fit slot allocator: records offsets, fails when the heap is exhausted."""
+
+    def __init__(self, heap):
+        super().__init__()
+        self.heap, self.next_off, self.offsets, self.sizes = heap, 0, [], []
+
+    def win_register(self, comm, nbytes):
+        from aiter.gemm_fusion.resources import ResourceError
+
+        if self.next_off + nbytes > self.heap:
+            raise ResourceError("gf_win_register rc=-3 (slot exhausted)")
+        self.offsets.append(self.next_off)
+        self.sizes.append(nbytes)
+        self.next_off += nbytes
+        return super().win_register(comm, nbytes)
+
+    def comm_create(self, rank, world, uid, vmm):
+        self.heap = vmm
+        return super().comm_create(rank, world, uid, vmm)
+
+
+def _all_plan_requests():
+    """Every (owner, [WindowReq]) the 15 profile cells register, via the real plans' resources()."""
+    from aiter.gemm_fusion import catalog
+
+    out = {}
+    for mode, T in specs.SMALL_CELLS:
+        p = _plan_for(mode, T, False)
+        out[p.build_key] = p.resources()
+    for mode, T in specs.LARGE_CELLS:
+        p = _plan_for(mode, T, True)
+        out[p.build_key] = p.resources()
+    return out
+
+
+def test_uniform_policy_reproduces_phase1_equal_layout(monkeypatch):
+    from aiter.gemm_fusion import catalog
+    from aiter.gemm_fusion.resources import FusionResources, heap_bytes_for
+
+    monkeypatch.setattr(catalog, "_CATALOG", {})
+    reqs = _all_plan_requests()
+    prof = profmod.load_profile(PROFILE)
+    wb = prof.meta["window_budget"]
+    assert wb["max_windows"] == sum(len([r for r in v if r.kind in ("p2p_window", "control")]) for v in reqs.values()) == 39
+    assert wb["window_bytes"] % (4 << 20) == 0 and wb["window_bytes"] == max(r.bytes for v in reqs.values() for r in v)
+    be, d = FirstFitBackend(0), FakeDist()
+    monkeypatch.setenv("AITER_GEMM_FUSION_PROFILE", PROFILE)
+    profmod.clear_profile_cache()
+    r = FusionResources(0, 4, dist=d, backend=be)
+    assert r.window_bytes == wb["window_bytes"] and r.max_windows == 39
+    assert be.heap == heap_bytes_for(wb["window_bytes"], 39) and be.heap % (4 << 30) == 0 and be.heap >= 39 * wb["window_bytes"] + (256 << 20)
+    for owner, rq in reqs.items():  # register ALL 15 plans (the gate02 sequence), in any order
+        r.ensure(owner, rq)
+    assert len(be.offsets) == 39 and set(be.sizes) == {wb["window_bytes"]}  # every window equal, 4 MiB multiple
+    assert all(o % wb["window_bytes"] == 0 for o in be.offsets)  # offsets are multiples of the window size, as in Phase-1 (0, W, 2W, ...)
+    assert be.next_off <= be.heap - (256 << 20)  # devcomm slack remains
+
+
+def test_per_owner_policy_is_the_old_behaviour_and_reports_layout_on_failure(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources, ResourceError
+
+    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "per_owner")
+    be = FirstFitBackend(0)
+    r = FusionResources(0, 4, dist=FakeDist(), backend=be, window_bytes=None)
+    r.ensure("a", [WindowReq("x", 100, "p2p_window")])
+    r.ensure("b", [WindowReq("x", 40 << 20, "p2p_window")])
+    assert be.sizes == [4 << 20, 40 << 20]  # mixed sizes (what failed on the GPU)
+    be.heap = be.next_off + 1  # force the next registration to fail
+    with pytest.raises(ResourceError, match=r"while registering c/x.*already registered.*heap=.*policy=per_owner.*layout so far"):
+        r.ensure("c", [WindowReq("x", 4 << 20, "p2p_window")])
+
+
+def test_uniform_overflow_and_first_request_sizing(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources, ResourceError
+
+    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
+    profmod.clear_profile_cache()
+    r = FusionResources(0, 4, dist=FakeDist(), backend=FirstFitBackend(0))  # no profile: size from the first request
+    assert r.window_bytes is None
+    r.ensure("a", [WindowReq("x", 40 << 20, "p2p_window"), WindowReq("c", 100, "control")])
+    assert r.window_bytes == 40 << 20 and r.backend.sizes == [40 << 20, 40 << 20]
+    with pytest.raises(ResourceError, match="exceeds the uniform window size"):
+        r.ensure("b", [WindowReq("x", 41 << 20, "p2p_window")])
+    r.ensure("c", [WindowReq("x", 4 << 20, "p2p_window")])  # smaller plans pad up to the uniform size
+    assert r.backend.sizes[-1] == 40 << 20
+    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_MIB", "164")
+    r2 = FusionResources(0, 4, dist=FakeDist(), backend=FirstFitBackend(0))
+    assert r2.window_bytes == 164 << 20
+
+
+def test_window_probe_sequences_and_first_failure_report(capsys):
+    from aiter.ops.gemm_fusion.sp_qkv import window_probe as wp
+
+    assert wp.sequence("phase1_equal") == [40 << 20] * 3
+    assert wp.sequence("small_then_big") == [4 << 20] * 12 + [40 << 20]
+    assert wp.sequence("uniform", n=39, window_mib=164) == [164 << 20] * 39
+    assert wp.sequence("custom", mib="4,40") == [4 << 20, 40 << 20]
+
+    class B(FirstFitBackend):
+        def uid(self, rank):
+            return b"u"
+
+        def win_deregister(self, comm, w):
+            pass
+
+        def comm_destroy(self, comm):
+            pass
+
+        def win_register(self, comm, nbytes):
+            if nbytes == 40 << 20 and self.next_off == 48 << 20:  # emulate the observed hipMemSetAccess failure
+                from aiter.gemm_fusion.resources import ResourceError
+
+                raise ResourceError("hipMemSetAccess invalid argument")
+            return super().win_register(comm, nbytes)
+
+    be, d = B(0), FakeDist()
+    assert wp.run(wp.sequence("phase1_equal"), 4 << 30, 0, 4, d, B(0), "phase1_equal") is True
+    assert wp.run(wp.sequence("small_then_big"), 4 << 30, 0, 4, d, be, "small_then_big") is False
+    out = capsys.readouterr().out
+    assert "seq=phase1_equal idx=2" in out and "result=FAIL" in out
+    assert "seq=small_then_big idx=12 size=41943040 cumulative=50331648 offset_mib=48 result=FAIL" in out
+
+
+def test_profile_window_budget_is_regenerated_consistently():
+    prof = profmod.load_profile(PROFILE)
+    assert dict(prof.meta["window_budget"]) == gen_profile.window_budget()

@@ -21,15 +21,19 @@ from __future__ import annotations
 
 import ctypes as C
 import logging
+import os
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .plan import WindowReq
 
 log = logging.getLogger("aiter.gemm_fusion")
 
 GRANULE = 4 << 20  # 4 MiB (Phase-1 r8g finding)
-PER_RANK_VMM_BYTES = 4294967296  # 4 GiB, as in the Phase-1 drivers
+PER_RANK_VMM_BYTES = 4294967296  # 4 GiB, as in the Phase-1 drivers (ccoCommCreate rounds the slot to a 4 GiB multiple)
+HEAP_SLACK_BYTES = 256 << 20  # ccoDevCommCreate allocates its own resource window from the same heap
+ENV_POLICY = "AITER_GEMM_FUSION_WINDOW_POLICY"  # "uniform" (default) | "per_owner"
+ENV_WINDOW_MIB = "AITER_GEMM_FUSION_WINDOW_MIB"  # override the uniform window size (MiB)
 
 
 class ResourceError(RuntimeError):
@@ -38,6 +42,13 @@ class ResourceError(RuntimeError):
 
 def round_up(n: int, g: int = GRANULE) -> int:
     return ((int(n) + g - 1) // g) * g
+
+
+def heap_bytes_for(window_bytes: int, max_windows: int, floor: int = PER_RANK_VMM_BYTES) -> int:
+    """Per-rank VMM heap for max_windows equal windows (+devcomm slack), rounded up to a 4 GiB multiple, never below the Phase-1 4 GiB."""
+    g = 4 << 30
+    need = window_bytes * max_windows + HEAP_SLACK_BYTES
+    return max(floor, ((need + g - 1) // g) * g)
 
 
 @dataclass
@@ -120,14 +131,22 @@ class FusionResources:
     """rank/world/group come from the caller (ATOM's SP group). ``dist`` is torch.distributed (or a fake)."""
 
     def __init__(self, rank: int, world: int, group=None, dist=None, backend=None, device: Optional[int] = None,
-                 caps: frozenset = frozenset(), vmm_bytes: int = PER_RANK_VMM_BYTES):
+                 caps: frozenset = frozenset(), vmm_bytes: Optional[int] = None, window_bytes: Optional[int] = None,
+                 max_windows: Optional[int] = None, policy: Optional[str] = None):
         if dist is None:
             import torch.distributed as dist  # type: ignore
         self.rank, self.world, self.group, self.dist = rank, world, group, dist
         self.device = rank if device is None else device
         self.caps = frozenset(caps)
         self.backend = backend or CcoBackend()
+        self.policy = (policy or os.environ.get(ENV_POLICY) or "uniform").lower()
+        if self.policy not in ("uniform", "per_owner"):
+            raise ResourceError(f"{ENV_POLICY} must be uniform or per_owner, got {self.policy!r}")
+        self.window_bytes, self.max_windows = self._budget(window_bytes, max_windows)
+        if vmm_bytes is None:
+            vmm_bytes = heap_bytes_for(self.window_bytes, self.max_windows) if self.window_bytes and self.policy == "uniform" else PER_RANK_VMM_BYTES
         self._vmm = vmm_bytes
+        self._reg_log: List[Tuple[str, str, int, int]] = []  # (owner, name, bytes, cumulative) in registration order
         self.comm = None
         self.devcomm = None
         self.windows: Dict[str, Dict[str, Window]] = {}  # owner -> name -> Window
@@ -140,6 +159,23 @@ class FusionResources:
         self._init_comm()
 
     # -- helpers -----------------------------------------------------------
+    def _budget(self, window_bytes, max_windows):
+        """Uniform window size / count: explicit args, then env MiB override, then the loaded profile\x27s window_budget. (None, N) if unknown."""
+        if window_bytes is None and os.environ.get(ENV_WINDOW_MIB):
+            window_bytes = int(os.environ[ENV_WINDOW_MIB]) << 20
+        if window_bytes is None or max_windows is None:
+            try:
+                from .profile import load_profile
+
+                wb = dict(load_profile().meta.get("window_budget") or {})
+                window_bytes = window_bytes if window_bytes is not None else wb.get("window_bytes")
+                max_windows = max_windows if max_windows is not None else wb.get("max_windows")
+            except Exception:  # no profile configured here: first-request sizing (see ensure)
+                pass
+        if window_bytes is not None:
+            window_bytes = round_up(window_bytes)
+        return window_bytes, int(max_windows or 0)
+
     def _barrier(self):
         self.dist.barrier(group=self.group)
 
@@ -147,7 +183,8 @@ class FusionResources:
         uid = [self.backend.uid(self.rank) if self.rank == 0 else None]
         self.dist.broadcast_object_list(uid, src=self._src0(), group=self.group)
         self.comm = self.backend.comm_create(self.rank, self.world, uid[0], self._vmm)
-        log.info("event=resources comm rank=%d world=%d", self.rank, self.world)
+        log.info("event=resources comm rank=%d world=%d heap_bytes=%d policy=%s window_bytes=%s max_windows=%s",
+                 self.rank, self.world, self._vmm, self.policy, self.window_bytes, self.max_windows)
 
     def _src0(self):
         # broadcast_object_list takes a GLOBAL rank; map group rank 0 when a group is given
@@ -166,10 +203,31 @@ class FusionResources:
             )
         wins: Dict[str, Window] = {}
         wreqs = [r for r in reqs if r.kind in ("p2p_window", "control")]
-        # equal sizes within a plan: all windows of an owner get the max, rounded to 4 MiB
-        size = round_up(max((r.bytes for r in wreqs), default=0)) if wreqs else 0
+        need = round_up(max((r.bytes for r in wreqs), default=0)) if wreqs else 0
+        if self.policy == "uniform" and wreqs:
+            # Phase-1 layout: EVERY window of the shared comm has the same size (r8g: equal, 4 MiB multiple), so slot offsets are
+            # multiples of that size exactly as in the accepted drivers. Size = profile budget / env, else the first request.
+            if self.window_bytes is None:
+                self.window_bytes = need
+            if need > self.window_bytes:
+                raise ResourceError(
+                    f"ensure({owner!r}): window need {need} B exceeds the uniform window size {self.window_bytes} B; "
+                    f"pre-size via the profile window_budget or {ENV_WINDOW_MIB}")
+            size = self.window_bytes
+        else:
+            size = need
         for r in wreqs:
-            h, loc = self.backend.win_register(self.comm, size)
+            cum = (self._reg_log[-1][3] if self._reg_log else 0) + size
+            try:
+                h, loc = self.backend.win_register(self.comm, size)
+            except ResourceError as e:
+                raise ResourceError(
+                    f"{e} while registering {owner}/{r.name}: size={size} B, window #{len(self._reg_log) + 1}, "
+                    f"{cum - size} B already registered on this rank, heap={self._vmm} B, policy={self.policy}; "
+                    f"layout so far: {self._reg_log[-8:]}") from e
+            self._reg_log.append((owner, r.name, size, cum))
+            log.info("event=resources window rank=%d owner=%s name=%s bytes=%d n=%d cumulative=%d heap=%d",
+                     self.rank, owner, r.name, size, len(self._reg_log), cum, self._vmm)
             wins[r.name] = Window(owner, r.name, r.kind, size, h, loc)
         self._sdma = getattr(self, "_sdma", 0) + sum(1 for r in reqs if r.kind == "sdma_queue")
         self.windows[owner] = wins
