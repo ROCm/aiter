@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Grouped contiguous-M A8W4 preshuffle MoE GEMM for gfx1250 (TDM pipeline)."""
+"""Grouped contiguous-M A8W4/A8W8 preshuffle MoE GEMM for gfx1250."""
 
 import math
 import os
@@ -15,7 +15,9 @@ from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
+from flydsl.runtime.device import get_rocm_arch
 
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 from aiter.utility.mx_types import MxDtypeInt as MxDtype
 
 from .buffer_ops import buffer_store, create_buffer_resource_from_addr
@@ -140,6 +142,7 @@ def launch_gemm_a8w4_tdm(
     out_is_f16: Constexpr[int],
     num_buffers: Constexpr[int],
     a_is_fp4: Constexpr[int],
+    w_is_fp8: Constexpr[int],
     arg_m_tile_map: fx.Pointer,
     n_experts: Constexpr[int],
     stage1_act: Constexpr[int],
@@ -172,7 +175,7 @@ def launch_gemm_a8w4_tdm(
     persistent_workers: Constexpr[int] = 0,
     rolled_drain: Constexpr[int] = 0,
 ):
-    """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
+    """Launch the grouped contiguous-M a8w4/a8w8 MoE GEMM for gfx1250.
 
     ``cluster_m`` and ``cluster_n`` explicitly select the physical workgroup
     cluster. Peers along N share A, while expert-compatible peers along M can
@@ -222,7 +225,9 @@ def launch_gemm_a8w4_tdm(
     WMMA_N = 32 if a_is_fp4 else 16
     WMMA_K = 128
     WAVE = 32
-    PACK_TK = tile_k // 2
+    assert not (a_is_fp4 and w_is_fp8), "a4w8 is not supported"
+    B_PACK = 1 if w_is_fp8 else 2
+    B_ROW_B = tile_k // B_PACK
     KWS = tile_k // WMMA_K
     # Double buffering is sufficient: the carry reads the other LDS buffer
     # before the post-compute barrier permits reusing the current buffer.
@@ -242,6 +247,7 @@ def launch_gemm_a8w4_tdm(
         out_is_f16,
         num_buffers,
         a_is_fp4,
+        w_is_fp8,
         n_experts,
         stage1_act,
         has_bias,
@@ -324,7 +330,7 @@ def launch_gemm_a8w4_tdm(
 
     LDS_PAD_A = 16
     A_LDS_ROW = A_ROW_B + LDS_PAD_A
-    B_LDS_ROW = PACK_TK * 16
+    B_LDS_ROW = B_ROW_B * 16
     STAGE_A = ceildiv(tile_m * A_LDS_ROW, 16) * 16
     STAGE_B = ceildiv((tile_n // 16) * B_LDS_ROW, 16) * 16
 
@@ -401,6 +407,13 @@ def launch_gemm_a8w4_tdm(
     AS_FULL_OFF = INPUT_LDS_B
     AS_FULL_B = ceildiv(AS_SUPERS * AS_FULL_INNER * 4, 128) * 128
     ARENA_B = max(AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0), C_STORE_B)
+    arch = get_rocm_arch().split(":", 1)[0]
+    lds_cap = get_lds_capacity_bytes(arch)
+    if ARENA_B > lds_cap:
+        raise RuntimeError(
+            f"Shared Memory Overflow: requested {ARENA_B} bytes on {arch}, "
+            f"limit is {lds_cap} bytes"
+        )
 
     # Quant epilogue compile-time constants.
     QUANT_ROWS_PER_TILE = quant_wmma_rep * 16
@@ -413,6 +426,7 @@ def launch_gemm_a8w4_tdm(
         ), "stage1 quant requires complete four-WMMA N groups"
 
     _afp = "fp4" if a_is_fp4 else "fp8"
+    _gemm = "a8w8" if w_is_fp8 else "a8w4"
     _act = f"_act{stage1_act}" if stage1_act else ""
     _qout = f"_q{stage1_quant_out}r{quant_wmma_rep}" if stage1_quant_out else ""
     _bias = "_bias" if has_bias else ""
@@ -440,7 +454,7 @@ def launch_gemm_a8w4_tdm(
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
     _kname = (
-        f"a8w4_tdm_{_afp}"
+        f"{_gemm}_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
         f"{_grouped}{_act}{_bias}{_qout}{_cl}{_cluster_sync}"
@@ -482,7 +496,7 @@ def launch_gemm_a8w4_tdm(
     ):
         K_TILES = K // tile_k
         A_KROW = K // A_PACK
-        Kp16 = (K // 2) * 16
+        Kp16 = (K // B_PACK) * 16
         K4 = K // 4
 
         tid = fx.thread_idx.x
@@ -817,13 +831,13 @@ def launch_gemm_a8w4_tdm(
             b_off0,
             Kp16,
             None,
-            PACK_TK * 16,
+            B_ROW_B * 16,
             tile_n // 16,
             on_i32=False,
             lds_off=B_LDS_OFF,
             lds_stage=B_LDS_STAGE,
             lds_row=B_LDS_ROW,
-            k_adv=PACK_TK * 16,
+            k_adv=B_ROW_B * 16,
             wv=waves[1],
             wg_mask=b_mcast_mask,
             cache_modifier=tdm_b_th,
@@ -1031,6 +1045,18 @@ def launch_gemm_a8w4_tdm(
             )
 
         def load_b(base, wn, ksl):
+            if const_expr(w_is_fp8):
+                off = wn * B_LDS_ROW + ksl * 2048
+                v = [
+                    Vec(lds_load_b128(base, fx.Int32(off + 512 * j)))
+                    for j in range_constexpr(4)
+                ]
+                return (
+                    v[0]
+                    .shuffle(v[1], list(range(8)))
+                    .shuffle(v[2].shuffle(v[3], list(range(8))), list(range(16)))
+                )
+
             def load_half(half):
                 off = half * B_LDS_ROW + ksl * 1024
                 return Vec(lds_load_b128(base, fx.Int32(off))).shuffle(
@@ -1071,7 +1097,7 @@ def launch_gemm_a8w4_tdm(
                             WMMA_M,
                             WMMA_N,
                             WMMA_K,
-                            fx.Float4E2M1FN,
+                            fx.Float8E4M3FN if w_is_fp8 else fx.Float4E2M1FN,
                             ACT_ELEM,
                             fx.Float32,
                             opsel_a=sb_sel,
@@ -1084,6 +1110,7 @@ def launch_gemm_a8w4_tdm(
             ]
         )
         WMMA_VECTOR_DWORDS = WMMA_N // 2
+        B_VECTOR_DWORDS = 16 if w_is_fp8 else WMMA_VECTOR_DWORDS
         c_frags = [
             fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Float32)
             for _ in range_constexpr(n_acc)
@@ -1144,7 +1171,7 @@ def launch_gemm_a8w4_tdm(
                         )
 
         DS_A = 2 if a_is_fp4 else 4
-        DS_B = 2
+        DS_B = 4 if w_is_fp8 else 2
         sb_pairs = output_n_rep // 2
         sa_pairs = (wmma_m_rep + 1) // 2
         BS_DS = wmma_n_rep * DS_B + sb_pairs + sa_pairs
@@ -1166,11 +1193,11 @@ def launch_gemm_a8w4_tdm(
                 for _ in range_constexpr(wmma_m_rep)
             ]
             b = [
-                fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Int32)
+                fx.make_rmem_tensor(B_VECTOR_DWORDS, fx.Int32)
                 for _ in range_constexpr(wmma_n_rep)
             ]
             if const_expr(SUPPORT_EXPLICIT_VGPR_PARTITION):
-                slot_width = wmma_m_rep * ACT_NDW + wmma_n_rep * WMMA_VECTOR_DWORDS
+                slot_width = wmma_m_rep * ACT_NDW + wmma_n_rep * B_VECTOR_DWORDS
                 assert slot_width <= 128
                 reg = 256 + slot_idx * 128
                 for wm in range_constexpr(wmma_m_rep):
@@ -1178,7 +1205,7 @@ def launch_gemm_a8w4_tdm(
                     reg += ACT_NDW
                 for wn in range_constexpr(wmma_n_rep):
                     fx.set_register(b[wn], register_class=fx.rocdl.VGPR, start=reg)
-                    reg += WMMA_VECTOR_DWORDS
+                    reg += B_VECTOR_DWORDS
                 assert reg <= 256 + (slot_idx + 1) * 128
             return RmemSlot(
                 a=a,

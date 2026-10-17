@@ -1084,7 +1084,9 @@ def resolve_activation_dtype(
         else:
             q_dtype_a = dtypes.fp4x2
 
-    if gfx == "gfx1250":
+    if gfx == "gfx1250" and not (
+        quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp8
+    ):
         if os.environ.get("AITER_FORCE_A8W4", "0") in ("1"):
             q_dtype_a = dtypes.fp8
         else:
@@ -1517,6 +1519,16 @@ def _fused_moe_impl(
     _validate_output_buffer_no_overlap(output, hidden_states)
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
+    if quant_type == QuantType.per_1x32 and q_dtype_w == torch.uint8:
+        # ATOM can preserve MX weights as raw byte tensors. Recover the logical
+        # dtype from the complete two-GEMM byte count; otherwise an MXFP8 weight
+        # is mistaken for packed FP4 and gfx1250 reads only half of every K row.
+        weight_nbytes = w1.numel() * w1.element_size() + w2.numel() * w2.element_size()
+        logical_elements = E * (3 * inter_dim * model_dim)
+        if weight_nbytes == logical_elements:
+            q_dtype_w = dtypes.fp8
+        elif weight_nbytes == logical_elements // 2:
+            q_dtype_w = dtypes.fp4x2
     q_dtype_a = resolve_activation_dtype(
         quant_type,
         q_dtype_w,
