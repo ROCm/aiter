@@ -2208,6 +2208,33 @@ def test_public_varlen_descale_route_skips_flydsl_for_ck_only_features(
         assert "pertensor" not in str(exc.value)
 
 
+@pytest.mark.parametrize("descale", [False, True])
+def test_public_varlen_skips_flydsl_when_not_installed(monkeypatch, descale):
+    """Without flydsl, varlen calls go to CK, or raise if descales need FlyDSL."""
+    from aiter import flash_attn_varlen_func
+    from aiter.ops import mha as mha_module
+
+    calls = _stub_varlen_backends(monkeypatch)
+    monkeypatch.setattr(mha_module, "_FLYDSL_AVAILABLE", False)
+    L, H = 1024, 1
+    dtype = torch.float8_e4m3fn if descale else torch.bfloat16
+    q = torch.empty(L, H, 192, dtype=dtype)
+    k = torch.empty(L, H, 192, dtype=dtype)
+    v = torch.empty(L, H, 128, dtype=dtype)
+    cu = torch.tensor([0, L], dtype=torch.int32)
+    kwargs = {"causal": True}
+    if descale:
+        s = torch.ones(1, dtype=torch.float32)
+        kwargs.update(q_descale=s, k_descale=s, v_descale=s)
+    assert flash_attn_varlen_func(q, k, v, cu, cu, L, L, **kwargs) == "ck"
+    assert calls == ["ck"]
+    if descale:
+        monkeypatch.setattr(mha_module, "ENABLE_CK", False)
+        with pytest.raises(RuntimeError, match="flydsl is not installed"):
+            flash_attn_varlen_func(q, k, v, cu, cu, L, L, **kwargs)
+        assert calls == ["ck"]
+
+
 _needs_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
 

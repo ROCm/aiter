@@ -3822,6 +3822,8 @@ def flash_attn_varlen_func(
     def descale_reject_reason():
         if ck_only_feature is not None:
             return ck_only_feature
+        if not _FLYDSL_AVAILABLE:
+            return "flydsl is not installed"
         return _varlen_descale_reject_reason(
             q,
             k,
@@ -3938,8 +3940,12 @@ def flash_attn_varlen_func(
     # take the CK path, which also consumes the descales. Without CK, FlyDSL is
     # the only backend that honors descales, so always try it. Features FlyDSL
     # cannot express (soft-cap, padded cu_seqlens) never take the descale route.
-    try_flydsl = not has_all_descales or (
-        ck_only_feature is None and (not ENABLE_CK or _prefer_flydsl_fp8_descale(q, v))
+    try_flydsl = _FLYDSL_AVAILABLE and (
+        not has_all_descales
+        or (
+            ck_only_feature is None
+            and (not ENABLE_CK or _prefer_flydsl_fp8_descale(q, v))
+        )
     )
     if try_flydsl and (len(window_size) < 3 or window_size[2] == 0):
         from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
