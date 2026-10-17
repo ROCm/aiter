@@ -1,0 +1,542 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""FlyDSL fp8 unified-attention backend for gfx942.
+
+Adapts ``kernels/unified_attention_fp8_gfx942.py`` to ``unified_attention``'s calling
+convention. Dispatch returns ``None`` for configs it can't serve or cedes, and
+the caller falls through to Triton unchanged.
+
+Served: Gemma-4's full and sliding layer shapes at TP1, causal paged
+attention, plain (unshuffled) FP8 E4M3FNUZ K/V with page 32/64,
+per-tensor fp32 descales and bf16 output.
+
+One launch serves a varlen batch: multi-token sequences run as prefill tiles,
+one-token sequences as KV splits merged by a combine launch. All-decode
+batches use a decode-only build, which writes the output itself at one split.
+A lone multi-token sequence that cannot fill the GPU splits its KV range,
+merged by a prefill combine.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+from functools import cache, lru_cache
+
+import torch
+
+from .kernels.unified_attention_fp8_gfx942 import (
+    build_unified_attention_fp8_gfx942_combine_module,
+    build_unified_attention_fp8_gfx942_module,
+    plan_num_kv_splits,
+    plan_prefill_splits,
+    prefill_block_k,
+    prefill_block_q,
+)
+
+__all__ = ["flydsl_unified_attention"]
+
+_FP8_DTYPE = torch.float8_e4m3fnuz
+_HEAD_DIMS = (256, 512)
+_PAGE_SIZES = (32, 64)
+# (query heads, KV heads, head dim, inclusive window keys). Keep automatic
+# dispatch on the shapes covered by correctness, performance and AOT evidence.
+_GEMMA4_SHAPES = {
+    (32, 4, 512, None),
+    (32, 16, 256, 1024),
+}
+
+
+@lru_cache(maxsize=1)
+def _is_flydsl_installed() -> bool:
+    return importlib.util.find_spec("flydsl") is not None
+
+
+@cache
+def is_flydsl_available(device_index: int) -> bool:
+    if not _is_flydsl_installed():
+        return False
+    props = torch.cuda.get_device_properties(device_index)
+    return props.gcnArchName.split(":", 1)[0] == "gfx942"
+
+
+@cache
+def _num_cus(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _window_keys(window_size):
+    """Inclusive key window, None for full attention, or False if unsupported."""
+    left, right = window_size
+    if left < 0 and right < 0:
+        return None
+    if left >= 0 and right in (0, -1):
+        return left + 1
+    return False
+
+
+def _dispatch_mode_ok(causal, window_size, block_table, shuffled_kv_cache, skip_reduce):
+    """Causal, paged, plain KV layout, no right window; skip_reduce asks for a
+    Triton output layout this kernel does not write."""
+    return (
+        bool(causal)
+        and _window_keys(window_size) is not False
+        and block_table is not None
+        and not shuffled_kv_cache
+        and not skip_reduce
+    )
+
+
+def _page_geometry_ok(block_size) -> bool:
+    return block_size in _PAGE_SIZES
+
+
+def _dtypes_ok(q, k, v, out, cu_seqlens_q, seqused_k, block_table) -> bool:
+    """FNUZ fp8 QKV, bf16 output, int32 index tensors."""
+    return (
+        q.dtype == _FP8_DTYPE
+        and k.dtype == _FP8_DTYPE
+        and v.dtype == _FP8_DTYPE
+        and out.dtype == torch.bfloat16
+        and cu_seqlens_q.dtype == torch.int32
+        and seqused_k.dtype == torch.int32
+        and block_table.dtype == torch.int32
+    )
+
+
+def _descales_ok(q_descale, k_descale, v_descale) -> bool:
+    """Per-tensor fp32 descales; numel()==1 admits the 0-dim scalars vLLM
+    passes, which _as_1d_descale widens."""
+    return all(
+        d is not None and d.dtype == torch.float32 and d.numel() == 1
+        for d in (q_descale, k_descale, v_descale)
+    )
+
+
+def _devices_ok(q, *tensors) -> bool:
+    """Every kernel input is a CUDA tensor on Q's device."""
+    return q.is_cuda and all(
+        isinstance(t, torch.Tensor) and t.is_cuda and t.device == q.device
+        for t in tensors
+    )
+
+
+def _as_1d_descale(d):
+    """FlyDSL's from_dlpack needs the singleton descale to be rank one."""
+    return d.reshape(1)
+
+
+def _geometry_ok(
+    q,
+    k,
+    v,
+    out,
+    num_kv_heads,
+    block_size,
+    num_queries_per_kv,
+    cu_seqlens_q,
+    block_table,
+    num_seqs,
+) -> bool:
+    """Head dim the kernel is built for; the GQA group divides the 16 MFMA
+    rows a wave owns; cu_seqlens covers every sequence."""
+    if (
+        q.dim() != 3
+        or k.dim() != 4
+        or v.shape != k.shape
+        or out.shape != q.shape
+        or cu_seqlens_q.dim() != 1
+        or block_table.dim() != 2
+    ):
+        return False
+    _, num_query_heads, head_size = q.shape
+    return (
+        head_size in _HEAD_DIMS
+        and tuple(k.shape[1:]) == (block_size, num_kv_heads, head_size)
+        and num_query_heads == num_kv_heads * num_queries_per_kv
+        and num_queries_per_kv > 0
+        and 16 % num_queries_per_kv == 0
+        and cu_seqlens_q.numel() == num_seqs + 1
+        and num_seqs > 0
+        and block_table.shape[0] >= num_seqs
+    )
+
+
+def _strides_ok(q, k, v, out, cu_seqlens_q, seqused_k, block_table) -> bool:
+    """Contiguous Q and O. K and V may be strided views of one cache (vLLM)
+    with a unit head-dim stride; their other strides are compiled in. The
+    kernel's vector loads promise 16-byte alignment to LLVM."""
+    return (
+        q.is_contiguous()
+        and out.is_contiguous()
+        and cu_seqlens_q.is_contiguous()
+        and seqused_k.dim() == 1
+        and seqused_k.is_contiguous()
+        and k.stride(3) == 1
+        and v.stride(3) == 1
+        and all(stride % 16 == 0 for stride in k.stride()[:3])
+        and all(stride % 16 == 0 for stride in v.stride()[:3])
+        and block_table.stride(1) == 1
+        and all(t.data_ptr() % 16 == 0 for t in (q, k, v))
+        and out.data_ptr() % 8 == 0
+        and all(t.data_ptr() % 4 == 0 for t in (cu_seqlens_q, seqused_k, block_table))
+    )
+
+
+def _gemma4_shape_ok(q, num_kv_heads, window_size) -> bool:
+    """Only route the Gemma-4 TP1 shapes covered by this ticket."""
+    window = _window_keys(window_size)
+    return (q.shape[1], num_kv_heads, q.shape[2], window) in _GEMMA4_SHAPES
+
+
+def _no_unsupported_features(
+    softcap, alibi_slopes, qq_bias, q_scales, output_scale, sinks
+) -> bool:
+    """Features the kernel has no path for; declining beats silently dropping."""
+    return (
+        not softcap
+        and alibi_slopes is None
+        and qq_bias is None
+        and q_scales is None
+        and output_scale is None
+        and sinks is None
+    )
+
+
+def _supported(
+    q,
+    k,
+    v,
+    out,
+    cu_seqlens_q,
+    seqused_k,
+    causal,
+    window_size,
+    block_table,
+    softcap,
+    q_descale,
+    k_descale,
+    v_descale,
+    num_kv_heads,
+    block_size,
+    num_queries_per_kv,
+    num_seqs,
+    q_scales,
+    alibi_slopes,
+    output_scale,
+    qq_bias,
+    sinks,
+    shuffled_kv_cache,
+    skip_reduce,
+) -> bool:
+    """Whether this exact configuration can be served."""
+    if not _devices_ok(
+        q,
+        k,
+        v,
+        out,
+        cu_seqlens_q,
+        seqused_k,
+        block_table,
+        q_descale,
+        k_descale,
+        v_descale,
+    ):
+        return False
+    device_index = q.device.index
+    if device_index is None or not is_flydsl_available(device_index):
+        return False
+    return (
+        _dispatch_mode_ok(
+            causal, window_size, block_table, shuffled_kv_cache, skip_reduce
+        )
+        and _page_geometry_ok(block_size)
+        and _dtypes_ok(q, k, v, out, cu_seqlens_q, seqused_k, block_table)
+        and _descales_ok(q_descale, k_descale, v_descale)
+        and _gemma4_shape_ok(q, num_kv_heads, window_size)
+        and _geometry_ok(
+            q,
+            k,
+            v,
+            out,
+            num_kv_heads,
+            block_size,
+            num_queries_per_kv,
+            cu_seqlens_q,
+            block_table,
+            num_seqs,
+        )
+        and _no_unsupported_features(
+            softcap, alibi_slopes, qq_bias, q_scales, output_scale, sinks
+        )
+        and _strides_ok(q, k, v, out, cu_seqlens_q, seqused_k, block_table)
+    )
+
+
+def _cede_to_triton(
+    head_size,
+    max_seqlen_q,
+    num_seqs,
+    max_seqlen_k,
+    block_size=None,
+    window=None,
+) -> bool:
+    """Keep measured FlyDSL loss regions on the tuned Triton implementation."""
+    if max_seqlen_q == 1:
+        if head_size == 512:
+            # Tiny decode is launch-latency bound; page 64 has no measured
+            # margin past 256 sequences.
+            return num_seqs * max_seqlen_k <= 2048 or (
+                block_size == 64 and num_seqs > 256
+            )
+        # Triton's page-32 sliding decode is as fast or faster past 38 sequences.
+        return window is not None and block_size == 32 and num_seqs > 38
+    if num_seqs == 1:
+        # A lone chunk over at least four cached tiles splits its KV range and
+        # wins. A short fresh prefill is latency bound: Triton's lighter
+        # prologue wins through 256 tokens at head 512 and 384 at head 256.
+        prefix = max_seqlen_k - max_seqlen_q
+        if window is not None:
+            prefix = min(prefix, window - 1)
+        short = 384 if head_size == 256 else 256
+        return max_seqlen_q <= short and prefix < 4 * prefill_block_k(head_size)
+    # A mixed batch cannot split a chunk's KV range, so a short chunk walks its
+    # prefix alone. Triton is as fast or faster through 128 queries at head
+    # 512, and at head 256 through 512 on page 32 and 256 on larger pages.
+    if head_size == 512:
+        return max_seqlen_q <= 128
+    return max_seqlen_q <= (512 if block_size == 32 else 256)
+
+
+def _as_i8(t: torch.Tensor) -> torch.Tensor:
+    """fp8 buffers are passed to FlyDSL as int8 views."""
+    return t.view(torch.int8) if t.dtype == _FP8_DTYPE else t
+
+
+def _workspace(device, numel):
+    """fp32 split partials, allocated per call: a shared buffer regrown later
+    would leave earlier captured graphs with a freed pointer."""
+    return torch.empty(numel, device=device, dtype=torch.float32)
+
+
+def _launch(
+    q,
+    k,
+    v,
+    out,
+    cu_seqlens_q,
+    max_seqlen_q,
+    seqused_k,
+    max_seqlen_k,
+    softmax_scale,
+    window,
+    block_table,
+    q_descale,
+    k_descale,
+    v_descale,
+    num_kv_heads,
+    block_size,
+    num_seqs,
+    num_kv_splits=None,
+    num_prefill_splits=None,
+):
+    """Launch a call that passed _supported. window is the inclusive key count
+    or None; num_kv_splits and num_prefill_splits force the decode and the
+    lone-sequence KV split counts."""
+    num_tokens, num_query_heads, head_size = q.shape
+    # max_seqlen_q is an upper bound under graph capture. For a lone sequence
+    # the packed token count reveals an actual one-token decode without a
+    # device read; otherwise treating it as a prefill leaves its row unwritten.
+    decode_only = max_seqlen_q == 1 or (num_seqs == 1 and num_tokens == 1)
+    # A lone multi-token sequence has no decode slots or decode combine, and
+    # may split its KV range instead.
+    lone_prefill = not decode_only and num_seqs == 1
+    # Triton's q-block count: an upper bound on any batch's prefill tiles.
+    tile_slots = (
+        0
+        if decode_only
+        else num_tokens // prefill_block_q(num_query_heads, num_kv_heads) + num_seqs
+    )
+    psplits = 1
+    if lone_prefill:
+        psplits = num_prefill_splits or plan_prefill_splits(
+            max_seqlen_q,
+            max_seqlen_k,
+            num_tokens,
+            num_query_heads,
+            num_kv_heads,
+            window,
+            head_size,
+            _num_cus(q.device.index),
+        )
+    splits = num_kv_splits or plan_num_kv_splits(
+        num_seqs,
+        max_seqlen_k,
+        num_kv_heads,
+        window,
+        head_size,
+        decode_only=decode_only,
+        num_cus=_num_cus(q.device.index),
+    )
+    # Each decode wave runs one split; the unified kernel has four per workgroup.
+    waves = 1 if decode_only else 4
+    groups = (splits + waves - 1) // waves
+    # A one-split decode-only launch writes the output itself.
+    direct = decode_only and groups == 1
+    decode_slots = 0 if lone_prefill else num_seqs * groups
+    stream = torch.cuda.current_stream(q.device)
+    if lone_prefill:
+        partials = num_tokens * num_query_heads * psplits if psplits > 1 else 0
+    elif direct:
+        partials = 0
+    else:
+        partials = num_seqs * num_query_heads * groups * waves
+    workspace = _workspace(q.device, max(4, partials * (head_size + 4)))
+    with torch.cuda.device(q.device):
+        kernel = build_unified_attention_fp8_gfx942_module(
+            head_size,
+            num_query_heads,
+            num_kv_heads,
+            window,
+            block_size,
+            k.stride()[:3] + v.stride()[:3],
+            decode_only=decode_only,
+        )
+        kernel(
+            _as_i8(q),
+            _as_i8(k),
+            _as_i8(v),
+            out,
+            workspace,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            _as_1d_descale(q_descale),
+            _as_1d_descale(k_descale),
+            _as_1d_descale(v_descale),
+            num_seqs,
+            tile_slots,
+            psplits,
+            groups,
+            # Binary-search steps over cu_seqlens_q's num_seqs + 1 entries.
+            (num_seqs - 1).bit_length(),
+            block_table.stride(0),
+            float(softmax_scale),
+            tile_slots * psplits + decode_slots,
+            stream=stream,
+        )
+        if psplits > 1:
+            combine = build_unified_attention_fp8_gfx942_combine_module(
+                head_size, num_query_heads, prefill=True
+            )
+            combine(workspace, out, cu_seqlens_q, num_tokens, psplits, stream=stream)
+        elif not lone_prefill and not direct:
+            combine = build_unified_attention_fp8_gfx942_combine_module(
+                head_size, num_query_heads
+            )
+            combine(
+                workspace, out, cu_seqlens_q, num_seqs, groups * waves, stream=stream
+            )
+    return out
+
+
+def flydsl_unified_attention(
+    q,
+    k,
+    v,
+    out,
+    cu_seqlens_q,
+    max_seqlen_q,
+    seqused_k,
+    max_seqlen_k,
+    softmax_scale,
+    causal,
+    window_size,
+    block_table,
+    softcap,
+    q_descale,
+    k_descale,
+    v_descale,
+    q_scales=None,
+    alibi_slopes=None,
+    output_scale=None,
+    qq_bias=None,
+    sinks=None,
+    shuffled_kv_cache=False,
+    skip_reduce=False,
+):
+    """Run unified attention on the FlyDSL fp8 gfx942 kernel.
+
+    Parameters mirror ``unified_attention``; max_seqlen_q and max_seqlen_k are
+    host integers bounding every sequence. Returns ``out`` (written in place),
+    or ``None`` to fall through to Triton.
+    """
+    # Only the plain [blocks, page, kv_heads, head_dim] cache is served.
+    if shuffled_kv_cache or q.dim() != 3 or k.dim() != 4:
+        return None
+    _, block_size, num_kv_heads, _ = k.shape
+    num_query_heads = q.shape[1]
+    if num_kv_heads <= 0 or num_query_heads % num_kv_heads:
+        return None
+    num_queries_per_kv = num_query_heads // num_kv_heads
+    num_seqs = len(seqused_k)
+    if not _supported(
+        q,
+        k,
+        v,
+        out,
+        cu_seqlens_q,
+        seqused_k,
+        causal,
+        window_size,
+        block_table,
+        softcap,
+        q_descale,
+        k_descale,
+        v_descale,
+        num_kv_heads,
+        block_size,
+        num_queries_per_kv,
+        num_seqs,
+        q_scales,
+        alibi_slopes,
+        output_scale,
+        qq_bias,
+        sinks,
+        shuffled_kv_cache,
+        skip_reduce,
+    ):
+        return None
+    window = _window_keys(window_size)
+    # A graph-capture bound may exceed the lone sequence's actual query length.
+    # Normalize the only host-observable case so routing and launch agree.
+    if num_seqs == 1 and q.shape[0] == 1:
+        max_seqlen_q = 1
+    if _cede_to_triton(
+        q.shape[-1],
+        max_seqlen_q,
+        num_seqs,
+        max_seqlen_k,
+        block_size,
+        window,
+    ):
+        return None
+    return _launch(
+        q,
+        k,
+        v,
+        out,
+        cu_seqlens_q,
+        max_seqlen_q,
+        seqused_k,
+        max_seqlen_k,
+        softmax_scale,
+        window,
+        block_table,
+        q_descale,
+        k_descale,
+        v_descale,
+        num_kv_heads,
+        block_size,
+        num_seqs,
+    )
