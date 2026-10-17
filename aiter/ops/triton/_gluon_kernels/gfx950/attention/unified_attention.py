@@ -767,113 +767,6 @@ class AsyncKVLoader:
 
 @aggregate
 @strip_annotate
-class ScaledKVLoader:
-    """Dequantize a directly staged FP8 page in the MFMA operand layout."""
-
-    base: AsyncKVLoader
-    k_scale_ptr: gl.tensor
-    v_scale_ptr: gl.tensor
-    seq_len: gl.tensor
-    scale_strides: gl.constexpr
-
-    @gluon.constexpr_function
-    def __init__(self, base, k_scale_ptr, v_scale_ptr, seq_len, scale_strides):
-        self.base = base
-        self.k_scale_ptr = k_scale_ptr
-        self.v_scale_ptr = v_scale_ptr
-        self.seq_len = seq_len
-        self.scale_strides = gl.constexpr(scale_strides)
-
-    @gluon.jit
-    def load_block_ids(self, i):
-        # The double buffer looks ahead by two pages. The final lookahead is
-        # unused, but its table load must stay within the allocated row.
-        if self.base.cfg.TILE_SIZE == self.base.cfg.BLOCK_SIZE:
-            i = gl.minimum(i, self.base.block_table_stride - 1)
-        return self.base.load_block_ids(i)
-
-    @gluon.jit
-    def load_k_to_shared(self, offset, buffer_id=0):
-        self.base.load_k_to_shared(offset, buffer_id)
-
-    @gluon.jit
-    def load_v_to_shared(self, offset, buffer_id=0):
-        self.base.load_v_to_shared(offset, buffer_id)
-
-    @gluon.jit
-    def dequantize(self, value, tile_index, target_dtype, is_key: gl.constexpr):
-        cfg = self.base.cfg
-        # Load the token scales in the same lane/register ownership as the
-        # MFMA operand. Expanding the missing head axis only broadcasts values;
-        # it does not redistribute a full FP32 tile through LDS.
-        if is_key:
-            scale_layout: gl.constexpr = cfg.k_layout
-            slots = gl.arange(0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, scale_layout))
-        else:
-            scale_layout: gl.constexpr = cfg.v_layout
-            slots = gl.arange(0, cfg.TILE_SIZE, layout=gl.SliceLayout(1, scale_layout))
-        token_start = tile_index * cfg.TILE_SIZE
-        valid = token_start + slots < self.seq_len
-        page = gl.load(
-            self.base.block_tables_ptr_shifted + token_start // cfg.BLOCK_SIZE
-        ).to(gl.int64)
-        slots = token_start % cfg.BLOCK_SIZE + slots
-        if is_key:
-            scale = gl.load(
-                self.k_scale_ptr
-                + page * self.scale_strides[0]
-                + slots * self.scale_strides[1],
-                mask=valid,
-                other=1.0,
-            )
-            scales = scale[None, :]
-        else:
-            scale = gl.load(
-                self.v_scale_ptr
-                + page * self.scale_strides[2]
-                + slots * self.scale_strides[3],
-                mask=valid,
-                other=1.0,
-            )
-            scales = scale[:, None]
-            mask = valid[:, None]
-            # Invalid slots may contain NaNs, so multiplying by zero is unsafe.
-            value = gl.where(mask, value, 0.0)
-        return (value * scales).to(target_dtype)
-
-    @gluon.jit
-    def load_k_from_shared(
-        self,
-        wait_count,
-        target_dtype,
-        buffer_id=0,
-        skip_wait: gl.constexpr = False,
-        RELAXED: gl.constexpr = False,
-        tile_index=0,
-    ):
-        raw = self.base.load_k_from_shared(
-            wait_count, gl.float32, buffer_id, skip_wait, RELAXED
-        )
-        return self.dequantize(raw, tile_index, target_dtype, True)
-
-    @gluon.jit
-    def load_v_from_shared(
-        self,
-        wait_count,
-        target_dtype,
-        buffer_id=0,
-        skip_wait: gl.constexpr = False,
-        RELAXED: gl.constexpr = False,
-        tile_index=0,
-    ):
-        raw = self.base.load_v_from_shared(
-            wait_count, gl.float32, buffer_id, skip_wait, RELAXED
-        )
-        return self.dequantize(raw, tile_index, target_dtype, False)
-
-
-@aggregate
-@strip_annotate
 class AsyncGatherKVLoader:
     """Async CDNA4 KV loader supporting TILE_SIZE != BLOCK_SIZE.
 
@@ -1188,6 +1081,113 @@ class AsyncGatherKVLoader:
             self.k_head_d_offset + within_block_k + block_base_k,
             self.v_head_d_offset + within_block_v + block_base_v,
         )
+
+
+@aggregate
+@strip_annotate
+class ScaledKVLoader:
+    """Dequantize a directly staged FP8 page in the MFMA operand layout."""
+
+    base: AsyncKVLoader | AsyncGatherKVLoader
+    k_scale_ptr: gl.tensor
+    v_scale_ptr: gl.tensor
+    seq_len: gl.tensor
+    scale_strides: gl.constexpr
+
+    @gluon.constexpr_function
+    def __init__(self, base, k_scale_ptr, v_scale_ptr, seq_len, scale_strides):
+        self.base = base
+        self.k_scale_ptr = k_scale_ptr
+        self.v_scale_ptr = v_scale_ptr
+        self.seq_len = seq_len
+        self.scale_strides = gl.constexpr(scale_strides)
+
+    @gluon.jit
+    def load_block_ids(self, i):
+        # The double buffer looks ahead by two pages. The final lookahead is
+        # unused, but its table load must stay within the allocated row.
+        if self.base.cfg.TILE_SIZE == self.base.cfg.BLOCK_SIZE:
+            i = gl.minimum(i, self.base.block_table_stride - 1)
+        return self.base.load_block_ids(i)
+
+    @gluon.jit
+    def load_k_to_shared(self, offset, buffer_id=0):
+        self.base.load_k_to_shared(offset, buffer_id)
+
+    @gluon.jit
+    def load_v_to_shared(self, offset, buffer_id=0):
+        self.base.load_v_to_shared(offset, buffer_id)
+
+    @gluon.jit
+    def dequantize(self, value, tile_index, target_dtype, is_key: gl.constexpr):
+        cfg = self.base.cfg
+        # Load the token scales in the same lane/register ownership as the
+        # MFMA operand. Expanding the missing head axis only broadcasts values;
+        # it does not redistribute a full FP32 tile through LDS.
+        if is_key:
+            scale_layout: gl.constexpr = cfg.k_layout
+            slots = gl.arange(0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, scale_layout))
+        else:
+            scale_layout: gl.constexpr = cfg.v_layout
+            slots = gl.arange(0, cfg.TILE_SIZE, layout=gl.SliceLayout(1, scale_layout))
+        token_start = tile_index * cfg.TILE_SIZE
+        valid = token_start + slots < self.seq_len
+        page = gl.load(
+            self.base.block_tables_ptr_shifted + token_start // cfg.BLOCK_SIZE
+        ).to(gl.int64)
+        slots = token_start % cfg.BLOCK_SIZE + slots
+        if is_key:
+            scale = gl.load(
+                self.k_scale_ptr
+                + page * self.scale_strides[0]
+                + slots * self.scale_strides[1],
+                mask=valid,
+                other=1.0,
+            )
+            scales = scale[None, :]
+        else:
+            scale = gl.load(
+                self.v_scale_ptr
+                + page * self.scale_strides[2]
+                + slots * self.scale_strides[3],
+                mask=valid,
+                other=1.0,
+            )
+            scales = scale[:, None]
+            mask = valid[:, None]
+            # Invalid slots may contain NaNs, so multiplying by zero is unsafe.
+            value = gl.where(mask, value, 0.0)
+        return (value * scales).to(target_dtype)
+
+    @gluon.jit
+    def load_k_from_shared(
+        self,
+        wait_count,
+        target_dtype,
+        buffer_id=0,
+        skip_wait: gl.constexpr = False,
+        RELAXED: gl.constexpr = False,
+        tile_index=0,
+    ):
+        raw = self.base.load_k_from_shared(
+            wait_count, gl.float32, buffer_id, skip_wait, RELAXED
+        )
+        return self.dequantize(raw, tile_index, target_dtype, True)
+
+    @gluon.jit
+    def load_v_from_shared(
+        self,
+        wait_count,
+        target_dtype,
+        buffer_id=0,
+        skip_wait: gl.constexpr = False,
+        RELAXED: gl.constexpr = False,
+        tile_index=0,
+    ):
+        raw = self.base.load_v_from_shared(
+            wait_count, gl.float32, buffer_id, skip_wait, RELAXED
+        )
+        return self.dequantize(raw, tile_index, target_dtype, False)
 
 
 @aggregate
