@@ -148,6 +148,25 @@ def _gfx950_gluon_supported(params: _UAParams):
     )
 
 
+def _use_gfx950_scaled_prefill_config(params: _UAParams):
+    """The shuffled BF16/FP8 configuration covered by the prefill shape sweep."""
+    return (
+        DEVICE_ARCH == "gfx950"
+        and not params.all_decode
+        and params.per_token_kv_scales
+        and params.shuffled_kv_cache
+        and params.v.ndim == 5
+        and params.q_dtype == torch.bfloat16
+        and params.head_size == params.head_size_v == 128
+        and params.block_size == 128
+        and params.num_queries_per_kv <= 64
+        and not params.sliding_window
+        and not params.use_alibi_slopes
+        and not params.use_qq_bias
+        and not params.softcap
+    )
+
+
 def use_2d_kernel(params: _UAParams, backend: str = "triton"):
     # if IS_DEVICE_ARCH_GFX12, always use 3D if all_decode and 2D otherwise
     if IS_DEVICE_ARCH_GFX12:
@@ -163,6 +182,11 @@ def use_2d_kernel(params: _UAParams, backend: str = "triton"):
         return True
 
     gate = params.target_num_prgms
+    if _use_gfx950_scaled_prefill_config(params):
+        # One M128 workgroup per CU already favors 2D over split attention.
+        # Requiring four waves here sends large query batches to the smaller
+        # split tile and repeats the same page loads/dequantization too often.
+        gate = params.num_sms
     if DEVICE_ARCH == "gfx1100":
         # On gfx1100 the 3D split-KV kernel only pays off while the 2D launch
         # is too small to fill the machine; past that the extra segment traffic
@@ -420,6 +444,12 @@ def unified_attention(
         config = get_unified_attention_config(
             "kv_split", params, backend="gluon" if use_gluon_3d else "triton"
         )
+        if not use_gluon_3d and _use_gfx950_scaled_prefill_config(params):
+            # Long contexts benefit from more than a single occupancy wave.
+            # Bound both scratch space and empty splits for short contexts.
+            config["NUM_SEGMENTS"] = min(
+                16, triton.next_power_of_2(triton.cdiv(max_seqlen_k, block_size))
+            )
         NUM_SEGMENTS = config["NUM_SEGMENTS"]
         # The triton kernels read a shuffled tile as one contiguous page, so
         # there the tile is the page. The gfx950 gluon loader gathers per token
@@ -584,6 +614,16 @@ def is_reduce_gluon_available(params: _UAParams, NUM_SEGMENTS, backend: str):
 def _triton_attention_config(params: _UAParams, op: str):
     """Resolve the exact query tile shared by dispatch and the kernel launch."""
     config = get_unified_attention_config(op, params, backend="triton")
+    if _use_gfx950_scaled_prefill_config(params):
+        # The split kernel has a different register/layout tradeoff: its
+        # validated M64/two-warp tile outperforms both M16 and M128. Do not
+        # inherit the four-warp 2D tile into the split kernel.
+        config.update(
+            BLOCK_M=128 if op == "attn_2d" else 64,
+            num_warps=4 if op == "attn_2d" else 2,
+            num_stages=1,
+            waves_per_eu=2,
+        )
     if DEVICE_ARCH == "gfx950" and params.shuffled_kv_cache:
         # A page-sized operand is staged in the query dtype. Leave LDS space
         # for dot-layout conversions rather than double buffering a large page.

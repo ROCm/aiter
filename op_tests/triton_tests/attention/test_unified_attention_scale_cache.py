@@ -388,3 +388,16 @@ if __name__ == "__main__":
             q_lens=[1, 17, 255, 256, 513],
             k_lens=[257, 273, 1023, 1037, 2049],
         )
+    # Exercise the tuned dispatch with GQA ratios beyond the two benchmark
+    # roles, partial pages and short contexts that use fewer than 16 splits.
+    for kv_heads in (1, 2, 4, 8, 16, 32, 64):
+        check_case(
+            "shuffle",
+            "token",
+            False,
+            page=128,
+            heads=64,
+            kv_heads=kv_heads,
+            q_lens=[1, 3, 19],
+            k_lens=[257, 519, 1037],
+        )
