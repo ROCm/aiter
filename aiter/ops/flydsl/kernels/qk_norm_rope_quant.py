@@ -21,7 +21,6 @@ import torch
 from flydsl.expr import const_expr, ptrtoint, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import FastMathFlags
-from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import Int32, ReductionOp, Stream, T
 
 from aiter.ops.flydsl.kernels import buffer_ops
@@ -2054,15 +2053,18 @@ def _build_kernel_w32_tdm(
 
             qw = _load_tensor_vec(q_weight, tid) if const_expr(q_weighted) else None
 
-            q_row0 = fx.Tensor(
-                fx.make_view(fx.get_iter(q_in), fx.make_layout((1, D), (D, 1)))
+            q_full = fx.Tensor(
+                fx.make_view(fx.get_iter(q_in), fx.make_layout((num_rows, D), (D, 1)))
             )
-            tdm_atom = fx.rocdl.make_tdm_atom(
-                q_row0,
-                [num_rows, None],
-                strides=[D, None],
+            q_tile = (1, D)
+            tdm_atom, q_coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                fx.rocdl.TensorLoad(),
+                q_full,
+                fx.make_layout(q_tile, (D, 1)),
+                q_tile,
                 num_warps=1,
             )
+            q_blk = fx.zipped_divide(q_coord, q_tile)[None, (None, 0)]
 
             def row_of(tile_idx):
                 return fx.min(tile_idx * RT + wave, nr_m1)
@@ -2071,15 +2073,13 @@ def _build_kernel_w32_tdm(
                 dst = fx.Tensor(
                     fx.make_view(
                         fx.inttoptr(lds_bf16_ptr_ty, lds_i32 + wave_lds_off + buf),
-                        fx.make_layout((1, D), (D, 1)),
+                        fx.make_layout((q_tile, 1), ((D, 1), D)),
                     )
                 )
-                fx.copy(
-                    tdm_atom,
-                    q_row0,
-                    dst,
-                    imm_offset=fx.Int64(row_of(tile_idx)) * (D * eb),
+                ts, tg = fx.rocdl.cdna5.tdm_partition(
+                    tdm_atom, 0, fx.make_layout(1, 1), dst, q_blk
                 )
+                fx.copy(tdm_atom, tg[None, row_of(tile_idx)], ts[None, 0])
 
             def compute_store(buf, tile_idx, cosv, sinv):
                 xv = _concat(
@@ -2135,7 +2135,7 @@ def _build_kernel_w32_tdm(
                 # throughout lets a drain tile read an LDS buffer whose load has
                 # not landed; it stays latent only while the per-tile compute
                 # happens to outlast the load.
-                tdm_ops.tensor_wait(min(K - 1, CT - 1 - i))
+                fx.rocdl.s_wait_tensorcnt(min(K - 1, CT - 1 - i))
                 fx.rocdl.s_wait_dscnt(0)
                 if const_expr(do_hoist):
                     cosv, sinv = cs_cache[0], cs_cache[1]

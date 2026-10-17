@@ -42,7 +42,6 @@ from flydsl.expr import arith, gpu, rocdl
 # Q/K/V staging managers (own their LDS swizzles + async copy schedules). They are
 # self-contained: this kernel maintains its own arch constants below and passes the
 # config each manager needs through its constructor.
-from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
 
@@ -826,10 +825,10 @@ def _core_attention(
         )
         q_frags = q_mgr.load_q_to_vgpr_part2(scale=softmax_scale)
         for _v in k_views:
-            fx.copy_atom_call(*_v)
+            fx.copy(*_v)
         for _v in v_views:
-            fx.copy_atom_call(*_v)
-        tdm_ops.tensor_wait(0)
+            fx.copy(*_v)
+        rocdl.s_wait_tensorcnt(0)
         gpu.barrier()
     else:
         k_gptrs, k_lds_ptrs, k_imm_offs = k_mgr.global_load_ptrs(
@@ -1015,7 +1014,7 @@ def _core_attention(
 
         def _drain_barrier():
             if USE_TDM_LOADER:
-                tdm_ops.tensor_wait(0)
+                rocdl.s_wait_tensorcnt(0)
             else:
                 rocdl.s_wait_asynccnt(0)
             rocdl.sched_barrier(0)
@@ -1031,9 +1030,9 @@ def _core_attention(
                     if USE_TDM_LOADER:
                         k_views, v_views = addr
                         for _v in k_views:
-                            fx.copy_atom_call(*_v)
+                            fx.copy(*_v)
                         for _v in v_views:
-                            fx.copy_atom_call(*_v)
+                            fx.copy(*_v)
                     else:
                         k_g, k_l, k_i, v_g, v_l, v_i = addr
                         _async_load_to_lds(k_g, k_l, cluster=True, imm_offs=k_i)

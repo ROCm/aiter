@@ -2232,13 +2232,15 @@ def build_moe_token_multidest_quant_module(
                 # barrier publishes chunk n, which only wave 0 waited on.
                 if const_expr(chunk == 0) and is_loader:
                     _issue_hidden(0)
-                    tdm_ops.tensor_wait(0)
+                    rocdl.s_wait_tensorcnt(0)
                 gpu.barrier()
                 if is_loader and const_expr(chunk + 1 < tdm_hidden_chunks):
                     _issue_hidden(chunk + 1)
                 if const_expr(chunk > 0):
                     if is_loader:
-                        tdm_ops.tensor_wait(1 if chunk + 1 < tdm_hidden_chunks else 0)
+                        rocdl.s_wait_tensorcnt(
+                            1 if chunk + 1 < tdm_hidden_chunks else 0
+                        )
                     gpu.barrier()
 
         # CTA-uniform guard (every launched block owns at least one token), so
@@ -2545,13 +2547,13 @@ def build_moe_token_multidest_compact_quant_module(
                 def chunk_prefetch(chunk):
                     if const_expr(chunk == 0) and is_loader:
                         _issue_hidden(0)
-                        tdm_ops.tensor_wait(0)
+                        rocdl.s_wait_tensorcnt(0)
                     gpu.barrier()
                     if is_loader and const_expr(chunk + 1 < tdm_hidden_chunks):
                         _issue_hidden(chunk + 1)
                     if const_expr(chunk > 0):
                         if is_loader:
-                            tdm_ops.tensor_wait(
+                            rocdl.s_wait_tensorcnt(
                                 1 if chunk + 1 < tdm_hidden_chunks else 0
                             )
                         gpu.barrier()

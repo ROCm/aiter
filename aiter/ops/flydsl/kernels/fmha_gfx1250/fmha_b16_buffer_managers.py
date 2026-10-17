@@ -33,7 +33,6 @@ Target: gfx1250 (MI400 / mi450), wave32, 8 waves per threadgroup (256 threads).
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import rocdl
-from flydsl.expr.rocdl import tdm_ops
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
@@ -960,8 +959,8 @@ def _tdm_load_views(
 ):
     """Build a LIST of ``(atom, g_view, lds_view)`` TDM global->LDS copies for one
     ``[n_rows, hdim]`` tile into a row-major padded (``hdim + pad_elems`` element row stride) LDS
-    block — PURE (no memory op), issue each with ``fx.copy_atom_call(*view)`` then drain with
-    ``tensor_wait(0)``. hdim is split into power-of-two column segments (pad_interval must be pow2):
+    block — PURE (no memory op), issue each with ``fx.copy(*view)`` then drain with
+    ``s_wait_tensorcnt(0)``. hdim is split into power-of-two column segments (pad_interval must be pow2):
     segment ``(c0, w)`` copies global cols ``[c0, c0+w)`` -> LDS cols ``[c0, c0+w)`` with
     ``pad_interval=w``, ``pad_amount=(hdim+pad_elems - w)`` so the LDS row still advances by the
     padded stride. One segment for pow2 hdim (128/256), two for 192. Src base = ``ptr_x[row0, head]``;
@@ -978,20 +977,33 @@ def _tdm_load_views(
     views = []
     for c0, w in _pow2_segments(hdim):
         gbase = fx.add_offset(base_iter, off + fx.Int64(c0))
-        g_view = fx.Tensor(fx.make_view(gbase, fx.make_layout((n_rows, w), (w, 1))))
-        atom = fx.rocdl.make_tdm_atom(
-            g_view,
-            [valid, None],
-            strides=[stride_seq, None],
-            num_warps=_DEFAULT_NUM_WAVES,
-            pad_interval=w,
-            pad_amount=row_elems - w,
+        tile = (n_rows, w)
+        g_view = fx.Tensor(
+            fx.make_view(gbase, fx.make_layout((valid, w), (stride_seq, 1)))
         )
+        atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+            fx.rocdl.TensorLoad(),
+            g_view,
+            fx.make_layout(tile, (row_elems, 1)),
+            tile,
+            num_warps=_DEFAULT_NUM_WAVES,
+        )
+        blk = fx.zipped_divide(coord, tile)[None, (0, None)]
         lds_iter = fx.inttoptr(lds_ptr_ty, lds_base + fx.Int32(c0 * _BF16_BYTES))
         lds_view = fx.Tensor(
-            fx.make_view(lds_iter, fx.make_layout((n_rows, w), (row_elems, 1)))
+            fx.make_view(
+                lds_iter,
+                fx.make_layout((tile, 1), ((row_elems, 1), n_rows * row_elems)),
+            )
         )
-        views.append((atom, g_view, lds_view))
+        ts, tg = fx.rocdl.cdna5.tdm_partition(
+            atom,
+            fx.rocdl.wave_id(),
+            fx.make_layout(_DEFAULT_NUM_WAVES, 1),
+            lds_view,
+            blk,
+        )
+        views.append((atom, tg[None, 0], ts[None, 0]))
     return views
 
 
@@ -1091,41 +1103,49 @@ class QManager16bV2:
         # row stride is preserved.
         for c0, w in _pow2_segments(self.qk_hdim):
             gbase = fx.add_offset(base_iter, off + fx.Int64(c0))
+            tile = (n_seq, n_head, w)
+            lds_stride = (n_head * self.row_elems, self.row_elems, 1)
             g_view = fx.Tensor(
                 fx.make_view(
-                    gbase, fx.make_layout((n_seq, n_head, w), (n_head * w, w, 1))
+                    gbase,
+                    fx.make_layout(
+                        (n_seq_valid, n_head, w), (stride_q_seq, stride_q_head, 1)
+                    ),
                 )
             )
-            atom = fx.rocdl.make_tdm_atom(
+            atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                fx.rocdl.TensorLoad(),
                 g_view,
-                [n_seq_valid, None, None],
-                strides=[stride_q_seq, stride_q_head, None],
+                fx.make_layout(tile, lds_stride),
+                tile,
                 num_warps=1,
-                pad_interval=w,
-                pad_amount=self.row_elems - w,
             )
+            blk = fx.zipped_divide(coord, tile)[None, (0, 0, None)]
             lds_iter = fx.inttoptr(lds_ptr_ty, warp_region + fx.Int32(c0 * _BF16_BYTES))
             lds_view = fx.Tensor(
                 fx.make_view(
                     lds_iter,
                     fx.make_layout(
-                        (n_seq, n_head, w), (n_head * self.row_elems, self.row_elems, 1)
+                        (tile, 1), (lds_stride, n_seq * n_head * self.row_elems)
                     ),
                 )
             )
-            fx.copy_atom_call(atom, g_view, lds_view)
+            ts, tg = fx.rocdl.cdna5.tdm_partition(
+                atom, 0, fx.make_layout(1, 1), lds_view, blk
+            )
+            fx.copy(atom, tg[None, 0], ts[None, 0])
         self._warp_region = warp_region
         self._lane_idx = lane_idx
 
     def load_q_to_vgpr_part2(self, *, scale):
-        """Drain this wave's Q TDM (``tensor_wait(0)``) and read its ``rows_per_warp x qk_hdim``
+        """Drain this wave's Q TDM (``s_wait_tensorcnt(0)``) and read its ``rows_per_warp x qk_hdim``
         tile into WMMA B-fragments (``scale`` folded). Returns a length-R list; entry ``qt`` is
         that q-tile's list of ``k_tiles`` v16-bf16 fragments (same as ``QManager16bV1``).
 
         Read collapses to 1 per-lane base + compile-time immediates (like K): lane ``l`` reads row
         ``l%16``, d-byte ``(l//16)*16``; fragment (qt, tile) = base + ``qt*16*row_bytes +
         tile*32*2`` (lo) and ``+ 16*2`` more (hi 8-col half)."""
-        tdm_ops.tensor_wait(0)
+        rocdl.s_wait_tensorcnt(0)
         v8_ty = fx.Vector.make_type(_CHUNK_ELEMS, self.elem_dtype)
         scale_bf16 = scale.to(self.elem_dtype)
         lane = self._lane_idx
@@ -1183,8 +1203,8 @@ class KManager16bV2:
     ):
         """Return a LIST of ``(atom, g_view, lds_view)`` TDM copies for this block's K tile into the
         padded LDS at ``ptr_lds`` (fx.Int32 byte base) — one per pow2 hdim segment (1 for 128/256, 2
-        for 192). Pure (hoistable); issue each with ``fx.copy_atom_call(*view)``, drain with
-        ``tdm_ops.tensor_wait(0)``."""
+        for 192). Pure (hoistable); issue each with ``fx.copy(*view)``, drain with
+        ``rocdl.s_wait_tensorcnt(0)``."""
         return _tdm_load_views(
             ptr_x=ptr_K,
             stride_seq=stride_k_seq,
@@ -1268,8 +1288,8 @@ class VManager16bV2:
         self, *, ptr_lds, ptr_V, stride_v_seq, stride_v_head, kv_head, kv_row0, kv_valid
     ):
         """Return a LIST of ``(atom, g_view, lds_view)`` TDM copies for this block's V tile (v_hdim=128
-        is pow2 -> one copy). Pure; issue each with ``fx.copy_atom_call(*view)``, drain with
-        ``tdm_ops.tensor_wait(0)``."""
+        is pow2 -> one copy). Pure; issue each with ``fx.copy(*view)``, drain with
+        ``rocdl.s_wait_tensorcnt(0)``."""
         return _tdm_load_views(
             ptr_x=ptr_V,
             stride_seq=stride_v_seq,
@@ -1676,13 +1696,28 @@ class OManager16bV2:
                     gbase, fx.make_layout((_WMMA_M, self.v_hdim), (self.v_hdim, 1))
                 )
             )
-            atom = fx.rocdl.make_tdm_atom(
-                g_view, [n_seq_valid, None], strides=[stride_o_seq, None], num_warps=1
+            o_tile = (_WMMA_M, self.v_hdim)
+            g_view = fx.Tensor(
+                fx.make_view(
+                    gbase,
+                    fx.make_layout((n_seq_valid, self.v_hdim), (stride_o_seq, 1)),
+                )
             )
+            atom, o_coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                fx.rocdl.TensorStore(),
+                g_view,
+                fx.make_layout(o_tile, (self.row_elems, 1)),
+                o_tile,
+                num_warps=1,
+            )
+            o_blk = fx.zipped_divide(o_coord, o_tile)[None, (0, None)]
             lds_view = fx.Tensor(
                 fx.make_view(
                     lds_iter,
-                    fx.make_layout((_WMMA_M, self.v_hdim), (self.row_elems, 1)),
+                    fx.make_layout(
+                        (o_tile, 1),
+                        ((self.row_elems, 1), _WMMA_M * self.row_elems),
+                    ),
                 )
             )
         else:
@@ -1702,22 +1737,38 @@ class OManager16bV2:
                     ),
                 )
             )
-            atom = fx.rocdl.make_tdm_atom(
+            o_tile = (n_seq, gqa, self.v_hdim)
+            o_lds_stride = (gqa * self.row_elems, self.row_elems, 1)
+            g_view = fx.Tensor(
+                fx.make_view(
+                    gbase,
+                    fx.make_layout(
+                        (n_seq_valid, gqa, self.v_hdim),
+                        (stride_o_seq, stride_o_head, 1),
+                    ),
+                )
+            )
+            atom, o_coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                fx.rocdl.TensorStore(),
                 g_view,
-                [n_seq_valid, None, None],
-                strides=[stride_o_seq, stride_o_head, None],
+                fx.make_layout(o_tile, o_lds_stride),
+                o_tile,
                 num_warps=1,
             )
+            o_blk = fx.zipped_divide(o_coord, o_tile)[None, (0, 0, None)]
             lds_view = fx.Tensor(
                 fx.make_view(
                     lds_iter,
                     fx.make_layout(
-                        (n_seq, gqa, self.v_hdim),
-                        (gqa * self.row_elems, self.row_elems, 1),
+                        (o_tile, 1),
+                        (o_lds_stride, n_seq * gqa * self.row_elems),
                     ),
                 )
             )
-        fx.copy_atom_call(atom, lds_view, g_view)  # src=shared, dst=global => store
+        tOs, tOg = fx.rocdl.cdna5.tdm_partition(
+            atom, 0, fx.make_layout(1, 1), lds_view, o_blk
+        )
+        fx.copy(atom, tOs[None, 0], tOg[None, 0])
 
 
 class OManager16bV3:
