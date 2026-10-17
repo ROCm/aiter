@@ -259,6 +259,7 @@ def compile_tdm_compact_plan(
     run_rows: int = PLAN_RUN_ROWS,
     s1f: bool = False,
     write_tok_map: bool = True,
+    align_m: int | None = None,
 ):
     """Compile the compact-plan kernel. ``hist_stride`` is ``npes * row_dwords``.
 
@@ -312,6 +313,12 @@ def compile_tdm_compact_plan(
     kernel reads the send list and the run table, tok_map only feeds the
     default dispatch (and the S1F check mode, which keeps it).
 
+    ``align_m`` (a multiple of ``tile_m``; default ``tile_m``) pads every
+    expert to that many rows instead of ``tile_m``. ``tile_m`` then only cuts
+    the runs and the tile_info m-tiles, so a stage-1 kernel whose GEMM1 tile is
+    ``align_m`` keeps its producers' ``tile_m``-row pieces and reads ``align_m
+    // tile_m`` tile_info words (and flags) per GEMM1 m-tile.
+
     """
     if WAVE != 32:
         raise ValueError("compact plan requires gfx1250 wave32")
@@ -322,6 +329,9 @@ def compile_tdm_compact_plan(
             f"compact plan LDS hist supports at most 1024 segments, got {segs}"
         )
     tile_m = int(tile_m)
+    align_m = tile_m if align_m is None else int(align_m)
+    if align_m < tile_m or align_m % tile_m:
+        raise ValueError(f"align_m={align_m} must be a multiple of tile_m={tile_m}")
     compact_cap = int(compact_cap)
     max_routes = max(1, int(max_routes))
     hist_pingpong = bool(hist_pingpong)
@@ -339,6 +349,8 @@ def compile_tdm_compact_plan(
         kernel_name += f"_b{plan_blocks}"
     if plan_waves != default_waves:
         kernel_name += f"_w{plan_waves}"
+    if align_m != tile_m:
+        kernel_name += f"_a{align_m}"
     s1f = bool(s1f)
     emit_runs = bool(emit_runs) or s1f
     if s1f and (epr > 255 or tile_m > 0xFFFF):
@@ -424,6 +436,8 @@ def compile_tdm_compact_plan(
     tm_pow2 = tile_m & (tile_m - 1) == 0
     rr_pow2 = run_rows & (run_rows - 1) == 0
     tm_shift = tile_m.bit_length() - 1
+    am_pow2 = align_m & (align_m - 1) == 0
+    am_shift = align_m.bit_length() - 1
     rr_shift = run_rows.bit_length() - 1
     per_tile = (tile_m + run_rows - 1) // run_rows
     bnd_n = npes + 1
@@ -447,6 +461,12 @@ def compile_tdm_compact_plan(
 
     def _tmod(x):
         return x & fx.Int32(tile_m - 1) if tm_pow2 else x % fx.Int32(tile_m)
+
+    def _aceil(x):
+        """``x`` rounded up to the expert alignment ``align_m``."""
+        x = x + fx.Int32(align_m - 1)
+        q = x >> fx.Int32(am_shift) if am_pow2 else x // fx.Int32(align_m)
+        return q * fx.Int32(align_m)
 
     def _rceil(x):
         x = x + fx.Int32(run_rows - 1)
@@ -1087,7 +1107,7 @@ def compile_tdm_compact_plan(
                 if in_expert:
                     total = _ld(lds_total, idx)
                     my_prefix = _ld(lds_pref, idx)
-                aligned = _tdiv(total + fx.Int32(tile_m - 1)) * fx.Int32(tile_m)
+                aligned = _aceil(total)
                 inclusive = _wave32_inclusive_scan_i32(aligned, lane_i)
                 expert_start = carry + inclusive - aligned
                 if in_expert:
@@ -1159,7 +1179,7 @@ def compile_tdm_compact_plan(
                         live_k = (fx.Int32(k) < ch_w) & (e_k < fx.Int32(epr))
                         e_ks = fx.Int32((e_k < fx.Int32(epr)).select(e_k, fx.Int32(0)))
                         t_k = _ld(lds_total, dest_w * fx.Int32(epr) + e_ks)
-                        a_k = _tdiv(t_k + fx.Int32(tile_m - 1)) * fx.Int32(tile_m)
+                        a_k = _aceil(t_k)
                         pre = pre + fx.Int32(live_k.select(a_k, fx.Int32(0)))
                     _scan_chunk(dest_w, ch_w * fx.Int32(WAVE), _wsum(pre))
             else:
