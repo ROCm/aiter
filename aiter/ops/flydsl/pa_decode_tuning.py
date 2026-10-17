@@ -75,9 +75,13 @@ class _PADecodeAutotuneResources:
             query_length=query_length,
         )
         rows = query_length * self.query.shape[1] // key.shape[1]
+        value_dim = value.shape[-2] if value.ndim == 5 else value.shape[2]
         scalar_shape = (key.shape[1], plan.capacity, rows)
-        output = torch.full_like(
-            self.query, float("nan"), memory_format=torch.contiguous_format
+        output = torch.full(
+            (*self.query.shape[:-1], value_dim),
+            float("nan"),
+            dtype=self.query.dtype,
+            device=self.query.device,
         )
         workspace = {
             "exp_sums": torch.empty(
@@ -87,7 +91,7 @@ class _PADecodeAutotuneResources:
                 scalar_shape, dtype=torch.float32, device=output.device
             ),
             "temporary_output": torch.empty(
-                (*scalar_shape, self.query.shape[-1]),
+                (*scalar_shape, value_dim),
                 dtype=output.dtype,
                 device=output.device,
             ),
@@ -173,6 +177,7 @@ def _validate_pa_decode_config(arguments):
         "num_kv_heads",
         "query_group_size",
         "head_dim",
+        "value_dim",
         "block_size",
         "query_length",
         "query_dtype",
@@ -193,6 +198,7 @@ def _pa_decode_autotuner(
     num_kv_heads,
     query_group_size,
     head_dim,
+    value_dim,
     block_size,
     query_length,
     query_dtype,
@@ -313,6 +319,9 @@ def prepare_pa_decode_plan(
             "num_kv_heads": key_cache.shape[1],
             "query_group_size": query.shape[1] // key_cache.shape[1],
             "head_dim": query.shape[-1],
+            "value_dim": (
+                value_cache.shape[-2] if value_cache.ndim == 5 else value_cache.shape[2]
+            ),
             "block_size": key_cache.shape[3],
             "query_length": query_length,
             "query_dtype": str(query.dtype),
@@ -376,6 +385,7 @@ def _parse_args(argv=None):
     parser.add_argument("--num-query-heads", type=_positive_int, default=16)
     parser.add_argument("--num-kv-heads", type=_positive_int, default=1)
     parser.add_argument("--head-dim", type=_positive_int, default=128)
+    parser.add_argument("--value-dim", type=_positive_int)
     parser.add_argument("-q", "--query-length", type=_positive_int, default=1)
     parser.add_argument(
         "-s",
@@ -413,8 +423,17 @@ def _parse_args(argv=None):
         parser.error("--num-query-heads must be divisible by --num-kv-heads")
     if not 64 <= args.head_dim <= 1024 or args.head_dim % 64:
         parser.error("--head-dim must be a multiple of 64 in [64, 1024]")
-    if args.kv_dtype == "fp8" and args.head_dim != 64 and args.head_dim % 128:
+    args.value_dim = args.head_dim if args.value_dim is None else args.value_dim
+    asymmetric = args.value_dim != args.head_dim
+    if (
+        args.kv_dtype == "fp8"
+        and args.head_dim != 64
+        and args.head_dim % 128
+        and not (asymmetric and args.head_dim == 192 and args.value_dim == 128)
+    ):
         parser.error("FP8 --head-dim must be 64 or a multiple of 128")
+    if args.value_dim % 64 or not 64 <= args.value_dim <= 1024:
+        parser.error("--value-dim must be a multiple of 64 in [64, 1024]")
     if args.scale_mode is None:
         args.scale_mode = "per-token" if args.kv_dtype == "fp8" else "none"
     if args.kv_dtype == "bf16" and (
@@ -454,7 +473,12 @@ def _make_tuning_inputs(args, device, kv_dtype):
     """Construct the requested shape with logical, vectorized K/V layouts."""
     torch.manual_seed(args.seed)
     query_dtype = torch.bfloat16 if args.query_dtype == "bf16" else torch.float16
-    page, dim, heads = args.block_size, args.head_dim, args.num_kv_heads
+    page, dim, value_dim, heads = (
+        args.block_size,
+        args.head_dim,
+        args.value_dim,
+        args.num_kv_heads,
+    )
     max_length = max(args.context_length)
     pages_per_seq = (max_length + page - 1) // page
     pages = args.batch_size * pages_per_seq
@@ -466,7 +490,9 @@ def _make_tuning_inputs(args, device, kv_dtype):
     key = torch.empty(
         (pages, heads, page, dim), dtype=torch.bfloat16, device=device
     ).uniform_(-0.5, 0.5)
-    value = torch.empty_like(key).uniform_(-0.5, 0.5)
+    value = torch.empty(
+        (pages, heads, page, value_dim), dtype=torch.bfloat16, device=device
+    ).uniform_(-0.5, 0.5)
     key_scale = value_scale = None
     if args.kv_dtype == "fp8":
         key, key_scale = _quantize_kv(key, kv_dtype, args.scale_mode)
@@ -478,7 +504,7 @@ def _make_tuning_inputs(args, device, kv_dtype):
         .contiguous()
     )
     value_cache = (
-        value.reshape(pages, heads, page // vector, vector, dim)
+        value.reshape(pages, heads, page // vector, vector, value_dim)
         .permute(0, 1, 2, 4, 3)
         .contiguous()
         if args.trans_v
@@ -539,7 +565,7 @@ def main(argv=None):
         kv_dtype = torch.float8_e4m3fn if arch == "gfx950" else torch.float8_e4m3fnuz
     print(
         f"Tuning {arch}: batch={args.batch_size}, Q heads={args.num_query_heads}, "
-        f"KV heads={args.num_kv_heads}, dim={args.head_dim}, "
+        f"KV heads={args.num_kv_heads}, dims={args.head_dim}/{args.value_dim}, "
         f"query length={args.query_length}, max context={max(args.context_length)}, "
         f"page={args.block_size}, KV={args.kv_dtype}"
     )
