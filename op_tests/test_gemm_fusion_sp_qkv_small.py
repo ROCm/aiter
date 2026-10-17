@@ -295,3 +295,31 @@ def test_reset_runs_init_hooks():
     r.finalize()
     r.quiesce_and_reset()
     assert calls == [1, 1]
+
+
+def test_reset_order_with_drain_hook():
+    """A2-H for large-M: device sync -> drain (all plans) + sync -> barrier -> zero+init -> sync -> barrier."""
+    be, d = FakeBackend(), FakeDist()
+    ev = []
+    be_orig_sync, be_orig_zero = be.device_sync, be.zero
+    be.device_sync = lambda dev: (ev.append("sync"), be_orig_sync(dev))[1]
+    be.zero = lambda dev, loc, n: (ev.append("zero"), be_orig_zero(dev, loc, n))[1]
+    d.barrier = lambda group=None: ev.append("barrier")
+    r = FusionResources(0, 4, dist=d, backend=be)
+    r.ensure("big", [WindowReq("a", 100, "p2p_window")])
+    r.ensure("small", [WindowReq("b", 100, "p2p_window")])
+    r.set_drain("big", lambda: ev.append("drain"))
+    r.set_init("big", lambda: ev.append("init"))
+    r.finalize()
+    ev.clear()
+    r.quiesce_and_reset()
+    assert ev == ["sync", "drain", "sync", "barrier", "zero", "init", "zero", "sync", "barrier"]
+    # no drain hooks -> no extra sync (small-M only)
+    r2 = FusionResources(0, 4, dist=d, backend=FakeBackend())
+    r2.ensure("s", [WindowReq("b", 100, "p2p_window")])
+    ev2 = []
+    r2.backend.device_sync = lambda dev: ev2.append("sync")
+    r2.backend.zero = lambda dev, loc, n: ev2.append("zero")
+    d.barrier = lambda group=None: ev2.append("barrier")
+    r2.quiesce_and_reset()
+    assert ev2 == ["sync", "barrier", "zero", "sync", "barrier"]

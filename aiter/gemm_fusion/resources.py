@@ -132,6 +132,7 @@ class FusionResources:
         self.devcomm = None
         self.windows: Dict[str, Dict[str, Window]] = {}  # owner -> name -> Window
         self._init_hooks: Dict[str, Callable[[], None]] = {}  # owner -> control-block initializer (re-run after every zeroing)
+        self._drain_hooks: Dict[str, Callable[[], None]] = {}  # owner -> pre-reset SDMA drain
         self.finalized = False
         self._released = False
         self._init_comm()
@@ -179,6 +180,11 @@ class FusionResources:
         self._init_hooks[owner] = fn
         fn()
 
+    def set_drain(self, owner: str, fn: Callable[[], None]):
+        """Register the owner's pre-reset drain (large-M: lg_comm_drain_all = quietQueue on every SDMA peer queue; it must
+        complete, with a device sync, on EVERY rank before any window is zeroed). Small-M plans have no SDMA queues: no hook."""
+        self._drain_hooks[owner] = fn
+
     def peers(self, win: Window) -> List[int]:
         return [self.backend.peer_ptr(self.comm, win.local, p) for p in range(self.world)]
 
@@ -196,8 +202,13 @@ class FusionResources:
             self.backend.zero(self.device, w.local, w.bytes)
 
     def quiesce_and_reset(self):
-        """A2-H: device sync -> barrier -> reset control/Rx windows -> device sync -> barrier. All ranks must call it."""
+        """A2-H: device sync -> per-plan drain (large-M: lg_comm_drain_all) + device sync -> barrier -> reset/init windows
+        -> device sync -> barrier. All ranks must call it."""
         self.backend.device_sync(self.device)
+        for hook in self._drain_hooks.values():
+            hook()
+        if self._drain_hooks:
+            self.backend.device_sync(self.device)
         self._barrier()
         for owner, wins in self.windows.items():
             self._zero_windows(wins.values())

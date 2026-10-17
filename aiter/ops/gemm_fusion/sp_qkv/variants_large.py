@@ -102,6 +102,7 @@ class SpQkvLarge(Plan):
             if not h:
                 raise RuntimeError("lg_attach_v1 failed")
             got = sc[self.owner] = lrt.LargeContext(lib, C.c_void_p(h), self.M, self.F, res.rank)
+            res.set_drain(self.owner, lambda c=got: c.drain_all(C.c_void_p(None)))  # A2-H: quietQueue on all peer queues before any reset
             res.set_init(self.owner, got.init_control)  # epoch=1 + magic; re-run after every reset
         self._ctx = got
         return got
