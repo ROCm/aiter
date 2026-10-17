@@ -186,9 +186,10 @@ def pa_decode(
     A 4D ``key_cache`` selects the NHD layout: K and V are equally shaped
     [num_blocks, 64, num_kv_heads, 256] views with a contiguous head axis and
     arbitrary other strides, e.g. both halves of one 512-byte token row. NHD
-    requires gfx950, FP8 KV, head 256, page 64, no sliding window, and a
-    uniform query_length whose rows (query_length times the GQA group size)
-    fit two 16-row M-tiles, e.g. query_length 1-4 at GQA 8. Each view must be
+    requires gfx950, FP8 KV, head 256, page 64, and a uniform query_length
+    whose rows (query_length times the GQA group size) fit two 16-row M-tiles,
+    e.g. query_length 1-4 at GQA 8. Both scale modes and positive sliding
+    windows are supported. Each view must be
     16-byte aligned with 16-byte multiple strides, its token rows must not
     overlap, and its strides and in-page span must fit int32; heads-outermost
     storage with several KV heads is thus limited to 2 GiB per head.
@@ -626,7 +627,7 @@ def pa_decode(
     stride_k_block = stride_k_token = stride_k_head = 0
     stride_v_block = stride_v_token = stride_v_head = 0
     if nhd_layout:
-        if sliding_window > 0 or not d256_pipe(
+        if not d256_pipe(
             arch,
             kv_dtype,
             head_dim,
@@ -635,8 +636,8 @@ def pa_decode(
             query_group_size,
         ):
             raise NotImplementedError(
-                "NHD pa_decode requires gfx950, FP8 KV, head 256, page 64, no "
-                "sliding window, and a uniform query_length * query_group_size "
+                "NHD pa_decode requires gfx950, FP8 KV, head 256, page 64, "
+                "and a uniform query_length * query_group_size "
                 "of at most 32 rows"
             )
         stride_k_block, stride_k_token, stride_k_head = _nhd_strides(key_cache)
