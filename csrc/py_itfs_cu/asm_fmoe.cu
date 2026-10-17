@@ -233,7 +233,7 @@ class FMoeKernel
         {
 
             bdx = 256;
-            gdx = this->num_persistent_tgs;
+            gdx = args.total_tgs;
             gdy = 1;
             gdz = 1;
         }
@@ -272,8 +272,14 @@ class FMoeKernel
     };
 };
 
-FMoeKernel* get_heuristic_kernel(
-    int inter_dim, int sub_X_cnt, CFG* cfgs, int smf = 0, std::string kernel_name = "", int block_size_M = 32)
+// model_dim must be a multiple of the kernel's dim_align (0 = unconstrained); 0 skips the check.
+FMoeKernel* get_heuristic_kernel(int inter_dim,
+                                 int sub_X_cnt,
+                                 CFG* cfgs,
+                                 int smf                 = 0,
+                                 std::string kernel_name = "",
+                                 int block_size_M        = 32,
+                                 int model_dim           = 0)
 {
     FMoeKernel* impl_ptr        = nullptr;
     uint32_t num_cu             = get_num_cu_func();
@@ -297,7 +303,7 @@ FMoeKernel* get_heuristic_kernel(
                 continue;
             const auto& cfg = el.second;
             if(cfg.vskip == vskip && cfg.smf == smf && block_size_M == cfg.subGU_m &&
-               cfg.flat == 0)
+               cfg.flat == 0 && model_dim % std::max(cfg.dim_align, 1) == 0)
             {
                 if((inter_dim % cfg.subGU_n) == 0)
                 {
@@ -331,12 +337,22 @@ FMoeKernel* get_heuristic_kernel(
                     ", smf: ",
                     smf,
                     ", vskip: ",
-                    vskip);
+                    vskip,
+                    ", model_dim: ",
+                    model_dim);
     }
     auto it = cfgs->find(selectedKl);
     if(it != cfgs->end())
     {
         const auto& cfg     = it->second;
+        AITER_CHECK(model_dim % std::max(cfg.dim_align, 1) == 0,
+                    __func__,
+                    ": ",
+                    selectedKl,
+                    " requires model_dim % ",
+                    cfg.dim_align,
+                    " == 0; got model_dim=",
+                    model_dim);
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
         if(cfg.ps == 1)
@@ -986,8 +1002,13 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             AITER_CHECK(
                 false, __func__, "Unsupported activation type for fmoe_fp8_blockscale_g1u1");
 
-        impl_ptr =
-            get_heuristic_kernel(inter_dim, sorted_expert_ids->size(0), config_map, 0, kernel_name_str, block_size_M);
+        impl_ptr = get_heuristic_kernel(inter_dim,
+                                        sorted_expert_ids->size(0),
+                                        config_map,
+                                        0,
+                                        kernel_name_str,
+                                        block_size_M,
+                                        down->size(1));
         impl_ptr->launch_kernel<1, 2, false>(out,
                                              input,
                                              gate,
