@@ -4,6 +4,7 @@
 import functools
 import os
 import re
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
@@ -262,6 +263,66 @@ def _fused_decode_sort_quant(
 
 # Optional hook for collecting per-stage benchmark callables.
 kernel_bench_callable = None
+
+# Optional BM=16 sort metadata from a caller's fused route+sort kernel (e.g.
+# SGLang's radix-4 router), registered on the calling thread immediately before
+# fused_moe. CUDA-graph replay does not re-enter Python, so a captured fused_moe
+# keeps whichever sort launches it was captured with.
+_PRESORTED_MOE = threading.local()
+# The only block size a presort is accepted for; other tile sizes re-sort.
+_PRESORTED_MOE_BLOCK_M = 16
+
+
+def register_presorted_moe(aux: dict | None) -> None:
+    """Hand the next fused_moe call on this thread a precomputed BM=16 sort.
+
+    ``aux`` holds the sort outputs (sorted_token_ids, sorted_weights,
+    sorted_expert_ids, num_valid_ids, m_indices, reverse_sorted) and the keys
+    they were computed for (topk_ids_ptr, topk_weights_ptr, M, block_m,
+    num_experts, topk). Set moe_buf_zeroed and moe_buf_ptr when the caller
+    already zeroed the buffer it will pass as ``output``. The next fused_moe
+    consumes it on every path, whether or not it matches or is used, so a stale
+    registration never applies to a later call. It is only used when the call
+    runs with block_m == 16 and without expert_mask or num_local_tokens; other
+    calls run fused_moe's own sort.
+    """
+    _PRESORTED_MOE.aux = aux
+
+
+def _pop_presorted_moe():
+    aux = getattr(_PRESORTED_MOE, "aux", None)
+    _PRESORTED_MOE.aux = None
+    return aux
+
+
+def _match_presorted_moe(
+    aux,
+    topk_ids,
+    topk_weight,
+    *,
+    block_m,
+    num_experts,
+    topk,
+    expert_mask=None,
+    num_local_tokens=None,
+):
+    if not aux or int(block_m) != _PRESORTED_MOE_BLOCK_M:
+        return None
+    # The presort has no expert mask applied and covers every row of topk_ids;
+    # moe_sorting honors both, so a masked or row-limited call must re-sort.
+    if expert_mask is not None or num_local_tokens is not None:
+        return None
+    if (
+        int(aux.get("topk_ids_ptr", 0)) != int(topk_ids.data_ptr())
+        # sorted_weights were gathered from this tensor.
+        or int(aux.get("topk_weights_ptr", 0)) != int(topk_weight.data_ptr())
+        or int(aux.get("M", -1)) != int(topk_ids.shape[0])
+        or int(aux.get("block_m", -1)) != int(block_m)
+        or int(aux.get("num_experts", -1)) != int(num_experts)
+        or int(aux.get("topk", -1)) != int(topk)
+    ):
+        return None
+    return aux
 
 
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
@@ -1141,61 +1202,105 @@ def fused_moe(
     FlyDSL AOT cache.
 
     """
-    has_shared_expert = (
-        any(
-            tensor is not None
-            for tensor in (shared_w1, shared_w2, shared_w1_scale, shared_w2_scale)
-        )
-        or shared_expert_id != -1
-    )
-    if not clamp_shared and not has_shared_expert:
-        raise ValueError("clamp_shared=False requires FHMoE shared-expert dispatch")
-    if has_shared_expert:
-        routed_mxfp8 = w1 is not None and w1.dtype == dtypes.fp8
-        unsupported = []
-        if stage2_scatter is not None:
-            unsupported.append("stage2_scatter")
-        if quant_type_a is not None:
-            unsupported.append("quant_type_a")
-        fhmoe_quant_dtype_a = (
-            dtypes.fp8 if GateMode(gate_mode) == GateMode.INTERLEAVE else dtypes.fp4x2
-        )
-        if quant_dtype_a is not None and quant_dtype_a != fhmoe_quant_dtype_a:
-            unsupported.append("quant_dtype_a")
-        if quant_dtype_a2 is not None:
-            unsupported.append("quant_dtype_a2")
-        # The MXFP8 path does not consume caller-prequantized activations and
-        # requires an explicit preshuffle marker. Preserve the existing DSV4
-        # MXFP4 path, which accepts activation scales and trusts its layout.
-        if routed_mxfp8 and a1_scale is not None:
-            unsupported.append("a1_scale")
-        if routed_mxfp8 and a2_scale is not None:
-            unsupported.append("a2_scale")
-        if unsupported:
-            raise NotImplementedError(
-                "FHMoE shared-expert dispatch does not support "
-                + ", ".join(unsupported)
+    # The custom op consumes a register_presorted_moe() registration at runtime;
+    # an error raised here first (e.g. a non-enum activation) would leave it live
+    # for a later call that reuses the same routing buffers, so drop it then.
+    try:
+        has_shared_expert = (
+            any(
+                tensor is not None
+                for tensor in (shared_w1, shared_w2, shared_w1_scale, shared_w2_scale)
             )
-        weights = (w1, w2, shared_w1, shared_w2)
-        if routed_mxfp8 and any(
-            weight is not None and not getattr(weight, "is_shuffled", False)
-            for weight in weights
-        ):
-            raise ValueError(
-                "FHMoE weights must be AITER-preshuffled and marked "
-                "is_shuffled=True; re-run the shuffle after tensor copies"
+            or shared_expert_id != -1
+        )
+        if not clamp_shared and not has_shared_expert:
+            raise ValueError("clamp_shared=False requires FHMoE shared-expert dispatch")
+        if has_shared_expert:
+            routed_mxfp8 = w1 is not None and w1.dtype == dtypes.fp8
+            unsupported = []
+            if stage2_scatter is not None:
+                unsupported.append("stage2_scatter")
+            if quant_type_a is not None:
+                unsupported.append("quant_type_a")
+            fhmoe_quant_dtype_a = (
+                dtypes.fp8
+                if GateMode(gate_mode) == GateMode.INTERLEAVE
+                else dtypes.fp4x2
             )
-        from aiter.fhmoe import _fhmoe
+            if quant_dtype_a is not None and quant_dtype_a != fhmoe_quant_dtype_a:
+                unsupported.append("quant_dtype_a")
+            if quant_dtype_a2 is not None:
+                unsupported.append("quant_dtype_a2")
+            # The MXFP8 path does not consume caller-prequantized activations and
+            # requires an explicit preshuffle marker. Preserve the existing DSV4
+            # MXFP4 path, which accepts activation scales and trusts its layout.
+            if routed_mxfp8 and a1_scale is not None:
+                unsupported.append("a1_scale")
+            if routed_mxfp8 and a2_scale is not None:
+                unsupported.append("a2_scale")
+            if unsupported:
+                raise NotImplementedError(
+                    "FHMoE shared-expert dispatch does not support "
+                    + ", ".join(unsupported)
+                )
+            weights = (w1, w2, shared_w1, shared_w2)
+            if routed_mxfp8 and any(
+                weight is not None and not getattr(weight, "is_shuffled", False)
+                for weight in weights
+            ):
+                raise ValueError(
+                    "FHMoE weights must be AITER-preshuffled and marked "
+                    "is_shuffled=True; re-run the shuffle after tensor copies"
+                )
+            from aiter.fhmoe import _fhmoe
 
-        return _fhmoe(
+            return _fhmoe(
+                hidden_states=hidden_states,
+                w1=w1,
+                w2=w2,
+                topk_weight=topk_weight,
+                topk_ids=topk_ids,
+                expert_mask=expert_mask,
+                activation=activation,
+                quant_type=quant_type,
+                doweight_stage1=doweight_stage1,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
+                block_size_M=block_size_M,
+                num_local_tokens=num_local_tokens,
+                moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+                dtype=dtype,
+                hidden_pad=hidden_pad,
+                intermediate_pad=intermediate_pad,
+                bias1=bias1,
+                bias2=bias2,
+                swiglu_limit=swiglu_limit,
+                gate_mode=gate_mode,
+                shared_w1=shared_w1,
+                shared_w2=shared_w2,
+                shared_w1_scale=shared_w1_scale,
+                shared_w2_scale=shared_w2_scale,
+                shared_expert_id=shared_expert_id,
+                clamp_shared=clamp_shared,
+                output=output,
+            )
+        if not block_size_M:
+            block_size_M = -1
+        enable_ep_scatter = stage2_scatter is not None
+        scatter_source_map = (
+            stage2_scatter.source_token_map if enable_ep_scatter else None
+        )
+        return fused_moe_(
             hidden_states=hidden_states,
             w1=w1,
             w2=w2,
             topk_weight=topk_weight,
             topk_ids=topk_ids,
             expert_mask=expert_mask,
-            activation=activation,
-            quant_type=quant_type,
+            activation=activation.value,
+            quant_type=quant_type.value,
             doweight_stage1=doweight_stage1,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
@@ -1210,65 +1315,33 @@ def fused_moe(
             bias1=bias1,
             bias2=bias2,
             swiglu_limit=swiglu_limit,
+            beta=beta,
+            linear_beta=linear_beta,
             gate_mode=gate_mode,
-            shared_w1=shared_w1,
-            shared_w2=shared_w2,
-            shared_w1_scale=shared_w1_scale,
-            shared_w2_scale=shared_w2_scale,
-            shared_expert_id=shared_expert_id,
-            clamp_shared=clamp_shared,
+            ep_arena_handle=stage2_scatter.arena_handle if enable_ep_scatter else 0,
+            ep_combine_input_offset=(
+                stage2_scatter.combine_input_offset if enable_ep_scatter else 0
+            ),
+            ep_slot_stride_bytes=(
+                stage2_scatter.slot_stride_bytes if enable_ep_scatter else 0
+            ),
+            ep_max_tokens_per_rank=(
+                stage2_scatter.max_tokens_per_rank if enable_ep_scatter else 0
+            ),
+            ep_world_size=stage2_scatter.world_size if enable_ep_scatter else 0,
+            ep_combine_quant=(
+                int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0
+            ),
+            ep_source_token_map=scatter_source_map,
             output=output,
+            quant_type_a=None if quant_type_a is None else quant_type_a.value,
+            quant_dtype_a=quant_dtype_a,
+            quant_dtype_a2=quant_dtype_a2,
         )
-    if not block_size_M:
-        block_size_M = -1
-    enable_ep_scatter = stage2_scatter is not None
-    scatter_source_map = stage2_scatter.source_token_map if enable_ep_scatter else None
-    return fused_moe_(
-        hidden_states=hidden_states,
-        w1=w1,
-        w2=w2,
-        topk_weight=topk_weight,
-        topk_ids=topk_ids,
-        expert_mask=expert_mask,
-        activation=activation.value,
-        quant_type=quant_type.value,
-        doweight_stage1=doweight_stage1,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        a1_scale=a1_scale,
-        a2_scale=a2_scale,
-        block_size_M=block_size_M,
-        num_local_tokens=num_local_tokens,
-        moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
-        dtype=dtype,
-        hidden_pad=hidden_pad,
-        intermediate_pad=intermediate_pad,
-        bias1=bias1,
-        bias2=bias2,
-        swiglu_limit=swiglu_limit,
-        beta=beta,
-        linear_beta=linear_beta,
-        gate_mode=gate_mode,
-        ep_arena_handle=stage2_scatter.arena_handle if enable_ep_scatter else 0,
-        ep_combine_input_offset=(
-            stage2_scatter.combine_input_offset if enable_ep_scatter else 0
-        ),
-        ep_slot_stride_bytes=(
-            stage2_scatter.slot_stride_bytes if enable_ep_scatter else 0
-        ),
-        ep_max_tokens_per_rank=(
-            stage2_scatter.max_tokens_per_rank if enable_ep_scatter else 0
-        ),
-        ep_world_size=stage2_scatter.world_size if enable_ep_scatter else 0,
-        ep_combine_quant=(
-            int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0
-        ),
-        ep_source_token_map=scatter_source_map,
-        output=output,
-        quant_type_a=None if quant_type_a is None else quant_type_a.value,
-        quant_dtype_a=quant_dtype_a,
-        quant_dtype_a2=quant_dtype_a2,
-    )
+
+    except BaseException:
+        _pop_presorted_moe()
+        raise
 
 
 def fused_moe_fake(
@@ -1457,6 +1530,9 @@ def _fused_moe_impl(
     _stage2_override: Callable | None = None,
     _enforce_metadata_block_size: bool = False,
 ) -> torch.Tensor:
+    # Consume a caller's presort first, so every path (including early returns
+    # and errors) clears it.
+    presorted_aux = _pop_presorted_moe()
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
     quant_type = QuantType(quant_type)
@@ -1831,32 +1907,69 @@ def _fused_moe_impl(
         _stage2_kwargs = metadata.stage2.keywords
         _kn2 = _stage2_kwargs.get("kernelName2") or _stage2_kwargs.get("kernelName", "")
         _atomic = parse_g2_kname_any(_kn2)["atomic"]
-        # BM16's adaptive sort already emits routes and zeroes the output without
-        # quantizing. Keep the Opus crossover for the configured aux pipeline.
-        sorting_ret = moe_sorting(
+        presorted = _match_presorted_moe(
+            presorted_aux,
             topk_ids,
             topk_weight,
-            global_E,
-            model_dim,
-            dtype,
-            block_size_M,
-            expert_mask,
-            num_local_tokens,
-            return_local_topk_ids=need_local_topk_ids,
-            accumulate=_atomic and not runtime_stage2_reduce,
-            output_aux=metadata.output_aux,
-            output=output,
+            block_m=block_size_M,
+            num_experts=global_E,
+            topk=topk,
+            expert_mask=expert_mask,
+            num_local_tokens=num_local_tokens,
         )
-        (
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            moe_buf,
-            sort_m_indices,
-            sort_reverse_sorted,
-        ) = sorting_ret[:7]
-        local_topk_ids = sorting_ret[7] if need_local_topk_ids else None
+        if presorted is not None:
+            sorted_ids = presorted["sorted_token_ids"]
+            sorted_weights = presorted["sorted_weights"]
+            sorted_expert_ids = presorted["sorted_expert_ids"]
+            num_valid_ids = presorted["num_valid_ids"]
+            sort_m_indices = presorted["m_indices"]
+            sort_reverse_sorted = presorted["reverse_sorted"]
+            if _atomic and not runtime_stage2_reduce:
+                moe_buf = (
+                    output
+                    if output is not None
+                    else torch.empty(
+                        (M, model_dim), dtype=dtype, device=topk_ids.device
+                    )
+                )
+                # Atomic GEMM2 needs a zeroed destination; skip the zeroing only
+                # if the caller zeroed this exact buffer.
+                if not (
+                    presorted.get("moe_buf_zeroed")
+                    and int(presorted.get("moe_buf_ptr", 0)) == moe_buf.data_ptr()
+                ):
+                    moe_buf.zero_()
+            else:
+                moe_buf = torch.empty((0, 0), dtype=dtype, device=topk_ids.device)
+            local_topk_ids = None
+        else:
+            # BM16's adaptive sort already emits routes and zeroes the output
+            # without quantizing. Keep the Opus crossover for the configured aux
+            # pipeline.
+            sorting_ret = moe_sorting(
+                topk_ids,
+                topk_weight,
+                global_E,
+                model_dim,
+                dtype,
+                block_size_M,
+                expert_mask,
+                num_local_tokens,
+                return_local_topk_ids=need_local_topk_ids,
+                accumulate=_atomic and not runtime_stage2_reduce,
+                output_aux=metadata.output_aux,
+                output=output,
+            )
+            (
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_buf,
+                sort_m_indices,
+                sort_reverse_sorted,
+            ) = sorting_ret[:7]
+            local_topk_ids = sorting_ret[7] if need_local_topk_ids else None
     elif fused_sort_quant:
         (
             sorted_ids,
