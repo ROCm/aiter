@@ -14,19 +14,12 @@ import flydsl.expr as fx
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.triton.utils.device_info import get_num_xcds
 
 from .kernels.pa_decode.traits import d256_pipe
 from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
 from .kernels.pa_decode_plan import PADecodePlan
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
-from .kernels.pa_decode_reduce import (
-    DUAL_REGISTER_PARTITIONS,
-    MAX_CTA_WAVES,
-    REGISTER_PARTITIONS,
-    WAVE,
-    compile_pa_decode_ps_reduce,
-)
+from .kernels.pa_decode_reduce import compile_pa_decode_ps_reduce
 from .kernels.tensor_shim import _run_compiled, get_dtype_str, ptr_arg
 
 
@@ -72,83 +65,64 @@ def launch_pa_decode_ps_reduce(
     query_seq_len: int,
     query_group_size: int,
     head_size: int,
-    partition_bound: int,
-    max_partitions: int,
+    context_partition_num: int,
     stream: torch.cuda.Stream,
     reduce_info: torch.Tensor,
 ) -> None:
-    """Reduce packed partials; every sequence has at most ``partition_bound``."""
-    props = torch.cuda.get_device_properties(output.device)
-    if max_partitions > props.multi_processor_count:
+    partition_limit = torch.cuda.get_device_properties(
+        output.device
+    ).multi_processor_count
+    if context_partition_num > partition_limit:
         raise ImportError(
-            "FlyDSL pa_decode reduce supports at most "
-            f"{props.multi_processor_count} partitions"
+            f"FlyDSL pa_decode reduce supports at most {partition_limit} partitions"
         )
-    batch, kv_heads = output.shape[0], output.shape[2]
-    rows = query_seq_len * query_group_size
-    # Exact bounds keep the register ladder short; above 64 a power of two
-    # bounds the specialization count.
-    partitions = min(partition_bound, max_partitions)
-    if partitions > REGISTER_PARTITIONS:
-        partitions = min(max_partitions, 1 << (partitions - 1).bit_length())
-    # A per-sequence span <= INT32_MAX keeps every attempted byte offset,
-    # including inactive partitions, below 2**32, so out-of-bounds reads
-    # cannot wrap back into valid data.
-    if not (
-        stride_logits_group == head_size
-        and stride_logits_part == rows * head_size
+    use_sinks = sink_token is not None
+    # Bound all attempted i32 byte offsets, including inactive partitions,
+    # so out-of-bounds reads cannot wrap back into valid data.
+    bounded_plan_logits = (
+        context_partition_num <= 64
+        and query_seq_len > 0
+        and query_group_size > 0
         and 0 <= stride_logits_head <= 2**31 - 1
-        and partitions * stride_logits_part * logits.element_size() <= 2**31 - 1
-    ):
-        raise NotImplementedError(
-            "FlyDSL pa_decode reduce requires packed partial rows spanning at "
-            "most 2**31 - 1 bytes per sequence"
-        )
-    # Paired loads need dword alignment; scalar output stores do not. The
-    # register-only kernel pairs only D128/D256: at larger heads, halving its
-    # waves costs more latency hiding than the wider loads save.
-    dual = partitions > REGISTER_PARTITIONS
-    pairs = (
-        (head_size % 128 == 0 if dual else head_size in (128, 256))
+        and stride_logits_group == head_size
+        and stride_logits_part == query_seq_len * query_group_size * head_size
+        and 0
+        < context_partition_num * stride_logits_part * logits.element_size()
+        <= 2**31 - 1
+    )
+    # Paired loads need dword alignment; scalar output stores do not.
+    vectorize_plan_logits = (
+        bounded_plan_logits
+        and head_size == 128
         and logits.dtype in (torch.bfloat16, torch.float16)
         and logits.data_ptr() % 4 == 0
         and stride_logits_head % 2 == 0
+        and stride_logits_part % 2 == 0
+        and stride_logits_group % 2 == 0
     )
-    ctas = batch * kv_heads * rows
-    groups, num_xcds = 1, 0
-    if dual:
-        # Partition groups fill the CTA while the grid stays within 16 waves
-        # per CU. D128 sequences averaging at most 32 partitions keep one.
-        group_waves = head_size // WAVE // (2 if pairs else 1)
-        budget = MAX_CTA_WAVES * props.multi_processor_count
-        if head_size != 128 or exp_sums.shape[1] > DUAL_REGISTER_PARTITIONS * batch:
-            while (
-                2 * groups * group_waves <= MAX_CTA_WAVES
-                and 2 * groups * group_waves * ctas <= budget
-            ):
-                groups *= 2
-        per_seq = rows * kv_heads
-        if ctas * group_waves >= budget and batch * per_seq * per_seq <= 2**30:
-            num_xcds = get_num_xcds()
-    num_xcds = num_xcds if num_xcds > 1 else 0
     compiled = compile_pa_decode_ps_reduce(
-        max_context_partition_num=partitions,
+        max_context_partition_num=context_partition_num,
         head_size=head_size,
         output_dtype_str=get_dtype_str(output.dtype),
         logits_dtype_str=get_dtype_str(logits.dtype),
         sink_dtype_str=get_dtype_str(
             output.dtype if sink_token is None else sink_token.dtype
         ),
-        use_sinks=sink_token is not None,
+        use_sinks=use_sinks,
         query_group_size=query_group_size,
-        pairs=pairs,
-        parallel_groups=groups,
-        num_xcds=num_xcds,
+        bounded_plan_logits=bounded_plan_logits,
+        vectorize_plan_logits=vectorize_plan_logits,
+        compact_plan=(
+            head_size == 128
+            and context_partition_num > 64
+            and exp_sums.ndim == 3
+            and exp_sums.shape[1] <= 32 * output.shape[0]
+        ),
     )
     sink_ptr = (
-        flyc.from_c_void_p(_flydsl_pointer_dtype(output.dtype), 0)
-        if sink_token is None
-        else ptr_arg(sink_token, _flydsl_pointer_dtype(sink_token.dtype))
+        ptr_arg(sink_token, _flydsl_pointer_dtype(sink_token.dtype))
+        if use_sinks
+        else flyc.from_c_void_p(_flydsl_pointer_dtype(output.dtype), 0)
     )
     _run_compiled(
         compiled["launch"],
@@ -167,11 +141,10 @@ def launch_pa_decode_ps_reduce(
         stride_logits_part,
         stride_logits_group,
         query_seq_len,
-        batch,
-        kv_heads,
+        query_group_size,
+        output.shape[0],
+        output.shape[2],
         ptr_arg(reduce_info, fx.Int32),
-        -(-(1 << 30) // rows),
-        -(-(1 << 30) // (rows * kv_heads)),
         stream,
     )
 
@@ -213,13 +186,12 @@ def pa_decode(
     A 4D ``key_cache`` selects the NHD layout: K and V are equally shaped
     [num_blocks, 64, num_kv_heads, 256] views with a contiguous head axis and
     arbitrary other strides, e.g. both halves of one 512-byte token row. NHD
-    requires gfx950, FP8 KV, head 256, page 64, per-tensor scales, no sliding
-    window, and a uniform query_length whose rows (query_length times the GQA
-    group size) fit two 16-row M-tiles, e.g. query_length 1-4 at GQA 8. Each
-    view must be 16-byte
-    aligned with 16-byte multiple strides, its token rows must not overlap, and
-    its strides and in-page span must fit int32; heads-outermost storage with
-    several KV heads is thus limited to 2 GiB per head.
+    requires gfx950, FP8 KV, head 256, page 64, no sliding window, and a
+    uniform query_length whose rows (query_length times the GQA group size)
+    fit two 16-row M-tiles, e.g. query_length 1-4 at GQA 8. Each view must be
+    16-byte aligned with 16-byte multiple strides, its token rows must not
+    overlap, and its strides and in-page span must fit int32; heads-outermost
+    storage with several KV heads is thus limited to 2 GiB per head.
 
     BF16 K/V requires BF16 queries, compute_type=torch.bfloat16, no K/V scales,
     and vectorized 5D caches with x=8; FP8 uses x=16. BF16 Q/P operands stay
@@ -654,22 +626,18 @@ def pa_decode(
     stride_k_block = stride_k_token = stride_k_head = 0
     stride_v_block = stride_v_token = stride_v_head = 0
     if nhd_layout:
-        if (
-            per_token_kv
-            or sliding_window > 0
-            or not d256_pipe(
-                arch,
-                kv_dtype,
-                head_dim,
-                block_size,
-                query_length,
-                query_group_size,
-            )
+        if sliding_window > 0 or not d256_pipe(
+            arch,
+            kv_dtype,
+            head_dim,
+            block_size,
+            query_length,
+            query_group_size,
         ):
             raise NotImplementedError(
-                "NHD pa_decode requires gfx950, FP8 KV, head 256, page 64, "
-                "per-tensor scales, no sliding window, and a uniform "
-                "query_length * query_group_size of at most 32 rows"
+                "NHD pa_decode requires gfx950, FP8 KV, head 256, page 64, no "
+                "sliding window, and a uniform query_length * query_group_size "
+                "of at most 32 rows"
             )
         stride_k_block, stride_k_token, stride_k_head = _nhd_strides(key_cache)
         stride_v_block, stride_v_token, stride_v_head = _nhd_strides(value_cache)
@@ -820,18 +788,13 @@ def pa_decode(
         output_5d = output.reshape(
             num_seqs, query_length, num_kv_heads, query_group_size, head_dim
         )
-        # No sequence has more partitions than tiles under the scheduling
-        # bound or the window, nor more than the plan capacity.
-        partition_bound = min(
-            work_plan.capacity,
-            max(1, -(-schedule_context_length // KV_COMPUTE_BLOCK)),
-        )
+        reduce_partitions = num_partitions
         if sliding_window > 0:
             # Bound the unaligned MTP window without shrinking the reusable plan.
             window_tiles = (
                 sliding_window + query_length - 2 + KV_COMPUTE_BLOCK - 1
             ) // KV_COMPUTE_BLOCK + 1
-            partition_bound = min(partition_bound, window_tiles)
+            reduce_partitions = min(reduce_partitions, window_tiles)
         launch_pa_decode_ps_reduce(
             output_5d,
             psum,
@@ -850,8 +813,7 @@ def pa_decode(
             query_seq_len=query_length,
             query_group_size=query_group_size,
             head_size=head_dim,
-            partition_bound=partition_bound,
-            max_partitions=num_partitions,
+            context_partition_num=reduce_partitions,
             stream=s,
             reduce_info=work_plan.reduce_info,
         )

@@ -189,6 +189,12 @@ def _make_inputs(
         # Give both quantization modes the same V absmax; the other channels
         # still isolate the probability-tail mass.
         value[first_page, :, 0, 0] = 3.5
+    elif pattern == "varied":
+        # Uniform draws quantize to nearly one per-token scale, so a shifted
+        # scale still matches the oracle. Token magnitudes spanning about a
+        # decade make a wrong scale index fail it.
+        key.mul_(torch.randn_like(key[..., :1]).mul_(0.4).exp_())
+        value.mul_(torch.randn_like(value[..., :1]).mul_(0.4).exp_())
 
     context = torch.tensor(lengths, dtype=torch.int32, device=device)
     return query, key, value, table, context
@@ -287,8 +293,6 @@ _BF16_CASES = _COMMON_CASES + [
         for length, dim, splits in ((4, 512, 2), (4, 1024, 4), (3, 1024, 3))
     ],
     ("graph-workspace", {"query_length": 4, "max_partitions": 7, "capture": True}),
-    # A 48-tile table bound with 1-2 live partitions reaches the register
-    # reducer's smallest rungs at NP 48.
     (
         "loose-bound",
         {
@@ -297,15 +301,8 @@ _BF16_CASES = _COMMON_CASES + [
             "max_partitions": None,
             "table_width": 768,
             "max_context": None,
-            "reducer": {
-                "max_context_partition_num": 48,
-                "parallel_groups": 1,
-                "xcd": False,
-                "pairs": True,
-            },
         },
     ),
-    # Three-wave groups exercise a non-power-of-two 20-partition rung.
     (
         "head192-np80",
         {
@@ -315,8 +312,6 @@ _BF16_CASES = _COMMON_CASES + [
             "max_partitions": 80,
         },
     ),
-    # One sequence takes the LDS path while short ones take the register
-    # branch in the same grid, which is large enough for XCD order.
     *[
         (
             f"head{dim}-mixed-np96",
@@ -328,21 +323,15 @@ _BF16_CASES = _COMMON_CASES + [
                 "lengths": (97 * 256,) + (0, 1, 257, 1027) * 10,
                 "max_partitions": 96,
                 "budget": 4096,
-                "reducer": {
-                    "max_context_partition_num": 96,
-                    "parallel_groups": 1,
-                    "xcd": True,
-                    "pairs": True,
-                },
             },
         )
         for dim in (256, 128)
     ],
 ]
-# FP8 per-tensor head 256, page 64, plain V, uniform query length with at most
-# 32 query rows: the gfx950 pipe. Dense CU-count budgets and a plan-independent
-# staging bound select its specialization; other architectures run the same
-# cases on the generic path.
+# FP8 head 256, page 64, plain V, uniform query length with at most 32 query
+# rows: the gfx950 pipe, for per-tensor and per-token scales. Dense CU-count
+# budgets and a plan-independent staging bound select its specialization;
+# other architectures run the same cases on the generic path.
 _PIPE_BASE = {
     "kv_dtype": "fp8",
     "scale_mode": "per-tensor",
@@ -357,7 +346,7 @@ _PIPE_CASES = [
     # At GQA 8, query length q gives 8 * q rows: one M-tile at 1 and 2 (1 pads
     # it), two at 3 and 4 (3 pads the second). Lengths put some row's causal
     # edge on a page or tile boundary, and lengths below q leave rows empty.
-    # P is FP8, so random rows see 0, 1 or at least 6 tokens; the per-token
+    # P is FP8, so random rows see 0, 1 or at least 6 tokens; the token
     # one-hot query-length-3 case covers 2 to 5 exactly. Packed plain V takes
     # the same pipe as NHD.
     #
@@ -387,10 +376,8 @@ _PIPE_CASES = [
             "budget": 1,
         },
     ),
-    # Above 64 partitions the reducer splits partitions over groups; 81 and
-    # 130 leave the last group short, and sequences with few or no tasks
-    # exercise the inactive-partition masking. A dropped row or tile changes
-    # a channel.
+    # 81 and 130 partitions leave a short tail, and sequences with few or no
+    # tasks must not change a channel.
     *(
         (
             f"d256-page64-q4-np{partitions}",
@@ -401,16 +388,6 @@ _PIPE_CASES = [
                 "max_partitions": partitions,
                 "budget": partitions,
                 "pattern": "one_hot_v",
-                "reducer": (
-                    {
-                        "max_context_partition_num": partitions,
-                        "parallel_groups": 8,
-                        "xcd": False,
-                        "pairs": True,
-                    }
-                    if partitions == 81
-                    else None
-                ),
             },
         )
         for partitions in (81, 130)
@@ -464,6 +441,64 @@ _PIPE_CASES = [
             "max_partitions": 8,
             "nhd_bufs": 2,
             "capture": True,
+        },
+    ),
+    # Per-token scales take the same pipe. The wide grid takes the one-buffer
+    # NHD path, whose V gather must not be replaced by a plain-V reload.
+    (
+        "d256-page64-per-token",
+        {
+            **_PIPE_BASE,
+            "scale_mode": "per-token",
+            "lengths": (1, 65, 257, 1027),
+            "max_partitions": 4,
+            "pattern": "varied",
+        },
+    ),
+    (
+        "d256-page64-q4-per-token",
+        {
+            **_PIPE_BASE,
+            "scale_mode": "per-token",
+            "query_length": 4,
+            "lengths": (0, 1, 65, 257, 2049),
+            "max_partitions": 4,
+            "pattern": "varied",
+        },
+    ),
+    (
+        "nhd-d256-page64-per-token",
+        {
+            **_NHD_BASE,
+            "scale_mode": "per-token",
+            "lengths": (1, 65, 257, 1027),
+            "max_partitions": 4,
+            "pattern": "varied",
+            "nhd_bufs": 2,
+        },
+    ),
+    (
+        "nhd-d256-page64-q4-per-token",
+        {
+            **_NHD_BASE,
+            "scale_mode": "per-token",
+            "query_length": 4,
+            "lengths": (0, 1, 65, 257, 2049),
+            "max_partitions": 4,
+            "pattern": "varied",
+            "nhd_bufs": 2,
+        },
+    ),
+    (
+        "nhd-d256-page64-per-token-wide",
+        {
+            **_NHD_BASE,
+            "scale_mode": "per-token",
+            "kv_heads": 3,
+            "lengths": (1, 65, 32600),
+            "max_partitions": 32,
+            "pattern": "varied",
+            "nhd_bufs": 1,
         },
     ),
 ]
@@ -566,7 +601,7 @@ def _nhd_caches(key, value, table, context, head_major, pool_blocks=None):
     return rows.transpose(1, 2).split(dim, dim=-1)
 
 
-def _check_pipe_policy(pa, case, arch, compile_kwargs, reducer_kwargs):
+def _check_pipe_policy(pa, case, arch, compile_kwargs):
     """Pin the selected specialization so a case cannot drift off its path."""
     from aiter.ops.flydsl.kernels.pa_decode.traits import PaDecodeSchedule
 
@@ -581,13 +616,6 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs, reducer_kwargs):
             assert (staged > 0) == (case["staged"] is not False)
             if case["nhd_bufs"]:
                 assert nhd_bufs == case["nhd_bufs"]
-    if case["reducer"] is not None:
-        expected = dict(case["reducer"])
-        # XCD order needs a device with several XCDs.
-        xcd = expected.pop("xcd") and pa.get_num_xcds() > 1
-        selected = reducer_kwargs[-1]
-        assert {key: selected[key] for key in expected} == expected
-        assert (selected["num_xcds"] > 0) == xcd
 
 
 def _check_nhd_contracts(pa, output, arguments, options, plan, check):
@@ -683,7 +711,6 @@ def test_pa_decode(case, device, monkeypatch):
             "staged": None,
             "nhd_bufs": None,
             "nhd_contracts": False,
-            "reducer": None,
         },
         **case,
     )
@@ -802,22 +829,14 @@ def test_pa_decode(case, device, monkeypatch):
         _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch)
         return
 
-    compile_kwargs, reducer_kwargs = [], []
-    compile_tile, compile_reduce = (
-        pa.compile_pa_decode_tile,
-        pa.compile_pa_decode_ps_reduce,
-    )
+    compile_kwargs = []
+    compile_tile = pa.compile_pa_decode_tile
 
     def spy_tile(**kwargs):
         compile_kwargs.append(kwargs)
         return compile_tile(**kwargs)
 
-    def spy_reduce(**kwargs):
-        reducer_kwargs.append(kwargs)
-        return compile_reduce(**kwargs)
-
     monkeypatch.setattr(pa, "compile_pa_decode_tile", spy_tile)
-    monkeypatch.setattr(pa, "compile_pa_decode_ps_reduce", spy_reduce)
 
     output = torch.full_like(query, float("nan"))
     workspace = {}
@@ -849,7 +868,7 @@ def test_pa_decode(case, device, monkeypatch):
 
     launch()
     check()
-    _check_pipe_policy(pa, case, arch, compile_kwargs, reducer_kwargs)
+    _check_pipe_policy(pa, case, arch, compile_kwargs)
     if case["nhd_contracts"]:
         _check_nhd_contracts(pa, output, arguments, options, plan, check)
     if case["capture"]:
@@ -892,12 +911,12 @@ def test_stage_bound_covers_plan(device):
 
 
 def test_pa_decode_nhd_rejected(device, monkeypatch):
-    """NHD is the gfx950 FP8 per-tensor dense page-64 path, at most 32 query rows."""
+    """NHD is the gfx950 FP8 dense page-64 path, at most 32 query rows."""
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
     fp8 = (
         torch.float8_e4m3fn if get_gfx_runtime() == "gfx950" else torch.float8_e4m3fnuz
     )
-    variants = ["bf16", "per-token", "mtp", "window", "page128"]
+    variants = ["bf16", "mtp", "window", "page128"]
     if get_gfx_runtime() != "gfx950":
         variants.insert(0, "arch")
 
@@ -915,11 +934,7 @@ def test_pa_decode_nhd_rejected(device, monkeypatch):
         cache = torch.zeros((2, page, 1, 256), dtype=dtype, device=device)
         context = torch.tensor([page], dtype=torch.int32, device=device)
         table = torch.zeros((1, 1), dtype=torch.int32, device=device)
-        scale = torch.ones(
-            (2, 1, page) if variant == "per-token" else (1,),
-            dtype=torch.float32,
-            device=device,
-        )
+        scale = torch.ones(1, dtype=torch.float32, device=device)
         plan = pa.plan_pa_decode(
             context,
             1,

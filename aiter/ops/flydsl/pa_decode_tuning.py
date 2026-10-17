@@ -465,7 +465,7 @@ def _parse_args(argv=None):
         "--layout",
         choices=("packed", "nhd"),
         default="packed",
-        help="nhd: [pages, 64, KV heads, 256] FP8 per-tensor K/V; implies --trans-v 0.",
+        help="nhd: [pages, 64, KV heads, 256] FP8 K/V; implies --trans-v 0.",
     )
     parser.add_argument("--trans-v", type=int, choices=(0, 1))
     parser.add_argument("--sliding-window", type=int, default=0)
@@ -492,14 +492,11 @@ def _parse_args(argv=None):
     if args.layout == "nhd":
         if args.trans_v == 1:
             parser.error("--layout nhd requires --trans-v 0")
-        if args.scale_mode not in (None, "per-tensor"):
-            parser.error("--layout nhd requires --scale-mode per-tensor")
         if (args.kv_dtype, args.head_dim, args.block_size) != ("fp8", 256, 64):
             parser.error(
                 "--layout nhd requires --kv-dtype fp8 --head-dim 256 --block-size 64"
             )
         args.trans_v = 0
-        args.scale_mode = "per-tensor"
     elif args.trans_v is None:
         args.trans_v = 1
     if args.scale_mode is None:
