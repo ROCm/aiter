@@ -64,6 +64,17 @@ int32_t gf_devcomm_create_v1(void* comm, uint32_t sdma_queues, void** out_dev) {
     *out_dev = dev;
     return OK;
 }
+// Facts of the process devcomm + comm for preflight/diagnostics: out[0]=lsaSize out[1]=lsaRank out[2]=sdmaNumQueue out[3]=worldSize
+// out[4]=comm.rank out[5]=myNodeStart out[6]=sizeof(ccoDevComm). Read-only; never mutates either object.
+int32_t gf_devcomm_info_v1(void* comm, const void* dev, uint64_t* out7) {
+    if (!comm || !dev || !out7) return E_ARG;
+    const auto* c = static_cast<const mori::cco::ccoComm*>(comm);
+    const auto* d = static_cast<const mori::cco::ccoDevComm*>(dev);
+    out7[0] = static_cast<uint64_t>(static_cast<int64_t>(d->lsaSize)); out7[1] = static_cast<uint64_t>(static_cast<int64_t>(d->lsaRank));
+    out7[2] = static_cast<uint64_t>(static_cast<int64_t>(d->sdma.sdmaNumQueue)); out7[3] = static_cast<uint64_t>(static_cast<int64_t>(c->worldSize));
+    out7[4] = static_cast<uint64_t>(static_cast<int64_t>(c->rank)); out7[5] = static_cast<uint64_t>(static_cast<int64_t>(c->myNodeStart)); out7[6] = sizeof(mori::cco::ccoDevComm);
+    return OK;
+}
 // Zero a window region (device sync included). All ranks must call, then barrier, before the next launch.
 int32_t gf_zero_v1(int32_t device, void* local, uint64_t bytes) {
     if (hipSetDevice(device) != hipSuccess) return E_HIP;

@@ -105,7 +105,7 @@ class CcoBackend:
         for n, a in [
             ("gf_uid_v1", [u32, vp]), ("gf_comm_create_v1", [u32, u32, vp, u64, C.POINTER(vp)]),
             ("gf_win_register_v1", [vp, u64, C.POINTER(vp), C.POINTER(vp)]), ("gf_peer_ptr_v1", [vp, vp, i32, C.POINTER(vp)]),
-            ("gf_devcomm_create_v1", [vp, u32, C.POINTER(vp)]), ("gf_zero_v1", [i32, vp, u64]), ("gf_device_sync_v1", [i32]),
+            ("gf_devcomm_create_v1", [vp, u32, C.POINTER(vp)]), ("gf_devcomm_info_v1", [vp, vp, C.POINTER(u64)]), ("gf_zero_v1", [i32, vp, u64]), ("gf_device_sync_v1", [i32]),
             ("gf_devcomm_destroy_v1", [vp, vp]), ("gf_win_deregister_v1", [vp, vp]), ("gf_comm_destroy_v1", [vp]),
         ]:
             f = getattr(lib, n)
@@ -141,6 +141,13 @@ class CcoBackend:
         o = C.c_void_p()
         self._chk(self.lib.gf_devcomm_create_v1(comm, sdma_queues, C.byref(o)), "gf_devcomm_create")
         return o.value
+
+    def devcomm_info(self, comm, dev):
+        b = (C.c_uint64 * 7)()
+        self._chk(self.lib.gf_devcomm_info_v1(comm, dev, b), "gf_devcomm_info")
+        s = lambda v: v - (1 << 64) if v >= (1 << 63) else v  # noqa: E731
+        k = ("lsaSize", "lsaRank", "sdmaNumQueue", "worldSize", "commRank", "myNodeStart", "sizeofDevComm")
+        return {n: s(int(v)) for n, v in zip(k, list(b))}
 
     def zero(self, device, local, nbytes):
         self._chk(self.lib.gf_zero_v1(device, local, nbytes), "gf_zero")
@@ -198,6 +205,7 @@ class FusionResources:
         self._close_hooks: Dict[str, Callable[[], None]] = {}  # owner -> free host/driver objects (L-5), run at release()
         self._poison_hooks: Dict[str, Callable[[], int]] = {}  # owner -> cheap poison word read (host, outside capture)
         self.sdma_queues = 0  # set by finalize(): sdmaQueueCount given to ccoDevCommCreate
+        self.devcomm_info = None  # set by finalize(): {lsaSize, lsaRank, sdmaNumQueue, worldSize, ...} read back from the created devcomm
         self.finalized = False
         self._released = False
         self._init_comm()
@@ -347,7 +355,14 @@ class FusionResources:
             return
         self.sdma_queues = max(1, getattr(self, "_sdma", 0))
         self.devcomm = self.backend.devcomm_create(self.comm, self.sdma_queues)
-        log.info("event=resources devcomm rank=%d sdma_queues=%d windows=%d", self.rank, self.sdma_queues, len(self._reg_log))
+        self.devcomm_info = None
+        info_fn = getattr(self.backend, "devcomm_info", None)
+        if info_fn is not None:
+            try:
+                self.devcomm_info = info_fn(self.comm, self.devcomm)
+            except Exception as e:  # noqa: BLE001  (diagnostic only)
+                log.warning("event=resources devcomm_info_failed rank=%d err=%s", self.rank, e)
+        log.info("event=resources devcomm rank=%d sdma_queues=%d windows=%d info=%s", self.rank, self.sdma_queues, len(self._reg_log), self.devcomm_info)
         self.finalized = True
         self.backend.device_sync(self.device)
         self._barrier()

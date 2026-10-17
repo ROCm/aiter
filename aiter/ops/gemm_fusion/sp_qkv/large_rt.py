@@ -20,7 +20,7 @@ def load_driver(path: str):
     lib = C.CDLL(path)
     vp, u32, u64, i32 = C.c_void_p, C.c_uint32, C.c_uint64, C.c_int32
     lib.lg_attach_v1.restype = vp
-    lib.lg_attach_v1.argtypes = [u32, u32, vp, vp, vp, vp, vp, vp, vp, vp, C.c_char_p, C.c_char_p, u32]
+    lib.lg_attach_v1.argtypes = [u32, u32, vp, vp, vp, vp, vp, vp, vp, vp, C.c_char_p, C.c_char_p, u32, C.POINTER(u64)]
     lib.lg_free_v1.restype = i32
     lib.lg_free_v1.argtypes = [vp]
     lib.lg_poison_v1.restype = i32
@@ -40,6 +40,31 @@ def load_driver(path: str):
     lib.lg_comm_drain_all.restype = i32
     lib.lg_comm_drain_all.argtypes = [vp, vp]
     return lib
+
+
+ATTACH_STAGES = {1: "args", 2: "image_hash", 3: "hipSetDevice", 4: "topology", 5: "sdma_queues", 6: "hipModuleLoad", 7: "entry_resolve"}
+ATTACH_ENTRIES = ("n1", "n2", "n4", "n2h", "n4h", "n3q", "quiet_ready", "drain_all")
+
+
+def decode_attach_diag(d) -> str:
+    """Human-readable reason for a failed lg_attach_v1 from its diag[8] output (see lg_fusion_driver.cpp D5)."""
+    st = int(d[0])
+    name = ATTACH_STAGES.get(st, f"unknown({st})")
+    s = lambda v: v - (1 << 64) if v >= (1 << 63) else v  # noqa: E731  (values are signed ints stored in u64)
+    if st == 1:
+        names = ("comm", "devcomm", "S", "R", "C", "Sva", "Rva", "Cva", "hsaco_path", "sha")
+        nulls = [n for i, n in enumerate(names) if int(d[1]) >> i & 1]
+        return f"stage={name}: NULL args {nulls or 'none (range check)'}, rank={int(d[2])} M={int(d[3])} Q={int(d[4])} (need rank<=3, M%256==0, M<=8192, Q==1)"
+    if st == 3 or st == 6:
+        return f"stage={name}: hipError={int(d[1])}"
+    if st == 4:
+        return f"stage={name}: world={s(int(d[1]))} lsaSize={s(int(d[2]))} lsaRank={s(int(d[3]))} myNodeStart={s(int(d[4]))} (need 4/4/rank/0)"
+    if st == 5:
+        return f"stage={name}: devcomm sdmaNumQueue={s(int(d[1]))} but the r11 kernels need {int(d[2])}"
+    if st == 7:
+        i = int(d[2])
+        return f"stage={name}: hipError={int(d[1])} entry #{i} ({ATTACH_ENTRIES[i] if i < len(ATTACH_ENTRIES) else '?'})"
+    return f"stage={name}"
 
 
 def info(lib):

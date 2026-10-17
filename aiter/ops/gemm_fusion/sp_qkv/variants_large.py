@@ -41,6 +41,43 @@ def large_window_bytes(mode: str, M: int) -> int:
     return round_up(need)
 
 
+def preflight_attach(res, owner: str, M: int, wins, built):
+    """Bounded checks of everything lg_attach_v1 needs, each raising a message that names the precondition (so a failure never
+    reduces to 'attach failed'): finalized, queue count, devcomm facts, hsaco file + sha, window handles/pointers, rank/M ranges."""
+    import hashlib
+    import os
+
+    if not 0 <= res.rank <= 3:
+        raise RuntimeError(f"preflight {owner}: rank {res.rank} outside 0..3 (r11 kernels: rank == lsaRank == HIP device)")
+    if M % 256 or not 256 <= M <= 8192:
+        raise RuntimeError(f"preflight {owner}: M={M} must be a multiple of 256 in [256, 8192]")
+    info = getattr(res, "devcomm_info", None)
+    if info:
+        if info.get("lsaSize") != 4 or info.get("lsaRank") != res.rank or info.get("worldSize") != 4 or info.get("myNodeStart") != 0:
+            raise RuntimeError(f"preflight {owner}: topology {info} (need worldSize=lsaSize=4, lsaRank=rank={res.rank}, myNodeStart=0)")
+        if info.get("sdmaNumQueue") != 1:
+            raise RuntimeError(f"preflight {owner}: devcomm sdmaNumQueue={info.get('sdmaNumQueue')} but the r11 kernels need 1 "
+                               f"(requested {getattr(res, 'sdma_queues', '?')})")
+    for k in ("/S", "/R", "/C"):
+        w = wins.get(owner + k)
+        if w is None or not w.handle or not w.local:
+            raise RuntimeError(f"preflight {owner}: window {owner + k} missing/NULL (handle={getattr(w, 'handle', None)}, local={getattr(w, 'local', None)})")
+        if w.bytes != wins[owner + "/S"].bytes:
+            raise RuntimeError(f"preflight {owner}: windows must be equal size (S={wins[owner + '/S'].bytes}, {k[1:]}={w.bytes})")
+    need = large_window_bytes(_mode_from_owner(owner), M)
+    if wins[owner + "/S"].bytes < need:
+        raise RuntimeError(f"preflight {owner}: window {wins[owner + '/S'].bytes} B < required {need} B")
+    if not os.path.isfile(built.hsaco):
+        raise RuntimeError(f"preflight {owner}: hsaco missing: {built.hsaco}")
+    got = hashlib.sha256(open(built.hsaco, "rb").read()).hexdigest()
+    if got != built.hsaco_sha256:
+        raise RuntimeError(f"preflight {owner}: hsaco sha256 {got} != expected {built.hsaco_sha256}")
+
+
+def _mode_from_owner(owner: str) -> str:  # owner = "sp_qkv.large/<mode>/M<M>"
+    return owner.split("/")[1]
+
+
 @register_variant(
     vid="sp_qkv.large.v1", family="gemm_ep.sp_qkv", stage_kinds=("sp_exchange",),
     contract=Contract(arch=("gfx950",), world=4, topology="single_node_xgmi_p2p", graph="capture_safe_epoch_state",
@@ -102,12 +139,15 @@ class SpQkvLarge(Plan):
             import ctypes as C
 
             S, R, Cw = wins[self.owner + "/S"], wins[self.owner + "/R"], wins[self.owner + "/C"]
+            preflight_attach(res, self.owner, self.M, wins, built)  # bounded, pure-Python, names the failing precondition before the driver call
+            diag = (C.c_uint64 * 8)()
             h = lib.lg_attach_v1(res.rank, self.M, C.c_void_p(res.comm), C.c_void_p(res.devcomm), C.c_void_p(S.handle), C.c_void_p(S.local),
-                                 C.c_void_p(R.handle), C.c_void_p(R.local), C.c_void_p(Cw.handle), C.c_void_p(Cw.local), built.hsaco.encode(), built.hsaco_sha256.encode(), 1)  # H-3: C++ exact-image gate
+                                 C.c_void_p(R.handle), C.c_void_p(R.local), C.c_void_p(Cw.handle), C.c_void_p(Cw.local), built.hsaco.encode(), built.hsaco_sha256.encode(), 1,
+                                 diag)  # H-3: C++ exact-image gate; diag[] carries the failing stage + values (no stderr scraping)
             if not h:
-                raise RuntimeError(f"lg_attach_v1 failed for {self.owner} (see the LG_ATTACH line on stderr: args / image hash / device / "
-                                   f"topology / sdmaNumQueue / hipModuleLoad / entry resolve); hsaco={built.hsaco} sha256={built.hsaco_sha256} "
-                                   f"rank={res.rank} M={self.M} sdma_queues={getattr(res, 'sdma_queues', '?')}")
+                raise RuntimeError(f"lg_attach_v1 failed for {self.owner} rank={res.rank} M={self.M}: {lrt.decode_attach_diag(list(diag))}; "
+                                   f"hsaco={built.hsaco} sha256={built.hsaco_sha256} devcomm_queues={getattr(res, 'sdma_queues', '?')} "
+                                   f"devcomm_info={getattr(res, 'devcomm_info', None)}")
             got = sc[self.owner] = lrt.LargeContext(lib, C.c_void_p(h), self.M, self.F, res.rank)
             res.set_close(self.owner, got.close)  # L-5
             res.set_poison(self.owner, lambda c=got: c.poison(stream_handle(None)))  # cheap per-step check on the CURRENT torch stream (4-byte D2H + that stream sync)

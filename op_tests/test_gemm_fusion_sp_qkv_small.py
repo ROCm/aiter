@@ -946,10 +946,112 @@ def test_large_attach_refuses_a_devcomm_with_wrong_queue_count_before_the_driver
 def test_lg_attach_every_failure_branch_reports_on_stderr():
     src = open(os.path.join(jit.CSRC, "host", "lg_fusion_driver.cpp"), encoding="utf-8").read()
     body = src[src.index("void* lg_attach_v1"):src.index("int32_t lg_free_v1")]
-    for stage in ("stage=args", "stage=hipSetDevice", "image hash mismatch", "stage=topology", "stage=sdma_queues", "stage=hipModuleLoad", "stage=entry"):
+    for stage in ("stage=args", "stage=hipSetDevice", "stage=image_hash", "stage=topology", "stage=sdma_queues", "stage=hipModuleLoad", "stage=entry"):
         assert stage in body, stage
     # no silent `return nullptr` left: every one is preceded by a diagnostic fprintf in the same branch
     for i, line in enumerate(body.splitlines()):
         if "return nullptr" in line and "LG_ATTACH" not in line:
             ctx = "\n".join(body.splitlines()[max(0, i - 4):i + 1])
             assert "LG_ATTACH" in ctx, f"silent failure branch: {line.strip()}"
+
+# ======================================================================= structured attach diagnostics + preflight
+def test_decode_attach_diag_covers_every_stage():
+    from aiter.ops.gemm_fusion.sp_qkv import large_rt as lrt
+
+    M64 = (1 << 64)
+    assert "NULL args ['devcomm', 'Sva']" in lrt.decode_attach_diag([1, 0b0000100010, 2, 2048, 1, 0, 0, 0])
+    assert "rank=7 M=2048 Q=1" in lrt.decode_attach_diag([1, 0, 7, 2048, 1, 0, 0, 0])
+    assert "stage=image_hash" in lrt.decode_attach_diag([2, 0, 0, 0, 0, 0, 0, 0])
+    assert "hipError=101" in lrt.decode_attach_diag([3, 101, 0, 0, 0, 0, 0, 0])
+    assert "world=4 lsaSize=4 lsaRank=2 myNodeStart=-1" in lrt.decode_attach_diag([4, 4, 4, 2, M64 - 1, 0, 0, 0])
+    assert "sdmaNumQueue=9 but the r11 kernels need 1" in lrt.decode_attach_diag([5, 9, 1, 0, 0, 0, 0, 0])
+    assert "hipError=700" in lrt.decode_attach_diag([6, 700, 0, 0, 0, 0, 0, 0])
+    assert "entry #5 (n3q)" in lrt.decode_attach_diag([7, 500, 5, 0, 0, 0, 0, 0])
+    assert "unknown(42)" in lrt.decode_attach_diag([42] + [0] * 7)
+
+
+def _large_plan_and_wins(res_rank=0, bytes_override=None):
+    from aiter.gemm_fusion.resources import Window
+
+    plan = _plan_for("dense", 8192, True)
+    b = bytes_override or plan.resources()[0].bytes
+    wins = {plan.owner + k: Window(plan.owner, plan.owner + k, "p2p_window", b, 11, 4096) for k in ("/S", "/R", "/C")}
+    return plan, wins
+
+
+def test_preflight_attach_names_each_failing_precondition(monkeypatch):
+    import hashlib
+    import shutil
+    import tempfile
+    import uuid
+    from pathlib import Path
+
+    tmp_path = Path(tempfile.gettempdir()) / ("pf_" + uuid.uuid4().hex)
+    tmp_path.mkdir()
+    from types import SimpleNamespace as NS
+
+    from aiter.gemm_fusion import catalog
+    from aiter.gemm_fusion.resources import Window
+
+    monkeypatch.setattr(catalog, "_CATALOG", {})
+    catalog._CATALOG.clear()
+    sys.modules.pop("aiter.ops.gemm_fusion.sp_qkv.variants", None)
+    sys.modules.pop("aiter.ops.gemm_fusion.sp_qkv.variants_large", None)
+    import aiter.ops.gemm_fusion.sp_qkv.variants_large as vl
+
+    plan, wins = _large_plan_and_wins()
+    h = tmp_path / "img.hsaco"
+    h.write_bytes(b"code-object")
+    sha = hashlib.sha256(b"code-object").hexdigest()
+    built = NS(hsaco=str(h), hsaco_sha256=sha)
+    good = {"lsaSize": 4, "lsaRank": 1, "sdmaNumQueue": 1, "worldSize": 4, "myNodeStart": 0}
+    res = NS(rank=1, sdma_queues=1, devcomm_info=dict(good))
+    vl.preflight_attach(res, plan.owner, 8192 // 4, wins, built)  # all good -> no raise (M = local rows)
+
+    def fails(msg, **kw):
+        r = NS(**{**dict(rank=1, sdma_queues=1, devcomm_info=dict(good)), **kw})
+        with pytest.raises(RuntimeError, match=msg):
+            vl.preflight_attach(r, plan.owner, kw.get("M", 2048), kw.get("wins", wins), kw.get("built", built))
+
+    fails("rank 5 outside", rank=5)
+    fails("topology", devcomm_info={**good, "lsaRank": 3})
+    fails("sdmaNumQueue=9 but the r11 kernels need 1", devcomm_info={**good, "sdmaNumQueue": 9}, sdma_queues=9)
+    w2 = dict(wins)
+    w2[plan.owner + "/R"] = Window(plan.owner, plan.owner + "/R", "p2p_window", 4 << 20, 0, 0)
+    fails("missing/NULL", wins=w2)
+    w3 = dict(wins)
+    w3[plan.owner + "/C"] = Window(plan.owner, plan.owner + "/C", "control", 4 << 20, 12, 4096)
+    fails("equal size", wins=w3)
+    small = {k: Window(plan.owner, k, "p2p_window", 4 << 20, 11, 4096) for k in wins}
+    fails("< required", wins=small)
+    fails("hsaco missing", built=NS(hsaco=str(tmp_path / "nope.hsaco"), hsaco_sha256=sha))
+    fails("hsaco sha256", built=NS(hsaco=str(h), hsaco_sha256="0" * 64))
+    with pytest.raises(RuntimeError, match="M=300 must be a multiple of 256"):
+        vl.preflight_attach(res, plan.owner, 300, wins, built)
+    shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_finalize_reads_back_devcomm_info_and_logs_it():
+    from aiter.gemm_fusion.resources import FusionResources
+
+    class B(FakeBackend):
+        def devcomm_info(self, comm, dev):
+            return {"lsaSize": 4, "lsaRank": 0, "sdmaNumQueue": 1, "worldSize": 4, "myNodeStart": 0}
+
+    r = FusionResources(0, 4, dist=FakeDist(), backend=B())
+    r.ensure("a", [WindowReq("q", 0, "sdma_queue")])
+    r.finalize()
+    assert r.devcomm_info["sdmaNumQueue"] == 1 and r.sdma_queues == 1
+    # a backend without the accessor (older gf_comm.so) must not break finalize
+    r2 = FusionResources(0, 4, dist=FakeDist(), backend=FakeBackend())
+    r2.finalize()
+    assert r2.devcomm_info is None
+
+
+def test_lg_attach_writes_structured_diag_on_every_branch():
+    src = open(os.path.join(jit.CSRC, "host", "lg_fusion_driver.cpp"), encoding="utf-8").read()
+    body = src[src.index("void* lg_attach_v1"):src.index("int32_t lg_free_v1")]
+    for code in ("diag[0] = 1;", "diag[0] = 2;", "diag[0] = 3;", "diag[0] = 4;", "diag[0] = 5;", "diag[0] = 6;", "diag[0] = 7;"):
+        assert code in body, code
+    assert "uint64_t* diag" in body and "diag = scratch" in body  # NULL diag tolerated
+    assert "gf_devcomm_info_v1" in open(os.path.join(jit.CSRC, "host", "gf_comm.cpp"), encoding="utf-8").read()

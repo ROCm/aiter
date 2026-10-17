@@ -29,15 +29,24 @@ int32_t lg_info_v1(uint64_t* out6) {
     out6[0] = LG_COMM_F; out6[1] = LG_X_N_RAW; out6[2] = LG_X_INDEXER; out6[3] = LG_R8_FOLD; out6[4] = LG_R_PAD_BYTES; out6[5] = sizeof(mori::cco::ccoDevComm);
     return 0;
 }
+// Structured diagnostics (D5): diag[0] = stage code (0 = OK), diag[1..6] = stage-specific values, written on EVERY path so the caller never
+// depends on scraping stderr. Stages: 1 args, 2 image hash, 3 hipSetDevice, 4 topology, 5 sdma_queues, 6 hipModuleLoad, 7 entry resolve.
+//   1: diag[1]=bitmask of NULL pointer args (bit i = arg i: comm,dev,S,R,C,Sva,Rva,Cva,hsaco,sha) diag[2]=rank diag[3]=M diag[4]=Q
+//   2: -   3: diag[1]=hipError   4: diag[1..4]=worldSize,lsaSize,lsaRank,myNodeStart   5: diag[1]=sdmaNumQueue diag[2]=wanted
+//   6: diag[1]=hipError          7: diag[1]=hipError diag[2]=entry index
 void* lg_attach_v1(uint32_t rank, uint32_t M, void* comm, const void* devcomm, void* S, void* Sva, void* R, void* Rva, void* C, void* Cva,
-                   const char* hsaco_path, const char* expected_hsaco_sha256_hex, uint32_t sdma_queues) {
+                   const char* hsaco_path, const char* expected_hsaco_sha256_hex, uint32_t sdma_queues, uint64_t* diag) {
+    uint64_t scratch[8]; if (!diag) diag = scratch;
+    for (int i = 0; i < 8; ++i) diag[i] = 0;
     if (rank > 3u || M == 0 || M % 256u || M > 8192u || sdma_queues != 1u || !comm || !devcomm || !S || !R || !C || !Sva || !Rva || !Cva || !hsaco_path || !expected_hsaco_sha256_hex) {
-        std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=args rank=%u M=%u Q=%u comm=%p dev=%p S=%p R=%p C=%p Sva=%p Rva=%p Cva=%p hsaco=%p sha=%p\n", rank, M, sdma_queues, comm, devcomm, S, R, C, Sva, Rva, Cva,
-                     static_cast<const void*>(hsaco_path), static_cast<const void*>(expected_hsaco_sha256_hex));
+        const void* a[10] = {comm, devcomm, S, R, C, Sva, Rva, Cva, hsaco_path, expected_hsaco_sha256_hex};
+        diag[0] = 1; for (int i = 0; i < 10; ++i) if (!a[i]) diag[1] |= (1ull << i);
+        diag[2] = rank; diag[3] = M; diag[4] = sdma_queues;
+        std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=args rank=%u M=%u Q=%u nullmask=0x%llx\n", rank, M, sdma_queues, static_cast<unsigned long long>(diag[1]));
         return nullptr;
     }
-    if (!sm_image_matches(hsaco_path, expected_hsaco_sha256_hex)) { std::fprintf(stderr, "LG_ATTACH rc=FAIL image hash mismatch (%s)\n", hsaco_path); return nullptr; }   // H-3: exact-image gate BEFORE any module action
-    if (const hipError_t e = hipSetDevice(static_cast<int>(rank)); e != hipSuccess) { std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=hipSetDevice rank=%u err=%d (%s)\n", rank, static_cast<int>(e), hipGetErrorString(e)); return nullptr; }
+    if (!sm_image_matches(hsaco_path, expected_hsaco_sha256_hex)) { diag[0] = 2; std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=image_hash (%s)\n", hsaco_path); return nullptr; }   // H-3: exact-image gate BEFORE any module action
+    if (const hipError_t e = hipSetDevice(static_cast<int>(rank)); e != hipSuccess) { diag[0] = 3; diag[1] = static_cast<uint64_t>(e); std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=hipSetDevice rank=%u err=%d (%s)\n", rank, static_cast<int>(e), hipGetErrorString(e)); return nullptr; }
     auto* c = new LgCommCtx();
     c->rank = rank; c->M = M; c->Q = sdma_queues;
     c->comm = static_cast<mori::cco::ccoComm*>(comm);
@@ -45,18 +54,23 @@ void* lg_attach_v1(uint32_t rank, uint32_t M, void* comm, const void* devcomm, v
     c->S = reinterpret_cast<mori::cco::ccoWindow_t>(S); c->R = reinterpret_cast<mori::cco::ccoWindow_t>(R); c->C = reinterpret_cast<mori::cco::ccoWindow_t>(C);
     c->Sva = Sva; c->Rva = Rva; c->Cva = Cva;
     if (c->comm->worldSize != 4 || c->comm->lsaSize != 4 || static_cast<uint32_t>(c->comm->lsaRank) != rank || c->comm->myNodeStart != 0) {
+        diag[0] = 4; diag[1] = static_cast<uint64_t>(static_cast<int64_t>(c->comm->worldSize)); diag[2] = static_cast<uint64_t>(static_cast<int64_t>(c->comm->lsaSize));
+        diag[3] = static_cast<uint64_t>(static_cast<int64_t>(c->comm->lsaRank)); diag[4] = static_cast<uint64_t>(static_cast<int64_t>(c->comm->myNodeStart));
         std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=topology rank=%u world=%d lsaSize=%d lsaRank=%d myNodeStart=%d (need 4/4/rank/0)\n", rank,
                      static_cast<int>(c->comm->worldSize), static_cast<int>(c->comm->lsaSize), static_cast<int>(c->comm->lsaRank), static_cast<int>(c->comm->myNodeStart));
         delete c; return nullptr;
     }
     if (static_cast<uint32_t>(c->dev.sdma.sdmaNumQueue) != sdma_queues) {       // CCO may cap Q: report, never silently reduce
+        diag[0] = 5; diag[1] = static_cast<uint64_t>(static_cast<int64_t>(c->dev.sdma.sdmaNumQueue)); diag[2] = sdma_queues;
         std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=sdma_queues rank=%u devcomm sdmaNumQueue=%d but the kernels need %u\n", rank, static_cast<int>(c->dev.sdma.sdmaNumQueue), sdma_queues);
         delete c; return nullptr;
     }
-    if (const hipError_t e = hipModuleLoad(&c->mod, hsaco_path); e != hipSuccess) { std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=hipModuleLoad rank=%u err=%d (%s) path=%s\n", rank, static_cast<int>(e), hipGetErrorString(e), hsaco_path); delete c; return nullptr; }
+    if (const hipError_t e = hipModuleLoad(&c->mod, hsaco_path); e != hipSuccess) { diag[0] = 6; diag[1] = static_cast<uint64_t>(e); std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=hipModuleLoad rank=%u err=%d (%s) path=%s\n", rank, static_cast<int>(e), hipGetErrorString(e), hsaco_path); delete c; return nullptr; }
     struct { hipFunction_t* f; const char* name; } fns[] = {{&c->fgemm[0], LG_ENTRY_GEMM_N1}, {&c->fgemm[1], LG_ENTRY_GEMM_N2}, {&c->fgemm[2], LG_ENTRY_GEMM_N4}, {&c->fgemm[3], LG_ENTRY_GEMM_N2H},
                                                  {&c->fgemm[4], LG_ENTRY_GEMM_N4H}, {&c->fgemm[5], LG_ENTRY_GEMM_N3Q}, {&c->fquiet, LG_ENTRY_QUIET}, {&c->fdrain, LG_ENTRY_DRAIN}};
+    int entry_idx = 0;
     for (auto& fn : fns) if (const hipError_t e = hipModuleGetFunction(fn.f, c->mod, fn.name); e != hipSuccess) {
+        diag[0] = 7; diag[1] = static_cast<uint64_t>(e); diag[2] = static_cast<uint64_t>(&fn - fns); (void)entry_idx;
         std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=entry rank=%u symbol=%s err=%d (%s)\n", rank, fn.name, static_cast<int>(e), hipGetErrorString(e));
         hipModuleUnload(c->mod); delete c; return nullptr;
     }
