@@ -68,7 +68,9 @@ def _torch_cu_num() -> int | None:
         props = _current_device_properties()
         if props is None:
             return None
-        cu = int(props.multi_processor_count)
+        cu = torch_processor_count_to_cu(
+            str(props.gcnArchName), int(props.multi_processor_count)
+        )
     except Exception:  # noqa: BLE001 device probing must allow CPU-only environments
         return None
     return cu if cu > 0 else None

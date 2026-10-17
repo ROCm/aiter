@@ -76,6 +76,18 @@ def test_cu_fallback_reads_current_device(device1_selected_empty_tool):
     assert chip_info.get_cu_num_custom_op() == 304
 
 
+@pytest.mark.parametrize("wgp_mode, cu_num", [("1", 40), ("0", 20)])
+def test_cu_fallback_counts_rdna_cus(
+    device1_selected_empty_tool, monkeypatch, wgp_mode, cu_num
+):
+    # In WGP mode HIP reports workgroup processors, two CUs each.
+    rdna = SimpleNamespace(gcnArchName="gfx1151", multi_processor_count=20)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda i: rdna)
+    monkeypatch.setenv("GPU_ENABLE_WGP_MODE", wgp_mode)
+    assert chip_info._torch_cu_num() == cu_num
+    assert chip_info.get_cu_num_custom_op() == cu_num
+
+
 def test_mixed_cu_counts_fall_back_to_current_device(
     device1_selected_empty_tool, monkeypatch
 ):
