@@ -75,6 +75,11 @@ _SCRIPT_FALLBACK: dict = {
 
 _SENTINEL = object()  # distinct from None: "not in fallback table"
 
+# Union of the shape-key columns of every pretunable family's untuned CSV.
+# Each tuner indexes its untune file by its own keys, so a missing column makes
+# the tuner exit with KeyError; columns absent from a family's CSV are dropped.
+_SHAPE_KEYS = ["B", "M", "N", "K", "q_dtype_w"]
+
 
 def _get_tune_script(entry: dict, csrc_dir: str):
     """Derive the tune .py path from the non-pybind _tune.cu src entry."""
@@ -141,6 +146,36 @@ def _resolve(module_name: str, cfg: dict, csrc_dir: str):
 
 def _all_tune_modules(cfg: dict) -> list:
     return [k for k in cfg if k.endswith("_tune")]
+
+
+def _inference_modules(config_attr: str, cfg: dict) -> list[str]:
+    """Return every non-tune module whose blob_gen_cmd reads AITER_CONFIGS.<config_attr>.
+
+    These .so files embed instances generated from that CSV, so all of them are
+    stale once the CSV changes.  CK and CKTile variants share one CSV, and a
+    CKTile tune module is deduplicated against its CK parent in
+    run_pretune_modules(), so deriving a single name from the tune module would
+    leave the other variant unrebuilt.
+    """
+    pattern = re.compile(rf"AITER_CONFIGS\.{re.escape(config_attr)}\b")
+    return [
+        k
+        for k, v in cfg.items()
+        if not k.endswith("_tune") and pattern.search(str(v.get("blob_gen_cmd", "")))
+    ]
+
+
+def _build_args(core, module_name: str):
+    """Return core.get_args_of_build(module_name) with md_name filled in.
+
+    get_args_of_build only sets md_name when called with "all"; for a single
+    module it returns md_name="", and build_module would then install a nameless
+    ".so" in the JIT dir instead of <module_name>.so.
+    """
+    args = core.get_args_of_build(ops_name=module_name)
+    if isinstance(args, dict) and not args.get("md_name"):
+        args["md_name"] = module_name
+    return args
 
 
 def _parse_module_list(value: str, cfg: dict) -> list[str]:
@@ -214,7 +249,9 @@ def run_pretune(
       2. Write a temp untune CSV with all unique shape keys from the merged tune CSV,
          no gfx/cu_num — the tuner auto-fills those from the live GPU.
       3. Run the tune script with --all so every shape is re-benchmarked.
-      4. Rebuild the inference .so  (gen_instances.py --tune_file → winners only).
+         A non-zero exit raises RuntimeError and skips step 4.
+      4. Rebuild every inference .so generated from that CSV
+         (gen_instances.py --tune_file → winners only).
 
     When build_one_module is None (standalone / direct path):
       Steps 2-3 run as above.  Step 1 is skipped — the tune script JIT-builds
@@ -259,7 +296,7 @@ def run_pretune(
 
     # ── 1. Build tune .so (setup.py path only) ────────────────────────────
     if build_one_module is not None:
-        tune_args = core.get_args_of_build(ops_name=module_name)
+        tune_args = _build_args(core, module_name)
         if isinstance(tune_args, dict) and tune_args.get("srcs"):
             logger.info(f"[pretune] building {module_name}")
             build_one_module(tune_args)
@@ -270,13 +307,12 @@ def run_pretune(
             )
 
     # ── 2. Write untune CSV ────────────────────────────────────────────────
-    # Shape key columns only (no gfx/cu_num).  B included for batched GEMM;
-    # silently dropped if absent.
+    # Shape key columns only (no gfx/cu_num).  B (batched GEMM) and q_dtype_w
+    # (A8W8, A8W8 bpreshuffle) are dropped for families that lack them.
     # With --all + untune_file != tune_file, get_retune_gemm_list() else-branch
     # auto-tags rows with live GPU's gfx/cu_num, re-benchmarks shapes already
     # in tune_file, and tunes shapes not yet present for this GPU.
-    shape_keys = ["B", "M", "N", "K"]
-    untune_csv = _make_untune_csv(tune_file, shape_keys)
+    untune_csv = _make_untune_csv(tune_file, _SHAPE_KEYS)
 
     try:
         # ── 3. Run tuner ───────────────────────────────────────────────────
@@ -298,9 +334,10 @@ def run_pretune(
         _log(f"[pretune] running: {' '.join(cmd)}")
         result = subprocess.run(cmd, env=env, check=False)
         if result.returncode != 0:
-            _warn(
-                f"[pretune] tuner exited {result.returncode} for {module_name}. "
-                "Inference module will still be rebuilt with whatever was written."
+            raise RuntimeError(
+                f"[pretune] tuner exited {result.returncode} for {module_name}; "
+                f"inference modules were not rebuilt and {write_tune_file} may "
+                "contain rows from the incomplete run"
             )
     finally:
         try:
@@ -309,34 +346,37 @@ def run_pretune(
             pass
 
     # ── 4. Rebuild inference .so ───────────────────────────────────────────
-    inf_module = re.sub(r"_cktile_tune$|_tune$", "", module_name)
-    _log(f"[pretune] rebuilding inference module {inf_module}")
-    core.rm_module(inf_module)
-    core.clear_build(inf_module)
-    inf_args = core.get_args_of_build(ops_name=inf_module)
-    if isinstance(inf_args, dict) and inf_args.get("srcs"):
-        if build_one_module is not None:
-            build_one_module(inf_args)
+    inf_modules = _inference_modules(config_attr, cfg)
+    if not inf_modules:
+        _warn(f"[pretune] no inference module reads {config_attr}. Nothing rebuilt.")
+    for inf_module in inf_modules:
+        _log(f"[pretune] rebuilding inference module {inf_module}")
+        core.rm_module(inf_module)
+        core.clear_build(inf_module)
+        inf_args = _build_args(core, inf_module)
+        if isinstance(inf_args, dict) and inf_args.get("srcs"):
+            if build_one_module is not None:
+                build_one_module(inf_args)
+            else:
+                core.build_module(
+                    md_name=inf_args["md_name"],
+                    srcs=inf_args["srcs"],
+                    flags_extra_cc=inf_args["flags_extra_cc"],
+                    flags_extra_hip=inf_args["flags_extra_hip"],
+                    blob_gen_cmd=inf_args["blob_gen_cmd"],
+                    extra_include=inf_args["extra_include"],
+                    extra_ldflags=None,
+                    verbose=False,
+                    is_python_module=True,
+                    is_standalone=False,
+                    torch_exclude=False,
+                    third_party=inf_args["third_party"],
+                )
         else:
-            core.build_module(
-                md_name=inf_args["md_name"],
-                srcs=inf_args["srcs"],
-                flags_extra_cc=inf_args["flags_extra_cc"],
-                flags_extra_hip=inf_args["flags_extra_hip"],
-                blob_gen_cmd=inf_args["blob_gen_cmd"],
-                extra_include=inf_args["extra_include"],
-                extra_ldflags=None,
-                verbose=False,
-                is_python_module=True,
-                is_standalone=False,
-                torch_exclude=False,
-                third_party=inf_args["third_party"],
+            _warn(
+                f"[pretune] get_args_of_build({inf_module!r}) returned no srcs. "
+                "Inference module not rebuilt."
             )
-    else:
-        _warn(
-            f"[pretune] get_args_of_build({inf_module!r}) returned no srcs. "
-            "Inference module not rebuilt."
-        )
 
 
 def run_pretune_modules(
@@ -359,6 +399,7 @@ def run_pretune_modules(
     logger.info(f"[pretune] PRETUNE_MODULES → {len(modules)} modules to tune")
 
     seen_keys: set = set()
+    failed: list[str] = []
     for mod in modules:
         script, attr = _resolve(mod, cfg, csrc_dir)
         key = (script, attr)
@@ -377,6 +418,9 @@ def run_pretune_modules(
             logger.warning(
                 f"[pretune] {mod} failed: {exc}. Continuing with remaining modules."
             )
+            failed.append(mod)
+    if failed:
+        raise RuntimeError(f"[pretune] failed modules: {', '.join(failed)}")
 
 
 def _main() -> None:
@@ -452,6 +496,7 @@ def _main() -> None:
     from jit import core
 
     seen_keys: set = set()
+    failed: list[str] = []
     for mod in modules:
         if mod in _unsupported:
             print(
@@ -477,6 +522,10 @@ def _main() -> None:
             run_pretune(mod, cfg, core, csrc_dir, repo_dir, libtype=args.libtype)
         except Exception as exc:  # noqa: BLE001
             print(f"[pretune] {mod} failed: {exc}. Continuing.")
+            failed.append(mod)
+    if failed:
+        print(f"[pretune] failed modules: {', '.join(failed)}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
