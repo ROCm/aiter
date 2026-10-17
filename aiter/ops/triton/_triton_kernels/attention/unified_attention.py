@@ -840,11 +840,15 @@ def kernel_unified_attention_3d(
     if out_scale_ptr is not None:
         out_factor = out_factor / tl.load(out_scale_ptr)
 
-    # iterate through tiles within current segment
-    for j in range(
-        segm_idx * tiles_per_segment,
-        min((segm_idx + 1) * tiles_per_segment, num_tiles),
-    ):
+    # Keep the loop induction variable local to the segment. The page-table
+    # index includes the segment offset exactly once, independent of the
+    # compiler's loop scheduling for wider query tiles.
+    segment_tile_start = segm_idx * tiles_per_segment
+    segment_tile_count = tl.maximum(
+        0, tl.minimum(tiles_per_segment, num_tiles - segment_tile_start)
+    )
+    for local_tile in tl.range(0, segment_tile_count):
+        j = segment_tile_start + local_tile
         seq_offset = j * TILE_SIZE + offs_t
         if TILE_SIZE == BLOCK_SIZE:
             tile_mask = tl.full((1,), 1, dtype=tl.int1)

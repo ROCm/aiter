@@ -166,6 +166,14 @@ def diagnose_launches(
                                     f"[paged-prefill-partial] variant={label} range={begin}:{begin+qlen} tensor={name} nonfinite={int((~torch.isfinite(a)).sum())} ref_nonfinite={int((~torch.isfinite(b)).sum())} max_finite_error={float((a-b).abs()[finite].max()) if finite.any() else None}",
                                     flush=True,
                                 )
+                            for seg in range(active):
+                                a = sm[begin : begin + qlen, :, seg]
+                                b = partial_reference[1][begin : begin + qlen, :, seg]
+                                good = torch.isfinite(a) & torch.isfinite(b)
+                                print(
+                                    f"[paged-prefill-segment] range={begin}:{begin+qlen} segment={seg} max_error={float((a-b).abs()[good].max()) if good.any() else None}",
+                                    flush=True,
+                                )
                             begin += qlen
                     ua._reduce_segments_triton(p, so, sm, se, splits, page)
                 torch.cuda.synchronize()
