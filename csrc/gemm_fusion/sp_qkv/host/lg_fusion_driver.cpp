@@ -31,21 +31,35 @@ int32_t lg_info_v1(uint64_t* out6) {
 }
 void* lg_attach_v1(uint32_t rank, uint32_t M, void* comm, const void* devcomm, void* S, void* Sva, void* R, void* Rva, void* C, void* Cva,
                    const char* hsaco_path, const char* expected_hsaco_sha256_hex, uint32_t sdma_queues) {
-    if (rank > 3u || M == 0 || M % 256u || M > 8192u || sdma_queues != 1u || !comm || !devcomm || !S || !R || !C || !Sva || !Rva || !Cva || !hsaco_path || !expected_hsaco_sha256_hex) return nullptr;
+    if (rank > 3u || M == 0 || M % 256u || M > 8192u || sdma_queues != 1u || !comm || !devcomm || !S || !R || !C || !Sva || !Rva || !Cva || !hsaco_path || !expected_hsaco_sha256_hex) {
+        std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=args rank=%u M=%u Q=%u comm=%p dev=%p S=%p R=%p C=%p Sva=%p Rva=%p Cva=%p hsaco=%p sha=%p\n", rank, M, sdma_queues, comm, devcomm, S, R, C, Sva, Rva, Cva,
+                     static_cast<const void*>(hsaco_path), static_cast<const void*>(expected_hsaco_sha256_hex));
+        return nullptr;
+    }
     if (!sm_image_matches(hsaco_path, expected_hsaco_sha256_hex)) { std::fprintf(stderr, "LG_ATTACH rc=FAIL image hash mismatch (%s)\n", hsaco_path); return nullptr; }   // H-3: exact-image gate BEFORE any module action
-    if (hipSetDevice(static_cast<int>(rank)) != hipSuccess) return nullptr;
+    if (const hipError_t e = hipSetDevice(static_cast<int>(rank)); e != hipSuccess) { std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=hipSetDevice rank=%u err=%d (%s)\n", rank, static_cast<int>(e), hipGetErrorString(e)); return nullptr; }
     auto* c = new LgCommCtx();
     c->rank = rank; c->M = M; c->Q = sdma_queues;
     c->comm = static_cast<mori::cco::ccoComm*>(comm);
     c->dev = *static_cast<const mori::cco::ccoDevComm*>(devcomm);
     c->S = reinterpret_cast<mori::cco::ccoWindow_t>(S); c->R = reinterpret_cast<mori::cco::ccoWindow_t>(R); c->C = reinterpret_cast<mori::cco::ccoWindow_t>(C);
     c->Sva = Sva; c->Rva = Rva; c->Cva = Cva;
-    if (c->comm->worldSize != 4 || c->comm->lsaSize != 4 || static_cast<uint32_t>(c->comm->lsaRank) != rank || c->comm->myNodeStart != 0) { delete c; return nullptr; }
-    if (static_cast<uint32_t>(c->dev.sdma.sdmaNumQueue) != sdma_queues) { delete c; return nullptr; }       // CCO may cap Q: report, never silently reduce
-    if (hipModuleLoad(&c->mod, hsaco_path) != hipSuccess) { delete c; return nullptr; }
+    if (c->comm->worldSize != 4 || c->comm->lsaSize != 4 || static_cast<uint32_t>(c->comm->lsaRank) != rank || c->comm->myNodeStart != 0) {
+        std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=topology rank=%u world=%d lsaSize=%d lsaRank=%d myNodeStart=%d (need 4/4/rank/0)\n", rank,
+                     static_cast<int>(c->comm->worldSize), static_cast<int>(c->comm->lsaSize), static_cast<int>(c->comm->lsaRank), static_cast<int>(c->comm->myNodeStart));
+        delete c; return nullptr;
+    }
+    if (static_cast<uint32_t>(c->dev.sdma.sdmaNumQueue) != sdma_queues) {       // CCO may cap Q: report, never silently reduce
+        std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=sdma_queues rank=%u devcomm sdmaNumQueue=%d but the kernels need %u\n", rank, static_cast<int>(c->dev.sdma.sdmaNumQueue), sdma_queues);
+        delete c; return nullptr;
+    }
+    if (const hipError_t e = hipModuleLoad(&c->mod, hsaco_path); e != hipSuccess) { std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=hipModuleLoad rank=%u err=%d (%s) path=%s\n", rank, static_cast<int>(e), hipGetErrorString(e), hsaco_path); delete c; return nullptr; }
     struct { hipFunction_t* f; const char* name; } fns[] = {{&c->fgemm[0], LG_ENTRY_GEMM_N1}, {&c->fgemm[1], LG_ENTRY_GEMM_N2}, {&c->fgemm[2], LG_ENTRY_GEMM_N4}, {&c->fgemm[3], LG_ENTRY_GEMM_N2H},
                                                  {&c->fgemm[4], LG_ENTRY_GEMM_N4H}, {&c->fgemm[5], LG_ENTRY_GEMM_N3Q}, {&c->fquiet, LG_ENTRY_QUIET}, {&c->fdrain, LG_ENTRY_DRAIN}};
-    for (auto& fn : fns) if (hipModuleGetFunction(fn.f, c->mod, fn.name) != hipSuccess) { hipModuleUnload(c->mod); delete c; return nullptr; }
+    for (auto& fn : fns) if (const hipError_t e = hipModuleGetFunction(fn.f, c->mod, fn.name); e != hipSuccess) {
+        std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=entry rank=%u symbol=%s err=%d (%s)\n", rank, fn.name, static_cast<int>(e), hipGetErrorString(e));
+        hipModuleUnload(c->mod); delete c; return nullptr;
+    }
     return c;
 }
 // L-5: call after hipDeviceSynchronize and BEFORE ccoCommDestroy. Windows are owned by the runtime (FusionResources), not freed here.

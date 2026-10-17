@@ -197,6 +197,7 @@ class FusionResources:
         self._drain_hooks: Dict[str, Callable[[], None]] = {}  # owner -> pre-reset SDMA drain
         self._close_hooks: Dict[str, Callable[[], None]] = {}  # owner -> free host/driver objects (L-5), run at release()
         self._poison_hooks: Dict[str, Callable[[], int]] = {}  # owner -> cheap poison word read (host, outside capture)
+        self.sdma_queues = 0  # set by finalize(): sdmaQueueCount given to ccoDevCommCreate
         self.finalized = False
         self._released = False
         self._init_comm()
@@ -302,7 +303,9 @@ class FusionResources:
                 self._pad_to_alignment(owner, r.name, start_alignment(size, self.align_cap))
             h, loc = self._register(owner, r.name, size)
             wins[r.name] = Window(owner, r.name, r.kind, size, h, loc)
-        self._sdma = getattr(self, "_sdma", 0) + sum(1 for r in reqs if r.kind == "sdma_queue")
+        # sdma_queue request: bytes = queues PER PEER wanted (0 = default 1). The shared devcomm gets the MAX over plans, never the
+        # number of plans (9 large plans must not ask CCO for 9 queues: the r11 kernels require exactly 1, as in Phase-1).
+        self._sdma = max([getattr(self, "_sdma", 0)] + [max(1, int(r.bytes)) for r in reqs if r.kind == "sdma_queue"])
         self.windows[owner] = wins
         self._zero_windows(wins.values())  # local only; ranks barrier before first launch (finalize)
         return wins
@@ -342,7 +345,9 @@ class FusionResources:
         """Create the single devcomm (after all windows are registered), then barrier. Collective."""
         if self.finalized:
             return
-        self.devcomm = self.backend.devcomm_create(self.comm, max(1, getattr(self, "_sdma", 0)))
+        self.sdma_queues = max(1, getattr(self, "_sdma", 0))
+        self.devcomm = self.backend.devcomm_create(self.comm, self.sdma_queues)
+        log.info("event=resources devcomm rank=%d sdma_queues=%d windows=%d", self.rank, self.sdma_queues, len(self._reg_log))
         self.finalized = True
         self.backend.device_sync(self.device)
         self._barrier()

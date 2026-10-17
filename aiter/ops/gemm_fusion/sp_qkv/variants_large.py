@@ -85,6 +85,9 @@ class SpQkvLarge(Plan):
         if got is None:
             if not res.finalized:
                 raise RuntimeError("sp_qkv.large: res.finalize() must run before the first launch (devcomm)")
+            if getattr(res, "sdma_queues", 1) != 1:
+                raise RuntimeError(f"sp_qkv.large: the shared devcomm has sdma_queues={res.sdma_queues}; the r11 kernels require exactly 1 "
+                                   f"(Phase-1 sdmaQueueCount=1)")
             wins = res.windows.get(self.owner) or res.ensure(self.owner, self.resources())
             built = build_large(self.params, self.mode)
             sha = hashlib.sha256(open(built.hsaco, "rb").read()).hexdigest()
@@ -102,7 +105,9 @@ class SpQkvLarge(Plan):
             h = lib.lg_attach_v1(res.rank, self.M, C.c_void_p(res.comm), C.c_void_p(res.devcomm), C.c_void_p(S.handle), C.c_void_p(S.local),
                                  C.c_void_p(R.handle), C.c_void_p(R.local), C.c_void_p(Cw.handle), C.c_void_p(Cw.local), built.hsaco.encode(), built.hsaco_sha256.encode(), 1)  # H-3: C++ exact-image gate
             if not h:
-                raise RuntimeError("lg_attach_v1 failed (image hash gate / topology / module load)")
+                raise RuntimeError(f"lg_attach_v1 failed for {self.owner} (see the LG_ATTACH line on stderr: args / image hash / device / "
+                                   f"topology / sdmaNumQueue / hipModuleLoad / entry resolve); hsaco={built.hsaco} sha256={built.hsaco_sha256} "
+                                   f"rank={res.rank} M={self.M} sdma_queues={getattr(res, 'sdma_queues', '?')}")
             got = sc[self.owner] = lrt.LargeContext(lib, C.c_void_p(h), self.M, self.F, res.rank)
             res.set_close(self.owner, got.close)  # L-5
             res.set_poison(self.owner, lambda c=got: c.poison(stream_handle(None)))  # cheap per-step check on the CURRENT torch stream (4-byte D2H + that stream sync)

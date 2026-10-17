@@ -901,3 +901,55 @@ def test_probe_aligned_sequences():
     real, al, lf = wp.real_sequence_sizes(), wp.sequence("aligned_all"), wp.sequence("largest_first")
     assert len(real) == 39 and lf == sorted(real, reverse=True) and len(al) > len(real)
     assert [s for s in al if s in set(real)]  # windows are all still present
+
+# ======================================================================= devcomm queue count (gate03_uniform lg_attach_v1 failure)
+def test_devcomm_sdma_queues_is_max_not_number_of_plans(monkeypatch):
+    """Every large plan declares ONE sdma_queue WindowReq. The shared devcomm must get sdmaQueueCount = 1 (the r11 kernels and
+    lg_attach_v1 require exactly 1), not the number of plans (9 large plans used to request 9)."""
+    from aiter.gemm_fusion import catalog
+    from aiter.gemm_fusion.resources import FusionResources
+
+    monkeypatch.setattr(catalog, "_CATALOG", {})
+    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "per_owner")
+    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
+    profmod.clear_profile_cache()
+    be = FakeBackend()
+    r = FusionResources(0, 4, dist=FakeDist(), backend=be)
+    for mode, T in specs.LARGE_CELLS:  # all 9 large plans
+        p = _plan_for(mode, T, True)
+        r.ensure(p.build_key, p.resources())
+    assert sum(1 for q in (x for pl in r.windows for x in [pl]) if q) == 9
+    r.finalize()
+    assert ("dev", 1) in be.log and not any(x[0] == "dev" and x[1] != 1 for x in be.log)
+    assert r.sdma_queues == 1
+    # an explicit request for more queues per peer is honoured as the MAX, still not summed
+    r2 = FusionResources(0, 4, dist=FakeDist(), backend=FakeBackend())
+    r2.ensure("a", [WindowReq("q", 2, "sdma_queue")])
+    r2.ensure("b", [WindowReq("q", 0, "sdma_queue")])
+    r2.ensure("c", [WindowReq("q", 1, "sdma_queue")])
+    r2.finalize()
+    assert r2.sdma_queues == 2 and ("dev", 2) in r2.backend.log
+
+
+def test_large_attach_refuses_a_devcomm_with_wrong_queue_count_before_the_driver():
+    from aiter.gemm_fusion import catalog
+    from types import SimpleNamespace as NS
+
+    catalog._CATALOG.clear()
+    plan = _plan_for("dense", 8192, True)
+    res = NS(finalized=True, sdma_queues=9, __dict__={})
+    res = type("R", (), {"finalized": True, "sdma_queues": 9})()
+    with pytest.raises(RuntimeError, match="sdma_queues=9.*exactly 1"):
+        plan._context(res)
+
+
+def test_lg_attach_every_failure_branch_reports_on_stderr():
+    src = open(os.path.join(jit.CSRC, "host", "lg_fusion_driver.cpp"), encoding="utf-8").read()
+    body = src[src.index("void* lg_attach_v1"):src.index("int32_t lg_free_v1")]
+    for stage in ("stage=args", "stage=hipSetDevice", "image hash mismatch", "stage=topology", "stage=sdma_queues", "stage=hipModuleLoad", "stage=entry"):
+        assert stage in body, stage
+    # no silent `return nullptr` left: every one is preceded by a diagnostic fprintf in the same branch
+    for i, line in enumerate(body.splitlines()):
+        if "return nullptr" in line and "LG_ATTACH" not in line:
+            ctx = "\n".join(body.splitlines()[max(0, i - 4):i + 1])
+            assert "LG_ATTACH" in ctx, f"silent failure branch: {line.strip()}"
