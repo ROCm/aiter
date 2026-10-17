@@ -1702,11 +1702,12 @@ def test_clamp_shared_preserves_existing_positional_argument_order():
     import aiter.fhmoe as fhmoe_module
 
     parameters = list(inspect.signature(fused_moe).parameters)
-    assert parameters[-4:] == [
+    assert parameters[-5:] == [
         "quant_type_a",
         "quant_dtype_a",
         "quant_dtype_a2",
         "clamp_shared",
+        "ep_has_fake_route",
     ]
     assert list(inspect.signature(fhmoe_module.fhmoe_fake).parameters)[-2:] == [
         "output",
