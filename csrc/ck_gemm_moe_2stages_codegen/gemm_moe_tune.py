@@ -602,6 +602,7 @@ class FmoeTuner(TunerCommon):
         "config_env_name": "AITER_CONFIG_FMOE",
     }
 
+    # Columns of an untuned shape list that name a quantization dtype.
     def _clear_op_caches(self):
         import aiter.fused_moe as fmoe_module
 
@@ -4754,8 +4755,8 @@ class FmoeTuner(TunerCommon):
             topk = int(row["topk"])
             act_type = eval(row["act_type"])
             dtype = eval(row["dtype"])
-            q_dtype_a = eval(row["q_dtype_a"])
-            q_dtype_w = eval(row["q_dtype_w"])
+            q_dtype_a = dtypes.normalize_fp8_dtype(eval(row["q_dtype_a"]))
+            q_dtype_w = dtypes.normalize_fp8_dtype(eval(row["q_dtype_w"]))
             q_type = eval(row["q_type"])
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             use_g1u1 = bool(row["use_g1u1"])
@@ -5161,8 +5162,8 @@ class FmoeTuner(TunerCommon):
                 doweight_stage1,
             ) = line
             dtype = eval(dtype)
-            q_dtype_a = eval(q_dtype_a)
-            q_dtype_w = eval(q_dtype_w)
+            q_dtype_a = dtypes.normalize_fp8_dtype(eval(q_dtype_a))
+            q_dtype_w = dtypes.normalize_fp8_dtype(eval(q_dtype_w))
             q_type = eval(q_type)
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             print("\nStart tuning", line)

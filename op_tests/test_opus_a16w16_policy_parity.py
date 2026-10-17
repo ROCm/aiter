@@ -215,7 +215,12 @@ def _pre_pr_python_tuned_map(rows: pd.DataFrame) -> dict[tuple, dict]:
 
 
 def _pre_pr_codegen_tuned_map(rows: pd.DataFrame) -> dict[tuple, int]:
-    # opus_gemm_lookup.h had one arch-specific (M,N,K,outdtype) table. The
+    # opus_gemm_lookup.h had one arch-specific (M,N,K,outdtype) table, but
+    # gen_instances.py filtered the tuned CSV to the host's cu_num before
+    # emitting it, so every build saw a single cu_num per arch. Key on cu_num
+    # too: gfx942 SKUs with different CU counts (MI308X 80, MI300A 228) can
+    # legitimately pick different kids for the same shape, and collapsing them
+    # into one table would compare one SKU's winner against another's. The
     # generated entry carried a launcher pointer, represented here by its kid.
     result = {}
     for _, row in rows.iterrows():
@@ -228,6 +233,7 @@ def _pre_pr_codegen_tuned_map(rows: pd.DataFrame) -> dict[tuple, int]:
         assert kid_arches == [str(row["gfx"])]
         key = (
             kid_arches[0],
+            int(row["cu_num"]),
             int(row["M"]),
             int(row["N"]),
             int(row["K"]),
@@ -285,8 +291,17 @@ def test_shipped_tuned_selection_diff_is_exhaustive(
 
         # The removed C++ table and the runtime table select the same kid for
         # every shipped full-key row. splitK was not stored in the C++ table.
-        codegen_key = (*shape, str(fields["outdtype"]))
-        assert pre_pr_codegen[codegen_key] == pair[0]
+        codegen_key = (
+            arch,
+            int(fields["cu_num"]),
+            *shape[1:],
+            str(fields["outdtype"]),
+        )
+        assert pre_pr_codegen[codegen_key] == pair[0], (
+            f"codegen mismatch for key={codegen_key}: "
+            f"expected kid={pre_pr_codegen[codegen_key]}, got kid={pair[0]} "
+            f"(full tuned key={key})"
+        )
 
         old_row = pre_pr_python[key[1:]]
         old_pair = (int(old_row["solidx"]), int(old_row["splitK"]))
