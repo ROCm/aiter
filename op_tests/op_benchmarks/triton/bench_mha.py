@@ -28,6 +28,8 @@ from aiter.test_mha_common import (
 )
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     get_model_configs,
     print_vgpr,
@@ -679,120 +681,23 @@ def run_benchmark(run: BenchRun):
         if sm_scale is None:
             sm_scale = 1.0 / (D_HEAD**0.5)
 
-        # Generate base inputs
-        q = torch.randn(
-            (BATCH, N_CTX_Q, HQ, D_HEAD),
-            device=device,
-            dtype=torch_dtype,
-            requires_grad=requires_grad,
-        )
-        k = torch.randn(
-            (BATCH, N_CTX_K, HK, D_HEAD),
-            device=device,
-            dtype=torch_dtype,
-            requires_grad=requires_grad,
-        )
-        v = torch.randn(
-            (BATCH, N_CTX_K, HK, D_HEAD_V),
-            device=device,
-            dtype=torch_dtype,
-            requires_grad=requires_grad,
-        )
-        sink = (
-            torch.randn(
-                (HQ,), device=device, dtype=torch_dtype, requires_grad=requires_grad
-            )
-            if run.sink
-            else None
-        )
-
         # FLOPS calculation variables
         total_flops = 0.0
-
-        # Input preparation
-        if is_decode:
-            # KV cache: q is (B, 1, Hq, D), k/v caches are (B, sk, Hk, D)
-            q_input = q[:, :N_CTX_Q, :, :]  # (B, sq, Hq, D)
-            k_cache = k[:, :N_CTX_K, :, :]  # (B, sk, Hk, D)
-            v_cache = v[:, :N_CTX_K, :, :D_HEAD_V]
-            cache_seqlens = torch.full(
-                (BATCH,), N_CTX_K, dtype=torch.int32, device=device
-            )
-            total_flops += 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
-
-            fn_kwargs = {
-                "sm_scale": sm_scale,
-                "causal": causal,
-                "cache_seqlens": cache_seqlens,
-            }
-            fn = make_fn(q_input, k_cache, v_cache, **fn_kwargs)
-            if fn is None:
-                return 0
-        elif is_varlen:
+        # Varlen's padding mask must be generated once per benchmark point (not per
+        # rotating-buffer pool entry): it fixes cu_seqlens/max_seqlen (and so every
+        # entry's unpadded tensor shapes) so a CUDA graph can capture across entries
+        # that only vary q/k/v content, not shape.
+        query_padding_mask = key_padding_mask = None
+        if is_varlen:
             query_padding_mask = generate_random_padding_mask(
                 N_CTX_Q, BATCH, device, mode="full" if run.equal_seqlens else "random"
             )
             key_padding_mask = generate_random_padding_mask(
                 N_CTX_K, BATCH, device, mode="full" if run.equal_seqlens else "random"
             )
-            (
-                q_unpad,
-                k_unpad,
-                v_unpad,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q,
-                max_seqlen_k,
-                q,
-                k,
-                v,
-                _,
-                _,
-                _,
-            ) = generate_qkv(
-                q, k, v, query_padding_mask, key_padding_mask, kvpacked=False
-            )
-            q_unpad.requires_grad = requires_grad
-            k_unpad.requires_grad = requires_grad
-            v_unpad.requires_grad = requires_grad
-
-            q_input, k_input, v_input = q_unpad, k_unpad, v_unpad
-
-            num_contexts = len(cu_seqlens_q) - 1
-            for i in range(num_contexts):
-                seqlen_q = (cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item()
-                seqlen_k = (cu_seqlens_k[i + 1] - cu_seqlens_k[i]).item()
-                total_flops += (
-                    _count_valid_attention_elements(
-                        seqlen_q, seqlen_k, causal, window_size
-                    )
-                    * HQ
-                    * (D_HEAD + D_HEAD_V)
-                    * 2.0
-                )
-
-            fn_kwargs = {
-                "sm_scale": sm_scale,
-                "causal": causal,
-                "dropout": dropout,
-                "return_lse": return_lse,
-                "return_attn_probs": return_attn_probs,
-                "sink": sink,
-                "window_size": window_size,
-                "has_pe": has_pe,
-                "has_sink": run.sink,
-                "backend": run.backend,
-                "cu_seqlens_q": cu_seqlens_q,
-                "cu_seqlens_k": cu_seqlens_k,
-                "max_seqlen_q": max_seqlen_q,
-                "max_seqlen_k": max_seqlen_k,
-            }
-            fn = make_fn(q_input, k_input, v_input, **fn_kwargs)
-            if fn is None:
-                return 0
+        elif is_decode:
+            total_flops += 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
         else:
-            q_input, k_input, v_input = q, k, v
-
             total_flops += (
                 2.0
                 * BATCH
@@ -801,46 +706,145 @@ def run_benchmark(run: BenchRun):
                 * (D_HEAD + D_HEAD_V)
             )
 
-            fn_kwargs = {
-                "sm_scale": sm_scale,
-                "causal": causal,
-                "dropout": dropout,
-                "return_lse": return_lse,
-                "return_attn_probs": return_attn_probs,
-                "sink": sink,
-                "window_size": window_size,
-                "has_pe": has_pe,
-                "has_sink": run.sink,
-                "backend": run.backend,
-            }
-            fn = make_fn(q_input, k_input, v_input, **fn_kwargs)
-            if fn is None:
-                return 0
+        def _make_pool_entry():
+            q = torch.randn(
+                (BATCH, N_CTX_Q, HQ, D_HEAD),
+                device=device,
+                dtype=torch_dtype,
+                requires_grad=requires_grad,
+            )
+            k = torch.randn(
+                (BATCH, N_CTX_K, HK, D_HEAD),
+                device=device,
+                dtype=torch_dtype,
+                requires_grad=requires_grad,
+            )
+            v = torch.randn(
+                (BATCH, N_CTX_K, HK, D_HEAD_V),
+                device=device,
+                dtype=torch_dtype,
+                requires_grad=requires_grad,
+            )
+            sink = (
+                torch.randn(
+                    (HQ,), device=device, dtype=torch_dtype, requires_grad=requires_grad
+                )
+                if run.sink
+                else None
+            )
 
-        if is_bwd:
-            with torch.enable_grad():
-                triton_out = fn()[0]
-                d_out = torch.randn_like(triton_out)
+            cu_seqlens_q = cu_seqlens_k = None
+            if is_decode:
+                # KV cache: q is (B, 1, Hq, D), k/v caches are (B, sk, Hk, D)
+                q_input = q[:, :N_CTX_Q, :, :]  # (B, sq, Hq, D)
+                k_input = k[:, :N_CTX_K, :, :]  # (B, sk, Hk, D)
+                v_input = v[:, :N_CTX_K, :, :D_HEAD_V]
+                cache_seqlens = torch.full(
+                    (BATCH,), N_CTX_K, dtype=torch.int32, device=device
+                )
+                fn_kwargs = {
+                    "sm_scale": sm_scale,
+                    "causal": causal,
+                    "cache_seqlens": cache_seqlens,
+                }
+                fwd_fn = make_fn(q_input, k_input, v_input, **fn_kwargs)
+            elif is_varlen:
+                (
+                    q_unpad,
+                    k_unpad,
+                    v_unpad,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                ) = generate_qkv(
+                    q, k, v, query_padding_mask, key_padding_mask, kvpacked=False
+                )
+                q_unpad.requires_grad = requires_grad
+                k_unpad.requires_grad = requires_grad
+                v_unpad.requires_grad = requires_grad
 
-                grad_inputs = (q_input, k_input, v_input)
-                if sink is not None:
-                    grad_inputs += (sink,)
+                q_input, k_input, v_input = q_unpad, k_unpad, v_unpad
 
-                def fn():
-                    grads = torch.autograd.grad(
-                        triton_out,
-                        grad_inputs,
-                        d_out,
-                        retain_graph=True,
-                    )
-                    return grads
+                fn_kwargs = {
+                    "sm_scale": sm_scale,
+                    "causal": causal,
+                    "dropout": dropout,
+                    "return_lse": return_lse,
+                    "return_attn_probs": return_attn_probs,
+                    "sink": sink,
+                    "window_size": window_size,
+                    "has_pe": has_pe,
+                    "has_sink": run.sink,
+                    "backend": run.backend,
+                    "cu_seqlens_q": cu_seqlens_q,
+                    "cu_seqlens_k": cu_seqlens_k,
+                    "max_seqlen_q": max_seqlen_q,
+                    "max_seqlen_k": max_seqlen_k,
+                }
+                fwd_fn = make_fn(q_input, k_input, v_input, **fn_kwargs)
+            else:
+                q_input, k_input, v_input = q, k, v
+                fn_kwargs = {
+                    "sm_scale": sm_scale,
+                    "causal": causal,
+                    "dropout": dropout,
+                    "return_lse": return_lse,
+                    "return_attn_probs": return_attn_probs,
+                    "sink": sink,
+                    "window_size": window_size,
+                    "has_pe": has_pe,
+                    "has_sink": run.sink,
+                    "backend": run.backend,
+                }
+                fwd_fn = make_fn(q_input, k_input, v_input, **fn_kwargs)
+
+            if is_bwd:
+                with torch.enable_grad():
+                    triton_out = fwd_fn()[0]
+                    d_out = torch.randn_like(triton_out)
+
+                    grad_inputs = (q_input, k_input, v_input)
+                    if sink is not None:
+                        grad_inputs += (sink,)
+
+                    def call():
+                        return torch.autograd.grad(
+                            triton_out,
+                            grad_inputs,
+                            d_out,
+                            retain_graph=True,
+                        )
+
+            else:
+                call = fwd_fn
+
+            return q_input, k_input, v_input, call, cu_seqlens_q, cu_seqlens_k
+
+        _out_val_keys = [
+            "q_input",
+            "k_input",
+            "v_input",
+            "call",
+            "cu_seqlens_q",
+            "cu_seqlens_k",
+        ]
 
         if run.profile_dir is not None:
             import os
 
+            entry = dict(zip(_out_val_keys, _make_pool_entry()))
+            call = entry["call"]
+
             # Warmup
             for _ in range(3):
-                fn()
+                call()
                 torch.cuda.synchronize()
 
             prof = torch.profiler.profile(
@@ -853,7 +857,7 @@ def run_benchmark(run: BenchRun):
             )
             prof.start()
             for _ in range(5):
-                fn()
+                call()
                 torch.cuda.synchronize()
             prof.stop()
 
@@ -872,21 +876,73 @@ def run_benchmark(run: BenchRun):
             prof.export_chrome_trace(os.path.join(trace_dir, "trace.json"))
             return 0
 
-        ms = triton.testing.do_bench(fn)
+        if is_bwd:
+            # autograd.grad's graph is built on the default stream; let CUDA graph
+            # capture (on its own side stream) adopt that stale reference.
+            torch.autograd.graph.set_override_stale_capture_stream(True)
+
+        # mha_v3's non-gluon fp8 wrappers (flash_attn_fp8_func / _varlen_fp8_func)
+        # quantize their high-precision inputs on every call, by design (see the
+        # module docstring). That quantization does a CPU->GPU copy, which CUDA
+        # graph capture disallows mid-capture, so this one combo can't use the
+        # rotating-buffer/capture path -- fall back to the original single-buffer
+        # plain do_bench. The gluon fp8 path pre-quantizes outside the returned
+        # call (see _make_fp8_gluon_fn) and has no such restriction.
+        needs_plain_do_bench = dtype == "fp8" and not is_gluon
+
+        # Configs here range from tiny decode steps to multi-GB prefill shapes
+        # (estimated_memory / _filter_by_memory exist for exactly this reason), so
+        # a floor of 4 pool entries could quadruple an already multi-GB config and
+        # OOM. Use a smaller floor; large tensors already exceed L2 capacity on
+        # their own and get little extra benefit from rotation anyway.
+        if not needs_plain_do_bench:
+            rot_bufs = generate_rotating_buffers_pool(
+                [_make_pool_entry], [_out_val_keys], target_mb=128, min_pool_len=2
+            )
+            sample = rot_bufs[0]
+        else:
+            sample = dict(zip(_out_val_keys, _make_pool_entry()))
+
+        base_elem = torch.tensor([], dtype=torch_dtype).element_size()
+        if is_varlen:
+            num_contexts = len(sample["cu_seqlens_q"]) - 1
+            for i in range(num_contexts):
+                seqlen_q = (
+                    sample["cu_seqlens_q"][i + 1] - sample["cu_seqlens_q"][i]
+                ).item()
+                seqlen_k = (
+                    sample["cu_seqlens_k"][i + 1] - sample["cu_seqlens_k"][i]
+                ).item()
+                total_flops += (
+                    _count_valid_attention_elements(
+                        seqlen_q, seqlen_k, causal, window_size
+                    )
+                    * HQ
+                    * (D_HEAD + D_HEAD_V)
+                    * 2.0
+                )
+            total_num_tokens_q = sample["cu_seqlens_q"][-1].item()
+            total_num_tokens_k = sample["cu_seqlens_k"][-1].item()
+        else:
+            total_num_tokens_q = BATCH * N_CTX_Q
+            total_num_tokens_k = BATCH * N_CTX_K
+
+        if needs_plain_do_bench:
+            ms = triton.testing.do_bench(sample["call"])
+        else:
+
+            def _run(call, **_):
+                call()
+
+            ms = do_bench_aiter_triton(_run, rot_bufs)
 
         if is_bwd:
             total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
 
-        if is_varlen:
-            total_num_tokens_q = cu_seqlens_q[-1].item()
-            total_num_tokens_k = cu_seqlens_k[-1].item()
-        else:
-            total_num_tokens_q = BATCH * N_CTX_Q
-            total_num_tokens_k = BATCH * N_CTX_K
-        q_size = total_num_tokens_q * HQ * D_HEAD * q.element_size()
-        k_size = total_num_tokens_k * HK * D_HEAD * k.element_size()
-        v_size = total_num_tokens_k * HK * D_HEAD_V * v.element_size()
-        o_size = total_num_tokens_q * HQ * D_HEAD_V * q.element_size()
+        q_size = total_num_tokens_q * HQ * D_HEAD * base_elem
+        k_size = total_num_tokens_k * HK * D_HEAD * base_elem
+        v_size = total_num_tokens_k * HK * D_HEAD_V * base_elem
+        o_size = total_num_tokens_q * HQ * D_HEAD_V * base_elem
         if is_bwd:
             # read q, k, v, do
             mem_read = q_size + k_size + v_size + o_size

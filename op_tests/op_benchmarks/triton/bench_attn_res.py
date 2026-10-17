@@ -23,6 +23,7 @@ the residual twice; its real HBM throughput is about 2x the reported value.
 """
 
 import argparse
+import functools
 import sys
 
 import torch
@@ -30,6 +31,8 @@ import triton
 
 from aiter.ops.triton.fusions.attn_res import attn_res_fwd, attn_res_gate
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     print_vgpr,
 )
@@ -37,6 +40,33 @@ from op_tests.triton_tests.fusions.test_attn_res import (
     generate_attn_res_gate_inputs,
     generate_attn_res_inputs,
 )
+
+
+def _generate_attn_res_gate_pool_inputs(N, D, L, dtype, with_add, with_add2, onorm):
+    prefix, block_residual, score_weight, add_hidden, add_hidden2 = (
+        generate_attn_res_gate_inputs(
+            N, D, L, dtype, with_add=with_add, with_add2=with_add2
+        )
+    )
+    output_rms_weight = torch.randn(D, dtype=dtype, device="cuda") if onorm else None
+    return (
+        prefix,
+        block_residual,
+        score_weight,
+        add_hidden,
+        add_hidden2,
+        output_rms_weight,
+    )
+
+
+def _generate_attn_res_fwd_pool_inputs(N, D, L, dtype, with_onorm, layout):
+    query, residuals, rms_weight, output_rms_weight = generate_attn_res_inputs(
+        N, D, L, dtype, with_onorm=with_onorm
+    )
+    if layout == "packed":
+        residuals = torch.stack(residuals, dim=-2).contiguous()
+    return query, residuals, rms_weight, output_rms_weight
+
 
 arg_to_torch_dtype = {
     "fp16": torch.float16,
@@ -73,54 +103,79 @@ def bench_attn_res_fn(N, D, L, layout, metric, args):
 
     if args.op == "gate":
         # L counts the prefix, so the packed block holds L - 1 rows.
-        prefix, block_residual, score_weight, add_hidden, add_hidden2 = (
-            generate_attn_res_gate_inputs(
-                N,
-                D,
-                L - 1,
-                dtype,
-                with_add=args.add_hidden or args.add_hidden2,
-                with_add2=args.add_hidden2,
-            )
-        )
+        with_add = args.add_hidden or args.add_hidden2
         if args.add_hidden:
             mem += 2 * N * D * elem_size  # add_hidden read + prefix write-back
         if args.add_hidden2:
             mem += N * D * elem_size  # second addend read
         if args.close_block:
             mem += N * L * D * elem_size  # fused block_out write, no separate cat
-        output_rms_weight = (
-            torch.randn(D, dtype=dtype, device="cuda") if args.onorm else None
+
+        _p_gen = functools.partial(
+            _generate_attn_res_gate_pool_inputs,
+            N,
+            D,
+            L - 1,
+            dtype,
+            with_add,
+            args.add_hidden2,
+            args.onorm,
         )
-        fn = lambda: attn_res_gate(
+        _out_val_keys = [
+            "prefix",
+            "block_residual",
+            "score_weight",
+            "add_hidden",
+            "add_hidden2",
+            "output_rms_weight",
+        ]
+        rot_bufs = generate_rotating_buffers_pool(
+            [_p_gen], [_out_val_keys], target_mb=256, min_pool_len=4
+        )
+
+        def _run(
             prefix,
             block_residual,
             score_weight,
-            args.eps,
             add_hidden,
             add_hidden2,
-            output_rms_weight=output_rms_weight,
-            output_rms_eps=args.out_eps,
-            scale=args.scale,
-            close_block=args.close_block,
-        )
-    else:
-        query, residuals, rms_weight, output_rms_weight = generate_attn_res_inputs(
-            N, D, L, dtype, with_onorm=args.onorm
-        )
-        if layout == "packed":
-            residuals = torch.stack(residuals, dim=-2).contiguous()
-        fn = lambda: attn_res_fwd(
-            query,
-            residuals,
-            rms_weight,
             output_rms_weight,
-            args.eps,
-            args.scale,
-            layout=layout,
+        ):
+            attn_res_gate(
+                prefix,
+                block_residual,
+                score_weight,
+                args.eps,
+                add_hidden,
+                add_hidden2,
+                output_rms_weight=output_rms_weight,
+                output_rms_eps=args.out_eps,
+                scale=args.scale,
+                close_block=args.close_block,
+            )
+
+        ms = do_bench_aiter_triton(_run, rot_bufs)
+    else:
+        _p_gen = functools.partial(
+            _generate_attn_res_fwd_pool_inputs, N, D, L, dtype, args.onorm, layout
+        )
+        _out_val_keys = ["query", "residuals", "rms_weight", "output_rms_weight"]
+        rot_bufs = generate_rotating_buffers_pool(
+            [_p_gen], [_out_val_keys], target_mb=256, min_pool_len=4
         )
 
-    ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
+        def _run(query, residuals, rms_weight, output_rms_weight):
+            attn_res_fwd(
+                query,
+                residuals,
+                rms_weight,
+                output_rms_weight,
+                args.eps,
+                args.scale,
+                layout=layout,
+            )
+
+        ms = do_bench_aiter_triton(_run, rot_bufs)
 
     if metric == "time":
         return ms
