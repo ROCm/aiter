@@ -911,12 +911,12 @@ def test_stage_bound_covers_plan(device):
 
 
 def test_pa_decode_nhd_rejected(device, monkeypatch):
-    """NHD is the gfx950 FP8 dense page-64 path, at most 32 query rows."""
+    """NHD requires gfx950 FP8 page 64 and at most 32 query rows."""
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
     fp8 = (
         torch.float8_e4m3fn if get_gfx_runtime() == "gfx950" else torch.float8_e4m3fnuz
     )
-    variants = ["bf16", "mtp", "window", "page128"]
+    variants = ["bf16", "mtp", "page128"]
     if get_gfx_runtime() != "gfx950":
         variants.insert(0, "arch")
 
@@ -928,7 +928,6 @@ def test_pa_decode_nhd_rejected(device, monkeypatch):
         page = 128 if variant == "page128" else 64
         # GQA 8: query length 5 is 40 rows, past the pipe's two M-tiles.
         query_length = 5 if variant == "mtp" else 1
-        window = 1 if variant == "window" else 0
         dtype = torch.bfloat16 if variant == "bf16" else fp8
         query = torch.zeros((query_length, 8, 256), dtype=torch.bfloat16, device=device)
         cache = torch.zeros((2, page, 1, 256), dtype=dtype, device=device)
@@ -939,7 +938,6 @@ def test_pa_decode_nhd_rejected(device, monkeypatch):
             context,
             1,
             max_partitions=1,
-            sliding_window=window,
             query_length=query_length,
         )
         with pytest.raises(NotImplementedError, match="NHD"):
@@ -955,6 +953,5 @@ def test_pa_decode_nhd_rejected(device, monkeypatch):
                 compute_type=dtype,
                 key_scale=None if variant == "bf16" else scale,
                 value_scale=None if variant == "bf16" else scale,
-                sliding_window=window,
                 work_plan=plan,
             )

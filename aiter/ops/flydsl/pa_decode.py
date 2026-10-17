@@ -179,12 +179,17 @@ def pa_decode(
     up to 1024; FP8 supports 64 and multiples of 128 up to 1024.
     K/V scales are [1] or [num_blocks, num_kv_heads, block_size, 1].
 
+    The gfx950 FP8 head-256 page-64 pipe supports both packed V layouts,
+    per-tensor or per-token scales, and sliding windows, with at most 32
+    query rows (query_length times the GQA group size).
+
     A 4D ``key_cache`` selects the NHD layout: K and V are equally shaped
     [num_blocks, 64, num_kv_heads, 256] views with a contiguous head axis and
     arbitrary other strides, e.g. both halves of one 512-byte token row. NHD
-    requires gfx950, FP8 KV, head 256, page 64, no sliding window, and a
-    uniform query_length whose rows (query_length times the GQA group size)
-    fit two 16-row M-tiles, e.g. query_length 1-4 at GQA 8. Each view must be
+    requires gfx950, FP8 KV, head 256, page 64, and a uniform query_length
+    whose rows (query_length times the GQA group size) fit two 16-row M-tiles,
+    e.g. query_length 1-4 at GQA 8. Both scale modes and positive sliding
+    windows are supported. Each view must be
     16-byte aligned with 16-byte multiple strides, its token rows must not
     overlap, and its strides and in-page span must fit int32; heads-outermost
     storage with several KV heads is thus limited to 2 GiB per head.
@@ -627,14 +632,12 @@ def pa_decode(
             kv_dtype,
             head_dim,
             block_size,
-            trans_v,
             query_length,
             query_group_size,
-            sliding_window,
         ):
             raise NotImplementedError(
-                "NHD pa_decode requires gfx950, FP8 KV, head 256, page 64, no "
-                "sliding window, and a uniform query_length * query_group_size "
+                "NHD pa_decode requires gfx950, FP8 KV, head 256, page 64, "
+                "and a uniform query_length * query_group_size "
                 "of at most 32 rows"
             )
         stride_k_block, stride_k_token, stride_k_head = _nhd_strides(key_cache)

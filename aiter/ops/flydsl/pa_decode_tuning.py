@@ -166,10 +166,8 @@ def _default_workgroup_budget(
     head_dim,
     block_size,
     kv_dtype,
-    trans_v,
     query_length,
     query_group_size,
-    sliding_window,
 ):
     """CU count for the head-256 pipe, otherwise two CTAs per CU."""
     one_cta_per_cu = d256_pipe(
@@ -177,10 +175,8 @@ def _default_workgroup_budget(
         "fp8" if "float8" in kv_dtype else "bf16",
         head_dim,
         block_size,
-        trans_v,
         query_length,
         query_group_size,
-        sliding_window,
     )
     return num_cu if one_cta_per_cu else 2 * num_cu
 
@@ -196,10 +192,8 @@ def _pa_decode_default(*args, **kwargs):
                     "head_dim",
                     "block_size",
                     "kv_dtype",
-                    "trans_v",
                     "query_length",
                     "query_group_size",
-                    "sliding_window",
                 )
             }
         )
@@ -338,21 +332,14 @@ def prepare_pa_decode_plan(
         limit = num_cu if max_partitions is None else max_partitions
         num_kv_heads, block_size, layout = _cache_geometry(key_cache)
         arch = get_gfx_runtime()
-        window = (
-            max(sliding_window, 0)
-            if isinstance(sliding_window, int)
-            else sliding_window
-        )
         default_budget = _default_workgroup_budget(
             num_cu=num_cu,
             arch=arch,
             head_dim=query.shape[-1],
             block_size=block_size,
             kv_dtype=str(key_cache.dtype),
-            trans_v=value_cache.ndim == 5,
             query_length=query_length,
             query_group_size=query.shape[1] // num_kv_heads,
-            sliding_window=window,
         )
         # Validate plan geometry even when native autotune takes the default.
         default_plan = plan_pa_decode(

@@ -897,16 +897,26 @@ class PaDecodeKVLoader:
             self.traits.NCHUNK * self.traits.N_SUBCHUNKS, 0, fx.Int64
         )
         if self.ctx.part_start < self.ctx.part_end:
-            k_pf0, phys_vec0 = self.load_k(self.ctx.part_start)
-            if const_expr(self.traits.REUSE_KV_PAGES):
-                # Reuse K page IDs for V's LDS broadcast.
-                self.stage_v_pages(phys_vec0)
-            else:
-                self.fetch_v_pages(self.ctx.part_start)
-            if const_expr(self.traits.per_token_kv):
+            if const_expr(self.traits.D256_PIPE and self.traits.per_token_kv):
+                # Put scales ahead of K on vmcnt, so waiting for their LDS
+                # writes does not also drain the first K prefetch.
+                phys_vec0 = self.fetch_v_pages(self.ctx.part_start)
                 self.stage_scales(
                     phys_vec0, self.scale_buffer_offset(fx.Int32(self.ctx.part_start))
                 )
+                k_pf0 = self.load_k_from_pages(phys_vec0)
+            else:
+                k_pf0, phys_vec0 = self.load_k(self.ctx.part_start)
+                if const_expr(self.traits.REUSE_KV_PAGES):
+                    # Reuse K page IDs for V's LDS broadcast.
+                    self.stage_v_pages(phys_vec0)
+                else:
+                    self.fetch_v_pages(self.ctx.part_start)
+                if const_expr(self.traits.per_token_kv):
+                    self.stage_scales(
+                        phys_vec0,
+                        self.scale_buffer_offset(fx.Int32(self.ctx.part_start)),
+                    )
         elif self.ctx.lane == 0:
             self.lds.store(
                 self.traits.sVPage_off
