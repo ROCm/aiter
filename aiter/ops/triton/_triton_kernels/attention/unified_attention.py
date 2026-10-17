@@ -345,7 +345,7 @@ def kernel_unified_attention_2d(
                 other=0.0,
                 cache_modifier=KV_cache_modifier,
             )
-            K = K_load.to(Q.dtype)
+            K = K_load if PER_TOKEN_KV_SCALES else K_load.to(Q.dtype)
 
             V_load = tl.load(
                 value_cache_ptr + v_offset,
@@ -353,7 +353,7 @@ def kernel_unified_attention_2d(
                 other=0.0,
                 cache_modifier=KV_cache_modifier,
             )
-            V = V_load.to(Q.dtype)
+            V = V_load if PER_TOKEN_KV_SCALES else V_load.to(Q.dtype)
 
             S = qk_scale * tl.dot(Q, K)
 
@@ -441,7 +441,7 @@ def kernel_unified_attention_2d(
             cache_modifier=KV_cache_modifier,
         )
 
-        K = K_load.to(Q.dtype)
+        K = K_load if PER_TOKEN_KV_SCALES else K_load.to(Q.dtype)
         if SHUFFLED_KV_CACHE:
             K = (
                 K.reshape(
@@ -462,7 +462,7 @@ def kernel_unified_attention_2d(
             cache_modifier=KV_cache_modifier,
         )
 
-        V = V_load.to(Q.dtype)
+        V = V_load if PER_TOKEN_KV_SCALES else V_load.to(Q.dtype)
         if SHUFFLED_KV_CACHE and V_CACHE_NHD:
             V = V.reshape(HEAD_SIZE_PADDED, TILE_SIZE).trans(1, 0)
         elif SHUFFLED_KV_CACHE:
@@ -840,15 +840,11 @@ def kernel_unified_attention_3d(
     if out_scale_ptr is not None:
         out_factor = out_factor / tl.load(out_scale_ptr)
 
-    # Keep the loop induction variable local to the segment. The page-table
-    # index includes the segment offset exactly once, independent of the
-    # compiler's loop scheduling for wider query tiles.
-    segment_tile_start = segm_idx * tiles_per_segment
-    segment_tile_count = tl.maximum(
-        0, tl.minimum(tiles_per_segment, num_tiles - segment_tile_start)
-    )
-    for local_tile in tl.range(0, segment_tile_count):
-        j = segment_tile_start + local_tile
+    # iterate through tiles within current segment
+    for j in range(
+        segm_idx * tiles_per_segment,
+        min((segm_idx + 1) * tiles_per_segment, num_tiles),
+    ):
         seq_offset = j * TILE_SIZE + offs_t
         if TILE_SIZE == BLOCK_SIZE:
             tile_mask = tl.full((1,), 1, dtype=tl.int1)
@@ -903,7 +899,7 @@ def kernel_unified_attention_3d(
             cache_modifier=KV_cache_modifier,
         )
 
-        K = K_load.to(Q.dtype)
+        K = K_load if PER_TOKEN_KV_SCALES else K_load.to(Q.dtype)
         if SHUFFLED_KV_CACHE:
             K = (
                 K.reshape(
@@ -924,7 +920,7 @@ def kernel_unified_attention_3d(
             cache_modifier=KV_cache_modifier,
         )
 
-        V = V_load.to(Q.dtype)
+        V = V_load if PER_TOKEN_KV_SCALES else V_load.to(Q.dtype)
         if SHUFFLED_KV_CACHE and V_CACHE_NHD:
             V = V.reshape(HEAD_SIZE_PADDED, TILE_SIZE).trans(1, 0)
         elif SHUFFLED_KV_CACHE:

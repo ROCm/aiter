@@ -584,18 +584,6 @@ def is_reduce_gluon_available(params: _UAParams, NUM_SEGMENTS, backend: str):
 def _triton_attention_config(params: _UAParams, op: str):
     """Resolve the exact query tile shared by dispatch and the kernel launch."""
     config = get_unified_attention_config(op, params, backend="triton")
-    if (
-        op == "attn_3d"
-        and DEVICE_ARCH == "gfx950"
-        and params.per_token_kv_scales
-        and not params.all_decode
-    ):
-        # Reuse prefill's query tile across KV splits. A decode-sized tile
-        # would undo the reuse that made the 2-D launch under-occupied.
-        prefill = get_unified_attention_config("attn_2d", params, backend="triton")
-        for key in ("BLOCK_M", "num_warps", "num_stages", "waves_per_eu"):
-            if key in prefill:
-                config[key] = prefill[key]
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
     )
