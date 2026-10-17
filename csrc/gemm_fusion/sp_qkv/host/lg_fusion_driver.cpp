@@ -10,8 +10,16 @@
 //   D2 lg_info_v1 / lg_window_bytes_v1: build constants and the window size the runtime must register.
 //   D3 lg_free_v1 (L-5): unload the module and delete the context (call after a device sync, before comm teardown).
 //   D4 lg_report_fast_v1: poison word only (4-byte D2H on the given stream), for the per-step host check.
+//   D6 Process-global HIP state (gf_device_scope.hpp): the Phase-1 entry points lg_comm_launch / lg_comm_init_control / lg_comm_read_report /
+//      lg_comm_drain_all use the CALLER'S current device and the only hipSetDevice(rank) in the file sits in lg_comm_create (never called here).
+//      Every entry point below runs in a DeviceScope of the comm's HIP device (ccoComm::hipDev, NOT the SP rank), restores the caller's device
+//      on exit, and flushes the sticky HIP last-error; lg_launch_v1 / lg_init_control_v1 / lg_report_v1 / lg_drain_v1 are scoped wrappers of the
+//      unmodified Phase-1 functions.
 #include "lg_comm_driver.cpp"
 #include "sha256_image.hpp"
+#include "gf_device_scope.hpp"
+
+namespace { inline int lg_dev(const LgCommCtx* c) { return (c && c->comm) ? static_cast<int>(c->comm->hipDev) : -1; } }
 
 extern "C" {
 // Window bytes every one of S, R, C must have for this build and M: roundup(max(P + pad, stamp area), 4 MiB) (r8g rule).
@@ -46,7 +54,9 @@ void* lg_attach_v1(uint32_t rank, uint32_t M, void* comm, const void* devcomm, v
         return nullptr;
     }
     if (!sm_image_matches(hsaco_path, expected_hsaco_sha256_hex)) { diag[0] = 2; std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=image_hash (%s)\n", hsaco_path); return nullptr; }   // H-3: exact-image gate BEFORE any module action
-    if (const hipError_t e = hipSetDevice(static_cast<int>(rank)); e != hipSuccess) { diag[0] = 3; diag[1] = static_cast<uint64_t>(e); std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=hipSetDevice rank=%u err=%d (%s)\n", rank, static_cast<int>(e), hipGetErrorString(e)); return nullptr; }
+    const int attach_dev = static_cast<int>(static_cast<mori::cco::ccoComm*>(comm)->hipDev);
+    gf::DeviceScope scope(attach_dev);   // the comm's HIP device, NOT the SP rank; the caller's current device is restored on exit
+    if (!scope.ok()) { diag[0] = 3; diag[1] = static_cast<uint64_t>(scope.err()); std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=hipSetDevice rank=%u device=%d err=%d (%s)\n", rank, attach_dev, static_cast<int>(scope.err()), hipGetErrorString(scope.err())); return nullptr; }
     auto* c = new LgCommCtx();
     c->rank = rank; c->M = M; c->Q = sdma_queues;
     c->comm = static_cast<mori::cco::ccoComm*>(comm);
@@ -74,13 +84,15 @@ void* lg_attach_v1(uint32_t rank, uint32_t M, void* comm, const void* devcomm, v
         std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=entry rank=%u symbol=%s err=%d (%s)\n", rank, fn.name, static_cast<int>(e), hipGetErrorString(e));
         hipModuleUnload(c->mod); delete c; return nullptr;
     }
+    gf::flush_sticky();
     return c;
 }
 // L-5: call after hipDeviceSynchronize and BEFORE ccoCommDestroy. Windows are owned by the runtime (FusionResources), not freed here.
 int32_t lg_free_v1(void* h) {
     auto* c = static_cast<LgCommCtx*>(h);
     if (!c) return -1;
-    if (hipSetDevice(static_cast<int>(c->rank)) != hipSuccess) return -2;
+    gf::DeviceScope scope(lg_dev(c));
+    if (!scope.ok()) return -2;
     if (c->mod) hipModuleUnload(c->mod);
     delete c;
     return 0;
@@ -89,8 +101,33 @@ int32_t lg_free_v1(void* h) {
 int32_t lg_poison_v1(void* h, void* stream, uint32_t* out) {
     auto* c = static_cast<LgCommCtx*>(h);
     if (!c || !out) return -1;
+    gf::DeviceScope scope(lg_dev(c));
     const hipStream_t s = static_cast<hipStream_t>(stream);
     if (hipMemcpyAsync(out, static_cast<uint8_t*>(c->Cva) + LGC_POISON_OFF, 4, hipMemcpyDeviceToHost, s) != hipSuccess) return -2;
     return hipStreamSynchronize(s) == hipSuccess ? 0 : -3;
+}
+// ---- device-scoped wrappers of the UNMODIFIED Phase-1 entry points (the Python runtime calls these, never the bare lg_comm_* ones) ----
+int32_t lg_init_control_v1(void* h) {
+    auto* c = static_cast<LgCommCtx*>(h); if (!c) return -1;
+    gf::DeviceScope scope(lg_dev(c)); if (!scope.ok()) return -2;
+    return lg_comm_init_control(h);
+}
+int32_t lg_launch_v1(void* h, const void* A, const void* W, const float* Ascale, const float* Wscale, uint32_t strideA, uint64_t poll_iterations,
+                     uint64_t poll_budget_us, uint32_t puts_per_peer, uint32_t half_first, void* stream) {
+    auto* c = static_cast<LgCommCtx*>(h); if (!c) return -1;
+    gf::DeviceScope scope(lg_dev(c)); if (!scope.ok()) return -2;   // module functions belong to the comm's device context
+    return lg_comm_launch(h, A, W, Ascale, Wscale, strideA, poll_iterations, poll_budget_us, puts_per_peer, half_first, stream);
+}
+int32_t lg_report_v1(void* h, uint64_t* out10) {
+    auto* c = static_cast<LgCommCtx*>(h); if (!c) return -1;
+    gf::DeviceScope scope(lg_dev(c)); if (!scope.ok()) return -2;
+    return lg_comm_read_report(h, out10);
+}
+int32_t lg_drain_v1(void* h, void* stream) {
+    auto* c = static_cast<LgCommCtx*>(h); if (!c) return -1;
+    gf::DeviceScope scope(lg_dev(c)); if (!scope.ok()) return -2;
+    const int32_t rc = lg_comm_drain_all(h, stream);
+    gf::flush_sticky();
+    return rc;
 }
 }

@@ -8,7 +8,15 @@
 //   D2 sm_bind_new_v1 / sm_launch_blk_v1 / sm_blk_free_v1: several bindings (one per site/layer) can share one context
 //      (windows+epoch); each owns its device-resident SmDev block. A and W are passed per launch (as kernargs, like Phase-1).
 //   D3 sm_info_v1: exports Rx/control byte sizes so the runtime sizes windows from the compiled geometry.
+//   D4 Process-global HIP state (gf_device_scope.hpp): the Phase-1 file calls hipSetDevice(c->rank) (rank = SP rank, also a KERNEL argument, so it cannot
+//      be reused as the device index) in build_dev_block / sm_reset_control_v1 / sm_create_v1. Those calls are rerouted, WITHOUT editing the file, by a macro
+//      around the include to gf::set_device(), which targets the device of the active DeviceScope (comm->hipDev). Every entry point below runs in a
+//      scope: the caller's current device is restored on exit, and the sticky HIP last-error is flushed.
+#include <hip/hip_runtime.h>
+#include "gf_device_scope.hpp"
+#define hipSetDevice(x) gf::set_device(x)
 #include "driver_sm.cpp"
+#undef hipSetDevice
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -27,7 +35,8 @@ bool own_ctx(const void* c) {
     return true;
 }
 std::mutex g_swap_mu;
-struct Blk { SmDev* dblk = nullptr; SmBindingV1 b{}; };
+struct Blk { SmDev* dblk = nullptr; SmBindingV1 b{}; int dev = -1; };
+inline int dev_of(const Ctx* c) { return (c && c->comm) ? static_cast<int>(c->comm->hipDev) : -1; }
 bool bind_ok(Ctx* c, const SmBindingV1* b) {
     // identical checks to sm_bind_v1
 #if SM_B_ROWSPLIT
@@ -52,8 +61,9 @@ int32_t sm_attach_v1(uint32_t rank, void* comm, void* rwin, void* rlocal, void* 
     *out_ctx = nullptr;
     if (!comm || !rwin || !rlocal || !cwin || !clocal || !gemm_hsaco || !ran_hsaco || rank > 3u) return E_ARG;
     auto* c = new Ctx(); *out_ctx = c; c->rank = static_cast<int>(rank);
-    if (hipSetDevice(c->rank) != hipSuccess) return E_HIP;
     c->comm = static_cast<mori::cco::ccoComm*>(comm);
+    gf::DeviceScope scope(dev_of(c));   // the comm's HIP device (not the SP rank); restored on exit
+    if (!scope.ok()) { sm_log("device", "hipSetDevice(%d) rc=FAIL", dev_of(c)); return E_HIP; }
     c->rwin = reinterpret_cast<mori::cco::ccoWindow_t>(rwin); c->rlocal = rlocal;
     c->cwin = reinterpret_cast<mori::cco::ccoWindow_t>(cwin); c->clocal = clocal;
     for (int p = 0; p < 4; ++p) {   // same peer resolution + self check as sm_create_v1
@@ -67,6 +77,7 @@ int32_t sm_attach_v1(uint32_t rank, void* comm, void* rwin, void* rlocal, void* 
     if (!sm_image_matches(gemm_hsaco, SM_EXPECTED_GEMM_SHA256) || !sm_image_matches(ran_hsaco, SM_EXPECTED_RAN_SHA256)) { sm_log("bundle", "rc=FAIL image hash mismatch"); return E_HASH; }
     if (hipModuleLoad(&c->mg, gemm_hsaco) != hipSuccess || hipModuleLoad(&c->mr, ran_hsaco) != hipSuccess) { sm_log("module", "rc=FAIL"); return E_HIP; }
     if (hipModuleGetFunction(&c->fg, c->mg, "sm_gemm_v1") != hipSuccess || hipModuleGetFunction(&c->fr, c->mr, "sm_ran_v1") != hipSuccess) { sm_log("resolve", "rc=FAIL"); return E_HIP; }
+    gf::flush_sticky();  // peer-pointer resolution / module load may leave a sticky last-error that a later torch op would raise
     sm_log("attach", "rc=OK");
     return OK;
 }
@@ -76,11 +87,12 @@ int32_t sm_bind_new_v1(void* ctx, const SmBindingV1* b, void** out_blk) {
     *out_blk = nullptr;
     if (!own_ctx(c)) return E_STATE;
     if (!bind_ok(c, b)) return E_ARG;
+    gf::DeviceScope scope(dev_of(c));
     std::lock_guard<std::mutex> swap_lk(g_swap_mu);
     SmBindingV1 saved_b = c->b; bool saved_bound = c->bound; SmDev* saved_dblk = c->dblk;
     c->b = *b; c->dblk = nullptr;
     const int32_t rc = build_dev_block(c);
-    auto* blk = new Blk(); blk->dblk = c->dblk; blk->b = *b;
+    auto* blk = new Blk(); blk->dblk = c->dblk; blk->b = *b; blk->dev = dev_of(c);
     c->b = saved_b; c->bound = saved_bound; c->dblk = saved_dblk;
     if (rc != OK) { delete blk; return rc; }
     *out_blk = blk;
@@ -90,6 +102,7 @@ int32_t sm_bind_new_v1(void* ctx, const SmBindingV1* b, void** out_blk) {
 int32_t sm_launch_blk_v1(void* ctx, void* blk_, const void* A, const void* W, uint32_t strideA, void* stream) {   // D2b: A, W and strideA (bytes) are per-launch arguments
     auto* c = static_cast<Ctx*>(ctx); auto* blk = static_cast<Blk*>(blk_); if (!c || !blk || !blk->dblk) return E_STATE;
     if (!own_ctx(c)) return E_STATE;
+    gf::DeviceScope scope(dev_of(c));   // module functions belong to the comm's device context
     std::lock_guard<std::mutex> swap_lk(g_swap_mu);
     SmBindingV1 saved_b = c->b; SmDev* saved_dblk = c->dblk;
     c->b = blk->b; c->b.A = A; c->b.W = W; c->b.strideA = strideA; c->dblk = blk->dblk;
@@ -100,6 +113,7 @@ int32_t sm_launch_blk_v1(void* ctx, void* blk_, const void* A, const void* W, ui
 }
 int32_t sm_blk_free_v1(void* blk_) {   // call only after quiesce (device sync)
     auto* blk = static_cast<Blk*>(blk_); if (!blk) return E_ARG;
+    gf::DeviceScope scope(blk->dev);
     if (blk->dblk) hipFree(blk->dblk);
     delete blk; return OK;
 }
@@ -113,7 +127,8 @@ int32_t sm_info_v1(uint64_t* out7) {
 // after every binding of this ctx was freed with sm_blk_free_v1, and BEFORE ccoCommDestroy. The windows belong to the runtime.
 int32_t sm_free_v1(void* ctx) {
     auto* c = static_cast<Ctx*>(ctx); if (!c) return E_ARG;
-    if (hipSetDevice(c->rank) != hipSuccess) return E_HIP;
+    gf::DeviceScope scope(dev_of(c));
+    if (!scope.ok()) return E_HIP;
     if (c->P) hipFree(c->P);
     if (c->dblk) hipFree(c->dblk);
     if (c->dbg) hipFree(c->dbg);
@@ -126,6 +141,7 @@ int32_t sm_free_v1(void* ctx) {
 // Poison word (u32 at SM_C_POISON of the control window): 4-byte D2H on `stream` + stream sync (cheap; the legacy sm_poison_v1 is a blocking hipMemcpy).
 int32_t sm_poison_fast_v1(void* ctx, void* stream, uint32_t* out) {
     auto* c = static_cast<Ctx*>(ctx); if (!c || !out) return E_ARG;
+    gf::DeviceScope scope(dev_of(c));
     const hipStream_t s = static_cast<hipStream_t>(stream);
     if (hipMemcpyAsync(out, static_cast<uint8_t*>(c->clocal) + SM_C_POISON, 4, hipMemcpyDeviceToHost, s) != hipSuccess) return E_HIP;
     return hipStreamSynchronize(s) == hipSuccess ? OK : E_HIP;

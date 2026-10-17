@@ -31,14 +31,15 @@ def load_driver(path: str):
     lib.lg_info_v1.argtypes = [vp]
     lib.lg_comm_R_ptr.restype = vp
     lib.lg_comm_R_ptr.argtypes = [vp]
-    lib.lg_comm_init_control.restype = i32
-    lib.lg_comm_init_control.argtypes = [vp]
-    lib.lg_comm_launch.restype = i32
-    lib.lg_comm_launch.argtypes = [vp, vp, vp, vp, vp, u32, u64, u64, u32, u32, vp]
-    lib.lg_comm_read_report.restype = i32
-    lib.lg_comm_read_report.argtypes = [vp, C.POINTER(u64)]
-    lib.lg_comm_drain_all.restype = i32
-    lib.lg_comm_drain_all.argtypes = [vp, vp]
+    # device-scoped wrappers (restore the caller's current device); the bare Phase-1 lg_comm_* entry points are not called from Python
+    lib.lg_init_control_v1.restype = i32
+    lib.lg_init_control_v1.argtypes = [vp]
+    lib.lg_launch_v1.restype = i32
+    lib.lg_launch_v1.argtypes = [vp, vp, vp, vp, vp, u32, u64, u64, u32, u32, vp]
+    lib.lg_report_v1.restype = i32
+    lib.lg_report_v1.argtypes = [vp, C.POINTER(u64)]
+    lib.lg_drain_v1.restype = i32
+    lib.lg_drain_v1.argtypes = [vp, vp]
     return lib
 
 
@@ -79,24 +80,24 @@ class LargeContext:
         self.lib, self.h, self.M, self.F, self.rank = lib, h, M, F, rank
 
     def init_control(self):
-        rc = self.lib.lg_comm_init_control(self.h)
+        rc = self.lib.lg_init_control_v1(self.h)
         if rc != 0:
             raise RuntimeError(f"lg_comm_init_control rc={rc}")
 
     def launch(self, A, W, As, Ws, strideA, puts_per_peer, half_first, stream, budget_us=0):
-        rc = self.lib.lg_comm_launch(self.h, C.c_void_p(A), C.c_void_p(W), C.c_void_p(As), C.c_void_p(Ws), strideA,
+        rc = self.lib.lg_launch_v1(self.h, C.c_void_p(A), C.c_void_p(W), C.c_void_p(As), C.c_void_p(Ws), strideA,
                                      POLL_ITERATIONS, budget_us, puts_per_peer, half_first, stream)
         if rc != 0:
             raise RuntimeError(f"lg_comm_launch rc={rc}")
 
     def report(self) -> dict:
         out = (C.c_uint64 * 10)()
-        if self.lib.lg_comm_read_report(self.h, out) != 0:
+        if self.lib.lg_report_v1(self.h, out) != 0:
             raise RuntimeError("lg_comm_read_report")
         return dict(zip(REPORT_FIELDS, list(out)))
 
     def drain_all(self, stream):
-        rc = self.lib.lg_comm_drain_all(self.h, stream)
+        rc = self.lib.lg_drain_v1(self.h, stream)
         if rc != 0:
             raise RuntimeError(f"lg_comm_drain_all rc={rc}")
 

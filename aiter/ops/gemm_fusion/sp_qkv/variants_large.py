@@ -48,7 +48,7 @@ def preflight_attach(res, owner: str, M: int, wins, built):
     import os
 
     if not 0 <= res.rank <= 3:
-        raise RuntimeError(f"preflight {owner}: rank {res.rank} outside 0..3 (r11 kernels: rank == lsaRank == HIP device)")
+        raise RuntimeError(f"preflight {owner}: SP rank {res.rank} outside 0..3 (r11 kernels: rank == lsaRank; the HIP device index is separate)")
     if M % 256 or not 256 <= M <= 8192:
         raise RuntimeError(f"preflight {owner}: M={M} must be a multiple of 256 in [256, 8192]")
     info = getattr(res, "devcomm_info", None)

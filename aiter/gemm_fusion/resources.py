@@ -103,7 +103,7 @@ class CcoBackend:
         self.lib = lib = C.CDLL(so_path)
         vp, u32, u64, i32 = C.c_void_p, C.c_uint32, C.c_uint64, C.c_int32
         for n, a in [
-            ("gf_uid_v1", [u32, vp]), ("gf_comm_create_v1", [u32, u32, vp, u64, C.POINTER(vp)]),
+            ("gf_uid_v1", [u32, vp]), ("gf_comm_create_v1", [u32, u32, i32, vp, u64, C.POINTER(vp)]),
             ("gf_win_register_v1", [vp, u64, C.POINTER(vp), C.POINTER(vp)]), ("gf_peer_ptr_v1", [vp, vp, i32, C.POINTER(vp)]),
             ("gf_devcomm_create_v1", [vp, u32, C.POINTER(vp)]), ("gf_devcomm_info_v1", [vp, vp, C.POINTER(u64)]), ("gf_zero_v1", [i32, vp, u64]), ("gf_device_sync_v1", [i32]),
             ("gf_devcomm_destroy_v1", [vp, vp]), ("gf_win_deregister_v1", [vp, vp]), ("gf_comm_destroy_v1", [vp]),
@@ -122,9 +122,12 @@ class CcoBackend:
         self._chk(self.lib.gf_uid_v1(rank, b), "gf_uid")
         return bytes(b)
 
-    def comm_create(self, rank, world, uid, vmm_bytes):
+    def comm_create(self, rank, world, uid, vmm_bytes, device=None):
+        """`device` = the HIP device this process drives (torch.cuda.current_device()); NOT derived from the SP rank."""
+        if device is None:
+            raise ResourceError("comm_create needs an explicit HIP device index (the SP rank is not a device index)")
         h = C.c_void_p()
-        self._chk(self.lib.gf_comm_create_v1(rank, world, uid, vmm_bytes, C.byref(h)), "gf_comm_create")
+        self._chk(self.lib.gf_comm_create_v1(rank, world, int(device), uid, vmm_bytes, C.byref(h)), "gf_comm_create")
         return h.value
 
     def win_register(self, comm, nbytes):
@@ -174,7 +177,7 @@ class FusionResources:
         if dist is None:
             import torch.distributed as dist  # type: ignore
         self.rank, self.world, self.group, self.dist = rank, world, group, dist
-        self.device = rank if device is None else device
+        self.device = self._default_device(rank) if device is None else int(device)
         self.caps = frozenset(caps)
         self.backend = backend or CcoBackend()
         self.policy = (policy or os.environ.get(ENV_POLICY) or "uniform").lower()
@@ -211,6 +214,19 @@ class FusionResources:
         self._init_comm()
 
     # -- helpers -----------------------------------------------------------
+    @staticmethod
+    def _default_device(rank: int) -> int:
+        """The HIP device of THIS process: torch's current device when torch is available (it owns the thread's device), else the rank.
+        The SP-group rank equals the local device index only in the simplest deployments (TP x SP, several groups and HIP_VISIBLE_DEVICES differ)."""
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                return int(torch.cuda.current_device())
+        except Exception:  # noqa: BLE001
+            pass
+        return rank
+
     def _budget(self, window_bytes, max_windows):
         """Uniform window size / count: explicit args, then env MiB override, then the loaded profile\x27s window_budget. (None, N) if unknown."""
         if window_bytes is None and os.environ.get(ENV_WINDOW_MIB):
@@ -235,7 +251,7 @@ class FusionResources:
     def _init_comm(self):
         uid = [self.backend.uid(self.rank) if self.rank == 0 else None]
         self.dist.broadcast_object_list(uid, src=self._src0(), group=self.group)
-        self.comm = self.backend.comm_create(self.rank, self.world, uid[0], self._vmm)
+        self.comm = self.backend.comm_create(self.rank, self.world, uid[0], self._vmm, self.device)
         log.info("event=resources comm rank=%d world=%d heap_bytes=%d policy=%s window_bytes=%s max_windows=%s",
                  self.rank, self.world, self._vmm, self.policy, self.window_bytes, self.max_windows)
 

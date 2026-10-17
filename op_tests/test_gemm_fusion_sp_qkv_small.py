@@ -125,7 +125,7 @@ class FakeBackend:
     def uid(self, rank):
         return b"u" * 128
 
-    def comm_create(self, rank, world, uid, vmm):
+    def comm_create(self, rank, world, uid, vmm, device=None):
         self.log.append(("comm", vmm))
         return 1
 
@@ -645,9 +645,9 @@ class FirstFitBackend(FakeBackend):
         self.next_off += nbytes
         return super().win_register(comm, nbytes)
 
-    def comm_create(self, rank, world, uid, vmm):
+    def comm_create(self, rank, world, uid, vmm, device=None):
         self.heap = vmm
-        return super().comm_create(rank, world, uid, vmm)
+        return super().comm_create(rank, world, uid, vmm, device)
 
 
 def _all_plan_requests():
@@ -785,9 +785,9 @@ class RealisticFirstFit(FakeBackend):
         super().__init__()
         self.base, self.top, self.heap, self.regs = base, 0, 1 << 62, []
 
-    def comm_create(self, rank, world, uid, vmm):
+    def comm_create(self, rank, world, uid, vmm, device=None):
         self.heap = vmm
-        return super().comm_create(rank, world, uid, vmm)
+        return super().comm_create(rank, world, uid, vmm, device)
 
     def win_register(self, comm, nbytes):
         from aiter.gemm_fusion.resources import ResourceError
@@ -1195,3 +1195,143 @@ def test_run_passes_the_per_launch_x_layout(monkeypatch):
     plan.run(x=x_padded, x_scale=st["xs"], w=w, w_scale=st["ws"], outs=outs, meta=meta, res=res)
     blk, a_ptr, w_ptr, stride_a, stream = calls[0]
     assert (a_ptr, w_ptr, stride_a, stream) == (x_padded.ptr, w.ptr, 8192, "S")
+
+# ======================================================================= process-global HIP state hygiene (E2: 'operation not supported' after FusionResources init)
+def _host_src(name):
+    return open(os.path.join(jit.CSRC, "host", name), encoding="utf-8").read()
+
+
+def test_no_bare_hipSetDevice_in_gemm_fusion_host_code():
+    """hipSetDevice may appear ONLY inside gf_device_scope.hpp (the scope guard) and in the sm driver's macro that reroutes the vendored Phase-1 calls."""
+    import re
+
+    for name in ("gf_comm.cpp", "lg_fusion_driver.cpp", "sm_fusion_driver.cpp"):
+        code = re.sub(r"//[^\n]*", "", _host_src(name))  # drop comments
+        code = re.sub(r'"(?:\\.|[^"\\])*"', '""', code)  # drop string literals (log text mentions hipSetDevice)
+        define_ok = "#define hipSetDevice(x) gf::set_device(x)" in code
+        calls = re.findall(r"\bhipSetDevice\s*\(", code.replace("#define hipSetDevice(x) gf::set_device(x)", ""))
+        if name == "sm_fusion_driver.cpp":
+            assert calls == [], "the sm driver may only mention hipSetDevice in the #define/#undef + comments"
+            assert define_ok and "#undef hipSetDevice" in code
+            raw = _host_src(name)  # (string literals are blanked in `code`, so the include line is only visible in the raw text)
+            assert raw.index("#define hipSetDevice") < raw.index('#include "driver_sm.cpp"') < raw.index("#undef hipSetDevice")
+        else:
+            assert calls == [], f"{name}: bare hipSetDevice call"
+    hdr = _host_src("gf_device_scope.hpp")
+    assert hdr.count("hipSetDevice(") >= 2 and "hipSetDevice(prev_)" in hdr and "hipGetLastError()" in hdr
+
+
+def test_every_entry_point_runs_in_a_device_scope_and_comm_device_not_rank():
+    gf = _host_src("gf_comm.cpp")
+    assert "int32_t gf_comm_create_v1(uint32_t rank, uint32_t world, int32_t device," in gf  # explicit device, not derived from rank
+    assert "comm->hipDev != device" in gf and "comm_dev(comm)" in gf
+    for fn in ("gf_win_register_v1", "gf_peer_ptr_v1", "gf_devcomm_create_v1", "gf_devcomm_destroy_v1", "gf_win_deregister_v1", "gf_comm_destroy_v1",
+               "gf_zero_v1", "gf_device_sync_v1"):
+        body = gf[gf.index("int32_t " + fn):]
+        body = body[:body.index("\n}\n")]
+        assert "gf::DeviceScope" in body, fn
+    for fn in ("gf_comm_create_v1", "gf_win_register_v1", "gf_devcomm_create_v1"):
+        body = gf[gf.index("int32_t " + fn):]
+        assert "flush_sticky" in body[:body.index("\n}\n")], fn  # sticky error from peer-access enabling must not leak into torch
+    sm = _host_src("sm_fusion_driver.cpp")
+    for fn in ("sm_attach_v1", "sm_bind_new_v1", "sm_launch_blk_v1", "sm_blk_free_v1", "sm_free_v1", "sm_poison_fast_v1"):
+        body = sm[sm.index("int32_t " + fn):]
+        assert "gf::DeviceScope" in body[:body.index("\n}\n")], fn
+    lg = _host_src("lg_fusion_driver.cpp")
+    assert "static_cast<mori::cco::ccoComm*>(comm)->hipDev" in lg  # attach uses the comm's device
+    for fn in ("lg_free_v1", "lg_poison_v1", "lg_init_control_v1", "lg_launch_v1", "lg_report_v1", "lg_drain_v1"):
+        body = lg[lg.index("int32_t " + fn):]
+        assert "gf::DeviceScope" in body[:body.index("\n}\n")], fn
+
+
+def test_python_calls_only_the_scoped_large_entry_points():
+    import ast  # noqa: F401
+
+    src = open(os.path.join(os.path.dirname(specs.__file__), "large_rt.py"), encoding="utf-8").read()
+    for bare in ("lg_comm_init_control", "lg_comm_launch", "lg_comm_read_report", "lg_comm_drain_all"):
+        assert f"lib.{bare}" not in src, f"{bare} must go through its device-scoped wrapper (no ctypes attribute access to the bare function)"
+    for wrapped in ("lg_init_control_v1", "lg_launch_v1", "lg_report_v1", "lg_drain_v1"):
+        assert wrapped in src
+
+
+def test_backend_requires_explicit_device_and_resources_defaults_to_torch_current_device(monkeypatch):
+    import types as _t
+
+    from aiter.gemm_fusion import resources as rmod
+    from aiter.gemm_fusion.resources import FusionResources, ResourceError
+
+    seen = []
+
+    class B(FakeBackend):
+        def comm_create(self, rank, world, uid, vmm, device=None):
+            seen.append((rank, device))
+            return 1
+
+    # torch present: the device is torch's current device (3), NOT the SP rank (1)
+    fake_torch = _t.ModuleType("torch")
+    fake_torch.cuda = _t.SimpleNamespace(is_available=lambda: True, current_device=lambda: 3)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    r = FusionResources(1, 4, dist=FakeDist(), backend=B())
+    assert r.device == 3 and seen == [(1, 3)]
+    # an explicit device wins
+    seen.clear()
+    FusionResources(1, 4, device=5, dist=FakeDist(), backend=B())
+    assert seen == [(1, 5)]
+    # no torch/cuda: falls back to the rank (single-process tools)
+    fake_torch.cuda = _t.SimpleNamespace(is_available=lambda: False, current_device=lambda: 9)
+    seen.clear()
+    FusionResources(2, 4, dist=FakeDist(), backend=B())
+    assert seen == [(2, 2)]
+    # the ctypes backend refuses a missing device instead of guessing
+    be = object.__new__(rmod.CcoBackend)
+    with pytest.raises(ResourceError, match="explicit HIP device"):
+        rmod.CcoBackend.comm_create(be, 0, 4, b"u" * 128, 1 << 32)
+
+
+def test_window_probe_atom_like_mode_pure_pieces(monkeypatch):
+    import types as _t
+
+    from aiter.ops.gemm_fusion.sp_qkv import window_probe as wp
+
+    assert "--atom-like" in wp.__doc__ and "zeros_like" in wp.__doc__
+    log = []
+
+    class Host:
+        def fill_(self, v):
+            log.append("fill")
+
+        def to(self, dev, non_blocking=False):
+            log.append(("to", dev))
+            return Dev()
+
+    class Dev:
+        def sum(self):
+            return _t.SimpleNamespace(item=lambda: 0.0)
+
+        def __getitem__(self, i):
+            return _t.SimpleNamespace(sum=lambda: _t.SimpleNamespace(item=lambda: 4.0))
+
+    class Torch:
+        float32, uint8 = "f", "u8"
+        cuda = _t.SimpleNamespace(synchronize=lambda: log.append("sync"))
+
+        @staticmethod
+        def empty(n, dtype=None, pin_memory=False, device=None):
+            log.append(("empty", dtype, pin_memory, device))
+            return Host()
+
+        @staticmethod
+        def zeros_like(x):
+            log.append("zeros_like")
+            return Dev()
+
+    assert wp.e2_trigger(Torch, 2, 0.001) is None
+    assert ("to", "cuda:2") in log and "zeros_like" in log and "sync" in log
+    assert any(isinstance(e, tuple) and e[0] == "empty" and e[2] is True for e in log)  # a PINNED host buffer is part of the trigger
+
+    class Boom(Torch):
+        @staticmethod
+        def zeros_like(x):
+            raise RuntimeError("HIP error: operation not supported")
+
+    assert "operation not supported" in wp.e2_trigger(Boom, 0, 0.001)
