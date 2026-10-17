@@ -1,18 +1,48 @@
+import functools
+
 import torch
 import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter.ops.triton.attention.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.utils.types import e4m3_dtype
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_caller_name_no_ext,
-)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 from op_tests.triton_tests.attention.test_fp8_mqa_logits import (
     per_custom_dims_cast_to_fp8,
 )
+
+
+def generate_fp8_mqa_logits_inputs(
+    batch_size, seq_q_l, seq_kv_l, num_heads_q, head_dim
+):
+    s_q = batch_size * seq_q_l
+    s_k = batch_size * seq_kv_l
+
+    q = torch.randn(s_q, num_heads_q, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    kv = (kv_fp8.to(torch.float32) * scales[:, None]).to(torch.bfloat16)
+    weights = torch.randn(s_q, num_heads_q, device="cuda", dtype=torch.float32)
+
+    ks = torch.zeros(s_q, dtype=torch.int, device="cuda")
+    ke = torch.zeros(s_q, dtype=torch.int, device="cuda")
+    arange_q = torch.arange(seq_q_l, dtype=torch.int, device="cuda")
+    for b in range(batch_size):
+        qs = b * seq_q_l
+        kvs = b * seq_kv_l
+        ks[qs : qs + seq_q_l] = kvs
+        ke[qs : qs + seq_q_l] = kvs + (seq_kv_l - seq_q_l) + arange_q + 1
+
+    q_fp8 = q.to(e4m3_dtype)
+    return q_fp8, kv_fp8, scales, weights, ks, ke
 
 
 def calculate_tflops(start_inds, end_inds, num_heads_q, head_dim, time_ms):
@@ -31,6 +61,9 @@ def calculate_tflops(start_inds, end_inds, num_heads_q, head_dim, time_ms):
 
 
 def run_benchmark(args):
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
     x_names = [
         "batch_size",
         "seq_q_l",
@@ -81,31 +114,25 @@ def run_benchmark(args):
         metric,
         **kwargs,
     ):
-        s_q = batch_size * seq_q_l
-        s_k = batch_size * seq_kv_l
+        _p_gen = functools.partial(
+            generate_fp8_mqa_logits_inputs,
+            batch_size,
+            seq_q_l,
+            seq_kv_l,
+            num_heads_q,
+            head_dim,
+        )
+        _out_val_keys = ["q_fp8", "kv_fp8", "scales", "weights", "ks", "ke"]
+        rot_bufs = bencher.build_pool([_p_gen], [_out_val_keys])
 
-        q = torch.randn(s_q, num_heads_q, head_dim, device="cuda", dtype=torch.bfloat16)
-        kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
-        kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
-        kv = (kv_fp8.to(torch.float32) * scales[:, None]).to(torch.bfloat16)
-        weights = torch.randn(s_q, num_heads_q, device="cuda", dtype=torch.float32)
+        def _run(q_fp8, kv_fp8, scales, weights, ks, ke):
+            fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits)
 
-        ks = torch.zeros(s_q, dtype=torch.int, device="cuda")
-        ke = torch.zeros(s_q, dtype=torch.int, device="cuda")
-        arange_q = torch.arange(seq_q_l, dtype=torch.int, device="cuda")
-        for b in range(batch_size):
-            qs = b * seq_q_l
-            kvs = b * seq_kv_l
-            ks[qs : qs + seq_q_l] = kvs
-            ke[qs : qs + seq_q_l] = kvs + (seq_kv_l - seq_q_l) + arange_q + 1
-
-        q_fp8 = q.to(e4m3_dtype)
-
-        def func():
-            return fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits)
-
-        time_ms = triton.testing.do_bench(func, warmup=25, rep=100)
-        tflops = calculate_tflops(ks, ke, num_heads_q, head_dim, time_ms)
+        time_ms = bencher.bench(_run)
+        sample = rot_bufs[0]
+        tflops = calculate_tflops(
+            sample["ks"], sample["ke"], num_heads_q, head_dim, time_ms
+        )
 
         # Return exactly one scalar depending on which metric is active
         if metric == "time":

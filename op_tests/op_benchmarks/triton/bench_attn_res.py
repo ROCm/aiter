@@ -22,14 +22,20 @@ higher number. The sequence layout runs a two-pass kernel and therefore reads
 the residual twice; its real HBM throughput is about 2x the reported value.
 """
 
+import functools
 import sys
 
 import torch
 import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter.ops.triton.fusions.attn_res import attn_res_fwd, attn_res_gate
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
@@ -40,6 +46,33 @@ from op_tests.triton_tests.fusions.test_attn_res import (
     generate_attn_res_gate_inputs,
     generate_attn_res_inputs,
 )
+
+
+def _generate_attn_res_gate_pool_inputs(N, D, L, dtype, with_add, with_add2, onorm):
+    prefix, block_residual, score_weight, add_hidden, add_hidden2 = (
+        generate_attn_res_gate_inputs(
+            N, D, L, dtype, with_add=with_add, with_add2=with_add2
+        )
+    )
+    output_rms_weight = torch.randn(D, dtype=dtype, device="cuda") if onorm else None
+    return (
+        prefix,
+        block_residual,
+        score_weight,
+        add_hidden,
+        add_hidden2,
+        output_rms_weight,
+    )
+
+
+def _generate_attn_res_fwd_pool_inputs(N, D, L, dtype, with_onorm, layout):
+    query, residuals, rms_weight, output_rms_weight = generate_attn_res_inputs(
+        N, D, L, dtype, with_onorm=with_onorm
+    )
+    if layout == "packed":
+        residuals = torch.stack(residuals, dim=-2).contiguous()
+    return query, residuals, rms_weight, output_rms_weight
+
 
 arg_to_torch_dtype = {
     "fp16": torch.float16,
@@ -70,60 +103,84 @@ def get_benchmark_shapes(args):
 
 def bench_attn_res_fn(N, D, L, layout, metric, args):
     dtype = arg_to_torch_dtype[args.dtype]
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
     elem_size = torch.tensor([], dtype=dtype, device="cuda").element_size()
     # Minimum required traffic: every candidate read once + output written once.
     mem = (N * L * D + N * D) * elem_size
 
     if args.op == "gate":
         # L counts the prefix, so the packed block holds L - 1 rows.
-        prefix, block_residual, score_weight, add_hidden, add_hidden2 = (
-            generate_attn_res_gate_inputs(
-                N,
-                D,
-                L - 1,
-                dtype,
-                with_add=args.add_hidden or args.add_hidden2,
-                with_add2=args.add_hidden2,
-            )
-        )
+        with_add = args.add_hidden or args.add_hidden2
         if args.add_hidden:
             mem += 2 * N * D * elem_size  # add_hidden read + prefix write-back
         if args.add_hidden2:
             mem += N * D * elem_size  # second addend read
         if args.close_block:
             mem += N * L * D * elem_size  # fused block_out write, no separate cat
-        output_rms_weight = (
-            torch.randn(D, dtype=dtype, device="cuda") if args.onorm else None
+
+        _p_gen = functools.partial(
+            _generate_attn_res_gate_pool_inputs,
+            N,
+            D,
+            L - 1,
+            dtype,
+            with_add,
+            args.add_hidden2,
+            args.onorm,
         )
-        fn = lambda: attn_res_gate(
+        _out_val_keys = [
+            "prefix",
+            "block_residual",
+            "score_weight",
+            "add_hidden",
+            "add_hidden2",
+            "output_rms_weight",
+        ]
+        bencher.build_pool([_p_gen], [_out_val_keys])
+
+        def _run(
             prefix,
             block_residual,
             score_weight,
-            args.eps,
             add_hidden,
             add_hidden2,
-            output_rms_weight=output_rms_weight,
-            output_rms_eps=args.out_eps,
-            scale=args.scale,
-            close_block=args.close_block,
-        )
-    else:
-        query, residuals, rms_weight, output_rms_weight = generate_attn_res_inputs(
-            N, D, L, dtype, with_onorm=args.onorm
-        )
-        if layout == "packed":
-            residuals = torch.stack(residuals, dim=-2).contiguous()
-        fn = lambda: attn_res_fwd(
-            query,
-            residuals,
-            rms_weight,
             output_rms_weight,
-            args.eps,
-            args.scale,
-            layout=layout,
-        )
+        ):
+            attn_res_gate(
+                prefix,
+                block_residual,
+                score_weight,
+                args.eps,
+                add_hidden,
+                add_hidden2,
+                output_rms_weight=output_rms_weight,
+                output_rms_eps=args.out_eps,
+                scale=args.scale,
+                close_block=args.close_block,
+            )
 
-    ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
+        ms = bencher.bench(_run)
+    else:
+        _p_gen = functools.partial(
+            _generate_attn_res_fwd_pool_inputs, N, D, L, dtype, args.onorm, layout
+        )
+        _out_val_keys = ["query", "residuals", "rms_weight", "output_rms_weight"]
+        bencher.build_pool([_p_gen], [_out_val_keys])
+
+        def _run(query, residuals, rms_weight, output_rms_weight):
+            attn_res_fwd(
+                query,
+                residuals,
+                rms_weight,
+                output_rms_weight,
+                args.eps,
+                args.scale,
+                layout=layout,
+            )
+
+        ms = bencher.bench(_run)
 
     if metric == "time":
         return ms
@@ -231,8 +288,7 @@ def parse_args():
         help="For --op gate: output RMSNorm epsilon (independent of --eps)",
     )
     parser.add_argument("--scale", type=float, default=1.0, help="Logit scale")
-    parser.add_argument("--warmup", type=int, default=25)
-    parser.add_argument("--rep", type=int, default=100)
+
     parser.add_argument(
         "-print_vgpr",
         action="store_true",
