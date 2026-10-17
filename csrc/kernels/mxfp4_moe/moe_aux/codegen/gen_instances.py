@@ -60,6 +60,12 @@ SHAPES = [
     (256, 6144, 3072, 6),  # Inkling TP=1
     (384, 6144, 2048, 8),  # MiMo-V2.5-Pro TP=1
     (288, 4096, 2048, 8),  # GLM-5.3-Flash / Step-3.5-Flash TP=1 aux key
+    (288, 4096, 1024, 8),  # GLM-5.3-Flash TP=2
+    (288, 4096, 512, 8),  # GLM-5.3-Flash TP=4
+    (288, 4096, 256, 8),  # GLM-5.3-Flash TP=8
+    (289, 4096, 1024, 9),  # GLM-5.3-Flash TP=2 shared-expert variant
+    (289, 4096, 512, 9),  # GLM-5.3-Flash TP=4 shared-expert variant
+    (289, 4096, 256, 9),  # GLM-5.3-Flash TP=8 shared-expert variant
 ]
 
 
