@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "quick_all_reduce_base.h"
+#include <string>
 #include <vector>
 #define caltime
 
@@ -1452,6 +1453,7 @@ struct DeviceComms
     static int constexpr kMaxWorldSize = 8;
 
     bool initialized    = false;
+    bool is_gfx950      = false;
     uint32_t* d_flag_color = nullptr;
     int world_size;
     int rank;
@@ -1471,6 +1473,11 @@ struct DeviceComms
         destroy();
         this->world_size = world_size;
         this->rank       = rank;
+        int device;
+        hipDeviceProp_t properties;
+        HIP_CHECK(hipGetDevice(&device));
+        HIP_CHECK(hipGetDeviceProperties(&properties, device));
+        is_gfx950 = std::string(properties.gcnArchName).starts_with("gfx950");
         if(max_problem_size.has_value() && max_problem_size.value() > 0)
         {
             this->kMaxProblemSize = max_problem_size.value();
@@ -1581,7 +1588,8 @@ struct DeviceComms
         // Configuration.
         uint32_t msg_size   = N * sizeof(T);
         uint32_t num_blocks = divceil(msg_size, kTileSize);
-        uint32_t grid       = min(kMaxNumBlocks, num_blocks);
+        uint32_t grid_cap   = is_gfx950 ? 256u * 4u : kMaxNumBlocks;
+        uint32_t grid       = min(grid_cap, num_blocks);
         auto quant_level_   = static_cast<QuickReduceQuantLevel>(quant_level);
         switch(quant_level_)
         {
