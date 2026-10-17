@@ -169,6 +169,15 @@ SPIN_LIMIT = 1 << 22
 POLL_SLEEP = 64
 #: Cache scope of the flag poll: the flags are written by peer ranks.
 POLL_SCOPE = SCOPE_SYS
+#: Code bytes a launch prefetches into the instruction cache on its own:
+#: ``.amdhsa_inst_pref_size`` counts 128 B lines in an 8-bit field, so a
+#: kernel longer than this starts its tail cold (see _prefetch_cold_code).
+INST_PREF_WINDOW = 255 * 128
+#: Bytes one ``s_prefetch_inst_pc_rel`` covers (32 lines, its maximum) and
+#: how many of them to issue: 8 take the warmed range to 64 KB, past any
+#: tile's stage-1 kernel.
+IPF_CHUNK = 32 * 128
+IPF_CHUNKS = 8
 
 
 def s1f_ctl_words(*, npes: int, tile_cap: int) -> int:
@@ -214,6 +223,43 @@ def _trap():
         operands_=[],
         asm_string="s_trap 2",
         constraints="",
+        has_side_effects=True,
+        is_align_stack=False,
+    )
+
+
+def _prefetch_cold_code():
+    """Pull this kernel's own tail into the instruction cache.
+
+    A launch prefetches only the first ``INST_PREF_WINDOW`` bytes of code.
+    The tile-256 stage-1 kernel is ~46 KB, so its epilogue is cold the first
+    time a wave reaches it, and every CTA sharing an instruction cache gets
+    there at once: the first item of each CTA spent 9.1 us between the end of
+    its k-loop and its last store against 2.0 us for every later item (traced,
+    tpr 1536). Issued here the misses overlap the first flag wait instead.
+
+    ``.Lfunc_end0`` is the end of this kernel's code, so the assembler folds
+    ``.Lfunc_end0 - .`` into the code bytes that follow this point: each chunk
+    is prefetched only once the compare proves it lies inside the kernel, and
+    a kernel that fits the launch window (tile 64 is ~21 KB) pays the first
+    compare and branches out.
+    """
+    asm = [".Ls1f_ipf_base:", "s_mov_b32 $0, .Lfunc_end0-.Ls1f_ipf_base"]
+    for i in range_constexpr(IPF_CHUNKS):
+        off = INST_PREF_WINDOW + i * IPF_CHUNK
+        # The chunk must end inside the kernel; +512 covers the distance from
+        # .Ls1f_ipf_base to the prefetch, which the compare does not see.
+        asm += [
+            f"s_cmp_lt_i32 $0, {off + IPF_CHUNK + 512}",
+            "s_cbranch_scc1 .Ls1f_ipf_done",
+            f"s_prefetch_inst_pc_rel {off}, null, {IPF_CHUNK // 128 - 1}",
+        ]
+    asm.append(".Ls1f_ipf_done:")
+    _llvm.InlineAsmOp(
+        res=T.i32,
+        operands_=[],
+        asm_string="\n".join(asm),
+        constraints="=s",
         has_side_effects=True,
         is_align_stack=False,
     )
@@ -770,6 +816,10 @@ def make_s1f_stage1(
             tid = fx.Int32(fx.thread_idx.x)
             lane = tid & fx.Int32(WAVE - 1)
             wave = _uniform(tid >> fx.Int32(5))
+            # One wave per CTA warms the kernel tail; the cache it fills is
+            # shared, and the CTA waits on flags long before it runs that code.
+            if wave == fx.Int32(0):
+                _prefetch_cold_code()
 
             smem = fx.SharedAllocator(static=False)
             arena_ptr = smem.allocate(ARENA_LDS, 128)._ptr
