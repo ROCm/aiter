@@ -18,12 +18,18 @@ from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 from aiter.ops.flydsl.kernels import buffer_ops
 
 from ..kernels_common import LOG2E as _LOG2E
-
-_LN2 = 1.0 / _LOG2E
-
-# log2 of e4m3's largest finite value, 448.
-_P_HEADROOM_LOG2 = 8.807354922057604
-
+from .common import (
+    LN2 as _LN2,
+)
+from .common import (
+    _buffer_load_128,
+    _buffer_load_lds_128,
+    _buffer_store_128,
+    _cu_load,
+    _init_dualwave_q_row,
+    _lane_pair_reduce,
+    _p_headroom_log2,
+)
 
 LDS_BYTES_GFX950 = 160 * 1024
 
@@ -40,12 +46,6 @@ def _waitcnt_vm_n(n):
 
 def _s_setprio(val):
     rocdl.s_setprio(val)
-
-
-def _read_exec_i64():
-    """Read the current wave exec mask, matching Clang's builtin lowering."""
-    true_i1 = fx.Boolean(True).ir_value()
-    return rocdl.ballot(T.i64, true_i1)
 
 
 def _ds_read_tr8_b64_imm(result_type, addr_i32, imm_offset=0):
@@ -82,15 +82,6 @@ def _attn_mask_vec2_imm(rel_i32, neg_inf_i32, thr_x, thr_y, x_ref_i32, y_ref_i32
     return out_x.ir_value(), out_y.ir_value()
 
 
-def _reduction_pair(v_f32):
-    v_i32 = _bitcast_i32(v_f32)
-    pair_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
-    swapped = rocdl.permlane32_swap(pair_ty, v_i32, v_i32, False, True)
-    lhs_i32 = llvm.extractvalue(T.i32, swapped, [0])
-    rhs_i32 = llvm.extractvalue(T.i32, swapped, [1])
-    return _bitcast_f32(lhs_i32), _bitcast_f32(rhs_i32)
-
-
 def _anchor_scalar_f32(x):
     """Pin a scalar f32 at the current source position (no-op asm)."""
     x_ir = as_mlir_value(x)
@@ -125,22 +116,6 @@ def _anchor_v_o(traits, v_o):
     ]
 
 
-def _score_pair_to_lists(v_s):
-    s_lo, s_hi = v_s
-    return (
-        [Vec(s_lo)[r] for r in range_constexpr(16)],
-        [Vec(s_hi)[r] for r in range_constexpr(16)],
-    )
-
-
-def _score_lists_to_vecs(v_s_lists):
-    s_lo, s_hi = v_s_lists
-    return (
-        Vec.from_elements([as_mlir_value(v) for v in s_lo], fx.Float32).ir_value(),
-        Vec.from_elements([as_mlir_value(v) for v in s_hi], fx.Float32).ir_value(),
-    )
-
-
 def _reduce_score_pair(v_s, initial, reducer, fm_fast):
     s_lo, s_hi = v_s
     acc = initial
@@ -151,24 +126,10 @@ def _reduce_score_pair(v_s, initial, reducer, fm_fast):
     return acc
 
 
-def _lane_pair_reduce(v, reducer, fm_fast):
-    lhs, rhs = _reduction_pair(v)
-    return reducer(lhs, rhs, fm_fast)
-
-
 def _score_pair_max(v_s, neg_inf, fm_fast):
     reducer = lambda a, b, _fm: fx.maxnumf(a, b)
     return _lane_pair_reduce(
         _reduce_score_pair(v_s, neg_inf, reducer, fm_fast), reducer, fm_fast
-    )
-
-
-def _score_pair_sum(v_s, zero_f, fm_fast):
-    s_lo, s_hi = _score_lists_to_vecs(v_s)
-    tile = Vec(s_lo) + Vec(s_hi)
-    reducer = lambda a, b, _fm: a + b
-    return _lane_pair_reduce(
-        tile.reduce("add", init_val=zero_f, fastmath=fm_fast), reducer, fm_fast
     )
 
 
@@ -212,12 +173,6 @@ def _exp2_score_slice(v_s, start):
     return lo_partial, hi_full
 
 
-def _scale_o_accs(v_o, scale_scalar, traits):
-    scale_vec = Vec.from_elements([scale_scalar], fx.Float32).broadcast_to(16)
-    for dc in range_constexpr(traits.D_CHUNKS):
-        v_o[dc] = Vec(v_o[dc]) * scale_vec
-
-
 def _causal_pair_thresholds(kv_vectorized):
     if const_expr(kv_vectorized):
         return [
@@ -256,29 +211,11 @@ def _apply_dualwave_causal_mask_pair(s_values, rel_i32, neg_inf_i32, pair_thresh
         s_values[idx_y] = _bitcast_f32(new_y)
 
 
-def _cu_load(div, idx, cu_atom, cu_v1i32):
-    """Load cu_seqlens[idx] into an SGPR. ``idx`` must be wave-uniform."""
-    v = fly.copy_atom_call_ssa(
-        [cu_v1i32], cu_atom, fx.slice(div, (None, fx.Int32(idx)))
-    )
-    return fx.Index(
-        rocdl.readfirstlane(T.i32, as_mlir_value(fx.Int32(Vec(v, (1,), fx.Int32)[0])))
-    )
-
-
 def _make_ws_rsrc(ws_base_i64, byte_offset, nrec_bytes):
     addr_i64 = as_mlir_value(ws_base_i64 + fx.Int64(byte_offset))
     return buffer_ops.create_buffer_resource_from_addr(
         addr_i64, num_records_bytes=as_mlir_value(fx.Int64(nrec_bytes))
     )
-
-
-def _p_headroom_log2(traits):
-    """Exponent bias `sub_m` folds into P, so l_row carries a 2**this factor."""
-    h = _P_HEADROOM_LOG2
-    if traits.DUALWAVE_SWP_LAZY_RESCALE:
-        h -= traits.DUALWAVE_SWP_RESCALE_THRESHOLD
-    return max(0.0, h)
 
 
 def _store_lse(ctx, row, m_scaled, l_row, in_range, is_writer):
@@ -309,35 +246,6 @@ def _store_lse(ctx, row, m_scaled, l_row, in_range, is_writer):
     )
     off = is_writer.select(in_range.select(local, slice_elems), slice_elems)
     buffer_ops.buffer_store(lse.ir_value(), lse_rsrc, fx.Int32(off).ir_value())
-
-
-def _buffer_load_128(elem_index, _load_atom_128, q_div, q_load_i32x4_type):
-    """128-bit global->register load (buffer_load_dwordx4) from Q."""
-    return fly.copy_atom_call_ssa(
-        [q_load_i32x4_type],
-        _load_atom_128,
-        fx.slice(q_div, (None, fx.Int32(elem_index))),
-    )
-
-
-def _buffer_load_lds_128(
-    src_div, lds_byte_addr, src_elem, soffset_elems, _dma_atom, _lds_ptr_ty
-):
-    """128-bit global->LDS DMA; `src_elem` is voffset, `soffset_elems` is scaled by the atom."""
-    lds_ptr = fx.inttoptr(_lds_ptr_ty, fx.Int32(lds_byte_addr))
-    dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
-    src = fx.slice(src_div, (None, fx.Int32(src_elem)))
-    fx.copy(_dma_atom, src, dst, soffset=fx.Int32(soffset_elems))
-
-
-def _buffer_store_128(
-    pack_i32_vec, elem_index, _o_store_reg_128, _store_atom_128, o_div
-):
-    """128-bit register->global store (buffer_store_dwordx4) into O."""
-    fx.memref_store_vec(pack_i32_vec, _o_store_reg_128)
-    fx.copy(
-        _store_atom_128, _o_store_reg_128, fx.slice(o_div, (None, fx.Int32(elem_index)))
-    )
 
 
 @flyc.jit
@@ -662,15 +570,6 @@ def _init_dualwave_thread_mapping(ctx):
     ctx.group_id = ctx.h_idx // traits.NUM_HEADS_KV
     ctx.q_head_idx = ctx.h_kv_idx * traits.GQA_GROUP_SIZE + ctx.group_id
     ctx.kv_head_idx = ctx.h_kv_idx
-
-
-def _init_dualwave_q_row(ctx):
-    """Set q_row / q_row_i32 / q_start_pos_i32 on a dualwave-style context."""
-    traits = ctx.traits
-    ctx.q_row_in_block = ctx.wave_q_offset + ctx.lane_mod_32
-    ctx.q_start_pos_i32 = fx.Int32(ctx.q_start + ctx.wave_id_uni * traits.ROWS_PER_WAVE)
-    ctx.q_row = ctx.q_start + ctx.q_row_in_block
-    ctx.q_row_i32 = fx.Int32(ctx.q_row)
 
 
 class DualwaveFp8KernelContext:
