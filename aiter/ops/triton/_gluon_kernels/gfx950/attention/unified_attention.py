@@ -788,7 +788,9 @@ class ScaledKVLoader:
     def load_block_ids(self, i):
         # The double buffer looks ahead by two pages. The final lookahead is
         # unused, but its table load must stay within the allocated row.
-        return self.base.load_block_ids(gl.minimum(i, self.base.block_table_stride - 1))
+        if self.base.cfg.TILE_SIZE == self.base.cfg.BLOCK_SIZE:
+            i = gl.minimum(i, self.base.block_table_stride - 1)
+        return self.base.load_block_ids(i)
 
     @gluon.jit
     def load_k_to_shared(self, offset, buffer_id=0):
@@ -810,8 +812,12 @@ class ScaledKVLoader:
         else:
             scale_layout: gl.constexpr = cfg.v_layout
             slots = gl.arange(0, cfg.TILE_SIZE, layout=gl.SliceLayout(1, scale_layout))
-        valid = tile_index * cfg.TILE_SIZE + slots < self.seq_len
-        page = gl.load(self.base.block_tables_ptr_shifted + tile_index).to(gl.int64)
+        token_start = tile_index * cfg.TILE_SIZE
+        valid = token_start + slots < self.seq_len
+        page = gl.load(
+            self.base.block_tables_ptr_shifted + token_start // cfg.BLOCK_SIZE
+        ).to(gl.int64)
+        slots = token_start % cfg.BLOCK_SIZE + slots
         if is_key:
             scale = gl.load(
                 self.k_scale_ptr
@@ -2072,7 +2078,7 @@ def _unified_attention_gluon_kernel(
         REMOVE_INDIRECT_ACCESS,
     )
     if PER_TOKEN_KV_SCALES:
-        gl.static_assert(SHUFFLED_KV_CACHE and TILE_SIZE == BLOCK_SIZE)
+        gl.static_assert(SHUFFLED_KV_CACHE and BLOCK_SIZE % TILE_SIZE == 0)
         gl.static_assert(not ALL_DECODE and KV_FP8 and q.dtype == gl.bfloat16)
         kv_loader = ScaledKVLoader(
             kv_loader,
