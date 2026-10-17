@@ -336,7 +336,7 @@ def _check_tables():
                 if key[0] == gfx
                 and row.get("libtype") == "opus"
                 and policy.mxscale_bmm_kid_group(int(row["kernelId"]))
-                != policy.mxscale_bmm_group_of_block(key[5])
+                != policy.mxscale_bmm_group_of_block(key[-1])
             }
         )
         bad_b = sorted(

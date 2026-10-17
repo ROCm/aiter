@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -264,6 +265,7 @@ def test_mxscale_invalid_tuned_kid_warns_and_uses_heuristic(
         ),
     )
     monkeypatch.setattr(policy, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(policy, "get_cu_num", lambda: 256)
     monkeypatch.setattr(policy, "get_padded_m", lambda m, _n, _k, _gl: m)
     monkeypatch.setattr(
         policy.logger,
@@ -284,6 +286,155 @@ def test_mxscale_invalid_tuned_kid_warns_and_uses_heuristic(
     finally:
         policy.lookup_mxscale_bmm_config.cache_clear()
         policy._load_mxscale_bmm_tuned.cache_clear()
+
+
+def test_mxscale_tuned_lookup_keys_on_cu_count(monkeypatch, tmp_path):
+    from aiter.ops.opus import policy
+
+    config_path = tmp_path / "mxscale.csv"
+    monkeypatch.setattr(
+        policy,
+        "AITER_CONFIGS",
+        SimpleNamespace(
+            AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE=str(config_path)
+        ),
+    )
+    monkeypatch.setattr(policy, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(
+        policy,
+        "_get_cached_a8w8_mxscale_bmm_plan",
+        lambda *_args, **_kwargs: object(),
+    )
+
+    def lookup_kid(table: str, cu_num: int) -> int:
+        config_path.write_text(table)
+        monkeypatch.setattr(policy, "get_cu_num", lambda: cu_num)
+        policy._load_mxscale_bmm_tuned.cache_clear()
+        policy.lookup_mxscale_bmm_config.cache_clear()
+        return policy.lookup_mxscale_bmm_config(2, 1, 1024, 4096)["kernelId"]
+
+    header = "gfx,cu_num,b,m,n,k,w_scale_block,libtype,kernelId,splitK\n"
+    shape = "2,1,1024,4096,128x128,opus"
+    try:
+        # A bound row serves its own CU count; a blank cu_num serves every other.
+        mixed = (
+            header
+            + f"gfx950,128,{shape},8311,1\n"
+            + f"gfx950,256,{shape},8312,1\n"
+            + f"gfx950,,{shape},8653,1\n"
+        )
+        assert lookup_kid(mixed, 128) == 8311
+        assert lookup_kid(mixed, 256) == 8312
+        assert lookup_kid(mixed, 304) == 8653
+
+        # A table without the column serves every CU count.
+        legacy = (
+            "gfx,b,m,n,k,libtype,kernelId,splitK\ngfx950,2,1,1024,4096,opus,8311,1\n"
+        )
+        assert lookup_kid(legacy, 128) == 8311
+
+        # Blank and negative cu_num count as 0 in the duplicate check.
+        for first, second in (("128", "128"), ("", "0"), ("-1", "0")):
+            duplicates = (
+                header
+                + f"gfx950,{first},{shape},8311,1\n"
+                + f"gfx950,{second},{shape},8312,1\n"
+            )
+            with pytest.raises(RuntimeError, match="duplicate"):
+                lookup_kid(duplicates, 128)
+    finally:
+        policy.lookup_mxscale_bmm_config.cache_clear()
+        policy._load_mxscale_bmm_tuned.cache_clear()
+
+
+def test_mxscale_tuner_keys_on_device_cu_count(monkeypatch, tmp_path):
+    from csrc.opus_gemm.opus_bmm_mxscale_tune import OpusBmmMxscaleTuner
+
+    tuner = OpusBmmMxscaleTuner()
+    monkeypatch.setattr(tuner, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(tuner, "get_cu_num", lambda: 256)
+    header = "gfx,cu_num,b,m,n,k,w_scale_block,libtype,kernelId,splitK\n"
+
+    # Shapes tuned for any CU count (0 or -1) are skipped; one tuned only for
+    # 128 CUs is retuned, retargeted to the device's 256 like the new shape.
+    untuned_path = tmp_path / "untuned.csv"
+    untuned_path.write_text(
+        "b,m,n,k,w_scale_block\n"
+        "2,1,1024,4096,128x128\n"
+        "2,16,1024,4096,128x128\n"
+        "2,64,1024,4096,128x128\n"
+        "2,128,1024,4096,128x128\n"
+    )
+    tuned_path = tmp_path / "tuned.csv"
+    tuned_path.write_text(
+        header
+        + "gfx950,0,2,1,1024,4096,128x128,opus,8311,1\n"
+        + "gfx950,128,2,16,1024,4096,128x128,opus,8311,1\n"
+        + "gfx950,-1,2,128,1024,4096,128x128,opus,8311,1\n"
+    )
+    tuner.pre_process(
+        tuner.parser.parse_args(["-i", str(untuned_path), "-o", str(tuned_path)])
+    )
+    assert tuner.untunedf[["cu_num", "m"]].values.tolist() == [[256, 16], [256, 64]]
+
+    # --run_config benchmarks the device's rows and the unbound ones, not rows
+    # for another CU count or arch.
+    saved_path = tmp_path / "saved.csv"
+    saved_path.write_text(
+        header
+        + "gfx950,0,2,1,1024,4096,128x128,opus,8311,1\n"
+        + "gfx950,256,2,16,1024,4096,128x128,opus,8311,1\n"
+        + "gfx950,128,2,64,1024,4096,128x128,opus,8311,1\n"
+        + "gfx1250,0,2,128,1024,4096,128x128,flydsl,-1,1\n"
+    )
+    benchmarked = []
+    monkeypatch.setattr(
+        tuner, "run_config", lambda _args: benchmarked.extend(tuner.untunedf["m"])
+    )
+    tuner.run(
+        tuner.parser.parse_args(
+            ["--run_config", str(saved_path), "-o", str(tmp_path / "out.csv")]
+        )
+    )
+    assert sorted(benchmarked) == [1, 16]
+
+    # Merging tables that all lack cu_num leaves every row unbound.
+    first_path, second_path = tmp_path / "first.csv", tmp_path / "second.csv"
+    first_path.write_text(
+        "gfx,b,m,n,k,w_scale_block,libtype,kernelId,splitK,us\n"
+        "gfx950,2,1,1024,4096,128x128,opus,8311,1,10.0\n"
+    )
+    second_path.write_text(
+        "gfx,b,m,n,k,w_scale_block,libtype,kernelId,splitK,us\n"
+        "gfx950,2,16,1024,4096,128x128,opus,8311,1,9.0\n"
+    )
+    merged = tuner.get_tuned_gemm_list(f"{first_path}{os.pathsep}{second_path}")
+    assert sorted(merged[["cu_num", "m"]].values.tolist()) == [[0, 1], [0, 16]]
+
+    # Writing results into a table without cu_num leaves its rows unbound and
+    # adds the column after gfx. The first sort is what a run with nothing to
+    # tune ends with.
+    legacy_path = tmp_path / "legacy.csv"
+    legacy_path.write_text(
+        "gfx,b,m,n,k,w_scale_block,libtype,kernelId,splitK,us\n"
+        "gfx950,2,1,1024,4096,128x128,opus,8311,1,10.0\n"
+        "gfx1250,2,1,1024,4096,128x128,flydsl,-1,1,10.0\n"
+    )
+    tuner.sortResults(str(legacy_path), True, tuner.sort_keys)
+    for concat in (True, False):
+        result = tuner.result_to_df(
+            [((("gfx950", 256, 2, 16, 1024, 4096, "128x128"), 8311, 1, ""), 9.0, 0.0)]
+        )
+        tuner.result_to_csv(result, str(legacy_path), concat=concat)
+        tuner.sortResults(str(legacy_path), True, tuner.sort_keys)
+
+    assert legacy_path.read_text().startswith("gfx,cu_num,b,m,n,k,w_scale_block,")
+    rows = tuner.get_tuned_gemm_list(str(legacy_path))
+    assert sorted(rows[["gfx", "cu_num", "m"]].values.tolist()) == [
+        ["gfx1250", 0, 1],
+        ["gfx950", 0, 1],
+        ["gfx950", 256, 16],
+    ]
 
 
 if __name__ == "__main__":

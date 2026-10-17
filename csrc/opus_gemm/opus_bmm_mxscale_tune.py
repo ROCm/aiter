@@ -2,7 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """MXFP8 BMM tuning through the shared GEMM tuner framework.
 
-The CSV key is (gfx, b, m, n, k, w_scale_block); existing scale rows are
+The CSV key is (gfx, cu_num, b, m, n, k, w_scale_block); existing scale rows are
 preserved. Shape-only inputs may specify --w_scale_block 32x32,128x128. Tuning uses
 BF16 output, token-major contiguous activations/scales, and the per-kid
 weight layout. All operands are passed to mp_tuner for buffer rotation.
@@ -757,7 +757,15 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         "config_env_name": "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
     }
 
-    KEYS: ClassVar[list[str]] = ["gfx", "b", "m", "n", "k", "w_scale_block"]
+    KEYS: ClassVar[list[str]] = [
+        "gfx",
+        "cu_num",
+        "b",
+        "m",
+        "n",
+        "k",
+        "w_scale_block",
+    ]
     RESULTS: ClassVar[list[str]] = [
         "libtype",
         "kernelId",
@@ -782,7 +790,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         )
         # sort N before M like the GEMM tuners (cosmetic ordering of the CSV),
         # then w_scale_block, so a shape's 32x32 and 128x128 rows land together.
-        self.sort_keys = ["gfx", "b", "n", "m", "k", "w_scale_block"]
+        self.sort_keys = ["gfx", "cu_num", "b", "n", "m", "k", "w_scale_block"]
 
     # --- schema helpers -----------------------------------------------------
     def getKernelName(self, kernelId):
@@ -953,6 +961,13 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             df[name] = values.astype("int64")
         if "gfx" not in df:
             df["gfx"] = self.get_gfx()
+        # 0 leaves a row unbound, matching any CU count of its arch, as the
+        # runtime loader reads it. Stamping this device's count would rebind
+        # other devices' rows when the tuner writes the table back.
+        if "cu_num" not in df:
+            df.insert(df.columns.get_loc("gfx") + 1, "cu_num", 0)
+        cu_num = pd.to_numeric(df["cu_num"], errors="coerce").fillna(0)
+        df["cu_num"] = cu_num.clip(lower=0).astype(int)
         if "w_scale_block" not in df:
             df = pd.concat(
                 [
@@ -1024,14 +1039,20 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         )
         if not self._bpreshuffle and self.untunedf["w_scale_block"].eq("1x32").any():
             raise ValueError("1x32 tuning requires --bpreshuffle")
+        # A source row tuned for another CU count still names a shape to measure
+        # here, so it is retargeted to this device rather than dropped.
+        cu_num = self.get_cu_num()
         self.untunedf = (
-            self.untunedf[self.untunedf["gfx"] == gfx][self.keys]
+            self.untunedf[self.untunedf["gfx"] == gfx]
+            .assign(cu_num=cu_num)[self.keys]
             .drop_duplicates()
             .reset_index(drop=True)
         )
         self.tunedf = self.get_tuned_gemm_list(args.tune_file)
         if not (args.all or args.run_config or args.compare) and not self.tunedf.empty:
-            have = set(self.tunedf[self.keys].apply(tuple, axis=1))
+            # An unbound row counts as tuned for every CU count of its arch.
+            tuned = self.tunedf[self.keys].replace({"cu_num": {0: cu_num}})
+            have = set(tuned.apply(tuple, axis=1))
             self.untunedf = self.untunedf[
                 ~self.untunedf.apply(tuple, axis=1).isin(have)
             ].reset_index(drop=True)
