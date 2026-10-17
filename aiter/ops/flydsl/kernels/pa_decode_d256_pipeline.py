@@ -478,7 +478,9 @@ def compile_pa_decode_d256_pipeline(
                                 ).broadcast_to(4)
                             ) & fx.Vector.from_elements(
                                 [qgroup * 16 + l16 < query_rows], dtype=fx.Boolean
-                            ).broadcast_to(4)
+                            ).broadcast_to(
+                                4
+                            )
                             scaled = acc * vec(
                                 key_scale * qsc * fx.Float32(scale * LOG2E)
                             )
