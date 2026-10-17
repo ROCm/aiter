@@ -249,6 +249,121 @@ def _fused_rms_mxfp4_quant_kernel(
         )
 
 
+_fused_rms_gated_mxfp4_quant_repr = make_kernel_repr(
+    "_fused_rms_gated_mxfp4_quant_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "MXFP4_QUANT_BLOCK_SIZE",
+        "NORM_BEFORE_GATE",
+        "ACTIVATION",
+        "EVEN_M_N",
+    ],
+)
+
+
+@triton.heuristics(
+    {
+        "EVEN_M_N": partial(
+            _even_m_n, block_m="BLOCK_SIZE_M", n="N", block_n="BLOCK_SIZE_N"
+        ),
+    }
+)
+@triton.jit(repr=_fused_rms_gated_mxfp4_quant_repr)
+def _fused_rms_gated_mxfp4_quant_kernel(
+    x_ptr,
+    z_ptr,
+    w_ptr,
+    out_fp4_ptr,
+    out_bs_ptr,
+    eps,
+    M,
+    N,
+    x_stride_m,
+    z_stride_m,
+    out_fp4_stride_m,
+    out_bs_stride_m,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
+    NORM_BEFORE_GATE: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    EVEN_M_N: tl.constexpr,
+):
+    """One norm group per row: RMSNorm over N, the act(z) gate, then MXFP4
+    quant. The gated activation is rounded to the input dtype before quant,
+    as it is when RMSNormGated and the quant run as separate ops."""
+    pid = tl.program_id(0)
+    NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
+    offs_m = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = tl.arange(0, BLOCK_SIZE_N)
+
+    mask = None
+    other = None
+    if not EVEN_M_N:
+        mask = (offs_m < M)[:, None] & (offs_n < N)[None, :]
+        other = 0.0
+
+    x = tl.load(
+        x_ptr + offs_m[:, None] * x_stride_m + offs_n[None, :],
+        mask=mask,
+        other=other,
+        cache_modifier=".cg",
+    ).to(tl.float32)
+    z = tl.load(
+        z_ptr + offs_m[:, None] * z_stride_m + offs_n[None, :],
+        mask=mask,
+        other=other,
+        cache_modifier=".cg",
+    ).to(tl.float32)
+    if ACTIVATION == "sigmoid":
+        gate = tl.sigmoid(z)
+    else:
+        gate = z * tl.sigmoid(z)
+
+    w_mask = None
+    w_other = None
+    if not EVEN_M_N:
+        w_mask = offs_n < N
+        w_other = 0.0
+    w = tl.load(w_ptr + offs_n, mask=w_mask, other=w_other).to(tl.float32)
+
+    if not NORM_BEFORE_GATE:
+        x = x * gate
+    y = _rmsmorm_op(x, w, N, eps)
+    if NORM_BEFORE_GATE:
+        y = y * gate
+    y = y.to(x_ptr.type.element_ty).to(tl.float32)
+
+    y_fp4, bs_e8m0 = _mxfp4_quant_op(
+        y, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
+    )
+
+    half_offs_n = tl.arange(0, BLOCK_SIZE_N // 2)
+    out_mask = None
+    if not EVEN_M_N:
+        out_mask = (offs_m < M)[:, None] & (half_offs_n < (N // 2))[None, :]
+    tl.store(
+        out_fp4_ptr + offs_m[:, None] * out_fp4_stride_m + half_offs_n[None, :],
+        y_fp4,
+        mask=out_mask,
+        cache_modifier=".cg",
+    )
+
+    bs_offs_n = tl.arange(0, NUM_QUANT_BLOCKS)
+    bs_mask = None
+    if not EVEN_M_N:
+        bs_mask = (offs_m < M)[:, None] & (bs_offs_n < (N // MXFP4_QUANT_BLOCK_SIZE))[
+            None, :
+        ]
+    tl.store(
+        out_bs_ptr + offs_m[:, None] * out_bs_stride_m + bs_offs_n[None, :],
+        bs_e8m0.to(out_bs_ptr.type.element_ty),
+        mask=bs_mask,
+        cache_modifier=".cg",
+    )
+
+
 _fused_flatten_mxfp4_quant_repr = make_kernel_repr(
     "_fused_flatten_mxfp4_quant",
     [
