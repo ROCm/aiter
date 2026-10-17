@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import aiter.ops.triton.attention.unified_attention as unified_attention_module
 from aiter.ops.triton.attention.unified_attention import (
     _is_gluon_available,
     is_2d_gluon_available,
@@ -934,3 +935,110 @@ def test_triton_unified_attn_asym_head_guards(case: str) -> None:
             shuffled_kv_cache=shuffled,
             backend="triton",
         )
+
+
+@pytest.mark.parametrize(
+    "route, q_len, kv_len, num_segments",
+    [
+        pytest.param("2d", 8, 71, None, id="2d"),
+        pytest.param("3d", 1, 513, 1, id="3d"),
+        pytest.param("3d", 1, 1000, 4, id="3d-split"),
+    ],
+)
+@pytest.mark.parametrize("poison", [float("nan"), float("inf")], ids=["nan", "inf"])
+@torch.inference_mode()
+def test_triton_unified_attn_masks_nonfinite_kv_page_tail(
+    monkeypatch: pytest.MonkeyPatch,
+    route: str,
+    q_len: int,
+    kv_len: int,
+    num_segments: int | None,
+    poison: float,
+) -> None:
+    """KV cache slots past seqused_k must not participate in attention."""
+    torch.manual_seed(0)
+    device = "cuda"
+    dtype = torch.bfloat16
+    block_size = 64
+    num_blocks = (kv_len + block_size - 1) // block_size
+    num_query_heads, num_kv_heads, head_size = 8, 1, 128
+    scale = head_size**-0.5
+
+    query = torch.randn(q_len, num_query_heads, head_size, device=device, dtype=dtype)
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, device=device, dtype=dtype
+    )
+    value_cache = torch.randn_like(key_cache)
+    block_tables = torch.arange(num_blocks, device=device, dtype=torch.int32)[None]
+    cu_seqlens_q = torch.tensor([0, q_len], device=device, dtype=torch.int32)
+    seqused_k = torch.tensor([kv_len], device=device, dtype=torch.int32)
+    output = torch.empty_like(query)
+
+    tail_start = kv_len % block_size
+    assert tail_start != 0
+    key_cache[-1, tail_start, 0, 0] = poison
+    value_cache[-1, tail_start, 0, 0] = poison
+
+    # Pin the whole-page tile (TILE_SIZE == BLOCK_SIZE) and the route so that
+    # every arch exercises the same kernel path.
+    real_get_config = unified_attention_module.get_unified_attention_config
+    seen_tile_sizes: list[int] = []
+
+    def get_config(op, params, backend="triton", arch=None):
+        config = dict(real_get_config(op, params, backend=backend, arch=arch))
+        if op in ("attn_2d", "kv_split"):
+            config["TILE_SIZE"] = block_size
+            seen_tile_sizes.append(block_size)
+        if op == "kv_split":
+            config["NUM_SEGMENTS"] = num_segments
+        return config
+
+    monkeypatch.setattr(
+        unified_attention_module, "get_unified_attention_config", get_config
+    )
+    monkeypatch.setattr(
+        unified_attention_module,
+        "use_2d_kernel",
+        lambda *_args, **_kwargs: route == "2d",
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=[q_len],
+        kv_lens=[kv_len],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=dtype,
+    )
+    assert torch.isfinite(ref_output).all()
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seqused_k,
+        max_seqlen_q=q_len,
+        max_seqlen_k=kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_tables,
+        softcap=0.0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        sinks=None,
+        output_scale=None,
+        shuffled_kv_cache=False,
+        backend="triton",
+    )
+
+    assert seen_tile_sizes == [block_size]
+    assert torch.isfinite(output).all(), "KV page tail leaked into the output"
+    torch.testing.assert_close(
+        output.float(), ref_output.float(), atol=1.5e-2, rtol=1e-2
+    )
