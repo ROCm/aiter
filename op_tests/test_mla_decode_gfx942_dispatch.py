@@ -66,7 +66,7 @@ def _simulate_get_heuristic_kernel_mla(
     elif gqa_ratio == 64:
         if q_type == "bf16" and kv_type == "bf16":
             if not persistent:
-                if max_seqlen_q == 1:
+                if max_seqlen_q == 1 and arch_id == "gfx950":
                     config_max_seqlen_q = 1
                 else:
                     config_max_seqlen_q = 0
@@ -108,8 +108,8 @@ def _simulate_get_heuristic_kernel_mla(
     return None, None
 
 
-def test_gfx942_bf16_gqa64_qseqlen1_csv_entry():
-    """Verify issue #6189 fix in hsa/gfx942/mla/mla_asm.csv."""
+def test_gfx942_bf16_gqa64_csv_entry():
+    """Verify gfx942 bf16 gqa=64 manifest entry has qSeqLen=0 to serve both qlen=1 and qlen>1."""
     assert GFX942_MLA_CSV.exists(), f"Manifest missing: {GFX942_MLA_CSV}"
     df = pd.read_csv(GFX942_MLA_CSV)
 
@@ -128,8 +128,8 @@ def test_gfx942_bf16_gqa64_qseqlen1_csv_entry():
 
     row = matched.iloc[0]
     assert (
-        int(row["qSeqLen"]) == 1
-    ), f"Expected qSeqLen == 1 for single-token decode (issue #6189), got {row['qSeqLen']}"
+        int(row["qSeqLen"]) == 0
+    ), f"Expected qSeqLen == 0 in manifest (serves both qlen=1 and qlen>1), got {row['qSeqLen']}"
     assert (
         row["knl_name"] == EXPECTED_SYMBOL
     ), f"Unexpected kernel symbol: {row['knl_name']}"
@@ -220,8 +220,8 @@ def test_heuristic_kernel_selection_simulation():
         co_name == GFX942_KERNEL_CO.name
     ), f"Expected {GFX942_KERNEL_CO.name}, got {co_name}"
 
-    # Sequence length 2 should miss (non-persistent 64mx1 is 1-token decode only)
-    knl_name_q2, _ = _simulate_get_heuristic_kernel_mla(
+    # Sequence length 2 on gfx942: routes to 64mx1 (multi-token decode supported via grid tiling)
+    knl_name_q2, co_name_q2 = _simulate_get_heuristic_kernel_mla(
         csv_path=GFX942_MLA_CSV,
         arch_id="gfx942",
         q_type="bf16",
@@ -231,8 +231,28 @@ def test_heuristic_kernel_selection_simulation():
         persistent=False,
     )
     assert (
-        knl_name_q2 is None
-    ), f"max_seqlen_q=2 should not select a 1-token decode kernel, got {knl_name_q2}"
+        knl_name_q2 == EXPECTED_SYMBOL
+    ), f"Expected {EXPECTED_SYMBOL}, got {knl_name_q2}"
+    assert (
+        co_name_q2 == GFX942_KERNEL_CO.name
+    ), f"Expected {GFX942_KERNEL_CO.name}, got {co_name_q2}"
+
+    # Sequence length 4 on gfx942
+    knl_name_q4, co_name_q4 = _simulate_get_heuristic_kernel_mla(
+        csv_path=GFX942_MLA_CSV,
+        arch_id="gfx942",
+        q_type="bf16",
+        kv_type="bf16",
+        gqa_ratio=64,
+        max_seqlen_q=4,
+        persistent=False,
+    )
+    assert (
+        knl_name_q4 == EXPECTED_SYMBOL
+    ), f"Expected {EXPECTED_SYMBOL}, got {knl_name_q4}"
+    assert (
+        co_name_q4 == GFX942_KERNEL_CO.name
+    ), f"Expected {GFX942_KERNEL_CO.name}, got {co_name_q4}"
 
     # Nearby case: gfx942 gqa=16, qseqlen=1
     _, co_gqa16 = _simulate_get_heuristic_kernel_mla(
@@ -270,8 +290,8 @@ def test_heuristic_kernel_selection_simulation():
     )
     assert co_gqa128 == "mla_dec_stage1_bf16_a16w16_subQ128_mqa128.co"
 
-    # Nearby case: gfx950 gqa=64, qseqlen=1 should continue to resolve to its dedicated kernel
-    _, co_950 = _simulate_get_heuristic_kernel_mla(
+    # Cross-architecture case: gfx950 gqa=64, qseqlen=1 resolves to dedicated v3 kernel
+    _, co_950_q1 = _simulate_get_heuristic_kernel_mla(
         csv_path=GFX950_MLA_CSV,
         arch_id="gfx950",
         q_type="bf16",
@@ -280,11 +300,23 @@ def test_heuristic_kernel_selection_simulation():
         max_seqlen_q=1,
         persistent=False,
     )
-    assert co_950 == "mla_a16w16_qh64_qseqlen1_gqaratio64_v3.co"
+    assert co_950_q1 == "mla_a16w16_qh64_qseqlen1_gqaratio64_v3.co"
+
+    # Cross-architecture case: gfx950 gqa=64, qseqlen=2 resolves to generic 64mx1 kernel
+    _, co_950_q2 = _simulate_get_heuristic_kernel_mla(
+        csv_path=GFX950_MLA_CSV,
+        arch_id="gfx950",
+        q_type="bf16",
+        kv_type="bf16",
+        gqa_ratio=64,
+        max_seqlen_q=2,
+        persistent=False,
+    )
+    assert co_950_q2 == GFX942_KERNEL_CO.name
 
 
-def test_codegen_produces_qseqlen1_entry():
-    """Verify that hsa/codegen.py processes the updated CSV and generates qSeqLen=1."""
+def test_codegen_produces_expected_entries():
+    """Verify that hsa/codegen.py processes CSVs and generates expected configuration headers."""
     codegen_script = REPO_ROOT / "hsa" / "codegen.py"
     with tempfile.TemporaryDirectory() as tmpdir:
         env = dict(os.environ, AITER_GPU_ARCHS="gfx942;gfx950")
@@ -301,14 +333,23 @@ def test_codegen_produces_qseqlen1_entry():
         assert header_path.exists(), "asm_mla_configs.hpp was not generated"
         content = header_path.read_text(encoding="utf-8")
 
-        # The ADD_CFG line for gfx942 64mx1 should have qSeqLen=1
-        expected_macro_substring = (
-            '"bf16", "bf16",   64,    0,    1,    0,    1,    0,    0, "gfx942", "mla/", '
+        # The ADD_CFG line for gfx942 64mx1 should have qSeqLen=0
+        expected_macro_substring_942 = (
+            '"bf16", "bf16",   64,    0,    0,    0,    1,    0,    0, "gfx942", "mla/", '
             f'"{EXPECTED_SYMBOL}", "{GFX942_KERNEL_CO.name}"'
         )
         assert (
-            expected_macro_substring in content
-        ), f"Expected macro entry not found in generated header:\n{expected_macro_substring}\n"
+            expected_macro_substring_942 in content
+        ), f"Expected gfx942 macro entry not found in generated header:\n{expected_macro_substring_942}\n"
+
+        # The ADD_CFG line for gfx950 v3 should have qSeqLen=1
+        expected_macro_substring_950 = (
+            '"bf16", "bf16",   64,    0,    1,    0,    1,    0,    0, "gfx950", "mla/", '
+            '"_ZN5aiter38mla_a16w16_qh64_qseqlen1_gqaratio64_v3E", "mla_a16w16_qh64_qseqlen1_gqaratio64_v3.co"'
+        )
+        assert (
+            expected_macro_substring_950 in content
+        ), f"Expected gfx950 v3 macro entry not found in generated header:\n{expected_macro_substring_950}\n"
 
 
 if __name__ == "__main__":
