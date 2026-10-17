@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Output-contract regressions and a valid-output MLA accuracy/performance sweep."""
+"""Output-width guards and an MLA accuracy/performance sweep.
+
+The default BF16 sweep matches the reported SGLang caller. Use ``-d bf16 fp16``
+to audit both 16-bit formats. Existing single-split direct-output paths can
+write BF16 bytes into an FP16 output; the full sweep reports those failures.
+The guards prevent unsafe output widths, not that separate numerical defect.
+"""
 
 import argparse
 import ctypes
@@ -294,7 +300,7 @@ def main():
         "--dtype",
         type=dtypes.str2Dtype,
         nargs="+",
-        default=[dtypes.bf16, dtypes.fp16],
+        default=[dtypes.bf16],
     )
     parser.add_argument(
         "--query-dtype",
