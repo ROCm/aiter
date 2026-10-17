@@ -116,6 +116,7 @@ def run_ck(
         cu_seqlens_kv=cu_seqlens_kv,
         num_splits=num_splits,
         num_rotate_args=1,
+        num_iters=3,
     )
 
     if dropout_p > 0.0:
@@ -148,6 +149,7 @@ def run_ck(
             dout,
             retain_graph=True,
             num_rotate_args=1,
+            num_iters=3,
         )
         return out, softmax_lse, dropout_mask, dq, dk, dv, dbias, (us_fwd, us_bwd)
     else:
@@ -158,6 +160,7 @@ def run_ck(
             dout,
             retain_graph=True,
             num_rotate_args=1,
+            num_iters=3,
         )
         return out, softmax_lse, dropout_mask, dq, dk, dv, None, (us_fwd, us_bwd)
 

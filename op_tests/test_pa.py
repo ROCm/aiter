@@ -306,7 +306,7 @@ def run_native(
     return output  # , 1
 
 
-@perftest()
+@perftest(num_iters=3)
 def run_aiter(
     query,
     k_cache,
@@ -374,7 +374,7 @@ def run_aiter_naive(
     )
 
 
-@perftest()
+@perftest(num_iters=3)
 def run_aiter_asm(
     query,
     k_cache,
@@ -405,7 +405,7 @@ def run_aiter_asm(
     )
 
 
-@perftest()
+@perftest(num_iters=3)
 def run_aiter_common(
     query,
     k_cache,

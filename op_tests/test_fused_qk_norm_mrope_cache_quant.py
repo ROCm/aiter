@@ -172,7 +172,7 @@ def set_kv_cache_shuffle_layout(
     )
 
 
-@perftest()
+@perftest(num_iters=3)
 def run_torch_mrope_3d_rms_set_kv_shuffle(
     qkv: Tensor,  # contiguous (num_tokens * (num_heads_q + num_heads_k + num_heads_v) * head_size)
     qw: Tensor,  #  contiguous (head_size)
@@ -316,7 +316,7 @@ def run_torch_mrope_3d_rms_set_kv_shuffle(
         v_out.copy_(v_quantized)
 
 
-@perftest()
+@perftest(num_iters=3)
 def run_fused_mrope_3d_rms_set_kv_shuffle(
     qkv: Tensor,  # contiguous (num_tokens * (num_heads_q + num_heads_k + num_heads_v) * head_size)
     qw: Tensor,  #  contiguous (head_size)

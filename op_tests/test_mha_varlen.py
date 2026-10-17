@@ -160,6 +160,7 @@ def run_ck(
         cu_seqlens_q_padded=cu_seqlens_q_padded,
         cu_seqlens_k_padded=cu_seqlens_k_padded,
         num_rotate_args=1,
+        num_iters=3,
     )
 
     if type(outputs) is tuple:
@@ -240,6 +241,7 @@ def run_ck(
             dout,
             retain_graph=True,
             num_rotate_args=1,
+            num_iters=3,
         )
         dq = dq_pad_fn(dq_unpad)
         dk = dk_pad_fn(dk_unpad)

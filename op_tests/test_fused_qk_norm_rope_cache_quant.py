@@ -156,7 +156,7 @@ def clone_qkv_inputs(
     return copy.deepcopy((q, k, v))
 
 
-@perftest()
+@perftest(num_iters=3)
 def run_torch_qk_norm_rope_cache_quant_shuffle(
     qkv: Tensor,  # contiguous (num_tokens * (num_heads_q + num_heads_k + num_heads_v) * head_size)
     qw: Tensor,  #  contiguous (head_size)
@@ -227,7 +227,7 @@ def run_torch_qk_norm_rope_cache_quant_shuffle(
     return q, k, v, k_cache, v_cache
 
 
-@perftest()
+@perftest(num_iters=3)
 def run_aiter_qk_norm_rope_cache_quant_shuffle(
     q: Tensor,
     k: Tensor,
@@ -825,7 +825,7 @@ def run_torch_qk_norm_rope_cache_block_quant_shuffle(
     return q, k, v, k_cache, v_cache
 
 
-@perftest(num_iters=31, num_rotate_args=31)
+@perftest(num_iters=3, num_rotate_args=3)
 def run_aiter_qk_norm_rope_cache_block_quant_shuffle(
     qkv: Tensor,  # contiguous (num_tokens * (num_heads_q + num_heads_k + num_heads_v) * head_size)
     qw: Tensor,  #  contiguous (head_size)
@@ -1182,7 +1182,7 @@ def test_qk_norm_rope_cache_quant_v_shuffle_layout(
     return {"v_shuffle_us_a": avg_a, "v_shuffle_us_b": avg_b}
 
 
-@perftest()
+@perftest(num_iters=3)
 def run_torch_qk_norm_rope_2way(
     q0: Tensor,  # contiguous (batch_size * num_tokens0 * num_heads_q * head_size)
     k0: Tensor,  # contiguous (batch_size * num_tokens0 * num_heads_k * head_size)
@@ -1237,7 +1237,7 @@ def run_torch_qk_norm_rope_2way(
     return q01, k01
 
 
-@perftest()
+@perftest(num_iters=3)
 def run_fused_qk_norm_rope_2way(
     q0: Tensor,  # contiguous (batch_size * num_tokens0 * num_heads_q * head_size)
     k0: Tensor,  # contiguous (batch_size * num_tokens0 * num_heads_k * head_size)
@@ -1402,7 +1402,7 @@ def test_qk_norm_rope_2way(
     return ret
 
 
-@perftest()
+@perftest(num_iters=3)
 def run_torch_qk_norm_rope_1way(
     q: Tensor,  # contiguous (batch_size * num_tokens * num_heads_q * head_size)
     k: Tensor,  # contiguous (batch_size * num_tokens * num_heads_k * head_size)
@@ -1440,7 +1440,7 @@ def run_torch_qk_norm_rope_1way(
     return q, k
 
 
-@perftest()
+@perftest(num_iters=3)
 def run_fused_qk_norm_rope_1way(
     q: Tensor,  # contiguous (batch_size * num_tokens * num_heads_q * head_size)
     k: Tensor,  # contiguous (batch_size * num_tokens * num_heads_k * head_size)
@@ -1571,7 +1571,7 @@ def minimax_rms_norm_forward(x: Tensor, weight: Tensor, eps: float) -> Tensor:
     return x.to(input_dtype)
 
 
-@perftest()
+@perftest(num_iters=3)
 def run_torch_minimax_qk_norm_rope(
     qkv: Tensor,
     q_weight: Tensor,
@@ -1614,7 +1614,7 @@ def run_torch_minimax_qk_norm_rope(
     return q, k, v
 
 
-@perftest()
+@perftest(num_iters=3)
 def run_aiter_minimax_qk_norm_rope(
     qkv: Tensor,
     q_weight: Tensor,

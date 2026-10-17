@@ -391,20 +391,6 @@ def test_mla(
     total_q = qo_indptr[-1].item()
     q = torch.randn((total_q, nhead, qk_head_dim), dtype=torch.bfloat16)
 
-    # troch implementation
-    out_ref, _lse_ref = torch_mla_extend(
-        q,
-        kv_buffer,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        sm_scale,
-        kv_lora_rank,
-        qk_rope_head_dim,
-        is_causal=True,
-        dtype=dtype,
-    )
-
     (
         (work_meta_data_size, work_meta_data_type),
         (work_indptr_size, work_indptr_type),

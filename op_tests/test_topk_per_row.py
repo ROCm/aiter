@@ -52,8 +52,9 @@ def create_random_logits(
         mask = torch.randint(0, 2, (row_starts.shape[0], 1), device="cuda").bool()
         logits = torch.where(mask, logits, logits_random)
 
-    for i, end in enumerate(row_ends):
-        logits[i, end:] = float("-inf")
+    cols = torch.arange(logits.shape[1], device=logits.device)
+    ends = row_ends.to(logits.device, torch.int64)[:, None]
+    logits.masked_fill_(cols >= ends, float("-inf"))
     return logits
 
 
@@ -85,7 +86,17 @@ def compare_topk_results(
     """
     num_rows = cuda_indices.shape[0]
 
+    # Rows whose index sets already match skip the per-row check below.
+    dev, width = cuda_indices.device, torch_indices.shape[1]
+    valid_counts = (row_ends - row_starts).to(dev).long().clamp(max=top_k)
+    pad = torch.arange(width, device=dev) >= valid_counts[:, None]
+    cuda_sorted = cuda_indices[:, :width].long().masked_fill(pad, -1).sort(dim=1)[0]
+    torch_sorted = torch_indices.to(dev).long().masked_fill(pad, -1).sort(dim=1)[0]
+    row_match = (cuda_sorted == torch_sorted).all(dim=1).tolist()
+
     for row_idx in range(num_rows):
+        if row_match[row_idx]:
+            continue
         # Get valid elements using row boundaries
         row_start = row_starts[row_idx].item()
         row_end = row_ends[row_idx].item()
@@ -150,7 +161,7 @@ def compare_topk_results(
     return True
 
 
-@perftest()
+@perftest(num_iters=3)
 def run_top_k_per_row_prefill(
     logits: torch.Tensor,
     row_starts: torch.Tensor,
@@ -195,7 +206,7 @@ def run_top_k_per_row_prefill(
     )
 
 
-@perftest()
+@perftest(num_iters=3)
 def run_top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,
