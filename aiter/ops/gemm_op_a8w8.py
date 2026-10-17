@@ -192,10 +192,11 @@ def gemm_a8w8_bpreshuffle_flydsl(
             XQ, WQ, x_scale, w_scale, Out, kernel_name
         )
 
-    from .flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+    from .flydsl.gemm_kernels import PRESHUFFLE_M_MAX, flydsl_preshuffle_gemm_a8
 
     parsed = _parse_flydsl_kernel_name(kernel_name)
-    if parsed is None:
+    # Padded-M lookup serves every M > 8192 with the M=8192 row when N > 4096.
+    if parsed is None or XQ.shape[0] > PRESHUFFLE_M_MAX:
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
     tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler, k_split = parsed
 
