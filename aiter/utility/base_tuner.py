@@ -9,13 +9,25 @@ import tempfile
 import time
 from abc import abstractmethod
 from operator import itemgetter
+from pathlib import Path
 from typing import Any, ClassVar
 
 import pandas as pd
 import torch
 
 from aiter import dtypes, logger
-from aiter.jit.utils.chip_info import get_gfx_runtime as _chip_get_gfx
+from aiter.jit.utils import chip_info
+from aiter.utility import selection_proof
+from aiter.utility.tuning_policy import (
+    DEFAULT_MEASUREMENT,
+    DEFAULT_PROMOTION,
+    DEFAULT_RUN,
+    PROMOTE,
+    PromotionPolicy,
+    gate_against_incumbent,
+)
+
+_REPOSITORY_ROOT = str(Path(__file__).resolve().parents[2])
 
 INVALID_TIME = -1
 
@@ -26,12 +38,61 @@ def _read_csv(filepath, **kwargs):
     """
     df = pd.read_csv(filepath, **kwargs)
     df.columns = df.columns.str.strip()
-    df = df.loc[:, ~df.columns.str.startswith("Unnamed:")]
+    df = df.loc[:, ~df.columns.str.startswith("Unnamed:")].copy()
     str_cols = df.select_dtypes(include=["object"]).columns
-    for col in str_cols:
-        df[col] = df[col].apply(lambda v: v.strip() if isinstance(v, str) else v)
+    if len(str_cols):
+        df = df.assign(
+            **{
+                col: df[col].map(
+                    lambda value: value.strip() if isinstance(value, str) else value
+                )
+                for col in str_cols
+            }
+        )
     df.dropna(how="all", inplace=True)
     return df
+
+
+def _write_csv(df, filepath, **kwargs):
+    """Write df to filepath so readers see either the old or the new file.
+
+    Tuned CSVs are read by inference; a run killed mid-write must not leave a
+    truncated one. Writes a temp file in the same directory, then os.replace().
+    The result keeps the old file's mode (mkstemp alone would publish it 0600,
+    unreadable to an inference user other than the tuner's), and a symlinked
+    path is written through rather than replaced.
+    """
+    filepath = os.path.realpath(filepath)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=os.path.dirname(filepath),
+        prefix=f".{os.path.basename(filepath)}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", newline="") as f:
+            df.to_csv(f, **kwargs)
+        if os.path.exists(filepath):
+            shutil.copymode(filepath, tmp_path)
+        else:
+            os.chmod(tmp_path, 0o666 & ~_current_umask())
+        os.replace(tmp_path, filepath)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+def _current_umask():
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
+def _improvement_pct(text):
+    value = float(text)
+    if not 0.0 <= value < 100.0:
+        raise argparse.ArgumentTypeError(f"must be in [0, 100), got {text}")
+    return value
 
 
 class TunerCommon:
@@ -39,19 +100,15 @@ class TunerCommon:
         "verbose": False,
         "tune_file": "",
         "untune_file": "",
-        "errRatio": 0.05,
-        "batch": 100,
+        "errRatio": DEFAULT_MEASUREMENT.err_ratio,
+        "batch": DEFAULT_RUN.batch,
         "profile_file": "",  # for all results
-        # Per-task watchdog (seconds). A worker killed by a GPU memory-access
-        # fault leaves its in-flight task unresolvable; with no timeout the whole
-        # run hangs. A generous default lets the existing reaping path drop the
-        # lost task and restart the pool, while staying comfortably above any
-        # legitimate shape-group tuning time so healthy tasks are never falsely
-        # reaped. Override with --timeout for tighter/looser bounds.
-        "timeout": 1800,
-        "warmup": 5,  # 5 warmup iters for profiling
-        "iters": 101,  # 101 run iters for profiling
-        "min_improvement_pct": 3.0,  # only write shapes improved by >= N%
+        # Override with --timeout for tighter/looser bounds.
+        "timeout": DEFAULT_MEASUREMENT.timeout,
+        "warmup": DEFAULT_MEASUREMENT.warmup,
+        "iters": DEFAULT_MEASUREMENT.iters,
+        # only write shapes improved by >= N%
+        "min_improvement_pct": DEFAULT_PROMOTION.min_improvement_pct,
     }
     dtype2bpe_dict: ClassVar[dict[str, Any]] = {
         dtypes.fp16: 2,
@@ -235,8 +292,10 @@ class TunerCommon:
         self.parser.add_argument(
             "--min_improvement_pct",
             dest="min_improvement_pct",
-            type=float,
-            default=defaults.get("min_improvement_pct", 3.0),
+            type=_improvement_pct,
+            default=defaults.get(
+                "min_improvement_pct", DEFAULT_PROMOTION.min_improvement_pct
+            ),
             help="With --compare --update_improved, update tuned CSV only when a valid pre/post benchmark shows at least this percent improvement. Shapes with no valid pre-run baseline but passing post-run are still allowed to update.",
         )
 
@@ -245,6 +304,19 @@ class TunerCommon:
         if args.update_improved and not args.compare:
             self.parser.error("--update_improved requires --compare")
         return args
+
+    @staticmethod
+    def measurement_kwargs(args, use_cuda_event=False):
+        """Timing keyword arguments for the function an mp_tuner task measures.
+
+        --warmup and --iters only take effect if they reach the timed call, so
+        a task that passes {} silently measures with run_perftest's defaults.
+        """
+        return {
+            "num_warmup": args.warmup,
+            "num_iters": args.iters,
+            "use_cuda_event": use_cuda_event,
+        }
 
     @abstractmethod
     def _setup_specific_arguments(self):
@@ -480,7 +552,10 @@ class TunerCommon:
         return cu_num
 
     def get_gfx(self):
-        return _chip_get_gfx()
+        return chip_info.get_gfx_runtime()
+
+    def get_gpu_model(self):
+        return chip_info.get_gpu_model(torch.cuda.current_device())
 
     def post_process(self, rets, args, topk=-1, fast_mode=False):
         """post process, post process all results to return topk results"""
@@ -574,13 +649,99 @@ class TunerCommon:
     def update_tflops_bw(self, tune_file):
         """update tflops and bw from old tune_file"""
 
+    # Fresh-process selection proof (aiter/utility/selection_proof.py). A
+    # family opts in by naming the module whose ``--_selection_probe`` entry
+    # calls run_selection_probe, by recording its dispatch with
+    # record_selection, and by implementing expected_selection.
+    SELECTION_PROBE_MODULE: ClassVar[str | None] = None
+    SELECTION_FAMILY: ClassVar[str | None] = None
+
+    def expected_selection(self, row) -> dict[str, Any] | None:
+        """The selection a fresh process must record when it runs ``row``.
+
+        None checks only that the public operator runs and is correct, and the
+        proof reports ``unchecked`` rather than ``verified``.
+        """
+        return None
+
+    def prove_selection(self, row, config_file, args):
+        """Prove in a fresh process that ``config_file`` makes the public
+        operator dispatch ``row`` the way the row says, and time it there.
+        ``config_file=None`` leaves the family's config as the caller has it."""
+        if self.SELECTION_PROBE_MODULE is None:
+            raise NotImplementedError(f"{self.name} has no selection probe")
+        probe_row = {
+            str(key): value.item() if hasattr(value, "item") else value
+            for key, value in row.items()
+            if pd.notna(value)
+        }
+        expected = self.expected_selection(row)
+        mismatch = self._hardware_mismatch(probe_row)
+        if mismatch:
+            return selection_proof.SelectionProof(
+                "failed", expected, [], None, mismatch, 0.0
+            )
+        return selection_proof.prove_selection(
+            family=self.SELECTION_FAMILY or self.name,
+            probe_module=self.SELECTION_PROBE_MODULE,
+            row=probe_row,
+            expected=expected,
+            config_env=self.get_arg_defaults().get("config_env_name"),
+            config_file=config_file,
+            warmup=args.warmup,
+            iters=args.iters,
+            timeout=args.timeout,
+            repository_root=_REPOSITORY_ROOT,
+        )
+
+    def _hardware_mismatch(self, row) -> str:
+        """Why ``row`` cannot be proven on this GPU, or "" when it can.
+
+        The child resolves the hardware key from the device it runs on, as
+        serving does, so a row keyed on other hardware would simply miss.
+        """
+        live = {
+            "gfx": self.get_gfx,
+            "gpu_model": self.get_gpu_model,
+            "cu_num": self.get_cu_num,
+        }
+        for field, resolve in live.items():
+            value = row.get(field)
+            if value is None or str(value).strip() == "":
+                continue
+            if str(value).strip().lower() != str(resolve()).strip().lower():
+                return f"row is keyed on {field}={value}, this GPU is {resolve()}"
+        return ""
+
     def run_config(self, args):
         """Run the production operator for each shape in the untuned CSV.
         Subclasses should override this to call the actual production operator.
         Returns a list of dicts: [{"shape": str, "us": float, "status": "ok"/"error"}]
+
+        A family with a selection probe gets this for free: each row is proven
+        in a fresh process against the config file run() points it at.
         """
-        logger.info(f"run_config not implemented for {self.name}, skipping benchmark")
-        return []
+        if self.SELECTION_PROBE_MODULE is None:
+            logger.info(
+                f"run_config not implemented for {self.name}, skipping benchmark"
+            )
+            return []
+        env_name = self.get_arg_defaults().get("config_env_name")
+        config_file = os.environ.get(env_name) if env_name else None
+        results = []
+        for _, row in self.untunedf.iterrows():
+            proof = self.prove_selection(row, config_file, args)
+            passed = proof.status in ("verified", "unchecked")
+            results.append(
+                {
+                    "shape": str(tuple(row[key] for key in self.keys)),
+                    "e2e_us": proof.latency_us if passed else -1,
+                    "status": (
+                        "ok" if passed else f"error: {proof.status}: {proof.detail}"
+                    ),
+                }
+            )
+        return results
 
     def _clear_op_caches(self):
         """Clear operator-specific config caches. Subclasses should override this
@@ -669,7 +830,11 @@ class TunerCommon:
         not falsely flag kernels whose error fluctuates slightly across seeds.
         """
         default_limit = float(
-            getattr(args, "errRatio", self.ARG_DEFAULTS.get("errRatio", 0.05))
+            getattr(
+                args,
+                "errRatio",
+                self.ARG_DEFAULTS.get("errRatio", DEFAULT_MEASUREMENT.err_ratio),
+            )
         )
         default_desc = f"--errRatio={default_limit:.6g}"
         if row is None or not hasattr(row, "get"):
@@ -973,10 +1138,19 @@ class TunerCommon:
         )
         comparison.loc[~valid, "improvement_pct"] = float("nan")
         comparison["update_reason"] = "skip"
-        comparison.loc[
-            valid & (comparison["improvement_pct"] >= threshold_percent),
-            "update_reason",
-        ] = "threshold_met"
+        policy = PromotionPolicy(min_improvement_pct=float(threshold_percent))
+        promoted = pd.Series(
+            [
+                bool(ok)
+                and gate_against_incumbent(pre, post, policy).outcome == PROMOTE
+                for ok, pre, post in zip(
+                    valid, comparison["pre_us"], comparison["post_us"]
+                )
+            ],
+            index=comparison.index,
+            dtype=bool,
+        )
+        comparison.loc[promoted, "update_reason"] = "threshold_met"
         comparison.loc[no_baseline, "update_reason"] = "no_baseline"
         comparison["update"] = comparison["update_reason"] != "skip"
         return comparison[columns]
@@ -1375,6 +1549,14 @@ class TunerCommon:
                     tunedf = tunedf[tunedf["gfx"].astype(str) == str(gfx)]
                 if "cu_num" in tunedf.columns:
                     tunedf = tunedf[tunedf["cu_num"] == cu]
+                if "gpu_model" in tunedf.columns:
+                    # A blank gpu_model is a row from before the column existed.
+                    models = tunedf["gpu_model"].fillna("").astype(str).str.strip()
+                    live = chip_info.normalize_gpu_model(self.get_gpu_model())
+                    tunedf = tunedf[
+                        (models == "")
+                        | (models.map(chip_info.normalize_gpu_model) == live)
+                    ]
                 self.untunedf = tunedf.drop_duplicates(subset=self.keys).reset_index(
                     drop=True
                 )

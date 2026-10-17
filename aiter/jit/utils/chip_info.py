@@ -135,6 +135,110 @@ def get_gfx_runtime() -> str:
     return gfx_arch
 
 
+_GPU_MODEL_PATTERN = re.compile(r"\bMI[0-9]{3,4}[A-Z0-9]*\b", re.IGNORECASE)
+
+
+def normalize_gpu_model(device_name: str) -> str:
+    """Return a stable lowercase GPU model token for tuned-artifact keys.
+
+    Architecture and CU count are insufficient to distinguish products such
+    as MI300X and MI325X. Prefer the product token exposed by HIP/PyTorch while
+    discarding vendor text that is not part of the model identity.
+    """
+
+    text = str(device_name).strip()
+    match = _GPU_MODEL_PATTERN.search(text)
+    if match is not None:
+        return match.group(0).lower()
+    normalized = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return normalized or "unknown"
+
+
+# Products whose HIP device name carries no MI token, by PCI product ID; the
+# same table comm-fused MoE keys its winner rows with.
+_GPU_MODELS_BY_PCI_ID = {
+    0x75A0: "mi350x",
+    0x75A3: "mi355x",
+    0x75A8: "mi350p",
+}
+
+
+def _gpu_model_from_pci(properties) -> str | None:
+    try:
+        bdf = (
+            f"{properties.pci_domain_id:04x}:{properties.pci_bus_id:02x}:"
+            f"{properties.pci_device_id:02x}.0"
+        )
+        device_path = f"/sys/bus/pci/devices/{bdf}"
+        # Prefer the subsystem product ID: virtual functions may expose a VF
+        # device ID while retaining the physical product in subsystem_device.
+        product_ids = []
+        for name in ("subsystem_device", "device"):
+            with open(f"{device_path}/{name}", encoding="utf-8") as handle:
+                product_ids.append(int(handle.read(), 0))
+    except (AttributeError, OSError, ValueError):
+        return None
+    return next(
+        (
+            model
+            for product_id in product_ids
+            if (model := _GPU_MODELS_BY_PCI_ID.get(product_id)) is not None
+        ),
+        None,
+    )
+
+
+@functools.lru_cache(maxsize=8)
+def get_gpu_model(device_id: int = 0) -> str:
+    """Return the live GPU model used to isolate per-SKU tuning rows.
+
+    ``AITER_GPU_MODEL`` is an explicit override for controlled build/replay
+    environments. Runtime tuning normally resolves the model from PyTorch's
+    HIP device properties.
+    """
+
+    override = os.getenv("AITER_GPU_MODEL", "").strip()
+    if override:
+        return normalize_gpu_model(override)
+    try:
+        import torch
+
+        name = torch.cuda.get_device_name(int(device_id))
+        if _GPU_MODEL_PATTERN.search(name) is None:
+            from_pci = _gpu_model_from_pci(
+                torch.cuda.get_device_properties(int(device_id))
+            )
+            if from_pci is not None:
+                return from_pci
+        return normalize_gpu_model(name)
+    except Exception as error:  # noqa: BLE001 - callers fail closed to "unknown"
+        logger.debug("GPU model detection failed, keying as unknown: %s", error)
+        return "unknown"
+
+
+# Hardware column names of a tuned CSV, in key order. Mirrors the keys of
+# get_tuning_hardware() below.
+TUNING_HARDWARE_FIELDS = ("gfx", "gpu_model", "cu_num")
+
+
+@functools.lru_cache(maxsize=8)
+def get_tuning_hardware(device_id: int = 0) -> dict[str, str | int]:
+    """Return the hardware identity a tuned row is only valid for.
+
+    A measurement is specific to the arch, the SKU and the CU count it ran on,
+    so tuning families scope their rows by this triple. The result is cached
+    and shared, so callers must not mutate it.
+    """
+
+    import torch
+
+    return {
+        "gfx": get_gfx_runtime(),
+        "gpu_model": get_gpu_model(device_id),
+        "cu_num": torch.cuda.get_device_properties(device_id).multi_processor_count,
+    }
+
+
 @functools.lru_cache(maxsize=1)
 def _rocminfo_gpu_agents() -> list[tuple[str, int]]:
     """(arch, asicRevision) of every GPU agent rocminfo reports.
