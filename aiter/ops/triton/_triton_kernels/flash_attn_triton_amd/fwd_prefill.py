@@ -19,6 +19,7 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     is_fp8,
     remap_xcd,
 )
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 FWD_PREFILL_AUTOTUNE_KEYS = [
@@ -1861,7 +1862,7 @@ def attention_forward_prefill_triton_impl(
     arch = get_arch()
     force_masking = arch.is_rdna
 
-    num_xcd = 1 if arch.is_rdna else 8
+    num_xcd = 1 if arch.is_rdna else get_num_xcds()
 
     # Soundness precondition for the `tl.multiple_of` head-stride hint inside
     # `attn_fwd`: only enable it when every Q/K/V head-axis stride is a

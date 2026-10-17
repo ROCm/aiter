@@ -12,6 +12,7 @@ from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a16w16_quant_x impor
     _fused_gemm_a16w16_quant_x_kernel,
     _get_config,
 )
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -141,6 +142,7 @@ def fused_gemm_a16w16_quant_x(
         SKIP_REDUCE=skip_reduce,
         QUANT_BLOCK_SIZE=_QUANT_BLOCK_SIZE,
         **config,
+        NUM_XCDS=get_num_xcds(),
     )
 
     if config["NUM_KSPLIT"] > 1:
