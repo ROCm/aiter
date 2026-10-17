@@ -1702,6 +1702,7 @@ def test_swiglu_mxfp4_untagged_layout_dispatch():
         "moe_2stage: SwiGLU MXFP4 untagged-layout dispatch regression test passed"
     )
 
+
 # The MXFP8 conversion in the fused sort+quant kernel is gfx950-only.
 A8W4_SORT_QUANT_GFX = ["gfx950"]
 # Kimi-K3 A8W4 MoE: E=896, topk=16, model_dim=3584 (inter_dim 384 at TP=8,
