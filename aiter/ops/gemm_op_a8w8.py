@@ -745,6 +745,20 @@ def gemm_a8w8_bpreshuffle(
     assert WQ.dtype == dtypes.fp8, "gemm_a8w8_bpreshuffle only support fp8 now"
     assert bias is None, "gemm_a8w8_bpreshuffle does not support bias now"
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    return _gemm_a8w8_bpreshuffle_into(XQ, WQ, x_scale, w_scale, Y)
+
+
+def _gemm_a8w8_bpreshuffle_into(
+    XQ: Tensor, WQ: Tensor, x_scale: Tensor, w_scale: Tensor, Y: Tensor
+) -> Tensor:
+    """Run the tuned (or default) bpreshuffle kernel into the dense [M, N] ``Y``.
+    Shared by gemm_a8w8_bpreshuffle and gemm_a8w8_bpreshuffle_out so both pick
+    the same kernel."""
+    m = XQ.shape[0]
+    n = WQ.shape[0]
+    k = XQ.shape[-1]
+    w_k = WQ.shape[-1]
+    dtype = Y.dtype
 
     # CKTile only supports bf16 dtype
     config = get_GEMM_config_with_quant_type(
@@ -804,6 +818,108 @@ def gemm_a8w8_bpreshuffle(
             f"gemm_a8w8_bpreshuffle failed for shape M={m}, N={n}, K={k}, "
             f"{dtype=}, config={config}: {e}"
         ) from e
+
+
+# Only ``out`` is written, so it is the only argument declared mutable; the
+# default mutates_args="unknown" would mark every input as written and make
+# torch.compile copy them back. Returning nothing keeps the op free of outputs
+# that alias an input. This is a separate op because narrowing mutates_args on
+# gemm_a8w8_bpreshuffle (optional out) breaks inductor for its no-out callers.
+@torch_compile_guard(mutates_args=["out"], gen_fake=lambda *args, **kwargs: None)
+def gemm_a8w8_bpreshuffle_out(
+    out: Tensor,  # [M, N] bf16, contiguous, caller-owned
+    XQ: Tensor,  # [M, K] fp8
+    WQ: Tensor,  # [N, K_w] fp8 preshuffled, K_w >= K (as gemm_a8w8_bpreshuffle)
+    x_scale: Tensor,  # [M, 1] fp32
+    w_scale: Tensor,  # [N, 1] fp32
+) -> None:
+    """gemm_a8w8_bpreshuffle written into a caller-owned buffer.
+
+    XQ and WQ must be 2-D fp8, x_scale and w_scale fp32 with M and N elements,
+    all tensors must be on one CUDA/HIP device, and ``out`` must be a contiguous
+    bf16 [M, N] tensor. Strided XQ, WQ and scales are made contiguous before
+    dispatch, and ``out`` must not overlap the dense tensors the kernel reads;
+    a strided input may alias ``out`` because the kernel reads its copy. A
+    K-padded WQ (K_w > K) gets gemm_a8w8_bpreshuffle's padded-K handling
+    unchanged. Only bf16 is accepted: the FlyDSL 8-wave kernels, which many
+    tuned rows select, write bf16 only.
+    CK and CKTile write a dense row-major [M, N], so a strided ``out`` (e.g. a
+    column slice of a wider buffer) is rejected instead of being written past
+    its bounds. Every check runs before any kernel launch. gfx1250 is rejected:
+    its WMMA backend is reachable through the shared dispatch but unvalidated.
+    """
+    if get_gfx() == "gfx1250":
+        raise NotImplementedError(
+            "gemm_a8w8_bpreshuffle_out is not supported on gfx1250; "
+            "use gemm_a8w8_bpreshuffle"
+        )
+    # The dispatcher reads K from shape[-1] but the CK launcher reads size(1),
+    # so any other rank would tune for one K and launch with another.
+    if XQ.ndim != 2 or WQ.ndim != 2:
+        raise ValueError(
+            f"XQ and WQ must be 2-D; got XQ {tuple(XQ.shape)}, WQ {tuple(WQ.shape)}"
+        )
+    m = XQ.shape[0]
+    n = WQ.shape[0]
+    if out.dtype != dtypes.bf16:
+        raise ValueError(f"out must be bf16, got {out.dtype}")
+    # Every backend is a GPU kernel that receives raw data pointers.
+    if not XQ.is_cuda:
+        raise ValueError(f"XQ must be a CUDA/HIP tensor, got device {XQ.device}")
+    if any(t.device != XQ.device for t in (out, WQ, x_scale, w_scale)):
+        raise ValueError(
+            "out, XQ, WQ, x_scale and w_scale must be on the same device; got "
+            f"out={out.device}, XQ={XQ.device}, WQ={WQ.device}, "
+            f"x_scale={x_scale.device}, w_scale={w_scale.device}"
+        )
+    if out.shape != (m, n) or not out.is_contiguous():
+        raise ValueError(
+            f"out must be a contiguous tensor of shape {(m, n)}; got shape "
+            f"{tuple(out.shape)}, stride {tuple(out.stride())}"
+        )
+    if XQ.dtype != dtypes.fp8 or WQ.dtype != dtypes.fp8:
+        raise ValueError(
+            f"XQ and WQ must be {dtypes.fp8}; got XQ {XQ.dtype}, WQ {WQ.dtype}"
+        )
+    # Every backend reads the scales as fp32 through raw pointers.
+    for name, scale, size in (("x_scale", x_scale, m), ("w_scale", w_scale, n)):
+        if scale.dtype != dtypes.fp32 or scale.numel() != size:
+            raise ValueError(
+                f"{name} must be an fp32 tensor of {size} elements; got "
+                f"dtype {scale.dtype}, shape {tuple(scale.shape)}"
+            )
+    if WQ.shape[-1] < XQ.shape[-1]:
+        raise ValueError(
+            f"gemm_a8w8_bpreshuffle_out requires WQ K >= XQ K, got WQ K="
+            f"{WQ.shape[-1]}, XQ K={XQ.shape[-1]}"
+        )
+    # Tuned rows exist for M=0, but no launcher accepts an empty grid.
+    if out.numel() == 0:
+        return
+    # CK and CKTile take only the row stride of XQ/WQ and raw scale pointers,
+    # so strided inputs are copied; dense ones pass through untouched.
+    if not XQ.is_contiguous():
+        XQ = XQ.contiguous()
+    if not WQ.is_contiguous():
+        WQ = WQ.contiguous()
+    if x_scale.shape != (m, 1) or not x_scale.is_contiguous():
+        x_scale = x_scale.reshape(m, 1).contiguous()
+    if w_scale.shape != (n, 1) or not w_scale.is_contiguous():
+        w_scale = w_scale.reshape(n, 1).contiguous()
+    # Every operand is dense now, so [data_ptr, data_ptr + nbytes) is its exact
+    # byte range. The kernel would overwrite an input it is still reading, and
+    # the schema tells torch.compile that only out is written. A strided input
+    # that aliased out was copied above, so the kernel reads a safe snapshot.
+    out_begin, out_end = out.data_ptr(), out.data_ptr() + out.nbytes
+    for name, t in (("XQ", XQ), ("WQ", WQ), ("x_scale", x_scale), ("w_scale", w_scale)):
+        if t.data_ptr() < out_end and out_begin < t.data_ptr() + t.nbytes:
+            raise ValueError(f"out must not overlap {name}")
+    # The launchers use the current device's stream.
+    if XQ.device.index == torch.cuda.current_device():
+        _gemm_a8w8_bpreshuffle_into(XQ, WQ, x_scale, w_scale, out)
+    else:
+        with torch.cuda.device(XQ.device):
+            _gemm_a8w8_bpreshuffle_into(XQ, WQ, x_scale, w_scale, out)
 
 
 # M at or above which the triton kernel beats the untuned CK fallback, which
