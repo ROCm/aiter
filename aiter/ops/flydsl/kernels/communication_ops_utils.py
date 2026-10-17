@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith
+from flydsl.expr.rocdl import readfirstlane
 from flydsl.expr.typing import T
 
 __all__ = [
@@ -57,9 +58,23 @@ __all__ = [
     "wait_i32_until_equals",
     "wait_i32_until_greater_than",
     "wait_i64_until_equals",
+    "wait_lds_wave",
     "waitcnt_all",
     "waitcnt_stores",
+    "wave_uniform_i64",
 ]
+
+
+def wait_lds_wave():
+    # A workgroup barrier would deadlock wave-selected branches.
+    fx.rocdl.s_waitcnt(lgkmcnt=0)
+
+
+def wave_uniform_i64(addr):
+    v = fx.Uint64(addr)
+    lo = readfirstlane(T.i32, fx.Uint32(v))  # low 32 bits
+    hi = readfirstlane(T.i32, fx.Uint32(v >> 32))  # high 32 bits (unsigned shift)
+    return (fx.Uint64(hi) << 32) | fx.Uint64(lo)
 
 
 def _to_ptr_global(v, dtype=fx.Int32, alignment=4):
