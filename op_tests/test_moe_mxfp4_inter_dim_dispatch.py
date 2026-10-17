@@ -11,7 +11,11 @@ import torch
 import aiter
 import aiter.fused_moe as fused_moe_module
 from aiter import ActivationType, QuantType, dtypes
-from aiter.fused_moe import cktile_moe_stage2, get_2stage_cfgs
+from aiter.fused_moe import (
+    _mxmoe_cfg_shape_reason,
+    cktile_moe_stage2,
+    get_2stage_cfgs,
+)
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.shuffle import shuffle_scale
@@ -273,6 +277,126 @@ def test_shuffle_scale_standard_layout_initializes_padding(dtype, src_value, pad
     assert padded[0, 0].item() == src_value
     padded[0, 0] = pad_value
     assert torch.all(padded == pad_value)
+
+
+# Tuned MXMOE rows whose kernels cannot run the runtime shape. Kimi-K3 TP=8 has
+# model_dim 3584 and inter_dim 384, which only a BK=128 gemm2 contracts.
+_MXMOE_G1 = "flydsl_mxmoe_g1_a4w4_16x128x256_f16in_hpf_nt_situv2"
+_MXMOE_G1_BN256 = "flydsl_mxmoe_g1_a4w4_16x256x256_situv2"
+_MXMOE_G2_BK128 = "flydsl_mxmoe_g2_a4w4_16x256x128_atomic"
+_MXMOE_G2_BK256 = "flydsl_mxmoe_g2_a4w4_16x256x256_atomic"
+_V2_G2_K128 = "flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_atomic_sbm16"
+_V2_G2_K256 = "flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x256_atomic_sbm16"
+_V2_G2_N256 = "flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x128_atomic_sbm16"
+
+
+@pytest.mark.parametrize(
+    ("kn1", "kn2", "model_dim", "inter_dim", "reason"),
+    [
+        # Valid rows are kept.
+        (_MXMOE_G1, _MXMOE_G2_BK128, 3584, 384, None),
+        (_MXMOE_G1, _MXMOE_G2_BK256, 3584, 512, None),
+        (_MXMOE_G1, _V2_G2_K128, 3584, 384, None),
+        ("", _V2_G2_N256, 3584, 384, None),
+        # Native gemm1 (_MXMOE_G1 is BN=128, BK=256): BK must be 256, K = model_dim
+        # by BK with 2..32 K tiles, and N = 2 * inter_dim by BN.
+        (_MXMOE_G1, _MXMOE_G2_BK128, 3712, 384, "model_dim % 256"),
+        (_MXMOE_G1, "", 8448, 384, "model_dim // 256 <= 32"),
+        (_MXMOE_G1, "", 256, 384, "2 * k_wave <= model_dim // 256"),
+        ("flydsl_mxmoe_g1_a4w4_16x128x128_f16in_situv2", "", 3584, 384, "BK=128"),
+        (_MXMOE_G1, "", 3584, 320, None),
+        (_MXMOE_G1_BN256, "", 3584, 320, "2*inter_dim % 256"),
+        (_MXMOE_G1, _MXMOE_G2_BK128, 3584, 320, "inter_dim % 128"),
+        # Native gemm2: inter_dim must be a multiple of its BK, model_dim of its
+        # BN, and BN must be 256.
+        (_MXMOE_G1, _MXMOE_G2_BK256, 3584, 384, "inter_dim % 256"),
+        (_MXMOE_G1, _MXMOE_G2_BK128, 3584, 448, "inter_dim % 128"),
+        ("", _MXMOE_G2_BK128, 3584, 448, "inter_dim % 128"),
+        ("", _MXMOE_G2_BK128, 3712, 384, "model_dim % 256"),
+        ("", "flydsl_mxmoe_g2_a4w4_16x128x128_atomic", 3584, 384, "unsupported BN/BK"),
+        # Layout-v2 gemm2: K = inter_dim by tile_k and N = model_dim by tile_n,
+        # with N capped by the launcher's HIDDEN_MAX.
+        (_MXMOE_G1, _V2_G2_K256, 3584, 384, "inter_dim % 256"),
+        ("", _V2_G2_N256, 3712, 384, "model_dim % 256"),
+        ("", _V2_G2_K128, 8192, 384, None),
+        ("", _V2_G2_K128, 8448, 384, "model_dim <= 8192"),
+    ],
+)
+def test_mxmoe_cfg_shape_reason(kn1, kn2, model_dim, inter_dim, reason):
+    got = _mxmoe_cfg_shape_reason(kn1, kn2, model_dim, inter_dim)
+    if reason is None:
+        assert got is None, got
+    else:
+        assert got is not None and reason in got, got
+
+
+@_SKIP
+@pytest.mark.parametrize(
+    ("kernel_name2", "kept"),
+    [(_MXMOE_G2_BK128, True), (_MXMOE_G2_BK256, False)],
+)
+def test_stale_tuned_mxmoe_row_is_discarded(monkeypatch, kernel_name2, kept):
+    """A tuned row whose gemm2 cannot contract inter_dim falls back to the
+    default heuristics instead of failing at compile time; a valid row is kept."""
+    token, model_dim, inter_dim, experts, topk = 8, 3584, 384, 896, 16
+    key = (
+        fused_moe_module.get_gfx_runtime(),
+        fused_moe_module.get_cu_num(),
+        token,
+        model_dim,
+        inter_dim,
+        experts,
+        topk,
+        str(ActivationType.Situv2),
+        str(dtypes.bf16),
+        str(dtypes.fp4x2),
+        str(dtypes.fp4x2),
+        str(QuantType.per_1x32),
+        True,
+        False,
+    )
+    cfg = {
+        "block_m": 16,
+        "ksplit": 0,
+        "kernelName1": _MXMOE_G1,
+        "kernelName2": kernel_name2,
+        "run_1stage": False,
+    }
+    monkeypatch.setattr(fused_moe_module, "cfg_2stages", ({key: cfg}, {}))
+    warnings = []
+    monkeypatch.setattr(
+        fused_moe_module.logger,
+        "warning",
+        lambda message: warnings.append(str(message)),
+    )
+    get_2stage_cfgs.cache_clear()
+    try:
+        meta = get_2stage_cfgs(
+            token,
+            model_dim,
+            inter_dim,
+            experts,
+            topk,
+            dtypes.bf16,
+            dtypes.fp4x2,
+            dtypes.fp4x2,
+            QuantType.per_1x32,
+            True,
+            ActivationType.Situv2,
+            False,
+            0,
+            0,
+            is_shuffled=True,
+            gate_mode=GateMode.SEPARATED,
+            opus_weights_shuffled=True,
+        )
+    finally:
+        get_2stage_cfgs.cache_clear()
+
+    used = (meta.stage2.keywords or {}).get("kernelName2")
+    discarded = any("discarding tuned config" in w for w in warnings)
+    assert (used == kernel_name2) == kept, used
+    assert discarded != kept, warnings
 
 
 if __name__ == "__main__":

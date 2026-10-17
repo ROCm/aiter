@@ -97,6 +97,8 @@ def _job_key(job: dict) -> tuple:
     return (
         2,
         job["BM"],
+        job["BN"],
+        job["BK"],
         job["use_nt"],
         job["NE"],
         job["N_OUT"],
@@ -152,7 +154,6 @@ def parse_csv(csv_path):
             expert = int(row["expert"])
             inter_dim = int(row["inter_dim"])
             d_inter = ((inter_dim + 255) // 256) * 256
-            d_inter_real = inter_dim if inter_dim != d_inter else None
 
             kn1 = (row.get("kernelName1") or "").strip()
             kn2 = (row.get("kernelName2") or "").strip()
@@ -161,6 +162,13 @@ def parse_csv(csv_path):
                 v2_d_inter = inter_dim
             else:
                 v2_d_inter = d_inter
+            # Native gemm2 pads K only up to its own BK (128 or 256).
+            native_d_inter, native_d_inter_real = d_inter, None
+            if _is_mxfp4_kname(kn2):
+                native_bk = _parse_mxfp4_g2_kname(kn2)["BK"]
+                native_d_inter = -(-inter_dim // native_bk) * native_bk
+                if native_d_inter != inter_dim:
+                    native_d_inter_real = inter_dim
 
             if _is_mxfp4_kname(kn1):
                 p1 = _parse_mxfp4_g1_kname(kn1)
@@ -276,14 +284,16 @@ def parse_csv(csv_path):
                                 kn2 if mxfp4out else kn2.replace("_f4out", "")
                             ),
                             "BM": p2["BM"],
+                            "BN": p2["BN"],
+                            "BK": p2["BK"],
                             "use_nt": p2["use_nt"],
                             "NE": expert,
                             "N_OUT": model_dim,
                             "epilog": _epilog_of(
                                 p2["atomic"], mxfp4out, p2["cshuffle"]
                             ),
-                            "D_INTER": d_inter,
-                            "D_INTER_REAL": d_inter_real,
+                            "D_INTER": native_d_inter,
+                            "D_INTER_REAL": native_d_inter_real,
                             "topk": topk,  # unused by the kernel; for the entry signature
                             "xcd_swizzle": p2["xcd_swizzle"],
                         }
@@ -388,6 +398,8 @@ def _compile_stage2(job):
         flat_out_scale=_dummy() if mxfp4out else None,
         cshuffle=epilog == "nonatomic_cshuffle",
         D_INTER_REAL=job["D_INTER_REAL"],
+        BN=job["BN"],
+        BK=job["BK"],
         xcd_swizzle=job["xcd_swizzle"],
         stream=0,
     )
