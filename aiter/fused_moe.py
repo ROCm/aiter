@@ -72,11 +72,23 @@ def _get_flydsl_moe_kernels():
 BLOCK_SIZE_M = 32
 
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
-_USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
+_FLYDSL_SORTING_ENV = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING")
+_USE_FLYDSL_MOE_SORTING = (
+    _FLYDSL_SORTING_ENV == "1"
+    if _FLYDSL_SORTING_ENV is not None
+    else get_gfx_runtime() == "gfx1250"
+)
 # Adaptive sort has no shape fallback, so output_aux is limited to generated shapes.
 _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 
 AUX_SORT_OPUS = "opus"
+
+
+def _use_opus_moe_sorting() -> bool:
+    # The current Opus sorter uses wave64 DPP broadcast controls. Those
+    # instructions are rejected by the gfx1250 wave32 assembler, while the CK
+    # sorter already supports this contract.
+    return not _USE_CK_MOE_SORTING and get_gfx_runtime() != "gfx1250"
 
 
 def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
@@ -809,7 +821,7 @@ def moe_sorting(
             expert_mask,
             num_local_tokens,
             dispatch_policy,
-            use_opus=not _USE_CK_MOE_SORTING,
+            use_opus=_use_opus_moe_sorting(),
             return_local_topk_ids=return_local_topk_ids,
             accumulate=accumulate,
             output_aux=output_aux,
