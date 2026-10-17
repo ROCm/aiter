@@ -115,6 +115,7 @@ def diagnose_launches(
         v_descale=vs,
         per_token_kv_scales=mode == "token",
     )
+    partial_reference = None
     for block_m, warps in ((max(16, ratio), 2), (max(128, ratio), 4)):
         for splits in (1, 8):
             label = f"explicit-M{block_m}-split{splits}"
@@ -148,6 +149,24 @@ def diagnose_launches(
                     ua._unified_attention_3d_triton(
                         p, so, sm, se, splits, page, config=cfg
                     )
+                    if partial_reference is None:
+                        partial_reference = (so.clone(), sm.clone(), se.clone())
+                    else:
+                        begin = 0
+                        for qlen, klen in zip(q_lens, k_lens):
+                            tiles = math.ceil(klen / (splits * page))
+                            active = math.ceil(klen / (tiles * page))
+                            for name, actual, ref in zip(
+                                ("acc", "max", "sum"), (so, sm, se), partial_reference
+                            ):
+                                a = actual[begin : begin + qlen, :, :active]
+                                b = ref[begin : begin + qlen, :, :active]
+                                finite = torch.isfinite(a) & torch.isfinite(b)
+                                print(
+                                    f"[paged-prefill-partial] variant={label} range={begin}:{begin+qlen} tensor={name} nonfinite={int((~torch.isfinite(a)).sum())} ref_nonfinite={int((~torch.isfinite(b)).sum())} max_finite_error={float((a-b).abs()[finite].max()) if finite.any() else None}",
+                                    flush=True,
+                                )
+                            begin += qlen
                     ua._reduce_segments_triton(p, so, sm, se, splits, page)
                 torch.cuda.synchronize()
                 report_output(label, out, expected, q_lens)

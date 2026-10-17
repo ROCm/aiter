@@ -345,7 +345,7 @@ def kernel_unified_attention_2d(
                 other=0.0,
                 cache_modifier=KV_cache_modifier,
             )
-            K = K_load if PER_TOKEN_KV_SCALES else K_load.to(Q.dtype)
+            K = K_load.to(Q.dtype)
 
             V_load = tl.load(
                 value_cache_ptr + v_offset,
@@ -353,7 +353,7 @@ def kernel_unified_attention_2d(
                 other=0.0,
                 cache_modifier=KV_cache_modifier,
             )
-            V = V_load if PER_TOKEN_KV_SCALES else V_load.to(Q.dtype)
+            V = V_load.to(Q.dtype)
 
             S = qk_scale * tl.dot(Q, K)
 
@@ -441,7 +441,7 @@ def kernel_unified_attention_2d(
             cache_modifier=KV_cache_modifier,
         )
 
-        K = K_load if PER_TOKEN_KV_SCALES else K_load.to(Q.dtype)
+        K = K_load.to(Q.dtype)
         if SHUFFLED_KV_CACHE:
             K = (
                 K.reshape(
@@ -462,7 +462,7 @@ def kernel_unified_attention_2d(
             cache_modifier=KV_cache_modifier,
         )
 
-        V = V_load if PER_TOKEN_KV_SCALES else V_load.to(Q.dtype)
+        V = V_load.to(Q.dtype)
         if SHUFFLED_KV_CACHE and V_CACHE_NHD:
             V = V.reshape(HEAD_SIZE_PADDED, TILE_SIZE).trans(1, 0)
         elif SHUFFLED_KV_CACHE:
@@ -899,7 +899,7 @@ def kernel_unified_attention_3d(
             cache_modifier=KV_cache_modifier,
         )
 
-        K = K_load if PER_TOKEN_KV_SCALES else K_load.to(Q.dtype)
+        K = K_load.to(Q.dtype)
         if SHUFFLED_KV_CACHE:
             K = (
                 K.reshape(
@@ -920,7 +920,7 @@ def kernel_unified_attention_3d(
             cache_modifier=KV_cache_modifier,
         )
 
-        V = V_load if PER_TOKEN_KV_SCALES else V_load.to(Q.dtype)
+        V = V_load.to(Q.dtype)
         if SHUFFLED_KV_CACHE and V_CACHE_NHD:
             V = V.reshape(HEAD_SIZE_PADDED, TILE_SIZE).trans(1, 0)
         elif SHUFFLED_KV_CACHE:
