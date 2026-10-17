@@ -4,6 +4,9 @@
 import torch
 import triton
 
+from aiter.ops.triton._gluon_kernels.gfx1250.normalization.rmsnorm import (
+    _gluon_rms_norm_kernel,
+)
 from aiter.ops.triton._triton_kernels.normalization.rmsnorm import (
     _fused_add_rmsnorm_kernel,
     _quant_fused_add_rmsnorm_kernel,
@@ -68,34 +71,82 @@ def num_programs_fwd(x):
         return num_programs(x)
 
 
-def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
+def _rmsnorm_forward(
+    x: torch.Tensor, weight: torch.Tensor, epsilon: float, backend: str | None = None
+):
 
     n_rows, n_cols = x.shape
 
     y = torch.empty_like(x)
     rsigma = torch.empty((n_rows,), dtype=torch.float32, device=x.device)
 
+    # check for gfx1250 hardware
+    if backend is None:
+        backend = "gluon" if get_arch() == "gfx1250" else "triton"
     blk_size = block_size(x)
     USE_BLOCKED = use_blocked(x)
     NUM_PRGMS = num_programs_fwd(x)
 
-    grid = lambda meta: (NUM_PRGMS,)
-    _rms_norm_kernel[grid](
-        x,
-        y,
-        weight,
-        rsigma,
-        x.stride(0),
-        y.stride(0),
-        n_rows,
-        n_cols,
-        epsilon,
-        blk_size,
-        USE_BLOCKED,
-        NUM_PRGMS,
-    )
+    backend = backend.lower()
+    assert backend in (
+        "triton",
+        "gluon",
+    ), f"Invalid backend: {backend}, must be 'triton' or 'gluon'"
 
-    return y, rsigma
+    if backend == "gluon":
+        if get_arch() == "gfx1250":
+
+            MAX_FUSED_SIZE = 32768 // x.element_size()
+            BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(n_cols))
+            USE_BLOCK = n_cols > BLOCK_SIZE
+            NUM_PROG = min(n_rows, get_num_sms())
+            NUM_WARPS = 4
+
+            grid = (NUM_PROG,)
+            _gluon_rms_norm_kernel[grid](
+                x,
+                y,
+                weight,
+                rsigma,
+                n_rows,
+                n_cols,
+                epsilon,
+                x.stride(0),
+                y.stride(0),
+                BLOCK_SIZE,
+                USE_BLOCK,
+                NUM_PROG,
+                num_warps=NUM_WARPS,
+            )
+            return y, rsigma
+        else:
+            _LOGGER.warning(
+                f"Gluon backend is not supported on {get_arch()}, using triton backend instead"
+            )
+            backend = "triton"
+
+    if backend == "triton":
+        blk_size = block_size(x)
+        USE_BLOCKED = use_blocked(x)
+        NUM_PRGMS = num_programs(x)
+
+        grid = lambda meta: (NUM_PRGMS,)
+        _rms_norm_kernel[grid](
+            x,
+            y,
+            weight,
+            rsigma,
+            x.stride(0),
+            y.stride(0),
+            n_rows,
+            n_cols,
+            epsilon,
+            blk_size,
+            USE_BLOCKED,
+            NUM_PRGMS,
+        )
+
+        return y, rsigma
 
 
 def _rmsnorm_forward_with_add(
@@ -271,7 +322,7 @@ def rmsnorm_forward_inference(x: torch.Tensor, weight: torch.Tensor, eps: float)
 class _RMSNorm(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, x, weight, epsilon, is_grad_enabled):
+    def forward(ctx, x, weight, epsilon, is_grad_enabled, backend: str | None = None):
 
         is_grad = is_grad_enabled and any(
             tensor.requires_grad for tensor in [x, weight]
@@ -287,8 +338,7 @@ class _RMSNorm(torch.autograd.Function):
                 y = out
                 rsigma = None
         else:
-            y, rsigma = _rmsnorm_forward(x, weight, epsilon)
-
+            y, rsigma = _rmsnorm_forward(x, weight, epsilon, backend)
         if is_grad:
             ctx.save_for_backward(x, weight, rsigma)
 
@@ -300,7 +350,7 @@ class _RMSNorm(torch.autograd.Function):
 
         dx, dg = _rmsnorm_backward(grad_output, x, weight, rsigma)
 
-        return dx, dg, None, None
+        return dx, dg, None, None, None
 
 
 class _RMSNorm2dFwdWithAdd(torch.autograd.Function):
@@ -331,7 +381,12 @@ class _RMSNorm2dFwdWithAdd(torch.autograd.Function):
         return None, dx, None, None, dg, None, None
 
 
-def rms_norm(input: torch.Tensor, weight: torch.Tensor, epsilon: float):
+def rms_norm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    backend: str | None = None,
+):
     """
     Applies Root Mean Square Layer Normalization over a mini-batch of inputs.
 
@@ -343,10 +398,8 @@ def rms_norm(input: torch.Tensor, weight: torch.Tensor, epsilon: float):
     Returns:
     - Output: The output tensor with shape (M, N).
     """
-    _LOGGER.info(
-        "RMSNORM: input=%s weight=%s ", tuple(input.shape), tuple(weight.shape)
-    )
-    return _RMSNorm.apply(input, weight, epsilon, torch.is_grad_enabled())
+    _LOGGER.info(f"RMSNORM: input={tuple(input.shape)} weight={tuple(weight.shape)} ")
+    return _RMSNorm.apply(input, weight, epsilon, torch.is_grad_enabled(), backend)
 
 
 def rmsnorm2d_fwd_with_add(
