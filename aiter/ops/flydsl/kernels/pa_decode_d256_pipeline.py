@@ -57,9 +57,10 @@ def compile_pa_decode_d256_pipeline(
 ):
     """Compile the gfx950 QL1-4/GQA8 specialization with token-major V.
 
-    K is [pages, heads, 16, 16, 16]; V is [pages, heads, 16, 256].
+    For page size B=16 or 64, K is [pages, heads, 16, B, 16] and
+    V is [pages, heads, B, 256].
     K/V scales are device-resident FP32 scalars or contiguous per-token
-    arrays [pages, heads, 16, 1]; K/V scale strides must match. QL1/2
+    arrays [pages, heads, B, 1]; K/V scale strides must match. QL1/2
     automatically share one query group across two D128 output slices. The launch ABI
     matches the general tile kernel, but the V layout does not.
     """
@@ -67,13 +68,13 @@ def compile_pa_decode_d256_pipeline(
         kwargs["head_dim"] == 256
         and kwargs["query_group_size"] == 8
         and (kwargs["query_length"] in (1, 2, 3, 4))
-        and (kwargs["block_size"] == 16)
+        and (kwargs["block_size"] in (16, 64))
         and (kwargs["kv_dtype"] == "fp8")
         and (kwargs["query_dtype"] == "bf16")
         and (kwargs["sliding_window"] == 0)
     ):
         raise NotImplementedError(
-            "wave-local D256 PA requires QL1-4/GQA8/page16 FP8 KV"
+            "wave-local D256 PA requires QL1-4/GQA8/page16 or page64 FP8 KV"
         )
     if get_gfx_runtime() != "gfx950":
         raise NotImplementedError("wave-local D256 PA requires gfx950")
@@ -97,6 +98,8 @@ def compile_pa_decode_d256_pipeline(
     if cache_modifier not in (0, 2):
         raise ValueError("cache_modifier must be 0 (default) or 2 (non-temporal)")
     query_length = kwargs["query_length"]
+    block_size = kwargs["block_size"]
+    segments_per_page = block_size // 16
     query_rows = query_length * 8
     per_token_kv = kwargs["per_token_kv"]
     if per_token_kv and head_splits != 1:
@@ -108,6 +111,7 @@ def compile_pa_decode_d256_pipeline(
     key = (
         scale,
         query_length,
+        block_size,
         num_buffers,
         waves_per_eu,
         tile_tokens,
@@ -173,7 +177,7 @@ def compile_pa_decode_d256_pipeline(
         if start < end:
             seq, context = (fx.Int32(task[0]), fx.Int32(task[3]))
             end = fx.min(end, (context + tile_tokens - 1) // tile_tokens)
-            pages = (context + 15) // 16
+            pages = (context + block_size - 1) // block_size
             smem = fx.SharedAllocator().allocate(Storage).peek()
             base = fx.recast_iter(fx.Uint8, smem.buf.ptr)
 
@@ -263,33 +267,43 @@ def compile_pa_decode_d256_pipeline(
                 )
 
             def load_page(tt):
-                page = fx.Int32(fx.rocdl.readfirstlane(T.i32, wave % 4))
-                idx = seq * table_stride + fx.min(tt * 4 + page, pages - 1)
+                segment = fx.Int32(fx.rocdl.readfirstlane(T.i32, wave % 4))
+                page_idx = (tt * 4 + segment) // segments_per_page
+                idx = seq * table_stride + fx.min(page_idx, pages - 1)
                 return fx.Int32(buf_load_scalar(table_rsrc, idx, dwords=1))
 
             def dma(tt, slot, physical=None, copy_k=True, copy_v=True):
-                page = fx.Int32(fx.rocdl.readfirstlane(T.i32, wave % 4))
+                segment = fx.Int32(fx.rocdl.readfirstlane(T.i32, wave % 4))
                 sub = wave // 4
-                page_idx = tt * 4 + page
+                page_idx = (tt * 4 + segment) // segments_per_page
+                token_offset = segment % segments_per_page * 16
                 if physical is None:
                     physical = load_page(tt)
-                page_bytes = (fx.Int64(physical) * kv_heads + kv_head) * 4096
+                page_bytes = (
+                    (fx.Int64(physical) * kv_heads + kv_head) * block_size * 256
+                )
                 kpage = buffer_ops.create_buffer_resource_from_addr(
                     buf_base_i64(key_ptr) + page_bytes
                 )
-                live = fx.min(fx.max(context - page_idx * 16, 0), 16)
+                live = fx.min(fx.max(context - page_idx * block_size, 0), block_size)
                 vpage = buffer_ops.create_buffer_resource_from_addr(
                     buf_base_i64(value_ptr) + page_bytes,
                     num_records_bytes=fx.Int32(
                         fx.rocdl.readfirstlane(T.i32, live * 256)
                     ),
                 )
-                # Each page-owning wave copies its 16 FP32 K/V scales to LDS.
+                # Each wave copies a 16-token segment. Page64's four segments
+                # share a physical page; the LDS ring layout stays unchanged.
                 # The scale arrays share block/head strides and token stride 1.
                 if fx.const_expr(per_token_kv and copy_k):  # noqa: SIM102
                     if lane < 16:
-                        scale_idx = physical * ks_block + kv_head * ks_head + lane
-                        scale_dest = slot * slot_bytes + scale_offset + page * 64
+                        scale_idx = (
+                            physical * ks_block
+                            + kv_head * ks_head
+                            + token_offset
+                            + lane
+                        )
+                        scale_dest = slot * slot_bytes + scale_offset + segment * 64
                         async_dma(ks_rsrc, scale_idx * 4, scale_dest, byte_count=4)
                         async_dma(
                             vs_rsrc, scale_idx * 4, scale_dest + 256, byte_count=4
@@ -298,17 +312,19 @@ def compile_pa_decode_d256_pipeline(
                     unit = sub * 64 + lane + i * (waves // 4) * 64
                     kh, kt = (unit // 16, unit % 16)
                     src_kt = kt ^ kh % k_swizzle
-                    dest = page * 4096 + (sub + i * (waves // 4)) * 1024
+                    dest = segment * 4096 + (sub + i * (waves // 4)) * 1024
                     if fx.const_expr(copy_k):
                         async_dma(
-                            kpage, kh * 256 + src_kt * 16, slot * slot_bytes + dest
+                            kpage,
+                            kh * block_size * 16 + (token_offset + src_kt) * 16,
+                            slot * slot_bytes + dest,
                         )
                     if fx.const_expr(copy_v):
                         token, band = (unit // 16, unit % 16)
-                        src_band = band ^ token % 8 ^ page % 2 * 8
+                        src_band = band ^ token % 8 ^ segment % 2 * 8
                         async_dma(
                             vpage,
-                            token * 256 + src_band * 16,
+                            (token_offset + token) * 256 + src_band * 16,
                             slot * slot_bytes + k_bytes + dest,
                         )
 
