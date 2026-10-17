@@ -415,10 +415,10 @@ def unified_attention(
 
     # Use the launch tile, not the provisional BLOCK_M=16 above. Configured
     # prefill tiles can cover eight times as many queries per workgroup.
+    triton_2d_config = None
     if not is_2d_gluon_available(params, backend):
-        params = _with_triton_program_count(
-            params, _triton_attention_config(params, "attn_2d")
-        )
+        triton_2d_config = _triton_attention_config(params, "attn_2d")
+        params = _with_triton_program_count(params, triton_2d_config)
 
     # if batch contains a prefill
     if use_2d_kernel(params, backend):
@@ -433,22 +433,28 @@ def unified_attention(
             else:
                 assert False, f"No gluon subwrapper for {DEVICE_ARCH}"
         else:
-            _unified_attention_2d_triton(params)
+            _unified_attention_2d_triton(params, config=triton_2d_config)
     else:
         use_gluon_3d = is_3d_gluon_available(params, backend)
+        triton_3d_config = None
         if not use_gluon_3d:
             # Segment count must use the tile of the split kernel as well.
-            params = _with_triton_program_count(
-                params, _triton_attention_config(params, "attn_3d")
-            )
+            triton_3d_config = _triton_attention_config(params, "attn_3d")
+            params = _with_triton_program_count(params, triton_3d_config)
         config = get_unified_attention_config(
             "kv_split", params, backend="gluon" if use_gluon_3d else "triton"
         )
         if not use_gluon_3d and _use_gfx950_scaled_prefill_config(params):
-            # Long contexts benefit from more than a single occupancy wave.
-            # Bound both scratch space and empty splits for short contexts.
+            # Use the actual M64 query grid to fill four workgroup waves.
+            # Long KV loops still benefit from a floor of 16; the cap bounds
+            # scratch space and the page limit avoids excessive empty splits.
+            occupancy_splits = triton.next_power_of_2(
+                triton.cdiv(params.target_num_prgms, max(1, params.num_2d_prgms))
+            )
             config["NUM_SEGMENTS"] = min(
-                16, triton.next_power_of_2(triton.cdiv(max_seqlen_k, block_size))
+                64,
+                max(16, occupancy_splits),
+                triton.next_power_of_2(triton.cdiv(max_seqlen_k, block_size)),
             )
         NUM_SEGMENTS = config["NUM_SEGMENTS"]
         # The triton kernels read a shuffled tile as one contiguous page, so
@@ -516,6 +522,7 @@ def unified_attention(
                 segm_expsum,
                 NUM_SEGMENTS,
                 TILE_SIZE,
+                config=triton_3d_config,
             )
 
         if NUM_SEGMENTS == 1:
