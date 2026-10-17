@@ -1,11 +1,8 @@
 name: Stale pull requests
 
-# Labels a pull request `stale` after 15 days without activity. Nothing is
-# closed. Issues are out of scope.
-
 on:
   schedule:
-    - cron: '30 1 * * *'
+    - cron: '0 1 * * *'
   workflow_dispatch:
 
 permissions:
@@ -20,18 +17,67 @@ jobs:
   stale:
     runs-on: ubuntu-latest
     steps:
+      # actions/stale cannot read reviews: mirror "approved by someone with
+      # write access" into the `approved` label, which it exempts.
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
+        with:
+          script: |
+            const label = 'approved';
+            await github.rest.issues
+              .createLabel({
+                ...context.repo,
+                name: label,
+                color: '0e8a16',
+                description: 'Has an approving review; never closed as stale',
+              })
+              .catch((e) => {
+                if (e.status !== 422) throw e; // 422: the label exists
+              });
+            const query = `query ($owner: String!, $repo: String!, $cursor: String) {
+              repository(owner: $owner, name: $repo) {
+                pullRequests(states: OPEN, first: 100, after: $cursor) {
+                  pageInfo { hasNextPage endCursor }
+                  nodes {
+                    number
+                    latestOpinionatedReviews(first: 50, writersOnly: true) {
+                      nodes { state }
+                    }
+                    labels(first: 100) { nodes { name } }
+                  }
+                }
+              }
+            }`;
+            let cursor = null;
+            do {
+              const { repository } = await github.graphql(query, { ...context.repo, cursor });
+              const { nodes, pageInfo } = repository.pullRequests;
+              for (const pr of nodes) {
+                const approved = pr.latestOpinionatedReviews.nodes.some((r) => r.state === 'APPROVED');
+                const labeled = pr.labels.nodes.some((l) => l.name === label);
+                const issue = { ...context.repo, issue_number: pr.number };
+                if (approved && !labeled) {
+                  await github.rest.issues.addLabels({ ...issue, labels: [label] });
+                } else if (!approved && labeled) {
+                  await github.rest.issues.removeLabel({ ...issue, name: label });
+                }
+              }
+              cursor = pageInfo.hasNextPage ? pageInfo.endCursor : null;
+            } while (cursor);
       - uses: actions/stale@1e223db275d687790206a7acac4d1a11bd6fe629  # v10.4.0
         with:
           days-before-pr-stale: 15
-          # -1 never closes; unset would fall back to the action's 7-day default.
-          days-before-pr-close: -1
-          days-before-issue-stale: -1
-          days-before-issue-close: -1
+          days-before-pr-close: 30
+          days-before-issue-stale: 30
+          days-before-issue-close: 7
           stale-pr-label: stale
-          exempt-pr-labels: 'do-not-close'
+          exempt-pr-labels: 'do-not-close,approved'
           exempt-draft-pr: true
-          operations-per-run: 300
+          operations-per-run: 30
           stale-pr-message: >
             No activity for 15 days, so this is now labelled `stale`. A push or
-            a comment clears it; `keep-open` exempts it. Nothing is closed
-            automatically.
+            a comment clears it; without one it closes in 30 days. Drafts,
+            approved PRs and `do-not-close` are never closed.
+          close-pr-message: 'Closing this PR due to continued inactivity. Please reopen as and when required'
+          stale-issue-message: 'This issue is stale because it has been open 30 days with no activity. Remove the stale label or comment, or this will be closed in 7 days.'
+          close-issue-message: 'Closing this issue after 7 days of inactivity since it was marked stale.'
+
