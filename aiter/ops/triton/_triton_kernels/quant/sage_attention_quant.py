@@ -7,9 +7,35 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 _mha_v4_per_tensor_amax_repr = make_kernel_repr(
     "mha_v4_per_tensor_amax_kernel",
     [
+        "STRIDED",
         "BLOCK_SIZE",
     ],
 )
+
+
+@triton.jit
+def _mha_v4_per_tensor_input_offsets(
+    offsets,
+    head_dim,
+    heads,
+    sequence,
+    stride_b,
+    stride_s,
+    stride_h,
+    STRIDED: tl.constexpr,
+):
+    """Map logical BSHD element indices to input offsets; only the last dimension must be dense."""
+    if STRIDED:
+        offsets = offsets.to(tl.int64)
+        row = offsets // head_dim
+        token_flat = row // heads
+        return (
+            (token_flat // sequence) * stride_b
+            + (token_flat % sequence) * stride_s
+            + (row % heads) * stride_h
+            + offsets % head_dim
+        )
+    return offsets
 
 
 @triton.jit(repr=_mha_v4_per_tensor_amax_repr)
@@ -17,11 +43,21 @@ def mha_v4_per_tensor_amax_kernel(
     input_ptr,
     partial_ptr,
     numel,
+    head_dim,
+    heads,
+    sequence,
+    stride_b,
+    stride_s,
+    stride_h,
+    STRIDED: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     block = tl.program_id(0)
     offsets = block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    values = tl.load(input_ptr + offsets, mask=offsets < numel, other=0.0).to(
+    input_offsets = _mha_v4_per_tensor_input_offsets(
+        offsets, head_dim, heads, sequence, stride_b, stride_s, stride_h, STRIDED
+    )
+    values = tl.load(input_ptr + input_offsets, mask=offsets < numel, other=0.0).to(
         tl.float32
     )
     tl.store(partial_ptr + block, tl.max(tl.abs(values), axis=0))
@@ -55,6 +91,7 @@ _mha_v4_per_tensor_quant_repr = make_kernel_repr(
     "mha_v4_per_tensor_quant_kernel",
     [
         "IS_INT8",
+        "STRIDED",
         "BLOCK_SIZE",
     ],
 )
@@ -66,13 +103,23 @@ def mha_v4_per_tensor_quant_kernel(
     output_ptr,
     scale_ptr,
     numel,
+    head_dim,
+    heads,
+    sequence,
+    stride_b,
+    stride_s,
+    stride_h,
     IS_INT8: tl.constexpr,
+    STRIDED: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     block = tl.program_id(0)
     offsets = block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < numel
-    values = tl.load(input_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    input_offsets = _mha_v4_per_tensor_input_offsets(
+        offsets, head_dim, heads, sequence, stride_b, stride_s, stride_h, STRIDED
+    )
+    values = tl.load(input_ptr + input_offsets, mask=mask, other=0.0).to(tl.float32)
     scale = tl.load(scale_ptr)
     if IS_INT8:
         quantized = values / scale
