@@ -79,7 +79,7 @@ gemm_a16w16_persistent_4g_safe_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
     using D_ACC = typename T::D_ACC;
 
     // ── XCD-local N-fast swizzle ────────────────────────────────────────
-    // Default round-robin XCD assignment (fid % 8 == xcd_id) would put 4
+    // Default round-robin XCD assignment (fid % NUM_XCD == xcd_id) would put 4
     // consecutive WGs on the same XCD but each touching a different
     // m_grp + same tile_n; the per-XCD A working set then balloons to
     // (4 m_grp × m_per_wg × A_tile) which exceeds L2 capacity on M=32K

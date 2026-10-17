@@ -110,7 +110,8 @@ def _emit_bf16_manifest_header() -> str:
         for idx, inst in enumerate(bf16_kernels):
             suffix = " \\\n" if idx != len(bf16_kernels) - 1 else "\n"
             lines.append(
-                f"    case {inst.kid}: return &{inst.launcher}<{inst.trait}>;" + suffix
+                f"    case {inst.kid}: return &{inst.launcher}<{inst.trait}<{build_num_xcd()}>>;"
+                + suffix
             )
     lines.append("\n")
 
@@ -136,6 +137,14 @@ def _cpp_name_suffix(name: str) -> str:
     )
 
 
+def build_num_xcd() -> int:
+    try:
+        from aiter.jit.utils.build_targets import build_num_xcds
+    except ImportError:
+        return 8  # Standalone codegen without aiter.
+    return build_num_xcds("gfx950")
+
+
 def _stage2_a8w4_traits_alias(kid: int) -> str:
     return f"OpusMoeStage2A8W4DecodeKid{int(kid)}Traits"
 
@@ -152,7 +161,8 @@ def _stage2_a8w4_traits_type(inst) -> str:
         f"{inst.cachectl_b}, "
         f"{inst.cachectl_wscale}, "
         f"{inst.pair_slots}, "
-        f"{inst.steady_pair_slots}"
+        f"{inst.steady_pair_slots}, "
+        f"{build_num_xcd()}"
         ">"
     )
 
@@ -598,7 +608,7 @@ class OpusMoeDeviceCodegen:
             lines.extend(
                 [
                     "template __global__ void opus_moe_stage2_gemmstyle_kernel_gfx950<",
-                    f"{inst.trait}>(opus_moe_stage2_bf16_kargs);\n",
+                    f"{inst.trait}<{build_num_xcd()}>>(opus_moe_stage2_bf16_kargs);\n",
                 ]
             )
         (self.instances_path / "opus_moe_stage2_bf16.device.cu").write_text(

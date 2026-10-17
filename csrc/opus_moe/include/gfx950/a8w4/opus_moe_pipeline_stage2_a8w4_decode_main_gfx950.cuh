@@ -36,19 +36,20 @@ inline __device__ void opus_moe_stage2_a8w4_decode_tile_ids(int wgid,
             if(wgid >= limit)
             {
                 const int full_groups = limit / tiles_per_group;
-                const int covered_cols = (limit - full_groups * tiles_per_group) / W;
+                const int covered_in_partial = limit - full_groups * tiles_per_group;
                 const int partial_first_row = full_groups * W;
                 int partial_row_extent = num_tiles_m - partial_first_row;
                 if(partial_row_extent > W)
                     partial_row_extent = W;
                 const int tail = wgid - limit;
                 const int partial_tiles =
-                    (partial_row_extent > 0) ? (num_tiles_n - covered_cols) * partial_row_extent
+                    (partial_row_extent > 0) ? partial_row_extent * num_tiles_n - covered_in_partial
                                              : 0;
                 if(tail < partial_tiles)
                 {
-                    tile_m_id = partial_first_row + (tail % partial_row_extent);
-                    tile_n_id = covered_cols + (tail / partial_row_extent);
+                    const int idx = covered_in_partial + tail;
+                    tile_m_id = partial_first_row + (idx % partial_row_extent);
+                    tile_n_id = idx / partial_row_extent;
                     return;
                 }
                 const int rest = tail - partial_tiles;
