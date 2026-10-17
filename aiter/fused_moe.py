@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import math
 import os
 import re
 from collections.abc import Callable
@@ -3346,6 +3347,80 @@ def _can_reroute_mxfp4_to_flydsl(
     )
 
 
+def _swiglu_limit_is_active(swiglu_limit) -> bool:
+    """True only for a finite positive clamp bound.
+
+    ``None``, ``0.0``, and ``+inf`` are not active. That matches
+    ``runtime_swiglu_limit`` and vLLM's ROCm adapter, which forwards ``0.0``
+    when the config limit is unset.
+    """
+    if swiglu_limit is None:
+        return False
+    try:
+        value = float(swiglu_limit)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(value) and value > 0.0
+
+
+def _force_a16wmix_bf16() -> bool:
+    """Debug override: select a16w16 even when the limit is a no-clamp sentinel.
+
+    Used to time the same kernel with and without a binding clamp. Not a
+    production switch — sentinels otherwise keep the pre-patch CK / 1-stage path.
+    """
+    return os.environ.get("AITER_FORCE_A16WMIX_BF16", "0") == "1"
+
+
+# a16wmix gemm1 clamps SwiGLU natively and SiLU via clamp_gate_up then
+# silu_mul_batch (the shared helper stays unclamped for mixed_moe).
+_A16WMIX_BF16_ACTIVATIONS = (ActivationType.Silu, ActivationType.Swiglu)
+
+
+def _can_reroute_bf16_to_a16wmix(
+    *,
+    model_dim,
+    inter_dim,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    q_type,
+    activation,
+    is_shuffled,
+    use_g1u1,
+    doweight_stage1,
+    swiglu_limit,
+    has_stage1_bias,
+    hidden_pad,
+    intermediate_pad,
+):
+    """Whether untuned/CK BF16 QuantType.No can take the a16wmix a16w16 port.
+
+    Inactive sentinels (None / 0.0 / +inf) keep the pre-patch CK / 1-stage path
+    so those outputs stay bit-identical, unless ``AITER_FORCE_A16WMIX_BF16=1``.
+    Weights must be preshuffled; a16wmix consumes shuffle_weight (16,16).
+    """
+    if not (
+        dtype == dtypes.bf16
+        and q_type == QuantType.No
+        and q_dtype_a == dtypes.bf16
+        and q_dtype_w == dtypes.bf16
+        and activation in _A16WMIX_BF16_ACTIVATIONS
+        and use_g1u1
+        and is_shuffled
+        and not doweight_stage1
+        and not has_stage1_bias
+        and not hidden_pad
+        and not intermediate_pad
+        and model_dim % 128 == 0
+        and inter_dim % 128 == 0
+    ):
+        return False
+    if _force_a16wmix_bf16():
+        return True
+    return _swiglu_limit_is_active(swiglu_limit)
+
+
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
@@ -3936,10 +4011,30 @@ def get_2stage_cfgs(
     ):
         kernelName2 = kernelName2.replace("_afp4_", "_afp8_", 1)
 
-    tag = f"({kernelName1=}, {kernelName2=})"
-    logger.info(
-        f"[fused_moe] using {'1stage' if run_1stage else '2stage'}{' xbf16' if run_1stage_xbf16 else ''} {'default' if cfg is None else tag} for {keys} "
-    )
+    reroute_a16wmix_bf16 = _can_reroute_bf16_to_a16wmix(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        dtype=dtype,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w,
+        q_type=q_type,
+        activation=activation,
+        is_shuffled=bool(weights_shuffled),
+        use_g1u1=use_g1u1,
+        doweight_stage1=doweight_stage1,
+        swiglu_limit=swiglu_limit,
+        has_stage1_bias=has_stage1_bias,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+    ) and not (isinstance(kernelName1, str) and kernelName1.startswith("flydsl_"))
+
+    # The a16wmix reroute below logs its own kernel names; this line would name
+    # the CK/1-stage choice it is about to discard.
+    if not reroute_a16wmix_bf16:
+        tag = f"({kernelName1=}, {kernelName2=})"
+        logger.info(
+            f"[fused_moe] using {'1stage' if run_1stage else '2stage'}{' xbf16' if run_1stage_xbf16 else ''} {'default' if cfg is None else tag} for {keys} "
+        )
 
     def get_block_m() -> int:
         if q_dtype_a == dtypes.fp8:
@@ -3958,6 +4053,44 @@ def get_2stage_cfgs(
             ksplit,
             has_stage1_bias=has_stage1_bias,
             has_stage2_bias=has_stage2_bias,
+        )
+
+    if reroute_a16wmix_bf16:
+        # Untuned a16w16 fallback (and override of a CK/asm tuned row) when a
+        # finite swiglu_limit is configured, or when AITER_FORCE_A16WMIX_BF16=1.
+        # Tiles belong in the CSV; this is the shape-safe default until a tuner
+        # row exists. block_m MUST equal tile_m -- it sizes both moe_sorting
+        # and the gemm tile.
+        from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
+
+        _out_str = "bf16"
+        _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
+        _tile_n = _tile_k = 128
+        kn1 = flydsl_kernel_name(1, "bf16", "bf16", _out_str, _tile_m, _tile_n, _tile_k)
+        kn2 = flydsl_kernel_name(
+            2, "bf16", "bf16", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
+        )
+        logger.warning(
+            f"[fused_moe] no FlyDSL a16w16 config for {keys}, "
+            f"using untuned fallback ({kn1=}, {kn2=})"
+        )
+        return MOEMetadata(
+            functools.partial(
+                _flydsl_stage1_wrapper,
+                kernelName=kn1,
+                activation=activation,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            functools.partial(
+                _flydsl_stage2_wrapper,
+                kernelName=kn2,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            _tile_m,
+            0,
+            False,
         )
 
     if run_1stage:
@@ -4955,6 +5088,13 @@ def fused_moe_2stages(
             a2_scale = a1_scale
     elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
         # a16wi4: stage1 output is bf16, no inter-stage quantization
+        a2_scale = None
+    elif (
+        quant_type == QuantType.No
+        and stage1_func is _flydsl_stage1_wrapper
+        and w1.dtype == dtypes.bf16
+    ):
+        # a16w16: stage1 returns bf16 [sorted_size, inter_dim]; no inter-stage quant
         a2_scale = None
     elif quant_type == QuantType.per_1x32:
         a2 = a2.view(-1, inter_dim)
