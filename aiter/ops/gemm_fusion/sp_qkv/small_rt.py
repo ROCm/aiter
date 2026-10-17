@@ -34,7 +34,7 @@ def load_driver(path: str):
     vp, u32, u64, i32 = C.c_void_p, C.c_uint32, C.c_uint64, C.c_int32
     sig = [
         ("sm_attach_v1", [u32, vp, vp, vp, vp, vp, C.c_char_p, C.c_char_p, C.POINTER(vp)]),
-        ("sm_bind_new_v1", [vp, vp, C.POINTER(vp)]), ("sm_launch_blk_v1", [vp, vp, vp, vp, vp]),
+        ("sm_bind_new_v1", [vp, vp, C.POINTER(vp)]), ("sm_launch_blk_v1", [vp, vp, vp, vp, u32, vp]),
         ("sm_blk_free_v1", [vp]), ("sm_free_v1", [vp]), ("sm_poison_fast_v1", [vp, vp, C.POINTER(u32)]), ("sm_info_v1", [vp]), ("sm_poison_v1", [vp, vp]), ("sm_last_hip_error_v1", [vp]),
     ]
     for n, a in sig:
@@ -102,7 +102,7 @@ class SmallContext:
         self.blks.append(blk)
         return blk
 
-    def launch(self, blk, A_ptr: int, W_ptr: int, stream):
-        rc = self.lib.sm_launch_blk_v1(self.ctx, blk, C.c_void_p(A_ptr), C.c_void_p(W_ptr), stream)
+    def launch(self, blk, A_ptr: int, W_ptr: int, strideA: int, stream):
+        rc = self.lib.sm_launch_blk_v1(self.ctx, blk, C.c_void_p(A_ptr), C.c_void_p(W_ptr), C.c_uint32(strideA), stream)
         if rc != OK:
             raise RuntimeError(f"sm_launch_blk rc={rc}")

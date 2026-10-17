@@ -18,6 +18,7 @@ plan.run(x, x_scale, w, w_scale, outs, meta, res, stream) contract (small):
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Dict, List
 
@@ -26,7 +27,9 @@ from aiter.gemm_fusion.match import ContractError
 from aiter.gemm_fusion.plan import Plan, WindowReq
 from aiter.gemm_fusion.resources import round_up
 
-from . import specs
+log = logging.getLogger("aiter.gemm_fusion")
+
+from . import specs  # noqa: E402
 from .jit import build_small, small_defs
 from . import small_rt as rt
 
@@ -44,6 +47,10 @@ def small_window_bytes(mode: str) -> Dict[str, int]:
     rx = 2 * 4 * rt.SM_MP * _F[mode] * 2
     ctl = 256 + 8 * 2 * 4 * _NA[mode]
     return {"rx": rx, "ctl": ctl}
+
+
+def _diff_parts(old: dict, new: dict) -> List[str]:
+    return [f"{k}: {old.get(k)} -> {new.get(k)}" for k in sorted(set(old) | set(new)) if old.get(k) != new.get(k)]
 
 
 def check_cache_page(k_cache, v_cache, page: int):
@@ -84,6 +91,7 @@ class SpQkvSmall(Plan):
         self.owner = "sp_qkv.small/" + self.mode + "/" + ",".join(f"{k}={v}" for k, v in sorted(self.params.items()))
         self.build_key = self.owner  # the key ATOM's plan_owner() uses for FusionResources.ensure / windows
         self._bindings: Dict[tuple, object] = {}
+        self._parts: Dict[tuple, dict] = {}  # key -> named components (for diffing a miss)
         self._ctx = None
 
     def resources(self) -> List[WindowReq]:
@@ -128,23 +136,47 @@ class SpQkvSmall(Plan):
         ikw = meta.get("index_k_norm_w") if m == "indexer" else None
         zeros = None
         if iqw is None:  # dense/reuse: kernel never reads these; Phase-1 harness passes zeroed 16B-aligned buffers
-            zeros = res.__dict__.setdefault("_sp_qkv_zero128", torch.zeros(128, device=x.device, dtype=torch.float32))
+            zeros = res.__dict__.get("_sp_qkv_zero128")  # NOT setdefault(..., torch.zeros()): that allocated on EVERY call, even inside capture
+            if zeros is None:
+                zeros = res.__dict__["_sp_qkv_zero128"] = torch.zeros(128, device=x.device, dtype=torch.float32)
             iqw = ikw = zeros
-        tens = [x_scale, w_scale, meta["q_norm_w"], meta["k_norm_w"], iqw, ikw, meta["cos_cache"], meta["sin_cache"],
-                meta["positions"], meta["slot_mapping"], outs["q"], *caches.values()]
+        named = {"x_scale": x_scale, "w_scale": w_scale, "q_norm_w": meta["q_norm_w"], "k_norm_w": meta["k_norm_w"], "iqw": iqw, "ikw": ikw,
+                 "cos_cache": meta["cos_cache"], "sin_cache": meta["sin_cache"], "positions": meta["positions"],
+                 "slot_mapping": meta["slot_mapping"], "q_out": outs["q"], **caches}
         for n in ("k", "v", "index_q"):
             if n in outs:
-                tens.append(outs[n])
+                named[n + "_out"] = outs[n]
         if m == "indexer":
-            tens.append(meta["index_cache"])
-        key = tuple(t.data_ptr() for t in tens) + (x.shape[0],)
+            named["index_cache"] = meta["index_cache"]
+        parts = {n: t.data_ptr() for n, t in named.items()}
+        # everything else the device block bakes in from these tensors (strides) or from x (rows): a change must be a NEW binding, not stale reuse
+        parts["x.rows"] = x.shape[0]
+        parts["cos.stride0"] = meta["cos_cache"].stride(0)
+        parts["k_cache.strides"] = tuple(caches["k_cache"].stride())
+        parts["v_cache.strides"] = tuple(caches["v_cache"].stride())
+        parts["k_scale.strides"] = (caches["k_scale"].stride(0), caches["k_scale"].stride(1))
+        parts["v_scale.strides"] = (caches["v_scale"].stride(0), caches["v_scale"].stride(1))
+        key = tuple(parts.items())
         blk = self._bindings.get(key)
         if blk is not None:
             return blk
+        # a NEW key: say exactly which components differ from the closest existing binding (this is the hidden eager second-binding too)
+        if self._bindings:
+            best = min(self._parts.values(), key=lambda p: len(_diff_parts(p, parts)))
+            why = _diff_parts(best, parts)
+            msg = (f"{self.owner}: binding #{len(self._bindings) + 1} needed; differs from the closest of {len(self._bindings)} existing "
+                   f"binding(s) in: {why}")
+        else:
+            why, msg = [], f"{self.owner}: first binding"
         if in_capture:
-            raise RuntimeError("sp_qkv.small: new binding required during graph capture; call plan.prepare() before capture")
+            raise RuntimeError("sp_qkv.small: new binding required during graph capture (prepare() did not bind these exact tensors): "
+                               + msg)
+        if self._bindings:
+            log.warning("event=binding new %s", msg)
+        else:
+            log.info("event=binding first owner=%s", self.owner)
         if len(self._bindings) >= _MAX_BINDINGS:
-            raise RuntimeError("sp_qkv.small: too many distinct bindings (pointers must be stable)")
+            raise RuntimeError("sp_qkv.small: too many distinct bindings (pointers must be stable): " + msg)
         check_cache_page(caches["k_cache"], caches["v_cache"], self.block)  # spec page vs actual cache layout
         sb = rt.SmBindingV1()
         sb.Ascale, sb.Wscale = x_scale.data_ptr(), w_scale.data_ptr()
@@ -178,6 +210,7 @@ class SpQkvSmall(Plan):
         sb.poll_iterations = 20000000
         blk = self._context(res).bind(sb)
         self._bindings[key] = blk
+        self._parts[key] = parts
         return blk
 
     def prepare(self, *, x, x_scale, w_scale, outs, meta, res):
@@ -190,7 +223,7 @@ class SpQkvSmall(Plan):
 
         sc = self._context(res)
         blk = self._binding(x, x_scale, w_scale, outs, meta, res, in_capture=torch.cuda.is_current_stream_capturing())
-        sc.launch(blk, x.data_ptr(), w.data_ptr(), rt.stream_handle(stream))
+        sc.launch(blk, x.data_ptr(), w.data_ptr(), x.stride(0) * x.element_size(), rt.stream_handle(stream))
 
 
 from . import variants_large  # noqa: E402,F401  (registers sp_qkv.large.v1)

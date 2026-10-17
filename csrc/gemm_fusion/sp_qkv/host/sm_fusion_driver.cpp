@@ -87,12 +87,12 @@ int32_t sm_bind_new_v1(void* ctx, const SmBindingV1* b, void** out_blk) {
     return OK;
 }
 // Enqueue sm_gemm then RAN on `stream` for this binding (capturable by torch.cuda.graph: plain kernel launches).
-int32_t sm_launch_blk_v1(void* ctx, void* blk_, const void* A, const void* W, void* stream) {
+int32_t sm_launch_blk_v1(void* ctx, void* blk_, const void* A, const void* W, uint32_t strideA, void* stream) {   // D2b: A, W and strideA (bytes) are per-launch arguments
     auto* c = static_cast<Ctx*>(ctx); auto* blk = static_cast<Blk*>(blk_); if (!c || !blk || !blk->dblk) return E_STATE;
     if (!own_ctx(c)) return E_STATE;
     std::lock_guard<std::mutex> swap_lk(g_swap_mu);
     SmBindingV1 saved_b = c->b; SmDev* saved_dblk = c->dblk;
-    c->b = blk->b; c->b.A = A; c->b.W = W; c->dblk = blk->dblk;
+    c->b = blk->b; c->b.A = A; c->b.W = W; c->b.strideA = strideA; c->dblk = blk->dblk;
     const hipError_t e = enqueue(c, static_cast<hipStream_t>(stream));
     c->b = saved_b; c->dblk = saved_dblk;
     if (e != hipSuccess) { c->last_hip = static_cast<int>(e); std::fprintf(stderr, "SM_LAUNCH stage=enqueue err=%d (%s)\n", (int)e, hipGetErrorString(e)); return E_HIP; }

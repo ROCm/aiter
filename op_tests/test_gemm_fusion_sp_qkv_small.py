@@ -1055,3 +1055,143 @@ def test_lg_attach_writes_structured_diag_on_every_branch():
         assert code in body, code
     assert "uint64_t* diag" in body and "diag = scratch" in body  # NULL diag tolerated
     assert "gf_devcomm_info_v1" in open(os.path.join(jit.CSRC, "host", "gf_comm.cpp"), encoding="utf-8").read()
+
+# ======================================================================= binding key / capture triage (gate04 'new binding required during capture')
+class _T:
+    """Minimal tensor stand-in with a stable address, shape and strides."""
+
+    _next = 0x10000
+
+    def __init__(self, shape, stride=None, dtype="f32"):
+        _T._next += 0x1000
+        self.shape, self._stride, self.dtype, self.device, self.ptr = tuple(shape), stride, dtype, "cuda:0", _T._next
+
+    def data_ptr(self):
+        return self.ptr
+
+    def stride(self, i=None):
+        s = self._stride or tuple(1 for _ in self.shape)
+        return s if i is None else s[i]
+
+    def element_size(self):
+        return 1
+
+
+def _binding_rig(monkeypatch, mode="dense", T=64):
+    """A dense small plan whose _context is a recording stub and whose torch is a counting fake."""
+    import types as _t
+    from types import SimpleNamespace as NS
+
+    from aiter.gemm_fusion import catalog
+
+    monkeypatch.setattr(catalog, "_CATALOG", {})
+    sys.modules.pop("aiter.ops.gemm_fusion.sp_qkv.variants", None)
+    sys.modules.pop("aiter.ops.gemm_fusion.sp_qkv.variants_large", None)
+    import aiter.ops.gemm_fusion.sp_qkv.variants as v
+
+    zeros_calls = []
+    fake_torch = _t.ModuleType("torch")
+    fake_torch.zeros = lambda *a, **k: (zeros_calls.append(1), _T((128,)))[1]
+    fake_torch.float32 = "f32"
+    fake_torch.finfo = lambda dt: NS(max=448.0)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    plan = v.SpQkvSmall(specs.sp_qkv_spec(mode), specs.SMALL_CELLS[(mode, T)][1], MatchCtx("gfx950", 256, 4, T // 4, frozenset({"mori_cco", "gfx950_sc_bypass"})))
+    binds = []
+    plan._context = lambda r: NS(bind=lambda sb: binds.append(sb) or object())
+    M = T // 4
+    page = plan.block
+    st = dict(x=_T((M, 6144), (6144, 1)), xs=_T((M, 1)), ws=_T((9216,)))
+    meta = {n: _T((128,)) for n in ("q_norm_w", "k_norm_w")}
+    meta.update(cos_cache=_T((1024, 32), (32, 1)), sin_cache=_T((1024, 32), (32, 1)), positions=_T((T,)), slot_mapping=_T((T,)),
+                k_cache=_T((4, 1, 8, page, 16), (page * 128, page * 128, page * 16, 16, 1)), v_cache=_T((4, 1, page // 16, 128, 16), (page * 128, page * 128, 2048, 16, 1)),
+                k_scale=_T((4, 1, page), (page, page, 1)), v_scale=_T((4, 1, page), (page, page, 1)))
+    outs = {"q": _T((T, 16, 128)), "k": _T((T, 1, 128)), "v": _T((T, 1, 128))}
+    res = type("R", (), {})()
+    return plan, st, meta, outs, res, binds, zeros_calls
+
+
+def test_binding_reuse_when_all_components_unchanged_and_no_per_call_allocation(monkeypatch):
+    plan, st, meta, outs, res, binds, zeros_calls = _binding_rig(monkeypatch)
+    b1 = plan._binding(st["x"], st["xs"], st["ws"], outs, meta, res)
+    for _ in range(5):  # the eager run path calls _binding again with the same tensors
+        assert plan._binding(st["x"], st["xs"], st["ws"], outs, meta, res, in_capture=True) is b1  # even in capture: a hit, no raise
+    assert len(binds) == 1
+    assert len(zeros_calls) == 1  # the 128-float placeholder is allocated ONCE (was once per call: setdefault evaluated torch.zeros eagerly)
+
+
+def test_capture_miss_names_the_component_that_moved(monkeypatch):
+    plan, st, meta, outs, res, binds, _z = _binding_rig(monkeypatch)
+    plan._binding(st["x"], st["xs"], st["ws"], outs, meta, res)  # prepare-time binding
+    meta2 = dict(meta)
+    meta2["q_norm_w"] = _T((128,))  # e.g. ATOM re-created the float32 copy of the norm weight
+    with pytest.raises(RuntimeError, match=r"graph capture.*q_norm_w: \d+ -> \d+") as ei:
+        plan._binding(st["x"], st["xs"], st["ws"], outs, meta2, res, in_capture=True)
+    assert "x_scale" not in str(ei.value).split("differs from the closest")[1]  # ONLY the moved component is listed
+    meta3 = dict(meta)
+    meta3["k_cache"] = _T(meta["k_cache"].shape, meta["k_cache"]._stride)
+    with pytest.raises(RuntimeError, match=r"k_cache: \d+ -> \d+"):
+        plan._binding(st["x"], st["xs"], st["ws"], outs, meta3, res, in_capture=True)
+    assert len(binds) == 1  # nothing was bound by the failed attempts
+
+
+def test_eager_second_binding_is_logged_with_the_diff(monkeypatch):
+    plan, st, meta, outs, res, binds, _z = _binding_rig(monkeypatch)
+    plan._binding(st["x"], st["xs"], st["ws"], outs, meta, res)
+    msgs = []
+
+    class H(logging.Handler):
+        def emit(self, rec):
+            msgs.append(rec.getMessage())
+
+    lg = logging.getLogger("aiter.gemm_fusion")
+    h, old = H(level=logging.INFO), lg.level
+    lg.addHandler(h)
+    lg.setLevel(logging.INFO)
+    try:
+        xs2 = _T((16, 1))  # the eager call used a DIFFERENT x_scale tensor than prepare did
+        plan._binding(st["x"], xs2, st["ws"], outs, meta, res)
+    finally:
+        lg.removeHandler(h)
+        lg.setLevel(old)
+    assert len(binds) == 2
+    assert any("event=binding new" in m and "x_scale:" in m and "binding #2" in m for m in msgs), msgs  # the hidden eager rebinding is now visible
+
+
+def test_stride_changes_make_a_new_binding_not_stale_reuse(monkeypatch):
+    plan, st, meta, outs, res, binds, _z = _binding_rig(monkeypatch)
+    plan._binding(st["x"], st["xs"], st["ws"], outs, meta, res)
+    meta2 = dict(meta)
+    kc = meta["k_cache"]
+    meta2["k_cache"] = type(kc)(kc.shape, (kc._stride[0] * 2,) + tuple(kc._stride[1:]))  # same shape, different strides (and a new object)
+    meta2["k_cache"].ptr = kc.ptr  # SAME address, different layout: only the stride part of the key can catch it
+    with pytest.raises(RuntimeError, match=r"k_cache\.strides"):
+        plan._binding(st["x"], st["xs"], st["ws"], outs, meta2, res, in_capture=True)
+
+
+def test_strideA_is_a_per_launch_argument_not_baked_into_the_binding():
+    import inspect
+
+    from aiter.ops.gemm_fusion.sp_qkv import small_rt as rt
+
+    assert "strideA" in inspect.signature(rt.SmallContext.launch).parameters
+    src = open(os.path.join(jit.CSRC, "host", "sm_fusion_driver.cpp"), encoding="utf-8").read()
+    assert "const void* A, const void* W, uint32_t strideA, void* stream" in src and "c->b.strideA = strideA" in src
+    pysrc = open(os.path.join(os.path.dirname(rt.__file__), "variants.py"), encoding="utf-8").read()
+    assert "sc.launch(blk, x.data_ptr(), w.data_ptr(), x.stride(0) * x.element_size()" in pysrc
+
+
+def test_run_passes_the_per_launch_x_layout(monkeypatch):
+    from types import SimpleNamespace as NS
+
+    plan, st, meta, outs, res, binds, _z = _binding_rig(monkeypatch)
+    calls = []
+    plan._context = lambda r: NS(bind=lambda sb: object(), launch=lambda *a: calls.append(a))
+    import types as _t
+
+    sys.modules["torch"].cuda = NS(is_current_stream_capturing=lambda: False)
+    monkeypatch.setattr("aiter.ops.gemm_fusion.sp_qkv.small_rt.stream_handle", lambda s: "S")
+    w = _T((9216, 6144))
+    x_padded = _T((16, 6144), (8192, 1))  # a row-padded activation view: stride(0) = 8192 bytes
+    plan.run(x=x_padded, x_scale=st["xs"], w=w, w_scale=st["ws"], outs=outs, meta=meta, res=res)
+    blk, a_ptr, w_ptr, stride_a, stream = calls[0]
+    assert (a_ptr, w_ptr, stride_a, stream) == (x_padded.ptr, w.ptr, 8192, "S")
