@@ -248,9 +248,7 @@ class MegaMoeTPLDSError(ValueError):
     """max_local_tokens does not fit in LDS (retry with a smaller one)."""
 
 
-# per-token tuned launch configs (op_tests/op_benchmarks/flydsl/tune_mega_moe_tp.py);
-# AITER_MEGAMOE_TP_TUNED: csv path, "0" disables; AITER_MEGAMOE_TP_FORCE="mt=4,npp=2":
-# fields forced for every batch (tuning)
+# per-token tuned launch configs: the nearest tuned batch's fields (below)
 _TUNED_KEY = (
     "gfx",
     "model_dim",
@@ -556,58 +554,25 @@ class MegaMoeTPEngine:
     def _tuned(self, lb: bool, tot: int) -> dict:
         """The tuned fields of the nearest tuned batch (same schedule, <= tot, else the
         smallest above)."""
-        path = _TUNED_DEFAULT
-        got: dict = {}
-        if path != "0":
-            from aiter.jit.utils.chip_info import get_gfx
-
-            key = (
-                get_gfx(),
-                self.H,
-                self.I,
-                self.E,
-                self.K,
-                self.tp,
-                self.mode,
-                "fp8" if self.a8 else "fp4",
-            )
-            rows = _tuned_table(os.path.abspath(path)).get(
-                tuple(str(k) for k in key), {}
-            )
-            ts = sorted(t for b, t in rows if b == int(lb))
-            if ts:
-                t = max((x for x in ts if x <= tot), default=ts[0])
-                got = dict(rows[(int(lb), t)])
-        return got
-
-    def tuned_rows(self) -> list[dict]:
-        """The csv rows (key + fields) of the launch configs used so far (tuning)."""
         from aiter.jit.utils.chip_info import get_gfx
 
-        out = []
-        for m, c in self._cfgs.items():
-            key = (
-                get_gfx(),
-                self.H,
-                self.I,
-                self.E,
-                self.K,
-                self.tp,
-                self.mode,
-                "fp8" if self.a8 else "fp4",
-            )
-            row = dict(zip(_TUNED_KEY, key), lb=int(c.lb), tot=m * self.tp)
-            row.update(
-                mt=c.mt,
-                npp=c.npp,
-                q=c.q or (self.lb_q if c.lb else 0),
-                pf=int(c.pf),
-                lp=c.lp,
-                ll=int(c.ll),
-                llr=int(c.llr),
-            )
-            out.append(row)
-        return out
+        key = (
+            get_gfx(),
+            self.H,
+            self.I,
+            self.E,
+            self.K,
+            self.tp,
+            self.mode,
+            "fp8" if self.a8 else "fp4",
+        )
+        rows = _tuned_table(os.path.abspath(_TUNED_DEFAULT)).get(
+            tuple(str(k) for k in key), {}
+        )
+        ts = sorted(t for b, t in rows if b == int(lb))
+        if not ts:
+            return {}
+        return dict(rows[(int(lb), max((x for x in ts if x <= tot), default=ts[0]))])
 
     def _lb_mt_ok(self, mt: int) -> int:
         # LB row chunks of the largest batch fit the kernel's table: grow the tile if not

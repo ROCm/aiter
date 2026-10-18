@@ -8,7 +8,8 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import math as fmath
+from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from .. import buffer_ops
@@ -422,28 +423,39 @@ def poll_sys_ge(addr, target, nap=2):
     return cur
 
 
-def tl_mark(ctrl, base_int, slot):
-    """s_memrealtime -> this CTA's int64 timeline slot after the ctrl ints."""
-    bid = i32(gpu.block_id("x"))
-    t = now()
-    addr = fx.Int64(ctrl) + fx.Int64(
-        (i32(base_int) + (bid * i32(24) + i32(slot)) * i32(2)) * i32(4)
-    )
-    g_st_sys(addr, fx.Int32(t))
-    g_st_sys(addr + fx.Int64(4), fx.Int32(t >> fx.Int64(32)))
-
-
-def tl_slot(ctrl, base_int, slot):
-    bid = i32(gpu.block_id("x"))
-    return fx.Int64(ctrl) + fx.Int64(
-        (i32(base_int) + (bid * i32(24) + i32(slot)) * i32(2)) * i32(4)
+def opaque(v):
+    """v through a side-effecting copy: derived values are not hoisted or CSE'd (equal loads
+    stay separate instructions for the static vmcnt waits; an item's address math stays inside
+    the item, not live across every item)"""
+    return fx.Int32(
+        _llvm.inline_asm(
+            T.i32, [v.ir_value()], "v_mov_b32 $0, $1", "=v,v", has_side_effects=True
+        )
     )
 
 
-def tl_add(ctrl, base_int, slot, t0):
-    """Accumulate now() - t0 (10 ns ticks) into the low int32 of a timeline slot."""
-    fx.atomic_add(
-        gptr(tl_slot(ctrl, base_int, slot)),
-        i32(fx.Int32(now() - t0)),
-        syncscope="agent",
-    )
+def i8x4_pack(f, inv):
+    """4 f32 * inv -> int8 (round to even, clamped to +-127) packed in an i32"""
+    w = i32(0)
+    for k in range_constexpr(4):
+        q = fx.Int32(fmath.roundeven(f[k] * inv))
+        q = fx.max(fx.min(q, i32(127)), i32(-127))
+        w = w | ((q & i32(0xFF)) << i32(8 * k))
+    return w
+
+
+def i8x4_unpack(d, sc):
+    out = []
+    for k in range_constexpr(4):
+        b = (fx.Int32(d) << i32(24 - 8 * k)) >> i32(24)
+        out.append(b.to(fx.Float32) * sc)
+    return out
+
+
+def f32_bits_add(x, y):
+    """f32 add on i32 bit patterns (block reductions over i32 LDS words)"""
+    return (x.bitcast(fx.Float32) + y.bitcast(fx.Float32)).bitcast(fx.Int32)
+
+
+def f32_bits_max(x, y):
+    return x.bitcast(fx.Float32).maximumf(y.bitcast(fx.Float32)).bitcast(fx.Int32)

@@ -33,8 +33,6 @@ from .common import (
     lds_st,
     pack_bf16x8,
     rsrc,
-    tl_mark,
-    tl_slot,
     uni,
     wait_vm,
     wave_red,
@@ -44,7 +42,6 @@ from .gemm import build_gemm
 from .mega_moe_tp_config import (
     C_EPOCH,
     C_TNL,
-    CTRL_INTS,
     CTRL_TNC,
     ERR_YAG,
     FLAG_TN,
@@ -127,7 +124,7 @@ def compile_mega_moe_tp(
     _ag_send_meta, _ag_send_meta_ll = kc.get("_ag_send_meta _ag_send_meta_ll")
     claim_addr, comm_help, comm_wave = kc.get("claim_addr comm_help comm_wave")
     compute_units, const_expr, ctrl_at = kc.get("compute_units const_expr ctrl_at")
-    TL, TNL = kc.get("TL TNL")
+    (TNL,) = kc.get("TNL")
     _drop_stale, _dyn_zero, fin_key = kc.get("_drop_stale _dyn_zero fin_key")
     fin_owned, fin_split, finish = kc.get("fin_owned fin_split finish")
     init_lds, layout_tag, lb_finish = kc.get("init_lds layout_tag lb_finish")
@@ -321,9 +318,6 @@ def compile_mega_moe_tp(
         if tid < i32(NT):
             compute_units(L, tid, a)
             comm_help(L, tid, a, epoch)
-            if const_expr(TL):  # noqa: SIM102
-                if tid == i32(0):
-                    tl_mark(a["ctrl"], CTRL_INTS, 5)
         else:
             if tid < i32(NT + 64):
                 ag_send(L, tid % i32(64), a)
@@ -332,9 +326,6 @@ def compile_mega_moe_tp(
                     comm_wave(L, tid, a, epoch)
                 else:
                     poll_loop(L, tid, a, epoch)
-                if const_expr(TL):  # noqa: SIM102
-                    if tid == i32(NT):
-                        tl_mark(a["ctrl"], CTRL_INTS, 12)
             elif tid < i32(NT + 128):
                 a_loader(L, tid, a)
                 if const_expr(LBPF):
@@ -406,11 +397,6 @@ def compile_mega_moe_tp(
         for j in range_constexpr(1, MAX_TP):
             mine = (rank == i32(j)).select(peers[j], mine)
         a.update(peer=peers, mine=fx.Int64(mine), ttot=tp * m)
-        if const_expr(TL):  # noqa: SIM102
-            if tid == i32(0):
-                tl_mark(ctrl, CTRL_INTS, 0)
-                for z in range_constexpr(13, 22):
-                    g_st_sys(tl_slot(ctrl, CTRL_INTS, z), i32(0))
         _dyn_zero(L, tid)
         init_lds(L, tid, a)
         gpu.barrier()
@@ -443,37 +429,19 @@ def compile_mega_moe_tp(
         if const_expr(TN):
             wait_vm(0)
         gpu.barrier()
-        if const_expr(TL):  # noqa: SIM102
-            if tid == i32(0):
-                tl_mark(ctrl, CTRL_INTS, 8)
         if const_expr(ar and not ARLL):
             yag_flush(L, tid, a)
             yag_wait(tid, a, epoch)
         if const_expr(TN):
             tn_rows(L, tid, a)
-            if const_expr(TL):  # noqa: SIM102
-                if tid == i32(0):
-                    tl_mark(ctrl, CTRL_INTS, 9)
             if const_expr(not TNL):
                 tn_wait(tid, a)
-            if const_expr(TL):  # noqa: SIM102
-                if tid == i32(0):
-                    tl_mark(ctrl, CTRL_INTS, 10)
         if const_expr(AG8):
             gpu.barrier()
             ag8_convert(tid, a)
-        if const_expr(TL):  # noqa: SIM102
-            if tid == i32(0):
-                tl_mark(ctrl, CTRL_INTS, 11)
         if const_expr(lb):
             lb_finish(tid, a, L)
-        if const_expr(TL):  # noqa: SIM102
-            if tid == i32(0):
-                tl_mark(ctrl, CTRL_INTS, 6)
         finish(tid, a, epoch)
-        if const_expr(TL):  # noqa: SIM102
-            if tid == i32(0):
-                tl_mark(ctrl, CTRL_INTS, 7)
 
     kargs = list(inspect.signature(mega_moe_tp_kernel).parameters)
     mega_moe_tp_kernel = flyc.kernel(name=name, known_block_size=[NTT, 1, 1])(

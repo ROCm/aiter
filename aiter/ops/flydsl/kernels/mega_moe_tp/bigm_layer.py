@@ -40,16 +40,21 @@ from .common import (
     bf16x8_to_f32,
     bld,
     bst,
+    f32_bits_add,
+    f32_bits_max,
     fp4_pack,
     fp8x4_pack,
     fp8x8_decode,
     g_ld_sys,
     g_st_sys,
+    i8x4_pack,
+    i8x4_unpack,
     i32,
     lds_atomic_add,
     lds_ld_i32,
     lds_st,
     now,
+    opaque,
     pack_bf16x8,
     rsrc,
     sum_live,
@@ -95,19 +100,6 @@ CTRL_INTS = C_XW + 3 * 8 * 512
 C_ERR = CTRL_INTS  # sticky watchdog word after the per-launch ctrl block (not zeroed per launch)
 
 
-def _opaque(v):
-    """v through a side-effecting copy: derived values are not hoisted out of the work loop
-    (each item's address math stays inside the item, not live across every item)"""
-    from flydsl._mlir.dialects import llvm as _llvm
-    from flydsl.expr import arith
-
-    return fx.Int32(
-        _llvm.inline_asm(
-            T.i32, [arith.unwrap(v)], "v_mov_b32 $0, $1", "=v,v", has_side_effects=True
-        )
-    )
-
-
 def _l2_writeback():
     """this XCD's dirty L2 lines to memory (device-scope release of plain stores)"""
     from flydsl._mlir.dialects import llvm as _llvm
@@ -119,14 +111,6 @@ def _l2_writeback():
 
 def i8_row_bytes(H):
     return H + H // 8
-
-
-def _fadd(x, y):
-    return (x.bitcast(fx.Float32) + y.bitcast(fx.Float32)).bitcast(fx.Int32)
-
-
-def _fmax(x, y):
-    return x.bitcast(fx.Float32).maximumf(y.bitcast(fx.Float32)).bitcast(fx.Int32)
 
 
 def _i4x8_pack(f, inv):
@@ -142,23 +126,6 @@ def _i4x8_unpack(d, sc):
     out = []
     for k in range_constexpr(8):
         b = (fx.Int32(d) << i32(28 - 4 * k)) >> i32(28)
-        out.append(b.to(fx.Float32) * sc)
-    return out
-
-
-def _i8x4_pack(f, inv):
-    w = i32(0)
-    for k in range_constexpr(4):
-        q = fx.Int32(fmath.roundeven(f[k] * inv))
-        q = fx.max(fx.min(q, i32(127)), i32(-127))
-        w = w | ((q & i32(0xFF)) << i32(8 * k))
-    return w
-
-
-def _i8x4_unpack(d, sc):
-    out = []
-    for k in range_constexpr(4):
-        b = (fx.Int32(d) << i32(24 - 8 * k)) >> i32(24)
         out.append(b.to(fx.Float32) * sc)
     return out
 
@@ -386,7 +353,7 @@ def compile_bigm_layer(
 
     def i8_rows_val(ld):
         d, sc = ld
-        return _i8x4_unpack(d[0], sc.bitcast(fx.Float32)) + _i8x4_unpack(
+        return i8x4_unpack(d[0], sc.bitcast(fx.Float32)) + i8x4_unpack(
             d[1], sc.bitcast(fx.Float32)
         )
 
@@ -456,7 +423,7 @@ def compile_bigm_layer(
         sc = am.maximumf(fx.Float32(1e-30)) / fx.Float32(127.0)
         inv = fx.Float32(1.0) / sc
         dv = fx.Vector.from_elements(
-            [_i8x4_pack(f[0:4], inv), _i8x4_pack(f[4:8], inv)], fx.Int32
+            [i8x4_pack(f[0:4], inv), i8x4_pack(f[4:8], inv)], fx.Int32
         )
         bst(dv, rd, drow * i32(RB) + p * i32(8), 0, AUX_SYS)
         if (lane & i32(3)) == i32(0):
@@ -553,9 +520,9 @@ def compile_bigm_layer(
         from flydsl.compiler.extern_link import link_extern
         from flydsl.expr.extern import ffi
 
-        from .sdma import _mori
+        from .sdma import sdma_bitcode
 
-        bc = _mori()[3](6)
+        bc = sdma_bitcode(6)
         put_ptr = link_extern(
             ffi(
                 "cco_sdma_put_ptr_rsig__thread",
@@ -775,7 +742,7 @@ def compile_bigm_layer(
         def item_rx(k, j):
             # io: ZX of this rank's (normed) rows -> MXFP4 rows + routing in the window; the last
             # item of a head sub-block posts it to every peer (gather C)
-            tid = _opaque(tid0)
+            tid = opaque(tid0)
             lane = tid % i32(64)
             o, s = chunk(k)
             B = i32(tp) * o
@@ -844,7 +811,7 @@ def compile_bigm_layer(
 
         @flyc.jit
         def item_s1(k, j):
-            tid = _opaque(tid0)
+            tid = opaque(tid0)
             o, s = chunk(k)
             B = i32(tp) * o
             if const_expr(SXW):
@@ -876,7 +843,7 @@ def compile_bigm_layer(
 
         @flyc.jit
         def item_s2(k):
-            tid = _opaque(tid0)
+            tid = opaque(tid0)
             _o, s = chunk(k)
             wait_ph(k, P_S1, cnt(P_S1, s))
             # route-list offsets (prefix of the counts, each thread its own expert)
@@ -909,7 +876,7 @@ def compile_bigm_layer(
 
         @flyc.jit
         def s2_greedy(k):
-            tid = _opaque(tid0)
+            tid = opaque(tid0)
             # units -> per-XCD queues: unit g of one round-robin sequence (the shared expert's
             # units, then those of the routed experts with more than UQ units) to queue g % 8,
             # slot g / 8; every other routed expert's units whole to the least-loaded queue (its
@@ -1000,7 +967,7 @@ def compile_bigm_layer(
 
         @flyc.jit
         def item_s3(k, j):
-            tid = _opaque(tid0)
+            tid = opaque(tid0)
             o, s = chunk(k)
             B = i32(tp) * o
             wait_ph(k, P_S2, i32(1))  # the route-list offsets
@@ -1064,7 +1031,7 @@ def compile_bigm_layer(
 
         @flyc.jit
         def item_u_own(k, j0):
-            tid = _opaque(tid0)
+            tid = opaque(tid0)
             o, s = chunk(k)
             B = i32(tp) * o
             wait_ph(k, P_S3, cnt(P_S3, s))
@@ -1116,7 +1083,7 @@ def compile_bigm_layer(
 
         @flyc.jit
         def item_rq(k, j):
-            tid = _opaque(tid0)
+            tid = opaque(tid0)
             lane = tid % i32(64)
             o, s = chunk(k)
             B = i32(tp) * o
@@ -1300,7 +1267,7 @@ def compile_bigm_layer(
 
         @flyc.jit
         def item_rf(k, j):
-            tid = _opaque(tid0)
+            tid = opaque(tid0)
             o, s = chunk(k)
             B = i32(tp) * o
             sb = s // i32(NSB)
@@ -1355,7 +1322,7 @@ def compile_bigm_layer(
                         fs.append(f)
                     fss.append(fs)
                     sss.append(ss.bitcast(fx.Int32))
-                tots = blk_red_vec(L, tid, sss, _fadd)
+                tots = blk_red_vec(L, tid, sss, f32_bits_add)
                 xss, ams = [], []
                 for ii in range_constexpr(ZQ):
                     rcp = fx.Float32(
@@ -1379,7 +1346,7 @@ def compile_bigm_layer(
                         xs_.append(xk)
                     xss.append(xs_)
                     ams.append(am.bitcast(fx.Int32))
-                amxs = blk_red_vec(L, tid, ams, _fmax)
+                amxs = blk_red_vec(L, tid, ams, f32_bits_max)
                 for ii in range_constexpr(ZQ):
                     i = i0 + i32(sbi * ZQ + ii)
                     scl = amxs[ii].bitcast(fx.Float32).maximumf(
@@ -1435,7 +1402,7 @@ def compile_bigm_layer(
             # io without tail: y = own partial + the peers' MoE-output rows (this rank's rows);
             # tailq 3: y rows to the "q" region (global row rank * m + ..), each sub-block then
             # put to every peer
-            tid = _opaque(tid0)
+            tid = opaque(tid0)
             o, s = chunk(k)
             B = i32(tp) * o
             sb = s // i32(NSB)
@@ -1764,8 +1731,7 @@ def _bigm_cached(launch, args):
     return "compiled"
 
 
-# per-batch tuned big-M configs (op_tests/op_benchmarks/flydsl/tune_mega_moe_tp_bigm.py):
-# chunks + AITER_BIGM_* options; AITER_MEGAMOE_TP_BIGM_TUNED: csv path, "0" disables
+# per-batch tuned big-M configs: chunks + AITER_BIGM_* options
 _BIGM_KEY = ("gfx", "model_dim", "inter_dim", "experts", "topk", "tp")
 _BIGM_TUNED_DEFAULT = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),

@@ -282,11 +282,9 @@ _CAP: dict = {}
 
 
 def max_local(mode: str, shape, wt) -> int:
-    """the test layers' max_local_tokens: the session's where forward has the big-M path
-    (ag_rs, Swiglu), else the largest the small-batch engine alone takes (probed once per
-    model and mode: halved until the layer's host-side limit check passes)"""
-    if mode == "ag_rs" and shape.act == aiter.ActivationType.Swiglu:
-        return S.max_local
+    """the test layers' max_local_tokens: the session's, else (no big-M path for the
+    shape / mode) the largest the small-batch engine alone takes (probed once per model
+    and mode: halved until the layer's host-side limit check passes)"""
     key = (shape.name, mode)
     if key not in _CAP:
         cap = S.max_local

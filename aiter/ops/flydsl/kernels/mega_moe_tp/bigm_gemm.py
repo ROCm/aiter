@@ -37,6 +37,7 @@ from .common import (
     lds_ld_i32,
     lds_st,
     mfma,
+    opaque,
     pack_bf16x2,
     rsrc,
     swap16,
@@ -48,19 +49,6 @@ from .common import (
 NW = 4
 NTH = NW * 64
 KCK = 2  # GEMM1 k-steps (of 128) per chunk
-
-
-def _opaque(v):
-    """v through a side-effecting copy: equal loads stay separate instructions (no CSE: the
-    static vmcnt waits count every issued load)"""
-    from flydsl._mlir.dialects import llvm as _llvm
-    from flydsl.expr import arith
-
-    return fx.Int32(
-        _llvm.inline_asm(
-            T.i32, [arith.unwrap(v)], "v_mov_b32 $0, $1", "=v,v", has_side_effects=True
-        )
-    )
 
 
 def bigm_lds(RG, NAB, I, NW=NW):
@@ -389,7 +377,7 @@ def build_bigm_unit(
                 rb = (e * i32(H) + n0 + i32(pp * 32)) // i32(32)
                 # k-steps 2j, 2j + 1 read the same scale word: kept as separate loads (an opaque
                 # offset), else CSE merges them and the static counts force a vmcnt(0) drain
-                vo = _opaque(lane * i32(4))
+                vo = opaque(lane * i32(4))
                 b.append(
                     fx.Int32(
                         bld(rws2, vo, (rb * i32(CH2) + kk // i32(2)) * i32(256), T.i32)

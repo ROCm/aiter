@@ -30,7 +30,7 @@ def _mori():
     os.environ.setdefault("MORI_ENABLE_SDMA", "1")
     from mori.cco import GDA_CONNECTION_NONE, CCODevCommRequirements, Communicator
 
-    return Communicator, CCODevCommRequirements, GDA_CONNECTION_NONE, sdma_bitcode
+    return Communicator, CCODevCommRequirements, GDA_CONNECTION_NONE
 
 
 def sdma_bitcode(cov: int = 6) -> str:
@@ -51,7 +51,7 @@ class SdmaComm:
     def __init__(self, *, group=None, num_queues: int = 8, device=None):
         from .mega_moe_tp import SymmetricArena
 
-        Communicator, Reqs, gda_none, _ = _mori()
+        Communicator, Reqs, gda_none = _mori()
         self.group = group
         self.rank = dist.get_rank(group)
         self.world = dist.get_world_size(group)

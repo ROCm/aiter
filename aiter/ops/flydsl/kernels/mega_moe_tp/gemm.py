@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import functools
 import math
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -34,14 +33,12 @@ from .common import (
     lds_st,
     lds_st_rel,
     mfma,
-    now,
     pack_bf16x2,
     rsrc,
     spin0,
     spin_lds_ge,
     swap16,
     swap32,
-    tl_add,
     uni,
     wait_lgkm0,
     wait_vm,
@@ -84,22 +81,12 @@ def build_gemm(kc: KernelCtx) -> dict:
     act_quant_store, ag_stage_free = kc.get("act_quant_store ag_stage_free")
     ag_wait_chunk, cbar, const_expr = kc.get("ag_wait_chunk cbar const_expr")
     ll_pkt, npp, nsk, route_fp8 = kc.get("ll_pkt npp nsk route_fp8")
-    TL, CTRL_INTS_, SOL = kc.get("TL CTRL_INTS_ SOL")
-    G1PRE = (
-        os.environ.get("AITER_MEGAMOE_TP_G1PRE", "0") == "1"
-    )  # [exp] fence after the A reads
-    ASC_CACHED = kc.get("ASC_CACHED")[0]
     route_region_bytes = kc.route_region_bytes
 
     @flyc.jit
-    def wait_a_chunk(L, lane, buf, q, a=None):
+    def wait_a_chunk(L, lane, buf, q):
         if lane == i32(0):
-            if const_expr(TL and a is not None):
-                t0 = now()
-                spin_lds_ge(L, L_CTL + (C_ASEQ * 4) + buf * i32(4), q + i32(1))
-                tl_add(a["ctrl"], CTRL_INTS_, 13, t0)
-            else:
-                spin_lds_ge(L, L_CTL + (C_ASEQ * 4) + buf * i32(4), q + i32(1))
+            spin_lds_ge(L, L_CTL + (C_ASEQ * 4) + buf * i32(4), q + i32(1))
         rocdl.sched_barrier(0)
 
     @flyc.jit
@@ -164,13 +151,13 @@ def build_gemm(kc: KernelCtx) -> dict:
     def _g1_sso(pas, kk):
         return pas * i32((128 // 32) * CH1 * 256) + (kk // i32(2)) * i32(256)
 
-    def _g1_chunk(L, lane, qb, ks, a=None):
+    def _g1_chunk(L, lane, qb, ks):
         k = ks % KCS
         q = qb + i32(ks // KCS)
         buf = q % i32(NAB)
         rocdl.sched_barrier(0)
         if k == 0:
-            wait_a_chunk(L, lane, buf, q, a)
+            wait_a_chunk(L, lane, buf, q)
         abuf = L + i32(L_A) + buf * i32(RG * ACB)
         asbuf = (
             L
@@ -189,26 +176,15 @@ def build_gemm(kc: KernelCtx) -> dict:
         afs, sas = [], []
         for m in range_constexpr(MTE):
             row = i32(m * 16) + lane % i32(16)
-            if const_expr("NA" in SOL):
-                afs.append(
-                    fx.Vector.from_elements(
-                        [lane + i32(m * 4 + i) for i in range(4)], fx.Int32
-                    )
-                )
-                sas.append(i32(127))
-            else:
-                afs.append(a_frag(abuf, row, k, lane // i32(16)))
-                sas.append(
-                    fx.Int32(lds_ld(asbuf, row * i32(4) + lane // i32(16), T.i8, 1))
-                    & i32(0xFF)
-                )
-        if const_expr(G1PRE):
-            rocdl.sched_barrier(0)
+            afs.append(a_frag(abuf, row, k, lane // i32(16)))
+            sas.append(
+                fx.Int32(lds_ld(asbuf, row * i32(4) + lane // i32(16), T.i8, 1))
+                & i32(0xFF)
+            )
         for m in range_constexpr(MTE):
             for t in range_constexpr(4):
                 j = o + (t // 2) * 2 * MTE + m * 2 + t % 2
-                if const_expr("NM" not in SOL):
-                    acc[j] = mfma(b[t], afs[m], acc[j], sc[t], sas[m], a8)
+                acc[j] = mfma(b[t], afs[m], acc[j], sc[t], sas[m], a8)
 
     def _g1_out(L, lane, w, a, acc, grp, P, MTE):
         ag_stage_free(L, lane, a)
@@ -239,8 +215,6 @@ def build_gemm(kc: KernelCtx) -> dict:
             pas, kk = _g1_where(g, total, P)
             slot = ring + i32(slot_idx * SLOT)
             so = _g1_so(pas, kk)
-            if const_expr("NBD" in SOL):
-                return
             for t in range_constexpr(4):
                 dma16(slot + i32(t * 1024), rw, vs[t], so, nt=True)
             sso = _g1_sso(pas, kk)
@@ -260,28 +234,18 @@ def build_gemm(kc: KernelCtx) -> dict:
                 acc = list(st)
                 qb = qbase + grp * i32(NCH) + (g0 - grp * i32(GS)) // i32(P * KCS)
                 for ks in range_constexpr(IL // P):
-                    k, buf, abuf, asbuf = _g1_chunk(L, lane, qb, ks, a)
+                    k, buf, abuf, asbuf = _g1_chunk(L, lane, qb, ks)
                     for pp in range_constexpr(P):
                         s_ = ks * P + pp
                         g = g0 + i32(s_)
                         wait_vm((nsk - 1) * OPS)
                         slot = ring + i32((s_ % nsk) * SLOT)
-                        if const_expr("NB" in SOL):
-                            b = [
-                                fx.Vector.from_elements(
-                                    [lane + i32(t * 4 + i) for i in range(4)], fx.Int32
-                                )
-                                for t in range(4)
-                            ]
-                            sgw = i32(0x7F7F7F7F)
-                            suw = i32(0x7F7F7F7F)
-                        else:
-                            b = [
-                                lds_ld(slot, i32(t * 1024) + lane * i32(16), V4I, 16)
-                                for t in range(4)
-                            ]
-                            sgw = lds_ld_i32(slot, i32(4096) + lane * i32(4))
-                            suw = lds_ld_i32(slot, i32(4096 + 256) + lane * i32(4))
+                        b = [
+                            lds_ld(slot, i32(t * 1024) + lane * i32(16), V4I, 16)
+                            for t in range(4)
+                        ]
+                        sgw = lds_ld_i32(slot, i32(4096) + lane * i32(4))
+                        suw = lds_ld_i32(slot, i32(4096 + 256) + lane * i32(4))
                         _g1_mfma(
                             acc,
                             pp * 4 * MTE,
@@ -364,31 +328,16 @@ def build_gemm(kc: KernelCtx) -> dict:
                 q = lds_ld_i32(L, L_CTL + C_LQ * 4)
                 b = q % i32(NAB)
                 if (lane == i32(0)) & (q >= i32(NAB)):
-                    if const_expr(TL):
-                        t0 = now()
-                        spin_lds_ge(
-                            L,
-                            L_CTL + C_AFREE * 4 + b * i32(4),
-                            i32(NW) * (q // i32(NAB)),
-                        )
-                        tl_add(a["ctrl"], CTRL_INTS_, 20, t0)
-                    else:
-                        spin_lds_ge(
-                            L,
-                            L_CTL + C_AFREE * 4 + b * i32(4),
-                            i32(NW) * (q // i32(NAB)),
-                        )
+                    spin_lds_ge(
+                        L,
+                        L_CTL + C_AFREE * 4 + b * i32(4),
+                        i32(NW) * (q // i32(NAB)),
+                    )
                 rocdl.sched_barrier(0)
                 cc = cidx % i32(NCH)
                 if cidx < i32(NCH):  # noqa: SIM102
                     if cidx >= uni(lds_ld_i32(L, L_CTL + C_ARDY * 4)):
-                        if const_expr(TL):
-                            t0 = now()
-                            ag_wait_chunk(L, lane, a, a["epoch"], cc)
-                            if lane == i32(0):
-                                tl_add(a["ctrl"], CTRL_INTS_, 15, t0)
-                        else:
-                            ag_wait_chunk(L, lane, a, a["epoch"], cc)
+                        ag_wait_chunk(L, lane, a, a["epoch"], cc)
                 abase = L + i32(L_A) + b * i32(RG * ACB)
                 for j in range_constexpr(NA_ROWOPS):
                     dma16(abase + i32(j * 1024), rx, arow[j], cc * i32(ACB))
@@ -400,28 +349,16 @@ def build_gemm(kc: KernelCtx) -> dict:
                             + b * i32(KCS * NSC_BLK * 64 * 4)
                             + i32((k * NSC_BLK + j) * 64 * 4)
                         )
-                        dma4(
-                            dst,
-                            rxs,
-                            ascl[j],
-                            cc * i32(8) + i32(k * 4),
-                            sys=not ASC_CACHED,
-                        )
-                _loader_advance(L, lane, q, a)
+                        dma4(dst, rxs, ascl[j], cc * i32(8) + i32(k * 4), sys=True)
+                _loader_advance(L, lane, q)
             wait_vm(0)
             _loader_flush(L, lane)
 
     @flyc.jit
-    def _loader_advance(L, lane, q, a=None):
+    def _loader_advance(L, lane, q):
         pub = lds_ld_i32(L, L_CTL + C_LPUB * 4)
         if q + i32(1) - pub >= i32(ADEPTH):
-            if const_expr(TL and a is not None):
-                t0 = now()
-                wait_vm(NA_L * (ADEPTH - 1))
-                if lane == i32(0):
-                    tl_add(a["ctrl"], CTRL_INTS_, 21, t0)
-            else:
-                wait_vm(NA_L * (ADEPTH - 1))
+            wait_vm(NA_L * (ADEPTH - 1))
             if lane == i32(0):
                 lds_st_rel(
                     L, L_CTL + C_ASEQ * 4 + (pub % i32(NAB)) * i32(4), pub + i32(1)
@@ -643,8 +580,6 @@ def build_gemm(kc: KernelCtx) -> dict:
             k = ks0 + qc - gi * i32(NKS)
             n0 = (w + i32(NW) * gi) * i32(64)
             slot = ring + i32(slot_idx * SLOT)
-            if const_expr("NBD2" in SOL):
-                return
             for t in range_constexpr(4):
                 dma16(
                     slot + i32(t * 1024), rw, lane * i32(16), _w2_off(n0, t, k), nt=True
@@ -742,7 +677,7 @@ def build_gemm(kc: KernelCtx) -> dict:
                         )
                     rocdl.sched_barrier(0)
                     rocdl.s_setprio(1)
-                    for m in range_constexpr(0 if "NM2" in SOL else MTE):
+                    for m in range_constexpr(MTE):
                         for t in range_constexpr(4):
                             acc[m * 4 + t] = mfma(
                                 b[t], af_l[m], acc[m * 4 + t], sb[t], sa_l[m], a8
@@ -756,9 +691,7 @@ def build_gemm(kc: KernelCtx) -> dict:
                 ccol = (q4 & i32(1)) * i32(16) + (q4 >> i32(1)) * i32(8)
                 for m in range_constexpr(MTE):
                     ok, wt, rix = row_meta[m]
-                    if const_expr("NST2" in SOL):
-                        pass
-                    elif const_expr(route_fp8):
+                    if const_expr(route_fp8):
                         store_route_fp8(
                             r_routes,
                             acc[m * 4 : m * 4 + 4],

@@ -25,9 +25,12 @@ from .common import (
     bf16x8_to_f32,
     bld,
     bst,
+    f32_bits_add,
     g_or_agent,
     g_st_sys,
     gptr,
+    i8x4_pack,
+    i8x4_unpack,
     i32,
     lds_ld_i32,
     lds_st,
@@ -89,24 +92,6 @@ def compile_sp_rs_norm(
         + (f"_nb{NB}" if NB != 256 else "")
         + (f"_nrt{nrt}" if nrt != NRT_MAX else "")
     )
-
-    def i8x4_pack(f, inv):
-        w = i32(0)
-        for k in range_constexpr(4):
-            q = fx.Int32(fmath.roundeven(f[k] * inv))
-            q = fx.max(fx.min(q, i32(127)), i32(-127))
-            w = w | ((q & i32(0xFF)) << i32(8 * k))
-        return w
-
-    def i8x4_unpack(d, sc):
-        out = []
-        for k in range_constexpr(4):
-            b = (fx.Int32(d) << i32(24 - 8 * k)) >> i32(24)
-            out.append(b.to(fx.Float32) * sc)
-        return out
-
-    def fadd(x, y):
-        return (x.bitcast(fx.Float32) + y.bitcast(fx.Float32)).bitcast(fx.Int32)
 
     LDSB = 128 + (NTH // 64) * 64 * (E // 16 if E else 1) * 16
     Shared = fx.struct(
@@ -364,7 +349,7 @@ def compile_sp_rs_norm(
 
     @flyc.jit
     def blk_sum(L, tid, v):
-        r = wave_red(v.bitcast(fx.Int32), tid % i32(64), fadd)
+        r = wave_red(v.bitcast(fx.Int32), tid % i32(64), f32_bits_add)
         if ((tid % i32(64)) == i32(0)) & (tid < i32(NTH)):
             lds_st(L, i32(16) + (tid // i32(64)) * i32(4), r)
         gpu.barrier()

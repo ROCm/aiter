@@ -32,13 +32,9 @@ from .common import (
     lds_ld_i32,
     lds_st,
     lds_st_rel,
-    now,
     rsrc,
     spin0,
     spin_lds_ge,
-    tl_add,
-    tl_mark,
-    tl_slot,
     uni,
     wait_lgkm0,
     wait_vm,
@@ -70,7 +66,6 @@ from .mega_moe_tp_config import (
     C_USEQ,
     CTRL_COLC,
     CTRL_G1C,
-    CTRL_INTS,
     CTRL_LBR,
     CTRL_LBSEQ,
     CTRL_XF,
@@ -91,7 +86,6 @@ from .mega_moe_tp_config import (
 def build_schedule(kc: KernelCtx) -> dict:
     """The schedule device functions of one instance (added to kc)."""
     DLL, DYN_PS, E, GPC, H2, I, KS2 = kc.get("DLL DYN_PS E GPC H2 I KS2")
-    (TL,) = kc.get("TL")
     L_B1, L_B1S, L_CTL, L_DCH, L_DCNT = kc.get("L_B1 L_B1S L_CTL L_DCH L_DCNT")
     L_DPRE, L_DYN, L_EOFF, L_INTER = kc.get("L_DPRE L_DYN L_EOFF L_INTER")
     L_INTERS, L_RIX, L_WSUM, L_WT, LB_B = kc.get("L_INTERS L_RIX L_WSUM L_WT LB_B")
@@ -141,9 +135,6 @@ def build_schedule(kc: KernelCtx) -> dict:
         elif const_expr(not ar):
             ag_wait_meta(a, tid, a["epoch"])
         _stale_dropped(tid, a)
-        if const_expr(TL):  # noqa: SIM102
-            if tid == i32(0):
-                tl_mark(a["ctrl"], CTRL_INTS, 1)
         if const_expr(ar and not DLL):
             zero_masked(L, tid % i32(64), a, tid // i32(64), NW)
         cbar(L, tid)
@@ -154,9 +145,6 @@ def build_schedule(kc: KernelCtx) -> dict:
             zero_masked(L, tid % i32(64), a, tid // i32(64), NW)
         if const_expr(lb):
             lb_plan(L, tid, a)
-            if const_expr(TL):  # noqa: SIM102
-                if tid == i32(0):
-                    tl_mark(a["ctrl"], CTRL_INTS, 2)
         else:
             dyn_plan(L, tid, a)
         ub = lds_ld_i32(L, L_CTL + C_UNIT * 4)
@@ -190,16 +178,10 @@ def build_schedule(kc: KernelCtx) -> dict:
             if const_expr(lb):  # noqa: SIM102
                 if tid == i32(0):
                     g_add_agent(lb_g1c(a, kind.shrui(i32(XQ_SHIFT)), lb_bank(L)), 1)
-        if const_expr(TL):  # noqa: SIM102
-            if tid == i32(0):
-                tl_mark(a["ctrl"], CTRL_INTS, 3)
         if const_expr(LBPF):
             lb_g2_consume(L, tid, a)
         elif const_expr(lb):
             lb_g2_phase(L, tid, a)
-        if const_expr(TL):  # noqa: SIM102
-            if tid == i32(0):
-                tl_mark(a["ctrl"], CTRL_INTS, 4)
         if const_expr(DLL):  # noqa: SIM102
             if tid == i32(0):
                 lds_st_rel(L, L_CTL + C_CDONE * 4, i32(1))
@@ -619,16 +601,8 @@ def build_schedule(kc: KernelCtx) -> dict:
         cbar(L, tid)
         return R
 
-    @flyc.jit
     def lb_g1_tile(L, tid, a, ent, i0, icnt, rows):
-        e = ent & i32(0xFFFF)
-        if const_expr(TL):
-            t0 = now()
-            gemm1(L, tid, a, e, i0, icnt // i32(128), rows)
-            if tid == i32(0):
-                tl_add(a["ctrl"], CTRL_INTS, 14, t0)
-        else:
-            gemm1(L, tid, a, e, i0, icnt // i32(128), rows)
+        gemm1(L, tid, a, ent & i32(0xFFFF), i0, icnt // i32(128), rows)
         xq_export(L, tid, a, i0, icnt, i32(0), rows)
 
     def lb_g2_cap(U2, nblk):
@@ -824,14 +798,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         ent = lds_ld_i32(L, L_DCH + j * i32(4))
         bank = lb_bank(L)
         if tid == i32(0):
-            if const_expr(TL):
-                t0 = now()
-                spin_sys_ge(lb_g1c(a, j, bank), lb_pieces(L, j), a)
-                tl_add(a["ctrl"], CTRL_INTS, 16, t0)
-            else:
-                spin_sys_ge(lb_g1c(a, j, bank), lb_pieces(L, j), a)
-        if const_expr(TL):
-            t1 = now()
+            spin_sys_ge(lb_g1c(a, j, bank), lb_pieces(L, j), a)
         R = lb_routes(L, tid, a, ent)
         gemm2(
             L,
@@ -851,14 +818,9 @@ def build_schedule(kc: KernelCtx) -> dict:
         cbar(L, tid)
         if tid == i32(0):
             lb_col_done(L, a, cc, nun, bank)
-            if const_expr(TL):
-                tl_add(a["ctrl"], CTRL_INTS, 18, t1)
-                g_add_agent(tl_slot(a["ctrl"], CTRL_INTS, 19), 1)
 
     @flyc.jit
     def lb_import(L, tid, a, rows):
-        if const_expr(TL):
-            t0 = now()
         ag_stage_free(L, tid % i32(64), a)
         cbar(L, tid)
         u16 = I // 2 // 16
@@ -887,9 +849,6 @@ def build_schedule(kc: KernelCtx) -> dict:
         for row, c, sv in ds:
             lds_st(L, i32(L_INTERS) + row * i32(I // 32) + c * i32(4), fx.Int32(sv))
         cbar(L, tid)
-        if const_expr(TL):  # noqa: SIM102
-            if tid == i32(0):
-                tl_add(a["ctrl"], CTRL_INTS, 17, t0)
 
     @flyc.jit
     def lb_finish(tid, a, L):
