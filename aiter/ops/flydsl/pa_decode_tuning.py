@@ -17,7 +17,9 @@ from pathlib import Path
 import torch
 from flydsl.autotune import Config, autotune
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.pa_decode import implementation_cache_tag
+from aiter.ops.flydsl.kernels.pa_decode.traits import d256_pipe
 from aiter.ops.flydsl.kernels.pa_decode_plan import PADecodePlan, plan_pa_decode
 from aiter.ops.flydsl.pa_decode import pa_decode
 
@@ -30,6 +32,15 @@ def _tuning_cache_tag():
     digest = sha256(implementation_cache_tag().encode())
     digest.update(Path(__file__).read_bytes())
     return digest.hexdigest()
+
+
+def _cache_geometry(key_cache):
+    """KV heads, page size and layout of a packed 5D K cache."""
+    if key_cache.ndim == 4:
+        raise NotImplementedError("Non-transposed key cache is not implemented")
+    if key_cache.ndim != 5:
+        raise ValueError("key_cache must be 5D")
+    return key_cache.shape[1], key_cache.shape[3], "packed"
 
 
 class _PADecodeAutotuneResources:
@@ -66,16 +77,17 @@ class _PADecodeAutotuneResources:
                         dtype=torch.float32,
                         device=self.query.device,
                     )
+        num_kv_heads = _cache_geometry(key)[0]
         plan = plan_pa_decode(
             lengths,
-            key.shape[1],
+            num_kv_heads,
             max_partitions=self.max_partitions,
             workgroup_budget=workgroup_budget,
             sliding_window=self.options["sliding_window"],
             query_length=query_length,
         )
-        rows = query_length * self.query.shape[1] // key.shape[1]
-        scalar_shape = (key.shape[1], plan.capacity, rows)
+        rows = query_length * self.query.shape[1] // num_kv_heads
+        scalar_shape = (num_kv_heads, plan.capacity, rows)
         output = torch.full_like(
             self.query, float("nan"), memory_format=torch.contiguous_format
         )
@@ -138,9 +150,9 @@ def _pa_decode_configs(*args, resources, num_cu, **kwargs):
     baseline = 2 * num_cu
     resources.prepare(baseline)
     batch = resources.args[2].numel()
-    kv_heads = resources.args[0].shape[1]
+    kv_heads = _cache_geometry(resources.args[0])[0]
     capacities = {}
-    for budget in [baseline, 128, 256, 512, 1024, 2048, 4096]:
+    for budget in [baseline, num_cu, 128, 256, 512, 1024, 2048, 4096]:
         capacity = min(
             batch * resources.max_partitions,
             max(batch, (budget + kv_heads - 1) // kv_heads),
@@ -149,8 +161,45 @@ def _pa_decode_configs(*args, resources, num_cu, **kwargs):
     return list(capacities.values())
 
 
-def _pa_decode_default(*args, num_cu, **kwargs):
-    return Config(workgroup_budget=2 * num_cu)
+def _default_workgroup_budget(
+    *,
+    num_cu,
+    arch,
+    head_dim,
+    block_size,
+    kv_dtype,
+    query_length,
+    query_group_size,
+):
+    """CU count for the head-256 pipe, otherwise two CTAs per CU."""
+    one_cta_per_cu = d256_pipe(
+        arch,
+        "fp8" if "float8" in kv_dtype else "bf16",
+        head_dim,
+        block_size,
+        query_length,
+        query_group_size,
+    )
+    return num_cu if one_cta_per_cu else 2 * num_cu
+
+
+def _pa_decode_default(*args, **kwargs):
+    return Config(
+        workgroup_budget=_default_workgroup_budget(
+            **{
+                name: kwargs[name]
+                for name in (
+                    "num_cu",
+                    "arch",
+                    "head_dim",
+                    "block_size",
+                    "kv_dtype",
+                    "query_length",
+                    "query_group_size",
+                )
+            }
+        )
+    )
 
 
 @contextmanager
@@ -174,6 +223,7 @@ def _validate_pa_decode_config(arguments):
         "query_group_size",
         "head_dim",
         "block_size",
+        "layout",
         "query_length",
         "query_dtype",
         "kv_dtype",
@@ -183,6 +233,7 @@ def _validate_pa_decode_config(arguments):
         "sliding_window",
         "max_partitions",
         "num_cu",
+        "arch",
         "implementation",
     ],
     default=_pa_decode_default,
@@ -194,6 +245,7 @@ def _pa_decode_autotuner(
     query_group_size,
     head_dim,
     block_size,
+    layout,
     query_length,
     query_dtype,
     kv_dtype,
@@ -203,6 +255,7 @@ def _pa_decode_autotuner(
     sliding_window,
     max_partitions,
     num_cu,
+    arch,
     implementation,
     resources,
     *,
@@ -249,7 +302,9 @@ def prepare_pa_decode_plan(
     """Select a work budget using native FlyDSL autotune, then build a plan.
 
     Call outside graph capture with the actual decode tensors/options. Native
-    cache hits and misses with the 2*CU default do not launch candidates.
+    cache hits and misses with the default do not launch candidates. The default
+    budget is the CU count for the one-CTA-per-CU head-256 pipe shapes (see
+    ``d256_pipe``) and twice the CU count otherwise.
     Set FLYDSL_AUTOTUNE=1 to prepare candidate workspaces/graphs and search with
     FlyDSL's default benchmark and fastest-config selection. Candidates must
     agree with the 2*CU baseline before timing.
@@ -261,8 +316,9 @@ def prepare_pa_decode_plan(
     ``config_dir`` selects a root containing per-architecture cache directories
     and takes precedence over the environment's cache-directory override.
 
-    Cache by attention geometry and execution modes. Tensor strides, total KV
-    cache pages, block-table padding, and max_context_length do not partition
+    A 4D ``key_cache`` is not implemented. Cache by attention geometry and
+    execution modes. Tensor strides,
+    total KV cache pages, block-table padding, and max_context_length do not partition
     the tuning cache; max_context_length still bounds kernel scheduling.
 
     Retain the returned plan for decode/graph replay. Refresh it with
@@ -275,11 +331,23 @@ def prepare_pa_decode_plan(
         properties = torch.cuda.get_device_properties(query.device)
         num_cu = properties.multi_processor_count
         limit = num_cu if max_partitions is None else max_partitions
+        num_kv_heads, block_size, layout = _cache_geometry(key_cache)
+        arch = get_gfx_runtime()
+        default_budget = _default_workgroup_budget(
+            num_cu=num_cu,
+            arch=arch,
+            head_dim=query.shape[-1],
+            block_size=block_size,
+            kv_dtype=str(key_cache.dtype),
+            query_length=query_length,
+            query_group_size=query.shape[1] // num_kv_heads,
+        )
         # Validate plan geometry even when native autotune takes the default.
         default_plan = plan_pa_decode(
             context_lengths,
-            key_cache.shape[1],
+            num_kv_heads,
             max_partitions=limit,
+            workgroup_budget=default_budget,
             sliding_window=sliding_window,
             query_length=query_length,
         )
@@ -305,15 +373,15 @@ def prepare_pa_decode_plan(
             limit,
         )
 
-        arch = properties.gcnArchName.split(":", 1)[0]
         config_dir = None if config_dir is None else Path(config_dir)
         tuner = _get_pa_decode_autotuner(arch, config_dir)
         tuning_args = {
             "num_seqs": context_lengths.numel(),
-            "num_kv_heads": key_cache.shape[1],
-            "query_group_size": query.shape[1] // key_cache.shape[1],
+            "num_kv_heads": num_kv_heads,
+            "query_group_size": query.shape[1] // num_kv_heads,
             "head_dim": query.shape[-1],
-            "block_size": key_cache.shape[3],
+            "block_size": block_size,
+            "layout": layout,
             "query_length": query_length,
             "query_dtype": str(query.dtype),
             "kv_dtype": str(key_cache.dtype),
@@ -325,6 +393,7 @@ def prepare_pa_decode_plan(
             "sliding_window": default_plan.sliding_window,
             "max_partitions": limit,
             "num_cu": num_cu,
+            "arch": arch,
             "implementation": _tuning_cache_tag(),
             "resources": resources,
         }
@@ -349,11 +418,11 @@ def prepare_pa_decode_plan(
             or config.pre_hook is not None
         ):
             raise ValueError("Invalid PA workgroup budget in FlyDSL autotune cache")
-        if budget == 2 * num_cu:
+        if budget == default_budget:
             return default_plan
         return plan_pa_decode(
             context_lengths,
-            key_cache.shape[1],
+            num_kv_heads,
             max_partitions=limit,
             workgroup_budget=budget,
             sliding_window=default_plan.sliding_window,
@@ -524,7 +593,7 @@ def main(argv=None):
     torch.cuda.set_device(args.device)
     device = torch.device("cuda", args.device)
     properties = torch.cuda.get_device_properties(device)
-    arch = properties.gcnArchName.split(":", 1)[0]
+    arch = get_gfx_runtime()
     if arch not in ("gfx942", "gfx950"):
         raise RuntimeError(f"PA decode tuning only supports gfx942/gfx950, got {arch}")
     if (
