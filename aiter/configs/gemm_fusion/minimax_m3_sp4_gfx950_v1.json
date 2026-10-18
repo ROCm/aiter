@@ -78,6 +78,7 @@
     },
     "shared_large_total_bytes": 398458880
   },
+  "wait_budget_us": 5000000,
   "generated_by": {
     "tool": "aiter.ops.gemm_fusion.sp_qkv.gen_profile",
     "ledger": "sp4-opus-mori-playground records/branch-ledger.md r165 (small), r152 (large)",

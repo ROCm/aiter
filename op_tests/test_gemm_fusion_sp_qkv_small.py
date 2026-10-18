@@ -2444,3 +2444,158 @@ def test_release_frees_each_window_local_allocation_after_deregister_before_comm
     monkeypatch.setenv("AITER_GEMM_FUSION_FREE_BEFORE_DESTROY", "0")
     _r, ev2 = build()
     assert [e[0] for e in ev2].count("free") == 0  # old behaviour for A/B
+
+# ======================================================================= wait_budget_us (large-M per-wait poll budget) + poison-reason logging
+def _log_capture(level=logging.INFO):
+    msgs = []
+
+    class H(logging.Handler):
+        def emit(self, rec):
+            msgs.append(rec.getMessage())
+
+    lg = logging.getLogger("aiter.gemm_fusion")
+    h, old = H(level=level), lg.level
+    lg.addHandler(h)
+    lg.setLevel(level)
+    return msgs, lambda: (lg.removeHandler(h), lg.setLevel(old))
+
+
+def test_wait_budget_resolution_precedence_default_validation_and_profile_value(monkeypatch):
+    from aiter.gemm_fusion.resources import DEFAULT_WAIT_BUDGET_US, FusionResources, ResourceError, resolve_wait_budget_us
+
+    monkeypatch.delenv("AITER_GEMM_FUSION_WAIT_BUDGET_US", raising=False)
+    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
+    prof = profmod.load_profile(PROFILE)
+    assert prof.meta["wait_budget_us"] == 5_000_000 == DEFAULT_WAIT_BUDGET_US  # the regenerated shipped profile carries it
+    assert resolve_wait_budget_us(prof) == (5_000_000, "profile")
+    assert resolve_wait_budget_us(None) == (5_000_000, "default")  # no profile: the 5 s default (not the kernel's 50 ms)
+    bare = profmod.parse_profile({"profile": "nobudget", "rows": []})
+    assert resolve_wait_budget_us(bare) == (5_000_000, "default")  # a profile without the field: default
+    custom = profmod.parse_profile({"profile": "c", "wait_budget_us": 2_000_000, "rows": []})
+    assert resolve_wait_budget_us(custom) == (2_000_000, "profile")
+    monkeypatch.setenv("AITER_GEMM_FUSION_WAIT_BUDGET_US", "123456")  # env overrides (tuning only)
+    assert resolve_wait_budget_us(custom) == (123456, "env") and resolve_wait_budget_us(None) == (123456, "env")
+    for bad in ("0", "-5", "abc", "1.5"):
+        monkeypatch.setenv("AITER_GEMM_FUSION_WAIT_BUDGET_US", bad)
+        with pytest.raises(ResourceError, match="AITER_GEMM_FUSION_WAIT_BUDGET_US"):
+            resolve_wait_budget_us(None)
+    monkeypatch.delenv("AITER_GEMM_FUSION_WAIT_BUDGET_US")
+    for badv in (0, -1, 1.5, "5", True):
+        with pytest.raises(ResourceError, match="wait_budget_us"):
+            resolve_wait_budget_us(profmod.parse_profile({"profile": "b", "wait_budget_us": badv, "rows": []}))
+    # FusionResources resolves it ONCE from its explicit profile and logs it with the comm line
+    msgs, undo = _log_capture()
+    try:
+        r = FusionResources(0, 4, dist=FakeDist(), backend=RealisticFirstFit(), profile=PROFILE, window_bytes=4 << 20, max_windows=2)
+    finally:
+        undo()
+    assert (r.wait_budget_us, r.wait_budget_source) == (5_000_000, "profile")
+    assert any("event=resources comm" in m and "wait_budget_us=5000000 (profile)" in m for m in msgs)
+
+
+def test_large_context_passes_the_budget_to_every_launch_and_defaults_to_the_kernel_when_unset():
+    from types import SimpleNamespace as NS
+
+    import aiter.ops.gemm_fusion.sp_qkv.large_rt as lrt
+
+    seen = []
+    lib = NS(lg_launch_v1=lambda h, A, W, As, Ws, sA, poll, budget, n, hf, stream: (seen.append(budget), 0)[1])
+    ctx = lrt.LargeContext(lib, 1, 2048, 2304, 0)
+    assert ctx.budget_us == 0  # unset: the kernel's own default (50 ms)
+    ctx.launch(1, 2, 3, 4, 5, 2, 0, None)
+    ctx.budget_us = 5_000_000
+    ctx.launch(1, 2, 3, 4, 5, 2, 0, None)
+    ctx.launch(1, 2, 3, 4, 5, 2, 0, None, budget_us=777)  # an explicit per-call value still wins
+    assert seen == [0, 5_000_000, 777]
+
+
+def test_large_plan_context_gets_the_resources_budget_and_logs_it(monkeypatch):
+    """variants_large._context copies FusionResources.wait_budget_us onto the LargeContext (so every launch, incl. the one captured in a graph, carries it)."""
+    import inspect
+
+    import aiter.ops.gemm_fusion.sp_qkv.variants_large as vl
+
+    src = inspect.getsource(vl.SpQkvLarge._context)
+    assert 'got.budget_us = int(getattr(res, "wait_budget_us", 0) or 0)' in src and "event=binding large_wait_budget" in src and "baked at graph capture" in src
+    run_src = inspect.getsource(vl.SpQkvLarge.run)
+    assert "c.launch(" in run_src and "budget_us=" not in run_src  # the budget lives on the context: the launch call itself is unchanged
+
+
+class _Rep:
+    def __init__(self, poison=0, report=None):
+        self.poison, self.rep = poison, report or {}
+
+    def read(self):
+        return self.poison
+
+    def report(self):
+        return self.rep
+
+
+def test_poison_reason_is_logged_before_quiesce_clears_it_large_and_small(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources
+    from aiter.ops.gemm_fusion.sp_qkv.variants import decode_small_poison
+    from aiter.ops.gemm_fusion.sp_qkv.variants_large import decode_large_poison
+
+    for var in ("AITER_GEMM_FUSION_PROFILE", "AITER_GEMM_FUSION_WAIT_BUDGET_US"):
+        monkeypatch.delenv(var, raising=False)
+    be = RealisticFirstFit()
+    ev = []
+    be.device_sync = lambda dev: ev.append("sync")
+    be.zero = lambda dev, loc, n: ev.append("zero")
+    r = FusionResources(0, 4, dist=FakeDist(), backend=be, window_bytes=4 << 20, max_windows=2, policy="per_owner", profile=None)
+    r.ensure("L", [WindowReq("a", 100, "p2p_window")])
+    r.ensure("S", [WindowReq("a", 100, "p2p_window")])
+    large = _Rep(2, {"epoch": 7, "poison": 2, "poison_reason": 2, "credit_wait_ticks_100MHz": 123})
+    small = _Rep(0x105)
+
+    def large_read():
+        ev.append("read_large")
+        return large.read()
+
+    r.set_poison("L", large_read, large.report, decode_large_poison)
+    r.set_poison("S", lambda: (ev.append("read_small"), small.read())[1], None, decode_small_poison)
+    r.finalize()
+    ev.clear()
+    msgs, undo = _log_capture(logging.WARNING)
+    try:
+        r.quiesce_and_reset()
+    finally:
+        undo()
+    pm = [m for m in msgs if "event=resources poison" in m]
+    assert len(pm) == 2 and all("where=quiesce_and_reset" in m and "wait_budget_us=5000000 (default)" in m for m in pm)
+    L = [m for m in pm if "owner=L" in m][0]
+    assert "W2_TIMEOUT(arrival wait" in L and "word=2" in L and "poison_reason=2" in L and "epoch=7" in L and "credit_wait_ticks_100MHz=123" in L
+    S = [m for m in pm if "owner=S" in m][0]
+    assert "OVERSHOOT" in S and "why=0x5" in S and "word=0x105" in S
+    assert ev.index("zero") > max(i for i, e in enumerate(ev) if e in ("read_large", "read_small"))  # logged BEFORE any window is zeroed/cleared
+    # not poisoned: nothing logged; the report is not even read
+    large.poison, small.poison = 0, 0
+    msgs, undo = _log_capture(logging.WARNING)
+    try:
+        r.quiesce_and_reset()
+        assert r.log_poison("x") == 0
+    finally:
+        undo()
+    assert not [m for m in msgs if "event=resources poison" in m]
+    # poison_local() semantics are unchanged (OR of the words)
+    large.poison = 1
+    assert r.poison_local() == 1
+
+
+def test_decoders_name_the_failing_wait():
+    from aiter.ops.gemm_fusion.sp_qkv.variants import decode_small_poison
+    from aiter.ops.gemm_fusion.sp_qkv.variants_large import decode_large_poison
+
+    assert "W1_TIMEOUT(credit wait" in decode_large_poison(1) and "W2_TIMEOUT(arrival wait" in decode_large_poison(2)
+    assert "POSTER_WAIT" in decode_large_poison(6) and "EPOCH_MISMATCH" in decode_large_poison(3) and "UNKNOWN" in decode_large_poison(99)
+    assert "OVERSHOOT" in decode_small_poison(0x142) and "why=0x42" in decode_small_poison(0x142)
+    assert "TIMEOUT-or-other" in decode_small_poison(0x40)  # the kernel's T != 4*M contract poison is reported as the raw code, not mislabelled
+
+
+def test_wait_budget_documents_the_capture_bake_in_and_costs():
+    from aiter.gemm_fusion import resources as rmod
+
+    assert "BAKED into a captured graph" in rmod.resolve_wait_budget_us.__doc__ and "before capture" in rmod.resolve_wait_budget_us.__doc__
+    g = open(os.path.join(os.path.dirname(specs.__file__), "gen_profile.py"), encoding="utf-8").read()
+    assert "BAKED into a captured graph" in g and "failure-detection latency" in g

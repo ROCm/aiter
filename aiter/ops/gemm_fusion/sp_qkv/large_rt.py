@@ -78,15 +78,17 @@ def info(lib):
 class LargeContext:
     def __init__(self, lib, h, M, F, rank):
         self.lib, self.h, self.M, self.F, self.rank = lib, h, M, F, rank
+        self.budget_us = 0  # per-wait poll budget (us) passed to every launch; 0 = the kernel default (50 ms). Set by the plan from FusionResources.wait_budget_us.
 
     def init_control(self):
         rc = self.lib.lg_init_control_v1(self.h)
         if rc != 0:
             raise RuntimeError(f"lg_comm_init_control rc={rc}")
 
-    def launch(self, A, W, As, Ws, strideA, puts_per_peer, half_first, stream, budget_us=0):
+    def launch(self, A, W, As, Ws, strideA, puts_per_peer, half_first, stream, budget_us=None):
+        # budget_us is a kernel ARGUMENT baked into a captured graph's argument block at capture time (see resources.resolve_wait_budget_us)
         rc = self.lib.lg_launch_v1(self.h, C.c_void_p(A), C.c_void_p(W), C.c_void_p(As), C.c_void_p(Ws), strideA,
-                                     POLL_ITERATIONS, budget_us, puts_per_peer, half_first, stream)
+                                     POLL_ITERATIONS, self.budget_us if budget_us is None else budget_us, puts_per_peer, half_first, stream)
         if rc != 0:
             raise RuntimeError(f"lg_comm_launch rc={rc}")
 

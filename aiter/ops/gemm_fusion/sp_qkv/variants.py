@@ -49,6 +49,14 @@ def small_window_bytes(mode: str) -> Dict[str, int]:
     return {"rx": rx, "ctl": ctl}
 
 
+def decode_small_poison(word: int) -> str:
+    """The small-M poison word is the `why` code of the failing site; bit 0x100 = the wait found the flag AHEAD of the expected epoch (overshoot / epoch
+    mismatch), otherwise a bounded-poll TIMEOUT (poll_iterations = 20,000,000 s_sleep(2) iterations). The per-site `why` values are kernel-internal (ran_kernel.cu)."""
+    w = int(word)
+    kind = "OVERSHOOT(flag ahead of expected epoch)" if w & 0x100 else "TIMEOUT-or-other(bounded poll / contract check)"
+    return f"{kind} why={w & 0xFF:#x} word={w:#x}"
+
+
 def _require_zeroed(res, owner: str):
     """With the default zero mode (h2d_deferred) the windows are zeroed in FusionResources.finalize(); a launch before that would run on garbage control state."""
     if getattr(res, "pending_zero", 0):
@@ -129,7 +137,7 @@ class SpQkvSmall(Plan):
                 raise RuntimeError(f"sm_attach rc={rc}")
             got = sc[self.owner] = rt.SmallContext(lib, h)
             res.set_close(self.owner, got.close)  # L-5: frees Blk, P, modules, ctx before comm teardown
-            res.set_poison(self.owner, lambda c=got: c.poison_fast(rt.stream_handle(None)))  # cheap per-step check on the CURRENT torch stream (4-byte D2H + that stream sync)
+            res.set_poison(self.owner, lambda c=got: c.poison_fast(rt.stream_handle(None)), None, decode_small_poison)  # cheap per-step check on the CURRENT torch stream (4-byte D2H + that stream sync)
         self._ctx = got
         return got
 

@@ -19,6 +19,7 @@ resources module docstring: divergence is detected by the host-side digest, not 
 from __future__ import annotations
 
 import hashlib
+import logging
 from typing import Dict, List
 
 from aiter.gemm_fusion.catalog import Contract, register_variant
@@ -30,6 +31,8 @@ from . import large_rt as lrt
 from . import specs
 from .jit import build_large, large_defs
 from .small_rt import stream_handle
+
+log = logging.getLogger("aiter.gemm_fusion")
 
 _F = {"dense": 2304, "indexer": 2560, "reuse": 2304}
 LG_CONTROL_MIN_BYTES = 8192  # control window image (LGC_STATE_OFF + state words); the device code never addresses beyond it with LG_STAMPS=0
@@ -82,6 +85,13 @@ def preflight_attach(res, owner: str, M: int, wins, built):
     got = hashlib.sha256(open(built.hsaco, "rb").read()).hexdigest()
     if got != built.hsaco_sha256:
         raise RuntimeError(f"preflight {owner}: hsaco sha256 {got} != expected {built.hsaco_sha256}")
+
+
+def decode_large_poison(word: int) -> str:
+    """Which wait failed: the r11 sticky poison word is the reason code (lg_comm_abi_v2.h LGC_POISON_*)."""
+    from aiter.gemm_fusion.resources import LG_POISON_NAMES
+
+    return f"{LG_POISON_NAMES.get(int(word), 'UNKNOWN')} word={int(word)}"
 
 
 def _mode_from_owner(owner: str) -> str:  # owner = "sp_qkv.large/<mode>/M<M>"
@@ -163,6 +173,9 @@ class SpQkvLarge(Plan):
                                    f"hsaco={built.hsaco} sha256={built.hsaco_sha256} devcomm_queues={getattr(res, 'sdma_queues', '?')} "
                                    f"devcomm_info={getattr(res, 'devcomm_info', None)}")
             got = sc[self.owner] = lrt.LargeContext(lib, C.c_void_p(h), self.M, self.F, res.rank)
+            got.budget_us = int(getattr(res, "wait_budget_us", 0) or 0)  # profile wait_budget_us / env / 5 s default; baked into captured graphs at capture time
+            log.info("event=binding large_wait_budget rank=%d owner=%s budget_us=%d source=%s (kernel argument, baked at graph capture)", res.rank, self.owner, got.budget_us,
+                     getattr(res, "wait_budget_source", "?"))
             res.set_close(self.owner, got.close)  # L-5 (per context: each frees its own module/ctx)
             hooks = dict(poison=lambda c=got: c.poison(stream_handle(None)),  # cheap per-step check on the CURRENT torch stream (4-byte D2H + that stream sync)
                          drain=lambda c=got: c.drain_all(C.c_void_p(None)),  # A2-H: quietQueue on all peer queues before any reset
@@ -170,9 +183,9 @@ class SpQkvLarge(Plan):
             if getattr(Cw, "shared", False):
                 # ONE control block for every large plan: its init/drain/poison are registered ONCE (by the first context that attaches). A later
                 # context attaching to the already LIVE block must not run init_control (that would reset the epoch on this rank only).
-                res.set_shared_hooks(init=hooks["init"], drain=hooks["drain"], poison=hooks["poison"])
+                res.set_shared_hooks(init=hooks["init"], drain=hooks["drain"], poison=hooks["poison"], poison_report=got.report, poison_decode=decode_large_poison)
             else:
-                res.set_poison(self.owner, hooks["poison"])
+                res.set_poison(self.owner, hooks["poison"], got.report, decode_large_poison)
                 res.set_drain(self.owner, hooks["drain"])
                 res.set_init(self.owner, hooks["init"])
         self._ctx = got

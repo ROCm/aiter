@@ -59,10 +59,18 @@ def window_budget():
             "shared": shared, "shared_large_total_bytes": sum(small_sizes) + sum(shared.values())}
 
 
+WAIT_BUDGET_US = 5_000_000
+
+
 def build_profile():
     return {
         "profile": "minimax_m3_sp4_gfx950_v1",
         "window_budget": window_budget(),
+        # Large-M per-WAIT poll budget in microseconds (credit wait, arrival wait, group waits): a per-launch kernel ARGUMENT, BAKED into a captured graph's argument
+        # block at capture time (resolve before capture). 5 s: the r11 kernel default of 50 ms is shorter than plausible cold-start / host skew between ranks in a serving
+        # engine; the cost of a large value is only failure-detection latency (a dead peer holds the stream for up to ~2-3 budgets). AITER_GEMM_FUSION_WAIT_BUDGET_US
+        # overrides it for tuning only. Small-M uses an iteration count (20,000,000) instead and is not affected.
+        "wait_budget_us": WAIT_BUDGET_US,
         "generated_by": {"tool": "aiter.ops.gemm_fusion.sp_qkv.gen_profile", "ledger": "sp4-opus-mori-playground records/branch-ledger.md r165 (small), r152 (large)",
                          "note": "m is local tokens per rank (T/4); exact rows only"},
         "rows": build_rows(),

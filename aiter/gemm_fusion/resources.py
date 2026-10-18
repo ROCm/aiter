@@ -49,6 +49,11 @@ ENV_ALIGN_CAP_MIB = "AITER_GEMM_FUSION_ALIGN_CAP_MIB"  # aligned policy: cap of 
 POLICIES = ("uniform", "per_owner", "aligned", "shared_large", "abs_aligned", "arena", "arena_per_owner")
 ARENA_ALIGN = 4 << 20  # sub-window offsets/sizes inside the arena are multiples of 4 MiB (the size every window used in the passing layouts was a multiple of)
 ENV_FREE_BEFORE_DESTROY = "AITER_GEMM_FUSION_FREE_BEFORE_DESTROY"  # default ON: ccoMemFree(local) after each ccoWindowDeregister (MORI's documented teardown); =0 = old behaviour (A/B)
+ENV_WAIT_BUDGET_US = "AITER_GEMM_FUSION_WAIT_BUDGET_US"  # TUNING ONLY: overrides the profile's wait_budget_us (large-M per-wait poll budget, microseconds)
+DEFAULT_WAIT_BUDGET_US = 5_000_000  # 5 s when neither the env nor the explicit profile carries one (the r11 kernel default of 50 ms is too tight for a serving engine)
+# r11 poison reasons (lg_comm_abi_v2.h LGC_POISON_*): which wait failed
+LG_POISON_NAMES = {1: "W1_TIMEOUT(credit wait: a peer never began this epoch)", 2: "W2_TIMEOUT(arrival wait: a peer's puts did not complete)",
+                   3: "EPOCH_MISMATCH", 4: "DUP_CHUNK", 5: "CONFIG(host/device build or plan mismatch)", 6: "POSTER_WAIT(local GEMM group wait timed out)"}
 ENV_ARENA_MIB = "AITER_GEMM_FUSION_ARENA_MIB"  # arena policies: arena size override (MiB)
 ENV_ABS_ALIGN = "AITER_GEMM_FUSION_ABS_ALIGN"  # shared_large only: =0 disables the absolute-VA alignment / ordered pre-registration (A/B); default on
 ENV_SPACER_GRAN_MIB = "AITER_GEMM_FUSION_SPACER_GRAN_MIB"  # round spacer sizes up to this many MiB (default: the CCO granule G, 4 KiB)
@@ -400,6 +405,29 @@ class CcoBackend:
         self._chk(self.lib.gf_comm_destroy_v1(comm), "gf_comm_destroy")
 
 
+def resolve_wait_budget_us(profile=None) -> Tuple[int, str]:
+    """Per-wait poll budget (microseconds) of the large-M kernels and where it came from: ('env'|'profile'|'default').
+    Precedence: AITER_GEMM_FUSION_WAIT_BUDGET_US (tuning only) > the EXPLICIT profile's top-level wait_budget_us > DEFAULT_WAIT_BUDGET_US (5 s).
+    The value is a per-launch KERNEL ARGUMENT that is BAKED into a captured graph's argument block at capture time: it must be resolved before capture;
+    changing the env/profile afterwards does not affect graphs that were already captured."""
+    env = os.environ.get(ENV_WAIT_BUDGET_US)
+    if env not in (None, ""):
+        try:
+            v = int(env)
+        except ValueError:
+            raise ResourceError(f"{ENV_WAIT_BUDGET_US} must be a positive integer (microseconds), got {env!r}") from None
+        if v <= 0:
+            raise ResourceError(f"{ENV_WAIT_BUDGET_US} must be > 0 microseconds, got {v}")
+        return v, "env"
+    if profile is not None:
+        v = getattr(profile, "meta", {}).get("wait_budget_us")
+        if v is not None:
+            if not isinstance(v, int) or isinstance(v, bool) or v <= 0:
+                raise ResourceError(f"profile wait_budget_us must be a positive integer (microseconds), got {v!r}")
+            return int(v), "profile"
+    return DEFAULT_WAIT_BUDGET_US, "default"
+
+
 class FusionResources:
     """rank/world/group come from the caller (ATOM's SP group). ``dist`` is torch.distributed (or a fake)."""
 
@@ -432,6 +460,7 @@ class FusionResources:
         self.reg_sync = _flag(reg_sync, ENV_REG_SYNC)
         self.allow_late = _flag(late_registration, ENV_LATE_REG)
         self.profile = self._resolve_profile(profile)  # explicit only: a Profile object or a name/path; NEVER the AITER_GEMM_FUSION_PROFILE env
+        self.wait_budget_us, self.wait_budget_source = resolve_wait_budget_us(self.profile)
         self.window_bytes, self.max_windows = self._budget(window_bytes, max_windows)
         if vmm_bytes is None:
             if self.policy == "uniform" and self.window_bytes:
@@ -480,6 +509,7 @@ class FusionResources:
         self._init_hooks: Dict[str, Callable[[], None]] = {}  # owner -> control-block initializer (re-run after every zeroing)
         self._drain_hooks: Dict[str, Callable[[], None]] = {}  # owner -> pre-reset SDMA drain
         self._close_hooks: Dict[str, Callable[[], None]] = {}  # owner -> free host/driver objects (L-5), run at release()
+        self._poison_info: Dict[str, tuple] = {}  # owner -> (report reader, poison decoder), logging only
         self._poison_hooks: Dict[str, Callable[[], int]] = {}  # owner -> cheap poison word read (host, outside capture)
         self.sdma_queues = 0  # set by finalize(): sdmaQueueCount given to ccoDevCommCreate
         self.devcomm_info = None  # set by finalize(): {lsaSize, lsaRank, sdmaNumQueue, worldSize, ...} read back from the created devcomm
@@ -540,8 +570,9 @@ class FusionResources:
         self.dist.broadcast_object_list(uid, src=self._src0(), group=self.group)
         self._mem_before_comm = self._mem_info()
         self.comm = self.backend.comm_create(self.rank, self.world, uid[0], self._vmm, self.device)
-        log.info("event=resources comm rank=%d world=%d heap_bytes=%d policy=%s window_bytes=%s max_windows=%s reg_barrier=%d reg_sync=%d late=%d zero_mode=%s",
-                 self.rank, self.world, self._vmm, self.policy, self.window_bytes, self.max_windows, self.reg_barrier, self.reg_sync, self.allow_late, self.zero_mode)
+        log.info("event=resources comm rank=%d world=%d heap_bytes=%d policy=%s window_bytes=%s max_windows=%s reg_barrier=%d reg_sync=%d late=%d zero_mode=%s wait_budget_us=%d (%s)",
+                 self.rank, self.world, self._vmm, self.policy, self.window_bytes, self.max_windows, self.reg_barrier, self.reg_sync, self.allow_late, self.zero_mode,
+                 self.wait_budget_us, self.wait_budget_source)
         if self._budget_doc:
             tbl = policy_memory_table(self._budget_doc, self.align_cap)
             log.info("event=resources policy_memory rank=%d selected=%s %s", self.rank, self.policy,
@@ -896,7 +927,7 @@ class FusionResources:
     def has_hook(self, kind: str, key: str) -> bool:
         return key in {"init": self._init_hooks, "drain": self._drain_hooks, "poison": self._poison_hooks, "close": self._close_hooks}[kind]
 
-    def set_shared_hooks(self, key: str = SHARED_KEY, *, init=None, drain=None, poison=None) -> bool:
+    def set_shared_hooks(self, key: str = SHARED_KEY, *, init=None, drain=None, poison=None, poison_report=None, poison_decode=None) -> bool:
         """Register the control-block init / SDMA drain / poison read of a SHARED window set exactly once. Returns True for the first caller.
         Later owners attaching to the same live set must NOT re-run init (that would reset the epoch on this rank only)."""
         if self.has_hook("init", key) or self.has_hook("drain", key) or self.has_hook("poison", key):
@@ -904,7 +935,7 @@ class FusionResources:
         if drain is not None:
             self.set_drain(key, drain)
         if poison is not None:
-            self.set_poison(key, poison)
+            self.set_poison(key, poison, poison_report, poison_decode)
         if init is not None:
             self.set_init(key, init)  # runs once now (epoch=1 + magic), then after every zeroing
         return True
@@ -936,8 +967,36 @@ class FusionResources:
         and BEFORE devcomm/window/comm teardown (L-5)."""
         self._close_hooks[owner] = fn
 
-    def set_poison(self, owner: str, fn: Callable[[], int]):
+    def set_poison(self, owner: str, fn: Callable[[], int], report: Optional[Callable[[], dict]] = None, decode: Optional[Callable[[int], str]] = None):
+        """`fn` returns the device poison word. Optional `report` (host read of the owner's report words, only called when poisoned) and `decode`
+        (poison word -> which wait failed) are used ONLY to log the reason before quiesce_and_reset clears it."""
         self._poison_hooks[owner] = fn
+        self._poison_info[owner] = (report, decode)
+
+    def log_poison(self, where: str) -> int:
+        """Log every poisoned owner's reason (and the report words when available) BEFORE the reset zeroes them; returns the OR of the poison words.
+        Reads the 4-byte poison word per owner (and the report only if poisoned); call outside capture. Logged at WARNING: event=resources poison."""
+        total = 0
+        for owner, fn in list(self._poison_hooks.items()):
+            try:
+                p = int(fn())
+            except Exception as e:  # noqa: BLE001  (diagnostic only: never mask the recovery that follows)
+                log.warning("event=resources poison rank=%d where=%s owner=%s read_failed=%s", self.rank, where, owner, e)
+                continue
+            total |= p
+            if not p:
+                continue
+            report, decode = self._poison_info.get(owner, (None, None))
+            rep = ""
+            if report is not None:
+                try:
+                    rep = " report=" + ",".join(f"{k}={v}" for k, v in report().items())
+                except Exception as e:  # noqa: BLE001
+                    rep = f" report_failed={e}"
+            what = decode(p) if decode is not None else f"word={p:#x}"
+            log.warning("event=resources poison rank=%d where=%s owner=%s reason=%s%s wait_budget_us=%d (%s)", self.rank, where, owner, what, rep,
+                        self.wait_budget_us, self.wait_budget_source)
+        return total
 
     def poison_local(self) -> int:
         """OR of every plan's device poison word on THIS rank (cheap: a 4-byte D2H + stream sync per plan; NOT capture-safe,
@@ -1038,6 +1097,7 @@ class FusionResources:
         """A2-H: device sync -> per-plan drain (large-M: lg_comm_drain_all) + device sync -> barrier -> reset/init windows
         -> device sync -> barrier. All ranks must call it."""
         self.backend.device_sync(self.device)
+        self.log_poison("quiesce_and_reset")  # the reason must be logged BEFORE the drain/zero/init below clears it
         for hook in self._drain_hooks.values():
             hook()
         if self._drain_hooks:
