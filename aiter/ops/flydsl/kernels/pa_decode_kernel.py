@@ -94,7 +94,7 @@ def compile_pa_decode_tile(
     query_splits: int | None = None,
     max_context_length: int | None = None,
     sliding_window: int = 0,
-    nhd_layout: bool = False,
+    trans_k: bool = True,
     from_table_width: bool = False,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
@@ -123,6 +123,7 @@ def compile_pa_decode_tile(
     ``work_capacity`` is a positive host integer matching the work plan.
     Positive ``sliding_window`` includes the query token.
     Plans cover the MTP window union; scores are masked per query row.
+    ``trans_k=False`` requires ``trans_v=False`` and selects NHD caches.
     All tasks write packed partials; the reducer applies sinks once and writes
     final output, including when the plan allows only one partition.
 
@@ -153,7 +154,7 @@ def compile_pa_decode_tile(
         work_capacity=work_capacity,
         max_context_length=max_context_length,
         sliding_window=sliding_window,
-        nhd_layout=nhd_layout,
+        trans_k=trans_k,
         from_table_width=from_table_width,
     )
     cached = _PA_DECODE_TILE_CACHE.get(schedule.cache_key)

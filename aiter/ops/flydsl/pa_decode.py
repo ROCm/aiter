@@ -311,7 +311,14 @@ def pa_decode(
             f"context_lengths.shape[0] ({num_seqs})"
         )
 
-    nhd_layout = key_cache.dim() == 4
+    trans_k = key_cache.dim() == 5
+    trans_v = value_cache.dim() == 5
+    if not trans_k and trans_v:
+        raise ValueError(
+            "NHD value_cache shape must match key_cache, "
+            f"got {tuple(value_cache.shape)} vs {tuple(key_cache.shape)}"
+        )
+    nhd_layout = (not trans_k) & (not trans_v)
     if nhd_layout:
         num_blocks, block_size, num_kv_heads, k_head = key_cache.shape
         if k_head != head_dim:
@@ -379,7 +386,6 @@ def pa_decode(
             f"pa_decode only supports block_size in (16, 64, 128), got {block_size}"
         )
 
-    trans_v = value_cache.dim() == 5
     if is_bf16_kv and not trans_v:
         raise ValueError("BF16 KV requires the vectorized 5D value_cache layout")
     if nhd_layout:
@@ -692,7 +698,7 @@ def pa_decode(
             max_context_length=schedule_context_length,
             from_table_width=max_context_length is None,
             sliding_window=sliding_window,
-            nhd_layout=nhd_layout,
+            trans_k=trans_k,
         )
 
     total_rows = query_length * query_group_size

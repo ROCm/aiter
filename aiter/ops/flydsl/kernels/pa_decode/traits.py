@@ -175,7 +175,7 @@ class PaDecodeSchedule:
         query_splits: int | None = None,
         max_context_length: int | None = None,
         sliding_window: int = 0,
-        nhd_layout: bool = False,
+        trans_k: bool = True,
         from_table_width: bool = False,
     ) -> PaDecodeSchedule:
         """Choose the existing policy from host-known grid and query bounds."""
@@ -183,6 +183,11 @@ class PaDecodeSchedule:
             raise TypeError("work_capacity must be a positive int")
         if work_capacity < 1:
             raise ValueError("work_capacity must be positive")
+        if not trans_k and trans_v:
+            raise NotImplementedError(
+                "Non-transposed key cache requires a non-transposed value cache"
+            )
+        nhd_layout = (not trans_k) & (not trans_v)
         arch = str(get_rocm_arch()).split(":", 1)[0]
         is_gfx950 = "gfx95" in arch
         if kv_dtype not in ("fp8", "bf16"):
