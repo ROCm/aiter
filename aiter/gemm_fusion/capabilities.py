@@ -130,6 +130,50 @@ def _dlopen_ok(path: str) -> bool:
         return False
 
 
+# ---- A-1 (arena review): the arena builds device-memory COPIES of MORI's ccoWindowDevice, so it is only valid against the MORI build the layout was audited on.
+PINNED_CCO_SO_SHA256 = "87b7322facd860c4f0ac8aa4207b3a17fe83c8c31df254f83d30b55a821e7652"  # libmori_cco.so (records/architecture/PR695-*/basis*.md)
+PINNED_CCO_HEADER_SHA256 = "cce155961f591bd81e35e8dcb9603d489e1c7a086ed04c5b9f0a6aeec8f915e6"  # cco.hpp (reference/mori/cco.hpp, 1870 lines)
+PINNED_WINDOW_DEVICE_ABI = (32, 0, 8, 12, 16)  # sizeof, offsetof winBase / stride4G / lsaRank / ibgdaWin
+ENV_ABI_PIN = "AITER_GEMM_FUSION_MORI_ABI_PIN"  # 'enforce' (default) | 'off' (skip the hash pin, e.g. to try another MORI build; the readback self-test still runs)
+_HASH_CACHE: dict = {}
+
+
+def _sha256_file(path: str) -> str:
+    import hashlib
+
+    st = os.stat(path)
+    key = (path, st.st_mtime_ns, st.st_size)
+    if key not in _HASH_CACHE:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for blk in iter(lambda: f.read(1 << 20), b""):
+                h.update(blk)
+        _HASH_CACHE[key] = h.hexdigest()
+    return _HASH_CACHE[key]
+
+
+def check_mori_abi_pin(env=None) -> Tuple[bool, str]:
+    """(ok, reason): the loaded CCO library and the header we compile against are exactly the audited ones. Never raises."""
+    env = os.environ if env is None else env
+    if env.get(ENV_ABI_PIN, "enforce").strip().lower() in ("off", "0", "false", "no"):
+        return True, f"pin check disabled by {ENV_ABI_PIN}"
+    try:
+        lib = resolve_cco_library(env)
+        if not lib or not os.path.isfile(lib):
+            return False, "CCO library path not resolvable for hashing"
+        hdr = os.path.join(mori_root(env), CCO_HEADER_REL)
+        if not os.path.isfile(hdr):
+            return False, f"CCO header missing: {hdr}"
+        sh_lib, sh_hdr = _sha256_file(lib), _sha256_file(hdr)
+        if sh_lib != PINNED_CCO_SO_SHA256:
+            return False, f"libmori_cco.so sha256 {sh_lib[:16]}... != pinned {PINNED_CCO_SO_SHA256[:16]}... ({lib})"
+        if sh_hdr != PINNED_CCO_HEADER_SHA256:
+            return False, f"cco.hpp sha256 {sh_hdr[:16]}... != pinned {PINNED_CCO_HEADER_SHA256[:16]}... ({hdr})"
+        return True, "ok"
+    except Exception as e:  # noqa: BLE001
+        return False, f"abi pin check error {e!r}"
+
+
 def probe_mori_cco(env=None, check_dlopen: bool = True) -> Tuple[bool, bool, str]:
     """(mori_cco, sdma, reason). Never raises."""
     try:

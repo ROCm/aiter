@@ -41,6 +41,7 @@ from .plan import WindowReq
 log = logging.getLogger("aiter.gemm_fusion")
 
 GRANULE = 4 << 20  # 4 MiB (Phase-1 r8g finding)
+DEFAULT_POLICY = "arena"  # A-3 (arena review): the default window policy; AITER_GEMM_FUSION_WINDOW_POLICY=uniform restores the Phase-1 equal-size layout (6.4 GiB)
 PER_RANK_VMM_BYTES = 4294967296  # 4 GiB, as in the Phase-1 drivers (ccoCommCreate rounds the slot to a 4 GiB multiple)
 HEAP_SLACK_BYTES = 256 << 20  # ccoDevCommCreate allocates its own resource window from the same heap
 ENV_POLICY = "AITER_GEMM_FUSION_WINDOW_POLICY"  # "uniform" (default) | "per_owner"
@@ -69,6 +70,10 @@ SHARED_KEY = "<shared>"  # hook key of a shared window set
 
 class ResourceError(RuntimeError):
     pass
+
+
+class _ArenaRefused(Exception):
+    """Internal: the arena failed its read-back self-test (on some rank): every rank falls back to the uniform policy."""
 
 
 class WindowAliasError(ResourceError):
@@ -309,7 +314,7 @@ class CcoBackend:
         for n, a in [
             ("gf_uid_v1", [u32, vp]), ("gf_comm_create_v1", [u32, u32, i32, vp, u64, C.POINTER(vp)]),
             ("gf_win_register_v1", [vp, u64, C.POINTER(vp), C.POINTER(vp)]), ("gf_peer_ptr_v1", [vp, vp, i32, C.POINTER(vp)]),
-            ("gf_devcomm_create_v1", [vp, u32, C.POINTER(vp)]), ("gf_devcomm_info_v1", [vp, vp, C.POINTER(u64)]), ("gf_zero_v1", [i32, vp, u64, i32]), ("gf_mem_info_v1", [i32, C.POINTER(u64)]), ("gf_comm_va_info_v1", [vp, C.POINTER(u64)]), ("gf_win_free_v1", [vp, vp]),
+            ("gf_devcomm_create_v1", [vp, u32, C.POINTER(vp)]), ("gf_devcomm_info_v1", [vp, vp, C.POINTER(u64)]), ("gf_zero_v1", [i32, vp, u64, i32]), ("gf_mem_info_v1", [i32, C.POINTER(u64)]), ("gf_comm_va_info_v1", [vp, C.POINTER(u64)]), ("gf_win_free_v1", [vp, vp]), ("gf_abi_info_v1", [C.POINTER(u64)]),
                      ("gf_win_view_v1", [vp, vp, u64, C.POINTER(vp)]), ("gf_win_view_free_v1", [vp, vp]), ("gf_win_info_v1", [vp, vp, C.POINTER(u64)]), ("gf_device_sync_v1", [i32]),
             ("gf_devcomm_destroy_v1", [vp, vp]), ("gf_win_deregister_v1", [vp, vp]), ("gf_comm_destroy_v1", [vp]),
         ]:
@@ -365,6 +370,18 @@ class CcoBackend:
     def zero(self, device, local, nbytes):
         self._chk(self.lib.gf_zero_v1(device, local, nbytes, self._zero_method), "gf_zero")
 
+    def abi_check(self):
+        """(ok, reason): MORI library + header hashes are the pinned ones AND this binary's compiled ccoWindowDevice layout is the pinned one."""
+        from . import capabilities as caps
+
+        ok, why = caps.check_mori_abi_pin()
+        if not ok:
+            return False, why
+        b = (C.c_uint64 * 5)()
+        if self.lib.gf_abi_info_v1(b) != 0 or tuple(int(x) for x in b) != caps.PINNED_WINDOW_DEVICE_ABI:
+            return False, f"compiled ccoWindowDevice layout {tuple(int(x) for x in b)} != pinned {caps.PINNED_WINDOW_DEVICE_ABI}"
+        return True, "ok"
+
     def win_free(self, comm, local):
         self._chk(self.lib.gf_win_free_v1(comm, local), "gf_win_free")
 
@@ -409,7 +426,15 @@ def resolve_wait_budget_us(profile=None) -> Tuple[int, str]:
     """Per-wait poll budget (microseconds) of the large-M kernels and where it came from: ('env'|'profile'|'default').
     Precedence: AITER_GEMM_FUSION_WAIT_BUDGET_US (tuning only) > the EXPLICIT profile's top-level wait_budget_us > DEFAULT_WAIT_BUDGET_US (5 s).
     The value is a per-launch KERNEL ARGUMENT that is BAKED into a captured graph's argument block at capture time: it must be resolved before capture;
-    changing the env/profile afterwards does not affect graphs that were already captured."""
+    changing the env/profile afterwards does not affect graphs that were already captured.
+
+    WHY 5 s (A-5): a clean first large call poisoned on all 4 ranks when the ranks entered the kernel ~213 ms apart (cold host skew, Evidence's skew
+    characterization 05055ac9: 0.2/20/40 ms skew passed, 60/100 ms and the natural 213 ms failed the previous 50 ms budget), and a serving engine can see
+    skew of hundreds of ms (GC pauses, cold module/first-SDMA costs, scheduler jitter). 5 s is ~20x the observed natural skew; it is a judgement, not derived.
+    Cost: only failure-DETECTION latency: a dead peer holds the stream (and the poster block's CU) for up to ~2-3 budgets (per sequential wait) before the poison.
+    The torch process-group / NCCL timeout MUST stay longer than that detection latency PLUS the recovery (poison all-reduce + quiesce_and_reset), i.e. PG timeout >
+    ~3 x budget + recover; the default 10 min watchdog satisfies this. Record any override in the run bindings (FusionResources.run_bindings() reports
+    wait_budget_us and wait_budget_source = env|profile|default)."""
     env = os.environ.get(ENV_WAIT_BUDGET_US)
     if env not in (None, ""):
         try:
@@ -442,11 +467,14 @@ class FusionResources:
         self.device = self._default_device(rank) if device is None else int(device)
         self.caps = frozenset(caps)
         self.backend = backend or CcoBackend()
-        self.policy = (policy or os.environ.get(ENV_POLICY) or "uniform").lower()
+        req = (policy or os.environ.get(ENV_POLICY) or "").lower()
+        self.policy_source = "explicit" if req else "default"
+        self.policy = req or DEFAULT_POLICY  # A-3: arena is the default; uniform / per_owner / ... stay selectable (explicit arg or the env var)
+        self.policy_fallback_reason: Optional[str] = None
         if self.policy not in POLICIES:
             raise ResourceError(f"{ENV_POLICY} must be one of {POLICIES}, got {self.policy!r}")
         self.align_cap = int(os.environ.get(ENV_ALIGN_CAP_MIB, "256")) << 20
-        self.abs_align = self.policy == "abs_aligned" or (self.policy == "shared_large" and _flag_default(None, ENV_ABS_ALIGN, True))
+        self._compute_abs_align()
         self.spacer_gran = int(os.environ.get(ENV_SPACER_GRAN_MIB, "0") or 0) << 20
         self._window_sizes: List[int] = []
         self._budget_doc: dict = {}
@@ -462,28 +490,10 @@ class FusionResources:
         self.profile = self._resolve_profile(profile)  # explicit only: a Profile object or a name/path; NEVER the AITER_GEMM_FUSION_PROFILE env
         self.wait_budget_us, self.wait_budget_source = resolve_wait_budget_us(self.profile)
         self.window_bytes, self.max_windows = self._budget(window_bytes, max_windows)
+        self._select_policy()
+        self._vmm_explicit = vmm_bytes is not None
         if vmm_bytes is None:
-            if self.policy == "uniform" and self.window_bytes:
-                vmm_bytes = heap_bytes_for(self.window_bytes, self.max_windows)
-            elif self.policy in ("arena", "arena_per_owner"):
-                g = 4 << 30
-                need = self._arena_size_from_budget() + HEAP_SLACK_BYTES
-                vmm_bytes = max(PER_RANK_VMM_BYTES, (need + g - 1) // g * g)
-            elif self.policy in ("abs_aligned", "shared_large") and self.abs_align and abs_items_from_budget(self._budget_doc, self.policy):
-                g = 4 << 30
-                need = abs_layout_total_bytes(abs_items_from_budget(self._budget_doc, self.policy), fill_gaps=self.policy == "shared_large",
-                                              cap=self.align_cap, spacer_gran=self.spacer_gran) + HEAP_SLACK_BYTES
-                vmm_bytes = max(PER_RANK_VMM_BYTES, (need + g - 1) // g * g)
-            elif self.policy == "shared_large" and self._budget_doc.get("shared_large_total_bytes"):
-                g = 4 << 30
-                need = int(self._budget_doc["shared_large_total_bytes"]) + HEAP_SLACK_BYTES
-                vmm_bytes = max(PER_RANK_VMM_BYTES, (need + g - 1) // g * g)
-            elif self.policy == "aligned" and self._window_sizes:
-                g = 4 << 30
-                need = aligned_total_bytes(self._window_sizes, self.align_cap) + HEAP_SLACK_BYTES
-                vmm_bytes = max(PER_RANK_VMM_BYTES, (need + g - 1) // g * g)
-            else:
-                vmm_bytes = PER_RANK_VMM_BYTES
+            vmm_bytes = self._default_vmm()
         self._vmm = vmm_bytes
         self._reg_log: List[Tuple[str, str, int, int]] = []  # (owner, name, bytes, cumulative) in registration order
         self._slot_base: Optional[int] = None  # local pointer of the first registration (slot offset 0 of this rank's heap)
@@ -636,6 +646,61 @@ class FusionResources:
 
     # -- absolute VA alignment (policies abs_aligned, shared_large) -------------------------------------------------
     # -- ARENA (D14 r1e/r1f): ONE registered window per comm, sub-allocated by aiter; every plan window is a VIEW struct --------------
+    def _compute_abs_align(self):
+        self.abs_align = self.policy == "abs_aligned" or (self.policy == "shared_large" and _flag_default(None, ENV_ABS_ALIGN, True))
+
+    def _select_policy(self):
+        """A-3: the DEFAULT policy is arena. An arena policy is refused (-> uniform, reason logged, kept in policy_fallback_reason) when the DEFAULT was not
+        overridden and either no arena size can be derived (no explicit profile window_budget / AITER_GEMM_FUSION_ARENA_MIB) or the MORI ABI pin does not
+        hold (A-1: library + header hashes, compiled ccoWindowDevice layout). An EXPLICITLY requested arena policy keeps the old behaviour for a missing budget
+        (ensure() raises) but is also refused on an ABI-pin mismatch, because that is a safety property, not a configuration choice."""
+        if self.policy not in ("arena", "arena_per_owner"):
+            return
+        reason = None
+        if not self._arena_size_from_budget() and self.policy_source == "default":
+            reason = "no arena size (FusionResources built without a profile window_budget and no AITER_GEMM_FUSION_ARENA_MIB)"
+        else:
+            chk = getattr(self.backend, "abi_check", None)
+            if chk is not None:
+                try:
+                    ok, why = chk()
+                except Exception as e:  # noqa: BLE001
+                    ok, why = False, f"abi_check error {e!r}"
+                if not ok:
+                    reason = f"MORI ABI pin mismatch: {why}"
+        if reason:
+            self._fall_back_to_uniform(reason)
+
+    def _fall_back_to_uniform(self, reason: str):
+        log.warning("event=resources arena_refused rank=%d policy=%s -> uniform reason=%s", self.rank, self.policy, reason)
+        self.policy, self.policy_fallback_reason = "uniform", reason
+        self._compute_abs_align()
+
+    def _default_vmm(self) -> int:
+        """Per-rank VMM heap for the CURRENT policy (recomputed on an arena -> uniform fallback)."""
+        if self.policy == "uniform" and self.window_bytes:
+            vmm_bytes = heap_bytes_for(self.window_bytes, self.max_windows)
+        elif self.policy in ("arena", "arena_per_owner"):
+            g = 4 << 30
+            need = self._arena_size_from_budget() + HEAP_SLACK_BYTES
+            vmm_bytes = max(PER_RANK_VMM_BYTES, (need + g - 1) // g * g)
+        elif self.policy in ("abs_aligned", "shared_large") and self.abs_align and abs_items_from_budget(self._budget_doc, self.policy):
+            g = 4 << 30
+            need = abs_layout_total_bytes(abs_items_from_budget(self._budget_doc, self.policy), fill_gaps=self.policy == "shared_large",
+                                          cap=self.align_cap, spacer_gran=self.spacer_gran) + HEAP_SLACK_BYTES
+            vmm_bytes = max(PER_RANK_VMM_BYTES, (need + g - 1) // g * g)
+        elif self.policy == "shared_large" and self._budget_doc.get("shared_large_total_bytes"):
+            g = 4 << 30
+            need = int(self._budget_doc["shared_large_total_bytes"]) + HEAP_SLACK_BYTES
+            vmm_bytes = max(PER_RANK_VMM_BYTES, (need + g - 1) // g * g)
+        elif self.policy == "aligned" and self._window_sizes:
+            g = 4 << 30
+            need = aligned_total_bytes(self._window_sizes, self.align_cap) + HEAP_SLACK_BYTES
+            vmm_bytes = max(PER_RANK_VMM_BYTES, (need + g - 1) // g * g)
+        else:
+            vmm_bytes = PER_RANK_VMM_BYTES
+        return vmm_bytes
+
     def _arena_size_from_budget(self) -> int:
         """Arena bytes: AITER_GEMM_FUSION_ARENA_MIB, else the explicit profile budget (arena: shared S/R/C + small windows; arena_per_owner: every per-owner window)."""
         env = os.environ.get(ENV_ARENA_MIB)
@@ -664,12 +729,71 @@ class FusionResources:
         w = Window("<arena>", "arena", "p2p_window", size, h, loc, shared=True)
         self._arena, self._arena_bytes, self._arena_top = w, size, 0
         self._regs.append(w)
+        ok, why = self._view_selftest(w)
+        got = [None] * self.world
+        self.dist.all_gather_object(got, (ok, why), group=self.group)  # every rank must agree to keep the arena: peers address it at identical offsets
+        if not all(g and g[0] for g in got):
+            raise _ArenaRefused("; ".join(f"rank{i}: {g[1]}" for i, g in enumerate(got) if not (g and g[0])) or "a rank failed the view self-test")
         if self.zero_mode == "h2d_deferred" and not late:
             self._unzeroed.append(w)
         else:
             self._zero_windows([w])
         log.info("event=resources arena rank=%d policy=%s bytes=%d (%.1f MiB) local=%#x", self.rank, self.policy, size, size / (1 << 20), int(loc))
         return w
+
+    def _view_selftest(self, arena: Window):
+        """A-1: PROVE the view property on this MORI build before anything uses it: create a view at a non-zero 4 MiB-aligned offset, read it back and require
+        winBase == arena.winBase + offset with equal stride4G / lsaRank. Backends that cannot read windows back (win_info) skip the check (fakes)."""
+        info = getattr(self.backend, "win_info", None)
+        if info is None:
+            return True, "win_info unavailable: self-test skipped"
+        off = ARENA_ALIGN if self._arena_bytes >= 2 * ARENA_ALIGN else 0
+        try:
+            v = self.backend.win_view(self.comm, arena.handle, off)
+            try:
+                good, why = self._check_view(arena, v, off)
+            finally:
+                self.backend.win_view_free(self.comm, v)
+            return good, why
+        except Exception as e:  # noqa: BLE001
+            return False, f"view self-test error {e!r}"
+
+    def _check_view(self, arena_win: Window, view_handle, off: int):
+        info = getattr(self.backend, "win_info", None)
+        if info is None:
+            return True, "skipped"
+        ab, astride, alsa = info(self.comm, arena_win.handle)
+        vb, vstride, vlsa = info(self.comm, view_handle)
+        if vb != ab + off or (vstride, vlsa) != (astride, alsa):
+            return False, (f"view read-back mismatch at offset {off}: winBase {vb:#x} (expected {ab + off:#x}), stride4G {vstride} (arena {astride}), "
+                           f"lsaRank {vlsa} (arena {alsa})")
+        return True, "ok"
+
+    def _arena_fallback(self, reason: str):
+        """The arena was refused after its single registration: tear the comm down and rebuild it for the uniform policy (registering a window of a
+        different size on the same comm is exactly what must not be done), identically on every rank (the refusal was agreed collectively)."""
+        log.warning("event=resources arena_refused rank=%d policy=%s -> uniform reason=%s", self.rank, self.policy, reason)
+        for v in self._views:
+            self.backend.win_view_free(self.comm, v.handle)
+        self._views.clear()
+        free = getattr(self.backend, "win_free", None)
+        for w in self._regs:
+            self.backend.win_deregister(self.comm, w.handle)
+            if free is not None:
+                free(self.comm, w.local)
+        self._regs.clear()
+        self._shared.clear()
+        self._unzeroed.clear()
+        self.backend.comm_destroy(self.comm)
+        self.policy, self.policy_fallback_reason = "uniform", reason
+        self._compute_abs_align()
+        self._arena, self._arena_bytes, self._arena_top = None, 0, 0
+        self._reg_log.clear()
+        self._va_log.clear()
+        self._slot_base, self._top, self._va_top = None, 0, None
+        if not self._vmm_explicit:
+            self._vmm = self._default_vmm()
+        self._init_comm()
 
     def _arena_view(self, owner: str, name: str, kind: str, nbytes: int, share: Optional[str] = None) -> Window:
         """Bump-allocate `nbytes` (4 MiB multiple) in the arena and return a Window whose handle is a VIEW struct and whose local is arena.local + offset."""
@@ -681,6 +805,10 @@ class FusionResources:
                                 f"size it via the profile window_budget or {ENV_ARENA_MIB})")
         self._arena_top = off + size
         view = self.backend.win_view(self.comm, a.handle, off)
+        good, why = self._check_view(a, view, off)
+        if not good:
+            self.backend.win_view_free(self.comm, view)
+            raise ResourceError(f"arena view for {owner}/{name}: {why}; fusion must be aborted")
         w = Window(SHARED_KEY if share else owner, share or name, kind, size, view, int(a.local) + off, shared=bool(share), arena_offset=off)
         self._views.append(w)
         return w
@@ -815,7 +943,11 @@ class FusionResources:
             wins0: Dict[str, Window] = {}
             self._reg_seq += 1
             if wreqs0:
-                self._arena_ensure(owner, wreqs0, late, wins0)
+                try:
+                    self._arena_ensure(owner, wreqs0, late, wins0)
+                except _ArenaRefused as e:
+                    self._arena_fallback(str(e))
+                    return self.ensure(owner, reqs)  # re-dispatch on the uniform policy
             self._sdma = max([getattr(self, "_sdma", 0)] + [max(1, int(r.bytes)) for r in reqs if r.kind == "sdma_queue"])
             self.windows[owner] = wins0
             return wins0
@@ -973,6 +1105,13 @@ class FusionResources:
         self._poison_hooks[owner] = fn
         self._poison_info[owner] = (report, decode)
 
+    def run_bindings(self) -> dict:
+        """What ATOM/Evidence should record in the run bindings: the effective policy (and why it is not the requested/default one), the wait budget and where it
+        came from (A-5: record any override), zero mode, ABI pin state."""
+        return {"window_policy": self.policy, "window_policy_source": self.policy_source, "window_policy_fallback_reason": self.policy_fallback_reason,
+                "wait_budget_us": self.wait_budget_us, "wait_budget_source": self.wait_budget_source, "zero_mode": self.zero_mode,
+                "heap_bytes": self._vmm, "arena_bytes": self._arena_bytes or None}
+
     def log_poison(self, where: str) -> int:
         """Log every poisoned owner's reason (and the report words when available) BEFORE the reset zeroes them; returns the OR of the poison words.
         Reads the 4-byte poison word per owner (and the report only if poisoned); call outside capture. Logged at WARNING: event=resources poison."""
@@ -1032,7 +1171,8 @@ class FusionResources:
                 hook()
         b = self.budget()
         log.info("event=resources budget rank=%d policy=%s windows=%d registered_bytes=%d (%.1f MiB) shared_bytes=%d spacer_bytes=%d heap_bytes=%d "
-                 "peer_mapped_va_bytes=%d owners=%d sdma_queues=%d", self.rank, b["policy"], b["windows"], b["registered_bytes"], b["registered_bytes"] / (1 << 20),
+                 "peer_mapped_va_bytes=%d owners=%d sdma_queues=%d (registered_bytes counts the fusion windows only: MORI's own comm/devcomm allocations are "
+                 "NOT included and are unattributed; see the separate hbm delta event)", self.rank, b["policy"], b["windows"], b["registered_bytes"], b["registered_bytes"] / (1 << 20),
                  b["shared_bytes"], b["spacer_bytes"], b["heap_bytes"], b["peer_mapped_va_bytes"], b["owners"], b["devcomm_sdma_queues"])
         self.backend.device_sync(self.device)
         mem1 = self._mem_info()

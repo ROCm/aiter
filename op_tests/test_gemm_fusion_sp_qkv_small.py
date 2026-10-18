@@ -688,7 +688,7 @@ def test_uniform_policy_reproduces_phase1_equal_layout(monkeypatch):
     be, d = FirstFitBackend(0), FakeDist()
     monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)  # the budget must come from the EXPLICIT profile=, never from the env
     profmod.clear_profile_cache()
-    r = FusionResources(0, 4, dist=d, backend=be, profile=PROFILE)
+    r = FusionResources(0, 4, dist=d, backend=be, profile=PROFILE, policy="uniform")  # A-3: arena is the default; uniform stays selectable
     assert r.window_bytes == wb["window_bytes"] and r.max_windows == 39
     assert be.heap == heap_bytes_for(wb["window_bytes"], 39) and be.heap % (4 << 30) == 0 and be.heap >= 39 * wb["window_bytes"] + (256 << 20)
     for owner, rq in reqs.items():  # register ALL 15 plans (the gate02 sequence), in any order
@@ -1361,7 +1361,7 @@ def test_fusion_resources_budget_from_explicit_profile_with_env_unset(monkeypatc
     profmod.clear_profile_cache()
     for prof in (PROFILE, profmod.load_profile(PROFILE)):  # a path AND a Profile object
         d, be = _spy_dist_backend()
-        r = FusionResources(0, 4, dist=d, backend=be, profile=prof)
+        r = FusionResources(0, 4, dist=d, backend=be, profile=prof, policy="uniform")
         assert r.window_bytes == 171966464 == 164 << 20 and r.max_windows == 39  # the shipped profile's own numbers
         assert r.profile is not None and r.profile.name == "minimax_m3_sp4_gfx950_v1"
         assert be.heap == heap_bytes_for(171966464, 39) and be.heap >= 39 * 171966464 + (256 << 20)
@@ -1962,16 +1962,17 @@ def test_C_S6_budget_log_has_registered_bytes_heap_and_hbm_delta(monkeypatch):
     lg.addHandler(h)
     lg.setLevel(logging.INFO)
     try:
-        r = FusionResources(0, 4, dist=FakeDist(), backend=MemBackend(), window_bytes=4 << 20, max_windows=6)
+        r = FusionResources(0, 4, dist=FakeDist(), backend=MemBackend(), window_bytes=4 << 20, max_windows=6, policy="uniform")
         _ensure_pairs(r)
         r.finalize()
     finally:
         lg.removeHandler(h)
         lg.setLevel(old)
     bud = [m for m in msgs if "event=resources budget" in m]
-    hbm = [m for m in msgs if "event=resources hbm" in m]
+    hbm = [m for m in msgs if m.startswith("event=resources hbm")]
     assert bud and "registered_bytes=25165824" in bud[0] and "heap_bytes=" in bud[0] and "peer_mapped_va_bytes=" in bud[0]
     assert hbm and "delta_bytes=25165824" in hbm[0] and "registered_bytes=25165824" in hbm[0] and "delta_over_registered=1.000" in hbm[0]
+    assert "registered_bytes counts the fusion windows only" in bud[0] and "NOT included and are unattributed" in bud[0].replace("\n", " ")  # A-7: never claim MORI's overhead as fusion-free
 
 # ======================================================================= D14 r1b/r1c: abs_aligned policy, shared_large absolute alignment, VA logging, probe sequences
 MiB = 1 << 20
@@ -2273,7 +2274,7 @@ def test_arena_registers_exactly_one_window_and_every_plan_window_is_a_view(monk
     n_views = len(r._views)
     be.log.clear()
     r.release()
-    assert n_views == 15 == len(be.freed) == len(set(be.freed))  # 12 small views... + the 3 shared S/R/C views, each freed exactly once
+    assert n_views == 15 and len(be.freed) == 16 == len(set(be.freed))  # 15 plan views (12 small + shared S/R/C) + the 1 view-self-test view, each freed exactly once
     assert len([x for x in be.log if x[0] == "dereg"]) == 1 and r._views == []  # the arena is the ONLY deregistered window
 
 
@@ -2599,3 +2600,245 @@ def test_wait_budget_documents_the_capture_bake_in_and_costs():
     assert "BAKED into a captured graph" in rmod.resolve_wait_budget_us.__doc__ and "before capture" in rmod.resolve_wait_budget_us.__doc__
     g = open(os.path.join(os.path.dirname(specs.__file__), "gen_profile.py"), encoding="utf-8").read()
     assert "BAKED into a captured graph" in g and "failure-detection latency" in g
+
+# ======================================================================= arena review conditions A-1 (ABI pin + view read-back + fallback), A-3 (default), A-5 (budget doc), A-7
+def _make_pinned_mori(tmp, lib_bytes=b"LIB", hdr_bytes=b"HDR"):
+    import hashlib
+    import tempfile
+    import uuid
+    from pathlib import Path
+
+    root = Path(tempfile.gettempdir()) / ("mori_" + uuid.uuid4().hex)
+    (root / "include" / "mori" / "cco").mkdir(parents=True)
+    (root / "lib").mkdir()
+    (root / "include" / "mori" / "cco" / "cco.hpp").write_bytes(hdr_bytes)
+    (root / "lib" / "libmori_cco.so").write_bytes(lib_bytes)
+    return root, hashlib.sha256(lib_bytes).hexdigest(), hashlib.sha256(hdr_bytes).hexdigest()
+
+
+def test_A1_abi_pin_check_compares_library_and_header_hashes(monkeypatch):
+    import shutil
+
+    from aiter.gemm_fusion import capabilities as caps
+
+    assert caps.PINNED_CCO_SO_SHA256.startswith("87b7322f") and len(caps.PINNED_CCO_SO_SHA256) == 64
+    assert caps.PINNED_CCO_HEADER_SHA256.startswith("cce155961f59") and len(caps.PINNED_CCO_HEADER_SHA256) == 64
+    assert caps.PINNED_WINDOW_DEVICE_ABI == (32, 0, 8, 12, 16)
+    root, sl, sh = _make_pinned_mori(None)
+    try:
+        env = {"MORI_ROOT": str(root), "MORI_CCO_SO": str(root / "lib" / "libmori_cco.so")}
+        ok, why = caps.check_mori_abi_pin(env)
+        assert not ok and "libmori_cco.so sha256" in why and "pinned 87b7322f" in why  # the fake lib is not the pinned one
+        monkeypatch.setattr(caps, "PINNED_CCO_SO_SHA256", sl)
+        ok, why = caps.check_mori_abi_pin(env)
+        assert not ok and "cco.hpp sha256" in why  # lib matches, header does not
+        monkeypatch.setattr(caps, "PINNED_CCO_HEADER_SHA256", sh)
+        assert caps.check_mori_abi_pin(env) == (True, "ok")
+        (root / "include" / "mori" / "cco" / "cco.hpp").write_bytes(b"CHANGED")
+        assert not caps.check_mori_abi_pin(env)[0]  # a header edit is noticed (the hash cache keys on mtime/size)
+        env2 = dict(env, AITER_GEMM_FUSION_MORI_ABI_PIN="off")
+        assert caps.check_mori_abi_pin(env2) == (True, "pin check disabled by AITER_GEMM_FUSION_MORI_ABI_PIN")
+        assert not caps.check_mori_abi_pin({"MORI_ROOT": str(root / "missing"), "MORI_CCO_SO": str(root / "nolib.so")})[0]  # never raises
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_A1_native_layout_static_asserts_and_runtime_abi_echo():
+    src = _host_src("gf_comm.cpp")
+    for frag in ("sizeof(mori::cco::ccoWindowDevice) == 32", "offsetof(mori::cco::ccoWindowDevice, winBase) == 0", "offsetof(mori::cco::ccoWindowDevice, stride4G) == 8",
+                 "offsetof(mori::cco::ccoWindowDevice, lsaRank) == 12", "offsetof(mori::cco::ccoWindowDevice, ibgdaWin) == 16", "#include <cstddef>"):
+        assert frag in src, frag
+    assert src.count("static_assert(") >= 6 and "int32_t gf_abi_info_v1(uint64_t* out5)" in src
+    # the static_asserts sit BEFORE the view code that depends on them
+    assert src.index("static_assert(sizeof(mori::cco::ccoWindowDevice) == 32") < src.index("int32_t gf_win_view_v1")
+    from aiter.gemm_fusion import capabilities as caps
+    from aiter.gemm_fusion.resources import CcoBackend
+
+    be = object.__new__(CcoBackend)
+
+    class Lib:
+        def __init__(self, vals):
+            self.vals = vals
+
+        def gf_abi_info_v1(self, b):
+            for i, v in enumerate(self.vals):
+                b[i] = v
+            return 0
+
+    import aiter.gemm_fusion.capabilities as c2
+
+    real = c2.check_mori_abi_pin
+    try:
+        c2.check_mori_abi_pin = lambda env=None: (True, "ok")
+        be.lib = Lib(caps.PINNED_WINDOW_DEVICE_ABI)
+        assert be.abi_check() == (True, "ok")
+        be.lib = Lib((40, 0, 8, 12, 24))  # a different compiled layout is refused
+        ok, why = be.abi_check()
+        assert not ok and "compiled ccoWindowDevice layout" in why
+        c2.check_mori_abi_pin = lambda env=None: (False, "lib hash differs")
+        assert be.abi_check() == (False, "lib hash differs")
+    finally:
+        c2.check_mori_abi_pin = real
+
+
+def test_A3_arena_is_the_default_and_uniform_per_owner_stay_selectable(monkeypatch):
+    from aiter.gemm_fusion.resources import DEFAULT_POLICY, FusionResources
+
+    for var in ("AITER_GEMM_FUSION_WINDOW_POLICY", "AITER_GEMM_FUSION_PROFILE", "AITER_GEMM_FUSION_ARENA_MIB"):
+        monkeypatch.delenv(var, raising=False)
+    profmod.clear_profile_cache()
+    assert DEFAULT_POLICY == "arena"
+    r = FusionResources(0, 4, dist=FakeDist(), backend=ArenaBackend(), profile=PROFILE)
+    assert r.policy == "arena" and r.policy_source == "default" and r.policy_fallback_reason is None and r._vmm == 4 << 30
+    # selectable: the env var and the argument
+    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "uniform")
+    ru = FusionResources(0, 4, dist=FakeDist(), backend=RealisticFirstFit(), profile=PROFILE)
+    assert ru.policy == "uniform" and ru.policy_source == "explicit" and ru._vmm == 8 << 30 and ru.policy_fallback_reason is None  # 6.4 GiB: documented cost
+    monkeypatch.delenv("AITER_GEMM_FUSION_WINDOW_POLICY")
+    rp = FusionResources(0, 4, dist=FakeDist(), backend=RealisticFirstFit(), profile=PROFILE, policy="per_owner")
+    assert rp.policy == "per_owner"
+    # default + no budget: refused with a logged reason, falls back to uniform (the previous no-profile behaviour)
+    msgs, undo = _log_capture(logging.WARNING)
+    try:
+        rn = FusionResources(0, 4, dist=FakeDist(), backend=RealisticFirstFit(), window_bytes=4 << 20, max_windows=2)
+    finally:
+        undo()
+    assert rn.policy == "uniform" and "no arena size" in rn.policy_fallback_reason
+    assert any("event=resources arena_refused" in m and "reason=no arena size" in m for m in msgs)
+    # an EXPLICIT arena without a budget still fails loudly at ensure() (configuration error, not a silent fallback)
+    from aiter.gemm_fusion.resources import ResourceError
+
+    ra = FusionResources(0, 4, dist=FakeDist(), backend=ArenaBackend(), window_bytes=4 << 20, max_windows=2, policy="arena")
+    assert ra.policy == "arena"
+    with pytest.raises(ResourceError, match="needs the arena size"):
+        ra.ensure("o", [WindowReq("a", 100, "p2p_window")])
+
+
+def test_A1_abi_pin_mismatch_refuses_arena_at_construction_and_falls_back_to_uniform(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources
+
+    for var in ("AITER_GEMM_FUSION_WINDOW_POLICY", "AITER_GEMM_FUSION_PROFILE"):
+        monkeypatch.delenv(var, raising=False)
+    profmod.clear_profile_cache()
+
+    class Pinned(ArenaBackend):
+        def __init__(self, ok, why):
+            super().__init__()
+            self.res = (ok, why)
+
+        def abi_check(self):
+            return self.res
+
+    be = Pinned(True, "ok")
+    assert FusionResources(0, 4, dist=FakeDist(), backend=be, profile=PROFILE).policy == "arena"
+    msgs, undo = _log_capture(logging.WARNING)
+    try:
+        bad = FusionResources(0, 4, dist=FakeDist(), backend=Pinned(False, "libmori_cco.so sha256 deadbeef... != pinned 87b7322f..."), profile=PROFILE)
+        explicit = FusionResources(0, 4, dist=FakeDist(), backend=Pinned(False, "hdr differs"), profile=PROFILE, policy="arena")  # a safety property: refused even if asked for
+    finally:
+        undo()
+    for r in (bad, explicit):
+        assert r.policy == "uniform" and r._vmm == 8 << 30 and r.window_bytes == 171966464  # uniform heap/budget from the profile
+    assert "MORI ABI pin mismatch" in bad.policy_fallback_reason and "deadbeef" in bad.policy_fallback_reason
+    assert sum("event=resources arena_refused" in m for m in msgs) == 2
+    assert bad.run_bindings()["window_policy"] == "uniform" and "MORI ABI pin mismatch" in bad.run_bindings()["window_policy_fallback_reason"]
+
+
+class _BadViewBackend(ArenaBackend):
+    """win_info of a view disagrees with the arena (a MORI build whose struct layout differs): the view property does not hold."""
+
+    def __init__(self, mode):
+        super().__init__()
+        self.mode, self.creates = mode, 0
+
+    def comm_create(self, rank, world, uid, heap, device):
+        self.creates += 1
+        return super().comm_create(rank, world, uid, heap, device) if hasattr(super(), "comm_create") else object()
+
+    def win_info(self, comm, w):
+        base, stride, lsa = super().win_info(comm, w)
+        if w in self.views:
+            return {"base": (base + 4096, stride, lsa), "stride": (base, stride + 1, lsa), "lsa": (base, stride, lsa + 1)}[self.mode]
+        return base, stride, lsa
+
+
+def test_A1_view_readback_mismatch_refuses_arena_and_rebuilds_the_comm_as_uniform(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources
+
+    for var in ("AITER_GEMM_FUSION_WINDOW_POLICY", "AITER_GEMM_FUSION_PROFILE"):
+        monkeypatch.delenv(var, raising=False)
+    profmod.clear_profile_cache()
+    plans = _all_plans(monkeypatch)
+    for mode in ("base", "stride", "lsa"):
+        be = _BadViewBackend(mode)
+        msgs, undo = _log_capture(logging.WARNING)
+        try:
+            r = FusionResources(0, 4, dist=FakeDist(), backend=be, profile=PROFILE)
+            assert r.policy == "arena"
+            for owner, rq in plans:
+                r.ensure(owner, rq)  # the first ensure() runs the self-test, refuses, rebuilds the comm for uniform and re-dispatches
+        finally:
+            undo()
+        assert r.policy == "uniform" and "view read-back mismatch" in r.policy_fallback_reason and r.window_bytes == 171966464
+        assert be.creates == 2  # the comm was destroyed and recreated: NO second window size on the arena's comm
+        assert r._arena is None and r._views == [] and len(r._regs) == 15 + 24 or len(r._regs) == 39  # uniform: 39 equal windows (15 plans -> 39 windows)
+        assert all(w.bytes == 171966464 for w in r._regs)
+        assert any("event=resources arena_refused" in m and "view read-back mismatch" in m for m in msgs)
+        assert r.run_bindings()["window_policy"] == "uniform"
+    # (a) a rank that disagrees on the REGISTRATION itself is a fatal abort (the pre-existing collective agreement check), not a fallback
+    from aiter.gemm_fusion.resources import ResourceError
+
+    r2 = FusionResources(0, 4, dist=FakeDist(diverge_rank=3), backend=ArenaBackend(), profile=PROFILE)
+    with pytest.raises(ResourceError, match="registration disagreement"):
+        r2.ensure(*plans[0])
+
+    # (b) ONE rank failing the view self-test makes EVERY rank fall back (peers address the arena at identical offsets): the self-test verdicts are all-gathered
+    class SplitDist(FakeDist):
+        def all_gather_object(self, out, obj, group=None):
+            self.calls.append(("allgather",))
+            for i in range(len(out)):
+                out[i] = obj
+            if isinstance(obj, tuple) and len(obj) == 2 and obj[0] is True:  # the view self-test verdict: rank 2 reports a failure
+                out[2] = (False, "rank2 view mismatch")
+
+    be3 = ArenaBackend()  # this rank's own read-back is fine
+    r3 = FusionResources(0, 4, dist=SplitDist(), backend=be3, profile=PROFILE)
+    for owner, rq in plans:
+        r3.ensure(owner, rq)
+    assert r3.policy == "uniform" and "rank2 view mismatch" in r3.policy_fallback_reason and r3._arena is None
+
+
+def test_A1_each_later_view_is_read_back_and_a_mismatch_aborts(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources, ResourceError
+
+    monkeypatch.delenv("AITER_GEMM_FUSION_WINDOW_POLICY", raising=False)
+    profmod.clear_profile_cache()
+    be = ArenaBackend()
+    r = FusionResources(0, 4, dist=FakeDist(), backend=be, profile=PROFILE)
+    plans = _all_plans(monkeypatch)
+    r.ensure(*plans[0])  # self-test passes, real views pass their read-back
+    orig = be.win_info
+    be.win_info = lambda comm, w: (lambda t: (t[0] + 8, t[1], t[2]) if w in be.views else t)(orig(comm, w))  # from now on views read back shifted
+    with pytest.raises(ResourceError, match="view read-back mismatch.*fusion must be aborted"):
+        r.ensure(*plans[1])
+
+
+def test_A5_wait_budget_rationale_and_pg_timeout_guidance_are_documented():
+    from aiter.gemm_fusion import resources as rmod
+
+    doc = rmod.resolve_wait_budget_us.__doc__
+    assert "213 ms" in doc and "PG timeout" in doc and "5 s" in doc and "detection latency" in doc and "run_bindings" in doc
+    g = open(os.path.join(os.path.dirname(specs.__file__), "gen_profile.py"), encoding="utf-8").read()
+    assert "213 ms" in g and "PG timeout" in g
+
+
+def test_A5_run_bindings_record_policy_budget_source_and_overrides(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources
+
+    for var in ("AITER_GEMM_FUSION_WINDOW_POLICY", "AITER_GEMM_FUSION_PROFILE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("AITER_GEMM_FUSION_WAIT_BUDGET_US", "9000000")
+    profmod.clear_profile_cache()
+    b = FusionResources(0, 4, dist=FakeDist(), backend=ArenaBackend(), profile=PROFILE).run_bindings()
+    assert b["wait_budget_us"] == 9000000 and b["wait_budget_source"] == "env"  # an override is visible in the bindings
+    assert b["window_policy"] == "arena" and b["window_policy_source"] == "default" and b["zero_mode"] == "h2d_deferred"

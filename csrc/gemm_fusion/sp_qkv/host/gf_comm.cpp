@@ -11,6 +11,7 @@
 #include <mori/cco/cco.hpp>
 #include "gf_device_scope.hpp"
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -85,6 +86,24 @@ int32_t gf_win_register_v1(void* comm, uint64_t bytes, void** out_win, void** ou
 // they are winBase + rank*perRankSize): every address the kernel derives from the view equals arena address + offset. The view is NOT registered with MORI (it must never be
 // passed to ccoWindowDeregister; the arena is the only registered window); it is freed with gf_win_view_free_v1 BEFORE the arena is deregistered. ibgdaWin is copied
 // unchanged (cross-node/GDA only; the single-node LSA kernels never read it).
+// A-1 (arena review): the view copies a ccoWindowDevice and shifts winBase, so the layout of the fields we touch is PINNED at compile time against the cco.hpp we build with
+// (pinned header sha256 cce15596...): 32-byte struct {char* winBase @0; uint32_t stride4G @8; int lsaRank @12; ccoIbgdaWin ibgdaWin @16 (peerRkeys ptr + lkey)}.
+// A different MORI header that moves or resizes these fails the BUILD, not the run.
+static_assert(sizeof(mori::cco::ccoWindowDevice) == 32, "ccoWindowDevice size changed: the arena view struct copy is no longer valid");
+static_assert(offsetof(mori::cco::ccoWindowDevice, winBase) == 0, "ccoWindowDevice::winBase offset changed");
+static_assert(offsetof(mori::cco::ccoWindowDevice, stride4G) == 8, "ccoWindowDevice::stride4G offset changed");
+static_assert(offsetof(mori::cco::ccoWindowDevice, lsaRank) == 12, "ccoWindowDevice::lsaRank offset changed");
+static_assert(offsetof(mori::cco::ccoWindowDevice, ibgdaWin) == 16, "ccoWindowDevice::ibgdaWin offset changed");
+static_assert(sizeof(((mori::cco::ccoWindowDevice*)nullptr)->winBase) == 8 && sizeof(((mori::cco::ccoWindowDevice*)nullptr)->stride4G) == 4 &&
+              sizeof(((mori::cco::ccoWindowDevice*)nullptr)->lsaRank) == 4, "ccoWindowDevice field sizes changed");
+// Runtime echo of what THIS binary was compiled with: out[0]=sizeof, [1]=off winBase, [2]=off stride4G, [3]=off lsaRank, [4]=off ibgdaWin (the Python side compares to its pin).
+int32_t gf_abi_info_v1(uint64_t* out5) {
+    if (!out5) return E_ARG;
+    out5[0] = sizeof(mori::cco::ccoWindowDevice);
+    out5[1] = offsetof(mori::cco::ccoWindowDevice, winBase); out5[2] = offsetof(mori::cco::ccoWindowDevice, stride4G);
+    out5[3] = offsetof(mori::cco::ccoWindowDevice, lsaRank); out5[4] = offsetof(mori::cco::ccoWindowDevice, ibgdaWin);
+    return OK;
+}
 int32_t gf_win_view_v1(void* comm, void* arena_win, uint64_t offset, void** out_view) {
     if (!comm || !arena_win || !out_view) return E_ARG;
     gf::DeviceScope scope(comm_dev(comm));
