@@ -28,11 +28,13 @@ Inputs/outputs:
   - scratch: int32, decode_scratch_slots(num_rows, ...), the candidate buffer under
     compact; any contents, since every entry is written before it is read.
 
-Paths (per row, by valid length row_len):
+Paths (per row, by valid length row_len; blocks_per_row, short_max and long_parts
+are launch arguments, so one build serves every grid width and cap):
   - short (row_len <= short_max): active_parts = 1; part 0 runs the whole radix-select
     in one workgroup — LDS-only histograms, no inter-workgroup barrier, no workspace
     round-trip.
-  - multi-part (row_len > short_max): active_parts = min(blocks_per_row, part_cap).
+  - multi-part (row_len > short_max): active_parts = long_parts, at most
+    blocks_per_row.
 
 Constraints:
   - logits are fp32; the order-preserving radix key twiddle is fp32-specific.
@@ -93,6 +95,8 @@ ORDERED_STAGES = 4
 # barriers and drains the loads in flight, so it wants to be paid as rarely as the
 # register budget allows; each step holds COMPACT_FILL_VECS * LOAD_VEC keys live.
 COMPACT_FILL_VECS = 4
+# Fewest parts at which an unordered compact row scan walks its own run.
+COMPACT_WALK_MIN_PARTS = 5
 # Candidate buffer slots per row, in units of k. Trades workspace for how often the
 # buffer path is taken, never correctness: a part that overflows rescans instead.
 COMPACT_CAP_MULT = 16
@@ -346,8 +350,17 @@ class DecodeAdaptiveConfig:
     kw: dict[str, Any]  # create_topk_per_row_decode_adaptive_kernel keywords
     grid: int
     parts: int
+    short_max: int
     compact: bool
     scratch_slots: int  # 0 when the build keeps no candidate buffer
+
+    @property
+    def parts_magic(self) -> int:
+        """ceil(2**32 / parts) as a signed int32, which the kernel divides by."""
+        if self.parts < 2:
+            return 0
+        magic = -(-(1 << 32) // self.parts)
+        return magic - (1 << 32) if magic >= 1 << 31 else magic
 
 
 def decode_adaptive_config(
@@ -362,21 +375,21 @@ def decode_adaptive_config(
 ) -> DecodeAdaptiveConfig:
     """Everything `create_topk_per_row_decode_adaptive_kernel` and its launch need.
 
-    Pass `cu_count` for the device that will run it. The caps stay at least two
-    even on a one-wide grid: they are upper bounds, and a cap of one is rejected.
+    Pass `cu_count` for the device that will run it. Only `kw` keys the build;
+    `grid`, `parts` and `short_max` are launch arguments.
     """
+    if seq >= 1 << 29:
+        raise ValueError(f"seq must be below 2**29 for parts_magic, got {seq}")
     parts = decode_adaptive_parts(rows, seq, cu_count)
     grid = decode_adaptive_grid(rows, decode_adaptive_want(rows, seq), seq, cu_count)
     if short_max is None:
         short_max = decode_adaptive_short_max(rows)
     compact = decode_compact_compacts(rows, seq, parts, short_max)
     kw = {
-        "blocks_per_row": grid,
+        "single_workgroup": grid == 1,
         # Not "auto" when every row fits: at one part the cooperating path folds
         # away at compile time and "auto" has nowhere to send a long row.
         "tier_mode": "short" if seq <= short_max else "auto",
-        "part_cap": max(2, parts),
-        "short_max": short_max,
         "ordered": ordered,
     }
     # Every build reaches it under `compact` too: unordered short rows on the short
@@ -391,6 +404,7 @@ def decode_adaptive_config(
         kw=kw,
         grid=grid,
         parts=parts,
+        short_max=short_max,
         compact=compact,
         scratch_slots=decode_scratch_slots(rows, compact, COMPACT_CAP_MULT * k),
     )
@@ -413,10 +427,8 @@ def decode_scratch_slots(num_rows: int, compact: bool, compact_cap: int) -> int:
 def create_topk_per_row_decode_adaptive_kernel(
     top_k: int,
     *,
-    blocks_per_row: int = 8,
+    single_workgroup: bool = False,
     tier_mode: Literal["auto", "short"] = "auto",
-    short_max: int = 16384,
-    part_cap: int = 32,
     early_stop: bool = False,
     ordered: bool = False,
     compact: bool = False,
@@ -434,21 +446,16 @@ def create_topk_per_row_decode_adaptive_kernel(
       where the last pass reads the candidate buffer rather than the row, but
       for ordered rows short enough to keep no buffer. The short tier takes it
       whenever it is compiled in.
-    - `part_cap` is clamped to `blocks_per_row`.
+    - `single_workgroup` builds launch one workgroup per row whatever
+      `blocks_per_row` says; others take it in [2, 32] and `long_parts` in
+      [2, blocks_per_row], with `parts_magic` from `DecodeAdaptiveConfig`; the
+      division it stands for is exact only while `width` < 2**29.
     - `packed_rows` reads row r from element row_starts[r] of a flat input, with
       `width` then the plane's; otherwise row_starts is not read.
 
     The module docstring describes what each tier, the candidate buffer and the
     histogram certificate actually do.
     """
-    # blocks_per_row == 1 collapses the launch to grid=(1, num_rows): every row runs
-    # the barrier-free single-workgroup short tier (no cooperative parts, so no dead
-    # blocks hogging co-resident slots).
-    if not 1 <= blocks_per_row <= 32:
-        raise ValueError(f"blocks_per_row must be in [1, 32], got {blocks_per_row}")
-
-    if part_cap < 2:
-        raise ValueError(f"part_cap must be >= 2, got {part_cap}")
     if tier_mode not in ("auto", "short"):
         raise ValueError(f"tier_mode must be auto or short, got {tier_mode!r}")
 
@@ -471,12 +478,7 @@ def create_topk_per_row_decode_adaptive_kernel(
     # way, so a long row has nowhere to go but the single-workgroup tier. Only
     # there is the length read at runtime; every other build keeps its
     # cooperating path fixed at compile time.
-    short_tier_by_len = short_tier and tier_mode == "auto" and blocks_per_row == 1
-    if ordered and blocks_per_row > WARP_SIZE:
-        raise ValueError(
-            f"ordered=True scans slice bases within one wave, so blocks_per_row "
-            f"must be <= {WARP_SIZE}, got {blocks_per_row}"
-        )
+    short_tier_by_len = short_tier and tier_mode == "auto" and single_workgroup
     block_threads = BLOCK_THREADS
     red_slots = (block_threads + WARP_SIZE - 1) // WARP_SIZE
     num_passes = NUM_PASSES
@@ -514,14 +516,10 @@ def create_topk_per_row_decode_adaptive_kernel(
     compact_cap = COMPACT_CAP_MULT * top_k if compact else 0
     scratch_row_slots = 2 * compact_cap
 
-    # Caps/thresholds only affect codegen for modes that use them; include them in
-    # the name for those modes so distinct configs cache separately.
-    _cap_tag = "" if tier_mode == "short" else f"_s{short_max}_pc{part_cap}"
     kernel_name = (
-        f"topk_per_row_decode_adaptive_k{top_k}_"
-        f"g{blocks_per_row}"
+        f"topk_per_row_decode_adaptive_k{top_k}"
+        f"{'_g1' if single_workgroup else ''}"
         f"_{tier_mode}"
-        f"{_cap_tag}"
         f"{'_1wg' if short_tier else ''}"
         f"{'_es' if early_stop else ''}"
         f"{'_ses' if short_early_stop else ''}"
@@ -550,6 +548,9 @@ def create_topk_per_row_decode_adaptive_kernel(
         scratch: fx.Tensor,
         stride0: fx.Int32,
         width: fx.Int32,
+        long_parts: fx.Int32,
+        parts_magic: fx.Int32,
+        short_max: fx.Int32,
     ) -> None:
         block_x = gpu.block_id("x")
         block_y = gpu.block_id("y")
@@ -572,7 +573,6 @@ def create_topk_per_row_decode_adaptive_kernel(
         c_block_idx = fx.Index(block_threads)
         c_bins_i32 = fx.Int32(num_buckets)
         c_bins_idx = fx.Index(num_buckets)
-        c_parts = fx.Int32(blocks_per_row)
         c_sign_bit = fx.Int32(-2147483648)
         c_nan_turn = fx.Int32(0x7FFFFF)  # keys from -inf past the -NaNs
         c_row_ws = fx.Int32(CONTROL_ROW_SLOTS)
@@ -646,20 +646,25 @@ def create_topk_per_row_decode_adaptive_kernel(
 
         # Active cooperating workgroups per row over the fixed grid (excess blocks
         # return immediately). "auto" picks per row by length; "short" gives every
-        # row one part. The cap is clamped to the grid.
-        c_part_cap = fx.Int32(part_cap)
-        capped_parts = (c_parts < c_part_cap).select(c_parts, c_part_cap)
-        if const_expr(tier_mode == "short"):
+        # row one part, and so does a one-wide grid, at compile time.
+        if const_expr(tier_mode == "short" or single_workgroup):
             active_parts = c_one
         else:  # "auto": pick per row by valid length
-            c_short = fx.Int32(short_max)
-            active_parts = (row_len <= c_short).select(c_one, capped_parts)
+            active_parts = (row_len <= short_max).select(c_one, long_parts)
         active_threads = active_parts * c_block_i32
         single_part_active = active_parts == c_one
         if const_expr(short_tier_by_len):
-            short_row = row_len <= fx.Int32(short_max)
+            short_row = row_len <= short_max
         else:
             short_row = single_part_active
+
+        def div_parts(n):
+            """`n // active_parts` for 0 <= n < 2**27, without an integer divide."""
+            if const_expr(tier_mode == "short" or single_workgroup):
+                return n
+            wide = fx.Uint64(fx.Uint32(n)) * fx.Uint64(fx.Uint32(parts_magic))
+            quotient = fx.Int32(fx.Uint32(wide >> fx.Uint64(32)))
+            return single_part_active.select(n, quotient)
 
         def active_stride_idx(mult: int = 1):
             """Vec-block stride covering `mult` rounds of the active workgroups."""
@@ -668,6 +673,10 @@ def create_topk_per_row_decode_adaptive_kernel(
         def scan_run_stride_idx(mult: int = 1):
             """Vec-block stride within one workgroup's ordered run."""
             return fx.Index(c_block_i32 * fx.Int32(mult))
+
+        def runtime_stride_idx(step_i32):
+            """Vec-block stride for a step chosen at runtime."""
+            return lambda mult=1: fx.Index(step_i32 * fx.Int32(mult))
 
         def counter_ptr(group: int):
             return fx.get_iter(fx.slice(counters, (group, None)))
@@ -1327,6 +1336,24 @@ def create_topk_per_row_decode_adaptive_kernel(
                 my_selected = my_selected + selected
                 my_tied = my_tied + tied
 
+        def run_tile_spans(tile_vblk, stages: int):
+            """(col_base, col_hi) per stage of a tile inside this part's own run.
+
+            Walking the part's contiguous run keeps every stage offset a constant;
+            an interleaved walk would hold `s * active_threads` in SGPRs.
+            """
+            spans = []
+            for s in range_constexpr(stages):
+                vblk_i32 = fx.Int32(tile_vblk) + tid + fx.Int32(s * BLOCK_THREADS)
+                in_row = vblk_i32 < run_end_vblk
+                spans.append(
+                    (
+                        in_row.select(vblk_i32 * c_vec, c_zero),
+                        in_row.select(row_len, c_zero),
+                    )
+                )
+            return spans
+
         def unordered_emit(need, kth_bits):
             """Row walk for the unordered emit, over a uniform number of tiles.
 
@@ -1335,24 +1362,15 @@ def create_topk_per_row_decode_adaptive_kernel(
             as in `ordered_emit`.
             """
             stages = ORDERED_STAGES
-            tile_stride = active_threads * fx.Int32(stages)
-            tiles_i32 = (vec_blocks_i32 + tile_stride - c_one) // tile_stride
-            for tile, place_state in range(
-                fx.Index(0), fx.Index(tiles_i32), fx.Index(1), init=[c_zero]
+            for tile_vblk, place_state in range(
+                run_first_idx,
+                run_end_idx,
+                fx.Index(BLOCK_THREADS * stages),
+                init=[c_zero],
             ):
                 # The whole tile is classified under one scan, so the staging also
                 # amortises the scan and the atomic over `stages` times the columns.
-                tile_first = global_vec_tid + fx.Int32(tile) * tile_stride
-                spans = []
-                for s in range_constexpr(stages):
-                    vblk_i32 = tile_first + fx.Int32(s) * active_threads
-                    in_row = vblk_i32 < vec_blocks_i32
-                    spans.append(
-                        (
-                            in_row.select(vblk_i32 * c_vec, c_zero),
-                            in_row.select(row_len, c_zero),
-                        )
-                    )
+                spans = run_tile_spans(tile_vblk, stages)
                 vecs = [load_row_vec(col_base) for col_base, _ in spans]
                 cols = []
                 n_selected = c_zero
@@ -1372,8 +1390,9 @@ def create_topk_per_row_decode_adaptive_kernel(
         vec_blocks_i32 = (row_len + c_vec - c_one).shrui(fx.Int32(LOAD_VEC_LOG2))
         vec_blocks_idx = fx.Index(vec_blocks_i32)
 
-        # ordered=True: one contiguous vec-block range per workgroup.
-        vblks_per_run = (vec_blocks_i32 + active_parts - c_one) // active_parts
+        # One contiguous vec-block range per workgroup, walked by the emits and the
+        # ordered or multi-part row scans.
+        vblks_per_run = div_parts(vec_blocks_i32 + active_parts - c_one)
         run_first_vblk = part * vblks_per_run
         run_last_vblk = run_first_vblk + vblks_per_run
         run_end_vblk = (run_last_vblk < vec_blocks_i32).select(
@@ -1388,7 +1407,7 @@ def create_topk_per_row_decode_adaptive_kernel(
         # buffer. Parts own ascending column runs, so slice order is column order and
         # the emit needs no cross-part compaction step -- each part reads back exactly
         # the slice it wrote.
-        part_slice_cap = fx.Int32(compact_cap) // active_parts if compact else c_zero
+        part_slice_cap = div_parts(fx.Int32(compact_cap)) if compact else c_zero
         part_slice_base = part * part_slice_cap if compact else c_zero
         part_slice_end = part_slice_base + part_slice_cap if compact else c_zero
 
@@ -1422,8 +1441,11 @@ def create_topk_per_row_decode_adaptive_kernel(
             same number of times. A tid-keyed loop bound would not; this walks a
             uniform trip count and predicates the tail columns away instead.
             """
-            per_tile = c_block_i32 * fx.Int32(COMPACT_FILL_VECS)
-            return fx.Index((vblks_per_run + per_tile - c_one) // per_tile)
+            # A shift, not `//`: a signed quotient leaves the loop compare as a signed
+            # i64 one, which only VALU has.
+            tile_log2 = int.bit_length(block_threads * COMPACT_FILL_VECS) - 1
+            tile_mask = fx.Int32((1 << tile_log2) - 1)
+            return fx.Index((vblks_per_run + tile_mask).shrui(fx.Int32(tile_log2)))
 
         def compact_fill(run, start_bit: int, previous_start_bit: int, current_bits):
             """Scan the row once more, this time also writing the candidates out."""
@@ -1576,22 +1598,13 @@ def create_topk_per_row_decode_adaptive_kernel(
             # per tile rather than one per winner -- the winners are exactly top_k,
             # so a per-winner atomic would scale with k.
             stages = ORDERED_STAGES
-            tile_stride = active_threads * fx.Int32(stages)
-            tiles_i32 = (vec_blocks_i32 + tile_stride - c_one) // tile_stride
-            for tile, place_state in range(
-                fx.Index(0), fx.Index(tiles_i32), fx.Index(1), init=[c_zero]
+            for tile_vblk, place_state in range(
+                run_first_idx,
+                run_end_idx,
+                fx.Index(BLOCK_THREADS * stages),
+                init=[c_zero],
             ):
-                tile_first = global_vec_tid + fx.Int32(tile) * tile_stride
-                spans = []
-                for s in range_constexpr(stages):
-                    vblk_i32 = tile_first + fx.Int32(s) * active_threads
-                    in_row = vblk_i32 < vec_blocks_i32
-                    spans.append(
-                        (
-                            in_row.select(vblk_i32 * c_vec, c_zero),
-                            in_row.select(row_len, c_zero),
-                        )
-                    )
+                spans = run_tile_spans(tile_vblk, stages)
                 vecs = [load_row_vec(col_base) for col_base, _ in spans]
                 cols = []
                 n_selected = c_zero
@@ -1616,7 +1629,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                     # A short row keeps no buffer, as the host decides for a launch
                     # whose rows are all short: it marks itself spilled, which sends
                     # the rescans and the emit back to the row.
-                    if row_len <= fx.Int32(short_max):
+                    if row_len <= short_max:
                         mark_compact_spilled(s_run)
                         row_scan(pass_id, start_bit, previous_start_bit, current_bits)
                     else:
@@ -1635,9 +1648,24 @@ def create_topk_per_row_decode_adaptive_kernel(
             pass_id: int, start_bit: int, previous_start_bit: int, current_bits
         ):
             """Histogram this part's share of the row."""
-            scan_step_idx = scan_run_stride_idx if ordered else active_stride_idx
-            scan_start_idx = run_first_idx + tid_idx if ordered else global_vec_tid_idx
-            scan_stop_idx = run_end_idx if ordered else vec_blocks_idx
+            # Multi-part rows walk the same run the emit re-reads, so it hits this part's L2.
+            walk_run = ordered or not (tier_mode == "short" or single_workgroup)
+            scan_step_idx = scan_run_stride_idx if walk_run else active_stride_idx
+            scan_start_idx = run_first_idx + tid_idx if walk_run else global_vec_tid_idx
+            scan_stop_idx = run_end_idx if walk_run else vec_blocks_idx
+            if const_expr(walk_run and compact and not ordered):
+                # Unordered compact rows split in 4 or fewer parts measured slower
+                # walking runs on gfx950 and gfx942, so they keep the interleave.
+                interleave = active_parts <= fx.Int32(COMPACT_WALK_MIN_PARTS - 1)
+                scan_step_idx = runtime_stride_idx(
+                    interleave.select(active_threads, c_block_i32)
+                )
+                scan_start_idx = fx.Index(
+                    interleave.select(global_vec_tid, run_first_vblk + tid)
+                )
+                scan_stop_idx = fx.Index(
+                    interleave.select(vec_blocks_i32, run_end_vblk)
+                )
             # Two loads in flight per step; the loop below takes the odd one out.
             unroll_limit_idx = scan_stop_idx - scan_step_idx()
             staged_stride_idx = scan_step_idx(2)
@@ -2004,7 +2032,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                 early = local_len == local_k
                 if const_expr(compact):
                     # Row-uniform, so the row's blocks still agree on `early`.
-                    early = early & (row_len <= fx.Int32(short_max))
+                    early = early & (row_len <= short_max)
                 if const_expr(not ordered):  # noqa: SIM102 - constexpr guard
                     if early:
                         early_write_all(settled_bit, kth_bits, local_k)
@@ -2085,6 +2113,10 @@ def create_topk_per_row_decode_adaptive_kernel(
         width: fx.Int32,
         stride0: fx.Int32,
         stride1: fx.Int32,
+        blocks_per_row: fx.Int32,
+        long_parts: fx.Int32,
+        parts_magic: fx.Int32,
+        short_max: fx.Int32,
         stream: fx.Stream,
     ) -> None:
         grid_y = fx.Index(num_rows)
@@ -2098,8 +2130,11 @@ def create_topk_per_row_decode_adaptive_kernel(
             scratch,
             stride0,
             width,
+            long_parts,
+            parts_magic,
+            short_max,
         ).launch(
-            grid=(blocks_per_row, grid_y, 1),
+            grid=(1 if single_workgroup else fx.Index(blocks_per_row), grid_y, 1),
             block=(block_threads, 1, 1),
             stream=stream,
         )

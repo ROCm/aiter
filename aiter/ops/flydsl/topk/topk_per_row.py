@@ -485,6 +485,10 @@ def _run_adaptive(
         width,
         stride0,
         stride1,
+        cfg.grid,
+        cfg.parts,
+        cfg.parts_magic,
+        cfg.short_max,
         stream,
     )
 
