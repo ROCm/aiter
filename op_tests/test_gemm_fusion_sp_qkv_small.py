@@ -2369,3 +2369,42 @@ def test_probe_arena_sequence_one_registration_and_view_checks(capsys):
     assert wp.sequence("arena") == [380 * MiB] and wp.sequence("arena_per_owner") == [2508 * MiB]
     be2 = B()
     assert wp.run_arena("arena_per_owner", 8 << 30, 0, 4, FakeDist(), be2, "arena_per_owner#0") and len(be2.regs) == 1
+
+def test_probe_run_arena_uses_the_rank_as_hip_device_not_device_zero(capsys):
+    """Evidence found run_arena hard-coded device 0 (wrong for ranks 1-3). Every probe path must pass device = rank (or the explicit override)."""
+    from aiter.ops.gemm_fusion.sp_qkv import window_probe as wp
+
+    class B(ArenaBackend):
+        devs = []
+
+        def uid(self, rank):
+            return b"u"
+
+        def comm_create(self, rank, world, uid, heap, device):
+            B.devs.append((rank, device))
+            return super().comm_create(rank, world, uid, heap, device) if hasattr(super(), "comm_create") else object()
+
+        def comm_destroy(self, comm):
+            pass
+
+        def win_deregister(self, comm, w):
+            pass
+
+        def peer_ptr(self, comm, local, p):
+            return local + p * (4 << 30)
+
+    for rank in range(4):
+        be = B()
+        be.heap = 8 << 30
+        wp.run_arena("arena", 4 << 30, rank, 4, FakeDist(), be, f"arena#r{rank}")
+    assert B.devs == [(0, 0), (1, 1), (2, 2), (3, 3)]
+    B.devs.clear()
+    be = B()
+    wp.run_arena("arena", 4 << 30, 2, 4, FakeDist(), be, "arena#override", device=5)
+    assert B.devs == [(2, 5)]
+    # the generic run() path already used rank; pin it
+    B.devs.clear()
+    be = B()
+    wp.run([4 << 20], 4 << 30, 3, 4, FakeDist(), be, "x")
+    assert B.devs == [(3, 3)]
+    capsys.readouterr()

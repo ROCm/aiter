@@ -66,7 +66,7 @@ ABS_SEQUENCES = ("abs_aligned_gate03", "abs_aligned_all", "shared_large_abs")
 ARENA_SEQUENCES = ("arena", "arena_per_owner")  # D14 r1e/r1f: ONE registered window, then device-memory VIEW structs (no second registration of any size)
 
 
-def run_arena(kind: str, heap_bytes: int, rank: int, world: int, dist, backend, tag: str) -> bool:
+def run_arena(kind: str, heap_bytes: int, rank: int, world: int, dist, backend, tag: str, device=None) -> bool:
     """ONE registration (the arena, sized like the policy: 380 MiB shared design / 2508 MiB per-owner variant) followed by the view structs the policy would create
     (shared S/R/C + the small windows / every per-owner window, 4 MiB aligned). Checks that every view struct reads back winBase = arena winBase + offset with unchanged
     stride/lsaRank, that peer pointers of a view equal the arena's peer pointers + offset, then frees the views and deregisters the arena. A second registration is never issued."""
@@ -82,7 +82,7 @@ def run_arena(kind: str, heap_bytes: int, rank: int, world: int, dist, backend, 
         offs = [(int(s), "owner") for s in wb["window_sizes"]]
     uid = [backend.uid(rank) if rank == 0 else None]
     dist.broadcast_object_list(uid, src=0)
-    comm = backend.comm_create(rank, world, uid[0], heap_bytes, 0)
+    comm = backend.comm_create(rank, world, uid[0], heap_bytes, rank if device is None else device)  # HIP device = rank (the torchrun mapping), as run() does; NOT 0
     ok, views = True, []
     try:
         h, loc = backend.win_register(comm, size)
@@ -355,7 +355,7 @@ def main(argv=None):
     ok = True
     for rep in range(a.repeat):
         if a.sequence in ARENA_SEQUENCES:
-            ok &= run_arena(a.sequence, a.heap_gib << 30, rank, world, dist, CcoBackend(), f"{a.sequence}#{rep}")
+            ok &= run_arena(a.sequence, a.heap_gib << 30, rank, world, dist, CcoBackend(), f"{a.sequence}#{rep}", device=rank)
             continue
         lay = None
         if a.sequence in ABS_SEQUENCES:
