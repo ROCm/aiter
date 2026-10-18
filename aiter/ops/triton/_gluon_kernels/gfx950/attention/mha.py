@@ -1831,7 +1831,7 @@ def _attn_fwd(
     )
     if IS_CAUSAL:  # noqa: SIM102
         if n_blocks <= 0:
-            # A causal M-block that sees no key: zero output, zero LSE.
+            # A causal M-block that sees no key: zero output, LSE -inf or sink[h].
             if IS_FP8:
                 # Built in _store_out's layout: converting from the MFMA layout
                 # would stage an fp32 tile through LDS beside the K/V buffers.
@@ -1888,9 +1888,20 @@ def _attn_fwd(
                 )
 
             if softmax_lse_ptr is not None:
-                lse = gl.zeros(
-                    [BLOCK_M], dtype=gl.float32, layout=gl.SliceLayout(1, cfg.mfma)
-                )
+                if ENABLE_SINK:
+                    lse = gl.full(
+                        [BLOCK_M],
+                        sink,
+                        dtype=gl.float32,
+                        layout=gl.SliceLayout(1, cfg.mfma),
+                    )
+                else:
+                    lse = gl.full(
+                        [BLOCK_M],
+                        float("-inf"),
+                        dtype=gl.float32,
+                        layout=gl.SliceLayout(1, cfg.mfma),
+                    )
                 offs_lse = (
                     gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.mfma))
                     * stride_lse_m
@@ -2060,7 +2071,13 @@ def _attn_fwd(
             softmax_lse = softmax_lse - cfg.P_LIFT
         softmax_lse = softmax_lse * LN2
         if IS_CAUSAL:
-            softmax_lse = gl.where(offs_m < causal_start_idx, 0.0, softmax_lse)
+            # These rows see no key: l_i is NaN without a sink, and sink may be -inf.
+            if ENABLE_SINK:
+                softmax_lse = gl.where(offs_m < causal_start_idx, sink, softmax_lse)
+            else:
+                softmax_lse = gl.where(
+                    offs_m < causal_start_idx, float("-inf"), softmax_lse
+                )
         offs_lse = (
             gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.mfma)) * stride_lse_m
         ).to(gl.int32)
