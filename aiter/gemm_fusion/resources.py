@@ -14,6 +14,17 @@ Deliberate deviations from the Phase-1 drivers (recorded in aiter-integration-no
     ensure() with identical requests in identical order; ensure() after finalize() raises).
 
 Lifecycle: ensure(owner, reqs) ... finalize() ... [quiesce_and_reset()]* ... release().
+
+Zeroing (D14 addendum r1a, H-Z): MORI avoids hipMemset on ccoMemAlloc windows (cco_init.cpp CcoZeroWindowMem: chunked hipMemcpy H2D). gf_zero_v1 does the same by
+default (AITER_GEMM_FUSION_ZERO_MODE=h2d_deferred): windows are registered WITHOUT any write or device sync in between, and zeroed once in finalize() after every
+registration and the devcomm; control images are rewritten right after. h2d_interleaved (MORI's method, right after each owner's registration) and
+memset_interleaved (the original hipMemset, right after registration) exist only for A/B. A launch before the zeroing is refused (pending_zero).
+
+Policy 'shared_large' CONTRACT (reviewer C-S3): all large plans share ONE control block and ONE S/R pair, so EVERY rank must launch the same SEQUENCE of large plans
+(not merely the same number of launches per plan). A rank that runs a different large plan (or the same plans in a different order) is NOT detected by the device:
+the epoch/credit/arrival values still match and layouts would be mixed silently for that step. Divergence is excluded by the host-side rank consensus and detected after
+the fact by the host-side per-step digest (ATOM check_step: site|tokens|vid|n_fused), not by the device. recv_view/reuse_view of any large plan alias the shared R
+and are valid only until the next large launch on this rank; assert_no_window_alias() (AITER_GEMM_FUSION_DEBUG_ALIAS=1) checks that nothing returned/stored points into a window.
 quiesce_and_reset = device sync -> barrier -> zero all windows -> device sync -> barrier  (all ranks).
 """
 
@@ -39,11 +50,46 @@ POLICIES = ("uniform", "per_owner", "aligned", "shared_large")
 ENV_REG_BARRIER = "AITER_GEMM_FUSION_REG_BARRIER"  # =1: collective barrier after EVERY window registration (E2 seam; default off)
 ENV_REG_SYNC = "AITER_GEMM_FUSION_REG_SYNC"  # =1: device sync BEFORE every registration (optional companion of REG_BARRIER)
 ENV_LATE_REG = "AITER_GEMM_FUSION_LATE_REG"  # =1: allow ensure() after finalize() (G-late seam; default off)
+ENV_ZERO_MODE = "AITER_GEMM_FUSION_ZERO_MODE"  # h2d_deferred (default) | h2d_interleaved | memset_interleaved (the original behaviour, for A/B)
+ENV_DEBUG_ALIAS = "AITER_GEMM_FUSION_DEBUG_ALIAS"  # =1: assert_no_window_alias() actually checks (C-S4); default off
+ZERO_MODES = ("h2d_deferred", "h2d_interleaved", "memset_interleaved")
 SHARED_KEY = "<shared>"  # hook key of a shared window set
 
 
 class ResourceError(RuntimeError):
     pass
+
+
+class WindowAliasError(ResourceError):
+    """A tensor handed out/stored by the integration points into a CCO window (S/R/C/...): it would be overwritten by a peer or by the next launch."""
+
+
+def tensor_extent(t):
+    """(first_byte_address, one_past_last_byte_address) of a tensor-like (data_ptr/shape/stride/element_size), honouring strides; None if empty."""
+    shape = tuple(int(x) for x in t.shape)
+    if not shape or any(s == 0 for s in shape):
+        return None
+    strides = tuple(int(x) for x in t.stride())
+    last = sum((s - 1) * st for s, st in zip(shape, strides) if st > 0)
+    first = sum((s - 1) * st for s, st in zip(shape, strides) if st < 0)  # negative strides (rare) extend below the base pointer
+    base = int(t.data_ptr())
+    es = int(t.element_size())
+    return base + first * es, base + (last + 1) * es
+
+
+def iter_tensors(obj, path="out"):
+    """Yield (path, tensor-like) from nested dict/list/tuple structures (tensors are recognised by data_ptr/shape/stride)."""
+    if hasattr(obj, "data_ptr") and hasattr(obj, "shape") and hasattr(obj, "stride"):
+        yield path, obj
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from iter_tensors(v, f"{path}[{k!r}]")
+    elif isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            yield from iter_tensors(v, f"{path}[{i}]")
+    elif hasattr(obj, "__dict__") and not isinstance(obj, type):
+        for k, v in vars(obj).items():
+            yield from iter_tensors(v, f"{path}.{k}")
 
 
 def round_up(n: int, g: int = GRANULE) -> int:
@@ -135,7 +181,7 @@ class CcoBackend:
         for n, a in [
             ("gf_uid_v1", [u32, vp]), ("gf_comm_create_v1", [u32, u32, i32, vp, u64, C.POINTER(vp)]),
             ("gf_win_register_v1", [vp, u64, C.POINTER(vp), C.POINTER(vp)]), ("gf_peer_ptr_v1", [vp, vp, i32, C.POINTER(vp)]),
-            ("gf_devcomm_create_v1", [vp, u32, C.POINTER(vp)]), ("gf_devcomm_info_v1", [vp, vp, C.POINTER(u64)]), ("gf_zero_v1", [i32, vp, u64]), ("gf_device_sync_v1", [i32]),
+            ("gf_devcomm_create_v1", [vp, u32, C.POINTER(vp)]), ("gf_devcomm_info_v1", [vp, vp, C.POINTER(u64)]), ("gf_zero_v1", [i32, vp, u64, i32]), ("gf_mem_info_v1", [i32, C.POINTER(u64)]), ("gf_device_sync_v1", [i32]),
             ("gf_devcomm_destroy_v1", [vp, vp]), ("gf_win_deregister_v1", [vp, vp]), ("gf_comm_destroy_v1", [vp]),
         ]:
             f = getattr(lib, n)
@@ -182,8 +228,18 @@ class CcoBackend:
         k = ("lsaSize", "lsaRank", "sdmaNumQueue", "worldSize", "commRank", "myNodeStart", "sizeofDevComm")
         return {n: s(int(v)) for n, v in zip(k, list(b))}
 
+    _zero_method = 0  # 0 = MORI's chunked H2D copy (default), 1 = hipMemset (A/B only)
+
+    def set_zero_mode(self, mode: str):
+        self._zero_method = 1 if mode == "memset_interleaved" else 0
+
     def zero(self, device, local, nbytes):
-        self._chk(self.lib.gf_zero_v1(device, local, nbytes), "gf_zero")
+        self._chk(self.lib.gf_zero_v1(device, local, nbytes, self._zero_method), "gf_zero")
+
+    def mem_info(self, device):
+        b = (C.c_uint64 * 2)()
+        self._chk(self.lib.gf_mem_info_v1(device, b), "gf_mem_info")
+        return int(b[0]), int(b[1])
 
     def device_sync(self, device):
         self._chk(self.lib.gf_device_sync_v1(device), "gf_device_sync")
@@ -204,7 +260,8 @@ class FusionResources:
     def __init__(self, rank: int, world: int, group=None, dist=None, backend=None, device: Optional[int] = None,
                  caps: frozenset = frozenset(), vmm_bytes: Optional[int] = None, window_bytes: Optional[int] = None,
                  max_windows: Optional[int] = None, policy: Optional[str] = None, profile=None,
-                 reg_barrier: Optional[bool] = None, reg_sync: Optional[bool] = None, late_registration: Optional[bool] = None):
+                 reg_barrier: Optional[bool] = None, reg_sync: Optional[bool] = None, late_registration: Optional[bool] = None,
+                 zero_mode: Optional[str] = None):
         if dist is None:
             import torch.distributed as dist  # type: ignore
         self.rank, self.world, self.group, self.dist = rank, world, group, dist
@@ -217,6 +274,12 @@ class FusionResources:
         self.align_cap = int(os.environ.get(ENV_ALIGN_CAP_MIB, "256")) << 20
         self._window_sizes: List[int] = []
         self._budget_doc: dict = {}
+        self.zero_mode = (zero_mode or os.environ.get(ENV_ZERO_MODE) or "h2d_deferred").lower()
+        if self.zero_mode not in ZERO_MODES:
+            raise ResourceError(f"{ENV_ZERO_MODE} must be one of {ZERO_MODES}, got {self.zero_mode!r}")
+        if hasattr(self.backend, "set_zero_mode"):
+            self.backend.set_zero_mode(self.zero_mode)
+        self.debug_alias = _flag(None, ENV_DEBUG_ALIAS)
         self.reg_barrier = _flag(reg_barrier, ENV_REG_BARRIER)
         self.reg_sync = _flag(reg_sync, ENV_REG_SYNC)
         self.allow_late = _flag(late_registration, ENV_LATE_REG)
@@ -243,6 +306,8 @@ class FusionResources:
         self._regs: List[Window] = []  # every registered window exactly ONCE (shared windows appear once): zeroing / deregistration / accounting
         self._shared: Dict[str, Window] = {}  # share tag -> the one registered window
         self._reg_seq = 0  # number of registering ensure() calls (agreement check)
+        self._unzeroed: List[Window] = []  # h2d_deferred: windows registered but not yet zeroed (zeroed in finalize(), after ALL registrations + the devcomm)
+        self._mem_before_comm = None  # (free, total) before ccoCommCreate, for the HBM delta log (C-S6)
         self.comm = None
         self.devcomm = None
         self.windows: Dict[str, Dict[str, Window]] = {}  # owner -> name -> Window
@@ -307,9 +372,10 @@ class FusionResources:
     def _init_comm(self):
         uid = [self.backend.uid(self.rank) if self.rank == 0 else None]
         self.dist.broadcast_object_list(uid, src=self._src0(), group=self.group)
+        self._mem_before_comm = self._mem_info()
         self.comm = self.backend.comm_create(self.rank, self.world, uid[0], self._vmm, self.device)
-        log.info("event=resources comm rank=%d world=%d heap_bytes=%d policy=%s window_bytes=%s max_windows=%s reg_barrier=%d reg_sync=%d late=%d",
-                 self.rank, self.world, self._vmm, self.policy, self.window_bytes, self.max_windows, self.reg_barrier, self.reg_sync, self.allow_late)
+        log.info("event=resources comm rank=%d world=%d heap_bytes=%d policy=%s window_bytes=%s max_windows=%s reg_barrier=%d reg_sync=%d late=%d zero_mode=%s",
+                 self.rank, self.world, self._vmm, self.policy, self.window_bytes, self.max_windows, self.reg_barrier, self.reg_sync, self.allow_late, self.zero_mode)
         if self._budget_doc:
             tbl = policy_memory_table(self._budget_doc, self.align_cap)
             log.info("event=resources policy_memory rank=%d selected=%s %s", self.rank, self.policy,
@@ -409,7 +475,10 @@ class FusionResources:
         # number of plans (9 large plans must not ask CCO for 9 queues: the r11 kernels require exactly 1, as in Phase-1).
         self._sdma = max([getattr(self, "_sdma", 0)] + [max(1, int(r.bytes)) for r in reqs if r.kind == "sdma_queue"])
         self.windows[owner] = wins
-        self._zero_windows(fresh)  # local only; ranks barrier before first launch (finalize). NEVER a shared window that already exists (it may be live)
+        if self.zero_mode == "h2d_deferred" and not late:
+            self._unzeroed.extend(fresh)  # NOT between registrations: zeroed in finalize(), after every registration and the devcomm (D14 addendum r1a)
+        else:
+            self._zero_windows(fresh)  # interleaved modes, and any late registration (the devcomm already exists). NEVER a pre-existing shared window (it may be live)
         if late:
             log.info("event=resources late_registration rank=%d owner=%s windows=%d (after ccoDevCommCreate; barrier done)", self.rank, owner, len(fresh))
         return wins
@@ -529,12 +598,69 @@ class FusionResources:
                 log.warning("event=resources devcomm_info_failed rank=%d err=%s", self.rank, e)
         log.info("event=resources devcomm rank=%d sdma_queues=%d windows=%d info=%s", self.rank, self.sdma_queues, len(self._reg_log), self.devcomm_info)
         self.finalized = True
+        if self._unzeroed:  # h2d_deferred: all registrations and the devcomm are done; now zero every window once, then (re)write any control images
+            self._zero_windows(self._unzeroed)
+            self._unzeroed.clear()
+            for hook in list(self._init_hooks.values()):
+                hook()
         b = self.budget()
         log.info("event=resources budget rank=%d policy=%s windows=%d registered_bytes=%d (%.1f MiB) shared_bytes=%d spacer_bytes=%d heap_bytes=%d "
                  "peer_mapped_va_bytes=%d owners=%d sdma_queues=%d", self.rank, b["policy"], b["windows"], b["registered_bytes"], b["registered_bytes"] / (1 << 20),
                  b["shared_bytes"], b["spacer_bytes"], b["heap_bytes"], b["peer_mapped_va_bytes"], b["owners"], b["devcomm_sdma_queues"])
         self.backend.device_sync(self.device)
+        mem1 = self._mem_info()
+        if self._mem_before_comm and mem1:
+            delta = self._mem_before_comm[0] - mem1[0]
+            reg = b["registered_bytes"] + b["spacer_bytes"]
+            log.info("event=resources hbm rank=%d free_before_comm=%d free_after_finalize=%d delta_bytes=%d (%.1f MiB) registered_bytes=%d delta_over_registered=%.3f "
+                     "(delta also contains the comm/devcomm internal allocations and any torch allocation in between)", self.rank, self._mem_before_comm[0], mem1[0],
+                     delta, delta / (1 << 20), reg, (delta / reg) if reg else 0.0)
         self._barrier()
+
+    def _mem_info(self):
+        fn = getattr(self.backend, "mem_info", None)
+        if fn is None:
+            return None
+        try:
+            return fn(self.device)
+        except Exception:  # noqa: BLE001  (accounting only)
+            return None
+
+    # -- C-S4: nothing returned or stored may point into a CCO window ----------------------------------------------
+    def window_ranges(self, kinds=("p2p_window", "control")) -> List[Tuple[str, int, int]]:
+        """[(label, start, end)] of every registered window (+ alignment spacers) in THIS process's address space."""
+        out = [(f"{w.owner}/{w.name}" + (" [shared]" if w.shared else ""), int(w.local), int(w.local) + int(w.bytes)) for w in self._regs if w.kind in kinds]
+        out += [(f"spacer#{i}", int(loc), int(loc) + int(n)) for i, (_h, loc, n) in enumerate(self._spacers)]
+        return out
+
+    def find_window_alias(self, obj, kinds=("p2p_window", "control")) -> List[str]:
+        """Names of the CCO windows that any tensor reachable from `obj` (nested dict/list/tuple/object attributes) overlaps. Empty = clean."""
+        wins = self.window_ranges(kinds)
+        hits = []
+        for path, t in iter_tensors(obj):
+            ext = tensor_extent(t)
+            if ext is None:
+                continue
+            for label, a, b in wins:
+                if ext[0] < b and a < ext[1]:
+                    hits.append(f"{path} [{ext[0]:#x},{ext[1]:#x}) overlaps window {label} [{a:#x},{b:#x})")
+        return hits
+
+    def assert_no_window_alias(self, obj, what: str = "gemm_fusion output", force: bool = False):
+        """The recv_view / reuse_view of a large plan aliases the R window (shared_large: the SAME R for every large plan), valid only until the next large
+        launch on this rank. A consumer must finish within the op: nothing RETURNED from the custom op or STORED on a long-lived object (e.g. attn.impl._index_q)
+        may point into a window. Call this on the op's results/attributes (cheap but O(windows x tensors)): it is a no-op unless
+        AITER_GEMM_FUSION_DEBUG_ALIAS=1 (or force=True / the resources' debug_alias flag). Raises WindowAliasError."""
+        if not (force or self.debug_alias):
+            return
+        hits = self.find_window_alias(obj)
+        if hits:
+            raise WindowAliasError(f"{what} points into a CCO window (valid only until the next launch; copy it within the op): " + "; ".join(hits))
+
+    @property
+    def pending_zero(self) -> int:
+        """Windows registered but not yet zeroed (h2d_deferred before finalize()). A launch while this is non-zero would run on garbage control state."""
+        return len(self._unzeroed)
 
     def _zero_windows(self, wins):
         for w in wins:
@@ -550,6 +676,7 @@ class FusionResources:
             self.backend.device_sync(self.device)
         self._barrier()
         self._zero_windows(self._regs)  # every registered window exactly once (a shared window is not zeroed once per owner)
+        self._unzeroed.clear()
         for hook in list(self._init_hooks.values()):  # control-block images; one per owner, one for a shared set
             hook()
         self.backend.device_sync(self.device)

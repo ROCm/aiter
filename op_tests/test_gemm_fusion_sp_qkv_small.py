@@ -299,8 +299,11 @@ def test_reset_runs_init_hooks():
     r.set_init("p", lambda: calls.append(1))
     assert calls == [1]
     r.finalize()
-    r.quiesce_and_reset()
+    # default zero mode h2d_deferred: windows are zeroed in finalize() (after ALL registrations + the devcomm) and the control image is rewritten
+    # right after, so the registration-time init (calls[0]) is not lost; then the reset runs it once more
     assert calls == [1, 1]
+    r.quiesce_and_reset()
+    assert calls == [1, 1, 1]
 
 
 def test_reset_order_with_drain_hook():
@@ -1736,3 +1739,233 @@ def test_A1_audit_host_launch_args_are_per_plan_but_target_windows_are_handles()
     # the context itself carries no epoch either
     ctx = drv[drv.index("struct LgCommCtx"):drv.index("};", drv.index("struct LgCommCtx"))]
     assert not re.search(r"epoch|\bep\b", ctx)
+
+
+# ======================================================================= zeroing (D14 addendum r1a: H-Z) + reviewer conditions C-S3/C-S4/C-S6
+class _ZeroRecBackend(RealisticFirstFit):
+    """Records the ORDER of registrations, zeroing, devcomm creation and device syncs."""
+
+    def __init__(self):
+        super().__init__()
+        self.ev = []
+        self.mode = None
+
+    def set_zero_mode(self, mode):
+        self.mode = mode
+
+    def win_register(self, comm, nbytes):
+        self.ev.append(("reg", nbytes))
+        return super().win_register(comm, nbytes)
+
+    def zero(self, dev, loc, n):
+        self.ev.append(("zero", loc - self.base))
+
+    def devcomm_create(self, comm, q):
+        self.ev.append(("devcomm", q))
+        return super().devcomm_create(comm, q)
+
+
+def _ensure_pairs(r, n=3):
+    for i in range(n):
+        r.ensure(f"o{i}", [WindowReq("a", 100, "p2p_window"), WindowReq("b", 100, "control")])
+
+
+def test_default_zero_mode_defers_zeroing_until_after_all_registrations_and_the_devcomm(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources
+
+    for var in ("AITER_GEMM_FUSION_ZERO_MODE", "AITER_GEMM_FUSION_WINDOW_POLICY", "AITER_GEMM_FUSION_PROFILE"):
+        monkeypatch.delenv(var, raising=False)
+    be = _ZeroRecBackend()
+    r = FusionResources(0, 4, dist=FakeDist(), backend=be, window_bytes=4 << 20, max_windows=6)
+    assert r.zero_mode == "h2d_deferred" and be.mode == "h2d_deferred"
+    _ensure_pairs(r)
+    kinds = [e[0] for e in be.ev]
+    assert kinds == ["reg"] * 6 and r.pending_zero == 6  # NOTHING zeroed between registrations (the H-Z suspect: zero after windows 2 and 4)
+    r.finalize()
+    kinds = [e[0] for e in be.ev]
+    assert kinds == ["reg"] * 6 + ["devcomm"] + ["zero"] * 6 and r.pending_zero == 0  # all registrations, then the devcomm, THEN each window zeroed once
+    assert len({e[1] for e in be.ev if e[0] == "zero"}) == 6
+
+
+def test_zero_mode_memset_interleaved_restores_the_old_behaviour_for_ab(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources, ResourceError
+
+    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
+    be = _ZeroRecBackend()
+    monkeypatch.setenv("AITER_GEMM_FUSION_ZERO_MODE", "memset_interleaved")
+    r = FusionResources(0, 4, dist=FakeDist(), backend=be, window_bytes=4 << 20, max_windows=6)
+    assert r.zero_mode == "memset_interleaved" and be.mode == "memset_interleaved"
+    _ensure_pairs(r)
+    kinds = [e[0] for e in be.ev]
+    assert kinds == ["reg", "reg", "zero", "zero", "reg", "reg", "zero", "zero", "reg", "reg", "zero", "zero"]  # zeroed right after each owner's pair
+    # h2d_interleaved: MORI's method but still interleaved (separates 'memset kernel' from 'any write between registrations')
+    be2 = _ZeroRecBackend()
+    r2 = FusionResources(0, 4, dist=FakeDist(), backend=be2, window_bytes=4 << 20, max_windows=6, zero_mode="h2d_interleaved")
+    _ensure_pairs(r2, 2)
+    assert [e[0] for e in be2.ev] == ["reg", "reg", "zero", "zero", "reg", "reg", "zero", "zero"] and be2.mode == "h2d_interleaved"
+    monkeypatch.delenv("AITER_GEMM_FUSION_ZERO_MODE")
+    with pytest.raises(ResourceError, match="ZERO_MODE must be one of"):
+        FusionResources(0, 4, dist=FakeDist(), backend=_ZeroRecBackend(), zero_mode="bogus")
+
+
+def test_deferred_zero_keeps_control_images_and_late_windows_are_zeroed_immediately(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources
+
+    monkeypatch.delenv("AITER_GEMM_FUSION_ZERO_MODE", raising=False)
+    be = _ZeroRecBackend()
+    r = FusionResources(0, 4, dist=FakeDist(), backend=be, window_bytes=4 << 20, max_windows=6, late_registration=True)
+    ev = []
+    r.ensure("o0", [WindowReq("a", 100, "p2p_window")])
+    r.set_init("o0", lambda: ev.append("init"))  # a control image written at attach time (before finalize)
+    assert ev == ["init"]
+    r.finalize()
+    assert ev == ["init", "init"]  # finalize() zeroed the window AFTER the first init, so the image is rewritten: not lost
+    n = len([e for e in be.ev if e[0] == "zero"])
+    r.ensure("late", [WindowReq("a", 100, "p2p_window")])  # after the devcomm: zeroed right away, never left pending
+    assert r.pending_zero == 0 and len([e for e in be.ev if e[0] == "zero"]) == n + 1
+
+
+def test_launch_refuses_windows_that_are_not_zeroed_yet(monkeypatch):
+    from types import SimpleNamespace as NS
+
+    plan, st, meta, outs, res, binds, _z = _binding_rig(monkeypatch)
+    res.pending_zero = 3
+    sys.modules["torch"].cuda = NS(is_current_stream_capturing=lambda: False)
+    with pytest.raises(RuntimeError, match="3 CCO window.*not yet zeroed.*finalize"):
+        plan.run(x=st["x"], x_scale=st["xs"], w=_T((9216, 6144)), w_scale=st["ws"], outs=outs, meta=meta, res=res)
+    res.pending_zero = 0
+    plan._context = lambda r: NS(bind=lambda sb: object(), launch=lambda *a: None)
+    monkeypatch.setattr("aiter.ops.gemm_fusion.sp_qkv.small_rt.stream_handle", lambda s: "S")
+    plan.run(x=st["x"], x_scale=st["xs"], w=_T((9216, 6144)), w_scale=st["ws"], outs=outs, meta=meta, res=res)  # zeroed: runs
+
+
+def test_native_zero_uses_mori_h2d_method_and_keeps_memset_behind_a_mode():
+    src = _host_src("gf_comm.cpp")
+    assert "static hipError_t zero_h2d(" in src and "hipMemcpyHostToDevice" in src and "4u << 20" in src  # MORI CcoZeroWindowMem: 4 MiB chunked H2D
+    zbody = src[src.index("int32_t gf_zero_v1"):]
+    zbody = zbody[:zbody.index("\n}\n")]
+    assert "mode == 1) ? hipMemset(" in zbody and "zero_h2d(local" in zbody and "hipDeviceSynchronize" in zbody  # memset only for mode 1 (A/B)
+    assert "int32_t gf_mem_info_v1" in src and "hipMemGetInfo" in src
+    import ast  # noqa: F401
+    from aiter.gemm_fusion import resources as rmod
+
+    be = object.__new__(rmod.CcoBackend)
+    be.set_zero_mode("memset_interleaved")
+    assert be._zero_method == 1
+    be.set_zero_mode("h2d_deferred")
+    assert be._zero_method == 0
+    be.set_zero_mode("h2d_interleaved")
+    assert be._zero_method == 0
+
+
+# ---- C-S4: nothing returned/stored may point into a CCO window ----
+def test_assert_no_window_alias_detects_overlap_strided_extents_and_nested_structures(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources, WindowAliasError, tensor_extent
+
+    monkeypatch.delenv("AITER_GEMM_FUSION_DEBUG_ALIAS", raising=False)
+    be = RealisticFirstFit()
+    r = FusionResources(0, 4, dist=FakeDist(), backend=be, window_bytes=4 << 20, max_windows=3)
+    w = r.ensure("big", [WindowReq("R", 100, "p2p_window")])["R"]
+    base = w.local
+
+    class Tn:
+        def __init__(self, ptr, shape, stride, es=2):
+            self.p, self.shape, self._s, self.es = ptr, shape, stride, es
+
+        def data_ptr(self):
+            return self.p
+
+        def stride(self):
+            return self._s
+
+        def element_size(self):
+            return self.es
+
+    inside = Tn(base + 1024, (16, 2304), (2304, 1))
+    outside = Tn(base + w.bytes + (64 << 20), (16, 16), (16, 1))
+    assert r.find_window_alias(outside) == []
+    assert r.find_window_alias(inside)  # overlaps R
+    # a strided [T,2560] row-stride-2304 view (the reuse view) extends further than numel*elem: the extent must honour the strides
+    reuse = Tn(base + w.bytes - 100, (4, 2560), (2304, 1))
+    ext = tensor_extent(reuse)
+    assert ext == (base + w.bytes - 100, base + w.bytes - 100 + ((3 * 2304 + 2559) + 1) * 2)
+    assert r.find_window_alias(reuse)  # starts inside R, runs past its end
+    adjacent = Tn(base + w.bytes, (4, 4), (4, 1))
+    assert r.find_window_alias(adjacent) == []  # one past the end is not an overlap
+    nested = {"out": [outside, (inside,)], "meta": {"x": outside}}
+    hits = r.find_window_alias(nested)
+    assert len(hits) == 1 and "['out'][1][0]" in hits[0]  # the path names the offending element inside the nested structure
+    # default: assertion is a no-op (debug off); force / env / flag turn it on
+    r.assert_no_window_alias(inside)
+    with pytest.raises(WindowAliasError, match="points into a CCO window.*copy it within the op"):
+        r.assert_no_window_alias(inside, force=True)
+    r.assert_no_window_alias(outside, force=True)
+    monkeypatch.setenv("AITER_GEMM_FUSION_DEBUG_ALIAS", "1")
+    r2 = FusionResources(0, 4, dist=FakeDist(), backend=RealisticFirstFit(), window_bytes=4 << 20, max_windows=3)
+    base2 = r2.ensure("o", [WindowReq("S", 100, "p2p_window")])["S"].local
+    with pytest.raises(WindowAliasError):
+        r2.assert_no_window_alias(Tn(base2, (2, 2), (2, 1)), what="attn.impl._index_q")
+    assert tensor_extent(Tn(0x1000, (0, 4), (4, 1))) is None  # empty tensors have no extent
+
+
+def test_alias_check_covers_shared_large_r_for_every_large_owner(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources
+
+    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "shared_large")
+    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
+    profmod.clear_profile_cache()
+    plans = _all_plans(monkeypatch)
+    r = FusionResources(0, 4, dist=FakeDist(), backend=RealisticFirstFit(), profile=PROFILE)
+    for owner, rq in plans:
+        r.ensure(owner, rq)
+    labels = [lab for lab, _a, _b in r.window_ranges()]
+    assert sum("[shared]" in lab for lab in labels) == 3 and len(labels) == 15  # one entry per registered window, the shared set once
+
+
+def test_C_S3_documented_in_code_and_policy_requires_the_same_large_plan_sequence():
+    """C-S3: the stricter contract and the host-side detection must be stated where the policy is defined."""
+    from aiter.gemm_fusion import resources as rmod
+
+    doc = rmod.__doc__
+    assert "same SEQUENCE of large plans" in doc and "digest" in doc and "not by the device" in doc
+    vl = open(os.path.join(os.path.dirname(specs.__file__), "variants_large.py"), encoding="utf-8").read()
+    assert "same SEQUENCE" in vl
+
+
+def test_C_S6_budget_log_has_registered_bytes_heap_and_hbm_delta(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources
+
+    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
+    msgs = []
+
+    class H(logging.Handler):
+        def emit(self, rec):
+            msgs.append(rec.getMessage())
+
+    class MemBackend(RealisticFirstFit):
+        def __init__(self):
+            super().__init__()
+            self.free = 100 << 30
+
+        def mem_info(self, device):
+            return (self.free, 288 << 30)
+
+        def win_register(self, comm, n):
+            self.free -= n
+            return super().win_register(comm, n)
+
+    lg = logging.getLogger("aiter.gemm_fusion")
+    h, old = H(level=logging.INFO), lg.level
+    lg.addHandler(h)
+    lg.setLevel(logging.INFO)
+    try:
+        r = FusionResources(0, 4, dist=FakeDist(), backend=MemBackend(), window_bytes=4 << 20, max_windows=6)
+        _ensure_pairs(r)
+        r.finalize()
+    finally:
+        lg.removeHandler(h)
+        lg.setLevel(old)
+    bud = [m for m in msgs if "event=resources budget" in m]
+    hbm = [m for m in msgs if "event=resources hbm" in m]
+    assert bud and "registered_bytes=25165824" in bud[0] and "heap_bytes=" in bud[0] and "peer_mapped_va_bytes=" in bud[0]
+    assert hbm and "delta_bytes=25165824" in hbm[0] and "registered_bytes=25165824" in hbm[0] and "delta_over_registered=1.000" in hbm[0]

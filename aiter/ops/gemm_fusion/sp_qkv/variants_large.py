@@ -12,6 +12,8 @@ plan.run(x, x_scale, w, w_scale, outs, meta, res, stream) contract (large):
   Epoch state (credit protocol) is device-owned; all ranks must launch the same number of epochs per plan. After ANY poison on ANY rank:
   collective res.quiesce_and_reset() (re-inits the control image epoch=1/magic) before the next launch.
 Requires res.finalize() to have run (the kernels take the process devcomm by value).
+Under the shared_large window policy every large plan uses ONE control block and ONE S/R pair: every rank must launch the same SEQUENCE of large plans (see the
+resources module docstring: divergence is detected by the host-side digest, not by the device) and a recv_view is valid only until the next large launch.
 """
 
 from __future__ import annotations
@@ -183,6 +185,9 @@ class SpQkvLarge(Plan):
     def run(self, *, x, x_scale, w, w_scale, outs=None, meta=None, res, stream=None):
         from .small_rt import stream_handle
 
+        from .variants import _require_zeroed
+
+        _require_zeroed(res, self.owner)
         c = self._context(res)
         if x.shape[0] != self.M:
             raise ValueError(f"x rows {x.shape[0]} != plan local M {self.M}")

@@ -10,9 +10,11 @@
 #include <hip/hip_runtime.h>
 #include <mori/cco/cco.hpp>
 #include "gf_device_scope.hpp"
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace {
 constexpr int OK = 0, E_ARG = -1, E_HIP = -2, E_CCO = -3, E_TOPO = -11;
@@ -97,12 +99,40 @@ int32_t gf_devcomm_info_v1(void* comm, const void* dev, uint64_t* out7) {
     out7[4] = static_cast<uint64_t>(static_cast<int64_t>(c->rank)); out7[5] = static_cast<uint64_t>(static_cast<int64_t>(c->myNodeStart)); out7[6] = sizeof(mori::cco::ccoDevComm);
     return OK;
 }
-// Zero a window region (device sync included). All ranks must call, then barrier, before the next launch.
-int32_t gf_zero_v1(int32_t device, void* local, uint64_t bytes) {
+// MORI's own zeroing method for ccoMemAlloc windows (cco_init.cpp CcoZeroWindowMem, file-static there, so re-implemented): chunked SYNCHRONOUS hipMemcpy
+// host->device from a small zero-filled pageable staging buffer. MORI avoids hipMemset on these windows (on UALink fabric-exportable pools hipMemset
+// returns hipErrorOutOfMemory; l.407-410 and the devcomm resource window l.1762). The staging buffer is reused across calls and never written after its fill.
+static hipError_t zero_h2d(void* ptr, size_t bytes) {
+    if (bytes == 0) return hipSuccess;
+    const size_t chunk = std::min<size_t>(bytes, 4u << 20);
+    static thread_local std::vector<char> zeros;
+    if (zeros.size() < chunk) zeros.assign(chunk, 0);
+    char* dst = static_cast<char*>(ptr);
+    for (size_t off = 0; off < bytes; off += chunk) {
+        const size_t n = std::min(chunk, bytes - off);
+        const hipError_t e = hipMemcpy(dst + off, zeros.data(), n, hipMemcpyHostToDevice);
+        if (e != hipSuccess) return e;
+    }
+    return hipSuccess;
+}
+// Zero a window region, then a device sync. mode 0 = MORI's H2D-copy method (default), mode 1 = the original hipMemset (kept ONLY for A/B:
+// AITER_GEMM_FUSION_ZERO_MODE=memset_interleaved). All ranks must call, then barrier, before the next launch.
+int32_t gf_zero_v1(int32_t device, void* local, uint64_t bytes, int32_t mode) {
     gf::DeviceScope scope(device);
     if (!scope.ok()) return E_HIP;
-    if (hipMemset(local, 0, static_cast<size_t>(bytes)) != hipSuccess) return E_HIP;
+    const hipError_t e = (mode == 1) ? hipMemset(local, 0, static_cast<size_t>(bytes)) : zero_h2d(local, static_cast<size_t>(bytes));
+    if (e != hipSuccess) { std::fprintf(stderr, "GF_COMM zero mode=%d bytes=%llu err=%d (%s)\n", static_cast<int>(mode), static_cast<unsigned long long>(bytes), static_cast<int>(e), hipGetErrorString(e)); return E_HIP; }
     return hipDeviceSynchronize() == hipSuccess ? OK : E_HIP;
+}
+// Device memory snapshot for accounting (C-S6): out[0] = free bytes, out[1] = total bytes of `device`.
+int32_t gf_mem_info_v1(int32_t device, uint64_t* out2) {
+    if (!out2) return E_ARG;
+    gf::DeviceScope scope(device);
+    if (!scope.ok()) return E_HIP;
+    size_t f = 0, t = 0;
+    if (hipMemGetInfo(&f, &t) != hipSuccess) return E_HIP;
+    out2[0] = f; out2[1] = t;
+    return OK;
 }
 int32_t gf_device_sync_v1(int32_t device) {
     gf::DeviceScope scope(device);

@@ -49,6 +49,12 @@ def small_window_bytes(mode: str) -> Dict[str, int]:
     return {"rx": rx, "ctl": ctl}
 
 
+def _require_zeroed(res, owner: str):
+    """With the default zero mode (h2d_deferred) the windows are zeroed in FusionResources.finalize(); a launch before that would run on garbage control state."""
+    if getattr(res, "pending_zero", 0):
+        raise RuntimeError(f"{owner}: {res.pending_zero} CCO window(s) are registered but not yet zeroed; call res.finalize() (collective) before the first launch")
+
+
 def _diff_parts(old: dict, new: dict) -> List[str]:
     return [f"{k}: {old.get(k)} -> {new.get(k)}" for k in sorted(set(old) | set(new)) if old.get(k) != new.get(k)]
 
@@ -221,6 +227,7 @@ class SpQkvSmall(Plan):
     def run(self, *, x, x_scale, w, w_scale, outs, meta, res, stream=None):
         import torch
 
+        _require_zeroed(res, self.owner)
         sc = self._context(res)
         blk = self._binding(x, x_scale, w_scale, outs, meta, res, in_capture=torch.cuda.is_current_stream_capturing())
         sc.launch(blk, x.data_ptr(), w.data_ptr(), x.stride(0) * x.element_size(), rt.stream_handle(stream))
