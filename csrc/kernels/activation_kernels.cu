@@ -398,12 +398,13 @@ __global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // 
                                           const int d,
                                           const int64_t in_row_stride,
                                           const int64_t out_row_stride,
-                                          const float* __restrict__ scale_ptr)
+                                          const float* __restrict__ scale_ptr,
+                                          const int cols_per_block,
+                                          const int col_step)
 {
     const int64_t token_idx         = blockIdx.x;
     auto const* ptr_x               = (input + token_idx * in_row_stride);
     auto const* ptr_y               = (ptr_x + d);
-    const float scale               = 1.0f / *scale_ptr;
     constexpr float out_min         = opus::finfo<DTYPE_O>::min();
     constexpr float out_max         = opus::finfo<DTYPE_O>::max();
     using vec_i                     = opus::vector_t<DTYPE_I, VEC_SIZE_I>;
@@ -432,13 +433,17 @@ __global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // 
     auto buffer_out = opus::make_gmem<DTYPE_O>(out_base, oob_o * sizeof(DTYPE_O));
 
     const int64_t d_vec = d / VEC_SIZE_I * VEC_SIZE_I;
-    int64_t idx         = threadIdx.x * VEC_SIZE_I;
-    for(; idx < d_vec; idx += blockDim.x * VEC_SIZE_I)
+    int64_t idx = static_cast<int64_t>(blockIdx.y) * cols_per_block + threadIdx.x * VEC_SIZE_I;
+    float scale = 0.0f;
+    for(; idx < d_vec; idx += col_step)
     {
         vec_i x{};
         vec_i y{};
         x = load_vector_nbytes<DTYPE_I, VEC_SIZE_I, load_chunk_bytes, GROUP_NT>(buffer_x, idx);
         y = load_vector_nbytes<DTYPE_I, VEC_SIZE_I, load_chunk_bytes, GROUP_NT>(buffer_y, idx);
+        // Keep the scale read behind the data loads so its latency overlaps theirs.
+        asm volatile("" ::: "memory");
+        scale = 1.0f / *scale_ptr;
 
         vec_o r{};
 
@@ -464,7 +469,7 @@ __global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // 
     defined(__gfx950__)
                 asm volatile("v_pk_mul_f32 %0, %1, %2\n\t"
                              "v_pk_mul_f32 %0, %0, %3"
-                             : "=v"(result)
+                             : "=&v"(result)
                              : "v"(act_vals), "v"(y_vals), "v"(scale_vals));
 #else
                 // RDNA archs lack `v_pk_mul_f32`; portable fallback emits two
@@ -489,6 +494,8 @@ __global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // 
 
     // Partial last vector: the out buffer range is rounded up to a dword, so a
     // vector store would spill into the next row. At most one thread gets here.
+    if(idx < d)
+        scale = 1.0f / *scale_ptr;
     for(; idx < d; idx++)
     {
         float rv      = ACT_FN(ptr_x[idx]) * opus::cast<float>(ptr_y[idx]) * scale;
@@ -1160,7 +1167,20 @@ static constexpr int nextPow2(unsigned int num)
     {                                                                                 \
         num_wave = 4;                                                                 \
         block    = dim3(num_wave * warp_size);                                        \
-    }
+    }                                                                                 \
+    /* Few rows: one block per row leaves CUs idle, so split each row over up */      \
+    /* to 16 blocks per CU in total, with 4-wave blocks below 2 rows per CU.  */      \
+    const int64_t num_cu = get_num_cu_func();                                         \
+    if(num_tokens > 0 && num_tokens < 16 * num_cu)                                    \
+    {                                                                                 \
+        if(num_tokens < 2 * num_cu)                                                   \
+            block = dim3(std::min<int>(block.x, 4 * warp_size));                      \
+        const int64_t cols       = block.x * vec_size;                                \
+        const int64_t max_splits = (16 * num_cu - 1) / num_tokens + 1;                \
+        grid = dim3(num_tokens, std::min((d + cols - 1) / cols, max_splits));         \
+    }                                                                                 \
+    const int cols_per_block = block.x * vec_size;                                    \
+    const int col_step       = grid.y * cols_per_block;
 
 // Helper macros for fp32 vec_size dispatch
 #define DISPATCH_FP32_VEC_SIZE_CASE(VS, KERNEL_NAME, KERNEL, ...)              \
@@ -1255,7 +1275,7 @@ static constexpr int nextPow2(unsigned int num)
 
 #define DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, scale_ptr)               \
     DISPATCH_FP32_KERNEL(                                                                   \
-        scaled_act_and_mul_kernel, KERNEL, out_ptr, in_ptr, d, in_row_stride, out_row_stride, scale_ptr)
+        scaled_act_and_mul_kernel, KERNEL, out_ptr, in_ptr, d, in_row_stride, out_row_stride, scale_ptr, cols_per_block, col_step)
 
 // Helper macro to dispatch scaled kernel with restricted output types (fp8 or int8)
 #define DISPATCH_OUTPUT_TYPE_SCALED(KERNEL, in_ptr, scale_ptr)                      \
