@@ -36,9 +36,9 @@ def _tuning_cache_tag():
 
 def _cache_geometry(key_cache):
     """KV heads, page size and layout of a packed 5D K cache."""
-    if key_cache.ndim == 4:
-        raise NotImplementedError("Non-transposed key cache is not implemented")
     if key_cache.ndim != 5:
+        if key_cache.ndim == 4:
+            raise NotImplementedError("Non-transposed key cache is not implemented")
         raise ValueError("key_cache must be 5D")
     return key_cache.shape[1], key_cache.shape[3], "packed"
 

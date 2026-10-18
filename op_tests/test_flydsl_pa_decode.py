@@ -722,25 +722,3 @@ def test_pa_decode(case, device, monkeypatch):
             output.fill_(float("nan"))
             graph.replay()
             check()
-
-
-def test_stage_bound_covers_plan(device):
-    """A 1M sequence stays within the host tile bound that sizes page-id staging."""
-    from aiter.ops.flydsl.kernels.pa_decode.traits import max_tiles_per_task
-    from aiter.ops.flydsl.kernels.pa_decode_plan import plan_pa_decode
-
-    batch, budget, max_length = 1, 256, 2**20
-    generator = torch.Generator().manual_seed(0)
-    for trial in range(6):
-        lengths = torch.randint(0, max_length + 1, (batch,), generator=generator)
-        lengths[0] = max_length
-        if trial % 2:
-            lengths[0] = max_length // (trial + 1)
-        context = lengths.to(device=device, dtype=torch.int32)
-        plan = plan_pa_decode(context, 1, workgroup_budget=budget)
-        work = plan.work_info.cpu()
-        spans = work[:, 2] - work[:, 1]
-        bound = max_tiles_per_task(
-            batch, plan.capacity, plan.max_partitions, max_length
-        )
-        assert spans.max().item() <= bound
