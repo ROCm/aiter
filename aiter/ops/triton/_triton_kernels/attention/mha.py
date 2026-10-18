@@ -531,7 +531,7 @@ def _attn_fwd(
     # Now we compute whether we need to exit early due to causal masking.
     # This is because for seqlen_q > seqlen_k, M rows of the attn scores
     # are completely masked, resulting in 0s written to the output, and
-    # inf written to LSE. We don't need to do any GEMMs in this case.
+    # -inf (or sink[h]) written to LSE. We don't need to do any GEMMs in this case.
     # This block of code determines what N is, and if this WG is operating
     # on those M rows.
     if IS_CAUSAL:
@@ -571,7 +571,12 @@ def _attn_fwd(
                     + offs_m * stride_lse_m
                 )
                 lse_mask = offs_m < SEQLEN_Q
-                lse = tl.full([BLOCK_M], value=0.0, dtype=tl.float32)
+                if ENABLE_SINK:
+                    # sink_val is loaded only after this early return.
+                    early_sink = tl.load(sink_ptr + off_q_head).to(tl.float32)
+                    lse = tl.full([BLOCK_M], early_sink, dtype=tl.float32)
+                else:
+                    lse = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
                 tl.store(softmax_lse_ptr + offs_lse, lse, mask=lse_mask)
                 # TODO: Should dropout and return encoded softmax be handled here too?
 
@@ -679,7 +684,9 @@ def _attn_fwd(
 
     if ENABLE_SINK:
         RCP_LN2: tl.constexpr = 1.4426950408889634
-        m_i_value = tl.load(sink_ptr + off_q_head).to(tl.float32) * RCP_LN2
+        # Natural units; fully masked rows store it as their LSE.
+        sink_val = tl.load(sink_ptr + off_q_head).to(tl.float32)
+        m_i_value = sink_val * RCP_LN2
     else:
         m_i_value = float("-inf")
 
@@ -897,9 +904,13 @@ def _attn_fwd(
         softmax_lse *= LN2
 
         if IS_CAUSAL:
-            # zero out nans caused by -infs when doing causal
+            # Rows before causal_start_idx see no keys: l_i is NaN without a sink,
+            # and storing sink_val (not the computed value) also covers sink = -inf.
             lse_causal_mask = (start_m_idx + tl.arange(0, BLOCK_M)) < causal_start_idx
-            softmax_lse = tl.where(lse_causal_mask, 0.0, softmax_lse)
+            if ENABLE_SINK:
+                softmax_lse = tl.where(lse_causal_mask, sink_val, softmax_lse)
+            else:
+                softmax_lse = tl.where(lse_causal_mask, float("-inf"), softmax_lse)
 
         # If seqlen_q not multiple of BLOCK_M, we need to mask out the last few rows.
         # This is only true for the last M block. For others, overflow_size will be -ve

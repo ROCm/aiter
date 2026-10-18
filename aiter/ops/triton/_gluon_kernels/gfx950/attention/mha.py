@@ -1558,7 +1558,9 @@ def _attn_fwd(
     # Online-softmax state.  A sliding window can mask whole rows of a block; a
     # finite initial max keeps exp2(m_old - m_new) at 1 there instead of NaN.
     if ENABLE_SINK:
-        m_i_init = gl.load(sink_ptr + off_q_head).to(gl.float32) * RCP_LN2
+        # Natural units; fully masked rows store it as their LSE.
+        sink_val = gl.load(sink_ptr + off_q_head).to(gl.float32)
+        m_i_init = sink_val * RCP_LN2
     elif SLIDING_WINDOW > 0:
         m_i_init = -1.0e30
     else:
@@ -1649,7 +1651,7 @@ def _attn_fwd(
     )
     if IS_CAUSAL:  # noqa: SIM102
         if n_blocks <= 0:
-            # A causal M-block that sees no key: zero output, zero LSE.
+            # A causal M-block that sees no key: zero output, LSE -inf or sink[h].
             if IS_FP8:
                 # Built in _store_out's layout: converting from the MFMA layout
                 # would stage an fp32 tile through LDS beside the K/V buffers.
@@ -1706,9 +1708,20 @@ def _attn_fwd(
                 )
 
             if softmax_lse_ptr is not None:
-                lse = gl.zeros(
-                    [BLOCK_M], dtype=gl.float32, layout=gl.SliceLayout(1, cfg.mfma)
-                )
+                if ENABLE_SINK:
+                    lse = gl.full(
+                        [BLOCK_M],
+                        sink_val,
+                        dtype=gl.float32,
+                        layout=gl.SliceLayout(1, cfg.mfma),
+                    )
+                else:
+                    lse = gl.full(
+                        [BLOCK_M],
+                        float("-inf"),
+                        dtype=gl.float32,
+                        layout=gl.SliceLayout(1, cfg.mfma),
+                    )
                 gl.amd.cdna4.buffer_store(
                     lse, ptr=lse_base, offsets=offs_lse, mask=lse_mask
                 )
@@ -1857,7 +1870,14 @@ def _attn_fwd(
             softmax_lse = softmax_lse - _FP8_P_LIFT
         softmax_lse = softmax_lse * LN2
         if IS_CAUSAL:
-            softmax_lse = gl.where(offs_m < causal_start_idx, 0.0, softmax_lse)
+            # Rows before causal_start_idx see no keys: l_i is NaN without a sink,
+            # and storing sink_val (not the computed value) also covers sink = -inf.
+            if ENABLE_SINK:
+                softmax_lse = gl.where(offs_m < causal_start_idx, sink_val, softmax_lse)
+            else:
+                softmax_lse = gl.where(
+                    offs_m < causal_start_idx, float("-inf"), softmax_lse
+                )
         gl.amd.cdna4.buffer_store(
             softmax_lse, ptr=lse_base, offsets=offs_lse, mask=lse_mask
         )
