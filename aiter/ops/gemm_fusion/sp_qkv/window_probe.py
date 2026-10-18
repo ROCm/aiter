@@ -24,7 +24,14 @@ ATOM-like mode (reproduces the E2 'HIP operation not supported' on torch.zeros_l
   windows, finalize(), and AFTER each stage the E2 trigger sequence: a pinned-host -> device copy, zeros_like on a device tensor, a large torch.empty,
   hipGetLastError via torch.cuda.synchronize(). Lines: ATOMLIKE rank= stage= device_before= device_after= result=OK|FAIL err=...
   Compare --policy runs and `AITER_GEMM_FUSION_WINDOW_POLICY` to separate (1) current-device change, (2) heap/window mappings, (3) a sticky error.
-Output lines: PROBE rank=R seq=S idx=I size=B cumulative=C result=OK|FAIL
+Absolute-VA sequences (D14 r1c, H-BASE): MORI reserves flatBase only G(4 KiB)-aligned, so a window's ABSOLUTE alignment is process dependent; these run the SAME
+layout engine the abs_aligned / shared_large policies use (aiter.gemm_fusion.resources.AbsLayout), driven by the measured absolute VA of each registration:
+  abs_aligned_gate03: 4,4,4,4,40 MiB with every window start aligned to A(size)=max(2 MiB, min(next_pow2(size), 256 MiB)) (the 40 MiB window at a 64 MiB boundary)
+  abs_aligned_all   : the 39 per-owner windows of the real 15-plan sequence, LARGEST FIRST, plain spacers (policy abs_aligned)
+  shared_large_abs  : the Architect's sequence: S(164) at a 256 MiB boundary, control + 12 small windows, a 40 MiB spacer, R(164) at the next 256 MiB boundary
+  gate03_prefix     : the plain failing 4,4,4,4,40 (kept; every PROBE line now carries the absolute VA)
+Output lines: PROBE rank=R seq=S idx=I size=B cumulative=C [kind=spacer] va=0x.. va_mod_2MiB= va_mod_16MiB= va_mod_64MiB= va_mod_256MiB= result=OK|FAIL
+(abs sequences also print: PROBE_BASE slot_base=0x.. base_mod_2MiB= base_mod_256MiB=)
 Comparing sequences from ONE run isolates the failing condition without guessing (size vs. offset alignment vs. count vs. heap).
 """
 
@@ -34,7 +41,7 @@ import argparse
 import sys
 from typing import List
 
-from aiter.gemm_fusion.resources import aligned_plan
+from aiter.gemm_fusion.resources import AbsLayout, aligned_plan
 
 MiB = 1 << 20
 
@@ -54,7 +61,28 @@ def real_sequence_sizes() -> List[int]:
     return out
 
 
+ABS_SEQUENCES = ("abs_aligned_gate03", "abs_aligned_all", "shared_large_abs")
+
+
+def abs_items(name: str):
+    """(size, role) items + fill_gaps for an absolute-VA sequence; the order of registration is decided by AbsLayout from the measured VA."""
+    if name == "abs_aligned_gate03":
+        return [(4 * MiB, None)] * 4 + [(40 * MiB, None)], False
+    if name == "abs_aligned_all":
+        return [(s, None) for s in real_sequence_sizes()], False
+    if name == "shared_large_abs":
+        from aiter.ops.gemm_fusion.sp_qkv import specs, variants, variants_large
+        from aiter.gemm_fusion.resources import round_up
+
+        small = [s for s in real_sequence_sizes() if s == 4 * MiB]
+        big = max(variants_large.large_window_bytes(m, T // 4) for (m, T) in specs.LARGE_CELLS)
+        return [(big, ("shared", "S")), (big, ("shared", "R")), (round_up(8192), ("shared", "C"))] + [(s, None) for s in small], True
+    raise SystemExit(f"{name!r} is not an absolute-VA sequence {ABS_SEQUENCES}")
+
+
 def sequence(name: str, mib: str = "", n: int = 39, window_mib: int = 164) -> List[int]:
+    if name in ABS_SEQUENCES:  # the SIZES (in the order of the plan); the actual registration order/spacers come from AbsLayout at run time
+        return [s for s, _r in abs_items(name)[0]]
     if name == "phase1_equal":
         return [40 * MiB] * 3
     if name == "small_then_big":
@@ -77,7 +105,12 @@ def sequence(name: str, mib: str = "", n: int = 39, window_mib: int = 164) -> Li
     raise SystemExit(f"unknown sequence {name!r}")
 
 
-def run(seq: List[int], heap_bytes: int, rank: int, world: int, dist, backend, tag: str, stagger_ms: int = 0, sleep=None, device=None) -> bool:
+def _va_fields(va: int) -> str:
+    return (f"va={va:#x} va_mod_2MiB={va % (2 * MiB)} va_mod_16MiB={va % (16 * MiB)} va_mod_64MiB={va % (64 * MiB)} va_mod_256MiB={va % (256 * MiB)}")
+
+
+def run(seq: List[int], heap_bytes: int, rank: int, world: int, dist, backend, tag: str, stagger_ms: int = 0, sleep=None, device=None,
+        abs_layout=None) -> bool:
     """Register `seq` on a fresh comm; returns True if all succeeded. Pure function of the injected dist/backend (unit-tested)."""
     uid = [backend.uid(rank) if rank == 0 else None]
     dist.broadcast_object_list(uid, src=0)
@@ -88,16 +121,46 @@ def run(seq: List[int], heap_bytes: int, rank: int, world: int, dist, backend, t
         import time
 
         sleep = time.sleep
-    for i, size in enumerate(seq):
+    va_top = None
+    if abs_layout is not None:  # absolute-VA sequence: the layout engine decides each registration (window or spacer) from the measured VA
+        fn = getattr(backend, "va_info", None)
+        if fn is not None:
+            base, _pr, gran = fn(comm)
+            va_top = int(base)
+            abs_layout.gran = int(gran) or 4096
+            print(f"PROBE_BASE rank={rank} seq={tag} slot_base={va_top:#x} granule={abs_layout.gran} base_mod_2MiB={va_top % (2 * MiB)} base_mod_256MiB={va_top % (256 * MiB)}", flush=True)
+
+    def steps():
+        if abs_layout is None:
+            for size in seq:
+                yield "window", size
+            return
+        while True:
+            act = abs_layout.next(va_top_box[0]) if va_top_box[0] is not None else None
+            if act is None:
+                if va_top_box[0] is None and abs_layout.pending:  # no va_info (fake/old backend): place the largest first, align from its measured VA on
+                    s, _r = abs_layout.pending.pop(0)
+                    yield "window", s
+                    continue
+                return
+            yield ("spacer", act[1]) if act[0] == "spacer" else ("window", act[1])
+
+    va_top_box = [va_top]
+    for i, (kind, size) in enumerate(steps()):
         if stagger_ms:
             sleep(rank * stagger_ms / 1000.0)
         try:
             w = backend.win_register(comm, size)
             wins.append(w)
             cum += size
-            print(f"PROBE rank={rank} seq={tag} idx={i} size={size} cumulative={cum} offset_mib={(cum - size) // MiB} result=OK", flush=True)
+            va = int(w[1])
+            if abs_layout is not None:
+                va_top_box[0] = va + (-(-size // abs_layout.gran) * abs_layout.gran)
+            print(f"PROBE rank={rank} seq={tag} idx={i} size={size} cumulative={cum} offset_mib={(cum - size) // MiB}"
+                  + (" kind=spacer" if kind == "spacer" else "") + f" {_va_fields(va)} result=OK", flush=True)
         except Exception as e:  # noqa: BLE001
-            print(f"PROBE rank={rank} seq={tag} idx={i} size={size} cumulative={cum} offset_mib={cum // MiB} result=FAIL err={e}", flush=True)
+            print(f"PROBE rank={rank} seq={tag} idx={i} size={size} cumulative={cum} offset_mib={cum // MiB}"
+                  + (" kind=spacer" if kind == "spacer" else "") + f" result=FAIL err={e}", flush=True)
             ok = False
             break
     for w in reversed(wins):
@@ -232,7 +295,12 @@ def main(argv=None):
         dist.new_group(backend="nccl")
     ok = True
     for rep in range(a.repeat):
-        ok &= run(sequence(a.sequence, a.mib, a.n, a.window_mib), a.heap_gib << 30, rank, world, dist, CcoBackend(), f"{a.sequence}#{rep}", a.stagger_ms)
+        lay = None
+        if a.sequence in ABS_SEQUENCES:
+            items, fill = abs_items(a.sequence)
+            lay = AbsLayout(items, fill_gaps=fill)
+        ok &= run(sequence(a.sequence, a.mib, a.n, a.window_mib), a.heap_gib << 30, rank, world, dist, CcoBackend(), f"{a.sequence}#{rep}", a.stagger_ms,
+                   abs_layout=lay)
     del hold
     sys.exit(0 if ok else 3)
 

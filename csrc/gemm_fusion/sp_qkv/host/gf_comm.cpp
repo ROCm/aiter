@@ -58,6 +58,17 @@ int32_t gf_comm_create_v1(uint32_t rank, uint32_t world, int32_t device, const u
     }
     return OK;
 }
+// Absolute VA facts of THIS rank's slot (read-only): out[0] = LocalSlotBase = flatBase + lsaRank * perRankSize (where the first-fit slot allocator starts;
+// cco_init.cpp LocalSlotBase), out[1] = perRankSize, out[2] = vmmGranularity (G; the slot granularity). flatBase is only G-aligned (hipMemAddressReserve(..., G)),
+// so the ABSOLUTE alignment of every window is process dependent (D14 r1c, H-BASE); the abs_aligned / shared_large policies align against this.
+int32_t gf_comm_va_info_v1(void* comm, uint64_t* out3) {
+    if (!comm || !out3) return E_ARG;
+    const auto* c = static_cast<const mori::cco::ccoComm*>(comm);
+    out3[0] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(c->flatBase)) + static_cast<uint64_t>(c->lsaRank) * static_cast<uint64_t>(c->perRankSize);
+    out3[1] = static_cast<uint64_t>(c->perRankSize);
+    out3[2] = static_cast<uint64_t>(c->vmmGranularity);
+    return OK;
+}
 int32_t gf_win_register_v1(void* comm, uint64_t bytes, void** out_win, void** out_local) {
     if (!comm || !out_win || !out_local) return E_ARG;
     gf::DeviceScope scope(comm_dev(comm));

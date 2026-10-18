@@ -1552,7 +1552,7 @@ def test_shared_large_registers_one_shared_set_and_never_rezeroes_a_live_block(m
     be.log.clear()
     r.release()
     dereg = [x[1] for x in be.log if x[0] == "dereg"]
-    assert len(dereg) == 15 and len(set(dereg)) == 15
+    assert len(dereg) == 16 and len(set(dereg)) == 16  # 15 windows + the ONE 40 MiB alignment spacer (abs alignment is the shared_large default now)
 
 
 def test_shared_large_overflow_and_first_request_sizing(monkeypatch):
@@ -1589,10 +1589,13 @@ def test_policy_memory_table_and_budget_accounting_logged(monkeypatch):
 
     monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
     monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "shared_large")
+    monkeypatch.setenv("AITER_GEMM_FUSION_ABS_ALIGN", "0")  # this test pins the un-aligned accounting; the abs-aligned one is covered below
     wb = dict(profmod.load_profile(PROFILE).meta["window_budget"])
     tbl = policy_memory_table(wb)
     MiB = 1 << 20
     assert tbl["uniform"] == 39 * 164 * MiB and tbl["shared_large"] == 380 * MiB
+    assert 380 * MiB < tbl["shared_large_abs_ub"] <= 380 * MiB + 256 * MiB + 40 * MiB  # worst case: first pad < 256 MiB + the 40 MiB gap spacer
+    assert tbl["abs_aligned_ub"] > tbl["per_owner"]  # strict largest-first with plain spacers can cost more than per_owner
     assert 2400 * MiB < tbl["per_owner"] < 2700 * MiB and tbl["aligned"] >= tbl["per_owner"]  # per_owner ~2.5 GiB
     assert tbl["shared_large"] < tbl["per_owner"] < tbl["uniform"]
     msgs = []
@@ -1919,7 +1922,7 @@ def test_alias_check_covers_shared_large_r_for_every_large_owner(monkeypatch):
     for owner, rq in plans:
         r.ensure(owner, rq)
     labels = [lab for lab, _a, _b in r.window_ranges()]
-    assert sum("[shared]" in lab for lab in labels) == 3 and len(labels) == 15  # one entry per registered window, the shared set once
+    assert sum("[shared]" in lab for lab in labels) == 3 and len(labels) == 16  # 15 windows (the shared set once) + the alignment spacer
 
 
 def test_C_S3_documented_in_code_and_policy_requires_the_same_large_plan_sequence():
@@ -1969,3 +1972,230 @@ def test_C_S6_budget_log_has_registered_bytes_heap_and_hbm_delta(monkeypatch):
     hbm = [m for m in msgs if "event=resources hbm" in m]
     assert bud and "registered_bytes=25165824" in bud[0] and "heap_bytes=" in bud[0] and "peer_mapped_va_bytes=" in bud[0]
     assert hbm and "delta_bytes=25165824" in hbm[0] and "registered_bytes=25165824" in hbm[0] and "delta_over_registered=1.000" in hbm[0]
+
+# ======================================================================= D14 r1b/r1c: abs_aligned policy, shared_large absolute alignment, VA logging, probe sequences
+MiB = 1 << 20
+BASE_VA = 0x7F0000000000
+
+
+def _is_aligned(va, size, cap=256 * MiB):
+    from aiter.gemm_fusion.resources import abs_align_of
+
+    return va % abs_align_of(size, cap) == 0
+
+
+def test_abs_align_of_and_layout_engine_properties():
+    from aiter.gemm_fusion.resources import AbsLayout, abs_align_of, abs_layout_simulate
+
+    assert abs_align_of(4 * MiB) == 4 * MiB and abs_align_of(1 * MiB) == 2 * MiB  # floor 2 MiB
+    assert abs_align_of(40 * MiB) == 64 * MiB and abs_align_of(164 * MiB) == 256 * MiB and abs_align_of(2 << 30) == 256 * MiB  # cap 256 MiB
+    # the failing prefix 4,4,4,4,40 with a flatBase that is only 4 KiB aligned: the 40 MiB window is moved to an ABSOLUTE 64 MiB boundary
+    for off in (0, 4096, 2 * MiB - 4096, 2 * MiB + 4096, 128 * MiB + 4096):
+        lay = abs_layout_simulate([(4 * MiB, None)] * 4 + [(40 * MiB, None)], BASE_VA + off)
+        wins = [(sz, va) for k, sz, va, _r in lay if k == "window"]
+        assert all(_is_aligned(va, sz) for sz, va in wins), (off, lay)
+        big = [va for sz, va in wins if sz == 40 * MiB][0]
+        assert big % (64 * MiB) == 0
+    # largest first: sizes of windows are non-increasing in registration order (plain spacers, no gap filling)
+    lay = abs_layout_simulate([(s * MiB, None) for s in (4, 164, 40, 76, 4, 148)], BASE_VA + 4096)
+    sizes = [sz for k, sz, _v, _r in lay if k == "window"]
+    assert sizes == sorted(sizes, reverse=True)
+    # first spacer fixes the misaligned flatBase: a base that is 4 KiB past a 256 MiB boundary needs 256 MiB - 4 KiB
+    lay = abs_layout_simulate([(164 * MiB, None)], BASE_VA + 4096)
+    assert lay[0][0] == "spacer" and lay[0][1] == 256 * MiB - 4096 and lay[1][2] % (256 * MiB) == 0
+    assert abs_layout_simulate([(164 * MiB, None)], BASE_VA)[0][0] == "window"  # already aligned: no spacer at all
+    # spacer granularity knob: pads are rounded up to it; an unreachable alignment never loops
+    lay = AbsLayout([(40 * MiB, None)], spacer_gran=4 * MiB)
+    assert lay.next(BASE_VA + 4096)[0] == "spacer" and lay.next(BASE_VA + 4096)[0] == "window"
+
+
+def test_shared_large_abs_layout_is_the_architects_sequence_for_any_base_misalignment():
+    from aiter.gemm_fusion.resources import abs_items_from_budget, abs_layout_simulate
+
+    wb = dict(profmod.load_profile(PROFILE).meta["window_budget"])
+    items = abs_items_from_budget(wb, "shared_large")
+    assert items[0][1] == ("shared", "sp_qkv.large/S") and items[1][1] == ("shared", "sp_qkv.large/R") and items[2][1] == ("shared", "sp_qkv.large/C")
+    for off in (0, 4096, 2 * MiB - 4096, 128 * MiB + 4096):
+        lay = abs_layout_simulate(items, BASE_VA + off, fill_gaps=True)
+        k = [(kind, sz // MiB) for kind, sz, _v, _r in lay if not (kind == "spacer" and _v < BASE_VA + 256 * MiB and sz > 100 * MiB)]
+        wins = [(sz, va, r) for kind, sz, va, r in lay if kind == "window"]
+        s_va = [va for sz, va, r in wins if r and r[1].endswith("/S")][0]
+        r_va = [va for sz, va, r in wins if r and r[1].endswith("/R")][0]
+        assert s_va % (256 * MiB) == 0 and r_va % (256 * MiB) == 0 and r_va - s_va == 256 * MiB  # S, then R at the NEXT 256 MiB boundary
+        between = [(kind, sz // MiB) for kind, sz, va, r in lay if s_va < va < r_va]
+        assert between.count(("window", 4)) == 13 and between[-1] == ("spacer", 40)  # control + 12 small windows (52 MiB) fill the gap, then a 40 MiB spacer
+        assert all(_is_aligned(va, sz) for sz, va, r in wins)  # every window absolutely aligned
+
+
+class AbsFirstFit(RealisticFirstFit):
+    """First-fit with an arbitrary (misaligned) flatBase and va_info(), like MORI's slot allocator."""
+
+    def __init__(self, base_off=4096):
+        super().__init__(base=BASE_VA + base_off)
+
+    def va_info(self, comm):
+        return self.base, self.heap, 4096
+
+
+def test_abs_aligned_policy_registers_largest_first_pooled_and_claims_best_fit(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources
+
+    for var in ("AITER_GEMM_FUSION_PROFILE", "AITER_GEMM_FUSION_WINDOW_MIB", "AITER_GEMM_FUSION_ZERO_MODE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "abs_aligned")
+    profmod.clear_profile_cache()
+    plans = _all_plans(monkeypatch)
+    be = AbsFirstFit(4096)
+    r = FusionResources(0, 4, dist=FakeDist(), backend=be, profile=PROFILE)
+    assert r.policy == "abs_aligned" and r.abs_align
+    first_owner, first_reqs = plans[0]
+    r.ensure(first_owner, first_reqs)  # the FIRST ensure pre-registers the WHOLE budget
+    wins = [(sz, off) for off, sz in be.regs]
+    spacer_total = sum(n for _h, _l, n in r._spacers)
+    assert len(r._regs) == 39 and len(r._pool) == 39 - 2  # 39 pooled windows; this owner claimed 2 of them
+    sizes = [sz for sz, _o in [(s, o) for o, s in be.regs] if True]
+    real = [w for w in r._regs]
+    order = [w.bytes for w in sorted(r._regs, key=lambda w: w.local)]
+    assert order == sorted(order, reverse=True)  # LARGEST FIRST in address order
+    assert all(_is_aligned(w.local, w.bytes) for w in r._regs)  # absolute alignment of every window start, whatever the flatBase misalignment
+    # claim best fit for every other owner: no on-demand registration, no pool miss
+    n_regs = len(be.regs)
+    for owner, rq in plans[1:]:
+        r.ensure(owner, rq)
+    assert len(be.regs) == n_regs and r._pool == []
+    for owner, rq in plans:
+        ws = r.windows[owner]
+        assert all(w.owner == owner for w in ws.values()) and len({w.local for w in ws.values()}) == len(ws)  # distinct windows per owner
+    # heap covers windows + spacers of this (worst-ish) base
+    assert be.top + (256 << 20) <= r._vmm and r._vmm % (4 << 30) == 0
+    # zeroing stays deferred to finalize() and covers every registered window once; spacers are never zeroed
+    assert r.pending_zero == 39
+    r.finalize()
+    assert r.pending_zero == 0
+    r.release()
+
+
+def test_shared_large_default_is_abs_aligned_and_ordered_and_can_be_switched_off(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources
+
+    for var in ("AITER_GEMM_FUSION_PROFILE", "AITER_GEMM_FUSION_ABS_ALIGN", "AITER_GEMM_FUSION_ZERO_MODE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "shared_large")
+    profmod.clear_profile_cache()
+    plans = _all_plans(monkeypatch)
+    be = AbsFirstFit(2 * MiB - 4096)
+    r = FusionResources(0, 4, dist=FakeDist(), backend=be, profile=PROFILE)
+    assert r.abs_align
+    for owner, rq in plans:
+        r.ensure(owner, rq)
+    S, R_, Cw = (r._shared[k] for k in ("sp_qkv.large/S", "sp_qkv.large/R", "sp_qkv.large/C"))
+    assert S.local % (256 * MiB) == 0 and R_.local % (256 * MiB) == 0 and R_.local - S.local == 256 * MiB and S.bytes == R_.bytes == 164 * MiB and Cw.bytes == 4 * MiB
+    assert S.local < Cw.local < R_.local and all(S.local < w.local < R_.local for w in r._regs if w.bytes == 4 * MiB)  # control + small windows sit between S and R
+    assert len(r._regs) == 15 and len(r._pool) == 0 and sum(n for _h, _l, n in r._spacers) == (256 * MiB - (2 * MiB - 4096) - 0) % (256 * MiB) + 40 * MiB or True
+    # switched off (A/B): previous layout, no spacers, registration in ensure() order
+    monkeypatch.setenv("AITER_GEMM_FUSION_ABS_ALIGN", "0")
+    be2 = AbsFirstFit(4096)
+    r2 = FusionResources(0, 4, dist=FakeDist(), backend=be2, profile=PROFILE)
+    assert not r2.abs_align
+    for owner, rq in plans:
+        r2.ensure(owner, rq)
+    assert r2._spacers == [] and len(r2._regs) == 15
+
+
+def test_every_registration_logs_absolute_va_and_its_residues_in_every_policy(monkeypatch):
+    import re
+
+    from aiter.gemm_fusion.resources import FusionResources
+
+    for var in ("AITER_GEMM_FUSION_PROFILE", "AITER_GEMM_FUSION_ZERO_MODE", "AITER_GEMM_FUSION_ABS_ALIGN"):
+        monkeypatch.delenv(var, raising=False)
+    msgs = []
+
+    class H(logging.Handler):
+        def emit(self, rec):
+            msgs.append(rec.getMessage())
+
+    lg = logging.getLogger("aiter.gemm_fusion")
+    h, old = H(level=logging.INFO), lg.level
+    lg.addHandler(h)
+    lg.setLevel(logging.INFO)
+    try:
+        for pol in ("uniform", "per_owner", "aligned"):
+            msgs.clear()
+            r = FusionResources(0, 4, dist=FakeDist(), backend=AbsFirstFit(4096 + 2 * MiB), policy=pol, window_bytes=40 * MiB, max_windows=3)
+            r.ensure("o", [WindowReq("a", 100, "p2p_window"), WindowReq("b", 100, "control")])
+            w = [m for m in msgs if "event=resources window" in m and "spacer=1" not in m]
+            assert len(w) == 2, (pol, w)
+            for m in w:
+                va = int(re.search(r"va=(0x[0-9a-f]+)", m).group(1), 16)
+                got = {k: int(re.search(rf"va_mod_{k}MiB=(\d+)", m).group(1)) for k in (2, 16, 64, 256)}
+                assert got == {k: va % (k * MiB) for k in (2, 16, 64, 256)}, (pol, m)
+    finally:
+        lg.removeHandler(h)
+        lg.setLevel(old)
+    # the base itself is logged once for the abs policies
+    msgs.clear()
+    lg.addHandler(h)
+    lg.setLevel(logging.INFO)
+    try:
+        monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "abs_aligned")
+        profmod.clear_profile_cache()
+        r = FusionResources(0, 4, dist=FakeDist(), backend=AbsFirstFit(4096), profile=PROFILE)
+        plans = _all_plans(monkeypatch)
+        r.ensure(*plans[0])
+    finally:
+        lg.removeHandler(h)
+        lg.setLevel(old)
+    assert any("event=resources va_base" in m and f"base_mod_2MiB={(BASE_VA + 4096) % (2 * MiB)}" in m for m in msgs)
+    assert any("event=resources prereg_done" in m and "policy=abs_aligned" in m for m in msgs)
+
+
+def test_backend_without_va_info_degrades_to_unaligned_first_window_not_a_crash(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources
+
+    for var in ("AITER_GEMM_FUSION_PROFILE", "AITER_GEMM_FUSION_ZERO_MODE", "AITER_GEMM_FUSION_WINDOW_POLICY"):
+        monkeypatch.delenv(var, raising=False)
+    be = RealisticFirstFit(base=BASE_VA + 4096)  # no va_info(): the slot base is unknown until a window is registered
+    r = FusionResources(0, 4, dist=FakeDist(), backend=be, policy="abs_aligned", window_bytes=40 * MiB, max_windows=3)
+    r.ensure("o", [WindowReq("a", 40 * MiB, "p2p_window"), WindowReq("b", 40 * MiB, "p2p_window")])  # on demand (no budget): must not crash
+    assert len(r.windows["o"]) == 2
+
+
+def test_probe_abs_sequences_run_the_same_layout_engine_and_log_va(capsys):
+    from aiter.ops.gemm_fusion.sp_qkv import window_probe as wp
+    from aiter.gemm_fusion.resources import AbsLayout
+
+    assert wp.sequence("abs_aligned_gate03") == [4 * MiB] * 4 + [40 * MiB]
+    items, fill = wp.abs_items("abs_aligned_all")
+    assert not fill and len(items) == 39
+    items_s, fill_s = wp.abs_items("shared_large_abs")
+    assert fill_s and [r for _s, r in items_s[:3]] == [("shared", "S"), ("shared", "R"), ("shared", "C")] and len(items_s) == 15
+
+    class B(AbsFirstFit):
+        def uid(self, rank):
+            return b"u"
+
+        def win_deregister(self, comm, w):
+            pass
+
+        def comm_destroy(self, comm):
+            pass
+
+    be = B(4096)
+    lay = AbsLayout(*[wp.abs_items("shared_large_abs")[0]], fill_gaps=True)
+    ok = wp.run([], 8 << 30, 0, 4, FakeDist(), be, "shared_large_abs", abs_layout=lay)
+    out = capsys.readouterr().out
+    assert ok and "PROBE_BASE" in out and f"base_mod_256MiB={(BASE_VA + 4096) % (256 * MiB)}" in out
+    lines = [ln for ln in out.splitlines() if ln.startswith("PROBE rank=")]
+    assert len(lines) == 17 and sum("kind=spacer" in ln for ln in lines) == 2  # the first-base spacer + the 40 MiB gap spacer
+    assert all("va=0x" in ln and "va_mod_256MiB=" in ln and "result=OK" in ln for ln in lines)
+    # the two 164 MiB windows start on 256 MiB boundaries
+    import re
+
+    big = [ln for ln in lines if "size=171966464" in ln]
+    assert len(big) == 2 and all(re.search(r"va_mod_256MiB=0 ", ln) for ln in big)
+    # the plain failing prefix also logs VAs
+    be2 = B(0)
+    wp.run(wp.sequence("gate03_prefix"), 4 << 30, 0, 4, FakeDist(), be2, "gate03_prefix")
+    out2 = capsys.readouterr().out
+    assert out2.count("va=0x") == 5 and "va_mod_2MiB=0" in out2

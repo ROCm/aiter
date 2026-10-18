@@ -46,7 +46,10 @@ HEAP_SLACK_BYTES = 256 << 20  # ccoDevCommCreate allocates its own resource wind
 ENV_POLICY = "AITER_GEMM_FUSION_WINDOW_POLICY"  # "uniform" (default) | "per_owner"
 ENV_WINDOW_MIB = "AITER_GEMM_FUSION_WINDOW_MIB"  # override the uniform window size (MiB)
 ENV_ALIGN_CAP_MIB = "AITER_GEMM_FUSION_ALIGN_CAP_MIB"  # aligned policy: cap of the start alignment (default 256 MiB)
-POLICIES = ("uniform", "per_owner", "aligned", "shared_large")
+POLICIES = ("uniform", "per_owner", "aligned", "shared_large", "abs_aligned")
+ENV_ABS_ALIGN = "AITER_GEMM_FUSION_ABS_ALIGN"  # shared_large only: =0 disables the absolute-VA alignment / ordered pre-registration (A/B); default on
+ENV_SPACER_GRAN_MIB = "AITER_GEMM_FUSION_SPACER_GRAN_MIB"  # round spacer sizes up to this many MiB (default: the CCO granule G, 4 KiB)
+ABS_MIN_ALIGN = 2 << 20  # A(s) floor: 2 MiB
 ENV_REG_BARRIER = "AITER_GEMM_FUSION_REG_BARRIER"  # =1: collective barrier after EVERY window registration (E2 seam; default off)
 ENV_REG_SYNC = "AITER_GEMM_FUSION_REG_SYNC"  # =1: device sync BEFORE every registration (optional companion of REG_BARRIER)
 ENV_LATE_REG = "AITER_GEMM_FUSION_LATE_REG"  # =1: allow ensure() after finalize() (G-late seam; default off)
@@ -132,6 +135,15 @@ def _flag(arg, env_name: str) -> bool:
     return os.environ.get(env_name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _flag_default(arg, env_name: str, default: bool) -> bool:
+    if arg is not None:
+        return bool(arg)
+    v = os.environ.get(env_name)
+    if v is None or v.strip() == "":
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
 def policy_memory_table(budget: dict, align_cap: int = 256 << 20) -> Dict[str, int]:
     """Predicted REGISTERED window bytes per rank for every policy, from a profile window_budget (log/accounting; excludes devcomm + slack).
     uniform: every window the max size; per_owner: each owner's own size; aligned: per_owner + worst-case spacer padding;
@@ -147,7 +159,110 @@ def policy_memory_table(budget: dict, align_cap: int = 256 << 20) -> Dict[str, i
     small = [int(x) for x in (budget.get("small_window_sizes") or [])]
     if sh and small:
         out["shared_large"] = sum(small) + sum(int(v) for v in sh.values())
+    for pol, key, fill in (("abs_aligned", "abs_aligned_ub", False), ("shared_large", "shared_large_abs_ub", True)):
+        items = abs_items_from_budget(budget, pol)
+        if items:
+            out[key] = abs_layout_total_bytes(items, fill_gaps=fill, cap=align_cap)  # windows + spacers, worst over the sampled base misalignments
     return out
+
+
+def abs_align_of(size: int, cap: int = 256 << 20, amin: int = ABS_MIN_ALIGN) -> int:
+    """A(s) = max(2 MiB, min(next_pow2(s), 256 MiB)): the ABSOLUTE start-VA alignment the abs_aligned / shared_large policies give a window of `size`."""
+    return max(int(amin), min(next_pow2(size), int(cap)))
+
+
+class AbsLayout:
+    """Decides, one registration at a time, what to register next so that every window starts at an ABSOLUTE VA aligned to A(size) (D14 r1c, H-BASE).
+    Windows are placed LARGEST FIRST. Before a window of size s a spacer of (-va_top) mod A(s) bytes (rounded up to `gran`) is registered, computed from the
+    measured absolute VA where the next slot will start. With fill_gaps=True (shared_large) pending windows that fit entirely inside that gap and are themselves
+    aligned there are registered first instead of wasting it: S(164) -> 52 MiB of small windows + control -> 40 MiB spacer -> R at +256 MiB (the Architect's sequence).
+    Pure: the policy drives it with the real VA, tests/probes with a simulated monotonic allocator. `items` are (size, role) pairs (role is opaque)."""
+
+    def __init__(self, items, cap: int = 256 << 20, amin: int = ABS_MIN_ALIGN, gran: int = 4096, fill_gaps: bool = False, spacer_gran: int = 0):
+        self.pending = sorted(((int(s), r) for s, r in items), key=lambda x: -x[0])  # stable: equal sizes keep the given role order (S before R)
+        self.cap, self.amin, self.gran, self.fill_gaps = int(cap), int(amin), max(1, int(gran)), fill_gaps
+        self.spacer_gran = max(self.gran, int(spacer_gran or 0))
+        self._spaced_for = None
+
+    def align_of(self, s: int) -> int:
+        return abs_align_of(s, self.cap, self.amin)
+
+    def done(self) -> bool:
+        return not self.pending
+
+    def next(self, va_top: int):
+        """-> None | ("window", size, role) | ("spacer", pad)."""
+        if not self.pending:
+            return None
+        s, role = self.pending[0]
+        a = self.align_of(s)
+        pad = (-int(va_top)) % a
+        if pad:
+            pad = -(-pad // self.spacer_gran) * self.spacer_gran
+        # alignment unreachable after we already spaced for this window (granularity larger than the residue): place it, never loop
+        if pad == 0 or self._spaced_for == id(self.pending[0]):
+            self._spaced_for = None
+            self.pending.pop(0)
+            return ("window", s, role)
+        if self.fill_gaps:
+            for i in range(1, len(self.pending)):
+                w, wr = self.pending[i]
+                if w <= pad and int(va_top) % self.align_of(w) == 0:
+                    self.pending.pop(i)
+                    return ("window", w, wr)
+        self._spaced_for = id(self.pending[0])
+        return ("spacer", pad)
+
+
+def abs_layout_simulate(items, base_va: int, fill_gaps: bool = False, cap: int = 256 << 20, gran: int = 4096, spacer_gran: int = 0):
+    """Run AbsLayout against a monotonic first-fit allocator starting at absolute `base_va`. Returns [(kind, size, va, role)] (kind window|spacer)."""
+    lay, va, out = AbsLayout(items, cap=cap, gran=gran, fill_gaps=fill_gaps, spacer_gran=spacer_gran), int(base_va), []
+    while True:
+        act = lay.next(va)
+        if act is None:
+            return out
+        if act[0] == "spacer":
+            out.append(("spacer", act[1], va, None))
+            va += act[1]
+        else:
+            out.append(("window", act[1], va, act[2]))
+            va += -(-act[1] // gran) * gran
+
+
+# base VAs (mod 256 MiB) that bracket the process-dependent flatBase misalignment: aligned, 4 KiB, 2 MiB +/- 4 KiB, 128 MiB + 4 KiB, 256 MiB - 4 KiB
+_SAMPLE_BASES = (0, 4096, (2 << 20) - 4096, (2 << 20) + 4096, (128 << 20) + 4096, (256 << 20) - 4096)
+
+
+def abs_layout_total_bytes(items, fill_gaps: bool = False, cap: int = 256 << 20, spacer_gran: int = 0) -> int:
+    """Upper bound (over the sample base misalignments) of windows + spacers registered by the abs layout: used for heap sizing / the memory table."""
+    base = 0x7F0000000000  # 4 GiB aligned: only its low 28 bits matter
+    best = 0
+    for m in _SAMPLE_BASES:
+        lay = abs_layout_simulate(items, base + m, fill_gaps=fill_gaps, cap=cap, spacer_gran=spacer_gran)
+        best = max(best, sum(sz for _k, sz, _v, _r in lay))
+    return best
+
+
+def abs_items_from_budget(budget: dict, policy: str):
+    """(size, role) items of the pre-registration for a policy, from a profile window_budget; None if the budget cannot describe it.
+    abs_aligned: every window of window_sizes (role None). shared_large: shared S, R (and C) tags first, then the small windows."""
+    if policy == "abs_aligned":
+        sizes = [int(x) for x in (budget.get("window_sizes") or [])]
+        return [(s, None) for s in sizes] or None
+    if policy == "shared_large":
+        sh = budget.get("shared") or {}
+        small = [int(x) for x in (budget.get("small_window_sizes") or [])]
+        if not sh or not small:
+            return None
+        def _rank(tag):  # S before R before C (the Architect's sequence); unknown tags last, by name
+            for i, suffix in enumerate(("/S", "/R", "/C")):
+                if tag.endswith(suffix):
+                    return (i, tag)
+            return (3, tag)
+
+        tags = sorted(sh.items(), key=lambda kv: (-int(kv[1]), _rank(kv[0])))  # big windows first (S then R), the 4 MiB control tag after them
+        return [(int(v), ("shared", t)) for t, v in tags] + [(s, None) for s in small]
+    return None
 
 
 def heap_bytes_for(window_bytes: int, max_windows: int, floor: int = PER_RANK_VMM_BYTES) -> int:
@@ -181,7 +296,7 @@ class CcoBackend:
         for n, a in [
             ("gf_uid_v1", [u32, vp]), ("gf_comm_create_v1", [u32, u32, i32, vp, u64, C.POINTER(vp)]),
             ("gf_win_register_v1", [vp, u64, C.POINTER(vp), C.POINTER(vp)]), ("gf_peer_ptr_v1", [vp, vp, i32, C.POINTER(vp)]),
-            ("gf_devcomm_create_v1", [vp, u32, C.POINTER(vp)]), ("gf_devcomm_info_v1", [vp, vp, C.POINTER(u64)]), ("gf_zero_v1", [i32, vp, u64, i32]), ("gf_mem_info_v1", [i32, C.POINTER(u64)]), ("gf_device_sync_v1", [i32]),
+            ("gf_devcomm_create_v1", [vp, u32, C.POINTER(vp)]), ("gf_devcomm_info_v1", [vp, vp, C.POINTER(u64)]), ("gf_zero_v1", [i32, vp, u64, i32]), ("gf_mem_info_v1", [i32, C.POINTER(u64)]), ("gf_comm_va_info_v1", [vp, C.POINTER(u64)]), ("gf_device_sync_v1", [i32]),
             ("gf_devcomm_destroy_v1", [vp, vp]), ("gf_win_deregister_v1", [vp, vp]), ("gf_comm_destroy_v1", [vp]),
         ]:
             f = getattr(lib, n)
@@ -236,6 +351,12 @@ class CcoBackend:
     def zero(self, device, local, nbytes):
         self._chk(self.lib.gf_zero_v1(device, local, nbytes, self._zero_method), "gf_zero")
 
+    def va_info(self, comm):
+        """(slot_base_va, per_rank_size, granule) of this rank's slot: where the first-fit allocator starts (absolute VA)."""
+        b = (C.c_uint64 * 3)()
+        self._chk(self.lib.gf_comm_va_info_v1(comm, b), "gf_comm_va_info")
+        return int(b[0]), int(b[1]), int(b[2])
+
     def mem_info(self, device):
         b = (C.c_uint64 * 2)()
         self._chk(self.lib.gf_mem_info_v1(device, b), "gf_mem_info")
@@ -272,6 +393,8 @@ class FusionResources:
         if self.policy not in POLICIES:
             raise ResourceError(f"{ENV_POLICY} must be one of {POLICIES}, got {self.policy!r}")
         self.align_cap = int(os.environ.get(ENV_ALIGN_CAP_MIB, "256")) << 20
+        self.abs_align = self.policy == "abs_aligned" or (self.policy == "shared_large" and _flag_default(None, ENV_ABS_ALIGN, True))
+        self.spacer_gran = int(os.environ.get(ENV_SPACER_GRAN_MIB, "0") or 0) << 20
         self._window_sizes: List[int] = []
         self._budget_doc: dict = {}
         self.zero_mode = (zero_mode or os.environ.get(ENV_ZERO_MODE) or "h2d_deferred").lower()
@@ -288,6 +411,11 @@ class FusionResources:
         if vmm_bytes is None:
             if self.policy == "uniform" and self.window_bytes:
                 vmm_bytes = heap_bytes_for(self.window_bytes, self.max_windows)
+            elif self.policy in ("abs_aligned", "shared_large") and self.abs_align and abs_items_from_budget(self._budget_doc, self.policy):
+                g = 4 << 30
+                need = abs_layout_total_bytes(abs_items_from_budget(self._budget_doc, self.policy), fill_gaps=self.policy == "shared_large",
+                                              cap=self.align_cap, spacer_gran=self.spacer_gran) + HEAP_SLACK_BYTES
+                vmm_bytes = max(PER_RANK_VMM_BYTES, (need + g - 1) // g * g)
             elif self.policy == "shared_large" and self._budget_doc.get("shared_large_total_bytes"):
                 g = 4 << 30
                 need = int(self._budget_doc["shared_large_total_bytes"]) + HEAP_SLACK_BYTES
@@ -306,6 +434,11 @@ class FusionResources:
         self._regs: List[Window] = []  # every registered window exactly ONCE (shared windows appear once): zeroing / deregistration / accounting
         self._shared: Dict[str, Window] = {}  # share tag -> the one registered window
         self._reg_seq = 0  # number of registering ensure() calls (agreement check)
+        self._va_top: Optional[int] = None  # ABSOLUTE local VA where the next slot will start (measured: previous local + aligned size)
+        self._gran = 4096  # CCO granule G (hipMemGetAllocationGranularity RECOMMENDED; reported 4096)
+        self._va_log: List[Tuple[str, str, int, int]] = []  # (owner, name, size, absolute local VA) of every registration, in order
+        self._pool: List[Window] = []  # abs policies: pre-registered per-owner windows not yet claimed by an ensure()
+        self._prereg_done = False
         self._unzeroed: List[Window] = []  # h2d_deferred: windows registered but not yet zeroed (zeroed in finalize(), after ALL registrations + the devcomm)
         self._mem_before_comm = None  # (free, total) before ccoCommCreate, for the HBM delta log (C-S6)
         self.comm = None
@@ -408,14 +541,22 @@ class FusionResources:
                 f"heap={self._vmm} B, policy={self.policy}; layout so far: {self._reg_log[-8:]}") from e
         if self._slot_base is None:
             self._slot_base = int(loc)
+        va = int(loc)
+        if self._va_top is not None and va != self._va_top:
+            log.warning("event=resources va_mismatch rank=%d owner=%s name=%s expected_va=%#x measured_va=%#x (allocator is not the monotonic first-fit the abs layout assumes)",
+                        self.rank, owner, name, self._va_top, va)
+        self._va_top = va + (-(-int(size) // self._gran) * self._gran)
+        self._va_log.append((owner, name, int(size), va))
         off = self._offset_of(loc)
         if off != expect:
             log.warning("event=resources offset_mismatch rank=%d owner=%s name=%s expected_offset=%d measured_offset=%s "
                         "(allocator is not the monotonic first-fit the aligned policy assumes)", self.rank, owner, name, expect, off)
         self._top = (off if off is not None else expect) + size
         self._reg_log.append((owner, name + ("[spacer]" if spacer else ""), size, cum))
-        log.info("event=resources window rank=%d owner=%s name=%s bytes=%d n=%d cumulative=%d offset=%s heap=%d%s",
-                 self.rank, owner, name, size, len(self._reg_log), cum, off, self._vmm, " spacer=1" if spacer else "")
+        MiB = 1 << 20
+        log.info("event=resources window rank=%d owner=%s name=%s bytes=%d n=%d cumulative=%d offset=%s heap=%d%s va=%#x va_mod_2MiB=%d va_mod_16MiB=%d "
+                 "va_mod_64MiB=%d va_mod_256MiB=%d", self.rank, owner, name, size, len(self._reg_log), cum, off, self._vmm, " spacer=1" if spacer else "", va,
+                 va % (2 * MiB), va % (16 * MiB), va % (64 * MiB), va % (256 * MiB))
         if self.reg_barrier or self.finalized:  # E2 seam: no rank starts allocating window k+1 while a peer may still be importing/mapping window k
             self._barrier()
         return h, loc
@@ -428,6 +569,98 @@ class FusionResources:
             pad = align - rem
             h, loc = self._register(owner, name + ".pad", pad, spacer=True)
             self._spacers.append((h, loc, pad))
+
+    # -- absolute VA alignment (policies abs_aligned, shared_large) -------------------------------------------------
+    def _init_va(self):
+        """Absolute VA where the first slot will start, from the comm (no registration needed). Backends without va_info: None (the first
+        window is then registered unaligned and the alignment starts from its measured VA)."""
+        if self._va_top is not None:
+            return
+        fn = getattr(self.backend, "va_info", None)
+        if fn is None:
+            return
+        try:
+            base, _per_rank, gran = fn(self.comm)
+        except Exception as e:  # noqa: BLE001
+            log.warning("event=resources va_info_failed rank=%d err=%s", self.rank, e)
+            return
+        self._va_top = int(base)
+        self._gran = int(gran) or 4096
+        log.info("event=resources va_base rank=%d slot_base=%#x granule=%d base_mod_2MiB=%d base_mod_256MiB=%d", self.rank, self._va_top, self._gran,
+                 self._va_top % (2 << 20), self._va_top % (256 << 20))
+
+    def _abs_pad(self, owner: str, name: str, size: int):
+        """On-demand absolute alignment (no pre-registration plan): one spacer so the window starts at a multiple of A(size)."""
+        if self._va_top is None:
+            return
+        lay = AbsLayout([(size, None)], cap=self.align_cap, gran=self._gran, spacer_gran=self.spacer_gran)
+        act = lay.next(self._va_top)
+        if act and act[0] == "spacer":
+            h, loc = self._register(owner, name + ".abspad", act[1], spacer=True)
+            self._spacers.append((h, loc, act[1]))
+
+    def _preregister(self, late: bool):
+        """Register the WHOLE budgeted window set once, LARGEST FIRST, each at an absolute VA aligned to A(size) (D14 r1b/r1c). Deterministic from the explicit
+        profile budget, so every rank issues the same sequence. abs_aligned: every window goes to a pool that ensure() claims best-fit. shared_large: the shared
+        S/R/C windows are registered at their place of the Architect's sequence (S, 52 MiB of small windows + control, spacer, R at +256 MiB), small windows pooled."""
+        if self._prereg_done:
+            return
+        self._prereg_done = True
+        items = abs_items_from_budget(self._budget_doc, self.policy) if self._budget_doc else None
+        if not items:
+            log.warning("event=resources abs_no_budget rank=%d policy=%s: the profile window_budget cannot describe the pre-registration; windows are registered "
+                        "on demand (each absolutely aligned, but NOT largest-first)", self.rank, self.policy)
+            return
+        self._init_va()
+        if late or self.reg_barrier:
+            self._agree_registration("<prereg>", [WindowReq(str(r), int(s), "p2p_window") for s, r in items])
+        lay = AbsLayout(items, cap=self.align_cap, gran=self._gran, fill_gaps=self.policy == "shared_large", spacer_gran=self.spacer_gran)
+        fresh: List[Window] = []
+        while True:
+            if self._va_top is None:  # no va_info: register the first (largest) window unaligned, align from its measured VA on
+                act = ("window",) + (lay.pending[0] if lay.pending else (0, None))
+                if lay.pending:
+                    lay.pending.pop(0)
+            else:
+                act = lay.next(self._va_top)
+            if act is None or (act[0] == "window" and not act[1]):
+                break
+            if act[0] == "spacer":
+                h, loc = self._register("<prereg>", "abspad", act[1], spacer=True)
+                self._spacers.append((h, loc, act[1]))
+                continue
+            _k, size, role = act
+            if role and role[0] == "shared":
+                tag = role[1]
+                h, loc = self._register(SHARED_KEY, tag, size)
+                kind = "control" if tag.endswith("/C") else "p2p_window"
+                w = Window(SHARED_KEY, tag, kind, size, h, loc, shared=True)
+                self._shared[tag] = w
+            else:
+                h, loc = self._register("<pool>", f"pool{size >> 20}M", size)
+                w = Window("<pool>", f"pool{size >> 20}M", "p2p_window", size, h, loc)
+                self._pool.append(w)
+            self._regs.append(w)
+            fresh.append(w)
+            if self.zero_mode != "h2d_deferred" or late:
+                self._zero_windows([w])  # interleaved A/B modes / late: right after the registration (deferred mode zeroes in finalize())
+                fresh.pop()
+        if self.zero_mode == "h2d_deferred" and not late:
+            self._unzeroed.extend(fresh)
+        log.info("event=resources prereg_done rank=%d policy=%s windows=%d spacers=%d spacer_bytes=%d", self.rank, self.policy, len(self._regs), len(self._spacers),
+                 sum(n for _h, _l, n in self._spacers))
+
+    def _claim_pooled(self, owner: str, r: WindowReq, size: int) -> Optional[Window]:
+        """Best-fit (smallest pooled window >= size). The window object is re-labelled to its owner; it is already in _regs and already queued for zeroing."""
+        best = None
+        for w in self._pool:
+            if w.bytes >= size and (best is None or w.bytes < best.bytes):
+                best = w
+        if best is None:
+            return None
+        self._pool.remove(best)
+        best.owner, best.name, best.kind = owner, r.name, r.kind
+        return best
 
     def ensure(self, owner: str, reqs: List[WindowReq]) -> Dict[str, Window]:
         """Register this owner's windows once (idempotent per owner; collective on first call)."""
@@ -447,6 +680,8 @@ class FusionResources:
         if wreqs and (late or self.reg_barrier):
             self._agree_registration(owner, wreqs)  # D14 rule 2: same (seq, owner, sizes) on every rank, else abort fusion
         self._reg_seq += 1
+        if wreqs and self.abs_align and self.policy in ("abs_aligned", "shared_large"):
+            self._preregister(late)
         need = round_up(max((r.bytes for r in wreqs), default=0)) if wreqs else 0
         if self.policy == "uniform" and wreqs:
             # Phase-1 layout: EVERY window of the shared comm has the same size (r8g: equal, 4 MiB multiple), so slot offsets are
@@ -466,6 +701,15 @@ class FusionResources:
                 continue
             if self.policy == "aligned":
                 self._pad_to_alignment(owner, r.name, start_alignment(size, self.align_cap))
+            if self.abs_align and self.policy in ("abs_aligned", "shared_large"):
+                pooled = self._claim_pooled(owner, r, size)
+                if pooled is not None:
+                    wins[r.name] = pooled  # pre-registered (largest first, absolutely aligned) in _preregister()
+                    continue
+                if self._prereg_done and self._budget_doc and abs_items_from_budget(self._budget_doc, self.policy):
+                    log.warning("event=resources pool_miss rank=%d owner=%s name=%s need=%d: no pre-registered window fits; registering on demand", self.rank, owner, r.name, size)
+                self._init_va()
+                self._abs_pad(owner, r.name, size)
             h, loc = self._register(owner, r.name, size)
             w = Window(owner, r.name, r.kind, size, h, loc)
             wins[r.name] = w
@@ -497,6 +741,9 @@ class FusionResources:
         size = round_up(int(budget)) if budget else need
         if need > size:
             raise ResourceError(f"ensure({owner!r}): shared window {r.share!r} need {need} B exceeds the budgeted {size} B (profile window_budget['shared'])")
+        if self.abs_align:
+            self._init_va()
+            self._abs_pad(SHARED_KEY, r.share, size)
         h, loc = self._register(SHARED_KEY, r.share, size)
         w = Window(SHARED_KEY, r.share, r.kind, size, h, loc, shared=True)
         self._shared[r.share] = w
