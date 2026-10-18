@@ -284,8 +284,6 @@ class MegaMoeTP:
                 chunks=None,
                 eps=self.engine.tn_eps,
                 gemma=self.engine.tn_gemma,
-                scale=1.0,
-                shared_w=0.0,
                 swiglu_limit=self.engine.swiglu_limit,  # (None -> the engine's default)
                 w1=a["w1"],
                 w1_scale=a["w1_scale"],
@@ -293,7 +291,6 @@ class MegaMoeTP:
                 w2_scale=a["w2_scale"],
                 group=a["group"],
                 device=a["device"],
-                io=True,
                 act=cfg.activation.name.lower(),
                 ygather=cfg.comm_mode == "ar",
                 # comm_dtype "bf16" (the accurate mode): bf16 route rows (MXFP8 otherwise)
