@@ -280,7 +280,7 @@ def main():
         all_ok &= check_prefill(2, 16384, 4096, tie)
         all_ok &= check_decode(2, 16384, 4096, 1, tie)
     all_ok &= check_prefill_many_tied_rows()
-    # packed rows: few rows at a long width take the chunked kernel, many
+    # packed rows: few rows at a long width take the single-launch kernel, many
     # rows the one-block kernel, a short width the one-workgroup kernel, as
     # their plane would
     for tie in ("none", "heavy"):
