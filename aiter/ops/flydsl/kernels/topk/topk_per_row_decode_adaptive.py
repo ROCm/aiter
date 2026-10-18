@@ -62,11 +62,14 @@ from flydsl.expr import (
     range_constexpr,
     rocdl,
 )
-from flydsl.expr.typing import ReductionOp, T
+from flydsl.expr.typing import ReductionOp
 from flydsl.extension.coop.warp import warp_inclusive_scan
 
-# buffer_ops comes from aiter's own shim; flydsl.expr's stable interface lacks it.
-from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    buf_base_i64,
+    buf_copy_load,
+    ptr_buf_tensor,
+)
 
 # A row's parts run on different CUs and meet only in the workspace, so its
 # atomics are agent-scoped; the LDS histogram is private to one workgroup.
@@ -108,16 +111,18 @@ CERTIFICATE_MAX_SPINS = 4194304
 # the only thing that needs it -- every other read of the histogram follows a
 # barrier, which has already made it visible.
 CACHE_BYPASS_L1_L2 = 17
-COUNTER_SLOTS = 7 * COUNTER_STRIDE
+COUNTER_GROUPS = 7
+COUNTER_SLOTS = COUNTER_GROUPS * COUNTER_STRIDE
+# Counter groups. Each is one slot, except the ordered emit's, which hold one per part.
 # Parts of the row that have finished with its control slots; the last clears them.
-COUNTER_EXIT = 0 * COUNTER_STRIDE
-COUNTER_ARRIVALS = 1 * COUNTER_STRIDE
-COUNTER_OUT_FRONT = 2 * COUNTER_STRIDE
-COUNTER_OUT_BACK = 3 * COUNTER_STRIDE
-COUNTER_PASS_DONE = 4 * COUNTER_STRIDE
+COUNTER_EXIT = 0
+COUNTER_ARRIVALS = 1
+COUNTER_OUT_FRONT = 2
+COUNTER_OUT_BACK = 3
+COUNTER_PASS_DONE = 4
 # Per-workgroup selected/tied counts for ordered emit (reserved for both modes).
-COUNTER_ORDERED_ABOVE = 5 * COUNTER_STRIDE
-COUNTER_ORDERED_EQUAL = 6 * COUNTER_STRIDE
+COUNTER_ORDERED_ABOVE = 5
+COUNTER_ORDERED_EQUAL = 6
 
 # Columns of `s_scan`: each wave's total, then its exclusive offset in the block.
 SCAN_TOTAL = 0
@@ -135,8 +140,10 @@ SMEM_META_EXIT = 4
 SMEM_META_TOTAL = 5
 
 # Compact candidate buffer, one region per row in `scratch`. Entry i is the pair
-# (column, twiddled key) at 2*i, so the later passes read a candidate without
-# touching the row.
+# (column, twiddled key), so the later passes read a candidate without touching
+# the row.
+COMPACT_COL = 0
+COMPACT_KEY = 1
 
 # Short-tier one-workgroup metadata reuses the same 8-int LDS block after zeroing.
 SMEM_META_SHORT_FIRST_ABOVE = 0
@@ -579,47 +586,63 @@ def create_topk_per_row_decode_adaptive_kernel(
             fx.make_layout(num_buckets if ordered else 1, 1)
         )
 
-        seq_lens_rsrc = buffer_ops.create_buffer_resource(seq_lens, max_size=True)
         indices_bytes = fx.Int64(gpu.grid_dim.y) * fx.Int64(top_k) * fx.Int64(4)
-        indices_rsrc = buffer_ops.create_buffer_resource(
-            indices, max_size=False, num_records_bytes=indices_bytes
-        )
-        workspace_rsrc = buffer_ops.create_buffer_resource(control, max_size=True)
-        scratch_rsrc = buffer_ops.create_buffer_resource(scratch, max_size=True)
-
+        indices_buf = ptr_buf_tensor(indices, fx.Int32, num_records_bytes=indices_bytes)
         hist_ptr = lds.s_hist.ptr
         meta_ptr = lds.s_meta.ptr
 
         # Decode row geometry.
         seq_row = row // next_n
         slot = row - seq_row * next_n
-        seq_len = fx.Int32(
-            buffer_ops.buffer_load(seq_lens_rsrc, seq_row, vec_width=1, dtype=T.i32)
-        )
+        seq_len = ptr_buf_tensor(seq_lens, fx.Int32)[seq_row]
         row_len = seq_len - next_n + slot + c_one
         row_len = (row_len > c_zero).select(row_len, c_zero)
         row_len = (row_len < width).select(row_len, width)
-        # One descriptor per row, based at the row and sized to its live length, so
-        # no stride0 can move the bound and the vec4 tail reads zeros past the row.
-        # The base is 64-bit, which keeps a tensor past 4 GiB addressable.
+        # One view per row, based at the row and sized to its live length, so no
+        # stride0 can move the bound and the vec4 tail reads zeros past the row.
+        # The base is 64-bit, which keeps a tensor past 4 GiB addressable, and the
+        # unit stride is one element because a packed row is only dword-aligned.
         if const_expr(packed_rows):
-            row_starts_rsrc = buffer_ops.create_buffer_resource(
-                row_starts, max_size=True
-            )
-            row_base = fx.Int64(
-                buffer_ops.buffer_load(row_starts_rsrc, row, vec_width=1, dtype=T.i32)
-            )
+            row_base = fx.Int64(ptr_buf_tensor(row_starts, fx.Int32)[row])
         else:
             row_base = fx.Int64(row) * fx.Int64(stride0)
-        logits_rsrc = buffer_ops.create_buffer_resource(
-            logits,
-            max_size=False,
+        row_vecs = ptr_buf_tensor(
+            buf_base_i64(logits) + row_base * fx.Int64(4),
+            fx.Float32,
+            unit_elems=LOAD_VEC,
+            unit_stride=1,
             num_records_bytes=fx.Int64(row_len) * fx.Int64(4),
-            base_byte_offset=row_base * fx.Int64(4),
         )
-        row_out = row * c_top_k
+        row_indices = fx.make_view(
+            fx.get_iter(indices_buf) + row * c_top_k, fx.make_layout(top_k, 1)
+        )
         row_ws_base = row * c_row_ws
         row_scratch_base = row * fx.Int32(scratch_row_slots)
+        row_control_ptr = fx.get_iter(control) + row_ws_base
+        row_control = fx.rocdl.make_buffer_tensor(
+            fx.make_view(row_control_ptr, fx.make_layout(CONTROL_ROW_SLOTS, 1))
+        )
+        counters = fx.make_view(
+            row_control_ptr,
+            fx.make_layout((COUNTER_GROUPS, COUNTER_STRIDE), (COUNTER_STRIDE, 1)),
+        )
+        counters_buf = fx.rocdl.make_buffer_tensor(counters)
+        histograms_layout = fx.make_layout((num_passes, num_buckets), (num_buckets, 1))
+        histograms = fx.make_view(
+            row_control_ptr + fx.Int32(COUNTER_SLOTS), histograms_layout
+        )
+        # Based at `control`, not the row: a second row-based descriptor spills SGPRs.
+        histograms_buf = fx.make_view(
+            fx.get_iter(fx.rocdl.make_buffer_tensor(control))
+            + (row_ws_base + fx.Int32(COUNTER_SLOTS)),
+            histograms_layout,
+        )
+        if const_expr(compact):
+            # Based at `scratch` for the same reason as `histograms_buf`.
+            candidates = fx.make_view(
+                fx.get_iter(fx.rocdl.make_buffer_tensor(scratch)) + row_scratch_base,
+                fx.make_layout((compact_cap, 2), (2, 1)),
+            )
 
         # Active cooperating workgroups per row over the fixed grid (excess blocks
         # return immediately). "auto" picks per row by length; "short" gives every
@@ -646,53 +669,38 @@ def create_topk_per_row_decode_adaptive_kernel(
             """Vec-block stride within one workgroup's ordered run."""
             return fx.Index(c_block_i32 * fx.Int32(mult))
 
-        def counter_slot(slot_const: int):
-            return row_ws_base + fx.Int32(slot_const)
+        def counter_ptr(group: int):
+            return fx.get_iter(fx.slice(counters, (group, None)))
 
-        def histogram_slot(pass_id: int, bin_i32):
-            return (
-                row_ws_base + fx.Int32(COUNTER_SLOTS + pass_id * num_buckets) + bin_i32
-            )
+        # Every index store sits under a dynamic `if` or loop, and a subscript store
+        # rebinds its view there; storing through a parameter keeps `row_indices` out.
+        def store_index(out, pos, col_i32):
+            out[pos] = col_i32
 
-        def compact_col_slot(entry_i32):
-            return row_scratch_base + entry_i32 * fx.Int32(2)
+        def histogram_ptr(pass_id: int, bin_i32):
+            offset = fx.crd2idx((fx.Int32(pass_id), bin_i32), histograms_layout)
+            return fx.get_iter(histograms) + fx.get_scalar(offset)
 
-        def compact_key_slot(entry_i32):
-            return row_scratch_base + fx.Int32(1) + entry_i32 * fx.Int32(2)
-
-        def ws_ptr(elem_i32):
-            return fx.get_iter(control) + fx.Int32(elem_i32)
-
-        def scratch_load(elem_i32):
-            return buffer_ops.buffer_load(
-                scratch_rsrc, elem_i32, vec_width=1, dtype=T.i32
-            )
-
-        def ws_load(elem_i32):
-            return buffer_ops.buffer_load(
-                workspace_rsrc, elem_i32, vec_width=1, dtype=T.i32
-            )
-
-        def ws_poll(elem_i32, ordering):
+        def ws_poll(ptr, ordering):
             # Volatile, so the spin re-reads the slot rather than a hoisted value;
             # a load rather than an RMW, so polling peers do not contend on it.
             return fx.generic_load(
-                ws_ptr(elem_i32),
+                ptr,
                 memory_order=ordering,
                 syncscope=_AGENT,
                 volatile=True,
             )
 
-        def spin_until_slot_ge(elem_i32, target):
+        def spin_until_ge(ptr, target):
             cur = c_zero
             while cur < target:
                 rocdl.s_sleep(SPIN_SLEEP)
-                cur = ws_poll(elem_i32, fx.AtomicOrdering.Monotonic)
+                cur = ws_poll(ptr, fx.AtomicOrdering.Monotonic)
             # The loop's monotonic observation only decides when to stop. This
             # acquire re-reads the same monotonically increasing token and pairs
             # with the last workgroup's release publish before any histogram
             # data is consumed.
-            ws_poll(elem_i32, fx.AtomicOrdering.Acquire)
+            ws_poll(ptr, fx.AtomicOrdering.Acquire)
 
         def row_barrier(token):
             # Waves 1-15 do not drain their flush atomics before gpu.barrier(); peers
@@ -706,7 +714,7 @@ def create_topk_per_row_decode_adaptive_kernel(
             gpu.barrier()
             if tid == c_zero:
                 prev = fx.atomic_add(
-                    ws_ptr(counter_slot(COUNTER_ARRIVALS)),
+                    counter_ptr(COUNTER_ARRIVALS),
                     c_one,
                     syncscope=_AGENT,
                     ordering=fx.AtomicOrdering.AcqRel,
@@ -714,13 +722,13 @@ def create_topk_per_row_decode_adaptive_kernel(
                 last = (prev + c_one) == target_arrivals
                 if last:
                     fx.atomic_xchg(
-                        ws_ptr(counter_slot(COUNTER_PASS_DONE)),
+                        counter_ptr(COUNTER_PASS_DONE),
                         token_value,
                         syncscope=_AGENT,
                         ordering=fx.AtomicOrdering.Release,
                     )
                 else:
-                    spin_until_slot_ge(counter_slot(COUNTER_PASS_DONE), token_value)
+                    spin_until_ge(counter_ptr(COUNTER_PASS_DONE), token_value)
             gpu.barrier()
 
         def radix_twiddle_key(val):
@@ -742,18 +750,11 @@ def create_topk_per_row_decode_adaptive_kernel(
             return key.shrui(fx.Int32(previous_start_bit)) << previous_start_bit
 
         def load_row_vec(col_base_i32):
-            return fx.Vector(
-                buffer_ops.buffer_load(
-                    logits_rsrc,
-                    col_base_i32,
-                    vec_width=LOAD_VEC,
-                    dtype=T.f32,
-                )
-            )
+            return buf_copy_load(row_vecs, col_base_i32, fx.Float32, LOAD_VEC)
 
-        def clear_local_histogram():
+        def clear_local_histogram(hist):
             for hist_idx in range(tid_idx, c_bins_idx, c_block_idx):
-                fx.memref_store(c_zero, s_hist, fx.Int32(hist_idx))
+                hist[fx.Int32(hist_idx)] = c_zero
             gpu.barrier()
 
         def wave_inclusive_scan_i32(value):
@@ -762,12 +763,12 @@ def create_topk_per_row_decode_adaptive_kernel(
         # Not fx.coop.BlockScan: it folds the wave totals linearly in every thread,
         # where here wave 0 scans them once.
         def block_exclusive_scan_i32(
-            value, *, leading_barrier=False, with_total=False, wave0_last=None
+            scan, value, *, leading_barrier=False, with_total=False, wave0_last=None
         ):
             """Exclusive prefix over tid of one i32 per thread, and the block total.
 
-            `wave0_last(block_total)` runs on one lane of wave 0 before the closing
-            barrier. A scan following a `with_total` one with no barrier between
+            `wave0_last = (fn, view)` runs `fn(view, block_total)` on one lane of wave 0
+            before the closing barrier. A scan following a `with_total` one with no barrier between
             needs `leading_barrier`, since that read of TOTAL may still be in flight.
             """
             if const_expr(leading_barrier):
@@ -775,28 +776,28 @@ def create_topk_per_row_decode_adaptive_kernel(
             wave_incl = wave_inclusive_scan_i32(value)
             wave_excl_thread = wave_incl - value
             if lane == c_last_lane:
-                fx.memref_store(wave_incl, s_scan, (wave, SCAN_TOTAL))
+                scan[wave, SCAN_TOTAL] = wave_incl
             gpu.barrier()
             if wave == c_zero:
                 in_slots = lane < c_red_slots
                 lane_safe = in_slots.select(lane, c_zero)
-                wtot = in_slots.select(s_scan[lane_safe, SCAN_TOTAL], c_zero)
+                wtot = in_slots.select(scan[lane_safe, SCAN_TOTAL], c_zero)
                 wincl = wave_inclusive_scan_i32(wtot)
                 if in_slots:
-                    fx.memref_store(wincl - wtot, s_scan, (lane, SCAN_OFFSET))
+                    scan[lane, SCAN_OFFSET] = wincl - wtot
                 if const_expr(wave0_last is not None) and lane == c_last_wave:
-                    wave0_last(wincl)
+                    wave0_last[0](wave0_last[1], wincl)
             gpu.barrier()
-            wave_off = s_scan[wave, SCAN_OFFSET]
+            wave_off = scan[wave, SCAN_OFFSET]
             total = (
-                s_scan[c_last_wave, SCAN_OFFSET] + s_scan[c_last_wave, SCAN_TOTAL]
+                scan[c_last_wave, SCAN_OFFSET] + scan[c_last_wave, SCAN_TOTAL]
                 if with_total
                 else None
             )
             exclusive = wave_off + wave_excl_thread
             return (exclusive, total) if with_total else exclusive
 
-        def choose_bucket_prefix(target_k):
+        def choose_bucket_prefix(hist, meta, target_k):
             # Multi-block ascending block scan over the LDS histogram; each thread owns a bin pair.
             first_bin = tid * fx.Int32(2)
             bin0_valid = first_bin < c_bins_i32
@@ -804,36 +805,35 @@ def create_topk_per_row_decode_adaptive_kernel(
             bin1_valid = bin1 < c_bins_i32
             safe0 = bin0_valid.select(first_bin, c_zero)
             safe1 = bin1_valid.select(bin1, c_zero)
-            c0 = bin0_valid.select(s_hist[safe0], c_zero)
-            c1 = bin1_valid.select(s_hist[safe1], c_zero)
+            c0 = bin0_valid.select(hist[safe0], c_zero)
+            c1 = bin1_valid.select(hist[safe1], c_zero)
 
             # The scan already carries the histogram's grand total, so the
             # certificate's test costs a store here and a compare there, not a
             # second pass over the bins.
-            def store_certificate_total(total):
-                fx.memref_store(total, s_meta, fx.Int32(SMEM_META_TOTAL))
+            def store_certificate_total(meta, total):
+                meta[fx.Int32(SMEM_META_TOTAL)] = total
 
             excl0 = block_exclusive_scan_i32(
+                s_scan,
                 c0 + c1,
-                wave0_last=(store_certificate_total if histogram_certificate else None),
+                wave0_last=(
+                    (store_certificate_total, meta) if histogram_certificate else None
+                ),
             )
             incl0 = excl0 + c0
             incl1 = incl0 + c1
 
-            def emit_find(bucket, excl, incl, count):
+            def emit_find(meta, bucket, excl, incl, count):
                 crosses = (excl < target_k) & (incl >= target_k)
                 if crosses:
-                    fx.memref_store(
-                        target_k - excl,
-                        s_meta,
-                        fx.Int32(SMEM_META_K),
-                    )
-                    fx.memref_store(count, s_meta, fx.Int32(SMEM_META_LEN))
-                    fx.memref_store(bucket, s_meta, fx.Int32(SMEM_META_THRESHOLD))
-                    fx.memref_store(excl, s_meta, fx.Int32(SMEM_META_ABOVE))
+                    meta[fx.Int32(SMEM_META_K)] = target_k - excl
+                    meta[fx.Int32(SMEM_META_LEN)] = count
+                    meta[fx.Int32(SMEM_META_THRESHOLD)] = bucket
+                    meta[fx.Int32(SMEM_META_ABOVE)] = excl
 
-            emit_find(first_bin, excl0, incl0, c0)
-            emit_find(bin1, incl0, incl1, c1)
+            emit_find(meta, first_bin, excl0, incl0, c0)
+            emit_find(meta, bin1, incl0, incl1, c1)
             gpu.barrier()
 
         def certified_merge(pass_id: int, target_k, expected_total):
@@ -847,15 +847,15 @@ def create_topk_per_row_decode_adaptive_kernel(
             answer that nothing catches, because no caller inspects the result.
             Reaching the cap means a bug elsewhere.
             """
-            load_global_histogram(pass_id, coherent=True)
-            choose_bucket_prefix(target_k)
+            load_global_histogram(s_hist, pass_id, coherent=True)
+            choose_bucket_prefix(s_hist, s_meta, target_k)
             spins = c_zero
             while (s_meta[fx.Int32(SMEM_META_TOTAL)] != expected_total) & (
                 spins < fx.Int32(CERTIFICATE_MAX_SPINS)
             ):
                 rocdl.s_sleep(SPIN_SLEEP)
-                load_global_histogram(pass_id, coherent=True)
-                choose_bucket_prefix(target_k)
+                load_global_histogram(s_hist, pass_id, coherent=True)
+                choose_bucket_prefix(s_hist, s_meta, target_k)
                 spins = spins + c_one
 
         def flush_local_histogram(pass_id: int):
@@ -864,7 +864,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                 count = s_hist[hist_i32]
                 if count != c_zero:
                     fx.atomic_add(
-                        ws_ptr(histogram_slot(pass_id, hist_i32)),
+                        histogram_ptr(pass_id, hist_i32),
                         count,
                         syncscope=_AGENT,
                     )
@@ -875,26 +875,29 @@ def create_topk_per_row_decode_adaptive_kernel(
             # stored over them and adds those to the histogram instead of its own.
             gpu.barrier()
 
-        def load_global_histogram(pass_id: int, coherent: bool = False):
+        def load_global_histogram(hist, pass_id: int, coherent: bool = False):
             # Vectorized reload. `coherent` bypasses the caches, which the
             # certificate's re-read needs and nothing else does: a barrier has
             # already made the histogram visible everywhere it is read after one.
             n_vec = num_buckets // LOAD_VEC
             c_nvec_idx = fx.Index(n_vec)
+            load_atom = fx.make_copy_atom(
+                fx.rocdl.BufferCopy(
+                    LOAD_VEC * 32, CACHE_BYPASS_L1_L2 if coherent else 0
+                ),
+                fx.Int32,
+            )
+            pass_vecs = fx.logical_divide(
+                fx.slice(histograms_buf, (pass_id, None)),
+                fx.make_layout(LOAD_VEC, 1),
+            )
             for grp in range(tid_idx, c_nvec_idx, c_block_idx):
                 base_bin = fx.Int32(grp) * c_vec
-                vec = fx.Vector(
-                    buffer_ops.buffer_load(
-                        workspace_rsrc,
-                        histogram_slot(pass_id, base_bin),
-                        vec_width=LOAD_VEC,
-                        dtype=T.i32,
-                        cache_modifier=CACHE_BYPASS_L1_L2 if coherent else 0,
-                    )
-                )
+                frag = fx.make_rmem_tensor(LOAD_VEC, fx.Int32)
+                fx.copy(load_atom, fx.slice(pass_vecs, (None, grp)), frag)
+                vec = frag.load()
                 for j in range_constexpr(LOAD_VEC):
-                    total = vec[j]
-                    fx.memref_store(total, s_hist, base_bin + fx.Int32(j))
+                    hist[base_bin + fx.Int32(j)] = vec[j]
             gpu.barrier()
 
         def over_chunk(col_base, body):
@@ -983,20 +986,24 @@ def create_topk_per_row_decode_adaptive_kernel(
 
             carried = s_run[fx.Int32(SMEM_RUN_COMPACT_COUNT)]
 
-            def publish_next_carry(tile_total):
+            def publish_next_carry(run, tile_total):
                 total = carried + tile_total
-                fx.memref_store(total, s_run, fx.Int32(SMEM_RUN_COMPACT_COUNT))
+                run[fx.Int32(SMEM_RUN_COMPACT_COUNT)] = total
                 if total > part_slice_cap:
-                    fx.memref_store(c_one, s_run, fx.Int32(SMEM_RUN_COMPACT_SPILLED))
+                    run[fx.Int32(SMEM_RUN_COMPACT_SPILLED)] = c_one
 
-            my_excl = block_exclusive_scan_i32(n_keep, wave0_last=publish_next_carry)
+            my_excl = block_exclusive_scan_i32(
+                s_scan, n_keep, wave0_last=(publish_next_carry, s_run)
+            )
+
+            def store_candidate(cands, entry, col_i32, key):
+                cands[entry, COMPACT_COL] = col_i32
+                cands[entry, COMPACT_KEY] = key
+
             slot = part_slice_base + carried + my_excl
             for col_i32, key, keep in keeps:
                 if (keep == c_one) & (slot < part_slice_end):
-                    buffer_ops.buffer_store(
-                        col_i32, scratch_rsrc, compact_col_slot(slot)
-                    )
-                    buffer_ops.buffer_store(key, scratch_rsrc, compact_key_slot(slot))
+                    store_candidate(candidates, slot, col_i32, key)
                 slot = slot + keep
 
         def scan_vec_block(
@@ -1033,13 +1040,13 @@ def create_topk_per_row_decode_adaptive_kernel(
         # 1024 or 2048 against 1024 threads, so this divides exactly.
         bins_per_thread = num_buckets // block_threads
 
-        def save_own_histogram():
+        def save_own_histogram(own):
             """Copy this workgroup's histogram before the row-wide merge."""
             for i in range_constexpr(bins_per_thread):
                 bin_i32 = tid + fx.Int32(i * block_threads)
-                fx.memref_store(s_hist[bin_i32], s_own_hist, bin_i32)
+                own[bin_i32] = s_hist[bin_i32]
 
-        def accumulate_run_counts(pass_id: int, chosen_bucket):
+        def accumulate_run_counts(run, pass_id: int, chosen_bucket):
             """Fold s_own_hist lower bins into this run's selected/tied totals."""
             if ~single_part_active:
                 mine = c_zero
@@ -1048,26 +1055,22 @@ def create_topk_per_row_decode_adaptive_kernel(
                     count = s_own_hist[bin_i32]
                     mine = mine + (bin_i32 < chosen_bucket).select(count, c_zero)
                 _, run_total = block_exclusive_scan_i32(
-                    mine, leading_barrier=True, with_total=True
+                    s_scan, mine, leading_barrier=True, with_total=True
                 )
                 if tid == c_zero:
                     carried = (
                         c_zero
                         if const_expr(pass_id == 0)
-                        else s_run[fx.Int32(SMEM_RUN_SELECTED)]
+                        else run[fx.Int32(SMEM_RUN_SELECTED)]
                     )
-                    fx.memref_store(
-                        carried + run_total, s_run, fx.Int32(SMEM_RUN_SELECTED)
-                    )
+                    run[fx.Int32(SMEM_RUN_SELECTED)] = carried + run_total
                     # The early stop emits after the pass before the last, taking
                     # that pass's whole bucket as the ties.
                     if const_expr(
                         pass_id == num_passes - 1
                         or (ordered_early_stop and pass_id == num_passes - 2)
                     ):
-                        fx.memref_store(
-                            s_own_hist[chosen_bucket], s_run, fx.Int32(SMEM_RUN_TIED)
-                        )
+                        run[fx.Int32(SMEM_RUN_TIED)] = s_own_hist[chosen_bucket]
                 gpu.barrier()
 
         def ordered_classify(col_base, vec, col_hi, kth_bits, key_mask=None):
@@ -1143,7 +1146,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                 return bases, [load_row_vec(b) for b in bases]
 
             base_selected, base_tied = ordered_emit_bases(
-                run_selected, run_tied, barrier_token
+                s_run, run_selected, run_tied, barrier_token
             )
 
             # Phase 2: place.
@@ -1151,7 +1154,9 @@ def create_topk_per_row_decode_adaptive_kernel(
                 cols, n_selected, n_tied = ordered_classify(
                     col_base, vec, col_hi, kth_bits, key_mask
                 )
-                ordered_place(cols, n_selected, n_tied, base_selected, base_tied, need)
+                ordered_place(
+                    s_run, cols, n_selected, n_tied, base_selected, base_tied, need
+                )
 
             if const_expr(not compact):
                 for step_b, place_state in range(
@@ -1191,70 +1196,69 @@ def create_topk_per_row_decode_adaptive_kernel(
                         entry_base, count_hi, kth_bits
                     )
                     ordered_place(
-                        cols, n_selected, n_tied, base_selected, base_tied, need
+                        s_run, cols, n_selected, n_tied, base_selected, base_tied, need
                     )
                     yield [buf_state[0]]
 
-        def ordered_emit_bases(run_selected, run_tied, barrier_token):
+        # A subscript store rebinds its view, so one nested in `if exchange` would
+        # make `run` a result of that scf.if; storing through a helper keeps it out.
+        def publish_part_counts(ctrs, selected, tied):
+            ctrs[COUNTER_ORDERED_ABOVE, part] = selected
+            ctrs[COUNTER_ORDERED_EQUAL, part] = tied
+
+        def store_part_bases(run, selected_base, tied_base):
+            run[fx.Int32(SMEM_RUN_PART_SELECTED)] = selected_base
+            run[fx.Int32(SMEM_RUN_PART_TIED)] = tied_base
+
+        def ordered_emit_bases(run, run_selected, run_tied, barrier_token):
             """Exclusive scan of selected/tied counts over the parts before this one."""
             # Single-workgroup rows skip the cross-part exchange; bases stay zero.
             if tid == c_zero:
-                fx.memref_store(c_zero, s_run, fx.Int32(SMEM_RUN_TILE_SELECTED))
-                fx.memref_store(c_zero, s_run, fx.Int32(SMEM_RUN_TILE_TIED))
+                run[fx.Int32(SMEM_RUN_TILE_SELECTED)] = c_zero
+                run[fx.Int32(SMEM_RUN_TILE_TIED)] = c_zero
                 if single_part_active:
-                    fx.memref_store(c_zero, s_run, fx.Int32(SMEM_RUN_PART_SELECTED))
-                    fx.memref_store(c_zero, s_run, fx.Int32(SMEM_RUN_PART_TIED))
+                    run[fx.Int32(SMEM_RUN_PART_SELECTED)] = c_zero
+                    run[fx.Int32(SMEM_RUN_PART_TIED)] = c_zero
 
             exchange = ~single_part_active
 
             if exchange:
                 if tid == c_zero:
-                    buffer_ops.buffer_store(
-                        run_selected,
-                        workspace_rsrc,
-                        counter_slot(COUNTER_ORDERED_ABOVE) + part,
-                    )
-                    buffer_ops.buffer_store(
-                        run_tied,
-                        workspace_rsrc,
-                        counter_slot(COUNTER_ORDERED_EQUAL) + part,
-                    )
+                    publish_part_counts(counters_buf, run_selected, run_tied)
                 row_barrier(barrier_token)
                 if wave == c_zero:
                     in_runs = lane < active_parts
                     lane_safe = in_runs.select(lane, c_zero)
                     peer_selected = in_runs.select(
-                        ws_load(counter_slot(COUNTER_ORDERED_ABOVE) + lane_safe),
-                        c_zero,
+                        counters_buf[COUNTER_ORDERED_ABOVE, lane_safe], c_zero
                     )
                     peer_tied = in_runs.select(
-                        ws_load(counter_slot(COUNTER_ORDERED_EQUAL) + lane_safe),
-                        c_zero,
+                        counters_buf[COUNTER_ORDERED_EQUAL, lane_safe], c_zero
                     )
                     selected_incl = wave_inclusive_scan_i32(peer_selected)
                     tied_incl = wave_inclusive_scan_i32(peer_tied)
                     if lane == part:
-                        fx.memref_store(
-                            selected_incl - peer_selected,
-                            s_run,
-                            fx.Int32(SMEM_RUN_PART_SELECTED),
-                        )
-                        fx.memref_store(
-                            tied_incl - peer_tied, s_run, fx.Int32(SMEM_RUN_PART_TIED)
+                        store_part_bases(
+                            run, selected_incl - peer_selected, tied_incl - peer_tied
                         )
             gpu.barrier()
             return (
-                s_run[fx.Int32(SMEM_RUN_PART_SELECTED)],
-                s_run[fx.Int32(SMEM_RUN_PART_TIED)],
+                run[fx.Int32(SMEM_RUN_PART_SELECTED)],
+                run[fx.Int32(SMEM_RUN_PART_TIED)],
             )
 
-        def ordered_place(cols, n_selected, n_tied, base_selected, base_tied, need):
+        def ordered_place(
+            run, cols, n_selected, n_tied, base_selected, base_tied, need
+        ):
             """Place one classified tile at its column-ordered output positions."""
             packed_excl, packed_total = block_exclusive_scan_i32(
-                (n_selected << 16) + n_tied, leading_barrier=True, with_total=True
+                s_scan,
+                (n_selected << 16) + n_tied,
+                leading_barrier=True,
+                with_total=True,
             )
-            carried_selected = s_run[fx.Int32(SMEM_RUN_TILE_SELECTED)]
-            carried_tied = s_run[fx.Int32(SMEM_RUN_TILE_TIED)]
+            carried_selected = run[fx.Int32(SMEM_RUN_TILE_SELECTED)]
+            carried_tied = run[fx.Int32(SMEM_RUN_TILE_TIED)]
             gpu.barrier()
 
             my_selected = (
@@ -1266,24 +1270,20 @@ def create_topk_per_row_decode_adaptive_kernel(
                 out_pos = my_selected + accepted
                 keep = selected + tied * (my_tied < need).select(c_one, c_zero)
                 if (keep == c_one) & (out_pos < c_top_k):
-                    buffer_ops.buffer_store(col_i32, indices_rsrc, row_out + out_pos)
+                    store_index(row_indices, out_pos, col_i32)
                 my_selected = my_selected + selected
                 my_tied = my_tied + tied
 
             if tid == c_zero:
-                fx.memref_store(
-                    carried_selected + packed_total.shrui(fx.Int32(16)),
-                    s_run,
-                    fx.Int32(SMEM_RUN_TILE_SELECTED),
+                run[fx.Int32(SMEM_RUN_TILE_SELECTED)] = (
+                    carried_selected + packed_total.shrui(fx.Int32(16))
                 )
-                fx.memref_store(
-                    carried_tied + (packed_total & fx.Int32(0xFFFF)),
-                    s_run,
-                    fx.Int32(SMEM_RUN_TILE_TIED),
+                run[fx.Int32(SMEM_RUN_TILE_TIED)] = carried_tied + (
+                    packed_total & fx.Int32(0xFFFF)
                 )
             gpu.barrier()
 
-        def unordered_place(cols, n_selected, n_tied, need):
+        def unordered_place(run, cols, n_selected, n_tied, need):
             """Place one classified tile, reserving its output range in one atomic.
 
             The counters stay global and per-row, which is what lets parts emit
@@ -1296,43 +1296,34 @@ def create_topk_per_row_decode_adaptive_kernel(
             checked against that bound.
             """
             packed_excl, packed_total = block_exclusive_scan_i32(
-                (n_selected << 16) + n_tied, leading_barrier=True, with_total=True
+                s_scan,
+                (n_selected << 16) + n_tied,
+                leading_barrier=True,
+                with_total=True,
             )
             if tid == c_zero:
-                fx.memref_store(
-                    fx.atomic_add(
-                        ws_ptr(counter_slot(COUNTER_OUT_FRONT)),
-                        packed_total.shrui(fx.Int32(16)),
-                        syncscope=_AGENT,
-                    ),
-                    s_run,
-                    fx.Int32(SMEM_RUN_TILE_SELECTED),
+                run[fx.Int32(SMEM_RUN_TILE_SELECTED)] = fx.atomic_add(
+                    counter_ptr(COUNTER_OUT_FRONT),
+                    packed_total.shrui(fx.Int32(16)),
+                    syncscope=_AGENT,
                 )
-                fx.memref_store(
-                    fx.atomic_add(
-                        ws_ptr(counter_slot(COUNTER_OUT_BACK)),
-                        packed_total & fx.Int32(0xFFFF),
-                        syncscope=_AGENT,
-                    ),
-                    s_run,
-                    fx.Int32(SMEM_RUN_TILE_TIED),
+                run[fx.Int32(SMEM_RUN_TILE_TIED)] = fx.atomic_add(
+                    counter_ptr(COUNTER_OUT_BACK),
+                    packed_total & fx.Int32(0xFFFF),
+                    syncscope=_AGENT,
                 )
             gpu.barrier()
-            my_selected = s_run[fx.Int32(SMEM_RUN_TILE_SELECTED)] + packed_excl.shrui(
+            my_selected = run[fx.Int32(SMEM_RUN_TILE_SELECTED)] + packed_excl.shrui(
                 fx.Int32(16)
             )
-            my_tied = s_run[fx.Int32(SMEM_RUN_TILE_TIED)] + (
+            my_tied = run[fx.Int32(SMEM_RUN_TILE_TIED)] + (
                 packed_excl & fx.Int32(0xFFFF)
             )
             for col_i32, selected, tied in cols:
                 if (selected == c_one) & (my_selected < c_top_k):
-                    buffer_ops.buffer_store(
-                        col_i32, indices_rsrc, row_out + my_selected
-                    )
+                    store_index(row_indices, my_selected, col_i32)
                 if (tied == c_one) & (my_tied < need):
-                    buffer_ops.buffer_store(
-                        col_i32, indices_rsrc, row_out + c_top_k - c_one - my_tied
-                    )
+                    store_index(row_indices, c_top_k - c_one - my_tied, col_i32)
                 my_selected = my_selected + selected
                 my_tied = my_tied + tied
 
@@ -1373,7 +1364,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                     cols = cols + stage_cols
                     n_selected = n_selected + stage_selected
                     n_tied = n_tied + stage_tied
-                unordered_place(cols, n_selected, n_tied, need)
+                unordered_place(s_run, cols, n_selected, n_tied, need)
                 yield [place_state[0]]
 
         global_vec_tid = part * c_block_i32 + tid
@@ -1413,8 +1404,8 @@ def create_topk_per_row_decode_adaptive_kernel(
                 # Clamp rather than predicate the load: out-of-slice entries would
                 # otherwise read a neighbouring part's candidates.
                 safe = in_buf.select(entry, part_slice_base)
-                col_i32 = scratch_load(compact_col_slot(safe))
-                key = scratch_load(compact_key_slot(safe))
+                col_i32 = candidates[safe, COMPACT_COL]
+                key = candidates[safe, COMPACT_KEY]
                 selected = in_buf.select(
                     ((key ^ c_sign_bit) < biased_kth).select(c_one, c_zero), c_zero
                 )
@@ -1434,11 +1425,11 @@ def create_topk_per_row_decode_adaptive_kernel(
             per_tile = c_block_i32 * fx.Int32(COMPACT_FILL_VECS)
             return fx.Index((vblks_per_run + per_tile - c_one) // per_tile)
 
-        def compact_fill(start_bit: int, previous_start_bit: int, current_bits):
+        def compact_fill(run, start_bit: int, previous_start_bit: int, current_bits):
             """Scan the row once more, this time also writing the candidates out."""
             if tid == c_zero:
-                fx.memref_store(c_zero, s_run, fx.Int32(SMEM_RUN_COMPACT_COUNT))
-                fx.memref_store(c_zero, s_run, fx.Int32(SMEM_RUN_COMPACT_SPILLED))
+                run[fx.Int32(SMEM_RUN_COMPACT_COUNT)] = c_zero
+                run[fx.Int32(SMEM_RUN_COMPACT_SPILLED)] = c_zero
             gpu.barrier()
 
             steps_idx = compact_steps_idx()
@@ -1465,6 +1456,11 @@ def create_topk_per_row_decode_adaptive_kernel(
 
             gpu.barrier()
 
+        def mark_compact_spilled(run):
+            if tid == c_zero:
+                run[fx.Int32(SMEM_RUN_COMPACT_COUNT)] = c_zero
+                run[fx.Int32(SMEM_RUN_COMPACT_SPILLED)] = c_one
+
         def compact_rescan(
             pass_id: int, start_bit: int, previous_start_bit: int, current_bits
         ):
@@ -1482,7 +1478,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                 c_block_idx,
                 init=[c_zero],
             ):
-                key = scratch_load(compact_key_slot(fx.Int32(entry)))
+                key = candidates[fx.Int32(entry), COMPACT_KEY]
                 if prefix_for_key(key, previous_start_bit) == current_bits:
                     fx.atomic_add(
                         hist_ptr + bucket_for_key(key, start_bit),
@@ -1532,7 +1528,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                 cols, n_selected, n_tied = compact_ordered_classify(
                     entry_base, count_hi, kth_bits
                 )
-                unordered_place(cols, n_selected, n_tied, local_k)
+                unordered_place(s_run, cols, n_selected, n_tied, local_k)
                 yield [write_state[0]]
 
             c_block_log2 = fx.Int32(int.bit_length(block_threads) - 1)
@@ -1548,7 +1544,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                 cols, n_selected, n_tied = ordered_classify(
                     col_base, load_row_vec(col_base), run_col_hi, kth_bits
                 )
-                unordered_place(cols, n_selected, n_tied, local_k)
+                unordered_place(s_run, cols, n_selected, n_tied, local_k)
                 yield [fallback_state[0]]
 
         def early_classify(col_base, vec, col_hi, previous_start_bit: int, kth_bits):
@@ -1605,7 +1601,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                     )
                     cols = cols + stage_cols
                     n_selected = n_selected + stage_selected
-                unordered_place(cols, n_selected, c_zero, need)
+                unordered_place(s_run, cols, n_selected, c_zero, need)
                 yield [place_state[0]]
 
         def scan_pass(
@@ -1614,25 +1610,19 @@ def create_topk_per_row_decode_adaptive_kernel(
             start_bit = max(32 - (pass_id + 1) * BITS_PER_PASS, 0)
             previous_start_bit = max(32 - pass_id * BITS_PER_PASS, 0)
 
-            clear_local_histogram()
+            clear_local_histogram(s_hist)
             if const_expr(compact and pass_id == compact_fill_pass):
                 if const_expr(short_rows_read_row):
                     # A short row keeps no buffer, as the host decides for a launch
                     # whose rows are all short: it marks itself spilled, which sends
                     # the rescans and the emit back to the row.
                     if row_len <= fx.Int32(short_max):
-                        if tid == c_zero:
-                            fx.memref_store(
-                                c_zero, s_run, fx.Int32(SMEM_RUN_COMPACT_COUNT)
-                            )
-                            fx.memref_store(
-                                c_one, s_run, fx.Int32(SMEM_RUN_COMPACT_SPILLED)
-                            )
+                        mark_compact_spilled(s_run)
                         row_scan(pass_id, start_bit, previous_start_bit, current_bits)
                     else:
-                        compact_fill(start_bit, previous_start_bit, current_bits)
+                        compact_fill(s_run, start_bit, previous_start_bit, current_bits)
                 else:
-                    compact_fill(start_bit, previous_start_bit, current_bits)
+                    compact_fill(s_run, start_bit, previous_start_bit, current_bits)
             elif const_expr(compact and pass_id > compact_fill_pass):
                 compact_rescan(pass_id, start_bit, previous_start_bit, current_bits)
             else:
@@ -1693,10 +1683,10 @@ def create_topk_per_row_decode_adaptive_kernel(
             certified = certified_pass(pass_id)
 
             if merged_locally:
-                choose_bucket_prefix(current_k)
+                choose_bucket_prefix(s_hist, s_meta, current_k)
             if ~merged_locally:
                 if const_expr(ordered):
-                    save_own_histogram()
+                    save_own_histogram(s_own_hist)
                 flush_local_histogram(pass_id)
                 # A certified pass proves the merge finished instead of waiting to
                 # be told, so it takes neither the barrier nor the read-back after
@@ -1705,12 +1695,12 @@ def create_topk_per_row_decode_adaptive_kernel(
                     certified_merge(pass_id, current_k, current_len)
                 if const_expr(not certified):
                     row_barrier(barrier_token)
-                    load_global_histogram(pass_id)
-                    choose_bucket_prefix(current_k)
+                    load_global_histogram(s_hist, pass_id)
+                    choose_bucket_prefix(s_hist, s_meta, current_k)
 
             chosen_bucket = s_meta[fx.Int32(SMEM_META_THRESHOLD)]
             if const_expr(ordered):
-                accumulate_run_counts(pass_id, chosen_bucket)
+                accumulate_run_counts(s_run, pass_id, chosen_bucket)
             next_k = s_meta[fx.Int32(SMEM_META_K)]
             next_len = s_meta[fx.Int32(SMEM_META_LEN)]
             next_bits = current_bits | fx.Int32(chosen_bucket << start_bit)
@@ -1757,40 +1747,47 @@ def create_topk_per_row_decode_adaptive_kernel(
             def radix_bucket(val, shift, mask):
                 return ordered_key(val).shrui(shift) & mask
 
-            def clear_hist():
+            def clear_hist(hist):
                 for h in range(tid_idx, c_bins_idx, c_block_idx):
-                    fx.memref_store(c_zero, s_hist, fx.Int32(h))
+                    hist[fx.Int32(h)] = c_zero
                 gpu.barrier()
 
-            def choose_threshold(target_k, above_slot, threshold_slot, len_slot=None):
+            def choose_threshold(
+                hist, meta, target_k, above_slot, threshold_slot, len_slot=None
+            ):
                 # Hierarchical inclusive block scan over the 2048-bin histogram;
                 # each thread owns the contiguous bin pair (2*tid, 2*tid+1). The
                 # kth-largest boundary is the first bucket whose inclusive prefix
                 # passes ``K' = total - target_k`` (excl <= K' < incl).
                 two_tid = tid * fx.Int32(2)
-                c0 = s_hist[two_tid]
-                c1 = s_hist[two_tid + c_one]
-                excl0, total = block_exclusive_scan_i32(c0 + c1, with_total=True)
+                c0 = hist[two_tid]
+                c1 = hist[two_tid + c_one]
+                excl0, total = block_exclusive_scan_i32(
+                    s_scan, c0 + c1, with_total=True
+                )
                 kprime = total - target_k
                 incl0 = excl0 + c0
                 incl1 = incl0 + c1
 
-                def emit_find(b, excl, incl):
+                def emit_find(meta, b, excl, incl):
                     crosses = (excl <= kprime) & (incl > kprime)
                     if crosses:
-                        fx.memref_store(b, s_meta, threshold_slot)
-                        fx.memref_store(total - incl, s_meta, above_slot)
+                        meta[threshold_slot] = b
+                        meta[above_slot] = total - incl
                         if const_expr(len_slot is not None):
-                            fx.memref_store(incl - excl, s_meta, len_slot)
+                            meta[len_slot] = incl - excl
 
-                emit_find(two_tid, excl0, incl0)
-                emit_find(two_tid + c_one, incl0, incl1)
+                emit_find(meta, two_tid, excl0, incl0)
+                emit_find(meta, two_tid + c_one, incl0, incl1)
                 gpu.barrier()
 
-            if tid == c_zero:
-                for meta_slot in range_constexpr(8):
-                    fx.memref_store(c_zero, s_meta, fx.Int32(meta_slot))
-            gpu.barrier()
+            def clear_meta(meta):
+                if tid == c_zero:
+                    for meta_slot in range_constexpr(8):
+                        meta[fx.Int32(meta_slot)] = c_zero
+                gpu.barrier()
+
+            clear_meta(s_meta)
 
             # Per-chunk bodies for the three radix passes plus the final scatter.
             # Each takes the chunk's first column index and its already-loaded
@@ -1839,7 +1836,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                             c_one,
                             syncscope=_WORKGROUP,
                         )
-                        buffer_ops.buffer_store(col_i32, indices_rsrc, row_out + pos)
+                        store_index(row_indices, pos, col_i32)
                     if at_boundary:
                         back = fx.atomic_add(
                             meta_ptr + SMEM_META_SHORT_BACK_COUNT,
@@ -1848,9 +1845,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                         )
                         if back < num_needed:
                             out_pos = c_top_k - c_one - back
-                            buffer_ops.buffer_store(
-                                col_i32, indices_rsrc, row_out + out_pos
-                            )
+                            store_index(row_indices, out_pos, col_i32)
 
                 over_chunk(col_base, body)
 
@@ -1867,10 +1862,12 @@ def create_topk_per_row_decode_adaptive_kernel(
                     chunk_fn(col_base, load_row_vec(col_base))
 
             # Pass 1: high 11 bits over the whole valid row.
-            clear_hist()
+            clear_hist(s_hist)
             reread_pass(lambda cb, v: hist_pass1_chunk(cb, v))
             gpu.barrier()
             choose_threshold(
+                s_hist,
+                s_meta,
                 c_top_k,
                 fx.Int32(SMEM_META_SHORT_FIRST_ABOVE),
                 fx.Int32(SMEM_META_SHORT_FIRST_THRESHOLD),
@@ -1897,7 +1894,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                 kth_signed = ((first_threshold << c_shift) ^ c_sign_bit) - c_one
             if ~first_settled:
                 # Pass 2: mid 11 bits within the high boundary bucket.
-                clear_hist()
+                clear_hist(s_hist)
                 reread_pass(lambda cb, v: hist_pass2_chunk(cb, v, first_threshold))
                 gpu.barrier()
                 if const_expr(not short_early_stop):
@@ -1905,6 +1902,8 @@ def create_topk_per_row_decode_adaptive_kernel(
                         c_top_k - s_meta[fx.Int32(SMEM_META_SHORT_FIRST_ABOVE)]
                     )
                 choose_threshold(
+                    s_hist,
+                    s_meta,
                     need_after_first,
                     fx.Int32(SMEM_META_SHORT_SECOND_ABOVE),
                     fx.Int32(SMEM_META_SHORT_SECOND_THRESHOLD),
@@ -1927,7 +1926,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                     kth_signed = ((high_mid_prefix << c_low_bits) ^ c_sign_bit) - c_one
                 if ~second_settled:
                     # Pass 3: low 10 bits within the high+mid boundary.
-                    clear_hist()
+                    clear_hist(s_hist)
                     reread_pass(lambda cb, v: hist_pass3_chunk(cb, v, high_mid_prefix))
                     gpu.barrier()
                     if const_expr(not short_early_stop):
@@ -1936,6 +1935,8 @@ def create_topk_per_row_decode_adaptive_kernel(
                             - s_meta[fx.Int32(SMEM_META_SHORT_SECOND_ABOVE)]
                         )
                     choose_threshold(
+                        s_hist,
+                        s_meta,
                         need_after_second,
                         fx.Int32(SMEM_META_SHORT_THIRD_ABOVE),
                         fx.Int32(SMEM_META_SHORT_THIRD_THRESHOLD),
@@ -1963,7 +1964,7 @@ def create_topk_per_row_decode_adaptive_kernel(
             out_col_i32 = fx.Int32(out_col)
             valid = out_col_i32 < row_len
             out_val = valid.select(out_col_i32, fx.Int32(-1))
-            buffer_ops.buffer_store(out_val, indices_rsrc, row_out + out_col_i32)
+            store_index(row_indices, out_col_i32, out_val)
 
         if const_expr(short_tier):
             short_active = short_row & (part == c_zero) & (row_len > c_top_k)
@@ -2041,33 +2042,35 @@ def create_topk_per_row_decode_adaptive_kernel(
             # row touched only the emit's output counters. On a multi-part row the
             # last part out clears the row: every peer arrives only after its last
             # use of the slots, so nothing lands behind the clear.
+            def clear_out_counters(ctrs):
+                for counter in (COUNTER_OUT_FRONT, COUNTER_OUT_BACK):
+                    ctrs[counter, 0] = c_zero
+
+            def clear_row_control(ctrl):
+                for ctrl_idx in range(
+                    tid_idx, fx.Index(CONTROL_ROW_SLOTS), c_block_idx
+                ):
+                    ctrl[fx.Int32(ctrl_idx)] = c_zero
+
             gpu.barrier()
             if single_part_active:
                 if tid == c_zero:
-                    for counter in (COUNTER_OUT_FRONT, COUNTER_OUT_BACK):
-                        buffer_ops.buffer_store(
-                            c_zero, workspace_rsrc, counter_slot(counter)
-                        )
+                    clear_out_counters(counters_buf)
             else:
                 if tid == c_zero:
                     arrived = fx.atomic_add(
-                        ws_ptr(counter_slot(COUNTER_EXIT)),
+                        counter_ptr(COUNTER_EXIT),
                         c_one,
                         syncscope=_AGENT,
                         ordering=fx.AtomicOrdering.Monotonic,
                     )
-                    fx.memref_store(arrived, s_meta, fx.Int32(SMEM_META_EXIT))
+                    s_meta[fx.Int32(SMEM_META_EXIT)] = arrived
                 gpu.barrier()
                 if s_meta[fx.Int32(SMEM_META_EXIT)] == active_parts - c_one:
                     if tid == c_zero:
-                        ws_poll(counter_slot(COUNTER_EXIT), fx.AtomicOrdering.Acquire)
+                        ws_poll(counter_ptr(COUNTER_EXIT), fx.AtomicOrdering.Acquire)
                     gpu.barrier()
-                    for slot in range(
-                        tid_idx, fx.Index(CONTROL_ROW_SLOTS), c_block_idx
-                    ):
-                        buffer_ops.buffer_store(
-                            c_zero, workspace_rsrc, row_ws_base + fx.Int32(slot)
-                        )
+                    clear_row_control(row_control)
 
     @flyc.jit
     def launcher(
