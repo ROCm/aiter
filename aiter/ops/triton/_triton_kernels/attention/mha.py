@@ -529,7 +529,8 @@ def _attn_fwd(
     # Now we compute whether we need to exit early due to causal masking.
     # This is because for seqlen_q > seqlen_k, M rows of the attn scores
     # are completely masked, resulting in 0s written to the output, and
-    # inf written to LSE. We don't need to do any GEMMs in this case.
+    # -inf (or the sink logit, when one is set) written to LSE. We don't
+    # need to do any GEMMs in this case.
     # This block of code determines what N is, and if this WG is operating
     # on those M rows.
     if IS_CAUSAL:
@@ -569,7 +570,20 @@ def _attn_fwd(
                     + offs_m * stride_lse_m
                 )
                 lse_mask = offs_m < SEQLEN_Q
-                lse = tl.full([BLOCK_M], value=0.0, dtype=tl.float32)
+                # This block never enters the loop, so the value stored here is
+                # the whole LSE. No key contributes: without a sink the
+                # normaliser is the empty sum and LSE is log(0) = -inf. With a
+                # sink the row still attends to that extra logit, so
+                # LSE = sink[h]. 0.0 is that value only when sink[h] == 0, and
+                # a finite stand-in gives the block a non-zero weight in a
+                # downstream merge while its output is all zeros.
+                if ENABLE_SINK:
+                    # Distinct from the sink_val loaded on the main path: this
+                    # block returns before that load.
+                    early_sink = tl.load(sink_ptr + off_q_head).to(tl.float32)
+                    lse = tl.full([BLOCK_M], early_sink, dtype=tl.float32)
+                else:
+                    lse = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
                 tl.store(softmax_lse_ptr + offs_lse, lse, mask=lse_mask)
                 # TODO: Should dropout and return encoded softmax be handled here too?
 
@@ -677,7 +691,10 @@ def _attn_fwd(
 
     if ENABLE_SINK:
         RCP_LN2: tl.constexpr = 1.4426950408889634
-        m_i_value = tl.load(sink_ptr + off_q_head).to(tl.float32) * RCP_LN2
+        # Natural units. The epilogue writes this scalar for fully masked rows;
+        # m_i carries the same logit in base 2.
+        sink_val = tl.load(sink_ptr + off_q_head).to(tl.float32)
+        m_i_value = sink_val * RCP_LN2
     else:
         m_i_value = float("-inf")
 
@@ -895,9 +912,21 @@ def _attn_fwd(
         softmax_lse *= LN2
 
         if IS_CAUSAL:
-            # zero out nans caused by -infs when doing causal
+            # Rows before causal_start_idx attend to no keys.
+            # Without a sink their scores are all -inf and l_i ends up NaN -- the
+            # same NaN the comment above describes for acc -- so softmax_lse is
+            # NaN here, not -inf. Replacing it is required cleanup: removing it
+            # lets the NaN reach a downstream merge.
+            # With a finite sink, m_i starts at sink[h] * log2(e) and l_i stays
+            # 1, so the value just computed is already sink[h]. Writing the
+            # loaded sink explicitly is that same value, and it also covers
+            # sink = -inf, which would otherwise leave the NaN. 0.0 is correct
+            # only when the sink logit happens to be 0.
             lse_causal_mask = (start_m_idx + tl.arange(0, BLOCK_M)) < causal_start_idx
-            softmax_lse = tl.where(lse_causal_mask, 0.0, softmax_lse)
+            if ENABLE_SINK:
+                softmax_lse = tl.where(lse_causal_mask, sink_val, softmax_lse)
+            else:
+                softmax_lse = tl.where(lse_causal_mask, float("-inf"), softmax_lse)
 
         # If seqlen_q not multiple of BLOCK_M, we need to mask out the last few rows.
         # This is only true for the last M block. For others, overflow_size will be -ve

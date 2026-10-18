@@ -96,8 +96,8 @@ def _test_mha_impl(
     torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
 
     if RETURN_LSE:
-        # Fully-masked causal rows are -inf in the reference (and Triton) and 0
-        # in Gluon; compare only rows that attended at least one key.
+        # Fully-masked causal rows are -inf on both backends (sink[h] when a
+        # sink is set). Compare only rows that attended at least one key.
         finite = torch.isfinite(lse_ref)
         torch.testing.assert_close(
             lse[finite].float(), lse_ref[finite].float(), atol=1e-2, rtol=1e-2
@@ -1037,3 +1037,115 @@ def test_mha_fwd_mid_head_selection(
         batch_heads=batch_heads,
     )
     assert cfg == fwd_cfg[expected]
+
+
+def _merge_attn_states(out_a, lse_a, out_b, lse_b):
+    """Reference chunked-prefill merge, in plain torch.
+
+    Written out here rather than imported because the consumer of this LSE lives
+    outside AITER; the property under test is a property of the value this kernel
+    stores.
+    """
+    max_lse = torch.maximum(lse_a, lse_b)
+    wa = torch.exp(lse_a - max_lse).unsqueeze(-1)
+    wb = torch.exp(lse_b - max_lse).unsqueeze(-1)
+    return (wa * out_a + wb * out_b) / (wa + wb)
+
+
+def _fwd_masked(
+    seqlen_q, seqlen_k, sink=None, batch=2, nheads=4, head_sz=128, backend="triton"
+):
+    torch.manual_seed(20)
+    shape_q = (batch, seqlen_q, nheads, head_sz)
+    shape_k = (batch, seqlen_k, nheads, head_sz)
+    q = torch.randn(shape_q, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(shape_k, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(shape_k, device="cuda", dtype=torch.bfloat16)
+    out, lse = flash_attn_func(
+        q, k, v, causal=True, return_lse=True, sink=sink, backend=backend
+    )
+    # lse is (batch, nheads, seqlen_q); line it up with out's sequence axis.
+    return out, lse.transpose(1, 2)
+
+
+# 512/128 and 256/64 mask whole BLOCK_M blocks and take the early-return path.
+# 300/128 and 129/1 put causal_start_idx inside a block and take the post-loop path.
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+@pytest.mark.parametrize(
+    "seqlen_q, seqlen_k", [(512, 128), (300, 128), (256, 64), (129, 1)]
+)
+def test_fully_masked_rows_have_neg_inf_lse(seqlen_q, seqlen_k, backend):
+    skip_if_gluon_unsupported(backend)
+    _, lse = _fwd_masked(seqlen_q, seqlen_k, backend=backend)
+    causal_start = seqlen_q - seqlen_k
+
+    masked = lse[:, :causal_start, :]
+    attended = lse[:, causal_start:, :]
+
+    assert torch.isneginf(masked).all(), (
+        f"rows before causal_start_idx={causal_start} attend to no keys, so their LSE must be "
+        f"-inf; got min={masked.min().item()} max={masked.max().item()}"
+    )
+    assert torch.isfinite(attended).all(), (
+        "rows at or after causal_start_idx attend to at least one key, so their LSE must be "
+        "finite"
+    )
+
+
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_masked_block_is_identity_under_merge(backend):
+    """Merging a fully masked chunk must be a no-op."""
+    skip_if_gluon_unsupported(backend)
+    seqlen_q, seqlen_k = 512, 128
+    out, lse = _fwd_masked(seqlen_q, seqlen_k, backend=backend)
+    causal_start = seqlen_q - seqlen_k
+
+    masked_out = out[:, :causal_start, :, :]
+    masked_lse = lse[:, :causal_start, :]
+    assert torch.count_nonzero(masked_out) == 0, "a fully masked row must output zeros"
+
+    # Stand-in for the partial result this chunk would be merged with.
+    torch.manual_seed(21)
+    other_out = torch.randn_like(masked_out)
+    other_lse = torch.randn_like(masked_lse).abs() + 0.5  # finite, away from zero
+
+    merged = _merge_attn_states(masked_out, masked_lse, other_out, other_lse)
+    assert torch.equal(
+        merged, other_out
+    ), "merging a fully masked chunk must reproduce the other chunk exactly"
+
+    # With the old 0.0 the merge shrinks the result, so if this ever stops
+    # holding the test above has stopped testing anything.
+    shrunk = _merge_attn_states(
+        masked_out, torch.zeros_like(masked_lse), other_out, other_lse
+    )
+    assert not torch.equal(
+        shrunk, other_out
+    ), "0.0 LSE is expected to corrupt the merge; if it no longer does, this test is vacuous"
+
+
+# 512/128 reaches the early return; 300/128 reaches the post-loop cleanup.
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+@pytest.mark.parametrize("seqlen_q, seqlen_k", [(512, 128), (300, 128)])
+def test_fully_masked_rows_store_sink_lse(seqlen_q, seqlen_k, backend):
+    """A fully masked row with a sink stores LSE = sink[h] and output 0.
+
+    Sinks are spread away from zero so a stored 0.0 cannot pass by accident.
+    """
+    skip_if_gluon_unsupported(backend)
+    batch, nheads = 2, 4
+    sink = torch.linspace(-2.0, 5.0, nheads, device="cuda", dtype=torch.float32)
+    out, lse = _fwd_masked(
+        seqlen_q, seqlen_k, sink=sink, batch=batch, nheads=nheads, backend=backend
+    )
+    cs = seqlen_q - seqlen_k
+    torch.testing.assert_close(
+        lse[:, :cs, :],
+        sink.view(1, 1, -1).expand(batch, cs, nheads),
+        rtol=0,
+        atol=1e-6,
+    )
+    assert torch.count_nonzero(out[:, :cs]) == 0, "a fully masked row must output zeros"
+    assert torch.isfinite(
+        lse[:, cs:]
+    ).all(), "rows at or after causal_start_idx attend to at least one key"
