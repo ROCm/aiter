@@ -30,12 +30,14 @@ Contract:
 * The symmetric memory uses hipIpc handles; in containers on the host network ROCm 7.1
   needs ``HSA_ENABLE_IPC_MODE_LEGACY=1``.
 
-Large batches (ag_rs, Swiglu, fp4, from ``bigm_min_tokens`` global tokens, default 8192, 0
+Large batches (Swiglu or Silu, fp4, from ``bigm_min_tokens`` global tokens, default 8192, 0
 disables) run the big-M kernel (bigm_layer: chunked, SDMA, per-batch tuned configs from
 configs/mega_moe_tp_bigm_tuned.csv) behind the same ``forward``; it needs MORI built with
 SDMA (importable, or its install directory in ``AITER_MORI_PATH``). ``max_local_tokens`` must
 then cover the largest batch (e.g. 8192 for 32768 tokens on tp4); the small-batch engine
-only holds up to ``bigm_min_tokens / world_size - 1`` of them.
+only holds up to ``bigm_min_tokens / world_size - 1`` of them. In the ar mode each rank runs
+its 1 / tp of the replicated rows through it (ag_rs) and the kernel gathers every rank's
+output rows (no fused tail there).
 
 Schedules (planned in the kernel from the routing): up to 256 global tokens the dynamic
 one, from ``lb_min`` (default 256) global tokens up the large-batch (LB) one; its row tile
@@ -136,8 +138,8 @@ class MegaMoeTP:
         self.cfg = cfg
         bmin = 8192 if cfg.bigm_min_tokens is None else cfg.bigm_min_tokens
         big_ok = (
-            cfg.comm_mode == "ag_rs"
-            and cfg.activation == ActivationType.Swiglu
+            cfg.comm_mode in ("ag_rs", "ar")
+            and cfg.activation in (ActivationType.Swiglu, ActivationType.Silu)
             and cfg.act_dtype == "fp4"
         )
         # local tokens from which forward runs the big-M kernel (0: never)
@@ -206,7 +208,9 @@ class MegaMoeTP:
         scale[, rows]), each [tp * m, ...] with rank r's rows at r * m. engine.tn_local
         (default True): only this rank's rows are written (the others are undefined);
         False: every rank's."""
-        if self._big(x_local.shape[0]):
+        if self._big(self._local(x_local.shape[0])):
+            if self.cfg.comm_mode == "ar":
+                return self._bigm_ar(x_local, topk_weights, topk_ids, out, tail)
             local = bool(self.engine.tn_local)
             res = self.bigm().moe(
                 x_local, topk_weights, topk_ids, out=out, tail=tail, local=local
@@ -215,6 +219,38 @@ class MegaMoeTP:
                 res = (*res, self._bigm_rows(tail[1], tail[2], local))
             return res
         return self.engine(x_local, topk_weights, topk_ids, out, tail=tail, bf16=bf16)
+
+    def _local(self, rows: int) -> int:
+        """local tokens of a forward of these input rows (ar: replicated, rows / tp per rank)"""
+        tp = self.cfg.world_size
+        return -(-rows // tp) if self.cfg.comm_mode == "ar" else rows
+
+    def _bigm_ar(self, x, topk_weights, topk_ids, out, tail):
+        """ar on the big-M kernel: this rank's rows of the replicated batch (ag_rs), every
+        rank's y gathered inside the kernel -> y [M, H] (out, else a new tensor)"""
+        if tail is not None:
+            raise ValueError("MegaMoeTP: no fused tail in the ar mode's big-M path")
+        M, H = x.shape
+        tp, r = self.cfg.world_size, self.cfg.rank
+        m = -(-M // tp)
+        lo, hi = min(r * m, M), min((r + 1) * m, M)
+        xs, tw, ids = x[lo:hi], topk_weights[lo:hi], topk_ids[lo:hi]
+        if hi - lo < m:  # the last ranks' rows of an uneven batch: zero / no route
+            n = hi - lo
+            xs = torch.cat([xs, x.new_zeros((m - n, H))])
+            tw = torch.cat([tw, tw.new_zeros((m - n, tw.shape[1]))])
+            ids = torch.cat([ids, ids.new_full((m - n, ids.shape[1]), -1)])
+        from .kernels.mega_moe_tp.bigm_layer import _kcopy
+
+        ya = self.bigm().moe(
+            xs.contiguous(), tw.contiguous(), ids.contiguous(), gather=True
+        )
+        if out is None:
+            out = torch.empty_like(x)
+        _kcopy(
+            out, ya[:M]
+        )  # (a shader copy: copy_ of the window may run on an SDMA engine)
+        return out
 
     def _bigm_rows(self, res_out, norm_w, local):
         """the big-M tail's bf16 rows [tp * m, H]: (Gemma)RMSNorm of res_out at this rank's
@@ -258,6 +294,8 @@ class MegaMoeTP:
                 group=a["group"],
                 device=a["device"],
                 io=True,
+                act=cfg.activation.name.lower(),
+                ygather=cfg.comm_mode == "ar",
                 # comm_dtype "bf16" (the accurate mode): bf16 route rows (MXFP8 otherwise)
                 opts={"AITER_BIGM_R8": "0"} if cfg.comm_dtype == "bf16" else None,
             )
@@ -300,6 +338,8 @@ class MegaMoeTP:
         while serving (a compile stalls every rank) and none inside CUDA graph capture.
         """
         ts = [local_tokens] if isinstance(local_tokens, int) else list(local_tokens)
+        ar = self.cfg.comm_mode == "ar"
+        btail = (tail or tail_bf16) and not ar  # (the ar big-M path has no tail)
         small = [t for t in ts if not self._big(t)]
         if small:
             self.engine.prepare(small, tail, tail_bf16, warmup)
@@ -310,10 +350,11 @@ class MegaMoeTP:
         rows = b.io_rows_per_kernel(self.bigm_m, hi)
         if warmup:
             b.precompile(
-                rows, (2 if self.engine.tn_local else 1) if tail or tail_bf16 else 0
+                rows, 3 if ar else (2 if self.engine.tn_local else 1) if btail else 0
             )
         for m in rows if warmup else ():
             cfg, dev = self.cfg, b.device
+            m = m * cfg.world_size if ar else m  # (ar: the replicated batch)
             x = torch.zeros((m, cfg.model_dim), dtype=torch.bfloat16, device=dev)
             # balanced routing: token i's slot j to expert (i (topk - 1) + j) % (experts - 1),
             # the shared expert (experts - 1) last
@@ -331,7 +372,7 @@ class MegaMoeTP:
             tw = torch.full(
                 (m, cfg.topk), 1.0 / cfg.topk, dtype=torch.float32, device=dev
             )
-            if tail or tail_bf16:
+            if btail:
                 res = torch.zeros_like(x)
                 self.forward(x, tw, ids, tail=(res, res, x[0]), bf16=tail_bf16)
             else:
@@ -345,7 +386,7 @@ class MegaMoeTP:
     def tail_ok(self, local_tokens: int) -> bool:
         """forward(tail=...) runs for this local token count."""
         if self._big(local_tokens):
-            return True
+            return self.cfg.comm_mode == "ag_rs"
         return self.engine.tail_ok(local_tokens)
 
     def launch_config(self, local_tokens: int) -> LaunchCfg:
