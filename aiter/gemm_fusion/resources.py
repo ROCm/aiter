@@ -48,6 +48,7 @@ ENV_WINDOW_MIB = "AITER_GEMM_FUSION_WINDOW_MIB"  # override the uniform window s
 ENV_ALIGN_CAP_MIB = "AITER_GEMM_FUSION_ALIGN_CAP_MIB"  # aligned policy: cap of the start alignment (default 256 MiB)
 POLICIES = ("uniform", "per_owner", "aligned", "shared_large", "abs_aligned", "arena", "arena_per_owner")
 ARENA_ALIGN = 4 << 20  # sub-window offsets/sizes inside the arena are multiples of 4 MiB (the size every window used in the passing layouts was a multiple of)
+ENV_FREE_BEFORE_DESTROY = "AITER_GEMM_FUSION_FREE_BEFORE_DESTROY"  # default ON: ccoMemFree(local) after each ccoWindowDeregister (MORI's documented teardown); =0 = old behaviour (A/B)
 ENV_ARENA_MIB = "AITER_GEMM_FUSION_ARENA_MIB"  # arena policies: arena size override (MiB)
 ENV_ABS_ALIGN = "AITER_GEMM_FUSION_ABS_ALIGN"  # shared_large only: =0 disables the absolute-VA alignment / ordered pre-registration (A/B); default on
 ENV_SPACER_GRAN_MIB = "AITER_GEMM_FUSION_SPACER_GRAN_MIB"  # round spacer sizes up to this many MiB (default: the CCO granule G, 4 KiB)
@@ -303,7 +304,7 @@ class CcoBackend:
         for n, a in [
             ("gf_uid_v1", [u32, vp]), ("gf_comm_create_v1", [u32, u32, i32, vp, u64, C.POINTER(vp)]),
             ("gf_win_register_v1", [vp, u64, C.POINTER(vp), C.POINTER(vp)]), ("gf_peer_ptr_v1", [vp, vp, i32, C.POINTER(vp)]),
-            ("gf_devcomm_create_v1", [vp, u32, C.POINTER(vp)]), ("gf_devcomm_info_v1", [vp, vp, C.POINTER(u64)]), ("gf_zero_v1", [i32, vp, u64, i32]), ("gf_mem_info_v1", [i32, C.POINTER(u64)]), ("gf_comm_va_info_v1", [vp, C.POINTER(u64)]),
+            ("gf_devcomm_create_v1", [vp, u32, C.POINTER(vp)]), ("gf_devcomm_info_v1", [vp, vp, C.POINTER(u64)]), ("gf_zero_v1", [i32, vp, u64, i32]), ("gf_mem_info_v1", [i32, C.POINTER(u64)]), ("gf_comm_va_info_v1", [vp, C.POINTER(u64)]), ("gf_win_free_v1", [vp, vp]),
                      ("gf_win_view_v1", [vp, vp, u64, C.POINTER(vp)]), ("gf_win_view_free_v1", [vp, vp]), ("gf_win_info_v1", [vp, vp, C.POINTER(u64)]), ("gf_device_sync_v1", [i32]),
             ("gf_devcomm_destroy_v1", [vp, vp]), ("gf_win_deregister_v1", [vp, vp]), ("gf_comm_destroy_v1", [vp]),
         ]:
@@ -358,6 +359,9 @@ class CcoBackend:
 
     def zero(self, device, local, nbytes):
         self._chk(self.lib.gf_zero_v1(device, local, nbytes, self._zero_method), "gf_zero")
+
+    def win_free(self, comm, local):
+        self._chk(self.lib.gf_win_free_v1(comm, local), "gf_win_free")
 
     def win_view(self, comm, arena_win, offset):
         out = C.c_void_p()
@@ -1067,12 +1071,17 @@ class FusionResources:
         for v in self._views:  # arena views are plain device allocations: freed BEFORE (and never deregistered like) the arena window
             self.backend.win_view_free(self.comm, v.handle)
         self._views.clear()
+        free = getattr(self.backend, "win_free", None) if _flag_default(None, ENV_FREE_BEFORE_DESTROY, True) else None
         for w in self._regs:  # each registered window once (a shared window is referenced by several owners; the arena is the only registered window)
             self.backend.win_deregister(self.comm, w.handle)
+            if free is not None:
+                free(self.comm, w.local)  # MORI teardown contract: WindowDeregister -> MemFree(localPtr) (before ccoCommDestroy)
         self._regs.clear()
         self._shared.clear()
-        for h, _loc, _n in self._spacers:
+        for h, loc, _n in self._spacers:
             self.backend.win_deregister(self.comm, h)
+            if free is not None:
+                free(self.comm, loc)
         self._spacers.clear()
         self.backend.comm_destroy(self.comm)
         self.windows.clear()

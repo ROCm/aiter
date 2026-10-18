@@ -111,6 +111,7 @@ def run_arena(kind: str, heap_bytes: int, rank: int, world: int, dist, backend, 
             pass
     try:
         backend.win_deregister(comm, h)
+        _free_local(backend, comm, loc)  # MORI teardown contract: WindowDeregister -> MemFree(local) before ccoCommDestroy (PROBE_FREE=0 = old behaviour)
         backend.comm_destroy(comm)
     except Exception:  # noqa: BLE001
         pass
@@ -162,6 +163,15 @@ def sequence(name: str, mib: str = "", n: int = 39, window_mib: int = 164) -> Li
     if name == "custom":
         return [int(x) * MiB for x in mib.split(",") if x]
     raise SystemExit(f"unknown sequence {name!r}")
+
+
+def _free_local(backend, comm, local) -> None:
+    """ccoMemFree of a window's local allocation after its Deregister (the documented teardown). Backends without win_free, or PROBE_FREE=0, skip it."""
+    import os as _o
+
+    fn = getattr(backend, "win_free", None)
+    if fn is not None and _o.environ.get("PROBE_FREE", "1") != "0":
+        fn(comm, local)
 
 
 def _va_fields(va: int) -> str:
@@ -225,6 +235,7 @@ def run(seq: List[int], heap_bytes: int, rank: int, world: int, dist, backend, t
     for w in reversed(wins):
         try:
             backend.win_deregister(comm, w[0])
+            _free_local(backend, comm, w[1])
         except Exception:  # noqa: BLE001
             pass
     try:

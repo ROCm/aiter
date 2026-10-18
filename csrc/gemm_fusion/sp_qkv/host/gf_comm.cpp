@@ -195,6 +195,14 @@ int32_t gf_win_deregister_v1(void* comm, void* win) {
     gf::DeviceScope scope(comm_dev(comm));
     return mori::cco::ccoWindowDeregister(static_cast<mori::cco::ccoComm*>(comm), reinterpret_cast<mori::cco::ccoWindow_t>(win)) == 0 ? OK : E_CCO;
 }
+// MORI's documented teardown of a window made by the ccoWindowRegister(comm, size, &win, &local) overload is WindowDeregister -> MemFree(local) (cco.hpp, Overload A/C
+// comment). Deregister only unmaps the PEER slots and drops the window struct; the local allocation stays in comm->allocTable until ccoMemFree, or until the
+// ccoCommDestroy 'safety net' sweep. We called only Deregister; this frees the local allocation explicitly, BEFORE ccoCommDestroy.
+int32_t gf_win_free_v1(void* comm, void* local) {
+    if (!comm || !local) return E_ARG;
+    gf::DeviceScope scope(comm_dev(comm));
+    return mori::cco::ccoMemFree(static_cast<mori::cco::ccoComm*>(comm), local) == 0 ? OK : E_CCO;
+}
 int32_t gf_comm_destroy_v1(void* comm) {
     if (!comm) return E_ARG;
     gf::DeviceScope scope(comm_dev(comm));

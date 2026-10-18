@@ -2408,3 +2408,39 @@ def test_probe_run_arena_uses_the_rank_as_hip_device_not_device_zero(capsys):
     wp.run([4 << 20], 4 << 30, 3, 4, FakeDist(), be, "x")
     assert B.devs == [(3, 3)]
     capsys.readouterr()
+
+def test_release_frees_each_window_local_allocation_after_deregister_before_comm_destroy(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources
+
+    for var in ("AITER_GEMM_FUSION_FREE_BEFORE_DESTROY", "AITER_GEMM_FUSION_PROFILE", "AITER_GEMM_FUSION_WINDOW_POLICY"):
+        monkeypatch.delenv(var, raising=False)
+
+    def build():
+        ev = []
+
+        class B(RealisticFirstFit):
+            def win_deregister(self, comm, w):
+                ev.append(("dereg", w))
+
+            def win_free(self, comm, loc):
+                ev.append(("free", loc))
+
+            def comm_destroy(self, comm):
+                ev.append(("comm_destroy",))
+
+        r = FusionResources(0, 4, dist=FakeDist(), backend=B(), policy="aligned", window_bytes=4 << 20, max_windows=4)
+        r.ensure("o", [WindowReq("a", 100, "p2p_window"), WindowReq("b", 100, "p2p_window")])
+        r.finalize()
+        ev.clear()
+        r.release()
+        return r, ev
+
+    r, ev = build()
+    kinds = [e[0] for e in ev]
+    assert kinds[-1] == "comm_destroy" and kinds.count("dereg") == kinds.count("free") >= 2
+    for i, e in enumerate(ev):
+        if e[0] == "dereg":
+            assert ev[i + 1][0] == "free"  # Deregister then MemFree(local), per window, spacers included
+    monkeypatch.setenv("AITER_GEMM_FUSION_FREE_BEFORE_DESTROY", "0")
+    _r, ev2 = build()
+    assert [e[0] for e in ev2].count("free") == 0  # old behaviour for A/B
