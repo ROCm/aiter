@@ -35,7 +35,11 @@ HEAP_SLACK_BYTES = 256 << 20  # ccoDevCommCreate allocates its own resource wind
 ENV_POLICY = "AITER_GEMM_FUSION_WINDOW_POLICY"  # "uniform" (default) | "per_owner"
 ENV_WINDOW_MIB = "AITER_GEMM_FUSION_WINDOW_MIB"  # override the uniform window size (MiB)
 ENV_ALIGN_CAP_MIB = "AITER_GEMM_FUSION_ALIGN_CAP_MIB"  # aligned policy: cap of the start alignment (default 256 MiB)
-POLICIES = ("uniform", "per_owner", "aligned")
+POLICIES = ("uniform", "per_owner", "aligned", "shared_large")
+ENV_REG_BARRIER = "AITER_GEMM_FUSION_REG_BARRIER"  # =1: collective barrier after EVERY window registration (E2 seam; default off)
+ENV_REG_SYNC = "AITER_GEMM_FUSION_REG_SYNC"  # =1: device sync BEFORE every registration (optional companion of REG_BARRIER)
+ENV_LATE_REG = "AITER_GEMM_FUSION_LATE_REG"  # =1: allow ensure() after finalize() (G-late seam; default off)
+SHARED_KEY = "<shared>"  # hook key of a shared window set
 
 
 class ResourceError(RuntimeError):
@@ -75,6 +79,31 @@ def aligned_total_bytes(sizes: List[int], cap: int = 256 << 20) -> int:
     return sum(s + max(0, start_alignment(s, cap) - GRANULE) for s in sizes)
 
 
+def _flag(arg, env_name: str) -> bool:
+    """Tuning flag: explicit arg wins, else the env var ('1'/'true'/'yes'), default off."""
+    if arg is not None:
+        return bool(arg)
+    return os.environ.get(env_name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def policy_memory_table(budget: dict, align_cap: int = 256 << 20) -> Dict[str, int]:
+    """Predicted REGISTERED window bytes per rank for every policy, from a profile window_budget (log/accounting; excludes devcomm + slack).
+    uniform: every window the max size; per_owner: each owner's own size; aligned: per_owner + worst-case spacer padding;
+    shared_large: small owners' windows + ONE shared S, R and C set."""
+    sizes = [int(x) for x in (budget.get("window_sizes") or [])]
+    out: Dict[str, int] = {}
+    if budget.get("window_bytes") and budget.get("max_windows"):
+        out["uniform"] = int(budget["window_bytes"]) * int(budget["max_windows"])
+    if sizes:
+        out["per_owner"] = sum(sizes)
+        out["aligned"] = aligned_total_bytes(sizes, align_cap)
+    sh = budget.get("shared") or {}
+    small = [int(x) for x in (budget.get("small_window_sizes") or [])]
+    if sh and small:
+        out["shared_large"] = sum(small) + sum(int(v) for v in sh.values())
+    return out
+
+
 def heap_bytes_for(window_bytes: int, max_windows: int, floor: int = PER_RANK_VMM_BYTES) -> int:
     """Per-rank VMM heap for max_windows equal windows (+devcomm slack), rounded up to a 4 GiB multiple, never below the Phase-1 4 GiB."""
     g = 4 << 30
@@ -90,6 +119,7 @@ class Window:
     bytes: int  # rounded
     handle: object
     local: int  # local device pointer (int)
+    shared: bool = False  # one registered window used by several owners (shared_large policy)
 
 
 class CcoBackend:
@@ -173,7 +203,8 @@ class FusionResources:
 
     def __init__(self, rank: int, world: int, group=None, dist=None, backend=None, device: Optional[int] = None,
                  caps: frozenset = frozenset(), vmm_bytes: Optional[int] = None, window_bytes: Optional[int] = None,
-                 max_windows: Optional[int] = None, policy: Optional[str] = None, profile=None):
+                 max_windows: Optional[int] = None, policy: Optional[str] = None, profile=None,
+                 reg_barrier: Optional[bool] = None, reg_sync: Optional[bool] = None, late_registration: Optional[bool] = None):
         if dist is None:
             import torch.distributed as dist  # type: ignore
         self.rank, self.world, self.group, self.dist = rank, world, group, dist
@@ -185,11 +216,19 @@ class FusionResources:
             raise ResourceError(f"{ENV_POLICY} must be one of {POLICIES}, got {self.policy!r}")
         self.align_cap = int(os.environ.get(ENV_ALIGN_CAP_MIB, "256")) << 20
         self._window_sizes: List[int] = []
+        self._budget_doc: dict = {}
+        self.reg_barrier = _flag(reg_barrier, ENV_REG_BARRIER)
+        self.reg_sync = _flag(reg_sync, ENV_REG_SYNC)
+        self.allow_late = _flag(late_registration, ENV_LATE_REG)
         self.profile = self._resolve_profile(profile)  # explicit only: a Profile object or a name/path; NEVER the AITER_GEMM_FUSION_PROFILE env
         self.window_bytes, self.max_windows = self._budget(window_bytes, max_windows)
         if vmm_bytes is None:
             if self.policy == "uniform" and self.window_bytes:
                 vmm_bytes = heap_bytes_for(self.window_bytes, self.max_windows)
+            elif self.policy == "shared_large" and self._budget_doc.get("shared_large_total_bytes"):
+                g = 4 << 30
+                need = int(self._budget_doc["shared_large_total_bytes"]) + HEAP_SLACK_BYTES
+                vmm_bytes = max(PER_RANK_VMM_BYTES, (need + g - 1) // g * g)
             elif self.policy == "aligned" and self._window_sizes:
                 g = 4 << 30
                 need = aligned_total_bytes(self._window_sizes, self.align_cap) + HEAP_SLACK_BYTES
@@ -201,6 +240,9 @@ class FusionResources:
         self._slot_base: Optional[int] = None  # local pointer of the first registration (slot offset 0 of this rank's heap)
         self._top = 0  # measured end offset of the last registration (monotonic first-fit assumption, verified per registration)
         self._spacers: List[Tuple[object, int, int]] = []  # (handle, local, bytes) of alignment pads, never used, freed at release
+        self._regs: List[Window] = []  # every registered window exactly ONCE (shared windows appear once): zeroing / deregistration / accounting
+        self._shared: Dict[str, Window] = {}  # share tag -> the one registered window
+        self._reg_seq = 0  # number of registering ensure() calls (agreement check)
         self.comm = None
         self.devcomm = None
         self.windows: Dict[str, Dict[str, Window]] = {}  # owner -> name -> Window
@@ -249,6 +291,7 @@ class FusionResources:
             window_bytes = window_bytes if window_bytes is not None else wb.get("window_bytes")
             max_windows = max_windows if max_windows is not None else wb.get("max_windows")
             self._window_sizes = [int(x) for x in (wb.get("window_sizes") or [])]
+            self._budget_doc = wb
         if window_bytes is None:
             log.warning("event=resources no_budget rank=%d profile=%s: no window budget available (%s); the uniform window size will be taken "
                         "from the FIRST ensure() request and a later larger plan will be rejected. Pass profile=<name|path|Profile> whose "
@@ -265,8 +308,12 @@ class FusionResources:
         uid = [self.backend.uid(self.rank) if self.rank == 0 else None]
         self.dist.broadcast_object_list(uid, src=self._src0(), group=self.group)
         self.comm = self.backend.comm_create(self.rank, self.world, uid[0], self._vmm, self.device)
-        log.info("event=resources comm rank=%d world=%d heap_bytes=%d policy=%s window_bytes=%s max_windows=%s",
-                 self.rank, self.world, self._vmm, self.policy, self.window_bytes, self.max_windows)
+        log.info("event=resources comm rank=%d world=%d heap_bytes=%d policy=%s window_bytes=%s max_windows=%s reg_barrier=%d reg_sync=%d late=%d",
+                 self.rank, self.world, self._vmm, self.policy, self.window_bytes, self.max_windows, self.reg_barrier, self.reg_sync, self.allow_late)
+        if self._budget_doc:
+            tbl = policy_memory_table(self._budget_doc, self.align_cap)
+            log.info("event=resources policy_memory rank=%d selected=%s %s", self.rank, self.policy,
+                     " ".join(f"{k}={v / (1 << 20):.0f}MiB" for k, v in tbl.items()))
 
     def _src0(self):
         # broadcast_object_list takes a GLOBAL rank; map group rank 0 when a group is given
@@ -284,6 +331,8 @@ class FusionResources:
         """One collective window registration with measured-offset logging and a rich failure message."""
         cum = (self._reg_log[-1][3] if self._reg_log else 0) + size
         expect = self._top
+        if self.reg_sync:  # E2 seam (optional): no outstanding device work while this rank allocates/maps
+            self.backend.device_sync(self.device)
         try:
             h, loc = self.backend.win_register(self.comm, size)
         except ResourceError as e:
@@ -301,6 +350,8 @@ class FusionResources:
         self._reg_log.append((owner, name + ("[spacer]" if spacer else ""), size, cum))
         log.info("event=resources window rank=%d owner=%s name=%s bytes=%d n=%d cumulative=%d offset=%s heap=%d%s",
                  self.rank, owner, name, size, len(self._reg_log), cum, off, self._vmm, " spacer=1" if spacer else "")
+        if self.reg_barrier or self.finalized:  # E2 seam: no rank starts allocating window k+1 while a peer may still be importing/mapping window k
+            self._barrier()
         return h, loc
 
     def _pad_to_alignment(self, owner: str, name: str, align: int):
@@ -316,12 +367,20 @@ class FusionResources:
         """Register this owner's windows once (idempotent per owner; collective on first call)."""
         if owner in self.windows:
             return self.windows[owner]
-        if self.finalized:
+        late = self.finalized
+        if late and not self.allow_late:
             raise ResourceError(
-                f"ensure({owner!r}) after finalize(): resolve every plan on every rank before finalize (collective ordering)"
+                f"ensure({owner!r}) after finalize(): resolve every plan on every rank before finalize (collective ordering); "
+                f"set {ENV_LATE_REG}=1 (late_registration=True) to allow registering after the devcomm exists"
             )
         wins: Dict[str, Window] = {}
+        fresh: List[Window] = []  # windows created by THIS call (only those are zeroed: a shared window may already be live)
         wreqs = [r for r in reqs if r.kind in ("p2p_window", "control")]
+        if late:
+            self._refuse_inside_capture(owner)
+        if wreqs and (late or self.reg_barrier):
+            self._agree_registration(owner, wreqs)  # D14 rule 2: same (seq, owner, sizes) on every rank, else abort fusion
+        self._reg_seq += 1
         need = round_up(max((r.bytes for r in wreqs), default=0)) if wreqs else 0
         if self.policy == "uniform" and wreqs:
             # Phase-1 layout: EVERY window of the shared comm has the same size (r8g: equal, 4 MiB multiple), so slot offsets are
@@ -334,18 +393,95 @@ class FusionResources:
                     f"pre-size by constructing FusionResources(profile=<the active profile>) (its window_budget), window_bytes=, or {ENV_WINDOW_MIB}")
             size = self.window_bytes
         else:
-            size = need  # per_owner and aligned: per-plan sizes (4 MiB multiples)
+            size = need  # per_owner, aligned, shared_large (unshared requests): per-plan sizes (4 MiB multiples)
         for r in wreqs:
+            if self.policy == "shared_large" and r.share:
+                wins[r.name] = self._shared_window(owner, r, fresh)
+                continue
             if self.policy == "aligned":
                 self._pad_to_alignment(owner, r.name, start_alignment(size, self.align_cap))
             h, loc = self._register(owner, r.name, size)
-            wins[r.name] = Window(owner, r.name, r.kind, size, h, loc)
+            w = Window(owner, r.name, r.kind, size, h, loc)
+            wins[r.name] = w
+            self._regs.append(w)
+            fresh.append(w)
         # sdma_queue request: bytes = queues PER PEER wanted (0 = default 1). The shared devcomm gets the MAX over plans, never the
         # number of plans (9 large plans must not ask CCO for 9 queues: the r11 kernels require exactly 1, as in Phase-1).
         self._sdma = max([getattr(self, "_sdma", 0)] + [max(1, int(r.bytes)) for r in reqs if r.kind == "sdma_queue"])
         self.windows[owner] = wins
-        self._zero_windows(wins.values())  # local only; ranks barrier before first launch (finalize)
+        self._zero_windows(fresh)  # local only; ranks barrier before first launch (finalize). NEVER a shared window that already exists (it may be live)
+        if late:
+            log.info("event=resources late_registration rank=%d owner=%s windows=%d (after ccoDevCommCreate; barrier done)", self.rank, owner, len(fresh))
         return wins
+
+    # -- shared windows (policy shared_large) --------------------------------------
+    def _shared_window(self, owner: str, r: WindowReq, fresh: List[Window]) -> Window:
+        """One registered window per share tag. Size = the profile budget for the tag, else the first request (a later larger request is rejected)."""
+        need = round_up(int(r.min_bytes if r.min_bytes is not None else r.bytes))
+        w = self._shared.get(r.share)
+        if w is not None:
+            if need > w.bytes:
+                raise ResourceError(f"ensure({owner!r}): shared window {r.share!r} need {need} B exceeds its size {w.bytes} B; pre-size via "
+                                    f"FusionResources(profile=...) window_budget['shared'][{r.share!r}]")
+            return w
+        budget = (self._budget_doc.get("shared") or {}).get(r.share)
+        size = round_up(int(budget)) if budget else need
+        if need > size:
+            raise ResourceError(f"ensure({owner!r}): shared window {r.share!r} need {need} B exceeds the budgeted {size} B (profile window_budget['shared'])")
+        h, loc = self._register(SHARED_KEY, r.share, size)
+        w = Window(SHARED_KEY, r.share, r.kind, size, h, loc, shared=True)
+        self._shared[r.share] = w
+        self._regs.append(w)
+        fresh.append(w)
+        return w
+
+    # -- collective safety of (lazy / late) registration ---------------------------
+    def _refuse_inside_capture(self, owner: str):
+        try:
+            import torch
+
+            cap = getattr(getattr(torch, "cuda", None), "is_current_stream_capturing", None)
+            if cap is not None and cap():
+                raise ResourceError(f"ensure({owner!r}): window registration is a collective HIP/VMM operation and is refused inside graph capture")
+        except ResourceError:
+            raise
+        except Exception:  # noqa: BLE001  (no torch/cuda: nothing to refuse)
+            pass
+
+    def _agree_registration(self, owner: str, wreqs: List[WindowReq]):
+        mine = (self._reg_seq, owner, tuple((r.name, r.kind, int(r.bytes), r.share) for r in wreqs))
+        got = [None] * self.world
+        self.dist.all_gather_object(got, mine, group=self.group)
+        if any(g != mine for g in got):
+            raise ResourceError(f"registration disagreement across ranks at ensure({owner!r}) (seq {self._reg_seq}): {got}; fusion must be aborted on every rank")
+
+    # -- hooks shared by several owners (shared window set): registered ONCE, by the first owner that attaches --------
+    def has_hook(self, kind: str, key: str) -> bool:
+        return key in {"init": self._init_hooks, "drain": self._drain_hooks, "poison": self._poison_hooks, "close": self._close_hooks}[kind]
+
+    def set_shared_hooks(self, key: str = SHARED_KEY, *, init=None, drain=None, poison=None) -> bool:
+        """Register the control-block init / SDMA drain / poison read of a SHARED window set exactly once. Returns True for the first caller.
+        Later owners attaching to the same live set must NOT re-run init (that would reset the epoch on this rank only)."""
+        if self.has_hook("init", key) or self.has_hook("drain", key) or self.has_hook("poison", key):
+            return False
+        if drain is not None:
+            self.set_drain(key, drain)
+        if poison is not None:
+            self.set_poison(key, poison)
+        if init is not None:
+            self.set_init(key, init)  # runs once now (epoch=1 + magic), then after every zeroing
+        return True
+
+    # -- memory accounting ----------------------------------------------------------
+    def budget(self) -> dict:
+        """Per-rank accounting of what THIS process registered: bytes per window, shared bytes, spacers, VA heap, peer-mapped VA."""
+        total = sum(w.bytes for w in self._regs)
+        spacer = sum(n for _h, _l, n in self._spacers)
+        shared = sum(w.bytes for w in self._regs if w.shared)
+        return {"policy": self.policy, "windows": len(self._regs), "registered_bytes": total, "shared_bytes": shared, "spacer_bytes": spacer,
+                "heap_bytes": self._vmm, "peer_mapped_va_bytes": (self.world - 1) * (total + spacer), "owners": len(self.windows),
+                "by_owner": {o: sum(w.bytes for w in ws.values() if not w.shared) for o, ws in self.windows.items()},
+                "devcomm_sdma_queues": self.sdma_queues}
 
     def set_init(self, owner: str, fn: Callable[[], None]):
         """Register + run the owner's control-block initializer (e.g. the large-M epoch=1/magic image); it is re-run after
@@ -393,6 +529,10 @@ class FusionResources:
                 log.warning("event=resources devcomm_info_failed rank=%d err=%s", self.rank, e)
         log.info("event=resources devcomm rank=%d sdma_queues=%d windows=%d info=%s", self.rank, self.sdma_queues, len(self._reg_log), self.devcomm_info)
         self.finalized = True
+        b = self.budget()
+        log.info("event=resources budget rank=%d policy=%s windows=%d registered_bytes=%d (%.1f MiB) shared_bytes=%d spacer_bytes=%d heap_bytes=%d "
+                 "peer_mapped_va_bytes=%d owners=%d sdma_queues=%d", self.rank, b["policy"], b["windows"], b["registered_bytes"], b["registered_bytes"] / (1 << 20),
+                 b["shared_bytes"], b["spacer_bytes"], b["heap_bytes"], b["peer_mapped_va_bytes"], b["owners"], b["devcomm_sdma_queues"])
         self.backend.device_sync(self.device)
         self._barrier()
 
@@ -409,14 +549,12 @@ class FusionResources:
         if self._drain_hooks:
             self.backend.device_sync(self.device)
         self._barrier()
-        for owner, wins in self.windows.items():
-            self._zero_windows(wins.values())
-            hook = self._init_hooks.get(owner)
-            if hook is not None:
-                hook()
+        self._zero_windows(self._regs)  # every registered window exactly once (a shared window is not zeroed once per owner)
+        for hook in list(self._init_hooks.values()):  # control-block images; one per owner, one for a shared set
+            hook()
         self.backend.device_sync(self.device)
         self._barrier()
-        log.info("event=resources quiesce_and_reset rank=%d windows=%d", self.rank, sum(len(w) for w in self.windows.values()))
+        log.info("event=resources quiesce_and_reset rank=%d windows=%d", self.rank, len(self._regs))
 
     def local_m(self, tokens: int) -> int:
         return tokens // self.world
@@ -435,9 +573,10 @@ class FusionResources:
         self._barrier()
         if self.devcomm is not None:
             self.backend.devcomm_destroy(self.comm, self.devcomm)
-        for wins in self.windows.values():
-            for w in wins.values():
-                self.backend.win_deregister(self.comm, w.handle)
+        for w in self._regs:  # each registered window once (a shared window is referenced by several owners)
+            self.backend.win_deregister(self.comm, w.handle)
+        self._regs.clear()
+        self._shared.clear()
         for h, _loc, _n in self._spacers:
             self.backend.win_deregister(self.comm, h)
         self._spacers.clear()

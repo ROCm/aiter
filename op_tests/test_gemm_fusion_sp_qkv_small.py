@@ -107,14 +107,20 @@ def test_vendored_sources_match_manifest():
 
 # ---- FusionResources with fakes -------------------------------------------------------------------------
 class FakeDist:
-    def __init__(self):
+    def __init__(self, diverge_rank=None):
         self.calls = []
+        self.diverge_rank = diverge_rank  # all_gather_object: pretend this rank saw a different object
 
     def broadcast_object_list(self, obj, src=0, group=None):
         self.calls.append(("bcast", src))
 
     def barrier(self, group=None):
         self.calls.append(("barrier",))
+
+    def all_gather_object(self, out, obj, group=None):
+        self.calls.append(("allgather",))
+        for i in range(len(out)):
+            out[i] = obj if i != self.diverge_rank else ("DIVERGED",) + tuple(obj[1:])
 
 
 class FakeBackend:
@@ -313,7 +319,9 @@ def test_reset_order_with_drain_hook():
     r.finalize()
     ev.clear()
     r.quiesce_and_reset()
-    assert ev == ["sync", "drain", "sync", "barrier", "zero", "init", "zero", "sync", "barrier"]
+    # every registered window is zeroed once, THEN the init hooks run (so an init image is never wiped by a later zero), then sync + barrier
+    assert ev == ["sync", "drain", "sync", "barrier", "zero", "zero", "init", "sync", "barrier"]
+    assert ev.index("init") > max(i for i, x in enumerate(ev) if x == "zero")
     # no drain hooks -> no extra sync (small-M only)
     r2 = FusionResources(0, 4, dist=d, backend=FakeBackend())
     r2.ensure("s", [WindowReq("b", 100, "p2p_window")])
@@ -1445,3 +1453,286 @@ def test_no_implicit_env_profile_lookup_in_the_gemm_fusion_runtime():
     assert files <= {"profile.py", "window_probe.py"}, hits  # resources.py / variants*.py / match.py must not read the env profile
     pr = open(os.path.join(root, "gemm_fusion", "resources.py"), encoding="utf-8").read()
     assert "load_profile()" not in pr and "ENV_PROFILE" not in pr
+
+# ======================================================================= D14: REG_BARRIER (E2 seam), shared_large (D-A), late registration (G-late)
+def _all_plans(monkeypatch):
+    from aiter.gemm_fusion import catalog
+
+    monkeypatch.setattr(catalog, "_CATALOG", {})
+    out = []
+    for mode, T in specs.SMALL_CELLS:
+        p = _plan_for(mode, T, False)
+        out.append((p.build_key, p.resources()))
+    for mode, T in specs.LARGE_CELLS:
+        p = _plan_for(mode, T, True)
+        out.append((p.build_key, p.resources()))
+    return out
+
+
+def test_reg_barrier_and_sync_seams_are_off_by_default_and_per_registration(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources
+
+    for var in ("AITER_GEMM_FUSION_REG_BARRIER", "AITER_GEMM_FUSION_REG_SYNC", "AITER_GEMM_FUSION_WINDOW_POLICY", "AITER_GEMM_FUSION_PROFILE"):
+        monkeypatch.delenv(var, raising=False)
+    reqs = [WindowReq("a", 100, "p2p_window"), WindowReq("b", 100, "control")]
+    d, be = FakeDist(), RealisticFirstFit()
+    r = FusionResources(0, 4, dist=d, backend=be, window_bytes=4 << 20, max_windows=2)
+    assert (r.reg_barrier, r.reg_sync) == (False, False)
+    d.calls.clear()
+    r.ensure("p", reqs)
+    assert [c for c in d.calls if c == ("barrier",)] == [] and not any(x[0] == "sync" for x in be.log)  # default: no extra collective, no extra sync
+    # ON via env: one barrier after EACH of the 2 registrations; one device sync BEFORE each when REG_SYNC=1
+    monkeypatch.setenv("AITER_GEMM_FUSION_REG_BARRIER", "1")
+    monkeypatch.setenv("AITER_GEMM_FUSION_REG_SYNC", "1")
+    d2, be2 = FakeDist(), RealisticFirstFit()
+    ev = []
+    be2.device_sync = lambda dev: ev.append("sync")
+    be2.win_register = (lambda orig: lambda comm, n: (ev.append("reg"), orig(comm, n))[1])(be2.win_register)
+    d2.barrier = lambda group=None: ev.append("barrier")
+    r2 = FusionResources(0, 4, dist=d2, backend=be2, window_bytes=4 << 20, max_windows=2)
+    assert (r2.reg_barrier, r2.reg_sync) == (True, True)
+    ev.clear()
+    r2.ensure("p", reqs)
+    # agreement (all_gather) + [sync, reg, barrier] x 2 ; zeroing the fresh windows adds syncs inside backend.zero (not counted here)
+    seq = [e for e in ev if e in ("sync", "reg", "barrier")]
+    assert seq[:6] == ["sync", "reg", "barrier", "sync", "reg", "barrier"], seq
+    assert ("allgather",) in d2.calls
+    # explicit arguments beat the env
+    r3 = FusionResources(0, 4, dist=FakeDist(), backend=RealisticFirstFit(), window_bytes=4 << 20, max_windows=2, reg_barrier=False, reg_sync=False)
+    assert (r3.reg_barrier, r3.reg_sync) == (False, False)
+
+
+def test_shared_large_registers_one_shared_set_and_never_rezeroes_a_live_block(monkeypatch):
+    import random
+
+    from aiter.gemm_fusion.resources import FusionResources, SHARED_KEY
+
+    for var in ("AITER_GEMM_FUSION_PROFILE", "AITER_GEMM_FUSION_WINDOW_MIB"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "shared_large")
+    profmod.clear_profile_cache()
+    plans = _all_plans(monkeypatch)
+    random.Random(7).shuffle(plans)  # registration order must not matter
+    be, d = RealisticFirstFit(), FakeDist()
+    r = FusionResources(0, 4, dist=d, backend=be, profile=PROFILE)
+    assert r.policy == "shared_large" and be.heap == 4 << 30  # ~0.4 GiB registered: the minimum 4 GiB heap
+    zeros_before = None
+    for owner, rq in plans:
+        r.ensure(owner, rq)
+    MiB = 1 << 20
+    assert sorted(w.bytes // MiB for w in r._regs) == [4] * 12 + [4, 164, 164]  # 12 small windows + shared C(4) S(164) R(164)
+    sizes = [w.bytes for w in r._regs]
+    assert sum(sizes) == 380 * MiB and r.budget()["shared_bytes"] == 332 * MiB
+    large_owners = [o for o, _ in plans if o.startswith("sp_qkv.large/")]
+    assert len(large_owners) == 9
+    s_objs = {id(r.windows[o][o + "/S"]) for o in large_owners}
+    r_objs = {id(r.windows[o][o + "/R"]) for o in large_owners}
+    c_objs = {id(r.windows[o][o + "/C"]) for o in large_owners}
+    assert len(s_objs) == len(r_objs) == len(c_objs) == 1 and len({*s_objs, *r_objs, *c_objs}) == 3  # ALL large plans use the same S, R and C
+    assert all(r.windows[o][o + "/S"].shared for o in large_owners)
+    # small plans keep their own windows
+    small_owners = [o for o, _ in plans if o.startswith("sp_qkv.small/")]
+    assert all(not w.shared for o in small_owners for w in r.windows[o].values())
+    # a LIVE shared control block must not be zeroed when another owner is ensured later
+    ctl = r._shared["sp_qkv.large/C"]
+    zeros = []
+    be.zero = lambda dev, loc, n: zeros.append(loc)
+    r.ensure("sp_qkv.large/dense/M9999", [WindowReq("sp_qkv.large/dense/M9999/S", 40 << 20, "p2p_window", share="sp_qkv.large/S", min_bytes=40 << 20),
+                                          WindowReq("sp_qkv.large/dense/M9999/R", 40 << 20, "p2p_window", share="sp_qkv.large/R", min_bytes=40 << 20),
+                                          WindowReq("sp_qkv.large/dense/M9999/C", 40 << 20, "control", share="sp_qkv.large/C", min_bytes=8192)])
+    assert zeros == [] and ctl.local not in zeros  # nothing was zeroed: all three windows already existed
+    # reset zeroes every registered window exactly once, release deregisters every handle exactly once
+    r.finalize()
+    zeros.clear()
+    r.quiesce_and_reset()
+    assert len(zeros) == len(r._regs) == 15 and len(set(zeros)) == 15
+    be.log.clear()
+    r.release()
+    dereg = [x[1] for x in be.log if x[0] == "dereg"]
+    assert len(dereg) == 15 and len(set(dereg)) == 15
+
+
+def test_shared_large_overflow_and_first_request_sizing(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources, ResourceError
+
+    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
+    profmod.clear_profile_cache()
+    r = FusionResources(0, 4, policy="shared_large", dist=FakeDist(), backend=RealisticFirstFit())  # no budget: first request sizes the group
+    mk = lambda o, b: [WindowReq(o + "/S", b, "p2p_window", share="g/S", min_bytes=b)]  # noqa: E731
+    r.ensure("a", mk("a", 40 << 20))
+    assert r._shared["g/S"].bytes == 40 << 20
+    r.ensure("b", mk("b", 8 << 20))  # smaller plans fit the shared window
+    with pytest.raises(ResourceError, match="shared window 'g/S'.*exceeds"):
+        r.ensure("c", mk("c", 41 << 20))
+
+
+def test_shared_set_hooks_are_registered_once_and_later_contexts_do_not_reinit(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources
+
+    r = FusionResources(0, 4, dist=FakeDist(), backend=FakeBackend(), window_bytes=4 << 20, max_windows=1)
+    calls = []
+    assert r.set_shared_hooks(init=lambda: calls.append("init1"), drain=lambda: calls.append("drain1"), poison=lambda: 0) is True
+    assert calls == ["init1"]  # the first context initialises the live-to-be block
+    assert r.set_shared_hooks(init=lambda: calls.append("init2"), drain=lambda: calls.append("drain2"), poison=lambda: 5) is False
+    assert calls == ["init1"]  # the second attach did NOT run init on the (possibly live) block
+    r.finalize()
+    r.quiesce_and_reset()
+    assert calls == ["init1", "drain1", "init1"]  # one drain + one init per reset, from the FIRST context only
+    assert r.poison_local() == 0  # the first context's poison read is the one registered
+
+
+def test_policy_memory_table_and_budget_accounting_logged(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources, policy_memory_table
+
+    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
+    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "shared_large")
+    wb = dict(profmod.load_profile(PROFILE).meta["window_budget"])
+    tbl = policy_memory_table(wb)
+    MiB = 1 << 20
+    assert tbl["uniform"] == 39 * 164 * MiB and tbl["shared_large"] == 380 * MiB
+    assert 2400 * MiB < tbl["per_owner"] < 2700 * MiB and tbl["aligned"] >= tbl["per_owner"]  # per_owner ~2.5 GiB
+    assert tbl["shared_large"] < tbl["per_owner"] < tbl["uniform"]
+    msgs = []
+
+    class H(logging.Handler):
+        def emit(self, rec):
+            msgs.append(rec.getMessage())
+
+    lg = logging.getLogger("aiter.gemm_fusion")
+    h, old = H(level=logging.INFO), lg.level
+    lg.addHandler(h)
+    lg.setLevel(logging.INFO)
+    try:
+        profmod.clear_profile_cache()
+        r = FusionResources(0, 4, dist=FakeDist(), backend=RealisticFirstFit(), profile=PROFILE)
+        r.ensure("s", [WindowReq("rx", 100, "p2p_window")])
+        r.finalize()
+    finally:
+        lg.removeHandler(h)
+        lg.setLevel(old)
+    pm = [m for m in msgs if "event=resources policy_memory" in m]
+    assert pm and "selected=shared_large" in pm[0] and all(k in pm[0] for k in ("uniform=6396MiB", "per_owner=", "aligned=", "shared_large=380MiB"))
+    bm = [m for m in msgs if "event=resources budget" in m]
+    assert bm and "policy=shared_large" in bm[0] and "registered_bytes=4194304" in bm[0] and "peer_mapped_va_bytes=12582912" in bm[0]
+
+
+def test_late_registration_gate_agreement_and_capture_refusal(monkeypatch):
+    import types as _t
+
+    from aiter.gemm_fusion.resources import FusionResources, ResourceError
+
+    for var in ("AITER_GEMM_FUSION_LATE_REG", "AITER_GEMM_FUSION_REG_BARRIER", "AITER_GEMM_FUSION_PROFILE", "AITER_GEMM_FUSION_WINDOW_POLICY"):
+        monkeypatch.delenv(var, raising=False)
+    reqs = [WindowReq("a", 100, "p2p_window")]
+    r = FusionResources(0, 4, dist=FakeDist(), backend=RealisticFirstFit(), window_bytes=4 << 20, max_windows=2, policy="per_owner")
+    r.ensure("first", reqs)
+    r.finalize()
+    with pytest.raises(ResourceError, match="after finalize.*AITER_GEMM_FUSION_LATE_REG"):
+        r.ensure("late", reqs)  # default: refused (as before)
+    # allowed: no devcomm recreation, a barrier follows the registration, ranks agree first
+    d = FakeDist()
+    be = RealisticFirstFit()
+    r2 = FusionResources(0, 4, dist=d, backend=be, window_bytes=4 << 20, max_windows=2, policy="per_owner", late_registration=True)
+    r2.ensure("first", reqs)
+    r2.finalize()
+    devs = [x for x in be.log if x[0] == "dev"]
+    d.calls.clear()
+    w = r2.ensure("late", reqs)
+    assert "late" in r2.windows and w["a"].bytes == 4 << 20
+    assert [x for x in be.log if x[0] == "dev"] == devs  # NO devcomm recreation
+    assert ("allgather",) in d.calls and ("barrier",) in d.calls  # collective safety: agreement + barrier after the registration
+    # a rank that disagrees aborts every rank with a clear error
+    r3 = FusionResources(0, 4, dist=FakeDist(diverge_rank=2), backend=RealisticFirstFit(), window_bytes=4 << 20, max_windows=2, policy="per_owner", late_registration=True)
+    r3.finalize()
+    with pytest.raises(ResourceError, match="registration disagreement"):
+        r3.ensure("late", reqs)
+    # refused inside graph capture
+    fake = _t.ModuleType("torch")
+    fake.cuda = _t.SimpleNamespace(is_current_stream_capturing=lambda: True)
+    monkeypatch.setitem(sys.modules, "torch", fake)
+    r4 = FusionResources(0, 4, dist=FakeDist(), backend=RealisticFirstFit(), window_bytes=4 << 20, max_windows=2, policy="per_owner", late_registration=True, device=0)
+    r4.finalize()
+    with pytest.raises(ResourceError, match="refused inside graph capture"):
+        r4.ensure("late", reqs)
+
+
+def test_preflight_accepts_a_shared_set_and_still_rejects_unequal_per_owner(monkeypatch):
+    import hashlib
+    from types import SimpleNamespace as NS
+
+    from aiter.gemm_fusion import catalog
+    from aiter.gemm_fusion.resources import Window
+
+    monkeypatch.setattr(catalog, "_CATALOG", {})
+    catalog._CATALOG.clear()
+    sys.modules.pop("aiter.ops.gemm_fusion.sp_qkv.variants", None)
+    sys.modules.pop("aiter.ops.gemm_fusion.sp_qkv.variants_large", None)
+    import aiter.ops.gemm_fusion.sp_qkv.variants_large as vl
+
+    plan = _plan_for("dense", 8192, True)
+    b = plan.resources()[0].bytes
+    import tempfile, uuid, shutil
+    from pathlib import Path
+
+    tmp = Path(tempfile.gettempdir()) / ("pf2_" + uuid.uuid4().hex)
+    tmp.mkdir()
+    try:
+        h = tmp / "i.hsaco"
+        h.write_bytes(b"x")
+        built = NS(hsaco=str(h), hsaco_sha256=hashlib.sha256(b"x").hexdigest())
+        res = NS(rank=0, sdma_queues=1, devcomm_info={"lsaSize": 4, "lsaRank": 0, "sdmaNumQueue": 1, "worldSize": 4, "myNodeStart": 0})
+        mk = lambda n, k, by, sh: Window("<shared>" if sh else plan.owner, plan.owner + n, k, by, 11, 4096, shared=sh)  # noqa: E731
+        shared = {plan.owner + "/S": mk("/S", "p2p_window", b, True), plan.owner + "/R": mk("/R", "p2p_window", b, True), plan.owner + "/C": mk("/C", "control", 4 << 20, True)}
+        vl.preflight_attach(res, plan.owner, 2048, shared, built)  # S=R=164 MiB, C=4 MiB: fine when SHARED
+        unshared = {k: Window(plan.owner, k, "control" if k.endswith("C") else "p2p_window", by.bytes, 11, 4096) for k, by in shared.items()}
+        with pytest.raises(RuntimeError, match="windows must be equal size"):
+            vl.preflight_attach(res, plan.owner, 2048, unshared, built)  # the per-owner convention is still enforced
+        bad = dict(shared)
+        bad[plan.owner + "/C"] = mk("/C", "control", 4096, True)
+        with pytest.raises(RuntimeError, match="shared control window"):
+            vl.preflight_attach(res, plan.owner, 2048, bad, built)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---- A1 audit (CPU): the vendored r11 large kernel keeps NO plan-specific epoch/target state in kernargs; the control protocol is plan-independent
+def _r11(*parts):
+    return open(os.path.join(jit.CSRC, "large", "r11", *parts), encoding="utf-8").read()
+
+
+def test_A1_audit_remote_targets_and_epoch_come_from_the_device_not_kernargs():
+    import re
+
+    abi = _r11("interface", "lg_comm_abi_v2.h")
+    struct = abi[abi.index("struct LgCommArgsV2"):abi.index("};", abi.index("struct LgCommArgsV2"))]
+    members = re.findall(r"^\s*(?:const\s+)?[\w:<>\*]+\s+\**(\w+)(?:\[\d+\])?\s*;", struct, re.M)
+    assert not [m for m in members if re.search(r"epoch|credit|arrival|^ep$|state", m, re.I)], members  # no epoch/credit/arrival kernarg
+    assert {"Swin", "Rwin", "Cwin", "M", "F", "chunks", "rank"} <= set(members)
+    dev = _r11("device", "lg_comm_device.hpp") + _r11("device", "lg_r6x.hpp")
+    assert "ld_u64(cw(a, LGC_EP_OFF))" in dev  # epoch is READ from the control window at launch
+    assert dev.count("cw_peer(a, ") >= 3 and "ccoGetLsaPeerPtr(a.Cwin, peer, off)" in dev  # remote control targets: from the window handle + peer rank
+    assert "a.Rwin" in dev and "a.Swin" in dev  # remote data targets: from the window handles
+    assert re.search(r"slot\s*=\s*2ull\s*\*\s*a\.M\s*\*\s*a\.F", dev)  # data layout derives from per-launch M and F, not from the window
+    # the control layout constants do not depend on the build (dense vs indexer) or on M: sharing one block across builds is layout-compatible
+    offs = re.findall(r"#define\s+LGC_\w+_OFF\s+([^\n/]+)", abi)
+    assert offs and not [o for o in offs if "LG_X_INDEXER" in o or "LG_COMM_F" in o or "a." in o]
+    # per-epoch device reset covers every plan: 4 x LG_MAX_CHUNKS words, and LG_MAX_CHUNKS covers the largest plan (M=8192 -> 32 chunks)
+    assert re.search(r"#define\s+LG_MAX_CHUNKS\s+32u", abi) and "4 * static_cast<int>(LG_MAX_CHUNKS)" in dev
+    assert max(T // 4 // 256 for (_m, T) in specs.LARGE_CELLS) == 32
+
+
+def test_A1_audit_host_launch_args_are_per_plan_but_target_windows_are_handles():
+    """What IS per plan in the captured kernarg block (M, N, F, chunks, plan code, grid) is consistent within ONE launch; the window arguments
+    are the shared handles (c->S / c->R / c->C); nothing epoch- or address-like is baked."""
+    import re
+
+    drv = _r11("host", "lg_comm_driver.cpp")
+    launch = drv[drv.index("int32_t lg_comm_launch"):]
+    launch = launch[:launch.index("// Control/report readback")]
+    assert "a.Swin = c->S; a.Rwin = c->R; a.Cwin = c->C;" in launch  # windows enter the kernel as the context's handles
+    assert "a.M = c->M" in launch and "a.F = LG_COMM_F" in launch and "a.chunks = c->M / LG_CHUNK_ROWS" in launch  # per-plan layout constants
+    assert "a.reserved[0] = LG_R6_PLAN_CODE_N(npp, hg)" in launch  # plan code: build/host agreement check only
+    assert not re.search(r"a\.(epoch|ep|credit|arrival)\b", launch)  # no epoch/credit/arrival is passed by value
+    # the context itself carries no epoch either
+    ctx = drv[drv.index("struct LgCommCtx"):drv.index("};", drv.index("struct LgCommCtx"))]
+    assert not re.search(r"epoch|\bep\b", ctx)

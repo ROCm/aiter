@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 
 @dataclass(frozen=True)
@@ -15,6 +15,11 @@ class WindowReq:
     name: str
     bytes: int
     kind: str  # "p2p_window" | "control" | "sdma_queue"
+    # Optional sharing tag: under the 'shared_large' policy every request with the same tag, from ANY owner, maps to ONE registered window.
+    # `min_bytes` is the real requirement used for a shared window (defaults to `bytes`); `bytes` keeps the equal-size-per-plan convention
+    # of the per-owner policies. Policies other than shared_large ignore both fields.
+    share: Optional[str] = None
+    min_bytes: Optional[int] = None
 
 
 class Plan:

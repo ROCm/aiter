@@ -48,8 +48,15 @@ def window_budget():
     large = {(mode, T // WORLD): variants_large.large_window_bytes(mode, T // WORLD) for (mode, T) in specs.LARGE_CELLS}
     wb = max(list(small.values()) + list(large.values()))
     sizes = sorted([s for s in small.values() for _ in range(2)] + [s for s in large.values() for _ in range(3)], reverse=True)
+    from . import variants_large as vl
+
+    small_sizes = sorted([s for s in small.values() for _ in range(2)], reverse=True)
+    sr = max(large.values())
+    shared = {vl.SHARE_S: sr, vl.SHARE_R: sr, vl.SHARE_C: round_up(vl.LG_CONTROL_MIN_BYTES)}
     return {"window_bytes": wb, "max_windows": 2 * len(small) + 3 * len(large), "small_owners": len(small), "large_owners": len(large),
-            "window_sizes": sizes}
+            "window_sizes": sizes, "small_window_sizes": small_sizes, "large_owner_bytes": sorted(large.values(), reverse=True),
+            # policy shared_large: ONE shared S, R (max large plan) and C (control) used by every large plan; small plans keep per-owner windows
+            "shared": shared, "shared_large_total_bytes": sum(small_sizes) + sum(shared.values())}
 
 
 def build_profile():

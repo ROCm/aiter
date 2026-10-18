@@ -30,6 +30,8 @@ from .jit import build_large, large_defs
 from .small_rt import stream_handle
 
 _F = {"dense": 2304, "indexer": 2560, "reuse": 2304}
+LG_CONTROL_MIN_BYTES = 8192  # control window image (LGC_STATE_OFF + state words); the device code never addresses beyond it with LG_STAMPS=0
+SHARE_S, SHARE_R, SHARE_C = "sp_qkv.large/S", "sp_qkv.large/R", "sp_qkv.large/C"  # share tags (policy shared_large maps all large plans onto these)
 LG_R_PAD = 4096
 LGC_STAMP_OFF = 65536
 
@@ -58,12 +60,18 @@ def preflight_attach(res, owner: str, M: int, wins, built):
         if info.get("sdmaNumQueue") != 1:
             raise RuntimeError(f"preflight {owner}: devcomm sdmaNumQueue={info.get('sdmaNumQueue')} but the r11 kernels need 1 "
                                f"(requested {getattr(res, 'sdma_queues', '?')})")
+    shared = all(getattr(wins.get(owner + k), "shared", False) for k in ("/S", "/R", "/C"))
     for k in ("/S", "/R", "/C"):
         w = wins.get(owner + k)
         if w is None or not w.handle or not w.local:
             raise RuntimeError(f"preflight {owner}: window {owner + k} missing/NULL (handle={getattr(w, 'handle', None)}, local={getattr(w, 'local', None)})")
-        if w.bytes != wins[owner + "/S"].bytes:
+        if not shared and w.bytes != wins[owner + "/S"].bytes:  # per-owner policies keep the equal-size convention; a SHARED set is S=R=max plan, C=control
             raise RuntimeError(f"preflight {owner}: windows must be equal size (S={wins[owner + '/S'].bytes}, {k[1:]}={w.bytes})")
+    if shared:
+        if wins[owner + "/S"].bytes != wins[owner + "/R"].bytes:
+            raise RuntimeError(f"preflight {owner}: shared S and R must be equal (S={wins[owner + '/S'].bytes}, R={wins[owner + '/R'].bytes})")
+        if wins[owner + "/C"].bytes < LG_CONTROL_MIN_BYTES:
+            raise RuntimeError(f"preflight {owner}: shared control window {wins[owner + '/C'].bytes} B < {LG_CONTROL_MIN_BYTES} B")
     need = large_window_bytes(_mode_from_owner(owner), M)
     if wins[owner + "/S"].bytes < need:
         raise RuntimeError(f"preflight {owner}: window {wins[owner + '/S'].bytes} B < required {need} B")
@@ -113,8 +121,12 @@ class SpQkvLarge(Plan):
 
     def resources(self) -> List[WindowReq]:
         b = large_window_bytes(self.mode, self.M)
-        return [WindowReq(self.owner + "/S", b, "p2p_window"), WindowReq(self.owner + "/R", b, "p2p_window"),
-                WindowReq(self.owner + "/C", b, "control"), WindowReq(self.owner + "/q", 0, "sdma_queue")]
+        # bytes = the per-owner equal-size convention (unchanged for uniform / per_owner / aligned); share + min_bytes serve policy shared_large:
+        # ONE S and ONE R sized to the largest large plan and ONE control window used by every large plan.
+        return [WindowReq(self.owner + "/S", b, "p2p_window", share=SHARE_S, min_bytes=b),
+                WindowReq(self.owner + "/R", b, "p2p_window", share=SHARE_R, min_bytes=b),
+                WindowReq(self.owner + "/C", b, "control", share=SHARE_C, min_bytes=LG_CONTROL_MIN_BYTES),
+                WindowReq(self.owner + "/q", 0, "sdma_queue")]
 
     def _context(self, res):
         sc = res.__dict__.setdefault("_sp_qkv_large", {})
@@ -149,10 +161,18 @@ class SpQkvLarge(Plan):
                                    f"hsaco={built.hsaco} sha256={built.hsaco_sha256} devcomm_queues={getattr(res, 'sdma_queues', '?')} "
                                    f"devcomm_info={getattr(res, 'devcomm_info', None)}")
             got = sc[self.owner] = lrt.LargeContext(lib, C.c_void_p(h), self.M, self.F, res.rank)
-            res.set_close(self.owner, got.close)  # L-5
-            res.set_poison(self.owner, lambda c=got: c.poison(stream_handle(None)))  # cheap per-step check on the CURRENT torch stream (4-byte D2H + that stream sync)
-            res.set_drain(self.owner, lambda c=got: c.drain_all(C.c_void_p(None)))  # A2-H: quietQueue on all peer queues before any reset
-            res.set_init(self.owner, got.init_control)  # epoch=1 + magic; re-run after every reset
+            res.set_close(self.owner, got.close)  # L-5 (per context: each frees its own module/ctx)
+            hooks = dict(poison=lambda c=got: c.poison(stream_handle(None)),  # cheap per-step check on the CURRENT torch stream (4-byte D2H + that stream sync)
+                         drain=lambda c=got: c.drain_all(C.c_void_p(None)),  # A2-H: quietQueue on all peer queues before any reset
+                         init=got.init_control)  # epoch=1 + magic; re-run after every reset
+            if getattr(Cw, "shared", False):
+                # ONE control block for every large plan: its init/drain/poison are registered ONCE (by the first context that attaches). A later
+                # context attaching to the already LIVE block must not run init_control (that would reset the epoch on this rank only).
+                res.set_shared_hooks(init=hooks["init"], drain=hooks["drain"], poison=hooks["poison"])
+            else:
+                res.set_poison(self.owner, hooks["poison"])
+                res.set_drain(self.owner, hooks["drain"])
+                res.set_init(self.owner, hooks["init"])
         self._ctx = got
         return got
 
