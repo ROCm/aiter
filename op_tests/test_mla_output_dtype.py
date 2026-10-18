@@ -155,7 +155,11 @@ def test_direct_stage1_rejects_unsupported_output_dtype(dtype_name, entrypoint):
         f"m['_check_direct_rejection']({dtype_name!r}, {entrypoint!r})"
     )
     result = subprocess.run(
-        [sys.executable, "-c", script], capture_output=True, text=True, timeout=600
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
     )
     assert result.returncode == 0, (
         f"{entrypoint}/{dtype_name}: exit {result.returncode}\n"
