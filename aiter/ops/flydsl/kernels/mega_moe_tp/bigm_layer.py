@@ -157,7 +157,7 @@ def compile_bigm_layer(
     tailq: int = 1,
     act: str = "swiglu",
 ):
-    """act: the units' activation ("swiglu", "silu"); E routed experts 128 or 256 (+ the shared one).
+    """act: the units' activation ("swiglu", "silu"); E < 512 routed experts (+ the shared one).
     tailq (io): 0 no tail, 1 the tail with the q gather, 2 the local tail (this rank's q rows),
     3 no tail, y of every rank's rows (bf16, the "q" region: the y gather of the ar mode).
     The MoE interface (MegaMoeTP.forward, ag_rs): the caller's normed own rows x [m, H] and their
@@ -170,7 +170,10 @@ def compile_bigm_layer(
         sorted(locals().items())
     )  # every compile argument (the disk cache key, _bigm_cached)
     K1, NE = K + 1, E + 1
-    PIT = H // 8 // NTH
+    HV = H // 8  # 16 B (8 bf16) columns of a row
+    PIT = -(
+        -HV // NTH
+    )  # row iterations per thread (the last one partial unless NTH | HV)
     # per-expert ctrl / LDS entries (one thread per expert, NEB rounds of NTH)
     NEB = -(-NE // NTH)
     NES = NEB * NTH
@@ -236,8 +239,8 @@ def compile_bigm_layer(
     if tailq == 3:
         PPC[QS] = 0  # the y gather: bf16 rows on QQ, no scales
     ZX = 16  # io: rows per input item (quant + routing copy)
-    assert H % (8 * NTH) == 0 and E % 64 == 0 and E // 64 in (2, 4) and K <= 64
-    EPL = E // 64
+    assert H % 256 == 0 and 0 < E < 512 and K <= 64
+    EPL = -(-E // 64)  # experts per lane of the plan's wave
     # int8 rows of the attention / MoE-output RS: one fp32 scale per 32 values
     RB = H + (H // 32) * 4
     SCO = H
@@ -261,8 +264,27 @@ def compile_bigm_layer(
     LH = LBASE + 128  # [NE] histogram / ranks
     LB2 = LH + 4 * NES  # [NE] bases
     LP = LB2 + 4 * NES  # [SRT * K1] route positions of a sort item ([NE] plan scratch)
-    LDS_BYTES = LP + max(4 * SRT * K1, 64 + 4 * NE) + 64
+    LDS_BYTES = LP + max(4 * SRT * K1, 64 + 4 * max(NE, 64 * EPL)) + 64
     assert LDS_BYTES <= 160 * 1024 // CPU, LDS_BYTES  # CPU CTAs per CU
+
+    def cpart(kk):  # row iteration kk is the partial last one
+        return HV % NTH != 0 and kk == PIT - 1
+
+    def col(tid, kk):
+        """this thread's column of row iteration kk; past the row (a partial last iteration) the
+        same lane of the last full 4-column group: those threads redo its loads, math and stores
+        (identical values, its per-32 scales included)"""
+        p = tid + i32(kk * NTH)
+        if not cpart(kk):
+            return p
+        return (p < i32(HV)).select(p, i32(HV - 4) + (p & i32(3)))
+
+    def at_col(
+        base, tid, kk
+    ):  # base + this thread's first element (bf16) of iteration kk
+        if not cpart(kk):
+            return base + tid * i32(8) + i32(kk * NTH * 8)
+        return base + col(tid, kk) * i32(8)
 
     def fb(v):
         return f"{struct.unpack('<I', struct.pack('<f', v))[0]:x}"
@@ -753,8 +775,7 @@ def compile_bigm_layer(
                 [
                     bld(
                         r_part,
-                        ((o + i0 + i32(ii)) * i32(H) + (tid + i32(kk * NTH)) * i32(8))
-                        * i32(2),
+                        ((o + i0 + i32(ii)) * i32(H) + col(tid, kk) * i32(8)) * i32(2),
                         0,
                         T.vec(4, T.i32),
                     )
@@ -783,7 +804,7 @@ def compile_bigm_layer(
             for ii in range_constexpr(ZX):
                 row0 = B + rank * s + i0 + i32(ii)
                 for kk in range_constexpr(PIT):
-                    p = tid + i32(kk * NTH)
+                    p = col(tid, kk)
                     y = bf16x8_to_f32(ld[ii][kk])
                     am = amax(y)
                     am = am.maximumf(am.shuffle_xor(i32(1), i32(64)))
@@ -941,23 +962,35 @@ def compile_bigm_layer(
                     for x in range_constexpr(8):
                         lds_st(L, i32(LP + 4 * x), ky[x] >> i32(3))
             gpu.barrier()
-            if tid < i32(E):
-                c = lds_ld_i32(L, i32(LH) + tid * i32(4))
-                off = lds_ld_i32(L, i32(LB2) + tid * i32(4))
-                nu = (c + i32(RG - 1)) // i32(RG)
-                qb = lds_ld_i32(L, i32(LEQ) + tid * i32(4))
-                spr = qb < i32(0)
-                g0 = qb & i32(0x7FFFFFFF)
-                x_ = qb & i32(0xFF)
-                b0 = (qb >> i32(8)) & i32(0xFFFFFF)
-                for u_ in range(i32(0), nu, i32(1)):
-                    u = i32(u_)
-                    xs = spr.select((g0 + u) % i32(8), x_)
-                    slot = fx.min(spr.select((g0 + u) // i32(8), b0 + u), ucap - i32(1))
-                    ent = ((k * i32(8) + xs) * ucap + slot) * i32(16)
-                    bst(tid, rut, ent, 0, AUX_SYS)
-                    bst(off + u * i32(RG), rut, ent + i32(4), 0, AUX_SYS)
-                    bst(fx.min(c - u * i32(RG), i32(RG)), rut, ent + i32(8), 0, AUX_SYS)
+            for b_ in range_constexpr(
+                -(-E // NTH)
+            ):  # (one round per NTH routed experts)
+                e = tid if b_ == 0 else tid + i32(b_ * NTH)
+                if e < i32(E):
+                    c = lds_ld_i32(L, i32(LH) + e * i32(4))
+                    off = lds_ld_i32(L, i32(LB2) + e * i32(4))
+                    nu = (c + i32(RG - 1)) // i32(RG)
+                    qb = lds_ld_i32(L, i32(LEQ) + e * i32(4))
+                    spr = qb < i32(0)
+                    g0 = qb & i32(0x7FFFFFFF)
+                    x_ = qb & i32(0xFF)
+                    b0 = (qb >> i32(8)) & i32(0xFFFFFF)
+                    for u_ in range(i32(0), nu, i32(1)):
+                        u = i32(u_)
+                        xs = spr.select((g0 + u) % i32(8), x_)
+                        slot = fx.min(
+                            spr.select((g0 + u) // i32(8), b0 + u), ucap - i32(1)
+                        )
+                        ent = ((k * i32(8) + xs) * ucap + slot) * i32(16)
+                        bst(e, rut, ent, 0, AUX_SYS)
+                        bst(off + u * i32(RG), rut, ent + i32(4), 0, AUX_SYS)
+                        bst(
+                            fx.min(c - u * i32(RG), i32(RG)),
+                            rut,
+                            ent + i32(8),
+                            0,
+                            AUX_SYS,
+                        )
             gpu.barrier()
             if tid < i32(8):
                 g_st_sys(
@@ -1133,7 +1166,7 @@ def compile_bigm_layer(
                                 bld(
                                     rx,
                                     ((w0 + i32(ii)) * i32(K1) + i32(t)) * i32(H)
-                                    + (tid + i32(kk * NTH)) * i32(8),
+                                    + col(tid, kk) * i32(8),
                                     0,
                                     T.vec(2, T.i32),
                                     CAUX,
@@ -1142,7 +1175,7 @@ def compile_bigm_layer(
                                     rx,
                                     nrt_ * i32(H)
                                     + ((w0 + i32(ii)) * i32(K1) + i32(t)) * i32(H // 32)
-                                    + (tid + i32(kk * NTH)) // i32(4),
+                                    + col(tid, kk) // i32(4),
                                     0,
                                     T.i8,
                                     CAUX,
@@ -1157,9 +1190,11 @@ def compile_bigm_layer(
                         bld(
                             rx,
                             (
-                                ((w0 + i32(ii)) * i32(K1) + i32(t)) * i32(H)
-                                + tid * i32(8)
-                                + i32(kk * NTH * 8)
+                                at_col(
+                                    ((w0 + i32(ii)) * i32(K1) + i32(t)) * i32(H),
+                                    tid,
+                                    kk,
+                                )
                             )
                             * i32(2),
                             0,
@@ -1175,7 +1210,7 @@ def compile_bigm_layer(
                 wrow = w0 + i32(ii)
                 vt = [rvalid(wrow, t) for t in range(K1)]
                 for kk in range_constexpr(PIT):
-                    p = tid + i32(kk * NTH)
+                    p = col(tid, kk)
                     acc = [fx.Float32(0.0)] * 8
                     for t in range_constexpr(K1):
                         v = (
@@ -1210,10 +1245,12 @@ def compile_bigm_layer(
                             bld(
                                 rx,
                                 (
-                                    ((w0 + i32(sbi * ZQ + ii)) * i32(K1) + i32(t))
-                                    * i32(H)
-                                    + tid * i32(8)
-                                    + i32(kk * NTH * 8)
+                                    at_col(
+                                        ((w0 + i32(sbi * ZQ + ii)) * i32(K1) + i32(t))
+                                        * i32(H),
+                                        tid,
+                                        kk,
+                                    )
                                 )
                                 * i32(2),
                                 0,
@@ -1231,7 +1268,7 @@ def compile_bigm_layer(
                     own = pd == rank
                     vt = [rvalid(wrow, t) for t in range(K1)]
                     for kk in range_constexpr(PIT):
-                        p = tid + i32(kk * NTH)
+                        p = col(tid, kk)
                         acc = [fx.Float32(0.0)] * 8
                         for t in range_constexpr(K1):
                             v = bf16x8_to_f32(lds_[ii][kk][t])
@@ -1287,12 +1324,12 @@ def compile_bigm_layer(
                     lo = ((o + i) * i32(H)) * i32(2)
                     row = []
                     for kk in range_constexpr(PIT):
-                        off = lo + (tid + i32(kk * NTH)) * i32(16)
+                        off = lo + col(tid, kk) * i32(16)
                         row.append(
                             (
                                 bld(r_y, off, 0, T.vec(4, T.i32), CAUX),
                                 [
-                                    e_ld(rv, B + i32(src_) * s + i, tid + i32(kk * NTH))
+                                    e_ld(rv, B + i32(src_) * s + i, col(tid, kk))
                                     for src_ in range(tp)
                                 ],
                                 bld(r_res, off, 0, T.vec(4, T.i32), 0),
@@ -1306,7 +1343,7 @@ def compile_bigm_layer(
                     fs = []
                     ss = fx.Float32(0.0)
                     for kk in range_constexpr(PIT):
-                        off = lo + (tid + i32(kk * NTH)) * i32(16)
+                        off = lo + col(tid, kk) * i32(16)
                         ly, lr, lres = ld[ii][kk]
                         f = bf16x8_to_f32(ly)
                         for src_ in range_constexpr(tp):
@@ -1317,8 +1354,13 @@ def compile_bigm_layer(
                         f = [x + yy for x, yy in zip(f, bf16x8_to_f32(lres))]
                         f = [fx.Float32(x.to(fx.BFloat16).to(fx.Float32)) for x in f]
                         bst(pack_bf16x8(f), r_out, off, 0)
-                        for x in f:
-                            ss = ss + x * x
+                        if const_expr(cpart(kk)):  # (the redone columns count once)
+                            live = tid + i32(kk * NTH) < i32(HV)
+                            for x in f:
+                                ss = ss + live.select(x * x, fx.Float32(0.0))
+                        else:
+                            for x in f:
+                                ss = ss + x * x
                         fs.append(f)
                     fss.append(fs)
                     sss.append(ss.bitcast(fx.Int32))
@@ -1333,7 +1375,7 @@ def compile_bigm_layer(
                     )
                     xs_, am = [], fx.Float32(0.0)
                     for kk in range_constexpr(PIT):
-                        wv = norm_w(r_wnext, tid + i32(kk * NTH))
+                        wv = norm_w(r_wnext, col(tid, kk))
                         xk = [
                             fx.Float32(
                                 fx.Float32(gate_w(x * rcp, wk))
@@ -1355,7 +1397,7 @@ def compile_bigm_layer(
                     inv = one / scl
                     g = rank * m + o + i
                     for kk in range_constexpr(PIT):
-                        p = tid + i32(kk * NTH)
+                        p = col(tid, kk)
                         qv = [x * inv for x in xss[ii][kk]]
                         d = fx.Vector.from_elements(
                             [fp8x4_pack(qv[0:4], one), fp8x4_pack(qv[4:8], one)],
@@ -1417,20 +1459,19 @@ def compile_bigm_layer(
                 i = i0 + i32(ii)
                 lo = ((o + i) * i32(H)) * i32(2)
                 for kk in range_constexpr(PIT):
-                    off = lo + (tid + i32(kk * NTH)) * i32(16)
+                    off = lo + col(tid, kk) * i32(16)
                     f = bf16x8_to_f32(bld(r_y, off, 0, T.vec(4, T.i32), CAUX))
                     for src_ in range_constexpr(tp):
                         f = sum_live(
                             f,
-                            e_val(e_ld(rv, B + i32(src_) * s + i, tid + i32(kk * NTH))),
+                            e_val(e_ld(rv, B + i32(src_) * s + i, col(tid, kk))),
                             i32(src_) != rank,
                         )
                     if const_expr(tailq == 3):
                         bst(
                             pack_bf16x8(f),
                             ryg,
-                            (rank * m + o + i) * i32(H * 2)
-                            + (tid + i32(kk * NTH)) * i32(16),
+                            (rank * m + o + i) * i32(H * 2) + col(tid, kk) * i32(16),
                             0,
                             AUX_SYS,
                         )

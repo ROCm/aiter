@@ -137,14 +137,14 @@ class MegaMoeTP:
         situ = act == "situv2"
         self.cfg = cfg
         bmin = 8192 if cfg.bigm_min_tokens is None else cfg.bigm_min_tokens
-        # the shapes the big-M kernel takes: H % 2048, 128 / 256 routed experts (+ the
-        # shared / placeholder last one), topk - 1 <= 64, inter % 128 (else the small engine)
+        # the shapes the big-M kernel takes: H % 256, < 512 routed experts (+ the last one,
+        # counted apart), topk - 1 <= 64, inter % 128 (else the small engine)
         big_ok = (
             cfg.comm_mode in ("ag_rs", "ar")
             and cfg.activation in (ActivationType.Swiglu, ActivationType.Silu)
             and cfg.act_dtype == "fp4"
-            and cfg.model_dim % 2048 == 0
-            and cfg.experts - 1 in (128, 256)
+            and cfg.model_dim % 256 == 0
+            and 0 < cfg.experts - 1 < 512
             and cfg.topk - 1 <= 64
             and cfg.inter_dim % 128 == 0
         )
