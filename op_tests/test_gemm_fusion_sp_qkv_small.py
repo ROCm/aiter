@@ -2199,3 +2199,173 @@ def test_probe_abs_sequences_run_the_same_layout_engine_and_log_va(capsys):
     wp.run(wp.sequence("gate03_prefix"), 4 << 30, 0, 4, FakeDist(), be2, "gate03_prefix")
     out2 = capsys.readouterr().out
     assert out2.count("va=0x") == 5 and "va_mod_2MiB=0" in out2
+
+# ======================================================================= D14 r1e/r1f: ARENA (one registered window per comm, view structs, no kernel change)
+class ArenaBackend(AbsFirstFit):
+    """First-fit fake with window VIEW support: a view is (arena handle, offset); win_info returns what a device copy of ccoWindowDevice would hold."""
+
+    def __init__(self):
+        super().__init__(0)
+        self.views, self.freed = {}, []
+
+    def win_register(self, comm, n):
+        h, loc = super().win_register(comm, n)
+        self.arena_base = {h: loc}
+        return h, loc
+
+    def win_view(self, comm, arena_win, offset):
+        v = 0xA000 + len(self.views)
+        self.views[v] = (arena_win, offset)
+        return v
+
+    def win_view_free(self, comm, v):
+        self.freed.append(v)
+
+    def win_info(self, comm, w):
+        if w in self.views:
+            a, off = self.views[w]
+            return (self.arena_base[a] + off, 1, 0)
+        return (self.arena_base[w], 1, 0)
+
+
+def _arena_res(monkeypatch, policy="arena"):
+    from aiter.gemm_fusion.resources import FusionResources
+
+    for var in ("AITER_GEMM_FUSION_PROFILE", "AITER_GEMM_FUSION_ARENA_MIB", "AITER_GEMM_FUSION_ZERO_MODE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", policy)
+    profmod.clear_profile_cache()
+    be = ArenaBackend()
+    return FusionResources(0, 4, dist=FakeDist(), backend=be, profile=PROFILE), be
+
+
+def test_arena_registers_exactly_one_window_and_every_plan_window_is_a_view(monkeypatch):
+    r, be = _arena_res(monkeypatch, "arena")
+    plans = _all_plans(monkeypatch)
+    import random
+
+    random.Random(3).shuffle(plans)
+    for owner, rq in plans:
+        r.ensure(owner, rq)
+    assert len(be.regs) == 1 and len(r._regs) == 1 and r._spacers == []  # ONE registration: the only size the comm ever sees
+    A = r._arena
+    assert A.bytes == 380 * MiB == r._arena_bytes and r.policy == "arena"
+    # views: inside the arena, 4 MiB aligned, pairwise disjoint (shared set once), local = arena.local + offset
+    seen = {}
+    for w in r._views:
+        assert w.arena_offset % (4 * MiB) == 0 and w.bytes % (4 * MiB) == 0 and w.local == A.local + w.arena_offset
+        assert 0 <= w.arena_offset and w.arena_offset + w.bytes <= A.bytes
+        seen[w.arena_offset] = w.bytes
+    spans = sorted(seen.items())
+    assert all(a + n <= b for (a, n), (b, _m) in zip(spans, spans[1:]))  # disjoint
+    assert sum(seen.values()) == 380 * MiB  # 12 small + shared S/R/C fill the arena exactly: the budget is exact
+    # every large owner got the SAME three views; the view struct reproduces arena + offset for local and peer addressing (stride/lsaRank unchanged)
+    large = [o for o, _ in plans if o.startswith("sp_qkv.large/")]
+    S0 = r.windows[large[0]][large[0] + "/S"]
+    assert all(r.windows[o][o + "/S"] is S0 and r.windows[o][o + "/S"].shared for o in large)
+    base, stride, lsa = be.win_info(r.comm, S0.handle)
+    assert base == A.local + S0.arena_offset and (stride, lsa) == be.win_info(r.comm, A.handle)[1:]
+    # the arena is zeroed once, in finalize(); the launch guard sees it pending before
+    assert r.pending_zero == 1
+    r.finalize()
+    assert r.pending_zero == 0
+    # release: views freed (never deregistered), the arena deregistered exactly once
+    n_views = len(r._views)
+    be.log.clear()
+    r.release()
+    assert n_views == 15 == len(be.freed) == len(set(be.freed))  # 12 small views... + the 3 shared S/R/C views, each freed exactly once
+    assert len([x for x in be.log if x[0] == "dereg"]) == 1 and r._views == []  # the arena is the ONLY deregistered window
+
+
+def test_arena_per_owner_variant_and_overflow_and_collective_layout_check(monkeypatch):
+    from aiter.gemm_fusion.resources import FusionResources, ResourceError
+
+    r, be = _arena_res(monkeypatch, "arena_per_owner")
+    plans = _all_plans(monkeypatch)
+    for owner, rq in plans:
+        r.ensure(owner, rq)
+    assert len(be.regs) == 1 and r._arena_bytes == 2508 * MiB and r._arena_top <= r._arena_bytes
+    large = [o for o, _ in plans if o.startswith("sp_qkv.large/")]
+    assert len({r.windows[o][o + "/S"].arena_offset for o in large}) == 9 and all(not w.shared for o in large for w in r.windows[o].values())  # nothing shared
+    assert all(r.windows[o][o + "/S"].bytes == r.windows[o][o + "/R"].bytes == r.windows[o][o + "/C"].bytes for o in large)  # equal sizes per plan (preflight convention)
+    # overflow names the sizes and the knob
+    monkeypatch.setenv("AITER_GEMM_FUSION_ARENA_MIB", "8")
+    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "arena")
+    r2 = FusionResources(0, 4, dist=FakeDist(), backend=ArenaBackend(), profile=PROFILE)
+    with pytest.raises(ResourceError, match="arena overflow.*AITER_GEMM_FUSION_ARENA_MIB"):
+        for owner, rq in plans:
+            r2.ensure(owner, rq)
+    # peers addressing this arena at the same offsets: a rank that laid it out differently aborts every rank
+    monkeypatch.delenv("AITER_GEMM_FUSION_ARENA_MIB")
+    r3 = FusionResources(0, 4, dist=FakeDist(diverge_rank=1), backend=ArenaBackend(), profile=PROFILE)
+    with pytest.raises(ResourceError, match="registration disagreement|arena layout disagreement"):
+        r3.ensure(*plans[0])
+    # no profile and no knob: a clear error, never a guessed size
+    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
+    r4 = FusionResources(0, 4, dist=FakeDist(), backend=ArenaBackend(), policy="arena", window_bytes=4 * MiB, max_windows=1)
+    with pytest.raises(ResourceError, match="needs the arena size"):
+        r4.ensure(*plans[0])
+
+
+def test_arena_late_owner_needs_no_collective_registration_and_is_refused_in_capture(monkeypatch):
+    import types as _t
+
+    r, be = _arena_res(monkeypatch, "arena")
+    plans = _all_plans(monkeypatch)
+    r.ensure(*plans[0])
+    r.finalize()
+    n = len(be.regs)
+    r.ensure(*plans[1])  # after finalize(): allowed (a view struct is a local device allocation), no new registration, no G-late env needed
+    assert len(be.regs) == n == 1 and r.pending_zero == 0
+    fake = _t.ModuleType("torch")
+    fake.cuda = _t.SimpleNamespace(is_current_stream_capturing=lambda: True)
+    monkeypatch.setitem(sys.modules, "torch", fake)
+    from aiter.gemm_fusion.resources import ResourceError
+
+    with pytest.raises(ResourceError, match="refused inside graph capture"):
+        r.ensure(*plans[2])
+
+
+def test_native_view_struct_reads_only_what_the_kernels_read():
+    """(1) of the lead's question, as a CPU audit of the sources: the view is a plain device copy of ccoWindowDevice with winBase shifted; the vendored kernels
+    reach a window handle only through ccoGetLocalPtr / ccoGetLsaPeerPtr (winBase, stride4G, lsaRank); the small kernel resolves peer pointers on the host."""
+    import re
+
+    src = _host_src("gf_comm.cpp")
+    body = src[src.index("int32_t gf_win_view_v1"):src.index("int32_t gf_win_view_free_v1")]
+    assert "hipMemcpyDeviceToHost" in body and "h.winBase += offset" in body and "hipMalloc" in body and "hipMemcpyHostToDevice" in body
+    assert "ccoWindowDeregister" not in body  # a view is never registered with MORI
+    dev = ""
+    for root, _d, fns in os.walk(os.path.join(jit.CSRC, "large", "r11", "device")):
+        dev += "".join(open(os.path.join(root, f), encoding="utf-8").read() for f in fns if f.endswith((".hpp", ".cu", ".h")))
+    dev += open(os.path.join(jit.CSRC, "small", "r18", "device", "sk_gemm_fp8.cu"), encoding="utf-8").read()
+    assert not re.search(r"->\s*(winBase|stride4G|lsaRank|ibgdaWin)|\.ibgdaWin|findWindow|windowTable|resourceWindow", dev)  # no direct field access, no table lookups
+    users = set(re.findall(r"(ccoGetLocalPtr|ccoGetLsaPeerPtr)\(\s*(?:a|args)\.(Swin|Rwin|Cwin)", dev))
+    assert {"Swin", "Rwin", "Cwin"} <= {w for _f, w in users}  # the handles are used ONLY as the first argument of those two accessors
+    # no kernel source differs from the vendored accepted file (no kernel change): the vendored sources are unchanged since the vendoring commit
+
+def test_probe_arena_sequence_one_registration_and_view_checks(capsys):
+    from aiter.ops.gemm_fusion.sp_qkv import window_probe as wp
+
+    class B(ArenaBackend):
+        def uid(self, rank):
+            return b"u"
+
+        def comm_destroy(self, comm):
+            pass
+
+        def win_deregister(self, comm, w):
+            pass
+
+        def peer_ptr(self, comm, local, p):
+            return local + p * (4 << 30)
+
+    be = B()
+    be.heap = 8 << 30
+    ok = wp.run_arena("arena", 4 << 30, 0, 4, FakeDist(), be, "arena#0")
+    out = capsys.readouterr().out
+    assert ok and len(be.regs) == 1 and "registrations=1 views=15" in out and out.count("result=FAIL") == 0
+    assert out.count("view_winBase_ok=1 peer_ptrs_ok=1") == 15 and len(be.freed) == 15
+    assert wp.sequence("arena") == [380 * MiB] and wp.sequence("arena_per_owner") == [2508 * MiB]
+    be2 = B()
+    assert wp.run_arena("arena_per_owner", 8 << 30, 0, 4, FakeDist(), be2, "arena_per_owner#0") and len(be2.regs) == 1

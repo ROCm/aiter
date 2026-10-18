@@ -46,7 +46,9 @@ HEAP_SLACK_BYTES = 256 << 20  # ccoDevCommCreate allocates its own resource wind
 ENV_POLICY = "AITER_GEMM_FUSION_WINDOW_POLICY"  # "uniform" (default) | "per_owner"
 ENV_WINDOW_MIB = "AITER_GEMM_FUSION_WINDOW_MIB"  # override the uniform window size (MiB)
 ENV_ALIGN_CAP_MIB = "AITER_GEMM_FUSION_ALIGN_CAP_MIB"  # aligned policy: cap of the start alignment (default 256 MiB)
-POLICIES = ("uniform", "per_owner", "aligned", "shared_large", "abs_aligned")
+POLICIES = ("uniform", "per_owner", "aligned", "shared_large", "abs_aligned", "arena", "arena_per_owner")
+ARENA_ALIGN = 4 << 20  # sub-window offsets/sizes inside the arena are multiples of 4 MiB (the size every window used in the passing layouts was a multiple of)
+ENV_ARENA_MIB = "AITER_GEMM_FUSION_ARENA_MIB"  # arena policies: arena size override (MiB)
 ENV_ABS_ALIGN = "AITER_GEMM_FUSION_ABS_ALIGN"  # shared_large only: =0 disables the absolute-VA alignment / ordered pre-registration (A/B); default on
 ENV_SPACER_GRAN_MIB = "AITER_GEMM_FUSION_SPACER_GRAN_MIB"  # round spacer sizes up to this many MiB (default: the CCO granule G, 4 KiB)
 ABS_MIN_ALIGN = 2 << 20  # A(s) floor: 2 MiB
@@ -159,6 +161,10 @@ def policy_memory_table(budget: dict, align_cap: int = 256 << 20) -> Dict[str, i
     small = [int(x) for x in (budget.get("small_window_sizes") or [])]
     if sh and small:
         out["shared_large"] = sum(small) + sum(int(v) for v in sh.values())
+    if sh and small:
+        out["arena"] = sum(-(-int(v) // ARENA_ALIGN) * ARENA_ALIGN for v in sh.values()) + sum(-(-s // ARENA_ALIGN) * ARENA_ALIGN for s in small)
+    if sizes:
+        out["arena_per_owner"] = sum(-(-s // ARENA_ALIGN) * ARENA_ALIGN for s in sizes)
     for pol, key, fill in (("abs_aligned", "abs_aligned_ub", False), ("shared_large", "shared_large_abs_ub", True)):
         items = abs_items_from_budget(budget, pol)
         if items:
@@ -281,6 +287,7 @@ class Window:
     handle: object
     local: int  # local device pointer (int)
     shared: bool = False  # one registered window used by several owners (shared_large policy)
+    arena_offset: Optional[int] = None  # arena policies: this window is a VIEW at this byte offset inside the single registered arena window (handle = the view struct)
 
 
 class CcoBackend:
@@ -296,7 +303,8 @@ class CcoBackend:
         for n, a in [
             ("gf_uid_v1", [u32, vp]), ("gf_comm_create_v1", [u32, u32, i32, vp, u64, C.POINTER(vp)]),
             ("gf_win_register_v1", [vp, u64, C.POINTER(vp), C.POINTER(vp)]), ("gf_peer_ptr_v1", [vp, vp, i32, C.POINTER(vp)]),
-            ("gf_devcomm_create_v1", [vp, u32, C.POINTER(vp)]), ("gf_devcomm_info_v1", [vp, vp, C.POINTER(u64)]), ("gf_zero_v1", [i32, vp, u64, i32]), ("gf_mem_info_v1", [i32, C.POINTER(u64)]), ("gf_comm_va_info_v1", [vp, C.POINTER(u64)]), ("gf_device_sync_v1", [i32]),
+            ("gf_devcomm_create_v1", [vp, u32, C.POINTER(vp)]), ("gf_devcomm_info_v1", [vp, vp, C.POINTER(u64)]), ("gf_zero_v1", [i32, vp, u64, i32]), ("gf_mem_info_v1", [i32, C.POINTER(u64)]), ("gf_comm_va_info_v1", [vp, C.POINTER(u64)]),
+                     ("gf_win_view_v1", [vp, vp, u64, C.POINTER(vp)]), ("gf_win_view_free_v1", [vp, vp]), ("gf_win_info_v1", [vp, vp, C.POINTER(u64)]), ("gf_device_sync_v1", [i32]),
             ("gf_devcomm_destroy_v1", [vp, vp]), ("gf_win_deregister_v1", [vp, vp]), ("gf_comm_destroy_v1", [vp]),
         ]:
             f = getattr(lib, n)
@@ -350,6 +358,19 @@ class CcoBackend:
 
     def zero(self, device, local, nbytes):
         self._chk(self.lib.gf_zero_v1(device, local, nbytes, self._zero_method), "gf_zero")
+
+    def win_view(self, comm, arena_win, offset):
+        out = C.c_void_p()
+        self._chk(self.lib.gf_win_view_v1(comm, arena_win, offset, C.byref(out)), "gf_win_view")
+        return out.value
+
+    def win_view_free(self, comm, view):
+        self._chk(self.lib.gf_win_view_free_v1(comm, view), "gf_win_view_free")
+
+    def win_info(self, comm, win):
+        b = (C.c_uint64 * 3)()
+        self._chk(self.lib.gf_win_info_v1(comm, win, b), "gf_win_info")
+        return int(b[0]), int(b[1]), int(b[2])
 
     def va_info(self, comm):
         """(slot_base_va, per_rank_size, granule) of this rank's slot: where the first-fit allocator starts (absolute VA)."""
@@ -411,6 +432,10 @@ class FusionResources:
         if vmm_bytes is None:
             if self.policy == "uniform" and self.window_bytes:
                 vmm_bytes = heap_bytes_for(self.window_bytes, self.max_windows)
+            elif self.policy in ("arena", "arena_per_owner"):
+                g = 4 << 30
+                need = self._arena_size_from_budget() + HEAP_SLACK_BYTES
+                vmm_bytes = max(PER_RANK_VMM_BYTES, (need + g - 1) // g * g)
             elif self.policy in ("abs_aligned", "shared_large") and self.abs_align and abs_items_from_budget(self._budget_doc, self.policy):
                 g = 4 << 30
                 need = abs_layout_total_bytes(abs_items_from_budget(self._budget_doc, self.policy), fill_gaps=self.policy == "shared_large",
@@ -434,6 +459,10 @@ class FusionResources:
         self._regs: List[Window] = []  # every registered window exactly ONCE (shared windows appear once): zeroing / deregistration / accounting
         self._shared: Dict[str, Window] = {}  # share tag -> the one registered window
         self._reg_seq = 0  # number of registering ensure() calls (agreement check)
+        self._arena: Optional[Window] = None  # the ONE registered window of the comm (arena policies)
+        self._arena_bytes = 0
+        self._arena_top = 0  # bump pointer inside the arena (4 MiB aligned)
+        self._views: List[Window] = []  # every view struct handed out (freed before the arena is deregistered)
         self._va_top: Optional[int] = None  # ABSOLUTE local VA where the next slot will start (measured: previous local + aligned size)
         self._gran = 4096  # CCO granule G (hipMemGetAllocationGranularity RECOMMENDED; reported 4096)
         self._va_log: List[Tuple[str, str, int, int]] = []  # (owner, name, size, absolute local VA) of every registration, in order
@@ -571,6 +600,84 @@ class FusionResources:
             self._spacers.append((h, loc, pad))
 
     # -- absolute VA alignment (policies abs_aligned, shared_large) -------------------------------------------------
+    # -- ARENA (D14 r1e/r1f): ONE registered window per comm, sub-allocated by aiter; every plan window is a VIEW struct --------------
+    def _arena_size_from_budget(self) -> int:
+        """Arena bytes: AITER_GEMM_FUSION_ARENA_MIB, else the explicit profile budget (arena: shared S/R/C + small windows; arena_per_owner: every per-owner window)."""
+        env = os.environ.get(ENV_ARENA_MIB)
+        if env:
+            return round_up(int(env) << 20)
+        b = self._budget_doc or {}
+        if self.policy == "arena":
+            sh, small = b.get("shared") or {}, b.get("small_window_sizes") or []
+            if sh and small:
+                return sum(round_up(int(v)) for v in sh.values()) + sum(round_up(int(s)) for s in small)
+        else:
+            sizes = b.get("window_sizes") or []
+            if sizes:
+                return sum(round_up(int(s)) for s in sizes)
+        return 0
+
+    def _ensure_arena(self, late: bool) -> Window:
+        if self._arena is not None:
+            return self._arena
+        size = self._arena_size_from_budget()
+        if not size:
+            raise ResourceError(f"policy {self.policy!r} needs the arena size: construct FusionResources(profile=<profile with window_budget>) or set {ENV_ARENA_MIB}")
+        if late or self.reg_barrier or self.world > 1:
+            self._agree_registration("<arena>", [WindowReq("arena", size, "p2p_window")])
+        h, loc = self._register("<arena>", "arena", size)  # THE registration: a single window, first, never followed by another size
+        w = Window("<arena>", "arena", "p2p_window", size, h, loc, shared=True)
+        self._arena, self._arena_bytes, self._arena_top = w, size, 0
+        self._regs.append(w)
+        if self.zero_mode == "h2d_deferred" and not late:
+            self._unzeroed.append(w)
+        else:
+            self._zero_windows([w])
+        log.info("event=resources arena rank=%d policy=%s bytes=%d (%.1f MiB) local=%#x", self.rank, self.policy, size, size / (1 << 20), int(loc))
+        return w
+
+    def _arena_view(self, owner: str, name: str, kind: str, nbytes: int, share: Optional[str] = None) -> Window:
+        """Bump-allocate `nbytes` (4 MiB multiple) in the arena and return a Window whose handle is a VIEW struct and whose local is arena.local + offset."""
+        a = self._arena
+        size = -(-int(nbytes) // ARENA_ALIGN) * ARENA_ALIGN
+        off = self._arena_top
+        if off + size > self._arena_bytes:
+            raise ResourceError(f"arena overflow at {owner}/{name}: need {size} B at offset {off}, arena is {self._arena_bytes} B (policy {self.policy}; "
+                                f"size it via the profile window_budget or {ENV_ARENA_MIB})")
+        self._arena_top = off + size
+        view = self.backend.win_view(self.comm, a.handle, off)
+        w = Window(SHARED_KEY if share else owner, share or name, kind, size, view, int(a.local) + off, shared=bool(share), arena_offset=off)
+        self._views.append(w)
+        return w
+
+    def _arena_ensure(self, owner: str, wreqs, late: bool, wins: Dict[str, Window]):
+        self._ensure_arena(late)
+        if late:
+            self._refuse_inside_capture(owner)
+        # deterministic offsets: the shared set is laid out in the budget order (S, R, C) at its FIRST use, then owners bump in ensure() order; peers address
+        # this rank's arena at the SAME offsets, so the layout is verified collectively below.
+        for r in wreqs:
+            if self.policy == "arena" and r.share:
+                w = self._shared.get(r.share)
+                need = int(r.min_bytes if r.min_bytes is not None else r.bytes)
+                if w is None:
+                    # the shared set is sized from the profile's shared budget (the LARGEST large plan), never from whichever plan is ensured first
+                    budget = int(((self._budget_doc or {}).get("shared") or {}).get(r.share) or 0)
+                    if budget and need > budget:
+                        raise ResourceError(f"ensure({owner!r}): shared arena window {r.share!r} need {need} B exceeds the budgeted {budget} B")
+                    w = self._arena_view(owner, r.name, r.kind, budget or need, share=r.share)
+                    self._shared[r.share] = w
+                elif int(r.min_bytes if r.min_bytes is not None else r.bytes) > w.bytes:
+                    raise ResourceError(f"ensure({owner!r}): shared arena window {r.share!r} need exceeds its size {w.bytes} B")
+                wins[r.name] = w
+            else:
+                wins[r.name] = self._arena_view(owner, r.name, r.kind, round_up(max(x.bytes for x in wreqs)) if self.policy == "arena_per_owner" else r.bytes)
+        offs = tuple((n, w.arena_offset, w.bytes) for n, w in wins.items())
+        got = [None] * self.world
+        self.dist.all_gather_object(got, (self._reg_seq, owner, offs), group=self.group)
+        if any(g != got[0] for g in got):
+            raise ResourceError(f"arena layout disagreement across ranks at ensure({owner!r}): {got}; peers address this arena at identical offsets, fusion must be aborted")
+
     def _init_va(self):
         """Absolute VA where the first slot will start, from the comm (no registration needed). Backends without va_info: None (the first
         window is then registered unaligned and the alignment starts from its measured VA)."""
@@ -667,6 +774,16 @@ class FusionResources:
         if owner in self.windows:
             return self.windows[owner]
         late = self.finalized
+        if self.policy in ("arena", "arena_per_owner"):
+            # no collective REGISTRATION after the first one: a late owner only needs a device-memory view struct, so G-late is not required (and capture is refused)
+            wreqs0 = [r for r in reqs if r.kind in ("p2p_window", "control")]
+            wins0: Dict[str, Window] = {}
+            self._reg_seq += 1
+            if wreqs0:
+                self._arena_ensure(owner, wreqs0, late, wins0)
+            self._sdma = max([getattr(self, "_sdma", 0)] + [max(1, int(r.bytes)) for r in reqs if r.kind == "sdma_queue"])
+            self.windows[owner] = wins0
+            return wins0
         if late and not self.allow_late:
             raise ResourceError(
                 f"ensure({owner!r}) after finalize(): resolve every plan on every rank before finalize (collective ordering); "
@@ -947,7 +1064,10 @@ class FusionResources:
         self._barrier()
         if self.devcomm is not None:
             self.backend.devcomm_destroy(self.comm, self.devcomm)
-        for w in self._regs:  # each registered window once (a shared window is referenced by several owners)
+        for v in self._views:  # arena views are plain device allocations: freed BEFORE (and never deregistered like) the arena window
+            self.backend.win_view_free(self.comm, v.handle)
+        self._views.clear()
+        for w in self._regs:  # each registered window once (a shared window is referenced by several owners; the arena is the only registered window)
             self.backend.win_deregister(self.comm, w.handle)
         self._regs.clear()
         self._shared.clear()

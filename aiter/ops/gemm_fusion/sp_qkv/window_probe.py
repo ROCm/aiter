@@ -30,6 +30,7 @@ layout engine the abs_aligned / shared_large policies use (aiter.gemm_fusion.res
   abs_aligned_all   : the 39 per-owner windows of the real 15-plan sequence, LARGEST FIRST, plain spacers (policy abs_aligned)
   shared_large_abs  : the Architect's sequence: S(164) at a 256 MiB boundary, control + 12 small windows, a 40 MiB spacer, R(164) at the next 256 MiB boundary
   gate03_prefix     : the plain failing 4,4,4,4,40 (kept; every PROBE line now carries the absolute VA)
+  arena / arena_per_owner : D14 r1e/r1f: ONE registration (380 MiB / 2508 MiB) + the view structs the arena policy creates; checks each view's winBase and peer pointers
 Output lines: PROBE rank=R seq=S idx=I size=B cumulative=C [kind=spacer] va=0x.. va_mod_2MiB= va_mod_16MiB= va_mod_64MiB= va_mod_256MiB= result=OK|FAIL
 (abs sequences also print: PROBE_BASE slot_base=0x.. base_mod_2MiB= base_mod_256MiB=)
 Comparing sequences from ONE run isolates the failing condition without guessing (size vs. offset alignment vs. count vs. heap).
@@ -62,6 +63,59 @@ def real_sequence_sizes() -> List[int]:
 
 
 ABS_SEQUENCES = ("abs_aligned_gate03", "abs_aligned_all", "shared_large_abs")
+ARENA_SEQUENCES = ("arena", "arena_per_owner")  # D14 r1e/r1f: ONE registered window, then device-memory VIEW structs (no second registration of any size)
+
+
+def run_arena(kind: str, heap_bytes: int, rank: int, world: int, dist, backend, tag: str) -> bool:
+    """ONE registration (the arena, sized like the policy: 380 MiB shared design / 2508 MiB per-owner variant) followed by the view structs the policy would create
+    (shared S/R/C + the small windows / every per-owner window, 4 MiB aligned). Checks that every view struct reads back winBase = arena winBase + offset with unchanged
+    stride/lsaRank, that peer pointers of a view equal the arena's peer pointers + offset, then frees the views and deregisters the arena. A second registration is never issued."""
+    from aiter.gemm_fusion.resources import ARENA_ALIGN, policy_memory_table
+    import json, os as _os
+    from aiter.gemm_fusion.profile import load_profile, window_budget_of
+
+    wb = window_budget_of(load_profile(_os.environ.get("PROBE_PROFILE", "minimax_m3_sp4_gfx950_v1")))
+    size = policy_memory_table(wb)[kind]
+    if kind == "arena":
+        offs = [(s, "shared") for s in sorted((int(v) for v in wb["shared"].values()), reverse=True)] + [(int(s), "small") for s in wb["small_window_sizes"]]
+    else:
+        offs = [(int(s), "owner") for s in wb["window_sizes"]]
+    uid = [backend.uid(rank) if rank == 0 else None]
+    dist.broadcast_object_list(uid, src=0)
+    comm = backend.comm_create(rank, world, uid[0], heap_bytes, 0)
+    ok, views = True, []
+    try:
+        h, loc = backend.win_register(comm, size)
+        print(f"PROBE rank={rank} seq={tag} idx=0 size={size} cumulative={size} kind=arena {_va_fields(int(loc))} result=OK", flush=True)
+        off = 0
+        for i, (sz, role) in enumerate(offs, 1):
+            sz = -(-sz // ARENA_ALIGN) * ARENA_ALIGN
+            v = backend.win_view(comm, h, off)
+            views.append(v)
+            wbase, stride, lsa = backend.win_info(comm, v)
+            abase, astride, alsa = backend.win_info(comm, h)
+            good = wbase == abase + off and (stride, lsa) == (astride, alsa)
+            peers_ok = all(backend.peer_ptr(comm, int(loc) + off, p) == backend.peer_ptr(comm, int(loc), p) + off for p in range(world))
+            print(f"PROBE rank={rank} seq={tag} idx={i} size={sz} offset={off} role={role} view_winBase_ok={int(good)} peer_ptrs_ok={int(peers_ok)} result={'OK' if good and peers_ok else 'FAIL'}", flush=True)
+            ok &= good and peers_ok
+            off += sz
+        print(f"PROBE rank={rank} seq={tag} registrations=1 views={len(views)} arena_used={off} arena={size} result={'OK' if off <= size and ok else 'FAIL'}", flush=True)
+        ok &= off <= size
+    except Exception as e:  # noqa: BLE001
+        print(f"PROBE rank={rank} seq={tag} result=FAIL err={e}", flush=True)
+        ok = False
+    for v in views:
+        try:
+            backend.win_view_free(comm, v)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        backend.win_deregister(comm, h)
+        backend.comm_destroy(comm)
+    except Exception:  # noqa: BLE001
+        pass
+    dist.barrier()
+    return ok
 
 
 def abs_items(name: str):
@@ -81,6 +135,11 @@ def abs_items(name: str):
 
 
 def sequence(name: str, mib: str = "", n: int = 39, window_mib: int = 164) -> List[int]:
+    if name in ARENA_SEQUENCES:
+        from aiter.gemm_fusion.resources import policy_memory_table
+        from aiter.gemm_fusion.profile import load_profile, window_budget_of
+
+        return [policy_memory_table(window_budget_of(load_profile("minimax_m3_sp4_gfx950_v1")))[name]]
     if name in ABS_SEQUENCES:  # the SIZES (in the order of the plan); the actual registration order/spacers come from AbsLayout at run time
         return [s for s, _r in abs_items(name)[0]]
     if name == "phase1_equal":
@@ -295,6 +354,9 @@ def main(argv=None):
         dist.new_group(backend="nccl")
     ok = True
     for rep in range(a.repeat):
+        if a.sequence in ARENA_SEQUENCES:
+            ok &= run_arena(a.sequence, a.heap_gib << 30, rank, world, dist, CcoBackend(), f"{a.sequence}#{rep}")
+            continue
         lay = None
         if a.sequence in ABS_SEQUENCES:
             items, fill = abs_items(a.sequence)

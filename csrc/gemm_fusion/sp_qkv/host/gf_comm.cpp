@@ -79,6 +79,38 @@ int32_t gf_win_register_v1(void* comm, uint64_t bytes, void** out_win, void** ou
     *out_win = reinterpret_cast<void*>(win); *out_local = local;
     return OK;
 }
+// ---- window VIEW (arena sub-window), no kernel change. A ccoWindow_t is a DEVICE pointer to a ccoWindowDevice {winBase, stride4G, lsaRank, ibgdaWin}. The only device
+// readers in the shipped kernels are ccoGetLocalPtr / ccoGetLsaPeerPtr (and ccoSdma::put, which calls those two): winBase + ((peer|lsaRank) * stride4G << 32) + offset.
+// So a view = a plain device-memory COPY of the arena's struct whose winBase is shifted by `offset` (peer and local addresses then shift by the same offset, because
+// they are winBase + rank*perRankSize): every address the kernel derives from the view equals arena address + offset. The view is NOT registered with MORI (it must never be
+// passed to ccoWindowDeregister; the arena is the only registered window); it is freed with gf_win_view_free_v1 BEFORE the arena is deregistered. ibgdaWin is copied
+// unchanged (cross-node/GDA only; the single-node LSA kernels never read it).
+int32_t gf_win_view_v1(void* comm, void* arena_win, uint64_t offset, void** out_view) {
+    if (!comm || !arena_win || !out_view) return E_ARG;
+    gf::DeviceScope scope(comm_dev(comm));
+    mori::cco::ccoWindowDevice h{};
+    if (hipMemcpy(&h, arena_win, sizeof h, hipMemcpyDeviceToHost) != hipSuccess) return E_HIP;
+    h.winBase += offset;
+    void* d = nullptr;
+    if (hipMalloc(&d, sizeof h) != hipSuccess) return E_HIP;
+    if (hipMemcpy(d, &h, sizeof h, hipMemcpyHostToDevice) != hipSuccess) { hipFree(d); return E_HIP; }
+    *out_view = d;
+    return OK;
+}
+int32_t gf_win_view_free_v1(void* comm, void* view) {
+    if (!comm || !view) return E_ARG;
+    gf::DeviceScope scope(comm_dev(comm));
+    return hipFree(view) == hipSuccess ? OK : E_HIP;
+}
+// Readback for verification: out[0] = winBase, out[1] = stride4G, out[2] = lsaRank of a window handle (arena or view).
+int32_t gf_win_info_v1(void* comm, void* win, uint64_t* out3) {
+    if (!comm || !win || !out3) return E_ARG;
+    gf::DeviceScope scope(comm_dev(comm));
+    mori::cco::ccoWindowDevice h{};
+    if (hipMemcpy(&h, win, sizeof h, hipMemcpyDeviceToHost) != hipSuccess) return E_HIP;
+    out3[0] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(h.winBase)); out3[1] = h.stride4G; out3[2] = static_cast<uint64_t>(h.lsaRank);
+    return OK;
+}
 int32_t gf_peer_ptr_v1(void* comm, void* local, int32_t peer, void** out) {
     if (!comm || !local || !out) return E_ARG;
     gf::DeviceScope scope(comm_dev(comm));
