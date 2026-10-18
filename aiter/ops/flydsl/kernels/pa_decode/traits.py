@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import functools
 from dataclasses import dataclass
 
 import flydsl.expr as fx
@@ -23,9 +22,7 @@ LOG2E = 1.4426950408889634
 KV_COMPUTE_BLOCK = 256
 BF16_LDS_LIMIT_BYTES = 64 * 1024
 PAGE_ID_STAGE_LIMIT = 4096  # i32 page ids, 16 KiB of LDS.
-LDS_BYTES_PER_CU = 160 * 1024  # gfx950; NHD runs only there.
 D256_PIPE_MAX_ROWS = 2 * MFMA_MNK
-_NHD_V_BUF_BYTES = 4 * 64 * 256
 
 
 def d256_pipe(
@@ -36,7 +33,7 @@ def d256_pipe(
     query_length,
     query_group_size,
 ) -> bool:
-    """gfx950 FP8 head 256, page 64, <= two M-tiles.
+    """gfx950 FP8 head 256, page 16/64, <= two M-tiles.
 
     Uniform query length; rows = query_length * query_group_size fit two
     16-row M-tiles that share one K/V stream. Packed caches support both V
@@ -46,21 +43,8 @@ def d256_pipe(
         "gfx95" in arch
         and kv_dtype == "fp8"
         and head_dim == 256
-        and block_size == 64
+        and block_size in (16, 64)
         and query_length * query_group_size <= D256_PIPE_MAX_ROWS
-    )
-
-
-@functools.cache
-def _warn_unstaged_page_ids(pages: int) -> None:
-    from aiter import logger
-
-    logger.warning(
-        "pa_decode reads page ids inside the tile loop: the block table allows "
-        "%d page ids per task, above the %d-id LDS limit. Pass max_context_length "
-        "to stage them.",
-        pages,
-        PAGE_ID_STAGE_LIMIT,
     )
 
 
@@ -76,47 +60,16 @@ def max_tiles_per_task(num_seqs, work_capacity, num_partitions, max_context_leng
     return min(max_tiles, max(-(-max_tiles // num_partitions), by_budget))
 
 
-def _nhd_single_cta_bytes(
-    stage_pages: int, m_tiles: int, per_token: bool, single_tile_plan: bool
-) -> int:
-    """LDS bytes for one NHD CTA with a single V buffer.
-
-    Per M-tile: one P slot (16 rows of 256 FP8 plus 16 B padding), 16 Q scales,
-    and the cross-wave max and sum slots; then the four V page ids. Per-token
-    rows drop the bank-pad column and add K/V scales for every tile token plus
-    one V-scale-max slot. Then the staged page ids and the V buffer.
-    Single-tile plans keep one set of K/V scales; other plans keep two.
-    ``PaDecodeTraits.create`` checks this against the real layout.
-    """
-    p_slot = MFMA_MNK * (KV_COMPUTE_BLOCK + 16)
-    q_scales = MFMA_MNK * 4
-    nwarp_pad = 4 if per_token else 5
-    max_and_sum = 2 * MFMA_MNK * nwarp_pad * 4
-    # Single-tile plans have no next-tile prefetch to protect with a second buffer.
-    scale_buffers = 1 if single_tile_plan else 2
-    scales = (
-        scale_buffers * 2 * KV_COMPUTE_BLOCK * 4 + nwarp_pad * 4 if per_token else 0
-    )
-    base = m_tiles * (p_slot + q_scales + max_and_sum) + 16 + scales
-    base += stage_pages * 4
-    return ((base + 15) & ~15) + _NHD_V_BUF_BYTES
-
-
 def stage_page_capacity(
     num_seqs,
     work_capacity,
     num_partitions,
     max_context_length,
     block_size,
-    from_table_width=False,
     sliding_window=0,
     query_length=1,
 ) -> int:
-    """Page ids to stage per task, or 0 to keep table reads in the tile loop.
-
-    The warning fires only when the block-table width set the bound. A caller
-    who passed ``max_context_length`` already chose that bound.
-    """
+    """Page ids to stage per task, or 0 to keep table reads in the tile loop."""
     if sliding_window > 0:
         # Planning apportions the visible MTP window union, rather than the
         # whole context. Its unaligned tile bound also bounds staged ids.
@@ -129,8 +82,6 @@ def stage_page_capacity(
     )
     pages = tiles * (KV_COMPUTE_BLOCK // block_size)
     if pages > PAGE_ID_STAGE_LIMIT:
-        if from_table_width:
-            _warn_unstaged_page_ids(pages)
         return 0
     return max(256, 1 << max(pages - 1, 0).bit_length())
 
@@ -176,18 +127,14 @@ class PaDecodeSchedule:
         max_context_length: int | None = None,
         sliding_window: int = 0,
         trans_k: bool = True,
-        from_table_width: bool = False,
     ) -> PaDecodeSchedule:
         """Choose the existing policy from host-known grid and query bounds."""
         if isinstance(work_capacity, bool) or not isinstance(work_capacity, int):
             raise TypeError("work_capacity must be a positive int")
         if work_capacity < 1:
             raise ValueError("work_capacity must be positive")
-        if not trans_k and trans_v:
-            raise NotImplementedError(
-                "Non-transposed key cache requires a non-transposed value cache"
-            )
-        nhd_layout = (not trans_k) & (not trans_v)
+        if not trans_k:
+            raise NotImplementedError("Non-transposed key cache is not implemented")
         arch = str(get_rocm_arch()).split(":", 1)[0]
         is_gfx950 = "gfx95" in arch
         if kv_dtype not in ("fp8", "bf16"):
@@ -326,16 +273,10 @@ class PaDecodeSchedule:
             query_length,
             query_group_size,
         )
-        if nhd_layout and not D256_PIPE:
-            raise NotImplementedError(
-                "NHD pa_decode is the gfx950 FP8 head-256 page-64 decode "
-                "path for uniform query lengths of at most 32 query rows "
-                "(query_length * query_group_size)"
-            )
         # Splitting would change the CTA's rows and re-read K/V per split.
         assert (
             not D256_PIPE or query_splits == 1
-        ), "the head-256 page-64 pipe keeps all query rows in one CTA"
+        ), "the head-256 page-16/64 pipe keeps all query rows in one CTA"
         stage_pages = 0
         if D256_PIPE and max_context_length is not None:
             stage_pages = stage_page_capacity(
@@ -344,25 +285,9 @@ class PaDecodeSchedule:
                 num_partitions,
                 max_context_length,
                 block_size,
-                from_table_width,
                 sliding_window,
                 query_length,
             )
-        # Two V buffers overlap the next tile's DMA with PV. One buffer is
-        # faster only when the grid is wider than the CU count and two
-        # single-buffered CTAs still fit in LDS and registers. Staged page ids
-        # can use the room the second CTA needs; then two buffers win. Two
-        # M-tiles exceed the 256 VGPRs a second CTA per SIMD allows.
-        wide_grid = nhd_layout and split_workgroups > num_compute_units
-        single_bytes = _nhd_single_cta_bytes(
-            stage_pages, M_TILES, per_token_kv, single_tile_plan
-        )
-        NHD_V_BUFS = (
-            1
-            if wide_grid and M_TILES == 1 and 2 * single_bytes <= LDS_BYTES_PER_CU
-            else (2 if nhd_layout else 1)
-        )
-
         # Prefetch supported single-M query tiles independently of grid size.
         prefetch_v = (
             D256_PIPE
@@ -422,8 +347,6 @@ class PaDecodeSchedule:
             kv_dtype,
             D256_PIPE,
             stage_pages,
-            nhd_layout,
-            NHD_V_BUFS,
         )
         return cls(
             cache_key=cache_key,
@@ -459,8 +382,6 @@ class PaDecodeTraits:
     buffer_plan_output: bool
     D256_PIPE: bool
     stage_page_capacity: int
-    nhd_layout: bool
-    NHD_V_BUFS: int
 
     # Element formats and instruction policy.
     FP8: type
@@ -527,12 +448,6 @@ class PaDecodeTraits:
     sVScale_off: int
     sVScaleMax_off: int
     sPages_off: int
-    sVnhd_off: int
-    nhd_buf_bytes: int
-    nhd_page_bytes: int
-    NHD_TOKS_PER_DMA: int
-    NHD_DMAS: int
-    NHD_K_LOADS: int
     total_bytes: int
 
     def o_slot(self, m: int, vh: int) -> int:
@@ -569,8 +484,6 @@ class PaDecodeTraits:
             kv_dtype,
             D256_PIPE,
             stage_page_capacity,
-            nhd_layout,
-            NHD_V_BUFS,
         ) = cache_key
         is_gfx950 = schedule.is_gfx950
         is_bf16_kv = kv_dtype == "bf16"
@@ -648,13 +561,8 @@ class PaDecodeTraits:
         TUNE_PAGE128 = block_size == 128 and (PER_TOKEN_M1 or TUNED_SCALAR)
         PAGE16_VPIPE = prefetch_v and block_size == 16
         REUSE_KV_PAGES = PER_TOKEN_M1 or (D256_PIPE and per_token_kv)
-        # NHD V is DMA'd into LDS. A plain-V reload here would overwrite that
-        # gather, so per-token NHD keeps the DMA schedule.
         SCALES_BEFORE_CURRENT_V = (
-            WIDE_FP8_MFMA
-            and PER_TOKEN_M1
-            and (block_size == 16 or not trans_v)
-            and not nhd_layout
+            WIDE_FP8_MFMA and PER_TOKEN_M1 and (block_size == 16 or not trans_v)
         )
         # Scale before masking to avoid -inf * 0 and a second mask.
         M1_SCALE_BEFORE_MASK = PER_TOKEN_M1 or D256_PIPE or is_bf16_kv
@@ -762,32 +670,6 @@ class PaDecodeTraits:
         # Page ids for the task's tiles, one i32 each, staged before the loop.
         sPages_off = total_bytes
         total_bytes += stage_page_capacity * 4
-        # NHD V: per warp one page of row-major token rows (head_dim bytes each)
-        # with XOR-swizzled 16-byte bands; see PaDecodeKVLoader.nhd_v_dma.
-        # An LDS-DMA writes LDSbase + M0 + lane*16, one wave-uniform 1 KiB run
-        # per instruction.
-        nhd_page_bytes = block_size * head_dim
-        nhd_buf_bytes = NWARP * nhd_page_bytes
-        NHD_TOKS_PER_DMA = (WAVE * 16) // head_dim
-        NHD_DMAS = block_size // NHD_TOKS_PER_DMA
-        NHD_K_LOADS = NCHUNK * QKHE_LOOP
-        sVnhd_off = (total_bytes + 15) & ~15
-        if nhd_layout:
-            # Lane L loads band L&15 of token L>>4: one 16-lane group covers
-            # one 256-byte row, so head_dim must be 256. Warp w stages one page
-            # of the tile, so the page must be TOK_PER_WARP tokens.
-            assert (
-                NHD_TOKS_PER_DMA == WAVE // 16 and head_dim == 256
-            ), "NHD V DMA maps one 16-lane group to one 256-byte token row"
-            assert block_size == TOK_PER_WARP, "NHD V DMA stages one page per warp"
-            assert NHD_DMAS * WAVE * 16 == nhd_page_bytes
-            assert sVnhd_off + nhd_buf_bytes == _nhd_single_cta_bytes(
-                stage_page_capacity, M_TILES, per_token_kv, single_tile_plan
-            ), "NHD single-buffer LDS no longer matches the buffer-count rule"
-            total_bytes = sVnhd_off + NHD_V_BUFS * nhd_buf_bytes
-            assert (
-                total_bytes <= LDS_BYTES_PER_CU
-            ), f"NHD LDS {total_bytes} B exceeds {LDS_BYTES_PER_CU} B"
 
         return cls(
             cache_key=cache_key,
@@ -807,8 +689,6 @@ class PaDecodeTraits:
             buffer_plan_output=buffer_plan_output,
             D256_PIPE=D256_PIPE,
             stage_page_capacity=stage_page_capacity,
-            nhd_layout=nhd_layout,
-            NHD_V_BUFS=NHD_V_BUFS,
             FP8=FP8,
             FP8_MAX=FP8_MAX,
             Q_DTYPE=Q_DTYPE,
@@ -869,11 +749,5 @@ class PaDecodeTraits:
             sVScale_off=sVScale_off,
             sVScaleMax_off=sVScaleMax_off,
             sPages_off=sPages_off,
-            sVnhd_off=sVnhd_off,
-            nhd_buf_bytes=nhd_buf_bytes,
-            nhd_page_bytes=nhd_page_bytes,
-            NHD_TOKS_PER_DMA=NHD_TOKS_PER_DMA,
-            NHD_DMAS=NHD_DMAS,
-            NHD_K_LOADS=NHD_K_LOADS,
             total_bytes=total_bytes,
         )

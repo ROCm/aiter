@@ -35,9 +35,11 @@ def _tuning_cache_tag():
 
 
 def _cache_geometry(key_cache):
-    """KV heads, page size and layout of a packed 5D or NHD 4D K cache."""
+    """KV heads, page size and layout of a packed 5D K cache."""
     if key_cache.ndim == 4:
-        return key_cache.shape[2], key_cache.shape[1], "nhd"
+        raise NotImplementedError("Non-transposed key cache is not implemented")
+    if key_cache.ndim != 5:
+        raise ValueError("key_cache must be 5D")
     return key_cache.shape[1], key_cache.shape[3], "packed"
 
 
@@ -314,9 +316,8 @@ def prepare_pa_decode_plan(
     ``config_dir`` selects a root containing per-architecture cache directories
     and takes precedence over the environment's cache-directory override.
 
-    A 4D NHD ``key_cache`` takes its KV heads and page size from its
-    [num_blocks, page, heads, dim] shape and is cached separately from packed
-    layouts. Cache by attention geometry and execution modes. Tensor strides,
+    A 4D ``key_cache`` is not implemented. Cache by attention geometry and
+    execution modes. Tensor strides,
     total KV cache pages, block-table padding, and max_context_length do not partition
     the tuning cache; max_context_length still bounds kernel scheduling.
 
@@ -461,13 +462,7 @@ def _parse_args(argv=None):
         choices=("per-tensor", "per-token", "none"),
         help="Default: per-token for FP8; none for BF16.",
     )
-    parser.add_argument(
-        "--layout",
-        choices=("packed", "nhd"),
-        default="packed",
-        help="nhd: [pages, 64, KV heads, 256] FP8 K/V; implies --trans-v 0.",
-    )
-    parser.add_argument("--trans-v", type=int, choices=(0, 1))
+    parser.add_argument("--trans-v", type=int, choices=(0, 1), default=1)
     parser.add_argument("--sliding-window", type=int, default=0)
     parser.add_argument(
         "--sink-dtype", choices=("none", "bf16", "fp16", "fp32"), default="none"
@@ -489,16 +484,6 @@ def _parse_args(argv=None):
         parser.error("--head-dim must be a multiple of 64 in [64, 1024]")
     if args.kv_dtype == "fp8" and args.head_dim != 64 and args.head_dim % 128:
         parser.error("FP8 --head-dim must be 64 or a multiple of 128")
-    if args.layout == "nhd":
-        if args.trans_v == 1:
-            parser.error("--layout nhd requires --trans-v 0")
-        if (args.kv_dtype, args.head_dim, args.block_size) != ("fp8", 256, 64):
-            parser.error(
-                "--layout nhd requires --kv-dtype fp8 --head-dim 256 --block-size 64"
-            )
-        args.trans_v = 0
-    elif args.trans_v is None:
-        args.trans_v = 1
     if args.scale_mode is None:
         args.scale_mode = "per-token" if args.kv_dtype == "fp8" else "none"
     if args.kv_dtype == "bf16" and (
@@ -555,24 +540,19 @@ def _make_tuning_inputs(args, device, kv_dtype):
     if args.kv_dtype == "fp8":
         key, key_scale = _quantize_kv(key, kv_dtype, args.scale_mode)
         value, value_scale = _quantize_kv(value, kv_dtype, args.scale_mode)
-    if args.layout == "nhd":
-        # [pages, heads, page, dim] -> [pages, page, heads, dim]
-        key_cache = key.permute(0, 2, 1, 3).contiguous()
-        value_cache = value.permute(0, 2, 1, 3).contiguous()
-    else:
-        vector = 8 if args.kv_dtype == "bf16" else 16
-        key_cache = (
-            key.reshape(pages, heads, page, dim // vector, vector)
-            .permute(0, 1, 3, 2, 4)
-            .contiguous()
-        )
-        value_cache = (
-            value.reshape(pages, heads, page // vector, vector, dim)
-            .permute(0, 1, 2, 4, 3)
-            .contiguous()
-            if args.trans_v
-            else value.permute(0, 1, 3, 2).contiguous()
-        )
+    vector = 8 if args.kv_dtype == "bf16" else 16
+    key_cache = (
+        key.reshape(pages, heads, page, dim // vector, vector)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+    )
+    value_cache = (
+        value.reshape(pages, heads, page // vector, vector, dim)
+        .permute(0, 1, 2, 4, 3)
+        .contiguous()
+        if args.trans_v
+        else value.permute(0, 1, 3, 2).contiguous()
+    )
     context = torch.tensor(args.context_length, dtype=torch.int32, device=device)
     table = torch.randperm(pages, dtype=torch.int32, device=device).reshape(
         args.batch_size, pages_per_seq

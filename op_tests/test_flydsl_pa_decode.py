@@ -341,16 +341,14 @@ _PIPE_BASE = {
     "group_size": 8,
     "pipe": True,
 }
-_NHD_BASE = {**_PIPE_BASE, "layout": "nhd"}
 _PIPE_CASES = [
     # At GQA 8, query length q gives 8 * q rows: one M-tile at 1 and 2 (1 pads
     # it), two at 3 and 4 (3 pads the second). Lengths put some row's causal
     # edge on a page or tile boundary, and lengths below q leave rows empty.
     # P is FP8, so random rows see 0, 1 or at least 6 tokens; the token
-    # one-hot query-length-3 case covers 2 to 5 exactly. Packed plain V takes
-    # the same pipe as NHD.
+    # one-hot token pattern covers short contexts exactly.
     #
-    # Table padding wider than 4096 page ids per task cannot be staged.
+    # A task needing more than 4096 page ids cannot stage the whole list.
     (
         "d256-unstaged-q2",
         {
@@ -392,59 +390,6 @@ _PIPE_CASES = [
         )
         for partitions in (81, 130)
     ),
-    # A head-major pool of 2**15 + 1 blocks puts KV head 2 past 2**31 bytes, so
-    # the host must select wide addressing and widen the head term. 288 CTAs
-    # exceed the CU count, which selects one V buffer. The long sequence gives
-    # each task four tiles that reuse that buffer, and its last tile ends
-    # mid-page with two empty pages.
-    (
-        "nhd-d256-page64-hkv3-head-major-wide",
-        {
-            **_NHD_BASE,
-            "kv_heads": 3,
-            "lengths": (1, 65, 32600),
-            "max_partitions": 32,
-            "head_major": True,
-            "pool_blocks": 2**15 + 1,
-            "wide": True,
-            "nhd_bufs": 1,
-        },
-    ),
-    (
-        "nhd-d256-page64",
-        {
-            **_NHD_BASE,
-            "lengths": (0, 1, 63, 64, 65, 255, 256, 257, 8192),
-            "max_partitions": 8,
-            "nhd_bufs": 2,
-            "nhd_contracts": True,
-        },
-    ),
-    # Two M-tiles always take two V buffers. The longest sequence gives tasks
-    # several tiles that alternate them, and the last task ends mid-page.
-    (
-        "nhd-d256-page64-q3",
-        {
-            **_NHD_BASE,
-            "query_length": 3,
-            "lengths": (0, 1, 2, 3, 5, 65, 257, 2049),
-            "max_partitions": 8,
-            "pattern": "one_hot_token",
-        },
-    ),
-    (
-        "nhd-d256-page64-q4",
-        {
-            **_NHD_BASE,
-            "query_length": 4,
-            "lengths": (0, 1, 65, 66, 257, 258, 8258),
-            "max_partitions": 8,
-            "nhd_bufs": 2,
-            "capture": True,
-        },
-    ),
-    # Per-token scales take the same pipe. The wide grid takes the one-buffer
-    # NHD path, whose V gather must not be replaced by a plain-V reload.
     (
         "d256-page64-per-token",
         {
@@ -464,41 +409,6 @@ _PIPE_CASES = [
             "lengths": (0, 1, 65, 257, 2049),
             "max_partitions": 4,
             "pattern": "varied",
-        },
-    ),
-    (
-        "nhd-d256-page64-per-token",
-        {
-            **_NHD_BASE,
-            "scale_mode": "per-token",
-            "lengths": (1, 65, 257, 1027),
-            "max_partitions": 4,
-            "pattern": "varied",
-            "nhd_bufs": 2,
-        },
-    ),
-    (
-        "nhd-d256-page64-q4-per-token",
-        {
-            **_NHD_BASE,
-            "scale_mode": "per-token",
-            "query_length": 4,
-            "lengths": (0, 1, 65, 257, 2049),
-            "max_partitions": 4,
-            "pattern": "varied",
-            "nhd_bufs": 2,
-        },
-    ),
-    (
-        "nhd-d256-page64-per-token-wide",
-        {
-            **_NHD_BASE,
-            "scale_mode": "per-token",
-            "kv_heads": 3,
-            "lengths": (1, 65, 32600),
-            "max_partitions": 32,
-            "pattern": "varied",
-            "nhd_bufs": 1,
         },
     ),
 ]
@@ -576,72 +486,17 @@ def _one_hot_kv(key, value, table, context, compute_type, tokens_per_channel=256
     )
 
 
-def _nhd_caches(key, value, table, context, head_major, pool_blocks=None):
-    """K and V views of one [page, token, KV head, 2 * dim] row store.
-
-    Unwritten V tails hold FP8 NaN: the kernel must zero-fill them because
-    0 * NaN would poison PV. Pool blocks past the table's pages stay unwritten.
-    """
-    pages, kv_heads, page, dim = key.shape
-    pool = pool_blocks or pages
-    if head_major:
-        rows = torch.empty(
-            (kv_heads, pool, page, 2 * dim), dtype=key.dtype, device=key.device
-        ).transpose(0, 1)
-    else:
-        rows = torch.empty(
-            (pool, kv_heads, page, 2 * dim), dtype=key.dtype, device=key.device
-        )
-    rows[:pages, ..., :dim] = key
-    rows[:pages, ..., dim:] = value
-    nan = torch.tensor(0x7F, dtype=torch.uint8, device=key.device).view(key.dtype)
-    for seq, length in enumerate(context.tolist()):
-        if length % page:
-            rows[table[seq, length // page], :, length % page :, dim:] = nan
-    return rows.transpose(1, 2).split(dim, dim=-1)
-
-
 def _check_pipe_policy(pa, case, arch, compile_kwargs):
     """Pin the selected specialization so a case cannot drift off its path."""
     from aiter.ops.flydsl.kernels.pa_decode.traits import PaDecodeSchedule
 
     assert compile_kwargs[-1]["wide_kv_addressing"] == case["wide"]
     if case["pipe"]:
-        # The cache key ends with (D256_PIPE, staged page ids, NHD, NHD V buffers).
-        pipe, staged, _, nhd_bufs = PaDecodeSchedule.select(
-            **compile_kwargs[-1]
-        ).cache_key[-4:]
+        # The cache key ends with (D256_PIPE, staged page ids).
+        pipe, staged = PaDecodeSchedule.select(**compile_kwargs[-1]).cache_key[-2:]
         assert pipe == (arch == "gfx950")
         if pipe:
             assert (staged > 0) == (case["staged"] is not False)
-            if case["nhd_bufs"]:
-                assert nhd_bufs == case["nhd_bufs"]
-
-
-def _check_nhd_contracts(pa, output, arguments, options, plan, check):
-    """Reject NHD views that break the 16-byte loads or the V tail bound."""
-    query, key, value, *rest = arguments
-    block, token, head, _ = key.stride()
-
-    def view(tensor, stride, offset=0):
-        return tensor.as_strided(tensor.shape, stride, tensor.storage_offset() + offset)
-
-    def run(out, bad_key, bad_value):
-        pa.pa_decode(out, query, bad_key, bad_value, *rest, work_plan=plan, **options)
-
-    for invalid, message in [
-        (view(key, key.stride(), offset=1), "16-byte"),
-        (view(key, (block, token - 8, head, 1)), "16-byte"),
-        (view(key, (block, 128, head, 1)), "overlap"),
-    ]:
-        with pytest.raises(ValueError, match=message):
-            run(torch.empty_like(query), invalid, value)
-    if key.shape[2] == 1:
-        # A single KV head is never stepped, so its stride may be anything.
-        odd = (block, token, 2**40 + 8, 1)
-        output.fill_(float("nan"))
-        run(output, view(key, odd), view(value, odd))
-        check()
 
 
 @pytest.mark.parametrize(
@@ -700,17 +555,12 @@ def test_pa_decode(case, device, monkeypatch):
             "trans_v": True,
             "capture": False,
             "lengths": None,
-            "layout": "packed",
-            "head_major": False,
-            "pool_blocks": None,
             "budget": None,
             "table_width": None,
             "max_context": "lengths",
             "wide": False,
             "pipe": False,
             "staged": None,
-            "nhd_bufs": None,
-            "nhd_contracts": False,
         },
         **case,
     )
@@ -718,8 +568,6 @@ def test_pa_decode(case, device, monkeypatch):
     num_cu = torch.cuda.get_device_properties(device).multi_processor_count
     if case["max_partitions"] is not None and case["max_partitions"] > num_cu:
         pytest.skip(f"plan_pa_decode caps max_partitions at {num_cu} CUs")
-    if case["layout"] == "nhd" and arch != "gfx950":
-        pytest.skip("NHD decode is gfx950 only")
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
     query_length, kv_heads, group_size, dim, page, window = (
         case[name]
@@ -732,10 +580,6 @@ def test_pa_decode(case, device, monkeypatch):
             "window",
         )
     )
-    if case["pool_blocks"]:
-        pool_bytes = case["pool_blocks"] * kv_heads * page * 2 * dim
-        if torch.cuda.mem_get_info(device)[0] < pool_bytes + 2**30:
-            pytest.skip(f"needs {pool_bytes} B of free GPU memory for the KV pool")
     torch.manual_seed(0)
     query, key, value, table, context = _make_inputs(
         query_length,
@@ -749,7 +593,6 @@ def test_pa_decode(case, device, monkeypatch):
         case["lengths"],
         case["table_width"],
     )
-    nhd = case["layout"] == "nhd"
     compute_type = torch.bfloat16
     key_scale = value_scale = None
     vector = 8
@@ -777,23 +620,18 @@ def test_pa_decode(case, device, monkeypatch):
     logical_key = key.float() * (1.0 if key_scale is None else key_scale)
     logical_value = value.float() * (1.0 if value_scale is None else value_scale)
     pages = key.shape[0]
-    if nhd:
-        key_cache, value_cache = _nhd_caches(
-            key, value, table, context, case["head_major"], case["pool_blocks"]
-        )
-    else:
-        key_cache = (
-            key.reshape(pages, kv_heads, page, dim // vector, vector)
-            .permute(0, 1, 3, 2, 4)
-            .contiguous()
-        )
-        value_cache = (
-            value.reshape(pages, kv_heads, page // vector, vector, dim)
-            .permute(0, 1, 2, 4, 3)
-            .contiguous()
-            if case["trans_v"]
-            else value.permute(0, 1, 3, 2).contiguous()
-        )
+    key_cache = (
+        key.reshape(pages, kv_heads, page, dim // vector, vector)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+    )
+    value_cache = (
+        value.reshape(pages, kv_heads, page // vector, vector, dim)
+        .permute(0, 1, 2, 4, 3)
+        .contiguous()
+        if case["trans_v"]
+        else value.permute(0, 1, 3, 2).contiguous()
+    )
     sinks = None
     if case["sink_dtype"] is not None:
         sinks = torch.linspace(
@@ -869,8 +707,6 @@ def test_pa_decode(case, device, monkeypatch):
     launch()
     check()
     _check_pipe_policy(pa, case, arch, compile_kwargs)
-    if case["nhd_contracts"]:
-        _check_nhd_contracts(pa, output, arguments, options, plan, check)
     if case["capture"]:
         # Compile/allocate before capture; replay must observe changed query data.
         capture_stream = torch.cuda.Stream()

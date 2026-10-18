@@ -80,9 +80,6 @@ class PaDecodePipeline:
                     v_flat0.extend(self.kv.load_v(v_page_pf0, vh))
                 v_pf0 = fx.Vector.from_elements(v_flat0, dtype=fx.Int64)
             init_state.append(v_pf0)
-        if const_expr(self.traits.NHD_V_BUFS == 2):  # noqa: SIM102
-            if self.ctx.part_start < self.ctx.part_end:
-                self.kv.nhd_v_dma(self.ctx.part_start, 0)
         # Single-tile plans eliminate loop/history but keep absolute tt for
         # addressing and masks; the outer guard excludes padded tasks.
         loop_start = (
@@ -104,7 +101,6 @@ class PaDecodePipeline:
                 else fx.Int32(loop_i)
             )
             tok0 = tt * self.traits.TILE_TOK
-            nhd_buf = (tt - self.ctx.part_start) & 1
             # Interleave MFMA with VALU/LDS or page16 V loads.
             if const_expr(
                 (not self.traits.per_token_kv and multi_query)
@@ -145,14 +141,10 @@ class PaDecodePipeline:
                 (self.traits.M_TILES > 1 and not self.traits.MTP4_FUSED)
                 or (self.traits.prefetch_v and not self.traits.SCALES_BEFORE_CURRENT_V)
             ):
-                if const_expr(self.traits.nhd_layout):
-                    if const_expr(self.traits.NHD_V_BUFS == 1):
-                        self.kv.nhd_v_dma(tt, 0)
-                else:
-                    v_vh_shared = [
-                        self.kv.load_v(v_page_cur, vh)
-                        for vh in range_constexpr(self.traits.VHE_CHUNKS)
-                    ]
+                v_vh_shared = [
+                    self.kv.load_v(v_page_cur, vh)
+                    for vh in range_constexpr(self.traits.VHE_CHUNKS)
+                ]
 
             q_scale_vec = None
             if const_expr(self.traits.M_TILES > 1 and not self.traits.is_bf16_kv):
@@ -190,7 +182,6 @@ class PaDecodePipeline:
                     scale_bounds,
                     v_vh_shared,
                     q_ops_all,
-                    nhd_buf,
                     q_scale_vec,
                 )
             results = yield next_state
@@ -485,7 +476,6 @@ class PaDecodePipeline:
         scale_bounds,
         v_vh_shared,
         q_ops_all,
-        nhd_buf,
         q_scale_vec,
     ):
         """Overlap QK, page/scale prefetch and PV for up to two padded query tiles.
@@ -514,12 +504,6 @@ class PaDecodePipeline:
             for m in range_constexpr(self.traits.M_TILES)
         ]
         k_next = k_cur
-        if const_expr(self.traits.nhd_layout and self.traits.NHD_V_BUFS == 1):
-            # Finish V before the next K load joins the vmcnt chain.
-            fx.rocdl.sched_barrier(0)
-            fx.rocdl.s_waitcnt(vmcnt=0)
-            gpu.barrier()
-            v_vh_shared = self.kv.nhd_v_gather(0)
         if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
             if const_expr(self.traits.REUSE_KV_PAGES):
                 # Stage scales before K so scale waits cannot drain K;
@@ -557,12 +541,7 @@ class PaDecodePipeline:
                 frag_Ss[m], scale, tile_valid, window_left, cur_kv_buf, scale_bounds, m
             )
             masked_chunks.append(chunks)
-        if const_expr(self.traits.NHD_V_BUFS == 2):
-            self.lds.barrier_keep_dma()
-            # Every wave has finished PV(t-1), so its buffer is free.
-            self.kv.nhd_v_dma(tt1, nhd_buf ^ 1)
-        else:
-            gpu.barrier()
+        gpu.barrier()
         v_page_next = v_page_cur
         if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
             v_page_next = self.kv.read_v_pages()
@@ -585,17 +564,7 @@ class PaDecodePipeline:
             )
             m_new.append(m_new_m)
             corr_reg.append(corr_m)
-        if const_expr(self.traits.NHD_V_BUFS == 2):
-            # vmcnt retires in issue order, and this tile's DMA is followed
-            # only by the next tile's K (none on the last tile) and DMA.
-            fx.rocdl.sched_barrier(0)
-            if tt1 < self.ctx.part_end:
-                fx.rocdl.s_waitcnt(vmcnt=self.traits.NHD_K_LOADS + self.traits.NHD_DMAS)
-            else:
-                fx.rocdl.s_waitcnt(vmcnt=self.traits.NHD_DMAS)
-            self.lds.barrier_keep_dma()
-        else:
-            gpu.barrier()
+        gpu.barrier()
         if const_expr(self.traits.PAGE16_VPIPE):  # noqa: SIM102
             # Next K can now overlap P reads/PV.
             if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
@@ -627,11 +596,6 @@ class PaDecodePipeline:
                     self.traits.OP_ELEMS
                 )
             )
-        if const_expr(self.traits.NHD_V_BUFS == 2):
-            # Issue the sums and P reads ahead of the V transposes so PV waits
-            # only for its own chunk.
-            fx.rocdl.sched_barrier(0)
-            v_vh_shared = self.kv.nhd_v_gather(nhd_buf)
         if const_expr(self.traits.prefetch_v):
             v_vh_batch = v_vh_shared
         else:
