@@ -9,9 +9,8 @@ aiter/ops/flydsl/configs/pa/<arch>/_pa_decode_autotuner.json
 
 For example, MI300/MI308 results use `gfx942/` and MI350/MI355 results use
 `gfx950/`. FlyDSL creates the directory and JSON file when tuning saves a result.
-Preparing a plan without a cached result uses the default budget (`CU` count for
-the gfx950 FP8 head-256 page-16/64 shapes, `2*CU` otherwise) and does not create a
-file.
+Preparing a plan without a cached result uses the default `2*CU` budget and does
+not create a file.
 
 Run the standalone tuning script from the repository root or an installed AITER
 package. It constructs the requested shape, benchmarks native candidates, and

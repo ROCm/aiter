@@ -329,8 +329,8 @@ _BF16_CASES = _COMMON_CASES + [
     ],
 ]
 # FP8 head 256, page 64, plain V, uniform query length with at most 32 query
-# rows: the gfx950 pipe, for per-tensor and per-token scales. Dense CU-count
-# budgets and a plan-independent staging bound select its specialization;
+# rows: the gfx950 pipe, for per-tensor and per-token scales. A plan-independent
+# staging bound selects its specialization;
 # other architectures run the same cases on the generic path.
 _PIPE_BASE = {
     "kv_dtype": "fp8",
