@@ -3184,6 +3184,38 @@ def _get_compiled_token_multidest_quant(
 
 
 @functools.cache
+def _get_compiled_apre_tile_quant(feat_dim: int, wmma_rep: int):
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        build_moe_apre_tile_quant_module,
+    )
+
+    return build_moe_apre_tile_quant_module(feat_dim, wmma_rep)
+
+
+@functools.cache
+def _get_compiled_apre_mono_quant_scatter(
+    feat_dim: int,
+    wmma_rep: int,
+    tile_k: int,
+    phase_q_repeats: int,
+    phase_s_repeats: int,
+    phase_s_double_buffer: bool,
+):
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        build_moe_apre_mono_quant_scatter_module,
+    )
+
+    return build_moe_apre_mono_quant_scatter_module(
+        feat_dim,
+        wmma_rep,
+        tile_k,
+        phase_q_repeats,
+        phase_s_repeats,
+        phase_s_double_buffer,
+    )
+
+
+@functools.cache
 def _get_compiled_fused_quant_preshuffle_route_ksplit(
     feat_dim: int,
     wmma_rep: int,
@@ -3456,6 +3488,83 @@ def flydsl_moe_fused_quant_preshuffle(
                 ptr_arg(topids_to_rows_i32),
                 token_num,
                 token_grid,
+                stream=torch.cuda.current_stream(),
+            )
+            return out_payload, out_scale
+        if payload_preshuffled and not prequantized:
+            if row_to_token is None:
+                raise ValueError(
+                    "A-preshuffle tile quant requires grouped-row -> token mapping"
+                )
+            if remap_rows or fuse_ep_psum:
+                raise ValueError(
+                    "A-preshuffle tile quant requires rows remapped before launch"
+                )
+            if os.environ.get("AITER_FLYDSL_APRE_MONO_QUANT", "1") in (
+                "1",
+                "true",
+                "True",
+            ):
+                from aiter.jit.utils.chip_info import get_cu_num
+
+                compact_payload = torch.empty(
+                    (token_num, Pb), dtype=torch.uint8, device=device
+                )
+                compact_scale = torch.empty(
+                    (token_num, Ws), dtype=torch.uint8, device=device
+                )
+                # The first phase's persistent-grid barrier starts at zero. A
+                # later optimization can have the preceding route/remap kernel
+                # clear this persistent scratch and remove the fill launch.
+                mono_barrier = torch.zeros(2, dtype=torch.int32, device=device)
+                mono_workers = max(
+                    1,
+                    int(
+                        os.environ.get(
+                            "AITER_FLYDSL_APRE_MONO_WORKERS",
+                            4 * (get_cu_num() or 1),
+                        )
+                    ),
+                )
+                mono_tile_k = int(
+                    os.environ.get("AITER_FLYDSL_APRE_MONO_TILE_K", "1024")
+                )
+                phase_q_repeats = int(
+                    os.environ.get("AITER_FLYDSL_APRE_MONO_REPEAT_Q", "1")
+                )
+                phase_s_repeats = int(
+                    os.environ.get("AITER_FLYDSL_APRE_MONO_REPEAT_S", "1")
+                )
+                phase_s_double_buffer = os.environ.get(
+                    "AITER_FLYDSL_APRE_MONO_DOUBLE_BUFFER", "0"
+                ) in ("1", "true", "True")
+                _get_compiled_apre_mono_quant_scatter(
+                    feat_dim,
+                    wmma_rep,
+                    mono_tile_k,
+                    phase_q_repeats,
+                    phase_s_repeats,
+                    phase_s_double_buffer,
+                )(
+                    ptr_arg(grouped_in.contiguous().view(-1)),
+                    ptr_arg(compact_payload.view(-1)),
+                    ptr_arg(compact_scale.view(-1)),
+                    ptr_arg(out_payload.view(-1)),
+                    ptr_arg(out_scale.view(-1)),
+                    ptr_arg(row_to_token.reshape(-1)),
+                    ptr_arg(mono_barrier),
+                    token_num,
+                    n_rows,
+                    mono_workers,
+                    stream=torch.cuda.current_stream(),
+                )
+                return out_payload, out_scale
+            _get_compiled_apre_tile_quant(feat_dim, wmma_rep)(
+                ptr_arg(grouped_in.contiguous().view(-1)),
+                ptr_arg(out_payload.view(-1)),
+                ptr_arg(out_scale.view(-1)),
+                ptr_arg(row_to_token.reshape(-1)),
+                n_rows,
                 stream=torch.cuda.current_stream(),
             )
             return out_payload, out_scale

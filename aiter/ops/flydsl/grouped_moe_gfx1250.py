@@ -631,6 +631,7 @@ def _grouped_a8w4_tdm_moe(
     _a_preshuffle_requested = data_format == "fp4" and _as_bool(
         os.environ.get("AITER_GROUPED_A4W4_A_PRESHUFFLE"), bool(a_preshuffle)
     )
+    a_preshuffled = bool(_a_preshuffle_requested and not _compact)
     if tile_m2 is None:
         tile_m2 = tile_m
     if tile_n2 is None:
@@ -815,10 +816,18 @@ def _grouped_a8w4_tdm_moe(
                 "max_tok": int(stage2_scatter.max_tokens_per_rank),
                 "slot_stride": int(stage2_scatter.max_tokens_per_rank) * int(topk),
             }
+    _apre_row_to_token = (
+        torch.full(
+            (int(contiguous_m),), -1, dtype=torch.int32, device=device
+        )
+        if a_preshuffled
+        else None
+    )
     _fuse_psum_quant = (
         _is_ep
         and enable_ep_scatter
         and not _compact
+        and not a_preshuffled
         and not _fuse_ep_route_quant
         and int(E) <= 256
         and dtype in (torch.bfloat16, dtypes.bf16)
@@ -862,6 +871,8 @@ def _grouped_a8w4_tdm_moe(
             _align_m,
             num_valid_routes=_ep_nvr,
             ep_scatter_params=ep_scatter_params,
+            row_to_token=_apre_row_to_token,
+            topk=int(topk),
         )
         psum = psum.to(torch.int32).contiguous()
     # Turns the TDM GEMM2 epilogue into the fused P2P scatter-combine.
@@ -922,11 +933,6 @@ def _grouped_a8w4_tdm_moe(
         torch.uint8,
         dtypes.fp4x2,
     )
-    a_preshuffled = (
-        _is_fp4
-        and not _compact
-        and _a_preshuffle_requested
-    )
     if src_a1_scale is not None and not _prequantized:
         # Loud rather than silently re-quantizing something already quantized.
         assert hidden_states.dtype == dtype, (
@@ -980,7 +986,7 @@ def _grouped_a8w4_tdm_moe(
         )
     )
     _compact_ascale_buf = None
-    _row_to_token = None
+    _row_to_token = _apre_row_to_token
     if _compact_ascale:
         _compact_ascale_buf = torch.empty(
             (token_num, model_dim // 32), dtype=torch.uint8, device=device
@@ -1917,6 +1923,8 @@ def contiguous_psum_remap(
     tile_m: int,
     num_valid_routes: torch.Tensor | None = None,
     ep_scatter_params: dict | None = None,
+    row_to_token: torch.Tensor | None = None,
+    topk: int = 1,
 ):
     """Tile-aligned psum and in-place masked-row -> contiguous-row remap.
 
@@ -1943,6 +1951,11 @@ def contiguous_psum_remap(
             .to(device=device, dtype=torch.int32)
             .contiguous()
         )
+    row_to_token_i32 = (
+        row_to_token.reshape(-1)
+        if row_to_token is not None
+        else torch.empty(0, dtype=torch.int32, device=device)
+    )
     if ep_scatter_params is not None:
         launch = _get_compiled_contiguous_psum_remap_ep()
         # ep_rowmap sentinel fill was done by the route kernel (g2l_lds),
@@ -1963,6 +1976,7 @@ def contiguous_psum_remap(
             int(ep_scatter_params["topk"]),
             int(ep_scatter_params["max_tok"]),
             int(ep_scatter_params["slot_stride"]),
+            ptr_arg(row_to_token_i32),
             stream=torch.cuda.current_stream(),
         )
         return starts, psum, contiguous_m_t
@@ -1984,6 +1998,8 @@ def contiguous_psum_remap(
         int(route_max_m),
         int(tile_m),
         ptr_arg(num_valid_routes_i32),
+        ptr_arg(row_to_token_i32),
+        int(topk),
         stream=torch.cuda.current_stream(),
     )
     return starts, psum, contiguous_m_t
