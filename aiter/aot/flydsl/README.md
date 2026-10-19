@@ -44,7 +44,13 @@ need no AOT change.
   behind an EP dispatch pass), and for FHMoE rows with MXFP8 routed weights
   both values of `clamp_shared`, which the runtime compiles into stage 1
   (MXFP4 rows keep the shared expert clamped). Combinations the runtime rejects
-  are reported as `[SKIP]`.
+  (`NotImplementedError`) are reported as `[SKIP]`.
+- The default caller of a row must be served. If the runtime refuses it at
+  only some of the row's token counts, an M-dependent runtime limit applies
+  (e.g. the FlyDSL route-reduce workspace beyond 32-bit addressing, which
+  `op_tests/test_moe_2stage.py` skips as well); those token counts compile
+  nothing and are reported as `[REFUSED]`. Refused at every token count, or
+  failing with any other error, the row fails the build.
 - Rows of the gfx1250 grouped table replay with the gate/up-interleaved
   weights and n32k4 scales gfx1250 callers pass; `_fused_moe_impl` hands them
   to FlyDSL's grouped GEMM. Grouped rows tuned for EP only (`topk` -1, or

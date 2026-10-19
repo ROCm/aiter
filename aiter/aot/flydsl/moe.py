@@ -166,7 +166,8 @@ def _caller_gate_mode(row: dict):
 
 def _variants(row: dict) -> list[dict]:
     """Caller-side choices a tuned row leaves open; the first is the one
-    serving uses by default and must replay cleanly."""
+    serving uses by default, which the runtime must serve (see
+    ``_judge_default_caller``)."""
     from aiter.ops.flydsl.moe_common import (
         DEFAULT_SITUV2_BETA,
         DEFAULT_SITUV2_LINEAR_BETA,
@@ -493,12 +494,9 @@ def compile_one_config(**job) -> dict:
             _replay(job)
         result["compile_time"] = time.time() - started
     except NotImplementedError as error:
-        if job["primary"]:
-            print(f"  [FAIL] {description}  arch={arch}: {error}", flush=True)
-        else:
-            # The runtime rejects this caller-side combination for the row.
-            result["compile_time"] = 0.0
-            result["unsupported"] = str(error)
+        # The runtime refuses the call; _replay_batch judges the refusal.
+        result["compile_time"] = 0.0
+        result["unsupported"] = str(error)
     except Exception as error:  # noqa: BLE001
         print(
             f"  [FAIL] {description}  arch={arch}: {type(error).__name__}: {error}",
@@ -557,6 +555,30 @@ def _bisect(job: dict, kernels: dict, low: int, high: int) -> list[dict]:
     ]
 
 
+def _judge_default_caller(outcomes: list[dict]) -> bool:
+    """Classify the runtime's refusals of a row's default caller. Refused at
+    only some of the row's token counts, the row meets an M-dependent runtime
+    limit (e.g. the 32-bit route-reduce workspace) and those token counts are
+    reported; refused at every one, the row is never served, which fails.
+    Returns whether the default caller replayed at any token count."""
+    served = any(
+        r["compile_time"] is not None and "unsupported" not in r for r in outcomes
+    )
+    for result in outcomes:
+        if "unsupported" not in result:
+            continue
+        reason = result.pop("unsupported")
+        if served:
+            result["refused"] = reason
+        else:
+            result["compile_time"] = None
+            print(
+                f"  [FAIL] {result['shape']}  arch={result['compile_arch']}: {reason}",
+                flush=True,
+            )
+    return served
+
+
 def _replay_batch(jobs: list[dict], kernel_name: str) -> dict:
     """Replay the jobs, then bisect each variant's bucket where its two token
     counts request different kernels: a row can switch kernels more than once
@@ -566,8 +588,12 @@ def _replay_batch(jobs: list[dict], kernel_name: str) -> dict:
         result, kernels = _replay_recorded(job)
         results.append(result)
         variant = tuple(sorted((k, v) for k, v in job.items() if k != "m"))
-        variants.setdefault(variant, (job, {}))[1][job["m"]] = kernels
-    for job, kernels in variants.values():
+        _, by_m, outcomes = variants.setdefault(variant, (job, {}, []))
+        by_m[job["m"]] = kernels
+        outcomes.append(result)
+    for job, kernels, outcomes in variants.values():
+        if job["primary"] and not _judge_default_caller(outcomes):
+            continue
         if len(kernels) == 2 and None not in kernels.values():
             probes += _bisect(job, kernels, *sorted(kernels))
     return {
@@ -618,13 +644,19 @@ def _replay_arch(jobs: list[dict], arch: str) -> int:
     failed = sum(1 for r in results if r["compile_time"] is None)
     rejected = Counter(r["unsupported"] for r in results if r.get("unsupported"))
     unsupported = sum(rejected.values())
-    print(
-        f"[aiter] FlyDSL MoE replay {arch}: {len(results) - failed - unsupported} ok, "
-        f"{failed} failed, {unsupported} unsupported caller-side variants",
-        flush=True,
+    refused = [r for r in results if r.get("refused")]
+    summary = (
+        f"[aiter] FlyDSL MoE replay {arch}: "
+        f"{len(results) - failed - unsupported - len(refused)} ok, {failed} failed, "
+        f"{unsupported} unsupported caller-side variants"
     )
+    if refused:
+        summary += f", {len(refused)} token counts the runtime refuses"
+    print(summary, flush=True)
     for reason, count in rejected.most_common():
         print(f"  [SKIP] {count} x {reason}", flush=True)
+    for result in refused:
+        print(f"  [REFUSED] {result['shape']}: {result['refused']}", flush=True)
     probes_failed = sum(1 for r in probes if r["compile_time"] is None)
     if probes:
         print(
