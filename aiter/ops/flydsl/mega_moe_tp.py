@@ -100,6 +100,12 @@ class MegaMoeTPConfig:
     inter_dim: int
     experts: int
     topk: int
+    # The largest batch of one forward, in local tokens (ag_rs: this rank's rows; ar: the
+    # replicated rows / world_size): set it to the caller's largest step, e.g. a scheduler's
+    # max_num_batched_tokens / world_size; larger batches must be split by the caller. It
+    # does not change the speed of smaller batches; it sizes the buffers: beyond what the
+    # small-batch engine holds (2048 local tokens on 256 CUs) the big-M path is set up, e.g.
+    # M3 tp4 ~0.5 GiB per rank at 1024, ~0.8 at 2048, ~2.8 at 4096, ~4.8 at 8192.
     max_local_tokens: int
     activation: ActivationType = ActivationType.Silu
     beta: float | None = None
