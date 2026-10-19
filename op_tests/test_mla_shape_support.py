@@ -11,8 +11,10 @@ import aiter
 from aiter import dtypes
 from aiter.ops.attention import (
     _MLA_ASM_STATUSES,
+    _MLA_BACKENDS,
     MlaAsmStatus,
     MlaBackend,
+    _mla_decode_head_plan,
     decode_update_mla_metadata_v1,
     get_mla_decode_shape_support,
     mla_decode_asm_query,
@@ -131,6 +133,128 @@ def test_gfx1250_flydsl_ps1_backend(monkeypatch):
     assert support(128, 1, flydsl_ps1=True).backend is MlaBackend.FLYDSL_PS1
     s = support(64, 1, flydsl_ps1=True, fast_mode=False)
     assert (s.backend, s.fold_factor, s.supported) == (MlaBackend.FLYDSL_PS1, 4, False)
+
+
+def test_ps1_asm_cprr_kernel(monkeypatch):
+    monkeypatch.delenv("AITER_MLA_DECODE_PS1_ASM", raising=False)
+    fp8 = torch.float8_e4m3fn
+
+    def support(world, rr):
+        return get_mla_decode_shape_support(
+            *(128, 1, fp8, fp8),
+            arch="gfx1250",
+            enable_experimental=False,
+            flydsl_ps1=True,
+            cp_world_size=world,
+            cp_round_robin=rr,
+        )
+
+    s = support(4, False)
+    assert s.backend is MlaBackend.ASM and s.supported is False, s.reasons
+    s = support(1, True)
+    assert s.backend is MlaBackend.PS1_FP8_ASM
+    if s.asm_status is MlaAsmStatus.ARCH_NOT_BUILT:
+        pytest.skip("no gfx1250 PS1 asm table built")
+    assert s.supported is True and "cprr" not in s.asm_kernel, s.asm_kernel
+    s = support(4, True)
+    assert s.supported is True and "cprr" in s.asm_kernel, s.asm_kernel
+
+
+def test_hk_backend():
+    fp8 = torch.float8_e4m3fn
+
+    def support(n, msq, **kw):
+        return get_mla_decode_shape_support(
+            n, msq, fp8, fp8, arch="gfx950", enable_experimental=True, **kw
+        )
+
+    s = support(128, 1)
+    assert (s.backend, s.supported) == (MlaBackend.HK, None), s.reasons
+    for n, msq, kw in (
+        (128, 1, {"return_lse": True}),
+        (64, 2, {"causal": False}),
+        (128, 1, {"cp_world_size": 2, "cp_round_robin": True}),
+    ):
+        s = support(n, msq, **kw)
+        assert (s.backend, s.supported) == (MlaBackend.HK, False), (n, msq, kw)
+
+
+def test_gfx1250_asm_page_size():
+    fp8 = torch.float8_e4m3fn
+
+    def support(page_size):
+        return get_mla_decode_shape_support(
+            *(16, 1, fp8, fp8),
+            persistent=False,
+            page_size=page_size,
+            arch="gfx1250",
+        )
+
+    s = support(1)
+    assert s.asm_status is MlaAsmStatus.NO_KERNEL and s.supported is False
+    assert support(64).asm_status in (MlaAsmStatus.OK, MlaAsmStatus.ARCH_NOT_BUILT)
+
+
+class _PlanCaptured(Exception):
+    pass
+
+
+def _launch_plan_call(monkeypatch, n, msq, **call_kw):
+    """The head-plan inputs mla_decode_fwd uses, captured before any launch."""
+    seen = {}
+
+    def capture(*args, **kw):
+        seen.update(args=args, kw=kw)
+        raise _PlanCaptured
+
+    monkeypatch.setattr(aiter.mla, "_mla_decode_head_plan", capture)
+    fp8, dim = torch.float8_e4m3fn, KV_LORA_RANK + QK_ROPE
+    i32 = torch.int32
+    with pytest.raises(_PlanCaptured):
+        aiter.mla.mla_decode_fwd(
+            torch.zeros(msq, n, dim).to(fp8),
+            torch.zeros(4, 1, 1, dim).to(fp8),
+            torch.empty(msq, n, KV_LORA_RANK, dtype=torch.bfloat16),
+            torch.tensor([0, msq], dtype=i32),
+            torch.tensor([0, 4], dtype=i32),
+            torch.arange(4, dtype=i32),
+            torch.ones(1, dtype=i32),
+            msq,
+            num_kv_splits=1,
+            work_meta_data=torch.zeros(1, dtype=i32),
+            q_scale=torch.ones(1),
+            kv_scale=torch.ones(1),
+            **call_kw,
+        )
+    return seen["args"], seen["kw"]
+
+
+def test_cp_world_size_matches_launch(monkeypatch):
+    fp8 = torch.float8_e4m3fn
+    flags = {"arch": "gfx1250", "enable_experimental": False, "flydsl_ps1": True}
+    g_kv_indptr = torch.tensor([0, 4], dtype=torch.int32)
+    backends = {}
+    for world, rr in ((1, False), (4, False), (4, True)):
+        args, kw = _launch_plan_call(
+            monkeypatch,
+            64,
+            1,
+            cp_world_size=world,
+            cp_rank=0,
+            g_kv_indptr=g_kv_indptr if rr else None,
+        )
+        assert (kw["cp_world_size"], kw["cp_round_robin"]) == (world, rr)
+        launch = _mla_decode_head_plan(*args, **kw, **flags)
+        query = get_mla_decode_shape_support(
+            64, 1, fp8, fp8, cp_world_size=world, cp_round_robin=rr, **flags
+        )
+        assert query.backend is _MLA_BACKENDS[launch.backend], (world, rr)
+        backends[world, rr] = query.backend
+    assert backends == {
+        (1, False): MlaBackend.FLYDSL_PS1,
+        (4, False): MlaBackend.ASM,
+        (4, True): MlaBackend.FLYDSL_PS1,
+    }
 
 
 def _indptrs(bs, msq):

@@ -26,7 +26,7 @@ from csrc.cpp_itfs.pa.pa_v1 import paged_attention_v1 as paged_attention_v1_core
 from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 
 from ..jit.core import compile_ops, env_flag_atoi, is_experimental_enabled
-from ..jit.utils.asm_guard import require_gfx1250_asm
+from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
 from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 
 MD_NAME = "module_attention"
@@ -1183,8 +1183,12 @@ class MlaDecodeShapeSupport:
     persistent=False mla_decode_fwd does not fold and only the asm table
     decides supported.
     supported is True when the selected backend has a kernel for the shape,
-    False when it does not, and None when it cannot be determined (opus and
-    FlyDSL routes, or a failed asm query); reasons explains every False/None.
+    False when it does not, and None when it cannot be determined (opus, HK
+    and FlyDSL routes, or a failed asm query); reasons explains every
+    False/None. Some routes write no final LSE for a KV split of one, so
+    return_lse is False on them: HK always, and gfx1250 stage 1 unless the Q
+    head count is 64. HK is also False with causal=False at max_seqlen_qo > 1
+    (it always masks) and with round-robin CP, and it ignores q_scale/kv_scale.
     Launch-size limits are not checked: the gfx950 non-persistent fp8 64-head
     kernel still raises at launch when kv_split > 1 and
     total_q * kv_split > 32768.
@@ -1442,7 +1446,7 @@ def _mla_asm_query_lib() -> Any:
     lib = ctypes.CDLL(build_ctypes_module("module_mla_asm"))
     out_args = [ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p]
     lib.mla_decode_asm_query.argtypes = (
-        [ctypes.c_char_p] * 3 + [ctypes.c_int] * 7 + out_args
+        [ctypes.c_char_p] * 3 + [ctypes.c_int] * 8 + out_args
     )
     lib.mla_ps1_fp8_asm_query.argtypes = (
         [ctypes.c_char_p] + [ctypes.c_int] * 5 + out_args
@@ -1480,6 +1484,7 @@ def mla_decode_asm_query(
     causal: bool,
     has_lse: bool,
     has_cprr: bool,
+    page_size: int = 1,
 ) -> tuple[int, int, int, str]:
     packed, kernel = _mla_asm_query_call(
         "mla_decode_asm_query",
@@ -1493,6 +1498,7 @@ def mla_decode_asm_query(
         int(causal),
         int(has_lse),
         int(has_cprr),
+        page_size,
     )
     return packed & 0xFF, (packed >> 8) & 0xFF, (packed >> 16) & 0xFF, kernel
 
@@ -1526,6 +1532,7 @@ def _get_mla_decode_shape_support_cached(
     return_lse: bool,
     causal: bool,
     persistent: bool,
+    cp_world_size: int,
     cp_round_robin: bool,
     page_size: int,
     fast_mode: bool,
@@ -1550,7 +1557,7 @@ def _get_mla_decode_shape_support_cached(
         flydsl_ps1,
         v_head_dim,
         page_size,
-        2 if cp_round_robin else 1,
+        cp_world_size,
         cp_round_robin,
         True,
         use_opus,
@@ -1570,6 +1577,8 @@ def _get_mla_decode_shape_support_cached(
         p.kernel_num_heads if persistent and backend is MlaBackend.ASM else num_heads
     )
     asm_status, asm_kernel = MlaAsmStatus.NOT_ASM, None
+    # Stage 1 picks its cprr kernel from g_kv_indptr, PS1 from cp_world_size > 1.
+    cprr = cp_round_robin if backend is MlaBackend.ASM else cp_world_size > 1
     if asm_route:
         try:
             if backend is MlaBackend.ASM:
@@ -1583,11 +1592,12 @@ def _get_mla_decode_shape_support_cached(
                     persistent,
                     causal,
                     return_lse,
-                    cp_round_robin,
+                    cprr,
+                    page_size,
                 )
             else:
                 code, kernel = mla_ps1_fp8_asm_query(
-                    arch, asm_heads, max_seqlen_qo, causal, return_lse, cp_round_robin
+                    arch, asm_heads, max_seqlen_qo, causal, return_lse, cprr
                 )
                 gqa, qlen = asm_heads, max_seqlen_qo
             asm_status = _MLA_ASM_STATUSES.get(code, MlaAsmStatus.UNKNOWN)
@@ -1603,9 +1613,15 @@ def _get_mla_decode_shape_support_cached(
                 f"{backend.value} {asm_status.value} on {arch}: q={q_type} kv={kv_type} "
                 f"heads={asm_heads} qlen={max_seqlen_qo} (table gqa={gqa} "
                 f"qseqlen={qlen}) persistent={int(persistent)} "
-                f"causal={int(causal)} lse={int(return_lse)} "
-                f"cprr={int(cp_round_robin)}"
+                f"causal={int(causal)} lse={int(return_lse)} cprr={int(cprr)}"
             )
+    a0_blocked = (
+        backend is MlaBackend.ASM
+        and arch == "gfx1250"
+        and not is_gfx1250_asm_supported()
+    )
+    if a0_blocked:
+        reasons.append("gfx1250 A0: the shipped stage-1 asm needs B0+")
 
     if persistent and not planner_accepts:
         reasons.insert(
@@ -1623,17 +1639,23 @@ def _get_mla_decode_shape_support_cached(
             f"{backend.value} kernels read unfolded heads; planner {planner} folds "
             f"{num_heads} heads {p.qk_batch_ratio * p.seqlen_fold}x"
         )
+    hk_problems = []
     if backend is MlaBackend.HK:
-        reasons.append(
-            "hk backend: hk_mla_decode_fwd is not defined "
-            "(AITER_ENABLE_EXPERIMENTAL route)"
-        )
+        if return_lse:
+            hk_problems.append("writes no final LSE for work that is not split")
+        if not causal and max_seqlen_qo > 1:
+            hk_problems.append("always applies the causal mask")
+        if cp_round_robin:
+            hk_problems.append("takes no g_kv_indptr (round-robin CP)")
+        reasons.extend(f"hk_mla_v32_decode_fwd {r}" for r in hk_problems)
+        reasons.append("hk_mla_v32_decode_fwd ignores q_scale and kv_scale")
 
     if (
         (persistent and not planner_accepts)
         or (persistent and not p.reduce_supported)
         or ps1_folded
-        or backend is MlaBackend.HK
+        or hk_problems
+        or a0_blocked
         or (asm_route and asm_status not in (MlaAsmStatus.OK, MlaAsmStatus.UNKNOWN))
     ):
         supported = False
@@ -1675,6 +1697,7 @@ def get_mla_decode_shape_support(
     return_lse: bool = False,
     causal: bool = True,
     persistent: bool = True,
+    cp_world_size: int = 1,
     cp_round_robin: bool = False,
     page_size: int = 1,
     fast_mode: bool = True,
@@ -1691,16 +1714,24 @@ def get_mla_decode_shape_support(
 
     num_heads is the Q head count per rank as passed to mla_decode_fwd (after any
     DCP gather) and max_seqlen_qo the per-request query length (>= 1). The
-    keyword arguments describe the call the caller will make. arch=None uses the
-    current device's arch; an explicit arch needs no device, but asm availability
-    is only known for arches compiled into the build. enable_experimental and
-    flydsl_ps1 default to the AITER_ENABLE_EXPERIMENTAL and
-    AITER_MLA_DECODE_PS1_FLYDSL env vars. Results are cached; call
+    keyword arguments describe the call the caller will make: cp_world_size is
+    mla_decode_fwd's cp_world_size, cp_round_robin is True when it is given
+    g_kv_indptr, and persistent is True when it is given work_meta_data. fp8 Q is
+    assumed to come with q_scale and kv_scale. Only kv_layout="token_major" (the
+    default) is described, not the gfx1250 kv_shuffled layouts.
+    persistent=True describes the persistent route. With num_kv_splits=None,
+    mla_decode_fwd runs gfx950 bf16 16-head single-token decode non-persistent
+    at batch >= AITER_MLA_DECODE_PERSISTENT_MAX_BATCH; persistent=False
+    describes that route.
+    arch=None uses the current device's arch; an explicit arch needs no device,
+    but asm availability is only known for arches compiled into the build.
+    enable_experimental and flydsl_ps1 default to the AITER_ENABLE_EXPERIMENTAL
+    and AITER_MLA_DECODE_PS1_FLYDSL env vars. Results are cached; call
     get_mla_decode_shape_support.cache_clear() after changing env vars.
 
     Raises TypeError for a non-int count or a non-torch.dtype, and ValueError
-    for num_heads < 1, max_seqlen_qo < 1, num_heads_k != 1 or an unsupported
-    dtype.
+    for num_heads < 1, max_seqlen_qo < 1, num_heads_k != 1, cp_world_size < 1
+    or an unsupported dtype.
     """
 
     def _as_int(name: str, value: object) -> int:
@@ -1716,6 +1747,7 @@ def get_mla_decode_shape_support(
     num_heads_k = _as_int("num_heads_k", num_heads_k)
     v_head_dim = _as_int("v_head_dim", v_head_dim)
     page_size = _as_int("page_size", page_size)
+    cp_world_size = _as_int("cp_world_size", cp_world_size)
     if num_heads < 1:
         raise ValueError(f"num_heads must be >= 1, got {num_heads}")
     if max_seqlen_qo < 1:
@@ -1724,6 +1756,8 @@ def get_mla_decode_shape_support(
         raise ValueError(
             f"num_heads_k must be 1 (asm MLA decode requires it), got {num_heads_k}"
         )
+    if cp_world_size < 1:
+        raise ValueError(f"cp_world_size must be >= 1, got {cp_world_size}")
     _mla_shape_dtype(q_dtype)
     _mla_shape_dtype(kv_dtype)
     return _get_mla_decode_shape_support_cached(
@@ -1735,6 +1769,7 @@ def get_mla_decode_shape_support(
         bool(return_lse),
         bool(causal),
         bool(persistent),
+        cp_world_size,
         bool(cp_round_robin),
         page_size,
         bool(fast_mode),

@@ -474,7 +474,8 @@ static MlaAsmDecodeCfg mla_asm_decode_remap_gfx1250(const std::string& q_type,
                                                     bool persistent,
                                                     bool has_lse,
                                                     bool has_cprr,
-                                                    bool kv_shuffled)
+                                                    bool kv_shuffled,
+                                                    int page_size)
 {
     MlaAsmDecodeCfg c = {};
     c.status          = MlaAsmStatus::NoKernel;
@@ -483,11 +484,12 @@ static MlaAsmDecodeCfg mla_asm_decode_remap_gfx1250(const std::string& q_type,
         c.reason = ": gfx1250 MLA minimal smoke only supports non-persistent decode";
         return c;
     }
-    // Only QH64 writes LSE for a single KV split (as fp32 partials); the other
-    // kernels' bf16 epilogue leaves it unwritten.
+    // Only QH64 writes LSE for a single KV split (as fp32 partials). The other
+    // kernels' bf16 epilogue leaves it unwritten, so their LSE is valid only when
+    // the launch picks kv_split > 1.
     if(has_lse && gqa_ratio != 64)
     {
-        c.reason = ": gfx1250 MLA does not return lse";
+        c.reason = ": gfx1250 MLA returns lse only for gqa64 or kv_split > 1 (chosen at launch)";
         return c;
     }
     if(has_cprr)
@@ -498,6 +500,11 @@ static MlaAsmDecodeCfg mla_asm_decode_remap_gfx1250(const std::string& q_type,
     if(q_type != "fp8" || kv_type != "fp8")
     {
         c.reason = ": only supports fp8/fp8 for minimal smoke";
+        return c;
+    }
+    if(page_size != 64)
+    {
+        c.reason = ": gfx1250 MLA only supports page_size == 64";
         return c;
     }
     // Supported gfx1250 gfx1250 variants, matching hsa/gfx1250/mla/mla_asm.csv and
@@ -547,7 +554,8 @@ MlaAsmDecodeCfg mla_asm_decode_config(const std::string& arch_id,
                                       bool causal,
                                       bool has_lse,
                                       bool has_cprr,
-                                      bool kv_shuffled = false)
+                                      bool kv_shuffled = false,
+                                      int page_size    = 64)
 {
     MlaAsmDecodeCfg c = {};
     c.status          = MlaAsmStatus::NoKernel;
@@ -559,8 +567,15 @@ MlaAsmDecodeCfg mla_asm_decode_config(const std::string& arch_id,
     const int gqa_ratio = num_heads / nhead_kv;
     if(arch_id == "gfx1250")
     {
-        c = mla_asm_decode_remap_gfx1250(
-            q_type, kv_type, gqa_ratio, max_seqlen_q, persistent, has_lse, has_cprr, kv_shuffled);
+        c = mla_asm_decode_remap_gfx1250(q_type,
+                                         kv_type,
+                                         gqa_ratio,
+                                         max_seqlen_q,
+                                         persistent,
+                                         has_lse,
+                                         has_cprr,
+                                         kv_shuffled,
+                                         page_size);
     }
     else if(kv_shuffled)
     {
@@ -642,6 +657,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT(mla_decode_asm_query,
                                 int causal,
                                 int has_lse,
                                 int has_cprr,
+                                int page_size,
                                 char* kernel_out,
                                 int kernel_out_len,
                                 hipStream_t stream),
@@ -655,6 +671,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT(mla_decode_asm_query,
                                 causal,
                                 has_lse,
                                 has_cprr,
+                                page_size,
                                 kernel_out,
                                 kernel_out_len,
                                 stream))
@@ -672,7 +689,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT(mla_decode_asm_query,
                                                     persistent != 0,
                                                     causal != 0,
                                                     has_lse != 0,
-                                                    has_cprr != 0);
+                                                    has_cprr != 0,
+                                                    false,
+                                                    page_size);
     if(kernel_out != nullptr && kernel_out_len > 0)
     {
         const size_t n = std::min(c.kernel.size(), static_cast<size_t>(kernel_out_len - 1));
@@ -862,7 +881,8 @@ static void mla_decode_gfx1250_dispatch(
                                                        false,
                                                        false,
                                                        false,
-                                                       kv_shuffled != 0);
+                                                       kv_shuffled != 0,
+                                                       page_size);
     AITER_CHECK(
         dcfg.status != MlaAsmStatus::RemapReject,
         __func__,
