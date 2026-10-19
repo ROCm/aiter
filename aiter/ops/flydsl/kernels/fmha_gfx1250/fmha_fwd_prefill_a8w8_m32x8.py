@@ -88,6 +88,9 @@ BLOCK_SIZE = WAVE_SIZE * NUM_WAVES  # 256 threads
 WMMA_M = 16  # query rows per WMMA tile (the "m16" in m32x8)
 WMMA_N = 16  # kv rows per WMMA tile (the S^T=K@Q^T output's n_block-direction axis)
 WMMA_K = 32  # WMMA contraction depth (bf16 v_wmma_f32_16x16x32); d-tile width
+# 8-bit WMMA contracts twice as deep for the same 8-VGPR operand: 16x16x64 carries
+# 32 B/lane of fp8 where 16x16x32 carries 32 B/lane of bf16 (probe-confirmed on HW).
+WMMA_K_B8 = 64
 WMMA_ROW_PER_WAVE = 2  # Q WMMA tiles per wave (the "x2" step from m16x8 to m32x8)
 BLOCK_M = WMMA_M * WMMA_ROW_PER_WAVE * NUM_WAVES  # 256
 # 1 => BLOCK_M 128 ("m16x8"), 2 => BLOCK_M 256. Chosen per call by _pick_num_q_tiles.
@@ -150,8 +153,19 @@ class WarpType(IntEnum):
 DEFAULT_QK_HDIM = 128
 DEFAULT_V_HDIM = 128
 DEFAULT_DTYPE = "bf16"
-_DTYPE_MAP = {"bf16": fx.BFloat16, "fp16": fx.Float16}
-_TORCH_DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16}
+_DTYPE_MAP = {
+    "bf16": fx.BFloat16,
+    "fp16": fx.Float16,
+    "fp8": fx.Float8E4M3FN,
+    "bf8": fx.Float8E5M2,
+}
+_TORCH_DTYPE_MAP = {
+    "bf16": torch.bfloat16,
+    "fp16": torch.float16,
+    "fp8": torch.float8_e4m3fn,
+    "bf8": torch.float8_e5m2,
+}
+_B8_DTYPES = (fx.Float8E4M3FN, fx.Float8E5M2)
 SUPPORTED_QK_HDIM = (64, 128, 192, 256)
 SUPPORTED_V_HDIM = (64, 128)
 
@@ -329,17 +343,33 @@ def _packed_tile_indices(gqa_ratio, warp_idx, lane_idx, num_q_tiles_per_wave):
 # ============================================================================
 
 
+_B8_WMMA = {
+    (fx.Float8E4M3FN, fx.Float8E4M3FN): rocdl.wmma_f32_16x16x64_fp8_fp8,
+    (fx.Float8E4M3FN, fx.Float8E5M2): rocdl.wmma_f32_16x16x64_fp8_bf8,
+    (fx.Float8E5M2, fx.Float8E4M3FN): rocdl.wmma_f32_16x16x64_bf8_fp8,
+    (fx.Float8E5M2, fx.Float8E5M2): rocdl.wmma_f32_16x16x64_bf8_bf8,
+}
+
+
 def _wmma(a, b, c):
-    """v_wmma_f32_16x16x32_{bf16,f16} (gfx1250, wave32): C[16x16 f32] = A[16x32] @
-    B[32x16] + C, with operand reuse off. ``a``/``b`` are v16 16-bit fragments, ``c`` a
-    v8 f32 accumulator; returns the raw v8 f32 result, feedable straight back as ``c``.
+    """One WMMA: C[16x16 f32] = A @ B + C, operand reuse off, v8 f32 accumulator.
+
+    16-bit operands take ``16x16x32`` and are passed as v16 bf16/f16. 8-bit operands
+    take ``16x16x64`` -- twice the contraction depth for the same 8 VGPRs -- and A/B may
+    mix FP8(E4M3FN) and BF8(E5M2) freely, one intrinsic per combination. The 8-bit
+    intrinsics reject float vectors ("operand #0 must be ... vector of integer"), so the
+    fragments are bitcast to v8 i32; the bits are unchanged.
     """
     v8f32 = fx.Vector.make_type(8, fx.Float32)
-    wmma = (
-        rocdl.wmma_f32_16x16x32_f16
-        if a.dtype is fx.Float16
-        else rocdl.wmma_f32_16x16x32_bf16
-    )
+    if a.dtype in _B8_DTYPES:
+        wmma = _B8_WMMA[(a.dtype, b.dtype)]
+        a, b = a.bitcast(fx.Int32), b.bitcast(fx.Int32)
+    else:
+        wmma = (
+            rocdl.wmma_f32_16x16x32_f16
+            if a.dtype is fx.Float16
+            else rocdl.wmma_f32_16x16x32_bf16
+        )
     # modC defaults to WMMACModifier::none (== the old modC=0); omit it.
     return wmma(v8f32, _ir(a), _ir(b), _ir(c), reuseA=False, reuseB=False).result
 
