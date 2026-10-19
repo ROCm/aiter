@@ -159,7 +159,9 @@ def test_standalone_accepts_custom_limit_and_compiles_the_discovered_jobs(
     with pytest.raises(SystemExit) as exited:
         aot.main()
     assert exited.value.code == 0
-    assert "Compiled:     4 ok, 0 failed" in capsys.readouterr().out
+    # Two GEMM1 interleave layouts, plus atomic GEMM2 bias variants for both
+    # valid-token-count modes.
+    assert "Compiled:     6 ok, 0 failed" in capsys.readouterr().out
     assert external_compiler
 
 
@@ -286,7 +288,7 @@ def test_documented_selected_csv_batch_runs_real_pool_in_an_independent_cpu_proc
         AITER_MXFP4_TUNE_SWIGLU_LIMIT="5",
         AITER_FLYDSL_STAGE2_FP8="1",
         AITER_MXFP4_INTERMEDIATE="1",
-        AITER_FLYDSL_AOT_WORKERS="2",
+        AITER_MAX_JOBS="2",
     )
     result = subprocess.run(
         [
