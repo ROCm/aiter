@@ -25,9 +25,7 @@ import math as host_math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -495,21 +493,22 @@ def build_flash_attn_func_module_gfx11(
             None
         ),
     ):
-        ctx = CompilationContext.get_current()
         n_qblk = (seq_q + (BLOCK_M - 1)) // BLOCK_M
-        launcher = flash_attn_func_kernel(Q, K, V, O, seq_q, seq_kv)
-        launcher.launch(
-            grid=(n_qblk * H, 1, batch_size), block=(THREADS, 1, 1), stream=stream
-        )
-
-        if const_expr(waves_per_eu is not None and int(waves_per_eu) >= 1):
-            # The gpu.func only exists once launch() has emitted it; an attribute
-            # set before that point finds no op and is silently dropped.
-            for op in ctx.gpu_module_body.operations:
-                if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
-                    op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
-                        T.i32, int(waves_per_eu)
-                    )
+        flash_attn_func_kernel(
+            Q,
+            K,
+            V,
+            O,
+            seq_q,
+            seq_kv,
+            value_attrs={
+                "rocdl.waves_per_eu": (
+                    int(waves_per_eu)
+                    if const_expr(waves_per_eu is not None and int(waves_per_eu) >= 1)
+                    else None
+                ),
+            },
+        ).launch(grid=(n_qblk * H, 1, batch_size), block=(THREADS, 1, 1), stream=stream)
 
     launch_flash_attn_func.compile_hints = {
         "fast_fp_math": fast_fp_math,
