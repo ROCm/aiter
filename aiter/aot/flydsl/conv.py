@@ -64,6 +64,16 @@ from aiter.ops.flydsl.kernels.conv.conv3d_implicit_gfx950 import (
     _dyn_hw_closure_key,
     compile_conv3d_implicit,
 )
+from aiter.ops.flydsl.kernels.conv.conv3d_implicit_gfx1250 import (
+    compile_conv3d_implicit_gfx1250,
+    make_conv3d_implicit_param_gfx1250,
+)
+from aiter.ops.flydsl.kernels.conv.conv3d_gfx1250_utils import CGP_ALIGN
+from aiter.ops.flydsl.conv3d_gfx1250 import (
+    AITER_CONV3D_DYN_HW as AITER_CONV3D_DYN_HW_1250,
+    _dyn_hw_ok_gfx1250,
+    _dispatch as _dispatch_gfx1250,
+)
 from aiter.ops.flydsl.kernels.conv.conv3d_transpose import (
     TR_MAX_BIG_S,
     TR_VEC,
@@ -99,6 +109,11 @@ def _conv_dedupe_key(job):
     """
     if not job["dyn_hw"]:
         return job_identity(job)
+    if str(job.get("gfx", "")).startswith("gfx1250"):
+        # gfx1250 dyn_hw: one artifact per layer (blank D/H/W/N).
+        return tuple(
+            sorted((k, v) for k, v in job.items() if k not in _RESOLUTION_COLS)
+        )
     tile = (job["tile_m"], job["tile_n"], job["wave_m"], job["wave_n"])
     try:
         param = _implicit_param_from_problem(
@@ -192,6 +207,8 @@ def parse_csv(csv_path: str):
                 # Missing splitK is resolved like the runtime, not defaulted to 1.
                 raw_splitk = row.get("splitK", "")
                 splitk = (int(raw_splitk) or 1) if raw_splitk else None
+                raw_br = row.get("block_rows", "")
+                block_rows = int(raw_br) if raw_br else None
             except ValueError as exc:
                 print(f"  [WARN] {csv_path}: unparsable row ({exc}), skipping")
                 continue
@@ -205,7 +222,11 @@ def parse_csv(csv_path: str):
                 continue
 
             groups = shape["groups"]
-            cgp = _pad_channels(shape["C"] // groups)
+            is_1250 = str(gfx).startswith("gfx1250")
+            if is_1250:
+                cgp = (shape["C"] // groups + CGP_ALIGN - 1) // CGP_ALIGN * CGP_ALIGN
+            else:
+                cgp = _pad_channels(shape["C"] // groups)
             c_padded = groups * cgp
 
             # out_ndhwc is compile-time; input layout is not. Two conv jobs per row.
@@ -215,6 +236,8 @@ def parse_csv(csv_path: str):
                 config["wave_m"],
                 config["wave_n"],
             )
+            if is_1250 and block_rows is None:
+                block_rows = 8
 
             # splitK is in the compile key: match what the runtime will request.
             crs = cgp * shape["kT"] * shape["kH"] * shape["kW"]
@@ -230,22 +253,35 @@ def parse_csv(csv_path: str):
                 num_cu=cu_num or None,
             )
             for out_ndhwc in (False, True):
-                conv_job = {
-                    "kind": "conv3d",
-                    "kernel_name": "conv3d_implicit_kernel",
-                    "cu_num": cu_num,
-                    "gfx": gfx,
-                    "has_bias": has_bias,
-                    "splitk": splitk,
-                    "out_ndhwc": out_ndhwc,
-                    # Same derivation as dispatch; dyn_hw is in the compile key.
-                    "dyn_hw": _resolve_dyn_hw(
+                if is_1250:
+                    dyn_hw = _resolve_dyn_hw_gfx1250(
+                        shape=shape,
+                        tile=tile,
+                        block_rows=block_rows,
+                        c_padded=c_padded,
+                    )
+                else:
+                    dyn_hw = _resolve_dyn_hw(
                         shape=shape,
                         splitk=splitk,
                         tile=tile,
                         out_ndhwc=out_ndhwc,
                         has_bias=has_bias,
+                    )
+                conv_job = {
+                    "kind": "conv3d",
+                    "kernel_name": (
+                        "conv3d_implicit_gfx1250_kernel"
+                        if is_1250
+                        else "conv3d_implicit_kernel"
                     ),
+                    "cu_num": cu_num,
+                    "gfx": gfx,
+                    "has_bias": has_bias,
+                    "splitk": splitk,
+                    "out_ndhwc": out_ndhwc,
+                    "dyn_hw": dyn_hw,
+                    "block_rows": block_rows,
                     **shape,
                     **config,
                 }
@@ -312,6 +348,24 @@ def _resolve_dyn_hw(*, shape, splitk, tile, out_ndhwc, has_bias):
     )
 
 
+def _resolve_dyn_hw_gfx1250(*, shape, tile, block_rows, c_padded):
+    """gfx1250 dyn_hw gate (host-pre-padded extents assumed = shape + pad)."""
+    if not AITER_CONV3D_DYN_HW_1250:
+        return False
+    n, d, h, w = shape["N"], shape["D"], shape["H"], shape["W"]
+    # Approximate post-pad extents the way runtime host pad does for zeros pad.
+    d_p = d + 2 * shape["pad_d"]
+    h_p = h + 2 * shape["pad_h"]
+    w_p = w + 2 * shape["pad_w"]
+    do = out_extent(d_p, 0, shape["dil_d"], shape["kT"], shape["stride_d"])
+    ho = out_extent(h_p, 0, shape["dil_h"], shape["kH"], shape["stride_h"])
+    wo = out_extent(w_p, 0, shape["dil_w"], shape["kW"], shape["stride_w"])
+    npq = n * do * ho * wo
+    return _dyn_hw_ok_gfx1250(
+        n, c_padded, d_p, h_p, w_p, shape["K"], npq, tile, block_rows, ho, wo
+    )
+
+
 def job_arch(cu_num: int = 0, gfx: str = "") -> str:
     """Target arch a job would compile for -- shared by dispatch and filtering."""
     return gfx or cu_num_to_arch(cu_num, default=CONV_AOT_ARCH_DEFAULT)
@@ -368,10 +422,45 @@ def _compile_conv3d_to_cache(
     wgm: int,
     out_ndhwc: bool = False,
     dyn_hw: bool = False,
+    block_rows: int | None = None,
+    gfx: str = "",
+    **_ignored,
 ):
-    # No **kwargs: a job field this does not name is a compile-time parameter
-    # being dropped, which would cache an artifact under the default and leave
-    # the runtime JITing the one it asked for. Let it raise TypeError instead.
+    # No silent drops of named compile-time fields: unknown extras stay in
+    # ``_ignored`` (cu_num / kernel_name arrive via compile_one_config).
+    del _ignored
+    if str(gfx).startswith("gfx1250"):
+        _compile_conv3d_gfx1250_to_cache(
+            N=N,
+            C=C,
+            D=D,
+            H=H,
+            W=W,
+            K=K,
+            kT=kT,
+            kH=kH,
+            kW=kW,
+            stride_d=stride_d,
+            stride_h=stride_h,
+            stride_w=stride_w,
+            pad_d=pad_d,
+            pad_h=pad_h,
+            pad_w=pad_w,
+            dil_d=dil_d,
+            dil_h=dil_h,
+            dil_w=dil_w,
+            groups=groups,
+            has_bias=has_bias,
+            splitk=splitk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            wave_m=wave_m,
+            wave_n=wave_n,
+            out_ndhwc=out_ndhwc,
+            dyn_hw=dyn_hw,
+            block_rows=block_rows or 8,
+        )
+        return
     exe = compile_conv3d_implicit(
         _implicit_param_from_problem(
             N,
@@ -404,6 +493,75 @@ def _compile_conv3d_to_cache(
     )
     with compile_only_env():
         _dispatch(exe, *_conv_probe_args(splitk), stream=None)
+
+
+def _compile_conv3d_gfx1250_to_cache(
+    *,
+    N,
+    C,
+    D,
+    H,
+    W,
+    K,
+    kT,
+    kH,
+    kW,
+    stride_d,
+    stride_h,
+    stride_w,
+    pad_d,
+    pad_h,
+    pad_w,
+    dil_d,
+    dil_h,
+    dil_w,
+    groups,
+    has_bias,
+    splitk,
+    tile_m,
+    tile_n,
+    wave_m,
+    wave_n,
+    out_ndhwc,
+    dyn_hw,
+    block_rows,
+):
+    """AOT compile path matching ``run_conv3d_gfx1250`` (host-pre-padded)."""
+    cgp = (C // groups + CGP_ALIGN - 1) // CGP_ALIGN * CGP_ALIGN
+    c_padded = groups * cgp
+    # Host pads then launches with pad=0; mirror that for the compile key.
+    d_p = D + 2 * pad_d
+    h_p = H + 2 * pad_h
+    w_p = W + 2 * pad_w
+    param = make_conv3d_implicit_param_gfx1250(
+        N,
+        c_padded,
+        d_p,
+        h_p,
+        w_p,
+        K,
+        kT,
+        kH,
+        kW,
+        stride_d,
+        stride_h,
+        stride_w,
+        dil_d,
+        dil_h,
+        dil_w,
+        has_bias and splitk == 1,
+        (tile_m, tile_n, wave_m, wave_n),
+        groups,
+        out_ndhwc,
+        block_rows,
+        num_buffers=2,
+        patch_reuse=False,
+        splitk=splitk,
+        dyn_hw=dyn_hw,
+    )
+    exe = compile_conv3d_implicit_gfx1250(param)
+    with compile_only_env():
+        _dispatch_gfx1250(exe, *_conv_probe_args(splitk), stream=None)
 
 
 def _compile_transpose_to_cache(*, N: int, c_padded: int, s: int):
@@ -446,7 +604,7 @@ def compile_one_config(
     try:
         with override_env("FLYDSL_GPU_ARCH", aot_arch):
             if kind == "conv3d":
-                _compile_conv3d_to_cache(**kwargs)
+                _compile_conv3d_to_cache(gfx=gfx, **kwargs)
             elif kind == "transpose":
                 _compile_transpose_to_cache(**kwargs)
             else:

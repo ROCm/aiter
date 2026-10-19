@@ -302,7 +302,38 @@ KW_CASES = [
     ("3d_1x1x1", 3, _X3, (48, 32, 1, 1, 1), {}, None, True),
     ("2d_3x3_pad1", 2, _X2, _W2, {"padding": 1}, None, False),
     ("2d_1x1", 2, _X2, (96, 96, 1, 1), {}, None, False),
-    ("2d_splitk2", 2, _X2, _W2, {"padding": 1, "splitk": 2}, {"padding": 1}, False),
+    # Tile must divide Ho/Wo and kg so split-K is not rejected by the tail gate
+    # (gfx950 and gfx1250 both refuse split-K with a masked tile edge).
+    (
+        "2d_splitk2",
+        2,
+        _X2,
+        _W2,
+        {
+            "padding": 1,
+            "splitk": 2,
+            "tile": (64, 32, 2, 1),
+            "block_rows": 4,
+            "patch_reuse": False,
+        },
+        {"padding": 1},
+        False,
+    ),
+    (
+        "3d_splitk2",
+        3,
+        (1, 32, 4, 32, 32),
+        (64, 32, 2, 2, 2),
+        {
+            "padding": 0,
+            "splitk": 2,
+            "tile": (64, 64, 2, 2),
+            "block_rows": 4,
+            "patch_reuse": False,
+        },
+        {"padding": 0},
+        False,
+    ),
     ("1d_3_pad1", 1, (1, 32, 128), (64, 32, 3), {"padding": 1}, None, False),
     # Independent input/output layouts; torch has no such kwargs (ref_kw).
     (

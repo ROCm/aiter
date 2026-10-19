@@ -93,7 +93,9 @@ TUNED_KEY_COLUMNS = (
     "groups",
     "bias",
 )
+# block_rows is optional in legacy gfx950 CSVs (loader defaults / ignores).
 TUNED_RESULT_COLUMNS = ("tile_m", "tile_n", "wave_m", "wave_n", "wgm")
+TUNED_OPTIONAL_RESULT_COLUMNS = ("block_rows",)
 TUNED_DEVICE_COLUMNS = ("gfx", "cu_num")
 
 # Result column, not part of the key. Empty cell means FlyDSL; other backends skipped.
@@ -252,7 +254,10 @@ _TUNED_LOOKUP_LOGGED = set()
 
 @functools.lru_cache(maxsize=1)
 def _load_tuned_table():
-    """``{(gfx, cu_num, *shape): (tile, wgm, splitk)}``. Empty dict on any failure."""
+    """``{(gfx, cu_num, *shape): (tile, wgm, splitk, block_rows)}``.
+
+    ``block_rows`` is None when the CSV omits the column (gfx950 tables).
+    """
     try:
         import pandas as pd
 
@@ -282,6 +287,7 @@ def _load_tuned_table():
             return {}
 
         has_libtype = TUNED_LIBTYPE_COLUMN in df.columns
+        has_block_rows = "block_rows" in df.columns
         skipped_libtypes = {}
 
         table = {}
@@ -314,6 +320,18 @@ def _load_tuned_table():
                 splitk = None
             if splitk is not None:
                 splitk = splitk or 1
+            block_rows = None
+            if has_block_rows:
+                raw_br = getattr(row, "block_rows", None)
+                try:
+                    if raw_br is not None and not (
+                        isinstance(raw_br, float) and pd.isna(raw_br)
+                    ):
+                        s = str(raw_br).strip()
+                        if s and s.lower() not in ("nan", ""):
+                            block_rows = int(float(s))
+                except (TypeError, ValueError):
+                    block_rows = None
             table[key] = (
                 (
                     int(row.tile_m),
@@ -323,6 +341,7 @@ def _load_tuned_table():
                 ),
                 int(row.wgm),
                 splitk,
+                block_rows,
             )
         if skipped_libtypes:
             from aiter import logger
@@ -364,17 +383,19 @@ def _log_tuned_lookup(table, dev, key, hit, borrowed=False):
     if hit is not None:
         splitk = hit[2]
         sk_s = f", splitK={splitk}" if splitk is not None else ""
+        br = hit[3] if len(hit) > 3 else None
+        br_s = f", block_rows={br}" if br is not None else ""
         if borrowed:
             logger.info(
                 f"conv3d_implicit: {shape} has no tuned row of its own on "
                 f"gfx={dev[0]}, cu_num={dev[1]}; borrowing this layer's nearest "
-                f"tuned resolution, tile={hit[0]}, wgm={hit[1]}. Tune this shape "
-                f"for the exact config."
+                f"tuned resolution, tile={hit[0]}, wgm={hit[1]}{br_s}. Tune this "
+                f"shape for the exact config."
             )
             return
         logger.info(
             f"conv3d_implicit: {shape} is tuned on gfx={dev[0]}, "
-            f"cu_num={dev[1]}; running tile={hit[0]}, wgm={hit[1]}{sk_s}."
+            f"cu_num={dev[1]}; running tile={hit[0]}, wgm={hit[1]}{sk_s}{br_s}."
         )
         return
 
@@ -446,11 +467,11 @@ def _borrow_tuned_tile(dev, key):
     f = dict(zip(TUNED_KEY_COLUMNS, key))
     if not _tile_fills_device(want, f["K"], f["groups"], hit[0], dev[1]):
         return None
-    return (hit[0], hit[1], None)
+    return (hit[0], hit[1], None, hit[3] if len(hit) > 3 else None)
 
 
 def _lookup_tuned_tile(key, device):
-    """Tuned (tile, wgm, splitk) for this device, or a borrowed same-layer row."""
+    """Tuned (tile, wgm, splitk, block_rows) for this device, or a borrowed row."""
     del device
     if key is None:
         return None
@@ -973,7 +994,7 @@ def _conv3d_impl(
     else:
         hit = _lookup_tuned_tile(tuned_key, x.device)
         if hit is not None:
-            chosen_tile, chosen_wgm, tuned_splitk = hit
+            chosen_tile, chosen_wgm, tuned_splitk = hit[0], hit[1], hit[2]
             if forced_wgm is not None:
                 chosen_wgm = forced_wgm
         else:

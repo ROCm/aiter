@@ -32,11 +32,16 @@ from aiter.ops.flydsl.conv3d_policy import (
     get_flydsl_conv3d_configs,
     tile_kernel_name,
 )
+from aiter.ops.flydsl.conv3d_policy_gfx1250 import (
+    get_flydsl_conv3d_configs_gfx1250,
+    tile_kernel_name_gfx1250,
+)
 from aiter.ops.flydsl.conv_kernels import (
     LIBTYPE_FLYDSL,
     TUNED_DEVICE_COLUMNS,
     TUNED_KEY_COLUMNS,
     TUNED_LIBTYPE_COLUMN,
+    TUNED_OPTIONAL_RESULT_COLUMNS,
     TUNED_RESULT_COLUMNS,
     _check_supported_arch,
     _is_matmul_fast_path,
@@ -57,6 +62,7 @@ RESULT_LIST = [
     # This tuner only enumerates FlyDSL candidates, so it always writes that.
     TUNED_LIBTYPE_COLUMN,
     *TUNED_RESULT_COLUMNS,
+    *TUNED_OPTIONAL_RESULT_COLUMNS,  # block_rows (gfx1250; empty on gfx950)
     "splitK",
     "us",
     "kernelName",
@@ -104,14 +110,11 @@ def generate_data(n, c, d, h, w, k, kt, kh, kw, groups, has_bias, seed=0, device
     return {"x": x, "weight": weight, "bias": bias}
 
 
-def run_flydsl_conv3d(x, weight, bias, params, tile, wgm, splitk):
+def run_flydsl_conv3d(x, weight, bias, params, tile, wgm, splitk, block_rows=None):
     # splitk is pinned rather than re-derived by the dispatch, so the CSV column
     # is the value that was timed and AOT compiles the artifact the runtime asks
-    # for.
-    return flydsl_conv_implicit(
-        x,
-        weight,
-        bias=bias,
+    # for. block_rows is gfx1250-only; ignored on gfx950.
+    kw = dict(
         tile=tile,
         wgm=wgm,
         splitk=splitk,
@@ -119,6 +122,9 @@ def run_flydsl_conv3d(x, weight, bias, params, tile, wgm, splitk):
         output_layout=LAYOUT,
         **params,
     )
+    if block_rows is not None:
+        kw["block_rows"] = block_rows
+    return flydsl_conv_implicit(x, weight, bias=bias, **kw)
 
 
 def conv3d_ref(x, weight, bias, params):
@@ -321,42 +327,55 @@ class Conv3dTuner(TunerCommon):
         has_bias = _parse_tuned_bool(kv["bias"])
         params = _row_params(kv)
         m_gemm, n_gemm, _k_gemm, _ = self._gemm_dims(keys)
+        gfx = self.get_gfx()
+        is_1250 = str(gfx).startswith("gfx1250")
 
-        configs = get_flydsl_conv3d_configs(
-            m_gemm, n_gemm, groups, self.get_cu_num(), max_configs=max_configs
-        )
-        # BASELINE_TILES covers the heuristic default but not a borrowed one: a
-        # tile tuned at another resolution of this layer can fall outside this
-        # npq's max_configs cut, and the runtime serves it until this row exists.
+        if is_1250:
+            configs = get_flydsl_conv3d_configs_gfx1250(
+                m_gemm, n_gemm, groups, self.get_cu_num(), max_configs=max_configs
+            )
+        else:
+            configs = [
+                (*c, None)
+                for c in get_flydsl_conv3d_configs(
+                    m_gemm, n_gemm, groups, self.get_cu_num(), max_configs=max_configs
+                )
+            ]
+        # BASELINE_TILES covers the heuristic default but not a borrowed one.
         borrowed = _borrow_tuned_tile(
-            (self.get_gfx(), self.get_cu_num()),
+            (gfx, self.get_cu_num()),
             _shape_key(keys[len(TUNED_DEVICE_COLUMNS) :]),
         )
-        if borrowed is not None and (*borrowed[0], borrowed[1]) not in configs:
-            configs.append((*borrowed[0], borrowed[1]))
+        if borrowed is not None:
+            br = borrowed[3] if len(borrowed) > 3 else None
+            cand = (*borrowed[0], borrowed[1], br)
+            if cand not in configs:
+                configs.append(cand)
 
         # crs is built from the *padded* per-group channel count, matching what
         # the kernel computes; splitK divisibility depends on it.
-        cgp = _pad_channels(c // groups)
+        # gfx1250 aligns C/groups to 32 (CGP_ALIGN); gfx950 uses LDG_VEC via
+        # _pad_channels.
+        if is_1250:
+            from aiter.ops.flydsl.kernels.conv.conv3d_gfx1250_utils import CGP_ALIGN
+
+            cgp = (c // groups + CGP_ALIGN - 1) // CGP_ALIGN * CGP_ALIGN
+        else:
+            cgp = _pad_channels(c // groups)
         crs = cgp * kt * kh * kw
 
         tasks = []
-        for tile_m, tile_n, wave_m, wave_n, wgm in configs:
+        for tile_m, tile_n, wave_m, wave_n, wgm, block_rows in configs:
             tile = (tile_m, tile_n, wave_m, wave_n)
-            # splitK is derived, not swept. A split only buys occupancy where
-            # the M/N grid alone cannot fill the device, and measured against
-            # the heuristic's own 3/4*CU bar that is 1 of the 76 shipped rows --
-            # the rest would spend tuning time confirming splitK=1 while paying
-            # an fp32 staging buffer and an atomic reduce to do it. It is still
-            # pinned rather than re-derived at dispatch, so the column records
-            # the value that ran and AOT compiles the artifact the runtime asks
-            # for.
-            # num_cu explicitly, so the CU count behind the split is the same
-            # one the policy enumerated against and the tuned row is stamped
-            # with; the device probe it would fall back to is a second source.
             sk = _resolve_splitk(
                 None, m_gemm, crs, k, None, tile, groups, num_cu=self.get_cu_num()
             )
+            if is_1250:
+                kname = tile_kernel_name_gfx1250(
+                    tile_m, tile_n, wave_m, wave_n, block_rows or 8
+                )
+            else:
+                kname = tile_kernel_name(tile_m, tile_n, wave_m, wave_n, wgm)
             info = (
                 keys,
                 tile_m,
@@ -364,8 +383,9 @@ class Conv3dTuner(TunerCommon):
                 wave_m,
                 wave_n,
                 wgm,
+                block_rows,
                 sk,
-                tile_kernel_name(tile_m, tile_n, wave_m, wave_n, wgm),
+                kname,
             )
             tasks.append(
                 (
@@ -373,7 +393,7 @@ class Conv3dTuner(TunerCommon):
                     generate_data,
                     (n, c, d, h, w, k, kt, kh, kw, groups, has_bias),
                     run_flydsl_conv3d,
-                    (["x", "weight", "bias"], params, tile, wgm, sk),
+                    (["x", "weight", "bias"], params, tile, wgm, sk, block_rows),
                     {},
                     conv3d_ref,
                     (["x", "weight", "bias"], params),
@@ -383,8 +403,6 @@ class Conv3dTuner(TunerCommon):
                     ATOL,
                     None,  # compare_fn
                     None,  # max_abs_delta
-                    # No output_keys: conv3d_implicit allocates and returns its
-                    # own output, so there is no caller-owned buffer to NaN-fill.
                     None,
                 )
             )
@@ -466,7 +484,17 @@ class Conv3dTuner(TunerCommon):
         rows = []
         for el in results:
             info, time, err_ratio = el
-            keys, tile_m, tile_n, wave_m, wave_n, wgm, splitk, kernel_name = info
+            (
+                keys,
+                tile_m,
+                tile_n,
+                wave_m,
+                wave_n,
+                wgm,
+                block_rows,
+                splitk,
+                kernel_name,
+            ) = info
             tflops, bw = self.calculate(el)
             row = dict(zip(self.keys, keys))
             row.update(
@@ -477,6 +505,7 @@ class Conv3dTuner(TunerCommon):
                     "wave_m": wave_m,
                     "wave_n": wave_n,
                     "wgm": wgm,
+                    "block_rows": "" if block_rows is None else block_rows,
                     "splitK": splitk,
                     "us": time,
                     "kernelName": kernel_name,
@@ -489,7 +518,8 @@ class Conv3dTuner(TunerCommon):
                 print(
                     f"Tuning result for {str(dict(zip(self.keys, keys))).strip('{}')} "
                     f"is tile=({tile_m},{tile_n},{wave_m},{wave_n}) wgm={wgm} "
-                    f"splitK={splitk}, {time}us, {err_ratio=}, {tflops=} TFLOPS, {bw=} GB/s"
+                    f"block_rows={block_rows} splitK={splitk}, {time}us, "
+                    f"{err_ratio=}, {tflops=} TFLOPS, {bw=} GB/s"
                 )
             rows.append(row)
         return pd.DataFrame(rows, columns=self.columns)
