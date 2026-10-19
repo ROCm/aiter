@@ -800,8 +800,8 @@ def test_mha_backward(
 def test_mha_dao_ai_backward_head_size(
     head_size, varlen, seqlen_q, seqlen_k, strided, monkeypatch
 ):
-    from aiter.ops.triton.attention import mha
     from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import bwd, interface_v2
+    from aiter.ops.triton.attention import mha
 
     monkeypatch.setattr(interface_v2, "BWD_MODE", "fused")
     kernel = bwd.bwd_kernel_fused_causal
