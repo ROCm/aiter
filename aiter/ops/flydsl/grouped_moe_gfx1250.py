@@ -704,6 +704,15 @@ def _grouped_a8w4_tdm_moe(
     _ep_nvt = None
     _fuse_ep_route_quant = False
     ep_rowmap = None
+    # Small TP batches: one workgroup counts, scans and remaps every route, in
+    # place of the counter fill, route and psum-remap launches.
+    _fused_tp_route = (
+        not _compact
+        and not _is_ep
+        and not enable_ep_scatter
+        and token_num * topk <= _FUSED_ROUTE_PSUM_MAX_NUMEL
+        and int(E) <= _FUSED_ROUTE_PSUM_MAX_EXPERTS
+    )
     if _compact:
         _masked_m = stage2_scatter.compact_masked_m
         topids_to_rows = None
@@ -787,6 +796,10 @@ def _grouped_a8w4_tdm_moe(
                 ep_rowmap=ep_rowmap,
                 contiguous_expert_mask=_direct_ep_mask,
             )
+    elif _fused_tp_route:
+        _masked_m, topids_to_rows, psum = fused_route_psum_remap(
+            topk_ids, E, max_m, _align_m
+        )
     else:
         _fuse_ep_route_quant = False
         _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
@@ -821,6 +834,8 @@ def _grouped_a8w4_tdm_moe(
         psum = stage2_scatter.compact_psum
     elif _fuse_ep_route_quant:
         psum = None
+    elif _fused_tp_route:
+        pass  # psum came from fused_route_psum_remap above
     elif _fuse_psum_quant:
         # The remapper's scan and ep_rowmap scatter ride the quant kernel:
         # every workgroup re-derives the (E,) prefix in LDS, so this launch

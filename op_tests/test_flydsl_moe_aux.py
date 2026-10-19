@@ -34,6 +34,8 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.grouped_moe_gfx1250 import (
     _build_g2l_lut,
     _grouped_a8w4_preshuffle_e8m0_scale,
+    contiguous_psum_remap,
+    fused_route_psum_remap,
 )
 from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
     build_moe_contiguous_psum_module,
@@ -58,6 +60,7 @@ from aiter.ops.flydsl.kernels.moe_scatter_copy_token import (
     build_moe_scatter_copy_token_module,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter.ops.flydsl.moe_kernels import flydsl_moe_topids_to_rows
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -814,17 +817,35 @@ def test_route_maps(numel, E, topk, max_m):
     return ret
 
 
+def _decode_topk_ids(tokens, E, topk):
+    """Decode routing with a fused shared expert: each token picks topk-1
+    distinct routed experts from [0, E-1) and always routes to expert E-1."""
+    routed = torch.rand(tokens, E - 1).topk(topk - 1, dim=1).indices
+    shared = torch.full((tokens, 1), E - 1, dtype=routed.dtype)
+    return torch.cat([routed, shared], dim=1).to(I32).contiguous()
+
+
 @benchmark()
-def test_route_psum_fused(numel, E, tile_m):
+def test_route_psum_fused(numel, E, tile_m, topk=0):
     """Single-workgroup route + LDS atomic + psum + remap, all in one launch.
 
     Collapses what test_topids_to_rows and test_contiguous_psum cover separately,
     so the checks are the union: exact masked_m/starts/psum against the torch
     prefix sum, and the row invariants against the *contiguous* bands it emits.
+
+    With ``topk`` set, routing is decode-shaped (``_decode_topk_ids``), max_m is
+    the TP grouped path's, and the ``fused_route_psum_remap`` wrapper is also
+    checked against the unfused ``flydsl_moe_topids_to_rows`` +
+    ``contiguous_psum_remap`` pair it replaces on that path.
     """
     launch = build_moe_route_psum_fused_module()
-    max_m = max(512, 4 * numel // E)
-    topk_ids = torch.randint(0, E, (numel,), dtype=I32)
+    if topk:
+        ids_2d = _decode_topk_ids(numel // topk, E, topk)
+        topk_ids = ids_2d.reshape(-1)
+        max_m = max(tile_m, (numel + tile_m - 1) // tile_m * tile_m)
+    else:
+        max_m = max(512, 4 * numel // E)
+        topk_ids = torch.randint(0, E, (numel,), dtype=I32)
     counts = torch.bincount(topk_ids.long(), minlength=E).to(I32)
     assert max_m > int(counts.max()), "max_m too small for this shape"
     ref_starts, ref_psum, _ = run_torch_psum(counts, tile_m)
@@ -877,6 +898,21 @@ def test_route_psum_fused(numel, E, tile_m):
         ret[f"{name} us"] = us
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
+    if topk:
+        f_masked, f_rows, f_psum = fused_route_psum_remap(ids_2d, E, max_m, tile_m)
+        u_masked, u_rows = flydsl_moe_topids_to_rows(ids_2d, E, max_m)
+        _, u_psum, _ = contiguous_psum_remap(u_masked, u_rows, E, max_m, tile_m)
+        assert torch.equal(f_masked, u_masked[:E].to(I32)), "masked_m vs unfused"
+        assert torch.equal(f_psum, u_psum), "psum vs unfused"
+        # Slots inside an expert's band follow atomic order, so check the band
+        # each route lands in and the row set, not row-for-row equality.
+        for tag, r in (("fused", f_rows), ("unfused", u_rows)):
+            r = r.reshape(-1).long()
+            expert = torch.searchsorted(ref_starts.long(), r, right=True) - 1
+            assert torch.equal(expert, topk_ids.long()), f"{tag}: wrong expert band"
+        assert torch.equal(
+            f_rows.reshape(-1).sort().values, u_rows.reshape(-1).sort().values
+        ), "fused and unfused row sets differ"
     return ret
 
 
@@ -1172,6 +1208,14 @@ def main():
             for n, E, tm in itertools.product(
                 args.numel, [e for e in args.experts if e <= 512], args.tile_m
             )
+        ],
+    )
+    # MiniMax-M3 TP decode: 128 routed + 1 fused shared expert, top-5.
+    summarize(
+        "moe_route_psum_fused (M3 decode, vs unfused)",
+        [
+            test_route_psum_fused(t * 5, 129, tm, topk=5)
+            for t, tm in itertools.product(range(1, 17), [64, 128])
         ],
     )
     summarize(
