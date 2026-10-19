@@ -72,19 +72,30 @@ def test_get_dtype_fp8_delegates_to_shared_runtime_detector():
 
 def test_get_dtype_fp8_skips_runtime_detection_without_hip_device():
     script = textwrap.dedent("""
+        import os
         import sys
         from unittest import mock
 
         import torch
         from aiter.utility import dtypes
 
-        for hip, available in ((None, True), ("6.3", False)):
+        cases = (
+            (None, True, "gfx950", torch.uint8),
+            ("6.3", False, "", torch.uint8),
+            ("6.3", False, "native", torch.uint8),
+            ("6.3", False, "gfx942;gfx950", torch.uint8),
+            # A single explicit target stands in for the absent GPU (AOT builds).
+            ("6.3", False, "gfx942", torch.float8_e4m3fnuz),
+            ("6.3", False, "gfx950", torch.float8_e4m3fn),
+        )
+        for hip, available, gpu_archs, expected in cases:
             with (
                 mock.patch.dict(sys.modules, {"aiter.jit.utils.chip_info": None}),
+                mock.patch.dict(os.environ, {"GPU_ARCHS": gpu_archs}),
                 mock.patch.object(torch.version, "hip", hip),
                 mock.patch.object(torch.cuda, "is_available", return_value=available),
             ):
-                assert dtypes.get_dtype_fp8() is torch.uint8
+                assert dtypes.get_dtype_fp8() is expected, (hip, gpu_archs)
     """)
     subprocess.run([sys.executable, "-c", script], check=True, env=_test_env())
 

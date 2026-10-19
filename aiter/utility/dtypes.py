@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
+import os
 
 import torch
 
@@ -23,8 +24,16 @@ _8bit_fallback = torch.uint8
 
 
 def get_dtype_fp8():
-    if torch.version.hip is None or not torch.cuda.is_available():
+    if torch.version.hip is None:
         return _8bit_fallback
+    if not torch.cuda.is_available():
+        # With no GPU to detect (CPU-only builds, AOT compilation), a single
+        # explicit GPU_ARCHS target stands in for the live GPU, as in
+        # chip_info.get_gfx_runtime().
+        targets = [t.strip() for t in os.getenv("GPU_ARCHS", "").split(";")]
+        targets = [t for t in targets if t]
+        gfx = targets[0].lower() if len(targets) == 1 else None
+        return defaultDtypes.get(gfx, {"fp8": _8bit_fallback})["fp8"]
     from ..jit.utils.chip_info import get_gfx_runtime
 
     gfx = get_gfx_runtime()
