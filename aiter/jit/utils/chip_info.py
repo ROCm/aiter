@@ -12,6 +12,7 @@ from build_targets import (
     _parse_gpu_archs_env,
     filter_tune_df,
     get_build_targets_env,
+    torch_processor_count_to_cu,
 )
 from cpp_extension import executable_path
 from torch_guard import torch_compile_guard
@@ -106,14 +107,25 @@ def get_lds_capacity_bytes(gfx: str | None = None) -> int:
 
 @functools.lru_cache(maxsize=1)
 def get_gfx_runtime() -> str:
-    """Return the arch of the live GPU, always via rocminfo/hipinfo.
+    """Return the live GPU arch, using Torch if Windows hipinfo is unavailable.
 
     Unlike get_gfx(), ignores GPU_ARCHS -- always detects the actual running
     GPU.  Use for runtime dispatch decisions (selecting tuned kernels, picking
     code paths).  Use get_gfx() for build-time codegen paths (gen_instances,
     csrc module-level arch selection) where no GPU may be available.
     """
-    gfx_arch = _detect_native()[0]
+    try:
+        gfx_arch = _detect_native()[0]
+    except RuntimeError:
+        if not IS_WINDOWS:
+            raise
+        import torch
+
+        if torch.version.hip is None or not torch.cuda.is_available():
+            raise
+        gfx_arch = (
+            torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0].lower()
+        )
     supported = set(GFX_MAP.values())
     if gfx_arch not in supported:
         raise KeyError(
@@ -259,25 +271,19 @@ def _parse_cu_num_rocminfo(output: str) -> list[int]:
     return gpu_compute_units
 
 
-def _parse_cu_num_hipinfo(output: str) -> list[int]:
-    # hipinfo prints one block per device with a line like:
-    #   "multiProcessorCount:           80"
-    # On AMD GPUs this is the compute-unit count.
-    return [
-        int(m.group(1)) for m in re.finditer(r"multiProcessorCount\s*:\s*(\d+)", output)
-    ]
-
-
 @torch_compile_guard()
 def get_cu_num_custom_op() -> int:
     cu_num = int(os.getenv("CU_NUM", "0"))
     if cu_num == 0:
+        if IS_WINDOWS:
+            import torch
+
+            props = torch.cuda.get_device_properties(0)
+            gfx = props.gcnArchName.split(":", 1)[0]
+            return torch_processor_count_to_cu(gfx, props.multi_processor_count)
         try:
             output = _gpu_info_output()
-            if IS_WINDOWS:
-                gpu_compute_units = _parse_cu_num_hipinfo(output)
-            else:
-                gpu_compute_units = _parse_cu_num_rocminfo(output)
+            gpu_compute_units = _parse_cu_num_rocminfo(output)
         except Exception as e:  # noqa: BLE001  blanket catch is intentional here
             raise RuntimeError(
                 f"Get GPU Compute Unit from {_GPU_INFO_TOOL} failed {e!s}"
