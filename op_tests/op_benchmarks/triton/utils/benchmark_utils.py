@@ -320,7 +320,7 @@ def parse_vgpr_usage(file_path, table_start="result-table-name"):
     # Print extracted information
     print("\n".join(vgpr_info))
     table = PrettyTable()
-    table.field_names = re.split(r" {1,}", table_lines[0].strip())
+    table.field_names = re.split(r" {2,}", table_lines[0].strip())
     [table.add_row(line.split()[1:]) for line in table_lines[1:]]
 
     print(table)
@@ -364,9 +364,10 @@ def get_dtype_bytes(dtype):
     elif dtype == torch.int64:
         return 8
     elif dtype in [
+        torch.float8_e4m3fn,
         torch.float8_e4m3fnuz,
         torch.float8_e5m2fnuz,
-        tl.float8e4,
+        tl.float8e4nv,
         tl.float8e5,
     ]:
         return 1

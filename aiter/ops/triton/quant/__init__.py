@@ -1,4 +1,7 @@
-from aiter.ops.triton.quant.fast_transpose import fast_transpose_2d
+from aiter.ops.triton.quant.fast_transpose import (
+    fast_transpose_2d,
+    transpose_packed_fp4,
+)
 from aiter.ops.triton.quant.fused_fp8_quant import (
     calc_rows_per_block,
     fused_flatten_fp8_group_quant,
@@ -90,4 +93,5 @@ __all__ = [
     "requant_fp8_row_to_col",
     # quant.py exports
     "static_per_tensor_quant_fp8_i8",
+    "transpose_packed_fp4",
 ]
