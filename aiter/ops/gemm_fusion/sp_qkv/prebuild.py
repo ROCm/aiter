@@ -36,8 +36,10 @@ from aiter.gemm_fusion.prebuild import BuildError, Task, Unit, default_jobs, exe
 
 from . import jit, specs
 
-# relative wall hints, used ONLY to order the scheduler (critical path first); calibrate from `Report.tasks` of a real run
-COST_HINTS = {"sm_gemm": 4.0, "sm_ran": 3.0, "sm_host": 2.0, "sm_hashes": 0.3, "sm_link": 0.5, "lg_gemm": 10.0, "lg_host": 2.0, "gf_comm": 2.0}
+# wall hints in seconds, used ONLY to order the scheduler (critical path first). Measured by Evidence on the node (32 quota cores, frozen 22a6a3b9, legacy per-key walls):
+# small gemm 0.92-0.94, ran 0.47-0.54, host 0.54; large dense device 3.62 / indexer 4.48, host 0.47; gf_comm 0.43. The aot1 hash object and the final link are tiny (assumed).
+# Recalibrate from `Report.tasks` (prebuild --report-json) if the sources change; a wrong hint only changes the order, never the result.
+COST_HINTS = {"sm_gemm": 0.93, "sm_ran": 0.5, "sm_host": 0.54, "sm_hashes": 0.1, "sm_link": 0.2, "lg_gemm": 4.0, "lg_host": 0.47, "gf_comm": 0.43}
 
 
 # ----------------------------------------------------------------------------------------------------------------------------- rows -> modes
