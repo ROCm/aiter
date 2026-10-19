@@ -5,8 +5,24 @@ constants: bigm_config.py): MegaMoeTPBigM (the SDMA window, buffers, per-batch p
 launches), the disk cache of the compiled kernels, the bf16 row gather of the fused tail.
 """
 
+import ast
+import ctypes
+import hashlib
+import inspect
+import logging
 import os
+import pickle
+import re
+import stat
+import tempfile
+import time
 
+import torch
+import torch.distributed as dist
+
+from aiter.jit.utils.chip_info import get_gfx
+
+from ..tensor_shim import _preload_compiled, _run_compiled
 from .bigm_config import (
     C_ERR,
     CMAX,
@@ -18,8 +34,12 @@ from .bigm_config import (
     i8_row_bytes,
     unit_cap,
 )
+from .bigm_gemm import bigm_lds
 from .bigm_kernel import compile_bigm_layer
+from .sdma import SdmaComm, compile_signal_read, sdma_bitcode
 from .tuned import bigm_tuned
+
+_log = logging.getLogger("aiter")
 
 __all__ = ["PAD", "MegaMoeTPBigM", "compile_bigm_layer"]
 
@@ -29,27 +49,50 @@ __all__ = ["PAD", "MegaMoeTPBigM", "compile_bigm_layer"]
 # out of its disk cache -- its key does not cover the bitcode -- so every process would compile
 # every big-M variant again (~86 s each, all ranks waiting). The artifact itself pickles fine
 # (no post-load processors), so this keeps it on disk keyed by the compile arguments plus the
-# digest of everything else it is built from: these kernel sources, the SDMA bitcode, the
-# FlyDSL compiler (its own cache key) and the GPU arch.
+# digest of everything else it is built from: the kernel's sources (bigm_kernel.py and the
+# modules it imports from this package), the SDMA bitcode, the FlyDSL compiler (its own cache
+# key) and the GPU arch.
 _DIGEST = None
+
+
+def _kernel_sources():
+    """bigm_kernel.py and every module of aiter.ops.flydsl.kernels it imports, transitively
+    (relative imports, wherever in the file); not into sdma.py, whose part in the kernel is
+    MORI's bitcode (hashed itself) and whose host side imports the small-batch engine"""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # .../kernels
+    todo = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "bigm_kernel.py")]
+    seen = set()
+    while todo:
+        f = todo.pop()
+        if f in seen or not os.path.isfile(f) or os.path.basename(f) == "sdma.py":
+            continue
+        seen.add(f)
+        here = os.path.dirname(f)
+        with open(f) as fh:
+            tree = ast.parse(fh.read())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or not node.level:
+                continue
+            base = here
+            for _ in range(node.level - 1):
+                base = os.path.dirname(base)
+            if not base.startswith(root):
+                continue
+            mods = (
+                [os.path.join(base, *node.module.split("."))]
+                if node.module
+                else [os.path.join(base, a.name) for a in node.names]
+            )
+            for m in mods:
+                todo += [m + ".py", os.path.join(m, "__init__.py")]
+    return sorted(seen)
 
 
 def _bigm_digest():
     global _DIGEST
     if _DIGEST is None:
-        import glob
-        import hashlib
-
-        from aiter.jit.utils.chip_info import get_gfx
-
-        from .sdma import sdma_bitcode
-
-        here = os.path.dirname(os.path.abspath(__file__))
         h = hashlib.sha256(get_gfx().encode())
-        srcs = sorted(glob.glob(os.path.join(here, "*.py"))) + sorted(
-            glob.glob(os.path.join(here, "..", "*.py"))
-        )
-        for f in srcs + [sdma_bitcode(6)]:
+        for f in _kernel_sources() + [sdma_bitcode(6)]:
             with open(f, "rb") as fh:
                 h.update(fh.read())
         try:
@@ -82,18 +125,14 @@ _WARNED = set()
 
 def _warn_once(key, msg, *args):
     if key not in _WARNED:
-        import logging
-
         _WARNED.add(key)
-        logging.getLogger("aiter").warning(msg, *args)
+        _log.warning(msg, *args)
 
 
 def _private(path):
     """path (the cache directory or an entry) is this user's and only writable by them: a
     pickled entry runs code when loaded, so a shared / writable-by-others cache is skipped
     """
-    import stat
-
     try:
         st = os.stat(path)
     except OSError:
@@ -105,13 +144,6 @@ def _bigm_cached(launch, args):
     """Collective-free: make launch(*args)'s compiled artifact resident -- from this process's
     memory, else the disk cache, else compiled (no kernel dispatch) and written to the disk
     cache -- and its code object loaded. Returns how it was obtained."""
-    import hashlib
-    import pickle
-    import re
-    import tempfile
-
-    from ..tensor_shim import _preload_compiled
-
     try:  # FlyDSL's in-process key of these arguments (private API: on any change, just compile)
         launch._ensure_sig()
         launch._ensure_cache_manager()
@@ -160,11 +192,7 @@ def _bigm_cached(launch, args):
             except (
                 Exception  # noqa: BLE001 (stale / corrupt entry: compile again)
             ) as e:
-                import logging
-
-                logging.getLogger("aiter").warning(
-                    "MegaMoeTP big-M: disk cache %s unusable (%s)", path, e
-                )
+                _log.warning("MegaMoeTP big-M: disk cache %s unusable (%s)", path, e)
     _preload_compiled(launch, *args)
     art = mem.get(ck)
     if (
@@ -176,17 +204,7 @@ def _bigm_cached(launch, args):
     if art is None:
         return "compiled (artifact not found)"
     art._get_func_exe()
-    # scratch spills: the register file is exhausted (seen with the waits timing out)
-    m_ = re.search(r"private_segment_fixed_size = (\d+)", getattr(art, "ir", "") or "")
-    if m_ and int(m_.group(1)):
-        import logging
-
-        logging.getLogger("aiter").warning(
-            "MegaMoeTP big-M: kernel %s spills to scratch (%s B per lane): lower its "
-            "register use (e.g. AITER_BIGM_RQD=1 / AITER_BIGM_R8=1)",
-            launch._bigm_spec[:120],
-            m_.group(1),
-        )
+    _warn_spills(launch, art)
     if path:
         try:
             os.makedirs(d, mode=0o700, exist_ok=True)
@@ -195,12 +213,21 @@ def _bigm_cached(launch, args):
                 pickle.dump(art, f)
             os.replace(tmp, path)  # atomic: concurrent ranks write the same bytes
         except Exception as e:  # noqa: BLE001
-            import logging
-
-            logging.getLogger("aiter").warning(
-                "MegaMoeTP big-M: disk cache write %s failed (%s)", path, e
-            )
+            _log.warning("MegaMoeTP big-M: disk cache write %s failed (%s)", path, e)
     return "compiled"
+
+
+def _warn_spills(launch, art):
+    """a freshly compiled kernel that spills to scratch: its register file is exhausted (seen
+    with the waits timing out)"""
+    m_ = re.search(r"private_segment_fixed_size = (\d+)", getattr(art, "ir", "") or "")
+    if m_ and int(m_.group(1)):
+        _log.warning(
+            "MegaMoeTP big-M: kernel %s spills to scratch (%s B per lane): lower its "
+            "register use (e.g. AITER_BIGM_RQD=1 / AITER_BIGM_R8=1)",
+            launch._bigm_spec[:120],
+            m_.group(1),
+        )
 
 
 _HIP = None
@@ -210,10 +237,6 @@ def _hip():
     """the HIP runtime torch uses (ctypes): stream write / wait value"""
     global _HIP
     if _HIP is None:
-        import ctypes
-
-        import torch
-
         torch.cuda.init()
         with open("/proc/self/maps") as maps:
             path = next(l.split()[-1] for l in maps if "libamdhip64" in l)
@@ -248,8 +271,6 @@ def _kcopy(dst, src):
     hipMemcpyAsync, which ROCm runs on the SDMA engine of that xGMI link -- the engines the
     big-M kernel's MORI queues use; ROCr's own queue there slows every later big-M put.
     """
-    import torch
-
     torch.mul(src, 1, out=dst)
 
 
@@ -296,11 +317,6 @@ class MegaMoeTPBigM:
         act="swiglu",
         ygather=False,
     ):
-        import torch
-        import torch.distributed as dist
-
-        from .sdma import SdmaComm
-
         self.H, self.I, self.E, self.K = hidden, inter, experts, topk
         self.K1, self.NE = topk + 1, experts + 1
         self.tp = dist.get_world_size(group)
@@ -309,7 +325,6 @@ class MegaMoeTPBigM:
         self.act = act  # the units' activation ("swiglu", "silu")
         self.ygather = bool(ygather)  # moe(gather=True): the "q" region holds bf16 rows
         self._plans = {}
-        self._pads = None
         self.cfg = (float(eps), bool(gemma), float(swiglu_limit))
         self.opts = tuple(sorted((opts or {}).items()))  # tuned AITER_BIGM_* options
         self._check_geom(dict(self.opts))
@@ -388,8 +403,6 @@ class MegaMoeTPBigM:
 
     def _nab(self):
         """the deepest A ring (dividing the GEMM1 chunk count) whose LDS fits a CU"""
-        from .bigm_gemm import bigm_lds
-
         kch = self.H // 256
         return next(
             n
@@ -419,15 +432,15 @@ class MegaMoeTPBigM:
         ahead of the GPU). Two buffers in turn: a peer's writes of call k + 2 follow its wait
         for this rank's flag of call k + 1, which this stream writes after whatever it ran on
         call k's rows."""
-        import torch
-        import torch.distributed as dist
-
-        assert (
-            not torch.cuda.is_current_stream_capturing()
-        ), "gather_rows: not graph-capturable"
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("MegaMoeTP big-M: gather_rows is not graph-capturable")
         m, H = rows.shape
         T = m * self.tp
-        assert T <= self.Tmax and rows.dtype == torch.bfloat16
+        if T > self.Tmax or rows.dtype != torch.bfloat16 or H != self.H:
+            raise ValueError(
+                f"MegaMoeTP big-M: gather_rows needs bf16 [m, {self.H}] rows, m * tp <= "
+                f"{self.Tmax}; got {rows.dtype} {tuple(rows.shape)}"
+            )
         stream = torch.cuda.current_stream()
         if getattr(self, "_brows_peer", None) is None:
             off, half = self.sd.offset("brows"), self.Tmax * H * 2
@@ -506,14 +519,6 @@ class MegaMoeTPBigM:
         """Collective: re-base the per-(peer, queue) signal bases on the received signals and
         clear the watchdog word -- after a wait gave up the bases may be out of step with the
         peers' puts (every later wait on that queue would time out)."""
-        import time
-
-        import torch
-        import torch.distributed as dist
-
-        from ..tensor_shim import _run_compiled
-        from .sdma import compile_signal_read
-
         torch.cuda.synchronize(self.device)
         dist.barrier(group=self.sd.group)
         time.sleep(0.2)  # the puts of the peers' finished launches land
@@ -576,8 +581,6 @@ class MegaMoeTPBigM:
         return sizes
 
     def _chunks(self, T):
-        import torch
-
         m = T // self.tp
         sizes = tuple(self._split(m))
         c = self.chunks_t.get(
@@ -606,8 +609,6 @@ class MegaMoeTPBigM:
 
     def set_weights(self, w1, w1_scale, w2, w2_scale):
         """the next launches use another layer's weights of the same shape"""
-        import torch
-
         self.w = (
             w1.view(torch.uint8),
             w1_scale.view(torch.uint8),
@@ -625,15 +626,9 @@ class MegaMoeTPBigM:
         )
 
     def _run(self, launch, args):
-        import torch
-
-        from ..tensor_shim import _run_compiled
-
         if launch not in self._ready:
             # compile (or load) on every rank first: the kernel's waits on peers have a 2 s
             # watchdog, a launch must not start while a peer is still compiling
-            import torch.distributed as dist
-
             _bigm_cached(launch, args)
             torch.cuda.synchronize()
             dist.barrier(group=self.sd.group)
@@ -643,7 +638,7 @@ class MegaMoeTPBigM:
     def moe(
         self, x, topk_weights, topk_ids, out=None, tail=None, local=False, gather=False
     ):
-        """io: the MoE of every rank's tokens (ag_rs): x [m, H] bf16 (this rank's rows, global
+        """The MoE of every rank's tokens (ag_rs): x [m, H] bf16 (this rank's rows, global
         rows rank * m + i), topk_weights f32 / topk_ids int32 [m, K1] (the shared expert E in
         any column; ids outside [0, experts] are no route) -> y [m, H] bf16 = this rank's rows of
         sum_r MoE_r(every row); tail = (res_in, res_out, norm_w): also res_out = y + res_in and
@@ -654,8 +649,6 @@ class MegaMoeTPBigM:
         copies out of the window by shader kernels (_kcopy).
         Any m: the kernel runs on m rounded up to a multiple of 64 (PAD; the extra rows are zero,
         with no routes), its results cut back to m rows."""
-        import torch
-
         if gather and not (self.ygather and tail is None):
             raise ValueError("MegaMoeTP big-M: gather needs ygather and no tail")
         m = x.shape[0]
@@ -692,13 +685,14 @@ class MegaMoeTPBigM:
         # rows m.. of x / tw / ids / res must be zero / no route; rows below _pad_dirty may hold
         # an earlier call's tokens
         xp, twp, idp, rp, qc, qsc = self._pads
-        lo_, hi_ = m, min(self._pad_dirty, mp)
-        if hi_ > lo_:
-            xp[lo_:hi_].zero_()
-            twp[lo_:hi_].zero_()
-            idp[lo_:hi_].fill_(-1)
-            rp[lo_:hi_].zero_()
-        self._pad_dirty = max(m, self._pad_dirty) if self._pad_dirty > mp else m
+        hi_ = min(self._pad_dirty, mp)
+        if hi_ > m:  # rows m .. mp of this call: clear what an earlier call left there
+            xp[m:hi_].zero_()
+            twp[m:hi_].zero_()
+            idp[m:hi_].fill_(-1)
+            rp[m:hi_].zero_()
+        # dirty from now on: this call's rows (< m), plus an earlier call's beyond mp
+        self._pad_dirty = self._pad_dirty if self._pad_dirty > mp else m
         xp, twp, idp, rp = xp[:mp], twp[:mp], idp[:mp], rp[:mp]
         qc, qsc = qc[: self.tp * m], qsc[: self.tp * m]
         xp[:m].copy_(x)
@@ -732,7 +726,7 @@ class MegaMoeTPBigM:
         return y if tail is None else (y, q, qs)
 
     def _io_launch(self, m, tailq):
-        """the io kernel of m (a multiple of PAD) local rows"""
+        """the kernel of m (a multiple of PAD) local rows"""
         T = m * self.tp
         eps, gemma, lim = self.cfg
         w_, opts = self._plan(T)
@@ -755,7 +749,7 @@ class MegaMoeTPBigM:
         )
 
     def io_rows_per_kernel(self, lo, hi):
-        """One local row count per distinct io kernel (whatever the tail) among the batches of
+        """One local row count per distinct kernel (whatever the tail) among the batches of
         lo .. hi local rows (padded to PAD as moe() does): warming these up compiles every big-M
         kernel such batches can launch."""
         reps = {}
@@ -764,15 +758,10 @@ class MegaMoeTPBigM:
         return sorted(reps.values())
 
     def precompile(self, rows, tailq):
-        """Collective: the io kernels of these local row counts (tailq: 0 - 3 as moe()) into
+        """Collective: the kernels of these local row counts (tailq: 0 - 3 as moe()) into
         the disk cache, split over the ranks -- rank r compiles every tp-th -- so a cold cache
         costs about one compile, not one per kernel; the moe() warm-ups then load them. No-op
         without a disk cache."""
-        import inspect
-
-        import torch
-        import torch.distributed as dist
-
         if not _bigm_cache_dir():
             return
         mine = [m for i, m in enumerate(rows) if i % self.tp == self.rank]
@@ -787,8 +776,6 @@ class MegaMoeTPBigM:
 
     def _moe(self, x, topk_weights, topk_ids, out, tail, local, gather=False):
         """moe() of m (a multiple of PAD) rows"""
-        import torch
-
         m = x.shape[0]
         T = m * self.tp
         w1, w1s, w2, w2s = self.w
