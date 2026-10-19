@@ -552,6 +552,21 @@ def get_wmma_m_rep(
     return tile_m // m_warp // wmma_m
 
 
+def _fit_tile_k(k_dim: int, tile_k: int, stage: str) -> int:
+    """The largest of tile_k, tile_k/2, ... (down to 128, one 4-scale WMMA step)
+    that divides k_dim and leaves the two K tiles the kernel needs."""
+    k_dim, tile_k = int(k_dim), int(tile_k)
+    t = tile_k
+    while t >= 128 and (k_dim % t or k_dim // t < 2):
+        t //= 2
+    if t < 128:
+        raise ValueError(
+            f"[grouped-moe tdm] {stage}: K={k_dim} has no tile_k <= {tile_k} "
+            "that divides it in at least two 128-multiple tiles"
+        )
+    return t
+
+
 def _grouped_a8w4_tdm_moe(
     hidden_states,
     w1,
@@ -643,6 +658,11 @@ def _grouped_a8w4_tdm_moe(
         # gains once its scatter epilogue runs on a narrower tile_m2. Blank
         # keeps gemm2 on gemm1's width, i.e. the historical behaviour.
         cluster_n2 = cluster_n
+    # The TDM GEMM walks K in whole tiles and drops a remainder, so each stage
+    # takes a tile_k that divides its K: DeepSeek-V4.1-Flash at TP4 has
+    # inter_dim 640 per rank, and the default 256 lost 128 of gemm2's K.
+    tile_k = _fit_tile_k(model_dim, tile_k, "gemm1")
+    tile_k2 = _fit_tile_k(inter_dim, tile_k2, "gemm2")
     if _compact:
         # The plan padded every expert's row count up to this alignment, and its
         # psum is what the GEMM binary-searches as its m-tile map. A tile wider

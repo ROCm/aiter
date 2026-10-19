@@ -839,6 +839,49 @@ def test_grouped_a8w4_situv2_matches_torch_ref():
     )
 
 
+@pytest.mark.parametrize("inter_dim", [384, 640])
+def test_grouped_inter_dim_not_tile_k_multiple(inter_dim):
+    # gemm2's K is inter_dim. 640 is DeepSeek-V4.1-Flash's per-rank inter_dim at
+    # TP4; with the default tile_k=256 the kernel dropped the K remainder
+    # (logits_diff 0.08 at 640, 0.19 at 384). a4w4 runs the same TDM GEMM K loop
+    # as a8w4 and has the tighter reference.
+    run_moe(
+        "a4w4",
+        activation=ActivationType.Silu,
+        swiglu_limit=10.0,
+        # No bias, like V4.1: a bias turns off the fused gemm1 requant, and the
+        # standalone quant kernel needs inter_dim % 256 == 0.
+        use_bias=False,
+        model_dim=512,
+        inter_dim=inter_dim,
+        # These shapes are not in the grouped CSV the AOT cache is built from.
+        check_aot_cache=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "k_dim, tile_k, expected",
+    [
+        (5120, 256, 256),
+        (640, 256, 128),
+        (384, 256, 128),
+        (512, 256, 256),
+        (256, 256, 128),
+    ],
+)
+def test_fit_tile_k(k_dim, tile_k, expected):
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import _fit_tile_k
+
+    assert _fit_tile_k(k_dim, tile_k, "gemm2") == expected
+
+
+def test_fit_tile_k_rejects_unaligned_k():
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import _fit_tile_k
+
+    with pytest.raises(ValueError):
+        _fit_tile_k(320, 256, "gemm2")
+
+
 @pytest.mark.parametrize("activation", [ActivationType.Silu, ActivationType.Swiglu])
 def test_grouped_a4w4_swiglu_limit_clamps(activation):
     run_moe("a4w4", activation=activation, swiglu_limit=1.0)
