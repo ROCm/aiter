@@ -34,6 +34,7 @@ op_tests/test_flydsl_mega_mhc.py	170
 op_tests/test_flydsl_mla_reduce.py	25
 op_tests/test_flydsl_moe_a16wfp4.py	4
 op_tests/test_flydsl_moe_aux.py	85
+op_tests/test_flydsl_mxscale_preshuffle.py	25
 op_tests/test_flydsl_pa_decode.py	140
 op_tests/test_flydsl_pa_mqa_logits_fp4.py	6
 op_tests/test_flydsl_pa_mqa_logits_fp4_prefill.py	6
