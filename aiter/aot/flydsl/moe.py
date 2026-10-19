@@ -39,6 +39,9 @@ Usage:
     # Compile every FlyDSL kernel the default tuned CSVs reach
     python -m aiter.aot.flydsl.moe
 
+    # Only the gfx1250 rows, which a gfx942;gfx950 wheel build leaves out
+    GPU_ARCHS=gfx1250 python -m aiter.aot.flydsl.moe
+
     # Custom CSV file(s)
     python -m aiter.aot.flydsl.moe --csv /path/to/config1.csv /path/to/config2.csv
 

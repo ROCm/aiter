@@ -123,6 +123,9 @@ into CI.
 # MoE / Mixed-MoE (default CSVs)
 python -m aiter.aot.flydsl.moe
 
+# MoE rows of gfx1250 only, which CI's gfx942;gfx950 wheel build leaves out
+GPU_ARCHS=gfx1250 python -m aiter.aot.flydsl.moe
+
 # GEMM
 python -m aiter.aot.flydsl.gemm
 
@@ -151,6 +154,16 @@ per rank, layout `varlen_cross` for the chunked-prefill serving path).
 python -m aiter.aot.flydsl.fmha_fp8
 # ad hoc shape, without editing DEFAULT_SHAPES
 python -m aiter.aot.flydsl.fmha_fp8 --shape 12:12:192:128
+```
+
+The gfx1250 MoE build imports aiter, so it needs aiter's C++ core module. An
+installed wheel ships it. Built for gfx1250, the module needs a HIP that
+declares the cluster launch API, which ROCm 7.2.4's does not; there, build it
+once for a CDNA arch first (it has host code only):
+
+```bash
+GPU_ARCHS=gfx950 python -c "import aiter"
+GPU_ARCHS=gfx1250 python -m aiter.aot.flydsl.moe
 ```
 
 MegaMoE defaults to every profile the service ships: DeepSeek-V4-Pro r0/r32/r64
