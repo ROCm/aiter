@@ -36,15 +36,17 @@ need no AOT change.
   since a row can switch more than once in its bucket (e.g. the gfx1250
   stage-1 quant's K split). These extra replays are reported as `[BISECT]`.
   `--row-tokens-only` replays the tuned count only.
-- Caller-side choices a row does not fix are enumerated: expert bias where the
-  quant family supports it (on both stages, and on stage 1 alone, since a
-  stage-2 bias makes the runtime re-select configs whose stage 2 cannot take
-  one), both gate/up layouts for MXMOE stage-1 rows, the default and model
-  SiTUv2 betas, a received token count (`num_local_tokens`, as callers
-  behind an EP dispatch pass), and for FHMoE rows with MXFP8 routed weights
-  both values of `clamp_shared`, which the runtime compiles into stage 1
-  (MXFP4 rows keep the shared expert clamped). Combinations the runtime rejects
-  (`NotImplementedError`) are reported as `[SKIP]`.
+- Caller-side choices a row does not fix are enumerated: expert bias for
+  Swiglu + MXFP4 rows only (the GPT-OSS path; on both stages, and on stage 1
+  alone, since a stage-2 bias makes the runtime re-select configs whose stage 2
+  cannot take one — never paired with a gate/up-interleaved layout, which
+  CK-Tile's split-k epilogue cannot bias), both gate/up layouts for MXMOE
+  stage-1 rows, the default and model SiTUv2 betas, a received token count
+  (`num_local_tokens`, as callers behind an EP dispatch pass), and for FHMoE
+  rows with MXFP8 routed weights both values of `clamp_shared`, which the
+  runtime compiles into stage 1 (MXFP4 rows keep the shared expert clamped).
+  Combinations the runtime rejects (`NotImplementedError`) are reported as
+  `[SKIP]`.
 - The default caller of a row must be served. If the runtime refuses it at
   only some of the row's token counts, an M-dependent runtime limit applies
   (e.g. the FlyDSL route-reduce workspace beyond 32-bit addressing, which
