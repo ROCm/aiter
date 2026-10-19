@@ -37,6 +37,22 @@ def sorted_pairs(ids, weights):
     return torch.gather(ids, -1, order), torch.gather(weights, -1, order)
 
 
+def invalid_id_rows(ids, num_experts):
+    # Masking ties hides which tied expert was picked, so catch duplicate and
+    # out-of-range ids on the raw kernel output first.
+    s = ids.sort(dim=-1).values
+    dup = (s[:, 1:] == s[:, :-1]).any(dim=-1)
+    return dup | (s[:, 0] < 0) | (s[:, -1] >= num_experts)
+
+
+def mask_boundary_ties(ids, score, kth):
+    # Experts whose score equals the k-th selected score are interchangeable for
+    # top-k, so kernel and reference may pick different ones.
+    num_experts = score.shape[-1]
+    tied = score.gather(-1, ids.long().clamp(0, num_experts - 1)) == kth
+    return torch.where(tied & (ids >= 0) & (ids < num_experts), -1, ids)
+
+
 def run_torch(gating, hidden, gate_weight, topk, num_shared, base, scale, renorm):
     # Reference only: fp32 math. Not timed, not in the table.
     probs = torch.softmax(gating.float(), dim=-1)
@@ -70,11 +86,13 @@ def _fused_buffers(tokens, topk, num_shared):
     )
 
 
-def _check(wbuf, ibuf, topk, ref, name):
+def _check(wbuf, ibuf, topk, ref, score, name):
     # Compare one candidate's output buffers against the torch reference and return
-    # the WORST of the four checks, so a mismatch in ANY of them (ids to the bit,
-    # weights within tol) shows up as a non-zero err in the table. checkAllclose
-    # also logs each check (red on mismatch), the way other aiter op_tests report.
+    # the WORST of the five checks, so a mismatch in ANY of them (ids to the bit
+    # outside k-th score ties, weights within tol) shows up as a non-zero err in
+    # the table. `score` is the value the kernel selects on (gating in fp32).
+    # checkAllclose also logs each check (red on mismatch), the way other aiter
+    # op_tests report.
     ref_rw, ref_ri, ref_sw, ref_si = ref
     got_rw, got_ri = wbuf[:, :topk], ibuf[:, :topk]
     got_sw, got_si = wbuf[:, topk:], ibuf[:, topk:]
@@ -92,8 +110,19 @@ def _check(wbuf, ibuf, topk, ref, name):
         atol=2e-2,
         msg=f"{name} shared weights",
     )
-    ref_ids, ref_w = sorted_pairs(ref_ri, ref_rw)
-    got_ids, got_w = sorted_pairs(got_ri.to(dtypes.i32), got_rw)
+    invalid = invalid_id_rows(got_ri, score.shape[-1]).to(dtypes.fp32)
+    e_valid = checkAllclose(
+        invalid,
+        torch.zeros_like(invalid),
+        rtol=0,
+        atol=0,
+        msg=f"{name} routed ids unique and in range",
+    )
+    kth = score.gather(-1, ref_ri.long()).min(dim=-1, keepdim=True).values
+    ref_ids, ref_w = sorted_pairs(mask_boundary_ties(ref_ri, score, kth), ref_rw)
+    got_ids, got_w = sorted_pairs(
+        mask_boundary_ties(got_ri.to(dtypes.i32), score, kth), got_rw
+    )
     e_rid = checkAllclose(
         got_ids.to(dtypes.fp32),
         ref_ids.to(dtypes.fp32),
@@ -108,7 +137,7 @@ def _check(wbuf, ibuf, topk, ref, name):
         atol=2e-2,
         msg=f"{name} routed weights",
     )
-    return max(e_sid, e_sw, e_rid, e_rw)
+    return max(e_sid, e_sw, e_valid, e_rid, e_rw)
 
 
 @benchmark()
@@ -181,7 +210,7 @@ def test_shared_gate(
     ret = {"gfx": get_gfx()}
     for name, (fn, wbuf, ibuf) in candidates.items():
         _, us = run_perftest(fn)
-        err = _check(wbuf, ibuf, topk, ref, name)
+        err = _check(wbuf, ibuf, topk, ref, gating.float(), name)
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
