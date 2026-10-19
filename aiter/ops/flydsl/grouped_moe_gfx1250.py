@@ -56,6 +56,31 @@ def _grouped_weight_uint8(w: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@functools.lru_cache(maxsize=None)
+def _fit_tile_k(tile_k: int, k: int) -> int:
+    """The widest k-tile, no wider than ``tile_k``, that the TDM GEMM can run for K = ``k``.
+
+    The GEMM runs K // tile_k k-tiles and has no tail, so a tile that does not
+    divide K silently drops the rest of it. Every tuned row divides its K; the
+    defaults (256) do not for a tensor-parallel expert slice such as Kimi-K3's
+    3072 / 8 = 384. Only the widths the tuned rows use are tried.
+    """
+    tile_k = int(tile_k)
+    for t in (tile_k, 512, 256, 128):
+        if t <= tile_k and t % 128 == 0 and k % t == 0:
+            if t != tile_k:
+                logger.info(
+                    "[grouped-moe tdm] tile_k=%d does not divide K=%d; using tile_k=%d",
+                    tile_k,
+                    k,
+                    t,
+                )
+            return t
+    raise ValueError(
+        f"[grouped-moe tdm] no k-tile of 512, 256 or 128 divides K={k} (tile_k={tile_k})"
+    )
+
+
 def _as_bool(value, default: bool) -> bool:
     if value is None or str(value).strip() == "":
         return default
@@ -629,6 +654,8 @@ def _grouped_a8w4_tdm_moe(
         tile_n2 = tile_n
     if tile_k2 is None:
         tile_k2 = tile_k
+    tile_k = _fit_tile_k(tile_k, model_dim)
+    tile_k2 = _fit_tile_k(tile_k2, inter_dim)
     if num_buffers2 is None:
         num_buffers2 = num_buffers
     if waves_per_tensor_tdm2 is None:
