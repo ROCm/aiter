@@ -13,6 +13,7 @@
 
 #include "aiter_stream.h"
 
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 
@@ -145,6 +146,9 @@ void mxfp4_moe_sort_quant_kernel(
         AITER_CHECK((M <= 1 || a_input.stride(0) % 8 == 0) &&
                         reinterpret_cast<uintptr_t>(a_input.data_ptr()) % 16 == 0,
                     "mxfp4_moe_sort_quant: MXFP8 a_input rows must be 16-byte aligned");
+        // The kernel takes the row stride as int32.
+        AITER_CHECK(a_input.stride(0) <= INT32_MAX,
+                    "mxfp4_moe_sort_quant: a_input row stride must fit in int32");
     } else {
         AITER_CHECK(M <= 1 || a_input.stride(0) == D_HIDDEN,
                     "mxfp4_moe_sort_quant: MXFP4 a_input must be contiguous");

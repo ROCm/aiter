@@ -346,7 +346,8 @@ __device__ __forceinline__ void quant_fp8_subkernel(
     {
         const int token = my_block / BLOCKS_PER_HIDDEN;
         const int group = my_block % BLOCKS_PER_HIDDEN;
-        const int kb = token * input_stride + group * 32 + lane_in_block * 8;
+        const int64_t kb =
+            static_cast<int64_t>(token) * input_stride + group * 32 + lane_in_block * 8;
         uint32_t h[4];
         *reinterpret_cast<int4 *>(h) =
             *reinterpret_cast<const int4 *>(&hidden_states[kb]);

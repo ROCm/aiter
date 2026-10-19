@@ -519,6 +519,7 @@ def _use_a8w4_fused_sort_quant(
         # 16-byte row loads; the kernel takes the row stride (moot for M == 1).
         and hidden_states.stride(-1) == 1
         and (M <= 1 or hidden_states.stride(0) % 8 == 0)
+        and hidden_states.stride(0) <= 2**31 - 1  # the kernel takes an int32 stride
         and hidden_states.data_ptr() % 16 == 0
         and topk_ids.dtype == dtypes.i32
         and topk_ids.is_contiguous()
