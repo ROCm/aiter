@@ -9,12 +9,19 @@ Usage:
     python bench_dsv4_indexer.py --metric bandwidth
 """
 
+import functools
+
 import torch
 import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter.ops.triton.attention.dsv4_indexer import dsv4_indexer, indexer_bwd
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
@@ -36,9 +43,18 @@ def _make_inputs(S, H, Hd, P, device="cuda"):
     return q, k, w
 
 
+def _generate_dsv4_indexer_bwd_pool_inputs(S, H, Hd, P, compress_ratio, topk):
+    q, k, w = _make_inputs(S, H, Hd, P)
+    d_scores = torch.randn(S, P, dtype=torch.float32, device="cuda")
+    return q, k, w, d_scores
+
+
 def benchmark(args):
     op = args.op
     unit = "ms" if args.metric == "time" else "GB/s"
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     x_vals = [(S, H, Hd, P, cr, topk) for S, H, Hd, P, cr, topk in _SHAPES]
 
@@ -56,23 +72,34 @@ def benchmark(args):
 
     @triton.testing.perf_report([config])
     def _run(S, H, Hd, P, compress_ratio, topk, provider):
-        q, k, w = _make_inputs(S, H, Hd, P)
+        hp = torch.bfloat16.itemsize
         if op == "fwd":
-            fn = lambda: dsv4_indexer(q, k, w, compress_ratio, topk)
+            _p_gen = functools.partial(_make_inputs, S, H, Hd, P)
+            _out_val_keys = ["q", "k", "w"]
+
+            def kernel_fn(q, k, w):
+                dsv4_indexer(q, k, w, compress_ratio, topk)
+
             # reads: q + k + w; writes: scores + indices
-            mem = (
-                S * H * Hd * q.element_size()
-                + P * Hd * k.element_size()
-                + S * H * 4
-                + S * min(topk, P) * (4 + 4)
-            )
+            mem = S * H * Hd * hp + P * Hd * hp + S * H * 4 + S * min(topk, P) * (4 + 4)
         else:  # bwd
-            _scores, _ = dsv4_indexer(q, k, w, compress_ratio, topk)
-            d_scores = torch.randn(S, P, dtype=torch.float32, device="cuda")
-            fn = lambda: indexer_bwd(q, k, w, d_scores, compress_ratio)
+            _p_gen = functools.partial(
+                _generate_dsv4_indexer_bwd_pool_inputs,
+                S,
+                H,
+                Hd,
+                P,
+                compress_ratio,
+                topk,
+            )
+            _out_val_keys = ["q", "k", "w", "d_scores"]
+
+            def kernel_fn(q, k, w, d_scores):
+                indexer_bwd(q, k, w, d_scores, compress_ratio)
+
             mem = (
-                S * H * Hd * q.element_size()
-                + P * Hd * k.element_size()
+                S * H * Hd * hp
+                + P * Hd * hp
                 + S * H * 4
                 + S * P * 4
                 + S * H * Hd * 4  # dq
@@ -80,7 +107,8 @@ def benchmark(args):
                 + S * H * 4  # dw
             )
 
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+        bencher.build_pool([_p_gen], [_out_val_keys])
+        ms = bencher.bench(kernel_fn)
         if args.metric == "time":
             return ms
         return mem * 1e-9 / (ms * 1e-3)
