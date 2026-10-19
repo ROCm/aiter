@@ -2407,5 +2407,10 @@ launch_gemm_a8w4_tdm.compile_hints["llvm_options"] = {
     "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
 }
 if SUPPORT_EXPLICIT_VGPR_PARTITION:
-    launch_gemm_a8w4_tdm.compile_hints["waves_per_eu"] = 1
-    # launch_gemm_a8w4_tdm.compile_hints["llvm_options"]["amdgpu-anti-hints-for-va-vdst"] = True 
+    launch_gemm_a8w4_tdm.compile_hints["waves_per_eu"] = (1, 1)
+    # launch_gemm_a8w4_tdm.compile_hints["llvm_options"]["amdgpu-anti-hints-for-va-vdst"] = True
+    # SameBank (ds_load→WMMA) overwrites exact VGPR pins (schedule.vgpr /
+    # set_register); without this, A/B at 256/384 collapse next to C at 512+.
+    launch_gemm_a8w4_tdm.compile_hints["llvm_options"][
+        "amdgpu-same-bank-hints"
+    ] = False
