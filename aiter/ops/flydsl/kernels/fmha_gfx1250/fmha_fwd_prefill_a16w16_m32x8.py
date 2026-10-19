@@ -361,6 +361,18 @@ def _keepalive(vals):
     )
 
 
+def _concat(parts):
+    """Join a fragment's ds_load results into one WMMA operand. A pure shufflevector --
+    the register allocator coalesces it into adjacent registers, so it costs no VALU."""
+    cur = list(parts)
+    while len(cur) > 1:
+        cur = [
+            cur[i].shuffle(cur[i + 1], list(range(2 * cur[i].numel)))
+            for i in range(0, len(cur), 2)
+        ]
+    return cur[0]
+
+
 def _ring_num_prefetch(num_ld, ring, ring_lag):
     """In-flight ds_load depth (NP) of a ``_ring_drive`` with this geometry. A tile that
     fits in the ring never wraps, so nothing is refilled and the WAR lag buys nothing --
@@ -793,10 +805,10 @@ def _pv_qk_gemm(
     def emit(j):
         return v_emit(j) if j < num_vld else k_emit(j - num_vld)
 
-    def consume(i, lo, hi):
+    def consume(i, *parts):
         if i < num_v_frags:
             d_tile_idx, k_tile_idx = divmod(i, num_contract_tiles)
-            v_frag = lo.shuffle(hi, list(range(16)))
+            v_frag = _concat(parts)
             for q_tile_idx in range(num_q_tiles):
                 acc = out_list[q_tile_idx][d_tile_idx]
                 if acc is None:
@@ -814,7 +826,7 @@ def _pv_qk_gemm(
                 rocdl.sched_barrier(0)
             return
         kv, d_tile_idx = divmod(i - num_v_frags, num_k_tiles)
-        k_frag = lo.shuffle(hi, list(range(16)))
+        k_frag = _concat(parts)
         for q_tile_idx in range(num_q_tiles):
             acc = (
                 s_acc_list[q_tile_idx][kv]
@@ -1533,6 +1545,7 @@ def _attention_core_multi_kv_tiles(
     _num_k_frags = k_mgr.num_ds_loads() // k_mgr.loads_per_frag
     _num_v_frags = v_mgr.num_ds_loads() // v_mgr.loads_per_frag
     _num_vld = v_mgr.num_ds_loads()
+    _vld_group = v_mgr.loads_per_frag  # pin the head in whole V fragments
     _num_prefetch = _ring_num_prefetch(
         _num_vld + k_mgr.num_ds_loads(), PVQK_RING, PVQK_LAG
     )
@@ -1548,7 +1561,7 @@ def _attention_core_multi_kv_tiles(
     for j in range(_num_head_carry):
         # Same per-pair pin as ``_issue_head`` in the body.
         _seed_head.append(_raw(v_mgr.load_one_to_reg(v_lds_ld[0], j)))
-        if len(_seed_head) % 2 == 0:
+        if len(_seed_head) % _vld_group == 0:
             rocdl.sched_barrier(0)
     _init = _init + _seed_head
 
@@ -1671,15 +1684,15 @@ def _attention_core_multi_kv_tiles(
             return v_mgr.load_one_to_reg(v_curr, j)
 
         def _issue_head(emit, first, last, carried=()):
-            # Pin every fragment's load PAIR in place. The ring consumes loads 2i and
-            # 2i+1 for fragment i, but the scheduler scatters the 20-deep burst freely --
+            # Pin every fragment's loads in place. The ring consumes one group per
+            # fragment, but the scheduler scatters the 20-deep burst freely --
             # in the dumps a partner load drifted 12+ slots back, so the wmma waited on
             # most of the burst (s_wait_dscnt 0x9 / 0x7) instead of the ring's 0x12.
             # NOT _keepalive -- that is a USE, so it drags an s_wait_dscnt 0x0 in with it.
             out = list(carried)
             for j in range(first, last):
                 out.append(emit(j))
-                if len(out) % 2 == 0:
+                if len(out) % _vld_group == 0:
                     rocdl.sched_barrier(0)
             return out
 
@@ -1815,6 +1828,7 @@ def _attention_core_multi_kv_tiles(
             o_out, s_acc = _pv_qk_gemm(
                 v_emit=_v_emit,
                 k_emit=_k_emit,
+                vld_per_frag=v_mgr.loads_per_frag,
                 p_list=p_list,
                 q_frags_list=q_frags,
                 v_hdim=v_hdim,
@@ -1834,6 +1848,7 @@ def _attention_core_multi_kv_tiles(
             o_acc, s_list = _pv_qk_gemm(
                 v_emit=_v_emit,
                 k_emit=_k_emit,
+                vld_per_frag=v_mgr.loads_per_frag,
                 p_list=carry_prev,
                 q_frags_list=q_frags,
                 v_hdim=v_hdim,
@@ -2197,7 +2212,7 @@ def _attention_core_one_kv_tile(
     pv_head = []
     for j in range(_num_prefetch):
         pv_head.append(_v_emit(j))
-        if len(pv_head) % 2 == 0:
+        if len(pv_head) % v_mgr.loads_per_frag == 0:
             rocdl.sched_barrier(0)
     rocdl.sched_barrier(0)
 
@@ -2237,6 +2252,7 @@ def _attention_core_one_kv_tile(
     o_list, _ = _pv_qk_gemm(
         v_emit=_v_emit,
         k_emit=None,
+        vld_per_frag=v_mgr.loads_per_frag,
         p_list=p_list,
         q_frags_list=q_frags,
         v_hdim=v_hdim,
