@@ -15,13 +15,17 @@ provides ``cco_sdma_put_ptr_rsig__thread`` / ``cco_sdma_signal_slot``, and ``MOR
 from __future__ import annotations
 
 import contextlib
+import functools
 import os
 import sys
 
+import flydsl.compiler as flyc
+import flydsl.expr as fx
 import torch
 import torch.distributed as dist
+from flydsl.expr import gpu
 
-__all__ = ["SdmaComm", "sdma_bitcode"]
+__all__ = ["SdmaComm", "compile_signal_read", "sdma_bitcode"]
 
 
 @contextlib.contextmanager
@@ -157,3 +161,31 @@ class SdmaComm:
             .view(dtype)
             .view(shape)
         )
+
+
+@functools.cache
+def compile_signal_read(tp, nq):
+    """launch(dc, out, stream): out [tp][nq] int32 <- the signal count received per (sender,
+    queue) (MORI's signal slots, low 32 bits)"""
+    from flydsl.compiler.extern_link import link_extern
+    from flydsl.expr.extern import ffi
+
+    from .common import g_ld_sys, g_st_sys, i32
+
+    sig_slot = link_extern(
+        ffi("cco_sdma_signal_slot", ["uint64", "int32", "int32"], "uint64"),
+        bitcode_path=sdma_bitcode(6),
+    )
+
+    @flyc.kernel(name=f"sdma_signal_read_tp{tp}_q{nq}", known_block_size=[64, 1, 1])
+    def kernel(dc: fx.Int64, out: fx.Int64):
+        lane = fx.Int32(gpu.thread_id("x"))
+        if lane < i32(tp * nq):
+            slot = fx.Int64(sig_slot(dc, lane // i32(nq), lane % i32(nq)))
+            g_st_sys(out + fx.Int64(lane * i32(4)), g_ld_sys(slot))
+
+    @flyc.jit
+    def launch(dc: fx.Int64, out: fx.Int64, stream: fx.Stream):
+        kernel(dc, out).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
+
+    return launch

@@ -54,3 +54,32 @@ def device_key(device=None) -> dict:
 
     props = torch.cuda.get_device_properties(device or torch.cuda.current_device())
     return {"gfx": get_gfx(), "cu_num": int(props.multi_processor_count)}
+
+
+def bigm_tuned(*, model_dim, inter_dim, experts, topk, tp, tokens, device=None):
+    """The tuned plan of the nearest tuned batch (<= tokens, else the smallest;
+    configs/mega_moe_tp_bigm_tuned.csv, see tuned.py): {"chunks": [..], "opts":
+    {"AITER_BIGM_*": ..}, "tokens": n} or None."""
+    from aiter.jit.core import AITER_CONFIGS
+
+    key = {
+        **device_key(device),
+        "model_dim": model_dim,
+        "inter_dim": inter_dim,
+        "experts": experts,
+        "topk": topk,
+        "tp": tp,
+    }
+    r = nearest(
+        tuned_rows(AITER_CONFIGS.AITER_CONFIG_MEGA_MOE_TP_BIGM_FILE, key, "tokens"),
+        tokens,
+        clamp=True,
+    )
+    if r is None:
+        return None
+    opts = dict(kv.split("=", 1) for kv in r.get("opts", "").split(";") if kv)
+    return {
+        "chunks": [int(x) for x in r["chunks"].split(",")],
+        "opts": opts,
+        "tokens": int(r["tokens"]),
+    }

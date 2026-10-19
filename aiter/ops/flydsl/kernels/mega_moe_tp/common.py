@@ -454,3 +454,27 @@ def f32_bits_add(x, y):
 
 def f32_bits_max(x, y):
     return x.bitcast(fx.Float32).maximumf(y.bitcast(fx.Float32)).bitcast(fx.Int32)
+
+
+def i4x8_pack(f, inv):
+    w = i32(0)
+    for k in range_constexpr(8):
+        q = fx.Int32(fmath.roundeven(f[k] * inv))
+        q = fx.max(fx.min(q, i32(7)), i32(-8))
+        w = w | ((q & i32(0xF)) << i32(4 * k))
+    return w
+
+
+def i4x8_unpack(d, sc):
+    out = []
+    for k in range_constexpr(8):
+        b = (fx.Int32(d) << i32(28 - 4 * k)) >> i32(28)
+        out.append(b.to(fx.Float32) * sc)
+    return out
+
+
+def l2_writeback():
+    """this XCD's dirty L2 lines to memory (device-scope release of plain stores)"""
+    _llvm.InlineAsmOp(
+        None, [], "buffer_wbl2 sc1\ns_waitcnt vmcnt(0)", "", has_side_effects=True
+    )
