@@ -9,7 +9,10 @@ __global__ void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(typename Traits::k
 {
 }
 #else
-#include "mla_v4_prefill_global_load.hpp"
+#include "mla_global_load.hpp"
+#include <bit>
+
+using opus::operator""_I;
 
 // =============================================================================
 // Variant 16mx1_16nx4 (T_M=1, T_N=NUM_WARPS) — used when H <= 32.
@@ -355,6 +358,7 @@ __device__ void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_kargs kargs,
         mfma_adaptor_swap_ab{});
 
     auto u_gkv = make_layout_gkv<T>(lane_id);
+    auto p_kv_lane = global_load_base<T::VEC_KV>(p_kv, u_gkv);
     auto u_skv = make_layout_skv<T>(warp_id);
     auto u_rk = make_layout_rk<T>(warp_id, lane_id);
     auto u_rv = make_layout_rv<T>(warp_id, lane_id);
@@ -375,8 +379,8 @@ __device__ void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_kargs kargs,
 
     for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
         s_waitcnt_vmcnt(0_I);
-        global_load<T::VEC_KV>(p_kv + kv_token_offset(kv_page[0]), s_kv.ptr, u_gkv, u_skv);
-        global_load<T::VEC_KV>(p_kv + kv_token_offset(kv_page[1]), s_kv.ptr, u_gkv, u_skv + T::NUM_WARPS * T::smem_d_rpt * (T::smem_linear_wave + T::smem_padding_32B));
+        global_load<T::VEC_KV>(p_kv_lane + kv_token_offset(kv_page[0]), s_kv.ptr, u_gkv, u_skv);
+        global_load<T::VEC_KV>(p_kv_lane + kv_token_offset(kv_page[1]), s_kv.ptr, u_gkv, u_skv + T::NUM_WARPS * T::smem_d_rpt * (T::smem_linear_wave + T::smem_padding_32B));
         s_waitcnt_vmcnt(0_I);
         __builtin_amdgcn_s_barrier();
         kv_page = load_kv_page(tile_idx + 1);

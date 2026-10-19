@@ -9,7 +9,10 @@ __global__ void opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel(opus_mla_v4_prefil
 {
 }
 #else
-#include "mla_v4_prefill_global_load.hpp"
+#include "mla_global_load.hpp"
+#include <bit>
+
+using opus::operator""_I;
 
 // =============================================================================
 // Variant 16mx8_32nx1 (T_M=NUM_WARPS, T_N=1) — used when H > 32.
@@ -385,6 +388,7 @@ __device__ void mla_v4_prefill_accum_le2_tiles(opus_mla_v4_prefill_kargs kargs,
         mfma_adaptor_swap_ab{});
 
     auto u_gkv = make_layout_gkv<T>(warp_id, lane_id);
+    auto p_kv_lane = global_load_base<T::VEC_KV>(p_kv, u_gkv);
     auto u_skv = make_layout_skv<T>(warp_id);
     auto u_rk = make_layout_rk<T>(lane_id);
     auto u_rv = make_layout_rv<T>(lane_id);
@@ -443,7 +447,7 @@ __device__ void mla_v4_prefill_accum_le2_tiles(opus_mla_v4_prefill_kargs kargs,
 
     for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
         const int kv_page = load_kv_page(tile_idx);
-        global_load<T::VEC_KV>(p_kv + kv_token_offset(kv_page), s_kv.ptr, u_gkv, u_skv);
+        global_load<T::VEC_KV>(p_kv_lane + kv_token_offset(kv_page), s_kv.ptr, u_gkv, u_skv);
         s_waitcnt_vmcnt(0_I);
         __builtin_amdgcn_s_barrier();
 
@@ -518,6 +522,7 @@ __device__ void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_kargs kargs,
 
     // Partition layouts
     auto u_gkv = make_layout_gkv<T>(warp_id, lane_id);
+    auto p_kv_lane = global_load_base<T::VEC_KV>(p_kv, u_gkv);
     auto u_skv = make_layout_skv<T>(warp_id);
     auto u_rk = make_layout_rk<T>(lane_id);
     auto u_rv = make_layout_rv<T>(lane_id);
@@ -587,13 +592,13 @@ __device__ void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_kargs kargs,
 
     // Prologue
     int pg = load_kv_page(0);
-    global_load<T::VEC_KV>(p_kv + kv_token_offset(pg), s_kv[0].ptr, u_gkv, u_skv);
+    global_load<T::VEC_KV>(p_kv_lane + kv_token_offset(pg), s_kv[0].ptr, u_gkv, u_skv);
     __builtin_amdgcn_s_waitcnt(0);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
 
     pg = load_kv_page(1);
-    global_load<T::VEC_KV>(p_kv + kv_token_offset(pg), s_kv[0].ptr, u_gkv, u_skv + kv_slot_offset);
+    global_load<T::VEC_KV>(p_kv_lane + kv_token_offset(pg), s_kv[0].ptr, u_gkv, u_skv + kv_slot_offset);
     __builtin_amdgcn_sched_barrier(0);
     kv_page[0] = load_kv_page(2);
     v_k[0] = load<T::VEC_KV>(s_kv[0], u_rk);
@@ -629,7 +634,7 @@ __device__ void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_kargs kargs,
     for (int j = 1; j < num_kv_tiles - 3; j += 2) {
         // Cluster 0:
         s_waitcnt_vmcnt(0_I);
-        global_load<T::VEC_KV>(p_kv + kv_token_offset(kv_page[0]), s_kv[1].ptr, u_gkv, u_skv);
+        global_load<T::VEC_KV>(p_kv_lane + kv_token_offset(kv_page[0]), s_kv[1].ptr, u_gkv, u_skv);
         __builtin_amdgcn_sched_barrier(0);
         kv_page[1] = load_kv_page(j + 2);
         v_k[0] = load<T::VEC_KV>(s_kv[0], u_rk + kv_slot_offset);
@@ -686,7 +691,7 @@ __device__ void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_kargs kargs,
 
         // Cluster 4:
         s_waitcnt_vmcnt(0_I);
-        global_load<T::VEC_KV>(p_kv + kv_token_offset(kv_page[1]), s_kv[1].ptr, u_gkv, u_skv + kv_slot_offset);
+        global_load<T::VEC_KV>(p_kv_lane + kv_token_offset(kv_page[1]), s_kv[1].ptr, u_gkv, u_skv + kv_slot_offset);
         __builtin_amdgcn_sched_barrier(0);
         kv_page[0] = load_kv_page(j + 3);
         v_k[0] = load<T::VEC_KV>(s_kv[1], u_rk);
@@ -748,7 +753,7 @@ __device__ void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_kargs kargs,
     if constexpr (OddTail) {
         // Cluster 0:
         s_waitcnt_vmcnt(0_I);
-        global_load<T::VEC_KV>(p_kv + kv_token_offset(kv_page[0]), s_kv[1].ptr, u_gkv, u_skv);
+        global_load<T::VEC_KV>(p_kv_lane + kv_token_offset(kv_page[0]), s_kv[1].ptr, u_gkv, u_skv);
         v_k[0] = load<T::VEC_KV>(s_kv[0], u_rk + kv_slot_offset);
         v_k[1] = load<T::VEC_KV>(s_kv[0], u_rk + kv_slot_offset + skv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
@@ -865,7 +870,7 @@ __device__ void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_kargs kargs,
     } else {
         // Cluster 0:
         s_waitcnt_vmcnt(0_I);
-        global_load<T::VEC_KV>(p_kv + kv_token_offset(kv_page[0]), s_kv[1].ptr, u_gkv, u_skv);
+        global_load<T::VEC_KV>(p_kv_lane + kv_token_offset(kv_page[0]), s_kv[1].ptr, u_gkv, u_skv);
         __builtin_amdgcn_sched_barrier(0);
         kv_page[1] = load_kv_page(num_kv_tiles - 1);
         v_k[0] = load<T::VEC_KV>(s_kv[0], u_rk + kv_slot_offset);
@@ -916,7 +921,7 @@ __device__ void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_kargs kargs,
 
         // Cluster 4:
         s_waitcnt_vmcnt(0_I);
-        global_load<T::VEC_KV>(p_kv + kv_token_offset(kv_page[1]), s_kv[1].ptr, u_gkv, u_skv + kv_slot_offset);
+        global_load<T::VEC_KV>(p_kv_lane + kv_token_offset(kv_page[1]), s_kv[1].ptr, u_gkv, u_skv + kv_slot_offset);
         v_k[0] = load<T::VEC_KV>(s_kv[1], u_rk);
         v_k[1] = load<T::VEC_KV>(s_kv[1], u_rk + skv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});

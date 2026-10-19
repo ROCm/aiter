@@ -14,7 +14,7 @@
 #include "aiter_hip_common.h"
 
 #include "../../cpp_itfs/pa/pa_ps.cuh"
-#include "opus/mla_v41_kargs.h"
+#include "opus/mla_v41_prefill_kargs.h"
 #include "opus/mla_v4_prefill_a16w16_16mx1_16nx4.hpp"
 #include "opus/mla_v4_prefill_a16w16_16mx8_32nx1.hpp"
 #include "opus/mla_v4_prefill_a8w8_16mx1_16nx4.hpp"
@@ -907,12 +907,13 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* kv_scale,
      aiter_tensor_t* kv_indices_extend,
      aiter_tensor_t* kv_indptr_extend,
-     aiter_tensor_t* attn_sink,
+     aiter_tensor_t* attn_sink, // [H] fp32 (nullable)
      aiter_tensor_t* out,
      float softmax_scale,
+     aiter_tensor_t* lse, // [N, H] fp32 (nullable)
      hipStream_t stream),
     (q, q_scale, unified_kv, unified_kv_scale, kv_indices_prefix, kv_indptr_prefix, kv,
-     kv_scale, kv_indices_extend, kv_indptr_extend, attn_sink, out, softmax_scale, stream))
+     kv_scale, kv_indices_extend, kv_indptr_extend, attn_sink, out, softmax_scale, lse, stream))
 {
     const std::string gfx = get_gpu_arch();
     AITER_CHECK(gfx == "gfx950", __func__, ": unsupported GPU arch '", gfx, "' (supported: gfx950).");
@@ -923,7 +924,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK(unified_kv->dim() == 2 && unified_kv_scale->dim() == 2 && kv->dim() == 2 &&
                     kv_scale->dim() == 2,
                 "unified_kv, unified_kv_scale, kv and kv_scale must be 2-D [rows, *]");
-    AITER_CHECK(attn_sink->dim() == 1, "attn_sink must be 1-D [H]");
 
     AITER_CHECK(q->dtype() == AITER_DTYPE_fp8 && unified_kv->dtype() == AITER_DTYPE_fp8 &&
                     kv->dtype() == AITER_DTYPE_fp8,
@@ -931,7 +931,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK(v41_is_e8m0(q_scale) && v41_is_e8m0(unified_kv_scale) && v41_is_e8m0(kv_scale),
                 "q_scale/unified_kv_scale/kv_scale must be E8M0 (uint8 or fp8_e8m0)");
     AITER_CHECK(out->dtype() == AITER_DTYPE_bf16, "out must be bf16");
-    AITER_CHECK(attn_sink->dtype() == AITER_DTYPE_fp32, "attn_sink must be fp32");
     AITER_CHECK(kv_indptr_prefix->dtype() == AITER_DTYPE_i32 &&
                     kv_indices_prefix->dtype() == AITER_DTYPE_i32 &&
                     kv_indptr_extend->dtype() == AITER_DTYPE_i32 &&
@@ -953,7 +952,14 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK(kv->size(0) == kv_scale->size(0), "kv and kv_scale must share total_tokens");
     AITER_CHECK(out->size(0) == N && out->size(1) == H && out->size(2) == kV41DHead,
                 "out shape must be [N, H, 512]");
-    AITER_CHECK(attn_sink->size(0) == H, "attn_sink length must equal H");
+    if(attn_sink)
+        AITER_CHECK(attn_sink->dim() == 1 && attn_sink->size(0) == H &&
+                        attn_sink->dtype() == AITER_DTYPE_fp32 && attn_sink->is_contiguous(),
+                    "attn_sink must be a contiguous fp32 [H]");
+    if(lse)
+        AITER_CHECK(lse->dim() == 2 && lse->size(0) == N && lse->size(1) == H &&
+                        lse->dtype() == AITER_DTYPE_fp32 && lse->stride(1) == 1,
+                    "lse must be fp32 [N, H], contiguous along H");
     AITER_CHECK(kv_indptr_prefix->size(0) == N + 1, "kv_indptr_prefix length must be N+1");
     AITER_CHECK(kv_indptr_extend->size(0) == N + 1, "kv_indptr_extend length must be N+1");
 
@@ -962,9 +968,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                     kv->stride(1) == 1 && kv_scale->stride(1) == 1,
                 "Q/KV/scales/out must be contiguous along the last dim");
     AITER_CHECK(kv_indices_prefix->is_contiguous() && kv_indptr_prefix->is_contiguous() &&
-                    kv_indices_extend->is_contiguous() && kv_indptr_extend->is_contiguous() &&
-                    attn_sink->is_contiguous(),
-                "kv_indices/kv_indptr (prefix+extend) and attn_sink must be contiguous");
+                    kv_indices_extend->is_contiguous() && kv_indptr_extend->is_contiguous(),
+                "kv_indices/kv_indptr (prefix+extend) must be contiguous");
 
     if(N == 0)
         return;
@@ -991,8 +996,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     kargs.unified_kv_scale_ptr = unified_kv_scale->data_ptr();
     kargs.kv_ptr               = kv->data_ptr();
     kargs.kv_scale_ptr         = kv_scale->data_ptr();
-    kargs.attn_sink_ptr        = attn_sink->data_ptr();
+    kargs.attn_sink_ptr        = attn_sink ? attn_sink->data_ptr() : nullptr;
     kargs.out_ptr              = out->data_ptr();
+    kargs.lse_ptr              = lse ? lse->data_ptr() : nullptr;
     kargs.kv_indptr_prefix     = reinterpret_cast<const int*>(kv_indptr_prefix->data_ptr());
     kargs.kv_indices_prefix    = reinterpret_cast<const int*>(kv_indices_prefix->data_ptr());
     kargs.kv_indptr_extend     = reinterpret_cast<const int*>(kv_indptr_extend->data_ptr());
@@ -1007,6 +1013,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     kargs.stride_q_scale_h     = static_cast<int>(q_scale->stride(1));
     kargs.stride_o_n           = static_cast<int>(out->stride(0));
     kargs.stride_o_h           = static_cast<int>(out->stride(1));
+    kargs.stride_lse_n         = lse ? static_cast<int>(lse->stride(0)) : 0;
     kargs.stride_kv_page       = static_cast<int>(stride_kv_page);
     kargs.stride_kv_scale_page = static_cast<int>(stride_kv_scale_page);
     kargs.softmax_scale        = softmax_scale;

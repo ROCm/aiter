@@ -174,7 +174,8 @@ def opus_mla_v41_prefill_a8w8_gfx950_fwd(
     kv_scale: torch.Tensor,
     kv_indices_extend: torch.Tensor,
     kv_indptr_extend: torch.Tensor,
-    attn_sink: torch.Tensor,
+    attn_sink: torch.Tensor | None,  # [H] fp32
     out: torch.Tensor,
     softmax_scale: float,
+    lse: torch.Tensor | None = None,  # [N, H] fp32
 ) -> None: ...

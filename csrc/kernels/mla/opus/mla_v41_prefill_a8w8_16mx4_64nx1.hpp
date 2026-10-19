@@ -1,9 +1,9 @@
 #pragma once
 
 #include <opus/opus.hpp>
-#include "mla_v41_kargs.h"
-#include "mla_v41_traits.h"
-#include "mla_v41_global_load.hpp"
+#include "mla_v41_prefill_kargs.h"
+#include "mla_v41_prefill_traits.h"
+#include "mla_global_load.hpp"
 #include <bit>
 
 using opus::operator""_I;
@@ -1209,8 +1209,20 @@ __device__ inline void opus_mla_v41_prefill_a8w8_16mx4_64nx1_fwd(opus_mla_v41_pr
                          kargs.kv_indptr_extend, kargs.kv_indices_extend, q_token_idx, smem,
                          issue_q, read_q, v_q, scale_q, v_o, m_row, l_row, temperature_scale);
 
-    auto g_attn_sink = make_gmem(reinterpret_cast<const D_ACC*>(kargs.attn_sink_ptr), kargs.H * sizeof(D_ACC));
-    const D_ACC sink_log2 = load(g_attn_sink, h_block_start + warp_id * T::Q_TILE_SIZE + lane_id % T::W_M)[0] * LOG2_E;
+    // Recomputed so that it is not live across the main loop.
+    int lane = lane_id;
+    asm volatile("" : "+v"(lane));
+    const int head = h_block_start + warp_id * T::Q_TILE_SIZE + lane % T::W_M;
+    // lse: natural log, without the sink, +inf for a token without rows.
+    if (kargs.lse_ptr != nullptr && lane_id < T::W_M && head < kargs.H) {
+        constexpr D_ACC LN_2 = 0.69314718056f;
+        reinterpret_cast<D_ACC*>(kargs.lse_ptr)[static_cast<int64_t>(q_token_idx) * kargs.stride_lse_n + head] =
+            l_row > D_ACC(0.0f) ? (m_row + __builtin_amdgcn_logf(l_row)) * LN_2 : numeric_limits<D_ACC>::infinity();
+    }
+
+    const bool has_sink = kargs.attn_sink_ptr != nullptr;
+    auto g_attn_sink = make_gmem(reinterpret_cast<const D_ACC*>(kargs.attn_sink_ptr), has_sink ? kargs.H * sizeof(D_ACC) : 0);
+    const D_ACC sink_log2 = has_sink ? load(g_attn_sink, head)[0] * LOG2_E : -numeric_limits<D_ACC>::infinity();
     const D_ACC m_final = max(m_row, sink_log2);
     const D_ACC alpha   = __builtin_amdgcn_exp2f(m_row - m_final);
     const D_ACC l_final = l_row * alpha + __builtin_amdgcn_exp2f(sink_log2 - m_final);

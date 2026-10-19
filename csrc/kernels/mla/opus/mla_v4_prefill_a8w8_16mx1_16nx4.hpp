@@ -9,7 +9,10 @@ __global__ void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(opus_mla_v4_prefill_
 {
 }
 #else
-#include "mla_v4_prefill_global_load.hpp"
+#include "mla_global_load.hpp"
+#include <bit>
+
+using opus::operator""_I;
 
 // =============================================================================
 // Variant 16mx1_16nx4 fp8 (T_M=1, T_N=NUM_WARPS) — split NoPE fp8 / RoPE bf16.

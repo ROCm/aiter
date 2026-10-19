@@ -429,6 +429,7 @@ def _opus_sparse_prefill_v41(
     attn_sink,
     softmax_scale,
     out,
+    lse,
 ):
     gfx = get_gfx_runtime()
     if gfx != "gfx950":
@@ -467,6 +468,7 @@ def _opus_sparse_prefill_v41(
         attn_sink,
         out,
         float(softmax_scale),
+        lse,
     )
     return out
 
@@ -660,9 +662,10 @@ def _mla_sparse_prefill_v41_fake(
     kv_scale: torch.Tensor,
     kv_indices_extend: torch.Tensor,
     kv_indptr_extend: torch.Tensor,
-    attn_sink: torch.Tensor,
+    attn_sink: torch.Tensor | None,
     softmax_scale: float,
     out: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
     backend: str | None = None,
 ) -> torch.Tensor:
     if out is not None:
@@ -671,7 +674,7 @@ def _mla_sparse_prefill_v41_fake(
     return torch.empty((t, h, 512), dtype=torch.bfloat16, device=q.device)
 
 
-@torch_compile_guard(mutates_args=["out"], gen_fake=_mla_sparse_prefill_v41_fake)
+@torch_compile_guard(mutates_args=["out", "lse"], gen_fake=_mla_sparse_prefill_v41_fake)
 def mla_sparse_prefill_v41(
     q: torch.Tensor,
     q_scale: torch.Tensor,
@@ -683,9 +686,10 @@ def mla_sparse_prefill_v41(
     kv_scale: torch.Tensor,
     kv_indices_extend: torch.Tensor,
     kv_indptr_extend: torch.Tensor,
-    attn_sink: torch.Tensor,
+    attn_sink: torch.Tensor | None,
     softmax_scale: float,
     out: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
     backend: str | None = None,
 ) -> torch.Tensor:
     """MLA v4.1 sparse prefill: rows of 512 values with separate E8M0 scales (uint8
@@ -708,10 +712,13 @@ def mla_sparse_prefill_v41(
       kv_indices_extend: ``[total_extend]`` int32 row indices into the extend
         source, concatenated per token.
       kv_indptr_extend:  ``[T+1]`` int32 CSR row pointers.
-      attn_sink:         ``[H]`` fp32 per-head softmax-denom bias.
+      attn_sink:         ``[H]`` fp32 per-head softmax-denom bias, or ``None``
+        for no sink.
       softmax_scale:     float scalar applied to the QK^T scores.
       out:               Optional ``[T, H, 512]`` bf16 output buffer; allocated
         if ``None``.
+      lse:               Optional ``[T, H]`` fp32 output: natural-log LSE of the
+        scaled scores without the sink, ``+inf`` for a token without rows.
       backend:           ``"opus"`` or ``None``.
 
     Returns:
@@ -732,6 +739,7 @@ def mla_sparse_prefill_v41(
         attn_sink,
         softmax_scale,
         out,
+        lse,
     )
 
 

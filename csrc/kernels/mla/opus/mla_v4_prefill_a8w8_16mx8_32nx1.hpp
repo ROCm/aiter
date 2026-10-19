@@ -9,7 +9,10 @@ __global__ void opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel(opus_mla_v4_prefill_
 {
 }
 #else
-#include "mla_v4_prefill_global_load.hpp"
+#include "mla_global_load.hpp"
+#include <bit>
+
+using opus::operator""_I;
 
 // =============================================================================
 // Variant 16mx8_32nx1 fp8 (split NoPE fp8 / RoPE bf16, T_M=NUM_WARPS, T_N=1) — used when H > 32.
@@ -583,6 +586,9 @@ __device__ void mla_v4_prefill_accum_le2_tiles(
     auto u_sv_dequant = make_layout_sv_dequant<T>(warp_id, lane_id);
     auto u_rv         = make_layout_rv<T>(lane_id);
 
+    auto p_k_nope_lane = global_load_base<T::VEC_KV_NOPE>(p_k_nope, u_gk_nope);
+    auto p_k_rope_lane = global_load_base<T::VEC_KV_ROPE>(p_k_rope, u_gk_rope);
+
     // Tiled MMA operators
     auto mfma0_nope = make_mfma<D_NOPE, D_NOPE, D_ACC>(number<T::W_M>{}, number<T::W_N>{}, number<T::W_K_NOPE>{});
     auto mma0_rope = make_tiled_mma<D_ROPE, D_ROPE, D_ACC>(
@@ -680,8 +686,8 @@ __device__ void mla_v4_prefill_accum_le2_tiles(
 
     for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
         const int kv_page = load_kv_page(tile_idx);
-        global_load<T::VEC_KV_NOPE>(p_k_nope + kv_nope_offset(kv_page), s_k_nope.ptr, u_gk_nope, u_sk_nope);
-        global_load<T::VEC_KV_ROPE>(p_k_rope + kv_rope_offset(kv_page), s_k_rope.ptr, u_gk_rope, u_sk_rope);
+        global_load<T::VEC_KV_NOPE>(p_k_nope_lane + kv_nope_offset(kv_page), s_k_nope.ptr, u_gk_nope, u_sk_nope);
+        global_load<T::VEC_KV_ROPE>(p_k_rope_lane + kv_rope_offset(kv_page), s_k_rope.ptr, u_gk_rope, u_sk_rope);
         s_waitcnt_vmcnt(0_I);
         __builtin_amdgcn_s_barrier();
 
@@ -790,6 +796,9 @@ __device__ void mla_v4_prefill_accum_pipelined(
     auto u_cp_rope    = make_layout_cp_rope<T>(warp_id, lane_id);
     auto u_rv         = make_layout_rv<T>(lane_id);
 
+    auto p_k_nope_lane = global_load_base<T::VEC_KV_NOPE>(p_k_nope, u_gk_nope);
+    auto p_k_rope_lane = global_load_base<T::VEC_KV_ROPE>(p_k_rope, u_gk_rope);
+
     // Tiled MMA operators
     auto mfma0_nope = make_mfma<D_NOPE, D_NOPE, D_ACC>(number<T::W_M>{}, number<T::W_N>{}, number<T::W_K_NOPE>{});
     auto mma0_rope = make_tiled_mma<D_ROPE, D_ROPE, D_ACC>(
@@ -843,8 +852,8 @@ __device__ void mla_v4_prefill_accum_pipelined(
 
     auto async_load_kv = [&](auto slot_n, int token_idx) {
         constexpr int sl = decltype(slot_n)::value;
-        global_load<T::VEC_KV_NOPE>(p_k_nope + kv_nope_offset(token_idx), s_k_nope.ptr, u_gk_nope, u_sk_nope + number<sl * (T::smem_kv_bytes() / sizeof(D_NOPE))>{});
-        global_load<T::VEC_KV_ROPE>(p_k_rope + kv_rope_offset(token_idx), s_k_rope.ptr, u_gk_rope, u_sk_rope + number<sl * (T::smem_kv_bytes() / sizeof(D_ROPE))>{});
+        global_load<T::VEC_KV_NOPE>(p_k_nope_lane + kv_nope_offset(token_idx), s_k_nope.ptr, u_gk_nope, u_sk_nope + number<sl * (T::smem_kv_bytes() / sizeof(D_NOPE))>{});
+        global_load<T::VEC_KV_ROPE>(p_k_rope_lane + kv_rope_offset(token_idx), s_k_rope.ptr, u_gk_rope, u_sk_rope + number<sl * (T::smem_kv_bytes() / sizeof(D_ROPE))>{});
     };
 
     auto load_mxscl = [&](auto slot_off) {
