@@ -846,7 +846,7 @@ def mla_ps64_qh128_fp8_asm_fwd(
 
 @compile_ops(MD_NAME, ffi_type="ctypes")
 def mla_decode_stage1_asm_fwd(
-    # [num_seqs, num_heads, head_size]
+    # [total_q, num_heads, head_size]
     Q: torch.Tensor,
     # [num_page, page_size, num_kv_heads, kv_lora_rank + qk_rope_head_dim]
     KV: torch.Tensor,
@@ -866,12 +866,12 @@ def mla_decode_stage1_asm_fwd(
     page_size: int,
     nhead_kv: int,
     softmax_scale: float,
-    # [batch_size, num_kv_splits, num_heads, v_head_dim]
+    # [total_q, num_kv_splits, num_heads, v_head_dim]
     splitData: torch.Tensor,
-    # [batch_size, num_kv_splits, num_heads,  1]
+    # [total_q, num_kv_splits, num_heads, 1]
     splitLse: torch.Tensor,
     output: torch.Tensor,
-    # [batch_size, num_heads, v_head_dim]
+    # [total_q, num_heads] final natural-log LSE
     lse: torch.Tensor | None = None,
     # [1] per-tensor
     q_scale: torch.Tensor | None = None,
@@ -886,7 +886,11 @@ def mla_decode_stage1_asm_fwd(
     # [batch_size] scratch for gfx1250 packed MLA kernels
     valid_split_count: torch.Tensor | None = None,
     use_valid_split_count_reduce: int = 0,
+    # QH64 shuffled: right-aligned mask per query from qo_indptr.
     causal: bool = True,
+    kv_shuffled: int = 0,
+    # Shuffled QH64 only: indptr counts tokens, indices contain page64 slot IDs.
+    kv_indptr_is_token_level: bool = False,
 ) -> None: ...
 
 
@@ -1941,8 +1945,8 @@ def opus_mla_decode_mxfp8_fwd(
 
 @compile_ops("module_mla_decode_opus", ffi_type="ctypes")
 def opus_mla_decode_fwd(
-    q: torch.Tensor,  # [total_q, H, 576] bf16
-    kv: torch.Tensor,  # [num_page, 1, 1, 576] bf16, page_size == 1
+    q: torch.Tensor,  # [total_q, H, 576] bf16 or fp8 (merged nope+rope)
+    kv: torch.Tensor,  # [total_tokens, ..., 576] same dtype as q, page_size == 1
     qo_indptr: torch.Tensor,
     kv_indptr: torch.Tensor,
     kv_indices: torch.Tensor,
@@ -1954,28 +1958,11 @@ def opus_mla_decode_fwd(
     attn_lse: torch.Tensor,  # aiter split_lse    [num_partials,1,H,1]   fp32
     out: torch.Tensor,  # final [total_q, H, 512] bf16
     final_lse: torch.Tensor | None = None,  # [total_q, H] fp32
-) -> None: ...
-
-
-@compile_ops("module_mla_decode_opus", ffi_type="ctypes")
-def opus_mla_decode_fp8_fwd(
-    q: torch.Tensor,  # [B, H, 576]           fp8 (merged nope+rope)
-    kv: torch.Tensor,  # [total_tokens, 576]   fp8 (merged nope+rope)
-    qo_indptr: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    kv_indices: torch.Tensor,
-    kv_last_page_lens: torch.Tensor,
-    work_indptr: torch.Tensor,
-    work_info_set: torch.Tensor,
-    max_seqlen_q: int,
-    page_size: int,
-    nhead_kv: int,
-    softmax_scale: float,
-    logits: torch.Tensor,  # aiter split_output [num_partials,1,H,512] fp32
-    attn_lse: torch.Tensor,  # aiter split_lse    [num_partials,1,H,1]   fp32
-    out: torch.Tensor,  # final [B, H, 512] bf16
-    final_lse: torch.Tensor | None = None,  # [B, H] fp32
-    q_scale: torch.Tensor | None = None,  # float[1] per-tensor descale
-    kv_scale: torch.Tensor | None = None,  # float[1] per-tensor descale
-    causal: bool = True,  # mask across the max_seqlen_q query tokens
+    q_scale: torch.Tensor | None = None,  # fp8: float[1] per-tensor descale
+    kv_scale: torch.Tensor | None = None,  # fp8: float[1] per-tensor descale
+    max_seqlen_q: int = -1,  # fp8: required, picks the kernel; bf16: unused
+    causal: bool = True,  # fp8: mask across the max_seqlen_q query tokens
+    g_kv_indptr: torch.Tensor | None = None,  # fp8 round-robin CP: GLOBAL kv_indptr
+    cp_world_size: int = 1,  # fp8 round-robin CP: number of ranks, 1 = no CP
+    cp_rank: int = 0,  # fp8 round-robin CP: this rank
 ) -> None: ...
