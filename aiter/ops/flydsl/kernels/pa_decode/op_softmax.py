@@ -73,6 +73,15 @@ class PaDecodeSoftmax:
             + m * MFMA_MNK * self.traits.NWARP_PAD * self.traits.f32
         )
 
+    def lsum_offset(self, m):
+        return (
+            self.traits.sLsum_off
+            + m * MFMA_MNK * self.traits.NWARP_PAD * self.traits.f32
+        )
+
+    def p_offset(self, m):
+        return self.traits.sP_off + m * MFMA_MNK * self.traits.SP_ROW_BYTES
+
     def row_thresholds(self, tile_valid, window_left, m):
         n_valid_tile = (tile_valid - self.ctx.causal_offset[m]).to(fx.Float32)
         base_tok_f = fx.Int32(
@@ -198,9 +207,9 @@ class PaDecodeSoftmax:
         return v_max_scaled, norm_factor_b
 
     def single_scores(
-        self, frag_Ss, scale, tile_valid, window_left, cur_kv_buf, bounds
+        self, frag_Ss, scale, tile_valid, window_left, cur_kv_buf, bounds, m
     ):
-        thr, window_thr = self.row_thresholds(tile_valid, window_left, 0)
+        thr, window_thr = self.row_thresholds(tile_valid, window_left, m)
         neg4 = fx.Vector.filled(
             4,
             float("-inf") if self.traits.M1_SCALE_BEFORE_MASK else -1e30,
@@ -244,7 +253,7 @@ class PaDecodeSoftmax:
         # pass 1: per-warp max for this qhead
         self.stage_row_max(
             masked_chunks,
-            self.traits.sLmax_off,
+            self.lmax_offset(m),
             scale,
             self.traits.M1_SCALE_BEFORE_MASK,
         )
@@ -390,22 +399,30 @@ class PaDecodeSoftmax:
 
     @flyc.jit
     def pack_single(
-        self, masked_chunks, m_prev, scale, v_scale_vecs, cur_kv_buf, norm_factor_b
+        self,
+        masked_chunks,
+        m_prev,
+        scale,
+        v_scale_vecs,
+        cur_kv_buf,
+        norm_factor_b,
+        m,
     ):
-        # pass 2: global max over warps -> exp -> fp8 P pack (-> sP) -> sum
+        # pass 2: global max over warps -> exp -> fp8 P pack (-> sP) -> sum.
+        # M-tile m owns its Lmax, P and Lsum slots.
         if const_expr(self.traits.M1_SCALE_BEFORE_MASK):
-            tile_max = self.lds.load_wave(
-                self.traits.sLmax_off, self.ctx.lane16
-            ).reduce(ReductionOp.MAX, fastmath=self.ctx.fm_nnan)
+            tile_max = self.lds.load_wave(self.lmax_offset(m), self.ctx.lane16).reduce(
+                ReductionOp.MAX, fastmath=self.ctx.fm_nnan
+            )
             m_new = (
                 tile_max
                 if const_expr(self.traits.single_tile_plan)
                 else fx.maxnumf(m_prev, tile_max, fastmath=self.ctx.fm_nnan)
             )
         else:
-            tile_max = self.lds.load_wave(
-                self.traits.sLmax_off, self.ctx.lane16
-            ).reduce(ReductionOp.MAX)
+            tile_max = self.lds.load_wave(self.lmax_offset(m), self.ctx.lane16).reduce(
+                ReductionOp.MAX
+            )
             m_new = (
                 tile_max
                 if const_expr(self.traits.single_tile_plan)
@@ -456,7 +473,7 @@ class PaDecodeSoftmax:
                 else self.gemm.fp8_words(p_scaled)[0]
             )
         p_off0 = (
-            self.traits.sP_off
+            self.p_offset(m)
             + self.ctx.lane16 * self.traits.SP_ROW_BYTES
             + (self.ctx.warp * self.traits.TOK_PER_WARP + self.ctx.rgroup * 4)
             * self.traits.QP_ELEM_BYTES
@@ -480,7 +497,5 @@ class PaDecodeSoftmax:
             else fx.Float32(fx.exp2(m_prev - softmax_max, fastmath="fast"))
         )
         if self.ctx.rgroup == 0:
-            self.lds.store_wave(
-                self.traits.sLsum_off, self.ctx.lane16, self.ctx.warp, ls
-            )
+            self.lds.store_wave(self.lsum_offset(m), self.ctx.lane16, self.ctx.warp, ls)
         return m_new, corr_reg

@@ -8,8 +8,8 @@ rename or tune a config file.
 ## Rules
 
 1. Put tuning values in JSON. Do not put them in Python: no `setdefault`, no
-   inline dicts, no arch-specific constants and no fallback configs. If a
-   value is missing, fix the JSON.
+   inline dicts, no arch-specific constants and no fallback configs. Do not
+   put them in CSV files. If a value is missing, fix the JSON.
 2. Read configs only through a loader in `utils/`. The loaders use
    `resolve_config_dir()` and `load_config_json()`. Do not use
    `json.load(open(...))`, function-attribute caches or paths built by hand
@@ -177,10 +177,10 @@ there is no file. Do not change the returned dict.
 | `A4W4` | `gluon` | `bm<block_m>_n<N>_k<K>_<bucket>`, then `bm<block_m>_any` | `block_n`, `block_k`, `num_buffers`, `num_warps` |
 
 - `block_m` is the key. Do not put `BLOCK_SIZE_M` or `block_m` in an entry.
-- `<bucket>` comes from `m2bucket()`: `tiny`, `small`, `medium`, `medium2`,
-  `large` and `xlarge` (M split at 8, 32, 128, 256 and 512). Give each new
-  Gluon shape all six buckets. A missing bucket falls back to
-  `bm<block_m>_any`.
+- `<bucket>` comes from `m2bucket()`: `tiny` (M ≤ 8), `small` (M ≤ 32),
+  `medium` (M ≤ 128), `medium2` (M ≤ 256), `large` (M ≤ 512) and `xlarge`
+  (M > 512). Give each new Gluon shape all six buckets. A missing bucket
+  falls back to `bm<block_m>_any`.
 - Each Gluon file has a `bm<block_m>_any` entry for each `block_m`.
 
 ## Conv
