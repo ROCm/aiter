@@ -467,14 +467,20 @@ def build_gemm(kc: KernelCtx) -> dict:
         # a *method* on an atom treats that atom as scf.for loop-carried state (and
         # chokes extracting IR from it), so the atom method calls live inside this
         # function and the loop body is only a plain call.
-        # Plain closure (see the module note): the runtime n-tile loop body is only a
-        # plain call so the atoms aren't treated as scf.for loop-carried state.
+        # Stage the A-scale ONCE per unit (the same per-echunk block for every n-tile):
+        # off the per-n-tile critical path, one cbar instead of N_TILES, and it lets the
+        # waves keep drifting across n-tiles without a cooperative re-stage each time.
+        cbar(L, tid)  # sync waves entering the unit before the cooperative stage
+        a_scale.stage(a_scale_lds, tib)
+        cbar(L, tid)  # A-scale staged + visible to all compute waves
+
+        # Plain closure (see the module note): the runtime n-tile loop body is only a plain
+        # call so the atoms aren't treated as scf.for loop-carried state.  No nt-boundary
+        # cbar -- the previous n-tile's epilogue (or the per-unit stage above) already
+        # re-synced the waves, and the A-scale is staged once above.
         def _run_ntile(nt):
-            cbar(L, tid)  # sync the compute waves at the n-tile boundary
             b_row = wave_id * i32(n_per_wave) + nt * i32(TILE_N)
             q0 = uni((uord * ntpu + (nt - nt_lo)) * i32(K_ITERS))  # running ring-tile base
-            a_scale.stage(a_scale_lds, tib)  # compute stages the A-scale (small, one-shot)
-            cbar(L, tid)
             _ring_wait(L, tid, q0)  # wait the loader staged A K-step 0
             b_prev = b_loader.load_step(b_row, i32(0))
             acc = [mfma_gu.zero_value for _ in range(N_ACC)]
@@ -598,13 +604,18 @@ def build_gemm(kc: KernelCtx) -> dict:
         cptr = _lds_f32_ptr(L, L_C)  # cshuffle C tile (own region; the A-ring runs ahead)
         wave_id = tid // i32(64)
         tib = e * i32(RG)
+        # Stage the A-scale ONCE per unit (same per-echunk block for every n-tile) -- off
+        # the per-n-tile critical path (see gemm1).  Runs when the @flyc.jit wrapper calls
+        # _gemm2_core, before its n-tile loop.
+        cbar(L, tid)  # sync waves entering the unit before the cooperative stage
+        a_scale.stage(a_scale_lds, tib)
+        cbar(L, tid)  # A-scale staged + visible to all compute waves
 
+        # No nt-boundary cbar (see gemm1): prev n-tile's epilogue / the per-unit stage
+        # already re-synced the waves; A-scale is staged once above.
         def _run_ntile(nt):
-            cbar(L, tid)
             b_row = wave_id * i32(n_per_wave2) + nt * i32(TILE_N2)
             q0 = uni((uord * ntpu + (nt - nt_lo)) * i32(K_ITERS2))  # running ring-tile base
-            a_scale.stage(a_scale_lds, tib)  # compute stages the A-scale (small, one-shot)
-            cbar(L, tid)
             _ring_wait(L, tid, q0)  # wait the loader staged inter K-step 0
             b_prev = b_loader.load_step(b_row, i32(0))
             acc = [mfma_gu.zero_value for _ in range(N_ACC2)]
