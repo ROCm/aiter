@@ -179,11 +179,19 @@ def _assert_supported(
             "flydsl mxfp4 GEMM1 requires at least 2 K tiles per wave, "
             f"got D_HIDDEN/BK/k_wave={D_HIDDEN // BK // k_wave}"
         )
-    if (BM, use_nt, inline_quant) not in MXFP4_G1_VARIANTS[a_dtype]:
+    # FP8 BM16 inline quant may also load B cached (no NT); kept out of
+    # MXFP4_G1_VARIANTS so the tuner's search space is unchanged.
+    variant = (BM, use_nt, inline_quant)
+    inline_cached = a_dtype == "fp8" and variant == (16, False, True)
+    if variant not in MXFP4_G1_VARIANTS[a_dtype] and not inline_cached:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm1 unsupported variant "
             f"(a_dtype={a_dtype}, BM={BM}, use_nt={use_nt}, "
             f"inline_quant={inline_quant})"
+        )
+    if inline_quant and not use_nt and out_dtype != "fp8":
+        raise NotImplementedError(
+            "flydsl mxfp4 GEMM1 cached inline quantization requires FP8 output"
         )
 
 
