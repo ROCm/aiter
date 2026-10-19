@@ -1123,6 +1123,15 @@ def torch_mla_extend_3buffer_split_kv_and_reduce(
     )
 
 
+# get_mla_metadata_v1 planner per mode: (fast_mode, intra_batch_mode).
+# fast -> v1_2, v1_0 -> the -nps default, v1_1 -> neither flag.
+MLA_METADATA_MODES = {
+    "fast": (True, False),
+    "v1_0": (False, True),
+    "v1_1": (False, False),
+}
+
+
 def _make_mla_metadata(
     qo_indptr,
     kv_indptr,
@@ -1138,7 +1147,11 @@ def _make_mla_metadata(
     non_persistent_mode=False,
     causal=True,
     is_cp_round_robin=False,
+    metadata_mode=None,
 ):
+    if metadata_mode is None:
+        metadata_mode = "v1_0" if non_persistent_mode else "fast"
+    fast_mode, intra_batch_mode = MLA_METADATA_MODES[metadata_mode]
     names = (
         "work_meta_data",
         "work_indptr",
@@ -1154,9 +1167,9 @@ def _make_mla_metadata(
         dtype,
         kvtype,
         is_sparse=False,
-        fast_mode=not non_persistent_mode,
+        fast_mode=fast_mode,
         num_kv_splits=max_split_per_batch,
-        intra_batch_mode=non_persistent_mode,
+        intra_batch_mode=intra_batch_mode,
     )
     metadata = {
         name: torch.empty(shape, dtype=buffer_dtype, device=qo_indptr.device)
@@ -1182,9 +1195,9 @@ def _make_mla_metadata(
         ),
         max_seqlen_qo=int(max_seqlen_qo),
         uni_seqlen_qo=decode_qlen,
-        fast_mode=not non_persistent_mode,
+        fast_mode=fast_mode,
         max_split_per_batch=max_split_per_batch,
-        intra_batch_mode=non_persistent_mode,
+        intra_batch_mode=intra_batch_mode,
         dtype_q_nope=dtype,
         dtype_kv_nope=kvtype,
         is_cp_round_robin=is_cp_round_robin,
@@ -1212,6 +1225,7 @@ def test_mla(
     scale_dim,
     return_lse,
     causal,
+    metadata_mode=None,
 ):
     ret = {}
 
@@ -1333,6 +1347,9 @@ def test_mla(
             (cu_num + batch_size - 1) // batch_size, max_split_per_batch
         )
 
+    if metadata_mode is None:
+        metadata_mode = "v1_0" if non_persistent_mode else "fast"
+    fast_mode, intra_batch_mode = MLA_METADATA_MODES[metadata_mode]
     metadata = _make_mla_metadata(
         qo_indptr,
         kv_indptr,
@@ -1345,8 +1362,8 @@ def test_mla(
         max_seqlen_qo,
         decode_qlen,
         max_split_per_batch,
-        non_persistent_mode=non_persistent_mode,
         causal=causal,
+        metadata_mode=metadata_mode,
     )
     work_meta_data = metadata["work_meta_data"]
     work_indptr = metadata["work_indptr"]
@@ -1469,8 +1486,8 @@ def test_mla(
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
-            intra_batch_mode=non_persistent_mode,
-            fast_mode=bool(not non_persistent_mode),
+            intra_batch_mode=intra_batch_mode,
+            fast_mode=fast_mode,
             kv_scale=kv_scale,
             causal=causal,
         )
@@ -1548,8 +1565,8 @@ def test_mla(
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
-            intra_batch_mode=non_persistent_mode,
-            fast_mode=bool(not non_persistent_mode),
+            intra_batch_mode=intra_batch_mode,
+            fast_mode=fast_mode,
             return_lse=return_lse,
             causal=causal,
         )
@@ -1652,8 +1669,8 @@ def test_mla(
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
-            intra_batch_mode=non_persistent_mode,
-            fast_mode=bool(not non_persistent_mode),
+            intra_batch_mode=intra_batch_mode,
+            fast_mode=fast_mode,
             return_lse=return_lse,
             causal=causal,
         )
@@ -1774,8 +1791,8 @@ def test_mla(
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
-            intra_batch_mode=non_persistent_mode,
-            fast_mode=bool(not non_persistent_mode),
+            intra_batch_mode=intra_batch_mode,
+            fast_mode=fast_mode,
             causal=causal,
         )
 
@@ -2259,6 +2276,16 @@ parser.add_argument(
     --varlen # True""",
 )
 parser.add_argument(
+    "-mm",
+    "--metadata_mode",
+    type=str,
+    choices=list(MLA_METADATA_MODES),
+    default=None,
+    help="""get_mla_metadata_v1 planner: fast (v1_2), v1_0 or v1_1.
+    Default: v1_0 with -nps, else fast.
+    e.g.: -mm v1_1""",
+)
+parser.add_argument(
     "-pl",
     "--paged_layout",
     type=str,
@@ -2368,6 +2395,8 @@ def main():
                     scale_dim=args.scale_dim,
                     return_lse=args.return_lse,
                     causal=args.causal,
+                    metadata_mode=args.metadata_mode
+                    or ("v1_0" if args.non_persistent_mode else "fast"),
                 )
                 df.append(ret)
         df = pd.DataFrame(df)
