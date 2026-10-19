@@ -782,6 +782,33 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
     // flag = rocblas_gemm_flags_fp16_alt_impl;
     //}
 
+    // Max value of N dimension for decode GEMM
+    int decode_max_n = 512;
+
+    // load tuning cache file and check if the gemm has been already tuned
+    const char* env = std::getenv("HIP_ONLINE_TUNING");
+    bool online_tuning = env && (std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0);
+    // check if there is enough memory left for online tuning
+    if (online_tuning) {
+        size_t freeMem, totalMem;
+        hipMemGetInfo(&freeMem, &totalMem);
+        if (freeMem <= 128*1024*1024) {
+            std::cout << "No space left for hipBLASLt online tuning." << std::endl;
+            online_tuning = false;
+        }
+    }
+
+    if (online_tuning && n <= decode_max_n) {
+      solution_index = get_algoIdx_hip_tuning_csv("./hip_online_tuning_res.csv", handle,
+                                                  bpreshuffle,
+                                                  op_A, op_B, m, n, k,
+                                                  intype, lda, 0,
+                                                  intype, ldb, 0,
+                                                  outtype, ldc, 0,
+                                                  HIPBLAS_COMPUTE_32F, 1,
+                                                  scaleA_mode, scaleB_mode);
+    }
+
     // nvtxRangePushA("hipBLASLt variables creation");
     hipblasLtMatrixLayout_t matA, matB, matC;
     hipblasLtMatmulDesc_t matmul;
@@ -875,33 +902,6 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
     // auto gemm_key { MatMulConfig { op_A, op_B, m, n, k, dtype } };
     // if (heuristic_map.count(gemm_key) <= 0) {
     
-    // Max value of N dimension for decode GEMM
-    int decode_max_n = 512;
-
-    // load tuning cache file and check if the gemm has been already tuned
-    const char* env = std::getenv("HIP_ONLINE_TUNING");
-    bool online_tuning = env && (std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0);
-    // check if there is enough memory left for online tuning
-    if (online_tuning) {
-        size_t freeMem, totalMem;
-        hipMemGetInfo(&freeMem, &totalMem);
-        if (freeMem <= 128*1024*1024) {
-            std::cout << "No space left for hipBLASLt online tuning." << std::endl;
-            online_tuning = false;
-        }
-    }
-
-    if (online_tuning && n <= decode_max_n) { 
-      solution_index = get_algoIdx_hip_tuning_csv("./hip_online_tuning_res.csv", handle,
-                                                  bpreshuffle,
-                                                  op_A, op_B, m, n, k,
-                                                  intype, lda, 0,
-                                                  intype, ldb, 0,
-                                                  outtype, ldc, 0,
-                                                  HIPBLAS_COMPUTE_32F, 1,
-                                                  scaleA_mode, scaleB_mode);
-    }
-
     std::vector<hipblasLtMatmulHeuristicResult_t> heuristicResult(1);
     if(solution_index < 0)
     {
@@ -1125,9 +1125,9 @@ static void validate_hipb_operand_scale(const aiter_tensor_t& scale,
         AITER_CHECK(scale.dtype() == AITER_DTYPE_u8 || scale.dtype() == AITER_DTYPE_fp8_e8m0,
                     name,
                     " must have dtype uint8 or fp8_e8m0");
-        AITER_CHECK(scale.dim() == 2 && scale.size(0) == scale_rows && scale.size(1) == scale_k,
+        AITER_CHECK(scale.dim() == 2 && scale.size(0) >= scale_rows && scale.size(1) == scale_k,
                     name,
-                    " must have shape [",
+                    " must have shape [at least ",
                     scale_rows,
                     ", ",
                     scale_k,

@@ -6,10 +6,18 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.jit.core import get_module
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.gradlib import HipblasLtMatmulScaleMode as ScaleMode
 from aiter.test_common import assertAllclose
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+requires_fp8 = pytest.mark.skipif(
+    dtypes.fp8 == dtypes.u8, reason="FP8 is not supported on this device"
+)
+requires_mxfp8 = pytest.mark.skipif(
+    get_gfx() != "gfx950", reason="MXFP8 hipb_mm requires gfx950"
+)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -19,6 +27,7 @@ def hipb_extension():
     aiter.hipb_destroy_extension()
 
 
+@requires_fp8
 @pytest.mark.parametrize("rows", [1, 32])
 @pytest.mark.parametrize("mode", [ScaleMode.SCALAR_32F, ScaleMode.OUTER_VEC_32F])
 @pytest.mark.parametrize("explicit", [(), ("A",), ("B",), ("A", "B")])
@@ -45,19 +54,19 @@ def test_hipb_mm_scale_mode_inference(rows, mode, explicit):
     assertAllclose(ref, out, rtol=1e-2, atol=1e-2, catastrophic_check=True)
 
 
-@pytest.mark.parametrize("operand", ["A", "B"])
+@requires_fp8
 @pytest.mark.parametrize(
-    "rows, scale_a_shape, scale_b_shape, provided",
+    "rows, scale_a_shape, scale_b_shape, provided, operand",
     [
-        (1, (1, 1), (1, 1), ScaleMode.OUTER_VEC_32F),
-        (32, (1, 1), (1, 1), ScaleMode.OUTER_VEC_32F),
-        (1, (1, 1), (1, 128), ScaleMode.SCALAR_32F),
-        (32, (32, 1), (1, 128), ScaleMode.SCALAR_32F),
+        (1, (1, 1), (1, 1), ScaleMode.OUTER_VEC_32F, "A"),
+        (32, (1, 1), (1, 1), ScaleMode.OUTER_VEC_32F, "B"),
+        (1, (1, 1), (1, 128), ScaleMode.SCALAR_32F, "A"),
+        (32, (32, 1), (1, 128), ScaleMode.SCALAR_32F, "B"),
     ],
     ids=["scalar-1-row", "scalar-32-rows", "rowwise-1-row", "rowwise-32-rows"],
 )
 def test_hipb_mm_rejects_scale_mode_conflict(
-    operand, rows, scale_a_shape, scale_b_shape, provided
+    rows, scale_a_shape, scale_b_shape, provided, operand
 ):
     x = torch.zeros((rows, 256), device="cuda", dtype=dtypes.fp8)
     w = torch.zeros((128, 256), device="cuda", dtype=dtypes.fp8)
@@ -84,6 +93,7 @@ def test_hipb_mm_without_scales(dtype):
     aiter.hipb_mm(x, w.t(), solution_index=-1, out_dtype=dtype)
 
 
+@requires_fp8
 @pytest.mark.parametrize("operand", ["A", "B"])
 def test_hipb_mm_single_scale(operand):
     x = torch.randint(-2, 3, (32, 256), device="cuda").to(dtypes.fp8)
@@ -100,6 +110,7 @@ def test_hipb_mm_single_scale(operand):
     assertAllclose(ref, out, rtol=1e-2, atol=1e-2, catastrophic_check=True)
 
 
+@requires_fp8
 @pytest.mark.parametrize(
     "mode_a, mode_b, scale_a_shape, scale_b_shape, scale_dtype",
     [
@@ -110,12 +121,12 @@ def test_hipb_mm_single_scale(operand):
             (1, 128),
             torch.float32,
         ),
-        (ScaleMode.VEC32_UE8M0, ScaleMode.VEC32_UE8M0, (32, 8), (128, 8), torch.uint8),
+        (ScaleMode.VEC32_UE8M0, ScaleMode.VEC32_UE8M0, (33, 8), (128, 8), torch.uint8),
         (
             ScaleMode.VEC32_UE8M0,
             ScaleMode.VEC32_UE8M0,
             (32, 8),
-            (128, 8),
+            (129, 8),
             dtypes.fp8_e8m0,
         ),
     ],
@@ -144,6 +155,73 @@ def test_hipb_mm_rejects_unrepresentable_tuning_modes(
             scaleA_mode=mode_a,
             scaleB_mode=mode_b,
         )
+
+
+@requires_fp8
+@pytest.mark.parametrize(
+    "mode, scale_a_shape, scale_b_shape, operand",
+    [
+        (ScaleMode.BLK32_UE8M0_32_8_EXT, (63, 24), (128, 24), "A"),
+        (ScaleMode.BLK32_UE8M0_32_8_EXT, (64, 24), (128, 32), "B"),
+        (ScaleMode.VEC32_UE8M0, (32, 24), (128, 24), "A"),
+    ],
+    ids=[
+        "short-rows-A",
+        "extra-columns-B",
+        "unswizzled-short-rows-A",
+    ],
+)
+def test_hipb_mm_rejects_invalid_scale_shape(
+    mode, scale_a_shape, scale_b_shape, operand
+):
+    if mode == ScaleMode.BLK32_UE8M0_32_8_EXT and get_module(
+        "module_hipbsolgemm"
+    ).hipblaslt_build_version < (1, 3, 0):
+        pytest.skip("Swizzled MXFP8 requires hipBLASLt >=1.3")
+    x = torch.zeros((33, 768), device="cuda", dtype=dtypes.fp8)
+    w = torch.zeros((128, 768), device="cuda", dtype=dtypes.fp8)
+    scale_a = torch.ones(scale_a_shape, device="cuda", dtype=dtypes.u8)
+    scale_b = torch.ones(scale_b_shape, device="cuda", dtype=dtypes.u8)
+    with pytest.raises(RuntimeError, match=f"scale{operand} must have shape"):
+        aiter.hipb_mm(
+            x,
+            w.t(),
+            solution_index=-1,
+            out_dtype=dtypes.bf16,
+            scaleA=scale_a,
+            scaleB=scale_b,
+            scaleA_mode=mode,
+            scaleB_mode=mode,
+        )
+
+
+@requires_fp8
+@requires_mxfp8
+@pytest.mark.parametrize(
+    "mode", [ScaleMode.VEC32_UE8M0, ScaleMode.BLK32_UE8M0_32_8_EXT]
+)
+@pytest.mark.parametrize("scale_dtype", [dtypes.u8, dtypes.fp8_e8m0])
+def test_hipb_mm_accepts_mxfp8_scale_dtype(mode, scale_dtype):
+    if mode == ScaleMode.BLK32_UE8M0_32_8_EXT and get_module(
+        "module_hipbsolgemm"
+    ).hipblaslt_build_version < (1, 3, 0):
+        pytest.skip("Swizzled MXFP8 requires hipBLASLt >=1.3")
+    x = torch.zeros((32, 256), device="cuda", dtype=dtypes.fp8)
+    w = torch.zeros((128, 256), device="cuda", dtype=dtypes.fp8)
+    # E8M0 1.0 has byte value 127; constant scales need no swizzling.
+    scale_a = torch.full((32, 8), 127, device="cuda", dtype=dtypes.u8)
+    scale_b = torch.full((128, 8), 127, device="cuda", dtype=dtypes.u8)
+    aiter.hipb_mm(
+        x,
+        w.t(),
+        solution_index=-1,
+        out_dtype=dtypes.bf16,
+        scaleA=scale_a.view(scale_dtype),
+        scaleB=scale_b.view(scale_dtype),
+        scaleA_mode=mode,
+        scaleB_mode=mode,
+    )
+    torch.cuda.synchronize()
 
 
 if __name__ == "__main__":

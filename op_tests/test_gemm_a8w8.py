@@ -77,8 +77,8 @@ def run_torch(
 ):
     # MXFP8 reference scales are unswizzled E8M0, one per 32 elements along K.
     if quant_mode in ("mxfp8-unswizzled", "mxfp8-swizzled"):
-        x_scale = torch.exp2(x_scale.float() - 127).repeat_interleave(32, dim=1)
-        w_scale = torch.exp2(w_scale.float() - 127).repeat_interleave(32, dim=1)
+        x_scale = x_scale.float().repeat_interleave(32, dim=1)
+        w_scale = w_scale.float().repeat_interleave(32, dim=1)
     x = x.to(dtypes.fp32) * x_scale
     weight = weight.to(dtypes.fp32) * w_scale
     out = F.linear(x, weight)
@@ -197,7 +197,7 @@ def test_gemm(
             )
             operand = (operand.float() * factors.repeat_interleave(32, dim=1)).to(dtype)
             values = torch.empty_like(operand, dtype=quantDtype)
-            scales = torch.empty_like(factors, dtype=torch.uint8)
+            scales = torch.empty_like(factors, dtype=dtypes.fp8_e8m0)
             aiter.dynamic_per_group_scaled_quant(
                 values, operand, scales, group_size=32, shuffle_scale=False
             )
@@ -284,8 +284,8 @@ def test_gemm(
         init_hipblas()
         hipb_x_scale, hipb_w_scale = x_scale, w_scale
         if quant_mode == "mxfp8-swizzled":
-            hipb_x_scale = shuffle_scale(x_scale)[: (m + 31) // 32 * 32]
-            hipb_w_scale = shuffle_scale(w_scale)[: (n + 31) // 32 * 32]
+            hipb_x_scale = shuffle_scale(x_scale)
+            hipb_w_scale = shuffle_scale(w_scale)
         hipb, avg_hipb = run_aiter_hip(
             x,
             weight,
