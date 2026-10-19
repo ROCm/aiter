@@ -197,8 +197,11 @@ def _variants(row: dict) -> list[dict]:
             layouts = (GateMode.SEPARATED, GateMode.INTERLEAVE)
             gate_modes += [mode for mode in layouts if mode not in gate_modes]
         biases = ["none"]
+        # Mirror fused_moe.enable_bias: only Swiglu (GPT-OSS) takes expert
+        # bias; Silu / SiTUv2 callers never pass one, so do not AOT those.
         if (
-            _name(row["q_type"]) == "per_1x32"
+            _name(row["act_type"]) == "Swiglu"
+            and _name(row["q_type"]) == "per_1x32"
             and _name(row["dtype"]) in ("bfloat16", "float16")
             and _name(row["q_dtype_w"]) == _FP4
         ):
@@ -211,6 +214,8 @@ def _variants(row: dict) -> list[dict]:
         # passed explicitly.
         betas += [(1.0, 1.0), (DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA)]
     # Callers behind an EP dispatch pass the received token count.
+    # CK-Tile's interleaved split-k epilogue cannot apply bias (#6478), so
+    # drop INTERLEAVE x bias rather than widening that into a runtime skip.
     return [
         {
             "gate_mode": gate_mode.value,
@@ -225,6 +230,7 @@ def _variants(row: dict) -> list[dict]:
         for bias in biases
         for beta, linear_beta in betas
         for clamp_shared in clamps
+        if bias == "none" or gate_mode != GateMode.INTERLEAVE
     ]
 
 

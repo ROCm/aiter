@@ -5635,9 +5635,7 @@ def cktile_moe_stage1(
 
         if is_interleaved:
             if bias1 is not None:
-                raise NotImplementedError(
-                    "CK-Tile interleaved split-k bias is not supported"
-                )
+                raise ValueError("CK-Tile interleaved split-k bias is not supported")
             inter_dim = out.shape[-1]
             if activation == ActivationType.Swiglu:
                 from aiter.ops.flydsl.moe_kernels import (
