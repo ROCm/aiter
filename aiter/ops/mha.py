@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import importlib.util
 import os
 from typing import Any
 
@@ -22,6 +23,8 @@ from ..jit.utils.mha_recipes import (
 )
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
+
+_FLYDSL_AVAILABLE = importlib.util.find_spec("flydsl") is not None
 
 
 def _fmha_kv_byte_extent_ge_u32(
@@ -1243,7 +1246,7 @@ def cmdGenFunc_mha_bwd(
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
-        "flags_extra_cc": ["'-DONLY_FAV3=0'"],
+        "flags_extra_cc": ["-DONLY_FAV3=0"],
     }
 
 
@@ -1501,7 +1504,7 @@ def cmdGenFunc_mha_varlen_bwd(
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
-        "flags_extra_cc": ["'-DONLY_FAV3=0'"],
+        "flags_extra_cc": ["-DONLY_FAV3=0"],
     }
 
 
@@ -2837,7 +2840,7 @@ def flash_attn_func(
     # FlyDSL path returns result if supported, None otherwise. window_size[2] (sink
     # size) is unsupported: the FlyDSL gate rejects it, and this screen keeps it off
     # the path so a sink-token request is never silently dropped.
-    if (
+    if _FLYDSL_AVAILABLE and (
         cu_seqlens_q is None
         and cu_seqlens_kv is None
         and num_splits <= 1
@@ -3354,7 +3357,7 @@ def _flash_attn_varlen_backward(
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     # Evaluated after maybe_contiguous: the gate checks contiguity.
-    can_impl_fmha_bwd_flydsl_ = can_impl_fmha_bwd_flydsl()
+    can_impl_fmha_bwd_flydsl_ = _FLYDSL_AVAILABLE and can_impl_fmha_bwd_flydsl()
 
     if can_impl_fmha_bwd_flydsl_:
         from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_bwd
@@ -3786,9 +3789,8 @@ def flash_attn_varlen_func(
         is_hd192x128 = hdim_q == 192 and hdim_v == 128
         if not ((hdim_q in (64, 128) and hdim_v == hdim_q) or is_hd192x128):
             return False
-        # Experimental FlyDSL m32x8 kernel owns the 128/128 path when enabled;
-        # yield so it reaches flydsl_flash_attn_varlen_func below.
-        if hdim_q == 128 and is_experimental_enabled():
+        # Yield these to the FlyDSL m32x8 kernel below; without 192 the bshd and thd routers disagree.
+        if hdim_q in (64, 128, 192) and is_experimental_enabled():
             return False
         if nhead_q % nhead_k != 0:
             return False
@@ -3842,12 +3844,14 @@ def flash_attn_varlen_func(
             v_descale,
         )
 
-    # FlyDSL path returns result if supported, None otherwise. window_size[2] (sink
-    # size) is unsupported: the FlyDSL gate rejects it, and this screen keeps it off
-    # the path so a sink-token request is never silently dropped.
-    # FlyDSL also does not consume precomputed Q/K/V descales, so keep
-    # prequantized FP8 attention on the CK path.
-    if not has_all_descales and (len(window_size) < 3 or window_size[2] == 0):
+    if (
+        _FLYDSL_AVAILABLE
+        and not has_all_descales
+        and (len(window_size) < 3 or window_size[2] == 0)
+        and cu_seqlens_q_padded is None
+        and cu_seqlens_k_padded is None
+        and logits_soft_cap == 0.0
+    ):
         from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
 
         _flydsl_result = flydsl_flash_attn_varlen_func(
