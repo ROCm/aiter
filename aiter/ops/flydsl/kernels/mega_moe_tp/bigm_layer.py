@@ -22,6 +22,7 @@ import torch.distributed as dist
 
 from aiter.jit.utils.chip_info import get_gfx
 
+from ....communication import SdmaComm, compile_signal_read, sdma_bitcode
 from ..tensor_shim import _preload_compiled, _run_compiled
 from .bigm_config import (
     C_ERR,
@@ -36,7 +37,6 @@ from .bigm_config import (
 )
 from .bigm_gemm import bigm_lds
 from .bigm_kernel import compile_bigm_layer
-from .sdma import SdmaComm, compile_signal_read, sdma_bitcode
 from .tuned import bigm_tuned
 
 _log = logging.getLogger("aiter")
@@ -50,21 +50,20 @@ __all__ = ["PAD", "MegaMoeTPBigM", "compile_bigm_layer"]
 # every big-M variant again (~86 s each, all ranks waiting). The artifact itself pickles fine
 # (no post-load processors), so this keeps it on disk keyed by the compile arguments plus the
 # digest of everything else it is built from: the kernel's sources (bigm_kernel.py and the
-# modules it imports from this package), the SDMA bitcode, the FlyDSL compiler (its own cache
+# modules it imports from aiter.ops.flydsl.kernels), the SDMA bitcode, the FlyDSL compiler (its own cache
 # key) and the GPU arch.
 _DIGEST = None
 
 
 def _kernel_sources():
     """bigm_kernel.py and every module of aiter.ops.flydsl.kernels it imports, transitively
-    (relative imports, wherever in the file); not into sdma.py, whose part in the kernel is
-    MORI's bitcode (hashed itself) and whose host side imports the small-batch engine"""
+    (relative imports, wherever in the file; MORI's bitcode is hashed itself)"""
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # .../kernels
     todo = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "bigm_kernel.py")]
     seen = set()
     while todo:
         f = todo.pop()
-        if f in seen or not os.path.isfile(f) or os.path.basename(f) == "sdma.py":
+        if f in seen or not os.path.isfile(f):
             continue
         seen.add(f)
         here = os.path.dirname(f)

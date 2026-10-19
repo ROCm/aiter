@@ -528,7 +528,7 @@ def compile_bigm_layer(
         from flydsl.compiler.extern_link import link_extern
         from flydsl.expr.extern import ffi
 
-        from .sdma import sdma_bitcode
+        from ....communication import sdma_bitcode
 
         bc = sdma_bitcode(6)
         put_ptr = link_extern(
