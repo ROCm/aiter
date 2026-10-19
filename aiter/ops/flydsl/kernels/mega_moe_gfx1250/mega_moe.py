@@ -90,10 +90,19 @@ _S1F_MIN_TILE_M = 16
 _S1F_TILE_N, _S1F_TILE_K = 256, 256
 #: Stage-1 variants by GEMM1 tile_m, i.e. by the step's compact alignment:
 #: (pipeline buffers, CTAs per CU). A 64-row tile (~230 VGPRs, 133,632 B
-#: arena) runs two CTAs per CU. A 256-row tile's ~800 VGPRs leave one wave
-#: per SIMD, so its CTA has the CU to itself; 3 buffers (221,184 B) beat 4 at
-#: tpr 1536 (stage 1 167 vs 172 us, 2 interleaved runs each).
-_S1F_VARIANTS = {64: (3, 2), 256: (3, 1)}
+#: arena) runs two CTAs per CU. A 128-row tile holds twice the accumulators
+#: in 162,816 B and runs two CTAs per CU: 2 x 163,840 B is exactly the 320 KB
+#: of LDS, and the compiled body takes 398 VGPRs (no spills), so two waves
+#: still fit a SIMD. A 256-row
+#: tile's ~800 VGPRs leave one wave per SIMD, so its CTA has the CU to
+#: itself; 3 buffers (221,184 B) beat 4 at tpr 1536 (stage 1 167 vs 172 us,
+#: 2 interleaved runs each).
+#:
+#: Every worker CTA has to be resident at once -- the producers hand tiles to
+#: consumers inside one launch -- so a variant whose CTAs per CU exceeds what
+#: VGPRs and LDS allow would hang, not just run slow. Check the ISA dump
+#: (.vgpr_count, .group_segment_fixed_size) when adding one.
+_S1F_VARIANTS = {64: (3, 2), 128: (3, 2), 256: (3, 1)}
 #: m-tiles per group in the GEMM1 work order.
 _S1F_GROUP_M = 8
 
