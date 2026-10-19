@@ -197,6 +197,7 @@ def check_case(
     kv_heads=None,
     q_lens=None,
     k_lens=None,
+    backend="triton",
 ):
     torch.manual_seed(125)
     device = "cuda"
@@ -217,7 +218,8 @@ def check_case(
     for i, count in enumerate(pages_per_request):
         table[i, :count] = perm[offset : offset + count]
         offset += count
-    table[1, 0] = table[0, 0]
+    if len(q_lens) > 1:
+        table[1, 0] = table[0, 0]
     # Poison invalid final-page V slots: the kernel must mask them before PV.
     for i, length in enumerate(k_lens):
         if length % page:
@@ -317,7 +319,7 @@ def check_case(
         ks if mode == "scalar" else None,
         vs if mode == "scalar" else None,
         shuffled_kv_cache=layout != "flash",
-        backend="triton",
+        backend=backend,
         **kwargs,
     )
     torch.testing.assert_close(
