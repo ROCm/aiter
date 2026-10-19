@@ -325,96 +325,77 @@ def build_gemm(kc: KernelCtx) -> dict:
         ``cbar`` for the two LDS syncs.  Mirrors ``SiluQuantEpilogue.store`` (evec==2) but
         stores the E8M0 out-scale ROW-MAJOR (``row_g*inter_scols + col_s``) so the GEMM2
         reader is unchanged."""
-        wave = tid // i32(64)
         lane = tid % i32(64)
+        wave = tid // i32(64)
         l16 = lane % i32(16)
-        ld4 = (lane // i32(16)) * i32(4)
-        nwo = cs_tile_n // NW
-        cbase = wave * i32(nwo)
+        q4 = lane // i32(16)
+        cbase = wave * i32(cs_tile_n // NW)  # this wave's base col (of 32) within the n-tile
         gui_n = NUM_ACC_N // 2
-        # combine gate/up accumulators + activation (round through bf16, as the naive
-        # path did, to match the reference intermediate numerics)
-        combined = []
+        c64 = i32(64)
+        del cptr  # register epilogue: no cshuffle C-tile
+        # Quantize straight from the MFMA accumulators (no C-tile).  acc[mi][nj*2 | +1]
+        # (gate|up) element v lands at (row = mi*16 + q4*4 + v, col = cbase + nj*16 + l16);
+        # the wave's 32 cols (nj in {0,1}) are exactly one 1x32 E8M0 group of that row, so
+        # the group-max = reg-max over nj + shuffle_xor over l16, and the fp4 pack of adjacent
+        # cols reads the l16^1 neighbour (the even lane owns the (l16, l16+1) byte).
         for mi in range_constexpr(M_REPEAT):
-            for ni in range_constexpr(gui_n):
-                g_idx = mi * NUM_ACC_N + ni * 2
+            cnj = []
+            for nj in range_constexpr(gui_n):
+                g_idx = mi * NUM_ACC_N + nj * 2
                 gv = fx.Vector(acc[g_idx])
                 uv = fx.Vector(acc[g_idx + 1])
                 gs = [fx.Float32(gv[v]) for v in range(4)]
                 us = [fx.Float32(uv[v]) for v in range(4)]
-                xs = [
-                    fx.Float32(x).to(fx.BFloat16).to(fx.Float32)
-                    for x in _act_batch(gs, us)
-                ]
-                combined.append(fx.Vector.from_elements(xs, fx.Float32))
-        n_per = gui_n
-        # cshuffle write (wave-local 32 cols)
-        for mi in range_constexpr(M_REPEAT):
-            for nj in range_constexpr(n_per):
-                v4 = fx.Vector(combined[mi * n_per + nj])
-                col = cbase + i32(nj * 16) + l16
-                for ii in range_constexpr(4):
-                    row = i32(mi * 16) + ld4 + i32(ii)
-                    idx = row * i32(cs_tile_n) + col
-                    ptr = fx.add_offset(cptr, fx.make_int_tuple(idx))
-                    fx.ptr_store(fx.Vector.from_elements([v4[ii]], fx.Float32), ptr)
-        cbar(L, tid)
-        # read back + per-1x32 E8M0 quant + row-major store
-        NLANE = 32
-        EVEC = 2
-        rows_per_iter = NW * 64 // NLANE
-        mlane = tid // i32(NLANE)
-        nlane = tid % i32(NLANE)
-        m_reps = RG // rows_per_iter
-        n_reps = cs_tile_n // (NLANE * EVEC)
-        c64 = i32(64)
-        for mr in range_constexpr(m_reps):
-            row = i32(mr * rows_per_iter) + mlane
-            row_g = e * i32(RG) + row
-            out_row = row_g * i32(inter_row_bytes)
-            s_row = row_g * i32(inter_scols)
-            for nr in range_constexpr(n_reps):
-                col0 = i32(nr * NLANE * EVEC) + nlane * i32(EVEC)
-                idx = row * i32(cs_tile_n) + col0
-                f32_iter = fx.recast_iter(
-                    fx.Float32, fx.add_offset(cptr, fx.make_int_tuple(idx))
+                cnj.append(
+                    [fx.Float32(x).to(fx.BFloat16).to(fx.Float32) for x in _act_batch(gs, us)]
                 )
-                frag = fx.make_view(f32_iter, fx.make_layout(EVEC, 1)).load()
-                v0 = frag[0]
-                v1 = frag[1]
-                a0 = v0.maximumf(fx.Float32(0.0) - v0)
-                a1 = v1.maximumf(fx.Float32(0.0) - v1)
+            for v in range_constexpr(4):
+                row_g = e * i32(RG) + i32(mi * 16) + q4 * i32(4) + i32(v)
+                out_row = row_g * i32(inter_row_bytes)
+                s_row = row_g * i32(inter_scols)
+                c0, c1 = cnj[0][v], cnj[1][v]
+                a0 = c0.maximumf(fx.Float32(0.0) - c0)
+                a1 = c1.maximumf(fx.Float32(0.0) - c1)
                 m = a0.maximumf(a1)
                 for off in (1, 2, 4, 8):
                     m = m.maximumf(m.shuffle_xor(i32(off), c64))
                 max_rounded = (m.bitcast(fx.Int32) + i32(0x400000)) & i32(0xFF800000)
                 _e = (max_rounded >> i32(23)) - i32(8 if a8 else 2)
                 e8 = (_e > i32(0)).select(_e, i32(0))
-                gcol = i32(n_tile) * i32(cs_tile_n) + col0
-                if const_expr(a8):
-                    qscale = ((i32(254) - e8) << i32(23)).bitcast(fx.Float32)
-                    s0 = v0 * qscale
-                    s1 = v1 * qscale
-                    packed = rocdl.cvt_pk_fp8_f32(T.i32, s0, s1, i32(0), 0)
-                    bst(fx.Int32(packed).to(fx.Int16), r_inter, out_row + gcol, 0, 0)
-                else:
-                    dequant = (e8 << i32(23)).bitcast(fx.Float32)
-                    packed = rocdl.cvt_scalef32_pk_fp4_f32(
-                        T.i32, i32(0), v0, v1, dequant, 0
-                    )
-                    bst(
-                        fx.Int32(packed).to(fx.Int8),
-                        r_inter,
-                        out_row + gcol // i32(2),
-                        0,
-                        0,
-                    )
-                # Every lane of a 1x32 group holds the same reduced max -> same e8 and
-                # same col_s (gcol>>5), so all 16 writers store the identical byte; no
-                # dynamic group-writer guard needed (this fn is not in the jit scope).
-                bst(e8.to(fx.Int8), r_inters, s_row + gcol // i32(32), 0, 0)
-        wait_lgkm0()
-        cbar(L, tid)
+                gbase = i32(n_tile) * i32(cs_tile_n) + cbase  # this group's first global col
+                # All lanes of the group hold the same reduced e8 -> redundant scale store
+                # (no dynamic group-writer guard; this fn is not in the @flyc.jit scope).
+                bst(e8.to(fx.Int8), r_inters, s_row + gbase // i32(32), 0, 0)
+                # fp4/fp8 packs 2 adjacent cols per store; the cols live on lanes l16 and
+                # l16^1.  Both lanes compute the SAME (even_col, odd_col) pair via a parity
+                # select on the shuffled neighbour and store the SAME byte -> no runtime
+                # even-lane guard needed (redundant store, identical value).
+                is_odd = l16 & i32(1)
+                even = is_odd == i32(0)
+                for nj in range_constexpr(gui_n):
+                    cv = cnj[nj][v]
+                    cvn = cv.shuffle_xor(i32(1), c64)  # neighbour col (l16 ^ 1)
+                    first = even.select(cv, cvn)  # the even col's value of this 2-col byte
+                    second = even.select(cvn, cv)  # the odd col's value
+                    gcol = gbase + i32(nj * 16) + l16 - is_odd  # even col of the pair
+                    if const_expr(a8):
+                        qscale = ((i32(254) - e8) << i32(23)).bitcast(fx.Float32)
+                        packed = rocdl.cvt_pk_fp8_f32(
+                            T.i32, first * qscale, second * qscale, i32(0), 0
+                        )
+                        bst(fx.Int32(packed).to(fx.Int16), r_inter, out_row + gcol, 0, 0)
+                    else:
+                        dequant = (e8 << i32(23)).bitcast(fx.Float32)
+                        packed = rocdl.cvt_scalef32_pk_fp4_f32(
+                            T.i32, i32(0), first, second, dequant, 0
+                        )
+                        bst(
+                            fx.Int32(packed).to(fx.Int8),
+                            r_inter,
+                            out_row + gcol // i32(2),
+                            0,
+                            0,
+                        )
 
     @flyc.jit
     def gemm1(L, tid, a, expert, e, s, P, uord):
