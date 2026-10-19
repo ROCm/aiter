@@ -25,7 +25,7 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl import flydsl_conv_implicit
+from aiter.ops.flydsl import conv_kernels, flydsl_conv_implicit
 from aiter.ops.flydsl.conv_kernels import SUPPORTED_GFX
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -392,6 +392,62 @@ KW_CASES = [
         {"padding": 1},
         True,
     ),
+    # kH x kW reuse, forced: block_rows=8 makes 8x32 output blocks, so these do
+    # not depend on what the tuned tables pick. Ho/Wo leave an H and a W tail.
+    (
+        "2d_block_rows8_nhwc",
+        2,
+        (1, 96, 37, 70),
+        _W2,
+        {
+            "padding": 1,
+            "tile": (256, 96, 4, 1),
+            "block_rows": 8,
+            "input_layout": "NHWC",
+            "output_layout": "NHWC",
+        },
+        {"padding": 1},
+        True,
+    ),
+    (
+        "3d_block_rows8_ndhwc",
+        3,
+        (1, 96, 4, 20, 45),
+        (96, 96, 3, 3, 3),
+        {
+            "padding": 1,
+            "tile": (256, 96, 4, 1),
+            "block_rows": 8,
+            "input_layout": "NDHWC",
+            "output_layout": "NDHWC",
+        },
+        {"padding": 1},
+        True,
+    ),
+    (
+        "2d_block_rows8_dil_w2",
+        2,
+        (1, 96, 37, 70),
+        _W2,
+        {
+            "padding": (1, 2),
+            "dilation": (1, 2),
+            "tile": (256, 96, 4, 1),
+            "block_rows": 8,
+        },
+        {"padding": (1, 2), "dilation": (1, 2)},
+        True,
+    ),
+    # Stride 2: make_im2col_plan declines block_rows and the default path runs.
+    (
+        "2d_block_rows8_gated_s2",
+        2,
+        (1, 96, 41, 81),
+        _W2,
+        {"stride": 2, "padding": 1, "tile": (256, 96, 4, 1), "block_rows": 8},
+        {"stride": 2, "padding": 1},
+        True,
+    ),
 ]
 
 # -c labels, read back off the sweep builders so the choices cannot drift from the
@@ -611,6 +667,36 @@ def test_artifact_key_isolation(dtype):
     return rows
 
 
+def test_block_rows_static(dtype):
+    """kH x kW reuse on the per-shape (static-extent) path, not dyn_hw.
+
+    AITER_CONV3D_DYN_HW is read when the module loads; _dyn_hw_ok reads the
+    module global per call, so flipping it here selects the static artifact.
+    """
+    torch.manual_seed(0)
+    x = torch.randn((1, 96, 37, 70), device="cuda", dtype=dtype)
+    w = torch.randn(_W2, device="cuda", dtype=dtype)
+    b = torch.randn(_W2[0], device="cuda", dtype=dtype)
+    kw = {"padding": 1, "tile": (256, 96, 4, 1), "block_rows": 8}
+    saved = conv_kernels.AITER_CONV3D_DYN_HW
+    conv_kernels.AITER_CONV3D_DYN_HW = 0
+    try:
+        out = flydsl_conv_implicit(x, w, b, **kw)
+    finally:
+        conv_kernels.AITER_CONV3D_DYN_HW = saved
+    ref = _ref(x, w, b, 2, padding=1)
+    case = "2d_block_rows8_static"
+    return [
+        {
+            "case": case,
+            "gfx": get_gfx(),
+            "flydsl err": checkAllclose(
+                ref.to(dtypes.fp32), out.to(dtypes.fp32), msg=f"{case}: ", **TOL
+            ),
+        }
+    ]
+
+
 def summarize(title, rows):
     if not rows:  # every case in this sweep was filtered out by --cases
         return
@@ -748,6 +834,12 @@ def main():
         summarize(
             f"compile-key isolation, same output extents ({name})",
             test_artifact_key_isolation(dtype),
+        )
+        # Also unfiltered: the static-extent 2D path is otherwise only reached
+        # with AITER_CONV3D_DYN_HW=0 set for the whole process.
+        summarize(
+            f"kH x kW reuse on the static-extent path ({name})",
+            test_block_rows_static(dtype),
         )
 
     # After the tables, so a failure is read next to the numbers that produced it.

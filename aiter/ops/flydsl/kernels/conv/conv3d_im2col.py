@@ -180,11 +180,13 @@ def make_im2col_plan(param, geom, cfg):
 
     # kH x kW reuse. cols % 16 keeps every MFMA atom's 16 rows inside one
     # image row of the patch. The epilogue masks the H/W tails through the
-    # output descriptor, which BIG_OUT does not have.
+    # output descriptor, which BIG_OUT does not have. param.kw_reuse gates it
+    # too, so AITER_CONV3D_KW_REUSE=0 turns off every LDS-reuse path.
     rows = param.block_rows
     cols = tile_m // rows if rows > 0 and tile_m % rows == 0 else 0
     kh_layer_ok = bool(
-        rows > 1
+        param.kw_reuse
+        and rows > 1
         and cols > 0
         and cols % 16 == 0
         and (kh > 1 or kw > 1)

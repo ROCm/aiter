@@ -229,10 +229,12 @@ def _implicit_param_from_problem(
     )
 
 
-# Share one LDS strip across the kW taps of a (kt, kh, channel block) when the
-# layer allows it (see make_im2col_plan); part of the compile key. The tuned
-# tables are tuned with it on: some of their tiles only fit two blocks per CU
-# in the reuse layout.
+# Share the im2col input across filter taps in LDS when the layer allows it
+# (see make_im2col_plan): the kW strip, and the kH x kW 2D output block where
+# a tuned row sets block_r. Part of the compile key. Temporary rollback switch
+# while the reuse paths are validated: 0 gives one A tile per tap, but the
+# tuned tables are tuned with it on, and some of their tiles then hold one
+# block per CU instead of two.
 AITER_CONV3D_KW_REUSE = int(os.environ.get("AITER_CONV3D_KW_REUSE", "1"))
 
 # Runtime D/H/W so one artifact serves every resolution. Set 0 to compile per

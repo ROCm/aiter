@@ -81,10 +81,11 @@ class Conv3dImplicitParam:
     out_ndhwc: fx.Constexpr[bool]
     # Runtime D/H/W; host still uses d/h/w to build geometry. Closure must not capture extents.
     dyn_hw: fx.Constexpr[bool]
-    # Request the kW-reuse A path; make_im2col_plan decides whether it applies.
+    # Request the LDS-reuse A paths (kW strip, and kH x kW when block_rows > 1);
+    # make_im2col_plan decides whether one applies.
     kw_reuse: fx.Constexpr[bool]
     # Output rows of a block's 2D patch (kH x kW reuse); 1 = consecutive rows.
-    # make_im2col_plan decides whether it applies.
+    # Needs kw_reuse; make_im2col_plan decides whether it applies.
     block_rows: fx.Constexpr[int]
 
 
