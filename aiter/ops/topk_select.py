@@ -185,7 +185,7 @@ _PLAIN_K2048_SHORT_MAX_ROWS = 128
 # stop covering a row of them, those bands lapse for it on every part rather
 # than send it to the generic kernel they were not tuned against.
 _PLAIN_K2048_REG_WINDOW_BANDS = (_PLAIN_K2048_4K_BAND, _PLAIN_K2048_SHORT_BANDS[0])
-# gfx942 below 128 CUs (MI308X, k=2048, randn, device time): plain also beat
+# gfx942 below 128 CUs (k=2048, randn, device time): plain also beat
 # decode on the 4K triplet at every row count, at 129..255 rows on the short
 # bands, and from 128 rows below 8192 columns -- 25% less total time over 732
 # cells, none slower.  gfx942 with 128+ CUs is unmeasured and keeps the bands.
