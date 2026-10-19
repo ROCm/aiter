@@ -11,7 +11,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp
 
 from .. import dpp_utils
-from ..tensor_shim import ptr_buf_tensor
+from ..tensor_shim import buf_base_i64, ptr_buf_tensor
 from ..utils import rcp_f32
 from .traits import MFMA_MNK
 
@@ -283,13 +283,35 @@ class PaDecodeKVLoader:
 
         return _load
 
-    def init_loaders(self):
-        self._k_load_vector = self._make_raw_flat_loader(
-            self.ctx.key_cache_ptr,
-            self.traits.KV_DTYPE,
-            self.traits.KV_VECTOR_WIDTH,
-            self.traits.KV_EXTENT,
+    def _make_nt_k_loader(self, tensor_ptr):
+        # K on the pipe is a flat global_load_dwordx4 with !nontemporal.
+        # V stays on the cached copy.
+        base = buf_base_i64(tensor_ptr)
+        ptr_ty = fx.PointerType.get(
+            fx.Int32.ir_type,
+            address_space=fx.AddressSpace.Global,
+            alignment=16,
         )
+
+        def _load(elem_idx):
+            # FP8 elements are one byte, so the element index is the byte offset.
+            # inttoptr, not add_offset: the GEP form reschedules the K loads and
+            # splits their vmcnt waits (q4 loop: one wait becomes seven).
+            ptr = fx.Pointer(fx.inttoptr(ptr_ty, base + fx.Int64(elem_idx)))
+            return fx.generic_load(ptr, dtype=fx.Int32, count=4, nontemporal=True)
+
+        return _load
+
+    def init_loaders(self):
+        if const_expr(self.traits.D256_PIPE):
+            self._k_load_vector = self._make_nt_k_loader(self.ctx.key_cache_ptr)
+        else:
+            self._k_load_vector = self._make_raw_flat_loader(
+                self.ctx.key_cache_ptr,
+                self.traits.KV_DTYPE,
+                self.traits.KV_VECTOR_WIDTH,
+                self.traits.KV_EXTENT,
+            )
         self._v_load_vector = self._make_raw_flat_loader(
             self.ctx.value_cache_ptr,
             self.traits.KV_DTYPE,
@@ -324,6 +346,15 @@ class PaDecodeKVLoader:
             unit_elems=self.traits.PAGES_PER_CHUNK,
             unit_stride=1,
             num_records_bytes=bt_num_records_bytes,
+        )
+        self.bt_scalar = (
+            self.bt_buf
+            if const_expr(self.traits.PAGES_PER_CHUNK == 1)
+            else ptr_buf_tensor(
+                self.ctx.block_tables_ptr,
+                fx.Int32,
+                num_records_bytes=bt_num_records_bytes,
+            )
         )
         if const_expr(not self.traits.per_token_kv and not self.traits.is_bf16_kv):
             key_scale_buf = ptr_buf_tensor(self.ctx.key_scale_ptr, fx.Float32)
@@ -371,13 +402,45 @@ class PaDecodeKVLoader:
         )
         return fx.Vector(fx.memref_load_vec(self.v_scale_reg))
 
+    def _table_page(self, page):
+        element_offset = self.ctx.seq * self.ctx.max_blocks_per_seq + page
+        result = self.bt_scalar[element_offset]
+        return (page < self.ctx.num_pages).select(fx.Int32(result), fx.Int32(0))
+
+    @flyc.jit
+    def _staged_page(self, page):
+        """Page id from LDS, or the block table when the index is outside it.
+
+        A task can own more pages than ``max_context_length`` staged. The
+        table load stays in the other branch so an in-window page does not
+        wait on it.
+        """
+        rel = page - self.ctx.part_start * (
+            self.traits.TILE_TOK // self.traits.block_size
+        )
+        page_id = fx.Int32(0)
+        if (rel >= 0) & (rel < self.traits.stage_page_capacity):
+            page_id = fx.Int32(
+                self.lds.load(self.traits.sPages_off + rel * 4, fx.Int32, 1)[0]
+            )
+        else:
+            page_id = self._table_page(page)
+        return page_id
+
     def load_pages(self, page, vec_width=1):
         # Even an in-bounds table entry can contain a stale page ID beyond
         # this context. Pin those pages to block 0 before loading K/V.
-        element_offset = self.ctx.seq * self.ctx.max_blocks_per_seq + page
+        # Staged ids were pinned the same way when they were stored.
+        if const_expr(self.traits.stage_page_capacity):
+            if const_expr(vec_width == 1):
+                return self._staged_page(page)
+            return fx.Vector.from_elements(
+                [self._staged_page(page + i) for i in range_constexpr(vec_width)],
+                dtype=fx.Int32,
+            )
         if const_expr(vec_width == 1):
-            result = self.bt_buf[element_offset]
-            return (page < self.ctx.num_pages).select(fx.Int32(result), fx.Int32(0))
+            return self._table_page(page)
+        element_offset = self.ctx.seq * self.ctx.max_blocks_per_seq + page
         bt_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
         frag = fx.make_fragment_like(fx.slice(self.bt_buf, (0, None)))
         fx.copy(
@@ -620,22 +683,54 @@ class PaDecodeKVLoader:
         return ops  # NVOPS i64, the 64-token contiguous run for this head
 
     @flyc.jit
+    def stage_page_ids(self):
+        """Stage this task's page ids in LDS so the tile loop never reads the table."""
+        traits = self.traits
+        ppt = traits.TILE_TOK // traits.block_size
+        first_page = self.ctx.part_start * ppt
+        n_part_pages = (self.ctx.part_end - self.ctx.part_start) * ppt
+        rounds = traits.stage_page_capacity // traits.BLOCK_THREADS
+        for r in range_constexpr(rounds):
+            idx = self.ctx.tid + r * traits.BLOCK_THREADS
+            if idx < n_part_pages:
+                pg = first_page + idx
+                raw = fx.Int32(
+                    self.bt_scalar[self.ctx.seq * self.ctx.max_blocks_per_seq + pg]
+                )
+                val = (pg < self.ctx.num_pages).select(raw, fx.Int32(0))
+                self.lds.store(
+                    traits.sPages_off + idx * 4,
+                    fx.Int32,
+                    fx.Vector.from_elements([val], dtype=fx.Int32),
+                )
+
+    @flyc.jit
     def prefetch_first(self):
         # Empty partitions must not read K/V or block_tables.
         k_pf0 = fx.Vector.filled(
             self.traits.NCHUNK * self.traits.N_SUBCHUNKS, 0, fx.Int64
         )
         if self.ctx.part_start < self.ctx.part_end:
-            k_pf0, phys_vec0 = self.load_k(self.ctx.part_start)
-            if const_expr(self.traits.REUSE_KV_PAGES):
-                # Reuse K page IDs for V's LDS broadcast.
-                self.stage_v_pages(phys_vec0)
-            else:
-                self.fetch_v_pages(self.ctx.part_start)
-            if const_expr(self.traits.per_token_kv):
+            if const_expr(self.traits.D256_PIPE and self.traits.per_token_kv):
+                # Put scales ahead of K on vmcnt, so waiting for their LDS
+                # writes does not also drain the first K prefetch.
+                phys_vec0 = self.fetch_v_pages(self.ctx.part_start)
                 self.stage_scales(
                     phys_vec0, self.scale_buffer_offset(fx.Int32(self.ctx.part_start))
                 )
+                k_pf0 = self.load_k_from_pages(phys_vec0)
+            else:
+                k_pf0, phys_vec0 = self.load_k(self.ctx.part_start)
+                if const_expr(self.traits.REUSE_KV_PAGES):
+                    # Reuse K page IDs for V's LDS broadcast.
+                    self.stage_v_pages(phys_vec0)
+                else:
+                    self.fetch_v_pages(self.ctx.part_start)
+                if const_expr(self.traits.per_token_kv):
+                    self.stage_scales(
+                        phys_vec0,
+                        self.scale_buffer_offset(fx.Int32(self.ctx.part_start)),
+                    )
         elif self.ctx.lane == 0:
             self.lds.store(
                 self.traits.sVPage_off
