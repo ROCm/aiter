@@ -335,6 +335,7 @@ def torch_mla_extend(
     "q_dtype, kv_dtype, out_dtype, block_size, use_out_scale",
     [
         (torch.bfloat16, torch.bfloat16, torch.bfloat16, 64, False),
+        (torch.bfloat16, torch.bfloat16, torch.bfloat16, 16, False),
         (torch.bfloat16, e4m3_dtype, torch.bfloat16, 64, False),
         (e4m3_dtype, e4m3_dtype, torch.bfloat16, 64, False),
         (e4m3_dtype, e4m3_dtype, e4m3_dtype, 64, True),
@@ -362,11 +363,18 @@ def test_mla_decode_fwd(
 ):
     if DEVICE_ARCH not in (
         "gfx950",
+        "gfx1201",
         "gfx1250",
     ):
         # gfx1250 -> Gluon
-        # gfx950 -> Triton
+        # gfx950, gfx1201 -> Triton
         pytest.skip(f"skip {DEVICE_ARCH}")
+    if DEVICE_ARCH == "gfx1201" and (
+        shuffled_kv_cache or q_dtype != torch.bfloat16 or kv_dtype != torch.bfloat16
+    ):
+        pytest.skip("gfx1201 runs the BF16 non-shuffled KV cache path only")
+    if block_size == 16 and DEVICE_ARCH != "gfx1201":
+        pytest.skip("block_size 16 is the RDNA vLLM page size")
 
     if kv_dtype == torch.uint8:
         if DEVICE_ARCH not in ("gfx1250",):

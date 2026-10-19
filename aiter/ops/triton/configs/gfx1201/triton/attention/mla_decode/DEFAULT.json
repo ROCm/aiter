@@ -1,0 +1,9 @@
+{
+  "attn": {
+    "num_warps": 8,
+    "MAX_SEGMENTS": 32
+  },
+  "reduce": {
+    "num_warps": 4
+  }
+}
