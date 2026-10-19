@@ -472,7 +472,6 @@ def compile_mixed_moe_gemm1_common(
         ):
 
             tokens_in = fx.Index(i32_tokens_in)
-            n_in = fx.Index(i32_n_in)
             k_in = fx.Index(i32_k_in)
             size_expert_ids_in = fx.Index(i32_size_expert_ids_in)
             # Runtime clamp bound for the activation.  Host passes the configured
@@ -534,20 +533,8 @@ def compile_mixed_moe_gemm1_common(
 
             if const_expr(xcd_swizzle > 0):
                 num_xcds = 8
-                one = arith.constant(1, index=True)
-                tile_n_idx = arith.constant(tile_n, index=True)
-                inter_pad_idx = arith.constant(n_rows_skipped, index=True)
-                if const_expr(mock_gate_only or gate_up_interleave):
-                    grid_x = (n_in - inter_pad_idx + tile_n_idx - one) // tile_n_idx
-                else:
-                    two = arith.constant(2, index=True)
-                    grid_x = (
-                        (n_in - inter_pad_idx + two * tile_n_idx - one)
-                        // tile_n_idx
-                        // two
-                    )
-                persist_m_idx = arith.constant(persist_m, index=True)
-                grid_y = (size_expert_ids_in + persist_m_idx - one) // persist_m_idx
+                grid_x = fx.Index(gpu.grid_dim.x)
+                grid_y = fx.Index(gpu.grid_dim.y)
                 linear_id = bx_persist * grid_x + by
                 num_workgroups = grid_x * grid_y
                 num_xcds_idx = arith.constant(num_xcds, index=True)
