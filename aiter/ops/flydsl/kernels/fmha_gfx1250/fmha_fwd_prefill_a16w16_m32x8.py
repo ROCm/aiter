@@ -919,6 +919,59 @@ _PROLOGUE_KEYS = (
 )
 
 
+def _build_managers(
+    *, qk_hdim, v_hdim, n_block, gqa_ratio, num_q_tiles_per_wave, elem_dtype
+):
+    """The Q/K/V staging managers both cores use; USE_TDM_LOADER picks the transport.
+
+    Pure object construction -- no IR is emitted until a manager method is called, so
+    sharing this between the cores cannot move the generated code.
+    """
+    if USE_TDM_LOADER:
+        return (
+            QManager16bV2(
+                qk_hdim=qk_hdim,
+                gqa_ratio=gqa_ratio,
+                num_waves=NUM_WAVES,
+                q_tiles_per_wave=num_q_tiles_per_wave,
+                elem_dtype=elem_dtype,
+            ),
+            KManager16bV2(
+                qk_hdim=qk_hdim,
+                n_block=n_block,
+                num_waves=NUM_WAVES,
+                elem_dtype=elem_dtype,
+            ),
+            VManager16bV2(
+                v_hdim=v_hdim,
+                n_block=n_block,
+                num_waves=NUM_WAVES,
+                elem_dtype=elem_dtype,
+            ),
+        )
+    return (
+        QManager16bV1(
+            qk_hdim=qk_hdim,
+            gqa_ratio=gqa_ratio,
+            num_waves=NUM_WAVES,
+            q_tiles_per_wave=num_q_tiles_per_wave,
+            elem_dtype=elem_dtype,
+        ),
+        KManager16bV1(
+            qk_hdim=qk_hdim,
+            n_block=n_block,
+            num_waves=NUM_WAVES,
+            elem_dtype=elem_dtype,
+        ),
+        VManager16bV1(
+            v_hdim=v_hdim,
+            n_block=n_block,
+            num_waves=NUM_WAVES,
+            elem_dtype=elem_dtype,
+        ),
+    )
+
+
 def _attention_prologue(
     *,
     qk_hdim,
@@ -968,40 +1021,14 @@ def _attention_prologue(
     # K/V staging: N_KV_PP slots of 2 LDS_CHUNK_BYTES chunks each, every tile split 2-way
     # along n_block into chunks 6 apart (different 64 KB segments). Q time-shares slot 1's
     # chunks, O the two slots the loop has finished with -- see the 12-chunk map up top.
-    if USE_TDM_LOADER:
-        q_mgr = QManager16bV2(
-            qk_hdim=qk_hdim,
-            gqa_ratio=gqa_ratio,
-            num_waves=NUM_WAVES,
-            q_tiles_per_wave=num_q_tiles_per_wave,
-            elem_dtype=elem_dtype,
-        )
-        k_mgr = KManager16bV2(
-            qk_hdim=qk_hdim,
-            n_block=n_block,
-            num_waves=NUM_WAVES,
-            elem_dtype=elem_dtype,
-        )
-        v_mgr = VManager16bV2(
-            v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=elem_dtype
-        )
-    else:
-        q_mgr = QManager16bV1(
-            qk_hdim=qk_hdim,
-            gqa_ratio=gqa_ratio,
-            num_waves=NUM_WAVES,
-            q_tiles_per_wave=num_q_tiles_per_wave,
-            elem_dtype=elem_dtype,
-        )
-        k_mgr = KManager16bV1(
-            qk_hdim=qk_hdim,
-            n_block=n_block,
-            num_waves=NUM_WAVES,
-            elem_dtype=elem_dtype,
-        )
-        v_mgr = VManager16bV1(
-            v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=elem_dtype
-        )
+    q_mgr, k_mgr, v_mgr = _build_managers(
+        qk_hdim=qk_hdim,
+        v_hdim=v_hdim,
+        n_block=n_block,
+        gqa_ratio=gqa_ratio,
+        num_q_tiles_per_wave=num_q_tiles_per_wave,
+        elem_dtype=elem_dtype,
+    )
     k_blk_bytes = k_mgr.get_lds_size_in_byte()
     v_blk_bytes = v_mgr.get_lds_size_in_byte()
     assert k_blk_bytes % KV_LDS_SPLITS == 0 and v_blk_bytes % KV_LDS_SPLITS == 0
@@ -2023,40 +2050,14 @@ def _attention_core_one_kv_tile(
     _q_scale = softmax_scale * fx.Float32(LOG2E)
     num_q_tiles = num_q_tiles_per_wave
 
-    if USE_TDM_LOADER:
-        q_mgr = QManager16bV2(
-            qk_hdim=qk_hdim,
-            gqa_ratio=gqa_ratio,
-            num_waves=NUM_WAVES,
-            q_tiles_per_wave=num_q_tiles,
-            elem_dtype=elem_dtype,
-        )
-        k_mgr = KManager16bV2(
-            qk_hdim=qk_hdim,
-            n_block=n_block,
-            num_waves=NUM_WAVES,
-            elem_dtype=elem_dtype,
-        )
-        v_mgr = VManager16bV2(
-            v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=elem_dtype
-        )
-    else:
-        q_mgr = QManager16bV1(
-            qk_hdim=qk_hdim,
-            gqa_ratio=gqa_ratio,
-            num_waves=NUM_WAVES,
-            q_tiles_per_wave=num_q_tiles,
-            elem_dtype=elem_dtype,
-        )
-        k_mgr = KManager16bV1(
-            qk_hdim=qk_hdim,
-            n_block=n_block,
-            num_waves=NUM_WAVES,
-            elem_dtype=elem_dtype,
-        )
-        v_mgr = VManager16bV1(
-            v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=elem_dtype
-        )
+    q_mgr, k_mgr, v_mgr = _build_managers(
+        qk_hdim=qk_hdim,
+        v_hdim=v_hdim,
+        n_block=n_block,
+        gqa_ratio=gqa_ratio,
+        num_q_tiles_per_wave=num_q_tiles,
+        elem_dtype=elem_dtype,
+    )
     _SPLIT_STRIDE = 6 * LDS_CHUNK_BYTES
     slot_bytes = 2 * LDS_CHUNK_BYTES
     for _label, _bytes in (
