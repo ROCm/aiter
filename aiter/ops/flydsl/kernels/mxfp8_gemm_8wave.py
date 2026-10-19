@@ -92,7 +92,17 @@ class ScalePreshuffledS2R:
 
 
 class ScaleRawLds:
-    """Row-major ``[rows, K // 32]`` E8M0 (no host shuffle), staged through LDS."""
+    """Unshuffled E8M0 scales (no host shuffle), staged through LDS a chunk of
+    ``CHUNK`` K-steps at a time.
+
+    Per operand: a 1x32 scale is row-major ``[rows, K // 32]`` (16 bytes of a row
+    per chunk; a 32x32 B ``[N // 32, K // 32]`` repeats a row over its 32 N-rows);
+    a 1x128 A is the blockscale column-major ``[K // 128, M]`` (a chunk is CHUNK
+    columns of the block's 256 rows); a 128x128 B is ``[N // 128, K // 128]``, one
+    row per 128-row LDS half (a chunk is a dword of each). The 1x128 A goes a
+    byte per lane into dword slots. Every operand issues two copies per chunk,
+    so the pipeline's vmcnt waits stay as validated.
+    """
 
     CHUNK = 4
     BYTES = 2 * 256 * 16
@@ -109,31 +119,83 @@ class ScaleRawLds:
         b_row,
         lds,
         fp8_ir_t,
+        b_rows_per=1,
+        a_col_major=False,
+        b_block128=False,
+        c_m=None,
     ):
-        """``a_row`` / ``b_row``: block-local first row of this wave's tiles; ``lds``: two chunk slots."""
+        """``a_row`` / ``b_row``: block-local first row of this wave's tiles; ``lds``: two chunk slots.
+
+        ``b_rows_per`` N-rows share one B scale row: 1 for ``[N, K // 32]``, 32
+        for a 32x32 ``[N // 32, K // 32]`` -- the staged chunk is the 1x32 one.
+        ``a_col_major`` / ``b_block128`` select the 1x128 / 128x128 forms (``c_m``
+        is M, the column stride of the former).
+        """
         self.row_bytes = K // 32
+        self.k128 = K // 128
+        self.a_col = a_col_major
+        self.b_blk = b_block128
+        self.c_m = c_m
         lane = fx.thread_idx.x % 64
         self.wave_id = wave_id
         self.lds = lds
         self.atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(), 32)
         self.LdsPtr_t = fx.PointerType.get(fp8_ir_t, 2, 512)
         self.srcs = []
-        for arg, block in ((A_scale, block_m), (B_scale, block_n)):
-            src = fx.logical_divide(
-                make_fp8_buffer_tensor(arg, fp8_ir_t), fx.make_layout(1, 1)
-            )
+        for op, (arg, block, rows_per) in enumerate(
+            ((A_scale, block_m, 1), (B_scale, block_n, b_rows_per))
+        ):
+            if const_expr(op == 0 and a_col_major):
+                # Copied a byte per lane into a dword slot of its own (as bmm's
+                # byte-copied panels): the column offsets c * M are not dword
+                # aligned, and a dword copy ending past the tensor would read
+                # zero whole, valid bytes too. The buffer bounds are exact.
+                src = fx.rocdl.get_buffer_rsrc(
+                    fx.get_iter(fx.rocdl.make_buffer_tensor(arg, max_size=False))
+                )
+            else:
+                src = fx.logical_divide(
+                    make_fp8_buffer_tensor(arg, fp8_ir_t), fx.make_layout(1, 1)
+                )
             offs = []
             for step in range_constexpr(2):
-                word = step * 512 + wave_id * 64 + lane  # 4 words per row
-                offs.append((block * 256 + word // 4) * self.row_bytes + (word % 4) * 4)
+                word = step * 512 + wave_id * 64 + lane
+                if const_expr(op == 0 and a_col_major):
+                    # A chunk is CHUNK columns of the block's 256 rows: 1024 bytes,
+                    # two copies of 512 lanes, slot w = (column, row).
+                    offs.append(word // 256 * c_m + block * 256 + word % 256)
+                elif const_expr(op == 1 and b_block128):
+                    # Slot w holds half w % 2's row; only slots 0 and 1 are read.
+                    offs.append((block * 2 + word % 2) * self.k128)
+                else:
+                    row = block * 256 + word // 4  # 4 words per row
+                    if const_expr(rows_per > 1):
+                        row = row // rows_per
+                    offs.append(row * self.row_bytes + (word % 4) * 4)
             self.srcs.append((src, offs))
         # One per-lane base per operand; every read adds only a constant, which
         # folds into the ds_read offset as long as the buffer sits below 64 KB.
         lane_off = (lane % 16) * 16 + lane // 16
         self.bases = [
-            fx.add_offset(lds.ptr, fx.make_int_tuple(op * 4096 + row * 16 + lane_off))
-            for op, row in ((0, a_row), (1, b_row))
+            fx.add_offset(
+                lds.ptr,
+                fx.make_int_tuple(
+                    (a_row + lane % 16) * 4 if a_col_major else a_row * 16 + lane_off
+                ),
+            ),
+            fx.add_offset(
+                lds.ptr,
+                fx.make_int_tuple(4096 if b_block128 else 4096 + b_row * 16 + lane_off),
+            ),
         ]
+
+    def _soffset(self, op, chunk):
+        if const_expr(op == 0 and self.a_col):
+            return fx.Int32(chunk * self.CHUNK) * self.c_m
+        if const_expr(op == 1 and self.b_blk):
+            # The dword never runs past the row's end (K // 128 >= 4).
+            return fx.Int32(min(chunk * self.CHUNK, self.k128 - 4))
+        return fx.Int32(chunk * 16)
 
     def dma(self, chunk):
         """Stage chunk ``chunk``; the last chunk may run past K (those bytes are never read)."""
@@ -147,33 +209,53 @@ class ScaleRawLds:
                     + step * 2048
                     + self.wave_id * 256
                 )
-                dst = fx.make_view(
-                    fx.inttoptr(self.LdsPtr_t, base_i32 + fx.Int32(dst_off)),
-                    fx.make_layout(1, 1),
-                )
+                lds_dst = fx.inttoptr(self.LdsPtr_t, base_i32 + fx.Int32(dst_off))
+                if const_expr(op == 0 and self.a_col):
+                    rocdl.buffer_load_to_lds(
+                        src,
+                        fx.to_llvm_ptr(lds_dst),
+                        fx.Int32(offs[step]).ir_value(),
+                        size_bytes=1,
+                        soffset=self._soffset(op, chunk).ir_value(),
+                    )
+                    continue
+                dst = fx.make_view(lds_dst, fx.make_layout(1, 1))
                 fx.copy(
                     self.atom,
                     fx.slice(src, (None, fx.Int32(offs[step]))),
                     dst,
-                    soffset=fx.Int32(chunk * 16),
+                    soffset=self._soffset(op, chunk),
                 )
+
+    def _byte(self, op, off):
+        v = fx.make_view(
+            fx.recast_iter(
+                fx.Uint8, fx.add_offset(self.bases[op], fx.make_int_tuple(off))
+            ),
+            fx.make_layout(1, 1),
+        )
+        return fx.Int32(v.load()[0])
 
     def read(self, op, half_row, n_tiles, k):
         """MFMA scale operands of ``n_tiles`` tiles, ``half_row`` rows past this wave's first row."""
+        slot = k // self.CHUNK % 2 * self.BYTES
+        if const_expr(op == 1 and self.b_blk):
+            # One block per 128-row half: every tile and lane shares its byte.
+            chunk = k // self.CHUNK
+            start = min(chunk * self.CHUNK, self.k128 - 4)
+            v = self._byte(op, slot + half_row // 128 * 4 + (k - start))
+            return [v] * n_tiles
         words = []
         for t in range_constexpr(n_tiles):
-            off = (
-                k // self.CHUNK % 2 * self.BYTES
-                + (half_row + t * 16) * 16
-                + (k % self.CHUNK) * 4
-            )
-            v = fx.make_view(
-                fx.recast_iter(
-                    fx.Uint8, fx.add_offset(self.bases[op], fx.make_int_tuple(off))
-                ),
-                fx.make_layout(1, 1),
-            )
-            words.append(fx.Int32(v.load()[0]))
+            if const_expr(op == 0 and self.a_col):
+                words.append(
+                    self._byte(
+                        op, slot + ((k % self.CHUNK) * 256 + half_row + t * 16) * 4
+                    )
+                )
+            else:
+                off = slot + (half_row + t * 16) * 16 + (k % self.CHUNK) * 4
+                words.append(self._byte(op, off))
         return words
 
 
@@ -285,12 +367,30 @@ def compile_mxfp8_gemm_8w(
     scale_preshuffled: bool = False,
     waves_per_eu: int = 2,
     xcd_swizzle: int = 0,
+    b_scale_block: str = "1x32",
+    a_scale_block: str = "1x32",
 ):
     """Build the MXFP8 launcher.
 
     ``scale_preshuffled=True`` takes ``shuffle_scale_w4``-permuted A/B scales;
     ``False`` takes them row-major ``[rows, K // 32]`` as the quantizer emits them.
+    ``b_scale_block="32x32"`` (row-major only) takes B's as ``[N // 32, K // 32]``,
+    ``"128x128"`` as ``[N // 128, K // 128]``; ``a_scale_block="1x128"`` takes A's
+    as the blockscale column-major ``[K // 128, M]`` (both unshuffled only).
     """
+    assert b_scale_block in (
+        "1x32",
+        "32x32",
+        "128x128",
+    ), f"b_scale_block {b_scale_block}"
+    assert a_scale_block in ("1x32", "1x128"), f"a_scale_block {a_scale_block}"
+    assert not scale_preshuffled or (a_scale_block, b_scale_block) == (
+        "1x32",
+        "1x32",
+    ), "a 32x32 / 1x128 / 128x128 scale is unshuffled only"
+    assert (
+        b_scale_block != "128x128" or K >= 512
+    ), "a 128x128 B scale needs K >= 512 (a dword of K // 128 per chunk)"
     # A 256x256 tile already spends 128 KB of the 160 KB LDS; every other
     # BLOCK_M/BLOCK_N either overflows it or breaks the 2-threads-per-scale-row
     # staging split. Kept as an assert rather than dead generality.
@@ -331,6 +431,10 @@ def compile_mxfp8_gemm_8w(
 
     _layout_tag = "bpreshuffle" if b_preshuffled else "rowmajor"
     _scale_tag = "" if scale_preshuffled else "_row"
+    if a_scale_block == "1x128":
+        _scale_tag += "_xb1x128"
+    if b_scale_block != "1x32":
+        _scale_tag += f"_wb{b_scale_block}"
     _kname = (
         f"flydsl_{_layout_tag}_mxfp8_8w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_F8_F8_B16_"
         f"{waves_per_eu}x{xcd_swizzle}{_scale_tag}_k{K}"
@@ -425,6 +529,10 @@ def compile_mxfp8_gemm_8w(
                 wave_n * B_GRP_ROWS,
                 lds.S_lds,
                 F8_IR_t,
+                b_rows_per=32 if b_scale_block == "32x32" else 1,
+                a_col_major=a_scale_block == "1x128",
+                b_block128=b_scale_block == "128x128",
+                c_m=c_m,
             )
             n_chunks = (K_ITERS + ScaleRawLds.CHUNK - 1) // ScaleRawLds.CHUNK
         # 16-row tile index of each wave's first row, per LDS half.

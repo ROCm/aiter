@@ -40,7 +40,7 @@ rules are in [`configs/AGENTS.md`](configs/AGENTS.md).
 ### Configs
 
 11. Put tuning values in the JSON files in `configs/`. Do not put tuning
-    values in Python.
+    values in Python or in CSV files.
 12. Read configs only through the loaders in `utils/`.
 13. In GEMM configs, use only `M_LEQ_<x>` keys and `"any"` for M buckets.
 14. Use `autotune_configs()` for every `@triton.autotune` config list.
@@ -71,7 +71,7 @@ rules are in [`configs/AGENTS.md`](configs/AGENTS.md).
 
 22. Change one backend in each PR. Triton and Gluon are one backend.
 23. Keep PRs small: one problem in each PR. For work that depends on other
-    work, use stacked PRs.
+    work, use [stacked PRs](https://docs.github.com/en/pull-requests/how-tos/stacked-pull-requests).
 24. Write the PR description with these parts: motivation, technical
     details, test plan and test results.
 25. Assign the PR to yourself and answer the reviewers. Code owners can close
