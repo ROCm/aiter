@@ -363,12 +363,13 @@ KW_CASES = [
         True,
     ),
     # Pin wider tiles; KW shapes otherwise land on the narrowest _pick_tile.
+    # gfx1250 uses wave32 so (wave_m, wave_n) differ from gfx950's wave64 tiles.
     (
         "3d_tile_128",
         3,
         _X3,
         _W3,
-        {"padding": 1, "tile": (128, 128, 2, 4)},
+        {"padding": 1, "tile": (128, 128, 2, 4), "block_rows": 8},
         {"padding": 1},
         False,
     ),
@@ -377,9 +378,19 @@ KW_CASES = [
         2,
         _X2,
         _W2,
-        {"padding": 1, "tile": (256, 256, 2, 4)},
+        {"padding": 1, "tile": (256, 256, 2, 4), "block_rows": 8},
         {"padding": 1},
         False,
+    ),
+    # gfx1250: R/C tail + N tail with an oversize N tile.
+    (
+        "3d_tail_blocks",
+        3,
+        (1, 32, 3, 17, 19),
+        _W3,
+        {"padding": 1, "tile": (64, 64, 2, 2), "block_rows": 4},
+        {"padding": 1},
+        True,
     ),
 ]
 
