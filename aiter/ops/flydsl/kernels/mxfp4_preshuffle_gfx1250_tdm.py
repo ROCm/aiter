@@ -2408,4 +2408,4 @@ launch_gemm_a8w4_tdm.compile_hints["llvm_options"] = {
 }
 if SUPPORT_EXPLICIT_VGPR_PARTITION:
     launch_gemm_a8w4_tdm.compile_hints["waves_per_eu"] = 1
-    launch_gemm_a8w4_tdm.compile_hints["maxnreg"] = 1024
+    # launch_gemm_a8w4_tdm.compile_hints["llvm_options"]["amdgpu-anti-hints-for-va-vdst"] = True 
