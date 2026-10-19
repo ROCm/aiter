@@ -762,7 +762,8 @@ class QManager16bV1:
         fragments, ``scale`` folded in (None leaves Q raw). The leading ``sched_barrier``
         keeps the waits and reads below the caller's SALU, inside the load shadow.
 
-        Returns one list of ``k_tiles`` v16-bf16 A fragments per q-tile."""
+        Returns one list of ``k_tiles`` B fragments per q-tile (two 16 B groups each).
+        """
         rocdl.sched_barrier(0)  # keep waits/reads below the caller's SALU
         R = self.q_tiles_per_wave
         k_tiles = self.k_tiles
@@ -794,7 +795,9 @@ class QManager16bV1:
                     lo = _scaled(lo)
                     rocdl.s_wait_dscnt(0)  # hi landed
                     hi = _scaled(hi)
-                    q_frags_list[qt].append(lo.shuffle(hi, list(range(16))))
+                    q_frags_list[qt].append(
+                        lo.shuffle(hi, list(range(2 * self.chunk_elems)))
+                    )
             return q_frags_list
 
         # Non-fully-resident ring drain — R==1 only (guarded in __init__).
@@ -813,7 +816,7 @@ class QManager16bV1:
             lo, hi = _read_tile(ds_ptrs, i - lds_tiles)
             rocdl.s_wait_dscnt(0)  # slot free to overwrite
             _refill(i)
-            q_frags.append(_scaled(lo.shuffle(hi, list(range(16)))))
+            q_frags.append(_scaled(lo.shuffle(hi, list(range(2 * self.chunk_elems)))))
         # Drain loop: read the last lds_tiles tiles, no refill; overlap lo scale w/ hi load.
         for i in fx.range_constexpr(0, lds_tiles):
             rocdl.s_wait_asynccnt((lds_tiles - 1 - i) * 2)
@@ -822,7 +825,7 @@ class QManager16bV1:
             lo = _scaled(lo)
             rocdl.s_wait_dscnt(0)  # hi landed
             hi = _scaled(hi)
-            q_frags.append(lo.shuffle(hi, list(range(16))))
+            q_frags.append(lo.shuffle(hi, list(range(2 * self.chunk_elems))))
         return [q_frags]
 
 
@@ -1248,12 +1251,12 @@ class QManager16bV2:
                 imm_lo = (
                     qt * _WMMA_M * self.row_bytes + tile * self.wmma_k * self.elem_bytes
                 )
-                imm_hi = imm_lo + _WMMA_M * self.elem_bytes
+                imm_hi = imm_lo + 2 * _CHUNK_BYTES  # next group: 32 B either width
                 p_lo = base if imm_lo == 0 else fx.add_offset(base, imm_lo)
                 p_hi = fx.add_offset(base, imm_hi)
                 lo = fx.ptr_load(p_lo, result_type=v8_ty)
                 hi = fx.ptr_load(p_hi, result_type=v8_ty)
-                frag = lo.shuffle(hi, list(range(16)))
+                frag = lo.shuffle(hi, list(range(2 * self.chunk_elems)))
                 q_frags_list[qt].append(
                     frag if scale_bf16 is None else frag * scale_bf16
                 )
