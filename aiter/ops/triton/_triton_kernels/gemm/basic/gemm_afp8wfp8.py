@@ -4,8 +4,11 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+    pid_grid,
+    remap_xcd,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _gemm_afp8wfp8_repr = make_kernel_repr(
@@ -190,13 +193,13 @@ def _gemm_afp8wfp8_kernel(
                 a_scales_ptr + offs_asm[:, None] + offs_ask[None, :] * stride_ask
             )
             if EVEN_K:
-                a_scales = tl.load(a_scale_ptrs, mask=offs_am[:, None] < M, other=127)
+                a_scales = tl.load(a_scale_ptrs, mask=offs_am[:, None] < M, other=0)
             else:
                 a_scale_mask = offs_scale_k_a[None, :] < (
                     K // SCALE_GROUP_SIZE - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
                 )
                 a_scales = tl.load(
-                    a_scale_ptrs, mask=a_scale_mask & (offs_am[:, None] < M), other=127
+                    a_scale_ptrs, mask=a_scale_mask & (offs_am[:, None] < M), other=0
                 )
 
             # ---- Load and broadcast B scales (BLOCK_SIZE_N, BLOCK_SIZE_K // 32) ----
@@ -212,7 +215,7 @@ def _gemm_afp8wfp8_kernel(
                 b_scales = tl.load(
                     b_scale_ptrs,
                     mask=offs_bn[:, None] < N,
-                    other=127,
+                    other=0,
                     cache_modifier=cache_modifier,
                 )
             else:
@@ -223,7 +226,7 @@ def _gemm_afp8wfp8_kernel(
                 b_scales = tl.load(
                     b_scale_ptrs,
                     mask=b_scale_mask & (offs_bn[:, None] < N),
-                    other=127,
+                    other=0,
                     cache_modifier=cache_modifier,
                 )
 
@@ -444,14 +447,14 @@ def _gemm_afp8wfp8_packed_kernel(
             + rows[:, None] * stride_asm
             + (ag // (A_SCALE_K_GROUP // 32)) * stride_ask,
             (rows[:, None] < M) & (ag < groups),
-            other=127,
+            other=0,
         )
         b_code = tl.load(
             b_scale_ptr
             + (cols[:, None] // B_SCALE_N_GROUP) * stride_bsn
             + (bg // (B_SCALE_K_GROUP // 32)) * stride_bsk,
             (cols[:, None] < N) & (bg < groups),
-            other=127,
+            other=0,
             cache_modifier=B_CACHE_MODIFIER,
         )
         accumulator = tl.dot_scaled(
@@ -641,7 +644,7 @@ def _gemm_afp8wfp8_preshuffle_kernel(
                 a_scale_mask = offs_scale_k_a[None, :] < (
                     K // SCALE_GROUP_SIZE - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
                 )
-                a_scales = tl.load(a_scale_ptrs, mask=a_scale_mask, other=127)
+                a_scales = tl.load(a_scale_ptrs, mask=a_scale_mask, other=0)
 
             # Load and broadcast B scales (computed from absolute K).
             offs_bsk = (k_base + offs_scale_k_a * SCALE_GROUP_SIZE) // B_SCALE_K_GROUP
@@ -659,7 +662,7 @@ def _gemm_afp8wfp8_preshuffle_kernel(
                 b_scales = tl.load(
                     b_scale_ptrs,
                     mask=b_scale_mask,
-                    other=127,
+                    other=0,
                     cache_modifier=cache_modifier,
                 )
 

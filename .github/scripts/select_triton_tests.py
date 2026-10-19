@@ -21,6 +21,14 @@ SRC = "aiter/ops/triton/"
 KERNELS = SRC + "_triton_kernels/"
 GLUON_KERNELS = SRC + "_gluon_kernels/"
 CONFIGS = SRC + "configs/"
+# Ops whose Triton launch path is only exercised on MI300X (MI35X takes a
+# Gluon branch instead), so a change to them needs the MI300X job even without
+# a gfx942 config or Gluon-kernel change.
+GFX942_LAUNCH_PATHS = (
+    SRC + "attention/pa_prefill_sparse.py",
+    SRC + "_triton_kernels/attention/sparse_attention_dsv4.py",
+    "op_tests/triton_tests/attention/test_pa_prefill_sparse.py",
+)
 TESTS = "op_tests/triton_tests/"
 BENCH = "op_tests/op_benchmarks/triton/"
 ROOT = Path(__file__).resolve().parents[2]
@@ -53,7 +61,7 @@ NON_CATEGORY_DIRS = {"utils", "configs", "_triton_kernels", "_gluon_kernels"}
 
 # Config categories whose source/test folders use a different layout.
 CONFIG_CATEGORIES = {
-    "attention": {"attention", "chunk_delta_attn"},
+    "attention": {"attention", "kimi_delta_attn"},
     "mhc": {"fusions"},
 }
 
@@ -111,6 +119,40 @@ def legacy_trigger(diff):
 
 def list_files(base, pattern):
     return sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / base).rglob(pattern))
+
+
+def is_non_triton_config(path):
+    return path.startswith("aiter/configs/") and path.endswith(".csv")
+
+
+@cache
+def config_names_in(path):
+    tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
+    return {
+        node.value.lower().replace("-", "_")
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+
+
+def config_loaders(family, sources):
+    names = [family]
+    words = family.split("_")
+    while len(words) > 2:
+        words.pop()
+        names.append("_".join(words))
+    util_files = [s for s in sources if s.startswith(SRC + "utils/")]
+    kernel_files = [
+        s for s in sources if s not in util_files and Path(s).name != "__init__.py"
+    ]
+    for files in (kernel_files, util_files):
+        for name in names:
+            loaders = [
+                s for s in files if name in config_names_in(s) or Path(s).stem == name
+            ]
+            if loaders:
+                return loaders
+    return []
 
 
 def category_of(path):
@@ -233,7 +275,7 @@ def scan_imports(path, gone, dynamic):
     return found
 
 
-def dependents(paths, importers):
+def dependents(paths, importers, stop_at=()):
     """Follow imports backwards from changed files to their consumers."""
     seen = set(paths)
     frontier = list(seen)
@@ -241,7 +283,8 @@ def dependents(paths, importers):
         for path in importers.get(frontier.pop(), ()):
             if path not in seen:
                 seen.add(path)
-                frontier.append(path)
+                if path not in stop_at:
+                    frontier.append(path)
     return seen
 
 
@@ -256,6 +299,7 @@ def changed_files(merge_ref):
 def select(diff):
     """Select affected test files, raising when a subset cannot be determined."""
     diff = [p for p in diff if not p.endswith(".md") and Path(p).name != ".gitkeep"]
+    diff = [p for p in diff if not is_non_triton_config(p)]
     if not any(
         p.startswith((SRC, TESTS, "aiter/aot/triton/", "aiter/utility/triton/"))
         or p in CI_FILES
@@ -322,6 +366,12 @@ def select(diff):
             ):
                 raise RuntimeError(f"{path}: unknown config layout")
             op, family = parts[2:4]
+            loaders = config_loaders(family, sources)
+            hits = tests & dependents(loaders, importers, stop_at=tests)
+            if hits:
+                selected.update(hits)
+                reasons.append(f"{path}: '{family}' kernels ({len(hits)} tests)")
+                continue
             categories = CONFIG_CATEGORIES.get(op, {op})
             hits = {test for test in tests if category_of(test) in categories}
             if not hits and not any(
@@ -394,6 +444,7 @@ def main():
             diff = changed_files(args.merge_ref)
             needs_mi300x = any(
                 path.startswith((CONFIGS + "gfx942/", GLUON_KERNELS + "gfx942/"))
+                or path in GFX942_LAUNCH_PATHS
                 for path in diff
             )
             if not args.all:
