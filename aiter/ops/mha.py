@@ -1246,7 +1246,7 @@ def cmdGenFunc_mha_bwd(
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
-        "flags_extra_cc": ["'-DONLY_FAV3=0'"],
+        "flags_extra_cc": ["-DONLY_FAV3=0"],
     }
 
 
@@ -1504,7 +1504,7 @@ def cmdGenFunc_mha_varlen_bwd(
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
-        "flags_extra_cc": ["'-DONLY_FAV3=0'"],
+        "flags_extra_cc": ["-DONLY_FAV3=0"],
     }
 
 
@@ -3876,9 +3876,8 @@ def flash_attn_varlen_func(
         is_hd192x128 = hdim_q == 192 and hdim_v == 128
         if not ((hdim_q in (64, 128) and hdim_v == hdim_q) or is_hd192x128):
             return False
-        # Experimental FlyDSL m32x8 kernel owns the 128/128 path when enabled;
-        # yield so it reaches flydsl_flash_attn_varlen_func below.
-        if hdim_q == 128 and is_experimental_enabled():
+        # Yield these to the FlyDSL m32x8 kernel below; without 192 the bshd and thd routers disagree.
+        if hdim_q in (64, 128, 192) and is_experimental_enabled():
             return False
         if nhead_q % nhead_k != 0:
             return False
@@ -3939,7 +3938,7 @@ def flash_attn_varlen_func(
     # (see _prefer_flydsl_fp8_descale); the rest, and anything FlyDSL declines,
     # take the CK path, which also consumes the descales. Without CK, FlyDSL is
     # the only backend that honors descales, so always try it. Features FlyDSL
-    # cannot express (soft-cap, padded cu_seqlens) never take the descale route.
+    # cannot express (soft-cap, padded cu_seqlens) never take the FlyDSL route.
     try_flydsl = _FLYDSL_AVAILABLE and (
         not has_all_descales
         or (
@@ -3947,7 +3946,11 @@ def flash_attn_varlen_func(
             and (not ENABLE_CK or _prefer_flydsl_fp8_descale(q, v))
         )
     )
-    if try_flydsl and (len(window_size) < 3 or window_size[2] == 0):
+    if (
+        try_flydsl
+        and (len(window_size) < 3 or window_size[2] == 0)
+        and ck_only_feature is None
+    ):
         from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
 
         _flydsl_result = flydsl_flash_attn_varlen_func(
