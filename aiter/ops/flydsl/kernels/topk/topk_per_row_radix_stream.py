@@ -476,11 +476,11 @@ def build_topk_per_row_radix_stream_module(
     wave_size: int,
     partial: bool = False,
     labelled: bool = False,
-    terminal: bool = False,
     block_threads: int = _BLOCK_THREADS,
     lds_budgets: tuple[int, int] | None = None,
     vec: int = _VEC,
     lds_plan: tuple[int, int] | None = None,
+    terminal: bool = False,
 ):
     """Compile the streaming selector for one k. The row width is a runtime value.
 
