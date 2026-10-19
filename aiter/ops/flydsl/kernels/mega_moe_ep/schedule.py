@@ -56,6 +56,7 @@ _PROF = bool(int(os.environ.get("EP_PROF_DEV", "0")))
 _PROF_SLOTS = 9  # +7 post-gemm1, +8 post-gemm2 (per-unit; <=1 unit/CTA)
 from .mega_moe_ep_config import (
     B_LOADER,
+    EP_NW8,
     C_BARCNT,
     C_BARGEN,
     C_CNT,
@@ -96,6 +97,12 @@ def build_schedule(kc: KernelCtx) -> dict:
     a_loader_g1, a_loader_g2 = kc.get("a_loader_g1 a_loader_g2")
     gemm1, gemm2 = kc.get("gemm1 gemm2")
     gemm2_combine = kc.get("gemm2_combine")[0]
+    # NW=8 (all-8-waves-compute, serial-comm) variants: inline-A GEMMs + the a2a send done
+    # by the compute waves themselves (no concurrent dispatch/loader band).
+    gemm1_nw8, gemm2_pipe_nw8, gemm2_combine_nw8 = kc.get(
+        "gemm1_nw8 gemm2_pipe_nw8 gemm2_combine_nw8"
+    )
+    dispatch_send = kc.get("dispatch_send")[0]
     combine_send = kc.get("combine_send")[0]
     dispatch_wait = kc.get("dispatch_wait")[0]
     dispatch_wait_meta = kc.get("dispatch_wait_meta")[0]
@@ -352,6 +359,14 @@ def build_schedule(kc: KernelCtx) -> dict:
         ...); GEMM1/GEMM2 iterate (echunk, n-tile shard) units.  The gather pass publishes
         each row's recv-slot (``rowidx``) + payload-row (``rowmap``) to GLOBAL so the later
         passes -- on different CTAs once P>1 shards an echunk -- can read them."""
+        if const_expr(EP_NW8):
+            # NW=8 (all 8 waves compute MFMA): there is no concurrent dispatch band, so wave
+            # 0 does this CTA's full a2a scatter HERE (serial), then all 8 waves proceed to
+            # the planner + inline-A GEMM.  Trades the comm/compute overlap for 2 MFMA
+            # waves/SIMD.  (The A-loader band is likewise gone; the GEMMs self-stage A.)
+            if tid < i32(64):
+                dispatch_send(L, tid, a)
+            gpu.barrier()
         if tid == i32(0):
             dispatch_wait_meta(a, a["epoch"] & i32(1), i32(0))  # wait ROUTING only (fast)
         cbar(L, tid)
@@ -411,8 +426,11 @@ def build_schedule(kc: KernelCtx) -> dict:
         for gi_ in range(bid, nch * P, nblk):
             gi = i32(gi_)
             eg = gi // P
-            gemm1(L, tid, a, lds_ld_i32(L, L_DCH + eg * i32(4)) & i32(0xFFFF),
-                  eg, gi - eg * P, P, (gi - bid) // nblk)
+            expert = lds_ld_i32(L, L_DCH + eg * i32(4)) & i32(0xFFFF)
+            if EP_NW8:
+                gemm1_nw8(L, tid, a, expert, eg, gi - eg * P, P)
+            else:
+                gemm1(L, tid, a, expert, eg, gi - eg * P, P, (gi - bid) // nblk)
         if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
             if tid == i32(0):  # post gemm1 (slot 7)
                 bst(now(), rsrc(a["dbg"]),
@@ -443,7 +461,10 @@ def build_schedule(kc: KernelCtx) -> dict:
                     lds_ld_i32(L, L_DCNT + (ec & i32(0xFFFF)) * i32(4)) - cc * i32(rch),
                     i32(rch),
                 )
-                gemm2_combine(L, tid, a, ec & i32(0xFFFF), ei, rows, (ei - bid) // nblk)
+                if EP_NW8:
+                    gemm2_combine_nw8(L, tid, a, ec & i32(0xFFFF), ei, rows)
+                else:
+                    gemm2_combine(L, tid, a, ec & i32(0xFFFF), ei, rows, (ei - bid) // nblk)
             if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
                 if tid == i32(0):  # post gemm2 (slot 8)
                     bst(now(), rsrc(a["dbg"]),
@@ -453,8 +474,12 @@ def build_schedule(kc: KernelCtx) -> dict:
             for gi_ in range(bid, nch * P, nblk):
                 gi = i32(gi_)
                 eg = gi // P
-                gemm2(L, tid, a, lds_ld_i32(L, L_DCH + eg * i32(4)) & i32(0xFFFF),
-                      eg, gi - eg * P, P, rsrc(a["gout"]), (gi - bid) // nblk)
+                expert = lds_ld_i32(L, L_DCH + eg * i32(4)) & i32(0xFFFF)
+                if EP_NW8:
+                    gemm2_pipe_nw8(L, tid, a, expert, eg, gi - eg * P, P, rsrc(a["gout"]))
+                else:
+                    gemm2(L, tid, a, expert, eg, gi - eg * P, P,
+                          rsrc(a["gout"]), (gi - bid) // nblk)
             if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
                 if tid == i32(0):  # post gemm2 (slot 8)
                     bst(now(), rsrc(a["dbg"]),

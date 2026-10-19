@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import functools
 import math
+import os
 
 import flydsl.expr as fx
 
@@ -75,10 +76,16 @@ MAX_NPES = MAX_TP
 NCTA_MAX = 256
 N_XCD = 8
 
-# Block geometry: one CTA per CU, eight 64-lane waves, warp-specialized by tid.
-NW = 4  # compute waves
-NT = NW * 64  # 256 compute threads
-NTT = NT + 4 * 64  # 512 threads (8 waves): 4 compute + dispatch + loader + 2 combine
+# Block geometry: one CTA per CU, eight 64-lane waves.  Default (NW=4): warp-specialized
+# -- 4 compute waves + 4 aux (dispatch / A-loader / combine) running CONCURRENTLY so the
+# a2a + A-staging overlap the GEMM (1 MFMA wave/SIMD).  EP_NW8=1: all 8 waves compute MFMA
+# (2 MFMA waves/SIMD, the V2-style occupancy) with the comm done SERIALLY by the compute
+# waves (no aux band, no A-loader ring) -- a prototype of the "trade comm overlap for 2x
+# MFMA occupancy" direction.  Block stays 8 waves (NTT=512) either way.
+EP_NW8 = bool(int(os.environ.get("EP_NW8", "0")))
+NW = 8 if EP_NW8 else 4  # compute waves (NW8: all 8; else 4 + 4 aux)
+NT = NW * 64  # 512 (NW8) or 256 compute threads
+NTT = NT + (0 if EP_NW8 else 4 * 64)  # 512 threads (8 waves) in both modes
 
 # Role bands by tid (see mega_moe_ep_kernel.roles):
 #   [0, NT)                   compute_units (local-expert GEMM1 + act + GEMM2)
@@ -99,7 +106,11 @@ NLOAD = NLOAD_W * 64
 # halves (2*inter_dim). FP4 activations halve the per-K-step A bytes.
 KCS = 2  # A K-chunks staged together
 TILE_K = 256
-TILE_N = 256
+# Output-col tile.  NW=8 doubles it to 512 so each of the 8 compute waves still owns 32
+# output cols = exactly one 1x32 MX quant group (NUM_ACC_N=4, gui_n=2) -- the register
+# GEMM1 epilogue + the chunked GEMM2 cshuffle need the per-wave group to be in-wave, which
+# TILE_N/NW=64 gives at NW=8 just as TILE_N/NW=64 does at NW=4 (TILE_N=256).
+TILE_N = 512 if EP_NW8 else 256
 # A-ring banks for the TP-style dedicated A-loader prefetch (producer/consumer depth):
 # the GEMM1/GEMM2 compute waves read A K-tiles from this many LDS banks while the loader
 # wave stages the next ones ahead.  >=2 (double-buffer); bounded by the LDS budget.

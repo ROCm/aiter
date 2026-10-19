@@ -19,6 +19,7 @@ from ..mega_moe_tp.mega_moe_tp import SymmetricArena
 from ..tensor_shim import _run_compiled
 from .mega_moe_ep_config import (
     CTRL_INTS,
+    EP_NW8,
     FLAG_INTS,
     MAX_NPES,
     NCHA,
@@ -308,7 +309,10 @@ class MegaMoeEPEngine:
         # per-expert row-chunk count (~received_rows/(RG/2)) stays under the planner's
         # NCHA LDS chunk table -- otherwise the chunk table overflows past L_EOFF into
         # L_CTL and corrupts the compute-wave cbar slots (a 2^24-chunk hang).
-        mt = 2 if m <= 512 else 4
+        # NW=8 inline-A GEMM stages A with all NT=512 threads (16 B/thread), so the A tile
+        # RG*A_K_STEP must be >= 512*16 = 8192 B, i.e. RG>=64 -> mt>=4.  Force mt=4 (the
+        # high-bs value anyway; low bs just pads to 64 rows, still correct).
+        mt = 4 if EP_NW8 else (2 if m <= 512 else 4)
         while mt > 2:
             if (
                 mega_moe_ep_consts(

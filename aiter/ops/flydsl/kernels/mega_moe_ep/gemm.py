@@ -518,6 +518,89 @@ def build_gemm(kc: KernelCtx) -> dict:
         for nt_ in range(nt_lo, nt_hi, i32(1)):
             _run_ntile(i32(nt_))
 
+    # ===================== NW=8 inline-A GEMM1 (serial-comm path) =================
+    @flyc.jit
+    def gemm1_nw8(L, tid, a, expert, e, s, P):
+        """Inline-A GEMM1 for the all-8-waves (NW=8) path: with no dedicated A-loader wave,
+        the compute waves stage each A K-tile into a 2-bank LDS double-buffer THEMSELVES
+        (``ATileLoader`` with ``total_threads=NT=512``) and read it back via ``AS2RLoader``,
+        syncing with the hardware block barrier (all 8 waves are compute, so ``gpu.barrier``
+        is valid and cheap vs the NW=4 ``cbar``).  Double-buffering + the 2 MFMA waves/SIMD
+        hide the A-load + barrier latency.  Register epilogue (identical to ``gemm1``).  No
+        ring counters / ``uord`` (there is no producer/consumer split)."""
+        rm_rsrc = ptr_buf_tensor(fx.Int64(a["rowmap"]), fx.Int32)
+        payload = _global_byte_tensor(
+            fx.Int64(a["mine"]) + fx.Int64(a["off_payload"]), TMAX * a_row_bytes
+        )
+        a_gather = ATileLoader(
+            row_bytes=a_row_bytes, sort_block_m=RG, k_step_bytes=A_K_STEP,
+            total_threads=NT, swizzle=True, x_tensor=payload, async_copy=False,
+            indexed_input=True, row_map_rsrc=rm_rsrc, source_rows=TMAX, a_dtype=a_dtype,
+        )
+        a_s2r = AS2RLoader(k_step_bytes=A_K_STEP, swizzle=True, a_dtype=a_dtype)
+        w_rsrc = ptr_buf_tensor(
+            fx.Int64(a["w1"]) + fx.Int64(expert) * fx.Int64(2 * I * (H // 2)),
+            fx.Int32, unit_elems=4,
+        )
+        b_loader = BWeightLoader(w_rsrc=w_rsrc, num_acc_n=NUM_ACC_N, model_dim=H)
+        sw_rsrc = ptr_buf_tensor(
+            fx.Int64(a["w1s"]) + fx.Int64(expert) * fx.Int64(2 * I * (H // 32)), fx.Int32,
+        )
+        b_scale = BScaleLoader(scale_rsrc=sw_rsrc, num_acc_n=NUM_ACC_N, model_dim=H)
+        sx_rsrc = ptr_buf_tensor(
+            fx.Int64(a["mine"]) + fx.Int64(a["off_pscale"]), fx.Int32, unit_elems=4
+        )
+        a_scale = AScaleLoader(
+            scale_rsrc=sx_rsrc, m_repeat=M_REPEAT, model_dim=H, sort_block_m=RG,
+            total_threads=NT, indexed_input=True, row_map_rsrc=rm_rsrc,
+        )
+        mfma_gu = MfmaScaleGU(m_repeat=M_REPEAT, num_acc_n=NUM_ACC_N, a_dtype=a_dtype)
+        a_buf = _LdsView(_lds_byte_ptr(L, L_A))
+        a_scale_lds = _LdsView(_lds_byte_ptr(L, L_AS))
+        r_inter = rsrc(a["inter"])
+        r_inters = rsrc(a["inters"])
+        wave_id = tid // i32(64)
+        tib = e * i32(RG)
+        nt_lo = s * i32(N_TILES) // P
+        nt_hi = (s + i32(1)) * i32(N_TILES) // P
+        a_gather.for_tile(tib)
+        gpu.barrier()
+        a_scale.stage(a_scale_lds, tib)
+        gpu.barrier()
+
+        def _bank(j):
+            return uni((i32(j) % i32(2)) * i32(A_LDS_I32))  # 2-bank A double-buffer
+
+        def _run_ntile(nt):
+            b_row = wave_id * i32(n_per_wave) + nt * i32(TILE_N)
+            # prime bank 0 (K=0), prefetch K=1 regs (HBM->reg, overlaps the barrier)
+            regs = a_gather.load_regs(i32(0))
+            a_gather.store(a_buf, regs, _bank(i32(0)))
+            regs = a_gather.load_regs(i32(A_K_STEP))
+            wait_lgkm0()
+            gpu.barrier()
+            acc = [mfma_gu.zero_value for _ in range(N_ACC)]
+            for sp in range_constexpr(K_ITERS):
+                cur = _bank(i32(sp))
+                sb = b_scale.load_step(b_row, i32(sp))
+                sa = a_scale.load_step(a_scale_lds, i32(sp))
+
+                def _al(mi, ks, _b=cur):
+                    return a_s2r.load_operand(a_buf, mi, ks, _b)
+
+                # store the prefetched next K-tile into the OTHER bank (no conflict with the
+                # MFMA's read of ``cur``), then prefetch K=sp+2 (unconditional wrap so flyc
+                # doesn't treat ``regs`` as conditionally-assigned scf state; see a_loader_g1).
+                a_gather.store(a_buf, regs, _bank(i32(sp + 1)))
+                regs = a_gather.load_regs(i32(((sp + 2) % K_ITERS) * A_K_STEP))
+                acc = mfma_gu.call(_al, b_loader.load_step(b_row, i32(sp)), acc, sa, sb)
+                wait_lgkm0()  # the next-bank ds_write landed
+                gpu.barrier()  # next bank visible; all waves done reading ``cur``
+            _epilogue(L, tid, acc, nt, i32(0), r_inter, r_inters, e)
+
+        for nt_ in range(nt_lo, nt_hi, i32(1)):
+            _run_ntile(i32(nt_))
+
     # ============================ GEMM2 (pipelined) ==============================
     def _epilogue_g2(L, tid, acc, n_tile, cptr, r_gout, e):
         """Per-mi (CROWS=16-row) chunked cshuffle of the GEMM2 accumulators -> bf16 ->
@@ -856,6 +939,104 @@ def build_gemm(kc: KernelCtx) -> dict:
                         )
                         bst(ov, src_out, (obase + row * i32(H) + col) * i32(2), 0, 0)
         del rows
+
+    # ===================== NW=8 inline-A GEMM2 (serial-comm path) =================
+    def _gemm2_core_nw8(L, tid, a, expert, e, epi):
+        """Inline-A GEMM2 core for NW=8 (mirrors ``_gemm2_core`` but the compute waves
+        self-stage the A=inter K-tiles into a 2-bank LDS double-buffer -- no loader ring).
+        ``epi(acc, nt, cptr)`` consumes each n-tile (gout store or fused-combine scatter).
+        Returns ``_run_ntile``; the @flyc.jit wrapper drives the dynamic n-tile loop (the
+        plain def cannot host a runtime ``range`` over dynamic bounds -- see ``_gemm2_core``)."""
+        inter_tensor = _global_byte_tensor(fx.Int64(a["inter"]), INTER_NBYTES)
+        a_gather = ATileLoader(
+            row_bytes=inter_row_bytes, sort_block_m=RG, k_step_bytes=A_K_STEP,
+            total_threads=NT, swizzle=True, x_tensor=inter_tensor, async_copy=False,
+            indexed_input=False, a_dtype=a_dtype,
+        )
+        a_s2r = AS2RLoader(k_step_bytes=A_K_STEP, swizzle=True, a_dtype=a_dtype)
+        w_rsrc = ptr_buf_tensor(
+            fx.Int64(a["w2"]) + fx.Int64(expert) * fx.Int64(H * (I // 2)),
+            fx.Int32, unit_elems=4,
+        )
+        b_loader = BWeightLoader(w_rsrc=w_rsrc, num_acc_n=NUM_ACC_N2, model_dim=I)
+        sw_rsrc = ptr_buf_tensor(
+            fx.Int64(a["w2s"]) + fx.Int64(expert) * fx.Int64(H * (I // 32)), fx.Int32
+        )
+        b_scale = BScaleLoader(scale_rsrc=sw_rsrc, num_acc_n=NUM_ACC_N2, model_dim=I)
+        sx_rsrc = ptr_buf_tensor(fx.Int64(a["inters"]), fx.Int32, unit_elems=4)
+        a_scale = AScaleLoader(
+            scale_rsrc=sx_rsrc, m_repeat=M_REPEAT, model_dim=I, sort_block_m=RG,
+            total_threads=NT, indexed_input=False,
+        )
+        mfma_gu = MfmaScaleGU(m_repeat=M_REPEAT, num_acc_n=NUM_ACC_N2, a_dtype=a_dtype)
+        a_buf = _LdsView(_lds_byte_ptr(L, L_A))
+        a_scale_lds = _LdsView(_lds_byte_ptr(L, L_AS))
+        cptr = _lds_f32_ptr(L, L_C)
+        wave_id = tid // i32(64)
+        tib = e * i32(RG)
+        a_gather.for_tile(tib)
+        gpu.barrier()
+        a_scale.stage(a_scale_lds, tib)
+        gpu.barrier()
+
+        def _bank(j):
+            return uni((i32(j) % i32(2)) * i32(A_LDS_I32))
+
+        def _run_ntile(nt):
+            b_row = wave_id * i32(n_per_wave2) + nt * i32(TILE_N2)
+            regs = a_gather.load_regs(i32(0))
+            a_gather.store(a_buf, regs, _bank(i32(0)))
+            regs = a_gather.load_regs(i32(A_K_STEP))
+            wait_lgkm0()
+            gpu.barrier()
+            acc = [mfma_gu.zero_value for _ in range(N_ACC2)]
+            for sp in range_constexpr(K_ITERS2):
+                cur = _bank(i32(sp))
+                sb = b_scale.load_step(b_row, i32(sp))
+                sa = a_scale.load_step(a_scale_lds, i32(sp))
+
+                def _al(mi, ks, _b=cur):
+                    return a_s2r.load_operand(a_buf, mi, ks, _b)
+
+                a_gather.store(a_buf, regs, _bank(i32(sp + 1)))
+                regs = a_gather.load_regs(i32(((sp + 2) % K_ITERS2) * A_K_STEP))
+                acc = mfma_gu.call(_al, b_loader.load_step(b_row, i32(sp)), acc, sa, sb)
+                wait_lgkm0()
+                gpu.barrier()
+            epi(acc, nt, cptr)
+
+        return _run_ntile
+
+    @flyc.jit
+    def gemm2_pipe_nw8(L, tid, a, expert, e, s, P, src_out):
+        """NW=8 GEMM2 -> bf16 gout (P>1 n-tile shard).  Inline-A; gout epilogue."""
+        nt_lo = s * i32(N_TILES2) // P
+        nt_hi = (s + i32(1)) * i32(N_TILES2) // P
+        run_ntile = _gemm2_core_nw8(
+            L, tid, a, expert, e,
+            lambda acc, nt, cptr: _epilogue_g2(L, tid, acc, nt, cptr, src_out, e),
+        )
+        for nt_ in range(nt_lo, nt_hi, i32(1)):
+            run_ntile(i32(nt_))
+
+    @flyc.jit
+    def gemm2_combine_nw8(L, tid, a, expert, e, rows):
+        """NW=8 GEMM2 (P==1) with fused combine: inline-A, scatter each row's bf16 output
+        straight to its source ``part`` (no gout), then drain + per-row combine_arrive."""
+        run_ntile = _gemm2_core_nw8(
+            L, tid, a, expert, e,
+            lambda acc, nt, cptr: _epilogue_g2_combine(L, tid, acc, nt, cptr, a, e, rows),
+        )
+        for nt_ in range(i32(0), i32(N_TILES2), i32(1)):
+            run_ntile(i32(nt_))
+        wait_vm(0)  # drain the fused part stores before signalling the sources
+        parity = a["epoch"] & i32(1)
+        mt = a["mtpr"]
+        exp = a["m"] * i32(TOPK)
+        for k_ in range(tid, rows, i32(NT)):
+            k = i32(k_)
+            idx = fx.Int32(bld(rsrc(a["rowidx"]), (e * i32(RG) + k) * i32(4), 0, T.i32, 0))
+            combine_arrive(a, (idx // i32(TOPK)) // mt, parity, i32(0), i32(1), exp)
 
     # Select the pipelined GEMM2 (the naive path is kept as a fallback for debugging).
     gemm2 = gemm2_pipe
