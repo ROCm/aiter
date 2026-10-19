@@ -501,6 +501,8 @@ def _use_a8w4_fused_sort_quant(
     M = hidden_states.shape[0]
     return (
         _MOE_A8W4_FUSED_SORT_QUANT
+        # The debug bypass feeds unit scales to both stages; the fused quant does not.
+        and not _MOE_A8W4_BYPASS_QUANT
         and M <= _A8W4_SORT_QUANT_MAX_TOKENS
         and quant_type == QuantType.per_1x32
         and q_dtype_a == dtypes.fp8
