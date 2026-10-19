@@ -166,6 +166,11 @@ _TORCH_DTYPE_MAP = {
     "bf8": torch.float8_e5m2,
 }
 _B8_DTYPES = (fx.Float8E4M3FN, fx.Float8E5M2)
+# ``elem_dtype`` is the Q/K/V input type. P and O do not follow it: softmax P is always
+# bf8 (its [0,1] range wants the wider exponent, not fp8's extra mantissa bit), and the O
+# accumulator and store stay 16-bit.
+P_DTYPE = fx.Float8E5M2
+O_DTYPE = fx.BFloat16
 SUPPORTED_QK_HDIM = (64, 128, 192, 256)
 SUPPORTED_V_HDIM = (64, 128)
 
@@ -1438,7 +1443,7 @@ def _attention_core_multi_kv_tiles(
     warp_type,  # compile-time WarpType (LO/HI x SIMD parity)
     lds_base,  # LDS base (fx.Int32), allocated once by the caller (_alloc_lds)
     prologue,  # dict from _attention_prologue: managers, LDS map, KV span, Q fragments
-    elem_dtype,  # compile-time fx.BFloat16 / fx.Float16 for Q/K/V/P/O fragments
+    elem_dtype,  # compile-time Q/K/V fragment type; P is P_DTYPE, O is O_DTYPE
 ):
     """Layout-agnostic m32x8 compute, shared by the THD and BSHD kernel entries.
 
@@ -1545,7 +1550,7 @@ def _attention_core_multi_kv_tiles(
                 _raw(
                     fx.Vector.filled(8, float("-inf"), fx.Float32)
                     if _is_lagging_softmax
-                    else fx.Vector.filled(8, 0.0, fx.Float32).to(elem_dtype)
+                    else fx.Vector.filled(8, 0.0, fx.Float32).to(P_DTYPE)
                 )
                 for _ in range(num_kv_frags)
             ]
@@ -1851,7 +1856,7 @@ def _attention_core_multi_kv_tiles(
             rocdl.sched_barrier(0)
             pvqk_head = _pvqk_head()
             rocdl.sched_barrier(0)
-            p_list = _convert_vectors(p_f32, elem_dtype)
+            p_list = _convert_vectors(p_f32, P_DTYPE)
             # Anchor the conversion in THIS block. Its only real use is past the barrier,
             # so MachineSink (which ignores sched_barrier) would otherwise sink every
             # v_cvt_pk_bf16_f32 into the gemm and interleave it with the WMMA.
@@ -1900,7 +1905,7 @@ def _attention_core_multi_kv_tiles(
                 lambda j: v_mgr.load_one_to_reg(v_slots[1], j), 0, _num_head_carry
             )
             rocdl.sched_barrier(0)
-            carry_next = _convert_vectors(carry_f32, elem_dtype)
+            carry_next = _convert_vectors(carry_f32, P_DTYPE)
 
         # Yield: num_q_tiles updated (m, d, O, P) groups, then the ds pointers and slot bases
         # left-rotated by one so slot 0 holds tile tile_idx (next body's PV) and the oldest
@@ -2279,7 +2284,7 @@ def _attention_core_one_kv_tile(
         ],
         kv_len=kv_len,
     )
-    p_list = _convert_vectors(p_f32, elem_dtype)
+    p_list = _convert_vectors(p_f32, P_DTYPE)
     _keepalive([v for pt in p_list for v in pt])
     o_list, _ = _pv_qk_gemm(
         v_emit=_v_emit,
@@ -2310,7 +2315,7 @@ def _attention_core_one_kv_tile(
     )
 
 
-def _o_manager(*, v_hdim, gqa_ratio, num_q_tiles_per_wave, elem_dtype):
+def _o_manager(*, v_hdim, gqa_ratio, num_q_tiles_per_wave, elem_dtype=O_DTYPE):
     """The O epilogue's LDS staging manager, plus the clearance check both cores need.
 
     Two waves share a chunk at 0 and LDS_QO_BYTES, and the upper one must stop short of
@@ -2514,7 +2519,6 @@ def _attention_epilogue(
             v_hdim=v_hdim,
             gqa_ratio=gqa_ratio,
             num_q_tiles_per_wave=num_q_tiles,
-            elem_dtype=elem_dtype,
         ),
         m_list=[
             fx.Float32(epi_state[q_tile_idx * _q_epi_slots + 0])
@@ -2592,7 +2596,7 @@ def _zero_fill_attention(
     o_rsrc = buffer_ops.create_buffer_resource(
         ptr_O, num_records_bytes=o_num_records_bytes
     )
-    zero_o = fx.Vector.filled(_chunk_elems, 0.0, elem_dtype)
+    zero_o = fx.Vector.filled(_chunk_elems, 0.0, O_DTYPE)
     for r in range(BLOCK_M * num_chunks_per_row // BLOCK_SIZE):
         chunk_idx = (
             fx.Int32(r * BLOCK_SIZE) + thread_idx
