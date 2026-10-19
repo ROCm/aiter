@@ -191,8 +191,21 @@ class SpQkvLarge(Plan):
         self._ctx = got
         return got
 
-    def prepare(self, *, res, **_):
-        """Attach + init the control block. Call after res.finalize() and before graph capture; then barrier on all ranks."""
+    def _check_inputs(self, x, x_scale, w_scale, w=None):
+        """Reject, with ContractError, tensors the kernels cannot handle (see inputs.py). Dense/reuse builds read the first 9216 rows of w / w_scale, indexer 9856."""
+        from . import inputs
+
+        N = 9856 if self.mode == "indexer" else 9216
+        inputs.check_activation(self.owner, x, x_scale, M=self.M)
+        inputs.check_weight_scale(self.owner, w_scale, N=N)
+        if w is not None:
+            inputs.check_weight(self.owner, w, N=N)
+
+    def prepare(self, *, res, x=None, x_scale=None, w_scale=None, **_):
+        """Attach + init the control block. Call after res.finalize() and before graph capture; then barrier on all ranks. When the activation tensors are
+        passed (ATOM does) their contract is checked here, once, outside capture."""
+        if x is not None and x_scale is not None and w_scale is not None:
+            self._check_inputs(x, x_scale, w_scale)
         return self._context(res)
 
     def run(self, *, x, x_scale, w, w_scale, outs=None, meta=None, res, stream=None):
@@ -204,6 +217,7 @@ class SpQkvLarge(Plan):
         c = self._context(res)
         if x.shape[0] != self.M:
             raise ValueError(f"x rows {x.shape[0]} != plan local M {self.M}")
+        self._check_inputs(x, x_scale, w_scale, w)  # at capture once, in eager every call; a graph replay runs no Python
         c.launch(x.data_ptr(), w.data_ptr(), x_scale.data_ptr(), w_scale.data_ptr(), x.stride(0) * x.element_size(),
                  self.n, self.half_first, stream_handle(stream))
         self._epochs += 1

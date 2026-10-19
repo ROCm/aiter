@@ -805,6 +805,25 @@ class _T:
         _T._next += 0x1000
         self.shape, self._stride, self.dtype, self.device, self.ptr = tuple(shape), stride, dtype, "cuda:0", _T._next
 
+    def dim(self):
+        return len(self.shape)
+
+    def numel(self):
+        n = 1
+        for s in self.shape:
+            n *= s
+        return n
+
+    def is_contiguous(self):
+        if self._stride is None:
+            return True
+        expect, ok = 1, True
+        for size, st in zip(reversed(self.shape), reversed(self._stride)):
+            if size != 1 and st != expect:
+                ok = False
+            expect *= size
+        return ok
+
     def data_ptr(self):
         return self.ptr
 
@@ -814,6 +833,13 @@ class _T:
 
     def element_size(self):
         return 1
+
+
+def _w_ok(rows=9216, k=6144, shuffled=True):
+    """A well-formed preshuffled fp8 weight stand-in."""
+    w = _T((rows, k), (k, 1), "fp8")
+    w.is_shuffled = shuffled
+    return w
 
 
 def _binding_rig(monkeypatch, mode="dense", T=64):
@@ -831,7 +857,7 @@ def _binding_rig(monkeypatch, mode="dense", T=64):
     zeros_calls = []
     fake_torch = _t.ModuleType("torch")
     fake_torch.zeros = lambda *a, **k: (zeros_calls.append(1), _T((128,)))[1]
-    fake_torch.float32 = "f32"
+    fake_torch.float32, fake_torch.float8_e4m3fn, fake_torch.int64 = "f32", "fp8", "i64"
     fake_torch.finfo = lambda dt: NS(max=448.0)
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
     plan = v.SpQkvSmall(specs.sp_qkv_spec(mode), specs.SMALL_CELLS[(mode, T)][1], MatchCtx("gfx950", 256, 4, T // 4, frozenset({"mori_cco", "gfx950_sc_bypass"})))
@@ -839,9 +865,10 @@ def _binding_rig(monkeypatch, mode="dense", T=64):
     plan._context = lambda r: NS(bind=lambda sb: binds.append(sb) or object())
     M = T // 4
     page = plan.block
-    st = dict(x=_T((M, 6144), (6144, 1)), xs=_T((M, 1)), ws=_T((9216,)))
+    n_rows = 9856 if mode in ("indexer", "reuse") else 9216
+    st = dict(x=_T((M, 6144), (6144, 1), "fp8"), xs=_T((M, 1), (1, 1)), ws=_T((n_rows,), (1,)), w=_w_ok(n_rows))
     meta = {n: _T((128,)) for n in ("q_norm_w", "k_norm_w")}
-    meta.update(cos_cache=_T((1024, 32), (32, 1)), sin_cache=_T((1024, 32), (32, 1)), positions=_T((T,)), slot_mapping=_T((T,)),
+    meta.update(cos_cache=_T((1024, 32), (32, 1)), sin_cache=_T((1024, 32), (32, 1)), positions=_T((T,), (1,), "i64"), slot_mapping=_T((T,), (1,), "i64"),
                 k_cache=_T((4, 1, 8, page, 16), (page * 128, page * 128, page * 16, 16, 1)), v_cache=_T((4, 1, page // 16, 128, 16), (page * 128, page * 128, 2048, 16, 1)),
                 k_scale=_T((4, 1, page), (page, page, 1)), v_scale=_T((4, 1, page), (page, page, 1)))
     outs = {"q": _T((T, 16, 128)), "k": _T((T, 1, 128)), "v": _T((T, 1, 128))}
@@ -929,8 +956,8 @@ def test_run_passes_the_per_launch_x_layout(monkeypatch):
 
     sys.modules["torch"].cuda = NS(is_current_stream_capturing=lambda: False)
     monkeypatch.setattr("aiter.ops.gemm_fusion.sp_qkv.small_rt.stream_handle", lambda s: "S")
-    w = _T((9216, 6144))
-    x_padded = _T((16, 6144), (8192, 1))  # a row-padded activation view: stride(0) = 8192 bytes
+    w = _w_ok()
+    x_padded = _T((16, 6144), (8192, 1), "fp8")  # a row-padded activation view: stride(0) = 8192 bytes
     plan.run(x=x_padded, x_scale=st["xs"], w=w, w_scale=st["ws"], outs=outs, meta=meta, res=res)
     blk, a_ptr, w_ptr, stride_a, stream = calls[0]
     assert (a_ptr, w_ptr, stride_a, stream) == (x_padded.ptr, w.ptr, 8192, "S")
@@ -1285,11 +1312,11 @@ def test_launch_refuses_windows_that_are_not_zeroed_yet(monkeypatch):
     res.pending_zero = 3
     sys.modules["torch"].cuda = NS(is_current_stream_capturing=lambda: False)
     with pytest.raises(RuntimeError, match="3 CCO window.*not yet zeroed.*finalize"):
-        plan.run(x=st["x"], x_scale=st["xs"], w=_T((9216, 6144)), w_scale=st["ws"], outs=outs, meta=meta, res=res)
+        plan.run(x=st["x"], x_scale=st["xs"], w=st["w"], w_scale=st["ws"], outs=outs, meta=meta, res=res)
     res.pending_zero = 0
     plan._context = lambda r: NS(bind=lambda sb: object(), launch=lambda *a: None)
     monkeypatch.setattr("aiter.ops.gemm_fusion.sp_qkv.small_rt.stream_handle", lambda s: "S")
-    plan.run(x=st["x"], x_scale=st["xs"], w=_T((9216, 6144)), w_scale=st["ws"], outs=outs, meta=meta, res=res)  # zeroed: runs
+    plan.run(x=st["x"], x_scale=st["xs"], w=st["w"], w_scale=st["ws"], outs=outs, meta=meta, res=res)  # zeroed: runs
 
 
 def test_C_S3_documented_in_code_and_policy_requires_the_same_large_plan_sequence():
@@ -2154,3 +2181,223 @@ def test_binding_checker_flags_a_missing_native_and_a_dead_binding_negative_cont
         import shutil
 
         shutil.rmtree(d, ignore_errors=True)
+
+# ======================================================================= task-264: plan.prepare/run input contract (inputs.py)
+def _small_ready(monkeypatch, mode="dense", T=64):
+    """The binding rig plus a recording launch stub: returns (plan, st, meta, outs, res, launches, binds)."""
+    from types import SimpleNamespace as NS
+
+    plan, st, meta, outs, res, binds, _z = _binding_rig(monkeypatch, mode, T)
+    launches = []
+    plan._context = lambda r: NS(bind=lambda sb: binds.append(sb) or object(), launch=lambda *a: launches.append(a))
+    sys.modules["torch"].cuda = NS(is_current_stream_capturing=lambda: False)
+    monkeypatch.setattr("aiter.ops.gemm_fusion.sp_qkv.small_rt.stream_handle", lambda s: "S")
+    return plan, st, meta, outs, res, launches, binds
+
+
+def _run_small(plan, st, meta, outs, res, **over):
+    kw = dict(x=st["x"], x_scale=st["xs"], w=st["w"], w_scale=st["ws"], outs=outs, meta=meta, res=res)
+    kw.update(over)
+    return plan.run(**kw)
+
+
+def test_inputs_small_accepts_every_deliberately_allowed_form(monkeypatch):
+    plan, st, meta, outs, res, launches, binds = _small_ready(monkeypatch)
+    M, T = 16, 64
+    _run_small(plan, st, meta, outs, res)  # the baseline
+    _run_small(plan, st, meta, outs, res, x=_T((M, 6144), (8192, 1), "fp8"))  # a row-strided view (stride(0) > K): strideA carries it
+    _run_small(plan, st, meta, outs, res, w_scale=_T((9216, 1), (1, 1)))  # [N,1] (what ATOM's weight_scale is), not only [N]
+    _run_small(plan, st, meta, outs, res, w_scale=_T((9344,), (1,)), w=_w_ok(9344))  # N padded to 128 (ATOM): a prefix-compatible weight / scale with MORE rows
+    _run_small(plan, st, meta, outs, res, x_scale=_T((M,), (1,)))  # [M] as well as [M,1]
+    longer = dict(positions=_T((T + 64,), (1,), "i64"), slot_mapping=_T((T + 64,), (1,), "i64"))  # a longer persistent buffer is safe: the kernel reads t < T
+    _run_small(plan, st, {**meta, **longer}, outs, res)
+    assert len(launches) == 6
+    # a decode pad row has slot -1: only the LENGTH is checked (values are never inspected), so exact-length arrays are fine whatever they hold
+    _run_small(plan, st, meta, outs, res)
+    # reuse and indexer plans take the 9856-row weight; the dense plan accepts it too (it reads the first 9216 rows)
+    _run_small(plan, st, meta, outs, res, w=_w_ok(9856), w_scale=_T((9856, 1), (1, 1)))
+
+
+@pytest.mark.parametrize("what,over,match", [
+    ("x K-padded (shape[1]=6400)", dict(x=_T((16, 6400), (6400, 1), "fp8")), r"x K=6400 != 6144.*K-padded activation"),
+    ("x K stride != 1", dict(x=_T((16, 6144), (6144, 2), "fp8")), r"x must be K-contiguous"),
+    ("x row stride < K", dict(x=_T((16, 6144), (4096, 1), "fp8")), r"row stride >= 6144"),
+    ("x not fp8", dict(x=_T((16, 6144), (6144, 1), "bf16")), r"x dtype bf16 is not float8_e4m3fn"),
+    ("x 1-D", dict(x=_T((16,), (1,), "fp8")), r"x must be 2-D"),
+    ("x_scale not fp32", dict(x_scale=_T((16, 1), (1, 1), "bf16")), r"x_scale dtype bf16 is not float32"),
+    ("x_scale wrong length", dict(x_scale=_T((15, 1), (1, 1))), r"x_scale must be contiguous with exactly 16 elements"),
+    ("x_scale non-contiguous", dict(x_scale=_T((16, 2), (2, 1))), r"x_scale must be contiguous with exactly 16"),
+    ("w_scale not fp32", dict(w_scale=_T((9216,), (1,), "bf16")), r"w_scale dtype bf16 is not float32"),
+    ("w_scale short", dict(w_scale=_T((9215,), (1,))), r"w_scale must be contiguous \[N\] or \[N,1\] with N >= 9216"),
+    ("w_scale [N,2]", dict(w_scale=_T((9216, 2), (2, 1))), r"w_scale must be contiguous \[N\] or \[N,1\]"),
+    ("w_scale non-contiguous", dict(w_scale=_T((9216,), (2,))), r"w_scale must be contiguous"),
+    ("w K-padded (shape[1]=6400)", dict(w=_w_ok(9216, 6400)), r"w K=6400 != 6144.*K-padded weight"),
+    ("w shuffled with K padding (attrs)", dict(w=type("W", (_T,), {"aiter_padded_k": 6400, "aiter_original_k": 6144})((9216, 6144), (6144, 1), "fp8")),
+     r"shuffled with K padding"),
+    ("w original K != 6144 (attrs)", dict(w=type("W", (_T,), {"aiter_original_k": 6000})((9216, 6144), (6144, 1), "fp8")), r"shuffled with K padding"),
+    ("w unshuffled", dict(w=_w_ok(9216, shuffled=False)), r"is_shuffled=False"),
+    ("w too few rows", dict(w=_w_ok(9200)), r"w has 9200 rows < N=9216"),
+    ("w not fp8", dict(w=_T((9216, 6144), (6144, 1), "bf16")), r"w dtype bf16 is not float8_e4m3fn"),
+    ("w non-contiguous", dict(w=_T((9216, 6144), (6144 * 2, 1), "fp8")), r"w must be contiguous"),
+    ("w 1-D", dict(w=_T((9216,), (1,), "fp8")), r"w must be 2-D"),
+])
+def test_inputs_small_rejects_each_violation_before_any_binding_or_launch(monkeypatch, what, over, match):
+    from aiter.gemm_fusion import ContractError
+
+    plan, st, meta, outs, res, launches, binds = _small_ready(monkeypatch)
+    with pytest.raises(ContractError, match=match):
+        _run_small(plan, st, meta, outs, res, **over)
+    assert launches == [] and binds == [], what  # rejected BEFORE a binding was created or anything launched
+
+
+@pytest.mark.parametrize("what,meta_over,outs_over,match", [
+    ("positions shorter than T (the pad_rows case: real tokens < padded)", dict(positions=_T((61,), (1,), "i64")), {}, r"positions has 61 entries but the kernel reads 64"),
+    ("slot_mapping shorter than T", dict(slot_mapping=_T((63,), (1,), "i64")), {}, r"slot_mapping has 63 entries but the kernel reads 64"),
+    ("positions int32", dict(positions=_T((64,), (1,), "i32")), {}, r"positions dtype i32 is not int64"),
+    ("slot_mapping int32", dict(slot_mapping=_T((64,), (1,), "i32")), {}, r"slot_mapping dtype i32 is not int64"),
+    ("q output too short", {}, dict(q=_T((60, 16, 128))), r"output 'q' has 60 rows but the kernel writes 64"),
+    ("k output too short", {}, dict(k=_T((32, 1, 128))), r"output 'k' has 32 rows"),
+])
+def test_inputs_small_rejects_short_or_mistyped_token_arrays(monkeypatch, what, meta_over, outs_over, match):
+    from aiter.gemm_fusion import ContractError
+
+    plan, st, meta, outs, res, launches, binds = _small_ready(monkeypatch)
+    with pytest.raises(ContractError, match=match):
+        _run_small(plan, st, {**meta, **meta_over}, {**outs, **outs_over}, res)
+    assert launches == [] and binds == [], what
+
+
+def test_inputs_small_rejects_rows_outside_1_to_32_and_checks_prepare_without_a_weight(monkeypatch):
+    from aiter.gemm_fusion import ContractError
+
+    plan, st, meta, outs, res, launches, binds = _small_ready(monkeypatch)
+    with pytest.raises(ContractError, match=r"x has 33 rows, the small plans take local M 1\.\.32"):
+        _run_small(plan, st, meta, outs, res, x=_T((33, 6144), (6144, 1), "fp8"))
+    # prepare(): no weight is passed, everything else is checked ONCE, outside capture, before the binding exists
+    plan.prepare(x=st["x"], x_scale=st["xs"], w_scale=st["ws"], outs=outs, meta=meta, res=res)
+    assert len(binds) == 1
+    bad = {**meta, "positions": _T((61,), (1,), "i64")}  # real tokens (61) < padded rows x world (64)
+    plan2, st2, meta2, outs2, res2, l2, b2 = _small_ready(monkeypatch)
+    with pytest.raises(ContractError, match="padded rows.*must run natively"):
+        plan2.prepare(x=st2["x"], x_scale=st2["xs"], w_scale=st2["ws"], outs=outs2, meta={**meta2, **bad}, res=res2)
+    with pytest.raises(ContractError, match="x K=6400"):
+        plan2.prepare(x=_T((16, 6400), (6400, 1), "fp8"), x_scale=st2["xs"], w_scale=st2["ws"], outs=outs2, meta=meta2, res=res2)
+    assert b2 == []
+
+
+def test_inputs_small_indexer_and_reuse_need_the_9856_row_weight_dense_does_not(monkeypatch):
+    from aiter.gemm_fusion import ContractError
+
+    for mode in ("indexer", "reuse"):
+        plan, st, meta, outs, res, launches, binds = _small_ready(monkeypatch, mode=mode)
+        # the rig gives these modes their own k/v/index_q outputs only where the plan needs them; the weight contract is what is under test
+        meta = {**meta, "index_cache": _T((4, 1, 16, 128), (2048, 2048, 128, 1)), "index_q_norm_w": _T((128,)), "index_k_norm_w": _T((128,))}
+        outs = {"q": outs["q"], "index_q": _T((64, 1, 128))} if mode == "indexer" else outs
+        with pytest.raises(ContractError, match=r"w has 9216 rows < N=9856"):
+            _run_small(plan, st, meta, outs, res, w=_w_ok(9216), w_scale=_T((9856, 1), (1, 1)))
+        with pytest.raises(ContractError, match=r"w_scale must be contiguous \[N\] or \[N,1\] with N >= 9856"):
+            _run_small(plan, st, meta, outs, res, w_scale=_T((9216,), (1,)))
+
+
+# ---- large plans
+def _large_ready(monkeypatch, mode="dense", T=8192):
+    import types as _t
+    from types import SimpleNamespace as NS
+
+    monkeypatch.setitem(sys.modules, "torch", _t.ModuleType("torch"))
+    tm = sys.modules["torch"]
+    tm.float32, tm.float8_e4m3fn, tm.int64 = "f32", "fp8", "i64"
+    from aiter.gemm_fusion import catalog
+
+    monkeypatch.setattr(catalog, "_CATALOG", {})
+    plan = _plan_for(mode, T, True)
+    M = T // 4
+    launches = []
+    plan._context = lambda r: NS(launch=lambda *a, **k: launches.append(a))
+    monkeypatch.setattr("aiter.ops.gemm_fusion.sp_qkv.small_rt.stream_handle", lambda s: "S")
+    n_rows = 9856 if mode == "indexer" else 9216
+    st = dict(x=_T((M, 6144), (6144, 1), "fp8"), xs=_T((M, 1), (1, 1)), ws=_T((n_rows, 1), (1, 1)), w=_w_ok(n_rows))
+    return plan, st, type("R", (), {})(), launches
+
+
+def _run_large(plan, st, res, **over):
+    kw = dict(x=st["x"], x_scale=st["xs"], w=st["w"], w_scale=st["ws"], res=res)
+    kw.update(over)
+    return plan.run(**kw)
+
+
+def test_inputs_large_accepts_the_allowed_forms_and_rejects_each_violation(monkeypatch):
+    from aiter.gemm_fusion import ContractError
+
+    plan, st, res, launches = _large_ready(monkeypatch)
+    M = 2048
+    _run_large(plan, st, res)  # [N,1] w_scale and a caller-owned x_scale, as ATOM passes them
+    _run_large(plan, st, res, x=_T((M, 6144), (8192, 1), "fp8"))  # row-strided view
+    _run_large(plan, st, res, w=_w_ok(9344), w_scale=_T((9344, 1), (1, 1)))  # N-padded weight: prefix compatible
+    _run_large(plan, st, res, w=_w_ok(9856), w_scale=_T((9856,), (1,)))  # the dense build reads the first 9216 rows of the indexer weight
+    assert len(launches) == 4
+    cases = [
+        (dict(x=_T((M, 6400), (6400, 1), "fp8")), r"x K=6400 != 6144"),
+        (dict(x=_T((M, 6144), (6144, 2), "fp8")), r"x must be K-contiguous"),
+        (dict(x=_T((M, 6144), (6144, 1), "bf16")), r"x dtype bf16 is not float8_e4m3fn"),
+        (dict(x_scale=_T((M, 1), (1, 1), "bf16")), r"x_scale dtype bf16"),
+        (dict(x_scale=_T((M - 1, 1), (1, 1))), rf"exactly {M} elements"),
+        (dict(w_scale=_T((9215, 1), (1, 1))), r"w_scale must be contiguous.*N >= 9216"),
+        (dict(w_scale=_T((9216,), (1,), "bf16")), r"w_scale dtype bf16"),
+        (dict(w=_w_ok(9216, 6400)), r"w K=6400 != 6144.*K-padded weight"),
+        (dict(w=_w_ok(9216, shuffled=False)), r"is_shuffled=False"),
+        (dict(w=_w_ok(9215)), r"w has 9215 rows < N=9216"),
+        (dict(w=_T((9216, 6144), (6144, 1), "bf16")), r"w dtype bf16"),
+        (dict(w=_T((9216, 6144), (12288, 1), "fp8")), r"w must be contiguous"),
+    ]
+    for over, match in cases:
+        n = len(launches)
+        with pytest.raises(ContractError, match=match):
+            _run_large(plan, st, res, **over)
+        assert len(launches) == n  # nothing launched
+    # the pre-existing row-count error is unchanged
+    with pytest.raises(ValueError, match="x rows 1024 != plan local M 2048"):
+        _run_large(plan, st, res, x=_T((1024, 6144), (6144, 1), "fp8"))
+
+
+def test_inputs_large_indexer_needs_9856_rows_and_prepare_checks_when_tensors_are_passed(monkeypatch):
+    from aiter.gemm_fusion import ContractError
+
+    plan, st, res, launches = _large_ready(monkeypatch, mode="indexer", T=16384)
+    with pytest.raises(ContractError, match=r"w has 9216 rows < N=9856"):
+        _run_large(plan, st, res, w=_w_ok(9216))
+    _run_large(plan, st, res)
+    # prepare(): the old call shape (res only) still works; with the activation tensors (as ATOM passes them) they are checked once, outside capture
+    plan.prepare(res=res)
+    plan.prepare(res=res, x=st["x"], x_scale=st["xs"], w_scale=st["ws"])
+    with pytest.raises(ContractError, match=r"x K=6400"):
+        plan.prepare(res=res, x=_T((4096, 6400), (6400, 1), "fp8"), x_scale=st["xs"], w_scale=st["ws"])
+    with pytest.raises(ContractError, match=r"w_scale must be contiguous.*N >= 9856"):
+        plan.prepare(res=res, x=st["x"], x_scale=st["xs"], w_scale=_T((9216, 1), (1, 1)))
+
+
+def test_inputs_checks_are_pure_python_and_only_run_where_python_runs():
+    """The contract: prepare() once, run() at capture once and in eager every call; a graph replay executes no Python. Pin the wiring (read from the sources: importing
+    the variant modules again would re-register them in the catalog)."""
+    import ast as _a
+
+    base = os.path.dirname(specs.__file__)
+
+    def method_src(fname, cls, meth):
+        text = open(os.path.join(base, fname), encoding="utf-8").read()
+        for n in _a.parse(text).body:
+            if isinstance(n, _a.ClassDef) and n.name == cls:
+                for m in n.body:
+                    if isinstance(m, _a.FunctionDef) and m.name == meth:
+                        return _a.get_source_segment(text, m)
+        raise AssertionError(f"{cls}.{meth} not found")
+
+    small_prep, small_run = method_src("variants.py", "SpQkvSmall", "prepare"), method_src("variants.py", "SpQkvSmall", "run")
+    assert "self._check_inputs(x, x_scale, w_scale, outs, meta)" in small_prep
+    assert "self._check_inputs(x, x_scale, w_scale, outs, meta, w)" in small_run
+    assert small_run.index("self._check_inputs") < small_run.index("self._binding(")  # rejected before any binding
+    assert "self._check_inputs(x, x_scale, w_scale, w)" in method_src("variants_large.py", "SpQkvLarge", "run")
+    assert "self._check_inputs(x, x_scale, w_scale)" in method_src("variants_large.py", "SpQkvLarge", "prepare")
+    src = open(os.path.join(base, "inputs.py"), encoding="utf-8").read()
+    code = "\n".join(l for l in src.split("\n") if not l.lstrip().startswith("#"))
+    assert ".item(" not in code and "synchronize" not in code and ".cuda" not in code and "hipMemcpy" not in code  # attribute compares only; tensor VALUES are never read (slot -1 stays legal)

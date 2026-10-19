@@ -32,6 +32,7 @@ log = logging.getLogger("aiter.gemm_fusion")
 from . import specs  # noqa: E402
 from .jit import build_small, small_defs
 from . import small_rt as rt
+from . import inputs
 
 SRC_SHA = {
     "r17": "3f597cdb6141c39dd4450a1ea635785ffe44867006434157478f7822357d8ee3",
@@ -227,8 +228,20 @@ class SpQkvSmall(Plan):
         self._parts[key] = parts
         return blk
 
+    def _check_inputs(self, x, x_scale, w_scale, outs, meta, w=None):
+        """Reject, with ContractError, tensors the kernels cannot handle (see inputs.py) BEFORE any binding or launch. prepare() has no weight, run() passes it."""
+        M = int(x.shape[0])
+        if not 1 <= M <= rt.SM_MP:
+            raise ContractError(f"{self.owner}: x has {M} rows, the small plans take local M 1..{rt.SM_MP}")
+        inputs.check_activation(self.owner, x, x_scale, M=M)
+        inputs.check_weight_scale(self.owner, w_scale, N=_NA[self.mode] * 128)
+        if w is not None:
+            inputs.check_weight(self.owner, w, N=_NA[self.mode] * 128)
+        inputs.check_token_arrays(self.owner, T=4 * M, positions=meta["positions"], slot_mapping=meta["slot_mapping"], outs=outs)
+
     def prepare(self, *, x, x_scale, w_scale, outs, meta, res):
-        """Create the binding (and attach the context) outside graph capture. Idempotent."""
+        """Create the binding (and attach the context) outside graph capture. Idempotent. Checks the input contract (once, outside capture)."""
+        self._check_inputs(x, x_scale, w_scale, outs, meta)
         self._context(res)
         return self._binding(x, x_scale, w_scale, outs, meta, res)
 
@@ -236,6 +249,7 @@ class SpQkvSmall(Plan):
         import torch
 
         _require_zeroed(res, self.owner)
+        self._check_inputs(x, x_scale, w_scale, outs, meta, w)  # at capture once, in eager every call; a graph replay runs no Python
         sc = self._context(res)
         blk = self._binding(x, x_scale, w_scale, outs, meta, res, in_capture=torch.cuda.is_current_stream_capturing())
         sc.launch(blk, x.data_ptr(), w.data_ptr(), x.stride(0) * x.element_size(), rt.stream_handle(stream))
