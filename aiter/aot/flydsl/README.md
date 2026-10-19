@@ -1,9 +1,9 @@
 # FlyDSL AOT Pre-compilation & Tests
 
 This directory holds the **AOT (Ahead-Of-Time) pre-compilation entry points** for
-FlyDSL kernels. Each module extracts every unique FlyDSL kernel name from aiter's
-tuned CSV configs and compiles them into the cache up front, so that at runtime
-the JIT path hits the cache instead of compiling again.
+FlyDSL kernels. Each module derives the runtime-reachable jobs from aiter's
+tuned CSV configs—including ABI/cache variants that share a kernel name—and
+compiles them up front so the runtime JIT path hits the cache.
 
 | Module | OpKind | Description |
 | --- | --- | --- |
@@ -61,6 +61,11 @@ python -m aiter.aot.flydsl.mega_moe
 python -m aiter.aot.flydsl.mega_moe --experts-per-rank 48
 ```
 
+FHMoE stage-1 kernels use distinct cache identities for clamped and unclamped
+shared SiLU. MXFP8/FP8 shared-expert rows automatically emit both
+`clamp_shared=True` and `False` jobs; existing MXFP4/FP8 DSV4 rows remain
+clamped-only.
+
 The FP8 flash-attention kernel picks its tile, rescale threshold and split-K
 factor per call, so a serving process JIT-compiles each new combination on the
 request path. `fmha_fp8` enumerates every combination the wrapper's heuristics
@@ -93,25 +98,29 @@ python -m aiter.aot.flydsl.chunk_gdn_h --csv /path/to/tuned.csv
 | --- | --- | --- |
 | `AITER_AOT_IMPORT` | Set to `1` so `import aiter` only loads the lightweight JIT core and skips the full top-level op namespace — faster and avoids heavy import side effects during AOT compilation (this is what `setup.py` sets while pre-compiling). | `0` |
 | `FLYDSL_RUNTIME_CACHE_DIR` | Cache directory | `~/.flydsl/cache` |
-| `AITER_FLYDSL_AOT_WORKERS` | Max concurrent worker processes. Set explicitly to honor it verbatim (bypasses the memory cap below); `0`/negative clamps to 1. Each worker uses ~1.5–2.5 GB RSS. | `min(affinity-aware CPUs, 64)`, then capped by available memory |
-| `AITER_FLYDSL_AOT_MEM_PER_WORKER_GB` | Assumed GiB/worker for the **auto memory cap** that keeps the OOM-killer from firing. Only applies when `AITER_FLYDSL_AOT_WORKERS` is **not** set; `0` disables the cap. | `2.0` |
+| `AITER_MAX_JOBS` | Optional AITER-local ceiling for concurrent CPU compilation workers. If it is unset, standalone FlyDSL AOT CLIs adopt a valid positive legacy `MAX_JOBS` with a `FutureWarning`; AITER imports and runtime JIT do not. Sizing and precedence follow the shared policy in the [top-level README](../../../README.md#build-parallelism); invalid values use automatic sizing and non-positive values impose a one-worker ceiling. | auto |
 | `AITER_FLYDSL_AOT_TIMEOUT` | Per-kernel wall-clock cap (seconds). A worker stuck *alive* past this is killed (and retried); `0` disables. | `1200` |
 | `AITER_FLYDSL_AOT_MAX_RETRIES` | Retries for a worker that **died abnormally** (OOM-kill / segfault / timeout-kill). A clean compile error is never retried. `0` disables. | `2` |
 | `AITER_CONFIGS` | Resolves the default CSV lookup path (same as the runtime JIT) | repo built-in |
-| `ARCH` / `GPU_ARCHS` | Selects which jobs to build, not what arch a job compiles *for* (that comes from the CSV's `cu_num`). `conv.py` applies it inside `parse_csv`, so both `python -m` and the `setup.py` path (`run_aot`) honour it. `gemm.py` still filters in `main()` only, so `run_aot` builds all of its archs. | auto-detect |
+| `ARCH` / `GPU_ARCHS` | Selects which jobs to build, not what arch a job compiles *for* (that comes from the CSV's `gfx`, with legacy `cu_num` fallback). `conv.py` applies it inside `parse_csv`, so both `python -m` and the `setup.py` path (`run_aot`) honour it. `gemm.py` still filters in `main()` only, so `run_aot` builds all of its archs. | auto-detect |
 
 > **About the compile target arch.** The arch each kernel is actually compiled
-> for is derived per-job from the CSV's `cu_num` column (`cu_num_to_arch(...)`)
-> and applied internally via `FLYDSL_GPU_ARCH`. That internal var is overwritten
+> for is taken from the CSV's `gfx` column, with `cu_num_to_arch(...)` retained
+> as a fallback for legacy rows, and applied internally via `FLYDSL_GPU_ARCH`.
+> That internal var is overwritten
 > for every job, so setting `ARCH` / `GPU_ARCHS` / `FLYDSL_GPU_ARCH` in your shell
-> does **not** change what gets built. To cross-compile, edit the `cu_num`
-> column in the CSV.
+> does **not** change what gets built. To cross-compile, use the target `gfx` and
+> `cu_num` values in the CSV.
 
 Example:
 
 ```bash
-AITER_FLYDSL_AOT_WORKERS=16 python -m aiter.aot.flydsl.moe
+AITER_MAX_JOBS=16 python -m aiter.aot.flydsl.moe
 ```
+
+An explicit `AITER_MAX_JOBS` always takes precedence. Legacy adoption copies
+the positive value without changing `MAX_JOBS`; without either setting, worker
+selection is fully automatic.
 
 ---
 
@@ -165,8 +174,9 @@ python op_tests/test_moe_2stage.py
   is refreshed to the right version.
 - **Worker OOM / killed (exitcode -9)**: abnormal exits are auto-retried
   (`AITER_FLYDSL_AOT_MAX_RETRIES`) and the default worker count is already
-  memory-capped (`AITER_FLYDSL_AOT_MEM_PER_WORKER_GB`). If it still happens,
-  lower `AITER_FLYDSL_AOT_WORKERS` or raise the assumed GiB/worker.
+  bounded by the shared CPU and memory policy. If it still happens,
+  lower `AITER_MAX_JOBS`. Nested compiler fanout is fixed at one inside each
+  AOT worker.
 - **A kernel hangs / never finishes**: it is killed once it exceeds
   `AITER_FLYDSL_AOT_TIMEOUT` (default 1200 s) and then retried. Lower the timeout
   to fail faster, or raise it for genuinely slow kernels.
