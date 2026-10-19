@@ -191,17 +191,17 @@ def _async_load_to_lds(gptrs, lds_ptrs, *, cluster, imm_offs=None):
 
 # A WMMA AB operand is two GROUPS of 16 B per lane; group ``g`` holds K elements
 # ``[2*KPack*g + KPack*h, +KPack)`` for lane half ``h = lane//16``, KPack = 16/elem_bytes
-# (CK's gfx125 traits: 16x16x32 bf16 KPack 8, 16x16x64 fp8 KPack 16). K reads a group with
-# one b128; V reads it through the transpose crossbar, which delivers 8 elements per load,
-# so V needs KPack/8 of them per group.
+# (CK's gfx125 traits: 16x16x32 bf16 KPack 8, 16x16x64 fp8 KPack 16). K and Q read a group
+# with one b128 and sit at that logical k directly. V does NOT: PV sums over kv, so any kv
+# permutation is legal as long as P and V agree, and P's order is fixed by the QK
+# accumulator (lane half h holds kv 8h+0..7 of each 16-row frag). V therefore keeps the
+# 16-bit addressing at every width -- lane row base 8h, one 8-element transpose load per 16
+# kv rows -- and the wmma's own k order is permuted to match.
 _V_LANE_ELEMS = 8
-# Row skew that keeps those fetches conflict-free. K/Q read naturally, so theirs is a
-# fixed 16 B; V reads from 8 rows at once and needs the skew counted in ELEMENTS.
+# Row skew that keeps those fetches conflict-free: K/Q a fixed 16 B, V 16 ELEMENTS. Swept
+# against the bank model at both LDS service widths (16 and 32 lanes/cycle).
 _AB_PAD_BYTES = 16
 _V_PAD_ELEMS = 16
-# ASSUMED: ds_load_tr8_b64 is serviced 16 lanes/cycle like b128, which makes the pad above
-# conflict-free at 8-bit. If it is 32 lanes/cycle instead, NO row pad works -- the two
-# 8-row cosets a group spans land on the same banks -- and V needs a swizzle, not a pad.
 _O_PAD_ELEMS = 8  # 4 DW = 16 B per O row (conflict-free ds_store_b128); O stays 16-bit
 
 
@@ -1022,11 +1022,11 @@ class VManager16bV1(_AsyncTransport):
     # argument contract (``ptr_src`` is the V tensor here).
     def ds_load_ptrs(self, *, ptr_lds, lane_idx):
         """One per-lane transpose-load base pointer per LDS split; the crossbar fetch sits
-        at ``kv = (l//16)*KPack + l%8``, ``d = ((l//8)%2)*8``. Every fragment is its
-        split's base plus a lane-independent compile-time immediate."""
-        lane_kv = (lane_idx // _WMMA_M) * fx.Int32(
-            self.chunk_elems
-        ) + lane_idx % fx.Int32(8)
+        at ``kv = (l//16)*8 + l%8``, ``d = ((l//8)%2)*8``. Every fragment is its split's
+        base plus a lane-independent compile-time immediate."""
+        lane_kv = (lane_idx // _WMMA_M) * fx.Int32(_V_LANE_ELEMS) + lane_idx % fx.Int32(
+            8
+        )
         lane_d = ((lane_idx // fx.Int32(8)) % fx.Int32(2)) * fx.Int32(8)
         return [
             create_llvm_ptr(
@@ -1045,7 +1045,7 @@ class VManager16bV1(_AsyncTransport):
 
     @property
     def loads_per_frag(self):
-        return 2 * (self.chunk_elems // _V_LANE_ELEMS)  # 2 groups x KPack/8 loads
+        return self.wmma_k // _WMMA_M  # one transpose load per 16 kv rows
 
     def num_ds_loads(self):
         return (
@@ -1066,14 +1066,8 @@ class VManager16bV1(_AsyncTransport):
             for kt in range(nkt):
                 split, kt_local = divmod(kt, kt_per_split)
                 for sub in range(self.loads_per_frag):
-                    group, part = divmod(sub, self.chunk_elems // _V_LANE_ELEMS)
                     imm = (
-                        (
-                            kt_local * self.wmma_k
-                            + group * (self.wmma_k // 2)
-                            + part * _V_LANE_ELEMS
-                        )
-                        * self.row_bytes
+                        (kt_local * self.wmma_k + sub * _WMMA_M) * self.row_bytes
                         + dt * _WMMA_M * self.elem_bytes
                         + lds_imm_offset
                     )

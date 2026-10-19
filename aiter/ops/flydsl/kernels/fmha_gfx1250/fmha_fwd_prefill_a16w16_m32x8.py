@@ -785,6 +785,8 @@ def _pv_qk_gemm(
     num_contract_tiles = n_block // WMMA_K
     num_kv_frags = n_block // WMMA_N
     num_k_tiles = len(q_frags_list[0])
+    # softmax tiles per PV B operand: one per 16 kv rows of the contraction
+    num_p_parts = num_kv_frags // num_contract_tiles
 
     # ``phase`` drops one half of the stream when the caller knows it is dead (the
     # single-KV-tile core runs QK and PV as separate passes around softmax).
@@ -818,8 +820,8 @@ def _pv_qk_gemm(
                         else fx.Vector.filled(8, 0.0, fx.Float32)
                     )
                 p = p_list[q_tile_idx]
-                p_frag = p[2 * k_tile_idx].shuffle(
-                    p[2 * k_tile_idx + 1], list(range(16))
+                p_frag = _concat(
+                    [p[num_p_parts * k_tile_idx + t] for t in range(num_p_parts)]
                 )
                 p_frags[(q_tile_idx, k_tile_idx)] = p_frag
                 out_list[q_tile_idx][d_tile_idx] = _wmma(v_frag, p_frag, acc)
