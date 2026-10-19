@@ -846,7 +846,7 @@ def mla_ps64_qh128_fp8_asm_fwd(
 
 @compile_ops(MD_NAME, ffi_type="ctypes")
 def mla_decode_stage1_asm_fwd(
-    # [num_seqs, num_heads, head_size]
+    # [total_q, num_heads, head_size]
     Q: torch.Tensor,
     # [num_page, page_size, num_kv_heads, kv_lora_rank + qk_rope_head_dim]
     KV: torch.Tensor,
@@ -866,12 +866,12 @@ def mla_decode_stage1_asm_fwd(
     page_size: int,
     nhead_kv: int,
     softmax_scale: float,
-    # [batch_size, num_kv_splits, num_heads, v_head_dim]
+    # [total_q, num_kv_splits, num_heads, v_head_dim]
     splitData: torch.Tensor,
-    # [batch_size, num_kv_splits, num_heads,  1]
+    # [total_q, num_kv_splits, num_heads, 1]
     splitLse: torch.Tensor,
     output: torch.Tensor,
-    # [batch_size, num_heads, v_head_dim]
+    # [total_q, num_heads] final natural-log LSE
     lse: torch.Tensor | None = None,
     # [1] per-tensor
     q_scale: torch.Tensor | None = None,
@@ -886,7 +886,11 @@ def mla_decode_stage1_asm_fwd(
     # [batch_size] scratch for gfx1250 packed MLA kernels
     valid_split_count: torch.Tensor | None = None,
     use_valid_split_count_reduce: int = 0,
+    # QH64 shuffled: right-aligned mask per query from qo_indptr.
     causal: bool = True,
+    kv_shuffled: int = 0,
+    # Shuffled QH64 only: indptr counts tokens, indices contain page64 slot IDs.
+    kv_indptr_is_token_level: bool = False,
 ) -> None: ...
 
 
