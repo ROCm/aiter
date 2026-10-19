@@ -298,15 +298,21 @@ def build_gemm(kc: KernelCtx) -> dict:
 
         # Plain closure (as in gemm1): the runtime n-tile loop body is only a plain call so
         # a_gather isn't treated as scf.for loop-carried state.
+        # Depth-2 loader pipeline: prefetch the next K-step's A regs (HBM->reg) right after
+        # issuing the current LDS store, so the next tile's HBM latency overlaps the current
+        # store drain + publish instead of serialising one HBM round-trip per tile.
         def _produce_nt(nt):
             q0 = uni((uord * ntpu + (nt - nt_lo)) * i32(K_ITERS))
+            regs = a_gather.load_regs(i32(0))  # prefetch K-step 0
             for sp in range_constexpr(K_ITERS):
                 q = q0 + i32(sp)
                 _loader_wait_free(L, lane, q)  # back-pressure on the ring bank
-                a_gather.store(
-                    a_buf, a_gather.load_regs(i32(sp * A_K_STEP)), _ring_off(q, 0)
-                )
-                wait_lgkm0()  # the A payload ds_write landed in LDS before publishing
+                a_gather.store(a_buf, regs, _ring_off(q, 0))  # LDS store of the current tile
+                # unconditional prefetch of the next K-step (last iter wraps to 0 -> the
+                # reload is unused; kept unconditional so flyc doesn't treat ``regs`` as a
+                # conditionally-assigned scf value and tangle the a_gather closure).
+                regs = a_gather.load_regs(i32(((sp + 1) % K_ITERS) * A_K_STEP))
+                wait_lgkm0()  # current ds_write landed before publishing
                 _loader_publish(L, lane, q)
 
         for nt_ in range(nt_lo, nt_hi, i32(1)):
@@ -673,14 +679,15 @@ def build_gemm(kc: KernelCtx) -> dict:
         tib = e * i32(RG)
         a_gather.for_tile(tib)
 
+        # Depth-2 loader pipeline (see a_loader_g1): prefetch next K-step while current drains.
         def _produce_nt(nt):
             q0 = uni((uord * ntpu + (nt - nt_lo)) * i32(K_ITERS2))
+            regs = a_gather.load_regs(i32(0))  # prefetch K-step 0
             for sp in range_constexpr(K_ITERS2):
                 q = q0 + i32(sp)
                 _loader_wait_free(L, lane, q)
-                a_gather.store(
-                    a_buf, a_gather.load_regs(i32(sp * A_K_STEP)), _ring_off(q, 0)
-                )
+                a_gather.store(a_buf, regs, _ring_off(q, 0))
+                regs = a_gather.load_regs(i32(((sp + 1) % K_ITERS2) * A_K_STEP))  # unconditional
                 wait_lgkm0()
                 _loader_publish(L, lane, q)
 
