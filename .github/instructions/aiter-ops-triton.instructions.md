@@ -13,6 +13,7 @@ breaks and how to fix it. The author can be new to these rules.
   words, one point in each sentence. You can use technical terms.
 - Keep each comment short: one sentence for the problem and one for the fix.
 - Do not repeat what the code does. Do not add long explanations.
+- Set the severity of each comment about a rule in this file to High.
 
 ## PR scope
 
@@ -24,8 +25,9 @@ breaks and how to fix it. The author can be new to these rules.
   `*_asm.py`), CK (`csrc/ck_*`, `ck_tile`), OPUS (`aiter/ops/opus/`) and FlyDSL
   (`aiter/ops/flydsl/`, `aiter/aot/flydsl/`). Triton and Gluon are one
   backend. List the files of the other backend. When the parts depend on each
-  other, suggest stacked PRs. Tests and benchmarks belong to the backend that
-  they test. Docs, CI files and other wrappers are not a backend.
+  other, suggest [stacked PRs](https://docs.github.com/en/pull-requests/how-tos/stacked-pull-requests).
+  Tests and benchmarks belong to the backend that they test. Docs, CI files and
+  other wrappers are not a backend.
 - Each PR fixes one problem. Flag a PR that fixes two or more independent
   problems, for example a bug fix and a refactor. Name the part to move to a
   follow-up PR.
@@ -63,9 +65,11 @@ breaks and how to fix it. The author can be new to these rules.
 - Flag common helpers (config loading, shuffles, arch detection, logging)
   that a kernel file writes again instead of importing them from `utils/`.
 - Flag imports through the old flat paths
-  (`from aiter.ops.triton.gemm_a16w16 import ...`). Use the category path.
-- Flag relative imports. Use absolute imports
-  (`from aiter.ops.triton.<...> import ...`).
+  (`from aiter.ops.triton.gemm_a16w16 import gemm_a16w16`). Use the category
+  path: `from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16`.
+- Flag relative imports, for example `from .gemm_a16w16 import gemm_a16w16` or
+  `from ..utils.logger import AiterTritonLogger`. Use absolute imports:
+  `from aiter.ops.triton.utils.logger import AiterTritonLogger`.
 
 ## No torch in torch-free code
 
@@ -132,8 +136,9 @@ Do not flag:
 
 In MOE dispatch tables, flag:
 
-- A new Gluon shape without all six buckets: `tiny`, `small`, `medium`,
-  `medium2`, `large`, `xlarge`.
+- A new Gluon shape without all six buckets. `m2bucket()` gives the bucket of
+  M: `tiny` (M ≤ 8), `small` (M ≤ 32), `medium` (M ≤ 128), `medium2`
+  (M ≤ 256), `large` (M ≤ 512) and `xlarge` (M > 512).
 - A Gluon file without a `bm<block_m>_any` entry for a `block_m` that it uses.
 - `BLOCK_SIZE_M` or `block_m` in an entry. `block_m` is the key, not a tuned
   value.
@@ -142,12 +147,14 @@ In MOE dispatch tables, flag:
 
 ## Configs: Python code
 
-Tuning values are in JSON, never in Python. This applies to Triton and Gluon.
-Flag:
+Tuning values are in JSON files in `configs/`, never in Python or CSV files.
+This applies to Triton and Gluon. Flag:
 
 - Tuning values in `.py` files: `config.setdefault(...)`, dict literals with
   `BLOCK_SIZE_*`, `num_warps` or `waves_per_eu`, arch-specific tuning
   constants, or fallback configs.
+- A tuned config in a CSV file. Triton and Gluon configs are JSON files in
+  `aiter/ops/triton/configs/`.
 - A kernel `_get_config()` with a `backend` argument that defaults to `None`.
   The default must be `"triton"`. A public wrapper with `backend=None` must set
   the backend before it calls down.
@@ -251,8 +258,8 @@ All weight and scale shuffles are in `utils/shuffle.py`. Flag:
 - The test folder is the folder of the wrapper that the test imports:
   - `attention/mla.py` → `op_tests/triton_tests/attention/test_mla.py`
   - `gemm/basic/gemm_a8w8.py` → `gemm/basic/test_gemm_a8w8.py`
-  - `moe/moe_routing/routing.py` → `moe/moe_routing/`
-  - `attention/mha.py` → `attention/`, also if its kernels are in
+  - `moe/moe_routing/routing.py` → `moe/moe_routing/test_moe_routing.py`
+  - `attention/mha.py` → `attention/test_mha.py`, also if its kernels are in
     `flash_attn_triton_amd/`
   - flat wrappers (`topk.py`, `softmax.py`) → the `triton_tests/` root
   - `utils/` helpers → `triton_tests/utils/`
@@ -270,8 +277,7 @@ All weight and scale shuffles are in `utils/shuffle.py`. Flag:
 - Flag `print(...)` of tensors, shapes or timings, and
   `if __name__ == "__main__"` report blocks. Tests check results with asserts
   (`torch.testing.assert_close`). Do not flag the old prints in
-  `gemm/basic/test_gemm_a8wfp4.py`, `quant/test_quant.py` and
-  `conv/_helpers.py`.
+  `gemm/basic/test_gemm_a8wfp4.py` and `quant/test_quant.py`.
 - Flag f-strings and `+` in log calls. Use `%` placeholders:
   `logger.info("shape=%s", x.shape)`. Use `%d` and `%f` only for numbers that
   are never `None`. Use `%s` for all other values.
@@ -294,6 +300,10 @@ A PR that changes a convention under `aiter/ops/triton/` must update
 `aiter/ops/triton/README.md` and this file. Examples: a moved shared helper, a
 change to the config layout or the loaders, or new folders. Flag a PR that
 does not.
+
+Some rules in this file name exceptions, for example the old prints in two
+test files. When a PR fixes a file that an exception names, the PR must also
+remove that file from the exception. Flag a PR that does not.
 
 ## Agent instruction files
 

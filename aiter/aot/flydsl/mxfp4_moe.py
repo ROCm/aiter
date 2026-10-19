@@ -45,7 +45,6 @@ if os.path.exists(_ACTIVE_FMOE_CSV) and _ACTIVE_FMOE_CSV not in DEFAULT_CSVS:
 
 # Mirror the runtime gate so the default build skips the opt-in mxfp4-out path.
 _MXFP4_INTERMEDIATE = os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") not in ("0", "")
-_STAGE2_FP8_ROUTE_OUT = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
 # Mirror the runtime epilogue policy: atomic stage2 rows launch as their reduce
 # sibling, so the AOT cache has to be keyed on the kernel that actually runs.
 _ATOMIC_STAGE2 = atomic_stage2_opt_in()
@@ -167,7 +166,7 @@ def parse_csv(csv_path):
             if not _ATOMIC_STAGE2:
                 # Same policy get_2stage_cfgs applies at runtime: a tuned atomic
                 # layout-v2 row dispatches its reduce sibling, so precompile that
-                # name -- the epilogue also decides the fp8 route-out below.
+                # name instead of the epilogue that will never run.
                 kn2 = deterministic_v2_gemm2_name(kn2) or kn2
             v2_g2 = parse_flydsl_v2_gemm2_kernel(kn2)
             if v2_g2 is not None:
@@ -227,11 +226,7 @@ def parse_csv(csv_path):
 
             if v2_g2 is not None:
                 bm = v2_g2["tile_m"]
-                out_dtype = (
-                    "fp8"
-                    if v2_g2["epilog"] == "reduce" and _STAGE2_FP8_ROUTE_OUT
-                    else "bf16"
-                )
+                out_dtype = "bf16"
                 bias_supported = (
                     row.get("q_type", "").strip().split(".")[-1] == "per_1x32"
                     and row.get("dtype", "") in ("torch.bfloat16", "torch.float16")
