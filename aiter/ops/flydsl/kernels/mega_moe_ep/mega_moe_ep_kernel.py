@@ -46,8 +46,10 @@ from .mega_moe_ep_config import (
     C_BARCNT,
     C_BARGEN,
     C_PLAN,
+    NLOAD,
     NT,
     NTT,
+    RC_INTS,
     kernel_config,
 )
 from .schedule import build_schedule
@@ -95,7 +97,9 @@ def compile_mega_moe_ep(
     kc.add(build_schedule(kc))
     name, LDS_BYTES = kc.get("name LDS_BYTES")
     NBW, L_DYN, L_DCNT, L_CTL = kc.get("NBW L_DYN L_DCNT L_CTL")
+    L_RCTL = kc.get("L_RCTL")[0]
     compute_units, dispatch_send = kc.get("compute_units dispatch_send")
+    a_loader_units = kc.get("a_loader_units")[0]
     combine_final, barrier_init = kc.get("combine_final barrier_init")
 
     @flyc.jit
@@ -106,6 +110,9 @@ def compile_mega_moe_ep(
             lds_st(L, L_DYN + i32(s_) * i32(4), i32(0))
         for s_ in range(tid, i32(EPR), i32(NTT)):
             lds_st(L, L_DCNT + i32(s_) * i32(4), i32(0))
+        # zero the A-loader ring counters (RC_ASEQ / RC_AFREE per bank + the go flags)
+        for s_ in range(tid, i32(RC_INTS), i32(NTT)):
+            lds_st(L, L_RCTL + i32(s_) * i32(4), i32(0))
         if tid == i32(0):
             lds_st(L, L_CTL + C_BARCNT * 4, i32(0))
             lds_st(L, L_CTL + C_BARGEN * 4, i32(0))
@@ -123,7 +130,9 @@ def compile_mega_moe_ep(
             compute_units(L, tid, a)  # P==1; pass 3 in-band at P>1)
         elif tid < i32(B_LOADER):  # [NT, NT+64): a2a dispatch scatter (input)
             dispatch_send(L, tid % i32(64), a)
-        # [NT+64, NTT): idle -- combine no longer needs a comm band (fused into GEMM2)
+        elif tid < i32(B_LOADER + NLOAD):  # A-loader: stage GEMM1 A into the NAB-bank ring
+            a_loader_units(L, tid, a)
+        # [B_LOADER+NLOAD, NTT): idle
 
     Shared = fx.struct(
         type(

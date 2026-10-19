@@ -81,13 +81,17 @@ NT = NW * 64  # 256 compute threads
 NTT = NT + 4 * 64  # 512 threads (8 waves): 4 compute + dispatch + loader + 2 combine
 
 # Role bands by tid (see mega_moe_ep_kernel.roles):
-#   [0, NT)              compute_units (local-expert GEMM1 + act + GEMM2) + comm_help
-#   [NT, NT+64)          dispatch_send (a2a scatter tokens to expert-owner ranks)
-#   [NT+64, NT+128)      a_loader (stage dispatched tokens to LDS)
-#   [NT+128, NTT)        combine_send (scatter partials back to source) + comm_help
+#   [0, NT)                   compute_units (local-expert GEMM1 + act + GEMM2)
+#   [NT, NT+64)               dispatch_send (a2a scatter tokens to expert-owner ranks)
+#   [B_LOADER, B_LOADER+NLOAD) a_loader (TP-style: stage A K-tiles into the NAB-bank ring)
+#   [B_LOADER+NLOAD, NTT)     idle
 B_DISPATCH = NT
 B_LOADER = NT + 64
 B_COMBINE = NT + 128
+# The dedicated A-loader occupies NLOAD_W waves starting at B_LOADER (producer of the
+# NAB-bank A-ring the compute waves consume); more waves = more A-staging throughput.
+NLOAD_W = 1
+NLOAD = NLOAD_W * 64
 
 # GEMM geometry (the compute waves reuse the mega_moe stage1/stage2 MFMA atoms; see
 # gemm.py). The GEMM runs on the NW=4 compute waves (NT=256 threads). TILE_K is the
@@ -96,6 +100,10 @@ B_COMBINE = NT + 128
 KCS = 2  # A K-chunks staged together
 TILE_K = 256
 TILE_N = 256
+# A-ring banks for the TP-style dedicated A-loader prefetch (producer/consumer depth):
+# the GEMM1/GEMM2 compute waves read A K-tiles from this many LDS banks while the loader
+# wave stages the next ones ahead.  >=2 (double-buffer); bounded by the LDS budget.
+NAB = 4
 
 # Up to this many received (token, expert) pairs per rank use the dynamic planner
 # (the one ported here); larger batches want an LB-style two-phase planner (future).
@@ -156,6 +164,18 @@ C_UNIT = 12  # [C_UNIT, C_UNIT+1): this CTA's unit range [lo, hi)
 C_UL = 16  # per-CTA unit list base (records of 4 ints: expert_chunk, i0, icnt, kind)
 UL_MAX = (128 - C_UL) // 4
 
+# A-loader ring (producer/consumer) control slots, in their OWN LDS region ``L_RCTL`` so
+# the NAB per-bank counters don't crowd the unit-list area of ``L_CTL``.  The dedicated
+# loader wave publishes RC_ASEQ[bank] (an A K-tile is staged) and spins on RC_AFREE[bank]
+# (all NW compute waves released that bank's prior generation); the compute waves spin on
+# RC_ASEQ before reading and bump RC_AFREE after consuming.  RC_G1GO/RC_G2GO are the
+# per-pass go flags (compute sets them once the A source for that GEMM is live).
+RC_ASEQ = 0  # [RC_ASEQ, RC_ASEQ + NAB): produced seq (monotonic tile count) per ring bank
+RC_AFREE = NAB  # [RC_AFREE, RC_AFREE + NAB): consumer release count per ring bank
+RC_G1GO = 2 * NAB  # GEMM1 A-stream go (compute sets it after dispatch_wait + gather)
+RC_G2GO = 2 * NAB + 1  # GEMM2 A-stream go (Stage 2)
+RC_INTS = 2 * NAB + 8  # ints in L_RCTL (headroom for future loader bookkeeping)
+
 ACT_SET = ("silu", "situv2")
 
 
@@ -196,7 +216,10 @@ def mega_moe_ep_consts(
     # the pool uses the GEMM2 cshuffle (RG*TILE_N*4), which also fits GEMM1's.
     a_k_step = TILE_K if a8 else TILE_K // 2
     a_lds_size = RG * a_k_step
-    lds_pool = max(2 * a_lds_size, RG * TILE_N * 4)
+    # The A pool is the NAB-bank A-ring (TP-style prefetch); it must also fit the cshuffle
+    # C-tile that currently aliases it (RG*TILE_N f32).  The dedicated-loader milestone
+    # moves the C-tile to its own region so the ring can run ahead of the epilogue.
+    lds_pool = max(NAB * a_lds_size, RG * TILE_N * 4)
     c = {
         "RG": RG,
         "A_ROW": a_row,
@@ -214,6 +237,7 @@ def mega_moe_ep_consts(
         "A_K_STEP": a_k_step,
         "K_ITERS": H // TILE_K,
         "A_LDS_I32": a_lds_size // 4,
+        "NAB": NAB,
     }
     off = 0
 
@@ -228,8 +252,13 @@ def mega_moe_ep_consts(
     # full RG x inter tile would blow the 160 KB budget for FP8. The cshuffle epilogue
     # aliases the A pool (compile_gemm1 pattern); GEMM2 reads the intermediate from
     # global. TODO(tune): keep it per-inter-piece in LDS to drop the global round-trip.
-    c["L_A"] = take(lds_pool)  # A K-tile double-buffer | cshuffle epilogue (aliased)
-    c["L_AS"] = take(RG * a_scale)  # A-scale (E8M0) of one row tile
+    c["L_A"] = take(lds_pool)  # A NAB-bank ring (GEMM1 loader) | GEMM2 A + cshuffle alias
+    c["L_AS"] = take(RG * a_scale)  # A-scale (E8M0) of one row tile (compute-side stage)
+    # GEMM1's cshuffle C-tile gets its OWN region: the A-loader runs ahead into the L_A
+    # ring during the epilogue, so the C-tile can no longer alias L_A (it still aliases
+    # L_A in GEMM2, which has no loader yet).  Sized for the larger GEMM2 cshuffle too.
+    c["L_C"] = take(RG * TILE_N * 4)
+    c["L_RCTL"] = take(RC_INTS * 4)  # A-loader ring counters (RC_* slots)
     # dynamic planner tables
     c["L_DYN"] = take((2 * NBW + EPR) * 4)  # bitmap words | prefix words | dense list
     c["L_DCNT"] = take(EPR * 4)  # received rows per local expert
@@ -276,10 +305,12 @@ def kernel_config(
     L_A, L_AS = c["L_A"], c["L_AS"]
     L_DYN, L_DCNT, L_WSUM = c["L_DYN"], c["L_DCNT"], c["L_WSUM"]
     L_DCH, L_EOFF, L_RIX, L_CTL = c["L_DCH"], c["L_EOFF"], c["L_RIX"], c["L_CTL"]
+    L_C, L_RCTL = c["L_C"], c["L_RCTL"]
     KS1, KS2, G2 = c["KS1"], c["KS2"], c["G2"]
     CH1, CH2, M_REPEAT = c["CH1"], c["CH2"], c["M_REPEAT"]
     N_TILES, NUM_ACC_N = c["N_TILES"], c["NUM_ACC_N"]
     A_K_STEP, K_ITERS, A_LDS_I32 = c["A_K_STEP"], c["K_ITERS"], c["A_LDS_I32"]
+    NAB = c["NAB"]
     # GEMM1 inter-piece choices the planner balances over. BRING-UP: fixed at P=1 (no
     # inter split). unit_tile fuses GEMM1->GEMM2 per unit and GEMM2 contracts the full
     # inter dim, so one unit must own the whole inter dim; P>1 would feed GEMM2 an

@@ -73,13 +73,17 @@ class ATileLoader:
         row_map_rsrc=None,
         source_rows=0,
         a_dtype="fp8",
+        tid_override=None,
     ):
         self._sort_block_m = sort_block_m
         self._k_step_bytes = k_step_bytes
         self._total_threads = total_threads
         self._swizzle = swizzle
         self._row_bytes = row_bytes
-        self._tx = fx.thread_idx.x
+        # ``tid_override`` lets a dedicated loader wave (logical lanes 0..total_threads-1)
+        # drive the identical swizzle/gather the compute side reads back, instead of the
+        # physical ``thread_idx.x`` -- used by the EP A-loader; None keeps V2 behaviour.
+        self._tx = fx.thread_idx.x if tid_override is None else tid_override
         self._wave = self._tx // 64
         self._x_tensor = x_tensor
         self._async_copy = bool(async_copy)
