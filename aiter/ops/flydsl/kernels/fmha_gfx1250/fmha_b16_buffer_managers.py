@@ -13,11 +13,28 @@ the kernel; the facts intrinsic to the managed layout live below as private cons
 The ``16b`` suffix names the element width: every swizzle here assumes a ``b128 == 8``
 element chunk. An 8-bit (fp8) variant would need its own manager family.
 
-Contents: ``{Q,K,V,O}Manager16bV{1,2}`` plus ``OManager16bV3`` — V1 stages through
-``cluster_load_async_to_lds_b128``, V2 through TDM (hardware OOB), V3 writes O back with
-``global_store_async_from_lds_b128``. The K/V pairs are one class each plus a transport
-mixin: V2 *inherits* V1 and overrides only ``load_descriptor`` (see the K/V staging
-section). Q and O keep independent V1/V2. Each class's docstring has the details.
+Contents
+--------
+``QManager16bV1``  Q global->LDS->VGPR, ``cluster_load_async_to_lds_b128`` into a ring
+                   of ``lds_tiles`` slots shared by all waves.
+``QManager16bV2``  same fragments, but each wave TDM-copies its own rows into a private
+                   LDS region -- no ring and no cross-wave sync.
+``KManager16bV1``  K staging plus the ``ds_load_b128`` B-fragment read; the whole block's
+                   addresses collapse to 2 base pointers plus compile-time immediates.
+``KManager16bV2``  K with the TDM transport (hardware OOB, row-major padded LDS). Inherits
+                   V1 and overrides only ``load_descriptor``.
+``VManager16bV1``  V staging plus the **transpose** read: PV contracts over kv, so the
+                   fragment comes from ``ds_load_tr16_b128``, not K's natural load.
+``VManager16bV2``  V with the TDM transport; same inherit-and-override shape as K.
+``OManager16bV1``  O epilogue: fp32 accumulator -> bf16 -> LDS -> VGPR re-read ->
+                   ``buffer_store``.
+``OManager16bV2``  O staged padded in LDS and written with ONE TDM store descriptor.
+``OManager16bV3``  O staged the same way but written per-b128 with
+                   ``global_store_async_from_lds_b128``, so it addresses each packed row
+                   itself and serves any gqa.
+
+``_AsyncTransport`` / ``_TdmTransport`` are the two global->LDS transports the K/V pairs
+mix in. Each class's docstring has the details.
 
 Target: gfx1250 (MI400 / mi450), wave32, 8 waves per threadgroup (256 threads).
 """

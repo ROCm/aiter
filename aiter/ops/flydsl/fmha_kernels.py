@@ -3,7 +3,7 @@
 
 """High-level FlyDSL Flash Attention APIs.
 
-``flydsl_flash_attn_batch_func`` / ``flydsl_flash_attn_varlen_func`` dispatch by
+``flydsl_flash_attn_batch_fwd`` / ``flydsl_flash_attn_varlen_fwd`` dispatch by
 arch and dtype: gfx950 fp8 to ``kernels/fmha_gfx950``, gfx1250 bf16/f16 to the
 m32x8 prefill kernel, anything else ``None`` so the caller falls through to
 CK/Triton.
@@ -44,10 +44,10 @@ from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
 )
 
 __all__ = [
-    "flydsl_flash_attn_batch_func",
+    "flydsl_flash_attn_batch_fwd",
     "flydsl_flash_attn_func",
     "flydsl_flash_attn_varlen_bwd",
-    "flydsl_flash_attn_varlen_func",
+    "flydsl_flash_attn_varlen_fwd",
 ]
 
 
@@ -309,7 +309,7 @@ def _fp8_gfx950_supported(
     )
 
 
-def flydsl_flash_attn_varlen_func(
+def flydsl_flash_attn_varlen_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -440,7 +440,7 @@ def flydsl_flash_attn_varlen_func(
     )
 
 
-def flydsl_flash_attn_batch_func(
+def flydsl_flash_attn_batch_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,

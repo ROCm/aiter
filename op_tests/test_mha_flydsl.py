@@ -752,7 +752,7 @@ def check_routing_declines():
     v = torch.randn(L, H_kv, D, dtype=dtypes.bf16, device=dev)
 
     served = {}
-    real = fk.flydsl_flash_attn_varlen_func
+    real = fk.flydsl_flash_attn_varlen_fwd
 
     def spy(*a, **kw):
         out = real(*a, **kw)
@@ -761,11 +761,11 @@ def check_routing_declines():
 
     def ran_on_flydsl(**kw):
         served.clear()
-        fk.flydsl_flash_attn_varlen_func = spy
+        fk.flydsl_flash_attn_varlen_fwd = spy
         try:
             flash_attn_varlen_func(q, k, v, cu, cu, L, L, causal=True, **kw)
         finally:
-            fk.flydsl_flash_attn_varlen_func = real
+            fk.flydsl_flash_attn_varlen_fwd = real
         return served.get("hit", False)
 
     assert ran_on_flydsl(), "baseline d64/64 should be served by m32x8"

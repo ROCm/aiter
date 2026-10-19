@@ -1135,12 +1135,12 @@ def _fp8_dispatch_inputs(B=2, S=1024, H=8, D=128, varlen=False, Skv=None):
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("softmax_scale", [None, 0.37])
 def test_fp8_dispatch_batch_routes_to_gfx950(causal, softmax_scale):
-    """``flydsl_flash_attn_batch_func`` must route BSHD fp8 to the gfx950 kernel."""
-    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_func
+    """``flydsl_flash_attn_batch_fwd`` must route BSHD fp8 to the gfx950 kernel."""
+    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_fwd
 
     B, S, H, D = 2, 1024, 8, 128
     q, k, v, d = _fp8_dispatch_inputs(B, S, H, D)
-    out = flydsl_flash_attn_batch_func(
+    out = flydsl_flash_attn_batch_fwd(
         q, k, v, causal=causal, softmax_scale=softmax_scale, **d
     )
     assert out is not None, "gfx950 fp8 must not fall through to CK/Triton"
@@ -1163,13 +1163,13 @@ def test_fp8_dispatch_batch_routes_to_gfx950(causal, softmax_scale):
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("softmax_scale", [None, 0.37])
 def test_fp8_dispatch_varlen_routes_to_gfx950(causal, softmax_scale):
-    """``flydsl_flash_attn_varlen_func`` must route packed THD fp8 to gfx950."""
-    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
+    """``flydsl_flash_attn_varlen_fwd`` must route packed THD fp8 to gfx950."""
+    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_varlen_fwd
 
     B, S, H, D = 2, 1024, 8, 128
     q, k, v, d = _fp8_dispatch_inputs(B, S, H, D, varlen=True)
     cu = torch.tensor([0, 400, B * S], dtype=torch.int32, device="cuda")
-    out = flydsl_flash_attn_varlen_func(
+    out = flydsl_flash_attn_varlen_fwd(
         q,
         k,
         v,
@@ -1229,7 +1229,7 @@ def test_fp8_dispatch_rejects_unsupported(unsupported):
     Falling through is what lets the caller reach CK/Triton; raising or silently
     dropping the feature would both be wrong.
     """
-    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_func
+    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_fwd
 
     B, S, H, D = 2, 512, 8, 128
     q, k, v, d = _fp8_dispatch_inputs(B, S, H, D)
@@ -1244,7 +1244,7 @@ def test_fp8_dispatch_rejects_unsupported(unsupported):
     if not unsupported:  # the no_descales case
         kw = {}
 
-    assert flydsl_flash_attn_batch_func(q, k, v, causal=True, **kw) is None
+    assert flydsl_flash_attn_batch_fwd(q, k, v, causal=True, **kw) is None
 
 
 @_gfx950_only
@@ -1312,12 +1312,12 @@ def test_fp8_dispatch_rejects_descale_on_another_device():
     if torch.cuda.device_count() < 2:
         pytest.skip("requires >=2 visible GPUs")
 
-    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_func
+    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_fwd
 
     B, S, H, D = 2, 512, 8, 128
     q, k, v, d = _fp8_dispatch_inputs(B, S, H, D)
     d["q_descale"] = d["q_descale"].to("cuda:1")
-    assert flydsl_flash_attn_batch_func(q, k, v, causal=True, **d) is None
+    assert flydsl_flash_attn_batch_fwd(q, k, v, causal=True, **d) is None
 
 
 @_gfx950_only
@@ -1575,15 +1575,13 @@ def test_fp8_varlen_zero_length_kv_entry(causal, vl_q, vl_kv):
 def test_fp8_dispatch_return_lse(causal):
     """``return_lse`` now routes to gfx950 fp8 instead of falling through."""
     from aiter.ops.flydsl.fmha_kernels import (
-        flydsl_flash_attn_batch_func,
-        flydsl_flash_attn_varlen_func,
+        flydsl_flash_attn_batch_fwd,
+        flydsl_flash_attn_varlen_fwd,
     )
 
     B, S, H, D = 2, 1024, 8, 128
     q, k, v, d = _fp8_dispatch_inputs(B, S, H, D)
-    out, lse = flydsl_flash_attn_batch_func(
-        q, k, v, causal=causal, return_lse=True, **d
-    )
+    out, lse = flydsl_flash_attn_batch_fwd(q, k, v, causal=causal, return_lse=True, **d)
     assert out.shape == (B, S, H, D)
     assert lse.shape == (B, H, S)
     ref = _ref_lse(
@@ -1593,7 +1591,7 @@ def test_fp8_dispatch_return_lse(causal):
 
     qv, kv, vv, dv = _fp8_dispatch_inputs(B, S, H, D, varlen=True)
     cu = torch.tensor([0, 400, B * S], dtype=torch.int32, device="cuda")
-    out_v, lse_v = flydsl_flash_attn_varlen_func(
+    out_v, lse_v = flydsl_flash_attn_varlen_fwd(
         qv,
         kv,
         vv,
@@ -1612,22 +1610,22 @@ def test_fp8_dispatch_return_lse(causal):
 @_gfx950_only
 def test_fp8_dispatch_rejects_bf16_inputs():
     """bf16 on gfx950 has no FlyDSL kernel here and must fall through."""
-    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_func
+    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_fwd
 
     q = torch.randn(2, 512, 8, 128, device="cuda", dtype=torch.bfloat16)
-    assert flydsl_flash_attn_batch_func(q, q.clone(), q.clone(), causal=True) is None
+    assert flydsl_flash_attn_batch_fwd(q, q.clone(), q.clone(), causal=True) is None
 
 
 @_gfx950_only
 def test_fp8_dispatch_matches_direct_call():
     """The dispatch wrapper must not perturb the kernel it routes to."""
-    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_func
+    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_fwd
     from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
         flydsl_flash_attn_fp8_func,
     )
 
     q, k, v, d = _fp8_dispatch_inputs()
-    via_dispatch = flydsl_flash_attn_batch_func(q, k, v, causal=True, **d)
+    via_dispatch = flydsl_flash_attn_batch_fwd(q, k, v, causal=True, **d)
     direct = flydsl_flash_attn_fp8_func(q, k, v, causal=True, **d)
     torch.cuda.synchronize()
     torch.testing.assert_close(via_dispatch.float(), direct.float(), rtol=0, atol=0)
@@ -1837,9 +1835,9 @@ def test_fp8_softmax_scale_cpu_dispatch_contract(monkeypatch, varlen, scale, val
                 "max_seqlen_kv": 70,
                 "cross_seqlen": False,
             }
-            out = dispatch.flydsl_flash_attn_varlen_func(q, k, v, cu, cu, 70, 70, **kw)
+            out = dispatch.flydsl_flash_attn_varlen_fwd(q, k, v, cu, cu, 70, 70, **kw)
         else:
-            out = dispatch.flydsl_flash_attn_batch_func(q, k, v, **kw)
+            out = dispatch.flydsl_flash_attn_batch_fwd(q, k, v, **kw)
         if not valid:
             assert out is None
             with pytest.raises(
