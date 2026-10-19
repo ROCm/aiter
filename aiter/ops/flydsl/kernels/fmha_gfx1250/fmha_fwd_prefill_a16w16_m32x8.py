@@ -56,10 +56,10 @@ from ..kernels_common import LOG2E
 from ..tensor_shim import _run_compiled
 
 # Single source of truth for gfx1250 Expert Scheduling Mode 2 (DEP_MODE=2). Lives
-# in fmha_b16_buffer_managers. Under mode 2 the LLVM setreg (via the
+# in fmha_buffer_managers. Under mode 2 the LLVM setreg (via the
 # amdgpu-expert-scheduling-mode hint, set in _ensure_*_kernel) makes LLVM insert all
 # depctr covers itself for the plain intrinsics the kernel emits.
-from .fmha_b16_buffer_managers import (
+from .fmha_buffer_managers import (
     ENABLE_SCHED_MODE2,
     KManager16bV1,
     KManager16bV2,
@@ -231,7 +231,7 @@ PVQK_LAG = 2
 PVQK_HEAD_CARRY = 20
 
 # NOTE: the remaining tiling constants (chunk sizes, K/V write-tile + V swizzle
-# granularity) live inside fmha_b16_buffer_managers.py — they are intrinsic to the
+# granularity) live inside fmha_buffer_managers.py — they are intrinsic to the
 # managers' LDS layouts, so the kernel no longer declares them here.
 
 
