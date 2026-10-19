@@ -296,9 +296,13 @@ def kernel_unified_attention_2d(
 
         for j in range(tile_start, unmasked_tile_end):
             seq_offset = j * TILE_SIZE + offs_t
+            # Async copy ignores a mask that has no lower bound.
+            in_range = seq_offset >= 0
 
             physical_block_idx = tl.load(
-                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE,
+                mask=in_range,
+                other=0,
             ).to(tl.int64)
             v_offset = (
                 physical_block_idx[:, None] * stride_v_cache_0
@@ -315,7 +319,7 @@ def kernel_unified_attention_2d(
 
             K_load = tl.load(
                 key_cache_ptr + k_offset,
-                mask=dim_mask[:, None],
+                mask=dim_mask[:, None] & in_range[None, :],
                 other=0.0,
                 cache_modifier=KV_cache_modifier,
             )
@@ -323,7 +327,7 @@ def kernel_unified_attention_2d(
 
             V_load = tl.load(
                 value_cache_ptr + v_offset,
-                mask=dim_mask[None, :],
+                mask=dim_mask[None, :] & in_range[:, None],
                 other=0.0,
                 cache_modifier=KV_cache_modifier,
             )
@@ -361,11 +365,8 @@ def kernel_unified_attention_2d(
 
     for j in range(masked_tile_start, tile_end):
         seq_offset = j * TILE_SIZE + offs_t
-        # to reduce the masking effect when not needed
-        if TILE_SIZE == BLOCK_SIZE:
-            tile_mask = tl.full((1,), 1, dtype=tl.int1)
-        else:
-            tile_mask = seq_offset < max_seq_prefix_len
+        # Async copy ignores a mask that has no lower bound.
+        tile_mask = (seq_offset >= 0) & (seq_offset < max_seq_prefix_len)
 
         k_mask = None
         v_mask = None
@@ -386,8 +387,11 @@ def kernel_unified_attention_2d(
                 + offs_shfl
             )
         else:
+            # Masked-off lanes still compute a KV address; keep it on a real page.
             physical_block_idx = tl.load(
-                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE,
+                mask=tile_mask,
+                other=0,
             ).to(tl.int64)
 
             v_offset = (
@@ -768,10 +772,8 @@ def kernel_unified_attention_3d(
         min((segm_idx + 1) * tiles_per_segment, num_tiles),
     ):
         seq_offset = j * TILE_SIZE + offs_t
-        if TILE_SIZE == BLOCK_SIZE:
-            tile_mask = tl.full((1,), 1, dtype=tl.int1)
-        else:
-            tile_mask = seq_offset < max_seq_prefix_len
+        # Async copy ignores a mask that has no lower bound.
+        tile_mask = (seq_offset >= 0) & (seq_offset < max_seq_prefix_len)
 
         k_mask = None
         v_mask = None
@@ -792,8 +794,11 @@ def kernel_unified_attention_3d(
                 + offs_shfl
             )
         else:
+            # Masked-off lanes still compute a KV address; keep it on a real page.
             physical_block_idx = tl.load(
-                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE,
+                mask=tile_mask,
+                other=0,
             ).to(tl.int64)
 
             v_offset = (
