@@ -469,37 +469,44 @@ def build_gemm(kc: KernelCtx) -> dict:
             b_row = wave_id * i32(n_per_wave) + nt * i32(TILE_N)
             q0 = uni((uord * ntpu + (nt - nt_lo)) * i32(K_ITERS))  # running ring-tile base
             _ring_wait(L, tid, q0)  # wait the loader staged A K-step 0
-            b_prev = b_loader.load_step(b_row, i32(0))
+            # Deep (2-step) weight prefetch: prime W for K-steps 0,1, then each steady step
+            # MFMAs W[sp] (loaded 2 steps earlier) while prefetching W[sp+2] -> hides 2 MFMA
+            # steps of weight-load latency at 1 wave/SIMD (vs call_pipe_am's 1 step).  A is
+            # still ring-fed; no per-K-step cbar (waves drift, RC ring syncs A; re-sync at the
+            # pre-epilogue cbar).  The last 2 K-steps just consume the primed W (no W loads).
+            b_a = b_loader.load_step(b_row, i32(0))
+            b_b = b_loader.load_step(b_row, i32(1))
             acc = [mfma_gu.zero_value for _ in range(N_ACC)]
-            for sp in range_constexpr(K_ITERS - 1):
+            for sp in range_constexpr(K_ITERS - 2):
                 cur_off = _ring_off(q0, sp)
-                spn = sp + 1
                 sb = b_scale.load_step(b_row, i32(sp))
                 sa = a_scale.load_step(a_scale_lds, i32(sp))
 
                 def _al(mi, ks, _b=cur_off):
                     return a_s2r.load_operand(a_buf, mi, ks, _b)
 
-                def _ln(ni, _k=spn, _br=b_row):
+                def _ln(ni, _k=sp + 2, _br=b_row):
                     return b_loader.load_ni(_br, ni, i32(_k))
 
-                acc, b_prev = mfma_gu.call_pipe_am(_al, b_prev, acc, sa, sb, _ln)
+                acc, b_new = mfma_gu.call_pipe_am(_al, b_a, acc, sa, sb, _ln)
                 _ring_release(L, tid, q0 + i32(sp))  # done reading A K=sp
-                _ring_wait(L, tid, q0 + i32(spn))  # wait A K=sp+1 staged
-                # No per-K-step cbar: A is loader-produced (RC_ASEQ/RC_AFREE ring sync) and
-                # call_pipe has no cross-wave LDS write, so the 4 compute waves drift freely
-                # (ring back-pressure bounds the drift to <=NAB K-steps) -> their load stalls
-                # interleave and fill the MFMA pipe at 1 wave/SIMD.  Waves re-sync at the
-                # pre-epilogue cbar below.
-            final_off = _ring_off(q0, K_ITERS - 1)
+                _ring_wait(L, tid, q0 + i32(sp + 1))  # wait A K=sp+1 staged
+                b_a, b_b = b_b, b_new  # rotate the 2-deep weight pipe
+            for ts in range_constexpr(K_ITERS - 2, K_ITERS):  # tail: consume primed W
+                t_off = _ring_off(q0, ts)
 
-            def _alf(mi, ks, _b=final_off):
-                return a_s2r.load_operand(a_buf, mi, ks, _b)
+                def _alt(mi, ks, _b=t_off):
+                    return a_s2r.load_operand(a_buf, mi, ks, _b)
 
-            sb = b_scale.load_step(b_row, i32(K_ITERS - 1))
-            sa = a_scale.load_step(a_scale_lds, i32(K_ITERS - 1))
-            acc = mfma_gu.call_pipe_am_final(_alf, b_prev, acc, sa, sb)
-            _ring_release(L, tid, q0 + i32(K_ITERS - 1))  # done reading the final A K-step
+                acc = mfma_gu.call(
+                    _alt, b_a, acc,
+                    a_scale.load_step(a_scale_lds, i32(ts)),
+                    b_scale.load_step(b_row, i32(ts)),
+                )
+                _ring_release(L, tid, q0 + i32(ts))  # done reading A K=ts
+                if ts < K_ITERS - 1:
+                    _ring_wait(L, tid, q0 + i32(ts + 1))
+                    b_a = b_b  # advance to the last primed W
             cbar(L, tid)
             _epilogue(L, tid, acc, nt, cptr, r_inter, r_inters, e)
 
@@ -604,33 +611,41 @@ def build_gemm(kc: KernelCtx) -> dict:
             b_row = wave_id * i32(n_per_wave2) + nt * i32(TILE_N2)
             q0 = uni((uord * ntpu + (nt - nt_lo)) * i32(K_ITERS2))  # running ring-tile base
             _ring_wait(L, tid, q0)  # wait the loader staged inter K-step 0
-            b_prev = b_loader.load_step(b_row, i32(0))
+            # Deep (2-step) weight prefetch (see gemm1): prime W[0],W[1], steady MFMAs W[sp]
+            # while prefetching W[sp+2]; the tail 2 K-steps consume the primed W (no W loads).
+            b_a = b_loader.load_step(b_row, i32(0))
+            b_b = b_loader.load_step(b_row, i32(1))
             acc = [mfma_gu.zero_value for _ in range(N_ACC2)]
-            for sp in range_constexpr(K_ITERS2 - 1):
+            for sp in range_constexpr(K_ITERS2 - 2):
                 cur_off = _ring_off(q0, sp)
-                spn = sp + 1
                 sb = b_scale.load_step(b_row, i32(sp))
                 sa = a_scale.load_step(a_scale_lds, i32(sp))
 
                 def _al(mi, ks, _b=cur_off):
                     return a_s2r.load_operand(a_buf, mi, ks, _b)
 
-                def _ln(ni, _k=spn, _br=b_row):
+                def _ln(ni, _k=sp + 2, _br=b_row):
                     return b_loader.load_ni(_br, ni, i32(_k))
 
-                acc, b_prev = mfma_gu.call_pipe_am(_al, b_prev, acc, sa, sb, _ln)
+                acc, b_new = mfma_gu.call_pipe_am(_al, b_a, acc, sa, sb, _ln)
                 _ring_release(L, tid, q0 + i32(sp))  # done reading inter K=sp
-                _ring_wait(L, tid, q0 + i32(spn))  # wait inter K=sp+1 staged
-                # No per-K-step cbar (see gemm1): compute waves drift, the RC ring syncs A.
-            final_off = _ring_off(q0, K_ITERS2 - 1)
+                _ring_wait(L, tid, q0 + i32(sp + 1))  # wait inter K=sp+1 staged
+                b_a, b_b = b_b, b_new  # rotate the 2-deep weight pipe
+            for ts in range_constexpr(K_ITERS2 - 2, K_ITERS2):  # tail: consume primed W
+                t_off = _ring_off(q0, ts)
 
-            def _alf(mi, ks, _b=final_off):
-                return a_s2r.load_operand(a_buf, mi, ks, _b)
+                def _alt(mi, ks, _b=t_off):
+                    return a_s2r.load_operand(a_buf, mi, ks, _b)
 
-            sb = b_scale.load_step(b_row, i32(K_ITERS2 - 1))
-            sa = a_scale.load_step(a_scale_lds, i32(K_ITERS2 - 1))
-            acc = mfma_gu.call_pipe_am_final(_alf, b_prev, acc, sa, sb)
-            _ring_release(L, tid, q0 + i32(K_ITERS2 - 1))  # done reading the final K-step
+                acc = mfma_gu.call(
+                    _alt, b_a, acc,
+                    a_scale.load_step(a_scale_lds, i32(ts)),
+                    b_scale.load_step(b_row, i32(ts)),
+                )
+                _ring_release(L, tid, q0 + i32(ts))  # done reading inter K=ts
+                if ts < K_ITERS2 - 1:
+                    _ring_wait(L, tid, q0 + i32(ts + 1))
+                    b_a = b_b  # advance to the last primed W
             cbar(L, tid)
             epi(acc, nt, cptr)
 
