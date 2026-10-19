@@ -178,6 +178,7 @@ def controlled_mxfp4(
         row: "dict[str, object]",
         candidate: "dict[str, object]",
         args: "SimpleNamespace",
+        **options: "object",
     ) -> "float":
         attempts.append(dict(row))
         candidate.update(us=10.25, us1=10.25, us2=0, err1="0.0%", err2="0.0%")
@@ -443,6 +444,7 @@ def test_failed_retune_preserves_old_winner_and_continues_later_shape(
             row: "dict[str, object]",
             candidate: "dict[str, object]",
             args: "SimpleNamespace",
+            **options: "object",
         ) -> "float":
             if row["token"] == 4:
                 if failure == "exception":
@@ -493,6 +495,7 @@ def test_candidate_order_and_finite_winner_survive_bad_first_timing(
             row: "dict[str, object]",
             candidate: "dict[str, object]",
             args: "SimpleNamespace",
+            **options: "object",
         ) -> "float":
             name = candidate["kernelName1"]
             observed.append(name)

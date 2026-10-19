@@ -106,6 +106,41 @@ def test_cli_retains_tuner_and_grouped_combination_checks(
     assert failure.value.code == 2
 
 
+def test_cli_rejects_fast_scan_with_staged(
+    monkeypatch: "pytest.MonkeyPatch", capsys: "pytest.CaptureFixture[str]"
+) -> "None":
+    with pytest.raises(SystemExit) as failure:
+        parse_cli(
+            monkeypatch,
+            "--mxfp4-flydsl",
+            "--fast-scan",
+            "--mxfp4-search-mode",
+            "staged",
+        )
+    assert failure.value.code == 2
+    assert "--fast-scan applies to prune/full search" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("mode", [None, "prune", "full"])
+def test_cli_accepts_fast_scan_with_prune_and_full(
+    monkeypatch: "pytest.MonkeyPatch", mode: "str | None"
+) -> "None":
+    options = ["--mxfp4-flydsl", "--fast-scan"]
+    if mode is not None:
+        options.extend(["--mxfp4-search-mode", mode])
+    args = parse_cli(monkeypatch, *options)
+    assert args.fast_scan
+    assert args.mxfp4_search_mode == (mode or "prune")
+
+
+def test_tune_rejects_fast_scan_with_staged_before_any_work() -> "None":
+    with devices(("gfx950", 256)):
+        tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
+    args = SimpleNamespace(fast_scan=True, mxfp4_search_mode="staged", mp=1)
+    with pytest.raises(ValueError, match="--fast-scan applies to prune/full"):
+        tuner.tune(moe.pd.DataFrame([shape()]), None, args)
+
+
 def pair_names(rows: "list[dict[str, object]]") -> "list[tuple[str, str]]":
     return [(row["kernelName1"], row["kernelName2"]) for row in rows]
 

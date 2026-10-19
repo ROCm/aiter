@@ -221,6 +221,12 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
             "expert": 8,
             "topk": 2,
             "act_type": "ActivationType.Silu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": 1,
+            "doweight_stage1": 0,
         }
         calls = []
 
@@ -276,6 +282,12 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
             "expert": 8,
             "topk": 2,
             "act_type": "ActivationType.Silu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": 1,
+            "doweight_stage1": 0,
         }
         calls = []
 
@@ -340,6 +352,12 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
             "expert": 8,
             "topk": 2,
             "act_type": "ActivationType.Silu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": 1,
+            "doweight_stage1": 0,
         }
         final_calls = []
 
@@ -487,6 +505,12 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
             "expert": 8,
             "topk": 2,
             "act_type": "ActivationType.Silu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": 1,
+            "doweight_stage1": 0,
         }
         limits = []
 
@@ -634,6 +658,12 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
             "expert": 8,
             "topk": 2,
             "act_type": "ActivationType.Silu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": 1,
+            "doweight_stage1": 0,
         }
         with (
             mock.patch.object(tuner, "_candidate_rows", return_value=candidates),
@@ -681,6 +711,12 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
             "expert": 8,
             "topk": 2,
             "act_type": "ActivationType.Silu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": 1,
+            "doweight_stage1": 0,
         }
         with (
             mock.patch.object(tuner, "_candidate_rows", return_value=candidates),

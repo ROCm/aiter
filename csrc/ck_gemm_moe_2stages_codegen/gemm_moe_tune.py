@@ -685,6 +685,10 @@ class FmoeTuner(TunerCommon):
                 self.parser.error(
                     "--mxfp4-screen-topk requires explicit --mxfp4-search-mode staged"
                 )
+        if args.fast_scan and args.mxfp4_search_mode == "staged":
+            self.parser.error(
+                "--fast-scan applies to prune/full search, not --mxfp4-search-mode staged"
+            )
         args.mxfp4_search_mode = args.mxfp4_search_mode or "prune"
         args.mxfp4_screen_topk = args.mxfp4_screen_topk or 2
         return args
@@ -6670,6 +6674,13 @@ class Mxfp4FlydslTuner(FmoeTuner):
             "--fast-scan-final-iters (default: 5). One additional non-duplicate "
             "accuracy candidate is promoted when available.",
         )
+        for action in self.parser._actions:
+            if action.dest == "timeout":
+                action.help = (
+                    "best-effort per-operation SIGALRM timeout in seconds (default 1800); "
+                    "needs control to return to Python. No parent or shape hard deadline; "
+                    "a still-live permanent hang may wait indefinitely."
+                )
 
     input_metadata: ClassVar[tuple[str, ...]] = ("gate_mode",)
     PROFILE_HELP: ClassVar[str] = (
@@ -6714,15 +6725,6 @@ class Mxfp4FlydslTuner(FmoeTuner):
         self._invocation_configuration(args)
         return super().pre_process(args)
 
-    def _setup_specific_arguments(self) -> "None":
-        super()._setup_specific_arguments()
-        for action in self.parser._actions:
-            if action.dest == "timeout":
-                action.help = (
-                    "best-effort per-operation SIGALRM timeout in seconds (default 1800); "
-                    "needs control to return to Python. No parent or shape hard deadline; "
-                    "a still-live permanent hang may wait indefinitely."
-                )
 
     def _unsupported_row_reason(
         self, row: "Mapping[str, object] | pd.Series"
@@ -8215,6 +8217,14 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
     def tune(self, untunedf, tunedf, args):
         del tunedf
+        if (
+            getattr(args, "fast_scan", False)
+            and getattr(args, "mxfp4_search_mode", "prune") == "staged"
+        ):
+            raise ValueError(
+                "--fast-scan applies to prune/full search, not "
+                "--mxfp4-search-mode staged"
+            )
         self._invocation_configuration(args)
         rows = [row.to_dict() for _, row in untunedf.iterrows()]
 
