@@ -262,6 +262,7 @@ def _fused_decode_sort_quant(
         activation_scale,
     )
 
+
 # Fuse the a8w4 route sort with the per-token MXFP8 activation quant into one
 # launch. The fused kernel sorts in one CTA, so above this many tokens it is no
 # faster than the separate launches (MI355X, Kimi-K3 A8W4 at inter_dim 384 and
