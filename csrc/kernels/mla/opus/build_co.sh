@@ -4,6 +4,9 @@
 #   ninja clang lld clang-offload-bundler llvm-objcopy
 #
 #   PIN_LLVM=/path/to/llvm-project/build/bin ./build_co.sh [name ...]
+#
+# A .cu whose first line is "// build_co.sh flags: <flags>" appends <flags> to the shared flags
+# below; a repeated -mllvm option takes its last value.
 set -euo pipefail
 
 OPUS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,6 +19,7 @@ OUT_DIR="${OUT_DIR:-$AITER/hsa/gfx950/mla_opus}"
 
 for name in "$@"; do
     out="$OUT_DIR/opus_$name.co"
+    own_flags="$(sed -n '1s|^// build_co.sh flags: ||p' "$OPUS/$name.cu")"
     HIP_CLANG_PATH="$PIN_LLVM" /opt/rocm/bin/hipcc -x hip "$OPUS/$name.cu" \
         -I"$AITER/csrc/include" -I"$AITER/csrc/kernels/mla" \
         -std=c++20 -O3 --offload-arch=gfx950 -D__HIPCC_RTC__ \
@@ -23,7 +27,7 @@ for name in "$@"; do
         -mllvm --amdgpu-kernarg-preload-count=32 -mllvm --lsr-drop-solution=1 \
         -mllvm -amdgpu-early-inline-all=true -mllvm -amdgpu-function-calls=false \
         -mllvm -enable-post-misched=0 \
-        -Rpass-analysis=kernel-resource-usage ${EXTRA_FLAGS:-} \
+        $own_flags -Rpass-analysis=kernel-resource-usage ${EXTRA_FLAGS:-} \
         --genco -o "$out" 2>&1 | { grep -E "error|Function Name|VGPRs:|AGPRs:|ScratchSize|Occupancy|SGPRs:" || true; }
     echo "wrote $out"
 done

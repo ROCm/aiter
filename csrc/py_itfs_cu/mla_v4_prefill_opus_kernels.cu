@@ -11,6 +11,7 @@
 #define OPUS_MLA_V4_PREFILL_IMPL
 #include "mla_v4_prefill_opus.h"
 #include "../cpp_itfs/pa/pa_ps.cuh"
+#include "../kernels/mla/opus/mla_v41_kargs.h"
 
 #include "aiter_hip_common.h"
 #include "aiter_stream.h"
@@ -823,4 +824,166 @@ void opus_mla_v4_prefill_a8w8_gfx1250_fwd(aiter_tensor_t& q_nope,
         impl.launch_kernel(
             {&args, &arg_size, N, num_h_blocks, 1, kGfx1250BlockSize, 1, 1, stream});
     }
+}
+
+// ============================================================================
+// gfx950 MLA v4.1: prebuilt code object
+// ============================================================================
+
+namespace {
+
+// Built by csrc/kernels/mla/opus/build_co.sh; a workgroup covers one token and 64 heads.
+constexpr const char* kV41A8W8Co = "mla_opus/opus_mla_v41_prefill_a8w8_16mx4_64nx1.co";
+constexpr int kV41HeadsPerBlk    = 64;
+constexpr int kV41BlockSize      = 256;
+constexpr int kV41DHead          = 512;
+constexpr int kV41DScale         = kV41DHead / 32;
+
+bool v41_is_e8m0(const aiter_tensor_t& t)
+{
+    return t.dtype() == AITER_DTYPE_u8 || t.dtype() == AITER_DTYPE_fp8_e8m0;
+}
+
+// The kernel moves data rows 16 bytes and scale rows 4 bytes per lane.
+bool v41_aligned(const aiter_tensor_t& t, int64_t row_stride, int bytes)
+{
+    return reinterpret_cast<uintptr_t>(t.data_ptr()) % bytes == 0 &&
+           row_stride * static_cast<int64_t>(t.element_size()) % bytes == 0;
+}
+
+// One row stride serves both KV sources; an empty source does not constrain it.
+int64_t v41_shared_row_stride(const aiter_tensor_t& prefix, const aiter_tensor_t& extend)
+{
+    if(prefix.size(0) == 0)
+        return extend.stride(0);
+    if(extend.size(0) != 0)
+        AITER_CHECK(prefix.stride(0) == extend.stride(0),
+                    "the prefix and extend KV sources must share a row stride, got ",
+                    prefix.stride(0),
+                    " and ",
+                    extend.stride(0));
+    return prefix.stride(0);
+}
+
+} // namespace
+
+void opus_mla_v41_prefill_a8w8_gfx950_fwd(aiter_tensor_t& q,
+                                          aiter_tensor_t& q_scale,
+                                          aiter_tensor_t& unified_kv,
+                                          aiter_tensor_t& unified_kv_scale,
+                                          aiter_tensor_t& kv_indices_prefix,
+                                          aiter_tensor_t& kv_indptr_prefix,
+                                          aiter_tensor_t& kv,
+                                          aiter_tensor_t& kv_scale,
+                                          aiter_tensor_t& kv_indices_extend,
+                                          aiter_tensor_t& kv_indptr_extend,
+                                          aiter_tensor_t& attn_sink,
+                                          aiter_tensor_t& out,
+                                          float softmax_scale)
+{
+    const std::string gfx = get_gpu_arch();
+    AITER_CHECK(gfx == "gfx950", __func__, ": unsupported GPU arch '", gfx, "' (supported: gfx950).");
+
+    // ---- Shape / dtype validation -----------------------------------------
+    AITER_CHECK(q.dim() == 3 && q_scale.dim() == 3 && out.dim() == 3,
+                "q, q_scale and out must be 3-D [N, H, *]");
+    AITER_CHECK(unified_kv.dim() == 2 && unified_kv_scale.dim() == 2 && kv.dim() == 2 &&
+                    kv_scale.dim() == 2,
+                "unified_kv, unified_kv_scale, kv and kv_scale must be 2-D [rows, *]");
+    AITER_CHECK(attn_sink.dim() == 1, "attn_sink must be 1-D [H]");
+
+    AITER_CHECK(q.dtype() == AITER_DTYPE_fp8 && unified_kv.dtype() == AITER_DTYPE_fp8 &&
+                    kv.dtype() == AITER_DTYPE_fp8,
+                "q/unified_kv/kv must be fp8");
+    AITER_CHECK(v41_is_e8m0(q_scale) && v41_is_e8m0(unified_kv_scale) && v41_is_e8m0(kv_scale),
+                "q_scale/unified_kv_scale/kv_scale must be E8M0 (uint8 or fp8_e8m0)");
+    AITER_CHECK(out.dtype() == AITER_DTYPE_bf16, "out must be bf16");
+    AITER_CHECK(attn_sink.dtype() == AITER_DTYPE_fp32, "attn_sink must be fp32");
+    AITER_CHECK(kv_indptr_prefix.dtype() == AITER_DTYPE_i32 &&
+                    kv_indices_prefix.dtype() == AITER_DTYPE_i32 &&
+                    kv_indptr_extend.dtype() == AITER_DTYPE_i32 &&
+                    kv_indices_extend.dtype() == AITER_DTYPE_i32,
+                "kv_indptr/kv_indices (prefix+extend) must be int32");
+
+    const int N = static_cast<int>(q.size(0));
+    const int H = static_cast<int>(q.size(1));
+
+    AITER_CHECK(q.size(2) == kV41DHead, "q last dim must be 512");
+    AITER_CHECK(q_scale.size(0) == N && q_scale.size(1) == H && q_scale.size(2) == kV41DScale,
+                "q_scale shape must be [N, H, 16]");
+    AITER_CHECK(unified_kv.size(1) == kV41DHead && kv.size(1) == kV41DHead,
+                "unified_kv/kv last dim must be 512");
+    AITER_CHECK(unified_kv_scale.size(1) == kV41DScale && kv_scale.size(1) == kV41DScale,
+                "unified_kv_scale/kv_scale last dim must be 16");
+    AITER_CHECK(unified_kv.size(0) == unified_kv_scale.size(0),
+                "unified_kv and unified_kv_scale must share total_pages");
+    AITER_CHECK(kv.size(0) == kv_scale.size(0), "kv and kv_scale must share total_tokens");
+    AITER_CHECK(out.size(0) == N && out.size(1) == H && out.size(2) == kV41DHead,
+                "out shape must be [N, H, 512]");
+    AITER_CHECK(attn_sink.size(0) == H, "attn_sink length must equal H");
+    AITER_CHECK(kv_indptr_prefix.size(0) == N + 1, "kv_indptr_prefix length must be N+1");
+    AITER_CHECK(kv_indptr_extend.size(0) == N + 1, "kv_indptr_extend length must be N+1");
+
+    AITER_CHECK(q.stride(2) == 1 && q_scale.stride(2) == 1 && out.stride(2) == 1 &&
+                    unified_kv.stride(1) == 1 && unified_kv_scale.stride(1) == 1 &&
+                    kv.stride(1) == 1 && kv_scale.stride(1) == 1,
+                "Q/KV/scales/out must be contiguous along the last dim");
+    AITER_CHECK(kv_indices_prefix.is_contiguous() && kv_indptr_prefix.is_contiguous() &&
+                    kv_indices_extend.is_contiguous() && kv_indptr_extend.is_contiguous() &&
+                    attn_sink.is_contiguous(),
+                "kv_indices/kv_indptr (prefix+extend) and attn_sink must be contiguous");
+
+    if(N == 0)
+        return;
+
+    const int64_t stride_kv_page       = v41_shared_row_stride(unified_kv, kv);
+    const int64_t stride_kv_scale_page = v41_shared_row_stride(unified_kv_scale, kv_scale);
+    AITER_CHECK(v41_aligned(q, q.stride(0), 16) && v41_aligned(q, q.stride(1), 16) &&
+                    v41_aligned(unified_kv, stride_kv_page, 16) &&
+                    v41_aligned(kv, stride_kv_page, 16),
+                "q/unified_kv/kv base and row strides must be 16-byte aligned");
+    AITER_CHECK(v41_aligned(q_scale, q_scale.stride(0), 4) &&
+                    v41_aligned(q_scale, q_scale.stride(1), 4) &&
+                    v41_aligned(unified_kv_scale, stride_kv_scale_page, 4) &&
+                    v41_aligned(kv_scale, stride_kv_scale_page, 4),
+                "q_scale/unified_kv_scale/kv_scale base and row strides must be 4-byte aligned");
+    AITER_CHECK(v41_aligned(out, out.stride(0), 16) && v41_aligned(out, out.stride(1), 16),
+                "out base and row strides must be 16-byte aligned");
+
+    // ---- Build kernel args -----------------------------------------------
+    opus_mla_v41_prefill_kargs kargs{};
+    kargs.q_ptr                = q.data_ptr();
+    kargs.q_scale_ptr          = q_scale.data_ptr();
+    kargs.unified_kv_ptr       = unified_kv.data_ptr();
+    kargs.unified_kv_scale_ptr = unified_kv_scale.data_ptr();
+    kargs.kv_ptr               = kv.data_ptr();
+    kargs.kv_scale_ptr         = kv_scale.data_ptr();
+    kargs.attn_sink_ptr        = attn_sink.data_ptr();
+    kargs.out_ptr              = out.data_ptr();
+    kargs.kv_indptr_prefix     = reinterpret_cast<const int*>(kv_indptr_prefix.data_ptr());
+    kargs.kv_indices_prefix    = reinterpret_cast<const int*>(kv_indices_prefix.data_ptr());
+    kargs.kv_indptr_extend     = reinterpret_cast<const int*>(kv_indptr_extend.data_ptr());
+    kargs.kv_indices_extend    = reinterpret_cast<const int*>(kv_indices_extend.data_ptr());
+    kargs.N                    = N;
+    kargs.H                    = H;
+    kargs.total_pages          = static_cast<int>(unified_kv.size(0));
+    kargs.total_tokens         = static_cast<int>(kv.size(0));
+    kargs.stride_q_n           = static_cast<int>(q.stride(0));
+    kargs.stride_q_h           = static_cast<int>(q.stride(1));
+    kargs.stride_q_scale_n     = static_cast<int>(q_scale.stride(0));
+    kargs.stride_q_scale_h     = static_cast<int>(q_scale.stride(1));
+    kargs.stride_o_n           = static_cast<int>(out.stride(0));
+    kargs.stride_o_h           = static_cast<int>(out.stride(1));
+    kargs.stride_kv_page       = static_cast<int>(stride_kv_page);
+    kargs.stride_kv_scale_page = static_cast<int>(stride_kv_scale_page);
+    kargs.softmax_scale        = softmax_scale;
+
+    // ---- Launch ----------------------------------------------------------
+    HipDeviceGuard guard(q.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+
+    size_t arg_size = sizeof(kargs);
+    static AiterAsmKernel impl("opus_mla_v41_prefill_a8w8_16mx4_64nx1_kernel", kV41A8W8Co);
+    impl.launch_kernel(
+        {&kargs, &arg_size, N, ceil_div(H, kV41HeadsPerBlk), 1, kV41BlockSize, 1, 1, stream});
 }

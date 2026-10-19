@@ -1584,6 +1584,21 @@ namespace py = pybind11;
           py::arg("kv_indptr_extend"),              \
           py::arg("attn_sink"),                     \
           py::arg("out"),                           \
+          py::arg("softmax_scale"));                \
+    m.def("opus_mla_v41_prefill_a8w8_gfx950_fwd",   \
+          &opus_mla_v41_prefill_a8w8_gfx950_fwd,    \
+          py::arg("q"),                             \
+          py::arg("q_scale"),                       \
+          py::arg("unified_kv"),                    \
+          py::arg("unified_kv_scale"),              \
+          py::arg("kv_indices_prefix"),             \
+          py::arg("kv_indptr_prefix"),              \
+          py::arg("kv"),                            \
+          py::arg("kv_scale"),                      \
+          py::arg("kv_indices_extend"),             \
+          py::arg("kv_indptr_extend"),              \
+          py::arg("attn_sink"),                     \
+          py::arg("out"),                           \
           py::arg("softmax_scale"));
 
 #define PA_MQA_LOGITS_MXFP4_PYBIND                       \

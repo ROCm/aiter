@@ -120,6 +120,24 @@ void opus_mla_v4_prefill_a8w8_gfx1250_fwd(aiter_tensor_t& q_nope,
                                           aiter_tensor_t& out,
                                           float softmax_scale);
 
+// Public API: MLA v4.1 sparse prefill (gfx950, prebuilt code object). The v4 semantics, with
+// Q, unified_kv and kv as 512 e4m3 per row and their [*, 16] E8M0 scales in separate tensors.
+// unified_kv/kv share one row stride, as do their scales; data row strides must be 16-byte
+// aligned, scale row strides 4-byte aligned. `softmax_scale` is applied as-is.
+void opus_mla_v41_prefill_a8w8_gfx950_fwd(aiter_tensor_t& q,
+                                          aiter_tensor_t& q_scale,
+                                          aiter_tensor_t& unified_kv,
+                                          aiter_tensor_t& unified_kv_scale,
+                                          aiter_tensor_t& kv_indices_prefix,
+                                          aiter_tensor_t& kv_indptr_prefix,
+                                          aiter_tensor_t& kv,
+                                          aiter_tensor_t& kv_scale,
+                                          aiter_tensor_t& kv_indices_extend,
+                                          aiter_tensor_t& kv_indptr_extend,
+                                          aiter_tensor_t& attn_sink,
+                                          aiter_tensor_t& out,
+                                          float softmax_scale);
+
 #ifdef OPUS_MLA_V4_PREFILL_IMPL
 // ============================================================================
 // Implementation section - only compiled in the .cu translation unit
