@@ -162,6 +162,13 @@ def _gemm_a16_w16_kernel(
             b_ptrs += BLOCK_SIZE_K * stride_bk
 
         if use_activation and NUM_KSPLIT == 1:
+            # Round to the 16-bit output type first, as an unfused GEMM does.
+            # On gfx1151 this made the GELU epilogues faster.
+            if (
+                c_ptr.type.element_ty == tl.float16
+                or c_ptr.type.element_ty == tl.bfloat16
+            ):
+                accumulator = accumulator.to(c_ptr.type.element_ty).to(tl.float32)
             accumulator = activation(accumulator)
 
         # Write back the block of the output matrix C with masks.
