@@ -1122,7 +1122,9 @@ static void validate_hipb_operand_scale(const aiter_tensor_t& scale,
                     name,
                     " must be a GPU tensor on the operand device");
         AITER_CHECK(scale.is_contiguous(), name, " must be contiguous");
-        AITER_CHECK(scale.dtype() == AITER_DTYPE_u8, name, " must have dtype uint8");
+        AITER_CHECK(scale.dtype() == AITER_DTYPE_u8 || scale.dtype() == AITER_DTYPE_fp8_e8m0,
+                    name,
+                    " must have dtype uint8 or fp8_e8m0");
         AITER_CHECK(scale.dim() == 2 && scale.size(0) == scale_rows && scale.size(1) == scale_k,
                     name,
                     " must have shape [",
@@ -1579,6 +1581,8 @@ std::string getHipblasltKernelName(int solution_index)
 PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     AITER_SET_STREAM_PYBIND;
+    m.attr("hipblaslt_build_version") =
+        py::make_tuple(HIPBLASLT_VERSION_MAJOR, HIPBLASLT_VERSION_MINOR, HIPBLASLT_VERSION_PATCH);
     m.def("hipb_create_extension", &hipb_create_extension, "create_extension");
     m.def("hipb_destroy_extension", &hipb_destroy_extension, "destroy_extension");
     m.def("hipb_mm",

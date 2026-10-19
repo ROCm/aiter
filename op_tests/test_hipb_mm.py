@@ -7,7 +7,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.ops.gradlib import HipblasLtMatmulScaleMode as ScaleMode
-from aiter.test_common import checkAllclose
+from aiter.test_common import assertAllclose
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 
@@ -42,8 +42,7 @@ def test_hipb_mm_scale_mode_inference(rows, mode, explicit):
     )
     ref = ((x.float() * scale_a) @ (w.float().t() * scale_b)).to(dtypes.bf16)
     # A wrong inferred mode can launch successfully but apply the wrong scale factors.
-    err = checkAllclose(ref, out, rtol=1e-2, atol=1e-2, catastrophic_check=True)
-    assert err <= 0.05
+    assertAllclose(ref, out, rtol=1e-2, atol=1e-2, catastrophic_check=True)
 
 
 @pytest.mark.parametrize("operand", ["A", "B"])
@@ -98,8 +97,7 @@ def test_hipb_mm_single_scale(operand):
         **{f"scale{operand}": scale},
     )
     ref = ((x.float() @ w.float().t()) * scale).to(dtypes.bf16)
-    err = checkAllclose(ref, out, rtol=1e-2, atol=1e-2, catastrophic_check=True)
-    assert err <= 0.05
+    assertAllclose(ref, out, rtol=1e-2, atol=1e-2, catastrophic_check=True)
 
 
 @pytest.mark.parametrize(
@@ -113,8 +111,15 @@ def test_hipb_mm_single_scale(operand):
             torch.float32,
         ),
         (ScaleMode.VEC32_UE8M0, ScaleMode.VEC32_UE8M0, (32, 8), (128, 8), torch.uint8),
+        (
+            ScaleMode.VEC32_UE8M0,
+            ScaleMode.VEC32_UE8M0,
+            (32, 8),
+            (128, 8),
+            dtypes.fp8_e8m0,
+        ),
     ],
-    ids=["mixed", "block"],
+    ids=["mixed", "block", "block-e8m0"],
 )
 def test_hipb_mm_rejects_unrepresentable_tuning_modes(
     monkeypatch, tmp_path, mode_a, mode_b, scale_a_shape, scale_b_shape, scale_dtype

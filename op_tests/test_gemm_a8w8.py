@@ -15,11 +15,11 @@ from aiter import (
     hipb_findallsols,
     hipb_mm,
 )
-from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.core import AITER_CONFIGS, get_module
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.shuffle import shuffle_scale, shuffle_weight
-from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.test_common import assertAllclose, benchmark, checkAllclose, perftest
 
 try:
     from tuned_op_bench_utils import append_tuned_op_bench_rows
@@ -163,6 +163,7 @@ def run_gemm_skinny(
 @lru_cache(maxsize=1)
 def init_hipblas():
     hipb_create_extension()
+    return get_module("module_hipbsolgemm").hipblaslt_build_version
 
 
 @benchmark()
@@ -294,7 +295,7 @@ def test_gemm(
             quant_mode=quant_mode,
             bpreshuffle=False,
         )
-        err_hipb = checkAllclose(
+        err_hipb = assertAllclose(
             a,
             hipb,
             msg=f"hipmm {quant_mode}: ",
@@ -620,6 +621,11 @@ def test_normal_gemm_a8w8(
                     if quant_mode == "mxfp8-unswizzled" and m == 1:
                         aiter.logger.warning(
                             "Skipping unswizzled MXFP8 with hipBLASLt N=1 (test m=1)."
+                        )
+                        continue
+                    if quant_mode == "mxfp8-swizzled" and init_hipblas() < (1, 3, 0):
+                        aiter.logger.warning(
+                            "Swizzled MXFP8 requires hipBLASLt >=1.3; skipping."
                         )
                         continue
                     ret = test_gemm(
