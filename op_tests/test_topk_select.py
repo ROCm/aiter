@@ -483,7 +483,7 @@ def test_pitch_routing():
 # the leading axis: a (1, n) row, or for k = 1 an (m, 1) column, strides (1, 1).
 _UNIT_STRIDE_ROUTES = (
     ("decode", 64, 131072, 1024, "row"),
-    ("stream", 64, 32768, 512, "row"),
+    ("stream", 64, 32768, 256, "row"),
     ("small_k", 64, 4096, 16, "row"),
     ("argmax", 64, 4096, 1, "row"),
     ("argmax", 64, 4096, 1, "column"),
