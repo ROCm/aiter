@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from op_tests.tuning_tests._controlled_tuner_import import import_moe_tuner
+from op_tests.tuning_tests.test_mxfp4_tuner import import_moe_tuner
 
 import_moe_tuner()
 

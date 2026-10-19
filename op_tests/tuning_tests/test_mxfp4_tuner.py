@@ -1,26 +1,91 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Controlled tuner lifecycle checks; no GPU kernels or measurements run.
+"""Controlled MXFP4 tuner checks; no GPU kernels or measurements run.
 
-Full-module imports require the normal AITER ROCm/FlyDSL toolchain. Devices and
+Covers the tuning lifecycle, the invocation configuration snapshot and the staged
+operation timeout. Full-module imports require the normal AITER ROCm/FlyDSL
+toolchain. Import-time rocminfo/hipinfo discovery is synthetic; devices and
 measurement outcomes are simulated at the approved tuning boundaries.
 """
 
 import argparse
+import importlib
 import multiprocessing
+import os
+import signal
+import subprocess
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
+from multiprocessing.connection import Connection
 from multiprocessing.context import BaseContext
 from multiprocessing.process import BaseProcess
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 import pandas as pd
 import pytest
 import torch
 
-from op_tests.tuning_tests._controlled_tuner_import import import_moe_tuner
+
+def import_moe_tuner() -> "ModuleType":
+    run = subprocess.run
+    set_default_device = torch.set_default_device
+
+    def discover(
+        command: "list[str]", *args: "object", **kwargs: "object"
+    ) -> "subprocess.CompletedProcess[str]":
+        if isinstance(command, (list, tuple)) and Path(command[0]).name in (
+            "rocminfo",
+            "hipinfo",
+        ):
+            output = (
+                "Agent 1\n  Name: gfx950\n  Device Type: GPU\n"
+                "  Compute Unit: 256\n  ASIC Revision: 1\n"
+            )
+            return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+        return run(command, *args, **kwargs)
+
+    with (
+        mock.patch.dict(
+            os.environ,
+            {
+                "ROCR_VISIBLE_DEVICES": "",
+                "HIP_VISIBLE_DEVICES": "",
+                "CUDA_VISIBLE_DEVICES": "",
+                "GPU_ARCHS": "gfx950",
+                "CU_NUM": "256",
+            },
+        ),
+        mock.patch.object(subprocess, "run", side_effect=discover),
+        mock.patch.object(
+            torch,
+            "set_default_device",
+            side_effect=lambda device: set_default_device("cpu"),
+        ),
+    ):
+        tuner = importlib.import_module(
+            "csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune"
+        )
+    # Synthetic import discovery must not become runtime evidence.
+    for name in ("chip_info", "aiter.jit.utils.chip_info"):
+        module = sys.modules.get(name)
+        if module is not None:
+            for function in (
+                "_gpu_info_output",
+                "_detect_native",
+                "get_gfx_runtime",
+                "get_gfx",
+                "get_gfx_custom_op_core",
+                "_rocminfo_gpu_agents",
+                "get_gfx_list",
+            ):
+                clear = getattr(getattr(module, function), "cache_clear", None)
+                if clear is not None:
+                    clear()
+    return tuner
+
 
 moe = import_moe_tuner()
 
@@ -607,3 +672,399 @@ def test_unsupported_already_tuned_row_fails_and_later_winner_persists(
     winner = pd.read_csv(output)
     assert winner.loc[winner.token == 8, "us"].item() == 10.25
     assert "gate_mode" not in winner.columns
+
+
+PORT_E2E = moe.Mxfp4FlydslTuner._port_e2e
+
+
+def test_invocation_captures_limit_and_stage2_settings_for_every_shape(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
+    monkeypatch.setenv("AITER_MXFP4_TUNE_SWIGLU_LIMIT", "5")
+    monkeypatch.setenv("AITER_FLYDSL_STAGE2_FP8", "1")
+    monkeypatch.setenv("AITER_MXFP4_INTERMEDIATE", "1")
+    with devices(("gfx950", 256)):
+        tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
+        monkeypatch.setattr("sys.argv", ["tuner", "--mxfp4-flydsl"])
+        args = tuner.parse_args()
+        snapshots = []
+
+        def tune_shape(
+            row: "dict[str, object]", args: "SimpleNamespace"
+        ) -> "dict[str, object]":
+            snapshots.append(args.mxfp4_configuration)
+            return {**row, "us": 1.0}
+
+        monkeypatch.setattr(tuner, "_tune_one_shape", tune_shape)
+        tuner.tune(pd.DataFrame([shape(128), shape(2048)]), None, args)
+    assert (
+        snapshots
+        == [{"swiglu_limit": 5.0, "stage2_fp8": True, "fp4_scatter": True}] * 2
+    )
+    assert snapshots[0] is snapshots[1]
+
+
+@pytest.mark.parametrize("value", ["0", "-5", "nan", "inf"])
+def test_invalid_activation_limit_rejects_invocation_before_gpu_work(
+    monkeypatch: "pytest.MonkeyPatch", value: "object"
+) -> "None":
+    monkeypatch.setenv("AITER_MXFP4_TUNE_SWIGLU_LIMIT", value)
+    with devices(("gfx950", 256)):
+        tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
+        monkeypatch.setattr("sys.argv", ["tuner", "--mxfp4-flydsl"])
+        with pytest.raises(ValueError, match="finite and positive"):
+            tuner.parse_args()
+
+
+def test_custom_limit_rejects_situv2_even_if_same_shape_is_already_tuned(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
+    monkeypatch.setenv("AITER_MXFP4_TUNE_SWIGLU_LIMIT", "5")
+    with devices(("gfx950", 256)):
+        tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
+    row = shape(act_type="ActivationType.Situv2")
+    tuner.untunedf = pd.DataFrame([row])
+    tuner.tunedf = pd.DataFrame([{**row, "us": 1.0}])
+    assert not tuner._already_tuned_mask(KEYS).iloc[0]
+    result = tuner._tune_one_shape(row, SimpleNamespace(timeout=0))
+    assert result["us"] == -1 and "Situv2" in result["kernelName1"]
+
+
+def test_separate_invocations_on_one_tuner_capture_current_settings(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
+    with devices(("gfx950", 256)):
+        tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
+    snapshots = []
+    monkeypatch.setattr(
+        tuner,
+        "_tune_one_shape",
+        lambda row, args: snapshots.append(args.mxfp4_configuration)
+        or {**row, "us": 1.0},
+    )
+    for limit in ("7", "5"):
+        monkeypatch.setenv("AITER_MXFP4_TUNE_SWIGLU_LIMIT", limit)
+        with devices(("gfx950", 256)):
+            tuner.tune(pd.DataFrame([shape()]), None, SimpleNamespace(mp=1))
+    assert [item["swiglu_limit"] for item in snapshots] == [7.0, 5.0]
+
+
+def test_fp8_stage2_pair_and_screening_receive_original_route_weights(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
+    from op_tests.tuning_tests.test_mxfp4_staged import fake_case
+
+    data, sorting = fake_case()
+    monkeypatch.setattr(moe, "moe_sorting", lambda *args, **kwargs: sorting)
+    monkeypatch.setattr(
+        moe, "_mxfp4_a4w4_stage1_fw", lambda *args, **kwargs: (object(), object())
+    )
+    monkeypatch.setattr(
+        moe.aiter,
+        "fused_dynamic_mxfp4_quant_moe_sort",
+        lambda **kwargs: (object(), object()),
+    )
+    observed = []
+
+    def stage2(*args: "object", **kwargs: "object") -> "object":
+        observed.append(kwargs["topk_weights"])
+        return sorting[4]
+
+    monkeypatch.setattr(moe, "_mxfp4_a4w4_stage2_fw", stage2)
+    name = "flydsl_moe2_layout_afp4_wfp4_bf16_t128x128x128_reduce_sbm128"
+    PORT_E2E(
+        data,
+        "flydsl_mxmoe_g1_a4w4_128x128x256_swiglu",
+        name,
+        4,
+        128,
+        3072,
+        moe.dtypes.bf16,
+        swiglu_limit=5,
+    )
+    moe.Mxfp4FlydslTuner._gemm2_screening_call(
+        data, sorting, object(), object(), name, 4
+    )()
+    assert observed == [data["topk_weights"], data["topk_weights"]]
+
+
+@pytest.mark.parametrize(
+    "fp8,fp4", [(None, None), ("", ""), ("1", None), (None, "1"), ("1", "1")]
+)
+@pytest.mark.parametrize(
+    "epilog,bn", [("atomic", 128), ("reduce", 128), ("scatter", 128), ("scatter", 256)]
+)
+def test_production_stage2_path_matches_invocation_configuration(
+    monkeypatch: "pytest.MonkeyPatch",
+    fp8: "str | None",
+    fp4: "str | None",
+    epilog: "str",
+    bn: "int",
+) -> "None":
+    import importlib
+
+    from op_tests.tuning_tests.test_mxfp4_staged import FakeTensor, fake_case
+
+    monkeypatch.setattr(FakeTensor, "element_size", lambda self: 1, raising=False)
+    fm = importlib.import_module("aiter.fused_moe")
+    dispatcher = importlib.import_module("aiter.ops.flydsl.kernels.mxmoe_dispatcher")
+    kernels = importlib.import_module("aiter.ops.flydsl.moe_kernels")
+    for name, value in (
+        ("AITER_FLYDSL_STAGE2_FP8", fp8),
+        ("AITER_MXFP4_INTERMEDIATE", fp4),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    with devices(("gfx950", 256)):
+        tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
+    data, sorting = fake_case()
+    config = tuner._invocation_configuration()
+    expected = (
+        "fp8"
+        if epilog == "reduce" and config["stage2_fp8"]
+        else "fp4" if epilog == "scatter" and config["fp4_scatter"] else "bf16"
+    )
+    observed = {}
+    finished = []
+    monkeypatch.setattr(
+        moe.torch,
+        "empty",
+        lambda dimensions, **kwargs: FakeTensor(dimensions, kwargs["dtype"]),
+    )
+
+    def gemm(**kwargs: "object") -> "None":
+        observed.update(kwargs)
+
+    def reduction(
+        target: "torch.Tensor",
+        out: "torch.Tensor",
+        token: "int",
+        topk: "int",
+        hidden: "int",
+        **kwargs: "object",
+    ) -> "None":
+        assert kwargs["is_fp8"] == (expected == "fp8")
+        assert kwargs["topk_weights"] is (
+            data["topk_weights"] if expected == "fp8" else None
+        )
+        finished.append("reduce")
+
+    def scatter(**kwargs: "object") -> "None":
+        assert kwargs["out"] is sorting[4]
+        finished.append("scatter")
+
+    def quantized_scatter(**kwargs: "object") -> "None":
+        assert kwargs["flat_out_q"].shape == (256, 1536)
+        assert kwargs["flat_out_scale"].shape == (256, 96)
+        assert (
+            kwargs["flat_out_q"].dtype
+            == kwargs["flat_out_scale"].dtype
+            == moe.torch.uint8
+        )
+        finished.append("fp4-scatter")
+
+    monkeypatch.setattr(dispatcher, "mxfp4_moe_gemm2", gemm)
+    monkeypatch.setattr(kernels, "_run_moe_reduction", reduction)
+    monkeypatch.setattr(moe.aiter, "mxfp4_moe_scatter_reduce", scatter)
+    monkeypatch.setattr(moe.aiter, "mxfp4_moe_scatter_reduce_q", quantized_scatter)
+    result = fm._flydsl_v2_stage2_wrapper(
+        FakeTensor((256, 256), moe.torch.uint8),
+        None,
+        data["w2_a16"],
+        sorting[0],
+        sorting[2],
+        sorting[3],
+        sorting[4],
+        4,
+        kernelName=f"flydsl_moe2_layout_afp4_wfp4_bf16_t128x{bn}x128_{epilog}_sbm128",
+        model_dim=3072,
+        inter_dim=512,
+        num_experts=128,
+        a2_scale=FakeTensor((256, 16), moe.torch.uint8),
+        w2_scale=data["w2s_a16"],
+        sorted_weights=sorting[1],
+        topk_weights=data["topk_weights"],
+        reverse_sorted=sorting[6],
+    )
+    assert result is sorting[4] and observed["out_dtype"] == expected
+    assert finished == (
+        []
+        if epilog == "atomic"
+        else (
+            ["reduce"]
+            if epilog == "reduce"
+            else ["fp4-scatter"] if expected == "fp4" else ["scatter"]
+        )
+    )
+
+
+_GET_CONTEXT = multiprocessing.get_context
+_PROCESS_START = BaseProcess.start
+
+
+def cpu_configuration_worker(
+    payload: "tuple[tuple[str, ...], dict[str, object], SimpleNamespace, int]",
+    result_tx: "Connection",
+) -> "None":
+    import importlib
+
+    from op_tests.tuning_tests.test_mxfp4_tuner import import_moe_tuner
+
+    imported = import_moe_tuner()
+    fm = importlib.import_module("aiter.fused_moe")
+    keys, row, args, gpu = payload
+    del keys, gpu
+    try:
+        result_tx.send(
+            {
+                **row,
+                "snapshot": args.mxfp4_configuration,
+                "production_settings": {
+                    "stage2_fp8": fm._flydsl_stage2_fp8_enabled(),
+                    "fp4_scatter": fm._mxfp4_intermediate_enabled(),
+                    "swiglu_limit": imported.runtime_swiglu_limit(
+                        args.mxfp4_configuration["swiglu_limit"], "swiglu"
+                    ),
+                },
+                "environment": [
+                    os.environ.get(name)
+                    for name in (
+                        "AITER_MXFP4_TUNE_SWIGLU_LIMIT",
+                        "AITER_FLYDSL_STAGE2_FP8",
+                        "AITER_MXFP4_INTERMEDIATE",
+                    )
+                ],
+                "us": 1.0,
+            }
+        )
+    finally:
+        result_tx.close()
+
+
+@pytest.mark.parametrize(
+    "limit,fp8,fp4",
+    [
+        (None, None, None),
+        ("", "", ""),
+        (None, "1", None),
+        (None, None, "1"),
+        (None, "1", "1"),
+        ("5", "1", "1"),
+    ],
+)
+def test_spawned_shape_inherits_snapshot_and_stable_production_settings(
+    monkeypatch: "pytest.MonkeyPatch",
+    limit: "str | None",
+    fp8: "str | None",
+    fp4: "str | None",
+) -> "None":
+    for name, value in zip(
+        (
+            "AITER_MXFP4_TUNE_SWIGLU_LIMIT",
+            "AITER_FLYDSL_STAGE2_FP8",
+            "AITER_MXFP4_INTERMEDIATE",
+        ),
+        (limit, fp8, fp4),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    with devices(("gfx950", 256)):
+        tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
+        monkeypatch.setattr(
+            "sys.argv", ["tuner", "--mxfp4-flydsl", "--mxfp4-search-mode", "staged"]
+        )
+        args = tuner.parse_args()
+
+        def cpu_only_start(process: "BaseProcess") -> "None":
+            assert process._target is cpu_configuration_worker
+            return _PROCESS_START(process)
+
+        monkeypatch.setattr(BaseProcess, "start", cpu_only_start)
+        monkeypatch.setattr(multiprocessing, "get_context", _GET_CONTEXT)
+        isolated = moe._run_staged_shapes_isolated
+        monkeypatch.setattr(
+            moe,
+            "_run_staged_shapes_isolated",
+            lambda payloads, slots, ctx: isolated(
+                payloads, slots, ctx, entry=cpu_configuration_worker
+            ),
+        )
+        results = tuner.tune(pd.DataFrame([shape(128), shape(2048)]), None, args)
+    for result in results:
+        assert result["environment"] == [limit, fp8, fp4]
+        assert result["snapshot"] == args.mxfp4_configuration
+        assert result["production_settings"] == {
+            "stage2_fp8": fp8 == "1",
+            "fp4_scatter": fp4 == "1",
+            "swiglu_limit": 5.0 if limit == "5" else 7.0,
+        }
+
+
+def test_staged_operation_restores_existing_handler_and_timer() -> "None":
+    tuner = moe.Mxfp4FlydslTuner.__new__(moe.Mxfp4FlydslTuner)
+    tuner.keys = KEYS
+    owned_handler = object()
+    restored = []
+    with (
+        mock.patch.object(signal, "getsignal", return_value=owned_handler),
+        mock.patch.object(signal, "getitimer", return_value=(25.0, 3.0)),
+        mock.patch.object(
+            signal, "signal", side_effect=lambda sig, handler: restored.append(handler)
+        ),
+        mock.patch.object(signal, "setitimer") as timer,
+        tuner._staged_timeout(4),
+    ):
+        pass
+    assert restored[-1] is owned_handler
+    assert timer.call_args_list[-1] == mock.call(signal.ITIMER_REAL, 25.0, 3.0)
+
+
+def test_staged_soft_timeout_is_returned_as_screen_failure_and_restores_timer() -> (
+    "None"
+):
+    tuner = moe.Mxfp4FlydslTuner.__new__(moe.Mxfp4FlydslTuner)
+    installed = []
+    owned_handler = object()
+
+    def interrupted() -> "float":
+        installed[0](signal.SIGALRM, None)
+
+    with (
+        mock.patch.object(signal, "getsignal", return_value=owned_handler),
+        mock.patch.object(signal, "getitimer", return_value=(13.0, 0.0)),
+        mock.patch.object(
+            signal, "signal", side_effect=lambda sig, handler: installed.append(handler)
+        ),
+        mock.patch.object(signal, "setitimer") as timer,
+    ):
+        assert tuner._screen_candidate(interrupted, "fixture", 4) < 0
+    assert installed[-1] is owned_handler
+    assert timer.call_args_list[-1] == mock.call(signal.ITIMER_REAL, 13.0, 0.0)
+
+
+def test_staged_soft_timeout_unavailable_handler_runs_without_touching_timer() -> (
+    "None"
+):
+    tuner = moe.Mxfp4FlydslTuner.__new__(moe.Mxfp4FlydslTuner)
+    with (
+        mock.patch.object(signal, "getsignal", return_value=None),
+        mock.patch.object(signal, "setitimer") as timer,
+    ):
+        assert tuner._screen_candidate(lambda: 3.0, "fixture", 4) == 3.0
+    timer.assert_not_called()
+
+
+def test_staged_soft_timeout_outside_main_thread_runs_without_touching_timer() -> (
+    "None"
+):
+    tuner = moe.Mxfp4FlydslTuner.__new__(moe.Mxfp4FlydslTuner)
+    with (
+        mock.patch.object(signal, "signal", side_effect=ValueError("main thread")),
+        mock.patch.object(signal, "setitimer") as timer,
+    ):
+        assert tuner._screen_candidate(lambda: 3.0, "fixture", 4) == 3.0
+    timer.assert_not_called()
