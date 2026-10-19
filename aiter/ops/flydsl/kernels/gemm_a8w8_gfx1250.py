@@ -392,7 +392,7 @@ def launch_gemm_a8w8(
                 atomSA, coordSA = fx.rocdl.cdna5.make_tiled_tdm_atom(
                     fx.rocdl.TensorLoad(),
                     gSA_full,
-                    fx.make_layout(SA_TDM_SHAPE, (SA_LDS_ROW, 1)),
+                    fx.make_layout(SA_TDM_SHAPE, (SA_TDM_SHAPE[1], 1)),
                     SA_TDM_SHAPE,
                     num_warps=1,
                 )
