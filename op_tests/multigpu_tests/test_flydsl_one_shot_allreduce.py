@@ -923,7 +923,10 @@ def _spawn(target, world_size: int, **kwds) -> list:
             )
             for rank in range(world_size)
         ]
-        ranks = [fut.get(timeout=SPAWN_TIMEOUT_S) for fut in results]
+        # A bench spawn times every candidate at every shape: it may need far
+        # longer than a verify spawn on a cold JIT cache.
+        timeout = float(os.environ.get("FLYDSL_QR_TIMEOUT", str(SPAWN_TIMEOUT_S)))
+        ranks = [fut.get(timeout=timeout) for fut in results]
     except Exception:
         pool.terminate()
         raise
