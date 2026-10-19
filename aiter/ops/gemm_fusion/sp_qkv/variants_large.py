@@ -12,7 +12,7 @@ plan.run(x, x_scale, w, w_scale, outs, meta, res, stream) contract (large):
   Epoch state (credit protocol) is device-owned; all ranks must launch the same number of epochs per plan. After ANY poison on ANY rank:
   collective res.quiesce_and_reset() (re-inits the control image epoch=1/magic) before the next launch.
 Requires res.finalize() to have run (the kernels take the process devcomm by value).
-Under the shared_large window policy every large plan uses ONE control block and ONE S/R pair: every rank must launch the same SEQUENCE of large plans (see the
+Under the (default) arena window policy every large plan uses ONE control block and ONE S/R pair: every rank must launch the same SEQUENCE of large plans (see the
 resources module docstring: divergence is detected by the host-side digest, not by the device) and a recv_view is valid only until the next large launch.
 """
 
@@ -36,7 +36,7 @@ log = logging.getLogger("aiter.gemm_fusion")
 
 _F = {"dense": 2304, "indexer": 2560, "reuse": 2304}
 LG_CONTROL_MIN_BYTES = 8192  # control window image (LGC_STATE_OFF + state words); the device code never addresses beyond it with LG_STAMPS=0
-SHARE_S, SHARE_R, SHARE_C = "sp_qkv.large/S", "sp_qkv.large/R", "sp_qkv.large/C"  # share tags (policy shared_large maps all large plans onto these)
+SHARE_S, SHARE_R, SHARE_C = "sp_qkv.large/S", "sp_qkv.large/R", "sp_qkv.large/C"  # share tags (policy arena maps all large plans onto these)
 LG_R_PAD = 4096
 LGC_STAMP_OFF = 65536
 
@@ -133,8 +133,8 @@ class SpQkvLarge(Plan):
 
     def resources(self) -> List[WindowReq]:
         b = large_window_bytes(self.mode, self.M)
-        # bytes = the per-owner equal-size convention (unchanged for uniform / per_owner / aligned); share + min_bytes serve policy shared_large:
-        # ONE S and ONE R sized to the largest large plan and ONE control window used by every large plan.
+        # bytes = the per-plan equal-size convention (the uniform policy); share + min_bytes serve the arena policy: ONE S and ONE R sized to the largest
+        # large plan and ONE control window used by every large plan.
         return [WindowReq(self.owner + "/S", b, "p2p_window", share=SHARE_S, min_bytes=b),
                 WindowReq(self.owner + "/R", b, "p2p_window", share=SHARE_R, min_bytes=b),
                 WindowReq(self.owner + "/C", b, "control", share=SHARE_C, min_bytes=LG_CONTROL_MIN_BYTES),

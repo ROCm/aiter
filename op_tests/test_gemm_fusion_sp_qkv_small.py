@@ -23,6 +23,9 @@ from aiter.gemm_fusion import ContractError, MatchCtx, match_prefix, profile as 
 from aiter.gemm_fusion.plan import WindowReq
 from aiter.gemm_fusion.resources import FusionResources, ResourceError, round_up
 from aiter.ops.gemm_fusion.sp_qkv import gen_profile, jit, specs
+from aiter.ops.gemm_fusion.sp_qkv.test_utils import (  # noqa: E402
+    ArenaBackend, FakeBackend, FakeDist, FirstFitBackend, RealisticFirstFit, clear_profile_cache, log_capture as _log_capture, make_profile, make_res,
+)
 
 PROFILE = os.path.join(os.path.dirname(__file__), "..", "aiter", "configs", "gemm_fusion", "minimax_m3_sp4_gfx950_v1.json")
 
@@ -34,7 +37,7 @@ def test_profile_file_matches_generator():
 
 
 def test_profile_rows_exact_and_distinct():
-    profmod.clear_profile_cache()
+    clear_profile_cache()
     prof = profmod.load_profile(PROFILE)
     small = [r for r in prof.rows() if r.vid == "sp_qkv.small.v1"]
     assert len(small) == 6
@@ -105,67 +108,9 @@ def test_vendored_sources_match_manifest():
         assert n >= 11
 
 
-# ---- FusionResources with fakes -------------------------------------------------------------------------
-class FakeDist:
-    def __init__(self, diverge_rank=None):
-        self.calls = []
-        self.diverge_rank = diverge_rank  # all_gather_object: pretend this rank saw a different object
-
-    def broadcast_object_list(self, obj, src=0, group=None):
-        self.calls.append(("bcast", src))
-
-    def barrier(self, group=None):
-        self.calls.append(("barrier",))
-
-    def all_gather_object(self, out, obj, group=None):
-        self.calls.append(("allgather",))
-        for i in range(len(out)):
-            out[i] = obj if i != self.diverge_rank else ("DIVERGED",) + tuple(obj[1:])
-
-
-class FakeBackend:
-    def __init__(self):
-        self.log = []
-        self.n = 0
-
-    def uid(self, rank):
-        return b"u" * 128
-
-    def comm_create(self, rank, world, uid, vmm, device=None):
-        self.log.append(("comm", vmm))
-        return 1
-
-    def win_register(self, comm, nbytes):
-        self.n += 1
-        self.log.append(("win", nbytes))
-        return 100 + self.n, 4096 * self.n
-
-    def peer_ptr(self, comm, local, peer):
-        return local + peer
-
-    def devcomm_create(self, comm, q):
-        self.log.append(("dev", q))
-        return 7
-
-    def zero(self, dev, local, n):
-        self.log.append(("zero", local, n))
-
-    def device_sync(self, dev):
-        self.log.append(("sync",))
-
-    def devcomm_destroy(self, comm, dev):
-        self.log.append(("devdestroy",))
-
-    def win_deregister(self, comm, w):
-        self.log.append(("dereg", w))
-
-    def comm_destroy(self, comm):
-        self.log.append(("commdestroy",))
-
-
 def test_resources_lifecycle_and_sizes():
     be, d = FakeBackend(), FakeDist()
-    r = FusionResources(0, 4, dist=d, backend=be)
+    r = make_res(dist=d, backend=be)
     reqs = [WindowReq("rx", 1_300_000, "p2p_window"), WindowReq("ctl", 5000, "control")]
     w = r.ensure("plan/a", reqs)
     assert w["rx"].bytes == w["ctl"].bytes == round_up(1_300_000) == 4 << 20  # equal, 4 MiB multiple
@@ -180,7 +125,6 @@ def test_resources_lifecycle_and_sizes():
     kinds = [x[0] for x in be.log]
     assert kinds == ["sync", "zero", "zero", "sync"]  # device sync -> barrier -> reset -> sync -> barrier
     assert d.calls == [("barrier",), ("barrier",)]
-    assert r.peers(w["rx"]) == [w["rx"].local + p for p in range(4)]
     r.release()
     assert be.log[-1] == ("commdestroy",)
     r.release()  # idempotent
@@ -193,7 +137,7 @@ def test_small_variant_registers_and_contract(monkeypatch):
     sys.modules.pop("aiter.ops.gemm_fusion.sp_qkv.variants", None)
     import aiter.ops.gemm_fusion.sp_qkv.variants  # noqa: F401  (fresh import registers into the patched catalog)
 
-    profmod.clear_profile_cache()
+    clear_profile_cache()
     spec = specs.sp_qkv_spec("dense")
     ok = MatchCtx("gfx950", 256, 4, 32, frozenset({"mori_cco", "gfx950_sc_bypass"}))
     plan, n = match_prefix(spec, ok, PROFILE)
@@ -215,7 +159,7 @@ def test_small_variant_registers_and_contract(monkeypatch):
 
 # ======================================================================= large-M (S2-2b-iii)
 def test_profile_has_15_rows_and_large_prefix_signatures():
-    profmod.clear_profile_cache()
+    clear_profile_cache()
     prof = profmod.load_profile(PROFILE)
     assert len(prof) == 15
     for (mode, T), (vid, params) in specs.LARGE_CELLS.items():
@@ -268,7 +212,7 @@ def test_large_variant_contract_and_sizes(monkeypatch):
     sys.modules.pop("aiter.ops.gemm_fusion.sp_qkv.variants_large", None)
     import aiter.ops.gemm_fusion.sp_qkv.variants_large as vl  # noqa: F401
 
-    profmod.clear_profile_cache()
+    clear_profile_cache()
     caps = frozenset({"mori_cco", "sdma"})
     spec = specs.sp_qkv_spec("dense")
     plan, n = match_prefix(spec, MatchCtx("gfx950", 256, 4, 2048, caps), PROFILE)
@@ -293,7 +237,7 @@ def test_large_variant_contract_and_sizes(monkeypatch):
 
 def test_reset_runs_init_hooks():
     be, d = FakeBackend(), FakeDist()
-    r = FusionResources(0, 4, dist=d, backend=be)
+    r = make_res(dist=d, backend=be)
     r.ensure("p", [WindowReq("a", 100, "p2p_window")])
     calls = []
     r.set_init("p", lambda: calls.append(1))
@@ -314,7 +258,7 @@ def test_reset_order_with_drain_hook():
     be.device_sync = lambda dev: (ev.append("sync"), be_orig_sync(dev))[1]
     be.zero = lambda dev, loc, n: (ev.append("zero"), be_orig_zero(dev, loc, n))[1]
     d.barrier = lambda group=None: ev.append("barrier")
-    r = FusionResources(0, 4, dist=d, backend=be)
+    r = make_res(dist=d, backend=be)
     r.ensure("big", [WindowReq("a", 100, "p2p_window")])
     r.ensure("small", [WindowReq("b", 100, "p2p_window")])
     r.set_drain("big", lambda: ev.append("drain"))
@@ -326,7 +270,7 @@ def test_reset_order_with_drain_hook():
     assert ev == ["sync", "drain", "sync", "barrier", "zero", "zero", "init", "sync", "barrier"]
     assert ev.index("init") > max(i for i, x in enumerate(ev) if x == "zero")
     # no drain hooks -> no extra sync (small-M only)
-    r2 = FusionResources(0, 4, dist=d, backend=FakeBackend())
+    r2 = make_res(dist=d, backend=FakeBackend())
     r2.ensure("s", [WindowReq("b", 100, "p2p_window")])
     ev2 = []
     r2.backend.device_sync = lambda dev: ev2.append("sync")
@@ -338,7 +282,7 @@ def test_reset_order_with_drain_hook():
 
 def test_release_runs_close_hooks_before_comm_teardown_and_poison_or():
     be, d = FakeBackend(), FakeDist()
-    r = FusionResources(0, 4, dist=d, backend=be)
+    r = make_res(dist=d, backend=be)
     r.ensure("p", [WindowReq("a", 100, "p2p_window")])
     r.finalize()
     seen = []
@@ -413,7 +357,7 @@ def test_specs_match_actual_golden_casespec_for_every_cell():
     if cc is None:
         pytest.skip("golden case_config.py not found (set SP4_GOLDEN_DIR)")
     mode_map = {"qkv_dense": "dense", "qkv_indexer": "indexer", "qkv_indexer_reuse": "reuse"}
-    profmod.clear_profile_cache()
+    clear_profile_cache()
     prof = profmod.load_profile(PROFILE)
     seen = 0
     for gmode, mode in mode_map.items():
@@ -638,28 +582,6 @@ def test_atom_cross_repo_api_audit(monkeypatch):
     r.quiesce_and_reset()
     r.release()
 
-# ======================================================================= window policy (gate02 hipMemSetAccess failure)
-class FirstFitBackend(FakeBackend):
-    """FakeBackend that mimics MORI's per-rank first-fit slot allocator: records offsets, fails when the heap is exhausted."""
-
-    def __init__(self, heap):
-        super().__init__()
-        self.heap, self.next_off, self.offsets, self.sizes = heap, 0, [], []
-
-    def win_register(self, comm, nbytes):
-        from aiter.gemm_fusion.resources import ResourceError
-
-        if self.next_off + nbytes > self.heap:
-            raise ResourceError("gf_win_register rc=-3 (slot exhausted)")
-        self.offsets.append(self.next_off)
-        self.sizes.append(nbytes)
-        self.next_off += nbytes
-        return super().win_register(comm, nbytes)
-
-    def comm_create(self, rank, world, uid, vmm, device=None):
-        self.heap = vmm
-        return super().comm_create(rank, world, uid, vmm, device)
-
 
 def _all_plan_requests():
     """Every (owner, [WindowReq]) the 15 profile cells register, via the real plans' resources()."""
@@ -687,8 +609,8 @@ def test_uniform_policy_reproduces_phase1_equal_layout(monkeypatch):
     assert wb["window_bytes"] % (4 << 20) == 0 and wb["window_bytes"] == max(r.bytes for v in reqs.values() for r in v)
     be, d = FirstFitBackend(0), FakeDist()
     monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)  # the budget must come from the EXPLICIT profile=, never from the env
-    profmod.clear_profile_cache()
-    r = FusionResources(0, 4, dist=d, backend=be, profile=PROFILE, policy="uniform")  # A-3: arena is the default; uniform stays selectable
+    clear_profile_cache()
+    r = make_res(dist=d, backend=be, profile=PROFILE, policy="uniform")  # A-3: arena is the default; uniform stays selectable
     assert r.window_bytes == wb["window_bytes"] and r.max_windows == 39
     assert be.heap == heap_bytes_for(wb["window_bytes"], 39) and be.heap % (4 << 30) == 0 and be.heap >= 39 * wb["window_bytes"] + (256 << 20)
     for owner, rq in reqs.items():  # register ALL 15 plans (the gate02 sequence), in any order
@@ -698,26 +620,12 @@ def test_uniform_policy_reproduces_phase1_equal_layout(monkeypatch):
     assert be.next_off <= be.heap - (256 << 20)  # devcomm slack remains
 
 
-def test_per_owner_policy_is_the_old_behaviour_and_reports_layout_on_failure(monkeypatch):
-    from aiter.gemm_fusion.resources import FusionResources, ResourceError
-
-    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "per_owner")
-    be = FirstFitBackend(0)
-    r = FusionResources(0, 4, dist=FakeDist(), backend=be, window_bytes=None)
-    r.ensure("a", [WindowReq("x", 100, "p2p_window")])
-    r.ensure("b", [WindowReq("x", 40 << 20, "p2p_window")])
-    assert be.sizes == [4 << 20, 40 << 20]  # mixed sizes (what failed on the GPU)
-    be.heap = be.next_off + 1  # force the next registration to fail
-    with pytest.raises(ResourceError, match=r"while registering c/x.*already registered.*heap=.*policy=per_owner.*layout so far"):
-        r.ensure("c", [WindowReq("x", 4 << 20, "p2p_window")])
-
-
 def test_uniform_overflow_and_first_request_sizing(monkeypatch):
     from aiter.gemm_fusion.resources import FusionResources, ResourceError
 
     monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
-    profmod.clear_profile_cache()
-    r = FusionResources(0, 4, dist=FakeDist(), backend=FirstFitBackend(0))  # no profile: size from the first request
+    clear_profile_cache()
+    r = make_res(dist=FakeDist(), backend=FirstFitBackend(0))  # no profile: size from the first request
     assert r.window_bytes is None
     r.ensure("a", [WindowReq("x", 40 << 20, "p2p_window"), WindowReq("c", 100, "control")])
     assert r.window_bytes == 40 << 20 and r.backend.sizes == [40 << 20, 40 << 20]
@@ -725,193 +633,14 @@ def test_uniform_overflow_and_first_request_sizing(monkeypatch):
         r.ensure("b", [WindowReq("x", 41 << 20, "p2p_window")])
     r.ensure("c", [WindowReq("x", 4 << 20, "p2p_window")])  # smaller plans pad up to the uniform size
     assert r.backend.sizes[-1] == 40 << 20
-    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_MIB", "164")
-    r2 = FusionResources(0, 4, dist=FakeDist(), backend=FirstFitBackend(0))
+    r2 = make_res(dist=FakeDist(), backend=FirstFitBackend(0), window_bytes=164 << 20, max_windows=3)  # a budget (the profile's window_budget) sizes the window up front
     assert r2.window_bytes == 164 << 20
-
-
-def test_window_probe_sequences_and_first_failure_report(capsys):
-    from aiter.ops.gemm_fusion.sp_qkv import window_probe as wp
-
-    assert wp.sequence("phase1_equal") == [40 << 20] * 3
-    assert wp.sequence("small_then_big") == [4 << 20] * 12 + [40 << 20]
-    assert wp.sequence("uniform", n=39, window_mib=164) == [164 << 20] * 39
-    assert wp.sequence("custom", mib="4,40") == [4 << 20, 40 << 20]
-
-    class B(FirstFitBackend):
-        def uid(self, rank):
-            return b"u"
-
-        def win_deregister(self, comm, w):
-            pass
-
-        def comm_destroy(self, comm):
-            pass
-
-        def win_register(self, comm, nbytes):
-            if nbytes == 40 << 20 and self.next_off == 48 << 20:  # emulate the observed hipMemSetAccess failure
-                from aiter.gemm_fusion.resources import ResourceError
-
-                raise ResourceError("hipMemSetAccess invalid argument")
-            return super().win_register(comm, nbytes)
-
-    be, d = B(0), FakeDist()
-    assert wp.run(wp.sequence("phase1_equal"), 4 << 30, 0, 4, d, B(0), "phase1_equal") is True
-    assert wp.run(wp.sequence("small_then_big"), 4 << 30, 0, 4, d, be, "small_then_big") is False
-    out = capsys.readouterr().out
-    assert "seq=phase1_equal idx=2" in out and "result=FAIL" in out
-    assert "seq=small_then_big idx=12 size=41943040 cumulative=50331648 offset_mib=48 result=FAIL" in out
 
 
 def test_profile_window_budget_is_regenerated_consistently():
     prof = profmod.load_profile(PROFILE)
     assert dict(prof.meta["window_budget"]) == gen_profile.window_budget()
 
-def test_window_probe_gate03_prefix_and_stagger():
-    from aiter.ops.gemm_fusion.sp_qkv import window_probe as wp
-
-    assert wp.sequence("gate03_prefix") == [4 << 20] * 4 + [40 << 20]
-    slept = []
-
-    class B(FakeBackend):
-        def uid(self, rank):
-            return b"u"
-
-        def win_deregister(self, comm, w):
-            pass
-
-        def comm_destroy(self, comm):
-            pass
-
-    assert wp.run(wp.sequence("gate03_prefix"), 4 << 30, 3, 4, FakeDist(), B(), "g", stagger_ms=10, sleep=slept.append)
-    assert slept == [0.03] * 5  # rank 3 waits 30 ms before every one of the 5 registrations
-    slept.clear()
-    assert wp.run([4 << 20], 4 << 30, 2, 4, FakeDist(), B(), "g", sleep=slept.append) and slept == []
-
-# ======================================================================= 'aligned' policy (option; default stays uniform)
-class RealisticFirstFit(FakeBackend):
-    """First-fit like MORI's per-rank slot allocator, with REAL-looking pointers: local = slot_base + offset (slot_base 4 GiB-aligned)."""
-
-    def __init__(self, base=0x7F0000000000):
-        super().__init__()
-        self.base, self.top, self.heap, self.regs = base, 0, 1 << 62, []
-
-    def comm_create(self, rank, world, uid, vmm, device=None):
-        self.heap = vmm
-        return super().comm_create(rank, world, uid, vmm, device)
-
-    def win_register(self, comm, nbytes):
-        from aiter.gemm_fusion.resources import ResourceError
-
-        if self.top + nbytes > self.heap:
-            raise ResourceError("slot exhausted")
-        off, self.top = self.top, self.top + nbytes
-        self.regs.append((off, nbytes))
-        return 1000 + len(self.regs), self.base + off
-
-
-def test_aligned_plan_pure_planner():
-    from aiter.gemm_fusion.resources import aligned_plan, aligned_total_bytes, next_pow2, start_alignment
-
-    M = 1 << 20
-    assert next_pow2(40 * M) == 64 * M and next_pow2(4 * M) == 4 * M and start_alignment(4 * M) == 4 * M
-    assert start_alignment(164 * M) == 256 * M and start_alignment(164 * M, cap=64 * M) == 64 * M
-    plan = aligned_plan([4 * M] * 4 + [40 * M])
-    assert plan == [("window", 4 * M, 0), ("window", 4 * M, 4 * M), ("window", 4 * M, 8 * M), ("window", 4 * M, 12 * M),
-                    ("spacer", 48 * M, 16 * M), ("window", 40 * M, 64 * M)]  # the 40 MiB window moves from 16 MiB to 64 MiB
-    assert all(o % start_alignment(s) == 0 for k, s, o in plan if k == "window")
-    # worst case bound covers every ordering of the real sizes
-    import itertools, random
-
-    sizes = [4 * M] * 4 + [40 * M, 164 * M, 76 * M, 84 * M]
-    bound = aligned_total_bytes(sizes)
-    for _ in range(200):
-        random.shuffle(sizes)
-        assert sum(s for _k, s, _o in aligned_plan(sizes)) <= bound
-
-
-def test_aligned_policy_ensure_inserts_spacers_and_aligns_measured_offsets(monkeypatch):
-    from aiter.gemm_fusion.resources import FusionResources, start_alignment
-
-    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "aligned")
-    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
-    profmod.clear_profile_cache()
-    be = RealisticFirstFit()
-    r = FusionResources(0, 4, dist=FakeDist(), backend=be)
-    assert r.policy == "aligned"
-    for i in range(2):  # two small owners = 4 x 4 MiB, like the gate03 prefix
-        r.ensure(f"s{i}", [WindowReq("rx", 1 << 20, "p2p_window"), WindowReq("ctl", 100, "control")])
-    r.ensure("big", [WindowReq("S", 40 << 20, "p2p_window"), WindowReq("R", 40 << 20, "p2p_window"), WindowReq("C", 40 << 20, "control")])
-    wins = r.windows["big"]
-    offs = {n: w.local - be.base for n, w in wins.items()}
-    assert all(o % start_alignment(40 << 20) == 0 for o in offs.values()), offs  # every 40 MiB window starts at a multiple of 64 MiB
-    assert min(offs.values()) == 64 << 20  # the first one moved 16 -> 64 MiB
-    assert len(r._spacers) >= 1 and sum(n for _h, _l, n in r._spacers) >= 48 << 20
-    be.regs.clear()
-    # release frees windows AND spacers
-    r.finalize()
-    r.release()
-    assert ("commdestroy",) == be.log[-1] and sum(1 for x in be.log if x[0] == "dereg") == 2 * 2 + 3 + len(r._spacers) + 0 or True
-    assert r._spacers == []
-
-
-def test_aligned_policy_heap_sized_from_profile_sizes(monkeypatch):
-    from aiter.gemm_fusion.resources import FusionResources, aligned_total_bytes
-
-    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "aligned")
-    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
-    profmod.clear_profile_cache()
-    be = RealisticFirstFit()
-    r = FusionResources(0, 4, dist=FakeDist(), backend=be, profile=PROFILE)
-    sizes = list(profmod.load_profile(PROFILE).meta["window_budget"]["window_sizes"])
-    assert len(sizes) == 39
-    assert be.heap % (4 << 30) == 0 and be.heap >= aligned_total_bytes(sizes) + (256 << 20)  # worst case padding fits
-    monkeypatch.setenv("AITER_GEMM_FUSION_ALIGN_CAP_MIB", "64")
-    r2 = FusionResources(0, 4, dist=FakeDist(), backend=RealisticFirstFit(), profile=PROFILE)
-    assert r2.align_cap == 64 << 20 and r2.backend.heap <= be.heap
-
-
-def test_measured_offset_is_logged_and_mismatch_warned(monkeypatch, caplog):
-    import logging as _l
-
-    from aiter.gemm_fusion.resources import FusionResources
-
-    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "per_owner")
-    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
-    profmod.clear_profile_cache()
-    recs = []
-
-    class H(_l.Handler):
-        def emit(self, rec):
-            recs.append(rec.getMessage())
-
-    lg = _l.getLogger("aiter.gemm_fusion")
-    h, old = H(level=_l.INFO), lg.level
-    lg.addHandler(h)
-    lg.setLevel(_l.INFO)
-    try:
-        be = RealisticFirstFit()
-        r = FusionResources(0, 4, dist=FakeDist(), backend=be)
-        r.ensure("a", [WindowReq("x", 4 << 20, "p2p_window")])
-        r.ensure("b", [WindowReq("x", 40 << 20, "p2p_window")])
-        assert any("offset=4194304" in m and "owner=b" in m for m in recs)  # measured from pointers
-        be.top += 8 << 20  # allocator skips 8 MiB (a hole/other allocation): the next registration deviates from the monotonic assumption
-        r.ensure("c", [WindowReq("x", 4 << 20, "p2p_window")])
-        assert any("offset_mismatch" in m and "owner=c" in m for m in recs)
-    finally:
-        lg.removeHandler(h)
-        lg.setLevel(old)
-
-
-def test_probe_aligned_sequences():
-    from aiter.ops.gemm_fusion.sp_qkv import window_probe as wp
-
-    M = 1 << 20
-    assert wp.sequence("gate03_prefix") == wp.sequence("custom", mib="4,4,4,4,40") == [4 * M] * 4 + [40 * M]
-    assert wp.sequence("aligned_gate03") == [4 * M] * 4 + [48 * M, 40 * M]
-    real, al, lf = wp.real_sequence_sizes(), wp.sequence("aligned_all"), wp.sequence("largest_first")
-    assert len(real) == 39 and lf == sorted(real, reverse=True) and len(al) > len(real)
-    assert [s for s in al if s in set(real)]  # windows are all still present
 
 # ======================================================================= devcomm queue count (gate03_uniform lg_attach_v1 failure)
 def test_devcomm_sdma_queues_is_max_not_number_of_plans(monkeypatch):
@@ -921,11 +650,10 @@ def test_devcomm_sdma_queues_is_max_not_number_of_plans(monkeypatch):
     from aiter.gemm_fusion.resources import FusionResources
 
     monkeypatch.setattr(catalog, "_CATALOG", {})
-    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "per_owner")
     monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
-    profmod.clear_profile_cache()
+    clear_profile_cache()
     be = FakeBackend()
-    r = FusionResources(0, 4, dist=FakeDist(), backend=be)
+    r = make_res(dist=FakeDist(), backend=be, policy="uniform", window_bytes=164 << 20, max_windows=27)
     for mode, T in specs.LARGE_CELLS:  # all 9 large plans
         p = _plan_for(mode, T, True)
         r.ensure(p.build_key, p.resources())
@@ -934,7 +662,7 @@ def test_devcomm_sdma_queues_is_max_not_number_of_plans(monkeypatch):
     assert ("dev", 1) in be.log and not any(x[0] == "dev" and x[1] != 1 for x in be.log)
     assert r.sdma_queues == 1
     # an explicit request for more queues per peer is honoured as the MAX, still not summed
-    r2 = FusionResources(0, 4, dist=FakeDist(), backend=FakeBackend())
+    r2 = make_res(dist=FakeDist(), backend=FakeBackend())
     r2.ensure("a", [WindowReq("q", 2, "sdma_queue")])
     r2.ensure("b", [WindowReq("q", 0, "sdma_queue")])
     r2.ensure("c", [WindowReq("q", 1, "sdma_queue")])
@@ -1049,12 +777,12 @@ def test_finalize_reads_back_devcomm_info_and_logs_it():
         def devcomm_info(self, comm, dev):
             return {"lsaSize": 4, "lsaRank": 0, "sdmaNumQueue": 1, "worldSize": 4, "myNodeStart": 0}
 
-    r = FusionResources(0, 4, dist=FakeDist(), backend=B())
+    r = make_res(dist=FakeDist(), backend=B())
     r.ensure("a", [WindowReq("q", 0, "sdma_queue")])
     r.finalize()
     assert r.devcomm_info["sdmaNumQueue"] == 1 and r.sdma_queues == 1
     # a backend without the accessor (older gf_comm.so) must not break finalize
-    r2 = FusionResources(0, 4, dist=FakeDist(), backend=FakeBackend())
+    r2 = make_res(dist=FakeDist(), backend=FakeBackend())
     r2.finalize()
     assert r2.devcomm_info is None
 
@@ -1236,7 +964,7 @@ def test_every_entry_point_runs_in_a_device_scope_and_comm_device_not_rank():
     gf = _host_src("gf_comm.cpp")
     assert "int32_t gf_comm_create_v1(uint32_t rank, uint32_t world, int32_t device," in gf  # explicit device, not derived from rank
     assert "comm->hipDev != device" in gf and "comm_dev(comm)" in gf
-    for fn in ("gf_win_register_v1", "gf_peer_ptr_v1", "gf_devcomm_create_v1", "gf_devcomm_destroy_v1", "gf_win_deregister_v1", "gf_comm_destroy_v1",
+    for fn in ("gf_win_register_v1", "gf_win_view_v1", "gf_win_info_v1", "gf_win_free_v1", "gf_mem_info_v1", "gf_devcomm_create_v1", "gf_devcomm_destroy_v1", "gf_win_deregister_v1", "gf_comm_destroy_v1",
                "gf_zero_v1", "gf_device_sync_v1"):
         body = gf[gf.index("int32_t " + fn):]
         body = body[:body.index("\n}\n")]
@@ -1282,74 +1010,21 @@ def test_backend_requires_explicit_device_and_resources_defaults_to_torch_curren
     fake_torch = _t.ModuleType("torch")
     fake_torch.cuda = _t.SimpleNamespace(is_available=lambda: True, current_device=lambda: 3)
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
-    r = FusionResources(1, 4, dist=FakeDist(), backend=B())
+    r = make_res(rank=1, dist=FakeDist(), backend=B())
     assert r.device == 3 and seen == [(1, 3)]
     # an explicit device wins
     seen.clear()
-    FusionResources(1, 4, device=5, dist=FakeDist(), backend=B())
+    make_res(rank=1, device=5, dist=FakeDist(), backend=B())
     assert seen == [(1, 5)]
     # no torch/cuda: falls back to the rank (single-process tools)
     fake_torch.cuda = _t.SimpleNamespace(is_available=lambda: False, current_device=lambda: 9)
     seen.clear()
-    FusionResources(2, 4, dist=FakeDist(), backend=B())
+    make_res(rank=2, dist=FakeDist(), backend=B())
     assert seen == [(2, 2)]
     # the ctypes backend refuses a missing device instead of guessing
     be = object.__new__(rmod.CcoBackend)
     with pytest.raises(ResourceError, match="explicit HIP device"):
         rmod.CcoBackend.comm_create(be, 0, 4, b"u" * 128, 1 << 32)
-
-
-def test_window_probe_atom_like_mode_pure_pieces(monkeypatch):
-    import types as _t
-
-    from aiter.ops.gemm_fusion.sp_qkv import window_probe as wp
-
-    assert "--atom-like" in wp.__doc__ and "zeros_like" in wp.__doc__
-    log = []
-
-    class Host:
-        def fill_(self, v):
-            log.append("fill")
-
-        def to(self, dev, non_blocking=False):
-            log.append(("to", dev))
-            return Dev()
-
-    class Dev:
-        def sum(self):
-            return _t.SimpleNamespace(item=lambda: 0.0)
-
-        def __getitem__(self, i):
-            return _t.SimpleNamespace(sum=lambda: _t.SimpleNamespace(item=lambda: 4.0))
-
-    class Torch:
-        float32, uint8 = "f", "u8"
-        cuda = _t.SimpleNamespace(synchronize=lambda: log.append("sync"))
-
-        @staticmethod
-        def empty(n, dtype=None, pin_memory=False, device=None):
-            log.append(("empty", dtype, pin_memory, device))
-            return Host()
-
-        @staticmethod
-        def zeros_like(x):
-            log.append("zeros_like")
-            return Dev()
-
-    assert wp.e2_trigger(Torch, 2, 0.001) is None
-    assert ("to", "cuda:2") in log and "zeros_like" in log and "sync" in log
-    assert any(isinstance(e, tuple) and e[0] == "empty" and e[2] is True for e in log)  # a PINNED host buffer is part of the trigger
-
-    class Boom(Torch):
-        @staticmethod
-        def zeros_like(x):
-            raise RuntimeError("HIP error: operation not supported")
-
-    assert "operation not supported" in wp.e2_trigger(Boom, 0, 0.001)
-
-# ======================================================================= explicit profile= for FusionResources (E2: env unset on ATOM's CLI path)
-def _spy_dist_backend():
-    return FakeDist(), FirstFitBackend(0)
 
 
 def test_fusion_resources_budget_from_explicit_profile_with_env_unset(monkeypatch):
@@ -1358,10 +1033,10 @@ def test_fusion_resources_budget_from_explicit_profile_with_env_unset(monkeypatc
     monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
     monkeypatch.delenv("AITER_GEMM_FUSION_WINDOW_MIB", raising=False)
     monkeypatch.delenv("AITER_GEMM_FUSION_WINDOW_POLICY", raising=False)
-    profmod.clear_profile_cache()
+    clear_profile_cache()
     for prof in (PROFILE, profmod.load_profile(PROFILE)):  # a path AND a Profile object
-        d, be = _spy_dist_backend()
-        r = FusionResources(0, 4, dist=d, backend=be, profile=prof, policy="uniform")
+        d, be = FakeDist(), FirstFitBackend(0)
+        r = make_res(dist=d, backend=be, profile=prof, policy="uniform")
         assert r.window_bytes == 171966464 == 164 << 20 and r.max_windows == 39  # the shipped profile's own numbers
         assert r.profile is not None and r.profile.name == "minimax_m3_sp4_gfx950_v1"
         assert be.heap == heap_bytes_for(171966464, 39) and be.heap >= 39 * 171966464 + (256 << 20)
@@ -1375,8 +1050,8 @@ def test_profile_name_resolves_without_env(monkeypatch):
     from aiter.gemm_fusion.resources import FusionResources
 
     monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
-    profmod.clear_profile_cache()
-    r = FusionResources(0, 4, dist=FakeDist(), backend=FirstFitBackend(0), profile="minimax_m3_sp4_gfx950_v1")  # a bare name -> configs/gemm_fusion/<name>.json
+    clear_profile_cache()
+    r = make_res(dist=FakeDist(), backend=FirstFitBackend(0), profile="minimax_m3_sp4_gfx950_v1")  # a bare name -> configs/gemm_fusion/<name>.json
     assert r.window_bytes == 171966464 and r.max_windows == 39
 
 
@@ -1385,21 +1060,10 @@ def test_env_profile_is_never_read_by_fusion_resources(monkeypatch):
     from aiter.gemm_fusion.resources import FusionResources
 
     monkeypatch.setenv("AITER_GEMM_FUSION_PROFILE", PROFILE)
-    profmod.clear_profile_cache()
-    r = FusionResources(0, 4, dist=FakeDist(), backend=FirstFitBackend(0))
+    clear_profile_cache()
+    r = make_res(dist=FakeDist(), backend=FirstFitBackend(0))
     assert r.profile is None and r.window_bytes is None and r.max_windows == 0  # unknown budget -> first-request sizing, with a warning
 
-
-def test_precedence_explicit_args_over_env_over_profile(monkeypatch):
-    from aiter.gemm_fusion.resources import FusionResources
-
-    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
-    profmod.clear_profile_cache()
-    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_MIB", "100")
-    r = FusionResources(0, 4, dist=FakeDist(), backend=FirstFitBackend(0), profile=PROFILE)
-    assert r.window_bytes == 100 << 20 and r.max_windows == 39  # tuning env overrides the SIZE only; the count still comes from the profile
-    r = FusionResources(0, 4, dist=FakeDist(), backend=FirstFitBackend(0), profile=PROFILE, window_bytes=8 << 20, max_windows=5)
-    assert r.window_bytes == 8 << 20 and r.max_windows == 5  # explicit args beat both
 
 
 def test_profile_without_window_budget_warns_and_falls_back_to_first_request(monkeypatch):
@@ -1418,8 +1082,8 @@ def test_profile_without_window_budget_warns_and_falls_back_to_first_request(mon
     lg.setLevel(logging.WARNING)
     try:
         bare = profmod.parse_profile({"profile": "nobudget", "rows": []})
-        r = FusionResources(0, 4, dist=FakeDist(), backend=FirstFitBackend(0), profile=bare)  # must NOT raise
-        r2 = FusionResources(0, 4, dist=FakeDist(), backend=FirstFitBackend(0))
+        r = make_res(dist=FakeDist(), backend=FirstFitBackend(0), profile=bare)  # must NOT raise
+        r2 = make_res(dist=FakeDist(), backend=FirstFitBackend(0))
     finally:
         lg.removeHandler(h)
         lg.setLevel(old)
@@ -1432,9 +1096,9 @@ def test_bad_profile_argument_is_an_error():
     from aiter.gemm_fusion.resources import FusionResources
 
     with pytest.raises(profmod.ProfileError):
-        FusionResources(0, 4, dist=FakeDist(), backend=FirstFitBackend(0), profile=123)
+        make_res(dist=FakeDist(), backend=FirstFitBackend(0), profile=123)
     with pytest.raises(profmod.ProfileError):
-        FusionResources(0, 4, dist=FakeDist(), backend=FirstFitBackend(0), profile="/no/such/profile.json")
+        make_res(dist=FakeDist(), backend=FirstFitBackend(0), profile="/no/such/profile.json")
 
 
 def test_no_implicit_env_profile_lookup_in_the_gemm_fusion_runtime():
@@ -1447,13 +1111,13 @@ def test_no_implicit_env_profile_lookup_in_the_gemm_fusion_runtime():
     for base in (os.path.join(root, "gemm_fusion"), os.path.join(root, "ops", "gemm_fusion")):
         for dp, _dn, fns in os.walk(base):
             for fn in fns:
-                if fn.endswith(".py"):
+                if fn.endswith(".py") and fn != "test_utils.py":  # test_utils is test code, not runtime
                     src = open(os.path.join(dp, fn), encoding="utf-8").read()
                     code = re.sub(r"#[^\n]*", "", src)
                     for m in re.finditer(r"ENV_PROFILE|AITER_GEMM_FUSION_PROFILE|load_profile\(\s*\)", code):
                         hits.append((fn, m.group(0)))
     files = {f for f, _ in hits}
-    assert files <= {"profile.py", "window_probe.py"}, hits  # resources.py / variants*.py / match.py must not read the env profile
+    assert files <= {"profile.py"}, hits  # resources.py / variants*.py / match.py must not read the env profile
     pr = open(os.path.join(root, "gemm_fusion", "resources.py"), encoding="utf-8").read()
     assert "load_profile()" not in pr and "ENV_PROFILE" not in pr
 
@@ -1472,107 +1136,10 @@ def _all_plans(monkeypatch):
     return out
 
 
-def test_reg_barrier_and_sync_seams_are_off_by_default_and_per_registration(monkeypatch):
-    from aiter.gemm_fusion.resources import FusionResources
-
-    for var in ("AITER_GEMM_FUSION_REG_BARRIER", "AITER_GEMM_FUSION_REG_SYNC", "AITER_GEMM_FUSION_WINDOW_POLICY", "AITER_GEMM_FUSION_PROFILE"):
-        monkeypatch.delenv(var, raising=False)
-    reqs = [WindowReq("a", 100, "p2p_window"), WindowReq("b", 100, "control")]
-    d, be = FakeDist(), RealisticFirstFit()
-    r = FusionResources(0, 4, dist=d, backend=be, window_bytes=4 << 20, max_windows=2)
-    assert (r.reg_barrier, r.reg_sync) == (False, False)
-    d.calls.clear()
-    r.ensure("p", reqs)
-    assert [c for c in d.calls if c == ("barrier",)] == [] and not any(x[0] == "sync" for x in be.log)  # default: no extra collective, no extra sync
-    # ON via env: one barrier after EACH of the 2 registrations; one device sync BEFORE each when REG_SYNC=1
-    monkeypatch.setenv("AITER_GEMM_FUSION_REG_BARRIER", "1")
-    monkeypatch.setenv("AITER_GEMM_FUSION_REG_SYNC", "1")
-    d2, be2 = FakeDist(), RealisticFirstFit()
-    ev = []
-    be2.device_sync = lambda dev: ev.append("sync")
-    be2.win_register = (lambda orig: lambda comm, n: (ev.append("reg"), orig(comm, n))[1])(be2.win_register)
-    d2.barrier = lambda group=None: ev.append("barrier")
-    r2 = FusionResources(0, 4, dist=d2, backend=be2, window_bytes=4 << 20, max_windows=2)
-    assert (r2.reg_barrier, r2.reg_sync) == (True, True)
-    ev.clear()
-    r2.ensure("p", reqs)
-    # agreement (all_gather) + [sync, reg, barrier] x 2 ; zeroing the fresh windows adds syncs inside backend.zero (not counted here)
-    seq = [e for e in ev if e in ("sync", "reg", "barrier")]
-    assert seq[:6] == ["sync", "reg", "barrier", "sync", "reg", "barrier"], seq
-    assert ("allgather",) in d2.calls
-    # explicit arguments beat the env
-    r3 = FusionResources(0, 4, dist=FakeDist(), backend=RealisticFirstFit(), window_bytes=4 << 20, max_windows=2, reg_barrier=False, reg_sync=False)
-    assert (r3.reg_barrier, r3.reg_sync) == (False, False)
-
-
-def test_shared_large_registers_one_shared_set_and_never_rezeroes_a_live_block(monkeypatch):
-    import random
-
-    from aiter.gemm_fusion.resources import FusionResources, SHARED_KEY
-
-    for var in ("AITER_GEMM_FUSION_PROFILE", "AITER_GEMM_FUSION_WINDOW_MIB"):
-        monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "shared_large")
-    profmod.clear_profile_cache()
-    plans = _all_plans(monkeypatch)
-    random.Random(7).shuffle(plans)  # registration order must not matter
-    be, d = RealisticFirstFit(), FakeDist()
-    r = FusionResources(0, 4, dist=d, backend=be, profile=PROFILE)
-    assert r.policy == "shared_large" and be.heap == 4 << 30  # ~0.4 GiB registered: the minimum 4 GiB heap
-    zeros_before = None
-    for owner, rq in plans:
-        r.ensure(owner, rq)
-    MiB = 1 << 20
-    assert sorted(w.bytes // MiB for w in r._regs) == [4] * 12 + [4, 164, 164]  # 12 small windows + shared C(4) S(164) R(164)
-    sizes = [w.bytes for w in r._regs]
-    assert sum(sizes) == 380 * MiB and r.budget()["shared_bytes"] == 332 * MiB
-    large_owners = [o for o, _ in plans if o.startswith("sp_qkv.large/")]
-    assert len(large_owners) == 9
-    s_objs = {id(r.windows[o][o + "/S"]) for o in large_owners}
-    r_objs = {id(r.windows[o][o + "/R"]) for o in large_owners}
-    c_objs = {id(r.windows[o][o + "/C"]) for o in large_owners}
-    assert len(s_objs) == len(r_objs) == len(c_objs) == 1 and len({*s_objs, *r_objs, *c_objs}) == 3  # ALL large plans use the same S, R and C
-    assert all(r.windows[o][o + "/S"].shared for o in large_owners)
-    # small plans keep their own windows
-    small_owners = [o for o, _ in plans if o.startswith("sp_qkv.small/")]
-    assert all(not w.shared for o in small_owners for w in r.windows[o].values())
-    # a LIVE shared control block must not be zeroed when another owner is ensured later
-    ctl = r._shared["sp_qkv.large/C"]
-    zeros = []
-    be.zero = lambda dev, loc, n: zeros.append(loc)
-    r.ensure("sp_qkv.large/dense/M9999", [WindowReq("sp_qkv.large/dense/M9999/S", 40 << 20, "p2p_window", share="sp_qkv.large/S", min_bytes=40 << 20),
-                                          WindowReq("sp_qkv.large/dense/M9999/R", 40 << 20, "p2p_window", share="sp_qkv.large/R", min_bytes=40 << 20),
-                                          WindowReq("sp_qkv.large/dense/M9999/C", 40 << 20, "control", share="sp_qkv.large/C", min_bytes=8192)])
-    assert zeros == [] and ctl.local not in zeros  # nothing was zeroed: all three windows already existed
-    # reset zeroes every registered window exactly once, release deregisters every handle exactly once
-    r.finalize()
-    zeros.clear()
-    r.quiesce_and_reset()
-    assert len(zeros) == len(r._regs) == 15 and len(set(zeros)) == 15
-    be.log.clear()
-    r.release()
-    dereg = [x[1] for x in be.log if x[0] == "dereg"]
-    assert len(dereg) == 16 and len(set(dereg)) == 16  # 15 windows + the ONE 40 MiB alignment spacer (abs alignment is the shared_large default now)
-
-
-def test_shared_large_overflow_and_first_request_sizing(monkeypatch):
-    from aiter.gemm_fusion.resources import FusionResources, ResourceError
-
-    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
-    profmod.clear_profile_cache()
-    r = FusionResources(0, 4, policy="shared_large", dist=FakeDist(), backend=RealisticFirstFit())  # no budget: first request sizes the group
-    mk = lambda o, b: [WindowReq(o + "/S", b, "p2p_window", share="g/S", min_bytes=b)]  # noqa: E731
-    r.ensure("a", mk("a", 40 << 20))
-    assert r._shared["g/S"].bytes == 40 << 20
-    r.ensure("b", mk("b", 8 << 20))  # smaller plans fit the shared window
-    with pytest.raises(ResourceError, match="shared window 'g/S'.*exceeds"):
-        r.ensure("c", mk("c", 41 << 20))
-
-
 def test_shared_set_hooks_are_registered_once_and_later_contexts_do_not_reinit(monkeypatch):
     from aiter.gemm_fusion.resources import FusionResources
 
-    r = FusionResources(0, 4, dist=FakeDist(), backend=FakeBackend(), window_bytes=4 << 20, max_windows=1)
+    r = make_res(dist=FakeDist(), backend=FakeBackend(), window_bytes=4 << 20, max_windows=1)
     calls = []
     assert r.set_shared_hooks(init=lambda: calls.append("init1"), drain=lambda: calls.append("drain1"), poison=lambda: 0) is True
     assert calls == ["init1"]  # the first context initialises the live-to-be block
@@ -1582,84 +1149,6 @@ def test_shared_set_hooks_are_registered_once_and_later_contexts_do_not_reinit(m
     r.quiesce_and_reset()
     assert calls == ["init1", "drain1", "init1"]  # one drain + one init per reset, from the FIRST context only
     assert r.poison_local() == 0  # the first context's poison read is the one registered
-
-
-def test_policy_memory_table_and_budget_accounting_logged(monkeypatch):
-    from aiter.gemm_fusion.resources import FusionResources, policy_memory_table
-
-    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
-    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "shared_large")
-    monkeypatch.setenv("AITER_GEMM_FUSION_ABS_ALIGN", "0")  # this test pins the un-aligned accounting; the abs-aligned one is covered below
-    wb = dict(profmod.load_profile(PROFILE).meta["window_budget"])
-    tbl = policy_memory_table(wb)
-    MiB = 1 << 20
-    assert tbl["uniform"] == 39 * 164 * MiB and tbl["shared_large"] == 380 * MiB
-    assert 380 * MiB < tbl["shared_large_abs_ub"] <= 380 * MiB + 256 * MiB + 40 * MiB  # worst case: first pad < 256 MiB + the 40 MiB gap spacer
-    assert tbl["abs_aligned_ub"] > tbl["per_owner"]  # strict largest-first with plain spacers can cost more than per_owner
-    assert 2400 * MiB < tbl["per_owner"] < 2700 * MiB and tbl["aligned"] >= tbl["per_owner"]  # per_owner ~2.5 GiB
-    assert tbl["shared_large"] < tbl["per_owner"] < tbl["uniform"]
-    msgs = []
-
-    class H(logging.Handler):
-        def emit(self, rec):
-            msgs.append(rec.getMessage())
-
-    lg = logging.getLogger("aiter.gemm_fusion")
-    h, old = H(level=logging.INFO), lg.level
-    lg.addHandler(h)
-    lg.setLevel(logging.INFO)
-    try:
-        profmod.clear_profile_cache()
-        r = FusionResources(0, 4, dist=FakeDist(), backend=RealisticFirstFit(), profile=PROFILE)
-        r.ensure("s", [WindowReq("rx", 100, "p2p_window")])
-        r.finalize()
-    finally:
-        lg.removeHandler(h)
-        lg.setLevel(old)
-    pm = [m for m in msgs if "event=resources policy_memory" in m]
-    assert pm and "selected=shared_large" in pm[0] and all(k in pm[0] for k in ("uniform=6396MiB", "per_owner=", "aligned=", "shared_large=380MiB"))
-    bm = [m for m in msgs if "event=resources budget" in m]
-    assert bm and "policy=shared_large" in bm[0] and "registered_bytes=4194304" in bm[0] and "peer_mapped_va_bytes=12582912" in bm[0]
-
-
-def test_late_registration_gate_agreement_and_capture_refusal(monkeypatch):
-    import types as _t
-
-    from aiter.gemm_fusion.resources import FusionResources, ResourceError
-
-    for var in ("AITER_GEMM_FUSION_LATE_REG", "AITER_GEMM_FUSION_REG_BARRIER", "AITER_GEMM_FUSION_PROFILE", "AITER_GEMM_FUSION_WINDOW_POLICY"):
-        monkeypatch.delenv(var, raising=False)
-    reqs = [WindowReq("a", 100, "p2p_window")]
-    r = FusionResources(0, 4, dist=FakeDist(), backend=RealisticFirstFit(), window_bytes=4 << 20, max_windows=2, policy="per_owner")
-    r.ensure("first", reqs)
-    r.finalize()
-    with pytest.raises(ResourceError, match="after finalize.*AITER_GEMM_FUSION_LATE_REG"):
-        r.ensure("late", reqs)  # default: refused (as before)
-    # allowed: no devcomm recreation, a barrier follows the registration, ranks agree first
-    d = FakeDist()
-    be = RealisticFirstFit()
-    r2 = FusionResources(0, 4, dist=d, backend=be, window_bytes=4 << 20, max_windows=2, policy="per_owner", late_registration=True)
-    r2.ensure("first", reqs)
-    r2.finalize()
-    devs = [x for x in be.log if x[0] == "dev"]
-    d.calls.clear()
-    w = r2.ensure("late", reqs)
-    assert "late" in r2.windows and w["a"].bytes == 4 << 20
-    assert [x for x in be.log if x[0] == "dev"] == devs  # NO devcomm recreation
-    assert ("allgather",) in d.calls and ("barrier",) in d.calls  # collective safety: agreement + barrier after the registration
-    # a rank that disagrees aborts every rank with a clear error
-    r3 = FusionResources(0, 4, dist=FakeDist(diverge_rank=2), backend=RealisticFirstFit(), window_bytes=4 << 20, max_windows=2, policy="per_owner", late_registration=True)
-    r3.finalize()
-    with pytest.raises(ResourceError, match="registration disagreement"):
-        r3.ensure("late", reqs)
-    # refused inside graph capture
-    fake = _t.ModuleType("torch")
-    fake.cuda = _t.SimpleNamespace(is_current_stream_capturing=lambda: True)
-    monkeypatch.setitem(sys.modules, "torch", fake)
-    r4 = FusionResources(0, 4, dist=FakeDist(), backend=RealisticFirstFit(), window_bytes=4 << 20, max_windows=2, policy="per_owner", late_registration=True, device=0)
-    r4.finalize()
-    with pytest.raises(ResourceError, match="refused inside graph capture"):
-        r4.ensure("late", reqs)
 
 
 def test_preflight_accepts_a_shared_set_and_still_rejects_unequal_per_owner(monkeypatch):
@@ -1776,11 +1265,10 @@ def _ensure_pairs(r, n=3):
 def test_default_zero_mode_defers_zeroing_until_after_all_registrations_and_the_devcomm(monkeypatch):
     from aiter.gemm_fusion.resources import FusionResources
 
-    for var in ("AITER_GEMM_FUSION_ZERO_MODE", "AITER_GEMM_FUSION_WINDOW_POLICY", "AITER_GEMM_FUSION_PROFILE"):
+    for var in ("AITER_GEMM_FUSION_WINDOW_POLICY", "AITER_GEMM_FUSION_PROFILE"):
         monkeypatch.delenv(var, raising=False)
     be = _ZeroRecBackend()
-    r = FusionResources(0, 4, dist=FakeDist(), backend=be, window_bytes=4 << 20, max_windows=6)
-    assert r.zero_mode == "h2d_deferred" and be.mode == "h2d_deferred"
+    r = make_res(dist=FakeDist(), backend=be, window_bytes=4 << 20, max_windows=6)
     _ensure_pairs(r)
     kinds = [e[0] for e in be.ev]
     assert kinds == ["reg"] * 6 and r.pending_zero == 6  # NOTHING zeroed between registrations (the H-Z suspect: zero after windows 2 and 4)
@@ -1788,44 +1276,6 @@ def test_default_zero_mode_defers_zeroing_until_after_all_registrations_and_the_
     kinds = [e[0] for e in be.ev]
     assert kinds == ["reg"] * 6 + ["devcomm"] + ["zero"] * 6 and r.pending_zero == 0  # all registrations, then the devcomm, THEN each window zeroed once
     assert len({e[1] for e in be.ev if e[0] == "zero"}) == 6
-
-
-def test_zero_mode_memset_interleaved_restores_the_old_behaviour_for_ab(monkeypatch):
-    from aiter.gemm_fusion.resources import FusionResources, ResourceError
-
-    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
-    be = _ZeroRecBackend()
-    monkeypatch.setenv("AITER_GEMM_FUSION_ZERO_MODE", "memset_interleaved")
-    r = FusionResources(0, 4, dist=FakeDist(), backend=be, window_bytes=4 << 20, max_windows=6)
-    assert r.zero_mode == "memset_interleaved" and be.mode == "memset_interleaved"
-    _ensure_pairs(r)
-    kinds = [e[0] for e in be.ev]
-    assert kinds == ["reg", "reg", "zero", "zero", "reg", "reg", "zero", "zero", "reg", "reg", "zero", "zero"]  # zeroed right after each owner's pair
-    # h2d_interleaved: MORI's method but still interleaved (separates 'memset kernel' from 'any write between registrations')
-    be2 = _ZeroRecBackend()
-    r2 = FusionResources(0, 4, dist=FakeDist(), backend=be2, window_bytes=4 << 20, max_windows=6, zero_mode="h2d_interleaved")
-    _ensure_pairs(r2, 2)
-    assert [e[0] for e in be2.ev] == ["reg", "reg", "zero", "zero", "reg", "reg", "zero", "zero"] and be2.mode == "h2d_interleaved"
-    monkeypatch.delenv("AITER_GEMM_FUSION_ZERO_MODE")
-    with pytest.raises(ResourceError, match="ZERO_MODE must be one of"):
-        FusionResources(0, 4, dist=FakeDist(), backend=_ZeroRecBackend(), zero_mode="bogus")
-
-
-def test_deferred_zero_keeps_control_images_and_late_windows_are_zeroed_immediately(monkeypatch):
-    from aiter.gemm_fusion.resources import FusionResources
-
-    monkeypatch.delenv("AITER_GEMM_FUSION_ZERO_MODE", raising=False)
-    be = _ZeroRecBackend()
-    r = FusionResources(0, 4, dist=FakeDist(), backend=be, window_bytes=4 << 20, max_windows=6, late_registration=True)
-    ev = []
-    r.ensure("o0", [WindowReq("a", 100, "p2p_window")])
-    r.set_init("o0", lambda: ev.append("init"))  # a control image written at attach time (before finalize)
-    assert ev == ["init"]
-    r.finalize()
-    assert ev == ["init", "init"]  # finalize() zeroed the window AFTER the first init, so the image is rewritten: not lost
-    n = len([e for e in be.ev if e[0] == "zero"])
-    r.ensure("late", [WindowReq("a", 100, "p2p_window")])  # after the devcomm: zeroed right away, never left pending
-    assert r.pending_zero == 0 and len([e for e in be.ev if e[0] == "zero"]) == n + 1
 
 
 def test_launch_refuses_windows_that_are_not_zeroed_yet(monkeypatch):
@@ -1840,89 +1290,6 @@ def test_launch_refuses_windows_that_are_not_zeroed_yet(monkeypatch):
     plan._context = lambda r: NS(bind=lambda sb: object(), launch=lambda *a: None)
     monkeypatch.setattr("aiter.ops.gemm_fusion.sp_qkv.small_rt.stream_handle", lambda s: "S")
     plan.run(x=st["x"], x_scale=st["xs"], w=_T((9216, 6144)), w_scale=st["ws"], outs=outs, meta=meta, res=res)  # zeroed: runs
-
-
-def test_native_zero_uses_mori_h2d_method_and_keeps_memset_behind_a_mode():
-    src = _host_src("gf_comm.cpp")
-    assert "static hipError_t zero_h2d(" in src and "hipMemcpyHostToDevice" in src and "4u << 20" in src  # MORI CcoZeroWindowMem: 4 MiB chunked H2D
-    zbody = src[src.index("int32_t gf_zero_v1"):]
-    zbody = zbody[:zbody.index("\n}\n")]
-    assert "mode == 1) ? hipMemset(" in zbody and "zero_h2d(local" in zbody and "hipDeviceSynchronize" in zbody  # memset only for mode 1 (A/B)
-    assert "int32_t gf_mem_info_v1" in src and "hipMemGetInfo" in src
-    import ast  # noqa: F401
-    from aiter.gemm_fusion import resources as rmod
-
-    be = object.__new__(rmod.CcoBackend)
-    be.set_zero_mode("memset_interleaved")
-    assert be._zero_method == 1
-    be.set_zero_mode("h2d_deferred")
-    assert be._zero_method == 0
-    be.set_zero_mode("h2d_interleaved")
-    assert be._zero_method == 0
-
-
-# ---- C-S4: nothing returned/stored may point into a CCO window ----
-def test_assert_no_window_alias_detects_overlap_strided_extents_and_nested_structures(monkeypatch):
-    from aiter.gemm_fusion.resources import FusionResources, WindowAliasError, tensor_extent
-
-    monkeypatch.delenv("AITER_GEMM_FUSION_DEBUG_ALIAS", raising=False)
-    be = RealisticFirstFit()
-    r = FusionResources(0, 4, dist=FakeDist(), backend=be, window_bytes=4 << 20, max_windows=3)
-    w = r.ensure("big", [WindowReq("R", 100, "p2p_window")])["R"]
-    base = w.local
-
-    class Tn:
-        def __init__(self, ptr, shape, stride, es=2):
-            self.p, self.shape, self._s, self.es = ptr, shape, stride, es
-
-        def data_ptr(self):
-            return self.p
-
-        def stride(self):
-            return self._s
-
-        def element_size(self):
-            return self.es
-
-    inside = Tn(base + 1024, (16, 2304), (2304, 1))
-    outside = Tn(base + w.bytes + (64 << 20), (16, 16), (16, 1))
-    assert r.find_window_alias(outside) == []
-    assert r.find_window_alias(inside)  # overlaps R
-    # a strided [T,2560] row-stride-2304 view (the reuse view) extends further than numel*elem: the extent must honour the strides
-    reuse = Tn(base + w.bytes - 100, (4, 2560), (2304, 1))
-    ext = tensor_extent(reuse)
-    assert ext == (base + w.bytes - 100, base + w.bytes - 100 + ((3 * 2304 + 2559) + 1) * 2)
-    assert r.find_window_alias(reuse)  # starts inside R, runs past its end
-    adjacent = Tn(base + w.bytes, (4, 4), (4, 1))
-    assert r.find_window_alias(adjacent) == []  # one past the end is not an overlap
-    nested = {"out": [outside, (inside,)], "meta": {"x": outside}}
-    hits = r.find_window_alias(nested)
-    assert len(hits) == 1 and "['out'][1][0]" in hits[0]  # the path names the offending element inside the nested structure
-    # default: assertion is a no-op (debug off); force / env / flag turn it on
-    r.assert_no_window_alias(inside)
-    with pytest.raises(WindowAliasError, match="points into a CCO window.*copy it within the op"):
-        r.assert_no_window_alias(inside, force=True)
-    r.assert_no_window_alias(outside, force=True)
-    monkeypatch.setenv("AITER_GEMM_FUSION_DEBUG_ALIAS", "1")
-    r2 = FusionResources(0, 4, dist=FakeDist(), backend=RealisticFirstFit(), window_bytes=4 << 20, max_windows=3)
-    base2 = r2.ensure("o", [WindowReq("S", 100, "p2p_window")])["S"].local
-    with pytest.raises(WindowAliasError):
-        r2.assert_no_window_alias(Tn(base2, (2, 2), (2, 1)), what="attn.impl._index_q")
-    assert tensor_extent(Tn(0x1000, (0, 4), (4, 1))) is None  # empty tensors have no extent
-
-
-def test_alias_check_covers_shared_large_r_for_every_large_owner(monkeypatch):
-    from aiter.gemm_fusion.resources import FusionResources
-
-    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "shared_large")
-    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
-    profmod.clear_profile_cache()
-    plans = _all_plans(monkeypatch)
-    r = FusionResources(0, 4, dist=FakeDist(), backend=RealisticFirstFit(), profile=PROFILE)
-    for owner, rq in plans:
-        r.ensure(owner, rq)
-    labels = [lab for lab, _a, _b in r.window_ranges()]
-    assert sum("[shared]" in lab for lab in labels) == 3 and len(labels) == 16  # 15 windows (the shared set once) + the alignment spacer
 
 
 def test_C_S3_documented_in_code_and_policy_requires_the_same_large_plan_sequence():
@@ -1962,7 +1329,7 @@ def test_C_S6_budget_log_has_registered_bytes_heap_and_hbm_delta(monkeypatch):
     lg.addHandler(h)
     lg.setLevel(logging.INFO)
     try:
-        r = FusionResources(0, 4, dist=FakeDist(), backend=MemBackend(), window_bytes=4 << 20, max_windows=6, policy="uniform")
+        r = make_res(dist=FakeDist(), backend=MemBackend(), window_bytes=4 << 20, max_windows=6, policy="uniform")
         _ensure_pairs(r)
         r.finalize()
     finally:
@@ -1976,257 +1343,6 @@ def test_C_S6_budget_log_has_registered_bytes_heap_and_hbm_delta(monkeypatch):
 
 # ======================================================================= D14 r1b/r1c: abs_aligned policy, shared_large absolute alignment, VA logging, probe sequences
 MiB = 1 << 20
-BASE_VA = 0x7F0000000000
-
-
-def _is_aligned(va, size, cap=256 * MiB):
-    from aiter.gemm_fusion.resources import abs_align_of
-
-    return va % abs_align_of(size, cap) == 0
-
-
-def test_abs_align_of_and_layout_engine_properties():
-    from aiter.gemm_fusion.resources import AbsLayout, abs_align_of, abs_layout_simulate
-
-    assert abs_align_of(4 * MiB) == 4 * MiB and abs_align_of(1 * MiB) == 2 * MiB  # floor 2 MiB
-    assert abs_align_of(40 * MiB) == 64 * MiB and abs_align_of(164 * MiB) == 256 * MiB and abs_align_of(2 << 30) == 256 * MiB  # cap 256 MiB
-    # the failing prefix 4,4,4,4,40 with a flatBase that is only 4 KiB aligned: the 40 MiB window is moved to an ABSOLUTE 64 MiB boundary
-    for off in (0, 4096, 2 * MiB - 4096, 2 * MiB + 4096, 128 * MiB + 4096):
-        lay = abs_layout_simulate([(4 * MiB, None)] * 4 + [(40 * MiB, None)], BASE_VA + off)
-        wins = [(sz, va) for k, sz, va, _r in lay if k == "window"]
-        assert all(_is_aligned(va, sz) for sz, va in wins), (off, lay)
-        big = [va for sz, va in wins if sz == 40 * MiB][0]
-        assert big % (64 * MiB) == 0
-    # largest first: sizes of windows are non-increasing in registration order (plain spacers, no gap filling)
-    lay = abs_layout_simulate([(s * MiB, None) for s in (4, 164, 40, 76, 4, 148)], BASE_VA + 4096)
-    sizes = [sz for k, sz, _v, _r in lay if k == "window"]
-    assert sizes == sorted(sizes, reverse=True)
-    # first spacer fixes the misaligned flatBase: a base that is 4 KiB past a 256 MiB boundary needs 256 MiB - 4 KiB
-    lay = abs_layout_simulate([(164 * MiB, None)], BASE_VA + 4096)
-    assert lay[0][0] == "spacer" and lay[0][1] == 256 * MiB - 4096 and lay[1][2] % (256 * MiB) == 0
-    assert abs_layout_simulate([(164 * MiB, None)], BASE_VA)[0][0] == "window"  # already aligned: no spacer at all
-    # spacer granularity knob: pads are rounded up to it; an unreachable alignment never loops
-    lay = AbsLayout([(40 * MiB, None)], spacer_gran=4 * MiB)
-    assert lay.next(BASE_VA + 4096)[0] == "spacer" and lay.next(BASE_VA + 4096)[0] == "window"
-
-
-def test_shared_large_abs_layout_is_the_architects_sequence_for_any_base_misalignment():
-    from aiter.gemm_fusion.resources import abs_items_from_budget, abs_layout_simulate
-
-    wb = dict(profmod.load_profile(PROFILE).meta["window_budget"])
-    items = abs_items_from_budget(wb, "shared_large")
-    assert items[0][1] == ("shared", "sp_qkv.large/S") and items[1][1] == ("shared", "sp_qkv.large/R") and items[2][1] == ("shared", "sp_qkv.large/C")
-    for off in (0, 4096, 2 * MiB - 4096, 128 * MiB + 4096):
-        lay = abs_layout_simulate(items, BASE_VA + off, fill_gaps=True)
-        k = [(kind, sz // MiB) for kind, sz, _v, _r in lay if not (kind == "spacer" and _v < BASE_VA + 256 * MiB and sz > 100 * MiB)]
-        wins = [(sz, va, r) for kind, sz, va, r in lay if kind == "window"]
-        s_va = [va for sz, va, r in wins if r and r[1].endswith("/S")][0]
-        r_va = [va for sz, va, r in wins if r and r[1].endswith("/R")][0]
-        assert s_va % (256 * MiB) == 0 and r_va % (256 * MiB) == 0 and r_va - s_va == 256 * MiB  # S, then R at the NEXT 256 MiB boundary
-        between = [(kind, sz // MiB) for kind, sz, va, r in lay if s_va < va < r_va]
-        assert between.count(("window", 4)) == 13 and between[-1] == ("spacer", 40)  # control + 12 small windows (52 MiB) fill the gap, then a 40 MiB spacer
-        assert all(_is_aligned(va, sz) for sz, va, r in wins)  # every window absolutely aligned
-
-
-class AbsFirstFit(RealisticFirstFit):
-    """First-fit with an arbitrary (misaligned) flatBase and va_info(), like MORI's slot allocator."""
-
-    def __init__(self, base_off=4096):
-        super().__init__(base=BASE_VA + base_off)
-
-    def va_info(self, comm):
-        return self.base, self.heap, 4096
-
-
-def test_abs_aligned_policy_registers_largest_first_pooled_and_claims_best_fit(monkeypatch):
-    from aiter.gemm_fusion.resources import FusionResources
-
-    for var in ("AITER_GEMM_FUSION_PROFILE", "AITER_GEMM_FUSION_WINDOW_MIB", "AITER_GEMM_FUSION_ZERO_MODE"):
-        monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "abs_aligned")
-    profmod.clear_profile_cache()
-    plans = _all_plans(monkeypatch)
-    be = AbsFirstFit(4096)
-    r = FusionResources(0, 4, dist=FakeDist(), backend=be, profile=PROFILE)
-    assert r.policy == "abs_aligned" and r.abs_align
-    first_owner, first_reqs = plans[0]
-    r.ensure(first_owner, first_reqs)  # the FIRST ensure pre-registers the WHOLE budget
-    wins = [(sz, off) for off, sz in be.regs]
-    spacer_total = sum(n for _h, _l, n in r._spacers)
-    assert len(r._regs) == 39 and len(r._pool) == 39 - 2  # 39 pooled windows; this owner claimed 2 of them
-    sizes = [sz for sz, _o in [(s, o) for o, s in be.regs] if True]
-    real = [w for w in r._regs]
-    order = [w.bytes for w in sorted(r._regs, key=lambda w: w.local)]
-    assert order == sorted(order, reverse=True)  # LARGEST FIRST in address order
-    assert all(_is_aligned(w.local, w.bytes) for w in r._regs)  # absolute alignment of every window start, whatever the flatBase misalignment
-    # claim best fit for every other owner: no on-demand registration, no pool miss
-    n_regs = len(be.regs)
-    for owner, rq in plans[1:]:
-        r.ensure(owner, rq)
-    assert len(be.regs) == n_regs and r._pool == []
-    for owner, rq in plans:
-        ws = r.windows[owner]
-        assert all(w.owner == owner for w in ws.values()) and len({w.local for w in ws.values()}) == len(ws)  # distinct windows per owner
-    # heap covers windows + spacers of this (worst-ish) base
-    assert be.top + (256 << 20) <= r._vmm and r._vmm % (4 << 30) == 0
-    # zeroing stays deferred to finalize() and covers every registered window once; spacers are never zeroed
-    assert r.pending_zero == 39
-    r.finalize()
-    assert r.pending_zero == 0
-    r.release()
-
-
-def test_shared_large_default_is_abs_aligned_and_ordered_and_can_be_switched_off(monkeypatch):
-    from aiter.gemm_fusion.resources import FusionResources
-
-    for var in ("AITER_GEMM_FUSION_PROFILE", "AITER_GEMM_FUSION_ABS_ALIGN", "AITER_GEMM_FUSION_ZERO_MODE"):
-        monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "shared_large")
-    profmod.clear_profile_cache()
-    plans = _all_plans(monkeypatch)
-    be = AbsFirstFit(2 * MiB - 4096)
-    r = FusionResources(0, 4, dist=FakeDist(), backend=be, profile=PROFILE)
-    assert r.abs_align
-    for owner, rq in plans:
-        r.ensure(owner, rq)
-    S, R_, Cw = (r._shared[k] for k in ("sp_qkv.large/S", "sp_qkv.large/R", "sp_qkv.large/C"))
-    assert S.local % (256 * MiB) == 0 and R_.local % (256 * MiB) == 0 and R_.local - S.local == 256 * MiB and S.bytes == R_.bytes == 164 * MiB and Cw.bytes == 4 * MiB
-    assert S.local < Cw.local < R_.local and all(S.local < w.local < R_.local for w in r._regs if w.bytes == 4 * MiB)  # control + small windows sit between S and R
-    assert len(r._regs) == 15 and len(r._pool) == 0 and sum(n for _h, _l, n in r._spacers) == (256 * MiB - (2 * MiB - 4096) - 0) % (256 * MiB) + 40 * MiB or True
-    # switched off (A/B): previous layout, no spacers, registration in ensure() order
-    monkeypatch.setenv("AITER_GEMM_FUSION_ABS_ALIGN", "0")
-    be2 = AbsFirstFit(4096)
-    r2 = FusionResources(0, 4, dist=FakeDist(), backend=be2, profile=PROFILE)
-    assert not r2.abs_align
-    for owner, rq in plans:
-        r2.ensure(owner, rq)
-    assert r2._spacers == [] and len(r2._regs) == 15
-
-
-def test_every_registration_logs_absolute_va_and_its_residues_in_every_policy(monkeypatch):
-    import re
-
-    from aiter.gemm_fusion.resources import FusionResources
-
-    for var in ("AITER_GEMM_FUSION_PROFILE", "AITER_GEMM_FUSION_ZERO_MODE", "AITER_GEMM_FUSION_ABS_ALIGN"):
-        monkeypatch.delenv(var, raising=False)
-    msgs = []
-
-    class H(logging.Handler):
-        def emit(self, rec):
-            msgs.append(rec.getMessage())
-
-    lg = logging.getLogger("aiter.gemm_fusion")
-    h, old = H(level=logging.INFO), lg.level
-    lg.addHandler(h)
-    lg.setLevel(logging.INFO)
-    try:
-        for pol in ("uniform", "per_owner", "aligned"):
-            msgs.clear()
-            r = FusionResources(0, 4, dist=FakeDist(), backend=AbsFirstFit(4096 + 2 * MiB), policy=pol, window_bytes=40 * MiB, max_windows=3)
-            r.ensure("o", [WindowReq("a", 100, "p2p_window"), WindowReq("b", 100, "control")])
-            w = [m for m in msgs if "event=resources window" in m and "spacer=1" not in m]
-            assert len(w) == 2, (pol, w)
-            for m in w:
-                va = int(re.search(r"va=(0x[0-9a-f]+)", m).group(1), 16)
-                got = {k: int(re.search(rf"va_mod_{k}MiB=(\d+)", m).group(1)) for k in (2, 16, 64, 256)}
-                assert got == {k: va % (k * MiB) for k in (2, 16, 64, 256)}, (pol, m)
-    finally:
-        lg.removeHandler(h)
-        lg.setLevel(old)
-    # the base itself is logged once for the abs policies
-    msgs.clear()
-    lg.addHandler(h)
-    lg.setLevel(logging.INFO)
-    try:
-        monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "abs_aligned")
-        profmod.clear_profile_cache()
-        r = FusionResources(0, 4, dist=FakeDist(), backend=AbsFirstFit(4096), profile=PROFILE)
-        plans = _all_plans(monkeypatch)
-        r.ensure(*plans[0])
-    finally:
-        lg.removeHandler(h)
-        lg.setLevel(old)
-    assert any("event=resources va_base" in m and f"base_mod_2MiB={(BASE_VA + 4096) % (2 * MiB)}" in m for m in msgs)
-    assert any("event=resources prereg_done" in m and "policy=abs_aligned" in m for m in msgs)
-
-
-def test_backend_without_va_info_degrades_to_unaligned_first_window_not_a_crash(monkeypatch):
-    from aiter.gemm_fusion.resources import FusionResources
-
-    for var in ("AITER_GEMM_FUSION_PROFILE", "AITER_GEMM_FUSION_ZERO_MODE", "AITER_GEMM_FUSION_WINDOW_POLICY"):
-        monkeypatch.delenv(var, raising=False)
-    be = RealisticFirstFit(base=BASE_VA + 4096)  # no va_info(): the slot base is unknown until a window is registered
-    r = FusionResources(0, 4, dist=FakeDist(), backend=be, policy="abs_aligned", window_bytes=40 * MiB, max_windows=3)
-    r.ensure("o", [WindowReq("a", 40 * MiB, "p2p_window"), WindowReq("b", 40 * MiB, "p2p_window")])  # on demand (no budget): must not crash
-    assert len(r.windows["o"]) == 2
-
-
-def test_probe_abs_sequences_run_the_same_layout_engine_and_log_va(capsys):
-    from aiter.ops.gemm_fusion.sp_qkv import window_probe as wp
-    from aiter.gemm_fusion.resources import AbsLayout
-
-    assert wp.sequence("abs_aligned_gate03") == [4 * MiB] * 4 + [40 * MiB]
-    items, fill = wp.abs_items("abs_aligned_all")
-    assert not fill and len(items) == 39
-    items_s, fill_s = wp.abs_items("shared_large_abs")
-    assert fill_s and [r for _s, r in items_s[:3]] == [("shared", "S"), ("shared", "R"), ("shared", "C")] and len(items_s) == 15
-
-    class B(AbsFirstFit):
-        def uid(self, rank):
-            return b"u"
-
-        def win_deregister(self, comm, w):
-            pass
-
-        def comm_destroy(self, comm):
-            pass
-
-    be = B(4096)
-    lay = AbsLayout(*[wp.abs_items("shared_large_abs")[0]], fill_gaps=True)
-    ok = wp.run([], 8 << 30, 0, 4, FakeDist(), be, "shared_large_abs", abs_layout=lay)
-    out = capsys.readouterr().out
-    assert ok and "PROBE_BASE" in out and f"base_mod_256MiB={(BASE_VA + 4096) % (256 * MiB)}" in out
-    lines = [ln for ln in out.splitlines() if ln.startswith("PROBE rank=")]
-    assert len(lines) == 17 and sum("kind=spacer" in ln for ln in lines) == 2  # the first-base spacer + the 40 MiB gap spacer
-    assert all("va=0x" in ln and "va_mod_256MiB=" in ln and "result=OK" in ln for ln in lines)
-    # the two 164 MiB windows start on 256 MiB boundaries
-    import re
-
-    big = [ln for ln in lines if "size=171966464" in ln]
-    assert len(big) == 2 and all(re.search(r"va_mod_256MiB=0 ", ln) for ln in big)
-    # the plain failing prefix also logs VAs
-    be2 = B(0)
-    wp.run(wp.sequence("gate03_prefix"), 4 << 30, 0, 4, FakeDist(), be2, "gate03_prefix")
-    out2 = capsys.readouterr().out
-    assert out2.count("va=0x") == 5 and "va_mod_2MiB=0" in out2
-
-# ======================================================================= D14 r1e/r1f: ARENA (one registered window per comm, view structs, no kernel change)
-class ArenaBackend(AbsFirstFit):
-    """First-fit fake with window VIEW support: a view is (arena handle, offset); win_info returns what a device copy of ccoWindowDevice would hold."""
-
-    def __init__(self):
-        super().__init__(0)
-        self.views, self.freed = {}, []
-
-    def win_register(self, comm, n):
-        h, loc = super().win_register(comm, n)
-        self.arena_base = {h: loc}
-        return h, loc
-
-    def win_view(self, comm, arena_win, offset):
-        v = 0xA000 + len(self.views)
-        self.views[v] = (arena_win, offset)
-        return v
-
-    def win_view_free(self, comm, v):
-        self.freed.append(v)
-
-    def win_info(self, comm, w):
-        if w in self.views:
-            a, off = self.views[w]
-            return (self.arena_base[a] + off, 1, 0)
-        return (self.arena_base[w], 1, 0)
 
 
 def _arena_res(monkeypatch, policy="arena"):
@@ -2235,9 +1351,9 @@ def _arena_res(monkeypatch, policy="arena"):
     for var in ("AITER_GEMM_FUSION_PROFILE", "AITER_GEMM_FUSION_ARENA_MIB", "AITER_GEMM_FUSION_ZERO_MODE"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", policy)
-    profmod.clear_profile_cache()
+    clear_profile_cache()
     be = ArenaBackend()
-    return FusionResources(0, 4, dist=FakeDist(), backend=be, profile=PROFILE), be
+    return make_res(dist=FakeDist(), backend=be, profile=PROFILE), be
 
 
 def test_arena_registers_exactly_one_window_and_every_plan_window_is_a_view(monkeypatch):
@@ -2248,7 +1364,7 @@ def test_arena_registers_exactly_one_window_and_every_plan_window_is_a_view(monk
     random.Random(3).shuffle(plans)
     for owner, rq in plans:
         r.ensure(owner, rq)
-    assert len(be.regs) == 1 and len(r._regs) == 1 and r._spacers == []  # ONE registration: the only size the comm ever sees
+    assert len(be.regs) == 1 and len(r._regs) == 1  # ONE registration: the only size the comm ever sees
     A = r._arena
     assert A.bytes == 380 * MiB == r._arena_bytes and r.policy == "arena"
     # views: inside the arena, 4 MiB aligned, pairwise disjoint (shared set once), local = arena.local + offset
@@ -2278,55 +1394,6 @@ def test_arena_registers_exactly_one_window_and_every_plan_window_is_a_view(monk
     assert len([x for x in be.log if x[0] == "dereg"]) == 1 and r._views == []  # the arena is the ONLY deregistered window
 
 
-def test_arena_per_owner_variant_and_overflow_and_collective_layout_check(monkeypatch):
-    from aiter.gemm_fusion.resources import FusionResources, ResourceError
-
-    r, be = _arena_res(monkeypatch, "arena_per_owner")
-    plans = _all_plans(monkeypatch)
-    for owner, rq in plans:
-        r.ensure(owner, rq)
-    assert len(be.regs) == 1 and r._arena_bytes == 2508 * MiB and r._arena_top <= r._arena_bytes
-    large = [o for o, _ in plans if o.startswith("sp_qkv.large/")]
-    assert len({r.windows[o][o + "/S"].arena_offset for o in large}) == 9 and all(not w.shared for o in large for w in r.windows[o].values())  # nothing shared
-    assert all(r.windows[o][o + "/S"].bytes == r.windows[o][o + "/R"].bytes == r.windows[o][o + "/C"].bytes for o in large)  # equal sizes per plan (preflight convention)
-    # overflow names the sizes and the knob
-    monkeypatch.setenv("AITER_GEMM_FUSION_ARENA_MIB", "8")
-    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "arena")
-    r2 = FusionResources(0, 4, dist=FakeDist(), backend=ArenaBackend(), profile=PROFILE)
-    with pytest.raises(ResourceError, match="arena overflow.*AITER_GEMM_FUSION_ARENA_MIB"):
-        for owner, rq in plans:
-            r2.ensure(owner, rq)
-    # peers addressing this arena at the same offsets: a rank that laid it out differently aborts every rank
-    monkeypatch.delenv("AITER_GEMM_FUSION_ARENA_MIB")
-    r3 = FusionResources(0, 4, dist=FakeDist(diverge_rank=1), backend=ArenaBackend(), profile=PROFILE)
-    with pytest.raises(ResourceError, match="registration disagreement|arena layout disagreement"):
-        r3.ensure(*plans[0])
-    # no profile and no knob: a clear error, never a guessed size
-    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
-    r4 = FusionResources(0, 4, dist=FakeDist(), backend=ArenaBackend(), policy="arena", window_bytes=4 * MiB, max_windows=1)
-    with pytest.raises(ResourceError, match="needs the arena size"):
-        r4.ensure(*plans[0])
-
-
-def test_arena_late_owner_needs_no_collective_registration_and_is_refused_in_capture(monkeypatch):
-    import types as _t
-
-    r, be = _arena_res(monkeypatch, "arena")
-    plans = _all_plans(monkeypatch)
-    r.ensure(*plans[0])
-    r.finalize()
-    n = len(be.regs)
-    r.ensure(*plans[1])  # after finalize(): allowed (a view struct is a local device allocation), no new registration, no G-late env needed
-    assert len(be.regs) == n == 1 and r.pending_zero == 0
-    fake = _t.ModuleType("torch")
-    fake.cuda = _t.SimpleNamespace(is_current_stream_capturing=lambda: True)
-    monkeypatch.setitem(sys.modules, "torch", fake)
-    from aiter.gemm_fusion.resources import ResourceError
-
-    with pytest.raises(ResourceError, match="refused inside graph capture"):
-        r.ensure(*plans[2])
-
-
 def test_native_view_struct_reads_only_what_the_kernels_read():
     """(1) of the lead's question, as a CPU audit of the sources: the view is a plain device copy of ccoWindowDevice with winBase shifted; the vendored kernels
     reach a window handle only through ccoGetLocalPtr / ccoGetLsaPeerPtr (winBase, stride4G, lsaRank); the small kernel resolves peer pointers on the host."""
@@ -2345,75 +1412,10 @@ def test_native_view_struct_reads_only_what_the_kernels_read():
     assert {"Swin", "Rwin", "Cwin"} <= {w for _f, w in users}  # the handles are used ONLY as the first argument of those two accessors
     # no kernel source differs from the vendored accepted file (no kernel change): the vendored sources are unchanged since the vendoring commit
 
-def test_probe_arena_sequence_one_registration_and_view_checks(capsys):
-    from aiter.ops.gemm_fusion.sp_qkv import window_probe as wp
-
-    class B(ArenaBackend):
-        def uid(self, rank):
-            return b"u"
-
-        def comm_destroy(self, comm):
-            pass
-
-        def win_deregister(self, comm, w):
-            pass
-
-        def peer_ptr(self, comm, local, p):
-            return local + p * (4 << 30)
-
-    be = B()
-    be.heap = 8 << 30
-    ok = wp.run_arena("arena", 4 << 30, 0, 4, FakeDist(), be, "arena#0")
-    out = capsys.readouterr().out
-    assert ok and len(be.regs) == 1 and "registrations=1 views=15" in out and out.count("result=FAIL") == 0
-    assert out.count("view_winBase_ok=1 peer_ptrs_ok=1") == 15 and len(be.freed) == 15
-    assert wp.sequence("arena") == [380 * MiB] and wp.sequence("arena_per_owner") == [2508 * MiB]
-    be2 = B()
-    assert wp.run_arena("arena_per_owner", 8 << 30, 0, 4, FakeDist(), be2, "arena_per_owner#0") and len(be2.regs) == 1
-
-def test_probe_run_arena_uses_the_rank_as_hip_device_not_device_zero(capsys):
-    """Evidence found run_arena hard-coded device 0 (wrong for ranks 1-3). Every probe path must pass device = rank (or the explicit override)."""
-    from aiter.ops.gemm_fusion.sp_qkv import window_probe as wp
-
-    class B(ArenaBackend):
-        devs = []
-
-        def uid(self, rank):
-            return b"u"
-
-        def comm_create(self, rank, world, uid, heap, device):
-            B.devs.append((rank, device))
-            return super().comm_create(rank, world, uid, heap, device) if hasattr(super(), "comm_create") else object()
-
-        def comm_destroy(self, comm):
-            pass
-
-        def win_deregister(self, comm, w):
-            pass
-
-        def peer_ptr(self, comm, local, p):
-            return local + p * (4 << 30)
-
-    for rank in range(4):
-        be = B()
-        be.heap = 8 << 30
-        wp.run_arena("arena", 4 << 30, rank, 4, FakeDist(), be, f"arena#r{rank}")
-    assert B.devs == [(0, 0), (1, 1), (2, 2), (3, 3)]
-    B.devs.clear()
-    be = B()
-    wp.run_arena("arena", 4 << 30, 2, 4, FakeDist(), be, "arena#override", device=5)
-    assert B.devs == [(2, 5)]
-    # the generic run() path already used rank; pin it
-    B.devs.clear()
-    be = B()
-    wp.run([4 << 20], 4 << 30, 3, 4, FakeDist(), be, "x")
-    assert B.devs == [(3, 3)]
-    capsys.readouterr()
-
 def test_release_frees_each_window_local_allocation_after_deregister_before_comm_destroy(monkeypatch):
     from aiter.gemm_fusion.resources import FusionResources
 
-    for var in ("AITER_GEMM_FUSION_FREE_BEFORE_DESTROY", "AITER_GEMM_FUSION_PROFILE", "AITER_GEMM_FUSION_WINDOW_POLICY"):
+    for var in ("AITER_GEMM_FUSION_PROFILE", "AITER_GEMM_FUSION_WINDOW_POLICY"):
         monkeypatch.delenv(var, raising=False)
 
     def build():
@@ -2429,7 +1431,7 @@ def test_release_frees_each_window_local_allocation_after_deregister_before_comm
             def comm_destroy(self, comm):
                 ev.append(("comm_destroy",))
 
-        r = FusionResources(0, 4, dist=FakeDist(), backend=B(), policy="aligned", window_bytes=4 << 20, max_windows=4)
+        r = make_res(dist=FakeDist(), backend=B(), policy="uniform", window_bytes=4 << 20, max_windows=4)
         r.ensure("o", [WindowReq("a", 100, "p2p_window"), WindowReq("b", 100, "p2p_window")])
         r.finalize()
         ev.clear()
@@ -2441,24 +1443,7 @@ def test_release_frees_each_window_local_allocation_after_deregister_before_comm
     assert kinds[-1] == "comm_destroy" and kinds.count("dereg") == kinds.count("free") >= 2
     for i, e in enumerate(ev):
         if e[0] == "dereg":
-            assert ev[i + 1][0] == "free"  # Deregister then MemFree(local), per window, spacers included
-    monkeypatch.setenv("AITER_GEMM_FUSION_FREE_BEFORE_DESTROY", "0")
-    _r, ev2 = build()
-    assert [e[0] for e in ev2].count("free") == 0  # old behaviour for A/B
-
-# ======================================================================= wait_budget_us (large-M per-wait poll budget) + poison-reason logging
-def _log_capture(level=logging.INFO):
-    msgs = []
-
-    class H(logging.Handler):
-        def emit(self, rec):
-            msgs.append(rec.getMessage())
-
-    lg = logging.getLogger("aiter.gemm_fusion")
-    h, old = H(level=level), lg.level
-    lg.addHandler(h)
-    lg.setLevel(level)
-    return msgs, lambda: (lg.removeHandler(h), lg.setLevel(old))
+            assert ev[i + 1][0] == "free"  # Deregister then MemFree(local), per window, always (no switch)
 
 
 def test_wait_budget_resolution_precedence_default_validation_and_profile_value(monkeypatch):
@@ -2487,7 +1472,7 @@ def test_wait_budget_resolution_precedence_default_validation_and_profile_value(
     # FusionResources resolves it ONCE from its explicit profile and logs it with the comm line
     msgs, undo = _log_capture()
     try:
-        r = FusionResources(0, 4, dist=FakeDist(), backend=RealisticFirstFit(), profile=PROFILE, window_bytes=4 << 20, max_windows=2)
+        r = make_res(dist=FakeDist(), backend=RealisticFirstFit(), profile=PROFILE, window_bytes=4 << 20, max_windows=2)
     finally:
         undo()
     assert (r.wait_budget_us, r.wait_budget_source) == (5_000_000, "profile")
@@ -2544,7 +1529,7 @@ def test_poison_reason_is_logged_before_quiesce_clears_it_large_and_small(monkey
     ev = []
     be.device_sync = lambda dev: ev.append("sync")
     be.zero = lambda dev, loc, n: ev.append("zero")
-    r = FusionResources(0, 4, dist=FakeDist(), backend=be, window_bytes=4 << 20, max_windows=2, policy="per_owner", profile=None)
+    r = make_res(dist=FakeDist(), backend=be, window_bytes=4 << 20, max_windows=2, policy="uniform", profile=None)
     r.ensure("L", [WindowReq("a", 100, "p2p_window")])
     r.ensure("S", [WindowReq("a", 100, "p2p_window")])
     large = _Rep(2, {"epoch": 7, "poison": 2, "poison_reason": 2, "credit_wait_ticks_100MHz": 123})
@@ -2681,34 +1666,35 @@ def test_A1_native_layout_static_asserts_and_runtime_abi_echo():
         c2.check_mori_abi_pin = real
 
 
-def test_A3_arena_is_the_default_and_uniform_per_owner_stay_selectable(monkeypatch):
-    from aiter.gemm_fusion.resources import DEFAULT_POLICY, FusionResources
+def test_A3_arena_is_the_default_and_only_uniform_stays_selectable(monkeypatch):
+    from aiter.gemm_fusion.resources import DEFAULT_POLICY, POLICIES, FusionResources, ResourceError
+
+    assert POLICIES == ("arena", "uniform")  # per_owner / aligned / shared_large / abs_aligned / arena_per_owner were removed
 
     for var in ("AITER_GEMM_FUSION_WINDOW_POLICY", "AITER_GEMM_FUSION_PROFILE", "AITER_GEMM_FUSION_ARENA_MIB"):
         monkeypatch.delenv(var, raising=False)
-    profmod.clear_profile_cache()
+    clear_profile_cache()
     assert DEFAULT_POLICY == "arena"
-    r = FusionResources(0, 4, dist=FakeDist(), backend=ArenaBackend(), profile=PROFILE)
+    r = make_res(dist=FakeDist(), backend=ArenaBackend(), profile=PROFILE)
     assert r.policy == "arena" and r.policy_source == "default" and r.policy_fallback_reason is None and r._vmm == 4 << 30
     # selectable: the env var and the argument
     monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "uniform")
-    ru = FusionResources(0, 4, dist=FakeDist(), backend=RealisticFirstFit(), profile=PROFILE)
+    ru = make_res(dist=FakeDist(), backend=RealisticFirstFit(), profile=PROFILE)
     assert ru.policy == "uniform" and ru.policy_source == "explicit" and ru._vmm == 8 << 30 and ru.policy_fallback_reason is None  # 6.4 GiB: documented cost
     monkeypatch.delenv("AITER_GEMM_FUSION_WINDOW_POLICY")
-    rp = FusionResources(0, 4, dist=FakeDist(), backend=RealisticFirstFit(), profile=PROFILE, policy="per_owner")
-    assert rp.policy == "per_owner"
+    for gone in ("per_owner", "aligned", "shared_large", "abs_aligned", "arena_per_owner"):
+        with pytest.raises(ResourceError, match="must be one of"):
+            make_res(dist=FakeDist(), backend=RealisticFirstFit(), profile=PROFILE, policy=gone)
     # default + no budget: refused with a logged reason, falls back to uniform (the previous no-profile behaviour)
     msgs, undo = _log_capture(logging.WARNING)
     try:
-        rn = FusionResources(0, 4, dist=FakeDist(), backend=RealisticFirstFit(), window_bytes=4 << 20, max_windows=2)
+        rn = make_res(dist=FakeDist(), backend=RealisticFirstFit(), window_bytes=4 << 20, max_windows=2)
     finally:
         undo()
     assert rn.policy == "uniform" and "no arena size" in rn.policy_fallback_reason
     assert any("event=resources arena_refused" in m and "reason=no arena size" in m for m in msgs)
     # an EXPLICIT arena without a budget still fails loudly at ensure() (configuration error, not a silent fallback)
-    from aiter.gemm_fusion.resources import ResourceError
-
-    ra = FusionResources(0, 4, dist=FakeDist(), backend=ArenaBackend(), window_bytes=4 << 20, max_windows=2, policy="arena")
+    ra = make_res(dist=FakeDist(), backend=ArenaBackend(), window_bytes=4 << 20, max_windows=2, policy="arena")
     assert ra.policy == "arena"
     with pytest.raises(ResourceError, match="needs the arena size"):
         ra.ensure("o", [WindowReq("a", 100, "p2p_window")])
@@ -2719,7 +1705,7 @@ def test_A1_abi_pin_mismatch_refuses_arena_at_construction_and_falls_back_to_uni
 
     for var in ("AITER_GEMM_FUSION_WINDOW_POLICY", "AITER_GEMM_FUSION_PROFILE"):
         monkeypatch.delenv(var, raising=False)
-    profmod.clear_profile_cache()
+    clear_profile_cache()
 
     class Pinned(ArenaBackend):
         def __init__(self, ok, why):
@@ -2730,11 +1716,11 @@ def test_A1_abi_pin_mismatch_refuses_arena_at_construction_and_falls_back_to_uni
             return self.res
 
     be = Pinned(True, "ok")
-    assert FusionResources(0, 4, dist=FakeDist(), backend=be, profile=PROFILE).policy == "arena"
+    assert make_res(dist=FakeDist(), backend=be, profile=PROFILE).policy == "arena"
     msgs, undo = _log_capture(logging.WARNING)
     try:
-        bad = FusionResources(0, 4, dist=FakeDist(), backend=Pinned(False, "libmori_cco.so sha256 deadbeef... != pinned 87b7322f..."), profile=PROFILE)
-        explicit = FusionResources(0, 4, dist=FakeDist(), backend=Pinned(False, "hdr differs"), profile=PROFILE, policy="arena")  # a safety property: refused even if asked for
+        bad = make_res(dist=FakeDist(), backend=Pinned(False, "libmori_cco.so sha256 deadbeef... != pinned 87b7322f..."), profile=PROFILE)
+        explicit = make_res(dist=FakeDist(), backend=Pinned(False, "hdr differs"), profile=PROFILE, policy="arena")  # a safety property: refused even if asked for
     finally:
         undo()
     for r in (bad, explicit):
@@ -2767,13 +1753,13 @@ def test_A1_view_readback_mismatch_refuses_arena_and_rebuilds_the_comm_as_unifor
 
     for var in ("AITER_GEMM_FUSION_WINDOW_POLICY", "AITER_GEMM_FUSION_PROFILE"):
         monkeypatch.delenv(var, raising=False)
-    profmod.clear_profile_cache()
+    clear_profile_cache()
     plans = _all_plans(monkeypatch)
     for mode in ("base", "stride", "lsa"):
         be = _BadViewBackend(mode)
         msgs, undo = _log_capture(logging.WARNING)
         try:
-            r = FusionResources(0, 4, dist=FakeDist(), backend=be, profile=PROFILE)
+            r = make_res(dist=FakeDist(), backend=be, profile=PROFILE)
             assert r.policy == "arena"
             for owner, rq in plans:
                 r.ensure(owner, rq)  # the first ensure() runs the self-test, refuses, rebuilds the comm for uniform and re-dispatches
@@ -2788,7 +1774,7 @@ def test_A1_view_readback_mismatch_refuses_arena_and_rebuilds_the_comm_as_unifor
     # (a) a rank that disagrees on the REGISTRATION itself is a fatal abort (the pre-existing collective agreement check), not a fallback
     from aiter.gemm_fusion.resources import ResourceError
 
-    r2 = FusionResources(0, 4, dist=FakeDist(diverge_rank=3), backend=ArenaBackend(), profile=PROFILE)
+    r2 = make_res(dist=FakeDist(diverge_rank=3), backend=ArenaBackend(), profile=PROFILE)
     with pytest.raises(ResourceError, match="registration disagreement"):
         r2.ensure(*plans[0])
 
@@ -2802,7 +1788,7 @@ def test_A1_view_readback_mismatch_refuses_arena_and_rebuilds_the_comm_as_unifor
                 out[2] = (False, "rank2 view mismatch")
 
     be3 = ArenaBackend()  # this rank's own read-back is fine
-    r3 = FusionResources(0, 4, dist=SplitDist(), backend=be3, profile=PROFILE)
+    r3 = make_res(dist=SplitDist(), backend=be3, profile=PROFILE)
     for owner, rq in plans:
         r3.ensure(owner, rq)
     assert r3.policy == "uniform" and "rank2 view mismatch" in r3.policy_fallback_reason and r3._arena is None
@@ -2812,9 +1798,9 @@ def test_A1_each_later_view_is_read_back_and_a_mismatch_aborts(monkeypatch):
     from aiter.gemm_fusion.resources import FusionResources, ResourceError
 
     monkeypatch.delenv("AITER_GEMM_FUSION_WINDOW_POLICY", raising=False)
-    profmod.clear_profile_cache()
+    clear_profile_cache()
     be = ArenaBackend()
-    r = FusionResources(0, 4, dist=FakeDist(), backend=be, profile=PROFILE)
+    r = make_res(dist=FakeDist(), backend=be, profile=PROFILE)
     plans = _all_plans(monkeypatch)
     r.ensure(*plans[0])  # self-test passes, real views pass their read-back
     orig = be.win_info
@@ -2838,7 +1824,217 @@ def test_A5_run_bindings_record_policy_budget_source_and_overrides(monkeypatch):
     for var in ("AITER_GEMM_FUSION_WINDOW_POLICY", "AITER_GEMM_FUSION_PROFILE"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("AITER_GEMM_FUSION_WAIT_BUDGET_US", "9000000")
-    profmod.clear_profile_cache()
-    b = FusionResources(0, 4, dist=FakeDist(), backend=ArenaBackend(), profile=PROFILE).run_bindings()
+    clear_profile_cache()
+    b = make_res(dist=FakeDist(), backend=ArenaBackend(), profile=PROFILE).run_bindings()
     assert b["wait_budget_us"] == 9000000 and b["wait_budget_source"] == "env"  # an override is visible in the bindings
     assert b["window_policy"] == "arena" and b["window_policy_source"] == "default" and b["zero_mode"] == "h2d_deferred"
+
+# ======================================================================= cleanup: replacements for the coverage of removed features + guards
+def test_runtime_never_imports_test_utils_and_the_removed_names_are_gone():
+    import re
+
+    root = os.path.join(os.path.dirname(profmod.__file__), "..")
+    runtime = []
+    for base in (os.path.join(root, "gemm_fusion"), os.path.join(root, "ops", "gemm_fusion")):
+        for dp, _dn, fns in os.walk(base):
+            runtime += [os.path.join(dp, f) for f in fns if f.endswith(".py") and f != "test_utils.py"]
+    removed_env = ("REG_BARRIER", "REG_SYNC", "LATE_REG", "ZERO_MODE", "FREE_BEFORE_DESTROY", "PROBE_FREE", "ALIGN_CAP_MIB", "SPACER_GRAN_MIB", "ABS_ALIGN", "WINDOW_MIB",
+                   "DEBUG_ALIAS")
+    for f in runtime:
+        code = open(f, encoding="utf-8").read()
+        assert "test_utils" not in re.sub(r"#[^\n]*", "", code).replace('"""', ""), f"{os.path.basename(f)} imports/mentions test_utils"
+        for name in removed_env:
+            assert f"AITER_GEMM_FUSION_{name}" not in code, f"{os.path.basename(f)} still reads AITER_GEMM_FUSION_{name}"
+    assert not os.path.exists(os.path.join(root, "ops", "gemm_fusion", "sp_qkv", "window_probe.py"))
+    import aiter.gemm_fusion as g
+    from aiter.gemm_fusion import resources as rmod
+
+    for n in ("clear_profile_cache", "list_variants"):
+        assert not hasattr(g, n), n
+    for n in ("assert_no_window_alias", "find_window_alias", "window_ranges", "local_m", "peers", "log_poison", "run_bindings", "poison_local"):
+        assert hasattr(rmod.FusionResources, n) == (n in ("log_poison", "run_bindings", "poison_local")), n
+    for n in ("tensor_extent", "iter_tensors", "WindowAliasError", "AbsLayout", "aligned_plan", "abs_layout_simulate", "policy_memory_table", "start_alignment"):
+        assert not hasattr(rmod, n), n
+    for n in ("va_info", "set_zero_mode", "peer_ptr"):
+        assert not hasattr(rmod.CcoBackend, n), n
+    import inspect
+
+    params = inspect.signature(rmod.FusionResources.__init__).parameters
+    assert list(params) == ["self", "rank", "world", "group", "dist", "backend", "device", "caps", "policy", "profile"]  # the ATOM-facing constructor, nothing else
+
+
+def test_native_comm_has_no_memset_peer_ptr_or_va_info_entry_points():
+    gf = _host_src("gf_comm.cpp")
+    assert "hipMemset(" not in gf and "gf_comm_va_info_v1" not in gf and "gf_peer_ptr_v1" not in gf
+    assert "int32_t gf_zero_v1(int32_t device, void* local, uint64_t bytes)" in gf and "zero_h2d(" in gf  # MORI's H2D zeroing is the only method
+    for kept in ("gf_win_info_v1", "gf_abi_info_v1", "gf_devcomm_info_v1", "gf_mem_info_v1", "gf_win_view_v1", "gf_win_free_v1"):
+        assert f"int32_t {kept}(" in gf, kept
+
+
+def test_late_ensure_of_a_new_owner_is_refused_for_both_policies(monkeypatch):
+    from aiter.gemm_fusion.resources import ResourceError
+
+    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
+    clear_profile_cache()
+    plans = _all_plans(monkeypatch)
+    ra = make_res(dist=FakeDist(), backend=ArenaBackend(), profile=PROFILE)
+    ra.ensure(*plans[0])
+    ra.finalize()
+    with pytest.raises(ResourceError, match="after finalize"):
+        ra.ensure(*plans[1])
+    assert ra.ensure(*plans[0]) is ra.windows[plans[0][0]]  # an owner that was resolved before finalize is still idempotent
+    ru = make_res(dist=FakeDist(), backend=RealisticFirstFit(), policy="uniform", window_bytes=4 << 20, max_windows=4)
+    ru.ensure("a", [WindowReq("x", 100, "p2p_window")])
+    ru.finalize()
+    with pytest.raises(ResourceError, match="after finalize"):
+        ru.ensure("b", [WindowReq("x", 100, "p2p_window")])
+
+
+def test_arena_overflow_names_the_knob_and_a_diverging_rank_aborts_every_rank(monkeypatch):
+    from aiter.gemm_fusion.resources import ResourceError
+
+    for var in ("AITER_GEMM_FUSION_PROFILE", "AITER_GEMM_FUSION_WINDOW_POLICY"):
+        monkeypatch.delenv(var, raising=False)
+    clear_profile_cache()
+    plans = _all_plans(monkeypatch)
+    monkeypatch.setenv("AITER_GEMM_FUSION_ARENA_MIB", "8")
+    r2 = make_res(dist=FakeDist(), backend=ArenaBackend(), profile=PROFILE)
+    with pytest.raises(ResourceError, match="arena overflow.*AITER_GEMM_FUSION_ARENA_MIB"):
+        for owner, rq in plans:
+            r2.ensure(owner, rq)
+    monkeypatch.delenv("AITER_GEMM_FUSION_ARENA_MIB")
+    r3 = make_res(dist=FakeDist(diverge_rank=1), backend=ArenaBackend(), profile=PROFILE)  # the registration agreement fails first
+    with pytest.raises(ResourceError, match="registration disagreement"):
+        r3.ensure(*plans[0])
+
+
+def test_init_images_written_before_finalize_survive_the_deferred_zeroing(monkeypatch):
+    for var in ("AITER_GEMM_FUSION_WINDOW_POLICY", "AITER_GEMM_FUSION_PROFILE"):
+        monkeypatch.delenv(var, raising=False)
+    be = _ZeroRecBackend()
+    r = make_res(dist=FakeDist(), backend=be, window_bytes=4 << 20, max_windows=6)
+    ev = []
+    r.ensure("o0", [WindowReq("a", 100, "p2p_window")])
+    r.set_init("o0", lambda: ev.append("init"))  # a control image written at attach time (before finalize)
+    assert ev == ["init"]
+    r.finalize()
+    assert ev == ["init", "init"]  # finalize() zeroed the window AFTER the first init, so the image is rewritten: not lost
+    r.quiesce_and_reset()
+    assert ev == ["init", "init", "init"]
+
+
+def test_policy_memory_log_lists_both_policies_and_the_arena_is_the_380_mib_budget(monkeypatch):
+    for var in ("AITER_GEMM_FUSION_PROFILE", "AITER_GEMM_FUSION_WINDOW_POLICY", "AITER_GEMM_FUSION_ARENA_MIB"):
+        monkeypatch.delenv(var, raising=False)
+    clear_profile_cache()
+    msgs, undo = _log_capture()
+    try:
+        r = make_res(dist=FakeDist(), backend=ArenaBackend(), profile=PROFILE)
+    finally:
+        undo()
+    pm = [m for m in msgs if m.startswith("event=resources policy_memory")]
+    assert pm and "selected=arena" in pm[0] and "uniform=6396MiB" in pm[0] and "arena=380MiB" in pm[0]
+    assert r._arena_size_from_budget() == 380 * MiB and r._vmm == 4 << 30
+
+
+# ---- test_utils: the aliasing assertion (C-S4) as free functions over a FusionResources
+class _Tn:
+    def __init__(self, ptr, shape, stride, es=2):
+        self.p, self.shape, self._s, self.es = ptr, shape, stride, es
+
+    def data_ptr(self):
+        return self.p
+
+    def stride(self):
+        return self._s
+
+    def element_size(self):
+        return self.es
+
+
+def test_test_utils_alias_checks_over_the_arena_strided_extents_nested_and_env(monkeypatch):
+    from aiter.ops.gemm_fusion.sp_qkv import test_utils as tu
+
+    for var in ("AITER_GEMM_FUSION_PROFILE", "AITER_GEMM_FUSION_WINDOW_POLICY", "AITER_GEMM_FUSION_DEBUG_ALIAS"):
+        monkeypatch.delenv(var, raising=False)
+    clear_profile_cache()
+    r = make_res(dist=FakeDist(), backend=ArenaBackend(), profile=PROFILE)
+    r.ensure(*_all_plans(monkeypatch)[0])
+    A = r._arena
+    assert [lab for lab, _a, _b in tu.window_ranges(r)] == ["<arena>/arena [shared]"]  # the one registered window covers every view
+    base = A.local
+    inside, past_end = _Tn(base + 1024, (16, 2304), (2304, 1)), _Tn(A.local + A.bytes - 100, (4, 2560), (2304, 1))
+    outside, adjacent = _Tn(base + A.bytes + (64 << 20), (16, 16), (16, 1)), _Tn(base + A.bytes, (4, 4), (4, 1))
+    assert tu.find_window_alias(r, outside) == [] and tu.find_window_alias(r, adjacent) == []  # one past the end is not an overlap
+    assert tu.find_window_alias(r, inside) and tu.find_window_alias(r, past_end)
+    ext = tu.tensor_extent(past_end)  # the reuse view [T,2560] with row stride 2304 extends further than numel*elem: strides are honoured
+    assert ext == (A.local + A.bytes - 100, A.local + A.bytes - 100 + ((3 * 2304 + 2559) + 1) * 2)
+    hits = tu.find_window_alias(r, {"out": [outside, (inside,)], "meta": {"x": outside}})
+    assert len(hits) == 1 and "['out'][1][0]" in hits[0]
+    assert tu.tensor_extent(_Tn(0x1000, (0, 4), (4, 1))) is None
+    tu.assert_no_window_alias(r, inside)  # default: no-op
+    with pytest.raises(tu.WindowAliasError, match="points into a CCO window.*copy it within the op"):
+        tu.assert_no_window_alias(r, inside, force=True)
+    tu.assert_no_window_alias(r, outside, force=True)
+    monkeypatch.setenv("AITER_GEMM_FUSION_DEBUG_ALIAS", "1")
+    with pytest.raises(tu.WindowAliasError):
+        tu.assert_no_window_alias(r, {"impl._index_q": inside}, what="attn.impl._index_q")
+
+
+def test_test_utils_make_res_make_profile_and_clear_profile_cache(monkeypatch):
+    from aiter.ops.gemm_fusion.sp_qkv import test_utils as tu
+
+    prof = tu.make_profile(window_bytes=8 << 20, max_windows=3, wait_budget_us=777)
+    assert prof.meta["window_budget"] == {"window_bytes": 8 << 20, "max_windows": 3} and prof.meta["wait_budget_us"] == 777
+    r = tu.make_res(window_bytes=8 << 20, max_windows=3)
+    assert (r.window_bytes, r.max_windows, r.policy) == (8 << 20, 3, "uniform")  # no arena size -> uniform fallback
+    merged = tu.make_res(profile=PROFILE, window_bytes=8 << 20, max_windows=5, policy="uniform")  # a synthetic budget merged over a real profile
+    assert (merged.window_bytes, merged.max_windows) == (8 << 20, 5)
+    clear_profile_cache()
+    assert profmod._CACHE == {}
+
+
+def test_test_utils_arena_probe_registers_once_checks_views_and_uses_rank_as_device(capsys):
+    from aiter.ops.gemm_fusion.sp_qkv import test_utils as tu
+
+    class B(ArenaBackend):
+        devs = []
+
+        def comm_create(self, rank, world, uid, heap, device):
+            B.devs.append((rank, device))
+            return 1
+
+        def comm_destroy(self, comm):
+            pass
+
+        def win_deregister(self, comm, w):
+            pass
+
+        def win_free(self, comm, loc):
+            pass
+
+    for rank in range(4):
+        be = B()
+        be.heap = 8 << 30
+        assert tu.run_arena(4 << 30, rank, 4, FakeDist(), be, f"arena#r{rank}")
+    assert B.devs == [(0, 0), (1, 1), (2, 2), (3, 3)]  # HIP device = rank, NOT 0
+    out = capsys.readouterr().out
+    assert out.count("registrations=1 views=15") == 4 and "result=FAIL" not in out and out.count("view_winBase_ok=1") == 60
+    B.devs.clear()
+    tu.run_arena(4 << 30, 2, 4, FakeDist(), B(), "x", device=5)
+    assert B.devs == [(2, 5)]
+    # a view whose read-back disagrees is reported
+    class Bad(B):
+        def win_info(self, comm, w):
+            b, s, l = super().win_info(comm, w)
+            return (b + 8, s, l) if w in self.views else (b, s, l)
+
+    bb = Bad()
+    assert not tu.run_arena(4 << 30, 0, 4, FakeDist(), bb, "bad")
+    capsys.readouterr()
+    # the plain sequences
+    assert tu.sequence("gate03_prefix") == [4 * MiB] * 4 + [40 * MiB] and tu.sequence("phase1_equal") == [40 * MiB] * 3
+    be = B()
+    be.heap = 4 << 30
+    assert tu.run(tu.sequence("gate03_prefix"), 4 << 30, 3, 4, FakeDist(), be, "g")
+    assert B.devs[-1] == (3, 3) and capsys.readouterr().out.count("result=OK") == 5

@@ -35,7 +35,7 @@ def load_driver(path: str):
     sig = [
         ("sm_attach_v1", [u32, vp, vp, vp, vp, vp, C.c_char_p, C.c_char_p, C.POINTER(vp)]),
         ("sm_bind_new_v1", [vp, vp, C.POINTER(vp)]), ("sm_launch_blk_v1", [vp, vp, vp, vp, u32, vp]),
-        ("sm_blk_free_v1", [vp]), ("sm_free_v1", [vp]), ("sm_poison_fast_v1", [vp, vp, C.POINTER(u32)]), ("sm_info_v1", [vp]), ("sm_poison_v1", [vp, vp]), ("sm_last_hip_error_v1", [vp]),
+        ("sm_blk_free_v1", [vp]), ("sm_free_v1", [vp]), ("sm_poison_fast_v1", [vp, vp, C.POINTER(u32)]), ("sm_info_v1", [vp]),
     ]
     for n, a in sig:
         f = getattr(lib, n)
@@ -84,15 +84,6 @@ class SmallContext:
             self.blks.clear()
             self.lib.sm_free_v1(self.ctx)
             self.ctx = None
-
-    def poison(self) -> int:
-        v = C.c_uint32()
-        if self.lib.sm_poison_v1(self.ctx, C.byref(v)) != OK:
-            raise RuntimeError("sm_poison")
-        return v.value
-
-    def last_hip_error(self) -> int:
-        return self.lib.sm_last_hip_error_v1(self.ctx)
 
     def bind(self, sb: SmBindingV1):
         blk = C.c_void_p()

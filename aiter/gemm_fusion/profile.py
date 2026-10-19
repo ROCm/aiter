@@ -119,5 +119,3 @@ def load_profile(path: Optional[str] = None) -> Profile:
     return prof
 
 
-def clear_profile_cache():
-    _CACHE.clear()

@@ -97,7 +97,7 @@ def reg(monkeypatch):
 def write_prof(tmp_path, rows, name="p.json"):
     p = tmp_path / name
     p.write_text(json.dumps({"profile": "t", "rows": rows}))
-    profmod.clear_profile_cache()
+    from aiter.ops.gemm_fusion.sp_qkv.test_utils import clear_profile_cache; clear_profile_cache()
     return str(p)
 
 

@@ -45,7 +45,3 @@ def register_variant(*, vid, family, stage_kinds, contract, source_sha):
 
 def get_variant(vid: str) -> VariantInfo:
     return _CATALOG[vid]
-
-
-def list_variants() -> Dict[str, VariantInfo]:
-    return dict(_CATALOG)

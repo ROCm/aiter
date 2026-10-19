@@ -59,17 +59,6 @@ int32_t gf_comm_create_v1(uint32_t rank, uint32_t world, int32_t device, const u
     }
     return OK;
 }
-// Absolute VA facts of THIS rank's slot (read-only): out[0] = LocalSlotBase = flatBase + lsaRank * perRankSize (where the first-fit slot allocator starts;
-// cco_init.cpp LocalSlotBase), out[1] = perRankSize, out[2] = vmmGranularity (G; the slot granularity). flatBase is only G-aligned (hipMemAddressReserve(..., G)),
-// so the ABSOLUTE alignment of every window is process dependent (D14 r1c, H-BASE); the abs_aligned / shared_large policies align against this.
-int32_t gf_comm_va_info_v1(void* comm, uint64_t* out3) {
-    if (!comm || !out3) return E_ARG;
-    const auto* c = static_cast<const mori::cco::ccoComm*>(comm);
-    out3[0] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(c->flatBase)) + static_cast<uint64_t>(c->lsaRank) * static_cast<uint64_t>(c->perRankSize);
-    out3[1] = static_cast<uint64_t>(c->perRankSize);
-    out3[2] = static_cast<uint64_t>(c->vmmGranularity);
-    return OK;
-}
 int32_t gf_win_register_v1(void* comm, uint64_t bytes, void** out_win, void** out_local) {
     if (!comm || !out_win || !out_local) return E_ARG;
     gf::DeviceScope scope(comm_dev(comm));
@@ -130,13 +119,6 @@ int32_t gf_win_info_v1(void* comm, void* win, uint64_t* out3) {
     out3[0] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(h.winBase)); out3[1] = h.stride4G; out3[2] = static_cast<uint64_t>(h.lsaRank);
     return OK;
 }
-int32_t gf_peer_ptr_v1(void* comm, void* local, int32_t peer, void** out) {
-    if (!comm || !local || !out) return E_ARG;
-    gf::DeviceScope scope(comm_dev(comm));
-    *out = mori::cco::ccoGetPeerPtr(static_cast<mori::cco::ccoComm*>(comm), local, peer);
-    return *out ? OK : E_CCO;
-}
-// Collective; call once after ALL windows of the process are registered (Phase-1 order). Out handle is heap-allocated.
 int32_t gf_devcomm_create_v1(void* comm, uint32_t sdma_queues, void** out_dev) {
     if (!comm || !out_dev) return E_ARG;
     gf::DeviceScope scope(comm_dev(comm));
@@ -177,13 +159,12 @@ static hipError_t zero_h2d(void* ptr, size_t bytes) {
     }
     return hipSuccess;
 }
-// Zero a window region, then a device sync. mode 0 = MORI's H2D-copy method (default), mode 1 = the original hipMemset (kept ONLY for A/B:
-// AITER_GEMM_FUSION_ZERO_MODE=memset_interleaved). All ranks must call, then barrier, before the next launch.
-int32_t gf_zero_v1(int32_t device, void* local, uint64_t bytes, int32_t mode) {
+// Zero a window region with MORI's H2D-copy method, then a device sync. All ranks must call, then barrier, before the next launch.
+int32_t gf_zero_v1(int32_t device, void* local, uint64_t bytes) {
     gf::DeviceScope scope(device);
     if (!scope.ok()) return E_HIP;
-    const hipError_t e = (mode == 1) ? hipMemset(local, 0, static_cast<size_t>(bytes)) : zero_h2d(local, static_cast<size_t>(bytes));
-    if (e != hipSuccess) { std::fprintf(stderr, "GF_COMM zero mode=%d bytes=%llu err=%d (%s)\n", static_cast<int>(mode), static_cast<unsigned long long>(bytes), static_cast<int>(e), hipGetErrorString(e)); return E_HIP; }
+    const hipError_t e = zero_h2d(local, static_cast<size_t>(bytes));
+    if (e != hipSuccess) { std::fprintf(stderr, "GF_COMM zero bytes=%llu err=%d (%s)\n", static_cast<unsigned long long>(bytes), static_cast<int>(e), hipGetErrorString(e)); return E_HIP; }
     return hipDeviceSynchronize() == hipSuccess ? OK : E_HIP;
 }
 // Device memory snapshot for accounting (C-S6): out[0] = free bytes, out[1] = total bytes of `device`.

@@ -15,9 +15,9 @@ class WindowReq:
     name: str
     bytes: int
     kind: str  # "p2p_window" | "control" | "sdma_queue"
-    # Optional sharing tag: under the 'shared_large' policy every request with the same tag, from ANY owner, maps to ONE registered window.
+    # Optional sharing tag: under the 'arena' policy every request with the same tag, from ANY owner, maps to ONE shared view of the arena.
     # `min_bytes` is the real requirement used for a shared window (defaults to `bytes`); `bytes` keeps the equal-size-per-plan convention
-    # of the per-owner policies. Policies other than shared_large ignore both fields.
+    # of the uniform policy. The uniform policy ignores both fields.
     share: Optional[str] = None
     min_bytes: Optional[int] = None
 
