@@ -297,6 +297,28 @@ def test_fused_rms_gated_mxfp4_quant(
     torch.testing.assert_close(ref, out, atol=0.5, rtol=0.5)
 
 
+@pytest.mark.parametrize("M", [1, 31, 1000])
+@pytest.mark.parametrize("N, group_size", [(3072, 128), (256, None), (4096, 256)])
+def test_fused_rms_gated_mxfp4_quant_transpose_scale(M: int, N: int, group_size):
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    torch.manual_seed(0)
+    G = N if group_size is None else group_size
+    x = torch.randn((M, N), dtype=torch.bfloat16, device="cuda")
+    z = torch.randn((M, N), dtype=torch.bfloat16, device="cuda")
+    w = torch.randn(G, dtype=torch.bfloat16, device="cuda")
+
+    y_fp4, y_scales = fused_rms_gated_mxfp4_quant(x, w, z, 1e-6, group_size=group_size)
+    t_fp4, t_scales = fused_rms_gated_mxfp4_quant(
+        x, w, z, 1e-6, group_size=group_size, transpose_scale=True
+    )
+
+    assert t_scales.shape == (M, N // 32) and t_scales.stride() == (1, M)
+    assert torch.equal(t_fp4, y_fp4)
+    assert torch.equal(t_scales, y_scales)
+
+
 @pytest.mark.parametrize(
     "case",
     [

@@ -13,8 +13,10 @@ EPS = 1e-6
 
 def get_default_shapes() -> list[tuple[int, int, int]]:
     # Qwen3.8-Flash-Next GDN out_proj input per rank: 48 heads x 128 at TP1,
-    # 24 at TP2; decode M up to 64, plus one prefill-sized M.
-    return [(M, N, 128) for N in (6144, 3072) for M in (1, 4, 8, 16, 31, 32, 64, 1024)]
+    # 24 at TP2; decode M up to 64, plus two prefill-sized M.
+    return [
+        (M, N, 128) for N in (6144, 3072) for M in (1, 4, 8, 16, 31, 32, 64, 1024, 8192)
+    ]
 
 
 def get_dtype(dtype_str: str) -> torch.dtype:
@@ -67,12 +69,21 @@ def run_benchmark(args):
             "dtype": args.dtype,
             "activation": args.activation,
             "norm_before_gate": not args.norm_after_gate,
+            "transpose_scale": args.transpose_scale,
         },
     )
 
     @triton.testing.perf_report([benchmark])
     def bench_fused_rms_gated_mxfp4_quant(
-        M, N, group_size, metric, provider, dtype, activation, norm_before_gate
+        M,
+        N,
+        group_size,
+        metric,
+        provider,
+        dtype,
+        activation,
+        norm_before_gate,
+        transpose_scale,
     ):
         dtype = get_dtype(dtype)
         x = torch.randn((M, N), dtype=dtype, device="cuda")
@@ -90,6 +101,7 @@ def run_benchmark(args):
                     norm_before_gate=norm_before_gate,
                     activation=activation,
                     group_size=group_size,
+                    transpose_scale=transpose_scale,
                 )
 
         elif provider == "quant_only":
@@ -159,6 +171,11 @@ def parse_args(args: list[str] | None = None):
         "--norm-after-gate",
         action="store_true",
         help="Gate before the norm (norm_before_gate=False).",
+    )
+    parser.add_argument(
+        "--transpose-scale",
+        action="store_true",
+        help="Fused provider writes column-major scales, as dynamic_mxfp4_quant does.",
     )
     parser.add_argument(
         "--metric",

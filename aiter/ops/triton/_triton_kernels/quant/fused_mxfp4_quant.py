@@ -279,10 +279,12 @@ def _fused_rms_gated_mxfp4_quant_kernel(
     eps,
     M,
     N,
+    groups_per_row,
     x_stride_m,
     z_stride_m,
     out_fp4_stride_m,
     out_bs_stride_m,
+    out_bs_stride_n,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
@@ -292,7 +294,11 @@ def _fused_rms_gated_mxfp4_quant_kernel(
 ):
     """One norm group per row: RMSNorm over N, the act(z) gate, then MXFP4
     quant. The gated activation is rounded to the input dtype before quant,
-    as it is when RMSNormGated and the quant run as separate ops."""
+    as it is when RMSNormGated and the quant run as separate ops.
+
+    Row r is group r % groups_per_row of input row r // groups_per_row; the
+    scale strides are those of the caller's (input rows, scale columns) view,
+    so that view can be row- or column-major."""
     pid = tl.program_id(0)
     NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
     offs_m = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -356,8 +362,12 @@ def _fused_rms_gated_mxfp4_quant_kernel(
         bs_mask = (offs_m < M)[:, None] & (bs_offs_n < (N // MXFP4_QUANT_BLOCK_SIZE))[
             None, :
         ]
+    bs_row = offs_m // groups_per_row
+    bs_col = (offs_m % groups_per_row) * (N // MXFP4_QUANT_BLOCK_SIZE)
     tl.store(
-        out_bs_ptr + offs_m[:, None] * out_bs_stride_m + bs_offs_n[None, :],
+        out_bs_ptr
+        + bs_row[:, None] * out_bs_stride_m
+        + (bs_col[:, None] + bs_offs_n[None, :]) * out_bs_stride_n,
         bs_e8m0.to(out_bs_ptr.type.element_ty),
         mask=bs_mask,
         cache_modifier=".cg",

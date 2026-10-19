@@ -199,6 +199,7 @@ def fused_rms_gated_mxfp4_quant(
     norm_before_gate: bool = True,
     activation: str = "silu",
     group_size: int | None = None,
+    transpose_scale: bool = False,
 ):
     """
     Gated RMSNorm followed by MXFP4 quantization, the RMSNormGated + per-1x32
@@ -219,6 +220,9 @@ def fused_rms_gated_mxfp4_quant(
     - group_size: Length of each RMS group along N, or None for the whole row.
       It must divide N and be a multiple of 32, so that no MXFP4 block spans
       two groups.
+    - transpose_scale: If True, store out_bs column-major (strides (1, M)),
+      the layout dynamic_mxfp4_quant returns. gemm_afp4wfp4 reads it
+      faster than the row-major default once M reaches about 1024.
 
     Returns:
     - out_fp4: The output matrix with shape (M, N // 2).
@@ -254,9 +258,11 @@ def fused_rms_gated_mxfp4_quant(
     z = z.view(-1, G)
     rows = x.shape[0]
     out_fp4 = torch.empty((rows, G // 2), dtype=torch.uint8, device=x.device)
-    out_bs = torch.empty(
-        (rows, G // MXFP4_QUANT_BLOCK_SIZE), dtype=torch.uint8, device=x.device
-    )
+    n_scales = N // MXFP4_QUANT_BLOCK_SIZE
+    if transpose_scale:
+        out_bs = torch.empty((n_scales, M), dtype=torch.uint8, device=x.device).T
+    else:
+        out_bs = torch.empty((M, n_scales), dtype=torch.uint8, device=x.device)
 
     BLOCK_SIZE_N = triton.next_power_of_2(G)
     BLOCK_SIZE_M = min(8, triton.next_power_of_2(triton.cdiv(rows, 1024)))
@@ -270,10 +276,11 @@ def fused_rms_gated_mxfp4_quant(
         eps,
         rows,
         G,
+        N // G,
         x.stride(0),
         z.stride(0),
         out_fp4.stride(0),
-        out_bs.stride(0),
+        *out_bs.stride(),
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
@@ -281,7 +288,7 @@ def fused_rms_gated_mxfp4_quant(
         ACTIVATION="sigmoid" if activation == "sigmoid" else "silu",
     )
 
-    return out_fp4.view(M, N // 2), out_bs.view(M, N // MXFP4_QUANT_BLOCK_SIZE)
+    return out_fp4.view(M, N // 2), out_bs
 
 
 def fused_flatten_mxfp4_quant(
