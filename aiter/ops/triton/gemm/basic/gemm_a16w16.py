@@ -528,6 +528,7 @@ def gemm_a16w16_(
         use_activation=activation is not None,
         ADD_BIAS=(bias is not None),
         SKIP_REDUCE=skip_reduce,
+        ROUND_BEFORE_ACT=(get_arch() == "gfx1151"),
         **config,
     )
 

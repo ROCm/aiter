@@ -27,6 +27,7 @@ _gemm_a16w16_repr = make_kernel_repr(
         "use_activation",
         "ADD_BIAS",
         "SKIP_REDUCE",
+        "ROUND_BEFORE_ACT",
     ],
 )
 
@@ -72,6 +73,7 @@ def _gemm_a16_w16_kernel(
     use_activation: tl.constexpr,
     ADD_BIAS: tl.constexpr,
     SKIP_REDUCE: tl.constexpr,
+    ROUND_BEFORE_ACT: tl.constexpr,
 ):
     """Kernel for computing the matmul C = A x B.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
@@ -163,8 +165,9 @@ def _gemm_a16_w16_kernel(
 
         if use_activation and NUM_KSPLIT == 1:
             # Round to the 16-bit output type first, as an unfused GEMM does.
-            # On gfx1151 this made the GELU epilogues faster.
-            if (
+            # The wrapper sets ROUND_BEFORE_ACT on gfx1151, where this made the
+            # GELU epilogues faster.
+            if ROUND_BEFORE_ACT and (
                 c_ptr.type.element_ty == tl.float16
                 or c_ptr.type.element_ty == tl.bfloat16
             ):
