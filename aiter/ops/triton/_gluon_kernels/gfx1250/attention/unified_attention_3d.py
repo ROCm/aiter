@@ -1925,6 +1925,21 @@ unified_attention_gluon_kernel_3d_repr = make_kernel_repr(
 
 
 @gluon.jit
+def compute_pv_per_token(pgm, p, v, acc):
+    """P @ V for P already scaled by the per-token V scales.
+
+    P is split into a bf16 high part and a bf16 low part, so P keeps about 16
+    mantissa bits. One bf16 P truncates each weight by up to 2^-7, which biases
+    the output low against the fp32 row sum L. Decode is memory bound, so the
+    second WMMA costs little.
+    """
+    p_hi = p.to(gl.bfloat16)
+    p_lo = (p - p_hi.to(gl.float32)).to(gl.bfloat16)
+    acc = pgm.compute_pv(p_hi, v, None, acc)
+    return pgm.compute_pv(p_lo, v, None, acc)
+
+
+@gluon.jit
 def load_per_token_kv_scales(
     k_scale_ptr,
     v_scale_ptr,
@@ -2408,7 +2423,10 @@ def _unified_attention_gluon_kernel_3d(
         else:
             v = pgm.tdm_shared_load_v(wait_count=2, buffer_id=buffer_id)
             v_scales = None
-            acc = pgm.compute_pv(p, v, v_scales, acc)
+            if PER_TOKEN_KV_SCALE:
+                acc = compute_pv_per_token(pgm, p, v, acc)
+            else:
+                acc = pgm.compute_pv(p, v, v_scales, acc)
 
         buffer_id = next_buffer_id
         if need_addtional_mask:
@@ -2475,7 +2493,10 @@ def _unified_attention_gluon_kernel_3d(
     else:
         v = pgm.tdm_shared_load_v(wait_count=0, buffer_id=buffer_id)
         v_scales = None
-        acc = pgm.compute_pv(p, v, v_scales, acc)
+        if PER_TOKEN_KV_SCALE:
+            acc = compute_pv_per_token(pgm, p, v, acc)
+        else:
+            acc = pgm.compute_pv(p, v, v_scales, acc)
     # M = M * qk_factor
 
     if cfg.NUM_SEGMENTS_PER_SEQ == 1:

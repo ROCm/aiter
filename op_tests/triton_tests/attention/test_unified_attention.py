@@ -685,6 +685,10 @@ def test_unified_attention_per_token_kv_scale(
     assert torch.isfinite(output).all()
     torch.testing.assert_close(output.float(), dequant_ref, atol=2e-2, rtol=2e-2)
     assert cosine(output, dequant_ref) >= 0.9999
+    # A P truncated to bf16 biases the output low by about 0.3%.
+    out_f, ref_f = output.float().flatten(), dequant_ref.flatten()
+    bias = ((out_f * ref_f).sum() / (ref_f * ref_f).sum() - 1).item()
+    assert abs(bias) < 1e-3, f"output is biased by {bias:+.2e} against the reference"
     # The kernel may lose no more than the fp8 rounding of the cache itself.
     fp8_floor = cosine(dequant_ref, unquantized_ref)
     assert cosine(output, unquantized_ref) >= fp8_floor - 1e-4, (
