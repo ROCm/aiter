@@ -47,7 +47,11 @@ class Config:
 
     @classmethod
     def from_string(cls, data: str):
-        tile, down_path, padding = data.split(":")
+        parts = data.split(":")
+        # Configs tuned before the Down suffix existed use the default Down path.
+        if len(parts) == 1:
+            parts += ["default", "0"]
+        tile, down_path, padding = parts
         block_m, block_n, block_k, use_prefill = tile.split("_")
         if use_prefill not in ("True", "False"):
             raise ValueError(f"Invalid prefill flag: {use_prefill}")
@@ -370,10 +374,13 @@ def _run_prefill(
     if config.down_path == "8x1_compact":
         from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.gemm2_8x1_compact import (
             allocate_task_buffers,
+            device_cu_count,
         )
 
+        # The split policy and its buffer capacities must use the same CU count.
+        cu_count = device_cu_count(sorted_expert_ids.device)
         full_tasks, tail_tasks, counts = allocate_task_buffers(
-            sorted_expert_ids, problem.experts
+            sorted_expert_ids, problem.experts, cu_count
         )
         _launch(
             down_kernel,
@@ -383,6 +390,7 @@ def _run_prefill(
             counts,
             full_tasks.shape[0],
             tail_tasks.shape[0],
+            cu_count,
         )
     else:
         _launch(down_kernel, *down_args)

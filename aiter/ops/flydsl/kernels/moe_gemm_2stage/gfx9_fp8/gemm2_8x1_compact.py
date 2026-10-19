@@ -18,28 +18,24 @@ from .gemm2_8x1 import _build_moe_gemm2_8x1
 _SPLIT_NUM, _SPLIT_DEN = 3, 5
 
 
-def device_cu_count():
-    return int(
-        torch.cuda.get_device_properties(
-            torch.cuda.current_device()
-        ).multi_processor_count
-    )
+def device_cu_count(device):
+    return int(torch.cuda.get_device_properties(device).multi_processor_count)
 
 
-def task_capacities(metadata_capacity, experts):
-    assert metadata_capacity >= 0 and 0 < experts <= 2048
+def task_capacities(metadata_capacity, experts, cu_count):
+    assert metadata_capacity >= 0 and 0 < experts <= 2048 and cu_count > 0
     # An expert has at most three native tails. Each split full task adds four
     # tails, and total tail tasks cannot exceed the number of metadata blocks.
-    max_split = (device_cu_count() * _SPLIT_NUM - 1) // _SPLIT_DEN
+    max_split = (cu_count * _SPLIT_NUM - 1) // _SPLIT_DEN
     max_split = min(metadata_capacity // 4, max_split)
     return max(1, (metadata_capacity + 3) // 4), max(
         1, min(metadata_capacity, 3 * experts + 4 * max_split)
     )
 
 
-def allocate_task_buffers(sorted_expert_ids, experts):
-    """Allocate from tensor sizes using the compact launcher's split policy."""
-    full, tail = task_capacities(sorted_expert_ids.numel(), experts)
+def allocate_task_buffers(sorted_expert_ids, experts, cu_count):
+    """Allocate for the split policy the launcher applies with the same cu_count."""
+    full, tail = task_capacities(sorted_expert_ids.numel(), experts, cu_count)
     return (
         torch.empty((full, 2), dtype=torch.int32, device=sorted_expert_ids.device),
         torch.empty((tail, 2), dtype=torch.int32, device=sorted_expert_ids.device),
@@ -49,7 +45,6 @@ def allocate_task_buffers(sorted_expert_ids, experts):
 
 def build_task_table(experts):
     assert 0 < experts <= 2048
-    cu_count = device_cu_count()
     width = max(256, 1 << (experts - 1).bit_length())
     threads = 256
     rounds = width // threads
@@ -61,6 +56,8 @@ def build_task_table(experts):
         full_tasks: fx.Pointer,
         tail_tasks: fx.Pointer,
         counts: fx.Pointer,
+        cu_count: fx.Int32,
+        tail_capacity: fx.Int32,
     ):
         tid = fx.Int32(gpu.thread_idx.x)
         storage = fx.SharedAllocator().allocate(fx.Array[fx.Int32, width * 4, 16])
@@ -120,6 +117,9 @@ def build_task_table(experts):
             remainder,
             fx.Int32(0),
         )
+        # Never split more full tasks than the tail buffer holds.
+        spare = (tail_capacity - original_tail) // 4
+        split_full = fx.arith.select(split_full > spare, spare, split_full)
         keep_full = original_full - split_full
         if tid == 0:
             counts[0] = keep_full * 256
@@ -169,10 +169,18 @@ def build_task_table(experts):
         full_tasks: fx.Pointer,
         tail_tasks: fx.Pointer,
         counts: fx.Pointer,
+        cu_count: fx.Int32,
+        tail_capacity: fx.Int32,
         stream: fx.Stream,
     ):
         compact_m64_tasks(
-            sorted_experts, valid_rows, full_tasks, tail_tasks, counts
+            sorted_experts,
+            valid_rows,
+            full_tasks,
+            tail_tasks,
+            counts,
+            cu_count,
+            tail_capacity,
         ).launch(grid=(1, 1, 1), block=(threads, 1, 1), stream=stream)
 
     return launch
@@ -222,6 +230,7 @@ def _build_moe_gemm2_8x1_compact(
         p_counts: fx.Pointer,
         full_capacity: fx.Int32,
         tail_capacity: fx.Int32,
+        cu_count: fx.Int32,
         stream: fx.Stream,
     ):
         # Counts are consumed only by device guards; no host synchronization.
@@ -231,6 +240,8 @@ def _build_moe_gemm2_8x1_compact(
             p_full_tasks,
             p_tail_tasks,
             p_counts,
+            cu_count,
+            tail_capacity,
             stream,
         )
         full(
