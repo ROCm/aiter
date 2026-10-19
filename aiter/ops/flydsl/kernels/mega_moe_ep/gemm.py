@@ -493,8 +493,10 @@ def build_gemm(kc: KernelCtx) -> dict:
                 def _ln(ni, _k=sp + 2, _br=b_row):
                     return b_loader.load_ni(_br, ni, i32(_k))
 
+                rocdl.s_setprio(1)  # prioritize this compute wave's MFMA issue over the
                 acc, b_new = mfma_gu.call_pipe_am(_al, b_a, acc, sa, sb, _ln)
-                _ring_release(L, tid, q0 + i32(sp))  # done reading A K=sp
+                rocdl.s_setprio(0)  # aux wave sharing the SIMD (TP-style); drop between
+                _ring_release(L, tid, q0 + i32(sp))  # steps so the loader can issue. A K=sp
                 _ring_wait(L, tid, q0 + i32(sp + 1))  # wait A K=sp+1 staged
                 b_a, b_b = b_b, b_new  # rotate the 2-deep weight pipe
             for ts in range_constexpr(K_ITERS - 2, K_ITERS):  # tail: consume primed W
@@ -718,7 +720,9 @@ def build_gemm(kc: KernelCtx) -> dict:
                 def _ln(ni, _k=sp + 2, _br=b_row):
                     return b_loader.load_ni(_br, ni, i32(_k))
 
+                rocdl.s_setprio(1)  # prioritize MFMA issue over the SIMD's aux wave (TP-style)
                 acc, b_new = mfma_gu.call_pipe_am(_al, b_a, acc, sa, sb, _ln)
+                rocdl.s_setprio(0)
                 _ring_release(L, tid, q0 + i32(sp))  # done reading inter K=sp
                 _ring_wait(L, tid, q0 + i32(sp + 1))  # wait inter K=sp+1 staged
                 b_a, b_b = b_b, b_new  # rotate the 2-deep weight pipe
