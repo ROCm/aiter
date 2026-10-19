@@ -2965,6 +2965,8 @@ def _fused_applies(algorithm: str, knobs: dict, tp: int, hidden: int) -> bool:
     eng.rs_codec, _ag = _resolve_codecs(algo, tp, None, None)
     eng.block = None
     eng.atoms_per_row = apr
+    # ``_geom_for`` records a width whose ``atoms_per_row`` it substituted.
+    eng._apr_substituted = set()
     if not eng.supports_hidden(hidden):
         return False
     return apr is None or eng._geom_for(hidden)[1] == apr
