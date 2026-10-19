@@ -34,6 +34,16 @@ _GLUON_DEFAULT_ARCHS = ("gfx1250",)
 _GLUON_KERNEL_TYPES = ("bandwidth_bound", "compute_bound")
 
 
+def _gfx1250_num_buffers(config, prefetch_all=False):
+    """NUM_BUFFERS of the gfx1250 Gluon kernels, at most the K tiles of a split + 1
+
+    The kernels load NUM_BUFFERS - 1 K tiles of a split before the main loop, more buffers causse a page fault on the last split.
+    A kernel that loads all NUM_BUFFERS tiles first (prefetch_all) gets at most the K tiles of a split.
+    """
+    k_tiles = triton.cdiv(config["SPLITK_BLOCK_SIZE"], config["BLOCK_SIZE_K"])
+    return min(config["NUM_BUFFERS"], k_tiles if prefetch_all else k_tiles + 1)
+
+
 def gemm_a8w8_blockscale(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -161,7 +171,7 @@ def gemm_a8w8_blockscale(
             for i in range(int(math.log2(config["num_warps"] // 2))):
                 warp_bases.append((1 << i, 0))
             extra_constexpr["warp_bases"] = tuple(warp_bases)
-            config["NUM_BUFFERS"] = config.pop("num_stages", 1)
+            config["NUM_BUFFERS"] = _gfx1250_num_buffers(config)
         else:
             raise AssertionError(
                 f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{arch}'"
@@ -390,7 +400,9 @@ def gemm_a8w8_blockscale_preshuffle(
         for i in range(int(math.log2(config["num_warps"] // 2))):
             warp_bases.append((1 << i, 0))
         extra_constexpr["warp_bases"] = tuple(warp_bases)
-        config["NUM_BUFFERS"] = config.pop("num_stages", 1)
+        config["NUM_BUFFERS"] = _gfx1250_num_buffers(
+            config, prefetch_all=kernel_type == "compute_bound"
+        )
     else:
         impl = triton_gemm_a8w8_blockscale_preshuffle_kernel
 
