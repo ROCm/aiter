@@ -3199,23 +3199,19 @@ def _get_compiled_apre_quant(
 
 
 @functools.cache
-def _get_compiled_apre_fused_quant_scatter(
+def _get_compiled_apre_scatter(
     feat_dim: int,
     wmma_rep: int,
-    scatter_only: bool = False,
     src_scale_stride_bytes: int = 0,
-    row_major_scale: bool = False,
 ):
     from aiter.ops.flydsl.kernels.moe_apreshuffled_quant_scatter import (
-        build_moe_apre_fused_quant_scatter_module,
+        build_moe_apre_scatter_module,
     )
 
-    return build_moe_apre_fused_quant_scatter_module(
+    return build_moe_apre_scatter_module(
         feat_dim,
         wmma_rep,
-        scatter_only,
         src_scale_stride_bytes,
-        row_major_scale,
     )
 
 
@@ -3309,7 +3305,7 @@ def flydsl_moe_fused_quant_preshuffle(
     ep_psum_params: dict | None = None,
     # Prequantized full-row path only. Writes e8m0 as (row, K/32) instead of
     # the interleaved GEMM layout. The caller must launch gemm1 with
-    # row_major_ascale=1. Off for the quantizing path: that still preshuffles.
+    # row_major_ascale=1. Unsupported with A-preshuffled payloads or quantization.
     row_major_scale: bool = False,
     payload_preshuffled: bool = False,
 ):
@@ -3324,6 +3320,8 @@ def flydsl_moe_fused_quant_preshuffle(
             f"flydsl_moe_fused_quant_preshuffle: quant_mode={quant_mode!r} "
             "unsupported (expected 'fp4' or 'fp8')."
         )
+    if payload_preshuffled and row_major_scale:
+        raise ValueError("A-preshuffled payload requires M16K4 scales")
     if payload_preshuffled and (quant_mode != "fp4" or grouped_in.shape[-1] % 128):
         raise ValueError("preshuffled payload requires MXFP4 with K divisible by 128")
     # A quantizing EP dispatch (fp8 or fp4) already put the payload and its e8m0
@@ -3514,119 +3512,43 @@ def flydsl_moe_fused_quant_preshuffle(
                 raise ValueError(
                     "A-preshuffle tile quant requires rows remapped before launch"
                 )
-            quant_scatter_fused = os.environ.get(
-                "AITER_FLYDSL_MOE_APRESHUFFLE_QUANT_SCATTER_FUSED", "1"
-            ) in ("1", "true", "True")
-
             from aiter.jit.utils.chip_info import get_cu_num
 
+            apre_workers = max(1, 4 * (get_cu_num() or 1))
+            stream = torch.cuda.current_stream()
             if prequantized:
                 # MoRI already produced packed FP4 and padded E8M0 rows.
-                # Scatter directly from those buffers; no quantization, scratch
-                # copy, or global phase barrier is needed.
-                apre_workers = min(
-                    n_rows // 16,
-                    max(
-                        1,
-                        int(
-                            os.environ.get(
-                                "AITER_FLYDSL_APRE_FUSED_WORKERS",
-                                4 * (get_cu_num() or 1),
-                            )
-                        ),
-                    ),
+                compact_payload = grouped_in.contiguous()
+                compact_scale = prequantized_scale
+            else:
+                compact_payload = torch.empty(
+                    (token_num, Pb), dtype=torch.uint8, device=device
                 )
-                payload_ptr = ptr_arg(grouped_in.contiguous().view(-1))
-                scale_ptr = ptr_arg(prequantized_scale.view(-1))
-                _get_compiled_apre_fused_quant_scatter(
-                    feat_dim,
-                    wmma_rep,
-                    scatter_only=True,
-                    src_scale_stride_bytes=int(prequantized_scale.shape[-1]),
-                    row_major_scale=row_major_scale,
-                )(
-                    payload_ptr,
-                    payload_ptr,
-                    scale_ptr,
-                    ptr_arg(out_payload.view(-1)),
-                    ptr_arg(out_scale.view(-1)),
-                    ptr_arg(row_to_token.reshape(-1)),
-                    scale_ptr,
-                    token_num,
-                    n_rows,
-                    apre_workers,
-                    stream=torch.cuda.current_stream(),
+                compact_scale = torch.empty(
+                    (token_num, Ws), dtype=torch.uint8, device=device
                 )
-                return out_payload, out_scale
-
-            compact_payload = torch.empty(
-                (token_num, Pb), dtype=torch.uint8, device=device
-            )
-            compact_scale = torch.empty(
-                (token_num, Ws), dtype=torch.uint8, device=device
-            )
-            apre_workers = max(
-                1,
-                int(
-                    os.environ.get(
-                        "AITER_FLYDSL_APRE_FUSED_WORKERS",
-                        4 * (get_cu_num() or 1),
-                    )
-                ),
-            )
-            hidden_ptr = ptr_arg(grouped_in.contiguous().view(-1))
-            compact_payload_ptr = ptr_arg(compact_payload.view(-1))
-            compact_scale_ptr = ptr_arg(compact_scale.view(-1))
-            stream = torch.cuda.current_stream()
-            if not quant_scatter_fused:
-                _get_compiled_apre_quant(
-                    feat_dim,
-                    wmma_rep,
-                )(
-                    hidden_ptr,
-                    compact_payload_ptr,
-                    compact_scale_ptr,
+                _get_compiled_apre_quant(feat_dim, wmma_rep)(
+                    ptr_arg(grouped_in.contiguous().view(-1)),
+                    ptr_arg(compact_payload.view(-1)),
+                    ptr_arg(compact_scale.view(-1)),
                     token_num,
                     apre_workers,
                     stream=stream,
                 )
-                _get_compiled_apre_fused_quant_scatter(
-                    feat_dim,
-                    wmma_rep,
-                    scatter_only=True,
-                )(
-                    hidden_ptr,
-                    compact_payload_ptr,
-                    compact_scale_ptr,
-                    ptr_arg(out_payload.view(-1)),
-                    ptr_arg(out_scale.view(-1)),
-                    ptr_arg(row_to_token.reshape(-1)),
-                    compact_scale_ptr,
-                    token_num,
-                    n_rows,
-                    apre_workers,
-                    stream=stream,
-                )
-                return out_payload, out_scale
-
-            # The fused phase boundary uses two int32 words: arrival count and
-            # release flag. Separate quant/scatter launches use kernel completion
-            # to provide this ordering.
-            fused_barrier = torch.zeros(2, dtype=torch.int32, device=device)
-            _get_compiled_apre_fused_quant_scatter(
+            # Stream ordering makes compact rows visible to the scatter kernel.
+            _get_compiled_apre_scatter(
                 feat_dim,
                 wmma_rep,
+                src_scale_stride_bytes=int(compact_scale.shape[-1]),
             )(
-                hidden_ptr,
-                compact_payload_ptr,
-                compact_scale_ptr,
+                ptr_arg(compact_payload.view(-1)),
+                ptr_arg(compact_scale.view(-1)),
                 ptr_arg(out_payload.view(-1)),
                 ptr_arg(out_scale.view(-1)),
                 ptr_arg(row_to_token.reshape(-1)),
-                ptr_arg(fused_barrier),
                 token_num,
                 n_rows,
-                apre_workers,
+                min(n_rows // 16, apre_workers),
                 stream=stream,
             )
             return out_payload, out_scale

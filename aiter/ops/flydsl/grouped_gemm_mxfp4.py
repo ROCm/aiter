@@ -150,6 +150,8 @@ def flydsl_grouped_gemm_a8w4_masked(
     Preshuffled MXFP4 A uses logical (M/16, K/128, 4, 16, 32) tiles, with the
     innermost 32 FP4 values packed into 16 bytes.
     """
+    if a_preshuffled and row_major_ascale:
+        raise ValueError("A-preshuffled GEMM requires M16K4 activation scales")
     if a_preshuffled and not a_is_fp4:
         raise ValueError("preshuffled A requires MXFP4 activations")
     if a_preshuffled and (

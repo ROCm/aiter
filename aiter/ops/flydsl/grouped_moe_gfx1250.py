@@ -964,6 +964,7 @@ def _grouped_a8w4_tdm_moe(
     _rm_min_tokens = int(os.environ.get("AITER_TDM_ROW_MAJOR_A1_MIN_TOKENS", "1024"))
     _row_major_a1 = (
         _prequantized
+        and not a_preshuffled
         and not _compact
         and not _fuse_ep_route_quant
         and ep_psum_params is None
