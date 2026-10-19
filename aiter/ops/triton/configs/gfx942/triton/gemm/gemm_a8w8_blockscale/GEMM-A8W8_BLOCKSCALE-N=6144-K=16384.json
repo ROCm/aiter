@@ -10,15 +10,16 @@
     ],
     "M_LEQ_16": {
         "BLOCK_SIZE_M": 16,
-        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_N": 128,
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
-        "num_warps": 1,
+        "num_warps": 2,
         "num_stages": 2,
-        "waves_per_eu": 1,
+        "waves_per_eu": 0,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
-        "NUM_KSPLIT": 8
+        "NUM_KSPLIT": 16,
+        "kpack": 1
     },
     "M_LEQ_32": {
         "BLOCK_SIZE_M": 32,
@@ -30,7 +31,8 @@
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
-        "NUM_KSPLIT": 8
+        "NUM_KSPLIT": 8,
+        "kpack": 1
     },
     "M_LEQ_64": {
         "BLOCK_SIZE_M": 64,
@@ -42,7 +44,8 @@
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
-        "NUM_KSPLIT": 8
+        "NUM_KSPLIT": 8,
+        "kpack": 1
     },
     "M_LEQ_128": {
         "BLOCK_SIZE_M": 64,
@@ -54,7 +57,8 @@
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
-        "NUM_KSPLIT": 6
+        "NUM_KSPLIT": 6,
+        "kpack": 1
     },
     "M_LEQ_256": {
         "BLOCK_SIZE_M": 64,
@@ -66,7 +70,8 @@
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
-        "NUM_KSPLIT": 3
+        "NUM_KSPLIT": 3,
+        "kpack": 1
     },
     "M_LEQ_384": {
         "BLOCK_SIZE_M": 64,
@@ -78,7 +83,8 @@
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
-        "NUM_KSPLIT": 2
+        "NUM_KSPLIT": 2,
+        "kpack": 1
     },
     "M_LEQ_1024": {
         "BLOCK_SIZE_M": 64,
@@ -90,7 +96,8 @@
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
-        "NUM_KSPLIT": 3
+        "NUM_KSPLIT": 3,
+        "kpack": 1
     },
     "any": {
         "BLOCK_SIZE_M": 128,
@@ -102,6 +109,7 @@
         "waves_per_eu": 2,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
-        "NUM_KSPLIT": 1
+        "NUM_KSPLIT": 1,
+        "kpack": 1
     }
 }
