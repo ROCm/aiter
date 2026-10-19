@@ -46,6 +46,8 @@ from .common import (
     wait_vm,
 )
 
+const_expr = fx.const_expr
+
 NW = 4
 NTH = NW * 64
 KCK = 2  # GEMM1 k-steps (of 128) per chunk
@@ -97,13 +99,12 @@ def build_bigm_unit(
     scales [rows][H / 32] after them (at oob / 2: oob = the route count * H * 2).
     Returns (LDS layout, unit_body)."""
     assert RG % 16 == 0 and RG <= 128 and H % 256 == 0 and I % 128 == 0
-    MTE = RG // 16
+    MTE = RG // 16  # 16-row tiles (every wave computes every row of the unit)
     KH = H // 2  # A / w1 row bytes
     KCH = H // (128 * KCK)  # GEMM1 chunks (KCK k-steps of 128)
     RBA = 64 * KCK  # A row bytes per chunk
     LPR = RBA // 16  # DMA lanes per A row (16 B each)
     RPJ = 64 // LPR  # A rows per dma16
-    MTEW = MTE  # 16-row tiles per wave
     PASSES = I // (NW * 32)  # GEMM1 passes
     NG2 = H // (NW * 64)  # GEMM2 column groups per wave
     KS2 = I // 128  # GEMM2 k-steps
@@ -125,9 +126,12 @@ def build_bigm_unit(
     # sched barrier mask after the GEMM2 B issue groups (only VMEM is held)
     SCM = 0x38F
     NB2 = 6  # GEMM2 B ops per k-step: 4 tiles + 2 scale words per 64 columns
-    NST2 = 2 * MTEW  # route stores per wave per group
-    # steady-state GEMM1 issue order per chunk c: B(c + BST), then A(c + NAB - 1)
-    WAIT1 = min(NA + (NA + NB) * (BST - 1), (NA + NB) * (NAB - 2))
+    NST2 = 2 * MTE  # route stores per wave per group
+    # steady-state GEMM1 issue order per chunk c: B(c + BST), then A(c + NAB - 1). By the
+    # count alone A(c) has landed once (NA + NB) * (NAB - 2) newer ops remain, but its LDS
+    # writes (direct-to-LDS loads) can still be in flight then: one chunk's ops more are
+    # awaited (else a unit now and then reads stale A rows of a chunk, small units mostly)
+    WAIT1 = max(min(NA + (NA + NB) * (BST - 1), (NA + NB) * (NAB - 3)), 0)
     assert WAIT1 <= 63
 
     def _wait2(kk):
@@ -165,11 +169,9 @@ def build_bigm_unit(
         gpu.barrier()
 
     @flyc.jit
-    def part_g1(L, tid, e, rows, rx, rxs, w1, rws1):
+    def part_g1(L, tid, e, rx, rxs, w1, rws1):
         lane = tid % i32(64)
-        w = rocdl.readfirstlane(T.i32, tid // i32(64))
-        wc = w % i32(NW)  # column group
-        rb = (w // i32(NW)) * i32(RG)  # first row of this wave's tiles
+        w = rocdl.readfirstlane(T.i32, tid // i32(64))  # the wave: its column group
         q4 = lane // i32(16)
         zero = fx.Vector.filled(4, 0.0, fx.Float32)
         # ---- A operand addressing (this wave's rows) ----
@@ -224,7 +226,7 @@ def build_bigm_unit(
         rw1 = rsrc(fx.Int64(w1) + fx.Int64(e) * fx.Int64(2 * I * KH))
 
         def issue_b(p, c):
-            icol0 = p * i32(NW * 32) + wc * i32(32)
+            icol0 = p * i32(NW * 32) + w * i32(32)
             vg0 = icol0 * i32(KH) + lane * i32(16)
             vs = (vg0, vg0 + i32(16 * KH), vg0 + i32(I * KH), vg0 + i32((I + 16) * KH))
             b = []
@@ -256,21 +258,21 @@ def build_bigm_unit(
                     for x in (sgw, suw)
                     for h in (0, 1)
                 ]
-                afs = [a_frag_m(buf, m, k) for m in range(MTEW)]
-                sas = [a_scale_m(buf, m, k) for m in range(MTEW)]
-                for m in range_constexpr(MTEW):
+                afs = [a_frag_m(buf, m, k) for m in range(MTE)]
+                sas = [a_scale_m(buf, m, k) for m in range(MTE)]
+                for m in range_constexpr(MTE):
                     for t in range_constexpr(4):
-                        j = (t // 2) * 2 * MTEW + m * 2 + t % 2
+                        j = (t // 2) * 2 * MTE + m * 2 + t % 2
                         acc[j] = mfma(bq[k * 4 + t], afs[m], acc[j], sc[t], sas[m])
             return acc
 
         def act_store(acc, p):
-            for m in range_constexpr(MTEW):
-                row = rb + i32(m * 16) + lane % i32(16)
+            for m in range_constexpr(MTE):
+                row = i32(m * 16) + lane % i32(16)
                 gs, us_ = [], []
                 for t in range_constexpr(2):
                     ga, ua = fx.Vector(acc[m * 2 + t]), fx.Vector(
-                        acc[2 * MTEW + m * 2 + t]
+                        acc[2 * MTE + m * 2 + t]
                     )
                     for v in range_constexpr(4):
                         gs.append(fx.Float32(ga[v]))
@@ -284,7 +286,7 @@ def build_bigm_unit(
                 am = am.maximumf(am.shuffle_xor(i32(32), i32(64)))
                 e8, qs = _e8m0_from_amax(am, max_norm=6.0)
                 for t in range_constexpr(2):
-                    col = p * i32(NW * 32) + wc * i32(32) + i32(t * 16) + q4 * i32(4)
+                    col = p * i32(NW * 32) + w * i32(32) + i32(t * 16) + q4 * i32(4)
                     pk = fp4_pack(xs_[t * 4 : t * 4 + 4], qs)
                     lds_st(
                         L,
@@ -295,7 +297,7 @@ def build_bigm_unit(
                 if q4 == i32(0):
                     lds_st(
                         L,
-                        i32(LINTS) + row * i32(ISS) + p * i32(NW) + wc,
+                        i32(LINTS) + row * i32(ISS) + p * i32(NW) + w,
                         fx.Int8(e8),
                         align=1,
                     )
@@ -316,13 +318,13 @@ def build_bigm_unit(
                     bld(rx, lane * i32(16), 0, V4I)
         NBV = 4 * KCK + 2  # values per B issue
         assert KCH % BST == 0
-        init = [zero] * (4 * MTEW) + [v for b in bpre for v in b]
+        init = [zero] * (4 * MTE) + [v for b in bpre for v in b]
         phi = i32(PASSES)
         for p_, stt in range(i32(0), phi, i32(1), init=init):
             p = i32(p_)
-            acc = [zero] * (4 * MTEW)
+            acc = [zero] * (4 * MTE)
             ring = [
-                list(stt[4 * MTEW + s * NBV : 4 * MTEW + (s + 1) * NBV])
+                list(stt[4 * MTE + s * NBV : 4 * MTE + (s + 1) * NBV])
                 for s in range(BST)
             ]
             for c in range_constexpr(KCH):
@@ -342,7 +344,7 @@ def build_bigm_unit(
                 issue_a(i32((c + NAB - 1) % KCH), (c + NAB - 1) % NAB)
             act_store(acc, p)
             # (the yield's value binding is FlyDSL's loop-carried form)
-            res = yield [zero] * (4 * MTEW) + [  # noqa: F841
+            res = yield [zero] * (4 * MTE) + [  # noqa: F841
                 v for s in range(BST) for v in ring[s]
             ]
         wait_vm(0)
@@ -352,16 +354,14 @@ def build_bigm_unit(
     @flyc.jit
     def part_g2(L, tid, e, rows, w2, rws2, r_routes, oob):
         lane = tid % i32(64)
-        w = rocdl.readfirstlane(T.i32, tid // i32(64))
-        wc = w % i32(NW)  # column group
-        rb = (w // i32(NW)) * i32(RG)  # first row of this wave's tiles
+        w = rocdl.readfirstlane(T.i32, tid // i32(64))  # the wave: its column group
         q4 = lane // i32(16)
         zero = fx.Vector.filled(4, 0.0, fx.Float32)
         # ---- GEMM2 from the LDS intermediate: NG2 groups x KS2 k-steps, B ring BS2 ----
         rw2 = rsrc(fx.Int64(w2) + fx.Int64(e) * fx.Int64(H * (I // 2)))
 
         def issue_b2(gi, kk):  # one 64-column group
-            n0 = (wc + i32(NW) * gi) * i32(64)
+            n0 = (w + i32(NW) * gi) * i32(64)
             b = [
                 fx.Vector(
                     bld(
@@ -388,8 +388,8 @@ def build_bigm_unit(
             return b
 
         row_meta = []
-        for m in range_constexpr(MTEW):
-            R = rb + i32(m * 16) + lane % i32(16)
+        for m in range_constexpr(MTE):
+            R = i32(m * 16) + lane % i32(16)
             ok = R < rows
             Rc = ok.select(R, i32(0))
             row_meta.append(
@@ -400,14 +400,13 @@ def build_bigm_unit(
                 )
             )
 
-        def epi2(acc, gi, valid):
-            # route rows of group gi (valid False: stores dropped, counts kept)
-            n0 = (wc + i32(NW) * gi) * i32(64)
+        def epi2(acc, gi):
+            # route rows of group gi (rows past the unit's: stores dropped, counts kept)
+            n0 = (w + i32(NW) * gi) * i32(64)
             ccol = (q4 & i32(1)) * i32(16) + (q4 >> i32(1)) * i32(8)
-            for m in range(MTEW) if R8 else ():
+            for m in range(MTE) if R8 else ():
                 # MXFP8 route rows (the small-M engine's store_route_fp8 layout)
                 ok, wt, rix = row_meta[m]
-                ok = ok & valid
                 d, e8s = [], []
                 for half in range_constexpr(2):
                     f = [
@@ -432,9 +431,8 @@ def build_bigm_unit(
                 )
                 soff = oob // i32(2) + rix * i32(H // 32) + n0 // i32(32)
                 bst(sc, r_routes, (ok & (q4 == i32(0))).select(soff, oob), 0, 0)
-            for m in () if R8 else range(MTEW):
+            for m in () if R8 else range(MTE):
                 ok, wt, rix = row_meta[m]
-                ok = ok & valid
                 pk = []
                 for t in range_constexpr(4):
                     av = fx.Vector(acc[m * 4 + t])
@@ -469,19 +467,19 @@ def build_bigm_unit(
         b2pre = [issue_b2(i32(s_ // KS2), i32(s_ % KS2)) for s_ in range(BS2)]
         for _ in range_constexpr(NST2):
             bst(fx.Vector.filled(4, 0, fx.Int32), r_routes, oob, 0)
-        glo, ghi = i32(0), i32(NG2)
+        ghi = i32(NG2)
         init2 = [v for b in b2pre for v in b]
-        for gi_, st2 in range(glo, ghi, i32(1), init=init2):
+        for gi_, st2 in range(i32(0), ghi, i32(1), init=init2):
             gi = i32(gi_)
             ring2 = [list(st2[s * NB2 : (s + 1) * NB2]) for s in range(BS2)]
-            acc = [zero] * (4 * MTEW)
+            acc = [zero] * (4 * MTE)
             for kk in range_constexpr(KS2):
                 wait_vm(WAIT2[kk])
                 bq = ring2[kk % BS2]
                 sh0 = (i32(kk) & i32(1)) * i32(16)
                 afs, sas = [], []
-                for m in range_constexpr(MTEW):
-                    row = rb + i32(m * 16) + lane % i32(16)
+                for m in range_constexpr(MTE):
+                    row = i32(m * 16) + lane % i32(16)
                     afs.append(
                         lds_ld(
                             L,
@@ -508,7 +506,7 @@ def build_bigm_unit(
                     (s1 >> sh0) & i32(0xFF),
                     (s1 >> (sh0 + i32(8))) & i32(0xFF),
                 ]
-                for m in range_constexpr(MTEW):
+                for m in range_constexpr(MTE):
                     for t in range_constexpr(4):
                         j = m * 4 + t
                         acc[j] = mfma(bq[t], afs[m], acc[j], sb[t], sas[m])
@@ -516,7 +514,7 @@ def build_bigm_unit(
                 gn = gi + i32(sn // KS2)
                 gn = (gn < ghi).select(gn, ghi - i32(1))
                 ring2[kk % BS2] = issue_b2(gn, i32(sn % KS2))
-            epi2(acc, gi, gi >= glo)
+            epi2(acc, gi)
             res2 = yield [v for s in range(BS2) for v in ring2[s]]  # noqa: F841
         wait_vm(0)
 
@@ -525,10 +523,7 @@ def build_bigm_unit(
         L, tid, e, r0, rows, rr, rwt, rx, rxs, w1, w2, rws1, rws2, r_routes, oob
     ):
         part_fill(L, tid, r0, rows, rr, rwt)
-        part_g1(L, tid, e, rows, rx, rxs, w1, rws1)
+        part_g1(L, tid, e, rx, rxs, w1, rws1)
         part_g2(L, tid, e, rows, w2, rws2, r_routes, oob)
 
     return lay, unit_body
-
-
-const_expr = fx.const_expr

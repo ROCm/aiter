@@ -241,6 +241,18 @@ AITER_CONFIG_DISPATCH_COMBINE_INTRANODE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_dispatch_combine_intranode.csv",
 )
 
+# MegaMoE TP (aiter/ops/flydsl/mega_moe_tp.py): the small-batch engine's launch configs and
+# the big-M kernel's chunk plans
+AITER_CONFIG_MEGA_MOE_TP = os.getenv(
+    "AITER_CONFIG_MEGA_MOE_TP",
+    f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_tuned.csv",
+)
+
+AITER_CONFIG_MEGA_MOE_TP_BIGM = os.getenv(
+    "AITER_CONFIG_MEGA_MOE_TP_BIGM",
+    f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_bigm_tuned.csv",
+)
+
 
 class AITER_CONFIG:
     @property
@@ -399,6 +411,20 @@ class AITER_CONFIG:
             "AITER_CONFIG_DISPATCH_COMBINE_INTRANODE",
             AITER_CONFIG_DISPATCH_COMBINE_INTRANODE,
             "tuned_dispatch_combine_intranode",
+        )
+
+    @property
+    def AITER_CONFIG_MEGA_MOE_TP_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MEGA_MOE_TP", AITER_CONFIG_MEGA_MOE_TP, "mega_moe_tp_tuned"
+        )
+
+    @property
+    def AITER_CONFIG_MEGA_MOE_TP_BIGM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MEGA_MOE_TP_BIGM",
+            AITER_CONFIG_MEGA_MOE_TP_BIGM,
+            "mega_moe_tp_bigm_tuned",
         )
 
     @property

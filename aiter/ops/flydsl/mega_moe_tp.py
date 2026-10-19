@@ -30,12 +30,17 @@ Contract:
 * The symmetric memory uses hipIpc handles; in containers on the host network ROCm 7.1
   needs ``HSA_ENABLE_IPC_MODE_LEGACY=1``.
 
-Large batches (Swiglu or Silu, fp4, from ``bigm_min_tokens`` global tokens, default 8192, 0
+Large batches (Swiglu or Silu, fp4, from ``bigm_min_tokens`` global tokens; default: the
+batches the small-batch engine cannot hold, e.g. beyond 2048 local tokens on 256 CUs; 0
 disables) run the big-M kernel (bigm_layer: chunked, SDMA, per-batch tuned configs from
 configs/mega_moe_tp_bigm_tuned.csv) behind the same ``forward``; it needs MORI built with
 SDMA (importable, or its install directory in ``AITER_MORI_PATH``). ``max_local_tokens`` must
 then cover the largest batch (e.g. 8192 for 32768 tokens on tp4); the small-batch engine
-only holds up to ``bigm_min_tokens / world_size - 1`` of them. In the ar mode each rank runs
+holds the batches below the threshold. ``prepare()`` sets the big-M path up (a collective:
+SDMA queues, buffers, kernel compiles); big-M batches are not graph-capturable.
+``launch_config()`` is None for a big-M batch (``bigm_plan()``: its chunks and options);
+``error_flag()`` carries ``ERR_BIGM`` for a big-M timeout; ``close()`` frees the IPC memory
+and the SDMA queues. In the ar mode each rank runs
 its 1 / tp of the replicated rows through it (ag_rs) and the kernel gathers every rank's
 output rows (no fused tail there).
 
@@ -43,8 +48,9 @@ Schedules (planned in the kernel from the routing): up to 256 global tokens the 
 one, from ``lb_min`` (default 256) global tokens up the large-batch (LB) one; its row tile
 is 16 * ``lb_mt`` rows (``"T1:N1,...,N"``: up to Ti tokens Ni), 16 * ``lb_mt_small`` up to
 ``lb_small_max`` tokens; ``lb_npp`` GEMM1 column blocks per A pass; ``lb_q`` output column
-chunks per GEMM2 unit. Unset fields use the per-batch tuned configs
-(configs/mega_moe_tp_tuned.csv), else the defaults (lb_min 256, lb_mt 5, lb_npp 2, lb_q 3).
+chunks per GEMM2 unit. Fields set explicitly take precedence; unset ones use the per-batch
+tuned configs (configs/mega_moe_tp_tuned.csv, ``AITER_CONFIG_MEGA_MOE_TP``; inside its tuned
+range), else the defaults (lb_min 256, lb_mt 5, lb_npp 2, lb_q 3).
 """
 
 from __future__ import annotations
@@ -62,8 +68,12 @@ from .kernels.mega_moe_tp.mega_moe_tp import (
     MegaMoeTPLDSError,
 )
 
+# MegaMoeTP.error_flag(): a big-M wait timed out (the small engine's bits are below it)
+ERR_BIGM = 32
+
 __all__ = [
     "COMM_MODES",
+    "ERR_BIGM",
     "MegaMoeTP",
     "MegaMoeTPConfig",
     "MegaMoeTPLDSError",
@@ -109,8 +119,12 @@ class MegaMoeTPConfig:
     # the fused tail's norm: GemmaRMSNorm (scale 1 + w) or RMSNorm (w), and its eps
     tail_eps: float = 1e-6
     tail_gemma: bool = True
-    # global tokens from which forward runs the big-M kernel (None: 8192; 0: never)
+    # global tokens from which forward runs the big-M kernel (None: the batches the small
+    # engine cannot hold, i.e. (its capacity + 1) * world_size; 0: never)
     bigm_min_tokens: int | None = None
+    # max_local_tokens is an upper bound: without a big-M path for the batches beyond it the
+    # small engine takes, lowered to that (MegaMoeTP.max_local_tokens) instead of raising
+    fit_max_local: bool = False
 
 
 class MegaMoeTP:
@@ -136,7 +150,9 @@ class MegaMoeTP:
             raise ValueError(f"MegaMoeTP: unknown comm_mode {cfg.comm_mode!r}")
         situ = act == "situv2"
         self.cfg = cfg
-        bmin = 8192 if cfg.bigm_min_tokens is None else cfg.bigm_min_tokens
+        bmin = cfg.bigm_min_tokens
+        if bmin is not None and bmin < 0:
+            raise ValueError(f"MegaMoeTP: bigm_min_tokens {bmin} < 0")
         # the shapes the big-M kernel takes: H % 256, < 512 routed experts (+ the last one,
         # counted apart), topk - 1 <= 64, inter % 128 (else the small engine)
         big_ok = (
@@ -148,8 +164,16 @@ class MegaMoeTP:
             and cfg.topk - 1 <= 64
             and cfg.inter_dim % 128 == 0
         )
-        # local tokens from which forward runs the big-M kernel (0: never)
+        from .kernels.mega_moe_tp.bigm_layer import PAD
+
+        # local tokens from which forward runs the big-M kernel (0: never; set below for
+        # the default threshold, from the small engine's capacity)
         self.bigm_m = -(-bmin // cfg.world_size) if bmin and big_ok else 0
+        if self.bigm_m and self.bigm_m < PAD:
+            raise ValueError(
+                f"MegaMoeTP: bigm_min_tokens {bmin} < {PAD * cfg.world_size} (the big-M "
+                f"kernel runs at least {PAD} local rows)"
+            )
         self._bigm = None
         self._bigm_args = {
             "w1": w1,
@@ -162,6 +186,8 @@ class MegaMoeTP:
         small_max = cfg.max_local_tokens
         if self.bigm_m and cfg.max_local_tokens >= self.bigm_m:
             small_max = self.bigm_m - 1
+        # default threshold: the small engine holds what it can, big-M takes the rest
+        fit = (big_ok and bmin is None) or cfg.fit_max_local
         self.engine = MegaMoeTPEngine(
             rank=cfg.rank,
             world_size=cfg.world_size,
@@ -197,7 +223,10 @@ class MegaMoeTP:
             tail_gemma=cfg.tail_gemma,
             group=group,
             device=device,
+            fit_max_local=fit,
         )
+        if big_ok and bmin is None and self.engine.mmax < cfg.max_local_tokens:
+            self.bigm_m = self.engine.mmax + 1
 
     def forward(
         self,
@@ -215,6 +244,18 @@ class MegaMoeTP:
         (default True): only this rank's rows are written (the others are undefined);
         False: every rank's."""
         if self._big(self._local(x_local.shape[0])):
+            # the small engine's input checks (up to max_local_tokens), then the big-M
+            # kernel's input types (int32 ids, f32 weights, contiguous; no-ops if so)
+            self.engine._local_tokens(
+                x_local,
+                topk_weights,
+                topk_ids,
+                limit=self.cfg.max_local_tokens,
+                uneven=True,
+            )
+            x_local = x_local.contiguous()
+            topk_weights = topk_weights.to(torch.float32).contiguous()
+            topk_ids = topk_ids.to(torch.int32).contiguous()
             if self.cfg.comm_mode == "ar":
                 return self._bigm_ar(x_local, topk_weights, topk_ids, out, tail)
             local = bool(self.engine.tn_local)
@@ -275,9 +316,18 @@ class MegaMoeTP:
         return bool(self.bigm_m) and local_tokens >= self.bigm_m
 
     def bigm(self):
-        """The big-M kernel's host object (collective on first use: its SDMA window)."""
+        """The big-M kernel's host object (collective on first use: its SDMA window).
+        prepare() creates it (and compiles its kernels) when big batches are reachable.
+        """
         if self._bigm is None:
             from .kernels.mega_moe_tp.bigm_layer import PAD, MegaMoeTPBigM
+
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "MegaMoeTP: the big-M path first used inside CUDA graph capture; "
+                    "call prepare(local_tokens) first (big-M batches are not "
+                    "graph-capturable)"
+                )
 
             cfg, a = self.cfg, self._bigm_args
             self._bigm = MegaMoeTPBigM(
@@ -287,7 +337,6 @@ class MegaMoeTP:
                 topk=cfg.topk - 1,
                 # (the big-M kernel runs on local rows padded to a multiple of PAD)
                 max_tokens=-(-cfg.max_local_tokens // PAD) * PAD * cfg.world_size,
-                chunks=None,
                 eps=self.engine.tn_eps,
                 gemma=self.engine.tn_gemma,
                 swiglu_limit=self.engine.swiglu_limit,  # (None -> the engine's default)
@@ -392,12 +441,30 @@ class MegaMoeTP:
             return self.cfg.comm_mode == "ag_rs"
         return self.engine.tail_ok(local_tokens)
 
-    def launch_config(self, local_tokens: int) -> LaunchCfg:
+    def launch_config(self, local_tokens: int) -> LaunchCfg | None:
+        """The small engine's launch config of this local token count; None: the batch
+        runs the big-M kernel (see bigm_plan)."""
+        if self._big(local_tokens):
+            return None
         return self.engine.config(local_tokens)
 
+    def bigm_plan(self, local_tokens: int):
+        """The big-M kernel's plan of this local token count: ((chunk weights),
+        ((AITER_BIGM_* option, value), ...)); None: the small engine runs it."""
+        if not self._big(local_tokens):
+            return None
+        from .kernels.mega_moe_tp.bigm_layer import PAD
+
+        m = -(-local_tokens // PAD) * PAD
+        return self.bigm()._plan(m * self.cfg.world_size)
+
     def error_flag(self) -> torch.Tensor:
-        """Sticky watchdog bits (nonzero: a launch timed out) as a device tensor."""
-        return self.engine.error_flag()
+        """Sticky watchdog bits (nonzero: a launch timed out) as a device tensor (no
+        sync): the small engine's, | ERR_BIGM for a big-M one."""
+        e = self.engine.error_flag()
+        if self._bigm is None:
+            return e
+        return e | (self._bigm.error_flag() * ERR_BIGM)
 
     def poll_errors(self) -> int:
         """Nonzero if a wait inside the kernel gave up (a peer never arrived)."""
@@ -423,3 +490,13 @@ class MegaMoeTP:
     def reset(self) -> None:
         """Collective: restart the cross-rank state (after a timeout / desync)."""
         self.engine.reset()
+        if self._bigm is not None:
+            self._bigm.reset()
+
+    def close(self) -> None:
+        """Collective: release the IPC memory and the MORI SDMA queues (the instance is
+        unusable afterwards)."""
+        if self._bigm is not None:
+            self._bigm.close()
+            self._bigm = None
+        self.engine.arena.close()

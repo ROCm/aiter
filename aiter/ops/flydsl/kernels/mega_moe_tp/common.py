@@ -36,11 +36,6 @@ def _u(v):
     return v.ir_value() if hasattr(v, "ir_value") else v
 
 
-# s_sleep of the LDS-flag spin loops (0: back-to-back polls that compete with the
-# GEMM's LDS reads and the co-resident compute wave's issue slots)
-LDS_NAP = 0
-
-
 def i32(v):
     raw = v if isinstance(v, ir.Value) else getattr(v, "ir_value", lambda: None)()
     if raw is not None and isinstance(raw.type, ir.IndexType):
@@ -402,7 +397,7 @@ def alive(t0):
 def spin_lds_ge(L, off, target):
     cur = lds_ld_acq(L, off)
     while cur < target:
-        rocdl.s_sleep(LDS_NAP)
+        rocdl.s_sleep(0)
         cur = lds_ld_acq(L, off)
 
 

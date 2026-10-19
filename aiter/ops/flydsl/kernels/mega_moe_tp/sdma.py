@@ -14,6 +14,7 @@ provides ``cco_sdma_put_ptr_rsig__thread`` / ``cco_sdma_signal_slot``, and ``MOR
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 
@@ -23,22 +24,41 @@ import torch.distributed as dist
 __all__ = ["SdmaComm", "sdma_bitcode"]
 
 
-def _mori():
+@contextlib.contextmanager
+def _mori_env():
+    """For MORI's import / communicator setup only (the process environment is restored):
+    AITER_MORI_PATH (MORI's install directory, if not importable) on sys.path, and
+    MORI_ENABLE_SDMA=1 unless set (MORI builds the SDMA queues at communicator creation).
+    """
     path = os.environ.get("AITER_MORI_PATH")
-    if path and path not in sys.path:
+    added = bool(path) and path not in sys.path
+    if added:
         sys.path.insert(0, path)
-    os.environ.setdefault("MORI_ENABLE_SDMA", "1")
-    from mori.cco import GDA_CONNECTION_NONE, CCODevCommRequirements, Communicator
+    unset = "MORI_ENABLE_SDMA" not in os.environ
+    if unset:
+        os.environ["MORI_ENABLE_SDMA"] = "1"
+    try:
+        yield
+    finally:
+        if added and path in sys.path:
+            sys.path.remove(path)
+        if unset:
+            os.environ.pop("MORI_ENABLE_SDMA", None)
+
+
+def _mori():
+    with _mori_env():
+        from mori.cco import GDA_CONNECTION_NONE, CCODevCommRequirements, Communicator
 
     return Communicator, CCODevCommRequirements, GDA_CONNECTION_NONE
 
 
 def sdma_bitcode(cov: int = 6) -> str:
     """MORI's CCO device bitcode (code object version cov), which the big-M kernel links."""
-    _mori()  # (AITER_MORI_PATH on sys.path)
-    from mori.cco.device.bitcode import find_cco_bitcode
+    with _mori_env():
+        from mori.cco.device.bitcode import find_cco_bitcode
 
-    return find_cco_bitcode(cov)
+        return find_cco_bitcode(cov)
 
 
 class SdmaComm:
@@ -78,15 +98,18 @@ class SdmaComm:
         dist.broadcast_object_list(uid, src=src0, group=self.group)
         err = ""
         try:
-            self.comm = self._comm_cls.init(
-                self.world, self.rank, uid[0], per_rank_vmm=1 << 30
-            )
-            reqs = self._reqs_cls()
-            reqs.gda_connection_type = self._gda_none
-            reqs.gda_signal_count = 0
-            reqs.gda_counter_count = 0
-            reqs.sdma_queue_count = self.nq
-            self.dev_comm = self.comm.create_dev_comm(reqs)
+            with _mori_env():
+                # (per_rank_vmm: only a virtual-address reservation, rounded up to 4 GiB by
+                # MORI; no MORI window is used, the data lives in the hipIpc arena)
+                self.comm = self._comm_cls.init(
+                    self.world, self.rank, uid[0], per_rank_vmm=1 << 30
+                )
+                reqs = self._reqs_cls()
+                reqs.gda_connection_type = self._gda_none
+                reqs.gda_signal_count = 0
+                reqs.gda_counter_count = 0
+                reqs.sdma_queue_count = self.nq
+                self.dev_comm = self.comm.create_dev_comm(reqs)
         except Exception as exc:  # noqa: BLE001 (reported on every rank below)
             err = f"{type(exc).__name__}: {exc}"
         errs: list = [None] * self.world
@@ -100,13 +123,27 @@ class SdmaComm:
         self.bases = torch.tensor(
             self.arena._base_ptrs, dtype=torch.int64, device=self.device
         )
+        # [2][world * nq] int32 per-(peer, queue) signal bases of the big-M kernel: each launch
+        # reads one buffer and writes the next launch's into the other
         self.consumed = torch.zeros(
-            self.world * self.nq, dtype=torch.int32, device=self.device
+            (2, self.world * self.nq), dtype=torch.int32, device=self.device
         )
         self._committed = True
         torch.cuda.synchronize(self.device)
         dist.barrier(group=self.group)
         return self
+
+    def close(self) -> None:
+        """Collective: free the MORI device communicator / communicator (its SDMA queues)
+        and the arena. The instance is unusable afterwards."""
+        if not self._committed:
+            return
+        torch.cuda.synchronize(self.device)
+        dist.barrier(group=self.group)
+        self.dev_comm.close()
+        self.comm.destroy()
+        self.arena.close()
+        self._committed = False
 
     def view(
         self, name: str, shape, dtype: torch.dtype, offset: int = 0

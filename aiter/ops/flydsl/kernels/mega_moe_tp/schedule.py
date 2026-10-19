@@ -16,7 +16,6 @@ from ..kernels_common import ceildiv
 from .common import (
     ACQ,
     AUX_SYS,
-    LDS_NAP,
     V4I,
     _ctpop,
     bld,
@@ -624,7 +623,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         cur = lds_ld_acq(L, L_CTL + C_G2RDY * 4)
         end = lds_ld_acq(L, L_CTL + C_G2END * 4)
         while (cur < target) & (end == i32(0)):
-            rocdl.s_sleep(LDS_NAP)
+            rocdl.s_sleep(0)
             cur = lds_ld_acq(L, L_CTL + C_G2RDY * 4)
             end = lds_ld_acq(L, L_CTL + C_G2END * 4)
 

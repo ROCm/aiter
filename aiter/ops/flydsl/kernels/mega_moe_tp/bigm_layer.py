@@ -66,17 +66,16 @@ from .common import (
 NTH = NW * 64
 const_expr = fx.const_expr
 
-# SDMA queues per peer (MORI spreads a peer's queues over its two engines by parity); queues 0
-# and 7 (the whole-layer kernel's attention RS) carry no puts here
-QA0, QA1 = 0, 7
+# SDMA queues per peer (MORI spreads a peer's queues over its two engines by parity; queues 0
+# and 7 carry no puts)
 QE, QX, QQ, QXS, QS, QID = 1, 2, 3, 4, 5, 6
 NQ = 8
-QUEUES = (QA0, QE, QX, QQ, QXS, QS, QID, QA1)
-PUTS_PER_CHUNK = {QA0: 1, QE: 1, QX: 1, QQ: 1, QXS: 1, QS: 1, QID: 2, QA1: 1}
+QUEUES = (QE, QX, QQ, QXS, QS, QID)
+PUTS_PER_CHUNK = {QE: 1, QX: 1, QQ: 1, QXS: 1, QS: 1, QID: 2}
 
-# phase kinds (per chunk), in item order within a chunk (their done-counter slots; P_QA / P_RT:
-# the whole-layer kernel's attention quant / router, no items here)
-P_QA, P_RB, P_RT, P_S1, P_S2, P_S3, P_U, P_RQ, P_RF, P_UB = range(10)
+# phase kinds (per chunk), in item order within a chunk (their done-counter slots; 0 and 2
+# unused)
+P_RB, P_S1, P_S2, P_S3, P_U, P_RQ, P_RF, P_UB = 1, 3, 4, 5, 6, 7, 8, 9
 NKIND = 16  # done-counter slots per chunk
 ZQ = 4  # rows per RQ / RF item
 SRT = 32  # tokens per sort item
@@ -147,28 +146,26 @@ def compile_bigm_layer(
     eps: float,
     gemma: bool,
     swiglu_limit: float,
-    RG: int = 128,
     NAB: int = 4,
     BST: int = 3,
     BS2: int = 3,
     order: int = 3,
     opts: tuple = (),
-    CPU: int = 1,
     tailq: int = 1,
     act: str = "swiglu",
 ):
     """act: the units' activation ("swiglu", "silu"); E < 512 routed experts (+ the shared one).
-    tailq (io): 0 no tail, 1 the tail with the q gather, 2 the local tail (this rank's q rows),
+    tailq: 0 no tail, 1 the tail with the q gather, 2 the local tail (this rank's q rows),
     3 no tail, y of every rank's rows (bf16, the "q" region: the y gather of the ar mode).
     The MoE interface (MegaMoeTP.forward, ag_rs): the caller's normed own rows x [m, H] and their
     routing (ids / tw [m, K1], the shared expert's column included) are gathered; the tail sums the
     MoE output (y), and with tailq res_out = y + res_in, the next-layer norm + FP8 rows of every
     rank (q gather).
     """
-    io = 1  # (the attention RS / reduce + norm items of the whole-layer kernel are empty here)
     spec = repr(
         sorted(locals().items())
     )  # every compile argument (the disk cache key, _bigm_cached)
+    RG = UNIT_ROWS  # (one CTA of NW waves per CU)
     K1, NE = K + 1, E + 1
     HV = H // 8  # 16 B (8 bf16) columns of a row
     PIT = -(
@@ -209,10 +206,9 @@ def compile_bigm_layer(
     NSBA = int(_opt("AITER_BIGM_NSBA", "1"))
     assert NSBA in (1, 2, 4)
     UA = int(_opt("AITER_BIGM_UA", "32"))  # ORD 4: first-round unit slots per XCD
-    NSUBQ = 1  # row sub-batches per topk-sum / final-reduce item
     RQD = int(
         _opt("AITER_BIGM_RQD", "0")
-    )  # topk sum: token pipeline depth (0: batch of ZQ rows)
+    )  # topk sum: token pipeline depth (0: ZQ, a batch: every load first)
     # R8: route rows as MXFP8 (half the bytes of bf16 GEMM2 stores / topk-sum loads)
     R8 = int(_opt("AITER_BIGM_R8", "0"))
     E4 = int(
@@ -231,7 +227,6 @@ def compile_bigm_layer(
     PPC[QE] = PPC[QQ] = PPC[QS] = NSB
     PPC[QX] = PPC[QXS] = NSBA
     PPC[QID] = 2 * NSBA
-    PPC[QA0] = PPC[QA1] = 0  # no attention RS
     if tailq not in (1, 3):
         PPC[QQ] = PPC[QS] = (
             0  # no q gather (no tail, or the local tail: own rows' q only)
@@ -265,7 +260,7 @@ def compile_bigm_layer(
     LB2 = LH + 4 * NES  # [NE] bases
     LP = LB2 + 4 * NES  # [SRT * K1] route positions of a sort item ([NE] plan scratch)
     LDS_BYTES = LP + max(4 * SRT * K1, 64 + 4 * max(NE, 64 * EPL)) + 64
-    assert LDS_BYTES <= 160 * 1024 // CPU, LDS_BYTES  # CPU CTAs per CU
+    assert LDS_BYTES <= 160 * 1024, LDS_BYTES
 
     def cpart(kk):  # row iteration kk is the partial last one
         return HV % NTH != 0 and kk == PIT - 1
@@ -273,11 +268,20 @@ def compile_bigm_layer(
     def col(tid, kk):
         """this thread's column of row iteration kk; past the row (a partial last iteration) the
         same lane of the last full 4-column group: those threads redo its loads, math and stores
-        (identical values, its per-32 scales included)"""
+        (identical values, its per-32 scales included; the fused tail: see own_col)"""
         p = tid + i32(kk * NTH)
         if not cpart(kk):
             return p
         return (p < i32(HV)).select(p, i32(HV - 4) + (p & i32(3)))
+
+    def own_col(tid, kk):
+        """None, else (a partial iteration) whether this thread's column is its own, not redone.
+        The fused tail updates res in place (res_in == res_out): a redone column's res load
+        can follow its owner's store, so there the redone columns store nothing and stay out
+        of the row's sums."""
+        if not cpart(kk):
+            return None
+        return tid + i32(kk * NTH) < i32(HV)
 
     def at_col(
         base, tid, kk
@@ -334,7 +338,7 @@ def compile_bigm_layer(
 
     name = (
         f"bigm_layer_h{H}_i{I}_e{E}k{K}_tp{tp}_c{C}_rg{RG}_{fb(eps)}{'g' if gemma else 'r'}"
-        + f"_v23_t{tailq}_c{CPU}h{NSBA}_o{ORD}s{NSB}a{UA}d{RQD}r{R8}w{SXW}e{E4}b{BS2}"
+        + f"_v23_t{tailq}_c1h{NSBA}_o{ORD}s{NSB}a{UA}d{RQD}r{R8}w{SXW}e{E4}b{BS2}"
         + ("" if act == "swiglu" else f"_{act}{fb(swiglu_limit)}")
     )
 
@@ -462,7 +466,8 @@ def compile_bigm_layer(
         wb: fx.Int64,  # this rank's data arena (SdmaComm: hipIpc, not a MORI window)
         pbases: fx.Int64,  # [tp] int64 every rank's arena as mapped here (the put destinations)
         dc: fx.Int64,  # MORI device communicator
-        consumed: fx.Int64,  # [tp][NQ] int32 puts awaited before this launch (persistent)
+        consumed: fx.Int64,  # [tp][NQ] int32 puts awaited before this launch (persistent;
+        # the next launch's at consumed ^ (tp * NQ * 4): two buffers in turn)
         offs: fx.Int64,  # [8] int64 arena region offsets
         part: fx.Int64,  # x [m, H] bf16 own rows
         resid: fx.Int64,  # ids [m, K1] int32
@@ -530,7 +535,8 @@ def compile_bigm_layer(
         def rbase(k):  # chunk k's route rows (bytes)
             return fx.Int64(lbase(k)) * fx.Int64(H * 2)
 
-        # this launch's signal base per (peer, queue): read once, before any item
+        # this launch's signal base per (peer, queue) (GW writes the next launch's into the
+        # other buffer)
         rcons = rsrc(consumed)
 
         def sig_base(p, q):
@@ -674,14 +680,14 @@ def compile_bigm_layer(
             if const_expr(kind == P_RB):  # the input rows (item_rx)
                 return s_ // i32(ZX)
             if const_expr(kind == P_RF):
-                return s_ // i32(ZQ * NSUBQ)
+                return s_ // i32(ZQ)
             if const_expr(kind in (P_S1, P_S3)):
                 return (i32(tp) * s_ + i32(SRT - 1)) // i32(SRT)
             if const_expr(kind == P_S2):
                 return i32(1)
             if const_expr(kind == P_U):
                 return ucap * i32(8)
-            return (i32(tp) * s_) // i32(ZQ * NSUBQ)
+            return (i32(tp) * s_) // i32(ZQ)
 
         def chunk_v(k):  # per-claim (not hoisted: system-scope load)
             return fx.Int32(bld(rch, k * i32(8) + i32(4), 0, T.i32, AUX_SYS))
@@ -1146,10 +1152,10 @@ def compile_bigm_layer(
                 return (e_ >= i32(0)) & (e_ < i32(NE))
 
             sb = s // i32(NSB)
-            nb = (i32(tp) * sb) // i32(ZQ * NSUBQ)
+            nb = (i32(tp) * sb) // i32(ZQ)
             jx = il(j, cnt(P_RQ, s))
             b = jx // nb
-            rem = (jx - b * nb) * i32(ZQ * NSUBQ)
+            rem = (jx - b * nb) * i32(ZQ)
             pd = rem // sb
             w0 = pd * s + b * sb + (rem - pd * sb)  # first (dest rank, row) of the item
             own = pd == rank
@@ -1231,59 +1237,14 @@ def compile_bigm_layer(
                     else:
                         e_store(bf16x8_to_f32(yb), rd, B + wrow, p, lane)
 
-            NTQ = ZQ * NSUBQ
-            # RQD > 0: token-level pipeline (the next RQD tokens' loads in flight while one is summed)
-            rqp = [rq_load(ii) for ii in range(min(RQD, NTQ))]
-            for ii in range_constexpr(NTQ if RQD else 0):
-                if const_expr(ii + RQD < NTQ):
-                    rqp.append(rq_load(ii + RQD))
+            # token pipeline: the next D tokens' loads in flight while one is summed (D = ZQ:
+            # every load of the item first)
+            D = RQD or ZQ
+            rqp = [rq_load(ii) for ii in range(min(D, ZQ))]
+            for ii in range_constexpr(ZQ):
+                if const_expr(ii + D < ZQ):
+                    rqp.append(rq_load(ii + D))
                 rq_store(ii, rqp[ii])
-            for sbi in range_constexpr(0 if RQD else NSUBQ):
-                lds_ = [
-                    [
-                        [
-                            bld(
-                                rx,
-                                (
-                                    at_col(
-                                        ((w0 + i32(sbi * ZQ + ii)) * i32(K1) + i32(t))
-                                        * i32(H),
-                                        tid,
-                                        kk,
-                                    )
-                                )
-                                * i32(2),
-                                0,
-                                T.vec(4, T.i32),
-                                CAUX,
-                            )
-                            for t in range(K1)
-                        ]
-                        for kk in range(PIT)
-                    ]
-                    for ii in range(ZQ)
-                ]
-                for ii in range_constexpr(ZQ):
-                    wrow = w0 + i32(sbi * ZQ + ii)
-                    own = pd == rank
-                    vt = [rvalid(wrow, t) for t in range(K1)]
-                    for kk in range_constexpr(PIT):
-                        p = col(tid, kk)
-                        acc = [fx.Float32(0.0)] * 8
-                        for t in range_constexpr(K1):
-                            v = bf16x8_to_f32(lds_[ii][kk][t])
-                            acc = [vt[t].select(a_ + b_, a_) for a_, b_ in zip(acc, v)]
-                        yb = pack_bf16x8(acc)
-                        if own:
-                            bst(
-                                yb,
-                                r_y,
-                                ((o + wrow - rank * s) * i32(H) + p * i32(8)) * i32(2),
-                                0,
-                                AUX_SYS,
-                            )
-                        else:
-                            e_store(bf16x8_to_f32(yb), rd, B + wrow, p, lane)
             done_last(k, P_RQ, cnt(P_RQ, s))
             if done_at(sbc(k, 0, b), nb):  # noqa: SIM102 - preserve FlyDSL branches
                 if tid == i32(0):
@@ -1302,113 +1263,139 @@ def compile_bigm_layer(
                             )
                     give_turn(QE, tn)
 
-        @flyc.jit
-        def item_rf(k, j):
+        def rf_head(k, j):
+            # an RF item (ZQ rows of chunk k, from i0, in sub-block b), once every peer's E
+            # rows of its sub-block and this rank's topk sums of it are in:
+            # (tid, o, s, B, sb, i0, b, the received E rows)
             tid = opaque(tid0)
             o, s = chunk(k)
             B = i32(tp) * o
             sb = s // i32(NSB)
             jx = il(j, cnt(P_RF, s))
-            i0 = jx * i32(ZQ * NSUBQ)
+            i0 = jx * i32(ZQ)
             b = i0 // sb
             wait_puts_n(QE, k * i32(NSB) + b + i32(1))
-            wait_at(sbc(k, 0, b), (i32(tp) * sb) // i32(ZQ * NSUBQ))
-            rv = rsrc(wp("erecv"))
+            wait_at(sbc(k, 0, b), (i32(tp) * sb) // i32(ZQ))
+            return tid, o, s, B, sb, i0, b, rsrc(wp("erecv"))
+
+        def y_sum(ly, lsrc):
+            # y of a row's 8 columns: this rank's partial (ly) + every peer's (lsrc(src): its
+            # E value, loaded here or earlier)
+            f = bf16x8_to_f32(ly)
+            for src_ in range_constexpr(tp):
+                f = sum_live(f, e_val(lsrc(src_)), i32(src_) != rank)
+            return f
+
+        @flyc.jit
+        def item_rf(k, j):
+            tid, o, s, B, sb, i0, b, rv = rf_head(k, j)
             rq, rqs = rsrc(wp("q")), rsrc(wp("qs"))
             one = fx.Float32(1.0)
-            for sbi in range_constexpr(NSUBQ):
-                # every load of the item first (one memory round trip), then the math
-                ld = []
-                for ii in range_constexpr(ZQ):
-                    i = i0 + i32(sbi * ZQ + ii)
-                    lo = ((o + i) * i32(H)) * i32(2)
-                    row = []
-                    for kk in range_constexpr(PIT):
-                        off = lo + col(tid, kk) * i32(16)
-                        row.append(
-                            (
-                                bld(r_y, off, 0, T.vec(4, T.i32), CAUX),
-                                [
-                                    e_ld(rv, B + i32(src_) * s + i, col(tid, kk))
-                                    for src_ in range(tp)
-                                ],
-                                bld(r_res, off, 0, T.vec(4, T.i32), 0),
-                            )
-                        )
-                    ld.append(row)
-                fss, sss = [], []
-                for ii in range_constexpr(ZQ):
-                    i = i0 + i32(sbi * ZQ + ii)
-                    lo = ((o + i) * i32(H)) * i32(2)
-                    fs = []
-                    ss = fx.Float32(0.0)
-                    for kk in range_constexpr(PIT):
-                        off = lo + col(tid, kk) * i32(16)
-                        ly, lr, lres = ld[ii][kk]
-                        f = bf16x8_to_f32(ly)
-                        for src_ in range_constexpr(tp):
-                            f = sum_live(f, e_val(lr[src_]), i32(src_) != rank)
-                        # the MoE output y (this rank's rows)
-                        f = [fx.Float32(x.to(fx.BFloat16).to(fx.Float32)) for x in f]
-                        bst(pack_bf16x8(f), r_norm, off, 0)
-                        f = [x + yy for x, yy in zip(f, bf16x8_to_f32(lres))]
-                        f = [fx.Float32(x.to(fx.BFloat16).to(fx.Float32)) for x in f]
-                        bst(pack_bf16x8(f), r_out, off, 0)
-                        if const_expr(cpart(kk)):  # (the redone columns count once)
-                            live = tid + i32(kk * NTH) < i32(HV)
-                            for x in f:
-                                ss = ss + live.select(x * x, fx.Float32(0.0))
-                        else:
-                            for x in f:
-                                ss = ss + x * x
-                        fs.append(f)
-                    fss.append(fs)
-                    sss.append(ss.bitcast(fx.Int32))
-                tots = blk_red_vec(L, tid, sss, f32_bits_add)
-                xss, ams = [], []
-                for ii in range_constexpr(ZQ):
-                    rcp = fx.Float32(
-                        fmath.rsqrt(
-                            tots[ii].bitcast(fx.Float32) / fx.Float32(float(H))
-                            + fx.Float32(float(eps))
+            # every load of the item first (one memory round trip), then the math
+            ld = []
+            for ii in range_constexpr(ZQ):
+                i = i0 + i32(ii)
+                lo = ((o + i) * i32(H)) * i32(2)
+                row = []
+                for kk in range_constexpr(PIT):
+                    off = lo + col(tid, kk) * i32(16)
+                    row.append(
+                        (
+                            bld(r_y, off, 0, T.vec(4, T.i32), CAUX),
+                            [
+                                e_ld(rv, B + i32(src_) * s + i, col(tid, kk))
+                                for src_ in range(tp)
+                            ],
+                            bld(r_res, off, 0, T.vec(4, T.i32), 0),
                         )
                     )
-                    xs_, am = [], fx.Float32(0.0)
-                    for kk in range_constexpr(PIT):
-                        wv = norm_w(r_wnext, col(tid, kk))
-                        xk = [
-                            fx.Float32(
-                                fx.Float32(gate_w(x * rcp, wk))
-                                .to(fx.BFloat16)
-                                .to(fx.Float32)
-                            )
-                            for x, wk in zip(fss[ii][kk], wv)
-                        ]
-                        am = am.maximumf(amax(xk))
-                        xs_.append(xk)
-                    xss.append(xs_)
-                    ams.append(am.bitcast(fx.Int32))
-                amxs = blk_red_vec(L, tid, ams, f32_bits_max)
-                for ii in range_constexpr(ZQ):
-                    i = i0 + i32(sbi * ZQ + ii)
-                    scl = amxs[ii].bitcast(fx.Float32).maximumf(
-                        fx.Float32(1e-10)
-                    ) / fx.Float32(448.0)
-                    inv = one / scl
-                    g = rank * m + o + i
-                    for kk in range_constexpr(PIT):
-                        p = col(tid, kk)
-                        qv = [x * inv for x in xss[ii][kk]]
-                        d = fx.Vector.from_elements(
-                            [fp8x4_pack(qv[0:4], one), fp8x4_pack(qv[4:8], one)],
-                            fx.Int32,
+                ld.append(row)
+            fss, sss = [], []
+            for ii in range_constexpr(ZQ):
+                i = i0 + i32(ii)
+                lo = ((o + i) * i32(H)) * i32(2)
+                fs = []
+                ss = fx.Float32(0.0)
+                for kk in range_constexpr(PIT):
+                    off = lo + col(tid, kk) * i32(16)
+                    ly, lr, lres = ld[ii][kk]
+                    f = y_sum(ly, lambda src_, lr=lr: lr[src_])
+                    # the MoE output y (this rank's rows)
+                    f = [fx.Float32(x.to(fx.BFloat16).to(fx.Float32)) for x in f]
+                    live = own_col(tid, kk)
+                    if const_expr(live is None):
+                        bst(pack_bf16x8(f), r_norm, off, 0)
+                    else:
+                        yv = pack_bf16x8(f)
+                    f = [x + yy for x, yy in zip(f, bf16x8_to_f32(lres))]
+                    f = [fx.Float32(x.to(fx.BFloat16).to(fx.Float32)) for x in f]
+                    if const_expr(live is None):
+                        bst(pack_bf16x8(f), r_out, off, 0)
+                        for x in f:
+                            ss = ss + x * x
+                    else:
+                        if live:
+                            bst(yv, r_norm, off, 0)
+                            bst(pack_bf16x8(f), r_out, off, 0)
+                        for x in f:
+                            ss = ss + live.select(x * x, fx.Float32(0.0))
+                    fs.append(f)
+                fss.append(fs)
+                sss.append(ss.bitcast(fx.Int32))
+            tots = blk_red_vec(L, tid, sss, f32_bits_add)
+            xss, ams = [], []
+            for ii in range_constexpr(ZQ):
+                rcp = fx.Float32(
+                    fmath.rsqrt(
+                        tots[ii].bitcast(fx.Float32) / fx.Float32(float(H))
+                        + fx.Float32(float(eps))
+                    )
+                )
+                xs_, am = [], fx.Float32(0.0)
+                for kk in range_constexpr(PIT):
+                    wv = norm_w(r_wnext, col(tid, kk))
+                    xk = [
+                        fx.Float32(
+                            fx.Float32(gate_w(x * rcp, wk))
+                            .to(fx.BFloat16)
+                            .to(fx.Float32)
                         )
+                        for x, wk in zip(fss[ii][kk], wv)
+                    ]
+                    live = own_col(tid, kk)
+                    if const_expr(live is None):
+                        am = am.maximumf(amax(xk))
+                    else:
+                        am = am.maximumf(live.select(amax(xk), fx.Float32(0.0)))
+                    xs_.append(xk)
+                xss.append(xs_)
+                ams.append(am.bitcast(fx.Int32))
+            amxs = blk_red_vec(L, tid, ams, f32_bits_max)
+            for ii in range_constexpr(ZQ):
+                i = i0 + i32(ii)
+                scl = amxs[ii].bitcast(fx.Float32).maximumf(
+                    fx.Float32(1e-10)
+                ) / fx.Float32(448.0)
+                inv = one / scl
+                g = rank * m + o + i
+                for kk in range_constexpr(PIT):
+                    p = col(tid, kk)
+                    qv = [x * inv for x in xss[ii][kk]]
+                    d = fx.Vector.from_elements(
+                        [fp8x4_pack(qv[0:4], one), fp8x4_pack(qv[4:8], one)],
+                        fx.Int32,
+                    )
+                    live = own_col(tid, kk)
+                    if const_expr(live is None):
                         bst(d, rq, g * i32(H) + p * i32(8), 0, AUX_SYS)
-                    if tid == i32(0):
-                        bst(scl.bitcast(fx.Int32), rqs, g * i32(4), 0, AUX_SYS)
+                    else:
+                        if live:
+                            bst(d, rq, g * i32(H) + p * i32(8), 0, AUX_SYS)
+                if tid == i32(0):
+                    bst(scl.bitcast(fx.Int32), rqs, g * i32(4), 0, AUX_SYS)
             done_last(k, P_RF, cnt(P_RF, s))
             # (nested ifs: preserve FlyDSL branches)
-            if done_at(sbc(k, 1, b), sb // i32(ZQ * NSUBQ)) & (  # noqa: SIM102
+            if done_at(sbc(k, 1, b), sb // i32(ZQ)) & (  # noqa: SIM102
                 i32(int(tailq == 1)) == i32(1)
             ):
                 if tid == i32(0):
@@ -1444,29 +1431,19 @@ def compile_bigm_layer(
             # io without tail: y = own partial + the peers' MoE-output rows (this rank's rows);
             # tailq 3: y rows to the "q" region (global row rank * m + ..), each sub-block then
             # put to every peer
-            tid = opaque(tid0)
-            o, s = chunk(k)
-            B = i32(tp) * o
-            sb = s // i32(NSB)
-            jx = il(j, cnt(P_RF, s))
-            i0 = jx * i32(ZQ * NSUBQ)
-            b = i0 // sb
-            wait_puts_n(QE, k * i32(NSB) + b + i32(1))
-            wait_at(sbc(k, 0, b), (i32(tp) * sb) // i32(ZQ * NSUBQ))
-            rv = rsrc(wp("erecv"))
+            tid, o, s, B, sb, i0, b, rv = rf_head(k, j)
             ryg = rsrc(wp("q"))
-            for ii in range_constexpr(ZQ * NSUBQ):
+            for ii in range_constexpr(ZQ):
                 i = i0 + i32(ii)
                 lo = ((o + i) * i32(H)) * i32(2)
                 for kk in range_constexpr(PIT):
                     off = lo + col(tid, kk) * i32(16)
-                    f = bf16x8_to_f32(bld(r_y, off, 0, T.vec(4, T.i32), CAUX))
-                    for src_ in range_constexpr(tp):
-                        f = sum_live(
-                            f,
-                            e_val(e_ld(rv, B + i32(src_) * s + i, col(tid, kk))),
-                            i32(src_) != rank,
-                        )
+                    f = y_sum(
+                        bld(r_y, off, 0, T.vec(4, T.i32), CAUX),
+                        lambda src_, i=i, kk=kk: e_ld(
+                            rv, B + i32(src_) * s + i, col(tid, kk)
+                        ),
+                    )
                     if const_expr(tailq == 3):
                         bst(
                             pack_bf16x8(f),
@@ -1479,7 +1456,7 @@ def compile_bigm_layer(
                         bst(pack_bf16x8(f), r_norm, off, 0)
             done_last(k, P_RF, cnt(P_RF, s))
             if const_expr(tailq == 3):  # noqa: SIM102 - preserve FlyDSL branches
-                if done_at(sbc(k, 1, b), sb // i32(ZQ * NSUBQ)):  # noqa: SIM102
+                if done_at(sbc(k, 1, b), sb // i32(ZQ)):  # noqa: SIM102
                     if tid == i32(0):
                         g0 = rank * m + o + b * sb
                         tn = k * i32(NSB) + b
@@ -1506,13 +1483,17 @@ def compile_bigm_layer(
             if const_expr(tailq == 1):
                 wait_puts(QS, NSB, i32(C - 1))
             gpu.barrier()
-            # every put of this launch landed: advance the persistent per-(peer, queue) base
-            if lane < i32(tp):  # noqa: SIM102 - preserve FlyDSL branches
-                if lane != rank:
+            # every put of this launch landed: the next launch's per-(peer, queue) base, into
+            # the other buffer (a late wait of this launch still reads this launch's base).
+            # One thread per peer (tid, not lane: every wave would store it)
+            if tid < i32(tp):  # noqa: SIM102 - preserve FlyDSL branches
+                if tid != rank:
                     for qi in range_constexpr(len(QUEUES)):
                         q_ = QUEUES[qi]
-                        addr = consumed + fx.Int64((lane * i32(NQ) + i32(q_)) * i32(4))
-                        g_st_sys(addr, sig_base(lane, q_) + i32(C * PPC[q_]))
+                        addr = (consumed ^ fx.Int64(tp * NQ * 4)) + fx.Int64(
+                            (tid * i32(NQ) + i32(q_)) * i32(4)
+                        )
+                        g_st_sys(addr, sig_base(tid, q_) + i32(C * PPC[q_]))
 
         # ======================= the work loop =======================
         def decode(slices, t):
@@ -1527,26 +1508,19 @@ def compile_bigm_layer(
                 jj = hit.select(lo_ + (t - b0), jj)
             return kind_r, k_r, jj
 
-        rb_item = item_rx
         rf_item = item_rf_y if tailq in (0, 3) else item_rf
 
-        def next_plain():
-            b_ = claim()
-            return i32(1), b_, b_ < nall
-
-        def decode_plain(q, t_):
-            return decode(slices_of([chunk_v(i32(k)) for k in range(C)])[0], t_)
-
-        next_item = next_plain
-        decode_item = decode_plain
-        q_, t, alive_ = next_item()
+        t = claim()
+        alive_ = t < nall
         while alive_:
-            kind_r, k_r, jj = decode_item(q_, t)
+            kind_r, k_r, jj = decode(
+                slices_of([chunk_v(i32(k)) for k in range(C)])[0], t
+            )
             kind_r = uni(kind_r)
             k_r = uni(k_r)
             jj = uni(jj)
             if kind_r == i32(P_RB):
-                rb_item(k_r, jj)
+                item_rx(k_r, jj)
             elif kind_r == i32(P_S1):
                 item_s1(k_r, jj)
             elif kind_r == i32(P_S2):
@@ -1559,10 +1533,11 @@ def compile_bigm_layer(
                 item_rq(k_r, jj)
             elif kind_r == i32(P_RF):
                 rf_item(k_r, jj)
-            if (t == gw_lo) & (q_ == i32(1)):
+            if t == gw_lo:
                 item_gw()
             gpu.barrier()
-            q_, t, alive_ = next_item()
+            t = claim()
+            alive_ = t < nall
 
     @flyc.jit
     def launch(
@@ -1624,10 +1599,6 @@ def compile_bigm_layer(
             ucap,
         ).launch(grid=(fx.Int64(grid), 1, 1), block=(NTH, 1, 1), stream=stream)
 
-    if CPU > 1:
-        launch.compile_hints = {
-            "waves_per_eu": CPU
-        }  # CPU CTAs (of NW waves) per CU: <= 512 / CPU registers
     launch._bigm_spec = spec
     return launch
 
@@ -1685,6 +1656,30 @@ def _bigm_cache_dir():
     return os.path.join(root, "aiter_bigm") if root else None
 
 
+_WARNED = set()
+
+
+def _warn_once(key, msg, *args):
+    if key not in _WARNED:
+        import logging
+
+        _WARNED.add(key)
+        logging.getLogger("aiter").warning(msg, *args)
+
+
+def _private(path):
+    """path (the cache directory or an entry) is this user's and only writable by them: a
+    pickled entry runs code when loaded, so a shared / writable-by-others cache is skipped
+    """
+    import stat
+
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    return st.st_uid == os.getuid() and not st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+
+
 def _bigm_cached(launch, args):
     """Collective-free: make launch(*args)'s compiled artifact resident -- from this process's
     memory, else the disk cache, else compiled (no kernel dispatch) and written to the disk
@@ -1706,6 +1701,11 @@ def _bigm_cached(launch, args):
         )
         mem = launch._mem_cache
     except Exception:  # noqa: BLE001
+        _warn_once(
+            "api",
+            "MegaMoeTP big-M: FlyDSL's cache API changed (private names): no disk cache, "
+            "every process compiles its big-M kernels (minutes each)",
+        )
         _preload_compiled(launch, *args)
         return "compiled (no disk cache)"
     if ck in mem:
@@ -1719,7 +1719,17 @@ def _bigm_cached(launch, args):
             f"{launch._bigm_spec}|{_bigm_digest()}|{sig}".encode()
         ).hexdigest()[:32]
         path = os.path.join(d, f"bigm_{name}.pkl")
-        if os.path.isfile(path):
+        if os.path.isdir(d) and not _private(d):
+            _warn_once(
+                d,
+                "MegaMoeTP big-M: disk cache %s is not private to this user "
+                "(group / others writable or another owner): not used",
+                d,
+            )
+            path = None
+        elif os.path.isfile(path) and not _private(path):
+            path = None
+        if path and os.path.isfile(path):
             try:
                 with open(path, "rb") as f:
                     art = pickle.load(f)
@@ -1758,7 +1768,7 @@ def _bigm_cached(launch, args):
         )
     if path:
         try:
-            os.makedirs(d, exist_ok=True)
+            os.makedirs(d, mode=0o700, exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
             with os.fdopen(fd, "wb") as f:
                 pickle.dump(art, f)
@@ -1772,52 +1782,42 @@ def _bigm_cached(launch, args):
     return "compiled"
 
 
-# per-batch tuned big-M configs: chunks + AITER_BIGM_* options
-_BIGM_KEY = ("gfx", "model_dim", "inter_dim", "experts", "topk", "tp")
-_BIGM_TUNED_DEFAULT = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "..",
-    "..",
-    "..",
-    "..",
-    "configs",
-    "mega_moe_tp_bigm_tuned.csv",
-)
+def bigm_tuned(*, model_dim, inter_dim, experts, topk, tp, tokens, device=None):
+    """The tuned plan of the nearest tuned batch (<= tokens, else the smallest;
+    configs/mega_moe_tp_bigm_tuned.csv, see tuned.py): {"chunks": [..], "opts":
+    {"AITER_BIGM_*": ..}, "tokens": n} or None."""
+    from aiter.jit.core import AITER_CONFIGS
 
+    from .tuned import device_key, nearest, tuned_rows
 
-def bigm_tuned(*, model_dim, inter_dim, experts, topk, tp, tokens):
-    """The csv row of the nearest tuned batch (<= tokens, else the smallest):
-    {"chunks": [..], "opts": {"AITER_BIGM_*": ..}, "tokens": n} or None."""
-    import csv
-
-    from aiter.jit.utils.chip_info import get_gfx
-
-    path = _BIGM_TUNED_DEFAULT
-    if not os.path.isfile(path):
+    key = {
+        **device_key(device),
+        "model_dim": model_dim,
+        "inter_dim": inter_dim,
+        "experts": experts,
+        "topk": topk,
+        "tp": tp,
+    }
+    r = nearest(
+        tuned_rows(AITER_CONFIGS.AITER_CONFIG_MEGA_MOE_TP_BIGM_FILE, key, "tokens"),
+        tokens,
+        clamp=True,
+    )
+    if r is None:
         return None
-    key = tuple(str(x) for x in (get_gfx(), model_dim, inter_dim, experts, topk, tp))
-    rows = {}
-    with open(path) as f:
-        for r in csv.DictReader(f):
-            if tuple(r[k] for k in _BIGM_KEY) == key:
-                rows[int(r["tokens"])] = r
-    if not rows:
-        return None
-    t = max((x for x in rows if x <= tokens), default=min(rows))
-    r = rows[t]
     opts = dict(kv.split("=", 1) for kv in r.get("opts", "").split(";") if kv)
     return {
         "chunks": [int(x) for x in r["chunks"].split(",")],
         "opts": opts,
-        "tokens": t,
+        "tokens": int(r["tokens"]),
     }
 
 
 CMAX = 7  # chunks per launch (ctrl layout)
 PAD = 64  # the kernel's local rows (and chunk rows) are multiples of this (moe() pads)
-GEOMS = (
-    (128, 1),
-)  # (unit rows AITER_BIGM_RG, CTAs per CU AITER_BIGM_CPU) of the io path
+# rows per unit (AITER_BIGM_RG), one CTA (NW waves) per CU: the validated geometry (64-row
+# units: 16% slower at 16384 tokens and failing with two CTAs per CU / three chunks)
+UNIT_ROWS = 128
 
 
 _HIP = None
@@ -1870,6 +1870,34 @@ def _kcopy(dst, src):
     torch.mul(src, 1, out=dst)
 
 
+@functools.cache
+def _compile_signal_read(tp):
+    """launch(dc, out, stream): out [tp][NQ] int32 <- the received signal count per (sender,
+    queue) (MORI's signal slots, low 32 bits)"""
+    from flydsl.compiler.extern_link import link_extern
+    from flydsl.expr.extern import ffi
+
+    from .sdma import sdma_bitcode
+
+    sig_slot = link_extern(
+        ffi("cco_sdma_signal_slot", ["uint64", "int32", "int32"], "uint64"),
+        bitcode_path=sdma_bitcode(6),
+    )
+
+    @flyc.kernel(name=f"bigm_signal_read_tp{tp}", known_block_size=[64, 1, 1])
+    def kernel(dc: fx.Int64, out: fx.Int64):
+        lane = fx.Int32(gpu.thread_id("x"))
+        if lane < i32(tp * NQ):
+            slot = fx.Int64(sig_slot(dc, lane // i32(NQ), lane % i32(NQ)))
+            g_st_sys(out + fx.Int64(lane * i32(4)), g_ld_sys(slot))
+
+    @flyc.jit
+    def launch(dc: fx.Int64, out: fx.Int64, stream: fx.Stream):
+        kernel(dc, out).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
+
+    return launch
+
+
 class _CudaBuf:
     """__cuda_array_interface__ of raw device bytes (a peer's arena as mapped here)."""
 
@@ -1887,7 +1915,7 @@ class MegaMoeTPBigM:
     scratch buffers and the launch.
     moe(x [m, H], topk_weights / topk_ids [m, K1], out, tail) (MegaMoeTP.forward, ag_rs)
     -> y [m, H], with tail = (res_in, res_out, norm_w) (y, q [T, H] fp8, scales [T]).
-    chunks=None: per batch from the tuned csv (bigm_tuned: chunks + AITER_BIGM_* options).
+    Per batch the chunk plan and options come from the tuned csv (bigm_tuned), else defaults.
     """
 
     REGIONS = ("xq", "xs", "ids", "tw", "eq", "erecv", "q", "qs")
@@ -1900,7 +1928,6 @@ class MegaMoeTPBigM:
         experts,
         topk,
         max_tokens,
-        chunks,
         eps,
         gemma,
         swiglu_limit,
@@ -1926,22 +1953,11 @@ class MegaMoeTPBigM:
         self.Tmax = max_tokens
         self.act = act  # the units' activation ("swiglu", "silu")
         self.ygather = bool(ygather)  # moe(gather=True): the "q" region holds bf16 rows
-        if chunks is None:
-            self.weights = None  # per batch (_plan)
-        else:
-            self.weights = (
-                [1] * chunks if isinstance(chunks, int) else [int(x) for x in chunks]
-            )
-        self.C = CMAX if self.weights is None else len(self.weights)
-        assert self.C <= CMAX
         self._plans = {}
         self._pads = None
         self.cfg = (float(eps), bool(gemma), float(swiglu_limit))
         self.opts = tuple(sorted((opts or {}).items()))  # tuned AITER_BIGM_* options
-        od = dict(self.opts)
-        # unit rows and CTAs per CU (RG=64 units fit two CTAs in a CU: units beside row phases)
-        self.rg = int(od.get("AITER_BIGM_RG", "128"))
-        self.cpu = int(od.get("AITER_BIGM_CPU", "1"))
+        self._check_geom(dict(self.opts))
         self.w = (
             w1.view(torch.uint8),
             w1_scale.view(torch.uint8),
@@ -1950,6 +1966,12 @@ class MegaMoeTPBigM:
         )
         H, T, K1, tp = hidden, max_tokens, self.K1, self.tp
         RB = i8_row_bytes(H)
+        # the kernel's 32-bit offsets into these regions (the route rows: per chunk, _chunks)
+        for what, n in (("E rows", T * RB), ("y gather rows", T * H * 2)):
+            if n >= 1 << 31:
+                raise ValueError(
+                    f"MegaMoeTP big-M: {what} of {T} tokens exceed 32-bit offsets"
+                )
         sizes = {
             "xq": T * H // 2,
             "xs": T * H // 32,
@@ -1967,6 +1989,13 @@ class MegaMoeTPBigM:
         sd.reserve("brows", 2 * T * H * 2)  # two buffers in turn
         sd.reserve("bflag", tp * 64)  # per-rank epoch flags (gather_rows)
         sd.commit()
+        # the signal-base buffer each launch reads (the other: the next launch's, from GW)
+        self._cpar = 0
+        self._cons = tuple(int(c.data_ptr()) for c in sd.consumed)
+        if self._cons[0] % (2 * tp * NQ * 4) or self._cons[1] != self._cons[0] ^ (
+            tp * NQ * 4
+        ):
+            raise RuntimeError(f"MegaMoeTP big-M: misaligned signal bases {self._cons}")
         dev = self.device = sd.device
         self.offs = torch.tensor(
             [sd.offset(r_) for r_ in self.REGIONS], dtype=torch.int64, device=dev
@@ -1976,14 +2005,12 @@ class MegaMoeTPBigM:
         self.normed = torch.empty((m, H), dtype=bf, device=dev)
         self.resout = torch.empty((m, H), dtype=bf, device=dev)
         self.ybuf = torch.empty((m, H), dtype=bf, device=dev)
-        smax = m if self.weights is None else max(self._split(m))
         # route rows / lists of every chunk packed (chunk k from route tp * o_k * K1)
         self.routes = torch.empty(T * K1 * H, dtype=bf, device=dev)
         self.lrix = torch.empty(T * K1, dtype=torch.int32, device=dev)
         self.lwt = torch.empty(T * K1, dtype=torch.float32, device=dev)
-        self.ucap = unit_cap(tp, smax, K1, self.NE, self.rg)
         # unit slots of every chunk ([C][8][ucap of the batch]): sum over chunks <= the bound
-        self.uslots = 2 * (-(-tp * m * K1 // self.rg) // 8) + self.C * (
+        self.uslots = 2 * (-(-tp * m * K1 // UNIT_ROWS) // 8) + CMAX * (
             -(-self.NE // 8) + UQ + 2
         )
         self.utab = torch.zeros(8 * self.uslots * 4, dtype=torch.int32, device=dev)
@@ -2002,43 +2029,30 @@ class MegaMoeTPBigM:
         self._pad_dirty = 0  # rows below may hold an earlier call's tokens / routes
         self._ready = set()
         self.cu = torch.cuda.get_device_properties(dev).multi_processor_count
-        # deepest A ring (dividing the GEMM1 chunk count) whose LDS fits a CU
+        self.nab = self._nab()
 
-        self._nabs = {}
-        self.nab = self._nab(self.rg, self.cpu)
-
-    def _nab(self, rg, cpu):
-        """deepest A ring (dividing the GEMM1 chunk count) whose LDS fits cpu CTAs in a CU"""
-        n_ = self._nabs.get((rg, cpu))
-        if n_ is None:
-            kch = self.H // 256
-            n_ = self._nabs[(rg, cpu)] = next(
-                n
-                for n in (4, 3, 2)
-                if kch % n == 0
-                and self._unit_lds(n, self.I, rg) + 4096 <= 160 * 1024 // cpu
-            )
-        return n_
-
-    def _geom(self, T):
-        """(unit rows RG, CTAs per CU, A ring depth) of batch T: its plan's AITER_BIGM_RG /
-        AITER_BIGM_CPU (the tuned csv), else the instance's"""
-        o = dict(self._plan(T)[1])
-        rg, cpu = int(o.get("AITER_BIGM_RG", self.rg)), int(
-            o.get("AITER_BIGM_CPU", self.cpu)
-        )
-        # validated in this (io) path: 128-row units, one CTA per CU (64-row units: 16% slower at
-        # 16384 tokens and failing with two CTAs per CU / three chunks; 96 / 112: no LDS layout)
-        if (rg, cpu) not in GEOMS:
-            raise ValueError(
-                f"MegaMoeTP big-M: AITER_BIGM_RG={rg} / AITER_BIGM_CPU={cpu} unsupported (have {GEOMS})"
-            )
-        return rg, cpu, self._nab(rg, cpu)
-
-    def _unit_lds(self, n, inter, rg=None):
+    def _nab(self):
+        """the deepest A ring (dividing the GEMM1 chunk count) whose LDS fits a CU"""
         from .bigm_gemm import bigm_lds
 
-        return bigm_lds(rg or self.rg, n, inter)["BYTES"]
+        kch = self.H // 256
+        return next(
+            n
+            for n in (4, 3, 2)
+            if kch % n == 0
+            and bigm_lds(UNIT_ROWS, n, self.I)["BYTES"] + 4096 <= 160 * 1024
+        )
+
+    @staticmethod
+    def _check_geom(o):
+        rg, cpu = int(o.get("AITER_BIGM_RG", UNIT_ROWS)), int(
+            o.get("AITER_BIGM_CPU", 1)
+        )
+        if (rg, cpu) != (UNIT_ROWS, 1):
+            raise ValueError(
+                f"MegaMoeTP big-M: AITER_BIGM_RG={rg} / AITER_BIGM_CPU={cpu} unsupported "
+                f"(only {UNIT_ROWS} / 1)"
+            )
 
     def gather_rows(self, rows, local=False):
         """Collective: every rank's rows [m, H] bf16 -> [tp * m, H] (rank r's at r * m), a
@@ -2128,40 +2142,81 @@ class MegaMoeTPBigM:
     def clear_errors(self) -> None:
         self.ctrl[C_ERR:].zero_()
 
+    def error_flag(self):
+        """The sticky watchdog word as a 1-element device tensor (no sync): 1 if a wait gave
+        up since the last clear."""
+        return self.ctrl[C_ERR : C_ERR + 1]
+
+    def reset(self) -> None:
+        """Collective: re-base the per-(peer, queue) signal bases on the received signals and
+        clear the watchdog word -- after a wait gave up the bases may be out of step with the
+        peers' puts (every later wait on that queue would time out)."""
+        import time
+
+        import torch
+        import torch.distributed as dist
+
+        from ..tensor_shim import _run_compiled
+
+        torch.cuda.synchronize(self.device)
+        dist.barrier(group=self.sd.group)
+        time.sleep(0.2)  # the puts of the peers' finished launches land
+        got = torch.zeros(self.tp * NQ, dtype=torch.int32, device=self.device)
+        _run_compiled(
+            _compile_signal_read(self.tp),
+            self.sd.dev_comm.ptr,
+            got.data_ptr(),
+            torch.cuda.current_stream(),
+        )
+        self.sd.consumed[self._cpar].copy_(got)
+        self.ctrl.zero_()
+        torch.cuda.synchronize(self.device)
+        dist.barrier(group=self.sd.group)
+
+    def close(self) -> None:
+        """Collective: free the SDMA queues and the arena (unusable afterwards)."""
+        self.sd.close()
+
     def _plan(self, T):
-        """(chunk weights, AITER_BIGM_* options) of a batch of T tokens"""
+        """(chunk weights, AITER_BIGM_* options) of a batch of T tokens (T / tp a multiple
+        of PAD): the tuned csv's, else the defaults; at most one chunk per PAD local rows
+        """
         p = self._plans.get(T)
         if p is None:
-            w, o = self.weights, dict(self.opts)
-            if w is None:
-                tu = bigm_tuned(
-                    model_dim=self.H,
-                    inter_dim=self.I,
-                    experts=self.NE,
-                    topk=self.K1,
-                    tp=self.tp,
-                    tokens=T,
-                )
-                if tu is not None:
-                    w = tu["chunks"]
-                else:
-                    w = [1, 1] if T <= 16384 else [1, 2, 2, 1]
-                if tu is not None:
-                    o = {**tu["opts"], **o}
-            assert len(w) <= self.C
+            o = dict(self.opts)
+            tu = bigm_tuned(
+                model_dim=self.H,
+                inter_dim=self.I,
+                experts=self.NE,
+                topk=self.K1,
+                tp=self.tp,
+                tokens=T,
+                device=self.device,
+            )
+            if tu is not None:
+                w = tu["chunks"]
+                o = {**tu["opts"], **o}
+            else:
+                w = [1, 1] if T <= 16384 else [1, 2, 2, 1]
+            self._check_geom(o)
+            if not 0 < len(w) <= CMAX or min(w) <= 0:
+                raise ValueError(f"MegaMoeTP big-M: bad chunk weights {w} (T={T})")
+            n = max(1, T // self.tp // PAD)
+            if len(w) > n:  # few rows: fewer chunks (the largest weights)
+                w = sorted(w, reverse=True)[:n]
             p = self._plans[T] = (tuple(w), tuple(sorted(o.items())))
         return p
 
-    def _split(self, m, w=None):
-        w = w or self.weights or self._plan(m * self.tp)[0]
+    def _split(self, m):
+        w = self._plan(m * self.tp)[0]
         tot = sum(w)
         # multiples of 64 rows (moe() pads m to PAD): whole input row items (ZX) in every head
         # sub-block (AITER_BIGM_NSBA <= 4)
         g = PAD
-        assert m % g == 0, (m, g)
         sizes = [max(g, (m * x // tot) // g * g) for x in w]
         sizes[w.index(max(w))] += m - sum(sizes)
-        assert all(x > 0 and x % g == 0 for x in sizes) and sum(sizes) == m, (m, sizes)
+        if m % g or sum(sizes) != m or min(sizes) <= 0 or any(x % g for x in sizes):
+            raise RuntimeError(f"MegaMoeTP big-M: cannot split {m} rows by {w}")
         return sizes
 
     def _chunks(self, T):
@@ -2173,10 +2228,14 @@ class MegaMoeTPBigM:
             (T, sizes)
         )  # (the plan of T may be replaced: keyed by its sizes)
         if c is None:
+            # the kernel's 32-bit offsets of a chunk's route rows (rows * H bf16)
+            if self.tp * max(sizes) * self.K1 * self.H * 2 >= 1 << 31:
+                raise ValueError(
+                    f"MegaMoeTP big-M: chunks {sizes} of {T} tokens: a chunk's route rows "
+                    "exceed 32-bit offsets (more chunks: the tuned csv)"
+                )
             need = len(sizes) * self._ucap(T)
-            if (
-                need > self.uslots
-            ):  # a smaller unit (the plan's AITER_BIGM_RG): a larger table
+            if need > self.uslots:
                 self.uslots = need
                 self.utab = torch.zeros(
                     8 * need * 4, dtype=torch.int32, device=self.device
@@ -2206,7 +2265,7 @@ class MegaMoeTPBigM:
             max(self._split(T // self.tp)),
             self.K1,
             self.NE,
-            self._geom(T)[0],
+            UNIT_ROWS,
         )
 
     def _run(self, launch, args):
@@ -2241,12 +2300,31 @@ class MegaMoeTPBigM:
         with no routes), its results cut back to m rows."""
         import torch
 
-        assert not gather or (self.ygather and tail is None)
+        if gather and not (self.ygather and tail is None):
+            raise ValueError("MegaMoeTP big-M: gather needs ygather and no tail")
         m = x.shape[0]
-        assert x.is_contiguous() and topk_ids.shape == (m, self.K1)
-        assert topk_ids.dtype == torch.int32 and topk_weights.dtype == torch.float32
+        if (
+            x.dtype != torch.bfloat16
+            or tuple(x.shape) != (m, self.H)
+            or not x.is_contiguous()
+            or tuple(topk_ids.shape) != (m, self.K1)
+            or tuple(topk_weights.shape) != (m, self.K1)
+            or topk_ids.dtype != torch.int32
+            or topk_weights.dtype != torch.float32
+            or not (topk_ids.is_contiguous() and topk_weights.is_contiguous())
+        ):
+            raise ValueError(
+                f"MegaMoeTP big-M: need contiguous bf16 x [m, {self.H}], int32 topk_ids / "
+                f"f32 topk_weights [m, {self.K1}]; got {x.dtype} {tuple(x.shape)}, "
+                f"{topk_ids.dtype} {tuple(topk_ids.shape)}, {topk_weights.dtype} "
+                f"{tuple(topk_weights.shape)}"
+            )
         mp = -(-m // PAD) * PAD
-        assert mp * self.tp <= self.Tmax, (m, self.Tmax)
+        if mp * self.tp > self.Tmax:
+            raise ValueError(
+                f"MegaMoeTP big-M: {m} local tokens (padded {mp}) exceed "
+                f"{self.Tmax // self.tp}"
+            )
         if mp == m:
             if gather:
                 ya = self._moe(x, topk_weights, topk_ids, None, None, local, gather)
@@ -2302,7 +2380,6 @@ class MegaMoeTPBigM:
         T = m * self.tp
         eps, gemma, lim = self.cfg
         w_, opts = self._plan(T)
-        rg, cpu, nab = self._geom(T)
         order = 4 if self.tp * max(self._split(m)) >= 8192 else 3
         return compile_bigm_layer(
             self.H,
@@ -2314,11 +2391,9 @@ class MegaMoeTPBigM:
             eps,
             gemma,
             lim,
-            NAB=nab,
+            NAB=self.nab,
             order=order,
             opts=opts,
-            RG=rg,
-            CPU=cpu,
             tailq=tailq,
             act=self.act,
         )
@@ -2368,7 +2443,6 @@ class MegaMoeTPBigM:
             res_in, res_out, norm_w = x, self.resout, x
         tq = 3 if gather else 0 if tail is None else 2 if local else 1
         launch = self._io_launch(m, tq)
-        cpu = self._geom(T)[1]
         chunks = self._chunks(T)  # (first: it may grow the unit table)
         self.ctrl[:CTRL_INTS].zero_()
         self._run(
@@ -2377,7 +2451,7 @@ class MegaMoeTPBigM:
                 self.sd.base,
                 self.sd.bases.data_ptr(),
                 self.sd.dev_comm.ptr,
-                self.sd.consumed.data_ptr(),
+                self._cons[self._cpar],
                 self.offs.data_ptr(),
                 x.data_ptr(),
                 topk_ids.data_ptr(),
@@ -2400,10 +2474,11 @@ class MegaMoeTPBigM:
                 self.rank,
                 m,
                 self._ucap(T),
-                self.cu * cpu,
+                self.cu,
                 torch.cuda.current_stream(),
             ),
         )
+        self._cpar ^= 1  # (the next launch reads what this one's GW wrote)
         if gather:
             return self.sd.view("q", (T, self.H), torch.bfloat16)
         if tail is None:

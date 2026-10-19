@@ -678,7 +678,6 @@ class SpRsNorm:
             bad.append(f"hidden % {8 * NTH} == 0")
         if router and (E not in (128, 256) or not 0 < topk < 64):
             bad.append("router experts in (128, 256) and 0 < topk < 64")
-
         if bad:
             raise ValueError(f"SpRsNorm h{self.H} tp{self.tp}: need " + ", ".join(bad))
         self._xbank = self.tp * mmax * self.H

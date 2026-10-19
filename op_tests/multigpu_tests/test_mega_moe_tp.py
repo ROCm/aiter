@@ -283,22 +283,16 @@ _CAP: dict = {}
 
 def max_local(mode: str, shape, wt) -> int:
     """the test layers' max_local_tokens: the session's, else (no big-M path for the
-    shape / mode) the largest the small-batch engine alone takes (probed once per model
-    and mode: halved until the layer's host-side limit check passes)"""
+    shape / mode) the largest the small-batch engine alone takes (the layer's own limit,
+    fit_max_local; once per model and mode)"""
     key = (shape.name, mode)
     if key not in _CAP:
-        cap = S.max_local
-        while True:
-            try:
-                new_layer(shape, wt, S.ctx, mode, cap)
-                break
-            except ValueError:
-                if cap <= 1:
-                    raise
-                cap //= 2
+        layer = new_layer(shape, wt, S.ctx, mode, S.max_local, fit_max_local=True)
+        _CAP[key] = layer.max_local_tokens
+        layer.close()
+        del layer
         gc.collect()
         torch.cuda.empty_cache()
-        _CAP[key] = cap
     return _CAP[key]
 
 
@@ -781,6 +775,8 @@ def test_mega_moe_tp(model: str, mode: str, tokens: int, route: str, seed: int):
         cfg = layer.launch_config(tokens // ctx.world)
         ret[f"{name} cfg"] = (
             f"mt{cfg.mt}{' lb' if cfg.lb else ''}{' ll' if cfg.ll else ''}"
+            if cfg is not None
+            else "big-M " + ",".join(map(str, layer.bigm_plan(tokens // ctx.world)[0]))
         )
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
