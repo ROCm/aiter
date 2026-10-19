@@ -1218,7 +1218,8 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
     if tg_num >= cu_num:
         return 0
     tilek = 256
-    split_max = (cu_num + tg_num - 1) // tg_num
+    # KBatch >= 16 is wrong for some shapes (e.g. model_dim 4096, inter_dim 128)
+    split_max = min((cu_num + tg_num - 1) // tg_num, 15)
     # at least split = 2
     for i in reversed(range(2, split_max + 1)):
         if (model_dim % i == 0) and ((model_dim // i) % tilek == 0):
