@@ -26,10 +26,9 @@ from aiter.ops.asm.mla_decode_v4 import (
     mla_v4_fused_slot_f32,
 )
 from aiter.ops.attention import (
-    _mla_decode_head_plan,
+    _mla_decode_launch_plan,
     _MlaBackendId,
     _MlaHeadPlanKind,
-    get_mla_decode_fwd_max_splits,
     mla_ps64_qh128_fp8_asm_fwd,
 )
 
@@ -1408,29 +1407,20 @@ def mla_decode_fwd(
         if fp32_single_split_lse:
             return o, final_lse
     else:
-        if num_kv_splits is None:
-            num_kv_splits = get_mla_decode_fwd_max_splits(
-                ori_nhead,
-                max_seqlen_q,
-                q.dtype,
-                (
-                    dtypes.fp8
-                    if kv_buffer.dtype in (torch.int8, torch.uint8)
-                    else kv_buffer.dtype
-                ),
-            )
-        head_plan = _mla_decode_head_plan(
+        head_plan, max_splits = _mla_decode_launch_plan(
             ori_nhead,
             max_seqlen_q,
             q.dtype,
             kv_buffer.dtype,
-            fast_mode=fast_mode,
-            intra_batch_mode=intra_batch_mode,
-            page_size=page_size,
-            cp_world_size=cp_world_size,
-            cp_round_robin=g_kv_indptr is not None,
-            has_scales=q_scale is not None and kv_scale is not None,
+            fast_mode,
+            intra_batch_mode,
+            page_size,
+            cp_world_size,
+            g_kv_indptr is not None,
+            q_scale is not None and kv_scale is not None,
         )
+        if num_kv_splits is None:
+            num_kv_splits = max_splits
         use_ps1_asm = head_plan.backend == _MlaBackendId.PS1_FP8_ASM
         use_flydsl_ps1 = use_ps1_asm or head_plan.backend == _MlaBackendId.FLYDSL_PS1
         if use_flydsl_ps1:

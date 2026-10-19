@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import inspect
 import itertools
 import sys
 
@@ -15,6 +16,7 @@ from aiter.ops.attention import (
     MlaAsmStatus,
     MlaBackend,
     _mla_decode_head_plan,
+    _mla_decode_launch_plan,
     decode_update_mla_metadata_v1,
     get_mla_decode_shape_support,
     mla_decode_asm_query,
@@ -204,10 +206,11 @@ def _launch_plan_call(monkeypatch, n, msq, **call_kw):
     seen = {}
 
     def capture(*args, **kw):
-        seen.update(args=args, kw=kw)
+        bound = inspect.signature(_mla_decode_launch_plan).bind(*args, **kw)
+        seen.update(bound.arguments)
         raise _PlanCaptured
 
-    monkeypatch.setattr(aiter.mla, "_mla_decode_head_plan", capture)
+    monkeypatch.setattr(aiter.mla, "_mla_decode_launch_plan", capture)
     fp8, dim = torch.float8_e4m3fn, KV_LORA_RANK + QK_ROPE
     i32 = torch.int32
     with pytest.raises(_PlanCaptured):
@@ -226,7 +229,7 @@ def _launch_plan_call(monkeypatch, n, msq, **call_kw):
             kv_scale=torch.ones(1),
             **call_kw,
         )
-    return seen["args"], seen["kw"]
+    return seen
 
 
 def test_cp_world_size_matches_launch(monkeypatch):
@@ -235,7 +238,7 @@ def test_cp_world_size_matches_launch(monkeypatch):
     g_kv_indptr = torch.tensor([0, 4], dtype=torch.int32)
     backends = {}
     for world, rr in ((1, False), (4, False), (4, True)):
-        args, kw = _launch_plan_call(
+        kw = _launch_plan_call(
             monkeypatch,
             64,
             1,
@@ -244,6 +247,8 @@ def test_cp_world_size_matches_launch(monkeypatch):
             g_kv_indptr=g_kv_indptr if rr else None,
         )
         assert (kw["cp_world_size"], kw["cp_round_robin"]) == (world, rr)
+        shape = ("num_heads", "max_seqlen_qo", "q_dtype", "kv_dtype")
+        args = [kw.pop(k) for k in shape]
         launch = _mla_decode_head_plan(*args, **kw, **flags)
         query = get_mla_decode_shape_support(
             64, 1, fp8, fp8, cp_world_size=world, cp_round_robin=rr, **flags

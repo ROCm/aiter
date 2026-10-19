@@ -41,9 +41,14 @@ AITER_DISABLE_KERNARG_PRELOAD = (
 )
 
 
-def env_flag_atoi(name: str, default: str = "") -> bool:
-    m = re.match(r"\s*([+-]?\d+)", os.environ.get(name, default))
+@functools.lru_cache(maxsize=256)
+def _atoi_flag(raw: str) -> bool:
+    m = re.match(r"\s*([+-]?\d+)", raw)
     return m is not None and int(m.group(1)) != 0
+
+
+def env_flag_atoi(name: str, default: str = "") -> bool:
+    return _atoi_flag(os.environ.get(name, default))
 
 
 def is_experimental_enabled() -> bool:
