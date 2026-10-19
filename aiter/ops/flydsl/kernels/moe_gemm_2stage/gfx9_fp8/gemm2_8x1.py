@@ -105,7 +105,7 @@ def read_8x1_scale_g2r(n, pair, *, weight_quant_type, scale_buffer, mm, ops):
 
 
 def _fma_f32(a, b):
-    # Per-element inline v_fma_f32(a, b, 0.0) pins the explicit f32 instruction order.
+    # Per-element fma(a, b, 0.0); the kernel's -packed-fp32-ops keeps it a hazard-checked v_fma_f32.
     a, b, zero = as_ir_value(a), as_ir_value(b), as_ir_value(fx.Float32(0.0))
     f32 = ir.F32Type.get()
     lanes = []
@@ -114,15 +114,7 @@ def _fma_f32(a, b):
             vector_dialect.extract(x, static_position=[i], dynamic_position=[])
             for x in (a, b)
         ]
-        lanes.append(
-            llvm.inline_asm(
-                f32,
-                operands + [zero],
-                "v_fma_f32 $0, $1, $2, $3",
-                "=v,v,v,v",
-                has_side_effects=False,
-            )
-        )
+        lanes.append(llvm.intr_fma(*operands, zero))
     return Vec(
         vector_dialect.from_elements(ir.VectorType.get([len(lanes)], f32), lanes)
     )
@@ -370,7 +362,7 @@ def packing_events(k, stage, first=False):
 
 @cache
 def vmem_wait_schedule(k, n_tiles, ptpc=True):
-    """Per-step vmcnt budgets, counting one event per buffer/global load.
+    """Per-step (B, scale) vmcnt budgets, counting one event per buffer/global load.
 
     A budget is the minimum age of the B and scale loads consumed next; scales
     count because some K256 packets use the previous step's scale.
@@ -394,19 +386,20 @@ def vmem_wait_schedule(k, n_tiles, ptpc=True):
     result = []
     for q in range(n_tiles * 2 * ks):
         n, stage = divmod(q, 2 * ks)
+        b_budget = len(events) - 1 - requests[q] if valid(q) else 63
+        request(q + 2)
         scale_count = 2 if ptpc and stage < 4 else 0
         events.extend([("scale", n, stage)] * scale_count)
         if scale_count:
             scales[n, stage] = len(events) - 1
         store_count = 2 if n > 0 and stage < 4 else 0
         events.extend([("store", n, stage)] * store_count)
-        required = [requests[q]] if valid(q) else []
+        required = []
         if ptpc:
             for _, previous, record in packing_events(k, stage, n == 0):
                 required.append(scales[n - int(previous), record])
         budget = min((len(events) - 1 - index for index in required), default=63)
-        result.append(budget)
-        request(q + 2)
+        result.append((b_budget, budget))
     return tuple(result)
 
 
@@ -536,7 +529,8 @@ def run_8x1_tile(
         # kb indexes BK128 blocks; it is not an offset or slot.
         # half=0/1 selects the first/last 64 columns of N128; visit all L K blocks before H.
         kb, half, prefetch_slot = step % KS, step // KS, step & 1
-        lds_slot = (n * KS + kb) & 1
+        # Q[q] sits in LDS region q % 4 (slot q>>1&1, half q&1); odd KS flips slots with N parity.
+        lds_slot, lds_half = (step >> 1) & 1, step & 1
         # N0 q0 reads a whole N64 half; all other steps read two N32 packets.
         read_full_half = first and step == 0
         has_output = not first and step < 4
@@ -544,40 +538,17 @@ def run_8x1_tile(
 
         # Memory: read Q[q], interleaving previous-N C stores; P and LDS slots rotate independently.
         priority(0)
-        if const_expr(step < 4):
-            scales.append(read_scale_g2r(n, step))
-        if const_expr(has_output):
-            # Step s stores previous-N output quarter (row=s%2, half=s//2), not an N32 record.
-            fragments, destinations = shuffle_c_r2s2r(
-                n - 1, previous_packed, step % 2, step // 2
-            )
-        b_read_address = (
-            addresses[kb & 1] if const_expr(prepare_b_addresses is not None) else None
-        )
-        if const_expr(read_full_half):
-            # Whole-half and two-packet reads are exclusive and use their matching MFMA indices.
-            b_full = read_b_s2r(lds_slot, kb, half, packet=None, address=b_read_address)
-        else:
-            b0 = read_b_s2r(lds_slot, kb, half, packet=0, address=b_read_address)
-            if const_expr(has_output):
-                # Issue stores once old CShuffle reads complete; current B reads may remain in flight.
-                store_c_r2g(fragments, destinations, lgkmcnt=4)
-                fx.rocdl.sched_barrier(0)
-            b1 = read_b_s2r(lds_slot, kb, half, packet=1, address=b_read_address)
-
         # Protect the next B submission and this step's pack scales; N1 is separate, the backedge uses n>=2.
         budget_n = (
             0 if first else n_tiles - 1 if last else n if isinstance(n, int) else 2
         )
-        if const_expr(has_b_target(step, ahead=1, last=last) or (ptpc and events)):
-            rocdl.s_waitcnt(vmcnt=budgets[budget_n * 2 * KS + step])
         if const_expr(has_b_target(step, ahead=1, last=last)):
+            rocdl.s_waitcnt(vmcnt=budgets[budget_n * 2 * KS + step][0])
             # B r->s submits Q[q+1]; materialize the target after waiting, consuming P[prefetch_slot].
-            _b_r2s_n, b_r2s_kb, b_r2s_half, b_r2s_lds_slot = _b_coords(n, step + 1, KS)
+            _b_r2s_n, b_r2s_kb, _, _ = _b_coords(n, step + 1, KS)
+            b_r2s_lds_slot, b_r2s_half = ((step + 1) >> 1) & 1, (step + 1) & 1
             if const_expr(prepare_b_addresses is not None):
-                # The last L K block advances to the same N's H/K0; odd KS cannot use current LDS slot+1.
-                relative_slot = (b_r2s_kb + ((step + 1) // (2 * KS)) * KS) & 1
-                write_address = addresses[2 + relative_slot]
+                write_address = addresses[2 + b_r2s_lds_slot]
             else:
                 write_address = None
             store_b_r2s(
@@ -595,13 +566,38 @@ def run_8x1_tile(
             b_prefetch[prefetch_slot] = read_b_g2r(
                 b_g2r_n, b_g2r_kb, b_g2r_half, prefetch_slot=prefetch_slot
             )
-        if const_expr(first and step == 0):
-            # Q1's cross-group consumers need both LDS writes.
-            rocdl.s_waitcnt(lgkmcnt=0)
+        fx.rocdl.sched_barrier(0)
+        if const_expr(step < 4):
+            scales.append(read_scale_g2r(n, step))
+        if const_expr(has_output):
+            # Step s stores previous-N output quarter (row=s%2, half=s//2), not an N32 record.
+            fragments, destinations = shuffle_c_r2s2r(
+                n - 1, previous_packed, step % 2, step // 2
+            )
+        b_read_address = None
+        if const_expr(prepare_b_addresses is not None):
+            b_read_address = addresses[lds_slot]
+        if const_expr(read_full_half):
+            # Whole-half and two-packet reads are exclusive and use their matching MFMA indices.
+            b_full = read_b_s2r(
+                lds_slot, kb, lds_half, packet=None, address=b_read_address
+            )
+        else:
+            b0 = read_b_s2r(lds_slot, kb, lds_half, packet=0, address=b_read_address)
+            if const_expr(has_output):
+                # Issue stores once old CShuffle reads complete; current B reads may remain in flight.
+                store_c_r2g(fragments, destinations, lgkmcnt=4)
+                fx.rocdl.sched_barrier(0)
+            b1 = read_b_s2r(lds_slot, kb, lds_half, packet=1, address=b_read_address)
+        if const_expr(ptpc and events):
+            rocdl.s_waitcnt(vmcnt=budgets[budget_n * 2 * KS + step][1])
+        # Only the Q[q+1] write must land before the barrier; >= 8 later B ds_reads finish at compute start.
+        rocdl.s_waitcnt(lgkmcnt=0 if read_full_half else 8)
         stage_end()
 
         # Compute: preserve packet order, interleaving current-record MFMA with old/new-record packing.
         priority(3)
+        rocdl.s_waitcnt(lgkmcnt=0)
         # packet=0/1 selects each half's first/last 32 columns; record=0..3 identifies N32 outputs.
         for packet in range_constexpr(2):
             record = 2 * half + packet
@@ -794,6 +790,7 @@ def _build_moe_gemm2_8x1(*, N, K, weight_quant_type, act_quant_type, TOPK, paddi
         stream: fx.Stream,
     ):
         CompilationContext.get_current()
+        features = ir.Attribute.parse('#llvm.target_features<["-packed-fp32-ops"]>')
         kernel = moe_2stage_down_prefill_8x1(
             p_input,
             p_weight,
@@ -805,7 +802,7 @@ def _build_moe_gemm2_8x1(*, N, K, weight_quant_type, act_quant_type, TOPK, paddi
             p_w_scale,
             p_a_scale,
             M,
-            value_attrs={"passthrough": [["target-features", "-packed-fp32-ops"]]},
+            value_attrs={"llvm.target_features": features},
         )
         kernel.launch(grid=(1, task_num, 1), block=(512, 1, 1), stream=stream)
 
@@ -1277,20 +1274,22 @@ def k192_wait_schedule(n_tiles, ptpc):
     for n in range(n_tiles):
         for half in range(2):
             q = 2 * n + half
+            b_budget = sequence - requests[q + 1] if q + 1 < 2 * n_tiles else 63
+            request_b_g2r(q + 3)
             if ptpc:
                 for pair in range(2 * half, 2 * half + 2):
                     sequence += 2
                     scales[n, pair] = sequence
             if n > 0:
                 sequence += 4
-            required = [requests[q + 1]] if q + 1 < 2 * n_tiles else []
+            required = []
             if ptpc:
                 if half == 0 and n > 0:
                     required.extend(scales[n - 1, pair] for pair in (2, 3))
                 elif half == 1:
                     required.extend(scales[n, pair] for pair in (0, 1))
-            budgets.append(min((sequence - event for event in required), default=63))
-            request_b_g2r(q + 3)
+            budget = min((sequence - event for event in required), default=63)
+            budgets.append((b_budget, budget))
     return tuple(budgets)
 
 
@@ -1625,7 +1624,10 @@ def run_k192_tile(
     """
     budgets = k192_wait_schedule(n_tiles, ptpc)
     body_budgets = tuple(
-        min((budgets[2 * n + half] for n in range(2, n_tiles - 2)), default=63)
+        tuple(
+            min((budgets[2 * n + half][i] for n in range(2, n_tiles - 2)), default=63)
+            for i in range(2)
+        )
         for half in range(2)
     )
     has_next = not last
@@ -1638,6 +1640,20 @@ def run_k192_tile(
         prefetch_slot = half
         # Memory: read Q[2*n+half], interleaving previous-N CShuffle/stores per packet.
         priority(0)
+        budget, scale_budget = (
+            budgets[2 * n + half] if isinstance(n, int) else body_budgets[half]
+        )
+        # Protect the next B submission; later prefetches do not count.
+        if const_expr(budget != 63):
+            rocdl.s_waitcnt(vmcnt=budget)
+        if const_expr(half == 0 or has_next):
+            # B r->s submits Q[q+1]: L writes current-N.H, H writes next-N.L.
+            store_b_r2s(1 - half, b_prefetch[prefetch_slot], addresses=addresses)
+        if const_expr((half == 0 and has_next) or (half == 1 and has_future)):
+            # Prefetch Q[q+3] into just-submitted P[half]: next-N.H or following-N.L.
+            fx.rocdl.sched_barrier(0)
+            b_prefetch[prefetch_slot] = read_b_g2r(n + 1 + half, 1 - half)
+        fx.rocdl.sched_barrier(0)
         for pair in range_constexpr(2 * half, 2 * half + 2):
             scales.append(read_scale_g2r(n, pair))
         b_packets = []
@@ -1652,24 +1668,15 @@ def run_k192_tile(
                 # C reads precede the next six B ds_reads; issue stores without waiting for all of B.
                 store_c_r2g(fragments, destinations, lgkmcnt=6)
                 fx.rocdl.sched_barrier(0)
-        budget = budgets[2 * n + half] if isinstance(n, int) else body_budgets[half]
-        # Protect the next B submission and this step's pack scales; later prefetches do not count.
-        if const_expr(budget != 63):
-            rocdl.s_waitcnt(vmcnt=budget)
-        if const_expr(half == 0 or has_next):
-            # B r->s submits Q[q+1]: L writes current-N.H, H writes next-N.L.
-            store_b_r2s(1 - half, b_prefetch[prefetch_slot], addresses=addresses)
-        if const_expr((half == 0 and has_next) or (half == 1 and has_future)):
-            # Prefetch Q[q+3] into just-submitted P[half]: next-N.H or following-N.L.
-            fx.rocdl.sched_barrier(0)
-            b_prefetch[prefetch_slot] = read_b_g2r(n + 1 + half, 1 - half)
-        if const_expr(first and half == 0):
-            # Already staggered before q0; the other group must see both groups' full Q1 before H.
-            rocdl.s_waitcnt(lgkmcnt=0)
+        if const_expr(scale_budget != 63):
+            rocdl.s_waitcnt(vmcnt=scale_budget)
+        # Only the Q[q+1] write must land before the barrier; 12 later B ds_reads finish at compute start.
+        rocdl.s_waitcnt(lgkmcnt=12)
         stage_end()
 
         # Compute: retain packing interleaving and preparation of five next-N addresses.
         priority(3)
+        rocdl.s_waitcnt(lgkmcnt=0)
         # packet=0/1 selects the first/last 32 columns of the half; record=0..3 identifies N32 outputs.
         for packet in range_constexpr(2):
             record = half * 2 + packet
