@@ -357,7 +357,7 @@ class TunerCommon:
         return self._normalize_tuned_identity(tunedf)
 
     def _normalize_tuned_identity(self, tunedf: "pd.DataFrame") -> "pd.DataFrame":
-        """Backfill only missing legacy identities; retain explicit device rows."""
+        """Fill missing legacy gfx values; keep explicit ones."""
         tunedf = tunedf.copy()
         if "gfx" in self.keys:
             if "gfx" not in tunedf:
@@ -594,7 +594,7 @@ class TunerCommon:
         logger.info("Failed shapes:")
         print(self.failed, flush=True)
 
-        # Input-only validation metadata is not part of the persisted shape key.
+        # Match on shape keys only; input-only columns are not persisted.
         keys = self._summary_shape_keys()
         requested = self.untunedf[keys].copy()
         tunedf_subset = tunedf[keys].astype(requested.dtypes)

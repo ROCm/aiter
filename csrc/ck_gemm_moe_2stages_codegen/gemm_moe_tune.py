@@ -6833,8 +6833,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
     def _invocation_configuration(
         self, args: "argparse.Namespace | SimpleNamespace | None" = None
     ) -> "dict[str, float | bool | None]":
-        # Production reads the two output switches per call. Callers keep all
-        # three variables stable for this invocation and its spawned workers.
+        # Callers keep these variables unchanged for the whole run.
         if args is not None and hasattr(args, "mxfp4_configuration"):
             self._configuration = args.mxfp4_configuration
         elif args is not None or not hasattr(self, "_configuration"):
@@ -6919,7 +6918,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return arch, cu
 
     def get_gfx(self) -> "str":
-        # Main's single-slot prune/full path runs on the caller's current GPU.
+        # Single-slot prune/full runs on the current GPU.
         return (
             str(
                 torch.cuda.get_device_properties(
@@ -6950,14 +6949,12 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return [self._runtime_device_identity(gpu) for gpu in selected]
 
     def _summary_shape_keys(self) -> "list[str]":
-        # Requested rows are assigned to runtime GPUs by the scheduler. A
-        # successful row on another supported CU count still completes its
-        # requested shape; output keeps the actual assigned gfx/CU identity.
+        # Rows may run on any scheduled GPU; output keeps that GPU's gfx/CU.
         return [key for key in self.keys if key not in ("gfx", "cu_num")]
 
     def _normalize_tuned_csv(self, tunedf: "pd.DataFrame") -> "pd.DataFrame":
         tunedf = super()._normalize_tuned_csv(tunedf)
-        # Filter fallback tags while their meaning is still available.
+        # Drop tagged fallback rows before removing the tag column.
         if "_tag" in tunedf:
             tunedf = tunedf[tunedf["_tag"].fillna("").eq("")].drop(columns="_tag")
         for column in self.columns:
@@ -6980,7 +6977,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                     0
                 )
         tunedf = tunedf.drop(columns=list(self.input_metadata), errors="ignore")
-        # nt belongs to ordinary fMoE rows sharing this production file.
+        # Keep nt for ordinary fMoE rows in shared files.
         columns = self.columns + (["nt"] if "nt" in tunedf else [])
         return tunedf[columns]
 
@@ -7636,8 +7633,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 )
         situ_beta = DEFAULT_SITUV2_BETA if cfg["act"] == "situv2" else 1.0
         situ_linear_beta = DEFAULT_SITUV2_LINEAR_BETA if cfg["act"] == "situv2" else 1.0
-        # The production wrapper prepares output buffers and launches once,
-        # outside screening timing. Reuse those buffers for kernel-only timing.
+        # Run the wrapper once untimed to allocate buffers; time the kernel only.
         inter_q, inter_s = _mxfp4_a4w4_stage1_fw(
             stage1_input,
             data["w1_a16"],
@@ -7723,8 +7719,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         out = moe_buf if moe_buf.numel() else torch.empty_like(data["input"])
 
         def launch() -> torch.Tensor:
-            # Atomic accumulation must start from zero on every timed iteration.
-            # The production wrapper includes each non-atomic reduction/scatter.
+            # Atomic output accumulates, so clear it every iteration.
             if cfg["atomic"]:
                 out.zero_()
             return _mxfp4_a4w4_stage2_fw(
@@ -7754,8 +7749,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
         cfg = parse_g2_kname_any(kn2)
         data, sorting = self._prepare_screening_case(row, cfg["BM"], cfg["atomic"])
-        # The validated producer runs once during candidate-local setup. Neither
-        # its execution nor its intermediate survives into another screening run.
+        # Run the reference producer once, untimed, for this candidate only.
         _producer, inter_q, inter_s = self._prepare_gemm1_screening(
             data, sorting, kn1, int(row["topk"]), self._screening_limit()
         )
@@ -7809,8 +7803,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             "max_sorted": sti.shape[0],
             "n": int(nvi[0].item()),
         }
-        # Populate the native-BM sorted payload and scale layout from Torch,
-        # independently of every GEMM1 kernel under test.
+        # Build the GEMM2 input from the Torch reference, not a GEMM1 kernel.
         _v2_populate_stage2(
             {"ref1": ref1, "adtype": "fp4"}, intermediate, token, topk, cfg["BM"]
         )
@@ -8075,8 +8068,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                         if _is_accelerator_error(exc):
                             raise
                         us, failure = self.INVALID_TIME, str(exc)
-                    # Only returned outcomes enter this shape-local cache;
-                    # exception objects could retain tensors through tracebacks.
+                    # Cache results, not exceptions (tracebacks hold tensors).
                     evaluated_pairs[pair.key] = (us, failure)
                     print(
                         f"[mxfp4-staged] {candidate['kernelName1']} + "
@@ -8092,8 +8084,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                         group_best is None or us < float(group_best["us"])
                     ):
                         group_best = candidate
-                # A passing shortlist needs no expansion. Fallback, however,
-                # must finish the entire group before choosing its winner.
+                # Stop after a shortlist winner; fallback runs the whole group.
                 if group_best is not None:
                     break
             if group_best is not None and (
@@ -8408,8 +8399,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         del concat
         old_tunedf = self.get_tuned_gemm_list(file, self.columns)
         old_times = pd.to_numeric(old_tunedf["us"], errors="coerce")
-        # A same-file input can contain untuned shape rows. They are requests,
-        # not historical winners, and must not survive as zero-time output.
+        # Drop untuned input rows when input and output are the same file.
         old_tunedf = old_tunedf[(old_times > 0) & (old_times < self.INF_TIME)]
         times = pd.to_numeric(results["us"], errors="coerce")
         valid = results[(times > 0) & (times < self.INF_TIME)]
@@ -8485,12 +8475,9 @@ def _run_staged_shapes_isolated(
     ctx: Any,
     entry: Callable[..., None] = _mxfp4_staged_shape_proc,
 ) -> list[dict[str, Any] | None]:
-    """Run staged shapes with one private result Pipe per fresh worker.
+    """Run each staged shape in a fresh worker with a private result Pipe.
 
-    Within one Tuning run, a logical GPU remains owned until its worker exits,
-    preserving Per-GPU measurement exclusivity. Exclusivity between separate
-    Tuning runs is the caller's responsibility. There is intentionally no parent
-    deadline for a worker that remains alive.
+    A GPU is reused only after its worker exits. There is no parent deadline.
     """
     results: list[dict[str, Any] | None] = [None] * len(payloads)
     running: dict[int, _StagedShapeSlot] = {}
@@ -8582,17 +8569,14 @@ def _run_staged_shapes_isolated(
                 free_gpus.append(slot.gpu)
                 done.add(idx)
     finally:
-        # Only slots that were not successfully closed on the normal path remain
-        # cleanup-owned. Cleanup is best-effort and must not replace the exception
-        # already leaving the supervisor.
+        # Best-effort cleanup of unfinished workers; never mask a raised error.
         for slot in cleanup_slots:
             try:
                 if slot.proc.is_alive():
                     slot.proc.terminate()
             except BaseException:  # noqa: BLE001,S110
                 pass
-        # terminate() is followed by an immediate is_alive() check, which does
-        # not guarantee a SIGTERM grace period. Kill workers still reporting alive.
+        # Kill workers that survived terminate().
         for slot in cleanup_slots:
             try:
                 if slot.proc.is_alive():

@@ -1,10 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""AOT discovery/compile checks with GPU visibility empty.
-
-Normal ROCm/FlyDSL imports are required. Import discovery is synthetic; the
-external FlyDSL compiler is replaced so no GPU kernel compiles or launches.
-"""
+"""MXFP4 AOT job and compile tests; the FlyDSL compiler is stubbed."""
 
 import csv
 import os
@@ -158,8 +154,7 @@ def test_standalone_accepts_custom_limit_and_compiles_the_discovered_jobs(
     with pytest.raises(SystemExit) as exited:
         aot.main()
     assert exited.value.code == 0
-    # Two GEMM1 interleave layouts, plus atomic GEMM2 bias variants for both
-    # valid-token-count modes.
+    # 2 GEMM1 layouts + 2 bias x 2 valid-token-count GEMM2 variants.
     assert "Compiled:     6 ok, 0 failed" in capsys.readouterr().out
     assert external_compiler
 
