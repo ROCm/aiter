@@ -112,17 +112,7 @@ FP4. Bias scatter retains BF16. Each switch is enabled only by the value `1`.
 AITER_FLYDSL_STAGE2_FP8=1 AITER_MXFP4_INTERMEDIATE=1 \
   python -m aiter.aot.flydsl.mxfp4_moe \
   --csv /path/to/limit5-both-winner.csv --swiglu-limit 5
-
-# Compile only this selected CSV through the shared batch worker pool.
-AITER_MXFP4_TUNE_SWIGLU_LIMIT=5 AITER_FLYDSL_STAGE2_FP8=1 \
-  AITER_MXFP4_INTERMEDIATE=1 FLYDSL_RUNTIME_CACHE_DIR=/path/to/cache \
-  python docs/mxfp4_staged_main_port/scripts/compile_selected.py \
-  --csv /path/to/limit5-both-winner.csv
 ```
-
-The batch script has a guarded main entry so spawned workers can import it
-without restarting collection. Run it from the repo root with that checkout
-on `PYTHONPATH`, or from an environment with the same checkout installed.
 
 The full default `run_aot` model corpus includes Situv2 rows. A custom limit
 rejects those rows; select only the CSVs compatible with that activation limit
