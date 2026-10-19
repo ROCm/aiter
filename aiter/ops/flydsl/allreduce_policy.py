@@ -59,6 +59,10 @@ plus ``FUSED_QR_ROW_ATOMS``. All three fused families live in one slot
 (``QuickAllReduce``). The overrides are
 ``AITER_FLY_AR_FUSED_<ALG>_{MIN,MAX}_BYTES``. The one-shot ladder's ``split``
 rungs run unsplit unless ``AITER_FLY_AR_FUSED_SPLIT=1``.
+
+The fused ladders are also keyed by the hidden size, and are read from
+``fused_allreduce_ladders.json`` (or the file ``AITER_FLY_AR_FUSED_LADDERS``
+names).
 """
 
 from __future__ import annotations
@@ -66,8 +70,10 @@ from __future__ import annotations
 import dataclasses
 import enum
 import functools
+import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 
 logger = logging.getLogger("aiter")
@@ -1045,171 +1051,356 @@ _FUSED_POLICY_BY_KEY = _index(FUSED_FAMILY_POLICIES)
 
 
 # Level 2: configuration ladders
-
-
-# One-shot, ``FusedOneShotRung``. Rungs select by payload, which at a fixed
-# hidden is the token count, so "split the row at M=1, not at M=4" is two rungs.
 #
-#   PCIe  measured on MI350P.
-#   xGMI  measured on MI325X. A split row wins at TP4/TP8 for small M; TP2 never
-#         benefits from splitting it.
-_FUSED_ONESHOT_XGMI = {
-    2: (FusedOneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", split=1),),
-    4: (
-        FusedOneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", split=16),
-        FusedOneShotRung(
-            min_bytes=144 * KiB, atoms=1, grid_cap=128, fanout="peer", split=1
-        ),
-    ),
-    8: (
-        FusedOneShotRung(min_bytes=0, atoms=1, grid_cap=64, fanout="peer", split=16),
-        FusedOneShotRung(
-            min_bytes=56 * KiB, atoms=1, grid_cap=128, fanout="peer", split=16
-        ),
-    ),
-}
-FUSED_ONESHOT_LADDER: dict[tuple[str, str, int], tuple[FusedOneShotRung, ...]] = {
-    # --- gfx942 (MI300X) / xGMI ----------------------------------------------
-    **{("gfx942", "xgmi", ws): rungs for ws, rungs in _FUSED_ONESHOT_XGMI.items()},
-    # --- gfx950 (MI355X) / xGMI ----------------------------------------------
-    # TODO: measured on gfx942; tune on gfx950.
-    **{("gfx950", "xgmi", ws): rungs for ws, rungs in _FUSED_ONESHOT_XGMI.items()},
-    # --- gfx950 (MI350P) / PCIe ----------------------------------------------
-    ("gfx950", "pcie", 2): (
-        FusedOneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", split=1),
-    ),
-    ("gfx950", "pcie", 4): (
-        FusedOneShotRung(min_bytes=0, atoms=2, grid_cap=64, fanout="peer", split=1),
-        FusedOneShotRung(
-            min_bytes=64 * KiB, atoms=1, grid_cap=128, fanout="peer", split=1
-        ),
-        FusedOneShotRung(
-            min_bytes=384 * KiB, atoms=2, grid_cap=32, fanout="peer", split=1
-        ),
-    ),
-    ("gfx950", "pcie", 8): (
-        FusedOneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", split=8),
-        FusedOneShotRung(
-            min_bytes=48 * KiB, atoms=1, grid_cap=32, fanout="peer", split=1
-        ),
-    ),
+# The tables are keyed ``(arch, link, world_size, hidden)``, with
+# ``hidden=None`` for the default ladder; ``FUSED_QR_ROW_ATOMS`` by ``(arch,
+# link, world_size, algorithm, hidden)``.
+
+# The environment variable that names another ladder file.
+FUSED_LADDERS_ENV = "AITER_FLY_AR_FUSED_LADDERS"
+FUSED_LADDERS_JSON = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "fused_allreduce_ladders.json"
+)
+FUSED_LADDERS_SCHEMA_VERSION = 1
+
+# The quantized fused algorithms, whose entries carry ``atoms_per_row``.
+FUSED_QR_ALGORITHMS = ("mesh", "ring")
+
+_BYTES_RE = re.compile(r"^\s*(\d+)\s*(B|KiB|MiB)?\s*$")
+_BYTE_UNITS = {None: 1, "B": 1, "KiB": KiB, "MiB": MiB}
+
+
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _parse_bytes(value, where: str) -> int:
+    if _is_int(value) and value >= 0:
+        return value
+    m = _BYTES_RE.match(value) if isinstance(value, str) else None
+    if m is None:
+        raise ValueError(
+            f"{where}: expected a non-negative integer or '<n> KiB|MiB', "
+            f"got {value!r}"
+        )
+    return int(m[1]) * _BYTE_UNITS[m[2]]
+
+
+# A malformed ladder file raises ``ValueError`` whatever is wrong with it,
+# wrong JSON types included, so a caller handles one exception type.
+
+
+def _check_keys(obj, where: str, required, optional=()) -> None:
+    if not isinstance(obj, dict):
+        got = type(obj).__name__
+        raise ValueError(f"{where}: expected an object, got {got}")  # noqa: TRY004
+    keys = {k for k in obj if not k.startswith("_")}
+    missing = sorted(set(required) - keys)
+    unknown = sorted(keys - set(required) - set(optional))
+    if missing:
+        raise ValueError(f"{where}: missing {missing}")
+    if unknown:
+        raise ValueError(f"{where}: unknown {unknown}")
+
+
+def _check_in(value, legal, where: str) -> None:
+    if not _is_int(value) or value not in legal:
+        raise ValueError(f"{where}: must be one of {legal}, got {value!r}")
+
+
+def _check_grid_cap(rung, where: str) -> None:
+    if not _is_int(rung.grid_cap) or rung.grid_cap < 1:
+        raise ValueError(f"{where}.grid_cap: must be positive, got {rung.grid_cap!r}")
+
+
+def _check_oneshot_rung(rung: FusedOneShotRung, where: str) -> None:
+    _check_in(rung.atoms, SUPPORTED_ATOMS, f"{where}.atoms")
+    _check_in(rung.split, SUPPORTED_SPLITS, f"{where}.split")
+    _check_grid_cap(rung, where)
+    if rung.fanout not in FANOUT_ORDERS:
+        raise ValueError(
+            f"{where}.fanout: must be one of {FANOUT_ORDERS}, got {rung.fanout!r}"
+        )
+
+
+def _two_shot_check(super_tiles):
+    def check(rung: FusedTwoShotRung, where: str) -> None:
+        _check_in(rung.super_tile, super_tiles, f"{where}.super_tile")
+        _check_grid_cap(rung, where)
+
+    return check
+
+
+# The rung record and the rung check of each family in the file.
+_FUSED_FAMILIES = {
+    "oneshot": (FusedOneShotRung, _check_oneshot_rung),
+    "mesh": (FusedTwoShotRung, _two_shot_check(SUPER_TILES)),
+    "ring": (FusedTwoShotRung, _two_shot_check(RING_SUPER_TILES)),
 }
 
-# Mesh, ``FusedTwoShotRung``.
-_FUSED_MESH_XGMI = {
-    2: (FusedTwoShotRung(min_bytes=0, super_tile=1, grid_cap=128),),
-    4: (
-        FusedTwoShotRung(min_bytes=0, super_tile=8, grid_cap=128),
-        FusedTwoShotRung(min_bytes=4 * MiB, super_tile=1, grid_cap=128),
-    ),
-    8: (
-        FusedTwoShotRung(min_bytes=0, super_tile=1, grid_cap=128),
-        FusedTwoShotRung(min_bytes=6 * MiB, super_tile=8, grid_cap=128),
-    ),
-}
-FUSED_MESH_ST_LADDER: dict[tuple[str, str, int], tuple[FusedTwoShotRung, ...]] = {
-    # --- gfx942 (MI300X) / xGMI ----------------------------------------------
-    **{("gfx942", "xgmi", ws): rungs for ws, rungs in _FUSED_MESH_XGMI.items()},
-    # --- gfx950 (MI355X) / xGMI ----------------------------------------------
-    # TODO: measured on gfx942; tune on gfx950.
-    **{("gfx950", "xgmi", ws): rungs for ws, rungs in _FUSED_MESH_XGMI.items()},
-    # --- gfx950 (MI350P) / PCIe ----------------------------------------------
-    ("gfx950", "pcie", 2): (FusedTwoShotRung(min_bytes=0, super_tile=1, grid_cap=64),),
-    ("gfx950", "pcie", 4): (
-        FusedTwoShotRung(min_bytes=0, super_tile=1, grid_cap=32),
-        FusedTwoShotRung(min_bytes=896 * KiB, super_tile=8, grid_cap=128),
-    ),
-    ("gfx950", "pcie", 8): (FusedTwoShotRung(min_bytes=0, super_tile=8, grid_cap=32),),
-}
 
-# Ring, ``FusedTwoShotRung``.
-_FUSED_RING_XGMI = {
-    2: (
-        FusedTwoShotRung(min_bytes=0, super_tile=8, grid_cap=128),
-        FusedTwoShotRung(min_bytes=24 * MiB, super_tile=16, grid_cap=128),
-    ),
-    4: (
-        FusedTwoShotRung(min_bytes=0, super_tile=8, grid_cap=128),
-        FusedTwoShotRung(min_bytes=24 * MiB, super_tile=16, grid_cap=128),
-        FusedTwoShotRung(min_bytes=48 * MiB, super_tile=32, grid_cap=128),
-    ),
-    8: (
-        FusedTwoShotRung(min_bytes=0, super_tile=16, grid_cap=128),
-        FusedTwoShotRung(min_bytes=48 * MiB, super_tile=32, grid_cap=128),
-    ),
-}
-FUSED_RING_ST_LADDER: dict[tuple[str, str, int], tuple[FusedTwoShotRung, ...]] = {
-    # --- gfx942 (MI300X) / xGMI ----------------------------------------------
-    **{("gfx942", "xgmi", ws): rungs for ws, rungs in _FUSED_RING_XGMI.items()},
-    # --- gfx950 (MI355X) / xGMI ----------------------------------------------
-    # TODO: measured on gfx942; tune on gfx950.
-    **{("gfx950", "xgmi", ws): rungs for ws, rungs in _FUSED_RING_XGMI.items()},
-    # --- gfx950 (MI350P) / PCIe ----------------------------------------------
-    ("gfx950", "pcie", 2): (FusedTwoShotRung(min_bytes=0, super_tile=1, grid_cap=128),),
-    ("gfx950", "pcie", 4): (
-        FusedTwoShotRung(min_bytes=0, super_tile=16, grid_cap=128),
-    ),
-    ("gfx950", "pcie", 8): (
-        FusedTwoShotRung(min_bytes=0, super_tile=32, grid_cap=128),
-    ),
-}
+def _parse_rungs(raw, cls, check, where: str) -> tuple:
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(f"{where}.rungs: expected a non-empty list")
+    names = [f.name for f in dataclasses.fields(cls)]
+    rungs = []
+    for i, fields in enumerate(raw):
+        rw = f"{where}.rungs[{i}]"
+        _check_keys(fields, rw, names)
+        values = {name: fields[name] for name in names}
+        values["min_bytes"] = _parse_bytes(values["min_bytes"], f"{rw}.min_bytes")
+        rung = cls(**values)
+        check(rung, rw)
+        rungs.append(rung)
+    floors = [r.min_bytes for r in rungs]
+    if floors[0] != 0 or floors != sorted(set(floors)):
+        raise ValueError(
+            f"{where}: min_bytes must start at 0 and increase, got {floors}"
+        )
+    return tuple(rungs)
 
-# ``atoms_per_row`` of a fused mesh or ring build, per ``(arch, link,
-# world_size, algorithm)``: the portable form of the block knob, since which
-# blocks exist depends on the width and which ``atoms_per_row`` values exist
-# does not. A missing entry takes the widest workgroup the row allows.
-_FUSED_QR_ROW_ATOMS_XGMI = {(2, "ring"): 4, (4, "mesh"): 2, (8, "mesh"): 1}
-FUSED_QR_ROW_ATOMS: dict[tuple[str, str, int, str], int] = {
-    **{("gfx942", "xgmi", *k): v for k, v in _FUSED_QR_ROW_ATOMS_XGMI.items()},
-    # TODO: measured on gfx942; tune on gfx950.
-    **{("gfx950", "xgmi", *k): v for k, v in _FUSED_QR_ROW_ATOMS_XGMI.items()},
-    ("gfx950", "pcie", 2, "mesh"): 4,
-    ("gfx950", "pcie", 2, "ring"): 2,
-    ("gfx950", "pcie", 4, "mesh"): 2,
-    ("gfx950", "pcie", 4, "ring"): 2,
-    ("gfx950", "pcie", 8, "mesh"): 1,
-}
+
+def _parse_hidden(key: str, where: str) -> int:
+    if not key.isdigit() or int(key) <= 0 or str(int(key)) != key:
+        raise ValueError(f"{where}: a width is a positive integer, got {key!r}")
+    return int(key)
+
+
+def _no_duplicate_keys(pairs):
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"duplicate key {key!r}")
+        out[key] = value
+    return out
+
+
+@dataclass(frozen=True)
+class FusedLadders:
+    """The fused ladders of one file, as ``load_fused_ladders`` reads them.
+
+    ``oneshot``, ``mesh`` and ``ring`` map ``(arch, link, world_size, hidden)``
+    to a ladder, ``hidden=None`` being the default. ``row_atoms`` maps ``(arch,
+    link, world_size, algorithm, hidden)`` to ``atoms_per_row`` for the entries
+    that set it.
+    """
+
+    oneshot: dict[tuple, tuple[FusedOneShotRung, ...]]
+    mesh: dict[tuple, tuple[FusedTwoShotRung, ...]]
+    ring: dict[tuple, tuple[FusedTwoShotRung, ...]]
+    row_atoms: dict[tuple, int | None]
+
+
+def load_fused_ladders(path: str) -> FusedLadders:
+    """Read and check the fused ladder file at *path*. Raises ``ValueError``,
+    naming the entry, on anything the engines could not build."""
+    with open(path) as f:
+        try:
+            doc = json.load(f, object_pairs_hook=_no_duplicate_keys)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise ValueError(f"{path}: {exc}") from None
+    _check_keys(doc, path, ("schema_version", "platforms"))
+    if doc["schema_version"] != FUSED_LADDERS_SCHEMA_VERSION:
+        raise ValueError(
+            f"{path}: schema_version {doc['schema_version']!r}, expected "
+            f"{FUSED_LADDERS_SCHEMA_VERSION}"
+        )
+    if not isinstance(doc["platforms"], list):
+        raise ValueError(f"{path}: platforms must be a list")  # noqa: TRY004
+
+    tables = {family: {} for family in _FUSED_FAMILIES}
+    row_atoms = {}
+    for i, plat in enumerate(doc["platforms"]):
+        where = f"{path}: platforms[{i}]"
+        _check_keys(plat, where, ("arch", "link", "world_size", *_FUSED_FAMILIES))
+        arch, link, ws = plat["arch"], plat["link"], plat["world_size"]
+        if arch not in SUPPORTED_ARCHS:
+            raise ValueError(f"{where}.arch: must be one of {SUPPORTED_ARCHS}")
+        if not _is_int(ws):
+            raise ValueError(f"{where}.world_size: expected an integer, got {ws!r}")
+        try:
+            _check_platform(arch, link, ws)
+        except ValueError as exc:
+            raise ValueError(f"{where}: {exc}") from None
+        cell = (arch, link, ws)
+        if (*cell, None) in tables["oneshot"]:
+            raise ValueError(f"{where}: duplicate platform {arch}/{link}/TP{ws}")
+        where = f"{path}: {arch}/{link}/TP{ws}"
+
+        for family, (cls, check) in _FUSED_FAMILIES.items():
+            fw = f"{where}.{family}"
+            spec = plat[family]
+            _check_keys(spec, fw, ("default",), ("hidden",))
+            by_width = spec.get("hidden", {})
+            if not isinstance(by_width, dict):
+                raise ValueError(f"{fw}.hidden: expected an object")  # noqa: TRY004
+            entries = [(None, spec["default"], f"{fw}.default")]
+            entries += [
+                (_parse_hidden(key, f"{fw}.hidden"), entry, f"{fw}.hidden.{key}")
+                for key, entry in by_width.items()
+                if not key.startswith("_")
+            ]
+            qr = family in FUSED_QR_ALGORITHMS
+            for hidden, entry, ew in entries:
+                _check_keys(entry, ew, ("rungs",), ("atoms_per_row",) if qr else ())
+                rungs = _parse_rungs(entry["rungs"], cls, check, ew)
+                if family == "oneshot" and hidden is None:
+                    splits = sorted({r.split for r in rungs} - {1})
+                    if splits:
+                        raise ValueError(
+                            f"{ew}: the default ladder runs at every width, so it "
+                            f"does not split (split=1), got split={splits}"
+                        )
+                tables[family][(*cell, hidden)] = rungs
+                if "atoms_per_row" in entry:
+                    apr = entry["atoms_per_row"]
+                    if apr is not None and (
+                        not _is_int(apr) or apr < 1 or (8 // ws) % apr
+                    ):
+                        raise ValueError(
+                            f"{ew}.atoms_per_row: must divide a rank's "
+                            f"reduce-scatter chunk of {8 // ws} atoms, got {apr!r}"
+                        )
+                    row_atoms[(*cell, family, hidden)] = apr
+    return FusedLadders(row_atoms=row_atoms, **tables)
+
+
+def fused_ladders_path() -> str:
+    """The fused ladder file: ``AITER_FLY_AR_FUSED_LADDERS``, or the shipped
+    one when it is unset."""
+    return os.environ.get(FUSED_LADDERS_ENV, "").strip() or FUSED_LADDERS_JSON
+
+
+def _load_fused_ladders() -> FusedLadders:
+    path = fused_ladders_path()
+    if path != FUSED_LADDERS_JSON:
+        logger.info(
+            "FlyDSL all-reduce: fused ladders from %s=%s", FUSED_LADDERS_ENV, path
+        )
+    return load_fused_ladders(path)
+
+
+FUSED_LADDERS = _load_fused_ladders()
+FUSED_ONESHOT_LADDER = FUSED_LADDERS.oneshot
+FUSED_MESH_ST_LADDER = FUSED_LADDERS.mesh
+FUSED_RING_ST_LADDER = FUSED_LADDERS.ring
+FUSED_QR_ROW_ATOMS = FUSED_LADDERS.row_atoms
+
+
+def _fused_ladder(table: dict, name: str, arch, link: str, world_size: int, hidden):
+    """*hidden*'s ladder in *table*, or the platform's default ladder when the
+    width has none of its own or *hidden* is None."""
+    arch = detect_arch() if arch is None else arch
+    _check_platform(arch, link, int(world_size))
+    cell = (arch, link, int(world_size))
+    if hidden is not None:
+        rungs = table.get((*cell, int(hidden)))
+        if rungs is not None:
+            return rungs
+    rungs = table.get((*cell, None))
+    if rungs is None:
+        raise NoPolicyError(f"no {name} ladder for {arch}/{link}/TP{world_size}")
+    return rungs
 
 
 def fused_oneshot_ladder(
-    *, world_size: int, link: str, arch: str | None = None
+    *, world_size: int, link: str, arch: str | None = None, hidden: int | None = None
 ) -> tuple[FusedOneShotRung, ...]:
-    """The fused one-shot rungs for *(arch, link, world_size)*. *arch*
-    defaults to this host's.
+    """The fused one-shot rungs for *(arch, link, world_size)* at *hidden*:
+    the width's own ladder, or the default one. *arch* defaults to this host's.
 
     A split rung (``split > 1``) is returned as the same rung unsplit unless
     ``AITER_FLY_AR_FUSED_SPLIT=1`` (``fused_split_enabled``): its atoms, grid cap
     and fanout stay, so the unsplit build is the rung's own geometry with the
     whole row on one workgroup.
     """
-    rungs = _ladder(FUSED_ONESHOT_LADDER, "fused one-shot", arch, link, world_size)
+    rungs = _fused_ladder(
+        FUSED_ONESHOT_LADDER, "fused one-shot", arch, link, world_size, hidden
+    )
     if fused_split_enabled():
         return rungs
     return tuple(dataclasses.replace(r, split=1) for r in rungs)
 
 
 def fused_mesh_st_ladder(
-    *, world_size: int, link: str, arch: str | None = None
+    *, world_size: int, link: str, arch: str | None = None, hidden: int | None = None
 ) -> tuple[FusedTwoShotRung, ...]:
-    """The fused mesh rungs for *(arch, link, world_size)*. *arch* defaults to
-    this host's."""
-    return _ladder(FUSED_MESH_ST_LADDER, "fused mesh", arch, link, world_size)
+    """The fused mesh rungs for *(arch, link, world_size)* at *hidden*: the
+    width's own ladder, or the default one. *arch* defaults to this host's."""
+    return _fused_ladder(
+        FUSED_MESH_ST_LADDER, "fused mesh", arch, link, world_size, hidden
+    )
 
 
 def fused_ring_st_ladder(
-    *, world_size: int, link: str, arch: str | None = None
+    *, world_size: int, link: str, arch: str | None = None, hidden: int | None = None
 ) -> tuple[FusedTwoShotRung, ...]:
-    """The fused ring rungs for *(arch, link, world_size)*. *arch* defaults to
-    this host's."""
-    return _ladder(FUSED_RING_ST_LADDER, "fused ring", arch, link, world_size)
+    """The fused ring rungs for *(arch, link, world_size)* at *hidden*: the
+    width's own ladder, or the default one. *arch* defaults to this host's."""
+    return _fused_ladder(
+        FUSED_RING_ST_LADDER, "fused ring", arch, link, world_size, hidden
+    )
 
 
 def fused_qr_row_atoms(
-    *, world_size: int, algorithm: str, link: str, arch: str | None = None
+    *,
+    world_size: int,
+    algorithm: str,
+    link: str,
+    arch: str | None = None,
+    hidden: int | None = None,
 ) -> int | None:
-    """``atoms_per_row`` of a fused *algorithm* build, or None for the default."""
+    """``atoms_per_row`` of a fused *algorithm* build at *hidden*, or None for
+    the widest workgroup the row allows. A width whose entry does not set it
+    takes the default's."""
     arch = detect_arch() if arch is None else arch
-    return FUSED_QR_ROW_ATOMS.get((arch, link, int(world_size), str(algorithm)))
+    key = (arch, link, int(world_size), str(algorithm))
+    if hidden is not None and (*key, int(hidden)) in FUSED_QR_ROW_ATOMS:
+        return FUSED_QR_ROW_ATOMS[(*key, int(hidden))]
+    return FUSED_QR_ROW_ATOMS.get((*key, None))
+
+
+def fused_ladder_hiddens(
+    *, world_size: int, link: str, arch: str | None = None
+) -> tuple[int, ...]:
+    """The widths with a ladder of their own in any fused family, sorted."""
+    arch = detect_arch() if arch is None else arch
+    cell = (arch, link, int(world_size))
+    return tuple(
+        sorted(
+            {
+                key[3]
+                for table in (
+                    FUSED_ONESHOT_LADDER,
+                    FUSED_MESH_ST_LADDER,
+                    FUSED_RING_ST_LADDER,
+                )
+                for key in table
+                if key[:3] == cell and key[3] is not None
+            }
+        )
+    )
+
+
+def fused_platform_ladders(
+    *, world_size: int, link: str, arch: str | None = None
+) -> tuple:
+    """Fused ladders for this platform. Two ranks build the same
+    fused engines at every width exactly when this is equal on both."""
+    kw = {"world_size": world_size, "link": link, "arch": arch}
+    return tuple(
+        (
+            hidden,
+            fused_oneshot_ladder(**kw, hidden=hidden),
+            fused_mesh_st_ladder(**kw, hidden=hidden),
+            fused_ring_st_ladder(**kw, hidden=hidden),
+            *(
+                fused_qr_row_atoms(**kw, algorithm=alg, hidden=hidden)
+                for alg in FUSED_QR_ALGORITHMS
+            ),
+        )
+        for hidden in (None, *fused_ladder_hiddens(**kw))
+    )
 
 
 # Host and environment

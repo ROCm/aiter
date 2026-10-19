@@ -2249,11 +2249,13 @@ def test_one_shot_allreduce_rmsnorm_geom_for_pinned_block_pads():
     for block, split in ((128, 1), (256, 1), (512, 1), (1024, 1), (64, 8)):
         eng = OneShotAllReduceRMSNorm.__new__(OneShotAllReduceRMSNorm)
         eng.block = block
-        eng._ladder = (
-            FusedOneShotRung(
-                min_bytes=0, atoms=1, grid_cap=64, fanout="peer", split=split
-            ),
-        )
+        eng._ladders = {
+            4096: (
+                FusedOneShotRung(
+                    min_bytes=0, atoms=1, grid_cap=64, fanout="peer", split=split
+                ),
+            )
+        }
         if eng.supports_hidden(4096):
             atoms, h_pad, k = OneShotAllReduceRMSNorm._geom_for(eng, 4096, 1, split)
             assert block * atoms * 8 * k == h_pad, (block, atoms, h_pad, k)

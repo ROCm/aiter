@@ -2126,23 +2126,22 @@ def test_quick_allreduce_rmsnorm_production_geometry(
 ):
     """The fused epilogue on the geometry ``FlyDSLAllReduceRMSNorm`` builds.
 
-    Production pins ``atoms_per_row`` from ``FUSED_QR_ROW_ATOMS``; the other
-    tests leave it to the default, the widest block, which is a different build
-    at most widths. Skipped (``skipped`` in the row) where the table has no
-    entry for this (arch, link, tp, algorithm).
+    Production leaves ``atoms_per_row`` to the engine, which takes it per width
+    from ``FUSED_QR_ROW_ATOMS``; a policy entry other than None is a
+    different build from the widest block at most widths. Skipped (``skipped``
+    in the row) where the policy has no ``atoms_per_row`` for this (arch,
+    link, tp, algorithm, hidden).
     """
     apr = fly_policy.fused_qr_row_atoms(
-        world_size=tp, algorithm=algorithm, link=fly_policy.detect_link()
+        world_size=tp,
+        algorithm=algorithm,
+        link=fly_policy.detect_link(),
+        hidden=hidden,
     )
     if apr is None:
         return {"gfx": ARCH, "skipped": True}
     cases = [(t, h) for w, t, h, _ in _FUSED_CASES if w == tp]
-    batch = _fused_batch(
-        (tp, "production", algorithm),
-        cases,
-        algorithm=algorithm,
-        engine_kw={"atoms_per_row": apr},
-    )
+    batch = _fused_batch((tp, "production", algorithm), cases, algorithm=algorithm)
     rows = batch[(tokens, hidden)]
     fails = _fused_sqnr_fails(rows) + _fused_disagree_fails(rows)
     _check(f"{label}/{algorithm}/atoms_per_row={apr}", fails)
@@ -2203,9 +2202,6 @@ def _run_rank_fused_run_ahead(
         rank=rank,
         world_size=tp,
         algorithm=algorithm,
-        atoms_per_row=fly_policy.fused_qr_row_atoms(
-            world_size=tp, algorithm=algorithm, link=fly_policy.detect_link()
-        ),
     )
     eng.min_bytes = 0
     fails = []
@@ -3069,18 +3065,7 @@ def _bench_fused_rank(
     link = fly_policy.detect_link()
     # Built in a fixed order: each engine's IPC exchange is a collective, and
     # so is each width's build (``preload`` below).
-    specs = [
-        (
-            a,
-            a,
-            {
-                "atoms_per_row": fly_policy.fused_qr_row_atoms(
-                    world_size=tp, algorithm=a, link=link
-                )
-            },
-        )
-        for a in algorithms
-    ]
+    specs = [(a, a, {}) for a in algorithms]
     specs += [(name, a, dict(knobs)) for name, a, knobs in extra]
     engines = {}
     for name, algorithm, knobs in specs:

@@ -61,15 +61,7 @@ def _policy_digest(
         link,
         arch,
         policy,
-        fly_policy.fused_oneshot_ladder(world_size=world_size, link=link, arch=arch),
-        fly_policy.fused_mesh_st_ladder(world_size=world_size, link=link, arch=arch),
-        fly_policy.fused_ring_st_ladder(world_size=world_size, link=link, arch=arch),
-        *(
-            fly_policy.fused_qr_row_atoms(
-                world_size=world_size, algorithm=alg, link=link, arch=arch
-            )
-            for alg in ("mesh", "ring")
-        ),
+        fly_policy.fused_platform_ladders(world_size=world_size, link=link, arch=arch),
         fly_policy.fused_hiddens(hiddens),
     )
     digest = hashlib.sha256(repr(parts).encode()).digest()
@@ -256,15 +248,9 @@ class FlyDSLAllReduceRMSNorm:
             return OneShotAllReduceRMSNorm(
                 **common, max_bytes=self._windows[family].inclusive_range()[1]
             )
-        # The policy window is the floor here, not the engine's own.
-        return FlyQuickAllReduceRMSNorm(
-            **common,
-            algorithm=family,
-            atoms_per_row=fly_policy.fused_qr_row_atoms(
-                world_size=self.world_size, algorithm=family, link=self.link
-            ),
-            min_bytes=0,
-        )
+        # The policy window is the floor here, not the engine's own. The
+        # engine takes each width's ``atoms_per_row`` from the policy.
+        return FlyQuickAllReduceRMSNorm(**common, algorithm=family, min_bytes=0)
 
     def _prime_up_front(self, hidden: int) -> None:
         """:meth:`prime` at construction, agreed across ranks."""

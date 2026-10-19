@@ -352,9 +352,11 @@ class OneShotAllReduceRMSNorm:
     the GPU idle. A width with no split geometry for the requested value takes
     the nearest one it has, and a padded width runs unsplit.
 
-    ``atoms``, ``grid_cap``, ``fanout`` and ``split`` each override that field
-    on every rung of the ladder, and ``block`` overrides the geometry of every
-    rung; the knobs left unset keep the ladder's values.
+    Each width runs its own ladder from the policy (``fused_oneshot_ladder``
+    at that hidden), or the policy's default ladder when it has none for the
+    width. ``atoms``, ``grid_cap``, ``fanout`` and ``split`` each override that
+    field on every rung of every width's ladder, and ``block`` overrides the
+    geometry of every rung; the knobs left unset keep the ladder's values.
     """
 
     def __init__(
@@ -426,13 +428,11 @@ class OneShotAllReduceRMSNorm:
             )
             if value is not None
         }
-        self._ladder = tuple(
-            dataclasses.replace(rung, **pins)
-            for rung in fused_oneshot_ladder(
-                world_size=world_size, link=link, arch=arch
-            )
-        )
-        self.split = self._ladder[0].split
+        self._pins = pins
+        self._arch = arch
+        # hidden -> that width's ladder, the policy's for the width or its
+        # default, with the pins applied.
+        self._ladders: dict[int, tuple] = {}
 
         # (hidden, atoms, grid_cap, fanout, h_pad, split) -> (engine, spec)
         self._by_cfg: dict[tuple, tuple] = {}
@@ -522,10 +522,28 @@ class OneShotAllReduceRMSNorm:
         cap = max(split, int(rung.grid_cap) // split * split)
         return (int(hidden), atoms, cap, rung.fanout, h_pad, split)
 
+    def _ladder(self, hidden: int) -> tuple:
+        """The rungs at hidden: the policy's ladder for this width, or its
+        default ladder (``fused_oneshot_ladder``), with the pins applied."""
+        hidden = int(hidden)
+        ladder = self._ladders.get(hidden)
+        if ladder is None:
+            ladder = tuple(
+                dataclasses.replace(rung, **self._pins)
+                for rung in fused_oneshot_ladder(
+                    world_size=self.world_size,
+                    link=self.link,
+                    arch=self._arch,
+                    hidden=hidden,
+                )
+            )
+            self._ladders[hidden] = ladder
+        return ladder
+
     def _build_hidden(self, hidden: int) -> None:
         """Build every rung for hidden dim. Collective: all ranks must call it in
         the same order,."""
-        for rung in self._ladder:
+        for rung in self._ladder(hidden):
             key = self._cfg_key(hidden, rung)
             if key in self._by_cfg:
                 continue
@@ -554,7 +572,7 @@ class OneShotAllReduceRMSNorm:
                 )
 
     def _pick_cfg(self, hidden: int, live_bytes: int) -> tuple:
-        key = self._cfg_key(hidden, select_rung(self._ladder, live_bytes))
+        key = self._cfg_key(hidden, select_rung(self._ladder(hidden), live_bytes))
         if key not in self._by_cfg:
             self._build_hidden(int(hidden))
         return key
@@ -578,7 +596,7 @@ class OneShotAllReduceRMSNorm:
         hidden = int(hidden)
         if any(
             r.split > 1 and self._split_geom_for(hidden, r.atoms, r.split) is not None
-            for r in self._ladder
+            for r in self._ladder(hidden)
         ):
             return True
         if self.block is not None:
@@ -593,7 +611,7 @@ class OneShotAllReduceRMSNorm:
 
     def pads_hidden(self, hidden: int) -> int:
         """``h_pad`` this width would run at, or hidden dim when it needs no padding."""
-        first = self._ladder[0]
+        first = self._ladder(hidden)[0]
         return self._geom_for(int(hidden), first.atoms, first.split)[1]
 
     # -- launch --------------------------------------------------------------
@@ -639,7 +657,7 @@ class OneShotAllReduceRMSNorm:
             pin = (
                 f"block={self.block}"
                 if self.block is not None
-                else f"atoms={[r.atoms for r in self._ladder]}"
+                else f"atoms={[r.atoms for r in self._ladder(hidden)]}"
             )
             raise ValueError(
                 f"no fused build for hidden={hidden} at {pin}: one block "
@@ -765,7 +783,7 @@ class OneShotAllReduceRMSNorm:
         """``_by_cfg`` keys at hidden dim a payload of ``lo..hi`` bytes
         (inclusive) can select, in build order. Builds the width if needed."""
         hidden = int(hidden)
-        floors = [rung.min_bytes for rung in self._ladder]
+        floors = [rung.min_bytes for rung in self._ladder(hidden)]
         picked = {self._pick_cfg(hidden, n) for n in payload_probes(floors, lo, hi)}
         return [key for key in self._by_cfg if key in picked]
 

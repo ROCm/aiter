@@ -10,6 +10,7 @@ Run with ``pytest op_tests/flydsl_tests/test_flydsl_allreduce_policy.py``.
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 from types import SimpleNamespace
 from unittest import mock
@@ -559,13 +560,21 @@ def test_every_platform_has_one_fused_policy():
 
 
 def test_every_platform_has_one_fused_ladder_per_algorithm():
+    """A default ladder per platform and algorithm, and per-width ladders only
+    for platforms that exist."""
     keys = sorted((a, link, ws) for link, ws, a in CELLS)
     for table in (
         P.FUSED_ONESHOT_LADDER,
         P.FUSED_MESH_ST_LADDER,
         P.FUSED_RING_ST_LADDER,
     ):
-        assert sorted(table) == keys
+        assert sorted(k[:3] for k in table if k[3] is None) == keys
+        assert {k[:3] for k in table} <= set(keys)
+
+
+def _widths(link, ws, arch):
+    """``None`` (the default ladder) and every width with a ladder of its own."""
+    return (None, *P.fused_ladder_hiddens(world_size=ws, link=link, arch=arch))
 
 
 @pytest.mark.parametrize("cell", CELLS)
@@ -624,55 +633,96 @@ def test_fused_ladders_are_well_formed(cell):
     """The fused ladders obey the rules of the plain ones, with no ``block``:
     a fused build sizes its workgroup to the token row."""
     link, ws, arch = cell
-    kw = {"world_size": ws, "link": link, "arch": arch}
-    for name, rungs, valid_st in (
-        ("mesh", fused_mesh_st_ladder(**kw), SUPER_TILES),
-        ("ring", fused_ring_st_ladder(**kw), RING_SUPER_TILES),
-    ):
-        assert rungs and rungs[0].min_bytes == 0, name
-        floors = [r.min_bytes for r in rungs]
-        assert floors == sorted(floors), name
-        for r in rungs:
-            assert r.super_tile in valid_st, (name, r)
-            assert r.grid_cap >= 1, (name, r)
+    for hidden in _widths(*cell):
+        kw = {"world_size": ws, "link": link, "arch": arch, "hidden": hidden}
+        for name, rungs, valid_st in (
+            ("mesh", fused_mesh_st_ladder(**kw), SUPER_TILES),
+            ("ring", fused_ring_st_ladder(**kw), RING_SUPER_TILES),
+        ):
+            assert rungs and rungs[0].min_bytes == 0, (name, hidden)
+            floors = [r.min_bytes for r in rungs]
+            assert floors == sorted(floors), (name, hidden)
+            for r in rungs:
+                assert r.super_tile in valid_st, (name, hidden, r)
+                assert r.grid_cap >= 1, (name, hidden, r)
 
-    one = fused_oneshot_ladder(**kw)
-    assert one and one[0].min_bytes == 0
-    floors = [r.min_bytes for r in one]
-    assert floors == sorted(floors)
-    for r in one:
-        assert r.atoms in SUPPORTED_ATOMS, r
-        assert r.grid_cap >= 1, r
-        assert r.fanout in ("peer", "atom"), r
-        assert r.split in SUPPORTED_SPLITS, r
+        one = fused_oneshot_ladder(**kw)
+        assert one and one[0].min_bytes == 0, hidden
+        floors = [r.min_bytes for r in one]
+        assert floors == sorted(floors), hidden
+        for r in one:
+            assert r.atoms in SUPPORTED_ATOMS, (hidden, r)
+            assert r.grid_cap >= 1, (hidden, r)
+            assert r.fanout in ("peer", "atom"), (hidden, r)
+            assert r.split in SUPPORTED_SPLITS, (hidden, r)
+
+
+@pytest.mark.parametrize("cell", CELLS)
+def test_fused_default_oneshot_ladder_does_not_split(cell):
+    """The default one-shot ladder runs at every width, so even with
+    ``AITER_FLY_AR_FUSED_SPLIT=1`` it keeps one workgroup per row."""
+    link, ws, arch = cell
+    with _env(**{P.FUSED_SPLIT_ENV: "1"}):
+        rungs = fused_oneshot_ladder(world_size=ws, link=link, arch=arch)
+    assert all(r.split == 1 for r in rungs), rungs
+
+
+@pytest.mark.parametrize("cell", CELLS)
+def test_fused_width_without_a_ladder_runs_the_default(cell):
+    """A width with no entry of its own, or no width at all, resolves to the
+    platform's default ladder and ``atoms_per_row``; a width with an entry to
+    that entry."""
+    link, ws, arch = cell
+    kw = {"world_size": ws, "link": link, "arch": arch}
+    widths = P.fused_ladder_hiddens(**kw)
+    unknown = max((*widths, 0)) + 1024
+    for lookup, table in (
+        (fused_oneshot_ladder, P.FUSED_ONESHOT_LADDER),
+        (fused_mesh_st_ladder, P.FUSED_MESH_ST_LADDER),
+        (fused_ring_st_ladder, P.FUSED_RING_ST_LADDER),
+    ):
+        default = lookup(**kw)
+        assert lookup(**kw, hidden=unknown) == default
+        for h in widths:
+            own = table.get((arch, link, ws, h))
+            if own is None:
+                assert lookup(**kw, hidden=h) == default
+            elif lookup is not fused_oneshot_ladder:
+                assert lookup(**kw, hidden=h) == own
+    for alg in P.FUSED_QR_ALGORITHMS:
+        default = P.fused_qr_row_atoms(**kw, algorithm=alg)
+        assert default == P.FUSED_QR_ROW_ATOMS.get((arch, link, ws, alg, None))
+        assert P.fused_qr_row_atoms(**kw, algorithm=alg, hidden=unknown) == default
 
 
 def test_fused_oneshot_split_is_opt_in():
     """Without ``AITER_FLY_AR_FUSED_SPLIT=1`` every fused one-shot rung is
     unsplit and otherwise the table's rung; with it, the table's splits."""
     for link, ws, arch in CELLS:
-        kw = {"world_size": ws, "link": link, "arch": arch}
-        table = P.FUSED_ONESHOT_LADDER[(arch, link, ws)]
-        with mock.patch.dict(os.environ):
-            os.environ.pop(P.FUSED_SPLIT_ENV, None)
-            off = P.fused_oneshot_ladder(**kw)
-            os.environ[P.FUSED_SPLIT_ENV] = "0"
-            assert P.fused_oneshot_ladder(**kw) == off
-            os.environ[P.FUSED_SPLIT_ENV] = "1"
-            on = P.fused_oneshot_ladder(**kw)
-        assert on == table
-        assert all(r.split == 1 for r in off)
-        assert off == tuple(dataclasses.replace(r, split=1) for r in table)
+        for hidden in _widths(link, ws, arch):
+            kw = {"world_size": ws, "link": link, "arch": arch, "hidden": hidden}
+            table = P.FUSED_ONESHOT_LADDER[(arch, link, ws, hidden)]
+            with mock.patch.dict(os.environ):
+                os.environ.pop(P.FUSED_SPLIT_ENV, None)
+                off = P.fused_oneshot_ladder(**kw)
+                os.environ[P.FUSED_SPLIT_ENV] = "0"
+                assert P.fused_oneshot_ladder(**kw) == off
+                os.environ[P.FUSED_SPLIT_ENV] = "1"
+                on = P.fused_oneshot_ladder(**kw)
+            assert on == table
+            assert all(r.split == 1 for r in off)
+            assert off == tuple(dataclasses.replace(r, split=1) for r in table)
 
 
 def test_fused_row_atoms_divide_the_chunk():
     """Every ``FUSED_QR_ROW_ATOMS`` entry divides a rank's reduce-scatter
     chunk, ``8 // world_size`` atoms, and names a platform that exists."""
     platforms = {(a, link, ws) for link, ws, a in CELLS}
-    for (arch, link, ws, algorithm), atoms in P.FUSED_QR_ROW_ATOMS.items():
+    for (arch, link, ws, algorithm, _h), atoms in P.FUSED_QR_ROW_ATOMS.items():
         assert (arch, link, ws) in platforms, (arch, link, ws)
         assert algorithm in ("mesh", "ring"), algorithm
-        assert atoms >= 1 and (8 // ws) % atoms == 0, (arch, link, ws, atoms)
+        if atoms is not None:
+            assert atoms >= 1 and (8 // ws) % atoms == 0, (arch, link, ws, atoms)
 
 
 def test_fused_ladder_lookup_rejects_unknown_keys():
@@ -681,6 +731,205 @@ def test_fused_ladder_lookup_rejects_unknown_keys():
             ladder(world_size=4, link="pcie", arch="gfx942")
         with pytest.raises(ValueError):
             ladder(world_size=4, link="nosuchlink", arch="gfx950")
+
+
+# The fused ladder file
+# ---------------------
+
+
+def _oneshot_rung(min_bytes, split=1):
+    return {
+        "min_bytes": min_bytes,
+        "atoms": 1,
+        "grid_cap": 128,
+        "fanout": "peer",
+        "split": split,
+    }
+
+
+def _ladder_doc():
+    """A one-platform ladder file: per-width entries for the one-shot (7168)
+    and the mesh (4096), none for the ring."""
+    plat = {
+        "arch": "gfx950",
+        "link": "pcie",
+        "world_size": 4,
+        "_comment": "comments are ignored",
+        "oneshot": {
+            "default": {"rungs": [_oneshot_rung(0)]},
+            "hidden": {
+                "7168": {"rungs": [_oneshot_rung(0, split=7), _oneshot_rung("48 KiB")]}
+            },
+        },
+        "mesh": {
+            "default": {
+                "atoms_per_row": 2,
+                "rungs": [
+                    {"min_bytes": 0, "super_tile": 1, "grid_cap": 32},
+                    {"min_bytes": "1 MiB", "super_tile": 8, "grid_cap": 128},
+                ],
+            },
+            "hidden": {
+                "4096": {"rungs": [{"min_bytes": 0, "super_tile": 8, "grid_cap": 64}]}
+            },
+        },
+        "ring": {
+            "default": {"rungs": [{"min_bytes": 0, "super_tile": 16, "grid_cap": 128}]}
+        },
+    }
+    return {"schema_version": P.FUSED_LADDERS_SCHEMA_VERSION, "platforms": [plat]}
+
+
+def _write_ladders(tmp_path, doc) -> str:
+    path = tmp_path / "ladders.json"
+    path.write_text(doc if isinstance(doc, str) else json.dumps(doc))
+    return str(path)
+
+
+def test_fused_ladder_file_reads_what_it_says(tmp_path):
+    got = P.load_fused_ladders(_write_ladders(tmp_path, _ladder_doc()))
+    cell = ("gfx950", "pcie", 4)
+    assert got.oneshot[(*cell, 7168)] == (
+        P.FusedOneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", split=7),
+        P.FusedOneShotRung(
+            min_bytes=48 * P.KiB, atoms=1, grid_cap=128, fanout="peer", split=1
+        ),
+    )
+    assert got.mesh[(*cell, None)][1] == P.FusedTwoShotRung(
+        min_bytes=P.MiB, super_tile=8, grid_cap=128
+    )
+    assert sorted(got.oneshot, key=str) == [(*cell, 7168), (*cell, None)]
+    assert sorted(got.mesh, key=str) == [(*cell, 4096), (*cell, None)]
+    assert list(got.ring) == [(*cell, None)]
+    assert got.row_atoms == {(*cell, "mesh", None): 2}
+
+
+def test_fused_lookups_read_the_file(tmp_path):
+    """The lookups take a width's own ladder where it has one and the default
+    elsewhere; a width's entry without ``atoms_per_row`` takes the default's."""
+    got = P.load_fused_ladders(_write_ladders(tmp_path, _ladder_doc()))
+    kw = {"world_size": 4, "link": "pcie", "arch": "gfx950"}
+    with (
+        mock.patch.multiple(
+            P,
+            FUSED_ONESHOT_LADDER=got.oneshot,
+            FUSED_MESH_ST_LADDER=got.mesh,
+            FUSED_RING_ST_LADDER=got.ring,
+            FUSED_QR_ROW_ATOMS=got.row_atoms,
+        ),
+        _env(**{P.FUSED_SPLIT_ENV: "1"}),
+    ):
+        assert fused_oneshot_ladder(**kw, hidden=7168)[0].split == 7
+        assert fused_oneshot_ladder(**kw, hidden=4096) == fused_oneshot_ladder(**kw)
+        assert fused_mesh_st_ladder(**kw, hidden=4096)[0].super_tile == 8
+        assert fused_mesh_st_ladder(**kw, hidden=7168) == fused_mesh_st_ladder(**kw)
+        assert P.fused_qr_row_atoms(**kw, algorithm="mesh", hidden=4096) == 2
+        assert P.fused_qr_row_atoms(**kw, algorithm="ring", hidden=4096) is None
+        assert P.fused_ladder_hiddens(**kw) == (4096, 7168)
+        assert [h for h, *_ in P.fused_platform_ladders(**kw)] == [None, 4096, 7168]
+        with pytest.raises(P.NoPolicyError):
+            fused_oneshot_ladder(world_size=8, link="pcie", arch="gfx950", hidden=7168)
+
+
+def _set(path, value):
+    """Set the entry at *path* (keys and indices into the platform) to
+    *value*, or delete it when *value* is ``_DROP``."""
+
+    def edit(plat):
+        *head, last = path
+        node = plat
+        for key in head:
+            node = node[key]
+        if value is _DROP:
+            del node[last]
+        else:
+            node[last] = value
+
+    return edit
+
+
+_DROP = object()
+_D1 = ("oneshot", "default", "rungs", 0)
+_MESH = ("mesh", "default")
+
+
+@pytest.mark.parametrize(
+    "edit, match",
+    [
+        (_set((*_D1, "split"), 7), "does not split"),
+        (_set((*_MESH, "rungs", 0, "min_bytes"), 64), "start at 0"),
+        (_set((*_MESH, "rungs", 1, "min_bytes"), 0), "increase"),
+        (_set((*_MESH, "rungs", 0, "super_tile"), 16), "super_tile"),
+        (_set(("ring", "default", "rungs", 0, "super_tile"), 2), "super_tile"),
+        (_set(("ring", "default", "rungs", 0, "block"), 256), "unknown"),
+        (_set(("ring", "default", "rungs", 0, "grid_cap"), _DROP), "missing"),
+        (_set(("ring", "default", "rungs", 0, "grid_cap"), 0), "grid_cap"),
+        (_set(("oneshot", "hidden", "7168", "rungs", 0, "split"), 3), "split"),
+        (_set((*_D1, "atoms"), 3), "atoms"),
+        (_set((*_D1, "fanout"), "ring"), "fanout"),
+        (_set((*_D1, "min_bytes"), "0 KB"), "KiB"),
+        (_set((*_MESH, "atoms_per_row"), 4), "atoms_per_row"),
+        (_set(("oneshot", "default", "atoms_per_row"), 1), "unknown"),
+        (_set(("oneshot", "hidden", "07168"), {"rungs": [_oneshot_rung(0)]}), "width"),
+        (_set(("oneshot", "hidden", "-1"), {"rungs": [_oneshot_rung(0)]}), "width"),
+        (_set(("ring", "default", "rungs"), []), "non-empty"),
+        (_set(("ring",), _DROP), "missing"),
+        (_set(("link",), "nvlink"), "link"),
+        (_set(("arch",), "gfx942"), "PCIe"),
+    ],
+)
+def test_fused_ladder_file_rejects(tmp_path, edit, match):
+    doc = _ladder_doc()
+    edit(doc["platforms"][0])
+    with pytest.raises(ValueError, match=match):
+        P.load_fused_ladders(_write_ladders(tmp_path, doc))
+
+
+def test_fused_ladder_file_rejects_duplicates_and_other_schemas(tmp_path):
+    doc = _ladder_doc()
+    doc["platforms"].append(doc["platforms"][0])
+    with pytest.raises(ValueError, match="duplicate platform"):
+        P.load_fused_ladders(_write_ladders(tmp_path, doc))
+
+    text = json.dumps(_ladder_doc()).replace(
+        '"hidden": {"7168": ', '"hidden": {"7168": {"rungs": []}, "7168": ', 1
+    )
+    with pytest.raises(ValueError, match="duplicate key '7168'"):
+        P.load_fused_ladders(_write_ladders(tmp_path, text))
+
+    doc = _ladder_doc()
+    doc["schema_version"] = P.FUSED_LADDERS_SCHEMA_VERSION + 1
+    with pytest.raises(ValueError, match="schema_version"):
+        P.load_fused_ladders(_write_ladders(tmp_path, doc))
+
+
+def test_fused_ladder_file_env_override(tmp_path):
+    """``AITER_FLY_AR_FUSED_LADDERS`` replaces the shipped file, read when the
+    policy module is imported."""
+    import subprocess
+    import sys
+
+    with _env(**{P.FUSED_LADDERS_ENV: ""}):
+        assert P.fused_ladders_path() == P.FUSED_LADDERS_JSON
+    path = _write_ladders(tmp_path, _ladder_doc())
+    with _env(**{P.FUSED_LADDERS_ENV: path}):
+        assert P.fused_ladders_path() == path
+        out = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from aiter.ops.flydsl import allreduce_policy as P; "
+                    "print(sorted(P.FUSED_ONESHOT_LADDER, key=str))"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    assert out.strip().splitlines()[-1] == str(
+        [("gfx950", "pcie", 4, 7168), ("gfx950", "pcie", 4, None)]
+    )
 
 
 @pytest.mark.parametrize("cell", CELLS)
@@ -795,15 +1044,22 @@ def test_resolve_fused_rejects_unknown_keys():
         _resolve_fused(link="pcie", arch="gfx942")
 
 
-def _policy_agreement_rank(rank, init_method, queue):
-    """One rank: build the fused backend with a window override that only rank 1
-    has. The arch and link are fixed so the host does not matter; the ranks
-    meet in the agreement check, before any engine is built."""
+def _policy_agreement_rank(rank, init_method, queue, differ_by):
+    """One rank: build the fused backend with a window override (*differ_by*
+    ``"window"``) or a width's ladder (``"width"``) that only rank 1 has. The
+    arch and link are fixed so the host does not matter; the ranks meet in the
+    agreement check, before any engine is built."""
     import torch.distributed as dist
 
     os.environ["AITER_FLY_AR"] = "1"
-    if rank == 1:
+    if rank == 1 and differ_by == "window":
         os.environ["AITER_FLY_AR_FUSED_ONESHOT_MAX_BYTES"] = str(1 << 20)
+    if rank == 1 and differ_by == "width":
+        P.FUSED_ONESHOT_LADDER[("gfx950", "pcie", 2, 5120)] = (
+            P.FusedOneShotRung(
+                min_bytes=0, atoms=1, grid_cap=64, fanout="peer", split=1
+            ),
+        )
     dist.init_process_group("gloo", init_method=init_method, world_size=2, rank=rank)
     from aiter.dist.device_communicators import flydsl_backends as B
 
@@ -827,9 +1083,11 @@ def _policy_agreement_rank(rank, init_method, queue):
     dist.destroy_process_group()
 
 
-def test_fused_backend_declines_together_when_policies_differ():
-    """Ranks that resolved different windows must all decline, not deadlock in
-    the IPC exchange that building an engine starts."""
+@pytest.mark.parametrize("differ_by", ("window", "width"))
+def test_fused_backend_declines_together_when_policies_differ(differ_by):
+    """Ranks that resolved different windows, or different ladders at any
+    width, must all decline, not deadlock in the IPC exchange that building an
+    engine starts."""
     import torch.multiprocessing as mp
 
     from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
@@ -838,7 +1096,10 @@ def test_fused_backend_declines_together_when_policies_differ():
     queue = ctx.Queue()
     init_method = get_distributed_init_method(get_ip(), get_open_port())
     procs = [
-        ctx.Process(target=_policy_agreement_rank, args=(r, init_method, queue))
+        ctx.Process(
+            target=_policy_agreement_rank,
+            args=(r, init_method, queue, differ_by),
+        )
         for r in range(2)
     ]
     for p in procs:

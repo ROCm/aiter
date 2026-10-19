@@ -56,6 +56,7 @@ from .allreduce_policy import (
     TwoShotRung,
     default_codecs,
     fused_mesh_st_ladder,
+    fused_qr_row_atoms,
     fused_ring_st_ladder,
     mesh_st_ladder,
     quantized_floor,
@@ -600,12 +601,15 @@ class FlyQuickAllReduceRMSNorm:
 
     ``link`` selects the super-tile ladder (``FUSED_MESH_ST_LADDER``,
     ``FUSED_RING_ST_LADDER``), as in ``FlyQuickAllReduce``, and is detected
-    from the KFD topology when not given. ``min_bytes`` is the payload below
-    which ``allreduce_rmsnorm`` refuses to run, defaulting to where the fused
+    from the KFD topology when not given. Each width runs its own ladder and
+    ``atoms_per_row`` from the policy, or the policy's default ones when it has
+    none for the width. ``min_bytes`` is the payload below which
+    ``allreduce_rmsnorm`` refuses to run, defaulting to where the fused
     policy's mesh and ring windows start (``quantized_floor``).
 
     ``super_tile`` and ``grid_cap`` each override that field on every rung of
-    the ladder; the knobs left unset keep the ladder's values.
+    every width's ladder, and ``block`` or ``atoms_per_row`` the row geometry
+    of every width; the knobs left unset keep the policy's values.
     """
 
     #: Fused launches are capped at one workgroup per CU. That is not a
@@ -677,8 +681,8 @@ class FlyQuickAllReduceRMSNorm:
         self.ag_codec = ag_codec
         self.inbox_memory = resolved_inbox
         self.arch = arch
-        # Threads per block, or None for the widest this width admits. It is not
-        # a free knob: one workgroup covers one token row.
+        # Threads per block, or None for the policy's ``atoms_per_row``. It is
+        # not a free knob: one workgroup covers one token row.
         if block is not None and atoms_per_row is not None:
             raise ValueError("pin block or atoms_per_row, not both")
         self.block = None if block is None else int(block)
@@ -708,28 +712,15 @@ class FlyQuickAllReduceRMSNorm:
             raise ValueError(f"min_bytes must be non-negative, got {self.min_bytes}")
         self.max_bytes = max_bytes
 
-        # Rungs to build, as ``(super_tile, grid_cap)``, from the fused ladder.
         # A pinned ``super_tile`` or ``grid_cap`` overrides that field on every
-        # rung.
-        pins = {
+        # rung of every width's ladder.
+        self._pins = {
             name: int(value)
             for name, value in (("super_tile", super_tile), ("grid_cap", grid_cap))
             if value is not None
         }
-        self._ladder = tuple(
-            dataclasses.replace(r, **pins)
-            for r in algo.fused_st_ladder(
-                world_size=self.world_size, link=link, arch=arch
-            )
-        )
-        self._rungs = [(r.super_tile, r.grid_cap) for r in self._ladder]
-        # ST=1 is the fallback when a payload has fewer tiles than the chosen
-        # super-tile, exactly as in FlyQuickAllReduce.
-        by_cap = {}
-        for st, rung_cap in self._rungs:
-            by_cap.setdefault(st, rung_cap)
-        by_cap.setdefault(1, min(by_cap.values()))
-        self._by_cap = dict(sorted(by_cap.items()))
+        # hidden -> (that width's ladder, its grid cap per super-tile).
+        self._ladders: dict[int, tuple[tuple, dict[int, int]]] = {}
 
         # (hidden, super_tile) -> (engine, spec)
         self._by_cfg: dict[tuple, tuple] = {}
@@ -771,26 +762,38 @@ class FlyQuickAllReduceRMSNorm:
             opts = tuple(o for o in opts if o[0] == self.block)
         return opts
 
+    def _row_atoms(self, hidden: int) -> int | None:
+        """``atoms_per_row`` wanted at hidden dim: the pinned one, else the
+        policy's for this width (``fused_qr_row_atoms``), else None for the
+        widest block the row admits. A pinned ``block`` wants none."""
+        if self.atoms_per_row is not None or self.block is not None:
+            return self.atoms_per_row
+        return fused_qr_row_atoms(
+            world_size=self.world_size,
+            algorithm=self._algo.name,
+            link=self.link,
+            arch=self.arch,
+            hidden=int(hidden),
+        )
+
     def _geom_for(self, hidden: int) -> tuple[int, int, int]:
         """``(block, atoms_per_row, h_pad)`` for hidden dim.
 
         A width with a native geometry resolves exactly. A width without one
-        falls to the padded set, least wire volume first, with a pinned ``atoms_per_row``
-        breaking ties among equally-padded candidates.
+        falls to the padded set, least wire volume first, with the wanted
+        ``atoms_per_row`` (``_row_atoms``) breaking ties among equally-padded
+        candidates.
         """
         hidden = int(hidden)
+        want = self._row_atoms(hidden)
         if self._native_opts(hidden):
             block, apr = quick_reduce_row_block_for(
                 hidden,
                 self.world_size,
                 block=self.block,
-                atoms_per_row=self.atoms_per_row,
+                atoms_per_row=want,
             )
-            if (
-                self.atoms_per_row is not None
-                and apr != self.atoms_per_row
-                and hidden not in self._apr_substituted
-            ):
+            if want is not None and apr != want and hidden not in self._apr_substituted:
                 # The width has no block for the requested atoms_per_row,
                 # so it takes the earest it has.
                 self._apr_substituted.add(hidden)
@@ -799,7 +802,7 @@ class FlyQuickAllReduceRMSNorm:
                     "world_size=%d; building atoms_per_row=%d (block=%d) instead.",
                     self._algo.name,
                     hidden,
-                    self.atoms_per_row,
+                    want,
                     self.world_size,
                     apr,
                     block,
@@ -813,13 +816,12 @@ class FlyQuickAllReduceRMSNorm:
                 hidden,
                 self.world_size,
                 block=self.block,
-                atoms_per_row=self.atoms_per_row,
+                atoms_per_row=want,
             )
             return block, apr, hidden
         tied = [o for o in opts if o[2] == opts[0][2]]
-        if self.atoms_per_row is not None:
-            want = int(self.atoms_per_row)
-            return min(tied, key=lambda o: (abs(o[1] - want), o[1]))
+        if want is not None:
+            return min(tied, key=lambda o: (abs(o[1] - int(want)), o[1]))
         return tied[0]
 
     def pads_hidden(self, hidden: int) -> int:
@@ -848,6 +850,32 @@ class FlyQuickAllReduceRMSNorm:
         dist.all_reduce(shared, op=dist.ReduceOp.MIN, group=self.group)
         return max(1, int(shared.item()))
 
+    def _ladder(self, hidden: int) -> tuple[tuple, dict[int, int]]:
+        """``(rungs, grid cap per super-tile)`` at *hidden*: the policy's
+        ladder for this width, or its default ladder, with the pins applied.
+
+        ST=1 is always built: it is the fallback when a payload has fewer
+        tiles than the chosen super-tile.
+        """
+        hidden = int(hidden)
+        got = self._ladders.get(hidden)
+        if got is None:
+            rungs = tuple(
+                dataclasses.replace(r, **self._pins)
+                for r in self._algo.fused_st_ladder(
+                    world_size=self.world_size,
+                    link=self.link,
+                    arch=self.arch,
+                    hidden=hidden,
+                )
+            )
+            by_cap = {}
+            for r in rungs:
+                by_cap.setdefault(r.super_tile, r.grid_cap)
+            by_cap.setdefault(1, min(by_cap.values()))
+            got = self._ladders[hidden] = (rungs, dict(sorted(by_cap.items())))
+        return got
+
     def _build_hidden(self, hidden: int) -> None:
         """Build every rung for *hidden*.
 
@@ -860,7 +888,8 @@ class FlyQuickAllReduceRMSNorm:
             # Resolve again for the message: it names the constraint that failed.
             quick_reduce_row_block_at(hidden, self.world_size, self.block)
         block, _atoms_per_row, h_pad = self._geom_for(hidden)
-        for st in self._by_cap:
+        _rungs, by_cap = self._ladder(hidden)
+        for st, rung_cap in by_cap.items():
             key = (hidden, st)
             if key in self._by_cfg:
                 continue
@@ -868,7 +897,7 @@ class FlyQuickAllReduceRMSNorm:
                 world_size=self.world_size,
                 rank=self.rank,
                 super_tile=st,
-                grid=self._grid_for(st, self._by_cap[st], block),
+                grid=self._grid_for(st, rung_cap, block),
                 inbox_memory=self.inbox_memory,
                 rs_codec=self.rs_codec,
                 ag_codec=self.ag_codec,
@@ -923,14 +952,15 @@ class FlyQuickAllReduceRMSNorm:
         return self._by_cfg[key][1]["hbm_tile_bytes"]
 
     def _pick_cfg(self, hidden: int, live_bytes: int, num_tiles: int) -> tuple:
-        want = select_rung(self._ladder, live_bytes).super_tile
+        rungs, by_cap = self._ladder(hidden)
+        want = select_rung(rungs, live_bytes).super_tile
         if want != 1:
             if self._batch_publishes:
                 want = want if num_tiles >= want else 1
             else:
                 key = (int(hidden), want)
                 built = self._by_cfg.get(key)
-                grid = built[0].grid if built else self._by_cap[want]
+                grid = built[0].grid if built else by_cap[want]
                 want = want if num_tiles > grid else 1
         key = (int(hidden), want)
         if key not in self._by_cfg:
@@ -1104,7 +1134,7 @@ class FlyQuickAllReduceRMSNorm:
         (inclusive) can select, in build order. Builds the width if needed."""
         hidden = int(hidden)
         tile_bytes = self._tile_bytes(hidden)
-        floors = [rung.min_bytes for rung in self._ladder]
+        floors = [rung.min_bytes for rung in self._ladder(hidden)[0]]
         picked = {
             self._pick_cfg(hidden, n, max(1, -(-n // tile_bytes)))
             for n in payload_probes(floors, lo, hi)
