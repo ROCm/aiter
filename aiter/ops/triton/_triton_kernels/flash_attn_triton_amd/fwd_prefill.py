@@ -19,6 +19,7 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     is_fp8,
     remap_xcd,
 )
+from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 FWD_PREFILL_AUTOTUNE_KEYS = [
     "IS_CAUSAL",
@@ -245,7 +246,12 @@ def get_fwd_prefill_configs(mode: AutotuneMode):
         return configs
 
 
-fwd_prefill_autotune_configs = get_fwd_prefill_configs(AUTOTUNE)
+fwd_prefill_autotune_configs = autotune_configs(
+    "FLASH_ATTN",
+    get_fwd_prefill_configs(AUTOTUNE),
+    env="FLASH_ATTENTION_TRITON_AMD_AUTOTUNE",
+    default="1",
+)
 
 
 @triton.jit
@@ -1947,4 +1953,5 @@ def attention_forward_prefill_triton_impl(
         FORCE_MASKING=force_masking,
         NUM_XCD=num_xcd,
         HEAD_STRIDE_ALIGNED_8=head_stride_aligned_8,
+        enable_fp_fusion=True,
     )

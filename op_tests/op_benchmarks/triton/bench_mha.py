@@ -369,7 +369,7 @@ def model_benchmark_configs(
             if config["num_key_value_heads"] is None
             else config["num_key_value_heads"]
         )
-        HEAD_DIM = config["hidden_size"] // HQ
+        HEAD_DIM = config.get("head_dim", config["hidden_size"] // HQ)
         if args.sq:
             b = args.b if args.b else 1
             causal = args.causal if args.causal is not None else True
@@ -644,8 +644,7 @@ def run_benchmark(run: BenchRun):
         is_decode = function == "fwd_kvcache"
         is_gluon = run.backend == "gluon"
         requires_grad = is_bwd
-        # The Gluon backend is forward-only and returns just the output tensor.
-        return_lse = not is_gluon
+        return_lse = True
         return_attn_probs = False
         has_pe = D_HEAD > D_HEAD_V
         # Dense iff BOTH bounds are off (-1); either set = a window (matches the kernel's

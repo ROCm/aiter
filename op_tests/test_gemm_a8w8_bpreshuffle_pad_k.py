@@ -14,6 +14,33 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def test_preshuffle_flat_buffers_stay_below_4gib():
+    from aiter.ops.flydsl.gemm_kernels import (
+        _check_preshuffle_flat_buffer_capacity,
+    )
+
+    # The output is just under 4 GiB; masking the padded M rows keeps this legal.
+    _check_preshuffle_flat_buffer_capacity(8161, 262192, 512, 1, 1, 2)
+
+    with pytest.raises(RuntimeError, match="output buffer.*fewer than 4 GiB"):
+        _check_preshuffle_flat_buffer_capacity(8191, 262192, 512, 1, 1, 2)
+    with pytest.raises(RuntimeError, match="A buffer.*fewer than 4 GiB"):
+        _check_preshuffle_flat_buffer_capacity(65536, 16, 65536, 1, 1, 2)
+    with pytest.raises(RuntimeError, match="B buffer.*fewer than 4 GiB"):
+        _check_preshuffle_flat_buffer_capacity(16, 65536, 65536, 1, 1, 2)
+
+
+def test_two_wave_vgpr_estimate_uses_128_threads():
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
+        _estimate_max_wpe,
+    )
+
+    # Both tiles hold eight accumulator VGPRs per thread: 32x32 / 128 threads
+    # for the 2-wave path and 32x64 / 256 threads for the standard 4-wave path.
+    assert _estimate_max_wpe(32, 32, 512, total_vgpr=12) == 1
+    assert _estimate_max_wpe(32, 64, 512, total_vgpr=12) == 1
+
+
 def test_shuffle_weight_pad_k_to_pads_last_dim():
     weight = torch.zeros((16, 96), device="cuda", dtype=dtypes.fp8)
 

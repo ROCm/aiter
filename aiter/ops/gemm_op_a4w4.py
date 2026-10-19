@@ -11,6 +11,7 @@ from aiter import logger
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
+from ..jit.utils.asm_guard import require_gfx1250_asm
 from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..ops.gemm_op_common import get_padded_m
@@ -191,7 +192,7 @@ def gemm_a4w4(
     k = A.shape[-1] * 2
     gfx_arch = get_gfx()
     if gfx_arch in ["gfx1250"]:
-        # F4GEMM is kept on a separate dispatch (preload kargs layout).
+        require_gfx1250_asm("gemm_a4w4")
         out = _f4gemm_asm_dispatch(
             A,
             B,
@@ -394,6 +395,7 @@ def gemm_mxfp4_asm(
     ``(out_fp8 [M,N], scale_e8m0)``. ``scale_e8m0`` is in the PACKED
     ``(M/64,N//128,16,4)`` layout -- unpack via
     :func:`unpack_mxfp8_out_scale`."""
+    require_gfx1250_asm("gemm_mxfp4_asm")
     M = A.shape[0]
     N = B.shape[0]
     out = _alloc_f4gemm_out(M, N, dtype, A.device)
@@ -427,6 +429,7 @@ def gemm_nvfp4_asm(
     ``(out_fp8 [M,N], scale_e8m0)``. ``scale_e8m0`` is in the PACKED
     ``(M/64,N//128,16,4)`` layout -- unpack via
     :func:`unpack_mxfp8_out_scale`."""
+    require_gfx1250_asm("gemm_nvfp4_asm")
     M = A.shape[0]
     N = B.shape[0]
     out = _alloc_f4gemm_out(M, N, dtype, A.device)
@@ -502,6 +505,7 @@ def gemm_a4w4o8(
     assert (
         get_gfx() in _GFX1250
     ), f"gemm_a4w4o8 (mxfp8 output) is only supported on gfx1250, got {get_gfx()}"
+    require_gfx1250_asm("gemm_a4w4o8")
     o, s = _f4gemm_asm_dispatch(
         A,
         B,
@@ -520,6 +524,9 @@ def gemm_a4w4o8(
     return o.view(*lead, o.shape[-1]), s
 
 
+# torch_compile_guard infers each op's schema from the decorated function, then
+# hands the fake the very same arguments, so a fake has to mirror its own op's
+# signature -- the two ops below disagree past `Out` and cannot share one.
 def gen_gemm_a4w4_blockscale_fake_tensors(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -527,13 +534,45 @@ def gen_gemm_a4w4_blockscale_fake_tensors(
     w_scale: torch.Tensor,
     Out: torch.Tensor,
     splitK: int = 0,
-) -> torch.Tensor:
-    return Out
+    kernelName: str = "",
+) -> None:
+    return None
 
 
+def gen_gemm_a4w4_blockscale_tune_fake_tensors(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    kernelId: int = 0,
+    splitK: int = 0,
+) -> None:
+    return None
+
+
+# The C++ side of both ops is torch-free: it takes pybind aiter_tensor_t and
+# writes into Out in place.  `develop=True` makes core.py convert every
+# torch.Tensor argument via torch_to_aiter_pybind() and push the current stream
+# through _set_current_hip_stream() before the call.  The public wrappers below
+# return Out so callers still get a torch.Tensor.
 @compile_ops(
-    "module_gemm_a4w4_blockscale", gen_fake=gen_gemm_a4w4_blockscale_fake_tensors
+    "module_gemm_a4w4_blockscale",
+    fc_name="gemm_a4w4_blockscale",
+    gen_fake=gen_gemm_a4w4_blockscale_fake_tensors,
+    develop=True,
 )
+def _gemm_a4w4_blockscale(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    splitK: int = 0,
+    kernelName: str = "",
+) -> None: ...
+
+
 def gemm_a4w4_blockscale(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -542,14 +581,28 @@ def gemm_a4w4_blockscale(
     Out: torch.Tensor,
     splitK: int = 0,
     kernelName: str = "",
-) -> Tensor: ...
+) -> Tensor:
+    _gemm_a4w4_blockscale(XQ, WQ, x_scale, w_scale, Out, splitK, kernelName)
+    return Out
 
 
 @compile_ops(
     "module_gemm_a4w4_blockscale_tune",
     fc_name="gemm_a4w4_blockscale_tune",
-    gen_fake=gen_gemm_a4w4_blockscale_fake_tensors,
+    gen_fake=gen_gemm_a4w4_blockscale_tune_fake_tensors,
+    develop=True,
 )
+def _gemm_a4w4_blockscale_tune(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    kernelId: int,
+    splitK: int = 0,
+) -> None: ...
+
+
 def gemm_a4w4_blockscale_tune(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -558,4 +611,6 @@ def gemm_a4w4_blockscale_tune(
     Out: torch.Tensor,
     kernelId: int,
     splitK: int = 0,
-) -> Tensor: ...
+) -> Tensor:
+    _gemm_a4w4_blockscale_tune(XQ, WQ, x_scale, w_scale, Out, kernelId, splitK)
+    return Out
