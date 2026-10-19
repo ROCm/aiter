@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import torch
 import triton
 
@@ -122,6 +124,15 @@ def batched_gemm_bf16(
         waves_per_eu = config["waves_per_eu"]
         cache_modifier = config.get("cache_modifier", None)
         NUM_KSPLIT = config.get("NUM_KSPLIT", 1)
+        # An fp8 (8-bit) YQ relies on the GEMM epilogue's fp32 -> bf16 -> fp8
+        # round to stay bit-identical to the split path (bf16 epilogue + fp8
+        # rope cast) -- the bf16-absorb MLA q_nope-into-q_out case. Split-K
+        # instead writes fp32 partials and the shared reduce kernel casts
+        # fp32 -> fp8 directly, bypassing that round, so force a single K-slice
+        # for fp8 outputs. The affected GEMM's K (kv_lora_rank) is small, so
+        # disabling split-K here costs no measurable perf.
+        if NUM_KSPLIT > 1 and YQ is not None and YQ.element_size() == 1:
+            NUM_KSPLIT = 1
         SPLITK_BLOCK_SIZE = triton.cdiv(K, NUM_KSPLIT)
 
         num_k_tiles = triton.cdiv(SPLITK_BLOCK_SIZE, BLOCK_K)
@@ -193,6 +204,22 @@ def batched_gemm_bf16(
         num_ksplit = NUM_KSPLIT
         splitk_block_size = SPLITK_BLOCK_SIZE
 
+        # TDM-store epilogue (bandwidth_bound only): needs a single K split, a
+        # unit-stride output N dim, and a 16-byte-aligned base and batch/row
+        # strides. Other output views use direct stores.
+        # AITER_BATCHED_BF16_TDM_STORE=0 disables it.
+        extra_kwargs = {}
+        if kernel_type == "bandwidth_bound":
+            elem_bytes = YQ.element_size()
+            extra_kwargs["TDM_STORE"] = (
+                num_ksplit == 1
+                and YQ.stride(2) == 1
+                and YQ.data_ptr() % 16 == 0
+                and (YQ.stride(0) * elem_bytes) % 16 == 0
+                and (YQ.stride(1) * elem_bytes) % 16 == 0
+                and os.environ.get("AITER_BATCHED_BF16_TDM_STORE", "1") == "1"
+            )
+
         _KERNEL_MAP[kernel_type][grid](
             XQ,
             WQ,
@@ -228,6 +255,7 @@ def batched_gemm_bf16(
             num_warps=num_warps,
             waves_per_eu=waves_per_eu,
             cache_modifier=cache_modifier,
+            **extra_kwargs,
         )
 
     else:
