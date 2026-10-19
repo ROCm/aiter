@@ -205,7 +205,6 @@ def launch_gemm_a8w8(
 
         tid = fx.Int32(fx.thread_idx.x)
         bid_x, bid_y, bid_z = fx.block_idx
-        kt_base = fx.Int64(bid_z) * fx.Int64(K_TILES) if split_k > 1 else None
         kt_base_i32 = fx.Int32(bid_z) * fx.Int32(K_TILES) if split_k > 1 else None
         bz64 = fx.Int64(bid_z) if const_expr(batched) else None
         wave = rocdl.readfirstlane(T.i32, tid // WAVE)
@@ -310,21 +309,9 @@ def launch_gemm_a8w8(
             )
         )
         tBsB, tBgB = fx.rocdl.cdna5.tdm_partition(atomB, 0, WARP1, sB_lds, blkB)
-        W_SA = W_SB = gSA = atomSA = gSB = atomSB = sa_imm = sb_imm = None
+        W_SA = W_SB = atomSA = atomSB = None
         tSAsSA = tSAgSA = tSBsSB = tSBgSB = None
         if const_expr(is_mxscale):
-
-            def _tdm1(
-                gt, outer, inner, o_stride, mask=0
-            ):  # single-warp 2-D atom, both dims clamped
-                atom = fx.rocdl.make_tdm_atom(
-                    gt,
-                    [outer, inner],
-                    strides=[o_stride, None],
-                    num_warps=1,
-                    early_timeout=True,
-                )
-                return fx.atom_set_value(atom, "workgroup_mask", mask)
 
             W_SA, W_SB = 2 % num_waves, 3 % num_waves
             if const_expr(mx32):
@@ -386,35 +373,58 @@ def launch_gemm_a8w8(
                 sb_off0 = blk_n64 // 128 * (k64 // 128)
                 if const_expr(batched):
                     sb_off0 = sb_off0 + bz64 * (fx.Int64(i32_n) // 128) * (k64 // 128)
+                # kti carries the split-k base, so each view spans the whole K.
+                KT_ALL = (i32_k // tile_k) * K_WS
                 if const_expr(sa_m_major):
+                    # K is dim1 (contiguous); M rows are dim0, strided.
                     sa_off0 = blk_m64 * stride_ask64 + bz64 * (k64 // 128)
-                    gSA = _gv(arg_scale_a, sa_off0, SA_TDM_SHAPE, (SA_LDS_ROW, 1))
-                    atomSA = _tdm1(gSA, mn_oob, None, stride_ask64, a_mask)
-
-                    def sa_imm(kt):
-                        return fx.Int64(kt * K_WS)
-
+                    gSA_full = _gv(
+                        arg_scale_a, sa_off0, (mn_oob, KT_ALL), (stride_ask64, 1)
+                    )
+                    sa_rest = (0, None)
                 else:
+                    # K is dim0 (strided); M is the contiguous innermost axis.
                     sa_off0 = blk_m64
-                    gSA = _gv(arg_scale_a, sa_off0, SA_SHAPE, (tile_m, 1))
-                    atomSA = _tdm1(gSA, None, mn_oob, stride_ask64, a_mask)
+                    gSA_full = _gv(
+                        arg_scale_a, sa_off0, (KT_ALL, mn_oob), (stride_ask64, 1)
+                    )
+                    sa_rest = (None, 0)
+                atomSA, coordSA = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                    fx.rocdl.TensorLoad(),
+                    gSA_full,
+                    fx.make_layout(SA_TDM_SHAPE, (SA_LDS_ROW, 1)),
+                    SA_TDM_SHAPE,
+                    num_warps=1,
+                )
+                atomSA = fx.atom_set_value(atomSA, "workgroup_mask", a_mask)
+                blkSA = fx.zipped_divide(coordSA, SA_TDM_SHAPE)[None, sa_rest]
 
-                    def sa_imm(kt):
-                        return fx.Int64(kt * K_WS) * stride_ask64
+                gSB_full = _gv(
+                    arg_scale_b,
+                    sb_off0,
+                    (nb_oob if nb_oob is not None else SB_TDM_SHAPE[0], KT_ALL),
+                    (k64 // 128, 1),
+                )
+                atomSB, coordSB = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                    fx.rocdl.TensorLoad(),
+                    gSB_full,
+                    fx.make_layout(SB_TDM_SHAPE, (SB_LDS_ROW, 1)),
+                    SB_TDM_SHAPE,
+                    num_warps=1,
+                )
+                atomSB = fx.atom_set_value(atomSB, "workgroup_mask", b_mask)
+                blkSB = fx.zipped_divide(coordSB, SB_TDM_SHAPE)[None, (0, None)]
 
-                gSB = _gv(arg_scale_b, sb_off0, SB_TDM_SHAPE, (SB_LDS_ROW, 1))
-                atomSB = _tdm1(gSB, nb_oob, None, k64 // 128, b_mask)
-
-                def sb_imm(kt):
-                    return fx.Int64(kt) * K_WS
-
-        def _wcopy(w, atom, gt, lv, imm_offset):
+        def _scopy(w, atom, blk, kti, base, off, shape, row=None):
+            """One warp's scale copy: LDS box with the size-1 rest, then the K tile."""
+            r = shape[1] if row is None else row
+            box = _lv(fx.add_offset(base, off), (shape, 1), ((r, 1), shape[0] * r))
+            ts, tg = fx.rocdl.cdna5.tdm_partition(atom, 0, WARP1, box, blk)
             if wave == w:
-                fx.copy(atom, gt, lv, imm_offset=imm_offset)
+                fx.copy(atom, tg[None, kti], ts[None, 0])
 
         def issue(s, kt):
             pa = _buf_ptr(s)
-            ktg = fx.Int64(kt) if kt_base is None else fx.Int64(kt) + kt_base
             kti = fx.Int32(kt) if kt_base_i32 is None else fx.Int32(kt) + kt_base_i32
             if wave == W_A:
                 fx.copy(atomA, tAgA[None, kti], tAsA[None, s])
@@ -439,38 +449,14 @@ def launch_gemm_a8w8(
                     if wave == W_SB:
                         fx.copy(atomSB, tSBgSB[None, kti], tSBsSB[None, s])
                 else:
-                    _wcopy(
-                        W_SA,
-                        atomSA,
-                        gSA,
-                        _lv(fx.add_offset(pa, SA_OFF), SA_SHAPE, (SA_SHAPE[1], 1)),
-                        sa_imm(ktg),
-                    )
-                    _wcopy(
-                        W_SB,
-                        atomSB,
-                        gSB,
-                        _lv(fx.add_offset(pa, SB_OFF), SB_SHAPE, (SB_SHAPE[1], 1)),
-                        sb_imm(ktg),
-                    )
+                    _scopy(W_SA, atomSA, blkSA, kti, pa, SA_OFF, SA_SHAPE)
+                    _scopy(W_SB, atomSB, blkSB, kti, pa, SB_OFF, SB_SHAPE)
 
         panel_ptr = fx.add_offset(base_ptr, PANEL_OFF) if const_expr(preload) else None
 
         def preload_scales():
-            _wcopy(
-                W_SA,
-                atomSA,
-                gSA,
-                _lv(panel_ptr, SA_TDM_SHAPE, (SA_LDS_ROW, 1)),
-                fx.Int64(0),
-            )
-            _wcopy(
-                W_SB,
-                atomSB,
-                gSB,
-                _lv(fx.add_offset(panel_ptr, PANEL_A), SB_TDM_SHAPE, (SB_LDS_ROW, 1)),
-                fx.Int64(0),
-            )
+            _scopy(W_SA, atomSA, blkSA, 0, panel_ptr, 0, SA_TDM_SHAPE, SA_LDS_ROW)
+            _scopy(W_SB, atomSB, blkSB, 0, panel_ptr, PANEL_A, SB_TDM_SHAPE, SB_LDS_ROW)
             rocdl.s_wait_tensorcnt(0)
             workgroup_barrier(use_cluster=False)
 

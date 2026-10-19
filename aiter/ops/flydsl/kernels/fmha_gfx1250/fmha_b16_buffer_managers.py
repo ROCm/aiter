@@ -143,7 +143,7 @@ def _async_load_to_lds(gptrs, lds_ptrs, *, cluster, imm_offs=None):
 #
 #   V1  ``cluster_load_async_to_lds_b128`` -- per-lane addresses, software OOB clamp,
 #       one b128 per lane per 8x32 write tile; bumps ``asynccnt``.
-#   V2  TDM (``fx.copy_atom_call`` on a ``make_tdm_atom`` view) -- one descriptor-driven
+#   V2  TDM (``fx.copy`` on a ``make_tiled_tdm_atom`` partition) -- one descriptor-driven
 #       copy per band, no per-lane address VALU (so far fewer address VGPRs), and the
 #       per-dim extent gives HARDWARE OOB zero-fill; bumps ``tensorcnt``.
 #

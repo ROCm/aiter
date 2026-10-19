@@ -2238,7 +2238,7 @@ def launch_gemm_a8w4_tdm(
         if const_expr(persistent_workers > 0):
             # Every wave must retire the output store before another wave
             # reuses the same LDS arena for the next task's input. This also
-            # covers the fused scatter's tensor_wait above.
+            # covers the fused scatter's s_wait_tensorcnt above.
             workgroup_barrier()
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])

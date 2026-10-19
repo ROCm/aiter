@@ -119,7 +119,7 @@ class _EpPsumScanStorage:
 # descriptor builder sign-extends the size to 64 bits.
 _SCALE_RSRC_MAX_BYTES = 0x7FFFFFFF
 # TDM staging depth. One chunk is degenerate -- the prologue waits on the whole
-# row with nothing to overlap -- and past four the per-chunk tensor_wait and two
+# row with nothing to overlap -- and past four the per-chunk s_wait_tensorcnt and two
 # CTA barriers outweigh the smaller transfer. Four also divides every shipped
 # model_dim's iteration count, so one depth serves them all.
 _TOKEN_MULTIDEST_TDM_CHUNKS = 4

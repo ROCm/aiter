@@ -215,7 +215,7 @@ def launch_gather_kv_b_proj_8wave_gfx1250(
 
         # Partition B evenly too: each wave issues one B TDM plus four A
         # gathers per K tile. Equal per-wave tensorcnt is what makes the common
-        # pipelined tensor_wait counts below valid.
+        # pipelined s_wait_tensorcnt counts below valid.
         B_OUTER = tile_n // 16
         B_ROWS_PER_WAVE = B_OUTER // num_waves
         b_wave_row = wave * B_ROWS_PER_WAVE
