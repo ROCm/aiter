@@ -381,8 +381,8 @@ def _mha_fwd_subtiled(
         )
     qk = concat_subtile(qk0, qk1)
     m_ij = fast_maximum(m_i, gl.reduce(qk, 1, fast_maximum) * qk_scale)
-    qk0_shifted = qk0 * qk_scale - m_ij[:, None]
-    qk1_shifted = qk1 * qk_scale - m_ij[:, None]
+    qk0_shifted = gl.fma(qk0, qk_scale, -m_ij[:, None])
+    qk1_shifted = gl.fma(qk1, qk_scale, -m_ij[:, None])
     p0 = gl.exp2(qk0_shifted)
     k0 = local_load_k(
         k0_buffer, read_idx_k, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K
@@ -420,7 +420,7 @@ def _mha_fwd_subtiled(
             )
             p = concat_subtile(p0, p1)
             l_ij = gl.sum(p, 1)
-            l_i = l_i * alpha + l_ij
+            l_i = gl.fma(l_i, alpha, l_ij)
             p_quant = p.to(gl.float8e4nv)
             p_quant = gl.convert_layout(
                 p_quant, layout=DOT_LAYOUT_P, assert_trivial=True
@@ -462,8 +462,8 @@ def _mha_fwd_subtiled(
                 k0_buffer, read_idx_k, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K
             )
             m_ij = fast_maximum(m_i, m_ij)
-            qk0_shifted = qk0 * qk_scale - m_ij[:, None]
-            qk1_shifted = qk1 * qk_scale - m_ij[:, None]
+            qk0_shifted = gl.fma(qk0, qk_scale, -m_ij[:, None])
+            qk1_shifted = gl.fma(qk1, qk_scale, -m_ij[:, None])
             p0 = gl.exp2(qk0_shifted)
             k_desc = tdm_load_k(
                 k_desc,
@@ -539,7 +539,7 @@ def _mha_fwd_subtiled(
         )
         p = concat_subtile(p0, p1)
         l_ij = gl.sum(p, 1)
-        l_i = l_i * alpha + l_ij
+        l_i = gl.fma(l_i, alpha, l_ij)
         p_quant = p.to(gl.float8e4nv)
         p_quant = gl.convert_layout(p_quant, layout=DOT_LAYOUT_P, assert_trivial=True)
         v_desc = tdm_load_v(
@@ -578,8 +578,8 @@ def _mha_fwd_subtiled(
         k0 = local_load_k(
             k0_buffer, read_idx_k, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K
         )
-        qk0_shifted = qk0 * qk_scale - m_ij[:, None]
-        qk1_shifted = qk1 * qk_scale - m_ij[:, None]
+        qk0_shifted = gl.fma(qk0, qk_scale, -m_ij[:, None])
+        qk1_shifted = gl.fma(qk1, qk_scale, -m_ij[:, None])
         p0 = gl.exp2(qk0_shifted)
         v_desc = tdm_load_v(
             v_desc,
@@ -645,7 +645,7 @@ def _mha_fwd_subtiled(
         )
         p = concat_subtile(p0, p1)
         l_ij = gl.sum(p, 1)
-        l_i = l_i * alpha + l_ij
+        l_i = gl.fma(l_i, alpha, l_ij)
         p_quant = p.to(gl.float8e4nv)
         p_quant = gl.convert_layout(p_quant, layout=DOT_LAYOUT_P)
 
@@ -659,9 +659,10 @@ def _mha_fwd_subtiled(
         qk = concat_subtile(qk0, qk1)
         m_ij = fast_maximum(m_i, gl.reduce(qk, 1, fast_maximum) * qk_scale)
 
+    gl.amd.gfx1250.tdm.async_wait(0)
     acc1 = gl.amd.cdna5.wmma(p_quant, v1, acc1)
-    qk0_shifted = qk0 * qk_scale - m_ij[:, None]
-    qk1_shifted = qk1 * qk_scale - m_ij[:, None]
+    qk0_shifted = gl.fma(qk0, qk_scale, -m_ij[:, None])
+    qk1_shifted = gl.fma(qk1, qk_scale, -m_ij[:, None])
     p0 = gl.exp2(qk0_shifted)
 
     # iter last
@@ -672,19 +673,17 @@ def _mha_fwd_subtiled(
     acc0 = acc0 * alpha[:, None]
     acc1 = acc1 * alpha[:, None]
 
-    gl.amd.gfx1250.tdm.async_wait(1)
     v0 = local_load_v(
         v0_buffer, read_idx_v, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
     )
     p = concat_subtile(p0, p1)
     l_ij = gl.sum(p, 1)
-    l_i = l_i * alpha + l_ij
+    l_i = gl.fma(l_i, alpha, l_ij)
     v_scale = gl.load(v_scale_ptr)
     ep_norm = fast_dividef(v_scale, l_i[:, None])
     p_quant = p.to(gl.float8e4nv)
     p_quant = gl.convert_layout(p_quant, layout=DOT_LAYOUT_P)
 
-    gl.amd.gfx1250.tdm.async_wait(0)
     acc0 = gl.amd.cdna5.wmma(p_quant, v0, acc0)
     acc0 = acc0 * ep_norm
     acc0 = acc0.to(gl.bfloat16)
