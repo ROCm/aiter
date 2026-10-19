@@ -50,6 +50,8 @@ __all__ = [
     "FLAG_COMBINE",
     "FLAG_COMB_CNT",
     "FLAG_DISPATCH",
+    "FLAG_DISPM",
+    "FLAG_DISPM_CNT",
     "FLAG_DISP_CNT",
     "FLAG_INIT",
     "FLAG_INIT_CNT",
@@ -125,7 +127,13 @@ FLAG_COMB_CNT = FLAG_COMBINE + 2 * NCTA_MAX
 # FLAG_INIT_CNT + parity*NCTA_MAX + 0    post-init arrival counter (npes*n_cta)
 FLAG_INIT = FLAG_COMB_CNT + 2 * NCTA_MAX
 FLAG_INIT_CNT = FLAG_INIT + 2 * NCTA_MAX
-FLAG_INTS = FLAG_INIT_CNT + 2 * NCTA_MAX
+# FLAG_DISPM + parity*NCTA_MAX + tile    dispatch META (routing-only) ready (epoch) --
+# FLAG_DISPM_CNT + parity*NCTA_MAX + tile    its arrival counter. The routing (recv_le)
+# is scattered + signalled BEFORE the payload so the owner plans (pre_pos / dyn_plan /
+# gather, all routing-only) while the big payload a2a is still in flight.
+FLAG_DISPM = FLAG_INIT_CNT + 2 * NCTA_MAX
+FLAG_DISPM_CNT = FLAG_DISPM + 2 * NCTA_MAX
+FLAG_INTS = FLAG_DISPM_CNT + 2 * NCTA_MAX
 
 # Global control ints (device tensor): a sticky watchdog error word plus room.
 CTRL_ERR = 0

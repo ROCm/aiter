@@ -87,6 +87,7 @@ def build_schedule(kc: KernelCtx) -> dict:
     gemm2_combine = kc.get("gemm2_combine")[0]
     combine_send = kc.get("combine_send")[0]
     dispatch_wait = kc.get("dispatch_wait")[0]
+    dispatch_wait_meta = kc.get("dispatch_wait_meta")[0]
     grid_bar = kc.get("grid_bar")[0]
     assert L_EOFF is not None and const_expr  # L_EOFF: gather offsets (future)
 
@@ -278,25 +279,21 @@ def build_schedule(kc: KernelCtx) -> dict:
 
     @flyc.jit
     def dyn_plan(L, tid, a):
-        """Scan this rank's received routing -> per-local-expert bitmap + counts ->
-        active list -> row-chunk table -> per-CTA unit list [u_lo, u_hi) (XCD-aware)."""
-        rle = rsrc(a["recv_le"], a["nrecv"] * i32(4))
-        # Scan only the LIVE window -- npes source ranks x m tokens x topk routes -- not
-        # the full mtpr capacity, mapping the compact index back to the real recv_le slot
-        # (p*mtpr*topk + within-block). Assumes a uniform per-rank token count m (true for
-        # the EP tests / balanced serving); TODO: carry a global max-m for skewed ranks.
-        blk = a["m"] * i32(TOPK)
-        stride_p = a["mtpr"] * i32(TOPK)
-        for c_ in range(tid, a["npes"] * blk, i32(NT)):
-            c = i32(c_)
-            p = c // blk
-            idx = p * stride_p + (c - p * blk)
-            le = fx.Int32(bld(rle, idx * i32(4), 0, T.i32, 0))
-            if masked(le) == fx.Boolean(False):
-                lds_atomic_or(
-                    L, L_DYN + (le >> i32(5)) * i32(4), i32(1) << (le & i32(31))
+        """Per-local-expert bitmap + counts -> active list -> row-chunk table -> per-CTA
+        unit list [u_lo, u_hi) (XCD-aware).  The per-expert counts come straight from
+        pre_pos's global ``ecnt`` (one value per local expert; pre_pos already did the
+        agent-atomic scan of recv_le) -- so dyn_plan reads only EPR ints instead of
+        re-scanning the whole npes x m x topk routing window (which otherwise contends for
+        HBM with the overlapped payload a2a).  gbar(2) before this publishes ecnt."""
+        recnt = rsrc(fx.Int64(a["ecnt"]), i32(EPR) * i32(4))
+        for e_ in range(tid, i32(EPR), i32(NT)):
+            e = i32(e_)
+            cnt = fx.Int32(bld(recnt, e * i32(4), 0, T.i32, 0))
+            lds_st(L, L_DCNT + e * i32(4), cnt)  # distinct e per thread: no race
+            if cnt > i32(0):
+                lds_atomic_or(  # bitmap word shared by 32 experts: atomic
+                    L, L_DYN + (e >> i32(5)) * i32(4), i32(1) << (e & i32(31))
                 )
-                lds_atomic_add(L, L_DCNT + le * i32(4), 1)
         cbar(L, tid)
         _dyn_prefix(L, tid)
         cbar(L, tid)
@@ -345,14 +342,17 @@ def build_schedule(kc: KernelCtx) -> dict:
         each row's recv-slot (``rowidx``) + payload-row (``rowmap``) to GLOBAL so the later
         passes -- on different CTAs once P>1 shards an echunk -- can read them."""
         if tid == i32(0):
-            dispatch_wait(a, a["epoch"] & i32(1), i32(0))
+            dispatch_wait_meta(a, a["epoch"] & i32(1), i32(0))  # wait ROUTING only (fast)
         cbar(L, tid)
         if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
-            if tid == i32(0):  # post dispatch_wait (slot 4)
+            if tid == i32(0):  # post dispatch_wait_meta (slot 4)
                 bst(now(), rsrc(a["dbg"]),
                     (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(4)) * i32(8), 0, 0)
         # balanced-gather pre-pass: assign global per-expert positions, then a true
         # cross-CTA barrier (the scan is distributed) publishes rowpos to every CTA.
+        # All of pre_pos / dyn_plan / PASS0-gather read only the routing (recv_le), so
+        # they run NOW -- overlapping the big payload a2a still in flight -- and GEMM1
+        # below waits for the payload (dispatch_wait) just before it needs it.
         pre_pos(L, tid, a)
         gbar(L, tid, a, i32(2))  # forced cross-CTA (pre_pos is a distributed scan)
         dyn_plan(L, tid, a)
@@ -386,6 +386,12 @@ def build_schedule(kc: KernelCtx) -> dict:
                 bst((r < R).select(idx // i32(TOPK), i32(0)), r_rowmap, off, 0, 0)
             cbar(L, tid)  # done reading L_RIX before the next echunk's gather overwrites it
         gbar(L, tid, a, P)
+        # payload wait: only NOW does the kernel need the dispatched activation (GEMM1's
+        # A-gather). The planning + gather above overlapped the payload a2a, so this spin
+        # is short (payload mostly landed). After it, the rows for every echunk are live.
+        if tid == i32(0):
+            dispatch_wait(a, a["epoch"] & i32(1), i32(0))
+        cbar(L, tid)
         # --- PASS 1 (GEMM1): walk this CTA's (echunk, shard) units -> inter[echunk] slice.
         for gi_ in range(bid, nch * P, nblk):
             gi = i32(gi_)

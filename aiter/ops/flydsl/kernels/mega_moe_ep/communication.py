@@ -52,6 +52,8 @@ from .mega_moe_ep_config import (
     FLAG_COMBINE,
     FLAG_DISP_CNT,
     FLAG_DISPATCH,
+    FLAG_DISPM,
+    FLAG_DISPM_CNT,
     FLAG_INIT,
     FLAG_INIT_CNT,
     GBAR_CNT,
@@ -170,6 +172,22 @@ def build_communication(kc: KernelCtx) -> dict:
         )
 
     @flyc.jit
+    def dispatch_arrive_meta(a, p, parity, tile, delta, expected):
+        """Mirror of ``dispatch_arrive`` for the META (routing-only) dispatch phase: the
+        owner can start planning (pre_pos / dyn_plan / gather) once every sender's routing
+        has landed, while the big payload a2a is still in flight."""
+        old = g_add_agent(peer_flag(a, p, FLAG_DISPM_CNT, parity, tile), delta)
+        if old + delta == expected:
+            g_st_sys(peer_flag(a, p, FLAG_DISPM_CNT, parity, tile), i32(0))
+            g_st_sys(peer_flag(a, p, FLAG_DISPM, parity, tile), a["epoch"])
+
+    @flyc.jit
+    def dispatch_wait_meta(a, parity, tile):
+        spin_sys_ge(
+            own_flag(a, FLAG_DISPM, parity, tile), a["epoch"], a, ERR_DISPATCH
+        )
+
+    @flyc.jit
     def init_arrive(a, p, parity, expected):
         old = g_add_agent(peer_flag(a, p, FLAG_INIT_CNT, parity, i32(0)), i32(1))
         if old + i32(1) == expected:
@@ -223,23 +241,53 @@ def build_communication(kc: KernelCtx) -> dict:
 
     @flyc.jit
     def dispatch_send(L, lane, a):
-        """One wave: scatter each local (token, route) payload to its expert-owner
-        rank's arena, indexed by ``source_key = rank*mtpr + token`` (bounded by
-        npes*mtpr, overflow-proof), and record the received local-expert id. The top-k
-        weights stay at the source and are applied in combine_final. After the scatter
-        each rank signals every owner it is done (an all-to-all dispatch barrier)."""
+        """One wave: scatter each local (token, route) to its expert-owner rank's arena,
+        indexed by ``source_key = rank*mtpr + token`` (bounded by npes*mtpr,
+        overflow-proof). The top-k weights stay at the source (applied in combine_final).
+
+        Two phases so dispatch overlaps GEMM1: PASS A scatters only the tiny routing
+        (recv_le, 1 int/route) + signals ``dispatch_arrive_meta`` -- the owner then plans
+        (pre_pos / dyn_plan / gather, all routing-only) while PASS B's big payload a2a is
+        still in flight. PASS B scatters the activation + scale and signals the full
+        ``dispatch_arrive`` (payload ready) that GEMM1 waits on. Each phase is an
+        all-to-all barrier (npes*nblk arrivals per owner)."""
         m, mtpr, rank, epr, npes = a["m"], a["mtpr"], a["rank"], a["epr"], a["npes"]
         parity = a["epoch"] & i32(1)
         nblk = i32(gpu.grid_dim.x)
         rids = rsrc(a["ids"], m * i32(TOPK) * i32(4))
         rx = rsrc(a["x"])
         rxs = rsrc(a["xs"])
-        # block-strided over (token, route): every CTA scatters a DISJOINT slice (no
-        # redundant a2a). recv_le is host-initialized + barriered before launch, so the
-        # P2P writes have no init race to land into. The arrival count below is npes*nblk
-        # (every CTA of every rank arrives once), so the owner only stamps DISPATCH after
-        # all senders finish -- compute never reads recv_le early.
         bid = i32(gpu.block_id("x"))
+        # PASS A -- routing only (recv_le). Tiny (lane 0, 1 int/route) so it lands fast;
+        # block-strided over (token, route) for a disjoint a2a slice per CTA.
+        for wk_ in range(bid, m * i32(TOPK), nblk):
+            wk = i32(wk_)
+            t = wk // i32(TOPK)
+            r = wk - t * i32(TOPK)
+            e = fx.Int32(bld(rids, wk * i32(4), 0, T.i32, 0))
+            if (e >= i32(0)) & (e < i32(E)):
+                owner = e // epr
+                source_key = rank * mtpr + t
+                if lane == i32(0):
+                    bst(
+                        e - owner * epr,
+                        peer_rs(a, owner, "off_recv"),
+                        (source_key * i32(TOPK) + r) * i32(4),
+                        0,
+                        AUX_SYS,
+                    )
+            else:
+                # dropped/invalid route: this rank is the source, so pre-count it into
+                # this rank's single combine counter now -- combine_send only arrives for
+                # valid routes later, and combine_wait expects m*TOPK total.
+                if lane == i32(0):
+                    combine_arrive(a, rank, parity, i32(0), i32(1), m * i32(TOPK))
+        wait_vm(0)  # drain routing stores before signalling META-ready
+        if lane == i32(0):
+            for p in range_constexpr(MAX_NPES):
+                if i32(p) < npes:
+                    dispatch_arrive_meta(a, i32(p), parity, i32(0), i32(1), npes * nblk)
+        # PASS B -- the activation payload + E8M0 scale (the bulk of the a2a).
         for wk_ in range(bid, m * i32(TOPK), nblk):
             wk = i32(wk_)
             t = wk // i32(TOPK)
@@ -250,14 +298,6 @@ def build_communication(kc: KernelCtx) -> dict:
                 source_key = rank * mtpr + t
                 dpay = peer_rs(a, owner, "off_payload")
                 dsc = peer_rs(a, owner, "off_pscale")
-                if lane == i32(0):
-                    bst(
-                        e - owner * epr,
-                        peer_rs(a, owner, "off_recv"),
-                        (source_key * i32(TOPK) + r) * i32(4),
-                        0,
-                        AUX_SYS,
-                    )
                 for j in range_constexpr((N_VEC + 63) // 64):
                     u = lane + i32(j * 64)
                     if u < i32(N_VEC):
@@ -280,12 +320,6 @@ def build_communication(kc: KernelCtx) -> dict:
                             0,
                             AUX_SYS,
                         )
-            else:
-                # dropped/invalid route: this rank is the source, so pre-count it into
-                # this rank's single combine counter now -- combine_send only arrives for
-                # valid routes later, and combine_wait expects m*TOPK total.
-                if lane == i32(0):
-                    combine_arrive(a, rank, parity, i32(0), i32(1), m * i32(TOPK))
         wait_vm(0)
         if lane == i32(0):
             for p in range_constexpr(MAX_NPES):
