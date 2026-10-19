@@ -17,11 +17,16 @@ PAGE_SIZE: int = 16
 KV_COL_BLOCK: int = 64
 SIZE_MLA_WORK_INFO_IN_DW: int = 8
 
+# MFMA sizes for validation
+
+MFMA_M = 4
+MFMA_N = 4
+MFMA_K = 4
 
 
 @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
 def flydsl_mla_fwd_decode_m16_bf16_fp8_16head(
-   query: fx.Tensor,  # [num_q, H, 512 + 64] bf16
+   q: fx.Tensor,  # [num_q, H, 512 + 64] bf16
    kv: fx.Tensor,  # [num_pages, page_size, 1, 512 + 64] fp8
    kv_page_indices: fx.Tensor,  # [num_page_used] i32
    work_indptr: fx.Tensor,  # [num_workers + 1] i32
@@ -32,25 +37,22 @@ def flydsl_mla_fwd_decode_m16_bf16_fp8_16head(
 ):
     """Specialized MLA forward decode for heads <= 16."""
 
-    def masked_attention(
-        q: fx.Tensor, k: fx.Tensor, scale: fx.Tensor, out: fx.Tensor
-    ):
-        """Compute bf16 masked attention for the given tensors"""
+    def gemm(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor, BM: fx.Constexpr[int], BN: fx.Constexpr[int], BK: fx.Constexpr[int]):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
 
-        q = fx.rocdl.make_buffer_tensor(A)
-        k = fx.rocdl.make_buffer_tensor(B)
+        A = fx.rocdl.make_buffer_tensor(A)
+        B = fx.rocdl.make_buffer_tensor(B)
         C = fx.rocdl.make_buffer_tensor(C)
 
-        bA = fx.zipped_divide(q, (block_m, block_k))
-        bB = fx.zipped_divide(k, (block_n, block_k))
-        bC = fx.zipped_divide(out, (block_m, block_n))
+        bA = fx.zipped_divide(A, (BM, BK))
+        bB = fx.zipped_divide(B, (BN, BK))
+        bC = fx.zipped_divide(C, (BM, BN))
 
         bA = fx.slice(bA, (None, bid))
         bB = fx.slice(bB, (None, bid))
 
-        mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(4, 4, 4, fx.Float32))
+        mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(MFMA_M, MFMA_N, MFMA_K, fx.BFloat16))
         tiled_mma = fx.make_tiled_mma(mma_atom, fx.make_layout())
         thr_mma = tiled_mma.thr_slice(tid)
 
@@ -82,32 +84,47 @@ def flydsl_mla_fwd_decode_m16_bf16_fp8_16head(
         fx.gemm(mma_atom, frag_C, frag_A, frag_B, frag_C)
         fx.copy(copy_atom, copy_frag_C, copy_dst_C, pred=None)
 
+    def masked_attention(
+        q: fx.Tensor, # [4, 576] bf16
+        k: fx.Tensor, # [1, 576] fp8
+        scale: fx.Float32,
+        out: fx.Tensor # [4, 512]
+    ):
+        """Compute bf16 masked attention for the given tensors"""
+        gemm(q, k, out, 4, 512, 64)
 
-    # Work loop
-
-    q = fx.rocdl.make_buffer_tensor(query)
+    q = fx.rocdl.make_buffer_tensor(q)
     kv = fx.rocdl.make_buffer_tensor(kv)
-    page_idx = fx.rocdl.make_buffer_tensor(kv_page_indices)
+    kv_page_indices = fx.rocdl.make_buffer_tensor(kv_page_indices)
     work_indptr = fx.rocdl.make_buffer_tensor(work_indptr)
     work_info_set = fx.rocdl.make_buffer_tensor(work_info_set)
     split_output = fx.rocdl.make_buffer_tensor(split_output)
     split_lse = fx.rocdl.make_buffer_tensor(split_lse)
 
-    # Each work items is an 8 x uint32 struct (see mla.h)
-    # Each persistent workgroup processes its assigned work-set interval.
-    worker_idx = fx.gpu.block_idx.x
-    work_start = work_indptr[worker_idx]
-    work_end = work_indptr[worker_idx + 1]
-    for work_idx in range(work_start, work_end):
-        work_item = fx.slice(work_info_set, (work_idx, None))
+    # WIP: Simplified test with single work item
 
-        batch_idx = work_item[0]
-        partial_qo_loc = work_item[1]
-        qo_start = work_item[2]
-        qo_end = work_item[3]
-        kv_start_page = work_item[4]
-        kv_end_page = work_item[5]
-        kv_offset = work_item[6]
+    masked_attention(q, kv, softmax_scale, split_output)
+
+
+    # Each work items is an 8 x uint32 struct (see mla.h)
+    # Each persistent workgroup processes its assigned work set interval.
+
+    # worker_idx = fx.gpu.block_idx.x
+    # work_start = work_indptr[worker_idx]
+    # work_end = work_indptr[worker_idx + 1]
+    # for work_idx in range(work_start, work_end):
+    #     work_item = fx.slice(work_info_set, (work_idx, None))
+
+    #     batch_idx = work_item[0]
+    #     partial_qo_loc = work_item[1]
+    #     qo_start = work_item[2]
+    #     qo_end = work_item[3]
+    #     kv_start_page = work_item[4]
+    #     kv_end_page = work_item[5]
+    #     kv_offset = work_item[6]
+
+
+
 
     
 
@@ -135,7 +152,6 @@ def launch(
         split_lse,
         softmax_scale,
      ).launch(grid=grid, block=block, stream=stream)
-
 
 
 
