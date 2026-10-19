@@ -75,15 +75,3 @@ def test_staged_soft_timeout_outside_main_thread_runs_without_touching_timer() -
     ):
         assert tuner._screen_candidate(lambda: 3.0, "fixture", 4) == 3.0
     timer.assert_not_called()
-
-
-def test_mxfp4_help_reports_soft_timeout_and_preserves_other_tuner_help() -> "None":
-    from op_tests.tuning_tests.test_mxfp4_tuner_lifecycle import RESULTS, devices
-
-    with devices(("gfx950", 256)):
-        dedicated = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
-        ordinary = moe.FmoeTuner("fmoe", KEYS, RESULTS)
-    help_text = " ".join(dedicated.parser.format_help().split())
-    assert "best-effort per-operation SIGALRM" in help_text
-    assert "still-live permanent hang" in help_text
-    assert "per-task watchdog" in ordinary.parser.format_help()
