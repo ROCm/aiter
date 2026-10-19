@@ -1,0 +1,53 @@
+--- a/atom/model_ops/moe.py
++++ b/atom/model_ops/moe.py
+@@ -1256,6 +1256,39 @@
+         )
+ 
+ 
++import os as _os
++
++_ROUTER_DUMP_DIR = _os.environ.get("ATOM_DUMP_ROUTER_DIR")
++_ROUTER_DUMP_STEPS = int(_os.environ.get("ATOM_DUMP_ROUTER_STEPS", "8"))
++_ROUTER_DUMP_EVERY = int(_os.environ.get("ATOM_DUMP_ROUTER_EVERY", "1"))
++_router_dump_counts: dict[int, int] = {}
++_router_dump_calls: dict[int, int] = {}
++
++
++def _dump_router_logits(layer, router_logits, bias, custom_routing_function):
++    if custom_routing_function is not None or bias is None:
++        return
++    if router_logits.shape[0] != 64:
++        return
++    ctx = get_forward_context().context
++    if ctx is None or ctx.is_prefill:
++        return
++    lid = int(layer.layer_id)
++    call = _router_dump_calls.get(lid, 0)
++    _router_dump_calls[lid] = call + 1
++    if call % _ROUTER_DUMP_EVERY:
++        return
++    n = _router_dump_counts.get(lid, 0)
++    if n >= _ROUTER_DUMP_STEPS:
++        return
++    _router_dump_counts[lid] = n + 1
++    _os.makedirs(_ROUTER_DUMP_DIR, exist_ok=True)
++    torch.save(
++        {"logits": router_logits.detach().cpu(), "bias": bias.detach().cpu(), "decode_step": call},
++        f"{_ROUTER_DUMP_DIR}/L{lid:02d}_S{n:02d}.pt",
++    )
++
++
+ @lru_cache(maxsize=None)
+ def _log_flydsl_herd_batch(num_tokens: int, top_k: int) -> None:
+     logger.info(
+@@ -2061,6 +2094,10 @@
+                 act_quant=self.act_quant,
+             )
+ 
++        if _ROUTER_DUMP_DIR is not None:
++            _dump_router_logits(
++                layer, router_logits, e_score_correction_bias, custom_routing_function
++            )
+         herd_topk = 0
+         if self._flydsl_herd_step(
+             layer,
