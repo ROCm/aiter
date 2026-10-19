@@ -256,9 +256,13 @@ def mega_moe_ep_consts(
     c["L_A"] = take(lds_pool)  # A NAB-bank ring (GEMM1 + GEMM2 loader); cshuffle is in L_C
     c["L_AS"] = take(RG * a_scale)  # A-scale (E8M0) of one row tile (compute-side stage)
     # GEMM1's cshuffle C-tile gets its OWN region: the A-loader runs ahead into the L_A
-    # ring during the epilogue, so the C-tile can no longer alias L_A (it still aliases
-    # L_A in GEMM2, which has no loader yet).  Sized for the larger GEMM2 cshuffle too.
-    c["L_C"] = take(RG * TILE_N * 4)
+    # ring during the epilogue, so the C-tile can no longer alias L_A.  GEMM1 now uses a
+    # register epilogue (no C-tile); GEMM2's cshuffle is processed one MFMA m-tile (16
+    # rows) at a time, so L_C only needs 16 x TILE_N f32 (16 KB, not RG x TILE_N = 64 KB).
+    # The 48 KB saved lets the whole block fit twice per CU (2 MFMA waves/SIMD) while the
+    # shuffled layout (coalesced gout store / combine P2P) is preserved.  See gemm.py
+    # _epilogue_g2 / _epilogue_g2_combine (CROWS=16 per-mi chunking).
+    c["L_C"] = take(16 * TILE_N * 4)
     c["L_RCTL"] = take(RC_INTS * 4)  # A-loader ring counters (RC_* slots)
     # dynamic planner tables
     c["L_DYN"] = take((2 * NBW + EPR) * 4)  # bitmap words | prefix words | dense list

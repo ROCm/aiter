@@ -199,6 +199,11 @@ def build_gemm(kc: KernelCtx) -> dict:
     NUM_ACC_N2 = (TILE_N2 // NW) // 16
     K_ITERS2 = I // TILE_K
     N_ACC2 = M_REPEAT * NUM_ACC_N2
+    # GEMM2 cshuffle C-tile is processed one MFMA m-tile (16 rows) at a time so the LDS
+    # C region (L_C) holds only CROWS x cs_tile_n2 f32 (16 KB) instead of RG x cs_tile_n2
+    # (64 KB).  Shrinking L_C lets the whole block fit twice per CU (2 CTAs/CU => 2 MFMA
+    # waves/SIMD) while KEEPING the shuffled layout (coalesced gout store / combine P2P).
+    CROWS = RG // M_REPEAT  # == 16 (one MFMA m-tile of rows per cshuffle chunk)
     INTER_NBYTES = 256 * 64 * inter_row_bytes  # cosmetic x_tensor extent (NCTA*rg_max)
 
     def _act_batch(gs, us):
@@ -515,50 +520,53 @@ def build_gemm(kc: KernelCtx) -> dict:
 
     # ============================ GEMM2 (pipelined) ==============================
     def _epilogue_g2(L, tid, acc, n_tile, cptr, r_gout, e):
-        """CShuffle the GEMM2 accumulators -> bf16 -> ``gout`` (row-major
-        [e*RG+row, H]) with ``cbar`` syncs.  No activation / quant (combine_final
-        applies the top-k weight).  All RG rows are written (combine_send reads only the
+        """Per-mi (CROWS=16-row) chunked cshuffle of the GEMM2 accumulators -> bf16 ->
+        ``gout`` (row-major [e*RG+row, H]).  The C-tile LDS region (``L_C``) now holds only
+        one MFMA m-tile (16 x cs_tile_n2 f32 = 16 KB) instead of RG x cs_tile_n2 (64 KB), so
+        two CTAs fit per CU; for each mi we scatter that mi's accumulators into the C-tile
+        (local rows 0..15), ``cbar``, coalesced-read -> bf16 -> gout, then ``cbar`` before
+        the next mi reuses the C-tile.  All RG rows are written (combine_send reads only the
         valid prefix), so no dynamic per-row guard is needed."""
         wave = tid // i32(64)
         lane = tid % i32(64)
         l16 = lane % i32(16)
         ld4 = (lane // i32(16)) * i32(4)
         cbase = wave * i32(cs_tile_n2 // NW)
-        for mi in range_constexpr(M_REPEAT):
-            for ni in range_constexpr(NUM_ACC_N2):
-                v4 = fx.Vector(acc[mi * NUM_ACC_N2 + ni])
-                col = cbase + i32(ni * 16) + l16
-                for ii in range_constexpr(4):
-                    row = i32(mi * 16) + ld4 + i32(ii)
-                    idx = row * i32(cs_tile_n2) + col
-                    ptr = fx.add_offset(cptr, fx.make_int_tuple(idx))
-                    fx.ptr_store(fx.Vector.from_elements([v4[ii]], fx.Float32), ptr)
-        cbar(L, tid)
         EVEC2 = 8
         NLANE2 = cs_tile_n2 // EVEC2
         rows_per_iter = NW * 64 // NLANE2
         mlane = tid // i32(NLANE2)
         nlane = tid % i32(NLANE2)
-        m_reps = RG // rows_per_iter
+        m_reps = CROWS // rows_per_iter  # read-back iters to cover one 16-row chunk
         n_reps = cs_tile_n2 // (NLANE2 * EVEC2)
-        for mr in range_constexpr(m_reps):
-            row = i32(mr * rows_per_iter) + mlane
-            obase = (e * i32(RG) + row) * i32(H)  # gout bf16 row base
-            for nr in range_constexpr(n_reps):
-                col0 = i32(nr * NLANE2 * EVEC2) + nlane * i32(EVEC2)
-                idx = row * i32(cs_tile_n2) + col0
-                f32_iter = fx.recast_iter(
-                    fx.Float32, fx.add_offset(cptr, fx.make_int_tuple(idx))
-                )
-                frag = fx.make_view(f32_iter, fx.make_layout(EVEC2, 1)).load()
-                gcol = i32(n_tile) * i32(cs_tile_n2) + col0
-                ov = fx.Vector.from_elements(
-                    [fx.Float32(frag[v]).to(fx.BFloat16) for v in range(EVEC2)],
-                    fx.BFloat16,
-                )
-                bst(ov, r_gout, (obase + gcol) * i32(2), 0, 0)
-        wait_lgkm0()
-        cbar(L, tid)
+        for mi in range_constexpr(M_REPEAT):
+            for ni in range_constexpr(NUM_ACC_N2):
+                v4 = fx.Vector(acc[mi * NUM_ACC_N2 + ni])
+                col = cbase + i32(ni * 16) + l16
+                for ii in range_constexpr(4):
+                    lrow = ld4 + i32(ii)  # local row 0..15 within this mi chunk
+                    idx = lrow * i32(cs_tile_n2) + col
+                    ptr = fx.add_offset(cptr, fx.make_int_tuple(idx))
+                    fx.ptr_store(fx.Vector.from_elements([v4[ii]], fx.Float32), ptr)
+            cbar(L, tid)
+            for mr in range_constexpr(m_reps):
+                lrow = i32(mr * rows_per_iter) + mlane  # local row 0..15
+                obase = (e * i32(RG) + i32(mi * 16) + lrow) * i32(H)  # gout bf16 row base
+                for nr in range_constexpr(n_reps):
+                    col0 = i32(nr * NLANE2 * EVEC2) + nlane * i32(EVEC2)
+                    idx = lrow * i32(cs_tile_n2) + col0
+                    f32_iter = fx.recast_iter(
+                        fx.Float32, fx.add_offset(cptr, fx.make_int_tuple(idx))
+                    )
+                    frag = fx.make_view(f32_iter, fx.make_layout(EVEC2, 1)).load()
+                    gcol = i32(n_tile) * i32(cs_tile_n2) + col0
+                    ov = fx.Vector.from_elements(
+                        [fx.Float32(frag[v]).to(fx.BFloat16) for v in range(EVEC2)],
+                        fx.BFloat16,
+                    )
+                    bst(ov, r_gout, (obase + gcol) * i32(2), 0, 0)
+            wait_lgkm0()
+            cbar(L, tid)
 
     def _gemm2_core(L, tid, a, expert, e, epi, uord, nt_lo, ntpu):
         """Shared GEMM2 pipeline body for echunk ``e``: A = inter[e*RG..] (non-indexed,
@@ -707,13 +715,14 @@ def build_gemm(kc: KernelCtx) -> dict:
 
     # ================= GEMM2 with FUSED combine (P==1 overlap path) ================
     @flyc.jit
-    def _scatter_combine(L, tid, a, e, rows, n_tile, cptr):
-        """Scatter this n-tile's cshuffled C-tile slice (the H cols
-        ``[n_tile*TILE_N2, +TILE_N2)``) of each VALID row straight to its source rank's
-        ``part`` (async AUX_SYS P2P -- only xGMI, no local-HBM gout round-trip, so it
-        overlaps the next n-tile's MFMA).  Mirrors ``combine_send`` EXACTLY (wave-strided
-        rows, lane-strided V4I cols; only valid rows iterated so padding is skipped) --
-        the sole change is reading the LDS C-tile (``cptr``) instead of global ``gout``."""
+    def _scatter_combine(L, tid, a, e, rows, n_tile, cptr, row_lo):
+        """Scatter ONE cshuffle chunk (global rows ``[row_lo, row_lo+CROWS)``) of this
+        n-tile's C-tile slice (the H cols ``[n_tile*TILE_N2, +TILE_N2)``) of each VALID row
+        straight to its source rank's ``part`` (async AUX_SYS P2P -- only xGMI, no local-HBM
+        gout round-trip, so it overlaps the next chunk's cshuffle).  Mirrors ``combine_send``
+        (wave-strided rows, lane-strided V4I cols; padding skipped) but reads the LDS C-tile
+        (``cptr``) at the chunk-LOCAL row ``lr`` (0..CROWS-1); the C-tile now holds only this
+        16-row chunk (see ``_epilogue_g2``'s per-mi cshuffle)."""
         HV = H // 8
         mtpr = a["mtpr"]
         r_rowidx = rsrc(a["rowidx"])
@@ -721,8 +730,10 @@ def build_gemm(kc: KernelCtx) -> dict:
         lane = tid % i32(64)
         NV = cs_tile_n2 // 8  # V4I (8-bf16) cols produced by this n-tile
         hv0 = i32(n_tile) * i32(NV)  # this n-tile's base in the row's HV V4I cols
-        for k_ in range(wave, rows, i32(NW)):
-            k = i32(k_)
+        hi = fx.min(i32(CROWS), rows - row_lo)  # valid rows within this chunk (>=0)
+        for lr_ in range(wave, hi, i32(NW)):
+            lr = i32(lr_)  # chunk-local row 0..CROWS-1 (== C-tile row)
+            k = row_lo + lr  # global row within the echunk
             idx = fx.Int32(bld(r_rowidx, (e * i32(RG) + k) * i32(4), 0, T.i32, 0))
             sk = idx // i32(TOPK)
             route = idx - sk * i32(TOPK)
@@ -733,7 +744,7 @@ def build_gemm(kc: KernelCtx) -> dict:
             for g_ in range(lane, i32(NV), i32(64)):
                 g = i32(g_)
                 col0 = g * i32(8)
-                cidx = k * i32(cs_tile_n2) + col0
+                cidx = lr * i32(cs_tile_n2) + col0  # C-tile LOCAL row
                 f32_iter = fx.recast_iter(
                     fx.Float32, fx.add_offset(cptr, fx.make_int_tuple(cidx))
                 )
@@ -743,17 +754,19 @@ def build_gemm(kc: KernelCtx) -> dict:
                     fx.BFloat16,
                 )
                 bst(ov, dpart, (pbase + g) * i32(16), 0, AUX_SYS)
-        # the remote part stores overlap the next n-tile's MFMA (gemm2_combine drains
+        # the remote part stores overlap the next chunk's cshuffle (gemm2_combine drains
         # them once at the end, before the arrives); the cptr (LDS) reads must finish
-        # before the next n-tile's cshuffle overwrites the C-tile.
+        # before the next chunk's cshuffle overwrites the C-tile.
         wait_lgkm0()
         cbar(L, tid)
 
     def _epilogue_g2_combine(L, tid, acc, n_tile, cptr, a, e, rows):
-        """Fused-combine GEMM2 epilogue: cshuffle the accumulators to the LDS C-tile (same
-        as ``_epilogue_g2``), then ``_scatter_combine`` sends each row's bf16 output
-        straight to its source ``part`` (no gout) -- the cross-rank P2P overlaps the next
-        n-tile's MFMA."""
+        """Fused-combine GEMM2 epilogue, per-mi (CROWS=16-row) chunked like ``_epilogue_g2``:
+        for each mi, cshuffle that mi's accumulators into the 16-row C-tile, then
+        ``_scatter_combine`` sends those rows' bf16 output straight to each source ``part``
+        (no gout) -- the cross-rank P2P overlaps the next mi's cshuffle.  Same shuffled
+        layout as before (8-bf16 V4I/lane) so the P2P stays coalesced; only the C-tile is
+        now reused per-mi so the block fits 2 CTAs/CU."""
         wave = tid // i32(64)
         lane = tid % i32(64)
         l16 = lane % i32(16)
@@ -764,12 +777,12 @@ def build_gemm(kc: KernelCtx) -> dict:
                 v4 = fx.Vector(acc[mi * NUM_ACC_N2 + ni])
                 col = cbase + i32(ni * 16) + l16
                 for ii in range_constexpr(4):
-                    row = i32(mi * 16) + ld4 + i32(ii)
-                    idx = row * i32(cs_tile_n2) + col
+                    lrow = ld4 + i32(ii)  # local row 0..15 within this mi chunk
+                    idx = lrow * i32(cs_tile_n2) + col
                     ptr = fx.add_offset(cptr, fx.make_int_tuple(idx))
                     fx.ptr_store(fx.Vector.from_elements([v4[ii]], fx.Float32), ptr)
-        cbar(L, tid)
-        _scatter_combine(L, tid, a, e, rows, n_tile, cptr)
+            cbar(L, tid)
+            _scatter_combine(L, tid, a, e, rows, n_tile, cptr, i32(mi * 16))
 
     @flyc.jit
     def gemm2_combine(L, tid, a, expert, e, rows, uord):
