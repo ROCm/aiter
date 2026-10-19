@@ -261,6 +261,10 @@ def qwen_vae_conv2d(height, width):
 # has no such argument.
 _X3, _W3 = (1, 32, 4, 16, 16), (48, 32, 3, 3, 3)
 _X2, _W2 = (1, 96, 64, 64), (96, 96, 3, 3)
+# kH x kW reuse at 8x32 output blocks, forced rather than taken from a table.
+_KH8 = {"tile": (256, 96, 4, 1), "block_rows": 8}
+_NHWC = {"input_layout": "NHWC", "output_layout": "NHWC"}
+_NDHWC = {"input_layout": "NDHWC", "output_layout": "NDHWC"}
 
 # (case, rank, xshape, wshape, kw, ref_kw, bias)
 KW_CASES = [
@@ -392,20 +396,14 @@ KW_CASES = [
         {"padding": 1},
         True,
     ),
-    # kH x kW reuse, forced: block_rows=8 makes 8x32 output blocks, so these do
-    # not depend on what the tuned tables pick. Ho/Wo leave an H and a W tail.
+    # kH x kW reuse forced (_KH8), independently of the tuned tables. Ho/Wo
+    # leave an H and a W tail; stride 2 must be declined by the plan.
     (
         "2d_block_rows8_nhwc",
         2,
         (1, 96, 37, 70),
         _W2,
-        {
-            "padding": 1,
-            "tile": (256, 96, 4, 1),
-            "block_rows": 8,
-            "input_layout": "NHWC",
-            "output_layout": "NHWC",
-        },
+        {"padding": 1, **_KH8, **_NHWC},
         {"padding": 1},
         True,
     ),
@@ -414,13 +412,7 @@ KW_CASES = [
         3,
         (1, 96, 4, 20, 45),
         (96, 96, 3, 3, 3),
-        {
-            "padding": 1,
-            "tile": (256, 96, 4, 1),
-            "block_rows": 8,
-            "input_layout": "NDHWC",
-            "output_layout": "NDHWC",
-        },
+        {"padding": 1, **_KH8, **_NDHWC},
         {"padding": 1},
         True,
     ),
@@ -429,22 +421,16 @@ KW_CASES = [
         2,
         (1, 96, 37, 70),
         _W2,
-        {
-            "padding": (1, 2),
-            "dilation": (1, 2),
-            "tile": (256, 96, 4, 1),
-            "block_rows": 8,
-        },
+        {"padding": (1, 2), "dilation": (1, 2), **_KH8},
         {"padding": (1, 2), "dilation": (1, 2)},
         True,
     ),
-    # Stride 2: make_im2col_plan declines block_rows and the default path runs.
     (
         "2d_block_rows8_gated_s2",
         2,
         (1, 96, 41, 81),
         _W2,
-        {"stride": 2, "padding": 1, "tile": (256, 96, 4, 1), "block_rows": 8},
+        {"stride": 2, "padding": 1, **_KH8},
         {"stride": 2, "padding": 1},
         True,
     ),
@@ -677,7 +663,7 @@ def test_block_rows_static(dtype):
     x = torch.randn((1, 96, 37, 70), device="cuda", dtype=dtype)
     w = torch.randn(_W2, device="cuda", dtype=dtype)
     b = torch.randn(_W2[0], device="cuda", dtype=dtype)
-    kw = {"padding": 1, "tile": (256, 96, 4, 1), "block_rows": 8}
+    kw = {"padding": 1, **_KH8}
     saved = conv_kernels.AITER_CONV3D_DYN_HW
     conv_kernels.AITER_CONV3D_DYN_HW = 0
     try:

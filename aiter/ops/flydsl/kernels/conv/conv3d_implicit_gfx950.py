@@ -43,7 +43,6 @@ from .conv3d_im2col import (
     Im2colGather,
     PatchGather,
     StripGather,
-    grid_out_block,
     make_im2col_plan,
     patch_needs_park,
     strip_elems,
@@ -213,9 +212,7 @@ def _assert_shape_agnostic(param, cfg, kernel_grid, im2col_plan, scatter_plan, u
     try:
         probe_geom = make_conv_geometry(probe)
         probe_im2col = make_im2col_plan(probe, probe_geom, cfg)
-        probe_grid = make_launch_grid(
-            probe, probe_geom, cfg, grid_out_block(probe_im2col)
-        )
+        probe_grid = make_launch_grid(probe, probe_geom, cfg, probe_im2col.out_block)
         if probe_grid.m_chunks != 1:
             # The probe needs M chunking, which this path rules out anyway.
             return
@@ -270,7 +267,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
 
     # How the work is spread: the grid, its limits, and what a block decodes
     # to find its own (M, N, K) tile.
-    grid = make_launch_grid(param, geom, cfg, grid_out_block(im2col_plan))
+    grid = make_launch_grid(param, geom, cfg, im2col_plan.out_block)
 
     # How C is written back: the 5D scatter, the tail masking and the split-K
     # staging, against the same grid the gather reads A on.
@@ -300,6 +297,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         static_in_ext = static_input_extents(param)
 
     elem_ty = fx.BFloat16
+    N_CC = geom.cgp // cfg.tile_k
     if const_expr(im2col_plan.kh_reuse):
         assert (
             not grid.use_splitk
@@ -314,7 +312,6 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
                 cfg, im2col_plan.patch_ldg, im2col_plan.patch_alloc_vecs
             ),
         )
-        N_CC = geom.cgp // cfg.tile_k
         # One group = one (kt, channel block): all kH*kW taps read one patch.
         KH_GROUPS = [(kt_i, cc) for kt_i in range(param.kt) for cc in range(N_CC)]
         KH_STEPS = [
@@ -328,7 +325,6 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         STRIP_ELEMS = strip_elems(im2col_plan)
         SharedStorage = make_shared_storage(elem_ty, cfg, STRIP_ELEMS, param.kw)
         # One group = one (kt, kh, channel block); its KW taps share a strip.
-        N_CC = geom.cgp // cfg.tile_k
         GROUPS = [
             (kt_i, kh_i, cc)
             for kt_i in range(param.kt)

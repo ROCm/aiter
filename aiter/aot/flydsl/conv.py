@@ -61,10 +61,7 @@ from aiter.ops.flydsl.kernels.conv.conv3d_gfx950_utils import (
     out_extent,
     unit_divisors,
 )
-from aiter.ops.flydsl.kernels.conv.conv3d_im2col import (
-    grid_out_block,
-    make_im2col_plan,
-)
+from aiter.ops.flydsl.kernels.conv.conv3d_im2col import make_im2col_plan
 from aiter.ops.flydsl.kernels.conv.conv3d_implicit_gfx950 import (
     _dyn_hw_closure_key,
     compile_conv3d_implicit,
@@ -138,7 +135,7 @@ def _conv_dedupe_key(job):
         cfg = make_tile_config(param.tile)
         geom = make_conv_geometry(param)
         im2col_plan = make_im2col_plan(param, geom, cfg)
-        grid = make_launch_grid(param, geom, cfg, grid_out_block(im2col_plan))
+        grid = make_launch_grid(param, geom, cfg, im2col_plan.out_block)
         closure = _dyn_hw_closure_key(
             grid._replace(grid_x=0, grid_z=0, grid_m=0),
             im2col_plan,

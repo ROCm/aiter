@@ -17,6 +17,7 @@ pays a pre-transpose on top that no tile choice affects.
         -o aiter/configs/model_configs/qwenimage_vae_bf16_tuned_conv3d.csv
 """
 
+import functools
 import os
 import time
 from typing import Any, ClassVar
@@ -367,24 +368,25 @@ class Conv3dTuner(TunerCommon):
             except AssertionError:
                 return None  # the gather cannot reach this tile's span
 
+        @functools.cache
         def block_rows_options(tile):
-            # 1 (consecutive rows), plus every 2D output block the plan takes up.
-            opts = [1]
+            # (block_rows, plan): 1 (consecutive rows), plus every 2D output
+            # block the plan takes up. Cached: the policy's relaxation passes and
+            # the candidate filter below ask for the same tiles.
+            opts = [(1, plan_for(tile, 1))]
             for cols in BLOCK_COLS:
                 rows = tile[0] // cols
                 if rows >= 2 and rows * cols == tile[0]:
                     plan = plan_for(tile, rows)
                     if plan is not None and plan.kh_reuse:
-                        opts.append(rows)
+                        opts.append((rows, plan))
             return opts
 
         def lds_bytes_fn(tile):
             # The LDS the runtime will allocate for this tile on this shape:
             # the kW / kH x kW reuse layouts differ from the default path's.
             sizes = [
-                plan_lds_bytes(plan)
-                for plan in (plan_for(tile, r) for r in block_rows_options(tile))
-                if plan is not None
+                plan_lds_bytes(p) for _, p in block_rows_options(tile) if p is not None
             ]
             return min(sizes) if sizes else float("inf")
 
@@ -406,8 +408,8 @@ class Conv3dTuner(TunerCommon):
         candidates = [
             (*cfg5, r)
             for cfg5 in configs
-            for r in block_rows_options(tuple(cfg5[:4]))
-            if r == 1 or plan_lds_bytes(plan_for(tuple(cfg5[:4]), r)) <= max_lds_bytes()
+            for r, plan in block_rows_options(tuple(cfg5[:4]))
+            if r == 1 or plan_lds_bytes(plan) <= max_lds_bytes()
         ]
         if borrowed is not None:
             b = (*borrowed[0], borrowed[1], borrowed[3])

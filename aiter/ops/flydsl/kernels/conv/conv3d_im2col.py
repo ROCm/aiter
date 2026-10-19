@@ -95,7 +95,8 @@ class Im2colPlan(NamedTuple):
     # kH x kW reuse: a block owns an out_block = (rows, cols) patch of output
     # pixels in one (n, t) plane, and all kH*kW taps of one (kt, channel
     # block) read a single LDS patch of patch_rows x patch_cols input pixels.
-    # Takes precedence over kW reuse. Sizes come from the filter and tile.
+    # Takes precedence over kW reuse. Sizes come from the filter and tile;
+    # out_block is None unless kh_reuse.
     kh_reuse: bool
     out_block: object
     patch_rows: int
@@ -157,15 +158,16 @@ def make_im2col_plan(param, geom, cfg):
         )
 
     scalar_k = geom.cgp % tile_k == 0
-    kw_layer_ok = bool(
+    # What both reuse paths need of the layer; AITER_CONV3D_KW_REUSE=0 turns
+    # off every LDS-reuse path.
+    reuse_ok = bool(
         param.kw_reuse
-        and kw > 1
-        and sw == 1
         and scalar_k
         and pad_mode == "zeros"
         and groups == 1
         and param.splitk <= 1
     )
+    kw_layer_ok = reuse_ok and kw > 1 and sw == 1
     strip_halo = (kw - 1) * dw if kw_layer_ok else 0
     strip_rows = tile_m + 2 * strip_halo if kw_layer_ok else 0
     strip_vecs = strip_rows * (tile_k // LDG_VEC)
@@ -180,22 +182,17 @@ def make_im2col_plan(param, geom, cfg):
 
     # kH x kW reuse. cols % 16 keeps every MFMA atom's 16 rows inside one
     # image row of the patch. The epilogue masks the H/W tails through the
-    # output descriptor, which BIG_OUT does not have. param.kw_reuse gates it
-    # too, so AITER_CONV3D_KW_REUSE=0 turns off every LDS-reuse path.
+    # output descriptor, which BIG_OUT does not have.
     rows = param.block_rows
     cols = tile_m // rows if rows > 0 and tile_m % rows == 0 else 0
-    kh_layer_ok = bool(
-        param.kw_reuse
+    kh_layer_ok = (
+        reuse_ok
         and rows > 1
         and cols > 0
         and cols % 16 == 0
         and (kh > 1 or kw > 1)
         and sh == 1
         and sw == 1
-        and scalar_k
-        and pad_mode == "zeros"
-        and groups == 1
-        and param.splitk <= 1
     )
     patch_rows = rows + (kh - 1) * dh if kh_layer_ok else 0
     patch_cols = cols + (kw - 1) * dw if kh_layer_ok else 0
@@ -261,7 +258,7 @@ def make_im2col_plan(param, geom, cfg):
         strip_rows=strip_rows,
         strip_ldg=strip_ldg,
         kh_reuse=kh_reuse,
-        out_block=(rows, cols) if kh_layer_ok else None,
+        out_block=(rows, cols) if kh_reuse else None,
         patch_rows=patch_rows,
         patch_cols=patch_cols,
         patch_ldg=patch_ldg,
@@ -282,11 +279,6 @@ def _reuse_lds_bytes(cfg, strip_ldg, kw):
     strip = strip_ldg * cfg.block_threads * LDG_VEC
     stage = strip + kw * cfg.tile_n * cfg.tile_k
     return BF16_BYTES * (KW_REUSE_STAGES * stage + b_park_elems(cfg))
-
-
-def grid_out_block(plan):
-    """``out_block`` for ``make_launch_grid``: the 2D block when kH x kW reuse applies."""
-    return plan.out_block if plan.kh_reuse else None
 
 
 def patch_needs_park(cfg, patch_ldg, patch_alloc_vecs):
