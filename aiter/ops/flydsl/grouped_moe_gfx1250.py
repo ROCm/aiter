@@ -663,6 +663,13 @@ def _grouped_a8w4_tdm_moe(
     wmma_rep = get_wmma_m_rep(tile_m, tile_n, m_warp, n_warp, "gemm1")
     wmma_rep2 = get_wmma_m_rep(tile_m2, tile_n2, m_warp2, n_warp2, "gemm2")
     _align_m = max(tile_m, tile_m2)
+    # Alignment-gap suppression is useful in decode, with fewer activated experts. 
+    # Heuristic to check for how dense the routing is to determine decode vs prefill.
+    _routed_rows = int(token_num) * int(topk)
+    _routing_density = (_routed_rows + int(E) - 1) // int(E)
+    _sparse_routing = _routing_density <= _align_m
+    _stage1_m_alignment = _align_m if _sparse_routing else tile_m
+    _stage2_m_alignment = _align_m if _sparse_routing else tile_m2
     # Both GEMMs walk the same contiguous layout, each with its own tile height,
     # so every expert must start on a row that is a multiple of both. Aligning to
     # the larger tile only achieves that when it is a multiple of the smaller one.
@@ -1085,6 +1092,7 @@ def _grouped_a8w4_tdm_moe(
             quant_scale=a2_scale,
             quant_wmma_rep=wmma_rep2,
             persistent_workers=persistent_workers,
+            m_alignment=_stage1_m_alignment,
             cluster_m=cluster_m,
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
@@ -1124,6 +1132,7 @@ def _grouped_a8w4_tdm_moe(
             swiglu_limit=sl,
             num_buffers=num_buffers,
             persistent_workers=persistent_workers,
+            m_alignment=_stage1_m_alignment,
             cluster_m=cluster_m,
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
@@ -1172,6 +1181,7 @@ def _grouped_a8w4_tdm_moe(
         bias=_b2,
         num_buffers=num_buffers2,
         persistent_workers=persistent_workers2,
+        m_alignment=_stage2_m_alignment,
         cluster_m=cluster_m2,
         cluster_n=cluster_n2,
         waves_per_tensor_tdm=waves_per_tensor_tdm2,
@@ -1254,6 +1264,7 @@ def _grouped_a8w4_tdm_moe(
                         quant_scale=a2_scale,
                         quant_wmma_rep=wmma_rep2,
                         persistent_workers=persistent_workers,
+                        m_alignment=_stage1_m_alignment,
                         cluster_m=cluster_m,
                         cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
@@ -1295,6 +1306,7 @@ def _grouped_a8w4_tdm_moe(
                         swiglu_limit=sl,
                         num_buffers=num_buffers,
                         persistent_workers=persistent_workers,
+                        m_alignment=_stage1_m_alignment,
                         cluster_m=cluster_m,
                         cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
@@ -1334,6 +1346,7 @@ def _grouped_a8w4_tdm_moe(
                     bias=_b2,
                     num_buffers=num_buffers2,
                     persistent_workers=persistent_workers2,
+                    m_alignment=_stage2_m_alignment,
                     cluster_m=cluster_m2,
                     cluster_n=cluster_n2,
                     waves_per_tensor_tdm=waves_per_tensor_tdm2,

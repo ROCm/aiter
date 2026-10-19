@@ -171,6 +171,7 @@ def launch_gemm_a8w4_tdm(
     lds_soa_load_interleave: Constexpr[int] = 0,
     persistent_workers: Constexpr[int] = 0,
     rolled_drain: Constexpr[int] = 0,
+    m_alignment: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -224,6 +225,8 @@ def launch_gemm_a8w4_tdm(
     WAVE = 32
     PACK_TK = tile_k // 2
     KWS = tile_k // WMMA_K
+    ROW_ALIGNMENT = m_alignment if m_alignment else tile_m
+    assert ROW_ALIGNMENT % tile_m == 0, "row alignment must divide into M tiles"
     # Double buffering is sufficient: the carry reads the other LDS buffer
     # before the post-compute barrier permits reusing the current buffer.
     next_stage_on = 1 if (next_stage_prefetch and num_buffers >= 2) else 0
@@ -273,6 +276,7 @@ def launch_gemm_a8w4_tdm(
         ep_quant_bits,
         persistent_workers,
         rolled_drain,
+        ROW_ALIGNMENT,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -554,6 +558,17 @@ def launch_gemm_a8w4_tdm(
                 lo = go_right.select(mid + 1, lo)
                 hi = go_right.select(hi, mid)
             expert = lo
+        if const_expr(ROW_ALIGNMENT > tile_m):
+            # Skips padding between experts, free more resources in decode
+            expert_safe = (expert < n_experts).select(expert, n_experts - 1)
+            has_prev_expert = expert_safe > 0
+            prev_expert = has_prev_expert.select(expert_safe - 1, 0)
+            prev_end = tile_map[prev_expert]
+            aligned_prev_end = (
+                (prev_end + ROW_ALIGNMENT - 1) // ROW_ALIGNMENT * ROW_ALIGNMENT
+            )
+            expert_start = has_prev_expert.select(aligned_prev_end, 0)
+            has_work = has_work & (expert < n_experts) & (blk_m >= expert_start)
         eb64 = fx.Int64(expert)
         B_BATCH_ROWS = n64 // 16
         N_SUPERS = ceildiv(n64, 32)

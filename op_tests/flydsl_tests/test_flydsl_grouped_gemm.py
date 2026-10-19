@@ -584,33 +584,38 @@ def _gemm_work_metrics(
     """Return conventional GEMM FLOPs and effective fused-MoE bytes.
 
     The byte model matches the grouped-MoE tuner: logical quantized inputs and
-    weights, their E8M0 block scales, and BF16 outputs. GEMM1 counts the
-    post-activation output, whose width is ``inter_dim``; GEMM2 counts its
-    per-route output before gather-reduce. The model excludes routing,
-    quantization, bias, and other fused-MoE auxiliary traffic, so the reported
-    bandwidth is effective bandwidth rather than measured HBM traffic.
+    weights for the active experts, their E8M0 block scales, and BF16 outputs.
+    GEMM1 counts the post-activation output, whose width is ``inter_dim``;
+    GEMM2 counts its per-route output before gather-reduce. Without an explicit
+    active-expert override, ``min(experts, tokens * topk)`` is a conservative
+    upper bound. The model excludes routing, quantization, bias, and other
+    fused-MoE auxiliary traffic, so the reported bandwidth is effective
+    bandwidth rather than measured HBM traffic.
     """
     input_bytes = 0.5 if data_format == "a4w4" else 1.0
     weight_bytes = 0.5
     output_bytes = 2.0
     stage1_n = 2 * inter_dim
     routed_rows = tokens * topk
+    active_experts = min(experts, routed_rows)
+    if AITER_MOE_NUM_EXPERT_ACTIVATED > 0:
+        active_experts = min(active_experts, AITER_MOE_NUM_EXPERT_ACTIVATED)
 
     gemm1_flops = routed_rows * stage1_n * model_dim * 2
     gemm1_bytes = (
         routed_rows * model_dim * input_bytes
         + routed_rows * model_dim // SCALE_BLOCK
         + routed_rows * inter_dim * output_bytes
-        + experts * model_dim * stage1_n * weight_bytes
-        + experts * model_dim * stage1_n // SCALE_BLOCK
+        + active_experts * model_dim * stage1_n * weight_bytes
+        + active_experts * model_dim * stage1_n // SCALE_BLOCK
     )
     gemm2_flops = tokens * topk * model_dim * inter_dim * 2
     gemm2_bytes = (
         tokens * topk * inter_dim * input_bytes
         + routed_rows * inter_dim // SCALE_BLOCK
         + routed_rows * model_dim * output_bytes
-        + experts * inter_dim * model_dim * weight_bytes
-        + experts * inter_dim * model_dim // SCALE_BLOCK
+        + active_experts * inter_dim * model_dim * weight_bytes
+        + active_experts * inter_dim * model_dim // SCALE_BLOCK
     )
     return {
         "gemm1": (gemm1_flops, gemm1_bytes),
@@ -837,6 +842,41 @@ def test_grouped_a8w4_situv2_matches_torch_ref():
         inter_dim=512,
         tol=VERIFY_TOL_A8W4,
     )
+
+
+@pytest.mark.parametrize("persistent_workers2", [0, 96])
+def test_grouped_a8w4_stage2_finer_tile_skips_alignment_gaps(
+    monkeypatch, persistent_workers2
+):
+    """Stage2 M16 must skip the three padding tiles in each M64 expert slab."""
+    from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
+
+    monkeypatch.setattr(sys.modules[__name__], "AITER_MOE_NUM_EXPERT_ACTIVATED", 64)
+    monkeypatch.setenv("AITER_FORCE_A8W4", "1")
+    monkeypatch.setenv("AITER_TDM_TILE_M2", "16")
+    monkeypatch.setenv("AITER_TDM_TILE_N2", "512")
+    monkeypatch.setenv("AITER_TDM_TILE_K2", "128")
+    monkeypatch.setenv("AITER_TDM_M_WARP2", "1")
+    monkeypatch.setenv("AITER_TDM_N_WARP2", "2")
+    monkeypatch.setenv("AITER_TDM_NUM_BUFFERS2", "1")
+    monkeypatch.setenv("AITER_FLYDSL_PERSISTENT_WORKERS2", str(persistent_workers2))
+    grouped._GROUPED_CONFIG_CACHE.clear()
+    grouped._find_grouped_config.cache_clear()
+    try:
+        run_moe(
+            "a8w4",
+            experts=384,
+            tokens=8,
+            topk=8,
+            model_dim=7168,
+            inter_dim=256,
+            activation=ActivationType.Silu,
+            use_bias=False,
+            check_aot_cache=False,
+        )
+    finally:
+        grouped._GROUPED_CONFIG_CACHE.clear()
+        grouped._find_grouped_config.cache_clear()
 
 
 @pytest.mark.parametrize("activation", [ActivationType.Silu, ActivationType.Swiglu])
@@ -1333,13 +1373,11 @@ def main() -> None:
         run_csv_scenario(args)
         return
 
-    # The >=512 floor is a FlyDSL grouped-kernel constraint (tile_k=256 needs two
-    # K tiles).
-    if args.model_dim < 512 or args.inter_dim < 512:
+    min_inter_dim = 256 if args.data_format == "a8w4" else 512
+    if args.model_dim < 512 or args.inter_dim < min_inter_dim:
         raise SystemExit(
             f"model_dim ({args.model_dim}) and inter_dim ({args.inter_dim}) must be "
-            "at least 512 for the grouped GEMM kernels (tile_k=256 requires at "
-            "least two K tiles)."
+            f"at least 512/{min_inter_dim} for {args.data_format} grouped GEMM."
         )
 
     set_data_format(args.data_format)
