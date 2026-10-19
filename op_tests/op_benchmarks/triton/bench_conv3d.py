@@ -5,6 +5,7 @@
 import argparse
 import csv
 import json
+import os
 import statistics
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -32,6 +33,7 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
     override_parser_action,
 )
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import BASE_DIR
 from op_tests.triton_tests.conv._helpers import (
     _winograd_tolerances,
     apply_activation,
@@ -48,7 +50,6 @@ METHODS = (
     "winograd_cblocked",
 )
 _DEFAULT_MODEL = "wan22-a14b-vae"
-_MODEL_SHAPES_PATH = Path(__file__).with_name("conv_shapes.json")
 
 
 @dataclass(frozen=True)
@@ -108,8 +109,8 @@ def _torch_dtype(name: str) -> torch.dtype:
     return {"fp16": torch.float16, "bf16": torch.bfloat16}[name]
 
 
-def _load_model_cases(pattern: str) -> tuple[str, list[Conv3DCase]]:
-    with _MODEL_SHAPES_PATH.open() as file:
+def _load_model_cases(pattern: str, config_path: str) -> tuple[str, list[Conv3DCase]]:
+    with open(os.path.join(BASE_DIR, config_path)) as file:
         data = json.load(file)
     matches = [
         model
@@ -155,7 +156,7 @@ def _load_cases(args) -> tuple[str, list[Conv3DCase]]:
         ]
     if args.smoke:
         return "smoke", list(EDGE_CASES)
-    model, cases = _load_model_cases(args.model or _DEFAULT_MODEL)
+    model, cases = _load_model_cases(args.model or _DEFAULT_MODEL, args.model_configs)
     if args.batch_size is not None:
         cases = [
             replace(case, dims=(args.batch_size, *case.dims[1:])) for case in cases
@@ -684,6 +685,12 @@ def run_benchmark(args) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = get_parser(kernel_name="bench_conv3d")
+    override_parser_action(
+        parser,
+        action="--model-configs",
+        default="utils/conv_shapes.json",
+        help="Conv3D shapes JSON file (sweep mode).",
+    )
     source = parser.add_mutually_exclusive_group()
     source.add_argument(
         "--shape",
