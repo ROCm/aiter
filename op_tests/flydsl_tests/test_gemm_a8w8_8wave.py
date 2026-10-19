@@ -3,15 +3,8 @@
 
 """Correctness of the 8-wave a8w8 bpreshuffle GEMM.
 
-The peeled tail pre-reads the last K step's B0 and A0 before the wait that
-covers their producers, so it can read LDS the producing loads have not
-finished writing. It shows up as a handful of wrong rows rather than a NaN --
-small enough to pass for quantisation noise. Whether it happens at all depends
-on how the waves interleave, so a shape can be clean on one launch and wrong on
-the next; each shape is therefore run several times.
-
-``K=256`` is the shape that pins the fix to the tail: ``K_ITERS == 2`` makes the
-main loop run zero times, so no amount of tightening *there* can cover it.
+A missing LDS sync shows up as a few wrong rows on some launches only, so each
+shape runs several times. K=256 has no main-loop iterations.
 """
 
 import argparse
@@ -26,9 +19,7 @@ torch.set_default_device("cuda")
 
 SUPPORTED_GFX = ["gfx950"]
 
-# (M, N, K, block_m, block_n). Most are drawn from the tuned configs that
-# select this kernel; K=256 and K=512 are not tuned shapes but are legal, and
-# the first is the one the main loop cannot reach.
+# (M, N, K, block_m, block_n); mostly from the tuned configs.
 SHAPES = [
     (4096, 7168, 256, 256, 256),
     (4096, 7168, 512, 256, 256),
@@ -40,9 +31,7 @@ SHAPES = [
     (32768, 7168, 1792, 256, 256),
 ]
 REPS = 6
-# A dropped load leaves whole rows wrong by far more than this, so counting
-# offending elements separates cleanly: zero when correct, thousands when not.
-# An L2 norm would not -- the bad rows are a small fraction of a large output.
+# Count elements off by >5%; an L2 norm hides a few wrong rows.
 REL_TOL = 0.05
 
 
@@ -54,13 +43,10 @@ def run_shape(m, n, k, block_m, block_n, reps, verbose=False):
     b_scale = torch.rand(n, 1, generator=gen) + 0.5
     b_shuffled = shuffle_weight(b, (16, 16))
 
-    # rounded to the kernel's output precision, so the comparison sees the
-    # kernel's error rather than bf16's
+    # Rounded to bf16 like the kernel output.
     ref = ((a.float() * a_scale) @ (b.float() * b_scale).T).to(torch.bfloat16).float()
 
-    # Floor the per-element tolerance well below a typical output but above
-    # zero: elements that cancel to near nothing disagree with torch on
-    # summation order alone, and that is not what this test is looking for.
+    # Tolerance floor, so near-zero outputs are not judged on summation order.
     floor = 0.01 * ref.square().mean().sqrt()
 
     worst = 0
