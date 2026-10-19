@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import triton
 import pytest
+import torch
+import torch.nn.functional as F
+import triton
+
 from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_a16w16 import (
     fused_gemm_afp4wfp4_a16w16,
+)
+from aiter.ops.triton.utils._triton import arch_info
+from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
+    generate_gemm_a16w16_inputs,
 )
 from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
     generate_gemm_afp4wfp4_inputs,
@@ -13,11 +19,6 @@ from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
 from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
     run_torch as run_torch_fp4,
 )
-from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
-    generate_gemm_a16w16_inputs,
-)
-import torch.nn.functional as F
-import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 
 def run_torch(
@@ -101,7 +102,7 @@ def test_gemm(dtype, M, N1, N2, K, output, skip_reduce, fp4_shuffle):
         w_fp4_scale,
         x_fp4_scale_triton,
         w_fp4_scale_triton,
-        out_dtype,
+        _out_dtype,
         y_fp4,
     ) = generate_gemm_afp4wfp4_inputs(
         M,

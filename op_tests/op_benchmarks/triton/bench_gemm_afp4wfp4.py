@@ -1,25 +1,28 @@
+import math
+
 import torch
 import triton
-import math
+
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4 as triton_gemm_afp4wfp4,
+)
+from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4_preshuffle,
 )
-from aiter.ops.triton.gluon.gemm_afp4wfp4 import gemm_afp4wfp4 as gluon_gemm_afp4wfp4
-from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
-    generate_gemm_afp4wfp4_inputs,
-)
+from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.utils.argparse import (
-    get_parser,
     add_argparse_ff,
     get_ff_args,
+    get_parser,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_benchmark_object,
     get_shape_benchmark_object,
     print_vgpr,
 )
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
+    generate_gemm_afp4wfp4_inputs,
+)
 
 
 def bench_gemm_fn(
@@ -54,16 +57,16 @@ def bench_gemm_fn(
     mem = mem_read + mem_write
     if preshuffle:
         ms = triton.testing.do_bench(
-            lambda: gemm_afp4wfp4_preshuffle(
-                x, w, x_scale, w_scale, c_dtype, y, use_aot=True
-            ),
+            lambda: gemm_afp4wfp4_preshuffle(x, w, x_scale, w_scale, c_dtype, y),
             warmup=25,
             rep=100,
         )
     else:
         if gluon:
             ms = triton.testing.do_bench(
-                lambda: gluon_gemm_afp4wfp4(x, w, x_scale, w_scale, c_dtype, y),
+                lambda: triton_gemm_afp4wfp4(
+                    x, w, x_scale, w_scale, c_dtype, y, backend="gluon"
+                ),
                 warmup=25,
                 rep=100,
             )
@@ -94,7 +97,7 @@ def run_benchmark(args, defaults):
         unsupported_args = []
         for arg in unsupported_args:
             if getattr(args, arg, None) != getattr(defaults, arg, None):
-                raise Exception(
+                raise RuntimeError(
                     f"Argument '{arg}' is not supported for benchmarking with the --model flag."
                 )
         run_model_benchmark(args)
@@ -106,7 +109,7 @@ def run_benchmark(args, defaults):
         ]
         for arg in unsupported_args:
             if getattr(args, arg, None) != getattr(defaults, arg, None):
-                raise Exception(
+                raise RuntimeError(
                     f"Argument '{arg}' is not supported for benchmarking without the --model flag."
                 )
         run_shape_benchmark(args)
@@ -170,7 +173,7 @@ def main(args: list[str] | None = None) -> None:
     parsed_args, defaults = parse_args(args=args)
     if parsed_args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(parsed_args, defaults)  # noqa: E731
+        fun = lambda: run_benchmark(parsed_args, defaults)
         print_vgpr(fun, "GEMM")
         return
     run_benchmark(parsed_args, defaults)

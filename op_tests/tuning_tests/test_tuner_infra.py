@@ -6,10 +6,11 @@ Level 1: Unit tests for base_tuner infrastructure (no GPU required).
 Covers: CSV I/O, merge/dedup, calculate, post_process (topk selection).
 """
 
+import argparse
 import os
 import tempfile
 import unittest
-import argparse
+
 import pandas as pd
 
 TEST_GFX = "gfx942"
@@ -348,8 +349,7 @@ class TestUpdateConfigFiles(unittest.TestCase):
         path = os.path.join(self.tmpdir, name)
         with open(path, "w") as f:
             f.write(",".join(header) + "\n")
-            for row in rows:
-                f.write(",".join(str(v) for v in row) + "\n")
+            f.writelines(",".join(str(v) for v in row) + "\n" for row in rows)
         return path
 
     def test_single_path_returns_as_is(self):

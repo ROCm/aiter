@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
 import pytest
+import torch
 
 from aiter.ops.triton.quant import (
-    static_per_tensor_quant_fp8_i8,
     dynamic_per_tensor_quant_fp8_i8,
     dynamic_per_token_quant_fp8_i8,
+    static_per_tensor_quant_fp8_i8,
 )
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 

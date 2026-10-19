@@ -42,21 +42,21 @@ import torch.distributed as dist
 
 from aiter import dtypes
 from aiter.dist.communication_op import (
-    tensor_model_parallel_all_reduce,
-    expert_parallel_all_reduce,
     data_parallel_all_reduce,
+    expert_parallel_all_reduce,
+    tensor_model_parallel_all_reduce,
 )
 from aiter.dist.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
     ensure_model_parallel_initialized,
-    get_tp_group,
-    get_ep_group,
     get_dp_group,
-    get_pp_group,
+    get_ep_group,
     get_pcp_group,
+    get_pp_group,
     get_prefill_context_model_parallel_rank,
     get_prefill_context_model_parallel_world_size,
+    get_tp_group,
     init_distributed_environment,
     set_custom_all_reduce,
 )
@@ -66,6 +66,21 @@ from aiter.test_common import checkAllclose
 logger = logging.getLogger("aiter")
 
 set_start_method("spawn", force=True)
+
+
+def barrier_before_teardown():
+    """Align all ranks before tearing down the distributed groups.
+
+    Drain this rank's GPU work, then join a barrier so no rank starts freeing
+    IPC buffers / destroying process groups while a peer is still inside a
+    NCCL / custom-all-reduce collective -- that race intermittently hangs when
+    these comm UTs run back-to-back in CI. No-op if dist is uninitialized.
+    """
+    if not dist.is_initialized():
+        return
+    torch.cuda.synchronize()
+    get_tp_group().barrier()
+    torch.cuda.synchronize()
 
 
 def _worker(
@@ -143,6 +158,7 @@ def _worker(
     }
 
     if dist.is_initialized():
+        barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()

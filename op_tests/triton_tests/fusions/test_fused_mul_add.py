@@ -1,5 +1,6 @@
-import torch
 import pytest
+import torch
+
 from aiter.ops.triton.fusions.fused_mul_add import fused_mul_add
 
 

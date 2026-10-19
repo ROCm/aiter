@@ -8,20 +8,21 @@ This script tests the fully fused Triton kernel that combines multiple operation
 in a single kernel launch for optimal performance.
 """
 
-import torch
-import torch.distributed as dist
-import os
+import logging
 import multiprocessing as mp
+import os
 import sys
 import traceback
-import logging
+
+import torch
+import torch.distributed as dist
 
 import aiter
-from aiter.test_common import checkAllclose, perftest, ensure_spawn_method
 from aiter.ops.triton.comms import (
     IrisCommContext,
     reduce_scatter_rmsnorm_quant_all_gather,
 )
+from aiter.test_common import checkAllclose, ensure_spawn_method, perftest
 
 logger = logging.getLogger("aiter")
 
@@ -125,7 +126,7 @@ def run_fused_kernel(
 
     except Exception as e:
         logger.error(
-            f"\n-->[Error on GPU {gpuID}]: {str(e)}\n"
+            f"\n-->[Error on GPU {gpuID}]: {e!s}\n"
             f"-->[Traceback]: {''.join(traceback.format_exception(*sys.exc_info()))}"
         )
         raise
@@ -470,9 +471,9 @@ if __name__ == "__main__":
         print("All tests passed!")
         print("=" * 80)
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  blanket catch is intentional here
         print("=" * 80)
-        print(f"TEST FAILED: {str(e)}")
+        print(f"TEST FAILED: {e!s}")
         print("=" * 80)
         traceback.print_exc()
         sys.exit(1)

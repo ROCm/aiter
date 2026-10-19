@@ -1,43 +1,58 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import os
-from typing import Optional
-import aiter
-import torch
-import torch.nn.functional as F
-import torch.distributed as dist
 import argparse
 import itertools
-import pandas as pd
-from aiter import dtypes
+import logging
+import os
+from multiprocessing import Pool, freeze_support, set_start_method
 
-from aiter.dist.parallel_state import (
-    ensure_model_parallel_initialized,
-    init_distributed_environment,
-    set_custom_all_reduce,
-    get_tp_group,
-    graph_capture,
-    destroy_model_parallel,
-    destroy_distributed_environment,
-)
-from aiter.dist.utils import get_open_port, get_distributed_init_method, get_ip
+import pandas as pd
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+
+import aiter
+from aiter import dtypes
 from aiter.dist.communication_op import (
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_fused_allreduce_rmsnorm,
     tensor_model_parallel_fused_allreduce_rmsnorm_quant,
 )
+from aiter.dist.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
+    ensure_model_parallel_initialized,
+    get_tp_group,
+    graph_capture,
+    init_distributed_environment,
+    set_custom_all_reduce,
+)
+from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.test_common import (
+    benchmark,
     checkAllclose,
     perftest,
-    benchmark,
 )
-from multiprocessing import set_start_method, Pool, freeze_support
-import logging
 
 logger = logging.getLogger("aiter")
 
 set_start_method("spawn", force=True)
+
+
+def barrier_before_teardown():
+    """Align all ranks before tearing down the distributed groups.
+
+    Drain this rank's GPU work, then join a barrier so no rank starts freeing
+    IPC buffers / destroying process groups while a peer is still inside a
+    NCCL / custom-all-reduce collective -- that race intermittently hangs when
+    these comm UTs run back-to-back in CI. No-op if dist is uninitialized.
+    """
+    if not dist.is_initialized():
+        return
+    torch.cuda.synchronize()
+    get_tp_group().barrier()
+    torch.cuda.synchronize()
 
 
 def fused_ar_rmsnorm(
@@ -48,7 +63,7 @@ def fused_ar_rmsnorm(
     weight,
     eps,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
     post_per_token_quant: bool = False,
 ):
     device = torch.device(f"cuda:{rankID}")
@@ -73,18 +88,17 @@ def fused_ar_rmsnorm(
 
     if withGraph:
         graph = torch.cuda.CUDAGraph()
-        with graph_capture() as gc:
-            with torch.cuda.graph(graph, stream=gc.stream):
-                if not post_per_token_quant:
-                    out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
+        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+            if not post_per_token_quant:
+                out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
+                    x, x, weight, eps
+                )
+            else:
+                out, res_out, scale_out = (
+                    tensor_model_parallel_fused_allreduce_rmsnorm_quant(
                         x, x, weight, eps
                     )
-                else:
-                    out, res_out, scale_out = (
-                        tensor_model_parallel_fused_allreduce_rmsnorm_quant(
-                            x, x, weight, eps
-                        )
-                    )
+                )
         out.fill_(0)
         res_out.fill_(0)
 
@@ -102,12 +116,12 @@ def fused_ar_rmsnorm(
         @perftest()
         def run_ca(x):
             if not post_per_token_quant:
-                out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
+                out, _res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
                     x, x, weight, eps
                 )
                 return out
             else:
-                out, res_out, scale_out = (
+                out, _res_out, scale_out = (
                     tensor_model_parallel_fused_allreduce_rmsnorm_quant(
                         x, x, weight, eps
                     )
@@ -122,6 +136,7 @@ def fused_ar_rmsnorm(
 
     # destroy
     if dist.is_initialized():
+        barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()
@@ -136,7 +151,7 @@ def get_acc_value_with_cudagraph(
     weight,
     eps,
     loop_time=1,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -160,12 +175,9 @@ def get_acc_value_with_cudagraph(
 
     # out = torch.empty_like(x)
     graph = torch.cuda.CUDAGraph()
-    with graph_capture() as gc:
-        with torch.cuda.graph(graph, stream=gc.stream):
-            # out = torch.empty_like(x)
-            out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
-                x, x, weight, eps
-            )
+    with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+        # out = torch.empty_like(x)
+        out, _res_out = tensor_model_parallel_fused_allreduce_rmsnorm(x, x, weight, eps)
     out.fill_(0)
 
     def run_ca():
@@ -179,6 +191,7 @@ def get_acc_value_with_cudagraph(
 
     # destroy
     if dist.is_initialized():
+        barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()
@@ -193,7 +206,7 @@ def get_acc_value_only(
     weight,
     eps,
     loop_time=1,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -210,15 +223,18 @@ def get_acc_value_only(
     weight = weight.to(device)
     # dist.barrier(device_ids=[i for i in range(tp_size)])
 
-    # warmup and align all gpu
-    group = get_tp_group().device_group
+    # warmup and align all gpu. device_group is a plain attribute assigned in
+    # GroupCoordinator.__init__, so the access itself does nothing -- the point is
+    # get_tp_group(), which raises if the TP group was never initialised.
+    _ = get_tp_group().device_group
     torch.cuda.synchronize()
 
     for i in range(loop_time):
-        out, res = tensor_model_parallel_fused_allreduce_rmsnorm(x, x, weight, eps)
+        out, _res = tensor_model_parallel_fused_allreduce_rmsnorm(x, x, weight, eps)
 
     # destroy
     if dist.is_initialized():
+        barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()
@@ -233,7 +249,7 @@ def split_ar_rmsnorm(
     weight,
     eps,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -257,21 +273,20 @@ def split_ar_rmsnorm(
 
     if withGraph:
         graph = torch.cuda.CUDAGraph()
-        with graph_capture() as gc:
-            with torch.cuda.graph(graph, stream=gc.stream):
-                ar_out = tensor_model_parallel_all_reduce(x)
-                # out = aiter.rms_norm(ar_out, weight, eps, 0)
-                out = torch.empty_like(ar_out)
-                residual_out = torch.empty_like(ar_out)
-                aiter.rmsnorm2d_fwd_with_add(
-                    out,
-                    ar_out,
-                    x,
-                    residual_out,
-                    weight,
-                    eps,
-                    0,
-                )
+        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+            ar_out = tensor_model_parallel_all_reduce(x)
+            # out = aiter.rms_norm(ar_out, weight, eps, 0)
+            out = torch.empty_like(ar_out)
+            residual_out = torch.empty_like(ar_out)
+            aiter.rmsnorm2d_fwd_with_add(
+                out,
+                ar_out,
+                x,
+                residual_out,
+                weight,
+                eps,
+                0,
+            )
         out.fill_(0)
 
         @perftest()
@@ -302,6 +317,7 @@ def split_ar_rmsnorm(
 
     # destroy
     if dist.is_initialized():
+        barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()
@@ -315,7 +331,7 @@ def test_fused_ar_rmsnorm(
     shape,
     dtype,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
     post_per_token_quant: bool = False,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -404,7 +420,7 @@ def fused_ar_rmsnorm_pad_stride(
     x_pad_to_multiple=0,
     input_strided=False,
     residual_strided=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -437,6 +453,7 @@ def fused_ar_rmsnorm_pad_stride(
     )
 
     if dist.is_initialized():
+        barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()
@@ -452,7 +469,7 @@ def fused_ar_rmsnorm_padded_input(
     weight,
     eps,
     input_storage_width,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -487,6 +504,7 @@ def fused_ar_rmsnorm_padded_input(
     )
 
     if dist.is_initialized():
+        barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()
@@ -502,7 +520,7 @@ def test_fused_ar_rmsnorm_pad_stride_case(
     x_pad_to_multiple=0,
     input_strided=False,
     residual_strided=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
@@ -599,7 +617,7 @@ def test_fused_ar_rmsnorm_padded_input_case(
     dtype,
     *,
     input_storage_width,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
@@ -686,7 +704,7 @@ def fused_ar_rmsnorm_gemma(
     residual,
     weight,
     eps,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -715,6 +733,7 @@ def fused_ar_rmsnorm_gemma(
     )
 
     if dist.is_initialized():
+        barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()
@@ -727,7 +746,7 @@ def test_fused_ar_gemma_rmsnorm_case(
     shape,
     dtype,
     *,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
@@ -798,7 +817,7 @@ def test_fused_ar_gemma_rmsnorm_case(
     }
 
 
-def _set_ar_1stage_override(stage_override: Optional[str]):
+def _set_ar_1stage_override(stage_override: str | None):
     if stage_override is None:
         os.environ.pop("AITER_AR_1STAGE", None)
     else:
@@ -844,8 +863,8 @@ def fused_ar_gemma_rmsnorm_quant(
     residual,
     weight,
     eps,
-    stage_override: Optional[str] = None,
-    distributed_init_method: Optional[str] = None,
+    stage_override: str | None = None,
+    distributed_init_method: str | None = None,
 ):
     _set_ar_1stage_override(stage_override)
     device = torch.device(f"cuda:{rankID}")
@@ -880,6 +899,7 @@ def fused_ar_gemma_rmsnorm_quant(
         return dequant.cpu(), res_out.cpu(), out.dtype, tuple(scale_out.shape)
     finally:
         if dist.is_initialized():
+            barrier_before_teardown()
             destroy_model_parallel()
             destroy_distributed_environment()
             torch.cuda.empty_cache()
@@ -891,8 +911,8 @@ def _fused_ar_gemma_rmsnorm_quant_case(
     shape,
     dtype,
     *,
-    stage_override: Optional[str],
-    distributed_init_method: Optional[str] = None,
+    stage_override: str | None,
+    distributed_init_method: str | None = None,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"

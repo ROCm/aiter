@@ -1,39 +1,40 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from enum import IntEnum
+
 import torch
 import triton
 import triton.language as tl
 from torch import autograd
-from enum import IntEnum
-from typing import Tuple, Union
+
 from aiter.ops.triton._triton_kernels.rope.rope import (
-    _rope_kernel_sbhd_fwd,
-    _rope_kernel_sbhd_bwd,
-    _rope_kernel_thd_fwd,
-    _rope_kernel_thd_bwd,
-    _rope_kernel_sbhd_cached_fwd,
-    _rope_kernel_sbhd_cached_bwd,
-    _rope_kernel_thd_cached_2c_fwd,
-    _rope_kernel_thd_cached_2c_bwd,
-    _rope_kernel_cached_thd_2c_gqa_fwd,
-    _rope_kernel_cached_thd_2c_gqa_onehead_fwd,
-    _rope_kernel_cached_thd_2c_gqa_bwd,
-    _rope_kernel_cached_thd_2c_gqa_onehead_bwd,
-    _rope_fwd_2d_kernel_neox,
-    _rope_fwd_3d,
-    _get_neox_rotated_x_1D,
+    _get_gptj_rotated_x,
     _get_gptj_rotated_x_1D,
     _get_neox_rotated_x,
-    _get_gptj_rotated_x,
+    _get_neox_rotated_x_1D,
+    _rope_fwd_2d_kernel_neox,
+    _rope_fwd_3d,
+    _rope_kernel_cached_thd_2c_gqa_bwd,
+    _rope_kernel_cached_thd_2c_gqa_fwd,
+    _rope_kernel_cached_thd_2c_gqa_onehead_bwd,
+    _rope_kernel_cached_thd_2c_gqa_onehead_fwd,
+    _rope_kernel_sbhd_bwd,
+    _rope_kernel_sbhd_cached_bwd,
+    _rope_kernel_sbhd_cached_fwd,
+    _rope_kernel_sbhd_fwd,
+    _rope_kernel_thd_bwd,
+    _rope_kernel_thd_cached_2c_bwd,
+    _rope_kernel_thd_cached_2c_fwd,
+    _rope_kernel_thd_fwd,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 __all__ = [
-    "_get_neox_rotated_x_1D",
+    "_get_gptj_rotated_x",
     "_get_gptj_rotated_x_1D",
     "_get_neox_rotated_x",
-    "_get_gptj_rotated_x",
+    "_get_neox_rotated_x_1D",
 ]
 
 _LOGGER = AiterTritonLogger()
@@ -695,6 +696,46 @@ def _rope_cached_bwd(
     transpose_output: bool = False,
 ) -> torch.Tensor:
     s, b, h, d = x.shape
+
+    # The Triton kernel forms x/out offsets in signed 32-bit element units.
+    # Slice very large sequence-major views on the host so each launch receives
+    # an already advanced base pointer and only uses representable offsets.
+    index_limit = (1 << 31) - 1
+    fixed_x_elems = (
+        (b - 1) * abs(x.stride(1))
+        + (h - 1) * abs(x.stride(2))
+        + (d - 1) * abs(x.stride(3))
+    )
+    fixed_out_elems = (
+        (out.shape[1] - 1) * abs(out.stride(1))
+        + (out.shape[2] - 1) * abs(out.stride(2))
+        + (out.shape[3] - 1) * abs(out.stride(3))
+    )
+    x_row_elems = abs(x.stride(0))
+    out_row_elems = abs(out.stride(0))
+    rows_per_launch = min(
+        (index_limit - fixed_x_elems) // x_row_elems + 1,
+        (index_limit - fixed_out_elems) // out_row_elems + 1,
+    )
+    if s > rows_per_launch:
+        if rows_per_launch < 1:
+            raise RuntimeError("RoPE row span exceeds the 32-bit element-index limit")
+        for start in range(0, s, rows_per_launch):
+            end = min(start + rows_per_launch, s)
+            _rope_cached_bwd(
+                x[start:end],
+                out[start:end],
+                cos,
+                sin,
+                positions[start:end] if positions is not None else None,
+                offsets[start:end] if offsets is not None else None,
+                rotate_style,
+                reuse_freqs_front_part,
+                nope_first,
+                inplace,
+                transpose_output,
+            )
+        return out
 
     if cos.shape[-1] == d // 2:
         if reuse_freqs_front_part:
@@ -1523,7 +1564,7 @@ def rope_fwd_3d(
     c_total = C // 2  # 64
     c1 = c_total - 2 * (c_total // 3)  # 22
     c2 = c_total // 3  # 21
-    c3 = c_total // 3  # 21
+    c_total // 3  # 21
     device = x.device
 
     grid_sizes = grid_sizes.to(device=device, dtype=torch.int32).contiguous()
@@ -1593,9 +1634,7 @@ class RoPE(autograd.Function):
         )
 
     @staticmethod
-    def backward(
-        ctx, output_grads: torch.Tensor
-    ) -> Tuple[Union[torch.Tensor, None], ...]:
+    def backward(ctx, output_grads: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
         (freqs,) = ctx.saved_tensors
         return (
             rope_bwd(
@@ -1631,7 +1670,7 @@ class RoPETHD(autograd.Function):
         )
 
     @staticmethod
-    def backward(ctx, output_grads) -> Tuple[Union[torch.Tensor, None], ...]:
+    def backward(ctx, output_grads) -> tuple[torch.Tensor | None, ...]:
         cu_seqlens, freqs = ctx.saved_tensors
         return (
             rope_thd_bwd(
@@ -1676,7 +1715,7 @@ class RoPECached(autograd.Function):
         )
 
     @staticmethod
-    def backward(ctx, output_grads) -> Tuple[Union[torch.Tensor, None], ...]:
+    def backward(ctx, output_grads) -> tuple[torch.Tensor | None, ...]:
         cos, sin = ctx.saved_tensors
         return (
             rope_cached_bwd(

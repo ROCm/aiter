@@ -2,12 +2,14 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
 import itertools
+
 import torch
 import triton
-from aiter.ops.triton.moe.moe_routing.routing import RoutingData
+
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w8_blockscale import (
     _moe_gemm_a8w8_blockscale,
 )
+from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 
 # -----------------------------------------------------------------------------
@@ -78,7 +80,7 @@ def get_kernel_config(m, n, k, routing_data):
     if block_m == 16:
         block_n = 256
         block_k = 128
-        num_warps = 4
+        num_warps = 8
 
         grid_m = routing_data.n_blocks(m, block_m)
         grid_n = triton.cdiv(n, block_n)

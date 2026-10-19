@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <hip/hip_bfloat16.h>
 
+#include "opus_moe_stage1_a8w4_meta.h"
 #include "opus_moe_stage2_a8w4_meta.h"
 
 namespace opus_moe
@@ -95,8 +96,12 @@ struct opus_moe_stage2_a8w4_kargs
     int num_experts;
     int model_dim;
     int sorted_blocks;
+    int sort_block_m;
     int a_scale_rows;
     int route_out_fp8;          // Runtime guard for the MXFP8 route-out path.
+    int k_tiles;
+    int a_scale_words_per_row_pack;
+    int w_scale_words_per_row_pack;
     int64_t route_out_row_bytes;  // fp8 route_out row stride bytes (= model_dim + model_dim/8).
 };
 

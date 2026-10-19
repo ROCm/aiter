@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from torch import Tensor
-from ..jit.core import compile_ops, AITER_CSRC_DIR
 from functools import partial
 from typing import Any
+
 import torch
+from torch import Tensor
+
+from ..jit.core import AITER_CSRC_DIR, compile_ops
 
 MD_NAME = "module_aiter_operator"
 
@@ -29,12 +31,8 @@ def binary_inp_fake_shape(input: Tensor, other: Tensor) -> Tensor:
     return input
 
 
-def sigmoid_fake_shape(input: torch.Tensor) -> torch.Tensor:
-    return torch.empty(
-        size=input.shape,
-        dtype=input.dtype,
-        device=input.device,
-    )
+def unary_out_fake_shape(out: Tensor, input: Tensor) -> Tensor:
+    return out
 
 
 binary_add_build_args = partial(cmdGenFunc, "add")
@@ -181,9 +179,44 @@ def div_(input: Tensor, other: Tensor) -> Tensor:
     return input
 
 
-@compile_ops("module_aiter_unary", gen_fake=sigmoid_fake_shape)
-def sigmoid(input: Tensor) -> Tensor: ...
+@compile_ops(
+    "module_aiter_unary", fc_name="sigmoid", develop=True, gen_fake=unary_out_fake_shape
+)
+def _sigmoid(out: Tensor, input: Tensor) -> None: ...
 
 
-@compile_ops("module_aiter_unary", gen_fake=sigmoid_fake_shape)
-def tanh(input: Tensor) -> Tensor: ...
+@compile_ops(
+    "module_aiter_unary", fc_name="tanh", develop=True, gen_fake=unary_out_fake_shape
+)
+def _tanh(out: Tensor, input: Tensor) -> None: ...
+
+
+def _unary_tile_supported(input: Tensor) -> bool:
+    # Mirror the C++ tile fast-path condition (unary_operator.cu): contiguous,
+    # N % 8 == 0 and K % vec == 0, where vec is the number of elements spanning
+    # 16 bytes for this dtype (fp16/bf16 -> 8, fp32 -> 4).
+    if not input.is_contiguous():
+        return False
+    dim = input.dim()
+    if dim == 2:
+        n, k = input.size(0), input.size(1)
+    else:
+        n, k = input.size(1), input.size(2)
+    vec = 16 // input.element_size()
+    return n % 8 == 0 and k % vec == 0
+
+
+def sigmoid(input: Tensor) -> Tensor:
+    if not _unary_tile_supported(input):
+        return torch.sigmoid(input)
+    out = torch.empty_like(input)
+    _sigmoid(out, input)
+    return out
+
+
+def tanh(input: Tensor) -> Tensor:
+    if not _unary_tile_supported(input):
+        return torch.tanh(input)
+    out = torch.empty_like(input)
+    _tanh(out, input)
+    return out

@@ -2,23 +2,22 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-from typing import Optional
 
 from csrc.cpp_itfs.sampling.top_k_renorm_probs import (
     top_k_renorm_probs as top_k_renorm_probs_core,
 )
-from csrc.cpp_itfs.sampling.top_p_sampling_from_probs import (
-    top_p_sampling_from_probs as top_p_sampling_from_probs_core,
-)
 from csrc.cpp_itfs.sampling.top_k_top_p_sampling_from_probs import (
     top_k_top_p_sampling_from_probs as top_k_top_p_sampling_from_probs_core,
+)
+from csrc.cpp_itfs.sampling.top_p_sampling_from_probs import (
+    top_p_sampling_from_probs as top_p_sampling_from_probs_core,
 )
 from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 
 
 def top_k_renorm_probs(
     probs: torch.Tensor,
-    maybe_top_k_arr: Optional[torch.Tensor],
+    maybe_top_k_arr: torch.Tensor | None,
     top_k_val: int,
 ) -> torch.Tensor:
     return top_k_renorm_probs_core(
@@ -38,7 +37,7 @@ direct_register_custom_op(
 def top_p_sampling_from_probs(
     probs: torch.Tensor,
     indices: torch.Tensor,
-    maybe_top_p_arr: Optional[torch.Tensor],
+    maybe_top_p_arr: torch.Tensor | None,
     top_p_val: float,
     deterministic: bool = False,
 ) -> torch.Tensor:
@@ -84,8 +83,8 @@ _TOPK_FIRST_FAST_MIN_VOCAB = 65536
 
 def _topk_first_fast_path_applicable(
     probs: torch.Tensor,
-    indices: Optional[torch.Tensor],
-    maybe_top_k_arr: Optional[torch.Tensor],
+    indices: torch.Tensor | None,
+    maybe_top_k_arr: torch.Tensor | None,
     top_k_val: int,
 ) -> bool:
     return (
@@ -134,7 +133,7 @@ def _select_topk(probs: torch.Tensor, k: int):
 def _topk_first_fast_path(
     probs: torch.Tensor,
     top_k_val: int,
-    maybe_top_p_arr: Optional[torch.Tensor],
+    maybe_top_p_arr: torch.Tensor | None,
     top_p_val: float,
     deterministic: bool,
 ) -> torch.Tensor:
@@ -171,9 +170,9 @@ def _topk_first_fast_path(
 def top_k_top_p_sampling_from_probs(
     probs: torch.Tensor,
     indices: torch.Tensor,
-    maybe_top_k_arr: Optional[torch.Tensor],
+    maybe_top_k_arr: torch.Tensor | None,
     top_k_val: int,
-    maybe_top_p_arr: Optional[torch.Tensor],
+    maybe_top_p_arr: torch.Tensor | None,
     top_p_val: float,
     deterministic: bool = False,
 ) -> torch.Tensor:

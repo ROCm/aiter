@@ -1,20 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 import triton
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_afp4wfp4 import (
     _batched_gemm_afp4_wfp4_kernel,
     _batched_gemm_afp4_wfp4_reduce_kernel,
     _get_config,
 )
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-global _USE_GEMM_SPLITK_BF16
 _USE_GEMM_SPLITK_BF16 = False
 
 
@@ -28,9 +27,9 @@ def batched_gemm_afp4wfp4(
     w,
     x_scales,
     w_scales,
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
+    dtype: float | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
 ):
     """
     Computes batched FP4 matrix multiplication Y[i] = X[i] @ W[i]^T with FP4 activations and weights.
@@ -51,7 +50,11 @@ def batched_gemm_afp4wfp4(
         torch.Tensor: Output batch with shape (B, M, N).
     """
     _LOGGER.info(
-        f"BATCHED_GEMM_AFP4WFP4: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x.shape)} w_scale={tuple(w.shape)}"
+        "BATCHED_GEMM_AFP4WFP4: x=%s w=%s x_scale=%s w_scale=%s",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(x.shape),
+        tuple(w.shape),
     )
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
@@ -80,7 +83,7 @@ def batched_gemm_afp4wfp4(
     else:
         y_pp = None
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         Batch,
         (
             META["NUM_KSPLIT"]

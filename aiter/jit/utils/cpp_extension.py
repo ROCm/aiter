@@ -8,6 +8,7 @@
 import copy
 import importlib
 import importlib.abc
+import importlib.metadata
 import importlib.util
 import os
 import re
@@ -16,8 +17,9 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+import tempfile
 import warnings
-from typing import Dict, List, Optional, Tuple, Union
+from pathlib import Path
 
 import setuptools
 from _cpp_extension_versioner import ExtensionVersioner
@@ -29,18 +31,25 @@ from setuptools.command.build_ext import build_ext
 
 IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
-LIB_EXT = ".so"
-EXEC_EXT = ""
-CLIB_PREFIX = "lib"
-CLIB_EXT = ".so"
-SHARED_FLAG = "-shared"
+if IS_WINDOWS:
+    LIB_EXT = ".pyd"
+    EXEC_EXT = ".exe"
+    CLIB_PREFIX = ""
+    CLIB_EXT = ".dll"
+    SHARED_FLAG = "-Wl,/DLL"
+else:
+    LIB_EXT = ".so"
+    EXEC_EXT = ""
+    CLIB_PREFIX = "lib"
+    CLIB_EXT = ".so"
+    SHARED_FLAG = "-shared"
 
 SUBPROCESS_DECODE_ARGS = ()
 MINIMUM_GCC_VERSION = (5, 0, 0)
 MINIMUM_MSVC_VERSION = (19, 0, 24215)
 
-VersionRange = Tuple[Tuple[int, ...], Tuple[int, ...]]
-VersionMap = Dict[str, VersionRange]
+VersionRange = tuple[tuple[int, ...], tuple[int, ...]]
+VersionMap = dict[str, VersionRange]
 # The following values were taken from the following GitHub gist that
 # summarizes the minimum valid major versions of g++/clang++ for each supported
 # CUDA version: https://gist.github.com/ax3l/9489132
@@ -50,19 +59,49 @@ VersionMap = Dict[str, VersionRange]
 MINIMUM_CLANG_VERSION = (3, 3, 0)
 
 __all__ = [
+    "BuildExtension",
+    "CUDAExtension",
+    "CppExtension",
+    "check_compiler_is_gcc",
     "check_compiler_ok_for_platform",
     "get_compiler_abi_compatibility_and_version",
-    "BuildExtension",
-    "CppExtension",
-    "CUDAExtension",
+    "get_cxx_compiler",
     "include_paths",
+    "is_ninja_available",
     "library_paths",
     "load",
-    "is_ninja_available",
     "verify_ninja_availability",
-    "get_cxx_compiler",
-    "check_compiler_is_gcc",
 ]
+
+
+# ROCm tools are bare executables on Linux and .exe/.bat wrappers on Windows.
+EXE_SUFFIXES = (".exe", ".bat", "") if IS_WINDOWS else ("",)
+
+
+def _find_executable(directory: str, name: str) -> str | None:
+    """Return `<directory>/<name>` with a platform-appropriate suffix, if present."""
+    for suffix in EXE_SUFFIXES:
+        candidate = os.path.join(directory, name + suffix)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _posix_path(path: str) -> str:
+    """Forward-slash a path so it can be embedded in ninja files and flags."""
+    return path.replace("\\", "/") if IS_WINDOWS else path
+
+
+def _ninja_path(path: str) -> str:
+    """Escape a path for use in a ninja build statement.
+
+    Ninja treats ' ' as a field separator and ':' as a rule separator, so on
+    Windows the drive-letter colon has to be escaped too (``C:/`` -> ``C$:/``).
+    """
+    path = _posix_path(path).replace(" ", "$ ")
+    if IS_WINDOWS:
+        path = re.sub(r"^([A-Za-z]):/", r"\1$:/", path)
+    return path
 
 
 def executable_path(executable: str) -> str:
@@ -79,7 +118,7 @@ def executable_path(executable: str) -> str:
     if not path:
         home = _find_rocm_home()
         if home:
-            path = shutil.which(os.path.join(home, "bin", executable))
+            path = _find_executable(os.path.join(home, "bin"), executable)
         assert (
             path is not None
         ), f"Could not find {executable} in PATH or ROCM_HOME({home})"
@@ -91,7 +130,7 @@ def get_hip_version():
         hipconfig = executable_path("hipconfig")
         output = subprocess.check_output([hipconfig, "--version"], text=True)
         return output
-    except Exception:
+    except Exception:  # noqa: BLE001,S110
         pass
     # The fallbacks below previously hard-coded /opt/rocm, so they never
     # helped users whose ROCm lives elsewhere.  Resolve the ROCm root the
@@ -105,19 +144,19 @@ def get_hip_version():
     discovered = _find_rocm_home()
     if discovered:
         rocm_roots.append(discovered)
-    if "/opt/rocm" not in rocm_roots:
+    if not IS_WINDOWS and "/opt/rocm" not in rocm_roots:
         rocm_roots.append("/opt/rocm")
 
     # Fallback: try <rocm_root>/bin/hipconfig for each candidate root.
     for root in rocm_roots:
-        rocm_hipconfig = os.path.join(root, "bin", "hipconfig")
-        if os.path.isfile(rocm_hipconfig):
+        rocm_hipconfig = _find_executable(os.path.join(root, "bin"), "hipconfig")
+        if rocm_hipconfig is not None:
             try:
                 output = subprocess.check_output(
                     [rocm_hipconfig, "--version"], text=True
                 )
                 return output
-            except Exception:
+            except Exception:  # noqa: BLE001,S110
                 pass
     # Fallback: read HIP version from a header / info file under each root.
     for root in rocm_roots:
@@ -136,10 +175,16 @@ def get_hip_version():
                         return f"{major.group(1)}.{minor.group(1)}.{patch.group(1)}"
                 else:
                     return content.strip()
+    if IS_WINDOWS:
+        # The HIP SDK is a separate, optional install on Windows, so a missing
+        # one is not a broken install. The module-level consumers below already
+        # treat a missing version as "not a HIP extension", which lets callers
+        # fall back to the Triton ops instead of failing to import at all.
+        return None
     raise RuntimeError("ROCm version file not found")
 
 
-def _find_rocm_home() -> Optional[str]:
+def _find_rocm_home() -> str | None:
     """Find the ROCm install path."""
     # Guess #1
     rocm_home = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH")
@@ -155,7 +200,7 @@ def _find_rocm_home() -> Optional[str]:
             spec = None
         if spec is not None and spec.submodule_search_locations:
             candidate = spec.submodule_search_locations[0]
-            if os.path.exists(os.path.join(candidate, "bin", "hipconfig")):
+            if _find_executable(os.path.join(candidate, "bin"), "hipconfig"):
                 rocm_home = candidate
     if rocm_home is None:
         # Guess #3
@@ -166,9 +211,12 @@ def _find_rocm_home() -> Optional[str]:
             if os.path.basename(rocm_home) == "hip":
                 rocm_home = os.path.dirname(rocm_home)
         else:
-            # Guess #4
-            fallback_path = "/opt/rocm"
-            if os.path.exists(fallback_path):
+            # Guess #4: default install location. The Windows HIP SDK
+            # installer sets HIP_PATH to the versioned ROCm root.
+            fallback_path = (
+                os.environ.get("HIP_PATH", "") if IS_WINDOWS else "/opt/rocm"
+            )
+            if fallback_path and os.path.exists(fallback_path):
                 rocm_home = fallback_path
     if rocm_home is None:
         print(
@@ -177,7 +225,7 @@ def _find_rocm_home() -> Optional[str]:
     return rocm_home
 
 
-def _find_rocm_devel_include() -> Optional[str]:
+def _find_rocm_devel_include() -> str | None:
     """Locate the header tree shipped by the rocm-sdk-devel pip package.
 
     The rocm-sdk split-package layout puts runtime bits in `_rocm_sdk_core`
@@ -250,9 +298,7 @@ with compiling PyTorch from source.
 HIP_VERSION = get_hip_version()
 ROCM_HOME = _find_rocm_home()
 HIP_HOME = _join_rocm_home("hip") if ROCM_HOME else None
-IS_HIP_EXTENSION = (
-    True if ((ROCM_HOME is not None) and (HIP_VERSION is not None)) else False
-)
+IS_HIP_EXTENSION = bool(ROCM_HOME is not None and HIP_VERSION is not None)
 ROCM_VERSION = None
 if HIP_VERSION is not None:
     ROCM_VERSION = tuple(int(v) for v in HIP_VERSION.split(".")[:2])
@@ -293,23 +339,35 @@ COMMON_NVCC_FLAGS = [
 ]
 
 COMMON_HIP_FLAGS = [
-    "-fPIC",
     "-D__HIP_PLATFORM_AMD__=1",
     "-DUSE_ROCM=1",
     "-DHIPBLAS_V2",
 ]
+if IS_WINDOWS:
+    # The UCRT only declares M_PI & friends under this macro.
+    COMMON_HIP_FLAGS.append("-D_USE_MATH_DEFINES")
+else:
+    # PE binaries are always position independent.
+    COMMON_HIP_FLAGS.append("-fPIC")
 
 COMMON_HIPCC_FLAGS = [
     "-DCUDA_HAS_FP16=1",
     "-D__HIP_NO_HALF_OPERATORS__=1",
     "-D__HIP_NO_HALF_CONVERSIONS__=1",
-    "-mcmodel=large",
-    "-fno-unique-section-names",
-    "-ffunction-sections",
-    "-fdata-sections",
 ]
+if not IS_WINDOWS:
+    # ELF-only codegen options.
+    COMMON_HIPCC_FLAGS.extend(
+        [
+            "-mcmodel=large",
+            "-fno-unique-section-names",
+            "-ffunction-sections",
+            "-fdata-sections",
+        ]
+    )
 
-if not int(os.environ.get("AITER_SYMBOL_VISIBLE", "0")):
+# On Windows, symbol visibility is driven by __declspec(dllexport) instead.
+if not int(os.environ.get("AITER_SYMBOL_VISIBLE", "0")) and not IS_WINDOWS:
     COMMON_HIPCC_FLAGS.extend(["-fvisibility=hidden", "-fvisibility-inlines-hidden"])
 
 JIT_EXTENSION_VERSIONER = ExtensionVersioner()
@@ -321,7 +379,14 @@ PLAT_TO_VCVARS = {
 
 
 def get_cxx_compiler():
-    return os.environ.get("CXX", "c++")
+    cxx = os.environ.get("CXX")
+    if cxx:
+        return cxx
+    if IS_WINDOWS:
+        # hipcc is the only compiler on Windows that can build both the .cpp
+        # and .hip sources, so route everything through it.
+        return executable_path("hipcc")
+    return "c++"
 
 
 def _is_binary_build() -> bool:
@@ -330,9 +395,12 @@ def _is_binary_build() -> bool:
     return not BUILT_FROM_SOURCE_VERSION_PATTERN.match(torch.version.__version__)
 
 
-def _accepted_compilers_for_platform() -> List[str]:
+def _accepted_compilers_for_platform() -> list[str]:
     # gnu-c++ and gnu-cc are the conda gcc compilers
-    return ["g++", "gcc", "gnu-c++", "gnu-cc", "clang++", "clang"]
+    accepted = ["g++", "gcc", "gnu-c++", "gnu-cc", "clang++", "clang"]
+    if IS_WINDOWS:
+        accepted.append("hipcc")
+    return accepted
 
 
 def _maybe_write(filename, new_content):
@@ -398,7 +466,7 @@ def check_compiler_ok_for_platform(compiler: str) -> bool:
 
 def get_compiler_abi_compatibility_and_version(
     compiler, torch_exclude=False
-) -> Tuple[bool, Version]:
+) -> tuple[bool, Version]:
     """
     Determine if the given compiler is ABI-compatible with PyTorch alongside its version.
 
@@ -410,9 +478,8 @@ def get_compiler_abi_compatibility_and_version(
         A tuple that contains a boolean that defines if the compiler is (likely) ABI-incompatible with PyTorch,
         followed by a `Version` string that contains the compiler version separated by dots.
     """
-    if not torch_exclude:
-        if not _is_binary_build():
-            return (True, Version("0.0.0"))
+    if not torch_exclude and not _is_binary_build():
+        return (True, Version("0.0.0"))
     if os.environ.get("TORCH_DONT_CHECK_COMPILER_ABI") in [
         "ON",
         "1",
@@ -444,7 +511,11 @@ def get_compiler_abi_compatibility_and_version(
                 versionstr.decode(*SUBPROCESS_DECODE_ARGS).strip(),
             )
             version = ["0", "0", "0"] if match is None else list(match.groups())
-    except Exception:
+        else:
+            # Non-Linux: there is no gcc ABI to be compatible with, and hipcc
+            # pins its own bundled clang, so accept the resolved compiler.
+            return (True, Version("0.0.0"))
+    except Exception:  # noqa: BLE001
         _, error, _ = sys.exc_info()
         warnings.warn(f"Error checking compiler version for {compiler}: {error}")
         return (False, Version("0.0.0"))
@@ -478,10 +549,13 @@ class BuildExtension(build_ext):
     Fallbacks to the standard distutils backend if Ninja is not available.
 
     .. note::
-        By default, the Ninja backend uses #CPUS + 2 workers to build the
-        extension. This may use up too many resources on some systems. One
-        can control the number of workers by setting the `MAX_JOBS` environment
-        variable to a non-negative number.
+        The Ninja backend uses AITER's live CPU and memory worker budget. One
+        can impose an additional ceiling by setting the `AITER_MAX_JOBS`
+        environment variable to an integer. The live limits are recalculated
+        for every build. Non-positive values impose one worker. At the
+        AITER-owned runtime JIT compile boundary, a valid generic `MAX_JOBS`
+        is honored as a non-mutating legacy ceiling when `AITER_MAX_JOBS` is
+        unset. Merely importing AITER does not consult `MAX_JOBS`.
     """
 
     @classmethod
@@ -564,7 +638,6 @@ class BuildExtension(build_ext):
         if self.compiler.compiler_type == "msvc":
             self.compiler._cpp_extensions += [".cu", ".cuh"]
             original_compile = self.compiler.compile
-            original_spawn = self.compiler.spawn
         else:
             original_compile = self.compiler._compile
 
@@ -985,7 +1058,7 @@ def CUDAExtension(name, sources, *args, **kwargs):
     return setuptools.Extension(name, sources, *args, **kwargs)
 
 
-def include_paths(cuda: bool = False) -> List[str]:
+def include_paths(cuda: bool = False) -> list[str]:
     """
     Get the include paths required to build a C++ or CUDA extension.
 
@@ -1021,7 +1094,7 @@ def include_paths(cuda: bool = False) -> List[str]:
     return paths
 
 
-def library_paths(cuda: bool = False) -> List[str]:
+def library_paths(cuda: bool = False) -> list[str]:
     """
     Get the library paths required to build a C++ or CUDA extension.
 
@@ -1048,14 +1121,14 @@ def library_paths(cuda: bool = False) -> List[str]:
 
 def load(
     name,
-    sources: Union[str, List[str]],
+    sources: str | list[str],
     extra_cflags=None,
     extra_cuda_cflags=None,
     extra_ldflags=None,
     extra_include_paths=None,
     build_directory=None,
     verbose=False,
-    with_cuda: Optional[bool] = None,
+    with_cuda: bool | None = None,
     is_python_module=True,
     is_standalone=False,
     keep_intermediates=True,
@@ -1199,12 +1272,12 @@ def check_compiler_is_gcc(compiler):
         version_string = subprocess.check_output(
             [compiler, "-v"], stderr=subprocess.STDOUT, env=env
         ).decode(*SUBPROCESS_DECODE_ARGS)
-    except Exception:
+    except Exception:  # noqa: BLE001
         try:
             version_string = subprocess.check_output(
                 [compiler, "--version"], stderr=subprocess.STDOUT, env=env
             ).decode(*SUBPROCESS_DECODE_ARGS)
-        except Exception:
+        except Exception:  # noqa: BLE001
             return False
     # Check for 'gcc' or 'g++' for sccache wrapper
     pattern = re.compile("^COLLECT_GCC=(.*)$", re.MULTILINE)
@@ -1213,9 +1286,9 @@ def check_compiler_is_gcc(compiler):
         return False
     compiler_path = os.path.realpath(results[0].strip())
     # On RHEL/CentOS c++ is a gcc compiler wrapper
-    if os.path.basename(compiler_path) == "c++" and "gcc version" in version_string:
-        return True
-    return False
+    return bool(
+        os.path.basename(compiler_path) == "c++" and "gcc version" in version_string
+    )
 
 
 def _jit_compile(
@@ -1227,13 +1300,14 @@ def _jit_compile(
     extra_include_paths,
     build_directory: str,
     verbose: bool,
-    with_cuda: Optional[bool],
+    with_cuda: bool | None,
     is_python_module,
     is_standalone,
     keep_intermediates=True,
     torch_exclude=False,
     hipify=True,
     extra_cuda_cflags_per_source=None,
+    use_versioner=True,
 ) -> None:
     if is_python_module and is_standalone:
         raise ValueError(
@@ -1242,32 +1316,39 @@ def _jit_compile(
 
     if with_cuda is None:
         with_cuda = any(map(_is_cuda_file, sources))
-    old_version = JIT_EXTENSION_VERSIONER.get_version(name)
-    version = JIT_EXTENSION_VERSIONER.bump_version_if_changed(
-        name,
-        sources,
-        build_arguments=[
-            extra_cflags,
-            extra_cuda_cflags,
-            extra_ldflags,
-            extra_include_paths,
-            # Include per-source extras in the cache key so toggling them
-            # invalidates the cached .so on the next call.
-            extra_cuda_cflags_per_source,
-        ],
-        build_directory=build_directory,
-        with_cuda=with_cuda,
-        is_python_module=is_python_module,
-        is_standalone=is_standalone,
-    )
-    if version > 0:
-        if version != old_version and verbose:
-            print(
-                f"The input conditions for extension module {name} have changed. "
-                + f"Bumping to version {version} and re-building as {name}_v{version}...",
-                file=sys.stderr,
-            )
-        name = f"{name}_v{version}"
+    # Direct extension loaders retain versioned names. core.build_module instead
+    # installs a fixed <name>.so (including its PyInit_<name> symbol), so it must
+    # not produce <name>_vN.so or let a process-local cache skip Ninja. Ninja owns
+    # incremental checks there, including headers, deleted outputs and retries
+    # after a failed build; the versioner records inputs before compilation.
+    old_version = version = None
+    if use_versioner:
+        old_version = JIT_EXTENSION_VERSIONER.get_version(name)
+        version = JIT_EXTENSION_VERSIONER.bump_version_if_changed(
+            name,
+            sources,
+            build_arguments=[
+                extra_cflags,
+                extra_cuda_cflags,
+                extra_ldflags,
+                extra_include_paths,
+                # Include per-source extras in the cache key so toggling them
+                # invalidates the cached .so on the next call.
+                extra_cuda_cflags_per_source,
+            ],
+            build_directory=build_directory,
+            with_cuda=with_cuda,
+            is_python_module=is_python_module,
+            is_standalone=is_standalone,
+        )
+        if version > 0:
+            if version != old_version and verbose:
+                print(
+                    f"The input conditions for extension module {name} have changed. "
+                    + f"Bumping to version {version} and re-building as {name}_v{version}...",
+                    file=sys.stderr,
+                )
+            name = f"{name}_v{version}"
 
     baton = FileBaton(os.path.join(build_directory, "lock"))
     need_build = True
@@ -1275,15 +1356,15 @@ def _jit_compile(
         if baton.try_acquire():
             break  # we own the lock; fall through and build below
         # Another process holds the lock. wait() returns True if that holder
-        # finished normally (module is built — just import it), or False if we
-        # broke a stale lock left by a dead holder, in which case we loop and
-        # re-acquire so we build it ourselves instead of importing nothing.
-        if baton.wait():
+        # finished normally, or False if we broke a stale lock left by a dead
+        # holder. Versioned loaders can import a peer's completed module;
+        # fixed-target callers re-acquire and let Ninja check their own inputs.
+        if baton.wait() and use_versioner:
             need_build = False
             break
     if need_build:
         try:
-            if version != old_version:
+            if not use_versioner or version != old_version:
                 with GeneratedFileCleaner(
                     keep_intermediates=keep_intermediates
                 ) as clean_ctx:
@@ -1362,7 +1443,7 @@ def _jit_compile(
 
 
 def _write_ninja_file_and_compile_objects(
-    sources: List[str],
+    sources: list[str],
     objects,
     cflags,
     post_cflags,
@@ -1371,7 +1452,7 @@ def _write_ninja_file_and_compile_objects(
     cuda_dlink_post_cflags,
     build_directory: str,
     verbose: bool,
-    with_cuda: Optional[bool],
+    with_cuda: bool | None,
 ) -> None:
     verify_ninja_availability()
 
@@ -1409,14 +1490,14 @@ def _write_ninja_file_and_compile_objects(
 
 def _write_ninja_file_and_build_library(
     name,
-    sources: List[str],
+    sources: list[str],
     extra_cflags,
     extra_cuda_cflags,
     extra_ldflags,
     extra_include_paths,
     build_directory: str,
     verbose: bool,
-    with_cuda: Optional[bool],
+    with_cuda: bool | None,
     is_python_module: bool,
     is_standalone: bool = False,
     torch_exclude: bool = False,
@@ -1454,15 +1535,17 @@ def _write_ninja_file_and_build_library(
     if verbose:
         print(f"Building extension module {name}...", file=sys.stderr)
     _run_ninja_build(
-        build_directory, verbose, error_prefix=f"Error building extension '{name}'"
+        build_directory,
+        verbose,
+        error_prefix=f"Error building extension '{name}'",
     )
 
 
 def is_ninja_available():
     """Return ``True`` if the `ninja <https://ninja-build.org/>`_ build system is available on the system, ``False`` otherwise."""
     try:
-        subprocess.check_output("ninja --version".split())
-    except Exception:
+        subprocess.check_output(["ninja", "--version"])
+    except Exception:  # noqa: BLE001
         return False
     else:
         return True
@@ -1475,16 +1558,21 @@ def verify_ninja_availability():
 
 
 def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exclude):
-    extra_ldflags.append("-mcmodel=large")
-    extra_ldflags.append("-ffunction-sections")
-    extra_ldflags.append("-fdata-sections ")
-    extra_ldflags.append("-Wl,--gc-sections")
-    extra_ldflags.append("-Wl,--cref")
+    if not IS_WINDOWS:
+        # ELF/GNU-ld only.
+        extra_ldflags.append("-mcmodel=large")
+        extra_ldflags.append("-ffunction-sections")
+        extra_ldflags.append("-fdata-sections ")
+        extra_ldflags.append("-Wl,--gc-sections")
+        extra_ldflags.append("-Wl,--cref")
     if not torch_exclude:
         import torch
 
         _TORCH_PATH = os.path.join(os.path.dirname(torch.__file__))
-        TORCH_LIB_PATH = os.path.join(_TORCH_PATH, "lib")
+        # clang on Windows resolves `-l<name>` against `<name>.lib` import
+        # libraries, which the Windows torch wheels ship next to the DLLs, so
+        # the flags below are the same on both platforms.
+        TORCH_LIB_PATH = _posix_path(os.path.join(_TORCH_PATH, "lib"))
         extra_ldflags.append(f"-L{TORCH_LIB_PATH}")
         extra_ldflags.append("-lc10")
         if with_cuda:
@@ -1496,19 +1584,56 @@ def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exc
         if not is_standalone:
             extra_ldflags.append("-ltorch_python")
 
-        if is_standalone:
+        if is_standalone and not IS_WINDOWS:
+            # PE has no rpath; dependent DLLs are found via PATH or the
+            # directory of the loaded module.
             extra_ldflags.append(f"-Wl,-rpath,{TORCH_LIB_PATH}")
+
+    if IS_WINDOWS:
+        # PE resolves the CPython API through the pythonXYZ.lib import library,
+        # which pyconfig.h already requests via `#pragma comment(lib, ...)`;
+        # the linker only needs the directory. installed_base is the base
+        # interpreter prefix for venvs too, which is where the libraries live.
+        py_libs_dir = _posix_path(
+            os.path.join(
+                sysconfig.get_config_var("installed_base") or sys.base_prefix,
+                "libs",
+            )
+        )
+        if os.path.isdir(py_libs_dir):
+            extra_ldflags.append(f"-L{py_libs_dir}")
 
     if with_cuda and IS_HIP_EXTENSION:
         if verbose:
             print("Detected CUDA files, patching ldflags", file=sys.stderr)
 
-        extra_ldflags.append(f'-L{_join_rocm_home("lib")}')
+        extra_ldflags.append(f'-L{_posix_path(_join_rocm_home("lib"))}')
         extra_ldflags.append("-lamdhip64")
+    if IS_WINDOWS:
+        extra_ldflags = _resolve_mingw_import_libs(extra_ldflags)
     return extra_ldflags
 
 
-def _get_rocm_arch_flags(cflags: Optional[List[str]] = None) -> List[str]:
+def _resolve_mingw_import_libs(ldflags):
+    # lld-link misses MinGW-style lib<name>.dll.a import libraries for -l<name>.
+    lib_dirs = [f[2:] for f in ldflags if f.startswith("-L")]
+    resolved = []
+    for flag in ldflags:
+        if flag.startswith("-l"):
+            name = flag[2:]
+            if not any(
+                os.path.isfile(os.path.join(d, f"{name}.lib")) for d in lib_dirs
+            ):
+                for d in lib_dirs:
+                    mingw_lib = os.path.join(d, f"lib{name}.dll.a")
+                    if os.path.isfile(mingw_lib):
+                        flag = _posix_path(mingw_lib)
+                        break
+        resolved.append(flag)
+    return resolved
+
+
+def _get_rocm_arch_flags(cflags: list[str] | None = None) -> list[str]:
     # If cflags is given, there may already be user-provided arch flags in it
     # (from `extra_compile_args`)
     if cflags is not None:
@@ -1528,73 +1653,189 @@ def _get_rocm_arch_flags(cflags: Optional[List[str]] = None) -> List[str]:
             archs = []
     else:
         archs = _archs.replace(" ", ";").split(";")
+    if IS_WINDOWS and "native" in archs:
+        # clang's `--offload-arch=native` shells out to offload-arch, which
+        # cannot detect the GPU on Windows, so resolve the arch ourselves.
+        from chip_info import _detect_native
+
+        archs = [a for a in archs if a != "native"] + _detect_native()
     flags = [f"--offload-arch={arch}" for arch in archs]
     flags += ["-fno-gpu-rdc"]
     return flags
 
 
-def _get_num_workers(verbose: bool) -> Optional[int]:
-    max_jobs = os.environ.get("MAX_JOBS")
-    if max_jobs is not None and max_jobs.isdigit():
-        if int(max_jobs) > int(max(1, os.cpu_count() * 0.8)):
-            max_jobs = int(max(1, os.cpu_count() * 0.8))
-        if verbose:
-            print(
-                f"Using envvar MAX_JOBS ({max_jobs}) as the number of workers...",
-                file=sys.stderr,
-            )
-    else:
-        max_jobs = int(max(1, os.cpu_count() * 0.8))
+def _get_num_workers(verbose: bool) -> int:
+    from aiter_worker_limits import get_compile_worker_count
+
+    max_jobs = get_compile_worker_count()
+    if verbose:
         print(
-            f"Using 0.8*cpu_cnt MAX_JOBS ({max_jobs}) as the number of workers...",
+            f"Using AITER worker budget ({max_jobs}) as the number of workers...",
             file=sys.stderr,
         )
-    prebuild_thread_num = os.environ.get("PREBUILD_THREAD_NUM")
-    if prebuild_thread_num is not None:
-        max_jobs = int(max_jobs) / int(prebuild_thread_num)
-    return int(max_jobs)
+    return max_jobs
+
+
+def _get_hipcc_path() -> str:
+    # Keep diagnostics and Ninja's compiler selection in sync, including Windows.
+    try:
+        return executable_path("hipcc")
+    except AssertionError:
+        return _join_rocm_home("bin", "hipcc")
+
+
+def _rocm_sdk_for_compiler(hipcc: str):
+    # Installed SDK metadata is relevant only if it owns the selected compiler.
+    # RECORD covers venv trampolines; the devel tree is expanded lazily by the SDK.
+    compiler = Path(hipcc).resolve()
+    for name in ("rocm-sdk-core", "rocm-sdk-devel"):
+        try:
+            dist = importlib.metadata.distribution(name)
+            if any(
+                Path(dist.locate_file(file)).resolve() == compiler
+                for file in dist.files or ()
+                if file.name in ("hipcc", "hipcc.exe", "hipcc.bat")
+            ) or compiler.is_relative_to(
+                Path(dist.locate_file("_" + name.replace("-", "_"))).resolve()
+            ):
+                return dist
+        except (
+            importlib.metadata.PackageNotFoundError,
+            OSError,
+            TypeError,
+            ValueError,
+        ):
+            continue
+    return None
+
+
+def _rocm_devel_install_hint(hipcc: str) -> str:
+    sdk = _rocm_sdk_for_compiler(hipcc)
+    if sdk is not None:
+        # Validate before putting metadata into a suggested shell command.
+        try:
+            version = str(Version(sdk.version))
+        except (TypeError, ValueError):
+            version = None
+        if version:
+            python = (
+                subprocess.list2cmdline([sys.executable])
+                if IS_WINDOWS
+                else shlex.quote(sys.executable)
+            )
+            return (
+                f"Selected Python SDK: {sdk.metadata['Name']}=={version}\n"
+                "Add the development extra at this exact SDK version, using the same "
+                "package index or wheel source as the installed SDK "
+                "(pip does not record the original index URL):\n"
+                f'  {python} -m pip install "rocm[devel]=={version}" '
+                '--index-url "<original-SDK-index-URL>"\n'
+                "Replace the index placeholder with the original SDK index.\n"
+                "After installation (or if already installed), initialize the "
+                "development package before retrying:\n"
+                f"  {python} -m rocm_sdk init\n"
+                f"  {python} -m rocm_sdk path --root\n"
+                "Set ROCM_HOME/ROCM_PATH to that SDK root and put its bin directory "
+                "first on PATH. Keep the SDK packages on the same full version.\n"
+                "Prebuilt SDK packages and initialization: "
+                "https://rocm.docs.amd.com/en/latest/install/rocm.html\n"
+                "Prebuilt nightly/preview packages and indexes: "
+                "https://github.com/ROCm/TheRock/blob/main/RELEASES.md"
+            )
+
+    # A HIP version (or torch.version.hip) is not a ROCm/package release pin.
+    # Read the release only from the selected compiler's installation.
+    root = Path(hipcc).resolve().parent.parent
+    if root.name == "hip":
+        root = root.parent
+    release = None
+    for name in ("version", "version-dev"):
+        try:
+            value = (root / ".info" / name).read_text().strip()
+        except (OSError, UnicodeError):
+            continue
+        if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][\w.-]+)?", value):
+            release = value
+            break
+    target = f"ROCm {release}" if release else "the selected ROCm release"
+    return (
+        f"Selected compiler ROCm release: {release or 'unknown'} (root: {root})\n"
+        f"Install the prebuilt development packages for {target} from the same "
+        "repository/build as that installation. For split system packages, "
+        "rocPRIM headers are in rocprim-dev (Debian/Ubuntu) or rocprim-devel (RPM); "
+        "for the combined Core SDK, use amdrocm-core-sdk. "
+        "rocPRIM package versions differ from ROCm release numbers; select the "
+        "package version from the matching release repository.\n"
+        "Ensure ROCM_HOME/ROCM_PATH and PATH select that complete installation.\n"
+        "Prebuilt ROCm installation: https://rocm.docs.amd.com/en/latest/install/rocm.html"
+    )
+
+
+def _rocm_header_build_hint(output: str) -> str:
+    # Diagnose a compiler failure, not a missing file under ROCM_HOME: the
+    # compiler may resolve headers through environment variables or build flags.
+    if not IS_HIP_EXTENSION or not re.search(
+        r"(?:fatal )?error:\s*['\"<]?rocprim[/\\]rocprim\.hpp['\">]?"
+        r"(?::|\s)\s*(?:file not found|No such file or directory)",
+        output,
+    ):
+        return ""
+    hipcc = _get_hipcc_path()
+    return (
+        "\nAITER: the selected ROCm compiler could not resolve 'rocprim/rocprim.hpp'.\n"
+        f"Selected ROCM_HOME: {ROCM_HOME}\n"
+        f"Selected hipcc: {hipcc}\n" + _rocm_devel_install_hint(hipcc)
+    )
 
 
 def _run_ninja_build(build_directory: str, verbose: bool, error_prefix: str) -> None:
+    # Stream compiler progress without changing the application logger format.
+    verbose = verbose or os.getenv("AITER_JIT_VERBOSE", "0") == "1"
     command = ["ninja", "-v"]
     num_workers = _get_num_workers(verbose)
-    if num_workers is not None:
-        command.extend(["-j", str(num_workers)])
+    command.extend(["-j", str(num_workers)])
     env = os.environ.copy()
 
     try:
         sys.stdout.flush()
         sys.stderr.flush()
-        # Warning: don't pass stdout=None to subprocess.run to get output.
-        # subprocess.run assumes that sys.__stdout__ has not been modified and
-        # attempts to write to it by default.  However, when we call _run_ninja_build
-        # from ahead-of-time cpp extensions, the following happens:
-        # 1) If the stdout encoding is not utf-8, setuptools detachs __stdout__.
-        #    https://github.com/pypa/setuptools/blob/7e97def47723303fafabe48b22168bbc11bb4821/setuptools/dist.py#L1110
-        #    (it probably shouldn't do this)
-        # 2) subprocess.run (on POSIX, with no stdout override) relies on
-        #    __stdout__ not being detached:
-        #    https://github.com/python/cpython/blob/c352e6c7446c894b13643f538db312092b351789/Lib/subprocess.py#L1214
-        # To work around this, we pass in the fileno directly and hope that
-        # it is valid.
-        stdout_fileno = 1
-        subprocess.run(
+        # Keep successful build logs out of memory; read the full log on failure.
+        with tempfile.TemporaryFile() as log, subprocess.Popen(
             command,
-            stdout=stdout_fileno if verbose else subprocess.PIPE,
+            stdout=subprocess.PIPE if verbose else log,
             stderr=subprocess.STDOUT,
             cwd=build_directory,
-            check=True,
             env=env,
-        )
+        ) as process:
+            try:
+                if verbose:
+                    while chunk := process.stdout.read1(64 * 1024):
+                        log.write(chunk)
+                        # Use fd 1 because setuptools can detach __stdout__.
+                        # A write may accept only part of the buffer.
+                        pending = memoryview(chunk)
+                        while pending:
+                            pending = pending[os.write(1, pending) :]
+                process.wait()
+            except BaseException:
+                # Match subprocess.run's cleanup if streaming is interrupted.
+                process.kill()
+                raise
+            if process.returncode:
+                log.seek(0)
+                raise subprocess.CalledProcessError(
+                    process.returncode, command, output=log.read()
+                )
     except subprocess.CalledProcessError as e:
-        # Python 2 and 3 compatible way of getting the error object.
-        _, error, _ = sys.exc_info()
-        # error.output contains the stdout and stderr of the build attempt.
         message = error_prefix
-        # `error` is a CalledProcessError (which has an `output`) attribute, but
-        # mypy thinks it's Optional[BaseException] and doesn't narrow
-        if hasattr(error, "output") and error.output:  # type: ignore[union-attr]
-            message += f": {error.output.decode(*SUBPROCESS_DECODE_ARGS)}"  # type: ignore[union-attr]
+        if e.output:
+            output = e.output.decode(*SUBPROCESS_DECODE_ARGS, errors="replace")
+            message += f": {output}"
+            try:
+                message += _rocm_header_build_hint(output)
+            except Exception:  # noqa: BLE001,S110
+                # Optional diagnostics must never replace the compiler error.
+                pass
         raise RuntimeError(message) from e
 
 
@@ -1654,40 +1895,44 @@ def _write_ninja_file_to_build_library(
         system_includes += include_paths(with_cuda)
         system_includes = list(set(system_includes))
 
-    # FIXME: build python module excluded with torch, use `pybind11`
-    # But we can't use this now because all aiter op based on torch
-    # which means pybind11 related build flags must from torch now
     common_cflags = []
     if is_python_module:
         import pybind11
 
         extra_include_paths.append(pybind11.get_include())
-        common_cflags += [f"{x}" for x in _get_pybind11_abi_build_flags()]
-        common_cflags += [f"{x}" for x in _get_glibcxx_abi_build_flags()]
+        # _GLIBCXX_USE_CXX11_ABI is libstdc++-only.
+        if not torch_exclude:
+            common_cflags += [f"{x}" for x in _get_pybind11_abi_build_flags()]
+            if not IS_WINDOWS:
+                common_cflags += [f"{x}" for x in _get_glibcxx_abi_build_flags()]
+        elif not IS_WINDOWS:
+            common_cflags.append("-D_GLIBCXX_USE_CXX11_ABI=1")
 
     # sysconfig.get_path('include') gives us the location of Python.h
     # Explicitly specify 'posix_prefix' scheme on non-Windows platforms to workaround error on some MacOS
     # installations where default `get_path` points to non-existing `/Library/Python/M.m/include` folder
+    # (on Windows that scheme points at a non-existing include/pythonX.Y instead).
     if is_python_module:
-        python_include_path = sysconfig.get_path("include", scheme="posix_prefix")
+        if IS_WINDOWS:
+            python_include_path = sysconfig.get_path("include")
+        else:
+            python_include_path = sysconfig.get_path("include", scheme="posix_prefix")
         if python_include_path is not None:
             system_includes.append(python_include_path)
 
     # Turn into absolute paths so we can emit them into the ninja build
     # file wherever it is.
-    user_includes = [os.path.abspath(file) for file in extra_include_paths]
+    user_includes = [_posix_path(os.path.abspath(f)) for f in extra_include_paths]
+    system_includes = [_posix_path(p) for p in system_includes]
 
-    if not torch_exclude:
-        common_cflags.append(f"-DTORCH_EXTENSION_NAME={name}")
-        # common_cflags.append("-DTORCH_API_INCLUDE_EXTENSION_H")
-        # common_cflags += [f"{x}" for x in _get_pybind11_abi_build_flags()]
-        # common_cflags += [f"{x}" for x in _get_glibcxx_abi_build_flags()]
+    common_cflags.append(f"-DAITER_EXTENSION_NAME={name}")
+    common_cflags.append(f"-DTORCH_EXTENSION_NAME={name}")
 
-    # Windows does not understand `-isystem` and quotes flags later.
     common_cflags += [f"-I{shlex.quote(include)}" for include in user_includes]
     common_cflags += [f"-isystem {shlex.quote(include)}" for include in system_includes]
 
-    cflags = common_cflags + ["-fPIC", "-std=c++20"] + extra_cflags
+    base_cflags = ["-std=c++20"] if IS_WINDOWS else ["-fPIC", "-std=c++20"]
+    cflags = common_cflags + base_cflags + extra_cflags
 
     if with_cuda and IS_HIP_EXTENSION:
         cuda_flags = ["-DWITH_HIP"] + cflags + COMMON_HIP_FLAGS + COMMON_HIPCC_FLAGS
@@ -1784,10 +2029,10 @@ def _write_ninja_file(
 
     # Version 1.3 is required for the `deps` directive.
     config = ["ninja_required_version = 1.3"]
-    config.append(f"cxx = {compiler}")
+    config.append(f"cxx = {_posix_path(compiler)}")
     if with_cuda or cuda_dlink_post_cflags:
-        nvcc = _join_rocm_home("bin", "hipcc")
-        config.append(f"nvcc = {nvcc}")
+        nvcc = _get_hipcc_path()
+        config.append(f"nvcc = {_posix_path(nvcc)}")
 
     if IS_HIP_EXTENSION:
         post_cflags = COMMON_HIP_FLAGS + post_cflags
@@ -1851,8 +2096,8 @@ def _write_ninja_file(
             _resolve_per_source_flags(source_file) if is_cuda_source else None
         )
 
-        source_file_q = source_file.replace(" ", "$ ")
-        object_file_q = object_file.replace(" ", "$ ")
+        source_file_q = _ninja_path(source_file)
+        object_file_q = _ninja_path(object_file)
         build.append(f"build {object_file_q}: {rule} {source_file_q}")
         if per_source_flags:
             # Append to the rule-level $cuda_post_cflags rather than
@@ -1868,7 +2113,12 @@ def _write_ninja_file(
         devlink_out = os.path.join(os.path.dirname(objects[0]), "dlink.o")
         devlink_rule = ["rule cuda_devlink"]
         devlink_rule.append("  command = $nvcc $in -o $out $cuda_dlink_post_cflags")
-        devlink = [f'build {devlink_out}: cuda_devlink {" ".join(objects)}']
+        devlink = [
+            (
+                f"build {_ninja_path(devlink_out)}: cuda_devlink "
+                f'{" ".join(_ninja_path(o) for o in objects)}'
+            )
+        ]
         objects += [devlink_out]
     else:
         devlink_rule, devlink = [], []
@@ -1880,9 +2130,14 @@ def _write_ninja_file(
             "  command = $cxx @$out.rsp $ldflags -o $out\n  rspfile = $out.rsp\n  rspfile_content = $in"
         )
 
-        link = [f'build {library_target}: link {" ".join(objects)}']
+        link = [
+            (
+                f"build {_ninja_path(library_target)}: link "
+                f'{" ".join(_ninja_path(o) for o in objects)}'
+            )
+        ]
 
-        default = [f"default {library_target}"]
+        default = [f"default {_ninja_path(library_target)}"]
     else:
         link_rule, link, default = [], [], []
 

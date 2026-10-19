@@ -1,23 +1,26 @@
 import math
+
 import torch
 import triton
+
 from aiter.ops.triton.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
 )
-from op_tests.triton_tests.gemm.batched.test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
-    generate_batched_gemm_a16w8_inputs as generate_batched_gemm_a8w8_per_token_group_inputs,
-)
+from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.utils.argparse import (
-    get_parser,
     add_argparse_ff,
     get_ff_args,
+    get_parser,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    batched_model_benchmark_shapes,
+    get_caller_name_no_ext,
     get_model_benchmark_object,
     get_shape_benchmark_object,
-    batched_model_benchmark_shapes,
     print_vgpr,
-    get_caller_name_no_ext,
+)
+from op_tests.triton_tests.gemm.batched.test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
+    generate_batched_gemm_a16w8_inputs as generate_batched_gemm_a8w8_per_token_group_inputs,
 )
 
 
@@ -31,6 +34,7 @@ def bench_gemm_fn(
     group_size: int,
     has_bias: bool,
     transpose_bm: bool,
+    backend: str | None = None,
 ):
     c_dtype = torch.bfloat16
     x, weight, w_scale, bias, y = generate_batched_gemm_a8w8_per_token_group_inputs(
@@ -66,6 +70,7 @@ def bench_gemm_fn(
             dtype=c_dtype,
             YQ=y,
             transpose_bm=transpose_bm,
+            backend=backend,
         )
 
     ms = triton.testing.do_bench(fn, warmup=25, rep=100)
@@ -117,6 +122,7 @@ def run_model_benchmark(args):
             args.group_size,
             not args.no_bias,
             args.transpose_bm,
+            args.backend,
         )
 
     bench_batched_gemm_a8w8_per_token_group_prequant_w_per_batched_tensor_quant.run(
@@ -143,6 +149,7 @@ def run_shape_benchmark(args):
             args.group_size,
             not args.no_bias,
             args.transpose_bm,
+            args.backend,
         )
 
     bench_batched_gemm_a8w8_per_token_group_prequant_w_per_batched_tensor_quant.run(
@@ -174,7 +181,14 @@ def parse_args(args: list[str] | None = None):
         "--no-bias",
         action="store_true",
         default=False,
-        help="Disable bias.",
+        help="Disable bias (required for --backend gluon).",
+    )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["triton", "gluon"],
+        default=None,
+        help="Kernel backend (default: auto -- gluon on gfx1250 when bias is off).",
     )
     parser.add_argument(
         "--transpose-bm",
@@ -188,6 +202,12 @@ def parse_args(args: list[str] | None = None):
 
 def main(args: list[str] | None = None) -> None:
     parsed_args, defaults = parse_args(args=args)
+    if parsed_args.backend == "gluon" and arch_info.get_arch() != "gfx1250":
+        print(
+            f"--backend gluon is gfx1250-only (running on {arch_info.get_arch()}); "
+            "nothing to benchmark."
+        )
+        return
     if parsed_args.print_vgpr:
         print_vgpr(lambda: run_benchmark(parsed_args, defaults))
         return

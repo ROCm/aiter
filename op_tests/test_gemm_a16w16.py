@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes, hipb_create_extension, hipb_mm
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+from aiter.ops.gemm_op_a16w16 import _SEMA_SHAPE, get_semaphore_workspace
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.tuned_gemm import tgemm, triton_gemm
@@ -118,7 +119,7 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
             b.dtype == otype
         ), f"b={b.dtype}, expected output dtype={otype}, input dtype={dtype}"
 
-    msg_b = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, B avg: {avg_b:<8.2f} us,B uplift: {avg_a/avg_b-1:<5.1%}, "
+    msg_b = f"[perf] dim: {dim!s:<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, B avg: {avg_b:<8.2f} us,B uplift: {avg_a/avg_b-1:<5.1%}, "
     err_tgemm = checkAllclose(a, b, msg=msg_b, catastrophic_check=True)
     ret["torch us"] = avg_a
     ret["tgemm us"] = avg_b
@@ -143,7 +144,7 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         assert (
             c.dtype == otype
         ), f"c={c.dtype}, expected output dtype={otype}, input dtype={dtype}"
-        msg_c = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, C avg: {avg_c:<8.2f} us, C uplift: {avg_a/avg_c-1:<5.1%}, "
+        msg_c = f"[perf] dim: {dim!s:<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, C avg: {avg_c:<8.2f} us, C uplift: {avg_a/avg_c-1:<5.1%}, "
         err_hipb = (
             checkAllclose(a, c, msg=msg_c, catastrophic_check=True)
             if c is not None
@@ -166,11 +167,11 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         d, avg_d = run_bf16gemm_asm(
             x, wshuffle, out_asm, bias, bpreshuffle=wshuffle.is_shuffled
         )
-        msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm-bpreshuffle avg: {avg_d:<8.2f} us, uplift: {avg_b/avg_d-1:<5.1%}"
+        msg = f"[perf] dim: {dim!s:<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm-bpreshuffle avg: {avg_d:<8.2f} us, uplift: {avg_b/avg_d-1:<5.1%}"
         err_asm = checkAllclose(a, d, msg=msg, catastrophic_check=True)
         ### no shuffle
         e, avg_e = run_bf16gemm_asm(x, weight, out_asm, bias)
-        msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm-noshuffle avg: {avg_e:<8.2f} us, uplift: {avg_b/avg_e-1:<5.1%}"
+        msg = f"[perf] dim: {dim!s:<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm-noshuffle avg: {avg_e:<8.2f} us, uplift: {avg_b/avg_e-1:<5.1%}"
         err_asm_noshuffle = checkAllclose(a, e, msg=msg, catastrophic_check=True)
         ret["asm-bpshuff us"] = avg_d
         ret["asm-bpshuff err"] = err_asm
@@ -428,6 +429,85 @@ def test_skinny_gemm():
     return df
 
 
+def check_graph(dtype, m, n, k, otype):
+    """Capture the asm split-K GEMM in a HIP graph, replay it, compare against eager.
+
+    Not part of the perf table: this is a pass/fail check that the split-K
+    semaphore survives capture/replay. The kernel needs its counter to be zero
+    when a launch starts; a graph records launches, not the memset that zeroed
+    the counter, so a replay can start dirty and the kernel spins forever.
+    """
+    if dtype != dtypes.bf16 or otype not in (dtypes.bf16, dtypes.fp32):
+        return  # the asm a16w16 path only takes bf16 in, bf16/fp32 out
+    if k % 64 or n % 64:
+        return
+
+    x = torch.randn(m, k, dtype=dtype, device="cuda")
+    weight = torch.randn(n, k, dtype=dtype, device="cuda")
+    wshuffle = shuffle_weight(weight, layout=(16, 16))
+    out = torch.empty(m, n, dtype=otype, device="cuda")
+
+    # Warm up outside capture: the first call loads the module and allocates the
+    # semaphore workspace, neither of which may happen inside a capture region.
+    aiter.gemm_a16w16_asm(x, wshuffle, out, bpreshuffle=wshuffle.is_shuffled)
+    torch.cuda.synchronize()
+    eager = out.clone()
+
+    # Capture on a stream no warmup ran on: that is what makes the counter's
+    # (device, stream) key miss and allocate inside the capture region, which is
+    # where it can inherit a freed intermediate's address.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        aiter.gemm_a16w16_asm(x, wshuffle, out, bpreshuffle=wshuffle.is_shuffled)
+    torch.cuda.current_stream().wait_stream(stream)
+
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    # splitK reduces in whatever order the blocks finish, so the same inputs are
+    # not bit-identical run to run; compare with the file's usual tolerance.
+    err = checkAllclose(
+        eager,
+        out,
+        msg=f"graph dim: {(m, n, k)!s:<20} dtype: {dtype} otype: {otype}, replay vs eager: ",
+        catastrophic_check=True,
+    )
+    assert err == 0, f"graph replay diverged from eager at {(m, n, k)} {dtype} {otype}"
+
+    # The counter a capture hands out must not live on an address another graph
+    # in the same pool writes. The kernel hands it back at zero on its own, so
+    # nothing has to re-zero it per replay -- but an inherited address is
+    # overwritten every replay. Checked without a kernel so a regression asserts
+    # here in milliseconds instead of spinning in the GEMM above.
+    sink = torch.zeros(1, device=x.device)
+    pool = torch.cuda.graph_pool_handle()
+    src = torch.full((_SEMA_SHAPE[0] * _SEMA_SHAPE[1],), 3.0, device=x.device)
+    decoy = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(decoy, pool=pool, stream=stream):
+        transient = src * 2.0
+        transient_ptr = transient.data_ptr()
+        transient.sum()
+        del transient
+    probe = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(probe, pool=pool, stream=stream):
+        sema = get_semaphore_workspace(x.device)
+        sink.add_(1)  # a graph needs at least one node
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    assert (
+        sema.data_ptr() != transient_ptr
+    ), f"splitK counter inherited a freed intermediate's address at {(m, n, k)}"
+    decoy.replay()
+    torch.cuda.synchronize()
+    assert (
+        int(sema.view(torch.int32).max().item()) == 0
+    ), f"another graph in the pool wrote into the splitK counter at {(m, n, k)}"
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of a16w16_gemm_test",
@@ -495,6 +575,13 @@ parser.add_argument(
     help="""Scale B.
     e.g.: -sb 0.5""",
 )
+parser.add_argument(
+    "--graph",
+    action="store_true",
+    help="""Also run the HIP-graph capture/replay check for the asm splitK path
+    over the same sweep. Use shapes that select splitK (small m, large k).
+    e.g.: --graph -mnk 64,256,5120 32,512,8192 -d bf16 -o fp32""",
+)
 args = parser.parse_args()
 
 df = []
@@ -503,6 +590,8 @@ for test in args.test:
         for dtype in args.dtype:
             for otype in args.otype:
                 for m, n, k in args.mnk:
+                    if args.graph:
+                        check_graph(dtype, m, n, k, otype)
                     ret = test_gemm(
                         dtype,
                         m,
@@ -521,3 +610,5 @@ for test in args.test:
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("gemm_a16w16 summary (markdown):\n%s", df_md)
+if args.graph:
+    aiter.logger.info("all graph capture/replay checks passed")

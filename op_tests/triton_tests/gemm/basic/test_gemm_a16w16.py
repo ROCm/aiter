@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import pytest
 import torch
 import torch.nn.functional as F
-import pytest
-from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16, _is_gluon_available
+
+from aiter.ops.triton.gemm.basic.gemm_a16w16 import _is_gluon_available, gemm_a16w16
 from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import gemm_a16w16_atomic
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
 
@@ -62,6 +63,8 @@ def get_x_vals():
     x_vals += [(2**i, 256, 7168) for i in range(5, 9)]  # DSR1 router GEMM
     # GPT-OSS-120B attention projections
     x_vals += [(2**i, 5120, 2880) for i in range(5, 9)]  # GPTOSS QKV input projection
+    x_vals += [(2048, 5120, 2880)]  # GPTOSS QKV @ M=2048
+    x_vals += [(8192, 5120, 2880)]  # GPTOSS QKV @ M=8192
     x_vals += [(2**i, 2880, 4096) for i in range(5, 9)]  # output projection
     x_vals += [(2**i, 128, 2880) for i in range(5, 9)]  # Router GEMM
     x_vals += [(v, 106496, 16384) for v in (256, 4096)]  # LL3 405B FC1
@@ -79,7 +82,7 @@ def test_gemm_a16_w16(M: int, N: int, K: int, backend, kernel_type):
         pytest.skip("Gluon not supported on this architecture")
     _skip_if_triton_on_gfx1250(backend)
 
-    x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
+    x, w, _, _out_dtype, _y = generate_gemm_a16w16_inputs(
         M,
         N,
         K,
@@ -182,7 +185,7 @@ def test_gemm_a16_w16_layout(M: int, N: int, K: int, layout, backend, kernel_typ
 def test_gemm_a16_w16_atomic(M: int, N: int, K: int, output):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
-    x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
+    x, w, _, _out_dtype, y = generate_gemm_a16w16_inputs(
         M, N, K, torch.bfloat16, output=output
     )
 
@@ -203,7 +206,7 @@ def test_gemm_a16_w16_atomic(M: int, N: int, K: int, output):
 def test_gemm_a16_w16_atomic_layout(M: int, N: int, K: int, layout):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
-    x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
+    x, w, _, _out_dtype, y = generate_gemm_a16w16_inputs(
         M, N, K, torch.bfloat16, layout=layout, output=True
     )
 
@@ -211,5 +214,51 @@ def test_gemm_a16_w16_atomic_layout(M: int, N: int, K: int, layout):
 
     y = y.to(torch.float32).zero_()
     triton_out = gemm_a16w16_atomic(x, w, torch.float32, y).to(torch.bfloat16)
+
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
+
+@pytest.mark.parametrize("M, N, K", get_fewer_x_vals())
+@pytest.mark.parametrize("strided", [False, True])
+def test_gemm_a16_w16_atomic_accumulate(M: int, N: int, K: int, strided):
+    """accumulate=True adds X @ W^T into y in place, like torch.addmm_."""
+    torch.cuda.empty_cache()
+
+    x, w, _, _out_dtype, _y = generate_gemm_a16w16_inputs(
+        M, N, K, torch.bfloat16, output=False
+    )
+    base = torch.randn((M, 2 * N if strided else N), dtype=torch.float32, device="cuda")
+    y = base[:, :N]
+    torch_out = torch.addmm(y, x.float(), w.float().T)
+
+    triton_out = gemm_a16w16_atomic(x, w, torch.float32, y, accumulate=True)
+
+    assert triton_out.data_ptr() == y.data_ptr()
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
+
+@pytest.mark.parametrize("M, N, K", get_x_vals())
+@pytest.mark.parametrize("output", [True, False])
+@pytest.mark.parametrize("layout", ["TN", "TT"])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_gemm_a16w16_persistent_output(M: int, N: int, K: int, layout, output, backend):
+    if backend == "gluon" and not is_gluon_supported():
+        pytest.skip("Gluon not supported on this architecture")
+    torch.cuda.empty_cache()
+
+    x, w, _, _out_dtype, y = generate_gemm_a16w16_inputs(
+        M, N, K, torch.bfloat16, layout=layout, output=output
+    )
+
+    torch_out = F.linear(x, w, bias=None)
+
+    if output:
+        triton_out = gemm_a16w16(
+            x, w, dtype=torch.bfloat16, y=y, backend=backend, persistent=True
+        )
+    else:
+        triton_out = gemm_a16w16(
+            x, w, dtype=torch.bfloat16, backend=backend, persistent=True
+        )
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)

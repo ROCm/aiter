@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
+
 import torch
 from torch import Tensor
-from typing import Optional
-from ..jit.core import compile_ops, AITER_CSRC_DIR
-from .enum import ActivationType, QuantType
+
+from ..jit.core import AITER_CSRC_DIR, compile_ops
 from ..utility import dtypes
-import functools
+from .enum import ActivationType, QuantType
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
 
@@ -62,6 +63,57 @@ def topk_softmax(
         need_renorm,
         num_shared_experts,
         shared_expert_scoring_func,
+    )
+
+
+@compile_ops("module_moe_asm", fc_name="topk_softmax_fused_shared_gate", develop=True)
+def _topk_softmax_fused_shared_gate(
+    topk_weights: Tensor,
+    topk_indices: Tensor,
+    token_expert_indices: Tensor,
+    gating_output: Tensor,
+    need_renorm: bool,
+    num_shared_experts: int,
+    shared_expert_scoring_func: str,
+    hidden_states: Tensor,
+    gate_weight: Tensor,
+    shared_expert_scale: float,
+    shared_expert_base: int,
+) -> None: ...
+
+
+def topk_softmax_fused_shared_gate(
+    topk_weights: Tensor,
+    topk_indices: Tensor,
+    token_expert_indices: Tensor,
+    gating_output: Tensor,
+    need_renorm: bool,
+    num_shared_experts: int,
+    shared_expert_scoring_func: str,
+    hidden_states: Tensor,
+    gate_weight: Tensor,
+    shared_expert_scale: float = 1.0,
+    shared_expert_base: int = -1,
+) -> None:
+    # Option A ("fuse-gate"): gating_output holds ONLY routed experts; the shared
+    # logit is computed in-kernel as
+    #   sigmoid(hidden_states @ gate_weight.T) * shared_expert_scale
+    # (scale applied AFTER sigmoid) and the shared id (shared_expert_base + s) is
+    # written by the kernel. Output buffers are width topk + num_shared_experts.
+    # No softmax_workspace: the fused op supports only power-of-2 num_experts <= 512
+    # (non-power-of-2 is rejected), so the two-pass path that needed it never runs.
+    _topk_softmax_fused_shared_gate(
+        topk_weights,
+        topk_indices,
+        token_expert_indices,
+        gating_output,
+        need_renorm,
+        num_shared_experts,
+        shared_expert_scoring_func,
+        hidden_states,
+        gate_weight,
+        shared_expert_scale,
+        shared_expert_base,
     )
 
 
@@ -138,7 +190,7 @@ def fmoe_int8_g1u0(
     fc1_scale: Tensor,
     fc2_scale: Tensor,
     fc2_smooth_scale: Tensor,
-    activation: Optional[int] = ActivationType.Silu.value,
+    activation: int | None = ActivationType.Silu.value,
 ) -> None: ...
 
 
@@ -156,9 +208,9 @@ def fmoe_g1u1(
     input_scale: Tensor,
     fc1_scale: Tensor,
     fc2_scale: Tensor,
-    kernelName: Optional[str] = "",
-    fc2_smooth_scale: Optional[Tensor] = None,
-    activation: Optional[int] = ActivationType.Silu.value,
+    kernelName: str | None = "",
+    fc2_smooth_scale: Tensor | None = None,
+    activation: int | None = ActivationType.Silu.value,
 ) -> None: ...
 
 
@@ -176,9 +228,9 @@ def fmoe_g1u1_tkw1(
     input_scale: Tensor,
     fc1_scale: Tensor,
     fc2_scale: Tensor,
-    kernelName: Optional[str] = "",
-    fc2_smooth_scale: Optional[Tensor] = None,
-    activation: Optional[int] = ActivationType.Silu.value,
+    kernelName: str | None = "",
+    fc2_smooth_scale: Tensor | None = None,
+    activation: int | None = ActivationType.Silu.value,
 ) -> None: ...
 
 
@@ -197,7 +249,7 @@ def fmoe_int8_g1u0_a16(
     fc2_scale: Tensor,
     fc1_smooth_scale: Tensor,
     fc2_smooth_scale: Tensor,
-    activation: Optional[int] = ActivationType.Silu.value,
+    activation: int | None = ActivationType.Silu.value,
 ) -> None: ...
 
 
@@ -216,7 +268,7 @@ def fmoe_g1u1_a16(
     fc2_scale: Tensor,
     fc1_smooth_scale: Tensor,
     fc2_smooth_scale: Tensor,
-    activation: Optional[int] = ActivationType.Silu.value,
+    activation: int | None = ActivationType.Silu.value,
 ) -> None: ...
 
 
@@ -234,11 +286,11 @@ def fmoe_fp8_blockscale_g1u1(
     input_scale: Tensor,
     fc1_scale: Tensor,
     fc2_scale: Tensor,
-    kernelName: Optional[str] = "",
+    kernelName: str | None = "",
     fc_scale_blkn: int = 128,
     fc_scale_blkk: int = 128,
-    fc2_smooth_scale: Optional[Tensor] = None,
-    activation: Optional[int] = ActivationType.Silu.value,
+    fc2_smooth_scale: Tensor | None = None,
+    activation: int | None = ActivationType.Silu.value,
     block_size_M: int = 32,
 ) -> None: ...
 
@@ -253,14 +305,14 @@ def moe_stage1_g1u1(
     num_valid_ids: Tensor,
     out: Tensor,
     inter_dim: int,
-    kernelName: Optional[str],
+    kernelName: str | None,
     block_m: int,
     ksplit: int = 0,
-    activation: Optional[int] = ActivationType.Silu.value,
-    quant_type: Optional[int] = QuantType.No.value,
-    a1_scale: Optional[Tensor] = None,
-    w1_scale: Optional[Tensor] = None,
-    sorted_weights: Optional[Tensor] = None,
+    activation: int | None = ActivationType.Silu.value,
+    quant_type: int | None = QuantType.No.value,
+    a1_scale: Tensor | None = None,
+    w1_scale: Tensor | None = None,
+    sorted_weights: Tensor | None = None,
 ) -> None: ...
 
 
@@ -273,16 +325,16 @@ def cmdGenFunc_ck_moe_stage(
     num_valid_ids: Tensor,
     out: Tensor,
     topk: int,
-    kernelName: Optional[str] = None,
-    w1_scale: Optional[Tensor] = None,
-    a1_scale: Optional[Tensor] = None,
-    block_m: Optional[int] = 32,
-    sorted_weights: Optional[Tensor] = None,
+    kernelName: str | None = None,
+    w1_scale: Tensor | None = None,
+    a1_scale: Tensor | None = None,
+    block_m: int | None = 32,
+    sorted_weights: Tensor | None = None,
     quant_type: int = 0,
     activation: int = 0,
     splitk: int = 1,
     use_non_temporal_load: bool = False,
-    dst_type: Optional[str] = None,
+    dst_type: str | None = None,
     is_shuffled: bool = True,
 ):
 
@@ -315,16 +367,16 @@ def cmdGenFunc_ck_moe_stage2(
     num_valid_ids: Tensor,
     out: Tensor,
     topk: int,
-    kernelName: Optional[str] = None,
-    w1_scale: Optional[Tensor] = None,
-    a1_scale: Optional[Tensor] = None,
-    block_m: Optional[int] = 32,
-    sorted_weights: Optional[Tensor] = None,
+    kernelName: str | None = None,
+    w1_scale: Tensor | None = None,
+    a1_scale: Tensor | None = None,
+    block_m: int | None = 32,
+    sorted_weights: Tensor | None = None,
     quant_type: int = 0,
     activation: int = 0,
     splitk: int = 1,
     use_non_temporal_load: bool = False,
-    dst_type: Optional[str] = None,
+    dst_type: str | None = None,
     is_shuffled: bool = True,
 ):
 
@@ -354,16 +406,16 @@ def ck_moe_stage1(
     num_valid_ids: Tensor,
     out: Tensor,
     topk: int,
-    kernelName: Optional[str] = None,
-    w1_scale: Optional[Tensor] = None,
-    a1_scale: Optional[Tensor] = None,
-    block_m: Optional[int] = 32,
-    sorted_weights: Optional[Tensor] = None,
+    kernelName: str | None = None,
+    w1_scale: Tensor | None = None,
+    a1_scale: Tensor | None = None,
+    block_m: int | None = 32,
+    sorted_weights: Tensor | None = None,
     quant_type: int = 0,
     activation: int = 0,
-    splitk: Optional[int] = 1,
+    splitk: int | None = 1,
     use_non_temporal_load: bool = False,
-    dst_type: Optional[str] = None,
+    dst_type: str | None = None,
     is_shuffled: bool = True,
 ) -> None: ...
 
@@ -378,16 +430,16 @@ def ck_moe_stage2(
     num_valid_ids: Tensor,
     out: Tensor,
     topk: int,
-    kernelName: Optional[str] = None,
-    w2_scale: Optional[Tensor] = None,
-    a2_scale: Optional[Tensor] = None,
-    block_m: Optional[int] = 32,
-    sorted_weights: Optional[Tensor] = None,
+    kernelName: str | None = None,
+    w2_scale: Tensor | None = None,
+    a2_scale: Tensor | None = None,
+    block_m: int | None = 32,
+    sorted_weights: Tensor | None = None,
     quant_type: int = 0,
     activation: int = 0,
     splitk: int = 1,
     use_non_temporal_load: bool = False,
-    dst_type: Optional[str] = None,
+    dst_type: str | None = None,
     is_shuffled: bool = True,
 ) -> None: ...
 
@@ -401,15 +453,15 @@ def moe_cktile2stages_gemm1_ck(
     sorted_expert_ids: Tensor,
     max_token_ids: Tensor,
     topk: int,
-    n_padded_zeros: Optional[int] = 0,
-    k_padded_zeros: Optional[int] = 0,
-    topk_weight: Optional[Tensor] = None,
-    x_scale: Optional[Tensor] = None,
-    w_scale: Optional[Tensor] = None,
-    exp_bias: Optional[Tensor] = None,
-    activation: Optional[int] = 0,
-    block_m: Optional[int] = 32,
-    split_k: Optional[int] = 1,
+    n_padded_zeros: int | None = 0,
+    k_padded_zeros: int | None = 0,
+    topk_weight: Tensor | None = None,
+    x_scale: Tensor | None = None,
+    w_scale: Tensor | None = None,
+    exp_bias: Tensor | None = None,
+    activation: int | None = 0,
+    block_m: int | None = 32,
+    split_k: int | None = 1,
     kernel_name: str = "",
 ) -> Tensor: ...
 
@@ -422,15 +474,15 @@ def moe_cktile2stages_gemm1(
     sorted_expert_ids: Tensor,
     max_token_ids: Tensor,
     topk: int,
-    n_padded_zeros: Optional[int] = 0,
-    k_padded_zeros: Optional[int] = 0,
-    topk_weight: Optional[Tensor] = None,
-    x_scale: Optional[Tensor] = None,
-    w_scale: Optional[Tensor] = None,
-    exp_bias: Optional[Tensor] = None,
-    activation: Optional[int] = 0,
-    block_m: Optional[int] = 32,
-    split_k: Optional[int] = 1,
+    n_padded_zeros: int | None = 0,
+    k_padded_zeros: int | None = 0,
+    topk_weight: Tensor | None = None,
+    x_scale: Tensor | None = None,
+    w_scale: Tensor | None = None,
+    exp_bias: Tensor | None = None,
+    activation: int | None = 0,
+    block_m: int | None = 32,
+    split_k: int | None = 1,
     kernel_name: str = "",
 ):
     return moe_cktile2stages_gemm1_ck(
@@ -463,15 +515,15 @@ def moe_cktile2stages_gemm2_ck(
     sorted_expert_ids: Tensor,
     max_token_ids: Tensor,
     topk: int,
-    n_padded_zeros: Optional[int] = 0,
-    k_padded_zeros: Optional[int] = 0,
-    topk_weight: Optional[Tensor] = None,
-    x_scale: Optional[Tensor] = None,
-    w_scale: Optional[Tensor] = None,
-    exp_bias: Optional[Tensor] = None,
-    activation: Optional[int] = 0,
-    block_m: Optional[int] = 32,
-    split_k: Optional[int] = 1,
+    n_padded_zeros: int | None = 0,
+    k_padded_zeros: int | None = 0,
+    topk_weight: Tensor | None = None,
+    x_scale: Tensor | None = None,
+    w_scale: Tensor | None = None,
+    exp_bias: Tensor | None = None,
+    activation: int | None = 0,
+    block_m: int | None = 32,
+    split_k: int | None = 1,
     kernel_name: str = "",
 ) -> Tensor: ...
 
@@ -484,15 +536,15 @@ def moe_cktile2stages_gemm2(
     sorted_expert_ids: Tensor,
     max_token_ids: Tensor,
     topk: int,
-    n_padded_zeros: Optional[int] = 0,
-    k_padded_zeros: Optional[int] = 0,
-    topk_weight: Optional[Tensor] = None,
-    x_scale: Optional[Tensor] = None,
-    w_scale: Optional[Tensor] = None,
-    exp_bias: Optional[Tensor] = None,
-    activation: Optional[int] = 0,
-    block_m: Optional[int] = 32,
-    split_k: Optional[int] = 1,
+    n_padded_zeros: int | None = 0,
+    k_padded_zeros: int | None = 0,
+    topk_weight: Tensor | None = None,
+    x_scale: Tensor | None = None,
+    w_scale: Tensor | None = None,
+    exp_bias: Tensor | None = None,
+    activation: int | None = 0,
+    block_m: int | None = 32,
+    split_k: int | None = 1,
     kernel_name: str = "",
 ):
     return moe_cktile2stages_gemm2_ck(
@@ -593,15 +645,15 @@ def ck_moe_stage1_fwd(
     out: Tensor,
     topk: int,
     kernelName: str = "",
-    w1_scale: Optional[Tensor] = None,
-    a1_scale: Optional[Tensor] = None,
-    block_m: Optional[int] = 32,
-    sorted_weights: Optional[Tensor] = None,
+    w1_scale: Tensor | None = None,
+    a1_scale: Tensor | None = None,
+    block_m: int | None = 32,
+    sorted_weights: Tensor | None = None,
     quant_type: QuantType = QuantType.No,
     activation: ActivationType = ActivationType.Silu,
-    splitk: Optional[int] = 1,
-    use_non_temporal_load: Optional[bool] = False,
-    dst_type: Optional[torch.dtype] = None,
+    splitk: int | None = 1,
+    use_non_temporal_load: bool | None = False,
+    dst_type: torch.dtype | None = None,
 ):
     ck_moe_stage1(
         hidden_states,
@@ -637,13 +689,13 @@ def ck_moe_stage2_fwd(
     out: Tensor,
     topk: int,
     kernelName: str = "",
-    w2_scale: Optional[Tensor] = None,
-    a2_scale: Optional[Tensor] = None,
-    block_m: Optional[int] = 32,
-    sorted_weights: Optional[Tensor] = None,
+    w2_scale: Tensor | None = None,
+    a2_scale: Tensor | None = None,
+    block_m: int | None = 32,
+    sorted_weights: Tensor | None = None,
     quant_type: QuantType = QuantType.No,
     activation: ActivationType = ActivationType.Silu,
-    use_non_temporal_load: Optional[bool] = False,
+    use_non_temporal_load: bool | None = False,
 ):
     ck_moe_stage2(
         inter_states,

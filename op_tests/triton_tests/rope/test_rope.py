@@ -1,44 +1,44 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import pytest
 import random
 
-from op_tests.test_rope import (
-    ref_rope_sbhd_fwd,
-    ref_rope_thd_fwd,
-    RotateStyle,
-    ref_rope_2d_fwd,
-)
+import pytest
+import torch
+
+from aiter import logger
 from aiter.ops.triton.rope.rope import (
-    rope_fwd,
-    rope_fwd_inplace,
     rope_bwd,
-    rope_thd_fwd,
-    rope_thd_fwd_inplace,
-    rope_thd_bwd,
+    rope_cached_bwd,
     rope_cached_fwd,
     rope_cached_fwd_inplace,
+    rope_cached_positions_bwd,
     rope_cached_positions_fwd,
     rope_cached_positions_fwd_inplace,
+    rope_cached_positions_offsets_bwd,
     rope_cached_positions_offsets_fwd,
     rope_cached_positions_offsets_fwd_inplace,
-    rope_cached_bwd,
-    rope_cached_positions_bwd,
-    rope_cached_positions_offsets_bwd,
+    rope_cached_thd_positions_2c_bwd,
     rope_cached_thd_positions_2c_fwd,
     rope_cached_thd_positions_2c_fwd_inplace,
+    rope_cached_thd_positions_offsets_2c_bwd,
     rope_cached_thd_positions_offsets_2c_fwd,
     rope_cached_thd_positions_offsets_2c_fwd_inplace,
-    rope_cached_thd_positions_2c_bwd,
-    rope_cached_thd_positions_offsets_2c_bwd,
+    rope_fwd,
     rope_fwd_2d,
     rope_fwd_2d_inplace,
     rope_fwd_3d,
+    rope_fwd_inplace,
+    rope_thd_bwd,
+    rope_thd_fwd,
+    rope_thd_fwd_inplace,
 )
-
-DEBUG_MODE = False
+from op_tests.test_rope import (
+    RotateStyle,
+    ref_rope_2d_fwd,
+    ref_rope_sbhd_fwd,
+    ref_rope_thd_fwd,
+)
 
 
 def generate_rope_inputs(
@@ -236,7 +236,7 @@ def test_rope_sbhd_fwd(
     inplace: bool,
     dtype: torch.dtype,
 ):
-    x, y, gx, gy, freqs, positions, offsets, cos, sin = generate_rope_inputs(
+    x, _y, _gx, _gy, freqs, _positions, _offsets, _cos, _sin = generate_rope_inputs(
         B,
         S,
         H,
@@ -252,9 +252,13 @@ def test_rope_sbhd_fwd(
         dtype=dtype,
     )
 
-    if DEBUG_MODE:
-        print(f"x.shape={x.shape} x={x}")
-        print(f"freqs.shape={freqs.shape} freqs.strides={freqs.stride()} freqs={freqs}")
+    logger.debug("x.shape=%s x=%s", x.shape, x)
+    logger.debug(
+        "freqs.shape=%s freqs.strides=%s freqs=%s",
+        freqs.shape,
+        freqs.stride(),
+        freqs,
+    )
     torch_out = ref_rope_sbhd_fwd(
         x,
         freqs,
@@ -263,8 +267,7 @@ def test_rope_sbhd_fwd(
         nope_first=nope_first,
     )
 
-    if DEBUG_MODE:
-        print(f"torch_out={torch_out}")
+    logger.debug("torch_out=%s", torch_out)
 
     if inplace:
         triton_out = rope_fwd_inplace(
@@ -284,8 +287,7 @@ def test_rope_sbhd_fwd(
             nope_first=nope_first,
             transpose_output=False,
         )
-    if DEBUG_MODE:
-        print(f"triton_out={triton_out}")
+    logger.debug("triton_out=%s", triton_out)
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
@@ -310,7 +312,7 @@ def test_rope_sbhd_bwd(
     nope_first: bool,
     dtype: torch.dtype,
 ):
-    x, y, gx, gy, freqs, positions, offsets, cos, sin = generate_rope_inputs(
+    x, _y, gx, _gy, freqs, _positions, _offsets, _cos, _sin = generate_rope_inputs(
         B,
         S,
         H,
@@ -327,9 +329,13 @@ def test_rope_sbhd_bwd(
         bwd=True,
     )
 
-    if DEBUG_MODE:
-        print(f"x.shape={x.shape} x={x}")
-        print(f"freqs.shape={freqs.shape} freqs.strides={freqs.stride()} freqs={freqs}")
+    logger.debug("x.shape=%s x=%s", x.shape, x)
+    logger.debug(
+        "freqs.shape=%s freqs.strides=%s freqs=%s",
+        freqs.shape,
+        freqs.stride(),
+        freqs,
+    )
 
     triton_out = rope_bwd(
         gx,
@@ -350,11 +356,9 @@ def test_rope_sbhd_bwd(
     torch_fwd.backward(gx)
     torch_out = x.grad
 
-    if DEBUG_MODE:
-        print(f"torch_out={torch_out}")
+    logger.debug("torch_out=%s", torch_out)
 
-    if DEBUG_MODE:
-        print(f"triton_out={triton_out}")
+    logger.debug("triton_out=%s", triton_out)
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
@@ -380,7 +384,7 @@ def test_rope_thd_fwd(
     inplace: bool,
     dtype: torch.dtype,
 ):
-    x, y, gx, gy, freqs, positions, offsets, cos, sin = generate_rope_inputs(
+    x, _y, _gx, _gy, freqs, _positions, _offsets, _cos, _sin = generate_rope_inputs(
         1,
         T,
         H,
@@ -404,10 +408,14 @@ def test_rope_thd_fwd(
         seqlens = [0, T]
     cu_seqlens = torch.Tensor(seqlens).to(torch.int).to(freqs.device)
 
-    if DEBUG_MODE:
-        print(f"cu_seqlens={cu_seqlens}")
-        print(f"x.shape={x.shape} x={x}")
-        print(f"freqs.shape={freqs.shape} freqs.strides={freqs.stride()} freqs={freqs}")
+    logger.debug("cu_seqlens=%s", cu_seqlens)
+    logger.debug("x.shape=%s x=%s", x.shape, x)
+    logger.debug(
+        "freqs.shape=%s freqs.strides=%s freqs=%s",
+        freqs.shape,
+        freqs.stride(),
+        freqs,
+    )
 
     torch_out = ref_rope_thd_fwd(
         x,
@@ -417,8 +425,7 @@ def test_rope_thd_fwd(
         reuse_freqs_front_part=reuse_freqs_front_part,
         nope_first=nope_first,
     )
-    if DEBUG_MODE:
-        print(f"torch_out={torch_out}")
+    logger.debug("torch_out=%s", torch_out)
 
     if inplace:
         triton_out = rope_thd_fwd_inplace(
@@ -440,8 +447,7 @@ def test_rope_thd_fwd(
             nope_first=nope_first,
             transpose_output=False,
         )
-    if DEBUG_MODE:
-        print(f"triton_out={triton_out}")
+    logger.debug("triton_out=%s", triton_out)
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
@@ -465,7 +471,7 @@ def test_rope_thd_bwd(
     nope_first: bool,
     dtype: torch.dtype,
 ):
-    x, y, gx, gy, freqs, positions, offsets, cos, sin = generate_rope_inputs(
+    x, _y, gx, _gy, freqs, _positions, _offsets, _cos, _sin = generate_rope_inputs(
         1,
         T,
         H,
@@ -490,10 +496,14 @@ def test_rope_thd_bwd(
         seqlens = [0, T]
     cu_seqlens = torch.Tensor(seqlens).to(torch.int).to(freqs.device)
 
-    if DEBUG_MODE:
-        print(f"cu_seqlens={cu_seqlens}")
-        print(f"x.shape={x.shape} x={x}")
-        print(f"freqs.shape={freqs.shape} freqs.strides={freqs.stride()} freqs={freqs}")
+    logger.debug("cu_seqlens=%s", cu_seqlens)
+    logger.debug("x.shape=%s x=%s", x.shape, x)
+    logger.debug(
+        "freqs.shape=%s freqs.strides=%s freqs=%s",
+        freqs.shape,
+        freqs.stride(),
+        freqs,
+    )
 
     triton_out = rope_thd_bwd(
         gx,
@@ -516,11 +526,9 @@ def test_rope_thd_bwd(
     torch_fwd.backward(gx)
     torch_out = x.grad
 
-    if DEBUG_MODE:
-        print(f"torch_out={torch_out}")
+    logger.debug("torch_out=%s", torch_out)
 
-    if DEBUG_MODE:
-        print(f"triton_out={triton_out}")
+    logger.debug("triton_out=%s", triton_out)
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
@@ -550,7 +558,7 @@ def test_rope_cached_fwd(
     inplace: bool,
     dtype: torch.dtype,
 ):
-    x, y, gx, gy, freqs, positions, offsets, cos, sin = generate_rope_inputs(
+    x, _y, _gx, _gy, freqs, positions, offsets, cos, sin = generate_rope_inputs(
         B,
         S,
         H,
@@ -581,8 +589,7 @@ def test_rope_cached_fwd(
         reuse_freqs_front_part=reuse_freqs_front_part,
         nope_first=nope_first,
     )
-    if DEBUG_MODE:
-        print(f"torch_out={torch_out}")
+    logger.debug("torch_out=%s", torch_out)
 
     if pos:
         if offs:
@@ -655,8 +662,7 @@ def test_rope_cached_fwd(
                 transpose_output=False,
             )
 
-    if DEBUG_MODE:
-        print(f"triton_out={triton_out}")
+    logger.debug("triton_out=%s", triton_out)
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
@@ -685,7 +691,7 @@ def test_rope_cached_bwd(
     offs: bool,
     dtype: torch.dtype,
 ):
-    x, y, gx, gy, freqs, positions, offsets, cos, sin = generate_rope_inputs(
+    x, _y, gx, _gy, freqs, positions, offsets, cos, sin = generate_rope_inputs(
         B,
         S,
         H,
@@ -755,11 +761,9 @@ def test_rope_cached_bwd(
     torch_fwd.backward(gx)
     torch_out = x.grad
 
-    if DEBUG_MODE:
-        print(f"torch_out={torch_out}")
+    logger.debug("torch_out=%s", torch_out)
 
-    if DEBUG_MODE:
-        print(f"triton_out={triton_out}")
+    logger.debug("triton_out=%s", triton_out)
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
@@ -790,7 +794,7 @@ def test_rope_cached_thd_2c_fwd(
     offs: bool,
     inplace: bool,
 ):
-    x, y, gx, gy, freqs, positions, offsets, cos, sin = generate_rope_inputs(
+    x, y, _gx, _gy, freqs, positions, offsets, cos, sin = generate_rope_inputs(
         1,
         T,
         KH,
@@ -829,9 +833,8 @@ def test_rope_cached_thd_2c_fwd(
         nope_first=nope_first,
     ).squeeze(0)
 
-    if DEBUG_MODE:
-        print(f"torch_out_x={torch_out_x}")
-        print(f"torch_out_y={torch_out_y}")
+    logger.debug("torch_out_x=%s", torch_out_x)
+    logger.debug("torch_out_y=%s", torch_out_y)
 
     if offs:
         if inplace:
@@ -888,9 +891,8 @@ def test_rope_cached_thd_2c_fwd(
                 transpose_output=False,
             )
 
-    if DEBUG_MODE:
-        print(f"triton_out_x={triton_out_x}")
-        print(f"triton_out_y={triton_out_y}")
+    logger.debug("triton_out_x=%s", triton_out_x)
+    logger.debug("triton_out_y=%s", triton_out_y)
 
     torch.testing.assert_close(triton_out_x, torch_out_x, atol=1e-3, rtol=1e-1)
     torch.testing.assert_close(triton_out_y, torch_out_y, atol=1e-3, rtol=1e-1)
@@ -990,13 +992,11 @@ def test_rope_cached_thd_2c_bwd(
     torch_out_x = x.grad
     torch_out_y = y.grad
 
-    if DEBUG_MODE:
-        print(f"torch_out_x={torch_out_x}")
-        print(f"torch_out_y={torch_out_y}")
+    logger.debug("torch_out_x=%s", torch_out_x)
+    logger.debug("torch_out_y=%s", torch_out_y)
 
-    if DEBUG_MODE:
-        print(f"triton_out_x={triton_out_x}")
-        print(f"triton_out_y={triton_out_y}")
+    logger.debug("triton_out_x=%s", triton_out_x)
+    logger.debug("triton_out_y=%s", triton_out_y)
 
     torch.testing.assert_close(triton_out_x, torch_out_x, atol=1e-3, rtol=1e-1)
     torch.testing.assert_close(triton_out_y, torch_out_y, atol=1e-3, rtol=1e-1)
@@ -1045,24 +1045,48 @@ def test_rope_2d_fwd(
     cos_w = torch.cos(freqs_w)  # [1, width, 1, d // 2]
     sin_w = torch.sin(freqs_w)  # [1, width, 1, d // 2]
 
-    if DEBUG_MODE:
-        print(f"x.shape={x.shape} x={x}")
-        print(
-            f"freqs_h.shape={freqs_h.shape} freqs_h.strides={freqs_h.stride()} freqs_h={freqs_h}"
-        )
-        print(
-            f"freqs_w.shape={freqs_w.shape} freqs_w.strides={freqs_w.stride()} freqs_w={freqs_w}"
-        )
-        print(f"cos_h.shape={cos_h.shape} cos_h.strides={cos_h.stride()} cos_h={cos_h}")
-        print(f"sin_h.shape={sin_h.shape} sin_h.strides={sin_h.stride()} sin_h={sin_h}")
-        print(f"cos_w.shape={cos_w.shape} cos_w.strides={cos_w.stride()} cos_w={cos_w}")
-        print(f"sin_w.shape={sin_w.shape} sin_w.strides={sin_w.stride()} sin_w={sin_w}")
+    logger.debug("x.shape=%s x=%s", x.shape, x)
+    logger.debug(
+        "freqs_h.shape=%s freqs_h.strides=%s freqs_h=%s",
+        freqs_h.shape,
+        freqs_h.stride(),
+        freqs_h,
+    )
+    logger.debug(
+        "freqs_w.shape=%s freqs_w.strides=%s freqs_w=%s",
+        freqs_w.shape,
+        freqs_w.stride(),
+        freqs_w,
+    )
+    logger.debug(
+        "cos_h.shape=%s cos_h.strides=%s cos_h=%s",
+        cos_h.shape,
+        cos_h.stride(),
+        cos_h,
+    )
+    logger.debug(
+        "sin_h.shape=%s sin_h.strides=%s sin_h=%s",
+        sin_h.shape,
+        sin_h.stride(),
+        sin_h,
+    )
+    logger.debug(
+        "cos_w.shape=%s cos_w.strides=%s cos_w=%s",
+        cos_w.shape,
+        cos_w.stride(),
+        cos_w,
+    )
+    logger.debug(
+        "sin_w.shape=%s sin_w.strides=%s sin_w=%s",
+        sin_w.shape,
+        sin_w.stride(),
+        sin_w,
+    )
 
     torch_out = ref_rope_2d_fwd(
         x, height, width, cos_h, sin_h, cos_w, sin_w, rotate_style=rotate_style
     )
-    if DEBUG_MODE:
-        print(f"torch_out={torch_out}")
+    logger.debug("torch_out=%s", torch_out)
 
     if inplace:
         triton_out = rope_fwd_2d_inplace(
@@ -1092,14 +1116,13 @@ def test_rope_2d_fwd(
             nope_first=nope_first,
             transpose_output=False,
         )
-    if DEBUG_MODE:
-        print(f"triton_out={triton_out}")
+    logger.debug("triton_out=%s", triton_out)
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
 def rope_fwd_3d_torch(x, grid_sizes, freqs, sp_size, sp_rank):
-    B = x.size(0)
+    x.size(0)
     s = x.size(1)
     n = x.size(2)
     c = x.size(3) // 2
@@ -1123,7 +1146,7 @@ def rope_fwd_3d_torch(x, grid_sizes, freqs, sp_size, sp_rank):
             ],
             dim=-1,
         ).reshape(seq_len, 1, -1)
-        merged_real_sum = freqs_i.real.sum()
+        freqs_i.real.sum()
         freqs_i = pad_freqs(freqs_i, s * sp_size)
         s_per_rank = s
         freqs_i_rank = freqs_i[
@@ -1179,8 +1202,8 @@ def test_rope_fwd_3d(
         x.clone(), grid_sizes.clone(), freqs.clone(), sp_size, sp_rank
     )
 
-    print(f"the result compare: sp_rank={sp_rank}")
-    print("=" * 50)
+    logger.info("the result compare: sp_rank=%d", sp_rank)
+    logger.info("=" * 50)
     shape_ok = out_orig.shape == out_triton.shape
     sum_orig = out_orig.sum().item()
     sum_triton = out_triton.sum().item()
@@ -1191,18 +1214,21 @@ def test_rope_fwd_3d(
     feat_diff = torch.abs(feat_orig - feat_triton).max().item()
     feat_ok = feat_diff < 1e-3
 
-    print(f"shape same {'yes' if shape_ok else 'no'}")
-    print(f"(sum diff<1%): {'yes' if sum_ok else 'no'}")
-    print(f"   - Original sum: {sum_orig:.6f}")
-    print(f"   - Triton sum:   {sum_triton:.6f}")
-    print(f"   - corellation diff %:     {sum_diff*100:.2f}%")
-    print(f"fisrt 4 tensor same {'yes' if feat_ok else 'no'}")
-    print(f"   - Original: {feat_orig.cpu().numpy()}")
-    print(f"   - Triton:   {feat_triton.cpu().numpy()}")
-    print(f"   - max diff: {feat_diff:.6f}")
+    logger.info("shape same %s", "yes" if shape_ok else "no")
+    logger.info("(sum diff<1%%): %s", "yes" if sum_ok else "no")
+    logger.info("   - Original sum: %.6f", sum_orig)
+    logger.info("   - Triton sum:   %.6f", sum_triton)
+    logger.info("   - correlation diff %%:     %.2f%%", sum_diff * 100)
+    logger.info("first 4 tensor same %s", "yes" if feat_ok else "no")
+    logger.info("   - Original: %s", feat_orig.cpu().numpy())
+    logger.info("   - Triton:   %s", feat_triton.cpu().numpy())
+    logger.info("   - max diff: %.6f", feat_diff)
 
-    if shape_ok and sum_ok and feat_ok:
-        print(f"\n sp_rank={sp_rank} test success")
-    else:
-        print(f"\n sp_rank={sp_rank} test failed")
-    print("=" * 60)
+    assert shape_ok and sum_ok and feat_ok, (
+        f"sp_rank={sp_rank}: shape_ok={shape_ok} "
+        f"(torch {tuple(out_orig.shape)} vs triton {tuple(out_triton.shape)}), "
+        f"sum_ok={sum_ok} (diff {sum_diff:.2%}, threshold 1%), "
+        f"feat_ok={feat_ok} (max diff {feat_diff:.3e}, threshold 1e-3)"
+    )
+    logger.info("\n sp_rank=%d test success", sp_rank)
+    logger.info("=" * 60)

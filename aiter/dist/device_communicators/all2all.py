@@ -1,8 +1,12 @@
-import torch
 import importlib.util
-from .base_device_communicator import All2AllManagerBase, Cache
+import os
 from functools import cache
+
+import torch
+
 from aiter import logger
+
+from .base_device_communicator import All2AllManagerBase, Cache
 
 
 @cache
@@ -22,10 +26,28 @@ def has_mori() -> bool:
     return _has_module("mori")
 
 
+def _is_gfx125x() -> bool:
+    """Runtime arch check for the EP backend.
+
+    Not custom_all_reduce's _detect_gfx1250: that one honours
+    AITER_CUSTOM_AR_DISABLE_GFX1250, and forcing the old custom-AR path should
+    not change which backend mori's EP handle picks.
+    """
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    return get_gfx_runtime().startswith("gfx125")
+
+
 class MoriAll2AllManager(All2AllManagerBase):
     @staticmethod
     def _init_mori_shmem(cpu_group) -> None:
-        """Register *cpu_group* with mori's shmem heap and run the barrier."""
+        """Register *cpu_group* with mori's shmem heap and run the barrier.
+
+        Skipped on gfx125x: that arch has no shmem support, so mori's EP
+        backend there is CCO. Running this init would be useless and can hang.
+        """
+        if _is_gfx125x():
+            return
         import mori
 
         torch._C._distributed_c10d._register_process_group("mori", cpu_group)
@@ -35,7 +57,7 @@ class MoriAll2AllManager(All2AllManagerBase):
         assert has_mori(), (
             "MoRI kernels not found. Please follow https://github.com/ROCm/mori/blob/main/README.md"
             " to install MoRI kernels."
-        )  # noqa
+        )
 
         super().__init__(cpu_group)
         self.handle_cache = Cache()
@@ -54,39 +76,64 @@ class MoriAll2AllManager(All2AllManagerBase):
         num_local_experts: int,
         num_experts_per_token: int,
         gpu_per_node: int,
+        quant_type: str = "none",
+        low_latency: bool = False,
     ):
         import mori  # type: ignore[import-not-found]
 
-        if not self.internode:
-            # single node
-            kernel_type = mori.ops.EpDispatchCombineKernelType.IntraNode
-            warp_num_per_block = 16
-            block_num = 80
-            rdma_block_num = 0
-        else:
+        # `low_latency` is the caller's ask; `self.internode` is measured from
+        # the process group, never inferred from world size -- 2 nodes x 4 GPUs
+        # would read as intra-node and pick kernels that assume P2P.
+        num_qp_per_pe = None
+        if low_latency:
+            if self.internode:
+                kernel_type = mori.ops.EpDispatchCombineKernelType.InterNodeV1LL
+            else:
+                # AsyncLL has no RDMA path.
+                kernel_type = mori.ops.EpDispatchCombineKernelType.AsyncLL
+            # Wide-EP reference values; overridable, neither has been swept.
+            warp_num_per_block = int(os.environ.get("MORI_EP_WARP_PER_BLOCK", "8"))
+            block_num = int(os.environ.get("MORI_EP_BLOCK_NUM", "96"))
+            rdma_block_num = int(os.environ.get("MORI_EP_RDMA_BLOCK_NUM", "64"))
+            num_qp_per_pe = 2
+        elif self.internode:
             # multi node
             kernel_type = mori.ops.EpDispatchCombineKernelType.InterNodeV1
             warp_num_per_block = 16
             block_num = 32
             rdma_block_num = 16
+        else:
+            # single node
+            kernel_type = mori.ops.EpDispatchCombineKernelType.IntraNode
+            warp_num_per_block = 16
+            block_num = 80
+            rdma_block_num = 0
 
-        return dict(
-            rank=rank,
-            world_size=num_ep_ranks,
-            data_type=quant_dtype,
-            hidden_dim=token_hidden_size,
-            scale_dim=scale_dim,
-            scale_type_size=scale_type_size,
-            max_token_type_size=input_dtype.itemsize,
-            max_num_inp_token_per_rank=max_num_tokens_per_dp_rank,
-            num_experts_per_rank=num_local_experts,
-            num_experts_per_token=num_experts_per_token,
-            warp_num_per_block=warp_num_per_block,
-            block_num=block_num,
-            kernel_type=kernel_type,
-            rdma_block_num=rdma_block_num,
-            gpu_per_node=gpu_per_node,
-        )
+        kwargs = {
+            "rank": rank,
+            "world_size": num_ep_ranks,
+            "data_type": quant_dtype,
+            "hidden_dim": token_hidden_size,
+            "scale_dim": scale_dim,
+            "scale_type_size": scale_type_size,
+            "max_token_type_size": input_dtype.itemsize,
+            "max_num_inp_token_per_rank": max_num_tokens_per_dp_rank,
+            "num_experts_per_rank": num_local_experts,
+            "num_experts_per_token": num_experts_per_token,
+            "warp_num_per_block": warp_num_per_block,
+            "block_num": block_num,
+            "kernel_type": kernel_type,
+            "rdma_block_num": rdma_block_num,
+            "gpu_per_node": gpu_per_node,
+            # Combine-side codec. MoRI defaults this to "none" (bf16 on the wire);
+            # "fp8_blockwise" picks the EpCombineIntraNodeKernel_*_fp8bwq_* kernels.
+            "quant_type": quant_type,
+        }
+        if num_qp_per_pe is not None:
+            # Omitted otherwise, so the other kernels keep the handle_cache key
+            # and MoRI config they have always had.
+            kwargs["num_qp_per_pe"] = num_qp_per_pe
+        return kwargs
 
     def _make_handle(self, **kwargs):
         import mori  # type: ignore[import-not-found]
@@ -95,15 +142,18 @@ class MoriAll2AllManager(All2AllManagerBase):
         handle = mori.ops.EpDispatchCombineOp(mori_config)
         return handle
 
-    def get_handle(self, kwargs):
-        import mori  # type: ignore[import-not-found]
+    def get_handle(self, kwargs, index: int = 0):
+        """Cached op for one config and ``index``. Always a single handle.
 
+        ``index=0`` (default) is the shared singleton. Callers with several
+        operations in flight use a distinct index for each concurrent slot.
+        All indexes use ``handle_cache``.
+        """
         mori_kwargs = self._make_all2all_kwargs(**kwargs)
-        logger.debug("MoRI all2all args %s", mori_kwargs)
-        handle: mori.ops.EpDispatchCombineOp = self.handle_cache.get_or_create(
-            mori_kwargs, self._make_handle
+        logger.debug("MoRI all2all index=%d args %s", index, mori_kwargs)
+        return self.handle_cache.get_or_create(
+            mori_kwargs, self._make_handle, index=index
         )
-        return handle
 
 
 class FlyDSLAll2AllManager(All2AllManagerBase):
@@ -114,8 +164,8 @@ class FlyDSLAll2AllManager(All2AllManagerBase):
     must be installed alongside flydsl. The dispatch/combine *kernels* however
     are entirely FlyDSL-generated, replacing mori's comm primitives.
 
-    TBO multi-instance ops are created via ``create_handle`` (non-cached) so
-    the two ubatch ops are guaranteed to be distinct, independent objects.
+    TBO multi-instance ops use ``get_handle(..., index=)`` so ubatches get
+    distinct cached ops. ``create_handle`` remains for a one-off uncached op.
     """
 
     @staticmethod
@@ -181,39 +231,39 @@ class FlyDSLAll2AllManager(All2AllManagerBase):
         num_experts_per_token: int,
     ):
 
-        return dict(
-            rank=rank,
-            world_size=num_ep_ranks,
+        return {
+            "rank": rank,
+            "world_size": num_ep_ranks,
             # Buffer sized for input dtype (bf16) so one op handles both
             # bf16 and quantized input without reallocation; the dispatch
             # kernel specialisation is selected at call time by input.dtype.
-            data_type=input_dtype,
-            hidden_dim=token_hidden_size,
-            scale_dim=scale_dim,
-            scale_type_size=scale_type_size,
-            max_token_type_size=input_dtype.itemsize,
-            max_num_inp_token_per_rank=max_num_tokens_per_dp_rank,
-            num_experts_per_rank=num_local_experts,
-            num_experts_per_token=num_experts_per_token,
-            quant_type=self._make_quant_type(input_dtype, quant_dtype),
-        )
+            "data_type": input_dtype,
+            "hidden_dim": token_hidden_size,
+            "scale_dim": scale_dim,
+            "scale_type_size": scale_type_size,
+            "max_token_type_size": input_dtype.itemsize,
+            "max_num_inp_token_per_rank": max_num_tokens_per_dp_rank,
+            "num_experts_per_rank": num_local_experts,
+            "num_experts_per_token": num_experts_per_token,
+            "quant_type": self._make_quant_type(input_dtype, quant_dtype),
+        }
 
     def _make_handle(self, **kwargs):
         cfg = self._flydsl_dispatch_config_cls(**kwargs)
         return self._flydsl_dispatch_op_cls(cfg)
 
-    def get_handle(self, kwargs):
+    def get_handle(self, kwargs, index: int = 0):
         flydsl_kwargs = self._make_all2all_kwargs(**kwargs)
-        logger.debug("FlyDSL all2all args %s", flydsl_kwargs)
-        return self.handle_cache.get_or_create(flydsl_kwargs, self._make_handle)
+        logger.debug("FlyDSL all2all index=%d args %s", index, flydsl_kwargs)
+        return self.handle_cache.get_or_create(
+            flydsl_kwargs, self._make_handle, index=index
+        )
 
     def create_handle(self, kwargs):
         """Create a fresh, uncached FlyDSL op instance.
 
-        Unlike ``get_handle`` (which caches one op per config), every call
-        returns a new independent op. Callers that need multiple distinct ops
-        for the same config (e.g. ATOM for TBO ubatches) should call this
-        and manage the instances themselves.
+        Prefer ``get_handle(kwargs, index=)`` when the op should be reused.
+        Use this only if you need a throwaway instance that is not cached.
         """
         flydsl_kwargs = self._make_all2all_kwargs(**kwargs)
         logger.debug("FlyDSL all2all (uncached) args %s", flydsl_kwargs)

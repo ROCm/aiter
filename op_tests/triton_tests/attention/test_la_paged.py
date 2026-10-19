@@ -1,8 +1,10 @@
+import random
 import sys
+
 import pytest
 import torch
-import random
 
+from aiter import logger
 from aiter.ops.triton.attention.lean_atten_paged import persistent_lean_attention_paged
 
 
@@ -17,13 +19,15 @@ from aiter.ops.triton.attention.lean_atten_paged import persistent_lean_attentio
         (1, 96, 16, [65536], 64, 912, torch.float16, 16, 64, 2, 4),
         (1, 96, 16, [131072], 64, 912, torch.float16, 16, 64, 2, 4),
         (1, 96, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 96, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),  #
-        (1, 96, 16, [1048576], 16, 912, torch.float16, 16, 256, 1, 4),  #
+        # h * n_ctx * d == 3.22e9 elements, past INT32_MAX. Guards the 64-bit
+        # widening of the per-head K/V offset in la_persistent_paged.
+        (1, 96, 16, [524288], 64, 912, torch.float16, 16, 256, 2, 4),
+        (1, 96, 16, [1048576], 16, 912, torch.float16, 16, 256, 1, 4),
         (1, 128, 16, [32768], 64, 912, torch.float16, 16, 64, 2, 4),
         (1, 128, 16, [65536], 64, 912, torch.float16, 16, 64, 2, 4),
         (1, 128, 16, [131072], 64, 912, torch.float16, 16, 64, 2, 4),
         (1, 128, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 128, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),  #
+        (1, 128, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),
         (3, 64, 16, [4096, 32768, 65536], 64, 912, torch.float16, 16, 64, 2, 4),
         (
             8,
@@ -58,18 +62,13 @@ def test_persistent_lean_attention(
 
     torch.manual_seed(20)
     random.seed(20)
-    # Long seqlen (>512K) can hit memory access fault. Suspect compiler issue
-    # WA with shorter d and longer BLOCK_N
-    if any(item > 524288 for item in n_ctx):
-        BLOCK_N = 256
-        d = 16
 
     assert batch == len(n_ctx)
 
     try:
         sum_n_ctx = sum(int(n) for n in n_ctx)
     except ValueError:
-        print(f"N_CTX contains non-numeric values: {n_ctx}")
+        logger.info("N_CTX contains non-numeric values: %s", n_ctx)
 
     # N_CTX is a list of context lengthes for all the req in a batch
     # First, calculate #BLOCK_N for each context length "list_num_block_n"
@@ -100,9 +99,9 @@ def test_persistent_lean_attention(
         mean=0.0, std=0.5
     )
 
-    print(f"Q shape={q.shape}")
-    print(f"K shape={k.shape}")
-    print(f"V shape={v.shape}")
+    logger.info("Q shape=%s", q.shape)
+    logger.info("K shape=%s", k.shape)
+    logger.info("V shape=%s", v.shape)
     torch.set_printoptions(threshold=10000)
 
     block_tables = []  # kv block tables used by lean attention
@@ -120,7 +119,7 @@ def test_persistent_lean_attention(
         ref_b_ctx = []
         kv_n_ctx_idx = 0
 
-        r = random.sample(range(0, num_kv_blocks), num_kv_blocks)
+        r = random.sample(range(num_kv_blocks), num_kv_blocks)
         for i in range(num_kv_blocks):
             ref_b.append(r[i])
             if i == kv_n_ctx[kv_n_ctx_idx] - 1:
@@ -143,29 +142,29 @@ def test_persistent_lean_attention(
     start_q = 0
     ref_out = torch.empty_like(q, dtype=v.dtype)
     # qb = torch.empty((h, n_ctx_q*batch, d), dtype=init_dtype)
-    for h in range(h):
+    for hi in range(h):
         for b in range(len(n_ctx)):
-            # print(f"h={h}")
+            # print(f"hi={hi}")
             # print(f"n_ctx_q={N_CTX_Q}")
             # print(f"M shape: {M.shape}")
-            qb = q[h, start_q : (start_q + int(n_ctx_q)), :]
+            qb = q[hi, start_q : (start_q + int(n_ctx_q)), :]
             # print(f"qb shape: {qb.shape}")
             idxs = [
-                ref_block_tables[h][b][kv_b_i] * BLOCK_N + b_i
-                for kv_b_i in range(len(ref_block_tables[h][b]))
+                ref_block_tables[hi][b][kv_b_i] * BLOCK_N + b_i
+                for kv_b_i in range(len(ref_block_tables[hi][b]))
                 for b_i in range(BLOCK_N)
             ]
             # print(f'idxs: {idxs}')
             idxs = torch.tensor(idxs, dtype=torch.int32, device="cuda")
-            kb = torch.index_select(k[h], dim=0, index=idxs)
+            kb = torch.index_select(k[hi], dim=0, index=idxs)
             # print(f"{kb} kb shape: {kb.shape}")
-            vb = torch.index_select(v[h], dim=0, index=idxs)
+            vb = torch.index_select(v[hi], dim=0, index=idxs)
             # print(f"{vb} vb shape: {vb.shape}")
             p = torch.matmul(qb, kb.transpose(0, 1)) * sm_scale
             # print(f"p shape: {p.shape}")
             p = torch.softmax(p.float(), dim=-1).to(q.dtype)
             refb = torch.matmul(p, vb)
-            ref_out[h, start_q : (start_q + int(n_ctx_q)), :] = refb
+            ref_out[hi, start_q : (start_q + int(n_ctx_q)), :] = refb
             # print(f"refb={refb}")
             # print(f"refb shape: {refb.shape}")
             start += b
@@ -215,7 +214,7 @@ def main():
     try:
         sum_n_ctx = sum(int(n) for n in n_ctx)
     except ValueError:
-        print(f"N_CTX contains non-numeric values: {n_ctx}")
+        logger.info("N_CTX contains non-numeric values: %s", n_ctx)
 
     # N_CTX is a list of context lengthes for all the req in a batch
     # First, calculate #BLOCK_N for each context length "list_num_block_n"
@@ -246,18 +245,18 @@ def main():
         mean=0.0, std=0.5
     )
 
-    print(f"Q shape={q.shape}")
-    print(f"K shape={k.shape}")
-    print(f"V shape={v.shape}")
+    logger.info("Q shape=%s", q.shape)
+    logger.info("K shape=%s", k.shape)
+    logger.info("V shape=%s", v.shape)
 
     num_kv_blocks = sum_n_ctx // BLOCK_N + (1 if (sum_n_ctx % BLOCK_N != 0) else 0)
 
     block_tables = []
     for head in range(h):
-        b = random.sample(range(0, num_kv_blocks), num_kv_blocks)
+        b = random.sample(range(num_kv_blocks), num_kv_blocks)
         block_tables.append(b)
     kv_block_tables = torch.tensor(block_tables, dtype=torch.int32, device="cuda")
-    print(f"KV block tables shape={kv_block_tables.shape}")
+    logger.info("KV block tables shape=%s", kv_block_tables.shape)
 
     # LeanAttention Specific Parameters
     Mp = torch.empty((total_programs, n_ctx_q), device=q.device, dtype=torch.float32)
@@ -286,7 +285,7 @@ def main():
         waves_per_eu,
     )
 
-    print(f"la_out[0,0,:10]={la_out[0,0,:10]}")
+    logger.info("la_out[0,0,:10]=%s", la_out[0, 0, :10])
 
 
 if __name__ == "__main__":

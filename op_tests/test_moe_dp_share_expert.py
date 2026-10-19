@@ -1,20 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-from aiter.test_common import checkAllclose, run_perftest, benchmark
-from aiter import dtypes
-from aiter.ops.shuffle import shuffle_weight
-from aiter.int4_utils import *
-from aiter import ActivationType, QuantType
-from aiter.fused_moe_dp_shared_expert import (
-    torch_moe,
-    moe_sorting,
-    fused_moe_dp_share_expert,
-)
-import pandas as pd
-import aiter
 import argparse
+
+import pandas as pd
+import torch
+
+import aiter
+from aiter import QuantType, dtypes
+from aiter.fused_moe_dp_shared_expert import (
+    fused_moe_dp_share_expert,
+    torch_moe,
+)
+from aiter.int4_utils import *
+from aiter.ops.shuffle import shuffle_weight
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 
 @benchmark()
@@ -69,7 +69,7 @@ def test_dp_shared_expert_moe(
     time_list = []
     moe_buf = torch.zeros_like(hidden_states)
     for rank in range(dp_size):
-        moe_buf_tmp = torch.zeros_like(hidden_states)
+        torch.zeros_like(hidden_states)
         res, avg_t = run_perftest(
             fused_moe_dp_share_expert,
             hidden_states,

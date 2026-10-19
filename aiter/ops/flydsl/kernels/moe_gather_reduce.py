@@ -30,59 +30,71 @@ Inputs (all on device):
 Grid  : (token_num, 1, 1)   -- one block per output token
 Block : (BLOCK_THREADS, 1, 1)
 
-Each thread owns 4 consecutive dwords (16 B = 8 elements) and issues
-``buffer_load``/``buffer_store`` at ``vec_width=4``.  Wider transactions raise
+Each thread owns 4 consecutive dwords (16 B = 8 elements) and moves them with a
+single 128-bit buffer copy atom.  Wider transactions raise
 per-request bytes and cut the in-flight loads needed to saturate HBM.  When the
 row's dword count is not a multiple of 4 the trailing group falls back to a
 per-lane scalar tail (mirroring ``compile_moe_reduction`` in
 ``moe_gemm_2stage.py``), so any even ``model_dim`` is supported.  Unused (t,k)
 slots are filled with row 0 and weight 0 by the host wrapper, so they contribute
-nothing and need no branch.
+nothing and need no branch; EP routes that own no grouped row instead carry
+``moe_route_maps.DROPPED_ROUTE_ROW``, which is steered past the end of the flat
+tensor so the resource's own bounds check returns 0.
+
+The ``topk`` route rows and weights are block-uniform, so they are read once
+into LDS by the first ``topk`` lanes instead of by every thread, and the reads
+of ``grouped_out`` go through one flat descriptor at a dword offset rather than
+a freshly built per-row descriptor.
 """
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, range_constexpr, vector
-from flydsl.expr.typing import T, Int32
-from flydsl.expr.arith import ArithValue, CmpIPredicate
-from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr import gpu, ptrtoint, range_constexpr
+from flydsl.expr.typing import Int32, T
 
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import scf
-from flydsl.expr import buffer_ops
-
+from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.kernels_common import format_kernel_name
 from aiter.ops.flydsl.kernels.tensor_shim import (
-    ptr_rsrc,
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    buf_copy_atom,
+    ptr_buf_tensor,
 )
 
 BLOCK_THREADS = 256
+MAX_GATHER_TOPK = 32
 
 
-def _unpack_pair_to_f32(raw_dw, out_dtype, *, f32, i32):
-    """Unpack a dword holding 2 packed bf16/f16 elements into (lo_f32, hi_f32)."""
-    mask16 = arith.constant(0xFFFF, type=i32)
-    lo16 = raw_dw & mask16
-    hi16 = (raw_dw >> arith.constant(16, type=i32)) & mask16
+@fx.struct
+class _GatherRouteLds:
+    rows: fx.Array[fx.Int32, MAX_GATHER_TOPK, 16]
+    w_bits: fx.Array[fx.Int32, MAX_GATHER_TOPK, 16]
+
+
+def _lds_li32(ptr, idx):
+    return fx.ptr_load(ptr + fx.Int64(idx))
+
+
+def _lds_si32(ptr, val, idx):
+    fx.ptr_store(val, ptr + fx.Int64(idx))
+
+
+def _unpack_pair_to_f32(raw_dw, out_dtype):
+    lo16 = raw_dw & 0xFFFF
+    hi16 = (raw_dw >> 16) & 0xFFFF
     if out_dtype == "bf16":
-        # bf16 -> f32 is just the bf16 bits in the upper half of the f32.
-        lo = arith.bitcast(f32, lo16 << arith.constant(16, type=i32))
-        hi = arith.bitcast(f32, hi16 << arith.constant(16, type=i32))
-    else:  # f16
-        lo = arith.extf(f32, arith.bitcast(T.f16, arith.trunci(T.i16, lo16)))
-        hi = arith.extf(f32, arith.bitcast(T.f16, arith.trunci(T.i16, hi16)))
-    return ArithValue(lo), ArithValue(hi)
+        return (lo16 << 16).bitcast(fx.Float32), (hi16 << 16).bitcast(fx.Float32)
+    return (
+        fx.Uint16(lo16).bitcast(fx.Float16).to(fx.Float32),
+        fx.Uint16(hi16).bitcast(fx.Float16).to(fx.Float32),
+    )
 
 
-def _pack_pair_from_f32(acc_lo, acc_hi, out_dtype, *, i32):
-    """Truncate two f32 accumulators to bf16/f16 and pack into one dword."""
-    odt = T.bf16 if out_dtype == "bf16" else T.f16
-    lo_i16 = arith.bitcast(T.i16, arith.trunc_f(odt, acc_lo))
-    hi_i16 = arith.bitcast(T.i16, arith.trunc_f(odt, acc_hi))
-    lo_i32 = arith.extui(i32, lo_i16)
-    hi_i32 = arith.extui(i32, hi_i16)
-    return lo_i32 | (hi_i32 << arith.constant(16, type=i32))
+def _pack_pair_from_f32(acc_lo, acc_hi, out_dtype):
+    odt = fx.BFloat16 if out_dtype == "bf16" else fx.Float16
+    lo_i32 = fx.Uint32(acc_lo.to(odt).bitcast(fx.Uint16))
+    hi_i32 = fx.Uint32(acc_hi.to(odt).bitcast(fx.Uint16))
+    return lo_i32 | (hi_i32 << 16)
 
 
 def build_moe_gather_reduce_module(
@@ -93,41 +105,21 @@ def build_moe_gather_reduce_module(
     vec_dwords: int = 2,
     w_dtype: str = "f32",
 ):
-    """Return a JIT launcher for the one-pass MoE gather-reduce epilogue.
-
-    Each thread owns ``vec_dwords`` consecutive dwords and loads/stores at
-    ``vec_width=vec_dwords``.  Rows whose dword count is not a multiple of VEC process the
-    trailing partial group through a per-lane scalar tail, so any even
-    ``model_dim`` is supported.
-
-    Parameters
-    ----------
-    model_dim : int   output columns (must be even; 2 elems per dword)
-    topk      : int   number of expert contributions summed per token
-    out_dtype : str   "bf16" or "f16" (input and output share this dtype)
-    split_k   : int   number of split-K slices in grouped_out_flat
-    vec_dwords: int   dwords per thread (2 or 4)
-    w_dtype   : str   route-weight dtype: "f32" (default), "bf16", or "f16".
-                      The weight is always accumulated in f32; passing "f32"
-                      lets the host feed native fp32 route weights directly and
-                      avoids a fp32->bf16 copy kernel before the epilogue.
-    """
-    assert model_dim % 2 == 0, "model_dim must be even (2 elems per dword)"
+    assert model_dim % 2 == 0
     assert out_dtype in ("bf16", "f16")
     assert w_dtype in ("f32", "bf16", "f16")
-    if vec_dwords not in (2, 4):
-        raise ValueError(f"vec_dwords must be 2 or 4, got {vec_dwords}")
-    # Smaller per-thread groups increase column-grid parallelism for tiny token
-    # batches (e.g. token=1 decode) and reduce per-CTA split_k/topk work.
+    assert topk <= MAX_GATHER_TOPK
+    if vec_dwords not in (2, 4, 8):
+        raise ValueError(f"vec_dwords must be 2, 4, or 8, got {vec_dwords}")
+
     VEC = int(vec_dwords)
-    out_dwords = model_dim // 2  # dwords per output row
-    row_dwords = model_dim // 2  # dwords per grouped_out_flat row (same)
+    out_dwords = model_dim // 2  # dwords per output row (also the source row width)
     DWORDS_PER_ITER = BLOCK_THREADS * VEC  # dwords advanced per loop iter
     n_iters = (out_dwords + DWORDS_PER_ITER - 1) // DWORDS_PER_ITER
 
-    module_name = (
+    module_name = format_kernel_name(
         f"moe_gather_reduce_{out_dtype}_d{model_dim}_tk{topk}_sk{split_k}_v{VEC}"
-        f"_w{w_dtype}"
+        f"_w{w_dtype}_frlds"
     )
 
     @flyc.kernel(name=module_name)
@@ -138,102 +130,110 @@ def build_moe_gather_reduce_module(
         out: fx.Pointer,
         num_tokens: Int32,
         slice_stride_dw: Int32,
+        num_valid_tokens: fx.Pointer,
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
-
-        f32 = T.f32
         i32 = T.i32
-        vec_i32_ty = T.vec(VEC, i32)
         # Route-weight native dtype. "f32" lets the host pass raw fp32 route
         # weights straight through (no pre-cast); bf16/f16 get extended below.
         # (Ternary, not multi-line if: the flydsl tracer does not capture vars
-        # bound in an if/elif block for the nested _load_row_weight closure.)
-        w_dt = T.f32 if w_dtype == "f32" else (T.bf16 if w_dtype == "bf16" else T.f16)
+        # bound in an if/elif block for the nested route-cache closure.)
+        w_dt_fx = (
+            fx.Float32
+            if w_dtype == "f32"
+            else (fx.BFloat16 if w_dtype == "bf16" else fx.Float16)
+        )
 
-        out_dwords_i32 = arith.constant(out_dwords, type=i32)
-        topk_i32 = arith.constant(topk, type=i32)
-        row_dwords_i32 = arith.constant(row_dwords, type=i32)
-        vec_i32 = arith.constant(VEC, type=i32)
-        num_tokens_i32 = ArithValue(num_tokens)
-        bid_i32 = ArithValue(bid)
-        slice_stride_dw_i32 = ArithValue(slice_stride_dw)
+        # Uint32 (not Int32): every index here is a non-negative count, so `<`
+        # and `<=` lower to ult/ule.
+        out_dwords_i32 = fx.Uint32(out_dwords)
+        topk_i32 = fx.Uint32(topk)
+        vec_i32 = fx.Uint32(VEC)
+        num_tokens_i32 = fx.Uint32(num_tokens)
+        bid_i32 = fx.Uint32(bid)
 
-        tok_valid = arith.cmpi(CmpIPredicate.ult, bid_i32, num_tokens_i32)
-        _if_tok = scf.IfOp(tok_valid)
-        with ir.InsertionPoint(_if_tok.then_block):
-            in_rsrc = ptr_rsrc(grouped_out_flat)
-            rows_rsrc = ptr_rsrc(topids_to_rows)
-            w_rsrc = ptr_rsrc(gather_w)
-            out_rsrc = ptr_rsrc(out)
-            thread_id = ArithValue(tid)
-            iter_idx_i32 = ArithValue(fx.block_idx.y)
+        num_valid_tokens_is_set = fx.Int64(ptrtoint(num_valid_tokens)) != 0
+        valid_token_count = num_tokens_i32
+        if num_valid_tokens_is_set:
+            valid_token_count = fx.Uint32(ptr_buf_tensor(num_valid_tokens)[0])
+        tok_valid = bid_i32 < valid_token_count
+        if tok_valid:
+            rows_t = ptr_buf_tensor(topids_to_rows)
+            w_t = ptr_buf_tensor(gather_w, w_dt_fx)
+            in_base_i64 = fx.Uint64(ptrtoint(grouped_out_flat))
 
-            # Base dword offset of this token's row in topids_to_rows / gather_w
-            # (both are (token_num, topk), 1 dword per element).
             map_base = bid_i32 * topk_i32
             out_row_dw_base = bid_i32 * out_dwords_i32
 
-            def _load_row_weight(k):
-                """Load (source grouped row, route weight as f32) for slot k."""
-                map_off = map_base + arith.constant(k, type=i32)
-                row_i32 = ArithValue(
-                    buffer_ops.buffer_load(rows_rsrc, map_off, vec_width=1, dtype=i32)
-                )
-                # weight loaded in its native dtype; extend to f32 unless it is
-                # already f32 (native fp32 route weights need no conversion).
-                w_loaded = buffer_ops.buffer_load(
-                    w_rsrc, map_off, vec_width=1, dtype=w_dt
-                )
-                w_f32 = (
-                    ArithValue(w_loaded)
-                    if w_dtype == "f32"
-                    else ArithValue(arith.extf(f32, w_loaded))
-                )
+            route_lds = fx.SharedAllocator().allocate(_GatherRouteLds).peek()
+            rows_lds = route_lds.rows.ptr
+            wbits_lds = route_lds.w_bits.ptr
+            tid_u32 = fx.Uint32(tid)
+            if tid_u32 < topk_i32:
+                map_off = map_base + tid_u32
+                # DROPPED_ROUTE_ROW (-1) is kept as-is: it owns no grouped row,
+                # and the zero-length descriptor below is what switches its
+                # loads off. Clamping it to a real row instead would read bytes
+                # stage2 need never have written, and a stale NaN there survives
+                # the multiply by the route's (zero) weight.
+                row_i32 = fx.Int32(rows_t[map_off])
+                _lds_si32(rows_lds, row_i32, tid)
+                # .to(Float32) is a no-op when the route weights are already f32.
+                w_f32 = w_dt_fx(w_t[map_off]).to(fx.Float32)
+                _lds_si32(wbits_lds, w_f32.bitcast(fx.Int32), tid)
+            gpu.barrier()
+
+            thread_id = fx.Uint32(tid)
+            iter_idx_i32 = fx.Uint32(fx.block_idx.y)
+
+            row_bytes_i32 = fx.Int32(out_dwords * 4)
+
+            def _row_weight(k):
+                row_i32 = _lds_li32(rows_lds, k)
+                w_f32 = _lds_li32(wbits_lds, k).bitcast(fx.Float32)
                 return row_i32, w_f32
 
-            dw_base = thread_id * vec_i32 + iter_idx_i32 * arith.constant(
-                DWORDS_PER_ITER, type=i32
-            )
-            dw_valid = arith.cmpi(CmpIPredicate.ult, dw_base, out_dwords_i32)
-            _if_dw = scf.IfOp(dw_valid)
-            with ir.InsertionPoint(_if_dw.then_block):
-                full_valid = arith.cmpi(
-                    CmpIPredicate.ule, dw_base + vec_i32, out_dwords_i32
+            # A descriptor per route rather than one for the whole tensor: the
+            # buffer offset is 32-bit, so a flat descriptor stops addressing
+            # once grouped_out passes 4 GiB, which at topk=6 is around 48k
+            # tokens. Folding the row into the 64-bit base keeps the offset
+            # inside one row. The base is loop-invariant, so this costs the
+            # address math once per route, not once per access.
+            def _row_rsrc(row_i32, sk):
+                mapped = row_i32 >= fx.Int32(0)
+                row_u64 = fx.Uint64(mapped.select(row_i32, fx.Int32(0)))
+                off_dw = row_u64 * fx.Uint64(out_dwords)
+                if sk != 0:
+                    off_dw = off_dw + fx.Uint64(sk) * fx.Uint64(slice_stride_dw)
+                return buffer_ops.create_buffer_resource_from_addr(
+                    in_base_i64 + off_dw * fx.Uint64(4),
+                    num_records_bytes=mapped.select(row_bytes_i32, fx.Int32(0)),
                 )
-                _if_full = scf.IfOp(full_valid, has_else=True)
-                with ir.InsertionPoint(_if_full.then_block):
-                    acc = [
-                        ArithValue(arith.constant(0.0, type=f32))
-                        for _ in range(2 * VEC)
-                    ]
+
+            def load_flat(row_i32, sk, dw_off, vec_width):
+                return buffer_ops.buffer_load(
+                    _row_rsrc(row_i32, sk), dw_off, vec_width=vec_width, dtype=i32
+                )
+
+            dw_base = thread_id * vec_i32 + iter_idx_i32 * DWORDS_PER_ITER
+            dw_valid = dw_base < out_dwords_i32
+            if dw_valid:
+                full_valid = dw_base + vec_i32 <= out_dwords_i32
+                if full_valid:
+                    acc = [fx.Float32(0.0) for _ in range(2 * VEC)]
+                    vec_atom = buf_copy_atom(VEC * 4)
+                    out_vec_t = ptr_buf_tensor(out, unit_elems=VEC, unit_stride=1)
+                    frag = fx.make_fragment_like(fx.slice(out_vec_t, (0, None)))
 
                     for k in range_constexpr(topk):
-                        row_i32, w_f32 = _load_row_weight(k)
-                        src_dw_base = row_i32 * row_dwords_i32 + dw_base
-                        red = [
-                            ArithValue(arith.constant(0.0, type=f32))
-                            for _ in range(2 * VEC)
-                        ]
+                        row_i32, w_f32 = _row_weight(k)
+                        red = [fx.Float32(0.0) for _ in range(2 * VEC)]
                         for sk in range_constexpr(split_k):
-                            sk_off = arith.constant(sk, type=i32) * slice_stride_dw_i32
-                            raw_vec = buffer_ops.buffer_load(
-                                in_rsrc,
-                                src_dw_base + sk_off,
-                                vec_width=VEC,
-                                dtype=i32,
-                            )
+                            raw_vec = fx.Vector(load_flat(row_i32, sk, dw_base, VEC))
                             for lane in range_constexpr(VEC):
-                                raw_dw = ArithValue(
-                                    vector.extract(
-                                        raw_vec,
-                                        static_position=[lane],
-                                        dynamic_position=[],
-                                    )
-                                )
-                                lo_f32, hi_f32 = _unpack_pair_to_f32(
-                                    raw_dw, out_dtype, f32=f32, i32=i32
-                                )
+                                raw_dw = fx.Uint32(raw_vec[lane])
+                                lo_f32, hi_f32 = _unpack_pair_to_f32(raw_dw, out_dtype)
                                 red[2 * lane] = red[2 * lane] + lo_f32
                                 red[2 * lane + 1] = red[2 * lane + 1] + hi_f32
                         for lane in range_constexpr(VEC):
@@ -241,64 +241,44 @@ def build_moe_gather_reduce_module(
                             acc[2 * lane + 1] = (
                                 acc[2 * lane + 1] + w_f32 * red[2 * lane + 1]
                             )
-
                     packed = [
-                        _pack_pair_from_f32(
-                            acc[2 * lane], acc[2 * lane + 1], out_dtype, i32=i32
-                        )
+                        _pack_pair_from_f32(acc[2 * lane], acc[2 * lane + 1], out_dtype)
                         for lane in range(VEC)
                     ]
-                    out_vec = vector.from_elements(vec_i32_ty, packed)
-                    buffer_ops.buffer_store(
-                        out_vec, out_rsrc, out_row_dw_base + dw_base
+                    fx.memref_store_vec(
+                        fx.Vector.from_elements(packed, fx.Uint32), frag
                     )
-                    scf.YieldOp([])
-                with ir.InsertionPoint(_if_full.else_block):
+                    fx.copy(
+                        vec_atom,
+                        frag,
+                        fx.slice(out_vec_t, (out_row_dw_base + dw_base, None)),
+                    )
+                else:
+                    out_t = ptr_buf_tensor(out)
                     for lane in range_constexpr(VEC):
-                        dw_idx = dw_base + arith.constant(lane, type=i32)
-                        lane_valid = arith.cmpi(
-                            CmpIPredicate.ult, dw_idx, out_dwords_i32
-                        )
-                        _if_lane = scf.IfOp(lane_valid)
-                        with ir.InsertionPoint(_if_lane.then_block):
-                            acc_lo = ArithValue(arith.constant(0.0, type=f32))
-                            acc_hi = ArithValue(arith.constant(0.0, type=f32))
+                        dw_idx = dw_base + lane
+                        lane_valid = dw_idx < out_dwords_i32
+                        if lane_valid:
+                            acc_lo = fx.Float32(0.0)
+                            acc_hi = fx.Float32(0.0)
                             for k in range_constexpr(topk):
-                                row_i32, w_f32 = _load_row_weight(k)
-                                src_dw_base = row_i32 * row_dwords_i32 + dw_idx
-                                red_lo = ArithValue(arith.constant(0.0, type=f32))
-                                red_hi = ArithValue(arith.constant(0.0, type=f32))
+                                row_i32, w_f32 = _row_weight(k)
+                                red_lo = fx.Float32(0.0)
+                                red_hi = fx.Float32(0.0)
                                 for sk in range_constexpr(split_k):
-                                    sk_off = (
-                                        arith.constant(sk, type=i32)
-                                        * slice_stride_dw_i32
-                                    )
-                                    raw_dw = ArithValue(
-                                        buffer_ops.buffer_load(
-                                            in_rsrc,
-                                            src_dw_base + sk_off,
-                                            vec_width=1,
-                                            dtype=i32,
-                                        )
+                                    raw_dw = fx.Uint32(
+                                        load_flat(row_i32, sk, dw_idx, 1)
                                     )
                                     lo_f32, hi_f32 = _unpack_pair_to_f32(
-                                        raw_dw, out_dtype, f32=f32, i32=i32
+                                        raw_dw, out_dtype
                                     )
                                     red_lo = red_lo + lo_f32
                                     red_hi = red_hi + hi_f32
                                 acc_lo = acc_lo + w_f32 * red_lo
                                 acc_hi = acc_hi + w_f32 * red_hi
-
-                            packed = _pack_pair_from_f32(
-                                acc_lo, acc_hi, out_dtype, i32=i32
+                            out_t[out_row_dw_base + dw_idx] = _pack_pair_from_f32(
+                                acc_lo, acc_hi, out_dtype
                             )
-                            buffer_ops.buffer_store(
-                                packed, out_rsrc, out_row_dw_base + dw_idx
-                            )
-                            scf.YieldOp([])
-                    scf.YieldOp([])
-                scf.YieldOp([])
-            scf.YieldOp([])
 
     @flyc.jit
     def launch_moe_gather_reduce(
@@ -308,13 +288,9 @@ def build_moe_gather_reduce_module(
         out: fx.Pointer,
         num_tokens: fx.Int32,
         slice_stride_dw: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        num_valid_tokens: fx.Pointer,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            pass
-
-        idx_tokens = arith.index_cast(T.index, num_tokens)
         launcher = moe_gather_reduce_kernel(
             grouped_out_flat,
             topids_to_rows,
@@ -322,9 +298,10 @@ def build_moe_gather_reduce_module(
             out,
             num_tokens,
             slice_stride_dw,
+            num_valid_tokens,
         )
         launcher.launch(
-            grid=(idx_tokens, n_iters, 1),
+            grid=(fx.Int64(num_tokens), n_iters, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )

@@ -77,7 +77,7 @@ def main():
             content = yaml.safe_load(file_obj) or {}
 
         jobs_dict = content.get("jobs") or {}
-        job_ids = [job_id for job_id in jobs_dict.keys() if job_id not in excluded_jobs]
+        job_ids = [job_id for job_id in jobs_dict if job_id not in excluded_jobs]
 
         display_names = []
         for job_id in job_ids:

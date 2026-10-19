@@ -12,6 +12,7 @@
 
 import triton
 import triton.language as tl
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
@@ -112,7 +113,7 @@ def _kernel_paged_attention_2d(
     num_blocks = cdiv_fn(seq_len, BLOCK_SIZE)
 
     # iterate through tiles
-    for j in range(0, num_blocks):
+    for j in range(num_blocks):
 
         physical_block_idx = tl.load(block_tables_ptr + block_table_offset + j)
 

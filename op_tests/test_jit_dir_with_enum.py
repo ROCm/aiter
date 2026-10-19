@@ -1,6 +1,7 @@
 import contextlib
 import os
 import tempfile
+
 import torch
 
 
@@ -22,11 +23,11 @@ def test_aiter_jit_dir_with_enum():
     ):
         # Import aiter only after we set AITER_JIT_DIR
         from aiter import ActivationType, QuantType
+        from aiter.fused_moe_bf16_asm import moe_sorting_ck
 
         # Using moe_stage1_g1u1 as an example of a compiled function with enum types in its signature
         from aiter.ops.moe_op import moe_stage1_g1u1
         from aiter.utility import dtypes
-        from aiter.fused_moe_bf16_asm import moe_sorting_ck
 
         # Create dummy tensors for testing
         torch.set_default_device("cuda")
@@ -61,7 +62,7 @@ def test_aiter_jit_dir_with_enum():
         topk_weights = torch.rand(num_tokens, topk, dtype=torch.float32, device="cuda")
 
         # Use moe_sorting_ck to prepare sorted data (required by the kernel)
-        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
+        sorted_ids, _sorted_weights, sorted_expert_ids, num_valid_ids, _moe_buf = (
             moe_sorting_ck(
                 topk_ids,
                 topk_weights,

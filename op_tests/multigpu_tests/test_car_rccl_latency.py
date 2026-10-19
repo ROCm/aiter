@@ -2,9 +2,10 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
+from multiprocessing import Pool, freeze_support, set_start_method
+
 import torch
 import torch.distributed as dist
-from multiprocessing import Pool, freeze_support, set_start_method
 
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
@@ -27,6 +28,21 @@ DTYPE = torch.bfloat16
 ELEM_BYTES = 2  # bf16
 
 SIZES_MB = [128, 256, 512, 1024]
+
+
+def barrier_before_teardown():
+    """Align all ranks before tearing down the distributed groups.
+
+    Drain this rank's GPU work, then join a barrier so no rank starts freeing
+    IPC buffers / destroying process groups while a peer is still inside a
+    NCCL / custom-all-reduce collective -- that race intermittently hangs when
+    these comm UTs run back-to-back in CI. No-op if dist is uninitialized.
+    """
+    if not dist.is_initialized():
+        return
+    torch.cuda.synchronize()
+    get_tp_group().barrier()
+    torch.cuda.synchronize()
 
 
 def _measure_per_iter_us(fn, num_warmup=NUM_WARMUP, num_iters=NUM_ITERS):
@@ -71,14 +87,18 @@ def bench_worker(rank_id, tp_size, distributed_init_method):
 
         x_aiter = torch.randn(shape, dtype=DTYPE, device=device)
         aiter_lats = _measure_per_iter_us(
-            lambda: tensor_model_parallel_all_reduce(x_aiter)  # noqa: F821
+            lambda x_aiter=x_aiter: tensor_model_parallel_all_reduce(
+                x_aiter
+            )  # noqa: F821,RUF100
         )
 
         dist.barrier(group=group)
 
         x_rccl = torch.randn(shape, dtype=DTYPE, device=device)
         rccl_lats = _measure_per_iter_us(
-            lambda: dist.all_reduce(x_rccl, group=group)  # noqa: F821
+            lambda x_rccl=x_rccl: dist.all_reduce(
+                x_rccl, group=group
+            )  # noqa: F821,RUF100
         )
 
         dist.barrier(group=group)
@@ -89,6 +109,7 @@ def bench_worker(rank_id, tp_size, distributed_init_method):
         results[size_mb] = (aiter_lats, rccl_lats)
 
     if dist.is_initialized():
+        barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()

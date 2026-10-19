@@ -189,15 +189,21 @@ def _build_inputs(shape, bs, mtp, mode):
         kv_cache = torch.zeros(total_blocks, K_PER_BLOCK, D, dtype=dtypes.fp8)
         cache_scale = torch.zeros(total_blocks, K_PER_BLOCK, dtype=torch.float32)
     elif quant_mode == "fp4":
-        # FP4 preshuffle: data [NB, k_tiles, 4, K_PER_BLOCK, 16] u8,
-        # scale [NB, k_tiles, 4, K_PER_BLOCK] u8 (e8m0). 16 bytes = 32 fp4.
-        k_tiles = D // 128
-        kv_cache = torch.zeros(
-            total_blocks, k_tiles, 4, K_PER_BLOCK, 16, dtype=torch.uint8
-        )
-        cache_scale = torch.zeros(
-            total_blocks, k_tiles, 4, K_PER_BLOCK, dtype=torch.uint8
-        )
+        if get_gfx() == "gfx1250":
+            # OPUS natural rows: 64 packed bytes + four e8m0 bytes for D=128.
+            kv_cache = torch.zeros(total_blocks, K_PER_BLOCK, D // 2, dtype=torch.uint8)
+            cache_scale = torch.zeros(
+                total_blocks, K_PER_BLOCK, D // 32, dtype=torch.uint8
+            )
+        else:
+            # gfx950 FP4 preshuffle.
+            k_tiles = D // 128
+            kv_cache = torch.zeros(
+                total_blocks, k_tiles, 4, K_PER_BLOCK, 16, dtype=torch.uint8
+            )
+            cache_scale = torch.zeros(
+                total_blocks, k_tiles, 4, K_PER_BLOCK, dtype=torch.uint8
+            )
     else:
         kv_cache = torch.zeros(total_blocks, K_PER_BLOCK, D, dtype=torch.bfloat16)
         cache_scale = None
@@ -245,25 +251,25 @@ def _build_inputs(shape, bs, mtp, mode):
 
 def _run_kernel(inp, *, use_2kernel):
     """Run kernel into ``inp['kv_cache']`` / ``inp['cache_scale']`` in place."""
-    common = dict(
-        kv_in=inp["kv_in"],
-        score_in=inp["score_in"],
-        kv_state=inp["kv_state"],
-        score_state=inp["score_state"],
-        state_slot_mapping=inp["state_slot_mapping"],
-        plan_gpu=inp["plan_gpu"],
-        ape=inp["ape"],
-        rms_weight=inp["rms_weight"],
-        rms_eps=inp["rms_eps"],
-        cos_cache=inp["cos_cache"],
-        sin_cache=inp["sin_cache"],
-        kv_cache=inp["kv_cache"],
-        block_tables=inp["block_tables"],
-        k_per_block=inp["k_per_block"],
-        ratio=inp["ratio"],
-        head_dim=inp["head_dim"],
-        rope_head_dim=inp["rope_head_dim"],
-    )
+    common = {
+        "kv_in": inp["kv_in"],
+        "score_in": inp["score_in"],
+        "kv_state": inp["kv_state"],
+        "score_state": inp["score_state"],
+        "state_slot_mapping": inp["state_slot_mapping"],
+        "plan_gpu": inp["plan_gpu"],
+        "ape": inp["ape"],
+        "rms_weight": inp["rms_weight"],
+        "rms_eps": inp["rms_eps"],
+        "cos_cache": inp["cos_cache"],
+        "sin_cache": inp["sin_cache"],
+        "kv_cache": inp["kv_cache"],
+        "block_tables": inp["block_tables"],
+        "k_per_block": inp["k_per_block"],
+        "ratio": inp["ratio"],
+        "head_dim": inp["head_dim"],
+        "rope_head_dim": inp["rope_head_dim"],
+    }
     if use_2kernel:
         flydsl_hca_compress_attn(**common)
     else:
@@ -607,25 +613,25 @@ def test_flydsl_csa_nm_asm_fp8(bs, mtp=0):
     nb = inp["kv_cache"].shape[0]
     kpb = inp["k_per_block"]
 
-    common = dict(
-        kv_in=inp["kv_in"],
-        score_in=inp["score_in"],
-        kv_state=inp["kv_state"],
-        score_state=inp["score_state"],
-        plan_gpu=inp["plan_gpu"],
-        state_slot_mapping=inp["state_slot_mapping"],
-        ape=inp["ape"],
-        rms_weight=inp["rms_weight"],
-        rms_eps=inp["rms_eps"],
-        cos_cache=inp["cos_cache"],
-        sin_cache=inp["sin_cache"],
-        block_tables=inp["block_tables"],
-        k_per_block=kpb,
-        overlap=overlap,
-        ratio=ratio,
-        head_dim=D,
-        rope_head_dim=RD,
-    )
+    common = {
+        "kv_in": inp["kv_in"],
+        "score_in": inp["score_in"],
+        "kv_state": inp["kv_state"],
+        "score_state": inp["score_state"],
+        "plan_gpu": inp["plan_gpu"],
+        "state_slot_mapping": inp["state_slot_mapping"],
+        "ape": inp["ape"],
+        "rms_weight": inp["rms_weight"],
+        "rms_eps": inp["rms_eps"],
+        "cos_cache": inp["cos_cache"],
+        "sin_cache": inp["sin_cache"],
+        "block_tables": inp["block_tables"],
+        "k_per_block": kpb,
+        "overlap": overlap,
+        "ratio": ratio,
+        "head_dim": D,
+        "rope_head_dim": RD,
+    }
 
     fly_entry = torch.zeros(nb, kpb, D, dtype=dtypes.fp8)
     fly_rope = torch.zeros(nb, kpb, RD, dtype=torch.bfloat16)
@@ -713,8 +719,10 @@ def test_flydsl_csa_indexer_ksplit(shape_label, bs=2, mtp=0):
       1. asserts the auto-pick actually engages the multi-wave kernel (NW>1) for
          this plan_capacity — i.e. the auto path is the K-split path, not legacy;
       2. validates that the auto (K-split) cache matches the pure-torch reference;
-      3. validates the forced-legacy (NW=1) cache matches the reference too, so
-         the two wave layouts are cross-checked against a common oracle.
+      3. validates the forced-legacy (NW=1) cache matches the reference too when
+         that path is supported, so the two wave layouts are cross-checked
+         against a common oracle. gfx1250 natural FP4 intentionally requires
+         K-split and therefore skips only this legacy sub-check.
     """
     if get_gfx() == "gfx942":
         aiter.logger.info("gfx942 unsupported for fp8/fp4 indexer scatter")
@@ -811,17 +819,20 @@ def test_flydsl_csa_indexer_ksplit(shape_label, bs=2, mtp=0):
     )
 
     # (3) Forced-legacy (NW=1, single-wave) on fresh inputs vs the same ref.
-    leg_inp = dict(inp)
-    leg_inp["kv_cache"] = torch.zeros_like(inp["kv_cache"])
-    leg_inp["cache_scale"] = torch.zeros_like(inp["cache_scale"])
-    _run(leg_inp, k_split_num_waves=1)
-    _check(
-        leg_inp["kv_cache"],
-        leg_inp["cache_scale"],
-        ref_inp["kv_cache"],
-        ref_inp["cache_scale"],
-        f"{shape_label}/legacy(NW=1) bs={bs} mtp={mtp}",
-    )
+    # Natural FP4 on gfx1250 is K-split-only: its single-wave reduction is not
+    # a supported production path, so retain the oracle check without forcing it.
+    if not (get_gfx() == "gfx1250" and quant_mode == "fp4"):
+        leg_inp = dict(inp)
+        leg_inp["kv_cache"] = torch.zeros_like(inp["kv_cache"])
+        leg_inp["cache_scale"] = torch.zeros_like(inp["cache_scale"])
+        _run(leg_inp, k_split_num_waves=1)
+        _check(
+            leg_inp["kv_cache"],
+            leg_inp["cache_scale"],
+            ref_inp["kv_cache"],
+            ref_inp["cache_scale"],
+            f"{shape_label}/legacy(NW=1) bs={bs} mtp={mtp}",
+        )
 
     return {
         "gfx": get_gfx(),
@@ -951,16 +962,15 @@ def main():
     # They are wave64-only (never validated on gfx1250/wave32).
     if get_gfx() == "gfx1250":
         aiter.logger.warning("gfx1250: skipping wave64-only fp8 nm-asm cross-checks")
-        return
+    else:
+        # --- Table 2: HCA fp8 (flydsl 2-kernel fp8 vs pure-torch reference) ---
+        summarize("flydsl_hca_fp8", [test_flydsl_hca_fp8(bs) for bs in args.fp8_bs])
 
-    # --- Table 2: HCA fp8 (flydsl 2-kernel fp8 vs pure-torch reference) ---
-    summarize("flydsl_hca_fp8", [test_flydsl_hca_fp8(bs) for bs in args.fp8_bs])
-
-    # --- Table 3: CSA Main nm-asm fp8 (flydsl single-kernel group-quant vs torch) ---
-    summarize(
-        "flydsl_csa_nm_asm_fp8",
-        [test_flydsl_csa_nm_asm_fp8(bs) for bs in args.csa_fp8_bs],
-    )
+        # --- Table 3: CSA Main nm-asm fp8 (flydsl single-kernel group-quant vs torch) ---
+        summarize(
+            "flydsl_csa_nm_asm_fp8",
+            [test_flydsl_csa_nm_asm_fp8(bs) for bs in args.csa_fp8_bs],
+        )
 
     # --- Table 4: CSA-indexer AUTO K-split coverage (fp8 + fp4): auto NW>1 + vs
     # torch ref + forced-legacy cross-check. ---
@@ -969,6 +979,7 @@ def main():
         [
             test_flydsl_csa_indexer_ksplit(shape_label, bs)
             for shape_label in ("csa_indexer", "csa_indexer_fp4")
+            if shape_label in args.shapes
             for bs in args.ksplit_bs
         ],
     )

@@ -17,44 +17,43 @@ The other backends live in their own namespaces:
 * FlyDSL : ``aiter.ops.flydsl.causal_conv1d_flydsl.causal_conv1d_split_qkv_flydsl_fn``
 
 The ``@triton.jit`` kernels themselves live in
-``aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.causal_conv1d_fwd_split_qkv``.
+``aiter.ops.triton._triton_kernels.gated_delta_net.prefill.causal_conv1d_fwd_split_qkv``.
 
 ``x`` has shape ``[dim, cu_seqlen]`` with the channel axis packed as the
 concatenation ``[Q | K | V]`` (``dim == 2*k_dim + v_dim``).
 """
 
-from typing import List, Optional, Tuple
-
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.causal_conv1d_fwd_split_qkv import (
+from aiter.ops.prefill_batch_metadata import CausalConvPrefillMetadata
+from aiter.ops.triton._triton_kernels.gated_delta_net.prefill.causal_conv1d_fwd_split_qkv import (
     PAD_SLOT_ID,
-    _causal_conv1d_fwd_split_qkv_tile_kernel,
     _causal_conv1d_fwd_split_qkv_kernel,
+    _causal_conv1d_fwd_split_qkv_tile_kernel,
 )
 
 __all__ = [
+    "PAD_SLOT_ID",
     "causal_conv1d_split_qkv_triton_fn",
     "causal_conv1d_split_qkv_triton_tile_fn",
-    "PAD_SLOT_ID",
 ]
 
 
 def causal_conv1d_split_qkv_triton_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
     conv_states: torch.Tensor,
     query_start_loc: torch.Tensor,
-    seq_lens_cpu: List[int],
+    seq_lens_cpu: list[int],
     k_dim: int,
     v_dim: int,
-    cache_indices: Optional[torch.Tensor] = None,
-    has_initial_state: Optional[torch.Tensor] = None,
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
     activation: str = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """1D per-token Triton causal conv1d with fused split output for prefill.
 
     Returns contiguous (q, k, v) of shapes [cu_seqlen, k_dim] / [cu_seqlen, v_dim].
@@ -139,7 +138,7 @@ def causal_conv1d_split_qkv_triton_fn(
 
 def _build_chunk_schedule(
     query_start_loc: torch.Tensor, block_m: int
-) -> Tuple[int, torch.Tensor, torch.Tensor]:
+) -> tuple[int, torch.Tensor, torch.Tensor]:
     """Vectorized (sequence, chunk) schedule, exact-sized (no padding).
 
     ``batch_ptr[pid]`` is the sequence owning program ``pid`` and
@@ -166,20 +165,21 @@ def _build_chunk_schedule(
 def causal_conv1d_split_qkv_triton_tile_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
     conv_states: torch.Tensor,
     query_start_loc: torch.Tensor,
     k_dim: int,
     v_dim: int,
-    cache_indices: Optional[torch.Tensor] = None,
-    has_initial_state: Optional[torch.Tensor] = None,
-    activation: Optional[str] = "silu",
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | None = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
     block_m: int = 64,
     block_n: int = 32,
     num_warps: int = 4,
     metadata=None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    preserve_input_dtype: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """2D-tiled prefill causal conv1d with fused split q/k/v output.
 
     Drop-in alternative to the 1D ``causal_conv1d_split_qkv_triton_fn``.
@@ -187,7 +187,11 @@ def causal_conv1d_split_qkv_triton_tile_fn(
     x: [dim, cu_seqlen] bf16, channels packed ``[Q | K | V]``.
     weight: [dim, width] (width in {2,3,4}); conv_states: [lines, dim, width-1].
     Returns contiguous (q, k, v) of shapes [cu_seqlen, k_dim] / [cu_seqlen, v_dim].
+
+    preserve_input_dtype: return q/k/v in x's dtype to match vLLM
     """
+    # Cast back only when asked; a no-op when cache and activations share a dtype
+    out_dtype = x.dtype if preserve_input_dtype else conv_states.dtype
     x = x.to(conv_states.dtype)
     dim, cu_seqlen = x.shape
     _, width = weight.shape
@@ -209,8 +213,24 @@ def causal_conv1d_split_qkv_triton_tile_fn(
 
     # (sequence, chunk) schedule for the chosen BLOCK_M, optionally memoized
     # in ``metadata.nums_dict`` and shared with the HIP backend.
-    nums_dict = getattr(metadata, "nums_dict", None) if metadata is not None else None
-    if nums_dict is not None and BLOCK_M in nums_dict:
+    if isinstance(metadata, CausalConvPrefillMetadata):
+        metadata.validate(
+            query_start_loc,
+            total_tokens=cu_seqlen,
+            num_sequences=n_seqs,
+        )
+        grid = metadata.get_chunk_grid(BLOCK_M)
+        tot = grid.total_chunks
+        batch_ptr = grid.sequence_ids
+        token_chunk_offset_ptr = grid.chunk_ids
+        nums_dict = None
+    else:
+        nums_dict = (
+            getattr(metadata, "nums_dict", None) if metadata is not None else None
+        )
+    if not isinstance(metadata, CausalConvPrefillMetadata) and (
+        nums_dict is not None and BLOCK_M in nums_dict
+    ):
         entry = nums_dict[BLOCK_M]
         tot = int(entry["tot"])
         batch_ptr = entry["batch_ptr"]
@@ -218,7 +238,7 @@ def causal_conv1d_split_qkv_triton_tile_fn(
         if batch_ptr.device != x.device:
             batch_ptr = batch_ptr.to(x.device)
             token_chunk_offset_ptr = token_chunk_offset_ptr.to(x.device)
-    else:
+    elif not isinstance(metadata, CausalConvPrefillMetadata):
         tot, batch_ptr, token_chunk_offset_ptr = _build_chunk_schedule(
             query_start_loc, BLOCK_M
         )
@@ -240,7 +260,11 @@ def causal_conv1d_split_qkv_triton_tile_fn(
     value = torch.empty([cu_seqlen, v_dim], dtype=x.dtype, device=x.device)
 
     if tot == 0:
-        return query, key, value
+        return (
+            query.to(out_dtype),
+            key.to(out_dtype),
+            value.to(out_dtype),
+        )
 
     grid = (tot, triton.cdiv(dim, BLOCK_N))
     _causal_conv1d_fwd_split_qkv_tile_kernel[grid](
@@ -292,4 +316,8 @@ def causal_conv1d_split_qkv_triton_tile_fn(
         num_warps=num_warps,
         num_stages=1,
     )
-    return query, key, value
+    return (
+        query.to(out_dtype),
+        key.to(out_dtype),
+        value.to(out_dtype),
+    )

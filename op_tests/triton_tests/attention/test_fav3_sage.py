@@ -1,31 +1,52 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-import torch
-import pytest
-import logging
-import numpy as np
 import math
-from aiter.test_mha_common import (
-    attention_ref,
-    attention_ref_block_sparse,
-)
+
+import numpy as np
+import pytest
+import torch
+
+from aiter import logger
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_wrapper_func,
     get_sage_fwd_configs,
 )
-from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
-import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_wrapper,
     get_sage_fwd_configs_mxfp4,
 )
-from aiter.ops.triton.quant.sage_attention_quant_wrappers import create_hadamard_matrix
+from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
+from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
+    create_hadamard_matrix,
+    rotation_smooth_qk,
+)
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.test_mha_common import (
+    attention_ref,
+    attention_ref_block_sparse,
+)
 
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
-DEBUG_MODE = False
 ATOL_fp8 = 3.0e-1
 RTOL_fp8 = 2.5e-1
+
+
+def test_block_attn_mask_to_ragged_lut_metadata_dtype():
+    block_attn_mask = torch.tensor(
+        [[[[True, False, True], [False, True, True]]]],
+        dtype=torch.bool,
+        device="cuda",
+    )
+
+    _, lut_start, lut_count = block_attn_mask_to_ragged_lut(block_attn_mask)
+
+    assert lut_start.dtype == torch.int32
+    assert lut_count.dtype == torch.int32
+    torch.testing.assert_close(
+        lut_start, torch.tensor([0, 2], device="cuda", dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        lut_count, torch.tensor([2, 2], device="cuda", dtype=torch.int32)
+    )
 
 
 def compare_accuracy(current, reference):
@@ -34,26 +55,48 @@ def compare_accuracy(current, reference):
     reference_f = reference.float()
     abs_diff = torch.abs(reference_f - current_f)
 
-    print("Output Tensor Stats:")
-    print(
-        f"  Reference ({tuple(reference_f.shape)}): min={reference_f.min().item():.6f}, max={reference_f.max().item():.6f}, "
-        f"mean={reference_f.mean().item():.6f}, std={reference_f.std().item():.6f}"
+    logger.info("Output Tensor Stats:")
+    logger.info(
+        "  Reference (%s): min=%.6f, max=%.6f, mean=%.6f, std=%.6f",
+        tuple(reference_f.shape),
+        reference_f.min().item(),
+        reference_f.max().item(),
+        reference_f.mean().item(),
+        reference_f.std().item(),
     )
-    print(
-        f"  Test      ({tuple(current_f.shape)}): min={current_f.min().item():.6f}, max={current_f.max().item():.6f}, "
-        f"mean={current_f.mean().item():.6f}, std={current_f.std().item():.6f}"
+    logger.info(
+        "  Test      (%s): min=%.6f, max=%.6f, mean=%.6f, std=%.6f",
+        tuple(current_f.shape),
+        current_f.min().item(),
+        current_f.max().item(),
+        current_f.mean().item(),
+        current_f.std().item(),
     )
 
-    print("Correctness Comparison:")
-    print(f"  Mean Absolute Error: {abs_diff.mean().item():.6e}")
-    print(f"  Max Absolute Error: {abs_diff.max().item():.6e}")
-    print(f"  Std Absolute Error: {abs_diff.std().item():.6e}")
+    logger.info("Correctness Comparison:")
+    logger.info("  Mean Absolute Error: %.6e", abs_diff.mean().item())
+    logger.info("  Max Absolute Error: %.6e", abs_diff.max().item())
+    logger.info("  Std Absolute Error: %.6e", abs_diff.std().item())
     ref_flat = reference_f.reshape(-1)
     test_flat = current_f.reshape(-1)
     cos_sim = torch.nn.functional.cosine_similarity(
         ref_flat.unsqueeze(0), test_flat.unsqueeze(0)
     )
-    print(f"  Cosine Similarity: {cos_sim.item():.8f}")
+    logger.info("  Cosine Similarity: %.8f", cos_sim.item())
+    # Per-row (per-query) cosine over the head-dim D (last axis). Robust to a few outlier
+    # rows: the global flatten cosine is dominated by the largest-magnitude elements, so an
+    # aligned kernel with a handful of blown-up rows still reports a low global cosine. The
+    # median over rows is the alignment gate we trust.
+    rc = torch.nn.functional.cosine_similarity(current_f, reference_f, dim=-1).reshape(
+        -1
+    )
+    logger.info(
+        "  Per-row cosine (over D): mean=%.6f median=%.6f p10=%.6f frac>0.99=%.4f",
+        rc.mean().item(),
+        rc.median().item(),
+        rc.quantile(0.10).item(),
+        (rc > 0.99).float().mean().item(),
+    )
 
 
 def pad_rearrange_dropout_mask(
@@ -111,9 +154,8 @@ def fp8_assert_close(
     max_abs_idx = torch.argmax(abs_diff).item()
     max_rel_idx = torch.argmax(rel_diff).item()
 
-    flat_to_idx = lambda flat_idx, shape: np.unravel_index(  # noqa: E731
-        flat_idx, shape
-    )
+    def flat_to_idx(flat_idx, shape):
+        return np.unravel_index(flat_idx, shape)
 
     max_abs_pos = flat_to_idx(max_abs_idx, tensor_a.shape)
     max_rel_pos = flat_to_idx(max_rel_idx, tensor_a.shape)
@@ -175,7 +217,6 @@ def input_helper(
     dtype,
     layout,
 ):
-    # Generate base inputs in BHSD layout which is the layout used in wan model.
     # Set up tensor shapes based on layout
     if layout == "bhsd":
         q_shape = (BATCH, HQ, N_CTX_Q, D_HEAD)
@@ -244,8 +285,7 @@ def test_sage(
         layout=layout,
     )
 
-    if DEBUG_MODE:
-        print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
+    logger.debug("triton_out.shape=%s, triton_out=%s", triton_out.shape, triton_out)
 
     if layout == "bhsd":
         q = q.permute(0, 2, 1, 3).contiguous()
@@ -260,11 +300,12 @@ def test_sage(
 
     assert torch_out.shape == triton_out.shape
 
-    if DEBUG_MODE:
-        print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
-        print(
-            f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
-        )
+    logger.debug("torch_out.shape=%s, torch_out=%s", torch_out.shape, torch_out)
+    logger.debug(
+        "attention_scores.shape=%s, attention_scores=%s",
+        attention_scores.shape,
+        attention_scores,
+    )
 
     check_attention_outputs(
         triton_out,
@@ -274,6 +315,75 @@ def test_sage(
         rtol=RTOL_fp8,
         max_diff_percentage=0.5,
     )
+
+
+def _non_dense_qkv(kind, layout, batch, heads, seq, head_sz, dtype):
+    """Q/K/V views that are not non-overlapping and dense."""
+    g = torch.Generator(device="cuda").manual_seed(0)
+
+    def rand(*shape):
+        return torch.randn(*shape, generator=g, device="cuda", dtype=dtype)
+
+    def to_layout(t):  # t is BSHD
+        return t if layout == "bshd" else t.transpose(1, 2)
+
+    if kind == "qkv_split":  # slices of a fused QKV projection
+        qkv = rand(batch, seq, 3 * heads * head_sz)
+        return [
+            to_layout(t.view(batch, seq, heads, head_sz))
+            for t in qkv.split(heads * head_sz, dim=-1)
+        ]
+    if kind == "d_stride":  # every other element of a wider head dim
+        return [
+            to_layout(rand(batch, seq, heads, 2 * head_sz)[..., ::2]) for _ in range(3)
+        ]
+    q = to_layout(rand(batch, seq, heads, head_sz))
+    if layout == "bshd":
+        k, v = (rand(batch, seq + 64, heads, head_sz)[:, :seq] for _ in range(2))
+    else:
+        k, v = (rand(batch, heads, seq + 64, head_sz)[:, :, :seq] for _ in range(2))
+    if kind == "v_only":  # K and V in different layouts
+        k = k.contiguous()
+    return q, k, v
+
+
+@pytest.mark.parametrize("kind", ["seq_slice", "qkv_split", "v_only", "d_stride"])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+@pytest.mark.parametrize("smooth_k", [True, False])
+@pytest.mark.parametrize("q_smooth", [False, True])
+def test_sage_non_dense_inputs(kind, layout, smooth_k, q_smooth):
+    """Non-dense Q/K/V views must give the same result as contiguous copies."""
+    q, k, v = _non_dense_qkv(kind, layout, 2, 4, 1020, 128, torch.bfloat16)
+    assert not all(t.is_contiguous() for t in (q, k, v))
+    kwargs = {"layout": layout, "smooth_k": smooth_k, "q_smooth": q_smooth}
+    out = fav3_sage_wrapper_func(q, k, v, **kwargs)
+    ref = fav3_sage_wrapper_func(
+        q.contiguous(), k.contiguous(), v.contiguous(), **kwargs
+    )
+    # Q smoothing reduces over the head dim; a strided head dim changes that order (fp32 ulps).
+    tol = 1e-2 if kind == "d_stride" and q_smooth else 0
+    torch.testing.assert_close(
+        _tensor_from_result(out), _tensor_from_result(ref), atol=tol, rtol=tol
+    )
+
+
+@pytest.mark.parametrize("kind", ["seq_slice", "qkv_split"])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+@pytest.mark.parametrize("smooth_k", [True, False])
+def test_rotation_smooth_qk_non_dense_inputs(kind, layout, smooth_k):
+    """Rotated/smoothed Q, K and delta_s of non-dense views must match contiguous copies."""
+    q, k, _ = _non_dense_qkv(kind, layout, 2, 4, 1020, 128, torch.bfloat16)
+    kwargs = {
+        "BLOCK_R": 32,
+        "q_smoothing": True,
+        "layout": layout,
+        "sm_scale": 0.1,
+        "smooth_k": smooth_k,
+    }
+    out = rotation_smooth_qk(q, k, 64, **kwargs)
+    ref = rotation_smooth_qk(q.contiguous(), k.contiguous(), 64, **kwargs)
+    for name, actual, expected in zip(("q", "k", "delta_s"), out, ref):
+        assert torch.equal(actual, expected), name
 
 
 def _sage_int8_attention_ref(
@@ -372,7 +482,7 @@ def test_sage_int8_hadamard_preserves_float_logits(dtype=torch.bfloat16):
     BATCH, SEQLEN, NUM_HEADS = 1, 32, 4
 
     torch.manual_seed(7)
-    q, k, v = input_helper(
+    q, k, _v = input_helper(
         BATCH,
         NUM_HEADS,
         NUM_HEADS,
@@ -874,8 +984,7 @@ def test_sage_mxfp4(
         hadamard_rotation=hadamard_rotate,
     )
 
-    if DEBUG_MODE:
-        print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
+    logger.debug("triton_out.shape=%s, triton_out=%s", triton_out.shape, triton_out)
 
     if layout == "bhsd":
         q = q.permute(0, 2, 1, 3).contiguous()
@@ -890,11 +999,12 @@ def test_sage_mxfp4(
 
     assert torch_out.shape == triton_out.shape
 
-    if DEBUG_MODE:
-        print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
-        print(
-            f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
-        )
+    logger.debug("torch_out.shape=%s, torch_out=%s", torch_out.shape, torch_out)
+    logger.debug(
+        "attention_scores.shape=%s, attention_scores=%s",
+        attention_scores.shape,
+        attention_scores,
+    )
 
     check_attention_outputs(
         triton_out,

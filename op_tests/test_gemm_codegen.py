@@ -35,13 +35,12 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
 # Import arch constants directly from build_targets — no torch dependency.
 sys.path.insert(0, os.path.join(_REPO_ROOT, "aiter", "jit", "utils"))
-from build_targets import (  # noqa: E402
+import pandas as pd
+from build_targets import (
     GFX_CU_NUM_MAP,
     filter_tune_df,
     get_build_targets_env,
 )
-
-import pandas as pd  # noqa: E402
 
 REPRO_CSV = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -281,7 +280,8 @@ def test_gen_instances_filter(
 
 
 def _make_temp_csv(content: str) -> str:
-    f = tempfile.NamedTemporaryFile(
+    # delete=False on purpose: the path outlives the handle.
+    f = tempfile.NamedTemporaryFile(  # noqa: SIM115
         mode="w", suffix=".csv", delete=False, prefix="test_gemm_codegen_"
     )
     f.write(textwrap.dedent(content).strip() + "\n")
@@ -293,9 +293,9 @@ def test_runtime_dispatch_key():
     _section("4. Runtime dispatch — (gfx, cu_num, M, N, K) lookup key")
 
     try:
-        from aiter.ops.gemm_op_a8w8 import get_CKGEMM_config
         import aiter.ops.gemm_op_a8w8 as _mod
-    except Exception as e:
+        from aiter.ops.gemm_op_a8w8 import get_CKGEMM_config
+    except Exception as e:  # noqa: BLE001  blanket catch is intentional here
         print(f"  SKIP  could not import get_CKGEMM_config ({e})")
         return
 
@@ -303,11 +303,11 @@ def test_runtime_dispatch_key():
     # via rocminfo — GPU_ARCHS is intentionally ignored at runtime.  Derive the
     # test CSV rows from the actual live GPU so the test is correct on any runner.
     try:
-        from aiter.jit.utils.chip_info import get_gfx_runtime, get_cu_num
+        from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
         gfx = get_gfx_runtime()
         cu_num = get_cu_num()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"  SKIP  runtime dispatch tests require a live GPU ({e})")
         return
 
@@ -355,8 +355,8 @@ def test_runtime_dispatch_key():
             cu_num,M,N,K,kernelId,splitK,us,kernelName,tflops,bw,errRatio
             {cu_num},128,1280,8192,7,0,10.0,old_kernel,100.0,500.0,0.0
         """)
-        import logging
         import io
+        import logging
 
         buf = io.StringIO()
         handler = logging.StreamHandler(buf)
@@ -384,7 +384,7 @@ def test_runtime_dispatch_key():
             if path:
                 try:
                     os.unlink(path)
-                except Exception:
+                except Exception:  # noqa: BLE001,S110
                     pass
 
 
@@ -417,7 +417,10 @@ def test_write_name_keyed_lookup_header():
 
     path = None
     try:
-        f = tempfile.NamedTemporaryFile(mode="w", suffix=".h", delete=False)
+        # delete=False on purpose: the path outlives the handle.
+        f = tempfile.NamedTemporaryFile(  # noqa: SIM115
+            mode="w", suffix=".h", delete=False
+        )
         path = f.name
         f.close()
         write_name_keyed_lookup_header(
@@ -458,7 +461,7 @@ def test_write_name_keyed_lookup_header():
         if path:
             try:
                 os.unlink(path)
-            except Exception:
+            except Exception:  # noqa: BLE001,S110
                 pass
 
 
@@ -468,16 +471,16 @@ def test_blockscale_kernel_name_forwarding():
     try:
         import aiter.ops.gemm_op_a8w8 as a8w8_mod
         from aiter.ops.gemm_op_a8w8 import get_CKGEMM_config
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"  SKIP  could not import gemm_op_a8w8 ({e})")
         return
 
     try:
-        from aiter.jit.utils.chip_info import get_gfx_runtime, get_cu_num
+        from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
         gfx = get_gfx_runtime()
         cu_num = get_cu_num()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"  SKIP  forwarding tests require a live GPU for gfx detection ({e})")
         return
 
@@ -485,7 +488,7 @@ def test_blockscale_kernel_name_forwarding():
     # below short-circuit before any kernel actually runs.
     try:
         import torch
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"  SKIP  torch unavailable ({e})")
         return
 
@@ -674,7 +677,7 @@ def test_blockscale_kernel_name_forwarding():
         for p in csv_paths:
             try:
                 os.unlink(p)
-            except Exception:
+            except Exception:  # noqa: BLE001,S110
                 pass
 
 
@@ -684,28 +687,49 @@ def test_write_lookup_header():
     from chip_info import write_lookup_header
 
     class _FakeKernel:
-        def __init__(self, name):
+        def __init__(self, name, supports_m_padding=True, supports_k_padding=True):
             self.name = name
+            self.supports_m_padding = supports_m_padding
+            self.supports_k_padding = supports_k_padding
 
     kernels_dict = {
         ("gfx942", 304, 128, 4096, 4096): _FakeKernel("kernel_non_batched"),
-        ("gfx942", 304, 2, 128, 4096, 4096): _FakeKernel("kernel_batched"),
+        ("gfx942", 304, 2, 128, 4096, 4096): _FakeKernel(
+            "kernel_batched",
+            supports_m_padding=False,
+            supports_k_padding=False,
+        ),
         -1: _FakeKernel("default_kernel"),  # default_dict entry — must be skipped
     }
 
     LOOKUP_head = "#ifdef USE_ROCM\n#define GENERATE_LOOKUP_TABLE(DTYPE, ETYPE) {\\\n"
-    LOOKUP_template = "   {{{MNK}, {kernel_name}<DTYPE, ETYPE>}},\\\n"
+    LOOKUP_template = (
+        "   {{{MNK}, {{{kernel_name}<DTYPE, ETYPE>, {supports_m_padding}, "
+        "{supports_k_padding}}}}},\\\n"
+    )
     LOOKUP_end = "}\n#endif\n"
 
     path = None
     try:
-        f = tempfile.NamedTemporaryFile(mode="w", suffix=".h", delete=False)
+        # delete=False on purpose: the path outlives the handle.
+        f = tempfile.NamedTemporaryFile(  # noqa: SIM115
+            mode="w", suffix=".h", delete=False
+        )
         path = f.name
         f.close()
         write_lookup_header(
-            path, kernels_dict, LOOKUP_head, LOOKUP_template, LOOKUP_end
+            path,
+            kernels_dict,
+            LOOKUP_head,
+            LOOKUP_template,
+            LOOKUP_end,
+            extra_format_args=lambda kernel: {
+                "supports_m_padding": str(kernel.supports_m_padding).lower(),
+                "supports_k_padding": str(kernel.supports_k_padding).lower(),
+            },
         )
-        content = open(path).read()
+        with open(path) as fh:
+            content = fh.read()
 
         _check(
             "non-batched key: gfx string quoted in C++ initializer",
@@ -723,6 +747,11 @@ def test_write_lookup_header():
             f"default_kernel unexpectedly in output:\n{content}",
         )
         _check(
+            "per-kernel metadata is emitted in the lookup value",
+            "{kernel_batched<DTYPE, ETYPE>, false, false}" in content,
+            f"padding metadata not found in output:\n{content}",
+        )
+        _check(
             "old-style key without gfx (regression guard): {304, 128, ...} absent",
             "{304, 128, 4096, 4096}" not in content,
             f"old-style key found in output:\n{content}",
@@ -731,7 +760,7 @@ def test_write_lookup_header():
         if path:
             try:
                 os.unlink(path)
-            except Exception:
+            except Exception:  # noqa: BLE001,S110
                 pass
 
 

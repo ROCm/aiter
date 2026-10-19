@@ -24,7 +24,6 @@ import itertools
 import os
 import random
 import sys
-from typing import Optional, Tuple
 
 import pandas as pd
 import torch
@@ -582,10 +581,10 @@ def test_pa_decode(
     kv_head_num: int,
     ctx_len: int,
     mtp: int = 0,
-    scales: Optional[Tuple[float, float, float]] = None,
+    scales: tuple[float, float, float] | None = None,
     varlen: bool = False,
     use_sink: bool = False,
-    context_lens: Optional[list] = None,
+    context_lens: list | None = None,
 ) -> dict:
     """Random FP8 paged inputs (arbitrary kv_len) vs the torch host reference.
 
@@ -936,32 +935,32 @@ def _build_pa_inputs(
     )
     sink = torch.full((q_head_num,), -1.0e30, dtype=dtypes.fp32, device=device)
 
-    return dict(
-        batch=batch,
-        gqa=gqa,
-        mtp=mtp,
-        page_size=page_size,
-        head_dim=head_dim,
-        q_head_num=q_head_num,
-        Q=Q,
-        K=K,
-        V=V,
-        kv_indices=kv_indices,
-        seq_lens_kv=seq_lens_kv,
-        softmax_scale=softmax_scale,
-        kv_indptr=kv_indptr,
-        qo_indptr=qo_indptr,
-        query_scale=query_scale,
-        key_scale=key_scale,
-        value_scale=value_scale,
-        work_indptr=work_indptr,
-        work_info=work_info,
-        reduce_indptr=reduce_indptr,
-        reduce_final_map=reduce_final_map,
-        reduce_partial_map=reduce_partial_map,
-        split_rows=split_rows,
-        sink=sink,
-    )
+    return {
+        "batch": batch,
+        "gqa": gqa,
+        "mtp": mtp,
+        "page_size": page_size,
+        "head_dim": head_dim,
+        "q_head_num": q_head_num,
+        "Q": Q,
+        "K": K,
+        "V": V,
+        "kv_indices": kv_indices,
+        "seq_lens_kv": seq_lens_kv,
+        "softmax_scale": softmax_scale,
+        "kv_indptr": kv_indptr,
+        "qo_indptr": qo_indptr,
+        "query_scale": query_scale,
+        "key_scale": key_scale,
+        "value_scale": value_scale,
+        "work_indptr": work_indptr,
+        "work_info": work_info,
+        "reduce_indptr": reduce_indptr,
+        "reduce_final_map": reduce_final_map,
+        "reduce_partial_map": reduce_partial_map,
+        "split_rows": split_rows,
+        "sink": sink,
+    }
 
 
 def fill_v_padding(V, value, kv_indices, kv_indptr, seq_lens_kv, page_size):
@@ -1045,9 +1044,9 @@ def test_pa_decode_vmask(
     kv_head_num: int,
     ctx_len: int,
     mtp: int = 0,
-    scales: Optional[Tuple[float, float, float]] = None,
+    scales: tuple[float, float, float] | None = None,
     varlen: bool = False,
-    context_lens: Optional[list] = None,
+    context_lens: list | None = None,
 ) -> dict:
     """V-mask correctness: filling the last-page padding region with NaN vs 0 must
     yield BIT-IDENTICAL *kernel* output.

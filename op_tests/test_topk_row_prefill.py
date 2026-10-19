@@ -15,7 +15,7 @@ def create_random_logits(
     dtype: torch.dtype,
     seed: int,
     data_generation: str = "random",
-    pt_file_path: str = None,
+    pt_file_path: str | None = None,
     replicate_first_row: bool = False,
 ) -> torch.Tensor:
     """Create random logits tensor for testing."""

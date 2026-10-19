@@ -34,17 +34,24 @@ view to :func:`emit_mx_e8m0_scale` -- both round-trip through
 
 from __future__ import annotations
 
-from flydsl.expr import arith
-from flydsl.expr.typing import T
+import flydsl.expr as fx
+from flydsl.expr import arith, rocdl
 from flydsl.expr.arith import CmpIPredicate
+from flydsl.expr.typing import T
+
+from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
+from aiter.utility.mx_types import (
+    MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
+)
 
 # Bare-int mirrors of MxScaleRoundMode / MxDtype (mx_quant_utils.h). Same
 # numeric values as the pybind11 enum classes, but importing them is
 # JIT-free, which is required at FlyDSL AOT time.
 from aiter.utility.mx_types import (
     MxDtypeInt as _D,
+)
+from aiter.utility.mx_types import (
     MxScaleRoundModeInt as _M,
-    MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
 )
 
 # Per-MX-dtype constants. Tuple form: (target_max_pow2, max_pos_inv_f32_bits, mbits)
@@ -109,6 +116,7 @@ def emit_mx_e8m0_scale(
     """
     # Normalise int / pybind enum into a plain int -- pybind11 enum classes
     # don't auto-compare equal to ``int`` (unlike ``IntEnum``).
+    local_max = _raw(local_max)
     mode_int = int(mode)
     dtype_int = int(dtype)
     if dtype_int not in _DTYPE_CFG:
@@ -129,7 +137,7 @@ def emit_mx_e8m0_scale(
         # Defensive clamp into the E8M0 storage range [0, 0xFF]. Pathological
         # inputs (denormals, fp32 inf, mantissa bump from 0xFF -> 0x100) can
         # otherwise corrupt the stored uint8.
-        return arith.minsi(arith.maxsi(x, c0_i32), c0xFF_i32)
+        return fx.min(fx.max(fx.Int32(x), fx.Int32(0)), fx.Int32(0xFF)).ir_value()
 
     if mode_int == _M.RoundUp:
         # ceil_pow2(amax / max_pos): multiply by reciprocal of max_pos to get
@@ -143,7 +151,7 @@ def emit_mx_e8m0_scale(
         working_i32 = working.bitcast(T.i32)
         mantissa = working_i32 & c0x7FFFFF_i32
         biased_exp = (working_i32 >> c23_i32) & c0xFF_i32
-        mant_nonzero = arith.cmpi(CmpIPredicate.ne, mantissa, c0_i32)
+        mant_nonzero = mantissa != c0_i32
         exp_field = arith.select(
             mant_nonzero,
             biased_exp + c1_i32,
@@ -164,7 +172,7 @@ def emit_mx_e8m0_scale(
         amax_i32 = local_max.bitcast(T.i32)
         mantissa = amax_i32 & c0x7FFFFF_i32
         biased_exp = (amax_i32 >> c23_i32) & c0xFF_i32
-        mant_nonzero = arith.cmpi(CmpIPredicate.ne, mantissa, c0_i32)
+        mant_nonzero = mantissa != c0_i32
         biased_exp_bumped = arith.select(
             mant_nonzero,
             biased_exp + c1_i32,
@@ -241,6 +249,107 @@ def emit_f32_to_e2m1(qx_f32):
     normal_x = qx_abs + c0xC11FFFFF_i32 + mant_odd
     normal_x = normal_x >> c22_i32
 
-    e2m1 = arith.select(normal_mask, normal_x, c0x7_i32)
-    e2m1 = arith.select(denormal_mask, denormal_x, e2m1)
+    e2m1 = normal_mask.select(normal_x, c0x7_i32)
+    e2m1 = denormal_mask.select(denormal_x, e2m1)
     return (s >> c28_i32) | e2m1
+
+
+def emit_amax_e8m0_native_scale(
+    all_vals, *, wave_size, dtype=_D.FP8_E4M3, amax_gain=None
+):
+    """Like :func:`emit_amax_e8m0_recip` but returns the *forward* scale
+    ``2^(e8m0-127)`` needed by native gfx1250 ``v_cvt_scalef32_pk8_*``
+    instructions (HW divides by the scale internally).
+
+    ``amax_gain`` is an optional f32 the block amax is multiplied by before the
+    scale is derived. It exists so a caller whose block is a uniform multiple of
+    what it holds in registers -- an MoE tile row scaled by one route weight, say
+    -- can pay a single multiply here instead of one per element, and fold the
+    reciprocal into the ``v_cvt_scalef32`` scale operand. Applied AFTER the peer
+    reduction: every lane in a block shares the gain, so the order is
+    equivalent, and keeping it off the shuffle's input shortens that dependency
+    chain. Must be non-negative; pass ``abs()`` of a signed factor. A gain above
+    one can in principle push the amax past FLT_MAX; the e8m0 exponent clamp in
+    :func:`emit_mx_e8m0_scale` absorbs that rather than this function paying a
+    second clamp per block.
+
+    Returns:
+        ``(scale_f32, e8m0_byte)`` — f32 forward scale and i8 E8M0 byte.
+    """
+    if not all_vals:
+        raise ValueError("emit_amax_e8m0_native_scale needs at least one value")
+    c_flt_max = arith.constant(3.4028234663852886e38, type=T.f32)
+    c16 = arith.constant(16, type=T.i32)
+    c23 = arith.constant(23, type=T.i32)
+    c_wave = arith.constant(wave_size, type=T.i32)
+
+    # A tree, not a linear accumulate: a chain of N maxes is N deep and every
+    # step stalls on the last (one s_delay_alu each), while a tree is log-deep
+    # with independent maxes per level for the scheduler to interleave.
+    #
+    # Ternary groups rather than pairs: the AMDGPU backend contracts
+    # max(max(a, b), c) into one v_max3_f32, so a group of three costs the same
+    # single instruction a pair does. That is 8 instructions for 16 values
+    # instead of 15, and three levels instead of four. If the contraction ever
+    # stops firing this degrades to the pairwise count, never worse.
+    #
+    # No 0.0 seed: abs() already floors the inputs at zero, so it only bought an
+    # extra level.
+    level = [abs(fx.Float32(v)).ir_value() for v in all_vals]
+    while len(level) > 1:
+        nxt = []
+        for i in range(0, len(level), 3):
+            grp = level[i : i + 3]
+            acc = grp[0]
+            for v in grp[1:]:
+                acc = arith.maxnumf(acc, v)
+            nxt.append(acc)
+        level = nxt
+    block_amax = arith.minnumf(level[0], c_flt_max)
+    peer = block_amax.shuffle_xor(c16, c_wave)
+    block_amax = arith.maxnumf(block_amax, peer)
+    if amax_gain is not None:
+        block_amax = _raw(fx.Float32(block_amax) * fx.Float32(amax_gain))
+
+    e8m0 = emit_mx_e8m0_scale(block_amax, dtype=dtype)
+    scale_f32 = (e8m0 << c23).bitcast(T.f32)
+    e8m0_byte = arith.trunci(T.i8, e8m0)
+    return scale_f32, e8m0_byte
+
+
+def emit_cvt_scalef32_pk8_fp8_f32(src_v8f32, scale_f32, *, v2i32_ty, rocdl):
+    """Native gfx1250 ``v_cvt_scalef32_pk8_fp8_f32``: 8 f32 -> 8 fp8 e4m3.
+
+    ``src_v8f32`` is a ``vector<8, f32>`` ir.Value, ``scale_f32`` an f32 whose
+    exponent is the e8m0 block scale (2^(e8m0-127)); the HW divides each input
+    by it and RNE-packs 8 fp8 e4m3 bytes into a ``vector<2, i32>``.
+    No bf16 round-trip — full f32 precision into the scaled conversion.
+    """
+    return rocdl.cvt_scalef32_pk8_fp8_f32(
+        v2i32_ty,
+        _raw(src_v8f32),
+        _raw(scale_f32),
+    )
+
+
+def emit_cvt_scalef32_pk8_fp4_f32(src_v8f32, scale_f32, *, i32_ty, rocdl):
+    """Native gfx1250 ``v_cvt_scalef32_pk8_fp4_f32``: 8 f32 -> 8 fp4 e2m1.
+
+    Same contract as the fp8 form, except the eight 4-bit values pack into one
+    i32 instead of two. Also no bf16 round-trip, which the ``_bf16`` variant
+    below would cost -- and fp4 has too little mantissa to spend on that.
+    """
+    return rocdl.cvt_scalef32_pk8_fp4_f32(
+        i32_ty,
+        _raw(src_v8f32),
+        _raw(scale_f32),
+    )
+
+
+def emit_cvt_scalef32_pk8_fp4_bf16(src_v8bf16, scale_f32, *, i32_ty):
+    """Native gfx1250 scaled conversion of eight bf16 values to packed FP4."""
+    return rocdl.cvt_scalef32_pk8_fp4_bf16(
+        i32_ty,
+        _raw(src_v8bf16),
+        _raw(scale_f32),
+    )

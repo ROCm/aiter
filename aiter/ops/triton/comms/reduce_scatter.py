@@ -8,13 +8,17 @@ This module provides a reduce-scatter operation along the M dimension using
 GPU-initiated communication via the Iris library.
 """
 
-import torch
-from torch import Tensor
-import triton
-import triton.language as tl
 import logging
+from typing import TYPE_CHECKING
 
 import iris
+import triton
+import triton.language as tl
+from torch import Tensor
+
+if TYPE_CHECKING:
+    from aiter.ops.triton.comms.iris import IrisCommContext
+
 
 # If we got here, iris is available
 IRIS_AVAILABLE = True
@@ -216,7 +220,12 @@ def reduce_scatter(
         raise ValueError(f"M ({M}) must be divisible by world_size ({world_size})")
 
     logger.info(
-        f"Rank {cur_rank}/{world_size}: Reduce-scatter M={M}, N={N} -> M_shard={M_shard}"
+        "Rank %d/%d: Reduce-scatter M=%d, N=%d -> M_shard=%d",
+        cur_rank,
+        world_size,
+        M,
+        N,
+        M_shard,
     )
 
     # Allocate output buffer in IRIS shared memory
@@ -250,7 +259,9 @@ def reduce_scatter(
     iris_ctx.barrier()
 
     logger.info(
-        f"Rank {cur_rank}: Reduce-scatter complete, output_shard shape: {output_shard.shape}"
+        "Rank %d: Reduce-scatter complete, output_shard shape: %s",
+        cur_rank,
+        output_shard.shape,
     )
 
     return output_shard

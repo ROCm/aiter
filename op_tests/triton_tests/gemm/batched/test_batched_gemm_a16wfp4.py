@@ -1,9 +1,10 @@
-import torch
 import pytest
+import torch
+
 from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
 )
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
@@ -60,6 +61,13 @@ def generate_batched_gemm_a16wfp4_inputs(B, M, N, K, dtype, layout="TN", output=
     w_scales = torch.randint(
         124, 128, (B, K // SCALE_GROUP_SIZE, N), dtype=torch.uint8, device="cuda"
     )
+    # Put w_scales at the head of a buffer whose tail is 0xFF, which is NaN in
+    # e8m0. A ragged-K tile that loads scale groups past the end of w_scales
+    # then turns the output NaN instead of reading whatever memory follows.
+    poisoned = torch.full(
+        (2 * B, K // SCALE_GROUP_SIZE, N), 0xFF, dtype=torch.uint8, device="cuda"
+    )
+    w_scales = poisoned[:B].copy_(w_scales)
     w_scales = w_scales.transpose(1, 2)
 
     y = None
@@ -117,9 +125,14 @@ def get_x_vals():
     x_vals_with_batch = [
         (b, 2**m, n, k)
         for b in range(1, 17)
-        for m in range(0, 9)
+        for m in range(9)
         for (n, k) in [(512, 128), (128, 512)]
     ]
+    # This mirrors GLM MLA's qk_nope_head_dim=192.
+    x_vals_with_batch += [(16, 32, 512, 192)]
+    # K = 35 * 32 leaves a ragged tail under any BLOCK_SIZE_K >= 64, after
+    # several full K iterations rather than within the first one.
+    x_vals_with_batch += [(2, 7, 512, 1120), (3, 16, 128, 1120)]
     # x_vals_with_batch = [(1, 1, 128, 512+128), ] # TODO check
     return x_vals_with_batch
 
@@ -180,7 +193,7 @@ def test_batched_gemm_a16wfp4(B: int, M: int, N: int, K: int, layout, dtype):
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
-    x, w, x_scales, w_scales, out = generate_batched_gemm_a16wfp4_inputs(
+    x, w, _x_scales, w_scales, out = generate_batched_gemm_a16wfp4_inputs(
         B, M, N, K, dtype, layout=layout, output=True
     )
 

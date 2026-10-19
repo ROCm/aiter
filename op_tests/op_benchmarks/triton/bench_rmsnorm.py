@@ -1,16 +1,19 @@
 import argparse
+import math
+
 import torch
 import triton
+
 from aiter.ops.triton.normalization.rmsnorm import rms_norm
 from aiter.ops.triton.quant.fused_mxfp4_quant import fused_rms_mxfp4_quant
-from op_tests.triton_tests.normalization.test_rmsnorm import (
-    generate_rmsnorm_inputs,
-)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_configs,
     get_available_models,
     get_caller_name_no_ext,
+    get_model_configs,
     print_vgpr,
+)
+from op_tests.triton_tests.normalization.test_rmsnorm import (
+    generate_rmsnorm_inputs,
 )
 
 
@@ -19,7 +22,7 @@ def model_benchmark_shapes(args):
     configs = get_model_configs(
         config_path=config_file, models="llama3" if args.model is None else args.model
     )
-    M_list = [args.M] if args.model == "all" else [2**i for i in range(0, 15)]
+    M_list = [args.M] if args.model == "all" else [2**i for i in range(15)]
     shapes = []
     for M in M_list:
         for model_name, config in configs.items():
@@ -44,6 +47,10 @@ def get_x_vals():
         (4096, 1280),
         (8192, 1280),
         (16384, 1280),
+        # Large-M / small-N: exercises _rmsnorm_bwd_kernel_large_m_small_n
+        (16384, 128),
+        (32768, 128),
+        (16384, 512),
     ]
     return x_vals
 
@@ -57,6 +64,9 @@ def run_benchmark(args):
     if args.shape is not None:
         M, N = args.shape
         x_vals_list = [("custom", M, N)]
+    elif args.model is None and args.M is None:
+        # Default: sweep get_x_vals() which covers both standard and large-M/small-N
+        x_vals_list = [("custom", M, N) for M, N in get_x_vals()]
     else:
         x_vals_list = model_benchmark_shapes(args)
 
@@ -85,6 +95,9 @@ def run_benchmark(args):
 
     quant = args.quant
     add_residual = args.add_residual
+    do_backward = args.backward
+    if do_backward and quant != "none":
+        raise ValueError("--backward cannot be combined with --quant")
 
     @triton.testing.perf_report([benchmark])
     def bench_rmsnorm(M, N, metric, model_name=None, **kwargs):
@@ -96,7 +109,7 @@ def run_benchmark(args):
             # Fused RMSNorm (+ optional residual add) + MXFP4 quant epilogue.
             assert N % 2 == 0, "fused mxfp4 quant requires an even N (two fp4 -> uint8)"
             res = torch.randn_like(x) if add_residual else None
-            fn = lambda: fused_rms_mxfp4_quant(x, w, eps, res1=res)  # noqa: E731
+            fn = lambda: fused_rms_mxfp4_quant(x, w, eps, res1=res)
             # Bytes moved: read x (+ residual), write packed fp4 (N/2 bytes/row)
             # + e8m0 block scales (cdiv(N,32) bytes/row) (+ residual passthrough).
             mxfp4_block = 32
@@ -106,8 +119,38 @@ def run_benchmark(args):
                 mem_write += M * N * x.element_size()
             mem = mem_read + mem_write
             flops = 4 * M * N  # dominated by the norm; quant is elementwise
+        elif do_backward:
+            # Backward only: build y once, reuse the retained graph each trial.
+            x.requires_grad_(True)
+            w.requires_grad_(True)
+            y = rms_norm(x, w, eps)
+            dy = torch.randn_like(y)
+
+            def fn():
+                x.grad, w.grad = None, None
+                y.backward(dy, retain_graph=True)
+
+            BLOCK_N = triton.next_power_of_2(N)
+            BLOCK_M = max(min(16384 // BLOCK_N, 32), 8)
+            num_prgms_large = math.ceil(M / BLOCK_M)
+            num_sms = min(M, torch.cuda.get_device_properties(0).multi_processor_count)
+            use_large_m = M > 8192 and N <= 1024
+            # x, dy: input dtype; rsigma: fp32 (4 bytes)
+            mem_read = (2 * M * N) * x.element_size() + M * 4 + N * x.element_size()
+            # dx: input dtype; dg: input dtype
+            mem_write = (M * N + N) * x.element_size()
+            if use_large_m:
+                # dg_tmp: written by bwd kernel, read by reduction (fp32)
+                mem_read += num_prgms_large * N * 4
+                mem_write += num_prgms_large * N * 4
+            elif N > 1:
+                # generic path also writes/reads dg_tmp (fp32, num_sms rows)
+                mem_read += num_sms * N * 4
+                mem_write += num_sms * N * 4
+            mem = mem_read + mem_write
+            flops = 8 * M * N
         else:
-            fn = lambda: rms_norm(x, w, eps)  # noqa: E731
+            fn = lambda: rms_norm(x, w, eps)
             # memory transfer
             mem_read = (M * 1) * N * x.element_size()  # x is (M,N) and g/weight is (N)
             mem_write = M * N * x.element_size()  # output
@@ -193,6 +236,15 @@ def parse_args(args: list[str] | None = None):
         help="Print VGPR usage for Triton kernels.",
     )
     parser.add_argument(
+        "--backward",
+        action="store_true",
+        default=False,
+        help=(
+            "Benchmark the backward pass instead of forward. Exercises "
+            "_rmsnorm_bwd_kernel_large_m_small_n for M>8192,N<=1024 shapes."
+        ),
+    )
+    parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
     )
     args = parser.parse_args(args=args)
@@ -203,7 +255,7 @@ def main(args: list[str] | None = None) -> None:
     parsed_args = parse_args(args=args)
     if parsed_args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(parsed_args)  # noqa: E731
+        fun = lambda: run_benchmark(parsed_args)
         print_vgpr(fun, get_caller_name_no_ext())
         return
     run_benchmark(parsed_args)

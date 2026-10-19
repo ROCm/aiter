@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
 import pytest
+import torch
+
 from aiter.ops.triton.attention.extend_attention import extend_attention_fwd
 
 
@@ -224,7 +225,7 @@ def test_op_fwd(
 
     ref_out = torch.empty_like(tri_out, dtype=q_extend.dtype, device=q_extend.device)
     # ref implementation
-    for i in range(0, B):
+    for i in range(B):
         start_q, start_k = qo_indptr[i], kv_indptr[i]
         end_q, end_k = qo_indptr[i + 1], kv_indptr[i + 1]
 

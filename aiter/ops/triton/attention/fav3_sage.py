@@ -2,23 +2,74 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from __future__ import annotations
-from typing import Optional, Tuple
+
+import os
+
 import torch
-import aiter
 import triton
+
+import aiter
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
-    sage_fwd,
     map_dims,
+    sage_fwd,
+)
+from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import (
+    AITER_TRITON_CONFIGS_PATH,
+    load_config_json,
+    resolve_config_dir,
 )
 
-from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant
+_CONFIG_NAME = "FAV3_SAGE"
+# Arches with no tuned fav3_sage table of their own read the gfx942 file
+_FALLBACK_ARCH = "gfx942"
 
-from aiter.ops.triton.utils._triton import arch_info
+
+def _load_sage_fwd_tables() -> dict[str, dict]:
+    """Every shipped FAV3_SAGE table, keyed by architecture.
+
+    Read once, at import. ``get_sage_fwd_configs()`` is traced by Dynamo under
+    ``torch.compile(fullgraph=True)`` -- see
+    op_tests/triton_tests/attention/test_fav3_sage_compile.py -- and Dynamo
+    cannot trace the ``open()`` inside ``load_config_json()``. Its ``lru_cache``
+    does not help either: Dynamo ignores the wrapper and traces the function
+    body. So the read has to happen off the traced path, leaving
+    ``get_sage_fwd_configs()`` a plain dict lookup.
+
+    Every arch is loaded rather than just the running one, so the running
+    architecture is not baked into import-time state.
+    """
+    tables = {}
+    for entry in sorted(os.scandir(AITER_TRITON_CONFIGS_PATH), key=lambda e: e.name):
+        if not entry.is_dir():
+            continue
+        cfg_dir = resolve_config_dir(
+            "attention", _CONFIG_NAME, backend="triton", arch=entry.name
+        )
+        table = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
+        if table is not None:
+            tables[entry.name] = table
+
+    # get_sage_fwd_configs() falls back to this table for every arch that ships
+    # none of its own, and dict.get() evaluates its default eagerly, so a
+    # missing gfx942 file would raise KeyError on *every* arch rather than only
+    # the untuned ones. Fail here instead, naming the file that is absent.
+    assert _FALLBACK_ARCH in tables, (
+        f"no {_CONFIG_NAME} table for the fallback architecture "
+        f"{_FALLBACK_ARCH!r}: expected "
+        f"{resolve_config_dir('attention', _CONFIG_NAME, backend='triton', arch=_FALLBACK_ARCH)}"
+        "/DEFAULT.json"
+    )
+    return tables
+
+
+_SAGE_FWD_TABLES = _load_sage_fwd_tables()
 
 
 def get_sage_fwd_configs(
-    block_m: Optional[int] = None,
-    block_n: Optional[int] = None,
+    block_m: int | None = None,
+    block_n: int | None = None,
     *,
     a3_tuned: bool = False,
 ):
@@ -30,34 +81,11 @@ def get_sage_fwd_configs(
     (num_warps=4, waves_per_eu=2). Numerics match the default launch params;
     use this when long sequences (e.g. Qwen edit ~8400 tokens) are register-bound.
     """
-    arch = arch_info.get_arch()
-    if arch == "gfx950":
-        base = {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "waves_per_eu": 2,
-            "PRE_LOAD_V": False,
-            "num_stages": 3,
-            "num_warps": 8,
-        }
-    elif arch == "gfx942":
-        base = {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "waves_per_eu": 2,
-            "PRE_LOAD_V": False,
-            "num_stages": 2,
-            "num_warps": 8,
-        }
-    else:
-        base = {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "waves_per_eu": 2,
-            "PRE_LOAD_V": False,
-            "num_stages": 2,
-            "num_warps": 8,
-        }
+    config = _SAGE_FWD_TABLES.get(
+        arch_info.get_arch(), _SAGE_FWD_TABLES[_FALLBACK_ARCH]
+    )
+    # The tables are shared module state; copy before mutating.
+    base = dict(config["fwd"])
     if block_m is not None:
         base["BLOCK_M"] = block_m
     if block_n is not None:
@@ -65,8 +93,7 @@ def get_sage_fwd_configs(
 
     # Optional MI308/gfx942 perf preset; off by default so callers keep upstream behaviour.
     if a3_tuned:
-        base["num_warps"] = 4
-        base["waves_per_eu"] = 2
+        base.update(config["fwd_a3_tuned"])
     return base
 
 
@@ -90,20 +117,20 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         v: torch.Tensor,
         softmax_scale: float | None,
         causal: bool,
-        window_size: Tuple[int, int],
+        window_size: tuple[int, int],
         attention_chunk: int,
         softcap: float,
         deterministic: bool,
         sm_margin: int,
         return_lse: bool = True,
         layout: str = "bshd",
-        config: Optional[dict] = None,
-        block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        config: dict | None = None,
+        block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         smooth_k: bool = True,
         q_smooth: bool = False,
         hadamard_rotation: bool = False,
-        R: Optional[torch.Tensor] = None,
-        BLOCK_R: Optional[int] = None,
+        R: torch.Tensor | None = None,
+        BLOCK_R: int | None = None,
     ):
         # 1. Dimension Mapping & Config Setup
         bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
@@ -254,22 +281,22 @@ def fav3_sage_wrapper_func(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    softmax_scale: Optional[float] = None,
+    softmax_scale: float | None = None,
     causal: bool = False,
-    window_size: Tuple[int, int] = (-1, -1),
+    window_size: tuple[int, int] = (-1, -1),
     attention_chunk: int = 0,
     softcap: float = 0.0,
     deterministic: bool = False,
     sm_margin: int = 0,
     return_lse: bool = False,
     layout: str = "bshd",
-    config: Optional[dict] = None,
-    block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    config: dict | None = None,
+    block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     smooth_k: bool = True,
     q_smooth: bool = False,
     hadamard_rotation: bool = False,
-    R: Optional[torch.Tensor] = None,
-    BLOCK_R: Optional[int] = None,
+    R: torch.Tensor | None = None,
+    BLOCK_R: int | None = None,
 ):
     """
     SageAttention v1 high-precision entry point.
@@ -366,19 +393,19 @@ def fav3_sage_func(
     q_descale: torch.Tensor,
     k_descale: torch.Tensor,
     v_descale: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    softmax_scale: Optional[float] = None,
+    bias: torch.Tensor | None = None,
+    softmax_scale: float | None = None,
     causal: bool = False,
-    window_size: Tuple[int, int] = (-1, -1),
+    window_size: tuple[int, int] = (-1, -1),
     attention_chunk: int = 0,
     softcap: float = 0.0,
     sm_margin: int = 0,
     return_lse: bool = False,
     layout: str = "bshd",
-    config: Optional[dict] = None,
-    kv_block_indices: Optional[torch.Tensor] = None,
-    lut_start: Optional[torch.Tensor] = None,
-    lut_count: Optional[torch.Tensor] = None,
+    config: dict | None = None,
+    kv_block_indices: torch.Tensor | None = None,
+    lut_start: torch.Tensor | None = None,
+    lut_count: torch.Tensor | None = None,
     use_block_sparse: bool = False,
 ):
     """

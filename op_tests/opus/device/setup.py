@@ -10,15 +10,24 @@ Usage:
     python setup.py --clean  # remove built artifacts
 """
 
+import argparse
 import os
 import subprocess
 import sys
 import time
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_REPO_CSRC = os.path.normpath(
-    os.path.join(_THIS_DIR, "..", "..", "..", "csrc", "include")
+_REPO_ROOT = os.path.normpath(os.path.join(_THIS_DIR, "..", "..", ".."))
+_REPO_CSRC = os.path.normpath(os.path.join(_REPO_ROOT, "csrc", "include"))
+sys.path.insert(0, _REPO_ROOT)
+
+from aiter_worker_limits import (
+    JOBS_CLI_HELP,
+    adopt_legacy_max_jobs,
+    configure_worker_subprocesses,
+    get_worker_count_for,
 )
+
 _SO_NAME = "opus_device_test.so"
 
 _CU_SOURCES = [
@@ -61,8 +70,21 @@ def _detect_arch():
                 name = line.split()[-1].strip()
                 if name.startswith("gfx"):
                     return name
-    except Exception:
+    except Exception:  # noqa: BLE001,S110
         pass
+    # rocminfo is not always installed, and falling straight through to "native" costs
+    # more than an unresolved arch string: the per-arch skip lists below are keyed by
+    # gfx name, so an undetected arch silently stops applying them. torch is already a
+    # hard requirement of the harness that loads the .so, and reports the same name.
+    try:
+        import torch
+
+        props = torch.cuda.get_device_properties(0)
+        name = getattr(props, "gcnArchName", "").split(":")[0]
+    except (ImportError, AttributeError, AssertionError, RuntimeError):
+        name = ""
+    if name.startswith("gfx"):
+        return name
     return "native"
 
 
@@ -75,7 +97,7 @@ def _find_hipcc():
         return subprocess.check_output(
             ["which", "hipcc"], stderr=subprocess.DEVNULL, text=True
         ).strip()
-    except Exception:
+    except Exception:  # noqa: BLE001,S110
         pass
     return "hipcc"
 
@@ -113,25 +135,32 @@ def build(verbose=False, jobs=None):
     arch = _detect_arch()
     so_path = os.path.join(_THIS_DIR, _SO_NAME)
 
-    if jobs is None:
-        jobs = min(len(_CU_SOURCES), os.cpu_count() or 4)
-
-    if verbose:
-        print(f"[setup] arch={arch}, jobs={jobs}")
-
     # Per-arch skip list: kernels that use builtins not available on the
     # target arch. Skipped at .so build time so the rest of the suite
     # still links; the Python harness sees the missing extern "C" launcher
     # and reports SKIP for those tests.
-    #
-    # gfx1201 / gfx1200 (Navi 44/48, RDNA4): opus _async_load uses
-    # __builtin_amdgcn_raw_ptr_buffer_load_lds which needs the
-    # Per-arch build-time skip list. Empty today; add entries here if a
-    # future kernel needs an arch-specific feature unavailable elsewhere.
-    _ARCH_SKIP_SOURCES = {}
-    skip = _ARCH_SKIP_SOURCES.get(arch, set())
+    _ARCH_SKIP_SOURCES = {
+        "gfx1250": {
+            # gfx1201 wave64 WMMA builtins; no gfx1250 spelling.
+            "test_wmma_gfx1201_w64.cu",
+            # opus.hpp's wmma<i8, i8, f32, 16, 16, 128> dispatch does not accept the
+            # scale operands the kernel passes.
+            "test_wmma_scale.cu",
+        },
+    }
+
+    # The inverse list: sources that build for one arch and no other. Stated positively
+    # because the alternative is naming every arch a kernel does NOT support, which is a
+    # list that silently goes wrong every time a new one appears.
+    _ARCH_ONLY_SOURCES = {
+        # The tensor DMA opcodes are gfx1250-only.
+        "test_tdm_gfx1250.cu": {"gfx1250"},
+    }
+
+    skip = set(_ARCH_SKIP_SOURCES.get(arch, set()))
+    skip |= {s for s, archs in _ARCH_ONLY_SOURCES.items() if arch not in archs}
     sources = [s for s in _CU_SOURCES if s not in skip]
-    if verbose and skip:
+    if verbose:
         for s in sorted(skip):
             print(f"[setup]   skip {s} (incompatible with arch={arch})")
 
@@ -144,9 +173,15 @@ def build(verbose=False, jobs=None):
         obj = os.path.join(_THIS_DIR, s.replace(".cu", ".o"))
         extra = ["-mwavefrontsize64"] if s in _W64_SOURCES else []
         tasks.append((src, obj, hipcc, arch, verbose, extra))
+    jobs = get_worker_count_for(len(tasks), jobs)
+
+    if verbose:
+        print(f"[setup] arch={arch}, jobs={jobs}")
 
     objs = []
-    with ProcessPoolExecutor(max_workers=jobs) as pool:
+    with ProcessPoolExecutor(
+        max_workers=jobs, initializer=configure_worker_subprocesses
+    ) as pool:
         futures = {pool.submit(_compile_one, t): t for t in tasks}
         for fut in as_completed(futures):
             name, ms = fut.result()
@@ -215,16 +250,24 @@ def clean():
         print("Nothing to clean.")
 
 
-if __name__ == "__main__":
-    if "--clean" in sys.argv:
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--clean", action="store_true")
+    parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument(
+        "--jobs",
+        "-j",
+        type=int,
+        default=None,
+        help=JOBS_CLI_HELP,
+    )
+    args = parser.parse_args()
+    if args.clean:
         clean()
     else:
-        verbose = "-v" in sys.argv or "--verbose" in sys.argv
-        jobs = None
-        for arg in sys.argv[1:]:
-            if arg.startswith("-j"):
-                try:
-                    jobs = int(arg[2:])
-                except ValueError:
-                    pass
-        build(verbose=verbose, jobs=jobs)
+        build(verbose=args.verbose, jobs=args.jobs)
+
+
+if __name__ == "__main__":
+    adopt_legacy_max_jobs()
+    main()

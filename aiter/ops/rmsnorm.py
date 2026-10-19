@@ -3,10 +3,10 @@
 
 import torch
 from torch import Tensor
+
 from ..jit.core import compile_ops
 from ..jit.utils.torch_guard import torch_compile_guard
 from .quant import get_dtype_max
-from typing import Optional
 
 # opus is the sole rmsnorm backend (fp16/bf16/fp32, any hidden). Only group_size/
 # shuffle_scale quant and exotic dtypes fall back to module_rmsnorm_quant.
@@ -486,7 +486,7 @@ def rmsnorm2d_fwd_with_add_smoothquant(
     yscale: Tensor,
     weight: Tensor,
     epsilon: float,
-    out_before_quant: Optional[Tensor] = None,
+    out_before_quant: Tensor | None = None,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> None:
     rmsnorm2d_fwd_with_add_smoothquant_opus(
@@ -582,7 +582,7 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
         )
 
 
-@compile_ops("module_rmsnorm_quant")
+@compile_ops("module_rmsnorm_quant", develop=True)
 def add_rmsnorm_quant(
     out: Tensor,
     input: Tensor,
@@ -594,10 +594,11 @@ def add_rmsnorm_quant(
     group_size: int = 0,
     shuffle_scale: bool = False,
     gemma_norm: bool = False,
+    scale_layout_m32k4: bool = False,
 ) -> None: ...
 
 
-@compile_ops("module_rmsnorm_quant")
+@compile_ops("module_rmsnorm_quant", develop=True)
 def add_rmsnorm(
     out: Tensor,
     input: Tensor,
@@ -609,7 +610,7 @@ def add_rmsnorm(
 ) -> None: ...
 
 
-@compile_ops("module_rmsnorm_quant")
+@compile_ops("module_rmsnorm_quant", develop=True)
 def rmsnorm_quant(
     out: Tensor,
     input: Tensor,
@@ -619,10 +620,19 @@ def rmsnorm_quant(
     group_size: int = 0,
     shuffle_scale: bool = False,
     gemma_norm: bool = False,
-) -> None: ...
+    scale_layout_m32k4: bool = False,
+) -> None:
+    """Fused RMSNorm + quant.
+
+    ``scale_layout_m32k4=True`` (fp8 ``out``, e8m0 ``scale``, ``group_size == 32``)
+    writes the scale directly in the gfx1250 MXFP8 ASM GEMM A-scale layout, i.e.
+    the bytes of :func:`aiter.ops.shuffle.shuffle_mxfp8fp4_scale`. ``scale`` must
+    be a contiguous ``(pad32(M), N // 32)`` byte tensor; the kernel writes the pad
+    rows as 0x7F. ``shuffle_scale`` is ignored.
+    """
 
 
-@compile_ops("module_rmsnorm_quant")
+@compile_ops("module_rmsnorm_quant", develop=True)
 def rmsnorm(
     out: Tensor,
     input: Tensor,

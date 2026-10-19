@@ -1,16 +1,17 @@
-import os
-import json
 import inspect
-from pathlib import Path
-import torch
-import triton.language as tl
-import triton
-import warnings
-import sys
-import time
-import tempfile
+import json
+import os
 import re
+import sys
+import tempfile
+import time
+import warnings
+from pathlib import Path
+
 import matplotlib.pyplot as plt
+import torch
+import triton
+import triton.language as tl
 
 # Base directory where configs are located
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../"))
@@ -138,7 +139,7 @@ def model_benchmark_shapes(args):
     if args.model == "all":
         M_list = [args.M if args.M is not None else 4096]
     else:
-        M_list = [args.M] if args.M is not None else [2**i for i in range(0, 15)]
+        M_list = [args.M] if args.M is not None else [2**i for i in range(15)]
     shapes = []
     for M in M_list:
         for model_name, config in configs.items():
@@ -158,7 +159,7 @@ def batched_model_benchmark_shapes(args):
     if args.model == "all":
         M_list = [args.M if args.M is not None else 4096]
     else:
-        M_list = [args.M] if args.M is not None else [2**i for i in range(0, 15)]
+        M_list = [args.M] if args.M is not None else [2**i for i in range(15)]
     batch_size = args.B if args.B is not None else 16
     shapes = []
     for M in M_list:
@@ -319,7 +320,7 @@ def parse_vgpr_usage(file_path, table_start="result-table-name"):
     # Print extracted information
     print("\n".join(vgpr_info))
     table = PrettyTable()
-    table.field_names = re.split(r" {1,}", table_lines[0].strip())
+    table.field_names = re.split(r" {2,}", table_lines[0].strip())
     [table.add_row(line.split()[1:]) for line in table_lines[1:]]
 
     print(table)
@@ -356,20 +357,17 @@ def print_vgpr(fun, table_start="result-table-name"):
 
 
 def get_dtype_bytes(dtype):
-    if dtype in [torch.float16, tl.float16]:
+    if dtype in [torch.float16, tl.float16] or dtype in [torch.bfloat16, tl.bfloat16]:
         return 2
-    elif dtype in [torch.bfloat16, tl.bfloat16]:
-        return 2
-    elif dtype in [torch.float32, tl.float32]:
-        return 4
-    elif dtype == torch.int32:
+    elif dtype in [torch.float32, tl.float32] or dtype == torch.int32:
         return 4
     elif dtype == torch.int64:
         return 8
     elif dtype in [
+        torch.float8_e4m3fn,
         torch.float8_e4m3fnuz,
         torch.float8_e5m2fnuz,
-        tl.float8e4,
+        tl.float8e4nv,
         tl.float8e5,
     ]:
         return 1

@@ -1,6 +1,8 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 
 @triton.jit
 def vpopc(x):
@@ -43,14 +45,31 @@ def vpopc(x):
     return y
 
 
-@triton.jit
+_sum_bitmatrix_memset_repr = make_kernel_repr(
+    "_sum_bitmatrix_memset",
+    [
+        "BLOCK",
+    ],
+)
+
+
+@triton.jit(repr=_sum_bitmatrix_memset_repr)
 def _sum_bitmatrix_memset(Ret, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     tl.store(Ret + offs, 0)
 
 
-@triton.jit
+_sum_bitmatrix_rows_repr = make_kernel_repr(
+    "_sum_bitmatrix_rows",
+    [
+        "BLOCK_M",
+        "BLOCK_MM",
+    ],
+)
+
+
+@triton.jit(repr=_sum_bitmatrix_rows_repr)
 def _sum_bitmatrix_rows(
     B,
     shape_bm,

@@ -1,11 +1,27 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 
+import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
+
+FUSED_QKNORM_IDXRQKNORM_SUPPORTS_PACKED_SHUFFLE = True
+FUSED_QKNORM_IDXRQKNORM_SUPPORTS_FP8_INDEX_Q = True
+
+_FP8_E4M3_DTYPES = tuple(
+    dt
+    for dt in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+    )
+    if dt is not None
+)
+
+
+def _is_fp8_e4m3_tensor(t: Tensor | None) -> bool:
+    return t is not None and t.dtype in _FP8_E4M3_DTYPES
 
 
 @compile_ops(
@@ -23,22 +39,23 @@ def _fused_qknorm_idxrqknorm_hip(
     num_kv_heads: int,
     rotary_dim: int,
     eps: float,
-    index_q_norm_weight: Optional[Tensor],
-    index_k_norm_weight: Optional[Tensor],
+    index_q_norm_weight: Tensor | None,
+    index_k_norm_weight: Tensor | None,
     num_index_heads: int,
-    slot_mapping: Optional[Tensor],
-    kv_cache_k: Optional[Tensor],
-    kv_cache_v: Optional[Tensor],
-    index_cache: Optional[Tensor],
+    slot_mapping: Tensor | None,
+    kv_cache_k: Tensor | None,
+    kv_cache_v: Tensor | None,
+    index_cache: Tensor | None,
     block_size: int,
-    q_out: Optional[Tensor],
-    index_q_out: Optional[Tensor],
-    index_slot_mapping: Optional[Tensor],
+    q_out: Tensor | None,
+    index_q_out: Tensor | None,
+    index_slot_mapping: Tensor | None,
     kv_cache_dtype: str = "auto",
     index_cache_dtype: str = "auto",
-    k_scale: Optional[Tensor] = None,
-    v_scale: Optional[Tensor] = None,
+    k_scale: Tensor | None = None,
+    v_scale: Tensor | None = None,
     asm_layout: bool = False,
+    skip_index_branch: bool = False,
 ) -> None:
     pass
 
@@ -53,22 +70,23 @@ def fused_qknorm_idxrqknorm(
     num_kv_heads: int,
     rotary_dim: int,
     eps: float,
-    index_q_norm_weight: Optional[Tensor] = None,
-    index_k_norm_weight: Optional[Tensor] = None,
+    index_q_norm_weight: Tensor | None = None,
+    index_k_norm_weight: Tensor | None = None,
     num_index_heads: int = 0,
-    slot_mapping: Optional[Tensor] = None,
-    kv_cache_k: Optional[Tensor] = None,
-    kv_cache_v: Optional[Tensor] = None,
-    index_cache: Optional[Tensor] = None,
+    slot_mapping: Tensor | None = None,
+    kv_cache_k: Tensor | None = None,
+    kv_cache_v: Tensor | None = None,
+    index_cache: Tensor | None = None,
     block_size: int = 0,
-    q_out: Optional[Tensor] = None,
-    index_q_out: Optional[Tensor] = None,
-    index_slot_mapping: Optional[Tensor] = None,
+    q_out: Tensor | None = None,
+    index_q_out: Tensor | None = None,
+    index_slot_mapping: Tensor | None = None,
     kv_cache_dtype: str = "auto",
-    index_cache_dtype: Optional[str] = None,
-    k_scale: Optional[Tensor] = None,
-    v_scale: Optional[Tensor] = None,
+    index_cache_dtype: str | None = None,
+    k_scale: Tensor | None = None,
+    v_scale: Tensor | None = None,
     asm_layout: bool = False,
+    skip_index_branch: bool = False,
 ) -> None:
     # The main K/V caches are always passed as separate kv_cache_k / kv_cache_v
     # tensors. asm_layout selects the in-cache addressing: page-16 SHUFFLE
@@ -78,7 +96,7 @@ def fused_qknorm_idxrqknorm(
     if index_cache_dtype is None:
         index_cache_dtype = (
             "fp8"
-            if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8")
+            if _is_fp8_e4m3_tensor(index_cache) or _is_fp8_e4m3_tensor(index_q_out)
             else "auto"
         )
 
@@ -87,19 +105,27 @@ def fused_qknorm_idxrqknorm(
         and isinstance(kv_cache_dtype, str)
         and kv_cache_dtype.startswith("fp8")
     )
+    use_per_token_kv_scale = use_fp8_kv_cache and kv_cache_dtype in (
+        "fp8",
+        "fp8_e4m3",
+    )
+    use_static_kv_scale = use_fp8_kv_cache and kv_cache_dtype == "fp8_e4m3_static"
     if use_fp8_kv_cache:
-        if index_slot_mapping is None:
+        if not skip_index_branch and index_slot_mapping is None:
             index_slot_mapping = slot_mapping
-        assert index_q_norm_weight is not None
-        assert index_k_norm_weight is not None
         assert slot_mapping is not None
         assert kv_cache_v is not None
-        assert index_cache is not None
-        assert q_out is not None
-        assert index_q_out is not None
-        assert index_slot_mapping is not None
-        assert k_scale is not None
-        assert v_scale is not None
+        if not skip_index_branch:
+            assert index_q_norm_weight is not None
+            assert index_k_norm_weight is not None
+            assert index_cache is not None
+            assert index_slot_mapping is not None
+        if use_per_token_kv_scale or use_static_kv_scale:
+            assert k_scale is not None
+            assert v_scale is not None
+        else:
+            assert k_scale is None
+            assert v_scale is None
 
     _fused_qknorm_idxrqknorm_hip(
         qkv,
@@ -127,4 +153,5 @@ def fused_qknorm_idxrqknorm(
         k_scale,
         v_scale,
         asm_layout,
+        skip_index_branch,
     )

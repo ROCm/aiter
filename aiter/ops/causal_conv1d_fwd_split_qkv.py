@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
+from .prefill_batch_metadata import CausalConvPrefillMetadata
 
 MD_NAME = "module_causal_conv1d_fwd_split_qkv"
 
@@ -59,7 +59,7 @@ def _pick_tile(avg_seqlen: float) -> int:
 
 def _build_chunk_metadata(
     query_start_loc: Tensor, block_m: int
-) -> Tuple[int, Tensor, Tensor]:
+) -> tuple[int, Tensor, Tensor]:
     """Build (num_programs, batch_ptr, token_chunk_offset_ptr).
 
     The HIP kernel decodes ``grid.x`` (a flattened ``(sequence, chunk)``
@@ -90,18 +90,18 @@ def _build_chunk_metadata(
 def causal_conv1d_split_qkv_hip_fn(
     x: Tensor,
     weight: Tensor,
-    bias: Optional[Tensor],
+    bias: Tensor | None,
     conv_states: Tensor,
     query_start_loc: Tensor,
     k_dim: int,
     v_dim: int,
-    cache_indices: Optional[Tensor] = None,
-    has_initial_state: Optional[Tensor] = None,
-    activation: Optional[str] = "silu",
+    cache_indices: Tensor | None = None,
+    has_initial_state: Tensor | None = None,
+    activation: str | None = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
-    block_m: Optional[int] = None,
+    block_m: int | None = None,
     metadata=None,
-) -> Tuple[Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor]:
     """Prefill causal-conv1d (HIP) with fused split q/k/v output.
 
     Drop-in replacement for the Triton ``causal_conv1d_split_qkv_triton_fn``.
@@ -115,7 +115,7 @@ def causal_conv1d_split_qkv_hip_fn(
     if conv_states.dtype != torch.bfloat16:
         raise TypeError("HIP causal_conv1d kernel requires bfloat16 `conv_states`.")
 
-    dim, _cu_seqlen = x.shape
+    _dim, _cu_seqlen = x.shape
     _, width = weight.shape
     if width != 4:
         raise ValueError(f"HIP causal_conv1d kernel requires width=4, got {width}.")
@@ -139,8 +139,24 @@ def causal_conv1d_split_qkv_hip_fn(
     else:
         has_initial_state = has_initial_state.to(torch.uint8)
 
-    nums_dict = getattr(metadata, "nums_dict", None) if metadata is not None else None
-    if nums_dict is not None and bm in nums_dict:
+    if isinstance(metadata, CausalConvPrefillMetadata):
+        metadata.validate(
+            query_start_loc,
+            total_tokens=_cu_seqlen,
+            num_sequences=n_seqs,
+        )
+        grid = metadata.get_chunk_grid(bm)
+        tot = grid.total_chunks
+        batch_ptr = grid.sequence_ids
+        token_chunk_offset_ptr = grid.chunk_ids
+        nums_dict = None
+    else:
+        nums_dict = (
+            getattr(metadata, "nums_dict", None) if metadata is not None else None
+        )
+    if not isinstance(metadata, CausalConvPrefillMetadata) and (
+        nums_dict is not None and bm in nums_dict
+    ):
         # Reuse the precomputed schedule for the selected tile.
         entry = nums_dict[bm]
         tot = int(entry["tot"])
@@ -149,7 +165,7 @@ def causal_conv1d_split_qkv_hip_fn(
         if batch_ptr.device != x.device:
             batch_ptr = batch_ptr.to(x.device)
             token_chunk_offset_ptr = token_chunk_offset_ptr.to(x.device)
-    else:
+    elif not isinstance(metadata, CausalConvPrefillMetadata):
         # Build the chosen tile's schedule once. When structured metadata is
         # present, memoize it back into the shared ``nums_dict`` so later calls
         # in the same step can reuse it instead of rebuilding.

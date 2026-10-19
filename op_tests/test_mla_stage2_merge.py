@@ -29,15 +29,16 @@ Two candidates:
 import argparse
 import itertools
 
-import aiter
 import pandas as pd
 import torch
 import triton
 import triton.language as tl
+
+import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.mla import _fwd_kernel_stage2_asm
 from aiter.test_common import benchmark, checkAllclose, run_perftest
-from aiter.jit.utils.chip_info import get_gfx
 
 torch.set_default_device("cuda")
 torch.manual_seed(0)
@@ -57,7 +58,7 @@ MGC = 16
 def _stage2_merge_vec(
     Mid_O,  # [T, N, H, Lv] fp32
     Mid_lse,  # [T, N, H, 1] fp32
-    O,  # noqa: E741  [T, H, Lv]
+    O,
     qo_indptr,
     kv_indptr,
     kv_last_page_lens,

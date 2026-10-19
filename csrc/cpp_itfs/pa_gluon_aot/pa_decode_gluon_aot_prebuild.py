@@ -1,14 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import sys
 import argparse
-import random
-from typing import Optional, Tuple, Union, Dict
-import subprocess
-import multiprocessing
 import concurrent.futures
-from multiprocessing import cpu_count
+import multiprocessing
+import random
+import subprocess
+import sys
 
 import pandas as pd
 import torch
@@ -18,12 +16,17 @@ import triton.language as tl
 import aiter
 from aiter import dtypes
 from aiter.test_common import benchmark
-from csrc.cpp_itfs.utils import (
-    BUILD_DIR,
-    get_default_func_name,
+from aiter_worker_limits import (
+    adopt_legacy_max_jobs,
+    configure_worker_subprocesses,
+    get_gpu_worker_count,
 )
 from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import (
     pa_decode_gluon_aot,
+)
+from csrc.cpp_itfs.utils import (
+    BUILD_DIR,
+    get_default_func_name,
 )
 
 MD_NAME = "pa_decode_attention_reduce_kernel"
@@ -85,8 +88,8 @@ def run_gluon_kernel(
     exp_sums: torch.Tensor,
     max_logits: torch.Tensor,
     temporary_output: torch.Tensor,
-    alibi_slopes: Optional[torch.Tensor] = None,
-    sinks: Optional[torch.Tensor] = None,
+    alibi_slopes: torch.Tensor | None = None,
+    sinks: torch.Tensor | None = None,
     use_aot_impl: bool = False,
 ) -> None:
     """Run Gluon FP8/BF16/FP16 kernel for paged attention.
@@ -147,7 +150,7 @@ def run_gluon_kernel(
 def run_pa_gluon_test(
     context_length: int,
     batch_size: int,
-    num_heads: Tuple[int, int],
+    num_heads: tuple[int, int],
     head_size: int,
     block_size: int,
     compute_type: torch.dtype,
@@ -159,13 +162,13 @@ def run_pa_gluon_test(
     use_aot_impl: bool,
     quant_q: bool,
     quant_kv: bool,
-) -> Dict[str, Union[float, str]]:
+) -> dict[str, float | str]:
     """Test paged attention decode with gluon implementations."""
     results = {}
     data_type = compute_type
     if compute_type == aiter.dtypes.fp8:
         data_type = torch.bfloat16
-    device = "cuda:0"
+    device = f"cuda:{torch.cuda.current_device()}"
     torch.set_default_device(device)
     num_query_heads, num_kv_heads = num_heads
     assert (
@@ -490,13 +493,6 @@ def create_argument_parser() -> argparse.ArgumentParser:
         default=None,
         help="Sequence partition size",
     )
-    parser.add_argument(
-        "--num_processes",
-        type=int,
-        default=32,
-        help="Number of parallel processes to use (default: use 1 CPU cores)",
-    )
-
     return parser
 
 
@@ -583,6 +579,15 @@ def process_arguments(args: argparse.Namespace) -> tuple:
     )
 
 
+def _init_gpu_worker(device_counter, device_count):
+    """Pin each spawned worker to one device and bound nested compilation."""
+    configure_worker_subprocesses()
+    with device_counter.get_lock():
+        device = device_counter.value % device_count
+        device_counter.value += 1
+    torch.cuda.set_device(device)
+
+
 def _run_single_test(args):
     """
     Helper function to run a single test case.
@@ -646,20 +651,21 @@ def run_multi_pa_gluon_test(
     use_torch_flash_ref_options,
     use_aot_impl_options,
     context_partition_size_options,
-    num_processes=None,
-    sinks_options=[False],
-    sliding_window_options=[0],
+    sinks_options=None,
+    sliding_window_options=None,
 ) -> pd.DataFrame:
-    """
-    Run all tests using multiprocessing for parallel execution.
+    """Run all tests using bounded multiprocessing parallelism.
 
-    Args:
-        num_processes: Number of parallel processes to use.
-                      If None, uses cpu_count().
-
-    Returns:
-        DataFrame containing all test results
+    Workers are assigned round-robin to visible GPUs, with at most
+    ``AITER_GPU_WORKERS_PER_DEVICE`` workers per device (default 8).
+    ``AITER_MAX_JOBS`` and submitted work additionally cap the pool; host
+    CPU/memory budgets apply only to nested compilation. Standalone execution
+    adopts a positive legacy ``MAX_JOBS`` when ``AITER_MAX_JOBS`` is unset.
     """
+    if sliding_window_options is None:
+        sliding_window_options = [0]
+    if sinks_options is None:
+        sinks_options = [False]
     cdna_version = 3
     # Generate all test configurations
     test_configs = []
@@ -813,22 +819,26 @@ def run_multi_pa_gluon_test(
     total = len(test_configs)
     print(f"Total test cases after deduplication: {total}")
     print(f"Removed {total_before_dedup - total} duplicate configurations")
+    if total == 0:
+        return pd.DataFrame()
 
     # Prepare arguments for multiprocessing
     test_args = [(config, idx + 1, total) for idx, config in enumerate(test_configs)]
 
-    # Determine number of processes
-    if num_processes is None:
-        num_processes = min(cpu_count(), total)
-    else:
-        num_processes = min(cpu_count(), num_processes)
-        num_processes = min(total, num_processes)
-    print(f"Using {num_processes} parallel processes\n")
+    # These tasks execute kernels on the GPU, so bound the pool by visible
+    # devices instead of the host CPU/memory compilation budget.
+    device_count = torch.cuda.device_count()
+    worker_count = get_gpu_worker_count(total, device_count)
+    print(f"Using {worker_count} parallel processes\n")
 
     # Run tests in parallel using spawn context to avoid CUDA reinitialization issues
     mp_context = multiprocessing.get_context("spawn")
+    device_counter = mp_context.Value("i", 0)
     with concurrent.futures.ProcessPoolExecutor(
-        max_workers=num_processes, mp_context=mp_context
+        max_workers=worker_count,
+        mp_context=mp_context,
+        initializer=_init_gpu_worker,
+        initargs=(device_counter, device_count),
     ) as executor:
         results = list(executor.map(_run_single_test, test_args))
 
@@ -877,7 +887,6 @@ def parse_arg_and_run_test():
         use_torch_flash_ref_options,
         use_aot_impl_options,
         context_partition_size_options,
-        num_processes=args.num_processes,
         sinks_options=sinks_options,
         sliding_window_options=sliding_window_options,
     )
@@ -888,14 +897,18 @@ def get_so_files_size_and_count():
     """Get the total size and number of so files in aiter build directory."""
     try:
         du_result = subprocess.run(
-            ["du", "-sh", BUILD_DIR], capture_output=True, text=True, timeout=100
+            ["du", "-sh", BUILD_DIR],
+            capture_output=True,
+            text=True,
+            timeout=100,
+            check=False,
         )
         if du_result.returncode == 0:
             total_size_of_so_files = du_result.stdout.split()[0]
             print(
                 f"The total size of so files in aiter build directory: {total_size_of_so_files}"
             )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(
             f"Warning: Could not get the total size of so files in aiter build directory: {e}"
         )
@@ -906,13 +919,14 @@ def get_so_files_size_and_count():
             capture_output=True,
             text=True,
             timeout=100,
+            check=False,
         )
         if so_count_result.returncode == 0:
             number_of_so_files = so_count_result.stdout.strip()
             print(
                 f"The number of so files in aiter build directory: {number_of_so_files}"
             )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(
             f"Warning: Could not get the number of so files in aiter build directory: {e}"
         )
@@ -925,12 +939,10 @@ def prebuild_normal_accuracy_cases_aot_so():
     global BATCH_SIZE_OPTIONS
     global HEAD_CONFIGURATIONS
     global CONTEXT_LENGTH_OPTIONS
-    global COMPUTE_TYPE_OPTIONS
     global QUANT_MODE_OPTIONS
     global HEAD_DIMENSION_OPTIONS
     global TRANS_V_OPTIONS
     global KV_VARLEN_OPTIONS
-    global QUANT_Q_AND_KV_OPTIONS
     global USE_TORCH_FLASH_REF_OPTIONS
     global USE_AOT_IMPL_OPTIONS
     global CONTEXT_PARTITION_SIZE_OPTIONS
@@ -973,12 +985,10 @@ def prebuild_normal_performance_cases_aot_so():
     global BATCH_SIZE_OPTIONS
     global HEAD_CONFIGURATIONS
     global CONTEXT_LENGTH_OPTIONS
-    global COMPUTE_TYPE_OPTIONS
     global QUANT_MODE_OPTIONS
     global HEAD_DIMENSION_OPTIONS
     global TRANS_V_OPTIONS
     global KV_VARLEN_OPTIONS
-    global QUANT_Q_AND_KV_OPTIONS
     global USE_TORCH_FLASH_REF_OPTIONS
     global USE_AOT_IMPL_OPTIONS
     global CONTEXT_PARTITION_SIZE_OPTIONS
@@ -1006,6 +1016,7 @@ def prebuild_normal_performance_cases_aot_so():
 
 
 if __name__ == "__main__":
+    adopt_legacy_max_jobs()
     prebuild_normal_accuracy_cases_aot_so()
     prebuild_normal_performance_cases_aot_so()
     get_so_files_size_and_count()

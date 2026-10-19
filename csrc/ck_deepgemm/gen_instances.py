@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+import argparse
 import os
+import shutil
 import sys
 from pathlib import Path
+
 import pandas as pd
-import argparse
-import shutil
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = (
@@ -16,12 +17,11 @@ AITER_CORE_DIR = (
     else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
 )
 sys.path.insert(0, AITER_CORE_DIR)
-from chip_info import build_tune_dict, write_lookup_header  # noqa: E402
-
-from deepgemm_common import (  # noqa: E402
+from chip_info import build_tune_dict, write_lookup_header
+from deepgemm_common import (
+    default_kernels_dict,
     kernelInstance,
     kernels_list,
-    default_kernels_dict,
 )
 
 
@@ -222,8 +222,10 @@ torch::Tensor
 
         with open(os.path.join(self.working_path, "deepgemm_manifest.h"), "w") as f:
             f.write(MAINFEST_head)
-            for mnk, k in kernels_dict.items():
-                f.write(MAINFEST_template.format(kernel_name=k.name))
+            f.writelines(
+                MAINFEST_template.format(kernel_name=k.name)
+                for mnk, k in kernels_dict.items()
+            )
             f.write(MAINFEST_end)
 
     def gen_instances(self, kernels_dict):
@@ -234,7 +236,7 @@ torch::Tensor
             shutil.rmtree(self.instances_path)
         os.mkdir(self.instances_path)
 
-        for mnk, k in kernels_dict.items():
+        for k in kernels_dict.values():
             self.gen_instance(k)
 
         self.gen_lookup_dict(kernels_dict)

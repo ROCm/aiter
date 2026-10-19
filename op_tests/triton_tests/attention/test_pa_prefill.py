@@ -3,8 +3,10 @@
 
 import math
 import random
+
 import pytest
 import torch
+
 from aiter.ops.triton.attention.pa_prefill import context_attention_fwd
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 
@@ -14,6 +16,16 @@ HEAD_SIZES = [128]
 DTYPES = [torch.float16]
 SLIDING_WINDOW = [128, 2048]
 KV_CACHE_DTYPES = ["auto", "fp8e4m3"]
+
+
+@pytest.fixture(autouse=True)
+def restore_torch_devices():
+    default_device = torch.get_default_device()
+    cuda_device = torch.cuda.current_device() if torch.cuda.is_available() else None
+    yield
+    torch.set_default_device(default_device)
+    if cuda_device is not None:
+        torch.cuda.set_device(cuda_device)
 
 
 def context_attention_fwd_torch(
@@ -136,10 +148,9 @@ def context_attention_fwd_torch(
             # Output
             acc_total = acc + acc_self
             output[q_start:q_end, h] = acc_total.to(output.dtype)
-    return
 
 
-def _get_alibi_slopes(total_num_heads: int, device: torch.tensor) -> torch.Tensor:
+def _get_alibi_slopes(total_num_heads: int, device: torch.Tensor) -> torch.Tensor:
     closest_power_of_2 = 2 ** math.floor(math.log2(total_num_heads))
     base = torch.tensor(
         2 ** (-(2 ** -(math.log2(closest_power_of_2) - 3))),

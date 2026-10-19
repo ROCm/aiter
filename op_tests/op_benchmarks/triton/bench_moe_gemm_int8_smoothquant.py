@@ -1,24 +1,26 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/bench/bench_mlp.py
 
-from itertools import chain
-from pathlib import Path
-import triton.profiler as proton
-import torch
 import argparse
 import csv
+import inspect
+import tempfile
+from itertools import chain
+from pathlib import Path
+
+import torch
+import triton.profiler as proton
+
+from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_int8_smoothquant import (
     moe_gemm_int8_smoothquant,
     preshuffle_weights,
 )
-from aiter.ops.triton.moe.quant_moe import (
-    smoothquant_quantize,
-    quantize_weights_int8,
-)
 from aiter.ops.triton.moe.moe_routing.routing import routing
-from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
-import tempfile
-import inspect
+from aiter.ops.triton.moe.quant_moe import (
+    quantize_weights_int8,
+    smoothquant_quantize,
+)
 
 
 def parse_profile(profile_path, useful_op_regex, reps):
@@ -188,7 +190,7 @@ def bench_mlp_single_weight_init(
             out_dtype=torch.float32,
             apply_activation=True,
             limit=None,
-            add_residual=False,
+            swiglu_add_residual=False,
         )
         x, x_scale = smoothquant_quantize(x, fc2_smooth_scale)
         x = moe_gemm_int8_smoothquant(
@@ -203,7 +205,7 @@ def bench_mlp_single_weight_init(
             preshuffled=preshuffled,
             out_dtype=torch.bfloat16,
             apply_activation=False,
-            add_residual=False,
+            swiglu_add_residual=False,
         )
 
     proton.finalize()

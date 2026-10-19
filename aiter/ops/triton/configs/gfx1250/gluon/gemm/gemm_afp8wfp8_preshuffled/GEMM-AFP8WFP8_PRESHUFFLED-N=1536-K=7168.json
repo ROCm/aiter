@@ -1,0 +1,50 @@
+{
+    "M_LEQ_16": {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 256,
+        "CTAS_M": 1,
+        "CTAS_N": 1,
+        "GROUP_SIZE_M": 1,
+        "NUM_KSPLIT": 7,
+        "num_warps": 4,
+        "waves_per_eu": 1,
+        "NUM_BUFFERS": 4,
+        "cache_modifier": ".ca",
+        "LOOP_UNROLL_FACTOR": 1,
+        "B_SCALE_TDM": true,
+        "kernel_type": "bandwidth_bound"
+    },
+    "M_LEQ_64": {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 256,
+        "CTAS_M": 1,
+        "CTAS_N": 1,
+        "GROUP_SIZE_M": 1,
+        "NUM_KSPLIT": 8,
+        "num_warps": 4,
+        "waves_per_eu": 1,
+        "NUM_BUFFERS": 4,
+        "cache_modifier": ".ca",
+        "LOOP_UNROLL_FACTOR": 1,
+        "B_SCALE_TDM": true,
+        "kernel_type": "bandwidth_bound"
+    },
+    "any": {
+        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 128,
+        "CTAS_M": 1,
+        "CTAS_N": 2,
+        "GROUP_SIZE_M": 1,
+        "NUM_KSPLIT": 1,
+        "num_warps": 4,
+        "waves_per_eu": 0,
+        "NUM_BUFFERS": 4,
+        "cache_modifier": null,
+        "LOOP_UNROLL_FACTOR": 4,
+        "B_SCALE_TDM": true,
+        "kernel_type": "bandwidth_bound"
+    }
+}

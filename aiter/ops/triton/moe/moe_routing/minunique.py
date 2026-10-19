@@ -1,14 +1,14 @@
 import torch
 import triton
 
-from aiter.ops.triton.moe.moe_routing.topk import topk
 from aiter.ops.triton._triton_kernels.moe.moe_routing.minunique import _keepk_sort0
 from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import _combined_routing
 from aiter.ops.triton.moe.moe_routing.routing import (
-    _compute_expt_data_internal,
-    RoutingData,
     ExptData,
+    RoutingData,
+    _compute_expt_data_internal,
 )
+from aiter.ops.triton.moe.moe_routing.topk import topk
 from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 
 
@@ -135,7 +135,9 @@ def _minunique_common(
         num_warps=1,
     )
     expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
-    routing_data = RoutingData(block_m, gate_scal, hist, n_expts_tot, k, expt_data)
+    routing_data = RoutingData(
+        block_m, gate_scal, hist, n_expts_tot, k, expt_data, topk_ids=expt_indx2
+    )
     return routing_data, topk_indx, gate_indx
 
 

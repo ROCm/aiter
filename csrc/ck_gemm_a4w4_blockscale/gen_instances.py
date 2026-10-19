@@ -2,8 +2,8 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
 import os
-import sys
 import shutil
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -17,17 +17,16 @@ AITER_CORE_DIR = (
     else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
 )
 sys.path.insert(0, AITER_CORE_DIR)
-from chip_info import (  # noqa: E402
+from chip_info import (
     build_tune_dict,
     write_lookup_header,
     write_name_keyed_lookup_header,
 )
-
-from gemm_a4w4_blockscale_common import (  # noqa: E402
+from gemm_a4w4_blockscale_common import (
     default_kernels_dict,
     kernelInstance,
-    kernels_list,
     kernels_by_name,
+    kernels_list,
 )
 
 """
@@ -51,20 +50,21 @@ class gemm_a4w4_blockscale_codegen:
 #include "gemm_a4w4_blockscale_common.cuh"
 
 template <typename CDataType>
-torch::Tensor
+aiter_tensor_t&
 {k.name}(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &x_scale,
-    torch::Tensor &w_scale,
-    torch::Tensor &Y,
-    int splitK
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale,
+    aiter_tensor_t &Y,
+    int splitK,
+    hipStream_t stream
     )
 {{{{
     // The smallest kernel we have available. Works well for memory bound shapes.
 
     // Check if this input needs to be padded.
-    int M = size_to_dim_(XQ.dim() - 1, XQ.sizes());
+    int M = XQ.size(0); // 2D: [M, K/2]
     int N = WQ.size(0);
     int K = WQ.size(1);
     // TODO - padding
@@ -81,17 +81,17 @@ torch::Tensor
             {k.AK1}, {k.BK1},
             {k.MPerXDL}, {k.NPerXDL},
             {k.WAVE_MAP_M}, {k.WAVE_MAP_N},
-            S<{(", ").join(map(lambda x:str(x),k.ABLOCK_TRANSFER))}>,
-            S<{(", ").join(map(lambda x:str(x),k.BBLOCK_TRANSFER))}>,
+            S<{(", ").join(str(x) for x in k.ABLOCK_TRANSFER)}>,
+            S<{(", ").join(str(x) for x in k.BBLOCK_TRANSFER)}>,
             {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
             {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
-            S<{(", ").join(map(lambda x:str(x),k.CBLOCK_TRANSFER))}>,
+            S<{(", ").join(str(x) for x in k.CBLOCK_TRANSFER)}>,
             {k.CBLOCK_SPV},
             ck::BlockGemmPipelineScheduler::{k.PIPELINE_Sched},
             ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
             ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
         // Run kernel instance.
-        return gemm_a4w4_blockscale_impl<CDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, splitK);
+        return gemm_a4w4_blockscale_impl<CDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, splitK, stream);
 """
         if self.istune:
             INSTANCE_IMPL_str = INSTANCE_IMPL.format(
@@ -121,14 +121,15 @@ torch::Tensor
 
 #include "impl/{name}.cuh"
 
-template torch::Tensor
+template aiter_tensor_t&
 {name}<{dtypes}>(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &x_scale,
-    torch::Tensor &w_scale,
-    torch::Tensor &Y,
-    int splitK
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale,
+    aiter_tensor_t &Y,
+    int splitK,
+    hipStream_t stream
     );
 
 """
@@ -222,19 +223,20 @@ template torch::Tensor
 #ifdef USE_ROCM
 
 #include <cstdlib>
-
-#include <torch/extension.h>
+#include <hip/hip_runtime.h>
+#include "aiter_tensor.h"
 """
         MAINFEST_template = """
 template <typename CDataType>
-torch::Tensor
+aiter_tensor_t&
 {kernel_name}(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &x_scale,
-    torch::Tensor &w_scale,
-    torch::Tensor &Y,
-    int splitK);
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale,
+    aiter_tensor_t &Y,
+    int splitK,
+    hipStream_t stream);
 """
         MAINFEST_end = """
 
@@ -245,8 +247,10 @@ torch::Tensor
             os.path.join(self.working_path, "gemm_a4w4_blockscale_manifest.h"), "w"
         ) as f:
             f.write(MAINFEST_head)
-            for mnk, k in kernels_dict.items():
-                f.write(MAINFEST_template.format(kernel_name=k.name))
+            f.writelines(
+                MAINFEST_template.format(kernel_name=k.name)
+                for mnk, k in kernels_dict.items()
+            )
             f.write(MAINFEST_end)
 
     def gen_instances(self, kernels_dict):
@@ -257,7 +261,7 @@ torch::Tensor
             shutil.rmtree(self.instances_path)
         os.mkdir(self.instances_path)
 
-        for mnk, k in kernels_dict.items():
+        for k in kernels_dict.values():
             self.gen_instance(k)
 
         self.gen_lookup_dict(kernels_dict)
