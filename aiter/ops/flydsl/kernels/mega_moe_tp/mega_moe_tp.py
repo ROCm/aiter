@@ -247,7 +247,7 @@ class MegaMoeTPLDSError(ValueError):
     """max_local_tokens does not fit in LDS (retry with a smaller one)."""
 
 
-# the tuned launch-config fields of a batch (configs/mega_moe_tp_tuned.csv, see tuned.py)
+# the tuned launch-config fields of a batch (configs/mega_moe_tp_tuned.csv)
 _TUNED_FIELDS = ("mt", "npp", "q", "pf", "lp", "ll", "llr")
 
 
@@ -539,10 +539,10 @@ class MegaMoeTPEngine:
 
     def _tuned(self, lb: bool, tot: int) -> dict:
         """The tuned fields of the nearest tuned batch (same schedule, <= tot, inside the
-        tuned range: tuned.nearest), else {} (the defaults)."""
+        tuned range: common.nearest), else {} (the defaults)."""
         from aiter.jit.core import AITER_CONFIGS
 
-        from .tuned import device_key, nearest, tuned_rows
+        from .common import device_key, nearest, tuned_rows
 
         key = {
             **device_key(self.device),

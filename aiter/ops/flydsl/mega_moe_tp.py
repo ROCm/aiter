@@ -32,7 +32,7 @@ Contract:
 
 Large batches (Swiglu or Silu, fp4, from ``bigm_min_tokens`` global tokens; default: the
 batches the small-batch engine cannot hold, e.g. beyond 2048 local tokens on 256 CUs; 0
-disables) run the big-M kernel (bigm_layer: chunked, SDMA, per-batch tuned configs from
+disables) run the big-M kernel (bigm_compute: chunked, SDMA, per-batch tuned configs from
 configs/mega_moe_tp_bigm_tuned.csv) behind the same ``forward``; it needs MORI built with
 SDMA (importable, or its install directory in ``AITER_MORI_PATH``). ``max_local_tokens`` must
 then cover the largest batch (e.g. 8192 for 32768 tokens on tp4); the small-batch engine
@@ -170,7 +170,7 @@ class MegaMoeTP:
             and cfg.topk - 1 <= 64
             and cfg.inter_dim % 128 == 0
         )
-        from .kernels.mega_moe_tp.bigm_layer import PAD
+        from .kernels.mega_moe_tp.bigm_compute import PAD
 
         # local tokens from which forward runs the big-M kernel (0: never; set below for
         # the default threshold, from the small engine's capacity)
@@ -293,7 +293,7 @@ class MegaMoeTP:
             xs = torch.cat([xs, x.new_zeros((m - n, H))])
             tw = torch.cat([tw, tw.new_zeros((m - n, tw.shape[1]))])
             ids = torch.cat([ids, ids.new_full((m - n, ids.shape[1]), -1)])
-        from .kernels.mega_moe_tp.bigm_layer import _kcopy
+        from .kernels.mega_moe_tp.bigm_compute import _kcopy
 
         ya = self.bigm().moe(
             xs.contiguous(), tw.contiguous(), ids.contiguous(), gather=True
@@ -326,7 +326,7 @@ class MegaMoeTP:
         prepare() creates it (and compiles its kernels) when big batches are reachable.
         """
         if self._bigm is None:
-            from .kernels.mega_moe_tp.bigm_layer import PAD, MegaMoeTPBigM
+            from .kernels.mega_moe_tp.bigm_compute import PAD, MegaMoeTPBigM
 
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
@@ -459,7 +459,7 @@ class MegaMoeTP:
         ((AITER_BIGM_* option, value), ...)); None: the small engine runs it."""
         if not self._big(local_tokens):
             return None
-        from .kernels.mega_moe_tp.bigm_layer import PAD
+        from .kernels.mega_moe_tp.bigm_compute import PAD
 
         m = -(-local_tokens // PAD) * PAD
         return self.bigm()._plan(m * self.cfg.world_size)

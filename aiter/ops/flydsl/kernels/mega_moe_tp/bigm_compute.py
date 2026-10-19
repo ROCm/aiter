@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Host side of the big-M path of MegaMoeTP.forward (the kernel: bigm_kernel.py, its layout
-constants: bigm_config.py): MegaMoeTPBigM (the SDMA window, buffers, per-batch plans,
+"""Host side of the big-M path of MegaMoeTP.forward (the kernel: compile_bigm_layer in
+mega_moe_tp_kernel.py): MegaMoeTPBigM (the SDMA window, buffers, per-batch plans,
 launches), the disk cache of the compiled kernels, the bf16 row gather of the fused tail.
 """
 
@@ -20,14 +20,17 @@ import time
 import torch
 import torch.distributed as dist
 
+from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_gfx
 
 from ....communication import SdmaComm, compile_signal_read, sdma_bitcode
 from ..tensor_shim import _preload_compiled, _run_compiled
-from .bigm_config import (
+from .common import device_key, nearest, tuned_rows
+from .gemm import bigm_lds
+from .mega_moe_tp_config import (
+    BIGM_CTRL_INTS,
     C_ERR,
     CMAX,
-    CTRL_INTS,
     NQ,
     PAD,
     UNIT_ROWS,
@@ -35,9 +38,7 @@ from .bigm_config import (
     i8_row_bytes,
     unit_cap,
 )
-from .bigm_gemm import bigm_lds
-from .bigm_kernel import compile_bigm_layer
-from .tuned import bigm_tuned
+from .mega_moe_tp_kernel import compile_bigm_layer
 
 _log = logging.getLogger("aiter")
 
@@ -49,17 +50,17 @@ __all__ = ["PAD", "MegaMoeTPBigM", "compile_bigm_layer"]
 # out of its disk cache -- its key does not cover the bitcode -- so every process would compile
 # every big-M variant again (~86 s each, all ranks waiting). The artifact itself pickles fine
 # (no post-load processors), so this keeps it on disk keyed by the compile arguments plus the
-# digest of everything else it is built from: the kernel's sources (bigm_kernel.py and the
-# modules it imports from aiter.ops.flydsl.kernels), the SDMA bitcode, the FlyDSL compiler (its own cache
+# digest of everything else it is built from: the kernel's sources (mega_moe_tp_kernel.py and
+# the modules it imports from aiter.ops.flydsl.kernels), the SDMA bitcode, the FlyDSL compiler (its own cache
 # key) and the GPU arch.
 _DIGEST = None
 
 
 def _kernel_sources():
-    """bigm_kernel.py and every module of aiter.ops.flydsl.kernels it imports, transitively
+    """mega_moe_tp_kernel.py and every module of aiter.ops.flydsl.kernels it imports, transitively
     (relative imports, wherever in the file; MORI's bitcode is hashed itself)"""
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # .../kernels
-    todo = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "bigm_kernel.py")]
+    todo = [os.path.join(root, "mega_moe_tp", "mega_moe_tp_kernel.py")]
     seen = set()
     while todo:
         f = todo.pop()
@@ -290,7 +291,7 @@ class MegaMoeTPBigM:
     scratch buffers and the launch.
     moe(x [m, H], topk_weights / topk_ids [m, K1], out, tail) (MegaMoeTP.forward, ag_rs)
     -> y [m, H], with tail = (res_in, res_out, norm_w) (y, q [T, H] fp8, scales [T]).
-    Per batch the chunk plan and options come from the tuned csv (bigm_tuned), else defaults.
+    Per batch the chunk plan and options come from the tuned csv, else defaults.
     """
 
     REGIONS = ("xq", "xs", "ids", "tw", "eq", "erecv", "q", "qs")
@@ -383,7 +384,7 @@ class MegaMoeTPBigM:
             -(-self.NE // 8) + UQ + 2
         )
         self.utab = torch.zeros(8 * self.uslots * 4, dtype=torch.int32, device=dev)
-        self.ctrl = torch.zeros(CTRL_INTS + 32, dtype=torch.int32, device=dev)
+        self.ctrl = torch.zeros(BIGM_CTRL_INTS + 32, dtype=torch.int32, device=dev)
         self.chunks_t = {}
         # moe()'s padding buffers (m not a multiple of PAD), the largest padded size
         mpx = T // tp
@@ -544,18 +545,20 @@ class MegaMoeTPBigM:
         p = self._plans.get(T)
         if p is None:
             o = dict(self.opts)
-            tu = bigm_tuned(
-                model_dim=self.H,
-                inter_dim=self.I,
-                experts=self.NE,
-                topk=self.K1,
-                tp=self.tp,
-                tokens=T,
-                device=self.device,
-            )
+            key = {
+                **device_key(self.device),
+                "model_dim": self.H,
+                "inter_dim": self.I,
+                "experts": self.NE,
+                "topk": self.K1,
+                "tp": self.tp,
+            }
+            path = AITER_CONFIGS.AITER_CONFIG_MEGA_MOE_TP_BIGM_FILE
+            tu = nearest(tuned_rows(path, key, "tokens"), T, clamp=True)
             if tu is not None:
-                w = tu["chunks"]
-                o = {**tu["opts"], **o}
+                w = [int(x) for x in tu["chunks"].split(",")]
+                opts = (kv.split("=", 1) for kv in tu.get("opts", "").split(";") if kv)
+                o = {**dict(opts), **o}
             else:
                 w = [1, 1] if T <= 16384 else [1, 2, 2, 1]
             self._check_geom(o)
@@ -786,7 +789,7 @@ class MegaMoeTPBigM:
         tq = 3 if gather else 0 if tail is None else 2 if local else 1
         launch = self._io_launch(m, tq)
         chunks = self._chunks(T)  # (first: it may grow the unit table)
-        self.ctrl[:CTRL_INTS].zero_()
+        self.ctrl[:BIGM_CTRL_INTS].zero_()
         self._run(
             launch,
             (
