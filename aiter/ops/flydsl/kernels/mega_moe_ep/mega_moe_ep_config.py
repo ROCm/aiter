@@ -216,10 +216,11 @@ def mega_moe_ep_consts(
     # the pool uses the GEMM2 cshuffle (RG*TILE_N*4), which also fits GEMM1's.
     a_k_step = TILE_K if a8 else TILE_K // 2
     a_lds_size = RG * a_k_step
-    # The A pool is the NAB-bank A-ring (TP-style prefetch); it must also fit the cshuffle
-    # C-tile that currently aliases it (RG*TILE_N f32).  The dedicated-loader milestone
-    # moves the C-tile to its own region so the ring can run ahead of the epilogue.
-    lds_pool = max(NAB * a_lds_size, RG * TILE_N * 4)
+    # The A pool is JUST the NAB-bank A-ring now (the cshuffle C-tile moved to its own
+    # L_C region for both GEMM1 and GEMM2, so L_A no longer needs RG*TILE_N f32 -- that
+    # aliasing was the pre-loader design).  Sizing it to the ring alone reclaims the
+    # (RG*TILE_N*4 - NAB*a_lds_size) bytes (~32 KB at MT4) for headroom.
+    lds_pool = NAB * a_lds_size
     c = {
         "RG": RG,
         "A_ROW": a_row,
@@ -252,7 +253,7 @@ def mega_moe_ep_consts(
     # full RG x inter tile would blow the 160 KB budget for FP8. The cshuffle epilogue
     # aliases the A pool (compile_gemm1 pattern); GEMM2 reads the intermediate from
     # global. TODO(tune): keep it per-inter-piece in LDS to drop the global round-trip.
-    c["L_A"] = take(lds_pool)  # A NAB-bank ring (GEMM1 loader) | GEMM2 A + cshuffle alias
+    c["L_A"] = take(lds_pool)  # A NAB-bank ring (GEMM1 + GEMM2 loader); cshuffle is in L_C
     c["L_AS"] = take(RG * a_scale)  # A-scale (E8M0) of one row tile (compute-side stage)
     # GEMM1's cshuffle C-tile gets its OWN region: the A-loader runs ahead into the L_A
     # ring during the epilogue, so the C-tile can no longer alias L_A (it still aliases
