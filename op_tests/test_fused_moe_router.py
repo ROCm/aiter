@@ -806,7 +806,7 @@ def test_fp16_out_dtype_unsupported():
     )
 
 
-# fused_moe_router hands fused_moe_2stages both _metadata and a1_prequant, so
+# fused_moe_router hands fused_moe_2stages both _metadata and prequantized_a1, so
 # main's own A-preparation is skipped; configs that need anything other than
 # sorted MXFP4 A must be declined.
 def test_metadata_gate_rejects_non_prequant_stage1():
