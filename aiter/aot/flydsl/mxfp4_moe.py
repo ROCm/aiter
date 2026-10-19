@@ -45,6 +45,19 @@ _MXFP4_INTERMEDIATE = os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") not in ("0
 
 def _job_key(job: dict) -> tuple:
     """Dedup key == the runtime FlyDSL cache key."""
+    if job.get("sort_fold"):
+        return (
+            1,
+            "sort_fold",
+            job["D_HIDDEN"],
+            job["D_INTER"],
+            job["NE"],
+            job["topk"],
+            job["cap"],
+            job["split_k"],
+            job["token_rows"],
+            job["zero_output"],
+        )
     if job.get("v2_stage2"):
         return (
             2,
@@ -105,6 +118,44 @@ def _job_key(job: dict) -> tuple:
         job["D_INTER_REAL"],
         job["xcd_swizzle"],
     )
+
+
+def _sort_fold_jobs(token, model_dim, inter_dim, expert, topk, kn1, kn2):
+    """Sort-folded GEMM1 variants fused_moe launches for this tuned row."""
+    from aiter.fused_moe import (
+        _MXFP4_SORT_FOLD_M_RANGES,
+        _mxfp4_sort_fold_row_supported,
+        get_padded_M,
+    )
+    from aiter.ops.flydsl.mxfp4_gemm1_kernels import sort_fold_variant
+    from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
+
+    if not _mxfp4_sort_fold_row_supported(model_dim, inter_dim, expert, topk, kn1, kn2):
+        return []
+    zero_output = parse_flydsl_v2_gemm2_kernel(kn2)["epilog"] == "atomic"
+    variants = {
+        sort_fold_variant(m, topk)
+        for lo, hi in _MXFP4_SORT_FOLD_M_RANGES
+        for m in range(lo, hi + 1)
+        if get_padded_M(m) == token
+    }
+    return [
+        {
+            "stage": 1,
+            "sort_fold": True,
+            "kernel_name": f"{kn1}+sort_fold_c{cap}_sk{split_k}",
+            "BM": 16,
+            "D_HIDDEN": model_dim,
+            "D_INTER": inter_dim,
+            "NE": expert,
+            "topk": topk,
+            "cap": cap,
+            "split_k": split_k,
+            "token_rows": token_rows,
+            "zero_output": zero_output,
+        }
+        for cap, split_k, token_rows in sorted(variants)
+    ]
 
 
 def parse_csv(csv_path):
@@ -211,6 +262,10 @@ def parse_csv(csv_path):
                                 "k_wave": p1.get("k_wave", 1),
                             }
                         )
+                for job in _sort_fold_jobs(
+                    token, model_dim, inter_dim, expert, topk, kn1, kn2
+                ):
+                    _add(job)
 
             if v2_g2 is not None:
                 bm = v2_g2["tile_m"]
@@ -359,6 +414,26 @@ def _compile_stage1(job):
     )
 
 
+def _compile_sort_fold(job):
+    from aiter.ops.flydsl import moe_kernels
+    from aiter.ops.flydsl.mxfp4_gemm1_kernels import (
+        _get_compiled_mxfp4_gemm1_sort_fold,
+    )
+
+    launch = _get_compiled_mxfp4_gemm1_sort_fold(
+        job["D_HIDDEN"],
+        job["D_INTER"],
+        job["NE"],
+        job["topk"],
+        job["cap"],
+        job["split_k"],
+        job["token_rows"],
+        job["zero_output"],
+    )
+    ptr = _dummy().data_ptr()
+    moe_kernels._run_compiled(launch, (ptr, ptr, 1, 1, *(ptr,) * 11, 0))
+
+
 def _compile_stage2(job):
     from aiter.ops.flydsl.mxfp4_gemm2_kernels import flydsl_mxfp4_gemm2
 
@@ -497,7 +572,9 @@ def compile_one_config(**job):
         # get_rocm_arch() detects gfx942 and the gfx950 intrinsics fail to
         # select (LLVM aborts), so pin FLYDSL_GPU_ARCH=gfx950.
         with compile_only_env(), override_env("FLYDSL_GPU_ARCH", "gfx950"):
-            if stage == 1:
+            if job.get("sort_fold"):
+                _compile_sort_fold(job)
+            elif stage == 1:
                 _compile_stage1(job)
             elif job.get("v2_stage2"):
                 _compile_v2_stage2(job)
