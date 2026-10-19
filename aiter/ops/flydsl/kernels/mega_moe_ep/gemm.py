@@ -493,7 +493,11 @@ def build_gemm(kc: KernelCtx) -> dict:
                 acc, b_prev = mfma_gu.call_pipe(_al, b_prev, acc, sa, sb, _ln)
                 _ring_release(L, tid, q0 + i32(sp))  # done reading A K=sp
                 _ring_wait(L, tid, q0 + i32(spn))  # wait A K=sp+1 staged
-                cbar(L, tid)
+                # No per-K-step cbar: A is loader-produced (RC_ASEQ/RC_AFREE ring sync) and
+                # call_pipe has no cross-wave LDS write, so the 4 compute waves drift freely
+                # (ring back-pressure bounds the drift to <=NAB K-steps) -> their load stalls
+                # interleave and fill the MFMA pipe at 1 wave/SIMD.  Waves re-sync at the
+                # pre-epilogue cbar below.
             final_off = _ring_off(q0, K_ITERS - 1)
 
             def _alf(mi, ks, _b=final_off):
@@ -619,7 +623,7 @@ def build_gemm(kc: KernelCtx) -> dict:
                 acc, b_prev = mfma_gu.call_pipe(_al, b_prev, acc, sa, sb, _ln)
                 _ring_release(L, tid, q0 + i32(sp))  # done reading inter K=sp
                 _ring_wait(L, tid, q0 + i32(spn))  # wait inter K=sp+1 staged
-                cbar(L, tid)
+                # No per-K-step cbar (see gemm1): compute waves drift, the RC ring syncs A.
             final_off = _ring_off(q0, K_ITERS2 - 1)
 
             def _alf(mi, ks, _b=final_off):
