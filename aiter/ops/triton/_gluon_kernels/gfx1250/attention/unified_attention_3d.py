@@ -2326,6 +2326,16 @@ def _unified_attention_gluon_kernel_3d(
             query_mask_1_qk,
         )
 
+    # Segments split the whole sequence, but a query block that ends earlier
+    # (a non-last query of a multi-token request) can have no key in this
+    # segment. Store an empty partial (M = -inf) so the reduce weighs it 0.
+    if not cfg.ALL_DECODE and pgm.tile_start >= pgm.tile_end:
+        if KV_CACHE_DTYPE == "nvfp4" and cfg.HEAD_SIZE_SPLIT == 2:
+            pgm.store_output_3D_split_head(acc0, acc1, M, L, segm_idx)
+        else:
+            pgm.store_output_3D(acc, M, L, segm_idx)
+        return
+
     j_hbm_start: gl.int32 = pgm.tile_start
     max_num_tiles_this_seg: gl.int32 = pgm.tile_end - pgm.tile_start
     j_hbm: gl.int32 = 0

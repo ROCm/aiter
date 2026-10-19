@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import triton
 
 from aiter.ops.triton.attention.unified_attention import (
     _is_gluon_available,
@@ -697,13 +698,114 @@ def test_unified_attention_per_token_kv_scale(
     )
 
 
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # tails that end 1..4 tokens into a page leave early queries an empty segment
+        [(4, 129), (4, 130), (4, 131), (4, 132), (4, 2051)],
+        [(2, 4097), (3, 4098), (4, 513)],
+        [(4, 65537)] * 3,
+    ],
+)
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, e4m3_dtype])
+@torch.inference_mode()
+def test_unified_attention_short_query_split(seq_lens, kv_dtype) -> None:
+    """Speculative verify (2..4 tokens per request) on the gfx1250 3d split-K kernel."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("the short-query split covers the gfx1250 Gluon path")
+
+    block_size, head_size = 128, 128
+    num_blocks = sum(triton.cdiv(kv, block_size) for _, kv in seq_lens) + 64
+    (
+        query,
+        key_cache,
+        value_cache,
+        _shuffled_key_cache,
+        _shuffled_value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        _q_descale,
+        _k_descale,
+        _v_descale,
+        _output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=(16, 1),
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.float32,
+        out_dtype=torch.bfloat16,
+        use_kv_descale=False,
+        device="cuda",
+    )
+    if kv_dtype == e4m3_dtype:
+        key_fp8, value_fp8, k_scale, v_scale = per_token_quant_kv_cache(
+            key_cache, value_cache, kv_lens, block_tables
+        )
+        key_ref = key_fp8.float() * k_scale.nan_to_num().transpose(1, 2)[..., None]
+        value_ref = value_fp8.float() * v_scale.nan_to_num().transpose(1, 2)[..., None]
+        k, v = shuffle_kv_cache(key_fp8, value_fp8)
+        atol = rtol = 2e-2
+    else:
+        key_ref, value_ref = key_cache.bfloat16(), value_cache.bfloat16()
+        k, v = shuffle_kv_cache(key_ref, value_ref)
+        k_scale = v_scale = None
+        atol, rtol = 1.5e-2, 1e-2
+
+    unified_attention(
+        q=query,
+        k=k,
+        v=v,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=k_scale,
+        v_descale=v_scale,
+        shuffled_kv_cache=True,
+        backend="gluon",
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_ref,
+        value_cache=value_ref,
+        query_lens=[x[0] for x in seq_lens],
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.float32,
+    )
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output.float(), ref_output, atol=atol, rtol=rtol)
+
+
 @torch.inference_mode()
 def test_unified_attention_per_token_kv_scale_rejects_prefill() -> None:
     if DEVICE_ARCH != "gfx1250":
         pytest.skip("per-token KV scales are read only by the gfx1250 Gluon kernel")
 
     num_blocks, block_size, num_kv_heads, head_size = 64, 128, 1, 128
-    query = torch.randn(4, 16, head_size, dtype=torch.bfloat16, device="cuda")
+    # 8 query tokens: longer than a speculative verify, so the batch takes the 2d kernel
+    query = torch.randn(8, 16, head_size, dtype=torch.bfloat16, device="cuda")
     key_cache = torch.zeros(
         num_blocks,
         num_kv_heads,
@@ -731,9 +833,9 @@ def test_unified_attention_per_token_kv_scale_rejects_prefill() -> None:
             k=key_cache,
             v=value_cache,
             out=torch.empty_like(query),
-            cu_seqlens_q=torch.tensor([0, 4], dtype=torch.int32, device="cuda"),
+            cu_seqlens_q=torch.tensor([0, 8], dtype=torch.int32, device="cuda"),
             seqused_k=torch.tensor([200], dtype=torch.int32, device="cuda"),
-            max_seqlen_q=4,
+            max_seqlen_q=8,
             max_seqlen_k=200,
             softmax_scale=head_size**-0.5,
             causal=True,

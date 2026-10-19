@@ -50,6 +50,10 @@ except:  # noqa: E722
 # Max NUM_SEGMENTS the gluon reduce holds in-thread; larger split counts fall back to the Triton reduce_segments.
 _GLUON_REDUCE_MAX_SEGMENTS = 8
 
+# Longest query (tokens per request) that gfx1250 runs on the 3d split-K kernel
+# when the batch is not all-decode, e.g. a speculative verify of 3 draft tokens.
+_GFX1250_SPLIT_MAX_QUERY_LEN = 4
+
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
@@ -173,10 +177,34 @@ def _gfx950_split_grid(params: _UAParams):
     return config["NUM_SEGMENTS"] > 1
 
 
+def _gfx1250_split_short_queries(params: _UAParams, backend: str):
+    """Short multi-token queries (speculative verify) take the 3d split-K kernel.
+
+    The 2d grid has one program per (KV head, query block), so a few requests
+    with a long context leave most CUs idle. The 3d kernel masks the causal
+    edge only in the last tile of a query block, so each block must hold one
+    query position (BLOCK_Q == 1).
+    """
+    if (
+        backend != "gluon"
+        or not params.shuffled_kv_cache
+        or params.max_seqlen_q > _GFX1250_SPLIT_MAX_QUERY_LEN
+        or not is_3d_gluon_available(params, backend)
+    ):
+        return False
+    config = get_unified_attention_config("attn_3d", params, backend="gluon")
+    block_m = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
+    return block_m // params.num_queries_per_kv == 1
+
+
 def use_2d_kernel(params: _UAParams, backend: str = "triton"):
-    # if IS_DEVICE_ARCH_GFX12, always use 3D if all_decode and 2D otherwise
+    # gfx1250: 3d for decode and short split-safe queries, 2d otherwise
     if IS_DEVICE_ARCH_GFX12:
-        return (params.sliding_window > 0) or (not params.all_decode)
+        if params.sliding_window > 0:
+            return True
+        if params.all_decode:
+            return False
+        return not _gfx1250_split_short_queries(params, backend)
 
     # The gfx950 Gluon kernel is one kernel with a decode and a prefill grid,
     # and it owns its KV split, so decode and split batches take the 3d path
@@ -244,9 +272,10 @@ def _check_per_token_kv_scale_path(params: "_UAParams", backend: str):
     )
     if not supported:
         raise NotImplementedError(
-            "per-token KV scales need gfx1250, the gluon backend, all-decode "
-            "batches without a sliding window, a shuffled fp8 KV cache and a "
-            f"bf16 query; got arch={DEVICE_ARCH}, backend={backend}, "
+            "per-token KV scales need gfx1250, the gluon backend, a batch on the "
+            "3d kernel (decode or a short split-safe query) without a sliding "
+            "window, a shuffled fp8 KV cache and a bf16 query; "
+            f"got arch={DEVICE_ARCH}, backend={backend}, "
             f"all_decode={params.all_decode}, "
             f"sliding_window={params.sliding_window}, "
             f"shuffled_kv_cache={params.shuffled_kv_cache}, "
