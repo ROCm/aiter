@@ -7,6 +7,14 @@ row params. Device: hipcc -> .so -> .hip_fatbin -> clang-offload-bundler -> sm_g
 code-object hashes are generated into gen/sm_expected_hashes.h (as the Phase-1 recipe does) and the host driver is built
 against it. One build directory per cache key (sha256 of flags + source manifest + wrapper sources + toolchain).
 
+Build RECIPES (cache keys are unchanged for "legacy"; the others fold the recipe name into the key because their artifacts differ):
+  legacy  one build per call, serial: device .so x2 -> unbundle -> hash header -> host driver (the Phase-1 recipe, kept for A/B and as the reference).
+  aot1    DEFAULT. Same device compile commands (so the code objects are byte-identical to legacy) but run by prebuild.py as ONE parallel task graph over every unit a profile
+          needs; the host drivers no longer wait for the device builds (the expected hashes are linked in as a tiny extern-string object, sm_hashes.o).
+  aot2    aot1 + device TUs compiled straight to a code object (--offload-device-only --no-gpu-bundle-output): no host pass, no objcopy, no bundler.
+          Opt-in until `prebuild --verify-device-only` shows the .text/.rodata of every kernel equal to aot1 on the node.
+See prebuild.py (profile enumeration, parallel scheduler, rank coordination, per-task wall report).
+
 Environment (MORI is consumed read-only):
   MORI_ROOT      include root containing mori/cco/cco.hpp      (default /reference-mori)
   MORI_CCO_SO    libmori_cco.so                                (default $MORI_ROOT/build/src/cco/libmori_cco.so)
@@ -27,10 +35,18 @@ from typing import Dict, List, Tuple
 _HERE = os.path.dirname(os.path.abspath(__file__))
 CSRC = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "..", "csrc", "gemm_fusion", "sp_qkv"))
 SRCS = ("r17", "r18")
+RECIPES = ("legacy", "aot1", "aot2")
+DEFAULT_RECIPE = "aot1"
 
 
-class BuildError(RuntimeError):
-    pass
+def recipe_key(key: str, recipe: str) -> str:
+    """Cache key of a recipe: the legacy key itself, otherwise a hash of (legacy key, recipe) so that artifacts of different recipes never mix."""
+    if recipe not in RECIPES:
+        raise ValueError(f"recipe {recipe!r} not in {RECIPES}")
+    return key if recipe == "legacy" else hashlib.sha256(f"{key}|{recipe}".encode()).hexdigest()[:20]
+
+
+from aiter.gemm_fusion.prebuild import BuildError  # noqa: E402  (one error type for the legacy builds and the parallel engine)
 
 
 @dataclass(frozen=True)
@@ -117,7 +133,11 @@ def jit_root() -> str:
 
 
 # ---------------------------------------------------------------- command plan (pure; unit-tested)
-def device_cmds(src: str, dev_defs: List[str], tool: Dict[str, str], out: str) -> List[List[str]]:
+SMALL_DEVICE_TUS = (("sm_gemm", "sk_gemm_fp8.cu"), ("sm_ran", "ran_kernel.cu"))
+
+
+def device_cmd_one(src: str, dev_defs: List[str], tool: Dict[str, str], out: str, name: str) -> List[str]:
+    """The legacy compile command of ONE small device TU (name in sm_gemm | sm_ran): hipcc -> <out>/img/<name>.so (device fatbin embedded)."""
     sdir = os.path.join(CSRC, "small", src)
     flags = dev_defs + [
         f"-I{os.path.join(sdir, 'device')}", f"-I{os.path.join(sdir, 'interface')}",
@@ -125,11 +145,26 @@ def device_cmds(src: str, dev_defs: List[str], tool: Dict[str, str], out: str) -
         f"-I{tool['mori_root']}/include", "-D__HIPCC_RTC__", "-DBUILD_CCO_SDMA=1", "-DOPUS_TILE_CONTAINER=0",
         "-std=c++20", "-O3", "-fno-fast-math", "--offload-arch=gfx950",
     ]
-    cmds = []
-    for n, cu in (("sm_gemm", "sk_gemm_fp8.cu"), ("sm_ran", "ran_kernel.cu")):
-        so = os.path.join(out, "img", n + ".so")
-        cmds.append([tool["hipcc"], *flags, "-fPIC", "-shared", os.path.join(sdir, "device", cu), "-o", so])
-    return cmds
+    cu = dict(SMALL_DEVICE_TUS)[name]
+    return [tool["hipcc"], *flags, "-fPIC", "-shared", os.path.join(sdir, "device", cu), "-o", os.path.join(out, "img", name + ".so")]
+
+
+def device_cmds(src: str, dev_defs: List[str], tool: Dict[str, str], out: str) -> List[List[str]]:
+    return [device_cmd_one(src, dev_defs, tool, out, n) for n, _cu in SMALL_DEVICE_TUS]
+
+
+DEVICE_ONLY_FLAGS = ("--offload-device-only", "--no-gpu-bundle-output")
+
+
+def device_only_cmd(legacy_cmd: List[str], hsaco: str) -> List[str]:
+    """Derive the aot2 command from a legacy device command: the SAME flags and source, minus the host-side `-shared` link, with the device-only switches and the
+    code object as the output (no host pass, no objcopy, no clang-offload-bundler). Derived mechanically so nothing else can drift."""
+    if "-shared" not in legacy_cmd or "-o" not in legacy_cmd:
+        raise ValueError("not a legacy device command")
+    cmd = [a for a in legacy_cmd if a != "-shared"]
+    i = cmd.index("-o")
+    cmd[i + 1] = hsaco
+    return [cmd[0], *DEVICE_ONLY_FLAGS, *cmd[1:]]
 
 
 def host_cmds(src: str, host_defs: List[str], tool: Dict[str, str], out: str) -> List[List[str]]:
@@ -143,6 +178,38 @@ def host_cmds(src: str, host_defs: List[str], tool: Dict[str, str], out: str) ->
     drv = [tool["clangxx"], *flags, "-shared", os.path.join(CSRC, "host", "sm_fusion_driver.cpp"),
            "-o", os.path.join(out, "sm_driver.so"), *libs]
     return [drv]
+
+
+def host_compile_cmd(src: str, host_defs: List[str], tool: Dict[str, str], out: str) -> List[str]:
+    """The host driver compiled to an object (same flags as host_cmds, `-c` instead of `-shared`, no link libs)."""
+    sdir = os.path.join(CSRC, "small", src)
+    flags = host_defs + [
+        "-x", "c++", "-D__HIP_PLATFORM_AMD__=1", f"-I{tool['rocm']}/include", f"-I{os.path.join(out, 'gen')}",
+        f"-I{os.path.join(sdir, 'interface')}", f"-I{os.path.join(sdir, 'host')}", f"-I{tool['mori_root']}/include",
+        "-std=c++20", "-O3", "-fno-fast-math", "-fPIC", "-pthread",
+    ]
+    return [tool["clangxx"], *flags, "-c", os.path.join(CSRC, "host", "sm_fusion_driver.cpp"), "-o", os.path.join(out, "sm_driver.o")]
+
+
+def hashes_compile_cmd(tool: Dict[str, str], out: str) -> List[str]:
+    return [tool["clangxx"], "-x", "c++", "-std=c++20", "-O1", "-fPIC", "-c", os.path.join(out, "gen", "sm_hashes.cpp"), "-o", os.path.join(out, "sm_hashes.o")]
+
+
+def host_link_cmd(tool: Dict[str, str], out: str, objs: List[str], so: str) -> List[str]:
+    libs = ["-x", "none", tool["mori_so"], f"-L{tool['rocm']}/lib", "-lamdhip64", "-ldl", "-Wl,--no-undefined"]
+    return [tool["clangxx"], "-shared", "-pthread", "-o", so, *[os.path.join(out, o) for o in objs], *libs]
+
+
+def hashes_header_extern() -> str:
+    """gen/sm_expected_hashes.h of the decoupled recipes: the vendored driver only passes SM_EXPECTED_*_SHA256 to sm_image_matches(const char*, const char*), so the macros can
+    name extern strings that sm_hashes.o (generated after the device builds) defines: the host compile no longer depends on the device builds."""
+    return ('#pragma once\nextern "C" const char sm_expected_gemm_sha256[];\nextern "C" const char sm_expected_ran_sha256[];\n'
+            '#define SM_EXPECTED_GEMM_SHA256 sm_expected_gemm_sha256\n#define SM_EXPECTED_RAN_SHA256 sm_expected_ran_sha256\n')
+
+
+def hashes_source(gemm_sha: str, ran_sha: str) -> str:
+    return ('extern "C" {\nextern const char sm_expected_gemm_sha256[];\nextern const char sm_expected_ran_sha256[];\n'
+            f'const char sm_expected_gemm_sha256[] = "{gemm_sha}";\nconst char sm_expected_ran_sha256[] = "{ran_sha}";\n}}\n')
 
 
 def comm_cmd(tool: Dict[str, str], out: str) -> List[str]:
@@ -169,8 +236,14 @@ def _unbundle(tool, so, fatbin, hsaco, log):
     _run([tool["bundler"], "--type=o", "--unbundle", f"--targets={tgt}", f"--input={fatbin}", f"--output={hsaco}"], log)
 
 
-def build_small(params: dict, mode: str, tool: Dict[str, str] = None) -> SmallBuild:
-    """Build (or reuse) the 2 HSACOs + host driver for one parameter set. Safe under concurrent ranks (atomic rename)."""
+def build_small(params: dict, mode: str, tool: Dict[str, str] = None, recipe: str = None) -> SmallBuild:
+    """Build (or reuse) the 2 HSACOs + host driver for one parameter set. Safe under concurrent ranks (atomic rename). recipe: see the module doc; the default
+    (aot1) runs the unit's TUs in parallel and hits the artifacts prebuild_profile() produced."""
+    recipe = recipe or DEFAULT_RECIPE
+    if recipe != "legacy":
+        from . import prebuild
+
+        return prebuild.build_small(params, mode, tool, recipe)
     tool = tool or toolchain()
     src = params.get("src", "r17")
     dev, host = small_defs(params, mode)
@@ -209,8 +282,18 @@ def build_small(params: dict, mode: str, tool: Dict[str, str] = None) -> SmallBu
     return sb
 
 
-def build_comm(tool: Dict[str, str] = None) -> str:
-    """Build (or reuse) gf_comm.so; returns its path."""
+def comm_key(tool: Dict[str, str]) -> str:
+    return hashlib.sha256(_sha(os.path.join(CSRC, "host", "gf_comm.cpp")).encode() + repr(sorted(tool.items())).encode()).hexdigest()[:20]
+
+
+def build_comm(tool: Dict[str, str] = None, recipe: str = None) -> str:
+    """Build (or reuse) gf_comm.so; returns its path (one TU: the recipe does not change the artifact or its key). The default recipes go through the rank-safe engine
+    (one process compiles, the others wait on the unit lock); `legacy` is the old atomic-rename-only path."""
+    recipe = recipe or DEFAULT_RECIPE
+    if recipe != "legacy":
+        from . import prebuild
+
+        return prebuild.build_comm(tool)
     tool = tool or toolchain()
     h = hashlib.sha256(_sha(os.path.join(CSRC, "host", "gf_comm.cpp")).encode() + repr(sorted(tool.items())).encode()).hexdigest()[:20]
     final = os.path.join(jit_root(), "comm_" + h)
@@ -294,8 +377,17 @@ def large_host_cmd(defs: List[str], tool: Dict[str, str], out: str) -> List[str]
     return [tool["clangxx"], *flags, "-shared", os.path.join(CSRC, "host", "lg_fusion_driver.cpp"), "-o", os.path.join(out, "liblg_comm.so"), *libs]
 
 
-def build_large(params: dict, mode: str, tool: Dict[str, str] = None) -> LargeBuild:
+def large_device_only_cmd(defs: List[str], tool: Dict[str, str], out: str) -> List[str]:
+    return device_only_cmd(large_device_cmd(defs, tool, out), os.path.join(out, "img", "lg_gemm_quad_fp8_comm.hsaco"))
+
+
+def build_large(params: dict, mode: str, tool: Dict[str, str] = None, recipe: str = None) -> LargeBuild:
     """Build (or reuse) the large-M HSACO (all plan entries n1/n2/n4/n2h/n4h/n3q + quiet_ready + drain) and host driver for one mode."""
+    recipe = recipe or DEFAULT_RECIPE
+    if recipe != "legacy":
+        from . import prebuild
+
+        return prebuild.build_large(params, mode, tool, recipe)
     tool = tool or toolchain()
     defs = large_defs(params, mode)
     key = large_cache_key(defs, tool)

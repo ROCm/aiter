@@ -244,3 +244,10 @@ class SpQkvLarge(Plan):
     def poison(self, res) -> int:
         """Cheap host read of the device poison word (4-byte D2H on the current torch stream + that stream sync). Outside capture only; all-reduce MAX across ranks, then res.quiesce_and_reset()."""
         return self._context(res).poison(stream_handle(None))
+
+    @classmethod
+    def prebuild_units(cls, rows, *, recipe=None, tool=None):
+        """Hook of aiter.gemm_fusion.prebuild: the build units (and skipped-row reasons) of this variant's profile rows."""
+        from . import prebuild
+
+        return prebuild.units_for_rows(rows, recipe=recipe, tool=tool, large=True)

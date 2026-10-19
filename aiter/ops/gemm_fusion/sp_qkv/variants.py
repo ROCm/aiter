@@ -264,3 +264,13 @@ def _small_poison(self, res) -> int:
 
 
 SpQkvSmall.poison = _small_poison
+
+
+def _small_prebuild_units(cls, rows, *, recipe=None, tool=None):
+    """Hook of aiter.gemm_fusion.prebuild: the build units (and skipped-row reasons) of this variant's profile rows."""
+    from . import prebuild
+
+    return prebuild.units_for_rows(rows, recipe=recipe, tool=tool, large=False)
+
+
+SpQkvSmall.prebuild_units = classmethod(_small_prebuild_units)

@@ -88,15 +88,17 @@ def check_weight(owner: str, w, *, N: int, K: int = K_HIDDEN) -> None:
 
 
 def check_token_arrays(owner: str, *, T: int, positions, slot_mapping, outs) -> None:
-    """Small plans: positions[t] / slot_mapping[t] (int64) are read for every t < T = 4*M, and q/k/v/index_q are written for every t < T. A SHORTER array is an
-    out-of-bounds read/write (the pad_rows case: positions has the real token count while x has the padded rows); a longer persistent buffer is safe. Only lengths are
-    checked: slot_mapping entries of -1 (decode pad rows) are legal and skipped by the kernel."""
+    """Small plans: positions[t] / slot_mapping[t] (int64) are read for every t < T = 4*M, and q/k/v/index_q are written for every t < T. Padded rows are supported: the
+    caller stages T-long arrays whose pad rows are (position 0, slot_mapping -1); the kernel runs norm/rope on them like any row (in-bounds, discarded by the caller) and skips
+    every cache write for slot < 0 (KV and index cache). A SHORTER array means the caller did NOT stage the pad rows (positions carries only the real token count while x has
+    the padded rows): an out-of-bounds read/write, rejected. A longer persistent buffer is safe. Only lengths are checked, never values."""
     import torch
 
     for name, t in (("positions", positions), ("slot_mapping", slot_mapping)):
         n = int(t.numel())
         if n < T:
-            _fail(owner, f"{name} has {n} entries but the kernel reads {T} (T = 4 x local M = {T}): padded rows (real tokens != padded tokens) must run natively")
+            _fail(owner, f"{name} has {n} entries but the kernel reads T = 4 x local M = {T}: stage a T-long array whose pad rows are position 0 / slot_mapping -1 "
+                         f"(the kernel skips cache writes for slot < 0); a shorter array is an out-of-bounds read")
         if not _is(t, torch, "int64"):
             _fail(owner, f"{name} dtype {t.dtype} is not int64 (the kernel reads int64)")
     for name, t in (outs or {}).items():

@@ -2251,8 +2251,8 @@ def test_inputs_small_rejects_each_violation_before_any_binding_or_launch(monkey
 
 
 @pytest.mark.parametrize("what,meta_over,outs_over,match", [
-    ("positions shorter than T (the pad_rows case: real tokens < padded)", dict(positions=_T((61,), (1,), "i64")), {}, r"positions has 61 entries but the kernel reads 64"),
-    ("slot_mapping shorter than T", dict(slot_mapping=_T((63,), (1,), "i64")), {}, r"slot_mapping has 63 entries but the kernel reads 64"),
+    ("positions shorter than T (the pad_rows case: real tokens < padded)", dict(positions=_T((61,), (1,), "i64")), {}, r"positions has 61 entries but the kernel reads T = 4 x local M = 64: stage a T-long array"),
+    ("slot_mapping shorter than T", dict(slot_mapping=_T((63,), (1,), "i64")), {}, r"slot_mapping has 63 entries but the kernel reads T = 4 x local M = 64"),
     ("positions int32", dict(positions=_T((64,), (1,), "i32")), {}, r"positions dtype i32 is not int64"),
     ("slot_mapping int32", dict(slot_mapping=_T((64,), (1,), "i32")), {}, r"slot_mapping dtype i32 is not int64"),
     ("q output too short", {}, dict(q=_T((60, 16, 128))), r"output 'q' has 60 rows but the kernel writes 64"),
@@ -2278,7 +2278,7 @@ def test_inputs_small_rejects_rows_outside_1_to_32_and_checks_prepare_without_a_
     assert len(binds) == 1
     bad = {**meta, "positions": _T((61,), (1,), "i64")}  # real tokens (61) < padded rows x world (64)
     plan2, st2, meta2, outs2, res2, l2, b2 = _small_ready(monkeypatch)
-    with pytest.raises(ContractError, match="padded rows.*must run natively"):
+    with pytest.raises(ContractError, match="stage a T-long array.*slot_mapping -1"):
         plan2.prepare(x=st2["x"], x_scale=st2["xs"], w_scale=st2["ws"], outs=outs2, meta={**meta2, **bad}, res=res2)
     with pytest.raises(ContractError, match="x K=6400"):
         plan2.prepare(x=_T((16, 6400), (6400, 1), "fp8"), x_scale=st2["xs"], w_scale=st2["ws"], outs=outs2, meta=meta2, res=res2)
@@ -2401,3 +2401,35 @@ def test_inputs_checks_are_pure_python_and_only_run_where_python_runs():
     src = open(os.path.join(base, "inputs.py"), encoding="utf-8").read()
     code = "\n".join(l for l in src.split("\n") if not l.lstrip().startswith("#"))
     assert ".item(" not in code and "synchronize" not in code and ".cuda" not in code and "hipMemcpy" not in code  # attribute compares only; tensor VALUES are never read (slot -1 stays legal)
+
+
+# ---- task-264 (B): small shapes run fused after padding: ATOM stages T-long arrays whose pad rows are (position 0, slot -1)
+class _NoRead(_T):
+    """A tensor whose VALUES must never be read by the contract (slot -1 / position 0 pad rows are legal and only the kernel interprets them)."""
+
+    def _boom(self, *a, **k):
+        raise AssertionError("the input contract must not read tensor values")
+
+    item = tolist = cpu = numpy = __getitem__ = __iter__ = __bool__ = _boom
+
+
+def test_inputs_small_accepts_pad_rows_staged_as_T_long_arrays_and_never_reads_values(monkeypatch):
+    for mode, T in (("dense", 64), ("dense", 128), ("indexer", 64), ("reuse", 128)):
+        plan, st, meta, outs, res, launches, binds = _small_ready(monkeypatch, mode=mode, T=T)
+        M = T // 4
+        # 5 real tokens + (T - 5) pad rows: positions 0 / slot -1 for the pad rows; the arrays are T long, the activation has all M rows, outputs have T rows
+        pos, slot = _NoRead((T,), (1,), "i64"), _NoRead((T,), (1,), "i64")
+        meta = {**meta, "positions": pos, "slot_mapping": slot}
+        if mode == "indexer":
+            meta = {**meta, "index_cache": _T((4, 1, 16, 128), (2048, 2048, 128, 1)), "index_q_norm_w": _T((128,)), "index_k_norm_w": _T((128,))}
+            outs = {"q": outs["q"], "index_q": _T((T, 1, 128))}
+        elif mode == "reuse":
+            outs = dict(outs)
+        _run_small(plan, st, meta, outs, res)
+        plan.prepare(x=st["x"], x_scale=st["xs"], w_scale=st["ws"], outs=outs, meta=meta, res=res)
+        assert len(launches) == 1 and st["x"].shape[0] == M
+    # the unit-level pin of the kernel facts this relies on (ran_kernel.cu, r17/r18): the index cache and the KV cache writes are guarded by slot >= 0
+    for src in ("r17", "r18"):
+        text = open(os.path.join(os.path.dirname(specs.__file__), "..", "..", "..", "..", "csrc", "gemm_fusion", "sp_qkv", "small", src, "device", "ran_kernel.cu"), encoding="utf-8").read()
+        assert text.count("if (slot >= 0) {") >= 2 and "if (is >= 0) {" in text, src  # KV (k and v) writes skip slot -1; the index_cache write skips islot -1
+        assert "a.index_slot_mapping[t]" in text and "(live ? a.positions[t] : 0)" in text

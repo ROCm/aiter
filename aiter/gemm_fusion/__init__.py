@@ -5,6 +5,7 @@ from .spec import (  # noqa: F401
 )
 from .catalog import Contract, VariantInfo, register_variant, get_variant  # noqa: F401
 from .profile import Profile, ProfileError, load_profile, parse_profile  # noqa: F401
+from .prebuild import prebuild_profile  # noqa: F401
 from .match import MatchCtx, ContractError, match_prefix  # noqa: F401
 from .plan import Plan, WindowReq  # noqa: F401
 from .capabilities import detect_capabilities, detect_arch, detect_cu  # noqa: F401
