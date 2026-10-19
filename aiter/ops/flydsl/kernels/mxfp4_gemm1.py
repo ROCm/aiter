@@ -1660,6 +1660,9 @@ def compile_gemm1_a4w4_port(
     )
 
     variant_tag = "iq" if inline_quant else ("nt" if use_nt else "cached")
+    # Preserve inline NT symbols while distinguishing cached B-weight loads.
+    if inline_quant and not use_nt:
+        variant_tag += "_cached"
     if prefetch_hidden:
         variant_tag += "_hpf"
     # Tag with H/INTER/NE so different shape specializations get distinct
