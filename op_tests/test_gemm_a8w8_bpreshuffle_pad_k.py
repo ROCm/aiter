@@ -56,6 +56,8 @@ def test_flydsl_bpreshuffle_row_falls_back_to_ck_above_m_max(monkeypatch, m, bac
         seen.append("ck")
         return Y
 
+    # gfx1250 routes every kernel name to its WMMA backend before the M-limit check.
+    monkeypatch.setattr(gemm_mod, "get_gfx", lambda: "gfx950")
     monkeypatch.setattr(gemm_kernels, "flydsl_preshuffle_gemm_a8", fake_flydsl)
     monkeypatch.setattr(gemm_mod, "gemm_a8w8_bpreshuffle_ck", fake_ck)
 
