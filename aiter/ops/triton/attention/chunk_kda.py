@@ -402,11 +402,13 @@ def chunk_kda(
             per sequence; built by prepare_chunk_kda_metadata (a host sync) if None.
         scale: q scale, K**-0.5 if None.
         out: [1, T, H, 128] output, may alias v; allocated if None.
-        initial_state: fp32 (or bf16 on gfx950) [N, H, V, K] start state, zeros if None.
+        initial_state: [N, H, V, K] start state, zeros if None. The Gluon path accepts
+            fp32, or bf16 on gfx950. Other archs use the Triton dtype contract.
         output_final_state: return a new [N, H, V, K] final state with initial_state's
             dtype, or fp32 without initial_state.
-        state_cache: fp32 (or bf16 on gfx950) [slots, H, V, K] state, updated in place at
-            state_indices; replaces initial_state and output_final_state.
+        state_cache: [slots, H, V, K] state, with the same dtype limits as
+            initial_state. Updated in place at state_indices; replaces initial_state
+            and output_final_state.
         state_indices: [N] distinct cache rows; a row outside [0, slots) is not read or
             written (that sequence starts from zeros).
         has_initial_state: bool [N]; False starts that sequence from zeros.

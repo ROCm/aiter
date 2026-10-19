@@ -302,6 +302,9 @@ def fused_recurrent_kda(
     if state_dst is None and _ARCH == "gfx950":
         n_dst = B * T if is_paged else N
         state_dst = q.new_empty(n_dst, *state_shape, dtype=state_dtype)
+    # BF16 storage must not round the recurrent state between tokens.
+    if state_dst is not None and state_dst.dtype == torch.bfloat16 and T > 1:
+        resident_state = True
     slot_rows_in, rows_in = _rows(initial_state)
     slot_rows_out, rows_out = (
         (slot_rows_in, rows_in) if state_dst is initial_state else _rows(state_dst)

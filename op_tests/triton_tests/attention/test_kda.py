@@ -904,20 +904,57 @@ def _small(T=3, B=2, H=4, D=128):
 def test_state_dtype_guards():
     q, k, v, g, beta, h0 = _small()
     with pytest.raises(AssertionError):
-        fused_recurrent_kda(q, k, v, g, beta, initial_state=h0.half())
+        fused_recurrent_kda(q=q, k=k, v=v, g=g, beta=beta, initial_state=h0.half())
     if arch == "gfx950":
         with pytest.raises(AssertionError, match="state dtypes must match"):
             fused_recurrent_kda(
-                q,
-                k,
-                v,
-                g,
-                beta,
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
                 initial_state=h0.bfloat16(),
                 state_out=torch.empty_like(h0),
                 inplace_final_state=False,
                 output_final_state=True,
             )
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_varlen_state_precision_with_short_sequences(state_dtype):
+    """Short sequences must not make a long sequence round its state each token."""
+    if state_dtype == torch.bfloat16 and arch != "gfx950":
+        pytest.skip("bf16 state requires gfx950")
+    length, H, D = 128, 1, 128
+    lengths = [length] + [1] * length
+    total = sum(lengths)
+    q = torch.zeros(1, total, H, D, device=DEVICE)
+    q[..., 0] = 1
+    k, v, g = q.clone(), torch.zeros_like(q), torch.zeros_like(q)
+    beta = torch.full((1, total, H), 0.001, device=DEVICE)
+    state = torch.ones(len(lengths), H, D, D, dtype=state_dtype, device=DEVICE)
+    cu = torch.tensor([0] + lengths, device=DEVICE, dtype=torch.int32).cumsum(0)
+    out, final = fused_recurrent_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=state,
+        cu_seqlens=cu,
+        inplace_final_state=False,
+        output_final_state=True,
+    )
+    ref, ref_state = naive_recurrent_kda(
+        q[:, :length],
+        k[:, :length],
+        v[:, :length],
+        g[:, :length],
+        beta[:, :length],
+        initial_state=state[:1].transpose(-1, -2),
+    )
+    assert_close("long sequence output", ref, out[:, :length])
+    assert_close("long sequence state", ref_state, final[:1].transpose(-1, -2))
 
 
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
