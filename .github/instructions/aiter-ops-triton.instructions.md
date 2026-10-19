@@ -102,8 +102,9 @@ All tuned configs are in `configs/<arch>/<backend>/<op>/<d_type>/`. `<op>` is
 - A new `.gitkeep` file under `configs/`.
 - A new arch folder copied from another arch, when the copy is not byte
   identical or the commit message does not say so. The allowed copies are
-  gfx950 → gfx1250 and gfx1151 → gfx1150, Triton only. Never copy into a Gluon
-  folder or into gfx950.
+  gfx950 → gfx1250 and gfx1151 → gfx1150, Triton only. The copy from gfx1101
+  to gfx1200 and gfx1201 is also allowed, for Triton MHA only. Never copy into
+  a Gluon folder or into gfx950.
 - `kpack` in a config outside gfx942.
 - Files under `configs/gemm/aot/` or `configs/paged_mqa_logits/aot/`. These are
   runtime caches. Do not commit them.
