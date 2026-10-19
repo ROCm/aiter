@@ -483,7 +483,7 @@ def build_gemm(kc: KernelCtx) -> dict:
                 def _ln(ni, _k=spn, _br=b_row):
                     return b_loader.load_ni(_br, ni, i32(_k))
 
-                acc, b_prev = mfma_gu.call_pipe(_al, b_prev, acc, sa, sb, _ln)
+                acc, b_prev = mfma_gu.call_pipe_am(_al, b_prev, acc, sa, sb, _ln)
                 _ring_release(L, tid, q0 + i32(sp))  # done reading A K=sp
                 _ring_wait(L, tid, q0 + i32(spn))  # wait A K=sp+1 staged
                 # No per-K-step cbar: A is loader-produced (RC_ASEQ/RC_AFREE ring sync) and
@@ -618,7 +618,7 @@ def build_gemm(kc: KernelCtx) -> dict:
                 def _ln(ni, _k=spn, _br=b_row):
                     return b_loader.load_ni(_br, ni, i32(_k))
 
-                acc, b_prev = mfma_gu.call_pipe(_al, b_prev, acc, sa, sb, _ln)
+                acc, b_prev = mfma_gu.call_pipe_am(_al, b_prev, acc, sa, sb, _ln)
                 _ring_release(L, tid, q0 + i32(sp))  # done reading inter K=sp
                 _ring_wait(L, tid, q0 + i32(spn))  # wait inter K=sp+1 staged
                 # No per-K-step cbar (see gemm1): compute waves drift, the RC ring syncs A.
