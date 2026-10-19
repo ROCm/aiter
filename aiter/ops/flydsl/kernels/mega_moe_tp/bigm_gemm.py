@@ -37,7 +37,6 @@ from .common import (
     lds_ld_i32,
     lds_st,
     mfma,
-    opaque,
     pack_bf16x2,
     rsrc,
     swap16,
@@ -375,9 +374,7 @@ def build_bigm_unit(
             ]
             for pp in range_constexpr(2):
                 rb = (e * i32(H) + n0 + i32(pp * 32)) // i32(32)
-                # k-steps 2j, 2j + 1 read the same scale word: kept as separate loads (an opaque
-                # offset), else CSE merges them and the static counts force a vmcnt(0) drain
-                vo = opaque(lane * i32(4))
+                vo = lane * i32(4)
                 b.append(
                     fx.Int32(
                         bld(rws2, vo, (rb * i32(CH2) + kk // i32(2)) * i32(256), T.i32)

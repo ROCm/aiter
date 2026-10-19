@@ -418,17 +418,6 @@ def poll_sys_ge(addr, target, nap=2):
     return cur
 
 
-def opaque(v):
-    """v through a side-effecting copy: derived values are not hoisted or CSE'd (equal loads
-    stay separate instructions for the static vmcnt waits; an item's address math stays inside
-    the item, not live across every item)"""
-    return fx.Int32(
-        _llvm.inline_asm(
-            T.i32, [v.ir_value()], "v_mov_b32 $0, $1", "=v,v", has_side_effects=True
-        )
-    )
-
-
 def i8x4_pack(f, inv):
     """4 f32 * inv -> int8 (round to even, clamped to +-127) packed in an i32"""
     w = i32(0)
@@ -471,10 +460,3 @@ def i4x8_unpack(d, sc):
         b = (fx.Int32(d) << i32(28 - 4 * k)) >> i32(28)
         out.append(b.to(fx.Float32) * sc)
     return out
-
-
-def l2_writeback():
-    """this XCD's dirty L2 lines to memory (device-scope release of plain stores)"""
-    _llvm.InlineAsmOp(
-        None, [], "buffer_wbl2 sc1\ns_waitcnt vmcnt(0)", "", has_side_effects=True
-    )

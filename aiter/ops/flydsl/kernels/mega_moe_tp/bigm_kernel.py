@@ -28,7 +28,11 @@ from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
-from ..communication_ops_utils import atomic_add_agent, load_i32_global_agent
+from ..communication_ops_utils import (
+    atomic_add_agent,
+    fence_release,
+    load_i32_global_agent,
+)
 from ..mxfp4_gemm_common import _e8m0_from_amax
 from .bigm_config import (
     C_CNT,
@@ -86,12 +90,11 @@ from .common import (
     i8x4_pack,
     i8x4_unpack,
     i32,
-    l2_writeback,
     lds_atomic_add,
+    lds_ld_acq,
     lds_ld_i32,
     lds_st,
     now,
-    opaque,
     pack_bf16x8,
     rsrc,
     sum_live,
@@ -228,7 +231,8 @@ def compile_bigm_layer(
     LH = LBASE + 128  # [NE] histogram / ranks
     LB2 = LH + 4 * NES  # [NE] bases
     LP = LB2 + 4 * NES  # [SRT * K1] route positions of a sort item ([NE] plan scratch)
-    LDS_BYTES = LP + max(4 * SRT * K1, 64 + 4 * max(NE, 64 * EPL)) + 64
+    LTID = LP + max(4 * SRT * K1, 64 + 4 * max(NE, 64 * EPL)) + 64
+    LDS_BYTES = LTID + 4 * NTH  # [NTH] each thread's id (own_tid)
     assert LDS_BYTES <= 160 * 1024, LDS_BYTES
 
     def cpart(kk):  # row iteration kk is the partial last one
@@ -463,8 +467,15 @@ def compile_bigm_layer(
         sa = fx.SharedAllocator()
         st = sa.allocate(Shared).peek()
         L = fx.Int32(fx.ptrtoint(st.raw.ptr))
-        tid0 = fx.Int32(gpu.thread_id("x"))
-        tid = tid0
+        tid = fx.Int32(gpu.thread_id("x"))
+        lds_st(L, i32(LTID) + tid * i32(4), tid)
+
+        def own_tid():
+            # the thread id through a volatile LDS load, at the start of every item: values
+            # derived from it stay inside the item (not hoisted / CSE'd across items and live
+            # through the whole loop: register spills)
+            return lds_ld_acq(L, i32(LTID) + tid * i32(4))
+
         lane = tid % i32(64)
         bid = i32(gpu.block_id("x"))
         xc = bid % i32(8)
@@ -739,7 +750,7 @@ def compile_bigm_layer(
         def item_rx(k, j):
             # io: ZX of this rank's (normed) rows -> MXFP4 rows + routing in the window; the last
             # item of a head sub-block posts it to every peer (gather C)
-            tid = opaque(tid0)
+            tid = own_tid()
             lane = tid % i32(64)
             o, s = chunk(k)
             B = i32(tp) * o
@@ -807,7 +818,7 @@ def compile_bigm_layer(
 
         @flyc.jit
         def item_s1(k, j):
-            tid = opaque(tid0)
+            tid = own_tid()
             o, s = chunk(k)
             B = i32(tp) * o
             if const_expr(SXW):
@@ -839,7 +850,7 @@ def compile_bigm_layer(
 
         @flyc.jit
         def item_s2(k):
-            tid = opaque(tid0)
+            tid = own_tid()
             _o, s = chunk(k)
             wait_ph(k, P_S1, cnt(P_S1, s))
             # route-list offsets (prefix of the counts, each thread its own expert)
@@ -872,7 +883,7 @@ def compile_bigm_layer(
 
         @flyc.jit
         def s2_greedy(k):
-            tid = opaque(tid0)
+            tid = own_tid()
             # units -> per-XCD queues: unit g of one round-robin sequence (the shared expert's
             # units, then those of the routed experts with more than UQ units) to queue g % 8,
             # slot g / 8; every other routed expert's units whole to the least-loaded queue (its
@@ -975,7 +986,7 @@ def compile_bigm_layer(
 
         @flyc.jit
         def item_s3(k, j):
-            tid = opaque(tid0)
+            tid = own_tid()
             o, s = chunk(k)
             B = i32(tp) * o
             wait_ph(k, P_S2, i32(1))  # the route-list offsets
@@ -1039,7 +1050,7 @@ def compile_bigm_layer(
 
         @flyc.jit
         def item_u_own(k, j0):
-            tid = opaque(tid0)
+            tid = own_tid()
             o, s = chunk(k)
             B = i32(tp) * o
             wait_ph(k, P_S3, cnt(P_S3, s))
@@ -1082,16 +1093,17 @@ def compile_bigm_layer(
                     r_rt,
                     nrt * i32(H * 2),
                 )
-                # release: the unit's route rows out of this XCD's L2
+                # release: the unit's route rows out of this XCD's L2 (agent-scope release
+                # fence: buffer_wbl2 sc1 + wait)
                 wait_vm(0)
                 gpu.barrier()
                 if tid == i32(0):
-                    l2_writeback()
+                    fence_release(fx.rocdl.SyncScope.Agent)
                 done_last(k, P_U, i32(-1))  # counts units done (no single last)
 
         @flyc.jit
         def item_rq(k, j):
-            tid = opaque(tid0)
+            tid = own_tid()
             lane = tid % i32(64)
             o, s = chunk(k)
             B = i32(tp) * o
@@ -1236,7 +1248,7 @@ def compile_bigm_layer(
             # an RF item (ZQ rows of chunk k, from i0, in sub-block b), once every peer's E
             # rows of its sub-block and this rank's topk sums of it are in:
             # (tid, o, s, B, sb, i0, b, the received E rows)
-            tid = opaque(tid0)
+            tid = own_tid()
             o, s = chunk(k)
             B = i32(tp) * o
             sb = s // i32(NSB)
