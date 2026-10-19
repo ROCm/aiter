@@ -180,6 +180,8 @@ def build_moe_apre_fused_quant_scatter_module(
     feat_dim: int,
     wmma_rep: int,
     scatter_only: bool = False,
+    src_scale_stride_bytes: int = 0,
+    row_major_scale: bool = False,
 ):
     """Persistent two-phase source-quant + M16 A-preshuffle scatter.
 
@@ -193,6 +195,10 @@ def build_moe_apre_fused_quant_scatter_module(
     The launch grid must be persistent (all workgroups resident together), since
     the phase boundary is a hand-rolled global barrier.  On gfx1250, four
     512-thread workgroups per CU fill the 64 available wave slots.
+
+    Scatter-only skips quantization and the global phase barrier. Its input
+    scale rows may have a padded byte stride, and its output scales may be
+    row-major for GEMM1's prequantized-input path.
     """
     L = _quant_layout(feat_dim, "fp4", wmma_rep)
     if not L.use_pk8 or L.lanes_per_mx_block != 4:
@@ -210,10 +216,22 @@ def build_moe_apre_fused_quant_scatter_module(
     payload_bytes_per_row = L.payload_bytes_per_row
     payload_dwords_per_row = payload_bytes_per_row // 4
     scale_dwords_per_row = L.mx_blocks_per_row // 4
+    src_scale_stride_bytes = src_scale_stride_bytes or L.mx_blocks_per_row
+    if src_scale_stride_bytes < L.mx_blocks_per_row or src_scale_stride_bytes % 4:
+        raise ValueError("input scale stride must cover the row and be dword aligned")
+    if not scatter_only and (
+        src_scale_stride_bytes != L.mx_blocks_per_row or row_major_scale
+    ):
+        raise ValueError("scale layout overrides require scatter-only mode")
+    src_scale_dwords_per_row = src_scale_stride_bytes // 4
     module_kind = "scatter" if scatter_only else "fused_quant_scatter"
     module_name = (
         f"moe_apre_{module_kind}_fd{feat_dim}_r{wmma_rep}_" f"fp4_pk8_w16_tk{tile_k}"
     )
+    if src_scale_stride_bytes != L.mx_blocks_per_row:
+        module_name += f"_ss{src_scale_stride_bytes}"
+    if row_major_scale:
+        module_name += "_rm"
     _is_gfx12 = str(L.arch).startswith("gfx12")
 
     @flyc.kernel(name=module_name, known_block_size=[block_threads, 1, 1])
@@ -368,7 +386,7 @@ def build_moe_apre_fused_quant_scatter_module(
             fx.Int64(ptrtoint(grouped_payload)),
             num_records_bytes=_SCALE_RSRC_MAX_BYTES,
         )
-        compact_scale_dwords = fx.Uint32(token_num) * fx.Uint32(scale_dwords_per_row)
+        compact_scale_dwords = fx.Uint32(token_num) * fx.Uint32(src_scale_dwords_per_row)
         grouped_scale_dwords = fx.Uint32(n_rows) * fx.Uint32(scale_dwords_per_row)
         compact_scale_p = ptr_buf_tensor(
             compact_scale,
@@ -420,7 +438,7 @@ def build_moe_apre_fused_quant_scatter_module(
                     scale_half = lane - scale_k_inner * fx.Uint32(2)
                     scale_k256 = k_tile + scale_k_inner
                     src_scale_idx = (valid & scale_lane).select(
-                        src_row * fx.Uint32(scale_dwords_per_row)
+                        src_row * fx.Uint32(src_scale_dwords_per_row)
                         + scale_k256 * fx.Uint32(2)
                         + scale_half,
                         compact_scale_dwords,
@@ -520,7 +538,18 @@ def build_moe_apre_fused_quant_scatter_module(
                         grouped_scale_dwords,
                     )
                     gpu.barrier()
-                    scale_p[dst_scale_idx] = scale_out
+                    if const_expr(row_major_scale):
+                        # Keep the received row's scale dwords contiguous, as
+                        # expected by GEMM1's row-major scale loads.
+                        dst_row_scale_idx = scale_lane.select(
+                            row * fx.Uint32(scale_dwords_per_row)
+                            + k_tile * fx.Uint32(2)
+                            + lane,
+                            grouped_scale_dwords,
+                        )
+                        scale_p[dst_row_scale_idx] = scale_dword
+                    else:
+                        scale_p[dst_scale_idx] = scale_out
                     buffer_ops.buffer_store(
                         out_vec,
                         grouped_payload_rsrc,

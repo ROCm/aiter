@@ -3203,6 +3203,8 @@ def _get_compiled_apre_fused_quant_scatter(
     feat_dim: int,
     wmma_rep: int,
     scatter_only: bool = False,
+    src_scale_stride_bytes: int = 0,
+    row_major_scale: bool = False,
 ):
     from aiter.ops.flydsl.kernels.moe_apreshuffled_quant_scatter import (
         build_moe_apre_fused_quant_scatter_module,
@@ -3212,6 +3214,8 @@ def _get_compiled_apre_fused_quant_scatter(
         feat_dim,
         wmma_rep,
         scatter_only,
+        src_scale_stride_bytes,
+        row_major_scale,
     )
 
 
@@ -3299,9 +3303,8 @@ def flydsl_moe_fused_quant_preshuffle(
     # ``quant_mode``: the sender already quantized, so the kernel only scatters
     # + preshuffles.
     prequantized_scale: torch.Tensor | None = None,
-    # (contiguous_m,) int32 out: grouped row -> source token. Supplying it selects
-    # the compact scale, so ``out_scale`` takes one row-major row per token and the
-    # caller rebuilds the GEMM's layout with flydsl_moe_scatter_preshuffle_scale.
+    # (contiguous_m,) int32 grouped row -> source token. A-preshuffle consumes
+    # this map with -1 for padding; the compact-scale path writes it instead.
     row_to_token: torch.Tensor | None = None,
     ep_psum_params: dict | None = None,
     # Prequantized full-row path only. Writes e8m0 as (row, K/32) instead of
@@ -3491,7 +3494,18 @@ def flydsl_moe_fused_quant_preshuffle(
                 stream=torch.cuda.current_stream(),
             )
             return out_payload, out_scale
-        if payload_preshuffled and not prequantized:
+        # The M16 scatter consumes a finalized inverse map and K1024 tiles.
+        # Keep the route-copy fallback for callers without that layout.
+        use_prequantized_apre_scatter = (
+            prequantized
+            and row_to_token is not None
+            and feat_dim % 1024 == 0
+            and not remap_rows
+            and not fuse_ep_psum
+        )
+        if payload_preshuffled and (
+            not prequantized or use_prequantized_apre_scatter
+        ):
             if row_to_token is None:
                 raise ValueError(
                     "A-preshuffle tile quant requires grouped-row -> token mapping"
@@ -3505,6 +3519,45 @@ def flydsl_moe_fused_quant_preshuffle(
             ) in ("1", "true", "True")
 
             from aiter.jit.utils.chip_info import get_cu_num
+
+            if prequantized:
+                # MoRI already produced packed FP4 and padded E8M0 rows.
+                # Scatter directly from those buffers; no quantization, scratch
+                # copy, or global phase barrier is needed.
+                apre_workers = min(
+                    n_rows // 16,
+                    max(
+                        1,
+                        int(
+                            os.environ.get(
+                                "AITER_FLYDSL_APRE_FUSED_WORKERS",
+                                4 * (get_cu_num() or 1),
+                            )
+                        ),
+                    ),
+                )
+                payload_ptr = ptr_arg(grouped_in.contiguous().view(-1))
+                scale_ptr = ptr_arg(prequantized_scale.view(-1))
+                _get_compiled_apre_fused_quant_scatter(
+                    feat_dim,
+                    wmma_rep,
+                    scatter_only=True,
+                    src_scale_stride_bytes=int(prequantized_scale.shape[-1]),
+                    row_major_scale=row_major_scale,
+                )(
+                    payload_ptr,
+                    payload_ptr,
+                    scale_ptr,
+                    ptr_arg(out_payload.view(-1)),
+                    ptr_arg(out_scale.view(-1)),
+                    ptr_arg(row_to_token.reshape(-1)),
+                    scale_ptr,
+                    token_num,
+                    n_rows,
+                    apre_workers,
+                    stream=torch.cuda.current_stream(),
+                )
+                return out_payload, out_scale
 
             compact_payload = torch.empty(
                 (token_num, Pb), dtype=torch.uint8, device=device
