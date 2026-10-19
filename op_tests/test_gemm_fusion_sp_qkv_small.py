@@ -2038,3 +2038,119 @@ def test_test_utils_arena_probe_registers_once_checks_views_and_uses_rank_as_dev
     be.heap = 4 << 30
     assert tu.run(tu.sequence("gate03_prefix"), 4 << 30, 3, 4, FakeDist(), be, "g")
     assert B.devs[-1] == (3, 3) and capsys.readouterr().out.count("result=OK") == 5
+
+# ======================================================================= ctypes bindings vs the native extern "C" exports (a fake backend must not hide a missing symbol)
+import ast as _ast
+import re as _re
+
+_SYM = _re.compile(r"^(gf|sm|lg)_[a-z0-9_]+_v\d+$")
+_RUNTIME_PY = ("aiter/gemm_fusion/resources.py", "aiter/ops/gemm_fusion/sp_qkv/small_rt.py", "aiter/ops/gemm_fusion/sp_qkv/large_rt.py")
+_HOST_CPP = {"gf": "gf_comm.cpp", "sm": "sm_fusion_driver.cpp", "lg": "lg_fusion_driver.cpp"}
+
+
+def _repo(*parts):
+    return os.path.join(os.path.dirname(__file__), "..", *parts)
+
+
+def _cpp_exports_of(path, _seen=None):
+    """Names of the C functions DEFINED in a host .cpp (return-type + name at line start), following `#include "...cpp"` (the vendored drivers are included unmodified)."""
+    _seen = _seen if _seen is not None else set()
+    path = os.path.normpath(path)
+    _seen.add(path)
+    text = open(path, encoding="utf-8").read()
+    # a DEFINITION: return type + name + (params) + '{' (parameters may span lines; a declaration ends in ';' and is not an export)
+    names = set(_re.findall(r"^[ \t]*(?:extern\s+\"C\"\s+)?(?:int32_t|int|void\*|void|uint32_t|uint64_t|const char\*)\s+((?:gf|sm|lg)_[a-z0-9_]+_v\d+)\s*\([^;{]*?\)\s*\{",
+                            text, _re.M))
+    for inc in _re.findall(r'#include\s+"([^"]+\.cpp)"', text):
+        p = os.path.normpath(os.path.join(os.path.dirname(path), inc))
+        if os.path.exists(p) and p not in _seen:
+            names |= _cpp_exports_of(p, _seen)
+    return names
+
+
+def _py_bound_and_called(source):
+    """(bound, called): the native symbol names a Python source binds (string constants in argtypes tables, `lib.<name>` attributes) and the ones it CALLS."""
+    tree = _ast.parse(source)
+    bound, called = set(), set()
+    docs = {id(n.value) for n in _ast.walk(tree) if isinstance(n, _ast.Expr) and isinstance(n.value, _ast.Constant)}  # bare string statements (docstrings) are not bindings
+    for n in _ast.walk(tree):
+        if isinstance(n, _ast.Constant) and id(n) not in docs and isinstance(n.value, str) and _SYM.match(n.value):
+            bound.add(n.value)
+        elif isinstance(n, _ast.Attribute) and _SYM.match(n.attr):
+            bound.add(n.attr)
+        if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Attribute) and _SYM.match(n.func.attr):
+            called.add(n.func.attr)
+    return bound, called
+
+
+def _check_bindings(py_sources: dict, exports: dict):
+    """-> (missing {file: [names not exported by their library]}, dead [bound but called nowhere in the runtime])."""
+    missing, all_bound, all_called = {}, set(), set()
+    for f, src in py_sources.items():
+        b, c = _py_bound_and_called(src)
+        all_called |= c
+    for f, src in py_sources.items():
+        b, _c = _py_bound_and_called(src)
+        all_bound |= b
+        bad = sorted(n for n in b if n not in exports[n.split("_")[0]])
+        if bad:
+            missing[f] = bad
+    return missing, sorted(all_bound - all_called)
+
+
+def _runtime_sources():
+    out = {}
+    for rel in _RUNTIME_PY:
+        out[rel] = open(_repo(rel), encoding="utf-8").read()
+    called_elsewhere = ""
+    base = _repo("aiter", "ops", "gemm_fusion", "sp_qkv")
+    for fn in ("variants.py", "variants_large.py"):
+        called_elsewhere += open(os.path.join(base, fn), encoding="utf-8").read() + "\n"
+    return out, called_elsewhere
+
+
+def test_every_ctypes_binding_exists_in_the_native_exports_and_none_is_dead():
+    exports = {k: _cpp_exports_of(_repo("csrc", "gemm_fusion", "sp_qkv", "host", v)) for k, v in _HOST_CPP.items()}
+    assert len(exports["gf"]) >= 15 and len(exports["sm"]) >= 6 and len(exports["lg"]) >= 8, {k: len(v) for k, v in exports.items()}  # the extraction really found them
+    py, other = _runtime_sources()
+    missing, dead = _check_bindings(py, exports)
+    assert not missing, f"ctypes bindings with no native export (a fake backend would hide this: AttributeError undefined symbol at load): {missing}"
+    # a bound name counts as used when ANY runtime module calls it (the attach/window_bytes entries are called from variants*.py)
+    _b, called_elsewhere = _py_bound_and_called(other)
+    dead = [n for n in dead if n not in called_elsewhere]
+    assert not dead, f"bound but never called anywhere in the runtime (remove the binding and the native): {dead}"
+    # every native export that Python binds is a REAL definition: spot-check the ones the A-1 / teardown / poison paths depend on
+    for must in ("gf_abi_info_v1", "gf_win_info_v1", "gf_win_view_v1", "gf_win_free_v1", "gf_zero_v1", "gf_mem_info_v1", "gf_devcomm_info_v1"):
+        assert must in exports["gf"], must
+    assert "gf_comm_va_info_v1" not in exports["gf"] and not any("gf_comm_va_info_v1" in s for s in py.values())  # the removed native is not bound any more
+
+
+def test_binding_checker_flags_a_missing_native_and_a_dead_binding_negative_controls():
+    exports = {"gf": {"gf_a_v1", "gf_b_v1"}, "sm": set(), "lg": set()}
+    good = 'lib.gf_a_v1.restype = 1\nx = lib.gf_a_v1(2)\nfor n, a in [("gf_b_v1", [])]:\n    f = getattr(lib, n)\ny = lib.gf_b_v1(3)\n'
+    assert _check_bindings({"p.py": good}, exports) == ({}, [])
+    # the real incident: a name left in the argtypes table after its native was removed
+    stale = good + 'for n, a in [("gf_comm_va_info_v1", [])]:\n    pass\n'
+    missing, _dead = _check_bindings({"p.py": stale}, exports)
+    assert missing == {"p.py": ["gf_comm_va_info_v1"]}
+    # a binding that nothing calls is reported as dead
+    dead_src = 'for n, a in [("gf_a_v1", []), ("gf_b_v1", [])]:\n    f = getattr(lib, n)\nx = lib.gf_a_v1(1)\n'
+    assert _check_bindings({"p.py": dead_src}, exports) == ({}, ["gf_b_v1"])
+    # comments and docstrings are not bindings
+    assert _py_bound_and_called('# lib.gf_zzz_v1(1)\n"""gf_yyy_v1"""\n') == (set(), set())
+    # the C++ extraction: definitions yes, declarations/calls no, included drivers followed
+    import tempfile
+    import uuid
+    from pathlib import Path
+
+    d = Path(tempfile.gettempdir()) / ("exp_" + uuid.uuid4().hex)
+    d.mkdir()
+    try:
+        (d / "inc.cpp").write_text('extern "C" {\nint32_t sm_inner_v1(void* c) {\n  return 0;\n}\n}\n')
+        (d / "top.cpp").write_text('#include "inc.cpp"\nextern "C" {\nint32_t gf_outer_v1(int x) { return gf_other_v1(x); }\nvoid* lg_ptr_v1(void* h) { return h; }\n'
+                                   'int32_t gf_decl_only_v1(int);\n}\n')
+        assert _cpp_exports_of(str(d / "top.cpp")) == {"sm_inner_v1", "gf_outer_v1", "lg_ptr_v1"}
+    finally:
+        import shutil
+
+        shutil.rmtree(d, ignore_errors=True)
