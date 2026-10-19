@@ -108,12 +108,10 @@ def _job_key(job: dict) -> tuple:
 def parse_csv(
     csv_path: "str | io.TextIOBase", swiglu_limit: float | None = None
 ) -> "list[dict[str, object]]":
-    """Parse jobs with the caller's limit or AITER_MXFP4_TUNE_SWIGLU_LIMIT.
+    """Parse a tuned CSV path or text stream into deduplicated AOT jobs.
 
-    An unset/empty environment preserves activation defaults. Batch AOT uses
-    this same entry point; the caller supplies matching tuning/deployment settings.
-    ``csv_path`` may be a filesystem path or an already-open text stream (used
-    by ``jobs_from_rows`` for in-memory tuner candidates).
+    ``swiglu_limit`` defaults to AITER_MXFP4_TUNE_SWIGLU_LIMIT, else the
+    activation default.
     """
     from aiter.ops.flydsl.moe_common import (
         DEFAULT_SITUV2_BETA,
@@ -130,7 +128,7 @@ def parse_csv(
 
     if swiglu_limit is None:
         swiglu_limit = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT") or None
-    # Read the same exact opt-in gates as production for this collection.
+    # Same opt-in gates as production.
     mxfp4_intermediate = os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") == "1"
     stage2_fp8_route_out = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
     if swiglu_limit is not None:

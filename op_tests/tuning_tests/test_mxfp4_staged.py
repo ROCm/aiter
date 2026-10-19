@@ -1,12 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Controlled MXFP4 staged search checks; no GPU kernels or measurements run.
+"""MXFP4 staged search tests: CLI, planning, screening and worker supervision.
 
-Covers CLI and shape planning, screening execution with fake GPU setup and
-measurement callables, and the private-Pipe shape supervisor. The normal
-ROCm/FlyDSL toolchain is needed for imports. GPU tensor preparation, profiling
-and real shape-worker launches are fail-closed; the supervisor checks admit only
-the explicit CPU worker targets defined here.
+CPU only; GPU work and real shape workers are blocked.
 """
 
 import argparse
@@ -1423,8 +1419,7 @@ def run_in_thread(
 class TestStagedSupervisor:
     """Private-Pipe supervisor checks with explicit CPU-only shape workers."""
 
-    # Overrides the module-level autouse fixture of the same name: run the
-    # same GPU prohibitions, then admit only the CPU worker targets above.
+    # Overrides the module fixture to also allow the CPU workers above.
     @pytest.fixture(autouse=True)
     def prohibit_real_shape_workers_and_gpu_data(
         self, monkeypatch: "pytest.MonkeyPatch"

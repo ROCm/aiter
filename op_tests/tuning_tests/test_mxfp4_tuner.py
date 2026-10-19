@@ -1,11 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Controlled MXFP4 tuner checks; no GPU kernels or measurements run.
+"""MXFP4 tuner tests: lifecycle, configuration snapshot and timeouts.
 
-Covers the tuning lifecycle, the invocation configuration snapshot and the staged
-operation timeout. Full-module imports require the normal AITER ROCm/FlyDSL
-toolchain. Import-time rocminfo/hipinfo discovery is synthetic; devices and
-measurement outcomes are simulated at the approved tuning boundaries.
+CPU only; devices and measurements are simulated.
 """
 
 import argparse
@@ -127,8 +124,7 @@ RESULTS = [
 def prohibit_real_shape_workers_and_gpu_data(
     monkeypatch: "pytest.MonkeyPatch",
 ) -> "None":
-    # Spawn does not inherit parent mocks. Every multi-slot fixture must replace
-    # this boundary with controlled scheduling, even while the code is red.
+    # Spawned workers do not inherit mocks; multi-slot tests must stub scheduling.
     def forbidden(*args: "object", **kwargs: "object") -> "None":
         pytest.fail("controlled lifecycle test reached real GPU work")
 
