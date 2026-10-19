@@ -41,6 +41,7 @@ from unittest import mock
 import torch
 
 from aiter.aot.flydsl.common import replay_env, run_jobs_parallel
+from aiter_worker_limits import adopt_legacy_max_jobs
 
 ARCH = "gfx950"
 # The combine launch geometry is tuned per GPU model, read from the device name.
@@ -320,4 +321,5 @@ def main():
 
 
 if __name__ == "__main__":
+    adopt_legacy_max_jobs()
     main()

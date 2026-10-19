@@ -16,7 +16,7 @@ every FlyDSL launch on that path is compiled into the cache instead. This
 module only builds what a caller passes in: activations, routing, and weights
 quantized and preshuffled the way ``op_tests/test_moe_2stage.py`` prepares
 them, plus the caller-side choices a row does not pin down (bias, gate/up
-layout, SiTUv2 betas, ``num_local_tokens``).
+layout, SiTUv2 betas, ``num_local_tokens``, FHMoE's ``clamp_shared``).
 
 A row tuned at token count T also serves smaller M that ``get_padded_M`` maps
 to T, and some compile-time parameters follow the actual M, so each row is
@@ -67,6 +67,7 @@ from aiter.aot.flydsl.common import (
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
+from aiter_worker_limits import adopt_legacy_max_jobs
 
 # Keep the default AOT coverage aligned with runtime config resolution.
 DEFAULT_CSVS = [
@@ -173,9 +174,13 @@ def _variants(row: dict) -> list[dict]:
     )
     from aiter.ops.flydsl.mxfp4_kname import _is_mxfp4_kname
 
+    clamps = [True]
     if _int(row["shared_expert_id"], -1) >= 0:
         gate_modes = [GateMode[_name(row["gate_mode"]) or "SEPARATED"]]
         biases = ["none"]
+        # Only MXFP8 routed weights let a caller leave the shared expert unclamped.
+        if _name(row["q_dtype_w"]) in _FP8:
+            clamps.append(False)
     else:
         gate_modes = [_caller_gate_mode(row)]
         if _is_mxfp4_kname(row["kernelName1"]):
@@ -203,11 +208,13 @@ def _variants(row: dict) -> list[dict]:
             "beta": beta,
             "linear_beta": linear_beta,
             "local_tokens": local_tokens,
+            "clamp_shared": clamp_shared,
         }
         for local_tokens in (False, True)
         for gate_mode in gate_modes
         for bias in biases
         for beta, linear_beta in betas
+        for clamp_shared in clamps
     ]
 
 
@@ -398,7 +405,11 @@ def _replay(job: dict) -> None:
     if shared_expert_id >= 0:
         from aiter.fhmoe import _fhmoe_impl
 
-        _fhmoe_impl(**common, shared_expert_id=shared_expert_id)
+        _fhmoe_impl(
+            **common,
+            shared_expert_id=shared_expert_id,
+            clamp_shared=job["clamp_shared"],
+        )
         return
 
     from aiter.fused_moe import _fused_moe_impl
@@ -451,6 +462,8 @@ def _describe(job: dict) -> str:
         variant.append(f"beta={job['beta']:g}/{job['linear_beta']:g}")
     if job["local_tokens"]:
         variant.append("num_local_tokens")
+    if not job["clamp_shared"]:
+        variant.append("clamp_shared=False")
     return (
         f"{job['kernel_name']}  token={job['token']} m={job['m']} "
         f"dims=({job['model_dim']},{job['inter_dim']}) E={job['expert']} "
@@ -637,14 +650,23 @@ def run(csv_paths: list[str], *, edges: bool = True, check: bool = False) -> int
     workers = get_max_workers(len(jobs))
     jobs_per_arch = Counter(job_arch(job) for job in jobs)
     if jobs_per_arch:
-        # Importing aiter builds its C++ core module with the flags of the
-        # importing process's arch, and not every toolchain builds every arch
-        # (ROCm 7.2's HIP lacks the cluster launch gfx1250 builds turn on). The
-        # module has no device code, so build it once, before the replays race
-        # for it.
-        core_arch = jobs_per_arch.most_common(1)[0][0]
-        command = [sys.executable, "-c", "import aiter"]
-        subprocess.run(command, env=replay_env(core_arch, 1), check=True)
+        # Importing aiter builds its C++ core module, and the two-stage replays
+        # load another for a host-side query. Built by a replay, each would take
+        # that replay's arch flags, which not every toolchain builds (ROCm 7.2's
+        # HIP lacks the cluster launch gfx1250 builds turn on), and its share of
+        # the workers. The replays run only their host code, so build both once,
+        # first, with the whole budget.
+        two_stage = Counter(job_arch(job) for job in jobs if not _is_grouped(job))
+        arch = (two_stage or jobs_per_arch).most_common(1)[0][0]
+        prepare = "import aiter"
+        if two_stage:
+            cu_num = next(_int(job["cu_num"]) for job in jobs if job_arch(job) == arch)
+            prepare = (
+                "from aiter.aot.flydsl.moe import _load_host_helpers; "
+                f"_load_host_helpers({arch!r}, {cu_num})"
+            )
+        command = [sys.executable, "-c", prepare]
+        subprocess.run(command, env=replay_env(arch), check=True)
     replays = []
     for arch in archs:
         command = [sys.executable, "-m", "aiter.aot.flydsl.moe", "--arch", arch]
@@ -720,4 +742,5 @@ def main():
 
 
 if __name__ == "__main__":
+    adopt_legacy_max_jobs()
     main()
