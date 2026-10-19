@@ -741,6 +741,27 @@ def _plain_reads_pitch(rows: int, width: int, k: int, device: int) -> bool:
     return bool(topk_plain_reads_pitch(rows, width, k))
 
 
+@lru_cache(maxsize=1024)
+def _plain_reads_pitch_ranged(
+    rows: int, width: int, pitch: int, k: int, device: int
+) -> bool:
+    """Whether plain reads uniform rows at `pitch` in place through its ranged
+    form -- every row from column 0 to `width` -- where its uniform kernels do
+    not read the pitch (`_plain_reads_pitch`) and `topk_plain` would copy them.
+
+    The ranged form hands the launcher the pitch as the row length. Where both
+    forms take the one-block kernel (`_plain_multiblock`) it runs the kernel
+    the copy would feed, minus the copy. Wherever the multi-block kernel takes
+    either, the pitch decides its speed, not monotonically, and it can run
+    slower than the copy, so those keep the copy.
+    """
+    return not (
+        _plain_reads_pitch(rows, width, k, device)
+        or _plain_multiblock(rows, width, k, False, device)
+        or _plain_multiblock(rows, pitch, k, True, device)
+    )
+
+
 @lru_cache(maxsize=8)
 def _plain_width(name: str) -> int:
     """A row length bounding plain's one-block kernels (`topk_plain_width`),
@@ -898,12 +919,13 @@ def _plain_takes(
     `_RAGGED_K2048_STREAM_MAX_WIDTH`.
 
     Uniform rows at a pitch past their width (`stride0`) are read in place
-    only where `_plain_reads_pitch` holds -- gfx950's k=2048 one-block kernels
-    and the register window -- and copied first elsewhere. On gfx950 the
+    where `_plain_reads_pitch` holds -- gfx950's k=2048 one-block kernels and
+    the register window -- or through plain's ranged form where
+    `_plain_reads_pitch_ranged` does, and copied first elsewhere. On gfx950 the
     backends that read them in place measured faster than that copy and plain
     on every such cell plain was routed (165 of 165, 0.78x, at most 0.99x), so
-    plain declines them there. Elsewhere that was not measured, and plain keeps
-    them.
+    plain declines them there; its ranged form beat those backends on 136 of
+    the 165 but ran up to 1.19x slower on the rest. Elsewhere plain keeps them.
     """
     if not ragged and stride0 is not None and stride0 != width:
         if device is None:
@@ -1558,18 +1580,29 @@ def _dispatch(
     elif backend == "plain":
         # plain takes a [start, end) pair, not a length, and an empty
         # `rowStarts` with a real `rowEnds` reads as "no range" -- silently over
-        # the whole row. Pass the pair only when the rows really differ: uniform
-        # rows through the ranged overload cost 294918 launches against 25.
+        # the whole row. Pass the pair only when the rows really differ, or
+        # when uniform rows sit at a pitch the uniform form would copy them
+        # past and the ranged form reads them in place on the same kernel
+        # (`_plain_reads_pitch_ranged`). Off the radix path the ranged overload
+        # loops per row -- 294918 launches against 25 -- but plain is admitted
+        # only on it, and C++ decides that from the width, not the pitch.
         # The values are never read: whatever this entry returns is gathered
         # from `input` at `idx` below, because that is the only form that stays
         # consistent through the reorderings. So ask for the build that does not
         # write them, which `_available` admits plain only for, with NaN of
         # either sign ranked above +inf.
+        width = input.shape[1]
+        pitch = input.stride(0) if rows > 1 else width
         if ragged:
             starts = _zero_rows(rows, input.get_device())
             topk_plain(
                 input, idx, None, topk, True, starts, row_lens, -1, 1, nan_high=True
             )
+        elif pitch > width and _plain_reads_pitch_ranged(
+            rows, width, pitch, topk, input.get_device()
+        ):
+            starts, ends = _default_bounds(rows, width, input.get_device())
+            topk_plain(input, idx, None, topk, True, starts, ends, -1, 1, nan_high=True)
         else:
             empty = _no_range(input.device)
             topk_plain(input, idx, None, topk, True, empty, empty, -1, 1, nan_high=True)

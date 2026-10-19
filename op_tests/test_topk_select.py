@@ -479,6 +479,61 @@ def test_pitch_routing():
     return failures
 
 
+def test_plain_pitch_in_place():
+    """Rows at a pitch past their width that are routed to plain are read in
+    place, not copied, wherever its uniform kernels or its ranged form read
+    that pitch (`_plain_reads_pitch`, `_plain_reads_pitch_ranged`).
+
+    Off gfx950 plain copied every such call first, doubling the input's memory.
+    """
+    import aiter.ops.topk_select as ts
+
+    dev = torch.cuda.current_device()
+    wave = wave_size_of(dev)
+    failures, checked, copies = [], 0, []
+    real = torch.Tensor.contiguous
+
+    def spy(t, *args, **kwargs):
+        out = real(t, *args, **kwargs)
+        if out.data_ptr() != t.data_ptr():
+            copies.append(tuple(t.shape))
+        return out
+
+    for rows in (8, 256, 4096):
+        for width in (4097, 8192, 8193, 32768, 65536):
+            for k in (1024, 2048):
+                for pitch in (width + 64, 2 * width):
+                    route = ts._choose.__wrapped__(
+                        rows, width, pitch, k, wave, False, None, False, True, dev, True
+                    )
+                    if route != "plain" or not (
+                        ts._plain_reads_pitch(rows, width, k, dev)
+                        or ts._plain_reads_pitch_ranged(rows, width, pitch, k, dev)
+                    ):
+                        continue
+                    checked += 1
+                    torch.manual_seed(rows + width + k)
+                    x = torch.randn(rows, pitch)[:, :width]
+                    lens = torch.full((rows,), width, dtype=dtypes.i32)
+                    label = f"{rows}x{width} k={k} pitch={pitch}"
+                    copies.clear()
+                    torch.Tensor.contiguous = spy
+                    try:
+                        idx = topk_select(x, k)[1]
+                        torch.cuda.synchronize()
+                    finally:
+                        torch.Tensor.contiguous = real
+                    if copies:
+                        failures.append(f"{label}: copied the rows")
+                    if not torch.equal(_sorted_values(x, idx), run_torch(x, lens, k)):
+                        failures.append(f"{label}: wrong selection")
+    if not checked and get_gfx() in ("gfx942", "gfx950"):
+        failures.append("no shape reached plain at a pitch it reads in place")
+    for label in failures:
+        aiter.logger.error("PLAIN PITCH IN PLACE FAILED: %s", label)
+    return failures
+
+
 # One shape per FlyDSL backend, with the first call that puts a stride of 1 on
 # the leading axis: a (1, n) row, or for k = 1 an (m, 1) column, strides (1, 1).
 _UNIT_STRIDE_ROUTES = (
@@ -1141,6 +1196,12 @@ def main():
         "pitch routing: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
     )
     assert not bad, f"pitch routing: {len(bad)} failed"
+    bad = test_plain_pitch_in_place()
+    aiter.logger.info(
+        "plain pitch in place: %s",
+        "all hold" if not bad else f"{len(bad)} FAILED: {bad}",
+    )
+    assert not bad, f"plain pitch in place: {len(bad)} failed"
     bad = test_unit_stride_first()
     aiter.logger.info(
         "unit stride first: %s",
