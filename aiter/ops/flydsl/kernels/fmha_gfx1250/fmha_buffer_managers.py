@@ -904,8 +904,16 @@ class KManager16bV1(_AsyncTransport):
         _assert_multiple("n_block", self.n_block, num_splits * _WMMA_M)
         return self.n_block // num_splits
 
+    @property
+    def loads_per_frag(self):
+        return 2  # b128 is 16 B; a WMMA operand is 32 B/lane at either width
+
     def num_ds_loads(self):
-        return (self.n_block // _WMMA_M) * (self.qk_hdim // self.wmma_k) * 2
+        return (
+            (self.n_block // _WMMA_M)
+            * (self.qk_hdim // self.wmma_k)
+            * self.loads_per_frag
+        )
 
     def _ds_load_plan(self, num_splits, lds_imm_offset=0):
         """``[(base_idx, imm)]`` in ``_pv_qk_gemm``'s K order ``[(kv, dt, half)...]``, each
@@ -1019,8 +1027,16 @@ class VManager16bV1(_AsyncTransport):
         _assert_multiple("n_block", self.n_block, num_splits * self.wmma_k)
         return self.n_block // num_splits
 
+    @property
+    def loads_per_frag(self):
+        return 32 // (16 if self.elem_bytes == 2 else 8)  # tr16_b128 vs tr8_b64
+
     def num_ds_loads(self):
-        return (self.v_hdim // _WMMA_M) * (self.n_block // self.wmma_k) * 2
+        return (
+            (self.v_hdim // _WMMA_M)
+            * (self.n_block // self.wmma_k)
+            * self.loads_per_frag
+        )
 
     def _ds_load_plan(self, num_splits, lds_imm_offset=0):
         """``[(base_idx, imm)]`` in ``_pv_qk_gemm``'s V order ``[(dt, kt, half)...]``, each

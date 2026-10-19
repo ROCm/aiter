@@ -391,21 +391,22 @@ def _keepalive(vals):
     )
 
 
-def _ring_num_prefetch(num_frag, ring, ring_lag):
+def _ring_num_prefetch(num_ld, ring, ring_lag):
     """In-flight ds_load depth (NP) of a ``_ring_drive`` with this geometry. A tile that
     fits in the ring never wraps, so nothing is refilled and the WAR lag buys nothing --
     prefetch it whole. Only a wrapping ring pays for lag."""
-    num_ld = 2 * num_frag
     if num_ld <= ring:
         return num_ld
     return ring - 2 * ring_lag
 
 
-def _ring_drive(*, num_frag, emit, consume, ring, ring_lag, head=None, dies=None):
+def _ring_drive(*, widths, emit, consume, ring, ring_lag, head=None, dies=None):
     """Drive a fully-unrolled LDS->VGPR ring feeding a WMMA stream.
 
-    ``emit(j)`` emits ds_load ``j`` (2 per WMMA fragment); ``consume(i, lo, hi)`` emits
-    fragment ``i``'s WMMA chain. Only ``ring`` loads are live at once and
+    ``widths[i]`` is how many ds_loads fragment ``i`` is built from -- 2 where one load
+    covers half a 32-byte operand (b128), 4 where it covers a quarter (8-bit V, whose
+    transpose load is the half-width ``tr8_b64``). ``emit(j)`` emits ds_load ``j`` of the
+    flat stream; ``consume(i, *parts)`` emits fragment ``i``'s WMMA chain. Only ``ring`` loads are live at once and
     ``NP = ring - 2*lag`` are in flight, so a refill targets slots last read ``lag``
     fragments ago -- trading pipeline depth for WAR distance at fixed VGPR cost. Refills
     are hoisted ABOVE the wmma, which is what keeps the ring from reintroducing the
@@ -421,8 +422,12 @@ def _ring_drive(*, num_frag, emit, consume, ring, ring_lag, head=None, dies=None
     registers fall free the instant their last wmma issues and the next refill grabs them
     at a WAR distance of one VALU, instead of the ``2*rel`` the ring pairs enjoy.
     """
-    num_ld = 2 * num_frag
-    num_prefetch = _ring_num_prefetch(num_frag, ring, ring_lag)
+    num_frag = len(widths)
+    starts = [0]
+    for w in widths:
+        starts.append(starts[-1] + w)
+    num_ld = starts[-1]
+    num_prefetch = _ring_num_prefetch(num_ld, ring, ring_lag)
     ring = min(ring, num_ld)
     assert (
         num_prefetch > 0
@@ -446,20 +451,20 @@ def _ring_drive(*, num_frag, emit, consume, ring, ring_lag, head=None, dies=None
             rocdl.sched_barrier(0)
         rocdl.sched_barrier(0)  # pin the num_prefetch-deep burst above the stream
 
-    steady = num_frag - num_prefetch // 2
-    held = []  # held[i] = the pair fragment i read; released rel fragments later
+    issued = num_prefetch
+    held = []  # held[i] = the loads fragment i read; released rel fragments later
     rel = (
         ring_lag + 1
     )  # refill is hoisted, so hold one fragment PAST the refill of that slot
 
-    def _refill(i):
-        for k in range(2):
-            j = 2 * i + num_prefetch + k
-            if j < num_ld:
-                a[j % ring] = schedule_bank(
-                    emit(j), bank=1, soft=True, reason="ring_frag"
-                )
-                rocdl.sched_barrier(0)
+    def _refill(upto):
+        nonlocal issued
+        while issued < min(upto, num_ld):
+            a[issued % ring] = schedule_bank(
+                emit(issued), bank=1, soft=True, reason="ring_frag"
+            )
+            rocdl.sched_barrier(0)
+            issued += 1
 
     def _release(i):
         j = i - rel
@@ -472,29 +477,26 @@ def _ring_drive(*, num_frag, emit, consume, ring, ring_lag, head=None, dies=None
             rocdl.sched_barrier(0)
             held[j] = None
 
-    def _record(i, pair):
-        vals = list(pair) if pair is not None else []
+    def _record(i, parts):
+        vals = list(parts) if parts is not None else []
         if dies is not None:
             vals.extend(dies(i))
         held.append(tuple(vals) if vals else None)
 
-    for i in range(steady):
-        _waitn(num_prefetch - 2)
+    for i in range(num_frag):
+        # The wait is placed before the refill, so it is measured against what is already
+        # outstanding: everything issued past the end of this fragment may still be in
+        # flight, and the refill below only adds younger loads.
+        _waitn(issued - starts[i + 1])
         _release(i)
-        _refill(i)
-        lo, hi = a[(2 * i) % ring], a[(2 * i + 1) % ring]
+        refilling = issued < num_ld
+        _refill(starts[i + 1] + num_prefetch)
+        parts = tuple(a[(starts[i] + k) % ring] for k in range(widths[i]))
         rocdl.sched_barrier(0)
-        consume(i, lo, hi)
+        consume(i, *parts)
         rocdl.sched_barrier(0)
-        _record(i, (lo, hi) if ring_lag else None)
-    for i in range(steady, num_frag):
-        _waitn(num_prefetch - 2 * (i - steady + 1))
-        _release(i)
-        lo, hi = a[(2 * i) % ring], a[(2 * i + 1) % ring]
-        rocdl.sched_barrier(0)
-        consume(i, lo, hi)
-        rocdl.sched_barrier(0)
-        _record(i, None)
+        # Past the last refill nothing can clobber the slots, so holding them buys nothing.
+        _record(i, parts if (ring_lag and refilling) else None)
     for p in held:
         if p is not None:
             _keepalive(p)
@@ -760,6 +762,7 @@ def _pv_qk_gemm(
     head=None,
     ring=PVQK_RING,
     ring_lag=PVQK_LAG,
+    vld_per_frag=2,
     phase="pvqk",
 ):
     """GEMM2(u-1) then GEMM1(u) driven by ONE ring over the concatenated V-then-K
@@ -807,7 +810,7 @@ def _pv_qk_gemm(
     do_qk = phase != "pv"
     num_v_frags = d_tiles * num_contract_tiles if do_pv else 0
     num_k_frags = num_kv_frags * num_k_tiles if do_qk else 0
-    num_vld = 2 * num_v_frags
+    num_vld = vld_per_frag * num_v_frags
 
     out_list = [[None] * d_tiles for _ in range(num_q_tiles)]
     if not do_pv:
@@ -870,7 +873,7 @@ def _pv_qk_gemm(
     # in its softmax VALU here, and the gemm half must win issue arbitration.
     rocdl.s_setprio(2)
     _ring_drive(
-        num_frag=num_v_frags + num_k_frags,
+        widths=[vld_per_frag] * num_v_frags + [2] * num_k_frags,
         emit=emit,
         consume=consume,
         ring=ring,
@@ -1557,18 +1560,19 @@ def _attention_core_multi_kv_tiles(
 
     # Carried ring head: _num_head_carry of the first body's V loads, issued here (slot 0 is resident
     # -- the prologue fence just drained it) and thereafter at the end of each body.
-    _num_k_frags = k_mgr.num_ds_loads() // 2
-    _num_v_frags = v_mgr.num_ds_loads() // 2
-    _num_prefetch = _ring_num_prefetch(_num_v_frags + _num_k_frags, PVQK_RING, PVQK_LAG)
+    _num_k_frags = k_mgr.num_ds_loads() // k_mgr.loads_per_frag
+    _num_v_frags = v_mgr.num_ds_loads() // v_mgr.loads_per_frag
+    _num_vld = v_mgr.num_ds_loads()
+    _num_prefetch = _ring_num_prefetch(
+        _num_vld + k_mgr.num_ds_loads(), PVQK_RING, PVQK_LAG
+    )
     # The lagging half opens its body with softmax, so its ring head is issued there and
     # consumed after the barrier -- within one body, nothing to carry.
     # The carry is issued a body early, where only V is resident, so it cannot run past V.
     _num_head_carry = (
-        0
-        if _is_lagging_softmax
-        else min(PVQK_HEAD_CARRY, _num_prefetch, 2 * _num_v_frags)
+        0 if _is_lagging_softmax else min(PVQK_HEAD_CARRY, _num_prefetch, _num_vld)
     )
-    assert _num_head_carry <= 2 * _num_v_frags, "carried head must be V loads only"
+    assert _num_head_carry <= _num_vld, "carried head must be V loads only"
     _head_carry_idx = len(_init)
     _seed_head = []
     for j in range(_num_head_carry):
@@ -1712,7 +1716,7 @@ def _attention_core_multi_kv_tiles(
         def _vk_emit(j):
             # The ring runs V then K; past the V loads the head continues into K, matching
             # ``_pv_qk_gemm``'s emit. Both slots are resident, so either is issuable here.
-            return _v_emit(j) if j < 2 * _num_v_frags else _k_emit(j - 2 * _num_v_frags)
+            return _v_emit(j) if j < _num_vld else _k_emit(j - _num_vld)
 
         def _pvqk_head():
             # The first _num_head_carry loads came from the previous body (issued under its softmax);
@@ -2218,7 +2222,7 @@ def _attention_core_one_kv_tile(
     )
 
     # PV's ring head goes out before softmax so its LDS latency hides under the VALU.
-    _num_prefetch = _ring_num_prefetch(v_mgr.num_ds_loads() // 2, PVQK_RING, PVQK_LAG)
+    _num_prefetch = _ring_num_prefetch(v_mgr.num_ds_loads(), PVQK_RING, PVQK_LAG)
     rocdl.sched_barrier(0)
     pv_head = []
     for j in range(_num_prefetch):
