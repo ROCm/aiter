@@ -1012,6 +1012,13 @@ def _reduce_segments_gfx1250(
     )
 
 
+def _byte_span(t) -> int:
+    """Bytes from the first to the last element of t, for any strides."""
+    return (sum((s - 1) * st for s, st in zip(t.shape, t.stride())) + 1) * (
+        t.element_size()
+    )
+
+
 def _unified_attention_gfx950(
     params: _UAParams,
     config: dict,
@@ -1060,9 +1067,10 @@ def _unified_attention_gfx950(
     if 4 * TILE_SIZE * params.head_size * params.k.element_size() > _GFX950_LDS_BUDGET:
         NUM_BUFFERS = 1
 
-    # buffer ops need the tensor to fit a 32-bit offset
+    # buffer ops need the tensor to fit a 32-bit offset. k and v can be strided
+    # views of one packed cache, so use the span of the view, not its size.
     MAX_INT32 = 2**31 - 1
-    USE_LOAD_BUFFER_OP = params.k.nelement() * params.k.element_size() <= MAX_INT32
+    USE_LOAD_BUFFER_OP = max(_byte_span(params.k), _byte_span(params.v)) <= MAX_INT32
     USE_STORE_BUFFER_OP = params.out.nelement() * params.out.element_size() <= MAX_INT32
 
     _unified_attention_kernel_gfx950[grid](
