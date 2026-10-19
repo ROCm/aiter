@@ -25,12 +25,15 @@ different kernels, the M between them are bisected down to every M at which
 the runtime switches kernels: a row can switch more than once in its bucket
 (the gfx1250 stage-1 quant's K split steps through several values).
 
-aiter fixes some arch-dependent values at import (e.g. ``dtypes.fp8``), so the
-replay runs in one process per target arch, with the GPUs hidden and
-``GPU_ARCHS`` set before aiter is imported. Those processes need no GPU; they
-run side by side and split the worker budget by job count. Within one, a
-worker replays several jobs of one row in turn, so the kernels they share
-compile once.
+A row is compiled for the arch its ``gfx`` column names. With ``GPU_ARCHS``
+naming targets, as the wheel build sets it, only rows of those archs are
+replayed; unset or ``native``, every arch the tables have. aiter fixes some
+arch-dependent values at import (e.g. ``dtypes.fp8``), so the replay runs in
+one process per arch, started with ``GPU_ARCHS`` naming that arch and
+``AITER_AOT_REPLAY=1``, under which aiter's runtime arch queries answer it
+without probing a device. Those processes need no GPU; they run side by side
+and split the worker budget by job count. Within one, a worker replays several
+jobs of one row in turn, so the kernels they share compile once.
 
 Usage:
     # Compile every FlyDSL kernel the default tuned CSVs reach
@@ -44,6 +47,7 @@ Usage:
 
 Environment variables:
     FLYDSL_RUNTIME_CACHE_DIR  Cache directory (default: ~/.flydsl/cache)
+    GPU_ARCHS                 Archs to replay (default: every arch the tables have)
 """
 
 import argparse
@@ -59,6 +63,8 @@ from contextlib import contextmanager
 from unittest import mock
 
 from aiter.aot.flydsl.common import (
+    aot_target_archs,
+    check_replay_process,
     collect_aot_jobs,
     cu_num_to_arch,
     dedupe_jobs,
@@ -622,12 +628,8 @@ def _batches(jobs: list[dict]) -> list[list[dict]]:
 
 
 def _replay_arch(jobs: list[dict], arch: str) -> int:
-    """Replay ``jobs`` in this process; GPU_ARCHS must already name ``arch``."""
-    if os.environ.get("GPU_ARCHS") != arch:
-        raise RuntimeError(
-            f"replaying {arch} jobs needs GPU_ARCHS={arch} set before aiter is "
-            "imported; run through `python -m aiter.aot.flydsl.moe`"
-        )
+    """Replay ``jobs`` in this process, which ``run`` started for ``arch``."""
+    check_replay_process(arch)
     # Only the two-stage path queries it; the gfx1250 grouped path never does.
     if not all(_is_grouped(job) for job in jobs):
         _load_host_helpers(arch, _int(jobs[0]["cu_num"]))
@@ -668,9 +670,15 @@ def _replay_arch(jobs: list[dict], arch: str) -> int:
 
 
 def run(csv_paths: list[str], *, edges: bool = True, check: bool = False) -> int:
-    """Replay every FlyDSL row of ``csv_paths``, one process per target arch.
-    Returns the number of archs whose replay failed."""
+    """Replay every FlyDSL row of ``csv_paths`` whose arch ``GPU_ARCHS`` names
+    (every row when it names none), one process per arch. Returns the number of
+    archs whose replay failed."""
     jobs = collect_aot_jobs(csv_paths, functools.partial(parse_csv, edges=edges))
+    targets = aot_target_archs()
+    skipped = Counter(
+        job_arch(job) for job in jobs if targets and job_arch(job) not in targets
+    )
+    jobs = [job for job in jobs if job_arch(job) not in skipped]
     archs = sorted({job_arch(job) for job in jobs})
     rows = {tuple(job[f] for f in _ROW_KEY) for job in jobs}
     print(
@@ -678,6 +686,8 @@ def run(csv_paths: list[str], *, edges: bool = True, check: bool = False) -> int
         f"archs {', '.join(archs) or '-'}",
         flush=True,
     )
+    for arch, count in sorted(skipped.items()):
+        print(f"  [SKIP] {count} jobs for {arch}, which GPU_ARCHS omits", flush=True)
     # The archs replay side by side and split one worker budget by job count.
     workers = get_max_workers(len(jobs))
     jobs_per_arch = Counter(job_arch(job) for job in jobs)

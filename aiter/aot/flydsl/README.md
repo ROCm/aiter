@@ -57,11 +57,17 @@ need no AOT change.
   `ep_fused`) are skipped: the runtime picks them only under a caller's expert
   mask or MegaMoE's stage-2 scatter, and the table records neither the global
   expert count nor the real topk.
-- aiter fixes some arch-dependent values at import, so the replay runs in one
-  process per target arch with the GPUs hidden and `GPU_ARCHS` set before
-  aiter is imported. `python -m aiter.aot.flydsl.moe` starts those processes
-  side by side and splits the worker budget (`AITER_MAX_JOBS`, below) between
-  them by job count. Beforehand, it builds aiter's C++ core module and the one
+- Each row compiles for the arch its `gfx` column names. When `GPU_ARCHS`
+  names targets, as `setup.py`'s wheel build has it, only rows of those archs
+  are replayed; unset or `native`, rows of every arch are.
+- aiter fixes some arch-dependent values at import (e.g. `dtypes.fp8`), so the
+  replay runs in one process per arch, started with `GPU_ARCHS` naming that
+  arch and `AITER_AOT_REPLAY=1`. Under that flag `get_gfx_runtime()` and
+  `dtypes.fp8` answer the `GPU_ARCHS` arch instead of probing a device, so a
+  visible GPU of another arch cannot leak in; the GPUs stay hidden all the
+  same. `python -m aiter.aot.flydsl.moe` starts those processes side by side
+  and splits the worker budget (`AITER_MAX_JOBS`, below) between them by job
+  count. Beforehand, it builds aiter's C++ core module and the one
   behind the two-stage host-side query once, for the arch with the most
   two-stage jobs and with the whole budget: the replays run only their host
   code, and not every toolchain builds every arch (ROCm 7.2 cannot build the
@@ -86,9 +92,10 @@ variant of the profile's bundle plan.
   is tuned per GPU model.
 - `quantize()` is replayed too: `preload_aot_bundles()` leaves it out, but
   fixed-slot `forward` and the per-stage benchmarks call it.
-- Like the MoE replay, it runs in a process of its own, with the GPUs hidden
-  and `GPU_ARCHS=gfx950` set before aiter is imported; both
-  `python -m aiter.aot.flydsl.mega_moe` and `setup.py` start it that way.
+- Like the MoE replay, it runs in a process of its own, started with
+  `GPU_ARCHS=gfx950` and `AITER_AOT_REPLAY=1`; both
+  `python -m aiter.aot.flydsl.mega_moe` and `setup.py` start it that way. It
+  is skipped when `GPU_ARCHS` names targets without gfx950.
 
 ---
 
@@ -172,7 +179,7 @@ python -m aiter.aot.flydsl.moe --csv /path/to/config.csv --check
 | `AITER_FLYDSL_AOT_TIMEOUT` | Per-kernel wall-clock cap (seconds). A worker stuck *alive* past this is killed (and retried); `0` disables. | `1200` |
 | `AITER_FLYDSL_AOT_MAX_RETRIES` | Retries for a worker that **died abnormally** (OOM-kill / segfault / timeout-kill). A clean compile error is never retried. `0` disables. | `2` |
 | `AITER_CONFIGS` | Resolves the default CSV lookup path (same as the runtime JIT) | repo built-in |
-| `ARCH` / `GPU_ARCHS` | Selects which jobs to build, not what arch a job compiles *for* (that comes from the CSV's `gfx`, with legacy `cu_num` fallback). `conv.py` applies it inside `parse_csv`, so both `python -m` and the `setup.py` path (`run_aot`) honour it. `gemm.py` still filters in `main()` only, so `run_aot` builds all of its archs. | auto-detect |
+| `ARCH` / `GPU_ARCHS` | Selects which jobs to build, not what arch a job compiles *for* (that comes from the CSV's `gfx`, with legacy `cu_num` fallback). `conv.py` applies it inside `parse_csv`, and `moe.py` and `mega_moe.py` (`GPU_ARCHS` only) before they start their replays, so both `python -m` and the `setup.py` path (`run_aot`) honour it. `gemm.py` still filters in `main()` only, so `run_aot` builds all of its archs. | auto-detect |
 
 > **About the compile target arch.** The arch each kernel is actually compiled
 > for is taken from the CSV's `gfx` column, with `cu_num_to_arch(...)` retained
@@ -181,8 +188,8 @@ python -m aiter.aot.flydsl.moe --csv /path/to/config.csv --check
 > for every job, so setting `ARCH` / `GPU_ARCHS` / `FLYDSL_GPU_ARCH` in your shell
 > does **not** change what gets built. To cross-compile, use the target `gfx` and
 > `cu_num` values in the CSV. `moe.py` and `mega_moe.py` additionally run each
-> target arch in its own process with `GPU_ARCHS` pinned and the GPUs hidden, so
-> they build the same kernels on a machine with or without GPUs.
+> target arch in its own process with `GPU_ARCHS` pinned and `AITER_AOT_REPLAY=1`,
+> so they build the same kernels on a machine with or without GPUs.
 
 Example:
 

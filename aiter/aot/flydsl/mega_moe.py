@@ -15,8 +15,9 @@ out FakeTensors and fake addresses, so no GPU or process group is needed. This
 module only owns the deployment profiles.
 
 aiter fixes some arch-dependent values at import (e.g. ``dtypes.fp8``), so like
-the MoE replay this one runs in a process of its own, with the GPUs hidden and
-``GPU_ARCHS`` naming gfx950 before aiter is imported.
+the MoE replay this one runs in a process of its own, started with
+``GPU_ARCHS`` naming gfx950 and ``AITER_AOT_REPLAY=1``. It is skipped when
+``GPU_ARCHS`` names targets without gfx950.
 
 Usage:
     # Every profile the service ships (DeepSeek-V4-Pro and Kimi-K3)
@@ -40,7 +41,12 @@ from unittest import mock
 
 import torch
 
-from aiter.aot.flydsl.common import replay_env, run_jobs_parallel
+from aiter.aot.flydsl.common import (
+    aot_target_archs,
+    check_replay_process,
+    replay_env,
+    run_jobs_parallel,
+)
 from aiter_worker_limits import adopt_legacy_max_jobs
 
 ARCH = "gfx950"
@@ -252,6 +258,13 @@ def compile_one_config(**job):
 
 def run(argv: list[str] | None = None) -> int:
     """Replay in a process of its own; returns its exit status."""
+    targets = aot_target_archs()
+    if targets and ARCH not in targets:
+        print(
+            f"[aiter] FlyDSL MegaMoE replay: skipped, GPU_ARCHS omits {ARCH}",
+            flush=True,
+        )
+        return 0
     command = [sys.executable, "-m", "aiter.aot.flydsl.mega_moe", *(argv or [])]
     return subprocess.run(command, env=replay_env(ARCH), check=False).returncode
 
@@ -281,8 +294,9 @@ def main():
         default=list(DEFAULT_QUANTS),
     )
     args = parser.parse_args()
-    if os.environ.get("GPU_ARCHS") != ARCH:
+    if os.environ.get("AITER_AOT_REPLAY") != "1":
         raise SystemExit(run(sys.argv[1:]))
+    check_replay_process(ARCH)
     default_shape = (
         list(args.experts_per_rank) == list(DEFAULT_EXPERTS_PER_RANKS)
         and args.topk == TOPK

@@ -24,16 +24,11 @@ _8bit_fallback = torch.uint8
 
 
 def get_dtype_fp8():
-    if torch.version.hip is None:
+    # An AOT replay process hides the GPUs yet compiles for one arch, which
+    # get_gfx_runtime() returns there.
+    aot_replay = os.getenv("AITER_AOT_REPLAY") == "1"
+    if not aot_replay and (torch.version.hip is None or not torch.cuda.is_available()):
         return _8bit_fallback
-    if not torch.cuda.is_available():
-        # With no GPU to detect (CPU-only builds, AOT compilation), a single
-        # explicit GPU_ARCHS target stands in for the live GPU, as in
-        # chip_info.get_gfx_runtime().
-        targets = [t.strip() for t in os.getenv("GPU_ARCHS", "").split(";")]
-        targets = [t for t in targets if t]
-        gfx = targets[0].lower() if len(targets) == 1 else None
-        return defaultDtypes.get(gfx, {"fp8": _8bit_fallback})["fp8"]
     from ..jit.utils.chip_info import get_gfx_runtime
 
     gfx = get_gfx_runtime()

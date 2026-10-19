@@ -131,15 +131,27 @@ def override_env(var_name: str, value: str | None) -> Iterator[None]:
             os.environ[var_name] = prev
 
 
+def aot_target_archs() -> set[str] | None:
+    """The archs ``GPU_ARCHS`` names, as the wheel build sets it; ``None``
+    when it is unset or ``native``, meaning every arch the tables have."""
+    value = os.environ.get("GPU_ARCHS", "").strip()
+    if not value or value.lower() == "native":
+        return None
+    return {arch.strip() for arch in value.split(";") if arch.strip()}
+
+
 def replay_env(arch: str, workers: int | None = None) -> dict[str, str]:
     """Environment of a process that replays the runtime for ``arch``. aiter
-    fixes some arch-dependent values at import (e.g. ``dtypes.fp8``), so
-    ``GPU_ARCHS`` must name ``arch`` before aiter is imported; the GPUs stay
-    hidden, and aiter is imported in full rather than in AOT mode."""
+    fixes some arch-dependent values at import (e.g. ``dtypes.fp8``), so the
+    process starts with ``GPU_ARCHS`` naming ``arch`` and with
+    ``AITER_AOT_REPLAY=1``, under which aiter's runtime arch queries answer
+    ``arch`` instead of probing a device. The GPUs stay hidden, and aiter is
+    imported in full rather than in AOT mode."""
     env = dict(os.environ)
     env.pop("AITER_AOT_IMPORT", None)
     env.update(
         GPU_ARCHS=arch,
+        AITER_AOT_REPLAY="1",
         HIP_VISIBLE_DEVICES="-1",
         ROCR_VISIBLE_DEVICES="-1",
         CUDA_VISIBLE_DEVICES="-1",
@@ -147,6 +159,24 @@ def replay_env(arch: str, workers: int | None = None) -> dict[str, str]:
     if workers is not None:
         env["AITER_MAX_JOBS"] = str(workers)
     return env
+
+
+def check_replay_process(arch: str) -> None:
+    """Raise unless this process started with ``replay_env(arch)``, so that
+    what aiter fixed at import belongs to ``arch``."""
+    from aiter.utility import dtypes
+
+    if os.environ.get("AITER_AOT_REPLAY") != "1" or os.environ.get("GPU_ARCHS") != arch:
+        raise RuntimeError(
+            f"replaying {arch} needs AITER_AOT_REPLAY=1 and GPU_ARCHS={arch} set "
+            "before aiter is imported (see replay_env)"
+        )
+    expected = dtypes.defaultDtypes[arch]["fp8"]
+    if dtypes.fp8 is not expected:
+        raise RuntimeError(
+            f"aiter was imported for another arch: dtypes.fp8 is {dtypes.fp8}, "
+            f"{arch} needs {expected}"
+        )
 
 
 def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:

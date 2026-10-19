@@ -109,19 +109,29 @@ def get_lds_capacity_bytes(gfx: str | None = None) -> int:
 def get_gfx_runtime() -> str:
     """Return the live GPU arch, using Torch if Windows hipinfo is unavailable.
 
-    Unlike get_gfx(), detects the actual running GPU first; GPU_ARCHS does not
-    override it.  Use for runtime dispatch decisions (selecting tuned kernels,
-    picking code paths).  Use get_gfx() for build-time codegen paths
-    (gen_instances, csrc module-level arch selection) where no GPU may be
-    available.
+    Unlike get_gfx(), ignores GPU_ARCHS -- always detects the actual running
+    GPU.  Use for runtime dispatch decisions (selecting tuned kernels, picking
+    code paths).  Use get_gfx() for build-time codegen paths (gen_instances,
+    csrc module-level arch selection) where no GPU may be available.
 
-    With no GPU to detect (CPU-only builds, AOT compilation), a single explicit
-    GPU_ARCHS target stands in for the live GPU.
+    The exception is an AOT replay process (AITER_AOT_REPLAY=1, started by
+    aiter.aot.flydsl.common.replay_env): it runs the runtime without a GPU for
+    the one arch GPU_ARCHS names, which stands in for the live GPU there.
     """
-    try:
-        gfx_arch = _detect_native()[0]
-    except RuntimeError:
-        if IS_WINDOWS:
+    if os.getenv("AITER_AOT_REPLAY") == "1":
+        targets = _parse_gpu_archs_env(os.getenv("GPU_ARCHS", ""))
+        if len(targets) != 1:
+            raise RuntimeError(
+                "AITER_AOT_REPLAY=1 needs GPU_ARCHS to name the one arch the "
+                f"process compiles for, got {os.getenv('GPU_ARCHS')!r}"
+            )
+        gfx_arch = targets[0]
+    else:
+        try:
+            gfx_arch = _detect_native()[0]
+        except RuntimeError:
+            if not IS_WINDOWS:
+                raise
             import torch
 
             if torch.version.hip is None or not torch.cuda.is_available():
@@ -129,12 +139,6 @@ def get_gfx_runtime() -> str:
             gfx_arch = (
                 torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0].lower()
             )
-        else:
-            targets = [t.strip() for t in os.getenv("GPU_ARCHS", "").split(";")]
-            targets = [t for t in targets if t]
-            if len(targets) != 1 or targets[0].lower() == "native":
-                raise
-            gfx_arch = targets[0]
     supported = set(GFX_MAP.values())
     if gfx_arch not in supported:
         raise KeyError(

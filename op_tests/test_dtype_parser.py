@@ -72,30 +72,40 @@ def test_get_dtype_fp8_delegates_to_shared_runtime_detector():
 
 def test_get_dtype_fp8_skips_runtime_detection_without_hip_device():
     script = textwrap.dedent("""
-        import os
         import sys
         from unittest import mock
 
         import torch
         from aiter.utility import dtypes
 
-        cases = (
-            (None, True, "gfx950", torch.uint8),
-            ("6.3", False, "", torch.uint8),
-            ("6.3", False, "native", torch.uint8),
-            ("6.3", False, "gfx942;gfx950", torch.uint8),
-            # A single explicit target stands in for the absent GPU (AOT builds).
-            ("6.3", False, "gfx942", torch.float8_e4m3fnuz),
-            ("6.3", False, "gfx950", torch.float8_e4m3fn),
-        )
-        for hip, available, gpu_archs, expected in cases:
+        for hip, available in ((None, True), ("6.3", False)):
             with (
                 mock.patch.dict(sys.modules, {"aiter.jit.utils.chip_info": None}),
-                mock.patch.dict(os.environ, {"GPU_ARCHS": gpu_archs}),
                 mock.patch.object(torch.version, "hip", hip),
                 mock.patch.object(torch.cuda, "is_available", return_value=available),
             ):
-                assert dtypes.get_dtype_fp8() is expected, (hip, gpu_archs)
+                assert dtypes.get_dtype_fp8() is torch.uint8
+    """)
+    subprocess.run([sys.executable, "-c", script], check=True, env=_test_env())
+
+
+def test_get_dtype_fp8_asks_the_aot_replay_target_without_a_device():
+    script = textwrap.dedent("""
+        import os
+        from unittest import mock
+
+        import torch
+        from aiter.jit.utils import chip_info
+        from aiter.utility import dtypes
+
+        with (
+            mock.patch.dict(os.environ, {"AITER_AOT_REPLAY": "1"}),
+            mock.patch.object(torch.version, "hip", "6.3"),
+            mock.patch.object(torch.cuda, "is_available", return_value=False),
+            mock.patch.object(chip_info, "get_gfx_runtime", return_value="gfx942") as get_gfx,
+        ):
+            assert dtypes.get_dtype_fp8() is torch.float8_e4m3fnuz
+        get_gfx.assert_called_once_with()
     """)
     subprocess.run([sys.executable, "-c", script], check=True, env=_test_env())
 
@@ -104,3 +114,4 @@ if __name__ == "__main__":
     test_str2dtype_base_types_do_not_import_native_enum()
     test_get_dtype_fp8_delegates_to_shared_runtime_detector()
     test_get_dtype_fp8_skips_runtime_detection_without_hip_device()
+    test_get_dtype_fp8_asks_the_aot_replay_target_without_a_device()
