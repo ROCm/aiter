@@ -372,6 +372,51 @@ def _gemm1_body(
                     soffset=fx.Int32(kt * KH_TILE) // 4,
                 )
 
+    # FP8 BM32 register staging, split in two so the ds_write can trail its global load
+    # by one K step (a_defer). Writing right after the load makes the A load the
+    # youngest outstanding one, so the waitcnt pass emits vmcnt(0) and also drains the
+    # B prefetch issued for later tiles.
+    def a_fp8_stage_dst(slot, sub, half):
+        lds_row = wave_n * fx.Int32(BM // 4) + fx.Int32(sub * 8)
+        dst_row = lds_row + lane_div_8
+        half_off = fx.Int32(half * 128)
+        return (
+            aq_group_base
+            + fx.Int32(slot * (BM * KH_TILE))
+            + dst_row * fx.Int32(KH_TILE)
+            + half_off
+            + ((lane_mod_8 * fx.Int32(16)) ^ _lds_swizzle_mask(dst_row))
+        )
+
+    def issue_a_load_fp8_reg(kt):
+        regs = []
+        for sub in range_constexpr(kSubBlocks):
+            for half in range_constexpr(2):
+                src_off = (
+                    cached_actual_row[sub] * fx.Int32(A_ROW_BYTES)
+                    + fx.Int32(half * 128)
+                    + lane_mod_8 * fx.Int32(16)
+                )
+                r = fx.make_rmem_tensor(mem_4x1, fx.Int32)
+                fx.copy(
+                    aq_reg_atom,
+                    fx.slice(aq_dma_tiles4, (None, src_off // fx.Int32(16))),
+                    r,
+                    soffset=fx.Int32(kt * KH_TILE) // fx.Int32(4),
+                )
+                regs.append(r)
+        return regs
+
+    def a_fp8_reg_write_lds(slot, regs):
+        for sub in range_constexpr(kSubBlocks):
+            for half in range_constexpr(2):
+                dst_off = a_fp8_stage_dst(slot, sub, half)
+                fx.copy(
+                    i32x4_copy_atom,
+                    regs[sub * 2 + half],
+                    fx.slice(s_aq_i32x4_tiles, (None, dst_off // fx.Int32(16))),
+                )
+
     def issue_a_load_reg(kt):
         regs = []
         for sub in range_constexpr(kSubBlocks):
@@ -954,6 +999,16 @@ def _gemm1_body(
             return
 
         _relax_prologue = (BM == 128) and not inline_quant
+        a_defer = (
+            a_dtype == "fp8"
+            and BM < 64
+            and not inline_quant
+            and num_waves == 4
+            and k_stages >= 2
+            and kAStages > k_stages
+        )
+        # (slot, regs) of the A tile whose LDS write trails by one step
+        a_pending = None
         if const_expr(not inline_quant):
             issue_a_scale_load()
         hidden_prefetch = None
@@ -1031,7 +1086,16 @@ def _gemm1_body(
             else:
                 a_cur = issue_a_ds_read(read_slot)
                 asc_cur = issue_a_scale_ds_read(K_C - k_stages)
-            if const_expr(not inline_quant):
+            if const_expr(a_defer):
+                # The slot written here, (K_C - 1) % kAStages, was last read one step
+                # earlier (all waves passed this step's barrier) and is first read
+                # k_stages - 1 >= 1 barriers later; this step reads another slot.
+                if const_expr(a_pending is not None):
+                    rocdl.sched_barrier(0)
+                    a_fp8_reg_write_lds(a_pending[0], a_pending[1])
+                rocdl.sched_barrier(0)
+                a_pending = (write_slot, issue_a_load_fp8_reg(K_C))
+            elif const_expr(not inline_quant):
                 if const_expr(BM == 128 and kAStages == k_stages):
                     # The two-slot BM128 ring reuses the slot just read. Every
                     # wave must finish its LDS reads before any wave's DMA
@@ -1073,6 +1137,12 @@ def _gemm1_body(
             else:
                 a_cur = issue_a_ds_read(kt_local % kAStages)
                 asc_cur = issue_a_scale_ds_read(kt)
+            if const_expr(a_defer and a_pending is not None):
+                # Last A tile of the main loop; it is read at tail step S + 1.
+                rocdl.sched_barrier(0)
+                a_fp8_reg_write_lds(a_pending[0], a_pending[1])
+                a_pending = None
+                rocdl.sched_barrier(0)
             for J in range_constexpr(N_REPS):
                 mfma_cluster(
                     b[kt_local % k_stages],
