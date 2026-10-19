@@ -29,6 +29,7 @@ from aiter.ops.attention import (
     get_mla_decode_fwd_max_splits,
     mla_ps64_qh128_fp8_asm_fwd,
 )
+from aiter.ops.opus.mla import opus_mla_decode_supported
 
 _FLYDSL_MLA_REDUCE_TARGET_GFX = ("gfx942", "gfx950")
 _FLYDSL_MLA_REDUCE_TARGET_H = 16
@@ -531,6 +532,12 @@ def _fold_seqlen_indptr(indptr, fold_factor):
     cumsum = torch.cumsum(folded_lens, dim=0).to(indptr.dtype)
     out = torch.nn.functional.pad(cumsum, (1, 0), value=0)
     return out
+
+
+@functools.lru_cache(maxsize=1024)
+def _opus_mla_decode_supported(fp8: bool, nhead: int, max_seqlen_q: int) -> bool:
+    """Whether opus_mla_decode_fwd has a build for the (head-folded) shape."""
+    return bool(opus_mla_decode_supported(fp8, nhead, max_seqlen_q))
 
 
 def _use_persistent_mla_decode(bs, nhead, max_seqlen_q, q_dtype, kv_dtype):
@@ -1566,7 +1573,15 @@ def mla_decode_fwd(
             and page_size == 1
             and (
                 (q.dtype == dtypes.bf16 and kv_buffer.dtype == dtypes.bf16)
-                or (q.dtype == dtypes.fp8 and kv_buffer.dtype == dtypes.fp8)
+                or (
+                    q.dtype == dtypes.fp8
+                    and kv_buffer.dtype == dtypes.fp8
+                    and q_scale is not None
+                    and kv_scale is not None
+                )
+            )
+            and _opus_mla_decode_supported(
+                q.dtype == dtypes.fp8, q.size(1), max_seqlen_q
             )
         )
 

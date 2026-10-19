@@ -15,7 +15,7 @@ and the extend range is causal.
 The ``prec`` axis picks both the input format and the backends that run:
 
 * ``bf16`` -- single ``D=512`` Q/K/V/O tensor: ``opus``, ``triton``.
-* ``fp8``  -- split NoPE-fp8 / RoPE-bf16 DSA inputs: ``opus``, ``asm``.
+* ``v4``   -- v4 split NoPE-fp8 / RoPE-bf16 inputs: ``opus``, ``asm``.
 * ``v41``  -- MLA v4.1: 512 e4m3 rows with separate E8M0 scales: ``opus``
   (``mla_sparse_prefill_v41``, gfx950 only).
 
@@ -28,7 +28,7 @@ Example CLI usage::
     PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill.py
     PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill.py --topk 256 2048
     PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill.py --backend opus \\
-        -n 1024 --h_q 128 --prec fp8 --no-verify
+        -n 1024 --h_q 128 --prec v4 --no-verify
 """
 
 from __future__ import annotations
@@ -43,15 +43,18 @@ import pandas as pd
 import pytest
 import torch
 
-import aiter  # noqa: F401  (registers the top-level export)
+import aiter
 from aiter.benchmark_data_init import DATA_DISTS, fill, make_generator
 from aiter.benchmark_reporting import print_json_table
 from aiter.ops.mla_sparse_prefill import (
-    mla_sparse_prefill_fp8_asm,
+    mla_sparse_prefill,
+    mla_sparse_prefill_v4,
     mla_sparse_prefill_v41,
 )
+from aiter.ops.opus.mla import opus_mla_v4_prefill_a16w16_gfx950_fwd
 from aiter.ops.pa_sparse_prefill_opus import (
     pa_sparse_prefill_fp8_opus,
+    pa_sparse_prefill_gfx950_opus_fwd,
     pa_sparse_prefill_opus,
 )
 from aiter.test_common import (
@@ -100,7 +103,7 @@ def _skip_if_unsupported(d: int) -> bool:
     arch = _get_gpu_arch()
     if arch not in _SUPPORTED_ARCHS:
         return _skip(
-            f"pa_sparse_prefill_opus requires one of {_SUPPORTED_ARCHS}, found {arch}"
+            f"opus MLA sparse prefill requires one of {_SUPPORTED_ARCHS}, found {arch}"
         )
     if d != 512:
         return _skip(f"Only D=512 is compiled, requested D={d}")
@@ -565,7 +568,7 @@ _BACKENDS = ("opus", "asm", "triton")
 
 _PREC_BACKENDS = {
     "bf16": ("opus", "triton"),
-    "fp8": ("opus", "asm"),
+    "v4": ("opus", "asm"),
     "v41": ("opus",),
 }
 
@@ -594,7 +597,7 @@ def _profile_func(target_func, *, backend: str):
 # ---------------------------------------------------------------------------
 
 
-_PRECS = ("bf16", "fp8", "v41")
+_PRECS = ("bf16", "v4", "v41")
 _PREC_TO_DTYPE = {"bf16": torch.bfloat16}
 
 _RTOL = 1e-2
@@ -661,11 +664,11 @@ def run_pa_sparse_prefill(
                 (
                     "opus",
                     lambda: mla_sparse_prefill_v41(
-                        **kernel_inputs, softmax_scale=softmax_scale
+                        **kernel_inputs, softmax_scale=softmax_scale, backend="opus"
                     ),
                 )
             )
-    elif prec == "fp8":
+    elif prec == "v4":
         data = _make_inputs_fp8(
             n,
             h,
@@ -681,8 +684,8 @@ def run_pa_sparse_prefill(
             candidates.append(
                 (
                     "opus",
-                    lambda: pa_sparse_prefill_fp8_opus(
-                        **kernel_inputs, softmax_scale=softmax_scale
+                    lambda: mla_sparse_prefill_v4(
+                        **kernel_inputs, softmax_scale=softmax_scale, backend="opus"
                     ),
                 )
             )
@@ -690,8 +693,8 @@ def run_pa_sparse_prefill(
             candidates.append(
                 (
                     "asm",
-                    lambda: mla_sparse_prefill_fp8_asm(
-                        **kernel_inputs, softmax_scale=softmax_scale
+                    lambda: mla_sparse_prefill_v4(
+                        **kernel_inputs, softmax_scale=softmax_scale, backend="asm"
                     ),
                 )
             )
@@ -712,10 +715,11 @@ def run_pa_sparse_prefill(
             candidates.append(
                 (
                     "opus",
-                    lambda: pa_sparse_prefill_opus(
+                    lambda: mla_sparse_prefill(
                         **kernel_inputs,
                         softmax_scale=softmax_scale,
                         num_kv_splits=num_kv_splits,
+                        backend="opus",
                     ),
                 )
             )
@@ -783,7 +787,7 @@ def run_pa_sparse_prefill(
 # ---------------------------------------------------------------------------
 
 
-_PYTEST_PRECS = ["bf16", "fp8", "v41"]
+_PYTEST_PRECS = ["bf16", "v4", "v41"]
 
 # topk rides in the case instead of being its own axis: crossed with the shapes,
 # most combinations would collapse onto the same whole-pool budget.
@@ -847,6 +851,40 @@ def test_mla_sparse_prefill_v41_packed_pool():
         packed[scale] = pool[:, _V41_D:].view(dtypes.fp8_e8m0)
     out = mla_sparse_prefill_v41(**packed, softmax_scale=1.0 / math.sqrt(512))
     assert torch.equal(out, dense)
+
+    with pytest.raises(RuntimeError, match=r"supports \(q, kv\) dtypes"):
+        mla_sparse_prefill_v41(
+            **{**inputs, "q": inputs["q"].to(torch.bfloat16)}, softmax_scale=1.0
+        )
+
+
+def test_pa_sparse_prefill_opus_compat():
+    """The opus-pinned entries ATOM calls keep their names, torch ops and results,
+    and the backend-choosing entries pick opus where asm does not apply."""
+    if _skip_if_unsupported(d=512):
+        return
+    scale = 1.0 / math.sqrt(512)
+    bf16 = _make_inputs(64, 64, 512, 512, 512, torch.bfloat16, topk=200, seed=3)
+    fp8 = _make_inputs_fp8(64, 64, 512, 64, topk=200, seed=4)["kernel"]
+
+    assert torch.equal(
+        pa_sparse_prefill_opus(**bf16, softmax_scale=scale),
+        mla_sparse_prefill(**bf16, softmax_scale=scale),
+    )
+    assert torch.equal(
+        pa_sparse_prefill_fp8_opus(*fp8.values(), scale),
+        mla_sparse_prefill_v4(*fp8.values(), scale),
+    )
+    assert pa_sparse_prefill_gfx950_opus_fwd is opus_mla_v4_prefill_a16w16_gfx950_fwd
+    for name in ("pa_sparse_prefill_opus", "pa_sparse_prefill_fp8_opus"):
+        assert hasattr(aiter, name) and hasattr(torch.ops.aiter, name)
+    with pytest.raises(ValueError):
+        mla_sparse_prefill(**bf16, softmax_scale=scale, backend="triton")
+    as_bf16 = {
+        k: v.to(torch.bfloat16) if v.dtype == dtypes.fp8 else v for k, v in fp8.items()
+    }
+    with pytest.raises(RuntimeError, match="supports NoPE dtypes"):
+        mla_sparse_prefill_v4(**as_bf16, softmax_scale=scale, backend="opus")
 
 
 # ---------------------------------------------------------------------------
@@ -914,9 +952,9 @@ parser.add_argument(
     default=list(_PRECS),
     choices=list(_PRECS),
     help=(
-        "precision(s) to sweep (default: [bf16, fp8, v41]).\n"
+        "precision(s) to sweep (default: [bf16, v4, v41]).\n"
         "  bf16: single-tensor Q/K/V/O kernel      -> opus, triton\n"
-        "  fp8 : split NoPE-fp8 / RoPE-bf16 kernel -> opus, asm\n"
+        "  v4  : split NoPE-fp8 / RoPE-bf16 kernel -> opus, asm\n"
         "  v41 : e4m3 rows + E8M0 scales (MLA v4.1) -> opus (gfx950)"
     ),
 )
