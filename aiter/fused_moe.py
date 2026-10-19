@@ -1308,6 +1308,7 @@ def _resolve_quant_dtypes(
         M=M,
         hidden_dtype=hidden_states.dtype,
         has_a1_scale=a1_scale is not None,
+        gate_up_interleave=getattr(w1, "gate_up_interleave", None),
     )
     return dtype, quant_type, q_dtype_a, q_dtype_w
 
@@ -2060,7 +2061,7 @@ def _fused_moe_router_tuned_cfg_supported(
 ) -> bool:
     """Whether the tuned stage1/stage2 can take the router's prequantized A.
 
-    ``fused_moe_router`` passes ``_metadata`` and ``a1_prequant``, which bypasses
+    ``fused_moe_router`` passes ``_metadata`` and ``prequantized_a1``, which bypasses
     ``fused_moe_2stages``' own A-preparation, so admit only stage1 kernels that
     consume sorted MXFP4 A with the swizzled e8m0 scale layout: no 1-stage or
     FLAT path, no output_aux sort (needs m_indices / reverse_sorted), no
@@ -2210,6 +2211,7 @@ def fused_moe_router_supported(
         is_ep=expert_mask is not None,
         opus_weights_shuffled=getattr(w1, "is_shuffled", False)
         and getattr(w2, "is_shuffled", False),
+        gate_up_interleave=getattr(w1, "gate_up_interleave", None),
     )
     return _fused_moe_router_tuned_cfg_supported(
         metadata, getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
@@ -2344,6 +2346,7 @@ def fused_moe_router(
         is_ep=expert_mask is not None,
         opus_weights_shuffled=getattr(w1, "is_shuffled", False)
         and getattr(w2, "is_shuffled", False),
+        gate_up_interleave=getattr(w1, "gate_up_interleave", None),
     )
     block_size_M = int(metadata.block_m)
 
