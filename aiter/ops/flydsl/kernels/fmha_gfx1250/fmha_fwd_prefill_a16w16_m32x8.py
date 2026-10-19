@@ -3208,6 +3208,55 @@ def _ensure_bshd_kernel(
     _launch_fns[key] = _launch
 
 
+def flash_attn_m32x8_supported(
+    mode,
+    q,
+    k,
+    v,
+    *,
+    dropout_p=0.0,
+    window_size=(-1, -1),
+    bias=None,
+    alibi_slopes=None,
+    sink=None,
+    block_table=None,
+    return_attn_probs=False,
+) -> bool:
+    """Can the m32x8 prefill kernel serve this configuration?
+
+    Metadata only -- no allocation, compile or launch -- so a caller can gate before
+    preparing buffers. The ARCH is the caller's business: dispatch on it first and call
+    this only on gfx1250. ``mode`` is "varlen" or "batch"; both are served by the same
+    kernel today, so it is accepted and ignored.
+
+    Per-call buffer validation (a caller-provided ``out``) stays with the entry points.
+    """
+    del mode  # same gate for both layouts today
+    qk_hdim, v_hdim = q.shape[-1], v.shape[-1]
+    num_q, num_kv = q.shape[-2], k.shape[-2]
+    sink_ok = sink is None or (
+        torch.is_tensor(sink) and sink.dtype == torch.float32 and sink.shape == (num_q,)
+    )
+    return (
+        qk_hdim in SUPPORTED_QK_HDIM
+        and v_hdim in SUPPORTED_V_HDIM
+        and k.shape[-1] == qk_hdim
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and k.dtype == q.dtype
+        and v.dtype == q.dtype
+        and num_kv > 0
+        and num_q % num_kv == 0
+        and supports_gqa_ratio(num_q // max(num_kv, 1))
+        and dropout_p == 0.0
+        and (len(window_size) < 3 or window_size[2] == 0)
+        and block_table is None
+        and bias is None
+        and alibi_slopes is None
+        and sink_ok
+        and not return_attn_probs
+    )
+
+
 def flash_attn_varlen_m32x8(
     q: torch.Tensor,
     k: torch.Tensor,
