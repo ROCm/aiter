@@ -12,6 +12,40 @@ import triton
 import triton.language as tl
 
 
+@triton.jit
+def _gated_delta_rule_step(
+    b_h,
+    b_k,
+    b_v,
+    b_a,
+    b_b,
+    b_A_log,
+    b_dt_bias,
+    beta,
+    threshold,
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    IS_KDA: tl.constexpr,
+):
+    x = b_a + b_dt_bias
+    softplus_x = tl.where(
+        beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
+    )
+    b_g = -tl.exp(b_A_log) * softplus_x
+
+    b_beta = tl.sigmoid(b_b)
+
+    if USE_QK_L2NORM_IN_KERNEL:
+        b_k = b_k * tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
+    if not IS_KDA:
+        b_h *= tl.exp(b_g)
+    else:
+        b_h *= tl.exp(b_g[None, :])
+    b_v -= tl.sum(b_h * b_k[None, :], 1)
+    b_v *= b_beta
+    b_h += b_v[:, None] * b_k[None, :]
+    return b_h
+
+
 @triton.heuristics(
     {
         "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
@@ -58,6 +92,7 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
     IS_KDA: tl.constexpr,
+    DEFER_SPEC_STATE: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -98,8 +133,51 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
     mask_v = o_v < V
     mask_h = mask_v[:, None] & mask_k[None, :]
 
+    b_A_log = tl.load(p_A_log).to(tl.float32)
+    b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
+
+    # DEFER_SPEC_STATE stores the state only after the first token (slot 0) and
+    # records the inputs of the other tokens in slot 1. The next step replays the
+    # accepted records, so each step stores one state instead of one per token.
+    STASH_W: tl.constexpr = BK + BV + 2
+    o_r = tl.arange(0, BV)
     b_h = tl.zeros([BV, BK], dtype=tl.float32)
-    if USE_INITIAL_STATE:
+    if DEFER_SPEC_STATE:
+        state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq).to(tl.int64)
+        if state_idx < 0:
+            return
+        p_h0 = h0 + state_idx * stride_init_state_token
+        p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+        b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+        stash_idx = tl.load(
+            ssm_state_indices + i_n * stride_indices_seq + stride_indices_tok
+        ).to(tl.int64)
+        # Each program has its own records, so replay reads only its own data.
+        p_stash = (
+            h0
+            + stash_idx * stride_init_state_token
+            + (i_hv * tl.num_programs(1) + i_v) * STASH_W
+        )
+        stash_stride = HV * tl.num_programs(1) * STASH_W
+        num_replay = tl.load(num_accepted_tokens + i_n).to(tl.int32) - 1
+        for i_r in range(0, num_replay):
+            p_r = p_stash + i_r * stash_stride
+            b_h = _gated_delta_rule_step(
+                b_h,
+                tl.load(p_r + o_k, mask=mask_k, other=0).to(tl.float32),
+                tl.load(p_r + BK + o_r, mask=mask_v, other=0).to(tl.float32),
+                tl.load(p_r + BK + BV).to(tl.float32),
+                tl.load(p_r + BK + BV + 1).to(tl.float32),
+                b_A_log,
+                b_dt_bias,
+                beta,
+                threshold,
+                USE_QK_L2NORM_IN_KERNEL,
+                IS_KDA,
+            )
+        # Read all records before this step overwrites them.
+        tl.debug_barrier()
+    elif USE_INITIAL_STATE:
         if IS_CONTINUOUS_BATCHING:
             if IS_SPEC_DECODING:
                 i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
@@ -121,30 +199,38 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
         b_b = tl.load(p_b).to(tl.float32)
-
-        x = tl.load(p_a).to(tl.float32) + tl.load(p_dt_bias).to(tl.float32)
-        softplus_x = tl.where(
-            beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
-        )
-        b_g = -tl.exp(tl.load(p_A_log).to(tl.float32)) * softplus_x
-
-        b_beta = tl.sigmoid(b_b.to(tl.float32))
+        b_a = tl.load(p_a).to(tl.float32)
+        if DEFER_SPEC_STATE:
+            if i_t > 0:
+                p_r = p_stash + (i_t - 1) * stash_stride
+                tl.store(p_r + o_k, b_k.to(p_r.dtype.element_ty), mask=mask_k)
+                tl.store(p_r + BK + o_r, b_v.to(p_r.dtype.element_ty), mask=mask_v)
+                tl.store(p_r + BK + BV, b_a.to(p_r.dtype.element_ty))
+                tl.store(p_r + BK + BV + 1, b_b.to(p_r.dtype.element_ty))
 
         if USE_QK_L2NORM_IN_KERNEL:
             b_q = b_q * tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
-            b_k = b_k * tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
         b_q = b_q * scale
-        if not IS_KDA:
-            b_h *= tl.exp(b_g)
-        else:
-            b_h *= tl.exp(b_g[None, :])
-        b_v -= tl.sum(b_h * b_k[None, :], 1)
-        b_v *= b_beta
-        b_h += b_v[:, None] * b_k[None, :]
+        b_h = _gated_delta_rule_step(
+            b_h,
+            b_k,
+            b_v,
+            b_a,
+            b_b,
+            b_A_log,
+            b_dt_bias,
+            beta,
+            threshold,
+            USE_QK_L2NORM_IN_KERNEL,
+            IS_KDA,
+        )
         b_o = tl.sum(b_h * b_q[None, :], 1)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
-        if INPLACE_FINAL_STATE:
+        if DEFER_SPEC_STATE:
+            if i_t == 0:
+                tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
+        elif INPLACE_FINAL_STATE:
             final_state_idx = tl.load(
                 ssm_state_indices + i_n * stride_indices_seq + i_t * stride_indices_tok
             ).to(tl.int64)

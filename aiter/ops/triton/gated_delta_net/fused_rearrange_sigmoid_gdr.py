@@ -205,11 +205,18 @@ def fused_rearrange_sigmoid_gated_delta_rule(
     is_kda: bool = False,
     core_attn_out: torch.Tensor | None = None,
     draft_window: int | None = None,
+    defer_spec_state: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused sigmoid-gated delta rule over packed QKV.
 
     ``draft_window`` is host metadata required for FlyDSL dispatch. FlyDSL
     falls back to Triton during CUDA Graph capture.
+
+    With ``defer_spec_state``, a spec-decode step stores the state after its
+    first token in slot 0 of each ``ssm_state_indices`` row. It records the
+    inputs of the other tokens in slot 1. The next step replays
+    ``num_accepted_tokens - 1`` records onto slot 0. All spec-decode steps of a
+    request must use this mode. Nothing else can read the per-token slots.
     """
     # Spelled as raised ``AssertionError``s rather than ``assert`` statements,
     # keeping the type a caller may already handle while ``python -O`` can no
@@ -233,7 +240,7 @@ def fused_rearrange_sigmoid_gated_delta_rule(
 
     # FlyDSL port (opt-in). Only the speculative-verify shape is routed;
     # everything else falls through to Triton below unchanged.
-    if _flydsl_gdr_enabled():
+    if _flydsl_gdr_enabled() and not defer_spec_state:
         routed = _try_flydsl_mtp(
             A_log=A_log,
             a=a,
@@ -273,11 +280,14 @@ def fused_rearrange_sigmoid_gated_delta_rule(
     V = head_v_dim
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
 
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    # The deferred mode is bound by the token loop, so it uses more, smaller
+    # programs. BV sets the record layout and must not change between steps.
+    BK = triton.next_power_of_2(K)
+    BV = min(triton.next_power_of_2(V), 16 if defer_spec_state else 32)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3
-    num_warps = 4
+    num_warps = 1 if defer_spec_state and N > 1 else 4
 
     if inplace_final_state and ssm_state_indices is None:
         raise ValueError(
@@ -309,6 +319,21 @@ def fused_rearrange_sigmoid_gated_delta_rule(
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride(0), 1
     else:
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
+
+    if defer_spec_state:
+        assert (
+            inplace_final_state
+            and not is_kda
+            and initial_state is not None
+            and num_accepted_tokens is not None
+            and ssm_state_indices is not None
+            and ssm_state_indices.ndim == 2
+        )
+        max_query_len = ssm_state_indices.size(1)
+        # Replay gives the per-token states only if the state is not rounded.
+        assert initial_state.dtype == torch.float32
+        record_size = (max_query_len - 1) * NV * (BK + BV + 2)
+        assert record_size <= V * K, "too many speculative tokens for one slot"
 
     stride_qkv_l, stride_qkv_hd = qkv.stride()
 
@@ -346,6 +371,7 @@ def fused_rearrange_sigmoid_gated_delta_rule(
         INPLACE_FINAL_STATE=inplace_final_state,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_KDA=is_kda,
+        DEFER_SPEC_STATE=defer_spec_state,
         num_warps=num_warps,
         num_stages=num_stages,
     )

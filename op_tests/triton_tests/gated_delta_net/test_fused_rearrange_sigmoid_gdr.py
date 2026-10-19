@@ -269,3 +269,67 @@ def test_fused_rearrange_sigmoid_gdr_kda():
 
     torch.testing.assert_close(o_tr.float(), o_ref, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(h_tr[-1].float(), h_ref[0], rtol=1e-2, atol=1e-2)
+
+
+@cuda_ok
+@pytest.mark.parametrize("N", [1, 3, 16])
+@pytest.mark.parametrize("max_t", [2, 8])
+def test_fused_rearrange_sigmoid_gdr_defer_spec_state(N: int, max_t: int):
+    # Each step accepts a random number of the previous step's tokens. Equal
+    # outputs in each step show that the replay gives the correct start state.
+    device = "cuda"
+    H, HV, K, V, dtype = 2, 6, 128, 128, torch.bfloat16
+    key_dim, value_dim = H * K, HV * V
+    torch.manual_seed(0)
+    A_log = torch.randn(HV, device=device, dtype=torch.float32) * 0.5
+    dt_bias = torch.randn(HV, device=device, dtype=torch.float32)
+    state_ref = 0.1 * torch.randn(
+        1 + N * max_t, HV, V, K, device=device, dtype=torch.float32
+    )
+    state_defer = state_ref.clone()
+    idx = 1 + torch.randperm(N * max_t, device=device).view(N, max_t).int()
+    prev_t = None
+    for _ in range(6):
+        t_list = torch.randint(1, max_t + 1, (N,)).tolist()
+        if prev_t is None:
+            acc = [1] * N
+        else:
+            acc = [int(torch.randint(1, t + 1, (1,))) for t in prev_t]
+        prev_t = t_list
+        num_tokens = sum(t_list)
+        cu = torch.tensor([0] + t_list, device=device).cumsum(0).int()
+        # A slice of a wider buffer, as the spec rows of a packed projection.
+        qkv = torch.randn(
+            num_tokens, 2 * key_dim + value_dim + 64, device=device, dtype=dtype
+        )[:, : 2 * key_dim + value_dim]
+        a = torch.randn(num_tokens, HV, device=device, dtype=dtype)
+        b_gate = torch.randn(num_tokens, HV, device=device, dtype=dtype)
+        common = dict(
+            A_log=A_log,
+            a=a,
+            b=b_gate,
+            dt_bias=dt_bias,
+            qkv=qkv,
+            key_dim=key_dim,
+            value_dim=value_dim,
+            head_k_dim=K,
+            head_v_dim=V,
+            cu_seqlens=cu,
+            ssm_state_indices=idx,
+            num_accepted_tokens=torch.tensor(acc, device=device, dtype=torch.int32),
+            use_qk_l2norm_in_kernel=True,
+        )
+        o_ref, _ = fused_rearrange_sigmoid_gated_delta_rule(
+            initial_state=state_ref, **common
+        )
+        o_defer, _ = fused_rearrange_sigmoid_gated_delta_rule(
+            initial_state=state_defer, defer_spec_state=True, **common
+        )
+        torch.testing.assert_close(o_defer.float(), o_ref.float(), rtol=1e-2, atol=1e-3)
+        # The state after each sequence's first token is in slot 0 either way.
+        torch.testing.assert_close(
+            state_defer[idx[:, 0].long()],
+            state_ref[idx[:, 0].long()],
+            rtol=1e-4,
+            atol=1e-5,
+        )
