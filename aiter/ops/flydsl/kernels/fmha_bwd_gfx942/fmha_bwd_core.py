@@ -81,36 +81,36 @@ class _Geom:
     """
 
     __slots__ = (
-        "d_qk",
-        "d_v",
-        "qk_p",
-        "v_p",
-        "qk_s",
-        "v_s",
-        "n_tiles_qk",
-        "n_tiles_v",
-        "frags_per_row_qk",
-        "frags_per_row_v",
-        "ld_qk",
-        "ld_v",
-        "n_qk_chunks",
-        "n_v_chunks",
-        "off_q_nat",
-        "off_q_t",
-        "off_do_nat",
-        "off_do_t",
-        "off_k_nat",
-        "off_k_t",
-        "off_v_nat",
         "arena",
         "arena_dkdv",
-        "off_ds",
-        "ld_dqs",
-        "off_dqs",
+        "d_qk",
+        "d_v",
         "dq_tiles_per_wave",
         "est_vgpr",
         "est_vgpr_fused",
+        "frags_per_row_qk",
+        "frags_per_row_v",
         "fusable",
+        "ld_dqs",
+        "ld_qk",
+        "ld_v",
+        "n_qk_chunks",
+        "n_tiles_qk",
+        "n_tiles_v",
+        "n_v_chunks",
+        "off_do_nat",
+        "off_do_t",
+        "off_dqs",
+        "off_ds",
+        "off_k_nat",
+        "off_k_t",
+        "off_q_nat",
+        "off_q_t",
+        "off_v_nat",
+        "qk_p",
+        "qk_s",
+        "v_p",
+        "v_s",
     )
 
     def __init__(self, d_qk: int, d_v: int):
@@ -186,7 +186,7 @@ class _Geom:
         )
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _geom(d_qk: int, d_v: int) -> _Geom:
     return _Geom(d_qk, d_v)
 
@@ -555,7 +555,7 @@ def _packn_rne(vals):
     return packed.bitcast(fx.BFloat16)
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def build(
     n_split=1, d_qk=DQK, d_v=DV, deterministic=False, fuse_split=False, wgs_per_cu=0
 ):
@@ -1459,13 +1459,13 @@ def build(
                     for q_sub in range_constexpr(QUERY_TILE // 16):
                         # OPT_HOIST: issue the lse / delta LDS reads above both MFMA chains to hide
                         # their latency.
-                        def _lse4():
+                        def _lse4(q_sub=q_sub):
                             return fx.ptr_load(
                                 lds_lse + (q_sub * 16 + lane_k),
                                 result_type=fx.Vector.make_type(4, fx.Float32),
                             )
 
-                        def _delta4():
+                        def _delta4(q_sub=q_sub):
                             return fx.ptr_load(
                                 lds_delta + (q_sub * 16 + lane_k),
                                 result_type=fx.Vector.make_type(4, fx.Float32),
@@ -1475,7 +1475,7 @@ def build(
                             lse4 = _lse4()
                             delta4 = _delta4()
 
-                        def _a_q(d_tile):
+                        def _a_q(d_tile, q_sub=q_sub):
                             return _bf16x4(
                                 lds_q
                                 + (
@@ -1485,7 +1485,7 @@ def build(
                                 )
                             )
 
-                        def _a_do(d_tile):
+                        def _a_do(d_tile, q_sub=q_sub):
                             return _bf16x4(
                                 lds_do
                                 + (
@@ -1862,7 +1862,7 @@ def build(
 
                     for key_sub in range_constexpr(KEY_TILE // 16):
 
-                        def _b_k(d_tile):
+                        def _b_k(d_tile, key_sub=key_sub):
                             return _bf16x4(
                                 lds_k
                                 + (
@@ -1872,7 +1872,7 @@ def build(
                                 )
                             )
 
-                        def _b_v(d_tile):
+                        def _b_v(d_tile, key_sub=key_sub):
                             return _bf16x4(
                                 lds_v
                                 + (

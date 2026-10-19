@@ -365,7 +365,7 @@ _ROUTE_CASES = [
 def test_varlen_func_routing(
     monkeypatch, case, nheads, d_qk, d_v, deterministic, expect_flydsl
 ):
-    import aiter.ops.flydsl.fmha_kernels as fmha_kernels
+    from aiter.ops.flydsl import fmha_kernels
 
     calls = []
     real = fmha_kernels.flydsl_flash_attn_varlen_bwd
