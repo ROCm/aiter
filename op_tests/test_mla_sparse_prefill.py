@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Correctness and performance comparison for sparse paged prefill attention.
+"""Correctness and performance comparison for MLA sparse prefill attention.
 
 Three backends implement the same two-region sparse attention -- a paged
 prefix source (``unified_kv``) plus a flat extend source (``kv``), joined by
@@ -14,10 +14,15 @@ and the extend range is causal.
 
 The ``prec`` axis picks both the input format and the backends that run:
 
-* ``bf16`` -- single ``D=512`` Q/K/V/O tensor: ``opus``, ``triton``.
-* ``v4``   -- v4 split NoPE-fp8 / RoPE-bf16 inputs: ``opus``, ``asm``.
-* ``v41``  -- MLA v4.1: 512 e4m3 rows with separate E8M0 scales: ``opus``
-  (``mla_sparse_prefill_v41``, gfx950 only).
+* ``bf16`` -- single ``D=512`` Q/K/V/O tensor (``mla_sparse_prefill``): ``opus``,
+  ``triton``.
+* ``v4``   -- v4 split NoPE-fp8 / RoPE-bf16 inputs (``mla_sparse_prefill_v4``):
+  ``opus``, ``asm``.
+* ``v41``  -- MLA v4.1: 512 e4m3 rows with separate E8M0 scales
+  (``mla_sparse_prefill_v41``): ``opus``, gfx950 only.
+
+The ``pa_sparse_prefill*_opus`` names kept for existing callers are checked by
+``test_pa_sparse_prefill_opus_compat``.
 
 ``triton`` is the ``pa_prefill_sparse`` dispatcher, which on gfx1250 reaches a
 gluon kernel that takes both KV sources natively. ``asm`` needs ``H_Q == 128``.
@@ -25,9 +30,9 @@ Both are gfx1250-only here and drop out of the sweep elsewhere.
 
 Example CLI usage::
 
-    PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill.py
-    PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill.py --topk 256 2048
-    PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill.py --backend opus \\
+    PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py
+    PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --topk 256 2048
+    PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --backend opus \\
         -n 1024 --h_q 128 --prec v4 --no-verify
 """
 
@@ -115,7 +120,7 @@ def _skip_if_unsupported(d: int) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _ref_pa_sparse_prefill_opus(
+def _ref_mla_sparse_prefill(
     q: torch.Tensor,  # [N, H, D]
     unified_kv: torch.Tensor,  # [total_pages, D]
     kv_indices_prefix: torch.Tensor,  # [nnz_prefix] int32
@@ -217,7 +222,7 @@ def _quantize_nope(real: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return packed.view(torch.float8_e4m3fn), deq
 
 
-def _ref_pa_sparse_prefill_fp8(
+def _ref_mla_sparse_prefill_fp8(
     q_fp32: torch.Tensor,  # [N, H, 512] fp32 (dequant NoPE + RoPE)
     ukv_fp32: torch.Tensor,  # [total_pages, 512] fp32
     kv_fp32: torch.Tensor,  # [total_tokens, 512] fp32
@@ -610,7 +615,7 @@ _ATOL = 1e-2
 
 
 @benchmark()
-def run_pa_sparse_prefill(
+def run_mla_sparse_prefill(
     n: int,
     h: int,
     d: int,
@@ -658,7 +663,7 @@ def run_pa_sparse_prefill(
             data_init=data_init,
         )
         kernel_inputs = data["kernel"]
-        ref_fn, ref_inputs = _ref_pa_sparse_prefill_fp8, data["ref"]
+        ref_fn, ref_inputs = _ref_mla_sparse_prefill_fp8, data["ref"]
         if "opus" in wanted and _get_gpu_arch() == "gfx950":
             candidates.append(
                 (
@@ -679,7 +684,7 @@ def run_pa_sparse_prefill(
             data_init=data_init,
         )
         kernel_inputs = data["kernel"]
-        ref_fn, ref_inputs = _ref_pa_sparse_prefill_fp8, data["ref"]
+        ref_fn, ref_inputs = _ref_mla_sparse_prefill_fp8, data["ref"]
         if "opus" in wanted:
             candidates.append(
                 (
@@ -710,7 +715,7 @@ def run_pa_sparse_prefill(
             seed=seed,
             data_init=data_init,
         )
-        ref_fn, ref_inputs = _ref_pa_sparse_prefill_opus, kernel_inputs
+        ref_fn, ref_inputs = _ref_mla_sparse_prefill, kernel_inputs
         if "opus" in wanted:
             candidates.append(
                 (
@@ -809,8 +814,8 @@ _PYTEST_CASES = [
     _PYTEST_CASES,
     ids=lambda v: "x".join(map(str, v)) if isinstance(v, tuple) else str(v),
 )
-def test_pa_sparse_prefill(prec, n, h, total_pages, total_tokens, topk):
-    run_pa_sparse_prefill(
+def test_mla_sparse_prefill(prec, n, h, total_pages, total_tokens, topk):
+    run_mla_sparse_prefill(
         n=n,
         h=h,
         d=512,
@@ -949,7 +954,7 @@ def test_pa_sparse_prefill_opus_compat():
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description=(
-        "opus / asm / triton sparse-prefill correctness + benchmark driver.\n"
+        "opus / asm / triton MLA sparse prefill correctness + benchmark driver.\n"
         "All list arguments are swept via itertools.product."
     ),
 )
@@ -1068,7 +1073,7 @@ if __name__ == "__main__":
         args.num_kv_splits,
     ):
         total_tokens = args.total_tokens if args.total_tokens is not None else n
-        row = run_pa_sparse_prefill(
+        row = run_mla_sparse_prefill(
             n=n,
             h=h,
             d=args.head_dim,
@@ -1102,6 +1107,6 @@ if __name__ == "__main__":
         rest = [c for c in df.columns if c not in lead]
         metrics = [c for b in _BACKENDS for c in rest if c.startswith(f"{b} ")]
         df = df[lead + [c for c in rest if c not in metrics] + metrics]
-        print_json_table("pa_sparse_prefill summary", df)
+        print_json_table("mla_sparse_prefill summary", df)
         sys.exit(0)
     sys.exit(0)
