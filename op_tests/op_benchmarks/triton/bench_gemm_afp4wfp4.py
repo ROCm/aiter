@@ -4,15 +4,14 @@ import math
 import torch
 import triton
 
+from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4 as triton_gemm_afp4wfp4,
 )
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4_preshuffle,
 )
-from aiter.ops.shuffle import shuffle_mxfp8fp4_scale, shuffle_weight
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm_128row
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
     get_ff_args,
@@ -28,13 +27,6 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
     generate_gemm_afp4wfp4_inputs,
 )
-
-
-def _layout_scale(s: torch.Tensor, scale_layout: str) -> torch.Tensor:
-    """(rows, K//32) e8m0 -> the gfx1250 gluon kernel's scale_layout ("n32k4" / "128row")."""
-    if scale_layout == "n32k4":
-        return shuffle_mxfp8fp4_scale(s.contiguous()).view(-1, s.shape[1] * 32)
-    return shuffle_scale_gemm_128row(s.contiguous())
 
 
 def bench_gemm_fn(
@@ -60,6 +52,7 @@ def bench_gemm_fn(
         output=True,
         shuffle_scales_fg=preshuffle,
         shuffle_weight_fg=preshuffle,
+        scale_layout=scale_layout,
     )
     # (x, w, w_shuffed, x_scales, w_scales, x_scales_shuffled, w_scales_shuffled, out_dtype, y)
     # gemm_afp4wfp4_preshuffle names its activation/weight kwargs x_fp4/w_preshuf;
@@ -68,24 +61,12 @@ def bench_gemm_fn(
     x_key = "x_fp4" if preshuffle else "x"
     w_key = "w_preshuf" if preshuffle else "w"
     _out_vals_keys = [x_key, "_", w_key, "_", "_", "x_scales", "w_scales", "_", "y"]
-    if scale_layout != "aiter":
-        _out_vals_keys[3:5] = ["x_scales_raw", "w_scales_raw"]
 
     rot_bufs = generate_rotating_buffers_pool(
         [_p_gen], [_out_vals_keys], target_mb=256, min_pool_len=4
     )
-    # gfx1250 gluon input layouts (prepared once, outside the timed region)
-    for bufs in rot_bufs:
-        if scale_layout != "aiter":
-            x_scale_raw = bufs.pop("x_scales_raw")
-            # x_scales of a CTA with fewer than 32 rows stay un-shuffled
-            bufs["x_scales"] = (
-                _layout_scale(x_scale_raw, scale_layout)
-                if M >= 32
-                else x_scale_raw.contiguous()
-            )
-            bufs["w_scales"] = _layout_scale(bufs.pop("w_scales_raw"), scale_layout)
-        if x_preshuffled:
+    if x_preshuffled:
+        for bufs in rot_bufs:
             bufs[x_key] = shuffle_weight(bufs[x_key])
 
     if preshuffle:
@@ -228,20 +209,15 @@ def parse_args(args: list[str] | None = None):
     parser.add_argument(
         "--x-preshuffled",
         action="store_true",
-        help="gfx1250 gluon --preshuffle only: pass x through shuffle_weight (x_preshuffled=True).",
+        help="gfx1250 --preshuffle only: shuffle x with shuffle_weight.",
     )
     parser.add_argument(
         "--scale-layout",
         choices=["aiter", "n32k4", "128row"],
         default="aiter",
-        help="gfx1250 gluon --preshuffle only: scale layout of x and w scales (scale_layout=).",
+        help="gfx1250 --preshuffle only: layout of the x and w scales.",
     )
-    parsed, defaults = get_ff_args(parser, args=args)
-    if (
-        parsed.x_preshuffled or parsed.scale_layout != "aiter"
-    ) and not parsed.preshuffle:
-        parser.error("--x-preshuffled / --scale-layout need --preshuffle")
-    return parsed, defaults
+    return get_ff_args(parser, args=args)
 
 
 def main(args: list[str] | None = None) -> None:
