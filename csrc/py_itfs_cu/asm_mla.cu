@@ -1299,6 +1299,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     std::string arch_id = get_gpu_arch();
     if(arch_id == "gfx1250")
     {
+        // The gfx1250 kernels have no global KV positions, so round-robin CP
+        // would run unmasked; mla_asm_decode_config reports it as NoKernel.
+        AITER_CHECK(g_kv_indptr == nullptr || g_kv_indptr->data_ptr() == nullptr,
+                    __func__,
+                    ": gfx1250 MLA does not support round-robin context parallel (g_kv_indptr)");
         return mla_decode_gfx1250_dispatch(Q,
                                          KV,
                                          qo_indptr,
