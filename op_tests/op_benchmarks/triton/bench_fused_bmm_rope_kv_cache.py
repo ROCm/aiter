@@ -3,8 +3,6 @@ Benchmark for the fused MLA BMM + RoPE + concat + KV-cache write kernels
 (fused_fp4_bmm_rope_cat_and_cache_mla and fused_fp8_bmm_rope_cat_and_cache_mla).
 """
 
-import argparse
-
 import torch
 import triton
 
@@ -12,7 +10,13 @@ from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import (
     fused_fp4_bmm_rope_cat_and_cache_mla,
     fused_fp8_bmm_rope_cat_and_cache_mla,
 )
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    positive_int,
+    pow2_int,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
@@ -28,32 +32,13 @@ from op_tests.triton_tests.rope.test_rope import generate_rope_inputs
 
 def get_benchmark_shapes(args):
     """Return [(T, QH, KH), ...] for the current CLI args."""
-    tokens = args.T if args.T is not None else (1, 2, 32, 2048)
-    kv_heads = args.kh if args.kh is not None else (1, 8)
-    return [(t, args.qh_per_kh * kh, kh) for kh in kv_heads for t in tokens]
-
-
-def _positive_int(value):
-    try:
-        n = int(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"must be an integer, got {value}")
-    if n < 1:
-        raise argparse.ArgumentTypeError(f"must be >= 1, got {n}")
-    return n
-
-
-def _pow2_int(value):
-    n = _positive_int(value)
-    if n < 2 or n & (n - 1):
-        raise argparse.ArgumentTypeError(f"must be a power of 2 >= 2, got {n}")
-    return n
+    return [(t, args.qh_per_kh * kh, kh) for kh in args.kh for t in args.T]
 
 
 def bench_fused_bmm_rope_kv_cache_fn(T, QH, KH, metric, args):
     dtype = torch.bfloat16
     device = "cuda"
-    # Each unit test's BMM shape (N x K): fp4 512 x 128, fp8 128 x 512.
+    # Default BMM shape (N x K), from the unit tests: fp4 512 x 128, fp8 128 x 512.
     test_n, test_k = (512, 128) if args.bmm == "fp4" else (128, 512)
     kv_lora_rank = args.kv_lora_rank or test_n
     nope_dim = args.qk_nope_dim or test_k
@@ -181,7 +166,6 @@ def run_benchmark(args):
         line_arg="metric",
         line_vals=[args.metric],
         line_names=[args.metric],
-        styles=[("red", "-")],
         ylabel=units[args.metric],
         plot_name=f"{get_caller_name_no_ext()}_{args.bmm}",
         args={},
@@ -197,64 +181,59 @@ def run_benchmark(args):
 
 
 def parse_args(args: list[str] | None = None):
-    parser = argparse.ArgumentParser(
-        prog="Benchmark fused_bmm_rope_kv_cache",
-        description="Benchmark the Triton fused MLA BMM + RoPE + concat + KV-cache "
-        "write kernels",
-        allow_abbrev=False,
-    )
+    parser = get_parser(kernel_name="fused_bmm_rope_kv_cache")
+    parser.set_defaults(metric="time")
     parser.add_argument(
         "-T",
-        type=_positive_int,
+        type=positive_int,
         nargs="+",
-        default=None,
-        help="Number of tokens (default: 1 2 32 2048)",
+        default=[1, 2, 32, 2048],
+        help="Number of tokens",
     )
     parser.add_argument(
         "--kh",
-        type=_positive_int,
+        type=positive_int,
         nargs="+",
-        default=None,
-        help="Number of KV heads (default: 1 8)",
+        default=[1, 8],
+        help="Number of KV heads",
     )
     parser.add_argument(
         "--qh-per-kh",
-        type=_positive_int,
+        type=positive_int,
         default=16,
-        help="Query heads per KV head (default: 16)",
+        help="Query heads per KV head",
     )
     parser.add_argument(
         "--kv-lora-rank",
-        type=_pow2_int,
+        type=pow2_int,
         default=None,
-        help="Latent dim the BMM projects q_nope to, BMM N (default: 512 fp4, 128 fp8)",
+        help="Latent dim the BMM projects q_nope to, BMM N; unset: 512 fp4, 128 fp8",
     )
     parser.add_argument(
         "--qk-nope-dim",
-        type=_positive_int,
+        type=positive_int,
         default=None,
-        help="q_nope head dim, BMM K (default: 128 fp4, 512 fp8)",
+        help="q_nope head dim, BMM K; unset: 128 fp4, 512 fp8",
     )
     parser.add_argument(
         "--rope-dim",
-        type=_pow2_int,
+        type=pow2_int,
         default=128,
-        help="RoPE head dim (default: 128)",
+        help="RoPE head dim",
     )
     parser.add_argument(
         "--bmm",
         type=str,
         default="fp4",
         choices=["fp4", "fp8"],
-        help="BMM weight dtype: MXFP4 (fused_fp4_...) or FP8 (fused_fp8_...) "
-        "(default: fp4)",
+        help="BMM weight dtype: MXFP4 (fused_fp4_...) or FP8 (fused_fp8_...)",
     )
     parser.add_argument(
         "--cache-dtype",
         type=str,
         default="bf16",
         choices=["bf16", "fp8e4m3"],
-        help="KV cache dtype (default: bf16)",
+        help="KV cache dtype",
     )
     parser.add_argument(
         "--neox", action="store_true", default=False, help="NeoX-style RoPE"
@@ -266,17 +245,10 @@ def parse_args(args: list[str] | None = None):
         help="cos/sin hold rope_dim // 2 frequencies",
     )
     parser.add_argument(
-        "--metric",
-        type=str,
-        default="time",
-        choices=["time", "throughput", "bandwidth"],
-        help="Metric to report (default: time)",
-    )
-    parser.add_argument(
         "--rep",
-        type=_positive_int,
+        type=positive_int,
         default=20,
-        help="do_bench_cudagraph measurement budget in ms (default: 20)",
+        help="do_bench_cudagraph measurement budget in ms",
     )
     parser.add_argument(
         "-print_vgpr",
@@ -291,6 +263,9 @@ def parse_args(args: list[str] | None = None):
         help="Write performance results to CSV file",
     )
     parsed_args = parser.parse_args(args=args)
+    for name in ("rope_dim", "kv_lora_rank"):
+        if (getattr(parsed_args, name) or 2) < 2:
+            parser.error(f"--{name.replace('_', '-')} must be >= 2")
     nope_dim = parsed_args.qk_nope_dim
     # The fused fp4 kernel masks its K tail with the packed width, so a q_nope dim
     # that isn't a power of 2 >= 64 can give a wrong BMM (or fail to compile),
@@ -306,6 +281,9 @@ def parse_args(args: list[str] | None = None):
 
 def main(args: list[str] | None = None) -> None:
     parsed_args = parse_args(args=args)
+    if parsed_args.bmm == "fp4" and not arch_info.is_fp4_avail():
+        print("MXFP4 is not available on this architecture")
+        return
     if parsed_args.print_vgpr:
         print("Retrieving VGPR usage for fused_bmm_rope_kv_cache kernels...")
         print_vgpr(lambda: run_benchmark(parsed_args), get_caller_name_no_ext())
