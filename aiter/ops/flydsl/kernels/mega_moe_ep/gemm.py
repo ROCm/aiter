@@ -556,26 +556,18 @@ def build_gemm(kc: KernelCtx) -> dict:
         wait_lgkm0()
         cbar(L, tid)
 
-    def _gemm2_core(L, tid, a, expert, e, epi):
+    def _gemm2_core(L, tid, a, expert, e, epi, uord, nt_lo, ntpu):
         """Shared GEMM2 pipeline body for echunk ``e``: A = inter[e*RG..] (non-indexed,
-        A-scale ``inters``), B = W2 (shuffled, gate_up=False), cshuffle the accumulators
-        to the LDS C-tile, then ``epi(acc, nt, cptr)`` consumes it (gout store or fused
-        part scatter).  Returns the ``_run_ntile(nt)`` closure; the @flyc.jit caller drives
-        the dynamic n-tile loop (flyc only lowers ``range(traced, ...)`` in a jit function's
-        own body, not in this inlined plain def).  A plain def so both wrappers (``gemm2_pipe``
-        / ``gemm2_combine``) share the *identical* GEMM -- the only difference is ``epi``."""
-        inter_tensor = _global_byte_tensor(fx.Int64(a["inter"]), INTER_NBYTES)
-        a_gather = ATileLoader(
-            row_bytes=inter_row_bytes,
-            sort_block_m=RG,
-            k_step_bytes=A_K_STEP,
-            total_threads=NT,
-            swizzle=True,
-            x_tensor=inter_tensor,
-            async_copy=False,
-            indexed_input=False,
-            a_dtype=a_dtype,
-        )
+        A-scale ``inters``), B = W2, cshuffle the accumulators to the LDS C-tile, then
+        ``epi(acc, nt, cptr)`` consumes it (gout store or fused part scatter).
+
+        TP-style A path: the dedicated A-loader wave (``a_loader_g2``) stages each inter
+        K-tile into the LDS NAB-bank ring; this reads them back via ``AS2RLoader`` + the
+        RC_ASEQ/RC_AFREE ring sync (same mechanism as GEMM1), so the HBM inter-load latency
+        is off the compute critical path.  ``uord``/``nt_lo``/``ntpu`` give the running ring
+        tile index (matches the loader).  Returns ``_run_ntile(nt)``; the @flyc.jit caller
+        drives the dynamic n-tile loop.  A plain def so both wrappers share the identical
+        GEMM.  The A-scale + W2 weights are still staged by the compute wave."""
         a_s2r = AS2RLoader(k_step_bytes=A_K_STEP, swizzle=True, a_dtype=a_dtype)
         w_rsrc = ptr_buf_tensor(
             fx.Int64(a["w2"]) + fx.Int64(expert) * fx.Int64(H * (I // 2)),
@@ -599,61 +591,99 @@ def build_gemm(kc: KernelCtx) -> dict:
         mfma_gu = MfmaScaleGU(m_repeat=M_REPEAT, num_acc_n=NUM_ACC_N2, a_dtype=a_dtype)
         a_buf = _LdsView(_lds_byte_ptr(L, L_A))
         a_scale_lds = _LdsView(_lds_byte_ptr(L, L_AS))
-        cptr = _lds_f32_ptr(L, L_A)
+        cptr = _lds_f32_ptr(L, L_C)  # cshuffle C tile (own region; the A-ring runs ahead)
         wave_id = tid // i32(64)
         tib = e * i32(RG)
-        a_gather.for_tile(tib)
 
         def _run_ntile(nt):
             cbar(L, tid)
             b_row = wave_id * i32(n_per_wave2) + nt * i32(TILE_N2)
-            a_gather.store(a_buf, a_gather.load_regs(i32(0)), i32(0))
-            a_scale.stage(a_scale_lds, tib)
+            q0 = uni((uord * ntpu + (nt - nt_lo)) * i32(K_ITERS2))  # running ring-tile base
+            a_scale.stage(a_scale_lds, tib)  # compute stages the A-scale (small, one-shot)
             cbar(L, tid)
+            _ring_wait(L, tid, q0)  # wait the loader staged inter K-step 0
             b_prev = b_loader.load_step(b_row, i32(0))
             acc = [mfma_gu.zero_value for _ in range(N_ACC2)]
             for sp in range_constexpr(K_ITERS2 - 1):
-                cur_off = (sp & 1) * A_LDS_I32
-                nxt_off = ((sp + 1) & 1) * A_LDS_I32
+                cur_off = _ring_off(q0, sp)
                 spn = sp + 1
                 sb = b_scale.load_step(b_row, i32(sp))
                 sa = a_scale.load_step(a_scale_lds, i32(sp))
 
                 def _al(mi, ks, _b=cur_off):
-                    return a_s2r.load_operand(a_buf, mi, ks, i32(_b))
-
-                a_regs = a_gather.load_regs(i32(spn * A_K_STEP))
+                    return a_s2r.load_operand(a_buf, mi, ks, _b)
 
                 def _ln(ni, _k=spn, _br=b_row):
                     return b_loader.load_ni(_br, ni, i32(_k))
 
                 acc, b_prev = mfma_gu.call_pipe(_al, b_prev, acc, sa, sb, _ln)
-                a_gather.store(a_buf, a_regs, i32(nxt_off))
+                _ring_release(L, tid, q0 + i32(sp))  # done reading inter K=sp
+                _ring_wait(L, tid, q0 + i32(spn))  # wait inter K=sp+1 staged
                 cbar(L, tid)
-            final_off = ((K_ITERS2 - 1) & 1) * A_LDS_I32
+            final_off = _ring_off(q0, K_ITERS2 - 1)
 
             def _alf(mi, ks, _b=final_off):
-                return a_s2r.load_operand(a_buf, mi, ks, i32(_b))
+                return a_s2r.load_operand(a_buf, mi, ks, _b)
 
             sb = b_scale.load_step(b_row, i32(K_ITERS2 - 1))
             sa = a_scale.load_step(a_scale_lds, i32(K_ITERS2 - 1))
             acc = mfma_gu.call_pipe_am_final(_alf, b_prev, acc, sa, sb)
+            _ring_release(L, tid, q0 + i32(K_ITERS2 - 1))  # done reading the final K-step
             cbar(L, tid)
             epi(acc, nt, cptr)
 
         return _run_ntile  # caller (an @flyc.jit wrapper) drives the dynamic n-tile loop
 
     @flyc.jit
-    def gemm2_pipe(L, tid, a, expert, e, s, P, src_out):
+    def a_loader_g2(L, lane, a, e, nt_lo, ntpu, uord):
+        """Dedicated A-loader producer for one GEMM2 unit: stage inter[e*RG..] K-tiles
+        (GEMM1's output, non-indexed) into the NAB-bank LDS ring for the compute waves,
+        paced by the RC_AFREE back-pressure.  ``lane`` is loader-local (= ``tid-B_LOADER``,
+        the ATileLoader ``tid_override``).  Mirrors ``_gemm2_core``'s n-tile / K walk so the
+        running ring tile index ``q`` matches the consumer."""
+        inter_tensor = _global_byte_tensor(fx.Int64(a["inter"]), INTER_NBYTES)
+        a_gather = ATileLoader(
+            row_bytes=inter_row_bytes,
+            sort_block_m=RG,
+            k_step_bytes=A_K_STEP,
+            total_threads=NLOAD,
+            swizzle=True,
+            x_tensor=inter_tensor,
+            async_copy=False,
+            indexed_input=False,
+            a_dtype=a_dtype,
+            tid_override=lane,
+        )
+        a_buf = _LdsView(_lds_byte_ptr(L, L_A))
+        tib = e * i32(RG)
+        a_gather.for_tile(tib)
+
+        def _produce_nt(nt):
+            q0 = uni((uord * ntpu + (nt - nt_lo)) * i32(K_ITERS2))
+            for sp in range_constexpr(K_ITERS2):
+                q = q0 + i32(sp)
+                _loader_wait_free(L, lane, q)
+                a_gather.store(
+                    a_buf, a_gather.load_regs(i32(sp * A_K_STEP)), _ring_off(q, 0)
+                )
+                wait_lgkm0()
+                _loader_publish(L, lane, q)
+
+        for nt_ in range(nt_lo, nt_lo + ntpu, i32(1)):
+            _produce_nt(i32(nt_))
+
+    @flyc.jit
+    def gemm2_pipe(L, tid, a, expert, e, s, P, src_out, uord):
         """GEMM2 -> bf16 ``gout[e*RG..]`` for echunk ``e`` (n-tile shard
         ``[s*N_TILES2//P, (s+1)*N_TILES2//P)``; P-way CU split).  Thin @flyc.jit wrapper
-        over ``_gemm2_core`` with the gout epilogue."""
+        over ``_gemm2_core`` with the gout epilogue.  ``uord`` = this CTA's unit ordinal."""
+        nt_lo = s * i32(N_TILES2) // P  # this CTA's n-tile shard (P-way CU split)
+        nt_hi = (s + i32(1)) * i32(N_TILES2) // P
         run_ntile = _gemm2_core(
             L, tid, a, expert, e,
             lambda acc, nt, cptr: _epilogue_g2(L, tid, acc, nt, cptr, src_out, e),
+            uord, nt_lo, nt_hi - nt_lo,
         )
-        nt_lo = s * i32(N_TILES2) // P  # this CTA's n-tile shard (P-way CU split)
-        nt_hi = (s + i32(1)) * i32(N_TILES2) // P
         for nt_ in range(nt_lo, nt_hi, i32(1)):
             run_ntile(i32(nt_))
 
@@ -724,16 +754,18 @@ def build_gemm(kc: KernelCtx) -> dict:
         _scatter_combine(L, tid, a, e, rows, n_tile, cptr)
 
     @flyc.jit
-    def gemm2_combine(L, tid, a, expert, e, rows):
+    def gemm2_combine(L, tid, a, expert, e, rows, uord):
         """GEMM2 (P==1) that FUSES combine into the cshuffle epilogue: the bf16 output
         scatters straight to each row's source ``part`` (no gout), the cross-rank P2P
         overlapping the next n-tile's MFMA; after the loop one wait_vm drains the scatters
         and a per-row combine_arrive signals the sources.  Thin @flyc.jit wrapper over
         ``_gemm2_core`` (the *same* GEMM as ``gemm2_pipe``) with the fused epilogue.
-        ``rows`` = the echunk's valid row count (padding rows are skipped)."""
+        ``rows`` = the echunk's valid row count (padding rows are skipped); ``uord`` = this
+        CTA's unit ordinal (P==1 -> nt_lo=0, ntpu=N_TILES2)."""
         run_ntile = _gemm2_core(
             L, tid, a, expert, e,
             lambda acc, nt, cptr: _epilogue_g2_combine(L, tid, acc, nt, cptr, a, e, rows),
+            uord, i32(0), i32(N_TILES2),
         )
         for nt_ in range(i32(0), i32(N_TILES2), i32(1)):
             run_ntile(i32(nt_))

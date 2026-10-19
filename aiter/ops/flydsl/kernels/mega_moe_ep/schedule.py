@@ -67,11 +67,15 @@ from .mega_moe_ep_config import (
     C_UNIT,
     C_UROWS,
     C_USEQ,
+    NAB,
     N_XCD,
     NLOAD,
     NT,
     NW,
+    RC_AFREE,
+    RC_ASEQ,
     RC_G1GO,
+    RC_G2GO,
     UL_MAX,
     KernelCtx,
 )
@@ -86,9 +90,11 @@ def build_schedule(kc: KernelCtx) -> dict:
     L_EOFF, L_RIX, L_WSUM, NBW = kc.get("L_EOFF L_RIX L_WSUM NBW")
     L_RCTL = kc.get("L_RCTL")[0]
     const_expr, rch, N_TILES = kc.get("const_expr rch N_TILES")
-    # GEMM1/GEMM2 + the per-unit A loader (gemm.build_gemm) and the combine epilogue
+    N_TILES2 = kc.get("N_TILES2")[0]
+    # GEMM1/GEMM2 + the per-unit A loaders (gemm.build_gemm) and the combine epilogue
     # (communication.build_communication) are added to kc before build_schedule.
-    a_loader_g1, gemm1, gemm2 = kc.get("a_loader_g1 gemm1 gemm2")
+    a_loader_g1, a_loader_g2 = kc.get("a_loader_g1 a_loader_g2")
+    gemm1, gemm2 = kc.get("gemm1 gemm2")
     gemm2_combine = kc.get("gemm2_combine")[0]
     combine_send = kc.get("combine_send")[0]
     dispatch_wait = kc.get("dispatch_wait")[0]
@@ -412,6 +418,15 @@ def build_schedule(kc: KernelCtx) -> dict:
                 bst(now(), rsrc(a["dbg"]),
                     (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(7)) * i32(8), 0, 0)
         gbar(L, tid, a, P)
+        # reset the A-ring for GEMM2 + release the A-loader's PASS-2 phase (inter is now
+        # written + gbar-flushed).  Safe here: PASS-1 drained the ring (compute consumed,
+        # loader produced) and the loader is parked on RC_G2GO, so nothing touches it.
+        if tid == i32(0):
+            for b in range_constexpr(NAB):
+                lds_st(L, L_RCTL + (i32(RC_ASEQ) + i32(b)) * i32(4), i32(0))
+                lds_st(L, L_RCTL + (i32(RC_AFREE) + i32(b)) * i32(4), i32(0))
+            lds_st_rel(L, L_RCTL + RC_G2GO * i32(4), i32(1))
+        cbar(L, tid)  # compute waves see the zeroed ring before consuming GEMM2 A
         # --- PASS 2 (GEMM2) [+ fused combine at P==1].  P==1 (high bs): each echunk's
         #     GEMM2 scatters its output straight to the source ``part`` from the cshuffle
         #     epilogue (gemm2_combine) -- no gout round-trip, and the cross-rank P2P
@@ -428,7 +443,7 @@ def build_schedule(kc: KernelCtx) -> dict:
                     lds_ld_i32(L, L_DCNT + (ec & i32(0xFFFF)) * i32(4)) - cc * i32(rch),
                     i32(rch),
                 )
-                gemm2_combine(L, tid, a, ec & i32(0xFFFF), ei, rows)
+                gemm2_combine(L, tid, a, ec & i32(0xFFFF), ei, rows, (ei - bid) // nblk)
             if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
                 if tid == i32(0):  # post gemm2 (slot 8)
                     bst(now(), rsrc(a["dbg"]),
@@ -439,7 +454,7 @@ def build_schedule(kc: KernelCtx) -> dict:
                 gi = i32(gi_)
                 eg = gi // P
                 gemm2(L, tid, a, lds_ld_i32(L, L_DCH + eg * i32(4)) & i32(0xFFFF),
-                      eg, gi - eg * P, P, rsrc(a["gout"]))
+                      eg, gi - eg * P, P, rsrc(a["gout"]), (gi - bid) // nblk)
             if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
                 if tid == i32(0):  # post gemm2 (slot 8)
                     bst(now(), rsrc(a["dbg"]),
@@ -458,16 +473,19 @@ def build_schedule(kc: KernelCtx) -> dict:
 
     @flyc.jit
     def a_loader_units(L, tid, a):
-        """Dedicated A-loader band driver (TP-style).  Waits the GEMM1 go flag (RC_G1GO,
-        set by compute once the dispatched payload + the PASS-0 rowmap are live), then
-        walks this CTA's GEMM1 units with the SAME stride-#CU walk + P as compute_units
-        PASS 1 and stages each unit's A K-tiles into the LDS NAB-bank ring (``a_loader_g1``)
-        for the compute waves to consume.  GEMM2's A is still staged in-wave (Stage 2)."""
+        """Dedicated A-loader band driver (TP-style).  Two phases, each gated by a go flag
+        the compute band raises once the A source is live: PASS 1 (RC_G1GO -- dispatched
+        payload + PASS-0 rowmap) stages each GEMM1 unit's A, PASS 2 (RC_G2GO -- the GEMM1
+        intermediate written + gbar-flushed, ring reset) stages each GEMM2 unit's inter A.
+        Walks the SAME stride-#CU unit walk + P as compute_units so the running ring tile
+        index matches the consumer; GEMM2 mirrors the P==1 (per-echunk) / P>1 (per-shard)
+        split of compute_units PASS 2."""
         lane = tid - i32(B_LOADER)  # loader-local lane 0..NLOAD-1 (= ATileLoader override)
-        spin0(L, lane, L_RCTL + RC_G1GO * i32(4), i32(1))
         bid = i32(gpu.block_id("x"))
-        nch = lds_ld_i32(L, L_CTL + C_NCH * 4)
         nblk = i32(gpu.grid_dim.x)
+        # PASS 1: GEMM1 A (dispatched payload, indexed gather).
+        spin0(L, lane, L_RCTL + RC_G1GO * i32(4), i32(1))
+        nch = lds_ld_i32(L, L_CTL + C_NCH * 4)
         P = fx.max(fx.min(nblk // fx.max(nch, i32(1)), i32(N_TILES)), i32(1))
         for gi_ in range(bid, nch * P, nblk):
             gi = i32(gi_)
@@ -476,5 +494,19 @@ def build_schedule(kc: KernelCtx) -> dict:
                 L, lane, a, lds_ld_i32(L, L_DCH + eg * i32(4)) & i32(0xFFFF),
                 eg, gi - eg * P, P, (gi - bid) // nblk,
             )
+        # PASS 2: GEMM2 A (the intermediate, non-indexed) -- same unit walk + P split.
+        spin0(L, lane, L_RCTL + RC_G2GO * i32(4), i32(1))
+        if P == i32(1):
+            for ei_ in range(bid, nch, nblk):
+                ei = i32(ei_)
+                a_loader_g2(L, lane, a, ei, i32(0), i32(N_TILES2), (ei - bid) // nblk)
+        else:
+            for gi_ in range(bid, nch * P, nblk):
+                gi = i32(gi_)
+                eg = gi // P
+                s = gi - eg * P
+                nt_lo = s * i32(N_TILES2) // P
+                nt_hi = (s + i32(1)) * i32(N_TILES2) // P
+                a_loader_g2(L, lane, a, eg, nt_lo, nt_hi - nt_lo, (gi - bid) // nblk)
 
     return locals()
