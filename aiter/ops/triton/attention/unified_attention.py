@@ -179,12 +179,7 @@ def _gfx950_split_grid(params: _UAParams):
 
 def _gfx1250_split_short_queries(params: _UAParams, backend: str):
     """Short multi-token queries (speculative verify) take the 3d split-K kernel.
-
-    The 2d grid has one program per (KV head, query block), so a few requests
-    with a long context leave most CUs idle. The 3d kernel masks the causal
-    edge only in the last tile of a query block, so each block must hold one
-    query position (BLOCK_Q == 1).
-    """
+    It masks the causal edge only in a block's last tile, so BLOCK_Q must be 1."""
     if (
         backend != "gluon"
         or not params.shuffled_kv_cache

@@ -1926,13 +1926,8 @@ unified_attention_gluon_kernel_3d_repr = make_kernel_repr(
 
 @gluon.jit
 def compute_pv_per_token(pgm, p, v, acc):
-    """P @ V for P already scaled by the per-token V scales.
-
-    P is split into a bf16 high part and a bf16 low part, so P keeps about 16
-    mantissa bits. One bf16 P truncates each weight by up to 2^-7, which biases
-    the output low against the fp32 row sum L. Decode is memory bound, so the
-    second WMMA costs little.
-    """
+    """P @ V for P scaled by the per-token V scales, with P split into bf16 high
+    and low parts. One bf16 P biases the output low against the fp32 row sum."""
     p_hi = p.to(gl.bfloat16)
     p_lo = (p - p_hi.to(gl.float32)).to(gl.bfloat16)
     acc = pgm.compute_pv(p_hi, v, None, acc)
