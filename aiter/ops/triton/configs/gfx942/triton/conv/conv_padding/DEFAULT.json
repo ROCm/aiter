@@ -1,6 +1,0 @@
-{
-    "any": {
-        "BLOCK_SIZE": 256,
-        "num_warps": 4
-    }
-}

@@ -24,12 +24,12 @@ Plus 7 exact-route and configuration-precedence regression cases, 2
 scalar-parameter cases, 1 cache-clear case, and 2 inference-tensor cases.
 
 Convolution cases: 12 + 12 + 12 + 36 + 2 + 7 + 2 + 1 + 2 = 86.
-Padding primitives add 684 validation, mapping, reference, materialization, and
-configuration cases, for a total of 770 cases.
+Padding-preparation tests cover validation, reference semantics, materialization,
+layout conversion, input strides, no-op reuse, and delegation to F.pad.
 
 Convolution tests retain architecture gating. Padding validation and reference
-tests run on CPU. GPU tests that read padding configurations require a configured
-architecture; coordinate-mapping and no-op checks do not require padding configs.
+tests run on CPU. GPU padding tests do not require architecture-specific padding
+configurations.
 
 Where a kernel's guard rejects a shape (e.g. winograd on a 5x5), the
 shape is silently skipped inside run_all_methods.
@@ -42,11 +42,8 @@ shapes, in op_benchmarks/triton/model_benchmarking_tool/bench_models.py).
 import pytest
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
 
 import aiter.ops.triton.conv.conv2d as conv2d_module
-from aiter.ops.triton._triton_kernels.conv.padding import _map_padding_coordinate
 from aiter.ops.triton.conv import _launch as padding_ops
 from aiter.ops.triton.conv import _prepack as conv_prepack
 from aiter.ops.triton.conv._prepack import clear_conv2d_weight_pack_caches
@@ -365,7 +362,6 @@ def test_conv_config_layout_variant_precedence(monkeypatch, isolated_conv_config
 
 
 _PADDING_MODES = ("zeros", "reflect", "replicate", "circular")
-_PADDING_CONFIG_ARCHS = ("gfx1201", "gfx942", "gfx950")
 
 
 def _valid_padding_cases():
@@ -457,73 +453,6 @@ def test_padding_validation_matches_pytorch_limits(
         F.pad(source, (pad_width, pad_width, pad_height, pad_height), mode=padding_mode)
 
 
-@triton.jit
-def _padding_gather_kernel(
-    source,
-    output,
-    height: tl.constexpr,
-    width: tl.constexpr,
-    pad_height,
-    pad_width,
-    output_width,
-    overhang: tl.constexpr,
-    PADDING_MODE: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    row = tl.program_id(0)
-    columns = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    input_row, row_valid = _map_padding_coordinate(
-        row - pad_height - overhang, height, pad_height, PADDING_MODE
-    )
-    input_columns, columns_valid = _map_padding_coordinate(
-        columns - pad_width - overhang, width, pad_width, PADDING_MODE
-    )
-    output_valid = columns < output_width
-    values = tl.load(
-        source + input_row * width + input_columns,
-        mask=output_valid & row_valid & columns_valid,
-        other=0.0,
-    )
-    tl.store(output + row * output_width + columns, values, mask=output_valid)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
-@pytest.mark.parametrize("padding_mode,height,width,padding", _VALID_PADDING_CASES)
-def test_padding_mapping_matches_pytorch(padding_mode, height, width, padding, dtype):
-    """Check scalar rows, vector columns, and zeroed partial-tile overhang."""
-    _validate_conv2d_padding_mode(padding_mode, height, width, padding)
-    source = torch.arange(1, height * width + 1, dtype=torch.float32).reshape(
-        1, 1, height, width
-    )
-    pad_height, pad_width = padding
-    overhang = 3
-    output_height = height + 2 * (pad_height + overhang)
-    output_width = width + 2 * (pad_width + overhang)
-    output = torch.empty(1, 1, output_height, output_width, device="cuda", dtype=dtype)
-    _padding_gather_kernel[(output_height, triton.cdiv(output_width, 64))](
-        source.to(device="cuda", dtype=dtype),
-        output,
-        height,
-        width,
-        pad_height,
-        pad_width,
-        output_width,
-        overhang,
-        PADDING_MODE=padding_mode,
-        BLOCK_SIZE=64,
-        num_warps=4,
-    )
-
-    expected = F.pad(
-        source,
-        (pad_width, pad_width, pad_height, pad_height),
-        mode="constant" if padding_mode == "zeros" else padding_mode,
-    )
-    expected = F.pad(expected, (overhang, overhang, overhang, overhang))
-    torch.testing.assert_close(output.cpu().float(), expected, rtol=0, atol=0)
-
-
 @pytest.mark.parametrize("padding_mode", _PADDING_MODES)
 @pytest.mark.parametrize("layout", ["nchw", "nhwc"])
 @pytest.mark.parametrize("has_bias", [False, True])
@@ -574,12 +503,6 @@ def test_padding_reference_matches_module(
 def test_prepared_padding_matches_pytorch(
     padding_mode, height, width, padding, layout, dtype
 ):
-    if (
-        padding_mode != "zeros"
-        and padding != (0, 0)
-        and _current_arch not in _PADDING_CONFIG_ARCHS
-    ):
-        pytest.skip(f"No padding configuration for {_current_arch!r}")
     memory_format = torch.channels_last if layout == "nhwc" else torch.contiguous_format
     source = torch.arange(6 * height * width, device="cuda").reshape(
         2, 3, height, width
@@ -618,10 +541,6 @@ def test_prepared_padding_matches_pytorch(
 @pytest.mark.parametrize(
     "source_kind", ["sliced", "transposed", "broadcast", "channels_last"]
 )
-@pytest.mark.skipif(
-    _current_arch not in _PADDING_CONFIG_ARCHS,
-    reason=f"No padding configuration for {_current_arch!r}",
-)
 def test_prepared_padding_reads_source_strides(
     padding_mode, layout, dtype, source_kind
 ):
@@ -653,17 +572,16 @@ def test_prepared_padding_reads_source_strides(
     + [(mode, (0, 0)) for mode in _PADDING_MODES]
     + [("zeros", 2), ("zeros", (1, 3))],
 )
-def test_prepared_padding_noop_does_not_allocate_or_launch(
+def test_prepared_padding_noop_does_not_materialize(
     monkeypatch, padding_mode, padding, layout
 ):
     source = torch.ones(2, 3, 5, 7).transpose(2, 3)
 
-    def unexpected_allocation(*args, **kwargs):
-        pytest.fail("no-op padding must not allocate an output")
+    def unexpected_materialization(*args, **kwargs):
+        pytest.fail("no-op padding must not pad or convert the input layout")
 
-    monkeypatch.setattr(padding_ops, "_alloc_output", unexpected_allocation)
-    monkeypatch.setattr(padding_ops, "_get_config_padding", None)
-    monkeypatch.setattr(padding_ops, "_pad_conv2d_kernel", None)
+    monkeypatch.setattr(padding_ops.F, "pad", unexpected_materialization)
+    monkeypatch.setattr(padding_ops, "_ensure_layout", unexpected_materialization)
     actual, conv_padding = padding_ops._prepare_conv2d_padding(
         source, padding, padding_mode, layout=layout
     )
@@ -687,12 +605,15 @@ def test_prepared_padding_noop_does_not_allocate_or_launch(
         ((2, 3, 5, 7), 1, "replicate", "nchw", "requires a CUDA/ROCm tensor"),
     ],
 )
-def test_prepared_padding_validates_before_launch(
+def test_prepared_padding_validates_before_materialization(
     shape, padding, padding_mode, layout, message, monkeypatch
 ):
     source = torch.empty(shape)
-    monkeypatch.setattr(padding_ops, "_get_config_padding", None)
-    monkeypatch.setattr(padding_ops, "_pad_conv2d_kernel", None)
+
+    def unexpected_padding(*args, **kwargs):
+        pytest.fail("invalid padding must be rejected before calling F.pad")
+
+    monkeypatch.setattr(padding_ops.F, "pad", unexpected_padding)
     with pytest.raises(ValueError, match=message):
         padding_ops._prepare_conv2d_padding(
             source, padding, padding_mode, layout=layout
@@ -702,12 +623,8 @@ def test_prepared_padding_validates_before_launch(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 @pytest.mark.parametrize("layout", ["nchw", "nhwc"])
 @pytest.mark.parametrize("padding_mode", ["reflect", "replicate", "circular"])
-def test_prepared_padding_empty_batch_does_not_launch(
-    padding_mode, layout, monkeypatch
-):
+def test_prepared_padding_handles_empty_batch(padding_mode, layout):
     source = torch.empty(0, 3, 5, 7, device="cuda", dtype=torch.float16)
-    monkeypatch.setattr(padding_ops, "_get_config_padding", None)
-    monkeypatch.setattr(padding_ops, "_pad_conv2d_kernel", None)
     actual, conv_padding = padding_ops._prepare_conv2d_padding(
         source, (1, 2), padding_mode, layout=layout
     )
@@ -719,53 +636,34 @@ def test_prepared_padding_empty_batch_does_not_launch(
     assert conv_padding == (0, 0)
 
 
-@pytest.mark.parametrize("arch", _PADDING_CONFIG_ARCHS)
-def test_padding_config_defaults(monkeypatch, isolated_conv_config_cache, arch):
-    _use_arch(monkeypatch, arch)
-    config = padding_ops._get_config_padding(M=1024)
-    assert config == {"BLOCK_SIZE": 256, "num_warps": 4}
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 @pytest.mark.parametrize("layout", ["nchw", "nhwc"])
-def test_padding_launch_uses_json_parameters(
-    monkeypatch, isolated_conv_config_cache, layout
+@pytest.mark.parametrize("padding_mode", ["reflect", "replicate", "circular"])
+def test_prepared_padding_delegates_to_pytorch_without_config(
+    monkeypatch, padding_mode, layout
 ):
-    parameters = {"BLOCK_SIZE": 128, "num_warps": 2}
-    config_reads = []
-    launches = []
-    kernel = padding_ops._pad_conv2d_kernel
+    calls = []
+    original_pad = F.pad
 
-    def config_file(config_name):
-        config_reads.append(config_name)
-        return {"any": parameters}
+    def recording_pad(source, padding, mode):
+        calls.append((source, padding, mode))
+        return original_pad(source, padding, mode=mode)
 
-    class RecordingKernel:
-        def __getitem__(self, grid):
-            def launch(*args, **kwargs):
-                compiled_kernel = kernel[grid](*args, **kwargs)
-                launches.append((grid, kwargs, compiled_kernel.name))
-                return compiled_kernel
+    def unexpected_config(*args, **kwargs):
+        pytest.fail("F.pad must not need Triton padding launch configurations")
 
-            return launch
-
-    monkeypatch.setattr(conv_config_utils, "_get_conv_config_file", config_file)
-    monkeypatch.setattr(padding_ops, "_pad_conv2d_kernel", RecordingKernel())
+    monkeypatch.setattr(padding_ops.F, "pad", recording_pad)
+    monkeypatch.setattr(conv_config_utils, "_get_conv_config_file", unexpected_config)
     source = torch.arange(210, device="cuda", dtype=torch.float16).reshape(2, 3, 5, 7)
     actual, conv_padding = padding_ops._prepare_conv2d_padding(
-        source, (1, 2), "reflect", layout=layout
+        source, (1, 2), padding_mode, layout=layout
     )
 
-    assert config_reads == ["CONV-PADDING"]
-    assert len(launches) == 1
-    grid, launch_kwargs, kernel_name = launches[0]
-    assert grid == (triton.cdiv(actual.numel(), parameters["BLOCK_SIZE"]),)
-    assert launch_kwargs["BLOCK_SIZE"] == parameters["BLOCK_SIZE"]
-    assert launch_kwargs["num_warps"] == parameters["num_warps"]
-    assert kernel_name == (
-        f"_pad_conv2d_kernel_BLOCK_SIZE_{parameters['BLOCK_SIZE']}_"
-        f"PADDING_MODE_REFLECT_CHANNELS_LAST_{int(layout == 'nhwc')}"
-    )
+    assert len(calls) == 1
+    assert calls[0][0] is source
+    assert calls[0][1:] == ((2, 2, 1, 1), padding_mode)
+    memory_format = torch.channels_last if layout == "nhwc" else torch.contiguous_format
+    assert actual.is_contiguous(memory_format=memory_format)
     assert conv_padding == (0, 0)
-    expected = F.pad(source, (2, 2, 1, 1), mode="reflect")
+    expected = original_pad(source, (2, 2, 1, 1), mode=padding_mode)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
