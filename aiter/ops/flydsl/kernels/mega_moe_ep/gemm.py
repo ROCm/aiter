@@ -41,6 +41,7 @@ from ..mxfp4_gemm_common import _activation_mul_batch
 from ..tensor_shim import ptr_buf_tensor
 from .common import (
     ACQ_REL,
+    AUX_SYS,
     V4I,
     bld,
     bst,
@@ -60,6 +61,7 @@ from .common import (
 from .mega_moe_ep_config import (
     C_BARCNT,
     C_BARGEN,
+    MAX_NPES,
     NT,
     NW,
     TILE_K,
@@ -108,6 +110,15 @@ def build_gemm(kc: KernelCtx) -> dict:
     L_A, L_AS, L_CTL, TMAX = kc.get("L_A L_AS L_CTL TMAX")
     N_TILES, NUM_ACC_N, M_REPEAT = kc.get("N_TILES NUM_ACC_N M_REPEAT")
     A_K_STEP, K_ITERS, A_LDS_I32 = kc.get("A_K_STEP K_ITERS A_LDS_I32")
+    combine_arrive = kc.get("combine_arrive")[0]  # fused-combine epilogue signals source
+
+    def _part_base(a, src_rank):
+        """Runtime-select source rank ``src_rank``'s ``part`` region base (peer arena +
+        off_part), for the fused-combine GEMM2 epilogue's direct scatter-back."""
+        v = fx.Int64(a["peer"][0])
+        for j in range_constexpr(1, MAX_NPES):
+            v = (src_rank == i32(j)).select(fx.Int64(a["peer"][j]), v)
+        return v + fx.Int64(a["off_part"])
 
     MT = RG // 16  # MFMA row tiles (16 rows each) == M_REPEAT
     assert MT == M_REPEAT
@@ -462,13 +473,14 @@ def build_gemm(kc: KernelCtx) -> dict:
         wait_lgkm0()
         cbar(L, tid)
 
-    @flyc.jit
-    def gemm2_pipe(L, tid, a, expert, e, s, P, src_out):
-        """GEMM2 (intermediate x W2 -> bf16 gout) for echunk ``e``, pipelined via the
-        gemm_util atoms: A = inter[e*RG..] (non-indexed row tile, A-scale = ``inters``),
-        B = W2 (shuffled, gate_up=False), cshuffle -> bf16 -> gout[e*RG..].  ``s``/``P``
-        select this CTA's n-tile shard ``[s*N_TILES2//P, (s+1)*N_TILES2//P)`` of the H
-        output cols (P-way CU split; P==1 computes the whole row)."""
+    def _gemm2_core(L, tid, a, expert, e, epi):
+        """Shared GEMM2 pipeline body for echunk ``e``: A = inter[e*RG..] (non-indexed,
+        A-scale ``inters``), B = W2 (shuffled, gate_up=False), cshuffle the accumulators
+        to the LDS C-tile, then ``epi(acc, nt, cptr)`` consumes it (gout store or fused
+        part scatter).  Returns the ``_run_ntile(nt)`` closure; the @flyc.jit caller drives
+        the dynamic n-tile loop (flyc only lowers ``range(traced, ...)`` in a jit function's
+        own body, not in this inlined plain def).  A plain def so both wrappers (``gemm2_pipe``
+        / ``gemm2_combine``) share the *identical* GEMM -- the only difference is ``epi``."""
         inter_tensor = _global_byte_tensor(fx.Int64(a["inter"]), INTER_NBYTES)
         a_gather = ATileLoader(
             row_bytes=inter_row_bytes,
@@ -508,8 +520,6 @@ def build_gemm(kc: KernelCtx) -> dict:
         wave_id = tid // i32(64)
         tib = e * i32(RG)
         a_gather.for_tile(tib)
-        nt_lo = s * i32(N_TILES2) // P  # this CTA's n-tile shard (P-way CU split)
-        nt_hi = (s + i32(1)) * i32(N_TILES2) // P
 
         def _run_ntile(nt):
             cbar(L, tid)
@@ -546,10 +556,112 @@ def build_gemm(kc: KernelCtx) -> dict:
             sa = a_scale.load_step(a_scale_lds, i32(K_ITERS2 - 1))
             acc = mfma_gu.call_pipe_am_final(_alf, b_prev, acc, sa, sb)
             cbar(L, tid)
-            _epilogue_g2(L, tid, acc, nt, cptr, src_out, e)
+            epi(acc, nt, cptr)
 
+        return _run_ntile  # caller (an @flyc.jit wrapper) drives the dynamic n-tile loop
+
+    @flyc.jit
+    def gemm2_pipe(L, tid, a, expert, e, s, P, src_out):
+        """GEMM2 -> bf16 ``gout[e*RG..]`` for echunk ``e`` (n-tile shard
+        ``[s*N_TILES2//P, (s+1)*N_TILES2//P)``; P-way CU split).  Thin @flyc.jit wrapper
+        over ``_gemm2_core`` with the gout epilogue."""
+        run_ntile = _gemm2_core(
+            L, tid, a, expert, e,
+            lambda acc, nt, cptr: _epilogue_g2(L, tid, acc, nt, cptr, src_out, e),
+        )
+        nt_lo = s * i32(N_TILES2) // P  # this CTA's n-tile shard (P-way CU split)
+        nt_hi = (s + i32(1)) * i32(N_TILES2) // P
         for nt_ in range(nt_lo, nt_hi, i32(1)):
-            _run_ntile(i32(nt_))
+            run_ntile(i32(nt_))
+
+    # ================= GEMM2 with FUSED combine (P==1 overlap path) ================
+    @flyc.jit
+    def _scatter_combine(L, tid, a, e, rows, n_tile, cptr):
+        """Scatter this n-tile's cshuffled C-tile slice (the H cols
+        ``[n_tile*TILE_N2, +TILE_N2)``) of each VALID row straight to its source rank's
+        ``part`` (async AUX_SYS P2P -- only xGMI, no local-HBM gout round-trip, so it
+        overlaps the next n-tile's MFMA).  Mirrors ``combine_send`` EXACTLY (wave-strided
+        rows, lane-strided V4I cols; only valid rows iterated so padding is skipped) --
+        the sole change is reading the LDS C-tile (``cptr``) instead of global ``gout``."""
+        HV = H // 8
+        mtpr = a["mtpr"]
+        r_rowidx = rsrc(a["rowidx"])
+        wave = tid // i32(64)
+        lane = tid % i32(64)
+        NV = cs_tile_n2 // 8  # V4I (8-bf16) cols produced by this n-tile
+        hv0 = i32(n_tile) * i32(NV)  # this n-tile's base in the row's HV V4I cols
+        for k_ in range(wave, rows, i32(NW)):
+            k = i32(k_)
+            idx = fx.Int32(bld(r_rowidx, (e * i32(RG) + k) * i32(4), 0, T.i32, 0))
+            sk = idx // i32(TOPK)
+            route = idx - sk * i32(TOPK)
+            src_rank = sk // mtpr
+            slot = (sk - src_rank * mtpr) * i32(TOPK) + route
+            dpart = rsrc(_part_base(a, src_rank))
+            pbase = slot * i32(HV) + hv0
+            for g_ in range(lane, i32(NV), i32(64)):
+                g = i32(g_)
+                col0 = g * i32(8)
+                cidx = k * i32(cs_tile_n2) + col0
+                f32_iter = fx.recast_iter(
+                    fx.Float32, fx.add_offset(cptr, fx.make_int_tuple(cidx))
+                )
+                frag = fx.make_view(f32_iter, fx.make_layout(8, 1)).load()
+                ov = fx.Vector.from_elements(
+                    [fx.Float32(frag[v]).to(fx.BFloat16) for v in range(8)],
+                    fx.BFloat16,
+                )
+                bst(ov, dpart, (pbase + g) * i32(16), 0, AUX_SYS)
+        # the remote part stores overlap the next n-tile's MFMA (gemm2_combine drains
+        # them once at the end, before the arrives); the cptr (LDS) reads must finish
+        # before the next n-tile's cshuffle overwrites the C-tile.
+        wait_lgkm0()
+        cbar(L, tid)
+
+    def _epilogue_g2_combine(L, tid, acc, n_tile, cptr, a, e, rows):
+        """Fused-combine GEMM2 epilogue: cshuffle the accumulators to the LDS C-tile (same
+        as ``_epilogue_g2``), then ``_scatter_combine`` sends each row's bf16 output
+        straight to its source ``part`` (no gout) -- the cross-rank P2P overlaps the next
+        n-tile's MFMA."""
+        wave = tid // i32(64)
+        lane = tid % i32(64)
+        l16 = lane % i32(16)
+        ld4 = (lane // i32(16)) * i32(4)
+        cbase = wave * i32(cs_tile_n2 // NW)
+        for mi in range_constexpr(M_REPEAT):
+            for ni in range_constexpr(NUM_ACC_N2):
+                v4 = fx.Vector(acc[mi * NUM_ACC_N2 + ni])
+                col = cbase + i32(ni * 16) + l16
+                for ii in range_constexpr(4):
+                    row = i32(mi * 16) + ld4 + i32(ii)
+                    idx = row * i32(cs_tile_n2) + col
+                    ptr = fx.add_offset(cptr, fx.make_int_tuple(idx))
+                    fx.ptr_store(fx.Vector.from_elements([v4[ii]], fx.Float32), ptr)
+        cbar(L, tid)
+        _scatter_combine(L, tid, a, e, rows, n_tile, cptr)
+
+    @flyc.jit
+    def gemm2_combine(L, tid, a, expert, e, rows):
+        """GEMM2 (P==1) that FUSES combine into the cshuffle epilogue: the bf16 output
+        scatters straight to each row's source ``part`` (no gout), the cross-rank P2P
+        overlapping the next n-tile's MFMA; after the loop one wait_vm drains the scatters
+        and a per-row combine_arrive signals the sources.  Thin @flyc.jit wrapper over
+        ``_gemm2_core`` (the *same* GEMM as ``gemm2_pipe``) with the fused epilogue.
+        ``rows`` = the echunk's valid row count (padding rows are skipped)."""
+        run_ntile = _gemm2_core(
+            L, tid, a, expert, e,
+            lambda acc, nt, cptr: _epilogue_g2_combine(L, tid, acc, nt, cptr, a, e, rows),
+        )
+        for nt_ in range(i32(0), i32(N_TILES2), i32(1)):
+            run_ntile(i32(nt_))
+        wait_vm(0)  # drain the fused part stores before signalling the sources
+        parity = a["epoch"] & i32(1)
+        mt = a["mtpr"]
+        exp = a["m"] * i32(TOPK)
+        for k_ in range(tid, rows, i32(NT)):
+            k = i32(k_)
+            idx = fx.Int32(bld(rsrc(a["rowidx"]), (e * i32(RG) + k) * i32(4), 0, T.i32, 0))
+            combine_arrive(a, (idx // i32(TOPK)) // mt, parity, i32(0), i32(1), exp)
 
     @flyc.jit
     def _gemm2_naive(L, tid, a, expert, rows, src_out):

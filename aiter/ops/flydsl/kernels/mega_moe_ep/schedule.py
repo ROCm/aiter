@@ -32,7 +32,6 @@ from ..kernels_common import ceildiv
 from .common import (
     ACQ_REL,
     _ctpop,
-    alive,
     bld,
     bst,
     g_add_agent,
@@ -58,9 +57,7 @@ from .mega_moe_ep_config import (
     C_BARCNT,
     C_BARGEN,
     C_CNT,
-    C_COMM,
     C_DYNP,
-    C_GREADY,
     C_NACT,
     C_NCH,
     C_PLAN,
@@ -87,6 +84,7 @@ def build_schedule(kc: KernelCtx) -> dict:
     # GEMM1/GEMM2 + the per-unit A stager (gemm.build_gemm) and the combine epilogue
     # (communication.build_communication) are added to kc before build_schedule.
     a_loader, gemm1, gemm2 = kc.get("a_loader gemm1 gemm2")
+    gemm2_combine = kc.get("gemm2_combine")[0]
     combine_send = kc.get("combine_send")[0]
     dispatch_wait = kc.get("dispatch_wait")[0]
     grid_bar = kc.get("grid_bar")[0]
@@ -337,35 +335,6 @@ def build_schedule(kc: KernelCtx) -> dict:
         return fx.min(lds_ld_i32(L, L_DCNT + expert * i32(4)) - lo, i32(rch))
 
     @flyc.jit
-    def comm_combine(L, tid, a):
-        """Comm-band (tid>=NT) consumer of the P==1 overlap: wait for the plan (C_COMM),
-        then combine each echunk as soon as the compute band finishes its GEMM2 (the
-        ``C_GREADY`` counter), so the cross-rank scatter runs on these otherwise-idle waves
-        CONCURRENTLY with the compute band's next-wave GEMM.  P>1 keeps combine in the
-        compute band (pass 3, gout is n-tile-sharded), so this returns immediately."""
-        ct = tid - i32(NT)
-        t0 = now()
-        while (lds_ld_acq(L, L_CTL + C_COMM * 4) == i32(0)) & alive(t0):
-            rocdl.s_sleep(0)
-        if lds_ld_i32(L, L_CTL + C_DYNP * 4) == i32(1):
-            nch = lds_ld_i32(L, L_CTL + C_NCH * 4)
-            nblk = i32(gpu.grid_dim.x)
-            bid = i32(gpu.block_id("x"))
-            for ei_ in range(bid, nch, nblk):
-                ei = i32(ei_)
-                j = (ei - bid) // nblk
-                t1 = now()
-                while (lds_ld_acq(L, L_CTL + C_GREADY * 4) < j + i32(1)) & alive(t1):
-                    rocdl.s_sleep(0)
-                ec = lds_ld_i32(L, L_DCH + ei * i32(4))
-                cc = ec.shrui(i32(24))
-                rc = fx.min(
-                    lds_ld_i32(L, L_DCNT + (ec & i32(0xFFFF)) * i32(4)) - cc * i32(rch),
-                    i32(rch),
-                )
-                combine_send(L, ct, a, rsrc(a["gout"]), ei, rc)
-
-    @flyc.jit
     def compute_units(L, tid, a):
         """Local-expert GEMM as GATHER -> GEMM1 -> GEMM2 -> COMBINE passes separated by
         device grid barriers (``gbar``).  Each CTA walks its slice of the work with a
@@ -398,9 +367,6 @@ def build_schedule(kc: KernelCtx) -> dict:
         # at N_TILES).  When nch >= nblk (high bs) P collapses to 1 and nch itself spills
         # into multiple waves via the loops below.
         P = fx.max(fx.min(nblk // fx.max(nch, i32(1)), i32(N_TILES)), i32(1))
-        if tid == i32(0):  # publish P + "plan ready" to the comm band (P==1 overlap)
-            lds_st(L, L_CTL + C_DYNP * 4, P)
-            lds_st_rel(L, L_CTL + C_COMM * 4, i32(1))
         r_rowmap = rsrc(a["rowmap"])
         r_rowidx = rsrc(a["rowidx"])
         # --- PASS 0 (gather): walk this CTA's echunks, publish per-row recv-slot (rowidx,
@@ -431,20 +397,23 @@ def build_schedule(kc: KernelCtx) -> dict:
                 bst(now(), rsrc(a["dbg"]),
                     (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(7)) * i32(8), 0, 0)
         gbar(L, tid, a, P)
-        # --- PASS 2 (GEMM2) [+ overlap]. P==1: after each echunk's GEMM2 publish gready so
-        #     the comm band (comm_combine) scatters it back to source CONCURRENTLY with the
-        #     next echunk's GEMM2 (the scatter's cross-rank P2P overlaps the compute MFMA;
-        #     wait_vm only drains the compute waves' own vmcnt).  P>1 (gout n-tile-sharded
-        #     across CTAs): grid-barrier, then combine full rows in this band (pass 3).
+        # --- PASS 2 (GEMM2) [+ fused combine at P==1].  P==1 (high bs): each echunk's
+        #     GEMM2 scatters its output straight to the source ``part`` from the cshuffle
+        #     epilogue (gemm2_combine) -- no gout round-trip, and the cross-rank P2P
+        #     overlaps the NEXT n-tile's MFMA.  P>1 (gout n-tile-sharded across CTAs):
+        #     grid-barrier, then combine full rows in this band (pass 3, combine_send).
         if P == i32(1):
-            for gi_ in range(bid, nch, nblk):
-                e = i32(gi_)
-                gemm2(L, tid, a, lds_ld_i32(L, L_DCH + e * i32(4)) & i32(0xFFFF),
-                      e, i32(0), i32(1), rsrc(a["gout"]))
-                wait_vm(0)
-                cbar(L, tid)  # all compute waves' gout[e] drained before publishing
-                if tid == i32(0):
-                    lds_st_rel(L, L_CTL + C_GREADY * 4, (e - bid) // nblk + i32(1))
+            # fused-combine GEMM2: the bf16 output scatters straight to each row's source
+            # part from the epilogue (no gout). rows = valid count (padding skipped).
+            for ei_ in range(bid, nch, nblk):
+                ei = i32(ei_)
+                ec = lds_ld_i32(L, L_DCH + ei * i32(4))
+                cc = ec.shrui(i32(24))
+                rows = fx.min(
+                    lds_ld_i32(L, L_DCNT + (ec & i32(0xFFFF)) * i32(4)) - cc * i32(rch),
+                    i32(rch),
+                )
+                gemm2_combine(L, tid, a, ec & i32(0xFFFF), ei, rows)
             if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
                 if tid == i32(0):  # post gemm2 (slot 8)
                     bst(now(), rsrc(a["dbg"]),
