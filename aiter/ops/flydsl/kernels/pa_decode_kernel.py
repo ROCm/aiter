@@ -6,7 +6,8 @@
 K/V use e4m3 (FNUZ on gfx942, OCP on gfx950); BF16/FP16 Q and probabilities P
 are quantized to FP8. Q/key scales fold into QK, value scale and 1/FP8_MAX into
 the epilogue; softmax max/sum stay f32. Tuned gfx950 BF16 per-token MTP3/MTP4
-uses K128 MFMA instead of K32, preserving normalized Q/P and operand layouts.
+and the head-256 page-16/64 pipe use K128 MFMA instead of K32, preserving normalized
+Q/P and operand layouts.
 Every FP8-path Q row uses absmax normalization; per-tensor and per-token K/V scales
 retain range normalization for P.
 BF16 K/V use vector-8 caches and native BF16 Q/K/P/V MFMA operands, with
@@ -89,6 +90,7 @@ def compile_pa_decode_tile(
     query_splits: int | None = None,
     max_context_length: int | None = None,
     sliding_window: int = 0,
+    trans_k: bool = True,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -98,7 +100,10 @@ def compile_pa_decode_tile(
     for example D512/MTP4/GQA16 splits twice and D1024/MTP3/GQA16 splits three
     ways. Explicit BF16 splits must fit that limit as well.
     ``max_context_length`` bounds dense planned work for scheduling only; it does not
-    change the launch capacity, scratch layout, or single-tile guarantee.
+    change the launch capacity, scratch layout, or single-tile guarantee. Every
+    context length, including later graph replays, should be at most this value.
+    A smaller value still covers the real context: page ids outside the staged
+    window are read from the block table.
     CTAs receive equal groups of MTP positions, flattened with GQA into 16-row
     M-tiles. Partial output stays unsplit for the shared reducer.
 
@@ -113,6 +118,7 @@ def compile_pa_decode_tile(
     ``work_capacity`` is a positive host integer matching the work plan.
     Positive ``sliding_window`` includes the query token.
     Plans cover the MTP window union; scores are masked per query row.
+    ``trans_k=False`` is not implemented.
     All tasks write packed partials; the reducer applies sinks once and writes
     final output, including when the plan allows only one partition.
 
@@ -142,6 +148,7 @@ def compile_pa_decode_tile(
         work_capacity=work_capacity,
         max_context_length=max_context_length,
         sliding_window=sliding_window,
+        trans_k=trans_k,
     )
     cached = _PA_DECODE_TILE_CACHE.get(schedule.cache_key)
     if cached is not None:
