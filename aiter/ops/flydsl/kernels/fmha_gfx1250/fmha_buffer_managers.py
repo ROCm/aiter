@@ -189,10 +189,20 @@ def _async_load_to_lds(gptrs, lds_ptrs, *, cluster, imm_offs=None):
 # ``async_load()`` and fenced against the counters it declares.
 # ============================================================================
 
-_K_PAD_ELEMS = 8  # 4 DW = 16 B per K row
-_V_PAD_ELEMS = 16  # 8 DW = 32 B per V row
-_Q_PAD_ELEMS = 8  # 4 DW = 16 B per Q row (matches K)
-_O_PAD_ELEMS = 8  # 4 DW = 16 B per O row (conflict-free ds_store_b128)
+# A WMMA AB operand is two GROUPS of 16 B per lane; group ``g`` holds K elements
+# ``[2*KPack*g + KPack*h, +KPack)`` for lane half ``h = lane//16``, KPack = 16/elem_bytes
+# (CK's gfx125 traits: 16x16x32 bf16 KPack 8, 16x16x64 fp8 KPack 16). K reads a group with
+# one b128; V reads it through the transpose crossbar, which delivers 8 elements per load,
+# so V needs KPack/8 of them per group.
+_V_LANE_ELEMS = 8
+# Row skew that keeps those fetches conflict-free. K/Q read naturally, so theirs is a
+# fixed 16 B; V reads from 8 rows at once and needs the skew counted in ELEMENTS.
+_AB_PAD_BYTES = 16
+_V_PAD_ELEMS = 16
+# ASSUMED: ds_load_tr8_b64 is serviced 16 lanes/cycle like b128, which makes the pad above
+# conflict-free at 8-bit. If it is 32 lanes/cycle instead, NO row pad works -- the two
+# 8-row cosets a group spans land on the same banks -- and V needs a swizzle, not a pad.
+_O_PAD_ELEMS = 8  # 4 DW = 16 B per O row (conflict-free ds_store_b128); O stays 16-bit
 
 
 class ProducerCtx:
@@ -829,7 +839,7 @@ class KManager16bV1(_AsyncTransport):
     many ping-pong buffers as it wants, splits each as it wants, and passes the chosen
     bases (``ptr_lds``) into every method. The block is shared by all waves.
 
-    LDS is row-major with a padded row stride (``qk_hdim + _K_PAD_ELEMS`` elements). The
+    LDS is row-major with a padded row stride (``qk_hdim + pad_elems`` elements). The
     pad keeps the ``ds_load_b128`` fetch bank-conflict-free without a swizzle, which also
     makes the LDS column step equal the global one -- see the K/V staging section for why
     that is what lets the two transports share this class.
@@ -859,8 +869,8 @@ class KManager16bV1(_AsyncTransport):
         self.qk_hdim = qk_hdim  # compile-time
         self.n_block = n_block  # compile-time
         self.num_waves = num_waves  # compile-time
-        self.pad_elems = _K_PAD_ELEMS
-        self.row_elems = qk_hdim + _K_PAD_ELEMS  # padded LDS row stride (elems)
+        self.pad_elems = _AB_PAD_BYTES // self.elem_bytes
+        self.row_elems = qk_hdim + self.pad_elems  # padded LDS row stride (elems)
         self.row_bytes = self.row_elems * self.elem_bytes
 
     @property
@@ -888,7 +898,7 @@ class KManager16bV1(_AsyncTransport):
     # ------------------------------------------------------------------
     def ds_load_ptrs(self, *, ptr_lds, lane_idx):
         """One per-lane ds_load base pointer per LDS split; lane ``l`` fetches at row
-        ``l%16``, d-byte ``(l//16)*16``. Every fragment ``(kv, dt, half)`` is its split's
+        ``l%16``, d-byte ``(l//16)*16``. Every fragment ``(kv, dt, group)`` is its split's
         base plus a lane-independent compile-time immediate."""
         return [
             _lds_ptr_b128(
@@ -906,7 +916,7 @@ class KManager16bV1(_AsyncTransport):
 
     @property
     def loads_per_frag(self):
-        return 2  # b128 is 16 B; a WMMA operand is 32 B/lane at either width
+        return 2  # one b128 per group, at either width
 
     def num_ds_loads(self):
         return (
@@ -926,10 +936,11 @@ class KManager16bV1(_AsyncTransport):
         for kv in range(NKV):
             split, kv_local = divmod(kv, kv_per_split)
             for dt in range(NDT):
-                for half in range(2):
+                for sub in range(self.loads_per_frag):
                     imm = (
                         kv_local * _WMMA_M * self.row_bytes
-                        + (dt * self.wmma_k + half * _WMMA_M) * self.elem_bytes
+                        + (dt * self.wmma_k + sub * (self.wmma_k // 2))
+                        * self.elem_bytes
                         + lds_imm_offset
                     )
                     plan.append((split, imm))
@@ -937,7 +948,7 @@ class KManager16bV1(_AsyncTransport):
 
     def load_one_to_reg(self, base_ptrs, j, lds_imm_offset=0):
         """Emit the ``j``-th K ``ds_load_b128`` of the resident block."""
-        v8_ty = fx.Vector.make_type(8, self.elem_dtype)
+        v8_ty = fx.Vector.make_type(self.chunk_elems, self.elem_dtype)
         base_idx, imm = self._ds_load_plan(len(base_ptrs), lds_imm_offset)[j]
         p = base_ptrs[base_idx]
         if imm:
@@ -1008,9 +1019,11 @@ class VManager16bV1(_AsyncTransport):
     # argument contract (``ptr_src`` is the V tensor here).
     def ds_load_ptrs(self, *, ptr_lds, lane_idx):
         """One per-lane transpose-load base pointer per LDS split; the crossbar fetch sits
-        at ``kv = (l//16)*8 + l%8``, ``d = ((l//8)%2)*8``. Every fragment ``(dt, kt, half)``
-        is its split's base plus a lane-independent compile-time immediate."""
-        lane_kv = (lane_idx // _WMMA_M) * fx.Int32(8) + lane_idx % fx.Int32(8)
+        at ``kv = (l//16)*KPack + l%8``, ``d = ((l//8)%2)*8``. Every fragment is its
+        split's base plus a lane-independent compile-time immediate."""
+        lane_kv = (lane_idx // _WMMA_M) * fx.Int32(
+            self.chunk_elems
+        ) + lane_idx % fx.Int32(8)
         lane_d = ((lane_idx // fx.Int32(8)) % fx.Int32(2)) * fx.Int32(8)
         return [
             create_llvm_ptr(
@@ -1029,7 +1042,7 @@ class VManager16bV1(_AsyncTransport):
 
     @property
     def loads_per_frag(self):
-        return 32 // (16 if self.elem_bytes == 2 else 8)  # tr16_b128 vs tr8_b64
+        return 2 * (self.chunk_elems // _V_LANE_ELEMS)  # 2 groups x KPack/8 loads
 
     def num_ds_loads(self):
         return (
@@ -1049,9 +1062,15 @@ class VManager16bV1(_AsyncTransport):
         for dt in range(d_tiles):
             for kt in range(nkt):
                 split, kt_local = divmod(kt, kt_per_split)
-                for half in range(2):
+                for sub in range(self.loads_per_frag):
+                    group, part = divmod(sub, self.chunk_elems // _V_LANE_ELEMS)
                     imm = (
-                        (kt_local * self.wmma_k + half * _WMMA_M) * self.row_bytes
+                        (
+                            kt_local * self.wmma_k
+                            + group * (self.wmma_k // 2)
+                            + part * _V_LANE_ELEMS
+                        )
+                        * self.row_bytes
                         + dt * _WMMA_M * self.elem_bytes
                         + lds_imm_offset
                     )
@@ -1059,13 +1078,14 @@ class VManager16bV1(_AsyncTransport):
         return plan
 
     def load_one_to_reg(self, base_ptrs, j, lds_imm_offset=0):
-        """Emit the ``j``-th V ``ds_load_tr16_b128`` of the resident block."""
-        v8_ty = fx.Vector.make_type(8, self.elem_dtype)
+        """Emit the ``j``-th V transpose load of the resident block."""
+        v8_ty = fx.Vector.make_type(_V_LANE_ELEMS, self.elem_dtype)
         base_idx, imm = self._ds_load_plan(len(base_ptrs), lds_imm_offset)[j]
         p = base_ptrs[base_idx]
         if imm:
             p = buffer_ops.get_element_ptr(p, static_byte_offset=imm)
-        return fx.Vector(rocdl.ds_load_tr16_b128(v8_ty, p))
+        tr = rocdl.ds_load_tr16_b128 if self.elem_bytes == 2 else rocdl.ds_load_tr8_b64
+        return fx.Vector(tr(v8_ty, p))
 
     def load_all_to_reg(self, base_ptrs, lds_imm_offset=0):
         """Burst all V ``ds_load_tr16_b128`` for the resident block, in ``_pv_qk_gemm``'s
@@ -1084,7 +1104,7 @@ class QManager16bV2:
 
     A 3-D ``[num_seq, gqa_ratio, hdim]`` descriptor carries the GQA row-packing (packed row
     ``pr`` -> seq ``pr//gqa``, head ``kv_head*gqa + pr%gqa``), degenerating to
-    ``[rows, 1, hdim]`` at gqa==1. LDS row stride matches K's (``hdim + _Q_PAD_ELEMS``).
+    ``[rows, 1, hdim]`` at gqa==1. LDS row stride matches K's.
     """
 
     def __init__(
@@ -1112,7 +1132,7 @@ class QManager16bV2:
         self.k_tiles = qk_hdim // self.wmma_k
         self.rows_per_warp = _WMMA_M * q_tiles_per_wave  # this wave's Q rows (32)
         self.block_m = self.rows_per_warp * num_waves  # 256
-        self.row_elems = qk_hdim + _Q_PAD_ELEMS  # padded LDS row stride (elems)
+        self.row_elems = qk_hdim + _AB_PAD_BYTES // self.elem_bytes
         self.row_bytes = self.row_elems * self.elem_bytes
         # lds_tiles is accepted for signature-compat with V1; V2 has no ring.
 
