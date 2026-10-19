@@ -8,7 +8,9 @@ arch and dtype: gfx950 fp8 to ``kernels/fmha_gfx950``, gfx1250 bf16/f16 to the
 m32x8 prefill kernel, anything else ``None`` so the caller falls through to
 CK/Triton.
 
-``flydsl_flash_attn_func`` (gfx1201 / RDNA4) wraps the
+``flydsl_flash_attn_func`` serves gfx11 (RDNA3 / RDNA3.5) with
+``flash_attn_func_gfx11`` -- any sequence lengths, self- and cross-attention,
+``head_dim % 8 == 0``, no padding -- and gfx1201 (RDNA4) by wrapping the
 `flash_attn_func_gfx1201` kernel with:
   - Build cache keyed by (num_heads, head_dim, causal, dtype, waves_per_eu, daz).
   - Automatic seq_len padding to the kernel's tile size (multiple of 128).
@@ -22,8 +24,8 @@ CK/Triton.
     ratio=0.024%) clears it by 20x. See option (d) in
     ``2969_padded_softmax_rca.md``.
 
-The kernel implements self-attention only (Lq == Lk). Cross-attention
-(Lq != Lk) is rejected; callers should fall back to PyTorch SDPA.
+The gfx1201 kernel implements self-attention only (Lq == Lk). Cross-attention
+(Lq != Lk) is rejected there; callers should fall back to PyTorch SDPA.
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ import torch
 import torch.nn.functional as F
 
 from .fmha_bwd_gfx942 import flash_attn_varlen_bwd_d192_gfx942
+from .kernels.flash_attn_func_gfx11 import build_flash_attn_func_module_gfx11
 from .kernels.flash_attn_func_gfx1201 import build_flash_attn_func_module
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
     SUPPORTED_QK_HDIM,
@@ -81,15 +84,99 @@ def _get_kernel(
     dtype_str: str,
     waves_per_eu: int,
     daz: bool,
+    sm_scale: float | None = None,
 ):
     return build_flash_attn_func_module(
         num_heads=num_heads,
         head_dim=head_dim,
         causal=causal,
         dtype_str=dtype_str,
+        sm_scale=sm_scale,
         waves_per_eu=waves_per_eu,
         daz=daz,
     )
+
+
+@lru_cache(maxsize=64)
+def _get_kernel_gfx11(
+    num_heads: int,
+    head_dim: int,
+    causal: bool,
+    dtype_str: str,
+    sm_scale: float | None,
+    kv_tail: bool,
+    num_waves: int,
+    block_n: int,
+):
+    return build_flash_attn_func_module_gfx11(
+        num_heads=num_heads,
+        head_dim=head_dim,
+        causal=causal,
+        dtype_str=dtype_str,
+        sm_scale=sm_scale,
+        kv_tail=kv_tail,
+        num_waves=num_waves,
+        block_n=block_n,
+        vt_rows=4 if block_n >= 64 else 2,
+    )
+
+
+def _gfx11_config(seq_q: int, head_dim: int) -> tuple[int, int]:
+    """(num_waves, block_n) for the gfx11 kernel."""
+    return 16, 32
+
+
+def _flydsl_flash_attn_func_gfx11(q, k, v, causal, softmax_scale, stream):
+    if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+        raise ValueError(
+            "expected 4D BSHD tensors, got "
+            f"q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}"
+        )
+    batch, seq_q, num_heads, head_dim = q.shape
+    seq_kv = k.shape[1]
+    if k.shape != v.shape or k.shape[0] != batch or k.shape[2:] != q.shape[2:]:
+        raise ValueError(
+            "k and v must be [batch, seq_kv, num_heads, head_dim] matching q, got "
+            f"q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}"
+        )
+    if head_dim % 8 != 0:
+        raise ValueError(f"gfx11 kernel requires head_dim % 8 == 0, got {head_dim}")
+    if causal and seq_q != seq_kv:
+        raise ValueError(
+            f"causal attention requires seq_q == seq_kv, got {seq_q} and {seq_kv}"
+        )
+    if batch == 0 or seq_q == 0:
+        return torch.empty_like(q)
+    if seq_kv == 0:
+        raise ValueError("seq_kv must be positive")
+    # Per-batch buffer descriptors address with 32-bit byte offsets.
+    if max(seq_q, seq_kv) * num_heads * head_dim * q.element_size() >= 2**31:
+        raise ValueError("one batch slice of q/k/v must be smaller than 2 GiB")
+
+    dtype_str = _torch_dtype_to_str(q.dtype)
+    num_waves, block_n = _gfx11_config(seq_q, head_dim)
+    q_c, k_c, v_c = q.contiguous(), k.contiguous(), v.contiguous()
+    out = torch.empty_like(q_c)
+    with torch.cuda.device(q.device.index):
+        launch_stream = (
+            torch.cuda.current_stream(q.device) if stream is None else stream
+        )
+        if launch_stream.device != q.device:
+            raise ValueError(
+                f"`stream` must be on {q.device}, got {launch_stream.device}"
+            )
+        exe = _get_kernel_gfx11(
+            num_heads=num_heads,
+            head_dim=head_dim,
+            causal=causal,
+            dtype_str=dtype_str,
+            sm_scale=None if softmax_scale is None else float(softmax_scale),
+            kv_tail=seq_kv % block_n != 0,
+            num_waves=num_waves,
+            block_n=block_n,
+        )
+        exe(q_c, k_c, v_c, out, batch, seq_q, seq_kv, stream=launch_stream)
+    return out
 
 
 def flydsl_flash_attn_func(
@@ -100,27 +187,32 @@ def flydsl_flash_attn_func(
     waves_per_eu: int = 2,
     daz: bool = True,
     stream: torch.cuda.Stream | None = None,
+    softmax_scale: float | None = None,
 ) -> torch.Tensor:
-    """Run FlyDSL Flash Attention on RDNA4 (gfx1201).
+    """Run FlyDSL Flash Attention on gfx11 (RDNA3 / RDNA3.5) or gfx1201 (RDNA4).
 
     Args:
         q, k, v: tensors with shape ``[batch, seq_len, num_heads, head_dim]``
-            (BSHD). All three must share dtype, batch, num_heads, head_dim,
-            and seq_len. Must reside on a CUDA/HIP device.
+            (BSHD). All three must share dtype, batch, num_heads and head_dim.
+            gfx1201 also requires one seq_len; gfx11 accepts a k/v seq_len
+            different from q's (cross-attention). Must reside on a CUDA/HIP
+            device.
         causal: apply causal masking when ``True``.
-        waves_per_eu: kernel occupancy hint passed to the FlyDSL builder.
-        daz: enable denormals-are-zero on the kernel.
+        waves_per_eu: kernel occupancy hint passed to the gfx1201 builder.
+        daz: enable denormals-are-zero on the gfx1201 kernel.
         stream: optional CUDA/HIP stream to launch on. Defaults to the current
             stream for ``q.device``.
+        softmax_scale: scale applied to ``q @ k^T``; ``None`` means
+            ``1 / sqrt(head_dim)``.
 
     Returns:
         Output tensor with the same shape and dtype as ``q``.
 
     Raises:
         ValueError: if shapes/dtypes/devices are incompatible, the kernel's
-            ``head_dim`` constraints are not met, or the non-causal padding
-            ratio ``n_pad / seq_len_pad`` exceeds 0.5% (see module docstring
-            for rationale).
+            ``head_dim`` constraints are not met, or (gfx1201) the non-causal
+            padding ratio ``n_pad / seq_len_pad`` exceeds 0.5% (see module
+            docstring for rationale).
     """
     if not (q.is_cuda and k.is_cuda and v.is_cuda):
         raise ValueError("flydsl_flash_attn_func requires CUDA/HIP tensors")
@@ -134,8 +226,14 @@ def flydsl_flash_attn_func(
     except Exception:  # noqa: BLE001
         arch = ""
     arch_base = arch.lower().split(":")[0] if arch else ""
+    if arch_base.startswith("gfx11"):
+        if not (q.dtype == k.dtype == v.dtype):
+            raise ValueError(f"q/k/v dtype must match: {q.dtype}/{k.dtype}/{v.dtype}")
+        return _flydsl_flash_attn_func_gfx11(q, k, v, causal, softmax_scale, stream)
     if not arch_base.startswith("gfx1201"):
-        raise ValueError(f"flydsl_flash_attn_func requires gfx1201, got {arch!r}")
+        raise ValueError(
+            f"flydsl_flash_attn_func requires gfx11 or gfx1201, got {arch!r}"
+        )
     if not (q.shape == k.shape == v.shape):
         raise ValueError(
             "flydsl_flash_attn_func is self-attention; q/k/v must share "
@@ -207,6 +305,7 @@ def flydsl_flash_attn_func(
             dtype_str=dtype_str,
             waves_per_eu=waves_per_eu,
             daz=daz,
+            sm_scale=None if softmax_scale is None else float(softmax_scale),
         )
         exe(
             q_p.reshape(-1),
