@@ -1046,8 +1046,22 @@ def clone_3rdparty(third_party: str) -> None:
                         check=True,
                     )
             except BaseException:
+
+                def remove_readonly(func, path, exc_info):
+                    if os.name != "nt" or not isinstance(exc_info[1], PermissionError):
+                        raise exc_info[1]
+                    os.chmod(path, 0o700)
+                    func(path)
+
                 if os.path.isdir(dir_path) and not os.path.islink(dir_path):
-                    shutil.rmtree(dir_path)
+                    try:
+                        shutil.rmtree(dir_path, onerror=remove_readonly)
+                    except OSError:
+                        logger.warning(
+                            "Could not remove partial checkout %s; remove it before retrying",
+                            dir_path,
+                            exc_info=True,
+                        )
                 raise
 
     if third_party == "HipKittens":

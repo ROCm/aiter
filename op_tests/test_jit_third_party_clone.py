@@ -13,7 +13,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-
 CORE_PATH = Path(__file__).resolve().parents[1] / "aiter" / "jit" / "core.py"
 
 
@@ -33,7 +32,7 @@ def _clone_function(destination):
         "HIP_KITTENS_DIR": str(destination),
         "mp_lock": lambda lockPath, MainFunc, build_after_wait: MainFunc(),
     }
-    exec(
+    exec(  # noqa: S102 - Extract checked-in code without importing the ROCm runtime.
         compile(ast.Module(body=[function], type_ignores=[]), str(CORE_PATH), "exec"),
         namespace,
     )
@@ -41,9 +40,6 @@ def _clone_function(destination):
 
 
 class TestThirdPartyClone(unittest.TestCase):
-    @unittest.skipIf(
-        os.name == "nt", "Windows Git can hold submodule files during cleanup"
-    )
     def test_local_clone_keeps_submodule_usable(self):
         real_run = subprocess.run
 
@@ -91,23 +87,35 @@ class TestThirdPartyClone(unittest.TestCase):
             commit = git("rev-parse", "HEAD", cwd=source).stdout.strip()
 
             def local_run(command, **kwargs):
+                nonlocal failed
                 command = [
-                    str(source)
-                    if part == "https://github.com/HazyResearch/HipKittens.git"
-                    else commit
-                    if part == "d3cd9b31cb0ff611ff64b5701f57ccdeb7712f39"
-                    else f"--revision={commit}"
-                    if part == "--revision=d3cd9b31cb0ff611ff64b5701f57ccdeb7712f39"
-                    else part
+                    (
+                        str(source)
+                        if part == "https://github.com/HazyResearch/HipKittens.git"
+                        else (
+                            commit
+                            if part == "d3cd9b31cb0ff611ff64b5701f57ccdeb7712f39"
+                            else (
+                                f"--revision={commit}"
+                                if part
+                                == "--revision=d3cd9b31cb0ff611ff64b5701f57ccdeb7712f39"
+                                else part
+                            )
+                        )
+                    )
                     for part in command
                 ]
-                return real_run(
+                result = real_run(
                     command,
                     **kwargs,
                     env={**os.environ, "GIT_ALLOW_PROTOCOL": "file"},
                     capture_output=True,
                     text=True,
                 )
+                if failed_step in command and not failed:
+                    failed = True
+                    raise subprocess.CalledProcessError(1, command)
+                return result
 
             git_version = real_run(
                 ["git", "--version"], capture_output=True, text=True, check=True
@@ -117,36 +125,72 @@ class TestThirdPartyClone(unittest.TestCase):
             if match and tuple(map(int, match.groups())) >= (2, 49):
                 versions.append("2.49.0")
             for version in versions:
-                with self.subTest(version=version):
-                    destination = root_path / version / "HipKittens"
-                    clone = _clone_function(destination)
-                    with (
-                        mock.patch(
-                            "subprocess.check_output",
-                            return_value=f"git version {version}",
-                        ),
-                        mock.patch("subprocess.run", side_effect=local_run),
-                    ):
-                        clone("HipKittens")
+                steps = [None, "clone", "reset", "submodule"]
+                if version == "2.49.0":
+                    steps = [None, "clone"]
+                for failed_step in steps:
+                    with self.subTest(version=version, failed_step=failed_step):
+                        failed = False
+                        destination = (
+                            root_path / version / str(failed_step) / "HipKittens"
+                        )
+                        clone = _clone_function(destination)
+                        with (
+                            mock.patch(
+                                "subprocess.check_output",
+                                return_value=f"git version {version}",
+                            ),
+                            mock.patch("subprocess.run", side_effect=local_run),
+                        ):
+                            if failed_step is not None:
+                                with self.assertRaises(subprocess.CalledProcessError):
+                                    clone("HipKittens")
+                                self.assertTrue(failed)
+                                self.assertFalse(destination.exists())
+                            clone("HipKittens")
 
-                    self.assertEqual(
-                        git("rev-parse", "HEAD", cwd=destination).stdout.strip(),
-                        commit,
-                    )
-                    self.assertEqual(
-                        (destination / "child" / "header.h").read_text(
-                            encoding="utf-8"
-                        ),
-                        "// child\n",
-                    )
-                    self.assertEqual(
-                        git(
-                            "rev-parse",
-                            "--is-inside-work-tree",
-                            cwd=destination / "child",
-                        ).stdout.strip(),
-                        "true",
-                    )
+                        self.assertEqual(
+                            git("rev-parse", "HEAD", cwd=destination).stdout.strip(),
+                            commit,
+                        )
+                        self.assertEqual(
+                            (destination / "child" / "header.h").read_text(
+                                encoding="utf-8"
+                            ),
+                            "// child\n",
+                        )
+                        self.assertEqual(
+                            git(
+                                "rev-parse",
+                                "--is-inside-work-tree",
+                                cwd=destination / "child",
+                            ).stdout.strip(),
+                            "true",
+                        )
+
+    def test_cleanup_failure_preserves_git_error(self):
+        with tempfile.TemporaryDirectory() as root:
+            destination = Path(root) / "HipKittens"
+            clone = _clone_function(destination)
+            failure = subprocess.CalledProcessError(1, ["git", "clone"])
+
+            def run(command, **kwargs):
+                destination.mkdir()
+                raise failure
+
+            with (
+                mock.patch(
+                    "subprocess.check_output", return_value="git version 2.49.0"
+                ),
+                mock.patch("subprocess.run", side_effect=run),
+                mock.patch("shutil.rmtree", side_effect=PermissionError("locked")),
+                self.assertLogs(__name__, level="WARNING") as logs,
+                self.assertRaises(subprocess.CalledProcessError) as caught,
+            ):
+                clone("HipKittens")
+
+            self.assertIs(caught.exception, failure)
+            self.assertIn("remove it before retrying", logs.output[0])
 
     def test_failed_reset_leaves_no_destination_and_retry_succeeds(self):
         with tempfile.TemporaryDirectory() as root:
@@ -199,9 +243,9 @@ class TestThirdPartyClone(unittest.TestCase):
                 ),
                 mock.patch("subprocess.call") as legacy_call,
                 mock.patch("subprocess.run", side_effect=run),
+                self.assertRaises(subprocess.CalledProcessError),
             ):
-                with self.assertRaises(subprocess.CalledProcessError):
-                    clone("HipKittens")
+                clone("HipKittens")
 
             legacy_call.assert_not_called()
             self.assertFalse(destination.exists())
