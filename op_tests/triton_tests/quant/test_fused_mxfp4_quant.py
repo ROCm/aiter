@@ -256,7 +256,8 @@ def torch_rms_gated(x, weight, z, eps, group_size, norm_before_gate, activation)
 
 @pytest.mark.parametrize("M", [1, 4, 31, 64, 1000])
 @pytest.mark.parametrize(
-    "N, group_size", [(3072, 128), (6144, 128), (256, None), (4096, 256)]
+    "N, group_size",
+    [(3072, 128), (6144, 128), (256, None), (4096, 256), (4096, None)],
 )
 @pytest.mark.parametrize("norm_before_gate", [True, False])
 @pytest.mark.parametrize("activation", ["silu", "sigmoid"])
