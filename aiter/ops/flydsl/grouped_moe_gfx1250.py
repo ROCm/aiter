@@ -175,7 +175,17 @@ def _find_grouped_config(
     # as a value that matches nothing.
     def _cell(row, k):
         value = str(row.get(k) or "").strip()
-        return "" if value.lower() in ("nan", "none") else value
+        if value.lower() in ("nan", "none"):
+            return ""
+        # Same rewrite, other half: a column that holds blanks becomes a float
+        # column, so an integer cell reads back as "1.0" and never equals the
+        # "1" the caller asks for. Every numeric column here is integral, and
+        # the named ones (gfx, dtypes, enums) do not parse as floats.
+        try:
+            number = float(value)
+        except ValueError:
+            return value
+        return str(int(number)) if number.is_integer() else value
 
     def _matches(row, *, require_cu_num: bool):
         for k, v in keys.items():
