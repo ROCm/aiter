@@ -13,13 +13,25 @@
    - FlyDSL 的路由比 Triton 短约 3 µs，GEMM1 因此提前开始，和 alt stream 上还没跑完的 shared expert 重叠，被拖慢约 3 µs。
    - Triton 的路由更长，shared expert 基本在 GEMM1 开始前就跑完了，不受影响。
    - 加上 shared expert 后，单测里每层的胜负发生反转：不加时 FlyDSL 快 3.85 µs，加了之后慢 2.39 µs。
-3. **e2e 里 FlyDSL 的 GEMM 单独运行也更慢，这一点单测没有复现。**
-   - e2e：GEMM1 慢 2.3–3.5 µs/层，GEMM2 慢 2.4–3.7 µs/层。
-   - 单测在同样的路由分布下：GEMM1 快 0.9 µs，GEMM2 只慢 0.5 µs。
-   - 原因还没找到。
-4. **能解释多少：**
-   - 单测复现出来的部分是 +2.39 µs/层 × 40 个 HERD 层 ≈ +96 µs/step，约占 e2e 实测差距（+320 µs/step）的 30%。
-   - 其余部分来自第 3 点没复现的 GEMM 单独运行差距。关掉 dual-stream 后还出现了一部分非 kernel 的空闲时间（见 5.5）。
+3. **e2e 里没有并发时 FlyDSL 的 GEMM 也更慢，按层拆开后是两部分**（数据来自关 dual-stream 的 trace，GEMM 执行期间没有任何别的 stream 在跑，见 4.5）：
+   - **前 3 层 hash 层：两种模式算的路由不一样，不是 kernel 慢。**
+     - Triton 的 decode 路径会忽略 `custom_routing_function`，对 gate logits 做 top-k 再加 HERD；
+     - FlyDSL 按 `tid2eid` 查表，不做 HERD。bench 的输入是随机 token，查表后专家分布接近均匀，所以 FlyDSL 在这 3 层的 GEMM1 约 87 µs，每层比 Triton 多 GEMM1 +33 µs、GEMM2 +21 µs，每个 step 合计约 +160 µs。
+     - 这 3 层不是公平比较，见 5.5。
+   - **第 3–42 层：kernel 本身更慢，单测还没复现。**
+     - GEMM1 平均慢 3.0 µs（40 层里 37 层更慢），GEMM2 慢 2.1 µs；
+     - 差距随层变化：第 3–18 层 +4.5 µs，第 19–39 层 +2.4 µs，第 40–42 层约 0；
+     - 在同样的路由分布下，单测的 40 层中位数是 GEMM1 快 0.9 µs、GEMM2 慢 0.5 µs。
+4. **能解释多少**（开 dual-stream，按 kernel 时间算，见 4.5）：
+
+   | 来源 | 每个 step 的差值 | 单测是否复现 |
+   |---|---|---|
+   | 前 3 层 hash 层的路由差异：3 × (29.1 + 18.4) | 约 +142 µs | 单测不覆盖 hash 层 |
+   | 第 3–42 层的 GEMM（kernel 差距 + 并发争抢）：40 × (5.35 + 3.01) | 约 +334 µs | 只复现了并发争抢，约 +96 µs |
+   | 选专家 + sort 节省 | −132 µs | 能复现 |
+   | **合计** | **约 +344 µs** | 实测 TPOT 差为 +320 µs |
+
+   关掉 dual-stream 后，TPOT 差里还多出约 340 µs 的非 kernel 时间，见 5.6。
 
 ## 2. 环境与数据来源
 
@@ -89,6 +101,8 @@ GPU 是共用的：用户 sijieli2 从 06:18:58 UTC 开始用 `docker run --rm` 
 | Triton GEMM2 | 27.96 µs | — | 0% |
 | FlyDSL GEMM2 | 31.61 µs | — | 0% |
 
+这里的中位数是 43 层混在一起算的，包括 3 个 hash 层，按层拆开见 4.5。
+
 shared expert 的 down GEMM（`gemm_a8w8_mx128_t32x32x512_mw2_nw2_nb3`）：在 Triton 模式下平均 5.65 µs，在 FlyDSL 模式下平均 7.75 µs（被重叠时 8.65 µs，单独运行 5.31 µs）。
 
 ### 4.3 时间线（截取其中一层，以 GEMM1 开始时刻为 0）
@@ -106,8 +120,37 @@ shared expert 的 down GEMM（`gemm_a8w8_mx128_t32x32x512_mw2_nw2_nb3`）：在 
 | 每个 step 的 kernel 时间 | 9805.7 µs | 10100.2 µs | +294.4（其中选专家 + sort −132，非 MoE +2.6） |
 | 不 profile 时的 TPOT | 9.17 ms | 9.80 ms | +630 µs |
 
-- 不重叠时 FlyDSL 的 GEMM 仍然更慢，说明这部分差距是 kernel 自身的。
-- TPOT 的差距（+630 µs）比 kernel 时间的差距（+294 µs）大出约 340 µs，这部分不在 kernel 里，见 5.5。
+- 不重叠时 FlyDSL 的 GEMM 仍然更慢。但这里的中位数也包括 3 个 hash 层，在那几层两种模式算的路由不一样，按层拆开见 4.5。
+- TPOT 的差距（+630 µs）比 kernel 时间的差距（+294 µs）大出约 340 µs，这部分不在 kernel 里，见 5.6。
+
+### 4.5 按层拆分 GEMM
+
+用 `gemm_by_layer.py` 把每个 decode step 里的 GEMM 按层号（0–42）拆开，层号是 GEMM 在两个 `_fill_deferred_decode_ids_kernel` 之间出现的顺序。下表是关 dual-stream 时各层的中位数（单位 µs，没有任何并发）：
+
+| 层 | Triton GEMM1 | FlyDSL GEMM1 | GEMM1 差 | Triton GEMM2 | FlyDSL GEMM2 | GEMM2 差 |
+|---|---|---|---|---|---|---|
+| 0（hash） | 58.97 | 86.83 | +27.86 | 30.56 | 49.03 | +18.47 |
+| 1（hash） | 56.04 | 86.25 | +30.21 | 29.16 | 48.71 | +19.55 |
+| 2（hash） | 45.71 | 87.87 | +42.16 | 24.07 | 49.03 | +24.96 |
+| 3–18 平均 | 50.7 | 55.2 | +4.51 | — | — | +2.86 |
+| 19–39 平均 | 53.4 | 55.8 | +2.40 | — | — | +1.90 |
+| 40–42 平均 | 49.3 | 48.9 | −0.46 | — | — | −0.26 |
+
+- **hash 层：** FlyDSL 的 GEMM1 约 87 µs、GEMM2 约 49 µs，和单测均匀路由下的数值（约 89 / 48 µs）相当，说明这几层激活的专家很多；Triton 在这 3 层和普通层差不多。
+- **第 3–42 层：**
+  - GEMM1 平均 +3.03 µs，40 层里 37 层 FlyDSL 更慢；GEMM2 平均 +2.12 µs；
+  - Triton GEMM1 在 46.0–57.1 µs 之间（标准差 2.88），FlyDSL 在 45.7–58.1 µs 之间（标准差 2.40）；
+  - 差距和 Triton 当层耗时的相关系数是 −0.57：Triton 越快的层，FlyDSL 落后越多。
+
+开 dual-stream 的 trace 是同样的规律，只是第 3–42 层还叠加了并发争抢：
+
+| | GEMM1 差 | GEMM2 差 |
+|---|---|---|
+| 第 0–2 层平均 | +29.07 | +18.35 |
+| 第 3–42 层平均 | +5.35 | +3.01 |
+| 其中第 3–18 层 | +6.43 | +3.57 |
+| 其中第 19–39 层 | +5.94 | +3.23 |
+| 其中第 40–42 层 | −4.50 | −1.53 |
 
 ## 5. 原因逐条分析
 
@@ -166,9 +209,30 @@ shared expert 的 down GEMM（`gemm_a8w8_mx128_t32x32x512_mw2_nw2_nb3`）：在 
 - shared expert 自己的 kernel 在 FlyDSL 旁边也多了约 3 µs。
 - 每层 step 时间从"FlyDSL 快 3.85 µs"变成"FlyDSL 慢 2.39 µs"。
 
-### 5.5 尚未解释的部分
+### 5.5 前 3 层 hash 层的路由语义不同（Triton 路径的已有问题）
 
-1. **GEMM 单独运行的差距：** e2e 里 FlyDSL GEMM1 慢 2.3–3.5 µs、GEMM2 慢 2.4–3.7 µs；同样路由分布的单测里，GEMM1 快 0.9 µs、GEMM2 只慢 0.5 µs。还没排除的因素：
+DSV4 的第 0–2 层是 hash 层：`MoE._hash_topk` 通过 `custom_routing_function` 按 `tid2eid[input_ids]` 选专家，gate logits 只用来算权重，这几层也没有 `e_score_correction_bias`。两种模式在这几层的行为不同：
+
+| | FlyDSL 模式 | Triton decode 模式（`ATOM_USE_TRITON_MOE_DECODE=1`） |
+|---|---|---|
+| 路由入口 | `select_experts`，`custom_routing_function` 优先 | `Mxfp4MoEMethod.apply` 的 Triton 分支调用 aiter 的 `routing(router_logits, ...)` |
+| 专家选择 | `tid2eid` 查表（模型本来的语义） | 对 gate logits 做 sqrtsoftplus top-k，**完全不使用 `custom_routing_function`** |
+| HERD | 不做（`_flydsl_herd_step` 会排除 hash 层） | 做（只要 `AITER_TRITON_USE_HERD=1`，M 又在窗口内） |
+| 第 0–2 层 GEMM1 / GEMM2 | 约 87 / 49 µs | 46–59 / 24–31 µs |
+
+- **这个问题在 patch 之前就存在。** Triton 分支里 `needs_custom_routing` 只用来决定要不要走 `routing()`，并没有把 `custom_routing_function` 传进去，所以 hash 层在 Triton decode 下用的不是模型本来的路由。gsm8k 上没有看出差异（0.9492 对 0.9515），但语义不对。
+- **对性能比较的影响：** 这 3 层的耗时差距来自"算的不是同一件事"，每个 step 合计 +140–160 µs，大约是 e2e 差距的一半，不应该算作 FlyDSL kernel 的问题。要公平比较，需要先让 Triton 路径支持 hash 路由（例如用 hash 查表得到的 topk ids 经 `routing_from_dispatched` 生成 routing data），或者比较时把这 3 层排除在外。
+- **为什么 FlyDSL 在这几层这么慢：** bench 的输入是随机 token，`tid2eid` 查表后专家分布接近均匀，和单测的均匀路由情况相当，GEMM 时间也相当。
+
+### 5.6 尚未解释的部分
+
+1. **第 3–42 层 GEMM 单独运行的差距：**
+   - e2e 里（关 dual-stream，没有任何并发）FlyDSL 的 GEMM1 平均慢 3.0 µs，GEMM2 平均慢 2.1 µs；
+   - 差距随层变化：第 3–18 层 +4.5 µs，第 19–39 层 +2.4 µs，第 40–42 层约 0；Triton 越快的层差距越大（相关系数 −0.57）；
+   - 单测在同样路由分布下只看了 40 层的中位数（GEMM1 快 0.9 µs，GEMM2 慢 0.5 µs），没有按层比较，可能掩盖了这种逐层差异。
+
+   还没排除的因素：
+   - 各层路由形态不同（不只是专家数，还有每个专家分到的 token 数）对两种 kernel 的影响不同；
    - 真实权重和激活的数值（随机数据会影响功耗和频率）；
    - 持续满载时的频率；
    - 每层 MoE 前后的 attention 等 kernel 留下的 cache 和 TLB 状态；
@@ -187,9 +251,11 @@ shared expert 的 down GEMM（`gemm_a8w8_mx128_t32x32x512_mw2_nw2_nb3`）：在 
 ## 7. 下一步
 
 1. 在 GPU 空闲时，把每种 e2e 配置各重复 3 次，确认 2.7% 的差距和关 dual-stream 后的 +630 µs。
-2. 并发争抢：在单测里调整 shared expert 的启动时机，例如让 down GEMM 等 GEMM1 开始后再跑、只和 GEMM2 重叠；或者在 FlyDSL 路由结束和 GEMM1 之间加一个依赖。看 FlyDSL 能否拿回这约 6 µs/层。
-3. GEMM 单独运行的差距：单测改用一层的真实权重和激活；在 e2e 和单测里同时记录频率；在层与层之间插入类似 attention 的 kernel，模拟 cache 被冲刷的情况。
-4. 非 kernel 空闲：在不使用 classic path 的前提下，用 rocprofv3 测真实 graph 执行时 kernel 之间的间隙。
+2. hash 层：让 ATOM 的 Triton decode 路径支持 `custom_routing_function`，再重新测 e2e，得到一个语义一致的对比；或者在比较时把第 0–2 层排除。
+3. 逐层对比：让 `herd_e2e_repro.py` 按层输出 GEMM 时间，和 4.5 的 e2e 逐层数据对照，看单测能否复现"第 3–18 层差距大、第 40–42 层没有差距"的规律。
+4. 并发争抢：在单测里调整 shared expert 的启动时机，例如让 down GEMM 等 GEMM1 开始后再跑、只和 GEMM2 重叠；或者在 FlyDSL 路由结束和 GEMM1 之间加一个依赖。看 FlyDSL 能否拿回这约 6 µs/层。
+5. GEMM 单独运行的差距：单测改用一层的真实权重和激活；在 e2e 和单测里同时记录频率；在层与层之间插入类似 attention 的 kernel，模拟 cache 被冲刷的情况。
+6. 非 kernel 空闲：在不使用 classic path 的前提下，用 rocprofv3 测真实 graph 执行时 kernel 之间的间隙。
 
 ## 8. 文件与复现方法
 
@@ -199,6 +265,7 @@ shared expert 的 down GEMM（`gemm_a8w8_mx128_t32x32x512_mw2_nw2_nb3`）：在 
 | `/data/cguo/router_dump/` | 从 ATOM decode 导出的 router logits，每隔 64 步一次（不在仓库里） |
 | `dump_router.sh`、`atom_router_dump.patch` | 导出路由用的 eager 服务和临时 hook。运行结束后会把 `moe.py` 恢复成运行前的样子 |
 | `profile_mode.sh`、`analyze_trace.py`、`gemm_overlap.py`、`timeline_trace.py`、`idle_trace.py` | e2e 的 trace 采集与分析 |
+| `gemm_by_layer.py` | 两份 e2e trace 的逐层 GEMM 时间对比（4.5 节） |
 | `/home/cguo/dsv4_herd_bench/profiles/`、`/home/cguo/dsv4_herd_bench/logs/` | 本文引用的 trace 和所有日志（不在仓库里）。新跑的结果默认写到本目录下的 `profiles/`、`logs/` |
 | `server_env.sh` | 和服务相同的环境变量 |
 
@@ -215,4 +282,8 @@ python dsv4_herd_bench/herd_e2e_repro.py --routing real --layers 40 --rounds 3 -
 DECODE_WAIT_S=2 PROFILE_S=0.5 bash dsv4_herd_bench/profile_mode.sh triton_herd
 DECODE_WAIT_S=2 PROFILE_S=0.5 bash dsv4_herd_bench/profile_mode.sh flydsl_herd
 python3 dsv4_herd_bench/analyze_trace.py dsv4_herd_bench/profiles/{triton_herd,flydsl_herd}/trace/rank_0/*.json.gz
+# 逐层 GEMM 对比（第一个 trace 是基准，差值为第二个减第一个）
+python3 dsv4_herd_bench/gemm_by_layer.py dsv4_herd_bench/profiles/{triton_herd,flydsl_herd}/trace/rank_0/*.json.gz
 ```
+
+关 dual-stream 的 trace 用 `ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD=0 OUT=<dir> bash dsv4_herd_bench/profile_mode.sh <mode>` 采集。4.5 节用的就是这组，原始 trace 在 `/home/cguo/dsv4_herd_bench/profiles/*_dsoff/`。

@@ -1,7 +1,9 @@
 #!/bin/bash
 # Usage (inside gcy_atom): bash dump_router.sh [mode] [model]
-# Applies atom_router_dump.patch to ATOM moe.py (on top of
-# atom_flydsl_herd.patch), serves eagerly, drives 64 concurrent ISL=1024 /
+# Applies $DUMP_PATCH (default atom_router_dump.patch; atom_hash_compare.patch
+# records hash-layer routing on the Triton decode path, run it with mode
+# triton_herd) to ATOM moe.py on top of atom_flydsl_herd.patch, serves
+# eagerly, drives 64 concurrent ISL=1024 /
 # OSL=$DUMP_OSL requests so decode runs at bs=64, dumps each routed layer's
 # router logits every ATOM_DUMP_ROUTER_EVERY decode steps, up to
 # ATOM_DUMP_ROUTER_STEPS files per layer, then restores moe.py from a backup.
@@ -21,8 +23,9 @@ restore() {
   cp "$BACKUP" "$MOE"
   cmp -s "$BACKUP" "$MOE" && echo "[dump] moe.py restored" && rm -f "$BACKUP"
 }
-git -C "$ATOM_DIR" apply "$HERE/atom_router_dump.patch" || {
-  echo "[dump] atom_router_dump.patch does not apply (is atom_flydsl_herd.patch applied?)"
+PATCH="${DUMP_PATCH:-$HERE/atom_router_dump.patch}"
+git -C "$ATOM_DIR" apply "$PATCH" || {
+  echo "[dump] $PATCH does not apply (is atom_flydsl_herd.patch applied?)"
   exit 1
 }
 trap restore EXIT

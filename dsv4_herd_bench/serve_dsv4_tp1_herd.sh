@@ -2,6 +2,7 @@
 # serve_dsv4.sh at -tp 1, with the routed-expert backend picked by MOE_MODE:
 #   triton_herd: FlyDSL prefill + Triton/gluon decode, Triton HERD routing
 #   flydsl_herd: FlyDSL prefill + decode, FlyDSL HERD routing (decode only)
+#   triton:      FlyDSL prefill + Triton/gluon decode, stock routing
 #   flydsl:      FlyDSL prefill + decode, stock routing
 # ATOM_USE_TRITON_MOE=1 is required for ATOM_USE_TRITON_MOE_DECODE to take
 # effect at all (serve_dsv4.sh sets it to 0, which leaves decode on FlyDSL).
@@ -14,6 +15,9 @@ PORT="${PORT:-8000}"
 case "$MOE_MODE" in
   triton_herd)
     MODE_ENV=(ATOM_USE_TRITON_MOE=1 ATOM_USE_TRITON_MOE_DECODE=1 AITER_TRITON_USE_HERD=1 AITER_FLYDSL_USE_HERD=0)
+    ;;
+  triton)
+    MODE_ENV=(ATOM_USE_TRITON_MOE=1 ATOM_USE_TRITON_MOE_DECODE=1 AITER_TRITON_USE_HERD=0 AITER_FLYDSL_USE_HERD=0)
     ;;
   flydsl_herd)
     MODE_ENV=(ATOM_USE_TRITON_MOE=0 ATOM_USE_TRITON_MOE_DECODE=0 AITER_TRITON_USE_HERD=0 AITER_FLYDSL_USE_HERD=1)

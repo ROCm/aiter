@@ -1,0 +1,66 @@
+--- a/atom/model_ops/moe.py
++++ b/atom/model_ops/moe.py
+@@ -1256,6 +1256,51 @@
+         )
+ 
+ 
++import os as _os
++
++_HASH_COMPARE_DIR = _os.environ.get("ATOM_DUMP_ROUTER_DIR")
++_HASH_COMPARE_STEPS = int(_os.environ.get("ATOM_DUMP_ROUTER_STEPS", "8"))
++_HASH_COMPARE_EVERY = int(_os.environ.get("ATOM_DUMP_ROUTER_EVERY", "1"))
++_hash_compare_calls: dict[int, int] = {}
++_hash_compare_saved: dict[int, int] = {}
++
++
++def _dump_hash_compare(layer, x, router_logits, top_k, renormalize, custom_routing_function, routing_data):
++    """Save, for a hash-routed layer on the Triton decode path, the experts the
++    Triton routing() picked from the gate logits next to the ones the model's
++    own hash routing (custom_routing_function) picks for the same tokens."""
++    if router_logits.shape[0] != 64:
++        return
++    ctx = get_forward_context().context
++    if ctx is None or ctx.is_prefill:
++        return
++    lid = int(layer.layer_id)
++    call = _hash_compare_calls.get(lid, 0)
++    _hash_compare_calls[lid] = call + 1
++    if call % _HASH_COMPARE_EVERY:
++        return
++    n = _hash_compare_saved.get(lid, 0)
++    if n >= _HASH_COMPARE_STEPS:
++        return
++    _hash_compare_saved[lid] = n + 1
++    w_hash, ids_hash = custom_routing_function(
++        hidden_states=x, gating_output=router_logits, topk=top_k, renormalize=renormalize
++    )
++    _os.makedirs(_HASH_COMPARE_DIR, exist_ok=True)
++    torch.save(
++        {
++            "logits": router_logits.detach().cpu(),
++            "ids_hash": ids_hash.detach().cpu(),
++            "w_hash": w_hash.detach().cpu(),
++            "ids_triton": routing_data.topk_ids.detach().cpu(),
++            "input_ids": ctx.input_ids.flatten().detach().cpu(),
++            "routed_scaling_factor": float(layer.routed_scaling_factor),
++            "decode_step": call,
++        },
++        f"{_HASH_COMPARE_DIR}/H{lid:02d}_S{n:02d}.pt",
++    )
++
++
+ @lru_cache(maxsize=None)
+ def _log_flydsl_herd_batch(num_tokens: int, top_k: int) -> None:
+     logger.info(
+@@ -1982,6 +2027,11 @@
+                     num_expert_group=num_expert_group,
+                     topk_group=topk_group,
+                 )
++                if _HASH_COMPARE_DIR is not None and custom_routing_function is not None:
++                    _dump_hash_compare(
++                        layer, x, router_logits, top_k, renormalize,
++                        custom_routing_function, routing_data,
++                    )
+                 # Routed-only gate count (no shared-expert widening).
+                 n_expts_act = routing_data.n_expts_act
+ 

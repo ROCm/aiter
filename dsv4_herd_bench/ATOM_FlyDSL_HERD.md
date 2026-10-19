@@ -187,13 +187,16 @@ def _log_flydsl_herd_batch(num_tokens, top_k): logger.info("FlyDSL HERD decode r
 
 - 最早一轮（run1）bench 期间在做首次 JIT 编译（aiter 的 `module_top_k_per_row`、FlyDSL kernel emit），TTFT 和 P99 ITL 都被拉高（Triton+HERD 4991.76 tok/s，FlyDSL+HERD 4246.51 tok/s），这组数作废。
 - 两次 FlyDSL+HERD 相差约 2.3%，其他配置各只跑了一次；Triton 和 FlyDSL 之间 4–6% 的差距需要多跑几次才能定论。
+- 这个差距里约一半来自前 3 层 hash 层：Triton decode 路径在这几层用的不是模型本来的路由（见第 8 节第 4 点），所以并不完全是同一工作量下的对比。差距的完整拆分见 `E2E_vs_UnitTest_HERD.md`。
 
 ## 8. 已知问题和限制
 
 1. **prefill 小 batch 也可能被 aiter 内部 HERD 处理。** `AITER_FLYDSL_USE_HERD=1` 时，aiter 的 `topk_gating` 只按 M 判断，ATOM 不命中 HERD 的步（prefill）走 `select_experts → topk_gating([T, 6])`，如果 16 ≤ T ≤ 128，会在 aiter 内部做非融合的 HERD drop。本次计时的 bench 和 gsm8k 的 prefill 都远大于 128 token，只有 run3 计时前的一条 sanity 请求（18 token）落在窗口里，所以测得的数据不受影响。要做到严格只在 decode 生效，可以让 aiter 的 `topk_gating` 增加一个关闭内部 HERD 的参数，或者在 `use_flydsl_herd` 打开时让 ATOM 的 prefill 直接调用 `topk_gating_fwd`。
 2. **从 aiter 导入了私有名字**（`_FLYDSL_USE_HERD` 等）。如果 aiter 改名会导致导入失败；更稳妥的做法是 aiter 提供一个公开的 helper。
 3. **只接了 DSV4 这一类配置**：sqrtsoftplus + renormalize、TP、非融合 shared expert。EP / MegaMoE / modular kernel、融合 shared expert、sigmoid / softmax 模型都没有接。
-4. **已有问题，不是本 patch 引入的**：ATOM 的 Triton decode 分支调用 aiter `routing()` 时没有使用 `custom_routing_function`，所以 Triton+HERD 下前 3 层 hash 层在 decode 阶段用的是 gate top-k，而不是 `tid2eid` 查表。两种配置在这 3 层上算的不完全一样。
+4. **已有问题，不是本 patch 引入的**：ATOM 的 Triton decode 分支调用 aiter `routing()` 时没有使用 `custom_routing_function`，所以 Triton+HERD 下前 3 层 hash 层在 decode 阶段用的是 gate top-k 再加 HERD，而不是 `tid2eid` 查表。两种配置在这 3 层上算的不是同一件事。
+   - 按 e2e trace 逐层拆分，FlyDSL 在这 3 层的 GEMM1 约 87 µs、GEMM2 约 49 µs，Triton 是 46–59 / 24–31 µs。每个 step 合计约 +140–160 µs，大约是两者 e2e 差距的一半。
+   - 这部分不是 FlyDSL kernel 慢，详见 `E2E_vs_UnitTest_HERD.md` 的 4.5 和 5.5 节。
 5. **没有 `fused_moe(herd_topk)` 的数值单测**（需要构造 gfx1250 GUGU 布局的 MXFP4 权重）。目前的正确性来自：路由级逐位校验 + 下游 GEMM/gather 路径和非 HERD 共用 + 端到端精度。
 6. **没有比较"aiter `topk_gating` 内部 HERD（不改 ATOM）"和"融合 drop"两种方案的性能。** 选融合 drop 是为了能按 phase 门控，并复用 grouped MoE 本来就要跑的 route/psum kernel。
 7. patch 目前只存在于容器 `/app/ATOM` 里，没有 commit。
