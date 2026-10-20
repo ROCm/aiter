@@ -21,7 +21,10 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
     _get_config,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
+from aiter.ops.triton.utils.gemm_config_utils import (
+    clamp_num_buffers,
+    compute_splitk_params,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -32,16 +35,6 @@ _GLUON_SUPPORTED_ARCHS = ("gfx950", "gfx1250")
 _GLUON_PRESHUFFLE_ARCHS = ("gfx1250",)
 _GLUON_DEFAULT_ARCHS = ("gfx1250",)
 _GLUON_KERNEL_TYPES = ("bandwidth_bound", "compute_bound")
-
-
-def _gfx1250_num_buffers(config, prefetch_all=False):
-    """NUM_BUFFERS of the gfx1250 Gluon kernels, at most the K tiles of a split + 1
-
-    The kernels load NUM_BUFFERS - 1 K tiles of a split before the main loop, more buffers causse a page fault on the last split.
-    A kernel that loads all NUM_BUFFERS tiles first (prefetch_all) gets at most the K tiles of a split.
-    """
-    k_tiles = triton.cdiv(config["SPLITK_BLOCK_SIZE"], config["BLOCK_SIZE_K"])
-    return min(config["NUM_BUFFERS"], k_tiles if prefetch_all else k_tiles + 1)
 
 
 def gemm_a8w8_blockscale(
@@ -171,7 +164,8 @@ def gemm_a8w8_blockscale(
             for i in range(int(math.log2(config["num_warps"] // 2))):
                 warp_bases.append((1 << i, 0))
             extra_constexpr["warp_bases"] = tuple(warp_bases)
-            config["NUM_BUFFERS"] = _gfx1250_num_buffers(config)
+            k_tiles = triton.cdiv(config["SPLITK_BLOCK_SIZE"], config["BLOCK_SIZE_K"])
+            config["NUM_BUFFERS"] = clamp_num_buffers(config["NUM_BUFFERS"], k_tiles)
         else:
             raise AssertionError(
                 f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{arch}'"
@@ -400,8 +394,9 @@ def gemm_a8w8_blockscale_preshuffle(
         for i in range(int(math.log2(config["num_warps"] // 2))):
             warp_bases.append((1 << i, 0))
         extra_constexpr["warp_bases"] = tuple(warp_bases)
-        config["NUM_BUFFERS"] = _gfx1250_num_buffers(
-            config, prefetch_all=kernel_type == "compute_bound"
+        k_tiles = triton.cdiv(config["SPLITK_BLOCK_SIZE"], config["BLOCK_SIZE_K"])
+        config["NUM_BUFFERS"] = clamp_num_buffers(
+            config["NUM_BUFFERS"], k_tiles, prefetch_all=kernel_type == "compute_bound"
         )
     else:
         impl = triton_gemm_a8w8_blockscale_preshuffle_kernel
