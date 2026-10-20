@@ -142,19 +142,41 @@ def _atol_rtol(k, split_k, k_waves, dtype):
     return 5e-2 * k_scale, 5e-2
 
 
+def run_candidates(candidates, _make_inputs, runners, *, reference):
+    """Run each candidate through each ``{runner: checker}`` pair on fresh inputs.
+
+    ``runner(fn, *inputs)`` returns a tuple of outputs, which is passed on as
+    ``checker(name, ref, *outputs)``. The checker returns a dict of columns,
+    stored as ``"{name} {column}"``. ``ref`` is ``reference(*inputs)``,
+    computed once from the first generated inputs.
+    """
+    ref = None
+    ret = {}
+    for name, fn in candidates.items():
+        for runner, checker in runners.items():
+            inputs = _make_inputs()
+            if ref is None:
+                ref = reference(*inputs)
+            outputs = runner(fn, *inputs)
+            for column, value in checker(name, ref, *outputs).items():
+                ret[f"{name} {column}"] = value
+    return ret
+
+
 @benchmark()
 def test_hgemm(m, n, k, dtype, policy, split_k):
     tile = _tile_for(m, n, k, policy, split_k)
     assert tile is not None, f"no tuned tile for {(m, n, k, policy, split_k)}"
 
-    torch.manual_seed(SEED)
-    a = torch.empty((m, k), dtype=dtype, device="cuda").uniform_(-1, 1)
-    w = torch.empty((n, k), dtype=dtype, device="cuda").uniform_(-1, 1)
-    # Dirty preallocated C, as the model passes out= a buffer it owns.
-    out = torch.randn((m, n), dtype=dtype, device="cuda")
-    ref = run_torch(a, w, dtype)
+    def _make_inputs():
+        torch.manual_seed(SEED)
+        a = torch.empty((m, k), dtype=dtype, device="cuda").uniform_(-1, 1)
+        w = torch.empty((n, k), dtype=dtype, device="cuda").uniform_(-1, 1)
+        # Dirty preallocated C, as the model passes out= a buffer it owns.
+        out = torch.randn((m, n), dtype=dtype, device="cuda")
+        return a, w, out
 
-    def _run_flydsl():
+    def _run_flydsl(a, w, out):
         return flydsl_hgemm(
             a,
             w,
@@ -171,19 +193,32 @@ def test_hgemm(m, n, k, dtype, policy, split_k):
             policy=policy,
         )
 
-    out_mm = torch.empty_like(out)
-
-    def _run_torch_mm():
-        torch.mm(a, w.t(), out=out_mm)
-        return out_mm
+    def _run_torch_mm(a, w, out):
+        torch.mm(a, w.t(), out=out)
+        return out
 
     candidates = {"flydsl": _run_flydsl, "torch_mm": _run_torch_mm}
 
+    elem_size = torch.tensor([], dtype=dtype).element_size()
     flops = 2 * m * n * k
-    nbytes = (
-        m * k * a.element_size() + n * k * w.element_size() + m * n * out.element_size()
-    )
+    nbytes = (m * k + n * k + m * n) * elem_size
     atol, rtol = _atol_rtol(k, split_k, tile["k_waves"], dtype)
+
+    def _check_perftest(name, ref, y, us):
+        err = checkAllclose(
+            ref.to(dtypes.fp32),
+            y.to(dtypes.fp32),
+            rtol=rtol,
+            atol=atol,
+            msg=f"{name}: flydsl hgemm",
+        )
+        return {
+            "us": us,
+            "TFLOPS": flops / us / 1e6,
+            "TB/s": nbytes / us / 1e6,
+            "err": err,
+        }
+
     ret = {
         "gfx": get_gfx(),
         "tile": (
@@ -192,20 +227,14 @@ def test_hgemm(m, n, k, dtype, policy, split_k):
         ),
         "waves": f"{tile['m_waves']}x{tile['n_waves']}x{tile['k_waves']}",
     }
-    for name, fn in candidates.items():
-        # Not `out`: `_run_flydsl` closes over the preallocated buffer.
-        y, us = run_perftest(fn)
-        err = checkAllclose(
-            ref.to(dtypes.fp32),
-            y.to(dtypes.fp32),
-            rtol=rtol,
-            atol=atol,
-            msg=f"{name}: flydsl hgemm",
+    ret.update(
+        run_candidates(
+            candidates,
+            _make_inputs,
+            {run_perftest: _check_perftest},
+            reference=lambda a, w, out: run_torch(a, w, dtype),
         )
-        ret[f"{name} us"] = us
-        ret[f"{name} TFLOPS"] = flops / us / 1e6
-        ret[f"{name} TB/s"] = nbytes / us / 1e6
-        ret[f"{name} err"] = err
+    )
     return ret
 
 
