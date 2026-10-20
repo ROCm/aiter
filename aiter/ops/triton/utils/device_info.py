@@ -22,6 +22,21 @@ def get_num_sms():
         return current_device.multi_processor_count
 
 
-def get_num_xcds():
-    # Currently, you can't query this programmatically. For gfx942/gfx950 it's 8, so we hardcode that here.
-    return 8
+# XCD count is not queryable in ROCm, but runtime architecture and CU count
+# identify supported parts. Kernels use it to keep workgroups sharing data on one L2.
+_XCDS_BY_GFX_AND_CU_NUM = {
+    ("gfx942", 304): 8,
+    ("gfx942", 228): 6,
+    ("gfx942", 80): 4,
+    ("gfx950", 256): 8,
+}
+
+
+def get_num_xcds() -> int:
+    try:
+        from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+
+        part = (get_gfx_runtime(), get_cu_num())
+    except Exception:  # noqa: BLE001
+        return 8
+    return _XCDS_BY_GFX_AND_CU_NUM.get(part, 8)
