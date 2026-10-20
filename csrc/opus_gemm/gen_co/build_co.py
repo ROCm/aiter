@@ -195,30 +195,34 @@ def _unbundle_if_needed(path, llvm_bin, arch):
     return True
 
 
-def _kernel_metadata(readelf, path, symbol):
-    """Pull (.vgpr_count, .sgpr_count, .group_segment_fixed_size,
-    .kernarg_segment_size) for `symbol` out of the AMDGPU note."""
-    out = _run([readelf, "--notes", path]).stdout
-    # One kernel per .co, so a flat scan is enough -- but assert that, because
-    # a second kernel would make the numbers ambiguous.
-    names = re.findall(r"^\s*\.name:\s*(\S+)\s*$", out, re.MULTILINE)
-    if names != [symbol]:
-        raise SystemExit(
-            f"build_co: {os.path.basename(path)} should contain exactly one "
-            f"kernel named {symbol!r}, found {names!r}"
-        )
-    fields = {}
-    for key in (
+def _kernel_metadata(
+    readelf,
+    path,
+    symbol,
+    keys=(
         "vgpr_count",
         "sgpr_count",
         "vgpr_spill_count",
         "sgpr_spill_count",
         "group_segment_fixed_size",
         "kernarg_segment_size",
-    ):
-        m = re.search(rf"^\s*\.{key}:\s*(\d+)\s*$", out, re.MULTILINE)
+    ),
+):
+    """Read the requested integer fields from a single-kernel AMDGPU note."""
+    out = _run([readelf, "--notes", path]).stdout
+    # One kernel per .co, so a flat scan is enough -- but assert that, because
+    # a second kernel would make the numbers ambiguous.
+    names = re.findall(r"^\s*\.name:\s*(\S+)\s*$", out, re.MULTILINE)
+    if names != [symbol]:
+        raise ValueError(
+            f"build_co: {os.path.basename(path)} should contain exactly one "
+            f"kernel named {symbol!r}, found {names!r}"
+        )
+    fields = {}
+    for key in keys:
+        m = re.search(rf"^\s*(?:-\s*)?\.{key}:\s*(\d+)\s*$", out, re.MULTILINE)
         if m is None:
-            raise SystemExit(f"build_co: .{key} missing from {path} metadata")
+            raise ValueError(f"build_co: .{key} missing from {path} metadata")
         fields[key] = int(m.group(1))
     return fields
 
@@ -247,22 +251,18 @@ void {symbol}(opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950 kargs)
 
 
 def _check_gfx950_pin(entry, path, llvm_bin):
-    metadata = _run([_tool(llvm_bin, "llvm-readelf"), "--notes", path]).stdout
-    names = re.findall(r"^\s*\.name:\s*(\S+)\s*$", metadata, re.MULTILINE)
-    if names != [entry["symbol"]]:
-        raise ValueError(f"expected kernel {entry['symbol']}, found {names}")
-    fields = {}
-    for key in (
-        "vgpr_count",
-        "agpr_count",
-        "vgpr_spill_count",
-        "sgpr_spill_count",
-        "private_segment_fixed_size",
-    ):
-        match = re.search(rf"^\s*(?:-\s*)?\.{key}:\s*(\d+)\s*$", metadata, re.MULTILINE)
-        if match is None:
-            raise ValueError(f"missing .{key}")
-        fields[key] = int(match[1])
+    fields = _kernel_metadata(
+        _tool(llvm_bin, "llvm-readelf"),
+        path,
+        entry["symbol"],
+        (
+            "vgpr_count",
+            "agpr_count",
+            "vgpr_spill_count",
+            "sgpr_spill_count",
+            "private_segment_fixed_size",
+        ),
+    )
     if any(
         fields[key]
         for key in (
@@ -514,7 +514,10 @@ def build_one(k, args, llvm_bin, workdir):
     unbundled = _unbundle_if_needed(out_path, llvm_bin, args.arch)
 
     readelf = _tool(llvm_bin, "llvm-readelf")
-    md = _kernel_metadata(readelf, out_path, symbol)
+    try:
+        md = _kernel_metadata(readelf, out_path, symbol)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
 
     # Self-checks. Only the two that would make the HOST wrong are fatal; see
     # --fail-on-spill and _asm_stats() for the ones that merely describe the

@@ -185,17 +185,7 @@ KARGS_NAME_MAP = {
 
 
 def co_traits_args(k):
-    def argument(value):
-        if isinstance(value, dict):
-            args = ",".join(argument(v) for v in value["args"])
-            return f'{value["name"]}<{args}>'
-        if isinstance(value, bool):
-            return str(value).lower()
-        if isinstance(value, (int, str)):
-            return str(value)
-        raise ValueError(f"Invalid gfx950 CO traits parameter: {value!r}")
-
-    return ",".join(argument(value) for value in k["traits"]["args"])
+    return ",".join(k["traits"]["args"])
 
 
 def splitk_reduce_extra_device_instantiations():
@@ -3248,22 +3238,19 @@ def _gen_bpreshuffle_co(cg, k, instance_impl_preamble, make_host_decl):
             "    const unsigned dynamic_lds = selected->dynamic_lds;"
         )
     else:
-        rounded_m = f"(m + {k.B_M - 1})" if k.pad_m else "m"
-        grid_setup = (
-            f'AITER_CHECK(m % {k.m_align} == 0 && n % {k.B_N} == 0 && k % {k.B_K} == 0, "shape is unsupported by this CO");\n'
-            f"    const dim3 grid(n / {k.B_N}, {rounded_m} / {k.B_M}), block({k.BLOCK_SIZE});\n"
-            "    const unsigned dynamic_lds = 0;"
-        )
+        grid_setup = f'AITER_CHECK(m % {k.m_align} == 0 && n % {k.B_N} == 0 && k % {k.B_K} == 0, "shape is unsupported by this CO");\n'
         if entry.get("grid_layout") in ("xcd", "linear"):
             grid_x = (
                 "((tiles + 7) / 8) * 8" if entry["grid_layout"] == "xcd" else "tiles"
             )
-            grid_setup = (
-                f'AITER_CHECK(m % {k.m_align} == 0 && n % {k.B_N} == 0 && k % {k.B_K} == 0, "shape is unsupported by this CO");\n'
+            grid_setup += (
                 f"    const int tiles = ((m + {k.B_M - 1}) / {k.B_M}) * (n / {k.B_N});\n"
                 f"    const dim3 grid({grid_x}), block({k.BLOCK_SIZE});\n"
-                "    const unsigned dynamic_lds = 0;"
             )
+        else:
+            rounded_m = f"(m + {k.B_M - 1})" if k.pad_m else "m"
+            grid_setup += f"    const dim3 grid(n / {k.B_N}, {rounded_m} / {k.B_M}), block({k.BLOCK_SIZE});\n"
+        grid_setup += "    const unsigned dynamic_lds = 0;"
         limit = min(2147483647, k.max_tensor_bytes)
         conditions = [
             f"m * k <= {limit}",
@@ -3331,31 +3318,22 @@ void {k.name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
     )
 
 
-def _bpreshuffle_headers(entry):
-    return "\n".join(f'#include "{header}"' for header in entry["headers"])
-
-
-def _bpreshuffle_declaration(kernel, parameters, arguments):
-    parts = kernel.split("::")
-    declaration = f"template<{parameters}> __global__ void {parts[-1]}({arguments});"
-    if len(parts) > 1:
-        declaration = f"namespace {'::'.join(parts[:-1])} {{ {declaration} }}"
-    return declaration
-
-
-def _emit_bpreshuffle_host(
-    cg, k, instance_impl_preamble, make_host_decl, declarations, body, device
-):
+def _gen_bpreshuffle_tile(cg, k, instance_impl_preamble, make_host_decl):
     entry = k.bpreshuffle_entry
-    alias = f"{k.name}_Traits"
-    checks = [f"m % {k.m_align} == 0", "n % 128 == 0", f"k % {k.B_K} == 0"]
-    if not k.bpreshuffle_pad_n:
-        checks.append(f"n % {k.B_N} == 0")
+    kernel, alias = entry["kernel"], f"{k.name}_Traits"
+    header = entry["headers"][0]
+    abi = "opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950"
+    checks = [
+        f"m % {k.m_align} == 0",
+        "n % 128 == 0",
+        f"k % {k.B_K} == 0",
+        f"n % {k.B_N} == 0",
+    ]
     if k.max_k is not None:
         checks.append(f"k <= {k.max_k}")
     if k.bpreshuffle_fixed_k:
         checks.append(f"k == {k.bpreshuffle_fixed_k}")
-    checks.append(f"k / {k.B_K} >= {k.bpreshuffle_split_k}")
+    checks.append(f"k / {k.B_K} >= 1")
     checks.append(f"2ULL * (m < {k.B_M} ? m : {k.B_M}) * n <= INT32_MAX")
     input_limit = min(2147483647, k.max_tensor_bytes)
     checks.extend(
@@ -3374,11 +3352,11 @@ def _emit_bpreshuffle_host(
         '\n#include <climits>\n#include <type_traits>\n#include "opus_gemm_common.cuh"'
     )
     source = f"""{preamble}
-#include "{entry["headers"][0].replace("_pipeline_", "_traits_", 1)}"
+#include "{header.replace("_pipeline_", "_traits_", 1)}"
 #ifdef OPUS_FUSED_HOST_TU
-{declarations}
+template<class Traits> __global__ void {kernel}({abi});
 #else
-{_bpreshuffle_headers(entry)}
+#include "{header}"
 #endif
 struct {alias} : {entry["traits"]} {{}};
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
@@ -3389,12 +3367,14 @@ void {k.name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
 {_BPRESHUFFLE_ARGUMENTS}
     {shape_check}
     using Traits = {alias};
-{body}
+    const unsigned tiles_m = (m + Traits::B_M - 1) / Traits::B_M;
+    const unsigned tiles_n = n / Traits::B_N, tiles = tiles_m * tiles_n;
+    {kernel}<{alias}><<<dim3(Traits::XCD_ORDER ? (tiles + 7) / 8 * 8 : tiles), dim3(Traits::BLOCK_SIZE), 0, aiter::getCurrentHIPStream()>>>(args);
 }}
 #endif
 """
     write_if_changed(Path(cg.impl_path, f"{k.name}.cuh"), source)
-    cg._kid_pipeline_header[k.name] = entry["headers"][-1]
+    cg._kid_pipeline_header[k.name] = header
     cg._host_instantiations.append(
         {
             "kid_name": k.name,
@@ -3403,45 +3383,17 @@ void {k.name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
         }
     )
     cg._device_instantiations.append(
-        {"kid_name": k.name, "dtype": "bf16_t", "device_decl": device.rstrip() + "\n"}
-    )
-
-
-def _gen_bpreshuffle_tile(cg, k, instance_impl_preamble, make_host_decl):
-    entry = k.bpreshuffle_entry
-    kernel, alias = entry["kernel"], f"{k.name}_Traits"
-    abi = "opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950"
-    grid_kind = entry.get("grid_kind", "nm")
-    n_tiles = "n / Traits::B_N"
-    if grid_kind == "nm_tail":
-        n_tiles = (
-            "Traits::N_TAIL ? (n + Traits::B_N - 1) / Traits::B_N : n / Traits::B_N"
-        )
-    grid = "dim3(tiles_n, tiles_m)"
-    if grid_kind == "xcd":
-        grid = "dim3(Traits::XCD_ORDER ? (tiles + 7) / 8 * 8 : tiles)"
-    lds = "Traits::lds_bytes(k)" if entry.get("dynamic_lds") else "0"
-    _emit_bpreshuffle_host(
-        cg,
-        k,
-        instance_impl_preamble,
-        make_host_decl,
-        _bpreshuffle_declaration(kernel, "class Traits", abi),
-        f"""    const unsigned tiles_m = (m + Traits::B_M - 1) / Traits::B_M;
-    const unsigned tiles_n = {n_tiles}, tiles = tiles_m * tiles_n;
-    {kernel}<{alias}><<<{grid}, dim3(Traits::BLOCK_SIZE), {lds}, aiter::getCurrentHIPStream()>>>(args);""",
-        f"template __global__ void {kernel}<{alias}>({abi});",
+        {
+            "kid_name": k.name,
+            "dtype": "bf16_t",
+            "device_decl": f"template __global__ void {kernel}<{alias}>({abi});\n",
+        }
     )
 
 
 def gen_mxscale_bpreshuffle_instance(
     cg,
     k,
-    pipeline_header,
-    traits_header,
-    kernel_func,
-    traits_name,
-    kargs_name,
     instance_impl_preamble,
     make_a8w8_bpreshuffle_host_decl,
     **_unused,
