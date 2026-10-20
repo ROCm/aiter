@@ -701,7 +701,10 @@ def test_fused_oneshot_split_is_opt_in():
     for link, ws, arch in CELLS:
         for hidden in _widths(link, ws, arch):
             kw = {"world_size": ws, "link": link, "arch": arch, "hidden": hidden}
-            table = P.FUSED_ONESHOT_LADDER[(arch, link, ws, hidden)]
+            # A width with a mesh/ring ladder only runs the default one-shot.
+            table = P.FUSED_ONESHOT_LADDER.get(
+                (arch, link, ws, hidden), P.FUSED_ONESHOT_LADDER[(arch, link, ws, None)]
+            )
             with mock.patch.dict(os.environ):
                 os.environ.pop(P.FUSED_SPLIT_ENV, None)
                 off = P.fused_oneshot_ladder(**kw)

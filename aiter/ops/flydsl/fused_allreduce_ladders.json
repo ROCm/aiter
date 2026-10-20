@@ -183,20 +183,12 @@
       "arch": "gfx950",
       "link": "xgmi",
       "world_size": 2,
-      "_comment": "TODO: measured on gfx942; tune on gfx950.",
+      "_comment": "Tuned on MI355X (gfx950, xGMI). The mesh is not dispatched at TP2 and keeps the gfx942 ladders.",
       "oneshot": {
         "default": {
           "rungs": [
             {"min_bytes": 0, "atoms": 1, "grid_cap": 128, "fanout": "peer", "split": 1}
           ]
-        },
-        "hidden": {
-          "7168": {
-            "_comment": "placeholder: the ladder shipped before per-width ladders, until this width is tuned",
-            "rungs": [
-              {"min_bytes": 0, "atoms": 1, "grid_cap": 128, "fanout": "peer", "split": 1}
-            ]
-          }
         }
       },
       "mesh": {
@@ -205,34 +197,14 @@
           "rungs": [
             {"min_bytes": 0, "super_tile": 1, "grid_cap": 128}
           ]
-        },
-        "hidden": {
-          "7168": {
-            "_comment": "placeholder: the ladder shipped before per-width ladders, until this width is tuned",
-            "atoms_per_row": null,
-            "rungs": [
-              {"min_bytes": 0, "super_tile": 1, "grid_cap": 128}
-            ]
-          }
         }
       },
       "ring": {
         "default": {
           "atoms_per_row": 4,
           "rungs": [
-            {"min_bytes": 0, "super_tile": 8, "grid_cap": 128},
-            {"min_bytes": "24 MiB", "super_tile": 16, "grid_cap": 128}
+            {"min_bytes": 0, "super_tile": 1, "grid_cap": 256}
           ]
-        },
-        "hidden": {
-          "7168": {
-            "_comment": "placeholder: the ladder shipped before per-width ladders, until this width is tuned",
-            "atoms_per_row": 4,
-            "rungs": [
-              {"min_bytes": 0, "super_tile": 8, "grid_cap": 128},
-              {"min_bytes": "24 MiB", "super_tile": 16, "grid_cap": 128}
-            ]
-          }
         }
       }
     },
@@ -240,19 +212,29 @@
       "arch": "gfx950",
       "link": "xgmi",
       "world_size": 4,
-      "_comment": "TODO: measured on gfx942; tune on gfx950.",
+      "_comment": "Tuned on MI355X (gfx950, xGMI). The ring is not dispatched at TP4 and keeps the gfx942 ladders.",
       "oneshot": {
         "default": {
           "rungs": [
-            {"min_bytes": 0, "atoms": 1, "grid_cap": 128, "fanout": "peer", "split": 1}
+            {"min_bytes": 0, "atoms": 2, "grid_cap": 8, "fanout": "peer", "split": 1},
+            {"min_bytes": "64 KiB", "atoms": 1, "grid_cap": 128, "fanout": "peer", "split": 1}
           ]
         },
         "hidden": {
-          "7168": {
-            "_comment": "placeholder: the ladder shipped before per-width ladders, until this width is tuned",
+          "3072": {
             "rungs": [
-              {"min_bytes": 0, "atoms": 1, "grid_cap": 128, "fanout": "peer", "split": 16},
-              {"min_bytes": "144 KiB", "atoms": 1, "grid_cap": 128, "fanout": "peer", "split": 1}
+              {"min_bytes": 0, "atoms": 1, "grid_cap": 128, "fanout": "peer", "split": 1}
+            ]
+          },
+          "7168": {
+            "rungs": [
+              {"min_bytes": 0, "atoms": 1, "grid_cap": 256, "fanout": "peer", "split": 16},
+              {"min_bytes": "168 KiB", "atoms": 1, "grid_cap": 64, "fanout": "peer", "split": 1}
+            ]
+          },
+          "8192": {
+            "rungs": [
+              {"min_bytes": 0, "atoms": 1, "grid_cap": 256, "fanout": "peer", "split": 16}
             ]
           }
         }
@@ -261,19 +243,8 @@
         "default": {
           "atoms_per_row": 2,
           "rungs": [
-            {"min_bytes": 0, "super_tile": 8, "grid_cap": 128},
-            {"min_bytes": "4 MiB", "super_tile": 1, "grid_cap": 128}
+            {"min_bytes": 0, "super_tile": 1, "grid_cap": 256}
           ]
-        },
-        "hidden": {
-          "7168": {
-            "_comment": "placeholder: the ladder shipped before per-width ladders, until this width is tuned",
-            "atoms_per_row": 2,
-            "rungs": [
-              {"min_bytes": 0, "super_tile": 8, "grid_cap": 128},
-              {"min_bytes": "4 MiB", "super_tile": 1, "grid_cap": 128}
-            ]
-          }
         }
       },
       "ring": {
@@ -284,17 +255,6 @@
             {"min_bytes": "24 MiB", "super_tile": 16, "grid_cap": 128},
             {"min_bytes": "48 MiB", "super_tile": 32, "grid_cap": 128}
           ]
-        },
-        "hidden": {
-          "7168": {
-            "_comment": "placeholder: the ladder shipped before per-width ladders, until this width is tuned",
-            "atoms_per_row": null,
-            "rungs": [
-              {"min_bytes": 0, "super_tile": 8, "grid_cap": 128},
-              {"min_bytes": "24 MiB", "super_tile": 16, "grid_cap": 128},
-              {"min_bytes": "48 MiB", "super_tile": 32, "grid_cap": 128}
-            ]
-          }
         }
       }
     },
@@ -302,20 +262,28 @@
       "arch": "gfx950",
       "link": "xgmi",
       "world_size": 8,
-      "_comment": "TODO: measured on gfx942; tune on gfx950.",
+      "_comment": "Tuned on MI355X (gfx950, xGMI). The ring is not dispatched at TP8 and keeps the gfx942 ladders.",
       "oneshot": {
         "default": {
           "rungs": [
-            {"min_bytes": 0, "atoms": 1, "grid_cap": 64, "fanout": "peer", "split": 1},
-            {"min_bytes": "56 KiB", "atoms": 1, "grid_cap": 128, "fanout": "peer", "split": 1}
+            {"min_bytes": 0, "atoms": 1, "grid_cap": 64, "fanout": "peer", "split": 1}
           ]
         },
         "hidden": {
-          "7168": {
-            "_comment": "placeholder: the ladder shipped before per-width ladders, until this width is tuned",
+          "4096": {
             "rungs": [
-              {"min_bytes": 0, "atoms": 1, "grid_cap": 64, "fanout": "peer", "split": 16},
-              {"min_bytes": "56 KiB", "atoms": 1, "grid_cap": 128, "fanout": "peer", "split": 16}
+              {"min_bytes": 0, "atoms": 1, "grid_cap": 64, "fanout": "peer", "split": 8},
+              {"min_bytes": "96 KiB", "atoms": 1, "grid_cap": 64, "fanout": "peer", "split": 1}
+            ]
+          },
+          "7168": {
+            "rungs": [
+              {"min_bytes": 0, "atoms": 1, "grid_cap": 128, "fanout": "peer", "split": 16}
+            ]
+          },
+          "8192": {
+            "rungs": [
+              {"min_bytes": 0, "atoms": 1, "grid_cap": 128, "fanout": "peer", "split": 16}
             ]
           }
         }
@@ -324,17 +292,15 @@
         "default": {
           "atoms_per_row": 1,
           "rungs": [
-            {"min_bytes": 0, "super_tile": 1, "grid_cap": 128},
-            {"min_bytes": "6 MiB", "super_tile": 8, "grid_cap": 128}
+            {"min_bytes": 0, "super_tile": 8, "grid_cap": 256}
           ]
         },
         "hidden": {
           "7168": {
-            "_comment": "placeholder: the ladder shipped before per-width ladders, until this width is tuned",
             "atoms_per_row": 1,
             "rungs": [
-              {"min_bytes": 0, "super_tile": 1, "grid_cap": 128},
-              {"min_bytes": "6 MiB", "super_tile": 8, "grid_cap": 128}
+              {"min_bytes": 0, "super_tile": 1, "grid_cap": 32},
+              {"min_bytes": "5376 KiB", "super_tile": 8, "grid_cap": 256}
             ]
           }
         }
@@ -346,16 +312,6 @@
             {"min_bytes": 0, "super_tile": 16, "grid_cap": 128},
             {"min_bytes": "48 MiB", "super_tile": 32, "grid_cap": 128}
           ]
-        },
-        "hidden": {
-          "7168": {
-            "_comment": "placeholder: the ladder shipped before per-width ladders, until this width is tuned",
-            "atoms_per_row": null,
-            "rungs": [
-              {"min_bytes": 0, "super_tile": 16, "grid_cap": 128},
-              {"min_bytes": "48 MiB", "super_tile": 32, "grid_cap": 128}
-            ]
-          }
         }
       }
     },
@@ -368,14 +324,6 @@
           "rungs": [
             {"min_bytes": 0, "atoms": 1, "grid_cap": 128, "fanout": "peer", "split": 1}
           ]
-        },
-        "hidden": {
-          "7168": {
-            "_comment": "placeholder: the ladder shipped before per-width ladders, until this width is tuned",
-            "rungs": [
-              {"min_bytes": 0, "atoms": 1, "grid_cap": 128, "fanout": "peer", "split": 1}
-            ]
-          }
         }
       },
       "mesh": {
@@ -384,27 +332,17 @@
           "rungs": [
             {"min_bytes": 0, "super_tile": 1, "grid_cap": 64}
           ]
-        },
-        "hidden": {
-          "7168": {
-            "_comment": "placeholder: the ladder shipped before per-width ladders, until this width is tuned",
-            "atoms_per_row": 4,
-            "rungs": [
-              {"min_bytes": 0, "super_tile": 1, "grid_cap": 64}
-            ]
-          }
         }
       },
       "ring": {
         "default": {
-          "atoms_per_row": 2,
+          "atoms_per_row": 4,
           "rungs": [
             {"min_bytes": 0, "super_tile": 1, "grid_cap": 128}
           ]
         },
         "hidden": {
-          "7168": {
-            "_comment": "placeholder: the ladder shipped before per-width ladders, until this width is tuned",
+          "4096": {
             "atoms_per_row": 2,
             "rungs": [
               {"min_bytes": 0, "super_tile": 1, "grid_cap": 128}
@@ -420,56 +358,27 @@
       "oneshot": {
         "default": {
           "rungs": [
-            {"min_bytes": 0, "atoms": 2, "grid_cap": 64, "fanout": "peer", "split": 1},
+            {"min_bytes": 0, "atoms": 2, "grid_cap": 8, "fanout": "peer", "split": 1},
             {"min_bytes": "64 KiB", "atoms": 1, "grid_cap": 128, "fanout": "peer", "split": 1},
             {"min_bytes": "384 KiB", "atoms": 2, "grid_cap": 32, "fanout": "peer", "split": 1}
           ]
-        },
-        "hidden": {
-          "7168": {
-            "_comment": "placeholder: the ladder shipped before per-width ladders, until this width is tuned",
-            "rungs": [
-              {"min_bytes": 0, "atoms": 2, "grid_cap": 64, "fanout": "peer", "split": 1},
-              {"min_bytes": "64 KiB", "atoms": 1, "grid_cap": 128, "fanout": "peer", "split": 1},
-              {"min_bytes": "384 KiB", "atoms": 2, "grid_cap": 32, "fanout": "peer", "split": 1}
-            ]
-          }
         }
       },
       "mesh": {
         "default": {
           "atoms_per_row": 2,
           "rungs": [
-            {"min_bytes": 0, "super_tile": 1, "grid_cap": 32},
+            {"min_bytes": 0, "super_tile": 1, "grid_cap": 128},
             {"min_bytes": "896 KiB", "super_tile": 8, "grid_cap": 128}
           ]
-        },
-        "hidden": {
-          "7168": {
-            "_comment": "placeholder: the ladder shipped before per-width ladders, until this width is tuned",
-            "atoms_per_row": 2,
-            "rungs": [
-              {"min_bytes": 0, "super_tile": 1, "grid_cap": 32},
-              {"min_bytes": "896 KiB", "super_tile": 8, "grid_cap": 128}
-            ]
-          }
         }
       },
       "ring": {
         "default": {
           "atoms_per_row": 2,
           "rungs": [
-            {"min_bytes": 0, "super_tile": 16, "grid_cap": 128}
+            {"min_bytes": 0, "super_tile": 32, "grid_cap": 128}
           ]
-        },
-        "hidden": {
-          "7168": {
-            "_comment": "placeholder: the ladder shipped before per-width ladders, until this width is tuned",
-            "atoms_per_row": 2,
-            "rungs": [
-              {"min_bytes": 0, "super_tile": 16, "grid_cap": 128}
-            ]
-          }
         }
       }
     },
@@ -480,16 +389,20 @@
       "oneshot": {
         "default": {
           "rungs": [
-            {"min_bytes": 0, "atoms": 1, "grid_cap": 128, "fanout": "peer", "split": 1},
-            {"min_bytes": "48 KiB", "atoms": 1, "grid_cap": 32, "fanout": "peer", "split": 1}
+            {"min_bytes": 0, "atoms": 1, "grid_cap": 32, "fanout": "peer", "split": 1}
           ]
         },
         "hidden": {
           "7168": {
-            "_comment": "placeholder: the ladder shipped before per-width ladders, until this width is tuned",
             "rungs": [
-              {"min_bytes": 0, "atoms": 1, "grid_cap": 128, "fanout": "peer", "split": 8},
-              {"min_bytes": "48 KiB", "atoms": 1, "grid_cap": 32, "fanout": "peer", "split": 1}
+              {"min_bytes": 0, "atoms": 1, "grid_cap": 256, "fanout": "peer", "split": 8},
+              {"min_bytes": "56 KiB", "atoms": 1, "grid_cap": 32, "fanout": "peer", "split": 1}
+            ]
+          },
+          "8192": {
+            "rungs": [
+              {"min_bytes": 0, "atoms": 1, "grid_cap": 64, "fanout": "peer", "split": 8},
+              {"min_bytes": "64 KiB", "atoms": 1, "grid_cap": 32, "fanout": "peer", "split": 1}
             ]
           }
         }
@@ -500,15 +413,6 @@
           "rungs": [
             {"min_bytes": 0, "super_tile": 8, "grid_cap": 32}
           ]
-        },
-        "hidden": {
-          "7168": {
-            "_comment": "placeholder: the ladder shipped before per-width ladders, until this width is tuned",
-            "atoms_per_row": 1,
-            "rungs": [
-              {"min_bytes": 0, "super_tile": 8, "grid_cap": 32}
-            ]
-          }
         }
       },
       "ring": {
@@ -517,15 +421,6 @@
           "rungs": [
             {"min_bytes": 0, "super_tile": 32, "grid_cap": 128}
           ]
-        },
-        "hidden": {
-          "7168": {
-            "_comment": "placeholder: the ladder shipped before per-width ladders, until this width is tuned",
-            "atoms_per_row": null,
-            "rungs": [
-              {"min_bytes": 0, "super_tile": 32, "grid_cap": 128}
-            ]
-          }
         }
       }
     }
