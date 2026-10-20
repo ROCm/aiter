@@ -782,7 +782,9 @@ def _pv_qk_gemm(
     """
     num_q_tiles = len(p_list)
     d_tiles = v_hdim // WMMA_M
-    num_contract_tiles = n_block // WMMA_K
+    # Contraction depth follows the V load width: each tile is one WMMA's worth of kv,
+    # vld_per_frag transpose loads of 16 rows each (32 kv at 16-bit, 64 at 8-bit).
+    num_contract_tiles = n_block // (vld_per_frag * WMMA_N)
     num_kv_frags = n_block // WMMA_N
     num_k_tiles = len(q_frags_list[0])
     # softmax tiles per PV B operand: one per 16 kv rows of the contraction
@@ -2199,6 +2201,7 @@ def _attention_core_one_kv_tile(
     _, s_list = _pv_qk_gemm(
         v_emit=None,
         k_emit=_k_emit,
+        vld_per_frag=v_mgr.loads_per_frag,
         p_list=[[] for _ in range(num_q_tiles)],
         q_frags_list=q_frags,
         v_hdim=v_hdim,

@@ -35,6 +35,18 @@ import torch.nn.functional as F
 
 from .fmha_bwd_gfx942 import flash_attn_varlen_bwd_d192_gfx942
 from .kernels.flash_attn_func_gfx1201 import build_flash_attn_func_module
+from .kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
+    TORCH_O_DTYPE as _GFX1250_A8W8_OUT_DTYPE,
+)
+from .kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
+    flash_attn_a8w8_m32x8_supported as flash_attn_gfx1250_a8w8_supported,
+)
+from .kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
+    flash_attn_batch_a8w8_m32x8 as flash_attn_batch_gfx1250_a8w8,
+)
+from .kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
+    flash_attn_varlen_a8w8_m32x8 as flash_attn_varlen_gfx1250_a8w8,
+)
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
     flash_attn_batch_m32x8 as flash_attn_batch_gfx1250,
 )
@@ -225,17 +237,42 @@ def flydsl_flash_attn_func(
     return o_p
 
 
-def _check_out(out, q, v_hdim):
-    """Validate a caller-provided ``out`` tensor."""
+def _check_out(out, q, v_hdim, out_dtype=None):
+    """Validate a caller-provided ``out`` tensor. ``out_dtype`` defaults to q's -- the
+    8-bit gfx1250 kernel writes bf16 output, so it passes its own."""
     assert out is not None, "out must be provided"
     assert torch.is_tensor(out), f"out must be a tensor, got {type(out).__name__}"
-    assert out.dtype == q.dtype, f"out dtype {out.dtype} != q dtype {q.dtype}"
+    want_dtype = q.dtype if out_dtype is None else out_dtype
+    assert out.dtype == want_dtype, f"out dtype {out.dtype} != expected {want_dtype}"
     assert out.device == q.device, f"out device {out.device} != q device {q.device}"
     assert out.stride(-1) == 1, "out must have a contiguous last dimension"
     want = (*tuple(q.shape[:-1]), v_hdim)
     assert (
         tuple(out.shape) == want
     ), f"out shape {tuple(out.shape)} != expected {want} (v_hdim={v_hdim})"
+
+
+_GFX1250_A8W8_IN_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+
+def _gfx1250_fwd(q):
+    """``(supported, varlen, batch, out_dtype)`` for this input dtype on gfx1250.
+
+    8-bit Q/K/V go to the a8w8 sibling, which writes bf16 output; everything else to
+    a16w16, whose output follows the input."""
+    if q.dtype in _GFX1250_A8W8_IN_DTYPES:
+        return (
+            flash_attn_gfx1250_a8w8_supported,
+            flash_attn_varlen_gfx1250_a8w8,
+            flash_attn_batch_gfx1250_a8w8,
+            _GFX1250_A8W8_OUT_DTYPE,
+        )
+    return (
+        flash_attn_gfx1250_supported,
+        flash_attn_varlen_gfx1250,
+        flash_attn_batch_gfx1250,
+        q.dtype,
+    )
 
 
 def _fp8_gfx950_supported(
@@ -383,24 +420,27 @@ def flydsl_flash_attn_varlen_fwd(
                 out=out,
                 return_lse=return_lse,
             )
-    elif gfx == "gfx1250" and flash_attn_gfx1250_supported(
-        "varlen",
-        q,
-        k,
-        v,
-        dropout_p=dropout_p,
-        window_size=window_size,
-        bias=bias,
-        alibi_slopes=alibi_slopes,
-        sink=sink,
-        block_table=block_table,
-        return_attn_probs=return_attn_probs,
-    ):
+    elif gfx == "gfx1250":
+        _supported, _varlen_fn, _, _out_dtype = _gfx1250_fwd(q)
+        if not _supported(
+            "varlen",
+            q,
+            k,
+            v,
+            dropout_p=dropout_p,
+            window_size=window_size,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            sink=sink,
+            block_table=block_table,
+            return_attn_probs=return_attn_probs,
+        ):
+            return None
         if out is None:
-            out = q.new_empty((*q.shape[:-1], v.shape[-1]))
+            out = q.new_empty((*q.shape[:-1], v.shape[-1]), dtype=_out_dtype)
         else:
-            _check_out(out, q, v.shape[-1])
-        return flash_attn_varlen_gfx1250(
+            _check_out(out, q, v.shape[-1], out_dtype=_out_dtype)
+        return _varlen_fn(
             q,
             k,
             v,
@@ -487,10 +527,9 @@ def flydsl_flash_attn_batch_fwd(
             )
     # deterministic is a backward-only flag (this forward is atomic-free), and
     # flash_attn_func defaults it True -- gating on it would reject every request.
-    elif (
-        gfx == "gfx1250"
-        and q.dim() == 4
-        and flash_attn_gfx1250_supported(
+    elif gfx == "gfx1250" and q.dim() == 4:
+        _supported, _, _batch_fn, _out_dtype = _gfx1250_fwd(q)
+        if not _supported(
             "batch",
             q,
             k,
@@ -502,13 +541,13 @@ def flydsl_flash_attn_batch_fwd(
             sink=sink,
             block_table=None,
             return_attn_probs=return_attn_probs,
-        )
-    ):
+        ):
+            return None
         if out is None:
-            out = q.new_empty((*q.shape[:-1], v.shape[-1]))
+            out = q.new_empty((*q.shape[:-1], v.shape[-1]), dtype=_out_dtype)
         else:
-            _check_out(out, q, v.shape[-1])
-        return flash_attn_batch_gfx1250(
+            _check_out(out, q, v.shape[-1], out_dtype=_out_dtype)
+        return _batch_fn(
             q,
             k,
             v,

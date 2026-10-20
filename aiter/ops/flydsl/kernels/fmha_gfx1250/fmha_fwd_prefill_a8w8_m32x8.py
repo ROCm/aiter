@@ -152,25 +152,18 @@ class WarpType(IntEnum):
 
 DEFAULT_QK_HDIM = 128
 DEFAULT_V_HDIM = 128
-DEFAULT_DTYPE = "bf16"
-_DTYPE_MAP = {
-    "bf16": fx.BFloat16,
-    "fp16": fx.Float16,
-    "fp8": fx.Float8E4M3FN,
-    "bf8": fx.Float8E5M2,
-}
-_TORCH_DTYPE_MAP = {
-    "bf16": torch.bfloat16,
-    "fp16": torch.float16,
-    "fp8": torch.float8_e4m3fn,
-    "bf8": torch.float8_e5m2,
-}
+DEFAULT_DTYPE = "fp8"
+_DTYPE_MAP = {"fp8": fx.Float8E4M3FN, "bf8": fx.Float8E5M2}
+_TORCH_DTYPE_MAP = {"fp8": torch.float8_e4m3fn, "bf8": torch.float8_e5m2}
 _B8_DTYPES = (fx.Float8E4M3FN, fx.Float8E5M2)
 # ``elem_dtype`` is the Q/K/V input type. P and O do not follow it: softmax P is always
 # bf8 (its [0,1] range wants the wider exponent, not fp8's extra mantissa bit), and the O
 # accumulator and store stay 16-bit.
 P_DTYPE = fx.Float8E5M2
 O_DTYPE = fx.BFloat16
+TORCH_O_DTYPE = torch.bfloat16
+# Q/K/V inputs this kernel serves; 16-bit belongs to the a16w16 sibling.
+_TORCH_IN_DTYPES = {torch.float8_e4m3fn: "fp8", torch.float8_e5m2: "bf8"}
 SUPPORTED_QK_HDIM = (64, 128, 192, 256)
 SUPPORTED_V_HDIM = (64, 128)
 
@@ -356,32 +349,37 @@ _B8_WMMA = {
 }
 
 
-def _wmma(a, b, c):
+def _wmma(a, b, c, *, a_dtype, b_dtype):
     """One WMMA: C[16x16 f32] = A @ B + C, operand reuse off, v8 f32 accumulator.
 
-    16-bit operands take ``16x16x32`` and are passed as v16 bf16/f16. 8-bit operands
-    take ``16x16x64`` -- twice the contraction depth for the same 8 VGPRs -- and A/B may
-    mix FP8(E4M3FN) and BF8(E5M2) freely, one intrinsic per combination. The 8-bit
-    intrinsics reject float vectors ("operand #0 must be ... vector of integer"), so the
-    fragments are bitcast to v8 i32; the bits are unchanged.
+    ``16x16x64`` -- twice bf16's contraction depth for the same 8 VGPRs. A and B may mix
+    FP8(E4M3FN) and BF8(E5M2) freely, one intrinsic per combination. Operands arrive as
+    v8 i32 (the intrinsics reject float vectors, and nothing on the 8-bit path ever
+    materializes an f8 vector type), so the caller names their element types.
     """
     v8f32 = fx.Vector.make_type(8, fx.Float32)
-    if a.dtype in _B8_DTYPES:
-        wmma = _B8_WMMA[(a.dtype, b.dtype)]
-        a, b = a.bitcast(fx.Int32), b.bitcast(fx.Int32)
-    else:
-        wmma = (
-            rocdl.wmma_f32_16x16x32_f16
-            if a.dtype is fx.Float16
-            else rocdl.wmma_f32_16x16x32_bf16
-        )
+    wmma = _B8_WMMA[(a_dtype, b_dtype)]
     # modC defaults to WMMACModifier::none (== the old modC=0); omit it.
     return wmma(v8f32, _ir(a), _ir(b), _ir(c), reuseA=False, reuseB=False).result
 
 
+_B8_PK8_CVT = {
+    fx.Float8E4M3FN: rocdl.cvt_scalef32_pk8_fp8_f32,
+    fx.Float8E5M2: rocdl.cvt_scalef32_pk8_bf8_f32,
+}
+
+
 def _convert_vectors(vec_lists, dtype):
-    """Convert a list of lists of vectors to ``dtype``."""
-    return [[v.to(dtype) for v in row] for row in vec_lists]
+    """Convert a list of lists of vectors to ``dtype``.
+
+    ``.to()`` is no good for an 8-bit result: it emits ``arith.truncf``, which has no
+    lowering pattern for an f8 vector, so the value stays f8-typed while the pipeline
+    legalizes its users to i8 and the bridging cast dies unlegalized. The hardware
+    convert sidesteps that and does all 8 elements in one instruction; scale is 1."""
+    cvt = _B8_PK8_CVT[dtype]
+    v2i32 = fx.Vector.make_type(2, fx.Int32)
+    one = _ir(fx.Float32(1.0))
+    return [[fx.Vector(cvt(v2i32, _ir(v), one)) for v in row] for row in vec_lists]
 
 
 def _keepalive(vals):
@@ -780,6 +778,7 @@ def _pv_qk_gemm(
     ring=PVQK_RING,
     ring_lag=PVQK_LAG,
     vld_per_frag=2,
+    elem_dtype=None,
     phase="pvqk",
 ):
     """GEMM2(u-1) then GEMM1(u) driven by ONE ring over the concatenated V-then-K
@@ -817,7 +816,9 @@ def _pv_qk_gemm(
     """
     num_q_tiles = len(p_list)
     d_tiles = v_hdim // WMMA_M
-    num_contract_tiles = n_block // WMMA_K
+    # Contraction depth follows the V load width: each tile is one WMMA's worth of kv,
+    # vld_per_frag transpose loads of 16 rows each (32 kv at 16-bit, 64 at 8-bit).
+    num_contract_tiles = n_block // (vld_per_frag * WMMA_N)
     num_kv_frags = n_block // WMMA_N
     num_k_tiles = len(q_frags_list[0])
     # softmax tiles per PV B operand: one per 16 kv rows of the contraction
@@ -859,7 +860,9 @@ def _pv_qk_gemm(
                     [p[num_p_parts * k_tile_idx + t] for t in range(num_p_parts)]
                 )
                 p_frags[(q_tile_idx, k_tile_idx)] = p_frag
-                out_list[q_tile_idx][d_tile_idx] = _wmma(v_frag, p_frag, acc)
+                out_list[q_tile_idx][d_tile_idx] = _wmma(
+                    v_frag, p_frag, acc, a_dtype=elem_dtype, b_dtype=P_DTYPE
+                )
                 rocdl.sched_barrier(0)
             return
         kv, d_tile_idx = divmod(i - num_v_frags, num_k_tiles)
@@ -871,7 +874,11 @@ def _pv_qk_gemm(
                 else fx.Vector.filled(8, 0.0, fx.Float32)
             )
             s_acc_list[q_tile_idx][kv] = _wmma(
-                k_frag, q_frags_list[q_tile_idx][d_tile_idx], acc
+                k_frag,
+                q_frags_list[q_tile_idx][d_tile_idx],
+                acc,
+                a_dtype=elem_dtype,
+                b_dtype=elem_dtype,
             )
             rocdl.sched_barrier(0)
 
@@ -1068,7 +1075,9 @@ def _attention_prologue(
     )
 
     # softmax_scale*LOG2E, folded into Q by the loader's bf16 multiply.
-    _q_scale = softmax_scale * fx.Float32(LOG2E)
+    # TODO(a8w8): 8-bit Q cannot carry the scale (no f8 multiply), so S must be scaled
+    # after the QK gemm instead. Until that lands 8-bit results are NUMERICALLY WRONG.
+    _q_scale = None
 
     # K/V staging: N_KV_PP slots of 2 LDS_CHUNK_BYTES chunks each, every tile split 2-way
     # along n_block into chunks 6 apart (different 64 KB segments). Q time-shares slot 1's
@@ -1550,7 +1559,9 @@ def _attention_core_multi_kv_tiles(
                 _raw(
                     fx.Vector.filled(8, float("-inf"), fx.Float32)
                     if _is_lagging_softmax
-                    else fx.Vector.filled(8, 0.0, fx.Float32).to(P_DTYPE)
+                    else _convert_vectors(
+                        [[fx.Vector.filled(8, 0.0, fx.Float32)]], P_DTYPE
+                    )[0][0]
                 )
                 for _ in range(num_kv_frags)
             ]
@@ -1866,6 +1877,7 @@ def _attention_core_multi_kv_tiles(
                 v_emit=_v_emit,
                 k_emit=_k_emit,
                 vld_per_frag=v_mgr.loads_per_frag,
+                elem_dtype=elem_dtype,
                 p_list=p_list,
                 q_frags_list=q_frags,
                 v_hdim=v_hdim,
@@ -1886,6 +1898,7 @@ def _attention_core_multi_kv_tiles(
                 v_emit=_v_emit,
                 k_emit=_k_emit,
                 vld_per_frag=v_mgr.loads_per_frag,
+                elem_dtype=elem_dtype,
                 p_list=carry_prev,
                 q_frags_list=q_frags,
                 v_hdim=v_hdim,
@@ -2103,7 +2116,9 @@ def _attention_core_one_kv_tile(
     kv_head, q_head_idx, seq_idx = _packed_tile_indices(
         gqa_ratio, warp_idx, lane_idx, num_q_tiles_per_wave
     )
-    _q_scale = softmax_scale * fx.Float32(LOG2E)
+    # TODO(a8w8): 8-bit Q cannot carry the scale (no f8 multiply), so S must be scaled
+    # after the QK gemm instead. Until that lands 8-bit results are NUMERICALLY WRONG.
+    _q_scale = None
     num_q_tiles = num_q_tiles_per_wave
 
     q_mgr, k_mgr, v_mgr = _build_managers(
@@ -2234,6 +2249,8 @@ def _attention_core_one_kv_tile(
     _, s_list = _pv_qk_gemm(
         v_emit=None,
         k_emit=_k_emit,
+        vld_per_frag=v_mgr.loads_per_frag,
+        elem_dtype=elem_dtype,
         p_list=[[] for _ in range(num_q_tiles)],
         q_frags_list=q_frags,
         v_hdim=v_hdim,
@@ -2290,6 +2307,7 @@ def _attention_core_one_kv_tile(
         v_emit=_v_emit,
         k_emit=None,
         vld_per_frag=v_mgr.loads_per_frag,
+        elem_dtype=elem_dtype,
         p_list=p_list,
         q_frags_list=q_frags,
         v_hdim=v_hdim,
@@ -2659,11 +2677,13 @@ def kv_split_bytes(qk_hdim, v_hdim, n_block, elem_dtype):
 
 def pick_n_block(qk_hdim, v_hdim, elem_dtype):
     """Widest n_block from N_BLOCK_PREF whose split K and V tiles each still fit one
-    LDS_CHUNK_BYTES chunk and whose hdim is within N_BLOCK_WIDE_MAX_QK_HDIM. At bf16 that
-    is 128 for qk_hdim 128 and 64 for 192/256."""
+    LDS_CHUNK_BYTES chunk.
+
+    The 16-bit kernel also caps wide n_block at N_BLOCK_WIDE_MAX_QK_HDIM, a capacity
+    proxy that does not apply here: 8-bit halves the bytes, and n_block 64 is not merely
+    narrow but invalid, since a contraction tile is 64 kv deep and each of the
+    KV_LDS_SPLITS splits must hold whole tiles."""
     for candidate_n_block in N_BLOCK_PREF:
-        if candidate_n_block > DEFAULT_N_BLOCK and qk_hdim > N_BLOCK_WIDE_MAX_QK_HDIM:
-            continue
         if (
             max(kv_split_bytes(qk_hdim, v_hdim, candidate_n_block, elem_dtype))
             <= LDS_CHUNK_BYTES
@@ -3297,7 +3317,7 @@ def flash_attn_a8w8_m32x8_supported(
         qk_hdim in SUPPORTED_QK_HDIM
         and v_hdim in SUPPORTED_V_HDIM
         and k.shape[-1] == qk_hdim
-        and q.dtype in (torch.bfloat16, torch.float16)
+        and q.dtype in _TORCH_IN_DTYPES
         and k.dtype == q.dtype
         and v.dtype == q.dtype
         and num_kv > 0
@@ -3343,7 +3363,7 @@ def flash_attn_varlen_a8w8_m32x8(
     assert (
         k.dtype == q.dtype and v.dtype == q.dtype
     ), f"q/k/v dtype must match, got {q.dtype}/{k.dtype}/{v.dtype}"
-    dtype_str = "bf16" if q.dtype == torch.bfloat16 else "fp16"
+    dtype_str = _TORCH_IN_DTYPES[q.dtype]
     qk_hdim = q.shape[-1]
     assert (
         qk_hdim in SUPPORTED_QK_HDIM
@@ -3386,7 +3406,9 @@ def flash_attn_varlen_a8w8_m32x8(
 
     if out is None:
         out = torch.empty(
-            (total_q_tokens, nheads_q, v_hdim), dtype=q.dtype, device=q.device
+            (total_q_tokens, nheads_q, v_hdim),
+            dtype=TORCH_O_DTYPE,
+            device=q.device,
         )
     if return_lse:
         if lse is None:
@@ -3506,7 +3528,7 @@ def flash_attn_batch_a8w8_m32x8(
     assert (
         k.dtype == q.dtype and v.dtype == q.dtype
     ), f"q/k/v dtype must match, got {q.dtype}/{k.dtype}/{v.dtype}"
-    dtype_str = "bf16" if q.dtype == torch.bfloat16 else "fp16"
+    dtype_str = _TORCH_IN_DTYPES[q.dtype]
     assert q.dim() == 4, f"Expected 4D BSHD tensor, got rank {q.dim()}"
     qk_hdim = q.shape[-1]
     assert (
@@ -3549,7 +3571,9 @@ def flash_attn_batch_a8w8_m32x8(
 
     if out is None:
         out = torch.empty(
-            (batch, seq_len_q, nheads_q, v_hdim), dtype=q.dtype, device=q.device
+            (batch, seq_len_q, nheads_q, v_hdim),
+            dtype=TORCH_O_DTYPE,
+            device=q.device,
         )
     if return_lse:
         if lse is None:

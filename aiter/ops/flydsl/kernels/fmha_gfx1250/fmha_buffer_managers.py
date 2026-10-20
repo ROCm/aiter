@@ -198,6 +198,20 @@ def _async_load_to_lds(gptrs, lds_ptrs, *, cluster, imm_offs=None):
 # 16-bit addressing at every width -- lane row base 8h, one 8-element transpose load per 16
 # kv rows -- and the wmma's own k order is permuted to match.
 _V_LANE_ELEMS = 8
+
+
+def _load_vec_type(elem_dtype, num_elems):
+    """Result type for an LDS load of ``num_elems`` elements.
+
+    8-bit fragments stay in i32 the whole way to the wmma, which takes integer operands
+    anyway. Materializing the f8 vector type instead costs a bitcast that only folds when
+    its single user is another bitcast -- feed one to a shuffle, as every fragment concat
+    does, and the lowering leaves an unlegalizable cast behind."""
+    if elem_dtype.width == 8:
+        return fx.Vector.make_type(num_elems // 4, fx.Int32)
+    return fx.Vector.make_type(num_elems, elem_dtype)
+
+
 # Row skew that keeps those fetches conflict-free: K/Q a fixed 16 B, V 16 ELEMENTS. Swept
 # against the bank model at both LDS service widths (16 and 32 lanes/cycle).
 _AB_PAD_BYTES = 16
@@ -768,7 +782,7 @@ class QManager16bV1:
         R = self.q_tiles_per_wave
         k_tiles = self.k_tiles
         lds_tiles = self.lds_tiles
-        v8_ty = fx.Vector.make_type(self.chunk_elems, self.elem_dtype)
+        v8_ty = _load_vec_type(self.elem_dtype, self.chunk_elems)
         scale_bf16 = None if scale is None else scale.to(self.elem_dtype)
 
         def _scaled(v):  # scale=None: the caller scales S after the QK gemm instead
@@ -795,9 +809,7 @@ class QManager16bV1:
                     lo = _scaled(lo)
                     rocdl.s_wait_dscnt(0)  # hi landed
                     hi = _scaled(hi)
-                    q_frags_list[qt].append(
-                        lo.shuffle(hi, list(range(2 * self.chunk_elems)))
-                    )
+                    q_frags_list[qt].append(lo.shuffle(hi, list(range(2 * lo.numel))))
             return q_frags_list
 
         # Non-fully-resident ring drain — R==1 only (guarded in __init__).
@@ -816,7 +828,7 @@ class QManager16bV1:
             lo, hi = _read_tile(ds_ptrs, i - lds_tiles)
             rocdl.s_wait_dscnt(0)  # slot free to overwrite
             _refill(i)
-            q_frags.append(_scaled(lo.shuffle(hi, list(range(2 * self.chunk_elems)))))
+            q_frags.append(_scaled(lo.shuffle(hi, list(range(2 * lo.numel)))))
         # Drain loop: read the last lds_tiles tiles, no refill; overlap lo scale w/ hi load.
         for i in fx.range_constexpr(0, lds_tiles):
             rocdl.s_wait_asynccnt((lds_tiles - 1 - i) * 2)
@@ -825,7 +837,7 @@ class QManager16bV1:
             lo = _scaled(lo)
             rocdl.s_wait_dscnt(0)  # hi landed
             hi = _scaled(hi)
-            q_frags.append(lo.shuffle(hi, list(range(2 * self.chunk_elems))))
+            q_frags.append(lo.shuffle(hi, list(range(2 * lo.numel))))
         return [q_frags]
 
 
@@ -951,12 +963,12 @@ class KManager16bV1(_AsyncTransport):
 
     def load_one_to_reg(self, base_ptrs, j, lds_imm_offset=0):
         """Emit the ``j``-th K ``ds_load_b128`` of the resident block."""
-        v8_ty = fx.Vector.make_type(self.chunk_elems, self.elem_dtype)
+        ty = _load_vec_type(self.elem_dtype, self.chunk_elems)
         base_idx, imm = self._ds_load_plan(len(base_ptrs), lds_imm_offset)[j]
         p = base_ptrs[base_idx]
         if imm:
             p = fx.add_offset(p, imm)
-        return fx.ptr_load(p, result_type=v8_ty)
+        return fx.ptr_load(p, result_type=ty)
 
     def load_all_to_reg(self, base_ptrs, lds_imm_offset=0):
         """Burst all K ``ds_load_b128`` for the resident block, in ``_pv_qk_gemm``'s K
@@ -1076,13 +1088,13 @@ class VManager16bV1(_AsyncTransport):
 
     def load_one_to_reg(self, base_ptrs, j, lds_imm_offset=0):
         """Emit the ``j``-th V transpose load of the resident block."""
-        v8_ty = fx.Vector.make_type(_V_LANE_ELEMS, self.elem_dtype)
+        ty = _load_vec_type(self.elem_dtype, _V_LANE_ELEMS)
         base_idx, imm = self._ds_load_plan(len(base_ptrs), lds_imm_offset)[j]
         p = base_ptrs[base_idx]
         if imm:
             p = buffer_ops.get_element_ptr(p, static_byte_offset=imm)
         tr = rocdl.ds_load_tr16_b128 if self.elem_bytes == 2 else rocdl.ds_load_tr8_b64
-        return fx.Vector(tr(v8_ty, p))
+        return fx.Vector(tr(ty, p))
 
     def load_all_to_reg(self, base_ptrs, lds_imm_offset=0):
         """Burst all V ``ds_load_tr16_b128`` for the resident block, in ``_pv_qk_gemm``'s
@@ -1230,7 +1242,7 @@ class QManager16bV2:
 
         The read collapses to 1 per-lane base + compile-time immediates (like K): lane ``l``
         reads row ``l%16``, d-byte ``(l//16)*16``."""
-        v8_ty = fx.Vector.make_type(self.chunk_elems, self.elem_dtype)
+        v8_ty = _load_vec_type(self.elem_dtype, self.chunk_elems)
         scale_bf16 = None if scale is None else scale.to(self.elem_dtype)
         lane = self._lane_idx
         lane_base = (
@@ -1250,7 +1262,7 @@ class QManager16bV2:
                 p_hi = fx.add_offset(base, imm_hi)
                 lo = fx.ptr_load(p_lo, result_type=v8_ty)
                 hi = fx.ptr_load(p_hi, result_type=v8_ty)
-                frag = lo.shuffle(hi, list(range(2 * self.chunk_elems)))
+                frag = lo.shuffle(hi, list(range(2 * lo.numel)))
                 q_frags_list[qt].append(
                     frag if scale_bf16 is None else frag * scale_bf16
                 )
