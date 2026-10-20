@@ -31,29 +31,17 @@ If you have built gemm_a8w8 kernels before tuning new GEMM shapes, please add `A
 ### FlyDSL blockscale (gfx950)
 
 Use `--libtype flydsl` for FlyDSL only, or `--libtype all` to compare it with
-the other backends. The FlyDSL path uses FP8 E4M3FN inputs, FP32 scales and
-BF16 output; add `--preshuffle` for shuffled B. E8M0 block scales are tuned by
-`csrc/gemm_a8w8_mxfp8_bpreshuffle/gemm_a8w8_mxfp8_bpreshuffle_tune.py --mxscale_table`.
+the other backends. Inputs are FP8 E4M3FN with FP32 scales; output is BF16.
 
-| B layout | Default output |
-|---|---|
-| plain | [a8w8_blockscale_tuned_gemm.csv](../../aiter/configs/a8w8_blockscale_tuned_gemm.csv) |
-| `--preshuffle` | [a8w8_blockscale_bpreshuffle_tuned_gemm.csv](../../aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv) |
+- Plain B: row-major `x_scale[M, K/128]`; the adapter transposes it to
+  `[K/128, M]` inside the timed call.
+- `--preshuffle`: `x_scale` is stored as `[K/128, M]`
+  (`x_scale.T.contiguous().view_as(x_scale)`), prepared before timing.
+  Pass `-o aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv`, and keep
+  `--preshuffle` when replaying with `--run_config`.
 
-Keep custom `-o` outputs separate for each B layout. Use the same
-`--preshuffle` setting when replaying with `--run_config`.
-
-For FP32 FlyDSL tuning, with `KB = K // 128`:
-- Plain B passes row-major `x_scale[M, KB]`; kernel adapter will transpose to
-  `[KB, M]` storage is included in the measured time.
-- `--preshuffle` passes `x_scale_t`, prepared before timing with
-  `x_scale.T.contiguous().view_as(x_scale)`.
-  Its tensor shape remains `[M, KB]`, but storage is ordered as `[KB, M]`,
-  so the adapter skips the transpose.
-- Both use FP32 `w_scale[ceil(N / 128), KB]`.
-
-For FP32, public API defaults are unchanged; the 8-wave FlyDSL backend is
-selected only when a tuned CSV row requests it.
+Public API defaults are unchanged; FlyDSL runs only where a tuned CSV row
+selects it.
 
 ### Output Configuration
 
