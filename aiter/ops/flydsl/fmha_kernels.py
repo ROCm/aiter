@@ -28,21 +28,25 @@ The kernel implements self-attention only (Lq == Lk). Cross-attention
 
 from __future__ import annotations
 
-import math
 from functools import lru_cache
 
 import torch
 import torch.nn.functional as F
 
+from .fmha_bwd_gfx942 import flash_attn_varlen_bwd_d192_gfx942
 from .kernels.flash_attn_func_gfx1201 import build_flash_attn_func_module
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
+    SUPPORTED_QK_HDIM,
+    SUPPORTED_V_HDIM,
     flash_attn_batch_m32x8,
     flash_attn_varlen_m32x8,
+    supports_gqa_ratio,
 )
 
 __all__ = [
     "flydsl_flash_attn_batch_func",
     "flydsl_flash_attn_func",
+    "flydsl_flash_attn_varlen_bwd",
     "flydsl_flash_attn_varlen_func",
 ]
 
@@ -219,18 +223,18 @@ def flydsl_flash_attn_func(
     return o_p
 
 
-@lru_cache(maxsize=64)
-def _fp8_gfx950_buildable(head_dim: int, head_dim_v: int) -> bool:
-    from .kernels.fmha_gfx950.pipeline import _make_dualwave_swp_fp8_traits
-
-    for block_m in (128, 256):
-        try:
-            _make_dualwave_swp_fp8_traits(
-                1, 1, head_dim, 6.0, head_dim_v=head_dim_v, block_m=block_m
-            )
-        except RuntimeError:
-            return False
-    return True
+def _check_out(out, q, v_hdim):
+    """Validate a caller-provided ``out`` for a request m32x8 is about to serve."""
+    if out is None:
+        return
+    assert torch.is_tensor(out), f"out must be a tensor, got {type(out).__name__}"
+    assert out.dtype == q.dtype, f"out dtype {out.dtype} != q dtype {q.dtype}"
+    assert out.device == q.device, f"out device {out.device} != q device {q.device}"
+    assert out.stride(-1) == 1, "out must have a contiguous last dimension"
+    want = (*tuple(q.shape[:-1]), v_hdim)
+    assert (
+        tuple(out.shape) == want
+    ), f"out shape {tuple(out.shape)} != expected {want} (v_hdim={v_hdim})"
 
 
 def _fp8_gfx950_supported(
@@ -253,16 +257,19 @@ def _fp8_gfx950_supported(
 ) -> bool:
     """Gate for the gfx950 fp8 kernel.
 
-    It needs e4m3fn Q/K/V with per-tensor descales, hard-wires ``1/sqrt(D)``,
-    and writes bf16. Reject anything else so it falls through rather than
+    It needs e4m3fn Q/K/V with per-tensor descales and a positive, finite
+    softmax scale, and writes bf16. Reject anything else so it falls through rather than
     silently dropping the feature.
     """
     if q.dtype is not torch.float8_e4m3fn or q_descale is None:
         return False
 
-    from ...jit.utils.chip_info import get_gfx
+    from .kernels.flash_attn_func_fp8_gfx950 import (
+        _is_valid_softmax_scale,
+        flydsl_flash_attn_fp8_supported,
+    )
 
-    if get_gfx() != "gfx950":
+    if q.dim() not in (3, 4) or k.dim() != q.dim() or v.dim() != q.dim():
         return False
     if not (k.dtype == v.dtype == torch.float8_e4m3fn):
         return False
@@ -280,13 +287,13 @@ def _fp8_gfx950_supported(
     ):
         return False
     qk_hdim = q.shape[-1]
-    if softmax_scale is not None and not math.isclose(
-        softmax_scale, 1.0 / math.sqrt(qk_hdim), rel_tol=1e-6
-    ):
-        return False
-    if not _fp8_gfx950_buildable(qk_hdim, v.shape[-1]):
+    if not _is_valid_softmax_scale(softmax_scale):
         return False
     nq, nkv = q.shape[-2], k.shape[-2]
+    if not flydsl_flash_attn_fp8_supported(
+        q.device, nq, nkv, qk_hdim, v.shape[-1], dtype=q.dtype
+    ):
+        return False
     return (
         k.shape[-1] == qk_hdim
         and nkv > 0
@@ -331,7 +338,6 @@ def flydsl_flash_attn_varlen_func(
     Returns the result if FlyDSL can handle this configuration,
     otherwise returns None so the caller falls through to Triton/CK.
     """
-    from ...jit.core import is_experimental_enabled
     from ...jit.utils.chip_info import get_gfx
 
     if (
@@ -361,6 +367,7 @@ def flydsl_flash_attn_varlen_func(
             q,
             k,
             v,
+            softmax_scale=softmax_scale,
             causal=causal,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=cu_seqlens_k,
@@ -374,15 +381,12 @@ def flydsl_flash_attn_varlen_func(
             return_lse=return_lse,
         )
 
-    # FlyDSL m32x8 serves plain MHA plus attention-sink and sliding-window; other
-    # features (bias, alibi, dropout, paging, return_attn_probs) fall through to
-    # CK/Triton instead of being silently dropped.
-    #
-    # Routing (D_v=128, bf16, gfx1250): our m32x8 kernel is the DEFAULT for qk_hdim 128 and 192.
-    # qk_hdim==256 routes to us only under AITER_ENABLE_EXPERIMENTAL=1 (else CK).
+    # FlyDSL m32x8 serves plain MHA plus attention-sink and sliding-window; requests
+    # carrying bias, alibi, dropout, paging or return_attn_probs are declined here rather
+    # than silently dropped.
     qk_hdim = q.shape[-1]
-    exp = is_experimental_enabled()
-    _use_fdsl_wave8_fmha = qk_hdim in (128, 192) or (qk_hdim == 256 and exp)
+    _v_hdim = v.shape[-1]
+    _use_fdsl_wave8_fmha = qk_hdim in SUPPORTED_QK_HDIM and _v_hdim in SUPPORTED_V_HDIM
     # sink must be a valid [nheads_q] fp32 tensor; heads must divide;
     # window_size[2] (sink_size) is unsupported (reject so it is never silently dropped).
     _nq, _nkv = q.shape[-2], k.shape[-2]
@@ -392,13 +396,13 @@ def flydsl_flash_attn_varlen_func(
     supported = (
         get_gfx() == "gfx1250"
         and _use_fdsl_wave8_fmha
-        and v.shape[-1] == 128
         and k.shape[-1] == qk_hdim
         and q.dtype in (torch.bfloat16, torch.float16)
         and k.dtype == q.dtype
         and v.dtype == q.dtype
         and _nkv > 0
         and _nq % _nkv == 0
+        and supports_gqa_ratio(_nq // max(_nkv, 1))
         and dropout_p == 0.0
         and (len(window_size) < 3 or window_size[2] == 0)
         and block_table is None
@@ -410,11 +414,15 @@ def flydsl_flash_attn_varlen_func(
     if not supported:
         return None
 
-    # gfx1250 — varlen THD, D_v=128, bf16
-    if out is None:
-        out = torch.empty_like(q[:, :, : v.shape[-1]])
+    _check_out(out, q, _v_hdim)
 
-    # Clean-DSL 8-wave prefill kernel (m32x8), D_qk in {128,192,256}, D_v=128.
+    # gfx1250 — varlen THD, bf16/fp16
+    if out is None:
+        # Slicing q cannot widen it: at qk_hdim < v_hdim, q[..., :v_hdim] clamps back
+        # to qk_hdim and the kernel would write v_hdim values into a narrower buffer.
+        out = q.new_empty((*q.shape[:-1], _v_hdim))
+
+    # Clean-DSL 8-wave prefill kernel (m32x8), D_qk/D_v per the routing above.
     return flash_attn_varlen_m32x8(
         q,
         k,
@@ -459,7 +467,6 @@ def flydsl_flash_attn_batch_func(
     configuration, otherwise returns ``None`` so the caller falls through
     to Triton/CK.
     """
-    from ...jit.core import is_experimental_enabled
     from ...jit.utils.chip_info import get_gfx
 
     if (
@@ -489,6 +496,7 @@ def flydsl_flash_attn_batch_func(
             q,
             k,
             v,
+            softmax_scale=softmax_scale,
             causal=causal,
             q_descale=q_descale,
             k_descale=k_descale,
@@ -497,9 +505,10 @@ def flydsl_flash_attn_batch_func(
             return_lse=return_lse,
         )
 
-    # BSHD routes to the m32x8 kernel. D_v=128. D_qk 128/192 are
-    # the DEFAULT; D_qk==256 needs AITER_ENABLE_EXPERIMENTAL=1 (else CK).
+    # Same hdim policy as the THD router above.
     qk_hdim = q.shape[-1]
+    _v_hdim = v.shape[-1]
+    _use_fdsl_wave8_fmha = qk_hdim in SUPPORTED_QK_HDIM and _v_hdim in SUPPORTED_V_HDIM
     # Head count (BSHD [B,S,H,D]) and sink must satisfy the kernel's asserts, else validate
     # up front so an unsupported request returns None instead of tripping a kernel assert.
     _nq, _nkv = q.shape[-2], k.shape[-2]
@@ -509,14 +518,14 @@ def flydsl_flash_attn_batch_func(
     supported = (
         get_gfx() == "gfx1250"
         and q.dim() == 4
-        and (qk_hdim in (128, 192) or (qk_hdim == 256 and is_experimental_enabled()))
-        and v.shape[-1] == 128
+        and _use_fdsl_wave8_fmha
         and k.shape[-1] == qk_hdim
         and q.dtype in (torch.bfloat16, torch.float16)
         and k.dtype == q.dtype
         and v.dtype == q.dtype
         and _nkv > 0
         and _nq % _nkv == 0
+        and supports_gqa_ratio(_nq // max(_nkv, 1))
         and _sink_ok
         and dropout_p == 0.0
         and bias is None
@@ -529,6 +538,8 @@ def flydsl_flash_attn_batch_func(
     if not supported:
         return None
 
+    _check_out(out, q, _v_hdim)
+
     return flash_attn_batch_m32x8(
         q,
         k,
@@ -540,3 +551,52 @@ def flydsl_flash_attn_batch_func(
         return_lse=return_lse,
         sink=sink,
     )
+
+
+def flydsl_flash_attn_varlen_bwd(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+):
+    """FlyDSL MHA backward, varlen THD layout.
+
+    Returns ``(dq, dk, dv, softmax_d)`` to match ``mha_varlen_bwd`` and
+    ``fmha_v3_varlen_bwd``.  The gradients are the same tensors that were passed
+    in -- the kernel fills them in place -- and ``softmax_d`` is the ``[H, T]``
+    fp32 ``rowsum(dO*O)`` those two also return.
+
+    PRECONDITION: the caller has established this configuration is supported --
+    causal varlen THD self-attention, d_qk=192 / d_v=128, bf16, no GQA,
+    contiguous, ``[H, T]`` fp32 LSE, no dropout / sliding window / alibi / sink /
+    padded cu_seqlens, on gfx942.  The authoritative gate is
+    ``can_impl_fmha_bwd_flydsl`` inside ``_flash_attn_varlen_backward`` in
+    ``aiter/ops/mha.py``; the screened feature arguments are absent from this
+    signature precisely because that gate has already established they are unset,
+    leaving no configuration for this function to branch on.
+    """
+    dq, dk, dv, softmax_d = flash_attn_varlen_bwd_d192_gfx942(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        cu_seqlens,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        dq=dq,
+        dk=dk,
+        dv=dv,
+    )
+    return dq, dk, dv, softmax_d

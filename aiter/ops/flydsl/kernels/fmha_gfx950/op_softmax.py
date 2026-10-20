@@ -6,9 +6,8 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import arith, range_constexpr, rocdl
+from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
@@ -169,7 +168,7 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
     def rescale_from_tile_max(self, m_row, m_tile_max):
         row_max = fx.maxnumf(m_row, m_tile_max)
         diff_scaled = (m_row - row_max) * self.c_logit_scale
-        rescale = rocdl.exp2(T.f32, as_mlir_value(diff_scaled))
+        rescale = fx.Float32(diff_scaled).exp2(fastmath="afn").ir_value()
         return row_max, rescale
 
     def apply_l_rescale(self, l_row, rescale):
@@ -193,12 +192,8 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
             m_diff_scaled = m_diff * self.c_logit_scale
             below = fx.Float32(m_diff_scaled) <= self.c_rescale_thr_f
             ballot = rocdl.ballot(T.i64, as_mlir_value(below))
-            all_below = arith.cmpi(
-                arith.CmpIPredicate.eq, as_mlir_value(ballot), _read_exec_i64()
-            )
-            all_below = llvm.intr_expect(
-                all_below, arith.constant(1, type=ir.IntegerType.get_signless(1))
-            )
+            all_below = (fx.Int64(ballot) == fx.Int64(_read_exec_i64())).ir_value()
+            all_below = llvm.intr_expect(all_below, fx.Boolean(True).ir_value())
 
             o_out = [
                 as_mlir_value(v_o[dc]) for dc in range_constexpr(self.traits.D_CHUNKS)

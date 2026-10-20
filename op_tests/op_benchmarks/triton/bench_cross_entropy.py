@@ -7,14 +7,16 @@ Single-GPU (dist_group=None) path. The forward provider exercises the
 backward provider exercises ``_ce_grad_scale_kernel``.
 """
 
-import argparse
-
 import torch
 import triton
 
 from aiter.ops.triton.cross_entropy import (
     cross_entropy_backward,
     cross_entropy_forward,
+)
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
@@ -78,18 +80,13 @@ def benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(prog="Benchmark cross-entropy", allow_abbrev=False)
+    parser = get_parser(kernel_name="cross-entropy")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp32"])
     parser.add_argument(
-        "-metric",
-        nargs="?",
-        const="time",
-        choices=["time", "bandwidth"],
-        default="time",
-        help="Metric for the kernel benchmark.",
-    )
-    parser.add_argument(
         "-o", action="store_true", default=False, help="Write results to CSV"
+    )
+    override_parser_action(
+        parser, action="--metric", choices=["time", "bandwidth"], default="time"
     )
     return parser.parse_args()
 

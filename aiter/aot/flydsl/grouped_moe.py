@@ -22,6 +22,7 @@ from aiter.aot.flydsl.common import (
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter_worker_limits import adopt_legacy_max_jobs
 
 DEFAULT_CSVS = [AITER_CONFIGS.AITER_CONFIG_GROUPED_FMOE_FILE]
 _WARP_TILE_N = 64
@@ -214,6 +215,16 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
                 # would not fail loudly -- compile_one_config swallows the
                 # TypeError and the routeks kernels just stop being precompiled.
                 ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                ptr_arg(torch.empty(0, dtype=bf16, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                0,
+                1,
+                1,
+                1,
+                1,
                 grid,
                 stream=0,
             )
@@ -449,4 +460,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    adopt_legacy_max_jobs()
     main(sys.argv[1:])

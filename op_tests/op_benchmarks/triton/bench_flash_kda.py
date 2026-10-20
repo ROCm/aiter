@@ -25,7 +25,6 @@ python bench_flash_kda.py --seg-sweep
 python bench_flash_kda.py -o
 """
 
-import argparse
 import math
 import os
 import sys
@@ -42,27 +41,28 @@ if _REPO_ROOT not in sys.path:
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.flash_kda import (
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.flash_kda import (
     FLASH_KDA_CHUNK,
     flash_kda_fwd,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
 # (B, T, H, K, V) – H=12 is the Kimi K3 shape this path was built for; the rest
 # bracket it so a regression in the segmentation heuristic shows up as well as a
 # kernel one. K and V are fixed at 128, the only width FlashKDA supports.
 DEFAULT_SHAPES = [
-    (1, 16384, 8, 128, 128),
+    (1, 256, 12, 128, 128),
+    (1, 512, 12, 128, 128),
+    (1, 1664, 12, 128, 128),
+    (1, 2048, 12, 128, 128),
+    (1, 8192, 12, 128, 128),
     (1, 16384, 12, 128, 128),
     (1, 16384, 64, 128, 128),
     (1, 16384, 96, 128, 128),
-    (1, 8192, 12, 128, 128),
-    (1, 8192, 16, 128, 128),
     (1, 8192, 32, 128, 128),
     (1, 8192, 64, 128, 128),
-    (1, 32768, 128, 128, 128),
-    (1, 65536, 12, 128, 128),
-    (2, 16384, 32, 128, 128),
+    (2, 2664, 12, 128, 128),
     (4, 4096, 16, 128, 128),
     (8, 2048, 16, 128, 128),
 ]
@@ -192,10 +192,7 @@ def run_benchmark(args):
 
 
 def parse_args(args=None):
-    parser = argparse.ArgumentParser(
-        prog="Benchmark FlashKDA forward",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    parser = get_parser(kernel_name="FlashKDA forward")
     parser.add_argument(
         "--shape",
         type=int,

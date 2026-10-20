@@ -4,21 +4,21 @@
 
 """Per-block forward pass: shared primitives, traits, and the kernel context."""
 
-import math as host_math
 from dataclasses import dataclass
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import fly, llvm, vector
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
+from flydsl._mlir.dialects import fly, llvm
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
-_LOG2E = host_math.log2(host_math.e)
+from ..kernels_common import LOG2E as _LOG2E
+
 _LN2 = 1.0 / _LOG2E
 
 # log2 of e4m3's largest finite value, 448.
@@ -50,7 +50,7 @@ def _read_exec_i64():
 
 def _ds_read_tr8_b64_imm(result_type, addr_i32, imm_offset=0):
     imm = int(imm_offset)
-    raw_type = ir.VectorType.get([2], ir.IntegerType.get_signless(32))
+    raw_type = T.vec(2, T.i32)
     raw = llvm.inline_asm(
         raw_type,
         [as_mlir_value(addr_i32)],
@@ -58,7 +58,11 @@ def _ds_read_tr8_b64_imm(result_type, addr_i32, imm_offset=0):
         "=v,v,~{memory}",
         has_side_effects=True,
     )
-    return vector.BitCastOp(result_type, raw).result
+    return (
+        Vec(raw)
+        .bitcast(fx.Numeric.from_ir_type(ir.VectorType(result_type).element_type))
+        .ir_value()
+    )
 
 
 def _bitcast_i32(value):
@@ -198,13 +202,13 @@ def _exp2_score_slice(v_s, start):
         s_lo = [Vec(v_s[0])[r] for r in range_constexpr(16)]
         lo_partial = []
         for r in range_constexpr(16):
-            lo_partial.append(rocdl.exp2(T.f32, as_mlir_value(s_lo[r])))
+            lo_partial.append(fx.Float32(s_lo[r]).exp2(fastmath="afn"))
         return Vec.from_elements(lo_partial, fx.Float32).ir_value(), v_s[1]
 
     lo_partial = [Vec(v_s[0])[r] for r in range_constexpr(16)]
     hi_full = []
     for r in range_constexpr(16):
-        hi_full.append(rocdl.exp2(T.f32, as_mlir_value(Vec(v_s[1])[r])))
+        hi_full.append(fx.Float32(Vec(v_s[1])[r]).exp2(fastmath="afn"))
     return lo_partial, hi_full
 
 
@@ -646,9 +650,9 @@ def _init_dualwave_thread_mapping(ctx):
         (_tid_i32 // fx.Int32(traits.WARP_SIZE)).ir_value(),
     )
     # Two stagger groups, whatever the wave count.
-    ctx.stagger_i32 = arith.divsi(
-        _wave_id_uni_i32, as_mlir_value(fx.Int32(traits.NUM_WAVES // 2))
-    )
+    ctx.stagger_i32 = (
+        fx.Int32(_wave_id_uni_i32) // fx.Int32(traits.NUM_WAVES // 2)
+    ).ir_value()
     ctx.wave_id_uni = fx.Index(_wave_id_uni_i32)
 
     ctx.wave_q_offset = ctx.wave_id * traits.ROWS_PER_WAVE
@@ -694,7 +698,7 @@ class DualwaveFp8KernelContext:
         seq_len_kv=None,
         stride_q_n=None,
         stride_kv_n=None,
-        head_dim_runtime=None,
+        softmax_scale=None,
         lse_stride_h=None,
     ):
         if isinstance(traits_or_ctx, DualwaveFp8KernelContext):
@@ -718,7 +722,7 @@ class DualwaveFp8KernelContext:
         self.seq_len_kv = seq_len_kv
         self.stride_q_n = stride_q_n
         self.stride_kv_n = stride_kv_n
-        self.head_dim_runtime = head_dim_runtime
+        self.softmax_scale = softmax_scale
         self.lse_stride_h = lse_stride_h
 
     def init_types_and_constants(self):
@@ -767,11 +771,8 @@ class DualwaveFp8KernelContext:
         lds = fx.SharedAllocator().allocate(shared_storage).peek()
         self.lds = lds
         self.lds_kv_base_idx = fx.Index(fx.ptrtoint(lds.kv.ptr))
-        self.lds_kv_base_ptr = lds.kv.ptr.llvm_ptr
         self.lds_vt_base_idx = fx.Index(fx.ptrtoint(lds.vt.ptr))
-        self.lds_vt_base_ptr = lds.vt.ptr.llvm_ptr
         self.lds_q_base_idx = fx.Index(fx.ptrtoint(lds.q.ptr))
-        self.lds_q_base_ptr = lds.q.ptr.llvm_ptr
 
     def init_thread_mapping(self):
         _init_dualwave_thread_mapping(self)
@@ -882,9 +883,8 @@ class DualwaveFp8KernelContext:
             )
             return fx.Float32(Vec(_v, (1,), fx.Float32)[0])
 
-        head_dim_f32 = fx.Float32(self.head_dim_runtime)
         c_log2e_f = fx.Float32(_LOG2E)
-        c_sm_scale_log2e = fx.rsqrt(head_dim_f32, fastmath=self.fm_fast) * c_log2e_f
+        c_sm_scale_log2e = self.softmax_scale * c_log2e_f
         _qd = _load_scale_scalar(self.QDescale)
         _kd = _load_scale_scalar(self.KDescale)
         self.vd_fp8 = _load_scale_scalar(self.VDescale)
@@ -908,15 +908,15 @@ class DualwaveFp8KernelContext:
             causal_num_tiles = (
                 fx.Index(causal_end_i32) + kv_tile_size - 1
             ) // kv_tile_size
-            max_num_tiles = fx.Index(
-                (causal_num_tiles < num_kv_tiles).select(causal_num_tiles, num_kv_tiles)
+            max_num_tiles = (causal_num_tiles < num_kv_tiles).select(
+                causal_num_tiles, num_kv_tiles
             )
         else:
             causal_end_raw_i32 = None
             max_num_tiles = num_kv_tiles
         # Pipeline needs an EVEN tile count >= 4; extra tiles read 0 (num_records) and are masked.
         max_num_tiles = ((max_num_tiles + 1) // 2) * 2
-        max_num_tiles = fx.Index((max_num_tiles < 4).select(4, max_num_tiles))
+        max_num_tiles = (max_num_tiles < 4).select(4, max_num_tiles)
         self.max_num_tiles = max_num_tiles
         if const_expr(traits.SPLITK):
             chunk = (
@@ -927,14 +927,14 @@ class DualwaveFp8KernelContext:
                 // 2
                 * 2
             )
-            chunk = fx.Index((chunk < 6).select(6, chunk))
+            chunk = (chunk < 6).select(6, chunk)
             split_t0 = self.split_idx * chunk
             split_t_end = split_t0 + chunk
-            split_t_end = fx.Index(
-                (split_t_end < max_num_tiles).select(split_t_end, max_num_tiles)
+            split_t_end = (split_t_end < max_num_tiles).select(
+                split_t_end, max_num_tiles
             )
-            split_t_end = fx.Index(
-                (max_num_tiles - split_t_end < 4).select(max_num_tiles, split_t_end)
+            split_t_end = (max_num_tiles - split_t_end < 4).select(
+                max_num_tiles, split_t_end
             )
             self.split_nonempty = split_t0 + 4 <= max_num_tiles
         else:
@@ -949,7 +949,7 @@ class DualwaveFp8KernelContext:
             if const_expr(traits.CAUSAL and traits.CROSS_SEQLEN):
                 in_mask = causal_end_raw_i32 > fx.Int32(0)
                 active = in_mask if active is None else (active & in_mask)
-            split_t_end = fx.Index(active.select(split_t_end, split_t0))
+            split_t_end = active.select(split_t_end, split_t0)
 
         self.split_t0 = split_t0
         self.split_t_end = split_t_end
@@ -1032,12 +1032,13 @@ class DualwaveFp8KernelContext:
         )
 
     def read_i32x8_lds(self, base_ptr, byte_row):
+        vec_ty = Vec.make_type(4, fx.Int32)
+        ptr_ty = fx.PointerType.get(
+            fx.Int8.ir_type, fx.AddressSpace.Shared, alignment=16
+        )
+        base_ptr = fx.recast_iter(ptr_ty, base_ptr)
         halves = []
         for h in range_constexpr(2):
-            p = buffer_ops.get_element_ptr(
-                base_ptr, byte_offset=fx.Int32(byte_row + h * 16), elem_type=T.i8
-            )
-            halves.append(
-                Vec(llvm.LoadOp(Vec.make_type(4, fx.Int32), p, alignment=16).result)
-            )
+            p = fx.add_offset(base_ptr, fx.Int32(byte_row + h * 16))
+            halves.append(fx.ptr_load(p, result_type=vec_ty))
         return halves[0].shuffle(halves[1], [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()

@@ -8,6 +8,8 @@ import random
 import torch
 import triton
 
+from aiter.benchmark_data_init import DATA_DISTS, fill, make_generator
+from aiter.benchmark_reporting import print_json_table
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.attention.pa_mqa_logits import (
     deepgemm_fp8_paged_mqa_logits,
@@ -16,6 +18,7 @@ from aiter.ops.triton.attention.pa_mqa_logits import (
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_common import run_perftest
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 
 def cdiv(x: int, y: int) -> int:
@@ -189,22 +192,28 @@ def create_paged_mqa_logits_configs(args: argparse.Namespace):
     return configs
 
 
-def run_benchmark(args: argparse.Namespace):
+def run_benchmark(args: argparse.Namespace, data_init: str = "norm"):
     ChunkK = 128
     WavePerEU = 5
+    rows = []
 
     @triton.testing.perf_report(create_paged_mqa_logits_configs(args))
     def test_deepgemm_fp8_paged_mqa_logits(
         batch_size, next_n, heads, index_dim, avg_kv_length, kv_storage_kind
     ):
-        torch.manual_seed(0)
-        random.seed(0)
+        torch.manual_seed(args.seed)
+        random.seed(args.seed)
+        gen = make_generator(args.seed)
 
         max_model_len = 2 * avg_kv_length
-        blocksize = args.blocksize if args.kv_preshuffle else 1
+        # Unset means the page size each layout has always run here: one token
+        # per page plain, one MFMA tile per page preshuffled.
+        blocksize = args.blocksize or (16 if args.kv_preshuffle else 1)
         num_blocks = (max_model_len + blocksize - 1) // blocksize
 
-        assert blocksize == 1 or args.kv_preshuffle and blocksize % 16 == 0
+        assert (
+            not args.kv_preshuffle or blocksize % 16 == 0 or blocksize == 8
+        ), f"Preshuffle needs a page that is a multiple of the 16-token MFMA tile, or 8; got {blocksize}."
 
         var_ratio = 0.5
         # varctx gluon kernel only exists on the preshuffle path; passing a
@@ -225,19 +234,22 @@ def run_benchmark(args: argparse.Namespace):
         )
         prefix_sum_context_lens[1:] = torch.cumsum(context_lens, dim=0)
 
-        q = torch.randn(
-            (batch_size, next_n, heads, index_dim),
-            device="cuda",
+        q = fill(
+            (batch_size * next_n * heads, index_dim),
+            data_init,
+            gen,
             dtype=torch.bfloat16,
-        )
-        kv_cache = torch.randn(
-            (num_blocks, blocksize, 1, index_dim),
-            device="cuda",
+        ).view(batch_size, next_n, heads, index_dim)
+        kv_cache = fill(
+            (num_blocks * blocksize, index_dim),
+            data_init,
+            gen,
             dtype=torch.bfloat16,
-        )
-        weights = torch.randn(
+        ).view(num_blocks, blocksize, 1, index_dim)
+        weights = fill(
             (batch_size * next_n, heads),
-            device="cuda",
+            data_init,
+            gen,
             dtype=torch.float32,
         )
 
@@ -273,7 +285,7 @@ def run_benchmark(args: argparse.Namespace):
         for i in range(batch_size):
             ctx_len = int(context_lens[i].item())
             kv_indices[prefix_sum_context_lens[i] : prefix_sum_context_lens[i + 1]] = (
-                torch.randperm(max_model_len, device="cuda")[:ctx_len]
+                torch.randperm(max_model_len, device="cuda", generator=gen)[:ctx_len]
             )
 
         if kv_storage_kind == "non_ragged_k":
@@ -298,16 +310,20 @@ def run_benchmark(args: argparse.Namespace):
         )
 
         if kv_storage_kind == "non_ragged_k":
-            Preshuffle = blocksize % 16 == 0
+            Preshuffle = args.kv_preshuffle
 
             if Preshuffle:
                 kv_num_block, kv_block_Size, _, kv_index_dim = kv_cache_fp8.size()
 
                 split_kv_cache = kv_cache_fp8.view(-1, blocksize * kv_index_dim)
+                # A page shorter than the 16-token MFMA tile is shuffled in
+                # groups of its own length; the kernel then assembles one tile
+                # from two pages.
                 split_kv_cache_data = shuffle_weight(
                     split_kv_cache[..., : kv_block_Size * index_dim]
                     .contiguous()
-                    .view([kv_num_block, kv_block_Size, index_dim])
+                    .view([kv_num_block, kv_block_Size, index_dim]),
+                    layout=(min(blocksize, 16), 16),
                 )
                 split_kv_cache[..., : kv_block_Size * index_dim] = (
                     split_kv_cache_data.view(kv_num_block, kv_block_Size * index_dim)
@@ -369,6 +385,10 @@ def run_benchmark(args: argparse.Namespace):
         def calc_diff(x: torch.Tensor, y: torch.Tensor):
             x, y = x.double(), y.double()
             denominator = (x * x + y * y).sum()
+            # zero-init makes both logits tensors exactly zero. Treat that
+            # exact match as zero error instead of reporting 0/0 -> NaN.
+            if denominator == 0:
+                return torch.zeros_like(denominator)
             sim = 2 * (x * y).sum() / denominator
             return 1 - sim
 
@@ -400,6 +420,11 @@ def run_benchmark(args: argparse.Namespace):
             # Inner quotes must differ from the outer ones: reusing them is PEP 701
             # (Python 3.12+) and leaves this module unparseable on 3.10/3.11.
             aot_name = f"paged_mqa_logits{'_preshuffle' if args.kv_preshuffle else ''}{'_varctx' if EnableVarCtxOpt else ''}_{heads}x{ChunkK}x{index_dim}_B{blocksize}P{padded_str}W{WavePerEU}"
+            if (
+                not args.kv_preshuffle
+                and kv_cache_fp8.shape[0] * kv_cache_fp8.stride(0) >= 2**31
+            ):
+                aot_name += "_kv64"
 
             src = os.path.join(triton_cache_dir, cache_key)
             dst = os.path.join(aot_kernel_dir, aot_name)
@@ -410,13 +435,31 @@ def run_benchmark(args: argparse.Namespace):
 
             os.system("zip -r paged_mqa_logits_aot_kernel paged_mqa_logits")
 
+        rows.append(
+            {
+                "data_init": data_init,
+                "seed": args.seed,
+                "batch": batch_size,
+                "next_n": next_n,
+                "heads": heads,
+                "index_dim": index_dim,
+                "avg_kv_len": avg_kv_length,
+                "kv_storage": kv_storage_kind,
+                "blocksize": blocksize,
+                "kv_tokens": int(context_lens.sum().item()),
+                "latency_us": elapsed_us,
+                "TFLOPS": flops,
+                "logits_diff": float(logits_diff),
+            }
+        )
         return flops
 
-    test_deepgemm_fp8_paged_mqa_logits.run(print_data=True)
+    test_deepgemm_fp8_paged_mqa_logits.run(print_data=False)
+    print_json_table("paged_mqa_logits summary", rows)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = get_parser(kernel_name="DeepGEMM Attention")
     parser.add_argument("-B", "--batch", type=int, default=128, help="Batch size.")
     parser.add_argument(
         "-hq",
@@ -466,14 +509,30 @@ if __name__ == "__main__":
     parser.add_argument(
         "--blocksize",
         type=int,
-        default=16,
-        help="KVCache block size, only used when kv_preshuffle is enabled, must be multiple of 16",
+        default=None,
+        help="KVCache page size in tokens. Preshuffle needs a multiple of the "
+        "16-token MFMA tile, or 8. Default: 16 with --kv_preshuffle, 1 without.",
     )
     parser.add_argument(
         "--no-varctx",
         action="store_true",
         help="Disable varctx schedule (only applies with --kv_preshuffle)",
     )
+    parser.add_argument(
+        "--data-init",
+        nargs="+",
+        choices=list(DATA_DISTS),
+        default=["norm"],
+        help="DATA initialization distribution(s) for Q, KV and weights",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="RNG seed for input data and generated index tables (default: 0)",
+    )
 
     args = parser.parse_args()
-    run_benchmark(args)
+    for data_init in args.data_init:
+        print(f"data_init={data_init} seed={args.seed}")
+        run_benchmark(args, data_init=data_init)

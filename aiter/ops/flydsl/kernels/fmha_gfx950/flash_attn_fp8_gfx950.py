@@ -129,7 +129,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         seq_len_kv: fx.Int32,
         stride_q_n: fx.Int32,
         stride_kv_n: fx.Int32,
-        head_dim_runtime: fx.Int32,
+        softmax_scale: fx.Float32,
         lse_stride_h: fx.Int32,
     ):
         ctx = DualwaveFp8KernelContext(
@@ -149,7 +149,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
             seq_len_kv,
             stride_q_n,
             stride_kv_n,
-            head_dim_runtime,
+            softmax_scale,
             lse_stride_h,
         )
         ctx.init_types_and_constants()
@@ -176,6 +176,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         BN = traits.BLOCK_N
         D_CHUNKS = traits.D_CHUNKS
         NPF = const_expr(traits.NUM_PREFETCH_K)
+        NPF_I = const_expr(fx.Index(NPF))
         t0 = ctx.split_t0
         t_end = ctx.split_t_end
 
@@ -186,12 +187,6 @@ def build_flash_attn_dualwave_swp_fp8_module(
         DMA_PER_ITER = const_expr(dualwave_fp8_dma_per_iter(traits))
 
         def _phase_bar():
-            _waitcnt_vm_n(DMA_PER_ITER)
-            rocdl.sched_barrier(0)
-            rocdl.s_barrier()
-            rocdl.sched_barrier(0)
-
-        def _iter_end_bar():
             _waitcnt_vm_n(DMA_PER_ITER)
             rocdl.sched_barrier(0)
             rocdl.s_barrier()
@@ -242,7 +237,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         else:
             q_row, q_wide = None, None
 
-        kv_gmem_to_lds.load_k(t0 * BN, t0 % fx.Index(NPF))
+        kv_gmem_to_lds.load_k(t0 * BN, t0 % NPF_I)
         if const_expr(traits.QLDS):
             q_loader.stage_q_to_lds()
             rocdl.s_waitcnt(0)
@@ -250,13 +245,13 @@ def build_flash_attn_dualwave_swp_fp8_module(
             rocdl.s_barrier()
             q_row, q_wide = _load_q_regs()
 
-        kv_gmem_to_lds.load_k((t0 + 1) * BN, (t0 + 1) % fx.Index(NPF))
-        kv_gmem_to_lds.load_v(t0 * BN, t0 % fx.Index(NPF))
-        kv_gmem_to_lds.load_v((t0 + 1) * BN, (t0 + 1) % fx.Index(NPF))
-        kv_gmem_to_lds.load_k((t0 + 2) * BN, (t0 + 2) % fx.Index(NPF))
-        kv_gmem_to_lds.load_k((t0 + 3) * BN, (t0 + 3) % fx.Index(NPF))
-        kv_gmem_to_lds.load_v((t0 + 2) * BN, (t0 + 2) % fx.Index(NPF))
-        kv_gmem_to_lds.load_v((t0 + 3) * BN, (t0 + 3) % fx.Index(NPF))
+        kv_gmem_to_lds.load_k((t0 + 1) * BN, (t0 + 1) % NPF_I)
+        kv_gmem_to_lds.load_v(t0 * BN, t0 % NPF_I)
+        kv_gmem_to_lds.load_v((t0 + 1) * BN, (t0 + 1) % NPF_I)
+        kv_gmem_to_lds.load_k((t0 + 2) * BN, (t0 + 2) % NPF_I)
+        kv_gmem_to_lds.load_k((t0 + 3) * BN, (t0 + 3) % NPF_I)
+        kv_gmem_to_lds.load_v((t0 + 2) * BN, (t0 + 2) % NPF_I)
+        kv_gmem_to_lds.load_v((t0 + 3) * BN, (t0 + 3) % NPF_I)
         if const_expr(traits.QLDS):
             rocdl.s_waitcnt(0)
         else:
@@ -281,12 +276,10 @@ def build_flash_attn_dualwave_swp_fp8_module(
         l_row = ctx.c_zero_f
         v_o = [ctx.c_zero_v16f32 for _ in range_constexpr(D_CHUNKS)]
 
-        NPF_I = const_expr(fx.Index(NPF))
-
         def _ring_wrap(x):
             return (x >= NPF_I).select(x - NPF_I, x)
 
-        init_args = [m_row, l_row] + v_o + [t0 % fx.Index(NPF)]
+        init_args = [m_row, l_row] + v_o + [t0 % NPF_I]
         loop_results = init_args
         for j, loop_args in range(fx.Index(t0), t_end, 2, init=init_args):
             m_row = loop_args[0]
@@ -331,7 +324,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
 
             _pp_prio(1)
             v_o = _pv_part(v_p_b, v_v_b, v_o)
-            _iter_end_bar()
+            _phase_bar()
             loop_results = yield [m_row, l_row] + v_o + [nn_a_buf]
         m_row = loop_results[0]
         l_row = loop_results[1]
@@ -411,7 +404,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         seq_len_kv: fx.Int32,
         stride_q_n: fx.Int32,
         stride_kv_n: fx.Int32,
-        head_dim_runtime: fx.Int32,
+        softmax_scale: fx.Float32,
         lse_stride_h: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008  framework idiom
     ):
@@ -452,7 +445,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
             seq_len_kv,
             stride_q_n,
             stride_kv_n,
-            head_dim_runtime,
+            softmax_scale,
             lse_stride_h,
             value_attrs={
                 "rocdl.waves_per_eu": 1,
@@ -503,8 +496,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
         seq_len,
         stride_kv_n=None,
         stride_q_n=None,
-        head_dim_runtime=None,
         *,
+        softmax_scale=None,
         seq_len_kv=None,
         workspace=None,
         cu_seqlens_q=None,
@@ -521,8 +514,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
             stride_kv_n = DEFAULT_STRIDE_KV_N
         if stride_q_n is None:
             stride_q_n = DEFAULT_STRIDE_Q_N
-        if head_dim_runtime is None:
-            head_dim_runtime = HEAD_DIM
+        if softmax_scale is None:
+            softmax_scale = HEAD_DIM**-0.5
         # seq_len_kv defaults to seq_len (self-attention / equal Q,KV lengths).
         if seq_len_kv is None:
             seq_len_kv = seq_len
@@ -562,7 +555,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
             seq_len_kv,
             stride_q_n,
             stride_kv_n,
-            head_dim_runtime,
+            softmax_scale,
             lse_stride_h,
             fx.Stream(stream),
         )
