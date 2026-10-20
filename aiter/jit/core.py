@@ -508,9 +508,13 @@ class AITER_CONFIG:
                 + f"Duplicate rows:\n{dup_rows.to_string(index=False)}"
             )
 
-        # Auto-dedup: globally determine best row (lowest 'us') per shape
+        # Auto-dedup: globally determine best row (lowest 'us') per shape. One
+        # unparseable us cell (e.g. nan) leaves the column textual in
+        # `comparable`, where "10.5" sorts before "9.5", so coerce it alone.
+        us = pd.to_numeric(merge_df["us"], errors="coerce")
         best_row_index = set(
-            comparable.sort_values("us", kind="stable")
+            comparable.assign(us=us)
+            .sort_values("us", kind="stable")
             .drop_duplicates(subset=dedup_keys, keep="first")
             .index
         )
