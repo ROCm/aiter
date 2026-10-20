@@ -962,11 +962,16 @@ def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y):
 
             # View column-major scale bytes as [M, K/128] without copying.
             opus_scale = (
-                x_scale if x_scale.stride() == (1, m)
-                else x_scale.view(k // 128, m).T
+                x_scale if x_scale.stride() == (1, m) else x_scale.view(k // 128, m).T
             )
             return _launch_a8w8_blockscale_bpreshuffle_gemm(
-                XQ, WQ, opus_scale, w_scale, Y, kid=kid, instance=instance,
+                XQ,
+                WQ,
+                opus_scale,
+                w_scale,
+                Y,
+                kid=kid,
+                instance=instance,
             )
         # A padded-M lookup can select a kernel that does not support the original M.
         config = None

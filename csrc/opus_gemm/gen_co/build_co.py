@@ -70,20 +70,20 @@ _REPO_ROOT = os.path.dirname(_CSRC_DIR)
 sys.path.insert(0, _OPUS_GEMM_DIR)
 sys.path.insert(0, _REPO_ROOT)
 
+from codegen.gen_instances_gfx950 import co_traits_args as co_traits_args_gfx950
 from codegen.gen_instances_gfx1250 import (
     KARGS_NAME_MAP,
     KERNEL_FUNC_MAP,
     TRAITS_NAME_MAP,
     co_traits_args,
 )
-from codegen.gen_instances_gfx950 import co_traits_args as co_traits_args_gfx950
 
 # The _declared_ table, not the filtered one: opus_gemm_common drops entries
 # whose .co is not on disk (so nothing downstream can register an unlaunchable
 # kid), and this script exists to create exactly those files.
 from opus_gemm_common import (
-    gfx1250_4wave_co_kernels_declared,
     gfx950_co_kernels_declared,
+    gfx1250_4wave_co_kernels_declared,
 )
 
 from aiter_worker_limits import (
@@ -252,14 +252,25 @@ def _check_gfx950_pin(entry, path, llvm_bin):
     if names != [entry["symbol"]]:
         raise ValueError(f"expected kernel {entry['symbol']}, found {names}")
     fields = {}
-    for key in ("vgpr_count", "agpr_count", "vgpr_spill_count", "sgpr_spill_count",
-                "private_segment_fixed_size"):
+    for key in (
+        "vgpr_count",
+        "agpr_count",
+        "vgpr_spill_count",
+        "sgpr_spill_count",
+        "private_segment_fixed_size",
+    ):
         match = re.search(rf"^\s*(?:-\s*)?\.{key}:\s*(\d+)\s*$", metadata, re.MULTILINE)
         if match is None:
             raise ValueError(f"missing .{key}")
         fields[key] = int(match[1])
-    if any(fields[key] for key in ("vgpr_spill_count", "sgpr_spill_count",
-                                   "private_segment_fixed_size")):
+    if any(
+        fields[key]
+        for key in (
+            "vgpr_spill_count",
+            "sgpr_spill_count",
+            "private_segment_fixed_size",
+        )
+    ):
         raise ValueError(f"register spill/scratch: {fields}")
     mask = entry["pin_mask"]
     if not mask:
@@ -272,10 +283,15 @@ def _check_gfx950_pin(entry, path, llvm_bin):
     b_regs = bn // (wn * 16) * 8
     for bit, first, size in ((1, 0, a_regs), (2, 64, b_regs)):
         if mask & bit and not set(range(first, first + size, 4)).issubset(reads):
-            raise ValueError(f"pin mask {mask}: LDS reads did not reach AGPR range {first}:{first + size}")
+            raise ValueError(
+                f"pin mask {mask}: LDS reads did not reach AGPR range {first}:{first + size}"
+            )
     if mask & 4:
-        mmas = [line.split("//", 1)[0].strip().split(None, 1)[1].split(", ")
-                for line in asm.splitlines() if "v_mfma_scale_" in line]
+        mmas = [
+            line.split("//", 1)[0].strip().split(None, 1)[1].split(", ")
+            for line in asm.splitlines()
+            if "v_mfma_scale_" in line
+        ]
         seen = set()
         if not mmas:
             raise ValueError("pin C: no MFMA instructions")
@@ -300,23 +316,46 @@ def build_one_gfx950(entry, args, llvm_bin, workdir):
             pass
     stub_path = os.path.join(workdir, f"{symbol}.hip")
     with open(stub_path, "w") as f:
-        f.write(_GFX950_STUB_TEMPLATE.format(
-            traits_header=entry.get("traits_header",
-                entry["pipeline_header"].replace("_pipeline_", "_traits_", 1)),
-            pipeline_header=entry["pipeline_header"],
-            traits_name=entry["traits"]["name"],
-            traits_args=co_traits_args_gfx950(entry), body_func=entry["body_func"],
-            body_args=", ".join(map(str, entry["body_args"])),
-            symbol=symbol, lb_threads=entry["launch_bounds"][0],
-            lb_waves=entry["launch_bounds"][1],
-        ))
+        f.write(
+            _GFX950_STUB_TEMPLATE.format(
+                traits_header=entry.get(
+                    "traits_header",
+                    entry["pipeline_header"].replace("_pipeline_", "_traits_", 1),
+                ),
+                pipeline_header=entry["pipeline_header"],
+                traits_name=entry["traits"]["name"],
+                traits_args=co_traits_args_gfx950(entry),
+                body_func=entry["body_func"],
+                body_args=", ".join(map(str, entry["body_args"])),
+                symbol=symbol,
+                lb_threads=entry["launch_bounds"][0],
+                lb_waves=entry["launch_bounds"][1],
+            )
+        )
     staged = os.path.join(workdir, f"{symbol}.co")
-    command = [*shlex.split(args.hipcc), "-x", "hip", "--offload-arch=gfx950",
-              "-std=c++20", "-O3", "-D__HIPCC_RTC__", "-DOPUS_ENABLE_RUNTIME_QUERY=0",
-              f"-I{_CSRC_DIR}/include", f"-I{_OPUS_GEMM_DIR}/include",
-              *entry.get("device_flags", []), *args.device_flag,
-              *(["-Werror=unknown-attributes", "-Werror=ignored-attributes"] if optional else []),
-              "--genco", "-o", staged, stub_path]
+    command = [
+        *shlex.split(args.hipcc),
+        "-x",
+        "hip",
+        "--offload-arch=gfx950",
+        "-std=c++20",
+        "-O3",
+        "-D__HIPCC_RTC__",
+        "-DOPUS_ENABLE_RUNTIME_QUERY=0",
+        f"-I{_CSRC_DIR}/include",
+        f"-I{_OPUS_GEMM_DIR}/include",
+        *entry.get("device_flags", []),
+        *args.device_flag,
+        *(
+            ["-Werror=unknown-attributes", "-Werror=ignored-attributes"]
+            if optional
+            else []
+        ),
+        "--genco",
+        "-o",
+        staged,
+        stub_path,
+    ]
     env = dict(os.environ)
     if llvm_bin:
         env["HIP_CLANG_PATH"] = llvm_bin
@@ -330,8 +369,14 @@ def build_one_gfx950(entry, args, llvm_bin, workdir):
         if optional:
             if os.path.isfile(output):
                 os.remove(output)
-            return {"kid": entry["kid"], "status": "rejected", "reason": "compilation failed"}
-        raise SystemExit(f"build_co: compilation failed for gfx950 kid {entry['kid']}") from error
+            return {
+                "kid": entry["kid"],
+                "status": "rejected",
+                "reason": "compilation failed",
+            }
+        raise SystemExit(
+            f"build_co: compilation failed for gfx950 kid {entry['kid']}"
+        ) from error
     _unbundle_if_needed(staged, llvm_bin, "gfx950")
     try:
         resources = _check_gfx950_pin(entry, staged, llvm_bin) if optional else {}
@@ -560,10 +605,17 @@ def main():
         "Defaults to $OPUS_CO_LLVM_BIN, then $PIN.",
     )
     p.add_argument("--arch", choices=("gfx1250", "gfx950"), default="gfx1250")
-    p.add_argument("--kids", nargs="+", type=int, help="Build only these registered kernel IDs.")
-    p.add_argument("--skip-existing", action="store_true",
-                   help="gfx950: reuse existing COs; pin variants still undergo resource/ISA checks.")
-    p.add_argument("--report", help="gfx950: write this invocation's build report to this path.")
+    p.add_argument(
+        "--kids", nargs="+", type=int, help="Build only these registered kernel IDs."
+    )
+    p.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="gfx950: reuse existing COs; pin variants still undergo resource/ISA checks.",
+    )
+    p.add_argument(
+        "--report", help="gfx950: write this invocation's build report to this path."
+    )
     p.add_argument(
         "--device-flag",
         action="append",
@@ -632,8 +684,9 @@ def main():
         instances = [entry for entry in instances if entry["kid"] in args.kids]
     jobs = get_worker_count_for(len(instances), args.jobs)
 
-    workdir = tempfile.mkdtemp(prefix="opus_build_co_",
-                              dir=args.out_dir if args.arch == "gfx950" else None)
+    workdir = tempfile.mkdtemp(
+        prefix="opus_build_co_", dir=args.out_dir if args.arch == "gfx950" else None
+    )
     try:
         if jobs == 1:
             built = [build(k, args, llvm_bin, workdir) for k in instances]
@@ -657,11 +710,15 @@ def main():
             shutil.rmtree(workdir, ignore_errors=True)
 
     if args.arch == "gfx950":
-        with open(args.report or os.path.join(args.out_dir, "build_info.json"), "w") as stream:
+        with open(
+            args.report or os.path.join(args.out_dir, "build_info.json"), "w"
+        ) as stream:
             json.dump({"llvm_bin": llvm_bin, "kernels": built}, stream, indent=2)
             stream.write("\n")
         rejected = sum(row.get("status") == "rejected" for row in built)
-        print(f"[build_co] ready={len(built) - rejected} rejected={rejected} in {args.out_dir}")
+        print(
+            f"[build_co] ready={len(built) - rejected} rejected={rejected} in {args.out_dir}"
+        )
         return
 
     # Reproducibility record: which compiler and which flags produced these, so

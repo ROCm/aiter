@@ -2,9 +2,9 @@
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 """OPUS kernel registrations shared by selection and code generation."""
 
+import json
 import os
 import sys
-import json
 from dataclasses import asdict, dataclass, field
 
 _A16W16_CO_TAGS = frozenset(
@@ -217,7 +217,10 @@ class OpusGemmInstance:
     @property
     def name(self) -> str:
         if self.bpreshuffle_entry is not None:
-            return "opus_gemm_gfx950_a8w8_mxscale_gemm_bpreshuffle_" + self.bpreshuffle_entry["config_name"]
+            return (
+                "opus_gemm_gfx950_a8w8_mxscale_gemm_bpreshuffle_"
+                + self.bpreshuffle_entry["config_name"]
+            )
         if self.bpreshuffle_co is not None:
             family = self.bpreshuffle_co.get("name_family", "pin_agpr")
             return f"opus_gemm_gfx950_a8w8_mxscale_gemm_bpreshuffle_{family}_{self.bpreshuffle_co['kid']}"

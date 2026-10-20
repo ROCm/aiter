@@ -126,7 +126,12 @@ def opus_candidates(m, n, k, kids=None):
     )
 
     selected = candidate_kids_for_shape(
-        "gfx950", m, n, k, all_candidates=True, exhaustive=kids is None,
+        "gfx950",
+        m,
+        n,
+        k,
+        all_candidates=True,
+        exhaustive=kids is None,
     )
     return [
         (kid, a8w8_mxscale_gemm_bpreshuffle_kernels_list[kid])
@@ -142,8 +147,14 @@ def _opus_configuration(instance):
     )
     wave_k = instance.BLOCK_SIZE // (64 * instance.T_M * instance.T_N)
     geometry = (
-        entry["pipeline"], instance.B_M, instance.B_N, instance.B_K,
-        instance.T_M, instance.T_N, wave_k, instance.bpreshuffle_split_k,
+        entry["pipeline"],
+        instance.B_M,
+        instance.B_N,
+        instance.B_K,
+        instance.T_M,
+        instance.T_N,
+        wave_k,
+        instance.bpreshuffle_split_k,
     )
     return geometry, depth, ahead, output
 
@@ -171,7 +182,8 @@ def _opus_coarse_candidates(candidates):
                     abs(item[2] - target_depth),
                     (item[1].cachectl_a, item[1].cachectl_b) != cache,
                     item[1].WG_PER_CU != wg,
-                    item[3], item[0],
+                    item[3],
+                    item[0],
                 ),
             )
             coarse.add(selected[0])
@@ -182,15 +194,23 @@ def _opus_coarse_candidates(candidates):
 
 
 def _opus_refinement_candidates(
-    groups, measurements, already_measured, top_groups=3, *, err_ratio=0.05,
+    groups,
+    measurements,
+    already_measured,
+    top_groups=3,
+    *,
+    err_ratio=0.05,
 ):
     measured = {
-        int(kid): float(us) for kid, us, error in measurements
+        int(kid): float(us)
+        for kid, us, error in measurements
         if math.isfinite(float(us)) and float(us) > 0 and float(error) <= err_ratio
     }
     by_pipeline = defaultdict(list)
     for geometry, variants in groups.items():
-        best = min((measured[kid] for kid in variants if kid in measured), default=math.inf)
+        best = min(
+            (measured[kid] for kid in variants if kid in measured), default=math.inf
+        )
         by_pipeline[geometry[0]].append((best, geometry, variants))
     selected = set()
     for geometries in by_pipeline.values():
@@ -202,8 +222,11 @@ def _opus_refinement_candidates(
 
 
 def _opus_pin_candidates(candidates, measurements, top_groups=3, *, err_ratio=0.05):
-    valid = {int(kid): float(us) for kid, us, error in measurements
-             if math.isfinite(float(us)) and 0 < float(us) and float(error) <= err_ratio}
+    valid = {
+        int(kid): float(us)
+        for kid, us, error in measurements
+        if math.isfinite(float(us)) and 0 < float(us) and float(error) <= err_ratio
+    }
     groups = defaultdict(list)
     for kid, instance in candidates:
         entry = instance.bpreshuffle_co or {}
@@ -215,23 +238,46 @@ def _opus_pin_candidates(candidates, measurements, top_groups=3, *, err_ratio=0.
         if math.isfinite(best):
             variants = [kid for kid, entry in members if entry.get("pin_variant")]
             ranked[pipeline].append((best, base, variants))
-    return sorted({kid for schedules in ranked.values()
-                   for _, _, variants in sorted(schedules)[:top_groups] for kid in variants})
+    return sorted(
+        {
+            kid
+            for schedules in ranked.values()
+            for _, _, variants in sorted(schedules)[:top_groups]
+            for kid in variants
+        }
+    )
 
 
 def prepare_opus_pin_kids(kids):
     from csrc.opus_gemm.opus_gemm_common import gfx950_co_kernels_declared
 
-    kids = sorted(kid for kid in kids if gfx950_co_kernels_declared.get(kid, {}).get("pin_variant"))
+    kids = sorted(
+        kid
+        for kid in kids
+        if gfx950_co_kernels_declared.get(kid, {}).get("pin_variant")
+    )
     if not kids:
         return set()
     opus_dir = Path(__file__).resolve().parents[1] / "opus_gemm"
     co_root = Path(os.environ.get("OPUS_GEN_CO_DIR") or opus_dir / "gen_co")
-    command = [sys.executable, str(opus_dir / "gen_co/build_co.py"), "--arch", "gfx950",
-               "--jobs", "4", "--skip-existing", "--out-dir", str(co_root / "gfx950"),
-               "--kids", *map(str, kids)]
-    compiler = (os.environ.get("OPUS_CO_LLVM_BIN") or os.environ.get("OPUS_HIP_CLANG_PATH")
-                or os.environ.get("HIP_CLANG_PATH"))
+    command = [
+        sys.executable,
+        str(opus_dir / "gen_co/build_co.py"),
+        "--arch",
+        "gfx950",
+        "--jobs",
+        "4",
+        "--skip-existing",
+        "--out-dir",
+        str(co_root / "gfx950"),
+        "--kids",
+        *map(str, kids),
+    ]
+    compiler = (
+        os.environ.get("OPUS_CO_LLVM_BIN")
+        or os.environ.get("OPUS_HIP_CLANG_PATH")
+        or os.environ.get("HIP_CLANG_PATH")
+    )
     if compiler:
         command += ["--llvm-bin", compiler]
     with tempfile.TemporaryDirectory(prefix="opus_pin_build_") as directory:
@@ -257,9 +303,17 @@ def ensure_opus_kids_compiled(kids):
     except ModuleNotFoundError:
         config = core.get_args_of_build("module_aiter_core")
         keys = (
-            "srcs", "flags_extra_cc", "flags_extra_hip", "blob_gen_cmd",
-            "extra_include", "extra_ldflags", "verbose", "is_python_module",
-            "is_standalone", "torch_exclude", "third_party",
+            "srcs",
+            "flags_extra_cc",
+            "flags_extra_hip",
+            "blob_gen_cmd",
+            "extra_include",
+            "extra_ldflags",
+            "verbose",
+            "is_python_module",
+            "is_standalone",
+            "torch_exclude",
+            "third_party",
         )
         core.build_module(
             md_name="module_aiter_core",
@@ -294,8 +348,13 @@ def run_gemm_opus(x, weight_shuffle, x_scale, w_scale, out, kid):
     from aiter.ops.opus import opus_gemm
 
     return opus_gemm(
-        x, weight_shuffle, out, kid=kid, layout="bpreshuffle",
-        x_scale=x_scale, w_scale=w_scale,
+        x,
+        weight_shuffle,
+        out,
+        kid=kid,
+        layout="bpreshuffle",
+        x_scale=x_scale,
+        w_scale=w_scale,
     )
 
 
@@ -420,28 +479,36 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             "joins on 128x128. A shape list without a block column uses 128x128.",
         )
         self.parser.add_argument(
-            "--libtype", choices=("both", "opus", "flydsl"), default="both",
+            "--libtype",
+            choices=("both", "opus", "flydsl"),
+            default="both",
             help="Backends to search; OPUS requires --mxscale_table and 128x128.",
         )
         self.parser.add_argument(
-            "--opus-kids", type=parse_opus_kids,
+            "--opus-kids",
+            type=parse_opus_kids,
             help="Optional comma-separated exact OPUS IDs; explicit IDs bypass performance pruning.",
         )
         self.parser.add_argument(
-            "--opus-search", choices=("filtered", "exhaustive"), default="filtered",
+            "--opus-search",
+            choices=("filtered", "exhaustive"),
+            default="filtered",
             help="OPUS search policy: shape pruning, coarse geometry search, schedule and pin refinement "
             "(default), or every legal configuration. Timing and correctness checks are identical.",
         )
         self.parser.add_argument(
-            "--compare-upstream", action="store_true",
+            "--compare-upstream",
+            action="store_true",
             help="Compare current OPUS against FlyDSL BMM and GEMM #6603 using all saved BMM seeds.",
         )
         self.parser.add_argument(
-            "--bmm-seeds", type=Path,
+            "--bmm-seeds",
+            type=Path,
             help="Additional saved BMM rows in the standard tuned CSV format.",
         )
         self.parser.add_argument(
-            "--flydsl-candidates", type=Path,
+            "--flydsl-candidates",
+            type=Path,
             help="Optional per-shape FlyDSL shortlist CSV (M,N,K,w_scale_block,kernelName). "
             "Only listed legal BMM and PR6603 candidates are timed; OPUS search is unchanged.",
         )
@@ -466,7 +533,9 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                 a8w8_mxscale_gemm_bpreshuffle_kernels_list,
             )
 
-            unknown = args.opus_kids.difference(a8w8_mxscale_gemm_bpreshuffle_kernels_list)
+            unknown = args.opus_kids.difference(
+                a8w8_mxscale_gemm_bpreshuffle_kernels_list
+            )
             if unknown:
                 self.parser.error(f"Unknown or unavailable OPUS IDs: {sorted(unknown)}")
         super().pre_process(args)
@@ -499,7 +568,9 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
 
     def get_untuned_gemm_list(self, untuned_gemm_file):
         df = super().get_untuned_gemm_list(untuned_gemm_file)
-        default_block = "128x128" if getattr(self, "_mxscale_table", False) else W_SCALE_BLOCK
+        default_block = (
+            "128x128" if getattr(self, "_mxscale_table", False) else W_SCALE_BLOCK
+        )
         if "w_scale_block" not in df.columns:
             df["w_scale_block"] = default_block
         df["w_scale_block"] = df["w_scale_block"].fillna(default_block)
@@ -513,7 +584,9 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
 
     def get_tuned_gemm_list(self, tuned_gemm_file, columns=None):
         df = super().get_tuned_gemm_list(tuned_gemm_file, columns)
-        default_block = "128x128" if getattr(self, "_mxscale_table", False) else W_SCALE_BLOCK
+        default_block = (
+            "128x128" if getattr(self, "_mxscale_table", False) else W_SCALE_BLOCK
+        )
         df = with_mxscale_w_scale_block(df, tuned_gemm_file, default=default_block)
         # A table from before the column gets it where the tuner writes it.
         rest = [c for c in df.columns if c not in self.keys]
@@ -537,9 +610,15 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             }
             from csrc.opus_gemm.opus_gemm_common import gfx950_co_kernels_declared
 
-            pins = {kid for kid in kids if gfx950_co_kernels_declared.get(kid, {}).get("pin_variant")}
+            pins = {
+                kid
+                for kid in kids
+                if gfx950_co_kernels_declared.get(kid, {}).get("pin_variant")
+            }
             if pins - prepare_opus_pin_kids(pins):
-                raise RuntimeError("Requested OPUS pin COs failed build/resource checks")
+                raise RuntimeError(
+                    "Requested OPUS pin COs failed build/resource checks"
+                )
             ensure_opus_kids_compiled(kids)
         op = (
             gemm_a8w8_blockscale_bpreshuffle
@@ -565,7 +644,8 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                     num_iters=args.iters,
                 )
                 err_ratio = checkAllclose(
-                    out, run_torch(d["x_deq"], d["w_deq"]),
+                    out,
+                    run_torch(d["x_deq"], d["w_deq"]),
                     msg=f"run_config {shape_str}",
                 )
                 status = (
@@ -634,23 +714,43 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                     if args.libtype == "opus" and not opus_by_shape[shape]:
                         raise ValueError(f"No OPUS candidate supports {shape}")
             deferred = args.opus_search == "filtered" and args.opus_kids is None
-            pin_kids = {kid for candidates in opus_by_shape.values() for kid, instance in candidates
-                        if (instance.bpreshuffle_co or {}).get("pin_variant")}
+            pin_kids = {
+                kid
+                for candidates in opus_by_shape.values()
+                for kid, instance in candidates
+                if (instance.bpreshuffle_co or {}).get("pin_variant")
+            }
             ready = set() if deferred else prepare_opus_pin_kids(pin_kids)
             if not deferred:
                 rejected = pin_kids - ready
                 if args.opus_kids is not None and rejected:
-                    raise RuntimeError(f"Requested OPUS pin COs failed build/resource checks: {sorted(rejected)}")
-                opus_by_shape = {shape: [(kid, inst) for kid, inst in candidates if kid not in rejected]
-                                 for shape, candidates in opus_by_shape.items()}
-            ensure_opus_kids_compiled({kid for candidates in opus_by_shape.values()
-                                       for kid, _ in candidates if kid not in pin_kids or kid in ready})
+                    raise RuntimeError(
+                        f"Requested OPUS pin COs failed build/resource checks: {sorted(rejected)}"
+                    )
+                opus_by_shape = {
+                    shape: [
+                        (kid, inst) for kid, inst in candidates if kid not in rejected
+                    ]
+                    for shape, candidates in opus_by_shape.items()
+                }
+            ensure_opus_kids_compiled(
+                {
+                    kid
+                    for candidates in opus_by_shape.values()
+                    for kid, _ in candidates
+                    if kid not in pin_kids or kid in ready
+                }
+            )
         for i in range(len(untunedf)):
             M = int(untunedf.loc[i, "M"])
             N = int(untunedf.loc[i, "N"])
             K = int(untunedf.loc[i, "K"])
             block = str(untunedf.loc[i, "w_scale_block"])
-            allowed_flydsl = None if flydsl_shortlist is None else flydsl_shortlist.get((M, N, K, block))
+            allowed_flydsl = (
+                None
+                if flydsl_shortlist is None
+                else flydsl_shortlist.get((M, N, K, block))
+            )
             if flydsl_shortlist is not None and not allowed_flydsl:
                 raise ValueError(f"No FlyDSL shortlist for {(M, N, K, block)}")
             info_keys = (gfx, cu_num, M, N, K, block)
@@ -660,7 +760,8 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                 (kernel_id, ki)
                 for pipe in PIPELINES_BY_W_SCALE_BLOCK[block]
                 for kernel_id, ki in pipe.kernels_list.items()
-                if args.libtype != "opus" and pipe.fits(ki, M, N, K)
+                if args.libtype != "opus"
+                and pipe.fits(ki, M, N, K)
                 and (allowed_flydsl is None or ki.name in allowed_flydsl)
             ]
             runs = [
@@ -712,16 +813,32 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                     )
                 )
             for kid, instance in opus:
-                info = (info_keys, kid, instance.bpreshuffle_split_k, instance.name, "opus")
+                info = (
+                    info_keys,
+                    kid,
+                    instance.bpreshuffle_split_k,
+                    instance.name,
+                    "opus",
+                )
                 opus_keys = [*gemm_keys]
                 opus_keys[2] = "x_scale_opus"
                 task.append(
                     (
-                        info, generate_data,
+                        info,
+                        generate_data,
                         (M, N, K, seed, block),
-                        run_gemm_opus, (opus_keys, kid), dict(run_kwargs),
-                        run_torch, ref_args, {}, None,
-                        1e-2, 0.01, None, None, ("out",),
+                        run_gemm_opus,
+                        (opus_keys, kid),
+                        dict(run_kwargs),
+                        run_torch,
+                        ref_args,
+                        {},
+                        None,
+                        1e-2,
+                        0.01,
+                        None,
+                        None,
+                        ("out",),
                     )
                 )
             if not runs and not opus:
@@ -730,7 +847,10 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
 
         if not task:
             return []
-        if getattr(args, "opus_search", "filtered") == "filtered" and args.opus_kids is None:
+        if (
+            getattr(args, "opus_search", "filtered") == "filtered"
+            and args.opus_kids is None
+        ):
             return self._run_filtered_opus(task, opus_by_shape, args)
         return mp_tuner(
             task,
@@ -746,11 +866,22 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
     def _run_filtered_opus(self, tasks, candidates_by_shape, args):
         def run_pass(pass_tasks):
             counts = Counter(task[0][0] for task in pass_tasks)
-            return list(mp_tuner(
-                pass_tasks, [(count, ()) for count in counts.values()],
-                args.mp, False, args.shape_grouped, args.errRatio,
-                timeout=args.timeout, verbose=args.verbose,
-            )) if pass_tasks else []
+            return (
+                list(
+                    mp_tuner(
+                        pass_tasks,
+                        [(count, ()) for count in counts.values()],
+                        args.mp,
+                        False,
+                        args.shape_grouped,
+                        args.errRatio,
+                        timeout=args.timeout,
+                        verbose=args.verbose,
+                    )
+                )
+                if pass_tasks
+                else []
+            )
 
         def task_shape(info):
             return tuple(int(value) for value in info[0][2:5])
@@ -759,9 +890,13 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         for shape, candidates in candidates_by_shape.items():
             coarse, groups = _opus_coarse_candidates(candidates)
             plans[shape] = (set(coarse), groups)
-            print(f"[OPUS search] shape={shape} legal={len(candidates)} coarse={len(coarse)}", flush=True)
+            print(
+                f"[OPUS search] shape={shape} legal={len(candidates)} coarse={len(coarse)}",
+                flush=True,
+            )
         first_tasks = [
-            task for task in tasks
+            task
+            for task in tasks
             if task[0][-1] != "opus" or task[0][1] in plans[task_shape(task[0])][0]
         ]
         results = run_pass(first_tasks)
@@ -769,24 +904,39 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         pin_kids = set()
         for shape, (coarse, groups) in plans.items():
             measurements = [
-                (info[1], us, error) for info, us, error in results
+                (info[1], us, error)
+                for info, us, error in results
                 if info[-1] == "opus" and task_shape(info) == shape
             ]
             selected = _opus_refinement_candidates(
-                groups, measurements, coarse, err_ratio=args.errRatio,
+                groups,
+                measurements,
+                coarse,
+                err_ratio=args.errRatio,
             )
-            pins = _opus_pin_candidates(candidates_by_shape[shape], measurements, err_ratio=args.errRatio)
+            pins = _opus_pin_candidates(
+                candidates_by_shape[shape], measurements, err_ratio=args.errRatio
+            )
             pin_kids.update(pins)
             refinement[shape] = set(selected) | set(pins)
-            print(f"[OPUS refine] shape={shape} schedule={len(selected)} pin={len(pins)}", flush=True)
+            print(
+                f"[OPUS refine] shape={shape} schedule={len(selected)} pin={len(pins)}",
+                flush=True,
+            )
         ready = prepare_opus_pin_kids(pin_kids)
         ensure_opus_kids_compiled(ready)
-        for shape in refinement:
-            refinement[shape].difference_update(pin_kids - ready)
-        results.extend(run_pass([
-            task for task in tasks
-            if task[0][-1] == "opus" and task[0][1] in refinement[task_shape(task[0])]
-        ]))
+        for selected in refinement.values():
+            selected.difference_update(pin_kids - ready)
+        results.extend(
+            run_pass(
+                [
+                    task
+                    for task in tasks
+                    if task[0][-1] == "opus"
+                    and task[0][1] in refinement[task_shape(task[0])]
+                ]
+            )
+        )
         return results
 
     def result_to_df(self, results):

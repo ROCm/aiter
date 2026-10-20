@@ -1,0 +1,1255 @@
+{
+  "llvm_bin": "/root/toolchains/llvm-amdgpu-pin-op-dst-49c41889-build/bin",
+  "kernels": [
+    {
+      "kid": 70000,
+      "status": "ready"
+    },
+    {
+      "kid": 70001,
+      "status": "ready"
+    },
+    {
+      "kid": 70002,
+      "status": "ready"
+    },
+    {
+      "kid": 70003,
+      "status": "ready"
+    },
+    {
+      "kid": 70004,
+      "status": "ready"
+    },
+    {
+      "kid": 70005,
+      "status": "ready"
+    },
+    {
+      "kid": 70006,
+      "status": "ready"
+    },
+    {
+      "kid": 70007,
+      "status": "ready"
+    },
+    {
+      "kid": 70008,
+      "status": "ready"
+    },
+    {
+      "kid": 70009,
+      "status": "ready"
+    },
+    {
+      "kid": 70010,
+      "status": "ready"
+    },
+    {
+      "kid": 70011,
+      "status": "ready"
+    },
+    {
+      "kid": 70012,
+      "status": "ready"
+    },
+    {
+      "kid": 70013,
+      "status": "ready"
+    },
+    {
+      "kid": 70014,
+      "status": "ready"
+    },
+    {
+      "kid": 70015,
+      "status": "ready"
+    },
+    {
+      "kid": 70016,
+      "status": "ready"
+    },
+    {
+      "kid": 70017,
+      "status": "ready"
+    },
+    {
+      "kid": 70018,
+      "status": "ready"
+    },
+    {
+      "kid": 70019,
+      "status": "ready"
+    },
+    {
+      "kid": 70020,
+      "status": "ready"
+    },
+    {
+      "kid": 70021,
+      "status": "ready"
+    },
+    {
+      "kid": 70022,
+      "status": "ready"
+    },
+    {
+      "kid": 70023,
+      "status": "ready"
+    },
+    {
+      "kid": 70024,
+      "status": "ready"
+    },
+    {
+      "kid": 70025,
+      "status": "ready"
+    },
+    {
+      "kid": 70026,
+      "status": "ready"
+    },
+    {
+      "kid": 70027,
+      "status": "ready"
+    },
+    {
+      "kid": 70028,
+      "status": "ready"
+    },
+    {
+      "kid": 70029,
+      "status": "ready"
+    },
+    {
+      "kid": 70030,
+      "status": "ready"
+    },
+    {
+      "kid": 70031,
+      "status": "ready"
+    },
+    {
+      "kid": 70032,
+      "status": "ready"
+    },
+    {
+      "kid": 70033,
+      "status": "ready"
+    },
+    {
+      "kid": 70034,
+      "status": "ready"
+    },
+    {
+      "kid": 70035,
+      "status": "ready"
+    },
+    {
+      "kid": 70036,
+      "status": "ready"
+    },
+    {
+      "kid": 70037,
+      "status": "ready"
+    },
+    {
+      "kid": 70038,
+      "status": "ready"
+    },
+    {
+      "kid": 70039,
+      "status": "ready"
+    },
+    {
+      "kid": 70040,
+      "status": "ready"
+    },
+    {
+      "kid": 70041,
+      "status": "ready"
+    },
+    {
+      "kid": 70042,
+      "status": "ready"
+    },
+    {
+      "kid": 70043,
+      "status": "ready"
+    },
+    {
+      "kid": 70044,
+      "status": "ready"
+    },
+    {
+      "kid": 70045,
+      "status": "ready"
+    },
+    {
+      "kid": 70046,
+      "status": "ready"
+    },
+    {
+      "kid": 70047,
+      "status": "ready"
+    },
+    {
+      "kid": 70048,
+      "status": "ready"
+    },
+    {
+      "kid": 70049,
+      "status": "ready"
+    },
+    {
+      "kid": 70050,
+      "status": "ready"
+    },
+    {
+      "kid": 70051,
+      "status": "ready"
+    },
+    {
+      "kid": 70052,
+      "status": "ready"
+    },
+    {
+      "kid": 70053,
+      "status": "ready"
+    },
+    {
+      "kid": 70054,
+      "status": "ready"
+    },
+    {
+      "kid": 70055,
+      "status": "ready"
+    },
+    {
+      "kid": 70056,
+      "status": "ready"
+    },
+    {
+      "kid": 70057,
+      "status": "ready"
+    },
+    {
+      "kid": 70058,
+      "status": "ready"
+    },
+    {
+      "kid": 70059,
+      "status": "ready"
+    },
+    {
+      "kid": 70060,
+      "status": "ready"
+    },
+    {
+      "kid": 70061,
+      "status": "ready"
+    },
+    {
+      "kid": 70062,
+      "status": "ready"
+    },
+    {
+      "kid": 70063,
+      "status": "ready"
+    },
+    {
+      "kid": 70064,
+      "status": "ready"
+    },
+    {
+      "kid": 70065,
+      "status": "ready"
+    },
+    {
+      "kid": 70066,
+      "status": "ready"
+    },
+    {
+      "kid": 70067,
+      "status": "ready"
+    },
+    {
+      "kid": 70068,
+      "status": "ready"
+    },
+    {
+      "kid": 70069,
+      "status": "ready"
+    },
+    {
+      "kid": 70070,
+      "status": "ready"
+    },
+    {
+      "kid": 70071,
+      "status": "ready"
+    },
+    {
+      "kid": 70072,
+      "status": "ready"
+    },
+    {
+      "kid": 70073,
+      "status": "ready"
+    },
+    {
+      "kid": 70074,
+      "status": "ready"
+    },
+    {
+      "kid": 70075,
+      "status": "ready"
+    },
+    {
+      "kid": 70076,
+      "status": "ready"
+    },
+    {
+      "kid": 70077,
+      "status": "ready"
+    },
+    {
+      "kid": 70078,
+      "status": "ready"
+    },
+    {
+      "kid": 70079,
+      "status": "ready"
+    },
+    {
+      "kid": 70080,
+      "status": "ready"
+    },
+    {
+      "kid": 70081,
+      "status": "ready"
+    },
+    {
+      "kid": 70082,
+      "status": "ready"
+    },
+    {
+      "kid": 70083,
+      "status": "ready"
+    },
+    {
+      "kid": 70084,
+      "status": "ready"
+    },
+    {
+      "kid": 70085,
+      "status": "ready"
+    },
+    {
+      "kid": 70086,
+      "status": "ready"
+    },
+    {
+      "kid": 70087,
+      "status": "ready"
+    },
+    {
+      "kid": 70088,
+      "status": "ready"
+    },
+    {
+      "kid": 70089,
+      "status": "ready"
+    },
+    {
+      "kid": 70090,
+      "status": "ready"
+    },
+    {
+      "kid": 70091,
+      "status": "ready"
+    },
+    {
+      "kid": 70092,
+      "status": "ready"
+    },
+    {
+      "kid": 70093,
+      "status": "ready"
+    },
+    {
+      "kid": 70094,
+      "status": "ready"
+    },
+    {
+      "kid": 70095,
+      "status": "ready"
+    },
+    {
+      "kid": 70096,
+      "status": "ready"
+    },
+    {
+      "kid": 70097,
+      "status": "ready"
+    },
+    {
+      "kid": 70098,
+      "status": "ready"
+    },
+    {
+      "kid": 70099,
+      "status": "ready"
+    },
+    {
+      "kid": 70100,
+      "status": "ready"
+    },
+    {
+      "kid": 70101,
+      "status": "ready"
+    },
+    {
+      "kid": 70102,
+      "status": "ready"
+    },
+    {
+      "kid": 70103,
+      "status": "ready"
+    },
+    {
+      "kid": 70104,
+      "status": "ready"
+    },
+    {
+      "kid": 70105,
+      "status": "ready"
+    },
+    {
+      "kid": 70106,
+      "status": "ready"
+    },
+    {
+      "kid": 70107,
+      "status": "ready"
+    },
+    {
+      "kid": 70108,
+      "status": "ready"
+    },
+    {
+      "kid": 70109,
+      "status": "ready"
+    },
+    {
+      "kid": 70110,
+      "status": "ready"
+    },
+    {
+      "kid": 70111,
+      "status": "ready"
+    },
+    {
+      "kid": 70112,
+      "status": "ready"
+    },
+    {
+      "kid": 70113,
+      "status": "ready"
+    },
+    {
+      "kid": 70114,
+      "status": "ready"
+    },
+    {
+      "kid": 70115,
+      "status": "ready"
+    },
+    {
+      "kid": 70116,
+      "status": "ready"
+    },
+    {
+      "kid": 70117,
+      "status": "ready"
+    },
+    {
+      "kid": 70118,
+      "status": "ready"
+    },
+    {
+      "kid": 70119,
+      "status": "ready"
+    },
+    {
+      "kid": 70120,
+      "status": "ready"
+    },
+    {
+      "kid": 70121,
+      "status": "ready"
+    },
+    {
+      "kid": 70122,
+      "status": "ready"
+    },
+    {
+      "kid": 70123,
+      "status": "ready"
+    },
+    {
+      "kid": 70124,
+      "status": "ready"
+    },
+    {
+      "kid": 70125,
+      "status": "ready"
+    },
+    {
+      "kid": 70126,
+      "status": "ready"
+    },
+    {
+      "kid": 70127,
+      "status": "ready"
+    },
+    {
+      "kid": 70128,
+      "status": "ready"
+    },
+    {
+      "kid": 70129,
+      "status": "ready"
+    },
+    {
+      "kid": 70130,
+      "status": "ready"
+    },
+    {
+      "kid": 70131,
+      "status": "ready"
+    },
+    {
+      "kid": 70132,
+      "status": "ready"
+    },
+    {
+      "kid": 70133,
+      "status": "ready"
+    },
+    {
+      "kid": 70134,
+      "status": "ready"
+    },
+    {
+      "kid": 70135,
+      "status": "ready"
+    },
+    {
+      "kid": 70136,
+      "status": "ready"
+    },
+    {
+      "kid": 70137,
+      "status": "ready"
+    },
+    {
+      "kid": 70138,
+      "status": "ready"
+    },
+    {
+      "kid": 70139,
+      "status": "ready"
+    },
+    {
+      "kid": 70140,
+      "status": "ready"
+    },
+    {
+      "kid": 70141,
+      "status": "ready"
+    },
+    {
+      "kid": 70142,
+      "status": "ready"
+    },
+    {
+      "kid": 70143,
+      "status": "ready"
+    },
+    {
+      "kid": 70144,
+      "status": "ready"
+    },
+    {
+      "kid": 70145,
+      "status": "ready"
+    },
+    {
+      "kid": 70146,
+      "status": "ready"
+    },
+    {
+      "kid": 70147,
+      "status": "ready"
+    },
+    {
+      "kid": 70148,
+      "status": "ready"
+    },
+    {
+      "kid": 70149,
+      "status": "ready"
+    },
+    {
+      "kid": 70150,
+      "status": "ready"
+    },
+    {
+      "kid": 70151,
+      "status": "ready"
+    },
+    {
+      "kid": 70152,
+      "status": "ready"
+    },
+    {
+      "kid": 70153,
+      "status": "ready"
+    },
+    {
+      "kid": 70154,
+      "status": "ready"
+    },
+    {
+      "kid": 70155,
+      "status": "ready"
+    },
+    {
+      "kid": 70156,
+      "status": "ready"
+    },
+    {
+      "kid": 70157,
+      "status": "ready"
+    },
+    {
+      "kid": 70158,
+      "status": "ready"
+    },
+    {
+      "kid": 70159,
+      "status": "ready"
+    },
+    {
+      "kid": 70160,
+      "status": "ready"
+    },
+    {
+      "kid": 72666,
+      "status": "ready",
+      "vgpr_count": 152,
+      "agpr_count": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72667,
+      "status": "ready",
+      "vgpr_count": 152,
+      "agpr_count": 24,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72668,
+      "status": "ready",
+      "vgpr_count": 244,
+      "agpr_count": 152,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72669,
+      "status": "ready",
+      "vgpr_count": 220,
+      "agpr_count": 48,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72670,
+      "status": "ready",
+      "vgpr_count": 202,
+      "agpr_count": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72671,
+      "status": "ready",
+      "vgpr_count": 220,
+      "agpr_count": 48,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72672,
+      "status": "ready",
+      "vgpr_count": 328,
+      "agpr_count": 176,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72673,
+      "status": "ready",
+      "vgpr_count": 252,
+      "agpr_count": 48,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72674,
+      "status": "ready",
+      "vgpr_count": 356,
+      "agpr_count": 224,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72675,
+      "status": "ready",
+      "vgpr_count": 308,
+      "agpr_count": 224,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72676,
+      "status": "ready",
+      "vgpr_count": 232,
+      "agpr_count": 48,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72677,
+      "status": "ready",
+      "vgpr_count": 356,
+      "agpr_count": 224,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72678,
+      "status": "ready",
+      "vgpr_count": 308,
+      "agpr_count": 224,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72679,
+      "status": "ready",
+      "vgpr_count": 240,
+      "agpr_count": 48,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72680,
+      "status": "ready",
+      "vgpr_count": 356,
+      "agpr_count": 224,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72681,
+      "status": "ready",
+      "vgpr_count": 308,
+      "agpr_count": 224,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72682,
+      "status": "ready",
+      "vgpr_count": 240,
+      "agpr_count": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72683,
+      "status": "ready",
+      "vgpr_count": 240,
+      "agpr_count": 64,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72684,
+      "status": "ready",
+      "vgpr_count": 312,
+      "agpr_count": 160,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72685,
+      "status": "ready",
+      "vgpr_count": 358,
+      "agpr_count": 102,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72686,
+      "status": "ready",
+      "vgpr_count": 440,
+      "agpr_count": 224,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72687,
+      "status": "ready",
+      "vgpr_count": 388,
+      "agpr_count": 224,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72688,
+      "status": "ready",
+      "vgpr_count": 296,
+      "agpr_count": 40,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72689,
+      "status": "ready",
+      "vgpr_count": 292,
+      "agpr_count": 64,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72690,
+      "status": "ready",
+      "vgpr_count": 392,
+      "agpr_count": 192,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72691,
+      "status": "ready",
+      "vgpr_count": 296,
+      "agpr_count": 40,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72692,
+      "status": "ready",
+      "vgpr_count": 284,
+      "agpr_count": 64,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72693,
+      "status": "ready",
+      "vgpr_count": 400,
+      "agpr_count": 192,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72694,
+      "status": "ready",
+      "vgpr_count": 297,
+      "agpr_count": 41,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72695,
+      "status": "ready",
+      "vgpr_count": 292,
+      "agpr_count": 64,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72696,
+      "status": "ready",
+      "vgpr_count": 392,
+      "agpr_count": 192,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72697,
+      "status": "ready",
+      "vgpr_count": 296,
+      "agpr_count": 40,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72698,
+      "status": "ready",
+      "vgpr_count": 288,
+      "agpr_count": 64,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72699,
+      "status": "ready",
+      "vgpr_count": 408,
+      "agpr_count": 192,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72700,
+      "status": "ready",
+      "vgpr_count": 150,
+      "agpr_count": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72701,
+      "status": "ready",
+      "vgpr_count": 152,
+      "agpr_count": 32,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72702,
+      "status": "ready",
+      "vgpr_count": 216,
+      "agpr_count": 96,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72703,
+      "status": "ready",
+      "vgpr_count": 184,
+      "agpr_count": 96,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72704,
+      "status": "ready",
+      "vgpr_count": 280,
+      "agpr_count": 192,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72705,
+      "status": "ready",
+      "vgpr_count": 248,
+      "agpr_count": 192,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72706,
+      "status": "ready",
+      "vgpr_count": 248,
+      "agpr_count": 192,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72707,
+      "status": "ready",
+      "vgpr_count": 250,
+      "agpr_count": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72708,
+      "status": "ready",
+      "vgpr_count": 252,
+      "agpr_count": 32,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72709,
+      "status": "ready",
+      "vgpr_count": 316,
+      "agpr_count": 128,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72710,
+      "status": "ready",
+      "vgpr_count": 284,
+      "agpr_count": 128,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72711,
+      "status": "ready",
+      "vgpr_count": 380,
+      "agpr_count": 256,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72712,
+      "status": "ready",
+      "vgpr_count": 348,
+      "agpr_count": 256,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72713,
+      "status": "ready",
+      "vgpr_count": 316,
+      "agpr_count": 256,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72714,
+      "status": "ready",
+      "vgpr_count": 151,
+      "agpr_count": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72715,
+      "status": "ready",
+      "vgpr_count": 152,
+      "agpr_count": 32,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72716,
+      "status": "ready",
+      "vgpr_count": 216,
+      "agpr_count": 96,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72717,
+      "status": "ready",
+      "vgpr_count": 184,
+      "agpr_count": 96,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72718,
+      "status": "ready",
+      "vgpr_count": 280,
+      "agpr_count": 192,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72719,
+      "status": "ready",
+      "vgpr_count": 248,
+      "agpr_count": 192,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72720,
+      "status": "ready",
+      "vgpr_count": 248,
+      "agpr_count": 192,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72721,
+      "status": "ready",
+      "vgpr_count": 252,
+      "agpr_count": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72722,
+      "status": "ready",
+      "vgpr_count": 252,
+      "agpr_count": 32,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72723,
+      "status": "ready",
+      "vgpr_count": 316,
+      "agpr_count": 128,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72724,
+      "status": "ready",
+      "vgpr_count": 284,
+      "agpr_count": 128,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72725,
+      "status": "ready",
+      "vgpr_count": 380,
+      "agpr_count": 256,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72726,
+      "status": "ready",
+      "vgpr_count": 348,
+      "agpr_count": 256,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72727,
+      "status": "ready",
+      "vgpr_count": 316,
+      "agpr_count": 256,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
+    },
+    {
+      "kid": 72728,
+      "status": "ready"
+    },
+    {
+      "kid": 72729,
+      "status": "ready"
+    },
+    {
+      "kid": 72730,
+      "status": "ready"
+    },
+    {
+      "kid": 72731,
+      "status": "ready"
+    },
+    {
+      "kid": 72732,
+      "status": "ready"
+    },
+    {
+      "kid": 72733,
+      "status": "ready"
+    },
+    {
+      "kid": 72734,
+      "status": "ready"
+    },
+    {
+      "kid": 72735,
+      "status": "ready"
+    },
+    {
+      "kid": 72736,
+      "status": "ready"
+    },
+    {
+      "kid": 72737,
+      "status": "ready"
+    },
+    {
+      "kid": 72738,
+      "status": "ready"
+    },
+    {
+      "kid": 72739,
+      "status": "ready"
+    }
+  ]
+}

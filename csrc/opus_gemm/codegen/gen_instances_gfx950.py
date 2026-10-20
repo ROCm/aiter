@@ -194,6 +194,7 @@ def co_traits_args(k):
         if isinstance(value, (int, str)):
             return str(value)
         raise ValueError(f"Invalid gfx950 CO traits parameter: {value!r}")
+
     return ",".join(argument(value) for value in k["traits"]["args"])
 
 
@@ -3217,48 +3218,93 @@ def _gen_bpreshuffle_co(cg, k, instance_impl_preamble, make_host_decl):
     entry = k.bpreshuffle_co
     symbol = entry.get("symbol", f"opus_gemm_gfx950_pin_agpr_{entry['kid']}")
     if "launches" in entry:
-        rows = ["{" + ",".join(map(str, (*map(int, shape.split(",")), *launch["grid"],
-                         *launch["block"], launch.get("dynamic_lds_bytes", 0)))) + "}"
-                for shape, launch in entry["launches"].items()]
-        grid_setup = ("static constexpr opus_gfx950_co::LaunchContract contracts[] = {" + ",\n".join(rows) + "};\n"
-                      "    const opus_gfx950_co::LaunchContract* selected = nullptr;\n"
-                      "    for (const auto& contract : contracts)\n"
-                      "        if (contract.m == m && contract.n == n && contract.k == k) { selected = &contract; break; }\n"
-                      '    AITER_CHECK(selected, "shape is unsupported by this CO");\n'
-                      "    const dim3 grid(selected->gx, selected->gy, selected->gz), block(selected->bx, selected->by, selected->bz);\n"
-                      "    const unsigned dynamic_lds = selected->dynamic_lds;")
+        rows = [
+            "{"
+            + ",".join(
+                map(
+                    str,
+                    (
+                        *map(int, shape.split(",")),
+                        *launch["grid"],
+                        *launch["block"],
+                        launch.get("dynamic_lds_bytes", 0),
+                    ),
+                )
+            )
+            + "}"
+            for shape, launch in entry["launches"].items()
+        ]
+        grid_setup = (
+            "static constexpr opus_gfx950_co::LaunchContract contracts[] = {"
+            + ",\n".join(rows)
+            + "};\n"
+            "    const opus_gfx950_co::LaunchContract* selected = nullptr;\n"
+            "    for (const auto& contract : contracts)\n"
+            "        if (contract.m == m && contract.n == n && contract.k == k) { selected = &contract; break; }\n"
+            '    AITER_CHECK(selected, "shape is unsupported by this CO");\n'
+            "    const dim3 grid(selected->gx, selected->gy, selected->gz), block(selected->bx, selected->by, selected->bz);\n"
+            "    const unsigned dynamic_lds = selected->dynamic_lds;"
+        )
     else:
         rounded_m = f"(m + {k.B_M - 1})" if k.pad_m else "m"
-        grid_setup = (f'AITER_CHECK(m % {k.m_align} == 0 && n % {k.B_N} == 0 && k % {k.B_K} == 0, "shape is unsupported by this CO");\n'
-                      f"    const dim3 grid(n / {k.B_N}, {rounded_m} / {k.B_M}), block({k.BLOCK_SIZE});\n"
-                      "    const unsigned dynamic_lds = 0;")
+        grid_setup = (
+            f'AITER_CHECK(m % {k.m_align} == 0 && n % {k.B_N} == 0 && k % {k.B_K} == 0, "shape is unsupported by this CO");\n'
+            f"    const dim3 grid(n / {k.B_N}, {rounded_m} / {k.B_M}), block({k.BLOCK_SIZE});\n"
+            "    const unsigned dynamic_lds = 0;"
+        )
         if entry.get("grid_layout") in ("xcd", "linear"):
-            grid_x = "((tiles + 7) / 8) * 8" if entry["grid_layout"] == "xcd" else "tiles"
-            grid_setup = (f'AITER_CHECK(m % {k.m_align} == 0 && n % {k.B_N} == 0 && k % {k.B_K} == 0, "shape is unsupported by this CO");\n'
-                          f"    const int tiles = ((m + {k.B_M - 1}) / {k.B_M}) * (n / {k.B_N});\n"
-                          f"    const dim3 grid({grid_x}), block({k.BLOCK_SIZE});\n"
-                          "    const unsigned dynamic_lds = 0;")
+            grid_x = (
+                "((tiles + 7) / 8) * 8" if entry["grid_layout"] == "xcd" else "tiles"
+            )
+            grid_setup = (
+                f'AITER_CHECK(m % {k.m_align} == 0 && n % {k.B_N} == 0 && k % {k.B_K} == 0, "shape is unsupported by this CO");\n'
+                f"    const int tiles = ((m + {k.B_M - 1}) / {k.B_M}) * (n / {k.B_N});\n"
+                f"    const dim3 grid({grid_x}), block({k.BLOCK_SIZE});\n"
+                "    const unsigned dynamic_lds = 0;"
+            )
         limit = min(2147483647, k.max_tensor_bytes)
-        conditions = [f"m * k <= {limit}", f"n * k <= {limit}", f"2 * m * n <= {k.max_tensor_bytes}"]
+        conditions = [
+            f"m * k <= {limit}",
+            f"n * k <= {limit}",
+            f"2 * m * n <= {k.max_tensor_bytes}",
+        ]
         if k.max_k is not None:
             conditions.append(f"k <= {k.max_k}")
         if k.bpreshuffle_fixed_k:
             conditions.append(f"k == {k.bpreshuffle_fixed_k}")
         if entry.get("wide_output"):
-            conditions.append(f"2 * (((m < {k.B_M} ? m : {k.B_M}) - 1) * n + {k.B_N}) <= {limit}")
+            conditions.append(
+                f"2 * (((m < {k.B_M} ? m : {k.B_M}) - 1) * n + {k.B_N}) <= {limit}"
+            )
         elif not k.pad_m:
-            conditions.extend((f"m * n <= {limit}", f"2 * (({k.B_M - 1}) * n + {k.B_N}) <= {limit}"))
-        grid_setup += '\n    AITER_CHECK(' + ' && '.join(conditions) + ', "CO tensor extent exceeds pipeline limits");'
+            conditions.extend(
+                (f"m * n <= {limit}", f"2 * (({k.B_M - 1}) * n + {k.B_N}) <= {limit}")
+            )
+        grid_setup += (
+            "\n    AITER_CHECK("
+            + " && ".join(conditions)
+            + ', "CO tensor extent exceeds pipeline limits");'
+        )
     alignment = entry.get("pointer_alignment", {})
     alignment_check = " && ".join(
         f"reinterpret_cast<uintptr_t>({name}.data_ptr()) % {alignment[key]} == 0"
-        for key, name in (("a", "XQ"), ("b", "WQ"), ("out", "Y"), ("sfa", "x_scale"), ("sfb", "w_scale"))
+        for key, name in (
+            ("a", "XQ"),
+            ("b", "WQ"),
+            ("out", "Y"),
+            ("sfa", "x_scale"),
+            ("sfb", "w_scale"),
+        )
         if alignment.get(key, 1) and alignment.get(key, 1) > 1
     )
     if alignment_check:
-        grid_setup += f'\n    AITER_CHECK({alignment_check}, "CO pointer alignment differs");'
-    preamble = instance_impl_preamble('\n#include <climits>\n#include <type_traits>\n#include "gfx950/opus_gemm_kargs_a8w8_mxscale_bpreshuffle_gfx950.cuh"')
-    source = f'''{preamble}
+        grid_setup += (
+            f'\n    AITER_CHECK({alignment_check}, "CO pointer alignment differs");'
+        )
+    preamble = instance_impl_preamble(
+        '\n#include <climits>\n#include <type_traits>\n#include "gfx950/opus_gemm_kargs_a8w8_mxscale_bpreshuffle_gfx950.cuh"'
+    )
+    source = f"""{preamble}
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 #include "gfx950/opus_co_launch_gfx950.cuh"
 template<typename D_C>
@@ -3271,11 +3317,16 @@ void {k.name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
     opus_co_launch_gfx950(kernel, grid, block, args, aiter::getCurrentHIPStream(), dynamic_lds);
 }}
 #endif
-'''
+"""
     write_if_changed(Path(cg.impl_path, f"{k.name}.cuh"), source)
     cg._kid_pipeline_header[k.name] = "gfx950/opus_co_launch_gfx950.cuh"
-    cg._host_instantiations.append(dict(
-        kid_name=k.name, dtype="bf16_t", host_decl=make_host_decl(k.name, "bf16_t", "")))
+    cg._host_instantiations.append(
+        {
+            "kid_name": k.name,
+            "dtype": "bf16_t",
+            "host_decl": make_host_decl(k.name, "bf16_t", ""),
+        }
+    )
 
 
 def _bpreshuffle_headers(entry):
@@ -3290,8 +3341,9 @@ def _bpreshuffle_declaration(kernel, parameters, arguments):
     return declaration
 
 
-def _emit_bpreshuffle_host(cg, k, instance_impl_preamble, make_host_decl,
-                           declarations, body, device):
+def _emit_bpreshuffle_host(
+    cg, k, instance_impl_preamble, make_host_decl, declarations, body, device
+):
     entry = k.bpreshuffle_entry
     alias = f"{k.name}_Traits"
     checks = [f"m % {k.m_align} == 0", "n % 128 == 0", f"k % {k.B_K} == 0"]
@@ -3304,11 +3356,22 @@ def _emit_bpreshuffle_host(cg, k, instance_impl_preamble, make_host_decl,
     checks.append(f"k / {k.B_K} >= {k.bpreshuffle_split_k}")
     checks.append(f"2ULL * (m < {k.B_M} ? m : {k.B_M}) * n <= INT32_MAX")
     input_limit = min(2147483647, k.max_tensor_bytes)
-    checks.extend((f"m * k <= {input_limit}", f"n * k <= {input_limit}",
-                   f"2ULL * m * n <= {k.max_tensor_bytes}"))
-    shape_check = 'AITER_CHECK(' + ' && '.join(checks) + ', "shape exceeds this pipeline configuration");'
-    preamble = instance_impl_preamble('\n#include <climits>\n#include <type_traits>\n#include "opus_gemm_common.cuh"')
-    source = f'''{preamble}
+    checks.extend(
+        (
+            f"m * k <= {input_limit}",
+            f"n * k <= {input_limit}",
+            f"2ULL * m * n <= {k.max_tensor_bytes}",
+        )
+    )
+    shape_check = (
+        "AITER_CHECK("
+        + " && ".join(checks)
+        + ', "shape exceeds this pipeline configuration");'
+    )
+    preamble = instance_impl_preamble(
+        '\n#include <climits>\n#include <type_traits>\n#include "opus_gemm_common.cuh"'
+    )
+    source = f"""{preamble}
 #include "{entry["headers"][0].replace("_pipeline_", "_traits_", 1)}"
 #ifdef OPUS_FUSED_HOST_TU
 {declarations}
@@ -3327,13 +3390,19 @@ void {k.name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
 {body}
 }}
 #endif
-'''
+"""
     write_if_changed(Path(cg.impl_path, f"{k.name}.cuh"), source)
     cg._kid_pipeline_header[k.name] = entry["headers"][-1]
-    cg._host_instantiations.append(dict(kid_name=k.name, dtype="bf16_t",
-        host_decl=make_host_decl(k.name, "bf16_t", "")))
-    cg._device_instantiations.append(dict(kid_name=k.name, dtype="bf16_t",
-        device_decl=device.rstrip() + "\n"))
+    cg._host_instantiations.append(
+        {
+            "kid_name": k.name,
+            "dtype": "bf16_t",
+            "host_decl": make_host_decl(k.name, "bf16_t", ""),
+        }
+    )
+    cg._device_instantiations.append(
+        {"kid_name": k.name, "dtype": "bf16_t", "device_decl": device.rstrip() + "\n"}
+    )
 
 
 def _gen_bpreshuffle_tile(cg, k, instance_impl_preamble, make_host_decl):
@@ -3343,28 +3412,46 @@ def _gen_bpreshuffle_tile(cg, k, instance_impl_preamble, make_host_decl):
     grid_kind = entry.get("grid_kind", "nm")
     n_tiles = "n / Traits::B_N"
     if grid_kind == "nm_tail":
-        n_tiles = "Traits::N_TAIL ? (n + Traits::B_N - 1) / Traits::B_N : n / Traits::B_N"
+        n_tiles = (
+            "Traits::N_TAIL ? (n + Traits::B_N - 1) / Traits::B_N : n / Traits::B_N"
+        )
     grid = "dim3(tiles_n, tiles_m)"
     if grid_kind == "xcd":
         grid = "dim3(Traits::XCD_ORDER ? (tiles + 7) / 8 * 8 : tiles)"
     lds = "Traits::lds_bytes(k)" if entry.get("dynamic_lds") else "0"
-    _emit_bpreshuffle_host(cg, k, instance_impl_preamble, make_host_decl,
+    _emit_bpreshuffle_host(
+        cg,
+        k,
+        instance_impl_preamble,
+        make_host_decl,
         _bpreshuffle_declaration(kernel, "class Traits", abi),
-        f'''    const unsigned tiles_m = (m + Traits::B_M - 1) / Traits::B_M;
+        f"""    const unsigned tiles_m = (m + Traits::B_M - 1) / Traits::B_M;
     const unsigned tiles_n = {n_tiles}, tiles = tiles_m * tiles_n;
-    {kernel}<{alias}><<<{grid}, dim3(Traits::BLOCK_SIZE), {lds}, aiter::getCurrentHIPStream()>>>(args);''',
-        f"template __global__ void {kernel}<{alias}>({abi});")
+    {kernel}<{alias}><<<{grid}, dim3(Traits::BLOCK_SIZE), {lds}, aiter::getCurrentHIPStream()>>>(args);""",
+        f"template __global__ void {kernel}<{alias}>({abi});",
+    )
 
 
 def gen_mxscale_bpreshuffle_instance(
-    cg, k, pipeline_header, traits_header, kernel_func, traits_name, kargs_name,
-    instance_impl_preamble, make_a8w8_bpreshuffle_host_decl, **_unused,
+    cg,
+    k,
+    pipeline_header,
+    traits_header,
+    kernel_func,
+    traits_name,
+    kargs_name,
+    instance_impl_preamble,
+    make_a8w8_bpreshuffle_host_decl,
+    **_unused,
 ):
     if k.bpreshuffle_co is not None:
-        _gen_bpreshuffle_co(cg, k, instance_impl_preamble, make_a8w8_bpreshuffle_host_decl)
+        _gen_bpreshuffle_co(
+            cg, k, instance_impl_preamble, make_a8w8_bpreshuffle_host_decl
+        )
         return
     _gen_bpreshuffle_tile(
-        cg, k, instance_impl_preamble, make_a8w8_bpreshuffle_host_decl)
+        cg, k, instance_impl_preamble, make_a8w8_bpreshuffle_host_decl
+    )
 
 
 # ---------- Self-register at import time ----------
