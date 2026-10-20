@@ -253,19 +253,6 @@ def clamp_num_buffers(
 ) -> int:
     """
     Clamp the NUM_BUFFERS of a gfx1250 Gluon GEMM to the K tiles of one split.
-
-    This is a shape-derived clamp, not a tuning default. A kernel that loads
-    NUM_BUFFERS - 1 K tiles before its main loop can use k_tiles + 1 buffers. A
-    kernel that loads all NUM_BUFFERS tiles first (prefetch_all) can use k_tiles
-    buffers. More buffers make the prologue read past the end of the split.
-
-    Args:
-        num_buffers: NUM_BUFFERS of the config.
-        k_tiles: number of K tiles in one split.
-        prefetch_all: True when the kernel loads all NUM_BUFFERS tiles first.
-
-    Returns:
-        the clamped NUM_BUFFERS
     """
     return min(num_buffers, k_tiles if prefetch_all else k_tiles + 1)
 
