@@ -10,7 +10,7 @@ from collections import namedtuple
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl.expr import arith, const_expr, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import Constexpr, T
@@ -645,6 +645,11 @@ def launch_gemm_a8w4_tdm(
             addr = fx.Int32(lds_base_idx) + fx.Int32(byte_offset)
             fx.ptr_store(fx.Int16(data), fx.inttoptr(i16_lds_ptr_ty, addr))
 
+        def make_tdm_store(gt, outer, stride):
+            return fx.rocdl.make_tdm_atom(
+                gt, [outer, None], strides=[stride, None], num_warps=num_waves
+            )
+
         gA_base = fx.recast_iter(fx.Int8, arg_a)
         gB_base = fx.recast_iter(fx.Int8, arg_b)
         gSA_base = fx.recast_iter(fx.Int32, arg_scale_a)
@@ -708,14 +713,13 @@ def launch_gemm_a8w4_tdm(
             # Number of rotating A/B/A-scale/B-scale loads issued by each wave.
             TDM_PER = 4 * num_waves_per_tensor_tdm // num_waves
         nw = 1
-        WARP1 = fx.make_layout(1, 1)
         base_i32 = fx.recast_iter(p32_shared, base_ptr)
 
         # Waves in one ``wv`` differ only in runtime atom state, so the whole list
         # collapses to one atom: ``wv`` is the smallest unit needing its own code.
         Job = namedtuple(
             "Job",
-            "atom blk on_i32 lds_off lds_stage lds_row inner outer k_adv waves",
+            "atom gt on_i32 lds_off lds_stage lds_row inner outer k_adv waves",
         )
         jobs = []
         as_prologue_jobs = []
@@ -750,10 +754,6 @@ def launch_gemm_a8w4_tdm(
             inner_seg = inner // len(wv) if split_i else inner
             wave_outer_off = 0 if split_i or len(wv) == 1 else (wave - wv[0]) * seg
             wave_inner_off = (wave - wv[0]) * inner_seg if split_i else 0
-            ext = None if oob is None else oob - wave_outer_off
-            # The coordinate rest carries the K tile number, so the view spans
-            # every K tile rather than one; k_adv == 0 means a single tile.
-            tile = (seg, inner_seg)
             gt = tensor_view(
                 g_base
                 + (
@@ -761,17 +761,22 @@ def launch_gemm_a8w4_tdm(
                     + fx.Int64(wave_outer_off) * g_stride
                     + fx.Int64(wave_inner_off)
                 ),
-                (seg if ext is None else ext, inner_seg * (K_TILES if k_adv else 1)),
+                (seg, inner_seg),
                 (g_stride, 1),
             )
-            atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
-                fx.rocdl.TensorLoad(cache_modifier=cache_modifier),
+            ext = None if oob is None else oob - wave_outer_off
+            pad_kw = {"pad_interval": pad[0], "pad_amount": pad[1]} if pad else {}
+            atom = fx.rocdl.make_tdm_atom(
                 gt,
-                fx.make_layout(tile, (lds_row, 1)),
-                tile,
+                [ext, None],
+                strides=[g_stride, None],
                 num_warps=nw,
+                # Descriptor bit 21: release to the peers already present and
+                # re-broadcast later, so early arrivals are not held for a merge.
+                early_timeout=bool(wg_mask is not None),
+                cache_modifier=cache_modifier,
+                **pad_kw,
             )
-            blk = fx.zipped_divide(coord, tile)[None, (0, None)]
             if const_expr(wg_mask is not None):
                 # A runtime zero mask keeps a partial-M tail on the ordinary
                 # global-load path; nonzero masks select CLUSTER_LOAD_ASYNC.
@@ -779,7 +784,7 @@ def launch_gemm_a8w4_tdm(
             (jobs if target_jobs is None else target_jobs).append(
                 Job(
                     atom,
-                    blk,
+                    gt,
                     on_i32,
                     lds_off + wave_outer_off * lds_row + wave_inner_off,
                     lds_stage,
@@ -925,11 +930,10 @@ def launch_gemm_a8w4_tdm(
                 base = base_i32 if j.on_i32 else base_i8
                 dst = lds_view(
                     base + j.lds_off + s * j.lds_stage,
-                    ((j.outer, j.inner), 1),
-                    ((j.lds_row, 1), j.outer * j.lds_row),
+                    (j.outer, j.inner),
+                    (j.lds_row, 1),
                 )
-                ts, tg = fx.rocdl.cdna5.tdm_partition(j.atom, 0, WARP1, dst, j.blk)
-                fx.copy(j.atom, tg[None, fx.Int32(kt) if j.k_adv else 0], ts[None, 0])
+                fx.copy(j.atom, j.gt, dst, imm_offset=fx.Int64(kt * j.k_adv))
 
             if const_expr(my_jobs is not None):
                 for j in my_jobs:
@@ -953,13 +957,10 @@ def launch_gemm_a8w4_tdm(
                 if owns(job.waves):
                     destination = tensor_view(
                         base_i32 + job.lds_off,
-                        ((job.outer, job.inner), 1),
-                        ((job.lds_row, 1), job.outer * job.lds_row),
+                        (job.outer, job.inner),
+                        (job.lds_row, 1),
                     )
-                    ts, tg = fx.rocdl.cdna5.tdm_partition(
-                        job.atom, 0, WARP1, destination, job.blk
-                    )
-                    fx.copy(job.atom, tg[None, 0], ts[None, 0])
+                    fx.copy(job.atom, job.gt, destination)
 
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
@@ -1477,7 +1478,7 @@ def launch_gemm_a8w4_tdm(
                     if const_expr(next_stage_on):
                         # Every rolled iteration reads the carry, so prime it here --
                         # outside ``dispatch_wave_job``, since every wave runs this once.
-                        rocdl.s_wait_tensorcnt(TDM_PER * (num_buffers - 1))
+                        tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
                         workgroup_barrier()
                         first_lds_addr = calc_lds_addr(0)
                         rocdl.sched_barrier(0)
@@ -2196,7 +2197,7 @@ def launch_gemm_a8w4_tdm(
                             issue_scatter_group(group, scatter_vector, vector_pass)
                     else:
                         issue_scatter_group(group, scatter_vector, vector_pass)
-                rocdl.s_wait_tensorcnt(0)
+                tdm_ops.tensor_wait(0)
             else:
                 if const_expr(stage1_act):
                     out_divisor = 4 if is_fp4_quant else 2
@@ -2212,33 +2213,42 @@ def launch_gemm_a8w4_tdm(
                     oc_store = oc
                     c_iter = fx.recast_iter(oc, arg_c)
                 c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
-                c_tile = (tile_m, STORE_PITCH)
-                gtC = tensor_view(c_iter + c_off_rt, (mn_oob, STORE_N), (out_stride, 1))
-                atomC, coordC = fx.rocdl.cdna5.make_tiled_tdm_atom(
-                    fx.rocdl.TensorStore(),
-                    gtC,
-                    fx.make_layout(c_tile, (STORE_PITCH, 1)),
-                    c_tile,
-                    num_warps=num_waves,
-                )
-                blkC = fx.zipped_divide(coordC, c_tile)[None, (0, None)]
-                src = tensor_view(
-                    fx.recast_iter(oc_store, base_ptr),
-                    (c_tile, 1),
-                    ((STORE_PITCH, 1), tile_m * STORE_PITCH),
-                )
-                tCs, tCg = fx.rocdl.cdna5.tdm_partition(
-                    atomC, wave, fx.make_layout(num_waves, 1), src, blkC
-                )
-                fx.copy(atomC, tCs[None, 0], tCg[None, 0])
+                if const_expr(STORE_PAD == 0):
+                    gtC = tensor_view(
+                        c_iter + c_off_rt, (tile_m, STORE_N), (STORE_N, 1)
+                    )
+                    atomC = make_tdm_store(gtC, mn_oob, out_stride)
+                    src = tensor_view(
+                        fx.recast_iter(oc_store, base_ptr),
+                        (tile_m, STORE_N),
+                        (STORE_N, 1),
+                    )
+                else:
+                    # The LDS tile is (tile_m, STORE_PITCH) dense; the per-dim OOB
+                    # extent clamps the inner axis to STORE_N so the pad never lands.
+                    gtC = tensor_view(
+                        c_iter + c_off_rt, (tile_m, STORE_PITCH), (out_stride, 1)
+                    )
+                    atomC = fx.rocdl.make_tdm_atom(
+                        gtC,
+                        [mn_oob, STORE_N],
+                        strides=[out_stride, None],
+                        num_warps=num_waves,
+                    )
+                    src = tensor_view(
+                        fx.recast_iter(oc_store, base_ptr),
+                        (tile_m, STORE_PITCH),
+                        (STORE_PITCH, 1),
+                    )
+                fx.copy(atomC, src, gtC)
                 if const_expr(stage1_quant_out and stage1_act):
                     rocdl.s_wait_storecnt(0)
-                rocdl.s_wait_tensorcnt(0)
+                tdm_ops.tensor_wait(0)
 
         if const_expr(persistent_workers > 0):
             # Every wave must retire the output store before another wave
             # reuses the same LDS arena for the next task's input. This also
-            # covers the fused scatter's s_wait_tensorcnt above.
+            # covers the fused scatter's tensor_wait above.
             workgroup_barrier()
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])

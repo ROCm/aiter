@@ -373,12 +373,12 @@ def launch_mla_pagesize1_fp8_fp8(
         @flyc.jit
         def wait_kv_tile(has_next, has_second_next):
             if has_second_next:
-                rocdl.s_wait_tensorcnt(2)
+                tdm_ops.tensor_wait(2)
             else:
                 if has_next:
-                    rocdl.s_wait_tensorcnt(1)
+                    tdm_ops.tensor_wait(1)
                 else:
-                    rocdl.s_wait_tensorcnt(0)
+                    tdm_ops.tensor_wait(0)
 
         def load_k_tile(raw_slot, n_tile):
             quarter_base = kv_quarter_base(raw_slot, n_tile)
@@ -927,7 +927,7 @@ def launch_mla_pagesize1_fp8_fp8(
             )
             output_scale = inv_sum * kv_descale
 
-            rocdl.s_wait_tensorcnt(0)
+            tdm_ops.tensor_wait(0)
             gpu.barrier()
 
             def stage_output_lds(as_bf16, accs, scale, q_valid):
@@ -966,14 +966,8 @@ def launch_mla_pagesize1_fp8_fp8(
             def copy_output_to_global(ptr_out, elem_ty, tile_base, q_len):
                 rows = q_tile_rows * num_q_heads
                 valid_rows = q_len * num_q_heads
-                out_tile = (rows, V_HEAD_DIM)
-                global_view = fx.Tensor(
-                    fx.make_view(
-                        fx.add_offset(ptr_out, tile_base),
-                        fx.make_layout((valid_rows, V_HEAD_DIM), (V_HEAD_DIM, 1)),
-                    )
-                )
-                lds_box = fx.Tensor(
+                layout = fx.make_layout((rows, V_HEAD_DIM), (V_HEAD_DIM, 1))
+                lds_view = fx.Tensor(
                     fx.make_view(
                         fx.recast_iter(
                             fx.PointerType.get(
@@ -983,23 +977,22 @@ def launch_mla_pagesize1_fp8_fp8(
                             ),
                             lds_base,
                         ),
-                        fx.make_layout(
-                            (out_tile, 1), ((V_HEAD_DIM, 1), rows * V_HEAD_DIM)
-                        ),
+                        layout,
                     )
                 )
-                out_atom, out_coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
-                    fx.rocdl.TensorStore(),
+                global_view = fx.Tensor(
+                    fx.make_view(fx.add_offset(ptr_out, tile_base), layout)
+                )
+                fx.copy(
+                    fx.rocdl.make_tdm_atom(
+                        global_view,
+                        [valid_rows, None],
+                        strides=[V_HEAD_DIM, None],
+                        num_warps=NUM_WAVES,
+                    ),
+                    lds_view,
                     global_view,
-                    fx.make_layout(out_tile, (V_HEAD_DIM, 1)),
-                    out_tile,
-                    num_warps=NUM_WAVES,
                 )
-                out_blk = fx.zipped_divide(out_coord, out_tile)[None, (0, None)]
-                tOs, tOg = fx.rocdl.cdna5.tdm_partition(
-                    out_atom, wave_id, fx.make_layout(NUM_WAVES, 1), lds_box, out_blk
-                )
-                fx.copy(out_atom, tOs[None, 0], tOg[None, 0])
 
             lse_value = has_mass.select(
                 running_max + fmath.log(running_sum),
@@ -1042,7 +1035,7 @@ def launch_mla_pagesize1_fp8_fp8(
                 # already the merged LSE; the reduce never revisits these rows.
                 if const_expr(write_final_lse):
                     write_lse(ptr_final_lse, qo_start, owns_output, lse_value)
-            rocdl.s_wait_tensorcnt(0)
+            tdm_ops.tensor_wait(0)
             gpu.barrier()
 
     kernel(

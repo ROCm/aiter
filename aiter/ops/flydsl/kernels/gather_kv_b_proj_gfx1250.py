@@ -215,27 +215,28 @@ def launch_gather_kv_b_proj_8wave_gfx1250(
 
         # Partition B evenly too: each wave issues one B TDM plus four A
         # gathers per K tile. Equal per-wave tensorcnt is what makes the common
-        # pipelined s_wait_tensorcnt counts below valid.
+        # pipelined tensor_wait counts below valid.
         B_OUTER = tile_n // 16
         B_ROWS_PER_WAVE = B_OUTER // num_waves
         b_wave_row = wave * B_ROWS_PER_WAVE
         b_off0 = blk_n64 // 16 * (k64 * 16)
-        B_TILE = (B_ROWS_PER_WAVE, tile_k * 16)
         gB = _gv(
             gB_base,
             b_off0 + fx.Int64(b_wave_row) * (k64 * 16),
-            (B_ROWS_PER_WAVE, K_TILES * tile_k * 16),
-            (k64 * 16, 1),
+            (B_ROWS_PER_WAVE, tile_k * 16),
+            (tile_k * 16, 1),
         )
-        atomB, coordB = fx.rocdl.cdna5.make_tiled_tdm_atom(
-            fx.rocdl.TensorLoad(),
-            gB,
-            fx.make_layout(B_TILE, (B_LDS_ROW, 1)),
-            B_TILE,
-            num_warps=1,
+        atomB = fx.atom_set_value(
+            fx.rocdl.make_tdm_atom(
+                gB,
+                [None, None],
+                strides=[k64 * 16, None],
+                num_warps=1,
+                early_timeout=True,
+            ),
+            "workgroup_mask",
+            b_mask,
         )
-        atomB = fx.atom_set_value(atomB, "workgroup_mask", b_mask)
-        blkB = fx.zipped_divide(coordB, B_TILE)[None, (0, None)]
 
         def _gather_indices(group):
             local_base = group * num_waves * A_GATHER_ROWS + wave * A_GATHER_ROWS
@@ -281,15 +282,16 @@ def launch_gather_kv_b_proj_8wave_gfx1250(
                         dgroup3=desc.dgroup3,
                     )
                 )
-            b_box = _lv(
-                fx.add_offset(pa, STAGE_A + b_wave_row * B_LDS_ROW),
-                (B_TILE, 1),
-                ((B_LDS_ROW, 1), B_ROWS_PER_WAVE * B_LDS_ROW),
+            fx.copy(
+                atomB,
+                gB,
+                _lv(
+                    fx.add_offset(pa, STAGE_A + b_wave_row * B_LDS_ROW),
+                    (B_ROWS_PER_WAVE, tile_k * 16),
+                    (B_LDS_ROW, 1),
+                ),
+                imm_offset=ktg * (tile_k * 16),
             )
-            tBs, tBg = fx.rocdl.cdna5.tdm_partition(
-                atomB, 0, fx.make_layout(1, 1), b_box, blkB
-            )
-            fx.copy(atomB, tBg[None, fx.Int32(kt)], tBs[None, 0])
             rocdl.sched_barrier(0)
 
         wmb = wave_m * warp_tile_m

@@ -5,7 +5,7 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
@@ -173,6 +173,18 @@ def launch_gemm_a8w4_tdm(
         def _lv(ptr, shape, stride):  # LDS ring-slot view
             return fx.Tensor(fx.make_view(ptr, fx.make_layout(shape, stride)))
 
+        def _tdm(
+            gt, outer, stride, mask=0, early_timeout=True
+        ):  # 2-D TDM atom; outer clamps dim0, stride = runtime outer stride
+            atom = fx.rocdl.make_tdm_atom(
+                gt,
+                [outer, None],
+                strides=[stride, None],
+                num_warps=num_waves,
+                early_timeout=early_timeout,
+            )
+            return fx.atom_set_value(atom, "workgroup_mask", mask)
+
         gA_base = fx.recast_iter(fx.Int8, arg_a)
         gB_base = fx.recast_iter(fx.Int8, arg_b)
         gSA_base, gSB_base = fx.get_iter(arg_scale_a), fx.get_iter(arg_scale_b)
@@ -198,117 +210,118 @@ def launch_gemm_a8w4_tdm(
         W_SA = (4, 5) if WS8 else (0, 1)
         W_SB = (6, 7) if WS8 else (2, 3)
 
-        WARP1 = fx.make_layout(1, 1)
-
-        def _tiled1(base, off, rows, tile, g_stride, lds_row, mask=0):
-            """Single-warp load whose coordinate rest carries the K tile number."""
-            gt = _gv(base, off, (rows, tile[1] * K_TILES), (g_stride, 1))
-            atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
-                fx.rocdl.TensorLoad(),
+        def _tdm1(gt, outer, stride, mask=0, early_timeout=True):
+            atom = fx.rocdl.make_tdm_atom(
                 gt,
-                fx.make_layout(tile, (lds_row, 1)),
-                tile,
+                [outer, None],
+                strides=[stride, None],
                 num_warps=1,
+                early_timeout=early_timeout,
             )
-            atom = fx.atom_set_value(atom, "workgroup_mask", mask)
-            return atom, fx.zipped_divide(coord, tile)[None, (0, None)]
+            return fx.atom_set_value(atom, "workgroup_mask", mask)
 
-        atomA_h, blkA_h, atomB_h, blkB_h = [], [], [], []
-        atomSA_h, blkSA_h, atomSB_h, blkSB_h = [], [], [], []
+        gA_h, atomA_h, gB_h, atomB_h = [], [], [], []
+        gSA_h, atomSA_h, gSB_h, atomSB_h = [], [], [], []
         for h in range_constexpr(2):
-            a, b = _tiled1(
+            ga = _gv(
                 gA_base,
                 a_off0 + fx.Int64(h * HM) * A_OUTER_STRIDE,
-                mn_oob - h * HM,
                 (HM, A_ROW_B),
-                A_OUTER_STRIDE,
-                A_LDS_ROW,
-                a_mask,
+                (A_ROW_B, 1),
             )
-            atomA_h.append(a)
-            blkA_h.append(b)
-            a, b = _tiled1(
+            gA_h.append(ga)
+            atomA_h.append(
+                fx.atom_set_value(
+                    fx.rocdl.make_tdm_atom(
+                        ga,
+                        [mn_oob - h * HM, None],
+                        strides=[A_OUTER_STRIDE, None],
+                        num_warps=1,
+                        pad_interval=A_ROW_B,
+                        pad_amount=LDS_PAD_A,
+                        early_timeout=True,
+                    ),
+                    "workgroup_mask",
+                    a_mask,
+                )
+            )
+            gb = _gv(
                 gB_base,
                 b_off0 + fx.Int64(h * HB) * Kp16,
-                HB,
                 (HB, PACK_TK * 16),
-                Kp16,
-                B_LDS_ROW,
-                b_mask,
+                (PACK_TK * 16, 1),
             )
-            atomB_h.append(a)
-            blkB_h.append(b)
-            a, b = _tiled1(
+            gB_h.append(gb)
+            atomB_h.append(_tdm1(gb, None, Kp16, b_mask))
+            gsa = _gv(
                 gSA_base,
                 sa_off0 + fx.Int64(h * HSA) * SA_OUTER_STRIDE,
-                sa_oob - h * HSA,
                 (HSA, SC_INNER),
-                SA_OUTER_STRIDE,
-                SC_INNER,
-                a_mask,
+                (SC_INNER, 1),
             )
-            atomSA_h.append(a)
-            blkSA_h.append(b)
-            a, b = _tiled1(
+            gSA_h.append(gsa)
+            atomSA_h.append(_tdm1(gsa, sa_oob - h * HSA, SA_OUTER_STRIDE, a_mask))
+            gsb = _gv(
                 gSB_base,
                 sb_off0 + fx.Int64(h * HSB) * SB_OUTER_STRIDE,
-                HSB,
                 (HSB, SC_INNER),
-                SB_OUTER_STRIDE,
-                SC_INNER,
-                b_mask,
+                (SC_INNER, 1),
             )
-            atomSB_h.append(a)
-            blkSB_h.append(b)
+            gSB_h.append(gsb)
+            atomSB_h.append(_tdm1(gsb, None, SB_OUTER_STRIDE, b_mask))
         base_i32 = fx.recast_iter(fx.Int32, base_ptr)
 
-        def _tcopy(w, atom, blk, ptr, tile, lds_row, kt):
-            """One warp's tiled load; the K tile number indexes the rest."""
-            box = _lv(ptr, (tile, 1), ((lds_row, 1), tile[0] * lds_row))
-            ts, tg = fx.rocdl.cdna5.tdm_partition(atom, 0, WARP1, box, blk)
+        def _wcopy(w, atom, gt, lv, imm_offset):
             if wave == w:
-                fx.copy(atom, tg[None, kt], ts[None, 0])
+                fx.copy(atom, gt, lv, imm_offset=imm_offset)
 
         def issue(s, kt):
             pa = _buf_ptr(s)
             so4 = s * (PITCH // 4)
-            kti = fx.Int32(kt)
             for h in range_constexpr(2):
-                _tcopy(
+                _wcopy(
                     W_A[h],
                     atomA_h[h],
-                    blkA_h[h],
-                    fx.add_offset(pa, h * HM * A_LDS_ROW),
-                    (HM, A_ROW_B),
-                    A_LDS_ROW,
-                    kti,
+                    gA_h[h],
+                    _lv(
+                        fx.add_offset(pa, h * HM * A_LDS_ROW),
+                        (HM, A_ROW_B),
+                        (A_LDS_ROW, 1),
+                    ),
+                    fx.Int64(kt * A_ROW_B),
                 )
-                _tcopy(
+                _wcopy(
                     W_B[h],
                     atomB_h[h],
-                    blkB_h[h],
-                    fx.add_offset(pa, STAGE_A + h * HB * B_LDS_ROW),
-                    (HB, PACK_TK * 16),
-                    B_LDS_ROW,
-                    kti,
+                    gB_h[h],
+                    _lv(
+                        fx.add_offset(pa, STAGE_A + h * HB * B_LDS_ROW),
+                        (HB, PACK_TK * 16),
+                        (B_LDS_ROW, 1),
+                    ),
+                    fx.Int64(kt * (PACK_TK * 16)),
                 )
-                _tcopy(
+                _wcopy(
                     W_SA[h],
                     atomSA_h[h],
-                    blkSA_h[h],
-                    fx.add_offset(base_i32, so4 + SA_OFF // 4 + h * HSA * SC_INNER),
-                    (HSA, SC_INNER),
-                    SC_INNER,
-                    kti,
+                    gSA_h[h],
+                    _lv(
+                        fx.add_offset(base_i32, so4 + SA_OFF // 4 + h * HSA * SC_INNER),
+                        (HSA, SC_INNER),
+                        (SC_INNER, 1),
+                    ),
+                    fx.Int64(kt * (SC_INNER * 4)),
                 )
-                _tcopy(
+                _wcopy(
                     W_SB[h],
                     atomSB_h[h],
-                    blkSB_h[h],
-                    fx.add_offset(base_i32, so4 + SB_OFF // 4 + h * HSB * SC_INNER),
-                    (HSB, SC_INNER),
-                    SC_INNER,
-                    kti,
+                    gSB_h[h],
+                    _lv(
+                        fx.add_offset(base_i32, so4 + SB_OFF // 4 + h * HSB * SC_INNER),
+                        (HSB, SC_INNER),
+                        (SC_INNER, 1),
+                    ),
+                    fx.Int64(kt * (SC_INNER * 4)),
                 )
 
         wmb = wave_m * warp_tile_m
@@ -475,26 +488,14 @@ def launch_gemm_a8w4_tdm(
         workgroup_barrier(use_cluster=False)
         oc = out_cls
         c_off_rt = c_outer_off * fx.Int64(c_stride) + c_inner_off
-        c_tile = (tile_m, tile_n)
-        gtC = _gv(fx.get_iter(arg_c), c_off_rt, (mn_oob, tile_n), (c_stride, 1))
-        atomC, coordC = fx.rocdl.cdna5.make_tiled_tdm_atom(
-            fx.rocdl.TensorStore(),
-            gtC,
-            fx.make_layout(c_tile, (tile_n, 1)),
-            c_tile,
-            num_warps=num_waves,
+        gtC = _gv(fx.get_iter(arg_c), c_off_rt, (tile_m, tile_n), (tile_n, 1))
+        atomC = _tdm(
+            gtC, mn_oob, c_stride, early_timeout=False
+        )  # runtime N stride via strides=
+        fx.copy(
+            atomC, _lv(fx.recast_iter(oc, base_ptr), (tile_m, tile_n), (tile_n, 1)), gtC
         )
-        blkC = fx.zipped_divide(coordC, c_tile)[None, (0, None)]
-        sC = _lv(
-            fx.recast_iter(oc, base_ptr),
-            (c_tile, 1),
-            ((tile_n, 1), tile_m * tile_n),
-        )
-        tCs, tCg = fx.rocdl.cdna5.tdm_partition(
-            atomC, wave, fx.make_layout(num_waves, 1), sC, blkC
-        )
-        fx.copy(atomC, tCs[None, 0], tCg[None, 0])
-        rocdl.s_wait_tensorcnt(0)
+        tdm_ops.tensor_wait(0)
 
     gx = (i32_m + (tile_m - 1)) // tile_m
     gy = (N + (tile_n - 1)) // tile_n
