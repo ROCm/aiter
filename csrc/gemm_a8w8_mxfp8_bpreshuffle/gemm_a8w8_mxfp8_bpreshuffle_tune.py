@@ -111,29 +111,11 @@ def opus_kernel_name(kid):
     """CSV name in the usual OPUS geometry order; dispatch uses the exact kid."""
     from csrc.opus_gemm.opus_gemm_common import (
         a8w8_mxscale_gemm_bpreshuffle_kernels_list,
+        a8w8_mxscale_bpreshuffle_kernel_name,
     )
 
     instance = a8w8_mxscale_gemm_bpreshuffle_kernels_list[int(kid)]
-    entry = instance.bpreshuffle_co or instance.bpreshuffle_entry
-    family = {
-        "pin_agpr": "4wave_pin_agpr_co",
-        "pingpong_lds": "m_repeat_co",
-        "prefetch_b_vgpr": (
-            "b_vgpr_co" if instance.bpreshuffle_co else "prefetch_b_vgpr"
-        ),
-        "prefetch_b_vgpr_overlap": "b_vgpr_overlap_co",
-        "wave_interleave": "interleave_co",
-    }[entry["pipeline"]]
-    fields = (
-        (instance.BLOCK_SIZE, instance.B_M, instance.B_N, instance.B_K),
-        (instance.T_M, instance.T_N),
-        (instance.W_M, instance.W_N, instance.W_K),
-        (instance.GROUP_M, instance.GROUP_N, instance.GROUP_K),
-    )
-    return "_".join(
-        ("opus_gemm", instance.arch_prefix, family)
-        + tuple("x".join(map(str, values)) for values in fields)
-    )
+    return a8w8_mxscale_bpreshuffle_kernel_name(instance)
 
 
 def opus_candidates(m, n, k, kids=None):
@@ -181,6 +163,11 @@ def _opus_filtered_candidates(
     candidates, shape, cu_num, seed_kids=(), top_geometries=4
 ):
     """Choose geometry, schedule and pin candidates before any measurement."""
+    from csrc.opus_gemm.opus_gemm_common import (
+        a8w8_mxscale_bpreshuffle_tune_candidates,
+    )
+
+    candidates = a8w8_mxscale_bpreshuffle_tune_candidates(candidates, seed_kids)
     groups = defaultdict(list)
     for kid, instance in candidates:
         groups[_opus_geometry(instance)].append(kid)
@@ -211,7 +198,8 @@ def opus_available_kids():
     return {
         kid
         for kid, instance in a8w8_mxscale_gemm_bpreshuffle_kernels_list.items()
-        if instance.bpreshuffle_co is None or (co_dir / f"{instance.name}.co").is_file()
+        if instance.bpreshuffle_co is None
+        or (co_dir / instance.bpreshuffle_co["image"]).is_file()
     }
 
 
@@ -576,7 +564,7 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                     splits = parse_bmm_kernel_name(name)["splits"]
                     runs.append((KERNEL_ID_BASE_BMM + j, splits, name, run_bmm_flydsl))
             runs.extend(
-                (kid, 1, instance.name, run_gemm_opus) for kid, instance in opus
+                (kid, 1, opus_kernel_name(kid), run_gemm_opus) for kid, _ in opus
             )
             for kernel_id, split_k, name, run in runs:
                 is_opus = run is run_gemm_opus

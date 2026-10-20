@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Wave-group schedule follows the FlyDSL 8-wave pipeline. Loads, scaled MFMA
-// and output conversion use OPUS; K128 scales are cached once per block.
+// Layouts originate from the FlyDSL 8-wave adaptation; the OPUS main loop
+// streams N fragments with uniform block barriers and two B register slots.
 #pragma once
 
 #include <opus/hip_minimal.hpp>
@@ -22,24 +22,14 @@ __device__ inline int b_offset(int row, int col) {
     return (row / 8) * 1024 + (row % 8) * 16 + (col / 16) * 128;
 }
 
-template<int Count>
-__device__ inline void wait_barrier() {
-    opus::s_waitcnt_vmcnt(opus::number<Count>{});
-    opus::sync_threads();
-}
-
-template<int Tiles, bool Preshuffled, class Fragment, class Mem>
-__device__ inline auto read_operand(Mem& smem, int base, int wave_coord, int lane) {
-    opus::array<Fragment, Tiles> result;
-    opus::static_for<Tiles>([&](auto i) {
-        constexpr int tile = decltype(i)::value;
-        const int row = wave_coord * Tiles * 16 + tile * 16 + lane % 16;
-        const int col = (lane / 16) * 16;
-        const int lo = Preshuffled ? b_offset(row, col) : a_offset(row, col);
-        const int hi = Preshuffled ? b_offset(row, col + 64) : a_offset(row, col + 64);
-        opus::set_slice(result[tile], opus::load<16>(smem, base + lo), opus::number<0>{}, opus::number<16>{});
-        opus::set_slice(result[tile], opus::load<16>(smem, base + hi), opus::number<16>{}, opus::number<32>{});
-    });
+template<bool Preshuffled, class Fragment, class Mem>
+__device__ inline Fragment read_operand_fragment(Mem& smem, int base, int row, int lane) {
+    const int col = (lane / 16) * 16;
+    const int lo = Preshuffled ? b_offset(row, col) : a_offset(row, col);
+    const int hi = Preshuffled ? b_offset(row, col + 64) : a_offset(row, col + 64);
+    Fragment result;
+    opus::set_slice(result, opus::load<16>(smem, base + lo), opus::number<0>{}, opus::number<16>{});
+    opus::set_slice(result, opus::load<16>(smem, base + hi), opus::number<16>{}, opus::number<32>{});
     return result;
 }
 
@@ -152,11 +142,11 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_wave_interleave_body(
         seq<16, 16, 128>{},
         mfma_adaptor{});
     using MMA = typename decltype(mma)::MMA;
-    array<typename MMA::vtype_a, T::E_M> v_a;
-    array<typename MMA::vtype_b, T::E_N> v_b0, v_b1;
+    array<array<typename MMA::vtype_a, T::E_M>, 2> v_a;
+    array<typename MMA::vtype_b, 2 * T::E_N> v_b;
     array<typename MMA::vtype_c, 4 * T::E_M * T::E_N> v_c{};
     array<unsigned, 2> first_scale_a{};
-    unsigned scale_a = 0;
+    array<unsigned, 2> scale_a{};
     unsigned scale_b = 0;
 
     // Keep K=0 scales in registers. The remaining 127 A columns plus packed
@@ -236,123 +226,73 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_wave_interleave_body(
         }
         return result;
     };
-    auto compute = [&](auto half_m_i, auto half_n_i, const auto& b, auto barrier_i) {
-        constexpr int hm = decltype(half_m_i)::value;
-        constexpr int hn = decltype(half_n_i)::value;
-        __builtin_amdgcn_s_setprio(1);
-        static_for<T::E_M>([&](auto m_i) {
-            static_for<T::E_N>([&](auto n_i) {
-                constexpr int index = ((hm * 2 + hn) * T::E_M + decltype(m_i)::value) * T::E_N + decltype(n_i)::value;
+    auto issue_tile = [&](auto stage_i, int k) {
+        constexpr int first = decltype(stage_i)::value * 2;
+        load_a(number<first>{}, k);
+        load_a(number<first + 1>{}, k);
+        load_b(number<first>{}, k);
+        load_b(number<first + 1>{}, k);
+    };
+    auto read_b = [&](auto stage_i, auto n_i) {
+        constexpr int n = decltype(n_i)::value;
+        constexpr int half = n / T::E_N;
+        constexpr int slot = decltype(stage_i)::value * 2 + half;
+        const int r = (wave_n * T::E_N + n % T::E_N) * 16 + lane % 16;
+        v_b[n] = read_operand_fragment<true, typename MMA::vtype_b>(
+            s_b, slot * T::B_SLOT, r, lane);
+    };
+    auto consume_tile = [&](auto stage_i, int k) {
+        constexpr int stage = decltype(stage_i)::value;
+        s_waitcnt_vmcnt(0_I);
+        s_waitcnt_lgkmcnt(0_I);
+        sync_threads();
+        if (k + 1 < loops)
+            issue_tile(number<1 - stage>{}, k + 1);
 
-                v_c[index] = MMA{}(v_a[decltype(m_i)::value], b[decltype(n_i)::value], v_c[index],
-                    static_cast<int>(scale_a), static_cast<int>(scale_b), m_i, number<hn>{});
+        static_for<2>([&](auto half_i) {
+            constexpr int half = decltype(half_i)::value;
+            scale_a[half] = read_scale_a(k, half_i);
+            static_for<T::E_M>([&](auto m_i) {
+                constexpr int m = decltype(m_i)::value;
+                const int r = (wave_m * T::E_M + m) * 16 + lane % 16;
+                v_a[half][m] = read_operand_fragment<false, typename MMA::vtype_a>(
+                    s_a, (stage * 2 + half) * T::A_SLOT, r, lane);
             });
         });
-        __builtin_amdgcn_s_setprio(0);
-        if constexpr (decltype(barrier_i)::value)
-            sync_threads();
-    };
-    auto read_a = [&](auto slot_i) {
-        v_a = read_operand<T::E_M, false, typename MMA::vtype_a>(
-            s_a, decltype(slot_i)::value * T::A_SLOT, wave_m, lane);
-    };
-    auto read_b = [&](auto slot_i) {
-        return read_operand<T::E_N, true, typename MMA::vtype_b>(
-            s_b, decltype(slot_i)::value * T::B_SLOT, wave_n, lane);
+        scale_b = load<1>(s_sfb, k)[0];
+        static_for<2 * T::E_N>([&](auto n_i) { read_b(stage_i, n_i); });
+        s_waitcnt_lgkmcnt(0_I);
+
+        static_for<2 * T::E_N>([&](auto n_i) {
+            constexpr int n = decltype(n_i)::value;
+            constexpr int half_n = n / T::E_N;
+            static_for<2>([&](auto half_i) {
+                constexpr int half_m = decltype(half_i)::value;
+                static_for<T::E_M>([&](auto m_i) {
+                    constexpr int m = decltype(m_i)::value;
+                    constexpr int ci = ((half_m * 2 + half_n) * T::E_M + m) * T::E_N + n % T::E_N;
+                    v_c[ci] = MMA{}(v_a[half_m][m], v_b[n], v_c[ci],
+                        static_cast<int>(scale_a[half_m]), static_cast<int>(scale_b), m_i, number<half_n>{});
+                });
+            });
+
+        });
     };
 
     // ===== Prologue =====
-    // One wave_m group enters one barrier later, alternating memory work and MFMA.
-    load_b(number<0>{}, 0);
-    load_a(number<0>{}, 0);
-    load_b(number<1>{}, 0);
-    load_a(number<1>{}, 0);
-    if (wave_m == 1)
-        sync_threads();
-    wait_barrier<T::A_STEPS + T::B_STEPS>();
-    load_b(number<2>{}, 1);
-    load_a(number<2>{}, 1);
-    load_b(number<3>{}, 1);
-    wait_barrier<T::A_STEPS + 2 * T::B_STEPS>();
-
-    auto advance = [&](auto stage_i, int k) {
-        constexpr int cur = decltype(stage_i)::value * 2;
-        constexpr int next = (1 - decltype(stage_i)::value) * 2;
-        scale_a = read_scale_a(k, number<0>{});
-        scale_b = load<1>(s_sfb, k)[0];
-        v_b0 = read_b(number<cur>{});
-        read_a(number<cur>{});
-        load_a(number<next + 1>{}, k + 1);
-        sync_threads();
-        compute(number<0>{}, number<0>{}, v_b0, number<1>{});
-        v_b1 = read_b(number<cur + 1>{});
-        load_b(number<cur>{}, k + 2);
-        sync_threads();
-        compute(number<0>{}, number<1>{}, v_b1, number<1>{});
-        scale_a = read_scale_a(k, number<1>{});
-        read_a(number<cur + 1>{});
-        load_a(number<cur>{}, k + 2);
-        wait_barrier<2 * T::A_STEPS + 2 * T::B_STEPS>();
-        compute(number<1>{}, number<0>{}, v_b0, number<1>{});
-        load_b(number<cur + 1>{}, k + 2);
-        wait_barrier<2 * T::A_STEPS + T::B_STEPS>();
-        compute(number<1>{}, number<1>{}, v_b1, number<1>{});
-    };
-
-    // Peel the first pair so the K=0 scale registers die before the main loop.
-    if (loops > 2)
-        advance(number<0>{}, 0);
-    if (loops > 3)
-        advance(number<1>{}, 1);
+    issue_tile(0_I, 0);
 
     // ===== Main loop =====
-    // Advance both wave groups through alternating LDS slots.
+    // All waves publish together; each B fragment is reused across both M halves.
 #pragma nounroll
-    for (int k = 2; k + 2 < loops; k += 2) {
-        advance(number<0>{}, k);
-        if (k + 3 < loops)
-            advance(number<1>{}, k + 1);
+    for (int k = 0; k < loops; k += 2) {
+        consume_tile(0_I, k);
+        if (k + 1 < loops)
+            consume_tile(1_I, k + 1);
     }
 
-    // ===== Epilogue =====
-    // Peel the final two stages so the lagging group never reads an unpublished slot.
-    scale_a = read_scale_a(loops - 2, number<0>{});
-    scale_b = load<1>(s_sfb, loops - 2)[0];
-    v_b0 = read_b(number<0>{});
-    read_a(number<0>{});
-    wait_barrier<0>();
-    compute(number<0>{}, number<0>{}, v_b0, number<1>{});
-    v_b1 = read_b(number<1>{});
-    sync_threads();
-    compute(number<0>{}, number<1>{}, v_b1, number<1>{});
-    scale_a = read_scale_a(loops - 2, number<1>{});
-    read_a(number<1>{});
-    load_a(number<3>{}, loops - 1);
-    sync_threads();
-    compute(number<1>{}, number<0>{}, v_b0, number<1>{});
-    v_b0 = read_b(number<2>{});
-    sync_threads();
-    compute(number<1>{}, number<1>{}, v_b1, number<1>{});
-
-    scale_a = read_scale_a(loops - 1, number<0>{});
-    scale_b = load<1>(s_sfb, loops - 1)[0];
-    read_a(number<2>{});
-    wait_barrier<0>();
-    compute(number<0>{}, number<0>{}, v_b0, number<1>{});
-    v_b1 = read_b(number<3>{});
-    sync_threads();
-    compute(number<0>{}, number<1>{}, v_b1, number<1>{});
-    scale_a = read_scale_a(loops - 1, number<1>{});
-    read_a(number<3>{});
-    sync_threads();
-    compute(number<1>{}, number<0>{}, v_b0, number<0>{});
-    compute(number<1>{}, number<1>{}, v_b1, number<0>{});
-    sync_threads();
-
-    // Bring both groups to the same phase before reusing all LDS for output.
-    if (wave_m == 0)
-        sync_threads();
-    s_waitcnt_lgkmcnt(number<0>{});
+    s_waitcnt_vmcnt(0_I);
+    s_waitcnt_lgkmcnt(0_I);
     sync_threads();
 
     // ===== Output writeback =====

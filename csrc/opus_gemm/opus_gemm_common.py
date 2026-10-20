@@ -2910,6 +2910,36 @@ a8w8_mxscale_bmm_kernels_list = {
 }
 
 
+def _bpreshuffle_geometry_name(pipeline, fields, *, co):
+    family = {
+        "pin_agpr": "4wave_pin_agpr_co",
+        "pingpong_lds": "m_repeat_co",
+        "prefetch_b_vgpr": "b_vgpr_co" if co else "prefetch_b_vgpr",
+        "prefetch_b_vgpr_overlap": "b_vgpr_overlap_co",
+        "wave_interleave": "interleave_co",
+    }[pipeline]
+    return "_".join(
+        ("opus_gemm", "gfx950", family)
+        + tuple("x".join(map(str, values)) for values in fields)
+    )
+
+
+def a8w8_mxscale_bpreshuffle_kernel_name(instance):
+    """Name shared by tuned CSV rows and CO image basenames."""
+    if instance.bpreshuffle_co is not None:
+        return os.path.splitext(instance.bpreshuffle_co["image"])[0]
+    entry = instance.bpreshuffle_co or instance.bpreshuffle_entry
+    fields = (
+        (instance.BLOCK_SIZE, instance.B_M, instance.B_N, instance.B_K),
+        (instance.T_M, instance.T_N),
+        (instance.W_M, instance.W_N, instance.W_K),
+        (instance.GROUP_M, instance.GROUP_N, instance.GROUP_K),
+    )
+    return _bpreshuffle_geometry_name(
+        entry["pipeline"], fields, co=instance.bpreshuffle_co is not None
+    )
+
+
 def _load_gfx950_co_kernels(path):
     with open(path) as stream:
         document = json.load(stream)
@@ -2947,8 +2977,6 @@ def _load_gfx950_co_kernels(path):
                 entries[kid] = {
                     **base, "kid": kid, "pin_variant": True,
                     "traits": {**base["traits"], "args": variant_args},
-                    "symbol": (base["symbol"].rsplit("_pin", 1)[0]
-                               + f"_pinA{int(bool(mask & 1))}B{int(bool(mask & 2))}C{int(bool(mask & 4))}"),
                     "configKey": f"bpreshuffle_co_{base['pipeline']}_{kid}",
                 }
             entry = entries[kid]
@@ -2958,6 +2986,25 @@ def _load_gfx950_co_kernels(path):
             if entry.get("pin_group", group["base"]) != group["base"]:
                 raise ValueError(f"CO {kid} belongs to two pin groups")
             entry.update(pin_group=group["base"], pin_mask=mask)
+    image_configs = {}
+    for kid, entry in sorted(entries.items()):
+        fields = (
+            (entry["block_size"], *entry["tile"]),
+            entry["wave_layout"],
+            (16, 16, 128),
+            (1, 128, 128),
+        )
+        name = _bpreshuffle_geometry_name(entry["pipeline"], fields, co=True)
+        # Persist only the actual differences needed to distinguish this image.
+        suffix = document["image_suffixes"][str(kid)]
+        symbol = name + (f"_{suffix}" if suffix else "")
+        image = symbol + ".co"
+        config = {key: value for key, value in entry.items()
+                  if key not in ("kid", "configKey", "pin_variant", "pin_group", "pin_mask")}
+        if image_configs.setdefault(image, config) != config:
+            raise ValueError(f"Different CO configurations share image name {image}")
+        entry["symbol"] = symbol
+        entry["image"] = image
     return entries
 
 
@@ -3067,6 +3114,46 @@ def candidate_kids_for_shape(gfx, m, n, k, outdtype="bf16"):
         return []
     return [kid for kid, instance in sorted(a8w8_mxscale_gemm_bpreshuffle_kernels_list.items())
             if a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k)]
+
+
+def _m_repeat_generic_signature(instance):
+    entry = instance.bpreshuffle_co
+    if entry is None or entry["pipeline"] != "pingpong_lds":
+        return None
+    defaults = (
+        "192", "256", "128", "0", "4", "0", "0", "0",
+        "false", "false", "false", "false", "false", "false", "0", "8",
+    )
+    args = list(entry["traits"]["args"])
+    args.extend(defaults[len(args):])
+    args[3] = "0"
+    return (
+        tuple(entry["tile"]), tuple(entry["wave_layout"]),
+        tuple(args), tuple(entry["device_flags"]),
+    )
+
+
+# Existing paired tuning records: 950123/95063 (15 shapes) and 950125/950120
+# (59 shapes) show geometric mean speedups of 0.53% and 0.63%, respectively.
+GFX950_FIXED_K_TUNE_KIDS = frozenset((950123, 950125))
+
+
+def a8w8_mxscale_bpreshuffle_tune_candidates(candidates, seed_kids=()):
+    """Prefer an equivalent runtime-K candidate unless the fixed-K kid has evidence."""
+    generic = {
+        _m_repeat_generic_signature(instance)
+        for _, instance in candidates
+        if instance.bpreshuffle_co is not None
+        and instance.bpreshuffle_co["pipeline"] == "pingpong_lds"
+        and not instance.bpreshuffle_fixed_k
+    }
+    preserved = set(seed_kids) | GFX950_FIXED_K_TUNE_KIDS
+    return [
+        (kid, instance) for kid, instance in candidates
+        if not instance.bpreshuffle_fixed_k
+        or _m_repeat_generic_signature(instance) not in generic
+        or kid in preserved
+    ]
 
 
 def a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k):

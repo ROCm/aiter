@@ -25,10 +25,14 @@ Source of truth
 table (which drives the JIT codegen) and re-read from there by this script. One
 file describes each variant's tile, cluster, launch bounds, VGPR budget, dtypes
 and device flags, so adding a variant never touches Python. Both sides spell the
-traits through ``co_traits_args()``, which is what makes the three names
-identical without any sidecar::
+traits through ``co_traits_args()``. For both architectures, all three names
+are identical::
 
     .co filename == extern "C" symbol inside the .co == host launcher symbol
+
+gfx950 stores each image as ``gfx950/<CSV kernelName>.co``. Only the actual
+configuration differences needed to distinguish each image appear as suffixes;
+the same name is compiled into the device image and host launcher.
 
 The compiler is NOT pinned to a version
 ---------------------------------------
@@ -308,7 +312,8 @@ def _check_gfx950_pin(entry, path, llvm_bin):
 
 def build_one_gfx950(entry, args, llvm_bin, workdir):
     symbol = entry["symbol"]
-    output = os.path.join(args.out_dir, f"{symbol}.co")
+    output = os.path.join(args.out_dir, entry["image"])
+    os.makedirs(os.path.dirname(output), exist_ok=True)
     optional = entry.get("pin_variant", False)
     if getattr(args, "skip_existing", False) and os.path.isfile(output):
         try:
@@ -361,7 +366,7 @@ def build_one_gfx950(entry, args, llvm_bin, workdir):
     env = dict(os.environ)
     if llvm_bin:
         env["HIP_CLANG_PATH"] = llvm_bin
-    print(f"[build_co] compiling {symbol}", flush=True)
+    print(f"[build_co] compiling {entry['image']}", flush=True)
     try:
         result = _run(command, env=env)
         if result.stderr.strip():
@@ -726,7 +731,12 @@ def main():
         results = {row["kid"]: row for row in built}
         built = sorted(
             (
-                {**results[entry["kid"]], "kid": kid}
+                {
+                    **results[entry["kid"]],
+                    "kid": kid,
+                    "image": entry["image"],
+                    "symbol": entry["symbol"],
+                }
                 for entry in instances
                 for kid in co_aliases[entry["symbol"]]
             ),
