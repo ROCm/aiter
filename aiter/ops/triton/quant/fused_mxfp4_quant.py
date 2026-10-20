@@ -394,7 +394,8 @@ def fused_reduce_act_mul_and_mxfp4_quant(
 
         scaling_mode: The method to calculate MX block scaling.
             - "even" (default): `even_round` in `quark.torch.quantization.utils`.
-            - etc.
+            - "ceil": 2^ceil(log2(amax / 6)), the scale per_1x32_f4_quant_hip
+              uses by default (RoundUp), so a block never saturates.
         shuffle: Indicates whether to enable preshuffling of scales.
             - When enabled, scale dimensions (X, Y) are adjusted to be multiples of 8 and 256, respectively.
         dtype: dtype of y2. If None, y2 has the dtype of x2.
@@ -453,6 +454,10 @@ def fused_reduce_act_mul_and_mxfp4_quant(
     assert (
         N1 % 4 == 0
     ), "The last dimension for x1 should be multiple of 4 for acitvation, multiplication and mxfp4 quantization"
+    assert scaling_mode in (
+        "even",
+        "ceil",
+    ), f"scaling_mode must be 'even' or 'ceil', got {scaling_mode!r}"
 
     MXFP4_QUANT_BLOCK_SIZE = 32
     N_half = N1 // 2
@@ -510,7 +515,7 @@ def fused_reduce_act_mul_and_mxfp4_quant(
     # a 1x128 tile on 4 warps leaves most lanes idle and launches M * N_half / 128
     # programs. One warp over a wider row measured 1.02-3.8x faster on gfx950 for
     # N_half 2048..28672 and M 1..8192, the tile doesn't change the output bytes.
-    if not use_scale_shuffle_padding and not X_HAS_SPLITK and N_half > 1024:
+    if not shuffle and not X_HAS_SPLITK and N_half > 1024:
         BLOCK_SIZE_M1 = 1
         BLOCK_SIZE_N1 = 256 if M <= 64 else 512
         NUM_WARPS = 1
@@ -550,7 +555,7 @@ def fused_reduce_act_mul_and_mxfp4_quant(
         NUM_ITER=NUM_ITER,
         NUM_STAGES=NUM_STAGES,
         MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
-        SCALING_MODE=0,
+        SCALING_MODE=0 if scaling_mode == "even" else 1,
         ACTIVATION=_get_activation_from_str(activation) if activation else "",
         scaleN=scaleN_valid,
         scaleM_pad=(scaleM if use_scale_shuffle_padding else 1),

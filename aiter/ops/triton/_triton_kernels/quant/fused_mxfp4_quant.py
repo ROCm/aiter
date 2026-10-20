@@ -619,7 +619,7 @@ def _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel(
             x = x.to(x_ptr.dtype.element_ty).to(tl.float32)
 
         y, y_scale = _mxfp4_quant_op(
-            x, BLOCK_SIZE_N1, BLOCK_SIZE_M1, MXFP4_QUANT_BLOCK_SIZE
+            x, BLOCK_SIZE_N1, BLOCK_SIZE_M1, MXFP4_QUANT_BLOCK_SIZE, SCALING_MODE
         )
 
         out_offs_m = pid_m * BLOCK_SIZE_M1 + tl.arange(0, BLOCK_SIZE_M1)
