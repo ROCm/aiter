@@ -5,6 +5,27 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 )
 
 
+def positive_int(value: str) -> int:
+    error = argparse.ArgumentTypeError(f"'{value}' is not a positive integer")
+    try:
+        float_value = float(value)
+        if float_value != int(float_value):
+            raise error
+        int_value = int(float_value)
+    except (ValueError, OverflowError):
+        raise error
+    if int_value <= 0:
+        raise error
+    return int_value
+
+
+def pow2_int(value: str) -> int:
+    int_value = positive_int(value)
+    if int_value & (int_value - 1):
+        raise argparse.ArgumentTypeError(f"'{value}' is not a power of 2")
+    return int_value
+
+
 def get_parser(kernel_name: str) -> argparse.ArgumentParser:
     """
     Builds an argparser with default flags for Triton kernel benchmarking.
