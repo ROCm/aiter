@@ -19,6 +19,7 @@ from flydsl.autotune import Config, autotune
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.pa_decode import implementation_cache_tag
+from aiter.ops.flydsl.kernels.pa_decode.traits import d256_pipe
 from aiter.ops.flydsl.kernels.pa_decode_plan import (
     DEFAULT_MAX_BATCH_SIZE,
     PADecodePlan,
@@ -157,7 +158,7 @@ def _pa_decode_configs(*args, resources, num_cu, **kwargs):
     batch = resources.args[2].numel()
     kv_heads = _cache_geometry(resources.args[0])[0]
     capacities = {}
-    for budget in [baseline, 128, 256, 512, 1024, 2048, 4096]:
+    for budget in [baseline, num_cu, 128, 256, 512, 1024, 2048, 4096]:
         capacity = min(
             batch * resources.max_partitions,
             max(batch, (budget + kv_heads - 1) // kv_heads),
@@ -166,8 +167,57 @@ def _pa_decode_configs(*args, resources, num_cu, **kwargs):
     return list(capacities.values())
 
 
-def _pa_decode_default(*args, num_cu, **kwargs):
-    return Config(workgroup_budget=2 * num_cu)
+def _default_workgroup_budget(
+    *,
+    num_cu,
+    head_dim,
+    block_size,
+    kv_dtype,
+    query_length,
+    query_group_size,
+    sliding_window,
+):
+    """CU count for dense page-64 head-256 pipe shapes, otherwise 2*CU.
+
+    Page 16 and sliding windows on that pipe are as fast or faster at 2*CU.
+    """
+    one_cta_per_cu = (
+        block_size == 64
+        and sliding_window <= 0
+        and d256_pipe(
+            get_gfx_runtime(),
+            "fp8" if "float8" in kv_dtype else "bf16",
+            head_dim,
+            block_size,
+            query_length,
+            query_group_size,
+        )
+    )
+    return num_cu if one_cta_per_cu else 2 * num_cu
+
+
+def _pa_decode_default(
+    *args,
+    num_cu,
+    head_dim,
+    block_size,
+    kv_dtype,
+    query_length,
+    query_group_size,
+    sliding_window,
+    **kwargs,
+):
+    return Config(
+        workgroup_budget=_default_workgroup_budget(
+            num_cu=num_cu,
+            head_dim=head_dim,
+            block_size=block_size,
+            kv_dtype=kv_dtype,
+            query_length=query_length,
+            query_group_size=query_group_size,
+            sliding_window=sliding_window,
+        )
+    )
 
 
 @contextmanager
@@ -269,7 +319,9 @@ def prepare_pa_decode_plan(
     """Select a work budget using native FlyDSL autotune, then build a plan.
 
     Call outside graph capture with the actual decode tensors/options. Native
-    cache hits and misses with the 2*CU default do not launch candidates.
+    cache hits and misses with the default do not launch candidates. The
+    default budget is the CU count for dense page-64 shapes of the gfx950
+    head-256 pipe (see ``d256_pipe``) and 2*CU otherwise.
     Set FLYDSL_AUTOTUNE=1 to prepare candidate workspaces/graphs and search with
     FlyDSL's default benchmark and fastest-config selection. Candidates must
     agree with the 2*CU baseline before timing.
@@ -300,12 +352,22 @@ def prepare_pa_decode_plan(
         num_cu = properties.multi_processor_count
         limit = num_cu if max_partitions is None else max_partitions
         num_kv_heads, block_size, layout = _cache_geometry(key_cache)
+        default_budget = _default_workgroup_budget(
+            num_cu=num_cu,
+            head_dim=query.shape[-1],
+            block_size=block_size,
+            kv_dtype=str(key_cache.dtype),
+            query_length=query_length,
+            query_group_size=query.shape[1] // num_kv_heads,
+            sliding_window=sliding_window,
+        )
         # Validate plan geometry even when native autotune takes the default.
         default_plan = plan_pa_decode(
             context_lengths,
             num_kv_heads,
             max_partitions=limit,
             max_batch_size=max_batch_size,
+            workgroup_budget=default_budget,
             sliding_window=sliding_window,
             query_length=query_length,
         )
@@ -377,7 +439,7 @@ def prepare_pa_decode_plan(
             or config.pre_hook is not None
         ):
             raise ValueError("Invalid PA workgroup budget in FlyDSL autotune cache")
-        if budget == 2 * num_cu:
+        if budget == default_budget:
             return default_plan
         return plan_pa_decode(
             context_lengths,
