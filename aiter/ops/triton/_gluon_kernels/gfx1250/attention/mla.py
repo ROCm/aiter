@@ -1466,9 +1466,7 @@ class MLAProgram:
         output_buffers = ()
         for n in gl.static_range(0, cfg.KV_LORA_RANK, STORE_N):
             part = gl.amd.slice(acc, [cfg.BLOCK_M, STORE_N], [0, n])
-            o_smem = gl.allocate_shared_memory(
-                out_ty, [cfg.BLOCK_M, STORE_N], O_LAYOUT
-            )
+            o_smem = gl.allocate_shared_memory(out_ty, [cfg.BLOCK_M, STORE_N], O_LAYOUT)
             output_buffers += (o_smem,)
             o_smem.store(part.to(out_ty))
             gl.amd.gfx1250.tdm.async_store(o_desc, [0, n], o_smem)
@@ -2463,9 +2461,7 @@ def _mla_decode_fwd_kernel(
 
             p, alpha, M = pgm.softmax_part0(S, M)
             if KV_CACHE_DTYPE == "nvfp4":
-                p, L, acc0, acc1 = pgm.softmax_part1_split_head(
-                    p, L, acc0, acc1, alpha
-                )
+                p, L, acc0, acc1 = pgm.softmax_part1_split_head(p, L, acc0, acc1, alpha)
             else:
                 p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
 
@@ -2492,9 +2488,7 @@ def _mla_decode_fwd_kernel(
                 )
             else:
                 kv_lora_trans = pgm.tdm_shared_load_kv_lora_trans(2, buffer_id)
-                acc = pgm.compute_pkv_lora_trans(
-                    p, kv_lora_trans, kv_lora_scales, acc
-                )
+                acc = pgm.compute_pkv_lora_trans(p, kv_lora_trans, kv_lora_scales, acc)
 
             buffer_id = next_buffer_id
 
