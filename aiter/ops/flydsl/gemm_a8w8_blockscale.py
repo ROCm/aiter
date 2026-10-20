@@ -60,9 +60,19 @@ def _prepare_scales(
     if not preshuffle_b:
         x_scale = x_scale.view(M, KB)
         x_scale = x_scale.transpose(0, 1).contiguous()
-    elif not x_scale.is_contiguous():
-        # e.g. sglang's (1, M)-strided view: its .T is already the dense [KB, M].
+    elif x_scale.shape == (M, KB) and x_scale.stride() == (1, M):
+        # when preshuffled in sglang, x_scale already tranposed in buffer but view as [M, KB]: [1, M]
+        # q_scale = aiter_per1x128_quant(x, transpose_scale=True) ## [KB, M]:[M, 1]
+        # q_scale = q_scale.view(M, BK) [M, KB]:[KB, 1] ##buffer tranposed but view as plain buffer.
+        # x_scale = torch.as_strided(q_scale, (M, KB), (1, M)) ##[M, KB]: [1, M]
+
+        # [M, KB]: [1, M] not continguous, here just need to do transpose on sglang scale tensor
         x_scale = x_scale.T.contiguous()
+    elif not x_scale.is_contiguous():
+        raise ValueError(
+            "preshuffle x_scale must be contiguous [K/128, M] bytes "
+            "or an (M, K/128) view with stride (1, M)"
+        )
     sa = x_scale.view(-1)
     return sa, w_scale.contiguous().view(-1)
 
