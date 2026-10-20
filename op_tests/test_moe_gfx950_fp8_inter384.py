@@ -48,9 +48,7 @@ def _run(inter_dim, quant_type, static_a1):
     w1 = torch.randn(
         experts, inter_dim * 2, model_dim, device="cuda", dtype=torch.bfloat16
     )
-    w2 = torch.randn(
-        experts, model_dim, inter_dim, device="cuda", dtype=torch.bfloat16
-    )
+    w2 = torch.randn(experts, model_dim, inter_dim, device="cuda", dtype=torch.bfloat16)
     score = torch.randn(tokens, experts, device="cuda", dtype=torch.bfloat16)
     topk_weights, topk_ids = fused_topk(hidden, score, topk, True)
     w1_q, w1_scale = _quantize(w1, quant_type)
