@@ -4,6 +4,7 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -19,8 +20,13 @@ _LOGGER = AiterTritonLogger()
 #   V[slot, d] -> (slot // x) * head_size * x + d * x + (slot % x)
 # A16W8: q is 16-bit, fp8 KV dequantized (val * scale) before the dot.
 
+_pa_decode_shuffle_swa_repr = make_kernel_repr(
+    "_pa_decode_shuffle_swa_kernel",
+    ["HEAD", "BLOCK", "GRP", "SCALE_SCALAR"],
+)
 
-@triton.jit
+
+@triton.jit(repr=_pa_decode_shuffle_swa_repr)
 def _pa_decode_shuffle_swa_kernel(
     out_ptr,
     q_ptr,
@@ -42,6 +48,9 @@ def _pa_decode_shuffle_swa_kernel(
     ks_s0,
     ks_s1,
     ks_s2,
+    vs_s0,
+    vs_s1,
+    vs_s2,
     k_blk_stride,
     k_head_stride,
     v_blk_stride,
@@ -105,11 +114,17 @@ def _pa_decode_shuffle_swa_kernel(
             k = k * ks_scalar
             v = v * vs_scalar
         else:
-            sc_off = block_id * ks_s0 + kvh * ks_s1 + s * ks_s2
-            ks = tl.load(k_scale_ptr + sc_off, mask=s < BLOCK, other=0.0)
-            vs = tl.load(v_scale_ptr + sc_off, mask=s < BLOCK, other=0.0)
+            ks_off = block_id * ks_s0 + kvh * ks_s1 + s * ks_s2
+            vs_off = block_id * vs_s0 + kvh * vs_s1 + s * vs_s2
+            ks = tl.load(k_scale_ptr + ks_off, mask=s < BLOCK, other=0.0)
+            vs = tl.load(v_scale_ptr + vs_off, mask=s < BLOCK, other=0.0)
             k = k * ks[:, None]
             v = v * vs[:, None]
+        # unused slots get p = 0, but 0 * NaN is NaN in the p @ v dot, so a NaN
+        # left in an unused V slot or its scale has to be zeroed. Only the
+        # window edge blocks have unused slots, interior blocks skip the select.
+        if (b * BLOCK < win_start) | (b * BLOCK + BLOCK > seq_len):
+            v = tl.where(valid[:, None], v, 0.0)
 
         scores = tl.dot(q, tl.trans(k)) * scale
         scores = tl.where(valid[None, :], scores, -float("inf"))
@@ -121,7 +136,8 @@ def _pa_decode_shuffle_swa_kernel(
         acc = acc * alpha[:, None] + tl.dot(p.to(tl.float32), v)
         m_i = m_new
 
-    out = acc / l_i[:, None]
+    # seq_len == 0 (cudagraph padding rows) never enters the loop: write zeros, not 0 / 0
+    out = tl.where(l_i[:, None] > 0.0, acc / l_i[:, None], 0.0)
     o_ptrs = out_ptr + seq * o_s0 + q_head[:, None] * o_s1 + d[None, :] * o_s2
     tl.store(o_ptrs, out.to(out_ptr.dtype.element_ty), mask=q_mask)
 
@@ -139,7 +155,22 @@ def paged_attention_decode_shuffle_swa(
     sliding_window,  # number of keys attended (<= 0 means full causal)
 ):
     """Sliding-window decode over the shuffled fp8 KV layout. One program per
-    (sequence, kv head); decode only (one query token per sequence)."""
+    (sequence, kv head), one query token per sequence.
+
+    Args:
+        out: output, same shape as query, written in place.
+        query: 16-bit query, [num_seqs, num_q_heads, head_size].
+        key_cache, value_cache: fp8 caches in the shuffled layout above.
+        block_tables: int32 [num_seqs, max_num_blocks].
+        seq_lens: int32 [num_seqs]. A row with seq_len 0 gets zeros.
+        scale: softmax scale.
+        k_scale, v_scale: one scalar each, or per token [num_blocks,
+            num_kv_heads, block_size]. K and V scales can have different strides.
+        sliding_window: keys attended per sequence, <= 0 means all.
+
+    Returns:
+        out.
+    """
     num_seqs, num_q_heads, head = query.shape
     num_kv_heads = key_cache.shape[1]
     block_size = key_cache.shape[3]
@@ -149,15 +180,19 @@ def paged_attention_decode_shuffle_swa(
     head_pow2 = triton.next_power_of_2(head)
 
     _LOGGER.info(
-        f"PA_DECODE_SHUFFLE_SWA: q={tuple(query.shape)} "
-        f"k_cache={tuple(key_cache.shape)} window={sliding_window}"
+        "PA_DECODE_SHUFFLE_SWA: q=%s k_cache=%s window=%s",
+        tuple(query.shape),
+        tuple(key_cache.shape),
+        sliding_window,
     )
 
     scale_scalar = k_scale.numel() == 1
     if scale_scalar:
         ks_s0 = ks_s1 = ks_s2 = 0
+        vs_s0 = vs_s1 = vs_s2 = 0
     else:
         ks_s0, ks_s1, ks_s2 = k_scale.stride()
+        vs_s0, vs_s1, vs_s2 = v_scale.stride()
 
     grid = (num_seqs, num_kv_heads)
     _pa_decode_shuffle_swa_kernel[grid](
@@ -181,6 +216,9 @@ def paged_attention_decode_shuffle_swa(
         ks_s0,
         ks_s1,
         ks_s2,
+        vs_s0,
+        vs_s1,
+        vs_s2,
         key_cache.stride(0),
         key_cache.stride(1),
         value_cache.stride(0),
