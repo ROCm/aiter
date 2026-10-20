@@ -372,7 +372,7 @@ def kernel_config(
     return KernelCtx(**locals())
 
 
-# ---- big-M kernel (compile_bigm_layer) ----
+# ---- big-M kernel (compile_bigm_kernel) ----
 # SDMA queues per peer (MORI spreads a peer's queues over its two engines by parity; queues 0
 # and 7 carry no puts)
 QE, QX, QQ, QXS, QS, QID = 1, 2, 3, 4, 5, 6

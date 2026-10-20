@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Host side of the big-M path of MegaMoeTP.forward (the kernel: compile_bigm_layer in
+"""Host side of the big-M path of MegaMoeTP.forward (the kernel: compile_bigm_kernel in
 mega_moe_tp_kernel.py): MegaMoeTPBigM (the SDMA queues and hipIpc arena, buffers, per-batch
 plans, launches), the disk cache of the compiled kernels, the bf16 row gather of the fused tail.
 """
@@ -40,7 +40,7 @@ from .mega_moe_tp_config import (
     i8_row_bytes,
     unit_cap,
 )
-from .mega_moe_tp_kernel import compile_bigm_layer
+from .mega_moe_tp_kernel import compile_bigm_kernel
 
 _log = logging.getLogger("aiter")
 
@@ -712,7 +712,7 @@ class MegaMoeTPBigM:
 
     @staticmethod
     def tailq(tail, local, gather=False):
-        """the kernel variant (compile_bigm_layer's tailq) of a moe() call"""
+        """the kernel variant (compile_bigm_kernel's tailq) of a moe() call"""
         return 3 if gather else 0 if not tail else 2 if local else 1
 
     def _io_launch(self, m, tailq):
@@ -721,7 +721,7 @@ class MegaMoeTPBigM:
         eps, gemma, lim = self.cfg
         w_, opts = self._plan(T)
         order = 4 if self.tp * max(self._split(m)) >= 8192 else 3
-        return compile_bigm_layer(
+        return compile_bigm_kernel(
             self.H,
             self.I,
             self.E,

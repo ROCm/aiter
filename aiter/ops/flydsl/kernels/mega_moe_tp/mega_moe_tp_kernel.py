@@ -107,7 +107,7 @@ from .mega_moe_tp_config import (
 )
 from .schedule import build_schedule
 
-__all__ = ["compile_bigm_layer", "compile_mega_moe_tp"]
+__all__ = ["compile_bigm_kernel", "compile_mega_moe_tp"]
 
 
 @functools.cache
@@ -576,7 +576,7 @@ const_expr = fx.const_expr
 
 
 @functools.cache
-def compile_bigm_layer(
+def compile_bigm_kernel(
     H: int,
     I: int,
     E: int,
@@ -745,7 +745,7 @@ def compile_bigm_layer(
         return f"{struct.unpack('<I', struct.pack('<f', v))[0]:x}"
 
     name = (
-        f"bigm_layer_h{H}_i{I}_e{E}k{K}_tp{tp}_c{C}_rg{RG}_{fb(eps)}{'g' if gemma else 'r'}"
+        f"bigm_kernel_h{H}_i{I}_e{E}k{K}_tp{tp}_c{C}_rg{RG}_{fb(eps)}{'g' if gemma else 'r'}"
         + f"_v23_t{tailq}_c1h{NSBA}_o{ORD}s{NSB}a{UA}d{RQD}r{R8}w{SXW}e{E4}b{BS2}"
         + ("" if act == "swiglu" else f"_{act}{fb(swiglu_limit)}")
     )
@@ -1997,7 +1997,7 @@ def compile_bigm_layer(
 
     # launch forwards its arguments to the kernel by name
     if list(inspect.signature(launch).parameters) != kargs + ["grid", "stream"]:
-        raise ValueError("compile_bigm_layer: kernel and launch signatures differ")
+        raise ValueError("compile_bigm_kernel: kernel and launch signatures differ")
     launch = flyc.jit(launch)
     launch._bigm_spec = spec
     return launch

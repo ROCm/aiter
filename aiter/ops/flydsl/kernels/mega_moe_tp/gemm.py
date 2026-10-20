@@ -751,7 +751,7 @@ def build_gemm(kc: KernelCtx) -> dict:
     return locals()
 
 
-# ---- big-M fused units (compile_bigm_layer) ----
+# ---- big-M fused units (compile_bigm_kernel) ----
 const_expr = fx.const_expr
 
 KCK = 2  # GEMM1 k-steps (of 128) per chunk
