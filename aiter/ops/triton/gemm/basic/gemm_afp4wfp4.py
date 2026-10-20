@@ -495,7 +495,9 @@ def gemm_afp4wfp4_preshuffle(
     y: torch.Tensor | None = None,
     config: dict | None = None,
     skip_reduce: bool | None = False,
-) -> torch.Tensor:
+    mxfp4_out: bool = False,
+    y_scales: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights.
     Weight matrix and scales are stored in optimized layout for improved performance.
@@ -524,9 +526,15 @@ def gemm_afp4wfp4_preshuffle(
         config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
             BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
         skip_reduce (Optional[bool]): skip reduction, y becomes (SPK, M, N) where SPK is determined by config
+        mxfp4_out (bool): gfx1250 only. Write Y as 1x32 MXFP4 instead: y is the
+            (M, N // 2) packed payload and y_scales the (M, N // 32) e8m0 bytes,
+            row-major -- the bytes dynamic_per_group_scaled_quant(..., 32,
+            shuffle_scale=False) produces from the bf16 Y.
+        y_scales (Optional[torch.Tensor]): Pre-allocated scales for mxfp4_out.
 
     Returns:
-        y (torch.Tensor): Output with shape (M, N) or (SPK, M, N).
+        y (torch.Tensor): Output with shape (M, N) or (SPK, M, N); with
+            mxfp4_out, the tuple (y, y_scales).
     """
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
@@ -536,6 +544,10 @@ def gemm_afp4wfp4_preshuffle(
     n16, _ = w_preshuf.shape
     N = n16 * 16
     K_elems = 2 * K_bytes
+
+    if mxfp4_out:
+        assert use_gluon, "mxfp4_out needs the gfx1250 gluon kernel"
+        assert N % 32 == 0, f"mxfp4_out needs N % 32 == 0, got N={N}"
 
     if config is None:
         # _get_config doubles K itself (logical K = 2 * K_bytes) — pass bytes,
@@ -585,7 +597,24 @@ def gemm_afp4wfp4_preshuffle(
             ),
         )
         # gluon path does not support splitk; config has no NUM_KSPLIT / SPLITK_BLOCK_SIZE
-        if y is None:
+        quant_out = {}
+        if mxfp4_out:
+            if y is None:
+                y = torch.empty((M, N // 2), dtype=torch.uint8, device=x_fp4.device)
+            if y_scales is None:
+                y_scales = torch.empty(
+                    (M, N // 32), dtype=torch.uint8, device=x_fp4.device
+                )
+            assert y.shape == (M, N // 2) and y.element_size() == 1
+            assert y_scales.shape == (M, N // 32) and y_scales.element_size() == 1
+            assert config["num_ctas"] == 1, "mxfp4_out supports num_ctas == 1 only"
+            quant_out = {
+                "c_scale_ptr": y_scales.view(torch.uint8),
+                "stride_cs_m": y_scales.stride(0),
+                "stride_cs_n": y_scales.stride(1),
+                "QUANT_MXFP4_OUT": True,
+            }
+        elif y is None:
             y = torch.empty((M, N), dtype=dtype, device=x_fp4.device)
 
         # Clamp NUM_BUFFERS so  prologue never advances TDM descriptors past the end of K when k_tiles < NUM_BUFFERS (BLOCK_K_BYTES = BLOCK_SIZE_K // 2)
@@ -614,7 +643,7 @@ def gemm_afp4wfp4_preshuffle(
         _gluon_gemm_mxfp4_preshuffle_gfx1250[grid](
             x_fp4,
             w_preshuf,
-            y,
+            y.view(torch.uint8) if mxfp4_out else y,
             x_scales,
             w_scales,
             M,
@@ -633,8 +662,9 @@ def gemm_afp4wfp4_preshuffle(
             w_scales.stride(1),
             **config,
             **layouts,
+            **quant_out,
         )
-        return y
+        return (y, y_scales) if mxfp4_out else y
 
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(

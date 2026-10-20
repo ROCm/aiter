@@ -110,6 +110,20 @@ def _build_gemm_afp4wfp4_preshuffle_layouts(
         dot_b, [BLOCK_N, K_GROUPS], scale_factor=SCALE_GROUP_ELEMS
     )
 
+    # MXFP4-output epilogue: 8 consecutive columns per thread, so a 32-wide
+    # scale group spans 4 lanes; sized to the tile to avoid replication.
+    quant_tn = min(BLOCK_N // 8, 32)
+    quant_wn = max(1, min(num_warps, BLOCK_N // (8 * quant_tn)))
+    quant_out_layout = gl.BlockedLayout(
+        size_per_thread=[1, 8],
+        threads_per_warp=[32 // quant_tn, quant_tn],
+        warps_per_cta=[num_warps // quant_wn, quant_wn],
+        order=[1, 0],
+    )
+    shared_Q = gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_N // 2, 8]], [BLOCK_M, BLOCK_N // 2], [1, 0]
+    )
+
     return {
         "wmma_layout": wmma_layout,
         "wmma_acc_layout": wmma_acc_layout,
@@ -122,6 +136,8 @@ def _build_gemm_afp4wfp4_preshuffle_layouts(
         "dot_b_layout": dot_b,
         "a_scale_layout": scale_a,
         "b_scale_layout": scale_b,
+        "quant_out_layout": quant_out_layout,
+        "shared_Q": shared_Q,
     }
 
 
@@ -224,6 +240,86 @@ def _issue_tdm_stage(
         )
 
 
+@gluon.jit
+def _mx_e8m0_round_up(amax):
+    """E8M0 byte of ceil_pow2(amax / 6), as aiter's HIP group quant computes it:
+    RoundUp, with amax floored at 1e-10 (its reduction's starting value), so a
+    zero group gets 2^-35."""
+    amax = gl.maximum(amax, 1e-10)
+    bits = (amax * (1.0 / 6.0)).to(gl.uint32, bitcast=True)
+    exponent = (bits >> 23) & 0xFF
+    exponent = gl.where(
+        (exponent < 0xFF) & ((bits & 0x7FFFFF) != 0), exponent + 1, exponent
+    )
+    return exponent.to(gl.uint8)
+
+
+@gluon.jit
+def _store_mxfp4_tile(
+    acc,
+    q_ptr,
+    q_scale_ptr,
+    M,
+    N,
+    stride_q_m,
+    stride_q_n,
+    stride_qs_m,
+    stride_qs_n,
+    tile_m,
+    tile_n,
+    BLOCK_SIZE_M: gl.constexpr,
+    BLOCK_SIZE_N: gl.constexpr,
+    shared_C: gl.constexpr,
+    quant_out_layout: gl.constexpr,
+    shared_Q: gl.constexpr,
+):
+    """Write the tile as 1x32 MXFP4 plus row-major e8m0 scales. Quantizes the
+    bf16-rounded accumulator, i.e. exactly what the bf16 GEMM would have stored."""
+    GROUP: gl.constexpr = 32
+    GROUPS_N: gl.constexpr = BLOCK_SIZE_N // GROUP
+
+    staging = gl.allocate_shared_memory(
+        gl.bfloat16, shape=[BLOCK_SIZE_M, BLOCK_SIZE_N], layout=shared_C
+    )
+    staging.store(acc.to(gl.bfloat16))
+    gl.barrier()
+    x = staging.load(layout=quant_out_layout).to(gl.float32)
+
+    x_grouped = x.reshape(BLOCK_SIZE_M, GROUPS_N, GROUP)
+    amax = gl.max(gl.abs(x_grouped), axis=-1, keep_dims=True)
+    e8m0 = _mx_e8m0_round_up(amax).reshape(BLOCK_SIZE_M, GROUPS_N)
+    q = gl.amd.cdna5.scaled_downcast(x, e8m0, "e2m1", axis=1)
+
+    q_buffer = gl.allocate_shared_memory(
+        q_ptr.type.element_ty, shape=[BLOCK_SIZE_M, BLOCK_SIZE_N // 2], layout=shared_Q
+    )
+    q_buffer.store(q)
+    gl.barrier()
+    q_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=q_ptr,
+        shape=(M, N // 2),
+        strides=(stride_q_m, stride_q_n),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N // 2),
+        layout=shared_Q,
+    )
+    gl.amd.gfx1250.tdm.async_store(
+        q_desc, [tile_m * BLOCK_SIZE_M, tile_n * (BLOCK_SIZE_N // 2)], q_buffer
+    )
+
+    scale_layout: gl.constexpr = e8m0.type.layout
+    rows = tile_m * BLOCK_SIZE_M + gl.arange(
+        0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, scale_layout)
+    )
+    cols = tile_n * GROUPS_N + gl.arange(
+        0, GROUPS_N, layout=gl.SliceLayout(0, scale_layout)
+    )
+    gl.store(
+        q_scale_ptr + rows[:, None] * stride_qs_m + cols[None, :] * stride_qs_n,
+        e8m0,
+        mask=(rows < M)[:, None] & (cols < N // GROUP)[None, :],
+    )
+
+
 _gemm_mxfp4_preshuffle_gfx1250_repr = make_kernel_repr(
     "_gemm_mxfp4_preshuffle_gfx1250_kernel",
     [
@@ -233,6 +329,7 @@ _gemm_mxfp4_preshuffle_gfx1250_repr = make_kernel_repr(
         "num_warps",
         "NUM_BUFFERS",
         "num_ctas",
+        "QUANT_MXFP4_OUT",
     ],
 )
 
@@ -275,6 +372,14 @@ def gemm_mxfp4_preshuffle_gfx1250(
     a_scale_layout: gl.constexpr,
     b_scale_layout: gl.constexpr,
     num_ctas: gl.constexpr,
+    quant_out_layout: gl.constexpr = None,
+    shared_Q: gl.constexpr = None,
+    # QUANT_MXFP4_OUT: c_ptr is the (M, N // 2) MXFP4 output and c_scale_ptr its
+    # (M, N // 32) e8m0 scales, in place of the bf16 (M, N) output.
+    c_scale_ptr=None,
+    stride_cs_m=0,
+    stride_cs_n=0,
+    QUANT_MXFP4_OUT: gl.constexpr = False,
 ):
     # async_wait counts TDM ops in flight. The compiler fuses each stage's four
     # copies into one op (two with 2 warps, which fuse in pairs).
@@ -545,6 +650,29 @@ def gemm_mxfp4_preshuffle_gfx1250(
     # =====================================================================
     # Store output via TDM: accumulator → shared memory → global memory.
     # =====================================================================
+
+    if QUANT_MXFP4_OUT:
+        gl.static_assert(num_ctas == 1)
+        _store_mxfp4_tile(
+            acc,
+            c_ptr,
+            c_scale_ptr,
+            M,
+            N,
+            stride_c_m,
+            stride_c_n,
+            stride_cs_m,
+            stride_cs_n,
+            tile_m,
+            tile_n,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            shared_C,
+            quant_out_layout,
+            shared_Q,
+        )
+        gl.amd.gfx1250.tdm.async_wait(0)
+        return
 
     c_buffer = gl.allocate_shared_memory(
         c_ptr.type.element_ty,
