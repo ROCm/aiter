@@ -29,13 +29,27 @@ device_info = _load_device_info()
 
 
 class TestGetNumXcds(unittest.TestCase):
-    def test_known_parts_and_unknown_default(self):
-        self.assertEqual(device_info._xcds_for_part("gfx942", 304), 8)
-        self.assertEqual(device_info._xcds_for_part("gfx942", 228), 6)
-        self.assertEqual(device_info._xcds_for_part("gfx942", 80), 4)
-        self.assertEqual(device_info._xcds_for_part("gfx950", 256), 8)
-        # Unlisted part. 120 CUs can hold 8 XCDs; a 1-CU part cannot.
+    def test_published_xcd_parts(self):
+        # Active CUs per device and XCDs from the ROCm GPU specification table.
+        # gfx90a (MI210/MI250/MI250X) and gfx908 (MI100) are not here: those
+        # parts have no XCDs. An MI250 GCD is already its own device.
+        published = (
+            ("gfx942", 304, 8),  # MI300X, MI325X
+            ("gfx942", 228, 6),  # MI300A
+            ("gfx950", 256, 8),  # MI350X, MI355X
+            ("gfx950", 128, 4),  # MI350P
+        )
+        for gfx, cu_num, xcds in published:
+            with self.subTest(gfx=gfx, cu_num=cu_num):
+                self.assertEqual(device_info._xcds_for_part(gfx, cu_num), xcds)
+
+    def test_unlisted_part_defaults_to_eight_xcds(self):
+        # 120 CUs can hold 8 XCDs. A 1-CU part cannot, so it is not the example.
         self.assertEqual(device_info._xcds_for_part("gfx942", 120), 8)
+
+    def test_gfx942_80_cu_part_has_four_xcds(self):
+        # Kept from the previous table. Not a CU count in the ROCm spec table.
+        self.assertEqual(device_info._xcds_for_part("gfx942", 80), 4)
 
     def test_rocm_before_7_uses_part_table(self):
         with (

@@ -31,11 +31,14 @@ def get_num_sms():
 # ROCm 7+ reports the live count through hipDeviceAttributeNumberOfXccs,
 # including partition mode. Older runtimes do not, so those releases keep
 # this table. Parts that are not listed still return 8.
+# Counts are active CUs per device, from the ROCm GPU specification table.
+# gfx90a GCDs are separate devices, not XCDs, so they are not listed here.
 _XCDS_BY_GFX_AND_CU_NUM = {
-    ("gfx942", 304): 8,
-    ("gfx942", 228): 6,
+    ("gfx942", 304): 8,  # MI300X, MI325X: 8 XCDs x 38 CUs
+    ("gfx942", 228): 6,  # MI300A: 6 XCDs x 38 CUs
     ("gfx942", 80): 4,
-    ("gfx950", 256): 8,
+    ("gfx950", 256): 8,  # MI350X, MI355X: 8 XCDs x 32 CUs
+    ("gfx950", 128): 4,  # MI350P: 4 XCDs x 32 CUs
 }
 
 
