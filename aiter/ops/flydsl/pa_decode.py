@@ -192,6 +192,12 @@ def pa_decode(
     Supports page sizes 16/64/128. BF16 head dimensions are multiples of 64
     up to 1024; FP8 supports 64 and multiples of 128 up to 1024.
     K/V scales are [1] or [num_blocks, num_kv_heads, block_size, 1].
+    A non-transposed 4D key cache is not implemented.
+
+    The gfx950 FP8 head-256 page-16/64 pipe supports both packed V layouts,
+    per-tensor or per-token scales, and sliding windows, with at most 32
+    query rows (query_length times the GQA group size).
+
     BF16 K/V requires BF16 queries, compute_type=torch.bfloat16, no K/V scales,
     and vectorized 5D caches with x=8; FP8 uses x=16. BF16 Q/P operands stay
     in BF16 and softmax statistics and MFMA accumulation stay in FP32.
@@ -208,7 +214,8 @@ def pa_decode(
     ``work_plan`` is required and must be built with ``plan_pa_decode`` before
     calling decode. ``pa_decode_tuning.prepare_pa_decode_plan`` uses native
     FlyDSL autotune to select its budget before graph capture. A cache miss uses
-    twice the device CU count; ``tune=True`` forces a search during preparation.
+    the device CU count for the gfx950 head-256 pipe shapes and twice that
+    otherwise; ``tune=True`` forces a search during preparation.
     Decode and graph replay use the explicit plan without accessing autotune. Set its
     partition cap with ``plan_pa_decode(max_partitions=...)``; even a cap of one
     uses packed scratch and reduction.
@@ -225,8 +232,10 @@ def pa_decode(
 
     ``max_context_length`` selects the scheduling bound, rounded up to
     whole pages as in tuning. This keeps the selected specialization independent
-    of extra block-table padding. Callers must ensure
-    every GPU context length is at most ``max_context_length`` when supplying it.
+    of extra block-table padding. It is the caller's contract, including for
+    graph replay: every context length that will run must be at most
+    ``max_context_length``. A smaller value still covers the real context:
+    page ids outside the staged window are read from the block table.
 
     GPU lengths and table entries are not checked. Callers must ensure
     0 <= context_lengths[i] <= block_tables.shape[1] * block_size and used
@@ -272,7 +281,7 @@ def pa_decode(
     expected_ranks = (
         ("output", output, (3,)),
         ("query", query, (3,)),
-        ("key_cache", key_cache, (5,)),
+        ("key_cache", key_cache, (4, 5)),
         ("value_cache", value_cache, (4, 5)),
         ("context_lengths", context_lengths, (1,)),
         ("block_tables", block_tables, (2,)),
@@ -283,6 +292,10 @@ def pa_decode(
             raise ValueError(
                 f"{name} must be {expected}, got shape {tuple(tensor.shape)}"
             )
+
+    trans_k = key_cache.dim() == 5
+    if not trans_k:
+        raise NotImplementedError("Non-transposed key cache is not implemented")
 
     num_seqs = context_lengths.shape[0]
     total_q_rows, num_q_heads, head_dim = query.shape
@@ -306,6 +319,7 @@ def pa_decode(
             f"context_lengths.shape[0] ({num_seqs})"
         )
 
+    trans_v = value_cache.dim() == 5
     num_blocks, num_kv_heads, num_hgroups, block_size, hgroup_width = key_cache.shape
     if num_kv_heads < 1:
         raise ValueError(
@@ -358,7 +372,6 @@ def pa_decode(
             f"pa_decode only supports block_size in (16, 64, 128), got {block_size}"
         )
 
-    trans_v = value_cache.dim() == 5
     if is_bf16_kv and not trans_v:
         raise ValueError("BF16 KV requires the vectorized 5D value_cache layout")
     if trans_v:
@@ -607,6 +620,7 @@ def pa_decode(
             work_capacity=work_plan.capacity,
             max_context_length=schedule_context_length,
             sliding_window=sliding_window,
+            trans_k=trans_k,
         )
 
     total_rows = query_length * query_group_size

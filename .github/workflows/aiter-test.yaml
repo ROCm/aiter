@@ -19,7 +19,6 @@ concurrency:
 
 env:
   GPU_ARCH_LIST: "gfx942;gfx950"
-  AITER_TEST: "op_tests"
   AITER_WHEEL_ARTIFACT_NAME: aiter-whl-${{ github.run_id }}
   AITER_PREBUILD_MAX_JOBS: "64"
 
@@ -942,6 +941,16 @@ jobs:
           -w /workspace \
           aiter_test \
           bash -c "pip show amd-aiter || true"
+
+      - name: Focused regression tests
+        if: ${{ matrix.label == 'MI35X' && matrix.shard_idx == 0 }}
+        timeout-minutes: 10
+        run: |
+          set -ex
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          bash -c "python3 -m pytest -q tests"
 
       - name: Tests
         timeout-minutes: 90
