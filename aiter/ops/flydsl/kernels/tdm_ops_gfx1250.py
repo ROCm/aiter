@@ -9,8 +9,6 @@ import contextlib
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import fly as fly_dialect
-from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import memref as memref_dialect
 from flydsl.expr.meta import dsl_loc_tracing
 from flydsl.expr.rocdl import tdm_ops as _tdm_ops
@@ -39,11 +37,8 @@ __all__ = [
 
 def _fly_lds_base_index(raw: ir.Value) -> ir.Value:
     """Extract a Fly shared pointer / view as an LDS byte index."""
-    ptr_type = ir.Type.parse("!llvm.ptr<3>")
-    ptr = fly_dialect.extract_aligned_pointer_as_index(ptr_type, raw)
-    i64 = ir.IntegerType.get_signless(64)
-    ptr_i64 = llvm_dialect.ptrtoint(i64, ptr)
-    return fx.Index(ptr_i64).ir_value()
+    ptr = fx.Pointer(raw) if fx.PointerType.isinstance(raw.type) else fx.get_iter(raw)
+    return fx.Index(fx.ptrtoint(ptr)).ir_value()
 
 
 class _FlyAwareMemrefDialect:

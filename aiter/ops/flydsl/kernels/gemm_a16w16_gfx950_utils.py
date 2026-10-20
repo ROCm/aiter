@@ -237,12 +237,10 @@ class SplitKProtocol:
             # launch's tag. cur starts off the tag to force at least one load.
             cur = expected + 1
             while cur != expected:
-                cur = fx.Int32(
-                    fx.generic_load(
-                        _global_sync_ptr(self.signal_ptr, self.signal_idx, fx.Int32),
-                        memory_order=fx.AtomicOrdering.Monotonic,
-                        syncscope="agent",
-                    )
+                cur = fx.generic_load(
+                    _global_sync_ptr(self.signal_ptr, self.signal_idx, fx.Int32),
+                    memory_order=fx.AtomicOrdering.Monotonic,
+                    syncscope="agent",
                 )
         rocdl.sched_barrier(0)
         gpu.barrier()

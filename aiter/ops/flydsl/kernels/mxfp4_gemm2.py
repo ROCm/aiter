@@ -766,47 +766,38 @@ def _flat_mxfp4_epilog(
         r, group, col0 = _r_next, _grp_next, _col0_next
         if _bi + 1 < len(_blocks):
             _r_next, _grp_next, _col0_next = _issue_load(*_blocks[_bi + 1])
-        if True:
-            amax_f = fx.math.absf(r[0])
-            for e in range_constexpr(1, 8):
-                amax_f = fx.maxnumf(amax_f, fx.math.absf(r[e]))
-            amax = amax_f.bitcast(fx.Int32).shrui(fx.Int32(16))
-            amax_dpp = fx.Int32(_inline_dpp_quad_amax(amax))
-            f32b = (amax_dpp << 16).bitcast(fx.Float32)
-            e8m0, qscale_f = _e8m0_from_amax(f32b)
-            e8 = _raw(e8m0)
-            qscale = _raw(qscale_f)
-            packed = _raw(fx.Int32(0))
+        amax_f = fx.math.absf(r[0])
+        for e in range_constexpr(1, 8):
+            amax_f = fx.maxnumf(amax_f, fx.math.absf(r[e]))
+        amax = amax_f.bitcast(fx.Int32).shrui(fx.Int32(16))
+        amax_dpp = fx.Int32(_inline_dpp_quad_amax(amax))
+        f32b = (amax_dpp << 16).bitcast(fx.Float32)
+        e8m0, qscale_f = _e8m0_from_amax(f32b)
+        e8 = _raw(e8m0)
+        qscale = _raw(qscale_f)
+        packed = _raw(fx.Int32(0))
+        for pair in range_constexpr(4):
             packed = rocdl.cvt_scalef32_pk_fp4_f32(
-                T.i32, packed, _raw(r[0]), _raw(r[1]), qscale, 0
+                T.i32, packed, _raw(r[2 * pair]), _raw(r[2 * pair + 1]), qscale, pair
             )
-            packed = rocdl.cvt_scalef32_pk_fp4_f32(
-                T.i32, packed, _raw(r[2]), _raw(r[3]), qscale, 1
+        global_col = n_block_idx * fx.Int32(BN) + col0
+        blk = n_block_idx * fx.Int32(NBLK) + group
+        q_byte = (
+            _q_row0
+            + fx.Int64(mr * 16 * (N_OUT // 2))
+            + fx.Int64(global_col // fx.Int32(2))
+        )
+        s_byte = _s_row0 + fx.Int64(mr * 16 * (N_OUT // 32)) + fx.Int64(blk)
+        fx.generic_store(
+            global_typed_ptr(arg_out_q, T.i32, align=4, byte_offset=q_byte),
+            fx.Int32(packed),
+            nontemporal=True,
+        )
+        if kk == fx.Int32(0):
+            fx.ptr_store(
+                fx.Int8(e8),
+                global_typed_ptr(arg_out_scale, T.i8, align=1, byte_offset=s_byte),
             )
-            packed = rocdl.cvt_scalef32_pk_fp4_f32(
-                T.i32, packed, _raw(r[4]), _raw(r[5]), qscale, 2
-            )
-            packed = rocdl.cvt_scalef32_pk_fp4_f32(
-                T.i32, packed, _raw(r[6]), _raw(r[7]), qscale, 3
-            )
-            global_col = n_block_idx * fx.Int32(BN) + col0
-            blk = n_block_idx * fx.Int32(NBLK) + group
-            q_byte = (
-                _q_row0
-                + fx.Int64(mr * 16 * (N_OUT // 2))
-                + fx.Int64(global_col // fx.Int32(2))
-            )
-            s_byte = _s_row0 + fx.Int64(mr * 16 * (N_OUT // 32)) + fx.Int64(blk)
-            fx.generic_store(
-                global_typed_ptr(arg_out_q, T.i32, align=4, byte_offset=q_byte),
-                fx.Int32(packed),
-                nontemporal=True,
-            )
-            if kk == fx.Int32(0):
-                fx.ptr_store(
-                    fx.Int8(e8),
-                    global_typed_ptr(arg_out_scale, T.i8, align=1, byte_offset=s_byte),
-                )
 
 
 @flyc.jit
@@ -837,6 +828,7 @@ def _atomic_bf16_epilog(
     stids_base = _global_base_ptr1(arg_stids)
     sweights_base = _global_base_ptr1(arg_sweights)
 
+    # Typed FlyDSL loads do not expose invariant metadata.
     packed = []
     weight = []
     for mr in range_constexpr(M_REPS):

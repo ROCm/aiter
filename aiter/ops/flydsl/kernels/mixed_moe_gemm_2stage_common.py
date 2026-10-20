@@ -541,7 +541,7 @@ def compile_mixed_moe_gemm1_common(
                 group_id = workgroup_id // workgroups_per_group
                 first_m = group_id * group_m
                 remaining_m = grid_y - first_m
-                group_size_m = (fx.Uint64(remaining_m) < fx.Uint64(group_m)).select(
+                group_size_m = (fx.Index(remaining_m) < group_m).select(
                     remaining_m, group_m
                 )
                 workgroup_in_group = workgroup_id % workgroups_per_group
@@ -3326,7 +3326,7 @@ def compile_mixed_moe_gemm2_common(
                 group_id = workgroup_id // workgroups_per_group
                 first_m = group_id * group_m
                 remaining_m = grid_y - first_m
-                group_size_m = (fx.Uint64(remaining_m) < fx.Uint64(group_m)).select(
+                group_size_m = (fx.Index(remaining_m) < group_m).select(
                     remaining_m, group_m
                 )
                 workgroup_in_group = workgroup_id % workgroups_per_group
