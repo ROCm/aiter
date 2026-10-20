@@ -3797,15 +3797,16 @@ def get_2stage_cfgs(
         ) in fused_moe_1stage_dict.get(get_gfx(), {}):
             if q_type == QuantType.per_1x128:
                 # for fp8 blockscale, ck has better performance so disable assembly kernel
-                # gfx942 asm kernels read past X/w2 for model_dim < 512, and need
-                # model_dim % 256 (per-kernel dim_align in hsa/gfx942/fmoe)
+                # asm kernels read past X/w2 below a minimum model_dim and need it
+                # aligned (per-kernel dim_align in hsa/<arch>/fmoe)
+                min_dim, dim_align = {"gfx942": (512, 256), "gfx950": (1024, 512)}.get(
+                    get_gfx(), (0, 1)
+                )
                 run_1stage = (
                     token > 32
                     and inter_dim % 128 == 0
-                    and (
-                        get_gfx() != "gfx942"
-                        or (model_dim >= 512 and model_dim % 256 == 0)
-                    )
+                    and model_dim >= min_dim
+                    and model_dim % dim_align == 0
                 )
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
