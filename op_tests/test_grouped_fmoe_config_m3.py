@@ -22,17 +22,17 @@ from aiter.jit import core
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FAMILY = "tuned_grouped_fmoe"
 # Per-rank M3 TP4 MoE: hidden 6144, I 768, 128 routed + 1 shared, top-4 + shared.
-M3_KEY = dict(
-    model_dim=6144,
-    inter_dim=768,
-    experts=129,
-    topk=5,
-    activation=ActivationType.Swiglu,
-    dtype=dtypes.bf16,
-    q_dtype_a=dtypes.fp4x2,
-    q_dtype_w=dtypes.fp4x2,
-    quant_type=QuantType.per_1x32,
-)
+M3_KEY = {
+    "model_dim": 6144,
+    "inter_dim": 768,
+    "experts": 129,
+    "topk": 5,
+    "activation": ActivationType.Swiglu,
+    "dtype": dtypes.bf16,
+    "q_dtype_a": dtypes.fp4x2,
+    "q_dtype_w": dtypes.fp4x2,
+    "quant_type": QuantType.per_1x32,
+}
 
 
 class TestGroupedFmoeConfigM3(unittest.TestCase):
@@ -63,14 +63,13 @@ class TestGroupedFmoeConfigM3(unittest.TestCase):
     def lookup(self, token_num, gfx="gfx1250", **over):
         gm._find_grouped_config.cache_clear()
         gm._GROUPED_CONFIG_CACHE.clear()
-        with mock.patch.dict(os.environ, {"AITER_CONFIG_GROUPED_FMOE": self.merged}):
-            with mock.patch.object(gm, "get_gfx", return_value=gfx), mock.patch(
-                "aiter.jit.utils.chip_info.get_cu_num", return_value=256
-            ):
-                key = {**M3_KEY, **over}
-                return gm._find_grouped_config(
-                    token_num=gm._get_padded_m(token_num), **key
-                )
+        with (
+            mock.patch.dict(os.environ, {"AITER_CONFIG_GROUPED_FMOE": self.merged}),
+            mock.patch.object(gm, "get_gfx", return_value=gfx),
+            mock.patch("aiter.jit.utils.chip_info.get_cu_num", return_value=256),
+        ):
+            key = {**M3_KEY, **over}
+            return gm._find_grouped_config(token_num=gm._get_padded_m(token_num), **key)
 
     def test_every_padded_token_hits_m3_row(self):
         # Every padded token (powers of two to 32768) plus T between them.
