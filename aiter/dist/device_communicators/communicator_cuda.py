@@ -292,7 +292,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
         ca_comm = self.ca_comm
         can_use_custom_ar = (
-            ca_comm is not None and not ca_comm.disabled and can_use_fuse_ar_rms
+            ca_comm is not None
+            and not ca_comm.disabled
+            and can_use_fuse_ar_rms
+            and ca_comm.should_fuse_ar_rms(input_, n, out_n)
         )
         total_bytes_limit = (
             self._ar_1stage_max_kb
@@ -476,6 +479,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
             and total_bytes <= fused_quant_bytes_limit
             and (prefill_support or total_bytes <= no_prefill_quant_bytes_limit)
+            and self.ca_comm.should_fuse_ar_rms(input_, hidden_dim, hidden_dim)
         ):
             total_bytes_limit = (
                 self._ar_1stage_max_kb if self._ar_1stage_max_kb >= 0 else 128 * 1024

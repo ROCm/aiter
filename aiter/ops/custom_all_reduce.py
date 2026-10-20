@@ -291,6 +291,40 @@ def all_gather_gfx1250(
 ) -> None: ...
 
 
+@compile_ops(GFX1250_MD_NAME, fc_name="fused_allreduce_rmsnorm", develop=True)
+def fused_allreduce_rmsnorm_gfx1250(
+    _fa: int,
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    res_out: torch.Tensor,
+    out: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    reg_ptr: int,
+    reg_bytes: int,
+    use_1stage: bool,
+    gemma_norm: bool = False,
+) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="fused_allreduce_rmsnorm_quant", develop=True)
+def fused_allreduce_rmsnorm_quant_gfx1250(
+    _fa: int,
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    res_out: torch.Tensor,
+    out: torch.Tensor,
+    scale_out: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    reg_ptr: int,
+    reg_bytes: int,
+    use_1stage: bool,
+    gemma_norm: bool = False,
+    bf16_out_ptr: int = 0,
+) -> None: ...
+
+
 @compile_ops(GFX1250_MD_NAME, fc_name="p2p_bw_test", develop=True)
 def p2p_bw_test_gfx1250(
     _fa: int,
