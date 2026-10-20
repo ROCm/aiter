@@ -776,6 +776,117 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
             result["failure_reason"].startswith("no valid coupled candidate")
         )
 
+    @staticmethod
+    def _funnel_case(finalists):
+        row = {
+            "token": 1,
+            "model_dim": 256,
+            "inter_dim": 256,
+            "expert": 8,
+            "topk": 2,
+            "act_type": "ActivationType.Silu",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+        }
+        args = SimpleNamespace(
+            fast_scan=True,
+            fast_scan_warmup_accuracy_checks=1,
+            fast_scan_iters=10,
+            fast_scan_final_iters=100,
+            fast_scan_finalists=finalists,
+            timeout=0,
+            errRatio=0.1,
+            warmup=2,
+            iters=101,
+        )
+        return row, args
+
+    def _run_funnel(self, row, args, candidates, run_candidate):
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
+        tuner.keys = ["token", "model_dim", "inter_dim", "expert", "topk"]
+        with (
+            mock.patch.object(tuner, "_candidate_rows", return_value=candidates),
+            mock.patch.object(tuner, "_precompile_candidates", return_value=(0, 0)),
+            mock.patch.object(tuner, "_prepare_case", return_value="fixture"),
+            mock.patch.object(tuner, "_torch_ref", return_value="reference"),
+            mock.patch.object(tuner, "_run_candidate", side_effect=run_candidate),
+            mock.patch("builtins.print"),
+        ):
+            return tuner, tuner._tune_one_shape(row, args)
+
+    def test_profile_rows_record_coarse_and_final_phases(self):
+        row, args = self._funnel_case(finalists=1)
+        candidates = [self._candidate(f"candidate_{i}") for i in range(3)]
+
+        def run_candidate(_row, candidate, _args, **kwargs):
+            index = int(candidate["kernelName1"].rsplit("_", 1)[1])
+            coarse = kwargs["num_iters"] == 10
+            candidate["us"] = (10.0 if coarse else 5.0) + index
+            candidate["err1"] = 0.01
+            return candidate["us"]
+
+        _, best = self._run_funnel(row, args, candidates, run_candidate)
+
+        # Every candidate keeps its coarse row; the speed finalist and the
+        # accuracy promotion add final rows under their original index.
+        self.assertEqual(
+            [(p["phase"], p["candidate_index"]) for p in best["_profile"]],
+            [("coarse", 1), ("coarse", 2), ("coarse", 3), ("final", 1), ("final", 2)],
+        )
+        winner_final = [
+            p
+            for p in best["_profile"]
+            if p["phase"] == "final" and p["kernelName1"] == best["kernelName1"]
+        ]
+        self.assertEqual(best["kernelName1"], "g1_candidate_0")
+        self.assertEqual([p["pipeline_us"] for p in winner_final], [best["us"]])
+        self.assertEqual(best["_search"]["candidate_count"], 3)
+        self.assertEqual(best["_search"]["evaluated_count"], 3)
+        self.assertEqual(best["_search"]["valid_count"], 3)
+        self.assertTrue(best["_search"]["search_complete"])
+
+    def test_fatal_gpu_error_during_finalists_aborts_the_search(self):
+        row, args = self._funnel_case(finalists=2)
+        candidates = [self._candidate(f"candidate_{i}") for i in range(3)]
+        final_calls = []
+
+        def run_candidate(_row, candidate, _args, **kwargs):
+            if kwargs["num_iters"] == 10:
+                candidate["us"] = 1.0
+                return candidate["us"]
+            final_calls.append(candidate["kernelName1"])
+            raise RuntimeError("HIP error: an illegal memory access was encountered")
+
+        tuner, best = self._run_funnel(row, args, candidates, run_candidate)
+
+        # The HIP context is unusable after the first fatal finalist, so no
+        # other finalist runs and the shape publishes no winner.
+        self.assertEqual(len(final_calls), 1)
+        self.assertEqual(best["status"], "incomplete")
+        self.assertEqual(best["us"], tuner.INVALID_TIME)
+        self.assertFalse(best["_search"]["search_complete"])
+        self.assertIn("illegal memory access", best["_search"]["termination_reason"])
+        last = best["_profile"][-1]
+        self.assertEqual((last["phase"], last["status"]), ("final", "fatal_gpu_error"))
+
+    def test_ordinary_search_records_single_phase_without_scan_arguments(self):
+        row, args = self._funnel_case(finalists=1)
+        args.fast_scan = False
+        candidates = [self._candidate(f"candidate_{i}") for i in range(2)]
+        calls = []
+
+        def run_candidate(_row, candidate, _args, **kwargs):
+            calls.append(kwargs)
+            candidate["us"] = 2.0 if candidate["kernelName1"].endswith("0") else 1.0
+            return candidate["us"]
+
+        _, best = self._run_funnel(row, args, candidates, run_candidate)
+
+        self.assertEqual(calls, [{}, {}])
+        self.assertEqual([p["phase"] for p in best["_profile"]], ["single", "single"])
+        self.assertEqual(best["kernelName1"], "g1_candidate_1")
+
 
 class TestGlm53TunedArtifact(unittest.TestCase):
     def test_token_one_row_matches_validated_coupled_winner(self):

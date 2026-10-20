@@ -152,6 +152,46 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
         ):
             self.tuner.pre_process(SimpleNamespace(run_config=True, compare=False))
 
+    def test_fast_scan_rejects_a8w4_rows_before_auxiliary_preparation(
+        self,
+    ) -> None:
+        from aiter.ops import moe_mxfp4_aux
+        from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import FmoeTuner
+
+        rows = self.read_rows([shape_row(), shape_row(q_dtype_a="torch.float8_e4m3fn")])
+        args = SimpleNamespace(
+            run_config=False,
+            compare=False,
+            fast_scan=True,
+            mxfp4_search_mode=None,
+            timeout=0,
+            mp=1,
+            errRatio=0.1,
+            profile_file="",
+        )
+
+        def prepare(_self: Any, _args: argparse.Namespace) -> None:
+            _self.untunedf = rows
+
+        rejected = r"row 3: --fast-scan supports A4W4 rows only, got A8W4"
+        with mock.patch.object(FmoeTuner, "pre_process", prepare), mock.patch.object(
+            moe_mxfp4_aux,
+            "prepare_mxfp4_moe_aux",
+            side_effect=AssertionError("A8W4 fast scan prepared auxiliary kernels"),
+        ), self.assertRaisesRegex(ValueError, rejected):
+            self.tuner.pre_process(args)
+        with mock.patch.object(
+            self.module,
+            "_run_shapes_isolated",
+            side_effect=AssertionError("A8W4 fast scan started a shape worker"),
+        ), self.assertRaisesRegex(ValueError, rejected):
+            self.tuner.tune(rows, pd.DataFrame(), args)
+        # A4W4 rows and ordinary A8W4 searches pass the guard.
+        a4_only = [row for _, row in rows.iloc[:1].iterrows()]
+        self.tuner._reject_fast_scan_a8w4(a4_only, args)
+        args.fast_scan = False
+        self.tuner._reject_fast_scan_a8w4([row for _, row in rows.iterrows()], args)
+
     def test_mixed_rows_use_their_own_precision_and_default_search(self) -> None:
         rows = self.read_rows([shape_row(), shape_row(q_dtype_a="torch.float8_e4m3fn")])
         a4, a8 = [row.to_dict() for _, row in rows.iterrows()]
