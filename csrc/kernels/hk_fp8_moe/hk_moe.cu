@@ -269,7 +269,9 @@ struct plain_tile_load
     __device__ __forceinline__ void prepare() { addr = precompute_addresses(dst, src, idx); }
     template <int i>
     __device__ __forceinline__ void issue()
-    { load_one<i>(dst, src, addr); }
+    {
+        load_one<i>(dst, src, addr);
+    }
 };
 
 // aiter shuffle_weight(w, (16,16)) fp8 layout: [N][K] viewed as [N/16][K/32][2][16 rows][16 B]. A
@@ -293,13 +295,13 @@ precompute_addresses_shuf(ST& dst, const T* W, int rb, int kk)
 template <int i, int K, typename ST>
 __device__ inline void load_one_shuf(ST& dst, precomputed_addresses addresses)
 {
-    using T                            = typename ST::dtype;
-    constexpr int num_warps            = NUM_WARPS;
-    constexpr int bytes_per_thread     = ST::underlying_subtile_bytes_per_thread;
-    constexpr int bytes_per_warp       = bytes_per_thread * kittens::WARP_THREADS;
-    const int lane_byte_offset         = (kittens::laneid() * bytes_per_thread) +
-                                         (kittens::warpid() * bytes_per_warp) +
-                                         (i * num_warps * bytes_per_warp);
+    using T                        = typename ST::dtype;
+    constexpr int num_warps        = NUM_WARPS;
+    constexpr int bytes_per_thread = ST::underlying_subtile_bytes_per_thread;
+    constexpr int bytes_per_warp   = bytes_per_thread * kittens::WARP_THREADS;
+    const int lane_byte_offset     = (kittens::laneid() * bytes_per_thread) +
+                                 (kittens::warpid() * bytes_per_warp) +
+                                 (i * num_warps * bytes_per_warp);
     const int subtile_id               = lane_byte_offset / ST::underlying_subtile_bytes;
     const int subtile_row              = subtile_id / ST::underlying_subtiles_per_row;
     const int subtile_col              = subtile_id % ST::underlying_subtiles_per_row;
@@ -329,10 +331,14 @@ struct shuf_tile_load
     int rb, kk;
     precomputed_addresses addr;
     __device__ __forceinline__ void prepare()
-    { addr = precompute_addresses_shuf<K>(dst, w, rb, kk); }
+    {
+        addr = precompute_addresses_shuf<K>(dst, w, rb, kk);
+    }
     template <int i>
     __device__ __forceinline__ void issue()
-    { load_one_shuf<i, K>(dst, addr); }
+    {
+        load_one_shuf<i, K>(dst, addr);
+    }
 };
 template <int K, typename ST>
 __device__ __forceinline__ void load_tile_shuf(ST& dst, const fp8e4m3* w, int rb, int kk)
@@ -377,7 +383,9 @@ struct gather_tile_load
     __device__ __forceinline__ void prepare() {}
     template <int i>
     __device__ __forceinline__ void issue()
-    { load_one_gather<i>(dst, gs); }
+    {
+        load_one_gather<i>(dst, gs);
+    }
 };
 template <typename ST>
 __device__ __forceinline__ void load_tile_gather(ST& dst, const gather_src& gs)
@@ -531,7 +539,7 @@ __device__ __forceinline__ void epilogue_silu_quant(const int br,
     __shared__ float amax_s[WARPS_COL][BLOCK_SIZE_ROW];
     // silu(min(g, L)) * clamp(u, -L, L) for accumulator subtile (n, m) of row half I (gate tile
     // c[I][0], up c[I][1])
-    auto act4 = [&]<int I, int n, int m>(float (&o)[4]) {
+    auto act4 = [&]<int I, int n, int m>(float(&o)[4]) {
         float gg[4], uu[4];
         acc_rd4<I * 128, n, m>(gg);
         acc_rd4<I * 128 + 64, n, m>(uu);
@@ -738,7 +746,7 @@ __global__ __launch_bounds__(256, 1) __attribute__((amdgpu_num_vgpr(128))) void 
     // (next loaded 4 K-steps before the switch)
     uint32_t aoc[8], aon[8];
     const i32x4 q_rsrc = make_srsrc((void*)A.raw_ptr, 0x7ffffff0u);
-    auto load_aoff     = [&](int row_tile, uint32_t (&o)[8]) {
+    auto load_aoff     = [&](int row_tile, uint32_t(&o)[8]) {
         const uint4* p =
             reinterpret_cast<const uint4*>(AOFF + ((size_t)row_tile * 256 + threadIdx.x) * 8);
         const uint4 x = p[0], y = p[1];
@@ -751,7 +759,7 @@ __global__ __launch_bounds__(256, 1) __attribute__((amdgpu_num_vgpr(128))) void 
         o[6] = y.z;
         o[7] = y.w;
     };
-    auto gsrc = [&](const uint32_t (&o)[8], int h, int kk) {
+    auto gsrc = [&](const uint32_t(&o)[8], int h, int kk) {
         gather_src gs;
         gs.srsrc = q_rsrc;
         gs.soff  = kk * 128;
@@ -976,7 +984,7 @@ __global__ __launch_bounds__(256, 1) __attribute__((amdgpu_num_vgpr(128))) void 
                 // deferred to the next tile's first K-step (epi_part)
                 p_nv   = ((cint_p)ecnt)[ex] - (br * BLOCK_SIZE_ROW - ((cint_p)eoff)[ex]);
                 p_crs  = make_srsrc(Cout + (size_t)br * BLOCK_SIZE_ROW * NTOT,
-                                    BLOCK_SIZE_ROW * NTOT * 2);
+                                   BLOCK_SIZE_ROW * NTOT * 2);
                 p_col0 = nb_of(bc, 0) * 128 + wn * 64;
                 p_col1 = nb_of(bc, 1) * 128 + wn * 64;
             }
@@ -1347,12 +1355,12 @@ struct tile_rc
 template <typename ST>
 __device__ __forceinline__ tile_rc load_coord(int i)
 {
-    using T                            = typename ST::dtype;
-    constexpr int bytes_per_thread     = ST::underlying_subtile_bytes_per_thread;
-    constexpr int bytes_per_warp       = bytes_per_thread * kittens::WARP_THREADS;
-    const int lane_byte_offset         = (kittens::laneid() * bytes_per_thread) +
-                                         (kittens::warpid() * bytes_per_warp) +
-                                         (i * NUM_WARPS * bytes_per_warp);
+    using T                        = typename ST::dtype;
+    constexpr int bytes_per_thread = ST::underlying_subtile_bytes_per_thread;
+    constexpr int bytes_per_warp   = bytes_per_thread * kittens::WARP_THREADS;
+    const int lane_byte_offset     = (kittens::laneid() * bytes_per_thread) +
+                                 (kittens::warpid() * bytes_per_warp) +
+                                 (i * NUM_WARPS * bytes_per_warp);
     const int subtile_id               = lane_byte_offset / ST::underlying_subtile_bytes;
     const int subtile_row              = subtile_id / ST::underlying_subtiles_per_row;
     const int subtile_col              = subtile_id % ST::underlying_subtiles_per_row;
@@ -1389,6 +1397,9 @@ __global__ void build_gather_tables(const int* __restrict__ tok,
 {
     using ST_A     = st_fp8e4m3<128, 128, st_16x128_s>;
     const int tile = blockIdx.x;
+    // Unused tiles have no initialized token rows and are never read by GEMM.
+    if(tile >= tile_e[max_tiles])
+        return;
 #pragma unroll
     for(int u = 0; u < KB * 64 / 256; u++)
     {
@@ -1406,8 +1417,6 @@ __global__ void build_gather_tables(const int* __restrict__ tok,
         }
         pa[((size_t)kb * max_tiles + tile) * 64 + j % 64] = w;
     }
-    if(tile >= tile_e[max_tiles])
-        return;
     uint32_t o[8];
 #pragma unroll
     for(int i = 0; i < 4; i++)
@@ -1432,7 +1441,9 @@ constexpr int D = 4096, I = 1024, KB1 = D / 128, KB2 = I / 128, TM = 256;
 inline size_t align256(size_t x) { return (x + 255) & ~size_t(255); }
 // sorted rows: every expert padded to whole tiles (upper bound E * (TM - 1) padding rows)
 inline int rowmax(int T, int S, int E)
-{ return (int)((((size_t)T * S + (size_t)E * (TM - 1)) + 255) / 256 * 256); }
+{
+    return (int)((((size_t)T * S + (size_t)E * (TM - 1)) + 255) / 256 * 256);
+}
 
 struct Workspace
 {
@@ -1547,7 +1558,9 @@ int forward(const bf16* x,
 
 extern "C" {
 size_t hk_moe_workspace_bytes(int T, int topk, int num_experts)
-{ return carve(nullptr, T, topk, num_experts, nullptr); }
+{
+    return carve(nullptr, T, topk, num_experts, nullptr);
+}
 
 int hk_moe_forward(const void* x,
                    void* out,
@@ -1567,11 +1580,11 @@ int hk_moe_forward(const void* x,
                    size_t ws_bytes,
                    hipStream_t stream)
 {
-    if(hidden != D || inter != I)
+    if(hidden != D || inter != I || T < 0 || T > 0x7ffffff0 / D)
         return HK_MOE_ERR_SHAPE;
     if(topk != 8 && topk != 9)
         return HK_MOE_ERR_TOPK;
-    if(num_experts > SORT_EMAX)
+    if(num_experts < 1 || num_experts > SORT_EMAX)
         return HK_MOE_ERR_EXPERTS;
     if(T <= 0)
         return HK_MOE_OK;

@@ -177,50 +177,94 @@ def test_routing_replay(weights):
 
 def test_rejects(weights):
     w13, s13, w2, s2 = weights
-    x = torch.randn(64, HIDDEN, dtype=torch.bfloat16, device="cuda")
-    ids = torch.zeros(64, 4, dtype=torch.int32, device="cuda")
-    ok = True
-    for bad in (
-        lambda: hk_fp8_moe(x, ids, ids.float(), w13, s13, w2, s2),  # top-k 4
-        lambda: hk_fp8_moe(
-            x[:, :2048], ids.repeat(1, 2), ids.float().repeat(1, 2), w13, s13, w2, s2
-        ),
+    x, ids, tw = make_routing(8, w13.shape[0])
+    args = [x, ids, tw, w13, s13, w2, s2]
+    bad_args = []
+    for index in range(len(args)):
+        bad = args.copy()
+        # Avoid copying the multi-GiB weight tensors to the CPU.
+        bad[index] = torch.empty(
+            args[index].shape, dtype=args[index].dtype, device="meta"
+        )
+        bad_args.append(bad)
+    for index, tensor in (
+        (0, x[:, :2048]),
+        (1, ids[:, :4]),
+        (1, ids[0, 0]),
+        (1, ids.float()),
+        (3, w13[0, 0, 0]),
+        (3, w13[:0]),
     ):
+        bad = args.copy()
+        bad[index] = tensor
+        bad_args.append(bad)
+    ok = True
+    for bad in bad_args:
         try:
-            bad()
+            hk_fp8_moe(*bad)
             ok = False
         except ValueError:
             pass
+    for out in (
+        torch.empty_like(x, device="cpu"),
+        torch.empty(x.numel() + 1, device="cuda", dtype=x.dtype)[1:].view_as(x),
+    ):
+        try:
+            hk_fp8_moe(*args, out=out)
+            ok = False
+        except ValueError:
+            pass
+    aiter.logger.info(f"hk_fp8_moe rejects invalid inputs: {'ok' if ok else 'FAIL'}")
+    return ok
+
+
+def test_int64_ids_and_empty(weights):
+    w13, s13, w2, s2 = weights
+    packed = shuffle_weight(w13, (16, 16)), shuffle_weight(w2, (16, 16))
+    x, ids, tw = make_routing(8, w13.shape[0])
+    ids64 = ids.long()
+    ids64[:, ::2] = 2**32
+    ids64[:, 1::4] = -(2**32)
+    masked = ids.clone()
+    masked[:, ::2] = -1
+    masked[:, 1::4] = -1
+    args = (packed[0], s13, packed[1], s2)
+    expected = hk_fp8_moe(x, masked, tw, *args)
+    actual = hk_fp8_moe(x, ids64, tw, *args)
+    empty = hk_fp8_moe(x[:0], ids[:0], tw[:0], *args)
+    ok = torch.equal(expected, actual) and empty.shape == x[:0].shape
     aiter.logger.info(
-        f"hk_fp8_moe rejects unsupported shapes: {'ok' if ok else 'FAIL'}"
+        f"hk_fp8_moe int64 masking and empty input: {'ok' if ok else 'FAIL'}"
     )
     return ok
 
 
-parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawTextHelpFormatter,
-    description="HipKittens block-FP8 grouped MoE: correctness vs fp32 and timing",
-)
-parser.add_argument(
-    "-t", "--tokens", type=int, nargs="*", default=None, help="Token counts"
-)
-parser.add_argument(
-    "--routing-only", action="store_true", help="Only routing replay regressions"
-)
-args = parser.parse_args()
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="HipKittens block-FP8 grouped MoE: correctness vs fp32 and timing",
+    )
+    parser.add_argument(
+        "-t", "--tokens", type=int, nargs="*", default=None, help="Token counts"
+    )
+    parser.add_argument(
+        "--routing-only", action="store_true", help="Only routing replay regressions"
+    )
+    args = parser.parse_args()
 
-if aiter.get_gfx() != "gfx950":
-    print(f"Skipping test_hk_fp8_moe.py: requires gfx950, got {aiter.get_gfx()}")
-    sys.exit(0)
+    if aiter.get_gfx() != "gfx950":
+        print(f"Skipping test_hk_fp8_moe.py: requires gfx950, got {aiter.get_gfx()}")
+        sys.exit(0)
 
-tokens = args.tokens or [1, 1024, 4096, 6144, 16384]
-results = []
-for E in (288, 289):
-    weights = make_weights(E)
-    for T in ([] if args.routing_only else tokens):
-        for limit in (0.0, 10.0):
-            results.append(test_case(T, E, limit, weights))
-    results.append(test_routing_replay(weights))
-    results.append(test_rejects(weights))
-    del weights
-sys.exit(0 if all(results) else 1)
+    tokens = args.tokens or [1, 1024, 4096, 6144, 16384]
+    results = []
+    for E in (288, 289):
+        weights = make_weights(E)
+        for T in ([] if args.routing_only else tokens):
+            for limit in (0.0, 10.0):
+                results.append(test_case(T, E, limit, weights))
+        results.append(test_routing_replay(weights))
+        results.append(test_rejects(weights))
+        results.append(test_int64_ids_and_empty(weights))
+        del weights
+    sys.exit(0 if all(results) else 1)

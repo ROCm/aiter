@@ -8,16 +8,17 @@ tiles. FP8 scales are applied with `V_MFMA_SCALE`.
 
 | Parameter | Requirement |
 |---|---|
-| Shapes | Hidden dimension 4096, intermediate dimension 1024, top-k 8 or 9, up to 1024 experts |
+| Shapes | Hidden dimension 4096, intermediate dimension 1024, top-k 8 or 9, 1 to 1024 experts, at most 524287 tokens |
 | Weights | FP8 e4m3: `w13` [E, 2048, 4096] with gate rows followed by up rows, and `w2` [E, 4096, 1024], both in `shuffle_weight(w, (16, 16))` layout |
 | Weight scales | FP32 powers of two for 128x128 blocks: `w13_scale` [E, 16, 32] and `w2_scale` [E, 32, 8]. Only the UE8M0 exponent is used. |
 | Activations | BF16 input and output; internal FP8 e4m3 quantization with a power-of-two scale per (token, 128 columns) |
-| Routing | Expert IDs and weights of shape [T, top-k]; out-of-range expert IDs contribute nothing |
+| Routing | Int32/int64 expert IDs and floating-point weights of shape [T, top-k]; out-of-range expert IDs contribute nothing |
 | SwiGLU | `silu(min(gate, L)) * clamp(up, -L, L)` when `swiglu_limit` L > 0; otherwise `silu(gate) * up` |
 
 Weights with arbitrary block scales must be requantized before calling the operator. The Python
 wrapper allocates the workspace through PyTorch's caching allocator. All work runs on the current
-stream and supports graph capture.
+stream and supports graph capture after JIT warmup. All tensors must be on the same gfx950 device.
+Weights and an explicit output buffer must have 16-byte-aligned base pointers.
 
 ## Pipeline
 
@@ -87,3 +88,15 @@ python3 csrc/kernels/hk_fp8_moe/check_pinned.py /tmp/hk_moe.s
 ```
 
 All VGPR spill counts must be zero, and `check_pinned.py` must pass for every grouped GEMM variant.
+
+## Compare with current AITER
+
+```bash
+python op_tests/op_benchmarks/bench_hk_fp8_moe.py --output /tmp/hk-moe-benchmark.json
+```
+
+The benchmark compares complete MoE calls with AITER's checked-in GLM-5.3-Flash tuning and its
+default heuristic. It uses identical inputs and weights, checks an FP32 reference, and records dispatch
+metadata and 21 alternating timing samples for each implementation. Timings use warm HIP graphs
+with ten calls per replay; routing, quantization, both GEMMs and weighted combination are included.
+Weight preparation, router top-k and compilation are excluded.

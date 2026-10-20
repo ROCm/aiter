@@ -6,10 +6,11 @@ A whole MoE layer forward (routing, both expert GEMMs, SwiGLU, weighted combine)
 intermediate 1024, top-8/9, with power-of-two (ue8M0) 128x128 block scales.
 """
 
+import math
+
 import torch
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_gfx
 
 HIDDEN, INTER, MAX_EXPERTS = 4096, 1024, 1024
 
@@ -60,24 +61,47 @@ def hk_fp8_moe(
     scales. Experts compute silu(min(gate, L)) * clamp(up, -L, L) for swiglu_limit L > 0, else silu(gate) * up.
     Returns bf16 [T, 4096]. The workspace comes from torch's caching allocator, so the call is graph-capturable.
     """
-    if get_gfx() != "gfx950":
-        raise RuntimeError(f"hk_fp8_moe requires gfx950, running on {get_gfx()}")
+    if not x.is_cuda:
+        raise ValueError("hk_fp8_moe: x must be on a HIP device")
+    for name, tensor in (
+        ("topk_ids", topk_ids),
+        ("topk_weights", topk_weights),
+        ("w13", w13),
+        ("w13_scale", w13_scale),
+        ("w2", w2),
+        ("w2_scale", w2_scale),
+        ("out", out),
+    ):
+        if tensor is not None and tensor.device != x.device:
+            raise ValueError(f"hk_fp8_moe: {name} must be on {x.device}")
+    arch = getattr(
+        torch.cuda.get_device_properties(x.device), "gcnArchName", "unknown"
+    ).split(":")[0]
+    if arch != "gfx950":
+        raise RuntimeError(f"hk_fp8_moe requires gfx950, running on {arch}")
     if x.dim() != 2 or x.shape[1] != HIDDEN or x.dtype != torch.bfloat16:
         raise ValueError(
             f"hk_fp8_moe: x must be bf16 [T, {HIDDEN}], got {x.dtype} {tuple(x.shape)}"
         )
-    T, E, topk = x.shape[0], w13.shape[0], topk_ids.shape[-1]
+    T = x.shape[0]
+    # Gather offsets address a buffer with a 0x7ffffff0-byte extent.
+    if T > 0x7FFFFFF0 // HIDDEN:
+        raise ValueError("hk_fp8_moe: token count exceeds the gather address range")
     if (
         topk_ids.dim() != 2
-        or topk not in (8, 9)
+        or topk_ids.shape[1] not in (8, 9)
         or topk_ids.shape[0] != T
         or topk_weights.shape != topk_ids.shape
+        or topk_ids.dtype not in (torch.int32, torch.int64)
     ):
         raise ValueError(
             f"hk_fp8_moe: topk_ids / topk_weights must be [T, 8 or 9], got {tuple(topk_ids.shape)}"
         )
-    if E > MAX_EXPERTS:
-        raise ValueError(f"hk_fp8_moe: at most {MAX_EXPERTS} experts, got {E}")
+    if w13.dim() != 3 or not 1 <= w13.shape[0] <= MAX_EXPERTS:
+        raise ValueError(f"hk_fp8_moe: w13 must have 1 to {MAX_EXPERTS} experts")
+    E, topk = w13.shape[0], topk_ids.shape[1]
+    if not math.isfinite(swiglu_limit):
+        raise ValueError("hk_fp8_moe: swiglu_limit must be finite")
     for name, w, shape in (
         ("w13", w13, (E, 2 * INTER, HIDDEN)),
         ("w2", w2, (E, HIDDEN, INTER)),
@@ -86,6 +110,7 @@ def hk_fp8_moe(
             tuple(w.shape) != shape
             or w.dtype != torch.float8_e4m3fn
             or not w.is_contiguous()
+            or w.data_ptr() % 16
         ):
             raise ValueError(
                 f"hk_fp8_moe: {name} must be contiguous fp8 e4m3 {shape}, got {w.dtype} {tuple(w.shape)}"
@@ -99,15 +124,27 @@ def hk_fp8_moe(
                 f"hk_fp8_moe: {name} must be contiguous fp32 {shape}, got {s.dtype} {tuple(s.shape)}"
             )
     x = x.contiguous()
+    if x.data_ptr() % 16:
+        x = x.clone()
     if out is None:
         out = torch.empty_like(x)
-    elif out.shape != x.shape or out.dtype != torch.bfloat16 or not out.is_contiguous():
+    elif (
+        out.shape != x.shape
+        or out.dtype != torch.bfloat16
+        or not out.is_contiguous()
+        or out.data_ptr() % 16
+    ):
         raise ValueError(
             "hk_fp8_moe: out must be a contiguous bf16 tensor shaped like x"
         )
     if T == 0:
         return out
-    ids = topk_ids.to(torch.int32).contiguous()
+    # Mask before narrowing so an invalid int64 ID cannot wrap to a live expert.
+    ids = (
+        topk_ids.clamp(-1, E).to(torch.int32)
+        if topk_ids.dtype == torch.int64
+        else topk_ids
+    ).contiguous()
     wts = topk_weights.to(torch.float32).contiguous()
     with torch.cuda.device(x.device):
         ws = torch.empty(
