@@ -206,7 +206,13 @@ def _make_combine_fused_reduce(
     S_ROW_BYTES = C_CHK * (CHUNK_ELEMS // SCALE_BLOCK) if quant_bits else 0
     IN_SCALE_OFF = IN_ROWS * P_ROW_BYTES
     IN_TILE = (IN_ROWS, P_ROW_BYTES)
-    SC_TILE = (IN_ROWS, S_ROW_BYTES)
+    # The scale plane keeps the old TDM atom, so it has no tile constant of its
+    # own: its row is C_CHK * 8 bytes, and _combine_tile picks C_CHK=1 whenever
+    # the hidden chunk count is odd -- hidden_dim=2304, topk=8, quant_bits=8
+    # gives an 8-byte row, under the 16-byte tile_dim0 span the tiled atom
+    # requires in the pinned flydsl. Only the payload and output planes use it.
+    # To restore, once the pin carries the relaxed span check: give this plane
+    # an (IN_ROWS, S_ROW_BYTES) tile and copy what IN_TILE does below.
     OUT_ROW_ELEMS = C_CHK * CHUNK_ELEMS
     OUT_ROW_BYTES = OUT_ROW_ELEMS * 2
     OUT_TILE = (T_TOK, OUT_ROW_ELEMS)
@@ -356,10 +362,12 @@ def _make_combine_fused_reduce(
             )
 
         def lds_scale_view(s):
+            # Flat 2-D: the scale plane stays on the old TDM atom (see the
+            # S_ROW_BYTES note at SC_TILE), whose fx.copy takes a plain view.
             return lds_view(
                 fx.recast_iter(p8_shared, in_buf_ptr(s) + IN_SCALE_OFF),
-                (SC_TILE, 1),
-                ((S_ROW_BYTES, 1), IN_ROWS * S_ROW_BYTES),
+                (IN_ROWS, S_ROW_BYTES),
+                (S_ROW_BYTES, 1),
             )
 
         def lds_out_view(s):
@@ -444,24 +452,15 @@ def _make_combine_fused_reduce(
                     + fx.Int64(q0) * fx.Int64(CHUNK_ELEMS // SCALE_BLOCK)
                 )
                 gt_sc = global_view(
-                    inp_iter, g_off_s, (row_oob, S_ROW_BYTES), (slot_stride, 1)
+                    inp_iter, g_off_s, (IN_ROWS, S_ROW_BYTES), (slot_stride, 1)
                 )
-                atom_sc, coord_sc = fx.rocdl.cdna5.make_tiled_tdm_atom(
-                    fx.rocdl.TensorLoad(),
+                atom_sc = fx.rocdl.make_tdm_atom(
                     gt_sc,
-                    fx.make_layout(SC_TILE, (S_ROW_BYTES, 1)),
-                    SC_TILE,
+                    [row_oob, None],
+                    strides=[slot_stride, None],
                     num_warps=warp_num_per_block,
                 )
-                blk_sc = fx.zipped_divide(coord_sc, SC_TILE)[None, (0, None)]
-                tSs, tSg = fx.rocdl.cdna5.tdm_partition(
-                    atom_sc,
-                    fx.rocdl.wave_id(),
-                    fx.make_layout(warp_num_per_block, 1),
-                    lds_scale_view(buf),
-                    blk_sc,
-                )
-                fx.copy(atom_sc, tSg[None, 0], tSs[None, 0])
+                fx.copy(atom_sc, gt_sc, lds_scale_view(buf))
 
         def reduce_tile(buf):
             """-- dequantize and sum the topk slots out of LDS --"""
