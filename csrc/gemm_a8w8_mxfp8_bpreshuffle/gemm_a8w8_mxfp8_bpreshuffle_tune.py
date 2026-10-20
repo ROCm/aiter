@@ -17,11 +17,8 @@ the only one the 32x32 (w_scale [N/32, K/32], as bmm's) and 128x128 blocks
 (w_scale [N/128, K/128], x_scale 1x128 as its column-major bytes) have: the
 batched GEMM at B = 1 (bmm) joins as a third backend on them (its candidates:
 the table's tuned bmm kernels for M/2..2M, its heuristic pick, and their
-split-K neighbours). OPUS also joins on 128x128, using the same scale bytes:
-ordinary candidates use JIT and pin-AGPR candidates use their pre-built CO.
-FlyDSL rows identify the backend with kernelId "mxfp8" or "bmm"; OPUS rows
-keep libtype "opus" and the exact numeric kernelId. All backends share the
-BF16 torch reference and the same checkAllclose/--errRatio acceptance rules:
+split-K neighbours). FlyDSL rows use kernelId "mxfp8" or "bmm"; OPUS supports
+128x128 blocks with libtype "opus" and a numeric kernelId:
 
     python3 csrc/gemm_a8w8_mxfp8_bpreshuffle/gemm_a8w8_mxfp8_bpreshuffle_tune.py \\
         --mxscale_table \\
@@ -152,7 +149,6 @@ def _opus_configuration(instance):
 
 
 def _opus_coarse_candidates(candidates):
-    """Time existing COs and two JIT samples; defer new pin variants."""
     groups = defaultdict(list)
     coarse = set()
     for kid, instance in candidates:
@@ -163,7 +159,6 @@ def _opus_coarse_candidates(candidates):
         geometry, depth, ahead, output = _opus_configuration(instance)
         groups[geometry].append((kid, instance, depth, ahead, output))
     for variants in groups.values():
-        # Sample a shallow/default-cache schedule and a deeper/streaming one.
         output_modes = sorted({item[4] for item in variants})
         for target_depth, cache, wg, output in (
             (2, (0, 0), 2, output_modes[0]),
@@ -189,10 +184,6 @@ def _opus_coarse_candidates(candidates):
 def _opus_refinement_candidates(
     groups, measurements, already_measured, top_groups=3, *, err_ratio=0.05,
 ):
-    """Expand the fastest valid geometries per pipeline under the shared error limit.
-
-    If all samples fail, expand the first three geometries as a bounded fallback.
-    """
     measured = {
         int(kid): float(us) for kid, us, error in measurements
         if math.isfinite(float(us)) and float(us) > 0 and float(error) <= err_ratio
@@ -211,7 +202,6 @@ def _opus_refinement_candidates(
 
 
 def _opus_pin_candidates(candidates, measurements, top_groups=3, *, err_ratio=0.05):
-    """Expand pin masks of the fastest measured CO schedules per pipeline."""
     valid = {int(kid): float(us) for kid, us, error in measurements
              if math.isfinite(float(us)) and 0 < float(us) and float(error) <= err_ratio}
     groups = defaultdict(list)
@@ -230,7 +220,6 @@ def _opus_pin_candidates(candidates, measurements, top_groups=3, *, err_ratio=0.
 
 
 def prepare_opus_pin_kids(kids):
-    """Build selected CO variants and keep only spill-free, effective pin layouts."""
     from csrc.opus_gemm.opus_gemm_common import gfx950_co_kernels_declared
 
     kids = sorted(kid for kid in kids if gfx950_co_kernels_declared.get(kid, {}).get("pin_variant"))
@@ -259,7 +248,6 @@ def prepare_opus_pin_kids(kids):
 
 
 def ensure_opus_kids_compiled(kids):
-    """Prepare the existing exact-kid JIT/CO host launchers before spawning."""
     if not kids:
         return False
     from aiter.jit import core
@@ -510,8 +498,6 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         return seeds
 
     def get_untuned_gemm_list(self, untuned_gemm_file):
-        # Default to 1x32 for the original table, 128x128 for --mxscale_table.
-        # pre_process slices untunedf down to self.keys.
         df = super().get_untuned_gemm_list(untuned_gemm_file)
         default_block = "128x128" if getattr(self, "_mxscale_table", False) else W_SCALE_BLOCK
         if "w_scale_block" not in df.columns:

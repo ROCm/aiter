@@ -185,7 +185,6 @@ KARGS_NAME_MAP = {
 
 
 def co_traits_args(k):
-    """Spell the parameterized C++ traits shared by every gfx950 CO entry."""
     def argument(value):
         if isinstance(value, dict):
             args = ",".join(argument(v) for v in value["args"])
@@ -3361,7 +3360,6 @@ def gen_mxscale_bpreshuffle_instance(
     cg, k, pipeline_header, traits_header, kernel_func, traits_name, kargs_name,
     instance_impl_preamble, make_a8w8_bpreshuffle_host_decl, **_unused,
 ):
-    """Emit the registered CO host or one traits-bound host/device pair."""
     if k.bpreshuffle_co is not None:
         _gen_bpreshuffle_co(cg, k, instance_impl_preamble, make_a8w8_bpreshuffle_host_decl)
         return

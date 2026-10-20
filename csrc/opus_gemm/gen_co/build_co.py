@@ -30,12 +30,6 @@ identical without any sidecar::
 
     .co filename == extern "C" symbol inside the .co == host launcher symbol
 
-gfx950 uses the registry's expanded ``gen_co/co_kernels_gfx950.json`` entries,
-including shared defaults and named device-flag sets. Every variant uses the
-same extern "C" entry template and ``hipcc --genco`` build path. The JSON selects
-the pipeline, traits and device flags. Its .co filename and GPU entry share the
-explicit ``symbol`` in the manifest; no symbol discovery is needed.
-
 The compiler is NOT pinned to a version
 ---------------------------------------
 ``--llvm-bin`` just says which toolchain to use; nothing here checks what it is.
@@ -48,10 +42,6 @@ Usage
 ::
 
     python3 csrc/opus_gemm/gen_co/build_co.py --llvm-bin /path/to/llvm/build/bin
-
-    # gfx950: build the pin-AGPR pipelines directly into device COs.
-    python3 csrc/opus_gemm/gen_co/build_co.py --arch gfx950 \\
-        --llvm-bin /path/to/pin-agpr-llvm/bin
 
     # or via the environment
     OPUS_CO_LLVM_BIN=/path/to/llvm/build/bin \\
@@ -257,7 +247,6 @@ void {symbol}(opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950 kargs)
 
 
 def _check_gfx950_pin(entry, path, llvm_bin):
-    """Reject spills and verify that each requested operand reached AGPRs."""
     metadata = _run([_tool(llvm_bin, "llvm-readelf"), "--notes", path]).stdout
     names = re.findall(r"^\s*\.name:\s*(\S+)\s*$", metadata, re.MULTILINE)
     if names != [entry["symbol"]]:
@@ -300,7 +289,6 @@ def _check_gfx950_pin(entry, path, llvm_bin):
 
 
 def build_one_gfx950(entry, args, llvm_bin, workdir):
-    """Generate one entry, compile it with hipcc and save the bare ELF CO."""
     symbol = entry.get("symbol", f"opus_gemm_gfx950_pin_agpr_{entry['kid']}")
     output = os.path.join(args.out_dir, f"{symbol}.co")
     optional = entry.get("pin_variant", False)
@@ -309,7 +297,6 @@ def build_one_gfx950(entry, args, llvm_bin, workdir):
             resources = _check_gfx950_pin(entry, output, llvm_bin) if optional else {}
             return {"kid": entry["kid"], "status": "ready", **resources}
         except ValueError:
-            # Rebuild a rejected cached variant once with the selected compiler.
             pass
     stub_path = os.path.join(workdir, f"{symbol}.hip")
     with open(stub_path, "w") as f:

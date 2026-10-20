@@ -204,12 +204,10 @@ class OpusGemmInstance:
     # Optional logical-M limit imposed by this exact kernel's launch geometry.
     max_m: int | None = None
 
-    # Compact E8M0 bpreshuffle kernel launch metadata.
     scale_dtype: str | None = None
     max_tensor_bytes: int | None = None
     pad_m: bool = False
     max_k: int | None = None
-    # B-preshuffle launch parameters used by the runtime and gfx950 emitter.
     bpreshuffle_split_k: int = 1
     bpreshuffle_fixed_k: int = 0
     bpreshuffle_pad_n: bool = False
@@ -2913,7 +2911,6 @@ a8w8_mxscale_bmm_kernels_list = {
 }
 
 
-# gfx950 B-preshuffle follows the existing parameter-loop -> traits -> kernel registry.
 _TAG = "a8w8_mxscale_gemm_bpreshuffle"
 _INT32_MAX = 2**31 - 1
 _BP_ROOT = "opus_gemm_blockscale_mxscale_bpreshuffle_"
@@ -2929,7 +2926,6 @@ def _bpreshuffle_register(pipeline, kernel, traits, bm, bn, bk, wm, wn, *,
                          wave_k=1, fixed_k=0, m_align=1, pad_n=False,
                          depth=1, output=0, ahead=0, wg_per_cu=1, cache_a=0, cache_b=0,
                          **launch):
-    # CO IDs occupy 70000-70160; JIT configurations follow in the same range.
     kid = 70161 + len(a8w8_mxscale_gemm_bpreshuffle_kernels_list)
     config_name = (f"{pipeline}_{bm}x{bn}x{bk}_w{wm}x{wn}x{wave_k}_p{depth}"
                    f"_o{output}_ba{ahead}_sk1_wg{wg_per_cu}"
@@ -2951,7 +2947,6 @@ def _bpreshuffle_register(pipeline, kernel, traits, bm, bn, bk, wm, wn, *,
         bpreshuffle_pad_n=pad_n, bpreshuffle_entry=entry)
 
 
-# Use the same A/B cache policies as the original gfx950 candidates.
 _BP_CACHE_POLICIES = ((0, 0), (1, 17), (17, 1))
 
 # Direct B operands use an A-LDS ring and a register B queue. The wait schedule needs FixedK.
@@ -2979,7 +2974,6 @@ for _k in (1024, 1536, 3072, 7168, 16384):
                                 _bm, _bn, 256, 1, _wn, m_align=16, fixed_k=_k, depth=_stages,
                                 ahead=_ahead, wg_per_cu=_wg, cache_a=_ca, cache_b=_cb, grid_kind="xcd")
 
-# Additional output/fixed-K configurations of the existing generic pipelines.
 for _bm, _bn, _wn, _stages, _ahead, _ca, _cb in (
         (64,64,2,4,2,17,1), (64,128,4,3,1,1,17), (96,64,4,4,2,1,17),
         (96,128,8,3,2,0,0), (128,128,4,4,2,17,1), (128,128,4,3,1,1,17)):
@@ -2988,9 +2982,8 @@ for _bm, _bn, _wn, _stages, _ahead, _ca, _cb in (
     _bpreshuffle_register("prefetch_b_vgpr", _BP_ROOT + "prefetch_b_vgpr_bulk_panel_kernel", _traits,
         _bm, _bn, 256, 1, _wn, m_align=16, fixed_k=7168, depth=_stages,
         ahead=_ahead, output=2, cache_a=_ca, cache_b=_cb, grid_kind="xcd")
-# Offline pipelines use the CO manifest; their device code stays outside ordinary JIT.
+
 def _load_gfx950_co_kernels(path):
-    """Expand shared fields and derive shape support from the launch table."""
     with open(path) as stream:
         document = json.load(stream)
     entries = {}
@@ -3002,8 +2995,6 @@ def _load_gfx950_co_kernels(path):
                 list(map(int, shape.split(","))) for shape in entry["launches"]
             )
         entries[entry["kid"]] = entry
-    # Pin masks are variants of one fixed geometry/schedule, not new pipelines.
-    # Explicit IDs in the manifest preserve every existing CO and JIT identity.
     for group in document.get("pin_groups", []):
         base = entries[group["base"]]
         lds = base["pipeline"] == "pingpong_lds"

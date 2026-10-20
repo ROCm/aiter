@@ -1,11 +1,4 @@
 {
-  "_comment": [
-    "gfx950 MXFP8 B-preshuffle COs: original IDs 70000-70160 and JIT IDs 70161-72665 remain stable. Pin variants use CO IDs 72666-72727; additional configurations append from 72728.",
-    "defaults are merged into every gfx950 entry; per-entry fields override them.",
-    "device_flags names a list in device_flag_sets; flag order is preserved.",
-    "For entries with launches, supported_shapes is derived from its keys in numeric order.",
-    "pin_groups bind a fixed base configuration to explicit IDs by mask (A=1, B=2, C=4). Missing entries inherit the base with only pin flags changed; LDS fragment representation stays fixed."
-  ],
   "defaults": {
     "tag": "a8w8_mxscale_gemm_bpreshuffle",
     "dtypes": {"a": "fp8_t", "b": "fp8_t", "c": "bf16_t", "acc": "fp32_t"}

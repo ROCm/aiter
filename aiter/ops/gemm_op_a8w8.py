@@ -936,8 +936,7 @@ def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y):
     its x_scale block goes with the w_scale's: 1x128 with 128x128, else 1x32),
     "bmm" the flydsl batched
     GEMM (flydsl.batched_gemm_a8w8) run with B = 1, which also serves untuned
-    shapes. libtype="opus" retains the exact numeric kid for native 128x128
-    scales; its existing launcher chooses JIT or pre-built CO."""
+    shapes. OPUS rows use numeric kernel IDs."""
     m, k = XQ.shape
     n = WQ.shape[0]
     w_scale_block = mxscale_w_scale_block(tuple(w_scale.shape), n, k)
@@ -961,8 +960,7 @@ def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y):
         ):
             from .opus.gemm_op_a8w8 import _launch_a8w8_blockscale_bpreshuffle_gemm
 
-            # Quantizer/FlyDSL pass column-major bytes as a contiguous
-            # [M,K/128] tensor. Give OPUS the logical view without a copy.
+            # View column-major scale bytes as [M, K/128] without copying.
             opus_scale = (
                 x_scale if x_scale.stride() == (1, m)
                 else x_scale.view(k // 128, m).T
@@ -970,8 +968,7 @@ def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y):
             return _launch_a8w8_blockscale_bpreshuffle_gemm(
                 XQ, WQ, opus_scale, w_scale, Y, kid=kid, instance=instance,
             )
-        # A padded-M lookup may find a shape-specialized OPUS row that cannot
-        # run the original shape. Keep the existing BMM heuristic fallback.
+        # A padded-M lookup can select a kernel that does not support the original M.
         config = None
     backend = None if config is None else str(config["kernelId"])
     if config is not None and (

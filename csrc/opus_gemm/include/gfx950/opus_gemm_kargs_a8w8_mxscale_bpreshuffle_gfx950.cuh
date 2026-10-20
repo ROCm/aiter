@@ -3,7 +3,6 @@
 
 #include <cstdint>
 
-// Shared by-value launch ABI; pipeline configuration lives in separate traits headers.
 struct opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950 {
     const void *__restrict__ ptr_a;
     const void *__restrict__ ptr_b;
