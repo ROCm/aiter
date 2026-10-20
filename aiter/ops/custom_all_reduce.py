@@ -135,6 +135,7 @@ def fused_allreduce_rmsnorm_quant_per_group(
     use_1stage: bool,
     bf16_out_ptr: int = 0,
     transpose_scale: bool = False,
+    gemma_norm: bool = False,
 ) -> None: ...
 
 
@@ -152,6 +153,7 @@ def fused_allreduce_rmsnorm_mxfp4_quant(
     reg_bytes: int,
     use_1stage: bool,
     bf16_out_ptr: int = 0,
+    gemma_norm: bool = False,
 ) -> None: ...
 
 
@@ -308,7 +310,7 @@ def dispose_gfx1250(_fa: int) -> None: ...
 
 
 @compile_ops(GFX1250_MD_NAME, fc_name="meta_size", develop=True)
-def meta_size_gfx1250() -> int: ...
+def meta_size_gfx1250(world_size: int = 8) -> int: ...
 
 
 @compile_ops(GFX1250_MD_NAME, fc_name="register_input_buffer", develop=True)

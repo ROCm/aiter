@@ -31,7 +31,8 @@ def benchmark(args):
     num_query_heads = args.num_query_heads
     num_kv_heads = args.num_kv_heads
     varlen = args.varlen
-    shuffled_kv_cache = args.shuffled_kv_cache
+    # Prefill only supports the unshuffled KV layout.
+    shuffled_kv_cache = args.shuffled_kv_cache if decode_qlen > 0 else False
     q_dtype = e4m3_dtype if args.q_dtype == "fp8" else torch.bfloat16
     kv_dtype = e4m3_dtype if args.kv_dtype == "fp8" else torch.bfloat16
     out_dtype = e4m3_dtype if args.out_dtype == "fp8" else torch.bfloat16

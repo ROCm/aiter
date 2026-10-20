@@ -33,6 +33,15 @@ def _tuning_cache_tag():
     return digest.hexdigest()
 
 
+def _cache_geometry(key_cache):
+    """KV heads and page size of a packed 5D K cache."""
+    if key_cache.ndim != 5:
+        if key_cache.ndim == 4:
+            raise NotImplementedError("Non-transposed key cache is not implemented")
+        raise ValueError("key_cache must be 5D")
+    return key_cache.shape[1], key_cache.shape[3]
+
+
 class _PADecodeAutotuneResources:
     """Prepare candidate plans and graphs outside FlyDSL's timed replay."""
 
@@ -67,16 +76,17 @@ class _PADecodeAutotuneResources:
                         dtype=torch.float32,
                         device=self.query.device,
                     )
+        num_kv_heads = _cache_geometry(key)[0]
         plan = plan_pa_decode(
             lengths,
-            key.shape[1],
+            num_kv_heads,
             max_partitions=self.max_partitions,
             workgroup_budget=workgroup_budget,
             sliding_window=self.options["sliding_window"],
             query_length=query_length,
         )
-        rows = query_length * self.query.shape[1] // key.shape[1]
-        scalar_shape = (key.shape[1], plan.capacity, rows)
+        rows = query_length * self.query.shape[1] // num_kv_heads
+        scalar_shape = (num_kv_heads, plan.capacity, rows)
         output = torch.full_like(
             self.query, float("nan"), memory_format=torch.contiguous_format
         )
@@ -139,7 +149,7 @@ def _pa_decode_configs(*args, resources, num_cu, **kwargs):
     baseline = 2 * num_cu
     resources.prepare(baseline)
     batch = resources.args[2].numel()
-    kv_heads = resources.args[0].shape[1]
+    kv_heads = _cache_geometry(resources.args[0])[0]
     capacities = {}
     for budget in [baseline, 128, 256, 512, 1024, 2048, 4096]:
         capacity = min(
@@ -262,9 +272,10 @@ def prepare_pa_decode_plan(
     ``config_dir`` selects a root containing per-architecture cache directories
     and takes precedence over the environment's cache-directory override.
 
-    Cache by attention geometry and execution modes. Tensor strides, total KV
-    cache pages, block-table padding, and max_context_length do not partition
-    the tuning cache; max_context_length still bounds kernel scheduling.
+    A 4D ``key_cache`` is not implemented. Cache by attention geometry and
+    execution modes. Tensor strides, total KV cache pages, block-table padding,
+    and max_context_length do not partition the tuning cache; max_context_length
+    still bounds kernel scheduling.
 
     Retain the returned plan for decode/graph replay. Refresh it with
     plan_pa_decode(..., plan=plan) when context lengths change; decode never
@@ -276,10 +287,11 @@ def prepare_pa_decode_plan(
         properties = torch.cuda.get_device_properties(query.device)
         num_cu = properties.multi_processor_count
         limit = num_cu if max_partitions is None else max_partitions
+        num_kv_heads, block_size = _cache_geometry(key_cache)
         # Validate plan geometry even when native autotune takes the default.
         default_plan = plan_pa_decode(
             context_lengths,
-            key_cache.shape[1],
+            num_kv_heads,
             max_partitions=limit,
             sliding_window=sliding_window,
             query_length=query_length,
@@ -311,10 +323,10 @@ def prepare_pa_decode_plan(
         tuner = _get_pa_decode_autotuner(arch, config_dir)
         tuning_args = {
             "num_seqs": context_lengths.numel(),
-            "num_kv_heads": key_cache.shape[1],
-            "query_group_size": query.shape[1] // key_cache.shape[1],
+            "num_kv_heads": num_kv_heads,
+            "query_group_size": query.shape[1] // num_kv_heads,
             "head_dim": query.shape[-1],
-            "block_size": key_cache.shape[3],
+            "block_size": block_size,
             "query_length": query_length,
             "query_dtype": str(query.dtype),
             "kv_dtype": str(key_cache.dtype),
@@ -354,7 +366,7 @@ def prepare_pa_decode_plan(
             return default_plan
         return plan_pa_decode(
             context_lengths,
-            key_cache.shape[1],
+            num_kv_heads,
             max_partitions=limit,
             workgroup_budget=budget,
             sliding_window=default_plan.sliding_window,

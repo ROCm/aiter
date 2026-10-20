@@ -33,6 +33,7 @@ length per row; lengths include query tokens. Use `--kv-dtype bf16` for unscaled
 BF16 K/V and `--help` for all shape, layout, window, sink, and device options.
 Both FP8 and native BF16 are supported on gfx942, gfx950, and gfx1250. The
 Python API infers compute type from the KV cache dtype when it is omitted.
+A non-transposed 4D key cache is not implemented.
 
 Python callers can import `prepare_pa_decode_plan` from
 `aiter.ops.flydsl.pa_decode_tuning` (or `aiter.ops.flydsl`) and pass their actual
