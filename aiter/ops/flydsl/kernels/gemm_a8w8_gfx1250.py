@@ -266,20 +266,43 @@ def launch_gemm_a8w8(
 
         a_base_off = bz64 * k64 if const_expr(batched) else fx.Int64(0)
         a_rows = i32_m if const_expr(A_PAIR == 1) else (i32_m + (A_PAIR - 1)) // A_PAIR
-        gA_full = _gv(
-            gA_base, a_base_off, (a_rows, i32_k * A_PAIR), (lda64 * A_PAIR, 1)
-        )
-        sA_box = fx.make_layout((A_LDS_ROWS, A_TDM_ROW), (A_LDS_ROW, 1))
+        # A row wider than the descriptor's 1024-byte pad interval carries
+        # A_PAD_SPLIT separate skips, not one fat skip at the end: a 2048-byte
+        # row pads at its midpoint and again at its end. A flat (row, stride)
+        # LDS box can only say "32 bytes every 2048", whose dword interval is
+        # 512 and overflows the 3-bit encoded field. Splitting the K axis of
+        # both sides into pad-interval chunks states the real shape, and the
+        # geometry pass then reads LDS_PAD_A every A_PAD_INTERVAL off the one
+        # stride jump it finds. The tiler needs the global tensor nested the
+        # same way, so the split is on the view as well as the box.
+        if const_expr(A_PAD_SPLIT > 1):
+            a_chunks = (i32_k * A_PAIR) // A_PAD_INTERVAL
+            gA_full = _gv(
+                gA_base,
+                a_base_off,
+                (a_rows, (a_chunks, A_PAD_INTERVAL)),
+                (lda64 * A_PAIR, (A_PAD_INTERVAL, 1)),
+            )
+            a_tile = (A_LDS_ROWS, (A_PAD_SPLIT, A_PAD_INTERVAL))
+            sA_inner = ((A_PAD_SPLIT, A_PAD_INTERVAL), (A_PAD_INTERVAL + LDS_PAD_A, 1))
+        else:
+            gA_full = _gv(
+                gA_base, a_base_off, (a_rows, i32_k * A_PAIR), (lda64 * A_PAIR, 1)
+            )
+            a_tile = (A_LDS_ROWS, A_TDM_ROW)
+            sA_inner = (A_TDM_ROW, 1)
+        sA_box = fx.make_layout((A_LDS_ROWS, sA_inner[0]), (A_LDS_ROW, sA_inner[1]))
         atomA, coordA = fx.rocdl.cdna5.make_tiled_tdm_atom(
-            fx.rocdl.TensorLoad(), gA_full, sA_box, (A_LDS_ROWS, A_TDM_ROW), num_warps=1
+            fx.rocdl.TensorLoad(), gA_full, sA_box, a_tile, num_warps=1
         )
         atomA = fx.atom_set_value(atomA, "workgroup_mask", a_mask)
-        blkA = fx.zipped_divide(coordA, (A_LDS_ROWS, A_TDM_ROW))[None, (bid_x, None)]
+        blkA = fx.zipped_divide(coordA, a_tile)[None, (bid_x, None)]
         sA_lds = fx.Tensor(
             fx.make_view(
                 base_ptr,
                 fx.make_layout(
-                    ((A_LDS_ROWS, A_TDM_ROW), num_buffers), ((A_LDS_ROW, 1), PITCH)
+                    ((A_LDS_ROWS, sA_inner[0]), num_buffers),
+                    ((A_LDS_ROW, sA_inner[1]), PITCH),
                 ),
             )
         )
