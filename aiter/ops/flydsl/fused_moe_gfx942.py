@@ -10,6 +10,7 @@ import aiter
 from aiter import ActivationType, QuantType
 from aiter.fused_moe import moe_sorting
 from aiter.fused_moe_registry import FusedMoeRequest
+from aiter.jit.utils.chip_info import get_cu_num
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
     flydsl_absmax,
     flydsl_quant_per_tensor,
@@ -374,11 +375,10 @@ def _run_prefill(
     if config.down_path == "8x1_compact":
         from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.gemm2_8x1_compact import (
             allocate_task_buffers,
-            device_cu_count,
         )
 
         # The split policy and its buffer capacities must use the same CU count.
-        cu_count = device_cu_count(sorted_expert_ids.device)
+        cu_count = get_cu_num()
         full_tasks, tail_tasks, counts = allocate_task_buffers(
             sorted_expert_ids, problem.experts, cu_count
         )

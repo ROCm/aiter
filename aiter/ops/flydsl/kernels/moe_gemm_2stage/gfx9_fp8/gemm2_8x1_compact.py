@@ -18,10 +18,6 @@ from .gemm2_8x1 import _build_moe_gemm2_8x1
 _SPLIT_NUM, _SPLIT_DEN = 3, 5
 
 
-def device_cu_count(device):
-    return int(torch.cuda.get_device_properties(device).multi_processor_count)
-
-
 def task_capacities(metadata_capacity, experts, cu_count):
     assert metadata_capacity >= 0 and 0 < experts <= 2048 and cu_count > 0
     # An expert has at most three native tails. Each split full task adds four

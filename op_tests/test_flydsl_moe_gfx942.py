@@ -26,7 +26,7 @@ from aiter.fused_moe_registry import (
     resolve_fused_moe_impl,
 )
 from aiter.jit.core import AITER_CONFIGS
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.flydsl.fused_moe_gfx942 import Config, get_tune_space
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
     gemm2_8x1_compact as compact,
@@ -421,12 +421,15 @@ def check_moe(
     rms = token_rms(reference)
     tasks = "-"
     if parsed.down_path == "8x1_compact":
-        device_cu = compact.device_cu_count(request.hidden_states.device)
+        device_cu = get_cu_num()
         output, tasks = run_compact(impl, request, experts, device_cu)
         # The cached launcher must stay in bounds and correct for the other CU count.
         for cu_count in CU_COUNTS:
             if cu_count != device_cu:
-                with patch.object(compact, "device_cu_count", return_value=cu_count):
+                with patch(
+                    "aiter.ops.flydsl.fused_moe_gfx942.get_cu_num",
+                    return_value=cu_count,
+                ):
                     other, _ = run_compact(impl, request, experts, cu_count)
                 diff = rms_error(output, other, rms)
                 assert diff < PATH_DIFF_LIMIT, f"{config} at {cu_count} CUs: {diff=}"

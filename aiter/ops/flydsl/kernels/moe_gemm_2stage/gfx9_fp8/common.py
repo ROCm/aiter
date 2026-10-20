@@ -21,6 +21,8 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+
 # RTA can be enabled if accuracy is acceptable. Simplified RTA may reverse NaNs although it should not
 #  occur in practice, so use with caution.
 _SIMPLIFIED_BF16_RTA = os.environ.get(
@@ -88,10 +90,9 @@ def _ptr(t):
 
 
 def get_down_device_config():
-    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
-    if properties.gcnArchName.split(":", 1)[0] != "gfx942":
+    if get_gfx_runtime() != "gfx942":
         raise RuntimeError("specialized Down kernels require gfx942")
-    is_mi308 = properties.multi_processor_count == 80
+    is_mi308 = get_cu_num() == 80
     return is_mi308, 4 if is_mi308 else 8
 
 
