@@ -504,10 +504,13 @@ def controlled_search(
         actual_row: "dict[str, object]",
         candidate: "dict[str, object]",
         actual_args: "SimpleNamespace",
+        **options: "object",
     ) -> "float":
         pair = candidate["kernelName1"], candidate["kernelName2"]
         state.events.append(("validate", *pair))
         assert actual_args is args
+        # Prune passes its fast-scan options explicitly; without fast-scan all are None.
+        assert all(value is None for value in options.values())
         us = returned(state.validation.get(pair, 10.0))
         candidate.update(us=us, us1=us, us2=0)
         return us
@@ -523,6 +526,7 @@ def controlled_search(
         monkeypatch.setattr(tuner, name, operation, raising=False)
     state.run = lambda actual_row=None: tuner._tune_one_shape(actual_row or row, args)
     state.pairs = [(g1, g2) for _, g1, g2 in pairs]
+    state.args = args
     return state
 
 
@@ -814,6 +818,50 @@ def test_staged_bootstrap_failure_is_local_to_bm_and_later_groups_still_screen(
     assert events(state, "g2") == [(g1_64, g2_64)]
     assert events(state, "validate") == [(G1_B, G2_B), (G1_A, G2_A), (g1_64, g2_64)]
     assert result["block_m"] == 32 and result["us"] == 0.25
+
+
+@pytest.mark.parametrize("token,small", [(1, True), (96, True), (97, False)])
+def test_staged_small_batch_times_every_pruned_pair_without_screening(
+    monkeypatch: "pytest.MonkeyPatch",
+    capsys: "pytest.CaptureFixture[str]",
+    token: "int",
+    small: "bool",
+) -> "None":
+    # shape(): expert=128, topk=4, so M_est = ceil(token / 32) and 97 is M_est 4.
+    state = controlled_search(monkeypatch, row=shape(token))
+    state.validation[(G1_A, G2_B)] = 0.5
+    result = state.run()
+    log = capsys.readouterr().out
+    if small:
+        assert events(state, "consumer") == events(state, "bootstrap") == []
+        assert events(state, "g1") == events(state, "g2") == []
+        assert sorted(events(state, "validate")) == sorted(state.pairs)
+        assert "small batch M_est=" in log and "exhaustive fallback" not in log
+        assert (result["kernelName1"], result["kernelName2"]) == (G1_A, G2_B)
+    else:
+        assert len(events(state, "g1")) == len(events(state, "g2")) == 3
+        assert events(state, "validate") == [(G1_B, G2_C)]
+        assert "small batch" not in log
+
+
+def test_staged_small_batch_matches_prune_mode_selection(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
+    winners = {}
+    for mode in ("staged", "prune"):
+        state = controlled_search(monkeypatch, row=shape(8))
+        state.validation[(G1_C, G2_C)] = 0.5
+        state.validation[(G1_A, G2_B)] = RuntimeError("incorrect output")
+        state.args.mxfp4_search_mode = mode
+        result = state.run()
+        winners[mode] = (
+            sorted(events(state, "validate")),
+            result["kernelName1"],
+            result["kernelName2"],
+            result["us"],
+        )
+    assert winners["staged"] == winners["prune"]
+    assert winners["staged"][1:] == (G1_C, G2_C, 0.5)
 
 
 def test_g1_screening_times_only_direct_kernel_after_untimed_setup(
