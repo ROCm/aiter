@@ -15,8 +15,7 @@ from collections.abc import Callable
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr, rocdl
-from flydsl.expr.arith import ArithValue
+from flydsl.expr import arith, gpu, ptrtoint, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, T
 
 from aiter.ops.flydsl.kernels import buffer_ops, tensor_shim
@@ -24,14 +23,28 @@ from aiter.ops.flydsl.kernels import gemm_common_gfx1250 as gemm_common
 from aiter.ops.flydsl.kernels import (
     moe_fused_route_quant_scatter as route_quant,
 )
+from aiter.ops.flydsl.kernels.kernels_common import create_llvm_ptr
 
 # Each K1024 slice contains four K256 blocks. Padding and the K32 swizzle
 # distribute vector payload accesses and scale transposes across LDS banks.
 _M_TILE_ROWS = 16
+_K_TILE_SIZE = 7168
 _K_SLICE_SIZE = 1024
-_K256_PER_SLICE = 4
-_SCALE_DWORDS_PER_SLICE_ROW = 8
-_PAYLOAD_LDS_ROW_DWORDS = 33
+_K256_SIZE = 256
+_MX_BLOCK_SIZE = 32
+_DWORD_BYTES = 4
+_FP4_VALUES_PER_BYTE = 2
+_PAYLOAD_VECTOR_BYTES = 16
+_PAYLOAD_VECTOR_DWORDS = _PAYLOAD_VECTOR_BYTES // _DWORD_BYTES
+_K_SLICES_PER_TILE = _K_TILE_SIZE // _K_SLICE_SIZE
+_K256_PER_SLICE = _K_SLICE_SIZE // _K256_SIZE
+_K32_PER_K256 = _K256_SIZE // _MX_BLOCK_SIZE
+_ROWS_PER_SWIZZLE_GROUP = 4
+# E8M0 has one byte per MX block; four scales fit in one dword.
+_SCALE_DWORDS_PER_SLICE_ROW = _K_SLICE_SIZE // _MX_BLOCK_SIZE // _DWORD_BYTES
+_SCALE_DWORDS_PER_K256 = _K256_SIZE // _MX_BLOCK_SIZE // _DWORD_BYTES
+_PAYLOAD_K256_ROW_DWORDS = _K256_SIZE // _FP4_VALUES_PER_BYTE // _DWORD_BYTES
+_PAYLOAD_LDS_ROW_DWORDS = _PAYLOAD_K256_ROW_DWORDS + 1
 _PAYLOAD_LDS_K256_DWORDS = _M_TILE_ROWS * _PAYLOAD_LDS_ROW_DWORDS
 _PAYLOAD_LDS_SLICE_DWORDS = _K256_PER_SLICE * _PAYLOAD_LDS_K256_DWORDS
 _SCALE_LDS_ROW_DWORDS = _SCALE_DWORDS_PER_SLICE_ROW + 1
@@ -39,31 +52,21 @@ _SCALE_LDS_SLICE_DWORDS = _M_TILE_ROWS * _SCALE_LDS_ROW_DWORDS
 
 
 @fx.struct
-class _PayloadLdsK1024:
-    """M16 x K1024 tile with one padding dword per M row and K256 slice."""
+class _PayloadLdsK7168:
+    """Seven K1024 payload slices, loaded asynchronously before one barrier."""
 
-    payload: fx.Array[fx.Int32, _PAYLOAD_LDS_SLICE_DWORDS, 16]
-
-
-@fx.struct
-class _ScaleLdsK1024:
-    """Padded M16 x 8-dword scale transpose tile."""
-
-    scale: fx.Array[fx.Int32, _SCALE_LDS_SLICE_DWORDS, 16]
+    payload: fx.Array[
+        fx.Int32, _K_SLICES_PER_TILE * _PAYLOAD_LDS_SLICE_DWORDS, _PAYLOAD_VECTOR_BYTES
+    ]
 
 
 @fx.struct
-class _PayloadLdsK4096:
-    """Four K1024 payload slices sharing one ready/reuse barrier pair."""
+class _ScaleLdsK7168:
+    """Seven padded scale slices for the full K7168 row."""
 
-    payload: fx.Array[fx.Int32, 4 * _PAYLOAD_LDS_SLICE_DWORDS, 16]
-
-
-@fx.struct
-class _ScaleLdsK4096:
-    """Four padded scale slices for one K4096 tile."""
-
-    scale: fx.Array[fx.Int32, 4 * _SCALE_LDS_SLICE_DWORDS, 16]
+    scale: fx.Array[
+        fx.Int32, _K_SLICES_PER_TILE * _SCALE_LDS_SLICE_DWORDS, _PAYLOAD_VECTOR_BYTES
+    ]
 
 
 def build_moe_apre_quant_module(
@@ -122,18 +125,12 @@ def build_moe_apre_quant_module(
         wave_id = thread_id // fx.Uint32(quant_layout.wave_size)
         lane_id = thread_id - wave_id * fx.Uint32(quant_layout.wave_size)
         first_source_token = block_id * fx.Uint32(waves_per_block) + wave_id
-        source_token_stride = fx.Uint32(num_workgroups) * fx.Uint32(
-            waves_per_block
-        )
+        source_token_stride = fx.Uint32(num_workgroups) * fx.Uint32(waves_per_block)
         for source_token in range(
             first_source_token, fx.Uint32(num_tokens), source_token_stride
         ):
-            for k256_group in range(
-                fx.Uint32(0), fx.Uint32(num_k256_groups), 1
-            ):
-                mx_block_in_wave = lane_id // fx.Uint32(
-                    quant_layout.lanes_per_mx_block
-                )
+            for k256_group in range(fx.Uint32(0), fx.Uint32(num_k256_groups), 1):
+                mx_block_in_wave = lane_id // fx.Uint32(quant_layout.lanes_per_mx_block)
                 lane_in_mx_block = lane_id - mx_block_in_wave * fx.Uint32(
                     quant_layout.lanes_per_mx_block
                 )
@@ -149,9 +146,7 @@ def build_moe_apre_quant_module(
                     feat_row_i32=source_token,
                     payload_num_records=payload_bytes_per_row,
                     prequantized=False,
-                    mx_blocks_per_wave_iter=(
-                        quant_layout.mx_blocks_per_wave_iter
-                    ),
+                    mx_blocks_per_wave_iter=(quant_layout.mx_blocks_per_wave_iter),
                     mx_blocks_per_row=quant_layout.mx_blocks_per_row,
                     amax_shuffle_dists=quant_layout.amax_shuffle_dists,
                     is_fp8=False,
@@ -178,9 +173,7 @@ def build_moe_apre_quant_module(
                     block_in_wave=mx_block_in_wave,
                     lane_in_block=lane_in_mx_block,
                     is_block_lead=lane_in_mx_block == zero_i32,
-                    payload_dests=[
-                        types.SimpleNamespace(payload_row_i32=source_token)
-                    ],
+                    payload_dests=[types.SimpleNamespace(payload_row_i32=source_token)],
                     dests=[
                         types.SimpleNamespace(
                             payload_row_i32=source_token,
@@ -240,16 +233,15 @@ def build_moe_apre_scatter_module(
 ) -> Callable:
     """Scatter compact MXFP4 rows into M16 A-preshuffled payload and scales.
 
-    Each 16-wave workgroup gathers an M16 tile through padded LDS. Input scale
-    rows may have a padded byte stride; output scales use M16K4. K >= 2048
-    uses K4096 tiles with next-tile prefetch; smaller inputs use K1024.
-    K4096 loads one scale dword per lane and stages four K1024 payload slices
-    before one ready/reuse barrier pair. A tail stages only its remaining
-    slices and masks unused scale lanes. Eight waves write scales; all 16
-    waves transfer payloads. Quantization runs in a separate kernel when needed.
+    Each 16-wave workgroup gathers one M16 x K7168 tile through padded LDS.
+    Seven K1024 slices are loaded asynchronously before one data-ready barrier.
+    Ordinary LDS reads and buffer stores write the A-preshuffled output.
+    LDS is never reused; there is no persistent loop or cross-tile prefetch.
+    Each wave ballots the same M16 row map, so early quit needs no TG barrier.
+    Eight waves write scales; all 16 waves transfer payloads.
 
     Args:
-        feat_dim: Logical feature count K, divisible by 1024.
+        feat_dim: Logical feature count K; this specialization requires 7168.
         wmma_rep: Number of M16 tiles grouped in the output scale layout.
         src_scale_stride_bytes: Input scale row stride, including transport
             padding. Zero selects the compact stride K / 32.
@@ -260,45 +252,41 @@ def build_moe_apre_scatter_module(
         Negative map entries are padding; fully empty M16 tiles are untouched.
 
     Raises:
-        ValueError: K or the input scale stride has unsupported alignment.
+        ValueError: K is not 7168, or the input scale stride is invalid.
         NotImplementedError: The target lacks gfx1250 pk8 or wave32 support.
     """
     quant_layout = route_quant._quant_layout(feat_dim, "fp4", wmma_rep)
     if not quant_layout.use_pk8 or quant_layout.lanes_per_mx_block != 4:
         raise NotImplementedError("A-preshuffle scatter requires gfx1250 pk8")
-    k_tile_size = 4096 if feat_dim >= 2048 else 1024
-    if feat_dim % 1024:
-        raise ValueError("A-preshuffle scatter requires K divisible by 1024")
-    slices_per_k_tile = k_tile_size // _K_SLICE_SIZE
-    num_k1024_slices = feat_dim // _K_SLICE_SIZE
-    num_k_tiles = (
-        num_k1024_slices + slices_per_k_tile - 1
-    ) // slices_per_k_tile
+    if feat_dim != _K_TILE_SIZE:
+        raise ValueError(f"A-preshuffle async scatter requires K={_K_TILE_SIZE}")
 
     wave_size = quant_layout.wave_size
     if wave_size != 32:
         raise NotImplementedError("A-preshuffle scatter requires wave32")
-    threads_per_block = 512
+    threads_per_block = _M_TILE_ROWS * wave_size
+    num_k_slices = feat_dim // _K_SLICE_SIZE
     payload_bytes_per_row = quant_layout.payload_bytes_per_row
-    payload_dwords_per_row = payload_bytes_per_row // 4
-    scale_dwords_per_row = quant_layout.mx_blocks_per_row // 4
-    src_scale_stride_bytes = (
-        src_scale_stride_bytes or quant_layout.mx_blocks_per_row
-    )
+    payload_dwords_per_row = payload_bytes_per_row // _DWORD_BYTES
+    scale_dwords_per_row = quant_layout.mx_blocks_per_row // _DWORD_BYTES
+    src_scale_stride_bytes = src_scale_stride_bytes or quant_layout.mx_blocks_per_row
     if (
         src_scale_stride_bytes < quant_layout.mx_blocks_per_row
-        or src_scale_stride_bytes % 4
+        or src_scale_stride_bytes % _DWORD_BYTES
     ):
-        raise ValueError(
-            "input scale stride must cover the row and be dword aligned"
-        )
-    source_scale_stride_dwords = src_scale_stride_bytes // 4
+        raise ValueError("input scale stride must cover the row and be dword aligned")
+    source_scale_stride_dwords = src_scale_stride_bytes // _DWORD_BYTES
+    scale_load_rounds = (scale_dwords_per_row + wave_size - 1) // wave_size
+    payload_slice_row_dwords = payload_dwords_per_row // num_k_slices
+    output_k256_dwords = _M_TILE_ROWS * _PAYLOAD_K256_ROW_DWORDS
+    output_k32_dwords = _M_TILE_ROWS * _PAYLOAD_VECTOR_DWORDS
     module_name = (
-        f"moe_apre_scatter_fd{feat_dim}_r{wmma_rep}_fp4_pk8_w16_tk{k_tile_size}"
+        f"moe_apre_scatter_fd{feat_dim}_r{wmma_rep}_fp4_pk8"
+        f"_w{_M_TILE_ROWS}_tk{_K_TILE_SIZE}"
     )
     if src_scale_stride_bytes != quant_layout.mx_blocks_per_row:
         module_name += f"_ss{src_scale_stride_bytes}"
-    module_name += "_pf_sw8"
+    module_name += "_grid_sw8_async_ballot"
 
     @flyc.kernel(name=module_name, known_block_size=[threads_per_block, 1, 1])
     def scatter_kernel(
@@ -311,17 +299,7 @@ def build_moe_apre_scatter_module(
         num_output_rows: Int32,
         num_workgroups: Int32,
     ):
-        i32 = T.i32
-        zero_i32 = arith.constant(0, type=i32)
-        one_i32 = arith.constant(1, type=i32)
-        lds_load_b128, lds_store_b128 = gemm_common.make_lds_copy_ops(128)
-
-        def _sync_lds():
-            # Only LDS is exchanged between waves. Keep next-chunk global
-            # loads and disjoint output stores in flight across the fence.
-            rocdl.s_wait_dscnt(0)
-            rocdl.s_barrier_signal(-1)
-            rocdl.s_barrier_wait(-1)
+        lds_load_b128, _ = gemm_common.make_lds_copy_ops(128)
 
         thread_id = fx.Uint32(fx.thread_idx.x)
         block_id = fx.Uint32(fx.block_idx.x)
@@ -329,381 +307,217 @@ def build_moe_apre_scatter_module(
         lane_id = thread_id - wave_id * fx.Uint32(wave_size)
 
         shared_allocator = fx.SharedAllocator()
-        if const_expr(k_tile_size == 4096):
-            payload_storage = shared_allocator.allocate(_PayloadLdsK4096).peek()
-            scale_storage = shared_allocator.allocate(_ScaleLdsK4096).peek()
-        else:
-            payload_storage = shared_allocator.allocate(_PayloadLdsK1024).peek()
-            scale_storage = shared_allocator.allocate(_ScaleLdsK1024).peek()
+        payload_storage = shared_allocator.allocate(_PayloadLdsK7168).peek()
+        scale_storage = shared_allocator.allocate(_ScaleLdsK7168).peek()
         payload_lds = payload_storage.payload.ptr
         payload_lds_base_bytes = fx.Index(fx.ptrtoint(payload_lds))
         scale_lds = scale_storage.scale.ptr
-        source_payload_resource = buffer_ops.create_buffer_resource_from_addr(
-            fx.Int64(ptrtoint(compact_payload)),
-            num_records_bytes=route_quant._SCALE_RSRC_MAX_BYTES,
-        )
         output_payload_resource = buffer_ops.create_buffer_resource_from_addr(
             fx.Int64(ptrtoint(grouped_payload)),
             num_records_bytes=route_quant._SCALE_RSRC_MAX_BYTES,
-        )
-        source_scale_size_dwords = fx.Uint32(num_tokens) * fx.Uint32(
-            source_scale_stride_dwords
         )
         output_scale_size_dwords = fx.Uint32(num_output_rows) * fx.Uint32(
             scale_dwords_per_row
         )
         output_scale_resource = buffer_ops.create_buffer_resource_from_addr(
             fx.Int64(ptrtoint(grouped_scale)),
-            num_records_bytes=output_scale_size_dwords * fx.Uint32(4),
-        )
-        source_scale_buffer = tensor_shim.ptr_buf_tensor(
-            compact_scale,
-            fx.Int32,
-            num_records_bytes=source_scale_size_dwords * fx.Uint32(4),
+            num_records_bytes=output_scale_size_dwords * fx.Uint32(_DWORD_BYTES),
         )
         row_to_token_buffer = tensor_shim.ptr_buf_tensor(row_to_token)
 
-        def _load_payload_slice(k256_offset, source_row):
-            """Load one 16-byte vector per lane from a K1024 source slice."""
-            source_payload_offset_dwords = (
-                source_row * fx.Uint32(payload_dwords_per_row)
-                + k256_offset * fx.Uint32(32)
-                + lane_id * fx.Uint32(4)
-            )
-            source_payload_vec = fx.Vector(
-                buffer_ops.buffer_load(
-                    source_payload_resource,
-                    source_payload_offset_dwords,
-                    vec_width=4,
-                    dtype=i32,
-                )
-            )
-            return source_payload_vec
-
-        def _load_scale_tile(
-            first_k1024_slice, active_slices, source_row, row_is_valid
-        ):
-            scale_lane_is_active = lane_id < fx.Uint32(active_slices * 8)
-            source_scale_offset_dwords = (
-                row_is_valid & scale_lane_is_active
-            ).select(
-                source_row * fx.Uint32(source_scale_stride_dwords)
-                + fx.Uint32(first_k1024_slice * 8)
-                + lane_id,
-                source_scale_size_dwords,
-            )
-            return fx.Int32(source_scale_buffer[source_scale_offset_dwords])
-
-        def _load_k1024_slice(k256_offset, source_row, row_is_valid):
-            is_scale_load_lane = lane_id < fx.Uint32(8)
-            source_scale_offset_dwords = (
-                row_is_valid & is_scale_load_lane
-            ).select(
-                source_row * fx.Uint32(source_scale_stride_dwords)
-                + k256_offset * fx.Uint32(2)
-                + lane_id,
-                source_scale_size_dwords,
-            )
-            scale_dword = fx.Int32(
-                source_scale_buffer[source_scale_offset_dwords]
-            )
-            rocdl.sched_barrier(0)
-            return _load_payload_slice(k256_offset, source_row), scale_dword
-
         row_in_m16 = wave_id
-        is_scale_load_lane = lane_id < fx.Uint32(_SCALE_DWORDS_PER_SLICE_ROW)
 
-        def _stage_slice_to_lds(
-            source_payload_vec, scale_dword, slice_id, row_is_valid
-        ):
-            """Stage payloads and K1024 scales, zeroing unmapped rows."""
-            masked_payload_vec = fx.Vector.from_elements(
-                [
-                    row_is_valid.select(
-                        ArithValue(source_payload_vec[j]), zero_i32
-                    )
-                    for j in range_constexpr(4)
-                ],
-                fx.Int32,
+        def load_payload_from_lds(slice_id):
+            """Read a 16-byte payload vector in destination order."""
+            output_slice_offset_dwords = thread_id * fx.Uint32(_PAYLOAD_VECTOR_DWORDS)
+            output_k256_in_slice = output_slice_offset_dwords // fx.Uint32(
+                output_k256_dwords
             )
-            rocdl.sched_barrier(0)
-
-            if const_expr(k_tile_size == 1024):
-                # The ninth dword in each scale row breaks stride-8 LDS bank
-                # aliasing. Inactive lanes write only to the padding column.
-                scale_padding_row = (lane_id + fx.Uint32(8)) % fx.Uint32(16)
-                scale_lds_offset_dwords = is_scale_load_lane.select(
-                    row_in_m16 * fx.Uint32(_SCALE_LDS_ROW_DWORDS) + lane_id,
-                    scale_padding_row * fx.Uint32(_SCALE_LDS_ROW_DWORDS)
-                    + fx.Uint32(8),
-                )
-                scale_lds[
-                    fx.Uint32(slice_id * _SCALE_LDS_SLICE_DWORDS)
-                    + scale_lds_offset_dwords
-                ] = scale_dword
-                rocdl.sched_barrier(0)
-
-            k256_in_slice = lane_id // fx.Uint32(8)
-            k32_in_k256 = lane_id - k256_in_slice * fx.Uint32(8)
-            swizzled_k32 = (
-                k32_in_k256 + row_in_m16 // fx.Uint32(4)
-            ) % fx.Uint32(8)
-            payload_lds_offset_dwords = (
-                k256_in_slice * fx.Uint32(_PAYLOAD_LDS_K256_DWORDS)
-                + row_in_m16 * fx.Uint32(_PAYLOAD_LDS_ROW_DWORDS)
-                + swizzled_k32 * fx.Uint32(4)
-            )
-            lds_store_b128(
-                payload_lds_base_bytes
-                + fx.Index(slice_id * _PAYLOAD_LDS_SLICE_DWORDS * 4),
-                fx.Index(payload_lds_offset_dwords * fx.Uint32(4)),
-                masked_payload_vec,
-            )
-
-        def _read_shuffled_slice_from_lds(k256_offset, slice_id, m16_tile_id):
-            """Read payload and scale vectors in their destination order."""
-            output_slice_offset_dwords = thread_id * fx.Uint32(4)
-            output_k256_in_slice = output_slice_offset_dwords // fx.Uint32(512)
             output_k256_offset_dwords = (
                 output_slice_offset_dwords
-                - output_k256_in_slice * fx.Uint32(512)
+                - output_k256_in_slice * fx.Uint32(output_k256_dwords)
             )
-            output_k32_in_k256 = output_k256_offset_dwords // fx.Uint32(64)
+            output_k32_in_k256 = output_k256_offset_dwords // fx.Uint32(
+                output_k32_dwords
+            )
             output_k32_offset_dwords = (
-                output_k256_offset_dwords - output_k32_in_k256 * fx.Uint32(64)
+                output_k256_offset_dwords
+                - output_k32_in_k256 * fx.Uint32(output_k32_dwords)
             )
-            output_row_in_m16 = output_k32_offset_dwords // fx.Uint32(4)
+            output_row_in_m16 = output_k32_offset_dwords // fx.Uint32(
+                _PAYLOAD_VECTOR_DWORDS
+            )
             output_swizzled_k32 = (
-                output_k32_in_k256 + output_row_in_m16 // fx.Uint32(4)
-            ) % fx.Uint32(8)
+                output_k32_in_k256
+                + output_row_in_m16 // fx.Uint32(_ROWS_PER_SWIZZLE_GROUP)
+            ) % fx.Uint32(_K32_PER_K256)
             read_payload_lds_offset_dwords = (
                 output_k256_in_slice * fx.Uint32(_PAYLOAD_LDS_K256_DWORDS)
                 + output_row_in_m16 * fx.Uint32(_PAYLOAD_LDS_ROW_DWORDS)
-                + output_swizzled_k32 * fx.Uint32(4)
+                + output_swizzled_k32 * fx.Uint32(_PAYLOAD_VECTOR_DWORDS)
             )
             output_payload_vec = lds_load_b128(
                 payload_lds_base_bytes
-                + fx.Index(slice_id * _PAYLOAD_LDS_SLICE_DWORDS * 4),
-                fx.Index(read_payload_lds_offset_dwords * fx.Uint32(4)),
+                + fx.Index(slice_id * _PAYLOAD_LDS_SLICE_DWORDS * _DWORD_BYTES),
+                fx.Index(read_payload_lds_offset_dwords * fx.Uint32(_DWORD_BYTES)),
             )
 
+            return output_payload_vec
+
+        def load_scale_from_lds(slice_id):
+            """Read a scale dword in destination order."""
             output_scale_dword = fx.Int32(0)
             # Eight waves each write 64 B for a K1024 scale slice.
             output_scale_column = row_in_m16
             output_scale_row = lane_id
-            is_scale_store_lane = (row_in_m16 < fx.Uint32(8)) & (
-                lane_id < fx.Uint32(16)
-            )
-            scale_padding_row = (lane_id + fx.Uint32(8)) % fx.Uint32(16)
-            inactive_scale_offset_dwords = scale_padding_row * fx.Uint32(
-                _SCALE_LDS_ROW_DWORDS
-            ) + fx.Uint32(8)
-            if const_expr(k_tile_size == 4096):
-                # Wide writes populate useful columns only.
-                inactive_scale_offset_dwords = fx.Uint32(0)
+            is_scale_store_lane = (
+                row_in_m16 < fx.Uint32(_SCALE_DWORDS_PER_SLICE_ROW)
+            ) & (lane_id < fx.Uint32(_M_TILE_ROWS))
             read_scale_lds_offset_dwords = is_scale_store_lane.select(
                 output_scale_row * fx.Uint32(_SCALE_LDS_ROW_DWORDS)
                 + output_scale_column,
-                inactive_scale_offset_dwords,
+                fx.Uint32(0),
             )
-            if row_in_m16 < fx.Uint32(8):
+            if row_in_m16 < fx.Uint32(_SCALE_DWORDS_PER_SLICE_ROW):
                 output_scale_dword = scale_lds[
                     fx.Uint32(slice_id * _SCALE_LDS_SLICE_DWORDS)
                     + read_scale_lds_offset_dwords
                 ]
 
-            scale_k256_in_slice = output_scale_column // fx.Uint32(2)
-            scale_k128_in_k256 = (
-                output_scale_column - scale_k256_in_slice * fx.Uint32(2)
+            return output_scale_dword
+
+        def store_scale_to_gmem(k256_offset, output_scale_dword, m16_tile_id):
+            """Store scales contiguously across the M16 output rows."""
+            output_scale_column = row_in_m16
+            output_scale_row = lane_id
+            is_scale_store_lane = (
+                row_in_m16 < fx.Uint32(_SCALE_DWORDS_PER_SLICE_ROW)
+            ) & (lane_id < fx.Uint32(_M_TILE_ROWS))
+            scale_k256_in_slice = output_scale_column // fx.Uint32(
+                _SCALE_DWORDS_PER_K256
+            )
+            scale_k128_in_k256 = output_scale_column - scale_k256_in_slice * fx.Uint32(
+                _SCALE_DWORDS_PER_K256
             )
             output_scale_k256 = k256_offset + scale_k256_in_slice
             scale_row_group = m16_tile_id // fx.Uint32(wmma_rep)
-            m16_in_scale_row_group = m16_tile_id - scale_row_group * fx.Uint32(
-                wmma_rep
-            )
+            m16_in_scale_row_group = m16_tile_id - scale_row_group * fx.Uint32(wmma_rep)
             scale_group_offset_dwords = scale_row_group * fx.Uint32(
-                scale_dwords_per_row * wmma_rep * 16
-            ) + m16_in_scale_row_group * fx.Uint32(16)
+                scale_dwords_per_row * wmma_rep * _M_TILE_ROWS
+            ) + m16_in_scale_row_group * fx.Uint32(_M_TILE_ROWS)
             output_scale_offset_dwords = is_scale_store_lane.select(
                 scale_group_offset_dwords
-                + output_scale_k256 * fx.Uint32(2 * wmma_rep * 16)
-                + scale_k128_in_k256 * fx.Uint32(wmma_rep * 16)
+                + output_scale_k256
+                * fx.Uint32(_SCALE_DWORDS_PER_K256 * wmma_rep * _M_TILE_ROWS)
+                + scale_k128_in_k256 * fx.Uint32(wmma_rep * _M_TILE_ROWS)
                 + output_scale_row,
                 output_scale_size_dwords,
             )
-            return (
-                output_payload_vec,
-                output_scale_dword,
-                output_scale_offset_dwords,
-            )
-
-        def _store_shuffled_slice(
-            k256_offset,
-            output_payload_vec,
-            output_scale_dword,
-            output_scale_offset_dwords,
-            m16_tile_id,
-        ):
-            """Store a shuffled K1024 slice to global output buffers."""
-            # Non-writing waves still take every payload barrier.
-            if row_in_m16 < fx.Uint32(8):
+            if row_in_m16 < fx.Uint32(_SCALE_DWORDS_PER_SLICE_ROW):
                 buffer_ops.buffer_store(
                     output_scale_dword,
                     output_scale_resource,
-                    output_scale_offset_dwords * fx.Uint32(4),
+                    output_scale_offset_dwords * fx.Uint32(_DWORD_BYTES),
                     offset_is_bytes=True,
                 )
+
+        def store_payload_to_gmem(k256_offset, output_payload_vec, m16_tile_id):
+            """Store a 16-byte vector at its contiguous A-preshuffled address."""
             buffer_ops.buffer_store(
                 output_payload_vec,
                 output_payload_resource,
-                m16_tile_id * fx.Uint32(16 * payload_dwords_per_row)
-                + k256_offset * fx.Uint32(512)
-                + thread_id * fx.Uint32(4),
+                m16_tile_id * fx.Uint32(_M_TILE_ROWS * payload_dwords_per_row)
+                + k256_offset * fx.Uint32(output_k256_dwords)
+                + thread_id * fx.Uint32(_PAYLOAD_VECTOR_DWORDS),
             )
 
-        num_m16_tiles = fx.Uint32(num_output_rows) // fx.Uint32(16)
-        for m16_tile_id in range(
-            block_id, num_m16_tiles, fx.Uint32(num_workgroups)
-        ):
-            output_row = m16_tile_id * fx.Uint32(16) + row_in_m16
-            # Fetch each row mapping once per wave, then use LDS both to
-            # broadcast it across the wave and to let thread 0 detect a fully
-            # empty M16 tile.  The resulting branch is uniform for the TG, so
-            # it is safe to skip all K-slice barriers together.
-            if lane_id == fx.Uint32(0):
-                payload_lds[row_in_m16] = row_to_token_buffer[output_row]
+        def copy_payload_from_gmem_to_lds(slice_id, source_row):
+            """Direct asynchronous b128 copy; no payload VGPR staging."""
+            k256_in_slice = lane_id // fx.Uint32(_K32_PER_K256)
+            k32_in_k256 = lane_id % fx.Uint32(_K32_PER_K256)
+            swizzled_k32 = (
+                k32_in_k256 + row_in_m16 // fx.Uint32(_ROWS_PER_SWIZZLE_GROUP)
+            ) % fx.Uint32(_K32_PER_K256)
+            dst_dword = (
+                fx.Uint32(slice_id * _PAYLOAD_LDS_SLICE_DWORDS)
+                + k256_in_slice * fx.Uint32(_PAYLOAD_LDS_K256_DWORDS)
+                + row_in_m16 * fx.Uint32(_PAYLOAD_LDS_ROW_DWORDS)
+                + swizzled_k32 * fx.Uint32(_PAYLOAD_VECTOR_DWORDS)
+            )
+            src_dword = (
+                source_row * fx.Uint32(payload_dwords_per_row)
+                + fx.Uint32(slice_id * payload_slice_row_dwords)
+                + lane_id * fx.Uint32(_PAYLOAD_VECTOR_DWORDS)
+            )
+            gptr = create_llvm_ptr(
+                fx.Int64(ptrtoint(compact_payload))
+                + fx.Int64(src_dword) * _DWORD_BYTES,
+                address_space=1,
+            )
+            lptr = create_llvm_ptr(
+                fx.Int32(payload_lds_base_bytes) + fx.Int32(dst_dword) * _DWORD_BYTES,
+                address_space=3,
+            )
+            rocdl.global_load_async_to_lds_b128(gptr, lptr, 0)
+
+        def copy_scale_from_gmem_to_lds(source_row, dst_scale_lds):
+            """Copy the row scales in wave-sized rounds, masking the final tail."""
+            for scale_round in range_constexpr(scale_load_rounds):
+                column = fx.Uint32(scale_round * wave_size) + lane_id
+                if column < fx.Uint32(scale_dwords_per_row):
+                    dst_dword = (
+                        (column // fx.Uint32(_SCALE_DWORDS_PER_SLICE_ROW))
+                        * fx.Uint32(_SCALE_LDS_SLICE_DWORDS)
+                        + row_in_m16 * fx.Uint32(_SCALE_LDS_ROW_DWORDS)
+                        + column % fx.Uint32(_SCALE_DWORDS_PER_SLICE_ROW)
+                    )
+                    src_dword = (
+                        source_row * fx.Uint32(source_scale_stride_dwords) + column
+                    )
+                    gptr = create_llvm_ptr(
+                        fx.Int64(ptrtoint(compact_scale))
+                        + fx.Int64(src_dword) * _DWORD_BYTES,
+                        address_space=1,
+                    )
+                    lptr = create_llvm_ptr(
+                        fx.Int32(ptrtoint(dst_scale_lds))
+                        + fx.Int32(dst_dword) * _DWORD_BYTES,
+                        address_space=3,
+                    )
+                    rocdl.global_load_async_to_lds_b32(gptr, lptr, 0)
+
+        # Each TG owns one M16 x K7168 tile. LDS is written once and never reused.
+        m16_tile_id = block_id
+        # Every wave reads the same M16 map. The second lane half repeats the
+        # first half's addresses, so all 32 lanes can load without an OOB mask.
+        map_row = lane_id % fx.Uint32(_M_TILE_ROWS)
+        token_on_lane = fx.Int32(
+            row_to_token_buffer[m16_tile_id * fx.Uint32(_M_TILE_ROWS) + map_row]
+        )
+        valid_rows = fx.Uint32(rocdl.ballot(T.i32, token_on_lane >= fx.Int32(0)))
+        tile_has_valid_rows = valid_rows != fx.Uint32(0)
+        # Wave w owns row w; broadcast that lane's mapping within the wave.
+        mapped_token = fx.Int32(rocdl.readlane(T.i32, token_on_lane, wave_id))
+
+        # Every wave observes the same flag before entering the payload barrier.
+        if tile_has_valid_rows:
+            # Padding rows are not consumed by the MoE output. Redirect them
+            # to token 0 so every wave can issue valid, unconditional loads.
+            # A nonempty M16 tile implies that at least one source token exists.
+            source_row = fx.Uint32(fx.max(mapped_token, fx.Int32(0)))
+
+            copy_scale_from_gmem_to_lds(source_row, scale_lds)
+            for slice_id in range_constexpr(num_k_slices):
+                copy_payload_from_gmem_to_lds(slice_id, source_row)
+            rocdl.s_wait_asynccnt(0)
             gpu.barrier()
-            mapped_token = fx.Int32(payload_lds[row_in_m16])
-            row_is_valid = mapped_token >= fx.Int32(0)
-            source_row = row_is_valid.select(
-                fx.Uint32(mapped_token), fx.Uint32(0)
-            )
 
-            if thread_id == fx.Uint32(0):
-                tile_has_valid_rows = zero_i32
-                for row_to_check in range(16):
-                    mapped_row_is_valid = (
-                        fx.Int32(payload_lds[fx.Uint32(row_to_check)])
-                        >= zero_i32
-                    )
-                    tile_has_valid_rows = fx.Int32(
-                        arith.ori(
-                            arith.unwrap(tile_has_valid_rows),
-                            arith.unwrap(
-                                mapped_row_is_valid.select(one_i32, zero_i32)
-                            ),
-                        )
-                    )
-                payload_lds[fx.Uint32(16)] = tile_has_valid_rows
-            gpu.barrier()
-            tile_has_valid_rows = (
-                fx.Int32(payload_lds[fx.Uint32(16)]) != zero_i32
-            )
-
-            if tile_has_valid_rows:
-                if const_expr(k_tile_size == 1024):
-                    k256_offset = fx.Uint32(0)
-                    source_payload_vec, scale_dword = _load_k1024_slice(
-                        k256_offset, source_row, row_is_valid
-                    )
-                    _stage_slice_to_lds(
-                        source_payload_vec, scale_dword, 0, row_is_valid
-                    )
-                    _sync_lds()
-                    shuffled_slice = _read_shuffled_slice_from_lds(
-                        k256_offset, 0, m16_tile_id
-                    )
-                    _sync_lds()
-                    _store_shuffled_slice(
-                        k256_offset,
-                        shuffled_slice[0],
-                        shuffled_slice[1],
-                        shuffled_slice[2],
-                        m16_tile_id,
-                    )
-                else:
-                    prefetched_scale_dword = _load_scale_tile(
-                        0,
-                        min(slices_per_k_tile, num_k1024_slices),
-                        source_row,
-                        row_is_valid,
-                    )
-                    prefetched_payload_slices = []
-                    for slice_id in range_constexpr(
-                        min(slices_per_k_tile, num_k1024_slices)
-                    ):
-                        prefetched_payload_slices.append(
-                            _load_payload_slice(
-                                fx.Uint32(slice_id * 4), source_row
-                            )
-                        )
-                    for k_tile_id in range_constexpr(num_k_tiles):
-                        first_k1024_slice = k_tile_id * slices_per_k_tile
-                        active_slices = min(
-                            slices_per_k_tile,
-                            num_k1024_slices - first_k1024_slice,
-                        )
-                        next_first_slice = first_k1024_slice + slices_per_k_tile
-                        next_active_slices = min(
-                            slices_per_k_tile,
-                            max(0, num_k1024_slices - next_first_slice),
-                        )
-                        current_scale_dword = prefetched_scale_dword
-                        current_payload_slices = prefetched_payload_slices
-                        prefetched_payload_slices = []
-                        if const_expr(next_active_slices > 0):
-                            prefetched_scale_dword = _load_scale_tile(
-                                next_first_slice,
-                                next_active_slices,
-                                source_row,
-                                row_is_valid,
-                            )
-                            for slice_id in range_constexpr(next_active_slices):
-                                prefetched_payload_slices.append(
-                                    _load_payload_slice(
-                                        fx.Uint32(
-                                            (next_first_slice + slice_id) * 4
-                                        ),
-                                        source_row,
-                                    )
-                                )
-                        # Each lane places its four scale bytes directly
-                        # into one of the four padded K1024 LDS slices.
-                        scale_slice_id = lane_id // fx.Uint32(8)
-                        scale_column = lane_id % fx.Uint32(8)
-                        scale_lds[
-                            scale_slice_id * fx.Uint32(_SCALE_LDS_SLICE_DWORDS)
-                            + row_in_m16 * fx.Uint32(_SCALE_LDS_ROW_DWORDS)
-                            + scale_column
-                        ] = current_scale_dword
-                        for slice_id in range_constexpr(active_slices):
-                            _stage_slice_to_lds(
-                                current_payload_slices[slice_id],
-                                zero_i32,
-                                slice_id,
-                                row_is_valid,
-                            )
-                        _sync_lds()
-                        shuffled_slices = []
-                        for slice_id in range_constexpr(active_slices):
-                            shuffled_slices.append(
-                                _read_shuffled_slice_from_lds(
-                                    fx.Uint32(
-                                        (first_k1024_slice + slice_id) * 4
-                                    ),
-                                    slice_id,
-                                    m16_tile_id,
-                                )
-                            )
-                        _sync_lds()
-                        for slice_id in range_constexpr(active_slices):
-                            _store_shuffled_slice(
-                                fx.Uint32((first_k1024_slice + slice_id) * 4),
-                                shuffled_slices[slice_id][0],
-                                shuffled_slices[slice_id][1],
-                                shuffled_slices[slice_id][2],
-                                m16_tile_id,
-                            )
+            for slice_id in range_constexpr(num_k_slices):
+                k256_offset = fx.Uint32(slice_id * _K256_PER_SLICE)
+                output_scale_dword = load_scale_from_lds(slice_id)
+                output_payload_vec = load_payload_from_lds(slice_id)
+                store_scale_to_gmem(k256_offset, output_scale_dword, m16_tile_id)
+                store_payload_to_gmem(k256_offset, output_payload_vec, m16_tile_id)
 
     @flyc.jit
     def launch_scatter(
@@ -727,7 +541,11 @@ def build_moe_apre_scatter_module(
             num_output_rows,
             num_workgroups,
         ).launch(
-            grid=(arith.index_cast(T.index, num_workgroups), 1, 1),
+            grid=(
+                arith.index_cast(T.index, num_output_rows) // _M_TILE_ROWS,
+                1,
+                1,
+            ),
             block=(threads_per_block, 1, 1),
             stream=stream,
         )
