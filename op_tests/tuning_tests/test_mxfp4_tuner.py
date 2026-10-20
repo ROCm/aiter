@@ -778,10 +778,61 @@ def test_fp8_stage2_pair_and_screening_receive_original_route_weights(
         moe.dtypes.bf16,
         swiglu_limit=5,
     )
-    moe.Mxfp4FlydslTuner._gemm2_screening_call(
+    launch, tensors = moe.Mxfp4FlydslTuner._gemm2_screening_call(
         data, sorting, object(), object(), name, 4
-    )()
+    )
+    launch(*tensors)
     assert observed == [data["topk_weights"], data["topk_weights"]]
+
+
+@pytest.mark.parametrize(
+    "kn1,kn2",
+    [
+        (
+            "flydsl_mxmoe_g1_a4w4_16x128x256_f16in_nt",
+            "flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_atomic_sbm16",
+        ),
+        (
+            "flydsl_mxmoe_g1_a4w4_128x128x256_swiglu",
+            "flydsl_moe2_layout_afp4_wfp4_bf16_t128x128x128_reduce_sbm128",
+        ),
+    ],
+)
+def test_port_e2e_reads_exactly_the_rotated_pipeline_inputs(
+    monkeypatch: "pytest.MonkeyPatch", kn1: "str", kn2: "str"
+) -> "None":
+    from op_tests.tuning_tests.test_mxfp4_staged import fake_case
+
+    class Recording(dict):
+        def __init__(self, items: "dict[str, object]") -> "None":
+            super().__init__(items)
+            self.read: set[str] = set()
+
+        def __getitem__(self, key: "str") -> "object":
+            self.read.add(key)
+            return super().__getitem__(key)
+
+        def get(self, key: "str", default: "object" = None) -> "object":
+            self.read.add(key)
+            return super().get(key, default)
+
+    data, sorting = fake_case()
+    monkeypatch.setattr(moe, "moe_sorting", lambda *args, **kwargs: sorting)
+    monkeypatch.setattr(
+        moe, "_mxfp4_a4w4_stage1_fw", lambda *args, **kwargs: (object(), object())
+    )
+    monkeypatch.setattr(
+        moe.aiter,
+        "fused_dynamic_mxfp4_quant_moe_sort",
+        lambda **kwargs: (object(), object()),
+    )
+    monkeypatch.setattr(
+        moe, "_mxfp4_a4w4_stage2_fw", lambda *args, **kwargs: sorting[4]
+    )
+    recording = Recording(data)
+    PORT_E2E(recording, kn1, kn2, 4, 128, 3072, moe.dtypes.bf16)
+    # Timing rebuilds the pipeline input from exactly these keys.
+    assert recording.read == set(moe.Mxfp4FlydslTuner._PORT_E2E_INPUTS)
 
 
 @pytest.mark.parametrize(

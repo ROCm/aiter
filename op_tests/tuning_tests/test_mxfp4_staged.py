@@ -31,6 +31,9 @@ from op_tests.tuning_tests.test_mxfp4_tuner import (
     shape,
 )
 
+# Captured before the autouse fixture replaces it with a GPU-work guard.
+RUN_CANDIDATE = moe.Mxfp4FlydslTuner._run_candidate
+
 
 def parse_cli(
     monkeypatch: "pytest.MonkeyPatch", *options: "str"
@@ -824,19 +827,31 @@ def test_g1_screening_times_only_direct_kernel_after_untimed_setup(
         events.append("case")
         return {}, ()
 
+    tensors = (object(), object())
+
     def prepare_launch(
         *args: "object", **kwargs: "object"
-    ) -> "tuple[Callable[[], None], object, object]":
+    ) -> "tuple[Callable[..., None], tuple[object, ...], object, object]":
         events.append("wrapper")
-        return lambda: events.append("kernel"), object(), object()
+
+        def launch(*received: "object") -> "None":
+            assert received == tensors
+            events.append("kernel")
+
+        return launch, tensors, object(), object()
 
     def measure(
-        launch: "Callable[[], object]", *, num_warmup: "int", num_iters: "int"
+        launch: "Callable[..., object]",
+        *received: "object",
+        num_warmup: "int",
+        num_iters: "int",
     ) -> "tuple[None, float]":
         assert (num_warmup, num_iters) == (3, 5)
         assert events == ["case", "wrapper"]
+        # Inputs reach run_perftest positionally, so it can rotate them.
+        assert received == tensors
         events.append("timing")
-        launch()
+        launch(*received)
         return None, 1.25
 
     monkeypatch.setattr(tuner, "_prepare_screening_case", prepare, raising=False)
@@ -906,6 +921,26 @@ def fake_case() -> "tuple[dict[str, object], tuple[object, ...]]":
     return data, sorting
 
 
+def rotated_copies(tensors: "tuple[object, ...]") -> "tuple[object, ...]":
+    """Stand-ins for one run_perftest rotation set; aliases share one copy."""
+    copies: dict[int, object] = {}
+    return tuple(
+        (
+            None
+            if tensor is None
+            else copies.setdefault(
+                id(tensor),
+                (
+                    FakeTensor(tensor.shape, tensor.dtype)
+                    if isinstance(tensor, FakeTensor)
+                    else object()
+                ),
+            )
+        )
+        for tensor in tensors
+    )
+
+
 @pytest.mark.parametrize("bm", [16, 32, 64, 128])
 @pytest.mark.parametrize(
     "act,configured_limit,expected_limit",
@@ -943,6 +978,7 @@ def test_g1_screening_matches_bm_input_quantization_and_effective_default_parame
     timed = False
     events = []
     wrapper_parameters = {}
+    copy_of: dict[int, object] = {}
 
     def prepare_case(*args: "object") -> "dict[str, object]":
         assert not timed
@@ -976,7 +1012,16 @@ def test_g1_screening_matches_bm_input_quantization_and_effective_default_parame
 
     def direct(**kwargs: "object") -> "None":
         assert timed
-        assert kwargs["hidden_states"] is (data["input"] if bm == 16 else packed)
+        # The timed launch reads run_perftest's rotated copies, not the originals.
+        received = [value for value in kwargs.values() if isinstance(value, FakeTensor)]
+        assert received and all(
+            any(tensor is copy for copy in copy_of.values()) for tensor in received
+        )
+        hidden = data["input"] if bm == 16 else packed
+        assert kwargs["hidden_states"] is copy_of[id(hidden)]
+        if bm != 16:
+            assert kwargs["a_quant"] is kwargs["hidden_states"]
+        assert kwargs["w1_u8"] is copy_of[id(data["w1_a16"])]
         assert kwargs["inline_quant"] == kwargs["native_scale_layout"] == (bm == 16)
         assert kwargs["interleave"] is False
         assert kwargs["a_dtype"] == kwargs["out_dtype"] == "fp4"
@@ -991,18 +1036,29 @@ def test_g1_screening_matches_bm_input_quantization_and_effective_default_parame
             == wrapper_parameters["situ_linear_beta"]
             == (moe.DEFAULT_SITUV2_LINEAR_BETA if act == "situv2" else 1.0)
         )
-        assert kwargs["inter_sorted_quant"] is intermediate[0]
-        assert kwargs["inter_sorted_shuffled_scale"] is intermediate[1]
+        assert kwargs["inter_sorted_quant"] is copy_of[id(intermediate[0])]
+        assert kwargs["inter_sorted_shuffled_scale"] is copy_of[id(intermediate[1])]
         events.append("kernel")
 
     def measure(
-        call: "Callable[[], object]", *, num_warmup: "int", num_iters: "int"
+        call: "Callable[..., object]",
+        *tensors: "object",
+        num_warmup: "int",
+        num_iters: "int",
     ) -> "tuple[None, float]":
         nonlocal timed
         assert (num_warmup, num_iters) == (3, 5)
+        # Every kernel input is rotatable: weights, routing and both buffers.
+        for tensor in (data["w1_a16"], data["w1s_a16"], *sorting[2:4], *intermediate):
+            assert any(tensor is received for received in tensors)
+        assert any(
+            (data["input"] if bm == 16 else packed) is received for received in tensors
+        )
+        copies = rotated_copies(tensors)
+        copy_of.update(zip(map(id, tensors), copies))
         timed = True
         try:
-            call()
+            call(*copies)
         finally:
             timed = False
         return None, 1.5
@@ -1045,6 +1101,7 @@ def test_g2_screening_owns_fresh_intermediate_and_times_complete_output_path(
     measured = []
     output_refs = []
     events = []
+    copy_of: dict[int, object] = {}
 
     def prepare_case(*args: "object") -> "dict[str, object]":
         assert not timed
@@ -1079,10 +1136,12 @@ def test_g2_screening_owns_fresh_intermediate_and_times_complete_output_path(
         **kwargs: "object",
     ) -> "object":
         assert timed
-        assert (
-            payload is intermediates[-2]() and kwargs["a2_scale"] is intermediates[-1]()
-        )
-        assert output is output_refs[-1]() and output.dtype == moe.dtypes.bf16
+        # The timed launch reads run_perftest's rotated copies; w1 stays bound.
+        assert payload is copy_of[id(intermediates[-2]())]
+        assert kwargs["a2_scale"] is copy_of[id(intermediates[-1]())]
+        assert w1 is data["w1_a16"] and w2 is copy_of[id(data["w2_a16"])]
+        assert output is copy_of[id(output_refs[-1]())]
+        assert output.dtype == moe.dtypes.bf16
         assert (
             kwargs["sorted_weights"] is not None
             and kwargs["reverse_sorted"] is not None
@@ -1099,14 +1158,24 @@ def test_g2_screening_owns_fresh_intermediate_and_times_complete_output_path(
         return output
 
     def measure(
-        call: "Callable[[], object]", *, num_warmup: "int", num_iters: "int"
+        call: "Callable[..., object]",
+        *tensors: "object",
+        num_warmup: "int",
+        num_iters: "int",
     ) -> "tuple[None, float]":
         nonlocal timed
         assert (num_warmup, num_iters) == (3, 5)
+        # The intermediate, w2 and the output rotate; w1 (shape only) does not.
+        for tensor in (intermediates[-2](), intermediates[-1](), data["w2_a16"]):
+            assert any(tensor is received for received in tensors)
+        assert any(output_refs[-1]() is received for received in tensors)
+        assert not any(data["w1_a16"] is received for received in tensors)
+        copies = rotated_copies(tensors)
+        copy_of.update(zip(map(id, tensors), copies))
         timed = True
         try:
             for _ in range(2):
-                assert call().value == 7
+                assert call(*copies).value == 7
         finally:
             timed = False
         return None, 2.5
@@ -1138,6 +1207,63 @@ def test_g2_screening_owns_fresh_intermediate_and_times_complete_output_path(
         assert all(reference() is None for reference in intermediates)
     assert measured == [name for name in names for _ in range(2)]
     assert events == ["producer", "complete-output", "complete-output"] * 3
+
+
+def test_pair_validation_passes_pipeline_inputs_positionally_for_rotation(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
+    with devices(("gfx950", 256)):
+        tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
+    data, _ = fake_case()
+    kn1 = "flydsl_mxmoe_g1_a4w4_128x128x256_swiglu"
+    kn2 = "flydsl_moe2_layout_afp4_wfp4_bf16_t128x128x128_atomic_sbm128"
+    timed = False
+    timed_inputs = []
+    rotated = []
+
+    def pair(received: "dict[str, object]", *args: "object", **kwargs: "object"):
+        assert args[:2] == (kn1, kn2)
+        if timed:
+            timed_inputs.append(received)
+        else:
+            assert received is data
+        return object()
+
+    def measure(
+        call: "Callable[..., object]",
+        *tensors: "object",
+        num_warmup: "int",
+        num_iters: "int",
+        **options: "object",
+    ) -> "tuple[None, float]":
+        nonlocal timed
+        assert (num_warmup, num_iters) == (3, 5)
+        # Rotation stays automatic outside fast-scan.
+        assert options == {"profile_warm_iters": 1, "num_rotate_args": 0}
+        # A zero-argument closure would make run_perftest's rotation a no-op.
+        assert tensors == tuple(data[key] for key in tuner._PORT_E2E_INPUTS)
+        rotated.extend(rotated_copies(tensors))
+        timed = True
+        try:
+            call(*rotated)
+        finally:
+            timed = False
+        return None, 4.0
+
+    monkeypatch.delenv("AITER_MXFP4_TUNE_SWIGLU_LIMIT", raising=False)
+    monkeypatch.setattr(tuner, "_prepare_case", lambda *args: data)
+    monkeypatch.setattr(tuner, "_port_e2e", pair)
+    monkeypatch.setattr(tuner, "_torch_ref", lambda *args, **kwargs: object())
+    monkeypatch.setattr(moe, "cosine_diff_compare", lambda *args, **kwargs: 0.01)
+    monkeypatch.setattr(tuner, "calculate", lambda *args: (0.0, 0.0))
+    monkeypatch.setattr("aiter.test_common.run_perftest", measure)
+    candidate = {"kernelName1": kn1, "kernelName2": kn2, "block_m": 128}
+    args = SimpleNamespace(errRatio=0.1, warmup=3, iters=5)
+    assert RUN_CANDIDATE(tuner, shape(2048), candidate, args) == 4.0
+    assert len(timed_inputs) == 1
+    # The timed pipeline runs on the rotated copies, keyed like the original data.
+    assert timed_inputs[0] == dict(zip(tuner._PORT_E2E_INPUTS, rotated))
+    assert all(timed_inputs[0][key] is not data[key] for key in timed_inputs[0])
 
 
 @pytest.mark.parametrize("limit", [None, 5.0])

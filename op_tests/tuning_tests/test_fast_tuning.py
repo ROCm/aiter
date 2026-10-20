@@ -88,6 +88,14 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
     def _candidate(name):
         return {"kernelName1": f"g1_{name}", "kernelName2": f"g2_{name}", "us": 0}
 
+    @staticmethod
+    def _pipeline_data():
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        # Timing passes each pipeline input to run_perftest positionally.
+        inputs = gemm_moe_tune.Mxfp4FlydslTuner._PORT_E2E_INPUTS
+        return {key: f"fixture:{key}" for key in inputs}
+
     def test_performance_finalists_keep_global_fastest(self):
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
@@ -444,13 +452,13 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
             "doweight_stage1": 0,
         }
 
-        def run_perftest(operation, **kwargs):
+        def run_perftest(operation, *inputs, **kwargs):
             self.assertEqual(kwargs["num_warmup"], 0)
             self.assertEqual(kwargs["num_iters"], 10)
             self.assertFalse(kwargs.get("use_cuda_event", False))
             self.assertEqual(kwargs["profile_warm_iters"], 0)
             self.assertEqual(kwargs["num_rotate_args"], 1)
-            return operation(), 7.0
+            return operation(*inputs), 7.0
 
         with (
             mock.patch.object(
@@ -469,7 +477,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
                 row,
                 candidate,
                 args,
-                data="fixture",
+                data=self._pipeline_data(),
                 reference="reference",
                 num_warmup=1,
                 num_iters=10,
@@ -567,20 +575,26 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
             limits.append(kwargs.get("swiglu_limit"))
             return "out"
 
+        pipeline = self._pipeline_data()
+
+        def run_perftest(operation, *inputs, **kwargs):
+            # Outside fast-scan every pipeline input is passed for rotation.
+            self.assertEqual(kwargs["num_rotate_args"], 0)
+            self.assertEqual(kwargs["profile_warm_iters"], 1)
+            self.assertEqual(inputs, tuple(pipeline.values()))
+            return operation(*inputs), 5.0
+
         with (
             mock.patch.dict(os.environ, {"AITER_MXFP4_TUNE_SWIGLU_LIMIT": "3.5"}),
             mock.patch.object(tuner, "_port_e2e", side_effect=port_e2e),
             mock.patch.object(tuner, "_torch_ref", return_value="ref") as torch_ref,
             mock.patch.object(gemm_moe_tune, "cosine_diff_compare", return_value=0.01),
             mock.patch.object(tuner, "calculate", return_value=(0.0, 0.0)),
-            mock.patch(
-                "aiter.test_common.run_perftest",
-                side_effect=lambda operation, **kwargs: (operation(), 5.0),
-            ),
+            mock.patch("aiter.test_common.run_perftest", side_effect=run_perftest),
         ):
             candidate = self._candidate("accurate")
             candidate.update(block_m=16)
-            tuner._run_candidate(row, candidate, args, data="fixture")
+            tuner._run_candidate(row, candidate, args, data=pipeline)
 
         # Kernel launch and reference must clamp identically, otherwise the
         # accuracy gate compares two different functions.
@@ -623,10 +637,13 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
             mock.patch.object(tuner, "calculate", return_value=(0.0, 0.0)),
             mock.patch(
                 "aiter.test_common.run_perftest",
-                side_effect=lambda operation, **kwargs: (operation(), 5.0),
+                side_effect=lambda operation, *inputs, **kwargs: (
+                    operation(*inputs),
+                    5.0,
+                ),
             ),
         ):
-            tuner._run_candidate(row, candidate, args, data="fixture")
+            tuner._run_candidate(row, candidate, args, data=self._pipeline_data())
 
         # The retime measured 0.010, but the coarse pass already saw 0.01149.
         # Keeping the raw value stops a 1.1% display string (0.011) from
