@@ -1190,6 +1190,7 @@ class MlaDecodeShapeSupport:
     return_lse is False on them: HK always, and gfx1250 stage 1 unless the Q
     head count is 64. HK is also False with causal=False at max_seqlen_qo > 1
     (it always masks) and with round-robin CP, and it ignores q_scale/kv_scale.
+    opus is False with cp_world_size > 1 unless Q is fp8 and cp_round_robin.
     Launch-size limits are not checked: the gfx950 non-persistent fp8 64-head
     kernel still raises at launch when kv_split > 1 and
     total_q * kv_split > 32768.
@@ -1780,12 +1781,20 @@ def _get_mla_decode_shape_support_cached(
             hk_problems.append("takes no g_kv_indptr (round-robin CP)")
         reasons.extend(f"hk_mla_v32_decode_fwd {r}" for r in hk_problems)
         reasons.append("hk_mla_v32_decode_fwd ignores q_scale and kv_scale")
+    opus_problems = []
+    if backend is MlaBackend.OPUS and cp_world_size > 1:
+        if q_type != "fp8":
+            opus_problems.append("runs round-robin CP in the fp8 builds only")
+        if not cp_round_robin:
+            opus_problems.append("needs g_kv_indptr when cp_world_size > 1")
+        reasons.extend(f"opus_mla_decode_fwd {r}" for r in opus_problems)
 
     if (
         (persistent and not planner_accepts)
         or (persistent and not p.reduce_supported)
         or ps1_folded
         or hk_problems
+        or opus_problems
         or a0_blocked
         or (asm_route and asm_status not in (MlaAsmStatus.OK, MlaAsmStatus.UNKNOWN))
     ):

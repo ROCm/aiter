@@ -260,6 +260,38 @@ def test_cp_world_size_matches_launch(monkeypatch):
         (4, False): MlaBackend.ASM,
         (4, True): MlaBackend.FLYDSL_PS1,
     }
+    # Without round-robin, CP takes persistent gfx1250 stage 1, which has no kernel.
+    s = get_mla_decode_shape_support(64, 1, fp8, fp8, cp_world_size=4, **flags)
+    assert s.supported is False, s.reasons
+
+
+def test_opus_cp(monkeypatch):
+    monkeypatch.setenv("AITER_MLA_USE_OPUS", "1")
+    get_mla_decode_shape_support.cache_clear()
+    fp8, bf16 = torch.float8_e4m3fn, torch.bfloat16
+
+    def support(dtype, world, rr):
+        return get_mla_decode_shape_support(
+            *(16, 1, dtype, dtype),
+            cp_world_size=world,
+            cp_round_robin=rr,
+            arch="gfx950",
+            enable_experimental=False,
+        )
+
+    try:
+        for dtype, world, rr, expect in (
+            (fp8, 1, False, None),
+            (fp8, 4, True, None),
+            (fp8, 4, False, False),
+            (bf16, 4, True, False),
+        ):
+            s = support(dtype, world, rr)
+            assert s.backend is MlaBackend.OPUS, s.backend
+            assert s.supported is expect, (dtype, world, rr, s.reasons)
+    finally:
+        monkeypatch.delenv("AITER_MLA_USE_OPUS")
+        get_mla_decode_shape_support.cache_clear()
 
 
 def _indptrs(bs, msq):
