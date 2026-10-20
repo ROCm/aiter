@@ -148,17 +148,18 @@ def _fwd_flops(B, sq, sk, Hq, d_qk, d_v, causal, window=(-1, -1)):
     return B * Hq * 2 * _attended_pairs(sq, sk, causal, window) * (d_qk + d_v)
 
 
-def _fwd_bytes(B, sq, sk, Hq, Hkv, d_qk, d_v, lse):
-    """HBM traffic: read Q/K/V, write O (all bf16 = 2B); +LSE (fp32 = 4B) when returned."""
+def _fwd_bytes(B, sq, sk, Hq, Hkv, d_qk, d_v, lse, in_esize=2, out_esize=2):
+    """HBM traffic: read Q/K/V at ``in_esize`` B/elem, write O at ``out_esize``;
+    +LSE (fp32 = 4B) when returned. The 8-bit kernels read 1B inputs but still
+    write a 2B O, so the two sizes are tracked apart."""
     total_q = B * sq
     total_k = B * sk
-    elems = (
-        total_q * Hq * d_qk  # Q
-        + total_k * Hkv * d_qk  # K
-        + total_k * Hkv * d_v  # V
-        + total_q * Hq * d_v  # O
-    )
-    nbytes = elems * 2
+    q_elems = total_q * Hq * d_qk
+    k_elems = total_k * Hkv * d_qk
+    v_elems = total_k * Hkv * d_v
+    in_elems = q_elems + k_elems + v_elems
+    out_elems = total_q * Hq * d_v
+    nbytes = in_elems * in_esize + out_elems * out_esize
     if lse:
         nbytes += total_q * Hq * 4
     return nbytes
@@ -269,7 +270,9 @@ def run_perf(case, warmup, repeat, fix_init=None):
         _run()  # one more inside the spy to confirm dispatch
 
     flop = _fwd_flops(B, sq, sk, Hq, d_qk, d_v, causal, window)
-    nbytes = _fwd_bytes(B, sq, sk, Hq, Hkv, d_qk, d_v, lse)
+    _in_esize = torch.empty((), dtype=dtype).element_size()
+    _out_esize = 2 if dtype in _B8_DTYPES else _in_esize
+    nbytes = _fwd_bytes(B, sq, sk, Hq, Hkv, d_qk, d_v, lse, _in_esize, _out_esize)
     avg_us = avg_ms * 1000
     tflops = _tflops(flop, avg_ms)
     tbps = _tbps(nbytes, avg_ms)

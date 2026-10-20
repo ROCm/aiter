@@ -223,15 +223,14 @@ def _flops(shapes, H_q, d_qk, d_v, causal):
     return total
 
 
-def _nbytes(tot_q, tot_k, H_q, H_kv, d_qk, d_v, elem_size, return_lse):
-    """Q + K + V reads and O (+ LSE) writes. Ignores re-reads of K/V across
-    M-blocks, so this is the compulsory-traffic lower bound."""
-    n = (
-        tot_q * H_q * d_qk  # Q
-        + tot_k * H_kv * d_qk  # K
-        + tot_k * H_kv * d_v  # V
-        + tot_q * H_q * d_v  # O
-    ) * elem_size
+def _nbytes(tot_q, tot_k, H_q, H_kv, d_qk, d_v, elem_size, out_elem_size, return_lse):
+    """Q + K + V reads at ``elem_size`` and O (+ LSE) writes at ``out_elem_size``.
+    The a8w8 backend reads 1-byte Q/K/V but writes a bf16 O, so the two sizes are
+    tracked apart. Ignores re-reads of K/V across M-blocks, so this is the
+    compulsory-traffic lower bound."""
+    in_elems = tot_q * H_q * d_qk + tot_k * H_kv * d_qk + tot_k * H_kv * d_v
+    out_elems = tot_q * H_q * d_v
+    n = in_elems * elem_size + out_elems * out_elem_size
     if return_lse:
         n += tot_q * H_q * 4
     return n
@@ -365,8 +364,17 @@ def test_mha_flydsl_varlen(
         candidates["triton"] = _call_varlen_triton
 
     flops = _flops(list(zip(seqs_q, seqs_k)), H_q, d_qk, d_v, causal)
+    _out_esize = 2 if q_dtype in _B8_TORCH else q.element_size()
     nbytes = _nbytes(
-        total_q, total_k, H_q, H_kv, d_qk, d_v, q.element_size(), return_lse
+        total_q,
+        total_k,
+        H_q,
+        H_kv,
+        d_qk,
+        d_v,
+        q.element_size(),
+        _out_esize,
+        return_lse,
     )
 
     ret = {"gfx": get_gfx()}
@@ -470,7 +478,18 @@ def test_mha_flydsl_batch(
     ref, ref_lse = ref_result if return_lse else (ref_result, None)
 
     flops = _flops([(sq, sk)] * B, H_q, d_qk, d_v, causal)
-    nbytes = _nbytes(B * sq, B * sk, H_q, H_kv, d_qk, d_v, q.element_size(), return_lse)
+    _out_esize = 2 if q_dtype in _B8_TORCH else q.element_size()
+    nbytes = _nbytes(
+        B * sq,
+        B * sk,
+        H_q,
+        H_kv,
+        d_qk,
+        d_v,
+        q.element_size(),
+        _out_esize,
+        return_lse,
+    )
 
     ret = {"gfx": get_gfx()}
     data, us = run_perftest(
