@@ -51,6 +51,7 @@ def _device_info(index: int) -> tuple[str, int]:
 
 def _split_layout(topk: int, num_splits: int) -> tuple[int, int]:
     """Tokens per split (whole wave rounds) and the split count that covers topk."""
+    topk = max(1, topk)
     per_split = -(-topk // max(1, num_splits))
     per_split = -(-per_split // SPLIT_TOKEN_ALIGN) * SPLIT_TOKEN_ALIGN
     return per_split, -(-topk // per_split)
@@ -92,6 +93,8 @@ def can_use_flydsl_qsa_sparse_decode(
     if q.dtype != torch.bfloat16 or k_cache.dtype not in _KV_DTYPES:
         return False
     if v_cache.dtype != k_cache.dtype or q.shape[2] != HEAD_DIM:
+        return False
+    if q.shape[1] == 0 or k_cache.shape[1] == 0:
         return False
     if k_cache.shape[2] != HEAD_DIM or q.shape[1] % k_cache.shape[1]:
         return False
@@ -159,15 +162,22 @@ def flydsl_qsa_sparse_decode(
         )
     if indices.shape[0] != rows:
         raise ValueError(f"`indices` must have {rows} rows, got {indices.shape[0]}.")
-    if req_to_token.dtype != torch.int32 or req_to_token.stride(1) != 1:
-        raise ValueError("`req_to_token` must be int32 with inner stride 1.")
+    if (
+        req_to_token.dtype != torch.int32
+        or req_to_token.dim() != 2
+        or req_to_token.stride(1) != 1
+    ):
+        raise ValueError(
+            "`req_to_token` must be a 2-D int32 tensor with inner stride 1."
+        )
     _check_index_tensor("row_req_pool_indices", row_req_pool_indices, rows)
     _check_index_tensor("seq_lens", seq_lens, rows)
 
     out = torch.empty_like(q)
-    if rows == 0:
-        return out
     topk = indices.shape[1]
+    if rows == 0 or topk == 0:
+        # No selected tokens: the same zeros the kernel writes for an empty row.
+        return out.zero_()
     tokens_per_split, num_splits = _split_layout(topk, num_splits)
     single_split = num_splits == 1
     partial_rows = rows * num_q_heads * num_splits
