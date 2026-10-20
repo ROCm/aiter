@@ -36,10 +36,10 @@ _DEFAULT_STREAM = fx.Stream(None)
 def create_causal_conv1d_prefill_kernel(
     dim: int,
     width: int,
-    xs: tuple,
+    x_unit: int,
     ws: tuple,
     ss: tuple,
-    os: tuple,
+    out_unit: int,
     has_bias: bool,
     has_cache: bool,
     has_indices: bool,
@@ -78,7 +78,20 @@ def create_causal_conv1d_prefill_kernel(
         w_span: fx.Int64,
         state_span: fx.Int64,
         out_span: fx.Int64,
+        x_stride: fx.Int64,
+        out_stride: fx.Int64,
     ):
+
+        xs0 = fx.Int64(1)
+        xs1 = x_stride
+        if const_expr(x_unit == 1):
+            xs0 = x_stride
+            xs1 = fx.Int64(1)
+        os0 = fx.Int64(1)
+        os1 = out_stride
+        if const_expr(out_unit == 1):
+            os0 = out_stride
+            os1 = fx.Int64(1)
         # Explicit physical offsets below already include the original strides.
         # Rebase to unit-stride views so Tensor indexing does not apply them twice.
         x = fx.Tensor(fx.make_view(fx.get_iter(x), fx.make_layout(x_span, 1)))
@@ -125,17 +138,14 @@ def create_causal_conv1d_prefill_kernel(
                 else:
                     hvalue = load_channels(
                         x,
-                        c * xs[0] + (start + offset - (width - 1) + j) * xs[1],
-                        fx.Int64(xs[0]),
+                        c * xs0 + (start + offset - (width - 1) + j) * xs1,
+                        xs0,
                     ).to(fx.Float32)
                 history.append(hvalue)
             weights = [raw_weights[j].to(fx.Float32) for j in range_constexpr(width)]
             base = fx.Vector.filled(lanes, 0.0, fx.Float32)
             if const_expr(has_bias):
                 base = load_channels(bias, fx.Int64(c), fx.Int64(1)).to(fx.Float32)
-            # Snapshot the whole old window before any state stores (short
-            # sequences must shift old history, not read overwritten values).
-            # Keep compile-time and runtime branches separate for FlyDSL.
             if const_expr(has_cache):  # noqa: SIM102
                 if chunk == 0:
                     for j in range_constexpr(width - 1):
@@ -143,7 +153,7 @@ def create_causal_conv1d_prefill_kernel(
                         value = fx.Vector.filled(lanes, 0.0, fx.Float32)
                         if tail >= 0:
                             value = load_channels(
-                                x, c * xs[0] + (start + tail) * xs[1], fx.Int64(xs[0])
+                                x, c * xs0 + (start + tail) * xs1, xs0
                             ).to(fx.Float32)
                         else:
                             for h in range_constexpr(width - 1):
@@ -153,9 +163,6 @@ def create_causal_conv1d_prefill_kernel(
                             state[slot * ss[0] + (c + lane) * ss[1] + j * ss[2]] = (
                                 element(value[lane])
                             )
-            # Issue a group of raw loads before conversions/arithmetic consume it.
-            # Clamped tail addresses avoid load-side control flow and stay inside
-            # this nonempty sequence. Tail values never reach a valid output.
             for t in range_constexpr(tokens):
                 if const_expr(t % prefetch == 0):
                     prefetched = []
@@ -164,8 +171,8 @@ def create_causal_conv1d_prefill_kernel(
                         safe_position = (position < length).select(position, length - 1)
                         raw = load_channels(
                             x,
-                            c * xs[0] + (start + safe_position) * xs[1],
-                            fx.Int64(xs[0]),
+                            c * xs0 + (start + safe_position) * xs1,
+                            xs0,
                         )
                         prefetched.append(raw)
                 value = prefetched[t % prefetch].to(fx.Float32)
@@ -179,7 +186,7 @@ def create_causal_conv1d_prefill_kernel(
                     )
                 if offset + t < length:
                     for lane in range_constexpr(lanes):
-                        out[(c + lane) * os[0] + (start + offset + t) * os[1]] = (
+                        out[(c + lane) * os0 + (start + offset + t) * os1] = (
                             element(acc[lane])
                         )
                 for j in range_constexpr(width - 2):
@@ -202,6 +209,8 @@ def create_causal_conv1d_prefill_kernel(
         w_span: fx.Int64,
         state_span: fx.Int64,
         out_span: fx.Int64,
+        x_stride: fx.Int64,
+        out_stride: fx.Int64,
         stream: fx.Stream = _DEFAULT_STREAM,
     ):
         causal_conv1d_prefill_kernel(
@@ -217,6 +226,8 @@ def create_causal_conv1d_prefill_kernel(
             w_span,
             state_span,
             out_span,
+            x_stride,
+            out_stride,
         ).launch(
             grid=(
                 (max_len + tokens - 1) // tokens,

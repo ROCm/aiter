@@ -1127,6 +1127,7 @@ def flydsl_gdn_decode_varlen(
     ksplit: int = 8,
     block: int = 256,
     viter: int | None = None,
+    validate_data: bool = False,
 ) -> torch.Tensor:
     """Gated Delta Net decode recurrence over a packed (varlen) batch.
 
@@ -1136,8 +1137,15 @@ def flydsl_gdn_decode_varlen(
     suppressed final write-back (EAGLE target-verify commits the accepted prefix
     itself).
 
+    Every sequence must hold the same ``T // n`` tokens, so ``cu_seqlens`` must
+    equal ``[0, T/n, 2T/n, ..., T]``. Only ``T % n`` is checked by default;
+    ``validate_data=True`` also checks the offsets themselves (a host sync, so
+    not graph safe).
+
     Returns ``out`` shaped ``[1, T, num_v_heads, head_v_dim]``.
     """
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise ValueError("q, k and v must be [1, T, heads, head_dim]")
     B, T, Hg, K = k.shape
     HV, V = v.shape[-2:]
     if B != 1:
@@ -1146,6 +1154,26 @@ def flydsl_gdn_decode_varlen(
         raise ValueError(f"head_k_dim must be 128, got {K}")
     if HV % Hg:
         raise ValueError(f"num_v_heads {HV} must be a multiple of num_k_heads {Hg}")
+    if q.shape != k.shape:
+        raise ValueError(f"q {tuple(q.shape)} and k {tuple(k.shape)} must match")
+    if v.shape[:2] != (1, T):
+        raise ValueError(f"v must be [1, {T}, HV, V], got {tuple(v.shape)}")
+    tensors = (
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state,
+        state_indices,
+        cu_seqlens,
+        intermediate_states,
+        intermediate_state_indices,
+    )
+    if any(t is not None and t.device != q.device for t in tensors):
+        raise ValueError(f"all tensors must be on {q.device}")
 
     for name, t_, dim in (("q", q, K), ("k", k, K), ("v", v, V)):
         if t_.dtype != torch.bfloat16:
@@ -1160,17 +1188,32 @@ def flydsl_gdn_decode_varlen(
             raise ValueError(f"{name} must be fp32 or bf16, got {t_.dtype}")
         if not t_.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
+    for name, t_ in (("a", a), ("b", b)):
+        if t_.ndim not in (2, 3) or t_.shape[-1] != HV or t_.numel() != T * HV:
+            raise ValueError(
+                f"{name} must be [{T}, {HV}] or [1, {T}, {HV}], got {tuple(t_.shape)}"
+            )
+    for name, t_ in (("A_log", A_log), ("dt_bias", dt_bias)):
+        if t_.shape != (HV,):
+            raise ValueError(f"{name} must be [{HV}], got {tuple(t_.shape)}")
     if state.dtype != torch.bfloat16:
         raise ValueError("state pool must be bf16")
+    if state.ndim != 4 or tuple(state.shape[1:]) != (HV, V, K):
+        raise ValueError(
+            f"state pool must be [slots, {HV}, {V}, {K}], got {tuple(state.shape)}"
+        )
     if state.stride()[1:] != (V * K, K, 1):
         raise ValueError("state pool inner dims must be contiguous [HV, V, K]")
 
+    if cu_seqlens.ndim != 1 or not cu_seqlens.is_contiguous():
+        raise ValueError("cu_seqlens must be contiguous [n + 1]")
     n = cu_seqlens.numel() - 1
     if n <= 0 or T % n:
         raise ValueError(f"ragged batch: T={T} is not divisible by n={n}")
     tokens_per_seq = T // n
 
     cache_states = intermediate_states is not None
+    index_tensors = [("cu_seqlens", cu_seqlens), ("state_indices", state_indices)]
     if cache_states:
         if intermediate_state_indices is None:
             raise ValueError("intermediate_states needs intermediate_state_indices")
@@ -1184,18 +1227,57 @@ def flydsl_gdn_decode_varlen(
                 f"got {tuple(intermediate_states.shape)}"
             )
         cache_steps = intermediate_states.shape[1]
+        # The snapshot buffer has no bounds check: a missing step would land
+        # in the next slot's snapshots.
+        if cache_steps < tokens_per_seq:
+            raise ValueError(
+                f"intermediate_states holds {cache_steps} steps per slot, "
+                f"but each sequence has {tokens_per_seq} tokens"
+            )
+        index_tensors.append(
+            ("intermediate_state_indices", intermediate_state_indices)
+        )
     else:
         cache_steps = 0
+    for name, t_ in index_tensors:
+        if t_.dtype not in (torch.int32, torch.int64):
+            raise ValueError(f"{name} must be int32 or int64, got {t_.dtype}")
+    for name, t_ in index_tensors[1:]:
+        if t_.shape != (n,) or not t_.is_contiguous():
+            raise ValueError(f"{name} must be contiguous [{n}], got {tuple(t_.shape)}")
+    if validate_data and cu_seqlens.tolist() != list(range(0, T + 1, tokens_per_seq)):
+        raise ValueError(
+            f"cu_seqlens must give every sequence {tokens_per_seq} tokens, "
+            f"got {cu_seqlens.tolist()}"
+        )
 
     out = q.new_empty(1, T, HV, V)
+    launch_tensors = (
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state,
+        state_indices,
+        out,
+        cu_seqlens,
+        intermediate_states if cache_states else state,
+        intermediate_state_indices if cache_states else state_indices,
+    )
 
-    with CompilationContext.compile_hints({"fastmath": "fast"}):
+    # The jit compiles on first call, not on build, so the hint has to still be
+    # in scope at the launch.
+    with CompilationContext.compile_hints(
+        {"fastmath": "fast"}
+    ), torch.cuda.device(q.device.index):
         launch = create_gdn_decode_verify_kernel(
             HV,
             Hg,
             V,
             tokens_per_seq,
-            out.numel() * out.element_size(),
             state.stride(0),
             q.stride()[1],
             k.stride()[1],
@@ -1218,21 +1300,20 @@ def flydsl_gdn_decode_varlen(
                 else int(viter)
             ),
         )
-        launch(
-            q,
-            k,
-            v,
-            a,
-            b,
-            A_log,
-            dt_bias,
-            state,
-            state_indices,
-            out,
-            cu_seqlens,
-            intermediate_states if cache_states else state,
-            intermediate_state_indices if cache_states else state_indices,
+        # The factory key fixes the geometry; the operand dtypes it leaves open
+        # (A_log, dt_bias, the index tensors) pick the compiled specialization.
+        # FlyDSL specializes tensors on dtype, rank, and the first unit-stride
+        # axis; sizes and the other strides stay dynamic.
+        key = (
+            q.device.index,
+            tuple((t.dtype, t.ndim, t.stride().index(1)) for t in launch_tensors),
+        )
+        _run_compiled(
+            launch,
+            *launch_tensors,
+            fx.Int64(out.numel() * out.element_size()),
             fx.Int32(n),
             fx.Stream(torch.cuda.current_stream(q.device)),
+            specialization_key=key,
         )
     return out

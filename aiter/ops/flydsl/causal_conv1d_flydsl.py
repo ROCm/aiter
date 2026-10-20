@@ -11,7 +11,7 @@ import torch
 from flydsl.expr.typing import Int32
 
 from aiter.ops.flydsl.kernels.kernels_common import LOG2E as _LOG2E
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_buf_tensor
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_buf_tensor
 
 from ..prefill_batch_metadata import CausalConvPrefillMetadata
 from .kernels.causal_conv1d_prefill import create_causal_conv1d_prefill_kernel
@@ -674,13 +674,18 @@ def causal_conv1d_prefill_flydsl_fn(
             else 1 + sum((n - 1) * s for n, s in zip(t.shape, t.stride()))
         )
 
+    # Weight and state strides are fixed per model and compiled in. x and out
+    # strides scale with the token count, so the kernel only bakes in which
+    # axis is unit-stride and receives the other stride at run time.
+    x_unit = x.stride().index(1)
+    out_unit = out.stride().index(1)
     launch = create_causal_conv1d_prefill_kernel(
         dim,
         width,
-        x.stride(),
+        x_unit,
         weight.stride(),
         ss,
-        out.stride(),
+        out_unit,
         bias is not None,
         conv_states is not None,
         cache_indices is not None,
@@ -704,22 +709,22 @@ def causal_conv1d_prefill_flydsl_fn(
         has_initial_state if has_initial_state is not None else query_start_loc,
         out,
     )
-    runtime = (batch, max_len, *(span(t) for t in (x, weight, conv_states, out)))
+    runtime = (
+        batch,
+        max_len,
+        *(span(t) for t in (x, weight, conv_states, out)),
+        x.stride(1 - x_unit),
+        out.stride(1 - out_unit),
+    )
     with torch.cuda.device(x.device):
         stream = torch.cuda.current_stream(x.device)
-        compiled = getattr(launch, "_compiled", None)
-        # FlyDSL specializes dtype, rank, and the first unit-stride axis.
-        # Sizes are dynamic; physical indexing strides remain in _build's key.
+        # FlyDSL specializes tensors on dtype, rank, and the first unit-stride
+        # axis; sizes and the other strides stay dynamic.
         key = (
             x.device.index,
             tuple((t.dtype, t.ndim, t.stride().index(1)) for t in args),
         )
-        if compiled is None:
-            launch._compiled = {}
-        if key not in launch._compiled:
-            launch._compiled[key] = flyc.compile(
-                launch, *args, *runtime, fx.Stream(stream)
-            )
-        else:
-            launch._compiled[key](*args, *runtime, fx.Stream(stream))
+        _run_compiled(
+            launch, *args, *runtime, fx.Stream(stream), specialization_key=key
+        )
     return out

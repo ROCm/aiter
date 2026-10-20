@@ -47,7 +47,6 @@ def create_gdn_decode_verify_kernel(
     num_k_heads: int,
     head_v_dim: int,
     tokens_per_seq: int,
-    out_bytes: int,
     state_slot_stride: int,
     q_token_stride: int,
     k_token_stride: int,
@@ -79,7 +78,6 @@ def create_gdn_decode_verify_kernel(
         )
     group = HV // Hg
     A_DT, B_DT = _dt(a_dtype), _dt(b_dtype)
-    OOB = out_bytes  # bytes >= elements for bf16, so always past the descriptor
 
     @flyc.jit
     def _group_sum(x):
@@ -115,6 +113,7 @@ def create_gdn_decode_verify_kernel(
         cu: fx.Tensor,
         icache: fx.Tensor,
         icache_idx: fx.Tensor,
+        out_bytes: fx.Int64,
     ):
         tid = fx.Int64(fx.thread_idx.x)
         hv = fx.Int64(fx.block_idx.x)
@@ -139,7 +138,7 @@ def create_gdn_decode_verify_kernel(
         bb = fx.rocdl.make_buffer_tensor(b)
 
         ob = fx.rocdl.make_buffer_tensor(
-            out, max_size=False, num_records_bytes=fx.Int64(out_bytes)
+            out, max_size=False, num_records_bytes=out_bytes
         )
         # Rebase before building the 32-bit-offset resource: a whole state pool
         # can exceed the 32-bit offset range.
@@ -244,8 +243,9 @@ def create_gdn_decode_verify_kernel(
                 for i in range(VITER)
             ]
             obase = (tok * HV + hv) * V + vcol
+
             oaddr = [
-                (kpart == 0).select(obase + i * VLANES, fx.Int64(OOB))
+                (kpart == 0).select(obase + i * VLANES, out_bytes)
                 for i in range(VITER)
             ]
             for i in range_constexpr(VITER):
@@ -295,11 +295,25 @@ def create_gdn_decode_verify_kernel(
         cu: fx.Tensor,
         icache: fx.Tensor,
         icache_idx: fx.Tensor,
+        out_bytes: fx.Int64,
         n: fx.Int32,
         stream: fx.Stream = _DEFAULT_STREAM,
     ):
         gdn_decode_verify_kernel(
-            q, k, v, a, b, A_log, dt_bias, state, indices, out, cu, icache, icache_idx
+            q,
+            k,
+            v,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            state,
+            indices,
+            out,
+            cu,
+            icache,
+            icache_idx,
+            out_bytes,
         ).launch(grid=(HV, V // VTILE, n), block=(BLOCK,), stream=stream)
 
     return launch
