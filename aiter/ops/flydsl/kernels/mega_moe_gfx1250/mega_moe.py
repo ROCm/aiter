@@ -58,6 +58,20 @@ _COMBINE_QUANT_CHUNKS_PER_ITER = 4
 # starts before dispatch returns and overlaps both; larger steps keep the plan
 # off the fabric until the payload copy is done, then overlap it with the GEMM.
 _DECODE_PLAN_OVERLAP_TOKENS = 128
+#: Workgroups the plan kernel adds for the dispatch quant, which otherwise
+#: costs its own launch. The plan holds 1-7 of 256 CUs for its whole
+#: cross-rank wait, so the quant rides along on idle ones.
+#:
+#: The kernel ends when its last block does, so the plan's measured time
+#: becomes max(plan, quant) and the count has to be large enough to keep the
+#: quant under it. A step at tpr 1536 streams ~28 MB, which is HBM traffic,
+#: not the L2-resident kind a GEMM sees: 32 blocks pushed the plan from 22 to
+#: 66-86 us, and it takes 128 to bring it back to 41-54. Per layer, three
+#: interleaved rounds at tpr 1536: 548.1 -> 540.7 us.
+#:
+#: 0 keeps the standalone HIP quant, which a step also falls back to when its
+#: plan was prefetched (that runs before this step's hidden states exist).
+_QUANT_FUSE_BLOCKS = int(os.environ.get("AITER_MEGA_QUANT_FUSE", "128"))
 
 
 def _read_s1f_mode() -> bool:
@@ -1646,6 +1660,7 @@ class MegaMoEGfx1250:
         slot: int | None = None,
         token_count: int | None = None,
         tok_map: bool = True,
+        quant_blocks: int = 0,
     ):
         """The compact-plan launch that aligns each expert's rows to ``align_m``.
 
@@ -1679,7 +1694,8 @@ class MegaMoEGfx1250:
         if plan_s1f:
             from .s1f_stage1 import FLAG_M
         write_tok_map = not plan_s1f or bool(tok_map)
-        key = (align_m, slot, waves, blocks, write_tok_map, plan_s1f)
+        qb = int(quant_blocks)
+        key = (align_m, slot, waves, blocks, write_tok_map, plan_s1f, qb)
         launch = self._compact_plan_launches.get(key)
         if launch is None:
             if torch.cuda.is_current_stream_capturing():
@@ -1711,6 +1727,10 @@ class MegaMoEGfx1250:
                 hist_pingpong=False,
                 plan_waves=None if waves == full_waves else waves,
                 plan_blocks=blocks,
+                quant_blocks=qb,
+                quant_model_dim=self.model_dim if qb else 0,
+                quant_row_stride=self._compact_wire_row if qb else 0,
+                quant_payload_bytes=(self._config.dispatch_token_nbytes if qb else 0),
                 # S1F: + run table, piece rows and per-tile source masks.
                 **(
                     {"s1f": True, "write_tok_map": write_tok_map, "align_m": align_m}
@@ -1820,6 +1840,7 @@ class MegaMoEGfx1250:
         slot: int | None = None,
         ready_event: torch.cuda.Event | None = None,
         tok_map: bool = True,
+        quant_src: torch.Tensor | None = None,
     ) -> None:
         slot = int(self._compact_slot if slot is None else slot)
         bufs = self._compact_slot_bufs(slot)
@@ -1842,15 +1863,30 @@ class MegaMoEGfx1250:
                 self._config.rank,
                 token_count,
             )
+            qb = 0
             if self._s1f_plan_mode(self._compact_step_align_m):
                 plan_args += (
                     bufs["send_list"].data_ptr(),
                     bufs["runs"].data_ptr(),
                     bufs["tile_src"].data_ptr(),
                 )
+                # Always passed so one kernel signature serves both: the quant
+                # partition only exists when quant_blocks > 0.
+                if quant_src is not None:
+                    qb = _QUANT_FUSE_BLOCKS
+                    plan_args += (
+                        quant_src.data_ptr(),
+                        self._s1f_wire.data_ptr(),
+                    )
+                else:
+                    plan_args += (0, 0)
             _run_compiled(
                 self._compact_plan_for(
-                    self._compact_step_align_m, slot, token_count, tok_map=tok_map
+                    self._compact_step_align_m,
+                    slot,
+                    token_count,
+                    tok_map=tok_map,
+                    quant_blocks=qb,
                 ),
                 *plan_args,
                 fx.Stream(plan_stream),
@@ -2192,6 +2228,16 @@ class MegaMoEGfx1250:
                 self._compact_plan_for(self._compact_tile_m, slot)
                 if self._s1f_plan_mode(self._compact_tile_m):
                     self._compact_plan_for(self._compact_tile_m, slot, tok_map=False)
+                    if _QUANT_FUSE_BLOCKS:
+                        # The fused variant is its own cache entry; a step that
+                        # quantizes inside the plan must not be the first to
+                        # compile it, which capture forbids.
+                        self._compact_plan_for(
+                            self._compact_tile_m,
+                            slot,
+                            tok_map=False,
+                            quant_blocks=_QUANT_FUSE_BLOCKS,
+                        )
         self._destination_peer_counter = torch.zeros(
             config.world_size, dtype=torch.int32, device=device
         )
@@ -2640,10 +2686,26 @@ class MegaMoEGfx1250:
     ):
         token_count = hidden_states.shape[0]
         spec = self._select_dispatch(token_count)
+        # The plan can quantize for us only when it is launched here: a
+        # prefetched plan ran before this step's hidden states existed.
+        fused_quant = bool(
+            _QUANT_FUSE_BLOCKS
+            and s1f
+            and self._config.is_quant_dispatch_wire
+            and getattr(self, "_s1f_wire", None) is not None
+            and self._compact_plan
+            and not self._compact_plan_pending
+            and self._s1f_plan_mode(self._compact_step_align_m)
+        )
         if self._compact_plan and not self._compact_plan_pending:
             # An S1F step's plan needs no tok_map (the stage-1 kernel reads
             # the send list); a default step's dispatch reads it.
-            self._launch_compact_plan_async(topk_ids, token_count, tok_map=not s1f)
+            self._launch_compact_plan_async(
+                topk_ids,
+                token_count,
+                tok_map=not s1f,
+                quant_src=hidden_states if fused_quant else None,
+            )
         stream = fx.Stream(torch.cuda.current_stream())
         payload = hidden_states
         if self._config.is_quant_dispatch_wire:
@@ -2656,7 +2718,13 @@ class MegaMoEGfx1250:
             payload = self._dispatch_quant_payload[:token_count]
             scale_rows = self._dispatch_quant_scales[:token_count]
             wire = getattr(self, "_s1f_wire", None) if s1f else None
-            if wire is not None:
+            if fused_quant:
+                # Written by the plan kernel's quant partition; only the scale
+                # pointer still has to be published here.
+                self._dispatch_sent_scales_ptr = (
+                    wire[:token_count].data_ptr() + self._config.dispatch_token_nbytes
+                )
+            elif wire is not None:
                 # S1F mailbox producer: the same bytes, written as whole wire
                 # rows (payload | e8m0 | pad) so one TDM gather moves a run.
                 pb = self._config.dispatch_token_nbytes
