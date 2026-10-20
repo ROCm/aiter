@@ -1019,17 +1019,27 @@ def get_bench_args(
         )
     # MLA kernel backend:
     # Only forward kernel, layout option doesn't make sense.
+    # bench_mla_decode.py only supports --model deepseek-V3. The shapes file
+    # records that config as DeepSeek-R1 (Decode).
     if "fwd" in kernels:
-        bench_args.extend(
-            [
+        for tp_model, b, s in product(
+            (tp_model for tp_model in tp_models if tp_model.model.use_mla),
+            batch_range.to_range(),
+            seq_range.to_range(),
+        ):
+            model = tp_model.model
+            if model.name != "DeepSeek-R1 (Decode)":
+                skipped_key = (model.name, "fwd")
+                if skipped_key not in skipped_model_kernels:
+                    logger.info(
+                        "Skipping fwd for model '%s': bench_mla_decode.py only supports deepseek-V3.",
+                        model.name,
+                    )
+                    skipped_model_kernels.add(skipped_key)
+                continue
+            bench_args.append(
                 BenchArgs(kernel="fwd", layout=None, tp_model=tp_model, b=b, s=s)
-                for tp_model, b, s in product(
-                    (tp_model for tp_model in tp_models if tp_model.model.use_mla),
-                    batch_range.to_range(),
-                    seq_range.to_range(),
-                )
-            ]
-        )
+            )
     return bench_args
 
 
