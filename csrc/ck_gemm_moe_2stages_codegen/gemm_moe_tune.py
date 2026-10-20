@@ -654,13 +654,15 @@ class FmoeTuner(TunerCommon):
             "--mxfp4-search-mode",
             choices=("prune", "full", "staged"),
             help="prune by M_est (default), exhaust all legal variants (full), "
-            "or screen the pruned stages (staged); requires --mxfp4-flydsl.",
+            "or screen the pruned stages (staged; shapes with M_est < 4 validate "
+            "every pruned pair unscreened); requires --mxfp4-flydsl.",
         )
         self.parser.add_argument(
             "--mxfp4-screen-topk",
             type=int,
             help="positive screening top-K per stage context (default 2); "
-            "requires explicit --mxfp4-search-mode staged; distinct from routing top-k.",
+            "requires explicit --mxfp4-search-mode staged; unused for M_est < 4; "
+            "distinct from routing top-k.",
         )
 
     def parse_args(self) -> argparse.Namespace:
@@ -6912,6 +6914,15 @@ class Mxfp4FlydslTuner(FmoeTuner):
     _G1_K_WAVE = (1, 2, 4)
     _G1_NUM_WAVES = (4, 2)
 
+    # Below this M_est, staged search validates every pruned pair, unscreened.
+    _STAGED_SMALL_BATCH_M_EST = 4
+
+    @staticmethod
+    def _m_est(row: dict[str, Any]) -> int:
+        """Estimated tokens per expert: ceil(token * topk / expert)."""
+        ne = int(row["expert"])
+        return (int(row["token"]) * int(row["topk"]) + ne - 1) // ne
+
     @staticmethod
     def _g1_matches_m_est(g1: dict[str, Any], m_est: int) -> bool:
         """Apply M_est allowlists; require an explicit rule for each BM family."""
@@ -6986,7 +6997,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                                 )
         if full_search:
             return out
-        m_est = (int(row["token"]) * topk + ne - 1) // ne
+        m_est = self._m_est(row)
         kept = [g1 for g1 in out if self._g1_matches_m_est(g1, m_est)]
         if len(kept) < len(out):
             # Name the shape in full: under --mp the workers' stdout interleaves,
@@ -7858,12 +7869,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
             print(f"[mxfp4-staged] {label} screening failed: {exc}", flush=True)
             return self.INVALID_TIME
 
-    def _tune_staged_shape(
-        self, row: dict[str, Any], args: Any, timeout: int
-    ) -> dict[str, Any]:
-        plan = self._staged_candidate_plan(row)
-        if not plan.pairs:
-            return _mxfp4_failed_row(self.keys, row, "no pipeline-pair candidates")
+    def _staged_shortlists(
+        self, row: dict[str, Any], plan: "StagedSearchPlan", args: Any, timeout: int
+    ) -> tuple[dict[Any, Any], dict[Any, Any]]:
+        """Screen GEMM1/GEMM2 per group and return their top-K shortlists."""
         screen_topk = getattr(args, "mxfp4_screen_topk", DEFAULT_SCREEN_TOPK)
         gemm2_groups = {group.key: group for group in plan.gemm2_groups}
         producers = {}
@@ -7967,6 +7976,29 @@ class Mxfp4FlydslTuner(FmoeTuner):
             for group in plan.gemm2_groups
             if group.key.block_m in producers
         }
+        return gemm1_shortlists, gemm2_shortlists
+
+    def _tune_staged_shape(
+        self, row: dict[str, Any], args: Any, timeout: int
+    ) -> dict[str, Any]:
+        plan = self._staged_candidate_plan(row)
+        if not plan.pairs:
+            return _mxfp4_failed_row(self.keys, row, "no pipeline-pair candidates")
+        m_est = self._m_est(row)
+        small_batch = m_est < self._STAGED_SMALL_BATCH_M_EST
+        if small_batch:
+            # Isolated stage time does not predict pipeline time at this scale,
+            # so time every pruned pair end to end, exactly as prune mode does.
+            print(
+                f"[mxfp4-staged] small batch M_est={m_est}: validating all "
+                f"{len(plan.pairs)} pruned pairs without screening",
+                flush=True,
+            )
+            gemm1_shortlists, gemm2_shortlists = {}, {}
+        else:
+            gemm1_shortlists, gemm2_shortlists = self._staged_shortlists(
+                row, plan, args, timeout
+            )
         best = None
         evaluated_pairs: dict[PipelinePairKey, tuple[float, str | None]] = {}
         for group in plan.pipeline_groups:
@@ -7983,7 +8015,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 for pair in group.pairs
                 if pair.key.gemm1 in gemm1 and pair.key.gemm2 in gemm2
             )
-            if not shortlisted:
+            if not shortlisted and not small_batch:
                 print(
                     f"[mxfp4-staged] exhaustive fallback BM{group.key.block_m} "
                     f"{group.key.accumulation_mode.value}: no usable reference/shortlist",
