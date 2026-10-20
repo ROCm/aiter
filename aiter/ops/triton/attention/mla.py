@@ -90,13 +90,16 @@ def select_3d_config(
             attn_num_warps = 4
         reduce_num_warps = 4
         attn_waves_per_eu = 1
-        # waves_per_eu=N pads the register allocation to cap occupancy at N; the
-        # reduce is latency-bound, so leave its occupancy to the compiler.
-        cfg_dir = resolve_config_dir("attention", "MLA-DECODE", backend="gluon")
-        table = load_config_json(f"{cfg_dir}/DEFAULT.json")
-        reduce_waves_per_eu = table["triton_mla_decode_fwd_reduce_kernel"][
-            "waves_per_eu"
-        ]
+        # Apply measured reduce occupancy when this dispatch arch has a config;
+        # otherwise retain the selector's default.
+        cfg_dir = resolve_config_dir(
+            "attention", "MLA-DECODE", backend="gluon", arch=DEVICE_ARCH
+        )
+        table = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
+        if table is not None:
+            reduce_waves_per_eu = table.get(
+                "triton_mla_decode_fwd_reduce_kernel", {}
+            ).get("waves_per_eu", reduce_waves_per_eu)
         if shuffled_kv_cache and kv_dtype == torch.uint8:
             assert (
                 block_size == 128
