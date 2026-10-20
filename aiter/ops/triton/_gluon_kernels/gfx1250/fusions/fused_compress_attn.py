@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""DeepSeek-V4 CSA indexer compressor for gfx1250: softmax pool, RMSNorm, RoPE, MXFP4."""
+
+# Compress attention: softmax pool of a token window, RMSNorm, RoPE and MXFP4 quant
 
 import functools
 
-import triton.experimental.gluon.language as gl
 from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton._gluon_kernels.common.utils import (
     exp_scaled,
@@ -24,115 +25,32 @@ COLS_PER_LANE = 8
 
 
 @functools.cache
-def get_fused_compress_attn_fp4_layouts():
-    # One row needs 16 lanes. The 32 lanes of a wave make 2 lane groups, and each
-    # lane holds 4 of the 8 window tokens.
+def get_fused_compress_attn_fp4_layouts(num_warps):
+    # One row needs 16 lanes, so the 32 lanes of a wave make 2 lane groups. The lane
+    # groups and the waves split the 8 window tokens.
     lanes = 32
     lanes_per_row = HEAD_DIM // COLS_PER_LANE
     lane_groups = lanes // lanes_per_row
     window_layout = gl.BlockedLayout(
-        size_per_thread=[2 * RATIO // lane_groups, COLS_PER_LANE],
+        size_per_thread=[2 * RATIO // (lane_groups * num_warps), COLS_PER_LANE],
         threads_per_warp=[lane_groups, lanes_per_row],
-        warps_per_cta=[1, 1],
+        warps_per_cta=[num_warps, 1],
         order=[1, 0],
     )
-    # The TDM descriptor needs a shared layout without swizzle.
-    shared_layout = gl.SwizzledSharedLayout(
-        vec=1, per_phase=1, max_phase=1, order=[1, 0]
-    )
-    return {
-        "window_layout": window_layout,
-        "shared_layout": shared_layout,
-    }
+    return {"window_layout": window_layout}
 
 
-# ===-----------------------------------------------------------------------===#
-# Step helpers
-# ===-----------------------------------------------------------------------===#
-
-
-@gluon.jit
-def load_from_state_ring(
-    kv_state_ptr,
-    score_state_ptr,
-    state_slot,
-    token_pos,
-    col_offset,
-    from_state,
-    STATE_SIZE: gl.constexpr,
-    KV_SLOT_STRIDE: gl.constexpr,
-    SCORE_SLOT_STRIDE: gl.constexpr,
-    window_layout: gl.constexpr,
-):
-    ROW_ELEMS: gl.constexpr = 2 * HEAD_DIM
-    col = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, window_layout))[None, :]
-    # Slots can be far apart. Use a 64-bit slot offset.
-    slot = state_slot.to(gl.int64)
-    row_start = (token_pos % STATE_SIZE) * ROW_ELEMS
-    # The compiler does not know the alignment. The hint gives 16-byte loads.
-    row_start = gl.multiple_of(row_start + col_offset, [8, 8])
-    kv_ring = kv_state_ptr + slot * KV_SLOT_STRIDE
-    score_ring = score_state_ptr + slot * SCORE_SLOT_STRIDE
-    # A masked gl.load adds a branch for each load. A buffer load sets masked lanes
-    # out of range, so it needs no branch.
-    values = gl.amd.gfx1250.buffer_load(kv_ring, row_start + col, from_state, 0.0)
-    scores = gl.amd.gfx1250.buffer_load(
-        score_ring, row_start + col, from_state, float("-inf")
-    )
-    return values, scores
-
-
-@gluon.jit
-def load_from_input_rows(
-    kv_in_ptr,
-    score_in_ptr,
-    ape_ptr,
-    stride_in_token,
-    last_token_row,
-    window_token,
-    col_offset,
-    from_input,
-    window_layout: gl.constexpr,
-):
-    WINDOW: gl.constexpr = 2 * RATIO
-    col = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, window_layout))[None, :]
-    row_start = (last_token_row - (WINDOW - 1) + window_token) * stride_in_token
-    row_start = gl.multiple_of(row_start + col_offset, [8, 8])
-    ape_row = gl.multiple_of(
-        (window_token % RATIO) * (2 * HEAD_DIM) + col_offset, [8, 8]
-    )
-    values = gl.amd.gfx1250.buffer_load(kv_in_ptr, row_start + col, from_input, 0.0)
-    scores = gl.amd.gfx1250.buffer_load(
-        score_in_ptr, row_start + col, from_input, float("-inf")
-    )
-    # The state ring stores scores with ape added. Add ape to the input scores only.
-    ape = gl.amd.gfx1250.buffer_load(ape_ptr, ape_row + col, from_input, 0.0)
-    return values.to(gl.float32), scores.to(gl.float32) + ape
-
-
-@gluon.jit
-def softmax_pool(values, scores):
-    max_score = gl.max(scores, axis=0)[None, :]
-    # gl.exp adds a denormal fix-up to each value. exp_scaled(1.0, x) is exp(x) with
-    # one exp2.
-    weights = exp_scaled(1.0, scores - max_score)
-    weighted_sum = gl.sum(weights * values, axis=0)
-    weight_sum = gl.sum(weights, axis=0)
-    # The IEEE divide is slow. fast_dividef uses v_rcp_f32 (1 ulp).
-    return gl.extra.libdevice.fast_dividef(weighted_sum, weight_sum)
-
-
-# ===-----------------------------------------------------------------------===#
+# ======================================
 # Kernel
-# ===-----------------------------------------------------------------------===#
+# ======================================
 
-_fused_compress_attn_fp4_gfx1250_repr = make_kernel_repr(
+_fused_compress_attn_fp4_repr = make_kernel_repr(
     "fused_compress_attn_fp4_gfx1250",
-    ["STATE_SIZE", "K_PER_BLOCK"],
+    ["STATE_SIZE", "K_PER_BLOCK", "cache_modifier"],
 )
 
 
-@gluon.jit(repr=_fused_compress_attn_fp4_gfx1250_repr)
+@gluon.jit(repr=_fused_compress_attn_fp4_repr)
 def fused_compress_attn_fp4_gfx1250(
     plan_ptr,
     state_slots_ptr,
@@ -148,7 +66,6 @@ def fused_compress_attn_fp4_gfx1250(
     kv_cache_ptr,
     cache_scale_ptr,
     num_seqs,
-    num_cache_rows,
     stride_block_tables_seq,
     stride_in_token,
     RMS_EPS: gl.constexpr,
@@ -156,31 +73,22 @@ def fused_compress_attn_fp4_gfx1250(
     K_PER_BLOCK: gl.constexpr,
     KV_STATE_SLOT_STRIDE: gl.constexpr,
     SCORE_STATE_SLOT_STRIDE: gl.constexpr,
+    cache_modifier: gl.constexpr,
     window_layout: gl.constexpr,
-    shared_layout: gl.constexpr,
 ):
     # Arguments after the first 30 dwords cost a memory load. Keep the runtime
     # arguments in 30 dwords.
 
     # Compile-time constants
     WINDOW: gl.constexpr = 2 * RATIO
+    # A state, input or ape row has the previous group, then the current group.
+    ROW_VALUES: gl.constexpr = 2 * HEAD_DIM
     # Two e2m1 values fit in one byte. One e8m0 scale covers 32 values.
     ROW_BYTES: gl.constexpr = HEAD_DIM // 2
     SCALE_GROUP: gl.constexpr = 32
     NUM_SCALES: gl.constexpr = HEAD_DIM // SCALE_GROUP
 
     gl.static_assert(STATE_SIZE >= WINDOW)
-
-    row_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=kv_cache_ptr,
-        shape=(num_cache_rows, ROW_BYTES),
-        strides=(ROW_BYTES, 1),
-        block_shape=(1, ROW_BYTES),
-        layout=shared_layout,
-    )
-    row_buffer = gl.allocate_shared_memory(
-        kv_cache_ptr.type.element_ty, [1, ROW_BYTES], layout=shared_layout
-    )
 
     # =====================================================================
     # Read the plan row
@@ -212,6 +120,7 @@ def fused_compress_attn_fp4_gfx1250(
         # =================================================================
         window_token = gl.arange(0, WINDOW, layout=gl.SliceLayout(1, window_layout))
         window_token = window_token[:, None]
+        col = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, window_layout))
         token_pos = last_pos - (WINDOW - 1) + window_token
         is_real = token_pos >= 0
         from_state = is_real & (window_token < num_from_state)
@@ -220,47 +129,62 @@ def fused_compress_attn_fp4_gfx1250(
         # second half.
         col_offset = gl.where(window_token >= RATIO, HEAD_DIM, 0)
 
-        state_values, state_scores = load_from_state_ring(
-            kv_state_ptr,
-            score_state_ptr,
-            state_slot,
-            token_pos,
-            col_offset,
-            from_state,
-            STATE_SIZE,
-            KV_STATE_SLOT_STRIDE,
-            SCORE_STATE_SLOT_STRIDE,
-            window_layout,
+        # The older tokens come from the state ring. Slots can be far apart, so use a
+        # 64-bit slot offset.
+        slot = state_slot.to(gl.int64)
+        kv_ring = kv_state_ptr + slot * KV_STATE_SLOT_STRIDE
+        score_ring = score_state_ptr + slot * SCORE_STATE_SLOT_STRIDE
+        state_start = (token_pos % STATE_SIZE) * ROW_VALUES
+        # The compiler does not know the alignment. The hint gives 16-byte loads.
+        state_start = gl.multiple_of(state_start + col_offset, [8, 8])
+        # A masked gl.load adds a branch for each load. A buffer load sets masked lanes
+        # out of range, so it needs no branch.
+        state_values = gl.amd.gfx1250.buffer_load(
+            kv_ring, state_start + col[None, :], from_state, 0.0
         )
-        input_values, input_scores = load_from_input_rows(
-            kv_in_ptr,
-            score_in_ptr,
-            ape_ptr,
-            stride_in_token,
-            last_token_row,
-            window_token,
-            col_offset,
-            from_input,
-            window_layout,
+        state_scores = gl.amd.gfx1250.buffer_load(
+            score_ring, state_start + col[None, :], from_state, float("-inf")
         )
+
+        # The newer tokens come from the input rows.
+        input_start = (last_token_row - (WINDOW - 1) + window_token) * stride_in_token
+        input_start = gl.multiple_of(input_start + col_offset, [8, 8])
+        input_values = gl.amd.gfx1250.buffer_load(
+            kv_in_ptr, input_start + col[None, :], from_input, 0.0
+        )
+        input_scores = gl.amd.gfx1250.buffer_load(
+            score_in_ptr, input_start + col[None, :], from_input, float("-inf")
+        )
+        # The state ring stores scores with ape added. Add ape to the input scores only.
+        ape_start = (window_token % RATIO) * ROW_VALUES
+        ape_start = gl.multiple_of(ape_start + col_offset, [8, 8])
+        ape = gl.amd.gfx1250.buffer_load(
+            ape_ptr, ape_start + col[None, :], from_input, 0.0
+        )
+
         # The cache row uses the RoPE angle of the first position in its group.
         cos, sin = load_interleaved_cos_sin(
             cos_ptr, sin_ptr, entry * RATIO, HEAD_DIM, ROPE_DIM, window_layout
         )
-        col = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, window_layout))
         weight = gl.load(rms_weight_ptr + col).to(gl.float32)
 
+        # --- 2. Softmax pool ---
         # Each token comes from at most one source. A masked source gives 0 and -inf,
         # so add the values and take the max of the scores.
-        values = state_values + input_values
-        scores = gl.maximum(state_scores, input_scores)
-
-        # --- 2. Softmax pool ---
-        pooled = softmax_pool(values, scores)
+        values = state_values + input_values.to(gl.float32)
+        scores = gl.maximum(state_scores, input_scores.to(gl.float32) + ape)
+        max_score = gl.max(scores, axis=0)[None, :]
+        # gl.exp adds a denormal fix-up to each value. exp_scaled(1.0, x) is exp(x) with
+        # one exp2.
+        weights = exp_scaled(1.0, scores - max_score)
+        # The IEEE divide is slow. fast_dividef uses v_rcp_f32 (1 ulp).
+        pooled = gl.extra.libdevice.fast_dividef(
+            gl.sum(weights * values, axis=0), gl.sum(weights, axis=0)
+        )
 
         # --- 3. RMSNorm ---
-        normed = _rmsnorm_op(pooled, weight, HEAD_DIM, RMS_EPS)
-        normed = normed[None, :]
+        normed = _rmsnorm_op(pooled, weight, HEAD_DIM, RMS_EPS)[None, :]
+
         # --- 4. RoPE ---
         # RoPE is on the last ROPE_DIM columns.
         is_rope = col[None, :] >= HEAD_DIM - ROPE_DIM
@@ -279,10 +203,17 @@ def fused_compress_attn_fp4_gfx1250(
         # =================================================================
         # 6. Write the cache row
         # =================================================================
-        # One wave writes the LDS row, so the TDM store needs no barrier.
-        row_buffer.store(packed)
-        gl.amd.gfx1250.tdm.async_store(row_desc, [cache_row, 0], row_buffer)
+        # A cache can have more than 2^31 bytes. Use a 64-bit row offset.
+        row = cache_row.to(gl.int64)
+        byte = gl.arange(0, ROW_BYTES, layout=gl.SliceLayout(0, packed.type.layout))
+        gl.store(
+            kv_cache_ptr + row * ROW_BYTES + byte[None, :],
+            packed,
+            cache_modifier=cache_modifier,
+        )
         group = gl.arange(0, NUM_SCALES, layout=gl.SliceLayout(0, scales.type.layout))
-        gl.store(cache_scale_ptr + cache_row * NUM_SCALES + group[None, :], scales)
-        # The TDM store reads the LDS row. Wait for it before the program ends.
-        gl.amd.gfx1250.tdm.async_wait(0)
+        gl.store(
+            cache_scale_ptr + row * NUM_SCALES + group[None, :],
+            scales,
+            cache_modifier=cache_modifier,
+        )
