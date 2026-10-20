@@ -3,6 +3,7 @@
 
 import importlib.util
 import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -29,6 +30,14 @@ device_info = _load_device_info()
 
 
 class TestGetNumXcds(unittest.TestCase):
+    def setUp(self):
+        self._env = mock.patch.dict(os.environ)
+        self._env.start()
+        os.environ.pop("CU_NUM", None)
+
+    def tearDown(self):
+        self._env.stop()
+
     def test_published_xcd_parts(self):
         # Active CUs per device and XCDs. gfx90a and gfx908 are not here:
         # those parts have no XCDs. An MI250 GCD is already its own device.
@@ -47,7 +56,7 @@ class TestGetNumXcds(unittest.TestCase):
         # One L2 domain per HIP device. 0 would divide by zero in remap_xcd
         # and in mla_gluon's batch // NUM_XCDS.
         for gfx, cu_num in (
-            ("gfx906", 64),  # CDNA1
+            ("gfx906", 64),  # MI50, MI60
             ("gfx908", 120),  # CDNA1, MI100
             ("gfx90a", 104),  # CDNA2, MI210 / MI250 per GCD
             ("gfx90a", 110),  # CDNA2, MI250X per GCD
@@ -113,6 +122,142 @@ class TestGetNumXcds(unittest.TestCase):
             mock.patch.object(device_info, "_xcds_from_known_part", return_value=4),
         ):
             self.assertEqual(device_info.get_num_xcds(0), 4)
+
+    def test_attribute_value_tracks_header_enum(self):
+        # ClockInstructionRate shares AmdSpecificBegin, so it does not consume
+        # a value. An enumerator inserted before NumberOfXccs shifts it.
+        base = """
+        hipDeviceAttributeAmdSpecificBegin = 10000,
+        hipDeviceAttributeClockInstructionRate =
+            hipDeviceAttributeAmdSpecificBegin,
+        hipDeviceAttributeWallClockRate,
+        hipDeviceAttributeNumberOfXccs,
+        """
+        shifted = base.replace(
+            "hipDeviceAttributeWallClockRate,",
+            "hipDeviceAttributeWallClockRate,\n        hipDeviceAttributeInserted,",
+        )
+        explicit = base.replace(
+            "hipDeviceAttributeNumberOfXccs,",
+            "hipDeviceAttributeNumberOfXccs = 12000,",
+        )
+        self.assertEqual(
+            device_info._hip_device_attribute_value(
+                base, "hipDeviceAttributeNumberOfXccs"
+            ),
+            10002,
+        )
+        self.assertEqual(
+            device_info._hip_device_attribute_value(
+                shifted, "hipDeviceAttributeNumberOfXccs"
+            ),
+            10003,
+        )
+        self.assertEqual(
+            device_info._hip_device_attribute_value(
+                explicit, "hipDeviceAttributeNumberOfXccs"
+            ),
+            12000,
+        )
+        shifted_by_sum = base.replace(
+            "hipDeviceAttributeClockInstructionRate =\n"
+            "            hipDeviceAttributeAmdSpecificBegin,",
+            "hipDeviceAttributeClockInstructionRate =\n"
+            "            hipDeviceAttributeAmdSpecificBegin + 5,",
+        )
+        self.assertEqual(
+            device_info._hip_device_attribute_value(
+                shifted_by_sum, "hipDeviceAttributeNumberOfXccs"
+            ),
+            10007,
+        )
+        prefixed = base.replace(
+            "hipDeviceAttributeWallClockRate,",
+            "hipDeviceAttributeNumberOfXccsEx,\n"
+            "        hipDeviceAttributeWallClockRate,",
+        )
+        self.assertEqual(
+            device_info._hip_device_attribute_value(
+                prefixed, "hipDeviceAttributeNumberOfXccs"
+            ),
+            10003,
+        )
+        conditional = base.replace(
+            "hipDeviceAttributeWallClockRate,",
+            "#if 0\n        hipDeviceAttributeWallClockRate,\n        #endif",
+        )
+        with self.assertRaises(ValueError):
+            device_info._hip_device_attribute_value(
+                conditional, "hipDeviceAttributeNumberOfXccs"
+            )
+        with self.assertRaises(ValueError):
+            device_info._hip_device_attribute_value(
+                "hipDeviceAttributeAmdSpecificBegin = sizeof(int),\n"
+                "hipDeviceAttributeNumberOfXccs,",
+                "hipDeviceAttributeNumberOfXccs",
+            )
+
+    def test_header_beside_loaded_library(self):
+        with tempfile.TemporaryDirectory() as root:
+            library = os.path.join(root, "lib", "libamdhip64.so.1")
+            header = os.path.join(root, "include", "hip", "hip_runtime_api.h")
+            os.makedirs(os.path.dirname(library))
+            os.makedirs(os.path.dirname(header))
+            open(library, "w").close()
+            open(header, "w").close()
+            self.assertEqual(device_info._header_beside_library(library), header)
+
+    def test_header_prefers_loaded_library_over_rocm_path(self):
+        with (
+            tempfile.TemporaryDirectory() as root,
+            tempfile.TemporaryDirectory() as other,
+        ):
+            library = os.path.join(root, "lib", "libamdhip64.so")
+            header = os.path.join(root, "include", "hip", "hip_runtime_api.h")
+            os.makedirs(os.path.dirname(library))
+            os.makedirs(os.path.dirname(header))
+            open(library, "w").close()
+            open(header, "w").close()
+            os.environ["ROCM_PATH"] = other
+            with mock.patch.object(
+                device_info, "_loaded_amdhip64_path", return_value=library
+            ):
+                self.assertEqual(device_info._hip_runtime_api_header(), header)
+
+    def test_versioned_rocm_roots_sort_by_version(self):
+        roots = [
+            "/opt/rocm-7.9.0",
+            "/opt/rocm-7.10.0",
+            "/opt/rocm-6.4.2",
+        ]
+        ordered = sorted(roots, key=device_info._rocm_version_key, reverse=True)
+        self.assertEqual(ordered[0], "/opt/rocm-7.10.0")
+
+    def test_cu_num_override_skips_hip_query(self):
+        os.environ["CU_NUM"] = "228"
+        with (
+            mock.patch.object(device_info, "_rocm_major", return_value=7),
+            mock.patch.object(
+                device_info,
+                "_query_num_xccs",
+                side_effect=AssertionError("HIP queried under CU_NUM"),
+            ),
+            mock.patch.object(
+                device_info, "_xcds_from_known_part", return_value=6
+            ) as table,
+        ):
+            self.assertEqual(device_info.get_num_xcds(1), 6)
+        table.assert_called_once_with(None)
+
+    def test_part_table_receives_device_id(self):
+        with (
+            mock.patch.object(device_info, "_rocm_major", return_value=6),
+            mock.patch.object(
+                device_info, "_xcds_from_known_part", return_value=4
+            ) as table,
+        ):
+            self.assertEqual(device_info.get_num_xcds(3), 4)
+        table.assert_called_once_with(3)
 
     def test_rejected_attribute_is_queried_once(self):
         device_info._query_num_xccs.cache_clear()
