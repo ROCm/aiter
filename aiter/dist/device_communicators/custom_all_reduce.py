@@ -1686,6 +1686,21 @@ class CustomAllreduce:
             or inp.numel() * inp.element_size() > _GFX1250_LL_MAX_BYTES
         )
 
+    @property
+    def has_old_arch_fused_kernels(self) -> bool:
+        """Whether the per-group / MXFP4 quant and qk-norm fused kernels can run.
+
+        They are built only into the old-arch module, whose ops cast ``_ptr`` to
+        the old-arch ``CustomAllreduce``. On gfx1250 ``_ptr`` is the gfx1250
+        class, so they would synchronize through the gfx1250 ``Signal`` with
+        their own counters and release later gfx1250 barriers early.
+        """
+        return not self._is_gfx1250
+
+    def _require_old_arch_fused_kernels(self, op: str) -> None:
+        if not self.has_old_arch_fused_kernels:
+            raise RuntimeError(f"{op} has no gfx1250 kernel")
+
     def should_custom_ar_bytes(self, inp: torch.Tensor, prefill_support: bool = False):
         """Return whether the tensor size fits custom AR even if it is strided.
 
@@ -2318,6 +2333,7 @@ class CustomAllreduce:
         transpose_scale: bool = False,
         gemma_norm: bool = False,
     ):
+        self._require_old_arch_fused_kernels("fused_ar_rms_per_group_quant")
         K = inp.shape[-1]
         # Fail fast on bad ``group_size`` at the Python boundary. Mirrors
         # the C++ host dispatcher checks; catching it here surfaces a
@@ -2377,6 +2393,7 @@ class CustomAllreduce:
         eps: float,
         registered: bool = False,
     ):
+        self._require_old_arch_fused_kernels("fused_qknorm_ar")
         dtype = qkv_in.dtype
         device = qkv_in.device
         hidden_dim_q = q_w.shape[-1]
@@ -2414,6 +2431,7 @@ class CustomAllreduce:
         eps: float,
         registered: bool = False,
     ):
+        self._require_old_arch_fused_kernels("fused_qknorm_ar_rope")
         dtype = qkv_in.dtype
         device = qkv_in.device
         hidden_dim_q = q_w.shape[-1]
@@ -2589,6 +2607,7 @@ class CustomAllreduce:
         emit_bf16: bool = False,
         gemma_norm: bool = False,
     ):
+        self._require_old_arch_fused_kernels("fused_ar_rms_mxfp4_quant")
         K = inp.shape[-1]
         _validate_mxfp4_hidden_dim(K, inp.element_size())
         res_out = torch.empty_like(inp)
@@ -2636,7 +2655,11 @@ class CustomAllreduce:
         transpose_scale: bool = False,
         gemma_norm: bool = False,
     ):
-        if self.disabled or not self.should_custom_ar(input):
+        if (
+            self.disabled
+            or not self.has_old_arch_fused_kernels
+            or not self.should_custom_ar(input)
+        ):
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():

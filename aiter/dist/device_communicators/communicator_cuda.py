@@ -726,6 +726,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         use_kernel = (
             ca_comm is not None
             and not ca_comm.disabled
+            and ca_comm.has_old_arch_fused_kernels
             and ca_comm.should_custom_ar(input_, prefill_support)
             and self.world_size != 6
             and (prefill_support or total_bytes <= 64 * 1024 * 1024)
