@@ -85,6 +85,8 @@ def can_use_flydsl_qsa_sparse_decode(
         return False
     if _device_info(q.device.index or 0)[0] != "gfx950":
         return False
+    if k_cache.device != q.device or v_cache.device != q.device:
+        return False
     if q.dim() != 3 or k_cache.dim() != 3 or v_cache.shape != k_cache.shape:
         return False
     if q.dtype != torch.bfloat16 or k_cache.dtype not in _KV_DTYPES:
@@ -96,6 +98,12 @@ def can_use_flydsl_qsa_sparse_decode(
     if q.shape[1] // k_cache.shape[1] > _MAX_GROUP_SIZE:
         return False
     return k_cache.is_contiguous() and v_cache.is_contiguous()
+
+
+def _check_device(name: str, tensor: torch.Tensor, device: torch.device) -> None:
+    # ptr_arg forwards raw addresses, so a host tensor would be read as device memory.
+    if tensor.device != device:
+        raise ValueError(f"`{name}` must be on {device}, got {tensor.device}.")
 
 
 def _check_index_tensor(name: str, tensor: torch.Tensor, rows: int) -> None:
@@ -138,6 +146,13 @@ def flydsl_qsa_sparse_decode(
     group_size = num_q_heads // num_kv_heads
     if not q.is_contiguous():
         raise ValueError("`q` must be contiguous.")
+    for name, tensor in (
+        ("req_to_token", req_to_token),
+        ("row_req_pool_indices", row_req_pool_indices),
+        ("indices", indices),
+        ("seq_lens", seq_lens),
+    ):
+        _check_device(name, tensor, q.device)
     if indices.dtype != torch.int32 or indices.dim() != 2 or indices.stride(1) != 1:
         raise ValueError(
             "`indices` must be a [rows, topk] int32 tensor with inner stride 1."
@@ -166,6 +181,8 @@ def flydsl_qsa_sparse_decode(
         )
     else:
         part_m, part_l, part_o = workspace
+        for name, tensor in zip(("part_m", "part_l", "part_o"), workspace):
+            _check_device(f"workspace.{name}", tensor, q.device)
         if part_m.numel() < partial_rows or part_o.numel() < partial_rows * HEAD_DIM:
             raise ValueError("`workspace` is too small for this batch and split count.")
 
