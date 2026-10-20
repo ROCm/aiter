@@ -253,6 +253,14 @@ def run_benchmark(args):
             num_blocks = min(
                 BS * triton.cdiv(SEQ_LEN, KV_BLK_SZ), (4 << 30) // page_bytes
             )
+        if args.backend == "triton":
+            max_blocks = (1 << 31) // (HK * KV_BLK_SZ * HEAD_DIM)
+            if args.num_blocks and num_blocks > max_blocks:
+                raise ValueError(
+                    f"-num_blocks must be <= {max_blocks} for this shape "
+                    "to keep Triton cache offsets within signed int32."
+                )
+            num_blocks = min(num_blocks, max_blocks)
         fn = paged_attn_decode(
             BS,
             HQ,
