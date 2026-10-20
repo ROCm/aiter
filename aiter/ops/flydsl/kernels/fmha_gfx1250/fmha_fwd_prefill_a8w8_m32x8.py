@@ -156,9 +156,10 @@ DEFAULT_DTYPE = "fp8"
 _DTYPE_MAP = {"fp8": fx.Float8E4M3FN, "bf8": fx.Float8E5M2}
 _TORCH_DTYPE_MAP = {"fp8": torch.float8_e4m3fn, "bf8": torch.float8_e5m2}
 _B8_DTYPES = (fx.Float8E4M3FN, fx.Float8E5M2)
-# ``elem_dtype`` is the Q/K/V input type. P and O do not follow it: softmax P is always
-# bf8 (its [0,1] range wants the wider exponent, not fp8's extra mantissa bit), and the O
-# accumulator and store stay 16-bit.
+# ``q_dtype`` types Q, ``kv_dtype`` types K and V; the two are independent (the wmma
+# takes a per-operand type) so fp8 Q against bf8 KV, or the reverse, is a legal build.
+# P and O follow neither: softmax P is always bf8 (its [0,1] range wants the wider
+# exponent, not fp8's extra mantissa bit), and the O accumulator and store stay 16-bit.
 P_DTYPE = fx.Float8E5M2
 O_DTYPE = fx.BFloat16
 TORCH_O_DTYPE = torch.bfloat16
@@ -787,7 +788,8 @@ def _pv_qk_gemm(
     ring=PVQK_RING,
     ring_lag=PVQK_LAG,
     vld_per_frag=2,
-    elem_dtype=None,
+    q_dtype=None,
+    kv_dtype=None,
     phase="pvqk",
 ):
     """GEMM2(u-1) then GEMM1(u) driven by ONE ring over the concatenated V-then-K
@@ -870,7 +872,7 @@ def _pv_qk_gemm(
                 )
                 p_frags[(q_tile_idx, k_tile_idx)] = p_frag
                 out_list[q_tile_idx][d_tile_idx] = _wmma(
-                    v_frag, p_frag, acc, a_dtype=elem_dtype, b_dtype=P_DTYPE
+                    v_frag, p_frag, acc, a_dtype=kv_dtype, b_dtype=P_DTYPE
                 )
                 rocdl.sched_barrier(0)
             return
@@ -886,8 +888,8 @@ def _pv_qk_gemm(
                 k_frag,
                 q_frags_list[q_tile_idx][d_tile_idx],
                 acc,
-                a_dtype=elem_dtype,
-                b_dtype=elem_dtype,
+                a_dtype=kv_dtype,
+                b_dtype=q_dtype,
             )
             rocdl.sched_barrier(0)
 
@@ -983,12 +985,13 @@ _PROLOGUE_KEYS = (
     "kv_len",
     "window_left",
     "window_right",
-    "elem_dtype",
+    "q_dtype",
+    "kv_dtype",
 )
 
 
 def _build_managers(
-    *, qk_hdim, v_hdim, n_block, gqa_ratio, num_q_tiles_per_wave, elem_dtype
+    *, qk_hdim, v_hdim, n_block, gqa_ratio, num_q_tiles_per_wave, q_dtype, kv_dtype
 ):
     """The Q/K/V staging managers both cores use; USE_TDM_LOADER picks the transport.
 
@@ -1002,19 +1005,19 @@ def _build_managers(
                 gqa_ratio=gqa_ratio,
                 num_waves=NUM_WAVES,
                 q_tiles_per_wave=num_q_tiles_per_wave,
-                elem_dtype=elem_dtype,
+                elem_dtype=q_dtype,
             ),
             KManager16bV2(
                 qk_hdim=qk_hdim,
                 n_block=n_block,
                 num_waves=NUM_WAVES,
-                elem_dtype=elem_dtype,
+                elem_dtype=kv_dtype,
             ),
             VManager16bV2(
                 v_hdim=v_hdim,
                 n_block=n_block,
                 num_waves=NUM_WAVES,
-                elem_dtype=elem_dtype,
+                elem_dtype=kv_dtype,
             ),
         )
     return (
@@ -1023,19 +1026,19 @@ def _build_managers(
             gqa_ratio=gqa_ratio,
             num_waves=NUM_WAVES,
             q_tiles_per_wave=num_q_tiles_per_wave,
-            elem_dtype=elem_dtype,
+            elem_dtype=q_dtype,
         ),
         KManager16bV1(
             qk_hdim=qk_hdim,
             n_block=n_block,
             num_waves=NUM_WAVES,
-            elem_dtype=elem_dtype,
+            elem_dtype=kv_dtype,
         ),
         VManager16bV1(
             v_hdim=v_hdim,
             n_block=n_block,
             num_waves=NUM_WAVES,
-            elem_dtype=elem_dtype,
+            elem_dtype=kv_dtype,
         ),
     )
 
@@ -1065,7 +1068,8 @@ def _attention_prologue(
     kv_len,
     window_left,
     window_right,
-    elem_dtype,
+    q_dtype,
+    kv_dtype,
     warp_idx,  # runtime fx.Int32 wave index
     lds_base,  # LDS base (fx.Int32), allocated once by the caller (_alloc_lds)
 ):
@@ -1097,7 +1101,8 @@ def _attention_prologue(
         n_block=n_block,
         gqa_ratio=gqa_ratio,
         num_q_tiles_per_wave=num_q_tiles_per_wave,
-        elem_dtype=elem_dtype,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
     )
     k_blk_bytes = k_mgr.get_lds_size_in_byte()
     v_blk_bytes = v_mgr.get_lds_size_in_byte()
@@ -1461,7 +1466,8 @@ def _attention_core_multi_kv_tiles(
     warp_type,  # compile-time WarpType (LO/HI x SIMD parity)
     lds_base,  # LDS base (fx.Int32), allocated once by the caller (_alloc_lds)
     prologue,  # dict from _attention_prologue: managers, LDS map, KV span, Q fragments
-    elem_dtype,  # compile-time Q/K/V fragment type; P is P_DTYPE, O is O_DTYPE
+    q_dtype,  # compile-time Q fragment type; K/V are kv_dtype, P is P_DTYPE, O is O_DTYPE
+    kv_dtype,  # compile-time K/V fragment type (may differ from q_dtype; both 8-bit)
 ):
     """Layout-agnostic m32x8 compute, shared by the THD and BSHD kernel entries.
 
@@ -1889,7 +1895,8 @@ def _attention_core_multi_kv_tiles(
                 v_emit=_v_emit,
                 k_emit=_k_emit,
                 vld_per_frag=v_mgr.loads_per_frag,
-                elem_dtype=elem_dtype,
+                q_dtype=q_dtype,
+                kv_dtype=kv_dtype,
                 p_list=p_list,
                 q_frags_list=q_frags,
                 v_hdim=v_hdim,
@@ -1910,7 +1917,8 @@ def _attention_core_multi_kv_tiles(
                 v_emit=_v_emit,
                 k_emit=_k_emit,
                 vld_per_frag=v_mgr.loads_per_frag,
-                elem_dtype=elem_dtype,
+                q_dtype=q_dtype,
+                kv_dtype=kv_dtype,
                 p_list=carry_prev,
                 q_frags_list=q_frags,
                 v_hdim=v_hdim,
@@ -2108,7 +2116,8 @@ def _attention_core_one_kv_tile(
     window_right,
     warp_idx,
     lds_base,
-    elem_dtype,
+    q_dtype,
+    kv_dtype,
 ):
     """Whole-attention compute for a workgroup whose band fits in ONE KV tile.
 
@@ -2139,7 +2148,8 @@ def _attention_core_one_kv_tile(
         n_block=n_block,
         gqa_ratio=gqa_ratio,
         num_q_tiles_per_wave=num_q_tiles,
-        elem_dtype=elem_dtype,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
     )
     _SPLIT_STRIDE = 6 * LDS_CHUNK_BYTES
     slot_bytes = 2 * LDS_CHUNK_BYTES
@@ -2262,7 +2272,8 @@ def _attention_core_one_kv_tile(
         v_emit=None,
         k_emit=_k_emit,
         vld_per_frag=v_mgr.loads_per_frag,
-        elem_dtype=elem_dtype,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
         p_list=[[] for _ in range(num_q_tiles)],
         q_frags_list=q_frags,
         v_hdim=v_hdim,
@@ -2320,7 +2331,8 @@ def _attention_core_one_kv_tile(
         v_emit=_v_emit,
         k_emit=None,
         vld_per_frag=v_mgr.loads_per_frag,
-        elem_dtype=elem_dtype,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
         p_list=p_list,
         q_frags_list=q_frags,
         v_hdim=v_hdim,
@@ -2468,7 +2480,6 @@ _EPILOGUE_KEYS = (
     "gqa_ratio",
     "num_q_tiles_per_wave",
     "return_lse",
-    "elem_dtype",
     "ptr_O",
     "ptr_LSE",
     "stride_o_seq",
@@ -2517,7 +2528,6 @@ def _attention_epilogue(
     gqa_ratio,
     num_q_tiles_per_wave,
     return_lse,
-    elem_dtype,
     ptr_O,
     ptr_LSE,
     stride_o_seq,
@@ -2606,7 +2616,6 @@ def _zero_fill_attention(
     lse_num_records_bytes,
     q_start,
     q_len,
-    elem_dtype,
 ):
     """q_len>0 with kv_len==0 (cross-attention): softmax over an empty KV set, so O=0 for
     this WG's valid query rows and LSE=-inf -- or LSE=sink[head] with a sink, exp(sink)
@@ -2670,17 +2679,17 @@ def _zero_fill_attention(
 # ============================================================================
 
 
-def kv_split_bytes(qk_hdim, v_hdim, n_block, elem_dtype):
+def kv_split_bytes(qk_hdim, v_hdim, n_block, kv_dtype):
     """Bytes one half of a 2-way-split K and V tile occupies, straight from the active
     managers -- n_block//KV_LDS_SPLITS rows of hdim*sizeof(elem) plus their per-row pad
     (16 B for K, 32 B for V)."""
     k_cls = KManager16bV2 if USE_TDM_LOADER else KManager16bV1
     v_cls = VManager16bV2 if USE_TDM_LOADER else VManager16bV1
     k_mgr = k_cls(
-        qk_hdim=qk_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=elem_dtype
+        qk_hdim=qk_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=kv_dtype
     )
     v_mgr = v_cls(
-        v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=elem_dtype
+        v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=kv_dtype
     )
     return (
         k_mgr.get_lds_size_in_byte() // KV_LDS_SPLITS,
@@ -2688,7 +2697,7 @@ def kv_split_bytes(qk_hdim, v_hdim, n_block, elem_dtype):
     )
 
 
-def pick_n_block(qk_hdim, v_hdim, elem_dtype):
+def pick_n_block(qk_hdim, v_hdim, kv_dtype):
     """Widest n_block from N_BLOCK_PREF whose split K and V tiles each still fit one
     LDS_CHUNK_BYTES chunk.
 
@@ -2698,7 +2707,7 @@ def pick_n_block(qk_hdim, v_hdim, elem_dtype):
     KV_LDS_SPLITS splits must hold whole tiles."""
     for candidate_n_block in N_BLOCK_PREF:
         if (
-            max(kv_split_bytes(qk_hdim, v_hdim, candidate_n_block, elem_dtype))
+            max(kv_split_bytes(qk_hdim, v_hdim, candidate_n_block, kv_dtype))
             <= LDS_CHUNK_BYTES
         ):
             return candidate_n_block
@@ -2715,7 +2724,8 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
     qk_hdim: int = DEFAULT_QK_HDIM,
     v_hdim: int = DEFAULT_V_HDIM,
     n_block: int | None = None,
-    dtype_str: str = DEFAULT_DTYPE,
+    q_dtype_str: str = DEFAULT_DTYPE,
+    kv_dtype_str: str = DEFAULT_DTYPE,
     mask_left: bool = False,
     mask_right: bool = False,
     one_kv_tile: bool = False,
@@ -2735,15 +2745,16 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
         qk_hdim in SUPPORTED_QK_HDIM and v_hdim in SUPPORTED_V_HDIM
     ), f"supports qk_hdim in {SUPPORTED_QK_HDIM} x v_hdim in {SUPPORTED_V_HDIM}, got {qk_hdim}/{v_hdim}"
     assert (
-        dtype_str in _DTYPE_MAP
-    ), f"dtype_str must be in {list(_DTYPE_MAP)}, got {dtype_str!r}"
-    ELEM_DTYPE = _DTYPE_MAP[dtype_str]
+        q_dtype_str in _DTYPE_MAP and kv_dtype_str in _DTYPE_MAP
+    ), f"dtypes must be in {list(_DTYPE_MAP)}, got {q_dtype_str!r}/{kv_dtype_str!r}"
+    Q_ELEM_DTYPE = _DTYPE_MAP[q_dtype_str]
+    KV_ELEM_DTYPE = _DTYPE_MAP[kv_dtype_str]
     assert gqa_ratio >= 1, f"gqa_ratio must be >= 1, got {gqa_ratio}"
     assert (
         num_q_tiles_per_wave in NUM_Q_TILES_CHOICES
     ), f"num_q_tiles_per_wave must be in {NUM_Q_TILES_CHOICES}, got {num_q_tiles_per_wave}"
     if n_block is None:
-        n_block = pick_n_block(qk_hdim, v_hdim, ELEM_DTYPE)
+        n_block = pick_n_block(qk_hdim, v_hdim, KV_ELEM_DTYPE)
     assert (
         n_block in N_BLOCK_CHOICES
     ), f"n_block must be in {N_BLOCK_CHOICES}, got {n_block}"
@@ -2843,7 +2854,8 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
                     "kv_len": kv_len,
                     "window_left": window_left,
                     "window_right": window_right,
-                    "elem_dtype": ELEM_DTYPE,
+                    "q_dtype": Q_ELEM_DTYPE,
+                    "kv_dtype": KV_ELEM_DTYPE,
                 }
                 # Exactly one core reaches the binary: the host decides from the shape (bshd) or
                 # from max_seqlen_k (thd) whether every WG sees a single KV tile.
@@ -2907,7 +2919,6 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
                     lse_num_records_bytes=lse_num_records_bytes,
                     q_start=q_start,
                     q_len=q_len,
-                    elem_dtype=ELEM_DTYPE,
                 )
 
         return kn_fmha_fwd_prefill_a8w8_m32x8_thd
@@ -2984,7 +2995,8 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
             "kv_len": seq_len_k,
             "window_left": window_left,
             "window_right": window_right,
-            "elem_dtype": ELEM_DTYPE,
+            "q_dtype": Q_ELEM_DTYPE,
+            "kv_dtype": KV_ELEM_DTYPE,
         }
         # Exactly one core reaches the binary: the host decides from the shape (bshd) or
         # from max_seqlen_k (thd) whether every WG sees a single KV tile.
@@ -3043,9 +3055,9 @@ _launch_fns = (
 )  # {(layout, mask_left, mask_right, return_lse, has_sink, gqa_ratio): fn}
 
 
-def _pick_one_kv_tile(max_seqlen_k, qk_hdim, v_hdim, dtype_str):
+def _pick_one_kv_tile(max_seqlen_k, qk_hdim, v_hdim, kv_dtype_str):
     """True when the launch bounds every WG to a single KV tile."""
-    n_block = pick_n_block(qk_hdim, v_hdim, _DTYPE_MAP[dtype_str])
+    n_block = pick_n_block(qk_hdim, v_hdim, _DTYPE_MAP[kv_dtype_str])
     return int(max_seqlen_k) <= n_block
 
 
@@ -3072,7 +3084,8 @@ def _ensure_thd_kernel(
     gqa_ratio: int,
     qk_hdim: int = DEFAULT_QK_HDIM,
     v_hdim: int = DEFAULT_V_HDIM,
-    dtype_str: str = DEFAULT_DTYPE,
+    q_dtype_str: str = DEFAULT_DTYPE,
+    kv_dtype_str: str = DEFAULT_DTYPE,
     num_q_tiles_per_wave: int = WMMA_ROW_PER_WAVE,
 ):
     key = (
@@ -3084,7 +3097,8 @@ def _ensure_thd_kernel(
         int(gqa_ratio),
         int(qk_hdim),
         int(v_hdim),
-        str(dtype_str),
+        str(q_dtype_str),
+        str(kv_dtype_str),
         int(num_q_tiles_per_wave),
         bool(one_kv_tile),
     )
@@ -3100,7 +3114,8 @@ def _ensure_thd_kernel(
         return_lse=return_lse,
         has_sink=has_sink,
         gqa_ratio=gqa_ratio,
-        dtype_str=dtype_str,
+        q_dtype_str=q_dtype_str,
+        kv_dtype_str=kv_dtype_str,
         num_q_tiles_per_wave=num_q_tiles_per_wave,
     )
     block_m = _block_m(num_q_tiles_per_wave)
@@ -3190,7 +3205,8 @@ def _ensure_bshd_kernel(
     gqa_ratio: int,
     qk_hdim: int = DEFAULT_QK_HDIM,
     v_hdim: int = DEFAULT_V_HDIM,
-    dtype_str: str = DEFAULT_DTYPE,
+    q_dtype_str: str = DEFAULT_DTYPE,
+    kv_dtype_str: str = DEFAULT_DTYPE,
     num_q_tiles_per_wave: int = WMMA_ROW_PER_WAVE,
 ):
     key = (
@@ -3202,7 +3218,8 @@ def _ensure_bshd_kernel(
         int(gqa_ratio),
         int(qk_hdim),
         int(v_hdim),
-        str(dtype_str),
+        str(q_dtype_str),
+        str(kv_dtype_str),
         int(num_q_tiles_per_wave),
         bool(one_kv_tile),
     )
@@ -3218,7 +3235,8 @@ def _ensure_bshd_kernel(
         return_lse=return_lse,
         has_sink=has_sink,
         gqa_ratio=gqa_ratio,
-        dtype_str=dtype_str,
+        q_dtype_str=q_dtype_str,
+        kv_dtype_str=kv_dtype_str,
         num_q_tiles_per_wave=num_q_tiles_per_wave,
     )
     block_m = _block_m(num_q_tiles_per_wave)
@@ -3331,8 +3349,8 @@ def flash_attn_a8w8_m32x8_supported(
         and v_hdim in SUPPORTED_V_HDIM
         and k.shape[-1] == qk_hdim
         and q.dtype in _TORCH_IN_DTYPES
-        and k.dtype == q.dtype
-        and v.dtype == q.dtype
+        and k.dtype in _TORCH_IN_DTYPES
+        and v.dtype == k.dtype
         and num_kv > 0
         and num_q % num_kv == 0
         and supports_gqa_ratio(num_q // max(num_kv, 1))
@@ -3372,11 +3390,12 @@ def flash_attn_varlen_a8w8_m32x8(
     its presence likewise compile-time. ``lse`` is an optional caller-provided
     ``[nheads_q, total_q]`` fp32 buffer, allocated here when ``return_lse`` and None.
     """
-    assert q.dtype in _TORCH_DTYPE_MAP.values(), f"Expected bf16 or fp16, got {q.dtype}"
     assert (
-        k.dtype == q.dtype and v.dtype == q.dtype
-    ), f"q/k/v dtype must match, got {q.dtype}/{k.dtype}/{v.dtype}"
-    dtype_str = _TORCH_IN_DTYPES[q.dtype]
+        q.dtype in _TORCH_DTYPE_MAP.values() and k.dtype in _TORCH_DTYPE_MAP.values()
+    ), f"Expected fp8 or bf8, got {q.dtype}/{k.dtype}"
+    assert v.dtype == k.dtype, f"k/v dtype must match, got {k.dtype}/{v.dtype}"
+    q_dtype_str = _TORCH_IN_DTYPES[q.dtype]
+    kv_dtype_str = _TORCH_IN_DTYPES[k.dtype]
     qk_hdim = q.shape[-1]
     assert (
         qk_hdim in SUPPORTED_QK_HDIM
@@ -3453,7 +3472,7 @@ def flash_attn_varlen_a8w8_m32x8(
         num_q_tiles_per_wave = _pick_num_q_tiles(nheads_k, batch, max_seqlen_q, gqa)
     num_q_tiles_per_wave = int(num_q_tiles_per_wave)
 
-    one_kv_tile = _pick_one_kv_tile(max_seqlen_k, qk_hdim, v_hdim, dtype_str)
+    one_kv_tile = _pick_one_kv_tile(max_seqlen_k, qk_hdim, v_hdim, kv_dtype_str)
 
     _ensure_thd_kernel(
         mask_left,
@@ -3464,7 +3483,8 @@ def flash_attn_varlen_a8w8_m32x8(
         gqa,
         qk_hdim=qk_hdim,
         v_hdim=v_hdim,
-        dtype_str=dtype_str,
+        q_dtype_str=q_dtype_str,
+        kv_dtype_str=kv_dtype_str,
         num_q_tiles_per_wave=num_q_tiles_per_wave,
     )
 
@@ -3479,7 +3499,8 @@ def flash_attn_varlen_a8w8_m32x8(
                 gqa,
                 qk_hdim,
                 v_hdim,
-                dtype_str,
+                q_dtype_str,
+                kv_dtype_str,
                 num_q_tiles_per_wave,
                 one_kv_tile,
             )
@@ -3537,11 +3558,12 @@ def flash_attn_batch_a8w8_m32x8(
     ``sink`` and ``lse`` behave as in ``flash_attn_varlen_a8w8_m32x8``; the LSE buffer is
     ``[B, nheads_q, S_q]`` here.
     """
-    assert q.dtype in _TORCH_DTYPE_MAP.values(), f"Expected bf16 or fp16, got {q.dtype}"
     assert (
-        k.dtype == q.dtype and v.dtype == q.dtype
-    ), f"q/k/v dtype must match, got {q.dtype}/{k.dtype}/{v.dtype}"
-    dtype_str = _TORCH_IN_DTYPES[q.dtype]
+        q.dtype in _TORCH_DTYPE_MAP.values() and k.dtype in _TORCH_DTYPE_MAP.values()
+    ), f"Expected fp8 or bf8, got {q.dtype}/{k.dtype}"
+    assert v.dtype == k.dtype, f"k/v dtype must match, got {k.dtype}/{v.dtype}"
+    q_dtype_str = _TORCH_IN_DTYPES[q.dtype]
+    kv_dtype_str = _TORCH_IN_DTYPES[k.dtype]
     assert q.dim() == 4, f"Expected 4D BSHD tensor, got rank {q.dim()}"
     qk_hdim = q.shape[-1]
     assert (
@@ -3635,7 +3657,7 @@ def flash_attn_batch_a8w8_m32x8(
         num_q_tiles_per_wave = _pick_num_q_tiles(nheads_k, batch, seq_len_q, gqa)
     num_q_tiles_per_wave = int(num_q_tiles_per_wave)
 
-    one_kv_tile = _pick_one_kv_tile(seq_len_k, qk_hdim, v_hdim, dtype_str)
+    one_kv_tile = _pick_one_kv_tile(seq_len_k, qk_hdim, v_hdim, kv_dtype_str)
 
     _ensure_bshd_kernel(
         mask_left,
@@ -3646,7 +3668,8 @@ def flash_attn_batch_a8w8_m32x8(
         gqa,
         qk_hdim=qk_hdim,
         v_hdim=v_hdim,
-        dtype_str=dtype_str,
+        q_dtype_str=q_dtype_str,
+        kv_dtype_str=kv_dtype_str,
         num_q_tiles_per_wave=num_q_tiles_per_wave,
     )
 
@@ -3661,7 +3684,8 @@ def flash_attn_batch_a8w8_m32x8(
                 gqa,
                 qk_hdim,
                 v_hdim,
-                dtype_str,
+                q_dtype_str,
+                kv_dtype_str,
                 num_q_tiles_per_wave,
                 one_kv_tile,
             )
