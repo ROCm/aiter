@@ -53,22 +53,22 @@ def is_fx_set_register_available():
     return callable(getattr(fx, "set_register", None))
 
 
-def _is_schedule_vgpr_available():
-    """Return whether this FlyDSL build has rocdl.schedule_vgpr."""
-    return hasattr(rocdl, "schedule_vgpr") or hasattr(rocdl, "ScheduleVGPR")
+def _is_sched_vgpr_available():
+    """Return whether this FlyDSL build has rocdl.sched_vgpr."""
+    return hasattr(rocdl, "sched_vgpr") or hasattr(rocdl, "ScheduleVGPR")
 
 
-def schedule_vgpr_rmem(rmem, regnum, soft=False):
+def sched_vgpr_rmem(rmem, regnum, soft=False):
     """Hint an rmem_tensor to a specific starting VGPR.
 
-    Loads the current value, wraps it with rocdl.schedule_vgpr, and stores back.
+    Loads the current value, wraps it with rocdl.sched_vgpr, and stores back.
     Requires the custom LLVM build with B512 pseudo support for wide vectors.
     """
     from flydsl.expr.typing import Vector as _Vec
 
     val = rmem.load()
     val_ir = val.ir_value() if hasattr(val, "ir_value") else val
-    hinted = rocdl.schedule_vgpr(val_ir, regnum=regnum, soft=soft)
+    hinted = rocdl.sched_vgpr(val_ir, regnum=regnum, soft=soft)
     rmem.store(_Vec(hinted))
 
 
@@ -105,9 +105,9 @@ if DISABLE_CLUSTER_SYNC not in (0, 1):
 
 SUPPORT_EXPLICIT_VGPR_PARTITION = bool(
     EXPLICIT_VGPR_PARTITION
-    and (is_fx_set_register_available() or _is_schedule_vgpr_available())
+    and (is_fx_set_register_available() or _is_sched_vgpr_available())
 )
-_USE_SCHEDULE_VGPR = SUPPORT_EXPLICIT_VGPR_PARTITION and _is_schedule_vgpr_available()
+_USE_SCHED_VGPR = SUPPORT_EXPLICIT_VGPR_PARTITION and _is_sched_vgpr_available()
 
 # MXFP8 combine wire format (``ep_quant_bits``): a slot holds two planes, N
 # payload bytes followed by N/32 e8m0 scale bytes. The block is 32 elements,
@@ -1111,7 +1111,7 @@ def launch_gemm_a8w4_tdm(
         ]
         if const_expr(SUPPORT_EXPLICIT_VGPR_PARTITION):
             assert n_acc * WMMA_VECTOR_DWORDS <= 512
-            if const_expr(not _USE_SCHEDULE_VGPR):
+            if const_expr(not _USE_SCHED_VGPR):
                 for idx in range_constexpr(n_acc):
                     fx.set_register(
                         c_frags[idx],
@@ -1120,9 +1120,9 @@ def launch_gemm_a8w4_tdm(
                     )
         for cf in c_frags:
             cf.store(fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32)))
-        if const_expr(_USE_SCHEDULE_VGPR):
+        if const_expr(_USE_SCHED_VGPR):
             for idx in range_constexpr(n_acc):
-                schedule_vgpr_rmem(c_frags[idx], regnum=512 + idx * WMMA_VECTOR_DWORDS)
+                sched_vgpr_rmem(c_frags[idx], regnum=512 + idx * WMMA_VECTOR_DWORDS)
 
         front_wm = (wmma_m_rep + 1) // 2
         FRONT = list(range(front_wm))
@@ -1155,8 +1155,8 @@ def launch_gemm_a8w4_tdm(
                             scaleAType=0,
                             scaleBType=wm % 2,
                         )
-                        if const_expr(_USE_SCHEDULE_VGPR):
-                            wmma_result = rocdl.schedule_vgpr(
+                        if const_expr(_USE_SCHED_VGPR):
+                            wmma_result = rocdl.sched_vgpr(
                                 wmma_result, regnum=512 + idx * WMMA_VECTOR_DWORDS,
                             )
                         c_frags[idx].store(wmma_result)
@@ -1200,7 +1200,7 @@ def launch_gemm_a8w4_tdm(
             if const_expr(SUPPORT_EXPLICIT_VGPR_PARTITION):
                 slot_width = wmma_m_rep * ACT_NDW + wmma_n_rep * WMMA_VECTOR_DWORDS
                 assert slot_width <= 128
-                if const_expr(not _USE_SCHEDULE_VGPR):
+                if const_expr(not _USE_SCHED_VGPR):
                     reg = 256 + slot_idx * 128
                     for wm in range_constexpr(wmma_m_rep):
                         fx.set_register(a[wm], register_class=fx.rocdl.VGPR, start=reg)
@@ -1222,15 +1222,15 @@ def launch_gemm_a8w4_tdm(
         rmem_slots = [make_rmem_slot(i) for i in range_constexpr(2)]
 
         def _hint_slot_ab(slot):
-            """Apply schedule_vgpr hints to A/B operands after LDS load."""
-            if const_expr(not _USE_SCHEDULE_VGPR):
+            """Apply sched_vgpr hints to A/B operands after LDS load."""
+            if const_expr(not _USE_SCHED_VGPR):
                 return
             reg = slot.vgpr_base
             for wm in range_constexpr(wmma_m_rep):
-                schedule_vgpr_rmem(slot.a[wm], regnum=reg)
+                sched_vgpr_rmem(slot.a[wm], regnum=reg)
                 reg += ACT_NDW
             for wn in range_constexpr(wmma_n_rep):
-                schedule_vgpr_rmem(slot.b[wn], regnum=reg)
+                sched_vgpr_rmem(slot.b[wn], regnum=reg)
                 reg += WMMA_VECTOR_DWORDS
 
         def load_lds_data(slot, lds_addr, ksl, kt, interleaved_lds_load=False):
@@ -2411,6 +2411,6 @@ if SUPPORT_EXPLICIT_VGPR_PARTITION:
     # launch_gemm_a8w4_tdm.compile_hints["llvm_options"]["amdgpu-anti-hints-for-va-vdst"] = True
     # SameBank (ds_load→WMMA) overwrites exact VGPR pins (schedule.vgpr /
     # set_register); without this, A/B at 256/384 collapse next to C at 512+.
-    launch_gemm_a8w4_tdm.compile_hints["llvm_options"][
-        "amdgpu-same-bank-hints"
-    ] = False
+    # launch_gemm_a8w4_tdm.compile_hints["llvm_options"][
+    #    "amdgpu-same-bank-hints"
+    #] = False
