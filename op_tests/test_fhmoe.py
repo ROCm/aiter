@@ -2628,6 +2628,25 @@ def test_fhmoe_aot_replays_dedicated_rows():
     }
 
 
+@pytest.mark.parametrize(
+    "table", ("model_configs/gptoss_fp8fp4_tuned_fmoe.csv", "tuned_grouped_fmoe.csv")
+)
+def test_moe_aot_replays_swiglu_bias_with_interleaved_weights(table: str):
+    from aiter.aot.flydsl.moe import parse_csv
+
+    configs = Path(__file__).resolve().parents[1] / "aiter/configs"
+    variants = {
+        (job["gate_mode"], job["bias"])
+        for job in parse_csv(str(configs / table))
+        if job["act_type"] == "ActivationType.Swiglu"
+    }
+    # GPT-OSS a8w4 on gfx950, and every gfx1250 caller, pass gate/up-interleaved
+    # weights; Swiglu callers also pass expert bias, which is a FlyDSL compile key.
+    assert {
+        (GateMode.INTERLEAVE.value, bias) for bias in ("none", "both", "stage1")
+    } <= variants
+
+
 def test_fhmoe_aot_import_is_safe_in_lightweight_mode():
     import subprocess
     import sys

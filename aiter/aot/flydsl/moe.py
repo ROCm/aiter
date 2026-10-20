@@ -214,8 +214,6 @@ def _variants(row: dict) -> list[dict]:
         # passed explicitly.
         betas += [(1.0, 1.0), (DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA)]
     # Callers behind an EP dispatch pass the received token count.
-    # CK-Tile's interleaved split-k epilogue cannot apply bias (#6478), so
-    # drop INTERLEAVE x bias rather than widening that into a runtime skip.
     return [
         {
             "gate_mode": gate_mode.value,
@@ -230,7 +228,6 @@ def _variants(row: dict) -> list[dict]:
         for bias in biases
         for beta, linear_beta in betas
         for clamp_shared in clamps
-        if bias == "none" or gate_mode != GateMode.INTERLEAVE
     ]
 
 

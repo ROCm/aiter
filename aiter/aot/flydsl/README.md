@@ -39,8 +39,7 @@ need no AOT change.
 - Caller-side choices a row does not fix are enumerated: expert bias for
   Swiglu + MXFP4 rows only (the GPT-OSS path; on both stages, and on stage 1
   alone, since a stage-2 bias makes the runtime re-select configs whose stage 2
-  cannot take one — never paired with a gate/up-interleaved layout, which
-  CK-Tile's split-k epilogue cannot bias), both gate/up layouts for MXMOE
+  cannot take one), both gate/up layouts for MXMOE
   stage-1 rows, the default and model SiTUv2 betas, a received token count
   (`num_local_tokens`, as callers behind an EP dispatch pass), and for FHMoE
   rows with MXFP8 routed weights both values of `clamp_shared`, which the
