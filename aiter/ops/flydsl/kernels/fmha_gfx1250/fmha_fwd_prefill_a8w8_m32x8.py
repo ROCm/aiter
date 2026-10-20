@@ -557,6 +557,7 @@ def _softmax(
     q_max_list=None,
     q_min_list=None,
     kv_len=None,
+    s_scale=None,
 ):
     """Online-softmax update for one KV tile, for ALL num_q_tiles q-WMMA-tiles this wave owns.
 
@@ -676,6 +677,11 @@ def _softmax(
             svec = fx.Vector(_ir(s[kv_frag_idx]))
             for i in range(8):
                 sval = fx.Float32(svec[i])
+                if s_scale is not None:
+                    # 8-bit Q cannot carry softmax_scale*LOG2E, so S is put into log2
+                    # units here instead. Folded in before the mask so the -inf lanes
+                    # stay -inf and the max/sum trees below see log2 units throughout.
+                    sval = sval * s_scale
                 if q_max is not None or q_min is not None or kv_len is not None:
                     kv_pos = _kv_pos_halves[
                         kv_frag_idx >= num_kv_frags // 2
@@ -1075,9 +1081,9 @@ def _attention_prologue(
     )
 
     # softmax_scale*LOG2E, folded into Q by the loader's bf16 multiply.
-    # TODO(a8w8): 8-bit Q cannot carry the scale (no f8 multiply), so S must be scaled
-    # after the QK gemm instead. Until that lands 8-bit results are NUMERICALLY WRONG.
+    # 8-bit Q cannot carry the scale (no f8 multiply), so softmax applies it to S.
     _q_scale = None
+    _s_scale = softmax_scale * fx.Float32(LOG2E)
 
     # K/V staging: N_KV_PP slots of 2 LDS_CHUNK_BYTES chunks each, every tile split 2-way
     # along n_block into chunks 6 apart (different 64 KB segments). Q time-shares slot 1's
@@ -1487,6 +1493,8 @@ def _attention_core_multi_kv_tiles(
     _kv_valid = prologue["kv_valid"]
     _kv_drain = prologue["kv_drain"]
     q_frags = prologue["q_frags"]
+    # 8-bit Q cannot carry the scale (no f8 multiply); softmax applies it to S.
+    _s_scale = softmax_scale * fx.Float32(LOG2E)
 
     def _get_kv_desc(slot, row0, valid):
         """This half's BufferOpDescriptor for one tile: LO issues every K copy, HI every
@@ -1779,6 +1787,7 @@ def _attention_core_multi_kv_tiles(
                 q_max_list=q_max_list,
                 q_min_list=q_min_list,
                 kv_len=kv_len,
+                s_scale=_s_scale,
             )
 
             # Rescale each q-tile's running O by this tile's corr. The leading half
@@ -2116,9 +2125,9 @@ def _attention_core_one_kv_tile(
     kv_head, q_head_idx, seq_idx = _packed_tile_indices(
         gqa_ratio, warp_idx, lane_idx, num_q_tiles_per_wave
     )
-    # TODO(a8w8): 8-bit Q cannot carry the scale (no f8 multiply), so S must be scaled
-    # after the QK gemm instead. Until that lands 8-bit results are NUMERICALLY WRONG.
+    # 8-bit Q cannot carry the scale (no f8 multiply), so softmax applies it to S.
     _q_scale = None
+    _s_scale = softmax_scale * fx.Float32(LOG2E)
     num_q_tiles = num_q_tiles_per_wave
 
     q_mgr, k_mgr, v_mgr = _build_managers(
@@ -2300,6 +2309,7 @@ def _attention_core_one_kv_tile(
             for q_tile_idx in range(num_q_tiles)
         ],
         kv_len=kv_len,
+        s_scale=_s_scale,
     )
     p_list = _convert_vectors(p_f32, P_DTYPE)
     _keepalive([v for pt in p_list for v in pt])
