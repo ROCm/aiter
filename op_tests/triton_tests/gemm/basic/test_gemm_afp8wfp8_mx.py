@@ -145,3 +145,127 @@ def test_gemm_afp8wfp8_mx_rejects_layout_config_keys():
         gemm_afp8wfp8_mx_preshuffle(
             x_k, w_k, xs_k, ws_k, config=dict(CLUSTER_CONFIG, SCALE_MODE=2)
         )
+
+
+# --- fp8 element formats and coarser e8m0 scale granularities ------------------------
+
+FP8_DTYPES = {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
+
+
+def generate_inputs_fmt(M, N, K, a_fmt, b_fmt, x_group, w_block, seed=0):
+    """fp8 x/w of the given formats, x scales per (1, x_group), w scales per w_block."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    x = (torch.rand((M, K), device="cuda", generator=g) * 4 - 2).to(FP8_DTYPES[a_fmt])
+    w = (torch.rand((N, K), device="cuda", generator=g) * 4 - 2).to(FP8_DTYPES[b_fmt])
+    xs = torch.randint(
+        124, 129, (M, K // x_group), dtype=torch.uint8, device="cuda", generator=g
+    )
+    bn, bk = w_block
+    ws = torch.randint(
+        124, 129, (-(-N // bn), K // bk), dtype=torch.uint8, device="cuda", generator=g
+    )
+    return x, w, xs, ws
+
+
+def reference_fmt(x, w, xs, ws, x_group, w_block):
+    N = w.shape[0]
+    bn, bk = w_block
+    xd = x.float() * torch.exp2(xs.float() - 127).repeat_interleave(x_group, 1)
+    wsd = (
+        torch.exp2(ws.float() - 127)
+        .repeat_interleave(bn, 0)[:N]
+        .repeat_interleave(bk, 1)
+    )
+    return xd @ (w.float() * wsd).T
+
+
+def run_fmt(
+    M, N, K, a_fmt, b_fmt, x_group, w_block, scale_layout="n32k4", x_preshuffled=False
+):
+    x, w, xs, ws = generate_inputs_fmt(M, N, K, a_fmt, b_fmt, x_group, w_block)
+    if x_group == 128:
+        xs_k = xs.T.contiguous()  # compact column-major (K // 128, M)
+    elif M < 32:
+        xs_k = xs.contiguous()
+    else:
+        xs_k = layout_scales(xs, scale_layout)
+    # MX 1x32 w scales are laid out; coarse blocks go in compact, as in the checkpoint
+    ws_k = layout_scales(ws, scale_layout) if w_block == (1, 32) else ws
+    w_k = shuffle_weight(w.view(torch.uint8)).reshape(N // 16, K * 16).view(w.dtype)
+    x_k = shuffle_weight(x.view(torch.uint8)).view(x.dtype) if x_preshuffled else x
+    y = gemm_afp8wfp8_mx_preshuffle(
+        x_k,
+        w_k,
+        xs_k,
+        ws_k,
+        torch.bfloat16,
+        x_preshuffled=x_preshuffled,
+        scale_layout=scale_layout,
+        x_scale_group_size=x_group,
+        w_scale_block_size=w_block,
+    )
+    check(y, reference_fmt(x, w, xs, ws, x_group, w_block))
+
+
+@pytest.mark.parametrize(
+    "a_fmt, b_fmt",
+    [("e4m3", "e4m3"), ("e5m2", "e5m2"), ("e4m3", "e5m2"), ("e5m2", "e4m3")],
+)
+@pytest.mark.parametrize(
+    "M, N, K", [(16, 4096, 1024), (256, 2112, 2048), (2048, 4096, 2048)]
+)
+def test_gemm_afp8wfp8_mx_formats(M, N, K, a_fmt, b_fmt):
+    run_fmt(M, N, K, a_fmt, b_fmt, 32, (1, 32))
+
+
+@pytest.mark.parametrize("w_block", [(1, 32), (32, 32), (128, 128)])
+@pytest.mark.parametrize(
+    "M, N, K",
+    [
+        (1, 1024, 256),
+        (31, 7168, 512),
+        (150, 2112, 1024),
+        (256, 8192, 2048),
+        (4096, 4096, 4096),
+    ],
+)
+@pytest.mark.parametrize("x_preshuffled", [False, True])
+def test_gemm_afp8wfp8_mx_x1x128(M, N, K, w_block, x_preshuffled):
+    """DeepSeek-V3.1-style UE8M0: 1x128 x scales (compact column-major) x coarse w scales."""
+    if x_preshuffled and M % 16:
+        pytest.skip("x_preshuffled needs M % 16 == 0")
+    run_fmt(M, N, K, "e4m3", "e4m3", 128, w_block, x_preshuffled=x_preshuffled)
+
+
+@pytest.mark.parametrize("w_block", [(32, 32), (128, 128)])
+@pytest.mark.parametrize("scale_layout", ["n32k4", "128row"])
+@pytest.mark.parametrize("M, N, K", [(31, 1024, 1024), (2048, 7168, 4096)])
+def test_gemm_afp8wfp8_mx_w_blocks(M, N, K, w_block, scale_layout):
+    run_fmt(M, N, K, "e4m3", "e4m3", 32, w_block, scale_layout=scale_layout)
+
+
+def test_gemm_afp8wfp8_mx_rejects_bad_args():
+    x, w, xs, ws = generate_inputs_fmt(256, 256, 256, "e4m3", "e4m3", 128, (128, 128))
+    w_k = shuffle_weight(w.view(torch.uint8)).reshape(16, 256 * 16)
+    xs_k = xs.T.contiguous()
+    with pytest.raises(ValueError):
+        gemm_afp8wfp8_mx_preshuffle(
+            x, w_k, xs_k, ws, x_scale_group_size=64, w_scale_block_size=(128, 128)
+        )
+    with pytest.raises(AssertionError):  # 1x128 x scales must be (K // 128, M)
+        gemm_afp8wfp8_mx_preshuffle(
+            x, w_k, xs, ws, x_scale_group_size=128, w_scale_block_size=(128, 128)
+        )
+    with pytest.raises(ValueError):  # unsupported w block
+        gemm_afp8wfp8_mx_preshuffle(
+            x, w_k, xs_k, ws, x_scale_group_size=128, w_scale_block_size=(64, 64)
+        )
+    with pytest.raises(ValueError):  # compact w scales of the wrong shape
+        gemm_afp8wfp8_mx_preshuffle(
+            x,
+            w_k,
+            xs_k,
+            ws.T.contiguous()[:1],
+            x_scale_group_size=128,
+            w_scale_block_size=(128, 128),
+        )
