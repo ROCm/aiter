@@ -31,7 +31,8 @@ def hipb_extension():
 @pytest.mark.parametrize("rows", [1, 32])
 @pytest.mark.parametrize("mode", [ScaleMode.SCALAR_32F, ScaleMode.OUTER_VEC_32F])
 @pytest.mark.parametrize("explicit", [(), ("A",), ("B",), ("A", "B")])
-def test_hipb_mm_scale_mode_inference(rows, mode, explicit):
+@pytest.mark.parametrize("use_findallsols", [False, True])
+def test_hipb_mm_scale_mode_inference(rows, mode, explicit, use_findallsols: bool):
     x = torch.randint(-2, 3, (rows, 256), device="cuda").to(dtypes.fp8)
     w = torch.randint(-2, 3, (128, 256), device="cuda").to(dtypes.fp8)
     scale_a = torch.full((1, 1), 0.25, device="cuda")
@@ -40,10 +41,22 @@ def test_hipb_mm_scale_mode_inference(rows, mode, explicit):
         scale_a = torch.exp2(torch.arange(rows, device="cuda").float() % 3 - 1)[:, None]
         scale_b = torch.exp2(torch.arange(128, device="cuda").float() % 3 - 1)[None, :]
     modes = {f"scale{operand}_mode": mode for operand in explicit}
+    solution_index = -1
+    if use_findallsols:
+        solutions = aiter.hipb_findallsols(
+            x,
+            w.t(),
+            out_dtype=dtypes.bf16,
+            scaleA=scale_a,
+            scaleB=scale_b,
+            **modes,
+        )
+        assert solutions, "hipb_findallsols returned no solutions"
+        solution_index = solutions[0]
     out = aiter.hipb_mm(
         x,
         w.t(),
-        solution_index=-1,
+        solution_index=solution_index,
         out_dtype=dtypes.bf16,
         scaleA=scale_a,
         scaleB=scale_b,
@@ -65,8 +78,15 @@ def test_hipb_mm_scale_mode_inference(rows, mode, explicit):
     ],
     ids=["scalar-1-row", "scalar-32-rows", "rowwise-1-row", "rowwise-32-rows"],
 )
+@pytest.mark.parametrize(
+    "op, op_kwargs",
+    [
+        pytest.param(aiter.hipb_mm, {"solution_index": -1}, id="mm"),
+        pytest.param(aiter.hipb_findallsols, {}, id="findallsols"),
+    ],
+)
 def test_hipb_mm_rejects_scale_mode_conflict(
-    rows, scale_a_shape, scale_b_shape, provided, operand
+    rows, scale_a_shape, scale_b_shape, provided, operand, op, op_kwargs
 ):
     x = torch.zeros((rows, 256), device="cuda", dtype=dtypes.fp8)
     w = torch.zeros((128, 256), device="cuda", dtype=dtypes.fp8)
@@ -75,13 +95,13 @@ def test_hipb_mm_rejects_scale_mode_conflict(
     with pytest.raises(
         RuntimeError, match=f"scale{operand}_mode disagrees with inferred"
     ):
-        aiter.hipb_mm(
+        op(
             x,
             w.t(),
-            solution_index=-1,
             out_dtype=dtypes.bf16,
             scaleA=scale_a,
             scaleB=scale_b,
+            **op_kwargs,
             **{f"scale{operand}_mode": provided},
         )
 
@@ -171,8 +191,15 @@ def test_hipb_mm_rejects_unrepresentable_tuning_modes(
         "unswizzled-short-rows-A",
     ],
 )
+@pytest.mark.parametrize(
+    "op, op_kwargs",
+    [
+        pytest.param(aiter.hipb_mm, {"solution_index": -1}, id="mm"),
+        pytest.param(aiter.hipb_findallsols, {}, id="findallsols"),
+    ],
+)
 def test_hipb_mm_rejects_invalid_scale_shape(
-    mode, scale_a_shape, scale_b_shape, operand
+    mode, scale_a_shape, scale_b_shape, operand, op, op_kwargs
 ):
     if mode == ScaleMode.BLK32_UE8M0_32_8_EXT and get_module(
         "module_hipbsolgemm"
@@ -183,15 +210,15 @@ def test_hipb_mm_rejects_invalid_scale_shape(
     scale_a = torch.ones(scale_a_shape, device="cuda", dtype=dtypes.u8)
     scale_b = torch.ones(scale_b_shape, device="cuda", dtype=dtypes.u8)
     with pytest.raises(RuntimeError, match=f"scale{operand} must have shape"):
-        aiter.hipb_mm(
+        op(
             x,
             w.t(),
-            solution_index=-1,
             out_dtype=dtypes.bf16,
             scaleA=scale_a,
             scaleB=scale_b,
             scaleA_mode=mode,
             scaleB_mode=mode,
+            **op_kwargs,
         )
 
 
