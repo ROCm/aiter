@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+# DeepSeek V4 end-to-end A/B on the MI350P box: aiter main vs main + PR 5670.
+# Run on the host, not inside a container (it drives docker).
+#
+#   ./e2e.sh build             # build both images from ./Dockerfile
+#   ./e2e.sh check             # preflight: images, vLLM all-reduce path, model
+#   ./e2e.sh run               # check, then the A/B benchmark, then the summary
+#   ./e2e.sh profile           # check, then one torch-profiled run per server
+#   ./e2e.sh summary <dir>     # summary table of a finished run
+#   ./e2e.sh all               # build + run
+#
+# Settings are environment variables, e.g. TPS="8" ./e2e.sh run. See below.
+#
+# For every (TP, image) "run" starts one server, checks that it answers,
+# records which all-reduce path vLLM took, runs the benchmark scenarios and
+# stops the server. The images alternate per TP so that slow drift does not
+# favour one of them.
+set -euo pipefail
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+MODEL=${MODEL:-deepseek-ai/DeepSeek-V4-Pro-0813}
+# The model is large: point HF_HUB at a disk with room for it, or at an
+# existing hub cache that already holds it.
+HF_HUB=${HF_HUB:-${HF_HOME:-$HOME/.cache/huggingface}/hub}
+CACHE_ROOT=${CACHE_ROOT:-$HOME/.cache/vllm-e2e}
+IMAGE_A=${IMAGE_A:-vllm-aiter-main}   # baseline: aiter main
+IMAGE_B=${IMAGE_B:-vllm-aiter-ar}     # aiter main + PR 5670
+TPS=${TPS:-"8 4 2"}
+GPUS=${GPUS:-}                        # default 0..TP-1
+PORT=${PORT:-8001}
+READY_TIMEOUT=${READY_TIMEOUT:-7200}
+# "input:output:concurrencies". The first one is the recipe's prefill-heavy
+# case. The decode-heavy cases are where the small all-reduce payloads are.
+SCENARIOS=${SCENARIOS:-"60000:100:1,4 1024:1024:1,4,16,64 8192:1024:4,16"}
+PROMPTS_PER_CONC=${PROMPTS_PER_CONC:-4}   # num_prompts = max(8, conc * this)
+NAME=dsv4-e2e
+
+MODE=bench
+RUN_DIR=
+
+log() {
+    local line="[$(date +%H:%M:%S)] $*"
+    echo "$line"
+    [ -n "$RUN_DIR" ] && echo "$line" >>"$RUN_DIR/run.log"
+    return 0
+}
+die() { log "ERROR: $*"; exit 1; }
+
+stop_server() { docker rm -f "$NAME" >/dev/null 2>&1 || true; }
+
+# ---------------------------------------------------------------- build ----
+
+cmd_build() {
+    log "building $IMAGE_B (main + PR 5670)"
+    docker build -t "$IMAGE_B" -f "$HERE/Dockerfile" "$HERE"
+    log "building $IMAGE_A (main only)"
+    docker build -t "$IMAGE_A" --build-arg WITH_ALLREDUCE=0 -f "$HERE/Dockerfile" "$HERE"
+}
+
+# ---------------------------------------------------------------- check ----
+
+in_image() {  # image cmd...
+    local image=$1
+    shift
+    docker run --rm --entrypoint "" "$image" "$@"
+}
+
+cmd_check() {
+    command -v docker >/dev/null || die "docker not found: run this on the host"
+    local ok=1 image
+    for image in "$IMAGE_A" "$IMAGE_B"; do
+        docker image inspect "$image" >/dev/null 2>&1 \
+            || die "image $image missing: ./e2e.sh build"
+        log "$image: $(in_image "$image" sh -c \
+            'echo "aiter $(git -C /opt/aiter log -1 --format=%h), AITER_FLY_AR=$AITER_FLY_AR, vllm $(python3 -c "import vllm; print(vllm.__version__)" 2>/dev/null)"')"
+        # vLLM reaches aiter's CustomAllreduce (and through it the FlyDSL
+        # one-shot and fused AR+RMSNorm) only if it has this switch.
+        if ! in_image "$image" python3 -c \
+            "import vllm.envs as e, sys; sys.exit(0 if e.VLLM_ROCM_USE_AITER_CUSTOM_AR else 1)" 2>/dev/null; then
+            log "WARNING $image: vLLM has no VLLM_ROCM_USE_AITER_CUSTOM_AR (or it is off);" \
+                "it will not call aiter's all-reduce, so the A/B measures nothing"
+            ok=0
+        fi
+    done
+    in_image "$IMAGE_B" sh -c 'AITER_AOT_IMPORT=1 python3 -c "from aiter.ops.flydsl import allreduce_policy"' \
+        || die "$IMAGE_B: FlyDSL all-reduce does not import"
+    [ "$(in_image "$IMAGE_A" sh -c 'echo $AITER_FLY_AR')" = 0 ] || die "$IMAGE_A should have AITER_FLY_AR=0"
+    [ "$(in_image "$IMAGE_B" sh -c 'echo $AITER_FLY_AR')" = 1 ] || die "$IMAGE_B should have AITER_FLY_AR=1"
+
+    local d
+    for d in "$HF_HUB" "$CACHE_ROOT"; do
+        mkdir -p "$d" 2>/dev/null && [ -w "$d" ] \
+            || die "$d is not writable: set HF_HUB / CACHE_ROOT to a writable directory"
+    done
+    local model_dir="$HF_HUB/models--${MODEL//\//--}"
+    if [ -d "$model_dir" ]; then
+        log "model cached: $model_dir ($(du -sh "$model_dir" 2>/dev/null | cut -f1))"
+    else
+        log "WARNING model not in $HF_HUB ($(df -h --output=avail "$HF_HUB" | tail -1 | tr -d ' ') free)," \
+            "the first server start downloads it (set HF_TOKEN)"
+    fi
+    if docker ps -a -q -f name="^$NAME$" | grep -q .; then
+        log "WARNING a $NAME container exists; it will be replaced"
+    fi
+    [ $ok = 1 ] && log "preflight ok" || log "preflight finished with warnings"
+}
+
+# ------------------------------------------------------------------ run ----
+
+start_server() {  # image tag tp out_dir
+    local image=$1 tag=$2 tp=$3 out=$4
+    local gpus=${GPUS:-$(seq -s, 0 $((tp - 1)))}
+    local profile_args=()
+    if [ "$MODE" = profile ]; then
+        profile_args=(
+            --profiler-config.profiler torch
+            --profiler-config.torch_profiler_dir /traces
+            --profiler-config.torch_profiler_record_shapes true
+            --profiler-config.torch_profiler_with_stack false
+        )
+    fi
+    # Per-image cache: torch.compile, triton and FlyDSL caches survive restarts,
+    # and the two aiter builds never share compiled artifacts.
+    mkdir -p "$CACHE_ROOT/$tag" "$out/traces"
+
+    # The image sets VLLM_ROCM_USE_AITER*, AITER_FLY_AR* and
+    # AITER_QUICK_REDUCE_QUANTIZATION; only the run-specific settings go here.
+    docker run -d \
+        --name "$NAME" \
+        --entrypoint "" \
+        -e HIP_VISIBLE_DEVICES="$gpus" \
+        -e VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=INT4 \
+        -e HF_TOKEN="${HF_TOKEN:-}" \
+        --network host --ipc host \
+        -v "$CACHE_ROOT/$tag":/root/.cache \
+        -v "$HF_HUB":/root/.cache/huggingface/hub \
+        -v "$out/traces":/traces \
+        --device /dev/dri:/dev/dri --device /dev/kfd:/dev/kfd \
+        --security-opt seccomp=unconfined \
+        --shm-size 128G \
+        "$image" \
+        vllm serve "$MODEL" \
+            --async_scheduling \
+            --no-enable_log_requests \
+            --block_size 256 \
+            --max-num-batched-tokens 8192 \
+            --compilation_config '{"mode": 3, "cudagraph_mode": "FULL_DECODE_ONLY"}' \
+            --distributed-executor-backend mp \
+            --gpu_memory_utilization 0.95 \
+            --no_enable_prefix_caching \
+            --port "$PORT" \
+            --tensor_parallel_size "$tp" \
+            --trust_remote_code \
+            --kv-cache-dtype fp8_e4m3 \
+            --tokenizer-mode deepseek_v4 \
+            --tool-call-parser deepseek_v4 \
+            --enable-auto-tool-choice \
+            --reasoning-parser deepseek_v4 \
+            "${profile_args[@]}" >/dev/null
+    docker logs -f "$NAME" >"$out/server.log" 2>&1 &
+}
+
+wait_ready() {
+    local t=0
+    until curl -sf "localhost:$PORT/health" >/dev/null; do
+        if ! docker ps -q -f name="^$NAME$" | grep -q .; then
+            log "server exited during startup, see server.log"
+            return 1
+        fi
+        if [ $t -ge "$READY_TIMEOUT" ]; then
+            log "server not ready after ${t}s"
+            return 1
+        fi
+        sleep 15
+        t=$((t + 15))
+    done
+    log "ready after ${t}s"
+}
+
+smoke() {  # out_dir
+    curl -sf "localhost:$PORT/v1/completions" -H 'Content-Type: application/json' \
+        -d "{\"model\": \"$MODEL\", \"prompt\": \"The capital of France is\", \"max_tokens\": 32, \"temperature\": 0}" \
+        >"$1/smoke.json" || return 1
+    log "smoke: $(grep -o '"text": *"[^"]*"' "$1/smoke.json" | head -1)"
+}
+
+record_ar_path() {  # out_dir
+    # The all-reduce backends vLLM enabled, and what aiter's FlyDSL code said.
+    grep -iE "all.?reduce|quick.?reduce|flydsl|fly_ar|AITER_CUSTOM|QUICK_REDUCE" "$1/server.log" \
+        | grep -v "^DEBUG" | sort | uniq -c | sort -rn >"$1/ar_path.txt" || true
+    log "all-reduce log lines: $(wc -l <"$1/ar_path.txt") ($1/ar_path.txt)"
+}
+
+bench() {  # in out conc out_dir [extra args]
+    local in=$1 outl=$2 conc=$3 dir=$4
+    shift 4
+    local n=$((conc * PROMPTS_PER_CONC))
+    [ $n -lt 8 ] && n=8
+    local file="bench_${in}x${outl}_c${conc}.json"
+    docker exec "$NAME" vllm bench serve \
+        --backend vllm \
+        --model "$MODEL" \
+        --port "$PORT" \
+        --dataset-name random \
+        --random-input-len "$in" \
+        --random-output-len "$outl" \
+        --random-range-ratio 0.8 \
+        --ignore-eos \
+        --request-rate inf \
+        --max-concurrency "$conc" \
+        --num-prompts "$n" \
+        --num-warmups "$conc" \
+        --seed 15 \
+        --percentile-metrics ttft,tpot,itl,e2el \
+        --save-result \
+        --result-dir /traces \
+        --result-filename "$file" \
+        "$@" >>"$dir/bench.log" 2>&1 || return 1
+    mv "$dir/traces/$file" "$dir/"
+}
+
+run_one() {  # image tag tp
+    local image=$1 tag=$2 tp=$3
+    local out="$RUN_DIR/${tag}_tp${tp}"
+    mkdir -p "$out"
+    log "=== $tag TP=$tp ($image $(docker image inspect -f '{{.Id}}' "$image" | cut -c8-19))"
+    stop_server
+    start_server "$image" "$tag" "$tp" "$out"
+    if ! wait_ready; then
+        stop_server
+        return 0
+    fi
+    smoke "$out" || log "smoke request FAILED"
+    record_ar_path "$out"
+    if [ "$MODE" = profile ]; then
+        bench 60000 100 4 "$out" --profile || log "profile run FAILED"
+    else
+        local s in outl concs c
+        for s in $SCENARIOS; do
+            IFS=: read -r in outl concs <<<"$s"
+            for c in ${concs//,/ }; do
+                log "bench ${in}x${outl} c=$c"
+                bench "$in" "$outl" "$c" "$out" || log "bench ${in}x${outl} c=$c FAILED, see bench.log"
+            done
+        done
+    fi
+    record_ar_path "$out"   # again: the fused engines may log after warmup
+    stop_server
+}
+
+cmd_run() {
+    RUN_DIR=${RUN_DIR_OVERRIDE:-$HERE/results/$(date +%Y%m%d-%H%M%S)-$MODE}
+    mkdir -p "$RUN_DIR"
+    trap stop_server EXIT
+    cmd_check
+    log "run dir $RUN_DIR, mode $MODE, TPs $TPS"
+    local i=0 tp
+    for tp in $TPS; do
+        if [ $((i % 2)) -eq 0 ]; then
+            run_one "$IMAGE_A" main "$tp"; run_one "$IMAGE_B" ar "$tp"
+        else
+            run_one "$IMAGE_B" ar "$tp"; run_one "$IMAGE_A" main "$tp"
+        fi
+        i=$((i + 1))
+    done
+    if [ "$MODE" = bench ]; then
+        cmd_summary "$RUN_DIR" | tee "$RUN_DIR/summary.md"
+    else
+        log "traces under $RUN_DIR/*/traces"
+    fi
+}
+
+# -------------------------------------------------------------- summary ----
+
+SUMMARY_PY='
+import json, re, sys
+from pathlib import Path
+
+METRICS = [("median_ttft_ms", "TTFT ms", -1),
+           ("median_tpot_ms", "TPOT ms", -1),
+           ("output_throughput", "out tok/s", 1)]
+
+rows = {}
+for f in Path(sys.argv[1]).glob("*_tp*/bench_*.json"):
+    tag, tp = re.match(r"(\w+)_tp(\d+)", f.parent.name).groups()
+    rows.setdefault((int(tp), f.stem[len("bench_"):]), {})[tag] = json.loads(f.read_text())
+
+def order(item):
+    (tp, scen), _ = item
+    shape, conc = scen.split("_c")
+    i, o = shape.split("x")
+    return (-tp, int(i), int(o), int(conc))
+
+head = ["TP", "scenario"]
+for _, name, _ in METRICS:
+    head += [name + " main", name + " ar", "delta"]
+print("| " + " | ".join(head) + " |")
+print("|" + "---|" * len(head))
+for (tp, scen), r in sorted(rows.items(), key=order):
+    cells = [str(tp), scen]
+    for m, _, sign in METRICS:
+        a, b = r.get("main", {}).get(m), r.get("ar", {}).get(m)
+        cells += ["%.1f" % a if a else "-", "%.1f" % b if b else "-"]
+        # Positive delta = ar is better.
+        cells.append("%+.1f%%" % (sign * (b - a) / a * 100) if a and b else "-")
+    print("| " + " | ".join(cells) + " |")
+'
+
+cmd_summary() {  # run_dir
+    local dir
+    dir=$(cd "${1:?usage: ./e2e.sh summary <run dir>}" && pwd)
+    if command -v python3 >/dev/null; then
+        python3 -c "$SUMMARY_PY" "$dir"
+    else
+        docker run --rm --entrypoint "" -v "$dir":/r "$IMAGE_A" python3 -c "$SUMMARY_PY" /r
+    fi
+}
+
+# ----------------------------------------------------------------- main ----
+
+case "${1:-}" in
+    build) cmd_build ;;
+    check) cmd_check ;;
+    run) MODE=bench; cmd_run ;;
+    profile) MODE=profile; cmd_run ;;
+    summary) cmd_summary "${2:-}" ;;
+    all) cmd_build; MODE=bench; cmd_run ;;
+    *) sed -n '2,13p' "$0"; exit 1 ;;
+esac
