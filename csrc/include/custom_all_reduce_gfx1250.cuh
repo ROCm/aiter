@@ -1250,7 +1250,12 @@ public:
         const size_t bytes = (size_t)numel * sizeof(T);
         const size_t nPk   = bytes >> 3; // 8 payload bytes per packet
 
-        const int threads = (bytes < 65536) ? 512 : 256;
+        // One block size for every message: the per-block epoch flags are only
+        // valid while each packet keeps the same owning (block, thread) across
+        // launches. With a size-dependent block size, a rank that runs ahead can
+        // overwrite a line its peer has not consumed yet, so the peer reads the
+        // wrong epoch's data or spins on a flag that never arrives.
+        constexpr int threads = 512;
         int blocks = std::min<int>(kMaxBlocks, (int)((nPk + threads - 1) / threads));
         if(blocks < 1)
             blocks = 1;
