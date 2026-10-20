@@ -4,6 +4,7 @@
 import functools
 import os
 import re
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
@@ -20,6 +21,7 @@ from aiter import (
     fused_dynamic_mxfp8_quant_moe_sort,
     logger,
     mxfp4_moe_sort_fwd,
+    op_recorder,
 )
 from aiter import get_hip_quant as get_quant
 from aiter.fhmoe_contract import (
@@ -1081,6 +1083,79 @@ def resolve_activation_dtype(
     return q_dtype_a
 
 
+def _record_session_info() -> dict:
+    """Report framework monkeypatches of the functions fused_moe relies on."""
+    module = sys.modules[__name__]
+    patched = {}
+    for name, original in globals().get("_RECORD_ORIGINALS", {}).items():
+        current = getattr(module, name, None)
+        if current is not original:
+            patched[name] = (
+                f"{getattr(current, '__module__', '?')}."
+                f"{getattr(current, '__qualname__', type(current).__name__)}"
+            )
+    return {"patched": patched}
+
+
+def _record_config_files() -> dict:
+    files = {"AITER_CONFIG_FMOE": AITER_CONFIGS.AITER_CONFIG_FMOE_FILE}
+    # Only the FHMoE shared-expert path reads this one; recording goes on without it.
+    try:
+        files["AITER_CONFIG_FHMOE"] = AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[aiter record] no FHMoE tuned config: {exc!r}")
+    return files
+
+
+FUSED_MOE_RECORD_SPEC = op_recorder.OpSpec(
+    name="fused_moe",
+    payload_args=("topk_weight",),
+    session_info=_record_session_info,
+    config_files=_record_config_files,
+)
+
+
+def _describe_moe_stage(stage) -> dict | None:
+    if stage is None:
+        return None
+    func = getattr(stage, "func", stage)
+    info = {"func": getattr(func, "__name__", type(func).__name__)}
+    for key, value in (getattr(stage, "keywords", None) or {}).items():
+        if isinstance(value, (bool, int, float, str)):
+            info[key] = value
+    return info
+
+
+def _describe_moe_metadata(metadata) -> dict:
+    """Dispatch decision of one fused_moe call, for AITER_RECORD and replay."""
+    stages = [
+        _describe_moe_stage(metadata.stage1),
+        _describe_moe_stage(metadata.stage2),
+    ]
+    kernels = [s.get("kernelName") or s["func"] for s in stages if s is not None]
+    full_impl = None
+    if metadata.full_impl is not None:
+        full_impl = (
+            getattr(metadata.full_impl, "__name__", None)
+            or repr(metadata.full_impl)[:200]
+        )
+        kernels = [f"full_impl:{full_impl}"] + kernels
+    return {
+        "op": "fused_moe",
+        "kernels": kernels,
+        "run_1stage": bool(metadata.run_1stage),
+        "flat": bool(metadata.flat),
+        "block_m": int(metadata.block_m),
+        "ksplit": int(metadata.ksplit),
+        "stage1": stages[0],
+        "stage2": stages[1],
+        "full_impl": full_impl,
+    }
+
+
+# With AITER_RECORD set, calls are written to a bundle that
+# op_tests/replay/replay_fused_moe.py replays; otherwise this is a no-op.
+@op_recorder.record_op(FUSED_MOE_RECORD_SPEC)
 def fused_moe(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -1715,6 +1790,8 @@ def _fused_moe_impl(
             f"kernel block size {metadata.block_m}"
         )
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
+    if op_recorder.dispatch_hook_active():
+        op_recorder.note_dispatch(_describe_moe_metadata(metadata))
     if metadata.full_impl is not None:
         full_output = metadata.full_impl(
             FusedMoeRequest(
@@ -5823,3 +5900,13 @@ def fused_topk(
     #     topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
     return topk_weights, topk_ids
+
+
+# Functions frameworks are known to monkeypatch (SGLang, ATOM plugins);
+# AITER_RECORD reports any that no longer point at these originals.
+_RECORD_ORIGINALS = {
+    "fused_moe": fused_moe,
+    "_moe_sorting_impl": _moe_sorting_impl,
+    "fused_dynamic_mxfp8_quant_moe_sort": fused_dynamic_mxfp8_quant_moe_sort,
+    "get_2stage_cfgs": get_2stage_cfgs,
+}
