@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import functools
 import itertools
 import math
 import shutil
@@ -16,10 +17,14 @@ from triton.testing import runtime
 
 from aiter.ops.triton.topk import topk as triton_topk
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_model_configs,
 )
 
@@ -262,10 +267,19 @@ def run_latency_memory(args):
                 print(f"?  {path.name} missing")
 
 
+def _generate_topk_pool_inputs(M, N):
+    return (torch.rand(M, N, device=DEVICE, dtype=torch.float32),)
+
+
+_TOPK_POOL_FIELDS = ["x"]
+
+
 def run_benchmark(args, x_vals_list):
     """
     Runs benchmark given the --model argument.
     """
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
     x_names = ["M", "N", "topk"]
 
     if args.metric == "time":
@@ -290,8 +304,15 @@ def run_benchmark(args, x_vals_list):
 
     @triton.testing.perf_report([benchmark])
     def bench_topk(M, N, topk, **kwargs):
-        x = torch.rand(M, N, device=DEVICE, dtype=torch.float32)
-        ms = triton.testing.do_bench(lambda: triton_topk(x, topk), warmup=25, rep=100)
+        pool_gen = functools.partial(_generate_topk_pool_inputs, M, N)
+        rot_bufs = generate_rotating_buffers_pool(
+            [pool_gen], [_TOPK_POOL_FIELDS], **kwargs_rot_bufs
+        )
+
+        def kernel_fn(x):
+            triton_topk(x, topk)
+
+        ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
         if args.metric == "time":
             return ms
         else:

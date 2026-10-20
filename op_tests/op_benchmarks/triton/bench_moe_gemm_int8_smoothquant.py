@@ -1,14 +1,36 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/bench/bench_mlp.py
+"""Benchmark the int8 SmoothQuant MoE MLP (two moe_gemm_int8_smoothquant calls).
+
+Each batch size is measured with `do_bench_aiter_triton` (a rotating-buffer
+CUDA graph replay) and reported as three rows, keyed by the `layer` column:
+
+  moe1   the gathered up projection alone   (N = dim2 / TP, K = dim1, + activation)
+  moe2   the scattered down projection alone (N = dim1, K = dim2 / TP / 2)
+  total  both back to back, i.e. the whole MLP
+
+`total` is not `moe1 + moe2`: an isolated projection replays the same kernel
+over and over, so its weights stay cache-resident in a way the real layer does
+not. Compare like with like.
+
+Weights are quantized to int8 once (per-output-channel scale); activations
+are SmoothQuant-quantized to int8 fresh before each GEMM (moe1's output is
+fp32, requantized before moe2 -- that requant is included in moe2's
+measurement, same as the reference this benchmark is modeled on).
+--preshuffled enables the MFMA-friendly weight tile layout.
+
+Everything except the GEMMs -- gating, routing, and the activation
+quantization that feeds each layer -- is built once outside the timed
+region, so the numbers cover the two projections and nothing else.
+"""
 
 import csv
+import functools
 import inspect
-import tempfile
 from itertools import chain
 from pathlib import Path
 
 import torch
-import triton.profiler as proton
 
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_int8_smoothquant import (
@@ -20,46 +42,26 @@ from aiter.ops.triton.moe.quant_moe import (
     quantize_weights_int8,
     smoothquant_quantize,
 )
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
+)
 
-
-def parse_profile(profile_path, useful_op_regex, reps):
-    """
-    construct a PerfRecord from a (proton) profile path and a regex for useful operations
-    """
-    from triton.profiler import viewer
-
-    gf, _, _, _ = viewer.read(profile_path)
-    useful = gf.filter(
-        f"MATCH ('*', c) WHERE c.'name' =~ '{useful_op_regex}' AND c IS LEAF"
-    ).dataframe
-    bytes_ = int(useful["bytes"].sum())
-    flops = int(
-        sum(useful[[c for c in ["flops8", "flops16"] if c in useful.columns]].sum())
-    )
-    allops = gf.filter("MATCH ('*', c) WHERE c IS LEAF").dataframe
-    total_time_ns = allops["time (ns)"].sum()
-    kernel_time_ns = useful["time (ns)"].sum()
-    return {
-        "total_time_ns": total_time_ns,
-        "kernel_time_ns": kernel_time_ns,
-        "flops": flops,
-        "bytes": bytes_,
-        "reps": reps,
-    }
+LAYERS = ("moe1", "moe2", "total")
 
 
 def compute_roofline(
     *args, bench_fn, intensity_proxy_name, intensity_proxy_values, out_path, **kwargs
 ):
-    """
-    Sweeps intensity_proxy_values by injecting them into bench_fn, prints summary, and writes a CSV to out_path.
-    """
     if not isinstance(intensity_proxy_name, str):
         raise TypeError(
             "intensity_proxy must be a string naming a parameter in target_fn"
         )
-
     sig = inspect.signature(bench_fn)
     params = list(sig.parameters.values())
     if intensity_proxy_name not in sig.parameters:
@@ -68,82 +70,77 @@ def compute_roofline(
         )
     pos_index = [p.name for p in params].index(intensity_proxy_name)
 
-    def inject_proxy_and_call(val, args_, kwargs_):
-        args_list = list(args_)
+    def inject_proxy_and_call(val, args, kwargs):
+        args_list = list(args)
         args_list.insert(pos_index, val)
-        return bench_fn(*args_list, **kwargs_)
+        return bench_fn(*args_list, **kwargs)
+
+    perfs = []
+    print("=========================================")
+    print(f"{out_path}...")
+    print("=========================================")
+
+    for val in intensity_proxy_values:
+        perf = inject_proxy_and_call(val, args, kwargs)
+        perfs.append((val, perf))
+
+        groups = " | ".join(
+            f"{name} {lp['latency_ms'] * 1e3:.2f}us "
+            f"{lp['flops'] / lp['latency_ms'] * 1e-9:#.4g} TF/s "
+            f"{lp['bytes'] / lp['latency_ms'] * 1e-9:#.4g} TB/s"
+            for name, lp in perf["layers"].items()
+        )
+        print(
+            f"{intensity_proxy_name}: {val:5d} | {groups} | "
+            f"block_m={perf['block_m']} routed_experts={perf['routed_experts']}"
+        )
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    results: list[tuple[str, dict[str, int | float]]] = []
-    print("=========================================")
-    print(f"{out_path}...")
-    print("=========================================")
-    for val in intensity_proxy_values:
-        perf = inject_proxy_and_call(val, args, kwargs)
-        results.append((val, perf))
-
-        tflops = perf["flops"] / perf["kernel_time_ns"] * 1e-3
-        tbps = perf["bytes"] / perf["kernel_time_ns"] * 1e-3
-        total_latency_us = perf["total_time_ns"] / 1e3 / perf["reps"]
-        kernel_latency_us = perf["kernel_time_ns"] / 1e3 / perf["reps"]
-        print(
-            f"{intensity_proxy_name}: {val:5d} | "
-            f"Total latency (us): {total_latency_us:.2f} | "
-            f"Kernel latency (us): {kernel_latency_us:.2f} | "
-            f"TFLOPS: {tflops:#.4g} | "
-            f"TBPS: {tbps:.2f}"
-        )
-
     fieldnames = [
-        intensity_proxy_name,  # e.g. "batch"
-        "total_latency_us",
-        "kernel_latency_us",
+        intensity_proxy_name,
+        "layer",
+        "latency_us",
         "tflops",
         "tbps",
-        "total_time_ns",
-        "kernel_time_ns",
         "flops",
         "bytes",
-        "reps",
+        "block_m",
+        "routed_experts",
     ]
+
     with out_path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
-        for val, perf in results:
-            w.writerow(
-                {
-                    intensity_proxy_name: val,
-                    "total_latency_us": perf["total_time_ns"] / 1e3 / perf["reps"],
-                    "kernel_latency_us": perf["kernel_time_ns"] / 1e3 / perf["reps"],
-                    "tflops": perf["flops"] / perf["kernel_time_ns"] * 1e-3,
-                    "tbps": perf["bytes"] / perf["kernel_time_ns"] * 1e-3,
-                    "total_time_ns": perf["total_time_ns"],
-                    "kernel_time_ns": perf["kernel_time_ns"],
-                    "flops": perf["flops"],
-                    "bytes": perf["bytes"],
-                    "reps": perf["reps"],
-                }
-            )
+        for val, perf in perfs:
+            for name, lp in perf["layers"].items():
+                w.writerow(
+                    {
+                        intensity_proxy_name: val,
+                        "layer": name,
+                        "latency_us": lp["latency_ms"] * 1e3,
+                        "tflops": lp["flops"] / lp["latency_ms"] * 1e-9,
+                        "tbps": lp["bytes"] / lp["latency_ms"] * 1e-9,
+                        "flops": lp["flops"],
+                        "bytes": lp["bytes"],
+                        "block_m": perf["block_m"],
+                        "routed_experts": perf["routed_experts"],
+                    }
+                )
 
 
-def bench_mlp_single_weight_init(
-    batch,
-    dim1,
-    dim2,
-    n_expts_tot,
-    n_expts_act,
-    preshuffled,
-    x_dtype,
-    w_dtype,
-    TP,
-    op_regex,
+def _generate_mlp_pool_entry(
+    dim1, dim2, n_expts_tot, n_expts_act, preshuffled, TP, batch
 ):
-    rank = 0
-    dev = f"cuda:{rank}"
+    """Build one full weight-init + routing + activation set.
 
-    assert dim2 % TP == 0, f"{dim2=}, {TP=}, dim2 must be divisible by TP"
+    Pure setup, not measured. Each call is one rotating-buffer pool entry:
+    independent random weights and routing, so replaying through the pool
+    during timing defeats cache residency the same way a repeat-and-average
+    loop would, without the cost of a fresh CUDA graph capture each time.
+    """
+    dev = f"cuda:{torch.cuda.current_device()}"
 
     wg = torch.randn((dim1, n_expts_tot), device=dev, dtype=torch.bfloat16)
     w1 = torch.randn((n_expts_tot, dim1, dim2 // TP), device=dev, dtype=torch.bfloat16)
@@ -165,22 +162,126 @@ def bench_mlp_single_weight_init(
         w1_int8 = preshuffle_weights(w1_int8)
         w2_int8 = preshuffle_weights(w2_int8)
 
-    reps = 100
     x = torch.randn((batch, dim1), dtype=torch.bfloat16, device=dev)
-    xg = x
+    logits = gemm_a16w16(x, wg.T, bg)
+    rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
 
-    fpath = Path(tempfile.mktemp())
-    proton.start(str(fpath), hook="triton")
+    x1, x1_scale = smoothquant_quantize(x, fc1_smooth_scale)
+    y1 = moe_gemm_int8_smoothquant(
+        x1,
+        w1_int8,
+        x1_scale,
+        w1_scale,
+        None,
+        rdata,
+        gather_indx=gather_indx,
+        scatter_indx=None,
+        preshuffled=preshuffled,
+        out_dtype=torch.float32,
+        apply_activation=True,
+        limit=None,
+        swiglu_add_residual=False,
+    )
+    y1_bytes = y1.numel() * y1.element_size()
 
-    for _ in range(reps):
-        logits = gemm_a16w16(xg, wg.T, bg)
-        rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
+    x2, x2_scale = smoothquant_quantize(y1, fc2_smooth_scale)
+    y2 = moe_gemm_int8_smoothquant(
+        x2,
+        w2_int8,
+        x2_scale,
+        w2_scale,
+        None,
+        rdata,
+        gather_indx=None,
+        scatter_indx=scatter_indx,
+        preshuffled=preshuffled,
+        out_dtype=torch.bfloat16,
+        apply_activation=False,
+        swiglu_add_residual=False,
+    )
 
-        x, x_scale = smoothquant_quantize(x, fc1_smooth_scale)
-        x = moe_gemm_int8_smoothquant(
-            x,
-            w1_int8,
-            x_scale,
+    # -- analytic FLOPs / bytes: 2*M*N*K per GEMM, and activations +
+    # routed-expert weights + matmul output for traffic. The moe2 scatter
+    # reduction is not counted; its runtime is inside
+    # moe_gemm_int8_smoothquant and so is inside the measurement.
+    n_tokens = gather_indx.shape[0]  # routed rows == batch * n_expts_act
+    routed = int((rdata.expt_data.hist > 0).sum())  # experts that got >= 1 token
+
+    def w_bytes(w):
+        return (w.numel() * w.element_size() // n_expts_tot) * routed
+
+    def scale_bytes(scale):
+        return (scale.numel() * scale.element_size() // n_expts_tot) * routed
+
+    moe1_flops = 2 * n_tokens * (dim2 // TP) * dim1  # N = dim2 // TP, K = dim1
+    moe1_bytes = (
+        x1.numel() * x1.element_size()
+        + w_bytes(w1_int8)
+        + scale_bytes(w1_scale)
+        + y1_bytes
+    )
+    moe2_flops = 2 * n_tokens * dim1 * (dim2 // TP // 2)  # N = dim1, K = dim2/TP/2
+    # y2 is the scatter-compressed [batch, dim1] result; the GEMM writes the
+    # uncompressed [n_tokens, dim1] rows the reduction then combines.
+    moe2_bytes = (
+        x2.numel() * x2.element_size()
+        + w_bytes(w2_int8)
+        + scale_bytes(w2_scale)
+        + n_tokens * dim1 * y2.element_size()
+    )
+
+    meta = {
+        "moe1_flops": moe1_flops,
+        "moe1_bytes": moe1_bytes,
+        "moe2_flops": moe2_flops,
+        "moe2_bytes": moe2_bytes,
+        "routed": routed,
+        "block_m": rdata.block_m,
+    }
+    return (
+        x1,
+        w1_int8,
+        x1_scale,
+        w1_scale,
+        x2,
+        w2_int8,
+        x2_scale,
+        w2_scale,
+        rdata,
+        gather_indx,
+        scatter_indx,
+        meta,
+    )
+
+
+_MLP_POOL_FIELDS = [
+    "x1",
+    "w1",
+    "x1_scale",
+    "w1_scale",
+    "x2",
+    "w2",
+    "x2_scale",
+    "w2_scale",
+    "rdata",
+    "gather_indx",
+    "scatter_indx",
+    "meta",
+]
+
+
+def _make_moe_layer_fns(preshuffled):
+    """Parameterized moe1/moe2/total kernel callables for do_bench_aiter_triton.
+
+    Argument names match a rotating-buffer pool entry's keys (``**_``
+    absorbs the ones a given layer does not need).
+    """
+
+    def layer1(x1, w1, x1_scale, w1_scale, rdata, gather_indx, **_):
+        moe_gemm_int8_smoothquant(
+            x1,
+            w1,
+            x1_scale,
             w1_scale,
             None,
             rdata,
@@ -192,11 +293,12 @@ def bench_mlp_single_weight_init(
             limit=None,
             swiglu_add_residual=False,
         )
-        x, x_scale = smoothquant_quantize(x, fc2_smooth_scale)
-        x = moe_gemm_int8_smoothquant(
-            x,
-            w2_int8,
-            x_scale,
+
+    def layer2(x2, w2, x2_scale, w2_scale, rdata, scatter_indx, **_):
+        moe_gemm_int8_smoothquant(
+            x2,
+            w2,
+            x2_scale,
             w2_scale,
             None,
             rdata,
@@ -208,10 +310,11 @@ def bench_mlp_single_weight_init(
             swiglu_add_residual=False,
         )
 
-    proton.finalize()
-    return parse_profile(
-        fpath.with_suffix(".hatchet"), useful_op_regex=op_regex, reps=reps
-    )
+    def both(**kwargs):
+        layer1(**kwargs)
+        layer2(**kwargs)
+
+    return layer1, layer2, both
 
 
 def bench_mlp(
@@ -221,38 +324,75 @@ def bench_mlp(
     n_expts_tot,
     n_expts_act,
     preshuffled,
-    x_dtype,
-    w_dtype,
     TP,
-    op_regex,
+    layers=LAYERS,
     num_weight_inits=1,
+    kwargs_rot_bufs=None,
+    kwargs_do_bench_graph=None,
 ):
-    all_results = []
-    for _ in range(num_weight_inits):
-        result = bench_mlp_single_weight_init(
-            batch,
-            dim1,
-            dim2,
-            n_expts_tot,
-            n_expts_act,
-            preshuffled,
-            x_dtype,
-            w_dtype,
-            TP,
-            op_regex,
-        )
-        all_results.append(result)
+    kwargs_rot_bufs = kwargs_rot_bufs or {}
+    kwargs_do_bench_graph = kwargs_do_bench_graph or {}
+    assert dim2 % TP == 0, f"{dim2=}, {TP=}, dim2 must be divisible by TP"
+    assert layers, "at least one layer must be selected"
+    assert set(layers) <= set(LAYERS), f"unknown layer(s) in {layers=}"
 
-    num_runs = len(all_results)
-    aggregated = {
-        "total_time_ns": sum(r["total_time_ns"] for r in all_results) / num_runs,
-        "kernel_time_ns": sum(r["kernel_time_ns"] for r in all_results) / num_runs,
-        "flops": sum(r["flops"] for r in all_results) / num_runs,
-        "bytes": sum(r["bytes"] for r in all_results) / num_runs,
-        "reps": all_results[0]["reps"],
+    # -- rotating-buffer pool: each entry is one independent weight init +
+    # routing + activation set, replacing a repeat-and-average loop with one
+    # capture that replays through all of them.
+    pool_gen = functools.partial(
+        _generate_mlp_pool_entry,
+        dim1,
+        dim2,
+        n_expts_tot,
+        n_expts_act,
+        preshuffled,
+        TP,
+        batch,
+    )
+    rot_bufs = generate_rotating_buffers_pool(
+        [pool_gen],
+        [_MLP_POOL_FIELDS],
+        target_mb=kwargs_rot_bufs.get("target_mb", 256),
+        min_pool_len=num_weight_inits,
+        print_info=kwargs_rot_bufs.get("print_info", False),
+    )
+
+    metas = [entry["meta"] for entry in rot_bufs]
+    num_entries = len(metas)
+
+    def avg(key):
+        return sum(m[key] for m in metas) / num_entries
+
+    moe1_flops = avg("moe1_flops")
+    moe1_bytes = avg("moe1_bytes")
+    moe2_flops = avg("moe2_flops")
+    moe2_bytes = avg("moe2_bytes")
+    routed_experts_used = avg("routed")
+    # block_m depends only on batch/topk/E, not on the weight draw
+    block_m = metas[0]["block_m"]
+
+    layer1_fn, layer2_fn, both_fn = _make_moe_layer_fns(preshuffled)
+
+    to_bench = {
+        "moe1": (layer1_fn, moe1_flops, moe1_bytes),
+        "moe2": (layer2_fn, moe2_flops, moe2_bytes),
+        "total": (both_fn, moe1_flops + moe2_flops, moe1_bytes + moe2_bytes),
+    }
+    measured = {
+        name: {
+            "latency_ms": do_bench_aiter_triton(f, rot_bufs, **kwargs_do_bench_graph),
+            "flops": flops,
+            "bytes": byts,
+        }
+        for name, (f, flops, byts) in to_bench.items()
+        if name in layers
     }
 
-    return aggregated
+    return {
+        "layers": measured,
+        "block_m": block_m,
+        "routed_experts": routed_experts_used,
+    }
 
 
 def roofline_mlp(
@@ -262,18 +402,24 @@ def roofline_mlp(
     n_expts_tot,
     n_expts_act,
     preshuffled,
-    x_dtype,
-    w_dtype,
     TP,
-    op_regex,
+    layers=LAYERS,
     num_weight_inits=1,
     name="",
+    kwargs_rot_bufs=None,
+    kwargs_do_bench_graph=None,
 ):
-    # Avoid creating an empty directory named like the output CSV stem.
     out_dir = Path("logs") / name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    out_csv = out_dir / f"{x_dtype}x-{w_dtype}w-TP{TP}.csv"
+    stem = (
+        f"int8x-int8w-TP{TP}-dim1={dim1}-dim2={dim2}-E={n_expts_tot}-topk={n_expts_act}"
+    )
+    if preshuffled:
+        stem += "-preshuffled"
+    if tuple(layers) != LAYERS:
+        stem += "-layers=" + "+".join(layers)
+    out_csv = out_dir / f"{stem}.csv"
 
     compute_roofline(
         dim1,
@@ -281,15 +427,15 @@ def roofline_mlp(
         n_expts_tot,
         n_expts_act,
         preshuffled,
-        x_dtype,
-        w_dtype,
         TP,
-        op_regex,
+        layers,
         num_weight_inits,
         bench_fn=bench_mlp,
         intensity_proxy_name="batch",
         intensity_proxy_values=batch_sizes,
         out_path=out_csv,
+        kwargs_rot_bufs=kwargs_rot_bufs,
+        kwargs_do_bench_graph=kwargs_do_bench_graph,
     )
 
 
@@ -315,17 +461,22 @@ def parse_args():
         help="Preshuffle weights.",
     )
     parser.add_argument(
-        "--op-regex",
-        type=str,
-        default=".*moe_gemm.*",
-        help="Regex to find perf for specific operation by its kernel name.",
+        "--layers",
+        nargs="+",
+        choices=LAYERS,
+        default=list(LAYERS),
+        help="Which layers to measure: moe1 (up projection), moe2 (down "
+        "projection), total (both back to back). Default: all three.",
     )
     parser.add_argument(
         "--num-weight-inits",
         type=int,
         default=1,
-        help="Number of different weight initializations to run for more stable results (default: 1). "
-        "Each initialization runs 100 iterations. Use higher values (e.g., 10) for more stable benchmarks.",
+        help="Minimum number of different weight initializations in the rotating "
+        "buffer pool for more stable results (default: 1). The pool can grow "
+        "larger than this to reach the cache-defeating size target; it never "
+        "shrinks below it. Use higher values (e.g., 10) for more stable "
+        "benchmarks.",
     )
     return parser.parse_args()
 
@@ -335,7 +486,6 @@ if __name__ == "__main__":
 
     dim1, dim2 = args.shape
     total_experts, active_experts = args.experts
-    preshuffled = args.preshuffled
     batch_ranges_moe = [
         (1, 2, 1),
         (2, 5, 2),
@@ -346,7 +496,6 @@ if __name__ == "__main__":
         (4096, 8200, 4096),
     ]
     batch_sizes_moe = list(chain(*[range(*r) for r in batch_ranges_moe]))
-    quantized_dtypes = [torch.int8, torch.int8]
 
     roofline_mlp(
         batch_sizes_moe,
@@ -354,11 +503,11 @@ if __name__ == "__main__":
         dim2,
         total_experts,
         active_experts,
-        preshuffled,
-        quantized_dtypes[0],
-        quantized_dtypes[1],
+        args.preshuffled,
         TP=1,
-        op_regex=args.op_regex,
+        layers=tuple(n for n in LAYERS if n in args.layers),
         num_weight_inits=args.num_weight_inits,
         name="int8-smoothquant",
+        kwargs_rot_bufs=get_rot_bufs_kwargs(args),
+        kwargs_do_bench_graph=get_do_bench_graph_kwargs(args),
     )
