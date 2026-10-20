@@ -86,3 +86,10 @@ with two fresh input seeds. Cases cover 1 to 16384 queries and 8 MiB / 5 GiB KV 
 slots are valid, so AITER can use its asynchronous LDS path. HK pads its index rows inside the call.
 A 512 MiB buffer evicts cache data before each timed one-call HIP graph replay; eviction is not timed.
 Raw samples, rejected candidates and correctness results are saved in JSON.
+
+The benchmark additionally tests the OPUS sparse-prefill kernels with losslessly repacked native
+inputs: BF16 Q/KV, or 448 FP8 dimensions with unit E8M0 scales plus 64 BF16 dimensions. Both
+represent exactly the same Q/K/V values as the flat FP8 input. The native caches occupy 2x and
+1.25x the original bytes, respectively. Query/cache repacking is excluded from their timings,
+and the attention sink is disabled. The JSON separately reports the strongest matching-layout
+Gluon baseline and the strongest passing candidate across all tested layouts.
