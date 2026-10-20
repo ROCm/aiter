@@ -91,21 +91,29 @@ def _verify_dispatch(layout):
     """
     import aiter.ops.flydsl.fmha_kernels as fk
 
-    name = "flash_attn_varlen_m32x8" if layout == "thd" else "flash_attn_batch_m32x8"
-    orig = getattr(fk, name)
+    # fmha_kernels imports the entries under aliases, and there are two families now
+    # (a16w16 and the 8-bit a8w8 sibling), so watch whichever one this dtype routes to.
+    suffix = "varlen" if layout == "thd" else "batch"
+    names = [f"flash_attn_{suffix}_gfx1250", f"flash_attn_{suffix}_gfx1250_a8w8"]
+    origs = {n: getattr(fk, n) for n in names}
     calls = {"n": 0}
 
-    def _spy(*a, **kw):
-        calls["n"] += 1
-        return orig(*a, **kw)
+    def _make_spy(fn):
+        def _spy(*a, **kw):
+            calls["n"] += 1
+            return fn(*a, **kw)
 
-    setattr(fk, name, _spy)
+        return _spy
+
+    for n, fn in origs.items():
+        setattr(fk, n, _make_spy(fn))
     try:
         yield calls
     finally:
-        setattr(fk, name, orig)
+        for n, fn in origs.items():
+            setattr(fk, n, fn)
     assert calls["n"] > 0, (
-        f"m32x8 kernel ({name}) never dispatched for layout={layout}; the call fell "
+        f"m32x8 kernel ({names}) never dispatched for layout={layout}; the call fell "
         f"through to another backend. Run with AITER_ENABLE_EXPERIMENTAL=1 and a "
         f"routed hdim (D_qk in 64/128/192/256, D_v in 64/128)."
     )
@@ -201,6 +209,8 @@ def run_perf(case, warmup, repeat, fix_init=None):
     sink = case.get("sink", False)
 
     assert Hq % Hkv == 0, f"nheads_q={Hq} must be a multiple of nheads_kv={Hkv}"
+    dtype_name = case.get("dtype", "bf16")
+    dtype = _DTYPES[dtype_name]
 
     # Always measure OUR m32x8 kernel, so experimental is always ON: the PR3039
     # gfx1250 varlen ASM gate in mha.py owns 128/128 and 192/128 unless experimental
@@ -212,13 +222,9 @@ def run_perf(case, warmup, repeat, fix_init=None):
 
     if layout == "thd":
         total_q, total_k = B * sq, B * sk
-        q = torch.randn(total_q, Hq, d_qk, dtype=torch.bfloat16, device=device)
-        k = torch.randn(total_k, Hkv, d_qk, dtype=torch.bfloat16, device=device)
-        v = torch.randn(total_k, Hkv, d_v, dtype=torch.bfloat16, device=device)
-        if fix_init is not None:
-            q.fill_(fix_init)
-            k.fill_(fix_init)
-            v.fill_(fix_init)
+        q = _randn((total_q, Hq, d_qk), dtype, device, fix_init)
+        k = _randn((total_k, Hkv, d_qk), dtype, device, fix_init)
+        v = _randn((total_k, Hkv, d_v), dtype, device, fix_init)
         cu_q = torch.arange(0, (B + 1) * sq, sq, dtype=torch.int32, device=device)
         cu_k = torch.arange(0, (B + 1) * sk, sk, dtype=torch.int32, device=device)
 
@@ -239,13 +245,9 @@ def run_perf(case, warmup, repeat, fix_init=None):
             )
 
     elif layout == "bshd":
-        q = torch.randn(B, sq, Hq, d_qk, dtype=torch.bfloat16, device=device)
-        k = torch.randn(B, sk, Hkv, d_qk, dtype=torch.bfloat16, device=device)
-        v = torch.randn(B, sk, Hkv, d_v, dtype=torch.bfloat16, device=device)
-        if fix_init is not None:
-            q.fill_(fix_init)
-            k.fill_(fix_init)
-            v.fill_(fix_init)
+        q = _randn((B, sq, Hq, d_qk), dtype, device, fix_init)
+        k = _randn((B, sk, Hkv, d_qk), dtype, device, fix_init)
+        v = _randn((B, sk, Hkv, d_v), dtype, device, fix_init)
 
         def _run():
             return flash_attn_func(
@@ -291,6 +293,7 @@ def run_perf(case, warmup, repeat, fix_init=None):
         "d_v": d_v,
         "sq": sq,
         "sk": sk,
+        "dtype": dtype_name,
         "causal": causal,
         "lse": lse,
         "window": str(window),
@@ -499,6 +502,21 @@ for _i, _c in enumerate(CASES):
     _c["id"] = _i
 
 
+# Q/K/V element type. 8-bit runs the a8w8 sibling kernel; only the matched bf8 pair
+# is offered here, which is what the kernel is tuned and verified for.
+_DTYPES = {"bf16": torch.bfloat16, "bf8": torch.float8_e5m2}
+
+
+def _randn(shape, dtype, device, fix_init=None):
+    """``randn`` (or a constant fill) in ``dtype``; 8-bit draws in fp32 and rounds,
+    since neither randn nor fill_ is available for it. The 0.3 keeps the draw inside
+    the 8-bit range so the measurement is not dominated by saturated values."""
+    if fix_init is not None:
+        return torch.full(shape, fix_init, dtype=torch.float32, device=device).to(dtype)
+    t = torch.randn(*shape, dtype=torch.float32, device=device)
+    return (t * 0.3).to(dtype) if dtype is not torch.bfloat16 else t.to(dtype)
+
+
 def _print_case_list():
     rows = [
         {
@@ -542,6 +560,18 @@ def main():
         choices=["thd", "bshd"],
         default="thd",
         help="Layout for detailed-args mode (default thd).",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=str,
+        choices=sorted(_DTYPES),
+        default="bf16",
+        help=(
+            "Q/K/V element type. 'bf8' runs the a8w8 kernel (bf8 Q, K and V;\n"
+            "        softmax P is bf8 and the output stays bf16 either way).\n"
+            "        Applies to every selected case -- case ids are unchanged."
+        ),
     )
     parser.add_argument("-b", "--batch", type=int, default=1, help="Batch size.")
     parser.add_argument(
@@ -646,7 +676,7 @@ def main():
         selected = []
         for cid in args.case:
             assert 0 <= cid < len(CASES), f"--case {cid} out of range [0,{len(CASES)})"
-            selected.append(CASES[cid])
+            selected.append(dict(CASES[cid], dtype=args.dtype))
     elif args.seqlen_q is not None and args.seqlen_kv is not None:
         Hkv = args.nheads_kv if args.nheads_kv is not None else args.nheads
         selected = [
@@ -663,6 +693,7 @@ def main():
                 "lse": args.lse,
                 "window": _parse_window(args.window),
                 "sink": args.sink,
+                "dtype": args.dtype,
             }
         ]
     else:
@@ -673,7 +704,7 @@ def main():
 
     init_desc = "random" if args.fix_init is None else f"fixed={args.fix_init}"
     print("=" * 70)
-    print(f"FlyDSL m32x8 MHA perf (gfx1250, bf16, init={init_desc})")
+    print(f"FlyDSL m32x8 MHA perf (gfx1250, {args.dtype}, init={init_desc})")
     print("=" * 70)
 
     rows = []

@@ -33,7 +33,11 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
+    flash_attn_a8w8_m32x8_supported,
+)
 from aiter.ops.flydsl.kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
+    flash_attn_m32x8_supported,
     supports_gqa_ratio,
 )
 from aiter.ops.mha import flash_attn_func, flash_attn_varlen_func
@@ -334,17 +338,20 @@ def test_mha_flydsl_varlen(
     total_q, total_k = cu_q[-1], cu_k[-1]
     max_sq, max_sk = max(seqs_q), max(seqs_k)
 
-    q = torch.randn(total_q, H_q, d_qk, dtype=dtype, device=device)
-    k = torch.randn(total_k, H_kv, d_qk, dtype=dtype, device=device)
-    v = torch.randn(total_k, H_kv, d_v, dtype=dtype, device=device)
+    q_dtype, kv_dtype = dtype
+    q = _randn_as((total_q, H_q, d_qk), q_dtype, device)
+    k = _randn_as((total_k, H_kv, d_qk), kv_dtype, device)
+    v = _randn_as((total_k, H_kv, d_v), kv_dtype, device)
     cu_q_t = torch.tensor(cu_q, dtype=torch.int32, device=device)
     cu_k_t = torch.tensor(cu_k, dtype=torch.int32, device=device)
 
     scale = 1.0 / math.sqrt(d_qk)
     sink_t = _make_sink(H_q, device) if sink else None
 
+    # Reference from the DEQUANTIZED inputs -- what the kernel actually sees.
+    qr, kr, vr = (t.float() if t.dtype in _B8_TORCH else t for t in (q, k, v))
     ref_result = run_torch_varlen(
-        q, k, v, cu_q, cu_k, scale, causal, return_lse, sink_t, window
+        qr, kr, vr, cu_q, cu_k, scale, causal, return_lse, sink_t, window
     )
     ref, ref_lses = ref_result if return_lse else (ref_result, None)
 
@@ -391,11 +398,12 @@ def test_mha_flydsl_varlen(
             H_q,
             d_v,
         ), f"{name}: bad out shape {tuple(out.shape)}"
+        _rtol, _atol = _tols(q_dtype, kv_dtype)
         err = checkAllclose(
             ref,
             out.float(),
-            rtol=1e-2,
-            atol=1e-2,
+            rtol=_rtol,
+            atol=_atol,
             msg=f"{name} thd out: ",
         )
 
@@ -448,14 +456,16 @@ def test_mha_flydsl_batch(
     assert (d_qk, d_v) in SUPPORTED_D_QK_V, f"unsupported d_qk/d_v {(d_qk, d_v)}"
     assert H_q % H_kv == 0, f"nheads_q={H_q} must be a multiple of nheads_kv={H_kv}"
 
-    q = torch.randn(B, sq, H_q, d_qk, dtype=dtype, device=device)
-    k = torch.randn(B, sk, H_kv, d_qk, dtype=dtype, device=device)
-    v = torch.randn(B, sk, H_kv, d_v, dtype=dtype, device=device)
+    q_dtype, kv_dtype = dtype
+    q = _randn_as((B, sq, H_q, d_qk), q_dtype, device)
+    k = _randn_as((B, sk, H_kv, d_qk), kv_dtype, device)
+    v = _randn_as((B, sk, H_kv, d_v), kv_dtype, device)
 
     scale = 1.0 / math.sqrt(d_qk)
     sink_t = _make_sink(H_q, device) if sink else None
 
-    ref_result = run_torch_batch(q, k, v, scale, causal, return_lse, sink_t, window)
+    qr, kr, vr = (t.float() if t.dtype in _B8_TORCH else t for t in (q, k, v))
+    ref_result = run_torch_batch(qr, kr, vr, scale, causal, return_lse, sink_t, window)
     ref, ref_lse = ref_result if return_lse else (ref_result, None)
 
     flops = _flops([(sq, sk)] * B, H_q, d_qk, d_v, causal)
@@ -484,7 +494,10 @@ def test_mha_flydsl_batch(
         H_q,
         d_v,
     ), f"bad out shape {tuple(out.shape)}"
-    err = checkAllclose(ref, out.float(), rtol=1e-2, atol=1e-2, msg="flydsl bshd out: ")
+    _rtol, _atol = _tols(q_dtype, kv_dtype)
+    err = checkAllclose(
+        ref, out.float(), rtol=_rtol, atol=_atol, msg="flydsl bshd out: "
+    )
     if lse is not None:
         # Kernel LSE is fp32 [B, nheads_q, sq], the layout test_mha.py asserts.
         assert lse.dtype == torch.float32, f"lse dtype {lse.dtype}"
@@ -701,6 +714,62 @@ def _shape_lists(args):
     return thd, bshd
 
 
+_B8_TORCH = (torch.float8_e4m3fn, torch.float8_e5m2)
+# dtypes.str2Dtype knows "fp8" (e4m3) but has no name for e5m2.
+_EXTRA_DTYPES = {"bf8": torch.float8_e5m2}
+
+
+def _one_dtype(name):
+    name = name.strip()
+    return _EXTRA_DTYPES.get(name) or dtypes.str2Dtype(name)
+
+
+def _str2dtype_pair(v):
+    """``q`` or ``q,k`` dtype spec; one name applies to both. V follows K."""
+    parts = str(v).split(",")
+    if len(parts) == 1:
+        parts *= 2
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(f"expected 'q' or 'q,k' dtypes, got {v!r}")
+    try:
+        return tuple(_one_dtype(p) for p in parts)
+    except Exception as exc:
+        raise argparse.ArgumentTypeError(f"bad dtype in {v!r}: {exc}") from exc
+
+
+def _backend_serves_dtypes(q_dtype, kv_dtype):
+    """Does the gfx1250 backend accept this (q, kv) dtype pair? Metadata only.
+
+    Ask the kernel's own gate rather than hardcoding a list here -- a pair the kernel
+    cannot express (today, q and kv differing) then reports as declined instead of
+    failing mid-run. The gate's dtype clause is hdim-independent, so one served hdim
+    stands in for all of them and the dtype axis can be filtered up front like the
+    hdim one."""
+    meta = torch.device("meta")
+    q = torch.empty(16, 8, 128, dtype=q_dtype, device=meta)
+    k = torch.empty(16, 2, 128, dtype=kv_dtype, device=meta)
+    v = torch.empty(16, 2, 128, dtype=kv_dtype, device=meta)
+    gate = (
+        flash_attn_a8w8_m32x8_supported
+        if q_dtype in _B8_TORCH
+        else flash_attn_m32x8_supported
+    )
+    return bool(gate("varlen", q, k, v))
+
+
+def _randn_as(shape, dtype, device):
+    """``randn`` in ``dtype``; 8-bit has no randn, so round a scaled fp32 draw. The
+    0.3 keeps e4m3 well inside range so the fp8 error stays representative."""
+    if dtype in _B8_TORCH:
+        return (torch.randn(*shape, dtype=torch.float32, device=device) * 0.3).to(dtype)
+    return torch.randn(*shape, dtype=dtype, device=device)
+
+
+def _tols(*dts):
+    """8-bit carries real quantization error (bf8 P alone is 2 mantissa bits)."""
+    return (1e-1, 2e-2) if any(d in _B8_TORCH for d in dts) else (1e-2, 1e-2)
+
+
 def _str2d_qk_v(v):
     """Parse a ``d_qk,d_v`` pair and check it against ``SUPPORTED_D_QK_V``."""
     pair = dtypes.str2tuple(v)
@@ -793,10 +862,20 @@ def main():
     parser.add_argument(
         "-d",
         "--dtype",
-        type=dtypes.str2Dtype,
+        type=_str2dtype_pair,
         nargs="*",
-        default=[dtypes.bf16, dtypes.fp16],
-        help="Element dtype (q/k/v share one).\n        e.g.: -d bf16",
+        default=[
+            (dtypes.bf16, dtypes.bf16),
+            (dtypes.fp16, dtypes.fp16),
+            (torch.float8_e5m2, torch.float8_e5m2),
+            (torch.float8_e4m3fn, torch.float8_e4m3fn),
+        ],
+        help=(
+            "Q and KV element dtypes as 'q' or 'q,kv' (V follows K).\n"
+            "        8-bit defaults to the matched pairs only -- bf8+bf8 and\n"
+            "        fp8+fp8; mixed pairs are accepted but the backend may\n"
+            "        decline them.\n        e.g.: -d bf16 -d bf8,bf8"
+        ),
     )
     parser.add_argument(
         "-l",
@@ -963,7 +1042,7 @@ def main():
         axes = [
             [h for h in hdims if _flydsl_serves(*h)],
             shapes,
-            args.dtype,
+            served_dtypes,
             causals,
             lses,
             sinks,
@@ -987,6 +1066,15 @@ def main():
                 combo.append(a[j])
             picked.append(tuple(reversed(combo)))
         return picked
+
+    served_dtypes = [d for d in args.dtype if _backend_serves_dtypes(*d)]
+    for d in args.dtype:
+        if d not in served_dtypes:
+            aiter.logger.info(
+                "skipping dtype pair q=%s kv=%s: declined by the backend", *d
+            )
+    if not served_dtypes:
+        raise SystemExit("no requested dtype pair is served by the backend")
 
     if "thd" in args.layout:
         rows = []
