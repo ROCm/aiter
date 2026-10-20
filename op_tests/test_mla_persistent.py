@@ -13,7 +13,6 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.core import is_experimental_enabled
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -600,6 +599,9 @@ def torch_mla_extend_split_kv(
     is_causal=True,
     q_scale=None,
     kv_scale=None,
+    fast_mode=True,
+    intra_batch_mode=False,
+    plan_dtypes=None,
 ):
 
     _num_page, page_size, _nhead_kv, _ = kvc_cache.shape
@@ -607,6 +609,8 @@ def torch_mla_extend_split_kv(
     dev = kvc_cache.device
     is_fp8_q = q.dtype == dtypes.fp8
     is_fp8_kvc = kvc_cache.dtype == dtypes.fp8
+    if plan_dtypes is None:
+        plan_dtypes = (q.dtype, kvc_cache.dtype)
 
     if is_fp8_q:
         q = q.to(torch.float)
@@ -623,77 +627,19 @@ def torch_mla_extend_split_kv(
 
     io_transformed = False
     q_ratio = 1
-    if (
-        nheads == 16
-        or (get_gfx() == "gfx942" and nheads == 128 and is_fp8_q and is_fp8_kvc)
-        or (
-            get_gfx() == "gfx950"
-            and nheads == 128
-            and is_fp8_q
-            and is_fp8_kvc
-            and is_experimental_enabled()
-        )
-        or (
-            get_gfx() == "gfx942"
-            and nheads in (16, 32, 64)
-            and nheads * max_seqlen_q == 128
-            and is_fp8_q
-            and is_fp8_kvc
-            and is_experimental_enabled()
-        )
-        or (
-            get_gfx() == "gfx950"
-            and nheads == 8
-            and is_fp8_q
-            and is_fp8_kvc
-            and max_seqlen_q == 4
-        )
-        or (
-            get_gfx() == "gfx942"
-            and nheads == 8
-            and not is_fp8_q
-            and not is_fp8_kvc
-            and max_seqlen_q == 2
-        )
-        or (
-            # fp8/fp8 PS GQA catch-all -- mirrors aiter/mla.py / asm_mla.cu
-            get_gfx() == "gfx950"
-            and is_fp8_q
-            and is_fp8_kvc
-            and ((nheads == 32) or (nheads == 64) or (nheads == 128))
-        )
-        or (
-            get_gfx() == "gfx942"
-            and nheads == 64
-            and is_fp8_q
-            and is_fp8_kvc
-            and max_seqlen_q == 1
-        )
-        or (get_gfx() == "gfx950" and not is_fp8_q and not is_fp8_kvc)
-        or (
-            get_gfx() == "gfx950"
-            and nheads == 96
-            and is_fp8_q
-            and is_fp8_kvc
-            and max_seqlen_q <= 6
-        )
-        or (
-            get_gfx() == "gfx950"
-            and is_fp8_q
-            and is_fp8_kvc
-            and nheads == 12
-            and nheads * max_seqlen_q <= 128
-        )
-    ):
-        # Natively support cases
-        pass
-    elif nheads in range(32, 128 + 1, 16):
-        # we use nhead=16 to simulate such cases by customized metadata
-        # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
+    # Read the head fold from the planner rules mla_decode_fwd and
+    # get_mla_metadata_v1 use, for the planner mode the metadata was built with.
+    fold_factor = aiter.get_mla_decode_shape_support(
+        nheads,
+        max_seqlen_q,
+        *plan_dtypes,
+        fast_mode=fast_mode,
+        intra_batch_mode=intra_batch_mode,
+    ).fold_factor
+    if fold_factor > 1:
+        # mla_decode_fwd views qo as (total_s * fold_factor, nheads // fold_factor)
         ori_nheads = nheads
-
-        fold_factor = nheads // 16
-        nheads = 16
+        nheads = nheads // fold_factor
         total_s = total_q * fold_factor
         if max_seqlen_q == 1:
             q_ratio = fold_factor
@@ -986,6 +932,9 @@ def torch_mla_split_kv_and_reduce(
     is_causal=True,
     q_scale=None,
     kv_scale=None,
+    fast_mode=True,
+    intra_batch_mode=False,
+    plan_dtypes=None,
 ):
     total_q, nhead, _ = q.shape
     partial_out, partial_lse, split_out, split_lse, io_transformed = (
@@ -1007,6 +956,9 @@ def torch_mla_split_kv_and_reduce(
             is_causal=is_causal,
             q_scale=q_scale,
             kv_scale=kv_scale,
+            fast_mode=fast_mode,
+            intra_batch_mode=intra_batch_mode,
+            plan_dtypes=plan_dtypes,
         )
     )
 
@@ -1077,6 +1029,8 @@ def torch_mla_extend_3buffer_split_kv_and_reduce(
     q_scale=None,
     kv_scale=None,
     scale_dim=4,
+    fast_mode=True,
+    intra_batch_mode=False,
 ):
 
     num_page = kvc_cache.shape[0]
@@ -1120,6 +1074,10 @@ def torch_mla_extend_3buffer_split_kv_and_reduce(
         is_causal,
         q_scale,
         kv_scale,
+        fast_mode=fast_mode,
+        intra_batch_mode=intra_batch_mode,
+        # mla_decode_fwd plans the byte KV buffer as fp8.
+        plan_dtypes=(q.dtype, dtypes.fp8),
     )
 
 
@@ -1526,6 +1484,8 @@ def test_mla(
                     is_causal=causal,
                     q_scale=None,
                     kv_scale=kv_scale,
+                    fast_mode=fast_mode,
+                    intra_batch_mode=intra_batch_mode,
                 )
             )
 
@@ -1603,6 +1563,8 @@ def test_mla(
                     reduce_partial_map=reduce_partial_map,
                     max_seqlen_q=max_seqlen_qo,
                     is_causal=causal,
+                    fast_mode=fast_mode,
+                    intra_batch_mode=intra_batch_mode,
                 )
             )
 
@@ -1716,6 +1678,8 @@ def test_mla(
                     is_causal=causal,
                     q_scale=q_scale,
                     kv_scale=kv_scale,
+                    fast_mode=fast_mode,
+                    intra_batch_mode=intra_batch_mode,
                 )
             )
 
@@ -1831,6 +1795,8 @@ def test_mla(
                     max_seqlen_q=max_seqlen_qo,
                     is_causal=causal,
                     scale_dim=scale_dim,
+                    fast_mode=fast_mode,
+                    intra_batch_mode=intra_batch_mode,
                 )
             )
 
