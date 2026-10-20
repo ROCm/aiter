@@ -22,7 +22,6 @@ from .attention_common import (
     _center,
     _copy_coordinates,
     _cross,
-    _dma_offsets,
     _exps,
     _join,
     _k_lds_address,
@@ -30,7 +29,6 @@ from .attention_common import (
     _max,
     _maximum,
     _min,
-    _pack,
     _pack_bf16,
     _pin,
     _pin_i32,
@@ -54,11 +52,25 @@ __all__ = ["run"]
 BM, BN, D, THREADS, LDS_BYTES = 128, 64, 256, 512, 65536
 
 
-def _source_rows(table, tile, count, wave, hk):
-    lane = fx.thread_idx.x & 63
-    index = _min(tile * 16 + (wave & 3) * 4 + (lane & 3), count - 1)
-    block = _buffer_words(table, index * 4, 1)[0]
-    return fx.Uint32(block) * (4 * hk * D * 2) + (wave >> 2) * 256
+def _source_blocks(blocks, tile, count, lane_bytes):
+    # SALU-only address: the descriptor starts at the tile; slots past count read 0 (masked).
+    view = fx.make_view(blocks + tile * 16, fx.make_layout(16, 1))
+    return _buffer_words(_buffer(view, (count - tile * 16) * 4), lane_bytes, 1)[0]
+
+
+def _dma_rows(blocks, wave, hk):
+    """SOFFSET rows of the wave's four slots: lanes 0..3 hold their block IDs."""
+    return fx.Vector.from_elements(
+        [
+            fx.Int32(
+                fx.Uint32(rocdl.readlane(fx.Int32.ir_type, blocks, slot))
+                * (4 * hk * D * 2)
+                + (wave >> 2) * 256
+            )
+            for slot in range(4)
+        ],
+        fx.Int32,
+    )
 
 
 def _union_dma(
@@ -238,10 +250,10 @@ def _body(
     STAGGER: fx.Constexpr[bool],
 ):
     read_k, read_v, pv = _read_k, _read_v, _pv
-    dma_offsets, v_operands = _dma_offsets, _v_operands
-    source_rows, output_fn = _source_rows, _output
+    dma_rows, v_operands = _dma_rows, _v_operands
+    source_blocks, output_fn = _source_blocks, _output
     qk, local_sum, local_max, cross = _qk, _sum, _max, _cross
-    exps, pack, center = _exps, _pack, _center
+    exps, pack, center = _exps, _pack_bf16, _center
     rescale, advance_max = _rescale, _advance_max
     slices = (BQ * GP + 127) // 128
     tile_id, hkv = work // (HK * slices), work % HK
@@ -249,8 +261,7 @@ def _body(
     q0, qvalid = _uniform(META[tile_id * 5]), _uniform(META[tile_id * 5 + 1])
     k0, kv_len = _uniform(META[tile_id * 5 + 2]), _uniform(META[tile_id * 5 + 3])
     count = _uniform(COUNTS[tile_id])
-    table = fx.make_view(fx.get_iter(BLOCKS) + tile_id * CAP, fx.make_layout(CAP, 1))
-    table = _buffer(table, CAP * 4)
+    blocks = fx.get_iter(BLOCKS) + tile_id * CAP
     masks = fx.make_view(
         fx.get_iter(MEMBERS) + tile_id * (CAP // 16) * BQ * 4,
         fx.make_layout((CAP // 16) * BQ * 4, 1),
@@ -258,6 +269,7 @@ def _body(
     mask_resource = rocdl.get_buffer_rsrc(_buffer(masks, (CAP // 16) * BQ * 8))
     tid = fx.thread_idx.x
     wave, lane = _uniform(tid >> 6), tid & 63
+    lane_bytes = _pin_i32(((wave & 3) * 4 + (lane & 3)) * 4)
     row = row_offset + wave * 16 + (lane & 15)
     query, head = row // GP, row % GP
     mask_offset = _pin_i32(_min(query, fx.Int32(BQ - 1)) * 8 + (lane >> 4) * 2)
@@ -307,11 +319,11 @@ def _body(
     )
     vr = _pin_i32(shared + _v_lds_address((lane >> 4) * 8, (lane & 15) * 8))
     cross_addresses = tuple(_pin_i32((lane ^ offset) * 4) for offset in (16, 32, 48))
-    rows0 = source_rows(table, fx.Int32(0), count, wave, HK)
-    rows1 = source_rows(table, _min(fx.Int32(1), last), count, wave, HK)
-    rows2 = source_rows(table, _min(fx.Int32(2), last), count, wave, HK)
+    blocks0 = source_blocks(blocks, fx.Int32(0), count, lane_bytes)
+    blocks1 = source_blocks(blocks, _min(fx.Int32(1), last), count, lane_bytes)
+    blocks2 = source_blocks(blocks, _min(fx.Int32(2), last), count, lane_bytes)
     bits = _prefetch_mask(mask_resource, fx.Int32(0), mask_offset, BQ)
-    offsets = dma_offsets(rows0, 4)
+    offsets = dma_rows(blocks0, wave, HK)
     v_offsets = offsets
     for packet in fx.range_constexpr(16):
         _union_dma(
@@ -353,8 +365,9 @@ def _body(
     scores = center(scores, scale, maximum)
     row_sum = fx.Float32(0.0)
     _stage_end()
-    offsets = dma_offsets(rows1, 4)
+    offsets = dma_rows(blocks1, wave, HK)
     current_offsets = offsets
+    next_offsets = dma_rows(blocks2, wave, HK)
     for packet in fx.range_constexpr(16):
         _union_dma(
             gk,
@@ -383,7 +396,7 @@ def _body(
         o1,
         previous_offsets,
         current_offsets,
-        next_rows,
+        next_offsets,
         t,
     ):
         previous, maximum, row_sum = (
@@ -393,9 +406,11 @@ def _body(
         )
         o0, o1, t = fx.Vector(o0), fx.Vector(o1), fx.Int32(t)
         previous_offsets = fx.Vector(previous_offsets)
-        current_offsets, next_rows = fx.Vector(current_offsets), fx.Int32(next_rows)
+        current_offsets, next_offsets = fx.Vector(current_offsets), fx.Vector(
+            next_offsets
+        )
         bits = _prefetch_mask(mask_resource, t, mask_offset, BQ)
-        future_rows = source_rows(table, _min(t + 2, last), count, wave, HK)
+        future_blocks = source_blocks(blocks, _min(t + 2, last), count, lane_bytes)
         parts = []
         for n in fx.range_constexpr(2):
             for step in fx.range_constexpr(8):
@@ -441,8 +456,9 @@ def _body(
         rocdl.sched_barrier(0)
         hi = qk(q, k)
         current = _apply_mask(_join(lo, hi), bits)
-        total, probabilities = local_sum(previous), pack(previous)
-        offsets = dma_offsets(next_rows, 4)
+        total, probabilities = local_sum(previous), pack(previous).bitcast(fx.BFloat16)
+        # The stage C vmcnt(0) retired this load; only SGPR rows cross iterations.
+        future_offsets = dma_rows(future_blocks, wave, HK)
         _schedule(32, 2, 2)
         _stage_end()
         sums = cross(total, cross_addresses)
@@ -455,7 +471,7 @@ def _body(
                         storage,
                         wave,
                         lane,
-                        offsets,
+                        next_offsets,
                         _min(t + 1, last),
                         compact_len,
                         limits,
@@ -499,11 +515,30 @@ def _body(
         o0, o1, row_sum = rescale(o0, o1, row_sum, maximum, new_max, ballot)
         new_max = advance_max(maximum, new_max)
         _stage_end()
-        return current, new_max, row_sum, o0, o1, current_offsets, offsets, future_rows
+        return (
+            current,
+            new_max,
+            row_sum,
+            o0,
+            o1,
+            current_offsets,
+            next_offsets,
+            future_offsets,
+        )
 
     for t in range(fx.Int32(1), tiles, fx.Int32(1)):
-        scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, rows2 = phase(
-            scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, rows2, t
+        scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, next_offsets = (
+            phase(
+                scores,
+                maximum,
+                row_sum,
+                o0,
+                o1,
+                v_offsets,
+                current_offsets,
+                next_offsets,
+                t,
+            )
         )
     offsets = fx.Vector(v_offsets)
     for packet in fx.range_constexpr(16):
@@ -527,7 +562,7 @@ def _body(
     total = total + total.shuffle_xor(16, 64)
     total = total + total.shuffle_xor(32, 64)
     row_sum = fx.Float32(row_sum) + total
-    probabilities = pack(scores)
+    probabilities = pack(scores).bitcast(fx.BFloat16)
     rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
     _stage_end()
     _stage_end()
@@ -697,7 +732,9 @@ def _launch(
             SCALE,
             value_attrs={
                 "rocdl.waves_per_eu": 2,
-                "passthrough": [["target-features", "-packed-fp32-ops"]],
+                "llvm.target_features": ir.Attribute.parse(
+                    '#llvm.target_features<["-packed-fp32-ops"]>'
+                ),
             },
         ).launch(grid=(GRID, 1, 1), block=(THREADS, 1, 1), stream=stream)
 

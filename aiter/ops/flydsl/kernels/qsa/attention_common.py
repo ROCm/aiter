@@ -210,8 +210,9 @@ def _pack_bf16(values):
     # gfx942 has no native packed FP32 -> BF16 instruction; software RNE.
     bits = fx.Vector(values).bitcast(fx.Uint32)
     rounded = bits + fx.Uint32(0x7FFF) + ((bits >> 16) & fx.Uint32(1))
+    # One v_perm_b32 joins both high halves; element i lands in the low half.
     words = [
-        (rounded[i] >> 16) | (rounded[i + 1] & fx.Uint32(0xFFFF0000))
+        fx.Uint32(rocdl.perm_b32(rounded[i + 1], rounded[i], 0x07060302))
         for i in range(0, values.numel, 2)
     ]
     return fx.Vector.from_elements(words, fx.Uint32)
@@ -370,25 +371,6 @@ def _exps(values):
     return fx.Vector.from_elements([_exp(values[i]) for i in range(16)], fx.Float32)
 
 
-def _pack(values):
-    # Opaque v_perm_b32: rocdl.perm_b32 exposes the dependencies, 0.1% slower.
-    bits = fx.Vector(values).bitcast(fx.Uint32) + fx.Uint32(0x8000)
-    selector = fx.Int32(0x07060302)
-    words = [
-        fx.Int32(
-            llvm.inline_asm(
-                fx.Int32.ir_type,
-                [bits[i + 1].ir_value(), bits[i].ir_value(), selector.ir_value()],
-                "v_perm_b32 $0, $1, $2, $3",
-                "=v,v,v,s",
-                has_side_effects=True,
-            )
-        )
-        for i in range(0, 16, 2)
-    ]
-    return fx.Vector.from_elements(words, fx.Int32).bitcast(fx.BFloat16)
-
-
 def _k_phase(token):
     return (token & 3) | ((token >> 3) & 1) * 4
 
@@ -404,18 +386,6 @@ def _v_lds_address(token, dimension):
 def _copy_coordinates(wave, packet, page=0):
     token = (wave & 3) * 16 + packet if page == 4 else (wave & 3) + packet * 4
     return token, (wave >> 2) * 128
-
-
-def _dma_offsets(rows, page):
-    if page:
-        return fx.Vector.from_elements(
-            [
-                fx.Int32(rocdl.readlane(fx.Int32.ir_type, rows, packet))
-                for packet in range(4 if page == 4 else 16)
-            ],
-            fx.Int32,
-        )
-    return fx.Vector.from_elements([rows], fx.Int32)
 
 
 def _read_k(addresses, half, lower_first=False):
