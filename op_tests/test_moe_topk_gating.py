@@ -10,6 +10,8 @@ Usage:
   python test_moe_topk_gating.py --section softmax --topk 8
   python test_moe_topk_gating.py --section sigmoid,softmax --num-tokens 64,1024
   python test_moe_topk_gating.py --section ties,eplb
+  python test_moe_topk_gating.py --section biased-sigmoid --num-experts 896 \
+      --num-tokens 1,8,32,128 --topk 16 --dtype bf16
 """
 
 import argparse
@@ -23,6 +25,7 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.topk import biased_grouped_topk, biased_grouped_topk_hip
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -389,6 +392,63 @@ def bench_topk_sigmoid(num_experts, num_tokens, topk, dtype):
         ret[f"{name} idx_err"] = checkAllclose(
             ref_idx, ids, tol_err_ratio=0.01, msg=f"{name}: sigmoid indices"
         )
+    return ret
+
+
+@benchmark()
+def bench_biased_grouped_sigmoid(
+    num_experts, num_tokens, topk, dtype, renormalize=True, route_scale=1.0
+):
+    """Compare the gfx1250 caller-owned specialization with its HIP fallback."""
+    torch.random.manual_seed(0)
+    gating_output = _make_gating(num_experts, num_tokens, dtype)
+    correction_bias = (torch.randn(num_experts) * 0.1).to(torch.bfloat16)
+    triton_weights = torch.empty((num_tokens, topk), dtype=torch.float32)
+    triton_ids = torch.empty((num_tokens, topk), dtype=torch.int32)
+    hip_weights = torch.empty_like(triton_weights)
+    hip_ids = torch.empty_like(triton_ids)
+
+    def run_triton():
+        biased_grouped_topk(
+            gating_output,
+            correction_bias,
+            triton_weights,
+            triton_ids,
+            1,
+            1,
+            renormalize,
+            route_scale,
+        )
+        return triton_weights, triton_ids
+
+    def run_hip():
+        biased_grouped_topk_hip(
+            gating_output,
+            correction_bias,
+            hip_weights,
+            hip_ids,
+            1,
+            1,
+            renormalize,
+            route_scale,
+        )
+        return hip_weights, hip_ids
+
+    run_hip()
+    ref_weights = hip_weights.clone()
+    ref_ids = hip_ids.clone()
+    nbytes = (
+        num_tokens * num_experts * gating_output.element_size()
+        + num_experts * correction_bias.element_size()
+        + num_tokens * topk * 8
+    )
+    ret = {"gfx": get_gfx()}
+    for name, fn in {"triton": run_triton, "hip": run_hip}.items():
+        (weights, ids), us = run_perftest(fn)
+        ret[f"{name} us"] = us
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} weight_err"] = float((weights - ref_weights).abs().max())
+        ret[f"{name} id_err"] = float((ids != ref_ids).float().mean())
     return ret
 
 
@@ -918,8 +978,9 @@ def main():
         type=lambda s: [x.strip() for x in s.split(",")],
         default=["sigmoid", "softplus", "softmax", "nan", "ties", "eplb", "shared"],
         help="Comma-separated list of sections to run: "
-        "sigmoid,softplus,softmax,nan,ties,eplb,shared (default: all). "
-        "The first three are named after a score function; nan, ties and eplb "
+        "sigmoid,biased-sigmoid,softplus,softmax,nan,ties,eplb,shared "
+        "(default: all except biased-sigmoid). "
+        "Sigmoid, softplus and softmax are named after score functions; nan, ties and eplb "
         "each sweep all score functions. --score-func is a deprecated alias.",
     )
     args = parser.parse_args()
@@ -953,6 +1014,34 @@ def main():
             print(f"\nERROR: {len(errors)} sigmoid config(s) had errors > 1%!")
             print(errors.to_string(index=False))
             failed_sections.append("sigmoid")
+
+    # -- gfx1250 caller-owned biased sigmoid: Triton versus HIP -------------
+    if "biased-sigmoid" in sections:
+        biased_configs = list(
+            itertools.product(
+                [e for e in num_experts_list if e in (512, 768, 896, 900, 1024)],
+                num_tokens_list,
+                [k for k in topk_list if k in (4, 8, 16)],
+                [d for d in dtype_list if d == torch.bfloat16],
+                [False, True],
+            )
+        )
+        if not biased_configs:
+            raise ValueError(
+                "biased-sigmoid requires bf16, E in {512,768,896,900,1024}, "
+                "and K in {4,8,16}"
+            )
+        df = [bench_biased_grouped_sigmoid(*cfg) for cfg in biased_configs]
+        df = pd.DataFrame(df)
+        aiter.logger.info(
+            "biased_grouped_topk sigmoid summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+        errors = df[(df["triton weight_err"] > 2e-5) | (df["triton id_err"] != 0.0)]
+        if len(errors) > 0:
+            print(f"\nERROR: {len(errors)} biased-sigmoid config(s) mismatched HIP!")
+            print(errors.to_string(index=False))
+            failed_sections.append("biased-sigmoid")
 
     # -- topk_softplus ---------------------------------------------------
     if "softplus" in sections:

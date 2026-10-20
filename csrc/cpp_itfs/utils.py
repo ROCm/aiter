@@ -22,6 +22,8 @@ from functools import cache, lru_cache, partial
 from jinja2 import Template
 from packaging.version import Version, parse
 
+from aiter_worker_limits import get_worker_count_for
+
 IS_WINDOWS = sys.platform == "win32"
 NULL_DEVICE = "NUL" if IS_WINDOWS else "/dev/null"
 # Built shared library: Python loads `.pyd`/`.dll` on Windows, `.so` elsewhere.
@@ -158,6 +160,12 @@ default {{target}}
     # ninja rejects a file whose last statement lacks a newline.
     keep_trailing_newline=True,
 )
+
+
+def _build_command(source_count: int) -> list[str]:
+    """Build with the live AITER budget, including nested-worker limits."""
+    command = ["ninja"] if IS_WINDOWS else ["make", "build"]
+    return [*command, f"-j{get_worker_count_for(source_count)}"]
 
 
 def mp_lock(
@@ -329,26 +337,19 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
             )
             with open(os.path.join(sub_build_dir, "build.ninja"), "w") as f:
                 f.write(ninja_file)
-            subprocess.run(
-                ["ninja", f"-j{len(sources)}"],
-                cwd=sub_build_dir,
-                shell=False,
-                capture_output=AITER_LOG_MORE < 2,
-                check=True,
-            )
         else:
             makefile_file = makefile_template.render(
                 includes=[f"-I{include_dir}"], sources=sources, cxxflags=cxxflags
             )
             with open(f"{sub_build_dir}/Makefile", "w") as f:
                 f.write(makefile_file)
-            subprocess.run(
-                ["make", "build", f"-j{len(sources)}"],
-                cwd=sub_build_dir,
-                shell=False,
-                capture_output=AITER_LOG_MORE < 2,
-                check=True,
-            )
+        subprocess.run(
+            _build_command(len(sources)),
+            cwd=sub_build_dir,
+            shell=False,
+            capture_output=AITER_LOG_MORE < 2,
+            check=True,
+        )
 
     def final_func():
         logger.info(
