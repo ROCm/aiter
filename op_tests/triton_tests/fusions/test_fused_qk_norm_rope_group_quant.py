@@ -75,9 +75,26 @@ def dequant(nope):
     return (values * scales[..., None]).flatten(-2)
 
 
+def ceil_scale_bytes(normed):
+    """The e8m0 scale byte of each group: amax / 448, rounded up to a power of two.
+    The minimum amax is 1e-8. The kernel uses _mxfp8_downcast_op with SCALING_MODE=1."""
+    amax = normed.unflatten(-1, (NOPE_DIM // GROUP_SIZE, GROUP_SIZE)).abs().amax(-1)
+    bits = (amax.clamp_min(1e-8) * (1 / 448)).view(torch.int32)
+    # The biased exponent, plus 1 if the value is not a power of two.
+    return ((bits >> 23) + ((bits & 0x7FFFFF) != 0)).to(torch.uint8)
+
+
 @pytest.mark.parametrize("num_tokens", [37, 300, 600])
 def test_fused_qk_norm_rope_group_quant(num_tokens):
     inputs = make_inputs(num_tokens)
+    # The scale rounding modes differ only when amax / 448 is a power of two or
+    # amax is 0. Random data does not have these cases. Add them to two Q rows.
+    # Token 0, head 0: the RMS is 8, so in group 0 amax / 448 = 14 / 8 / 448 = 2^-8.
+    row = torch.full((HEAD_DIM,), 8.0, device="cuda")
+    row[0], row[1], row[2:5] = 14.0, 4.0, 6.0  # 14**2 + 4**2 + 3 * 6**2 = 5 * 8**2
+    inputs["q"][0, 0] = row
+    # Token 1, head 0: group 1 is all zeros.
+    inputs["q"][1, 0, GROUP_SIZE : 2 * GROUP_SIZE] = 0
     q_nope, q_rope, k_nope, k_rope = fused_qk_norm_rope_group_quant(**inputs)
 
     # Q has no RMSNorm weight. Use 1.0.
@@ -88,6 +105,13 @@ def test_fused_qk_norm_rope_group_quant(num_tokens):
     torch.testing.assert_close(dequant(k_nope), ref_k_nope, atol=1e-2, rtol=1 / 16)
     torch.testing.assert_close(q_rope.float(), ref_q_rope, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(k_rope.float(), ref_k_rope, atol=1e-2, rtol=1e-2)
+
+    # Both copies of each scale byte must be exact.
+    num_groups = NOPE_DIM // GROUP_SIZE
+    for nope, ref_nope in ((q_nope, ref_q_nope), (k_nope, ref_k_nope)):
+        scale_bytes = nope.view(torch.uint8)[..., NOPE_DIM : NOPE_DIM + 2 * num_groups]
+        ref_bytes = ceil_scale_bytes(ref_nope).repeat_interleave(2, dim=-1)
+        torch.testing.assert_close(scale_bytes, ref_bytes)
 
     # Tokens with a negative SWA row or batch id get no SWA write.
     written = (inputs["swa_dest_rows"] >= 0) & (inputs["batch_ids"] >= 0)
