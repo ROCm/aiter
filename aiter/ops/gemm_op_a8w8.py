@@ -936,12 +936,43 @@ def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y):
     its x_scale block goes with the w_scale's: 1x128 with 128x128, else 1x32),
     "bmm" the flydsl batched
     GEMM (flydsl.batched_gemm_a8w8) run with B = 1, which also serves untuned
-    shapes."""
+    shapes. libtype="opus" retains the exact numeric kid for native 128x128
+    scales; its existing launcher chooses JIT or pre-built CO."""
     m, k = XQ.shape
     n = WQ.shape[0]
     w_scale_block = mxscale_w_scale_block(tuple(w_scale.shape), n, k)
     x_block = k // x_scale.shape[-1]
     config = get_mxscale_bpreshuffle_config(m, n, k, w_scale_block)
+    if config is not None and config["libtype"] == "opus":
+        from csrc.opus_gemm.opus_gemm_common import (
+            a8w8_mxscale_bpreshuffle_supports_shape,
+            a8w8_mxscale_gemm_bpreshuffle_kernels_list,
+        )
+
+        kid = int(config["kernelId"])
+        instance = a8w8_mxscale_gemm_bpreshuffle_kernels_list.get(kid)
+        if instance is None:
+            raise ValueError(f"Unknown or unavailable OPUS MXFP8 bpreshuffle kid {kid}")
+        if (
+            w_scale_block == "128x128"
+            and x_block == 128
+            and Y.dtype == dtypes.bf16
+            and a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k)
+        ):
+            from .opus.gemm_op_a8w8 import _launch_a8w8_blockscale_bpreshuffle_gemm
+
+            # Quantizer/FlyDSL pass column-major bytes as a contiguous
+            # [M,K/128] tensor. Give OPUS the logical view without a copy.
+            opus_scale = (
+                x_scale if x_scale.stride() == (1, m)
+                else x_scale.view(k // 128, m).T
+            )
+            return _launch_a8w8_blockscale_bpreshuffle_gemm(
+                XQ, WQ, opus_scale, w_scale, Y, kid=kid, instance=instance,
+            )
+        # A padded-M lookup may find a shape-specialized OPUS row that cannot
+        # run the original shape. Keep the existing BMM heuristic fallback.
+        config = None
     backend = None if config is None else str(config["kernelId"])
     if config is not None and (
         config["libtype"] != "flydsl" or backend not in _MXSCALE_RAW_KERNEL_IDS
@@ -1253,8 +1284,8 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 XQ, WQ, x_scale, w_scale, Y, {"kernelName": ki.name}
             )
 
-    # E8M0 block scales take the flydsl GEMMs on raw scales (bmm or
-    # gemm_a8w8_mxfp8, as the tuned row says), FP32 ones CK / asm below.
+    # E8M0 block scales use the tuned FlyDSL or OPUS kernel on raw scales;
+    # FP32 scales use CK / asm below.
     if (
         get_gfx() == "gfx950"
         and x_scale.dtype == dtypes.fp8_e8m0

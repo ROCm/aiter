@@ -492,6 +492,7 @@ _A8W8_FAMILY_BY_TAG = {
     "a8w8": _A8W8_FAMILY,
     "a8w8_scale": _A8W8_BLOCKSCALE_FAMILY,
     "a8w8_blockscale_bpreshuffle_singlebuf": _A8W8_BPRESHUFFLE_FAMILY,
+    "a8w8_mxscale_gemm_bpreshuffle": _A8W8_BPRESHUFFLE_FAMILY,
     **{tag: _A8W8_MXSCALE_BMM_FAMILY for tag in _A8W8_MXSCALE_BMM_TAGS},
 }
 _A8W8_FAMILY_LAYOUT = {

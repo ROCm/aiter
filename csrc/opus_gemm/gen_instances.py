@@ -34,6 +34,7 @@ from opus_gemm_common import (
     OpusGemmInstance,
     a8w8_kernels_list,
     a8w8_mxscale_bmm_kernel_lists,
+    a8w8_mxscale_gemm_bpreshuffle_kernels_list,
     a8w8_scale_kernels_list,
     a16w16_flatmm_kernels_list,
     a16w16_flatmm_splitk_kernels_list,
@@ -241,12 +242,16 @@ INPUT_DTYPE_MAP = {
     "a8w8_mxscale_bmm_wave4m2_selfload": ("fp8_t", "fp8_t"),
     "a8w8": ("fp8_t", "fp8_t"),
     "a8w8_blockscale_bpreshuffle_singlebuf": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_gemm_bpreshuffle": ("fp8_t", "fp8_t"),
     **{tag: ("bf16_t", "bf16_t") for tag in _A16W16_TAGS},
 }
 
 # A16W16 uses separate direct-output and workspace launcher tables.
 A16W16_KID_DISPATCH_TAGS = set(_A16W16_TAGS)
-A8W8_BPRESHUFFLE_TAGS = {"a8w8_blockscale_bpreshuffle_singlebuf"}
+A8W8_BPRESHUFFLE_TAGS = {
+    "a8w8_blockscale_bpreshuffle_singlebuf",
+    "a8w8_mxscale_gemm_bpreshuffle",
+}
 # Three-tensor launchers: A16W16 and A8W8 no-scale.
 NOSCALE_TAGS = A16W16_KID_DISPATCH_TAGS | {"a8w8"}
 
@@ -1302,6 +1307,7 @@ if __name__ == "__main__":
     if args.tune_files is None and args.tune_file is not None:
         args.tune_files = args.tune_file
     TAG_TO_LIST = {
+        "a8w8_mxscale_gemm_bpreshuffle": a8w8_mxscale_gemm_bpreshuffle_kernels_list,
         "a8w8_scale": a8w8_scale_kernels_list,
         "a8w8": a8w8_kernels_list,
         "a16w16": a16w16_kernels_list,
