@@ -604,24 +604,46 @@ Legacy raw intrinsics (`buffer_ops.create_buffer_resource` / `buffer_load` /
 | `fx.UniversalCopy(64)` | 64 | 2x f32 elements |
 | `fx.UniversalCopy(128)` | 128 | 4x f32 elements |
 | `fx.rocdl.BufferCopy128b()` | 128 | AMD buffer load 4xf32 (CDNA) |
-| `fx.rocdl.make_tdm_atom(...)` | whole tile | gfx1250 TDM async Global↔LDS DMA (1–5D) — see below |
+| `fx.rocdl.cdna5.make_tiled_tdm_atom(...)` | whole tile | gfx1250 TDM async Global↔LDS DMA (1–5D) — see below |
 
-**gfx1250 TDM async copy** (`fx.rocdl.make_tdm_atom`): a whole-tile DMA whose
-descriptor (base pointer, per-dim extent for HW OOB handling, per-dim stride) is
-carried as **atom state**. The global operand of `copy_atom_call` is a
-shape/direction token only — its layout gives the compile-time N-D tile shape and
-its address space picks load vs store; its *pointer is unused* (base comes from
-state). Needs a **raw VA** (not `make_buffer_tensor`).
+**gfx1250 TDM async copy** — use `fx.rocdl.cdna5.make_tiled_tdm_atom` +
+`fx.rocdl.cdna5.tdm_partition`. The atom is built over the whole tensor,
+`zipped_divide` picks the block's tile, `tdm_partition` cuts one warp's share,
+and `fx.copy` moves it. Needs a **raw VA** (not `make_buffer_tensor`).
+
+Three things that used to be explicit parameters now live in the tensors, and
+the hand math for them goes away:
+
+- **extents and strides** — put them in the global view's layout, static or
+  runtime; the lowering opens the dynamic leaves itself. There is no
+  `tensor_extents=` or `strides=`.
+- **K advance** — the coordinate tensor's surviving rest mode is an **i32 tile
+  number**, not a byte `imm_offset`.
+- **LDS padding** — row slack in the LDS box layout. A *store* cannot drain a
+  padded tile, so for one make `tdm_tile` the padded width and give the view the
+  real width; `boundary_check` drops the pad columns.
 
 ```python
 lds = fx.SharedAllocator().allocate(fx.Array[fx.Float16, M * N]).peek()
-lds2d = fx.make_view(lds.ptr, fx.make_layout((M, N), (N, 1)))       # note: lds.ptr
-g2d = fx.make_view(fx.get_iter(A), fx.make_layout((M, N), (N, 1)))
-atom = fx.rocdl.make_tdm_atom(g2d, [M, N], num_warps=4)            # rank = len(extents), 1–5D
-fx.copy_atom_call(atom, g2d, lds2d)                               # Global → LDS
-fx.rocdl.tdm_ops.tensor_wait(0)                                  # await async DMA
-atom = fx.rocdl.advance_tdm_atom(atom, k_tile * k_stride_bytes)  # K-loop tile bump (imm_offset)
+g_full = fx.Tensor(fx.make_view(fx.get_iter(A), fx.make_layout((M, K), (lda, 1))))
+tile = (TM, TK)
+atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+    fx.rocdl.TensorLoad(), g_full, fx.make_layout(tile, (LDS_ROW, 1)), tile, num_warps=4
+)
+blk = fx.zipped_divide(coord, tile)[None, (bid_x, None)]   # keep ONE rest for K
+lds_box = fx.Tensor(fx.make_view(lds.ptr, fx.make_layout((tile, PIPE),
+                                                         ((LDS_ROW, 1), PITCH))))
+ts, tg = fx.rocdl.cdna5.tdm_partition(atom, wave, fx.make_layout(4, 1), lds_box, blk)
+fx.copy(atom, tg[None, k_tile_i32], ts[None, stage])       # Global -> LDS
+fx.rocdl.s_wait_tensorcnt(0)                               # await async DMA
 ```
+
+The older `fx.rocdl.make_tdm_atom` + `fx.copy_atom_call` + `advance_tdm_atom`
+carried the descriptor as atom state and is being retired — do not write new
+kernels against it. It is still required where the tiled atom cannot reach: the
+gather/scatter family (`make_tensor_gather_descriptor` / `tensor_load_gather`,
+for per-row addresses such as a KV page table), and a tile whose innermost
+dimension spans under 16 bytes per warp.
 
 ---
 
