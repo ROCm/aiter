@@ -7,7 +7,7 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl, tdm_ops
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -242,8 +242,8 @@ def launch_mla_pagesize64_fp8_fp8(
                 fx.make_view(
                     kv_lds_ptr,
                     fx.make_layout(
-                        ((HEADS_PER_WAVE, QK_NOPE_HEAD_DIM), 1),
-                        ((Q_LDS_ROW_BYTES, 1), HEADS_PER_WAVE * Q_LDS_ROW_BYTES),
+                        (HEADS_PER_WAVE, QK_NOPE_HEAD_DIM),
+                        (Q_LDS_ROW_BYTES, 1),
                     ),
                 )
             )
@@ -259,20 +259,16 @@ def launch_mla_pagesize64_fp8_fp8(
                     ),
                 )
             )
-            kv_tile = (HEADS_PER_WAVE, QK_NOPE_HEAD_DIM)
-            kv_nope_tdm_atom, kv_coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
-                fx.rocdl.TensorLoad(),
+            kv_nope_tdm_atom = fx.rocdl.make_tdm_atom(
                 kv_nope_global,
-                fx.make_layout(kv_tile, (Q_LDS_ROW_BYTES, 1)),
-                kv_tile,
+                [HEADS_PER_WAVE, None],
+                strides=[QK_NOPE_HEAD_DIM, None],
                 num_warps=1,
-            )
-            kv_blk = fx.zipped_divide(kv_coord, kv_tile)[None, (0, None)]
-            tKs, tKg = fx.rocdl.cdna5.tdm_partition(
-                kv_nope_tdm_atom, 0, fx.make_layout(1, 1), kv_lds, kv_blk
+                pad_interval=QK_NOPE_HEAD_DIM,
+                pad_amount=Q_LDS_ROW_BYTES - QK_NOPE_HEAD_DIM,
             )
             rocdl.sched_barrier(0)
-            fx.copy(kv_nope_tdm_atom, tKg[None, 0], tKs[None, 0])
+            fx.copy(kv_nope_tdm_atom, kv_nope_global, kv_lds)
             kv_dwords = _dword_iter(ptr_kv)
             for rope_pass in range_constexpr(2):
                 src_row = token_begin + rope_pass * 8 + rope_row
@@ -297,14 +293,14 @@ def launch_mla_pagesize64_fp8_fp8(
         @flyc.jit
         def wait_kv_page(has_next, has_second_next):
             if has_second_next:
-                rocdl.s_wait_tensorcnt(2)
+                tdm_ops.tensor_wait(2)
                 rocdl.s_wait_asynccnt(2 * ROPE_ASYNC_PER_PAGE)
             else:
                 if has_next:
-                    rocdl.s_wait_tensorcnt(1)
+                    tdm_ops.tensor_wait(1)
                     rocdl.s_wait_asynccnt(1 * ROPE_ASYNC_PER_PAGE)
                 else:
-                    rocdl.s_wait_tensorcnt(0)
+                    tdm_ops.tensor_wait(0)
                     rocdl.s_wait_asynccnt(0)
 
         second_page = split_page_begin + num_splits
@@ -846,25 +842,23 @@ def launch_mla_pagesize64_fp8_fp8(
                     fx.make_view(
                         output_lds_ptr,
                         fx.make_layout(
-                            ((HEADS_PER_WAVE, V_HEAD_DIM), 1),
-                            ((V_HEAD_DIM, 1), HEADS_PER_WAVE * V_HEAD_DIM),
+                            (HEADS_PER_WAVE, V_HEAD_DIM),
+                            (V_HEAD_DIM, 1),
                         ),
                     )
                 )
-                out_tile = (HEADS_PER_WAVE, V_HEAD_DIM)
-                output_tdm_atom, out_coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
-                    fx.rocdl.TensorStore(),
+                output_tdm_atom = fx.rocdl.make_tdm_atom(
                     output_global,
-                    fx.make_layout(out_tile, (V_HEAD_DIM, 1)),
-                    out_tile,
+                    [HEADS_PER_WAVE, None],
+                    strides=[V_HEAD_DIM, None],
                     num_warps=1,
                 )
-                out_blk = fx.zipped_divide(out_coord, out_tile)[None, (0, None)]
-                tOs, tOg = fx.rocdl.cdna5.tdm_partition(
-                    output_tdm_atom, 0, fx.make_layout(1, 1), output_lds, out_blk
+                fx.copy(
+                    output_tdm_atom,
+                    output_lds,
+                    output_global,
                 )
-                fx.copy(output_tdm_atom, tOs[None, 0], tOg[None, 0])
-                rocdl.s_wait_tensorcnt(0)
+                tdm_ops.tensor_wait(0)
             else:
                 for dv_tile in range_constexpr(PV_D_TILES):
                     for i in range_constexpr(PV_ACC_DWORDS):

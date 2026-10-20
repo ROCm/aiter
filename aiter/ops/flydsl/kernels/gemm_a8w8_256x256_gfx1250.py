@@ -538,7 +538,7 @@ def launch_gemm_a8w8_256x256(
 
         if const_expr(persistent_n_tiles > 1):
             rocdl.sched_barrier(0)
-            rocdl.s_wait_tensorcnt(0)
+            tdm_ops.tensor_wait(0)
         cluster.cluster_barrier()
         # Keep fragment displacements as DS immediates inside the K loop.
         stage_a_addr, stage_b_addr, stage_sa_addr, stage_sb_addr = (
@@ -1131,27 +1131,29 @@ def launch_gemm_a8w8_256x256(
                 bounded_m=bounded_m,
             )
         else:
-            c_tile = (tile_m, C_LDS_ROW)
-            gtC = _gv(gC_base, c_off_rt, (mn_oob, tile_n), (ldc64, 1))
-            atomC, coordC = fx.rocdl.cdna5.make_tiled_tdm_atom(
-                fx.rocdl.TensorStore(),
+            gtC = _gv(
+                gC_base,
+                c_off_rt,
+                (tile_m, C_LDS_ROW),
+                (C_LDS_ROW, 1),
+            )
+            atomC = fx.rocdl.make_tdm_atom(
                 gtC,
-                fx.make_layout(c_tile, (C_LDS_ROW, 1)),
-                c_tile,
+                [mn_oob, tile_n],
+                strides=[ldc64, None],
                 num_warps=num_waves,
             )
-            blkC = fx.zipped_divide(coordC, c_tile)[None, (0, None)]
-            sC = _view(
-                fx.recast_iter(partial_elem, base_ptr),
-                (c_tile, 1),
-                ((C_LDS_ROW, 1), tile_m * C_LDS_ROW),
+            fx.copy(
+                atomC,
+                _view(
+                    fx.recast_iter(partial_elem, base_ptr),
+                    (tile_m, C_LDS_ROW),
+                    (C_LDS_ROW, 1),
+                ),
+                gtC,
             )
-            tCs, tCg = fx.rocdl.cdna5.tdm_partition(
-                atomC, wave, fx.make_layout(num_waves, 1), sC, blkC
-            )
-            fx.copy(atomC, tCs[None, 0], tCg[None, 0])
             if const_expr(persistent_n_tiles == 1):
-                rocdl.s_wait_tensorcnt(0)
+                tdm_ops.tensor_wait(0)
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
     def kernel_gemm_a8w8_256x256(
@@ -1189,7 +1191,7 @@ def launch_gemm_a8w8_256x256(
                 fx.Int32(0), fx.Int32(persistent_n_tiles), fx.Int32(1)
             ):
                 _run_tile(*tile_args, tile_idx)
-            rocdl.s_wait_tensorcnt(0)
+            tdm_ops.tensor_wait(0)
 
     gx = (i32_m + (tile_m - 1)) // tile_m
     gy = (N + (tile_n - 1)) // tile_n

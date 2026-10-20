@@ -121,7 +121,7 @@ class _EpPsumScanStorage:
 # descriptor builder sign-extends the size to 64 bits.
 _SCALE_RSRC_MAX_BYTES = 0x7FFFFFFF
 # TDM staging depth. One chunk is degenerate -- the prologue waits on the whole
-# row with nothing to overlap -- and past four the per-chunk s_wait_tensorcnt and two
+# row with nothing to overlap -- and past four the per-chunk tensor_wait and two
 # CTA barriers outweigh the smaller transfer. Four also divides every shipped
 # model_dim's iteration count, so one depth serves them all.
 _TOKEN_MULTIDEST_TDM_CHUNKS = 4
@@ -2198,15 +2198,13 @@ def build_moe_token_multidest_quant_module(
                 # barrier publishes chunk n, which only wave 0 waited on.
                 if const_expr(chunk == 0) and is_loader:
                     _issue_hidden(0)
-                    rocdl.s_wait_tensorcnt(0)
+                    tdm_ops.tensor_wait(0)
                 gpu.barrier()
                 if is_loader and const_expr(chunk + 1 < tdm_hidden_chunks):
                     _issue_hidden(chunk + 1)
                 if const_expr(chunk > 0):
                     if is_loader:
-                        rocdl.s_wait_tensorcnt(
-                            1 if chunk + 1 < tdm_hidden_chunks else 0
-                        )
+                        tdm_ops.tensor_wait(1 if chunk + 1 < tdm_hidden_chunks else 0)
                     gpu.barrier()
 
         # CTA-uniform guard (every launched block owns at least one token), so
@@ -2507,13 +2505,13 @@ def build_moe_token_multidest_compact_quant_module(
                 def chunk_prefetch(chunk):
                     if const_expr(chunk == 0) and is_loader:
                         _issue_hidden(0)
-                        rocdl.s_wait_tensorcnt(0)
+                        tdm_ops.tensor_wait(0)
                     gpu.barrier()
                     if is_loader and const_expr(chunk + 1 < tdm_hidden_chunks):
                         _issue_hidden(chunk + 1)
                     if const_expr(chunk > 0):
                         if is_loader:
-                            rocdl.s_wait_tensorcnt(
+                            tdm_ops.tensor_wait(
                                 1 if chunk + 1 < tdm_hidden_chunks else 0
                             )
                         gpu.barrier()
