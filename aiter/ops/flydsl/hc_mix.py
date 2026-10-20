@@ -93,7 +93,9 @@ def _load(tensor, offset, width, dtype):
         kind = fx.rocdl.BufferCopy32b()
     else:
         kind = fx.rocdl.BufferCopy16b()
-    view = fx.make_view(fx.get_iter(tensor) + fx.Int32(offset), fx.make_layout(width, 1))
+    view = fx.make_view(
+        fx.get_iter(tensor) + fx.Int32(offset), fx.make_layout(width, 1)
+    )
     frag = fx.make_rmem_tensor(width, dtype)
     fx.copy(fx.make_copy_atom(kind, dtype), view, frag)
     return fx.Vector(frag.load())
@@ -311,7 +313,8 @@ def _hc_up_silu(
                 align=16,
                 byte_offset=(c + c // (R // 8)) * fx.Int32(16),
             )
-            if const_expr((j + 1) * threads <= chunks):
+            # Compile-time full chunk vs. runtime-guarded tail; keep separate.
+            if const_expr((j + 1) * threads <= chunks):  # noqa: SIM114
                 fx.ptr_store(vals[j].ir_value(), ptr)
             elif c < chunks:
                 fx.ptr_store(vals[j].ir_value(), ptr)
@@ -325,9 +328,7 @@ def _hc_up_silu(
         if const_expr(g > 0):
             bvs = []
             for ki in range_constexpr(g, min(g + _PREFETCH, steps)):
-                bvs.append(
-                    _load(w, (nt * steps + ki) * 512 + lane * 8, 8, fx.BFloat16)
-                )
+                bvs.append(_load(w, (nt * steps + ki) * 512 + lane * 8, 8, fx.BFloat16))
         for j in range_constexpr(len(bvs)):
             ki = g + j
             for t in range_constexpr(mt):
