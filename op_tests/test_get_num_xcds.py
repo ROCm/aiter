@@ -34,7 +34,8 @@ class TestGetNumXcds(unittest.TestCase):
         self.assertEqual(device_info._xcds_for_part("gfx942", 228), 6)
         self.assertEqual(device_info._xcds_for_part("gfx942", 80), 4)
         self.assertEqual(device_info._xcds_for_part("gfx950", 256), 8)
-        self.assertEqual(device_info._xcds_for_part("gfx942", 1), 8)
+        # Unlisted part. 120 CUs can hold 8 XCDs; a 1-CU part cannot.
+        self.assertEqual(device_info._xcds_for_part("gfx942", 120), 8)
 
     def test_rocm_before_7_uses_part_table(self):
         with (
