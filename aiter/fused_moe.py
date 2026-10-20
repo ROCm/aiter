@@ -1506,8 +1506,8 @@ def _fused_moe_impl(
     M, topk = topk_ids.shape
     herd_candidate_ids, herd_candidate_weights = topk_ids, topk_weight
     if herd_topk:
-        if get_gfx() != "gfx950":
-            raise ValueError("HERD MoE requires gfx950")
+        if get_gfx() not in ("gfx950", "gfx1250"):
+            raise ValueError("HERD MoE requires gfx950 or gfx1250")
         if topk != herd_topk + 1 or topk_weight.shape != topk_ids.shape:
             raise ValueError(
                 "herd_topk requires K+1 candidate IDs and weights per token"
@@ -1625,10 +1625,17 @@ def _fused_moe_impl(
             situ_beta=1.0 if beta is None else float(beta),
             situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
             stage2_scatter=stage2_scatter,
+            herd_topk=herd_topk,
+            herd_routed_scaling_factor=herd_routed_scaling_factor,
         )
 
     if grouped_a8w4_out is not None:
         return _return_output(grouped_a8w4_out, output)
+    if herd_topk and get_gfx() == "gfx1250":
+        raise ValueError(
+            "gfx1250 HERD needs the grouped MoE path (per_1x32 MXFP4 weights, "
+            "gate_mode=INTERLEAVE)"
+        )
 
     # a16w4-SiTUv2 (bf16 A x MXFP4 W); SiTUv2 gate distinguishes gpt-oss (Swiglu -> cktile).
     _is_a16w4_situv2 = (
