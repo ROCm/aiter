@@ -314,14 +314,20 @@ def test_metadata(
     return ret
 
 
-def check_intra_batch_kv_coverage(nhead, dtype, kvtype):
+def check_intra_batch_kv_coverage(
+    nhead, dtype, kvtype, kv_lens=None, kv_granularity=None
+):
     """intra_batch_mode (v1_0): each batch's works must tile its KV range exactly.
 
-    gfx942 splits every sequence 16 ways, so short contexts reach the case where a
-    tail of <= 4 tokens is folded into the previous split and the split count drops
-    to 1. Returns the kv lengths whose works leave a gap or an overlap.
+    A tail of <= 4 tokens is folded into the previous split. When that fold
+    leaves a single split, the second pass used to skip the tail, so the last
+    1-4 tokens were never attended. Returns the kv lengths that still have a
+    gap or an overlap.
     """
-    kv_lens = list(range(1, 65)) + [127, 128, 129, 2048, 2049]
+    if kv_lens is None:
+        kv_lens = list(range(1, 65)) + [127, 128, 129, 2048, 2049]
+    if kv_granularity is None:
+        kv_granularity = KV_GRANULARITY
     batch_size = len(kv_lens)
     qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32)
     kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32)
@@ -354,7 +360,7 @@ def check_intra_batch_kv_coverage(nhead, dtype, kvtype):
         outs["reduce_final_map"],
         outs["reduce_partial_map"],
         page_size=PAGE_SIZE,
-        kv_granularity=KV_GRANULARITY,
+        kv_granularity=kv_granularity,
         max_seqlen_qo=MAX_SEQLEN_QO,
         uni_seqlen_qo=UNI_SEQLEN_QO,
         fast_mode=False,
@@ -379,6 +385,30 @@ def check_intra_batch_kv_coverage(nhead, dtype, kvtype):
         if pos != kv[b + 1]:
             bad.append(kv_len)
     return bad
+
+
+def test_intra_batch_kv_coverage():
+    gfx = get_gfx()
+    if gfx == "gfx942":
+        gran = 16
+        kv_lens = [16, 17, 18, 19, 20]
+    elif gfx == "gfx950":
+        gran = 256
+        kv_lens = [512, 513, 514, 515, 516]
+    else:
+        return
+
+    bad = check_intra_batch_kv_coverage(
+        nhead=16,
+        dtype=dtypes.fp8,
+        kvtype=dtypes.fp8,
+        kv_lens=kv_lens,
+        kv_granularity=gran,
+    )
+    assert not bad, (
+        f"intra_batch_mode leaves KV uncovered for kv_len {bad} "
+        f"at kv_granularity {gran}"
+    )
 
 
 def main():
@@ -483,9 +513,7 @@ def main():
     )
     assert all_match, "parallel MLA metadata planner diverged from serial reference"
 
-    if get_gfx() == "gfx942":
-        bad = check_intra_batch_kv_coverage(nhead, dtype, kvtype)
-        assert not bad, f"intra_batch_mode leaves KV uncovered for kv_len {bad}"
+    test_intra_batch_kv_coverage()
 
 
 if __name__ == "__main__":
