@@ -122,6 +122,7 @@ class _UAParams(NamedTuple):
     v_descale: torch.Tensor | None = None
     output_scale: torch.Tensor | None = None
     skip_reduce: bool = False
+    per_token_kv_scales: bool = False
 
 
 def _gfx950_gluon_supported(params: _UAParams):
@@ -143,7 +144,7 @@ def _gfx950_gluon_supported(params: _UAParams):
         and triton.next_power_of_2(params.head_size) == params.head_size
         and params.head_size_v == params.head_size
         and params.q_dtype in (e4m3_dtype, torch.bfloat16)
-        and params.q_dtype == params.kv_cache_dtype
+        and (params.q_dtype == params.kv_cache_dtype or params.per_token_kv_scales)
     )
 
 
@@ -228,7 +229,15 @@ def unified_attention(
     skip_reduce: bool = False,
     # backend
     backend: str | None = None,  # "triton" | "gluon"
+    k_scale_cache=None,
+    v_scale_cache=None,
 ):
+    """Compute causal paged attention into out.
+
+    Optional FP32 scale caches have shape [page, KV head, token]. They support
+    gfx950 Gluon with BF16 queries and shuffled FP8 KV, head and page size 128.
+    Other arguments and return values follow the upstream unified API.
+    """
     assert causal, "Only causal attention is supported"
 
     if backend is None:
@@ -328,6 +337,39 @@ def unified_attention(
         total_num_q_blocks = num_tokens // BLOCK_Q + num_seqs
     num_2d_prgms = total_num_q_blocks * num_kv_heads
 
+    per_token_kv_scales = k_scale_cache is not None or v_scale_cache is not None
+    if per_token_kv_scales:
+        if not (
+            backend == "gluon"
+            and DEVICE_ARCH == "gfx950"
+            and q_dtype == torch.bfloat16
+            and kv_cache_dtype == e4m3_dtype
+            and shuffled_kv_cache
+            and k.ndim == v.ndim == 5
+            and head_size == head_size_v == block_size == 128
+            and not SLIDING_WINDOW
+            and not use_alibi_slopes
+            and not use_qq_bias
+            and not softcap
+            and q_descale is None
+            and k_descale is None
+            and v_descale is None
+        ):
+            raise ValueError(
+                "Scale caches require gfx950 Gluon BF16/FP8 shuffled page-128 KV"
+            )
+        for scale in (k_scale_cache, v_scale_cache):
+            if (
+                scale is None
+                or scale.dtype != torch.float32
+                or scale.device != q.device
+                or tuple(scale.shape) != (num_blocks, num_kv_heads, block_size)
+            ):
+                raise ValueError(
+                    "KV scale caches must be FP32 [page, KV head, token] on the query device"
+                )
+        k_descale, v_descale = k_scale_cache, v_scale_cache
+
     # build parameters
     params = _UAParams(
         q=q,
@@ -374,7 +416,13 @@ def unified_attention(
         v_descale=v_descale,
         output_scale=output_scale,
         skip_reduce=skip_reduce,
+        per_token_kv_scales=per_token_kv_scales,
     )
+
+    if per_token_kv_scales and not _gfx950_gluon_supported(params):
+        raise RuntimeError(
+            "Scaled gfx950 Gluon is unavailable; refusing attention fallback"
+        )
 
     # if batch contains a prefill
     if use_2d_kernel(params, backend):
@@ -1122,6 +1170,25 @@ def _unified_attention_gfx950(
         partial_m_ptr=partial_m,
         partial_l_ptr=partial_l,
         partial_acc_ptr=partial_acc,
+        PER_TOKEN_KV_SCALES=params.per_token_kv_scales,
+        stride_k_scale_0=(
+            params.k_descale.stride(0) if params.per_token_kv_scales else 0
+        ),
+        stride_k_scale_1=(
+            params.k_descale.stride(1) if params.per_token_kv_scales else 0
+        ),
+        stride_k_scale_2=(
+            params.k_descale.stride(2) if params.per_token_kv_scales else 0
+        ),
+        stride_v_scale_0=(
+            params.v_descale.stride(0) if params.per_token_kv_scales else 0
+        ),
+        stride_v_scale_1=(
+            params.v_descale.stride(1) if params.per_token_kv_scales else 0
+        ),
+        stride_v_scale_2=(
+            params.v_descale.stride(2) if params.per_token_kv_scales else 0
+        ),
         enable_fp_fusion=True,
     )
 
