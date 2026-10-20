@@ -7,6 +7,7 @@ import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.common import (
     apply_rotary,
+    attention_mask,
     compute_alibi_block,
     compute_fp8_scaling_factors,
 )
@@ -255,32 +256,6 @@ fwd_prefill_autotune_configs = autotune_configs(
 
 
 @triton.jit
-def attention_mask(
-    offs_m,
-    offs_n,
-    seqlen_q,
-    seqlen_k,
-    IS_CAUSAL: tl.constexpr,
-    USE_SLIDING_WINDOW: tl.constexpr,
-    WINDOW_SIZE_LEFT: tl.constexpr,
-    WINDOW_SIZE_RIGHT: tl.constexpr,
-):
-    """Allowed query/key pairs; negative window sizes mean unbounded."""
-    # Align query and key positions at the end of unequal-length sequences.
-    query_pos = offs_m[:, None] + seqlen_k - seqlen_q
-    key_pos = offs_n[None, :]
-    allowed = (offs_m[:, None] < seqlen_q) & (key_pos < seqlen_k)
-    if IS_CAUSAL:
-        allowed = allowed & (key_pos <= query_pos)
-    if USE_SLIDING_WINDOW:
-        if WINDOW_SIZE_LEFT >= 0:
-            allowed = allowed & (key_pos >= query_pos - WINDOW_SIZE_LEFT)
-        if WINDOW_SIZE_RIGHT >= 0:
-            allowed = allowed & (key_pos <= query_pos + WINDOW_SIZE_RIGHT)
-    return allowed
-
-
-@triton.jit
 def _attn_fwd_inner(
     acc,
     l_i,
@@ -311,7 +286,6 @@ def _attn_fwd_inner(
     offs_d_v,
     block_min,
     block_max,
-    n_extra_tokens,
     alibi_slope,
     q_descale,
     k_descale,
@@ -387,13 +361,6 @@ def _attn_fwd_inner(
         # setup qk accumulator
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
 
-        # Apply extra token masking for partial blocks (only when APPLY_MASK=True)
-        if APPLY_MASK and ((n_extra_tokens != 0) and (start_n + BLOCK_N == block_max)):
-            boundary_m = tl.full([BLOCK_M], seqlen_k, dtype=tl.int32)
-            size_n = start_n + offs_n[None, :]
-            mask = size_n < boundary_m[:, None]
-            qk = tl.where(mask, qk, float("-inf"))
-
         # -- compute qk ----
         if IS_FP8:
             qk += tl.dot(q, k) * q_descale * k_descale
@@ -461,6 +428,7 @@ def _attn_fwd_inner(
             dropout_mask = rng_output > dropout_p
 
             if RETURN_SCORES:
+                # Negative scores mark dropped values.
                 sd_mask_value = tl.where(dropout_mask, p, -p)
             p = tl.where(dropout_mask, p, 0.0)
         elif RETURN_SCORES:
@@ -1132,7 +1100,6 @@ def attn_fwd(
             offs_d_v,
             block_min,  # Start of front masked blocks
             block_max,  # End of front masked blocks
-            0,  # n_extra_tokens (0 for front blocks, only relevant for last block)
             alibi_slope,
             q_descale,
             k_descale,
@@ -1199,7 +1166,6 @@ def attn_fwd(
             offs_d_v,
             block_min,  # Start of range: 0
             block_max,  # End of range: n_full_blocks * BLOCK_N
-            0,  # n_extra_tokens (not used for full blocks)
             alibi_slope,
             q_descale,
             k_descale,
@@ -1271,7 +1237,6 @@ def attn_fwd(
             offs_d_v,
             block_min,  # Start of range: n_full_blocks * BLOCK_N
             block_max,  # End of range: n_visible_k_blocks * BLOCK_N
-            n_extra_tokens,  # Padding tokens in last block
             alibi_slope,
             q_descale,
             k_descale,

@@ -272,6 +272,51 @@ def test_mha_dao_ai(
             )
 
 
+@pytest.mark.parametrize(
+    "causal,window_size",
+    [(True, (-1, -1)), (False, (16, 16))],
+)
+def test_mha_dao_ai_dropout_scores(dao_ai_impl, causal, window_size):
+    torch.manual_seed(20)
+    seqlen = 96  # Partial final key block.
+    q = torch.randn(1, seqlen, 4, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    out, lse, scores = flash_attn_func(
+        q,
+        k,
+        v,
+        dropout_p=0.25,
+        causal=causal,
+        window_size=window_size,
+        return_lse=True,
+        return_attn_probs=True,
+    )
+
+    query_pos = torch.arange(seqlen, device="cuda")[:, None]
+    key_pos = torch.arange(seqlen, device="cuda")[None, :]
+    if causal:
+        allowed = key_pos <= query_pos
+    else:
+        allowed = (key_pos >= query_pos - 16) & (key_pos <= query_pos + 16)
+    assert scores.shape == (1, 4, seqlen, seqlen)
+    assert torch.all(scores[..., ~allowed] == 0)
+    assert torch.any(scores[..., allowed] < 0)
+    assert torch.any(scores[..., allowed] > 0)
+
+    ref_out, _, ref_lse = attention_ref(
+        q,
+        k,
+        v,
+        dropout_p=0.25,
+        dropout_mask=scores >= 0,
+        causal=causal,
+        window_size=window_size,
+    )
+    torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse, ref_lse.float(), atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("default_device", ["cpu", "cuda"])
 @pytest.mark.parametrize("mha_type", ["mha", "gqa"])
 def test_mha_dao_ai_graph(dao_ai_impl, mha_type, default_device):

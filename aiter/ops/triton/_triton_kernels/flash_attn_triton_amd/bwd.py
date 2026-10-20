@@ -3516,13 +3516,10 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
             mask_d_v = offs_d_v < ACTUAL_HEAD_DIM_V
             mask_v &= mask_d_v[None, :]
 
-        # Packed sequences use global token rows; dense tensors use a batch offset.
+        # Varlen batch strides are zero; k_start selects the global token rows.
         kv_rows = k_start + offs_n
-        dk_base = DK + hkid * stride_dkh
-        dv_base = DV + hkid * stride_dvh
-        if not IS_VARLEN:
-            dk_base += bid * stride_dkb
-            dv_base += bid * stride_dvb
+        dk_base = DK + bid * stride_dkb + hkid * stride_dkh
+        dv_base = DV + bid * stride_dvb + hkid * stride_dvh
         dk_ptrs = (
             dk_base + kv_rows[:, None] * stride_dkn + offs_d_qk[None, :] * stride_dkd
         )
