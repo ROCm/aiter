@@ -12,9 +12,6 @@ import math
 
 import torch
 
-from aiter.ops.triton.attention.unified_attention import unified_attention
-from aiter.ops.triton.utils.types import e4m3_dtype
-
 
 def report_output(label, out, expected, q_lens):
     """Keep per-request evidence even when the correctness gate fails."""
@@ -163,7 +160,7 @@ def diagnose_launches(
                                 b = ref[begin : begin + qlen, :, :active]
                                 finite = torch.isfinite(a) & torch.isfinite(b)
                                 print(
-                                    f"[paged-prefill-partial] variant={label} range={begin}:{begin+qlen} tensor={name} nonfinite={int((~torch.isfinite(a)).sum())} ref_nonfinite={int((~torch.isfinite(b)).sum())} max_finite_error={float((a-b).abs()[finite].max()) if finite.any() else None}",
+                                    f"[paged-prefill-partial] variant={label} range={begin}:{begin + qlen} tensor={name} nonfinite={int((~torch.isfinite(a)).sum())} ref_nonfinite={int((~torch.isfinite(b)).sum())} max_finite_error={float((a - b).abs()[finite].max()) if finite.any() else None}",
                                     flush=True,
                                 )
                             for seg in range(active):
@@ -171,7 +168,7 @@ def diagnose_launches(
                                 b = partial_reference[1][begin : begin + qlen, :, seg]
                                 good = torch.isfinite(a) & torch.isfinite(b)
                                 print(
-                                    f"[paged-prefill-segment] range={begin}:{begin+qlen} segment={seg} max_error={float((a-b).abs()[good].max()) if good.any() else None}",
+                                    f"[paged-prefill-segment] range={begin}:{begin + qlen} segment={seg} max_error={float((a - b).abs()[good].max()) if good.any() else None}",
                                     flush=True,
                                 )
                             begin += qlen
@@ -198,14 +195,21 @@ def check_case(
     q_lens=None,
     k_lens=None,
     backend="triton",
+    device="cuda",
+    reference_only=False,
 ):
     torch.manual_seed(125)
-    device = "cuda"
     q_lens = q_lens or ([1, 1] if split else [2, 7, 19])
     k_lens = k_lens or ([2049, 2071] if split else [39, 145, 273])
     kv_heads = (1 if split else 16) if kv_heads is None else kv_heads
     pages_per_request = [math.ceil(n / page) for n in k_lens]
     num_pages = sum(pages_per_request) + 4
+    if str(device) == "cpu":
+        # Match the target gfx950 encoding without importing GPU libraries.
+        e4m3_dtype = torch.float8_e4m3fn
+    else:
+        from aiter.ops.triton.utils.types import e4m3_dtype
+
     kv_dtype = torch.bfloat16 if mode == "bf16" else e4m3_dtype
     dense_k = torch.randn(num_pages, page, kv_heads, dim, device=device).to(kv_dtype)
     dense_v = torch.randn_like(dense_k, dtype=torch.float32).to(kv_dtype)
@@ -218,7 +222,9 @@ def check_case(
     for i, count in enumerate(pages_per_request):
         table[i, :count] = perm[offset : offset + count]
         offset += count
-    if len(q_lens) > 1:
+    # Only a full prefix page may be shared. Poisoning a partial page for
+    # a shorter request would overwrite another request's valid values.
+    if len(q_lens) > 1 and min(k_lens[:2]) >= page:
         table[1, 0] = table[0, 0]
     # Poison invalid final-page V slots: the kernel must mask them before PV.
     for i, length in enumerate(k_lens):
@@ -284,6 +290,11 @@ def check_case(
         expected.append(torch.einsum("hqk,khd->qhd", scores.softmax(-1), values))
         begin += qlen
     expected = torch.cat(expected).bfloat16()
+    assert torch.isfinite(expected).all().item(), (
+        "Invalid fixture: reference contains NaN/Inf before the attention launch"
+    )
+    if reference_only:
+        return expected, table, dense_v
     # Guard the padded-head span so a wrong single-segment output pitch is
     # detected without corrupting the query, cache, or subsequent diagnostics.
     padded_dim = 1 << (dim - 1).bit_length()
@@ -301,6 +312,8 @@ def check_case(
         flush=True,
     )
     kwargs = {"k_scale_cache": ks, "v_scale_cache": vs} if mode == "token" else {}
+    from aiter.ops.triton.attention.unified_attention import unified_attention
+
     unified_attention(
         q,
         kc,
