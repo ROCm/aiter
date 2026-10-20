@@ -124,8 +124,7 @@ DINLINE opus::fp32_t downcast_s<opus::fp32_t>(opus::fp32_t val)
 // ---------------------------------------------------------------------------
 // LL (low-latency) small-message all-reduce
 // ---------------------------------------------------------------------------
-// Ported from the standalone PoC (formerly custom_all_reduce_ll_poc.*), now
-// folded into the gfx1250 path. Flag-in-data, zero GPU barrier: each 16B line
+// Flag-in-data, zero GPU barrier: each 16B line
 // carries 8B payload + two 4B epoch flags. A rank publishes its sendbuff into
 // every peer's staging scratch, then polls its own scratch for the peers' lines
 // (spinning on the flag) and reduces in fp32. The scratch lives appended to the
@@ -135,8 +134,7 @@ DINLINE opus::fp32_t downcast_s<opus::fp32_t>(opus::fp32_t val)
 constexpr int    kLLMaxRanks       = kMaxNgpus;
 // Route to LL when bytes <= this (matches RCCL DDA_ALLREDUCE_LL_THRESHOLD).
 constexpr size_t kLLArMaxBytes     = 4194304;           // 4 MiB
-// Hard per-message payload cap (one slot). Comfortably above the routing
-// threshold so all dtypes at <=128 KiB fit.
+// Hard per-message payload cap (one slot), equal to the routing threshold.
 constexpr size_t kLLScratchCapBytes = 4194304;          // 4 MiB
 // Per-rank staging slot capacity, in 8-byte packets.
 constexpr size_t kLLPackCapacity   = kLLScratchCapBytes / 8;  // 524288
@@ -1105,7 +1103,8 @@ public:
     // LL small-message fast path. Device table of per-rank scratch bases (each
     // = peer meta base + kLLScratchOffset, i.e. the region right after the peer
     // Signal in the shared meta buffer) and a persistent per-block epoch array.
-    // Allocated lazily by ensure_ll_tables_() on the first LL launch.
+    // Built eagerly by the constructors so graph capture never performs an
+    // allocation; ensure_ll_tables_() remains idempotent.
     void**    d_ll_peers_       = nullptr;
     uint32_t* d_ll_block_flags_ = nullptr;
 
@@ -1222,7 +1221,7 @@ public:
         return !disabled;
     }
 
-    // Lazily build the per-rank LL scratch pointer table and per-block epoch.
+    // Build the per-rank LL scratch pointer table and per-block epoch.
     // sg_.signals[i] is each rank's meta base (populated by both constructors);
     // the LL scratch sits at + kLLScratchOffset. The shared meta buffer is
     // zero-initialized by the caller, which resets the LL flags (0 == cleared).
