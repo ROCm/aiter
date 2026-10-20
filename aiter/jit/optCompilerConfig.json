@@ -1099,6 +1099,19 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_kpool_compress": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/kpool_compress_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/kpool_compress.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_sample": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/sample_pybind.cu'",
