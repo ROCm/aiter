@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
-"""Fused Stage1 dispatch with FP8 activation and FP4-weight GEMM1."""
+"""Fused Stage1 dispatch with FP8/FP4 activation and FP4-weight GEMM1."""
 
 import functools
 
@@ -31,7 +31,6 @@ from .gemm1 import _LdsF32View, build_fused_gemm1
 from .mega_moe_config import (
     FIXED_GRID_MULT_VALUES,
     INDEXED_PAYLOAD_MIN_MTPR,
-    INDEXED_PAYLOAD_MIN_SBM,
     Stage1Config,
     fixed_stage1_epoch_slot,
 )
@@ -95,7 +94,7 @@ def compile_mega_moe_stage1(
     waves_per_eu_hint: int = 2, num_cu: int = 256, num_dispatch_cu: int = 32,
     b_nt: int = -1,
     work_shards: int | None = None, payload_chunk_rows: int = 0,
-    tile_state_stride: int = 0,
+    tile_state_stride: int = 0, a_dtype: str = "fp8", out_dtype: str = "fp8",
     swiglu_limit: float = 0.0,
     act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0,
     bounds_check: bool = False,
@@ -148,9 +147,11 @@ def compile_mega_moe_stage1(
     M_REPEAT = sort_block_m // 16
     NUM_ACC_N = n_per_wave // 16
     assert NUM_ACC_N % 2 == 0 and M_REPEAT % 2 == 0
+    assert a_dtype in ("fp4", "fp8")
+    assert out_dtype in ("fp4", "fp8")
 
     assert tile_k == 256, "MegaMoE v2 GEMM1 requires tile_k=256"
-    A_K_STEP_BYTES = tile_k
+    A_K_STEP_BYTES = tile_k // (2 if a_dtype == "fp4" else 1)
     K_ITERS = model_dim // tile_k
     TOTAL_THREADS = NUM_WAVES * 64
     WORK_SHARDS = 4 if work_shards is None and int(fuse_mtpr) >= 8192 else 8
@@ -176,10 +177,13 @@ def compile_mega_moe_stage1(
     if fixed_slot_dispatch:
         _validate_fixed_slot_geometry(fz_npes, fz_epr, fz_mtpr, fz_cap, fz_tile_m)
     fz_total_experts = fz_npes * fz_epr
+    # The payload buffer is sized for the source-indexed layout at the indexed-
+    # capable MTPR class, so every rank there uses indexed (one row per source
+    # token) regardless of sort_block_m. The receive layout must not depend on a
+    # per-rank quantity: a route-major rank would need one row per (token,expert),
+    # which cross-rank token skew can push past the shared payload buffer.
     indexed_payload = (
-        not fixed_slot_dispatch
-        and fuse_mtpr >= INDEXED_PAYLOAD_MIN_MTPR
-        and sort_block_m >= INDEXED_PAYLOAD_MIN_SBM
+        not fixed_slot_dispatch and fuse_mtpr >= INDEXED_PAYLOAD_MIN_MTPR
     )
     source_rows = fz_npes * fz_mtpr + 1 if indexed_payload else 0
     if indexed_payload and source_rows * model_dim >= _BUFFER_OFFSET_ABI_BYTES:
@@ -192,7 +196,9 @@ def compile_mega_moe_stage1(
         )
     # Small batches stream B; large batches cache it across M tiles.
     b_cache_modifier = int(b_nt) if int(b_nt) >= 0 else (3 if fz_mtpr <= 512 else 0)
-    fz_nbytes = model_dim
+    a_pack = 2 if a_dtype == "fp4" else 1
+    out_pack = 2 if out_dtype == "fp4" else 1
+    fz_nbytes = model_dim // a_pack
     fz_n_i32 = fz_nbytes // 4
     fz_scale_bytes = int(fuse_scale_dim)
     fz_scale_n_i32 = (fz_scale_bytes + 3) // 4 if fz_scale_bytes > 0 else 0
@@ -201,7 +207,7 @@ def compile_mega_moe_stage1(
     fz_enable_scales = fz_scale_bytes > 0
     fz_safe_end_i32 = (fz_n_i32 // 512) * 512
     _validate_dispatch_capacity(
-        fz_mtpr, fz_npes, fz_epr, fz_k, fz_tile_m, fz_nbytes, inter_dim, use_tile_resource
+        fz_mtpr, fz_npes, fz_epr, fz_k, fz_tile_m, fz_nbytes, inter_dim // out_pack, use_tile_resource
     )
 
     @fx.struct
@@ -255,7 +261,7 @@ def compile_mega_moe_stage1(
         return {"num_records_bytes": nbytes} if bounds_check else {}
     kernel_name = (
         f"megamoe_stage1_{dispatch_path}_t{sort_block_m}x{tile_n}x{tile_k}"
-        "_afp8ofp8"
+        f"_a{a_dtype}o{out_dtype}"
         f"_w{NUM_WAVES}_gm{grid_mult}"
         f"_dcu{dispatch_blocks}_pw{int(pipe_weights)}ma{int(mfma_amajor)}sw{int(swizzle_a)}"
         f"_cgc{grid_x}"
@@ -501,9 +507,13 @@ def compile_mega_moe_stage1(
         if const_expr(use_tile_resource):
             out_rsrc = None
         else:
-            out_nbytes = tokens * fx.Int32(inter_dim)
+            out_nbytes = tokens * fx.Int32(inter_dim // out_pack)
             # In the element width of the epilogue's stores (see SiluQuantEpilogue).
-            if const_expr(EPI_EVEC == 8):
+            if const_expr(out_dtype == "fp4"):
+                out_rsrc = ptr_buf_tensor(
+                    fx.get_iter(out), fx.Int8, num_records_bytes=out_nbytes
+                )
+            elif const_expr(EPI_EVEC == 8):
                 out_rsrc = ptr_buf_tensor(
                     fx.get_iter(out), fx.Int32, unit_elems=2, num_records_bytes=out_nbytes
                 )
@@ -533,6 +543,7 @@ def compile_mega_moe_stage1(
             indexed_input=indexed_payload,
             row_map_rsrc=srcmap_rsrc,
             source_rows=source_rows,
+            a_dtype=a_dtype, out_dtype=out_dtype,
             swiglu_limit=swiglu_limit,
             act=act, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta,
         )
@@ -605,14 +616,8 @@ def compile_mega_moe_stage1(
                 if work < total_work:
                     if const_expr(fixed_slot_dispatch):
                         fx.barrier()
-                    else:
-                        # Both the sequential and the ready-order compact paths
-                        # must wait for the tile to be published and acquire
-                        # before reading its per-tile metadata.  The ready-order
-                        # path previously skipped this, so a consumer could read
-                        # tile_input_base (and the other per-tile metadata) before
-                        # the planner's store was visible, feeding a stale/garbage
-                        # row into the A-scale gather and faulting under skew.
+                    elif not use_ready_order:
+                        # Ready-order waits for the tile in the scheduler block.
                         if tid == fx.Int32(0):
                             _wait_tile_payload(work)
                         fx.barrier()
@@ -681,6 +686,7 @@ def compile_mega_moe_stage1(
                         scheduled_first = (
                             ready_m_tile * fx.Int32(N_TILES) + first_n_tile
                         )
+                        _wait_tile_payload(scheduled_first)
                         fx.ptr_store(
                             Vec.from_elements([scheduled_first], fx.Int32),
                             sched_scratch,
@@ -747,6 +753,8 @@ def compile_mega_moe_stage1_bundle(
     situ_beta: float = 1.0,
     situ_linear_beta: float = 1.0,
     bounds_check: bool = False,
+    a_dtype: str = "fp8",
+    out_dtype: str = "fp8",
 ):
     """Compile every production Stage1 variant into one profile module."""
     if not variants:
@@ -784,6 +792,8 @@ def compile_mega_moe_stage1_bundle(
             act=act,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
+            a_dtype=a_dtype,
+            out_dtype=out_dtype,
             bounds_check=bounds_check,
             _return_kernel_spec=True,
         )
@@ -870,6 +880,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
     use_tile_resource=True, waves_per_eu_hint=2,
     b_nt=-1, work_shards=None,
     payload_chunk_rows=0, tile_state_stride=0,
+    a_dtype="fp8", out_dtype="fp8",
     swiglu_limit=0.0, act="silu", situ_beta=1.0, situ_linear_beta=1.0, bounds_check=False):
     launch = compile_mega_moe_stage1(
         model_dim=model_dim, inter_dim=inter_dim, rank=rank, experts_per_rank=experts_per_rank,
@@ -880,7 +891,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
         async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
         waves_per_eu_hint=waves_per_eu_hint, num_cu=num_cu, num_dispatch_cu=num_dispatch_cu,
         b_nt=b_nt, work_shards=work_shards, payload_chunk_rows=payload_chunk_rows,
-        tile_state_stride=tile_state_stride,
+        tile_state_stride=tile_state_stride, a_dtype=a_dtype, out_dtype=out_dtype,
         swiglu_limit=swiglu_limit, act=act, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta,
         bounds_check=bounds_check,
     )

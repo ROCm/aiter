@@ -5,16 +5,8 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.rmsnorm import _rmsnorm_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-
-
-@triton.jit
-def _rmsnorm_op(row, weight, n_cols, epsilon):
-    row_norm = row * row
-    row_norm = tl.sum(row_norm, axis=-1)
-    norm_factor = tl.math.rsqrt((row_norm / n_cols) + epsilon)
-    return row * norm_factor * weight
-
 
 _triton_fused_rms_kernel_repr = make_kernel_repr(
     "_triton_fused_rms_kernel",
