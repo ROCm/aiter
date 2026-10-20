@@ -1182,6 +1182,8 @@ def _runtime_skip_reason() -> str | None:
     gfx = get_gfx_runtime()
     if gfx not in SUPPORTED_GFX:
         return f"requires one of {SUPPORTED_GFX}, got {gfx}"
+    if not is_flydsl_comm_fused_moe_available():
+        return "requires ROCm >= 7.2 and a compatible mori.cco installation"
     return None
 
 
@@ -1244,11 +1246,6 @@ def main() -> None:
         if int(os.environ.get("LOCAL_RANK", "0")) == 0:
             aiter.logger.warning("comm-fused MoE test skipped: %s", skip_reason)
         return
-    if not is_flydsl_comm_fused_moe_available():
-        raise RuntimeError(
-            "comm-fused MoE on gfx950 requires ROCm >= 7.2 and a compatible "
-            "mori.cco installation"
-        )
 
     requested_tokens = tuple(dict.fromkeys(args.tokens))
     requested_routes = tuple(dict.fromkeys(args.routes))

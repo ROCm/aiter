@@ -699,6 +699,10 @@ def _stream_scratch(input, dtype=None):
 def _dispatch(
     backend, input, row_lens, idx, topk, rows, ragged, tie=None, deterministic=False
 ):
+    # Every backend puts rows on a grid dimension, and HIP rejects a zero-sized
+    # launch. An empty batch has nothing to select, so `idx` stays [0, topk].
+    if rows == 0:
+        return
     if backend == "argmax":
         topk_per_row_argmax(input, row_lens, idx)
     elif backend == "small_k":
