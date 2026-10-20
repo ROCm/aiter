@@ -1297,6 +1297,11 @@ def launch_gemm_a8w4_tdm(
         ):
             """Compute one k128 while optionally loading the next LDS slot."""
             reuse_cur_rmem = load_nxt_fn is not None and next_rmem is cur_rmem
+            if const_expr(issue_fn is not None):
+                # The carried operands may still be reading the LDS buffer
+                # that issue_fn recycles. Retire those reads before all waves
+                # rendezvous at the REUSE fence; waiting at the MMA is too late.
+                rocdl.s_wait_dscnt(0)
             if const_expr(fence_fn is not None):
                 fence_fn()
             elif const_expr(num_outstanding_tdm is not None):
