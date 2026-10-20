@@ -47,9 +47,17 @@ class TestGetNumXcds(unittest.TestCase):
         # 120 CUs can hold 8 XCDs. A 1-CU part cannot, so it is not the example.
         self.assertEqual(device_info._xcds_for_part("gfx942", 120), 8)
 
-    def test_gfx942_80_cu_part_has_four_xcds(self):
-        # Kept from the previous table. Not a CU count in the ROCm spec table.
-        self.assertEqual(device_info._xcds_for_part("gfx942", 80), 4)
+    def test_non_xcd_arch_returns_one(self):
+        # One L2 domain per HIP device. 0 would divide by zero in remap_xcd
+        # and in mla_gluon's batch // NUM_XCDS.
+        for gfx, cu_num in (
+            ("gfx906", 64),
+            ("gfx908", 120),
+            ("gfx90a", 104),
+            ("gfx90a", 110),
+        ):
+            with self.subTest(gfx=gfx, cu_num=cu_num):
+                self.assertEqual(device_info._xcds_for_part(gfx, cu_num), 1)
 
     def test_rocm_before_7_uses_part_table(self):
         with (
@@ -103,6 +111,26 @@ class TestGetNumXcds(unittest.TestCase):
             mock.patch.object(device_info, "_xcds_from_known_part", return_value=4),
         ):
             self.assertEqual(device_info.get_num_xcds(0), 4)
+
+    def test_rejected_attribute_is_queried_once(self):
+        device_info._query_num_xccs.cache_clear()
+        calls = []
+
+        def reject(device_id):
+            calls.append(device_id)
+            raise RuntimeError("rejected")
+
+        try:
+            with (
+                mock.patch.object(device_info, "_rocm_major", return_value=7),
+                mock.patch.object(device_info, "_hip_num_xccs", side_effect=reject),
+                mock.patch.object(device_info, "_xcds_from_known_part", return_value=6),
+            ):
+                self.assertEqual(device_info.get_num_xcds(0), 6)
+                self.assertEqual(device_info.get_num_xcds(0), 6)
+            self.assertEqual(calls, [0])
+        finally:
+            device_info._query_num_xccs.cache_clear()
 
 
 if __name__ == "__main__":

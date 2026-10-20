@@ -1,8 +1,9 @@
 import functools
 
-# hipDeviceAttributeNumberOfXccs. AMD-specific attributes start at
-# hipDeviceAttributeAmdSpecificBegin (10000); this one is 10018.
-# ROCm before 7 does not expose it.
+# hipDeviceAttributeNumberOfXccs. The C enum is not available to ctypes, so
+# the value is the one from hip_runtime_api.h: AMD-specific attributes begin
+# at 10000, and hipDeviceAttributeClockInstructionRate shares that value, so
+# this enumerator is 10018. On ROCm 7.2.4 the query returns the XCC count.
 _HIP_DEVICE_ATTRIBUTE_NUMBER_OF_XCCS = 10018
 
 
@@ -30,19 +31,22 @@ def get_num_sms():
 # Kernels use the XCD count to keep workgroups that share data on one L2.
 # ROCm 7+ reports the live count through hipDeviceAttributeNumberOfXccs,
 # including partition mode. Older runtimes do not, so those releases keep
-# this table. Parts that are not listed still return 8.
+# this table. An unlisted gfx942 or gfx950 CU count still returns 8.
+# Any other arch is one L2 domain per HIP device, so it returns 1.
+# 0 is not a usable count: callers divide and modulo by it.
 # Counts are active CUs per device, from the ROCm GPU specification table.
-# gfx90a GCDs are separate devices, not XCDs, so they are not listed here.
+_XCD_ARCHS = frozenset({"gfx942", "gfx950"})
 _XCDS_BY_GFX_AND_CU_NUM = {
     ("gfx942", 304): 8,  # MI300X, MI325X: 8 XCDs x 38 CUs
     ("gfx942", 228): 6,  # MI300A: 6 XCDs x 38 CUs
-    ("gfx942", 80): 4,
     ("gfx950", 256): 8,  # MI350X, MI355X: 8 XCDs x 32 CUs
     ("gfx950", 128): 4,  # MI350P: 4 XCDs x 32 CUs
 }
 
 
 def _xcds_for_part(gfx: str, cu_num: int) -> int:
+    if gfx not in _XCD_ARCHS:
+        return 1
     return _XCDS_BY_GFX_AND_CU_NUM.get((gfx, cu_num), 8)
 
 
@@ -73,8 +77,7 @@ def _current_device_id() -> int:
     return int(torch.cuda.current_device())
 
 
-@functools.lru_cache(maxsize=8)
-def _query_num_xccs(device_id: int) -> int:
+def _hip_num_xccs(device_id: int) -> int:
     import ctypes
 
     from aiter.jit.utils.chip_info import _load_hip_runtime
@@ -93,12 +96,28 @@ def _query_num_xccs(device_id: int) -> int:
     return int(xcc_count.value)
 
 
+@functools.cache
+def _query_num_xccs(device_id: int) -> int:
+    # Cache a rejection as 0. functools.cache does not store exceptions, and this
+    # function is called from kernel launch paths. A runtime that rejects the
+    # attribute will reject it for the rest of the process, so repeating the
+    # driver call on every launch is wasted work. The following table lookup
+    # is already cached. A successful count is cached the same way.
+    try:
+        count = _hip_num_xccs(int(device_id))
+    except Exception:  # noqa: BLE001
+        return 0
+    return max(0, count)
+
+
 def get_num_xcds(device_id=None) -> int:
     """Return the number of XCDs visible on ``device_id``.
 
     On ROCm 7 and newer this is ``hipDeviceAttributeNumberOfXccs``. Earlier
-    releases use the architecture and CU count, and return 8 when that part
-    is not in the table. An undetected ROCm version tries the query first.
+    releases use the architecture and CU count. gfx942 and gfx950 parts that
+    are not in the table return 8. Other architectures return 1, because each
+    HIP device is one L2 domain. An undetected ROCm version tries the query
+    first.
     """
     major = _rocm_major()
     if major is None or major >= 7:
