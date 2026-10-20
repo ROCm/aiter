@@ -95,7 +95,7 @@ def idx2crd(idx, layout):
         elif _is_pow2(stride_val):
             c = _div_pow2(remaining, stride_val)
         else:
-            c = remaining / fx.Index(stride_val)
+            c = remaining // stride_val
         if size_val is not None:
             if _is_pow2(size_val):
                 c = _mod_pow2(c, size_val)

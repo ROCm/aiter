@@ -37,7 +37,7 @@ __all__ = [
 
 def _fly_lds_base_index(raw: ir.Value) -> ir.Value:
     """Extract a Fly shared pointer / view as an LDS byte index."""
-    ptr = fx.Pointer(raw) if fx.PointerType.isinstance(raw.type) else fx.get_iter(raw)
+    ptr = fx.Pointer(raw) if isinstance(raw.type, fx.PointerType) else fx.get_iter(raw)
     return fx.Index(fx.ptrtoint(ptr)).ir_value()
 
 

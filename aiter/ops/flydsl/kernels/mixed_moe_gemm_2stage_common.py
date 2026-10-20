@@ -790,7 +790,7 @@ def compile_mixed_moe_gemm1_common(
                 col_offset_base = lane_div_16 * 16
 
                 if const_expr(k_wave > 1):
-                    wave_k_id = wave_id / num_n_waves
+                    wave_k_id = wave_id // num_n_waves
                     body_k_base_idx = body_k_base_idx + wave_k_id * klen
                     grp_x_bytes = wave_k_id * single_x_bytes
                     pong_off = lds_pong_offset + grp_x_bytes
@@ -2439,7 +2439,7 @@ def compile_mixed_moe_gemm1_common(
                     nreps = int(tile_n) // (cn * int(e_vec))
                     c_cn = cn
                     c_ev = e_vec
-                    m_lane = tx / c_cn
+                    m_lane = tx // c_cn
                     n_lane = tx % c_cn
                     for mr in range_constexpr(mreps):
                         _row_local = (mr * cm) + m_lane
