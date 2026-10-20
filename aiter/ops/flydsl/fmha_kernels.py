@@ -356,10 +356,10 @@ def flydsl_flash_attn_varlen_fwd(
     Returns the result if FlyDSL can handle this configuration,
     otherwise returns None so the caller falls through to Triton/CK.
     """
-    from ...jit.utils.chip_info import get_gfx
+    from ...jit.utils.chip_info import get_gfx_runtime
 
-    gfx = get_gfx()
-    if gfx == "gfx950":
+    gfxip = get_gfx_runtime()
+    if gfxip == "gfx950":
         if (
             q.dtype is torch.float8_e4m3fn
             and q.dim() == 3
@@ -400,7 +400,7 @@ def flydsl_flash_attn_varlen_fwd(
                 out=out,
                 return_lse=return_lse,
             )
-    elif gfx == "gfx1250":
+    elif gfxip == "gfx1250":
         # 8-bit Q/K/V go to the a8w8 sibling, which writes bf16 output; everything
         # else to a16w16, whose output follows the input.
         _is_b8 = q.dtype in _GFX1250_A8W8_IN_DTYPES
@@ -476,10 +476,10 @@ def flydsl_flash_attn_batch_fwd(
     configuration, otherwise returns ``None`` so the caller falls through
     to Triton/CK.
     """
-    from ...jit.utils.chip_info import get_gfx
+    from ...jit.utils.chip_info import get_gfx_runtime
 
-    gfx = get_gfx()
-    if gfx == "gfx950":
+    gfxip = get_gfx_runtime()
+    if gfxip == "gfx950":
         if (
             q.dtype is torch.float8_e4m3fn
             and q.dim() == 4
@@ -517,7 +517,7 @@ def flydsl_flash_attn_batch_fwd(
             )
     # deterministic is a backward-only flag (this forward is atomic-free), and
     # flash_attn_func defaults it True -- gating on it would reject every request.
-    elif gfx == "gfx1250" and q.dim() == 4:
+    elif gfxip == "gfx1250" and q.dim() == 4:
         _is_b8 = q.dtype in _GFX1250_A8W8_IN_DTYPES
         _out_dtype = _GFX1250_A8W8_OUT_DTYPE if _is_b8 else q.dtype
         _supported = (

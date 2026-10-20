@@ -1799,7 +1799,7 @@ def test_fp8_softmax_scale_cpu_dispatch_contract(monkeypatch, varlen, scale, val
     from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
 
     launches = []
-    monkeypatch.setattr(chip_info, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx950")
     monkeypatch.setattr(fa, "_gpu_arch", lambda device: "gfx950")
     monkeypatch.setattr(fa, "_num_cu", lambda device: 256)
     monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
