@@ -17,7 +17,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.utility import dtypes
 
-from .kernels.pa_decode.traits import d256_pipe
+from .kernels.pa_decode.traits import d256_page64_pipe
 from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
 from .kernels.pa_decode_plan import PADecodePlan
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
@@ -31,7 +31,8 @@ from .kernels.tensor_shim import _run_compiled, get_dtype_str, ptr_arg
 
 def _nhd_strides(view: torch.Tensor) -> tuple[int, int, int]:
     """Block, token and head strides; size-1 axes are never stepped, so 0."""
-    return tuple(0 if view.shape[d] == 1 else int(view.stride(d)) for d in range(3))
+    shape, stride = view.shape, view.stride()
+    return tuple(0 if shape[d] == 1 else stride[d] for d in range(3))
 
 
 def _view_span(view: torch.Tensor) -> int:
@@ -251,9 +252,8 @@ def pa_decode(
 
     ``work_plan`` is required and must be built with ``plan_pa_decode`` before
     calling decode. ``pa_decode_tuning.prepare_pa_decode_plan`` uses native
-    FlyDSL autotune to select its budget before graph capture. A cache miss uses
-    the device CU count for dense page-64 shapes of the gfx950 head-256 pipe
-    and twice that otherwise; ``tune=True`` forces a search during preparation.
+    FlyDSL autotune to select its budget before graph capture, and documents the
+    default budget; ``tune=True`` forces a search during preparation.
     Decode and graph replay use the explicit plan without accessing autotune. Set its
     partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx1250, a cap
     of one writes output directly when sinks are absent and query/output strides
@@ -354,11 +354,6 @@ def pa_decode(
 
     trans_k = key_cache.dim() == 5
     trans_v = value_cache.dim() == 5
-    if not trans_k and trans_v:
-        raise ValueError(
-            "NHD value_cache shape must match key_cache, "
-            f"got {tuple(value_cache.shape)} vs {tuple(key_cache.shape)}"
-        )
     nhd_layout = not trans_k
     if nhd_layout:
         num_blocks, block_size, num_kv_heads, k_head = key_cache.shape
@@ -391,8 +386,18 @@ def pa_decode(
             f"pa_decode requires compute_type={expected_kv_dtype} for the KV cache "
             f"on {arch}, got {compute_type}"
         )
-    if nhd_layout and is_bf16_kv:
-        raise NotImplementedError("NHD pa_decode requires FP8 KV")
+    if nhd_layout and not d256_page64_pipe(
+        arch,
+        kv_dtype,
+        head_dim,
+        block_size,
+        query_length,
+        num_q_heads // num_kv_heads,
+    ):
+        raise NotImplementedError(
+            "NHD pa_decode requires gfx950, FP8 KV, head 256, page 64, "
+            "and a uniform query_length * query_group_size of at most 32 rows"
+        )
     vector_width = 8 if is_bf16_kv else 16
 
     # Enforce tile Q-load constraints and the reducer's 1024-thread limit.
@@ -426,6 +431,7 @@ def pa_decode(
 
     if is_bf16_kv and arch != "gfx1250" and not trans_v:
         raise ValueError("BF16 KV requires the vectorized 5D value_cache layout")
+    nhd_strides = (0,) * 6
     if nhd_layout:
         if value_cache.shape != key_cache.shape:
             raise ValueError(
@@ -434,9 +440,12 @@ def pa_decode(
             )
         if key_cache.stride(-1) != 1 or value_cache.stride(-1) != 1:
             raise ValueError("NHD key and value head axes must be contiguous")
-        for name, view in (("key_cache", key_cache), ("value_cache", value_cache)):
+        nhd_strides = _nhd_strides(key_cache) + _nhd_strides(value_cache)
+        for name, view, strides in (
+            ("key_cache", key_cache, nhd_strides[:3]),
+            ("value_cache", value_cache, nhd_strides[3:]),
+        ):
             # K loads and V LDS-DMAs move 16-byte chunks.
-            strides = _nhd_strides(view)
             if view.data_ptr() % 16 or any(stride % 16 for stride in strides):
                 raise ValueError(
                     f"NHD {name} needs a 16-byte aligned base and block, token "
@@ -449,6 +458,16 @@ def pa_decode(
                     f"NHD {name} token rows must not overlap, got token stride "
                     f"{view.stride(1)} for head_dim={head_dim}"
                 )
+        # Strides are i32 kernel arguments, and the in-page offset and V tail
+        # bound stay i32 even in wide mode.
+        k_block, k_token, k_head, v_block, v_token, v_head = nhd_strides
+        page_span = block_size * max(k_token, v_token)
+        if max(k_block, k_head, v_block, v_head, page_span) >= 2**31:
+            raise NotImplementedError(
+                "NHD pa_decode requires int32 block and head strides and "
+                "block_size * token_stride < 2**31, got strides "
+                f"{key_cache.stride()} and {value_cache.stride()}"
+            )
         v_num_blocks, v_num_kv_heads = num_blocks, num_kv_heads
     elif trans_v:
         v_num_blocks, v_num_kv_heads = value_cache.shape[:2]
@@ -674,35 +693,6 @@ def pa_decode(
         and output.stride() == query.stride()
     )
 
-    stride_k_block = stride_k_token = stride_k_head = 0
-    stride_v_block = stride_v_token = stride_v_head = 0
-    if nhd_layout:
-        if block_size != 64 or not d256_pipe(
-            arch,
-            kv_dtype,
-            head_dim,
-            block_size,
-            query_length,
-            query_group_size,
-        ):
-            raise NotImplementedError(
-                "NHD pa_decode requires gfx950, FP8 KV, head 256, page 64, "
-                "and a uniform query_length * query_group_size "
-                "of at most 32 rows"
-            )
-        stride_k_block, stride_k_token, stride_k_head = _nhd_strides(key_cache)
-        stride_v_block, stride_v_token, stride_v_head = _nhd_strides(value_cache)
-        # Strides are i32 kernel arguments, and the in-page offset and V tail
-        # bound stay i32 even in wide mode.
-        strides = (stride_k_block, stride_k_head, stride_v_block, stride_v_head)
-        page_span = block_size * max(stride_k_token, stride_v_token)
-        if max(*strides, page_span) >= 2**31:
-            raise NotImplementedError(
-                "NHD pa_decode requires int32 block and head strides and "
-                "block_size * token_stride < 2**31, got strides "
-                f"{key_cache.stride()} and {value_cache.stride()}"
-            )
-
     # Bound byte offsets as well as element indices for 16-bit BF16 caches. A
     # strided NHD view can span more bytes than numel(), and its head stride
     # may scale with num_blocks, so measure the highest byte offset.
@@ -833,12 +823,7 @@ def pa_decode(
             stride_ks_head,
             int(query.stride(0)),
             int(query.stride(1)),
-            stride_k_block,
-            stride_k_token,
-            stride_k_head,
-            stride_v_block,
-            stride_v_token,
-            stride_v_head,
+            *nhd_strides,
             ptr_arg(work_plan.work_info, fx.Int32),
             work_plan.capacity,
             s,
