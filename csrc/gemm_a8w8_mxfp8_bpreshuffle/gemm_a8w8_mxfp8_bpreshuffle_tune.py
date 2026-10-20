@@ -717,9 +717,10 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             reader = csv.DictReader(stream)
             columns, rows = reader.fieldnames, list(reader)
         for row in rows:
+            if row.get("libtype") != "opus":
+                continue
             if (
-                row.get("libtype") == "opus"
-                and row.get("gfx") == "gfx950"
+                row.get("gfx") == "gfx950"
                 and row.get("w_scale_block") == "128x128"
                 and row.get("kernelName") not in (None, "", "None", "Null")
                 and float(row["us"]) > 0
