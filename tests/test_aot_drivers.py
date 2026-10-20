@@ -1,18 +1,20 @@
-"""AOT driver coverage: MLA config wiring and PA-Gluon's GPU worker policy."""
+"""AOT driver coverage: config wiring, cache signatures, and GPU worker policy."""
 
+from contextlib import nullcontext
 import inspect
 import pathlib
 import sys
 import unittest
 from unittest.mock import MagicMock, call, patch
 
-_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+if str(pathlib.Path(__file__).resolve().parents[1]) not in sys.path:
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
 from aiter.aot import asm_mla_decode_fwd as driver
+from aiter.aot.flydsl import gemm
+from aiter.ops.flydsl.kernels import gemm_a16w16_gfx950 as gemm_kernel
 from csrc.cpp_itfs import utils as cpp_itfs_utils
 from csrc.cpp_itfs.mla import asm_mla_decode_fwd as compile_module
 from csrc.cpp_itfs.pa_gluon_aot import pa_decode_gluon_aot_prebuild as pa_gluon
@@ -25,6 +27,45 @@ class AsmMlaDecodeAotTest(unittest.TestCase):
         )[:6]
 
         self.assertEqual(driver.MLAConfig._fields, compile_parameters)
+
+
+class FlydslGemmAotTest(unittest.TestCase):
+    def test_a16w16_aot_matches_runtime_semaphore_types(self):
+        """AOT must use the runtime semaphore ABI to reuse its compiled cache."""
+        gemm_kernel.get_split_k_buffers.cache_clear()
+        self.addCleanup(gemm_kernel.get_split_k_buffers.cache_clear)
+        with patch.object(gemm_kernel, "persistent_alloc", return_value=nullcontext()):
+            semaphore, signal = gemm_kernel.get_split_k_buffers(None, "cpu", 1)
+
+        for dtype in ("bf16", "fp16"):
+            for split_k in (1, 7):
+                with (
+                    self.subTest(dtype=dtype, split_k=split_k),
+                    patch.object(gemm, "run_cached") as compile_call,
+                ):
+                    gemm._compile_hgemm_to_cache(
+                        m=128,
+                        n=7168,
+                        k=7168,
+                        dtype=dtype,
+                        out_dtype=dtype,
+                        block_m=128,
+                        block_n=128,
+                        block_k=64,
+                        stages=2,
+                        split_k=split_k,
+                        m_waves=2,
+                        n_waves=2,
+                        k_waves=1,
+                        group_m=0,
+                        use_half_tile_interleaved=False,
+                        has_bias=False,
+                        target_gfx="gfx950",
+                    )
+                    self.assertEqual(
+                        compile_call.call_args.args[5].dtype, semaphore.dtype
+                    )
+                    self.assertEqual(compile_call.call_args.args[6].dtype, signal.dtype)
 
 
 class PaGluonProcessLimitTest(unittest.TestCase):

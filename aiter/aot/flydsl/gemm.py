@@ -490,8 +490,9 @@ def _compile_hgemm_to_cache(
         ).t()
         out = torch.empty((1, representative_extent), device=dev, dtype=torch_out_dtype)
         bias = torch.empty((representative_extent,), device=dev, dtype=torch_dtype)
+        # Match get_split_k_buffers: dtype is part of the FlyDSL cache signature.
         semaphore = torch.zeros(
-            (SPLIT_K_SEMAPHORE_MAX_LEN,), device=dev, dtype=torch.int32
+            (SPLIT_K_SEMAPHORE_MAX_LEN,), device=dev, dtype=torch.int64
         )
         signal = torch.zeros(
             (SPLIT_K_SEMAPHORE_MAX_LEN,), device=dev, dtype=torch.int32
