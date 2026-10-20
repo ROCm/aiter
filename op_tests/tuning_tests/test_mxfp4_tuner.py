@@ -25,6 +25,13 @@ import pandas as pd
 import pytest
 import torch
 
+from op_tests.tuning_tests._mxfp4_test_process import (
+    require_gpu_hidden_process,
+    use_default_device,
+)
+
+require_gpu_hidden_process()
+
 
 def import_moe_tuner() -> "ModuleType":
     run = subprocess.run
@@ -44,7 +51,9 @@ def import_moe_tuner() -> "ModuleType":
             return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
         return run(command, *args, **kwargs)
 
+    # Restored last, after the set_default_device patch is gone.
     with (
+        use_default_device("cpu"),
         mock.patch.dict(
             os.environ,
             {
@@ -120,10 +129,7 @@ RESULTS = [
 ]
 
 
-@pytest.fixture(autouse=True)
-def prohibit_real_shape_workers_and_gpu_data(
-    monkeypatch: "pytest.MonkeyPatch",
-) -> "None":
+def block_real_work(monkeypatch: "pytest.MonkeyPatch") -> "None":
     # Spawned workers do not inherit mocks; multi-slot tests must stub scheduling.
     def forbidden(*args: "object", **kwargs: "object") -> "None":
         pytest.fail("controlled lifecycle test reached real GPU work")
@@ -156,7 +162,15 @@ def prohibit_real_shape_workers_and_gpu_data(
         "randint",
     ):
         monkeypatch.setattr(torch, name, forbidden)
-    torch.set_default_device("cpu")
+
+
+@pytest.fixture(autouse=True)
+def prohibit_real_shape_workers_and_gpu_data(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "Iterator[None]":
+    block_real_work(monkeypatch)
+    with use_default_device("cpu"):
+        yield
 
 
 def shape(token: "int" = 4, **updates: "object") -> "dict[str, object]":
@@ -275,7 +289,9 @@ def test_retune_replaces_duplicate_old_winners(
     pd.DataFrame([shape()]).to_csv(source, index=False)
     with devices(("gfx950", 256)):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
-        old = tuner._candidate_row(shape(), 16, "old-g1", "old-g2")
+        old = tuner._candidate_row(
+            shape(), 16, "flydsl_mxmoe_g1_old", "flydsl_mxmoe_g2_old"
+        )
         pd.DataFrame([dict(old, us=20), dict(old, us=21)]).to_csv(output, index=False)
         controlled_mxfp4(tuner, monkeypatch, [])
         tuner.run(tuner_args(tuner, source, output, "--all"))
@@ -314,8 +330,8 @@ def test_shared_csv_preserves_valid_rows_and_normalizes_legacy_defaults(
             gfx=None, us=15.75, us1=6.5, us2=9.25, nt=1, xbf16=None, flat=None
         )
         explicit = dict(legacy, token=128, gfx="gfx1250", cu_num=256, nt=0)
-        tagged = dict(legacy, token=32, gfx="gfx942", _tag="fallback")
-        pd.DataFrame([legacy, explicit, tagged]).to_csv(output, index=False)
+        fallback = dict(legacy, token=32, gfx="gfx942", _tag="flydsl_fallback")
+        pd.DataFrame([legacy, explicit, fallback]).to_csv(output, index=False)
         pd.DataFrame([] if empty_input else [shape()], columns=KEYS).to_csv(
             source, index=False
         )
@@ -331,7 +347,204 @@ def test_shared_csv_preserves_valid_rows_and_normalizes_legacy_defaults(
         [6.5, 9.25, 15.75]
     ]
     assert csv[["xbf16", "flat"]].notna().all().all()
-    assert "_tag" not in csv.columns and "gate_mode" not in csv.columns
+    assert csv["_tag"].isna().all() and "gate_mode" not in csv.columns
+
+
+@pytest.mark.parametrize("empty_input", [False, True])
+def test_shared_csv_keeps_every_row_the_runtime_still_loads(
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch", empty_input: "bool"
+) -> "None":
+    source, output = tmp_path / "input.csv", tmp_path / "shared.csv"
+    with devices(("gfx950", 256)):
+        tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
+        row = tuner._candidate_row(shape(64), 32, "live-g1", "live-g2")
+        row.update(us=15.75)
+        rows = [
+            dict(row, token=8, _tag="0"),
+            dict(row, token=16, _tag="glm5_ptpc", comm_fused_configs="cfg-16"),
+            dict(row, token=32, us=None, us1=None, us2=None),
+            dict(row, token=64, _tag="flydsl_fallback", kernelName1="stale-g1"),
+            dict(row, token=64),
+            dict(row, token=128, _tag="flydsl_fallback"),
+            # A later MXFP4 duplicate is unreachable; a non-MXFP4 one may
+            # still serve the runtime activation fallback.
+            dict(row, token=256, kernelName1="flydsl_mxmoe_g1_first"),
+            dict(row, token=256, kernelName1="flydsl_mxmoe_g1_second"),
+            dict(row, token=512, kernelName1="flydsl_mxmoe_g1_first"),
+            dict(row, token=512, kernelName1="fmoe_1stage_fallback", kernelName2=""),
+        ]
+        pd.DataFrame(rows).to_csv(output, index=False)
+        pd.DataFrame([] if empty_input else [shape()], columns=KEYS).to_csv(
+            source, index=False
+        )
+        controlled_mxfp4(tuner, monkeypatch, [])
+        tuner.run(tuner_args(tuner, source, output))
+    csv = pd.read_csv(output, dtype={"_tag": str})
+    assert csv.loc[csv.token == 512, "kernelName1"].tolist() == [
+        "flydsl_mxmoe_g1_first",
+        "fmoe_1stage_fallback",
+    ]
+    csv = csv[csv.token != 512].set_index("token")
+    tuned = [8, 16, 32, 64, 256]
+    assert sorted(csv.index) == (tuned if empty_input else [4, *tuned])
+    assert csv.loc[8, "_tag"] == "0" and csv.loc[16, "_tag"] == "glm5_ptpc"
+    assert csv.loc[16, "comm_fused_configs"] == "cfg-16"
+    assert pd.isna(csv.loc[32, "us"]) and csv.loc[32, "kernelName1"] == "live-g1"
+    assert csv.loc[64, "kernelName1"] == "live-g1" and pd.isna(csv.loc[64, "_tag"])
+    assert csv.loc[256, "kernelName1"] == "flydsl_mxmoe_g1_first"
+
+
+def test_retune_updates_the_row_runtime_loads_and_keeps_its_tag(
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+) -> "None":
+    source, output = tmp_path / "input.csv", tmp_path / "winner.csv"
+    pd.DataFrame([shape()]).to_csv(source, index=False)
+    with devices(("gfx950", 256)):
+        tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
+        old = tuner._candidate_row(
+            shape(), 16, "flydsl_mxmoe_g1_old", "flydsl_mxmoe_g2_old"
+        )
+        pd.DataFrame(
+            [
+                dict(old, us=20, _tag="first"),
+                dict(old, us=21, _tag="second"),
+                dict(old, us=22, _tag="first"),
+            ]
+        ).to_csv(output, index=False)
+        controlled_mxfp4(tuner, monkeypatch, [])
+        tuner.run(tuner_args(tuner, source, output, "--all"))
+    winner = pd.read_csv(output)
+    assert winner[["us", "kernelName1", "_tag"]].values.tolist() == [
+        [10.25, "g1-controlled", "first"]
+    ]
+
+
+@pytest.mark.parametrize("same_file", [False, True])
+def test_failed_retune_keeps_old_winner_behind_a_placeholder_row(
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch", same_file: "bool"
+) -> "None":
+    source = tmp_path / "input.csv"
+    output = source if same_file else tmp_path / "winner.csv"
+    with devices(("gfx950", 256)):
+        tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
+        old = tuner._candidate_row(
+            shape(), 16, "flydsl_mxmoe_g1_old", "flydsl_mxmoe_g2_old"
+        )
+        pd.DataFrame([shape(), dict(old, us=20)]).to_csv(output, index=False)
+        if not same_file:
+            pd.DataFrame([shape()]).to_csv(source, index=False)
+
+        def measure(*args: "object", **kwargs: "object") -> "float":
+            return float("nan")
+
+        controlled_mxfp4(tuner, monkeypatch, [])
+        monkeypatch.setattr(tuner, "_run_candidate", measure)
+        with pytest.raises(SystemExit):
+            tuner.run(tuner_args(tuner, source, output, "--all"))
+    csv = pd.read_csv(output)
+    assert "flydsl_mxmoe_g1_old" in csv.kernelName1.tolist()
+
+
+def test_compare_merge_keeps_rows_the_runtime_fallback_can_load(
+    tmp_path: "Path",
+) -> "None":
+    base, candidate = tmp_path / "base.csv", tmp_path / "candidate.csv"
+    with devices(("gfx950", 256)):
+        tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
+        old = tuner._candidate_row(shape(), 16, "flydsl_mxmoe_g1_old", "g2")
+        improved = tuner._candidate_row(shape(8), 16, "flydsl_mxmoe_g1_new", "g2")
+        pd.DataFrame(
+            [
+                dict(old, us=20),
+                dict(old, us=30, kernelName1="fmoe_1stage_fallback"),
+                dict(improved, us=20),
+            ]
+        ).to_csv(base, index=False)
+        pd.DataFrame([dict(improved, us=10)]).to_csv(candidate, index=False)
+        comparison = pd.DataFrame([dict(shape(8), update=True)])
+        merged = tuner._merge_compare_filtered_results(
+            str(base), str(candidate), comparison
+        )
+    assert merged[["token", "kernelName1"]].values.tolist() == [
+        [4, "flydsl_mxmoe_g1_old"],
+        [4, "fmoe_1stage_fallback"],
+        [8, "flydsl_mxmoe_g1_new"],
+    ]
+
+
+def test_same_file_drops_only_untuned_input_rows(
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+) -> "None":
+    file = tmp_path / "same.csv"
+    with devices(("gfx950", 256)):
+        tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
+        untimed = tuner._candidate_row(shape(32), 16, "live-g1", "live-g2")
+        untimed.update(us=None)
+        pd.DataFrame([shape(), untimed]).to_csv(file, index=False)
+        attempts = []
+        controlled_mxfp4(tuner, monkeypatch, attempts)
+        tuner.run(tuner_args(tuner, file, file))
+    assert [row["token"] for row in attempts] == [4]
+    csv = pd.read_csv(file).set_index("token")
+    assert sorted(csv.index) == [4, 32]
+    assert csv.loc[4, "us"] == 10.25 and csv.loc[32, "kernelName1"] == "live-g1"
+
+
+def test_separate_output_keeps_rows_without_kernels(
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+) -> "None":
+    source, output = tmp_path / "input.csv", tmp_path / "manifest.csv"
+    pd.DataFrame([shape()]).to_csv(source, index=False)
+    pd.DataFrame([shape(32), shape(64)]).to_csv(output, index=False)
+    with devices(("gfx950", 256)):
+        tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
+        controlled_mxfp4(tuner, monkeypatch, [])
+        tuner.run(tuner_args(tuner, source, output))
+    assert sorted(pd.read_csv(output).token) == [4, 32, 64]
+
+
+def test_default_device_helper_leaves_a_fresh_process_usable() -> "None":
+    # In-process checks would see the fixture's DeviceContext mode instead.
+    code = (
+        "import torch\n"
+        "from op_tests.tuning_tests._mxfp4_test_process import use_default_device\n"
+        "with use_default_device('cpu'):\n"
+        "    pass\n"
+        "assert not hasattr(torch._GLOBAL_DEVICE_CONTEXT, 'device_context')\n"
+        "print(torch.get_default_device())\n"
+    )
+    root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "cpu"
+
+
+def test_unsaved_winner_is_not_reported_tuned_and_exits_nonzero(
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+) -> "None":
+    source, output = tmp_path / "input.csv", tmp_path / "winner.csv"
+    pd.DataFrame([shape()]).to_csv(source, index=False)
+    to_csv = pd.DataFrame.to_csv
+
+    def failing_to_csv(df: "pd.DataFrame", path: "object" = None, **kwargs: "object"):
+        if str(path) == str(output):
+            raise OSError("No space left on device")
+        return to_csv(df, path, **kwargs)
+
+    monkeypatch.setattr(pd.DataFrame, "to_csv", failing_to_csv)
+    with devices(("gfx950", 256)):
+        tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
+        controlled_mxfp4(tuner, monkeypatch, [])
+        with pytest.raises(SystemExit) as status:
+            tuner.run(tuner_args(tuner, source, output))
+    assert status.value.code == 1
+    assert tuner.success.empty and list(tuner.remain_untuned.token) == [4]
 
 
 @pytest.mark.parametrize("modern_second", [False, True])

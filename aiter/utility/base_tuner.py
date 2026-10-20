@@ -25,6 +25,8 @@ def _read_csv(filepath, **kwargs):
     """Read CSV with automatic cleanup of common formatting issues:
     trailing tabs/spaces, extra unnamed columns, whitespace in headers/values.
     """
+    # Tags are labels; numeric parsing would rewrite "0" as "0.0".
+    kwargs.setdefault("dtype", {"_tag": str})
     df = pd.read_csv(filepath, **kwargs)
     df.columns = df.columns.str.strip()
     df = df.loc[:, ~df.columns.str.startswith("Unnamed:")]
@@ -435,8 +437,6 @@ class TunerCommon:
         if df_updates.empty:
             return df_old
         key_columns = self.keys
-        dedup_keys = key_columns + (["_tag"] if "_tag" in df_old else [])
-        df_old = df_old.drop_duplicates(subset=dedup_keys, keep="last").copy()
         df_updates = df_updates.loc[:, self.columns]
         # Backfill columns present in the new results but missing from a legacy
         # tuned CSV (for example a newly added gfx key column), so that the
@@ -454,6 +454,9 @@ class TunerCommon:
                     df_old[col] = self.get_cu_num()
                 else:
                     df_old[col] = pd.NA
+        # Dedup on backfilled keys so each key updates a single old row.
+        dedup_keys = key_columns + (["_tag"] if "_tag" in df_old else [])
+        df_old = self._drop_superseded_rows(df_old, dedup_keys).copy()
         # Widen integer columns to object so that float/string updates don't
         # trigger a Pandas dtype-coercion error (e.g. tflops=0 stored as int64
         # cannot accept a float like 2.61).
@@ -506,11 +509,14 @@ class TunerCommon:
         if "_tag" in tunedf.columns:
             tunedf["_tag"] = tunedf["_tag"].fillna("")
             dedup_keys = self.keys + ["_tag"]
-        tunedf = tunedf.drop_duplicates(
-            subset=dedup_keys,
-            keep="last",
-        )
+        tunedf = self._drop_superseded_rows(tunedf, dedup_keys)
         tunedf.to_csv(tune_file, index=False)
+
+    def _drop_superseded_rows(
+        self, tunedf: "pd.DataFrame", dedup_keys: "list[str]"
+    ) -> "pd.DataFrame":
+        """Drop duplicate-key rows that a later row supersedes."""
+        return tunedf.drop_duplicates(subset=dedup_keys, keep="last")
 
     def get_cu_num(self):
         gpu = torch.cuda.current_device()
@@ -1170,10 +1176,7 @@ class TunerCommon:
         if "_tag" in merged.columns:
             merged["_tag"] = merged["_tag"].fillna("")
             dedup_keys.append("_tag")
-        merged = merged.drop_duplicates(subset=dedup_keys, keep="last").reset_index(
-            drop=True
-        )
-        return merged
+        return self._drop_superseded_rows(merged, dedup_keys).reset_index(drop=True)
 
     def _run_config_for_shapes(self, args, shapes_df, config_file=None):
         original_untunedf = self.untunedf
@@ -1584,6 +1587,11 @@ class TunerCommon:
                 raise tune_exit
             if summary_exc is not None:
                 raise summary_exc
+            # An error or interrupt may leave results unsaved, even for shapes
+            # counted as tuned.
+            if tuning_status != "Finished":
+                logger.error(f"tuning {tuning_status.lower()}; exiting nonzero")
+                sys.exit(1)
 
 
 class GemmCommonTuner(TunerCommon):
