@@ -404,6 +404,8 @@ def flydsl_flash_attn_varlen_fwd(
         # 8-bit Q/K/V go to the a8w8 sibling, which writes bf16 output; everything
         # else to a16w16, whose output follows the input.
         _is_b8 = q.dtype in _GFX1250_A8W8_IN_DTYPES
+        if _is_b8 and any(d is not None for d in (q_descale, k_descale, v_descale)):
+            return None
         _out_dtype = _GFX1250_A8W8_OUT_DTYPE if _is_b8 else q.dtype
         _supported = (
             flash_attn_gfx1250_a8w8_supported
@@ -519,6 +521,8 @@ def flydsl_flash_attn_batch_fwd(
     # flash_attn_func defaults it True -- gating on it would reject every request.
     elif gfxip == "gfx1250" and q.dim() == 4:
         _is_b8 = q.dtype in _GFX1250_A8W8_IN_DTYPES
+        if _is_b8 and any(d is not None for d in (q_descale, k_descale, v_descale)):
+            return None
         _out_dtype = _GFX1250_A8W8_OUT_DTYPE if _is_b8 else q.dtype
         _supported = (
             flash_attn_gfx1250_a8w8_supported
