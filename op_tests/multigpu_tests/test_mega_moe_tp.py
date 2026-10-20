@@ -40,7 +40,7 @@ SUPPORTED_GFX = ("gfx950",)
 SEED = 123
 # rel_l2 gate vs the torch reference (pass: rel_l2 <= 0.1, as op_tests/multigpu_tests/
 # test_mega_moe_v2.py), for every comm format: fp8 / bf16 comm, MXFP8 all-reduce second hop
-RTOL = {"fp8": 0.10, "bf16": 0.10, "ag8": 0.10}
+RTOL = 0.10
 GRAPH_CALLS, PERF_ITERS, PERF_WARMUP = 10, 20, 3
 
 QUANT_TYPE = aiter.QuantType.per_1x32
@@ -341,7 +341,7 @@ def call(layer, c: Case, out=None):
     return y
 
 
-def check(y, c: Case, rtol, what="fused vs torch"):
+def check(y, c: Case, rtol=RTOL, what="fused vs torch"):
     e = rel_l2(y, c.ref)
     if not e <= rtol:
         raise CaseFailure(f"{what}: rel_l2={e:.4f} > {rtol}")
@@ -353,7 +353,7 @@ def case_varying_m(shape, wt, ctx, S, mode):
     worst = 0.0
     for m in (8, 1, 32, 1, min(64, S.max_local), 8):
         c = make_case(shape, wt, ctx, mode, m * ctx.world, "random", SEED + m)
-        worst = max(worst, check(call(layer, c).clone(), c, RTOL["fp8"], f"m={m}"))
+        worst = max(worst, check(call(layer, c).clone(), c, RTOL, f"m={m}"))
     return worst
 
 
@@ -365,9 +365,7 @@ def case_layers(shape, wt, ctx, S, mode):
     for rnd in range(2):
         for i, layer in enumerate(layers):
             c = make_case(shape, wt, ctx, mode, 8 * ctx.world, "random", 100 * rnd + i)
-            worst = max(
-                worst, check(call(layer, c).clone(), c, RTOL["fp8"], f"layer {i}")
-            )
+            worst = max(worst, check(call(layer, c).clone(), c, RTOL, f"layer {i}"))
         del layers[:2]
         gc.collect()
         layers += [
@@ -390,7 +388,7 @@ def case_out(shape, wt, ctx, S, mode):
     call(layer, c2)
     if not ctx.all_ok(torch.equal(out, keep)):
         raise CaseFailure("out= of call N changed by call N+1")
-    return check(keep, c1, RTOL["fp8"])
+    return check(keep, c1, RTOL)
 
 
 def case_graph(shape, wt, ctx, S, mode):
@@ -447,7 +445,7 @@ def case_dynamic(shape, wt, ctx, S, mode, lb):
         for kind in ("random", "subset"):
             c = make_case(shape, wt, ctx, mode, t, kind, SEED + 3 * t)
             y = call(layer, c).clone()
-            worst = max(worst, check(y, c, RTOL["fp8"], f"M={t} {kind}"))
+            worst = max(worst, check(y, c, RTOL, f"M={t} {kind}"))
     return worst
 
 
@@ -488,9 +486,9 @@ def case_tail(shape, wt, ctx, S):
     for local in (True, False):
         eng.tn_local = local
         rows = own if local else slice(None)
-        xn_, s_ref_ = xn[rows], s_ref[rows]
-        e_ref_ = float(
-            (q_ref[rows].float() * s_ref_[:, None] - xn_).norm() / xn_.norm()
+        xn_r, s_ref_r = xn[rows], s_ref[rows]
+        e_ref = float(
+            (q_ref[rows].float() * s_ref_r[:, None] - xn_r).norm() / xn_r.norm()
         )
         for bf16 in (False, True):
             r = res.clone()
@@ -501,7 +499,7 @@ def case_tail(shape, wt, ctx, S):
                 not bf16 or outs[3].shape[0] == m * ctx.world
             )
             q, s = q[rows], s[rows]
-            e_q = float((q.view(fp8).float() * s[:, None] - xn_).norm() / xn_.norm())
+            e_q = float((q.view(fp8).float() * s[:, None] - xn_r).norm() / xn_r.norm())
             bad = [
                 what
                 for what, ok in (
@@ -509,9 +507,9 @@ def case_tail(shape, wt, ctx, S):
                     ("shapes [T, ...]", shapes_ok),
                     ("y", torch.equal(y, y0)),
                     ("res_out", torch.equal(r, r_ref)),
-                    (f"q rel {e_q:.4f} (fp8 {e_ref_:.4f})", e_q < 1.05 * e_ref_),
-                    ("scale", float(((s - s_ref_).abs() / s_ref_).max()) < 1e-2),
-                    ("bf16 rows", not bf16 or rel_l2(outs[3][rows], xn_) < 0.01),
+                    (f"q rel {e_q:.4f} (fp8 {e_ref:.4f})", e_q < 1.05 * e_ref),
+                    ("scale", float(((s - s_ref_r).abs() / s_ref_r).max()) < 1e-2),
+                    ("bf16 rows", not bf16 or rel_l2(outs[3][rows], xn_r) < 0.01),
                 )
                 if not ok
             ]
@@ -587,9 +585,9 @@ def check_sp_rs_norm(op, inputs, out, res_out):
 def case_masked(shape, wt, ctx, S, mode):
     layer = new_layer(shape, wt, ctx, mode, max_local(mode, shape, wt))
     c = make_case(shape, wt, ctx, mode, 16 * ctx.world, "random", 11, mask=0.2)
-    e = check(call(layer, c).clone(), c, RTOL["fp8"], "masked ids")
+    e = check(call(layer, c).clone(), c, RTOL, "masked ids")
     c2 = make_case(shape, wt, ctx, mode, 16 * ctx.world, "random", 12)
-    check(call(layer, c2).clone(), c2, RTOL["fp8"], "next clean call")
+    check(call(layer, c2).clone(), c2, RTOL, "next clean call")
     return e
 
 
@@ -599,7 +597,7 @@ def case_empty(shape, wt, ctx, S, mode):
     y = call(layer, Case(c.x[:0], c.w[:0], c.ids[:0], c.ref[:0]))
     if tuple(y.shape) != (0, shape.model_dim):
         raise CaseFailure(f"m=0 returned shape {tuple(y.shape)}")
-    check(call(layer, c).clone(), c, RTOL["fp8"], "call after m=0")
+    check(call(layer, c).clone(), c, RTOL, "call after m=0")
 
 
 def expect_raise(fn, what, errors=(ValueError, TypeError)):
@@ -652,7 +650,7 @@ def case_checked(shape, wt, ctx, S):
         expect_raise(
             lambda: layer(c.x, c.w, ids), "ar with routing that differs across ranks"
         )
-        check(call(layer, c).clone(), c, RTOL["fp8"], "checked call")
+        check(call(layer, c).clone(), c, RTOL, "checked call")
     finally:
         os.environ.pop("AITER_MEGAMOE_TP_CHECK", None)
 
@@ -742,16 +740,16 @@ def test_mega_moe_tp(model: str, mode: str, tokens: int, route: str, seed: int):
             f"{mode}: up to {max_local(mode, shape, wt)} local tokens (no big-M path)"
         )
     c = make_case(shape, wt, ctx, mode, tokens, route, SEED + 1000 * seed + tokens)
-    # name -> (comm_dtype, ar_gather, rel_l2 gate)
+    # name -> (comm_dtype, ar_gather)
     candidates = {
-        "megamoe_tp": ("fp8", "bf16", RTOL["fp8"]),
-        "megamoe_tp bf16comm": ("bf16", "bf16", RTOL["bf16"]),
+        "megamoe_tp": ("fp8", "bf16"),
+        "megamoe_tp bf16comm": ("bf16", "bf16"),
     }
     if mode == "ar":  # the MXFP8 all-gather second hop exists only for ar
-        candidates["megamoe_tp ag8"] = ("fp8", "fp8", RTOL["ag8"])
+        candidates["megamoe_tp ag8"] = ("fp8", "fp8")
     flops, nbytes = _work(shape, wt, c, tokens)
     ret = {"gfx": get_gfx()}
-    for name, (comm, agather, rtol) in candidates.items():
+    for name, (comm, agather) in candidates.items():
         layer = _layer(model, mode, comm, agather)
         out = torch.empty_like(c.ref, dtype=dtypes.bf16)
         y = call(layer, c, out=out).clone()
@@ -767,8 +765,8 @@ def test_mega_moe_tp(model: str, mode: str, tokens: int, route: str, seed: int):
                 printLog=ctx.rank == 0,
             )
         )
-        if not e <= rtol:
-            raise CaseFailure(f"{name}: rel_l2={e:.4f} > {rtol}")
+        if not e <= RTOL:
+            raise CaseFailure(f"{name}: rel_l2={e:.4f} > {RTOL}")
         if mode == "ar" and not identical_across_ranks(y):
             raise CaseFailure(f"{name}: all-reduce output differs across ranks")
         us = _graph_us(layer, c, out)

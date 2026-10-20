@@ -757,7 +757,7 @@ const_expr = fx.const_expr
 KCK = 2  # GEMM1 k-steps (of 128) per chunk
 
 
-def bigm_lds(RG, NAB, I, NW=NW):
+def bigm_lds(RG, NAB, I):
     """LDS layout (bytes) of one CTA."""
     c = {}
     o = 0
@@ -769,33 +769,21 @@ def bigm_lds(RG, NAB, I, NW=NW):
         o += n
         return r
 
-    c["LA"] = take(
-        NAB * RG * 64 * KCK
-    )  # A codes: [buf][row][128 B], 16 B columns swizzled
+    # A codes: [buf][row][128 B], 16 B columns swizzled
+    c["LA"] = take(NAB * RG * 64 * KCK)
     c["LAS"] = take(NAB * NW * 64 * 4)  # A scales: [buf][wave][lane] words (dma4 order)
     c["LRIX"] = take(RG * 4)
     c["LWT"] = take(RG * 4)
     c["SIS"] = I // 2 + 16
     c["LINT"] = take(RG * c["SIS"])  # intermediate MXFP4 rows
     c["ISS"] = I // 32
-    c["LINTS"] = take(RG * (I // 32))  # their E8M0 scales
+    c["LINTS"] = take(RG * c["ISS"])  # their E8M0 scales
     c["LCTL"] = take(64)
     c["BYTES"] = (o + 15) // 16 * 16
     return c
 
 
-def build_bigm_unit(
-    H,
-    I,
-    TOPK,
-    RG=128,
-    NAB=4,
-    BST=3,
-    BS2=3,
-    act="swiglu",
-    swiglu_limit=7.0,
-    R8=0,
-):
+def build_bigm_unit(H, I, TOPK, RG, NAB, BST, BS2, act, swiglu_limit, R8):
     """The fused unit device function: unit_body(L, tid, e, r0, rows, rr, rwt, rx, rxs, w1,
     w2, rws1, rws2, r_routes, oob): rows rr / rwt[r0 : r0 + rows] (route index, weight) of expert
     e -> route rows wt * GEMM2(act(GEMM1(A[route // TOPK]))) stored at route * H (bf16).
@@ -813,10 +801,9 @@ def build_bigm_unit(
     NG2 = H // (NW * 64)  # GEMM2 column groups per wave
     KS2 = I // 128  # GEMM2 k-steps
     assert I % (NW * 32) == 0
-    CH1 = (H // 32 + 7) // 8
-    CH2 = (I // 32 + 7) // 8
+    CH1, CH2 = ceildiv(H // 32, 8), ceildiv(I // 32, 8)
     assert KCH % NAB == 0 and KCH % BST == 0 and KS2 % BS2 == 0
-    lay = bigm_lds(RG, NAB, I, NW)
+    lay = bigm_lds(RG, NAB, I)
     ISS = lay["ISS"]
     LA, LAS, LRIX, LWT = lay["LA"], lay["LAS"], lay["LRIX"], lay["LWT"]
     SIS, LINT, LINTS = lay["SIS"], lay["LINT"], lay["LINTS"]
@@ -824,9 +811,8 @@ def build_bigm_unit(
     assert AR in (16, 32) and 64 % (AR * KCK) == 0
     NAJ = AR // RPJ  # dma16 per wave per chunk (RPJ rows x RBA B each)
     NA = NAJ + 1  # A ops per wave per chunk: dma16s + 1 x dma4 (scales)
-    NB = (
-        4 * KCK + 2
-    )  # B ops per wave per chunk: 2 k-steps x 4 tiles + gate / up scale words
+    # B ops per wave per chunk: 2 k-steps x 4 tiles + gate / up scale words
+    NB = 4 * KCK + 2
     # sched barrier mask after the GEMM2 B issue groups (only VMEM is held)
     SCM = 0x38F
     NB2 = 6  # GEMM2 B ops per k-step: 4 tiles + 2 scale words per 64 columns
@@ -944,15 +930,14 @@ def build_bigm_unit(
             # one scale word = 2 k-steps
             cw = (c * i32(KCK)) // i32(2)
             sg = ((e * i32(2 * I) + icol0) // i32(32)) * i32(CH1 * 256) + cw * i32(256)
-            su = ((e * i32(2 * I) + i32(I) + icol0) // i32(32)) * i32(
-                CH1 * 256
-            ) + cw * i32(256)
+            su = ((e * i32(2 * I) + i32(I) + icol0) // i32(32)) * i32(CH1 * 256)
+            su = su + cw * i32(256)
             vso = lane * i32(4)
             b.append(fx.Int32(bld(rws1, vso, sg, T.i32)))
             b.append(fx.Int32(bld(rws1, vso, su, T.i32)))
             return b
 
-        def g1_chunk(acc, bq, buf, c=0):
+        def g1_chunk(acc, bq, buf, c):
             # c: the chunk (compile time)
             sgw, suw = bq[4 * KCK], bq[4 * KCK + 1]
             for k in range_constexpr(KCK):
@@ -975,9 +960,8 @@ def build_bigm_unit(
                 row = i32(m * 16) + lane % i32(16)
                 gs, us_ = [], []
                 for t in range_constexpr(2):
-                    ga, ua = fx.Vector(acc[m * 2 + t]), fx.Vector(
-                        acc[2 * MTE + m * 2 + t]
-                    )
+                    ga = fx.Vector(acc[m * 2 + t])
+                    ua = fx.Vector(acc[2 * MTE + m * 2 + t])
                     for v in range_constexpr(4):
                         gs.append(fx.Float32(ga[v]))
                         us_.append(fx.Float32(ua[v]))
@@ -1020,16 +1004,13 @@ def build_bigm_unit(
             else:
                 for _ in range_constexpr(NA):
                     bld(rx, lane * i32(16), 0, V4I)
-        NBV = 4 * KCK + 2  # values per B issue
-        assert KCH % BST == 0
         init = [zero] * (4 * MTE) + [v for b in bpre for v in b]
         phi = i32(PASSES)
         for p_, stt in range(i32(0), phi, i32(1), init=init):
             p = i32(p_)
             acc = [zero] * (4 * MTE)
             ring = [
-                list(stt[4 * MTE + s * NBV : 4 * MTE + (s + 1) * NBV])
-                for s in range(BST)
+                list(stt[4 * MTE + s * NB : 4 * MTE + (s + 1) * NB]) for s in range(BST)
             ]
             for c in range_constexpr(KCH):
                 rocdl.sched_barrier(0)
@@ -1106,63 +1087,69 @@ def build_bigm_unit(
             # route rows of group gi (rows past the unit's: stores dropped, counts kept)
             n0 = (w + i32(NW) * gi) * i32(64)
             ccol = (q4 & i32(1)) * i32(16) + (q4 >> i32(1)) * i32(8)
-            for m in range(MTE) if R8 else ():
-                # MXFP8 route rows (the small-M engine's store_route_fp8 layout)
-                ok, wt, rix = row_meta[m]
-                d, e8s = [], []
-                for half in range_constexpr(2):
-                    f = [
-                        fx.Float32(fx.Vector(acc[m * 4 + 2 * half + h])[i]) * wt
-                        for h in range(2)
-                        for i in range(4)
-                    ]
-                    am = amax(f)
-                    am = am.maximumf(am.shuffle_xor(i32(16), i32(64)))
-                    am = am.maximumf(am.shuffle_xor(i32(32), i32(64)))
-                    e8, qs = _e8m0_from_amax(am, max_norm=448.0)
-                    d += [fp8x4_pack(f[0:4], qs), fp8x4_pack(f[4:8], qs)]
-                    e8s.append(fx.Int32(e8) & i32(0xFF))
-                d0, d1 = swap16(d[0], d[1])
-                d2, d3 = swap16(d[2], d[3])
-                d0, d2 = swap32(d0, d2)
-                d1, d3 = swap32(d1, d3)
-                ov = fx.Vector.from_elements([d0, d1, d2, d3], fx.Int32)
-                sc = fx.Int16(e8s[0] | (e8s[1] << i32(8)))
-                bst(
-                    ov, r_routes, ok.select(rix * i32(H) + n0 + q4 * i32(16), oob), 0, 0
-                )
-                soff = oob // i32(2) + rix * i32(H // 32) + n0 // i32(32)
-                bst(sc, r_routes, (ok & (q4 == i32(0))).select(soff, oob), 0, 0)
-            for m in () if R8 else range(MTE):
-                ok, wt, rix = row_meta[m]
-                pk = []
-                for t in range_constexpr(4):
-                    av = fx.Vector(acc[m * 4 + t])
-                    pk.append(
-                        [
-                            pack_bf16x2(
-                                fx.Float32(av[2 * h]) * wt,
-                                fx.Float32(av[2 * h + 1]) * wt,
-                            )
+            if const_expr(R8):
+                for m in range_constexpr(MTE):
+                    # MXFP8 route rows (the small-M engine's store_route_fp8 layout)
+                    ok, wt, rix = row_meta[m]
+                    d, e8s = [], []
+                    for half in range_constexpr(2):
+                        f = [
+                            fx.Float32(fx.Vector(acc[m * 4 + 2 * half + h])[i]) * wt
                             for h in range(2)
+                            for i in range(4)
                         ]
-                    )
-                for half in range_constexpr(2):
-                    ta, tb = 2 * half, 2 * half + 1
-                    lo, hi = [], []
-                    for h in range_constexpr(2):
-                        x, y = swap16(pk[ta][h], pk[tb][h])
-                        lo.append(x)
-                        hi.append(y)
-                    ov = fx.Vector.from_elements(lo + hi, fx.Int32)
-                    col = n0 + i32(half * 32) + ccol
+                        am = amax(f)
+                        am = am.maximumf(am.shuffle_xor(i32(16), i32(64)))
+                        am = am.maximumf(am.shuffle_xor(i32(32), i32(64)))
+                        e8, qs = _e8m0_from_amax(am, max_norm=448.0)
+                        d += [fp8x4_pack(f[0:4], qs), fp8x4_pack(f[4:8], qs)]
+                        e8s.append(fx.Int32(e8) & i32(0xFF))
+                    d0, d1 = swap16(d[0], d[1])
+                    d2, d3 = swap16(d[2], d[3])
+                    d0, d2 = swap32(d0, d2)
+                    d1, d3 = swap32(d1, d3)
+                    ov = fx.Vector.from_elements([d0, d1, d2, d3], fx.Int32)
+                    sc = fx.Int16(e8s[0] | (e8s[1] << i32(8)))
                     bst(
                         ov,
                         r_routes,
-                        ok.select((rix * i32(H) + col) * i32(2), oob),
+                        ok.select(rix * i32(H) + n0 + q4 * i32(16), oob),
                         0,
                         0,
                     )
+                    soff = oob // i32(2) + rix * i32(H // 32) + n0 // i32(32)
+                    bst(sc, r_routes, (ok & (q4 == i32(0))).select(soff, oob), 0, 0)
+            else:
+                for m in range_constexpr(MTE):
+                    ok, wt, rix = row_meta[m]
+                    pk = []
+                    for t in range_constexpr(4):
+                        av = fx.Vector(acc[m * 4 + t])
+                        pk.append(
+                            [
+                                pack_bf16x2(
+                                    fx.Float32(av[2 * h]) * wt,
+                                    fx.Float32(av[2 * h + 1]) * wt,
+                                )
+                                for h in range(2)
+                            ]
+                        )
+                    for half in range_constexpr(2):
+                        ta, tb = 2 * half, 2 * half + 1
+                        lo, hi = [], []
+                        for h in range_constexpr(2):
+                            x, y = swap16(pk[ta][h], pk[tb][h])
+                            lo.append(x)
+                            hi.append(y)
+                        ov = fx.Vector.from_elements(lo + hi, fx.Int32)
+                        col = n0 + i32(half * 32) + ccol
+                        bst(
+                            ov,
+                            r_routes,
+                            ok.select((rix * i32(H) + col) * i32(2), oob),
+                            0,
+                            0,
+                        )
 
         # prologue = the steady issue order of the BS2 steps before (0, 0): their B2 loads,
         # then (the previous group's last step) NST2 route stores, here dropped (OOB)
@@ -1194,7 +1181,7 @@ def build_bigm_unit(
                         fx.Int32(
                             lds_ld(
                                 L,
-                                i32(LINTS) + row * i32(I // 32) + i32(kk * 4) + q4,
+                                i32(LINTS) + row * i32(ISS) + i32(kk * 4) + q4,
                                 T.i8,
                                 1,
                             )

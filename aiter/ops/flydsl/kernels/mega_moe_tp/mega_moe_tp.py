@@ -13,9 +13,12 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
+from aiter.jit.core import AITER_CONFIGS
+
 from ...quick_allreduce_int4_ipc import UncachedIpcHeap as _Ipc
 from ..kernels_common import ceildiv
 from ..tensor_shim import _preload_compiled, _run_compiled
+from .common import device_key, nearest, tuned_rows
 from .mega_moe_tp_config import (
     CTRL_ERR,
     CTRL_INTS,
@@ -540,10 +543,6 @@ class MegaMoeTPEngine:
     def _tuned(self, lb: bool, tot: int) -> dict:
         """The tuned fields of the nearest tuned batch (same schedule, <= tot, inside the
         tuned range: common.nearest), else {} (the defaults)."""
-        from aiter.jit.core import AITER_CONFIGS
-
-        from .common import device_key, nearest, tuned_rows
-
         key = {
             **device_key(self.device),
             "model_dim": self.H,
@@ -579,7 +578,7 @@ class MegaMoeTPEngine:
             if lb:
                 small = tot <= self.lb_small_max
                 # an explicit config field, else the tuned one, else the default
-                if "mt_small" in self._lb_set if small else "mt" in self._lb_set:
+                if ("mt_small" if small else "mt") in self._lb_set:
                     tu.pop("mt", None)
                 if "npp" in self._lb_set and not small:
                     tu.pop("npp", None)

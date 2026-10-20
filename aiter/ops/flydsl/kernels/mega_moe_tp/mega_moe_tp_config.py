@@ -378,7 +378,6 @@ def kernel_config(
 QE, QX, QQ, QXS, QS, QID = 1, 2, 3, 4, 5, 6
 NQ = 8
 QUEUES = (QE, QX, QQ, QXS, QS, QID)
-PUTS_PER_CHUNK = {QE: 1, QX: 1, QQ: 1, QXS: 1, QS: 1, QID: 2}
 
 # phase kinds (per chunk), in item order within a chunk (their done-counter slots; 0 and 2
 # unused)
@@ -407,7 +406,7 @@ C_ERR = BIGM_CTRL_INTS  # sticky watchdog word after the per-launch ctrl block (
 
 CMAX = 7  # chunks per launch (ctrl layout)
 PAD = 64  # the kernel's local rows (and chunk rows) are multiples of this (moe() pads)
-# rows per unit (AITER_BIGM_RG), one CTA (NW waves) per CU: the validated geometry (64-row
+# rows per unit, one CTA (NW waves) per CU: the validated geometry (64-row
 # units: 16% slower at 16384 tokens and failing with two CTAs per CU / three chunks)
 UNIT_ROWS = 128
 

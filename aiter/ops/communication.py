@@ -132,12 +132,12 @@ def _mori():
     return Communicator, CCODevCommRequirements, GDA_CONNECTION_NONE
 
 
-def sdma_bitcode(cov: int = 6) -> str:
-    """MORI's CCO device bitcode (code object version cov), which the big-M kernel links."""
+def sdma_bitcode() -> str:
+    """MORI's CCO device bitcode (code object version 6), which the big-M kernel links."""
     with _mori_env():
         from mori.cco.device.bitcode import find_cco_bitcode
 
-        return find_cco_bitcode(cov)
+        return find_cco_bitcode(6)
 
 
 class SdmaComm:
@@ -196,11 +196,16 @@ class SdmaComm:
         bad = {r: e for r, e in enumerate(errs) if e}
         if bad:
             raise RuntimeError(f"SdmaComm: MORI SDMA setup failed on ranks {bad}")
-        self.arena.commit()  # (raises on every rank if any rank fails)
+        try:
+            self.arena.commit()  # (raises on every rank if any rank fails)
+        except BaseException:
+            self.dev_comm.close()
+            self.comm.destroy()
+            raise
         self.storage = self.arena.storage
         self.base = int(self.storage.data_ptr())
         self.bases = torch.tensor(
-            self.arena._base_ptrs, dtype=torch.int64, device=self.device
+            self.arena.base_ptrs, dtype=torch.int64, device=self.device
         )
         # [2][world * nq] int32 per-(peer, queue) signal bases of the big-M kernel: each launch
         # reads one buffer and writes the next launch's into the other
@@ -219,23 +224,19 @@ class SdmaComm:
             return
         torch.cuda.synchronize(self.device)
         dist.barrier(group=self.group)
-        self.dev_comm.close()
-        self.comm.destroy()
-        self.arena.close()
         self._committed = False
+        try:
+            self.dev_comm.close()
+            self.comm.destroy()
+        finally:
+            self.arena.close()
 
-    def view(
-        self, name: str, shape, dtype: torch.dtype, offset: int = 0
-    ) -> torch.Tensor:
-        """A torch view of region ``name`` (plus a byte offset into it)."""
+    def view(self, name: str, shape, dtype: torch.dtype) -> torch.Tensor:
+        """A torch view of region ``name``."""
         sl = self._slices[name]
-        n = torch.Size(shape).numel() * torch.empty((), dtype=dtype).element_size()
-        assert offset + n <= sl.nbytes, (name, offset, n, sl.nbytes)
-        return (
-            self.storage[sl.offset + offset : sl.offset + offset + n]
-            .view(dtype)
-            .view(shape)
-        )
+        n = torch.Size(shape).numel() * dtype.itemsize
+        assert n <= sl.nbytes, (name, n, sl.nbytes)
+        return self.storage[sl.offset : sl.offset + n].view(dtype).view(shape)
 
 
 @functools.cache
@@ -252,7 +253,7 @@ def compile_signal_read(tp, nq):
 
     sig_slot = link_extern(
         ffi("cco_sdma_signal_slot", ["uint64", "int32", "int32"], "uint64"),
-        bitcode_path=sdma_bitcode(6),
+        bitcode_path=sdma_bitcode(),
     )
 
     @flyc.kernel(name=f"sdma_signal_read_tp{tp}_q{nq}", known_block_size=[64, 1, 1])

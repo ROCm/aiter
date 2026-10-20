@@ -90,7 +90,6 @@ from .mega_moe_tp_config import (
     P_S3,
     P_U,
     P_UB,
-    PUTS_PER_CHUNK,
     QE,
     QID,
     QQ,
@@ -103,6 +102,7 @@ from .mega_moe_tp_config import (
     UNIT_ROWS,
     UQ,
     ZQ,
+    i8_row_bytes,
     kernel_config,
 )
 from .schedule import build_schedule
@@ -587,8 +587,6 @@ def compile_bigm_layer(
     gemma: bool,
     swiglu_limit: float,
     NAB: int = 4,
-    BST: int = 3,
-    BS2: int = 3,
     order: int = 3,
     opts: tuple = (),
     tailq: int = 1,
@@ -602,24 +600,21 @@ def compile_bigm_layer(
     MoE output (y), and with tailq res_out = y + res_in, the next-layer norm + FP8 rows of every
     rank (q gather).
     """
-    spec = repr(
-        sorted(locals().items())
-    )  # every compile argument (the disk cache key, _bigm_cached)
+    # every compile argument (the disk cache key, _bigm_cached)
+    spec = repr(sorted(locals().items()))
+    assert H % 256 == 0 and 0 < E < 512 and K <= 64 and act in ("swiglu", "silu")
     RG = UNIT_ROWS  # (one CTA of NW waves per CU)
     K1, NE = K + 1, E + 1
     HV = H // 8  # 16 B (8 bf16) columns of a row
-    PIT = -(
-        -HV // NT
-    )  # row iterations per thread (the last one partial unless NT | HV)
+    # row iterations per thread (the last one partial unless NT | HV)
+    PIT = ceildiv(HV, NT)
     # per-expert ctrl / LDS entries (one thread per expert, NEB rounds of NT)
-    NEB = -(-NE // NT)
+    NEB = ceildiv(NE, NT)
     NES = NEB * NT
-    XST = 256 if NE <= 256 else 512
     if NE <= 256:
-        CC_CNT, CC_OFF, CC_FILL = C_ECNT, C_OFF, C_FILL
+        XST, CC_CNT, CC_OFF, CC_FILL = 256, C_ECNT, C_OFF, C_FILL
     else:
-        CC_CNT, CC_OFF, CC_FILL = C_XW, C_XW + 8 * 512, C_XW + 16 * 512
-    assert NE <= 512 and act in ("swiglu", "silu")
+        XST, CC_CNT, CC_OFF, CC_FILL = 512, C_XW, C_XW + 8 * 512, C_XW + 16 * 512
 
     od = dict(opts)  # tuned AITER_BIGM_* options (configs/mega_moe_tp_bigm_tuned.csv)
 
@@ -630,71 +625,47 @@ def compile_bigm_layer(
     # this launch -- route rows, own MoE rows, received E rows: stored cached and this XCD's L2
     # written back (buffer_wbl2 sc1) before a unit counts as done (release), loaded sc1
     CAUX = 16
-    BS2 = int(
-        _opt("AITER_BIGM_BS2", str(BS2))
-    )  # GEMM2 B ring depth (6 = a whole group: the
-    # route stores of a group never sit between a GEMM2 load and its wait)
+    # GEMM2 B ring depth (6 = a whole group: the route stores of a group never sit between a
+    # GEMM2 load and its wait)
+    BS2 = int(_opt("AITER_BIGM_BS2", "3"))
     # the B rings' depths divide the unit's GEMM1 chunks (H / 256) / GEMM2 k-steps (I / 128): the
     # largest divisor up to the requested depth (H 4096: BST 3 -> 2; I 512: BS2 3 -> 2, 6 -> 4)
-    BST = max(d for d in range(1, BST + 1) if (H // 256) % d == 0)
+    BST = max(d for d in range(1, 4) if (H // 256) % d == 0)
     BS2 = max(d for d in range(1, BS2 + 1) if (I // 128) % d == 0)
     # item order (see ORDER below); the host picks 3 (one unit round per chunk) or 4 (several)
     ORD = int(_opt("AITER_BIGM_ORD", str(order)))
     # tail sub-blocks: each chunk's topk sums / drains post their E / q puts per row sub-block
-    NSB = int(_opt("AITER_BIGM_NSB", "4"))
+    NSB = 4
     # head sub-blocks: each chunk's gather of the input rows + routing (C) per row sub-block
     NSBA = int(_opt("AITER_BIGM_NSBA", "1"))
     assert NSBA in (1, 2, 4)
     UA = int(_opt("AITER_BIGM_UA", "32"))  # ORD 4: first-round unit slots per XCD
-    RQD = int(
-        _opt("AITER_BIGM_RQD", "0")
-    )  # topk sum: token pipeline depth (0: ZQ, a batch: every load first)
     # R8: route rows as MXFP8 (half the bytes of bf16 GEMM2 stores / topk-sum loads)
     R8 = int(_opt("AITER_BIGM_R8", "0"))
-    E4 = int(
-        _opt("AITER_BIGM_E4", "0")
-    )  # MoE-output RS rows as int4 (+ bf16 scale per 32)
+    # MoE-output RS rows as int4 (+ bf16 scale per 32)
+    E4 = int(_opt("AITER_BIGM_E4", "0"))
     # SXW 0: the routing plan waits only for the gathered routing; units wait for the gathered rows
     SXW = int(_opt("AITER_BIGM_SXW", "1"))
-    if R8:
-        RQD = max(RQD, 1)
-    elif K1 * PIT > 16 and "AITER_BIGM_RQD" not in od:
-        # bf16 route rows of many routes (GLM-5: 9 x 6144): a batch's topk-sum loads alone
-        # take the register file (512 VGPRs + scratch spills): pipelined instead
-        RQD = 1
-    assert NSB in (1, 2, 4) and 16 % NSB == 0
-    PPC = dict(PUTS_PER_CHUNK)
-    PPC[QE] = PPC[QQ] = PPC[QS] = NSB
-    PPC[QX] = PPC[QXS] = NSBA
-    PPC[QID] = 2 * NSBA
+    # topk sum: token pipeline depth (0: ZQ, a batch: every load first). bf16 route rows of many
+    # routes (GLM-5: 9 x 6144): a batch's topk-sum loads alone take the register file (512 VGPRs
+    # + scratch spills): pipelined instead
+    RQD = int(bool(R8) or K1 * PIT > 16)
+    # puts per chunk and queue; no q gather without the tail or with the local tail (own rows'
+    # q only); the y gather (tailq 3): bf16 rows on QQ, no scales
+    PPC = {QE: NSB, QQ: NSB, QS: NSB, QX: NSBA, QXS: NSBA, QID: 2 * NSBA}
     if tailq not in (1, 3):
-        PPC[QQ] = PPC[QS] = (
-            0  # no q gather (no tail, or the local tail: own rows' q only)
-        )
+        PPC[QQ] = PPC[QS] = 0
     if tailq == 3:
-        PPC[QS] = 0  # the y gather: bf16 rows on QQ, no scales
+        PPC[QS] = 0
     ZX = 16  # io: rows per input item (quant + routing copy)
-    assert H % 256 == 0 and 0 < E < 512 and K <= 64
-    EPL = -(-E // 64)  # experts per lane of the plan's wave
+    EPL = ceildiv(E, 64)  # experts per lane of the plan's wave
     # int8 rows of the attention / MoE-output RS: one fp32 scale per 32 values
-    RB = H + (H // 32) * 4
+    RB = i8_row_bytes(H)
     SCO = H
-    lay, unit_body = build_bigm_unit(
-        H,
-        I,
-        K1,
-        RG,
-        NAB,
-        BST,
-        BS2,
-        act,
-        swiglu_limit,
-        R8=R8,
-    )
-    LBASE = lay[
-        "BYTES"
-    ]  # row-phase / plan scratch after the unit's LDS (also reused ranges)
-    LSC = LBASE  # 16 B scratch for block reductions
+    lay, unit_body = build_bigm_unit(H, I, K1, RG, NAB, BST, BS2, act, swiglu_limit, R8)
+    # row-phase / plan scratch after the unit's LDS (also reused ranges)
+    LBASE = lay["BYTES"]
+    LSC = LBASE  # 64 B scratch for block reductions (NW x 4 words)
     LT = LBASE + 64  # ticket broadcast
     LH = LBASE + 128  # [NE] histogram / ranks
     LB2 = LH + 4 * NES  # [NE] bases
@@ -724,15 +695,11 @@ def compile_bigm_layer(
             return None
         return tid + i32(kk * NT) < i32(HV)
 
-    def at_col(
-        base, tid, kk
-    ):  # base + this thread's first element (bf16) of iteration kk
+    def at_col(base, tid, kk):
+        """base + this thread's first element (bf16) of iteration kk"""
         if not cpart(kk):
             return base + tid * i32(8) + i32(kk * NT * 8)
         return base + col(tid, kk) * i32(8)
-
-    def fb(v):
-        return f"{struct.unpack('<I', struct.pack('<f', v))[0]:x}"
 
     # item order: chunk k+1's prep (input rows RB, plan) ahead of chunk k's units and drain
     # (a CTA spinning on an item cannot take later ones: items that wait for a transfer come
@@ -771,11 +738,11 @@ def compile_bigm_layer(
                 ORDER += prep(k + 1)
             ORDER += [(k, P_RQ)]
         ORDER += [(C - 1, P_RF)]
-    if not any(x == P_UB for _, x in ORDER):
         ORDER += [(k, P_UB) for k in range(C)]  # empty: U(k) takes every unit slot
-    KINDS = (P_RB, P_S1, P_S2, P_S3, P_U, P_RQ, P_RF, P_UB)
-    assert sorted(ORDER) == sorted((k, x) for k in range(C) for x in KINDS), ORDER
     USPLIT = ORD == 4
+
+    def fb(v):
+        return f"{struct.unpack('<I', struct.pack('<f', v))[0]:x}"
 
     name = (
         f"bigm_layer_h{H}_i{I}_e{E}k{K}_tp{tp}_c{C}_rg{RG}_{fb(eps)}{'g' if gemma else 'r'}"
@@ -906,7 +873,6 @@ def compile_bigm_layer(
                 AUX_SYS,
             )
 
-    @flyc.kernel(name=name, known_block_size=[NT, 1, 1])
     def kernel(
         wb: fx.Int64,  # this rank's data arena (SdmaComm: hipIpc, not a MORI window)
         pbases: fx.Int64,  # [tp] int64 every rank's arena as mapped here (the put destinations)
@@ -914,12 +880,12 @@ def compile_bigm_layer(
         consumed: fx.Int64,  # [tp][NQ] int32 puts awaited before this launch (persistent;
         # the next launch's at consumed ^ (tp * NQ * 4): two buffers in turn)
         offs: fx.Int64,  # [8] int64 arena region offsets
-        part: fx.Int64,  # x [m, H] bf16 own rows
-        resid: fx.Int64,  # ids [m, K1] int32
-        wpost: fx.Int64,  # tw [m, K1] f32
-        wnext: fx.Int64,  # [H] the next layer's norm weight (tail)
-        res: fx.Int64,  # res_in [m, H] bf16 (tail)
-        normed: fx.Int64,  # y [m, H] bf16 out (the MoE output)
+        xin: fx.Int64,  # [m, H] bf16 own rows
+        ids: fx.Int64,  # [m, K1] int32
+        tw: fx.Int64,  # [m, K1] f32
+        normw: fx.Int64,  # [H] the next layer's norm weight (tail)
+        resin: fx.Int64,  # [m, H] bf16 (tail)
+        yout: fx.Int64,  # [m, H] bf16 out (the MoE output)
         resout: fx.Int64,  # [m, H] bf16 out
         ybuf: fx.Int64,  # [m, H] bf16 own MoE rows
         routes: fx.Int64,  # [T * K1, H] bf16 route rows (chunk k's from route tp * o_k * K1)
@@ -1002,7 +968,7 @@ def compile_bigm_layer(
 
         from ....communication import sdma_bitcode
 
-        bc = sdma_bitcode(6)
+        bc = sdma_bitcode()
         put_ptr = link_extern(
             ffi(
                 "cco_sdma_put_ptr_rsig__thread",
@@ -1128,7 +1094,7 @@ def compile_bigm_layer(
 
         # ---- item counts per (chunk, kind) (rows s per rank of the chunk) ----
 
-        def cnt(kind, s_, k_=0):
+        def cnt(kind, s_):
             if const_expr(kind == P_RB):  # the input rows (item_rx)
                 return s_ // i32(ZX)
             if const_expr(kind == P_RF):
@@ -1145,12 +1111,11 @@ def compile_bigm_layer(
             return fx.Int32(bld(rch, k * i32(8) + i32(4), 0, T.i32, AUX_SYS))
 
         def slices_of(sk):
-            order = ORDER
             out = []
             tot_ = i32(0)
-            for oi in range_constexpr(len(order)):
-                k, kind = order[oi]
-                n = cnt(kind, sk[k], k)
+            for oi in range_constexpr(len(ORDER)):
+                k, kind = ORDER[oi]
+                n = cnt(kind, sk[k])
                 if const_expr(kind == P_S2):
                     lo_, c_ = i32(0), (xc == i32(0)).select(i32(1), i32(0))
                 elif const_expr(kind == P_U):
@@ -1168,9 +1133,9 @@ def compile_bigm_layer(
         _, gw_lo = slices_of([chunk(i32(k))[1] for k in range(C)])
         nall = gw_lo + (xc == i32(0)).select(i32(1), i32(0))
 
-        r_part, r_res, r_resid = rsrc(part), rsrc(res), rsrc(resid)
-        r_wpost, r_wnext, r_y = rsrc(wpost), rsrc(wnext), rsrc(ybuf)
-        r_norm, r_out = rsrc(normed), rsrc(resout)
+        r_xin, r_resin, r_ids = rsrc(xin), rsrc(resin), rsrc(ids)
+        r_tw, r_normw, r_y = rsrc(tw), rsrc(normw), rsrc(ybuf)
+        r_yout, r_out = rsrc(yout), rsrc(resout)
 
         def norm_w(rw, p):
             return bf16x8_to_f32(bld(rw, p * i32(16), 0, T.vec(4, T.i32)))
@@ -1232,7 +1197,7 @@ def compile_bigm_layer(
             ld = [
                 [
                     bld(
-                        r_part,
+                        r_xin,
                         ((o + i0 + i32(ii)) * i32(H) + col(tid, kk) * i32(8)) * i32(2),
                         0,
                         T.vec(4, T.i32),
@@ -1246,14 +1211,14 @@ def compile_bigm_layer(
                 src = (o + i0 + rr_) * i32(K1) + (tid - rr_ * i32(K1))
                 dst = (B + rank * s + i0) * i32(K1) + tid
                 bst(
-                    fx.Int32(bld(r_resid, src * i32(4), 0, T.i32)),
+                    fx.Int32(bld(r_ids, src * i32(4), 0, T.i32)),
                     rsrc(wp("ids")),
                     dst * i32(4),
                     0,
                     AUX_SYS,
                 )
                 bst(
-                    fx.Int32(bld(r_wpost, src * i32(4), 0, T.i32)),
+                    fx.Int32(bld(r_tw, src * i32(4), 0, T.i32)),
                     rsrc(wp("tw")),
                     dst * i32(4),
                     0,
@@ -1420,7 +1385,9 @@ def compile_bigm_layer(
                     for x in range_constexpr(8):
                         lds_st(L, i32(LP + 4 * x), ky[x] >> i32(3))
             gpu.barrier()
-            for b_ in range_constexpr(-(-E // NT)):  # (one round per NT routed experts)
+            for b_ in range_constexpr(
+                ceildiv(E, NT)
+            ):  # (one round per NT routed experts)
                 e = tid if b_ == 0 else tid + i32(b_ * NT)
                 if e < i32(E):
                     c = lds_ld_i32(L, i32(LH) + e * i32(4))
@@ -1757,7 +1724,7 @@ def compile_bigm_layer(
                                 e_ld(rv, B + i32(src_) * s + i, col(tid, kk))
                                 for src_ in range(tp)
                             ],
-                            bld(r_res, off, 0, T.vec(4, T.i32), 0),
+                            bld(r_resin, off, 0, T.vec(4, T.i32), 0),
                         )
                     )
                 ld.append(row)
@@ -1775,7 +1742,7 @@ def compile_bigm_layer(
                     f = [fx.Float32(x.to(fx.BFloat16).to(fx.Float32)) for x in f]
                     live = own_col(tid, kk)
                     if const_expr(live is None):
-                        bst(pack_bf16x8(f), r_norm, off, 0)
+                        bst(pack_bf16x8(f), r_yout, off, 0)
                     else:
                         yv = pack_bf16x8(f)
                     f = [x + yy for x, yy in zip(f, bf16x8_to_f32(lres))]
@@ -1786,7 +1753,7 @@ def compile_bigm_layer(
                             ss = ss + x * x
                     else:
                         if live:
-                            bst(yv, r_norm, off, 0)
+                            bst(yv, r_yout, off, 0)
                             bst(pack_bf16x8(f), r_out, off, 0)
                         for x in f:
                             ss = ss + live.select(x * x, fx.Float32(0.0))
@@ -1804,7 +1771,7 @@ def compile_bigm_layer(
                 )
                 xs_, am = [], fx.Float32(0.0)
                 for kk in range_constexpr(PIT):
-                    wv = norm_w(r_wnext, col(tid, kk))
+                    wv = norm_w(r_normw, col(tid, kk))
                     xk = [
                         fx.Float32(
                             fx.Float32(gate_w(x * rcp, wk))
@@ -1904,7 +1871,7 @@ def compile_bigm_layer(
                             AUX_SYS,
                         )
                     else:
-                        bst(pack_bf16x8(f), r_norm, off, 0)
+                        bst(pack_bf16x8(f), r_yout, off, 0)
             done_last(k, P_RF, cnt(P_RF, s))
             if const_expr(tailq == 3):  # noqa: SIM102 - preserve FlyDSL branches
                 if done_at(sbc(k, 1, b), sb // i32(ZQ)):  # noqa: SIM102
@@ -1990,19 +1957,21 @@ def compile_bigm_layer(
             t = claim()
             alive_ = t < nall
 
-    @flyc.jit
+    kargs = list(inspect.signature(kernel).parameters)
+    kernel = flyc.kernel(name=name, known_block_size=[NT, 1, 1])(kernel)
+
     def launch(
         wb: fx.Int64,
         pbases: fx.Int64,
         dc: fx.Int64,
         consumed: fx.Int64,
         offs: fx.Int64,
-        part: fx.Int64,
-        resid: fx.Int64,
-        wpost: fx.Int64,
-        wnext: fx.Int64,
-        res: fx.Int64,
-        normed: fx.Int64,
+        xin: fx.Int64,
+        ids: fx.Int64,
+        tw: fx.Int64,
+        normw: fx.Int64,
+        resin: fx.Int64,
+        yout: fx.Int64,
         resout: fx.Int64,
         ybuf: fx.Int64,
         routes: fx.Int64,
@@ -2021,34 +1990,14 @@ def compile_bigm_layer(
         grid: fx.Int32,
         stream: fx.Stream,
     ):
-        kernel(
-            wb,
-            pbases,
-            dc,
-            consumed,
-            offs,
-            part,
-            resid,
-            wpost,
-            wnext,
-            res,
-            normed,
-            resout,
-            ybuf,
-            routes,
-            lrix,
-            lwt,
-            utab,
-            w1,
-            w1s,
-            w2,
-            w2s,
-            ctrl,
-            chunks,
-            rank,
-            m,
-            ucap,
-        ).launch(grid=(fx.Int64(grid), 1, 1), block=(NT, 1, 1), stream=stream)
+        loc = locals()
+        kernel(*[loc[k] for k in kargs]).launch(
+            grid=(fx.Int64(grid), 1, 1), block=(NT, 1, 1), stream=stream
+        )
 
+    # launch forwards its arguments to the kernel by name
+    if list(inspect.signature(launch).parameters) != kargs + ["grid", "stream"]:
+        raise ValueError("compile_bigm_layer: kernel and launch signatures differ")
+    launch = flyc.jit(launch)
     launch._bigm_spec = spec
     return launch
