@@ -8,7 +8,23 @@ import torch
 
 from aiter import sparse_mla_fp8_fwd, allocate_sparse_mla_fp8_workspace
 
-QUERIES = list(range(1, 65)) + [65, 128, 256, 512, 1024, 2048]
+QUERIES = list(range(1, 65)) + [
+    65,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    2049,
+    4095,
+    4096,
+    4097,
+    8191,
+    8192,
+    8193,
+    16383,
+    16384,
+]
 CAPACITIES = [0, 1, 63, 64, 127, 128, 129, 2048, 2051, 2111, 2112, 2113, 2176]
 TOLERANCE = 0.07
 
@@ -107,7 +123,9 @@ def test_capacity_stride_scale(n, capacity):
     assert torch.equal(lse, control_lse)
 
 
-@pytest.mark.parametrize("n", [1, 6, 7, 8, 12, 13, 22, 24, 43, 65, 129, 2048])
+@pytest.mark.parametrize(
+    "n", [1, 6, 7, 8, 12, 13, 22, 24, 43, 65, 129, 2048, 4096, 8192, 16384]
+)
 def test_changed_graph(n):
     q, kv, ids = inputs(n)
     workspace = allocate_sparse_mla_fp8_workspace(q)
@@ -154,6 +172,46 @@ def test_bad_scales(argument, scale):
     kwargs = {"softmax_scale": 1 / 16, argument: scale}
     with pytest.raises((ValueError, RuntimeError), match="scale"):
         sparse_mla_fp8_fwd(q, kv, ids, **kwargs)
+
+
+@pytest.mark.parametrize("n", [4096, 8192, 16384])
+def test_large_query_chunk_equivalence(n):
+    """Every row agrees with the previously supported S1 launch size."""
+    q, kv, ids = inputs(n, 2176, strided=True)
+    kwargs = dict(q_scale=0.5, kv_scale=1.25, return_lse=True)
+    out, lse = sparse_mla_fp8_fwd(q, kv, ids, 1 / 16, **kwargs)
+    assert_reference(out, lse, q, kv, ids, q_scale=0.5, kv_scale=1.25)
+    for start in range(0, n, 2048):
+        chunk_out, chunk_lse = sparse_mla_fp8_fwd(
+            q[start : start + 2048], kv, ids[start : start + 2048], 1 / 16, **kwargs
+        )
+        assert torch.equal(out[start : start + 2048], chunk_out)
+        assert torch.equal(lse[start : start + 2048], chunk_lse)
+
+
+def test_query_limit():
+    q = torch.empty((16385, 64, 512), device="cuda", dtype=torch.bfloat16)
+    kv = torch.empty((1, 512), device=q.device, dtype=torch.float8_e4m3fn)
+    ids = torch.empty((len(q), 0), device=q.device, dtype=torch.int32)
+    for call in [
+        lambda: allocate_sparse_mla_fp8_workspace(q),
+        lambda: sparse_mla_fp8_fwd(q, kv, ids, 1 / 16),
+        # Bypass the Python checks to cover the public custom-op boundary.
+        lambda: torch.ops.aiter.sparse_mla_fp8_fwd_out(
+            q,
+            kv,
+            ids,
+            torch.empty_like(q),
+            None,
+            torch.empty(0, device=q.device, dtype=torch.bfloat16),
+            torch.empty(0, device=q.device, dtype=torch.float32),
+            1 / 16,
+            1.0,
+            1.0,
+        ),
+    ]:
+        with pytest.raises((ValueError, RuntimeError), match="16384"):
+            call()
 
 
 def test_metadata_and_storage():

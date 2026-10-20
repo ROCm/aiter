@@ -34,8 +34,8 @@ def allocate_sparse_mla_fp8_workspace(
     Reuse this pair for the same Q shape and device. No initialization or GPU
     kernel is required. The layout is private and may vary with query count.
     """
-    if q.ndim != 3 or q.shape[1:] != (64, 512) or not 0 <= q.shape[0] <= 2048:
-        raise ValueError("expected q=[Q,64,512], 0 <= Q <= 2048")
+    if q.ndim != 3 or q.shape[1:] != (64, 512) or not 0 <= q.shape[0] <= 16384:
+        raise ValueError("expected q=[Q,64,512], 0 <= Q <= 16384")
     queries = q.shape[0]
     splits = _split_count(queries)
     rows = queries * splits * 64 if splits > 1 else 0
@@ -133,7 +133,7 @@ def sparse_mla_fp8_fwd(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Sparse attention with a shared FP8 K/V latent and no appended RoPE.
 
-    Q is BF16 or E4M3FN [Q,64,512], with Q <= 2048. Q rows must be aligned
+    Q is BF16 or E4M3FN [Q,64,512], with Q <= 16384. Q rows must be aligned
     to 16 bytes, non-overlapping, and have unit inner stride. KV is contiguous
     E4M3FN [slots,512], [pages,page_size,512], or [slots,1,1,512].
 
@@ -153,8 +153,8 @@ def sparse_mla_fp8_fwd(
     dispatch uses host shape metadata and replay reads updated input values.
     This opt-in operator supports gfx950 only and has no engine fallback.
     """
-    if q.ndim != 3 or q.shape[1:] != (64, 512) or not 0 <= q.shape[0] <= 2048:
-        raise ValueError("expected q=[Q,64,512], 0 <= Q <= 2048")
+    if q.ndim != 3 or q.shape[1:] != (64, 512) or not 0 <= q.shape[0] <= 16384:
+        raise ValueError("expected q=[Q,64,512], 0 <= Q <= 16384")
     if kv_buffer.ndim == 4 and kv_buffer.shape[1:3] == (1, 1):
         kv_buffer = kv_buffer.view(kv_buffer.shape[0], kv_buffer.shape[-1])
     elif kv_buffer.ndim == 3:

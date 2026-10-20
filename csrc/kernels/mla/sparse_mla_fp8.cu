@@ -84,7 +84,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(sparse_mla_fp8_fwd_out,
     check_tensor(q, "q", q->dtype(), device);
     AITER_CHECK(q->dim() == 3 && q->size(1) == 64 && q->size(2) == 512, "expected q=[Q,64,512]");
     const int64_t queries = q->size(0);
-    AITER_CHECK(queries <= 2048, "Q must be <= 2048");
+    AITER_CHECK(queries <= 16384, "Q must be <= 16384");
     AITER_CHECK(q->stride(2) == 1 && q->stride(1) >= 512 && q->stride(0) >= 63 * q->stride(1) + 512,
                 "q must have non-overlapping, unit-inner-stride rows");
     const int bytes = q->element_size();

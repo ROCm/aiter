@@ -29,7 +29,7 @@ graph.replay()
 
 | Argument | Contract |
 |---|---|
-| Q | BF16 or `float8_e4m3fn`, `[Q,64,512]`, Q from 0 through 2048 |
+| Q | BF16 or `float8_e4m3fn`, `[Q,64,512]`, Q from 0 through 16384 |
 | Q layout | Unit inner stride, non-overlapping rows, pointer and row strides aligned to 16 bytes |
 | KV | Contiguous `float8_e4m3fn`, `[slots,512]`, `[pages,page_size,512]`, or `[slots,1,1,512]` |
 | Slot IDs | Contiguous int32 `[Q,K]` or `[Q,1,K]`, capacity K from 0 through 2176 |
@@ -73,7 +73,7 @@ input or each other. Unsupported devices and metadata raise errors.
 | 24–42 | 64 | 128 | 6 | Rotating KV buffers |
 | 43–64 | 64 | 128 | 4 | Rotating KV buffers |
 | 65–128 | 64 | 128 | 2 | Streaming double buffer |
-| 129–2048 | 64 | 128 | 1 | Streaming double buffer, direct output |
+| 129–16384 | 64 | 128 | 1 | Streaming double buffer, direct output |
 
 Q8 uses head-major partial LSE and a packed FP32 reducer. Other split paths use
 their corresponding split-major layout. Workspace is opaque so callers do not
@@ -94,7 +94,7 @@ GPU_ARCHS=gfx950 python -m pytest -q op_tests/test_sparse_mla_fp8.py
 The benchmark accepts BF16 Q for both HIP and Gluon, includes conversion inside
 attention, and ends with BF16 O ready. It uses a random 5,608,046,592-byte FP8 KV
 pool, 2051 valid slots per query, capacity 2112, and `-1` padding. The default
-queries are every power of two from 1 through 2048; `--all-small` additionally
+queries are every power of two from 1 through 16384; `--all-small` additionally
 covers Q1–64 individually and Q65.
 
 ```bash

@@ -75,10 +75,10 @@ def check_gluon(out, q, kv, ids, block_m):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--queries", type=int, nargs="+", default=[2**i for i in range(12)]
+        "--queries", type=int, nargs="+", default=[2**i for i in range(15)]
     )
     parser.add_argument(
-        "--all-small", action="store_true", help="Q1-64 plus 65/128/.../2048"
+        "--all-small", action="store_true", help="Q1-64 plus 65/128/.../16384"
     )
     parser.add_argument("--pool-bytes", type=int, default=5_608_046_592)
     parser.add_argument("--valid-k", type=int, default=2051)
@@ -88,11 +88,21 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.all_small:
-        args.queries = list(range(1, 65)) + [65, 128, 256, 512, 1024, 2048]
+        args.queries = list(range(1, 65)) + [
+            65,
+            128,
+            256,
+            512,
+            1024,
+            2048,
+            4096,
+            8192,
+            16384,
+        ]
     assert 0 < args.valid_k <= args.capacity <= 2176
     assert args.pool_bytes > 0 and args.pool_bytes % 512 == 0
     assert args.samples > 0 and args.graph_repetitions > 0
-    assert all(1 <= n <= 2048 for n in args.queries)
+    assert all(1 <= n <= 16384 for n in args.queries)
     args.output.mkdir(parents=True, exist_ok=False)
     (args.output / "config.json").write_text(
         json.dumps(vars(args), default=str, indent=2)
