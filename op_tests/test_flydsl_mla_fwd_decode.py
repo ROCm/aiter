@@ -27,9 +27,12 @@ torch.set_default_device("cuda")
 
 SUPPORTED_GFX = ["gfx942", "gfx950"]
 NUM_HEADS = 128
+NUM_HEADS_KV = 1
 QK_HEAD_DIM = 576
 V_HEAD_DIM = 512
-
+KV_LORA_RANK = 512
+PAGE_SIZE = 1
+DECODE_QLEN = 1
 
 # Pytorch reference, from FlyDSL tests/kernels/test_mla_decode.py
 
@@ -53,7 +56,7 @@ def ref_masked_attention(query, key, value, scale, dtype, q_scale=None, kv_scale
     return out.to(dtype), lse
 
 
-def torch_mla_extend(q, kvc_cache, qo_indptr, kv_indptr, kv_indices, kv_last_page_lens, sm_scale, dtype):
+def run_torch(q, kvc_cache, qo_indptr, kv_indptr, kv_indices, kv_last_page_lens, sm_scale, dtype):
     """Pure-PyTorch paged MLA attention reference."""
     is_fp8_q = q.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
     is_fp8_kvc = kvc_cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
@@ -63,7 +66,8 @@ def torch_mla_extend(q, kvc_cache, qo_indptr, kv_indptr, kv_indices, kv_last_pag
     if is_fp8_kvc:
         kvc_cache = kvc_cache.to(torch.float)
 
-    num_page, page_size, nhead_kv, _ = kvc_cache.shape
+    # num_page, page_size, nhead_kv, _ = kvc_cache.shape
+    page_size = 1
     qs = torch.tensor_split(q, qo_indptr.tolist()[1:])
     kvc = torch.index_select(kvc_cache, 0, kv_indices)
     kvs = torch.tensor_split(kvc, kv_indptr.tolist()[1:])
@@ -86,59 +90,107 @@ def torch_mla_extend(q, kvc_cache, qo_indptr, kv_indptr, kv_indices, kv_last_pag
     lse = torch.concat(lses, dim=1).transpose(0, 1)
     return o, lse
 
-def run_torch(
-        query,
-        kv_buffer,
-        kv_page_indices,
-        work_indptr,
+
+def _make_inputs(batch, context_len, decode_qlen=DECODE_QLEN, max_split_per_batch=32):
+    """Build Q, paged KV, and persistent-decode metadata.
+
+    Sequence tables and ``work_indptr`` / ``work_info_set`` come from
+    ``aiter.get_mla_metadata_v1``, matching FlyDSL ``tests/kernels/test_mla_decode.py``.
+    """
+    nhead = NUM_HEADS
+    nhead_kv = NUM_HEADS_KV
+    page_size = PAGE_SIZE
+    fp8 = dtypes.fp8
+
+    seq_lens_qo = torch.full((batch,), decode_qlen, dtype=torch.int)
+    qo_indptr = torch.zeros(batch + 1, dtype=torch.int)
+    qo_indptr[1:] = torch.cumsum(seq_lens_qo, dim=0)
+    total_q = qo_indptr[-1].item()
+    max_seqlen_qo = decode_qlen
+
+    kv_block_nums = torch.full(
+        (batch,), (context_len + page_size - 1) // page_size, dtype=torch.int
+    )
+    kv_last_page_lens = torch.ones(batch, dtype=torch.int)
+    if context_len % page_size != 0:
+        kv_last_page_lens.fill_(context_len % page_size)
+    kv_indptr = torch.zeros(batch + 1, dtype=torch.int)
+    kv_indptr[1:] = torch.cumsum(kv_block_nums, dim=0)
+    num_page = kv_indptr[-1].item()
+    kv_page_indices = torch.randperm(num_page, dtype=torch.int)
+
+    query = torch.randn((total_q, nhead, QK_HEAD_DIM), dtype=torch.bfloat16).to(fp8)
+    kv_buffer = torch.randn(
+        (num_page, page_size, nhead_kv, QK_HEAD_DIM), dtype=torch.bfloat16
+    ).to(fp8)
+
+    cu_num = torch.cuda.get_device_properties(query.device).multi_processor_count
+    max_split_per_batch = min((cu_num + batch - 1) // batch, max_split_per_batch)
+
+    (
+        (work_meta_data_size, work_meta_data_type),
+        (work_indptr_size, work_indptr_type),
+        (work_info_set_size, work_info_set_type),
+        (reduce_indptr_size, reduce_indptr_type),
+        (reduce_final_map_size, reduce_final_map_type),
+        (reduce_partial_map_size, reduce_partial_map_type),
+    ) = aiter.get_mla_metadata_info_v1(
+        batch,
+        max_seqlen_qo,
+        nhead,
+        fp8,
+        fp8,
+        is_sparse=False,
+        fast_mode=True,
+        num_kv_splits=max_split_per_batch,
+        intra_batch_mode=False,
+    )
+
+    work_meta_data = torch.empty(work_meta_data_size, dtype=work_meta_data_type)
+    work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type)
+    work_info_set = torch.empty(work_info_set_size, dtype=work_info_set_type)
+    reduce_indptr = torch.empty(reduce_indptr_size, dtype=reduce_indptr_type)
+    reduce_final_map = torch.empty(reduce_final_map_size, dtype=reduce_final_map_type)
+    reduce_partial_map = torch.empty(reduce_partial_map_size, dtype=reduce_partial_map_type)
+
+    aiter.get_mla_metadata_v1(
+        qo_indptr,
+        kv_indptr,
+        kv_last_page_lens,
+        nhead // nhead_kv,
+        nhead_kv,
+        False,
+        work_meta_data,
         work_info_set,
-        final_output,
-        split_output,
-        split_lse
-        ):
-    """Torch reference for MLA forward decode"""
-
-
-
-    pass
-    # return ref_output, ref_lse
-
-
-def _make_inputs(batch, context_len):
-    total_kv = batch * context_len
-    query = torch.zeros((batch * NUM_HEADS, QK_HEAD_DIM), dtype=dtypes.fp8)
-    kv_buffer = torch.zeros((total_kv, QK_HEAD_DIM), dtype=dtypes.fp8)
-    kv_page_indices = torch.arange(total_kv, dtype=torch.int32)
-    work_indptr = torch.tensor([0, batch], dtype=torch.int32)
-    work_info_set = torch.tensor(
-        [
-            [
-                batch_idx,
-                batch_idx,
-                batch_idx,
-                batch_idx + 1,
-                batch_idx * context_len,
-                (batch_idx + 1) * context_len,
-                0,
-                0,
-            ]
-            for batch_idx in range(batch)
-        ],
-        dtype=torch.int32,
+        work_indptr,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        kv_granularity=max(page_size, 16),
+        max_seqlen_qo=int(max_seqlen_qo),
+        uni_seqlen_qo=decode_qlen,
+        fast_mode=True,
+        max_split_per_batch=max_split_per_batch,
+        intra_batch_mode=False,
+        dtype_q=fp8,
+        dtype_kv=fp8,
     )
-    final_output = torch.empty(
-        (batch * NUM_HEADS, V_HEAD_DIM), dtype=torch.bfloat16
-    )
+
+    final_output = torch.empty((total_q, nhead, V_HEAD_DIM), dtype=torch.bfloat16)
+    num_partial = reduce_partial_map.size(0) * max_seqlen_qo
     split_output = torch.full(
-        (batch * NUM_HEADS, V_HEAD_DIM), float("nan"), dtype=torch.float32
+        (num_partial, 1, nhead, V_HEAD_DIM), float("nan"), dtype=torch.float32
     )
     split_lse = torch.full(
-        (batch * NUM_HEADS,), float("nan"), dtype=torch.float32
+        (num_partial, 1, nhead, 1), float("nan"), dtype=torch.float32
     )
     return (
         query,
         kv_buffer,
         kv_page_indices,
+        qo_indptr,
+        kv_indptr,
+        kv_last_page_lens,
         work_indptr,
         work_info_set,
         final_output,
@@ -160,13 +212,27 @@ def test_mla_fwd_decode_m16x8_fp8_fp8(batch=1, context_len=1):
         query,
         kv_buffer,
         kv_page_indices,
+        qo_indptr,
+        kv_indptr,
+        kv_last_page_lens,
         work_indptr,
         work_info_set,
         final_output,
         split_output,
         split_lse,
     ) = _make_inputs(batch, context_len)
-    ref_output, ref_lse = run_torch(batch, context_len, split_output, split_lse)
+
+    sm_scale = 1.0 / (QK_HEAD_DIM**0.5)
+    ref_output, ref_lse = run_torch(
+        query,
+        kv_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_page_indices,
+        kv_last_page_lens,
+        sm_scale,
+        torch.bfloat16,
+    )
 
     props = torch.cuda.get_device_properties(query.device)
     lds_size = getattr(props, "shared_memory_per_multiprocessor", None)
@@ -183,8 +249,8 @@ def test_mla_fwd_decode_m16x8_fp8_fp8(batch=1, context_len=1):
             final_output,
             split_output,
             split_lse,
-            1.0 / (QK_HEAD_DIM**0.5),
-            1,
+            sm_scale,
+            work_indptr.shape[0] - 1,
             lds_size,
             torch.cuda.current_stream(),
         )
