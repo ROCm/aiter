@@ -23,7 +23,6 @@ from aiter.dist.parallel_state import (
 )
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.test_common import (
-    benchmark,
     checkAllclose,
     perftest,
 )
@@ -48,16 +47,72 @@ def barrier_before_teardown():
     torch.cuda.synchronize()
 
 
-def run_allgather(
+def _run_allgather_case(
+    rankID, tp_size, case_idx, shape, dtype, withGraph, use_custom, dim, graphs
+):
+    """All-gather one case on an initialized rank and check it against the
+    concatenation of every rank's input along ``dim``.
+
+    Each rank regenerates all ``tp_size`` inputs from the same ``case_idx``
+    seed and keeps its own, so the reference is available locally and only
+    scalars go back to the parent. In graph mode the captured graph and its
+    buffers are appended to ``graphs`` and must outlive the whole sweep:
+    custom collectives cache the peer IPC address of every captured buffer by
+    its local pointer, so freeing one and capturing a later case at the same
+    address would replay with stale peer pointers.
+    """
+    if rankID == 0:
+        print(f"run perf test, use custom allgather {use_custom}")
+    gen = torch.Generator(device="cuda").manual_seed(case_idx)
+    inputs = [
+        torch.randn(shape, dtype=dtype, device="cuda", generator=gen)
+        for _ in range(tp_size)
+    ]
+    x = inputs[rankID]
+    ref = torch.cat(inputs, dim)
+
+    if withGraph:
+        graph = torch.cuda.CUDAGraph()
+        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+            out = tensor_model_parallel_all_gather(x, use_custom=use_custom, dim=dim)
+        out.fill_(0)
+        graphs.append((graph, x, out))
+
+        @perftest()
+        def run_ca():
+            graph.replay()
+
+        _, us = run_ca()
+    else:
+
+        @perftest()
+        def run_ca(x):
+            return tensor_model_parallel_all_gather(x, use_custom=use_custom, dim=dim)
+
+        out, us = run_ca(x)
+
+    msg = (
+        f"allgather (use custom {use_custom}): rank={rankID} "
+        f"{shape=} {dtype=} {withGraph=} {us:>8.2f}"
+    )
+    return {"us": us, "err": checkAllclose(ref, out, msg=msg)}
+
+
+def allgather_sweep(
     tp_size,
     pp_size,
     rankID,
-    x,
+    cases,
+    dtype,
     withGraph=False,
-    use_custom=False,
-    dim=0,
     distributed_init_method: str | None = None,
 ):
+    """Run every case on one rank inside a single distributed init.
+
+    Setting up the TP group dominates a single case (seconds vs. microseconds
+    of kernel time), so the group is created and torn down once. Custom and
+    RCCL all-gather share it: ``use_custom`` is a per-call switch.
+    """
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
     # init
@@ -69,41 +124,36 @@ def run_allgather(
         distributed_init_method=distributed_init_method,
     )
     ensure_model_parallel_initialized(tp_size, pp_size)
-    x = x.to(device)
-    # dist.barrier(device_ids=[i for i in range(tp_size)])
 
     # warmup and align all gpu
     group = get_tp_group().device_group
     dist.all_reduce(torch.zeros(1).cuda(), group=group)
     torch.cuda.synchronize()
 
-    if withGraph:
-        graph = torch.cuda.CUDAGraph()
-        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
-            out = tensor_model_parallel_all_gather(x, use_custom=use_custom, dim=dim)
-        out.fill_(0)
-
-        @perftest()
-        def run_ca():
-            graph.replay()
-
-        _, us = run_ca()
-        out = (out, us)
-    else:
-
-        @perftest()
-        def run_ca(x):
-            return tensor_model_parallel_all_gather(x, use_custom=use_custom, dim=dim)
-
-        out = run_ca(x)
+    graphs = []
+    results = [
+        _run_allgather_case(
+            rankID,
+            tp_size,
+            case_idx,
+            case["shape"],
+            dtype,
+            withGraph,
+            case["use_custom"],
+            case["dim"],
+            graphs,
+        )
+        for case_idx, case in enumerate(cases)
+    ]
 
     # destroy
     if dist.is_initialized():
         barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
+        graphs.clear()
         torch.cuda.empty_cache()
-    return out
+    return results
 
 
 def call_ccl_allgather_naive(
@@ -192,61 +242,37 @@ def allgather_acctest(
         checkAllclose(ref, i.to(ref))
 
 
-@benchmark()
-def allgather_perftest(
-    tp_size,
-    pp_size,
-    shape,
-    dtype,
-    withGraph=False,
-    use_custom=False,
-    dim=0,
-    distributed_init_method: str | None = None,
-):
-    print(f"run perf test, use custom allgather {use_custom}")
+def allgather_perftest(tp_size, pp_size, cases, dtype, withGraph=False):
+    """Sweep ``cases`` on one TP group and return one summary row per case."""
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
-    pool = Pool(processes=tp_size)
-    ref = torch.zeros(shape, dtype=dtype)
-    rets = []
-    input_list = []
-    for i in range(tp_size):
-        x = torch.randn(shape, dtype=dtype)
-        input_list.append(x)
-        rets.append(
+    init_method = get_distributed_init_method(get_ip(), get_open_port())
+    with Pool(processes=tp_size) as pool:
+        rets = [
             pool.apply_async(
-                run_allgather,
-                args=(
-                    tp_size,
-                    pp_size,
-                    i,
-                    x,
-                    withGraph,
-                    use_custom,
-                    dim,
-                    distributed_init_method,
-                ),
+                allgather_sweep,
+                args=(tp_size, pp_size, rank, cases, dtype, withGraph, init_method),
             )
-            # pool.apply_async(run_cu, args=(x, weight, eps, i))
+            for rank in range(tp_size)
+        ]
+        per_rank = [el.get() for el in rets]
+    rows = []
+    for i, case in enumerate(cases):
+        all_us = [results[i]["us"] for results in per_rank]
+        rows.append(
+            {
+                "tp_size": tp_size,
+                "shape": case["shape"],
+                "dtype": dtype,
+                "withGraph": withGraph,
+                "use_custom": case["use_custom"],
+                "dim": case["dim"],
+                "min_us": min(all_us),
+                "max_us": max(all_us),
+                "err": max(results[i]["err"] for results in per_rank),
+            }
         )
-    pool.close()
-    pool.join()
-    ref = input_list[0]
-    for i in range(tp_size - 1):
-        ref = torch.concat((ref, input_list[i + 1]), dim)
-
-    rets = [el.get() for el in rets]
-    all_us = [us for _, us in rets]
-    max_err = 0.0
-    for out, us in rets:
-        msg = f"allgather (use custom {use_custom}): {shape=} {dtype=} {withGraph=} {us:>8.2f}"
-        err = checkAllclose(ref, out.to(ref), msg=msg)
-        max_err = max(max_err, err)
-    return {
-        "min_us": min(all_us),
-        "max_us": max(all_us),
-        "err": max_err,
-    }
+    return rows
 
 
 l_dtype = ["bf16"]
@@ -316,24 +342,16 @@ if __name__ == "__main__":
         l_shape = [args.shape]
     tp_size = args.tp_size
     l_dim = [0, -1]
+    # One TP group per dtype; shapes, dims and custom/RCCL are swept inside it.
+    cases = [
+        {"shape": shape, "dim": dim, "use_custom": use_custom}
+        for shape in l_shape
+        for dim in l_dim
+        for use_custom in [False, True]
+    ]
     df = []
     for dtype in l_dtype:
-        for shape in l_shape:
-            for dim in l_dim:
-                for use_custom in [False, True]:
-                    ret = allgather_perftest(
-                        tp_size,
-                        1,
-                        shape,
-                        dtype,
-                        withGraph=False,
-                        use_custom=use_custom,
-                        dim=dim,
-                        distributed_init_method=get_distributed_init_method(
-                            get_ip(), get_open_port()
-                        ),
-                    )
-                    df.append(ret)
+        df.extend(allgather_perftest(tp_size, 1, cases, dtype, withGraph=False))
     df = pd.DataFrame(df)
     show_cols = [
         "tp_size",

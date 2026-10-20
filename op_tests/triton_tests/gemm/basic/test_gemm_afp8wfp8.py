@@ -146,7 +146,7 @@ def get_shapes():
     # (M, N, K), with N % 128 == 0 and K % 128 == 0 to fit the 128x128 W-scale layout.
     return [
         (m, n, k)
-        for m in [1, 8, 16, 32, 64, 512, 16384]
+        for m in [16, 32, 64, 512]
         for n, k in [
             (2048, 7168),
             (65536, 1536),

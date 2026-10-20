@@ -458,6 +458,29 @@ def test_weight_prepack_cache_reuses_and_invalidates(monkeypatch):
     ), "refreshed K-padding region contains nonzero values"
 
 
+def test_conv3d_inference_weight_observes_updates():
+    torch.manual_seed(0)
+    with torch.inference_mode():
+        x = torch.randn(1, 64, 4, 8, 8, device="cuda", dtype=torch.float16)
+        weight = torch.randn(32, 64, 3, 3, 3, device="cuda", dtype=torch.float16)
+
+        output = conv3d(x, weight, padding=1)
+        reference = F.conv3d(x.float(), weight.float(), padding=1)
+
+        weight.add_(0.25)
+        output_after_update = conv3d(x, weight, padding=1)
+        reference_after_update = F.conv3d(x.float(), weight.float(), padding=1)
+
+    rtol, atol = dynamic_conv_tolerances(torch.float16, 64 * 3 * 3 * 3)
+    torch.testing.assert_close(output.float(), reference, rtol=rtol, atol=atol)
+    torch.testing.assert_close(
+        output_after_update.float(),
+        reference_after_update,
+        rtol=rtol,
+        atol=atol,
+    )
+
+
 def test_weight_prepack_cache_uses_lru_eviction(monkeypatch):
     cache = conv_prepack._LRUPackCache(maxsize=2)
     monkeypatch.setattr(conv_prepack, "_PACK_CACHE_3D_GENERAL", cache)
@@ -549,8 +572,8 @@ def test_invalid_layout():
 
 
 def test_conv3d_dims_supports_cpu_tensors():
-    x = torch.empty((2, 4, 5, 6, 7), dtype=torch.float16)
-    w = torch.empty((8, 4, 3, 3, 3), dtype=torch.float16)
+    x = torch.empty((2, 4, 5, 6, 7), dtype=torch.float16, device="cpu")
+    w = torch.empty((8, 4, 3, 3, 3), dtype=torch.float16, device="cpu")
 
     dimensions = _conv3d_dims(
         x,
@@ -565,8 +588,8 @@ def test_conv3d_dims_supports_cpu_tensors():
 
 
 def test_conv3d_execution_rejects_cpu_tensors():
-    x = torch.empty((1, 4, 3, 4, 4), dtype=torch.float16)
-    w = torch.empty((4, 4, 1, 1, 1), dtype=torch.float16)
+    x = torch.empty((1, 4, 3, 4, 4), dtype=torch.float16, device="cpu")
+    w = torch.empty((4, 4, 1, 1, 1), dtype=torch.float16, device="cpu")
 
     with pytest.raises(ValueError, match="requires CUDA input and weight tensors"):
         conv3d_general(x, w)
