@@ -471,6 +471,14 @@ class MegaMoEConfig:
         )
 
     @property
+    def dispatch_backend(self) -> str:
+        """Which dispatch stage1_fused picks, by the name it used to be chosen by.
+
+        Read-only, for callers that still log it; nothing here consults it.
+        """
+        return "flydsl" if self.stage1_fused else "mori"
+
+    @property
     def is_quant_dispatch_wire(self) -> bool:
         """The wire carries an MX payload plus its e8m0 row, not bf16."""
         return self.dispatch_wire in ("fp8", "fp4")
@@ -636,6 +644,7 @@ class MegaMoEGfx1250:
         stage1_fused: bool = False,
         stage2_fused: bool = True,
         combine_quant: str | None = None,
+        dispatch_backend: str | None = None,
     ):
         """Everything here is fixed for the whole model; forward() takes the rest.
 
@@ -643,7 +652,19 @@ class MegaMoEGfx1250:
         communication arena and differ only in their weights, so one instance
         serves every layer (weights are forward() arguments) and the model keeps a
         single cco symmetric arena instead of one per layer.
+
+        ``dispatch_backend`` no longer chooses anything: stage1_fused does. It is
+        still accepted so a caller written against the old switch keeps working,
+        as long as it names the dispatch stage1_fused picks.
         """
+        if dispatch_backend is not None:
+            expected = "flydsl" if stage1_fused else "mori"
+            if dispatch_backend != expected:
+                raise ValueError(
+                    f"dispatch_backend={dispatch_backend!r} no longer picks the "
+                    f"dispatch; stage1_fused does, and stage1_fused={stage1_fused} "
+                    f"runs {expected}"
+                )
         gfx = get_gfx()
         if gfx != "gfx1250":
             raise RuntimeError(f"MegaMoEGfx1250 requires gfx1250, got {gfx}")
