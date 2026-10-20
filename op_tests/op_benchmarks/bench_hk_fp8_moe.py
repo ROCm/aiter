@@ -20,11 +20,15 @@ D, INTER, ROUTED_EXPERTS = 4096, 1024, 288
 def make_weights():
     import torch
 
-    from aiter.ops.shuffle import shuffle_weight
+    from aiter.ops.shuffle import (
+        shuffle_scale_a16w4,
+        shuffle_weight,
+        shuffle_weight_a16w4,
+    )
 
     generator = torch.Generator(device="cuda").manual_seed(0)
 
-    def quantize(n, k):
+    def quantize(n, k, gate_up):
         w = (
             torch.randn(ROUTED_EXPERTS + 1, n, k, device="cuda", generator=generator)
             * 0.02
@@ -40,15 +44,26 @@ def make_weights():
         q = (blocks / scale).to(torch.float8_e4m3fn).view_as(w)
         reference = (q.float().view_as(blocks) * scale).view_as(w)
         packed = shuffle_weight(q, (16, 16))
+        # Repeat each power-of-two 128x128 scale over its 1x32 sub-blocks.
+        # The E4M3 payload and every dequantized weight remain exactly equal.
+        block_scale = scale.view(ROUTED_EXPERTS + 1, n // 128, k // 128)
+        exponent = ((block_scale.view(torch.int32) >> 23) & 255).to(torch.uint8)
+        assert torch.equal((exponent.int() << 23).view(torch.float32), block_scale)
+        mx_scale = exponent.repeat_interleave(128, 1).repeat_interleave(4, 2)
+        mx_scale = mx_scale.flatten(0, 1).view(torch.float8_e8m0fnu)
+        mx_weight = shuffle_weight_a16w4(q, 16, gate_up)
+        mx_scale = shuffle_scale_a16w4(mx_scale, ROUTED_EXPERTS + 1, gate_up)
         return (
             packed,
             scale.view(ROUTED_EXPERTS + 1, n // 128, k // 128).contiguous(),
             reference,
+            mx_weight,
+            mx_scale,
         )
 
-    w13, s13, reference13 = quantize(2 * INTER, D)
-    w2, s2, reference2 = quantize(D, INTER)
-    return w13, s13, w2, s2, reference13, reference2
+    w13, s13, reference13, mx13, mxs13 = quantize(2 * INTER, D, True)
+    w2, s2, reference2, mx2, mxs2 = quantize(D, INTER, False)
+    return w13, s13, w2, s2, reference13, reference2, mx13, mxs13, mx2, mxs2
 
 
 def make_inputs(tokens, topk):
@@ -127,7 +142,7 @@ def measure_pair(graphs, repetitions, rounds):
     return result
 
 
-def dispatch_metadata(fm, tokens, topk, experts):
+def dispatch_metadata(fm, tokens, topk, experts, native=False):
     import torch
 
     from aiter import ActivationType, QuantType
@@ -141,7 +156,7 @@ def dispatch_metadata(fm, tokens, topk, experts):
         torch.bfloat16,
         torch.float8_e4m3fn,
         torch.float8_e4m3fn,
-        QuantType.per_1x128,
+        QuantType.per_1x32 if native else QuantType.per_1x128,
         True,
         ActivationType.Silu,
         False,
@@ -150,6 +165,8 @@ def dispatch_metadata(fm, tokens, topk, experts):
         True,
         opus_weights_shuffled=True,
         input_dtype=torch.bfloat16,
+        gate_mode="interleave" if native else "separated",
+        gate_up_interleave=True if native else None,
     )
     return {
         name: (
@@ -204,11 +221,15 @@ def moe():
     from aiter.ops.hk_fp8_moe import hk_fp8_moe
 
     fm = importlib.import_module("aiter.fused_moe")
-    w13, s13, w2, s2, ref13, ref2 = make_weights()
+    w13, s13, w2, s2, ref13, ref2, mx13, mxs13, mx2, mxs2 = make_weights()
     result = {
         "mode": "moe",
         "base": os.environ["REVIEW_BASE"],
         "config_sources": sources,
+        "benchmark_commit": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+        ).strip(),
+        "native_mxfp8": "Identical FP8 weight payloads; power-of-two 128x128 scales repeated losslessly into E8M0 1x32 scales. Activation quantization changes to per-32. Weight repacking excluded; runtime quantization included.",
         "protocol": "whole operator, identical BF16 input and shuffled block FP8 weights; checked-in GLM tuning; warm HIP graphs; 21 alternating samples; unclamped Silu",
         "cases": [],
     }
@@ -216,6 +237,11 @@ def moe():
         E = 288 + (topk == 9)
         a, b = w13[:E], w2[:E]
         a.is_shuffled = b.is_shuffled = True
+        ma, mb = mx13[:E], mx2[:E]
+        ma.is_shuffled = mb.is_shuffled = True
+        ma.gate_up_interleave = True
+        mb.gate_up_interleave = False
+        ms1, ms2 = mxs13[: E * 2 * INTER], mxs2[: E * D]
         for T in (1, 128, 1024, 2048, 4096, 8192, 16384):
             x, ids, tw = make_inputs(T, topk)
             rows, expected = reference(x, ids, tw, ref13, ref2)
@@ -257,18 +283,63 @@ def moe():
                 name: accuracy(output, expected, rows, 0.06)
                 for name, output in outputs.items()
             }
+            native_calls = {
+                "aiter_mxfp8": partial(
+                    fm.fused_moe,
+                    x,
+                    ma,
+                    mb,
+                    tw,
+                    ids,
+                    activation=aiter.ActivationType.Silu,
+                    quant_type=aiter.QuantType.per_1x32,
+                    w1_scale=ms1,
+                    w2_scale=ms2,
+                    gate_mode="interleave",
+                    dtype=torch.bfloat16,
+                    output=torch.empty_like(x),
+                )
+            }
+            if topk == 9:
+                native_calls["aiter_fhmoe_mxfp8"] = partial(
+                    native_calls["aiter_mxfp8"],
+                    shared_w1=mx13[-1:],
+                    shared_w2=mx2[-1:],
+                    shared_w1_scale=mxs13[-2 * INTER :],
+                    shared_w2_scale=mxs2[-D:],
+                    shared_expert_id=E - 1,
+                    clamp_shared=False,
+                    output=torch.empty_like(x),
+                )
+            failures, native_dispatch = {}, {}
+            for name, call in native_calls.items():
+                try:
+                    graph, output = capture_repeated(call, 10)
+                    checks[name] = accuracy(output, expected, rows, 0.06)
+                    graphs[name], outputs[name] = graph, output
+                    if name == "aiter_mxfp8":
+                        native_dispatch = dispatch_metadata(fm, T, topk, E, native=True)
+                except Exception as exc:  # noqa: BLE001
+                    # Retain failed candidates for review instead of hiding them.
+                    failures[name] = f"{type(exc).__name__}: {exc}"
+                    print("CANDIDATE_FAILED", T, topk, name, failures[name], flush=True)
             timing = measure_pair(graphs, 10, 21)
+            winner = min(
+                (n for n in timing if n != "hk"), key=lambda n: timing[n]["median_us"]
+            )
             row = {
                 "tokens": T,
                 "topk": topk,
                 "correctness": checks,
                 "timing": timing,
-                "hk_speedup": min(
-                    timing["aiter_tuned"]["median_us"],
-                    timing["aiter_heuristic"]["median_us"],
-                )
-                / timing["hk"]["median_us"],
-                "dispatch": {"tuned": tuned_dispatch, "heuristic": heuristic_dispatch},
+                "hk_speedup": timing[winner]["median_us"] / timing["hk"]["median_us"],
+                "strongest_baseline": winner,
+                "candidate_failures": failures,
+                "dispatch": {
+                    "tuned": tuned_dispatch,
+                    "heuristic": heuristic_dispatch,
+                    "native": native_dispatch,
+                },
             }
             result["cases"].append(row)
             OUT.write_text(json.dumps(result, indent=2) + "\n")
@@ -278,13 +349,11 @@ def moe():
                 topk,
                 row["hk_speedup"],
                 timing["hk"]["median_us"],
-                min(
-                    timing["aiter_tuned"]["median_us"],
-                    timing["aiter_heuristic"]["median_us"],
-                ),
+                winner,
+                timing[winner]["median_us"],
                 flush=True,
             )
-            del graphs, outputs, calls, x, ids, tw, expected, out
+            del graphs, outputs, calls, native_calls, x, ids, tw, expected, out
             gc.collect()
             torch.cuda.empty_cache()
     return result
