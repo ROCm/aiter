@@ -37,28 +37,37 @@ def get_fp8_e4m3_dtype():
     return e4m3_dtype
 
 
-e5m2_dtype, e4m3_dtype = get_fp8_dtypes()
-str_to_torch_dtype = {
-    "float64": torch.float64,
-    "float32": torch.float32,
-    "fp32": torch.float32,
-    "bfloat16": torch.bfloat16,
-    "bf16": torch.bfloat16,
-    "float16": torch.float16,
-    "fp16": torch.float16,
-    "float8_e5m2": e5m2_dtype,
-    "float8_e4m3fn": e4m3_dtype,
-    "e5m2fnuz": e5m2_dtype,
-    "e4m3fnuz": e4m3_dtype,
-    "fp8e4m3": e4m3_dtype,
-    "fp8e5m2": e5m2_dtype,
-    "int64": torch.int64,
-    "int32": torch.int32,
-    "int16": torch.int16,
-    "uint8": torch.uint8,
-    "int8": torch.int8,
-    "mxfp4_e2m1": torch.uint8,  # OCP MXFP4 packs two 4-bits into 8-bit
-}
+# The fp8 names depend on the device arch. They are resolved on first access so
+# that importing this module does not need a visible GPU.
+def __getattr__(name):
+    if name not in ("e5m2_dtype", "e4m3_dtype", "str_to_torch_dtype"):
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    e5m2_dtype, e4m3_dtype = get_fp8_dtypes()
+    globals()["e5m2_dtype"] = e5m2_dtype
+    globals()["e4m3_dtype"] = e4m3_dtype
+    globals()["str_to_torch_dtype"] = {
+        "float64": torch.float64,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "float8_e5m2": e5m2_dtype,
+        "float8_e4m3fn": e4m3_dtype,
+        "e5m2fnuz": e5m2_dtype,
+        "e4m3fnuz": e4m3_dtype,
+        "fp8e4m3": e4m3_dtype,
+        "fp8e5m2": e5m2_dtype,
+        "int64": torch.int64,
+        "int32": torch.int32,
+        "int16": torch.int16,
+        "uint8": torch.uint8,
+        "int8": torch.int8,
+        "mxfp4_e2m1": torch.uint8,  # OCP MXFP4 packs two 4-bits into 8-bit
+    }
+    return globals()[name]
+
 
 torch_to_triton_dtype = {
     torch.float64: tl.float64,
