@@ -392,6 +392,48 @@ def test_fused_silu_mul_mxfp4_quant_round_to_input_dtype(M, N, dtype):
     torch.testing.assert_close(y_s[:M, : N // 32], y_s_torch)
 
 
+@pytest.mark.parametrize("M", [1, 4, 31, 32, 33, 64, 65, 256])
+@pytest.mark.parametrize("N", [256, 4096, 14336])
+@pytest.mark.parametrize(
+    "shuffle, padding", [(False, False), (False, True), (True, True)]
+)
+def test_fused_silu_mul_mxfp4_quant_ceil_matches_hip_quant(M, N, shuffle, padding):
+    # scaling_mode="ceil" + round_to_input_dtype is a drop in for silu_mul followed
+    # by per_1x32_f4_quant_hip, same bytes and same (shuffled) scale layout, so it
+    # can feed gemm_afp4wfp4_preshuffle / gemm_a4w4 where the HIP quant does now
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+    if shuffle and N % 256 != 0:
+        pytest.skip()
+
+    torch.manual_seed(0)
+    x = torch.randn((M, 2 * N), dtype=torch.bfloat16).cuda() * 2
+    a, b = x.float().split([N, N], dim=-1)
+    y_q_hip, y_s_hip = per_1x32_f4_quant_hip(
+        (F.silu(a) * b).to(torch.bfloat16), shuffle=shuffle
+    )
+
+    (y_q, y_s), _ = fused_reduce_act_mul_and_mxfp4_quant(
+        x,
+        activation="silu",
+        scaling_mode="ceil",
+        shuffle=shuffle,
+        scale_shuffle_padding=padding,
+        round_to_input_dtype=True,
+    )
+
+    y_s_hip = y_s_hip.view(torch.uint8)
+    if padding == shuffle:
+        assert y_s.shape == y_s_hip.shape
+    if shuffle:
+        y_s = unshuffle_scale_gemm(y_s.view(y_s.shape[0] // 32, -1), arch="gfx950")
+        y_s_hip = unshuffle_scale_gemm(
+            y_s_hip.view(y_s_hip.shape[0] // 32, -1), arch="gfx950"
+        )
+    assert torch.equal(y_q, y_q_hip.view(torch.uint8))
+    assert torch.equal(y_s[:M, : N // 32], y_s_hip[:M, : N // 32])
+
+
 @pytest.mark.parametrize("M", [1, 4, 33, 64, 256])
 @pytest.mark.parametrize("N", [256, 4096, 14336])
 @pytest.mark.parametrize("res1", [True, False])
