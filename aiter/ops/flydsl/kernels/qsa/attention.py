@@ -2,7 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """One-call gfx942 BF16 D256 QSA sparse attention; plans and scratch are private.
 
-Each call recovers and validates the selected four-token blocks (FlyDSL K1-K3),
+Each call recovers the selected four-token blocks (FlyDSL K1-K3),
 routes every query tile to the FlyDSL union kernel (queries of a tile share one
 compact block list with exact per-query membership) or to the FlyDSL direct
 kernel (one query per wave over its own blocks), and writes O in place.
@@ -90,9 +90,7 @@ class _Workspace:
             "prefix_lens": prefix_lens,
             "scale": scale,
             "topk": topk,
-            "kv_lens": prepare.upload(lengths, q.device),
             "query_positions": prepare.upload(positions, q.device),
-            "query_sequence_ids": prepare.upload(sequence, q.device),
             "max_seqlen_k": int(lengths.max(initial=0)),
         }
         self.captured = False
@@ -206,40 +204,6 @@ class _Hot:
 _workspaces = OrderedDict()
 _lock = threading.RLock()
 _device = None
-_warmed = set()
-
-
-def _causal_indices(rows, topk, device):
-    """Each row's first min(visible // 4, topk) blocks, then its causal tail: a valid selection."""
-    visible = torch.arange(1, rows + 1, dtype=torch.int32, device=device)[:, None]
-    blocks = (visible // 4).clamp(max=topk) * 4
-    columns = torch.arange(4 * topk + 3, dtype=torch.int32, device=device)
-    tail = torch.where(
-        columns < blocks + visible % 4, columns - blocks + visible // 4 * 4, -1
-    )
-    return torch.where(columns < blocks, columns, tail).contiguous()
-
-
-def _warm(device, heads, kv_heads, scale, topk):
-    """Compile every variant this head shape can use (no plan, each union tile: BQ16/BQ21 for H6,
-    BQ32/BQ42 for H3) with full-causal dummies, so later layouts never JIT mid-serving.
-    """
-    group = heads // kv_heads
-    rows = [1, max(_union_min_rows(group), 1)]
-    if kv_heads == 1 and group in (6, 3):
-        rows.append(prepare.wide_tile_rows(21 if group == 6 else 42))
-    for n in rows:
-        q = torch.zeros((n, heads, 256), dtype=torch.bfloat16, device=device)
-        kv = torch.zeros((n, kv_heads, 256), dtype=torch.bfloat16, device=device)
-        indices = _causal_indices(n, topk, device)
-        _Hot(
-            _Workspace(q, kv, kv, indices, (n,), (0,), scale),
-            q,
-            kv,
-            kv,
-            indices,
-            torch.empty_like(q),
-        )
 
 
 def qsa_sparse_attention_flydsl(
@@ -252,7 +216,8 @@ def qsa_sparse_attention_flydsl(
     tail tokens, then -1 padding. Block IDs are request-local, unique, and may be
     unordered. The selected set is exact. K/V must be finite: rows of a request share
     union tiles, so a non-finite value can also reach rows that did not select it.
-    A selection that breaks this layout traps on the GPU, which aborts the process.
+    The layout is not validated: a selection that breaks it gives wrong results,
+    also in later calls on the same stream.
 
     Host query_lens/prefix_lens describe packed requests. For one request they
     default to (M,) and (N-M,). Plans are built and cached per layout. Hot calls
@@ -261,9 +226,8 @@ def qsa_sparse_attention_flydsl(
     layout before graph capture. Captured workspaces stay pinned for graph pointer
     lifetime and share their stream's scratch: do not replay them concurrently
     with each other or with that stream's calls.
-    The first call for each head shape (H, HK, scale) and T compiles every kernel
-    variant that shape can use, so no later layout compiles; with empty caches this
-    takes about half a minute. One GPU per process (TP uses separate workers).
+    Each kernel variant compiles on its first use: a few seconds with empty FlyDSL
+    caches. One GPU per process (TP uses separate workers).
     """
     global _device
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
@@ -360,10 +324,6 @@ def qsa_sparse_attention_flydsl(
             raise ValueError("QSA sparse attention supports one GPU per process")
         _device = q.device
         capturing = torch.cuda.is_current_stream_capturing()
-        shape = (q.device, q.shape[1], k.shape[1], scale, topk)
-        if shape not in _warmed and not capturing:
-            _warm(*shape)
-            _warmed.add(shape)
         key = (
             q.device,
             torch._C._cuda_getCurrentRawStream(q.device.index),

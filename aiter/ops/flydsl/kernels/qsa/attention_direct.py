@@ -12,7 +12,7 @@ In the raw fallback, four query waves each own one query and its GQA heads.
 V loads directly from global memory into registers for the transpose; Q/K
 remain in registers. Only the output transpose uses LDS (32 KiB). Softmax
 is updated once per BN tokens. Sparse addresses are full byte VOFFSETs.
-The shared token-recovery validation already supplies sorted block indices.
+The shared token recovery already supplies sorted block indices.
 Each wave caches 64 block IDs for eight BN32 steps. K loads group four
 adjacent lanes per token, then transpose at QK consumption. K addresses are
 reused for V; the first V segment is requested before QK. K completion is
@@ -183,15 +183,16 @@ def prepare(
         sources = upload(
             k_starts[owner] + 4 * (np.arange(len(owner)) - p_starts[owner]), device
         )
+    standin = inputs.query_positions  # tensor slots ungated launches do not read
     prepared = DirectPlan(
         metadata=upload(metadata, device),
         query_tile=waves,
         num_tiles=len(metadata),
         gated=union is not None,
-        active=inputs.query_positions if union is None else union.active,
-        query_tiles=inputs.query_sequence_ids if union is None else union.query_tiles,
-        direct_flag=inputs.kv_lens if union is None else union.direct_flag,
-        union_meta=inputs.kv_lens if union is None else union.metadata,
+        active=standin if union is None else union.active,
+        query_tiles=standin if union is None else union.query_tiles,
+        direct_flag=standin if union is None else union.direct_flag,
+        union_meta=standin if union is None else union.metadata,
         union_tile=1 if union is None else union.query_tile,
         union_tiles=0 if union is None else union.num_tiles,
         source_blocks=inputs.block_indices,

@@ -5,10 +5,10 @@
 These three FlyDSL kernels (K1-K3) are the private preparation step of the
 FlyDSL QSA sparse attention; they are not a public op.
 
-Recovery validates every selection row and traps on an invalid one. Dense membership is
-zero when a plan is allocated and after every completed build. Recovery scatters into it; its
-owning compact CTA consumes and clears the same causal prefix. The next launch sorts tasks
-and builds disjoint mask partitions. Plans use one stream's scratch and are pinned for graphs.
+Recovery does not validate the selection layout. Dense membership is zero when a plan is
+allocated and after every completed build. Recovery scatters into it; its owning compact CTA
+consumes and clears the same causal prefix. The next launch sorts tasks and builds disjoint
+mask partitions. Plans use one stream's scratch and are pinned for graphs.
 """
 
 import math
@@ -20,7 +20,6 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import numpy as np
 import torch
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import rocdl
 
 from aiter.jit.utils.chip_info import get_cu_num
@@ -183,8 +182,6 @@ def _sort_columns(topk):
 def _recover_row(
     INDICES: fx.Tensor,
     POSITIONS: fx.Tensor,
-    LENGTHS: fx.Tensor,
-    SEQUENCE_IDS: fx.Tensor,
     BLOCKS: fx.Tensor,
     DENSE: fx.Tensor,
     QUERY_TILES: fx.Tensor,
@@ -201,45 +198,18 @@ def _recover_row(
     # An indices row holds TOPK four-token blocks, then 3 tail tokens.
     row_bytes = (4 * TOPK + 3) * 4
     columns, width = TOPK // 64, _sort_columns(TOPK)
-    position = _uniform(POSITIONS[row])
-    length = _uniform(LENGTHS[_uniform(SEQUENCE_IDS[row])])
-    visible = position + 1
+    visible = _uniform(POSITIONS[row]) + 1
     complete = _min(visible >> 2, fx.Int32(TOPK))
-    tail = visible & 3
-    tail_start = visible - tail
     indices = _buffer(INDICES, ROWS * row_bytes)
-    # Lanes 0..2 check the entries after the TOPK blocks: the tail of a full row, else -1.
-    offset = row * row_bytes + TOPK * 16 + _min(lane, fx.Int32(2)) * 4
-    last = _buffer_words(indices, offset, 1)[0]
-    expected = ((complete == TOPK) & (lane < tail)).select(
-        tail_start + lane, fx.Int32(-1)
-    )
-    failed = (lane < 3) & (last != expected)
     unsorted = fx.Boolean(False)
     # Lane holds columns 64 * k + lane: each load, store and scatter spans 64 adjacent ones.
     keys = []
     for k in fx.range_constexpr(columns):
         column = k * 64 + lane
-        words = _buffer_words(indices, row * row_bytes + column * 16)
-        a, b, c, d = words[0], words[1], words[2], words[3]
         full = column < complete
-        valid = (a >= 0) & ((a & 3) == 0) & (b == a + 1) & (c == a + 2) & (d == a + 3)
-        valid = valid & (d < visible) & (d < length)
-        # The first incomplete column holds the causal tail tokens, then -1.
-        partial = column == complete
-        padding = a == (partial & (tail > 0)).select(tail_start, fx.Int32(-1))
-        padding = padding & (
-            b == (partial & (tail > 1)).select(tail_start + 1, fx.Int32(-1))
-        )
-        padding = padding & (
-            c == (partial & (tail > 2)).select(tail_start + 2, fx.Int32(-1))
-        )
-        padding = padding & (d == -1)
-        failed = failed | full.select(~valid, ~padding)
-        block = (full & valid).select(a >> 2, fx.Int32(-1))
+        block = _buffer_words(indices, row * row_bytes + column * 16, 1)[0] >> 2
         unsorted = unsorted | (full & (block != column))
         keys.append(full.select(block, fx.Int32(INT_MAX)))
-    error = (position < 0) | (visible > length) | (_ballot(failed) != 0)
     # Rows that select their first blocks in order (complete causal prefixes) skip the sort.
     if _ballot(unsorted) != 0:
         # The sort holds keys width * lane .. width * lane + width - 1: transpose through the
@@ -249,21 +219,9 @@ def _recover_row(
             scratch[slot + k * 64 + lane] = padded[k]
         ordered = [scratch[slot + lane * width + r] for r in range(width)]
         ordered = _bitonic(ordered, lane, False)
-        previous = fx.gpu.shuffle_up(ordered[width - 1], 1, 64)
-        repeated = fx.Boolean(False)
-        for r in fx.range_constexpr(width):
-            column = lane * width + r
-            before = ordered[r - 1] if r else previous
-            repeated = repeated | (
-                (column < complete) & (column > 0) & (ordered[r] == before)
-            )
-        error = error | (_ballot(repeated) != 0)
         for r in fx.range_constexpr(width):
             scratch[slot + lane * width + r] = ordered[r]
         keys = [scratch[slot + k * 64 + lane] for k in range(columns)]
-    if error:
-        # llvm.trap (s_trap 2) halts the wave and puts the queue into the error state.
-        llvm.intr_trap()
     for k in fx.range_constexpr(columns):
         column = k * 64 + lane
         BLOCKS[row * TOPK + column] = (column < complete).select(keys[k], fx.Int32(-1))
@@ -277,17 +235,14 @@ def _recover_row(
                 block = keys[k]
                 if (k * 64 + lane < complete) & (block >= 0) & (block < MAX_BLOCKS):
                     fx.atomic_or(dense + block, bit, syncscope="agent")
-            tail_block = visible >> 2
-            if (lane == 0) & (tail != 0) & (visible >= 0) & (tail_block < MAX_BLOCKS):
-                fx.atomic_or(dense + tail_block, bit, syncscope="agent")
+            if (lane == 0) & ((visible & 3) != 0):
+                fx.atomic_or(dense + (visible >> 2), bit, syncscope="agent")
 
 
 @flyc.kernel(name="qsa_recover_scatter", known_block_size=[THREADS, 1, 1])
 def _recover_kernel(
     INDICES: fx.Tensor,
     POSITIONS: fx.Tensor,
-    LENGTHS: fx.Tensor,
-    SEQUENCE_IDS: fx.Tensor,
     BLOCKS: fx.Tensor,
     DENSE: fx.Tensor,
     QUERY_TILES: fx.Tensor,
@@ -312,8 +267,6 @@ def _recover_kernel(
         _recover_row(
             INDICES,
             POSITIONS,
-            LENGTHS,
-            SEQUENCE_IDS,
             BLOCKS,
             DENSE,
             QUERY_TILES,
@@ -333,8 +286,6 @@ def _recover_kernel(
 def _recover_launch(
     INDICES: fx.Tensor,
     POSITIONS: fx.Tensor,
-    LENGTHS: fx.Tensor,
-    SEQUENCE_IDS: fx.Tensor,
     BLOCKS: fx.Tensor,
     DENSE: fx.Tensor,
     QUERY_TILES: fx.Tensor,
@@ -349,8 +300,6 @@ def _recover_launch(
         _recover_kernel(
             INDICES,
             POSITIONS,
-            LENGTHS,
-            SEQUENCE_IDS,
             BLOCKS,
             DENSE,
             QUERY_TILES,
@@ -1013,13 +962,11 @@ def _compiled(launch, args, grid, constants):
 
 def _launches(inputs, plan, stream):
     """(compiled, args) of K1-K3 in launch order; K1's first argument is the indices."""
-    standin = inputs.kv_lens  # tensor slots K1 does not read without a plan
+    standin = inputs.query_positions  # tensor slots K1 does not read without a plan
     bits = 0 if plan is None else 64 if plan.query_tile > 32 else 32
     args = (
         inputs.indices,
         inputs.query_positions,
-        inputs.kv_lens,
-        inputs.query_sequence_ids,
         inputs.block_indices.view(-1),
         # 2-D: FlyDSL passes int32 dims, and tiles * max_blocks may exceed 2**31.
         standin if plan is None else plan.dense_membership,
@@ -1031,7 +978,7 @@ def _launches(inputs, plan, stream):
         inputs.topk,
         stream,
     )
-    yield _compiled(_recover_launch, args, 8, (bits, inputs.topk)), args
+    yield _compiled(_recover_launch, args, 6, (bits, inputs.topk)), args
     if plan is None or plan.num_tiles == 0:
         return
     members64 = plan.query_tile > 32
