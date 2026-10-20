@@ -46,6 +46,9 @@ class PaDecodePipeline:
         self.ctx.init_partition_bounds()
         self.lds.allocate()
         self.kv.init_scale_loaders()
+        if const_expr(self.traits.stage_page_capacity):
+            self.kv.stage_page_ids()
+            gpu.barrier()
         k_pf0 = self.kv.prefetch_first()
         self.ctx.init_scales(self.kv.key_scale, self.kv.value_scale)
         self.query.stage(q_units_prefetched)
@@ -83,6 +86,8 @@ class PaDecodePipeline:
             0 if const_expr(self.traits.single_tile_plan) else self.ctx.part_start
         )
         loop_end = 1 if const_expr(self.traits.single_tile_plan) else self.ctx.part_end
+        # The d256 pipe keeps its M-tiles on the single-tile schedule.
+        multi_query = self.traits.M_TILES > 1 and not self.traits.D256_PIPE
         for loop_i, ostate in range(loop_start, loop_end, 1, init=init_state):
             k_cur = ostate[
                 self.traits.K_SLOT
@@ -98,7 +103,7 @@ class PaDecodePipeline:
             tok0 = tt * self.traits.TILE_TOK
             # Interleave MFMA with VALU/LDS or page16 V loads.
             if const_expr(
-                (not self.traits.per_token_kv and self.traits.M_TILES > 1)
+                (not self.traits.per_token_kv and multi_query)
                 or self.traits.PAGE16_VPIPE
             ):
                 fx.rocdl.iglp_opt(0)
@@ -151,7 +156,7 @@ class PaDecodePipeline:
                 )
 
             # All query tiles share one K/V tile; each path retains its publication barriers.
-            if const_expr(self.traits.M_TILES > 1):
+            if const_expr(multi_query):
                 next_state = self.multi_query_tile(
                     ostate,
                     k_cur,
@@ -177,6 +182,7 @@ class PaDecodePipeline:
                     scale_bounds,
                     v_vh_shared,
                     q_ops_all,
+                    q_scale_vec,
                 )
             results = yield next_state
         o_final = results
@@ -470,16 +476,33 @@ class PaDecodePipeline:
         scale_bounds,
         v_vh_shared,
         q_ops_all,
+        q_scale_vec,
     ):
-        """Overlap QK, page/scale prefetch and PV for one padded query tile."""
+        """Overlap QK, page/scale prefetch and PV for up to two padded query tiles.
+
+        Every M-tile reuses one K tile and one V gather, owns private P and Lsum
+        slots, and keeps its own accumulator chain. The tile's memory-op sequence
+        is independent of M_TILES, so the vmcnt counts below hold for any M.
+        """
         next_state = [None, None]
         o_acc = [
-            ostate[self.traits.o_slot(0, vh)]
-            for vh in range_constexpr(self.traits.VHE_CHUNKS)
+            [
+                ostate[self.traits.o_slot(m, vh)]
+                for vh in range_constexpr(self.traits.VHE_CHUNKS)
+            ]
+            for m in range_constexpr(self.traits.M_TILES)
         ]
-        m_prev = ostate[self.traits.m_slot(0)]  # running max, carried from last tile
-        l_prev = ostate[self.traits.l_slot(0)]  # running denom, carried from last tile
-        frag_Ss = self.gemm.qk(k_cur, q_ops_all, 0)
+        # Running max and denominator, carried from the last tile.
+        m_prev = [
+            ostate[self.traits.m_slot(m)] for m in range_constexpr(self.traits.M_TILES)
+        ]
+        l_prev = [
+            ostate[self.traits.l_slot(m)] for m in range_constexpr(self.traits.M_TILES)
+        ]
+        frag_Ss = [
+            self.gemm.qk(k_cur, q_ops_all, m)
+            for m in range_constexpr(self.traits.M_TILES)
+        ]
         k_next = k_cur
         if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
             if const_expr(self.traits.REUSE_KV_PAGES):
@@ -501,15 +524,23 @@ class PaDecodePipeline:
                 self.kv.load_v(v_page_cur, vh)
                 for vh in range_constexpr(self.traits.VHE_CHUNKS)
             ]
-        scale = (
-            self.ctx.scale_qk
-            if const_expr(self.traits.is_bf16_kv)
-            else self.ctx.scale_qk
-            * self.lds.load_scalar(self.traits.sQscale_off, self.ctx.lane16)
-        )
-        masked_chunks, v_scale_vecs = self.softmax.single_scores(
-            frag_Ss, scale, tile_valid, window_left, cur_kv_buf, scale_bounds
-        )
+        scales = []
+        masked_chunks = []
+        v_scale_vecs = None
+        for m in range_constexpr(self.traits.M_TILES):
+            if const_expr(self.traits.is_bf16_kv):
+                scale = self.ctx.scale_qk
+            elif const_expr(self.traits.M_TILES > 1):
+                scale = self.ctx.scale_qk * fx.Float32(q_scale_vec[m])
+            else:
+                scale = self.ctx.scale_qk * self.lds.load_scalar(
+                    self.traits.sQscale_off, self.ctx.lane16
+                )
+            scales.append(scale)
+            chunks, v_scale_vecs = self.softmax.single_scores(
+                frag_Ss[m], scale, tile_valid, window_left, cur_kv_buf, scale_bounds, m
+            )
+            masked_chunks.append(chunks)
         gpu.barrier()
         v_page_next = v_page_cur
         if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
@@ -519,33 +550,52 @@ class PaDecodePipeline:
         norm_factor_b = None
         if const_expr(self.traits.per_token_kv):
             v_max_scaled, norm_factor_b = self.softmax.v_scale_normalization()
-        m_new, corr_reg = self.softmax.pack_single(
-            masked_chunks, m_prev, scale, v_scale_vecs, cur_kv_buf, norm_factor_b
-        )
+        m_new = []
+        corr_reg = []
+        for m in range_constexpr(self.traits.M_TILES):
+            m_new_m, corr_m = self.softmax.pack_single(
+                masked_chunks[m],
+                m_prev[m],
+                scales[m],
+                v_scale_vecs,
+                cur_kv_buf,
+                norm_factor_b,
+                m,
+            )
+            m_new.append(m_new_m)
+            corr_reg.append(corr_m)
         gpu.barrier()
         if const_expr(self.traits.PAGE16_VPIPE):  # noqa: SIM102
             # Next K can now overlap P reads/PV.
             if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
                 k_next = self.kv.load_k_from_pages(self.kv.read_k_pages())
         next_state[self.traits.K_SLOT] = k_next
-        gsum = self.lds.load_wave(self.traits.sLsum_off, self.ctx.lane16).reduce(
-            ReductionOp.ADD
-        )
-        l_new = (
-            gsum
-            if const_expr(self.traits.single_tile_plan)
-            else l_prev * corr_reg + gsum
-        )
-        p_ops = self.lds.load(
-            self.traits.sP_off
-            + self.ctx.lane16 * self.traits.SP_ROW_BYTES
-            + self.ctx.rgroup * 64 * self.traits.QP_ELEM_BYTES,
-            fx.Int64,
-            self.traits.NVOPS,
-        )
-        corr_b = fx.Vector.from_elements([corr_reg], dtype=fx.Float32).broadcast_to(
-            self.traits.OP_ELEMS
-        )
+        l_new = []
+        p_ops = []
+        corr_b = []
+        for m in range_constexpr(self.traits.M_TILES):
+            gsum = self.lds.load_wave(
+                self.softmax.lsum_offset(m), self.ctx.lane16
+            ).reduce(ReductionOp.ADD)
+            l_new.append(
+                gsum
+                if const_expr(self.traits.single_tile_plan)
+                else l_prev[m] * corr_reg[m] + gsum
+            )
+            p_ops.append(
+                self.lds.load(
+                    self.softmax.p_offset(m)
+                    + self.ctx.lane16 * self.traits.SP_ROW_BYTES
+                    + self.ctx.rgroup * 64 * self.traits.QP_ELEM_BYTES,
+                    fx.Int64,
+                    self.traits.NVOPS,
+                )
+            )
+            corr_b.append(
+                fx.Vector.from_elements([corr_reg[m]], dtype=fx.Float32).broadcast_to(
+                    self.traits.OP_ELEMS
+                )
+            )
         if const_expr(self.traits.prefetch_v):
             v_vh_batch = v_vh_shared
         else:
@@ -553,17 +603,21 @@ class PaDecodePipeline:
                 self.kv.load_v(v_page_cur, vh)
                 for vh in range_constexpr(self.traits.VHE_CHUNKS)
             ]
+        # vh outer, m inner: each M-tile is a separate accumulator chain on the
+        # same V operand.
         for vh in range_constexpr(self.traits.VHE_CHUNKS):
             v_vh = v_vh_batch[vh]
-            op = self.gemm.pv(v_vh, p_ops)
-            if const_expr(self.traits.per_token_kv):
-                op = op * fx.Vector.from_elements(
-                    [v_max_scaled], dtype=fx.Float32
-                ).broadcast_to(self.traits.OP_ELEMS)
-            o_acc[vh] = (
-                op
-                if const_expr(self.traits.single_tile_plan)
-                else o_acc[vh] * corr_b + op
-            )
-        next_state.extend([*o_acc, m_new, l_new])
+            for m in range_constexpr(self.traits.M_TILES):
+                op = self.gemm.pv(v_vh, p_ops[m])
+                if const_expr(self.traits.per_token_kv):
+                    op = op * fx.Vector.from_elements(
+                        [v_max_scaled], dtype=fx.Float32
+                    ).broadcast_to(self.traits.OP_ELEMS)
+                o_acc[m][vh] = (
+                    op
+                    if const_expr(self.traits.single_tile_plan)
+                    else o_acc[m][vh] * corr_b[m] + op
+                )
+        for m in range_constexpr(self.traits.M_TILES):
+            next_state.extend([*o_acc[m], m_new[m], l_new[m]])
         return next_state

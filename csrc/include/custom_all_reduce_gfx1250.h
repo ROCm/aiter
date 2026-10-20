@@ -69,7 +69,7 @@ void reduce_scatter(fptr_t _fa,
                     int64_t split_dim,
                     int64_t reg_ptr, int64_t reg_bytes);
 void dispose(fptr_t _fa);
-int64_t meta_size();
+int64_t meta_size(int64_t world_size);
 // register_input/output_buffer receive direct device pointers per rank.
 void register_input_buffer(fptr_t _fa,
                            int64_t self_ptr,
