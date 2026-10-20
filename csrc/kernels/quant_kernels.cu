@@ -1529,7 +1529,7 @@ static void dynamic_per_group_quant_m32k4(aiter_tensor_t& out,
     // One 4-row step per wave, eight waves per 32x128 tile.
     // Fewer rows per wave means more waves in flight; 8x1 gives 8 waves/SIMD at this shape.
     if(out_fp4)
-        launch(opus::fp4_t{}, std::integral_constant<int, 8>{}, std::integral_constant<int, 1>{});
+        launch(opus::fp4_t{}, std::integral_constant<int, 16>{}, std::integral_constant<int, 2>{});
     else
         launch(opus::fp8_t{}, std::integral_constant<int, 8>{}, std::integral_constant<int, 1>{});
 }
