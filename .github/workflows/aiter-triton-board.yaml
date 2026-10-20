@@ -1,40 +1,23 @@
 name: AITER-triton Kernels board
 
 # Keeps the AITER-triton Kernels board
-# (https://github.com/orgs/ROCm/projects/232) in step with the repo.
+# (https://github.com/orgs/ROCm/projects/232) in step with the repo by applying
+# the Triton/Gluon label. The board itself does the rest through its built-in
+# workflows: "Auto-add to project" (label:Triton/Gluon) puts items on the board,
+# and "Item added", "Code review approved", "Pull request merged", "Item closed"
+# and "Item reopened" set their Status. This workflow never touches the board,
+# so it needs no organization permissions.
 #
-# Pull requests are handled entirely here. A PR belongs on the board when any
-# of these hold:
-#   1. it is authored by, or assigned to, a member of @ROCm/triton_kernels_team
-#      (the team is read live on each run, so there is no roster to maintain);
+# A PR or issue gets the label when any of these hold:
+#   1. it is authored by (PRs), or assigned to, someone listed in
+#      .github/triton-board-team.txt (@ROCm/triton_kernels_team);
 #   2. its diff touches Triton/Gluon code (TRITON_PATHS) or Triton CI
 #      (TRITON_CI: anything under .github/ with "triton" in its path, plus
-#      requirements-triton*);
-#   3. it carries the Triton/Gluon label.
+#      requirements-triton*).
 #
-# A PR's Status follows the PR: a draft sits in "Backlog"; a review request
-# moves it to "In Progress"; an approval from a member of @ROCm/team_aiter
-# moves it to "Approved"; a dismissed review moves it back to "In review";
-# otherwise an open PR sits in "In review" unless someone has already moved it
-# on to "In Progress" or "Approved". Review events from bots (Copilot's
-# automatic reviews) are ignored. Review submissions and dismissals on PRs from
-# forks carry no secrets, so the App token cannot be minted there and those
-# runs are skipped; every pull_request_target event still syncs such PRs.
-#
-# Issues stay label-driven through the board's own auto-add rule. Here they are
-# added when assigned to a team member or labeled (rules 1 and 3), and their
-# Status is left to the board's "Item added" automation.
-#
-# An item leaves the board only when it loses what qualified it — the
-# Triton/Gluon label, or a team member as assignee — and no rule still applies.
-# Nothing else removes anything, so items people add by hand stay put.
-#
-# Every API call uses a token minted from the GitHub App behind the repository
-# secrets AITER_CI_APP_ID / AITER_CI_APP_PRIVATE_KEY (currently aiter-gh-app).
-# Its ROCm installation must have accepted the organization permissions
-# "Members: Read-only" (team lookups) and "Projects: Read and write" (the
-# board); adding them on the App alone is not enough. The run logs name the App
-# it used, and the permission errors below say which of the two is missing.
+# The label is never removed here, so labels people add or remove by hand are
+# left alone, except that a PR still matching rule 2 gets it back on its next
+# event.
 
 on:
   pull_request_target:
@@ -42,56 +25,30 @@ on:
       - opened
       - reopened
       - ready_for_review
-      - converted_to_draft
       - synchronize
       - assigned
-      - unassigned
-      - labeled
-      - unlabeled
-      - review_requested
-  pull_request_review:
-    types: [submitted, dismissed]
   issues:
-    types: [opened, reopened, assigned, unassigned, labeled, unlabeled]
+    types: [opened, reopened, assigned]
 
-permissions: {}
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
 
 concurrency:
   group: triton-board-${{ github.event.pull_request.number || github.event.issue.number }}
   cancel-in-progress: true
 
 jobs:
-  board:
-    # pull_request_review runs for fork PRs get no secrets (see the header).
-    if: ${{ github.event_name != 'pull_request_review' || github.event.pull_request.head.repo.full_name == github.repository }}
+  label:
     runs-on: ubuntu-latest
     steps:
-      - name: Mint a GitHub App token
-        id: app_token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.AITER_CI_APP_ID }}
-          private-key: ${{ secrets.AITER_CI_APP_PRIVATE_KEY }}
-          owner: ROCm
-          repositories: aiter
-
-      - name: Sync the item with the board
+      - name: Label Triton work
         uses: actions/github-script@v7
-        env:
-          APP_SLUG: ${{ steps.app_token.outputs.app-slug }}
         with:
-          github-token: ${{ steps.app_token.outputs.token }}
           script: |
-            const ORG = 'ROCm';
-            const APP = process.env.APP_SLUG
-              ? `the ${process.env.APP_SLUG} GitHub App`
-              : 'the GitHub App behind AITER_CI_APP_ID';
-            const ACCEPT = `then accept the change on its ${ORG} installation`;
-            core.info(`Acting as ${APP}.`);
-            const PROJECT_NUMBER = 232;
-            const TEAM_SLUG = 'triton_kernels_team';
-            const APPROVER_TEAM_SLUG = 'team_aiter';  // whose approvals move a PR to "Approved"
             const LABEL = 'Triton/Gluon';
+            const ROSTER = '.github/triton-board-team.txt';
             const TRITON_PATHS = [
               'aiter/ops/triton/',
               'aiter/aot/triton/',
@@ -100,66 +57,47 @@ jobs:
               'op_tests/op_benchmarks/triton/',
             ];
             const TRITON_CI = [/^\.github\/.*triton/i, /^requirements-triton/i];
-            // Open-PR statuses a person may have set by hand; anything else on
-            // an open, non-draft PR is corrected to "In review".
-            const KEEP_OPEN = ['in review', 'in progress', 'approved'];
 
             const { owner, repo } = context.repo;
-            const action = context.payload.action;
             const isPR = Boolean(context.payload.pull_request);
             const number = (context.payload.pull_request ?? context.payload.issue).number;
             const what = `${isPR ? 'PR' : 'issue'} #${number}`;
 
-            // Members of an org team as lower-case logins, or null when the
-            // App cannot read the team.
-            async function teamMembers(slug) {
-              try {
-                const members = await github.paginate(github.rest.teams.listMembersInOrg, {
-                  org: ORG,
-                  team_slug: slug,
-                  per_page: 100,
-                });
-                return new Set(members.map(m => m.login.toLowerCase()));
-              } catch (e) {
-                core.warning(`Could not list @${ORG}/${slug} members (HTTP ${e.status ?? '?'}: ${e.message}). `
-                  + `Grant ${APP} the organization permission "Members: Read-only", ${ACCEPT}.`);
-                return null;
-              }
-            }
-
             // Work from the current state, not the event payload: by the time
-            // this runs the PR may have been marked ready, converted to draft,
-            // relabeled, reassigned or closed.
+            // this runs the PR may have been relabeled, reassigned or closed.
             const item = isPR
               ? (await github.rest.pulls.get({ owner, repo, pull_number: number })).data
               : (await github.rest.issues.get({ owner, repo, issue_number: number })).data;
-            const pr = isPR ? item : null;
 
-            if (pr && pr.state !== 'open') {
+            if (item.state !== 'open') {
               core.info(`${what} is closed — nothing to do.`);
               return;
             }
+            if ((item.labels ?? []).some(l => l.name === LABEL)) {
+              core.info(`${what} is already labeled ${LABEL}.`);
+              return;
+            }
 
-            // ---- does it belong on the board? ----
             const reasons = [];
 
-            // Rule 1: authored by (PRs) or assigned to a team member.
-            // `team` is null when the lookup fails; the rule is then skipped
-            // for adding, and nothing is removed (see below).
+            // Rule 1: read from the default branch, never from the PR.
+            const { data: roster } = await github.rest.repos.getContent({
+              owner,
+              repo,
+              path: ROSTER,
+              ref: context.payload.repository.default_branch,
+            });
+            const team = new Set(Buffer.from(roster.content, 'base64').toString()
+              .split('\n').map(l => l.trim().toLowerCase()).filter(Boolean));
             const people = (item.assignees ?? []).map(a => a.login);
-            if (pr) people.unshift(pr.user.login);
-            const team = await teamMembers(TEAM_SLUG);
-            if (team) {
-              const ours = people.filter(login => team.has(login.toLowerCase()));
-              if (ours.length) {
-                reasons.push(`team: ${[...new Set(ours)].join(', ')}`);
-              }
-            } else {
-              core.warning('Skipping the team rule for this run.');
+            if (isPR) people.unshift(item.user.login);
+            const ours = people.filter(login => team.has(login.toLowerCase()));
+            if (ours.length) {
+              reasons.push(`team: ${[...new Set(ours)].join(', ')}`);
             }
 
             // Rule 2: the diff itself.
-            if (pr) {
+            if (isPR) {
               const files = await github.paginate(github.rest.pulls.listFiles, {
                 owner,
                 repo,
@@ -175,141 +113,9 @@ jobs:
               }
             }
 
-            // Rule 3: labeled.
-            if ((item.labels ?? []).some(l => l.name === LABEL)) {
-              reasons.push(`labeled ${LABEL}`);
+            if (!reasons.length) {
+              core.info(`${what} does not belong on the board.`);
+              return;
             }
-
-            // Only losing a qualifier takes an item off the board: the
-            // Triton/Gluon label, or a team member as assignee. Removing an
-            // unrelated assignee says nothing about the item, and other events
-            // never remove anything, so items people added by hand are left
-            // alone.
-            let lostQualifier = false;
-            if (action === 'unlabeled') {
-              lostQualifier = context.payload.label?.name === LABEL;
-            } else if (action === 'unassigned' && team) {
-              const removed = context.payload.assignee?.login;
-              lostQualifier = Boolean(removed) && team.has(removed.toLowerCase());
-            }
-
-            try {
-              if (!reasons.length) {
-                if (!team && (lostQualifier || action === 'unassigned')) {
-                  // Without the team we cannot tell whether the item still
-                  // qualifies through an assignee, so leave the board alone.
-                  core.warning(`${what} may have lost a qualifier, but the team lookup failed — leaving the board alone.`);
-                  return;
-                }
-                if (!lostQualifier) {
-                  core.info(`${what} does not belong on the board.`);
-                  return;
-                }
-                const { node } = await github.graphql(`
-                  query($id: ID!) {
-                    node(id: $id) {
-                      ... on PullRequest { projectItems(first: 100) { nodes { id project { id number } } } }
-                      ... on Issue { projectItems(first: 100) { nodes { id project { id number } } } }
-                    }
-                  }`, { id: item.node_id });
-                const onBoard = (node?.projectItems?.nodes ?? []).find(n => n.project.number === PROJECT_NUMBER);
-                if (!onBoard) {
-                  core.info(`${what} no longer qualifies and is not on the board.`);
-                  return;
-                }
-                await github.graphql(`
-                  mutation($project: ID!, $item: ID!) {
-                    deleteProjectV2Item(input: { projectId: $project, itemId: $item }) { deletedItemId }
-                  }`, { project: onBoard.project.id, item: onBoard.id });
-                core.info(`${what} no longer qualifies — removed from the board.`);
-                return;
-              }
-              core.info(`${what} belongs on the board: ${reasons.join('; ')}`);
-
-              // ---- add it and, for PRs, keep Status in step with the PR ----
-              const { organization: { projectV2: project } } = await github.graphql(`
-                query($org: String!, $number: Int!) {
-                  organization(login: $org) {
-                    projectV2(number: $number) {
-                      id
-                      field(name: "Status") {
-                        ... on ProjectV2SingleSelectField { id options { id name } }
-                      }
-                    }
-                  }
-                }`, { org: ORG, number: PROJECT_NUMBER });
-              if (!project?.field?.options) {
-                throw new Error(`project ${PROJECT_NUMBER} or its Status field is not visible to the App token`);
-              }
-
-              // Adding an item that is already on the board returns the
-              // existing item, so this is safe to repeat on every event.
-              const { addProjectV2ItemById: { item: boardItem } } = await github.graphql(`
-                mutation($project: ID!, $content: ID!) {
-                  addProjectV2ItemById(input: { projectId: $project, contentId: $content }) {
-                    item {
-                      id
-                      fieldValueByName(name: "Status") {
-                        ... on ProjectV2ItemFieldSingleSelectValue { name }
-                      }
-                    }
-                  }
-                }`, { project: project.id, content: item.node_id });
-              const current = boardItem.fieldValueByName?.name ?? null;
-
-              if (!pr) {
-                core.info(`${what} is on the board (Status: ${current ?? 'unset'}; left to the board's automation).`);
-                return;
-              }
-
-              // Review-driven transitions. Bots are ignored: Copilot's
-              // automatic review requests itself on every new PR.
-              const review = context.payload.review;
-              const requested = context.payload.requested_reviewer ?? context.payload.requested_team;
-              const isReviewEvent = context.eventName === 'pull_request_review';
-              const reviewRequested = action === 'review_requested' && requested?.type !== 'Bot';
-              const reviewDismissed = isReviewEvent && action === 'dismissed' && review?.user?.type !== 'Bot';
-              let approvedBy = null;
-              if (isReviewEvent && action === 'submitted' && review?.state?.toLowerCase() === 'approved') {
-                const approvers = await teamMembers(APPROVER_TEAM_SLUG);
-                if (approvers?.has(review.user.login.toLowerCase())) {
-                  approvedBy = review.user.login;
-                }
-              }
-
-              let wanted, why;
-              if (pr.draft) {
-                [wanted, why] = ['Backlog', 'draft'];
-              } else if (approvedBy) {
-                [wanted, why] = ['Approved', `approved by ${approvedBy} (@${ORG}/${APPROVER_TEAM_SLUG})`];
-              } else if (reviewRequested) {
-                [wanted, why] = ['In Progress', 'review requested'];
-              } else if (reviewDismissed) {
-                [wanted, why] = ['In review', 'review dismissed'];
-              } else if (KEEP_OPEN.includes((current ?? '').toLowerCase())) {
-                [wanted, why] = [current, 'kept'];
-              } else {
-                [wanted, why] = ['In review', 'open PR'];
-              }
-              if (wanted === current) {
-                core.info(`${what} is on the board with Status "${current}" (${why}) — nothing to change.`);
-                return;
-              }
-              const option = project.field.options.find(o => o.name.toLowerCase() === wanted.toLowerCase());
-              if (!option) {
-                throw new Error(`the board has no Status option named "${wanted}"`);
-              }
-              await github.graphql(`
-                mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
-                  updateProjectV2ItemFieldValue(input: {
-                    projectId: $project, itemId: $item, fieldId: $field,
-                    value: { singleSelectOptionId: $option }
-                  }) { projectV2Item { id } }
-                }`, { project: project.id, item: boardItem.id, field: project.field.id, option: option.id });
-              core.info(`${what}: Status ${current ?? 'unset'} -> ${option.name} (${why}).`);
-            } catch (e) {
-              core.setFailed(`Could not update the board: ${e.message}. `
-                + `If this is a permission error, grant ${APP} the organization permission `
-                + `"Projects: Read and write" (not the repository-level Projects), ${ACCEPT}. `
-                + `Board: https://github.com/orgs/${ORG}/projects/${PROJECT_NUMBER}`);
-            }
+            await github.rest.issues.addLabels({ owner, repo, issue_number: number, labels: [LABEL] });
+            core.info(`${what}: labeled ${LABEL} (${reasons.join('; ')}).`);
