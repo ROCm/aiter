@@ -1,18 +1,26 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tests for the FlyDSL flash-attention kernels: gfx1201 bf16/f16 and gfx950 fp8."""
+"""Tests for gfx1201 BF16/F16/FP8 and gfx950 FP8 FlyDSL flash attention."""
 
 from __future__ import annotations
 
+import argparse
+import itertools
+import warnings
 from contextlib import nullcontext
 from itertools import pairwise
 
+import pandas as pd
 import pytest
 import torch
 import torch.nn.functional as F
 
-from aiter.ops.flydsl import flydsl_flash_attn_func
+import aiter
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl import flydsl_flash_attn_func, flydsl_fp8_quant
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 
 def _arch() -> str:
@@ -126,6 +134,12 @@ def _make_qkv(
         (2, 1024, 8, 128),
         # Unaligned shape — exercises the auto-padding path. 32760 → 32768.
         (1, 32760, 12, 128),
+        # Short Flux self-attention (128x32 tile).
+        (1, 512, 24, 128),
+        # 24-head diffusion attention.
+        (1, 1024, 24, 128),
+        # Head dimension 64 uses the 128x64 tile.
+        (1, 2048, 16, 64),
     ],
 )
 def test_flydsl_fmha_correctness_bf16(batch, seq_len, num_heads, head_dim):
@@ -144,15 +158,6 @@ def test_flydsl_fmha_correctness_bf16(batch, seq_len, num_heads, head_dim):
     # bf16 attention is noisy; cosine is the right correctness signal.
     assert cos.min().item() > 0.99, f"min_cos={cos.min().item():.6f}"
     assert cos.mean().item() > 0.999, f"mean_cos={cos.mean().item():.6f}"
-
-
-@_gfx1201_only
-def test_flydsl_fmha_rejects_cross_attention():
-    q = torch.randn(1, 1024, 12, 128, dtype=torch.bfloat16, device="cuda")
-    k = torch.randn(1, 512, 12, 128, dtype=torch.bfloat16, device="cuda")
-    v = torch.randn(1, 512, 12, 128, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(ValueError, match="self-attention"):
-        flydsl_flash_attn_func(q, k, v)
 
 
 @_gfx1201_only
@@ -233,11 +238,6 @@ def test_flydsl_fmha_correctness_multi_device():
     import textwrap
 
     script = textwrap.dedent("""
-        import sys
-        sys.path.insert(0, "/workspace/FlyDSL/python")
-        import flydsl
-        flydsl.__version__ = "0.1.5.dev999"
-
         import torch
         import torch.nn.functional as F
         from aiter.ops.flydsl import flydsl_flash_attn_func
@@ -295,27 +295,10 @@ def test_flydsl_fmha_correctness_multi_device():
 
 
 @_gfx1201_only
-def test_flydsl_fmha_rejects_excessive_padding():
-    """Non-causal path must reject padding ratio > 0.5% (option (d) guard).
-
-    S_real=129 -> S_pad=256, pad ratio 127/256 = 49.6%. Padded K/V keys
-    would contribute to the softmax denominator and silently scale outputs
-    (rel_err ~37% per RCA in 2969_padded_softmax_rca.md). Wrapper must
-    raise before launching the kernel.
-    """
-    batch, seq_len, num_heads, head_dim = 1, 129, 8, 128
-    q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
-    with pytest.raises(ValueError, match="0.5% safety threshold"):
-        flydsl_flash_attn_func(q, k, v, causal=False)
-
-
-@_gfx1201_only
 def test_flydsl_fmha_allows_tight_padding():
-    """Wan2.1 production case (S_real=32760 -> S_pad=32768, ratio 0.024%)
-    must pass the 0.5% threshold and produce SDPA-equivalent output.
-
-    Regression guard for option (d) — protects the production hot path
-    from a future, stricter threshold accidentally rejecting it.
+    """Wan2.1 production case (S_real=32760 -> S_pad=32768) must produce
+    SDPA-equivalent output. The kernel bounds the non-causal KV loop at the
+    real length and masks the straddling final tile exactly.
     """
     batch, seq_len, num_heads, head_dim = 1, 32760, 12, 128
     q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
@@ -1917,3 +1900,221 @@ def test_fp8_repeat_launch_is_bit_exact_under_load():
     base = outs[100]
     bad = sum(1 for o in outs if not torch.equal(o, base))
     assert bad == 0, f"{bad}/200 launches differed bitwise from the reference launch"
+
+
+# Native gfx1201 FMHA op-test.  This intentionally lives in the canonical
+# arch-dispatching test module rather than a separate test_*_gfx1201.py file.
+_GFX1201_OPTEST_SHAPES = [
+    ("d64_256", 1, 256, 256, 8, 64, False),
+    ("d128_cross_tail", 1, 2048, 1400, 8, 128, False),
+    ("causal_d128", 1, 512, 512, 8, 128, True),
+]
+
+
+def _optest_make_gfx1201_qkv(batch, seq_q, seq_kv, heads, head_dim, *, device="cuda"):
+    generator = torch.Generator(device=device).manual_seed(0)
+    return (
+        torch.randn(
+            (batch, seq_q, heads, head_dim),
+            generator=generator,
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        torch.randn(
+            (batch, seq_kv, heads, head_dim),
+            generator=generator,
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        torch.randn(
+            (batch, seq_kv, heads, head_dim),
+            generator=generator,
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+    )
+
+
+def _optest_gfx1201_reference(q, k, v, *, causal):
+    """FP32 SDPA reference for the public BSHD API; it is never timed."""
+    return (
+        F.scaled_dot_product_attention(
+            q.transpose(1, 2).float(),
+            k.transpose(1, 2).float(),
+            v.transpose(1, 2).float(),
+            is_causal=causal,
+        )
+        .transpose(1, 2)
+        .contiguous()
+    )
+
+
+def _optest_assert_gfx1201_quality(actual, expected, *, head_dim, minimum, mean):
+    cosine = F.cosine_similarity(
+        actual.float().reshape(-1, head_dim),
+        expected.float().reshape(-1, head_dim),
+        dim=1,
+    )
+    min_cos = cosine.min().item()
+    mean_cos = cosine.mean().item()
+    assert min_cos > minimum, f"min_cos={min_cos:.6f}"
+    assert mean_cos > mean, f"mean_cos={mean_cos:.6f}"
+
+
+def _optest_gfx1201_contracts():
+    """Check durable public-wrapper boundaries outside timed benchmark rows."""
+    q, k, v = _optest_make_gfx1201_qkv(1, 97, 97, 2, 128)
+    out = torch.full_like(q, float("nan"))
+    result = flydsl_flash_attn_func(q, k, v, out=out)
+    assert result.data_ptr() == out.data_ptr()
+    _optest_assert_gfx1201_quality(
+        out,
+        _optest_gfx1201_reference(q, k, v, causal=False),
+        head_dim=128,
+        minimum=0.99,
+        mean=0.999,
+    )
+
+    stream = torch.cuda.Stream(device=q.device)
+    stream_out = torch.full_like(q, float("nan"))
+    streamed = flydsl_flash_attn_func(q, k, v, stream=stream, out=stream_out)
+    stream.synchronize()
+    assert streamed.data_ptr() == stream_out.data_ptr()
+    _optest_assert_gfx1201_quality(
+        stream_out,
+        _optest_gfx1201_reference(q, k, v, causal=False),
+        head_dim=128,
+        minimum=0.99,
+        mean=0.999,
+    )
+
+    q_storage = torch.randn((1, 97, 2, 256), dtype=torch.bfloat16, device="cuda")
+    q_noncontig = q_storage[..., ::2]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        copied = flydsl_flash_attn_func(q_noncontig, q_noncontig, q_noncontig)
+    assert any(
+        "materializes non-contiguous Q/K/V" in str(warning.message)
+        for warning in caught
+    )
+    _optest_assert_gfx1201_quality(
+        copied,
+        _optest_gfx1201_reference(q_noncontig, q_noncontig, q_noncontig, causal=False),
+        head_dim=128,
+        minimum=0.99,
+        mean=0.999,
+    )
+
+
+@benchmark()
+def run_flydsl_fmha_optest(
+    shape, batch, seq_q, seq_kv, num_heads, head_dim, dtype, causal
+):
+    """Time public BF16 and pre-quantized FP8 attention paths against SDPA."""
+    q, k, v = _optest_make_gfx1201_qkv(batch, seq_q, seq_kv, num_heads, head_dim)
+    ref = _optest_gfx1201_reference(q, k, v, causal=causal)
+    out = torch.full_like(q, float("nan"))
+    is_fp8 = dtype == "fp8"
+    if is_fp8:
+        q8, k8, v8, sq, sk, sv = flydsl_fp8_quant(q, k, v)
+        candidates = {
+            "flydsl": lambda: flydsl_flash_attn_func(
+                q8,
+                k8,
+                v8,
+                causal=causal,
+                q_descale=sq,
+                k_descale=sk,
+                v_descale=sv,
+                out=out,
+            )
+        }
+        minimum, mean, element_bytes = 0.97, 0.994, 1
+    else:
+        candidates = {
+            "flydsl": lambda: flydsl_flash_attn_func(q, k, v, causal=causal, out=out)
+        }
+        minimum, mean, element_bytes = 0.99, 0.999, q.element_size()
+
+    flops = 4.0 * batch * num_heads * seq_q * seq_kv * head_dim
+    if causal:
+        flops *= 0.5
+    nbytes = (
+        batch
+        * num_heads
+        * head_dim
+        * ((seq_q + 2 * seq_kv) * element_bytes + seq_q * out.element_size())
+    )
+
+    ret = {"gfx": get_gfx()}
+    for name, fn in candidates.items():
+        result, us = run_perftest(fn)
+        assert result.data_ptr() == out.data_ptr(), f"{name} did not use out buffer"
+        err = checkAllclose(
+            ref.to(dtypes.fp32),
+            result.to(dtypes.fp32),
+            rtol=2e-1 if is_fp8 else 2e-2,
+            atol=2e-1 if is_fp8 else 2e-2,
+            msg=f"{name}: {shape}",
+        )
+        _optest_assert_gfx1201_quality(
+            result, ref, head_dim=head_dim, minimum=minimum, mean=mean
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+def main():
+    if get_gfx() != "gfx1201":
+        aiter.logger.warning(
+            "native FlyDSL FMHA op test unsupported on %s; skipping", get_gfx()
+        )
+        return
+
+    parser = argparse.ArgumentParser(description="Native FlyDSL FMHA config")
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        choices=["bf16", "fp8"],
+        nargs="*",
+        default=["bf16", "fp8"],
+        help="Attention paths to sweep.",
+    )
+    parser.add_argument(
+        "-s",
+        "--shape",
+        choices=[shape[0] for shape in _GFX1201_OPTEST_SHAPES],
+        nargs="*",
+        default=[shape[0] for shape in _GFX1201_OPTEST_SHAPES],
+        help="Attention shape groups to sweep.",
+    )
+    args = parser.parse_args()
+
+    _optest_gfx1201_contracts()
+    rows = []
+    for dtype, config in itertools.product(args.dtype, _GFX1201_OPTEST_SHAPES):
+        shape, batch, seq_q, seq_kv, num_heads, head_dim, causal = config
+        if shape in args.shape:
+            rows.append(
+                run_flydsl_fmha_optest(
+                    shape,
+                    batch,
+                    seq_q,
+                    seq_kv,
+                    num_heads,
+                    head_dim,
+                    dtype,
+                    causal,
+                )
+            )
+    aiter.logger.info(
+        "flydsl_fmha summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+
+if __name__ == "__main__":
+    main()
