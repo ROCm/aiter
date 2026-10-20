@@ -134,6 +134,8 @@ DINLINE opus::fp32_t downcast_s<opus::fp32_t>(opus::fp32_t val)
 constexpr int    kLLMaxRanks       = kMaxNgpus;
 // Route to LL when bytes <= this (matches RCCL DDA_ALLREDUCE_LL_THRESHOLD).
 constexpr size_t kLLArMaxBytes     = 4194304;           // 4 MiB
+// Narrower rows do not amortize the extra launches of two-stage fused AR.
+constexpr int kArRmsTwoStageMinHidden = 6144;
 // Hard per-message payload cap (one slot), equal to the routing threshold.
 constexpr size_t kLLScratchCapBytes = 4194304;          // 4 MiB
 // Per-rank staging slot capacity, in 8-byte packets.
@@ -460,6 +462,55 @@ __global__ void __launch_bounds__(256, 2) ar_gfx1250_naive_unroll4(
 // ---------------------------------------------------------------------------
 // gfx1250 fused allreduce + residual add + RMSNorm (+ per-token FP8 quant)
 // ---------------------------------------------------------------------------
+// Stage 1 of the large-message path. Each rank owns one contiguous hidden
+// shard, reduces that shard in fixed rank order, and writes it to its local
+// peer-visible scratch. Stage 2 reads the reduced shards below.
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) ar_rmsnorm_reduce_scatter_gfx1250(
+    RankData* _input_dp,
+    Signal* self_sg,
+    int rank,
+    int tokens,
+    int packs)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    const int shard_packs   = packs / ngpus;
+    const int shard_size    = tokens * shard_packs;
+    const P* ptrs[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; ++i)
+        ptrs[i] = reinterpret_cast<const P*>(_input_dp->ptrs[i]);
+    P* scratch =
+        reinterpret_cast<P*>(reinterpret_cast<char*>(self_sg) + kLLScratchOffset);
+
+    const int tid    = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = gridDim.x * blockDim.x;
+    for(int out_idx = tid; out_idx < shard_size; out_idx += stride)
+    {
+        const int token = out_idx / shard_packs;
+        const int col   = out_idx - token * shard_packs;
+        const int idx   = token * packs + rank * shard_packs + col;
+        A acc;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+            acc[j] = upcast_s(ptrs[0][idx][j]);
+#pragma unroll
+        for(int i = 1; i < ngpus; ++i)
+        {
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+                acc[j] += upcast_s(ptrs[i][idx][j]);
+        }
+        P reduced;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+            reduced[j] = downcast_s<T>(acc[j]);
+        scratch[out_idx] = reduced;
+    }
+}
+
 // Sum or max over the block; every thread gets the result. Threads past the
 // row contribute 0, so the block size may exceed the row as long as it is a
 // whole number of waves.
@@ -490,7 +541,7 @@ DINLINE float block_allreduce_f32(float v)
 // One block per token, one thread per 16-byte pack of the row. Matches the
 // unfused path: the all-reduce result is rounded to T before the residual add,
 // and ranks are summed in rank order so every rank gets the same bits.
-template <typename T, typename OutT, int ngpus, bool GEMMA_NORM>
+template <typename T, typename OutT, int ngpus, bool GEMMA_NORM, bool TWO_STAGE = false>
 __global__ void __launch_bounds__(1024, 1) ar_rmsnorm_gfx1250(
     RankData* _input_dp,
     RankSignals sg,
@@ -513,12 +564,19 @@ __global__ void __launch_bounds__(1024, 1) ar_rmsnorm_gfx1250(
     const P* ptrs[ngpus];
 #pragma unroll
     for(int i = 0; i < ngpus; i++)
-        ptrs[i] = (const P*)_input_dp->ptrs[i];
+    {
+        if constexpr(TWO_STAGE)
+            ptrs[i] = reinterpret_cast<const P*>(
+                reinterpret_cast<const char*>(sg.signals[i]) + kLLScratchOffset);
+        else
+            ptrs[i] = reinterpret_cast<const P*>(_input_dp->ptrs[i]);
+    }
     P w{};
     if(active)
         w = reinterpret_cast<const P*>(weight)[threadIdx.x];
 
-    start_sync<ngpus>(sg, self_sg, rank);
+    if constexpr(!TWO_STAGE)
+        start_sync<ngpus>(sg, self_sg, rank);
     for(int t = blockIdx.x; t < tokens; t += gridDim.x)
     {
         const int idx = t * packs + threadIdx.x;
@@ -526,13 +584,26 @@ __global__ void __launch_bounds__(1024, 1) ar_rmsnorm_gfx1250(
         float square_sum   = 0.f;
         if(active)
         {
-#pragma unroll
-            for(int i = 0; i < ngpus; i++)
+            if constexpr(TWO_STAGE)
             {
-                const P v = ptrs[i][idx];
+                const int shard_packs = packs / ngpus;
+                const int owner       = threadIdx.x / shard_packs;
+                const int col         = threadIdx.x - owner * shard_packs;
+                const P   v           = ptrs[owner][t * shard_packs + col];
 #pragma unroll
-                for(int j = 0; j < pack_size; j++)
-                    x[j] += upcast_s(v[j]);
+                for(int j = 0; j < pack_size; ++j)
+                    x[j] = upcast_s(v[j]);
+            }
+            else
+            {
+#pragma unroll
+                for(int i = 0; i < ngpus; i++)
+                {
+                    const P v = ptrs[i][idx];
+#pragma unroll
+                    for(int j = 0; j < pack_size; j++)
+                        x[j] += upcast_s(v[j]);
+                }
             }
             const P res = reinterpret_cast<const P*>(residual_inp)[idx];
             P sum;
@@ -596,7 +667,8 @@ __global__ void __launch_bounds__(1024, 1) ar_rmsnorm_gfx1250(
                 scale_out[t] = scale;
         }
     }
-    end_sync<ngpus, true>(sg, self_sg, rank);
+    if constexpr(!TWO_STAGE)
+        end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 // ---------------------------------------------------------------------------
@@ -1053,19 +1125,19 @@ __global__ void __launch_bounds__(256, 1) rs_gfx1250_split_middim(
 // sync latency
 // ---------------------------------------------------------------------------
 template <int ngpus>
-__global__ void start_sync_latency(RankSignals sg, Signal* self_sg, int rank)
+__global__ void start_sync_kernel(RankSignals sg, Signal* self_sg, int rank)
 {
   start_sync<ngpus>(sg, self_sg, rank);
 }
 
 template <int ngpus>
-__global__ void end_sync_latency(RankSignals sg, Signal* self_sg, int rank)
+__global__ void end_sync_kernel(RankSignals sg, Signal* self_sg, int rank)
 {
   end_sync<ngpus>(sg, self_sg, rank);
 }
 
 template <int ngpus>
-__global__ void two_sync_latency(RankSignals sg, Signal* self_sg, int rank)
+__global__ void two_sync_kernel(RankSignals sg, Signal* self_sg, int rank)
 {
   start_sync<ngpus>(sg, self_sg, rank);
   end_sync<ngpus>(sg, self_sg, rank);
@@ -1637,8 +1709,34 @@ public:
         RankData* input_ptrs = get_buffer_RD(stream, input);
         const int threads    = (hidden / pack_size + 63) / 64 * 64;
         const int blocks     = std::min(tokens, kMaxBlocks);
+        const size_t bytes   = (size_t)tokens * hidden * sizeof(T);
+        // At TP4+, two-stage halves or better the peer traffic of direct-read.
+        // Its three single-block barriers do not amortize at TP2 or narrow rows.
+        // The reduced shard reuses the LL scratch and is capacity-checked here.
+        const bool two_stage =
+            world_size_ >= 4 && hidden >= kArRmsTwoStageMinHidden &&
+            hidden / pack_size % world_size_ == 0 &&
+            bytes / world_size_ <= llScratchBytes(world_size_) && bytes > kLLArMaxBytes;
 #define LAUNCH_AR_RMS(NG)                                                                   \
-        if(gemma_norm)                                                                      \
+        if(two_stage)                                                                       \
+        {                                                                                   \
+            start_sync_kernel<NG><<<1, 64, 0, stream>>>(sg_, self_sg_, rank_);              \
+            ar_rmsnorm_reduce_scatter_gfx1250<T, NG><<<blocks, 512, 0, stream>>>(           \
+                input_ptrs, self_sg_, rank_, tokens, hidden / pack_size);                   \
+            end_sync_kernel<NG><<<1, 64, 0, stream>>>(sg_, self_sg_, rank_);                \
+            if(gemma_norm)                                                                  \
+                ar_rmsnorm_gfx1250<T, OutT, NG, true, true>                                 \
+                    <<<blocks, threads, 0, stream>>>(                                       \
+                        nullptr, sg_, self_sg_, rank_, residual_inp, residual_out, output,   \
+                        weight, scale_out, bf16_output, tokens, hidden, eps);                \
+            else                                                                            \
+                ar_rmsnorm_gfx1250<T, OutT, NG, false, true>                                \
+                    <<<blocks, threads, 0, stream>>>(                                       \
+                        nullptr, sg_, self_sg_, rank_, residual_inp, residual_out, output,   \
+                        weight, scale_out, bf16_output, tokens, hidden, eps);                \
+            end_sync_kernel<NG><<<1, 64, 0, stream>>>(sg_, self_sg_, rank_);                \
+        }                                                                                   \
+        else if(gemma_norm)                                                                 \
             ar_rmsnorm_gfx1250<T, OutT, NG, true><<<blocks, threads, 0, stream>>>(          \
                 input_ptrs, sg_, self_sg_, rank_, residual_inp, residual_out, output,       \
                 weight, scale_out, bf16_output, tokens, hidden, eps);                       \
