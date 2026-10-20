@@ -1,3 +1,7 @@
+import os
+import subprocess
+import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -7,6 +11,23 @@ from aiter.ops.triton.fusions.activation import act_mul_and_mxfp4_quant
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm, unshuffle_scale_gemm
 from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
+
+
+def test_activation_imports_in_triton_only_mode():
+    code = """
+from aiter.ops.triton.fusions import activation
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+assert activation.fp8_dtype == get_fp8_e4m3_dtype()
+"""
+    env = os.environ.copy()
+    env["AITER_TRITON_ONLY"] = "1"
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def pad_tensor_2d(tensor, mult_m=256, mult_n=8):
