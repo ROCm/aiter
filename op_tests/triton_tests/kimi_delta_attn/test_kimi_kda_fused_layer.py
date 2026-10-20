@@ -112,6 +112,8 @@ def test_decode_runs_inplace_deterministic(m):
     ins = _decode_inputs(m, dev, seed=m)
     ok, reason = kimi_kda_fused_layer_decode_supported(**ins)
     assert ok, reason
+    conv_before = ins["conv_state"].clone()
+    state_before = ins["state"].clone()
     out = torch.empty((m, 7168), dtype=BF16, device=dev)
     o, conv, state = kimi_kda_fused_layer_decode(
         **ins, lower_bound=-5.0, norm_eps=1e-5, output_tensor=out
@@ -120,6 +122,9 @@ def test_decode_runs_inplace_deterministic(m):
     assert o.data_ptr() == out.data_ptr()
     assert conv.data_ptr() == ins["conv_state"].data_ptr()
     assert state.data_ptr() == ins["state"].data_ptr()
+    # the conv/recurrent caches are updated in place
+    assert not torch.equal(conv, conv_before)
+    assert not torch.equal(state, state_before)
     ins2 = _decode_inputs(m, dev, seed=m)
     out2 = torch.empty((m, 7168), dtype=BF16, device=dev)
     o2, _, _ = kimi_kda_fused_layer_decode(
@@ -138,7 +143,7 @@ def test_decode_rejects_bad_output_tensor():
         )
 
 
-def _prefill_inputs(m, n, dev, seed=0):
+def _prefill_inputs(m, n, dev, seed=0, initial=False):
     torch.manual_seed(seed)
     slots = max(n, 4)
     base = m // n
@@ -147,6 +152,9 @@ def _prefill_inputs(m, n, dev, seed=0):
     cu = torch.tensor(
         [0, *torch.cumsum(torch.tensor(lens), 0).tolist()], dtype=I32, device=dev
     )
+    has_initial_state = torch.zeros(n, dtype=torch.bool, device=dev)
+    if initial:
+        has_initial_state[::2] = True  # read initial states for the even sequences
     return {
         "qkv": _rnd((m, 4608), BF16, dev),
         "gate": _rnd((m, 1536), BF16, dev),
@@ -161,23 +169,29 @@ def _prefill_inputs(m, n, dev, seed=0):
         "state": _rnd((slots, 12, 128, 128), F32, dev),
         "state_indices": torch.arange(n, dtype=I32, device=dev),
         "cu_seqlens": cu,
-        "has_initial_state": torch.zeros(n, dtype=torch.bool, device=dev),
+        "has_initial_state": has_initial_state,
     }
 
 
 @on_device
+@pytest.mark.parametrize("initial", [False, True])
 @pytest.mark.parametrize("m,n", [(1024, 1), (2048, 4), (8192, 32)])
-def test_prefill_runs_inplace_deterministic(m, n):
+def test_prefill_runs_inplace_deterministic(m, n, initial):
     dev = "cuda"
-    ins = _prefill_inputs(m, n, dev, seed=m + n)
+    ins = _prefill_inputs(m, n, dev, seed=m + n, initial=initial)
     ok, reason = kimi_kda_fused_layer_prefill_supported(**ins)
     assert ok, reason
+    conv_before = ins["conv_state"].clone()
+    state_before = ins["state"].clone()
     o, conv, state = kimi_kda_fused_layer_prefill(
         **ins, lower_bound=-5.0, norm_eps=1e-5
     )
     assert o.shape == (m, 1536) and o.dtype == BF16
     assert conv.data_ptr() == ins["conv_state"].data_ptr()
     assert state.data_ptr() == ins["state"].data_ptr()
-    ins2 = _prefill_inputs(m, n, dev, seed=m + n)
+    # the conv/recurrent caches are updated in place
+    assert not torch.equal(conv, conv_before)
+    assert not torch.equal(state, state_before)
+    ins2 = _prefill_inputs(m, n, dev, seed=m + n, initial=initial)
     o2, _, _ = kimi_kda_fused_layer_prefill(**ins2, lower_bound=-5.0, norm_eps=1e-5)
     assert torch.equal(o, o2)
