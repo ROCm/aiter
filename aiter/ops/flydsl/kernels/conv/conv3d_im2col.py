@@ -10,10 +10,14 @@ from flydsl.expr import const_expr, range_constexpr
 
 from .conv3d_gfx950_utils import (
     BF16_BYTES,
+    KW_REUSE_STAGES,
     LDG_VEC,
+    LDS_BYTES_PER_CU,
     OOB_SENTINEL_BYTES,
     OOB_SENTINEL_ELEM,
+    WARP_SIZE,
     TileConfig,
+    b_park_elems,
     dil,
     flat_buffer_view,
     gather_valid,
@@ -78,6 +82,28 @@ class Im2colPlan(NamedTuple):
     big_in_nm: bool
     t_aligned: bool
 
+    # kW reuse: the KW taps of one (kt, kh, channel block) share a single LDS
+    # strip of input pixels, read back at a row shift of kw*dw. The strip
+    # holds the block's rows plus a halo per output-row segment; tile_m <= Wo
+    # keeps that to two segments. Only the boolean may follow the resolution;
+    # the strip sizes come from the filter and tile alone.
+    kw_reuse: bool
+    strip_halo: int
+    strip_rows: int
+    strip_ldg: int
+
+    # kH x kW reuse: a block owns an out_block = (rows, cols) patch of output
+    # pixels in one (n, t) plane, and all kH*kW taps of one (kt, channel
+    # block) read a single LDS patch of patch_rows x patch_cols input pixels.
+    # Takes precedence over kW reuse. Sizes come from the filter and tile;
+    # out_block is None unless kh_reuse.
+    kh_reuse: bool
+    out_block: object
+    patch_rows: int
+    patch_cols: int
+    patch_ldg: int
+    patch_alloc_vecs: int
+
 
 def make_im2col_plan(param, geom, cfg):
     """Im2colPlan, or an assertion about gather reach."""
@@ -131,6 +157,61 @@ def make_im2col_plan(param, geom, cfg):
             f"over N, or pass a narrower tile=(TILE_M, ...)."
         )
 
+    scalar_k = geom.cgp % tile_k == 0
+    # What both reuse paths need of the layer; AITER_CONV3D_KW_REUSE=0 turns
+    # off every LDS-reuse path.
+    reuse_ok = bool(
+        param.kw_reuse
+        and scalar_k
+        and pad_mode == "zeros"
+        and groups == 1
+        and param.splitk <= 1
+    )
+    kw_layer_ok = reuse_ok and kw > 1 and sw == 1
+    strip_halo = (kw - 1) * dw if kw_layer_ok else 0
+    strip_rows = tile_m + 2 * strip_halo if kw_layer_ok else 0
+    strip_vecs = strip_rows * (tile_k // LDG_VEC)
+    strip_ldg = -(-strip_vecs // cfg.block_threads)
+    # The KW B tiles per stage can push LDS past what keeps the default path's
+    # blocks resident (128x192: 80 KB -> 96 KB, two blocks per CU -> one), and
+    # measured on the VAE layers that loses more than the cut L2 traffic buys.
+    reuse_lds = _reuse_lds_bytes(cfg, strip_ldg, kw)
+    base_lds = _base_lds_bytes(cfg)
+    keeps_occupancy = LDS_BYTES_PER_CU // reuse_lds >= LDS_BYTES_PER_CU // base_lds
+    kw_reuse = kw_layer_ok and keeps_occupancy and not big_in and wo >= tile_m
+
+    # kH x kW reuse. cols % 16 keeps every MFMA atom's 16 rows inside one
+    # image row of the patch. The epilogue masks the H/W tails through the
+    # output descriptor, which BIG_OUT does not have.
+    rows = param.block_rows
+    cols = tile_m // rows if rows > 0 and tile_m % rows == 0 else 0
+    kh_layer_ok = (
+        reuse_ok
+        and rows > 1
+        and cols > 0
+        and cols % 16 == 0
+        and (kh > 1 or kw > 1)
+        and sh == 1
+        and sw == 1
+    )
+    patch_rows = rows + (kh - 1) * dh if kh_layer_ok else 0
+    patch_cols = cols + (kw - 1) * dw if kh_layer_ok else 0
+    patch_vecs = patch_rows * patch_cols * (tile_k // LDG_VEC)
+    patch_ldg = -(-patch_vecs // cfg.block_threads)
+    # The last round is padded to whole waves; the waves past it park.
+    patch_alloc_vecs = -(-patch_vecs // WARP_SIZE) * WARP_SIZE
+    big_out = param.k * geom.npq * BF16_BYTES > 0x7FFFFFFF
+    # Against the path this layer would otherwise take: kW reuse can already
+    # hold two blocks per CU where the default path holds one (256x96).
+    other_lds = reuse_lds if kw_reuse else base_lds
+    kh_keeps_occupancy = kh_layer_ok and (
+        LDS_BYTES_PER_CU // _patch_lds_bytes(cfg, patch_ldg, patch_alloc_vecs)
+        >= LDS_BYTES_PER_CU // other_lds
+    )
+    kh_reuse = kh_layer_ok and kh_keeps_occupancy and not big_in and not big_out
+    if kh_reuse:
+        kw_reuse = False
+
     return Im2colPlan(
         c=c,
         kh=kh,
@@ -167,12 +248,232 @@ def make_im2col_plan(param, geom, cfg):
         # A K tile that never straddles a channel boundary makes the channel and
         # the filter tap uniform across the tile, so they are hoisted per tile
         # rather than recomputed per tap.
-        scalar_k=geom.cgp % tile_k == 0,
+        scalar_k=scalar_k,
         big_in=big_in,
         big_in_n1=big_in_n1,
         big_in_nm=big_in_nm,
         t_aligned=t_aligned,
+        kw_reuse=kw_reuse,
+        strip_halo=strip_halo,
+        strip_rows=strip_rows,
+        strip_ldg=strip_ldg,
+        kh_reuse=kh_reuse,
+        out_block=(rows, cols) if kh_reuse else None,
+        patch_rows=patch_rows,
+        patch_cols=patch_cols,
+        patch_ldg=patch_ldg,
+        patch_alloc_vecs=patch_alloc_vecs,
     )
+
+
+def strip_elems(plan):
+    """Elements of one LDS strip stage, padded to whole DMA rounds."""
+    return plan.strip_ldg * plan.cfg.block_threads * LDG_VEC
+
+
+def _base_lds_bytes(cfg):
+    return BF16_BYTES * (cfg.lds_a_elems + cfg.lds_b_elems + b_park_elems(cfg))
+
+
+def _reuse_lds_bytes(cfg, strip_ldg, kw):
+    strip = strip_ldg * cfg.block_threads * LDG_VEC
+    stage = strip + kw * cfg.tile_n * cfg.tile_k
+    return BF16_BYTES * (KW_REUSE_STAGES * stage + b_park_elems(cfg))
+
+
+def patch_needs_park(cfg, patch_ldg, patch_alloc_vecs):
+    """Whether the patch's last DMA round has waves past the padded patch."""
+    return patch_ldg * cfg.block_threads > patch_alloc_vecs
+
+
+def _patch_lds_bytes(cfg, patch_ldg, patch_alloc_vecs):
+    park = b_park_elems(cfg) or (
+        WARP_SIZE * LDG_VEC if patch_needs_park(cfg, patch_ldg, patch_alloc_vecs) else 0
+    )
+    patch = KW_REUSE_STAGES * patch_alloc_vecs * LDG_VEC
+    return BF16_BYTES * (patch + cfg.lds_b_elems + park)
+
+
+def plan_lds_bytes(plan):
+    """LDS one block allocates under this plan (what make_shared_storage lays out)."""
+    if plan.kh_reuse:
+        return _patch_lds_bytes(plan.cfg, plan.patch_ldg, plan.patch_alloc_vecs)
+    if plan.kw_reuse:
+        return _reuse_lds_bytes(plan.cfg, plan.strip_ldg, plan.kw)
+    return _base_lds_bytes(plan.cfg)
+
+
+class StripGather:
+    """kW-reuse gather: one LDS strip per (kt, kh, channel block).
+
+    Strip row r holds 32 channels of one input pixel. The block's GEMM rows
+    m = 0..tile_m-1 are consecutive output positions; they wrap to the next
+    output row at m_w = Wo - ow0 at most once (tile_m <= Wo). Segment 0 fills
+    strip rows [0, m_w + halo), segment 1 the rows after, so tap kw of row m
+    reads strip row s(m) + kw*dw with s(m) = m + halo * (m >= m_w).
+    """
+
+    def __init__(self, plan, x, ext):
+        assert plan.kw_reuse
+        self._plan = plan
+        self._ext = ext
+        self._x_src = flat_buffer_view(
+            fx.get_iter(x), ext.x_elems, _bytes_of(ext.x_elems)
+        )
+        self._m_w = None
+        self._vecs = None
+
+    def bind_block(self, tid, m_offset):
+        plan, ext, cfg = self._plan, self._ext, self._plan.cfg
+        halo = plan.strip_halo
+        m0 = fx.Int64(m_offset)
+        n0, rem = ext.div_dhw.divmod(m0)
+        ot0, rem = ext.div_hw_o.divmod(rem)
+        oh0, ow0 = ext.div_wo.divmod(rem)
+        m_w = fx.Int64(ext.wo) - ow0
+        m1 = m0 + m_w
+        n1, rem = ext.div_dhw.divmod(m1)
+        ot1, rem = ext.div_hw_o.divmod(rem)
+        oh1 = ext.div_wo.div(rem)
+        npq = fx.Int64(ext.npq)
+        exists0 = m0 < npq
+        exists1 = m1 < npq
+        r1 = m_w + fx.Int64(halo)
+        d, h, w = fx.Int64(ext.d), fx.Int64(ext.h), fx.Int64(ext.w)
+
+        vecs_per_row = cfg.tile_k // LDG_VEC
+        self._vecs = []
+        for i in range_constexpr(plan.strip_ldg):
+            v = fx.Int64(tid) + fx.Int64(i * cfg.block_threads)
+            r = v // vecs_per_row
+            q = v % vecs_per_row
+            seg1 = r >= r1
+            n = seg1.select(n1, n0)
+            ot = seg1.select(ot1, ot0)
+            oh = seg1.select(oh1, oh0)
+            iw = seg1.select(r - r1, ow0 + r) - fx.Int64(plan.pw)
+            it0 = ot * plan.st - plan.pt
+            ih0 = oh * plan.sh - plan.ph
+            base = (((n * d + it0) * h + ih0) * w + iw) * plan.c + q * LDG_VEC
+            ok = (
+                seg1.select(exists1, exists0)
+                & in_range(iw, w)
+                & (r < fx.Int64(plan.strip_rows))
+            )
+            self._vecs.append((base, ok, it0, ih0))
+        self._m_w = m_w
+
+    def taps(self, kt, kh, cc):
+        """Yield ``(i, src, voff)`` per strip vector of group (kt, kh, cc)."""
+        assert self._vecs is not None, "bind_block() before taps()"
+        plan, ext = self._plan, self._ext
+        t_off = dil(kt, plan.dt)
+        h_off = dil(kh, plan.dh)
+        delta = (fx.Int64(t_off) * fx.Int64(ext.h) + fx.Int64(h_off)) * fx.Int64(
+            ext.w
+        ) * plan.c + cc * plan.cfg.tile_k
+        for i in range_constexpr(plan.strip_ldg):
+            base, ok, it0, ih0 = self._vecs[i]
+            valid = gather_valid(
+                ok,
+                in_range(it0 + fx.Int64(t_off), ext.d),
+                in_range(ih0 + fx.Int64(h_off), ext.h),
+            )
+            yield i, self._x_src, valid.select(
+                fx.Int32(base + delta), fx.Int32(OOB_SENTINEL_ELEM)
+            )
+
+    def row_offset(self, m):
+        """Strip element offset of GEMM row ``m`` at tap kw = 0."""
+        halo = self._plan.strip_halo
+        m = fx.Int64(m)
+        s = m + (m >= self._m_w).select(fx.Int64(halo), fx.Int64(0))
+        return s * self._plan.cfg.tile_k
+
+
+class PatchGather:
+    """kH x kW reuse gather: one LDS patch per (kt, channel block).
+
+    The block owns a ``rows x cols`` patch of output pixels in one (n, t)
+    plane (``plan.out_block``). The LDS patch holds ``patch_rows x
+    patch_cols`` input pixels (32 channels each), and tap (kh, kw) of output
+    (r, c) reads patch pixel (r + kh*dh, c + kw*dw). Unit H/W stride.
+    """
+
+    def __init__(self, plan, x, ext):
+        assert plan.kh_reuse
+        cfg = plan.cfg
+        self._plan, self._ext = plan, ext
+        self.rows, self.cols = plan.out_block
+        self.prow, self.pcol = plan.patch_rows, plan.patch_cols
+        self._vpp = cfg.tile_k // LDG_VEC
+        self.vecs = self.prow * self.pcol * self._vpp
+        self.ldg = plan.patch_ldg
+        self.alloc_vecs = plan.patch_alloc_vecs
+        self.stage_elems = self.alloc_vecs * LDG_VEC
+        self._x_src = flat_buffer_view(
+            fx.get_iter(x), ext.x_elems, _bytes_of(ext.x_elems)
+        )
+        self._vecs = None
+        self._tid = None
+
+    def bind_block(self, tid, m0):
+        plan, ext, cfg = self._plan, self._ext, self._plan.cfg
+        m0 = fx.Int64(m0)
+        n0, rem = ext.div_dhw.divmod(m0)
+        ot0, rem = ext.div_hw_o.divmod(rem)
+        oh0, ow0 = ext.div_wo.divmod(rem)
+        d, h, w = fx.Int64(ext.d), fx.Int64(ext.h), fx.Int64(ext.w)
+        it0 = ot0 * plan.st - plan.pt
+        self._tid = tid
+        self._vecs = []
+        for i in range_constexpr(self.ldg):
+            v = fx.Int64(tid) + fx.Int64(i * cfg.block_threads)
+            p = v // self._vpp
+            q = v % self._vpp
+            pr = p // self.pcol
+            pc = p % self.pcol
+            ih = oh0 + pr - fx.Int64(plan.ph)
+            iw = ow0 + pc - fx.Int64(plan.pw)
+            base = (((n0 * d + it0) * h + ih) * w + iw) * plan.c + q * LDG_VEC
+            ok = (v < fx.Int64(self.vecs)) & in_range(ih, h) & in_range(iw, w)
+            self._vecs.append((base, ok))
+        self._it0 = it0
+
+    def taps(self, kt, cc):
+        """Yield ``(i, src, voff, live)`` per patch vector of group (kt, cc).
+
+        ``live`` is None, or the wave-uniform predicate of a round that is
+        only partly inside the padded patch (the rest of the waves park).
+        """
+        plan, ext, cfg = self._plan, self._ext, self._plan.cfg
+        t_off = dil(kt, plan.dt)
+        delta = (
+            fx.Int64(t_off) * fx.Int64(ext.h) * fx.Int64(ext.w) * plan.c
+            + cc * cfg.tile_k
+        )
+        t_ok = in_range(self._it0 + fx.Int64(t_off), ext.d)
+        for i in range_constexpr(self.ldg):
+            base, ok = self._vecs[i]
+            voff = (ok & t_ok).select(
+                fx.Int32(base + delta), fx.Int32(OOB_SENTINEL_ELEM)
+            )
+            live = None
+            if const_expr((i + 1) * cfg.block_threads > self.alloc_vecs):
+                wave_v = (
+                    fx.Int32(self._tid) // WARP_SIZE
+                ) * WARP_SIZE + i * cfg.block_threads
+                live = wave_v < fx.Int32(self.alloc_vecs)
+            yield i, self._x_src, voff, live
+
+    def lane_offset(self, m):
+        """Patch element offset of block-local output row ``m`` at tap (0, 0)."""
+        m = fx.Int64(m)
+        return ((m // self.cols) * self.pcol + m % self.cols) * self._plan.cfg.tile_k
+
+    def tap_offset(self, kh, kw):
+        plan = self._plan
+        return (dil(kh, plan.dh) * self.pcol + dil(kw, plan.dw)) * plan.cfg.tile_k
 
 
 class Im2colGather:
