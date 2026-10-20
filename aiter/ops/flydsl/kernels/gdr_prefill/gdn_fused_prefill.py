@@ -449,7 +449,10 @@ def compile_gdn_fused_prefill(
         pre0 = _prefetch(fx.Int32(0)) + _prefetch(fx.Int32(1))
         N_PRE = len(pre0) // 2
         ident = _vec(
-            [((4 * gq + i) == c).select(fx.Float32(1.0), fx.Float32(0.0)) for i in range(4)]
+            [
+                ((4 * gq + i) == c).select(fx.Float32(1.0), fx.Float32(0.0))
+                for i in range(4)
+            ]
         )
 
         def _mm_k4(a_row, b_row):
@@ -480,7 +483,9 @@ def compile_gdn_fused_prefill(
 
         def _p_tile(kbuf, a, b, diag):
             # P^T[j][t], j-block b (rows, from k), t-block a (columns, from q).
-            acc = _mm_k4(kbuf + (16 * b + c) * ROW + 8 * gq, (16 * a + c) * ROW + 8 * gq)
+            acc = _mm_k4(
+                kbuf + (16 * b + c) * ROW + 8 * gq, (16 * a + c) * ROW + 8 * gq
+            )
             eb4 = _fac4(F_EB, 16 * b + 4 * gq)
             eq = _fac1(F_EQ, 16 * a + c)
             vals = []
@@ -510,8 +515,8 @@ def compile_gdn_fused_prefill(
             bv = fx.Float32(state[N_S + 6])
             pre_next = [state[N_S + N_PRE + i] for i in range(N_PRE)]
 
-            if const_expr(HAS_TRACK):
-                if wh == 0:
+            if const_expr(HAS_TRACK):  # noqa: SIM102 - Preserve FlyDSL branches.
+                if wh == 0:  # noqa: SIM102 - Preserve FlyDSL branches.
                     if ch == trk:
                         for j in range_constexpr(2):
                             for vb in range_constexpr(NVB):
@@ -655,12 +660,17 @@ def compile_gdn_fused_prefill(
                     ]
                 )
                 z = [None] * 4
-                z[3] = _vec([(wl == 3).select(zw[i], fx.Float32(0.0)) for i in range(4)])
+                z[3] = _vec(
+                    [(wl == 3).select(zw[i], fx.Float32(0.0)) for i in range(4)]
+                )
                 for j in range_constexpr(2, -1, -1):
                     y = _zeros4()
                     for kb in range_constexpr(j + 1, 4):
                         a_frag = _lds_ld(
-                            p_ap, (kb * (kb - 1) // 2 + j) * FRAG + lane * 4, 4, fx.BFloat16
+                            p_ap,
+                            (kb * (kb - 1) // 2 + j) * FRAG + lane * 4,
+                            4,
+                            fx.BFloat16,
                         )
                         y = _mfma16(a_frag, _bf16(z[kb]), y)
                     td_frag = _lds_ld(p_td, j * FRAG + lane * 4, 4, fx.BFloat16)

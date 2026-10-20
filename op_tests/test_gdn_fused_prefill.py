@@ -66,9 +66,12 @@ def _make_inputs(shape: FusedShape, seed: int = 2026):
     q = q.view(1, t, hg, K)
     k = k.view(1, t, hg, K)
     v = v.view(1, t, h, V)
-    g = -torch.nn.functional.softplus(
-        torch.randn(1, t, h, dtype=torch.float32, generator=gen)
-    ) * 0.5
+    g = (
+        -torch.nn.functional.softplus(
+            torch.randn(1, t, h, dtype=torch.float32, generator=gen)
+        )
+        * 0.5
+    )
     beta = torch.randn(1, t, h, dtype=torch.float32, generator=gen).sigmoid()
     offsets = [0]
     for length in shape.seq_lens:
@@ -240,7 +243,9 @@ def main():
         rows.append(
             test_gdn_fused_prefill(name, list(shape.seq_lens), shape.hg, shape.h)
         )
-    aiter.logger.info("gdn_fused_prefill summary:\n%s", pd.DataFrame(rows).to_markdown())
+    aiter.logger.info(
+        "gdn_fused_prefill summary:\n%s", pd.DataFrame(rows).to_markdown()
+    )
 
 
 if __name__ == "__main__":
