@@ -39,6 +39,7 @@ from ..mega_moe.gemm_util import (
 )
 from ..mxfp4_gemm_common import _activation_mul_batch
 from ..tensor_shim import ptr_buf_tensor
+from .communication import _quantize_group8  # per-8 fp8 combine codec (P==1 fused scatter)
 from .common import (
     ACQ_REL,
     AUX_SYS,
@@ -810,13 +811,13 @@ def build_gemm(kc: KernelCtx) -> dict:
         (wave-strided rows, lane-strided V4I cols; padding skipped) but reads the LDS C-tile
         (``cptr``) at the chunk-LOCAL row ``lr`` (0..CROWS-1); the C-tile now holds only this
         16-row chunk (see ``_epilogue_g2``'s per-mi cshuffle)."""
-        HV = H // 8
         mtpr = a["mtpr"]
         r_rowidx = rsrc(a["rowidx"])
         wave = tid // i32(64)
         lane = tid % i32(64)
-        NV = cs_tile_n2 // 8  # V4I (8-bf16) cols produced by this n-tile
-        hv0 = i32(n_tile) * i32(NV)  # this n-tile's base in the row's HV V4I cols
+        PART_RB = H + H // 8  # part row bytes (H fp8 + H/8 per-8 E8M0); matches communication
+        NV = cs_tile_n2 // 8  # 8-element groups produced by this n-tile
+        gv0 = i32(n_tile) * i32(NV)  # this n-tile's base group in the part row
         hi = fx.min(i32(CROWS), rows - row_lo)  # valid rows within this chunk (>=0)
         for lr_ in range(wave, hi, i32(NW)):
             lr = i32(lr_)  # chunk-local row 0..CROWS-1 (== C-tile row)
@@ -827,20 +828,21 @@ def build_gemm(kc: KernelCtx) -> dict:
             src_rank = sk // mtpr
             slot = (sk - src_rank * mtpr) * i32(TOPK) + route
             dpart = rsrc(_part_base(a, src_rank))
-            pbase = slot * i32(HV) + hv0
+            prow = slot * i32(PART_RB)
+            # per-8 fp8: same 64-lane g-loop; read 8 f32 from the C-tile, quantize to 8 fp8
+            # (w0,w1) + 1 E8M0 (coalesced across lanes).  Keeps the original parallelism.
             for g_ in range(lane, i32(NV), i32(64)):
                 g = i32(g_)
-                col0 = g * i32(8)
-                cidx = lr * i32(cs_tile_n2) + col0  # C-tile LOCAL row
+                cidx = lr * i32(cs_tile_n2) + g * i32(8)  # C-tile LOCAL row
                 f32_iter = fx.recast_iter(
                     fx.Float32, fx.add_offset(cptr, fx.make_int_tuple(cidx))
                 )
-                frag = fx.make_view(f32_iter, fx.make_layout(8, 1)).load()
-                ov = fx.Vector.from_elements(
-                    [fx.Float32(frag[v]).to(fx.BFloat16) for v in range(8)],
-                    fx.BFloat16,
-                )
-                bst(ov, dpart, (pbase + g) * i32(16), 0, AUX_SYS)
+                fv = fx.make_view(f32_iter, fx.make_layout(8, 1)).load()
+                e8m0, w0, w1 = _quantize_group8(fv)
+                gg = gv0 + g  # global 8-group index in the part row
+                bst(fx.Int32(w0), dpart, prow + gg * i32(8), 0, AUX_SYS)
+                bst(fx.Int32(w1), dpart, prow + gg * i32(8) + i32(4), 0, AUX_SYS)
+                bst(fx.Int32(e8m0).to(fx.Int8), dpart, prow + i32(H) + gg, 0, AUX_SYS)
         # the remote part stores overlap the next chunk's cshuffle (gemm2_combine drains
         # them once at the end, before the arrives); the cptr (LDS) reads must finish
         # before the next chunk's cshuffle overwrites the C-tile.

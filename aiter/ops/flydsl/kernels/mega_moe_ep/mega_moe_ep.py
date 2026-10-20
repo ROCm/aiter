@@ -228,7 +228,11 @@ class MegaMoeEPEngine:
         self._payload = arena.reserve("payload", (tot, a_row), torch.uint8)
         self._pscale = arena.reserve("pscale", (tot, self.H // 32), torch.uint8)
         self._recv = arena.reserve("recv_le", (tot * self.K,), torch.int32)
-        self._part = arena.reserve("part", (self.mtpr * self.K, self.H), torch.bfloat16)
+        # combine partials sent fp8 per-8-blockwise (half the a2a traffic): each slot row is
+        # H fp8-e4m3 bytes then H/8 per-8 E8M0 scale bytes (co-located, one buffer).
+        self._part = arena.reserve(
+            "part", (self.mtpr * self.K, self.H + self.H // 8), torch.uint8
+        )
         self._flag = arena.reserve("flag", (FLAG_INTS,), torch.int32)
         self._out = arena.reserve("out", (self.mtpr, self.H), torch.bfloat16)
         arena.commit()

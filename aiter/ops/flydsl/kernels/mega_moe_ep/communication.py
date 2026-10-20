@@ -21,7 +21,7 @@ from __future__ import annotations
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import gpu, range_constexpr, rocdl
-from flydsl.expr.typing import T
+from flydsl.expr.typing import T, as_ir_value
 
 from .common import (
     AUX_SYS,
@@ -69,6 +69,48 @@ from .mega_moe_ep_config import (
 __all__ = ["build_communication"]
 
 
+# --- fp8 per-8 blockwise P2P codec for the combine send (halves the combine a2a traffic) ---
+# Per-8-element E8M0 + fp8-e4m3 so the quant/decode stays WITHIN the existing 8-per-lane /
+# 8-per-group combine loops (no 32-per-lane restructure -> no parallelism loss).  Finer than
+# MXFP8's 1x32, so precision is at least as good (V2 validates 1x32 fp8 P2P for a4w4).
+def _e8m0_scale(local_max):
+    working = (local_max * fx.Int32(0x3B124925).bitcast(fx.Float32)).bitcast(fx.Int32)
+    mantissa = working & fx.Int32(0x7FFFFF)
+    exponent = (working >> fx.Int32(23)) & fx.Int32(0xFF)
+    e8m0 = (mantissa != fx.Int32(0)).select(exponent + fx.Int32(1), exponent)
+    e8m0 = (e8m0 > fx.Int32(0xFF)).select(fx.Int32(0xFF), e8m0)
+    scale = ((fx.Int32(254) - e8m0) << fx.Int32(23)).bitcast(fx.Float32)
+    return e8m0, scale
+
+
+def _quantize_group8(v8):
+    """8 f32 (list or vector) -> (E8M0 exponent, 2 i32 words = 8 fp8-e4m3), one per-8 scale."""
+    local_max = fx.Float32(1e-10)
+    for i in range_constexpr(8):
+        local_max = local_max.maximumf(v8[i].maximumf(fx.Float32(0.0) - v8[i]))
+    e8m0, scale = _e8m0_scale(local_max)
+    w0 = rocdl.cvt_pk_fp8_f32(T.i32, v8[0] * scale, v8[1] * scale, fx.Int32(0), 0)
+    w0 = rocdl.cvt_pk_fp8_f32(T.i32, v8[2] * scale, v8[3] * scale, w0, 1)
+    w1 = rocdl.cvt_pk_fp8_f32(T.i32, v8[4] * scale, v8[5] * scale, fx.Int32(0), 0)
+    w1 = rocdl.cvt_pk_fp8_f32(T.i32, v8[6] * scale, v8[7] * scale, w1, 1)
+    return e8m0, w0, w1
+
+
+def _decode_group8(w0, w1, e8m0):
+    """2 i32 words (8 fp8) + E8M0 -> 8 f32 (dequantized)."""
+    scale = (fx.Int32(e8m0) << fx.Int32(23)).bitcast(fx.Float32)
+    vals = []
+    for word in (w0, w1):
+        for half in range_constexpr(2):
+            pair = fx.Vector(
+                rocdl.cvt_scalef32_pk_bf16_fp8(
+                    T.vec(2, T.bf16), as_ir_value(word), as_ir_value(scale), bool(half)
+                )
+            ).to(fx.Float32)
+            vals.extend((pair[0], pair[1]))
+    return vals
+
+
 def build_communication(kc: KernelCtx) -> dict:
     """The arena / flag / watchdog device functions of one instance (added to kc)."""
     const_expr = kc.get("const_expr")[0]
@@ -78,6 +120,7 @@ def build_communication(kc: KernelCtx) -> dict:
     ROW_BYTES = H if a8 else H // 2  # quantized activation bytes per row (FP8 vs FP4)
     N_VEC = ROW_BYTES // 16  # 16-byte (V4I) copy units per payload row
     SCALE_I32 = H // 128  # i32 E8M0-scale units per row (H//32 bytes / 4)
+    PART_RB = H + H // 8  # combine ``part`` row bytes: H fp8-e4m3 then H/8 per-8 E8M0 scale
     SENTINEL = EPR  # recv_le empty-slot marker (masked by the planner: >= EPR)
 
     # --- arena addressing --------------------------------------------------------
@@ -366,11 +409,17 @@ def build_communication(kc: KernelCtx) -> dict:
             src_tok = sk - src_rank * mtpr
             slot = src_tok * i32(TOPK) + route
             dpart = peer_rs(a, src_rank, "off_part")
-            obase = e * i32(RG * HV)  # echunk e's gout rows
+            row_v4 = (e * i32(RG) + k) * i32(HV)  # this gout row's base V4I index
+            prow = slot * i32(PART_RB)  # this slot's byte base in the fp8 part
+            # per-8 fp8: same 64-lane g-loop; each lane reads its 8 bf16, quantizes to 8 fp8
+            # (w0,w1) + 1 E8M0.  fp8/E8M0 stores are contiguous across lanes -> coalesced.
             for g_ in range(lane, i32(HV), i32(64)):
                 g = i32(g_)
-                v = bld(src_out, (obase + k * i32(HV) + g) * i32(16), 0, V4I, 0)
-                bst(v, dpart, (slot * i32(HV) + g) * i32(16), 0, AUX_SYS)
+                fv = bf16x8_to_f32(bld(src_out, (row_v4 + g) * i32(16), 0, V4I, 0))
+                e8m0, w0, w1 = _quantize_group8(fv)
+                bst(fx.Int32(w0), dpart, prow + g * i32(8), 0, AUX_SYS)
+                bst(fx.Int32(w1), dpart, prow + g * i32(8) + i32(4), 0, AUX_SYS)
+                bst(fx.Int32(e8m0).to(fx.Int8), dpart, prow + i32(H) + g, 0, AUX_SYS)
             if lane == i32(0):
                 combine_arrive(a, src_rank, parity, i32(0), i32(1), m * i32(TOPK))
         wait_vm(0)
@@ -407,14 +456,11 @@ def build_communication(kc: KernelCtx) -> dict:
                     ).bitcast(fx.Float32)
                     # drop invalid routes (their part slot was never scattered)
                     w = ((e >= i32(0)) & (e < i32(E))).select(w, fx.Float32(0.0))
-                    pv = bld(
-                        rpart,
-                        ((t * i32(TOPK) + i32(r)) * i32(HV) + g) * i32(16),
-                        0,
-                        V4I,
-                        0,
-                    )
-                    fv = bf16x8_to_f32(pv)
+                    prow = (t * i32(TOPK) + i32(r)) * i32(PART_RB)
+                    w0 = fx.Int32(bld(rpart, prow + g * i32(8), 0, T.i32, 0))
+                    w1 = fx.Int32(bld(rpart, prow + g * i32(8) + i32(4), 0, T.i32, 0))
+                    e8 = fx.Int32(bld(rpart, prow + i32(H) + g, 0, T.i8, 0)) & i32(0xFF)
+                    fv = _decode_group8(w0, w1, e8)
                     for i in range_constexpr(8):
                         acc[i] = acc[i] + w * fv[i]
                 bst(pack_bf16x8(acc), rout, (t * i32(HV) + g) * i32(16), 0, 0)
