@@ -5,10 +5,8 @@ import contextlib
 
 import pytest
 import torch
+import triton
 
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.fwd_prefill import (
-    attn_fwd,
-)
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
@@ -428,18 +426,22 @@ def test_mha_dao_ai_varlen_graph(dao_ai_impl, mha_type, default_device):
     assert diff < 1e-5, f"Graph replay vs eager max diff {diff:.6e} exceeds 1e-5"
 
 
-def _num_attn_fwd_kernels():
-    return sum(len(cache[0]) for cache in attn_fwd.fn.device_caches.values())
-
-
 @pytest.mark.parametrize("CAUSAL", [True, False])
-def test_mha_dao_ai_varlen_max_seqlen_no_recompile(dao_ai_impl, CAUSAL):
+def test_mha_dao_ai_varlen_max_seqlen_no_recompile(dao_ai_impl, monkeypatch, CAUSAL):
     """A new max sequence length in a varlen batch must not compile a new kernel."""
+    compiled = []
+    monkeypatch.setattr(
+        triton.knobs.runtime,
+        "jit_post_compile_hook",
+        lambda *, fn, **kwargs: compiled.append(fn.name),
+    )
     device = "cuda"
     dtype = torch.bfloat16
     nheads, d = 4, 64
     torch.manual_seed(0)
-    num_kernels = []
+    new_compiles = []
+    # The total lengths are not multiples of 16. Thus only the max length changes
+    # between the batches, not the divisibility specialization of the strides.
     for seqlens in ([96, 200], [300, 130], [57, 515], [1024, 33]):
         cu_seqlens = torch.tensor(
             [0, seqlens[0], sum(seqlens)], device=device, dtype=torch.int32
@@ -448,11 +450,12 @@ def test_mha_dao_ai_varlen_max_seqlen_no_recompile(dao_ai_impl, CAUSAL):
             torch.randn(sum(seqlens), nheads, d, device=device, dtype=dtype)
             for _ in range(3)
         )
+        compiled.clear()
         flash_attn_varlen_func(
             q, k, v, cu_seqlens, cu_seqlens, max(seqlens), max(seqlens), causal=CAUSAL
         )
         torch.cuda.synchronize()
-        num_kernels.append(_num_attn_fwd_kernels())
-    assert (
-        num_kernels[1:] == num_kernels[:1] * 3
-    ), f"attn_fwd compiled new kernels for new max_seqlen values: {num_kernels}"
+        new_compiles.append(compiled.count("attn_fwd"))
+    assert not any(
+        new_compiles[1:]
+    ), f"attn_fwd compiled for new max_seqlen values: {new_compiles}"
