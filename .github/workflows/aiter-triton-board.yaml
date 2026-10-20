@@ -25,10 +25,14 @@ on:
       - opened
       - reopened
       - ready_for_review
+      - converted_to_draft
       - synchronize
       - assigned
+      - unassigned
+      - labeled
+      - unlabeled
   issues:
-    types: [opened, reopened, assigned]
+    types: [opened, reopened, assigned, unassigned, labeled, unlabeled]
 
 permissions:
   contents: read
