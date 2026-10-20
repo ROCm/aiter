@@ -94,6 +94,53 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
         assert (plan.work_info.data_ptr(), plan.reduce_info.data_ptr()) == pointers
 
 
+@pytest.mark.parametrize(
+    "shape", ["page64", "nhd", "page16", "window", "head128", "rows64"]
+)
+def test_prepare_pa_decode_plan_default_budget(shape, device, tmp_path):
+    """A cache miss plans dense page-64 head-256 pipe shapes at the CU count."""
+    from aiter.ops.flydsl.pa_decode_tuning import prepare_pa_decode_plan
+
+    arch = get_gfx_runtime()
+    fp8 = torch.float8_e4m3fn if arch == "gfx950" else torch.float8_e4m3fnuz
+    page = 16 if shape == "page16" else 64
+    dim = 128 if shape == "head128" else 256
+    group = 16 if shape == "rows64" else 8
+    batch, query_length, hkv = 4, 4, 1
+    window = 4096 if shape == "window" else 0
+    pages = batch * 2
+    query = torch.zeros(
+        batch * query_length, hkv * group, dim, dtype=torch.bfloat16, device=device
+    )
+    if shape == "nhd":
+        kv = torch.zeros(pages, page, hkv, 2, dim, dtype=fp8, device=device)
+        key_cache, value_cache = kv[:, :, :, 0], kv[:, :, :, 1]
+    else:
+        key_cache = torch.zeros(
+            pages, hkv, dim // 16, page, 16, dtype=fp8, device=device
+        )
+        value_cache = torch.zeros(pages, hkv, dim, page, dtype=fp8, device=device)
+    context = torch.full((batch,), 2 * page, dtype=torch.int32, device=device)
+    table = torch.arange(pages, dtype=torch.int32, device=device).view(batch, 2)
+    plan = prepare_pa_decode_plan(
+        query,
+        key_cache,
+        value_cache,
+        context,
+        table,
+        dim**-0.5,
+        query_length,
+        compute_type=fp8,
+        key_scale=1.0,
+        value_scale=1.0,
+        sliding_window=window,
+        config_dir=tmp_path,
+    )
+    num_cu = torch.cuda.get_device_properties(device).multi_processor_count
+    one_cta_per_cu = arch == "gfx950" and shape in ("page64", "nhd")
+    assert plan.capacity == (num_cu if one_cta_per_cu else 2 * num_cu)
+
+
 def _reference(query, key, value, table, lengths, query_length, window, sinks):
     """FP32 attention over logical KV, independent of kernel Q/P rounding."""
     batch = lengths.numel()
