@@ -540,7 +540,10 @@ class KdaInputs:
 
 
 def _make_kda_inputs(
-    batch: int, seed: int = 20260728, conv_width_major: bool = False
+    batch: int,
+    seed: int = 20260728,
+    conv_width_major: bool = False,
+    state_dtype: torch.dtype = torch.float32,
 ) -> KdaInputs:
     generator = torch.Generator(device=_KDA_DEVICE).manual_seed(seed + batch)
     slots = batch + 2
@@ -576,12 +579,15 @@ def _make_kda_inputs(
         ).transpose(1, 2)
     else:
         conv_state = conv_state.view(slots, _KDA_CHANNELS, _KDA_CONV_WIDTH - 1)
-    state_storage = 0.01 * torch.randn(
-        (slots, _KDA_HEADS * _KDA_DIM * _KDA_DIM + 23),
-        dtype=torch.float32,
-        device=_KDA_DEVICE,
-        generator=generator,
-    )
+    state_storage = (
+        0.01
+        * torch.randn(
+            (slots, _KDA_HEADS * _KDA_DIM * _KDA_DIM + 23),
+            dtype=torch.float32,
+            device=_KDA_DEVICE,
+            generator=generator,
+        )
+    ).to(state_dtype)
     state = state_storage[:, : _KDA_HEADS * _KDA_DIM * _KDA_DIM].view(
         slots, _KDA_HEADS, _KDA_DIM, _KDA_DIM
     )
@@ -662,6 +668,16 @@ def _copy_kda_inputs(inputs: KdaInputs) -> KdaInputs:
 
 
 def _kda_reference(inputs: KdaInputs) -> torch.Tensor:
+    if inputs.state.dtype != torch.float32:
+        # The kernel's rounding boundary for a narrow state: widen on load,
+        # update in FP32, round to nearest-even on store.
+        stored = inputs.state
+        inputs.state = stored.float()
+        output = _kda_reference(inputs)
+        stored.copy_(inputs.state)
+        inputs.state = stored
+        return output
+
     batch = inputs.x.shape[0]
     output = torch.zeros(
         (1, batch, _KDA_HEADS, _KDA_DIM),
@@ -784,6 +800,33 @@ def _assert_kda_close(
     return err
 
 
+# Reference and kernel round the same FP32 update to BF16, but their FP32
+# values differ in the last bits, so an element that sits near a rounding tie
+# can land one BF16 ULP (at most 2**-7 relative) apart.
+_KDA_BF16_STATE_TOL = {"atol": 1e-6, "rtol": 1e-2}
+
+
+def _assert_kda_state_close(
+    reference: torch.Tensor,
+    actual: torch.Tensor,
+    msg: str,
+    tol_err_ratio: float = 0.0,
+) -> None:
+    assert actual.dtype == reference.dtype, f"{msg}: dtype {actual.dtype}"
+    if actual.dtype == torch.float32:
+        _assert_kda_close(reference, actual, _KDA_STATE_TOL, msg, tol_err_ratio)
+        return
+    _assert_kda_close(reference, actual, _KDA_BF16_STATE_TOL, msg, tol_err_ratio)
+    # One-ULP ties are rare. A store that truncates instead of rounding, or a
+    # load that misreads BF16, moves a large fraction of the bits.
+    mismatched = (
+        (reference.view(torch.int16) != actual.view(torch.int16)).float().mean()
+    ).item()
+    assert (
+        mismatched <= _TOL_ERR_RATIO
+    ), f"{msg}: {mismatched:.4%} of BF16 state bits differ from the reference"
+
+
 def _run_kda(inputs: KdaInputs, out: torch.Tensor | None = None) -> torch.Tensor:
     return flydsl_kda_decode(
         x=inputs.x,
@@ -808,6 +851,7 @@ def _make_kda_fb_inputs(
     batch: int,
     seed: int = 20260728,
     conv_width_major: bool = False,
+    state_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor, KdaInputs]:
     generator = torch.Generator(device=_KDA_DEVICE).manual_seed(seed + 10_000 + batch)
     f_a_storage = torch.randn(
@@ -826,7 +870,7 @@ def _make_kda_fb_inputs(
             generator=generator,
         )
     ).to(torch.bfloat16)
-    inputs = _make_kda_inputs(batch, seed, conv_width_major)
+    inputs = _make_kda_inputs(batch, seed, conv_width_major, state_dtype)
     projected = F.linear(
         f_a.float(),
         f_b_weight.view(_KDA_HEADS * _KDA_DIM, _KDA_DIM).float(),
@@ -883,7 +927,7 @@ def _run_kda_triton(inputs: KdaInputs, cu_seqlens: torch.Tensor) -> torch.Tensor
     ).view(1, batch, _KDA_HEADS, _KDA_DIM)
 
 
-def _kda_decode_work(batch: int, fuse_f_b: bool) -> tuple[int, int]:
+def _kda_decode_work(batch: int, fuse_f_b: bool, state: torch.Tensor) -> tuple[int, int]:
     hidden = _KDA_HEADS * _KDA_DIM
     # Per token and head, the recurrence costs about 7*K*V + 2*V FLOPs as in
     # _recurrent_decode_work; the width-4 Q/K/V convolution adds 2*W per
@@ -891,9 +935,10 @@ def _kda_decode_work(batch: int, fuse_f_b: bool) -> tuple[int, int]:
     flops = batch * _KDA_HEADS * (7 * _KDA_DIM * _KDA_DIM + 2 * _KDA_DIM)
     flops += batch * _KDA_CHANNELS * 2 * _KDA_CONV_WIDTH
     # Useful bytes: read+write both caches, read x/raw_g/beta/output gate and
-    # the shared weights once, write the BF16 output.
+    # the shared weights once, write the BF16 output. State width follows the
+    # tensor the kernel actually stores.
     nbytes = batch * (
-        2 * hidden * _KDA_DIM * 4
+        2 * hidden * _KDA_DIM * state.element_size()
         + 2 * _KDA_CHANNELS * (_KDA_CONV_WIDTH - 1) * 2
         + (_KDA_CHANNELS + 3 * hidden + _KDA_HEADS) * 2
         + 4
@@ -964,7 +1009,7 @@ def test_flydsl_kda_decode(batch, conv_layout):
             tol_err_ratio,
         )
         assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
-        flops, nbytes = _kda_decode_work(batch, fuse_f_b)
+        flops, nbytes = _kda_decode_work(batch, fuse_f_b, seed.state)
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
@@ -1003,12 +1048,154 @@ def test_flydsl_kda_decode_matches_reference(batch: int, conv_layout: str) -> No
     assert result["flydsl_f_b err"] == 0
 
 
+def _run_kda_api(
+    fused_f_b: bool,
+    f_a: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    inputs: KdaInputs,
+) -> torch.Tensor:
+    if fused_f_b:
+        return _run_kda_with_f_b(f_a, f_b_weight, inputs)
+    return _run_kda(inputs)
+
+
 @_requires_kda
+@pytest.mark.parametrize("fused_f_b", [False, True])
+@pytest.mark.parametrize("slot_layout", ["dense", "padded"])
+@pytest.mark.parametrize("conv_layout", ["channel_major", "width_major"])
+@pytest.mark.parametrize("batch", [1, 2, 8])
+def test_flydsl_kda_decode_bf16_state_matches_reference(
+    batch: int, conv_layout: str, slot_layout: str, fused_f_b: bool
+) -> None:
+    f_a, f_b_weight, seed = _make_kda_fb_inputs(
+        batch,
+        conv_width_major=conv_layout == "width_major",
+        state_dtype=torch.bfloat16,
+    )
+    if slot_layout == "dense":
+        # SGLang's --mamba-ssm-dtype bfloat16 pool: [cache, 12, 128, 128].
+        seed.state = seed.state.contiguous()
+        assert seed.state.stride() == (_KDA_HEADS * _KDA_DIM * _KDA_DIM,) + (
+            _KDA_DIM * _KDA_DIM,
+            _KDA_DIM,
+            1,
+        )
+    else:
+        assert seed.state.stride(0) == _KDA_HEADS * _KDA_DIM * _KDA_DIM + 23
+    reference_inputs = _copy_kda_inputs(seed)
+    reference = _kda_reference(reference_inputs)
+    actual_inputs = _copy_kda_inputs(seed)
+
+    actual = _run_kda_api(fused_f_b, f_a, f_b_weight, actual_inputs)
+    torch.cuda.synchronize()
+
+    _assert_kda_close(reference, actual, _KDA_OUTPUT_TOL, "output", _TOL_ERR_RATIO)
+    _assert_kda_state_close(reference_inputs.state, actual_inputs.state, "state")
+    assert actual_inputs.state.stride() == seed.state.stride()
+    assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
+    # Slot zero and the spare slot past the batch are never addressed; a store
+    # with the wrong element width or slot pitch would spill into them.
+    for slot in (0, batch + 1):
+        assert torch.equal(
+            actual_inputs.state[slot].view(torch.int16),
+            seed.state[slot].view(torch.int16),
+        )
+
+
+@_requires_kda
+@pytest.mark.parametrize("fused_f_b", [False, True])
+def test_flydsl_kda_decode_bf16_state_recurrent_sequence(fused_f_b: bool) -> None:
+    # Rounding the state to BF16 every step must not drift from a reference
+    # that rounds at the same points. A one-ULP tie feeds the next step a
+    # slightly different input, so a few elements may then sit past one ULP;
+    # the decay keeps that bounded.
+    f_a, f_b_weight, seed = _make_kda_fb_inputs(batch=2, state_dtype=torch.bfloat16)
+    reference_inputs = _copy_kda_inputs(seed)
+    actual_inputs = _copy_kda_inputs(seed)
+    for step in range(8):
+        reference = _kda_reference(reference_inputs)
+        actual = _run_kda_api(fused_f_b, f_a, f_b_weight, actual_inputs)
+        torch.cuda.synchronize()
+        _assert_kda_close(
+            reference, actual, _KDA_OUTPUT_TOL, f"step {step} output", _TOL_ERR_RATIO
+        )
+        _assert_kda_state_close(
+            reference_inputs.state,
+            actual_inputs.state,
+            f"step {step} state",
+            _TOL_ERR_RATIO,
+        )
+        assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
+
+
+@_requires_kda
+@pytest.mark.parametrize("fused_f_b", [False, True])
+@pytest.mark.parametrize("state_dtype", [torch.float16, torch.float64])
+def test_flydsl_kda_decode_rejects_unsupported_state_dtype(
+    monkeypatch: pytest.MonkeyPatch,
+    fused_f_b: bool,
+    state_dtype: torch.dtype,
+) -> None:
+    from aiter.ops.flydsl import linear_attention_kernels
+
+    def unexpected_compile(*args, **kwargs):
+        pytest.fail("Unsupported state dtypes must be rejected before compilation.")
+
+    monkeypatch.setattr(
+        linear_attention_kernels, "create_kda_decode_kernel", unexpected_compile
+    )
+    f_a, f_b_weight, inputs = _make_kda_fb_inputs(batch=1)
+    inputs.state = inputs.state.to(state_dtype)
+    with pytest.raises(ValueError, match="`state` must have dtype"):
+        _run_kda_api(fused_f_b, f_a, f_b_weight, inputs)
+
+
+@_requires_kda
+def test_flydsl_kda_decode_advertises_state_dtypes() -> None:
+    expected = (torch.float32, torch.bfloat16)
+    assert flydsl_kda_decode.state_dtypes == expected
+    assert flydsl_kda_decode_with_f_b.state_dtypes == expected
+
+
+@_requires_kda
+def test_flydsl_kda_decode_kernel_names_identify_state_dtype() -> None:
+    from torch.profiler import ProfilerActivity, profile
+
+    from aiter.ops.flydsl.kernels.gdr_decode import create_kda_decode_kernel
+
+    # FP32-state names are unchanged; a profile can tell the BF16-state build
+    # apart by its suffix.
+    expected = {
+        (False, "f32"): "kda_decode_bf16_gfx950",
+        (True, "f32"): "kda_decode_fused_projection_bf16_gfx950",
+        (False, "bf16"): "kda_decode_bf16_gfx950_bf16state",
+        (True, "bf16"): "kda_decode_fused_projection_bf16_gfx950_bf16state",
+    }
+    f_a, f_b_weight, seed = _make_kda_fb_inputs(batch=1)
+    for (fused_f_b, state_dtype), name in expected.items():
+        inputs = _copy_kda_inputs(seed)
+        if state_dtype == "bf16":
+            inputs.state = inputs.state.to(torch.bfloat16)
+        # Compile outside the profiled region.
+        _run_kda_api(fused_f_b, f_a, f_b_weight, _copy_kda_inputs(inputs))
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            _run_kda_api(fused_f_b, f_a, f_b_weight, inputs)
+            torch.cuda.synchronize()
+        names = {event.name for event in prof.events() if "kda_decode" in event.name}
+        assert names == {name}, (fused_f_b, state_dtype, names)
+    with pytest.raises(ValueError, match="unsupported KDA state dtype"):
+        create_kda_decode_kernel(_KDA_NORM_EPS, _KDA_LOWER_BOUND, False, "f16")
+
+
+@_requires_kda
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("fused_f_b", [False, True])
 def test_flydsl_kda_decode_non_positive_slots_do_not_modify_caches(
     fused_f_b: bool,
+    state_dtype: torch.dtype,
 ) -> None:
-    f_a, f_b_weight, inputs = _make_kda_fb_inputs(batch=2)
+    f_a, f_b_weight, inputs = _make_kda_fb_inputs(batch=2, state_dtype=state_dtype)
     inputs.state_indices.copy_(
         torch.tensor([0, -1], dtype=torch.int32, device=_KDA_DEVICE)
     )
@@ -1027,15 +1214,17 @@ def test_flydsl_kda_decode_non_positive_slots_do_not_modify_caches(
 
 
 @_requires_kda
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("fused_f_b", [False, True])
 def test_flydsl_kda_decode_out_of_range_slots_do_not_modify_caches(
     fused_f_b: bool,
+    state_dtype: torch.dtype,
 ) -> None:
     batch = 4
     if fused_f_b:
-        f_a, f_b_weight, inputs = _make_kda_fb_inputs(batch)
+        f_a, f_b_weight, inputs = _make_kda_fb_inputs(batch, state_dtype=state_dtype)
     else:
-        inputs = _make_kda_inputs(batch)
+        inputs = _make_kda_inputs(batch, state_dtype=state_dtype)
     # Give the recurrent pool fewer slots than the convolution pool so the
     # bound must come from the smaller of the two caches.
     state_slots = inputs.state.shape[0] - 2
@@ -1080,7 +1269,7 @@ def _move_kda_to_large_caches(
     )
     state = torch.zeros(
         (slots, _KDA_HEADS, _KDA_DIM, _KDA_DIM),
-        dtype=torch.float32,
+        dtype=inputs.state.dtype,
         device=_KDA_DEVICE,
     )
     for batch_idx, slot in enumerate(slot_indices):
@@ -1099,17 +1288,21 @@ def _move_kda_to_large_caches(
 
 
 @_requires_kda
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("fused_f_b", [False, True])
-def test_flydsl_kda_decode_large_cache_slot_offsets(fused_f_b: bool) -> None:
-    # 11,000 [12, 128, 128] FP32 slots cross 2**31 elements of state, and a
-    # 2**18-element BF16 conv slot stride crosses 2**32 bytes past slot 8,192.
+def test_flydsl_kda_decode_large_cache_slot_offsets(
+    fused_f_b: bool, state_dtype: torch.dtype
+) -> None:
+    # 11,000 [12, 128, 128] slots cross 2**31 elements (FP32) or 2**32 bytes
+    # (BF16) of state, and a 2**18-element BF16 conv slot stride crosses
+    # 2**32 bytes past slot 8,192.
     slots = 11_000
     slot_indices = (5_500, 10_999)
     batch = len(slot_indices)
     if fused_f_b:
-        f_a, f_b_weight, seed = _make_kda_fb_inputs(batch)
+        f_a, f_b_weight, seed = _make_kda_fb_inputs(batch, state_dtype=state_dtype)
     else:
-        seed = _make_kda_inputs(batch)
+        seed = _make_kda_inputs(batch, state_dtype=state_dtype)
     reference_inputs = _copy_kda_inputs(seed)
     actual_inputs = _move_kda_to_large_caches(
         seed,
@@ -1128,10 +1321,9 @@ def test_flydsl_kda_decode_large_cache_slot_offsets(fused_f_b: bool) -> None:
     _assert_kda_close(reference, actual, _KDA_OUTPUT_TOL, "output")
     for batch_idx, slot in enumerate(slot_indices):
         small_slot = int(reference_inputs.state_indices[batch_idx])
-        _assert_kda_close(
+        _assert_kda_state_close(
             reference_inputs.state[small_slot],
             actual_inputs.state[slot],
-            _KDA_STATE_TOL,
             "state",
         )
         assert torch.equal(

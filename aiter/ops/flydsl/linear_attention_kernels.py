@@ -1081,6 +1081,9 @@ _KDA_HEADS = 12
 _KDA_DIM = 128
 _KDA_CONV_CHANNELS = 3 * _KDA_HEADS * _KDA_DIM
 _KDA_CONV_WIDTH = 4
+# Recurrent-state storage the KDA kernels accept, with the kernel's dtype tag.
+# The recurrence computes in FP32 for either.
+_KDA_STATE_DTYPES = {torch.float32: "f32", torch.bfloat16: "bf16"}
 _INT32_MAX = 2**31 - 1
 
 
@@ -1283,8 +1286,11 @@ def _validate_kda_inputs(
         raise ValueError(
             f"`state` must have shape [cache, 12, 128, 128], got {list(state.shape)}."
         )
-    if state.dtype != torch.float32:
-        raise ValueError("`state` must have dtype torch.float32.")
+    if state.dtype not in _KDA_STATE_DTYPES:
+        raise ValueError(
+            "`state` must have dtype torch.float32 or torch.bfloat16, "
+            f"got {state.dtype}."
+        )
     _check_dense_cache_slots("state", state, ((_KDA_DIM * _KDA_DIM, _KDA_DIM, 1),))
     _check_tensor(
         "raw_beta",
@@ -1393,6 +1399,9 @@ def flydsl_kda_decode(
 
     Requires gfx950, 12 heads, and 128-dim state (Kimi-K3 TP8). Check
     :func:`is_flydsl_kda_decode_supported` before dispatch.
+    ``state`` may be stored as FP32 or BF16. The recurrence always computes
+    in FP32: a BF16 state is widened on load and rounded to nearest-even BF16
+    on store, so it does not reproduce an FP32 state bit-for-bit.
     Strides and byte spans must fit non-negative int32 buffer addressing,
     except cache slot strides, which are rebased in int64.
     Both caches require dense inner dimensions and non-overlapping slots;
@@ -1448,6 +1457,7 @@ def flydsl_kda_decode(
         float(norm_eps),
         float(lower_bound),
         fuse_f_b=False,
+        state_dtype=_KDA_STATE_DTYPES[state.dtype],
     )
     with torch.cuda.device(device):
         stream = torch.cuda.current_stream(device)
@@ -1507,7 +1517,8 @@ def flydsl_kda_decode_with_f_b(
 
     Projects ``f_a`` with ``f_b_weight`` in FP32, then rounds once to BF16
     before the lower-bound decay gate, without storing raw-g in global memory.
-    Uses the same int32 stride/span limits as :func:`flydsl_kda_decode`.
+    Uses the same int32 stride/span limits and FP32-or-BF16 ``state`` storage
+    as :func:`flydsl_kda_decode`.
     ``state_indices`` follows the same bounded, unique-live-slot contract as
     :func:`flydsl_kda_decode`.
     """
@@ -1560,6 +1571,7 @@ def flydsl_kda_decode_with_f_b(
         float(norm_eps),
         float(lower_bound),
         fuse_f_b=True,
+        state_dtype=_KDA_STATE_DTYPES[state.dtype],
     )
     with torch.cuda.device(device):
         stream = torch.cuda.current_stream(device)
@@ -1598,3 +1610,9 @@ def flydsl_kda_decode_with_f_b(
             stream,
         )
     return out
+
+
+# Lets callers such as SGLang's dispatch probe which recurrent-state dtypes a
+# given build accepts before routing a cache to it.
+flydsl_kda_decode.state_dtypes = tuple(_KDA_STATE_DTYPES)
+flydsl_kda_decode_with_f_b.state_dtypes = tuple(_KDA_STATE_DTYPES)

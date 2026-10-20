@@ -1355,7 +1355,9 @@ _KDA_V_ITERS = _KDA_DIM // _KDA_V_GROUP_TILE
 _KDA_K_SHUFFLE_OFFSETS = (1, 2, 4)
 _KDA_PROJECTION_VECTOR = 4
 _KDA_PROJECTION_ITERS = _KDA_DIM // _KDA_PROJECTION_VECTOR
-_KDA_SPECIALIZATION_CACHE_SIZE = 8
+_KDA_SPECIALIZATION_CACHE_SIZE = 16
+# Recurrent-state storage dtypes. The recurrence always computes in FP32.
+_KDA_STATE_DTYPES = {"f32": fx.Float32, "bf16": fx.BFloat16}
 
 
 def _kda_one_plus_exp_neg(x):
@@ -1378,14 +1380,34 @@ def _kda_vector_sum(vec):
 
 
 # Each entry holds a JIT launcher and compiled module; keep only a few
-# (norm_eps, lower_bound, fuse_f_b) specializations alive.
+# (norm_eps, lower_bound, fuse_f_b, state_dtype) specializations alive.
 @functools.lru_cache(maxsize=_KDA_SPECIALIZATION_CACHE_SIZE)
-def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool):
+def create_kda_decode_kernel(
+    norm_eps: float, lower_bound: float, fuse_f_b: bool, state_dtype: str
+):
     """Build the fixed gfx950 BF16 KDA decode specialization.
 
     With ``fuse_f_b``, the kernel computes the head-local ``f_b`` projection
     instead of reading a precomputed raw gate from global memory.
+
+    ``state_dtype`` is the recurrent-state storage, ``"f32"`` or ``"bf16"``.
+    A BF16 state is widened to FP32 on load and rounded back on store; the
+    recurrence itself always runs in FP32.
     """
+    if state_dtype not in _KDA_STATE_DTYPES:
+        raise ValueError(
+            f"unsupported KDA state dtype {state_dtype!r}; "
+            f"expected one of {sorted(_KDA_STATE_DTYPES)}"
+        )
+    f32_state = state_dtype == "f32"
+    state_num = _KDA_STATE_DTYPES[state_dtype]
+    state_bytes = state_num.width // 8
+    name_suffix = "" if f32_state else f"_{state_dtype}state"
+    # 16-byte state transactions. fp32 is already f32x4. bf16 uses bf16x8 so
+    # the same 8-lane K group covers the row in two iterations.
+    values_per_thread_k = 4 if f32_state else 8
+    warp_tile_k = _KDA_WARP_THREADS_K * values_per_thread_k
+    k_iters = _KDA_DIM // warp_tile_k
 
     @fx.struct
     class SharedStorage:
@@ -1469,9 +1491,11 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
         )
         state = GTensor(
             state_mem,
-            dtype=T.f32,
+            dtype=state_num.ir_type,
             shape=(-1,),
-            static_bytes_offset_i64=state_slot * stride_state_slot * fx.Int64(4),
+            static_bytes_offset_i64=state_slot
+            * stride_state_slot
+            * fx.Int64(state_bytes),
         )
 
         if const_expr(fuse_f_b):
@@ -1544,12 +1568,14 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
 
         def recurrent_update():
             # Four waves split V into 32-row groups. Eight-lane subgroups
-            # reduce K; each lane issues one aligned f32x4 state transaction.
-            k_vec_start = lane_k * _KDA_VALUES_PER_THREAD_K
+            # reduce K. Each lane's state transaction is 16 bytes: f32x4, or
+            # bf16x8.
+            k_vec_start = lane_k * values_per_thread_k
             global_v_start = warp * _KDA_WARP_THREADS_V + lane // _KDA_WARP_THREADS_K
-            vec_f32 = T.vec(_KDA_VALUES_PER_THREAD_K, T.f32)
-            vec_bf16 = T.vec(_KDA_VALUES_PER_THREAD_K, T.bf16)
-            zero_vec = fx.Vector.filled(_KDA_VALUES_PER_THREAD_K, 0.0, fx.Float32)
+            vec_f32 = T.vec(values_per_thread_k, T.f32)
+            vec_bf16 = T.vec(values_per_thread_k, T.bf16)
+            vec_state = T.vec(values_per_thread_k, state_num.ir_type)
+            zero_vec = fx.Vector.filled(values_per_thread_k, 0.0, fx.Float32)
 
             q_vecs = []
             k_vecs = []
@@ -1558,8 +1584,8 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
             sum_k_partial = fx.Float32(0.0)
             a = fx.math.exp2(fx.Float32(A_log[head]) * fx.Float32(_LOG2E))
 
-            for ki in range_constexpr(_KDA_K_ITERS):
-                k_base = k_vec_start + ki * _KDA_WARP_TILE_K
+            for ki in range_constexpr(k_iters):
+                k_base = k_vec_start + ki * warp_tile_k
                 q_f32 = fx.ptr_load(q_lds + k_base, result_type=vec_bf16).extf(vec_f32)
                 k_f32 = fx.ptr_load(k_lds + k_base, result_type=vec_bf16).extf(vec_f32)
                 q_vecs.append(q_f32)
@@ -1573,11 +1599,16 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
                 else:
                     gate_bf16 = raw_g.vec_load(
                         (batch * stride_g_token + head * _KDA_DIM + k_base,),
-                        _KDA_VALUES_PER_THREAD_K,
+                        values_per_thread_k,
                     )
-                dt = dt_bias.vec_load(
-                    (head * _KDA_DIM + k_base,), _KDA_VALUES_PER_THREAD_K
-                )
+                # dt_bias is fp32, so a 16-byte transaction is f32x4. A bf16x8
+                # K vector is two of those.
+                if const_expr(values_per_thread_k == 8):
+                    dt_lo = dt_bias.vec_load((head * _KDA_DIM + k_base,), 4)
+                    dt_hi = dt_bias.vec_load((head * _KDA_DIM + k_base + 4,), 4)
+                    dt = dt_lo.shuffle(dt_hi, [0, 1, 2, 3, 4, 5, 6, 7])
+                else:
+                    dt = dt_bias.vec_load((head * _KDA_DIM + k_base,), 4)
                 gate = _kda_sigmoid((gate_bf16.extf(vec_f32) + dt) * a, lower_bound)
                 decay_vecs.append(fx.math.exp2(gate * fx.Float32(_LOG2E)))
 
@@ -1588,12 +1619,12 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
             inv_q = fx.math.rsqrt(norm_q + fx.Float32(1e-6))
             inv_k = fx.math.rsqrt(norm_k + fx.Float32(1e-6))
 
-            for ki in range_constexpr(_KDA_K_ITERS):
+            for ki in range_constexpr(k_iters):
                 q_vecs[ki] = q_vecs[ki] * inv_q * fx.Float32(_KDA_SCALE)
                 k_vecs[ki] = k_vecs[ki] * inv_k
 
             dot_kq_vec = zero_vec
-            for ki in range_constexpr(_KDA_K_ITERS):
+            for ki in range_constexpr(k_iters):
                 dot_kq_vec = fx.math.fma(k_vecs[ki], q_vecs[ki], dot_kq_vec)
             dot_kq = _kda_k_group_sum(_kda_vector_sum(dot_kq_vec))
 
@@ -1603,19 +1634,20 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
             state_vecs = []
             for vi in range_constexpr(_KDA_V_ITERS):
                 global_v = global_v_start + vi * _KDA_V_GROUP_TILE
-                for ki in range_constexpr(_KDA_K_ITERS):
-                    k_base = k_vec_start + ki * _KDA_WARP_TILE_K
+                for ki in range_constexpr(k_iters):
+                    k_base = k_vec_start + ki * warp_tile_k
                     state_off = state_head_base + global_v * _KDA_DIM + k_base
-                    state_vecs.append(
-                        state.vec_load((state_off,), _KDA_VALUES_PER_THREAD_K)
-                    )
+                    state_vec = state.vec_load((state_off,), values_per_thread_k)
+                    if const_expr(not f32_state):
+                        state_vec = state_vec.extf(vec_f32)
+                    state_vecs.append(state_vec)
 
             for vi in range_constexpr(_KDA_V_ITERS):
                 global_v = global_v_start + vi * _KDA_V_GROUP_TILE
                 sum_hk_vec = zero_vec
                 sum_hq_vec = zero_vec
-                for ki in range_constexpr(_KDA_K_ITERS):
-                    state_pos = vi * _KDA_K_ITERS + ki
+                for ki in range_constexpr(k_iters):
+                    state_pos = vi * k_iters + ki
                     decayed = state_vecs[state_pos] * decay_vecs[ki]
                     state_vecs[state_pos] = decayed
                     sum_hk_vec = fx.math.fma(decayed, k_vecs[ki], sum_hk_vec)
@@ -1628,16 +1660,16 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
                 v_new = (conv_v - sum_hk) * beta
                 v_new = fx.shuffle_idx(v_new, subgroup_leader, _KDA_WARP_SIZE)
                 recurrent_value = sum_hq + v_new * dot_kq
-                v_new_vec = fx.Vector.filled(
-                    _KDA_VALUES_PER_THREAD_K, v_new, fx.Float32
-                )
+                v_new_vec = fx.Vector.filled(values_per_thread_k, v_new, fx.Float32)
 
-                for ki in range_constexpr(_KDA_K_ITERS):
-                    state_pos = vi * _KDA_K_ITERS + ki
+                for ki in range_constexpr(k_iters):
+                    state_pos = vi * k_iters + ki
                     updated = fx.math.fma(k_vecs[ki], v_new_vec, state_vecs[state_pos])
-                    k_base = k_vec_start + ki * _KDA_WARP_TILE_K
+                    if const_expr(not f32_state):
+                        updated = updated.truncf(vec_state)
+                    k_base = k_vec_start + ki * warp_tile_k
                     state_off = state_head_base + global_v * _KDA_DIM + k_base
-                    state.vec_store((state_off,), updated, _KDA_VALUES_PER_THREAD_K)
+                    state.vec_store((state_off,), updated, values_per_thread_k)
 
                 if lane_k == 0:
                     fx.ptr_store(fx.BFloat16(recurrent_value), out_lds + global_v)
@@ -1690,7 +1722,7 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
     if fuse_f_b:
 
         @flyc.kernel(
-            name="kda_decode_fused_projection_bf16_gfx950",
+            name=f"kda_decode_fused_projection_bf16_gfx950{name_suffix}",
             known_block_size=[_KDA_BLOCK_THREADS, 1, 1],
         )
         def kernel(
@@ -1831,7 +1863,7 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
     else:
 
         @flyc.kernel(
-            name="kda_decode_bf16_gfx950",
+            name=f"kda_decode_bf16_gfx950{name_suffix}",
             known_block_size=[_KDA_BLOCK_THREADS, 1, 1],
         )
         def kernel(
