@@ -42,12 +42,12 @@ def reference(q, kv, idx, sm_scale, rows):
         k = kv[idx[t].clamp(0, kv.shape[0] - 1).long(), 0, :DIM].float()
         s = (q[t].float() @ k.T) * sm_scale
         s[:, ~valid] = -float("inf")
-        out.append(torch.softmax(s, -1) @ k)
+        out.append(torch.softmax(s, -1).nan_to_num() @ k)
     return torch.stack(out)
 
 
 def rel_err(out, ref):
-    return ((out.float() - ref).norm() / ref.norm()).item()
+    return ((out.float() - ref).norm() / ref.norm().clamp_min(1e-12)).item()
 
 
 @perftest()
@@ -62,7 +62,7 @@ def test_case(T, topk_real, topk, row_bytes=576, num_slots=16384):
     out, us = run(q, kv, idx, sm_scale)
     rows = list(range(0, T, max(1, T // 16)))[:16]
     err = rel_err(out[rows], reference(q, kv, idx, sm_scale, rows))
-    ok = err < TOL and not torch.isnan(out).any()
+    ok = err < TOL and torch.isfinite(out).all().item()
     aiter.logger.info(
         f"hk_sparse_mla T={T:6d} topk={topk:4d} row={row_bytes}B: rel err {err:.4f} {us:8.1f} us  "
         f"{'ok' if ok else 'FAIL'}"
@@ -110,55 +110,139 @@ def test_large_pool():
 
 def test_rejects():
     q, kv, idx = make_inputs(4, 1024, 2048, 2048, 576)
-    ok = True
-    for bad in (
+    alias_out = (
+        kv.view(torch.uint8)
+        .flatten()[: q.numel() * 2]
+        .view(torch.bfloat16)
+        .view(q.shape)
+    )
+    bad_calls = [
+        lambda: hk_sparse_mla_fwd(q, kv, idx[:, :0], 1.0),
         lambda: hk_sparse_mla_fwd(
             q, kv, torch.zeros(4, 2432, dtype=torch.int32, device="cuda"), 1.0
         ),
         lambda: hk_sparse_mla_fwd(q[:, :16], kv, idx, 1.0),
-    ):
+        lambda: hk_sparse_mla_fwd(q, kv.to(torch.float8_e4m3fnuz), idx, 1.0),
+        lambda: hk_sparse_mla_fwd(q, kv[:0], idx, 1.0),
+        lambda: hk_sparse_mla_fwd(q, kv[..., 1:], idx, 1.0),
+        lambda: hk_sparse_mla_fwd(q, kv.expand(-1, 2, -1), idx, 1.0),
+        lambda: hk_sparse_mla_fwd(q, kv, idx.float(), 1.0),
+        lambda: hk_sparse_mla_fwd(q, kv, idx, 1.0, out=alias_out),
+        lambda: hk_sparse_mla_fwd(
+            q, kv, idx, 1.0, out=torch.empty(q.shape, dtype=torch.bfloat16)
+        ),
+    ]
+    for scale in (0.0, -1.0, float("nan"), float("inf")):
+        bad_calls.append(lambda scale=scale: hk_sparse_mla_fwd(q, kv, idx, scale))
+    for index in range(3):
+        args = [q, kv, idx]
+        args[index] = args[index].cpu()
+        bad_calls.append(lambda args=args: hk_sparse_mla_fwd(*args, 1.0))
+    ok = True
+    for bad in bad_calls:
         try:
             bad()
             ok = False
         except ValueError:
             pass
+    aiter.logger.info(f"hk_sparse_mla rejects invalid inputs: {'ok' if ok else 'FAIL'}")
+    return ok
+
+
+def test_replay():
+    ok = True
+    for T in (1, 32, 512):
+        q, kv, idx = make_inputs(T, 1024, 2048, 2051, 576)
+        original = idx.clone()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            hk_sparse_mla_fwd(q, kv, idx, DIM**-0.5)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            out = hk_sparse_mla_fwd(q, kv, idx, DIM**-0.5)
+        rows = list(range(0, T, max(1, T // 8)))[:8]
+        for mode in ("random", "empty", "one", "out_of_pool", "random"):
+            if mode == "random":
+                idx.copy_(original)
+            elif mode == "empty":
+                idx.fill_(-1)
+            elif mode == "one":
+                idx.fill_(-1)
+                idx[:, -1] = 0
+            else:
+                idx.fill_(2**31 - 1)
+            q.copy_((torch.randn_like(q, dtype=torch.float32) * 0.4).to(FP8))
+            graph.replay()
+            first = out.clone()
+            graph.replay()
+            ref = reference(q, kv, idx, DIM**-0.5, rows)
+            err = rel_err(out[rows], ref)
+            passed = (
+                err < TOL
+                and torch.isfinite(out).all().item()
+                and torch.equal(first, out)
+            )
+            ok = ok and passed
+            aiter.logger.info(
+                f"hk_sparse_mla graph T={T} {mode}: rel err {err:.4f} {'ok' if passed else 'FAIL'}"
+            )
+    return ok
+
+
+def test_int64_ids_and_empty():
+    q, kv, idx = make_inputs(8, 1024, 128, 128, 512)
+    long_ids = idx.long()
+    long_ids[:, ::2] = 2**32
+    long_ids[:, 1::4] = -(2**32)
+    masked = idx.clone()
+    masked[:, ::2] = -1
+    masked[:, 1::4] = -1
+    expected = hk_sparse_mla_fwd(q, kv, masked, DIM**-0.5)
+    actual = hk_sparse_mla_fwd(q, kv, long_ids, DIM**-0.5)
+    empty = hk_sparse_mla_fwd(q[:0], kv, idx[:0], DIM**-0.5)
+    ok = torch.equal(expected, actual) and empty.shape == q[:0].shape
     aiter.logger.info(
-        f"hk_sparse_mla rejects unsupported shapes: {'ok' if ok else 'FAIL'}"
+        f"hk_sparse_mla int64 masking and empty input: {'ok' if ok else 'FAIL'}"
     )
     return ok
 
 
-parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawTextHelpFormatter,
-    description="HipKittens sparse MLA (DSA) forward: correctness vs fp32 and timing",
-)
-parser.add_argument(
-    "-t", "--tokens", type=int, nargs="*", default=None, help="Query tokens"
-)
-parser.add_argument(
-    "--no-large-pool", action="store_true", help="skip the 5 GiB pool case"
-)
-args = parser.parse_args()
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="HipKittens sparse MLA (DSA) forward: correctness vs fp32 and timing",
+    )
+    parser.add_argument(
+        "-t", "--tokens", type=int, nargs="*", default=None, help="Query tokens"
+    )
+    parser.add_argument(
+        "--no-large-pool", action="store_true", help="skip the 5 GiB pool case"
+    )
+    args = parser.parse_args()
 
-if aiter.get_gfx() != "gfx950":
-    print(f"Skipping test_hk_sparse_mla.py: requires gfx950, got {aiter.get_gfx()}")
-    sys.exit(0)
+    if aiter.get_gfx() != "gfx950":
+        print(f"Skipping test_hk_sparse_mla.py: requires gfx950, got {aiter.get_gfx()}")
+        sys.exit(0)
 
-if args.tokens:
-    results = [test_case(T, 2048, 2048) for T in args.tokens]
-else:
-    results = [
-        test_case(1, 2048, 2048),  # decode: split-K + combine
-        test_case(8, 2048, 2048),
-        test_case(32, 2048, 2051),  # kpool tail, padded to a 128 multiple by the op
-        test_case(128, 2048, 2048),
-        test_case(512, 2048, 2048),  # no split
-        test_case(4096, 2048, 2176),
-        test_case(16384, 2048, 2048, row_bytes=512),  # prefill, dense rows
-        test_case(64, 1024, 1024),  # short context
-        test_out_of_pool_slots_masked(),
-        test_rejects(),
-    ]
-    if not args.no_large_pool:
-        results.append(test_large_pool())
-sys.exit(0 if all(results) else 1)
+    if args.tokens:
+        results = [test_case(T, 2048, 2048) for T in args.tokens]
+    else:
+        results = [
+            test_case(1, 2048, 2048),  # decode: split-K + combine
+            test_case(8, 2048, 2048),
+            test_case(32, 2048, 2051),  # kpool tail, padded to a 128 multiple by the op
+            test_case(128, 2048, 2048),
+            test_case(512, 2048, 2048),  # no split
+            test_case(4096, 2048, 2176),
+            test_case(16384, 2048, 2048, row_bytes=512),  # prefill, dense rows
+            test_case(64, 1024, 1024),  # short context
+            test_out_of_pool_slots_masked(),
+            test_rejects(),
+            test_replay(),
+            test_int64_ids_and_empty(),
+        ]
+        if not args.no_large_pool:
+            results.append(test_large_pool())
+    sys.exit(0 if all(results) else 1)

@@ -60,22 +60,29 @@ Any other head count or latent size is not supported, so callers fall back to an
 - Registers: the forward kernel uses 195 VGPR with no spills (1 workgroup per CU); the combine kernel uses 175 VGPR.
   Check with `hipcc ... --cuda-device-only -S` (see the MoE README for the flags).
 
-## Performance (MI355X, one GPU, topk 2048)
-
-| case | HK | TileLang (SGLang ROCm default) | B300 (FlashMLA sparse) |
-|---|---|---|---|
-| 16k-token prefill, per layer | 2.78 ms | 8.52 ms | ~3.6 ms |
-| 9k extend on a 90k prefix, per layer | 1.66 ms | 5.01 ms | ~2.1 ms |
-| decode, 8 rows | 18 us | 22 us | |
-| decode, 128 rows | 38 us | 110 us | |
-| decode, 512 rows | 96 us | 354 us | |
-
-HK times use cold caches (rotated input copies). End to end in SGLang (GLM-5.3-Flash FP8, TP2), measured with the
-earlier 4-wave flat-LDS version of this kernel (3.66 ms at 16k): uncached 16k-64k prefills are 8.5-9% faster than with
-TileLang, and the decode-heavy benchmark at concurrency 16 gains +17% throughput.
-
 ## Build and test
 
 aiter JIT-builds the module on first use, with HipKittens headers from `HIP_KITTENS_DIR` (fetched at the pinned
 commit by default). `op_tests/test_hk_sparse_mla.py` checks against an fp32 reference: prefill and split-K decode,
 masked keys, padded top-k, slots past the pool and a pool past 4 GiB.
+
+Run `python op_tests/test_hk_sparse_mla.py` on gfx950. The suite also checks changed-input graph
+replay, fully masked rows, int64 indices outside the int32 range, empty query batches, and invalid inputs.
+
+All tensors must be on the same gfx950 device. KV uses OCP `float8_e4m3fn`; FNUZ is not supported.
+The Python wrapper accepts floating-point Q and casts it to OCP FP8. KV can be `[N, D]` or have
+singleton dimensions between N and D. The softmax scale must be finite and positive. Output must
+be contiguous, 16-byte aligned, and use separate storage from the inputs. Warm the JIT before capture.
+
+## Compare with current AITER
+
+```bash
+python op_tests/op_benchmarks/bench_hk_sparse_mla.py --output /tmp/hk-sparse-benchmark.json
+```
+
+The benchmark tests FP8 and BF16 compute and the default split count plus 1, 2, 4, 8, 16 and 32.
+It checks accuracy before selecting candidates, then confirms the fastest candidates and both defaults
+with two fresh input seeds. Cases cover 1 to 16384 queries and 8 MiB / 5 GiB KV pools. All selected
+slots are valid, so AITER can use its asynchronous LDS path. HK pads its index rows inside the call.
+A 512 MiB buffer evicts cache data before each timed one-call HIP graph replay; eviction is not timed.
+Raw samples, rejected candidates and correctness results are saved in JSON.

@@ -7,14 +7,14 @@ K and V. Built for 32 heads per GPU x 512 latent dims (no RoPE part), fp8 q / kv
 fp8(P * 448), the TileLang kernel's numerics), up to 2304 indices per token.
 """
 
+import math
+
 import torch
 import torch.nn.functional as F
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_gfx
 
 HEADS, DIM, MAX_TOPK, KEY_BLOCK = 32, 512, 2304, 128
-_FP8 = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
 
 
 @compile_ops(
@@ -58,31 +58,75 @@ def hk_sparse_mla_fwd(
     keys and merges the partials; their workspace comes from torch's caching allocator, so the call is
     graph-capturable.
     """
-    if get_gfx() != "gfx950":
-        raise RuntimeError(f"hk_sparse_mla_fwd requires gfx950, running on {get_gfx()}")
-    if kv.dtype not in _FP8 or kv.dim() < 2 or kv.shape[-1] < DIM or kv.stride(-1) != 1:
+    if not q.is_cuda:
+        raise ValueError("hk_sparse_mla_fwd: q must be on a HIP device")
+    for name, tensor in (("kv", kv), ("indices", indices), ("out", out)):
+        if tensor is not None and tensor.device != q.device:
+            raise ValueError(f"hk_sparse_mla_fwd: {name} must be on {q.device}")
+    arch = getattr(
+        torch.cuda.get_device_properties(q.device), "gcnArchName", "unknown"
+    ).split(":")[0]
+    if arch != "gfx950":
+        raise RuntimeError(f"hk_sparse_mla_fwd requires gfx950, running on {arch}")
+    if (
+        kv.dtype != torch.float8_e4m3fn
+        or kv.dim() < 2
+        or kv.shape[-1] < DIM
+        or kv.stride(-1) != 1
+        or math.prod(kv.shape[1:-1]) != 1
+        or not 1 <= kv.shape[0] < 2**31
+        or kv.stride(0) < DIM
+        or kv.stride(0) % 16
+        or kv.data_ptr() % 16
+    ):
         raise ValueError(
-            f"hk_sparse_mla_fwd: kv must be fp8 e4m3 [N, ..., >= {DIM}] with contiguous rows"
+            f"hk_sparse_mla_fwd: kv must be OCP fp8 e4m3 [N, ..., >= {DIM}] with singleton middle dimensions, "
+            "1 <= N < 2^31, contiguous latent rows and 16-byte-aligned base/row stride"
         )
+    if not math.isfinite(sm_scale) or sm_scale <= 0:
+        raise ValueError("hk_sparse_mla_fwd: sm_scale must be finite and positive")
+    if not q.is_floating_point():
+        raise ValueError("hk_sparse_mla_fwd: q must have a floating-point dtype")
     q = q.to(kv.dtype).contiguous()
+    if q.data_ptr() % 16:
+        q = q.clone()
     if q.dim() != 3 or q.shape[1] != HEADS or q.shape[2] != DIM:
         raise ValueError(
             f"hk_sparse_mla_fwd: q must be [T, {HEADS}, {DIM}], got {tuple(q.shape)}"
         )
     T = q.shape[0]
-    if indices.dim() != 2 or indices.shape[0] != T:
+    if (
+        indices.dim() != 2
+        or indices.shape[0] != T
+        or indices.dtype not in (torch.int32, torch.int64)
+        or not 1 <= indices.shape[1] <= MAX_TOPK
+    ):
         raise ValueError(
-            f"hk_sparse_mla_fwd: indices must be [T, topk], got {tuple(indices.shape)}"
+            f"hk_sparse_mla_fwd: indices must be int32/int64 [T, topk], 1 <= topk <= {MAX_TOPK}, got {tuple(indices.shape)}"
         )
     if out is None:
         out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
-    elif out.shape != q.shape or out.dtype != torch.bfloat16 or not out.is_contiguous():
+    elif (
+        out.shape != q.shape
+        or out.dtype != torch.bfloat16
+        or not out.is_contiguous()
+        or out.data_ptr() % 16
+    ):
         raise ValueError(
             f"hk_sparse_mla_fwd: out must be a contiguous bf16 [T, {HEADS}, {DIM}] tensor"
         )
+    if out.numel() and any(
+        torch._C._overlaps(out, tensor) for tensor in (q, kv, indices)
+    ):
+        raise ValueError("hk_sparse_mla_fwd: out must not overlap any input storage")
     if T == 0:
         return out
-    idx = indices.to(torch.int32)
+    # Preserve masking for int64 IDs outside the int32 address range.
+    idx = (
+        indices.clamp(-1, kv.shape[0]).to(torch.int32)
+        if indices.dtype == torch.int64
+        else indices
+    )
     pad = -idx.shape[1] % KEY_BLOCK
     if pad:
         idx = F.pad(idx, (0, pad), value=-1)
