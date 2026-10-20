@@ -6,6 +6,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <memory>
+#include <numeric>
 #include <tuple>
 
 struct __attribute__((packed)) KernelArgs
@@ -75,6 +76,7 @@ class FMoeKernel
     uint32_t sub_GU             = 512;
     bool is_int4                = false;
     uint32_t num_persistent_tgs = 0;
+    uint32_t tgs_align          = 1;
     const char* name            = nullptr;
     // flat_mode: 0 = host-sorted, 1 = flat one-token-per-TG grid, 2 = emsort persistent grid
     int flat_mode = 0;
@@ -84,10 +86,12 @@ class FMoeKernel
                const char* hsaco,
                uint32_t sub_GU             = 512,
                uint32_t num_persistent_tgs = 0,
-               int flat_mode               = 0) : kernel(name, hsaco)
+               int flat_mode               = 0,
+               uint32_t tgs_align          = 1) : kernel(name, hsaco)
     {
         this->sub_GU             = sub_GU;
         this->num_persistent_tgs = num_persistent_tgs;
+        this->tgs_align          = std::max(tgs_align, 1u);
         this->name               = name;
         this->flat_mode          = flat_mode;
     };
@@ -181,7 +185,10 @@ class FMoeKernel
         args.eSMQs     = stride_expert_SMTDQN;
         args.topk      = topk;
         args.ps_deno   = ((inter_dim + sub_GU - 1) / sub_GU);
-        args.total_tgs = this->num_persistent_tgs / args.ps_deno * args.ps_deno;
+        // Kernels that remap workgroups across XCDs need total_tgs to also be a
+        // multiple of tgs_align (the XCD count), or the remap skips work.
+        const uint32_t tgs_unit = std::lcm(args.ps_deno, this->tgs_align);
+        args.total_tgs          = this->num_persistent_tgs / tgs_unit * tgs_unit;
 
         int bdx;
         int gdx;
@@ -365,7 +372,8 @@ FMoeKernel* get_heuristic_kernel(int inter_dim,
             num_persistent_tgs = 0;
 
         impl_ptr = &impl_ptr_map.get_or_create(name, [&]() {
-            return FMoeKernel(name, co_name, cfg.subGU_n, num_persistent_tgs, cfg.flat);
+            return FMoeKernel(
+                name, co_name, cfg.subGU_n, num_persistent_tgs, cfg.flat, cfg.tgs_align);
         });
     }
     else
