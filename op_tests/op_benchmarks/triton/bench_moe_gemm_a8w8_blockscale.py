@@ -10,6 +10,10 @@ from pathlib import Path
 import torch
 import triton.profiler as proton
 
+from op_tests.op_benchmarks.triton.proton_visible_devices import (
+    proton_visible_devices,
+)
+
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_a8w8_blockscale import (
     moe_gemm_a8w8_blockscale,
@@ -222,7 +226,8 @@ def bench_mlp_single_weight_init(
     config["BLOCK_SIZE_N"] = min(config["BLOCK_SIZE_N"], 128)
     config["BLOCK_SIZE_K"] = min(config["BLOCK_SIZE_K"], 128)
 
-    proton.start(str(fpath), hook="triton")
+    with proton_visible_devices():
+        proton.start(str(fpath), hook="triton")
     for _ in range(reps):
         logits = gemm_a16w16(xg, wg.T, bg, config=config)
         rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
