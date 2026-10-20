@@ -104,7 +104,10 @@ for a worked example and static validation results.
 The dedicated `--mxfp4-flydsl` tuner does not write stage-ranking or full-pair
 profile artifacts through this option. Its winner CSV writes the validated
 end-to-end kernel-duration sum to both `us1` and `us`, with `us2=0`. Ordinary
-fMoE retains its stage timings and profiling outputs.
+fMoE retains its stage timings and profiling outputs. Without `--fast-scan`,
+each timed iteration reads a different copy of its inputs (cold cache, as in
+production); `--fast-scan` reuses one input set, so its `us` is warm-cache and
+not directly comparable with the other modes.
 
 MXFP4 input rows may contain `gate_mode`; it is retained for support validation
 and removed from the winner CSV. An unsupported requested row is reported even

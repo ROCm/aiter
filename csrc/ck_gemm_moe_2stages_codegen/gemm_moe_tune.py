@@ -7123,6 +7123,17 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
         return data
 
+    # Every data entry _port_e2e reads; timing rotates exactly these tensors.
+    _PORT_E2E_INPUTS: ClassVar[tuple[str, ...]] = (
+        "input",
+        "w1_a16",
+        "w2_a16",
+        "w1s_a16",
+        "w2s_a16",
+        "topk_ids",
+        "topk_weights",
+    )
+
     @staticmethod
     def _port_e2e(data, kn1, kn2, topk, ne, h, dtype, swiglu_limit=None):
         # kn2 may name either gemm2 family (path B or native mxmoe).
@@ -7336,15 +7347,30 @@ class Mxfp4FlydslTuner(FmoeTuner):
             ):
                 raise RuntimeError(f"cosine err_ratio {err} > {args.errRatio}")
             timed_warmup = requested_warmup
+        # run_perftest rotates deep copies of its arguments, sized from the
+        # positional tensors; anything a closure captures is never copied.
+        inputs = self._PORT_E2E_INPUTS
+
+        def timed_pipeline(*tensors):
+            return self._port_e2e(
+                dict(zip(inputs, tensors)),
+                kn1,
+                kn2,
+                topk,
+                ne,
+                h,
+                dtype,
+                swiglu_limit=swiglu_limit,
+            )
+
         timed_out, us = run_perftest(
-            lambda: self._port_e2e(
-                data, kn1, kn2, topk, ne, h, dtype, swiglu_limit=swiglu_limit
-            ),
+            timed_pipeline,
+            *(data[key] for key in inputs),
             num_warmup=timed_warmup,
             num_iters=measured_iters,
-            # The MXFP4 funnel owns warm-up explicitly, and its closure has no
-            # rotating arguments. Count every requested profiler sample and skip
-            # the generic memory-probe launch.
+            # The fast-scan funnel owns warm-up explicitly: count every requested
+            # profiler sample, keep one input set and skip the memory-probe launch.
+            # Other modes rotate the inputs so each iteration reads cold data.
             profile_warm_iters=0 if fast_scan else 1,
             num_rotate_args=1 if fast_scan else 0,
         )
@@ -7474,7 +7500,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
         kn1: str,
         topk: int,
         swiglu_limit: float | None = None,
-    ) -> tuple[Callable[[], None], torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        Callable[..., None], tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor
+    ]:
+        """Return (launch, tensors, inter_q, inter_s); time launch(*tensors)."""
         from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
 
         cfg = _parse_mxfp4_g1_kname(kn1)
@@ -7526,18 +7555,22 @@ class Mxfp4FlydslTuner(FmoeTuner):
             swiglu_limit=runtime_swiglu_limit(swiglu_limit, cfg["act"]),
         )
         placeholder = torch.empty(0, device=stage1_input.device, dtype=torch.uint8)
-        launch = functools.partial(
+        # Every tensor the kernel touches, so run_perftest can rotate them.
+        tensor_args = {
+            "a_quant": placeholder if bm == 16 else stage1_input,
+            "a_scale_sorted_shuffled": placeholder if bm == 16 else stage1_scale,
+            "w1_u8": data["w1_a16"].view(torch.uint8),
+            "w1_scale_u8": data["w1s_a16"].view(torch.uint8),
+            "sorted_expert_ids": sei,
+            "cumsum_tensor": nvi,
+            "m_indices": m_indices,
+            "inter_sorted_quant": inter_q,
+            "inter_sorted_shuffled_scale": inter_s,
+            "hidden_states": stage1_input,
+        }
+        names = tuple(tensor_args)
+        kernel = functools.partial(
             flydsl_mxfp4_gemm1,
-            a_quant=placeholder if bm == 16 else stage1_input,
-            a_scale_sorted_shuffled=placeholder if bm == 16 else stage1_scale,
-            w1_u8=data["w1_a16"].view(torch.uint8),
-            w1_scale_u8=data["w1s_a16"].view(torch.uint8),
-            sorted_expert_ids=sei,
-            cumsum_tensor=nvi,
-            m_indices=m_indices,
-            inter_sorted_quant=inter_q,
-            inter_sorted_shuffled_scale=inter_s,
-            hidden_states=stage1_input,
             n_tokens=stage1_input.shape[0],
             NE=data["w1_a16"].shape[0],
             D_HIDDEN=data["w2_a16"].shape[1],
@@ -7561,7 +7594,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
             situ_linear_beta=situ_linear_beta,
             swiglu_limit=runtime_swiglu_limit(swiglu_limit, cfg["act"]),
         )
-        return launch, inter_q, inter_s
+
+        def launch(*tensors: torch.Tensor) -> None:
+            return kernel(**dict(zip(names, tensors)))
+
+        return launch, tuple(tensor_args.values()), inter_q, inter_s
 
     def _screen_gemm1(self, row: dict[str, Any], kn1: str, args: Any) -> float:
         from aiter.test_common import run_perftest
@@ -7569,11 +7606,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
         data, sorting = self._prepare_screening_case(
             row, _parse_mxfp4_g1_kname(kn1)["BM"], False
         )
-        launch, _inter_q, _inter_s = self._prepare_gemm1_screening(
+        launch, tensors, _inter_q, _inter_s = self._prepare_gemm1_screening(
             data, sorting, kn1, int(row["topk"]), self._screening_limit()
         )
         _, us = run_perftest(
-            launch, num_warmup=int(args.warmup), num_iters=int(args.iters)
+            launch, *tensors, num_warmup=int(args.warmup), num_iters=int(args.iters)
         )
         return float(us)
 
@@ -7585,34 +7622,64 @@ class Mxfp4FlydslTuner(FmoeTuner):
         inter_s: torch.Tensor,
         kn2: str,
         topk: int,
-    ) -> Callable[[], torch.Tensor]:
+    ) -> tuple[Callable[..., torch.Tensor], tuple[torch.Tensor, ...]]:
+        """Return (launch, tensors); time launch(*tensors) so inputs rotate.
+
+        w1 stays bound: the stage2 wrapper reads only its shape.
+        """
         cfg = parse_g2_kname_any(kn2)
         sti, sw, sei, nvi, moe_buf, _m_indices, reverse_sorted = sorting
         out = moe_buf if moe_buf.numel() else torch.empty_like(data["input"])
+        w1 = data["w1_a16"]
 
-        def launch() -> torch.Tensor:
+        def launch(
+            inter_q: torch.Tensor,
+            inter_s: torch.Tensor,
+            w2: torch.Tensor,
+            w2_scale: torch.Tensor,
+            sti: torch.Tensor,
+            sw: torch.Tensor,
+            sei: torch.Tensor,
+            nvi: torch.Tensor,
+            out: torch.Tensor,
+            topk_weights: torch.Tensor,
+            reverse_sorted: torch.Tensor,
+        ) -> torch.Tensor:
             # Atomic output accumulates, so clear it every iteration.
             if cfg["atomic"]:
                 out.zero_()
             return _mxfp4_a4w4_stage2_fw(
                 inter_q,
-                data["w1_a16"],
-                data["w2_a16"],
+                w1,
+                w2,
                 sti,
                 sei,
                 nvi,
                 out,
                 topk,
-                w2_scale=data["w2s_a16"],
+                w2_scale=w2_scale,
                 a2_scale=inter_s,
                 block_m=cfg["BM"],
                 sorted_weights=sw,
-                topk_weights=data["topk_weights"],
+                topk_weights=topk_weights,
                 kernelName2=kn2,
                 reverse_sorted=reverse_sorted,
             )
 
-        return launch
+        tensors = (
+            inter_q,
+            inter_s,
+            data["w2_a16"],
+            data["w2s_a16"],
+            sti,
+            sw,
+            sei,
+            nvi,
+            out,
+            data["topk_weights"],
+            reverse_sorted,
+        )
+        return launch, tensors
 
     def _screen_gemm2(
         self, row: dict[str, Any], kn1: str, kn2: str, args: Any
@@ -7622,14 +7689,14 @@ class Mxfp4FlydslTuner(FmoeTuner):
         cfg = parse_g2_kname_any(kn2)
         data, sorting = self._prepare_screening_case(row, cfg["BM"], cfg["atomic"])
         # Run the reference producer once, untimed, for this candidate only.
-        _producer, inter_q, inter_s = self._prepare_gemm1_screening(
+        _producer, _producer_tensors, inter_q, inter_s = self._prepare_gemm1_screening(
             data, sorting, kn1, int(row["topk"]), self._screening_limit()
         )
-        launch = self._gemm2_screening_call(
+        launch, tensors = self._gemm2_screening_call(
             data, sorting, inter_q, inter_s, kn2, int(row["topk"])
         )
         _, us = run_perftest(
-            launch, num_warmup=int(args.warmup), num_iters=int(args.iters)
+            launch, *tensors, num_warmup=int(args.warmup), num_iters=int(args.iters)
         )
         return float(us)
 
@@ -7679,10 +7746,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
         _v2_populate_stage2(
             {"ref1": ref1, "adtype": "fp4"}, intermediate, token, topk, cfg["BM"]
         )
-        launch = self._gemm2_screening_call(
+        launch, tensors = self._gemm2_screening_call(
             data, sorting, intermediate["isq"], intermediate["iss"], kn2, topk
         )
-        out = launch()
+        out = launch(*tensors)
         ref = FmoeTuner.run_torch_moe_stage2(
             ref1,
             data["w1_qt"],
