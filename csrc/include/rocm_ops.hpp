@@ -25,6 +25,7 @@ namespace py = pybind11;
         .value("per_128x128", QuantType::per_128x128)                                       \
         .value("per_256x128", QuantType::per_256x128)                                       \
         .value("per_1024x128", QuantType::per_1024x128)                                     \
+        .value("iq2r_2bit", QuantType::iq2r_2bit)                                           \
         .export_values();                                                                   \
     pybind11::enum_<ActivationType>(m, "ActivationType")                                    \
         .value("No", ActivationType::No)                                                    \
@@ -33,6 +34,7 @@ namespace py = pybind11;
         .value("Swiglu", ActivationType::Swiglu)                                            \
         .value("Situv2", ActivationType::Situv2)                                            \
         .value("GeluTanh", ActivationType::GeluTanh)                                        \
+        .value("Relu2", ActivationType::Relu2)                                              \
         .export_values();                                                                   \
     pybind11::enum_<MlaVersion>(m, "MlaVersion")                                            \
         .value("V32", MlaVersion::V32)                                                      \
@@ -651,7 +653,8 @@ namespace py = pybind11;
           py::arg("reg_ptr"),                                                        \
           py::arg("reg_bytes"),                                                      \
           py::arg("use_1stage"),                                                     \
-          py::arg("bf16_out_ptr") = static_cast<int64_t>(0));                        \
+          py::arg("bf16_out_ptr") = static_cast<int64_t>(0),                         \
+          py::arg("gemma_norm")   = false);                                          \
     m.def("fused_qknorm_allreduce",                                                  \
           &aiter::fused_qknorm_allreduce,                                            \
           py::arg("_fa"),                                                            \
