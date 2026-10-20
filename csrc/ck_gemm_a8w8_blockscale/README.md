@@ -13,7 +13,7 @@
 Run the following cmd to start tuning, please wait a few minutes as it will build gemm_a8w8_blockscale_tune via jit:
 `python3 csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py -i aiter/configs/a8w8_blockscale_untuned_gemm.csv -o aiter/configs/a8w8_blockscale_tuned_gemm.csv --libtype both`
 `--libtype` accepts `ck`, `cktile`, `asm`, `opus`, `flydsl`, `all` (default), or `both`.
-`both` compares CK/CKTile only; `all` compares supported backends for the selected scale dtype.
+`both` compares CK/CKTile only; `all` compares every supported backend, including FlyDSL.
 You can find the results in [a8w8_blockscale_tuned_gemm.csv](../../aiter/configs/a8w8_blockscale_tuned_gemm.csv), like this:
     |**gfx**  |**cu_num**|**M**|**N**|**K**|**kernelId**|**splitK**|**us**|**kernelName**|**tflops**|**bw**|**errRatio**|
     |---------|----------|-----|-----|-----|------------|----------|------|--------------|----------|------|------------|
@@ -30,21 +30,18 @@ If you have built gemm_a8w8 kernels before tuning new GEMM shapes, please add `A
 
 ### FlyDSL blockscale (gfx950)
 
-Use `--libtype flydsl` for FlyDSL only, or `--libtype all` to compare supported
-backends. `--scale-dtype` defaults to `fp32` for every backend. The FP32 FlyDSL
-path uses FP8 E4M3FN inputs and BF16 output; add `--preshuffle` for shuffled B.
-E8M0 is a separate MXScale path: it requires explicit `--scale-dtype e8m0`,
-`--preshuffle`, and `--libtype flydsl` or `all`. FP32 and E8M0 candidates are
-never mixed.
+Use `--libtype flydsl` for FlyDSL only, or `--libtype all` to compare it with
+the other backends. The FlyDSL path uses FP8 E4M3FN inputs, FP32 scales and
+BF16 output; add `--preshuffle` for shuffled B. E8M0 block scales are tuned by
+`csrc/gemm_a8w8_mxfp8_bpreshuffle/gemm_a8w8_mxfp8_bpreshuffle_tune.py --mxscale_table`.
 
-| Scale dtype | B layout | Default output |
-|---|---|---|
-| `fp32` | plain | [a8w8_blockscale_tuned_gemm.csv](../../aiter/configs/a8w8_blockscale_tuned_gemm.csv) |
-| `fp32` | `--preshuffle` | [a8w8_blockscale_bpreshuffle_tuned_gemm.csv](../../aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv) |
-| `e8m0` | `--preshuffle` required | [a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv](../../aiter/configs/a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv) |
+| B layout | Default output |
+|---|---|
+| plain | [a8w8_blockscale_tuned_gemm.csv](../../aiter/configs/a8w8_blockscale_tuned_gemm.csv) |
+| `--preshuffle` | [a8w8_blockscale_bpreshuffle_tuned_gemm.csv](../../aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv) |
 
-Keep custom `-o` outputs separate for each scale/B-layout contract. Use the
-same `--scale-dtype` and `--preshuffle` settings when replaying with `--run_config`.
+Keep custom `-o` outputs separate for each B layout. Use the same
+`--preshuffle` setting when replaying with `--run_config`.
 
 For FP32 FlyDSL tuning, with `KB = K // 128`:
 - Plain B passes row-major `x_scale[M, KB]`; kernel adapter will transpose to
