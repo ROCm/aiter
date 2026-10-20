@@ -1,10 +1,10 @@
 {
     "fwd": {
-        "BLOCK_M": 256,
+        "BLOCK_M": 128,
         "BLOCK_N": 128,
-        "waves_per_eu": 2,
+        "waves_per_eu": 0,
         "PRE_LOAD_V": false,
-        "num_stages": 3,
-        "num_warps": 8
+        "num_stages": 2,
+        "num_warps": 4
     }
 }
