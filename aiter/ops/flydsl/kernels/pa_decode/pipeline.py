@@ -625,6 +625,232 @@ class PaDecodePipeline:
         return next_state
 
 
+class Gfx1250Bf16Pipeline:
+    """Four waves share packed BF16 pages and retain Q/PV operands."""
+
+    def __init__(self, ctx):
+        self.ctx, self.t = ctx, ctx.traits
+        self.mem = Gfx1250Memory(ctx)
+
+    @flyc.jit
+    def run(self):
+        ctx, t = self.ctx, self.t
+        ctx.tid = fx.Int32(gpu.thread_id("x"))
+        ctx.warp, ctx.lane = ctx.tid // t.WAVE, ctx.tid % t.WAVE
+        ctx.lane16, ctx.half = ctx.lane % 16, ctx.lane // 16
+        ctx.kv_h = fx.Int32(gpu.block_id("y")) // t.query_splits
+        ctx.query_begin = (fx.Int32(gpu.block_id("y")) % t.query_splits) * (
+            t.query_length // t.query_splits
+        )
+        ctx.n_kv = fx.Int32(gpu.grid_dim.y) // t.query_splits
+        self.mem.allocate()
+        query = fx.recast_iter(t.q_dtype, ctx.query_ptr)
+        q_operands = []
+        initial = []
+        for m in range_constexpr(t.m_tiles):
+            row = m * 16 + ctx.lane16
+            qbase = (
+                fx.Int64(ctx.planned_seq) * t.query_length
+                + ctx.query_begin
+                + row // t.query_group_size
+            ) * ctx.stride_q_row + (
+                ctx.kv_h * t.query_group_size + row % t.query_group_size
+            ) * ctx.stride_q_head
+            operands = []
+            for d in range_constexpr(t.head_dim // 32):
+                values = []
+                for j in range_constexpr(2):
+                    fragment = fx.Vector.filled(8, 0.0, fx.BFloat16)
+                    if row < t.rows:
+                        fragment = fx.Vector(
+                            fx.ptr_load(
+                                fx.add_offset(
+                                    query, qbase + d * 32 + ctx.half * 8 + j * 16
+                                ),
+                                result_type=fx.Vector.make_type(8, t.q_dtype),
+                            )
+                        ).to(fx.BFloat16)
+                    values.extend([fragment[i] for i in range_constexpr(8)])
+                operands.append(fx.Vector.from_elements(values, dtype=fx.BFloat16))
+            q_operands.append(operands)
+            initial.extend([fx.Float32(float("-inf")), fx.Float32(0.0)])
+            initial.extend(
+                [
+                    fx.Vector.filled(8, 0.0, fx.Float32)
+                    for _ in range_constexpr(t.head_dim // 64)
+                ]
+            )
+        state_stride = 2 + t.head_dim // 64
+        begin, end = (
+            ctx.planned_start * KV_COMPUTE_BLOCK,
+            ctx.planned_end * KV_COMPUTE_BLOCK,
+        )
+        self.mem.stage_bf16_page(begin, fx.Int32(0))
+        for token_i, state in range(begin, end, 128, init=initial):
+            token_base = fx.Int32(token_i)
+            buffer = ((token_base - begin) // 128) % 2
+            tdm_ops.tensor_wait(0)
+            gpu.barrier()
+            kv_off = t.q_bytes + buffer * t.kv_stride
+            if token_base + 128 < end:
+                self.mem.stage_bf16_page(token_base + 128, 1 - buffer)
+            next_state = []
+            for m in range_constexpr(t.m_tiles):
+                row = m * 16 + ctx.lane16
+                upper = (
+                    ctx.planned_context
+                    - t.query_length
+                    + ctx.query_begin
+                    + row // t.query_group_size
+                    + 1
+                )
+                units = []
+                for n in range_constexpr(2):
+                    scores = fx.Vector.filled(8, 0.0, fx.Float32)
+                    for d in range_constexpr(t.head_dim // 32):
+                        k = self.mem.bf16_k_operand(
+                            kv_off,
+                            ctx.warp * 32 + n * 16,
+                            d * 32,
+                            ctx.lane16,
+                            ctx.half,
+                        )
+                        scores = Gfx1250Gemm.mma(k, q_operands[m][d], scores, 32, True)
+                    for r in range_constexpr(8):
+                        token = token_base + ctx.warp * 32 + n * 16 + ctx.half * 8 + r
+                        visible = (token < upper) & (row < t.rows)
+                        if const_expr(t.sliding_window > 0):
+                            visible = visible & (token >= upper - t.sliding_window)
+                        units.append(
+                            visible.select(
+                                scores[r] * fx.Float32(t.softmax_scale * LOG2E),
+                                fx.Float32(float("-inf")),
+                            )
+                        )
+                scores = fx.Vector.from_elements(units, dtype=fx.Float32)
+                tile_max = scores.reduce(ReductionOp.MAX)
+                tile_max = fx.maxnumf(tile_max, tile_max.shuffle_xor(16, t.WAVE))
+                if ctx.half == 0:
+                    self.mem.store(
+                        t.stats_offset + (ctx.lane16 * 4 + ctx.warp) * 4,
+                        tile_max,
+                        fx.Float32,
+                    )
+                gpu.barrier()
+                tile_max = self.mem.load(
+                    t.stats_offset + ctx.lane16 * 16, fx.Float32, 4
+                ).reduce(ReductionOp.MAX)
+                old_max = state[m * state_stride]
+                new_max = fx.maxnumf(old_max, tile_max)
+                safe_max = (new_max > fx.Float32(float("-inf"))).select(
+                    new_max, fx.Float32(0.0)
+                )
+                corr = fx.Float32(fx.exp2(old_max - safe_max, fastmath="afn"))
+                probs = fx.Vector(
+                    fx.exp2(
+                        scores
+                        - fx.Vector.from_elements(
+                            [safe_max], dtype=fx.Float32
+                        ).broadcast_to(16),
+                        fastmath="afn",
+                    )
+                )
+                tile_sum = probs.reduce(ReductionOp.ADD)
+                tile_sum = tile_sum + tile_sum.shuffle_xor(16, t.WAVE)
+                if ctx.half == 0:
+                    self.mem.store(
+                        t.stats_offset + 256 + (ctx.lane16 * 4 + ctx.warp) * 4,
+                        tile_sum,
+                        fx.Float32,
+                    )
+                for n in range_constexpr(2):
+                    p = fx.Vector.from_elements(
+                        [probs[n * 8 + r] for r in range_constexpr(8)], dtype=fx.Float32
+                    ).to(fx.BFloat16)
+                    self.mem.store(
+                        t.p_offset
+                        + ctx.lane16 * t.v_stride
+                        + (ctx.warp * 32 + n * 16 + ctx.half * 8) * 2,
+                        p,
+                        fx.BFloat16,
+                    )
+                gpu.barrier()
+                denom = state[m * state_stride + 1] * corr + self.mem.load(
+                    t.stats_offset + 256 + ctx.lane16 * 16, fx.Float32, 4
+                ).reduce(ReductionOp.ADD)
+                next_state.extend([new_max, denom])
+                p_operands = [
+                    self.mem.operand(
+                        t.p_offset + d * 64, t.v_stride, 32, ctx.lane16, ctx.half
+                    )
+                    for d in range_constexpr(4)
+                ]
+                for vh in range_constexpr(t.head_dim // 64):
+                    # Rescale the running accumulator before PV's fused adds.
+                    out = state[m * state_stride + 2 + vh] * fx.Vector.from_elements(
+                        [corr],
+                        dtype=fx.Float32,
+                    ).broadcast_to(8)
+                    for d in range_constexpr(4):
+                        v = self.mem.bf16_v_operand(
+                            kv_off + t.k_bytes,
+                            vh * 64 + ctx.warp * 16,
+                            d * 32,
+                            ctx.lane16,
+                            ctx.half,
+                        )
+                        out = Gfx1250Gemm.mma(v, p_operands[d], out, 32, True)
+                    next_state.append(out)
+                if const_expr(m + 1 < t.m_tiles):
+                    # Retire P reads before another query tile overwrites them.
+                    gpu.barrier()
+            final = yield next_state
+        pout = fx.recast_iter(t.q_dtype, ctx.pout_ptr)
+        pmax = fx.recast_iter(fx.Float32, ctx.pmax_ptr)
+        psum = fx.recast_iter(fx.Float32, ctx.psum_ptr)
+        slot = fx.Int64(ctx.kv_h) * fx.Int64(gpu.grid_dim.x) + fx.Int64(
+            gpu.block_id("x")
+        )
+        for m in range_constexpr(t.m_tiles):
+            row = m * 16 + ctx.lane16
+            output_row = ctx.query_begin * t.query_group_size + row
+            partial_row = slot * (t.rows * t.query_splits) + output_row
+            denom = final[m * state_stride + 1]
+            inv = fx.Float32(rcp_f32((denom > 0.0).select(denom, fx.Float32(1.0))))
+            if row < t.rows:
+                for vh in range_constexpr(t.head_dim // 64):
+                    d = vh * 64 + ctx.warp * 16 + ctx.half * 8
+                    value = (
+                        final[m * state_stride + 2 + vh]
+                        * fx.Vector.from_elements(
+                            [inv],
+                            dtype=fx.Float32,
+                        ).broadcast_to(8)
+                    ).to(t.q_dtype)
+                    offset = (
+                        (
+                            fx.Int64(ctx.planned_seq) * t.query_length
+                            + output_row // t.query_group_size
+                        )
+                        * ctx.stride_q_row
+                        + (
+                            ctx.kv_h * t.query_group_size
+                            + output_row % t.query_group_size
+                        )
+                        * ctx.stride_q_head
+                        + d
+                        if t.direct_output
+                        else partial_row * t.head_dim + d
+                    )
+                    fx.ptr_store(value, fx.add_offset(pout, offset))
+                if const_expr(not t.direct_output):  # noqa: SIM102
+                    if ctx.warp == 0 and ctx.half == 0:
+                        pmax[partial_row] = final[m * state_stride] * fx.Float32(
+                            1.0 / LOG2E
+                        )
+                        psum[partial_row] = denom
+
+
 class Gfx1250Pipeline:
     def __init__(self, ctx):
         self.ctx, self.t = ctx, ctx.traits

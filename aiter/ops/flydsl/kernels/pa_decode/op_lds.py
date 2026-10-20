@@ -968,6 +968,81 @@ class Gfx1250Memory:
             words.extend([frag[i] for i in range_constexpr(4)])
         return fx.Vector.from_elements(words, dtype=fx.Int32)
 
+    def bf16_k_operand(self, offset, token, dim, lane16, half):
+        # Retain vector-8 cache packing: each half-wave reads alternate chunks.
+        words = []
+        for j in range_constexpr(2):
+            frag = self.load(
+                offset + ((dim // 8 + half + 2 * j) * 128 + token + lane16) * 16,
+                fx.Int32,
+                4,
+            )
+            words.extend([frag[i] for i in range_constexpr(4)])
+        return fx.Vector.from_elements(words, dtype=fx.Int32).bitcast(fx.BFloat16)
+
+    def bf16_v_operand(self, offset, dim, token, lane16, half):
+        words = []
+        for j in range_constexpr(2):
+            frag = self.load(
+                offset
+                + (token // 8 + half + 2 * j) * self.t.head_dim * 16
+                + (dim + lane16) * 16,
+                fx.Int32,
+                4,
+            )
+            words.extend([frag[i] for i in range_constexpr(4)])
+        return fx.Vector.from_elements(words, dtype=fx.Int32).bitcast(fx.BFloat16)
+
+    @flyc.jit
+    def stage_bf16_page(self, token_base, buffer):
+        """Gather a BF16 page without transposition; zero-fill its unwritten tail."""
+        ctx, t = self.ctx, self.t
+        safe = (token_base < ctx.planned_context).select(token_base, fx.Int32(0))
+        table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
+        page = fx.Int32(table[ctx.planned_seq * ctx.max_blocks_per_seq + safe // 128])
+        off = (fx.Int64(page) * ctx.n_kv + ctx.kv_h) * t.head_dim * 128
+        kv_off = t.q_bytes + buffer * t.kv_stride
+        valid = fx.max(
+            fx.Int32(0), fx.min(fx.Int32(128), ctx.planned_context - token_base)
+        )
+        self.tdm_copy(
+            ctx.key_cache_ptr,
+            off + ctx.warp * (t.head_dim // 32) * 1024,
+            kv_off + ctx.warp * (t.head_dim // 32) * 2048,
+            (t.head_dim // 32, 128, 8),
+            (1024, 8, 1),
+            (None, valid, None),
+            8,
+            8,
+        )
+        if token_base + 128 <= ctx.planned_context:
+            self.tdm_copy(
+                ctx.value_cache_ptr,
+                off + ctx.warp * t.head_dim * 32,
+                kv_off + t.k_bytes + ctx.warp * t.head_dim * 64,
+                (32 * t.head_dim,),
+                (1,),
+                (None,),
+                8,
+                8,
+            )
+        else:
+            # Token extents apply inside each eight-token V chunk.
+            for chunk in range_constexpr(4):
+                count = fx.max(
+                    fx.Int32(0), fx.min(fx.Int32(8), valid - ctx.warp * 32 - chunk * 8)
+                )
+                self.tdm_copy(
+                    ctx.value_cache_ptr,
+                    off + (ctx.warp * 4 + chunk) * t.head_dim * 8,
+                    kv_off + t.k_bytes + (ctx.warp * 4 + chunk) * t.head_dim * 16,
+                    (t.head_dim, 8),
+                    (8, 1),
+                    (None, count),
+                    8,
+                    8,
+                )
+
     @flyc.jit
     def stage_padded_tdm(self, token_base, kv_off, full_tile):
         ctx, t = self.ctx, self.t

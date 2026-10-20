@@ -19,6 +19,8 @@ plan tile. Packed FP8 D128/D256 full-attention paths use K128 WMMA; other
 FP8 paths use K64 and BF16 uses K32. Supported layouts use TDM K/V transfers,
 with two LDS buffers where capacity permits. One-partition plans can write
 final output directly; other plans use the shared partition reducer.
+BF16 transposed page128 caches at D64/D128/D256 use a packed-page pipeline
+with resident Q and fused PV accumulation; D256 is limited to 32 query rows.
 
 Logical layouts (not preshuffled):
 
@@ -52,7 +54,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .pa_decode import implementation_cache_tag
 from .pa_decode.context import PaDecodeContext
-from .pa_decode.pipeline import Gfx1250Pipeline, PaDecodePipeline
+from .pa_decode.pipeline import Gfx1250Bf16Pipeline, Gfx1250Pipeline, PaDecodePipeline
 from .pa_decode.traits import (
     FP8_PACK_K,
     KV_COMPUTE_BLOCK,
@@ -499,7 +501,10 @@ def compile_gfx1250_pa_decode(
                 fx.Int32(task[2]),
                 fx.Int32(task[3]),
             )
-            Gfx1250Pipeline(ctx).run()
+            if const_expr(t.bf16_packed):
+                Gfx1250Bf16Pipeline(ctx).run()
+            else:
+                Gfx1250Pipeline(ctx).run()
         elif const_expr(t.direct_output):
             output = fx.recast_iter(t.q_dtype, pout)
             tid = fx.Int32(gpu.thread_id("x"))
