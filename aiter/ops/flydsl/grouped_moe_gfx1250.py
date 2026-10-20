@@ -592,6 +592,11 @@ def _grouped_a8w4_tdm_moe(
     tdm_as_in_prologue=0,
     tdm_b_th=0,
     lds_soa_load_interleave=0,
+    lds_soa_load_interleave2=None,
+    force_mid_compute=0,
+    force_mid_compute2=0,
+    linear_wg_map=0,
+    linear_wg_map2=0,
     rolled_drain=0,
     persistent_workers=0,
     persistent_workers2=0,
@@ -643,6 +648,25 @@ def _grouped_a8w4_tdm_moe(
         # gains once its scatter epilogue runs on a narrower tile_m2. Blank
         # keeps gemm2 on gemm1's width, i.e. the historical behaviour.
         cluster_n2 = cluster_n
+    lds_soa_load_interleave2 = (
+        lds_soa_load_interleave
+        if lds_soa_load_interleave2 is None
+        else lds_soa_load_interleave2
+    )
+    _g1_lds_interleave = int(lds_soa_load_interleave)
+    _g2_lds_interleave = int(lds_soa_load_interleave2)
+    if _g1_lds_interleave not in (0, 1) or _g2_lds_interleave not in (0, 1):
+        raise ValueError("stage-specific LDS SoA interleave values must be 0 or 1")
+    if any(
+        value not in (0, 1)
+        for value in (
+            force_mid_compute,
+            force_mid_compute2,
+            linear_wg_map,
+            linear_wg_map2,
+        )
+    ):
+        raise ValueError("stage-specific pipeline and task-map values must be 0 or 1")
     if _compact:
         # The plan padded every expert's row count up to this alignment, and its
         # psum is what the GEMM binary-searches as its m-tile map. A tile wider
@@ -670,6 +694,38 @@ def _grouped_a8w4_tdm_moe(
     _sparse_routing = _routing_density <= _align_m
     _stage1_m_alignment = _align_m if _sparse_routing else tile_m
     _stage2_m_alignment = _align_m if _sparse_routing else tile_m2
+    # Handling for decode routing activating fewer experts than prefill.
+    # Skips excess padding tiles to avoid computations treating padding as
+    # computable rows and loading dead/unnecessary resources
+    _direct_expert_map = (
+        expert_mask is None
+        and not _compact
+    )
+    _sparse_row_cap = min(int(E), _routed_rows) * _align_m
+    _stage1_task_cap = (
+        (_sparse_row_cap + int(tile_m) - 1)
+        // int(tile_m)
+        * ((2 * int(inter_dim) + int(tile_n) - 1) // int(tile_n))
+    )
+    _stage2_task_cap = (
+        (_sparse_row_cap + int(tile_m2) - 1)
+        // int(tile_m2)
+        * ((int(model_dim) + int(tile_n2) - 1) // int(tile_n2))
+    )
+    _stage1_single_task = (
+        _sparse_routing
+        and expert_mask is None
+        and not _compact
+        and not enable_ep_scatter
+        and int(persistent_workers) >= _stage1_task_cap
+    )
+    _stage2_single_task = (
+        _sparse_routing
+        and expert_mask is None
+        and not _compact
+        and not enable_ep_scatter
+        and int(persistent_workers2) >= _stage2_task_cap
+    )
     # Both GEMMs walk the same contiguous layout, each with its own tile height,
     # so every expert must start on a row that is a multiple of both. Aligning to
     # the larger tile only achieves that when it is a multiple of the smaller one.
@@ -852,16 +908,21 @@ def _grouped_a8w4_tdm_moe(
         # _align_m, not tile_m: gemm2 may tile M more coarsely than gemm1, and a
         # start aligned only to tile_m would let a gemm2 tile cross an expert
         # boundary (see the divisibility check above).
-        _starts, psum, _ = contiguous_psum_remap(
+        _starts, psum, _, _m_expert_tile_map = contiguous_psum_remap(
             _masked_m,
             topids_to_rows,
             E,
             max_m,
             _align_m,
+            expert_tile_m=(
+                min(tile_m, tile_m2) if _direct_expert_map else None
+            ),
             num_valid_routes=_ep_nvr,
             ep_scatter_params=ep_scatter_params,
         )
         psum = psum.to(torch.int32).contiguous()
+    if _compact or _fuse_ep_route_quant or _fuse_psum_quant:
+        _m_expert_tile_map = None
     # Turns the TDM GEMM2 epilogue into the fused P2P scatter-combine.
     _ep_gemm2_kwargs = (
         {
@@ -1088,18 +1149,23 @@ def _grouped_a8w4_tdm_moe(
             bias=_b1,
             swiglu_limit=sl,
             num_buffers=num_buffers,
+            force_mid_compute=force_mid_compute,
+            linear_wg_map=linear_wg_map,
             stage1_quant_out=1,
             quant_scale=a2_scale,
             quant_wmma_rep=wmma_rep2,
             persistent_workers=persistent_workers,
+            persistent_single_task=int(_stage1_single_task),
             m_alignment=_stage1_m_alignment,
+            m_expert_tile_map=_m_expert_tile_map,
+            expert_tile_m=min(tile_m, tile_m2),
             cluster_m=cluster_m,
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
             tdm_as_in_prologue=tdm_as_in_prologue,
             tdm_b_th=tdm_b_th,
-            lds_soa_load_interleave=lds_soa_load_interleave,
+            lds_soa_load_interleave=_g1_lds_interleave,
             rolled_drain=rolled_drain,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
@@ -1131,15 +1197,20 @@ def _grouped_a8w4_tdm_moe(
             bias=_b1,
             swiglu_limit=sl,
             num_buffers=num_buffers,
+            force_mid_compute=force_mid_compute,
+            linear_wg_map=linear_wg_map,
             persistent_workers=persistent_workers,
+            persistent_single_task=int(_stage1_single_task),
             m_alignment=_stage1_m_alignment,
+            m_expert_tile_map=_m_expert_tile_map,
+            expert_tile_m=min(tile_m, tile_m2),
             cluster_m=cluster_m,
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
             tdm_as_in_prologue=tdm_as_in_prologue,
             tdm_b_th=tdm_b_th,
-            lds_soa_load_interleave=lds_soa_load_interleave,
+            lds_soa_load_interleave=_g1_lds_interleave,
             rolled_drain=rolled_drain,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
@@ -1181,14 +1252,19 @@ def _grouped_a8w4_tdm_moe(
         bias=_b2,
         num_buffers=num_buffers2,
         persistent_workers=persistent_workers2,
+        persistent_single_task=int(_stage2_single_task),
+        force_mid_compute=force_mid_compute2,
+        linear_wg_map=linear_wg_map2,
         m_alignment=_stage2_m_alignment,
+        m_expert_tile_map=_m_expert_tile_map,
+        expert_tile_m=min(tile_m, tile_m2),
         cluster_m=cluster_m2,
         cluster_n=cluster_n2,
         waves_per_tensor_tdm=waves_per_tensor_tdm2,
         next_stage_prefetch=next_stage_prefetch,
         tdm_as_in_prologue=tdm_as_in_prologue,
         tdm_b_th=tdm_b_th,
-        lds_soa_load_interleave=lds_soa_load_interleave,
+        lds_soa_load_interleave=_g2_lds_interleave,
         rolled_drain=rolled_drain,
         **_ep_gemm2_kwargs,
     )
@@ -1260,18 +1336,23 @@ def _grouped_a8w4_tdm_moe(
                         bias=_b1,
                         swiglu_limit=sl,
                         num_buffers=num_buffers,
+                        force_mid_compute=force_mid_compute,
+                        linear_wg_map=linear_wg_map,
                         stage1_quant_out=1,
                         quant_scale=a2_scale,
                         quant_wmma_rep=wmma_rep2,
                         persistent_workers=persistent_workers,
+                        persistent_single_task=int(_stage1_single_task),
                         m_alignment=_stage1_m_alignment,
+                        m_expert_tile_map=_m_expert_tile_map,
+                        expert_tile_m=min(tile_m, tile_m2),
                         cluster_m=cluster_m,
                         cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
                         next_stage_prefetch=next_stage_prefetch,
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         tdm_b_th=tdm_b_th,
-                        lds_soa_load_interleave=lds_soa_load_interleave,
+                        lds_soa_load_interleave=_g1_lds_interleave,
                         row_major_ascale=int(_row_major_ascale),
                         rolled_drain=rolled_drain,
                         **_situ_kw,
@@ -1305,15 +1386,20 @@ def _grouped_a8w4_tdm_moe(
                         bias=_b1,
                         swiglu_limit=sl,
                         num_buffers=num_buffers,
+                        force_mid_compute=force_mid_compute,
+                        linear_wg_map=linear_wg_map,
                         persistent_workers=persistent_workers,
+                        persistent_single_task=int(_stage1_single_task),
                         m_alignment=_stage1_m_alignment,
+                        m_expert_tile_map=_m_expert_tile_map,
+                        expert_tile_m=min(tile_m, tile_m2),
                         cluster_m=cluster_m,
                         cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
                         next_stage_prefetch=next_stage_prefetch,
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         tdm_b_th=tdm_b_th,
-                        lds_soa_load_interleave=lds_soa_load_interleave,
+                        lds_soa_load_interleave=_g1_lds_interleave,
                         row_major_ascale=int(_row_major_ascale),
                         rolled_drain=rolled_drain,
                         **_situ_kw,
@@ -1346,14 +1432,19 @@ def _grouped_a8w4_tdm_moe(
                     bias=_b2,
                     num_buffers=num_buffers2,
                     persistent_workers=persistent_workers2,
+                    persistent_single_task=int(_stage2_single_task),
+                    force_mid_compute=force_mid_compute2,
+                    linear_wg_map=linear_wg_map2,
                     m_alignment=_stage2_m_alignment,
+                    m_expert_tile_map=_m_expert_tile_map,
+                    expert_tile_m=min(tile_m, tile_m2),
                     cluster_m=cluster_m2,
                     cluster_n=cluster_n2,
                     waves_per_tensor_tdm=waves_per_tensor_tdm2,
                     next_stage_prefetch=next_stage_prefetch,
                     tdm_as_in_prologue=tdm_as_in_prologue,
                     tdm_b_th=tdm_b_th,
-                    lds_soa_load_interleave=lds_soa_load_interleave,
+                    lds_soa_load_interleave=_g2_lds_interleave,
                     rolled_drain=rolled_drain,
                 ),
             )
@@ -1631,8 +1722,26 @@ def grouped_gemm_gfx1250_a8w4(
                 cfg_row.get("tdm_as_in_prologue"), 0
             )
             _tdm_kw["tdm_b_th"] = _as_int(cfg_row.get("tdm_b_th"), 0)
-            _tdm_kw["lds_soa_load_interleave"] = _as_int(
+            shared_lds_interleave = _as_int(
                 cfg_row.get("lds_soa_load_interleave"), 0
+            )
+            _tdm_kw["lds_soa_load_interleave"] = _as_int(
+                cfg_row.get("lds_soa_load_interleave1"), shared_lds_interleave
+            )
+            _tdm_kw["lds_soa_load_interleave2"] = _as_int(
+                cfg_row.get("lds_soa_load_interleave2"), shared_lds_interleave
+            )
+            _tdm_kw["force_mid_compute"] = _as_int(
+                cfg_row.get("force_mid_compute1"), 0
+            )
+            _tdm_kw["force_mid_compute2"] = _as_int(
+                cfg_row.get("force_mid_compute2"), 0
+            )
+            _tdm_kw["linear_wg_map"] = _as_int(
+                cfg_row.get("linear_wg_map1"), 0
+            )
+            _tdm_kw["linear_wg_map2"] = _as_int(
+                cfg_row.get("linear_wg_map2"), 0
             )
             _tdm_kw["rolled_drain"] = _as_int(cfg_row.get("rolled_drain"), 0)
             # GEMM1 always has a local epilogue; stage2_scatter only changes
@@ -1748,6 +1857,7 @@ def _get_compiled_gather_reduce(
     split_k: int = 1,
     vec_dwords: int = 2,
     w_dtype: str = "f32",
+    block_threads: int = 256,
 ):
     """Compile and cache the one-pass MoE gather-reduce kernel."""
     from aiter.ops.flydsl.kernels.moe_gather_reduce import (
@@ -1755,7 +1865,13 @@ def _get_compiled_gather_reduce(
     )
 
     return build_moe_gather_reduce_module(
-        model_dim, topk, out_dtype, split_k, vec_dwords, w_dtype
+        model_dim,
+        topk,
+        out_dtype,
+        split_k,
+        vec_dwords,
+        w_dtype,
+        block_threads,
     )
 
 
@@ -1895,6 +2011,7 @@ def contiguous_psum_remap(
     experts: int,
     route_max_m: int,
     tile_m: int,
+    expert_tile_m: int | None = None,
     num_valid_routes: torch.Tensor | None = None,
     ep_scatter_params: dict | None = None,
 ):
@@ -1911,6 +2028,21 @@ def contiguous_psum_remap(
     psum = torch.empty(experts, dtype=torch.int32, device=device)
     contiguous_m_t = torch.empty(1, dtype=torch.int32, device=device)
     topids_flat = topids_to_rows.reshape(-1)
+    expert_tile_map = (
+        torch.empty(
+            (
+                int(topids_flat.numel())
+                + experts * int(tile_m)
+                + int(expert_tile_m)
+                - 1
+            )
+            // int(expert_tile_m),
+            dtype=torch.int32,
+            device=device,
+        )
+        if expert_tile_m is not None
+        else None
+    )
     # Only remap the valid routes; dead-tail rows are unwritten and must not be
     # used as a row index. Default (no truncation) covers every route.
     if num_valid_routes is None:
@@ -1945,7 +2077,7 @@ def contiguous_psum_remap(
             int(ep_scatter_params["slot_stride"]),
             stream=torch.cuda.current_stream(),
         )
-        return starts, psum, contiguous_m_t
+        return starts, psum, contiguous_m_t, None
     from aiter.ops.flydsl.kernels.moe_contiguous_psum import MAX_REMAP_EXPERTS
 
     assert experts <= MAX_REMAP_EXPERTS, (
@@ -1959,14 +2091,20 @@ def contiguous_psum_remap(
         ptr_arg(starts),
         ptr_arg(psum),
         ptr_arg(contiguous_m_t),
+        ptr_arg(
+            expert_tile_map
+            if expert_tile_map is not None
+            else torch.empty(0, dtype=torch.int32, device=device)
+        ),
         int(topids_flat.numel()),
         experts,
         int(route_max_m),
         int(tile_m),
+        int(expert_tile_m or tile_m),
         ptr_arg(num_valid_routes_i32),
         stream=torch.cuda.current_stream(),
     )
-    return starts, psum, contiguous_m_t
+    return starts, psum, contiguous_m_t, expert_tile_map
 
 
 def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int):
@@ -2042,8 +2180,20 @@ def flydsl_moe_gather_reduce(
         )
 
     gather_vec = _choose_gather_reduce_vec(token_num, model_dim)
+    gather_threads = int(
+        os.environ.get(
+            "AITER_FLYDSL_GATHER_REDUCE_THREADS",
+            "512" if token_num >= 8192 else "256",
+        )
+    )
     launch = _get_compiled_gather_reduce(
-        model_dim, topk, out_dtype, split_k, gather_vec, w_dtype
+        model_dim,
+        topk,
+        out_dtype,
+        split_k,
+        gather_vec,
+        w_dtype,
+        gather_threads,
     )
     slice_stride_dw = E * max_m * (model_dim // 2)
     # Skip dead-tail output tokens whose route map is unwritten. Default (no

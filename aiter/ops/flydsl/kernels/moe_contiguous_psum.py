@@ -247,10 +247,12 @@ def build_moe_contiguous_psum_remap_module():
         starts: fx.Pointer,
         psum: fx.Pointer,
         contiguous_m: fx.Pointer,
+        expert_tile_map: fx.Pointer,
         numel: Int32,
         experts: Int32,
         route_max_m: Int32,
         tile_m: Int32,
+        expert_tile_m: Int32,
         num_valid_routes: fx.Pointer,
     ):
         tid = fx.Uint32(fx.thread_idx.x)
@@ -271,6 +273,7 @@ def build_moe_contiguous_psum_remap_module():
         s_p = ptr_buf_tensor(starts)
         p_p = ptr_buf_tensor(psum)
         c_p = ptr_buf_tensor(contiguous_m)
+        expert_map_p = ptr_buf_tensor(expert_tile_map)
 
         is_lane0 = tid == fx.Uint32(0)
         if is_lane0:
@@ -330,6 +333,20 @@ def build_moe_contiguous_psum_remap_module():
 
         gpu.barrier()
 
+        # Use map to find experts instead of binary search
+        expert_map_is_set = fx.Int64(ptrtoint(expert_tile_map)) != 0
+        if expert_map_is_set & is_blk0:
+            e = tid
+            in_expert = e < fx.Uint32(experts)
+            if in_expert:
+                m_e = fx.Uint32(m_p[e])
+                aligned_rows = (m_e + tile_minus_1) // tile_v * tile_v
+                fine_tile = fx.Uint32(expert_tile_m)
+                map_start = fx.Uint32(starts_lds[e]) // fine_tile
+                map_count = aligned_rows // fine_tile
+                for local_tile in range(0, map_count):
+                    expert_map_p[map_start + fx.Uint32(local_tile)] = fx.Int32(e)
+
         # Only remap valid routes ([0, valid_route_count)); dead-tail routes hold
         # unwritten rows from the route kernel and must not be used as a row index.
         # When truncation is disabled the caller passes a null pointer instead of a
@@ -361,10 +378,12 @@ def build_moe_contiguous_psum_remap_module():
         starts: fx.Pointer,
         psum: fx.Pointer,
         contiguous_m: fx.Pointer,
+        expert_tile_map: fx.Pointer,
         numel: fx.Int32,
         experts: fx.Int32,
         route_max_m: fx.Int32,
         tile_m: fx.Int32,
+        expert_tile_m: fx.Int32,
         num_valid_routes: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
@@ -374,10 +393,12 @@ def build_moe_contiguous_psum_remap_module():
             starts,
             psum,
             contiguous_m,
+            expert_tile_map,
             numel,
             experts,
             route_max_m,
             tile_m,
+            expert_tile_m,
             num_valid_routes,
         ).launch(
             grid=(REMAP_NBLK, 1, 1),

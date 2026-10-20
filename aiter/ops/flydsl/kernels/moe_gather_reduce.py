@@ -104,6 +104,7 @@ def build_moe_gather_reduce_module(
     split_k: int = 1,
     vec_dwords: int = 2,
     w_dtype: str = "f32",
+    block_threads: int = BLOCK_THREADS,
 ):
     assert model_dim % 2 == 0
     assert out_dtype in ("bf16", "f16")
@@ -111,15 +112,18 @@ def build_moe_gather_reduce_module(
     assert topk <= MAX_GATHER_TOPK
     if vec_dwords not in (2, 4, 8):
         raise ValueError(f"vec_dwords must be 2, 4, or 8, got {vec_dwords}")
+    if block_threads not in (128, 256, 512):
+        raise ValueError(f"block_threads must be 128, 256, or 512, got {block_threads}")
 
     VEC = int(vec_dwords)
     out_dwords = model_dim // 2  # dwords per output row (also the source row width)
-    DWORDS_PER_ITER = BLOCK_THREADS * VEC  # dwords advanced per loop iter
+    DWORDS_PER_ITER = block_threads * VEC  # dwords advanced per loop iter
     n_iters = (out_dwords + DWORDS_PER_ITER - 1) // DWORDS_PER_ITER
 
     module_name = format_kernel_name(
         f"moe_gather_reduce_{out_dtype}_d{model_dim}_tk{topk}_sk{split_k}_v{VEC}"
         f"_w{w_dtype}_frlds"
+        f"{f'_bt{block_threads}' if block_threads != BLOCK_THREADS else ''}"
     )
 
     @flyc.kernel(name=module_name)
@@ -302,7 +306,7 @@ def build_moe_gather_reduce_module(
         )
         launcher.launch(
             grid=(fx.Int64(num_tokens), n_iters, 1),
-            block=(BLOCK_THREADS, 1, 1),
+            block=(block_threads, 1, 1),
             stream=stream,
         )
 

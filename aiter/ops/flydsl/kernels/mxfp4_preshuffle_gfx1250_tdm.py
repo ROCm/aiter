@@ -60,11 +60,6 @@ DS_FIRST_N = int(os.environ.get("AITER_FLYDSL_DS_FIRST_N", "0"))
 EXPLICIT_VGPR_PARTITION = int(
     os.environ.get("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION", "0")
 )
-PLANAR_LDS = int(os.environ.get("AITER_FLYDSL_PLANAR_LDS", "0"))
-INTERLEAVED_LDS_LOAD = int(os.environ.get("AITER_FLYDSL_INTERLEAVED_LDS_LOAD", "0"))
-LDS_SOA_LOAD_INTERLEAVE = os.environ.get("LDS_SOA_LOAD_INTERLEAVE")
-if LDS_SOA_LOAD_INTERLEAVE is not None:
-    LDS_SOA_LOAD_INTERLEAVE = int(LDS_SOA_LOAD_INTERLEAVE)
 FORCE_1X4_CLUSTER = int(os.environ.get("AITER_FLYDSL_FORCE_1X4_CLUSTER", "0"))
 DISABLE_CLUSTER_SYNC = int(os.environ.get("AITER_FLYDSL_DISABLE_CLUSTER_SYNC", "0"))
 if MMA_GROUP < 1 or MMA_FIRST_GROUP < 1:
@@ -73,12 +68,6 @@ if DS_FIRST_N < 0:
     raise ValueError("AITER_FLYDSL_DS_FIRST_N must be non-negative")
 if EXPLICIT_VGPR_PARTITION not in (0, 1):
     raise ValueError("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION must be 0 or 1")
-if PLANAR_LDS not in (0, 1):
-    raise ValueError("AITER_FLYDSL_PLANAR_LDS must be 0 or 1")
-if INTERLEAVED_LDS_LOAD not in (0, 1):
-    raise ValueError("AITER_FLYDSL_INTERLEAVED_LDS_LOAD must be 0 or 1")
-if LDS_SOA_LOAD_INTERLEAVE not in (None, 0, 1):
-    raise ValueError("LDS_SOA_LOAD_INTERLEAVE must be 0 or 1")
 if FORCE_1X4_CLUSTER not in (0, 1):
     raise ValueError("AITER_FLYDSL_FORCE_1X4_CLUSTER must be 0 or 1")
 if DISABLE_CLUSTER_SYNC not in (0, 1):
@@ -130,7 +119,7 @@ def launch_gemm_a8w4_tdm(
     arg_scale_b: fx.Tensor,
     i32_m: fx.Int32,
     stream: fx.Stream,
-    N: fx.Int32,
+    N: Constexpr[int],
     K: Constexpr[int],
     tile_m: Constexpr[int],
     tile_n: Constexpr[int],
@@ -172,6 +161,13 @@ def launch_gemm_a8w4_tdm(
     persistent_workers: Constexpr[int] = 0,
     rolled_drain: Constexpr[int] = 0,
     m_alignment: Constexpr[int] = 0,
+    arg_m_expert_tile_map: fx.Tensor = None,
+    expert_tile_m: Constexpr[int] = 0,
+    direct_expert_map: Constexpr[int] = 0,
+    static_m: Constexpr[int] = 0,
+    persistent_single_task: Constexpr[int] = 0,
+    force_mid_compute: Constexpr[int] = 0,
+    linear_wg_map: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -205,20 +201,19 @@ def launch_gemm_a8w4_tdm(
         assert not (
             enable_ep_scatter and ep_quant_bits
         ), "persistent EP scatter requires an unquantized combine wire"
+    else:
+        assert not persistent_single_task, "single-task mode requires persistent workers"
+    # If tasks can be 1:1 with workgroups
+    if linear_wg_map:
+        assert cluster_m == 1 and cluster_n == 1
     # Resolve per-row settings before specializing the layout and cache key.
-    lds_soa_load_interleave_on = (
-        lds_soa_load_interleave
-        if LDS_SOA_LOAD_INTERLEAVE is None
-        else LDS_SOA_LOAD_INTERLEAVE
-    )
+    lds_soa_load_interleave_on = lds_soa_load_interleave
     assert lds_soa_load_interleave_on in (
         0,
         1,
     ), "lds_soa_load_interleave must be 0 or 1"
-    planar_lds_on = int(bool(PLANAR_LDS or lds_soa_load_interleave_on))
-    interleaved_lds_load_on = int(
-        bool(INTERLEAVED_LDS_LOAD or lds_soa_load_interleave_on)
-    )
+    planar_lds_on = int(bool(lds_soa_load_interleave_on))
+    interleaved_lds_load_on = int(bool(lds_soa_load_interleave_on))
     WMMA_M = 16
     WMMA_N = 32 if a_is_fp4 else 16
     WMMA_K = 128
@@ -277,6 +272,11 @@ def launch_gemm_a8w4_tdm(
         persistent_workers,
         rolled_drain,
         ROW_ALIGNMENT,
+        direct_expert_map,
+        static_m,
+        persistent_single_task,
+        force_mid_compute,
+        linear_wg_map,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -442,6 +442,9 @@ def launch_gemm_a8w4_tdm(
     _interleaved_lds_load = "_interleavelds" if interleaved_lds_load_on else ""
     _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
+    _persistent_single = "_pw1task" if persistent_single_task else ""
+    _mid_compute = "_midpipe" if force_mid_compute else ""
+    _linear_wg_map = "_linearwg" if linear_wg_map else ""
     _drain = "_rolleddrain" if rolled_drain else ""
     _kname = (
         f"a8w4_tdm_{_afp}"
@@ -452,7 +455,8 @@ def launch_gemm_a8w4_tdm(
         f"{_b_tdm_th}{_waves_per_tensor}{_ep}{_epq}"
         f"{_mma_group}{_ds_first}"
         f"{_explicit_vgpr_partition}{_planar_lds}"
-        f"{_interleaved_lds_load}{_persistent}{_drain}"
+        f"{_interleaved_lds_load}{_persistent}{_persistent_single}"
+        f"{_mid_compute}{_linear_wg_map}{_drain}"
     )
 
     # Compile the static path directly, preserving its launch ABI and the
@@ -473,11 +477,12 @@ def launch_gemm_a8w4_tdm(
         arg_scale_a: fx.Pointer,
         arg_scale_b: fx.Pointer,
         arg_m_tile_map: fx.Pointer,
+        arg_m_expert_tile_map: fx.Pointer,
         arg_bias: fx.Pointer,
         arg_quant_scale: fx.Pointer,
         arg_ep_row_map: fx.Pointer,
         i32_m: fx.Int32,
-        i32_n: fx.Int32,
+        i32_n: Constexpr[int],
         f32_swiglu_limit: fx.Float32,
         f32_situ_beta: fx.Float32,
         f32_situ_linear_beta: fx.Float32,
@@ -502,28 +507,47 @@ def launch_gemm_a8w4_tdm(
         TILES_PER_GROUP = 16
         assert TILES_PER_GROUP % cluster_m == 0
         total_n_tiles = ceildiv(i32_n, tile_n)
-        total_m_tiles = ceildiv(schedule_rows if persistent_workers else i32_m, tile_m)
-        swz_id = bid_x // cluster_n if cluster_n > 1 else bid_x
-        local_n = bid_x - swz_id * cluster_n if cluster_n > 1 else 0
-        n_units = total_n_tiles // cluster_n if cluster_n > 1 else total_n_tiles
-        local_m = fx.block_idx.y if cluster_m > 1 else 0
-        m_units = (total_m_tiles + cluster_m - 1) // cluster_m
-        group_m_units = TILES_PER_GROUP // cluster_m
-        blocks_per_group = n_units * group_m_units
-        group = swz_id // blocks_per_group
-        group_first_tile = group * group_m_units
-        in_group = swz_id - group * blocks_per_group
-        rem_tiles = m_units - group_first_tile
-        group_tiles = (rem_tiles < group_m_units).select(rem_tiles, group_m_units)
-        m_unit = group_first_tile + (in_group - (in_group // group_tiles) * group_tiles)
-        m_tile = m_unit * cluster_m + local_m
-        blk_m = m_tile * tile_m
-        n_unit = in_group // group_tiles
-        blk_n = (
-            (n_unit * cluster_n + local_n) * tile_n
-            if cluster_n > 1
-            else n_unit * tile_n
+        capacity_rows = static_m if static_m else i32_m
+        total_m_tiles = ceildiv(
+            schedule_rows if persistent_workers else capacity_rows, tile_m
         )
+        # Do not swizzle if swizzle is not worth the overhead
+        # ex: with small M
+        if const_expr(linear_wg_map):
+            m_tile = bid_x // total_n_tiles
+            n_unit = bid_x - m_tile * total_n_tiles
+            blk_m = m_tile * tile_m
+            blk_n = n_unit * tile_n
+            local_m = 0
+            m_unit = m_tile
+        else:
+            swz_id = bid_x // cluster_n if cluster_n > 1 else bid_x
+            local_n = bid_x - swz_id * cluster_n if cluster_n > 1 else 0
+            n_units = (
+                total_n_tiles // cluster_n if cluster_n > 1 else total_n_tiles
+            )
+            local_m = fx.block_idx.y if cluster_m > 1 else 0
+            m_units = (total_m_tiles + cluster_m - 1) // cluster_m
+            group_m_units = TILES_PER_GROUP // cluster_m
+            blocks_per_group = n_units * group_m_units
+            swizzle_group = swz_id // blocks_per_group
+            group_first_tile = swizzle_group * group_m_units
+            in_group = swz_id - swizzle_group * blocks_per_group
+            rem_tiles = m_units - group_first_tile
+            group_tiles = (rem_tiles < group_m_units).select(
+                rem_tiles, group_m_units
+            )
+            m_unit = group_first_tile + (
+                in_group - (in_group // group_tiles) * group_tiles
+            )
+            n_unit = in_group // group_tiles
+            m_tile = m_unit * cluster_m + local_m
+            blk_m = m_tile * tile_m
+            blk_n = (
+                (n_unit * cluster_n + local_n) * tile_n
+                if cluster_n > 1
+                else n_unit * tile_n
+            )
         # A always follows the existing 1x4 direction: one M row broadcasts
         # across the four N columns, even when the physical cluster is 4x4.
         a_mcast_mask = (
@@ -547,17 +571,24 @@ def launch_gemm_a8w4_tdm(
         # result with the padding sentinel so it remains defined outside the
         # dynamic branch and the existing main-body guard stays valid.
         expert = blk_m * 0 + n_experts
-        if has_work:
-            lo, hi = blk_m * 0, blk_m * 0 + n_experts
-            for _ in range_constexpr(
-                max(1, math.ceil(math.log2(max(2, n_experts))) + 1)
-            ):
-                mid = (lo + hi) >> 1
-                mid_clamped = (mid < n_experts - 1).select(mid, n_experts - 1)
-                go_right = tile_map[mid_clamped] <= blk_m
-                lo = go_right.select(mid + 1, lo)
-                hi = go_right.select(hi, mid)
-            expert = lo
+        if const_expr(direct_expert_map):
+            expert_map = fx.recast_iter(i32_ptr, arg_m_expert_tile_map)
+            if has_work:
+                expert = expert_map[blk_m // expert_tile_m]
+                expert_safe = (expert < n_experts).select(expert, n_experts - 1)
+                has_work = blk_m < tile_map[expert_safe]
+        else:
+            if has_work:
+                lo, hi = blk_m * 0, blk_m * 0 + n_experts
+                for _ in range_constexpr(
+                    max(1, math.ceil(math.log2(max(2, n_experts))) + 1)
+                ):
+                    mid = (lo + hi) >> 1
+                    mid_clamped = (mid < n_experts - 1).select(mid, n_experts - 1)
+                    go_right = tile_map[mid_clamped] <= blk_m
+                    lo = go_right.select(mid + 1, lo)
+                    hi = go_right.select(hi, mid)
+                expert = lo
         if const_expr(ROW_ALIGNMENT > tile_m):
             # Skips padding between experts, free more resources in decode
             expert_safe = (expert < n_experts).select(expert, n_experts - 1)
@@ -1485,7 +1516,9 @@ def launch_gemm_a8w4_tdm(
             def run_mainloop(interleaved_lds_load):
                 # Post-compute wins for decode and for shallow pipelines: at
                 # num_buffers<=2 mid-compute prefetches one tile and under-overlaps.
-                if const_expr(tile_m <= 32 or num_buffers <= 2):
+                if const_expr(
+                    (tile_m <= 32 or num_buffers <= 2) and not force_mid_compute
+                ):
                     # Post-compute issue: better for decode (small tile_m).
                     for i in range_constexpr(num_buffers):
                         issue(i, i)
@@ -1732,7 +1765,9 @@ def launch_gemm_a8w4_tdm(
                 scale_rsrc = create_buffer_resource_from_addr(
                     fx.ptrtoint(scale_ptr),
                     num_records_bytes=(
-                        fx.Int64(i32_m) * fx.Int64(q_dst_scale_dwpr) * fx.Int64(4)
+                        fx.Int64(capacity_rows)
+                        * fx.Int64(q_dst_scale_dwpr)
+                        * fx.Int64(4)
                     ).ir_value(),
                 )
 
@@ -2260,7 +2295,7 @@ def launch_gemm_a8w4_tdm(
                     rocdl.s_wait_storecnt(0)
                 tdm_ops.tensor_wait(0)
 
-        if const_expr(persistent_workers > 0):
+        if const_expr(persistent_workers > 0 and not persistent_single_task):
             # Every wave must retire the output store before another wave
             # reuses the same LDS arena for the next task's input. This also
             # covers the fused scatter's tensor_wait above.
@@ -2274,11 +2309,12 @@ def launch_gemm_a8w4_tdm(
         arg_scale_a: fx.Pointer,
         arg_scale_b: fx.Pointer,
         arg_m_tile_map: fx.Pointer,
+        arg_m_expert_tile_map: fx.Pointer,
         arg_bias: fx.Pointer,
         arg_quant_scale: fx.Pointer,
         arg_ep_row_map: fx.Pointer,
         i32_m: fx.Int32,
-        i32_n: fx.Int32,
+        i32_n: Constexpr[int],
         f32_swiglu_limit: fx.Float32,
         f32_situ_beta: fx.Float32,
         f32_situ_linear_beta: fx.Float32,
@@ -2293,6 +2329,7 @@ def launch_gemm_a8w4_tdm(
                 arg_scale_a,
                 arg_scale_b,
                 arg_m_tile_map,
+                arg_m_expert_tile_map,
                 arg_bias,
                 arg_quant_scale,
                 arg_ep_row_map,
@@ -2317,17 +2354,23 @@ def launch_gemm_a8w4_tdm(
             tile_map = fx.recast_iter(map_ptr_type, arg_m_tile_map)
             rows = tile_map[n_experts - 1]
             tasks = ceildiv(rows, tile_m) * ceildiv(i32_n, tile_n)
-            for task_id in range(fx.block_idx.x, tasks, persistent_workers):
-                run_task(task_id, rows)
+            if const_expr(persistent_single_task):
+                if fx.block_idx.x < tasks:
+                    run_task(fx.block_idx.x, rows)
+            else:
+                for task_id in range(fx.block_idx.x, tasks, persistent_workers):
+                    run_task(task_id, rows)
         else:
-            run_task(fx.block_idx.x, i32_m)
+            run_task(fx.block_idx.x, static_m if static_m else i32_m)
 
-    m_tiles = ceildiv(i32_m, tile_m)
+    m_tiles = ceildiv(static_m if static_m else i32_m, tile_m)
     n_tiles = ceildiv(N, tile_n)
     if arg_ep_row_map is None:
         arg_ep_row_map = arg_c
     if arg_quant_scale is None:
         arg_quant_scale = arg_c
+    if arg_m_expert_tile_map is None:
+        arg_m_expert_tile_map = arg_c
     kargs = (
         fx.get_iter(arg_c),
         arg_a,
@@ -2335,6 +2378,7 @@ def launch_gemm_a8w4_tdm(
         fx.get_iter(arg_scale_a),
         fx.get_iter(arg_scale_b),
         arg_m_tile_map,
+        fx.get_iter(arg_m_expert_tile_map),
         arg_bias,
         fx.get_iter(arg_quant_scale),
         fx.get_iter(arg_ep_row_map),
