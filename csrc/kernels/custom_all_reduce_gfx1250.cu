@@ -590,7 +590,7 @@ void start_sync_latency(fptr_t _fa, int64_t blocks)
     int ws = fa->world_size_;
     constexpr int threads = 256;
 #define LAUNCH_START_SYNC(NG) \
-    aiter::start_sync_latency<NG><<<blocks, threads, 0, stream>>>( \
+    aiter::start_sync_kernel<NG><<<blocks, threads, 0, stream>>>( \
         fa->sg_, fa->self_sg_, fa->rank_)
     DISPATCH_AG_NGPUS_1250(ws, LAUNCH_START_SYNC);
 #undef LAUNCH_START_SYNC
@@ -603,7 +603,7 @@ void end_sync_latency(fptr_t _fa, int64_t blocks)
     int ws = fa->world_size_;
     constexpr int threads = 256;
 #define LAUNCH_END_SYNC(NG) \
-    aiter::end_sync_latency<NG><<<blocks, threads, 0, stream>>>( \
+    aiter::end_sync_kernel<NG><<<blocks, threads, 0, stream>>>( \
         fa->sg_, fa->self_sg_, fa->rank_)
     DISPATCH_AG_NGPUS_1250(ws, LAUNCH_END_SYNC);
 #undef LAUNCH_END_SYNC
@@ -616,7 +616,7 @@ void two_sync_latency(fptr_t _fa, int64_t blocks)
     int ws = fa->world_size_;
     constexpr int threads = 256;
 #define LAUNCH_TWO_SYNC(NG) \
-    aiter::two_sync_latency<NG><<<blocks, threads, 0, stream>>>( \
+    aiter::two_sync_kernel<NG><<<blocks, threads, 0, stream>>>( \
         fa->sg_, fa->self_sg_, fa->rank_)
     DISPATCH_AG_NGPUS_1250(ws, LAUNCH_TWO_SYNC);
 #undef LAUNCH_TWO_SYNC

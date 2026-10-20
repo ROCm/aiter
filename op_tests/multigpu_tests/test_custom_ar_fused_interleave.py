@@ -68,11 +68,12 @@ def _worker(
     eps = 1e-6
     weight = _inputs(-1, (hidden,), device)
     small, big = (small_rows, hidden), (big_rows, hidden)
-    fused_big = (fused_big_rows, hidden)
+    fused_big_shapes = tuple((rows, hidden) for rows in fused_big_rows)
     worst = {"fused": 0.0, "fused_big": 0.0, "small": 0.0, "big": 0.0, "gather": 0.0}
     for step in range(1, steps + 1):
         seeds = [8 * (step * tp_size + r) for r in range(tp_size)]
         residual = _inputs(-2 - step, small, device)
+        fused_big = fused_big_shapes[step % len(fused_big_shapes)]
         residual_big = _inputs(-3 - step, fused_big, device)
 
         _skew(rank, step)
@@ -123,7 +124,7 @@ def test_mixed_size_custom_ar_under_skew(
     hidden=6144,
     small_rows=4,
     big_rows=16,
-    fused_big_rows=384,
+    fused_big_rows=(384, 1024),
     timeout_s=600,
 ):
     init_method = get_distributed_init_method(get_ip(), get_open_port())
