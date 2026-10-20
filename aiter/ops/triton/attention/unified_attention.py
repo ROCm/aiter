@@ -892,6 +892,12 @@ def _unified_attention_3d_gfx1250(
     QUERY_DTYPE = get_dtype_str(params.q_dtype)
     KV_CACHE_DTYPE = get_dtype_str(params.kv_cache_dtype)
     config = get_unified_attention_config("attn_3d", params, backend="gluon")
+    if config.get("num_stages", 2) != 2:
+        raise ValueError(
+            f"_unified_attention_gluon_kernel_3d requires num_stages==2 "
+            f"(the pipeline is hard-wired for exactly one tile of prefetch); "
+            f"got num_stages={config['num_stages']} from the attn_3d config"
+        )
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
     )

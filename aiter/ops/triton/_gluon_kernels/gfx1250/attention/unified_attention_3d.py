@@ -1992,7 +1992,10 @@ def _unified_attention_gluon_kernel_3d(
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
-    assert num_stages == 2
+    gl.static_assert(
+        num_stages == 2,
+        "_unified_attention_gluon_kernel_3d requires num_stages==2; the pipeline is hard-wired for exactly one tile of prefetch",
+    )
     # Build config with all layouts and derived constants
     cfg = AttentionConfig(
         HEAD_SIZE,
