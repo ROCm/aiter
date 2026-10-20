@@ -37,7 +37,7 @@ from aiter.ops.flydsl.kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
     flash_attn_a8w8_m32x8_supported,
 )
 from aiter.ops.flydsl.kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
-    flash_attn_m32x8_supported,
+    flash_attn_a16w16_m32x8_supported,
     supports_gqa_ratio,
 )
 from aiter.ops.mha import flash_attn_func, flash_attn_varlen_func
@@ -752,7 +752,7 @@ def _backend_serves_dtypes(q_dtype, kv_dtype):
     gate = (
         flash_attn_a8w8_m32x8_supported
         if q_dtype in _B8_TORCH
-        else flash_attn_m32x8_supported
+        else flash_attn_a16w16_m32x8_supported
     )
     return bool(gate("varlen", q, k, v))
 

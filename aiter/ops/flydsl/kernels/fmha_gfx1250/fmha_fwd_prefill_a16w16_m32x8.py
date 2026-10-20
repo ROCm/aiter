@@ -3233,7 +3233,7 @@ def _ensure_bshd_kernel(
     _launch_fns[key] = _launch
 
 
-def flash_attn_m32x8_supported(
+def flash_attn_a16w16_m32x8_supported(
     mode,
     q,
     k,
