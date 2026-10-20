@@ -100,3 +100,10 @@ default heuristic. It uses identical inputs and weights, checks an FP32 referenc
 metadata and 21 alternating timing samples for each implementation. Timings use warm HIP graphs
 with ten calls per replay; routing, quantization, both GEMMs and weighted combination are included.
 Weight preparation, router top-k and compilation are excluded.
+
+It also compares AITER's native FlyDSL MXFP8 path, its fused shared-expert path for top-k 9,
+and their stage-two reduction variants. The original FP8 weight payloads are unchanged; each
+power-of-two 128x128 scale is repeated losslessly into per-32 E8M0 scales before weight shuffling.
+This changes activation quantization to per-32. One-time weight repacking is excluded, while
+runtime activation quantization is included. Every candidate must pass the same FP32-reference
+check. Failed candidates are retained in the JSON rather than counted as valid baselines.
