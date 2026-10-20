@@ -283,7 +283,7 @@ def test_mhc_fused_post_pre_delayed(m, hidden_size=5120, identity_pre=False, see
     out, us = run_perftest(seam_new, *args, pre_mix)
     out_n, norm_us = run_perftest(seam_new_rmsnorm, *args, pre_mix, norm_weight=w)
     out_t, triton_us = run_perftest(seam_triton_rmsnorm, *args, pre_mix, w)
-    residual_out, post_mix, comb_mix, layer_input, next_pre = out
+    _, post_mix, comb_mix, _, next_pre = out
 
     g_ref = gates_ref(res_a, inp["fn"], inp["hc_scale"], inp["hc_base"])
     diff_post_a = max_diff(post_a, g_ref[0])
