@@ -14,11 +14,16 @@ MODES: tuple = get_args(Mode)
 CACHE_POLICIES: tuple = get_args(CachePolicy)
 METRICS: tuple = get_args(Metric)
 
-# Cache policy used when MeasureConfig.cache is None.
+# Cache policy used when MeasureConfig.cache is None. Every mode defaults to
+# cold inputs, so a number never depends on what the previous call left in the
+# cache.
 #   device: rotate -- matches run_perftest, so device numbers stay comparable.
-#   graph:  warm   -- back-to-back replay of resident buffers, as in serving.
+#   graph:  rotate -- a graph cannot flush between recorded calls, so cold
+#                     inputs come from cycling input copies.
 #   eager:  flush  -- matches triton.testing.do_bench.
-DEFAULT_CACHE: dict = {"device": "rotate", "graph": "warm", "eager": "flush"}
+# When the callable takes no inputs (a closure), rotate falls back to flush,
+# or to warm in graph mode, with a note in the result.
+DEFAULT_CACHE: dict = {"device": "rotate", "graph": "rotate", "eager": "flush"}
 
 
 def _check_choice(name, value, choices):
@@ -60,7 +65,7 @@ class MeasureConfig:
     eager_sync_each: bool = False
     graph_min_replay_us: float = 1000.0
     graph_max_calls: int = 4096
-    rotate_max_copies: int = 1024
+    rotate_max_copies: int = 4096
     record_gpu_state: bool = True
     telemetry: bool = False
 

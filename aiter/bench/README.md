@@ -2,10 +2,6 @@
 
 One timing interface for every aiter backend (FlyDSL, CK, ASM, HIP, Triton).
 Every result records which mode, cache policy and environment produced it.
-Design and roadmap: `op_tests/dump_data/docs/aiter_unified_benchmarking_plan.md`.
-
-`run_perftest` in `aiter/test_common.py` is unchanged. `aiter.bench` sits
-beside it.
 
 ## Quick start
 
@@ -34,16 +30,16 @@ to every call you want to compare.
 | Mode | Measures | How | Use it for |
 |---|---|---|---|
 | `device` (default) | GPU busy time per call: the sum of every kernel, memcpy and memset the call launches | torch.profiler hardware timestamps. Each call runs in its own profiler range, and a GPU operation belongs to the call whose range issued its launch (matched by correlation id, not kernel name). | Kernel work in isolation; per-kernel breakdown (`per_kernel_us`); comparable to `run_perftest` |
-| `graph` | Steady-state time per call when replayed from a HIP graph, as graph-based serving runs it | K calls recorded into one graph; each sample is one replay ÷ K. K is chosen so one replay takes at least `graph_min_replay_us` (default 1000 µs). Fails with `EmptyGraphCaptureError` when nothing was captured. | **PR verdicts** (graph median); production-style A/B |
+| `graph` | Steady-state time per call when replayed from a HIP graph, as graph-based serving runs it | K calls recorded into one graph; each sample is one replay ÷ K. K is chosen so one replay takes at least `graph_min_replay_us` (default 1000 µs). Fails with `EmptyGraphCaptureError` when nothing was captured. |  Production-style A/B coparisons|
 | `eager` | Per-call time including host launch overhead | GPU events around every call; one sync at the end (`do_bench` pattern). `eager_sync_each=True` drains every call, adding the full host round trip. | Non-graph serving; launch-overhead questions |
 
-Reading them together:
+Reading the benchmarking times
 
 | Observation | Meaning |
 |---|---|
 | `eager` ≫ `graph` | Host launch overhead dominates at this shape. |
 | `device` `span_us` > `median_us` | Gaps between the call's kernels (`span_us − median_us`). |
-| `graph` > `device` for kernels under ~2 µs | Graph replay pays a per-kernel GPU dispatch cost (~0.5 µs on MI350P) that profiler timestamps leave out. Real in serving. |
+| `graph` > `device` for kernels under ~2 µs | Graph replay pays a per-kernel GPU dispatch cost that profiler timestamps leave out. Real in serving. |
 | `graph` < `device` for kernels of ~2–10 µs | Back-to-back kernels in a graph overlap dispatch with the previous kernel's tail; device mode times each kernel separately. |
 | `graph` ≈ `device` above ~20 µs | Fixed per-kernel effects are negligible. |
 
@@ -54,22 +50,27 @@ number. Compare like with like: same mode, cache policy and `MeasureConfig`.
 
 A `g.replay()` costs the host about 6 µs and the GPU a further 5–10 µs of
 fixed setup. With one call per graph, every kernel faster than that reads as
-the replay cost (a 1.2 µs kernel measured 5.9 µs on MI350P). Spreading the
-fixed cost over K calls bounds its share at roughly
+the replay cost. Spreading the fixed cost over K calls bounds its share at roughly
 `fixed_cost / graph_min_replay_us`, about 1% at the default.
 
 ## Cache policies
 
 | Policy | Effect | Default for |
 |---|---|---|
-| `warm` | Same inputs every call; they stay cache-resident. | `graph` |
-| `rotate` | Deep copies of the inputs, cycled so each call reads data that is not cache-resident (sized from the last-level cache, 256 MB Infinity Cache on gfx942/gfx950). Needs inputs passed as arguments. | `device` (matches `run_perftest`) |
+| `warm` | Same inputs every call; they stay cache-resident. | — (opt in) |
+| `rotate` | Deep copies of the inputs, cycled so each call reads data that is not cache-resident (sized from the last-level cache, 256 MB Infinity Cache on gfx942/gfx950). Needs inputs passed as arguments. In graph mode each copy is one recorded call, so at most `graph_max_calls` copies. | `device` (matches `run_perftest`), `graph` |
 | `flush` | Overwrite a buffer twice the last-level cache size before each call, outside the timed span. Not available in graph mode (use `rotate`). | `eager` (matches `do_bench`) |
 | `auto` | Probe warm vs flushed calls; go cold (`flush`, or `rotate` in graph mode) when cold is more than 5% slower. The measured difference is in `cache_probe_delta`. | — |
 
-`cache=None` (the default) picks the per-mode default above. The policy that
-actually ran is always in `result.cache_policy`. A `rotate` that could not fit
-enough copies adds a "partly warm" note.
+`cache=None` (the default) picks the per-mode default above: **every mode
+defaults to cold inputs**. A callable without inputs (a closure) has nothing
+to rotate, so the default falls back to `flush`, or to `warm` in graph mode
+with a note. The policy that actually ran is always in `result.cache_policy`.
+A `rotate` that could not fit enough copies adds a "partly warm" note. This
+happens in graph mode for small inputs: being cold needs about
+2 × 256 MB / input size copies, more than `graph_max_calls` (4096) for inputs
+under about 128 KB. Kernels with inputs that small are rarely limited by
+memory traffic.
 
 ## Results
 

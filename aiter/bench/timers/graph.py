@@ -79,8 +79,11 @@ def _estimate_call_us(calls, probes=5):
     return max(sorted(times)[len(times) // 2], 1e-3)
 
 
-def _calls_for(target_us, call_us, min_k, max_k):
-    return max(min_k, min(max_k, math.ceil(target_us / call_us)))
+def _calls_for(target_us, call_us, n_copies, max_k):
+    """Calls per replay: a whole number of passes over the input copies."""
+    passes = math.ceil(target_us / call_us / n_copies)
+    passes = max(1, min(passes, max_k // n_copies))
+    return passes * n_copies
 
 
 def time_graph(calls, iters, *, min_replay_us, max_calls) -> TimerOutput:
@@ -94,17 +97,17 @@ def time_graph(calls, iters, *, min_replay_us, max_calls) -> TimerOutput:
             call()
     torch.cuda.synchronize()
 
-    # Every rotated copy appears at least once per replay, otherwise the
-    # replay would cycle through a subset of the copies.
-    min_k = min(len(calls), max_calls)
+    # Every rotated copy appears equally often per replay, otherwise the
+    # replay would favour a subset of the copies.
+    n_copies = min(len(calls), max_calls)
     # The eager estimate includes host overhead, so it overestimates small
     # kernels and K comes out too small; one refinement from the measured
     # replay corrects that.
-    k = _calls_for(min_replay_us, _estimate_call_us(calls), min_k, max_calls)
+    k = _calls_for(min_replay_us, _estimate_call_us(calls), n_copies, max_calls)
     graph = _capture(calls, k, stream)
     replay_us = _replay_us(graph, 3)
     if replay_us < min_replay_us / 2 and k < max_calls:
-        refined = _calls_for(min_replay_us, replay_us / k, min_k, max_calls)
+        refined = _calls_for(min_replay_us, replay_us / k, n_copies, max_calls)
         if refined > k:
             graph.reset()
             k = refined

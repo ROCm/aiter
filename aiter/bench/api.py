@@ -82,11 +82,22 @@ def _measure(fn, args, kwargs, cfg, name, flops, nbytes):
 
     cache = cfg.resolved_cache
     delta = None
+    has_inputs = input_bytes(args, kwargs) > 0
     if cache == "auto":
-        has_inputs = input_bytes(args, kwargs) > 0
         cache, delta = _resolve_auto(
             _call(fn, args, kwargs), cfg.mode, has_inputs, notes
         )
+    elif cache == "rotate" and cfg.cache is None and not has_inputs:
+        # Default policy on a closure: nothing to rotate. An explicit
+        # cache="rotate" still raises in make_rotation.
+        if cfg.mode == "graph":
+            cache = "warm"
+            notes.append(
+                "graph mode runs cold only by rotating inputs, and none were "
+                "passed (pass them via args); timed warm"
+            )
+        else:
+            cache = "flush"
     if cache == "flush" and cfg.mode == "graph":
         raise ValueError(
             "graph mode cannot flush the cache between recorded calls; use "
@@ -97,8 +108,13 @@ def _measure(fn, args, kwargs, cfg, name, flops, nbytes):
     if cache == "rotate":
         # Graph replays repeat the recorded calls, so copies are reused.
         timed_calls = None if cfg.mode == "graph" else cfg.iters + _DEVICE_EXTRA_CALLS
+        # A graph replay records one call per copy, so copies beyond
+        # graph_max_calls would never run.
+        max_copies = cfg.rotate_max_copies
+        if cfg.mode == "graph":
+            max_copies = min(max_copies, cfg.graph_max_calls)
         rotation = make_rotation(
-            args, kwargs, cfg.rotate_max_copies, timed_calls=timed_calls, device=device
+            args, kwargs, max_copies, timed_calls=timed_calls, device=device
         )
         copies = rotation.copies
         if not rotation.cold:

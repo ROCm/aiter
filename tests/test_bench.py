@@ -44,7 +44,7 @@ FAST = {"iters": 20, "warmup_iters": 2, "record_gpu_state": False}
 
 def test_config_defaults_per_mode():
     assert MeasureConfig(mode="device").resolved_cache == "rotate"
-    assert MeasureConfig(mode="graph").resolved_cache == "warm"
+    assert MeasureConfig(mode="graph").resolved_cache == "rotate"
     assert MeasureConfig(mode="eager").resolved_cache == "flush"
     assert MeasureConfig(mode="graph", cache="rotate").resolved_cache == "rotate"
 
@@ -301,6 +301,26 @@ def test_rotate_copies_are_cold():
         _mul, MeasureConfig(mode="device", cache="rotate", **FAST), args=(x, y)
     )
     assert result.rotate_copies == 20 + device_timer.PROFILER_WARMUP
+    assert not any("partly warm" in note for note in result.notes)
+
+
+@needs_gpu
+@pytest.mark.parametrize(
+    "mode, fallback", [("device", "flush"), ("eager", "flush"), ("graph", "warm")]
+)
+def test_default_cache_on_closure_falls_back(mode, fallback):
+    x, y = _tensors()
+    result = time_fn(lambda: _mul(x, y), MeasureConfig(mode=mode, **FAST))
+    assert result.cache_policy == fallback
+    assert (mode == "graph") == any("timed warm" in note for note in result.notes)
+
+
+@needs_gpu
+def test_graph_rotates_by_default():
+    x, y = _tensors(1 << 22)  # 32 MB of inputs: 16 copies cover 2x the LLC
+    result = time_fn(_mul, MeasureConfig(mode="graph", **FAST), args=(x, y))
+    assert result.cache_policy == "rotate"
+    assert result.graph_calls_per_replay % result.rotate_copies == 0
     assert not any("partly warm" in note for note in result.notes)
 
 
