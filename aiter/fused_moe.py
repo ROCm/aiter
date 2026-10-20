@@ -1129,7 +1129,9 @@ def fused_moe(
     activations and one tile configuration for every token count. It is
     supported for bf16 activations x MXFP4 weights (``QuantType.per_1x32``,
     separated gate/up, preshuffled), SwiGLU or SiTUv2, bf16 output, without
-    expert parallelism, and is slower than the default.
+    expert parallelism, and is slower than the default. Its kernels (block_m 32,
+    reduce epilogue) are not in the tuned configs, so AOT precompilation does not
+    cover them and they are JIT-compiled on first use.
 
     Supplying any shared tensor (or ``shared_expert_id``) requires all four
     shared weight/scale tensors and dispatches through the gfx950 FHMoE path.
@@ -3434,7 +3436,9 @@ def _check_deterministic_supported(
             ),
             (gate_mode != GateMode.SEPARATED, f"gate_mode={gate_mode.value!r}"),
             (
-                gate_up_interleave is True,
+                not _flydsl_mxfp4_layout_is_compatible(
+                    dtypes.bf16, gate_mode, gate_up_interleave
+                ),
                 "gate/up-interleaved weights (the separated preshuffle only)",
             ),
             (

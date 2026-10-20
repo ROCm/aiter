@@ -270,3 +270,70 @@ def test_flydsl_a16wfp4_deterministic_rejects_unsupported():
         call(in_dtype=dtypes.fp16)
     with pytest.raises(NotImplementedError, match="interleaved"):
         call(interleaved=True)
+
+
+@_SKIP
+@pytest.mark.parametrize("capacity,local", [(2, 1), (2, 2), (8, 7), (8, 3)])
+def test_flydsl_a16wfp4_reduce_epilogue_stays_in_bounds(monkeypatch, capacity, local):
+    """With num_local_tokens below the batch capacity, the sort's padding rows must
+    not be stored by the reduce epilogue: its [capacity*topk, N] buffer is followed
+    by a guard region that has to stay untouched, and the local tokens match the
+    same tokens run alone."""
+    import aiter.ops.flydsl.kernels.moe_2stage_a16wmix as a16wmix
+
+    dtype = dtypes.bf16
+    torch.manual_seed(0)
+    model_dim, inter_dim, E, topk = 1024, 512, 32, 4
+    inp = torch.randn((capacity, model_dim), dtype=dtype, device="cuda")
+    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype, device="cuda")
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype, device="cuda")
+    score = torch.randn((capacity, E), dtype=dtype, device="cuda")
+    topk_weights, topk_ids = fused_topk(inp, score, topk, True)
+    tq = aiter.get_torch_quant(QuantType.per_1x32)
+    w1_qt, w1_scale = tq(w1 * model_dim**-0.5, quant_dtype=dtypes.fp4x2)
+    w2_qt, w2_scale = tq(w2 * inter_dim**-0.5, quant_dtype=dtypes.fp4x2)
+    w1_s = shuffle_weight_a16w4(w1_qt.view(E, inter_dim * 2, model_dim // 2), 16, False)
+    w2_s = shuffle_weight_a16w4(w2_qt.view(E, model_dim, inter_dim // 2), 16, False)
+    w1_scale_s = shuffle_scale_a16w4(w1_scale, E, False)
+    w2_scale_s = shuffle_scale_a16w4(w2_scale, E, False)
+
+    guard_fill = 7.0
+    touched = []
+    gemm2 = a16wmix.flydsl_a16w4_gemm2
+
+    def guarded_gemm2(*args, flat_out, epilog="atomic", **kwargs):
+        if epilog != "reduce":
+            return gemm2(*args, flat_out=flat_out, epilog=epilog, **kwargs)
+        n = flat_out.numel()
+        buf = torch.full((n + topk * model_dim,), guard_fill, dtype=flat_out.dtype)
+        buf = buf.to(flat_out.device)
+        ret = gemm2(*args, flat_out=buf[:n], epilog=epilog, **kwargs)
+        flat_out.copy_(buf[:n])
+        touched.append(int((buf[n:] != guard_fill).sum()))
+        return ret
+
+    monkeypatch.setattr(a16wmix, "flydsl_a16w4_gemm2", guarded_gemm2)
+
+    def run(rows, num_local_tokens=None):
+        return fused_moe(
+            inp[rows],
+            w1_s,
+            w2_s,
+            topk_weights[rows],
+            topk_ids[rows],
+            w1_scale=w1_scale_s,
+            w2_scale=w2_scale_s,
+            quant_type=QuantType.per_1x32,
+            activation=ActivationType.Swiglu,
+            gate_mode=GateMode.SEPARATED.value,
+            num_local_tokens=num_local_tokens,
+            deterministic=True,
+        )
+
+    n_local = torch.tensor([local], dtype=dtypes.i32, device="cuda")
+    out = run(slice(None), n_local)
+    torch.cuda.synchronize()
+    assert (
+        touched and touched[-1] == 0
+    ), f"reduce epilogue wrote {touched[-1] if touched else '?'} elements past its buffer"
+    assert torch.equal(out[:local], run(slice(0, local))), "local tokens differ"

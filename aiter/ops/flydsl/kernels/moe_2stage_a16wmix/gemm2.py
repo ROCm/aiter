@@ -229,7 +229,9 @@ def _reduce_bf16_epilog(
         row_in_block = fx.Int32(mr * 8) + m_lane
         token_id = packed[mr] & fx.Int32(0x00FFFFFF)
         slot = packed[mr] >> fx.Int32(24)
-        if token_id < i32_M:
+        # Padding rows of the sort carry slot == topk; with num_local_tokens they
+        # can also carry a token id below M, so check the slot too.
+        if (token_id < i32_M) & (slot < fx.Int32(TOPK)):
             row_base_addr = (
                 (token_id * fx.Int32(TOPK) + slot) * fx.Int32(N_OUT)
                 + n_block_idx * fx.Int32(BN)

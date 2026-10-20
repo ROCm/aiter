@@ -911,6 +911,9 @@ def _precompile_a16w4_to_cache(
     )
 
     z = torch.zeros(1, dtype=torch.int32, device="cpu")
+    # The bias only has to exist with the right size (the launchers check it) for
+    # the has_bias variant to be compiled.
+    enable_bias = bool(kwargs.get("enable_bias"))
     common = {
         "sorted_expert_ids": z,
         "cumsum_tensor": z,
@@ -939,6 +942,11 @@ def _precompile_a16w4_to_cache(
                 act=("situv2" if act in ("situv2", "situ") else act),
                 w_dtype=b_dtype,
                 w_layout="standard",
+                bias=(
+                    torch.zeros(experts * 2 * inter_dim, dtype=torch.float32)
+                    if enable_bias
+                    else None
+                ),
                 **common,
             )
         else:
@@ -954,6 +962,7 @@ def _precompile_a16w4_to_cache(
                 if inter_dim % tile_k == 0
                 else (128 if inter_dim % 128 == 0 else 64)
             )
+            epilog = "reduce" if kwargs.get("mode") == "reduce" else "atomic"
             flydsl_a16w4_gemm2(
                 inter_sorted_bf16=z,
                 w2_u8=z,
@@ -966,9 +975,29 @@ def _precompile_a16w4_to_cache(
                 tile_n=g2_tile_n,
                 tile_k=g2_tile_k,
                 w_dtype=b_dtype,
-                epilog=("reduce" if kwargs.get("mode") == "reduce" else "atomic"),
+                epilog=epilog,
+                bias=(
+                    torch.zeros(experts * model_dim, dtype=torch.float32)
+                    if enable_bias
+                    else None
+                ),
                 **common,
             )
+            if epilog == "reduce":
+                # The runtime follows the reduce epilogue with moe_reduce; compile it
+                # through the same helper so the cache key matches.
+                from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
+
+                _run_moe_reduction(
+                    torch.zeros(topk * model_dim, dtype=torch.bfloat16),
+                    torch.zeros((1, model_dim), dtype=torch.bfloat16),
+                    1,
+                    topk,
+                    model_dim,
+                    expert_mask=None,
+                    topk_ids=None,
+                    stream=0,
+                )
 
 
 def _precompile_epilogue_to_cache(act: str, inter_dim: int, topk: int):
