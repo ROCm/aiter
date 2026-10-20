@@ -6,7 +6,7 @@
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
         "num_warps": 2,
-        "num_stages": 3,
+        "NUM_BUFFERS": 3,
         "waves_per_eu": 0,
         "cache_modifier": null,
         "NUM_KSPLIT": 16
@@ -17,7 +17,7 @@
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
         "num_warps": 2,
-        "num_stages": 3,
+        "NUM_BUFFERS": 3,
         "waves_per_eu": 0,
         "cache_modifier": null,
         "NUM_KSPLIT": 16
@@ -28,7 +28,7 @@
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
         "num_warps": 2,
-        "num_stages": 4,
+        "NUM_BUFFERS": 4,
         "waves_per_eu": 0,
         "cache_modifier": null,
         "NUM_KSPLIT": 16
@@ -39,7 +39,7 @@
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
         "num_warps": 2,
-        "num_stages": 6,
+        "NUM_BUFFERS": 6,
         "waves_per_eu": 4,
         "cache_modifier": null,
         "NUM_KSPLIT": 8
@@ -50,7 +50,7 @@
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
         "num_warps": 2,
-        "num_stages": 4,
+        "NUM_BUFFERS": 4,
         "waves_per_eu": 2,
         "cache_modifier": null,
         "NUM_KSPLIT": 8
@@ -61,7 +61,7 @@
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
         "num_warps": 4,
-        "num_stages": 6,
+        "NUM_BUFFERS": 6,
         "waves_per_eu": 4,
         "cache_modifier": null,
         "NUM_KSPLIT": 8
@@ -72,7 +72,7 @@
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
         "num_warps": 2,
-        "num_stages": 6,
+        "NUM_BUFFERS": 6,
         "waves_per_eu": 1,
         "cache_modifier": null,
         "NUM_KSPLIT": 4
@@ -83,7 +83,7 @@
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
         "num_warps": 2,
-        "num_stages": 4,
+        "NUM_BUFFERS": 4,
         "waves_per_eu": 0,
         "cache_modifier": null,
         "NUM_KSPLIT": 4
@@ -94,7 +94,7 @@
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
         "num_warps": 2,
-        "num_stages": 6,
+        "NUM_BUFFERS": 6,
         "waves_per_eu": 1,
         "cache_modifier": null,
         "NUM_KSPLIT": 1
@@ -105,7 +105,7 @@
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
         "num_warps": 2,
-        "num_stages": 4,
+        "NUM_BUFFERS": 4,
         "waves_per_eu": 1,
         "cache_modifier": null,
         "NUM_KSPLIT": 1
@@ -116,7 +116,7 @@
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
         "num_warps": 2,
-        "num_stages": 4,
+        "NUM_BUFFERS": 4,
         "waves_per_eu": 1,
         "cache_modifier": null,
         "NUM_KSPLIT": 1
@@ -127,7 +127,7 @@
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
         "num_warps": 2,
-        "num_stages": 4,
+        "NUM_BUFFERS": 4,
         "waves_per_eu": 1,
         "cache_modifier": null,
         "NUM_KSPLIT": 1
@@ -138,7 +138,7 @@
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 8,
         "num_warps": 2,
-        "num_stages": 4,
+        "NUM_BUFFERS": 4,
         "waves_per_eu": 1,
         "cache_modifier": null,
         "NUM_KSPLIT": 1
@@ -149,7 +149,7 @@
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
         "num_warps": 4,
-        "num_stages": 2,
+        "NUM_BUFFERS": 2,
         "waves_per_eu": 1,
         "cache_modifier": null,
         "NUM_KSPLIT": 1
