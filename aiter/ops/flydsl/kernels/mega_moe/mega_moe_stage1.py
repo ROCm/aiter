@@ -31,7 +31,6 @@ from .gemm1 import _LdsF32View, build_fused_gemm1
 from .mega_moe_config import (
     FIXED_GRID_MULT_VALUES,
     INDEXED_PAYLOAD_MIN_MTPR,
-    INDEXED_PAYLOAD_MIN_SBM,
     Stage1Config,
     fixed_stage1_epoch_slot,
 )
@@ -178,10 +177,13 @@ def compile_mega_moe_stage1(
     if fixed_slot_dispatch:
         _validate_fixed_slot_geometry(fz_npes, fz_epr, fz_mtpr, fz_cap, fz_tile_m)
     fz_total_experts = fz_npes * fz_epr
+    # The payload buffer is sized for the source-indexed layout at the indexed-
+    # capable MTPR class, so every rank there uses indexed (one row per source
+    # token) regardless of sort_block_m. The receive layout must not depend on a
+    # per-rank quantity: a route-major rank would need one row per (token,expert),
+    # which cross-rank token skew can push past the shared payload buffer.
     indexed_payload = (
-        not fixed_slot_dispatch
-        and fuse_mtpr >= INDEXED_PAYLOAD_MIN_MTPR
-        and sort_block_m >= INDEXED_PAYLOAD_MIN_SBM
+        not fixed_slot_dispatch and fuse_mtpr >= INDEXED_PAYLOAD_MIN_MTPR
     )
     source_rows = fz_npes * fz_mtpr + 1 if indexed_payload else 0
     if indexed_payload and source_rows * model_dim >= _BUFFER_OFFSET_ABI_BYTES:
