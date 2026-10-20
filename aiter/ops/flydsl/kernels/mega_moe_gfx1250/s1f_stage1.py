@@ -89,7 +89,6 @@ from aiter.ops.flydsl.kernels.mxfp4_preshuffle_gfx1250_tdm import (
 )
 
 from . import tdm_prims as TDM
-from . import vector
 from .compact_plan import (
     PLAN_RUN_ROWS,
     RUN_HDR_RUNS,
@@ -341,10 +340,9 @@ def _tdm_group1_rows(dim0, rows, elem_bytes):
     ds = {1: 0, 2: 1, 4: 2, 8: 3}[elem_bytes]
     if not 1 <= dim0 <= TDM.TDM_MAX_DIM:
         raise ValueError(f"TDM row width {dim0} out of range")
-    r = readfirstlane(T.i32, arith.unwrap(rows))
-    r_hi = arith.shli(r, TDM._i32(16))
-    return vector.from_elements(
-        T.vec(8, T.i32),
+    r = fx.Int32(readfirstlane(T.i32, fx.Int32(rows).ir_value()))
+    r_hi = r << fx.Int32(16)
+    return fx.Vector.from_elements(
         [
             TDM._i32(ds << 16),
             TDM._i32((dim0 & 0xFFFF) << 16),
@@ -1220,8 +1218,8 @@ def make_s1f_stage1(
 
                 # ===================== W0: loader (one TDM gather per op) =====================
                 if wave == fx.Int32(0):
-                    z4 = vector.from_elements(T.vec(4, T.i32), [TDM._i32(0)] * 4)
-                    z8 = vector.from_elements(T.vec(8, T.i32), [TDM._i32(0)] * 8)
+                    z4 = fx.Vector.from_elements([TDM._i32(0)] * 4)
+                    z8 = fx.Vector.from_elements([TDM._i32(0)] * 8)
                     wire_lo = _uniform(_i32_lo(inp_tok))
                     wire_hi = _uniform(_i32_hi(inp_tok) | fx.Int32(-(1 << 31)))
                     ntok = _uniform(inp_cur_tok)
@@ -1258,8 +1256,7 @@ def make_s1f_stage1(
                             e1 = _vld4(rec + fx.Int32(16))
                             hdr = _uniform(fx.Int32(e0[0]))
                             row0 = _uniform(fx.Int32(e0[1]))
-                            g2 = vector.from_elements(
-                                T.vec(4, T.i32),
+                            g2 = fx.Vector.from_elements(
                                 [
                                     arith.unwrap(_uniform(fx.Int32(e1[i])))
                                     for i in range_constexpr(4)
@@ -1276,8 +1273,7 @@ def make_s1f_stage1(
                             ):
                                 _trap()
                             sl = slot_lds(k)
-                            g0 = vector.from_elements(
-                                T.vec(4, T.i32),
+                            g0 = fx.Vector.from_elements(
                                 [
                                     TDM._i32(0x80000001),
                                     arith.unwrap(_uniform(sl)),
@@ -1285,8 +1281,7 @@ def make_s1f_stage1(
                                     arith.unwrap(wire_hi),
                                 ],
                             )
-                            g1 = vector.from_elements(
-                                T.vec(8, T.i32),
+                            g1 = fx.Vector.from_elements(
                                 [
                                     TDM._i32(0),
                                     TDM._i32((row_stride & 0xFFFF) << 16),
@@ -1370,8 +1365,8 @@ def make_s1f_stage1(
                 # ===================== W2 / W3: storers (op parity) =====================
                 if wave >= fx.Int32(2):
                     sid = wave - fx.Int32(2)
-                    z4s = vector.from_elements(T.vec(4, T.i32), [TDM._i32(0)] * 4)
-                    z8s = vector.from_elements(T.vec(8, T.i32), [TDM._i32(0)] * 8)
+                    z4s = fx.Vector.from_elements([TDM._i32(0)] * 4)
+                    z8s = fx.Vector.from_elements([TDM._i32(0)] * 8)
 
                     def retire(hh, nin, vs_now):
                         """Op hh (the oldest of nin in flight) retires: its TDM
@@ -1468,8 +1463,7 @@ def make_s1f_stage1(
                             else:
                                 if n > fx.Int32(R):
                                     _trap()
-                                g0s = vector.from_elements(
-                                    T.vec(4, T.i32),
+                                g0s = fx.Vector.from_elements(
                                     [
                                         TDM._i32(1),
                                         arith.unwrap(_uniform(slot_lds(k))),
