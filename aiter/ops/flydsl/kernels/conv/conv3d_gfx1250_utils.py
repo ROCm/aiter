@@ -40,12 +40,19 @@ TILE_K = WMMA_K
 # Channels packed per K-tile (same as TILE_K for bf16 WMMA).
 CGP_ALIGN = TILE_K
 
-DEFAULT_TILE = (128, 128, 2, 4)  # tile_m, tile_n, m_warp, n_warp
+DEFAULT_TILE = (128, 128, 2, 2)  # tile_m, tile_n, m_warp, n_warp
 DEFAULT_BLOCK_ROWS = 8  # R such that R * C = tile_m with C % 16 == 0
+
+# Blocks of 8 or 16 waves return wrong results on gfx1250 (a different subset of
+# elements on every run, so most likely a cross-wave synchronization race); keep
+# them out of every path until the kernel is fixed.
+MAX_WAVES = 4
 
 
 def validate_launch_config_gfx1250(tile_m, tile_n, wave_m, wave_n, block_rows):
     """Why this tile cannot compile on gfx1250, or None."""
+    if wave_m * wave_n > MAX_WAVES:
+        return f"{wave_m}x{wave_n} waves exceed MAX_WAVES={MAX_WAVES}"
     block_threads = wave_m * wave_n * WAVE_SIZE
     if block_threads > 1024:
         return f"BLOCK_THREADS={block_threads} exceeds 1024"

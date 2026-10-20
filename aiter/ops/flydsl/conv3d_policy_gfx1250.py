@@ -16,6 +16,7 @@ from .kernels.conv.conv3d_gfx1250_utils import (
     BF16_BYTES,
     DEFAULT_BLOCK_ROWS,
     LDS_PAD,
+    MAX_WAVES,
     TILE_K,
     WMMA_M,
     WMMA_N,
@@ -38,7 +39,7 @@ WAVE_N_VALUES = (1, 2, 4)
 BLOCK_ROWS_VALUES = (2, 4, 8, 16)
 
 BASELINE_TILES = (
-    (128, 128, 2, 4, 8),
+    (128, 128, 2, 2, 8),
     (128, 64, 2, 2, 8),
     (64, 64, 2, 2, 4),
     (64, 32, 2, 1, 4),
@@ -47,7 +48,6 @@ BASELINE_TILES = (
 
 MAX_N_ACC = 32
 MIN_WAVES = 2
-MAX_WAVES = 16
 
 
 def is_legal_tile_gfx1250(tile_m, tile_n, wave_m, wave_n, block_rows):

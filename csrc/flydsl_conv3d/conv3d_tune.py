@@ -36,6 +36,7 @@ from aiter.ops.flydsl.conv3d_policy import (
 )
 from aiter.ops.flydsl.conv3d_policy_gfx1250 import (
     get_flydsl_conv3d_configs_gfx1250,
+    is_legal_tile_gfx1250,
     tile_kernel_name_gfx1250,
 )
 from aiter.ops.flydsl.conv_kernels import (
@@ -154,6 +155,19 @@ def conv3d_ref(x, weight, bias, params):
     ref_bias = bias.to(x.dtype) if bias is not None else None
     y = F.conv3d(x.permute(0, 4, 1, 2, 3).contiguous(), weight, bias=ref_bias, **params)
     return y.permute(0, 2, 3, 4, 1).contiguous()
+
+
+def strict_compare(ref, res, msg="", printLog=False):
+    """1.0 if any element is outside RTOL/ATOL, else 0.0.
+
+    mp_tuner rounds the error ratio to 4 decimals, so a plain ratio under 5e-5
+    -- thousands of wrong elements on the larger VAE layers -- would pass
+    errRatio=0.
+    """
+    bad = int((~torch.isclose(res, ref, rtol=RTOL, atol=ATOL)).sum().item())
+    if bad and printLog:
+        logger.info(f"{msg}{bad} of {ref.numel()} elements outside tolerance")
+    return 1.0 if bad else 0.0
 
 
 def _shape_key(row):
@@ -432,7 +446,8 @@ class Conv3dTuner(TunerCommon):
         )
         if borrowed is not None:
             b = (*borrowed[0], borrowed[1], borrowed[3])
-            if b not in candidates:
+            legal = not is_1250 or is_legal_tile_gfx1250(*b[:4], b[5])
+            if legal and b not in candidates:
                 candidates.append(b)
 
         tasks = []
@@ -480,7 +495,7 @@ class Conv3dTuner(TunerCommon):
                     None,
                     RTOL,
                     ATOL,
-                    None,  # compare_fn
+                    strict_compare,
                     None,  # max_abs_delta
                     None,
                 )

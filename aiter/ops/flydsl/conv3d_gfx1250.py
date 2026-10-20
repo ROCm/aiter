@@ -22,6 +22,7 @@ from aiter.ops.flydsl.kernels.conv.conv3d_gfx1250_utils import (
     CGP_ALIGN,
     DEFAULT_BLOCK_ROWS,
     DEFAULT_TILE,
+    MAX_WAVES,
     out_extent,
 )
 from aiter.ops.flydsl.kernels.conv.conv3d_implicit_gfx1250 import (
@@ -31,7 +32,7 @@ from aiter.ops.flydsl.kernels.conv.conv3d_implicit_gfx1250 import (
 
 # Heuristic ladder (tile_m, tile_n, m_warp, n_warp, block_rows).
 _TILE_LADDER = (
-    (128, 128, 2, 4, 8),
+    (128, 128, 2, 2, 8),
     (128, 64, 2, 2, 8),
     (64, 64, 2, 2, 4),
     (64, 32, 2, 1, 4),
@@ -145,6 +146,22 @@ def _pick_tile(npq, k, groups, device, ho, wo):
         if waves >= 2 * num_cu or (tile_m, tile_n) == _TILE_LADDER[-1][:2]:
             return (tile_m, tile_n, wm, wn), br
     return DEFAULT_TILE, DEFAULT_BLOCK_ROWS
+
+
+_DROPPED_TILES = set()
+
+
+def _warn_dropped_tile(tile):
+    """Warn once per tile that a tuned row was ignored for exceeding MAX_WAVES."""
+    if tile in _DROPPED_TILES:
+        return
+    _DROPPED_TILES.add(tile)
+    from aiter import logger
+
+    logger.warning(
+        f"conv3d_gfx1250: tuned tile {tile} exceeds MAX_WAVES={MAX_WAVES}; "
+        "using the heuristic tile instead. Re-tune this shape."
+    )
 
 
 def _patch_reuse_ok(st, sh, sw, kh, kw, groups, tile, block_rows, d, h, w, cgp):
@@ -312,6 +329,9 @@ def run_conv3d_gfx1250(
 
             hit = _lookup_tuned_tile(tuned_key, x.device)
         except Exception:  # noqa: BLE001 -- bad config table must not break a conv
+            hit = None
+        if hit is not None and hit[0][2] * hit[0][3] > MAX_WAVES:
+            _warn_dropped_tile(hit[0])
             hit = None
 
         if hit is not None:
