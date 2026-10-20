@@ -1034,12 +1034,25 @@ class VManager16bV1(_AsyncTransport):
     # argument contract (``ptr_src`` is the V tensor here).
     def ds_load_ptrs(self, *, ptr_lds, lane_idx):
         """One per-lane transpose-load base pointer per LDS split; the crossbar fetch sits
-        at ``kv = (l//16)*8 + l%8``, ``d = ((l//8)%2)*8``. Every fragment is its split's
-        base plus a lane-independent compile-time immediate."""
-        lane_kv = (lane_idx // _WMMA_M) * fx.Int32(_V_LANE_ELEMS) + lane_idx % fx.Int32(
-            8
-        )
-        lane_d = ((lane_idx // fx.Int32(8)) % fx.Int32(2)) * fx.Int32(8)
+        base plus a lane-independent compile-time immediate.
+
+        Both widths must land lane ``l`` on column ``l%16`` with 8 consecutive rows, but
+        the two transpose loads do NOT share a crossbar. tr16_b128 transposes over eight
+        CONSECUTIVE lanes; tr8_b64 uses the strided set {b..b+3, b+8..b+11} (HW-probed),
+        so its fetch formula differs. Get it wrong and each lane straddles two columns,
+        which the kv sum then blends."""
+        if self.elem_bytes == 2:
+            lane_kv = (lane_idx // _WMMA_M) * fx.Int32(
+                _V_LANE_ELEMS
+            ) + lane_idx % fx.Int32(8)
+            lane_d = ((lane_idx // fx.Int32(8)) % fx.Int32(2)) * fx.Int32(8)
+        else:
+            lane_kv = (
+                (lane_idx // _WMMA_M) * fx.Int32(_V_LANE_ELEMS)
+                + ((lane_idx % fx.Int32(_WMMA_M)) // fx.Int32(8)) * fx.Int32(4)
+                + lane_idx % fx.Int32(4)
+            )
+            lane_d = ((lane_idx // fx.Int32(4)) % fx.Int32(2)) * fx.Int32(8)
         return [
             create_llvm_ptr(
                 base
