@@ -29,7 +29,6 @@ from .conv3d_gfx1250_utils import (
     CONV_COMPILE_HINTS,
     DEFAULT_BLOCK_ROWS,
     DEFAULT_TILE,
-    DynShapeArgs1250,
     LDS_PAD,
     OOB_SENTINEL_ELEM,
     TILE_K,
@@ -37,6 +36,7 @@ from .conv3d_gfx1250_utils import (
     WMMA_K,
     WMMA_M,
     WMMA_N,
+    DynShapeArgs1250,
     _as_stream,
     buffer_atomic_add,
     decode_block_2d,
@@ -320,9 +320,9 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
 
     smem_bytes = dsl_size_of(SharedStorage)
     lds_cap = get_lds_capacity_bytes(gpu_arch)
-    assert smem_bytes <= lds_cap, (
-        f"SharedStorage {smem_bytes}B exceeds LDS capacity {lds_cap}B on {gpu_arch}"
-    )
+    assert (
+        smem_bytes <= lds_cap
+    ), f"SharedStorage {smem_bytes}B exceeds LDS capacity {lds_cap}B on {gpu_arch}"
 
     BLOCK_THREADS = cfg.block_threads
     num_warps = cfg.num_warps
@@ -335,12 +335,8 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
     use_splitk = grid.use_splitk
     big_out = grid.big_out
     # Staging / output byte window for the buffer descriptor (split-K is fp32).
-    y_bytes = (
-        geom.npq * param.k * 4 if use_splitk else Y_ELEMS * BF16_BYTES
-    )
-    # BIG_OUT drops the buffer path; still need a descriptor size for non-big.
-    if not big_out and not use_splitk:
-        assert y_bytes <= 0x7FFFFFFF or True  # gated by big_out flag above
+    # BIG_OUT drops the buffer path; non-big uses this size for the descriptor.
+    y_bytes = geom.npq * param.k * 4 if use_splitk else Y_ELEMS * BF16_BYTES
 
     N_CC = cgp // TILE_K
     assert N_CC * param.kt * param.kh * param.kw == grid.k_tiles
@@ -394,9 +390,7 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
                 y, max_size=False, num_records_bytes=y_bytes
             )
             y_div = fx.logical_divide(
-                fx.Tensor(
-                    fx.make_view(fx.get_iter(y_buf), fx.make_layout(Y_ELEMS, 1))
-                ),
+                fx.Tensor(fx.make_view(fx.get_iter(y_buf), fx.make_layout(Y_ELEMS, 1))),
                 fx.make_layout(1, 1),
             )
             st1_atom = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), elem_ty)
@@ -593,9 +587,8 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
 
         def imm_a(kt_i, kh_i, kw_i, cc):
             elems = (
-                ((kt_i * param.dt * Hp + kh_i * param.dh) * Wp + kw_i * param.dw) * Cp
-                + cc * TILE_K
-            )
+                (kt_i * param.dt * Hp + kh_i * param.dh) * Wp + kw_i * param.dw
+            ) * Cp + cc * TILE_K
             return elems * BF16_BYTES
 
         def imm_b(kt_i, kh_i, kw_i, cc):
@@ -728,9 +721,9 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
         lds_k = cfg.lds_k_stride
         PR, PC = patch_rows, patch_cols
 
-        a_base = (
-            ((n_idx * Dp + ot * param.st) * Hp + oh0) * Wp + ow0
-        ) * Cp + fx.Int64(gi) * cgp
+        a_base = (((n_idx * Dp + ot * param.st) * Hp + oh0) * Wp + ow0) * Cp + fx.Int64(
+            gi
+        ) * cgp
         gA = fx.Tensor(
             fx.make_view(
                 fx.add_offset(fx.get_iter(x), a_base),
@@ -788,9 +781,7 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
 
         def load_patch(g, gs):
             kt_i, cc = PATCH_GROUPS[g]
-            imm = fx.Int64(
-                (kt_i * param.dt * Hp * Wp * Cp + cc * TILE_K) * BF16_BYTES
-            )
+            imm = fx.Int64((kt_i * param.dt * Hp * Wp * Cp + cc * TILE_K) * BF16_BYTES)
             dst = fx.Tensor(
                 fx.make_view(
                     fx.add_offset(big_a_mem, slot_patch(gs)),
@@ -1017,7 +1008,9 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
     def _launch(y, x, weight, bias, stream=None):
         with CompilationContext.compile_hints(CONV_COMPILE_HINTS):
             if const_expr(param.dyn_hw):
-                return launch(y, x, weight, bias, *extra_args, stream=_as_stream(stream))
+                return launch(
+                    y, x, weight, bias, *extra_args, stream=_as_stream(stream)
+                )
             return launch(y, x, weight, bias, stream=_as_stream(stream))
 
     def _compile(y, x, weight, bias, stream=None):

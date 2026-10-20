@@ -16,19 +16,18 @@ import weakref
 
 import torch
 
+from aiter.ops.flydsl.kernels.conv.conv3d_gfx950_utils import _as_stream
 from aiter.ops.flydsl.kernels.conv.conv3d_gfx1250_utils import (
     BF16_BYTES,
     CGP_ALIGN,
     DEFAULT_BLOCK_ROWS,
     DEFAULT_TILE,
-    TILE_K,
     out_extent,
 )
 from aiter.ops.flydsl.kernels.conv.conv3d_implicit_gfx1250 import (
     compile_conv3d_implicit_gfx1250,
     make_conv3d_implicit_param_gfx1250,
 )
-from aiter.ops.flydsl.kernels.conv.conv3d_gfx950_utils import _as_stream
 
 # Heuristic ladder (tile_m, tile_n, m_warp, n_warp, block_rows).
 _TILE_LADDER = (
@@ -116,9 +115,7 @@ def _prep_weight(w, k, kt, kh, kw, wc, cgp):
     if ent is not None and ent[0]() is anchor and ent[2] == stamp:
         return ent[1]
     wsrc = (
-        torch.nn.functional.pad(w, (0, 0, 0, 0, 0, 0, 0, cgp - wc))
-        if cgp != wc
-        else w
+        torch.nn.functional.pad(w, (0, 0, 0, 0, 0, 0, 0, cgp - wc)) if cgp != wc else w
     )
     wk = wsrc.permute(0, 2, 3, 4, 1).contiguous().reshape(k, kt * kh * kw * cgp)
     _WEIGHT_CACHE[key] = (
@@ -136,12 +133,12 @@ def _pick_tile(npq, k, groups, device, ho, wo):
         from aiter.jit.utils.chip_info import get_cu_num
 
         num_cu = int(get_cu_num()) or 256
-    except Exception:
+    except Exception:  # noqa: BLE001 -- no rocminfo (CPU-only host)
         num_cu = 256
 
     for tile_m, tile_n, wm, wn, br in _TILE_LADDER:
         cols = tile_m // br
-        if cols > wo and wo > 0:
+        if cols > wo > 0:
             continue
         blocks = ((npq + tile_m - 1) // tile_m) * groups * ((kg + tile_n - 1) // tile_n)
         waves = blocks * wm * wn
@@ -153,11 +150,11 @@ def _pick_tile(npq, k, groups, device, ho, wo):
 def _patch_reuse_ok(st, sh, sw, kh, kw, groups, tile, block_rows, d, h, w, cgp):
     if not (st == sh == sw == 1 and (kh > 1 or kw > 1) and groups == 1):
         return False
+    from aiter.jit.utils.chip_info import get_lds_capacity_bytes
     from aiter.ops.flydsl.kernels.conv.conv3d_gfx1250_utils import (
         LDS_PAD,
         make_tile_config_gfx1250,
     )
-    from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
     cfg = make_tile_config_gfx1250(tile, block_rows)
     pr = block_rows + (kh - 1)
@@ -211,7 +208,7 @@ def run_conv3d_gfx1250(
     output_layout="NCDHW",
     patch_reuse=True,
     splitk=None,
-    wgm=None,  # noqa: ARG001 — accepted for API parity; unused on gfx1250
+    wgm=None,  # accepted for API parity; unused on gfx1250
     **_ignored,
 ):
     """Run gfx1250 FlyDSL conv3d (TDM+WMMA; optional split-K / dyn_hw / tuned tile)."""
@@ -314,7 +311,7 @@ def run_conv3d_gfx1250(
             from aiter.ops.flydsl.conv_kernels import _lookup_tuned_tile
 
             hit = _lookup_tuned_tile(tuned_key, x.device)
-        except Exception:
+        except Exception:  # noqa: BLE001 -- bad config table must not break a conv
             hit = None
 
         if hit is not None:

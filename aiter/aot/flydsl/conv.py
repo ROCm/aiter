@@ -36,6 +36,15 @@ from aiter.aot.flydsl.common import (
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
+from aiter.ops.flydsl.conv3d_gfx1250 import (
+    AITER_CONV3D_DYN_HW as AITER_CONV3D_DYN_HW_1250,
+)
+from aiter.ops.flydsl.conv3d_gfx1250 import (
+    _dispatch as _dispatch_gfx1250,
+)
+from aiter.ops.flydsl.conv3d_gfx1250 import (
+    _dyn_hw_ok_gfx1250,
+)
 from aiter.ops.flydsl.conv_kernels import (
     AITER_CONV3D_DYN_HW,
     LIBTYPE_FLYDSL,
@@ -59,6 +68,7 @@ from aiter.ops.flydsl.kernels.conv.conv3d_gfx950_utils import (
     out_extent,
     unit_divisors,
 )
+from aiter.ops.flydsl.kernels.conv.conv3d_gfx1250_utils import CGP_ALIGN
 from aiter.ops.flydsl.kernels.conv.conv3d_im2col import make_im2col_plan
 from aiter.ops.flydsl.kernels.conv.conv3d_implicit_gfx950 import (
     _dyn_hw_closure_key,
@@ -67,12 +77,6 @@ from aiter.ops.flydsl.kernels.conv.conv3d_implicit_gfx950 import (
 from aiter.ops.flydsl.kernels.conv.conv3d_implicit_gfx1250 import (
     compile_conv3d_implicit_gfx1250,
     make_conv3d_implicit_param_gfx1250,
-)
-from aiter.ops.flydsl.kernels.conv.conv3d_gfx1250_utils import CGP_ALIGN
-from aiter.ops.flydsl.conv3d_gfx1250 import (
-    AITER_CONV3D_DYN_HW as AITER_CONV3D_DYN_HW_1250,
-    _dyn_hw_ok_gfx1250,
-    _dispatch as _dispatch_gfx1250,
 )
 from aiter.ops.flydsl.kernels.conv.conv3d_transpose import (
     TR_MAX_BIG_S,

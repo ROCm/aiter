@@ -123,9 +123,7 @@ def _sweep(npq, kg, groups, num_cu, min_n_fill, min_waves, check_waste, check_gr
                 continue
             # Try building cfg (asserts divisibility already covered).
             try:
-                make_tile_config_gfx1250(
-                    (tile_m, tile_n, wave_m, wave_n), block_rows
-                )
+                make_tile_config_gfx1250((tile_m, tile_n, wave_m, wave_n), block_rows)
             except AssertionError:
                 continue
             scored.append(

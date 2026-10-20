@@ -118,7 +118,9 @@ class ConvGeometry1250(NamedTuple):
     crs: int
 
 
-def make_conv_geometry_gfx1250(n, cgp, d, h, w, k, kt, kh, kw, st, sh, sw, pt, ph, pw, dt, dh, dw):
+def make_conv_geometry_gfx1250(
+    n, cgp, d, h, w, k, kt, kh, kw, st, sh, sw, pt, ph, pw, dt, dh, dw
+):
     """Output extents after host pre-pad (kernel sees pt=ph=pw=0)."""
     do = out_extent(d, pt, dt, kt, st)
     ho = out_extent(h, ph, dh, kh, sh)
@@ -172,11 +174,13 @@ def make_launch_grid_gfx1250(n, geom, cfg, groups, k, splitk=1):
     n_tail = kg % cfg.tile_n != 0
     row_chk = geom.ho % rows != 0 or geom.wo % cols != 0
     k_tiles = geom.crs // cfg.tile_k
-    assert geom.crs % cfg.tile_k == 0, f"crs={geom.crs} not divisible by tile_k={cfg.tile_k}"
+    assert (
+        geom.crs % cfg.tile_k == 0
+    ), f"crs={geom.crs} not divisible by tile_k={cfg.tile_k}"
     splitk = max(1, min(int(splitk), k_tiles))
-    assert k_tiles % splitk == 0, (
-        f"splitk={splitk} does not divide k_tiles={k_tiles}; pick via _resolve_splitk"
-    )
+    assert (
+        k_tiles % splitk == 0
+    ), f"splitk={splitk} does not divide k_tiles={k_tiles}; pick via _resolve_splitk"
     tiles_per_split = k_tiles // splitk
     use_splitk = splitk > 1
     big_out = (n * k * geom.do * geom.ho * geom.wo * BF16_BYTES) > 0x7FFFFFFF
@@ -185,9 +189,9 @@ def make_launch_grid_gfx1250(n, geom, cfg, groups, k, splitk=1):
         f"{'split-K' if use_splitk else 'BIG_OUT'} cannot mask a tile tail "
         f"(row_chk={row_chk}, n_tail={n_tail})"
     )
-    assert not use_splitk or geom.npq * k * 4 <= SPLITK_MAX_STAGING_BYTES, (
-        f"split-K staging {geom.npq * k * 4}B exceeds {SPLITK_MAX_STAGING_BYTES}B"
-    )
+    assert (
+        not use_splitk or geom.npq * k * 4 <= SPLITK_MAX_STAGING_BYTES
+    ), f"split-K staging {geom.npq * k * 4}B exceeds {SPLITK_MAX_STAGING_BYTES}B"
     assert splitk <= MAX_GRID_YZ, f"splitk={splitk} exceeds grid.z limit {MAX_GRID_YZ}"
     return LaunchGrid1250(
         grid_m=grid_m,
@@ -308,9 +312,7 @@ class DynShapeArgs1250:
 def dyn_shape_values_gfx1250(param, geom, grid):
     """Host-side DynShapeArgs1250 values in FIELDS order."""
     if geom.npq >= MAX_DYN_DIVIDEND:
-        raise ValueError(
-            f"npq={geom.npq} reaches the {MAX_DYN_DIVIDEND} dyn_hw bound"
-        )
+        raise ValueError(f"npq={geom.npq} reaches the {MAX_DYN_DIVIDEND} dyn_hw bound")
     return (
         param.d,
         param.h,
