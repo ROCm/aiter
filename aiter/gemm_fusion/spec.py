@@ -23,7 +23,6 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass, fields, is_dataclass
-from typing import Optional, Tuple, Union
 
 SCHEMA_VERSION = 1
 
@@ -57,8 +56,8 @@ class SPExchange:
 
     kind: str = "sp_exchange"
     world: int = 4
-    fields: Tuple[Field, ...] = ()
-    drop: Tuple[str, ...] = ()  # fields not consumed downstream
+    fields: tuple[Field, ...] = ()
+    drop: tuple[str, ...] = ()  # fields not consumed downstream
     out_layout: str = "packed_rows"
 
 
@@ -76,10 +75,10 @@ class HeadNormRopeCache:
     norm: str = "gemma_rms"
     numerics: str = "triton_norm_rope_cache_v1"  # or "aiter_fused_qknorm_idxrqknorm_v1"
     kv_cache: str = "shuffle_page16_fp8_ptok"
-    index: Optional[str] = None  # "fp8_unit_page128" or None
+    index: str | None = None  # "fp8_unit_page128" or None
 
 
-Stage = Union[SPExchange, HeadNormRopeCache]
+Stage = SPExchange | HeadNormRopeCache
 
 
 def canonical(obj):
@@ -107,23 +106,39 @@ def canonical(obj):
 @dataclass(frozen=True)
 class FusionSpec:
     gemm: GemmSpec
-    stages: Tuple[Stage, ...] = ()
+    stages: tuple[Stage, ...] = ()
 
-    def prefix(self, n: int) -> "FusionSpec":
+    def prefix(self, n: int) -> FusionSpec:
         return FusionSpec(self.gemm, tuple(self.stages[:n]))
 
     def canonical_json(self) -> str:
         blob = {"schema": SCHEMA_VERSION, "spec": canonical(self)}
-        return json.dumps(blob, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        return json.dumps(
+            blob, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        )
 
     def signature(self) -> str:
         return hashlib.sha256(self.canonical_json().encode("utf-8")).hexdigest()[:16]
 
 
-def qkv_fields(q: int, kv: int, world: int, iq: int = 0, ik: int = 0, kv_shards=None, ik_shards: int = 1):
+def qkv_fields(
+    q: int,
+    kv: int,
+    world: int,
+    iq: int = 0,
+    ik: int = 0,
+    kv_shards=None,
+    ik_shards: int = 1,
+):
     """Standard GEMM column map: q | k | v | [iq | ik]; widths are full (unsharded)."""
     out, off = [], 0
-    for name, w, sh in (("q", q, world), ("k", kv, kv_shards or world), ("v", kv, kv_shards or world), ("iq", iq, world), ("ik", ik, ik_shards)):
+    for name, w, sh in (
+        ("q", q, world),
+        ("k", kv, kv_shards or world),
+        ("v", kv, kv_shards or world),
+        ("iq", iq, world),
+        ("ik", ik, ik_shards),
+    ):
         if w:
             out.append(Field(name, off, w, sh))
             off += w

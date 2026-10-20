@@ -16,10 +16,10 @@ NOT imported by any runtime module (aiter.gemm_fusion.*, aiter.ops.gemm_fusion.s
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import os
 import sys
-from typing import Callable, List, Optional, Tuple
 
 MiB = 1 << 20
 
@@ -167,7 +167,13 @@ def clear_profile_cache() -> None:
     profmod._CACHE.clear()
 
 
-def make_profile(window_bytes=None, max_windows=None, window_budget=None, wait_budget_us=None, name="test"):
+def make_profile(
+    window_bytes=None,
+    max_windows=None,
+    window_budget=None,
+    wait_budget_us=None,
+    name="test",
+):
     """A rows-less Profile carrying only a window_budget (and optionally wait_budget_us): enough for FusionResources."""
     from aiter.gemm_fusion.profile import parse_profile
 
@@ -184,9 +190,24 @@ def make_profile(window_bytes=None, max_windows=None, window_budget=None, wait_b
     return parse_profile(doc)
 
 
-def make_res(*, rank=0, world=4, dist=None, backend=None, policy=None, profile=None, window_bytes=None, max_windows=None, **kw):
+def make_res(
+    *,
+    rank=0,
+    world=4,
+    dist=None,
+    backend=None,
+    policy=None,
+    profile=None,
+    window_bytes=None,
+    max_windows=None,
+    **kw,
+):
     """FusionResources(...) for tests: ``window_bytes`` / ``max_windows`` become a synthetic window_budget (merged over ``profile`` when one is given)."""
-    from aiter.gemm_fusion.profile import parse_profile, resolve_profile, window_budget_of
+    from aiter.gemm_fusion.profile import (
+        parse_profile,
+        resolve_profile,
+        window_budget_of,
+    )
     from aiter.gemm_fusion.resources import FusionResources
 
     if window_bytes is not None or max_windows is not None:
@@ -197,11 +218,20 @@ def make_res(*, rank=0, world=4, dist=None, backend=None, policy=None, profile=N
                 wb["window_bytes"] = window_bytes
             if max_windows is not None:
                 wb["max_windows"] = max_windows
-            profile = parse_profile({**prof.meta, "profile": prof.name, "window_budget": wb, "rows": []})
+            profile = parse_profile(
+                {**prof.meta, "profile": prof.name, "window_budget": wb, "rows": []}
+            )
         else:
             profile = make_profile(window_bytes, max_windows)
-    return FusionResources(rank, world, dist=dist if dist is not None else FakeDist(), backend=backend if backend is not None else RealisticFirstFit(),
-                           policy=policy, profile=profile, **kw)
+    return FusionResources(
+        rank,
+        world,
+        dist=dist if dist is not None else FakeDist(),
+        backend=backend if backend is not None else RealisticFirstFit(),
+        policy=policy,
+        profile=profile,
+        **kw,
+    )
 
 
 def log_capture(level=logging.INFO):
@@ -234,7 +264,9 @@ def tensor_extent(t):
         return None
     strides = tuple(int(x) for x in t.stride())
     last = sum((s - 1) * st for s, st in zip(shape, strides) if st > 0)
-    first = sum((s - 1) * st for s, st in zip(shape, strides) if st < 0)  # negative strides (rare) extend below the base pointer
+    first = sum(
+        (s - 1) * st for s, st in zip(shape, strides) if st < 0
+    )  # negative strides (rare) extend below the base pointer
     base = int(t.data_ptr())
     es = int(t.element_size())
     return base + first * es, base + (last + 1) * es
@@ -255,12 +287,20 @@ def iter_tensors(obj, path="out"):
             yield from iter_tensors(v, f"{path}.{k}")
 
 
-def window_ranges(res, kinds=("p2p_window", "control")) -> List[Tuple[str, int, int]]:
+def window_ranges(res, kinds=("p2p_window", "control")) -> list[tuple[str, int, int]]:
     """[(label, start, end)] of every window REGISTERED by ``res`` (under the arena policy: the one arena) in this process's address space."""
-    return [(f"{w.owner}/{w.name}" + (" [shared]" if w.shared else ""), int(w.local), int(w.local) + int(w.bytes)) for w in res._regs if w.kind in kinds]
+    return [
+        (
+            f"{w.owner}/{w.name}" + (" [shared]" if w.shared else ""),
+            int(w.local),
+            int(w.local) + int(w.bytes),
+        )
+        for w in res._regs
+        if w.kind in kinds
+    ]
 
 
-def find_window_alias(res, obj, kinds=("p2p_window", "control")) -> List[str]:
+def find_window_alias(res, obj, kinds=("p2p_window", "control")) -> list[str]:
     """Descriptions of every overlap between a tensor reachable from ``obj`` and a window of ``res``. Empty = clean."""
     wins = window_ranges(res, kinds)
     hits = []
@@ -270,23 +310,34 @@ def find_window_alias(res, obj, kinds=("p2p_window", "control")) -> List[str]:
             continue
         for label, a, b in wins:
             if ext[0] < b and a < ext[1]:
-                hits.append(f"{path} [{ext[0]:#x},{ext[1]:#x}) overlaps window {label} [{a:#x},{b:#x})")
+                hits.append(
+                    f"{path} [{ext[0]:#x},{ext[1]:#x}) overlaps window {label} [{a:#x},{b:#x})"
+                )
     return hits
 
 
-def assert_no_window_alias(res, obj, what: str = "gemm_fusion output", force: bool = False) -> None:
+def assert_no_window_alias(
+    res, obj, what: str = "gemm_fusion output", force: bool = False
+) -> None:
     """The recv_view / reuse_view of a large plan aliases the shared R window (the SAME R for every large plan), valid only until the next large launch on this rank.
     Nothing RETURNED from the op or STORED on a long-lived object (e.g. attn.impl._index_q) may point into a window. No-op unless AITER_GEMM_FUSION_DEBUG_ALIAS=1 or
     force=True. Raises WindowAliasError."""
-    if not (force or os.environ.get(ENV_DEBUG_ALIAS, "").strip().lower() in ("1", "true", "yes", "on")):
+    if not (
+        force
+        or os.environ.get(ENV_DEBUG_ALIAS, "").strip().lower()
+        in ("1", "true", "yes", "on")
+    ):
         return
     hits = find_window_alias(res, obj)
     if hits:
-        raise WindowAliasError(f"{what} points into a CCO window (valid only until the next launch; copy it within the op): " + "; ".join(hits))
+        raise WindowAliasError(
+            f"{what} points into a CCO window (valid only until the next launch; copy it within the op): "
+            + "; ".join(hits)
+        )
 
 
 # ------------------------------------------------------------------------------------------------------------- bare-metal window probe
-def sequence(name: str, mib: str = "", n: int = 39, window_mib: int = 164) -> List[int]:
+def sequence(name: str, mib: str = "", n: int = 39, window_mib: int = 164) -> list[int]:
     """Window sizes (bytes) of a named registration sequence for ``run`` (plain sequences; the arena has run_arena)."""
     if name == "phase1_equal":
         return [40 * MiB] * 3
@@ -298,18 +349,33 @@ def sequence(name: str, mib: str = "", n: int = 39, window_mib: int = 164) -> Li
         return [4 * MiB] * 4 + [40 * MiB]
     if name == "custom":
         return [int(x) * MiB for x in mib.split(",") if x]
-    raise SystemExit(f"unknown sequence {name!r} (phase1_equal, small_then_big, uniform, gate03_prefix, custom, arena)")
+    raise SystemExit(
+        f"unknown sequence {name!r} (phase1_equal, small_then_big, uniform, gate03_prefix, custom, arena)"
+    )
 
 
 def _va_fields(va: int) -> str:
     return f"va={va:#x} va_mod_2MiB={va % (2 * MiB)} va_mod_256MiB={va % (256 * MiB)}"
 
 
-def run(seq: List[int], heap_bytes: int, rank: int, world: int, dist, backend, tag: str, stagger_ms: int = 0, sleep=None, device=None) -> bool:
+def run(
+    seq: list[int],
+    heap_bytes: int,
+    rank: int,
+    world: int,
+    dist,
+    backend,
+    tag: str,
+    stagger_ms: int = 0,
+    sleep=None,
+    device=None,
+) -> bool:
     """Register `seq` on a fresh comm (HIP device = rank unless ``device`` is given); returns True if all succeeded. Pure function of the injected dist/backend."""
     uid = [backend.uid(rank) if rank == 0 else None]
     dist.broadcast_object_list(uid, src=0)
-    comm = backend.comm_create(rank, world, uid[0], heap_bytes, rank if device is None else device)
+    comm = backend.comm_create(
+        rank, world, uid[0], heap_bytes, rank if device is None else device
+    )
     cum, ok, wins = 0, True, []
     if sleep is None:
         import time
@@ -322,21 +388,23 @@ def run(seq: List[int], heap_bytes: int, rank: int, world: int, dist, backend, t
             w = backend.win_register(comm, size)
             wins.append(w)
             cum += size
-            print(f"PROBE rank={rank} seq={tag} idx={i} size={size} cumulative={cum} offset_mib={(cum - size) // MiB} {_va_fields(int(w[1]))} result=OK", flush=True)
+            print(
+                f"PROBE rank={rank} seq={tag} idx={i} size={size} cumulative={cum} offset_mib={(cum - size) // MiB} {_va_fields(int(w[1]))} result=OK",
+                flush=True,
+            )
         except Exception as e:  # noqa: BLE001
-            print(f"PROBE rank={rank} seq={tag} idx={i} size={size} cumulative={cum} offset_mib={cum // MiB} result=FAIL err={e}", flush=True)
+            print(
+                f"PROBE rank={rank} seq={tag} idx={i} size={size} cumulative={cum} offset_mib={cum // MiB} result=FAIL err={e}",
+                flush=True,
+            )
             ok = False
             break
     for w in reversed(wins):
-        try:
+        with contextlib.suppress(Exception):
             backend.win_deregister(comm, w[0])
             backend.win_free(comm, w[1])
-        except Exception:  # noqa: BLE001
-            pass
-    try:
+    with contextlib.suppress(Exception):
         backend.comm_destroy(comm)
-    except Exception:  # noqa: BLE001
-        pass
     dist.barrier()
     return ok
 
@@ -348,23 +416,40 @@ def _arena_layout(wb: dict):
     def up(x):
         return -(-int(x) // ARENA_ALIGN) * ARENA_ALIGN
 
-    items = [(up(v), "shared") for v in sorted(wb["shared"].values(), reverse=True)] + [(up(s), "small") for s in wb["small_window_sizes"]]
+    items = [(up(v), "shared") for v in sorted(wb["shared"].values(), reverse=True)] + [
+        (up(s), "small") for s in wb["small_window_sizes"]
+    ]
     return sum(s for s, _ in items), items
 
 
-def run_arena(heap_bytes: int, rank: int, world: int, dist, backend, tag: str, device=None, profile="minimax_m3_sp4_gfx950_v1") -> bool:
+def run_arena(
+    heap_bytes: int,
+    rank: int,
+    world: int,
+    dist,
+    backend,
+    tag: str,
+    device=None,
+    profile="minimax_m3_sp4_gfx950_v1",
+) -> bool:
     """ONE registration (the arena: 380 MiB for the shipped profile) followed by the view structs the arena policy would create (4 MiB aligned). Checks that every view
-    struct reads back winBase = arena winBase + offset with unchanged stride4G/lsaRank, then frees the views and deregisters the arena. A second registration is never issued. Not tested: kernels dereferencing a view on the device."""
+    struct reads back winBase = arena winBase + offset with unchanged stride4G/lsaRank, then frees the views and deregisters the arena. A second registration is never issued. Not tested: kernels dereferencing a view on the device.
+    """
     from aiter.gemm_fusion.profile import load_profile, window_budget_of
 
     size, items = _arena_layout(window_budget_of(load_profile(profile)))
     uid = [backend.uid(rank) if rank == 0 else None]
     dist.broadcast_object_list(uid, src=0)
-    comm = backend.comm_create(rank, world, uid[0], heap_bytes, rank if device is None else device)  # HIP device = rank (the torchrun mapping), NOT 0
+    comm = backend.comm_create(
+        rank, world, uid[0], heap_bytes, rank if device is None else device
+    )  # HIP device = rank (the torchrun mapping), NOT 0
     ok, views, h, loc = True, [], None, 0
     try:
         h, loc = backend.win_register(comm, size)
-        print(f"PROBE rank={rank} seq={tag} idx=0 size={size} cumulative={size} kind=arena {_va_fields(int(loc))} result=OK", flush=True)
+        print(
+            f"PROBE rank={rank} seq={tag} idx=0 size={size} cumulative={size} kind=arena {_va_fields(int(loc))} result=OK",
+            flush=True,
+        )
         off = 0
         for i, (sz, role) in enumerate(items, 1):
             v = backend.win_view(comm, h, off)
@@ -372,34 +457,42 @@ def run_arena(heap_bytes: int, rank: int, world: int, dist, backend, tag: str, d
             wbase, stride, lsa = backend.win_info(comm, v)
             abase, astride, alsa = backend.win_info(comm, h)
             good = wbase == abase + off and (stride, lsa) == (astride, alsa)
-            print(f"PROBE rank={rank} seq={tag} idx={i} size={sz} offset={off} role={role} view_winBase_ok={int(good)} "
-                  f"result={'OK' if good else 'FAIL'}", flush=True)
+            print(
+                f"PROBE rank={rank} seq={tag} idx={i} size={sz} offset={off} role={role} view_winBase_ok={int(good)} "
+                f"result={'OK' if good else 'FAIL'}",
+                flush=True,
+            )
             ok &= good
             off += sz
-        print(f"PROBE rank={rank} seq={tag} registrations=1 views={len(views)} arena_used={off} arena={size} result={'OK' if off <= size and ok else 'FAIL'}", flush=True)
+        print(
+            f"PROBE rank={rank} seq={tag} registrations=1 views={len(views)} arena_used={off} arena={size} result={'OK' if off <= size and ok else 'FAIL'}",
+            flush=True,
+        )
         ok &= off <= size
     except Exception as e:  # noqa: BLE001
         print(f"PROBE rank={rank} seq={tag} result=FAIL err={e}", flush=True)
         ok = False
     for v in views:
-        try:
+        with contextlib.suppress(Exception):
             backend.win_view_free(comm, v)
-        except Exception:  # noqa: BLE001
-            pass
-    try:
+    with contextlib.suppress(Exception):
         if h is not None:
             backend.win_deregister(comm, h)
             backend.win_free(comm, loc)
         backend.comm_destroy(comm)
-    except Exception:  # noqa: BLE001
-        pass
     dist.barrier()
     return ok
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="bare-metal CCO window probe (torchrun --nproc_per_node=4 -m aiter.ops.gemm_fusion.sp_qkv.test_utils ...)")
-    ap.add_argument("--sequence", required=True, help="arena | phase1_equal | small_then_big | uniform | gate03_prefix | custom")
+    ap = argparse.ArgumentParser(
+        description="bare-metal CCO window probe (torchrun --nproc_per_node=4 -m aiter.ops.gemm_fusion.sp_qkv.test_utils ...)"
+    )
+    ap.add_argument(
+        "--sequence",
+        required=True,
+        help="arena | phase1_equal | small_then_big | uniform | gate03_prefix | custom",
+    )
     ap.add_argument("--heap-gib", type=int, default=4)
     ap.add_argument("--mib", default="")
     ap.add_argument("--n", type=int, default=39)
@@ -412,14 +505,20 @@ def main(argv=None):
     import torch
     import torch.distributed as dist
 
-    rank, world = int(os.environ.get("RANK", "0")), int(os.environ.get("WORLD_SIZE", "1"))
+    rank, world = int(os.environ.get("RANK", "0")), int(
+        os.environ.get("WORLD_SIZE", "1")
+    )
     torch.cuda.set_device(rank)
     dist.init_process_group("gloo")
     from aiter.gemm_fusion.resources import CcoBackend
 
     hold = None
-    if a.torch_gib > 0:  # real runs hold model weights / KV cache in the torch caching allocator before the comm exists
-        hold = torch.empty(int(a.torch_gib * (1 << 30)), dtype=torch.uint8, device=f"cuda:{rank}")
+    if (
+        a.torch_gib > 0
+    ):  # real runs hold model weights / KV cache in the torch caching allocator before the comm exists
+        hold = torch.empty(
+            int(a.torch_gib * (1 << 30)), dtype=torch.uint8, device=f"cuda:{rank}"
+        )
         hold.fill_(1)
         torch.cuda.synchronize()
     if a.init_dist_nccl:
@@ -428,9 +527,20 @@ def main(argv=None):
     for rep in range(a.repeat):
         tag = f"{a.sequence}#{rep}"
         if a.sequence == "arena":
-            ok &= run_arena(a.heap_gib << 30, rank, world, dist, CcoBackend(), tag, device=rank)
+            ok &= run_arena(
+                a.heap_gib << 30, rank, world, dist, CcoBackend(), tag, device=rank
+            )
         else:
-            ok &= run(sequence(a.sequence, a.mib, a.n, a.window_mib), a.heap_gib << 30, rank, world, dist, CcoBackend(), tag, a.stagger_ms)
+            ok &= run(
+                sequence(a.sequence, a.mib, a.n, a.window_mib),
+                a.heap_gib << 30,
+                rank,
+                world,
+                dist,
+                CcoBackend(),
+                tag,
+                a.stagger_ms,
+            )
     del hold
     sys.exit(0 if ok else 3)
 

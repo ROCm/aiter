@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
 
 
 @dataclass(frozen=True)
@@ -18,18 +17,20 @@ class WindowReq:
     # Optional sharing tag: under the 'arena' policy every request with the same tag, from ANY owner, maps to ONE shared view of the arena.
     # `min_bytes` is the real requirement used for a shared window (defaults to `bytes`); `bytes` keeps the equal-size-per-plan convention
     # of the uniform policy. The uniform policy ignores both fields.
-    share: Optional[str] = None
-    min_bytes: Optional[int] = None
+    share: str | None = None
+    min_bytes: int | None = None
 
 
 class Plan:
     n_stages: int = 0
     vid: str = ""
 
-    def resources(self) -> List[WindowReq]:
+    def resources(self) -> list[WindowReq]:
         raise NotImplementedError
 
-    def run(self, *, x, x_scale, w, w_scale, outs: Dict, meta: Dict, res, stream=None) -> None:
+    def run(
+        self, *, x, x_scale, w, w_scale, outs: dict, meta: dict, res, stream=None
+    ) -> None:
         """Run the covered stage prefix. ``res`` is a bound resources object
         (see aiter.gemm_fusion.resources.FusionResources)."""
         raise NotImplementedError

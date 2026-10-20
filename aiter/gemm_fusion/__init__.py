@@ -1,12 +1,58 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-from .spec import (  # noqa: F401
-    FusionSpec, GemmSpec, Field, SPExchange, HeadNormRopeCache, canonical, qkv_fields, SCHEMA_VERSION,
+from .capabilities import detect_arch, detect_capabilities, detect_cu
+from .catalog import Contract, VariantInfo, get_variant, register_variant
+from .match import ContractError, MatchCtx, match_prefix
+from .plan import Plan, WindowReq
+from .prebuild import prebuild_profile
+from .profile import Profile, ProfileError, load_profile, parse_profile
+from .resources import (
+    CcoBackend,
+    FusionResources,
+    ResourceError,
+    Window,
+    round_up,
 )
-from .catalog import Contract, VariantInfo, register_variant, get_variant  # noqa: F401
-from .profile import Profile, ProfileError, load_profile, parse_profile  # noqa: F401
-from .prebuild import prebuild_profile  # noqa: F401
-from .match import MatchCtx, ContractError, match_prefix  # noqa: F401
-from .plan import Plan, WindowReq  # noqa: F401
-from .capabilities import detect_capabilities, detect_arch, detect_cu  # noqa: F401
-from .resources import CcoBackend, FusionResources, ResourceError, Window, round_up  # noqa: F401
+from .spec import (
+    SCHEMA_VERSION,
+    Field,
+    FusionSpec,
+    GemmSpec,
+    HeadNormRopeCache,
+    SPExchange,
+    canonical,
+    qkv_fields,
+)
+
+__all__ = [
+    "SCHEMA_VERSION",
+    "CcoBackend",
+    "Contract",
+    "ContractError",
+    "Field",
+    "FusionResources",
+    "FusionSpec",
+    "GemmSpec",
+    "HeadNormRopeCache",
+    "MatchCtx",
+    "Plan",
+    "Profile",
+    "ProfileError",
+    "ResourceError",
+    "SPExchange",
+    "VariantInfo",
+    "Window",
+    "WindowReq",
+    "canonical",
+    "detect_arch",
+    "detect_capabilities",
+    "detect_cu",
+    "get_variant",
+    "load_profile",
+    "match_prefix",
+    "parse_profile",
+    "prebuild_profile",
+    "qkv_fields",
+    "register_variant",
+    "round_up",
+]

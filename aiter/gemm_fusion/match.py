@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import FrozenSet, Optional, Tuple
 
 from . import catalog
 from .profile import load_profile
@@ -29,7 +28,7 @@ class MatchCtx:
     cu: int
     world: int
     m: int  # local M (tokens per rank, padded)
-    available: FrozenSet[str] = frozenset()  # {"mori_cco","sdma","gfx950_sc_bypass"}
+    available: frozenset[str] = frozenset()  # {"mori_cco","sdma","gfx950_sc_bypass"}
     graph_mode: str = "eager"  # "eager" | "capture"
 
 
@@ -64,14 +63,16 @@ def _load_builtin(vid: str):
         if vid.startswith(prefix):
             try:
                 importlib.import_module(mod)
-            except ImportError as e:  # surfaces as an unregistered variant (ContractError)
+            except (
+                ImportError
+            ) as e:  # surfaces as an unregistered variant (ContractError)
                 log.warning("event=variant_load_failed vid=%s err=%s", vid, e)
             return
 
 
 def match_prefix(
-    spec: FusionSpec, ctx: MatchCtx, profile: Optional[str] = None
-) -> Tuple[Optional[object], int]:
+    spec: FusionSpec, ctx: MatchCtx, profile: str | None = None
+) -> tuple[object | None, int]:
     """Return (plan, n_stages) for the longest covered prefix, or (None, 0)."""
     prof = load_profile(profile)
     for n in range(len(spec.stages), 0, -1):
@@ -83,15 +84,23 @@ def match_prefix(
             _load_builtin(row.vid)
         info = catalog.get_variant(row.vid) if row.vid in catalog._CATALOG else None
         if info is None:
-            raise ContractError(f"profile row references unregistered variant {row.vid!r}")
+            raise ContractError(
+                f"profile row references unregistered variant {row.vid!r}"
+            )
         _check_contract(info, sub, ctx, row)
         plan = info.factory(sub, dict(row.params), ctx)
         plan.vid = row.vid
         plan.n_stages = n
         log.info(
             "event=dispatch sig=%s m=%d vid=%s n_stages=%d params=%s",
-            sub.signature(), ctx.m, row.vid, n, dict(row.params),
+            sub.signature(),
+            ctx.m,
+            row.vid,
+            n,
+            dict(row.params),
         )
         return plan, n
-    log.info("event=dispatch sig=%s m=%d vid=native n_stages=0", spec.signature(), ctx.m)
+    log.info(
+        "event=dispatch sig=%s m=%d vid=native n_stages=0", spec.signature(), ctx.m
+    )
     return None, 0

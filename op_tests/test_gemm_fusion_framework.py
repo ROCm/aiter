@@ -5,18 +5,19 @@
 import json
 import logging
 import os
-import sys
 import shutil
+import sys
 import tempfile
-import uuid
 import types
+import uuid
 from pathlib import Path
 
 import pytest
 
 try:
-    import aiter.gemm_fusion as gf  # noqa: F401
-except Exception:  # no torch / GPU: load the pure-Python subpackage without aiter/__init__
+    import aiter.gemm_fusion as gf
+except Exception:  # noqa: BLE001
+    # no torch / GPU: load the pure-Python subpackage without aiter/__init__
     for _k in [k for k in sys.modules if k == "aiter" or k.startswith("aiter.")]:
         del sys.modules[_k]
     _root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "aiter")
@@ -26,10 +27,22 @@ except Exception:  # no torch / GPU: load the pure-Python subpackage without ait
     import aiter.gemm_fusion as gf  # noqa: F401
 
 from aiter.gemm_fusion import (
-    Contract, ContractError, Field, FusionSpec, GemmSpec, HeadNormRopeCache, MatchCtx, Plan,
-    ProfileError, SPExchange, WindowReq, match_prefix, parse_profile, qkv_fields, register_variant,
+    Contract,
+    ContractError,
+    FusionSpec,
+    GemmSpec,
+    HeadNormRopeCache,
+    MatchCtx,
+    Plan,
+    ProfileError,
+    SPExchange,
+    catalog,
+    match_prefix,
+    parse_profile,
+    qkv_fields,
+    register_variant,
 )
-from aiter.gemm_fusion import catalog, profile as profmod
+from aiter.gemm_fusion import profile as profmod
 
 
 def mkspec(eps=1e-6, drop=()):
@@ -56,7 +69,10 @@ def test_signature_sensitivity():
     assert mkspec().prefix(1).signature() != base
     # field order is semantic
     f = qkv_fields(q=8192, kv=512, world=4, kv_shards=4)
-    s2 = FusionSpec(GemmSpec(n=9216, k=6144), (SPExchange(world=4, fields=tuple(reversed(f))), HeadNormRopeCache()))
+    s2 = FusionSpec(
+        GemmSpec(n=9216, k=6144),
+        (SPExchange(world=4, fields=tuple(reversed(f))), HeadNormRopeCache()),
+    )
     assert s2.signature() != base
     # int 1 vs bool True never alias
     with pytest.raises(ValueError):
@@ -66,7 +82,7 @@ def test_signature_sensitivity():
 @pytest.fixture
 def tmp_path():
     # plain mkdir: mkdtemp's restrictive ACL breaks on some sandboxed Windows hosts
-    d = Path(tempfile.gettempdir()) / ('gf_' + uuid.uuid4().hex)
+    d = Path(tempfile.gettempdir()) / ("gf_" + uuid.uuid4().hex)
     d.mkdir()
     try:
         yield d
@@ -81,8 +97,13 @@ def reg(monkeypatch):
 
     def add(vid, kinds, requires=()):
         @register_variant(
-            vid=vid, family="t", stage_kinds=kinds, source_sha="x",
-            contract=Contract(("gfx950",), 4, "t", "g", requires=requires, m_multiple=16),
+            vid=vid,
+            family="t",
+            stage_kinds=kinds,
+            source_sha="x",
+            contract=Contract(
+                ("gfx950",), 4, "t", "g", requires=requires, m_multiple=16
+            ),
         )
         class P(Plan):
             def __init__(self, spec, params, ctx):
@@ -97,15 +118,25 @@ def reg(monkeypatch):
 def write_prof(tmp_path, rows, name="p.json"):
     p = tmp_path / name
     p.write_text(json.dumps({"profile": "t", "rows": rows}))
-    from aiter.ops.gemm_fusion.sp_qkv.test_utils import clear_profile_cache; clear_profile_cache()
+    from aiter.ops.gemm_fusion.sp_qkv.test_utils import clear_profile_cache
+
+    clear_profile_cache()
     return str(p)
 
 
 def row(sig, m, vid, **params):
-    return {"sig": sig, "arch": "gfx950", "cu": 256, "world": 4, "m": m, "vid": vid, "params": params}
+    return {
+        "sig": sig,
+        "arch": "gfx950",
+        "cu": 256,
+        "world": 4,
+        "m": m,
+        "vid": vid,
+        "params": params,
+    }
 
 
-CTX = lambda m, avail=("mori_cco",): MatchCtx("gfx950", 256, 4, m, frozenset(avail))  # noqa: E731
+CTX = lambda m, avail=("mori_cco",): MatchCtx("gfx950", 256, 4, m, frozenset(avail))
 
 
 def test_exact_match_and_dispatch_log(tmp_path, reg, caplog):
@@ -130,7 +161,10 @@ def test_exact_match_and_dispatch_log(tmp_path, reg, caplog):
         lg.removeHandler(h)
         lg.setLevel(old_level)
     assert n == 2 and plan.vid == "v.full" and plan.params == {"sk": 3}
-    assert any("event=dispatch" in r.getMessage() and "vid=v.full" in r.getMessage() for r in records)
+    assert any(
+        "event=dispatch" in r.getMessage() and "vid=v.full" in r.getMessage()
+        for r in records
+    )
     # exact rows only: other M -> native
     assert match_prefix(s, CTX(32), p) == (None, 0)
 
@@ -147,7 +181,10 @@ def test_longest_prefix_wins(tmp_path, reg):
     reg("v.ex", ("sp_exchange",))
     reg("v.full", ("sp_exchange", "head_norm_rope_cache"))
     s = mkspec()
-    p = write_prof(tmp_path, [row(s.prefix(1).signature(), 16, "v.ex"), row(s.signature(), 16, "v.full")])
+    p = write_prof(
+        tmp_path,
+        [row(s.prefix(1).signature(), 16, "v.ex"), row(s.signature(), 16, "v.full")],
+    )
     assert match_prefix(s, CTX(16), p)[1] == 2
 
 
@@ -211,18 +248,34 @@ def _fake_elf(symbols):
     for s in symbols:
         offs.append(o)
         o += len(s) + 1
-    dynsym = b"\0" * 24 + b"".join(st.pack("<IBBHQQ", off, 0x12, 0, 1, 0, 0) for off in offs)
+    dynsym = b"\0" * 24 + b"".join(
+        st.pack("<IBBHQQ", off, 0x12, 0, 1, 0, 0) for off in offs
+    )
     shstr = b"\0.dynsym\0.dynstr\0.shstrtab\0"
     body = dynsym + dynstr + shstr
     base = 64
-    o_dynsym, o_dynstr, o_shstr = base, base + len(dynsym), base + len(dynsym) + len(dynstr)
+    o_dynsym, o_dynstr, o_shstr = (
+        base,
+        base + len(dynsym),
+        base + len(dynsym) + len(dynstr),
+    )
     shoff = base + len(body)
 
     def sh(name, typ, off, size, link=0, entsize=0):
         return st.pack("<IIQQQQIIQQ", name, typ, 0, 0, off, size, link, 0, 8, entsize)
 
-    shdrs = b"\0" * 64 + sh(1, 11, o_dynsym, len(dynsym), link=2, entsize=24) + sh(9, 3, o_dynstr, len(dynstr)) + sh(17, 3, o_shstr, len(shstr))
-    ehdr = b"\x7fELF" + bytes([2, 1, 1, 0]) + b"\0" * 8 + st.pack("<HHIQQQIHHHHHH", 3, 0xE0, 1, 0, 0, shoff, 0, 64, 0, 0, 64, 4, 3)
+    shdrs = (
+        b"\0" * 64
+        + sh(1, 11, o_dynsym, len(dynsym), link=2, entsize=24)
+        + sh(9, 3, o_dynstr, len(dynstr))
+        + sh(17, 3, o_shstr, len(shstr))
+    )
+    ehdr = (
+        b"\x7fELF"
+        + bytes([2, 1, 1, 0])
+        + b"\0" * 8
+        + st.pack("<HHIQQQIHHHHHH", 3, 0xE0, 1, 0, 0, shoff, 0, 64, 0, 0, 64, 4, 3)
+    )
     return ehdr + body + shdrs
 
 
@@ -253,19 +306,29 @@ def test_capabilities_probe_cco_library(mori_tree):
     from aiter.gemm_fusion import capabilities as cap
 
     so = mori_tree / "build" / "src" / "cco" / "libmori_cco.so"
-    _write_lib(so)  # NO sdma/anvil symbol names (like the real libmori_cco.so 87b7322f): sdma must still be detected via the header
+    _write_lib(
+        so
+    )  # NO sdma/anvil symbol names (like the real libmori_cco.so 87b7322f): sdma must still be detected via the header
     env = {"MORI_ROOT": str(mori_tree)}
     # symbols present, library not dlopen-able (fake ELF) -> dlopen check fails; with the check off it passes
     assert cap.probe_mori_cco(env, check_dlopen=True)[0] is False
     ok, sdma, why = cap.probe_mori_cco(env, check_dlopen=False)
     assert ok and sdma, why
-    assert cap.detect_capabilities(arch="gfx950", env=env, check_dlopen=False) == frozenset({"gfx950_sc_bypass", "mori_cco", "sdma"})
+    assert cap.detect_capabilities(
+        arch="gfx950", env=env, check_dlopen=False
+    ) == frozenset({"gfx950_sc_bypass", "mori_cco", "sdma"})
     # header without the SDMA device API -> mori_cco only
     hdr = mori_tree / "include" / "mori" / "cco" / "cco.hpp"
     hdr.write_text("// no sdma here\nint ccoDevCommCreate();\n")
-    assert cap.detect_capabilities(arch="gfx950", env=env, check_dlopen=False) == frozenset({"gfx950_sc_bypass", "mori_cco"})
-    hdr.write_text("#define BUILD_CCO_SDMA 0\nstruct ccoSdmaContext;\n")  # a token missing (sdmaQueueCount) -> not enough
-    assert "sdma" not in cap.detect_capabilities(arch="gfx950", env=env, check_dlopen=False)
+    assert cap.detect_capabilities(
+        arch="gfx950", env=env, check_dlopen=False
+    ) == frozenset({"gfx950_sc_bypass", "mori_cco"})
+    hdr.write_text(
+        "#define BUILD_CCO_SDMA 0\nstruct ccoSdmaContext;\n"
+    )  # a token missing (sdmaQueueCount) -> not enough
+    assert "sdma" not in cap.detect_capabilities(
+        arch="gfx950", env=env, check_dlopen=False
+    )
     hdr.write_text(SDMA_HDR)
     # a missing required symbol -> no capability at all
     _write_lib(so, drop=("ccoWindowRegister",))
@@ -277,8 +340,15 @@ def test_capabilities_probe_cco_library(mori_tree):
     _write_lib(good)
     cap._SYM_CACHE.clear()
     env2 = {"MORI_ROOT": str(mori_tree), "MORI_CCO_SO": str(good)}
-    assert cap.resolve_cco_library(env2) == str(good) and cap.probe_mori_cco(env2, check_dlopen=False)[:2] == (True, True)
-    assert cap.resolve_cco_library({"MORI_ROOT": str(mori_tree), "MORI_CCO_SO": str(mori_tree / "nope.so")}) is None
+    assert cap.resolve_cco_library(env2) == str(good) and cap.probe_mori_cco(
+        env2, check_dlopen=False
+    )[:2] == (True, True)
+    assert (
+        cap.resolve_cco_library(
+            {"MORI_ROOT": str(mori_tree), "MORI_CCO_SO": str(mori_tree / "nope.so")}
+        )
+        is None
+    )
     # MORI_ROOT/lib is preferred over build/src/cco
     (mori_tree / "lib").mkdir()
     libp = mori_tree / "lib" / "libmori_cco.so"
@@ -304,8 +374,15 @@ def test_capabilities_probe_failures_never_raise(mori_tree, tmp_path):
     ok, _s, why = cap.probe_mori_cco(env, check_dlopen=False)
     assert not ok and "header" in why
     # nothing at all
-    assert cap.probe_mori_cco({"MORI_ROOT": str(tmp_path / "empty")}, check_dlopen=False)[0] is False
-    assert "mori_cco" not in cap.detect_capabilities(arch="gfx942", env={"MORI_ROOT": str(tmp_path / "empty")})
+    assert (
+        cap.probe_mori_cco({"MORI_ROOT": str(tmp_path / "empty")}, check_dlopen=False)[
+            0
+        ]
+        is False
+    )
+    assert "mori_cco" not in cap.detect_capabilities(
+        arch="gfx942", env={"MORI_ROOT": str(tmp_path / "empty")}
+    )
 
 
 def test_capabilities_never_imports_mori_python_package(mori_tree):
@@ -314,5 +391,7 @@ def test_capabilities_never_imports_mori_python_package(mori_tree):
     from aiter.gemm_fusion import capabilities as cap
 
     before = "mori" in sys.modules
-    cap.detect_capabilities(arch="gfx950", env={"MORI_ROOT": str(mori_tree)}, check_dlopen=False)
+    cap.detect_capabilities(
+        arch="gfx950", env={"MORI_ROOT": str(mori_tree)}, check_dlopen=False
+    )
     assert ("mori" in sys.modules) == before

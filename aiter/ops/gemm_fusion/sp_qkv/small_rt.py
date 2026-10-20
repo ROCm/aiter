@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """ctypes runtime for the small-M driver (sm_fusion_driver.cpp). No torch import at module level.
-SmBindingV1 mirrors candidates/SM-T1-r18/host/bridge_sm.py (sha256 f243ef11...) field for field."""
+SmBindingV1 mirrors candidates/SM-T1-r18/host/bridge_sm.py (sha256 f243ef11...) field for field.
+"""
 
 from __future__ import annotations
 
@@ -13,29 +14,69 @@ SM_MP = 32
 
 class SmBindingV1(C.Structure):
     _fields_ = [
-        ("A", C.c_void_p), ("W", C.c_void_p), ("Ascale", C.c_void_p), ("Wscale", C.c_void_p),
-        ("qw", C.c_void_p), ("kw", C.c_void_p), ("cos_cache", C.c_void_p), ("sin_cache", C.c_void_p),
-        ("cos_stride_pos", C.c_int64), ("positions", C.c_void_p), ("slot_mapping", C.c_void_p),
-        ("k_cache", C.c_void_p), ("v_cache", C.c_void_p), ("k_scale", C.c_void_p), ("v_scale", C.c_void_p),
-        ("kc_sb", C.c_int64), ("kc_sh", C.c_int64), ("kc_sdx", C.c_int64), ("kc_ss", C.c_int64), ("kc_sx", C.c_int64),
-        ("vc_sb", C.c_int64), ("vc_sh", C.c_int64), ("vc_ssc", C.c_int64), ("vc_sd", C.c_int64), ("vc_sx", C.c_int64),
-        ("ks_sb", C.c_int64), ("ks_sh", C.c_int64), ("vs_sb", C.c_int64), ("vs_sh", C.c_int64),
-        ("q_out", C.c_void_p), ("k_out", C.c_void_p), ("v_out", C.c_void_p),
-        ("iqw", C.c_void_p), ("ikw", C.c_void_p), ("index_q_out", C.c_void_p), ("index_cache", C.c_void_p),
+        ("A", C.c_void_p),
+        ("W", C.c_void_p),
+        ("Ascale", C.c_void_p),
+        ("Wscale", C.c_void_p),
+        ("qw", C.c_void_p),
+        ("kw", C.c_void_p),
+        ("cos_cache", C.c_void_p),
+        ("sin_cache", C.c_void_p),
+        ("cos_stride_pos", C.c_int64),
+        ("positions", C.c_void_p),
+        ("slot_mapping", C.c_void_p),
+        ("k_cache", C.c_void_p),
+        ("v_cache", C.c_void_p),
+        ("k_scale", C.c_void_p),
+        ("v_scale", C.c_void_p),
+        ("kc_sb", C.c_int64),
+        ("kc_sh", C.c_int64),
+        ("kc_sdx", C.c_int64),
+        ("kc_ss", C.c_int64),
+        ("kc_sx", C.c_int64),
+        ("vc_sb", C.c_int64),
+        ("vc_sh", C.c_int64),
+        ("vc_ssc", C.c_int64),
+        ("vc_sd", C.c_int64),
+        ("vc_sx", C.c_int64),
+        ("ks_sb", C.c_int64),
+        ("ks_sh", C.c_int64),
+        ("vs_sb", C.c_int64),
+        ("vs_sh", C.c_int64),
+        ("q_out", C.c_void_p),
+        ("k_out", C.c_void_p),
+        ("v_out", C.c_void_p),
+        ("iqw", C.c_void_p),
+        ("ikw", C.c_void_p),
+        ("index_q_out", C.c_void_p),
+        ("index_cache", C.c_void_p),
         ("index_slot_mapping", C.c_void_p),
-        ("M", C.c_uint32), ("T", C.c_uint32), ("block_size", C.c_uint32), ("x_size", C.c_uint32),
-        ("strideA", C.c_uint32), ("pad0", C.c_uint32), ("eps", C.c_float), ("fp8_amax", C.c_float),
+        ("M", C.c_uint32),
+        ("T", C.c_uint32),
+        ("block_size", C.c_uint32),
+        ("x_size", C.c_uint32),
+        ("strideA", C.c_uint32),
+        ("pad0", C.c_uint32),
+        ("eps", C.c_float),
+        ("fp8_amax", C.c_float),
         ("poll_iterations", C.c_uint64),
     ]
 
 
 def load_driver(path: str):
     lib = C.CDLL(path)
-    vp, u32, u64, i32 = C.c_void_p, C.c_uint32, C.c_uint64, C.c_int32
+    vp, u32, i32 = C.c_void_p, C.c_uint32, C.c_int32
     sig = [
-        ("sm_attach_v1", [u32, vp, vp, vp, vp, vp, C.c_char_p, C.c_char_p, C.POINTER(vp)]),
-        ("sm_bind_new_v1", [vp, vp, C.POINTER(vp)]), ("sm_launch_blk_v1", [vp, vp, vp, vp, u32, vp]),
-        ("sm_blk_free_v1", [vp]), ("sm_free_v1", [vp]), ("sm_poison_fast_v1", [vp, vp, C.POINTER(u32)]), ("sm_info_v1", [vp]),
+        (
+            "sm_attach_v1",
+            [u32, vp, vp, vp, vp, vp, C.c_char_p, C.c_char_p, C.POINTER(vp)],
+        ),
+        ("sm_bind_new_v1", [vp, vp, C.POINTER(vp)]),
+        ("sm_launch_blk_v1", [vp, vp, vp, vp, u32, vp]),
+        ("sm_blk_free_v1", [vp]),
+        ("sm_free_v1", [vp]),
+        ("sm_poison_fast_v1", [vp, vp, C.POINTER(u32)]),
+        ("sm_info_v1", [vp]),
     ]
     for n, a in sig:
         f = getattr(lib, n)
@@ -71,7 +112,9 @@ class SmallContext:
     def poison_fast(self, stream=None) -> int:
         """Cheap per-step host check: 4-byte D2H of the poison word + stream sync (not capture-safe; call outside capture)."""
         v = C.c_uint32()
-        rc = self.lib.sm_poison_fast_v1(self.ctx, stream if stream is not None else C.c_void_p(None), C.byref(v))
+        rc = self.lib.sm_poison_fast_v1(
+            self.ctx, stream if stream is not None else C.c_void_p(None), C.byref(v)
+        )
         if rc != OK:
             raise RuntimeError(f"sm_poison_fast rc={rc}")
         return v.value
@@ -94,6 +137,13 @@ class SmallContext:
         return blk
 
     def launch(self, blk, A_ptr: int, W_ptr: int, strideA: int, stream):
-        rc = self.lib.sm_launch_blk_v1(self.ctx, blk, C.c_void_p(A_ptr), C.c_void_p(W_ptr), C.c_uint32(strideA), stream)
+        rc = self.lib.sm_launch_blk_v1(
+            self.ctx,
+            blk,
+            C.c_void_p(A_ptr),
+            C.c_void_p(W_ptr),
+            C.c_uint32(strideA),
+            stream,
+        )
         if rc != OK:
             raise RuntimeError(f"sm_launch_blk rc={rc}")

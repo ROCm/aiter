@@ -6,21 +6,52 @@ from __future__ import annotations
 
 import ctypes as C
 
-REPORT_FIELDS = ("epoch", "poison", "deferred_chunks", "credit_wait_ticks_100MHz", "inline_posts", "quiet_posts",
-                 "poison_reason", "epochs_done", "credit_miss", "lock_miss")
+REPORT_FIELDS = (
+    "epoch",
+    "poison",
+    "deferred_chunks",
+    "credit_wait_ticks_100MHz",
+    "inline_posts",
+    "quiet_posts",
+    "poison_reason",
+    "epochs_done",
+    "credit_miss",
+    "lock_miss",
+)
 POLL_ITERATIONS = 2_000_000  # r11 bridge default
 
 
 class _Va:  # raw device pointer -> torch via __cuda_array_interface__ (no copy, no ownership)
     def __init__(self, ptr, shape, typestr="<u2"):
-        self.__cuda_array_interface__ = {"shape": tuple(shape), "typestr": typestr, "data": (int(ptr), False), "version": 3, "strides": None}
+        self.__cuda_array_interface__ = {
+            "shape": tuple(shape),
+            "typestr": typestr,
+            "data": (int(ptr), False),
+            "version": 3,
+            "strides": None,
+        }
 
 
 def load_driver(path: str):
     lib = C.CDLL(path)
     vp, u32, u64, i32 = C.c_void_p, C.c_uint32, C.c_uint64, C.c_int32
     lib.lg_attach_v1.restype = vp
-    lib.lg_attach_v1.argtypes = [u32, u32, vp, vp, vp, vp, vp, vp, vp, vp, C.c_char_p, C.c_char_p, u32, C.POINTER(u64)]
+    lib.lg_attach_v1.argtypes = [
+        u32,
+        u32,
+        vp,
+        vp,
+        vp,
+        vp,
+        vp,
+        vp,
+        vp,
+        vp,
+        C.c_char_p,
+        C.c_char_p,
+        u32,
+        C.POINTER(u64),
+    ]
     lib.lg_free_v1.restype = i32
     lib.lg_free_v1.argtypes = [vp]
     lib.lg_poison_v1.restype = i32
@@ -43,7 +74,15 @@ def load_driver(path: str):
     return lib
 
 
-ATTACH_STAGES = {1: "args", 2: "image_hash", 3: "hipSetDevice", 4: "topology", 5: "sdma_queues", 6: "hipModuleLoad", 7: "entry_resolve"}
+ATTACH_STAGES = {
+    1: "args",
+    2: "image_hash",
+    3: "hipSetDevice",
+    4: "topology",
+    5: "sdma_queues",
+    6: "hipModuleLoad",
+    7: "entry_resolve",
+}
 ATTACH_ENTRIES = ("n1", "n2", "n4", "n2h", "n4h", "n3q", "quiet_ready", "drain_all")
 
 
@@ -51,9 +90,20 @@ def decode_attach_diag(d) -> str:
     """Human-readable reason for a failed lg_attach_v1 from its diag[8] output (see lg_fusion_driver.cpp D5)."""
     st = int(d[0])
     name = ATTACH_STAGES.get(st, f"unknown({st})")
-    s = lambda v: v - (1 << 64) if v >= (1 << 63) else v  # noqa: E731  (values are signed ints stored in u64)
+    s = lambda v: (v - (1 << 64) if v >= (1 << 63) else v)
     if st == 1:
-        names = ("comm", "devcomm", "S", "R", "C", "Sva", "Rva", "Cva", "hsaco_path", "sha")
+        names = (
+            "comm",
+            "devcomm",
+            "S",
+            "R",
+            "C",
+            "Sva",
+            "Rva",
+            "Cva",
+            "hsaco_path",
+            "sha",
+        )
         nulls = [n for i, n in enumerate(names) if int(d[1]) >> i & 1]
         return f"stage={name}: NULL args {nulls or 'none (range check)'}, rank={int(d[2])} M={int(d[3])} Q={int(d[4])} (need rank<=3, M%256==0, M<=8192, Q==1)"
     if st == 3 or st == 6:
@@ -85,10 +135,23 @@ class LargeContext:
         if rc != 0:
             raise RuntimeError(f"lg_comm_init_control rc={rc}")
 
-    def launch(self, A, W, As, Ws, strideA, puts_per_peer, half_first, stream, budget_us=None):
+    def launch(
+        self, A, W, As, Ws, strideA, puts_per_peer, half_first, stream, budget_us=None
+    ):
         # budget_us is a kernel ARGUMENT baked into a captured graph's argument block at capture time (see resources.resolve_wait_budget_us)
-        rc = self.lib.lg_launch_v1(self.h, C.c_void_p(A), C.c_void_p(W), C.c_void_p(As), C.c_void_p(Ws), strideA,
-                                     POLL_ITERATIONS, self.budget_us if budget_us is None else budget_us, puts_per_peer, half_first, stream)
+        rc = self.lib.lg_launch_v1(
+            self.h,
+            C.c_void_p(A),
+            C.c_void_p(W),
+            C.c_void_p(As),
+            C.c_void_p(Ws),
+            strideA,
+            POLL_ITERATIONS,
+            self.budget_us if budget_us is None else budget_us,
+            puts_per_peer,
+            half_first,
+            stream,
+        )
         if rc != 0:
             raise RuntimeError(f"lg_comm_launch rc={rc}")
 
@@ -108,9 +171,12 @@ class LargeContext:
 
     def poison(self, stream=None) -> int:
         """Cheap per-step host check: 4-byte D2H of the poison word on `stream` (null = default stream) + that stream's sync.
-        NOT capture-safe (host sync): call outside graph capture, e.g. once per model step."""
+        NOT capture-safe (host sync): call outside graph capture, e.g. once per model step.
+        """
         v = C.c_uint32()
-        rc = self.lib.lg_poison_v1(self.h, stream if stream is not None else C.c_void_p(None), C.byref(v))
+        rc = self.lib.lg_poison_v1(
+            self.h, stream if stream is not None else C.c_void_p(None), C.byref(v)
+        )
         if rc != 0:
             raise RuntimeError(f"lg_poison rc={rc}")
         return int(v.value)
