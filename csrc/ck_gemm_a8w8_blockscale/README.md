@@ -47,7 +47,7 @@ For FP32 FlyDSL tuning, with `KB = K // 128`:
 - Plain B passes row-major `x_scale[M, KB]`; kernel adapter will transpose to
   `[KB, M]` storage is included in the measured time.
 - `--preshuffle` passes `x_scale_t`, prepared before timing with
-  `x_scale.T.contiguous().view_as(x_scale)` and `is_transposed=True`.
+  `x_scale.T.contiguous().view_as(x_scale)`.
   Its tensor shape remains `[M, KB]`, but storage is ordered as `[KB, M]`,
   so the adapter skips the transpose.
 - Both use FP32 `w_scale[ceil(N / 128), KB]`.

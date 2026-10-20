@@ -51,15 +51,18 @@ def _prepare_scales(
         raise ValueError("FlyDSL blockscale requires FP32 scales")
     if tuple(w_scale.shape) != ((N + 127) // 128, KB):
         raise ValueError("w_scale must have shape (ceil(N / 128), K / 128)")
-
-    if not x_scale.is_contiguous() or x_scale.nelement() != M * KB:
-        raise ValueError(
-            "x_scale tensor must be contiguous and have the correct number of elements"
-        )
-    # kernel expected x_scale layout is [KB, M], so need to tranposed if not.
-    if not getattr(x_scale, "is_transposed", False):
+    if x_scale.nelement() != M * KB:
+        raise ValueError("x_scale tensor must have the correct number of elements")
+    # X scale must be [KB, M] layout, M is the innner-most dimension not matter preshuffle_b is True or False.
+    # The gemm op A8w8 blockscale  has implicit rule:
+    # x_scale =  orignal_scale.tranposed(0,1).contineous() if preshuffle_b else orignal_scale
+    # here let us assume x_scale already transposed when preshuffle_b and plain when not preshuffle_b
+    if not preshuffle_b:
         x_scale = x_scale.view(M, KB)
         x_scale = x_scale.transpose(0, 1).contiguous()
+    elif not x_scale.is_contiguous():
+        # e.g. sglang's (1, M)-strided view: its .T is already the dense [KB, M].
+        x_scale = x_scale.T.contiguous()
     sa = x_scale.view(-1)
     return sa, w_scale.contiguous().view(-1)
 
@@ -103,7 +106,7 @@ def run_gemm_a8w8_blockscale(
 ) -> Tensor:
     """Run the named candidate into ``Out``; never silently benchmark a fallback.
 
-    Plain B: XQ[M,K], WQ[N,K], row-major x_scale[M,K/128] unless is_transposed=True.
+    Plain B: XQ[M,K], WQ[N,K], row-major x_scale[M,K/128].
     Preshuffled B: shuffle_weight(WQ, (16,16)) and column-major x_scale.
     Both use w_scale[ceil(N/128),K/128] and BF16/FP16 output on gfx950.
     """

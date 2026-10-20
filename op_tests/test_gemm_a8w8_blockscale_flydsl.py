@@ -55,11 +55,12 @@ def test_gemm(m, n, k, dtype, layout, scale_layout, data_init):
     ref = run_torch(x, weight, x_scale, w_scale, dtype)
     gemm_weight = shuffle_weight(weight, layout=(16, 16)) if preshuffle_b else weight
     if scale_layout == "transposed":
+        # [K/128, M] bytes behind an (M, K/128) shape, as aiter's quant emits them.
         gemm_scale = x_scale.T.contiguous().view_as(x_scale)
-        # Mark the final prepared tensor, not the row-major reference scales.
-        gemm_scale.is_transposed = True
+    elif scale_layout == "strided":
+        # The same bytes as the (1, M)-strided view sglang passes.
+        gemm_scale = x_scale.T.contiguous().T
     else:
-        # gemm_scale.is_transposed would be checked , if will transposed if  not transpoed
         gemm_scale = x_scale
 
     candidates = {
@@ -156,8 +157,8 @@ def main():
     parser.add_argument(
         "--scale-layout",
         nargs="+",
-        choices=["non-transposed", "transposed"],
-        default=["non-transposed", "transposed"],
+        choices=["non-transposed", "transposed", "strided"],
+        default=["non-transposed", "transposed", "strided"],
     )
 
     parser.add_argument(
@@ -172,8 +173,8 @@ def main():
     for (m, n, k), layout, scale_layout, data_init, dtype in itertools.product(
         args.mnk, args.layout, args.scale_layout, args.data_init, args.dtype
     ):
-        # The preshuffle API requires transposed activation scales.
-        if layout == "preshuffle" and scale_layout == "non-transposed":
+        # Plain B reads row-major x_scale; preshuffled B reads [K/128, M] bytes.
+        if (layout == "plain") != (scale_layout == "non-transposed"):
             continue
         rows.append(test_gemm(m, n, k, dtype, layout, scale_layout, data_init))
     aiter.logger.info(
