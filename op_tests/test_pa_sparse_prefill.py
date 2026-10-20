@@ -657,6 +657,14 @@ def run_pa_sparse_prefill(
             tflops = flops / max(lat_us * 1e-6, 1e-12) / 1e12
             row[f"{name} us"] = round(float(lat_us), 2)
             row[f"{name} TFLOPS"] = round(float(tflops), 2)
+            if name == "asm":
+                # Effective Q/KV reads + BF16 output writes. Packed NoPE
+                # includes scales/padding; KV is shared by K/V and all heads.
+                # Count each CSR entry, without adjusting for cache reuse.
+                bytes_per_row = _FP8_D_NOPE_PADDED + _FP8_D_ROPE * 2
+                nbytes = (n * h + total_nnz) * bytes_per_row + n * h * d * 2
+                tbps = nbytes / max(lat_us * 1e-6, 1e-12) / 1e12
+                row["asm TB/s"] = round(float(tbps), 2)
 
     return row
 
