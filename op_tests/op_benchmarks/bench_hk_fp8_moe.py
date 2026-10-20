@@ -242,6 +242,10 @@ def moe():
         ma.gate_up_interleave = True
         mb.gate_up_interleave = False
         ms1, ms2 = mxs13[: E * 2 * INTER], mxs2[: E * D]
+        shared_a, shared_b = mx13[-1:], mx2[-1:]
+        shared_a.is_shuffled = shared_b.is_shuffled = True
+        shared_a.gate_up_interleave = True
+        shared_b.gate_up_interleave = False
         for T in (1, 128, 1024, 2048, 4096, 8192, 16384):
             x, ids, tw = make_inputs(T, topk)
             rows, expected = reference(x, ids, tw, ref13, ref2)
@@ -303,8 +307,8 @@ def moe():
             if topk == 9:
                 native_calls["aiter_fhmoe_mxfp8"] = partial(
                     native_calls["aiter_mxfp8"],
-                    shared_w1=mx13[-1:],
-                    shared_w2=mx2[-1:],
+                    shared_w1=shared_a,
+                    shared_w2=shared_b,
                     shared_w1_scale=mxs13[-2 * INTER :],
                     shared_w2_scale=mxs2[-D:],
                     shared_expert_id=E - 1,
