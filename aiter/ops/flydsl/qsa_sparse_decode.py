@@ -179,37 +179,41 @@ def flydsl_qsa_sparse_decode(
         kv_fp8=k_cache.dtype == torch.float8_e4m3fn,
     )
     kv_ptr_dtype = fx.Int8 if k_cache.dtype == torch.float8_e4m3fn else fx.BFloat16
-    stream = torch.cuda.current_stream(q.device)
-    _run_compiled(
-        attn,
-        ptr_arg(q, fx.BFloat16),
-        ptr_arg(k_cache, kv_ptr_dtype),
-        ptr_arg(v_cache, kv_ptr_dtype),
-        ptr_arg(req_to_token, fx.Int32),
-        ptr_arg(row_req_pool_indices, fx.Int32),
-        ptr_arg(indices, fx.Int32),
-        ptr_arg(seq_lens, fx.Int32),
-        ptr_arg(out, fx.BFloat16),
-        ptr_arg(part_m, fx.Float32),
-        ptr_arg(part_l, fx.Float32),
-        ptr_arg(part_o, fx.Float32),
-        rows,
-        num_kv_heads,
-        num_splits,
-        tokens_per_split,
-        indices.stride(0),
-        req_to_token.stride(0),
-        stream,
-    )
-    if not single_split:
+    # FlyDSL loads and launches on the current HIP device, not the stream's.
+    with torch.cuda.device(q.device):
+        stream = torch.cuda.current_stream(q.device)
         _run_compiled(
-            build_sparse_decode_reduce(group_size=group_size, num_splits=num_splits),
+            attn,
+            ptr_arg(q, fx.BFloat16),
+            ptr_arg(k_cache, kv_ptr_dtype),
+            ptr_arg(v_cache, kv_ptr_dtype),
+            ptr_arg(req_to_token, fx.Int32),
+            ptr_arg(row_req_pool_indices, fx.Int32),
+            ptr_arg(indices, fx.Int32),
+            ptr_arg(seq_lens, fx.Int32),
+            ptr_arg(out, fx.BFloat16),
             ptr_arg(part_m, fx.Float32),
             ptr_arg(part_l, fx.Float32),
             ptr_arg(part_o, fx.Float32),
-            ptr_arg(out, fx.BFloat16),
             rows,
             num_kv_heads,
+            num_splits,
+            tokens_per_split,
+            indices.stride(0),
+            req_to_token.stride(0),
             stream,
         )
+        if not single_split:
+            _run_compiled(
+                build_sparse_decode_reduce(
+                    group_size=group_size, num_splits=num_splits
+                ),
+                ptr_arg(part_m, fx.Float32),
+                ptr_arg(part_l, fx.Float32),
+                ptr_arg(part_o, fx.Float32),
+                ptr_arg(out, fx.BFloat16),
+                rows,
+                num_kv_heads,
+                stream,
+            )
     return out
