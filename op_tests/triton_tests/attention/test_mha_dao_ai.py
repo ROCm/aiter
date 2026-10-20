@@ -6,6 +6,9 @@ import contextlib
 import pytest
 import torch
 
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.fwd_prefill import (
+    attn_fwd,
+)
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
@@ -423,3 +426,33 @@ def test_mha_dao_ai_varlen_graph(dao_ai_impl, mha_type, default_device):
     assert not torch.isnan(out_graph).any(), "Graph replay produced NaN"
     diff = (out_eager - out_graph).abs().max().item()
     assert diff < 1e-5, f"Graph replay vs eager max diff {diff:.6e} exceeds 1e-5"
+
+
+def _num_attn_fwd_kernels():
+    return sum(len(cache[0]) for cache in attn_fwd.fn.device_caches.values())
+
+
+@pytest.mark.parametrize("CAUSAL", [True, False])
+def test_mha_dao_ai_varlen_max_seqlen_no_recompile(dao_ai_impl, CAUSAL):
+    """A new max sequence length in a varlen batch must not compile a new kernel."""
+    device = "cuda"
+    dtype = torch.bfloat16
+    nheads, d = 4, 64
+    torch.manual_seed(0)
+    num_kernels = []
+    for seqlens in ([96, 200], [300, 130], [57, 515], [1024, 33]):
+        cu_seqlens = torch.tensor(
+            [0, seqlens[0], sum(seqlens)], device=device, dtype=torch.int32
+        )
+        q, k, v = (
+            torch.randn(sum(seqlens), nheads, d, device=device, dtype=dtype)
+            for _ in range(3)
+        )
+        flash_attn_varlen_func(
+            q, k, v, cu_seqlens, cu_seqlens, max(seqlens), max(seqlens), causal=CAUSAL
+        )
+        torch.cuda.synchronize()
+        num_kernels.append(_num_attn_fwd_kernels())
+    assert (
+        num_kernels[1:] == num_kernels[:1] * 3
+    ), f"attn_fwd compiled new kernels for new max_seqlen values: {num_kernels}"

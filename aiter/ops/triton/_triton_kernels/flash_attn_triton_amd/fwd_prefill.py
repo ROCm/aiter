@@ -1872,6 +1872,11 @@ def attention_forward_prefill_triton_impl(
         stride_qh % 8 == 0 and stride_kh % 8 == 0 and stride_vh % 8 == 0
     )
 
+    # Varlen reads the sequence lengths from cu_seqlens. Pass 0 for MAX_SEQLENS_*
+    # so that all varlen batches use one compiled kernel.
+    kernel_max_seqlens_q = 0 if IS_VARLEN else max_seqlens_q
+    kernel_max_seqlens_k = 0 if IS_VARLEN else max_seqlens_k
+
     # launch kernel
     def grid(META):
         return (nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]), batch)
@@ -1931,8 +1936,8 @@ def attention_forward_prefill_triton_impl(
         HK=nheads_k,
         ACTUAL_BLOCK_DMODEL_QK=head_size_qk,
         ACTUAL_BLOCK_DMODEL_V=head_size_v,
-        MAX_SEQLENS_Q=max_seqlens_q,
-        MAX_SEQLENS_K=max_seqlens_k,
+        MAX_SEQLENS_Q=kernel_max_seqlens_q,
+        MAX_SEQLENS_K=kernel_max_seqlens_k,
         SM_SCALE=sm_scale,
         IS_CAUSAL=causal,
         USE_SLIDING_WINDOW=use_sliding_window,
