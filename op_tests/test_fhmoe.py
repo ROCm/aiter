@@ -2805,6 +2805,9 @@ def test_fhmoe_aot_replay_forwards_caller_choices(
     monkeypatch.setattr(
         fhmoe_module, "_fhmoe_impl", lambda **kwargs: calls.append(kwargs)
     )
+    # A replay process imports aiter for its arch; this one imported it for the
+    # host, whose fp8 alias is fnuz on gfx942.
+    monkeypatch.setattr(dtypes, "fp8", torch.float8_e4m3fn)
     with dry_run("gfx950", 256):
         aot_moe._replay(job)
 
