@@ -1589,9 +1589,21 @@ class MegaMoEGfx1250:
             if config.is_quant_dispatch_wire
             else {}
         )
+        # Driving EpDispatchPlan directly bypasses mori's op layer
+        # (EpDispatchCombineOpHip), which decides whether the slot allocator word
+        # moves out of the cco window into tokoff-ext memory. A mori from #726 on
+        # takes that decision as the plan's tok_off_ext, from TokOffExt.wanted.
+        # An older one rejects the unknown argument before compiling anything,
+        # and its op layer moved the word unless MORI_EP_TOKOFF_EXT=0/false/no/off.
+        try:
+            from mori.ops.dispatch_combine_v2.hip_backend import TokOffExt
+        except ImportError:
+            TokOffExt = None
+        wanted = getattr(TokOffExt, "wanted", None)
+        tokoff_kw = {"tok_off_ext": int(wanted(config.world_size))} if wanted else {}
         plans = {}
         for spec in self._dispatch_specs:
-            plan = EpDispatchPlan(
+            plan_kw = dict(
                 world_size=config.world_size,
                 # see dispatch_wire_elem_count; mori's plan_api: "the caller halves
                 # hiddenDim"
@@ -1608,24 +1620,26 @@ class MegaMoEGfx1250:
                 arena=self._arena,
                 region_names=_MORI_REGION_NAMES,
             )
+            try:
+                plan = EpDispatchPlan(**plan_kw, **tokoff_kw)
+            except TypeError:
+                if not tokoff_kw:
+                    raise
+                tokoff_kw = {}
+                plan = EpDispatchPlan(**plan_kw)
             plan.bind(rank=config.rank)
             plans[spec] = plan
         # The kernels dereference the window, so the plans have to outlive them.
         self._mori_plans = plans
 
-        # mori's op layer builds the tokoff-ext slot allocator in
-        # EpDispatchCombineOpHip.__init__; driving EpDispatchPlan directly
-        # bypasses that, leaving EpArgs.tokOffPeers null and dispatch on the
-        # serializing cco-window atomic. Mirror mori's gate (default on;
-        # MORI_EP_TOKOFF_EXT=0/false/no/off opts out) so the env var is not
-        # dead on this path. Reuse mori's builder rather than duplicate its
-        # IPC handle protocol, which must match the kernel byte for byte.
-        if os.environ.get("MORI_EP_TOKOFF_EXT", "1").strip().lower() not in (
-            "0",
-            "false",
-            "no",
-            "off",
-        ):
+        if tokoff_kw:
+            tokoff_ext = bool(tokoff_kw["tok_off_ext"])
+        else:
+            env = os.environ.get("MORI_EP_TOKOFF_EXT", "1").strip().lower()
+            tokoff_ext = env not in ("0", "false", "no", "off")
+        # Reuse mori's builder rather than duplicate its IPC handle protocol,
+        # which must match the kernel byte for byte.
+        if tokoff_ext:
             from mori.ops.dispatch_combine_v2.hip_backend import TokOffExt
 
             self._tokoff_ext = TokOffExt(
