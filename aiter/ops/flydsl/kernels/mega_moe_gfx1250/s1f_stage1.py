@@ -369,7 +369,7 @@ def _wait_tile_flags(
     addr = fx.Int64(flag_addr) + fx.Int64(src) * fx.Int64(4)
     want = fx.Int32(need) != fx.Int32(0)
     cur = fx.Int32(comm_ops.load_i32_global_system(addr))
-    bad = fx.Int32(ballot(T.i32, arith.unwrap(want & (cur != fx.Int32(gen)))))
+    bad = fx.Int32(ballot(T.i32, want & (cur != fx.Int32(gen))))
     it = fx.Int32(0)
     while (bad != fx.Int32(0)) & (it < fx.Int32(limit)):
         if it < fx.Int32(4):
@@ -377,7 +377,7 @@ def _wait_tile_flags(
         else:
             fx.rocdl.s_sleep(sleep)
         cur = fx.Int32(comm_ops.load_i32_global_system(addr))
-        bad = fx.Int32(ballot(T.i32, arith.unwrap(want & (cur != fx.Int32(gen)))))
+        bad = fx.Int32(ballot(T.i32, want & (cur != fx.Int32(gen))))
         it = it + fx.Int32(1)
     return it
 
@@ -1035,7 +1035,7 @@ def make_s1f_stage1(
                         )
                         start = inb & ((run_l == fx.Int32(0)) | (key_l != key_p))
                         in_blk = (lane >= fx.Int32(1)) & (lane <= fx.Int32(RBK))
-                        b_st = _uniform(ballot(T.i32, arith.unwrap(start & in_blk)))
+                        b_st = _uniform(ballot(T.i32, start & in_blk))
                         # the block's pieces end at the next piece start past it
                         # or at the table end, whichever comes first
                         b_end = _uniform(
@@ -1064,12 +1064,10 @@ def make_s1f_stage1(
                             & (tile_l == (row0_l + n_l - fx.Int32(1)) >> fx.Int32(FSH))
                             & (soff_l + n_l <= fx.Int32(max_routes))
                         )
-                        if _uniform(
-                            ballot(T.i32, arith.unwrap(owned & ~ok))
-                        ) != fx.Int32(0):
+                        if _uniform(ballot(T.i32, owned & ~ok)) != fx.Int32(0):
                             _trap()
                         # pieces: index within the block, ops per piece
-                        b_own = _uniform(ballot(T.i32, arith.unwrap(owned & start)))
+                        b_own = _uniform(ballot(T.i32, owned & start))
                         n_pc = _popc(b_own)
                         pidx_l = _popc(b_own & below) + fx.Int32(
                             start.select(fx.Int32(0), fx.Int32(-1))
@@ -1102,7 +1100,7 @@ def make_s1f_stage1(
                                     | (routes[kk] >= n_routes)
                                 )
                             )
-                        if _uniform(ballot(T.i32, arith.unwrap(bad))) != fx.Int32(0):
+                        if _uniform(ballot(T.i32, bad)) != fx.Int32(0):
                             _trap()
                         # ---- next claim (in flight until the block's end) ----
                         more = nblk + fx.Int32(1) < blk_cap
