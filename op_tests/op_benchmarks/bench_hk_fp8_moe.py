@@ -311,8 +311,16 @@ def moe():
                     clamp_shared=False,
                     output=torch.empty_like(x),
                 )
+            for name, call in list(native_calls.items()):
+                native_calls[name + "_reduce"] = partial(
+                    call, output=torch.empty_like(x)
+                )
             failures, native_dispatch = {}, {}
             for name, call in native_calls.items():
+                os.environ["AITER_FLYDSL_FORCE_REDUCE"] = (
+                    "1" if name.endswith("_reduce") else "0"
+                )
+                fm.get_2stage_cfgs.cache_clear()
                 try:
                     graph, output = capture_repeated(call, 10)
                     checks[name] = accuracy(output, expected, rows, 0.06)
@@ -323,6 +331,8 @@ def moe():
                     # Retain failed candidates for review instead of hiding them.
                     failures[name] = f"{type(exc).__name__}: {exc}"
                     print("CANDIDATE_FAILED", T, topk, name, failures[name], flush=True)
+            os.environ["AITER_FLYDSL_FORCE_REDUCE"] = "0"
+            fm.get_2stage_cfgs.cache_clear()
             timing = measure_pair(graphs, 10, 21)
             winner = min(
                 (n for n in timing if n != "hk"), key=lambda n: timing[n]["median_us"]
