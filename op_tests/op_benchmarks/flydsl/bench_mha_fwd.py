@@ -498,13 +498,23 @@ _HDIM_PAIRS = ((128, 128), (192, 128), (256, 128), (64, 64))
 CASES = [
     dict(_c, d_qk=_dqk, d_v=_dv) for _dqk, _dv in _HDIM_PAIRS for _c in _BASE_CASES
 ]
+# bf8 twins of every case, appended so the existing ids never move (case 10 is the
+# standing perf reference). Only the matched bf8+bf8 pair is listed; other dtypes
+# stay opt-in through -d.
+CASES += [dict(_c, dtype="bf8") for _c in CASES]
 for _i, _c in enumerate(CASES):
     _c["id"] = _i
 
 
-# Q/K/V element type. 8-bit runs the a8w8 sibling kernel; only the matched bf8 pair
-# is offered here, which is what the kernel is tuned and verified for.
-_DTYPES = {"bf16": torch.bfloat16, "bf8": torch.float8_e5m2}
+# Q/K/V element type. 8-bit routes to the a8w8 sibling kernel; Q, K and V share one
+# type (softmax P is bf8 and the output stays bf16 regardless).
+_DTYPES = {
+    "bf16": torch.bfloat16,
+    "fp16": torch.float16,
+    "bf8": torch.float8_e5m2,
+    "fp8": torch.float8_e4m3fn,
+}
+_B8_DTYPES = (torch.float8_e5m2, torch.float8_e4m3fn)
 
 
 def _randn(shape, dtype, device, fix_init=None):
@@ -514,7 +524,7 @@ def _randn(shape, dtype, device, fix_init=None):
     if fix_init is not None:
         return torch.full(shape, fix_init, dtype=torch.float32, device=device).to(dtype)
     t = torch.randn(*shape, dtype=torch.float32, device=device)
-    return (t * 0.3).to(dtype) if dtype is not torch.bfloat16 else t.to(dtype)
+    return (t * 0.3).to(dtype) if dtype in _B8_DTYPES else t.to(dtype)
 
 
 def _print_case_list():
@@ -533,6 +543,7 @@ def _print_case_list():
             "lse": c.get("lse", False),
             "window": str(tuple(c.get("window", (-1, -1)))),
             "sink": c.get("sink", False),
+            "dtype": c.get("dtype", "bf16"),
             "desc": c.get("desc", ""),
         }
         for c in CASES
@@ -566,11 +577,11 @@ def main():
         "--dtype",
         type=str,
         choices=sorted(_DTYPES),
-        default="bf16",
+        default=None,
         help=(
-            "Q/K/V element type. 'bf8' runs the a8w8 kernel (bf8 Q, K and V;\n"
-            "        softmax P is bf8 and the output stays bf16 either way).\n"
-            "        Applies to every selected case -- case ids are unchanged."
+            "Q/K/V element type; 8-bit runs the a8w8 kernel. Overrides the\n"
+            "        dtype each selected case carries, which is bf16 unless the\n"
+            "        case says otherwise.\n        e.g.: -d bf8"
         ),
     )
     parser.add_argument("-b", "--batch", type=int, default=1, help="Batch size.")
@@ -676,7 +687,8 @@ def main():
         selected = []
         for cid in args.case:
             assert 0 <= cid < len(CASES), f"--case {cid} out of range [0,{len(CASES)})"
-            selected.append(dict(CASES[cid], dtype=args.dtype))
+            c = CASES[cid]
+            selected.append(dict(c, dtype=args.dtype) if args.dtype else c)
     elif args.seqlen_q is not None and args.seqlen_kv is not None:
         Hkv = args.nheads_kv if args.nheads_kv is not None else args.nheads
         selected = [
@@ -693,7 +705,7 @@ def main():
                 "lse": args.lse,
                 "window": _parse_window(args.window),
                 "sink": args.sink,
-                "dtype": args.dtype,
+                "dtype": args.dtype or "bf16",
             }
         ]
     else:
@@ -704,7 +716,8 @@ def main():
 
     init_desc = "random" if args.fix_init is None else f"fixed={args.fix_init}"
     print("=" * 70)
-    print(f"FlyDSL m32x8 MHA perf (gfx1250, {args.dtype}, init={init_desc})")
+    _dts = sorted({c.get("dtype", "bf16") for c in selected})
+    print(f"FlyDSL m32x8 MHA perf (gfx1250, {'/'.join(_dts)}, init={init_desc})")
     print("=" * 70)
 
     rows = []
