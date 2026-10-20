@@ -92,7 +92,11 @@ def select_3d_config(
         attn_waves_per_eu = 1
         # waves_per_eu=N pads the register allocation to cap occupancy at N; the
         # reduce is latency-bound, so leave its occupancy to the compiler.
-        reduce_waves_per_eu = 0
+        cfg_dir = resolve_config_dir("attention", "MLA-DECODE", backend="gluon")
+        table = load_config_json(f"{cfg_dir}/DEFAULT.json")
+        reduce_waves_per_eu = table["triton_mla_decode_fwd_reduce_kernel"][
+            "waves_per_eu"
+        ]
         if shuffled_kv_cache and kv_dtype == torch.uint8:
             assert (
                 block_size == 128
@@ -497,6 +501,22 @@ def mla_decode_fwd(
             num_seqs,
             max_seqlen_kv,
         )
+        # Overrides may increase stages or Q padding even when the heuristic fits.
+        # Reject the whole override before changing tiles or either segment count.
+        if (
+            _pipelined_unshuffled_lds_bytes(
+                block_size,
+                tuned.get("BLOCK_M", BLOCK_M),
+                kv_lora_rank,
+                qk_rope_head_dim,
+                kv_buffer.element_size(),
+                q.element_size(),
+                tuned.get("num_stages", attn_config["num_stages"]),
+                tuned.get("Q_FROM_LDS", attn_config.get("Q_FROM_LDS", False)),
+            )
+            > 256 * 1024
+        ):
+            tuned = {}
         if "BLOCK_M" in tuned:
             # A smaller head tile needs less LDS, so the gate above still holds.
             assert (

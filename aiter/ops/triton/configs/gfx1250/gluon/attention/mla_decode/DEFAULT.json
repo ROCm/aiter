@@ -1,4 +1,7 @@
 {
+  "triton_mla_decode_fwd_reduce_kernel": {
+    "waves_per_eu": 0
+  },
   "pipelined_unshuffled": {
     "fp8_fp8": {
       "H_LEQ_32": {},
