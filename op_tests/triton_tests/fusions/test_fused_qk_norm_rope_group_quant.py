@@ -75,8 +75,6 @@ def dequant(nope):
     return (values * scales[..., None]).flatten(-2)
 
 
-# One case for each bucket of the config: 37 and 300 tokens use T_LEQ_512, 600
-# tokens use any.
 @pytest.mark.parametrize("num_tokens", [37, 300, 600])
 def test_fused_qk_norm_rope_group_quant(num_tokens):
     inputs = make_inputs(num_tokens)

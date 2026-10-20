@@ -394,7 +394,6 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
         [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
     )
 
-    # order=[1,0]: N fastest; threads_per_warp=[8,4] required by scaled_downcast
     blocked_layout: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 8],
         threads_per_warp=[8, 4],
