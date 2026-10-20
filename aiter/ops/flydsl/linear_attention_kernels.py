@@ -1072,37 +1072,27 @@ def flydsl_gdr_mtp_sglang(
     )
 
 
-_GDN_VARLEN_VITER4_MIN_DRAFT = 4
-_GDN_VARLEN_VITER4_BLOCKS_PER_CU = 1.5
-_GDN_VARLEN_VITER2_BLOCKS_PER_CU = 12.0
+# Swept on MI355X (Qwen3.8 TP1, batch 1-128, 1-5 tokens per sequence, KSPLIT
+# 2-16, BLOCK 64-512): KSPLIT=16 won every shape, and the widest VITER that
+# still leaves three blocks per CU was within 6% of the best config at each;
+# a narrower VITER only adds blocks that re-load q/k and redo their norms.
+_GDN_VARLEN_MIN_BLOCKS_PER_CU = 3
 
 
-def _gdn_varlen_viter(n, tokens_per_seq, num_v_heads, head_v_dim, ksplit, block):
-    """Widest v-iteration this launch's grid can pay for.
+def _gdn_varlen_viter(n, num_v_heads, head_v_dim, ksplit, block):
+    """Widest v-iteration that keeps the grid at three blocks per CU.
 
     A VITER that does not divide the head width is skipped rather than rounded,
     since the kernel would refuse it.
     """
     vlanes = block // ksplit
-    num_sms = get_num_sms()
-    draft = max(1, tokens_per_seq)
-
-    def blocks(viter):
+    min_blocks = _GDN_VARLEN_MIN_BLOCKS_PER_CU * get_num_sms()
+    for viter in (4, 2):
         vtile = vlanes * viter
         if head_v_dim % vtile:
-            return None
-        return n * num_v_heads * (head_v_dim // vtile)
-
-    wide = blocks(4)
-    if (
-        draft >= _GDN_VARLEN_VITER4_MIN_DRAFT
-        and wide is not None
-        and wide >= _GDN_VARLEN_VITER4_BLOCKS_PER_CU * num_sms
-    ):
-        return 4
-    mid = blocks(2)
-    if mid is not None and mid >= (_GDN_VARLEN_VITER2_BLOCKS_PER_CU / draft) * num_sms:
-        return 2
+            continue
+        if n * num_v_heads * (head_v_dim // vtile) >= min_blocks:
+            return viter
     return 1
 
 
@@ -1124,7 +1114,7 @@ def flydsl_gdn_decode_varlen(
     disable_state_update: bool = False,
     intermediate_states: torch.Tensor | None = None,
     intermediate_state_indices: torch.Tensor | None = None,
-    ksplit: int = 8,
+    ksplit: int = 16,
     block: int = 256,
     viter: int | None = None,
     validate_data: bool = False,
@@ -1234,9 +1224,7 @@ def flydsl_gdn_decode_varlen(
                 f"intermediate_states holds {cache_steps} steps per slot, "
                 f"but each sequence has {tokens_per_seq} tokens"
             )
-        index_tensors.append(
-            ("intermediate_state_indices", intermediate_state_indices)
-        )
+        index_tensors.append(("intermediate_state_indices", intermediate_state_indices))
     else:
         cache_steps = 0
     for name, t_ in index_tensors:
@@ -1270,9 +1258,8 @@ def flydsl_gdn_decode_varlen(
 
     # The jit compiles on first call, not on build, so the hint has to still be
     # in scope at the launch.
-    with CompilationContext.compile_hints(
-        {"fastmath": "fast"}
-    ), torch.cuda.device(q.device.index):
+    fastmath = CompilationContext.compile_hints({"fastmath": "fast"})
+    with fastmath, torch.cuda.device(q.device.index):
         launch = create_gdn_decode_verify_kernel(
             HV,
             Hg,
@@ -1295,7 +1282,7 @@ def flydsl_gdn_decode_varlen(
             ksplit,
             block,
             (
-                _gdn_varlen_viter(n, tokens_per_seq, HV, V, ksplit, block)
+                _gdn_varlen_viter(n, HV, V, ksplit, block)
                 if viter is None
                 else int(viter)
             ),

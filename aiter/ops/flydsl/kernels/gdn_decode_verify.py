@@ -61,7 +61,7 @@ def create_gdn_decode_verify_kernel(
     cache_steps: int,
     a_dtype: str,
     b_dtype: str,
-    KSPLIT: int = 8,
+    KSPLIT: int = 16,
     BLOCK: int = 256,
     VITER: int = 1,
 ):
@@ -158,6 +158,33 @@ def create_gdn_decode_verify_kernel(
         dtb = fx.Float32(dt_bias[hv])
         neg_exp_alog = -fx.exp(alog)
 
+        def load_token(t):
+            tok = bos + t
+            koff = tok * k_token_stride + ih * KDIM + kbase
+            qoff = tok * q_token_stride + ih * KDIM + kbase
+            voff = tok * v_token_stride + hv * V + vcol
+            return (
+                [
+                    _load_vec(kb, koff + j * HALF, HALF, fx.BFloat16)
+                    for j in range(NHALF)
+                ],
+                [
+                    _load_vec(qb, qoff + j * HALF, HALF, fx.BFloat16)
+                    for j in range(NHALF)
+                ],
+                _load_vec(ab, tok * a_token_stride + hv, 1, A_DT),
+                _load_vec(bb, tok * b_token_stride + hv, 1, B_DT),
+                [
+                    _load_vec(vbuf, voff + i * VLANES, 1, fx.BFloat16)
+                    for i in range(VITER)
+                ],
+            )
+
+        # The output and snapshot stores inside the token loop order every
+        # later load behind them; issuing all token loads up front lets them
+        # overlap the recurrence instead.
+        prefetched = [load_token(t) for t in range(TSTATIC)]
+
         sbase = hv * V * KDIM + vcol * KDIM + kbase
         VSTEP = VLANES * KDIM
         h = [fx.Vector.filled(HALF, 0.0, fx.Float32) for _ in range(VITER * NHALF)]
@@ -172,16 +199,9 @@ def create_gdn_decode_verify_kernel(
 
         for t in range_constexpr(TSTATIC):
             tok = bos + t
-            koff = tok * k_token_stride + ih * KDIM + kbase
-            qoff = tok * q_token_stride + ih * KDIM + kbase
-            kvec = [
-                _load_vec(kb, koff + j * HALF, HALF, fx.BFloat16).to(fx.Float32)
-                for j in range(NHALF)
-            ]
-            qvec = [
-                _load_vec(qb, qoff + j * HALF, HALF, fx.BFloat16).to(fx.Float32)
-                for j in range(NHALF)
-            ]
+            kraw, qraw, araw, braw, vraw = prefetched[t]
+            kvec = [x.to(fx.Float32) for x in kraw]
+            qvec = [x.to(fx.Float32) for x in qraw]
 
             sk_local = functools.reduce(lambda p, c: p + c, [x * x for x in kvec])
             sq_local = functools.reduce(lambda p, c: p + c, [x * x for x in qvec])
@@ -192,19 +212,9 @@ def create_gdn_decode_verify_kernel(
             kvec = [x * rk for x in kvec]
             qvec = [x * rq for x in qvec]
 
-            av = fx.Float32(
-                _load_vec(ab, tok * a_token_stride + hv, 1, A_DT)[0].to(fx.Float32)
-            )
-            bv_in = fx.Float32(
-                _load_vec(bb, tok * b_token_stride + hv, 1, B_DT)[0].to(fx.Float32)
-            )
-            voff = tok * v_token_stride + hv * V + vcol
-            vval = [
-                fx.Float32(
-                    _load_vec(vbuf, voff + i * VLANES, 1, fx.BFloat16)[0].to(fx.Float32)
-                )
-                for i in range(VITER)
-            ]
+            av = fx.Float32(araw[0].to(fx.Float32))
+            bv_in = fx.Float32(braw[0].to(fx.Float32))
+            vval = [fx.Float32(x[0].to(fx.Float32)) for x in vraw]
 
             x = av + dtb
             bx = softplus_beta * x
@@ -245,8 +255,7 @@ def create_gdn_decode_verify_kernel(
             obase = (tok * HV + hv) * V + vcol
 
             oaddr = [
-                (kpart == 0).select(obase + i * VLANES, out_bytes)
-                for i in range(VITER)
+                (kpart == 0).select(obase + i * VLANES, out_bytes) for i in range(VITER)
             ]
             for i in range_constexpr(VITER):
                 _store_vec(

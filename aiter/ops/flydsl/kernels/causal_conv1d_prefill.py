@@ -186,8 +186,8 @@ def create_causal_conv1d_prefill_kernel(
                     )
                 if offset + t < length:
                     for lane in range_constexpr(lanes):
-                        out[(c + lane) * os0 + (start + offset + t) * os1] = (
-                            element(acc[lane])
+                        out[(c + lane) * os0 + (start + offset + t) * os1] = element(
+                            acc[lane]
                         )
                 for j in range_constexpr(width - 2):
                     history[j] = history[j + 1]

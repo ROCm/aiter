@@ -532,9 +532,7 @@ def make_gdn_varlen_inputs(
         1, tokens, 2 * k_width + num_v_heads * head_v_dim, dtype=torch.bfloat16
     )
     q = mixed[..., :k_width].view(1, tokens, num_k_heads, GDN_HEAD_K_DIM)
-    k = mixed[..., k_width : 2 * k_width].view(
-        1, tokens, num_k_heads, GDN_HEAD_K_DIM
-    )
+    k = mixed[..., k_width : 2 * k_width].view(1, tokens, num_k_heads, GDN_HEAD_K_DIM)
     v = mixed[..., 2 * k_width :].view(1, tokens, num_v_heads, head_v_dim)
     state = torch.randn(2 * batch + 1, num_v_heads, head_v_dim, GDN_HEAD_K_DIM)
     return {
@@ -679,7 +677,9 @@ def test_flydsl_gdn_decode_varlen(
         perf_state = initial_state.clone()
         perf_inter = initial_inter.clone() if cache_states else None
         _, us = run_perftest(
-            lambda state: candidate(state, perf_inter),
+            lambda state, candidate=candidate, inter=perf_inter: candidate(
+                state, inter
+            ),
             perf_state,
             num_rotate_args=_perf_rotation_count(perf_state, reference_out),
         )
@@ -713,9 +713,9 @@ def test_flydsl_gdn_decode_varlen(
                     msg=f"{name}: GDN varlen snapshots ",
                 )
             )
-        assert max(errs) <= _TOL_ERR_RATIO, (
-            f"{name}: mismatch ratio exceeds {_TOL_ERR_RATIO:g}: {errs}"
-        )
+        assert (
+            max(errs) <= _TOL_ERR_RATIO
+        ), f"{name}: mismatch ratio exceeds {_TOL_ERR_RATIO:g}: {errs}"
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
@@ -771,9 +771,13 @@ def test_flydsl_gdn_decode_varlen_padding_slot():
 @_gdn_varlen_only
 def test_flydsl_gdn_decode_varlen_reuses_kernel_across_batch_sizes():
     """The output size is a launch argument, so a new batch size must neither
-    build a new kernel nor reuse a stale bound."""
+    build a new kernel nor reuse a stale bound.
+
+    Starts at two tokens: torch reports a size-1 token axis with its own
+    stride, so a single-token batch builds its own kernel once.
+    """
     misses = None
-    for batch in (1, 2, 7):
+    for batch in (2, 3, 7):
         inputs = make_gdn_varlen_inputs(batch, 1, 16, 48, 128, torch.bfloat16)
         reference_state = inputs["state"].clone()
         reference_out = ref_gdn_decode_varlen(**{**inputs, "state": reference_state})
@@ -945,9 +949,7 @@ def main():
         # Decode writes the state back; target verify snapshots every token and
         # leaves the commit to the caller, as the SGLang GDN backend does.
         rows.append(
-            test_flydsl_gdn_decode_varlen(
-                batch, tps, *heads, dtype, tps > 1, tps == 1
-            )
+            test_flydsl_gdn_decode_varlen(batch, tps, *heads, dtype, tps > 1, tps == 1)
         )
     aiter.logger.info(
         "FlyDSL GDN packed decode/verify summary (markdown):\n%s",

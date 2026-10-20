@@ -184,9 +184,8 @@ def test_causal_conv1d_prefill(
     tokens = batch * seqlen
     flops = 2 * tokens * dim * width
     # x in, output out, weights, and the state window read and written.
-    nbytes = (
-        2 * tokens * dim + dim * width + 2 * batch * dim * (width - 1)
-    ) * inputs["x"].element_size()
+    elements = 2 * tokens * dim + dim * width + 2 * batch * dim * (width - 1)
+    nbytes = elements * inputs["x"].element_size()
 
     ret = {"gfx": get_gfx()}
     for name, fn in candidates.items():
