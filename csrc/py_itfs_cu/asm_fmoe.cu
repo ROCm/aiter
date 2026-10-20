@@ -272,7 +272,8 @@ class FMoeKernel
     };
 };
 
-// model_dim must be a multiple of the kernel's dim_align (0 = unconstrained); 0 skips the check.
+// model_dim must be a multiple of the kernel's dim_align and at least its dim_min
+// (0 = unconstrained).
 FMoeKernel* get_heuristic_kernel(int inter_dim,
                                  int sub_X_cnt,
                                  CFG* cfgs,
@@ -303,7 +304,8 @@ FMoeKernel* get_heuristic_kernel(int inter_dim,
                 continue;
             const auto& cfg = el.second;
             if(cfg.vskip == vskip && cfg.smf == smf && block_size_M == cfg.subGU_m &&
-               cfg.flat == 0 && model_dim % std::max(cfg.dim_align, 1) == 0)
+               cfg.flat == 0 && model_dim % std::max(cfg.dim_align, 1) == 0 &&
+               model_dim >= cfg.dim_min)
             {
                 if((inter_dim % cfg.subGU_n) == 0)
                 {
@@ -345,13 +347,15 @@ FMoeKernel* get_heuristic_kernel(int inter_dim,
     if(it != cfgs->end())
     {
         const auto& cfg     = it->second;
-        AITER_CHECK(model_dim % std::max(cfg.dim_align, 1) == 0,
+        AITER_CHECK(model_dim % std::max(cfg.dim_align, 1) == 0 && model_dim >= cfg.dim_min,
                     __func__,
                     ": ",
                     selectedKl,
                     " requires model_dim % ",
                     cfg.dim_align,
-                    " == 0; got model_dim=",
+                    " == 0 and model_dim >= ",
+                    cfg.dim_min,
+                    "; got model_dim=",
                     model_dim);
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();

@@ -3798,16 +3798,22 @@ def get_2stage_cfgs(
             if q_type == QuantType.per_1x128:
                 # for fp8 blockscale, ck has better performance so disable assembly kernel
                 # asm kernels read past X/w2 below a minimum model_dim and need it
-                # aligned (per-kernel dim_align in hsa/<arch>/fmoe)
-                min_dim, dim_align = {"gfx942": (512, 256), "gfx950": (1024, 512)}.get(
-                    get_gfx(), (0, 1)
-                )
-                run_1stage = (
-                    token > 32
-                    and inter_dim % 128 == 0
-                    and model_dim >= min_dim
-                    and model_dim % dim_align == 0
-                )
+                # aligned (per-kernel dim_align/dim_min in hsa/<arch>/fmoe). On
+                # gfx950 only the 32x256/32x384 kernels handle model_dim 512.
+                gfx = get_gfx()
+                if gfx == "gfx942":
+                    dim_ok = model_dim >= 512 and model_dim % 256 == 0
+                elif gfx == "gfx950":
+                    dim_ok = model_dim % 512 == 0 and (
+                        model_dim >= 1024
+                        or (
+                            model_dim == 512
+                            and (inter_dim % 256 == 0 or inter_dim % 384 == 0)
+                        )
+                    )
+                else:
+                    dim_ok = True
+                run_1stage = token > 32 and inter_dim % 128 == 0 and dim_ok
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
