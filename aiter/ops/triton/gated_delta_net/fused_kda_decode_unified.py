@@ -15,7 +15,7 @@ from __future__ import annotations
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_conv_recurrent_norm_unified import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.decode.fused_conv_recurrent_norm_unified import (
     _fused_kda_decode_unified_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch

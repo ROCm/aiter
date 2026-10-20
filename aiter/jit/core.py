@@ -8,7 +8,6 @@ import logging
 import multiprocessing
 import os
 import re
-import shlex
 import shutil
 import sys
 import time
@@ -22,7 +21,7 @@ from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
-from chip_info import get_gfx, get_gfx_list, get_gfx_runtime
+from chip_info import _detect_native, get_gfx, get_gfx_list, get_gfx_runtime
 from cpp_extension import _jit_compile, executable_path, get_hip_version
 from file_baton import FileBaton
 from jit_cache import (
@@ -94,6 +93,13 @@ logger = logging.getLogger("aiter")
 PY = sys.executable
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
+# Platform helpers to keep aiter importable and buildable on Windows.
+IS_WINDOWS = sys.platform == "win32"
+NULL_DEVICE = "NUL" if IS_WINDOWS else "/dev/null"
+# Suffix for built JIT modules. Linux extensions ship as `.so`; on Windows
+# Python loads `.pyd` (which is just a renamed `.dll`).
+JIT_LIB_EXT = ".pyd" if IS_WINDOWS else ".so"
+
 AITER_ROOT_DIR = os.path.abspath(f"{this_dir}/../../")
 AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", "0"))
 AITER_LOG_TUNED_CONFIG = int(os.getenv("AITER_LOG_TUNED_CONFIG", "0"))
@@ -108,6 +114,16 @@ AITER_CONFIG_GEMM_A4W4 = os.getenv(
 AITER_CONFIG_GEMM_A6W6 = os.getenv(
     "AITER_CONFIG_GEMM_A6W6",
     f"{AITER_ROOT_DIR}/aiter/configs/a6w6_blockscale_tuned_gemm.csv",
+)
+
+AITER_CONFIG_GEMM_A6W4_ASM = (
+    os.getenv("AITER_CONFIG_GEMM_A6W4_ASM", "").strip()
+    or f"{AITER_ROOT_DIR}/aiter/configs/a6w4_asm_tuned_gemm.csv"
+)
+
+AITER_CONFIG_GEMM_A4W6_ASM = (
+    os.getenv("AITER_CONFIG_GEMM_A4W6_ASM", "").strip()
+    or f"{AITER_ROOT_DIR}/aiter/configs/a4w6_asm_tuned_gemm.csv"
 )
 
 AITER_CONFIG_GEMM_A8W8 = os.getenv(
@@ -125,14 +141,22 @@ AITER_CONFIG_GEMM_A8W8_BLOCKSCALE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_tuned_gemm.csv",
 )
 
+# Native E8M0 group32 scales have a different operand contract from the
+# FP32 128x128 blockscale family, so shape-identical rows must stay separate.
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32 = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_group32_tuned_gemm.csv",
+)
+# E8M0 block-scale GEMM rows (1x32/32x32 and 1x128/128x128) for (16, 16)-
+# preshuffled weights, keyed on the w_scale block as well.
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv",
+)
+
 AITER_CONFIG_FMOE = os.getenv(
     "AITER_CONFIG_FMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
-)
-
-AITER_CONFIG_COMM_FUSED_MOE = os.getenv(
-    "AITER_CONFIG_COMM_FUSED_MOE",
-    f"{AITER_ROOT_DIR}/aiter/configs/comm_fused_moe.csv",
 )
 
 AITER_CONFIG_FHMOE = os.getenv(
@@ -148,6 +172,11 @@ AITER_CONFIG_GROUPED_FMOE = os.getenv(
 AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE = os.getenv(
     "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv",
+)
+
+AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_mxfp8_bpreshuffle_tuned_gemm.csv",
 )
 
 AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE = os.getenv(
@@ -168,8 +197,9 @@ AITER_CONFIG_BF16_BATCHED_GEMM = os.getenv(
 # fp8 e8m0 mxscale (block-scale) batched-GEMM tuned config. Its own family
 # (scale type baked into the filename, matching the a8w8_/bf16_ split) so a
 # future fp32 rowwise-scale variant lands in a separate CSV and never collides
-# on key. The scale type is identified by the filename alone. The
-# per-model tuned data currently lives under model_configs/ (e.g.
+# on key. Within the family the e8m0 weight-scale block (32x32, 128x128, 1x32
+# or 1x128) is the w_scale_block key column. The per-model tuned data
+# currently lives under model_configs/ (e.g.
 # dsv4_batched_gemm_a8w8_blockscale_mxscale_tuned.csv), merged in at runtime by
 # get_config_file; this canonical path may not exist on disk.
 AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE = os.getenv(
@@ -177,6 +207,7 @@ AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/batched_gemm_a8w8_blockscale_mxscale_tuned.csv",
 )
 
+# Separate configs for (16,16)-preshuffled B let both weight layouts coexist.
 AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE = os.getenv(
     "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
     f"{AITER_ROOT_DIR}/aiter/configs/"
@@ -186,6 +217,14 @@ AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE = os.getenv(
 AITER_CONFIG_GEMM_BF16 = os.getenv(
     "AITER_CONFIG_GEMM_BF16",
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
+)
+
+# Per-model tuned rows live under model_configs/
+# (qwenimage_vae_bf16_tuned_conv3d.csv, wan21_vae_bf16_tuned_conv3d.csv) and
+# get merged into this canonical file by get_config_file. It ships header-only.
+AITER_CONFIG_CONV3D_BF16 = os.getenv(
+    "AITER_CONFIG_CONV3D_BF16",
+    f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_conv3d.csv",
 )
 
 # K5 opt BV tuned config. Per-model tuned rows live under model_configs/
@@ -198,9 +237,26 @@ AITER_CONFIG_GDN_K5_OPT = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_opt_tuned.csv",
 )
 
+AITER_CONFIG_IQ2R_GLM53 = os.getenv(
+    "AITER_CONFIG_IQ2R_GLM53",
+    f"{AITER_ROOT_DIR}/aiter/configs/iq2r_glm53_tuned.csv",
+)
+
 AITER_CONFIG_DISPATCH_COMBINE_INTRANODE = os.getenv(
     "AITER_CONFIG_DISPATCH_COMBINE_INTRANODE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_dispatch_combine_intranode.csv",
+)
+
+# MegaMoE TP (aiter/ops/flydsl/mega_moe_tp.py): the small-batch engine's launch configs and
+# the big-M kernel's chunk plans
+AITER_CONFIG_MEGA_MOE_TP = os.getenv(
+    "AITER_CONFIG_MEGA_MOE_TP",
+    f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_tuned.csv",
+)
+
+AITER_CONFIG_MEGA_MOE_TP_BIGM = os.getenv(
+    "AITER_CONFIG_MEGA_MOE_TP_BIGM",
+    f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_bigm_tuned.csv",
 )
 
 
@@ -219,6 +275,22 @@ class AITER_CONFIG:
             "AITER_CONFIG_GEMM_A6W6",
             AITER_CONFIG_GEMM_A6W6,
             "a6w6_blockscale_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A6W4_ASM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A6W4_ASM",
+            AITER_CONFIG_GEMM_A6W4_ASM,
+            "a6w4_asm_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A4W6_ASM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A4W6_ASM",
+            AITER_CONFIG_GEMM_A4W6_ASM,
+            "a4w6_asm_tuned_gemm",
         )
 
     @property
@@ -244,17 +316,25 @@ class AITER_CONFIG:
         )
 
     @property
-    def AITER_CONFIG_FMOE_FILE(self):
+    def AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32_FILE(self):
         return self.get_config_file(
-            "AITER_CONFIG_FMOE", AITER_CONFIG_FMOE, "tuned_fmoe"
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32",
+            AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32,
+            "a8w8_blockscale_group32_tuned_gemm",
         )
 
     @property
-    def AITER_CONFIG_COMM_FUSED_MOE_FILE(self):
+    def AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE(self):
         return self.get_config_file(
-            "AITER_CONFIG_COMM_FUSED_MOE",
-            AITER_CONFIG_COMM_FUSED_MOE,
-            "tuned_comm_fused_moe",
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+            AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE,
+            "a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_FMOE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_FMOE", AITER_CONFIG_FMOE, "tuned_fmoe"
         )
 
     @property
@@ -277,6 +357,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
             AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE,
             "a8w8_blockscale_bpreshuffle_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE",
+            AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE,
+            "a8w8_mxfp8_bpreshuffle_tuned_gemm",
         )
 
     @property
@@ -310,6 +398,12 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_CONV3D_BF16_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_CONV3D_BF16", AITER_CONFIG_CONV3D_BF16, "bf16_tuned_conv3d"
+        )
+
+    @property
     def AITER_CONFIG_GDN_K5_OPT_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GDN_K5_OPT",
@@ -318,11 +412,31 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_IQ2R_GLM53_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_IQ2R_GLM53", AITER_CONFIG_IQ2R_GLM53, "iq2r_glm53_tuned"
+        )
+
+    @property
     def AITER_CONFIG_DISPATCH_COMBINE_INTRANODE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_DISPATCH_COMBINE_INTRANODE",
             AITER_CONFIG_DISPATCH_COMBINE_INTRANODE,
             "tuned_dispatch_combine_intranode",
+        )
+
+    @property
+    def AITER_CONFIG_MEGA_MOE_TP_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MEGA_MOE_TP", AITER_CONFIG_MEGA_MOE_TP, "mega_moe_tp_tuned"
+        )
+
+    @property
+    def AITER_CONFIG_MEGA_MOE_TP_BIGM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MEGA_MOE_TP_BIGM",
+            AITER_CONFIG_MEGA_MOE_TP_BIGM,
+            "mega_moe_tp_bigm_tuned",
         )
 
     @property
@@ -335,15 +449,168 @@ class AITER_CONFIG:
 
     @property
     def AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE(self):
+        # The name carries _bpreshuffle_ between mxscale and tuned, so the glob
+        # above cannot pick these files up and this one cannot pick those up.
         return self.get_config_file(
             "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
             AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE,
             "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned",
         )
 
-    def update_config_files(self, file_path: str, merge_name: str):
+    def _raise_on_duplicate_shapes(
+        self, merge_df, source_pairs, merge_name: str, env_name: str | None = None
+    ):
+        """Reject duplicate shapes in `merge_df`, keyed on the columns of the
+        family's *untuned* CSV. On collision, rewrite each source file keeping
+        the best (lowest `us`) row per key and raise so the caller re-runs.
+
+        `source_pairs` is [(path, df)] in the same row order as `merge_df`, so
+        the write-back can map merged rows back to their originating file.
+
+        Shared by the multi-file merge and the single-file path: one CSV on its
+        own can carry duplicate shapes too (e.g. a retune appended instead of
+        replacing), and no other check looks at it."""
+        import pandas as pd
+
+        has_tag = "_tag" in merge_df.columns
+        if has_tag:
+            merge_df["_tag"] = merge_df["_tag"].fillna("")
+
+        ## get keys from untuned file to drop_duplicates
+        # Turn the tuned-file base name into its untuned sibling by rewriting the
+        # LAST "tuned" token (handles both mid-string names like
+        # "a8w8_tuned_gemm" and trailing ones like "..._mxscale_tuned").
+        untuned_name = "untuned".join(merge_name.rsplit("tuned", 1))
+        untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
+        if not os.path.exists(untuned_path):
+            logger.warning(
+                f"Untuned config file not found: {untuned_path}. "
+                "Skipping duplicate-shape check."
+            )
+            return
+
+        untunedf = pd.read_csv(untuned_path)
+        keys = untunedf.columns.to_list()
+        if "cu_num" not in keys:
+            keys.append("cu_num")
+        if "gfx" in merge_df.columns and "gfx" not in keys:
+            keys.append("gfx")
+        dedup_keys = keys + ["_tag"] if has_tag else keys
+        # Only key on columns actually present in the merged frame. Most
+        # families carry cu_num, but some (e.g. the mxscale batched-GEMM
+        # table) key on gfx and never carry cu_num; keeping a missing column
+        # in the subset would raise inside pandas' duplicated().
+        dedup_keys = [k for k in dedup_keys if k in merge_df.columns]
+        if not dedup_keys:
+            return
+        duplicated_mask = merge_df.duplicated(subset=dedup_keys, keep=False)
+        if not duplicated_mask.any():
+            return
+
+        dup_count = int(duplicated_mask.sum())
+        dup_rows = merge_df[duplicated_mask].sort_values(dedup_keys)
+        dup_header = (
+            f"Found {dup_count} duplicate shape entries during merge of "
+            f"'{merge_name}' (dedup key: {dedup_keys}).\n"
+        )
+        env_hint = (
+            f"To use only specific tables, set {env_name or 'the matching AITER_CONFIG_* env var'} "
+            f"to their paths, separated by '{os.pathsep}'; this also skips the "
+            f"model_configs/ scan.\n"
+        )
+        if "us" not in merge_df.columns:
+            raise RuntimeError(
+                dup_header + "No 'us' column to determine best performing entry. "
+                "Please remove duplicates manually.\n"
+                + env_hint
+                + f"Duplicate rows:\n{dup_rows.to_string(index=False)}"
+            )
+
+        # Auto-dedup: globally determine best row (lowest 'us') per shape
+        best_row_index = set(
+            merge_df.sort_values("us", kind="stable")
+            .drop_duplicates(subset=dedup_keys, keep="first")
+            .index
+        )
+
+        saved_files = []
+        failed_files = []
+        offset = 0
+        for src_path, src_df in source_pairs:
+            start, end = offset, offset + len(src_df)
+            offset = end
+            file_rows = merge_df.iloc[start:end]
+            new_src_df = file_rows[file_rows.index.isin(best_row_index)].reset_index(
+                drop=True
+            )
+            if len(new_src_df) < len(src_df):
+                try:
+                    new_src_df.to_csv(src_path, index=False)
+                except OSError as exc:
+                    # A read-only install or container cannot take the rewrite.
+                    # Letting that escape would replace the diagnostic below
+                    # with a bare PermissionError, dropping the dedup key and
+                    # the env var hint exactly where they are needed most, and
+                    # would also abandon any remaining source half-rewritten.
+                    failed_files.append(f"  {src_path}: {exc}")
+                    continue
+                saved_files.append(
+                    f"  {src_path}: {len(src_df)} -> {len(new_src_df)} rows"
+                )
+        if failed_files:
+            outcome = (
+                "Resolved by keeping best performing (lowest 'us') for each key, "
+                "but not every source config file could be rewritten.\n"
+            )
+        else:
+            outcome = (
+                "Auto-resolved by keeping best performing (lowest 'us') for each "
+                "key and saved back to source config files.\n"
+            )
+        saved_info = "\n".join(saved_files) if saved_files else "  (no files updated)"
+        failed_info = (
+            "\nNot updated:\n" + "\n".join(failed_files) if failed_files else ""
+        )
+        raise RuntimeError(
+            dup_header
+            + outcome
+            + "In a source checkout, re-run and commit the updated files. "
+            "In an installed package or container the rewritten files may not "
+            "persist, so re-running can hit the same duplicates.\n"
+            + env_hint
+            + f"Duplicate rows:\n{dup_rows.to_string(index=False)}\n"
+            f"Updated files:\n{saved_info}" + failed_info
+        )
+
+    def update_config_files(
+        self, file_path: str, merge_name: str, env_name: str | None = None
+    ):
         path_list = file_path.split(os.pathsep) if file_path else []
         if len(path_list) <= 1:
+            # Nothing to merge, but the lone CSV can still hold two rows with
+            # the same shape key. The merge is the only other place this is
+            # caught, so families that never grow a model_configs/ sibling
+            # would otherwise never have their tuned data validated at all.
+            import pandas as pd
+
+            single = path_list[0] if path_list else None
+            if single and os.path.exists(single):
+                try:
+                    df = pd.read_csv(single)
+                except (OSError, UnicodeError, ValueError, pd.errors.ParserError):
+                    # This path previously handed the file back unread, so an
+                    # unparseable CSV surfaced from the op's own loader. Keep
+                    # that: the duplicate check must not turn into a new way
+                    # for a malformed table to fail, and earlier.
+                    logger.warning(
+                        f"Could not parse {single} for the duplicate-shape "
+                        "check; leaving it to the caller."
+                    )
+                    df = None
+                if df is not None and not df.empty:
+                    self._raise_on_duplicate_shapes(
+                        df, [(single, df)], merge_name, env_name
+                    )
             return file_path
         source_pairs = []
         ## merge config files
@@ -391,83 +658,21 @@ class AITER_CONFIG:
             if non_empty
             else source_pairs[0][1].iloc[0:0].copy()
         )
-        has_tag = "_tag" in merge_df.columns
-        if has_tag:
-            merge_df["_tag"] = merge_df["_tag"].fillna("")
-
-        ## get keys from untuned file to drop_duplicates
-        # Turn the tuned-file base name into its untuned sibling by rewriting the
-        # LAST "tuned" token (handles both mid-string names like
-        # "a8w8_tuned_gemm" and trailing ones like "..._mxscale_tuned").
-        untuned_name = "untuned".join(merge_name.rsplit("tuned", 1))
-        untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
-        if os.path.exists(untuned_path):
-            untunedf = pd.read_csv(untuned_path)
-            keys = untunedf.columns.to_list()
-            if "cu_num" not in keys:
-                keys.append("cu_num")
-            if "gfx" in merge_df.columns and "gfx" not in keys:
-                keys.append("gfx")
-            dedup_keys = keys + ["_tag"] if has_tag else keys
-            # Only key on columns actually present in the merged frame. Most
-            # families carry cu_num, but some (e.g. the mxscale batched-GEMM
-            # table) key on gfx and never carry cu_num; keeping a missing column
-            # in the subset would raise inside pandas' duplicated().
-            dedup_keys = [k for k in dedup_keys if k in merge_df.columns]
-            duplicated_mask = merge_df.duplicated(subset=dedup_keys, keep=False)
-            if duplicated_mask.any():
-                dup_count = int(duplicated_mask.sum())
-                dup_rows = merge_df[duplicated_mask].sort_values(dedup_keys)
-                if "us" not in merge_df.columns:
-                    raise RuntimeError(
-                        f"Found {dup_count} duplicate shape entries during merge of '{merge_name}'. "
-                        f"No 'us' column to determine best performing entry. "
-                        f"Please remove duplicates manually.\n"
-                        f"Duplicate rows:\n{dup_rows.to_string(index=False)}"
-                    )
-
-                # Auto-dedup: globally determine best row (lowest 'us') per shape
-                best_row_index = set(
-                    merge_df.sort_values("us", kind="stable")
-                    .drop_duplicates(subset=dedup_keys, keep="first")
-                    .index
-                )
-
-                saved_files = []
-                offset = 0
-                for src_path, src_df in source_pairs:
-                    start, end = offset, offset + len(src_df)
-                    offset = end
-                    file_rows = merge_df.iloc[start:end]
-                    new_src_df = file_rows[
-                        file_rows.index.isin(best_row_index)
-                    ].reset_index(drop=True)
-                    if len(new_src_df) < len(src_df):
-                        new_src_df.to_csv(src_path, index=False)
-                        saved_files.append(
-                            f"  {src_path}: {len(src_df)} -> {len(new_src_df)} rows"
-                        )
-                saved_info = (
-                    "\n".join(saved_files) if saved_files else "  (no files updated)"
-                )
-                raise RuntimeError(
-                    f"Found {dup_count} duplicate shape entries during merge of '{merge_name}'. "
-                    f"Auto-resolved by keeping best performing (lowest 'us') for each shape "
-                    f"and saved back to source config files. Please re-run.\n"
-                    f"Duplicate rows:\n{dup_rows.to_string(index=False)}\n"
-                    f"Updated files:\n{saved_info}"
-                )
-        else:
-            logger.warning(
-                f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
-            )
-
+        # Empty sources were dropped from `non_empty` above, so pass only those
+        # to keep merge_df's row order aligned with the per-file slices.
+        self._raise_on_duplicate_shapes(
+            merge_df,
+            [(p, d) for p, d in source_pairs if not d.empty],
+            merge_name,
+            env_name,
+        )
+        import tempfile
         from pathlib import Path
 
-        config_path = Path("/tmp/aiter_configs/")
+        config_path = Path(tempfile.gettempdir()) / "aiter_configs"
         if not config_path.exists():
             config_path.mkdir(parents=True, exist_ok=True)
-        new_file_path = f"{config_path}/{merge_name}.csv"
+        new_file_path = str(config_path / f"{merge_name}.csv")
         lock_path = f"{new_file_path}.lock"
         tmp_file_path = f"{new_file_path}.tmp"
 
@@ -480,9 +685,9 @@ class AITER_CONFIG:
 
     # Cache is keyed on (self, env_name, ...); this object is a
     # process-lifetime singleton, so the retained reference is not a leak.
-    @functools.lru_cache(maxsize=20)  # noqa: B019
+    @functools.lru_cache(maxsize=64)  # noqa: B019
     def get_config_file(self, env_name, default_file, tuned_file_name):
-        config_env_file = os.getenv(env_name)
+        config_env_file = (os.getenv(env_name) or "").strip()
         # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file_name}.csv"
         from pathlib import Path
 
@@ -495,16 +700,27 @@ class AITER_CONFIG:
             ]
 
             if not op_tuned_file_list:
-                config_file = default_file
+                # No per-model table to merge with, so the canonical CSV is used
+                # as-is -- still run the duplicate-shape check on it, otherwise
+                # families that never grow a model_configs/ sibling are the only
+                # ones whose tuned data is never validated.
+                config_file = self.update_config_files(
+                    default_file, tuned_file_name, env_name
+                )
             else:
-                tuned_files = ":".join(str(p) for p in op_tuned_file_list)
-                tuned_files = default_file + ":" + tuned_files
+                tuned_files = os.pathsep.join(
+                    [default_file] + [str(p) for p in op_tuned_file_list]
+                )
                 logger.info(
                     f"merge tuned file under model_configs/ and configs/ {tuned_files}"
                 )
-                config_file = self.update_config_files(tuned_files, tuned_file_name)
+                config_file = self.update_config_files(
+                    tuned_files, tuned_file_name, env_name
+                )
         else:
-            config_file = self.update_config_files(config_env_file, tuned_file_name)
+            config_file = self.update_config_files(
+                config_env_file, tuned_file_name, env_name
+            )
             # print(f"get config file from environment ", config_file)
         return config_file
 
@@ -603,6 +819,12 @@ if multiprocessing.current_process().name == "MainProcess":
 def validate_and_update_archs():
     archs = os.getenv("GPU_ARCHS", "native").split(";")
     archs = [arch.strip() for arch in archs]
+
+    # clang's `--offload-arch=native` shells out to offload-arch, which cannot
+    # detect the GPU on Windows, so resolve the arch ourselves instead.
+    if IS_WINDOWS and archs == ["native"]:
+        archs = _detect_native()
+
     # List of allowed architectures
     allowed_archs = [
         "native",
@@ -639,11 +861,11 @@ def hip_flag_checker(flag_hip: str) -> bool:
     cmd = (
         [executable_path("hipcc")]
         + flag_hip.split()
-        + ["-x", "hip", "-E", "-P", "/dev/null", "-o", "/dev/null"]
+        + ["-x", "hip", "-E", "-P", NULL_DEVICE, "-o", NULL_DEVICE]
     )
     try:
         subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, FileNotFoundError):
         logger.warning(f"Current hipcc not support: {flag_hip}, skip it.")
         return False
     return True
@@ -658,40 +880,47 @@ def check_LLVM_MAIN_REVISION():
     #else
     #define CK_TILE_HOST_DEVICE_EXTERN"""
     import subprocess
+    import tempfile
 
+    # Compile a probe file rather than piping the source through the shell:
+    # the `echo ... | hipcc -` idiom quotes differently under cmd.exe, so the
+    # probe silently always failed on Windows. The standard is pinned to the
+    # one the modules are built with, otherwise the compiler default decides
+    # whether the probe's CTAD is even legal and the answer stops being about
+    # __host__ __device__ at all.
+    probe_src = (
+        "#include <tuple>\n"
+        "__host__ __device__ void func(){"
+        "std::tuple<int, int> t = std::tuple(1, 1);"
+        "}\n"
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cpp", delete=False) as tf:
+        tf.write(probe_src)
+        probe_path = tf.name
     try:
-        hipcc = shlex.quote(executable_path("hipcc"))
-        cmd = f"""echo "#include <tuple>
-__host__ __device__ void func(){{std::tuple<int, int> t = std::tuple(1, 1);}}" | {hipcc} -x hip -P -c -Wno-unused-command-line-argument -o /dev/null -"""
-        subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.STDOUT)
+        subprocess.check_output(
+            [
+                executable_path("hipcc"),
+                "-x",
+                "hip",
+                "-std=c++20",
+                "-P",
+                "-c",
+                "-Wno-unused-command-line-argument",
+                "-o",
+                NULL_DEVICE,
+                probe_path,
+            ],
+            stderr=subprocess.STDOUT,
+        )
     except (subprocess.CalledProcessError, AssertionError):
         return 554785
-    return 554785 - 1
-
-
-def check_and_set_ninja_worker():
-    max_num_jobs_cores = max(1, os.cpu_count() * 0.8)
-    import psutil
-
-    # calculate the maximum allowed NUM_JOBS based on free memory
-    free_memory_gb = psutil.virtual_memory().available / (1024**3)  # free memory in GB
-    max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
-
-    # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
-    max_jobs = int(max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
-    max_jobs_env = os.environ.get("MAX_JOBS")
-    if max_jobs_env is not None:
+    finally:
         try:
-            max_processes = int(max_jobs_env)
-            # too large value
-            if max_processes > max_jobs:
-                os.environ["MAX_JOBS"] = str(max_jobs)
-        # error value
-        except ValueError:
-            os.environ["MAX_JOBS"] = str(max_jobs)
-    # none value
-    else:
-        os.environ["MAX_JOBS"] = str(max_jobs)
+            os.remove(probe_path)
+        except OSError:
+            pass
+    return 554785 - 1
 
 
 def rename_cpp_to_cu(els, dst, hipify, recursive=False):
@@ -700,11 +929,11 @@ def rename_cpp_to_cu(els, dst, hipify, recursive=False):
         if hipify:
             if name.endswith((".cpp", ".cu")):
                 newName = name.replace(".cpp", ".cu")
-                ret.append(f"{dst}/{newName}")
-            shutil.copy(f"{src}/{name}", f"{dst}/{newName}")
+                ret.append(os.path.join(dst, newName))
+            shutil.copy(os.path.join(src, name), os.path.join(dst, newName))
         else:
             if name.endswith((".cpp", ".cu")):
-                ret.append(f"{src}/{newName}")
+                ret.append(os.path.join(src, newName))
 
     ret = []
     for el in els:
@@ -713,11 +942,10 @@ def rename_cpp_to_cu(els, dst, hipify, recursive=False):
             continue
         if os.path.isdir(el):
             for entry in os.listdir(el):
-                if os.path.isdir(f"{el}/{entry}"):
+                child = os.path.join(el, entry)
+                if os.path.isdir(child):
                     if recursive:
-                        ret += rename_cpp_to_cu(
-                            [f"{el}/{entry}"], dst, hipify, recursive
-                        )
+                        ret += rename_cpp_to_cu([child], dst, hipify, recursive)
                     continue
                 do_rename_and_mv(entry, el, dst, ret)
         else:
@@ -747,7 +975,14 @@ def _stage_blob_sources(
 
 @torch_compile_guard()
 def check_numa_custom_op() -> None:
-    numa_balance_set = os.popen("cat /proc/sys/kernel/numa_balancing").read().strip()
+    # /proc/sys/kernel/numa_balancing is Linux-only.
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        with open("/proc/sys/kernel/numa_balancing") as f:
+            numa_balance_set = f.read().strip()
+    except OSError:
+        return
     if numa_balance_set == "1":
         logger.warning(
             "WARNING: NUMA balancing is enabled, which may cause errors. "
@@ -874,7 +1109,7 @@ def _needs_arch_rebuild(md_name):
     except Exception:  # noqa: BLE001
         # running arch undetectable (e.g. no GPU) -> keep normal behaviour
         return False
-    so_path = os.path.join(get_user_jit_dir(), f"{md_name}.so")
+    so_path = os.path.join(get_user_jit_dir(), f"{md_name}{JIT_LIB_EXT}")
     built = _so_offload_archs(so_path)
     if not built or cur in built:
         return False
@@ -1023,11 +1258,19 @@ def clone_3rdparty(third_party: str) -> None:
 
 
 def rm_module(md_name):
-    os.system(f"rm -rf {get_user_jit_dir()}/{md_name}.so")
+    path = os.path.join(get_user_jit_dir(), f"{md_name}{JIT_LIB_EXT}")
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.warning(f"Failed to remove {path}: {e}")
 
 
 def clear_build(md_name):
-    os.system(f"rm -rf {bd_dir}/{md_name}")
+    path = os.path.join(bd_dir, md_name)
+    if os.path.isdir(path):
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def build_module(
@@ -1050,7 +1293,7 @@ def build_module(
     os.makedirs(bd_dir, exist_ok=True)
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
-    target_name = f"{md_name}.so" if not is_standalone else md_name
+    target_name = f"{md_name}{JIT_LIB_EXT}" if not is_standalone else md_name
 
     for tp in third_party:
         clone_3rdparty(tp)
@@ -1176,8 +1419,6 @@ def build_module(
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
         flags_hip = sorted(set(flags_hip))  # remove same flags
         flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
-        check_and_set_ninja_worker()
-
         blob_dir = f"{op_dir}/blob"
         staged_blob_dir = None
         staged_token = None
@@ -1601,7 +1842,7 @@ def _ctypes_call(func, fc_name, md_name):
     def _ensure_loaded():
         if _cache:
             return
-        so_path = os.path.join(get_user_jit_dir(), f"{md_name}.so")
+        so_path = os.path.join(get_user_jit_dir(), f"{md_name}{JIT_LIB_EXT}")
         if not os.path.exists(so_path) or _needs_arch_rebuild(md_name):
             d_args = get_args_of_build(md_name)
             d_args["torch_exclude"] = True

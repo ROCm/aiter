@@ -98,4 +98,8 @@ def gemm_a16w16_opus(
     )
 
 
-__all__ = ["gemm_a16w16_opus", "opus_bmm", "opus_gemm"]
+__all__ = [
+    "gemm_a16w16_opus",
+    "opus_bmm",
+    "opus_gemm",
+]

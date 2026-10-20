@@ -221,6 +221,7 @@ def _get_compile_fn():
 # Mirrors preshuffle_gemm.PRESHUFFLE_M_MAX; duplicated to avoid importing the
 # compiler module before the preshuffle path is selected.
 PRESHUFFLE_M_MAX = 65536
+PRESHUFFLE_FLAT_BUFFER_LIMIT_BYTES = 1 << 32
 
 PRESHUFFLE_SPLIT_K_MAX_TILES = 256
 PRESHUFFLE_SPLIT_K_MAX_TILE_ELEMS = 32 * 128
@@ -246,10 +247,32 @@ def _get_preshuffle_split_buffers(
     return workspace, semaphore
 
 
+def _check_preshuffle_flat_buffer_capacity(
+    m: int,
+    n: int,
+    k: int,
+    a_elem_bytes: int,
+    b_elem_bytes: int,
+    out_elem_bytes: int,
+) -> None:
+    """Keep flat AMD buffer descriptors and their i32 offsets below 4 GiB."""
+    buffer_bytes = {
+        "A": m * k * a_elem_bytes,
+        "B": n * k * b_elem_bytes,
+        "output": m * n * out_elem_bytes,
+    }
+    for name, size in buffer_bytes.items():
+        if size >= PRESHUFFLE_FLAT_BUFFER_LIMIT_BYTES:
+            raise RuntimeError(
+                f"[FlyDSL] preshuffle {name} buffer needs {size} bytes; "
+                "flat buffer descriptors require fewer than 4 GiB"
+            )
+
+
 def _check_preshuffle_split_capacity(
     m: int, n: int, tile_m: int, tile_n: int, split_k: int
 ) -> None:
-    tiles = ((m + tile_m - 1) // tile_m) * (n // tile_n)
+    tiles = ((m + tile_m - 1) // tile_m) * ((n + tile_n - 1) // tile_n)
     if tiles > PRESHUFFLE_SPLIT_K_MAX_TILES:
         raise RuntimeError(
             f"[FlyDSL] split_k needs {tiles} tile semaphores, "
@@ -291,10 +314,13 @@ def flydsl_preshuffle_gemm_a8(
             f"[FlyDSL] M ({m}) exceeds {PRESHUFFLE_M_MAX}; the preshuffle kernel "
             f"views A and C through a layout bounded by that many rows."
         )
-    if n % tile_n != 0:
+    if n % 16 != 0:
         raise RuntimeError(
-            f"[FlyDSL] N ({n}) is not a multiple of tile_n ({tile_n}). "
-            f"Arguments not supported! Skipping gemm!"
+            f"[FlyDSL] N ({n}) must be a multiple of 16 for preshuffled B."
+        )
+    if n % tile_n != 0 and split_k > 1:
+        raise RuntimeError(
+            f"[FlyDSL] ragged N ({n}) does not support split_k ({split_k})."
         )
     if split_k < 1 or k % split_k != 0:
         raise RuntimeError(
@@ -325,6 +351,14 @@ def flydsl_preshuffle_gemm_a8(
             f"[FlyDSL] unsupported output dtype {Out.dtype}; "
             "expected torch.bfloat16 or torch.float16"
         )
+    _check_preshuffle_flat_buffer_capacity(
+        m,
+        n,
+        k,
+        XQ.element_size(),
+        WQ.element_size(),
+        Out.element_size(),
+    )
 
     exe = compile_fn(
         N=n,

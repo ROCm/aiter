@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL backend for the MLA fused gather + kv_b_proj expansion (gfx950).
+"""FlyDSL backend for the MLA fused gather + kv_b_proj expansion.
 
 Supported: fp8 KV cache (OCP e4m3), fp8 weight in either row-major or
 ``shuffle_weight((16,16))`` layout, per-output-row *or* 128x128 block weight
-scale, per-tensor activation scale, page_size 1, bf16 or scaled fp8 outputs, gfx950.
+scale, per-tensor activation scale, page_size 1, bf16 or scaled fp8 outputs on
+gfx950. The gfx1250 128+128 ptpc specialization is dispatched separately.
 
 The cache has no size limit: up to 4 GiB it is reached through one buffer
 descriptor, beyond that through 64-bit per-lane addresses. Output width is
@@ -171,6 +172,15 @@ def _unsupported_reason(
             "an unquantized weight (kv_proj_scale=None) is not supported; this "
             "backend is fp8 x per-output-row scale only"
         )
+    if not k_buffer.is_cuda:
+        return "k_buffer must be on a CUDA/HIP device"
+    if kv_proj_weight.dim() != 2:
+        return "kv_proj_weight must be 2-D"
+    if (
+        kv_proj_weight.device != k_buffer.device
+        or kv_proj_scale.device != k_buffer.device
+    ):
+        return "kv_proj_weight and kv_proj_scale must be on the cache device"
     if k_buffer.dim() != 3 or k_buffer.shape[1] != 1:
         return (
             f"k_buffer must be [num_blocks, 1, {KV_ROW_ELEMS}] (page_size 1), got "
@@ -180,6 +190,17 @@ def _unsupported_reason(
         return f"k_buffer last dim must be {KV_ROW_ELEMS}, got {k_buffer.shape[2]}"
 
     arch = _arch_of(k_buffer.device.index)
+    if arch == "gfx1250":
+        from .gather_kv_b_proj_gfx1250 import unsupported_reason
+
+        return unsupported_reason(
+            k_buffer,
+            kv_proj_weight,
+            kv_proj_scale,
+            k_prefix,
+            v_prefix,
+            shuffled_kv_cache=shuffled_kv_cache,
+        )
     if arch != "gfx950":
         return f"gfx950 only (OCP e4m3 + CDNA4 MFMA_Scale + 128 KB LDS), got {arch}"
     for name, t in (("k_buffer", k_buffer), ("kv_proj_weight", kv_proj_weight)):
@@ -207,6 +228,8 @@ def _unsupported_reason(
             f"{tuple(v_prefix.shape)}"
         )
     nope = kp_dim - KV_PE_DIM
+    if n_heads <= 0 or nope <= 0 or v_dim <= 0:
+        return "outputs must have positive heads, NoPE width and V width"
     weight_n, weight_k = kv_proj_weight.shape
     if weight_k != KV_C_DIM:
         return f"weight K must be {KV_C_DIM}, got {weight_k}"
@@ -259,6 +282,62 @@ def gather_kv_b_proj_flydsl_supported(*args, **kwargs) -> bool:
     not by the call. Arguments are :func:`_unsupported_reason`'s.
     """
     return _unsupported_reason(*args, **kwargs) is None
+
+
+def _output_scale_reason(k_buffer, k_prefix, k_out_scale, v_out_scale) -> str | None:
+    output_fp8 = k_prefix.dtype == torch.float8_e4m3fn
+    for name, t in (("k_out_scale", k_out_scale), ("v_out_scale", v_out_scale)):
+        if output_fp8:
+            if (
+                t is None
+                or t.dtype != torch.float32
+                or t.numel() != 1
+                or t.device != k_buffer.device
+            ):
+                return f"{name} must be a single fp32 descale on the cache device for fp8 outputs"
+        elif t is not None:
+            return f"{name} requires fp8 outputs"
+    return None
+
+
+def gather_kv_b_proj_flydsl_fp8_supported(
+    k_buffer: Tensor,
+    kv_proj_weight: Tensor,
+    kv_proj_scale: Tensor | None,
+    k_prefix: Tensor,
+    v_prefix: Tensor,
+    *,
+    k_out_scale: Tensor | None = None,
+    v_out_scale: Tensor | None = None,
+    shuffled_kv_cache: bool = False,
+    block_m: int | None = None,
+    waves_per_eu: int = 2,
+) -> bool:
+    """Can gather write these FP8 outputs with the supplied descales?
+
+    Like :func:`gather_kv_b_proj_flydsl_supported`, but explicitly checks FP8
+    output and descale metadata. Outputs may be FP8 views of BF16 workspaces;
+    creating those views does not modify their storage. This check performs
+    no compilation, launch or device-tensor read. Cache while device, layout,
+    dtype, head widths and scale metadata remain fixed. Token counts and scale
+    values may change; scale values must stay positive and finite (caller
+    contract, not checked by synchronizing the device).
+    """
+    return (
+        k_prefix.dtype == torch.float8_e4m3fn
+        and _unsupported_reason(
+            k_buffer,
+            kv_proj_weight,
+            kv_proj_scale,
+            k_prefix,
+            v_prefix,
+            shuffled_kv_cache=shuffled_kv_cache,
+            block_m=block_m,
+            waves_per_eu=waves_per_eu,
+        )
+        is None
+        and _output_scale_reason(k_buffer, k_prefix, k_out_scale, v_out_scale) is None
+    )
 
 
 @functools.lru_cache(maxsize=64)
@@ -398,21 +477,29 @@ def gather_kv_b_proj_flydsl(
     if reason is not None:
         _raise(reason)
 
-    output_fp8 = k_prefix.dtype == torch.float8_e4m3fn
-    for name, t in (("k_out_scale", k_out_scale), ("v_out_scale", v_out_scale)):
-        if output_fp8:
-            if (
-                t is None
-                or t.dtype != torch.float32
-                or t.numel() != 1
-                or t.device != k_buffer.device
-            ):
-                raise ValueError(
-                    f"[FlyDSL gather_kv_b_proj] {name} must be a single fp32 descale on the cache device for fp8 outputs"
-                )
-        elif t is not None:
-            raise ValueError(f"[FlyDSL gather_kv_b_proj] {name} requires fp8 outputs")
+    reason = _output_scale_reason(k_buffer, k_prefix, k_out_scale, v_out_scale)
+    if reason is not None:
+        _raise(reason)
 
+    if _arch_of(k_buffer.device.index) == "gfx1250":
+        from .gather_kv_b_proj_gfx1250 import gather_kv_b_proj_flydsl_gfx1250
+
+        return gather_kv_b_proj_flydsl_gfx1250(
+            k_buffer,
+            k_scale,
+            kv_indptr,
+            kv_indices,
+            kv_prefix_sum_context_lens,
+            kv_proj_weight,
+            kv_proj_scale,
+            k_prefix,
+            v_prefix,
+            num_tokens=num_tokens,
+            weight_preshuffle=weight_preshuffle,
+            shuffled_kv_cache=shuffled_kv_cache,
+        )
+
+    output_fp8 = k_prefix.dtype == torch.float8_e4m3fn
     num_blocks = k_buffer.shape[0]
     total_kv, n_heads, kp_dim = k_prefix.shape
     nope = kp_dim - KV_PE_DIM

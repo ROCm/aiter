@@ -7,6 +7,7 @@
 // the t2opus<c10::*> specializations, so nothing here needs torch/ATen/c10.
 #define AITER_NO_TORCH_TYPES
 #include <cmath>
+#include <limits>
 
 #include "aiter_hip_common.h"
 #include "aiter_opus_plus.h"
@@ -389,16 +390,22 @@ __global__ void swiglu_act_and_mul_bias_kernel(DTYPE_O* __restrict__ out,       
 }
 
 // Scaled activation and gating kernel template with flexible output type.
-// DTYPE_I: input type, DTYPE_O: output type (typically fp8 for quantization)
+// DTYPE_I: input type, DTYPE_O: output type (fp8 or int8)
+// out = saturate(act(x) * y / *scale), with the scale read on device.
 template <typename DTYPE_I, typename DTYPE_O, float (*ACT_FN)(const DTYPE_I&), int32_t VEC_SIZE_I>
 __global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // [..., d]
                                           const DTYPE_I* __restrict__ input, // [..., 2, d]
                                           const int d,
-                                          const float scale)
+                                          const int64_t in_row_stride,
+                                          const int64_t out_row_stride,
+                                          const float* __restrict__ scale_ptr)
 {
     const int64_t token_idx         = blockIdx.x;
-    auto const* ptr_x               = (input + token_idx * 2 * d);
-    auto const* ptr_y               = (input + token_idx * 2 * d + d);
+    auto const* ptr_x               = (input + token_idx * in_row_stride);
+    auto const* ptr_y               = (ptr_x + d);
+    const float scale               = 1.0f / *scale_ptr;
+    constexpr float out_min         = opus::finfo<DTYPE_O>::min();
+    constexpr float out_max         = opus::finfo<DTYPE_O>::max();
     using vec_i                     = opus::vector_t<DTYPE_I, VEC_SIZE_I>;
     using vec_o                     = opus::vector_t<DTYPE_O, VEC_SIZE_I>;
     static constexpr int32_t total_load_bytes = sizeof(DTYPE_I) * VEC_SIZE_I;
@@ -419,12 +426,14 @@ __global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // 
     auto buffer_x = opus::make_gmem<DTYPE_I>(ptr_x, oob_i * sizeof(DTYPE_I));
     auto buffer_y = opus::make_gmem<DTYPE_I>(ptr_y, oob_i * sizeof(DTYPE_I));
 
-    DTYPE_O* __restrict__ out_base  = out + token_idx * d;
+    DTYPE_O* __restrict__ out_base  = out + token_idx * out_row_stride;
     static constexpr int32_t ooba_o = 4 / sizeof(DTYPE_O);
     const int32_t oob_o             = (d + ooba_o - 1) / ooba_o * ooba_o;
     auto buffer_out = opus::make_gmem<DTYPE_O>(out_base, oob_o * sizeof(DTYPE_O));
 
-    for(int64_t idx = threadIdx.x * VEC_SIZE_I; idx < d; idx += blockDim.x * VEC_SIZE_I)
+    const int64_t d_vec = d / VEC_SIZE_I * VEC_SIZE_I;
+    int64_t idx         = threadIdx.x * VEC_SIZE_I;
+    for(; idx < d_vec; idx += blockDim.x * VEC_SIZE_I)
     {
         vec_i x{};
         vec_i y{};
@@ -464,18 +473,26 @@ __global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // 
                 result.y = act_vals.y * y_vals.y * scale_vals.y;
 #endif
 
-                r[j]     = opus::cast<DTYPE_O>(result.x);
-                r[j + 1] = opus::cast<DTYPE_O>(result.y);
+                r[j]     = opus::cast<DTYPE_O>(__builtin_amdgcn_fmed3f(result.x, out_min, out_max));
+                r[j + 1] = opus::cast<DTYPE_O>(__builtin_amdgcn_fmed3f(result.y, out_min, out_max));
             }
             else
             {
                 DTYPE_I x_val = x[j];
                 float rv      = ACT_FN(x_val) * opus::cast<float>(y[j]) * scale;
-                r[j]          = opus::cast<DTYPE_O>(rv);
+                r[j]          = opus::cast<DTYPE_O>(__builtin_amdgcn_fmed3f(rv, out_min, out_max));
             }
         }
 
         store_vector_nbytes<DTYPE_O, DTYPE_O, VEC_SIZE_I, store_chunk_bytes, 0>(buffer_out, r, idx);
+    }
+
+    // Partial last vector: the out buffer range is rounded up to a dword, so a
+    // vector store would spill into the next row. At most one thread gets here.
+    for(; idx < d; idx++)
+    {
+        float rv      = ACT_FN(ptr_x[idx]) * opus::cast<float>(ptr_y[idx]) * scale;
+        out_base[idx] = opus::cast<DTYPE_O>(__builtin_amdgcn_fmed3f(rv, out_min, out_max));
     }
 }
 
@@ -826,7 +843,11 @@ situv2_activate_scalar(const opus::vector_t<opus::bf16_t, VecSize>& gate,
 // FP32 LDS. WARP_SIZE is a device compile-time constant (32 on gfx12, 64 on
 // gfx9/gfx950), so the reduction follows the native wave topology on both, and
 // a single-wave block skips the cross-wave stage entirely.
-template <int32_t BlockSize, int32_t VecSize, int32_t StaticD = 0, bool SinglePass = false>
+template <int32_t BlockSize,
+          int32_t VecSize,
+          int32_t StaticD = 0,
+          bool SinglePass = false,
+          bool RecomputeMultiPass = false>
 __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
     opus::fp8_t* __restrict__ out,
     const opus::bf16_t* __restrict__ input,
@@ -866,26 +887,34 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
     static constexpr int32_t load_chunk_bytes =
         load_bytes % 16 == 0 ? 16 : (load_bytes % 8 == 0 ? 8 : 4);
     auto gate_buffer = opus::make_gmem<opus::bf16_t>(
-        gate_ptr, dim * sizeof(opus::bf16_t));
+        gate_ptr,
+        static_cast<unsigned int>(dim) *
+            static_cast<unsigned int>(sizeof(opus::bf16_t)));
     auto up_buffer = opus::make_gmem<opus::bf16_t>(
-        up_ptr, dim * sizeof(opus::bf16_t));
+        up_ptr,
+        static_cast<unsigned int>(dim) *
+            static_cast<unsigned int>(sizeof(opus::bf16_t)));
     auto out_buffer = opus::make_gmem<opus::fp8_t>(
-        out_ptr, dim * sizeof(opus::fp8_t));
+        out_ptr,
+        static_cast<unsigned int>(dim) *
+            static_cast<unsigned int>(sizeof(opus::fp8_t)));
 
     extern __shared__ float activated[];
-    auto* reduce_scratch = activated + (register_resident ? 0 : dim);
+    auto* reduce_scratch =
+        activated + ((register_resident || RecomputeMultiPass) ? 0 : dim);
     float thread_max = 0.0f;
     using vec_f       = opus::vector_t<float, VecSize>;
     vec_f register_values{};
 
-    auto activate_chunk = [&](int idx) {
+    auto compute_chunk = [&](int idx) {
         auto gate = load_vector_nbytes<
             opus::bf16_t, VecSize, load_chunk_bytes, GROUP_NT>(gate_buffer, idx);
         auto up = load_vector_nbytes<
             opus::bf16_t, VecSize, load_chunk_bytes, GROUP_NT>(up_buffer, idx);
 
         vec_f act_values{};
-        if constexpr(StaticD == 768 && (VecSize == 8 || VecSize == 4))
+        if constexpr(
+            (StaticD == 768 || StaticD == 33792) && (VecSize == 8 || VecSize == 4))
         {
             act_values = situv2_activate_packed<VecSize>(gate,
                                                          up,
@@ -900,9 +929,18 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
             act_values = situv2_activate_scalar<VecSize>(
                 gate, up, beta, gate_tanh_mul, linear_beta, up_tanh_mul, thread_max);
         }
+        return act_values;
+    };
+
+    auto activate_chunk = [&](int idx) {
+        vec_f act_values = compute_chunk(idx);
         if constexpr(register_resident)
         {
             register_values = act_values;
+        }
+        else if constexpr(RecomputeMultiPass)
+        {
+            return;
         }
         else if constexpr(VecSize == 8 && StaticD != 0)
         {
@@ -997,6 +1035,10 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
         if constexpr(register_resident)
         {
             values = register_values;
+        }
+        else if constexpr(RecomputeMultiPass)
+        {
+            values = compute_chunk(idx);
         }
         else if constexpr(VecSize == 8 && StaticD != 0)
         {
@@ -1211,22 +1253,23 @@ static constexpr int nextPow2(unsigned int num)
         DISPATCH_FP32_SWIGLU_BIAS_VEC_SIZE_CASE(1, swiglu_act_and_mul_bias_kernel, IDXTYPE, out_ptr, in_ptr, ids_ptr, bias_ptr, d, num_experts)  \
     }
 
-#define DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, inv_scale) \
-    DISPATCH_FP32_KERNEL(scaled_act_and_mul_kernel, KERNEL, out_ptr, in_ptr, d, inv_scale)
+#define DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, scale_ptr)               \
+    DISPATCH_FP32_KERNEL(                                                                   \
+        scaled_act_and_mul_kernel, KERNEL, out_ptr, in_ptr, d, in_row_stride, out_row_stride, scale_ptr)
 
 // Helper macro to dispatch scaled kernel with restricted output types (fp8 or int8)
-#define DISPATCH_OUTPUT_TYPE_SCALED(KERNEL, in_ptr, inv_scale)                      \
+#define DISPATCH_OUTPUT_TYPE_SCALED(KERNEL, in_ptr, scale_ptr)                      \
     if(out.dtype() == AITER_DTYPE_fp8)                                              \
     {                                                                               \
         using output_dtype = fp8_type;                                              \
         auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());       \
-        DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, inv_scale)         \
+        DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, scale_ptr)         \
     }                                                                               \
     else if(out.dtype() == AITER_DTYPE_i8)                                          \
     {                                                                               \
         using output_dtype = opus::i8_t;                                            \
         auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());       \
-        DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, inv_scale)         \
+        DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, scale_ptr)         \
     }                                                                               \
     else                                                                            \
     {                                                                               \
@@ -1288,16 +1331,35 @@ static constexpr int nextPow2(unsigned int num)
 #define LAUNCH_ACTIVATION_GATE_KERNEL(KERNEL) \
     LAUNCH_ACTIVATION_GATE_KERNEL_IMPL(KERNEL, false, 0.0f)
 
+// Row stride of a [..., n] tensor whose last dim is contiguous and whose leading
+// dims flatten into a single row dimension.
+static int64_t scaled_act_row_stride(const aiter_tensor_t& t, const char* name)
+{
+    AITER_CHECK(t.stride(-1) == 1, "scaled_act_and_mul: ", name, " last dim must be contiguous");
+    for(int i = 0; i + 2 < t.dim(); i++)
+        AITER_CHECK(t.stride(i) == t.stride(i + 1) * t.size(i + 1),
+                    "scaled_act_and_mul: ",
+                    name,
+                    " leading dims must flatten into rows");
+    return t.dim() >= 2 ? t.stride(-2) : t.size(-1);
+}
+
 // Launch scaled activation and gating kernel with flexible input/output types
 #define LAUNCH_SCALED_ACTIVATION_GATE_KERNEL(KERNEL)                                            \
     COMPUTE_SCALED_ACTIVATION_KERNEL_PARAMS                                                     \
+    const int64_t in_row_stride  = scaled_act_row_stride(input, "input");                       \
+    const int64_t out_row_stride = scaled_act_row_stride(out, "out");                           \
+    AITER_CHECK(out.size(-1) == d && out.numel() == static_cast<size_t>(num_tokens) * d,        \
+                "scaled_act_and_mul: out must have shape [..., input.size(-1) / 2]");           \
+    AITER_CHECK(scale.dtype() == AITER_DTYPE_fp32 && scale.numel() == 1 && scale.is_gpu(),      \
+                "scaled_act_and_mul: scale must be a single fp32 element on the GPU");          \
+    auto* scale_ptr = reinterpret_cast<const float*>(scale.data_ptr());                         \
     if(input.dtype() == AITER_DTYPE_fp32)                                                       \
     {                                                                                           \
         /* fp32 input: dispatch based on output type (fp8/bf16/fp16/fp32) */                    \
         using input_dtype = opus::fp32_t;                                                       \
         auto* in_ptr      = reinterpret_cast<input_dtype*>(input.data_ptr());                   \
-        float inv_scale   = 1.0f / (*reinterpret_cast<float*>(scale.data_ptr()));               \
-        DISPATCH_OUTPUT_TYPE_SCALED(KERNEL, in_ptr, inv_scale)                                  \
+        DISPATCH_OUTPUT_TYPE_SCALED(KERNEL, in_ptr, scale_ptr)                                  \
     }                                                                                           \
     else                                                                                        \
     {                                                                                           \
@@ -1305,8 +1367,7 @@ static constexpr int nextPow2(unsigned int num)
         AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "scaled_act_and_mul_kernel", [&] {       \
             using input_dtype = typename aiter::hip2opus<scalar_t>::type;                       \
             auto* in_ptr      = reinterpret_cast<input_dtype*>(input.data_ptr());               \
-            float inv_scale   = 1.0f / (*reinterpret_cast<float*>(scale.data_ptr()));           \
-            DISPATCH_OUTPUT_TYPE_SCALED(KERNEL, in_ptr, inv_scale)                              \
+            DISPATCH_OUTPUT_TYPE_SCALED(KERNEL, in_ptr, scale_ptr)                              \
         });                                                                                     \
     }
 
@@ -1732,7 +1793,11 @@ void silu_and_mul_quant(const aiter_tensor_t& out,
     }
 }
 
-template <int32_t BlockSize, int32_t VecSize, int32_t StaticD = 0, bool SinglePass = false>
+template <int32_t BlockSize,
+          int32_t VecSize,
+          int32_t StaticD = 0,
+          bool SinglePass = false,
+          bool RecomputeMultiPass = false>
 static void launch_situv2_and_mul_quant(const aiter_tensor_t& out,
                                         const aiter_tensor_t& input,
                                         const aiter_tensor_t& scale,
@@ -1759,15 +1824,17 @@ static void launch_situv2_and_mul_quant(const aiter_tensor_t& out,
     const size_t num_waves  = (BlockSize + wave_size - 1) / wave_size;
     // Activations need d floats unless they stay in registers; the cross-wave
     // scratch needs num_waves floats unless the block is a single wave.
-    const size_t lds_bytes = (static_cast<size_t>(register_resident ? 0 : d) +
+    const size_t lds_bytes =
+        (static_cast<size_t>((register_resident || RecomputeMultiPass) ? 0 : d) +
                               (single_wave ? 0 : num_waves)) *
-                             sizeof(float);
+        sizeof(float);
     // Both live in one dynamic allocation, so a wide row plus its scratch can
     // outgrow the 64 KB budget even though d alone fits. Catch it here instead
     // of at the launch, which would only report hipErrorInvalidValue.
-    AITER_CHECK(lds_bytes <= static_cast<size_t>(opus::get_smem_size()),
+    AITER_CHECK(lds_bytes <= get_smem_size_func(),
                 "situv2_and_mul_quant: d is too large for the LDS budget");
-    situv2_and_mul_quant_kernel<BlockSize, VecSize, StaticD, SinglePass>
+    situv2_and_mul_quant_kernel<
+        BlockSize, VecSize, StaticD, SinglePass, RecomputeMultiPass>
         <<<dim3(num_tokens), dim3(BlockSize), lds_bytes, stream>>>(
             reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
             reinterpret_cast<const opus::bf16_t*>(input.data_ptr()),
@@ -1807,16 +1874,22 @@ void situv2_and_mul_quant(const aiter_tensor_t& out,
                     linear_beta > 0.0f,
                 "situv2_and_mul_quant: beta and linear_beta must be finite and positive");
 
-    const int d              = input.size(-1) / 2;
+    // Dynamic kernels advance a signed 32-bit index by at most 1024 * 8
+    // elements. Leave room for the final loop increment, and reject before
+    // narrowing the tensor dimension to int.
+    constexpr int64_t max_kernel_stride = 1024 * 8;
+    constexpr int64_t max_supported_d =
+        static_cast<int64_t>(std::numeric_limits<int>::max()) - max_kernel_stride + 1;
+    const int64_t d64 = input.size(-1) / 2;
+    AITER_CHECK(d64 <= max_supported_d,
+                "situv2_and_mul_quant: d exceeds the 32-bit kernel indexing limit (",
+                max_supported_d,
+                ")");
+
+    const int d              = static_cast<int>(d64);
     const int64_t num_tokens = input.numel() / input.size(-1);
-    // Beyond 4096 the row no longer fits one chunk per thread, so it is staged
-    // in FP32 LDS instead. 16384 floats fill the 64 KB budget exactly, but the
-    // multi-pass path also needs one float per wave of cross-wave scratch out
-    // of the same allocation -- four of them for the widest such block (256
-    // threads on wave64) -- so the usable bound is the largest multiple of 8
-    // below 16384 - 4.
-    AITER_CHECK(d > 0 && d <= 16376 && d % 8 == 0,
-                "situv2_and_mul_quant: d must be divisible by 8 and in (0, 16376]");
+    AITER_CHECK(d > 0 && d % 8 == 0,
+                "situv2_and_mul_quant: d must be positive and divisible by 8");
     AITER_CHECK(group_size == d,
                 "situv2_and_mul_quant: only per-token quantization "
                 "(group_size == d) is implemented");
@@ -1843,6 +1916,25 @@ void situv2_and_mul_quant(const aiter_tensor_t& out,
 #define LAUNCH_SITUV2_SP(BLOCK_SIZE, VEC_SIZE, STATIC_D)                                   \
     launch_situv2_and_mul_quant<BLOCK_SIZE, VEC_SIZE, STATIC_D, true>(                     \
         out, input, scale, d, num_tokens, beta, linear_beta, stream)
+#define LAUNCH_SITUV2_RECOMPUTE(BLOCK_SIZE, VEC_SIZE)                                      \
+    launch_situv2_and_mul_quant<BLOCK_SIZE, VEC_SIZE, 0, false, true>(                      \
+        out, input, scale, d, num_tokens, beta, linear_beta, stream)
+
+    const size_t smem_size = get_smem_size_func();
+    const size_t static_scratch = (1024 / wave_size) * sizeof(float);
+    if(d == 33792 &&
+       static_cast<size_t>(d) * sizeof(float) + static_scratch <= smem_size)
+    {
+        LAUNCH_SITUV2(1024, 8, 33792);
+        return;
+    }
+    const size_t generic_block = wave_size == 32 ? 96 : 256;
+    const size_t generic_scratch = generic_block / wave_size * sizeof(float);
+    if(static_cast<size_t>(d) * sizeof(float) + generic_scratch > smem_size)
+    {
+        LAUNCH_SITUV2_RECOMPUTE(1024, 8);
+        return;
+    }
 
     if(d == 768)
     {
@@ -1935,6 +2027,7 @@ void situv2_and_mul_quant(const aiter_tensor_t& out,
 
 #undef LAUNCH_SITUV2
 #undef LAUNCH_SITUV2_SP
+#undef LAUNCH_SITUV2_RECOMPUTE
 }
 
 void gelu_and_mul(const aiter_tensor_t& out,   // [..., d]
@@ -2015,6 +2108,53 @@ __global__ void activation_kernel_vec(DTYPE_I* __restrict__ out,
     }
 }
 
+// Bounds-safe variant of activation_kernel_vec: guards both x0 and x1
+// against numel not being a multiple of VEC_SIZE_I * 2, with a scalar
+// tail loop for any remainder. Used by relu2().
+
+template <typename DTYPE_I, float (*ACT_FN)(const DTYPE_I&), int32_t VEC_SIZE_I>
+__global__ void activation_kernel_vec_safe(DTYPE_I* __restrict__ out,
+                                            const DTYPE_I* __restrict__ input,
+                                            const int64_t numel)
+{
+    using vec_i = opus::vector_t<DTYPE_I, VEC_SIZE_I>;
+    const int64_t stride = gridDim.x * blockDim.x * VEC_SIZE_I * 2;
+
+    for(int64_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * VEC_SIZE_I * 2;
+        idx < numel;
+        idx += stride)
+    {
+        bool has_first  = (idx + VEC_SIZE_I <= numel);
+        bool has_second = (idx + 2 * VEC_SIZE_I <= numel);
+
+        vec_i x0{};
+        vec_i x1{};
+        if (has_first)  x0 = *reinterpret_cast<const vec_i*>(&input[idx]);
+        if (has_second) x1 = *reinterpret_cast<const vec_i*>(&input[idx + VEC_SIZE_I]);
+
+        DTYPE_I* x0_ptr = reinterpret_cast<DTYPE_I*>(&x0);
+        DTYPE_I* x1_ptr = reinterpret_cast<DTYPE_I*>(&x1);
+
+        #pragma unroll
+        for(size_t j = 0; j < VEC_SIZE_I; j++) {
+            if (has_first)  x0_ptr[j] = opus::cast<DTYPE_I>(ACT_FN(x0_ptr[j]));
+            if (has_second) x1_ptr[j] = opus::cast<DTYPE_I>(ACT_FN(x1_ptr[j]));
+        }
+
+        if (has_first)  *reinterpret_cast<vec_i*>(&out[idx]) = x0;
+        if (has_second) *reinterpret_cast<vec_i*>(&out[idx + VEC_SIZE_I]) = x1;
+
+        // Scalar tail for any remainder smaller than a full vec_i.
+        if (!has_first) {
+            for(int64_t k = idx; k < numel; k++)
+                out[k] = opus::cast<DTYPE_I>(ACT_FN(input[k]));
+        } else if (!has_second) {
+            for(int64_t k = idx + VEC_SIZE_I; k < numel; k++)
+                out[k] = opus::cast<DTYPE_I>(ACT_FN(input[k]));
+        }
+    }
+}
+
 } // namespace aiter
 
 #define LAUNCH_ACTIVATION_KERNEL_VEC(KERNEL)                                                \
@@ -2044,6 +2184,33 @@ __global__ void activation_kernel_vec(DTYPE_I* __restrict__ out,
                                          numel);)                                                  \
     });
 
+#define LAUNCH_ACTIVATION_KERNEL_VEC_SAFE(KERNEL)                                                \
+    int64_t numel      = input.numel();                                                          \
+    int warp_size = static_cast<int>(WARP_SIZE);                                                 \
+    int vec_size       = nextPow2(static_cast<unsigned int>(numel / warp_size));                  \
+    vec_size           = vec_size > max_vec_size ? max_vec_size : vec_size;                        \
+    vec_size           = vec_size < 1 ? 1 : vec_size;                                              \
+    int64_t num_vecs   = (numel + vec_size - 1) / vec_size;                                        \
+    int num_wave       = nextPow2(static_cast<unsigned int>(num_vecs / warp_size));               \
+    num_wave           = num_wave > max_wave_num ? max_wave_num : num_wave;                        \
+    num_wave           = num_wave < 1 ? 1 : num_wave;                                              \
+    int block_size     = num_wave * warp_size;                                                     \
+    int64_t num_blocks = (num_vecs + block_size - 1) / block_size;                                 \
+    num_blocks         = num_blocks > 2048 ? 2048 : num_blocks;                                    \
+    dim3 grid(num_blocks);                                                                         \
+    dim3 block(block_size);                                                                        \
+    HipDeviceGuard device_guard(input.device_id);                                                  \
+    const hipStream_t stream = aiter::getCurrentHIPStream();                                       \
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "activation_kernel_vec_safe", [&] {                  \
+        using input_dtype = typename aiter::hip2opus<scalar_t>::type;                              \
+        AITER_DISPATCH_CASE_VEC_SIZE_rmTorch(                                                              \
+            vec_size,                                                                              \
+            aiter::activation_kernel_vec_safe<input_dtype, KERNEL<input_dtype>, VEC_SIZE>               \
+            <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(out.data_ptr()),           \
+                                         reinterpret_cast<input_dtype*>(input.data_ptr()),         \
+                                         numel);)                                                  \
+    });
+
 namespace aiter {
 
 // Float-returning GELU used by vectorized activation kernel.
@@ -2061,6 +2228,35 @@ void gelu_fast(const aiter_tensor_t& out,   // [..., d]
                const aiter_tensor_t& input) // [..., d]
 {
     LAUNCH_ACTIVATION_KERNEL_VEC(aiter::gelu_fast_kernel);
+}
+
+// Float-returning plain ReLU^2 (no gating multiply): relu(x)^2.
+template <typename T>
+__device__ __forceinline__ float relu2_kernel(const T& x)
+{
+    const float f = opus::cast<float>(x);
+    const float r = fmaxf(f, 0.0f);
+    return r * r;
+}
+
+void relu2(const aiter_tensor_t& out,   // [..., d]
+           const aiter_tensor_t& input) // [..., d]
+{
+    AITER_CHECK(out.dtype() == input.dtype(),
+                "relu2: out and input dtype must match");
+    AITER_CHECK(input.is_gpu() && out.is_gpu(),
+                "relu2: out and input must be GPU tensors");
+    AITER_CHECK(input.is_contiguous() && out.is_contiguous(),
+                "relu2: out and input must be contiguous");
+    AITER_CHECK(out.device_id == input.device_id,
+                "relu2: out and input must be on the same device");
+    AITER_CHECK(out.numel() == input.numel(),
+                "relu2: out and input must have the same number of elements");
+    if(input.numel() == 0)
+    {
+        return;
+    }
+    LAUNCH_ACTIVATION_KERNEL_VEC_SAFE(aiter::relu2_kernel);
 }
 
 } // namespace aiter

@@ -343,7 +343,9 @@ def rms_norm(input: torch.Tensor, weight: torch.Tensor, epsilon: float):
     Returns:
     - Output: The output tensor with shape (M, N).
     """
-    _LOGGER.info(f"RMSNORM: input={tuple(input.shape)} weight={tuple(weight.shape)} ")
+    _LOGGER.info(
+        "RMSNORM: input=%s weight=%s ", tuple(input.shape), tuple(weight.shape)
+    )
     return _RMSNorm.apply(input, weight, epsilon, torch.is_grad_enabled())
 
 
@@ -371,7 +373,10 @@ def rmsnorm2d_fwd_with_add(
     - Output: The output tensor with shape (M, N).
     """
     _LOGGER.info(
-        f"RMSNORM_2D_FWD_ADD: input={tuple(input.shape)} weight={tuple(weight.shape)} residual_in={tuple(residual_in.shape)}  "
+        "RMSNORM_2D_FWD_ADD: input=%s weight=%s residual_in=%s  ",
+        tuple(input.shape),
+        tuple(weight.shape),
+        tuple(residual_in.shape),
     )
     return _RMSNorm2dFwdWithAdd.apply(
         out, input, residual_in, residual_out, weight, epsilon, torch.is_grad_enabled()
@@ -398,8 +403,11 @@ def rmsnorm2d_fwd_with_smoothquant(
     - Epsilon: A value added to the denominator for numerical stability.
     """
     _LOGGER.info(
-        f"RMSNORM_2D_FWD_SMOOTHQUANT: input={tuple(input.shape)} weight={tuple(weight.shape)} "
-        + f"xscale={tuple(xscale.shape)} yscale={tuple(yscale.shape)}  "
+        "RMSNORM_2D_FWD_SMOOTHQUANT: input=%s weight=%s xscale=%s yscale=%s  ",
+        tuple(input.shape),
+        tuple(weight.shape),
+        tuple(xscale.shape),
+        tuple(yscale.shape),
     )
     n_rows, n_cols = input.shape
 
@@ -469,7 +477,10 @@ def rmsnorm2d_fwd_with_dynamicquant(
     - Epsilon: A value added to the denominator for numerical stability.
     """
     _LOGGER.info(
-        f"RMSNORM_2D_FWD_DYNAMICQUANT: input={tuple(input.shape)} weight={tuple(weight.shape)} yscale={tuple(yscale.shape)}  "
+        "RMSNORM_2D_FWD_DYNAMICQUANT: input=%s weight=%s yscale=%s  ",
+        tuple(input.shape),
+        tuple(weight.shape),
+        tuple(yscale.shape),
     )
     n_rows, n_cols = input.shape
 
@@ -545,8 +556,12 @@ def rmsnorm2d_fwd_with_add_smoothquant(
     - Epsilon: A value added to the denominator for numerical stability.
     """
     _LOGGER.info(
-        f"RMSNORM_2D_FWD_ADD_SMOOTHQUANT: input={tuple(input.shape)} weight={tuple(weight.shape)} "
-        + f"residual_in={tuple(residual_in.shape)} xscale={tuple(xscale.shape)} yscale={tuple(yscale.shape)}  "
+        "RMSNORM_2D_FWD_ADD_SMOOTHQUANT: input=%s weight=%s residual_in=%s xscale=%s yscale=%s  ",
+        tuple(input.shape),
+        tuple(weight.shape),
+        tuple(residual_in.shape),
+        tuple(xscale.shape),
+        tuple(yscale.shape),
     )
     n_rows, n_cols = input.shape
 
@@ -609,7 +624,11 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     - Epsilon: A value added to the denominator for numerical stability.
     """
     _LOGGER.info(
-        f"RMSNORM_2D_FWD_ADD_DYNAMICQUANT: input={input.shape} weight={weight.shape} residual_in={residual_in.shape} yscale={yscale.shape}  "
+        "RMSNORM_2D_FWD_ADD_DYNAMICQUANT: input=%s weight=%s residual_in=%s yscale=%s  ",
+        input.shape,
+        weight.shape,
+        residual_in.shape,
+        yscale.shape,
     )
     n_rows, n_cols = input.shape
 

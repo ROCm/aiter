@@ -100,7 +100,11 @@ def fused_gemm_afp4wfp4_mul_add(
     """
 
     _LOGGER.info(
-        f"FUSED_GEMM_AFPWFP4_MUL_ADD: x.shape={tuple(x.shape)} w.shape={tuple(w.shape)} x_scale={tuple(x_scales.shape)} w_scale={tuple(w_scales.shape)} "
+        "FUSED_GEMM_AFP4WFP4_MUL_ADD: x.shape=%s w.shape=%s x_scale=%s w_scale=%s ",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(x_scales.shape),
+        tuple(w_scales.shape),
     )
 
     if isinstance(a, (float, int)):
@@ -156,6 +160,11 @@ def fused_gemm_afp4wfp4_mul_add(
     else:
         config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
+
+    # The scale loads are unmasked, so BLOCK_SIZE_K must not run past K.
+    if config["BLOCK_SIZE_K"] >= 2 * K:
+        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
 
     grid = lambda META: (
         (

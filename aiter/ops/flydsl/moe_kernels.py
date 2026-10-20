@@ -111,6 +111,34 @@ def requires_flydsl_stage2_reduce(
     return int(token_num) * int(model_dim) * int(element_size) > 0xFFFFFFFF
 
 
+def resolve_flydsl_stage2_mode(
+    mode: str,
+    token_num: int,
+    model_dim: int,
+    element_size: int,
+    b_dtype: str,
+    return_per_slot: bool,
+    *,
+    force_reduce: bool | None = None,
+    stage2_fp8: bool | None = None,
+) -> str:
+    """Resolve runtime reduce overrides shared by sorting and stage 2."""
+    if force_reduce is None:
+        force_reduce = os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1"
+    if stage2_fp8 is None:
+        stage2_fp8 = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
+    fp8_reduce = stage2_fp8 and b_dtype in ("fp4", "fp8") and not return_per_slot
+    if force_reduce or fp8_reduce:
+        return "reduce"
+    if (
+        mode != "reduce"
+        and not return_per_slot
+        and requires_flydsl_stage2_reduce(token_num, model_dim, element_size)
+    ):
+        return "reduce"
+    return mode
+
+
 def requires_flydsl_stage2_global_a(a: torch.Tensor) -> bool:
     """Return whether A's stored bytes reach the 4 GiB buffer descriptor limit."""
     return a.numel() * a.element_size() >= (1 << 32)
@@ -401,9 +429,17 @@ def get_flydsl_stage2_v2_kernels(
     for tm in bms:
         for tn in tile_ns:
             for tk in tile_ks:
-                for epilog in ("atomic", "reduce"):
+                epilogs = (
+                    ("atomic", "reduce", "scatter")
+                    if tm == 128
+                    else ("atomic", "reduce")
+                )
+                for epilog in epilogs:
+                    if epilog == "scatter" and out_dtype != "bf16":
+                        continue
                     for use_nt in (True, False):
-                        for persist in persists:
+                        epilog_persists = (False,) if epilog == "scatter" else persists
+                        for persist in epilog_persists:
                             name = build_flydslv2_gemm2_name(
                                 a_dtype,
                                 b_dtype,
@@ -665,8 +701,9 @@ def compile_flydsl_moe_stage1(
             w_dtype=b_dtype,
             w_layout="standard",
             k_wave=k_wave,
-            # gfx942 lacks K=32 bf16 MFMA + v_cvt_pk_bf16_f32 -> K=16 fallback.
-            use_k16="gfx95" not in str(get_rocm_arch()),
+            # The kernel derives its gfx942 fallbacks (K=16 MFMA split, bf16 pack,
+            # fp4 byte-LUT decode, LDS staging) from this arch string.
+            rocm_arch=str(get_rocm_arch()),
         )
     if b_dtype in ("fp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import GateMode, compile_mixed_moe_gemm1
@@ -750,8 +787,9 @@ def compile_flydsl_moe_stage2(
             b_cache_mod=b_nt,
             waves_per_eu=waves_per_eu,
             w_dtype=b_dtype,
-            # gfx942 lacks K=32 bf16 MFMA + v_cvt_pk_bf16_f32 -> K=16 fallback.
-            use_k16="gfx95" not in str(get_rocm_arch()),
+            # The kernel derives its gfx942 fallbacks (K=16 MFMA split, bf16 pack,
+            # fp4 byte-LUT decode, atomic epilogue) from this arch string.
+            rocm_arch=str(get_rocm_arch()),
             epilog=("reduce" if b_dtype == "int4" and mode == "reduce" else "atomic"),
             topk=topk,
         )
@@ -2102,17 +2140,14 @@ def _flydsl_moe_stage2_impl(
     model_dim = w2.shape[1]
     inter_dim = inter_states.shape[2]
 
-    # Debug: force stage2 to use the masked reduce epilogue instead of atomic
-    # accumulate. Enabled by default; set AITER_FLYDSL_FORCE_REDUCE=0 to opt out.
-    if os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1":
-        mode = "reduce"
-    elif (
-        mode != "reduce"
-        and not return_per_slot
-        and requires_flydsl_stage2_reduce(token_num, model_dim, 2)
-    ):
-        # Buffer atomics use 32-bit offsets; reduce outputs larger than 4 GiB.
-        mode = "reduce"
+    mode = resolve_flydsl_stage2_mode(
+        mode,
+        token_num,
+        model_dim,
+        2,
+        b_dtype,
+        return_per_slot,
+    )
 
     accumulate = mode != "reduce" and not return_per_slot
 
@@ -2171,7 +2206,8 @@ def _flydsl_moe_stage2_impl(
         _persist_m = -1 if m_blocks > 256 else 1
 
     if a_dtype == "fp8":
-        # FP8 uses non-persistent scheduling, so cap grid.y via persist_m.
+        # Normalize FP8-A grid scheduling from runtime occupancy, even for
+        # legacy tuned names that retain `_persist` as part of their identity.
         _persist_m = resolve_flydsl_grid_y_persist_m(m_blocks)
 
     if bias is not None and bias.dtype != torch.float32:
@@ -3182,6 +3218,7 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
     prequantized: bool = False,
     src_scale_bytes_per_row: int = 0,
     fuse_ep_psum: bool = False,
+    row_major_scale: bool = False,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_quant_preshuffle_route_ksplit_module,
@@ -3197,6 +3234,7 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
         prequantized=prequantized,
         src_scale_bytes_per_row=src_scale_bytes_per_row,
         fuse_ep_psum=fuse_ep_psum,
+        row_major_scale=row_major_scale,
     )
 
 
@@ -3256,6 +3294,10 @@ def flydsl_moe_fused_quant_preshuffle(
     # caller rebuilds the GEMM's layout with flydsl_moe_scatter_preshuffle_scale.
     row_to_token: torch.Tensor | None = None,
     ep_psum_params: dict | None = None,
+    # Prequantized full-row path only. Writes e8m0 as (row, K/32) instead of
+    # the interleaved GEMM layout. The caller must launch gemm1 with
+    # row_major_ascale=1. Off for the quantizing path: that still preshuffles.
+    row_major_scale: bool = False,
 ):
     """Fused grouped quant + e8m0 scale-preshuffle.
 
@@ -3314,10 +3356,17 @@ def flydsl_moe_fused_quant_preshuffle(
     Ws = feat_dim // 32
     if out_payload is None:
         out_payload = torch.empty((E, max_m, Pb), dtype=torch.uint8, device=device)
+    if row_major_scale and not prequantized:
+        raise ValueError("row_major_scale requires a prequantized payload")
     if out_scale is None:
-        out_scale = torch.empty(
-            (E, max_m // wmma_rep, Ws * wmma_rep), dtype=torch.uint8, device=device
-        )
+        if row_major_scale:
+            # Flat (row, K/32). E is 1 on the contiguous grouped path; a masked
+            # (E, max_m) row index still addresses this buffer as E*max_m rows.
+            out_scale = torch.empty((E * max_m, Ws), dtype=torch.uint8, device=device)
+        else:
+            out_scale = torch.empty(
+                (E, max_m // wmma_rep, Ws * wmma_rep), dtype=torch.uint8, device=device
+            )
 
     skip_padding = masked_m is not None
     if skip_padding:
@@ -3424,7 +3473,10 @@ def flydsl_moe_fused_quant_preshuffle(
                 stream=torch.cuda.current_stream(),
             )
             return out_payload, out_scale
-        use_ksplit = grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
+        # Row-major stores are emitted only by the full-row prequant copy.
+        use_ksplit = (
+            not row_major_scale and grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
+        )
         launch = _get_compiled_fused_quant_preshuffle_route_ksplit(
             feat_dim=feat_dim,
             wmma_rep=wmma_rep,
@@ -3437,6 +3489,7 @@ def flydsl_moe_fused_quant_preshuffle(
                 int(prequantized_scale.shape[-1]) if prequantized else 0
             ),
             fuse_ep_psum=fuse_ep_psum,
+            row_major_scale=row_major_scale,
         )
         # Dead-tail skip (EP dynamic token count): routes >= num_valid_routes are
         # padding rows of the dispatch buffer and are not gathered/quantized. When
