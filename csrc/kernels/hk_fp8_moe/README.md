@@ -107,3 +107,8 @@ power-of-two 128x128 scale is repeated losslessly into per-32 E8M0 scales before
 This changes activation quantization to per-32. One-time weight repacking is excluded, while
 runtime activation quantization is included. Every candidate must pass the same FP32-reference
 check. Failed candidates are retained in the JSON rather than counted as valid baselines.
+
+The native candidate sweep also retargets the checked-in GLM-5 and MiniMax-M3 MXFP8 recipes
+to this operator's dimensions and expert counts. This includes the newer stage-two layouts and
+fused FP8 intermediates. Each recipe must be selected by the dispatcher and pass the same
+numerical check before it is ranked; the original recipes were tuned for different shapes.

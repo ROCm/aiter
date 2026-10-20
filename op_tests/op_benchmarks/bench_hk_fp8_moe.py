@@ -198,7 +198,7 @@ def moe():
 
     sources = []
     fields = []
-    rows = []
+    config_rows = []
     for name in (
         "a8w8_blockscale_tuned_fmoe_glm5_3_flash_gfx950.csv",
         "a8w8_blockscale_tuned_fmoe_glm5_3_flash_shared_gfx950.csv",
@@ -207,13 +207,25 @@ def moe():
         with p.open() as f:
             reader = csv.DictReader(f)
             fields.extend(k for k in reader.fieldnames if k not in fields)
-            rows.extend(reader)
+            config_rows.extend(reader)
         sources.append(str(p.relative_to(ROOT)))
+    native_recipes = {}
+    for model in ("glm5", "minimax_m3"):
+        path = ROOT / "aiter/configs/model_configs" / f"{model}_mxfp8_tuned_fmoe.csv"
+        with path.open() as source:
+            reader = csv.DictReader(source)
+            fields.extend(k for k in reader.fieldnames if k not in fields)
+            for recipe in reader:
+                name = f"aiter_{model}_recipe_i{recipe['inter_dim']}"
+                native_recipes.setdefault(int(recipe["token"]), []).append(
+                    (name, recipe)
+                )
+        sources.append(str(path.relative_to(ROOT)))
     cfg = OUT.with_suffix(".csv")
     with cfg.open("w") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(config_rows)
     os.environ["AITER_CONFIG_FMOE"] = str(cfg)
     import importlib
 
@@ -229,6 +241,7 @@ def moe():
         "benchmark_commit": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
         ).strip(),
+        "native_recipes": "Retarget the published GLM-5 and MiniMax-M3 MXFP8 kernel choices to D4096/I1024 and the actual expert/top-k counts. Validate each whole operator against the same FP32 reference before ranking; these are tuning candidates, not prevalidated configs for this geometry.",
         "native_mxfp8": "Identical FP8 weight payloads; power-of-two 128x128 scales repeated losslessly into E8M0 1x32 scales. Activation quantization changes to per-32. Weight repacking excluded; runtime quantization included.",
         "protocol": "whole operator, identical BF16 input and shuffled block FP8 weights; checked-in GLM tuning; warm HIP graphs; 21 alternating samples; unclamped Silu",
         "cases": [],
@@ -336,6 +349,46 @@ def moe():
                     failures[name] = f"{type(exc).__name__}: {exc}"
                     print("CANDIDATE_FAILED", T, topk, name, failures[name], flush=True)
             os.environ["AITER_FLYDSL_FORCE_REDUCE"] = "0"
+            recipe_dispatch = {}
+            default_config = fm.cfg_2stages
+            for name, original in native_recipes.get(T, []):
+                recipe = dict(
+                    original,
+                    model_dim=str(D),
+                    inter_dim=str(INTER),
+                    expert=str(E),
+                    topk=str(topk),
+                )
+                with cfg.open("w") as source:
+                    writer = csv.DictWriter(source, fieldnames=fields)
+                    writer.writeheader()
+                    writer.writerows(config_rows + [recipe])
+                fm.cfg_2stages = None
+                fm.get_2stage_cfgs.cache_clear()
+                try:
+                    call = partial(
+                        native_calls["aiter_mxfp8"], output=torch.empty_like(x)
+                    )
+                    graph, output = capture_repeated(call, 10)
+                    check = accuracy(output, expected, rows, 0.06)
+                    selected_metadata = dispatch_metadata(fm, T, topk, E, native=True)
+                    selected_text = json.dumps(selected_metadata)
+                    assert (
+                        recipe["kernelName1"] in selected_text
+                        and recipe["kernelName2"] in selected_text
+                    ), selected_metadata
+                    checks[name] = check
+                    graphs[name], outputs[name] = graph, output
+                    recipe_dispatch[name] = selected_metadata
+                except Exception as exc:  # noqa: BLE001
+                    # Retargeted recipes must compile and pass the numerical reference.
+                    failures[name] = f"{type(exc).__name__}: {exc}"
+                    print("CANDIDATE_FAILED", T, topk, name, failures[name], flush=True)
+            with cfg.open("w") as source:
+                writer = csv.DictWriter(source, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(config_rows)
+            fm.cfg_2stages = default_config
             fm.get_2stage_cfgs.cache_clear()
             timing = measure_pair(graphs, 10, 21)
             winner = min(
@@ -353,6 +406,7 @@ def moe():
                     "tuned": tuned_dispatch,
                     "heuristic": heuristic_dispatch,
                     "native": native_dispatch,
+                    "retargeted_recipes": recipe_dispatch,
                 },
             }
             result["cases"].append(row)
