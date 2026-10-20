@@ -11,9 +11,21 @@ from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_compress_attn import 
     get_fused_compress_attn_fp4_layouts,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import (
+    load_config_json,
+    resolve_config_dir,
+    select_leq_config,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+_CONFIG_NAME = "FUSED_COMPRESS_ATTN_FP4"
+
+
+def _get_config(num_plan_rows: int) -> dict:
+    config_dir = resolve_config_dir("fusions", _CONFIG_NAME, backend="gluon")
+    configs = load_config_json(f"{config_dir}/DEFAULT.json")
+    return select_leq_config(configs, num_plan_rows, prefix="P_LEQ_")
 
 
 def fused_compress_attn_fp4(
@@ -32,7 +44,7 @@ def fused_compress_attn_fp4(
     cache_scale: torch.Tensor,
     block_tables: torch.Tensor,
 ) -> None:
-    """DeepSeek-V4 CSA indexer compressor: one MXFP4 cache row for each plan row.
+    """Fused compress attention: one MXFP4 cache row for each plan row.
 
     A plan row merges its last 8 tokens with a softmax pool. Then it applies RMSNorm
     to the 128 values and interleaved RoPE (adjacent pairs rotate together) to the
@@ -79,7 +91,7 @@ def fused_compress_attn_fp4(
     assert block_tables.stride(1) == 1
 
     _LOGGER.info("FUSED_COMPRESS_ATTN_FP4: plan rows=%d", plan.shape[0])
-    k_per_block = kv_cache.shape[1]
+    config = _get_config(plan.shape[0])
     fused_compress_attn_fp4_gfx1250[(plan.shape[0],)](
         plan,
         state_slots,
@@ -95,14 +107,13 @@ def fused_compress_attn_fp4(
         kv_cache,
         cache_scale,
         state_slots.numel(),
-        kv_cache.shape[0] * k_per_block,
         block_tables.stride(0),
         kv_in.stride(0),
         RMS_EPS=rms_eps,
         STATE_SIZE=kv_state.shape[1],
-        K_PER_BLOCK=k_per_block,
+        K_PER_BLOCK=kv_cache.shape[1],
         KV_STATE_SLOT_STRIDE=kv_state.stride(0),
         SCORE_STATE_SLOT_STRIDE=score_state.stride(0),
-        num_warps=1,
-        **get_fused_compress_attn_fp4_layouts(),
+        **config,
+        **get_fused_compress_attn_fp4_layouts(config["num_warps"]),
     )

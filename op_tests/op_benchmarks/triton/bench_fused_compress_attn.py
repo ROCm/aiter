@@ -18,11 +18,13 @@ def main():
     for num_rows in PLAN_ROW_COUNTS:
         inputs = make_inputs(num_rows)
         # The first timing of new inputs is too high. Run once and drop it.
-        run_perftest(fused_compress_attn_fp4, **inputs)
-        _, compress_us = run_perftest(fused_compress_attn_fp4, **inputs)
+        run_perftest(fused_compress_attn_fp4, **inputs, num_rotate_args=4)
+        _, compress_us = run_perftest(
+            fused_compress_attn_fp4, **inputs, num_rotate_args=4
+        )
         # Column 2 is last_pos. A negative last_pos makes every plan row empty.
         inputs["plan"][:, 2] = -1
-        _, empty_us = run_perftest(fused_compress_attn_fp4, **inputs)
+        _, empty_us = run_perftest(fused_compress_attn_fp4, **inputs, num_rotate_args=4)
         results.append(
             {"M": num_rows, "compress_us": compress_us, "empty_us": empty_us}
         )

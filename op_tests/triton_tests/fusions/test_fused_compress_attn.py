@@ -21,13 +21,15 @@ K_PER_BLOCK = 64
 
 def make_inputs(num_rows):
     """Decode plan. Sequence i has 4 * i + 4 tokens. Its window has 7 tokens from
-    the state ring and 1 token from the input. Every 5th plan row is empty."""
+    the state ring and 1 token from the input. Every 5th plan row is empty. Rows 0
+    to 3 are in reverse order, so their sequence is not the plan row."""
     torch.manual_seed(0)
     seq = torch.arange(num_rows, device="cuda")
     last_pos = RATIO * seq + RATIO - 1
     num_from_state = torch.full_like(seq, 2 * RATIO - 1)
     # Each plan row is [last_token_row, seq, last_pos, num_from_state].
     plan = torch.stack([seq, seq, last_pos, num_from_state], dim=1).int()
+    plan[:4] = plan[:4].flip(0)
     plan[2::5] = -1
     max_pos = RATIO * num_rows
     # Sequence i writes cache entry i. Give each sequence blocks for num_rows entries.
