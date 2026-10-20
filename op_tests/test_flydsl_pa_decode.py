@@ -130,7 +130,16 @@ def _reference(query, key, value, table, lengths, query_length, window, sinks):
 
 
 def _make_inputs(
-    query_length, kv_heads, group_size, dim, page_size, dtype, pattern, device, lengths
+    query_length,
+    kv_heads,
+    group_size,
+    dim,
+    page_size,
+    dtype,
+    pattern,
+    device,
+    lengths,
+    table_width=None,
 ):
     if lengths is None:
         lengths = (0, 1, 255, 256, 257, 1027) if pattern == "random" else (1024,)
@@ -140,6 +149,9 @@ def _make_inputs(
     table = torch.randperm(num_pages, device=device, dtype=torch.int32).reshape(
         batch, pages_per_seq
     )
+    if table_width is not None:
+        # Block-table padding beyond the live pages must not reach the kernel.
+        table = torch.nn.functional.pad(table, (0, table_width - pages_per_seq))
     query = torch.empty(
         (batch * query_length, kv_heads * group_size, dim), dtype=dtype, device=device
     ).uniform_(-0.5, 0.5)
@@ -177,6 +189,12 @@ def _make_inputs(
         # Give both quantization modes the same V absmax; the other channels
         # still isolate the probability-tail mass.
         value[first_page, :, 0, 0] = 3.5
+    elif pattern == "varied":
+        # Uniform draws quantize to nearly one per-token scale, so a shifted
+        # scale still matches the oracle. Token magnitudes spanning about a
+        # decade make a wrong scale index fail it.
+        key.mul_(torch.randn_like(key[..., :1]).mul_(0.4).exp_())
+        value.mul_(torch.randn_like(value[..., :1]).mul_(0.4).exp_())
 
     context = torch.tensor(lengths, dtype=torch.int32, device=device)
     return query, key, value, table, context
@@ -275,6 +293,124 @@ _BF16_CASES = _COMMON_CASES + [
         for length, dim, splits in ((4, 512, 2), (4, 1024, 4), (3, 1024, 3))
     ],
     ("graph-workspace", {"query_length": 4, "max_partitions": 7, "capture": True}),
+    (
+        "loose-bound",
+        {
+            "block_size": 16,
+            "lengths": (0, 1, 257, 300, 512),
+            "max_partitions": None,
+            "table_width": 768,
+            "max_context": None,
+        },
+    ),
+    (
+        "head192-np80",
+        {
+            "group_size": 16,
+            "head_dim": 192,
+            "lengths": (80 * 256,),
+            "max_partitions": 80,
+        },
+    ),
+    *[
+        (
+            f"head{dim}-mixed-np96",
+            {
+                "query_length": 4,
+                "kv_heads": 2,
+                "group_size": 16,
+                "head_dim": dim,
+                "lengths": (97 * 256,) + (0, 1, 257, 1027) * 10,
+                "max_partitions": 96,
+                "budget": 4096,
+            },
+        )
+        for dim in (256, 128)
+    ],
+]
+# FP8 head 256, page 64, plain V, uniform query length with at most 32 query
+# rows: the gfx950 pipe, for per-tensor and per-token scales. A plan-independent
+# staging bound selects its specialization;
+# other architectures run the same cases on the generic path.
+_PIPE_BASE = {
+    "kv_dtype": "fp8",
+    "scale_mode": "per-tensor",
+    "trans_v": False,
+    "head_dim": 256,
+    "block_size": 64,
+    "group_size": 8,
+    "pipe": True,
+}
+_PIPE_CASES = [
+    # At GQA 8, query length q gives 8 * q rows: one M-tile at 1 and 2 (1 pads
+    # it), two at 3 and 4 (3 pads the second). Lengths put some row's causal
+    # edge on a page or tile boundary, and lengths below q leave rows empty.
+    # P is FP8, so random rows see 0, 1 or at least 6 tokens; the token
+    # one-hot token pattern covers short contexts exactly.
+    #
+    # A task needing more than 4096 page ids cannot stage the whole list.
+    (
+        "d256-unstaged-q2",
+        {
+            **_PIPE_BASE,
+            "query_length": 2,
+            "lengths": (0, 1, 65, 257, 8192),
+            "max_partitions": 4,
+            "budget": 1,
+            "table_width": 20000,
+            "max_context": None,
+            "staged": False,
+        },
+    ),
+    # max_context_length below the real context used to index past the staged
+    # page ids and fault. The tail must still match a full-context reference.
+    (
+        "d256-page64-short-bound",
+        {
+            **_PIPE_BASE,
+            "lengths": (128 * 1024,),
+            "max_partitions": 1,
+            "max_context": 8192,
+            "budget": 1,
+        },
+    ),
+    # 81 and 130 partitions leave a short tail, and sequences with few or no
+    # tasks must not change a channel.
+    *(
+        (
+            f"d256-page64-q4-np{partitions}",
+            {
+                **_PIPE_BASE,
+                "query_length": 4,
+                "lengths": (0, 1, 257, 66532),
+                "max_partitions": partitions,
+                "budget": partitions,
+                "pattern": "one_hot_v",
+            },
+        )
+        for partitions in (81, 130)
+    ),
+    (
+        "d256-page64-per-token",
+        {
+            **_PIPE_BASE,
+            "scale_mode": "per-token",
+            "lengths": (1, 65, 257, 1027),
+            "max_partitions": 4,
+            "pattern": "varied",
+        },
+    ),
+    (
+        "d256-page64-q4-per-token",
+        {
+            **_PIPE_BASE,
+            "scale_mode": "per-token",
+            "query_length": 4,
+            "lengths": (0, 1, 65, 257, 2049),
+            "max_partitions": 4,
+            "pattern": "varied",
+        },
+    ),
 ]
 _INVALID_CASES = [
     ("fp16-query", NotImplementedError, "BF16 KV requires bfloat16 queries"),
@@ -327,6 +463,42 @@ def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
         )
 
 
+def _one_hot_kv(key, value, table, context, compute_type, tokens_per_channel=256):
+    """Zero K and one-hot V in channel (token // tokens_per_channel) % dim.
+
+    With 256 tokens per channel each tile owns one output channel, so a task
+    that drops or repeats a tile changes that channel's mean. With one, a row's
+    output marks exactly the tokens it sees, and zero K keeps FP8 P exact.
+    Scales are explicit because a zero K must not reach the quantizer.
+    """
+    dim, page = value.shape[-1], value.shape[2]
+    dense = torch.zeros(value.shape, dtype=torch.float32, device=value.device)
+    for seq, length in enumerate(context.tolist()):
+        tokens = torch.arange(length, device=value.device)
+        pages = table[seq, tokens // page].long()
+        dense[pages, :, tokens % page, (tokens // tokens_per_channel) % dim] = 224
+    scale = torch.ones(1, dtype=torch.float32, device=value.device)
+    return (
+        torch.zeros_like(key, dtype=compute_type),
+        scale,
+        dense.to(compute_type),
+        scale * 0.25,
+    )
+
+
+def _check_pipe_policy(pa, case, arch, compile_kwargs):
+    """Pin the selected specialization so a case cannot drift off its path."""
+    from aiter.ops.flydsl.kernels.pa_decode.traits import PaDecodeSchedule
+
+    assert compile_kwargs[-1]["wide_kv_addressing"] == case["wide"]
+    if case["pipe"]:
+        # The cache key ends with (D256_PIPE, staged page ids).
+        pipe, staged = PaDecodeSchedule.select(**compile_kwargs[-1]).cache_key[-2:]
+        assert pipe == (arch == "gfx950")
+        if pipe:
+            assert (staged > 0) == (case["staged"] is not False)
+
+
 @pytest.mark.parametrize(
     "case",
     [
@@ -349,6 +521,7 @@ def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
             )
         ],
         *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _BF16_CASES],
+        *[pytest.param(geometry, id=name) for name, geometry in _PIPE_CASES],
         *[
             pytest.param(
                 {
@@ -382,9 +555,19 @@ def test_pa_decode(case, device, monkeypatch):
             "trans_v": True,
             "capture": False,
             "lengths": None,
+            "budget": None,
+            "table_width": None,
+            "max_context": "lengths",
+            "wide": False,
+            "pipe": False,
+            "staged": None,
         },
         **case,
     )
+    arch = get_gfx_runtime()
+    num_cu = torch.cuda.get_device_properties(device).multi_processor_count
+    if case["max_partitions"] is not None and case["max_partitions"] > num_cu:
+        pytest.skip(f"plan_pa_decode caps max_partitions at {num_cu} CUs")
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
     query_length, kv_heads, group_size, dim, page, window = (
         case[name]
@@ -408,6 +591,7 @@ def test_pa_decode(case, device, monkeypatch):
         case["pattern"],
         device,
         case["lengths"],
+        case["table_width"],
     )
     compute_type = torch.bfloat16
     key_scale = value_scale = None
@@ -420,7 +604,12 @@ def test_pa_decode(case, device, monkeypatch):
         )
         vector = 16
         mode = case["scale_mode"]
-        if mode in ("per-tensor", "per-token"):
+        if case["pattern"] in ("one_hot_v", "one_hot_token"):
+            tokens_per_channel = 1 if case["pattern"] == "one_hot_token" else 256
+            key, key_scale, value, value_scale = _one_hot_kv(
+                key, value, table, context, compute_type, tokens_per_channel
+            )
+        elif mode in ("per-tensor", "per-token"):
             quantize = pertoken_quant if mode == "per-token" else per_tensor_quant
             key, key_scale = quantize(key, quant_dtype=compute_type)
             value, value_scale = quantize(value, quant_dtype=compute_type)
@@ -455,19 +644,37 @@ def test_pa_decode(case, device, monkeypatch):
         "value_scale": value_scale,
         "sinks": sinks,
         "sliding_window": window,
-        "max_context_length": context.max().item(),
+        "max_context_length": (
+            None
+            if case["max_context"] is None
+            else (
+                context.max().item()
+                if case["max_context"] == "lengths"
+                else case["max_context"]
+            )
+        ),
     }
     arguments = (query, key_cache, value_cache, context, table, dim**-0.5, query_length)
     plan = pa.plan_pa_decode(
         context,
         kv_heads,
         max_partitions=case["max_partitions"],
+        workgroup_budget=case["budget"],
         query_length=query_length,
         sliding_window=window,
     )
     if "invalid_input" in case:
         _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch)
         return
+
+    compile_kwargs = []
+    compile_tile = pa.compile_pa_decode_tile
+
+    def spy_tile(**kwargs):
+        compile_kwargs.append(kwargs)
+        return compile_tile(**kwargs)
+
+    monkeypatch.setattr(pa, "compile_pa_decode_tile", spy_tile)
 
     output = torch.full_like(query, float("nan"))
     workspace = {}
@@ -499,6 +706,7 @@ def test_pa_decode(case, device, monkeypatch):
 
     launch()
     check()
+    _check_pipe_policy(pa, case, arch, compile_kwargs)
     if case["capture"]:
         # Compile/allocate before capture; replay must observe changed query data.
         capture_stream = torch.cuda.Stream()

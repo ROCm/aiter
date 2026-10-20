@@ -1,3 +1,5 @@
+import functools
+
 import torch
 import triton.experimental.gluon.language as gl
 import triton.language as tl
@@ -1741,6 +1743,17 @@ def _moe_gemm_a8w4_decode(
         gl.amd.gfx1250.tdm.async_wait(0)
 
 
+def _gather_idx_dtype(gather_indx):
+    if gather_indx is None:
+        return None
+    dtype = gather_indx.dtype
+    assert dtype in (
+        torch.uint16,
+        torch.int32,
+    ), "Gather index datatype should be uint16 or int32"
+    return dtype
+
+
 def get_moe_a8w4_layouts(
     num_warps,
     BLOCK_M,
@@ -1754,6 +1767,48 @@ def get_moe_a8w4_layouts(
     has_quant_static_scale,
     apply_swiglu,
     GatherIndx,
+    X_SCALE_TDM=False,
+    out_mx_quant=False,
+    is_prefill=True,
+):
+    # Building the layouts costs ~1 ms of Python per call. ctas_per_cga is a
+    # list and GatherIndx is a tensor; both are normalized before the cache key.
+    # Return a copy so callers can mutate the dict.
+    return dict(
+        _build_moe_a8w4_layouts(
+            num_warps,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            tuple(ctas_per_cga),
+            ACTIVATION_REDUCTION_N,
+            PRESHUFFLED,
+            SWIZZLE_MX_SCALE,
+            is_x_microscaled,
+            has_quant_static_scale,
+            apply_swiglu,
+            _gather_idx_dtype(GatherIndx),
+            X_SCALE_TDM,
+            out_mx_quant,
+            is_prefill,
+        )
+    )
+
+
+@functools.cache
+def _build_moe_a8w4_layouts(
+    num_warps,
+    BLOCK_M,
+    BLOCK_N,
+    BLOCK_K,
+    ctas_per_cga,
+    ACTIVATION_REDUCTION_N,
+    PRESHUFFLED,
+    SWIZZLE_MX_SCALE,
+    is_x_microscaled,
+    has_quant_static_scale,
+    apply_swiglu,
+    gather_idx_dtype,
     X_SCALE_TDM=False,
     out_mx_quant=False,
     is_prefill=True,
@@ -1814,12 +1869,8 @@ def get_moe_a8w4_layouts(
     CGA_A_T = [[basis[1], basis[0]] for basis in CGA_A]
 
     X_GATHER_IDX_LAYOUT = None
-    if GatherIndx is not None:
-        assert GatherIndx.dtype in (
-            torch.uint16,
-            torch.int32,
-        ), "Gather index datatype should be uint16 or int32"
-        gather_index_bitwidth = 16 if GatherIndx.dtype == torch.uint16 else 32
+    if gather_idx_dtype is not None:
+        gather_index_bitwidth = 16 if gather_idx_dtype == torch.uint16 else 32
         X_GATHER_IDX_LAYOUT = gl.SliceLayout(
             0,
             gl.BlockedLayout(
