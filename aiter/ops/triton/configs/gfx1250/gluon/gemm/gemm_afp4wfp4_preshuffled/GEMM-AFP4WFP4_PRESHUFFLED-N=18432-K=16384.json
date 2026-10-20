@@ -81,20 +81,20 @@
         "num_ctas": 2
     },
     "M_LEQ_2048": {
-        "BLOCK_SIZE_M": 1024,
-        "BLOCK_SIZE_N": 1024,
-        "BLOCK_SIZE_K": 256,
-        "num_warps": 4,
-        "NUM_BUFFERS": 4,
-        "num_ctas": 16
-    },
-    "M_LEQ_4096": {
-        "BLOCK_SIZE_M": 2048,
-        "BLOCK_SIZE_N": 512,
+        "BLOCK_SIZE_M": 512,
+        "BLOCK_SIZE_N": 256,
         "BLOCK_SIZE_K": 256,
         "num_warps": 4,
         "NUM_BUFFERS": 3,
-        "num_ctas": 16
+        "num_ctas": 2
+    },
+    "M_LEQ_4096": {
+        "BLOCK_SIZE_M": 512,
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 256,
+        "num_warps": 4,
+        "NUM_BUFFERS": 3,
+        "num_ctas": 2
     },
     "M_LEQ_8192": {
         "BLOCK_SIZE_M": 1024,
