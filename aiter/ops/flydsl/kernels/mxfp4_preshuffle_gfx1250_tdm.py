@@ -715,7 +715,8 @@ def launch_gemm_a8w4_tdm(
         # collapses to one atom: ``wv`` is the smallest unit needing its own code.
         Job = namedtuple(
             "Job",
-            "atom blk on_i32 lds_off lds_stage lds_row inner outer k_adv waves",
+            "atom blk gt k_step inner_idx on_i32 lds_off lds_stage lds_row "
+            "inner outer k_adv waves",
         )
         jobs = []
         as_prologue_jobs = []
@@ -739,6 +740,7 @@ def launch_gemm_a8w4_tdm(
             split_inner=False,
             target_jobs=None,
             cache_modifier=0,
+            old_iface=False,
         ):
             split_i = split_inner and len(wv) > 1
             if const_expr(len(wv) > 1):
@@ -751,27 +753,54 @@ def launch_gemm_a8w4_tdm(
             wave_outer_off = 0 if split_i or len(wv) == 1 else (wave - wv[0]) * seg
             wave_inner_off = (wave - wv[0]) * inner_seg if split_i else 0
             ext = None if oob is None else oob - wave_outer_off
-            # The coordinate rest carries the K tile number, so the view spans
-            # every K tile rather than one; k_adv == 0 means a single tile.
-            tile = (seg, inner_seg)
-            gt = tensor_view(
-                g_base
-                + (
-                    g_off
-                    + fx.Int64(wave_outer_off) * g_stride
-                    + fx.Int64(wave_inner_off)
-                ),
-                (seg if ext is None else ext, inner_seg * (K_TILES if k_adv else 1)),
-                (g_stride, 1),
-            )
-            atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
-                fx.rocdl.TensorLoad(cache_modifier=cache_modifier),
-                gt,
-                fx.make_layout(tile, (lds_row, 1)),
-                tile,
-                num_warps=nw,
-            )
-            blk = fx.zipped_divide(coord, tile)[None, (0, None)]
+            if const_expr(old_iface):
+                # Rows too narrow for the tiled atom's tile_dim0 span keep the
+                # old descriptor, which takes the K bump as a byte imm_offset.
+                gt = tensor_view(
+                    g_base
+                    + (
+                        g_off
+                        + fx.Int64(wave_outer_off) * g_stride
+                        + fx.Int64(wave_inner_off)
+                    ),
+                    (seg, inner_seg),
+                    (g_stride, 1),
+                )
+                pad_kw = {"pad_interval": pad[0], "pad_amount": pad[1]} if pad else {}
+                atom = fx.rocdl.make_tdm_atom(
+                    gt,
+                    [ext, None],
+                    strides=[g_stride, None],
+                    num_warps=nw,
+                    early_timeout=bool(wg_mask is not None),
+                    cache_modifier=cache_modifier,
+                    **pad_kw,
+                )
+                blk = k_step = inner_idx = None
+            else:
+                # The coordinate rest carries the K tile number, so the view
+                # spans every K tile rather than one; k_adv == 0 means a single
+                # tile. The rest counts in units of the *tile*, which is one
+                # wave's slice when the inner extent is split, so one K tile is
+                # k_step of those units and the wave's slice is the rest's
+                # starting offset. Folding the slice into the base instead would
+                # make the rest step inner_seg and silently halve the K stride.
+                tile = (seg, inner_seg)
+                k_step = inner // inner_seg
+                inner_idx = (wave - wv[0]) if split_i else None
+                gt = tensor_view(
+                    g_base + (g_off + fx.Int64(wave_outer_off) * g_stride),
+                    (seg if ext is None else ext, inner * (K_TILES if k_adv else 1)),
+                    (g_stride, 1),
+                )
+                atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                    fx.rocdl.TensorLoad(cache_modifier=cache_modifier),
+                    gt,
+                    fx.make_layout(tile, (lds_row, 1)),
+                    tile,
+                    num_warps=nw,
+                )
+                blk = fx.zipped_divide(coord, tile)[None, (0, None)]
             if const_expr(wg_mask is not None):
                 # A runtime zero mask keeps a partial-M tail on the ordinary
                 # global-load path; nonzero masks select CLUSTER_LOAD_ASYNC.
@@ -780,6 +809,9 @@ def launch_gemm_a8w4_tdm(
                 Job(
                     atom,
                     blk,
+                    gt,
+                    k_step,
+                    inner_idx,
                     on_i32,
                     lds_off + wave_outer_off * lds_row + wave_inner_off,
                     lds_stage,
@@ -845,6 +877,12 @@ def launch_gemm_a8w4_tdm(
         elif const_expr(row_major_ascale):
             # Compact dispatch lands e8m0 row-major at the wire pitch. The
             # rotating path keeps one tile_k slice in each pipeline buffer.
+            #
+            # Old interface on purpose: a row here is SA_KDW = tile_k // 128
+            # dwords, so 8 bytes at tile_k=256 and 4 at tile_k=128, under the
+            # 16-byte tile_dim0 span the tiled atom requires in the pinned
+            # flydsl. To restore, drop old_iface once the pin carries the
+            # relaxed span check -- nothing else about this call changes.
             add_tdm_loads(
                 gSA_base,
                 blk_m64 * SA_GROW,
@@ -858,6 +896,7 @@ def launch_gemm_a8w4_tdm(
                 lds_row=SA_KDW,
                 k_adv=SA_KDW * 4,
                 wv=waves[2],
+                old_iface=True,
             )
         elif const_expr(tdm_as_in_prologue):
             add_tdm_loads(
@@ -918,18 +957,44 @@ def launch_gemm_a8w4_tdm(
                 pred = pred | (wave == w)
             return pred
 
+        def _rest(j, kt):
+            """Coordinate rest for one job: whole K tiles plus this wave's slice.
+
+            The rest counts tiles, and a split-inner job's tile is one wave's
+            slice of the row, so a K tile is ``k_step`` of them. Advancing by a
+            bare ``kt`` would step one slice -- the next wave's half of the same
+            K tile, not the next K tile.
+            """
+            if const_expr(j.inner_idx is None):
+                return fx.Int32(kt * j.k_step) if j.k_adv else 0
+            if const_expr(not j.k_adv):
+                return j.inner_idx
+            return fx.Int32(kt * j.k_step) + j.inner_idx
+
         def issue(s, kt, my_jobs=None):
             base_i8 = fx.recast_iter(p8_shared, base_ptr)
 
             def emit(j):
                 base = base_i32 if j.on_i32 else base_i8
+                if const_expr(j.blk is None):
+                    fx.copy(
+                        j.atom,
+                        j.gt,
+                        lds_view(
+                            base + j.lds_off + s * j.lds_stage,
+                            (j.outer, j.inner),
+                            (j.lds_row, 1),
+                        ),
+                        imm_offset=fx.Int64(kt * j.k_adv),
+                    )
+                    return
                 dst = lds_view(
                     base + j.lds_off + s * j.lds_stage,
                     ((j.outer, j.inner), 1),
                     ((j.lds_row, 1), j.outer * j.lds_row),
                 )
                 ts, tg = fx.rocdl.cdna5.tdm_partition(j.atom, 0, WARP1, dst, j.blk)
-                fx.copy(j.atom, tg[None, fx.Int32(kt) if j.k_adv else 0], ts[None, 0])
+                fx.copy(j.atom, tg[None, _rest(j, kt)], ts[None, 0])
 
             if const_expr(my_jobs is not None):
                 for j in my_jobs:
@@ -959,7 +1024,7 @@ def launch_gemm_a8w4_tdm(
                     ts, tg = fx.rocdl.cdna5.tdm_partition(
                         job.atom, 0, WARP1, destination, job.blk
                     )
-                    fx.copy(job.atom, tg[None, 0], ts[None, 0])
+                    fx.copy(job.atom, tg[None, _rest(job, 0)], ts[None, 0])
 
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
