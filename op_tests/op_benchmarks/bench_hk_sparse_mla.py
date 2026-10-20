@@ -66,6 +66,10 @@ def accuracy(out, ref, rows, tolerance):
 
 def sparse():
     from aiter.ops.hk_sparse_mla import hk_sparse_mla_fwd
+    from aiter.ops.pa_sparse_prefill_opus import (
+        pa_sparse_prefill_fp8_opus,
+        pa_sparse_prefill_opus,
+    )
     from aiter.ops.triton.attention.sparse_mla import sparse_mla_fwd
 
     tests = module(ROOT / "op_tests/test_hk_sparse_mla.py", "hk_tests")
@@ -73,6 +77,9 @@ def sparse():
     flush = torch.empty(512 << 20, dtype=torch.uint8, device="cuda")
     result = {
         "mode": "sparse",
+        "benchmark_commit": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+        ).strip(),
         "base": os.environ["REVIEW_BASE"],
         "torch": str(torch.__version__),
         "hip": str(torch.version.hip),
@@ -85,6 +92,7 @@ def sparse():
             "cache": "512 MiB eviction before each timed one-call HIP graph replay; eviction excluded",
             "selection": "all valid uniform random physical slots; duplicate selections retained",
             "tuning": "FP8 and BF16 dots; kv_splits default,1,2,4,8,16,32; nine samples",
+            "opus": "Lossless repack of identical values to native OPUS caches: BF16 (2x bytes) or 448 FP8 + unit E8M0 scales + 64 BF16 (1.25x bytes). Q/cache repack excluded; no attention sink. Reported separately from matching-layout Gluon.",
             "confirmation": "top three candidates plus both defaults, two fresh seeds, 21 samples each, alternating order",
             "reference": "FP32 attention on identical quantized inputs, sampled rows; relative L2 < 0.04",
         },
@@ -98,6 +106,12 @@ def sparse():
             kv[first : first + n] = (torch.randn(n, 512, device="cuda") * 0.4).to(
                 kv.dtype
             )
+        kv_bf16 = kv.to(torch.bfloat16)
+        kv_nope = torch.zeros_like(kv)
+        kv_rope = kv[:, 448:].to(torch.bfloat16).contiguous()
+        kv_nope[:, :448].copy_(kv[:, :448])
+        kv_nope.view(torch.uint8)[:, 448:462].fill_(127)
+        sink = torch.full((32,), float("-inf"), dtype=torch.float32, device="cuda")
         for T in (1, 8, 32, 128, 512, 2048, 8192, 16384):
             torch.manual_seed(T + slots)
             q = (torch.randn(T, 32, 512, device="cuda") * 0.4).to(kv.dtype)
@@ -129,6 +143,45 @@ def sparse():
                         )[0]
 
                     calls[name] = partial(invoke, precision, split, q, kv, indptr, ids)
+            # Give OPUS its native layouts with exactly the same q/k/v values.
+            # Cache and query conversion are deliberately excluded from timing.
+            q_bf16 = q.to(torch.bfloat16)
+            q_nope = torch.zeros_like(q)
+            q_nope[:, :, :448].copy_(q[:, :, :448])
+            q_nope.view(torch.uint8)[:, :, 448:462].fill_(127)
+            q_rope = q[:, :, 448:].to(torch.bfloat16).contiguous()
+            empty_ids = ids.flatten()[:0]
+            empty_ptr = torch.zeros_like(indptr)
+            for split in (None, 1, 2, 4, 8):
+                name = "aiter_opus_bf16_" + ("default" if split is None else str(split))
+                calls[name] = partial(
+                    pa_sparse_prefill_opus,
+                    q_bf16,
+                    kv_bf16,
+                    ids.flatten(),
+                    indptr,
+                    kv_bf16[:0],
+                    empty_ids,
+                    empty_ptr,
+                    sink,
+                    512**-0.5,
+                    num_kv_splits=split,
+                )
+            calls["aiter_opus_fp8"] = partial(
+                pa_sparse_prefill_fp8_opus,
+                q_nope,
+                q_rope,
+                kv_nope,
+                kv_rope,
+                ids.flatten(),
+                indptr,
+                kv_nope[:0],
+                kv_rope[:0],
+                empty_ids,
+                empty_ptr,
+                sink,
+                512**-0.5,
+            )
             candidates, failures = {}, {}
             for name, call in calls.items():
                 try:
@@ -153,6 +206,10 @@ def sparse():
                     ["hk"]
                     + ranked[:3]
                     + [
+                        n for n in ranked if n.startswith(("aiter_fp8_", "aiter_bf16_"))
+                    ][:1]
+                    + [n for n in ranked if n.startswith("aiter_opus_")][:1]
+                    + [
                         n
                         for n in ("aiter_fp8_default", "aiter_bf16_default")
                         if n in candidates
@@ -169,6 +226,9 @@ def sparse():
                 ids.copy_(
                     torch.randint(slots, (T, K), device="cuda", dtype=torch.int32)
                 )
+                q_bf16.copy_(q)
+                q_nope[:, :, :448].copy_(q[:, :, :448])
+                q_rope.copy_(q[:, :, 448:])
                 expected = tests.reference(q, kv[:, None, :], ids, 512**-0.5, rows)
                 for graph in graphs.values():
                     graph.replay()
@@ -189,6 +249,10 @@ def sparse():
                 for name in selected
             }
             winner = min((n for n in selected if n != "hk"), key=medians.get)
+            matching = min(
+                (n for n in selected if n.startswith(("aiter_fp8_", "aiter_bf16_"))),
+                key=medians.get,
+            )
             row = {
                 "tokens": T,
                 "topk": K,
@@ -198,6 +262,8 @@ def sparse():
                 "phases": phases,
                 "median_us": medians,
                 "strongest_baseline": winner,
+                "strongest_matching_layout": matching,
+                "hk_speedup_matching_layout": medians[matching] / medians["hk"],
                 "hk_speedup": medians[winner] / medians["hk"],
             }
             result["cases"].append(row)
@@ -209,10 +275,10 @@ def sparse():
                 ),
                 flush=True,
             )
-            del calls, graphs, outputs, q, ids, expected
+            del calls, graphs, outputs, q, q_bf16, q_nope, q_rope, ids, expected
             gc.collect()
             torch.cuda.empty_cache()
-        del kv
+        del kv, kv_bf16, kv_nope, kv_rope
     return result
 
 
