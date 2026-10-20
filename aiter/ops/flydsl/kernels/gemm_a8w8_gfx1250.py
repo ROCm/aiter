@@ -350,18 +350,11 @@ def launch_gemm_a8w8(
                     )
                 else:
                     sa_off0 = blk_m64 * (k64 // 32)
-                    gSA_full = _gv(
-                        arg_scale_a, sa_off0, (sa_oob, i32_k // 32), (k64 // 32, 1)
-                    )
-                    atomSA, coordSA = fx.rocdl.cdna5.make_tiled_tdm_atom(
-                        fx.rocdl.TensorLoad(),
-                        gSA_full,
-                        fx.make_layout(SA_SHAPE, (SA_SHAPE[1], 1)),
-                        SA_SHAPE,
-                        num_warps=1,
-                    )
-                    atomSA = fx.atom_set_value(atomSA, "workgroup_mask", a_mask)
-                    blkSA = fx.zipped_divide(coordSA, SA_SHAPE)[None, (0, None)]
+                    gSA = _gv(arg_scale_a, sa_off0, SA_SHAPE, (tile_k // 32, 1))
+                    atomSA = _tdm1(gSA, sa_oob, None, k64 // 32, a_mask)
+
+                    def sa_imm(kt):
+                        return fx.Int64(kt) * (tile_k // 32)
 
                 sb_off0 = blk_n64 // 32 * k64
                 gSB_full = _gv(arg_scale_b, sb_off0, (SB_SHAPE[0], i32_k), (k64, 1))
@@ -426,16 +419,13 @@ def launch_gemm_a8w8(
                         if wave == W_SA:
                             fx.copy(atomSA, tSAgSA[None, kti], tSAsSA[None, s])
                     else:
-                        if wave == W_SA:
-                            sa_box = _lv(
-                                fx.add_offset(pa, SA_OFF),
-                                (SA_SHAPE, 1),
-                                ((SA_SHAPE[1], 1), SA_SHAPE[0] * SA_SHAPE[1]),
-                            )
-                            tSAs2, tSAg2 = fx.rocdl.cdna5.tdm_partition(
-                                atomSA, 0, WARP1, sa_box, blkSA
-                            )
-                            fx.copy(atomSA, tSAg2[None, kti], tSAs2[None, 0])
+                        _wcopy(
+                            W_SA,
+                            atomSA,
+                            gSA,
+                            _lv(fx.add_offset(pa, SA_OFF), SA_SHAPE, (SA_SHAPE[1], 1)),
+                            sa_imm(ktg),
+                        )
                     if wave == W_SB:
                         fx.copy(atomSB, tSBgSB[None, kti], tSBsSB[None, s])
                 else:
