@@ -527,7 +527,13 @@ def compile_fp8_gemm_8w(
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, set_prio=False)
         c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, set_prio=False)
         rocdl.s_setprio(0)
-        rocdl.s_barrier()
+        # Balance the prologue's extra wave_m == 1 barrier so both groups' epilogues overlap.
+        # Not at BLOCK_N=512: already at 256 VGPRs, the branch raises spills from 4 to 11.
+        if const_expr(BLOCK_N > 256):
+            rocdl.s_barrier()
+        else:
+            if wave_m == 0:
+                rocdl.s_barrier()
 
         # Scale and store back to gmem
         wave_n_offset = wave_n * (N_TILES_B * 16)
