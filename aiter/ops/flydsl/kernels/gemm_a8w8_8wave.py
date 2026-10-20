@@ -431,7 +431,6 @@ def compile_fp8_gemm_8w(
         b_g2s.load(b_cur1, B1_gl_offset + 0 * B_K_STEP)
         a_g2s.load(a_cur1, A1_gl_offset + 0 * BLOCK_K)
 
-        # Intentional: waves 0-3 run one barrier ahead of waves 4-7.
         if wave_m == 1:
             rocdl.s_barrier()
 
@@ -447,7 +446,6 @@ def compile_fp8_gemm_8w(
             b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
             a0_frag = a_s2r.load(a_cur0)
             a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
-            # The other wave group refills B0 right after this barrier: finish this wave's LDS reads first.
             rocdl.s_waitcnt(lgkmcnt=0)
             rocdl.s_barrier()
 
@@ -480,7 +478,6 @@ def compile_fp8_gemm_8w(
         k = K_ITERS - 2
         b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
         a0_frag = a_s2r.load(a_cur0)
-        # Drain the last tile's loads: its B0/A0 are read before the final wait.
         wait_barrier(0)
 
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
@@ -527,13 +524,8 @@ def compile_fp8_gemm_8w(
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, set_prio=False)
         c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, set_prio=False)
         rocdl.s_setprio(0)
-        # Balance the prologue's extra wave_m == 1 barrier so both groups' epilogues overlap.
-        # Not at BLOCK_N=512: already at 256 VGPRs, the branch raises spills from 4 to 11.
-        if const_expr(BLOCK_N > 256):
+        if wave_m == 0:
             rocdl.s_barrier()
-        else:
-            if wave_m == 0:
-                rocdl.s_barrier()
 
         # Scale and store back to gmem
         wave_n_offset = wave_n * (N_TILES_B * 16)
