@@ -22,8 +22,8 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 
 from . import implementation_cache_tag
-from .pipeline_gfx1250 import Gfx1250Pipeline
-from .traits_gfx1250 import Gfx1250Traits
+from .pipeline import Gfx1250Pipeline
+from .traits import Gfx1250Traits
 
 _CACHE = {}
 
