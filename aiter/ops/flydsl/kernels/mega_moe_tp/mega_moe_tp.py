@@ -834,6 +834,26 @@ class MegaMoeTPEngine:
             self.n_cta,
         )
 
+    def _check_out(self, out, rows: int) -> None:
+        if out is not None and (
+            tuple(out.shape) != (rows, self.H)
+            or out.dtype != torch.bfloat16
+            or out.device != self.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError(f"out: need a contiguous bf16 [{rows}, {self.H}]")
+
+    def _check_tail(self, tail, m: int) -> None:
+        res_in, res_out, nw = tail
+        for t, shp in ((res_in, (m, self.H)), (res_out, (m, self.H)), (nw, (self.H,))):
+            if (
+                tuple(t.shape) != shp
+                or t.dtype != torch.bfloat16
+                or t.device != self.device
+                or not t.is_contiguous()
+            ):
+                raise ValueError(f"tail: need contiguous bf16 {shp} on {self.device}")
+
     def forward(
         self,
         x_local: torch.Tensor,
@@ -845,13 +865,7 @@ class MegaMoeTPEngine:
     ):
         m = self._local_tokens(x_local, topk_weights, topk_ids)
         rows = m * self.tp if self.ar else m
-        if out is not None and (
-            tuple(out.shape) != (rows, self.H)
-            or out.dtype != torch.bfloat16
-            or out.device != self.device
-            or not out.is_contiguous()
-        ):
-            raise ValueError(f"out: need a contiguous bf16 [{rows}, {self.H}]")
+        self._check_out(out, rows)
         if m == 0:
             return x_local.new_empty((0, self.H)) if out is None else out
         x = x_local.contiguous()
@@ -863,18 +877,7 @@ class MegaMoeTPEngine:
                 raise ValueError(
                     "tail: ag_rs, the LB schedule, at most TN_MAX local tokens"
                 )
-            res_in, res_out, nw = tail
-            for t, shp in (
-                (res_in, (m, self.H)),
-                (res_out, (m, self.H)),
-                (nw, (self.H,)),
-            ):
-                if (
-                    tuple(t.shape) != shp
-                    or t.dtype != torch.bfloat16
-                    or not t.is_contiguous()
-                ):
-                    raise ValueError(f"tail: need contiguous bf16 {shp}")
+            self._check_tail(tail, m)
             cfg = dataclasses.replace(cfg, tn=2 if bf16 else 1)
         local_y = not self.ar or self._arll(cfg) or self._ag8(cfg)
         y = out if out is not None and local_y else self.y

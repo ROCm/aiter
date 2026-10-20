@@ -257,6 +257,9 @@ class MegaMoeTP:
                 limit=self.cfg.max_local_tokens,
                 uneven=True,
             )
+            self.engine._check_out(out, x_local.shape[0])
+            if tail is not None:
+                self.engine._check_tail(tail, x_local.shape[0])
             x_local = x_local.contiguous()
             topk_weights = topk_weights.to(torch.float32).contiguous()
             topk_ids = topk_ids.to(torch.int32).contiguous()

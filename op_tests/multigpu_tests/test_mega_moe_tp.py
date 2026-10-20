@@ -391,6 +391,58 @@ def case_out(shape, wt, ctx, S, mode):
     return check(keep, c1, RTOL)
 
 
+def case_bigm(shape, wt, ctx, S, mode):
+    pad = 64
+    if max_local(mode, shape, wt) < pad:
+        return "skipped (max_local_tokens < 64)"
+    layer = new_layer(
+        shape,
+        wt,
+        ctx,
+        mode,
+        max_local(mode, shape, wt),
+        bigm_min_tokens=pad * ctx.world,
+    )
+    if not layer.bigm_m:
+        return "skipped (no big-M path)"
+    worst = 0.0
+    tokens = [(pad - 1) * ctx.world, pad * ctx.world]
+    if mode == "ar":
+        tokens.append(pad * ctx.world + 1)
+    for t in tokens:
+        c = make_case(shape, wt, ctx, mode, t, "random", SEED + t)
+        out = torch.empty_like(c.ref, dtype=dtypes.bf16)
+        y = call(layer, c, out=out)
+        if y.data_ptr() != out.data_ptr():
+            raise CaseFailure(f"M={t}: out= was not returned")
+        worst = max(worst, check(out, c, RTOL, f"M={t}"))
+    c = make_case(shape, wt, ctx, mode, pad * ctx.world, "random", SEED)
+    x, w, ids = c.x, c.w, c.ids
+    H = shape.model_dim
+    expect_raise(
+        lambda: layer(x, w, ids, out=torch.empty_like(c.ref, dtype=torch.float16)),
+        "big-M out of the wrong dtype",
+    )
+    expect_raise(
+        lambda: layer(x, w, ids, out=torch.empty((1, 1), dtype=dtypes.bf16)),
+        "big-M out of the wrong shape",
+    )
+    if mode == "ag_rs":
+        m = x.shape[0]
+        res = torch.zeros((m, H), dtype=dtypes.bf16, device=ctx.device)
+        nw = torch.zeros((H,), dtype=dtypes.bf16, device=ctx.device)
+        for bad, what in (
+            ((res[:1], res, nw), "res_in of the wrong shape"),
+            ((res, res.float(), nw), "fp32 res_out"),
+            ((res, res, nw.cpu()), "norm_w on the cpu"),
+            ((res.t().contiguous().t(), res, nw), "non-contiguous res_in"),
+        ):
+            expect_raise(lambda bad=bad: layer(x, w, ids, tail=bad), f"big-M {what}")
+    layer.close()
+    layer.close()
+    return worst
+
+
 def case_graph(shape, wt, ctx, S, mode):
     layer = new_layer(shape, wt, ctx, mode, max_local(mode, shape, wt))
     cases = [
@@ -788,6 +840,7 @@ CASES = {
     "varying m": case_varying_m,
     "new / freed layers": case_layers,
     "out=": case_out,
+    "big-M": case_bigm,
     "cuda graph": case_graph,
     "dynamic": lambda *a: case_dynamic(*a, lb=False),
     "dynamic LB": lambda *a: case_dynamic(*a, lb=True),

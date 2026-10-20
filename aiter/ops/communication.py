@@ -222,12 +222,14 @@ class SdmaComm:
         and the arena. The instance is unusable afterwards."""
         if not self._committed:
             return
-        torch.cuda.synchronize(self.device)
-        dist.barrier(group=self.group)
         self._committed = False
         try:
-            self.dev_comm.close()
-            self.comm.destroy()
+            torch.cuda.synchronize(self.device)
+            dist.barrier(group=self.group)
+            try:
+                self.dev_comm.close()
+            finally:
+                self.comm.destroy()
         finally:
             self.arena.close()
 
