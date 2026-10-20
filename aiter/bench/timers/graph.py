@@ -35,6 +35,19 @@ class GraphCaptureError(RuntimeError):
     pass
 
 
+def _captured_node_count(graph):
+    """Return the captured node count when the torch build exposes it."""
+    for attr in ("num_nodes", "_num_nodes"):
+        try:
+            probe = getattr(graph, attr)
+            value = probe() if callable(probe) else probe
+        except (AttributeError, RuntimeError, TypeError):
+            continue
+        if isinstance(value, int):
+            return value
+    return None
+
+
 def _capture(calls, k, stream):
     graph = torch.cuda.CUDAGraph()
     with warnings.catch_warnings(record=True) as caught:
@@ -50,9 +63,11 @@ def _capture(calls, k, stream):
                 "host-to-device copies or allocations outside the caching "
                 "allocator inside the call."
             ) from error
-    if any("empty" in str(w.message).lower() for w in caught):
+    captured_nodes = _captured_node_count(graph)
+    empty_warning = any("empty" in str(w.message).lower() for w in caught)
+    if captured_nodes == 0 or (captured_nodes is None and empty_warning):
         raise EmptyGraphCaptureError()
-    return graph
+    return graph, captured_nodes
 
 
 def _replay_us(graph, replays):
@@ -104,14 +119,14 @@ def time_graph(calls, iters, *, min_replay_us, max_calls) -> TimerOutput:
     # kernels and K comes out too small; one refinement from the measured
     # replay corrects that.
     k = _calls_for(min_replay_us, _estimate_call_us(calls), n_copies, max_calls)
-    graph = _capture(calls, k, stream)
+    graph, captured_nodes = _capture(calls, k, stream)
     replay_us = _replay_us(graph, 3)
     if replay_us < min_replay_us / 2 and k < max_calls:
         refined = _calls_for(min_replay_us, replay_us / k, n_copies, max_calls)
         if refined > k:
             graph.reset()
             k = refined
-            graph = _capture(calls, k, stream)
+            graph, captured_nodes = _capture(calls, k, stream)
             replay_us = _replay_us(graph, 3)
     if replay_us < min_replay_us / 2:
         notes.append(
@@ -130,5 +145,5 @@ def time_graph(calls, iters, *, min_replay_us, max_calls) -> TimerOutput:
     torch.cuda.synchronize()
     samples = [s.elapsed_time(e) * 1000.0 / k for s, e in zip(starts, ends)]
     graph.reset()
-    info = {"graph_calls_per_replay": k, "captured_nodes": None}
+    info = {"graph_calls_per_replay": k, "captured_nodes": captured_nodes}
     return TimerOutput(samples_us=samples, info=info, notes=notes)

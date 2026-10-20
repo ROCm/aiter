@@ -5,6 +5,7 @@ timer's kernel-to-call matching (on synthetic profiler events). GPU tests run
 each timing mode on small torch kernels and skip cleanly without a GPU.
 """
 
+import contextlib
 import json
 import pathlib
 import statistics
@@ -31,6 +32,7 @@ from aiter.bench import (
 from aiter.bench import env as bench_env
 from aiter.bench.stats import count_outliers, summarize
 from aiter.bench.timers import device as device_timer
+from aiter.bench.timers import graph as graph_timer
 from aiter.bench.timers.graph import time_graph
 
 needs_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -161,6 +163,30 @@ def test_split_calls_by_launch_range():
     assert [op.name() for op in per_call[0]] == ["gemm", "reduce", "gemm"]
     assert [op.name() for op in per_call[1]] == ["gemm"]
     assert unmatched == 1
+
+
+def test_capture_rejects_zero_nodes_without_warning(monkeypatch):
+    class EmptyGraph:
+        def num_nodes(self):
+            return 0
+
+    monkeypatch.setattr(graph_timer.torch.cuda, "CUDAGraph", EmptyGraph)
+    monkeypatch.setattr(
+        graph_timer.torch.cuda,
+        "graph",
+        lambda graph, stream: contextlib.nullcontext(),
+    )
+
+    with pytest.raises(EmptyGraphCaptureError):
+        graph_timer._capture([lambda: None], 1, object())
+
+
+def test_captured_node_count_supports_attribute_and_missing_api():
+    class GraphWithNodeAttribute:
+        _num_nodes = 3
+
+    assert graph_timer._captured_node_count(GraphWithNodeAttribute()) == 3
+    assert graph_timer._captured_node_count(object()) is None
 
 
 # --------------------------------------------------------------------------- #
