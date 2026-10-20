@@ -3835,6 +3835,31 @@ def get_2stage_cfgs(
             f"activation {activation}; using default heuristics"
         )
 
+    # The SwiGLU OAI FLAT asm kernels hard-code alpha=1.702 / limit=7.0, take
+    # GGUU (separated) gate/up weights and have no per-expert bias input. The
+    # 1-stage launch does not forward bias or swiglu_limit, so a row that does
+    # not match the call would silently compute a different function.
+    if (
+        cfg is not None
+        and cfg.get("run_1stage", False)
+        and activation == ActivationType.Swiglu
+    ):
+        unsupported = None
+        if has_stage1_bias or has_stage2_bias:
+            unsupported = "per-expert bias"
+        elif swiglu_limit is not None and float(swiglu_limit) != 7.0:
+            unsupported = f"swiglu_limit={swiglu_limit} (kernel uses 7.0)"
+        elif gate_mode != GateMode.SEPARATED:
+            unsupported = f"gate mode {gate_mode.value!r}"
+        elif gate_up_interleave:
+            unsupported = "gate/up-interleaved (GUGU) weights"
+        if unsupported is not None:
+            cfg = None
+            logger.warning(
+                f"[fused_moe] discarding SwiGLU OAI 1-stage asm config for {keys}: "
+                f"unsupported {unsupported}; using default heuristics"
+            )
+
     use_non_temporal_load = False
     if cfg is None or bypass_tuned_config:
         ksplit = 0
@@ -5046,12 +5071,17 @@ def fused_moe_2stages(
 
 
 def torch_moe_act(act_input, torch_act, inter_dim, activation=None):
+    # OAI SwiGLU is a gated (g1u1) activation with its own formula; it has no
+    # single-input torch_act, so it must never reach torch_act below.
+    if activation == ActivationType.Swiglu:
+        if act_input.shape[-1] != 2 * inter_dim:
+            raise NotImplementedError("ActivationType.Swiglu requires g1u1 weights")
+        gate, up = act_input.split([inter_dim, inter_dim], dim=-1)
+        return swiglu(gate, up)
     if act_input.shape[-1] == inter_dim:
         return torch_act(act_input)
     else:
         gate, up = act_input.split([inter_dim, inter_dim], dim=-1)
-        if activation == ActivationType.Swiglu:
-            return swiglu(gate, up)
         return torch_act(gate) * up
 
 
