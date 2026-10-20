@@ -12,6 +12,7 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
 )
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.common_utils import max_addressable_bytes
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.ops.triton.utils.unified_attention_utils import (
@@ -1012,13 +1013,6 @@ def _reduce_segments_gfx1250(
     )
 
 
-def _byte_span(t) -> int:
-    """Bytes from the first to the last element of t, for any strides."""
-    return (sum((s - 1) * st for s, st in zip(t.shape, t.stride())) + 1) * (
-        t.element_size()
-    )
-
-
 def _unified_attention_gfx950(
     params: _UAParams,
     config: dict,
@@ -1070,7 +1064,10 @@ def _unified_attention_gfx950(
     # buffer ops need the tensor to fit a 32-bit offset. k and v can be strided
     # views of one packed cache, so use the span of the view, not its size.
     MAX_INT32 = 2**31 - 1
-    USE_LOAD_BUFFER_OP = max(_byte_span(params.k), _byte_span(params.v)) <= MAX_INT32
+    USE_LOAD_BUFFER_OP = (
+        max(max_addressable_bytes(params.k), max_addressable_bytes(params.v))
+        <= MAX_INT32
+    )
     USE_STORE_BUFFER_OP = params.out.nelement() * params.out.element_size() <= MAX_INT32
 
     _unified_attention_kernel_gfx950[grid](
