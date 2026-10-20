@@ -523,7 +523,12 @@
     },
     {
       "kid": 70130,
-      "status": "ready"
+      "status": "ready",
+      "vgpr_count": 440,
+      "agpr_count": 224,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0
     },
     {
       "kid": 70131,

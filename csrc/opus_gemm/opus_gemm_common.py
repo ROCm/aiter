@@ -222,8 +222,7 @@ class OpusGemmInstance:
                 + self.bpreshuffle_entry["config_name"]
             )
         if self.bpreshuffle_co is not None:
-            family = self.bpreshuffle_co.get("name_family", "pin_agpr")
-            return f"opus_gemm_gfx950_a8w8_mxscale_gemm_bpreshuffle_{family}_{self.bpreshuffle_co['kid']}"
+            return self.bpreshuffle_co["symbol"]
         parts = [
             self.name_root,
             "x".join(map(str, [self.BLOCK_SIZE, self.B_M, self.B_N, self.B_K])),
@@ -3023,7 +3022,8 @@ def _load_gfx950_co_kernels(path):
                 entries[kid] = {
                     **base, "kid": kid, "pin_variant": True,
                     "traits": {**base["traits"], "args": variant_args},
-                    "symbol": f"opus_gemm_gfx950_{base['pipeline']}_{kid}",
+                    "symbol": (base["symbol"].rsplit("_pin", 1)[0]
+                               + f"_pinA{int(bool(mask & 1))}B{int(bool(mask & 2))}C{int(bool(mask & 4))}"),
                     "configKey": f"bpreshuffle_co_{base['pipeline']}_{kid}",
                 }
             entry = entries[kid]
@@ -3134,7 +3134,11 @@ _name_owner = {}
 _name_clashes = []
 for _cat in (*a8w8_mxscale_bmm_kernel_lists, kernels_list):
     for _kid, _inst in _cat.items():
-        _sig = repr(asdict(_inst))
+        _config = asdict(_inst)
+        if _inst.bpreshuffle_co is not None:
+            for _key in ("kid", "configKey", "pin_variant", "pin_group", "pin_mask"):
+                _config["bpreshuffle_co"].pop(_key, None)
+        _sig = repr(_config)
         _owner = _name_owner.setdefault(_inst.name, (_kid, _sig))
         if _owner[1] != _sig:
             _name_clashes.append((_owner[0], _kid, _inst.name))

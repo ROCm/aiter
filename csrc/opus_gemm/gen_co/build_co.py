@@ -305,7 +305,7 @@ def _check_gfx950_pin(entry, path, llvm_bin):
 
 
 def build_one_gfx950(entry, args, llvm_bin, workdir):
-    symbol = entry.get("symbol", f"opus_gemm_gfx950_pin_agpr_{entry['kid']}")
+    symbol = entry["symbol"]
     output = os.path.join(args.out_dir, f"{symbol}.co")
     optional = entry.get("pin_variant", False)
     if getattr(args, "skip_existing", False) and os.path.isfile(output):
@@ -682,6 +682,14 @@ def main():
         if unknown:
             p.error(f"Unknown CO IDs: {sorted(unknown)}")
         instances = [entry for entry in instances if entry["kid"] in args.kids]
+    if args.arch == "gfx950":
+        co_aliases, co_instances = {}, {}
+        for entry in instances:
+            symbol = entry["symbol"]
+            co_aliases.setdefault(symbol, []).append(entry["kid"])
+            if symbol not in co_instances or entry.get("pin_variant"):
+                co_instances[symbol] = entry
+        instances = list(co_instances.values())
     jobs = get_worker_count_for(len(instances), args.jobs)
 
     workdir = tempfile.mkdtemp(
@@ -710,6 +718,15 @@ def main():
             shutil.rmtree(workdir, ignore_errors=True)
 
     if args.arch == "gfx950":
+        results = {row["kid"]: row for row in built}
+        built = sorted(
+            (
+                {**results[entry["kid"]], "kid": kid}
+                for entry in instances
+                for kid in co_aliases[entry["symbol"]]
+            ),
+            key=lambda row: row["kid"],
+        )
         with open(
             args.report or os.path.join(args.out_dir, "build_info.json"), "w"
         ) as stream:

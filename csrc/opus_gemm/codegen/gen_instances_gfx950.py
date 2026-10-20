@@ -3215,8 +3215,10 @@ _BPRESHUFFLE_ARGUMENTS = r"""
 
 
 def _gen_bpreshuffle_co(cg, k, instance_impl_preamble, make_host_decl):
+    if any(row["kid_name"] == k.name for row in cg._host_instantiations):
+        return
     entry = k.bpreshuffle_co
-    symbol = entry.get("symbol", f"opus_gemm_gfx950_pin_agpr_{entry['kid']}")
+    symbol = entry["symbol"]
     if "launches" in entry:
         rows = [
             "{"
