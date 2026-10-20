@@ -6,7 +6,7 @@ import math
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.protocol import dsl_size_of
-from flydsl.expr import const_expr, gpu, idx2crd, range_constexpr, rocdl, tdm_ops
+from flydsl.expr import const_expr, gpu, idx2crd, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.runtime.device import check_smem_capacity
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
@@ -89,7 +89,6 @@ def compile_gemm_a16w16(
     warp_tile_m, warp_tile_n = tile_m // m_warp, tile_n // n_warp
     split_k_chunk = K // split_k
     num_k_tiles = (split_k_chunk + tile_k - 1) // tile_k
-    k_rem = split_k_chunk % tile_k
 
     for _nm, _v, _d in (
         ("K", K, split_k),
@@ -125,21 +124,21 @@ def compile_gemm_a16w16(
     N_A_FRAGS, N_B_FRAGS = wmma_m_rep * k_wmma_steps, wmma_n_rep * k_wmma_steps
 
     if physical_mk:
-        a_tile_shape, a_pad_interval = (tile_m, tile_k), tile_k
-        a_imm_bytes, lds_a_stride = tile_k * elem_bytes, tile_k + LDS_PAD_A
+        a_tile_shape = (tile_m, tile_k)
+        lds_a_stride = tile_k + LDS_PAD_A
         lds_a_elems = tile_m * lds_a_stride + LDS_PAD_A
     else:
-        a_tile_shape, a_pad_interval = (tile_k, tile_m), tile_m
-        a_imm_bytes, lds_a_stride = None, tile_m + LDS_PAD_A
+        a_tile_shape = (tile_k, tile_m)
+        lds_a_stride = tile_m + LDS_PAD_A
         lds_a_elems = tile_k * lds_a_stride + LDS_PAD_A
 
     if physical_kn:
-        b_tile_shape, b_pad_interval = (tile_k, tile_n), tile_n
-        b_imm_bytes, lds_b_stride = None, tile_n + LDS_PAD_B
+        b_tile_shape = (tile_k, tile_n)
+        lds_b_stride = tile_n + LDS_PAD_B
         lds_b_elems = tile_k * lds_b_stride + LDS_PAD_B
     else:
-        b_tile_shape, b_pad_interval = (tile_n, tile_k), tile_k
-        b_imm_bytes, lds_b_stride = tile_k * elem_bytes, tile_k + LDS_PAD_B
+        b_tile_shape = (tile_n, tile_k)
+        lds_b_stride = tile_k + LDS_PAD_B
         lds_b_elems = tile_n * lds_b_stride + LDS_PAD_B
 
     if split_k > 1:
@@ -240,29 +239,32 @@ def compile_gemm_a16w16(
         blk_m64, blk_n64 = fx.Int64(blk_m), fx.Int64(blk_n)
         split_k_base64 = fx.Int64(split_k_base)
 
-        def _mk_side(
-            ptr, base_off, shape, outer_stride, pad_interval, pad_amount, extents
-        ):
+        def _mk_side(ptr, base_off, tile, outer_stride, lds_stride, kdim, oob):
+            # The view carries the whole K range, so the tail tile is clamped by
+            # boundary_check instead of a per-iteration extent write.
+            shape = list(tile)
+            shape[kdim] = split_k_chunk
+            if oob is not None:
+                shape[1 - kdim] = oob
             gt = fx.Tensor(
                 fx.make_view(
                     fx.add_offset(ptr, base_off),
-                    fx.make_layout(shape, (outer_stride, 1)),
+                    fx.make_layout(tuple(shape), (outer_stride, 1)),
                 )
             )
-            return gt, fx.rocdl.make_tdm_atom(
+            atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                fx.rocdl.TensorLoad(),
                 gt,
-                extents,
-                strides=[outer_stride, None],
+                fx.make_layout(tile, (lds_stride, 1)),
+                tile,
                 num_warps=num_warps,
-                pad_interval=pad_interval,
-                pad_amount=pad_amount,
-                early_timeout=True,
             )
+            rest = [0, 0]
+            rest[kdim] = None
+            return atom, fx.zipped_divide(coord, tile)[None, tuple(rest)]
 
         m_oob = fx.Int32(m_idx - blk_m)
         n_oob = fx.Int32(fx.Uint64(N) - blk_n) if const_expr(N > 0) else None
-        a_extents = [m_oob, None] if const_expr(physical_mk) else [None, m_oob]
-        b_extents = [None, n_oob] if const_expr(physical_kn) else [n_oob, None]
 
         lda64 = fx.Int64(fx.Uint64(i32_lda))
         ldb64 = fx.Int64(fx.Uint64(i32_ldb))
@@ -271,28 +273,28 @@ def compile_gemm_a16w16(
         else:
             a_base_off = split_k_base64 * lda64 + blk_m64
         a_stride_rt = fx.Int32(i32_lda)
-        gA, atom_a = _mk_side(
+        atom_a, blk_a = _mk_side(
             arg_x,
             a_base_off,
             a_tile_shape,
             a_stride_rt,
-            a_pad_interval,
-            LDS_PAD_A,
-            a_extents,
+            lds_a_stride,
+            1 if physical_mk else 0,
+            m_oob,
         )
         if const_expr(physical_kn):
             b_base_off = split_k_base64 * ldb64 + blk_n64
         else:
             b_base_off = blk_n64 * ldb64 + split_k_base64
         b_stride_rt = fx.Int32(i32_ldb)
-        gB, atom_b = _mk_side(
+        atom_b, blk_b = _mk_side(
             arg_w,
             b_base_off,
             b_tile_shape,
             b_stride_rt,
-            b_pad_interval,
-            LDS_PAD_B,
-            b_extents,
+            lds_b_stride,
+            0 if physical_kn else 1,
+            n_oob,
         )
 
         def _imm64(k_tile, mul):
@@ -318,21 +320,8 @@ def compile_gemm_a16w16(
                 for rep in range_constexpr(reps)
             ]
 
-        a_imm_rt = (
-            a_imm_bytes
-            if const_expr(a_imm_bytes is not None)
-            else lda64 * (tile_k * elem_bytes)
-        )
-        b_imm_rt = (
-            b_imm_bytes
-            if const_expr(b_imm_bytes is not None)
-            else ldb64 * (tile_k * elem_bytes)
-        )
-
         # One spec per operand side; A and B differ only in these fields.
-        MEM, BASE, BASES, STRIDE, TR, ELEMS, REPS, ATOM, GT, SHAPE, IMM, KDIM = range(
-            12
-        )
+        MEM, BASE, BASES, STRIDE, TR, ELEMS, REPS, ATOM, BLK, SHAPE = range(10)
         A_SIDE = (
             big_a_mem,
             big_a_base_idx,
@@ -342,10 +331,8 @@ def compile_gemm_a16w16(
             lds_a_elems,
             wmma_m_rep,
             atom_a,
-            gA,
+            blk_a,
             a_tile_shape,
-            a_imm_rt,
-            1 if physical_mk else 0,
         )
         B_SIDE = (
             big_b_mem,
@@ -356,33 +343,30 @@ def compile_gemm_a16w16(
             lds_b_elems,
             wmma_n_rep,
             atom_b,
-            gB,
+            blk_b,
             b_tile_shape,
-            b_imm_rt,
-            0 if physical_kn else 1,
         )
 
         def issue_tdm_loads(buf_idx, k_tile):
-            if const_expr(k_rem != 0):
-                k_left = fx.Int32(split_k_chunk) - fx.Int32(k_tile) * tile_k
             for sd in (A_SIDE, B_SIDE):
                 atom = sd[ATOM]
-                if const_expr(k_rem != 0):
-                    atom = fx.atom_set_value(atom, f"extent_{sd[KDIM]}", k_left)
-                fx.copy(
-                    atom,
-                    sd[GT],
-                    fx.Tensor(
-                        fx.make_view(
-                            fx.add_offset(
-                                sd[MEM],
-                                _slot_off(buf_idx, sd[ELEMS]),
-                            ),
-                            fx.make_layout(sd[SHAPE], (sd[STRIDE], 1)),
-                        )
-                    ),
-                    imm_offset=_imm64(k_tile, sd[IMM]),
+                lds_box = fx.Tensor(
+                    fx.make_view(
+                        fx.add_offset(sd[MEM], _slot_off(buf_idx, sd[ELEMS])),
+                        fx.make_layout(
+                            (sd[SHAPE], 1),
+                            ((sd[STRIDE], 1), sd[SHAPE][0] * sd[STRIDE]),
+                        ),
+                    )
                 )
+                ts, tg = fx.rocdl.cdna5.tdm_partition(
+                    atom,
+                    fx.rocdl.wave_id(),
+                    fx.make_layout(num_warps, 1),
+                    lds_box,
+                    sd[BLK],
+                )
+                fx.copy(atom, tg[None, fx.Int32(k_tile)], ts[None, 0])
 
         lds_tr_ptr_ty = fx.PointerType.get(
             elem_ty=_fx_elem.ir_type,
@@ -671,7 +655,7 @@ def compile_gemm_a16w16(
 
         def _run_tile(accs_, ca, cb, cidx, lidx):
             issue_tdm_loads(lidx % num_buffers, lidx)
-            tdm_ops.tensor_wait(
+            rocdl.s_wait_tensorcnt(
                 0 if num_buffers == 2 else (num_buffers - 2) * _TDMS_PER_TILE
             )
             gpu.barrier()
@@ -689,7 +673,7 @@ def compile_gemm_a16w16(
         # Prologue:
         for i in range_constexpr(num_buffers - 1):
             issue_tdm_loads(i, i)
-        tdm_ops.tensor_wait((num_buffers - 2) * _TDMS_PER_TILE)
+        rocdl.s_wait_tensorcnt((num_buffers - 2) * _TDMS_PER_TILE)
         gpu.barrier()
         cur_a, cur_b = load_frags(A_SIDE, 0), load_frags(B_SIDE, 0)
 
@@ -740,7 +724,7 @@ def compile_gemm_a16w16(
             tile_idx = drain_base + j
             if const_expr(j < drain_count_d - 1):
                 next_tile = tile_idx + 1
-                tdm_ops.tensor_wait(
+                rocdl.s_wait_tensorcnt(
                     max(0, num_k_tiles - 1 - next_tile) * _TDMS_PER_TILE
                 )
                 gpu.barrier()
