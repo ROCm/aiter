@@ -116,7 +116,7 @@ def launch_pa_decode_ps_reduce(
                 groups *= 2
         per_seq = rows * kv_heads
         if ctas * group_waves >= budget and batch * per_seq * per_seq <= 2**30:
-            num_xcds = get_num_xcds()
+            num_xcds = get_num_xcds(output.device.index)
     num_xcds = num_xcds if num_xcds > 1 else 0
     compiled = compile_pa_decode_ps_reduce(
         max_context_partition_num=partitions,
