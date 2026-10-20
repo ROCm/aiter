@@ -29,6 +29,7 @@ from aiter.fused_moe import fused_moe, fused_topk, torch_moe_stage1, torch_moe_s
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+from aiter.test_common import checkAllclose
 
 _SKIP = pytest.mark.skipif(
     get_gfx() not in ("gfx942", "gfx950"),
@@ -212,9 +213,60 @@ def test_flydsl_a16wfp4_swiglu_bias_deterministic(model_dim, inter_dim, E, topk)
     out = run(slice(None))
     assert not out.isnan().any().item(), "deterministic a16w4 output contains NaN"
     ld = _cos_diff(ref.float(), out.float())
-    assert ld < 1e-2, f"deterministic a16w4 cos/logits_diff too large: {ld:.3e}"
+    assert ld < 1e-4, f"deterministic a16w4 cos/logits_diff too large: {ld:.3e}"
+    err = checkAllclose(
+        ref.to(dtypes.fp32),
+        out.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="deterministic a16w4 vs torch: ",
+    )
+    assert err <= 0.01, f"deterministic a16w4: {err:.2%} of elements outside tolerance"
     for _ in range(2):
         assert torch.equal(run(slice(None)), out), "differs from run to run"
     for k in (1, 31, 255, 256):
         assert torch.equal(run(slice(0, k)), out[:k]), f"first {k} tokens differ"
     assert torch.equal(run(slice(150, 151)), out[150:151]), "token alone differs"
+
+
+@_SKIP
+def test_flydsl_a16wfp4_deterministic_rejects_unsupported():
+    """Configurations the deterministic kernels cannot run raise instead of running
+    a path that would give wrong results: SiLU (activation quantization), fp16
+    output (bf16-only epilogue) and gate/up-interleaved weights."""
+    dtype = dtypes.bf16
+    torch.manual_seed(0)
+    M, model_dim, inter_dim, E, topk = 8, 1024, 512, 32, 4
+    inp = torch.randn((M, model_dim), dtype=dtype, device="cuda")
+    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype, device="cuda")
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype, device="cuda")
+    score = torch.randn((M, E), dtype=dtype, device="cuda")
+    topk_weights, topk_ids = fused_topk(inp, score, topk, True)
+    tq = aiter.get_torch_quant(QuantType.per_1x32)
+    w1_qt, w1_scale = tq(w1, quant_dtype=dtypes.fp4x2)
+    w2_qt, w2_scale = tq(w2, quant_dtype=dtypes.fp4x2)
+    w1_qt = w1_qt.view(E, inter_dim * 2, model_dim // 2)
+    w2_qt = w2_qt.view(E, model_dim, inter_dim // 2)
+
+    def call(interleaved=False, **kw):
+        args = {"activation": ActivationType.Swiglu, "deterministic": True}
+        args.update(kw)
+        return fused_moe(
+            inp.to(args.pop("in_dtype", dtype)),
+            shuffle_weight_a16w4(w1_qt, 16, interleaved),
+            shuffle_weight_a16w4(w2_qt, 16, False),
+            topk_weights,
+            topk_ids,
+            w1_scale=shuffle_scale_a16w4(w1_scale, E, interleaved),
+            w2_scale=shuffle_scale_a16w4(w2_scale, E, False),
+            quant_type=QuantType.per_1x32,
+            gate_mode=GateMode.SEPARATED.value,
+            **args,
+        )
+
+    with pytest.raises(NotImplementedError, match="activation"):
+        call(activation=ActivationType.Silu)
+    with pytest.raises(NotImplementedError, match="output dtype"):
+        call(in_dtype=dtypes.fp16)
+    with pytest.raises(NotImplementedError, match="interleaved"):
+        call(interleaved=True)

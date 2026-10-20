@@ -1128,8 +1128,8 @@ def fused_moe(
     batch, and from run to run: no atomic accumulation, no split-K, bf16
     activations and one tile configuration for every token count. It is
     supported for bf16 activations x MXFP4 weights (``QuantType.per_1x32``,
-    separated gate/up, preshuffled), without expert parallelism, and is slower
-    than the default.
+    separated gate/up, preshuffled), SwiGLU or SiTUv2, bf16 output, without
+    expert parallelism, and is slower than the default.
 
     Supplying any shared tensor (or ``shared_expert_id``) requires all four
     shared weight/scale tensors and dispatches through the gfx950 FHMoE path.
@@ -1534,11 +1534,13 @@ def _fused_moe_impl(
 
     if deterministic:
         _check_deterministic_supported(
+            dtype=dtype,
             quant_type=quant_type,
             q_dtype_w=q_dtype_w,
             q_dtype_a=q_dtype_a if quant_dtype_a is not None else None,
             activation=activation,
             gate_mode=gate_mode,
+            gate_up_interleave=getattr(w1, "gate_up_interleave", None),
             is_shuffled=isShuffled,
             is_g1u1=isG1U1,
             doweight_stage1=doweight_stage1,
@@ -1635,7 +1637,10 @@ def _fused_moe_impl(
                     f"(gfx={get_gfx()!r})"
                 ),
             ),
-            (bias1 is not None or bias2 is not None, "per-expert bias"),
+            (
+                (bias1 is not None or bias2 is not None) and not deterministic,
+                "per-expert bias",
+            ),
             (expert_mask is not None, "expert-parallel masking"),
             (
                 not (isShuffled and isG1U1 and not doweight_stage1),
@@ -1692,7 +1697,6 @@ def _fused_moe_impl(
 
     if deterministic:
         metadata = _deterministic_a16w4_metadata(
-            dtype=dtype,
             inter_dim=inter_dim,
             activation=activation,
             hidden_pad=hidden_pad,
@@ -3393,11 +3397,13 @@ _DETERMINISTIC_BLOCK_M = 32
 
 def _check_deterministic_supported(
     *,
+    dtype,
     quant_type,
     q_dtype_w,
     q_dtype_a,
     activation,
     gate_mode,
+    gate_up_interleave,
     is_shuffled,
     is_g1u1,
     doweight_stage1,
@@ -3419,16 +3425,18 @@ def _check_deterministic_supported(
                 q_dtype_a is not None and q_dtype_a != dtypes.bf16,
                 f"activation dtype {q_dtype_a} (bf16 only)",
             ),
+            (dtype != dtypes.bf16, f"output dtype {dtype} (bf16 only)"),
             (
-                activation
-                not in (
-                    ActivationType.Silu,
-                    ActivationType.Swiglu,
-                    ActivationType.Situv2,
-                ),
+                # SiLU would take the MXFP4 activation-quantization path before both
+                # stages instead of the bf16 inputs these kernels read.
+                activation not in (ActivationType.Swiglu, ActivationType.Situv2),
                 f"activation {activation!s}",
             ),
             (gate_mode != GateMode.SEPARATED, f"gate_mode={gate_mode.value!r}"),
+            (
+                gate_up_interleave is True,
+                "gate/up-interleaved weights (the separated preshuffle only)",
+            ),
             (
                 not (is_shuffled and is_g1u1 and not doweight_stage1),
                 "non-preshuffled / non-g1u1 weights or doweight_stage1=True",
@@ -3444,7 +3452,10 @@ def _check_deterministic_supported(
                 and int(block_size_M) != _DETERMINISTIC_BLOCK_M,
                 f"block_size_M={block_size_M} (uses {_DETERMINISTIC_BLOCK_M})",
             ),
-            (get_gfx() not in ("gfx942", "gfx950"), f"gfx={get_gfx()!r}"),
+            (
+                get_gfx_runtime() not in ("gfx942", "gfx950"),
+                f"gfx={get_gfx_runtime()!r}",
+            ),
         )
         if bad
     ]
@@ -3455,7 +3466,7 @@ def _check_deterministic_supported(
 
 
 def _deterministic_a16w4_metadata(
-    *, dtype, inter_dim, activation, hidden_pad, intermediate_pad
+    *, inter_dim, activation, hidden_pad, intermediate_pad
 ):
     """FlyDSL a16w4 kernels with the non-atomic reduce epilogue and no split-K."""
     from aiter.ops.flydsl.moe_kernels import (
@@ -3464,7 +3475,7 @@ def _deterministic_a16w4_metadata(
         pick_flydsl_stage2_tile_k,
     )
 
-    out_type = "bf16" if dtype == dtypes.bf16 else "f16"
+    out_type = "bf16"  # the reduce epilogue stores bf16 only
     block_m = _DETERMINISTIC_BLOCK_M
     kn1 = flydsl_kernel_name(1, "bf16", "fp4", out_type, block_m, 128, 256)
     kn2 = flydsl_kernel_name(
