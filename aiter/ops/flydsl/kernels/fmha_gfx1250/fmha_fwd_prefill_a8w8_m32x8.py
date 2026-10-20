@@ -629,6 +629,9 @@ def _softmax(
     def fsub_inf(a, b):  # masked s is -inf and must stay -inf: no ninf fast-math here
         return fx.Float32(arith.subf(_raw(a), _raw(b)))
 
+    def fma_inf(a, b, c):  # a*b + c, same no-ninf rule as fsub_inf (-inf*c + finite)
+        return fx.fma(a, b, c)
+
     def exp2(x):
         return fx.exp2(x, fastmath="afn")
 
@@ -677,11 +680,6 @@ def _softmax(
             svec = fx.Vector(_ir(s[kv_frag_idx]))
             for i in range(8):
                 sval = fx.Float32(svec[i])
-                if s_scale is not None:
-                    # 8-bit Q cannot carry softmax_scale*LOG2E, so S is put into log2
-                    # units here instead. Folded in before the mask so the -inf lanes
-                    # stay -inf and the max/sum trees below see log2 units throughout.
-                    sval = sval * s_scale
                 if q_max is not None or q_min is not None or kv_len is not None:
                     kv_pos = _kv_pos_halves[
                         kv_frag_idx >= num_kv_frags // 2
@@ -710,6 +708,11 @@ def _softmax(
     for r in range(num_q_tiles):
         m_prev, q_min = m_prev_list[r], q_min_list[r]
         row_max = fmax(local_max_list[r], peer(local_max_list[r]))
+        # S is left RAW through mask and max tree so the scale has a single consumer
+        # (the exp argument) and folds into its subtract. Valid because the scale is
+        # positive: max(c*S) == c*max(S). One multiply per row, not per element.
+        if s_scale is not None:
+            row_max = fmul(row_max, s_scale)
         m_full = fmax(m_prev, row_max)
 
         # Deferred oaccu rescale: keep m STALE while the running max barely moves, so the
@@ -739,10 +742,18 @@ def _softmax(
     # into v_dual_sub_f32 against their row's shared m_new, and the exp run stays pure
     # TRANS -- the coexecution hazard is TRANS followed by non-TRANS VALU, so an
     # uninterrupted run needs none of the v_nop padding an interleaved one does. ----
-    diff_list = [
-        [fsub_inf(sv, m_new_list[r]) for sv in s_masked_list[r]]
-        for r in range(num_q_tiles)
-    ]
+    if s_scale is None:
+        diff_list = [
+            [fsub_inf(sv, m_new_list[r]) for sv in s_masked_list[r]]
+            for r in range(num_q_tiles)
+        ]
+    else:
+        # exp2(c*S - m) as one fma: the scale's only consumer, so it contracts.
+        neg_m = [fsub(fx.Float32(0.0), m_new_list[r]) for r in range(num_q_tiles)]
+        diff_list = [
+            [fma_inf(sv, s_scale, neg_m[r]) for sv in s_masked_list[r]]
+            for r in range(num_q_tiles)
+        ]
     p_flat_list = [[exp2(d) for d in diff] for diff in diff_list]
     p_list = [
         [
