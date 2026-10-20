@@ -687,7 +687,9 @@ def get_flydsl_stage2_kernels_a16w16(out_dtype: str) -> dict[str, dict]:
     tile_ks = [128, 256]
     tile_ms = [16, 32, 64, 128]
     tile_ns = [128]
-    modes = ["atomic", "reduce"]
+    # bf16 stage2 has no reduce epilogue (int4 only). A "reduce" name still
+    # atomic-scatters into an unzeroed buffer. See ROCm/aiter#6724.
+    modes = ["atomic"]
 
     for tm in tile_ms:
         for tn in tile_ns:
