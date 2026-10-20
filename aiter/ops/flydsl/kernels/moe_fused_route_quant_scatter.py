@@ -1826,7 +1826,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 rocdl.readfirstlane(i32, fx.Uint32(tid // c_wave))
             )
             lane = tid - warp_in_block * c_wave
-            token = bid * arith.constant(warps_per_block, type=i32) + warp_in_block
+            token = bid * fx.Uint32(warps_per_block) + warp_in_block
             rows_t = ptr_buf_tensor(topids_to_rows)
             md_ep = ptr_buf_tensor(ep_rowmap) if const_expr(fuse_ep_psum) else None
             md_w = (
