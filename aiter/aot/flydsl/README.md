@@ -96,10 +96,11 @@ python -m aiter.aot.flydsl.chunk_gdn_h --csv /path/to/tuned.csv
 ### MXFP4 activation and stage2 settings
 
 MXFP4 AOT accepts `--swiglu-limit` for a positive finite SiLU/SwiGLU clamp
-limit. Omitted callers, including batch `run_aot`, read
-`AITER_MXFP4_TUNE_SWIGLU_LIMIT`; an unset or empty variable preserves SwiGLU
-limit 7 and unclamped SiLU/Situv2. Situv2 rejects an explicit limit and retains
-its existing `(beta, linear_beta)` variants `(1, 1)` and `(4, 25)`.
+limit. Omitted standalone callers read `AITER_MXFP4_TUNE_SWIGLU_LIMIT`; an
+unset or empty variable preserves SwiGLU limit 7 and unclamped SiLU/Situv2.
+Batch `run_aot` (including `PREBUILD_KERNELS` installs) ignores the variable
+and always compiles the default limits. Situv2 rejects an explicit limit and
+retains its existing `(beta, linear_beta)` variants `(1, 1)` and `(4, 25)`.
 
 Set the same output switches before tuning, AOT and production:
 `AITER_FLYDSL_STAGE2_FP8=1` selects FP8 route output for reduce, and
@@ -114,9 +115,9 @@ AITER_FLYDSL_STAGE2_FP8=1 AITER_MXFP4_INTERMEDIATE=1 \
   --csv /path/to/limit5-both-winner.csv --swiglu-limit 5
 ```
 
-The full default `run_aot` model corpus includes Situv2 rows. A custom limit
-rejects those rows; select only the CSVs compatible with that activation limit
-when preparing a custom batch.
+The full default `run_aot` model corpus includes Situv2 rows, which reject a
+custom limit. Compile custom-limit kernels with the standalone command above,
+passing only CSVs compatible with that activation limit.
 
 Production receives `swiglu_limit=5` through its explicit API and the same
 stage2 environment. The caller associates each winner CSV with those settings:

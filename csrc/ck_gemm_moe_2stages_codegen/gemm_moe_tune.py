@@ -73,6 +73,7 @@ from aiter.ops.flydsl.moe_kernels import (
     runtime_swiglu_limit,
 )
 from aiter.ops.flydsl.mxfp4_kname import (
+    _is_mxfp4_kname,
     _parse_mxfp4_g1_kname,
     parse_g2_kname_any,
 )
@@ -6724,6 +6725,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
     def pre_process(self, args: "argparse.Namespace | SimpleNamespace") -> "None":
         self._invocation_configuration(args)
+        self._input_file = args.untune_file
         return super().pre_process(args)
 
     def _unsupported_row_reason(
@@ -6768,13 +6770,41 @@ class Mxfp4FlydslTuner(FmoeTuner):
             return "topk must not exceed expert count"
         return None
 
+    @staticmethod
+    def _names_kernel(tunedf: "pd.DataFrame") -> "pd.Series":
+        """Rows naming a kernel are live configs, even without a timing."""
+        names = [c for c in ("kernelName1", "kernelName2") if c in tunedf]
+        kernels = tunedf[names].fillna("").astype(str)
+        return kernels.apply(lambda c: c.str.strip().ne("")).any(axis=1)
+
+    def _drop_superseded_rows(
+        self, tunedf: "pd.DataFrame", dedup_keys: "list[str]"
+    ) -> "pd.DataFrame":
+        """Drop only rows the runtime can never load.
+
+        get_cfg_2stages uses the first row per key, and a later one only as an
+        activation fallback, which skips MXFP4 and CK 2-stage kernels. Rows
+        without a kernel do not shadow later rows.
+        """
+        del dedup_keys
+        configured = self._names_kernel(tunedf)
+        keys = tunedf.loc[configured, self.keys].astype(str)
+        later = keys.duplicated(keep="first").reindex(tunedf.index, fill_value=False)
+        kernel1 = tunedf.get("kernelName1", pd.Series("", index=tunedf.index))
+        kernel2 = tunedf.get("kernelName2", pd.Series("", index=tunedf.index))
+        no_fallback = (
+            kernel1.fillna("").astype(str).str.contains("moe_ck2stages")
+            | kernel1.map(_is_mxfp4_kname)
+            | kernel2.map(_is_mxfp4_kname)
+        )
+        return tunedf[~(later & no_fallback)]
+
     def _already_tuned_mask(self, dedup_cols: "list[str]") -> "pd.Series":
-        times = pd.to_numeric(self.tunedf.get("us"), errors="coerce")
-        valid = self.tunedf[(times > 0) & (times < self.INF_TIME)]
+        configured = self.tunedf[self._names_kernel(self.tunedf)]
         mask = (
             self.untunedf[dedup_cols]
             .apply(tuple, axis=1)
-            .isin(valid[dedup_cols].apply(tuple, axis=1))
+            .isin(configured[dedup_cols].apply(tuple, axis=1))
         )
         unsupported = self.untunedf.apply(
             lambda row: self._unsupported_row_reason(row) is not None, axis=1
@@ -6827,9 +6857,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
     def _normalize_tuned_csv(self, tunedf: "pd.DataFrame") -> "pd.DataFrame":
         tunedf = super()._normalize_tuned_csv(tunedf)
-        # Drop tagged fallback rows before removing the tag column.
+        # Runtime ignores only flydsl_fallback rows; every other tag is live.
         if "_tag" in tunedf:
-            tunedf = tunedf[tunedf["_tag"].fillna("").eq("")].drop(columns="_tag")
+            tags = tunedf["_tag"].fillna("").astype(str).str.strip()
+            tunedf = tunedf[tags.ne("flydsl_fallback")]
         for column in self.columns:
             if column not in tunedf:
                 tunedf[column] = "" if column.startswith("kernelName") else 0
@@ -6850,9 +6881,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
                     0
                 )
         tunedf = tunedf.drop(columns=list(self.input_metadata), errors="ignore")
-        # Keep nt for ordinary fMoE rows in shared files.
-        columns = self.columns + (["nt"] if "nt" in tunedf else [])
-        return tunedf[columns]
+        # Keep columns owned by other rows of shared files (nt, _tag, ...).
+        return tunedf[
+            self.columns + [column for column in tunedf if column not in self.columns]
+        ]
 
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **FmoeTuner.ARG_DEFAULTS,
@@ -8368,18 +8400,19 @@ class Mxfp4FlydslTuner(FmoeTuner):
     def result_to_csv(self, results, file, concat=False):
         del concat
         old_tunedf = self.get_tuned_gemm_list(file, self.columns)
-        old_times = pd.to_numeric(old_tunedf["us"], errors="coerce")
-        # Drop untuned input rows when input and output are the same file.
-        old_tunedf = old_tunedf[(old_times > 0) & (old_times < self.INF_TIME)]
+        input_file = getattr(self, "_input_file", None)
+        if input_file and os.path.realpath(input_file) == os.path.realpath(file):
+            # Drop the untuned input rows of a same-file run.
+            old_tunedf = old_tunedf[self._names_kernel(old_tunedf)]
         times = pd.to_numeric(results["us"], errors="coerce")
         valid = results[(times > 0) & (times < self.INF_TIME)]
         invalid = results[~results.index.isin(valid.index)]
-        resultdf = self.update_tunedf(old_tunedf, valid)
-        self.success = pd.concat([self.success, valid], ignore_index=True)
         self.failed = pd.concat([self.failed, invalid], ignore_index=True)
-        resultdf = self._normalize_tuned_csv(resultdf)
-        resultdf = resultdf.astype(str).drop_duplicates(subset=self.keys, keep="last")
-        resultdf.to_csv(file, index=False)
+        resultdf = self._normalize_tuned_csv(self.update_tunedf(old_tunedf, valid))
+        # The updated row is the first per key; drop rows it made unreachable.
+        self._drop_superseded_rows(resultdf, self.keys).to_csv(file, index=False)
+        # Count winners only once saved; unsaved shapes report as untuned.
+        self.success = pd.concat([self.success, valid], ignore_index=True)
 
 
 def _mxfp4_tune_shape_worker(payload):

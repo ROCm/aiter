@@ -10,6 +10,10 @@ from pathlib import Path
 import pytest
 import torch
 
+from op_tests.tuning_tests._mxfp4_test_process import require_gpu_hidden_process
+
+require_gpu_hidden_process()
+
 from op_tests.tuning_tests.test_mxfp4_tuner import import_moe_tuner
 
 import_moe_tuner()
@@ -101,6 +105,39 @@ def test_situv2_retains_default_parameter_variants_and_rejects_a_custom_limit(
     } == {(1.0, 1.0, float("inf")), (4.0, 25.0, float("inf"))}
     with pytest.raises(ValueError, match="situv2"):
         aot.parse_csv(str(path), swiglu_limit=5)
+
+
+def test_situv2_limit_error_names_the_csv_row_and_limit_source(
+    monkeypatch: "pytest.MonkeyPatch", tmp_path: "Path"
+) -> "None":
+    path = winner_csv(tmp_path, activation="situv2")
+    monkeypatch.setenv("AITER_MXFP4_TUNE_SWIGLU_LIMIT", "5")
+    with pytest.raises(ValueError) as error:
+        aot.parse_csv(str(path))
+    message = str(error.value)
+    assert str(path) in message and "_situv2" in message
+    assert "AITER_MXFP4_TUNE_SWIGLU_LIMIT=5" in message
+
+
+def test_batch_aot_ignores_a_stale_tuning_limit_for_the_default_corpus(
+    monkeypatch: "pytest.MonkeyPatch", tmp_path: "Path"
+) -> "None":
+    from aiter.aot.flydsl.common import OpKind, _collect_aot_jobs_for
+
+    (tmp_path / "situv2").mkdir()
+    (tmp_path / "swiglu").mkdir()
+    situv2 = winner_csv(tmp_path / "situv2", activation="situv2")
+    swiglu = winner_csv(tmp_path / "swiglu")
+    monkeypatch.setattr(aot, "DEFAULT_CSVS", [str(situv2), str(swiglu)])
+    monkeypatch.setenv("AITER_MXFP4_TUNE_SWIGLU_LIMIT", "5")
+    jobs = _collect_aot_jobs_for(OpKind.MXFP4_MOE)
+    limits = {
+        job["swiglu_limit"]
+        for job in jobs
+        if job["stage"] == 1 and "_swiglu" in job["kernel_name"]
+    }
+    assert limits == {7.0}
+    assert os.environ["AITER_MXFP4_TUNE_SWIGLU_LIMIT"] == "5"
 
 
 @pytest.mark.parametrize(

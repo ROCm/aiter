@@ -11,7 +11,7 @@ import os
 import sys
 import threading
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from multiprocessing.connection import Connection
 from multiprocessing.context import BaseContext
 from multiprocessing.process import BaseProcess
@@ -20,6 +20,10 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 import torch
+
+from op_tests.tuning_tests._mxfp4_test_process import require_gpu_hidden_process
+
+require_gpu_hidden_process()
 
 from op_tests.tuning_tests import test_mxfp4_tuner as lifecycle
 from op_tests.tuning_tests.test_mxfp4_tuner import (
@@ -1597,8 +1601,8 @@ class TestStagedSupervisor:
     @pytest.fixture(autouse=True)
     def prohibit_real_shape_workers_and_gpu_data(
         self, monkeypatch: "pytest.MonkeyPatch"
-    ) -> "None":
-        lifecycle.prohibit_real_shape_workers_and_gpu_data.__wrapped__(monkeypatch)
+    ) -> "Iterator[None]":
+        lifecycle.block_real_work(monkeypatch)
 
         def cpu_only_start(process: "BaseProcess") -> "None":
             if process._target not in CPU_WORKERS:
@@ -1606,6 +1610,8 @@ class TestStagedSupervisor:
             return _PROCESS_START(process)
 
         monkeypatch.setattr(BaseProcess, "start", cpu_only_start)
+        with lifecycle.use_default_device("cpu"):
+            yield
 
     def test_staged_supervisor_empty_batch_launches_none_and_one_shape_gets_worker_pid(
         self,

@@ -126,8 +126,10 @@ def parse_csv(
         parse_flydsl_v2_gemm2_kernel,
     )
 
+    limit_source = "swiglu_limit"
     if swiglu_limit is None:
         swiglu_limit = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT") or None
+        limit_source = "AITER_MXFP4_TUNE_SWIGLU_LIMIT"
     # Same opt-in gates as production.
     mxfp4_intermediate = os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") == "1"
     stage2_fp8_route_out = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
@@ -179,7 +181,11 @@ def parse_csv(
                 situ_params = [(1.0, 1.0)]
                 if p1["act"] == "situv2":
                     if swiglu_limit is not None:
-                        raise ValueError("swiglu_limit is not supported for situv2")
+                        raise ValueError(
+                            f"swiglu_limit is not supported for situv2: "
+                            f"{getattr(f, 'name', '<in-memory rows>')} row {kn1} with "
+                            f"{limit_source}={swiglu_limit:g}"
+                        )
                     situ_params.append(
                         (DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA)
                     )
