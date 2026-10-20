@@ -74,17 +74,6 @@ def wait_barrier(count):
     )
 
 
-def read_done_barrier():
-    """Finish this wave's LDS reads, then barrier."""
-    _llvm.inline_asm(
-        res=None,
-        operands_=[],
-        asm_string="s_waitcnt lgkmcnt(0)\ns_barrier",
-        constraints="~{memory}",
-        has_side_effects=True,
-    )
-
-
 class G2SLoader:
     def __init__(self, gl_src, gl_offsets, n_load_steps, lds_dtype, wave_id):
         self.g2lds_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
@@ -458,8 +447,9 @@ def compile_fp8_gemm_8w(
             b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
             a0_frag = a_s2r.load(a_cur0)
             a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
-            # The other wave group refills B0 right after this barrier.
-            read_done_barrier()
+            # The other wave group refills B0 right after this barrier: finish this wave's LDS reads first.
+            rocdl.s_waitcnt(lgkmcnt=0)
+            rocdl.s_barrier()
 
             c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
 
