@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import textwrap
 
 import pytest
 import torch
@@ -14,20 +15,15 @@ from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dynamic_mxfp4_qua
 
 
 def test_activation_imports_in_triton_only_mode():
-    code = """
-from aiter.ops.triton.fusions import activation
-from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
-assert activation.fp8_dtype == get_fp8_e4m3_dtype()
-"""
+    script = textwrap.dedent("""
+        from aiter.ops.triton.fusions import activation
+        from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+
+        assert activation.fp8_dtype == get_fp8_e4m3_dtype()
+        """)
     env = os.environ.copy()
     env["AITER_TRITON_ONLY"] = "1"
-    result = subprocess.run(
-        [sys.executable, "-c", code],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
+    subprocess.run([sys.executable, "-c", script], check=True, env=env)
 
 
 def pad_tensor_2d(tensor, mult_m=256, mult_n=8):

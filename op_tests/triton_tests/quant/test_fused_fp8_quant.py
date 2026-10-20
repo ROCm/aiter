@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import textwrap
 
 import pytest
 import torch
@@ -23,28 +24,36 @@ from aiter.test_common import (
 rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
 
 
-def test_module_imports_in_triton_only_mode():
+def test_fused_fp8_quant_imports_in_triton_only_mode():
     # Load this file directly so the unrelated fused_mxfp4_quant import in
     # quant/__init__.py does not hide this module's aiter.dtypes regression.
-    code = """
-import importlib.util
-from pathlib import Path
-from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
-path = Path("aiter/ops/triton/quant/fused_fp8_quant.py").resolve()
-spec = importlib.util.spec_from_file_location("_fused_fp8_quant_test", path)
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-assert module.fp8_dtype == get_fp8_e4m3_dtype()
-"""
+    module_path = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "..",
+            "aiter",
+            "ops",
+            "triton",
+            "quant",
+            "fused_fp8_quant.py",
+        )
+    )
+    script = textwrap.dedent(f"""
+        import importlib.util
+
+        from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+
+        path = {module_path!r}
+        spec = importlib.util.spec_from_file_location("_fused_fp8_quant_test", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        assert module.fp8_dtype == get_fp8_e4m3_dtype()
+        """)
     env = os.environ.copy()
     env["AITER_TRITON_ONLY"] = "1"
-    result = subprocess.run(
-        [sys.executable, "-c", code],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
+    subprocess.run([sys.executable, "-c", script], check=True, env=env)
 
 
 def rmsnorm(input, weight, eps=1e-6):
