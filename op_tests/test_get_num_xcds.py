@@ -30,31 +30,33 @@ device_info = _load_device_info()
 
 class TestGetNumXcds(unittest.TestCase):
     def test_published_xcd_parts(self):
-        # Active CUs per device and XCDs from the ROCm GPU specification table.
-        # gfx90a (MI210/MI250/MI250X) and gfx908 (MI100) are not here: those
-        # parts have no XCDs. An MI250 GCD is already its own device.
+        # Active CUs per device and XCDs. gfx90a and gfx908 are not here:
+        # those parts have no XCDs. An MI250 GCD is already its own device.
         published = (
             ("gfx942", 304, 8),  # MI300X, MI325X
             ("gfx942", 228, 6),  # MI300A
             ("gfx950", 256, 8),  # MI350X, MI355X
             ("gfx950", 128, 4),  # MI350P
+            ("gfx1250", 256, 8),  # MI455X
         )
         for gfx, cu_num, xcds in published:
             with self.subTest(gfx=gfx, cu_num=cu_num):
                 self.assertEqual(device_info._xcds_for_part(gfx, cu_num), xcds)
 
-    def test_unlisted_part_defaults_to_eight_xcds(self):
-        # 120 CUs can hold 8 XCDs. A 1-CU part cannot, so it is not the example.
-        self.assertEqual(device_info._xcds_for_part("gfx942", 120), 8)
-
-    def test_non_xcd_arch_returns_one(self):
+    def test_other_cases_return_one(self):
         # One L2 domain per HIP device. 0 would divide by zero in remap_xcd
         # and in mla_gluon's batch // NUM_XCDS.
         for gfx, cu_num in (
-            ("gfx906", 64),
-            ("gfx908", 120),
-            ("gfx90a", 104),
-            ("gfx90a", 110),
+            ("gfx906", 64),  # CDNA1
+            ("gfx908", 120),  # CDNA1, MI100
+            ("gfx90a", 104),  # CDNA2, MI210 / MI250 per GCD
+            ("gfx90a", 110),  # CDNA2, MI250X per GCD
+            ("gfx942", 80),  # MI308X: XCD count is not known
+            ("gfx942", 120),  # unlisted gfx942
+            ("gfx1100", 96),  # RDNA3
+            ("gfx1200", 32),  # RDNA4
+            ("gfx1201", 64),  # RDNA4
+            ("gfx1250", 128),  # unlisted CDNA5
         ):
             with self.subTest(gfx=gfx, cu_num=cu_num):
                 self.assertEqual(device_info._xcds_for_part(gfx, cu_num), 1)

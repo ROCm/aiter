@@ -31,23 +31,19 @@ def get_num_sms():
 # Kernels use the XCD count to keep workgroups that share data on one L2.
 # ROCm 7+ reports the live count through hipDeviceAttributeNumberOfXccs,
 # including partition mode. Older runtimes do not, so those releases keep
-# this table. An unlisted gfx942 or gfx950 CU count still returns 8.
-# Any other arch is one L2 domain per HIP device, so it returns 1.
+# this table. Every other arch and every unlisted CU count returns 1.
 # 0 is not a usable count: callers divide and modulo by it.
-# Counts are active CUs per device, from the ROCm GPU specification table.
-_XCD_ARCHS = frozenset({"gfx942", "gfx950"})
 _XCDS_BY_GFX_AND_CU_NUM = {
     ("gfx942", 304): 8,  # MI300X, MI325X: 8 XCDs x 38 CUs
     ("gfx942", 228): 6,  # MI300A: 6 XCDs x 38 CUs
     ("gfx950", 256): 8,  # MI350X, MI355X: 8 XCDs x 32 CUs
     ("gfx950", 128): 4,  # MI350P: 4 XCDs x 32 CUs
+    ("gfx1250", 256): 8,  # MI455X: 8 XCDs x 32 WGPs
 }
 
 
 def _xcds_for_part(gfx: str, cu_num: int) -> int:
-    if gfx not in _XCD_ARCHS:
-        return 1
-    return _XCDS_BY_GFX_AND_CU_NUM.get((gfx, cu_num), 8)
+    return _XCDS_BY_GFX_AND_CU_NUM.get((gfx, cu_num), 1)
 
 
 def _xcds_from_known_part() -> int:
@@ -56,7 +52,7 @@ def _xcds_from_known_part() -> int:
 
         return _xcds_for_part(get_gfx_runtime(), get_cu_num())
     except Exception:  # noqa: BLE001
-        return 8
+        return 1
 
 
 def _rocm_major():
@@ -114,10 +110,10 @@ def get_num_xcds(device_id=None) -> int:
     """Return the number of XCDs visible on ``device_id``.
 
     On ROCm 7 and newer this is ``hipDeviceAttributeNumberOfXccs``. Earlier
-    releases use the architecture and CU count. gfx942 and gfx950 parts that
-    are not in the table return 8. Other architectures return 1, because each
-    HIP device is one L2 domain. An undetected ROCm version tries the query
-    first.
+    releases use the architecture and CU count. Only the CDNA3, CDNA4, and
+    CDNA5 parts in the table have a known XCD count. Every other case returns
+    1, because callers divide by the count and one L2 domain is an identity
+    remap. An undetected ROCm version tries the query first.
     """
     major = _rocm_major()
     if major is None or major >= 7:
