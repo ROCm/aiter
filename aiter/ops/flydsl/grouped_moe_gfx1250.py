@@ -1228,6 +1228,7 @@ def _grouped_a8w4_tdm_moe(
                     prequantized_scale=src_a1_scale if _prequantized else None,
                     out_payload=a1_payload,
                     out_scale=a1_scale,
+                    row_to_token=_apre_row_to_token,
                     row_major_scale=_row_major_a1,
                     payload_preshuffled=a_preshuffled,
                 ),
