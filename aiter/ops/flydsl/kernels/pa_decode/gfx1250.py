@@ -5,10 +5,11 @@
 
 Four waves split 64- or 128-token compute tiles within each 256-token plan tile.
 FP8 D128/D256/page128+ full attention uses 128-token tiles and K128 QK/PV WMMA.
-Per-token FP8 D128/D256 transposed caches with one query tile, and
+FP8 D128/D256 transposed caches with one query tile, and
 D256/G8/MTP4/page128 full attention with two query tiles, keep their packed
 layout without TDM transposition or row padding. D256/page128 full attention
-uses two buffers and asynchronous scale copies to overlap memory transfers.
+uses two buffers to overlap memory transfers, with asynchronous scale copies
+for per-token quantization.
 WMMA accumulates into a rescaled running output; empty tiles retain its scale.
 Other TDM/vector DMA paths alternate LDS buffers where capacity permits.
 FP8 Q and P use native eight-element conversion; BF16 uses K32 WMMA.
@@ -109,11 +110,11 @@ class Gfx1250Traits:
 
     @property
     def packed_lds(self):
+        # FP8 cache layout is independent of scalar or per-token scales.
         # Two fused query tiles reuse the packed page and K128 WMMA path for
         # measured D256/G8/MTP4 full attention, without extra KV fetches.
         return (
             not self.bf16
-            and self.per_token_kv
             and self.head_dim in (128, 256)
             and self.block_size >= 64
             and self.trans_v
@@ -182,11 +183,16 @@ class Gfx1250Traits:
 
     @property
     def use_tdm(self):
-        # FP8 per-token D128+ benefits from scalar address generation; D64
-        # and scalar scales measured faster with vector DMA. BF16 descriptors
-        # fit D64–512. Row padding requires a power-of-two interval <= 1024 bytes.
+        # Packed FP8 tiles retain the cache layout for TDM transfers. Other
+        # per-token D128+ tiles also benefit from scalar address generation.
+        # BF16 descriptors fit D64–512; row padding requires a power-of-two
+        # interval <= 1024 bytes.
         return (
-            (self.bf16 or (self.per_token_kv and self.head_dim >= 128))
+            (
+                self.bf16
+                or self.packed_lds
+                or (self.per_token_kv and self.head_dim >= 128)
+            )
             and self.head_dim * self.elem_bytes <= 1024
             and self.head_dim & (self.head_dim - 1) == 0
         )
@@ -585,7 +591,7 @@ class Gfx1250Memory:
         else:
             self.stage_vector_dma(token_base, kv_off)
 
-        if const_expr(t.async_page and full_tile):
+        if const_expr(t.async_page and full_tile and t.per_token_kv):
             # One wave copies four FP32 scales per lane directly into LDS.
             # Waiting on ASYNC_CNT at consumption avoids the load/store drain
             # that otherwise serializes K/V staging with scale staging.
@@ -872,6 +878,12 @@ class Gfx1250Pipeline:
             elif const_expr(not t.bf16):
                 vs = fx.recast_iter(fx.Float32, ctx.value_scale_ptr)
                 vfactor = fx.Float32(vs[0]) * fx.Float32(1.0 / t.FP8_MAX)
+                if const_expr(t.packed_lds):
+                    # The fused accumulator carries unscaled V until epilogue.
+                    # A zero scalar V scale must produce zero without 0 * inf.
+                    vnorm = fx.Float32(
+                        rcp_f32((vfactor != 0.0).select(vfactor, fx.Float32(1.0)))
+                    )
             next_state = []
             for m in range_constexpr(t.m_tiles):
                 if const_expr(t.q_tiles != t.m_tiles):
