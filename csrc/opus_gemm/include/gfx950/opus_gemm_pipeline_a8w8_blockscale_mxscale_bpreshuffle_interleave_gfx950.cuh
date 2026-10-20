@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-// Layouts originate from the FlyDSL 8-wave adaptation; the OPUS main loop
-// streams N fragments with uniform block barriers and two B register slots.
 #pragma once
 
 #include <opus/hip_minimal.hpp>

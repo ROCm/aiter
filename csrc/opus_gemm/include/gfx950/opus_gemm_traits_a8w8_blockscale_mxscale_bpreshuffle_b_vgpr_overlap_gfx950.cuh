@@ -3,7 +3,6 @@
 
 #include "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
 
-// Prefetch geometry with a configurable LDS publication point.
 template<int BM, int BN, int NB, int BD, int BC = 0, bool XCD = false,
     int FixedK = 7168, int WN = 4, int WGPerCU = 1, int ACache = 0, int StoreCache = 2,
     int Output = 0, int BlockK = 256, bool Contiguous = false,

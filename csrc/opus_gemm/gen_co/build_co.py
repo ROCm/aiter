@@ -30,10 +30,6 @@ are identical::
 
     .co filename == extern "C" symbol inside the .co == host launcher symbol
 
-gfx950 stores each image as ``gfx950/<CSV kernelName>.co``. Only the actual
-configuration differences needed to distinguish each image appear as suffixes;
-the same name is compiled into the device image and host launcher.
-
 The compiler is NOT pinned to a version
 ---------------------------------------
 ``--llvm-bin`` just says which toolchain to use; nothing here checks what it is.
@@ -70,7 +66,6 @@ _OPUS_GEMM_DIR = os.path.dirname(_HERE)  # csrc/opus_gemm
 _CSRC_DIR = os.path.dirname(_OPUS_GEMM_DIR)  # csrc
 _REPO_ROOT = os.path.dirname(_CSRC_DIR)
 
-# opus_gemm_common / codegen.* are imported the same way gen_instances.py does.
 sys.path.insert(0, _OPUS_GEMM_DIR)
 sys.path.insert(0, _REPO_ROOT)
 
@@ -96,9 +91,6 @@ from aiter_worker_limits import (
     get_worker_count_for,
 )
 
-# Every pre-compiled family and the pipeline header each one's device body
-# lives in. The rest of the stub (traits/kargs/body names) comes from the
-# codegen maps, so a new family is one row here plus one row there.
 _PIPELINE_HEADERS = {
     "a16w16_4wave_co": "opus_gemm_pipeline_a16w16_4wave_compute_gfx1250.cuh",
     "a16w16_4wave_wl_co": "opus_gemm_pipeline_a16w16_4wave_wl_gfx1250.cuh",
@@ -214,8 +206,6 @@ def _kernel_metadata(
 ):
     """Read the requested integer fields from a single-kernel AMDGPU note."""
     out = _run([readelf, "--notes", path]).stdout
-    # One kernel per .co, so a flat scan is enough -- but assert that, because
-    # a second kernel would make the numbers ambiguous.
     names = re.findall(r"^\s*\.name:\s*(\S+)\s*$", out, re.MULTILINE)
     if names != [symbol]:
         raise ValueError(
@@ -400,8 +390,6 @@ def _expected_lds(k, no_pad=False):
 
     Including the 1-WG/CU pad: a tile whose A/B segments fit twice in the
     320 KB budget is padded past 160 KB so a second workgroup cannot co-reside.
-    Keep this in step with LDS_BYTES in the traits -- the check below compares
-    the two and is the reason the drift was caught rather than shipped.
 
     ``no_pad`` mirrors -DOPUS_CO_NO_1WG_PAD, the debug switch that puts the
     padded variants back at 2 WG/CU.
@@ -423,15 +411,6 @@ _WMMA_DST = re.compile(r"v_wmma\S*\s+v\[(\d+):\d+\]\s*(?:/\*v\[(\d+):)?")
 
 
 def _asm_stats(text, prefix):
-    """The numbers that used to be enforced by --min-vgpr, now RECORDED instead
-    of judged: with several VGPR budgets in the table there is no single
-    threshold that means "the pin was honoured". Compare them across builds.
-
-    va_vdst(0) counts the full VALU->VMEM drains the pinning exists to avoid
-    (21 in the pinned reference, 160 unpinned); wmma_dst_hi says whether the
-    accumulators actually landed in the high register file (768/768 pinned,
-    0/768 unpinned).
-    """
     lines = text.splitlines()
     hi = total = 0
     for ln in lines:
@@ -511,8 +490,6 @@ def build_one(k, args, llvm_bin, workdir):
             sys.stderr.write(proc.stderr)
             raise SystemExit(f"build_co: hipcc failed for {symbol} ({what})")
         if proc.stderr.strip():
-            # Warnings are worth seeing: a dropped attribute here is exactly the
-            # failure mode this whole offline path exists to avoid.
             sys.stderr.write(proc.stderr)
 
     print(f"[build_co] compiling {symbol}")
@@ -580,10 +557,6 @@ def build_one(k, args, llvm_bin, workdir):
             "s": os.path.relpath(s_path, args.out_dir),
             "dis": os.path.relpath(dis_path, args.out_dir),
         }
-        # Both, because they count different things: the listing carries the
-        # directives and scheduling comments (and is what the historical
-        # 6463-line / 21 va_vdst(0) / 768 WMMA reference numbers came from),
-        # while the disassembly is the artifact that actually ships.
         with open(s_path) as f:
             info.update(_asm_stats(f.read(), "asm_"))
         info.update(_asm_stats(dis, "dis_"))
@@ -709,10 +682,6 @@ def main():
         if jobs == 1:
             built = [build(k, args, llvm_bin, workdir) for k in instances]
         else:
-            # One hipcc per entry and they share nothing but the read-only headers,
-            # so this is embarrassingly parallel. A full sweep is thousands of
-            # entries; serially that is hours, and the box has hundreds of cores.
-            # Threads, not processes: every worker spends its life in subprocess.
             from concurrent.futures import ThreadPoolExecutor
 
             print(f"[build_co] {len(instances)} entries on {jobs} jobs")

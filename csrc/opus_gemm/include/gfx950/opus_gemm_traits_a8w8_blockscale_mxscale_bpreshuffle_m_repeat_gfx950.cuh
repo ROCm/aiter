@@ -3,7 +3,6 @@
 
 #include <opus/opus.hpp>
 
-// Double-buffered LDS panel with matrix/scale overlap and staged output.
 template<int BlockM = 192, int BlockN = 256, int ScalePanel = 128, int FixedK = 0,
     int WaveM = 4, int GroupM = 0, int CacheA = 0, int CacheB = 0,
     bool FragmentArrays = false, bool PinA = false, bool PinB = false, bool PinC = false,

@@ -2925,7 +2925,6 @@ def _bpreshuffle_geometry_name(pipeline, fields, *, co):
 
 
 def a8w8_mxscale_bpreshuffle_kernel_name(instance):
-    """Name shared by tuned CSV rows and CO image basenames."""
     if instance.bpreshuffle_co is not None:
         return os.path.splitext(instance.bpreshuffle_co["image"])[0]
     entry = instance.bpreshuffle_co or instance.bpreshuffle_entry
@@ -2995,7 +2994,6 @@ def _load_gfx950_co_kernels(path):
             (1, 128, 128),
         )
         name = _bpreshuffle_geometry_name(entry["pipeline"], fields, co=True)
-        # Persist only the actual differences needed to distinguish this image.
         suffix = document["image_suffixes"][str(kid)]
         symbol = name + (f"_{suffix}" if suffix else "")
         image = symbol + ".co"
@@ -3133,8 +3131,7 @@ def _m_repeat_generic_signature(instance):
     )
 
 
-# Existing paired tuning records: 950123/95063 (15 shapes) and 950125/950120
-# (59 shapes) show geometric mean speedups of 0.53% and 0.63%, respectively.
+# Fixed-K variants with measured benefit.
 GFX950_FIXED_K_TUNE_KIDS = frozenset((950123, 950125))
 
 
@@ -3411,14 +3408,6 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
         ),
         "a8w8": frozenset({"a8w8"}),
         "a8w8_blockscale": frozenset({"a8w8_scale"}),
-        # Keep in step with _A8W8_MXSCALE_BMM_TAGS in aiter/ops/opus/launch_plan.py.
-        # They are two hand-maintained copies of the same list and both are
-        # consulted, this one first: get_kernel_instance rejects a kid whose tag
-        # is missing here before the plan builder ever checks its own copy. A tag
-        # added to only one of them therefore looks like "no registered OPUS
-        # kernel", which reads as a missing kernel rather than a missing list
-        # entry -- that is exactly how all 133 preshuffled rows were dropped
-        # while the kids were present in kernels_list the whole time.
         "a8w8_mxscale_bmm": frozenset(
             {
                 "a8w8_mxscale_bmm_flatmm_splitk",
@@ -3429,9 +3418,6 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
                 "a8w8_mxscale_bmm_pipeline",
                 "a8w8_mxscale_bmm_wave8n2",
                 "a8w8_mxscale_bmm_wave4m2_selfload",
-                # The preshuffled-B families: unreachable upstream, where gfx950
-                # preshuffle is off, but every row of the preshuffled tuned table
-                # names one.
                 "a8w8_mxscale_bmm_bpreshuffle_bdirect",
                 "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen",
                 "a8w8_mxscale_bmm_bpreshuffle_blds",

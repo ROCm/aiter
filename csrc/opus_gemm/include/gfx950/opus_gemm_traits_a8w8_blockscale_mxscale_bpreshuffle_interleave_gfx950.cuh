@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-// Two wave groups alternate operand staging and scaled MFMA.
 template<int BlockM = 256, int FixedK = 0, int GroupM = 4, bool XcdOrder = true,
     int CacheA = 0, int CacheB = 0, int WaveN = 4>
 struct opus_gemm_bpreshuffle_wave_interleave_traits {

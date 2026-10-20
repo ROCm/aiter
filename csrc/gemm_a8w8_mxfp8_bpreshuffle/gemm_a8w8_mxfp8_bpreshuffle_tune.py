@@ -56,7 +56,6 @@ MXSCALE_TUNED_FILE = "aiter/configs/model_configs/dsv4_a8w8_blockscale_mxscale_b
 # The block of a shape list without a w_scale_block column, and of a tuned
 # table from before the column.
 W_SCALE_BLOCK = "1x32"
-# w_scale block -> the pipelines tuned for it.
 PIPELINES_BY_W_SCALE_BLOCK = {
     "1x32": MXFP8_ROW_PIPELINES,
     "32x32": MXFP8_ROW_W32X32_PIPELINES,
@@ -108,7 +107,6 @@ def run_torch(x_deq, w_deq, dtype=dtypes.bf16):
 
 
 def opus_kernel_name(kid):
-    """CSV name in the usual OPUS geometry order; dispatch uses the exact kid."""
     from csrc.opus_gemm.opus_gemm_common import (
         a8w8_mxscale_gemm_bpreshuffle_kernels_list,
         a8w8_mxscale_bpreshuffle_kernel_name,
@@ -162,7 +160,6 @@ def _opus_geometry_cost(geometry, shape, cu_num):
 def _opus_filtered_candidates(
     candidates, shape, cu_num, seed_kids=(), top_geometries=4
 ):
-    """Choose geometry, schedule and pin candidates before any measurement."""
     from csrc.opus_gemm.opus_gemm_common import (
         a8w8_mxscale_bpreshuffle_tune_candidates,
     )
@@ -433,7 +430,6 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
     def get_tuned_gemm_list(self, tuned_gemm_file, columns=None):
         df = super().get_tuned_gemm_list(tuned_gemm_file, columns)
         df = with_mxscale_w_scale_block(df, tuned_gemm_file, default=W_SCALE_BLOCK)
-        # A table from before the column gets it where the tuner writes it.
         rest = [c for c in df.columns if c not in self.keys]
         return df[[c for c in self.keys if c in df.columns] + rest]
 
@@ -514,8 +510,6 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         self._mxscale_table = bool(getattr(args, "mxscale_table", False))
         coarse = sorted(set(untunedf["w_scale_block"]) - {W_SCALE_BLOCK})
         if coarse and not self._mxscale_table:
-            # gemm_a8w8_mxfp8_bpreshuffle serves 1x32 only; these blocks run
-            # through gemm_a8w8_blockscale_bpreshuffle's table, tuned with bmm.
             raise ValueError(
                 f"w_scale block {coarse} is tuned for gemm_a8w8_blockscale_"
                 f"bpreshuffle only: pass --mxscale_table"
@@ -538,7 +532,6 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             K = int(untunedf.loc[i, "K"])
             block = str(untunedf.loc[i, "w_scale_block"])
             info_keys = (gfx, cu_num, M, N, K, block)
-            # One pass per pipeline of the block, in their order.
             opus = opus_by_shape.get((M, N, K), ()) if block == "128x128" else ()
             cands = [
                 (kernel_id, ki)
@@ -756,7 +749,6 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
 
 
 if __name__ == "__main__":
-    # Same columns as the table the gfx1250 rows already live in.
     key = ["gfx", "cu_num", "M", "N", "K", "w_scale_block"]
     resultList = [
         "libtype",

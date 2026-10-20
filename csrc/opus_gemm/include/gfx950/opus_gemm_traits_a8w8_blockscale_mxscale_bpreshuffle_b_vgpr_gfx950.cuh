@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-// Tile geometry, operand-ring sizes, cache policies and resource limits.
 template<int BM, int BN, int NB, int BD, int BC = 0, bool XCD = false,
     int FixedK = 7168, int WN = 4, int WGPerCU = 1, int ACache = 0, int StoreCache = 2,
     int Output = 0, int BlockK = 256, bool Contiguous = false,
