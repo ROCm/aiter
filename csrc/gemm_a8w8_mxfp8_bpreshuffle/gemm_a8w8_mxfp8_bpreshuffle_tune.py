@@ -17,8 +17,11 @@ the only one the 32x32 (w_scale [N/32, K/32], as bmm's) and 128x128 blocks
 (w_scale [N/128, K/128], x_scale 1x128 as its column-major bytes) have: the
 batched GEMM at B = 1 (bmm) joins as a third backend on them (its candidates:
 the table's tuned bmm kernels for M/2..2M, its heuristic pick, and their
-split-K neighbours). FlyDSL rows use kernelId "mxfp8" or "bmm"; OPUS supports
-128x128 blocks with libtype "opus" and a numeric kernelId:
+split-K neighbours). With --libtype both (default), OPUS joins on 128x128:
+shape filtering selects up to four geometries per pipeline, including their
+schedule and pin variants and the saved winner, before a single measurement
+pass alongside FlyDSL. FlyDSL rows use kernelId "mxfp8" or "bmm"; OPUS rows
+use libtype "opus" and a numeric kernelId:
 
     python3 csrc/gemm_a8w8_mxfp8_bpreshuffle/gemm_a8w8_mxfp8_bpreshuffle_tune.py \\
         --mxscale_table \\
@@ -26,11 +29,10 @@ split-K neighbours). FlyDSL rows use kernelId "mxfp8" or "bmm"; OPUS supports
         -o aiter/configs/model_configs/dsv4_a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv
 """
 
-import argparse
 import math
 import os
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -105,14 +107,33 @@ def run_torch(x_deq, w_deq, dtype=dtypes.bf16):
     return F.linear(x_deq, w_deq).to(dtype)
 
 
-def parse_opus_kids(value):
-    try:
-        kids = [int(item.strip()) for item in value.split(",")]
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("--opus-kids requires integer IDs") from exc
-    if not kids or min(kids) < 0 or len(kids) != len(set(kids)):
-        raise argparse.ArgumentTypeError("--opus-kids requires unique nonnegative IDs")
-    return frozenset(kids)
+def opus_kernel_name(kid):
+    """CSV name in the usual OPUS geometry order; dispatch uses the exact kid."""
+    from csrc.opus_gemm.opus_gemm_common import (
+        a8w8_mxscale_gemm_bpreshuffle_kernels_list,
+    )
+
+    instance = a8w8_mxscale_gemm_bpreshuffle_kernels_list[int(kid)]
+    entry = instance.bpreshuffle_co or instance.bpreshuffle_entry
+    family = {
+        "pin_agpr": "4wave_pin_agpr_co",
+        "pingpong_lds": "m_repeat_co",
+        "prefetch_b_vgpr": (
+            "b_vgpr_co" if instance.bpreshuffle_co else "prefetch_b_vgpr"
+        ),
+        "prefetch_b_vgpr_overlap": "b_vgpr_overlap_co",
+        "wave_interleave": "interleave_co",
+    }[entry["pipeline"]]
+    fields = (
+        (instance.BLOCK_SIZE, instance.B_M, instance.B_N, instance.B_K),
+        (instance.T_M, instance.T_N),
+        (instance.W_M, instance.W_N, instance.W_K),
+        (instance.GROUP_M, instance.GROUP_N, instance.GROUP_K),
+    )
+    return "_".join(
+        ("opus_gemm", instance.arch_prefix, family)
+        + tuple("x".join(map(str, values)) for values in fields)
+    )
 
 
 def opus_candidates(m, n, k, kids=None):
@@ -126,6 +147,58 @@ def opus_candidates(m, n, k, kids=None):
         for kid in candidate_kids_for_shape("gfx950", m, n, k)
         if kids is None or kid in kids
     ]
+
+
+def _opus_geometry(instance):
+    entry = instance.bpreshuffle_co or instance.bpreshuffle_entry
+    return (
+        entry["pipeline"],
+        instance.B_M,
+        instance.B_N,
+        instance.B_K,
+        instance.T_M,
+        instance.T_N,
+    )
+
+
+def _opus_geometry_cost(geometry, shape, cu_num):
+    _, bm, bn, _, _, _ = geometry
+    m, n, _ = shape
+    tiles = math.ceil(m / bm) * math.ceil(n / bn)
+    padding = math.ceil(m / bm) * bm / m * math.ceil(n / bn) * bn / n
+    occupancy = tiles / max(cu_num, 1)
+    return (
+        padding
+        - 1
+        + 2 * max(0, 1 - occupancy)
+        + 0.1 * (math.ceil(occupancy) / occupancy - 1)
+        + 8 / bm
+        + 8 / bn
+    )
+
+
+def _opus_filtered_candidates(
+    candidates, shape, cu_num, seed_kids=(), top_geometries=4
+):
+    """Choose geometry, schedule and pin candidates before any measurement."""
+    groups = defaultdict(list)
+    for kid, instance in candidates:
+        groups[_opus_geometry(instance)].append(kid)
+    by_pipeline = defaultdict(list)
+    for geometry in groups:
+        by_pipeline[geometry[0]].append(geometry)
+    retained = {
+        geometry
+        for geometries in by_pipeline.values()
+        for geometry in sorted(
+            geometries,
+            key=lambda item: (_opus_geometry_cost(item, shape, cu_num), item),
+        )[:top_geometries]
+    }
+    legal = {kid for kid, _ in candidates}
+    selected = {kid for geometry in retained for kid in groups[geometry]}
+    selected.update(set(seed_kids) & legal)
+    return sorted(selected), len(retained)
 
 
 def opus_available_kids():
@@ -298,7 +371,9 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
 
         _op._get_mxfp8_bpreshuffle_config.cache_clear()
         _op._load_mxfp8_bpreshuffle_tuned.cache_clear()
-        _op.get_mxscale_bpreshuffle_config.cache_clear()
+        getattr(
+            _op, "_get_mxscale_bpreshuffle_config", _op.get_mxscale_bpreshuffle_config
+        ).cache_clear()
         _op._load_mxscale_bpreshuffle_tuned.cache_clear()
         _op._CKGEMM_CONFIG_CACHE.clear()
         _op._CKGEMM_HAS_GFX.clear()
@@ -309,35 +384,15 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             action="store_true",
             help="Tune gemm_a8w8_blockscale_bpreshuffle's e8m0 table: bmm (the "
             "batched GEMM at B = 1) joins on 32x32 / 128x128; OPUS JIT/CO "
-            "joins on 128x128. A shape list without a block column uses 128x128.",
+            "joins on 128x128.",
         )
         self.parser.add_argument(
             "--libtype",
             choices=("both", "opus", "flydsl"),
             default="both",
-            help="Backends to search; OPUS requires --mxscale_table and 128x128. "
+            help="Backends to search; OPUS filters candidates before a single measurement pass "
+            "and requires --mxscale_table and 128x128. "
             "Prebuild COs with csrc/opus_gemm/gen_co/build_co.py --arch gfx950.",
-        )
-        self.parser.add_argument(
-            "--opus-kids",
-            type=parse_opus_kids,
-            help="Optional comma-separated OPUS IDs; defaults to all available legal candidates.",
-        )
-        self.parser.add_argument(
-            "--compare-upstream",
-            action="store_true",
-            help="Compare current OPUS against FlyDSL BMM and GEMM #6603 using all saved BMM seeds.",
-        )
-        self.parser.add_argument(
-            "--bmm-seeds",
-            type=Path,
-            help="Additional saved BMM rows in the standard tuned CSV format.",
-        )
-        self.parser.add_argument(
-            "--flydsl-candidates",
-            type=Path,
-            help="Optional per-shape FlyDSL shortlist CSV (M,N,K,w_scale_block,kernelName). "
-            "Only listed legal BMM and PR6603 candidates are timed; OPUS search is unchanged.",
         )
 
     def pre_process(self, args):
@@ -349,25 +404,11 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             }
             if args.tune_file == TUNED_FILE:
                 args.tune_file = MXSCALE_TUNED_FILE
-        elif args.libtype == "opus" or args.opus_kids is not None:
+        elif args.libtype == "opus":
             self.parser.error("OPUS tuning requires --mxscale_table")
-        if args.compare_upstream and not args.mxscale_table:
-            self.parser.error("--compare-upstream requires --mxscale_table")
-        if args.libtype == "flydsl" and args.opus_kids is not None:
-            self.parser.error("--opus-kids requires --libtype opus or both")
-        if args.opus_kids is not None:
-            from csrc.opus_gemm.opus_gemm_common import (
-                a8w8_mxscale_gemm_bpreshuffle_kernels_list,
-            )
-
-            unknown = args.opus_kids.difference(
-                a8w8_mxscale_gemm_bpreshuffle_kernels_list
-            )
-            if unknown:
-                self.parser.error(f"Unknown or unavailable OPUS IDs: {sorted(unknown)}")
         super().pre_process(args)
 
-    def _bmm_seeds(self, extra_path=None):
+    def _bmm_seeds(self):
         """{(N, K, w_scale_block): [(M, bmm kernelName)]} of the tuned
         gemm_a8w8_blockscale_bpreshuffle table, this arch and CU count."""
         from aiter.jit.core import AITER_CONFIGS
@@ -376,11 +417,6 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         try:
             df = with_mxscale_w_scale_block(pd.read_csv(path), path)
         except (OSError, pd.errors.EmptyDataError):
-            df = pd.DataFrame()
-        if extra_path is not None:
-            extra = with_mxscale_w_scale_block(pd.read_csv(extra_path), extra_path)
-            df = pd.concat((df, extra), ignore_index=True)
-        if df.empty:
             return {}
         df = df[
             (df["gfx"] == self.get_gfx())
@@ -395,12 +431,9 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
 
     def get_untuned_gemm_list(self, untuned_gemm_file):
         df = super().get_untuned_gemm_list(untuned_gemm_file)
-        default_block = (
-            "128x128" if getattr(self, "_mxscale_table", False) else W_SCALE_BLOCK
-        )
         if "w_scale_block" not in df.columns:
-            df["w_scale_block"] = default_block
-        df["w_scale_block"] = df["w_scale_block"].fillna(default_block)
+            df["w_scale_block"] = W_SCALE_BLOCK
+        df["w_scale_block"] = df["w_scale_block"].fillna(W_SCALE_BLOCK)
         unknown = set(df["w_scale_block"]) - set(PIPELINES_BY_W_SCALE_BLOCK)
         if unknown:
             raise ValueError(
@@ -411,10 +444,7 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
 
     def get_tuned_gemm_list(self, tuned_gemm_file, columns=None):
         df = super().get_tuned_gemm_list(tuned_gemm_file, columns)
-        default_block = (
-            "128x128" if getattr(self, "_mxscale_table", False) else W_SCALE_BLOCK
-        )
-        df = with_mxscale_w_scale_block(df, tuned_gemm_file, default=default_block)
+        df = with_mxscale_w_scale_block(df, tuned_gemm_file, default=W_SCALE_BLOCK)
         # A table from before the column gets it where the tuner writes it.
         rest = [c for c in df.columns if c not in self.keys]
         return df[[c for c in self.keys if c in df.columns] + rest]
@@ -502,51 +532,23 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                 f"w_scale block {coarse} is tuned for gemm_a8w8_blockscale_"
                 f"bpreshuffle only: pass --mxscale_table"
             )
-        seeds = self._bmm_seeds(args.bmm_seeds) if self._mxscale_table else {}
-        flydsl_shortlist = None
-        if getattr(args, "flydsl_candidates", None) is not None:
-            shortlist = pd.read_csv(args.flydsl_candidates)
-            required = ["M", "N", "K", "w_scale_block", "kernelName"]
-            if not set(required).issubset(shortlist.columns):
-                raise ValueError(f"--flydsl-candidates requires columns {required}")
-            flydsl_shortlist = {}
-            for row in shortlist.itertuples():
-                key = (int(row.M), int(row.N), int(row.K), str(row.w_scale_block))
-                flydsl_shortlist.setdefault(key, set()).add(str(row.kernelName))
-        comparison_seeds = {}
-        if args.compare_upstream:
-            for (n, k, block), entries in seeds.items():
-                comparison_seeds.setdefault(block, set()).update(
-                    name for _, name in entries
-                )
+        seeds = self._bmm_seeds() if self._mxscale_table else {}
         opus_by_shape = {}
         if args.libtype != "flydsl" and self._mxscale_table:
             if args.libtype == "opus" and set(untunedf.w_scale_block) != {"128x128"}:
                 raise ValueError("OPUS supports A 1x128 / B 128x128 scales only")
-            opus_kids = (
-                args.opus_kids if args.opus_kids is not None else opus_available_kids()
-            )
+            opus_kids = opus_available_kids()
             for row in untunedf.itertuples():
                 if row.w_scale_block == "128x128":
                     shape = (int(row.M), int(row.N), int(row.K))
                     opus_by_shape[shape] = opus_candidates(*shape, opus_kids)
                     if args.libtype == "opus" and not opus_by_shape[shape]:
                         raise ValueError(f"No OPUS candidate supports {shape}")
-            ensure_opus_kids_compiled(
-                {kid for candidates in opus_by_shape.values() for kid, _ in candidates}
-            )
         for i in range(len(untunedf)):
             M = int(untunedf.loc[i, "M"])
             N = int(untunedf.loc[i, "N"])
             K = int(untunedf.loc[i, "K"])
             block = str(untunedf.loc[i, "w_scale_block"])
-            allowed_flydsl = (
-                None
-                if flydsl_shortlist is None
-                else flydsl_shortlist.get((M, N, K, block))
-            )
-            if flydsl_shortlist is not None and not allowed_flydsl:
-                raise ValueError(f"No FlyDSL shortlist for {(M, N, K, block)}")
             info_keys = (gfx, cu_num, M, N, K, block)
             # One pass per pipeline of the block, in their order.
             opus = opus_by_shape.get((M, N, K), ()) if block == "128x128" else ()
@@ -554,9 +556,7 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                 (kernel_id, ki)
                 for pipe in PIPELINES_BY_W_SCALE_BLOCK[block]
                 for kernel_id, ki in pipe.kernels_list.items()
-                if args.libtype != "opus"
-                and pipe.fits(ki, M, N, K)
-                and (allowed_flydsl is None or ki.name in allowed_flydsl)
+                if args.libtype != "opus" and pipe.fits(ki, M, N, K)
             ]
             runs = [
                 (kernel_id, ki.split_k, ki.name, run_gemm_flydsl)
@@ -568,13 +568,7 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                     for mm, name in seeds.get((N, K, block), ())
                     if M / 2 <= mm <= M * 2
                 ]
-                if args.compare_upstream:
-                    near = sorted(set(near) | comparison_seeds.get(block, set()))
-                if allowed_flydsl is not None:
-                    near = sorted(allowed_flydsl)
                 for j, name in enumerate(bmm_candidates(M, N, K, block, near)):
-                    if allowed_flydsl is not None and name not in allowed_flydsl:
-                        continue
                     from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
                         parse_bmm_kernel_name,
                     )
@@ -617,9 +611,17 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
 
         if not task:
             return []
-        counts = Counter(entry[0][0] for entry in task)
+        return self._run_filtered_opus(task, opus_by_shape, args)
+
+    def _run_tasks(self, tasks, args):
+        if not tasks:
+            return []
+        ensure_opus_kids_compiled(
+            {task[0][1] for task in tasks if task[0][-1] == "opus"}
+        )
+        counts = Counter(task[0][0] for task in tasks)
         return mp_tuner(
-            task,
+            tasks,
             [(count, ()) for count in counts.values()],
             args.mp,
             False,
@@ -629,20 +631,76 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             verbose=args.verbose,
         )
 
+    def _run_filtered_opus(self, tasks, candidates_by_shape, args):
+        def task_shape(info):
+            return tuple(int(value) for value in info[0][2:5])
+
+        seeds = defaultdict(set)
+        seed_tables = []
+        if candidates_by_shape:
+            from aiter.jit.core import AITER_CONFIGS
+
+            paths = {
+                args.tune_file,
+                AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE,
+            }
+            for path in paths:
+                try:
+                    seed_tables.append(pd.read_csv(path))
+                except (OSError, pd.errors.EmptyDataError):
+                    pass
+        cu_num = self.get_cu_num()
+        for table in seed_tables:
+            if table is None:
+                continue
+            for row in table.itertuples():
+                if (
+                    getattr(row, "libtype", None) == "opus"
+                    and str(getattr(row, "gfx", "gfx950")) == "gfx950"
+                    and int(getattr(row, "cu_num", cu_num)) == cu_num
+                    and str(getattr(row, "w_scale_block", "128x128")) == "128x128"
+                    and float(row.us) > 0
+                    and math.isfinite(float(row.us))
+                    and float(row.errRatio) <= args.errRatio
+                ):
+                    seeds[(int(row.M), int(row.N), int(row.K))].add(int(row.kernelId))
+        plans = {}
+        for shape, candidates in candidates_by_shape.items():
+            legal = {kid for kid, _ in candidates}
+            seed_kids = seeds[shape] & legal
+            selected, geometries = _opus_filtered_candidates(
+                candidates, shape, cu_num, seed_kids
+            )
+            plans[shape] = set(selected)
+            print(
+                f"[OPUS search] shape={shape} legal={len(candidates)} "
+                f"geometries={geometries} candidates={len(selected)} seeds={len(seed_kids)}",
+                flush=True,
+            )
+        selected_tasks = [
+            task
+            for task in tasks
+            if task[0][-1] != "opus" or task[0][1] in plans[task_shape(task[0])]
+        ]
+        return self._run_tasks(selected_tasks, args)
+
     def result_to_df(self, results):
         rows = []
         for el in results:
             info, time, err_ratio = el
+            time = round(time, 4)
             keys, kernelId, splitK, kernelName, libtype = info
             if time in (self.INVALID_TIME, self.INF_TIME):
                 kernelName = "None"
+            elif libtype == "opus":
+                kernelName = opus_kernel_name(kernelId)
             elif libtype == "flydsl" and getattr(self, "_mxscale_table", False):
                 kernelId = (
                     MXSCALE_BMM_KERNEL_ID
                     if kernelId >= KERNEL_ID_BASE_BMM
                     else MXSCALE_KERNEL_ID
                 )
-            tflops, bw = self.calculate(el)
+            tflops, bw = self.calculate((info, time, err_ratio))
             key_dict = dict(zip(self.keys, keys))
             if len(results) == self.topk:
                 print(
@@ -666,6 +724,47 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         if not rows:
             return pd.DataFrame(columns=self.columns)
         return pd.concat([pd.DataFrame(r) for r in rows], ignore_index=True)
+
+    @staticmethod
+    def _format_saved_csv(path):
+        import csv
+
+        path = Path(path)
+        if not path.is_file():
+            return
+        with path.open(newline="") as stream:
+            reader = csv.DictReader(stream)
+            columns, rows = reader.fieldnames, list(reader)
+        for row in rows:
+            if (
+                row.get("libtype") == "opus"
+                and row.get("gfx") == "gfx950"
+                and row.get("w_scale_block") == "128x128"
+                and row.get("kernelName") not in (None, "", "None", "Null")
+                and float(row["us"]) > 0
+                and math.isfinite(float(row["us"]))
+            ):
+                row["kernelName"] = opus_kernel_name(row["kernelId"])
+            if row.get("us") not in (None, "", "Null"):
+                row["us"] = f"{float(row['us']):.4f}"
+        with path.open("w", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=columns, lineterminator="\n")
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def post_process(self, rets, args, topk=-1, fast_mode=False):
+        result = super().post_process(rets, args, topk, fast_mode)
+        if args.profile_file:
+            self._format_saved_csv(args.profile_file)
+        return result
+
+    def result_to_csv(self, resultdf, file, concat=False):
+        super().result_to_csv(resultdf, file, concat)
+        self._format_saved_csv(file)
+
+    def sortResults(self, tune_file, issorted, values):
+        super().sortResults(tune_file, issorted, values)
+        self._format_saved_csv(tune_file)
 
 
 if __name__ == "__main__":
