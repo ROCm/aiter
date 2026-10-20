@@ -38,6 +38,7 @@ struct opus_gemm_bpreshuffle_pingpong_lds_traits {
     static constexpr int E_M = B_M / (T_M * W_M);
     static constexpr int E_N = B_N / (T_N * W_N);
     static constexpr int E_K = 1;
+    static constexpr int A_RING = E_M < 3 ? E_M : 3;
 
     static_assert(E_M >= 2 && B_N >= NUM_WAVES * 16);
 
@@ -61,7 +62,6 @@ struct opus_gemm_bpreshuffle_pingpong_lds_traits {
 
     // Publish the next LDS tile before the last M repeat reloads B.
     static_assert(PublishM >= 0 && PublishM < BlockM / (WaveM * 16) - 1);
-    static_assert(!PIN_A || E_M * 8 <= 64);
     static_assert(!PIN_B || E_N * 8 <= 64);
     static_assert(!PIN_C || 128 + E_M * E_N * 4 <= 256);
 

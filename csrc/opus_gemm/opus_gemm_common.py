@@ -2910,10 +2910,66 @@ a8w8_mxscale_bmm_kernels_list = {
 }
 
 
+def _load_gfx950_co_kernels(path):
+    with open(path) as stream:
+        document = json.load(stream)
+    entries = {}
+    for record in document["gfx950"]:
+        entry = {**document["defaults"], **record}
+        entry["device_flags"] = list(document["device_flag_sets"][entry["device_flags"]])
+        if "launches" in entry:
+            entry["supported_shapes"] = sorted(
+                list(map(int, shape.split(","))) for shape in entry["launches"]
+            )
+        entries[entry["kid"]] = entry
+    for group in document.get("pin_groups", []):
+        base = entries[group["base"]]
+        lds = base["pipeline"] == "pingpong_lds"
+        if base["pipeline"] not in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap", "pingpong_lds"):
+            raise ValueError(f"Pin variants are unsupported for {base['pipeline']}")
+        args = list(base["traits"]["args"])
+        if lds:
+            # Keep fragment representation identical, including the no-pin control.
+            args += ["false"] * max(0, 12 - len(args))
+            args[8] = "true"
+            positions = ((9, 1), (10, 2), (11, 4))
+        else:
+            args += ["false"] * max(0, 16 - len(args))
+            positions = ((14, 1), (15, 4))
+        for mask_text, kid in group["kids"].items():
+            mask = int(mask_text)
+            if mask not in (range(8) if lds else (0, 1, 4, 5)):
+                raise ValueError(f"Invalid pin mask {mask} for {base['pipeline']}")
+            variant_args = list(args)
+            for index, bit in positions:
+                variant_args[index] = str(bool(mask & bit)).lower()
+            if kid not in entries:
+                entries[kid] = {
+                    **base, "kid": kid, "pin_variant": True,
+                    "traits": {**base["traits"], "args": variant_args},
+                    "symbol": (base["symbol"].rsplit("_pin", 1)[0]
+                               + f"_pinA{int(bool(mask & 1))}B{int(bool(mask & 2))}C{int(bool(mask & 4))}"),
+                    "configKey": f"bpreshuffle_co_{base['pipeline']}_{kid}",
+                }
+            entry = entries[kid]
+            if (entry["traits"] != {**base["traits"], "args": variant_args}
+                    or entry["device_flags"] != base["device_flags"]):
+                raise ValueError(f"CO {kid} differs from pin group {group['base']} / mask {mask}")
+            if entry.get("pin_group", group["base"]) != group["base"]:
+                raise ValueError(f"CO {kid} belongs to two pin groups")
+            entry.update(pin_group=group["base"], pin_mask=mask)
+    return entries
+
+
+gfx950_co_kernels_declared = _load_gfx950_co_kernels(
+    os.path.join(os.path.dirname(__file__), "gen_co", "co_kernels_gfx950.json")
+)
+
 _TAG = "a8w8_mxscale_gemm_bpreshuffle"
 _INT32_MAX = 2**31 - 1
 _BP_ROOT = "opus_gemm_blockscale_mxscale_bpreshuffle_"
 a8w8_mxscale_gemm_bpreshuffle_kernels_list = {}
+_BPRESHUFFLE_NEXT_SERIAL = 1
 
 
 def _bpreshuffle_traits(name, *args):
@@ -2924,7 +2980,14 @@ def _bpreshuffle_traits(name, *args):
 def _bpreshuffle_register(pipeline, kernel, traits, bm, bn, bk, wm, wn, *,
                          fixed_k=0, m_align=1, depth=1, output=0, ahead=0,
                          wg_per_cu=1, cache_a=0, cache_b=0):
-    kid = 70161 + len(a8w8_mxscale_gemm_bpreshuffle_kernels_list)
+    global _BPRESHUFFLE_NEXT_SERIAL
+    while True:
+        if _BPRESHUFFLE_NEXT_SERIAL >= 1_000_000:
+            raise ValueError("gfx950 kernel IDs exceed the 950 + six-digit serial range")
+        kid = int(f"950{_BPRESHUFFLE_NEXT_SERIAL}")
+        _BPRESHUFFLE_NEXT_SERIAL += 1
+        if kid not in gfx950_co_kernels_declared:
+            break
     config_name = (f"{pipeline}_{bm}x{bn}x{bk}_w{wm}x{wn}x1_p{depth}"
                    f"_o{output}_ba{ahead}_sk1_wg{wg_per_cu}"
                    f"_cA{cache_a}cB{cache_b}_k{fixed_k}_nt0")
@@ -2981,60 +3044,6 @@ for _bm, _bn, _wn, _stages, _ahead, _ca, _cb in (
         _bm, _bn, 256, 1, _wn, m_align=16, fixed_k=7168, depth=_stages,
         ahead=_ahead, output=2, cache_a=_ca, cache_b=_cb)
 
-def _load_gfx950_co_kernels(path):
-    with open(path) as stream:
-        document = json.load(stream)
-    entries = {}
-    for record in document["gfx950"]:
-        entry = {**document["defaults"], **record}
-        entry["device_flags"] = list(document["device_flag_sets"][entry["device_flags"]])
-        if "launches" in entry:
-            entry["supported_shapes"] = sorted(
-                list(map(int, shape.split(","))) for shape in entry["launches"]
-            )
-        entries[entry["kid"]] = entry
-    for group in document.get("pin_groups", []):
-        base = entries[group["base"]]
-        lds = base["pipeline"] == "pingpong_lds"
-        if base["pipeline"] not in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap", "pingpong_lds"):
-            raise ValueError(f"Pin variants are unsupported for {base['pipeline']}")
-        args = list(base["traits"]["args"])
-        if lds:
-            # Keep fragment representation identical, including the no-pin control.
-            args += ["false"] * max(0, 12 - len(args))
-            args[8] = "true"
-            positions = ((9, 1), (10, 2), (11, 4))
-        else:
-            args += ["false"] * max(0, 16 - len(args))
-            positions = ((14, 1), (15, 4))
-        for mask_text, kid in group["kids"].items():
-            mask = int(mask_text)
-            if mask not in (range(8) if lds else (0, 1, 4, 5)):
-                raise ValueError(f"Invalid pin mask {mask} for {base['pipeline']}")
-            variant_args = list(args)
-            for index, bit in positions:
-                variant_args[index] = str(bool(mask & bit)).lower()
-            if kid not in entries:
-                entries[kid] = {
-                    **base, "kid": kid, "pin_variant": True,
-                    "traits": {**base["traits"], "args": variant_args},
-                    "symbol": (base["symbol"].rsplit("_pin", 1)[0]
-                               + f"_pinA{int(bool(mask & 1))}B{int(bool(mask & 2))}C{int(bool(mask & 4))}"),
-                    "configKey": f"bpreshuffle_co_{base['pipeline']}_{kid}",
-                }
-            entry = entries[kid]
-            if (entry["traits"] != {**base["traits"], "args": variant_args}
-                    or entry["device_flags"] != base["device_flags"]):
-                raise ValueError(f"CO {kid} differs from pin group {group['base']} / mask {mask}")
-            if entry.get("pin_group", group["base"]) != group["base"]:
-                raise ValueError(f"CO {kid} belongs to two pin groups")
-            entry.update(pin_group=group["base"], pin_mask=mask)
-    return entries
-
-
-gfx950_co_kernels_declared = _load_gfx950_co_kernels(
-    os.path.join(os.path.dirname(__file__), "gen_co", "co_kernels_gfx950.json")
-)
 for _kid, _entry in gfx950_co_kernels_declared.items():
     if _kid in a8w8_mxscale_gemm_bpreshuffle_kernels_list:
         raise ValueError(f"gfx950 CO ID {_kid} collides with a JIT ID")

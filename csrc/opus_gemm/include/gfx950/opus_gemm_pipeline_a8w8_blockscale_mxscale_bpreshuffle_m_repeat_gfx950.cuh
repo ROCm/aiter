@@ -423,7 +423,7 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
 
     using BaseMMA = typename decltype(mma)::MMA;
     using AFragments = std::conditional_t<T::FRAGMENT_ARRAYS,
-        array<typename BaseMMA::vtype_a, T::E_M>, typename decltype(mma)::vtype_a>;
+        array<typename BaseMMA::vtype_a, T::A_RING>, vector_t<D_A, T::A_RING * ELEM_A>>;
     using BFragments = std::conditional_t<T::FRAGMENT_ARRAYS,
         array<typename BaseMMA::vtype_b, T::E_N>, typename decltype(mma)::vtype_b>;
     using CFragments = std::conditional_t<T::FRAGMENT_ARRAYS,
@@ -519,20 +519,21 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
     auto load_a_fragment = [&](auto m_i, auto stage_i) {
         if constexpr (T::FRAGMENT_ARRAYS) {
             constexpr int m_repeat = decltype(m_i)::value;
-            const auto offsets = layout_to_offsets<T::VEC_A>(u_ra + sa_offset(decltype(stage_i)::value));
+            const auto offsets = layout_to_offsets<T::VEC_A>(u_ra + sa_offset(static_cast<int>(stage_i)));
             if constexpr (T::PIN_A) {
-                load_operand_fragment_pinned<T::VEC_A, m_repeat * T::A_CHUNKS_PER_FRAGMENT>( number<m_repeat * 8>{}, v_a[m_repeat], s_a, offsets);
+                load_operand_fragment_pinned<T::VEC_A, m_repeat * T::A_CHUNKS_PER_FRAGMENT>( number<(m_repeat % T::A_RING) * 8>{}, v_a[m_repeat % T::A_RING], s_a, offsets);
             } else {
-                v_a[m_repeat] = load_operand_fragment_staged< T::VEC_A, m_repeat * T::A_CHUNKS_PER_FRAGMENT, typename BaseMMA::vtype_a>(s_a, offsets);
+                v_a[m_repeat % T::A_RING] = load_operand_fragment_staged< T::VEC_A, m_repeat * T::A_CHUNKS_PER_FRAGMENT, typename BaseMMA::vtype_a>(s_a, offsets);
             }
         } else {
             constexpr int m_repeat = decltype(m_i)::value;
-            constexpr int stage = decltype(stage_i)::value;
+            const int stage = static_cast<int>(stage_i);
             const auto offsets = layout_to_offsets<T::VEC_A>(u_ra + sa_offset(stage));
             static_for<T::A_CHUNKS_PER_FRAGMENT>([&](auto chunk_i) {
                 constexpr int index = m_repeat * T::A_CHUNKS_PER_FRAGMENT + decltype(chunk_i)::value;
                 set_slice(v_a, load<T::VEC_A>(s_a, offsets[index]),
-                    number<index * T::VEC_A>{}, number<(index + 1) * T::VEC_A>{});
+                    number<((m_repeat % T::A_RING) * T::A_CHUNKS_PER_FRAGMENT + decltype(chunk_i)::value) * T::VEC_A>{},
+                    number<((m_repeat % T::A_RING) * T::A_CHUNKS_PER_FRAGMENT + decltype(chunk_i)::value + 1) * T::VEC_A>{});
             });
         }
     };
@@ -569,10 +570,10 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
                 [[clang::amdgpu_pin_agpr(128 + ci * 4)]]
                 v_c[ci] = v_c[ci];
                 [[clang::amdgpu_pin_agpr(128 + ci * 4)]]
-                v_c[ci] = BaseMMA{}(v_a[mr], v_b[nr], v_c[ci],
+                v_c[ci] = BaseMMA{}(v_a[mr % T::A_RING], v_b[nr], v_c[ci],
                     static_cast<int>(v_sfa[mr / 4]), static_cast<int>(v_sfb[0]), number<mr % 4>{}, number<sn>{});
             } else {
-                v_c[ci] = BaseMMA{}(v_a[mr], v_b[nr], v_c[ci],
+                v_c[ci] = BaseMMA{}(v_a[mr % T::A_RING], v_b[nr], v_c[ci],
                     static_cast<int>(v_sfa[mr / 4]), static_cast<int>(v_sfb[0]), number<mr % 4>{}, number<sn>{});
             }
         } else {
@@ -580,7 +581,7 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
             constexpr int n_repeat = decltype(n_i)::value;
             constexpr int c_index = m_repeat * T::E_N + n_repeat;
             constexpr int scale_n_index = n_repeat / (T::GROUP_N / (T::T_N * T::W_N));
-            const auto a = slice(v_a, number<m_repeat * ELEM_A>{}, number<(m_repeat + 1) * ELEM_A>{});
+            const auto a = slice(v_a, number<(m_repeat % T::A_RING) * ELEM_A>{}, number<(m_repeat % T::A_RING + 1) * ELEM_A>{});
             const auto b = slice(v_b, number<n_repeat * ELEM_B>{}, number<(n_repeat + 1) * ELEM_B>{});
             auto c = slice(v_c, number<c_index * ELEM_C>{}, number<(c_index + 1) * ELEM_C>{});
             c = typename decltype(mma)::MMA{}(a, b, c,
@@ -590,34 +591,45 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
         }
     };
 
+    // Long fixed-K fragment tiles can overlap K+2 publication with the last
+    // current MFMAs; defer waiting for the next LDS stage until its first read.
+    constexpr bool defer_next_stage_wait = T::FIXED_K == 16384 &&
+        T::FRAGMENT_ARRAYS && T::E_M == 4 && T::E_N == 8;
     auto advance_tile = [&](auto stage_i, int tile_k) {
         constexpr int stage = decltype(stage_i)::value;
-        constexpr int next_stage = (stage + 1) % T::NUM_STAGES;
+        constexpr int next_stage = 1 - stage;
         read_scales(tile_k + 1, v_sfa_next, v_sfb_next);
-        // Overlap the selected M repeats with the pending next matrix tile.
         static_for<T::E_M>([&](auto m_i) {
-            static_for<T::E_N>([&](auto n_i) {
-                mma_scale_fragment(m_i, n_i);
-                if constexpr (decltype(m_i)::value == T::E_M - 1)
-                    load_b_fragment(n_i, number<next_stage>{});
-            });
-            if constexpr (decltype(m_i)::value == T::PUBLISH_M) {
-                __builtin_amdgcn_sched_barrier(0);
-                s_waitcnt_vmcnt(0_I);
-                s_waitcnt_lgkmcnt(0_I);
-                // Publish K+1 and retire all K readers before K+2 reuses the same LDS slot.
+            constexpr int m = decltype(m_i)::value;
+            s_waitcnt_lgkmcnt(0_I);
+            if constexpr (m == T::E_M - T::A_RING) {
+                // All current A fragments are resident; release the LDS slot
+                // while the final register fragments still have MFMA consumers.
+                if constexpr (!defer_next_stage_wait)
+                    s_waitcnt_vmcnt(0_I);
                 opus::sync_threads();
                 if (tile_k + 2 < loops)
                     issue_matrix_prefetch(stage_i, tile_k + 2);
                 __builtin_amdgcn_sched_barrier(0);
-                static_for<T::PUBLISH_M>([&](auto earlier_m) { load_a_fragment(earlier_m, number<next_stage>{}); });
             }
-            // Earlier A fragments remain intact until K+1 is published.
-            if constexpr (decltype(m_i)::value >= T::PUBLISH_M)
-                load_a_fragment(m_i, number<next_stage>{});
+            static_for<T::E_N>([&](auto n_i) {
+                mma_scale_fragment(m_i, n_i);
+                if constexpr (m == T::E_M - 1) {
+                    if constexpr (defer_next_stage_wait && decltype(n_i)::value == 0) {
+                        if (tile_k + 2 < loops)
+                            s_waitcnt_vmcnt(number<T::MATRIX_VMEM_INSTRUCTIONS>{});
+                        else
+                            s_waitcnt_vmcnt(0_I);
+                        opus::sync_threads();
+                    }
+                    load_b_fragment(n_i, number<next_stage>{});
+                }
+            });
+            // Reuse the consumed A slot for the M repeat one ring length ahead.
+            if constexpr (m + T::A_RING < T::E_M)
+                load_a_fragment(number<m + T::A_RING>{}, stage_i);
         });
-        // Complete this wave's next-tile reads; the next midpoint barrier protects LDS reuse.
-        s_waitcnt_lgkmcnt(0_I);
+        static_for<T::A_RING>([&](auto m_i) { load_a_fragment(m_i, number<next_stage>{}); });
         v_sfa = v_sfa_next;
         v_sfb = v_sfb_next;
     };
@@ -645,12 +657,13 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
     s_waitcnt_lgkmcnt(0_I);
     opus::sync_threads();
     read_scales(0, v_sfa, v_sfb);
-    static_for<T::E_M>([&](auto m_i) { load_a_fragment(m_i, number<0>{}); });
+    static_for<T::A_RING>([&](auto m_i) { load_a_fragment(m_i, 0_I); });
     static_for<T::E_N>([&](auto n_i) { load_b_fragment(n_i, number<0>{}); });
     s_waitcnt_lgkmcnt(0_I);
 
     // ===== Main loop =====
-    // Alternate LDS slots and replace operands after their last consumer.
+    // Alternate LDS tiles while the A fragment ring rolls across M repeats.
+#pragma nounroll
     for (int tile_k = 0; tile_k + 1 < loops; tile_k += T::LOOP_UNROLL) {
         advance_tile(number<0>{}, tile_k);
 
@@ -658,8 +671,30 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
             advance_tile(number<1>{}, tile_k + 1);
     }
 
+    // ===== Epilogue =====
+    auto finish_tile = [&](auto stage_i) {
+        static_for<T::E_M>([&](auto m_i) {
+            constexpr int m = decltype(m_i)::value;
+            s_waitcnt_lgkmcnt(0_I);
+            static_for<T::E_N>([&](auto n_i) { mma_scale_fragment(m_i, n_i); });
+            if constexpr (m + T::A_RING < T::E_M)
+                load_a_fragment(number<m + T::A_RING>{}, stage_i);
+        });
+    };
+    if constexpr (T::FRAGMENT_ARRAYS || (T::FIXED_K == 0 && T::E_M >= 3)) {
+        // One final MFMA site keeps pinned C/D in place and shortens live
+        // ranges when the final LDS stage is selected at runtime.
+        finish_tile((loops - 1) % 2);
+    } else {
+        // Fixed-K and small unpinned tiles retain their constant LDS offsets.
+        if ((loops - 1) % 2 == 0)
+            finish_tile(0_I);
+        else
+            finish_tile(1_I);
+    }
+
     // ===== Output writeback =====
-    // Finish the last tile and stage BF16 fragments in LDS.
+    // Stage BF16 fragments only after the final tile has released its LDS reads.
     auto stage_output_fragment = [&](auto c_i) {
         constexpr int c_index = decltype(c_i)::value;
         const auto c = [&] {
@@ -674,13 +709,7 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
     s_waitcnt_lgkmcnt(0_I);
     opus::sync_threads();
 
-    static_for<T::E_M>([&](auto m_i) {
-        static_for<T::E_N>([&](auto n_i) {
-            constexpr int c_index = decltype(m_i)::value * T::E_N + decltype(n_i)::value;
-            mma_scale_fragment(m_i, n_i);
-            stage_output_fragment(number<c_index>{});
-        });
-    });
+    static_for<T::E_M * T::E_N>([&](auto c_i) { stage_output_fragment(c_i); });
 
     // Write contiguous BF16 vectors, preserving the final partial M tile guard.
     s_waitcnt_lgkmcnt(0_I);

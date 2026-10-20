@@ -280,6 +280,8 @@ def _check_gfx950_pin(entry, path, llvm_bin):
     bm, bn, bk = entry["tile"]
     wm, wn = entry["wave_layout"]
     a_regs = bm // (wm * 16) * (bk // 128) * 8
+    if entry["pipeline"] == "pingpong_lds":
+        a_regs = min(bm // (wm * 16), 3) * 8
     b_regs = bn // (wn * 16) * 8
     for bit, first, size in ((1, 0, a_regs), (2, 64, b_regs)):
         if mask & bit and not set(range(first, first + size, 4)).issubset(reads):

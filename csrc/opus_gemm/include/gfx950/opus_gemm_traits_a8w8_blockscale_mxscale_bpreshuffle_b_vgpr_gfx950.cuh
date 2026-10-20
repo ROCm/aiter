@@ -45,8 +45,20 @@ struct opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits {
     static_assert(Output == 0 || Output == 2);
 
     static constexpr int STAGES = NB;
-    static constexpr int B_AHEAD = BD;
-    static constexpr int B_SETS = BD + 1;
+    static constexpr int B_FRAGMENTS = (B_K / 128) * NR;
+    // Keep cross-K prefetch within the wave's register budget. Each B fragment
+    // costs eight dwords; reserve space for A, C, packed scales and addressing.
+    static constexpr int REGISTER_BUDGET = WGPerCU == 2 ? 256 : 512;
+    static constexpr int B_REGISTER_ROOM =
+        REGISTER_BUDGET - MR * NR * 4 - (B_K / 128) * MR * 8 - 48;
+    static constexpr int B_MAX_AHEAD = B_REGISTER_ROOM / 8 - 1 > 0
+        ? B_REGISTER_ROOM / 8 - 1 : 1;
+    static constexpr bool ROTATE_B = WGPerCU == 2 || (B_K / 128) * MR >= 16;
+    static constexpr int B_SCHEDULE_AHEAD = ROTATE_B ? (NB == 2 ? 1 : 4)
+        : (B_K == 128 && NR >= 4 && PinA && FixedK >= 1536 ? 3 : B_MAX_AHEAD);
+    static constexpr int B_AHEAD = BD * B_FRAGMENTS < B_SCHEDULE_AHEAD
+        ? BD * B_FRAGMENTS : B_SCHEDULE_AHEAD;
+    static constexpr int B_SETS = B_AHEAD + 1;
     static constexpr int B_CACHE = BC;
     static constexpr bool XCD_ORDER = XCD;
     static constexpr bool SB_SLOTS = SCALE_COLS % 4 != 0;
@@ -66,10 +78,6 @@ struct opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits {
     static constexpr int LDS_BYTES = PIPELINE_BYTES;
 
     static constexpr int INITIAL_A = NB - 1;
-    static constexpr int INITIAL_B = BD;
-    static constexpr int STEADY = PANELS - INITIAL_A;
-    static constexpr int B_ISSUES = NR * 2 * (B_K / 128);
-    static constexpr int SCALE_ISSUES = SA_COPIES + 1;
 
     static_assert(BM > 0 && BM % 16 == 0 && BN > 0 && BN % (WN * 16) == 0);
     static_assert(WN == 1 || WN == 2 || WN == 4 || WN == 8);
