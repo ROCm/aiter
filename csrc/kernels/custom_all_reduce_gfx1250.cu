@@ -477,6 +477,110 @@ void all_reduce(fptr_t _fa,
                 use_new, is_broadcast_reg_outptr);
 }
 
+// ---- Fused allreduce + RMSNorm ----
+
+static void _fused_allreduce_rmsnorm(fptr_t _fa,
+                                     const aiter_tensor_t& inp,
+                                     const aiter_tensor_t& res_inp,
+                                     const aiter_tensor_t& res_out,
+                                     void* out,
+                                     const aiter_tensor_t& w,
+                                     float* scale_out,
+                                     void* bf16_out,
+                                     double eps,
+                                     int64_t reg_ptr,
+                                     int64_t reg_bytes,
+                                     bool gemma_norm)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa            = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    const int hidden   = (int)w.numel();
+    const int tokens   = (int)(inp.numel() / hidden);
+    if((int)inp.size(-1) != hidden || (int)res_inp.size(-1) != hidden ||
+       (int)res_out.size(-1) != hidden)
+        throw std::runtime_error(
+            "gfx1250 fused allreduce rmsnorm requires input/residual width == weight width");
+
+    void* actual_inp = inp.data_ptr();
+    if(reg_ptr != 0)
+    {
+        const int64_t data_bytes = inp.numel() * inp.element_size();
+        if(data_bytes > reg_bytes)
+            throw std::runtime_error("registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync(
+            (void*)reg_ptr, actual_inp, data_bytes, hipMemcpyDeviceToDevice, stream));
+        actual_inp = (void*)reg_ptr;
+    }
+
+#define AR_RMS_DISPATCH(T)                                                                \
+    if(scale_out == nullptr)                                                              \
+        fa->fused_allreduce_rmsnorm<T, T>(stream,                                         \
+                                          reinterpret_cast<T*>(actual_inp),               \
+                                          reinterpret_cast<const T*>(res_inp.data_ptr()), \
+                                          reinterpret_cast<T*>(res_out.data_ptr()),       \
+                                          reinterpret_cast<T*>(out),                      \
+                                          reinterpret_cast<const T*>(w.data_ptr()),       \
+                                          nullptr, nullptr, tokens, hidden, (float)eps,   \
+                                          gemma_norm);                                    \
+    else                                                                                  \
+        fa->fused_allreduce_rmsnorm<T, opus::fp8_t>(                                      \
+            stream,                                                                       \
+            reinterpret_cast<T*>(actual_inp),                                             \
+            reinterpret_cast<const T*>(res_inp.data_ptr()),                               \
+            reinterpret_cast<T*>(res_out.data_ptr()),                                     \
+            reinterpret_cast<opus::fp8_t*>(out),                                          \
+            reinterpret_cast<const T*>(w.data_ptr()),                                     \
+            scale_out, reinterpret_cast<T*>(bf16_out), tokens, hidden, (float)eps,        \
+            gemma_norm);                                                                  \
+    break
+
+    switch(inp.dtype())
+    {
+    case AITER_DTYPE_bf16: AR_RMS_DISPATCH(opus::bf16_t);
+    case AITER_DTYPE_fp16: AR_RMS_DISPATCH(opus::fp16_t);
+    default:
+        throw std::runtime_error("gfx1250 fused allreduce rmsnorm only supports bf16 and fp16");
+    }
+#undef AR_RMS_DISPATCH
+}
+
+void fused_allreduce_rmsnorm(fptr_t _fa,
+                             const aiter_tensor_t& inp,
+                             const aiter_tensor_t& res_inp,
+                             const aiter_tensor_t& res_out,
+                             const aiter_tensor_t& out,
+                             const aiter_tensor_t& w,
+                             double eps,
+                             int64_t reg_ptr,
+                             int64_t reg_bytes,
+                             bool /*use_1stage*/,
+                             bool gemma_norm)
+{
+    _fused_allreduce_rmsnorm(_fa, inp, res_inp, res_out, out.data_ptr(), w,
+                             nullptr, nullptr, eps, reg_ptr, reg_bytes, gemma_norm);
+}
+
+void fused_allreduce_rmsnorm_quant(fptr_t _fa,
+                                   const aiter_tensor_t& inp,
+                                   const aiter_tensor_t& res_inp,
+                                   const aiter_tensor_t& res_out,
+                                   const aiter_tensor_t& out,
+                                   const aiter_tensor_t& scale_out,
+                                   const aiter_tensor_t& w,
+                                   double eps,
+                                   int64_t reg_ptr,
+                                   int64_t reg_bytes,
+                                   bool /*use_1stage*/,
+                                   bool gemma_norm,
+                                   int64_t bf16_out_ptr)
+{
+    _fused_allreduce_rmsnorm(_fa, inp, res_inp, res_out, out.data_ptr(), w,
+                             reinterpret_cast<float*>(scale_out.data_ptr()),
+                             reinterpret_cast<void*>(bf16_out_ptr), eps, reg_ptr, reg_bytes,
+                             gemma_norm);
+}
+
 // ---- Sync latency measurement kernels ----
 
 void start_sync_latency(fptr_t _fa, int64_t blocks)

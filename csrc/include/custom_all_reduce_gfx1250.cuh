@@ -487,6 +487,148 @@ __global__ void __launch_bounds__(256, 2) ar_gfx1250_naive_unroll4(
 }
 
 // ---------------------------------------------------------------------------
+// gfx1250 fused allreduce + residual add + RMSNorm (+ per-token FP8 quant)
+// ---------------------------------------------------------------------------
+// Sum or max over the block; every thread gets the result. Threads past the
+// row contribute 0, so the block size may exceed the row as long as it is a
+// whole number of waves.
+template <bool kMax>
+DINLINE float block_allreduce_f32(float v)
+{
+    __shared__ float partial[32];
+    __shared__ float result;
+    for(int off = warpSize / 2; off > 0; off >>= 1)
+    {
+        const float o = __shfl_xor(v, off);
+        v             = kMax ? fmaxf(v, o) : v + o;
+    }
+    if(threadIdx.x % warpSize == 0)
+        partial[threadIdx.x / warpSize] = v;
+    __syncthreads();
+    if(threadIdx.x == 0)
+    {
+        float r = partial[0];
+        for(int w = 1; w < (int)(blockDim.x / warpSize); ++w)
+            r = kMax ? fmaxf(r, partial[w]) : r + partial[w];
+        result = r;
+    }
+    __syncthreads();
+    return result;
+}
+
+// One block per token, one thread per 16-byte pack of the row. Matches the
+// unfused path: the all-reduce result is rounded to T before the residual add,
+// and ranks are summed in rank order so every rank gets the same bits.
+template <typename T, typename OutT, int ngpus, bool GEMMA_NORM>
+__global__ void __launch_bounds__(1024, 1) ar_rmsnorm_gfx1250(
+    RankData* _input_dp,
+    RankSignals sg,
+    Signal* self_sg,
+    int rank,
+    const T* __restrict__ residual_inp,
+    T* __restrict__ residual_out,
+    OutT* __restrict__ output,
+    const T* __restrict__ weight,
+    float* __restrict__ scale_out,
+    T* __restrict__ bf16_output,
+    int tokens,
+    int hidden,
+    float eps)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    const int packs         = hidden / pack_size;
+    const bool active       = (int)threadIdx.x < packs;
+    const P* ptrs[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; i++)
+        ptrs[i] = (const P*)_input_dp->ptrs[i];
+    P w{};
+    if(active)
+        w = reinterpret_cast<const P*>(weight)[threadIdx.x];
+
+    start_sync<ngpus>(sg, self_sg, rank);
+    for(int t = blockIdx.x; t < tokens; t += gridDim.x)
+    {
+        const int idx = t * packs + threadIdx.x;
+        float x[pack_size] = {};
+        float square_sum   = 0.f;
+        if(active)
+        {
+#pragma unroll
+            for(int i = 0; i < ngpus; i++)
+            {
+                const P v = ptrs[i][idx];
+#pragma unroll
+                for(int j = 0; j < pack_size; j++)
+                    x[j] += upcast_s(v[j]);
+            }
+            const P res = reinterpret_cast<const P*>(residual_inp)[idx];
+            P sum;
+#pragma unroll
+            for(int j = 0; j < pack_size; j++)
+            {
+                x[j]   = upcast_s(downcast_s<T>(x[j])) + upcast_s(res[j]);
+                sum[j] = downcast_s<T>(x[j]);
+                square_sum += x[j] * x[j];
+            }
+            reinterpret_cast<P*>(residual_out)[idx] = sum;
+        }
+        const float inv_rms = rsqrtf(block_allreduce_f32<false>(square_sum) / hidden + eps);
+        float amax          = 0.f;
+#pragma unroll
+        for(int j = 0; j < pack_size; j++)
+        {
+            const float wj = upcast_s(w[j]) + (GEMMA_NORM ? 1.f : 0.f);
+            x[j] *= inv_rms * wj;
+            amax = fmaxf(amax, fabsf(x[j]));
+        }
+        if constexpr(std::is_same_v<T, OutT>)
+        {
+            if(active)
+            {
+                P o;
+#pragma unroll
+                for(int j = 0; j < pack_size; j++)
+                    o[j] = downcast_s<T>(x[j]);
+                reinterpret_cast<P*>(output)[idx] = o;
+            }
+        }
+        else
+        {
+            if(active && bf16_output != nullptr)
+            {
+                P o;
+#pragma unroll
+                for(int j = 0; j < pack_size; j++)
+                    o[j] = downcast_s<T>(x[j]);
+                reinterpret_cast<P*>(bf16_output)[idx] = o;
+            }
+            amax                = block_allreduce_f32<true>(amax);
+            const float fp8_max = opus::cast<opus::fp32_t>(opus::numeric_limits<OutT>::max());
+            const float scale   = amax == 0.f ? 1.f : amax / fp8_max;
+            if(active)
+            {
+                opus::vector_t<OutT, pack_size> q;
+#pragma unroll
+                for(int j = 0; j < pack_size / 4; j++)
+                {
+                    opus::fp32x4_t f;
+#pragma unroll
+                    for(int k = 0; k < 4; k++)
+                        f[k] = x[j * 4 + k];
+                    *(reinterpret_cast<opus::fp8x4_t*>(&q) + j) = opus::cast<opus::fp8_t>(f / scale);
+                }
+                reinterpret_cast<opus::vector_t<OutT, pack_size>*>(output)[idx] = q;
+            }
+            if(threadIdx.x == 0)
+                scale_out[t] = scale;
+        }
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
+// ---------------------------------------------------------------------------
 // gfx1250 allgather kernel — scalar fallback (size not pack-aligned)
 // ---------------------------------------------------------------------------
 template <typename T, int ngpus>
@@ -1429,6 +1571,44 @@ public:
             input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size)
         DISPATCH_NGPUS_1250(world_size_, LAUNCH_AR);
 #undef LAUNCH_AR
+    }
+
+    // Fused allreduce + residual add + RMSNorm over [tokens, hidden]. OutT is T,
+    // or fp8 for per-token quantized output with one scale per token.
+    template <typename T, typename OutT>
+    void fused_allreduce_rmsnorm(hipStream_t stream,
+                                 T* input,
+                                 const T* residual_inp,
+                                 T* residual_out,
+                                 OutT* output,
+                                 const T* weight,
+                                 float* scale_out,
+                                 T* bf16_output,
+                                 int tokens,
+                                 int hidden,
+                                 float eps,
+                                 bool gemma_norm)
+    {
+        constexpr int pack_size = 16 / sizeof(T);
+        if(hidden % pack_size != 0 || hidden / pack_size > 1024)
+            throw std::runtime_error("gfx1250 fused allreduce rmsnorm: unsupported hidden size " +
+                                     std::to_string(hidden));
+        if(tokens == 0)
+            return;
+        RankData* input_ptrs = get_buffer_RD(stream, input);
+        const int threads    = (hidden / pack_size + 63) / 64 * 64;
+        const int blocks     = std::min(tokens, kMaxBlocks);
+#define LAUNCH_AR_RMS(NG)                                                                   \
+        if(gemma_norm)                                                                      \
+            ar_rmsnorm_gfx1250<T, OutT, NG, true><<<blocks, threads, 0, stream>>>(          \
+                input_ptrs, sg_, self_sg_, rank_, residual_inp, residual_out, output,       \
+                weight, scale_out, bf16_output, tokens, hidden, eps);                       \
+        else                                                                                \
+            ar_rmsnorm_gfx1250<T, OutT, NG, false><<<blocks, threads, 0, stream>>>(         \
+                input_ptrs, sg_, self_sg_, rank_, residual_inp, residual_out, output,       \
+                weight, scale_out, bf16_output, tokens, hidden, eps)
+        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AR_RMS);
+#undef LAUNCH_AR_RMS
     }
 
     template <typename T>
