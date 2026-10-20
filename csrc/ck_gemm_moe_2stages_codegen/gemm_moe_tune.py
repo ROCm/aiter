@@ -6890,6 +6890,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
         super().pre_process(args)
         if args.run_config:
             return
+        # Reject before auxiliary preparation, which may build the JIT module.
+        self._reject_fast_scan_a8w4([row for _, row in self.untunedf.iterrows()], args)
         import importlib
 
         from aiter.ops.moe_mxfp4_aux import (
@@ -7154,6 +7156,21 @@ class Mxfp4FlydslTuner(FmoeTuner):
         if not args.run_config and not args.compare and self.untunedf.empty:
             self._write_failed_shapes(pd.DataFrame(), self._mxfp4_output_file)
         return result
+
+    def _reject_fast_scan_a8w4(
+        self, rows: "list[Any]", args: "argparse.Namespace"
+    ) -> "None":
+        """The fast-scan funnel builds one A4W4 fixture and reference per shape.
+
+        A8W4 rows are not supported there yet, so they fail before any work.
+        """
+        if not getattr(args, "fast_scan", False):
+            return
+        for index, row in enumerate(rows):
+            if self._row_precision(row) == "A8W4":
+                raise ValueError(
+                    f"row {index + 2}: --fast-scan supports A4W4 rows only, got A8W4"
+                )
 
     def _valid_tuned_mask(
         self, tunedf: "pd.DataFrame", err_ratio: "float"
@@ -9050,12 +9067,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 self._validate_row(row)
             except (ArgumentTypeError, KeyError, TypeError, ValueError) as exc:
                 raise ValueError(f"row {index + 2}: {exc}") from exc
-            # The fast-scan funnel builds one A4W4 fixture and reference per
-            # shape. A8W4 rows are not supported there yet.
-            if getattr(args, "fast_scan", False) and self._row_precision(row) == "A8W4":
-                raise ValueError(
-                    f"row {index + 2}: --fast-scan supports A4W4 rows only, got A8W4"
-                )
+        self._reject_fast_scan_a8w4(rows, args)
 
         if not rows:
             return []
