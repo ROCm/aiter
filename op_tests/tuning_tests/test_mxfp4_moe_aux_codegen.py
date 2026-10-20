@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import ast
+import csv
 import re
 import subprocess
 import sys
@@ -54,6 +55,28 @@ class TestMxfp4MoeAuxCatalog(unittest.TestCase):
         for shape in MODEL_SHAPES:
             with self.subTest(shape=shape):
                 self.assertTrue(aux.is_mxfp4_moe_shape_supported(*shape))
+
+    def test_shipped_mxmoe_tuned_rows_are_registered(self) -> None:
+        # fused_moe discards a tuned MXMOE pair whose shape is missing from the
+        # catalog and silently falls back to default heuristics.
+        aux = load_aux_module()
+        configs = sorted((ROOT / "aiter/configs").rglob("*tuned*.csv"))
+        checked = 0
+        for path in configs:
+            if "untuned" in path.name:
+                continue
+            with path.open(newline="") as handle:
+                for row in csv.DictReader(handle):
+                    if not (row.get("kernelName1") or "").startswith("flydsl_mxmoe"):
+                        continue
+                    checked += 1
+                    shape = tuple(
+                        int(row[column])
+                        for column in ("expert", "model_dim", "inter_dim", "topk")
+                    )
+                    with self.subTest(config=path.name, shape=shape):
+                        self.assertTrue(aux.is_mxfp4_moe_shape_supported(*shape))
+        self.assertGreater(checked, 0)
 
     def test_generates_missing_instances_and_reuses_existing_keys_once(self) -> None:
         expected_ne24 = {
