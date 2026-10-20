@@ -1584,7 +1584,7 @@ public:
             throw std::runtime_error(
                 "custom allreduce requires input length to be multiple of " + std::to_string(d));
 
-        // LL small-message fast lane: bytes <= kLLArMaxBytes (128 KiB) route to
+        // LL small-message fast lane: bytes <= kLLArMaxBytes (4 MiB) route to
         // the flag-in-data kernel, which reads input locally and pushes to the
         // shared peer scratch — no registered peer-input table (_input_dp) is
         // needed, so branch before get_buffer_RD.
