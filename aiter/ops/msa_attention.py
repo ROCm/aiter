@@ -14,6 +14,9 @@ from .msa_block_select import (
     pa_sparse_block_score_prefill as pa_sparse_block_score_prefill_core,
 )
 from .msa_block_select import pa_sparse_block_topk as pa_sparse_block_topk_core
+from .msa_block_select import (
+    pa_sparse_block_topk_cp as pa_sparse_block_topk_cp_core,
+)
 
 
 def pa_sparse_block_score_decode(
@@ -26,6 +29,8 @@ def pa_sparse_block_score_decode(
     local_blocks: int = 0,
     query_len: int = 1,
     max_seq_len: int = 0,
+    rank: int = 0,
+    world: int = 1,
 ) -> None:
     pa_sparse_block_score_decode_core(
         q_idx,
@@ -37,6 +42,8 @@ def pa_sparse_block_score_decode(
         local_blocks,
         query_len,
         max_seq_len,
+        rank,
+        world,
     )
 
 
@@ -120,4 +127,61 @@ direct_register_custom_op(
     "pa_sparse_block_topk",
     pa_sparse_block_topk,
     ["topk_idx", "sparse_bt", "sparse_ctx"],
+)
+
+
+def pa_sparse_block_topk_cp(
+    score: torch.Tensor,
+    peer_cand_ptrs: torch.Tensor,
+    cp_gen: torch.Tensor,
+    topk_idx: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    sparse_bt: torch.Tensor,
+    sparse_ctx: torch.Tensor,
+    max_seq_len: int = 0,
+    block_size: int = 0,
+    cand_rows: int = 0,
+    query_len: int = 1,
+    init_blocks: int = 0,
+    local_blocks: int = 0,
+    num_kv_heads: int = 1,
+    pages_per_block: int = 8,
+    rank: int = 0,
+    world: int = 1,
+    num_waves: int = 0,
+) -> None:
+    pa_sparse_block_topk_cp_core(
+        score,
+        peer_cand_ptrs,
+        cp_gen,
+        topk_idx,
+        seq_lens,
+        block_table,
+        sparse_bt,
+        sparse_ctx,
+        max_seq_len,
+        block_size,
+        cand_rows,
+        query_len,
+        init_blocks,
+        local_blocks,
+        num_kv_heads,
+        pages_per_block,
+        rank,
+        world,
+        num_waves,
+    )
+
+
+# The candidate buffers are reached through addresses rather than tensors, so
+# they are not in the mutation set. That is what the caller owning them for the
+# lifetime of the mapping is for: they are scratch no other op reads, and a
+# generation left behind in them is what the next call distinguishes itself
+# from rather than something to be reset. ``cp_gen`` is a real tensor and is
+# advanced in place, so it is declared.
+direct_register_custom_op(
+    "pa_sparse_block_topk_cp",
+    pa_sparse_block_topk_cp,
+    ["cp_gen", "topk_idx", "sparse_bt", "sparse_ctx"],
 )

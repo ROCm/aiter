@@ -45,6 +45,7 @@ from aiter.ops.triton.utils.gmm_common import (
     str_from_dtype,
     str_from_group_sizes_dtype,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import positive_int
 
 logger = logging.getLogger(__name__)
 
@@ -336,22 +337,6 @@ def benchmark_gmm(
 
 # Command line interface parsing.
 # ------------------------------------------------------------------------------
-
-
-def positive_int(value: str) -> int:
-    error = argparse.ArgumentTypeError(f"'{value}' is not a positive integer")
-    try:
-        # First try to convert to float to handle ".0" decimal notation.
-        float_value = float(value)
-        # Check if it's a whole number (no fractional part).
-        if float_value != int(float_value):
-            raise error
-        int_value = int(float_value)
-    except ValueError:
-        raise error
-    if int_value <= 0:
-        raise error
-    return int_value
 
 
 def add_trans_arg(
