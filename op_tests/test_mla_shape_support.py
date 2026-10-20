@@ -131,6 +131,20 @@ def test_gfx1250_flydsl_ps1_backend(monkeypatch):
     s = support(96, 1, flydsl_ps1=True, fast_mode=False)
     assert (s.backend, s.fold_factor) == (MlaBackend.PS1_FP8_ASM, 6)
     assert s.supported is False, s.reasons
+    # #6563: 32/64 heads also at qlen <= 4 (heads x qlen <= 128), 16 heads at
+    # qlen <= 4 only, and bf16/bf16 runs the FlyDSL JIT kernel (no asm table).
+    assert support(32, 4, flydsl_ps1=True).backend is MlaBackend.FLYDSL_PS1
+    assert support(32, 4, flydsl_ps1=True).fold_factor == 1
+    assert support(16, 5, flydsl_ps1=True).backend is MlaBackend.ASM
+    bf16 = torch.bfloat16
+    for n in (64, 128):
+        s = get_mla_decode_shape_support(
+            *(n, 1, bf16, bf16),
+            arch="gfx1250",
+            enable_experimental=False,
+            flydsl_ps1=True,
+        )
+        assert (s.backend, s.fold_factor) == (MlaBackend.FLYDSL_PS1, 1), n
     monkeypatch.setenv("AITER_MLA_DECODE_PS1_ASM", "0")
     assert support(128, 1, flydsl_ps1=True).backend is MlaBackend.FLYDSL_PS1
     s = support(64, 1, flydsl_ps1=True, fast_mode=False)
