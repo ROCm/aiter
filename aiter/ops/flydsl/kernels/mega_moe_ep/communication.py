@@ -287,39 +287,50 @@ def build_communication(kc: KernelCtx) -> dict:
             for p in range_constexpr(MAX_NPES):
                 if i32(p) < npes:
                     dispatch_arrive_meta(a, i32(p), parity, i32(0), i32(1), npes * nblk)
-        # PASS B -- the activation payload + E8M0 scale (the bulk of the a2a).
-        for wk_ in range(bid, m * i32(TOPK), nblk):
-            wk = i32(wk_)
-            t = wk // i32(TOPK)
-            r = wk - t * i32(TOPK)
-            e = fx.Int32(bld(rids, wk * i32(4), 0, T.i32, 0))
-            if (e >= i32(0)) & (e < i32(E)):
+        # PASS B -- the activation payload + E8M0 scale (the bulk of the a2a).  Iterate per
+        # TOKEN (not per token-route) and DEDUP owner ranks across the token's TOPK routes:
+        # the payload destination is source_key=rank*mtpr+t (per token, NOT per expert), so
+        # two routes to experts on the SAME owner would scatter the identical payload to the
+        # identical slot twice.  Sending once per (token, owner) cuts the payload a2a traffic
+        # ~45% (TOPK=6 routes -> ~3.3 unique owners @ world=4).  ``seen`` is a per-token
+        # npes-bit mask; it is updated UNCONDITIONALLY (bit=0 for invalid routes, so no
+        # pollution) to avoid a conditional-reassignment scf tangle.
+        for t_ in range(bid, m, nblk):
+            t = i32(t_)
+            source_key = rank * mtpr + t
+            seen = i32(0)
+            for r in range_constexpr(TOPK):
+                e = fx.Int32(bld(rids, (t * i32(TOPK) + i32(r)) * i32(4), 0, T.i32, 0))
+                valid = (e >= i32(0)) & (e < i32(E))
                 owner = e // epr
-                source_key = rank * mtpr + t
-                dpay = peer_rs(a, owner, "off_payload")
-                dsc = peer_rs(a, owner, "off_pscale")
-                for j in range_constexpr((N_VEC + 63) // 64):
-                    u = lane + i32(j * 64)
-                    if u < i32(N_VEC):
-                        v = bld(rx, t * i32(ROW_BYTES) + u * i32(16), 0, V4I, 0)
-                        bst(
-                            v,
-                            dpay,
-                            source_key * i32(ROW_BYTES) + u * i32(16),
-                            0,
-                            AUX_SYS,
-                        )
-                for j in range_constexpr((SCALE_I32 + 63) // 64):
-                    u = lane + i32(j * 64)
-                    if u < i32(SCALE_I32):
-                        s = bld(rxs, (t * i32(SCALE_I32) + u) * i32(4), 0, T.i32, 0)
-                        bst(
-                            s,
-                            dsc,
-                            (source_key * i32(SCALE_I32) + u) * i32(4),
-                            0,
-                            AUX_SYS,
-                        )
+                bit = valid.select(i32(1) << (owner & i32(7)), i32(0))  # &7: shift-safe
+                do_send = valid & ((seen & bit) == i32(0))  # valid AND owner not yet sent
+                seen = seen | bit
+                if do_send:
+                    dpay = peer_rs(a, owner, "off_payload")
+                    dsc = peer_rs(a, owner, "off_pscale")
+                    for j in range_constexpr((N_VEC + 63) // 64):
+                        u = lane + i32(j * 64)
+                        if u < i32(N_VEC):
+                            v = bld(rx, t * i32(ROW_BYTES) + u * i32(16), 0, V4I, 0)
+                            bst(
+                                v,
+                                dpay,
+                                source_key * i32(ROW_BYTES) + u * i32(16),
+                                0,
+                                AUX_SYS,
+                            )
+                    for j in range_constexpr((SCALE_I32 + 63) // 64):
+                        u = lane + i32(j * 64)
+                        if u < i32(SCALE_I32):
+                            s = bld(rxs, (t * i32(SCALE_I32) + u) * i32(4), 0, T.i32, 0)
+                            bst(
+                                s,
+                                dsc,
+                                (source_key * i32(SCALE_I32) + u) * i32(4),
+                                0,
+                                AUX_SYS,
+                            )
         wait_vm(0)
         if lane == i32(0):
             for p in range_constexpr(MAX_NPES):
