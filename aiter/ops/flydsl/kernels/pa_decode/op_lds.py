@@ -145,9 +145,7 @@ class PaDecodeQueryLoader:
 
         q_scale = absmax * fx.Float32(1.0 / self.traits.FP8_MAX)
         inv = fx.Float32(rcp_f32(fx.maxnumf(q_scale, fx.Float32(1e-20))))
-        inv_b = fx.Vector.from_elements([inv], dtype=fx.Float32).broadcast_to(
-            self.traits.QLOAD_UNIT
-        )
+        inv_b = fx.full(self.traits.QLOAD_UNIT, inv, fx.Float32)
 
         for u in range_constexpr(self.traits.N_QLOADS):
             q_scaled_unit = q_units[u].to(fx.Float32) * inv_b
@@ -207,14 +205,14 @@ class PaDecodeQueryLoader:
                         self.lds.store(
                             q_row_off + elem_off * 2,
                             fx.BFloat16,
-                            fx.Vector.filled(self.traits.QLOAD_UNIT, 0.0, fx.BFloat16),
+                            fx.full(self.traits.QLOAD_UNIT, 0.0, fx.BFloat16),
                         )
                 else:
                     self.lds.store_words(
                         q_row_off
                         + self.ctx.qh_local * self.traits.head_dim
                         + self.ctx.lane16 * self.traits.QCHUNK,
-                        fx.Vector.filled(self.traits.QCHUNK // 4, 0, fx.Int32),
+                        fx.full(self.traits.QCHUNK // 4, 0, fx.Int32),
                     )
                     if self.ctx.lane16 == 0:
                         self.lds.store_scalar(
@@ -477,7 +475,7 @@ class PaDecodeKVLoader:
             self.traits.PAGES_PER_CHUNK,
         )
         fetched_vec = (
-            fx.Vector.from_elements([fx.Int32(fetched)], dtype=fx.Int32)
+            fx.Vector.from_elements([fetched], dtype=fx.Int32)
             if const_expr(self.traits.PAGES_PER_CHUNK == 1)
             else fx.Vector(fetched)
         )
@@ -633,7 +631,7 @@ class PaDecodeKVLoader:
             self.traits.PAGES_PER_CHUNK,
         )
         phys_vec = (
-            fx.Vector.from_elements([fx.Int32(fetched)], dtype=fx.Int32)
+            fx.Vector.from_elements([fetched], dtype=fx.Int32)
             if const_expr(self.traits.PAGES_PER_CHUNK == 1)
             else fx.Vector(fetched)
         )
@@ -707,9 +705,7 @@ class PaDecodeKVLoader:
     @flyc.jit
     def prefetch_first(self):
         # Empty partitions must not read K/V or block_tables.
-        k_pf0 = fx.Vector.filled(
-            self.traits.NCHUNK * self.traits.N_SUBCHUNKS, 0, fx.Int64
-        )
+        k_pf0 = fx.full(self.traits.NCHUNK * self.traits.N_SUBCHUNKS, 0, fx.Int64)
         if self.ctx.part_start < self.ctx.part_end:
             if const_expr(self.traits.D256_PIPE and self.traits.per_token_kv):
                 # Put scales ahead of K on vmcnt, so waiting for their LDS
@@ -736,6 +732,6 @@ class PaDecodeKVLoader:
                 self.traits.sVPage_off
                 + self.ctx.warp * (self.traits.PAGES_PER_CHUNK * 4),
                 fx.Int32,
-                fx.Vector.filled(self.traits.PAGES_PER_CHUNK, 0, fx.Int32),
+                fx.full(self.traits.PAGES_PER_CHUNK, 0, fx.Int32),
             )
         return k_pf0

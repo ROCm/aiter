@@ -510,7 +510,7 @@ def launch_mla_pagesize1_fp8_fp8(
                     inflight_next = 0
 
                 accumulator = fx.make_rmem_tensor(QK_ACC_DWORDS, fx.Float32)
-                accumulator.store(Vec.filled(QK_ACC_DWORDS, 0.0, fx.Float32))
+                accumulator.store(fx.full(QK_ACC_DWORDS, 0.0, fx.Float32))
                 for fragment in range_constexpr(Q_NOPE_FRAGMENT_COUNT):
                     remaining_ds = (
                         (Q_NOPE_FRAGMENT_COUNT - 1 - fragment) * 4 + 2 + inflight_next
@@ -604,7 +604,7 @@ def launch_mla_pagesize1_fp8_fp8(
                 exp_bias = fx.Float32(0.0) - new_max * fx.Float32(LOG2E)
 
             probabilities = []
-            sum_vector = Vec.filled(QK_ACC_DWORDS, 0.0, fx.Float32)
+            sum_vector = fx.full(QK_ACC_DWORDS, 0.0, fx.Float32)
             for n_tile in range_constexpr(KV_N_TILES):
                 with fx.fastmath(fm_no_inf):
                     if const_expr(mask_bounds):
@@ -763,7 +763,7 @@ def launch_mla_pagesize1_fp8_fp8(
             work_end,
             fx.Int32(1),
         ):
-            work_base = fx.Int64(work_idx) * fx.Int64(8)
+            work_base = fx.Int64(work_idx) * 8
             partial_qo_loc = work_info_scalar(work_base, 1)
             qo_start = work_info_scalar(work_base, 2)
             qo_end = work_info_scalar(work_base, 3)
@@ -847,7 +847,7 @@ def launch_mla_pagesize1_fp8_fp8(
             rocdl.sched_barrier(0)
 
             has_tokens = kv_start < kv_end
-            zero_out = Vec.filled(PV_ACC_DWORDS, 0.0, fx.Float32)
+            zero_out = fx.full(PV_ACC_DWORDS, 0.0, fx.Float32)
             seed_producer_start = kv_start + 3 * KV_TILE_TOKENS
             safe_seed_start = (seed_producer_start < kv_end).select(
                 seed_producer_start, kv_start
@@ -855,7 +855,7 @@ def launch_mla_pagesize1_fp8_fp8(
             init_state = (
                 [fx.Float32(float("-inf")), fx.Float32(0.0)]
                 + [zero_out for _ in range_constexpr(pv_d_tiles_per_wave)]
-                + [Vec.filled(PACKED_PROB_WORDS, 0, fx.Int32)]
+                + [fx.full(PACKED_PROB_WORDS, 0, fx.Int32)]
                 + list(load_page_indices(safe_seed_start))
             )
             remaining_tokens = kv_end - kv_start
@@ -920,7 +920,7 @@ def launch_mla_pagesize1_fp8_fp8(
 
             running_max = fx.Float32(loop_results[0])
             running_sum = fx.Float32(loop_results[1])
-            has_mass = running_sum > fx.Float32(0.0)
+            has_mass = running_sum > 0.0
             inv_sum = has_mass.select(
                 fx.Float32(rocdl.rcp(T.f32, running_sum.ir_value())),
                 fx.Float32(0.0),

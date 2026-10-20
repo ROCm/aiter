@@ -80,7 +80,7 @@ class PaDecodeGemm:
     def qk(self, k_ops, q_ops, m):
         frag_Ss = []
         for a in range_constexpr(self.traits.NCHUNK):
-            acc = fx.Vector.filled(MFMA_ACC_ELEMS, 0.0, fx.Float32)
+            acc = fx.full(MFMA_ACC_ELEMS, 0.0, fx.Float32)
             acc = self.mfma(
                 k_ops,
                 q_ops,
@@ -93,6 +93,6 @@ class PaDecodeGemm:
         return frag_Ss
 
     def pv(self, v_ops, p_ops):
-        acc = fx.Vector.filled(MFMA_ACC_ELEMS, 0.0, fx.Float32)
+        acc = fx.full(MFMA_ACC_ELEMS, 0.0, fx.Float32)
         acc = self.mfma(v_ops, p_ops, 0, 0, self.traits.NVOPS, acc)
         return fx.Vector(acc)

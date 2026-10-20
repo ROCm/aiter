@@ -63,7 +63,7 @@ class PaDecodePipeline:
     @flyc.jit
     def mainloop(self, k_pf0, v_page_pf0, q_ops_all):
         """Carry prefetch operands and online-softmax state between KV tiles."""
-        o_zero = fx.Vector.filled(self.traits.OP_ELEMS, 0.0, fx.Float32)
+        o_zero = fx.full(self.traits.OP_ELEMS, 0.0, fx.Float32)
         init_state = [k_pf0, v_page_pf0]
         for _m in range_constexpr(self.traits.M_TILES):
             init_state.extend(
@@ -71,9 +71,7 @@ class PaDecodePipeline:
             )
         # Reuse carried V registers only after the final query consumes a chunk.
         if const_expr(self.traits.MTP4_PREFETCH_V):
-            v_pf0 = fx.Vector.filled(
-                self.traits.VHE_CHUNKS * self.traits.NVOPS, 0, fx.Int64
-            )
+            v_pf0 = fx.full(self.traits.VHE_CHUNKS * self.traits.NVOPS, 0, fx.Int64)
             if self.ctx.part_start < self.ctx.part_end:
                 v_flat0 = []
                 for vh in range_constexpr(self.traits.VHE_CHUNKS):
@@ -240,7 +238,7 @@ class PaDecodePipeline:
 
         # Publish next pages/scales with the Phase A barrier.
         k_next = (
-            fx.Vector.filled(self.traits.NCHUNK * self.traits.N_SUBCHUNKS, 0, fx.Int64)
+            fx.full(self.traits.NCHUNK * self.traits.N_SUBCHUNKS, 0, fx.Int64)
             if const_expr(self.traits.MTP4_FUSED)
             else k_cur
         )
@@ -333,14 +331,12 @@ class PaDecodePipeline:
                     fx.Int64,
                     self.traits.NVOPS,
                 )
-                corr_b = fx.Vector.from_elements(
-                    [corr_reg], dtype=fx.Float32
-                ).broadcast_to(self.traits.OP_ELEMS)
+                corr_b = fx.full(self.traits.OP_ELEMS, fx.Float32(corr_reg), fx.Float32)
                 for vh in range_constexpr(self.traits.VHE_CHUNKS):
                     v_vh = v_vh_shared[vh]
-                    op = self.gemm.pv(v_vh, p_ops) * fx.Vector.from_elements(
-                        [v_max_scaled], dtype=fx.Float32
-                    ).broadcast_to(self.traits.OP_ELEMS)
+                    op = self.gemm.pv(v_vh, p_ops) * fx.full(
+                        self.traits.OP_ELEMS, v_max_scaled, fx.Float32
+                    )
                     o_acc[vh] = (
                         op
                         if const_expr(self.traits.single_tile_plan)
@@ -352,7 +348,7 @@ class PaDecodePipeline:
                         and not self.traits.single_tile_plan
                     ):
                         # Reuse the dead V chunk while the final PV finishes.
-                        v_next_chunk = fx.Vector.filled(self.traits.NVOPS, 0, fx.Int64)
+                        v_next_chunk = fx.full(self.traits.NVOPS, 0, fx.Int64)
                         if (
                             const_expr(not self.traits.single_tile_plan)
                             and tt1 < self.ctx.part_end
@@ -436,16 +432,14 @@ class PaDecodePipeline:
                     self.traits.NVOPS,
                 )
 
-                corr_b = fx.Vector.from_elements(
-                    [corr_reg], dtype=fx.Float32
-                ).broadcast_to(self.traits.OP_ELEMS)
+                corr_b = fx.full(self.traits.OP_ELEMS, fx.Float32(corr_reg), fx.Float32)
                 for vh in range_constexpr(self.traits.VHE_CHUNKS):
                     v_vh = v_vh_shared[vh]
                     op = self.gemm.pv(v_vh, p_ops)
                     if const_expr(self.traits.per_token_kv):
-                        op = op * fx.Vector.from_elements(
-                            [v_max_scaled], dtype=fx.Float32
-                        ).broadcast_to(self.traits.OP_ELEMS)
+                        op = op * fx.full(
+                            self.traits.OP_ELEMS, v_max_scaled, fx.Float32
+                        )
                     o_acc[vh] = (
                         op
                         if const_expr(self.traits.single_tile_plan)
@@ -592,9 +586,7 @@ class PaDecodePipeline:
                 )
             )
             corr_b.append(
-                fx.Vector.from_elements([corr_reg[m]], dtype=fx.Float32).broadcast_to(
-                    self.traits.OP_ELEMS
-                )
+                fx.full(self.traits.OP_ELEMS, fx.Float32(corr_reg[m]), fx.Float32)
             )
         if const_expr(self.traits.prefetch_v):
             v_vh_batch = v_vh_shared
@@ -610,9 +602,7 @@ class PaDecodePipeline:
             for m in range_constexpr(self.traits.M_TILES):
                 op = self.gemm.pv(v_vh, p_ops[m])
                 if const_expr(self.traits.per_token_kv):
-                    op = op * fx.Vector.from_elements(
-                        [v_max_scaled], dtype=fx.Float32
-                    ).broadcast_to(self.traits.OP_ELEMS)
+                    op = op * fx.full(self.traits.OP_ELEMS, v_max_scaled, fx.Float32)
                 o_acc[m][vh] = (
                     op
                     if const_expr(self.traits.single_tile_plan)

@@ -124,7 +124,7 @@ def update_tensor_descriptor_2d_lds_addr(
     g0 = Vec(desc.dgroup0)
     return TDMDescriptor2D(
         dgroup0=Vec.from_elements(
-            [g0[0], fx.Int32(new_lds_addr), g0[2], g0[3]], fx.Int32
+            [g0[0], new_lds_addr, g0[2], g0[3]], fx.Int32
         ).ir_value(),
         dgroup1=desc.dgroup1,
     )
@@ -135,8 +135,6 @@ def update_tensor_descriptor_2d_pred(desc: TDMDescriptor2D, pred) -> TDMDescript
     """Enable one wave's TDM load only when its panel needs refilling."""
     g0 = Vec(desc.dgroup0)
     return TDMDescriptor2D(
-        dgroup0=Vec.from_elements(
-            [fx.Int32(pred), g0[1], g0[2], g0[3]], fx.Int32
-        ).ir_value(),
+        dgroup0=Vec.from_elements([pred, g0[1], g0[2], g0[3]], fx.Int32).ir_value(),
         dgroup1=desc.dgroup1,
     )

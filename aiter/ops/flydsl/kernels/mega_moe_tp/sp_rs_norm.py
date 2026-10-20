@@ -189,7 +189,7 @@ def compile_sp_rs_norm(
                     )
                 return out_
 
-            acc0 = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(E // 16)]
+            acc0 = [fx.full(4, 0.0, fx.Float32) for _ in range(E // 16)]
             for j in range_constexpr(NPF):
                 acc0 = step(
                     acc0, k0 + i32(j * 32) + (lane // i32(16)) * i32(8), pf[j], row
@@ -272,9 +272,7 @@ def compile_sp_rs_norm(
                 x = x + live.select(v, fx.Float32(0.0))
             if const_expr(logit_bf16):
                 x = fx.Float32(x).to(fx.BFloat16).to(fx.Float32)
-            sc = fx.Float32(1.0) / (
-                fx.Float32(1.0) + fx.Float32(fmath.exp2(x * fx.Float32(-LOG2E)))
-            )
+            sc = 1.0 / (1.0 + fx.Float32(fmath.exp2(x * fx.Float32(-LOG2E))))
             orig.append(sc)
             b = fx.Int32(bld(rb, e * i32(4), 0, T.i32)).bitcast(fx.Float32)
             vals.append(sc + b)
@@ -301,8 +299,8 @@ def compile_sp_rs_norm(
                     .bitcast(fx.Int32),
                 ).bitcast(fx.Float32)
                 bal = fx.Int64(rocdl.ballot(T.i64, mv == mx))
-                win = i32(fx.ctpop(fx.Int64((bal & (fx.Int64(0) - bal)) - fx.Int64(1))))
-                win = (bal == fx.Int64(0)).select(i32(0), win)
+                win = i32(fx.ctpop((bal & (0 - bal)) - 1))
+                win = (bal == 0).select(i32(0), win)
                 wid = i32(rocdl.readlane(T.i32, mi, win))
                 wgt = fx.Int32(
                     rocdl.readlane(T.i32, mo.bitcast(fx.Int32), win)
@@ -332,8 +330,8 @@ def compile_sp_rs_norm(
                     .bitcast(fx.Int32),
                 ).bitcast(fx.Float32)
                 bal = fx.Int64(rocdl.ballot(T.i64, bv == mx))
-                win = i32(fx.ctpop(fx.Int64((bal & (fx.Int64(0) - bal)) - fx.Int64(1))))
-                win = (bal == fx.Int64(0)).select(i32(0), win)
+                win = i32(fx.ctpop((bal & (0 - bal)) - 1))
+                win = (bal == 0).select(i32(0), win)
                 wid = i32(rocdl.readlane(T.i32, bi, win))
                 wgt = fx.Int32(
                     rocdl.readlane(T.i32, bo.bitcast(fx.Int32), win)
@@ -549,7 +547,7 @@ def compile_sp_rs_norm(
         for j in range_constexpr(1, MAX_TP):
             mine = (rank == i32(j)).select(peers[j], mine)
         bid = i32(gpu.block_id("x"))
-        ea = fx.Int64(ctrl) + fx.Int64(bid * i32(4))
+        ea = ctrl + fx.Int64(bid * i32(4))
         epoch = i32(fx.generic_load(gptr(ea), dtype=fx.Int32)) + i32(1)
         a = {
             "part": part,
@@ -562,7 +560,7 @@ def compile_sp_rs_norm(
             # receive buffers double-buffered by launch parity: a peer's next launch
             # never overwrites the rows this one still reads
             "off_x": off_x + fx.Int64(epoch & i32(1)) * xbank,
-            "off_s": off_s + fx.Int64(epoch & i32(1)) * (xbank // fx.Int64(8)),
+            "off_s": off_s + fx.Int64(epoch & i32(1)) * (xbank // 8),
             "off_f": off_f,
             "rank": rank,
             "m": m,

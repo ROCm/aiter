@@ -476,7 +476,7 @@ def compile_mixed_moe_gemm1_common(
             vec4_f32 = T.vec(4, f32)
             vec16_elems = 16 if a_elem_bytes == 1 else 8
 
-            acc_init = fx.Vector.filled(4, 0.0, fx.Float32).ir_value()
+            acc_init = fx.full(4, 0.0, fx.Float32).ir_value()
 
             c_n_total = experts * (2 * inter_dim)
             b_layout = make_preshuffle_b_layout(
@@ -762,7 +762,7 @@ def compile_mixed_moe_gemm1_common(
                     )
                     fused_u = fx.Uint32(fused_i)
                     t_i32 = fused_u & fx.Uint32(mask24)
-                    s_i32 = fused_u >> fx.Uint32(24)
+                    s_i32 = fused_u >> 24
                     t_valid = t_i32 < fx.Uint32(tokens_i32)
                     s_valid = s_i32 < fx.Uint32(topk_i32)
                     ts_valid = t_valid & s_valid
@@ -1001,14 +1001,14 @@ def compile_mixed_moe_gemm1_common(
                 if const_expr(pack_M < scale_mn_pack):
                     m_half_idx = (bx_m // c16_idx) % c2_idx
                     m_half_i32 = fx.Int32(m_half_idx)
-                    scale_shift = m_half_i32 * fx.Int32(8)
-                    scale_shift_hi = scale_shift + fx.Int32(16)
+                    scale_shift = m_half_i32 * 8
+                    scale_shift_hi = scale_shift + 16
 
                 if const_expr(pack_N < scale_mn_pack):
                     n_half_idx = (n_tile_base // c16_idx) % c2_idx
                     n_half_i32 = fx.Int32(n_half_idx)
-                    bscale_shift = n_half_i32 * fx.Int32(8)
-                    bscale_shift_hi = bscale_shift + fx.Int32(16)
+                    bscale_shift = n_half_i32 * 8
+                    bscale_shift_hi = bscale_shift + 16
 
                 def rearrange_a_scale(raw_i32):
                     """Rearrange scale bytes for pack_M=1: extract m_half's k0,k1 bytes."""
@@ -1274,7 +1274,7 @@ def compile_mixed_moe_gemm1_common(
 
                     def pack_i64x4_to_i32x8(x0, x1, x2, x3):
                         v4 = fx.Vector.from_elements([x0, x1, x2, x3], i64_t)
-                        return fx.Vector(v4).bitcast(i32_t)
+                        return v4.bitcast(i32_t)
 
                     eff_packed = (ku_count + pack_K - 1) // pack_K
                     for ku128 in range_constexpr(eff_packed):
@@ -1405,7 +1405,7 @@ def compile_mixed_moe_gemm1_common(
 
                     def pack(x0, x1, x2, x3):
                         v4 = fx.Vector.from_elements([x0, x1, x2, x3], i64_t)
-                        return fx.Vector(v4).bitcast(i32_t)
+                        return v4.bitcast(i32_t)
 
                     def pack_b(b_single):
                         if const_expr(body_b_has_full_operand):
@@ -2337,7 +2337,7 @@ def compile_mixed_moe_gemm1_common(
 
                         if const_expr(need_sort):
                             col_g0_i32 = fx.Int32(col_g0)
-                            is_scale_writer = (col_g0_i32 & c31_i32) == fx.Int32(c0_i32)
+                            is_scale_writer = (col_g0_i32 & c31_i32) == c0_i32
 
                             def _scale_writer_then():
                                 row_i32_s = fx.Int32(row)
@@ -3274,7 +3274,7 @@ def compile_mixed_moe_gemm2_common(
             i64_t = fx.Numeric.from_ir_type(i64)
             vec4_f32 = T.vec(4, f32)
 
-            acc_init = fx.Vector.filled(4, 0.0, fx.Float32).ir_value()
+            acc_init = fx.full(4, 0.0, fx.Float32).ir_value()
 
             topk_idx = topk
             m_in = tokens_in * topk_idx
@@ -3615,7 +3615,7 @@ def compile_mixed_moe_gemm2_common(
                         )
                         fused_u = fx.Uint32(fused_i)
                         t_i32 = fused_u & fx.Uint32(mask24)
-                        s_i32 = fused_u >> fx.Uint32(24)
+                        s_i32 = fused_u >> 24
 
                         t_valid = t_i32 < fx.Uint32(tokens_i32)
                         s_valid = s_i32 < fx.Uint32(topk_i32)
@@ -4098,7 +4098,7 @@ def compile_mixed_moe_gemm2_common(
 
                     def pack_i64x4_to_i32x8(x0, x1, x2, x3):
                         v4 = fx.Vector.from_elements([x0, x1, x2, x3], i64_t)
-                        return fx.Vector(v4).bitcast(i32_t)
+                        return v4.bitcast(i32_t)
 
                     pack_K_shift = (pack_K - 1).bit_length()
                     pack_K_mask = pack_K - 1
@@ -4310,7 +4310,7 @@ def compile_mixed_moe_gemm2_common(
                             )
                         if const_expr(use_buf_atomic_pre):
                             t_pre = tid_val & fx.Int32(0xFFFFFF)
-                            s_pre = fx.Uint32(tid_val) >> fx.Uint32(24)
+                            s_pre = fx.Uint32(tid_val) >> 24
                             row_byte_off = t_pre * fx.Int32(row_stride_bytes_pre)
                             global_row_i32 = fx.Int32(tid_row)
                             valid = (
@@ -4859,7 +4859,7 @@ def compile_mixed_moe_gemm2_common(
                 first_tok = buffer_ops.buffer_load(
                     sorted_rsrc, bx_m, vec_width=1, dtype=T.i32
                 )
-                first_tid = fx.Int32(first_tok) & fx.Int32(0xFFFFFF)
+                first_tid = fx.Int32(first_tok) & 0xFFFFFF
                 tokens_i32_guard = fx.Int32(tokens_in)
                 tile_has_tokens = fx.Uint32(first_tid) < fx.Uint32(tokens_i32_guard)
                 if const_expr(pack_M < scale_pack_m):

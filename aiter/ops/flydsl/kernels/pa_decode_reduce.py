@@ -32,7 +32,7 @@ def _shuffle_offsets(parts):
 
 def _fast_div(value, magic):
     """floor(value / d) for magic = ceil(2**30 / d), exact while value * d <= 2**30."""
-    return fx.Int32((fx.Int64(value) * fx.Int64(magic)) >> fx.Int64(30))
+    return fx.Int32((fx.Int64(value) * fx.Int64(magic)) >> 30)
 
 
 @lru_cache(maxsize=256)
@@ -233,7 +233,7 @@ def compile_pa_decode_ps_reduce(
 
         def _zero():
             if fx.const_expr(pairs):
-                return fx.Vector.filled(2, 0.0, fx.Float32)
+                return fx.full(2, 0.0, fx.Float32)
             return zero_f
 
         def _load_logits(part, unit):
@@ -359,7 +359,7 @@ def compile_pa_decode_ps_reduce(
             if fx.const_expr(partitions <= 8):
                 acc = _reduce_register(partitions, unit)
             else:
-                if part_count > fx.Int32(8):
+                if part_count > 8:
                     acc = _top_first(high_rungs, _reduce_register, unit)
                 else:
                     acc = _top_first(low_rungs, _reduce_register, unit)
@@ -418,8 +418,8 @@ def compile_pa_decode_ps_reduce(
                             if fx.const_expr(pairs):
                                 acc = acc + fx.Vector.from_elements(
                                     [
-                                        fx.Float32(partials[other - 1, unit * 2]),
-                                        fx.Float32(partials[other - 1, unit * 2 + 1]),
+                                        partials[other - 1, unit * 2],
+                                        partials[other - 1, unit * 2 + 1],
                                     ],
                                     dtype=fx.Float32,
                                 )

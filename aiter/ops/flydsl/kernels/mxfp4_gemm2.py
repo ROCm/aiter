@@ -149,8 +149,8 @@ def compile_gemm2_a4w4_port(
         tx_i32 = fx.Int32(tx)
         bx_i32 = fx.Int32(bx)
 
-        lane = tx_i32 % fx.Int32(64)
-        wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
+        lane = tx_i32 % 64
+        wave = rocdl.readfirstlane(T.i32, tx_i32 // 64)
 
         _aq_num = fx.Int64(i32_max_m_blocks) * (BM * _K_HALF)
         aq_rsrc = _buffer_rsrc(arg_aq, _aq_num)
@@ -161,7 +161,7 @@ def compile_gemm2_a4w4_port(
             for slot in range_constexpr(kStages):
                 for sub in range_constexpr(_kSubBlocks):
                     lds_row = wave * fx.Int32(_rows_per_wave) + fx.Int32(sub * 8)
-                    car = m_row0 + lds_row + (lane // fx.Int32(8))
+                    car = m_row0 + lds_row + (lane // 8)
                     _issue_a_load_lds(
                         aq_rsrc,
                         saq_base_i32,
@@ -484,7 +484,7 @@ def _gemm2_body(
         return a
 
     mfma_res_ty = T.f32x4
-    zero4 = Vec.filled(4, 0.0, fx.Float32)
+    zero4 = fx.full(4, 0.0, fx.Float32)
     accm = [[None, None, None, None] for _ in range(_kMChunks)]
 
     def mfma_cluster(b_tile, a, a_scale_sub, b_scale_slot, init, kt=0):
@@ -625,7 +625,7 @@ def _flat_bf16_epilog(
     lane_mod_16 = lane % fx.Int32(16)
     row_base = m_row + lane_div_16 * fx.Int32(4)
     gn_base = n_block_idx * fx.Int32(BN) + wave * fx.Int32(BN // 4) + lane_mod_16
-    byte_base = (fx.Int64(row_base) * fx.Int64(N_OUT) + fx.Int64(gn_base)) * fx.Int64(2)
+    byte_base = (fx.Int64(row_base) * fx.Int64(N_OUT) + fx.Int64(gn_base)) * 2
     for i in range_constexpr(kMChunks):
         for J in range_constexpr(4):
             vec = Vec(accm[i][J])
@@ -651,9 +651,9 @@ def _cshuffle_flat_bf16_epilog(
     lane_div_16 = lane // fx.Int32(16)
     lane_mod_16 = lane % fx.Int32(16)
     tx_i32 = fx.Int32(gpu.thread_id("x"))
-    m_lane = tx_i32 // fx.Int32(32)
-    n_lane = tx_i32 % fx.Int32(32)
-    col_start = n_lane * fx.Int32(2)
+    m_lane = tx_i32 // 32
+    n_lane = tx_i32 % 32
+    col_start = n_lane * 2
 
     for i in range_constexpr(_iC):
         row_base = fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)
@@ -677,7 +677,7 @@ def _cshuffle_flat_bf16_epilog(
             pk = Vec(
                 lds_vec_load(
                     lds_acc_base_i32,
-                    idx0 * fx.Int32(2),
+                    idx0 * 2,
                     T.vec(2, T.bf16),
                     T.bf16,
                     align=4,
@@ -687,9 +687,7 @@ def _cshuffle_flat_bf16_epilog(
             elem = fx.Int64(sorted_row) * fx.Int64(N_OUT) + fx.Int64(n_col)
             fx.ptr_store(
                 _raw(pk),
-                global_typed_ptr(
-                    arg_out, T.bf16, align=4, byte_offset=elem * fx.Int64(2)
-                ),
+                global_typed_ptr(arg_out, T.bf16, align=4, byte_offset=elem * 2),
             )
 
 
@@ -822,9 +820,9 @@ def _atomic_bf16_epilog(
     lane_mod_16 = lane % fx.Int32(16)
 
     tx_i32 = fx.Int32(gpu.thread_id("x"))
-    m_lane = tx_i32 // fx.Int32(32)
-    n_lane = tx_i32 % fx.Int32(32)
-    col_start = n_lane * fx.Int32(2)
+    m_lane = tx_i32 // 32
+    n_lane = tx_i32 % 32
+    col_start = n_lane * 2
     stids_base = _global_base_ptr1(arg_stids)
     sweights_base = _global_base_ptr1(arg_sweights)
 
@@ -872,7 +870,7 @@ def _atomic_bf16_epilog(
                 v2 = Vec(
                     lds_vec_load(
                         lds_acc_base_i32,
-                        idx0 * fx.Int32(4),
+                        idx0 * 4,
                         T.vec(2, T.f32),
                         T.f32,
                         align=8,
