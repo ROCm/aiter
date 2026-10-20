@@ -418,13 +418,11 @@ parser.add_argument(
     choices=[
         "silu",
         "gelu",
-        "swiglu",
     ],
     default="silu",
     help="""Activation function.
     e.g.: -a silu
           or -a gelu
-          or -a swiglu
     """,
 )
 
