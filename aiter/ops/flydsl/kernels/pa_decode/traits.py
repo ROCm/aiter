@@ -842,12 +842,13 @@ class Gfx1250Traits:
     @property
     def packed_lds(self):
         # FP8 cache layout is independent of scalar or per-token scales.
+        # Page16 tiles gather one page per wave without padded LDS rows.
         # Two fused query tiles reuse the packed page and K128 WMMA path for
         # measured D256/G8/MTP4 full attention, without extra KV fetches.
         return (
             not self.bf16
             and self.head_dim in (128, 256)
-            and self.block_size >= 64
+            and (self.block_size == 16 or self.block_size >= 64)
             and self.trans_v
             and (
                 self.m_tiles == 1
@@ -903,7 +904,8 @@ class Gfx1250Traits:
     @property
     def buffers(self):
         if self.packed_lds:
-            return 2 if self.async_page else 1
+            # Page16 gathering can overlap the next four pages in a second buffer.
+            return 2 if self.async_page or self.block_size == 16 else 1
         return (
             2 if self.q_bytes + 2 * self.kv_stride + self.p_bytes + 576 <= 327680 else 1
         )

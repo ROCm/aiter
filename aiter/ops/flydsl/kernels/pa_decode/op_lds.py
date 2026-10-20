@@ -855,10 +855,11 @@ class Gfx1250Memory:
         table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
         # Keep the cache's contiguous 16-byte chunks in LDS. TDM then gathers
         # whole spans without transposing them or inserting row padding.
+        absolute = token_base + (ctx.warp * 16 if t.block_size == 16 else 0)
         safe = (
-            token_base
+            absolute
             if full_tile
-            else (token_base < ctx.planned_context).select(token_base, fx.Int32(0))
+            else (absolute < ctx.planned_context).select(absolute, fx.Int32(0))
         )
         page = fx.Int32(
             table[
@@ -868,13 +869,14 @@ class Gfx1250Memory:
         )
         off = (fx.Int64(page) * ctx.n_kv + ctx.kv_h) * t.head_dim * t.block_size
         pt = fx.Uint32(safe) % t.block_size
+        wave_token = pt + (ctx.warp * 16 if t.block_size != 16 else 0)
         valid = fx.max(
             fx.Int32(0),
             fx.min(fx.Int32(16), ctx.planned_context - token_base - ctx.warp * 16),
         )
         self.tdm_copy(
             ctx.key_cache_ptr,
-            off + (pt + ctx.warp * 16) * 16,
+            off + wave_token * 16,
             kv_off + ctx.warp * t.head_dim * 16,
             (t.head_dim // 16, 256) if full_tile else (t.head_dim // 16, 16, 16),
             (t.block_size * 16, 1) if full_tile else (t.block_size * 16, 16, 1),
@@ -884,7 +886,7 @@ class Gfx1250Memory:
         )
         self.tdm_copy(
             ctx.value_cache_ptr,
-            off + (pt // 16 + ctx.warp) * t.head_dim * 16,
+            off + (wave_token // 16) * t.head_dim * 16,
             kv_off + t.k_bytes + ctx.warp * t.head_dim * 16,
             (t.head_dim * 16,) if full_tile else (t.head_dim, 16),
             (1,) if full_tile else (16, 1),
