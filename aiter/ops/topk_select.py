@@ -60,7 +60,7 @@ from aiter.ops.topk_plain import topk_plain, topk_plain_batches_ragged_rows
 
 __all__ = ["topk_select", "topk_select_backend"]
 
-_SUPPORTED_GFX = ("gfx942", "gfx950")
+_SUPPORTED_GFX = ("gfx942", "gfx950", "gfx1250")
 
 _PLAIN_MAX_K = 2048
 # Which backends can promise a column order among equal scores. `plain` appears
@@ -699,6 +699,10 @@ def _stream_scratch(input, dtype=None):
 def _dispatch(
     backend, input, row_lens, idx, topk, rows, ragged, tie=None, deterministic=False
 ):
+    # Every backend puts rows on a grid dimension, and HIP rejects a zero-sized
+    # launch. An empty batch has nothing to select, so `idx` stays [0, topk].
+    if rows == 0:
+        return
     if backend == "argmax":
         topk_per_row_argmax(input, row_lens, idx)
     elif backend == "small_k":

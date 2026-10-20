@@ -35,10 +35,19 @@ _LAZY_IMPORTS = {
         ".fp8_mqa_logits_kernels",
         "KERNEL_VARIANTS",
     ),
+    "DenseGemmConfig": (".gemm_a16wfp4", "DenseGemmConfig"),
     "QuickAllReduceInt4": (".quick_allreduce_int4", "QuickAllReduceInt4"),
+    "PreshuffledA16WFP4Weight": (
+        ".gemm_a16wfp4",
+        "PreshuffledA16WFP4Weight",
+    ),
     "compute_varqlen_windows": (
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "compute_varqlen_windows",
+    ),
+    "a16wfp4_shape_supported": (
+        ".gemm_a16wfp4",
+        "a16wfp4_shape_supported",
     ),
     "flydsl_conv_implicit": (".conv_kernels", "flydsl_conv_implicit"),
     "flydsl_flash_attn_fp8_func": (
@@ -54,6 +63,15 @@ _LAZY_IMPORTS = {
         ".fp8_mqa_logits_kernels",
         "flydsl_fp8_mqa_logits",
     ),
+    "flydsl_fp8_paged_mqa_logits": (
+        ".kernels.mqa_logits.fp8_paged_mqa_logits_gfx950",
+        "flydsl_fp8_paged_mqa_logits",
+    ),
+    "flydsl_fp8_paged_mqa_logits_gfx950": (
+        ".kernels.mqa_logits.fp8_paged_mqa_logits_gfx950",
+        "flydsl_fp8_paged_mqa_logits_gfx950",
+    ),
+    "flydsl_gemm_a16wfp4": (".gemm_a16wfp4", "flydsl_gemm_a16wfp4"),
     "flydsl_hgemm": (".gemm_kernels", "flydsl_hgemm"),
     "flydsl_hstu_attention": (
         ".hstu_attention",
@@ -67,12 +85,22 @@ _LAZY_IMPORTS = {
         ".hstu_attention",
         "flydsl_hstu_attention_fwd",
     ),
+    "flydsl_mega_mhc": (".mega_mhc_kernels", "flydsl_mega_mhc"),
     "flydsl_mla_reduce_v1": (".mla_reduce_kernels", "flydsl_mla_reduce_v1"),
     "flydsl_moe_stage1": (".moe_kernels", "flydsl_moe_stage1"),
     "flydsl_moe_stage2": (".moe_kernels", "flydsl_moe_stage2"),
     "flydsl_pa_mqa_logits_fp4": (
         ".kernels.mqa_logits.pa_mqa_logits_fp4",
         "flydsl_pa_mqa_logits_fp4",
+    ),
+    "flydsl_pa_mqa_logits_fp4_rowgroup": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup",
+        "flydsl_pa_mqa_logits_fp4_rowgroup",
+    ),
+    "Fp4MqaPlan": (".kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup", "Fp4MqaPlan"),
+    "make_fp4_mqa_plan": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup",
+        "make_fp4_mqa_plan",
     ),
     "flydsl_pa_mqa_logits_fp4_prefill": (
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
@@ -99,44 +127,102 @@ _LAZY_IMPORTS = {
         "gather_kv_b_proj_flydsl_supported",
     ),
     "pa_decode": (".pa_decode", "pa_decode"),
+    "prepare_pa_decode_plan": (".pa_decode_tuning", "prepare_pa_decode_plan"),
+    "prepare_gemm_a16wfp4_weight": (
+        ".gemm_a16wfp4",
+        "prepare_gemm_a16wfp4_weight",
+    ),
     "gather_kv_b_proj_flydsl_fp8_supported": (
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl_fp8_supported",
+    ),
+    "minimax_m3_index_score_flydsl": (
+        ".kernels.minimax_m3_index_score",
+        "score_flydsl",
+    ),
+    "minimax_m3_index_score_flydsl_supported": (
+        ".kernels.minimax_m3_index_score",
+        "index_score_supported",
+    ),
+    "minimax_m3_index_score_alloc": (
+        ".kernels.minimax_m3_index_score",
+        "alloc_score",
+    ),
+    "minimax_m3_index_score_work_map": (
+        ".kernels.minimax_m3_index_score",
+        "build_work_map",
+    ),
+    "minimax_m3_index_score_work_map_capacity": (
+        ".kernels.minimax_m3_index_score",
+        "work_map_capacity",
+    ),
+    "minimax_m3_index_score_work_map_size": (
+        ".kernels.minimax_m3_index_score",
+        "work_map_size",
+    ),
+    "minimax_m3_index_score_prefill_flydsl": (
+        ".kernels.minimax_m3_index_score_prefill",
+        "score_prefill_flydsl",
+    ),
+    # Its own, not the decode scorer's: prefill's output is
+    # [heads, total_q, max_block] and is sized from the ragged batch.
+    "minimax_m3_index_score_prefill_alloc": (
+        ".kernels.minimax_m3_index_score_prefill",
+        "alloc_score",
     ),
 }
 
 __all__ = [
     "FP8_MQA_LOGITS_DEFAULT_VARIANT",
     "FP8_MQA_LOGITS_VARIANTS",
+    "DenseGemmConfig",
+    "Fp4MqaPlan",
     "GateMode",
+    "PreshuffledA16WFP4Weight",
     "QuickAllReduceInt4",
+    "a16wfp4_shape_supported",
     "compute_varqlen_windows",
     "flydsl_conv_implicit",
     "flydsl_flash_attn_fp8_func",
     "flydsl_flash_attn_fp8_supported",
     "flydsl_flash_attn_func",
     "flydsl_fp8_mqa_logits",
+    "flydsl_fp8_paged_mqa_logits",
+    "flydsl_fp8_paged_mqa_logits_gfx950",
+    "flydsl_gemm_a16wfp4",
     "flydsl_hgemm",
     "flydsl_hstu_attention",
     "flydsl_hstu_attention_bwd",
     "flydsl_hstu_attention_fwd",
+    "flydsl_mega_mhc",
     "flydsl_mla_reduce_v1",
     "flydsl_moe_stage1",
     "flydsl_moe_stage2",
     "flydsl_pa_mqa_logits_fp4",
     "flydsl_pa_mqa_logits_fp4_prefill",
+    "flydsl_pa_mqa_logits_fp4_rowgroup",
     "flydsl_pa_mqa_logits_fp4_varqlen",
     "flydsl_preshuffle_gemm_a8",
     "flydsl_qk_norm_rope_quant",
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
+    "make_fp4_mqa_plan",
+    "minimax_m3_index_score_alloc",
+    "minimax_m3_index_score_flydsl",
+    "minimax_m3_index_score_flydsl_supported",
+    "minimax_m3_index_score_prefill_alloc",
+    "minimax_m3_index_score_prefill_flydsl",
+    "minimax_m3_index_score_work_map",
+    "minimax_m3_index_score_work_map_capacity",
+    "minimax_m3_index_score_work_map_size",
     "pa_decode",
+    "prepare_gemm_a16wfp4_weight",
+    "prepare_pa_decode_plan",
 ]
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
 register_fused_moe_impl("flydsl_gfx942", _fused_moe_impl_path)
-register_fused_moe_impl("flydsl_gfx950", _fused_moe_impl_path)
 
 
 def __getattr__(name: str):
