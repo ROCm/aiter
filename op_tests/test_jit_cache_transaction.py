@@ -10,6 +10,7 @@ import json
 import multiprocessing
 import os
 import re
+import runpy
 import shlex
 import shutil
 import socket
@@ -97,6 +98,139 @@ def _load_functions(path, names, namespace):
 
 
 class TestJitCacheTransaction(unittest.TestCase):
+    def test_windows_codegen_keeps_paths_with_spaces_as_single_arguments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            op_dir = os.path.join(tmp, "work tree", "module")
+            command = (
+                r'"C:\Work Tree\aiter\3rdparty\composable_kernel'
+                r'\example\ck_tile\01_fmha\generate.py" '
+                '-d fwd --receipt 100 --filter " @ " --output_dir {}'
+            )
+
+            def run(args, check):
+                self.assertTrue(check)
+                output_dir = args[args.index("--output_dir") + 1]
+                _write(os.path.join(output_dir, "generated.cpp"), "// generated\n")
+
+            with (
+                mock.patch.object(jit_cache, "IS_WINDOWS", True),
+                mock.patch.object(
+                    jit_cache.subprocess, "run", side_effect=run
+                ) as run_process,
+            ):
+                staging_dir = jit_cache.stage_blob_sources(
+                    command,
+                    op_dir,
+                    r"C:\Program Files\Python\python.exe",
+                )
+
+            args = run_process.call_args.args[0]
+            self.assertEqual(args[0], r"C:\Program Files\Python\python.exe")
+            self.assertEqual(
+                args[1],
+                r"C:\Work Tree\aiter\3rdparty\composable_kernel"
+                r"\example\ck_tile\01_fmha\generate.py",
+            )
+            self.assertEqual(args[args.index("--filter") + 1], " @ ")
+            self.assertEqual(
+                args[args.index("--output_dir") + 1],
+                os.path.join(staging_dir, ""),
+            )
+            self.assertTrue(os.path.isfile(os.path.join(staging_dir, "generated.cpp")))
+
+    def test_windows_codegen_keeps_positional_output_paths_with_spaces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            op_dir = os.path.join(tmp, "work tree", "module")
+            command = r'"C:\Work Tree\generator.py" {}'
+
+            def run(args, check):
+                self.assertTrue(check)
+                _write(os.path.join(args[2], "generated.cpp"), "// generated\n")
+
+            with (
+                mock.patch.object(jit_cache, "IS_WINDOWS", True),
+                mock.patch.object(
+                    jit_cache.subprocess, "run", side_effect=run
+                ) as run_process,
+            ):
+                staging_dir = jit_cache.stage_blob_sources(
+                    command, op_dir, r"C:\Program Files\Python\python.exe"
+                )
+
+            args = run_process.call_args.args[0]
+            self.assertEqual(args[1], r"C:\Work Tree\generator.py")
+            self.assertEqual(args[2], os.path.join(staging_dir, ""))
+            self.assertTrue(os.path.isfile(os.path.join(staging_dir, "generated.cpp")))
+
+    def test_windows_codegen_preserves_format_placeholders_and_escaped_braces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            op_dir = os.path.join(tmp, "work tree", "module")
+            command = r'"C:\Work Tree\generator.py" {0} --again {0} --literal {{}}'
+
+            def run(args, check):
+                self.assertTrue(check)
+                _write(os.path.join(args[2], "generated.cpp"), "// generated\n")
+
+            with (
+                mock.patch.object(jit_cache, "IS_WINDOWS", True),
+                mock.patch.object(
+                    jit_cache.subprocess, "run", side_effect=run
+                ) as run_process,
+            ):
+                staging_dir = jit_cache.stage_blob_sources(
+                    command, op_dir, r"C:\Program Files\Python\python.exe"
+                )
+
+            args = run_process.call_args.args[0]
+            self.assertEqual(args[2], os.path.join(staging_dir, ""))
+            self.assertEqual(args[3], "--again")
+            self.assertEqual(args[4], os.path.join(staging_dir, ""))
+            self.assertEqual(args[5], "--literal")
+            self.assertEqual(args[6], "{}")
+
+            with self.assertRaises(IndexError):
+                command = r'"C:\Work Tree\generator.py" {} {}'
+                with mock.patch.object(jit_cache, "IS_WINDOWS", True):
+                    jit_cache.stage_blob_sources(
+                        command, op_dir, r"C:\Program Files\Python\python.exe"
+                    )
+
+    def test_windows_codegen_preserves_multi_value_and_equals_tokens(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            op_dir = os.path.join(tmp, "work tree", "module")
+            command = (
+                r'"C:\Work Tree\generator.py" --extra_kids 7 9 '
+                r'--filter=" @ " --config "C:\Program Files\Aiter\config.json" '
+                r"--output_dir {}"
+            )
+
+            def run(args, check):
+                self.assertTrue(check)
+                output_dir = args[args.index("--output_dir") + 1]
+                _write(os.path.join(output_dir, "generated.cpp"), "// generated\n")
+
+            with (
+                mock.patch.object(jit_cache, "IS_WINDOWS", True),
+                mock.patch.object(
+                    jit_cache.subprocess, "run", side_effect=run
+                ) as run_process,
+            ):
+                staging_dir = jit_cache.stage_blob_sources(
+                    command, op_dir, r"C:\Program Files\Python\python.exe"
+                )
+
+            args = run_process.call_args.args[0]
+            kids_index = args.index("--extra_kids")
+            self.assertEqual(args[kids_index + 1 : kids_index + 3], ["7", "9"])
+            self.assertEqual(args[args.index("--filter= @ ")], "--filter= @ ")
+            self.assertEqual(
+                args[args.index("--config") + 1],
+                r"C:\Program Files\Aiter\config.json",
+            )
+            self.assertEqual(
+                args[args.index("--output_dir") + 1], os.path.join(staging_dir, "")
+            )
+
     def test_failed_codegen_restores_last_complete_sources(self):
         with tempfile.TemporaryDirectory() as tmp:
             op_dir = os.path.join(tmp, "module")
@@ -236,9 +370,12 @@ with open(args.output_dir + "/new.cpp", "w") as source:
                     raise OSError("simulated publication failure")
                 return real_replace(source, destination, *args, **kwargs)
 
-            with mock.patch.object(
-                jit_cache, "_replace", side_effect=fail_candidate_publish
-            ), self.assertRaisesRegex(OSError, "publication failure"):
+            with (
+                mock.patch.object(
+                    jit_cache, "_replace", side_effect=fail_candidate_publish
+                ),
+                self.assertRaisesRegex(OSError, "publication failure"),
+            ):
                 jit_cache.publish_blob_sources(staging_dir, blob_dir)
 
             self.assertEqual(_read(os.path.join(blob_dir, "old.cpp")), "// old\n")
@@ -277,9 +414,12 @@ with open(args.output_dir + "/ours.cpp", "w") as source:
                     _write(os.path.join(blob_dir, "peer.cpp"), "// peer\n")
                 return real_replace(source, destination, *args, **kwargs)
 
-            with mock.patch.object(
-                jit_cache, "_replace", side_effect=inject_peer_publish
-            ), self.assertRaises(OSError):
+            with (
+                mock.patch.object(
+                    jit_cache, "_replace", side_effect=inject_peer_publish
+                ),
+                self.assertRaises(OSError),
+            ):
                 jit_cache.publish_blob_sources(staging_dir, blob_dir)
 
             self.assertEqual(_read(os.path.join(blob_dir, "peer.cpp")), "// peer\n")
@@ -398,9 +538,10 @@ with open(args.output_dir + "/generated.hpp", "w") as header:
                     raise OSError("simulated sidecar seed failure")
                 return real_copy2(source, destination, *args, **kwargs)
 
-            with mock.patch.object(
-                jit_cache, "_copy2", side_effect=fail_sidecar_seed
-            ), self.assertRaisesRegex(OSError, "sidecar seed failure"):
+            with (
+                mock.patch.object(jit_cache, "_copy2", side_effect=fail_sidecar_seed),
+                self.assertRaisesRegex(OSError, "sidecar seed failure"),
+            ):
                 jit_cache.stage_blob_sources(
                     generator,
                     op_dir,
@@ -483,13 +624,20 @@ with open(args.output_dir + "/generated.hpp", "w") as header:
                     os.path.join(staging, jit_cache.CODEGEN_COMPLETE_MARKER), "ready"
                 )
                 os.chmod(op_dir, mode)
+                expected_dir_mode = stat.S_IMODE(os.stat(op_dir).st_mode)
                 os.chmod(staging, mode)
                 os.chmod(os.path.join(staging, "sub"), mode)
-                os.chmod(os.path.join(staging, "sub", "generated.cpp"), 0o644)
+                generated_file = os.path.join(staging, "sub", "generated.cpp")
+                os.chmod(generated_file, 0o644)
+                expected_file_mode = stat.S_IMODE(os.stat(generated_file).st_mode)
                 original_snapshot = jit_cache._copy_blob_snapshot
 
                 def check_candidate(
-                    source, destination, previous, expected=mode, copy=original_snapshot
+                    source,
+                    destination,
+                    previous,
+                    expected=expected_dir_mode,
+                    copy=original_snapshot,
                 ):
                     self.assertEqual(
                         stat.S_IMODE(os.stat(destination).st_mode), expected
@@ -502,12 +650,14 @@ with open(args.output_dir + "/generated.hpp", "w") as header:
                 ):
                     jit_cache.publish_blob_sources(staging, blob)
                 for path in (blob, os.path.join(blob, "sub")):
-                    self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), mode)
+                    self.assertEqual(
+                        stat.S_IMODE(os.stat(path).st_mode), expected_dir_mode
+                    )
                 self.assertEqual(
                     stat.S_IMODE(
                         os.stat(os.path.join(blob, "sub", "generated.cpp")).st_mode
                     ),
-                    0o644,
+                    expected_file_mode,
                 )
 
     def test_atomic_copy_keeps_previous_binary_on_copy_failure(self):
@@ -526,9 +676,12 @@ with open(args.output_dir + "/generated.hpp", "w") as header:
                     output.write(b"partial")
                 raise OSError("simulated interrupted copy")
 
-            with mock.patch.object(
-                jit_cache, "_copy2", side_effect=fail_after_partial_copy
-            ), self.assertRaisesRegex(OSError, "interrupted copy"):
+            with (
+                mock.patch.object(
+                    jit_cache, "_copy2", side_effect=fail_after_partial_copy
+                ),
+                self.assertRaisesRegex(OSError, "interrupted copy"),
+            ):
                 jit_cache.atomic_copy(source, destination)
 
             with open(destination, "rb") as output:
@@ -547,6 +700,7 @@ class TestJitCacheRecovery(unittest.TestCase):
         _write(os.path.join(self.blob_dir, "first.cpp"), "// first\n")
         _write(os.path.join(self.blob_dir, "second.cpp"), "// second\n")
         os.chmod(self.op_dir, 0o755)
+        self.op_dir_mode = stat.S_IMODE(os.stat(self.op_dir).st_mode)
         self.generator = _write_generator(self.root, "pass\n")
 
     def _restore_with_copy_failure(self):
@@ -556,7 +710,7 @@ class TestJitCacheRecovery(unittest.TestCase):
             # Recovery must correct mkdtemp's 0700 before copying any sources.
             candidate = os.path.dirname(destination)
             self.assertTrue(os.path.basename(candidate).startswith(".blob-reset-"))
-            self.assertEqual(stat.S_IMODE(os.stat(candidate).st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE(os.stat(candidate).st_mode), self.op_dir_mode)
             if os.path.basename(source) == "second.cpp":
                 raise OSError("simulated partial restore failure")
             return original_copy(source, destination, *args, **kwargs)
@@ -571,12 +725,15 @@ class TestJitCacheRecovery(unittest.TestCase):
         ):
             self.assertEqual(_read(os.path.join(self.staging_dir, name)), contents)
             self.assertEqual(_read(os.path.join(self.blob_dir, name)), contents)
-        self.assertEqual(stat.S_IMODE(os.stat(self.staging_dir).st_mode), 0o755)
+        self.assertEqual(
+            stat.S_IMODE(os.stat(self.staging_dir).st_mode), self.op_dir_mode
+        )
         self.assertEqual(_transaction_artifacts(self.op_dir), [])
 
     def test_initial_restore_copy_failure_does_not_install_partial_staging(self):
-        with self._restore_with_copy_failure(), self.assertRaisesRegex(
-            OSError, "partial restore failure"
+        with (
+            self._restore_with_copy_failure(),
+            self.assertRaisesRegex(OSError, "partial restore failure"),
         ):
             jit_cache.stage_blob_sources(self.generator, self.op_dir, sys.executable)
         self.assertFalse(os.path.lexists(self.staging_dir))
@@ -586,8 +743,9 @@ class TestJitCacheRecovery(unittest.TestCase):
         jit_cache.stage_blob_sources(self.generator, self.op_dir, sys.executable)
         failing_generator = os.path.join(self.root, "failing.py")
         _write(failing_generator, "raise SystemExit(7)\n")
-        with self._restore_with_copy_failure(), self.assertRaises(
-            subprocess.CalledProcessError
+        with (
+            self._restore_with_copy_failure(),
+            self.assertRaises(subprocess.CalledProcessError),
         ):
             jit_cache.stage_blob_sources(failing_generator, self.op_dir, sys.executable)
         # The failed generator's own live PID must not strand an incomplete
@@ -763,6 +921,7 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
             "AITER_LOG_MORE": 0,
             "AITER_DISABLE_KERNARG_PRELOAD": True,
             "AITER_ROOT_DIR": self.root,
+            "JIT_LIB_EXT": ".so",
             "AITER_CSRC_DIR": self.root,
             "CK_3RDPARTY_DIR": os.path.join(self.root, "absent_ck"),
             "HIP_KITTENS_DIR": os.path.join(self.root, "absent_kittens"),
@@ -774,7 +933,6 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
             "check_LLVM_MAIN_REVISION": lambda: 0,
             "validate_and_update_archs": lambda: ["gfx942"],
             "hip_flag_checker": lambda _flag: True,
-            "check_and_set_ninja_worker": lambda: None,
             "stage_blob_sources": jit_cache.stage_blob_sources,
             "publish_blob_sources": jit_cache.publish_blob_sources,
             "publish_compiled_kids": jit_cache.publish_compiled_kids,
@@ -926,9 +1084,12 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
             return result
 
         self.core["_jit_compile"] = mock.Mock()
-        with mock.patch.object(
-            jit_cache, "_replace", side_effect=replace_then_peer_token
-        ), self.assertRaisesRegex(RuntimeError, "build .* failed"):
+        with (
+            mock.patch.object(
+                jit_cache, "_replace", side_effect=replace_then_peer_token
+            ),
+            self.assertRaisesRegex(RuntimeError, "build .* failed"),
+        ):
             self.build(9)
         self.core["_jit_compile"].assert_not_called()
         self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7})
@@ -1041,7 +1202,7 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
                 get_gfx_runtime=lambda: "gfx942"
             ),
             "opus_gemm_common": types.SimpleNamespace(
-                heuristic_kids_for_arch=lambda _arches: {1}
+                default_compiled_kids_for_arch=lambda _arches: {1}
             ),
         }
         self.tuner_imports = imports
@@ -1059,7 +1220,6 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
                 "os": os,
                 "sys": sys,
                 "json": json,
-                "HEURISTIC_DEFAULT_KIDS": {1},
                 "_opus_sidecar_path": lambda: self.sidecar,
             },
         )["_ensure_kids_compiled"]
@@ -1088,8 +1248,9 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
         self.build(7)
         tuner, calls = self.load_tuner()
         self.tuner_core.AITER_REBUILD = 1
-        with mock.patch.dict(os.environ, {"AITER_REBUILD": "1"}), mock.patch.object(
-            sys, "stderr"
+        with (
+            mock.patch.dict(os.environ, {"AITER_REBUILD": "1"}),
+            mock.patch.object(sys, "stderr"),
         ):
             self.assertTrue(tuner({7}))
             self.assertEqual(os.environ["AITER_REBUILD"], "0")
@@ -1109,10 +1270,13 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
                     return_value=baton
                 )
                 receipt_results = [True] if route == "fast" else [False, True]
-                with mock.patch.dict(
-                    os.environ, {"AITER_REBUILD": "1"}
-                ), mock.patch.object(
-                    jit_cache, "compiled_kids_are_current", side_effect=receipt_results
+                with (
+                    mock.patch.dict(os.environ, {"AITER_REBUILD": "1"}),
+                    mock.patch.object(
+                        jit_cache,
+                        "compiled_kids_are_current",
+                        side_effect=receipt_results,
+                    ),
                 ):
                     self.assertFalse(tuner({7}))
                     self.assertEqual(os.environ["AITER_REBUILD"], "0")
@@ -1126,8 +1290,9 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
         self.compiler["_write_ninja_file_and_build_library"] = mock.Mock(
             side_effect=OSError("hipcc OOM")
         )
-        with mock.patch.dict(os.environ, {"AITER_REBUILD": "1"}), mock.patch.object(
-            sys, "stderr"
+        with (
+            mock.patch.dict(os.environ, {"AITER_REBUILD": "1"}),
+            mock.patch.object(sys, "stderr"),
         ):
             with self.assertRaisesRegex(RuntimeError, "subset-compile rebuild failed"):
                 tuner({7})
@@ -1144,13 +1309,13 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
         self.tuner_imports["aiter.jit.utils.chip_info"].get_gfx_runtime = mock.Mock(
             side_effect=RuntimeError("no rocminfo")
         )
-        heuristic = mock.Mock(
+        defaults = mock.Mock(
             side_effect=lambda arches: {1} if arches == {"gfx942"} else {1, 200}
         )
-        self.tuner_imports["opus_gemm_common"].heuristic_kids_for_arch = heuristic
+        self.tuner_imports["opus_gemm_common"].default_compiled_kids_for_arch = defaults
         with mock.patch.dict(os.environ, {"GPU_ARCHS": "gfx942"}):
             self.assertFalse(tuner({7}))
-        heuristic.assert_called_once_with({"gfx942"})
+        defaults.assert_called_once_with({"gfx942"})
         self.assertEqual(calls, [])
 
     def test_tuner_interruption_restores_environment_and_releases_locks(self):
@@ -1164,12 +1329,16 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
                     self.tuner_imports["aiter.jit.utils.file_baton"].FileBaton = (
                         mock.Mock(return_value=baton)
                     )
-                    with mock.patch.dict(os.environ), mock.patch.dict(
-                        self.compiler,
-                        _write_ninja_file_and_build_library=mock.Mock(
-                            side_effect=interruption()
+                    with (
+                        mock.patch.dict(os.environ),
+                        mock.patch.dict(
+                            self.compiler,
+                            _write_ninja_file_and_build_library=mock.Mock(
+                                side_effect=interruption()
+                            ),
                         ),
-                    ), mock.patch.object(sys, "stderr"):
+                        mock.patch.object(sys, "stderr"),
+                    ):
                         if previous_env is None:
                             os.environ.pop("AITER_REBUILD", None)
                         else:
@@ -1258,9 +1427,10 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
                 self.restage(11)
             return result
 
-        with mock.patch.object(
-            jit_cache, "_copy2", side_effect=copy_then_restage
-        ), self.assertRaisesRegex(RuntimeError, "build .* failed"):
+        with (
+            mock.patch.object(jit_cache, "_copy2", side_effect=copy_then_restage),
+            self.assertRaisesRegex(RuntimeError, "build .* failed"),
+        ):
             self.build(9)
         self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7})
         self.assertTrue(
@@ -1374,7 +1544,7 @@ class TestCppExtensionControl(unittest.TestCase):
 
         self.namespace = _load_functions(
             JIT_CACHE_PATH.with_name("cpp_extension.py"),
-            ["_jit_compile"],
+            ["_get_num_workers", "_jit_compile"],
             {
                 "os": os,
                 "sys": sys,
@@ -1386,6 +1556,33 @@ class TestCppExtensionControl(unittest.TestCase):
                 "_import_module_from_library": lambda *args: None,
             },
         )
+
+    def test_ninja_worker_count_follows_the_shared_worker_budget(self):
+        # The worker count is owned by aiter_worker_limits; a single-worker
+        # ceiling is the one value that is deterministic on any host, and it
+        # proves a legacy MAX_JOBS is read as a ceiling instead of being
+        # handed to Ninja verbatim.
+        with (
+            mock.patch.dict(os.environ, {"AITER_MAX_JOBS": "1"}, clear=True),
+            mock.patch.object(os, "cpu_count", return_value=32),
+        ):
+            self.assertEqual(self.namespace["_get_num_workers"](verbose=False), 1)
+
+        with (
+            mock.patch.dict(os.environ, {"MAX_JOBS": "1"}, clear=True),
+            mock.patch.object(os, "cpu_count", return_value=32),
+        ):
+            self.assertEqual(self.namespace["_get_num_workers"](verbose=False), 1)
+
+        # A larger legacy MAX_JOBS stays bounded by the live CPU and memory
+        # budget instead of pinning the count, and never drops below one.
+        with (
+            mock.patch.dict(os.environ, {"MAX_JOBS": "32"}, clear=True),
+            mock.patch.object(os, "cpu_count", return_value=32),
+        ):
+            workers = self.namespace["_get_num_workers"](verbose=False)
+        self.assertGreaterEqual(workers, 1)
+        self.assertLessEqual(workers, 32)
 
     def compile(self, **options):
         self.namespace["_jit_compile"](
@@ -1481,6 +1678,10 @@ class TestCppExtensionControl(unittest.TestCase):
 class TestOpusRequestedKids(unittest.TestCase):
     def test_real_generator_accepts_valid_requests_and_rejects_filtered_requests(self):
         generator = JIT_CACHE_PATH.parents[3] / "csrc/opus_gemm/gen_instances.py"
+        registry = runpy.run_path(str(generator.with_name("opus_gemm_common.py")))
+        bmm_kids = sorted(registry["BMM_MXSCALE_KIDS"])
+        co_kids = sorted(registry["GFX1250_4WAVE_CO_KIDS"])
+        workspace_kid = min(registry["gfx1250_clusterlaunch_kernels_list"])
         runner = (
             "import os, runpy, sys, types; "
             "sys.argv = sys.argv[1:]; "
@@ -1490,16 +1691,21 @@ class TestOpusRequestedKids(unittest.TestCase):
             "runpy.run_path(sys.argv[0], run_name='__main__')"
         )
         cases = (
-            (10006, [], True),
-            (999999, [], False),
-            (200, [], False),
-            (200, ["--kernel_tag", "a16w16"], False),
-            (10006, ["--kernel_tag", "a8w8"], False),
+            ("gfx942", [10006], [], True),
+            ("gfx942", [999999], [], False),
+            ("gfx942", [200], [], False),
+            ("gfx942", [200], ["--kernel_tag", "a16w16"], False),
+            ("gfx942", [10006], ["--kernel_tag", "a8w8"], False),
+            ("gfx950", bmm_kids, [], True),
+            ("gfx950", bmm_kids, ["--kernel_tag", "a8w8"], True),
+            ("gfx942", bmm_kids, [], False),
+            ("gfx1250", [workspace_kid, *co_kids], [], True),
         )
-        for kid, extra_args, accepted in cases:
-            with self.subTest(
-                kid=kid, extra_args=extra_args
-            ), tempfile.TemporaryDirectory() as tmp:
+        for arch, kids, extra_args, accepted in cases:
+            with (
+                self.subTest(arch=arch, kids=kids, extra_args=extra_args),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
                 sidecar = os.path.join(tmp, "compiled_kids.json")
                 _write(sidecar, "[]")
                 result = subprocess.run(
@@ -1511,17 +1717,33 @@ class TestOpusRequestedKids(unittest.TestCase):
                         "--working_path",
                         tmp,
                         "--extra_kids",
-                        str(kid),
+                        *map(str, kids),
                         *extra_args,
                     ],
-                    env={**os.environ, "GPU_ARCHS": "gfx942"},
+                    env={**os.environ, "GPU_ARCHS": arch},
                     capture_output=True,
                     text=True,
                     check=False,
                 )
                 if accepted:
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertIn(kid, json.loads(_read(sidecar)))
+                    self.assertTrue(set(kids) <= set(json.loads(_read(sidecar))))
+                    manifest = _read(os.path.join(tmp, "opus_gemm_manifest.h"))
+                    for name in {registry["kernels_list"][kid].name for kid in kids}:
+                        self.assertEqual(manifest.count(name + "("), 1, name)
+                    if arch == "gfx950":
+                        dispatch = _read(
+                            os.path.join(tmp, "opus_bmm_mxscale_kid_dispatch.h")
+                        )
+                        # Anchor on the kernel pointer, not on "{ <int>,":
+                        # the header carries a second table mapping each kid to
+                        # its { GROUP_N, GROUP_K }, whose inner braces the bare
+                        # pattern reads as kids and so reports 1 / 32 / 128 as
+                        # spurious extras.
+                        emitted = {
+                            int(kid) for kid in re.findall(r"\{\s*(\d+),\s*&", dispatch)
+                        }
+                        self.assertEqual(emitted, set(bmm_kids))
                 else:
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn(

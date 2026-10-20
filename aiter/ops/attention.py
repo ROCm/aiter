@@ -20,7 +20,8 @@ from csrc.cpp_itfs.pa.pa_v1 import paged_attention_v1 as paged_attention_v1_core
 from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 
 from ..jit.core import compile_ops, is_experimental_enabled
-from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..jit.utils.asm_guard import require_gfx1250_asm
+from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 
 MD_NAME = "module_attention"
 
@@ -365,6 +366,8 @@ def pa_ps_fwd_asm(
     quant_type: Enum | None = QuantType.per_Token.value,
 ) -> torch.Tensor:
     output = out_ if out_ is not None else torch.empty_like(Q)
+    if K.dtype in (dtypes.bf16, dtypes.fp16):
+        quant_type = QuantType.No.value
     _pa_ps_fwd_asm(
         Q,
         K,
@@ -472,6 +475,7 @@ def pa_decode_bf16_asm(
         this slot, so when `sink` is None a -inf buffer is allocated, making the
         sink a numerical no-op.
     """
+    require_gfx1250_asm("pa_decode_bf16_asm")
     device = Q.device
     kv_head_num = K.shape[1]
     q_head_num = kv_head_num * gqa
@@ -544,6 +548,28 @@ def pa_reduce_v1(
     )
 
 
+@compile_ops(
+    "module_attention_ps_reduce_asm", fc_name="attention_ps_reduce", ffi_type="ctypes"
+)
+def _attention_ps_reduce_asm(
+    partial_output: torch.Tensor,
+    partial_lse: torch.Tensor,
+    reduce_indptr: torch.Tensor,
+    reduce_final_map: torch.Tensor,
+    reduce_partial_map: torch.Tensor,
+    max_seqlen_q: int,
+    final_output: torch.Tensor,
+    final_lse: torch.Tensor | None = None,
+) -> None:
+    """Merge compatible PS-mode split-attention outputs and LSE on gfx950.
+
+    Partial output/LSE must be contiguous FP32 tensors with compatible int32
+    reduction maps on the output device. Output is BF16/FP16 [queries, heads,
+    128]; optional final LSE is FP32. The producer must follow the same partial
+    layout and LSE convention. No paged-KV or causal-mask inputs are consumed.
+    """
+
+
 def pa_persistent_fwd(
     Q: torch.Tensor,  # [sum_qlen, kv_heads * gqa + kv_heads * 2, head_dim]
     K: torch.Tensor,  # [num_blocks, kv_heads, head_dim / x, block_size, x]
@@ -565,7 +591,15 @@ def pa_persistent_fwd(
     softmax_scale: float | None = None,
     mask: int = 0,
     quant_type: QuantType = QuantType.per_Token,
+    high_precision: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run persistent attention and merge only materialized partial outputs.
+
+    Work records with partial index -1 write directly to output. Their final
+    LSE is undefined and must not be read; the forward kernel does not produce it.
+    Empty reduction maps skip the reducer; preallocated GPU maps are handled on
+    device without reading metadata back to the host.
+    """
     device = Q.device
     total_s, nhead, v_head_dim = output.shape
     if softmax_scale is None:
@@ -600,9 +634,22 @@ def pa_persistent_fwd(
         logits,
         splitLse,
         mask,
+        high_precision=high_precision,
         quant_type=quant_type,
     )
-    pa_reduce_v1(
+    if reduce_partial_map.numel() == 0 or reduce_indptr.numel() == 1:
+        return logits, final_lse
+
+    reduce_fn = pa_reduce_v1
+    if (
+        K.shape[3] == 16
+        and v_head_dim == 128
+        and output.dtype in (dtypes.bf16, dtypes.fp16)
+        and reduce_final_map is not None
+        and get_gfx_runtime() == "gfx950"
+    ):
+        reduce_fn = _attention_ps_reduce_asm
+    reduce_fn(
         logits,
         splitLse,
         reduce_indptr,
@@ -784,8 +831,22 @@ MD_NAME = "module_mla_asm"
 
 
 @compile_ops(MD_NAME, ffi_type="ctypes")
+def mla_ps64_qh128_fp8_asm_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor | None,
+    q_scale: torch.Tensor,
+    kv_scale: torch.Tensor,
+    softmax_scale: float,
+) -> None: ...
+
+
+@compile_ops(MD_NAME, ffi_type="ctypes")
 def mla_decode_stage1_asm_fwd(
-    # [num_seqs, num_heads, head_size]
+    # [total_q, num_heads, head_size]
     Q: torch.Tensor,
     # [num_page, page_size, num_kv_heads, kv_lora_rank + qk_rope_head_dim]
     KV: torch.Tensor,
@@ -805,12 +866,12 @@ def mla_decode_stage1_asm_fwd(
     page_size: int,
     nhead_kv: int,
     softmax_scale: float,
-    # [batch_size, num_kv_splits, num_heads, v_head_dim]
+    # [total_q, num_kv_splits, num_heads, v_head_dim]
     splitData: torch.Tensor,
-    # [batch_size, num_kv_splits, num_heads,  1]
+    # [total_q, num_kv_splits, num_heads, 1]
     splitLse: torch.Tensor,
     output: torch.Tensor,
-    # [batch_size, num_heads, v_head_dim]
+    # [total_q, num_heads] final natural-log LSE
     lse: torch.Tensor | None = None,
     # [1] per-tensor
     q_scale: torch.Tensor | None = None,
@@ -825,60 +886,42 @@ def mla_decode_stage1_asm_fwd(
     # [batch_size] scratch for gfx1250 packed MLA kernels
     valid_split_count: torch.Tensor | None = None,
     use_valid_split_count_reduce: int = 0,
+    # QH64 shuffled: right-aligned mask per query from qo_indptr.
     causal: bool = True,
+    kv_shuffled: int = 0,
+    # Shuffled QH64 only: indptr counts tokens, indices contain page64 slot IDs.
+    kv_indptr_is_token_level: bool = False,
 ) -> None: ...
 
 
-MD_NAME_V4 = "module_mla_v4_asm"
-
-
-@compile_ops(MD_NAME_V4, ffi_type="ctypes")
-def mla_decode_v4_asm(
-    # [total_query_len, num_heads, head_size]   FP8 packed Q + e8m0 scale region
-    Q: torch.Tensor,
-    # [total_query_len, num_heads, kv_rotary]   BF16
-    qrope: torch.Tensor,
-    # [num_page, page_size, num_kv_heads, head_size]  FP8
-    KV: torch.Tensor,
-    # [num_page, page_size, num_kv_heads, kv_rotary]  BF16
-    kvrope: torch.Tensor,
-    # [num_seqs+1]
-    qo_indptr: torch.Tensor,
-    # [num_seqs+1]
-    kv_indptr: torch.Tensor,
-    # [num_page_used]
+@compile_ops(MD_NAME, ffi_type="ctypes")
+def mla_ps1_fp8_asm_fwd(
+    # [num_partials, num_heads, 512] fp32
+    split_data: torch.Tensor,
+    # [num_partials, num_heads] fp32
+    split_lse: torch.Tensor,
+    # [total_q, num_heads, 512] bf16
+    final_output: torch.Tensor,
+    # [total_q, num_heads] fp32; None skips the un-split rows' LSE
+    final_lse: torch.Tensor | None,
+    # [total_q, num_heads, 576] fp8
+    q: torch.Tensor,
+    # [num_pages, 1, 1, 576] fp8
+    kv_buffer: torch.Tensor,
     kv_page_indices: torch.Tensor,
-    # [num_seqs+1]
-    split_indptr: torch.Tensor,
-    # [num_heads] FP32 -- attention sink logit. Loaded by the kernel via
-    # kernarg slot 18 (byte offset 0x120). Caller must ALWAYS pass a real
-    # tensor; there is no nullable-sink convention on the C ABI. Pass
-    # torch.full((num_heads,), float("-inf")) for "no sink" math.
-    sink: torch.Tensor,
-    max_seqlen_q: int,
-    # ignored on v4 nm; kernel hardcodes 1/sqrt(kV4DimNope+kV4DimRope)=1/sqrt(512)
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
     softmax_scale: float,
-    # 0 = fp32 split-out path; 1 = bf16 nosplit reduce path
-    out_16_nosplit: int,
-    num_kv_splits: int,
-    # outputs
-    # [num_seqs, num_kv_splits, num_kv_heads, gqa*max_seqlen_q, v_head_dim] FP32
-    splitData: torch.Tensor,
-    # [num_seqs, num_kv_splits, num_kv_heads, gqa*max_seqlen_q, 1]          FP32
-    splitLse: torch.Tensor,
-    # [total_query_len, num_heads, v_head_dim] BF16 (used when out_16_nosplit==1)
-    output: torch.Tensor,
-    # [num_seqs] int32 scratch for gfx1250 packed MLA kernels. Holds the
-    # per-request valid kv-split count the kernel writes (slot 19). Pass a
-    # real tensor when use_valid_split_count_reduce != 0; otherwise the
-    # kernel skips the write and nullptr is fine.
-    valid_split_count: torch.Tensor | None = None,
-    use_valid_split_count_reduce: int = 0,
-    # [num_seqs] int32. Unused on the v4 nm path (page_size=1 -> the kernel derives
-    # kv_seq_len from the token-level kv_indptr). Optional/nullable: None sends a
-    # nullptr; the host guards the deref (asm_mla_v4.cu) and the kernel never loads
-    # through it. Placed at the tail because it carries no data on this path.
-    kv_last_page_lens: torch.Tensor | None = None,
+    q_scale: torch.Tensor,
+    kv_scale: torch.Tensor,
+    max_seqlen_q: int,
+    causal: bool,
+    # round-robin CP only (cp_world_size > 1 and causal)
+    qo_indptr: torch.Tensor | None = None,
+    kv_indptr: torch.Tensor | None = None,
+    g_kv_indptr: torch.Tensor | None = None,
+    cp_world_size: int = 1,
+    cp_rank: int = 0,
 ) -> None: ...
 
 
@@ -1007,15 +1050,24 @@ def get_ps_metadata_info_v1(
     num_head_k: int,
     max_qlen: int,
     qlen_granularity: int = 256,
+    total_qlen: int | None = None,
 ):
     """
+    Args:
+        total_qlen: Upper bound on the sum of query lengths over the batch of a
+            single call, e.g. the serving engine's token budget. None means
+            unknown, in which case every batch is assumed to carry max_qlen query
+            tokens.
     Returns:
         1. Shape of work_metadata_ptrs followed by its scalar type.
         2. Shape of work_indptr followed by its scalar type.
         3. Shape of work_info followed by its scalar type.
         4. Shape of reduce_indptr followed by its scalar type.
         5. Shape of reduce_final_map followed by its scalar type.
-        6. Shape of reduce_partial_map followed by its scalar type.
+        6. Shape of reduce_partial_map followed by its scalar type. Its entries
+           index a partial pool of reduce_partial_map_size * qlen_granularity
+           rows, so allocate the partial logits as (rows, num_head_q,
+           v_head_dim) and the partial lse as (rows, num_head_q).
     """
 
     device = torch.cuda.current_device()
@@ -1028,6 +1080,12 @@ def get_ps_metadata_info_v1(
     max_qo_split_per_batch = math.ceil(max_qlen / qlen_granularity)
 
     qo_tile_cnt = batch_size * max_qo_split_per_batch
+    if total_qlen is not None:
+        assert total_qlen > 0, "total_qlen must be positive, use None if unknown"
+        # sum_i ceil(qlen_i / g) <= ceil(sum_i qlen_i / g) + (batch_size - 1),
+        # since only the last tile of each batch is a partially filled one.
+        budget_qo_tile_cnt = math.ceil(total_qlen / qlen_granularity) + batch_size - 1
+        qo_tile_cnt = min(qo_tile_cnt, max(budget_qo_tile_cnt, max_qo_split_per_batch))
     # a work item is created either
     #   1. for every qo tile (no split)
     #   2. every split qo tile, which can be done at most #TG times in total
@@ -1157,7 +1215,7 @@ def get_mla_metadata_info_v1(
         6. Shape of reduce_partial_map followed by its scalar type.
     """
 
-    assert num_head_qo % 8 == 0
+    assert num_head_qo % 4 == 0
     max_splits = get_mla_decode_fwd_max_splits(
         num_head_qo, max_seqlen_qo, q_dtype, kv_dtype
     )
@@ -1232,17 +1290,35 @@ def get_mla_metadata_info_v1(
     ):
         max_qo_tiles_per_batch = math.ceil(packed_qo_len / 128)
     elif (
-        get_gfx() == "gfx950"
-        and (packed_qo_len >= 128 or num_head_qo > 64)
-        and kv_dtype == dtypes.bf16
-        and q_dtype == dtypes.bf16
-        and num_head_qo != 48
-    ) or (
-        get_gfx() == "gfx950"
-        and q_dtype == dtypes.fp8
-        and kv_dtype == dtypes.fp8
-        and num_head_qo == 96
-        and effective_seqlen_qo <= 6
+        (
+            get_gfx() == "gfx950"
+            and (packed_qo_len >= 128 or num_head_qo > 64)
+            and kv_dtype == dtypes.bf16
+            and q_dtype == dtypes.bf16
+            and num_head_qo != 48
+        )
+        or (
+            get_gfx() == "gfx950"
+            and q_dtype == dtypes.fp8
+            and kv_dtype == dtypes.fp8
+            and num_head_qo == 96
+            and effective_seqlen_qo <= 6
+        )
+        or (
+            get_gfx() == "gfx950"
+            and q_dtype == dtypes.fp8
+            and kv_dtype == dtypes.fp8
+            and num_head_qo == 12
+            and packed_qo_len <= 128
+            and fast_mode
+        )
+        or (
+            get_gfx() == "gfx1250"
+            and os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") == "1"
+            and q_dtype == dtypes.fp8
+            and kv_dtype == dtypes.fp8
+            and num_head_qo == 96
+        )
     ):
         if num_head_qo * 2 > 128:
             max_qo_tiles_per_batch = effective_seqlen_qo
@@ -1668,6 +1744,13 @@ def decode_update_mla_metadata_v1(
             and num_heads_per_head_k in (32, 64, 128)
             and max_seqlen_qo == 1
         )
+        or (
+            arch_id == "gfx950"
+            and q_is_fp8
+            and kv_is_fp8
+            and num_heads_per_head_k == 12
+            and num_heads_per_head_k * max_seqlen_qo <= 128
+        )
     )
     cu_num = work_indptr.shape[0] - 1
     tile_reduce_cnt = reduce_indptr.shape[0] - 1
@@ -1838,50 +1921,48 @@ def hk_mla_v40_decode_fwd(
         )
 
 
-@compile_ops("module_ds32_mla", develop=True)
-def mla_decode_stage1_opus_fwd_ds32(
-    q_nope: torch.Tensor,  # [B, H, D_NOPE]          fp8
-    q_rope: torch.Tensor,  # [B, H, D_ROPE]          bf16
-    kv_nope: torch.Tensor,  # [total_tokens, D_NOPE]  fp8
-    kv_rope: torch.Tensor,  # [total_tokens, D_ROPE]  bf16
+@compile_ops("module_mla_decode_opus", ffi_type="ctypes")
+def opus_mla_decode_mxfp8_fwd(
+    q_nope: torch.Tensor,  # [total_q, H, D_NOPE]      fp8
+    q_scale: torch.Tensor,  # [total_q, H, D_SCALE]     uint8 (E8M0)
+    q_rope: torch.Tensor,  # [total_q, H, D_ROPE]      bf16
+    kv_nope: torch.Tensor,  # [total_tokens, D_NOPE]    fp8
+    kv_scale: torch.Tensor,  # [total_tokens, D_SCALE]   uint8 (E8M0)
+    kv_rope: torch.Tensor,  # [total_tokens, D_ROPE]    bf16
     qo_indptr: torch.Tensor,
     kv_indptr: torch.Tensor,
     kv_indices: torch.Tensor,
-    kv_last_page_lens: torch.Tensor,
     work_indptr: torch.Tensor,
     work_info_set: torch.Tensor,
-    max_seqlen_q: int,
     page_size: int,
-    nhead_kv: int,
     softmax_scale: float,
     logits: torch.Tensor,  # aiter split_output [num_partials,1,H,D_NOPE] fp32
     attn_lse: torch.Tensor,  # aiter split_lse    [num_partials,1,H,1]      fp32
-    out: torch.Tensor,  # final [B, H, D_NOPE] bf16
-    final_lse: torch.Tensor,
-    q_scale: torch.Tensor,  # [B, H, D_SCALE]         uint8 (E8M0)
-    kv_scale: torch.Tensor,  # [total_tokens, D_SCALE] uint8
+    out: torch.Tensor,  # final [total_q, H, D_NOPE] bf16
+    final_lse: torch.Tensor | None = None,
 ) -> None: ...
 
 
-@compile_ops("module_opus_mla", ffi_type="ctypes")
-def mla_decode_fwd_opus_stage1(
-    q: torch.Tensor,  # [B, H, 576]           fp8 (merged nope+rope)
-    kv: torch.Tensor,  # [total_tokens, 576]   fp8 (merged nope+rope)
+@compile_ops("module_mla_decode_opus", ffi_type="ctypes")
+def opus_mla_decode_fwd(
+    q: torch.Tensor,  # [total_q, H, 576] bf16 or fp8 (merged nope+rope)
+    kv: torch.Tensor,  # [total_tokens, ..., 576] same dtype as q, page_size == 1
     qo_indptr: torch.Tensor,
     kv_indptr: torch.Tensor,
     kv_indices: torch.Tensor,
-    kv_last_page_lens: torch.Tensor,
     work_indptr: torch.Tensor,
     work_info_set: torch.Tensor,
-    max_seqlen_q: int,
     page_size: int,
-    nhead_kv: int,
     softmax_scale: float,
     logits: torch.Tensor,  # aiter split_output [num_partials,1,H,512] fp32
     attn_lse: torch.Tensor,  # aiter split_lse    [num_partials,1,H,1]   fp32
-    out: torch.Tensor,  # final [B, H, 512] bf16
-    final_lse: torch.Tensor | None = None,  # [B, H] fp32
-    q_scale: torch.Tensor | None = None,  # float[1] per-tensor descale
-    kv_scale: torch.Tensor | None = None,  # float[1] per-tensor descale
-    causal: bool = True,  # mask across the max_seqlen_q query tokens
+    out: torch.Tensor,  # final [total_q, H, 512] bf16
+    final_lse: torch.Tensor | None = None,  # [total_q, H] fp32
+    q_scale: torch.Tensor | None = None,  # fp8: float[1] per-tensor descale
+    kv_scale: torch.Tensor | None = None,  # fp8: float[1] per-tensor descale
+    max_seqlen_q: int = -1,  # fp8: required, picks the kernel; bf16: unused
+    causal: bool = True,  # fp8: mask across the max_seqlen_q query tokens
+    g_kv_indptr: torch.Tensor | None = None,  # fp8 round-robin CP: GLOBAL kv_indptr
+    cp_world_size: int = 1,  # fp8 round-robin CP: number of ranks, 1 = no CP
+    cp_rank: int = 0,  # fp8 round-robin CP: this rank
 ) -> None: ...
