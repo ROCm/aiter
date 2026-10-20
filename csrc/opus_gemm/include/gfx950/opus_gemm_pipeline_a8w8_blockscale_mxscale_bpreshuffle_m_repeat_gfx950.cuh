@@ -5,7 +5,7 @@
 #include <opus/opus.hpp>
 #include "../opus_gemm_utils.cuh"
 #include "opus_gemm_kargs_a8w8_mxscale_bpreshuffle_gfx950.cuh"
-#include "opus_gemm_traits_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh"
+#include "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh"
 
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
 namespace opus_gemm_bpreshuffle_pingpong_lds_layout {

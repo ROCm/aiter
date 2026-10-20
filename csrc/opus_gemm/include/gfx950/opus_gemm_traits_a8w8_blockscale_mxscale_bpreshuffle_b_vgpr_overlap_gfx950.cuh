@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include "opus_gemm_traits_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+#include "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
 
 // Prefetch geometry with a configurable LDS publication point.
 template<int BM, int BN, int NB, int BD, int BC = 0, bool XCD = false,

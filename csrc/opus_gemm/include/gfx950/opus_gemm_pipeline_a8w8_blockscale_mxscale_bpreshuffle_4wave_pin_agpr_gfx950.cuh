@@ -6,7 +6,7 @@
 #include <opus/opus.hpp>
 #include "../opus_gemm_utils.cuh"
 #include "opus_gemm_kargs_a8w8_mxscale_bpreshuffle_gfx950.cuh"
-#include "opus_gemm_traits_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh"
+#include "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh"
 
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
 namespace opus_gemm_blockscale_mxscale_bpreshuffle_pin_detail {

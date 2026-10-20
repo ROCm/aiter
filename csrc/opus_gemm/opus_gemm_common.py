@@ -2934,9 +2934,10 @@ def _bpreshuffle_register(pipeline, kernel, traits, bm, bn, bk, wm, wn, *,
     config_name = (f"{pipeline}_{bm}x{bn}x{bk}_w{wm}x{wn}x{wave_k}_p{depth}"
                    f"_o{output}_ba{ahead}_sk1_wg{wg_per_cu}"
                    f"_cA{cache_a}cB{cache_b}_k{fixed_k}_nt{int(pad_n)}")
+    header_pipeline = "b_vgpr" if pipeline == "prefetch_b_vgpr" else pipeline
     entry = dict(kid=kid, pipeline=pipeline, kernel=kernel, traits=traits,
                  config_name=config_name,
-                 headers=("gfx950/opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_" + pipeline + "_gfx950.cuh",),
+                 headers=("gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_" + header_pipeline + "_gfx950.cuh",),
                  m_align=m_align, **launch)
     a8w8_mxscale_gemm_bpreshuffle_kernels_list[kid] = OpusGemmInstance(
         BLOCK_SIZE=64 * wm * wn * wave_k, B_M=bm, B_N=bn, B_K=bk,

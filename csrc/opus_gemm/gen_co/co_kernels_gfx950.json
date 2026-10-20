@@ -520,7 +520,7 @@
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
       "symbol": "opus_gemm_gfx950_pin_agpr_9000",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -541,7 +541,7 @@
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
       "symbol": "opus_gemm_gfx950_pin_agpr_9001",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -566,7 +566,7 @@
         "args": ["64", "16384", "true", "2"]
       },
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": [
         "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::remaining_rows, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds>"
       ]
@@ -593,7 +593,7 @@
         "args": ["false"]
       },
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": [
         "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_fixed_traits<opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::direct>, 40960, 7168, 768, true>"
       ]
@@ -620,7 +620,7 @@
         "args": ["64", "7168", "true", "2"]
       },
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": [
         "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_fixed_traits<opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::direct>, 2048, 6144, 7168, true>"
       ]
@@ -647,7 +647,7 @@
         "args": ["true"]
       },
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": [
         "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_fixed_traits<opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::direct>, 1984, 7168, 16384, true>"
       ]
@@ -727,7 +727,7 @@
         "args": ["64", "0", "false", "2"]
       },
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -805,7 +805,7 @@
         "args": ["64", "0", "true", "2"]
       },
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -988,7 +988,7 @@
         "args": ["64", "0", "false", "2"]
       },
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -1171,7 +1171,7 @@
         "args": ["64", "0", "false", "4"]
       },
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -1204,7 +1204,7 @@
         "args": ["16", "384", "false", "2"]
       },
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -1232,7 +1232,7 @@
         "args": ["32", "3072", "false", "2"]
       },
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -1289,7 +1289,7 @@
         "args": ["64", "7168", "false", "2"]
       },
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -1319,7 +1319,7 @@
         "args": ["64", "16384", "false", "2"]
       },
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -1352,7 +1352,7 @@
         "args": ["16", "384", "true", "2"]
       },
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -1380,7 +1380,7 @@
         "args": ["32", "3072", "true", "2"]
       },
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -1437,7 +1437,7 @@
         "args": ["64", "7168", "true", "2"]
       },
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -1467,7 +1467,7 @@
         "args": ["64", "16384", "true", "2"]
       },
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -1661,7 +1661,7 @@
         "args": ["64", "7168", "false", "4"]
       },
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -1687,7 +1687,7 @@
       },
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
       "symbol": "opus_gemm_gfx950_pin_agpr_9227",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": [
         "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::matrix, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds>"
       ]
@@ -1716,7 +1716,7 @@
       "expected_kernel_calls": 1,
       "launches": {"65536,16384,1536": {"grid": [64, 256, 1], "block": [256, 1, 1], "dynamic_lds_bytes": 0}},
       "pointer_alignment": {"a": 16, "b": 16, "out": 16, "sfa": 16, "sfb": 1, "workspace": null},
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": [
         "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_fixed_traits<opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, true>, 65536, 16384, 1536, false>"
       ]
@@ -1743,7 +1743,7 @@
         "args": ["64", "0", "false", "2"]
       },
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": [
         "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_fixed_traits<opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, true>, 1920, 7168, 768, false>"
       ]
@@ -1774,7 +1774,7 @@
       "workspace_bytes": 0,
       "expected_kernel_calls": 1,
       "launches": {"12288,7168,3072": {"grid": [28, 48, 1], "block": [256, 1, 1], "dynamic_lds_bytes": 0}},
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -1803,7 +1803,7 @@
       "workspace_bytes": 0,
       "expected_kernel_calls": 1,
       "launches": {"28672,16384,1536": {"grid": [64, 112, 1], "block": [256, 1, 1], "dynamic_lds_bytes": 0}},
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -1832,7 +1832,7 @@
       "workspace_bytes": 0,
       "expected_kernel_calls": 1,
       "launches": {"1664,16384,1536": {"grid": [64, 7, 1], "block": [256, 1, 1], "dynamic_lds_bytes": 0}},
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -1861,7 +1861,7 @@
       "workspace_bytes": 0,
       "expected_kernel_calls": 1,
       "launches": {"1280,65536,1536": {"grid": [256, 5, 1], "block": [256, 1, 1], "dynamic_lds_bytes": 0}},
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -1890,7 +1890,7 @@
       "workspace_bytes": 0,
       "expected_kernel_calls": 1,
       "launches": {"57344,16384,1536": {"grid": [64, 224, 1], "block": [256, 1, 1], "dynamic_lds_bytes": 0}},
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -1919,7 +1919,7 @@
       "workspace_bytes": 0,
       "expected_kernel_calls": 1,
       "launches": {"57344,7168,7168": {"grid": [28, 224, 1], "block": [256, 1, 1], "dynamic_lds_bytes": 0}},
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -1948,7 +1948,7 @@
       "workspace_bytes": 0,
       "expected_kernel_calls": 1,
       "launches": {"4096,7168,3072": {"grid": [28, 16, 1], "block": [256, 1, 1], "dynamic_lds_bytes": 0}},
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -1977,7 +1977,7 @@
       "workspace_bytes": 0,
       "expected_kernel_calls": 1,
       "launches": {"1792,65536,1536": {"grid": [256, 7, 1], "block": [256, 1, 1], "dynamic_lds_bytes": 0}},
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -2006,7 +2006,7 @@
       "workspace_bytes": 0,
       "expected_kernel_calls": 1,
       "launches": {"28672,7168,3072": {"grid": [28, 112, 1], "block": [256, 1, 1], "dynamic_lds_bytes": 0}},
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -2035,7 +2035,7 @@
       "workspace_bytes": 0,
       "expected_kernel_calls": 1,
       "launches": {"4096,7168,768": {"grid": [28, 16, 1], "block": [256, 1, 1], "dynamic_lds_bytes": 0}},
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -2064,7 +2064,7 @@
       "workspace_bytes": 0,
       "expected_kernel_calls": 1,
       "launches": {"49152,7168,768": {"grid": [28, 192, 1], "block": [256, 1, 1], "dynamic_lds_bytes": 0}},
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -2093,7 +2093,7 @@
       "workspace_bytes": 0,
       "expected_kernel_calls": 1,
       "launches": {"10240,16384,1536": {"grid": [64, 40, 1], "block": [256, 1, 1], "dynamic_lds_bytes": 0}},
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -2122,7 +2122,7 @@
       "workspace_bytes": 0,
       "expected_kernel_calls": 1,
       "launches": {"28672,6144,7168": {"grid": [24, 112, 1], "block": [256, 1, 1], "dynamic_lds_bytes": 0}},
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -2152,7 +2152,7 @@
       "expected_kernel_calls": 1,
       "launches": {"65536,16384,1536": {"grid": [64, 256, 1], "block": [256, 1, 1], "dynamic_lds_bytes": 0}},
       "pointer_alignment": {"a": 16, "b": 16, "out": 16, "sfa": 16, "sfb": 1, "workspace": null},
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": [
         "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_fixed_traits<opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, true>, 65536, 16384, 1536, false>"
       ]
@@ -2183,7 +2183,7 @@
       "workspace_bytes": 0,
       "expected_kernel_calls": 1,
       "launches": {"1984,65536,1536": {"grid": [256, 8, 1], "block": [256, 1, 1], "dynamic_lds_bytes": 0}},
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -2212,7 +2212,7 @@
       "workspace_bytes": 0,
       "expected_kernel_calls": 1,
       "launches": {"1984,7168,16384": {"grid": [28, 8, 1], "block": [256, 1, 1], "dynamic_lds_bytes": 0}},
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -2241,7 +2241,7 @@
       "workspace_bytes": 0,
       "expected_kernel_calls": 1,
       "launches": {"6144,16384,1536": {"grid": [64, 24, 1], "block": [256, 1, 1], "dynamic_lds_bytes": 0}},
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -2270,7 +2270,7 @@
       "workspace_bytes": 0,
       "expected_kernel_calls": 1,
       "launches": {"32768,7168,3072": {"grid": [28, 128, 1], "block": [256, 1, 1], "dynamic_lds_bytes": 0}},
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -2299,7 +2299,7 @@
       "workspace_bytes": 0,
       "expected_kernel_calls": 1,
       "launches": {"32768,16384,1536": {"grid": [64, 128, 1], "block": [256, 1, 1], "dynamic_lds_bytes": 0}},
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": ["opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"]
     },
     {
@@ -2320,7 +2320,7 @@
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
       "symbol": "opus_gemm_gfx950_pin_agpr_9260",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": [
         "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 0>"
       ],
@@ -2344,7 +2344,7 @@
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
       "symbol": "opus_gemm_gfx950_pin_agpr_9261",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": [
         "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 0>"
       ],
@@ -2368,7 +2368,7 @@
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
       "symbol": "opus_gemm_gfx950_pin_agpr_9274",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": [
         "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 4>"
       ],
@@ -2392,7 +2392,7 @@
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
       "symbol": "opus_gemm_gfx950_pin_agpr_9275",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": [
         "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 4>"
       ],
@@ -2416,7 +2416,7 @@
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
       "symbol": "opus_gemm_gfx950_pin_agpr_9276",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": [
         "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 8>"
       ],
@@ -2440,7 +2440,7 @@
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
       "symbol": "opus_gemm_gfx950_pin_agpr_9277",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": [
         "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 8>"
       ],
@@ -2464,7 +2464,7 @@
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
       "symbol": "opus_gemm_gfx950_pin_agpr_9278",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": [
         "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 16>"
       ],
@@ -2488,7 +2488,7 @@
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
       "symbol": "opus_gemm_gfx950_pin_agpr_9279",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": [
         "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 16>"
       ],
@@ -2516,7 +2516,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9300",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -2541,7 +2541,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9301",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -2566,7 +2566,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9302",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -2591,7 +2591,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9303",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -2616,7 +2616,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9304",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -2641,7 +2641,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9305",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -2666,7 +2666,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9306",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -2691,7 +2691,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9307",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -2716,7 +2716,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9308",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -2741,7 +2741,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9309",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -2766,7 +2766,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9310",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -2791,7 +2791,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9311",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -2816,7 +2816,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9312",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -2841,7 +2841,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9313",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -2866,7 +2866,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9314",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -2891,7 +2891,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9315",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -2916,7 +2916,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9320",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -2941,7 +2941,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9340",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -2966,7 +2966,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9341",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -2991,7 +2991,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9342",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -3016,7 +3016,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9343",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -3041,7 +3041,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9344",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -3066,7 +3066,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9345",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -3091,7 +3091,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9346",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -3116,7 +3116,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9347",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -3141,7 +3141,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9356",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -3166,7 +3166,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9357",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -3191,7 +3191,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9358",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -3216,7 +3216,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9359",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -3241,7 +3241,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9360",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -3266,7 +3266,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9361",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -3291,7 +3291,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9362",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -3316,7 +3316,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9363",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -3341,7 +3341,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9364",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -3366,7 +3366,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9365",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -3391,7 +3391,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9366",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -3416,7 +3416,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9367",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -3442,7 +3442,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9380",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70087,
@@ -3467,7 +3467,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9381",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70088,
@@ -3492,7 +3492,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9382",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70089,
@@ -3517,7 +3517,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9383",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70090,
@@ -3542,7 +3542,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9384",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70091,
@@ -3567,7 +3567,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9385",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70092,
@@ -3592,7 +3592,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9386",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70093,
@@ -3617,7 +3617,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9387",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70094,
@@ -3642,7 +3642,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9388",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70095,
@@ -3667,7 +3667,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9389",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70096,
@@ -3692,7 +3692,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9390",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70097,
@@ -3717,7 +3717,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9391",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70098,
@@ -3742,7 +3742,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9392",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70099,
@@ -3767,7 +3767,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9393",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70100,
@@ -3792,7 +3792,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9394",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70101,
@@ -3817,7 +3817,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9395",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70102,
@@ -3842,7 +3842,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9396",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70103,
@@ -3867,7 +3867,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9397",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70104,
@@ -3892,7 +3892,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9398",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70105,
@@ -3917,7 +3917,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9399",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70106,
@@ -3942,7 +3942,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9400",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70107,
@@ -3967,7 +3967,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9401",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70108,
@@ -3992,7 +3992,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9402",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70109,
@@ -4017,7 +4017,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9403",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70110,
@@ -4059,7 +4059,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9410",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70111,
@@ -4101,7 +4101,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9411",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70112,
@@ -4143,7 +4143,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9412",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70113,
@@ -4185,7 +4185,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9413",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70114,
@@ -4227,7 +4227,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9414",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70115,
@@ -4269,7 +4269,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9415",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70116,
@@ -4311,7 +4311,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9416",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70117,
@@ -4353,7 +4353,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9417",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70118,
@@ -4395,7 +4395,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9418",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70119,
@@ -4419,7 +4419,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9420",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -4444,7 +4444,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9421",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -4469,7 +4469,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9422",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -4494,7 +4494,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9423",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -4519,7 +4519,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9424",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -4563,7 +4563,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9427",
       "grid_layout": "linear",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70127,
@@ -4606,7 +4606,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9428",
       "grid_layout": "linear",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70128,
@@ -4649,7 +4649,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9429",
       "grid_layout": "linear",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70129,
@@ -4692,7 +4692,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9430",
       "grid_layout": "linear",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70130,
@@ -4735,7 +4735,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9431",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70131,
@@ -4778,7 +4778,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9432",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70132,
@@ -4821,7 +4821,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9433",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70133,
@@ -4864,7 +4864,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9434",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70134,
@@ -4907,7 +4907,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9435",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70138,
@@ -4950,7 +4950,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9440",
       "grid_layout": "linear",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70139,
@@ -4993,7 +4993,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9441",
       "grid_layout": "linear",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70141,
@@ -5036,7 +5036,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9443",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70142,
@@ -5079,7 +5079,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9444",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70124,
@@ -5118,7 +5118,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9425",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -5158,7 +5158,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9426",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -5179,7 +5179,7 @@
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
       "symbol": "opus_gemm_gfx950_pin_agpr_9436",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": [
         "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_fixed_traits<opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 0>,0,0,1536,false>"
       ],
@@ -5205,7 +5205,7 @@
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
       "symbol": "opus_gemm_gfx950_pin_agpr_9437",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": [
         "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_fixed_traits<opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 8>,0,0,0,false>"
       ],
@@ -5231,7 +5231,7 @@
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
       "symbol": "opus_gemm_gfx950_pin_agpr_9439",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": [
         "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_fixed_traits<opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 0>,0,0,384,false>"
       ],
@@ -5257,7 +5257,7 @@
       "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
       "symbol": "opus_gemm_gfx950_pin_agpr_9442",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
       "body_args": [
         "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_fixed_traits<opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 8>,0,0,0,false>"
       ],
@@ -5306,7 +5306,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9445",
       "grid_layout": "linear",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70144,
@@ -5349,7 +5349,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9446",
       "grid_layout": "linear",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70145,
@@ -5392,7 +5392,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9447",
       "grid_layout": "linear",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70146,
@@ -5435,7 +5435,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9448",
       "grid_layout": "linear",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70147,
@@ -5478,7 +5478,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9449",
       "grid_layout": "linear",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70148,
@@ -5521,7 +5521,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9450",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70149,
@@ -5564,7 +5564,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9451",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70150,
@@ -5607,7 +5607,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9452",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70151,
@@ -5650,7 +5650,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9453",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70152,
@@ -5693,7 +5693,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9454",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 70153,
@@ -5733,7 +5733,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9455",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -5774,7 +5774,7 @@
       "body_func": "opus_gemm_bpreshuffle_pingpong_lds_body",
       "symbol": "opus_gemm_gfx950_lds_panel_9456",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh",
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",
       "body_args": ["CoTraits"]
     },
     {
@@ -5819,8 +5819,8 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9457",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh",
-      "traits_header": "opus_gemm_traits_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh"
     },
     {
       "kid": 70156,
@@ -5864,8 +5864,8 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9458",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh",
-      "traits_header": "opus_gemm_traits_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh"
     },
     {
       "kid": 70157,
@@ -5909,8 +5909,8 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9459",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh",
-      "traits_header": "opus_gemm_traits_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh"
     },
     {
       "kid": 70158,
@@ -5954,8 +5954,8 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9460",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh",
-      "traits_header": "opus_gemm_traits_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh"
     },
     {
       "kid": 70159,
@@ -5999,8 +5999,8 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9461",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh",
-      "traits_header": "opus_gemm_traits_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh"
     },
     {
       "kid": 70160,
@@ -6044,8 +6044,8 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_b_direct_9462",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh",
-      "traits_header": "opus_gemm_traits_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh"
     },
     {
       "kid": 72728,
@@ -6070,7 +6070,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_pingpong_lds_72728",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh"
     },
     {
       "kid": 72729,
@@ -6095,7 +6095,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_pingpong_lds_72729",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_pingpong_lds_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh"
     },
     {
       "kid": 72730,
@@ -6120,7 +6120,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_wave_interleave_72730",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_wave_interleave_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_interleave_gfx950.cuh"
     },
     {
       "kid": 72731,
@@ -6145,7 +6145,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_wave_interleave_72731",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_wave_interleave_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_interleave_gfx950.cuh"
     },
     {
       "kid": 72732,
@@ -6170,7 +6170,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_wave_interleave_72732",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_wave_interleave_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_interleave_gfx950.cuh"
     },
     {
       "kid": 72733,
@@ -6195,7 +6195,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_wave_interleave_72733",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_wave_interleave_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_interleave_gfx950.cuh"
     },
     {
       "kid": 72734,
@@ -6220,7 +6220,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_wave_interleave_72734",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_wave_interleave_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_interleave_gfx950.cuh"
     },
     {
       "kid": 72735,
@@ -6245,7 +6245,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_wave_interleave_72735",
       "grid_layout": "n_m",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_wave_interleave_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_interleave_gfx950.cuh"
     },
     {
       "kid": 72736,
@@ -6270,7 +6270,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_prefetch_b_vgpr_72736",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 72737,
@@ -6295,7 +6295,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_prefetch_b_vgpr_72737",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 72738,
@@ -6320,7 +6320,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_prefetch_b_vgpr_72738",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     },
     {
       "kid": 72739,
@@ -6345,7 +6345,7 @@
       "body_args": ["CoTraits"],
       "symbol": "opus_gemm_gfx950_prefetch_b_vgpr_72739",
       "grid_layout": "xcd",
-      "pipeline_header": "opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_prefetch_b_vgpr_gfx950.cuh"
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     }
   ]
 }
