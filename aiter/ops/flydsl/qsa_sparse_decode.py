@@ -181,10 +181,22 @@ def flydsl_qsa_sparse_decode(
         )
     else:
         part_m, part_l, part_o = workspace
-        for name, tensor in zip(("part_m", "part_l", "part_o"), workspace):
+        # The kernels index each buffer as a flat f32 array from its data pointer.
+        for name, tensor, min_numel in (
+            ("part_m", part_m, partial_rows),
+            ("part_l", part_l, partial_rows),
+            ("part_o", part_o, partial_rows * HEAD_DIM),
+        ):
             _check_device(f"workspace.{name}", tensor, q.device)
-        if part_m.numel() < partial_rows or part_o.numel() < partial_rows * HEAD_DIM:
-            raise ValueError("`workspace` is too small for this batch and split count.")
+            if tensor.dtype != torch.float32 or not tensor.is_contiguous():
+                raise ValueError(
+                    f"`workspace.{name}` must be a contiguous float32 tensor."
+                )
+            if tensor.numel() < min_numel:
+                raise ValueError(
+                    f"`workspace.{name}` needs >= {min_numel} elements for this "
+                    f"batch and split count, got {tensor.numel()}."
+                )
 
     attn = build_sparse_decode_attn(
         group_size=group_size,
