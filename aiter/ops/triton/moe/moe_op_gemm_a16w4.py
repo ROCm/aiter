@@ -6,6 +6,7 @@ from functools import lru_cache
 
 import torch
 import triton
+from packaging.version import Version
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4 import (
     _moe_gemm_a16w4_swizzle as _moe_gemm_a16w4_gluon_gfx950_swizzle,
@@ -104,14 +105,7 @@ def get_kernel_config_triton(m, n, k, routing_data):
         f"bm{block_m}_n{n}_k{k}"
     )
     if tuned is not None:
-        nonkdim = tuned.get("matrix_instr_nonkdim", 16)
-        # Triton 3.6 fails LLVM lowering of bm128_n5120_k768 at nonkdim 16
-        # (unrealized_conversion_cast). 3.8 is faster with 16.
-        if block_m == 128 and n == 5120 and k == 768 and nonkdim == 16:
-            major, minor = (int(p) for p in triton.__version__.split(".")[:2])
-            if (major, minor) < (3, 8):
-                nonkdim = 32
-        return {
+        config = {
             "block_m": block_m,
             "block_n": tuned["BLOCK_SIZE_N"],
             "block_k": tuned["BLOCK_SIZE_K"],
@@ -122,9 +116,23 @@ def get_kernel_config_triton(m, n, k, routing_data):
             "w_cache_modifier": w_cache_modifier,
             "split_k": split_k,
             "waves_per_eu": tuned.get("waves_per_eu", 0),
-            "matrix_instr_nonkdim": nonkdim,
+            "matrix_instr_nonkdim": tuned.get("matrix_instr_nonkdim", 16),
             "kpack": tuned.get("kpack", 1),
         }
+        # Below 3.8, bm128_n5120_k768 stays on the #5667 row. nonkdim 16
+        # fails LLVM lowering on 3.6, and stages=1 / waves=0 / kpack=2
+        # is slower than that row on 3.6 and 3.7.
+        if (
+            block_m == 128
+            and n == 5120
+            and k == 768
+            and Version(triton.__version__) < Version("3.8")
+        ):
+            config["num_stages"] = 2
+            config["waves_per_eu"] = 2
+            config["matrix_instr_nonkdim"] = 32
+            config["kpack"] = 1
+        return config
 
     num_stages = 1
     block_k = 256
