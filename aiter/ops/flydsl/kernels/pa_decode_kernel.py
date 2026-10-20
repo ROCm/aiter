@@ -146,7 +146,8 @@ def compile_pa_decode_tile(
 
     Masked V bytes must remain finite because ``0 * NaN == NaN`` in PV MFMA.
     Pages past the sequence are pinned to block 0; callers must leave the
-    unwritten tail of the last owned page finite. ``wide_kv_addressing`` protects
+    unwritten tail of the last owned page finite. NHD zero-fills that tail, so
+    it may hold any bytes. ``wide_kv_addressing`` protects
     offsets at 2 GiB; ``kv_buffer_u32`` proves both FP8 caches are below 4 GiB
     and permits unsigned buffer offsets instead of i64. For NHD it also widens
     the head term, and the in-page term stays i32.

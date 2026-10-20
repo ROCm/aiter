@@ -50,6 +50,15 @@ def d256_pipe(
     )
 
 
+def d256_page64_pipe(
+    arch, kv_dtype, head_dim, block_size, query_length, query_group_size
+) -> bool:
+    """The page-64 shapes of ``d256_pipe``, the only ones NHD supports."""
+    return block_size == 64 and d256_pipe(
+        arch, kv_dtype, head_dim, block_size, query_length, query_group_size
+    )
+
+
 def max_tiles_per_task(num_seqs, work_capacity, num_partitions, max_context_length):
     """Host bound on the KV tiles one dense planned task owns.
 
@@ -330,15 +339,17 @@ class PaDecodeSchedule:
         # single-buffered CTAs still fit in LDS and registers. Staged page ids
         # can use the room the second CTA needs; then two buffers win. Two
         # M-tiles exceed the 256 VGPRs a second CTA per SIMD allows.
-        wide_grid = nhd_layout and split_workgroups > num_compute_units
-        single_bytes = _nhd_single_cta_bytes(
-            stage_pages, M_TILES, per_token_kv, single_tile_plan
+        one_v_buf = (
+            nhd_layout
+            and split_workgroups > num_compute_units
+            and M_TILES == 1
+            and 2
+            * _nhd_single_cta_bytes(
+                stage_pages, M_TILES, per_token_kv, single_tile_plan
+            )
+            <= LDS_BYTES_PER_CU
         )
-        NHD_V_BUFS = (
-            1
-            if wide_grid and M_TILES == 1 and 2 * single_bytes <= LDS_BYTES_PER_CU
-            else (2 if nhd_layout else 1)
-        )
+        NHD_V_BUFS = 2 if nhd_layout and not one_v_buf else 1
 
         # Prefetch supported single-M query tiles independently of grid size.
         prefetch_v = (

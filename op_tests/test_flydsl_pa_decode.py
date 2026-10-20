@@ -12,7 +12,7 @@ from itertools import product
 import pytest
 import torch
 
-from aiter import per_tensor_quant, pertoken_quant
+from aiter import dtypes, per_tensor_quant, pertoken_quant
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 
@@ -97,12 +97,13 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
 @pytest.mark.parametrize(
     "shape", ["page64", "nhd", "page16", "window", "head128", "rows64"]
 )
-def test_prepare_pa_decode_plan_default_budget(shape, device, tmp_path):
+def test_prepare_pa_decode_plan_default_budget(shape, device, tmp_path, monkeypatch):
     """A cache miss plans dense page-64 head-256 pipe shapes at the CU count."""
     from aiter.ops.flydsl.pa_decode_tuning import prepare_pa_decode_plan
 
+    monkeypatch.delenv("FLYDSL_AUTOTUNE", raising=False)
     arch = get_gfx_runtime()
-    fp8 = torch.float8_e4m3fn if arch == "gfx950" else torch.float8_e4m3fnuz
+    fp8 = dtypes.fp8
     page = 16 if shape == "page16" else 64
     dim = 128 if shape == "head128" else 256
     group = 16 if shape == "rows64" else 8
@@ -462,7 +463,7 @@ _PIPE_CASES = [
             "kv_heads": 3,
             "lengths": (1, 65, 32600),
             "max_partitions": 32,
-            "head_major": True,
+            "nhd_order": "head",
             "pool_blocks": 2**15 + 1,
             "wide": True,
             "nhd_bufs": 1,
@@ -476,6 +477,19 @@ _PIPE_CASES = [
             "max_partitions": 8,
             "nhd_bufs": 2,
             "nhd_contracts": True,
+        },
+    ),
+    # Every KV head in one token row: a head stride of one K/V row pair and a
+    # token stride of all heads' rows.
+    (
+        "nhd-d256-page64-hkv2-token-rows",
+        {
+            **_NHD_BASE,
+            "kv_heads": 2,
+            "nhd_order": "token",
+            "lengths": (1, 65, 257, 4097),
+            "max_partitions": 8,
+            "nhd_bufs": 2,
         },
     ),
     # Two M-tiles always take two V buffers. The longest sequence gives tasks
@@ -548,7 +562,7 @@ _PIPE_CASES = [
         },
     ),
     (
-        "nhd-d256-page64-per-token-wide",
+        "nhd-d256-page64-per-token-wide-grid",
         {
             **_NHD_BASE,
             "scale_mode": "per-token",
@@ -659,49 +673,52 @@ def _one_hot_kv(key, value, table, context, compute_type, tokens_per_channel=256
     )
 
 
-def _nhd_caches(key, value, table, context, head_major, pool_blocks=None):
+def _nhd_caches(key, value, table, context, order, pool_blocks=None):
     """K and V views of one [page, token, KV head, 2 * dim] row store.
 
-    Unwritten V tails hold FP8 NaN: the kernel must zero-fill them because
-    0 * NaN would poison PV. Pool blocks past the table's pages stay unwritten.
+    ``order`` is the storage order outside the rows: "token" puts every KV
+    head in one token row, "page" puts each head's page contiguous within a
+    block, and "head" makes KV heads outermost. Unwritten K and V tails hold
+    FP8 NaN: masking must drop K tails, and the kernel must zero-fill V tails
+    because 0 * NaN would poison PV. Pool blocks past the table's pages stay
+    unwritten.
     """
     pages, kv_heads, page, dim = key.shape
     pool = pool_blocks or pages
-    if head_major:
-        rows = torch.empty(
-            (kv_heads, pool, page, 2 * dim), dtype=key.dtype, device=key.device
-        ).transpose(0, 1)
+    options = {"dtype": key.dtype, "device": key.device}
+    if order == "head":
+        rows = torch.empty((kv_heads, pool, page, 2 * dim), **options).transpose(0, 1)
+    elif order == "token":
+        rows = torch.empty((pool, page, kv_heads, 2 * dim), **options).transpose(1, 2)
     else:
-        rows = torch.empty(
-            (pool, kv_heads, page, 2 * dim), dtype=key.dtype, device=key.device
-        )
+        rows = torch.empty((pool, kv_heads, page, 2 * dim), **options)
     rows[:pages, ..., :dim] = key
     rows[:pages, ..., dim:] = value
     nan = torch.tensor(0x7F, dtype=torch.uint8, device=key.device).view(key.dtype)
     for seq, length in enumerate(context.tolist()):
         if length % page:
-            rows[table[seq, length // page], :, length % page :, dim:] = nan
+            rows[table[seq, length // page], :, length % page :] = nan
     return rows.transpose(1, 2).split(dim, dim=-1)
 
 
 def _check_pipe_policy(pa, case, arch, compile_kwargs):
     """Pin the selected specialization so a case cannot drift off its path."""
-    from aiter.ops.flydsl.kernels.pa_decode.traits import PaDecodeSchedule
+    from aiter.ops.flydsl.kernels.pa_decode.traits import (
+        PaDecodeSchedule,
+        PaDecodeTraits,
+    )
 
     assert compile_kwargs[-1]["wide_kv_addressing"] == case["wide"]
     if case["pipe"]:
-        # The cache key ends with (D256_PIPE, staged page ids, NHD, NHD V buffers).
         schedule_kwargs = dict(compile_kwargs[-1])
         schedule_kwargs.pop("architecture", None)
         schedule_kwargs.pop("direct_output", None)
-        pipe, staged, _, nhd_bufs = PaDecodeSchedule.select(**schedule_kwargs).cache_key[
-            -4:
-        ]
-        assert pipe == (arch == "gfx950")
-        if pipe:
-            assert (staged > 0) == (case["staged"] is not False)
+        traits = PaDecodeTraits.create(PaDecodeSchedule.select(**schedule_kwargs))
+        assert traits.D256_PIPE == (arch == "gfx950")
+        if traits.D256_PIPE:
+            assert (traits.stage_page_capacity > 0) == (case["staged"] is not False)
             if case["nhd_bufs"]:
-                assert nhd_bufs == case["nhd_bufs"]
+                assert traits.NHD_V_BUFS == case["nhd_bufs"]
 
 
 def _check_nhd_contracts(pa, output, arguments, options, plan, check):
@@ -787,7 +804,7 @@ def test_pa_decode(case, device, monkeypatch):
             "capture": False,
             "lengths": None,
             "layout": "packed",
-            "head_major": False,
+            "nhd_order": "page",
             "pool_blocks": None,
             "budget": None,
             "table_width": None,
@@ -874,7 +891,7 @@ def test_pa_decode(case, device, monkeypatch):
     pages = key.shape[0]
     if nhd:
         key_cache, value_cache = _nhd_caches(
-            key, value, table, context, case["head_major"], case["pool_blocks"]
+            key, value, table, context, case["nhd_order"], case["pool_blocks"]
         )
     else:
         key_cache = (
@@ -990,7 +1007,7 @@ def test_pa_decode_nhd_rejected(variant, device, monkeypatch):
     if (variant == "arch") == (arch == "gfx950"):
         pytest.skip(f"{variant} is not a rejected NHD variant on {arch}")
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    fp8 = torch.float8_e4m3fn if arch == "gfx950" else torch.float8_e4m3fnuz
+    fp8 = dtypes.fp8
 
     def unexpected_compile(**_):
         pytest.fail("rejected NHD inputs reached kernel compilation")

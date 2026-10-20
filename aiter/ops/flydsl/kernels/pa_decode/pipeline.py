@@ -582,10 +582,11 @@ class PaDecodePipeline:
             m_new.append(m_new_m)
             corr_reg.append(corr_m)
         if const_expr(self.traits.NHD_V_BUFS == 2):
-            # vmcnt retires in issue order, and this tile's DMA is followed
-            # only by the next tile's K (none on the last tile) and DMA.
+            # vmcnt retires in issue order. This tile's DMA is followed by the
+            # next tile's K loads (none on the last tile) and DMA; any other
+            # later load only makes the wait stricter.
             fx.rocdl.sched_barrier(0)
-            if tt1 < self.ctx.part_end:
+            if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
                 fx.rocdl.s_waitcnt(vmcnt=self.traits.NHD_K_LOADS + self.traits.NHD_DMAS)
             else:
                 fx.rocdl.s_waitcnt(vmcnt=self.traits.NHD_DMAS)
