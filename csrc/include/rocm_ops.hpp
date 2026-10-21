@@ -653,7 +653,8 @@ namespace py = pybind11;
           py::arg("reg_ptr"),                                                        \
           py::arg("reg_bytes"),                                                      \
           py::arg("use_1stage"),                                                     \
-          py::arg("bf16_out_ptr") = static_cast<int64_t>(0));                        \
+          py::arg("bf16_out_ptr") = static_cast<int64_t>(0),                         \
+          py::arg("gemma_norm")   = false);                                          \
     m.def("fused_qknorm_allreduce",                                                  \
           &aiter::fused_qknorm_allreduce,                                            \
           py::arg("_fa"),                                                            \
@@ -1911,8 +1912,13 @@ namespace py = pybind11;
           &aiter::init_custom_qr,                                                          \
           py::arg("rank"),                                                                 \
           py::arg("world_size"),                                                           \
-          py::arg("qr_max_size") = std::nullopt);                                          \
+          py::arg("qr_max_size") = std::nullopt,                                           \
+          py::arg("quant_level") = std::nullopt);                                          \
     m.def("qr_destroy", &aiter::qr_destroy, "qr_destroy(int fa) -> ()", py::arg("fa"));    \
+    m.def("qr_uses_pull_q4",                                                               \
+          &aiter::qr_uses_pull_q4,                                                         \
+          "qr_uses_pull_q4(int fa) -> bool",                                               \
+          py::arg("fa"));                                                                  \
     m.def("qr_all_reduce",                                                                 \
           &aiter::qr_all_reduce,                                                           \
           "qr_all_reduce(int fa, Tensor inp, Tensor out,"                                  \

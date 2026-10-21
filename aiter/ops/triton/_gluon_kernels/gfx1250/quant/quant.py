@@ -278,23 +278,24 @@ def _mxfp8_downcast_op(
     BLOCK_SIZE_N: gl.constexpr,
     BLOCK_SIZE_M: gl.constexpr,
     MXFP8_QUANT_BLOCK_SIZE: gl.constexpr,
-    num_warps: gl.constexpr,
+    SCALING_MODE: gl.constexpr,
 ):
-    """x (fp32) -> fp8 e4m3 with a per-block e8m0 scale."""
+    """x (fp32) -> fp8 e4m3 with a per-block e8m0 scale.
+    SCALING_MODE: 0 is "even" (mx_e8m0_scale), 1 is "ceil" (2^ceil(log2(amax / 448)),
+    with amax floored at 1e-8)."""
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP8_QUANT_BLOCK_SIZE
     x_grouped = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP8_QUANT_BLOCK_SIZE)
     amax = gl.max(gl.abs(x_grouped), axis=-1, keep_dims=True)
-    bs_e8m0 = mx_e8m0_scale(amax, 8)
+    if SCALING_MODE == 0:
+        bs_e8m0 = mx_e8m0_scale(amax, 8)
+    else:
+        # An all-zero block has no scale. Floor the amax at 1e-8.
+        amax_bits = gl.maximum(amax, 1e-8).to(gl.uint32, bitcast=True)
+        # 448 is 1.75 * 2^8. Subtract 8 from the exponent. Adding 0x1FFFFF carries
+        # into the exponent when the mantissa is above 1.75.
+        bs_e8m0 = ((amax_bits - (8 << 23) + 0x1FFFFF) >> 23).to(gl.uint8)
     bs_e8m0 = bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
 
-    # scaled_downcast requires the scale in this compact per-thread layout.
-    compact_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, NUM_QUANT_BLOCKS],
-        threads_per_warp=[8, 4],
-        warps_per_cta=[num_warps, 1],
-        order=[1, 0],
-    )
-    bs_e8m0 = gl.convert_layout(bs_e8m0, compact_layout)
     x_fp8 = gl.amd.cdna5.scaled_downcast(x, bs_e8m0, "e4m3", axis=1)
 
     return x_fp8, bs_e8m0
@@ -315,7 +316,6 @@ def _mxfp8_quant_tile(
     BLOCK_SIZE_N: gl.constexpr,
     MXFP8_QUANT_BLOCK_SIZE: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
-    num_warps: gl.constexpr,
 ):
     """Quantize the LDS tile at compute_idx, then start its payload and scale stores."""
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP8_QUANT_BLOCK_SIZE
@@ -327,7 +327,7 @@ def _mxfp8_quant_tile(
         .to(gl.float32)
     )
     out_fp8, bs_e8m0 = _mxfp8_downcast_op(
-        x_reg, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP8_QUANT_BLOCK_SIZE, num_warps
+        x_reg, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP8_QUANT_BLOCK_SIZE, SCALING_MODE=0
     )
 
     pid_n = start_n + compute_idx
@@ -394,7 +394,6 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
         [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
     )
 
-    # order=[1,0]: N fastest; threads_per_warp=[8,4] required by scaled_downcast
     blocked_layout: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 8],
         threads_per_warp=[8, 4],
@@ -486,7 +485,6 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
             BLOCK_SIZE_N,
             MXFP8_QUANT_BLOCK_SIZE,
             NUM_BUFFERS,
-            num_warps,
         )
         compute_idx += 1
 
@@ -508,7 +506,6 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
             BLOCK_SIZE_N,
             MXFP8_QUANT_BLOCK_SIZE,
             NUM_BUFFERS,
-            num_warps,
         )
         compute_idx += 1
 
