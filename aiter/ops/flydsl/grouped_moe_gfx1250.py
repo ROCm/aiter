@@ -602,6 +602,8 @@ def _grouped_a8w4_tdm_moe(
     situ_beta=1.0,
     situ_linear_beta=1.0,
     a1_scale=None,
+    herd_topk=0,
+    herd_routed_scaling_factor=1.0,
 ):
     import functools
 
@@ -616,6 +618,10 @@ def _grouped_a8w4_tdm_moe(
 
     device = hidden_states.device
     token_num, topk = topk_ids.shape
+    if herd_topk:
+        topk = int(herd_topk)
+    herd_psum = None
+    herd_gather_w = None
     enable_ep_scatter = stage2_scatter is not None
     _compact_ctx = _flydsl_dispatch_context()
     _compact = bool(
@@ -789,7 +795,17 @@ def _grouped_a8w4_tdm_moe(
             )
     else:
         _fuse_ep_route_quant = False
-        _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
+        if herd_topk:
+            _masked_m, topids_to_rows, herd_psum, herd_gather_w = herd_route_psum_remap(
+                topk_ids,
+                topk_weight,
+                E,
+                max_m,
+                _align_m,
+                herd_routed_scaling_factor,
+            )
+        else:
+            _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
         ep_rowmap = None
     # EP gemm2-fused scatter: the ep_rowmap was allocated (and sentinel-filled by
     # the route kernel) above; build the scatter params dict for contiguous_psum_remap.
@@ -821,6 +837,8 @@ def _grouped_a8w4_tdm_moe(
         psum = stage2_scatter.compact_psum
     elif _fuse_ep_route_quant:
         psum = None
+    elif herd_psum is not None:
+        psum = herd_psum
     elif _fuse_psum_quant:
         # The remapper's scan and ep_rowmap scatter ride the quant kernel:
         # every workgroup re-derives the (E,) prefix in LDS, so this launch
@@ -886,16 +904,9 @@ def _grouped_a8w4_tdm_moe(
         else (7.0 if activation == ActivationType.Swiglu else float("inf"))
     )
     _situ_kw = {"situ_beta": situ_beta, "situ_linear_beta": situ_linear_beta}
-    _b1 = (
-        bias1.to(dtype).contiguous()
-        if (bias1 is not None and bias1.numel() > 0)
-        else None
-    )
-    _b2 = (
-        bias2.to(dtype).contiguous()
-        if (bias2 is not None and bias2.numel() > 0)
-        else None
-    )
+
+    _b1 = bias1.contiguous() if bias1 is not None and bias1.numel() > 0 else None
+    _b2 = bias2.contiguous() if bias2 is not None and bias2.numel() > 0 else None
     _is_fp4 = data_format == "fp4"
     _quant_mode = "fp4" if _is_fp4 else "fp8"
     _a_is_fp4 = 1 if _is_fp4 else 0
@@ -1039,7 +1050,7 @@ def _grouped_a8w4_tdm_moe(
     disable_gemm1_requant = _as_bool(
         os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_REQUANT"), False
     )
-    _fuse_quant = _b1 is None and not disable_gemm1_requant
+    _fuse_quant = not disable_gemm1_requant
     w1_u8 = _grouped_weight_uint8(w1)
     w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
 
@@ -1359,6 +1370,8 @@ def _grouped_a8w4_tdm_moe(
         # non-local routes read through a zero-sized descriptor (DROPPED_ROUTE_ROW),
         # so a token whose every route is remote reduces to zeros.
         gather_w = _gather_w_buf
+    elif herd_gather_w is not None:
+        gather_w = herd_gather_w
     else:
         gather_w = (
             torch.ones((token_num, topk), dtype=topk_weight.dtype, device=device)
@@ -1405,6 +1418,8 @@ def grouped_gemm_gfx1250_a8w4(
     situ_linear_beta: float = 1.0,
     stage2_scatter: Stage2ScatterContext | None = None,
     a1_scale: torch.Tensor | None = None,
+    herd_topk: int = 0,
+    herd_routed_scaling_factor: float = 1.0,
 ):
     """Grouped a8w4/a4w4 MoE on the TDM batched GEMM (gfx1250).
 
@@ -1518,6 +1533,10 @@ def grouped_gemm_gfx1250_a8w4(
     device = hidden_states.device
     token_num, topk = topk_ids.shape
     _cctx = _flydsl_dispatch_context()
+    if herd_topk:
+        if _cctx is not None:
+            raise ValueError("herd_topk does not support a MegaMoE dispatch context")
+        topk = herd_topk
     _csv_tokens = token_num
     if _cctx is not None and getattr(_cctx, "compact_layout", False):
         # Dummy topk_ids are (1, topk) so fused_moe does not treat compact_cap
@@ -1713,6 +1732,8 @@ def grouped_gemm_gfx1250_a8w4(
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             a1_scale=a1_scale,
+            herd_topk=herd_topk,
+            herd_routed_scaling_factor=herd_routed_scaling_factor,
             **_tdm_kw,
         )
 
@@ -1843,6 +1864,60 @@ def fused_route_psum_remap(
         stream=torch.cuda.current_stream(),
     )
     return masked_m, topids_to_rows.view(token_num, topk), psum
+
+
+@functools.cache
+def _get_compiled_route_psum_herd(topk: int):
+    from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
+        build_moe_route_psum_herd_module,
+    )
+
+    return build_moe_route_psum_herd_module(topk)
+
+
+def herd_route_psum_remap(
+    cand_ids: torch.Tensor,
+    cand_scores: torch.Tensor,
+    experts: int,
+    max_m: int,
+    tile_m: int,
+    routed_scaling_factor: float = 1.0,
+):
+    device = cand_ids.device
+    token_num, kp1 = cand_ids.shape
+    topk = kp1 - 1
+    experts = int(experts)
+    if experts > _FUSED_ROUTE_PSUM_MAX_EXPERTS:
+        raise ValueError(
+            f"herd_route_psum_remap supports at most "
+            f"{_FUSED_ROUTE_PSUM_MAX_EXPERTS} experts, got {experts}"
+        )
+    topids_to_rows = torch.empty(token_num * topk, dtype=torch.int32, device=device)
+    gather_w = torch.empty(token_num * topk, dtype=torch.float32, device=device)
+    masked_m = torch.empty(experts, dtype=torch.int32, device=device)
+    starts = torch.empty(experts, dtype=torch.int32, device=device)
+    psum = torch.empty(experts, dtype=torch.int32, device=device)
+    _get_compiled_route_psum_herd(topk)(
+        ptr_arg(cand_ids.to(torch.int32).contiguous().reshape(-1)),
+        ptr_arg(cand_scores.to(torch.float32).contiguous().reshape(-1)),
+        ptr_arg(topids_to_rows),
+        ptr_arg(gather_w),
+        ptr_arg(masked_m),
+        ptr_arg(starts),
+        ptr_arg(psum),
+        int(token_num),
+        experts,
+        int(max_m),
+        int(tile_m),
+        float(routed_scaling_factor),
+        stream=torch.cuda.current_stream(),
+    )
+    return (
+        masked_m,
+        topids_to_rows.view(token_num, topk),
+        psum,
+        gather_w.view(token_num, topk),
+    )
 
 
 def contiguous_psum(masked_m: torch.Tensor, experts: int, tile_m: int):
