@@ -1,4 +1,3 @@
-import random
 import sys
 
 import torch
@@ -86,13 +85,10 @@ def input_helper(
             : B * max_num_blks_per_seq
         ].view(B, max_num_blks_per_seq)
     else:
-        block_tables = []
-        for i in range(B):
-            block_table = [
-                random.randint(0, num_blocks - 1) for _ in range(max_num_blks_per_seq)
-            ]
-            block_tables.append(block_table)
-        block_tables = torch.tensor(block_tables, dtype=torch.int32, device="cuda")
+        # Built on the GPU: a host-to-device copy of this table faults on gfx1250.
+        block_tables = torch.randint(
+            0, num_blocks, (B, max_num_blks_per_seq), dtype=torch.int32, device="cuda"
+        )
 
     output = torch.zeros(B, H_Q, D, dtype=output_type, device="cuda")
 
@@ -221,6 +217,20 @@ def triton_max_blocks(HK, KV_BLK_SZ, HEAD_DIM):
     return (1 << 31) // (HK * KV_BLK_SZ * HEAD_DIM)
 
 
+FLUSH_BYTES = 512 << 20
+
+
+def bench_ms(fn, flush_cache=True):
+    """Per-call time in ms of fn, optionally with the caches flushed before each call."""
+    if not flush_cache:
+        return triton.testing.do_bench_cudagraph(fn, rep=100)
+    buf = torch.empty(FLUSH_BYTES, dtype=torch.uint8, device="cuda")
+    flush = lambda: buf.fill_(1)
+    # Graph replays run back to back, so time flush+fn and take the flush alone off.
+    with_flush = triton.testing.do_bench_cudagraph(lambda: (flush(), fn()), rep=100)
+    return with_flush - triton.testing.do_bench_cudagraph(flush, rep=100)
+
+
 def run_benchmark(args):
     dtype = arg_to_torch_dtype[args.dtype]
     kv_cache_dtype = arg_to_torch_dtype[args.kv_cache_dtype]
@@ -296,7 +306,7 @@ def run_benchmark(args):
 
         fn()
         torch.cuda.synchronize()
-        ms = triton.testing.do_bench_cudagraph(fn, rep=100)
+        ms = bench_ms(fn, flush_cache=not args.no_flush_cache)
 
         # query and output
         mem = (BS * HQ * HEAD_DIM) * (
@@ -352,6 +362,11 @@ def parse_args():
     parser.add_argument("-output_type", default="fp16")
     override_parser_action(parser, "--backend", default="triton")
 
+    parser.add_argument(
+        "-no_flush_cache",
+        action="store_true",
+        help="Do not flush the caches before each call (flushing is the default).",
+    )
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
     )
