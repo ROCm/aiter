@@ -28,7 +28,7 @@ struct precomputed_addresses
 // I selects a 128-row half; J selects a 128-column weight block.
 // The kernel clobbers these ranges up front so they are allocated. amdgpu_num_vgpr(128) is NOT
 // honored once all 256 AGPRs are in use, so the compiler may still hand out v128+ for temporaries:
-// keep compiler register pressure low and check every build with check_pinned.py (no
+// keep compiler register pressure low and check builds with op_tests/test_hk_fp8_moe_codegen.py (no
 // compiler-generated instruction may touch v128+ or an AGPR).
 //
 // MFMAs are operand-swapped (weights are the MFMA A operand), so the art subtile (m, n) of an

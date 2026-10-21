@@ -49,7 +49,6 @@ skips MFMAs for tile halves containing only padding rows.
 | `hk_moe.h` | C API, tensor layouts, and workspace size query |
 | `hk_moe.cu` | Routing, grouped GEMMs, quantization, combine, and launch sequence |
 | `hk_fp8_moe_entry.cu` | AITER ctypes entry points |
-| `check_pinned.py` | Assembly check for compiler instructions that touch pinned registers |
 
 ## Build and test
 
@@ -75,19 +74,28 @@ The GEMM reserves v128-v255 for operand tiles and all 256 AGPRs for accumulators
 allocation, `amdgpu_num_vgpr(128)` does not keep compiler-generated instructions out of v128-v255.
 Changes that increase register pressure can therefore corrupt operand tiles.
 
-After kernel or compiler changes, check the assembly for VGPR spills and compiler instructions that
-touch pinned registers. Set `HIP_KITTENS_DIR` to the pinned HipKittens checkout, then run from the
+After kernel or compiler changes, run the correctness suite with a fresh JIT cache, then check its
+compiler configuration for VGPR spills and instructions that touch pinned registers. Run from the
 repository root:
 
 ```bash
-hipcc -DKITTENS_CDNA4 --offload-arch=gfx950 -std=c++20 -O3 \
-    -I"${HIP_KITTENS_DIR}/include" --cuda-device-only -S \
-    csrc/kernels/hk_fp8_moe/hk_moe.cu -o /tmp/hk_moe.s
-rg 'vgpr_spill_count' /tmp/hk_moe.s
-python3 csrc/kernels/hk_fp8_moe/check_pinned.py /tmp/hk_moe.s
+export AITER_JIT_DIR="$(mktemp -d /tmp/aiter-hk-moe.XXXXXX)"
+GPU_ARCHS=gfx950 python3 op_tests/test_hk_fp8_moe.py
+python3 op_tests/test_hk_fp8_moe_codegen.py \
+    --build-dir "$AITER_JIT_DIR/build/module_hk_fp8_moe/build" \
+    --output /tmp/hk_moe.s
 ```
 
-All VGPR spill counts must be zero, and `check_pinned.py` must pass for every grouped GEMM variant.
+The code-generation test obtains the `hk_moe.cu` compile command from `ninja -t compdb`, preserving
+the JIT flags and changing only the output to device assembly. All four grouped GEMM variants must
+avoid compiler instructions that touch pinned registers, and all VGPR spill counts must be zero.
+Inline assembly implementing HipKittens tiles is excluded from the register check.
+
+To check saved assembly without PyTorch, a GPU, or the HIP compiler:
+
+```bash
+python3 op_tests/test_hk_fp8_moe_codegen.py --assembly /tmp/hk_moe.s
+```
 
 ## Compare with current AITER
 
