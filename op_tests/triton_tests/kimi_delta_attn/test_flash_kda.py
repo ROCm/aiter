@@ -390,7 +390,11 @@ def test_tuner_keeps_the_two_schedules_apart():
     # An incoming state is what makes the two output passes otherwise identical:
     # without it the unsegmented one passes h_in=None and the key picks up the
     # difference through the dtypes it appends, hiding the collision.
-    kw = {"initial_state": torch.zeros(1, 4, K_DIM, K_DIM, device=device)}
+    kw = {
+        "initial_state": torch.zeros(
+            1, 4, K_DIM, K_DIM, device=device, dtype=torch.float32
+        )
+    }
     # This is about the Triton kernel's autotuner, which never runs -- and whose
     # cache therefore stays empty -- when K2 is routed to Gluon.
     with _k2_tuner_search_space() as kern, _route(k2=False):
@@ -939,9 +943,11 @@ def test_paged_cache_rejects_overlapping_slots(outer):
     v = args[2]
     plane = H * K_DIM * K_DIM
     if outer == "expanded":
-        cache = torch.zeros(1, H, K_DIM, K_DIM, device=device).expand(3, -1, -1, -1)
+        cache = torch.zeros(
+            1, H, K_DIM, K_DIM, device=device, dtype=torch.float32
+        ).expand(3, -1, -1, -1)
     else:
-        storage = torch.zeros(3 * plane, device=device)
+        storage = torch.zeros(3 * plane, device=device, dtype=torch.float32)
         cache = torch.as_strided(
             storage,
             size=(3, H, K_DIM, K_DIM),
