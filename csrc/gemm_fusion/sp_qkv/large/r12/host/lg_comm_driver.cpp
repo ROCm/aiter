@@ -154,7 +154,7 @@ int32_t lg_comm_launch(void* h, const void* A, const void* W, const float* Ascal
     if (call_id >> 31) return -104;                                         // call_id is a 31-bit key
     LgCommArgsV3 a; std::memset(&a, 0, sizeof a);
     a.dev = c->dev; a.Swin = c->S; a.Rwin = c->R; a.Cwin = c->C;
-    a.err = c->err; a.step = c->step; a.gpeers = c->gpeers; a.call_id = call_id;
+    a.err = c->err; a.step = c->step; a.gpeers = c->gpeers; a.call_id = call_id; a.qr_wgs = LG_QR_WGS;   // r12c: the device image compares this with its own LG_QR_WGS (mismatch => CONFIG error, never a silent 64-WG launch into a 1-WG image)
     a.A = A; a.W = W; a.Ascale = Ascale; a.Wscale = Wscale;
     a.M = c->M; a.N = LG_X_N_RAW; a.K = 6144; a.strideA = strideA; a.F = LG_COMM_F; a.rank = c->rank;
     a.chunks = c->M / LG_CHUNK_ROWS; a.abi_version = LG_COMM_ABI_VERSION; a.poll_iterations = poll_iterations;

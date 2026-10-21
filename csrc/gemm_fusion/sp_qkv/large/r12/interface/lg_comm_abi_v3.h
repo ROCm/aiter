@@ -206,7 +206,7 @@ struct LgCommArgsV3 {                         /* size 352, align 8 (V2 320 B + 3
     uint32_t* err;                            /* 328 per-comm ERR word (page base); CAS-set by the first failing kernel, read at entry and in every poll */
     const LgGfPeers* gpeers;                  /* 336 peer ERR words for propagation (cold path), may be null (no propagation) */
     uint32_t call_id;                         /* 344 31-bit rank-uniform key of (site, tokens, vid, n_fused) */
-    uint32_t pad;                             /* 348 must be 0 */
+    uint32_t qr_wgs;                          /* 348 == LG_QR_WGS of the HOST build; the device compares it with its own LG_QR_WGS (guard / quiet_ready WG0 => CONFIG): a host launching 64 WGs into a 1-WG device image is refused */
 };
 static_assert(sizeof(mori::cco::ccoDevComm) == 200, "DevComm 200B");
 static_assert(std::is_trivially_copyable<mori::cco::ccoDevComm>::value, "DevComm by value");

@@ -507,14 +507,16 @@ __device__ __forceinline__ void r12_fill_nan(const LgCommArgsV3& a, uint32_t wg,
 __device__ __forceinline__ void r6_quiet_ready(const LgCommArgsV3& a) {
     const int tid = static_cast<int>(opus::thread_id_x());
     const uint32_t wg = static_cast<uint32_t>(opus::block_id_x());
-    const bool err0 = err_clear(a);                                                 // ONE ERR read at entry per workgroup (r12c)
+    const bool clr0 = err_clear(a);                                                 // ONE ERR read at entry per workgroup (r12c)
     if (wg != 0u) {                                                                 // helper WGs: no waits, no flags
-        if (!err0) r12_fill_nan(a, wg, LG_QR_WGS);                                  // ERR set before/at dispatch: fill this WG's share of R with NaN
+        if (!clr0) r12_fill_nan(a, wg, LG_QR_WGS);                                  // ERR set before/at dispatch: fill this WG's share of R with NaN
         return;                                                                     // clean launch: exit at once (block-uniform; WG0 alone runs the barriers below)
     }
+    if (a.qr_wgs != LG_QR_WGS) { if (tid == 0) set_err(a, LGC_POISON_CONFIG, LG_QR_WGS, a.qr_wgs); }   // r12c host/device LG_QR_WGS mismatch: CONFIG error (W2 below sees ERR; WG0 then fills all of R alone)
+    const bool clr0b = clr0 && (a.qr_wgs == LG_QR_WGS);                                                // WG0 treats a mismatching launch as ERR-set-by-itself (fill alone, no epoch advance)
     const uint64_t e = ld_u64(cw(a, LGC_EP_OFF));
     const uint64_t E = tag_E(a);
-    if (tid < 3 && err0) {                                                  // r12 sticky: under ERR (at entry) W2 is skipped; the reset below still runs
+    if (tid < 3 && clr0b) {                                                  // r12 sticky: under ERR (at entry) W2 is skipped; the reset below still runs
         const int d = peer_of(static_cast<int>(a.rank), tid);
         bool got = false; uint64_t v = 0ull;
         const uint64_t t0 = __builtin_amdgcn_s_memrealtime(), budget = r6_budget_ticks(a);
@@ -562,7 +564,7 @@ __device__ __forceinline__ void r6_quiet_ready(const LgCommArgsV3& a) {
             add_report(a, 5, 1);
             st_u64_rel_x(cw(a, LGC_EP_OFF), e + 1ull);
         }
-        s_fill = err0 ? 1u : (clear_now ? 0u : 2u);       // the helper WGs saw ERR == 0 at their entry and exited: if WG0 set (or saw) ERR itself, WG0 must fill all of R
+        s_fill = !clr0 ? 1u : (clear_now ? 0u : 2u);      // ERR set at WG0's entry => fill my share (the helpers fill theirs); clear at entry but set now => the helpers saw it clear and exited: WG0 fills ALL of R alone
     }
     mori::cco::impl::syncThreads();
     const uint32_t fm = s_fill;

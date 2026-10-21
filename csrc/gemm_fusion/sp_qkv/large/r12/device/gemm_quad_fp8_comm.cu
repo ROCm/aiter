@@ -571,7 +571,7 @@ __device__ __forceinline__ void gemm_body(const LgCommArgsV3& args) {
 #endif
     if (args.items_per_group != LG_ITEMS_PER_GROUP || args.abi_version != LG_COMM_ABI_VERSION || args.sdma_queues != 1u || args.chunks > LG_MAX_CHUNKS ||
         args.chunks != args.M / 256u || (HG != 2 && (args.chunks % static_cast<uint32_t>(NP)) != 0u) || args.reserved[0] != LG_R6_PLAN_CODE_N(NP, HG) || (HG == 2 && args.chunks != 8u) || args.reserved[1] == 0ull ||
-        args.N != LG_X_N_RAW || args.F != LG_COMM_F || args.err == nullptr || args.step == nullptr || args.pad != 0u
+        args.N != LG_X_N_RAW || args.F != LG_COMM_F || args.err == nullptr || args.step == nullptr || args.qr_wgs != LG_QR_WGS
 #if LG_NO_GRIDREAD == 0
         || nblocks != lgc::grid_of<NP, HG>(static_cast<int>(args.chunks)) + 1
 #endif
