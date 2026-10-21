@@ -41,7 +41,7 @@ _HGEMM_KERNEL_RE = re.compile(
     r"w(?P<m_waves>\d+)x(?P<n_waves>\d+)x(?P<k_waves>\d+)_"
     r"bias(?P<has_bias>[01])_ktail(?P<has_k_tail>[01])_"
     r"gm(?P<group_m>\d+)_p(?P<policy>ft|ht|hti)_"
-    r"(?P<target_gfx>gfx[0-9a-z]+)$"
+    r"(?P<target_gfx>gfx[0-9a-z]+(?:-[0-9a-z]+)*)$"
 )
 
 

@@ -23,6 +23,7 @@ IS_WINDOWS = sys.platform == "win32"
 # Windows ROCm ships `hipinfo` instead of `rocminfo`; the output formats differ,
 # so each has its own compute-unit parser below.
 _GPU_INFO_TOOL = "hipinfo" if IS_WINDOWS else "rocminfo"
+_GFX_ARCH_PATTERN = r"gfx[0-9a-z]+(?:-[0-9a-z]+)*"
 
 
 @functools.lru_cache(maxsize=1)
@@ -42,7 +43,10 @@ def _detect_native() -> list[str]:
     try:
         # rocminfo: "Name: gfx942"; hipinfo: "gcnArchName: gfx1200"
         for line in _gpu_info_output().splitlines():
-            match = re.search(r"\b(gfx\w+)\b", line, re.IGNORECASE)
+            # Variant targets such as gfx1250-strict are distinct compiler and
+            # code-object identities.  Keep the complete hyphenated spelling;
+            # truncating it to gfx1250 can select B0-only binaries on A0.
+            match = re.search(rf"\b({_GFX_ARCH_PATTERN})\b", line, re.IGNORECASE)
             if match:
                 return [match.group(1).lower()]
     except Exception as e:
@@ -93,6 +97,7 @@ _LDS_CAPACITY_BYTES = {
     "gfx1200": 64 * 1024,
     "gfx1201": 64 * 1024,
     "gfx1250": 320 * 1024,
+    "gfx1250-strict": 320 * 1024,
 }
 
 
@@ -156,7 +161,7 @@ def _rocminfo_gpu_agents() -> list[tuple[str, int]]:
         key, value = m.group(1), m.group(2)
         if key == "Name" and name is None:
             # Agent names can carry target-id features ("gfx942:sramecc+").
-            m2 = re.search(r"\b(gfx\w+)\b", value, re.IGNORECASE)
+            m2 = re.search(rf"\b({_GFX_ARCH_PATTERN})\b", value, re.IGNORECASE)
             name = m2.group(1) if m2 else value
         elif key == "Device Type":
             kind = value
@@ -175,7 +180,9 @@ def _hipinfo_gpu_agents() -> list[tuple[str, int]]:
     for block in re.split(r"^device#", _gpu_info_output(), flags=re.MULTILINE)[1:]:
         # gcnArchName can carry target-id features ("gfx942:sramecc+").
         name = re.search(
-            r"^gcnArchName:\s*(gfx\w+)", block, re.MULTILINE | re.IGNORECASE
+            rf"^gcnArchName:\s*({_GFX_ARCH_PATTERN})",
+            block,
+            re.MULTILINE | re.IGNORECASE,
         )
         rev = re.search(r"^asicRevision:\s*(\d+)", block, re.MULTILINE)
         if name and rev:

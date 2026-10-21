@@ -843,8 +843,8 @@ def validate_and_update_archs():
         "gfx1200",
         "gfx1201",
         "gfx1250",
+        "gfx1250-strict",
         "gfx950",
-        "gfx1250",
     ]
 
     # Validate if each element in archs is in allowed_archs
@@ -1021,7 +1021,9 @@ def _so_offload_archs(so_path):
         with open(so_path, "rb") as f, mmap.mmap(
             f.fileno(), 0, access=mmap.ACCESS_READ
         ) as mm:
-            for m in re.finditer(rb"amdhsa--(gfx[0-9a-z]+)", mm):
+            for m in re.finditer(
+                rb"amdhsa--(gfx[0-9a-z]+(?:-[0-9a-z]+)*)", mm
+            ):
                 archs.add(m.group(1).decode())
     except (OSError, ValueError, OverflowError):
         pass
@@ -1379,9 +1381,15 @@ def build_module(
         # get_gfx() alone reads the LAST entry of a multi-arch GPU_ARCHS, which
         # left "gfx1250;gfx942" building gfx1250 kernels whose cluster launch
         # path was compiled out (AiterAsmKernelFast then rejects them at launch).
-        if (
-            get_gfx() == "gfx1250" or "gfx1250" in os.environ.get("GPU_ARCHS", "")
-        ) and hip_version >= Version("7.0.0"):
+        gpu_archs_env = os.environ.get("GPU_ARCHS", "native").strip()
+        build_archs = (
+            [get_gfx()]
+            if gpu_archs_env.lower() == "native"
+            else _parse_gpu_archs_env(gpu_archs_env)
+        )
+        if any(arch in ("gfx1250", "gfx1250-strict") for arch in build_archs) and (
+            hip_version >= Version("7.0.0")
+        ):
             flags_hip += ["-DAITER_ENABLE_CLUSTER_LAUNCH"]
 
         if not torch_exclude:

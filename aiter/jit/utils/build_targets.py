@@ -27,6 +27,7 @@ GFX_MAP = {
     16: "gfx1200",
     17: "gfx1201",
     18: "gfx1250",
+    19: "gfx1250-strict",
 }
 
 # Maps gfx arch to the default (SPX / full-GPU) CU count used when no live GPU is
@@ -49,6 +50,7 @@ GFX_CU_NUM_MAP = {
     "gfx1200": 32,  # Radeon RX 9060 XT; set CU_NUM=28 for Radeon RX 9060
     "gfx1201": 64,  # Radeon RX 9070 XT / Radeon AI PRO R9700
     "gfx1250": 256,  # Gfx1250
+    "gfx1250-strict": 256,  # MI450 A0; binary-incompatible with gfx1250 (B0)
 }
 
 

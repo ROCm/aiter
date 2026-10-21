@@ -17,6 +17,7 @@ defaultDtypes = {
     "gfx1200": {"fp8": torch.float8_e4m3fn},
     "gfx1201": {"fp8": torch.float8_e4m3fn},
     "gfx1250": {"fp8": torch.float8_e4m3fn},
+    "gfx1250-strict": {"fp8": torch.float8_e4m3fn},
 }
 
 _8bit_fallback = torch.uint8

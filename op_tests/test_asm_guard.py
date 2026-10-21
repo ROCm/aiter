@@ -51,8 +51,20 @@ def test_stepping_is_plausible(detected):
 
 def test_gate_follows_detected_stepping(detected):
     arch, rev = detected
-    expected = arch != "gfx1250" or rev >= 1
+    expected = arch not in ("gfx1250", "gfx1250-strict") or (
+        arch == "gfx1250" and rev >= 1
+    )
     assert asm_guard.is_gfx1250_asm_supported() is expected
+
+
+def test_strict_target_is_always_rejected(monkeypatch):
+    monkeypatch.setattr(asm_guard, "get_gfx_runtime", lambda: "gfx1250-strict")
+    monkeypatch.setattr(
+        asm_guard,
+        "get_asic_revision",
+        lambda: pytest.fail("strict target must not depend on stepping probing"),
+    )
+    assert asm_guard._probe_stepping_ok() is False
 
 
 def test_require_follows_gate(detected):
