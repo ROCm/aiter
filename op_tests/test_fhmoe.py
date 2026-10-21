@@ -1702,11 +1702,15 @@ def test_clamp_shared_preserves_existing_positional_argument_order():
     import aiter.fhmoe as fhmoe_module
 
     parameters = list(inspect.signature(fused_moe).parameters)
-    assert parameters[-4:] == [
+    # Parameters added after clamp_shared (deterministic) are appended, so the
+    # existing positional order is kept.
+    clamp_shared = parameters.index("clamp_shared")
+    assert parameters[clamp_shared - 3 :] == [
         "quant_type_a",
         "quant_dtype_a",
         "quant_dtype_a2",
         "clamp_shared",
+        "deterministic",
     ]
     assert list(inspect.signature(fhmoe_module.fhmoe_fake).parameters)[-2:] == [
         "output",
