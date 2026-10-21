@@ -21,7 +21,7 @@ from . import p1_sweep, specs
 ARCH, CU, WORLD = "gfx950", 256, 4
 LARGE_PROFILE_SRC = (
     specs.LARGE_PROFILE_SRC
-)  # the large rows and rules run the R12 kernels (ERR page, call_id tags, NaN-fill node); "r11" to A/B
+)  # the large rows and rules run the R12 kernels (ERR page, call_id tags, NaN fill folded into quiet_ready); "r11" to A/B
 
 
 SMALL_CAPS = frozenset({"mori_cco", "gfx950_sc_bypass"})

@@ -47,7 +47,7 @@ CALL_ID_LIMIT = 1 << 31
 
 def load_driver(path: str, abi: int = 2):
     """Bind the large driver. abi 3 (r12 build, LG_COMM_ABI_VERSION >= 4): lg_launch_v1 / lg_poison_v1 are compiled out; lg_gpage_attach_v1 attaches the per-comm ERR/STEP
-    page once after lg_attach_v1; lg_launch_v2 = GEMM + quiet_ready + the NaN-fill node (the runtime must NOT add its own fill); lg_abi_info_v1 reports the ABI for the
+    page once after lg_attach_v1; lg_launch_v2 = GEMM + quiet_ready (LG_QR_WGS workgroups; the best-effort NaN fill under ERR is folded into it: there is NO separate fill node and the runtime must NOT add one); lg_abi_info_v1 reports the ABI for the
     runtime's static checks."""
     lib = C.CDLL(path)
     vp, u32, u64, i32 = C.c_void_p, C.c_uint32, C.c_uint64, C.c_int32
@@ -288,7 +288,7 @@ class LargeContext:
         stream,
         budget_us=None,
     ):
-        """R12 launch = GEMM + quiet_ready + the NaN-fill node (all in the driver; capturable, no sync/alloc). call_id is the 31-bit decision key of the tag
+        """R12 launch = GEMM + quiet_ready (all in the driver, 2 graph nodes; quiet_ready includes the best-effort NaN fill under ERR; capturable, no sync/alloc). call_id is the 31-bit decision key of the tag
         E = (STEP << 32) | call_id; the driver refuses call_id >= 2^31 (-104) and a launch without an attached page (-110).
         """
         if not 0 <= call_id < CALL_ID_LIMIT:

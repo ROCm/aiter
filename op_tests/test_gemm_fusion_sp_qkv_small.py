@@ -4106,7 +4106,8 @@ def test_jit_abi_tables_sources_and_missing_source_error():
     ) + [
         "-DLG_TAG_EARLY=1",
         "-DLG_POLL_BATCH=1",
-    ]  # r12 = r11's flags + the two r12b knobs (passed explicitly, default 1)
+        "-DLG_QR_WGS=64",
+    ]  # r12 = r11's flags + the r12b / r12c knobs (passed explicitly, defaults 1 / 1 / 64)
     with pytest.raises(ValueError, match="large src 'r13'"):
         jit.large_defs({"src": "r13"}, "dense")
     tool = dict(TOOL_SIM)
@@ -4380,7 +4381,7 @@ def test_large_rt_r12_loader_abi_check_and_launch(monkeypatch):
         ctx.launch_v3(1, 2, 3, 4, 5, 1, 0, 5, "s")
     assert not hasattr(
         ctx, "nan_fill"
-    )  # lg_launch_v2 launches the NaN-fill node itself: the runtime must not add its own
+    )  # no separate fill node exists any more (r12c folded it into quiet_ready): the runtime has nothing to launch
 
 
 def test_inputs_v3_token_arrays_call_id_and_short_arrays_are_legal(monkeypatch):
@@ -5373,8 +5374,12 @@ def test_large_r12_knobs_are_explicit_validated_and_equal_the_header_and_build_d
     d12, d11 = jit.large_defs({"src": "r12"}, "dense"), jit.large_defs(
         {"src": "r11"}, "dense"
     )
-    assert d12 == d11 + ["-DLG_TAG_EARLY=1", "-DLG_POLL_BATCH=1"] and not any(
-        "TAG_EARLY" in d or "POLL_BATCH" in d for d in d11
+    assert d12 == d11 + [
+        "-DLG_TAG_EARLY=1",
+        "-DLG_POLL_BATCH=1",
+        "-DLG_QR_WGS=64",
+    ] and not any(
+        "TAG_EARLY" in d or "POLL_BATCH" in d or "QR_WGS" in d for d in d11
     )  # r11 has no such knobs
     # the A/B: another value is another BUILD (a different key), and bad values / r11 knobs are refused before a compile
     ab = jit.large_defs({"src": "r12", "tag_early": 0, "poll_batch": 0}, "dense")
@@ -5383,6 +5388,26 @@ def test_large_r12_knobs_are_explicit_validated_and_equal_the_header_and_build_d
     assert "-DLG_POLL_BATCH=2" in jit.large_defs(
         {"src": "r12", "poll_batch": 2}, "indexer"
     )
+    # qr_wgs (r12c: the NaN fill folded into quiet_ready; 64 = default, 1 = the single-WG A/B): validated, a different build key, and the HOST build gets it too
+    one = jit.large_defs({"src": "r12", "qr_wgs": 1}, "dense")
+    assert "-DLG_QR_WGS=1" in one and "-DLG_QR_WGS=64" not in one
+    assert jit.large_cache_key(one, tool, "r12") != jit.large_cache_key(
+        d12, tool, "r12"
+    )
+    host = lambda defs: [
+        a
+        for a in jit.large_host_cmd(defs, tool, "/out", "r12")
+        if a.startswith("-DLG_")
+    ]
+    assert "-DLG_QR_WGS=64" in host(d12) and "-DLG_QR_WGS=1" in host(
+        one
+    )  # the host launches quiet_ready with LG_QR_WGS WGs: device == host
+    assert "-DLG_QR_WGS=1" in [
+        a for a in jit.large_device_cmd(one, tool, "/out", "r12") if "QR_WGS" in a
+    ]
+    for bad in (0, 2, 63, 128):
+        with pytest.raises(ValueError, match="qr_wgs must be 1 or 64"):
+            jit.large_defs({"src": "r12", "qr_wgs": bad}, "dense")
     for bad, match in (
         ({"tag_early": 2}, "tag_early must be 0 or 1"),
         ({"poll_batch": 3}, "poll_batch must be 0, 1 or 2"),
@@ -5391,6 +5416,8 @@ def test_large_r12_knobs_are_explicit_validated_and_equal_the_header_and_build_d
             jit.large_defs({"src": "r12", **bad}, "dense")
     for src in ("r11", None):
         params = {"tag_early": 0} if src is None else {"src": src, "poll_batch": 0}
+        with pytest.raises(ValueError, match="exist only in large/r12"):
+            jit.large_defs({**params, "qr_wgs": 1}, "dense")
         with pytest.raises(ValueError, match="exist only in large/r12"):
             jit.large_defs(
                 params, "dense"
@@ -5409,6 +5436,7 @@ def test_large_r12_knobs_are_explicit_validated_and_equal_the_header_and_build_d
     assert (
         header["LG_TAG_EARLY"] == int(script["LG_TAG_EARLY"]) == 1
         and header["LG_POLL_BATCH"] == int(script["LG_POLL_BATCH"]) == 1
+        and header["LG_QR_WGS"] == int(script["LG_QR_WGS"]) == 64
     )
     passed = dict(f[2:].split("=") for f in d12)
     for name, val in passed.items():

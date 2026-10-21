@@ -610,6 +610,7 @@ def large_defs(params: dict, mode: str) -> list[str]:
         "src",
         "tag_early",
         "poll_batch",
+        "qr_wgs",
     }
     extra = set(params) - allowed
     if extra:
@@ -620,9 +621,9 @@ def large_defs(params: dict, mode: str) -> list[str]:
     if ng not in (0, 1, 2):
         raise ValueError("no_gridread")
     # r12b knobs (large/r12 only; the header defaults are 1, build_device.sh passes 1): tag_early = LG_TAG_EARLY (0|1: arrival tag stored in the first-put batch),
-    # poll_batch = LG_POLL_BATCH (0|1|2: target + ERR loaded back-to-back; 2 = ERR every 8th iteration). Passed EXPLICITLY for r12 so an A/B is a different build key and a
+    # poll_batch = LG_POLL_BATCH (0|1|2: target + ERR loaded back-to-back; 2 = ERR every 8th iteration), qr_wgs = LG_QR_WGS (1|64: quiet_ready workgroups, the NaN fill folded in). Passed EXPLICITLY for r12 so an A/B is a different build key and a
     # header default change cannot move a build silently; r11 has no such knobs.
-    knobs = [k for k in ("tag_early", "poll_batch") if k in params]
+    knobs = [k for k in ("tag_early", "poll_batch", "qr_wgs") if k in params]
     if knobs and params.get("src", LARGE_SRC) != "r12":
         raise ValueError(f"{knobs} exist only in large/r12 (src=r12)")
     tag_early, poll_batch = int(params.get("tag_early", 1)), int(
@@ -632,6 +633,11 @@ def large_defs(params: dict, mode: str) -> list[str]:
         raise ValueError("tag_early must be 0 or 1")
     if poll_batch not in (0, 1, 2):
         raise ValueError("poll_batch must be 0, 1 or 2")
+    # r12c: the NaN fill is folded into quiet_ready, which runs LG_QR_WGS workgroups (64 = the default, 1 = the A1'' single-WG form identical to r11's healthy path). The HOST
+    # launches quiet_ready with LG_QR_WGS workgroups, so the host build must get the SAME value (see large_host_cmd); the vendored build_host.sh does not pass it.
+    qr_wgs = int(params.get("qr_wgs", 64))
+    if qr_wgs not in (1, 64):
+        raise ValueError("qr_wgs must be 1 or 64")
     defs = [
         f"-DLG_X_INDEXER={1 if mode == 'indexer' else 0}",
         f"-DLG_NO_GRIDREAD={ng}",
@@ -656,7 +662,11 @@ def large_defs(params: dict, mode: str) -> list[str]:
         "-DLG_ISO_DELAY_ITERS=0",
     ]
     if params.get("src", LARGE_SRC) == "r12":
-        defs += [f"-DLG_TAG_EARLY={tag_early}", f"-DLG_POLL_BATCH={poll_batch}"]
+        defs += [
+            f"-DLG_TAG_EARLY={tag_early}",
+            f"-DLG_POLL_BATCH={poll_batch}",
+            f"-DLG_QR_WGS={qr_wgs}",
+        ]
     return defs
 
 
@@ -711,6 +721,7 @@ def large_host_cmd(
             "-DLG_X_INDEXER",
             "-DLG_R8_FOLD",
             "-DLG_DEBUG_POSTCOUNT",
+            "-DLG_QR_WGS",  # r12c: the host launches quiet_ready with this many WGs: it MUST equal the device build's value
         )
     ]
     flags = hostdefs + [

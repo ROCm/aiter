@@ -133,7 +133,7 @@ def _mode_from_owner(owner: str) -> str:  # owner = "sp_qkv.large/<mode>/M<M>"
 # sha256 of large/<src>/SOURCE_SHA256.txt (pinned to the manifest files by a test)
 LARGE_SRC_SHA = {
     "r11": "9874fe1ecb3b6a997523c96210a960434179c8eab84fffc00537170d49836643",
-    "r12": "93bfbcbae1205dce2583a584832b580756f93c1cf3916c5a2e4ca93f342176ac",  # R12 (abi 3) + LG_TAG_EARLY / LG_POLL_BATCH (r12b), derived from r11
+    "r12": "b253d2a05a9bb9775273929c29844bd00e52f9fe9047da3c5c9412eafb39c68f",  # R12 (abi 3) + LG_TAG_EARLY / LG_POLL_BATCH (r12b) + the NaN fill folded into quiet_ready, LG_QR_WGS (r12c), derived from r11
 }
 
 
@@ -182,7 +182,7 @@ class SpQkvLarge(Plan):
         self.src = self.params.get("src", LARGE_SRC)
         self.abi = src_abi(
             "large", self.src
-        )  # 2 = r11 (per-plan poison word); 3 = r12 (per-comm ERR/STEP page, call_id tags, NaN-fill node inside lg_launch_v2)
+        )  # 2 = r11 (per-plan poison word); 3 = r12 (per-comm ERR/STEP page, call_id tags; the best-effort NaN fill is folded into quiet_ready, no separate node)
         self.F = _F[self.mode]
         self.owner = f"sp_qkv.large/{self.mode}/M{self.M}"
         self.build_key = (
@@ -392,7 +392,7 @@ class SpQkvLarge(Plan):
         )  # at capture once, in eager every call; a graph replay runs no Python
         if (
             self.abi >= 3
-        ):  # R12: the tag E = (STEP << 32) | call_id; the launch includes quiet_ready and the NaN-fill node
+        ):  # R12: the tag E = (STEP << 32) | call_id; the launch is GEMM + quiet_ready (which includes the best-effort NaN fill under ERR)
             if call_id is None:
                 raise ContractError(
                     f"{self.owner}: an R12 (abi {self.abi}) plan needs run(call_id=...): the 31-bit decision key of (site, tokens, vid, n_fused)"
