@@ -255,6 +255,32 @@ fwd_prefill_autotune_configs = autotune_configs(
 
 
 @triton.jit
+def attention_mask(
+    offs_m,
+    offs_n,
+    seqlen_q,
+    seqlen_k,
+    IS_CAUSAL: tl.constexpr,
+    USE_SLIDING_WINDOW: tl.constexpr,
+    WINDOW_SIZE_LEFT: tl.constexpr,
+    WINDOW_SIZE_RIGHT: tl.constexpr,
+):
+    """Allowed query/key pairs; negative window sizes mean unbounded."""
+    # Align query and key positions at the end of unequal-length sequences.
+    query_pos = offs_m[:, None] + seqlen_k - seqlen_q
+    key_pos = offs_n[None, :]
+    allowed = (offs_m[:, None] < seqlen_q) & (key_pos < seqlen_k)
+    if IS_CAUSAL:
+        allowed = allowed & (key_pos <= query_pos)
+    if USE_SLIDING_WINDOW:
+        if WINDOW_SIZE_LEFT >= 0:
+            allowed = allowed & (key_pos >= query_pos - WINDOW_SIZE_LEFT)
+        if WINDOW_SIZE_RIGHT >= 0:
+            allowed = allowed & (key_pos <= query_pos + WINDOW_SIZE_RIGHT)
+    return allowed
+
+
+@triton.jit
 def _attn_fwd_inner(
     acc,
     l_i,
@@ -324,9 +350,6 @@ def _attn_fwd_inner(
     if USE_EXP2:
         RCP_LN2: tl.constexpr = 1.4426950408889634
 
-    # seqlen diff (only used when APPLY_MASK=True)
-    seqlen_delta_qk = seqlen_k - seqlen_q
-
     # loop over k, v, and update accumulator
     for start_n in tl.range(block_min, block_max, BLOCK_N, num_stages=1):
         # get ptrs
@@ -386,83 +409,20 @@ def _attn_fwd_inner(
             )
             qk_scaled += alibi_block
 
-        # Apply causal/sliding window masking (only when APPLY_MASK=True)
-        if APPLY_MASK:
-            if USE_SLIDING_WINDOW:
-                if IS_CAUSAL:
-                    # ========== CAUSAL SLIDING WINDOW MASKING ==========
-                    row_idx = offs_m
-                    col_idx = kv_offs_n
-                    row_idx_expanded = row_idx[:, None]
-                    col_idx_expanded = col_idx[None, :]
-
-                    causal_offset = seqlen_k - seqlen_q
-                    causal_mask = col_idx_expanded > (row_idx_expanded + causal_offset)
-
-                    if WINDOW_SIZE_LEFT < 0 and WINDOW_SIZE_RIGHT < 0:
-                        # both edges unbounded: only the causal cap constrains cols
-                        window_mask = causal_mask
-                    elif WINDOW_SIZE_LEFT < 0:
-                        # unbounded left, finite right
-                        window_mask = col_idx_expanded > (
-                            row_idx_expanded + causal_offset + WINDOW_SIZE_RIGHT
-                        )
-                    elif WINDOW_SIZE_RIGHT < 0:
-                        # unbounded right: the causal cap already bounds the right,
-                        # so only the finite left edge masks (mirror of infinite-left)
-                        left_bound = row_idx_expanded + causal_offset - WINDOW_SIZE_LEFT
-                        window_mask = col_idx_expanded < left_bound
-                    else:
-                        left_bound = row_idx_expanded + causal_offset - WINDOW_SIZE_LEFT
-                        right_bound = (
-                            row_idx_expanded + causal_offset + WINDOW_SIZE_RIGHT
-                        )
-                        window_mask = (col_idx_expanded < left_bound) | (
-                            col_idx_expanded > right_bound
-                        )
-
-                    mask = causal_mask | window_mask
-                    qk_scaled = tl.where(mask, float("-inf"), qk_scaled)
-                else:
-                    # ========== NON-CAUSAL SLIDING WINDOW MASKING ==========
-                    row_idx = offs_m
-                    col_idx = kv_offs_n
-                    sk = seqlen_k
-                    sq = seqlen_q
-                    row_idx_expanded = row_idx[:, None]
-                    col_idx_expanded = col_idx[None, :]
-
-                    if WINDOW_SIZE_LEFT < 0 and WINDOW_SIZE_RIGHT < 0:
-                        # both edges unbounded: full (non-causal) attention
-                        mask = (row_idx_expanded < 0) | (col_idx_expanded < 0)
-                    elif WINDOW_SIZE_LEFT < 0:
-                        # unbounded left, finite right
-                        mask = col_idx_expanded > (
-                            row_idx_expanded + sk - sq + WINDOW_SIZE_RIGHT
-                        )
-                    elif WINDOW_SIZE_RIGHT < 0:
-                        # unbounded right, finite left (mirror of infinite-left)
-                        mask = col_idx_expanded < (
-                            row_idx_expanded + sk - sq - WINDOW_SIZE_LEFT
-                        )
-                    else:
-                        sk_full = tl.full((1, BLOCK_N), sk, dtype=tl.int32)
-                        right_bound_val = row_idx_expanded + sk - sq + WINDOW_SIZE_RIGHT
-                        right_bound = tl.minimum(right_bound_val, sk_full)
-                        left_bound = row_idx_expanded + sk - sq - WINDOW_SIZE_LEFT
-                        mask = (col_idx_expanded > right_bound) | (
-                            col_idx_expanded < left_bound
-                        )
-
-                    qk_scaled = tl.where(mask, float("-inf"), qk_scaled)
-            else:
-                if IS_CAUSAL:
-                    causal_boundary = start_n + offs_n - seqlen_delta_qk
-                    causal_mask = offs_m[:, None] >= causal_boundary[None, :]
-                    qk_scaled = tl.where(causal_mask, qk_scaled, float("-inf"))
-
-        # compute qk mask for bounds checking
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
+        allowed = qk_mask
+        if APPLY_MASK:
+            allowed = attention_mask(
+                offs_m,
+                kv_offs_n,
+                seqlen_q,
+                seqlen_k,
+                IS_CAUSAL,
+                USE_SLIDING_WINDOW,
+                WINDOW_SIZE_LEFT,
+                WINDOW_SIZE_RIGHT,
+            )
+            qk_scaled = tl.where(allowed, qk_scaled, float("-inf"))
 
         # compute bias
         if bias_base_ptrs is not None:
@@ -500,55 +460,13 @@ def _attn_fwd_inner(
             rng_output = tl.rand(philox_seed, philox_ptrs)
             dropout_mask = rng_output > dropout_p
 
-            # return scores with negative values for dropped vals (only if RETURN_SCORES is True)
             if RETURN_SCORES:
                 sd_mask_value = tl.where(dropout_mask, p, -p)
-                sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
-                sd_mask_ptrs = (
-                    sd_mask_base
-                    + offs_m[:, None] * stride_sm
-                    + kv_offs_n[None, :] * stride_sn
-                )
-
-                sd_store_mask = (offs_m[:, None] < seqlen_q) & (
-                    kv_offs_n[None, :] < seqlen_k
-                )
-
-                if APPLY_MASK and IS_CAUSAL:
-                    causal_constraint = kv_offs_n[None, :] <= (
-                        offs_m[:, None] + seqlen_delta_qk
-                    )
-                    sd_store_mask = sd_store_mask & causal_constraint
-
-                if APPLY_MASK and USE_SLIDING_WINDOW:
-                    if WINDOW_SIZE_LEFT < 0 and WINDOW_SIZE_RIGHT < 0:
-                        window_constraint = offs_m[:, None] >= 0
-                    elif WINDOW_SIZE_LEFT < 0:
-                        window_constraint = kv_offs_n[None, :] <= (
-                            offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
-                        )
-                    elif WINDOW_SIZE_RIGHT < 0:
-                        left_bound = (
-                            offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
-                        )
-                        window_constraint = kv_offs_n[None, :] >= left_bound
-                    else:
-                        left_bound = (
-                            offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
-                        )
-                        right_bound = (
-                            offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
-                        )
-                        window_constraint = (kv_offs_n[None, :] >= left_bound) & (
-                            kv_offs_n[None, :] <= right_bound
-                        )
-                    sd_store_mask = sd_store_mask & window_constraint
-
-                tl.store(sd_mask_ptrs, sd_mask_value, mask=sd_store_mask)
-
-            # apply dropout mask in place
             p = tl.where(dropout_mask, p, 0.0)
         elif RETURN_SCORES:
+            sd_mask_value = p
+
+        if RETURN_SCORES:
             sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
             sd_mask_ptrs = (
                 sd_mask_base
@@ -556,35 +474,7 @@ def _attn_fwd_inner(
                 + kv_offs_n[None, :] * stride_sn
             )
 
-            sd_store_mask = (offs_m[:, None] < seqlen_q) & (
-                kv_offs_n[None, :] < seqlen_k
-            )
-
-            if APPLY_MASK and IS_CAUSAL:
-                causal_constraint = kv_offs_n[None, :] <= (
-                    offs_m[:, None] + seqlen_delta_qk
-                )
-                sd_store_mask = sd_store_mask & causal_constraint
-
-            if APPLY_MASK and USE_SLIDING_WINDOW:
-                if WINDOW_SIZE_LEFT < 0 and WINDOW_SIZE_RIGHT < 0:
-                    window_constraint = offs_m[:, None] >= 0
-                elif WINDOW_SIZE_LEFT < 0:
-                    window_constraint = kv_offs_n[None, :] <= (
-                        offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
-                    )
-                elif WINDOW_SIZE_RIGHT < 0:
-                    left_bound = offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
-                    window_constraint = kv_offs_n[None, :] >= left_bound
-                else:
-                    left_bound = offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
-                    right_bound = offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
-                    window_constraint = (kv_offs_n[None, :] >= left_bound) & (
-                        kv_offs_n[None, :] <= right_bound
-                    )
-                sd_store_mask = sd_store_mask & window_constraint
-
-            tl.store(sd_mask_ptrs, p, mask=sd_store_mask)
+            tl.store(sd_mask_ptrs, sd_mask_value, mask=allowed)
 
         # -- update output accumulator --
         m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
