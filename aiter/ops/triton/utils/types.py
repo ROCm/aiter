@@ -95,7 +95,7 @@ def _is_fp8(x):
         torch.float8_e5m2,
         torch.float8_e5m2fnuz,
     }:
-        if arch_info.is_fp8_avail():
+        if arch_info.is_fp8_avail() or arch_info.is_sw_emulated_fp8_avail():
             return True
         else:
             raise RuntimeError("This device does not support fp8")
