@@ -97,8 +97,9 @@ def gfx942_a16w4_layouts(block_m, block_n, block_k, num_warps):
               n = lane%16) holds 2*KG contiguous uint16 (KG = block_k//32 dwords = 32 B for
               block_k=256); the K bits of this layout are ordered so that the tile can be
               relabelled in-register into the MFMA B operand layout (see the kernel).
-      LOAD_S  (KG, 4, block_n) uint8 scale layout: lane (g, n) holds the KG scales of
-              column n (replicated across the 4 lane groups g).
+      LOAD_S  (KG//4, 1, 4, block_n) uint8 scale layout: lane (g, n) holds the KG//4 e8m0 scales
+              of the 32-K groups its weight dwords belong to (groups g*KG//4 .. +KG//4-1 of the tile);
+              the size-1 dim is broadcast to the 4 dwords per group in the kernel.
       MFMA    the 16x16x16 bf16 MFMA accumulator layout.
     The kernel checks (at compile time) that these match the dot-operand layouts.
     """
@@ -125,12 +126,13 @@ def gfx942_a16w4_layouts(block_m, block_n, block_k, num_warps):
         block_bases=[],
         shape=[PK2, block_n],
     )
+    KGL = KG // 4  # scale groups covered by one lane's KG consecutive dwords
     load_s = gl.DistributedLinearLayout(
-        reg_bases=[[1 << i, 0, 0] for i in range(kreg - 1)] + [[0, 0, t] for t in tile_n],
-        lane_bases=[[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 0, 8], [0, 1, 0], [0, 2, 0]],
-        warp_bases=[[0, 0, w] for w in warp_n],
+        reg_bases=[[1 << i, 0, 0, 0] for i in range(KGL.bit_length() - 1)] + [[0, 0, 0, t] for t in tile_n],
+        lane_bases=[[0, 0, 0, 1], [0, 0, 0, 2], [0, 0, 0, 4], [0, 0, 0, 8], [0, 0, 1, 0], [0, 0, 2, 0]],
+        warp_bases=[[0, 0, 0, w] for w in warp_n],
         block_bases=[],
-        shape=[KG, 4, block_n],
+        shape=[KGL, 1, 4, block_n],
     )
     mfma = gl.amd.AMDMFMALayout(
         version=3,
@@ -197,9 +199,10 @@ def _dequant_tile(
     lo1, hi1 = gl.split(o1)
     lo2, hi2 = gl.split(o2)
     lo3, hi3 = gl.split(o3)
-    # join order (o0,o2),(o1,o3) gives s = 2*inner + outer, i.e. s0 above h, s1 above s0
-    j_lo = gl.reshape(gl.permute(gl.join(gl.join(lo0, lo2), gl.join(lo1, lo3)), (0, 1, 3, 2)), (DN, BLOCK_N, 4))
-    j_hi = gl.reshape(gl.permute(gl.join(gl.join(hi0, hi2), gl.join(hi1, hi3)), (0, 1, 3, 2)), (DN, BLOCK_N, 4))
+    # nested joins: s = 2*outer + inner (verified on hardware with an identity-activation readout;
+    # the layout check below cannot see operand order, only the resulting bases)
+    j_lo = gl.reshape(gl.permute(gl.join(gl.join(lo0, lo1), gl.join(lo2, lo3)), (0, 1, 3, 2)), (DN, BLOCK_N, 4))
+    j_hi = gl.reshape(gl.permute(gl.join(gl.join(hi0, hi1), gl.join(hi2, hi3)), (0, 1, 3, 2)), (DN, BLOCK_N, 4))
     wb = gl.join(j_lo, j_hi)  # (d, n, s, h)
     wb = gl.permute(wb, (0, 2, 3, 1))  # (d, s, h, n)
     wb = gl.reshape(wb, (BLOCK_K, BLOCK_N))
@@ -348,7 +351,15 @@ def _moe_gemm_a16w4_gfx942(
         GatherIndx += start_m
         # no bounds check needed: offs_x_m wraps around M
         offs_x_m = gl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
-    offs_x_k = BLOCK_K * pid_k + gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, LOAD_X))
+    # K permutation at chunk (8-element) granularity: the W tile's lane group g holds the KG
+    # physically consecutive dwords KG*g .. KG*g+KG-1, which the B-operand layout interprets as
+    # semantic dwords d = g + 4*kt; load X so that semantic chunk d comes from physical chunk
+    # KG*(d%4) + d//4 (chunks stay contiguous, so the 16-byte loads survive). The order inside a
+    # chunk is fixed up in registers by _relabel_x before the LDS stage.
+    k_load = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, LOAD_X))
+    d_sem = k_load // 8
+    offs_x_k = BLOCK_K * pid_k + 8 * (KG * (d_sem % 4) + d_sem // 4) + (k_load % 8)
+    offs_x_k = gl.max_contiguous(gl.multiple_of(offs_x_k, 8), 8)
     XPtrs = X + offs_x_m.to(index_type)[:, None] * stride_x_m + offs_x_k.to(index_type)[None, :] * stride_x_k
 
     # ---- W pointers: uint16 view, lane (g, n) reads 2*KG contiguous uint16 of column n
@@ -367,27 +378,18 @@ def _moe_gemm_a16w4_gfx942(
     offs_w = gl.max_contiguous(gl.multiple_of(offs_w, [8, 8]), [2 * KG, 1])
     WPtrs = W16 + offs_w
 
-    # ---- scale pointers: (KG, 4, BLOCK_N), lane (g, n) reads the KG scales of column n
-    offs_s_k = KG * pid_k + gl.arange(0, KG, layout=gl.SliceLayout(1, gl.SliceLayout(2, LOAD_S)))
-    offs_s_g = gl.arange(0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(2, LOAD_S)))
-    offs_s_n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, gl.SliceLayout(1, LOAD_S)))
+    # ---- scale pointers: (KGL, 1, 4, BLOCK_N); lane (g, n) reads the KGL groups of its dwords
+    KGL: gl.constexpr = KG // 4
+    offs_s_j = gl.arange(0, KGL, layout=gl.SliceLayout(1, gl.SliceLayout(2, gl.SliceLayout(3, LOAD_S))))
+    offs_s_g = gl.arange(0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(1, gl.SliceLayout(3, LOAD_S))))
+    offs_s_n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, gl.SliceLayout(1, gl.SliceLayout(2, LOAD_S))))
     offs_s_n = gl.max_contiguous(gl.multiple_of(offs_s_n % N, BLOCK_N), BLOCK_N)
+    offs_s_kg = KG * pid_k + offs_s_g.to(index_type)[None, None, :, None] * KGL + offs_s_j.to(index_type)[:, None, None, None]
     if SCALE_K_CONTIG:
-        # stride_w_mx_k == 1: the KG scales of a column are one 8-byte load per lane
-        offs_s = (
-            offs_s_k.to(index_type)[:, None, None]
-            + offs_s_g.to(index_type)[None, :, None] * 0
-            + offs_s_n.to(index_type)[None, None, :] * stride_w_mx_n
-            + w_expt_id * stride_w_mx_e
-        )
-        offs_s = gl.max_contiguous(gl.multiple_of(offs_s, [KG, 1, 1]), [KG, 1, 1])
+        offs_s = offs_s_kg + offs_s_n.to(index_type)[None, None, None, :] * stride_w_mx_n + w_expt_id * stride_w_mx_e
+        offs_s = gl.max_contiguous(gl.multiple_of(offs_s, [KGL, 1, 1, 1]), [KGL, 1, 1, 1])
     else:
-        offs_s = (
-            offs_s_k.to(index_type)[:, None, None] * stride_w_mx_k
-            + offs_s_g.to(index_type)[None, :, None] * 0
-            + offs_s_n.to(index_type)[None, None, :] * stride_w_mx_n
-            + w_expt_id * stride_w_mx_e
-        )
+        offs_s = offs_s_kg * stride_w_mx_k + offs_s_n.to(index_type)[None, None, None, :] * stride_w_mx_n + w_expt_id * stride_w_mx_e
     SPtrs = WMxScale + offs_s
 
     x_smem = gl.allocate_shared_memory(gl.bfloat16, [BLOCK_M, BLOCK_K], SMEM_X)
@@ -405,9 +407,11 @@ def _moe_gemm_a16w4_gfx942(
 
         # weights: relabel into the k_width=2 operand layout, spread the scales, dequantise
         wu = _relabel_w(wq, KG, BLOCK_N, DOT_W16)
-        sc16 = sc.to(gl.uint16)  # (KG, 4, BLOCK_N)
+        sc16 = sc.to(gl.uint16)  # (KGL, 1, 4, BLOCK_N)
+        sc16 = gl.reshape(sc16.broadcast_to((KGL, 4, 4, BLOCK_N)), (KG, 4, BLOCK_N))  # dword kt = 4*j + r -> group j
         sc16 = gl.join(sc16, sc16)  # both 16-bit halves of each dword
-        sc16 = gl.convert_layout(gl.reshape(gl.permute(sc16, (0, 1, 3, 2)), (PK2, BLOCK_N)), DOT_W16, assert_trivial=True)
+        # register-local broadcast + relabel into the k_width=2 operand layout (no cross-lane movement)
+        sc16 = gl.convert_layout(gl.reshape(gl.permute(sc16, (0, 1, 3, 2)), (PK2, BLOCK_N)), DOT_W16)
         wb = _dequant_tile(wu, sc16, tlo0, tlo1, thi0, thi1, BLOCK_K, BLOCK_N, DOT_W)
 
         # activations: stage through LDS in the semantic K order of the W operand
