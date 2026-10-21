@@ -450,6 +450,7 @@ def _parse_args(argv=None):
         parser.error("context lengths must include all query tokens and fit in int32")
     if args.sliding_window < -1:
         parser.error("--sliding-window must be -1, 0 or positive")
+    args.sliding_window = max(args.sliding_window, 0)
     if asymmetric and not (
         args.head_dim == 192
         and args.value_dim == 128

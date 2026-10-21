@@ -95,19 +95,37 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
 
 
 @pytest.mark.parametrize(
-    "arch,num_seqs,expected_splits",
+    "arch,num_seqs,window,max_parts,capacity_per_seq,expected_splits",
     [
-        ("gfx950", 1, 8),
-        ("gfx950", 8, 8),
-        ("gfx950", 16, 4),
-        ("gfx950", 32, 4),
-        ("gfx950", 64, 2),
-        ("gfx950", 128, 1),
-        ("gfx942", 8, 1),
+        ("gfx950", 1, 1024, 8, 8, 8),
+        ("gfx950", 8, 1024, 8, 8, 8),
+        ("gfx950", 16, 1024, 8, 8, 4),
+        ("gfx950", 32, 1024, 8, 8, 4),
+        ("gfx950", 64, 1024, 8, 8, 2),
+        ("gfx950", 128, 1024, 8, 8, 1),
+        ("gfx942", 8, 1024, 8, 8, 1),
+        ("gfx950", 8, 1023, 8, 8, 8),
+        ("gfx950", 8, 1025, 8, 8, 8),
+        ("gfx950", 1, 512, 8, 8, 8),
+        ("gfx950", 8, 512, 8, 8, 8),
+        ("gfx950", 32, 512, 8, 8, 4),
+        ("gfx950", 128, 512, 8, 8, 1),
+        ("gfx942", 8, 512, 8, 8, 1),
+        # Other windows require a budget that guarantees one tile per task.
+        ("gfx950", 8, 512, 1, 1, 1),
+        ("gfx950", 8, 512, 4, 4, 8),
+        ("gfx950", 8, 512, 8, 3, 1),
+        ("gfx950", 32, 2048, 8, 8, 1),
+        # W1024 keeps its existing split even with multiple tiles per task.
+        ("gfx950", 8, 1024, 1, 1, 8),
+        ("gfx950", 8, 1024, 4, 4, 8),
+        ("gfx950", 8, 1024, 8, 2, 8),
     ],
 )
-def test_bf16_draft_query_split_schedule(monkeypatch, arch, num_seqs, expected_splits):
-    """The tuned Draft grid tapers query duplication as batch work grows."""
+def test_bf16_swa_query_split_schedule(
+    monkeypatch, arch, num_seqs, window, max_parts, capacity_per_seq, expected_splits
+):
+    """Window and budget boundaries preserve the tuned W1024 behavior."""
     traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
     monkeypatch.setattr(traits, "get_rocm_arch", lambda: arch)
     schedule = traits.PaDecodeSchedule.select(
@@ -118,16 +136,58 @@ def test_bf16_draft_query_split_schedule(monkeypatch, arch, num_seqs, expected_s
         num_seqs=num_seqs,
         num_kv_heads=1,
         num_compute_units=256,
-        work_capacity=num_seqs * 8,
-        num_partitions=8,
+        work_capacity=num_seqs * capacity_per_seq,
+        num_partitions=max_parts,
         query_dtype="bf16",
         kv_dtype="bf16",
         query_length=8,
         trans_v=True,
         max_context_length=8192,
-        sliding_window=1024,
+        sliding_window=window,
     )
     assert traits.PaDecodeTraits.create(schedule).query_splits == expected_splits
+
+
+@pytest.mark.parametrize(
+    "kv_dtype,scale_mode,window,expected_window",
+    [
+        ("fp8", "per-tensor", -1, 0),
+        ("fp8", "per-tensor", 0, 0),
+        ("fp8", "per-tensor", 128, 128),
+        ("fp8", "none", -1, 0),
+        ("fp8", "per-token", 128, None),
+        ("fp8", "per-tensor", -2, None),
+        ("fp8", "per-tensor", 129, None),
+        ("bf16", "none", 128, 128),
+        ("bf16", "none", -1, None),
+        ("bf16", "none", 0, None),
+    ],
+)
+def test_asymmetric_tuning_cli_window(kv_dtype, scale_mode, window, expected_window):
+    """The full-attention alias preserves the asymmetric dtype/scale contract."""
+    tuning = importlib.import_module("aiter.ops.flydsl.pa_decode_tuning")
+    argv = [
+        "--head-dim",
+        "192",
+        "--value-dim",
+        "128",
+        "--query-length",
+        "8",
+        "--block-size",
+        "64",
+        "--kv-dtype",
+        kv_dtype,
+        "--scale-mode",
+        scale_mode,
+        "--sliding-window",
+        str(window),
+    ]
+    if expected_window is None:
+        with pytest.raises(SystemExit) as error:
+            tuning._parse_args(argv)
+        assert error.value.code == 2
+    else:
+        assert tuning._parse_args(argv).sliding_window == expected_window
 
 
 def _reference(query, key, value, table, lengths, query_length, window, sinks):
@@ -338,6 +398,23 @@ _FP8_CASES = _COMMON_CASES + [
     ),
 ]
 _BF16_CASES = _COMMON_CASES + [
+    *[
+        (
+            f"qlen8-d128-w{window}-np{parts}",
+            {
+                "query_length": 8,
+                "group_size": 16,
+                "head_dim": 128,
+                "block_size": 64,
+                "max_partitions": parts,
+                "window": window,
+                "sink_dtype": torch.float32,
+                "capture": window == 1023,
+                "lengths": (0, 1, 127, 128, 129, 257, 515, 1027),
+            },
+        )
+        for window, parts in ((512, 4), (1023, 8), (1025, 8), (1024, 1), (1024, 4))
+    ],
     (
         "qlen8-w128-d192-v128",
         {
