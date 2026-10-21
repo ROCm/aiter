@@ -175,12 +175,15 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         softmax_scale = softmax_scale or (head_dim**-0.5)
         fp8_dtype = aiter.dtypes.fp8
         fp8_max = torch.finfo(fp8_dtype).max
+        # Without FP8 matrix cores (RDNA3), Triton converts FP8 V to FP16 in
+        # software. Keep V in FP16 there: it is faster and more accurate.
+        v_dtype = fp8_dtype if arch_info.is_fp8_avail() else torch.float16
 
         sq_result = sage_quant(
             q,
             k,
             v,
-            fp8_dtype,
+            v_dtype,
             fp8_max,
             sm_scale=softmax_scale,
             BLKQ=BLKQ,
