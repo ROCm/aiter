@@ -45,6 +45,8 @@ _STREAM_SELECT_MIN_COLUMNS = 32768
 # topk_select's decode gate for k=512 is rows <= 64. Above that, one
 # workgroup per row loses to the streaming selector.
 _DECODE_MAX_ROWS = 64
+# Columns per workgroup of the 16-row scorer.
+_ROWS_BLOCK_N = 64
 _SCORE_HEADS = (4, 8)
 _SCORE_SCALE = _D**-0.5
 
@@ -453,12 +455,22 @@ def build_qsa_indexer_prefill_scores_module(
     n_heads: int = _H,
     wide_cache: bool = False,
     k_strides: tuple[int, int, int] | None = None,
+    block_n: int = _ROWS_BLOCK_N,
 ):
-    """Build the single-request, 16-row by 32-column MFMA scorer."""
+    """Build the 16-row MFMA scorer, ``block_n`` columns per workgroup.
+
+    One wave per 16 columns, each over the whole head dim, so the four
+    heads accumulate in registers and the wave writes its scores directly.
+    A row tile may span requests. Q is staged once; each request in the tile
+    gathers its own K tile and writes only its own rows, so a request-major
+    batch (vLLM's layout) gathers each K tile once per request it touches.
+    """
     if page_size < 1:
         raise ValueError(f"page_size must be positive, got {page_size}")
     if n_heads not in _SCORE_HEADS:
         raise ValueError(f"score heads must be {_SCORE_HEADS}, got {n_heads}")
+    if block_n not in (32, 64):
+        raise ValueError(f"16-row scorer block_n must be 32 or 64, got {block_n}")
     dense_k_strides = _dense_indexer_strides(page_size)
     if k_strides is None:
         k_strides = dense_k_strides
@@ -467,12 +479,11 @@ def build_qsa_indexer_prefill_scores_module(
     strided_wide = wide_cache and k_strides != dense_k_strides
 
     block_m = 16
-    block_n = 32
-    block_threads = 128
+    num_waves = block_n // 16
+    block_threads = 64 * num_waves
     qk_k = 32 if use_k32 else 16
     qk_vec = qk_k // 4
-    k_steps = 64 // qk_k
-    n_subtiles = block_n // 16
+    k_steps = _D // qk_k
     vec = 8
     vec_chunks = _D // vec
     q_vectors = block_m * n_heads * vec_chunks
@@ -481,18 +492,17 @@ def build_qsa_indexer_prefill_scores_module(
         raise ValueError("prefill Q/K vector counts must divide block threads")
     q_vectors_per_thread = q_vectors // block_threads
     k_vectors_per_thread = k_vectors // block_threads
-    num_waves = block_threads // 64
 
     @fx.struct
     class SharedStorage:
         q: fx.Array[BFloat16, block_m * n_heads * _D, 16]
         k: fx.Array[BFloat16, block_n * _D, 16]
         visible: fx.Array[Int32, block_m, 16]
+        req: fx.Array[Int32, block_m, 16]
         live: fx.Array[Int32, block_n, 16]
-        c: fx.Array[Float32, n_heads * n_subtiles * num_waves * 64 * 4, 16]
 
     @flyc.kernel(
-        name="qsa_indexer_prefill_scores_"
+        name="qsa_indexer_rows_scores_"
         + kernel_signature(
             ps=page_size,
             bm=block_m,
@@ -517,11 +527,14 @@ def build_qsa_indexer_prefill_scores_module(
         row_lens: fx.Tensor,
         n_columns: Int32,
         rows: Int32,
+        n_req: Int32,
         score_scale: Float32,
         n_cache_blocks: Int32,
     ):
-        tile = Int32(gpu.block_id("x"))
-        row_tile = Int32(gpu.block_id("y"))
+        # Row tiles vary fastest, so workgroups resident together share a
+        # column tile: one K tile, many Q tiles.
+        row_tile = Int32(gpu.block_id("x"))
+        tile = Int32(gpu.block_id("y"))
         tid = Int32(gpu.thread_id("x"))
         zero = Int32(0)
         one = Int32(1)
@@ -562,19 +575,8 @@ def build_qsa_indexer_prefill_scores_module(
         )
         k_lds = storage.k.view(fx.make_layout((block_n, _D), (_D, 1)))
         visible_lds = storage.visible.view(fx.make_layout(block_m, 1))
+        req_lds = storage.req.view(fx.make_layout(block_m, 1))
         live_lds = storage.live.view(fx.make_layout(block_n, 1))
-        c_lds = storage.c.view(
-            fx.make_layout(
-                (n_heads, n_subtiles, num_waves, 64, 4),
-                (
-                    n_subtiles * num_waves * 64 * 4,
-                    num_waves * 64 * 4,
-                    64 * 4,
-                    4,
-                    1,
-                ),
-            )
-        )
         qk_mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, qk_k, BFloat16))
         qk_a = fx.make_rmem_tensor(fx.make_layout(qk_vec, 1), BFloat16)
         qk_b = fx.make_rmem_tensor(fx.make_layout(qk_vec, 1), BFloat16)
@@ -584,22 +586,32 @@ def build_qsa_indexer_prefill_scores_module(
             row = row_tile * Int32(block_m) + tid
             row_live = row < rows
             safe_row = row_live.select(row, zero)
-            req_live = row_live & (token_to_req[safe_row] == zero)
+            req = token_to_req[safe_row]
+            req_live = row_live & (req >= zero) & (req < n_req)
+            safe_req = req_live.select(req, zero)
             qpos = query_positions[safe_row]
-            slen = context_lens[zero]
+            slen = context_lens[safe_req]
             vis_q = _idiv(qpos + one, Int32(_R))
             vis_s = _idiv(slen, Int32(_R))
             visible = (vis_q < vis_s).select(vis_q, vis_s)
             visible = (visible < n_columns).select(visible, n_columns)
             visible = req_live.select(visible, zero)
             visible_lds[tid] = visible
+            req_lds[tid] = req_live.select(req, Int32(-1))
             if (tile == zero) & row_live:
                 row_lens[row] = visible
         gpu.barrier()
-        tile_visible = visible_lds[zero]
-        for r in range_constexpr(1, block_m):
+        # Every lane reads the same 16 entries, so these and every branch on
+        # them below are workgroup-uniform.
+        tile_visible = zero
+        req_lo = n_req
+        req_hi = Int32(-1)
+        for r in range_constexpr(block_m):
             v = visible_lds[Int32(r)]
+            rq = req_lds[Int32(r)]
             tile_visible = (v > tile_visible).select(v, tile_visible)
+            req_lo = ((rq >= zero) & (rq < req_lo)).select(rq, req_lo)
+            req_hi = (rq > req_hi).select(rq, req_hi)
 
         # As in the one-row scorer: skip tiles no row of this block can see.
         if tile * Int32(block_n) < tile_visible:
@@ -612,7 +624,7 @@ def build_qsa_indexer_prefill_scores_module(
                 row = row_tile * Int32(block_m) + row_local
                 row_live = row < rows
                 safe_row = row_live.select(row, zero)
-                req_live = row_live & (token_to_req[safe_row] == zero)
+                req_live = req_lds[row_local] >= zero
                 q_row = fx.logical_divide(
                     fx.slice(q_buf, (safe_row, head, None)), vec_layout
                 )
@@ -625,102 +637,120 @@ def build_qsa_indexer_prefill_scores_module(
                     qv = req_live.select(q_vec[i].to(Float32), Float32(0.0))
                     q_lds[row_local, head, d0 + Int32(i)] = qv.to(BFloat16)
 
-            context_cols = _idiv(context_lens[zero], Int32(_R))
-            for part in range_constexpr(k_vectors_per_thread):
-                linear = tid + Int32(part * block_threads)
-                col = _idiv(linear, Int32(vec_chunks))
-                d_chunk = linear - col * Int32(vec_chunks)
-                score_col = tile * Int32(block_n) + col
-                col_live = (score_col < n_columns) & (score_col < context_cols)
-                safe_col = col_live.select(score_col, zero)
-                logical_page = _idiv(safe_col, page)
-                off = safe_col - logical_page * page
-                phys = page_table[zero, logical_page]
-                phys_live = (phys >= zero) & (phys < n_cache_blocks)
-                safe_phys = phys_live.select(phys, zero)
-                col_live = col_live & phys_live
-                if const_expr(wide_cache):
-                    k_row = _k_page_row(
-                        k_base,
-                        safe_phys,
-                        off,
-                        page_elems64,
-                        token_elems64,
-                        head_elems64,
-                        zero,
-                        row_ptr_ty,
-                        vec_layout,
+            # Names assigned in this loop are its own: a name it shares with
+            # the code above would become an scf.for iter_arg.
+            for cur_req in range(req_lo, req_hi + one, one):
+                cur = Int32(cur_req)
+                req_visible = zero
+                for r_r in range_constexpr(block_m):
+                    v_r = (req_lds[Int32(r_r)] == cur).select(
+                        visible_lds[Int32(r_r)], zero
                     )
-                else:
-                    k_row = fx.logical_divide(
-                        fx.slice(k_buf, (safe_phys, off, zero, None)), vec_layout
-                    )
-                k_src = fx.slice(k_row, (None, d_chunk))
-                k_frag = fx.make_fragment_like(k_src)
-                fx.copy(k_copy, k_src, k_frag)
-                k_vec = fx.Vector(fx.memref_load_vec(k_frag))
-                d0 = d_chunk * Int32(vec)
-                for i in range_constexpr(vec):
-                    kv = col_live.select(k_vec[i].to(Float32), Float32(0.0))
-                    k_lds[col, d0 + Int32(i)] = kv.to(BFloat16)
-                # Every d_chunk of a column stores the same flag.
-                live_lds[col] = col_live.select(one, zero)
-            gpu.barrier()
+                    req_visible = (v_r > req_visible).select(v_r, req_visible)
+                if tile * Int32(block_n) < req_visible:
+                    context_cols_r = _idiv(context_lens[cur], Int32(_R))
+                    for part_r in range_constexpr(k_vectors_per_thread):
+                        linear_r = tid + Int32(part_r * block_threads)
+                        col_r = _idiv(linear_r, Int32(vec_chunks))
+                        d_chunk_r = linear_r - col_r * Int32(vec_chunks)
+                        score_col_r = tile * Int32(block_n) + col_r
+                        col_live_r = (score_col_r < n_columns) & (
+                            score_col_r < context_cols_r
+                        )
+                        safe_col_r = col_live_r.select(score_col_r, zero)
+                        logical_page_r = _idiv(safe_col_r, page)
+                        off_r = safe_col_r - logical_page_r * page
+                        phys_r = page_table[cur, logical_page_r]
+                        phys_live_r = (phys_r >= zero) & (phys_r < n_cache_blocks)
+                        safe_phys_r = phys_live_r.select(phys_r, zero)
+                        col_live_r = col_live_r & phys_live_r
+                        if const_expr(wide_cache):
+                            k_row_r = _k_page_row(
+                                k_base,
+                                safe_phys_r,
+                                off_r,
+                                page_elems64,
+                                token_elems64,
+                                head_elems64,
+                                zero,
+                                row_ptr_ty,
+                                vec_layout,
+                            )
+                        else:
+                            k_row_r = fx.logical_divide(
+                                fx.slice(k_buf, (safe_phys_r, off_r, zero, None)),
+                                vec_layout,
+                            )
+                        k_src_r = fx.slice(k_row_r, (None, d_chunk_r))
+                        k_frag_r = fx.make_fragment_like(k_src_r)
+                        fx.copy(k_copy, k_src_r, k_frag_r)
+                        k_vec_r = fx.Vector(fx.memref_load_vec(k_frag_r))
+                        d0_r = d_chunk_r * Int32(vec)
+                        for i_r in range_constexpr(vec):
+                            kv_r = col_live_r.select(
+                                k_vec_r[i_r].to(Float32), Float32(0.0)
+                            )
+                            k_lds[col_r, d0_r + Int32(i_r)] = kv_r.to(BFloat16)
+                        # Every d_chunk of a column stores the same flag.
+                        live_lds[col_r] = col_live_r.select(one, zero)
+                    gpu.barrier()
 
-            for head in range_constexpr(n_heads):
-                for ng in range_constexpr(n_subtiles):
-                    n_row = Int32(ng * 16) + lane_m
-                    acc4 = fx.Vector.filled(4, 0.0, Float32)
-                    for ks in range_constexpr(k_steps):
-                        d0 = (
-                            wave * Int32(64)
-                            + Int32(ks * qk_k)
-                            + lane_kg * Int32(qk_vec)
-                        )
-                        a_vec = fx.Vector.from_elements(
-                            [
-                                q_lds[lane_m, head, d0 + Int32(i)]
-                                for i in range_constexpr(qk_vec)
-                            ],
-                            BFloat16,
-                        )
-                        b_vec = fx.Vector.from_elements(
-                            [
-                                k_lds[n_row, d0 + Int32(i)]
-                                for i in range_constexpr(qk_vec)
-                            ],
-                            BFloat16,
-                        )
-                        acc4 = fx.Vector(
-                            _qk_mfma(qk_mma, qk_a, qk_b, qk_c, a_vec, b_vec, acc4)
-                        )
-                    for i in range_constexpr(4):
-                        c_lds[head, ng, wave, lane, i] = acc4[i]
-            gpu.barrier()
+                    # This wave's 16 columns against all 16 rows, per head.
+                    n_row_r = wave * Int32(16) + lane_m
+                    accs_r = []
+                    for head_r in range_constexpr(n_heads):
+                        acc4_r = fx.Vector.filled(4, 0.0, Float32)
+                        for ks_r in range_constexpr(k_steps):
+                            dk_r = Int32(ks_r * qk_k) + lane_kg * Int32(qk_vec)
+                            a_vec_r = fx.Vector.from_elements(
+                                [
+                                    q_lds[lane_m, head_r, dk_r + Int32(i_r)]
+                                    for i_r in range_constexpr(qk_vec)
+                                ],
+                                BFloat16,
+                            )
+                            b_vec_r = fx.Vector.from_elements(
+                                [
+                                    k_lds[n_row_r, dk_r + Int32(i_r)]
+                                    for i_r in range_constexpr(qk_vec)
+                                ],
+                                BFloat16,
+                            )
+                            acc4_r = fx.Vector(
+                                _qk_mfma(
+                                    qk_mma, qk_a, qk_b, qk_c, a_vec_r, b_vec_r, acc4_r
+                                )
+                            )
+                        accs_r.append(acc4_r)
 
-            if wave == zero:
-                for ng in range_constexpr(n_subtiles):
-                    out_col = tile * Int32(block_n) + Int32(ng * 16) + lane_m
+                    # 16x16 C: n = lane%16 (column), m = 4*(lane/16) + elem (row).
+                    out_col_r = tile * Int32(block_n) + n_row_r
                     # A visible column on an invalid page scored a zeroed K;
                     # it must not tie into the top-512.
-                    page_live = live_lds[Int32(ng * 16) + lane_m] != zero
-                    for i in range_constexpr(4):
-                        row_local = lane_kg * Int32(4) + Int32(i)
-                        row = row_tile * Int32(block_m) + row_local
-                        score = Float32(0.0)
-                        for head in range_constexpr(n_heads):
-                            dot = Float32(0.0)
-                            for w in range_constexpr(num_waves):
-                                dot = dot + c_lds[head, ng, w, lane, i]
-                            score = score + fx.max(dot, Float32(0.0))
-                        if (row < rows) & (out_col < n_columns):
-                            live = (out_col < visible_lds[row_local]) & page_live
-                            # ``scores`` must keep a dynamic row stride: a static
-                            # layout, use_32bit_stride=True, or an Int32 linear
-                            # index would wrap.
-                            scores[row, out_col] = live.select(
-                                score * score_scale, _neg_inf()
+                    page_live_r = live_lds[n_row_r] != zero
+                    for i_r in range_constexpr(4):
+                        row_local_r = lane_kg * Int32(4) + Int32(i_r)
+                        row_r = row_tile * Int32(block_m) + row_local_r
+                        score_r = Float32(0.0)
+                        for head_r in range_constexpr(n_heads):
+                            score_r = score_r + fx.max(
+                                accs_r[head_r][i_r], Float32(0.0)
                             )
+                        # Rows of other requests are written by their own
+                        # iteration.
+                        mine_r = req_lds[row_local_r] == cur
+                        if mine_r & (row_r < rows) & (out_col_r < n_columns):
+                            live_r = (
+                                out_col_r < visible_lds[row_local_r]
+                            ) & page_live_r
+                            # ``scores`` must keep a dynamic row stride: a
+                            # static layout, use_32bit_stride=True, or an
+                            # Int32 linear index would wrap.
+                            scores[row_r, out_col_r] = live_r.select(
+                                score_r * score_scale, _neg_inf()
+                            )
+                    # The next request overwrites k_lds and live_lds.
+                    gpu.barrier()
 
     @flyc.jit
     def launch_qsa_indexer_prefill_scores(
@@ -734,6 +764,7 @@ def build_qsa_indexer_prefill_scores_module(
         row_lens: fx.Tensor,
         n_columns: Int32,
         rows: Int32,
+        n_req: Int32,
         score_scale: Float32,
         n_cache_blocks: Int32,
         row_tiles: Int32,
@@ -751,10 +782,11 @@ def build_qsa_indexer_prefill_scores_module(
             row_lens,
             n_columns,
             rows,
+            n_req,
             score_scale,
             n_cache_blocks,
         ).launch(
-            grid=(tiles, row_tiles, 1),
+            grid=(row_tiles, tiles, 1),
             block=(block_threads, 1, 1),
             stream=stream,
         )

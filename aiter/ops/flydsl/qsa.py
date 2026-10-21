@@ -6,8 +6,9 @@
 ``qsa_indexer_block_ids`` writes indexer ``block_ids [M, 512]`` from paged
 compressed K. Rows up to 512 blocks use the fused emit kernel; longer rows
 use tiled BLOCK_N=32 BF16 MFMA scoring plus the stable decode radix below
-32768 columns and streaming radix at or above that width. Single-request
-prefill scores 16 query rows per workgroup. The indexer head count is 4 or
+32768 columns and streaming radix at or above that width. Batches averaging
+at least two query rows per request (prefill, mixed prefill and decode, MTP
+decode) score 16 rows per workgroup. The indexer head count is 4 or
 8, each a separate compile.
 
 ``qsa_sparse_gqa`` writes sparse GQA ``o [M, Hq, D]`` from paged K/V at the
@@ -40,6 +41,7 @@ from .kernels.qsa.indexer_select import (
     _K,
     _KV_HEADS,
     _R,
+    _ROWS_BLOCK_N,
     _SCORE_HEADS,
     _SCORE_SCALE,
     _STREAM_SELECT_MIN_COLUMNS,
@@ -204,19 +206,18 @@ def _prefill_scores_plan(
 def _k1_prefill_lds_bytes(n_heads: int) -> int:
     """Bytes in the 16-row scorer's LDS tile.
 
-    Q is ``16.H.128`` bf16, K is ``32.128`` bf16, the visibility vector is
-    16 int32s, and C is ``H.2.2.64.4`` fp32. Each field is already a
+    Q is ``16.H.128`` bf16, K is ``BLOCK_N.128`` bf16, and the visibility,
+    request and column-live vectors are int32. Each field is already a
     multiple of its 16-byte alignment, so nothing is inserted between them.
     """
     block_m = 16
-    block_n = 32
-    num_waves = 2
-    n_subtiles = block_n // 16
     q_bytes = block_m * n_heads * _D * 2
-    k_bytes = block_n * _D * 2
-    visible_bytes = block_m * 4
-    c_bytes = n_heads * n_subtiles * num_waves * 64 * 4 * 4
-    return q_bytes + k_bytes + visible_bytes + c_bytes
+    k_bytes = _ROWS_BLOCK_N * _D * 2
+    vector_bytes = (2 * block_m + _ROWS_BLOCK_N) * 4
+    return q_bytes + k_bytes + vector_bytes
+
+
+_ROWS_SCORER_MIN_ROWS_PER_REQUEST = 2
 
 
 def _k1_uses_prefill_scorer(
@@ -224,10 +225,12 @@ def _k1_uses_prefill_scorer(
 ) -> bool:
     """Whether this launch uses the 16-row scorer.
 
-    gfx942 H=8 stays on the one-row scorer. That tile is 73920 bytes and
-    gfx942 has 65536. gfx950 H=8 keeps the 16-row tile.
+    A tile gathers K once per request it spans and runs the MFMA for all 16
+    rows each time, so it pays off from two rows per request on average.
+    One-row decode stays on the one-row scorer. So does gfx942 H=8, which
+    has not been measured on the 16-row scorer.
     """
-    if n_requests != 1 or rows < 16:
+    if rows < 16 or rows < _ROWS_SCORER_MIN_ROWS_PER_REQUEST * n_requests:
         return False
     return not (arch.startswith("gfx942") and n_heads == 8)
 
@@ -304,9 +307,9 @@ def qsa_indexer_score_and_select(
 ) -> torch.Tensor:
     """Score long rows into ``[M, n_columns]`` and write top-512 ids into ``out``.
 
-    ``n_heads`` is 4 or 8, each a separate compile. One request with
-    ``M >= 16`` uses the 16-row scorer, except gfx942 H=8, which stays
-    on the one-row scorer. ``live_columns`` is
+    ``n_heads`` is 4 or 8, each a separate compile. ``M >= 16`` rows
+    averaging two or more per request use the 16-row scorer, except
+    gfx942 H=8, which stays on the one-row scorer. ``live_columns`` is
     the widest visible row. The score buffer stays the width of the
     table, and the selector sees that prefix. A padded table with at
     most 64 rows and at most 20000 live columns uses the one-workgroup
@@ -356,10 +359,11 @@ def qsa_indexer_score_and_select(
             row_lens,
             int(n_columns),
             m,
+            int(context_lens.shape[0]),
             float(score_scale),
             int(k_cache.shape[0]),
             (m + 15) // 16,
-            score_tiles,
+            (n_columns + _ROWS_BLOCK_N - 1) // _ROWS_BLOCK_N,
             torch.cuda.current_stream(q.device),
         )
     else:
@@ -527,8 +531,9 @@ def qsa_indexer_block_ids(
     ``[M, n_columns]`` workspace for that writer, with a unit column
     stride. ``n_columns`` is ``page_table.shape[1] * page_size``. ``None``
     allocates it. Emit does not read it. The buffer is overwritten and is
-    not returned. Single-request prefill batches 16 query rows, except
-    gfx942 H=8; other inputs use one row per workgroup. Selection is the
+    not returned. Batches averaging two or more rows per request score 16
+    query rows per workgroup, except gfx942 H=8; one-row decode uses one row
+    per workgroup. Selection is the
     stable decode radix below 32768 columns
     and streaming radix (``tie='low'``) at or above that width.
     Expand+tail is still separate. An empty context, cache, or page table
