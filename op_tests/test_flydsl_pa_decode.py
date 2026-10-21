@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from aiter import per_tensor_quant, pertoken_quant
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 
 
 @pytest.fixture
@@ -819,7 +819,7 @@ def test_pa_decode(case, device, monkeypatch):
         )
     )
     value_dim = head_dim if case["value_dim"] is None else case["value_dim"]
-    if value_dim != head_dim and get_gfx_runtime() != "gfx950":
+    if value_dim != head_dim and get_gfx() != "gfx950":
         pytest.skip("asymmetric Q/K and V widths require gfx950")
     torch.manual_seed(0)
     query, key, value, table, context = _make_inputs(
