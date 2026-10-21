@@ -19,12 +19,12 @@ from .attention_common import (
     _buffer_store_words,
     _buffer_words,
     _exp,
+    _load_lds,
     _maximum,
     _mfma,
     _min,
     _pack_bf16,
     _pin,
-    _read_address,
     _stage_end,
     _uniform,
     _write_address,
@@ -52,7 +52,7 @@ def _output(
     o1,
     inv,
     buffer,
-    shared,
+    storage,
     tid,
     h,
     g,
@@ -65,6 +65,7 @@ def _output(
     gated,
     nq,
 ):
+    shared = fx.Int32(fx.ptrtoint(fx.get_iter(storage)))
     row = (tid >> 6) * 16 + (tid & 15)
     for half in range(2):
         acc = o1 if half else o0
@@ -81,9 +82,7 @@ def _output(
     parts = []
     for part in range(8):
         element = tid * 8 + part * threads * 8
-        parts.append(
-            _read_address(shared + (element ^ (((element // 256) & 7) * 8)) * 2)
-        )
+        parts.append(_load_lds(storage, (element ^ (((element // 256) & 7) * 8)) * 2))
     rocdl.s_waitcnt(lgkmcnt=0)
     rocdl.sched_barrier(0)
     for part in range(8):
@@ -372,7 +371,6 @@ def _body(
         .peek()
         .view(fx.make_layout(8192, 1))
     )
-    shared = fx.Int32(fx.ptrtoint(fx.get_iter(storage)))
     tid = fx.thread_idx.x
     wave, lane = _uniform(tid >> 6), tid & 63
     first, rows = _uniform(META[tile * 5]), _uniform(META[tile * 5 + 1])
@@ -516,7 +514,7 @@ def _body(
         o1,
         inv,
         output,
-        shared,
+        storage,
         tid,
         H,
         H // HK,

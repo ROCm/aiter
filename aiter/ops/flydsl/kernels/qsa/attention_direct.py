@@ -266,7 +266,6 @@ def _body(
         .peek()
         .view(fx.make_layout(32768, 1))
     )
-    shared = fx.Int32(fx.ptrtoint(fx.get_iter(storage)))
     tid = fx.thread_idx.x
     wave, lane = _uniform(tid >> 6), tid & 63
     task = fx.block_idx.x
@@ -440,7 +439,7 @@ def _body(
         o1,
         inv,
         output,
-        shared,
+        storage,
         tid,
         H,
         H // HK,

@@ -23,7 +23,9 @@ from .attention_common import (
     _exps,
     _join,
     _k_lds_address,
+    _k_operands,
     _k_phase,
+    _load_lds,
     _max,
     _maximum,
     _min,
@@ -33,7 +35,6 @@ from .attention_common import (
     _pv,
     _q_fragment,
     _qk,
-    _read_address,
     _read_k,
     _read_v,
     _rescale,
@@ -86,6 +87,7 @@ def _union_dma(
     is_v,
     extent,
     tail=False,
+    read_storage=None,
     read_address=None,
     read_immediate=0,
 ):
@@ -97,7 +99,7 @@ def _union_dma(
     step = (packet & 3) * hk * D * 2
     # The instruction offset also moves the LDS destination, which M0 takes back; M0 must stay
     # non-negative, otherwise (HK > 1) the step goes into VOFFSET.
-    destination_offset = (32768 if is_v else 0) + packet * 512
+    destination_offset = packet * 512
     offset = step if step < 4096 and step <= destination_offset else 0
     if step != offset:
         voffset = voffset + step
@@ -107,7 +109,11 @@ def _union_dma(
     base_destination = fx.Int32(base_row * 512 + base_channel * 2)
     immediate = destination_offset - offset
     row, limit = fx.Uint32(rows[packet // 4]), limits[packet & 3]
-    data = None if read_address is None else _read_address(read_address, read_immediate)
+    data = (
+        None
+        if read_address is None
+        else _load_lds(read_storage, read_address, read_immediate)
+    )
     # Raw LDS DMA: BufferCopyLDS adds its own vmcnt wait; the pipeline waits itself.
     rocdl.raw_ptr_buffer_load_lds(
         resource,
@@ -141,9 +147,12 @@ def _apply_mask(scores, bits):
 
 
 def _output(
-    o0, o1, inv, buffer, shared, tid, heads, g, gp, bq, qvalid, extent, row_offset
+    o0, o1, inv, buffer, storages, tid, heads, g, gp, bq, qvalid, extent, row_offset
 ):
+    # O rows 0-63 go to the K buffer, rows 64-127 to the V buffer.
     row = (tid >> 6) * 16 + (tid & 15)
+    shared = [fx.Int32(fx.ptrtoint(fx.get_iter(storage))) for storage in storages]
+    base = (tid < THREADS // 2).select(shared[0], shared[1])
     for half in range(2):
         output = o1 if half else o0
         for i in range(4):
@@ -152,15 +161,19 @@ def _output(
             )
             words = _pack_bf16(values)
             column = (((tid >> 4) & 3) * 4 + i) * 8 + half * 128
-            address = fx.Int32(shared + ((row * 256 + column) ^ ((row & 7) * 8)) * 2)
+            address = fx.Int32(
+                base + (((row & 63) * 256 + column) ^ ((row & 7) * 8)) * 2
+            )
             _write_address(address, words)
     rocdl.s_waitcnt(lgkmcnt=0)
     _stage_end()
     parts = []
     for part in range(8):
-        element = tid * 8 + part * THREADS * 8
+        element = tid * 8 + (part % 4) * THREADS * 8
         read_row = element // 256
-        parts.append(_read_address(shared + (element ^ ((read_row & 7) * 8)) * 2))
+        parts.append(
+            _load_lds(storages[part // 4], (element ^ ((read_row & 7) * 8)) * 2)
+        )
     rocdl.s_waitcnt(lgkmcnt=0)
     rocdl.sched_barrier(0)
     for part in range(8):
@@ -191,7 +204,8 @@ def _body(
     BLOCKS,
     MEMBERS,
     COUNTS,
-    storage,
+    k_storage,
+    v_storage,
     work,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
@@ -261,16 +275,13 @@ def _body(
     compact_len = count * 4
     tiles = (compact_len + BN - 1) // BN
     last = tiles - 1
-    shared = fx.Int32(fx.ptrtoint(fx.get_iter(storage)))
     key_row = (lane & 3) + ((lane & 12) << 1)
     kr = tuple(
-        _pin_i32(
-            shared + _k_lds_address(key_row + n * 4, (lane >> 4) * 8 + parity * 32)
-        )
+        _pin_i32(_k_lds_address(key_row + n * 4, (lane >> 4) * 8 + parity * 32))
         for n in range(2)
         for parity in range(2)
     )
-    vr = _pin_i32(shared + _v_lds_address((lane >> 4) * 8, (lane & 15) * 8))
+    vr = _pin_i32(_v_lds_address((lane >> 4) * 8, (lane & 15) * 8))
     cross_addresses = tuple(_pin_i32((lane ^ offset) * 4) for offset in (16, 32, 48))
     blocks0 = source_blocks(blocks, fx.Int32(0), count, lane_bytes)
     blocks1 = source_blocks(blocks, _min(fx.Int32(1), last), count, lane_bytes)
@@ -281,7 +292,7 @@ def _body(
     for packet in fx.range_constexpr(16):
         _union_dma(
             gk,
-            storage,
+            k_storage,
             wave,
             lane,
             offsets,
@@ -297,19 +308,19 @@ def _body(
     _stage_end()
     if fx.const_expr(STAGGER):
         _stage_end()
-    k = read_k(kr, 0)
+    k = read_k(k_storage, kr, 0)
     rocdl.s_waitcnt(lgkmcnt=0)
     _stage_end()
-    lo = qk(q, k)
+    lo = qk(q, _k_operands(k))
     o0, o1 = _pin(fx.Vector.filled(32, 0.0, fx.Float32)), _pin(
         fx.Vector.filled(32, 0.0, fx.Float32)
     )
     _schedule(32, 3, 5)
     _stage_end()
-    k = read_k(kr, 1)
+    k = read_k(k_storage, kr, 1)
     rocdl.s_waitcnt(lgkmcnt=0)
     _stage_end()
-    hi = qk(q, k)
+    hi = qk(q, _k_operands(k))
     scores = _apply_mask(_join(lo, hi), bits)
     maximum = local_max(scores)
     maximum = _maximum(maximum, maximum.shuffle_xor(16, 64))
@@ -324,7 +335,7 @@ def _body(
     for packet in fx.range_constexpr(16):
         _union_dma(
             gk,
-            storage,
+            k_storage,
             wave,
             lane,
             offsets,
@@ -370,7 +381,7 @@ def _body(
                 parts.append(
                     _union_dma(
                         gv,
-                        storage,
+                        v_storage,
                         wave,
                         lane,
                         previous_offsets,
@@ -381,33 +392,27 @@ def _body(
                         n * 8 + step,
                         True,
                         extent,
+                        read_storage=k_storage,
                         read_address=kr[n * 2 + step % 2],
                         read_immediate=(step // 2) * 128,
                     )
                 )
-        words = fx.Vector.from_elements(
+        k = fx.Vector.from_elements(
             [part[i] for part in parts for i in range(4)], fx.Int32
         )
-        fragment = fx.make_rmem_tensor(
-            fx.make_layout((4, 16, 2), (1, 4, 64)), fx.BFloat16
-        )
-        fragment.store(words.bitcast(fx.BFloat16))
-        k = fx.make_view(fx.get_iter(fragment), fx.make_layout((4, 2, 16), (1, 64, 4)))
         _stage_end()
         rocdl.s_waitcnt(lgkmcnt=0)
-        rocdl.sched_barrier(0)
-        lo = qk(q, k)
+        lo = qk(q, _k_operands(k))
         previous = exps(previous)
         _schedule(32, 1, 1, True)
         _stage_end()
-        k = read_k(kr, 1, STAGGER)
+        k = read_k(k_storage, kr, 1, STAGGER)
         rocdl.s_waitcnt(vmcnt=0)
         if fx.const_expr(STAGGER):
             rocdl.s_waitcnt(lgkmcnt=8)
         _stage_end()
         rocdl.s_waitcnt(lgkmcnt=0)
-        rocdl.sched_barrier(0)
-        hi = qk(q, k)
+        hi = qk(q, _k_operands(k))
         current = _apply_mask(_join(lo, hi), bits)
         total, probabilities = local_sum(previous), pack(previous).bitcast(fx.BFloat16)
         # The stage C vmcnt(0) retired this load; only SGPR rows cross iterations.
@@ -415,13 +420,14 @@ def _body(
         _schedule(32, 2, 2)
         _stage_end()
         sums = cross(total, cross_addresses)
+        rocdl.sched_barrier(0)  # ds_bpermute counts in the hand-written lgkmcnt below
         parts = []
         for block in fx.range_constexpr(2):
             for r in fx.range_constexpr(8):
                 parts.append(
                     _union_dma(
                         gk,
-                        storage,
+                        k_storage,
                         wave,
                         lane,
                         next_offsets,
@@ -432,6 +438,7 @@ def _body(
                         block * 8 + r,
                         False,
                         extent,
+                        read_storage=v_storage,
                         read_address=vr,
                         read_immediate=block * 16384 + r * 512,
                     )
@@ -452,8 +459,9 @@ def _body(
         _schedule(32, 3, 3)
         _stage_end()
         maxima = cross(candidate, cross_addresses)
+        rocdl.sched_barrier(0)  # ds_bpermute counts in the hand-written lgkmcnt below
         rocdl.s_waitcnt(vmcnt=0)
-        v = read_v(vr, 1)
+        v = read_v(v_storage, vr, 1)
         prepared = v_operands(v, 0, True)
         _stage_end()
         o1, current, new_max, ballot = pv(
@@ -490,7 +498,7 @@ def _body(
     for packet in fx.range_constexpr(16):
         _union_dma(
             gv,
-            storage,
+            v_storage,
             wave,
             lane,
             offsets,
@@ -512,12 +520,12 @@ def _body(
     rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
     _stage_end()
     _stage_end()
-    v = read_v(vr, 0)
+    v = read_v(v_storage, vr, 0)
     rocdl.s_waitcnt(lgkmcnt=0)
     _stage_end()
     o0 = pv(probabilities, v, o0)
     _stage_end()
-    v = read_v(vr, 1)
+    v = read_v(v_storage, vr, 1)
     rocdl.s_waitcnt(lgkmcnt=0)
     _stage_end()
     o1 = pv(probabilities, v, o1)
@@ -537,7 +545,7 @@ def _body(
         o1,
         inv,
         output,
-        shared,
+        (k_storage, v_storage),
         _pin_i32(tid),
         H,
         H // HK,
@@ -572,11 +580,12 @@ def _kernel(
     SCALE: fx.Constexpr[float],
 ):
     body = _body
-    storage = (
-        fx.SharedAllocator()
-        .allocate(fx.Array[fx.Int8, LDS_BYTES, 16])
+    allocator = fx.SharedAllocator()
+    k_storage, v_storage = (
+        allocator.allocate(fx.Array[fx.Int8, LDS_BYTES // 2, 16])
         .peek()
-        .view(fx.make_layout(LDS_BYTES, 1))
+        .view(fx.make_layout(LDS_BYTES // 2, 1))
+        for _ in range(2)
     )
     work = fx.block_idx.x
     while work < ((TASKS + GRID - 1) // GRID) * GRID:
@@ -597,7 +606,8 @@ def _kernel(
                     BLOCKS,
                     MEMBERS,
                     COUNTS,
-                    storage,
+                    k_storage,
+                    v_storage,
                     mapped,
                     H,
                     HK,
@@ -618,7 +628,8 @@ def _kernel(
                     BLOCKS,
                     MEMBERS,
                     COUNTS,
-                    storage,
+                    k_storage,
+                    v_storage,
                     mapped,
                     H,
                     HK,

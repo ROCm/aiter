@@ -155,6 +155,16 @@ def _pin(values, chunk=8):
     return fx.Vector.from_elements(result, words.dtype).bitcast(dtype)
 
 
+def _keep_vgpr(words, chunk=4):
+    # Empty asm use keeps LDS loads in VGPRs; a tied pin's def would cost an s_nop.
+    words = fx.Vector(words)
+    for start in range(0, words.numel, chunk):
+        part = fx.Vector.from_elements(
+            [words[i] for i in range(start, start + chunk)], words.dtype
+        )
+        llvm.inline_asm(None, [part.ir_value()], "", "v", has_side_effects=True)
+
+
 def _join(a, b):
     a, b = fx.Vector(a), fx.Vector(b)
     return fx.Vector.from_elements(
@@ -238,23 +248,12 @@ def _buffer_store_words(words, buffer, offset):
     )
 
 
-def _read_address(address, immediate=0):
-    # Inline asm instead of an LLVM load (plain and volatile both measured):
-    # - Without alias info, SIInsertWaitcnts assumes the in-flight LDS DMA
-    #   (raw_ptr_buffer_load_lds) may write what a load reads, and puts s_waitcnt
-    #   vmcnt(0) before every read (32 per phase): the DMA no longer overlaps the reads.
-    # - The lgkmcnt waits are counted by hand in program order (_v_operands); LLVM
-    #   reschedules visible loads, adding waits and breaking the S1 MFMA/VALU interleave
-    #   (0.4-2.8% slower).
-    # Nothing waits for an asm result: those explicit waits and the stage barriers make
-    # the read safe; ~{memory} keeps it ordered with the other memory operations.
+def _load_lds(storage, offset, immediate=0):
+    # Volatile keeps the hand-written order; the LDS variable's GEP gives it an alias scope.
+    ptr = fx.to_llvm_ptr(fx.get_iter(storage) + (fx.Int32(offset) + immediate))
     return fx.Vector(
-        llvm.inline_asm(
-            ir.VectorType.get([4], fx.Int32.ir_type),
-            [address.ir_value()],
-            f"ds_read_b128 $0, $1 offset:{immediate}",
-            "=v,v,~{memory}",
-            has_side_effects=True,
+        llvm.load(
+            ir.VectorType.get([4], fx.Int32.ir_type), ptr, alignment=16, volatile_=True
         )
     )
 
@@ -279,7 +278,6 @@ def _rescale(o0, o1, row_sum, old_max, new_max, ballot):
 # ---- D256 BM128/BN64 eight-wave pipeline: MFMA fragments, softmax, LDS ----
 
 BM, BN, D, THREADS = 128, 64, 256, 512
-K_BYTES = 32768
 
 
 def _mma():
@@ -358,7 +356,7 @@ def _k_lds_address(token, dimension):
 
 
 def _v_lds_address(token, dimension):
-    return K_BYTES + token * 512 + dimension * 2
+    return token * 512 + dimension * 2
 
 
 def _copy_coordinates(wave, packet, page=0):
@@ -366,7 +364,7 @@ def _copy_coordinates(wave, packet, page=0):
     return token, (wave >> 2) * 128
 
 
-def _read_k(addresses, half, lower_first=False):
+def _read_k(storage, addresses, half, lower_first=False):
     parts = [None] * 16
     order = (
         [(n, k + high * 4) for high in range(2) for n in range(2) for k in range(4)]
@@ -374,22 +372,30 @@ def _read_k(addresses, half, lower_first=False):
         else [(n, k) for n in range(2) for k in range(8)]
     )
     for n, k in order:
-        parts[n * 8 + k] = _read_address(
-            addresses[n * 2 + k % 2], half * 16384 + (k // 2) * 128
+        parts[n * 8 + k] = _load_lds(
+            storage, addresses[n * 2 + k % 2], half * 16384 + (k // 2) * 128
         )
-    words = fx.Vector.from_elements(
+    return fx.Vector.from_elements(
         [part[i] for part in parts for i in range(4)], fx.Int32
     )
+
+
+def _k_operands(words):
+    # MFMA-only uses leave the loads AV-class; the scheduler then reverts the QK interleave.
+    _keep_vgpr(words)
+    rocdl.sched_barrier(0)
     frag = fx.make_rmem_tensor(fx.make_layout((4, 16, 2), (1, 4, 64)), fx.BFloat16)
     frag.store(words.bitcast(fx.BFloat16))
     return fx.make_view(fx.get_iter(frag), fx.make_layout((4, 2, 16), (1, 64, 4)))
 
 
-def _read_v(address, half, blocks=2):
+def _read_v(storage, address, half, blocks=2):
     parts = []
     for block in range(blocks):
         for row in range(8):
-            parts.append(_read_address(address, half * 256 + block * 16384 + row * 512))
+            parts.append(
+                _load_lds(storage, address, half * 256 + block * 16384 + row * 512)
+            )
     return fx.Vector.from_elements(
         [part[i] for part in parts for i in range(4)], fx.Int32
     )
@@ -397,10 +403,15 @@ def _read_v(address, half, blocks=2):
 
 def _v_operands(values, step, progressive):
     raw = fx.Vector(values)
+    row = (step // 2) * 8 + (step % 2) * 4
     if progressive:
         rocdl.s_waitcnt(lgkmcnt=12 - step * 4)
+        _keep_vgpr(
+            fx.Vector.from_elements(
+                [raw[i] for i in range(row * 4, row * 4 + 16)], fx.Int32
+            )
+        )
         rocdl.sched_barrier(0)
-    row = (step // 2) * 8 + (step % 2) * 4
     words = []
     for n in range(8):
         selector = 0x03020706 if n % 2 else 0x01000504
