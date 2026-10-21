@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from collections.abc import Iterable
+
 from torch import Tensor
 
 from ..jit.core import compile_ops
@@ -20,6 +22,7 @@ MXFP4_MOE_SUPPORTED_SHAPES = frozenset(
         (256, 3072, 768, 8),
         (512, 4096, 256, 10),
         (48, 7168, 3072, 6),
+        (24, 7168, 3072, 6),
         (384, 7168, 1536, 6),
         (384, 7168, 768, 6),
         (384, 7168, 512, 6),
@@ -31,6 +34,7 @@ MXFP4_MOE_SUPPORTED_SHAPES = frozenset(
         (32, 5120, 2304, 2),
         (32, 5120, 2304, 3),
         (256, 4096, 256, 6),
+        (256, 4096, 2048, 6),
         (385, 7168, 1536, 7),
         (385, 7168, 768, 7),
         (385, 7168, 512, 7),
@@ -39,6 +43,7 @@ MXFP4_MOE_SUPPORTED_SHAPES = frozenset(
         (257, 6144, 512, 9),
         (257, 6144, 256, 9),
         (896, 3584, 512, 16),
+        (896, 3584, 3072, 16),
         (56, 3584, 3072, 16),
         (64, 7168, 2048, 8),
         (128, 3072, 512, 4),
@@ -54,8 +59,25 @@ MXFP4_MOE_SUPPORTED_SHAPES = frozenset(
         (384, 7168, 256, 8),
         (512, 4096, 512, 10),
         (513, 4096, 512, 11),
+        (512, 2048, 512, 10),
+        (256, 6144, 2048, 8),
+        (256, 6144, 3072, 6),
+        (384, 6144, 2048, 8),
+        (288, 4096, 2048, 8),
     }
 )
+_MXFP4_MOE_SCATTER_KEYS = frozenset(
+    (hidden, topk) for _expert, hidden, _inter, topk in MXFP4_MOE_SUPPORTED_SHAPES
+)
+
+
+def is_mxfp4_moe_scatter_supported(model_dim: int, topk: int) -> bool:
+    """Static generated scatter/scatterq support, independent of expert/inter_dim.
+
+    The generator emits both NT variants for each catalog (model_dim, topk)
+    key. This does not probe or build the extension during candidate enumeration.
+    """
+    return (int(model_dim), int(topk)) in _MXFP4_MOE_SCATTER_KEYS
 
 
 def is_mxfp4_moe_shape_supported(
@@ -80,6 +102,45 @@ def _mxfp4_moe_sort_internal_is_supported(
     zero_init: bool,
 ) -> bool:
     """Private dispatch probe; not exported through ``aiter.ops`` or ``aiter``."""
+
+
+class _MissingMxfp4MoeAuxInstances(RuntimeError):
+    def __init__(self, missing_instances: list[tuple[int, int, int, bool]]) -> None:
+        # Structural identity is separate from the generated instance name so
+        # callers can match shapes without duplicating the name format.
+        self.missing_instances = tuple(missing_instances)
+        self.missing_keys = tuple(
+            f"aux_{'sortzi' if zero_init else 'sortonly'}_NE{expert}"
+            f"_TOPK{topk}_MB16_H{hidden}"
+            for expert, topk, hidden, zero_init in self.missing_instances
+        )
+        super().__init__(
+            "module_moe_mxfp4_aux is missing generated instances: "
+            + ", ".join(self.missing_keys)
+            + ". Add support in moe_aux/codegen/gen_instances.py if needed, "
+            "then rerun this preparation in a fresh process with AITER_REBUILD=1 "
+            "before launching tuning workers."
+        )
+
+
+def prepare_mxfp4_moe_aux(shapes: "Iterable[tuple[int, int, int, int]]") -> None:
+    """Load/build and verify the BM16 sort instances before tuning workers start.
+
+    ``shapes`` contains (expert, model_dim, inter_dim, topk) tuples. Instances
+    depend on the auxiliary key, so a new inter_dim can reuse compiled support
+    without adding a model whitelist to the tuner. An existing stale module
+    must be regenerated and rebuilt in a fresh process before workers launch.
+    """
+    keys = {(int(ne), int(h), int(topk)) for ne, h, _inter, topk in shapes}
+    missing = []
+    for expert, hidden, topk in sorted(keys):
+        for zero_init in (False, True):
+            if not _mxfp4_moe_sort_internal_is_supported(
+                expert, topk, hidden, 16, zero_init
+            ):
+                missing.append((expert, topk, hidden, zero_init))
+    if missing:
+        raise _MissingMxfp4MoeAuxInstances(missing)
 
 
 @compile_ops("module_moe_mxfp4_aux", develop=True)
