@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "fused_dsv41/cache_pipeline.hpp"
-#include "fused_dsv41/decode_prefetch.hpp"
 #include "fused_dsv41/decode_fp8_qk.hpp"
+#include "fused_dsv41/decode_prefetch.hpp"
 #include <cmath>
 #include <hip/hip_runtime.h>
 using B = opus::dtypes::bf16;
@@ -583,7 +583,7 @@ __global__ __launch_bounds__(256, 2) void fused_dsv41_mxfp8_decode_64(FusedDsv41
 #endif
 }
 
-template <bool RotateQ, int PageSize, bool PreparedQ = false>
+template <bool RotateQ, int PageSize, bool PreparedQ = false, bool LateCommit = false>
 __global__ __launch_bounds__(256, 1) void fused_dsv41_fp8_qk_decode_64(FusedDsv41Args a)
 {
 #if defined(__gfx950__)
@@ -605,10 +605,10 @@ __global__ __launch_bounds__(256, 1) void fused_dsv41_fp8_qk_decode_64(FusedDsv4
     if constexpr(PreparedQ)
     {
         opus::static_for<4>([&](auto step) {
-            const int d = int(step) * 128 + group * 32;
+            const int d  = int(step) * 128 + group * 32;
             q[int(step)] = *reinterpret_cast<const opus::vector_t<opus::fp8_t, 32>*>(
                 reinterpret_cast<const uint8_t*>(a.q) + (int64_t(t) * a.heads + hload) * 512 + d);
-            q[int(step)] = pack_fp8_qk_group(q[int(step)], lane);
+            q[int(step)]        = pack_fp8_qk_group(q[int(step)], lane);
             q_scales[int(step)] = a.q_scale[(int64_t(t) * a.heads + hload) * 16 + d / 32];
         });
     }
@@ -620,26 +620,29 @@ __global__ __launch_bounds__(256, 1) void fused_dsv41_fp8_qk_decode_64(FusedDsv4
             opus::vector_t<float, 32> values;
             const int d = int(step) * 128 + group * 32;
             opus::static_for<4>([&](auto sub) {
-                B8 x = *reinterpret_cast<const B8*>(a.q + (int64_t(t) * a.heads + hload) * 512 + d + int(sub) * 8);
+                B8 x = *reinterpret_cast<const B8*>(a.q + (int64_t(t) * a.heads + hload) * 512 + d +
+                                                    int(sub) * 8);
                 if constexpr(RotateQ && int(step) == 3)
                 {
                     if(group >= 2)
                         opus::static_for<4>([&](auto pair) {
                             int i = int(pair) * 2, ri = (d + int(sub) * 8 + i - 448) / 2;
-                            float x0 = f32(x[i]), x1 = f32(x[i + 1]), c = f32(cs[ri]), snv = f32(sn[ri]);
-                            x[i] = static_cast<B>(fmaf(x0, c, -x1 * snv));
-                            x[i + 1] = static_cast<B>(fmaf(x0, snv, x1 * c));
+                            float x0 = f32(x[i]), x1 = f32(x[i + 1]), c = f32(cs[ri]),
+                                  snv = f32(sn[ri]);
+                            x[i]      = static_cast<B>(fmaf(x0, c, -x1 * snv));
+                            x[i + 1]  = static_cast<B>(fmaf(x0, snv, x1 * c));
                         });
                 }
-                opus::static_for<8>([&](auto j) { values[int(sub) * 8 + int(j)] = f32(x[int(j)]); });
+                opus::static_for<8>(
+                    [&](auto j) { values[int(sub) * 8 + int(j)] = f32(x[int(j)]); });
             });
             float amax = 1e-30f;
             opus::static_for<32>([&](auto j) { amax = fmaxf(amax, fabsf(values[int(j)])); });
             const unsigned bits = __float_as_uint(amax / 448.0f);
-            const int exponent = int((bits - 1) >> 23) + 1 - 127;
-            const float mul = __uint_as_float(uint32_t(127 - exponent) << 23);
+            const int exponent  = int((bits - 1) >> 23) + 1 - 127;
+            const float mul     = __uint_as_float(uint32_t(127 - exponent) << 23);
             q_scales[int(step)] = exponent + 127;
-            q[int(step)] = pack_fp8_qk_group(opus::cast<opus::fp8_t>(values * mul), lane);
+            q[int(step)]        = pack_fp8_qk_group(opus::cast<opus::fp8_t>(values * mul), lane);
         });
     }
     constexpr float log2e = 1.4426950408889634f;
@@ -648,24 +651,23 @@ __global__ __launch_bounds__(256, 1) void fused_dsv41_fp8_qk_decode_64(FusedDsv4
     int end   = max(begin, min(a.prefix_capacity, a.prefix_indptr[t + 1]));
     if(end > begin)
     {
-        Fp8QkSource64<PageSize> src{{
-            a.pool,
-            a.prefix_at<PageSize>(begin),
-            end - begin,
-            (PageSize == -2 ? a.cache.num_rows : a.pool_bytes),
-            a.cache}};
-        fp8_qk_decode_accum64<T>(src,
-                                 end - begin,
-                                 (end - begin + 31) / 32,
-                                 reinterpret_cast<char*>(kv_tile),
-                                 q,
-                                 q_scales,
-                                 raw_k,
-                                 o,
-                                 actual_max,
-                                 m,
-                                 l,
-                                 a.softmax_scale * log2e);
+        Fp8QkSource64<PageSize> src{{a.pool,
+                                     a.prefix_at<PageSize>(begin),
+                                     end - begin,
+                                     (PageSize == -2 ? a.cache.num_rows : a.pool_bytes),
+                                     a.cache}};
+        fp8_qk_decode_accum64<T, LateCommit>(src,
+                                             end - begin,
+                                             (end - begin + 31) / 32,
+                                             reinterpret_cast<char*>(kv_tile),
+                                             q,
+                                             q_scales,
+                                             raw_k,
+                                             o,
+                                             actual_max,
+                                             m,
+                                             l,
+                                             a.softmax_scale * log2e);
     }
     __syncthreads();
     auto* staging = reinterpret_cast<uint8_t*>(kv_tile);
@@ -878,12 +880,30 @@ hipError_t launch_cache_mode(const FusedDsv41Args* a, int rotate_q, hipStream_t 
         if(a->fp8_qk)
         {
             dim3 grid(a->tokens, a->heads / 64);
-            if(a->q_scale)
-                fused_dsv41_fp8_qk_decode_64<false, PageSize, true><<<grid, 256, 0, stream>>>(*a);
-            else if(rotate_q)
-                fused_dsv41_fp8_qk_decode_64<true, PageSize><<<grid, 256, 0, stream>>>(*a);
+            // H64 benefits from overlapping V dequantization with the next raw
+            // tile fetch. H128 retains the earlier commit to avoid its regression.
+            if(a->heads == 64)
+            {
+                if(a->q_scale)
+                    fused_dsv41_fp8_qk_decode_64<false, PageSize, true, true>
+                        <<<grid, 256, 0, stream>>>(*a);
+                else if(rotate_q)
+                    fused_dsv41_fp8_qk_decode_64<true, PageSize, false, true>
+                        <<<grid, 256, 0, stream>>>(*a);
+                else
+                    fused_dsv41_fp8_qk_decode_64<false, PageSize, false, true>
+                        <<<grid, 256, 0, stream>>>(*a);
+            }
             else
-                fused_dsv41_fp8_qk_decode_64<false, PageSize><<<grid, 256, 0, stream>>>(*a);
+            {
+                if(a->q_scale)
+                    fused_dsv41_fp8_qk_decode_64<false, PageSize, true>
+                        <<<grid, 256, 0, stream>>>(*a);
+                else if(rotate_q)
+                    fused_dsv41_fp8_qk_decode_64<true, PageSize><<<grid, 256, 0, stream>>>(*a);
+                else
+                    fused_dsv41_fp8_qk_decode_64<false, PageSize><<<grid, 256, 0, stream>>>(*a);
+            }
             return hipGetLastError();
         }
     }

@@ -2,6 +2,7 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 #include "decode_prefetch.hpp"
+#include <type_traits>
 
 // MFMA consumes two 16-byte pieces per lane. Group32 scales are supplied
 // by lanes in group order, while values are interleaved across pairs of lanes.
@@ -30,68 +31,129 @@ template <int PageSize>
 struct Fp8QkSource64 : PackedDecodeSource64<true, PageSize>
 {
     using Base = PackedDecodeSource64<true, PageSize>;
-    template <class RawPointer>
-    __device__ __forceinline__ void commit_raw(
-        const typename Base::RawTile& raw, RawPointer raw_dst, int wave, int lane) const
+    // Preserve int32 paged indices until the next iteration consumes them.
+    // Extending an async int32 load immediately would force a VMEM wait before QK.
+    using Index = std::conditional_t<(PageSize != 0), int32_t, int64_t>;
+    __device__ __forceinline__ Index prefetch_index(int i) const
     {
-        auto* bytes = reinterpret_cast<OPUS_LDS_ADDR uint8_t*>(reinterpret_cast<uintptr_t>(raw_dst));
-        const int row = (lane / 8) * 4 + wave;
-        if((lane & 7) == 0)
-            *reinterpret_cast<OPUS_LDS_ADDR uint32_t*>(bytes + 32 * 528 + row * 4) = raw.live;
-        opus::static_for<8>([&](auto j) {
-            const int d = int(j) * 64 + (lane % 8) * 8;
-            *reinterpret_cast<OPUS_LDS_ADDR opus::vector_t<uint32_t, 2>*>(bytes + row * 528 + d) = raw.bytes[int(j)];
+        if(i < 0 || i >= this->length)
+            return Index{-1};
+        return static_cast<const Index*>(this->indices)[i];
+    }
+    using typename Base::Words4;
+    struct RawTile
+    {
+        opus::vector_t<uint32_t, 4> bytes[4];
+        opus::vector_t<uint32_t, 4> scales;
+        bool live;
+    };
+    __device__ __forceinline__ RawTile prefetch_row(int64_t r, int wave, int lane) const
+    {
+        asm volatile("" : "+v"(lane));
+        lane &= 63;
+        RawTile tile_data;
+        tile_data.live = this->valid_row(r);
+        // A device-constant zero row keeps invalid/tail loads defined without
+        // merging zero-filled vector PHIs before QK. commit_raw supplies scale 127.
+        const auto* zero = reinterpret_cast<const uint8_t*>(fused_zero_kv);
+        const auto* src =
+            tile_data.live ? this->cache.template data<PageSize>(this->pool, r) : zero;
+        const auto* scales = reinterpret_cast<const Words4*>(
+            tile_data.live ? this->cache.template scale<PageSize>(this->pool, r) : zero);
+        // Keep the original words live across QK; packing scales here serializes
+        // the prefetch on their VMEM completion.
+        tile_data.scales = {scales->x, scales->y, scales->z, scales->w};
+        // Four 16-byte reads preserve the public 4-byte row-alignment contract:
+        // Words4 has scalar uint32_t fields, rather than a 16-byte-aligned pointer.
+        opus::static_for<4>([&](auto j) {
+            const auto* values =
+                reinterpret_cast<const Words4*>(src + int(j) * 128 + (lane % 8) * 16);
+            tile_data.bytes[int(j)] = {values->x, values->y, values->z, values->w};
         });
-        if((lane & 3) == 0)
-            opus::static_for<8>([&](auto j) {
-                const int d = int(j) * 64 + (lane % 8) * 8;
-                bytes[row * 528 + 512 + d / 32] = raw.live ? (raw.scales[int(j) / 4] >> ((int(j) % 4) * 8)) & 255u : 127;
-            });
+        return tile_data;
+    }
+    __device__ __forceinline__ RawTile prefetch(int tile, int wave, int lane) const
+    {
+        return prefetch_row(this->row(tile * 32 + (lane / 8) * 4 + wave), wave, lane);
+    }
+    template <class RawPointer>
+    __device__ __forceinline__ void
+    commit_raw(const RawTile& raw, RawPointer raw_dst, int wave, int lane) const
+    {
+        auto* bytes =
+            reinterpret_cast<OPUS_LDS_ADDR uint8_t*>(reinterpret_cast<uintptr_t>(raw_dst));
+        const int row = (lane / 8) * 4 + wave;
+        opus::static_for<4>([&](auto j) {
+            const int d = int(j) * 128 + (lane % 8) * 16;
+            *reinterpret_cast<OPUS_LDS_ADDR opus::vector_t<uint32_t, 4>*>(bytes + row * 528 + d) =
+                raw.bytes[int(j)];
+        });
+        if((lane & 7) == 0)
+        {
+            *reinterpret_cast<OPUS_LDS_ADDR uint32_t*>(bytes + 32 * 528 + row * 4) = raw.live;
+            const opus::vector_t<uint32_t, 4> codes =
+                raw.live
+                    ? raw.scales
+                    : opus::vector_t<uint32_t, 4>{0x7f7f7f7f, 0x7f7f7f7f, 0x7f7f7f7f, 0x7f7f7f7f};
+            *reinterpret_cast<OPUS_LDS_ADDR opus::vector_t<uint32_t, 4>*>(bytes + row * 528 + 512) =
+                codes;
+        }
     }
     template <class Pointer, class RawPointer>
-    __device__ __forceinline__ void dequant_current(
-        RawPointer raw_src, Pointer dst, int wave, int lane) const
+    __device__ __forceinline__ void
+    dequant_current(RawPointer raw_src, Pointer dst, int wave, int lane) const
     {
-        auto* bytes = reinterpret_cast<OPUS_LDS_ADDR const uint8_t*>(reinterpret_cast<uintptr_t>(raw_src));
+        auto* bytes =
+            reinterpret_cast<OPUS_LDS_ADDR const uint8_t*>(reinterpret_cast<uintptr_t>(raw_src));
         const int row = (lane / 8) * 4 + wave;
         // Invalid rows were committed as zero bytes with scale 127, so they
         // dequantize to zero without a divergent validity branch. Load/convert
-        // each 8-value piece directly: rebuilding RawTile prolongs register
+        // each 16-value piece directly: rebuilding RawTile prolongs register
         // lifetimes and crosses the measured residency threshold.
         auto* lds = reinterpret_cast<OPUS_LDS_ADDR bf16_t*>(reinterpret_cast<uintptr_t>(dst));
-        opus::static_for<8>([&](auto j) {
-            const int d = int(j) * 64 + (lane % 8) * 8;
-            auto bits = *reinterpret_cast<OPUS_LDS_ADDR const opus::vector_t<uint32_t, 2>*>(bytes + row * 528 + d);
+        opus::static_for<4>([&](auto j) {
+            const int d = int(j) * 128 + (lane % 8) * 16;
+            auto bits   = *reinterpret_cast<OPUS_LDS_ADDR const opus::vector_t<uint32_t, 4>*>(
+                bytes + row * 528 + d);
             float scale = __uint_as_float(uint32_t(bytes[row * 528 + 512 + d / 32]) << 23);
-            opus::vector_t<bf16_t, 8> values;
-            opus::static_for<2>([&](auto half) {
+            opus::vector_t<bf16_t, 16> values;
+            opus::static_for<4>([&](auto half) {
                 uint32_t word = bits[int(half)];
-                auto lo = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(word, scale, false);
-                auto hi = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(word, scale, true);
-                auto* pairs = reinterpret_cast<opus::vector_t<bf16_t, 2>*>(&values);
-                pairs[int(half) * 2] = __builtin_bit_cast(opus::vector_t<bf16_t, 2>, lo);
+                auto lo       = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(word, scale, false);
+                auto hi       = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(word, scale, true);
+                auto* pairs   = reinterpret_cast<opus::vector_t<bf16_t, 2>*>(&values);
+                pairs[int(half) * 2]     = __builtin_bit_cast(opus::vector_t<bf16_t, 2>, lo);
                 pairs[int(half) * 2 + 1] = __builtin_bit_cast(opus::vector_t<bf16_t, 2>, hi);
             });
-            *reinterpret_cast<OPUS_LDS_ADDR opus::vector_t<bf16_t, 8>*>(lds + (int(j) * 4 + wave) * 528 + lane * 8) = values;
+            auto* dst = lds + ((int(j) * 2 + (lane % 8) / 4) * 4 + wave) * 528 + (lane / 8) * 64 +
+                        (lane % 4) * 16;
+            const auto lo = opus::slice(values, opus::number<0>{}, opus::number<8>{});
+            const auto hi = opus::slice(values, opus::number<8>{}, opus::number<16>{});
+            // The two lane groups write opposite halves first to reduce LDS bank
+            // overlap. Both stores retain exactly the original BF16 V layout.
+            const bool flip = (lane & 4) != 0;
+            *reinterpret_cast<OPUS_LDS_ADDR opus::vector_t<bf16_t, 8>*>(dst + (flip ? 8 : 0)) =
+                flip ? hi : lo;
+            *reinterpret_cast<OPUS_LDS_ADDR opus::vector_t<bf16_t, 8>*>(dst + (flip ? 0 : 8)) =
+                flip ? lo : hi;
         });
     }
 };
 
 namespace opus_mla_v4_prefill_a16w16_16mx8_32nx1 {
-template <class Traits, class Source>
-__device__ void fp8_qk_decode_accum64(
-    const Source& source,
-    int valid_kv_len,
-    int num_kv_tiles,
-    char* smem_kv_buf,
-    const opus::vector_t<opus::fp8_t, 32> (&v_q)[4],
-    const int (&q_scales)[4],
-    uint8_t* raw_lds,
-    opus::vector_t<typename Traits::D_ACC, 8> (&v_o)[16],
-    typename Traits::D_ACC& actual_max,
-    typename Traits::D_ACC& m_row,
-    typename Traits::D_ACC& l_row,
-    typename Traits::D_ACC temperature_scale)
+template <class Traits, bool LateCommit = false, class Source>
+__device__ void fp8_qk_decode_accum64(const Source& source,
+                                      int valid_kv_len,
+                                      int num_kv_tiles,
+                                      char* smem_kv_buf,
+                                      const opus::vector_t<opus::fp8_t, 32> (&v_q)[4],
+                                      const int (&q_scales)[4],
+                                      uint8_t* raw_lds,
+                                      opus::vector_t<typename Traits::D_ACC, 8> (&v_o)[16],
+                                      typename Traits::D_ACC& actual_max,
+                                      typename Traits::D_ACC& m_row,
+                                      typename Traits::D_ACC& l_row,
+                                      typename Traits::D_ACC temperature_scale)
 {
     using namespace opus;
     using T      = opus::remove_cvref_t<Traits>;
@@ -119,13 +181,13 @@ __device__ void fp8_qk_decode_accum64(
                                               seq<T::W_M, T::W_N, T::W_K>{},
                                               mfma_adaptor_swap_ab{});
 
-    auto u_gkv        = make_layout_gkv<T>(warp_id, lane_id);
-    auto u_skv        = make_layout_skv<T>(warp_id);
-    auto u_rv         = make_layout_rv<T>(lane_id);
+    auto u_gkv = make_layout_gkv<T>(warp_id, lane_id);
+    auto u_skv = make_layout_skv<T>(warp_id);
+    auto u_rv  = make_layout_rv<T>(lane_id);
 
     typename decltype(mma0)::vtype_c v_s;
     typename decltype(mma1)::vtype_a v_p;
-    typename decltype(mma1)::vtype_b v_v[2];
+    typename decltype(mma1)::vtype_b v_v[3];
     auto* v_o_slices = v_o;
 
     constexpr index_t s_len = vector_traits<typename decltype(mma0)::vtype_c>::size();
@@ -136,7 +198,7 @@ __device__ void fp8_qk_decode_accum64(
                       (s % 2) * T::SLICE_D>{};
     };
 
-    auto* raw_cur = reinterpret_cast<OPUS_LDS_ADDR uint8_t*>(reinterpret_cast<uintptr_t>(raw_lds));
+    auto* raw_cur  = reinterpret_cast<OPUS_LDS_ADDR uint8_t*>(reinterpret_cast<uintptr_t>(raw_lds));
     auto* raw_next = raw_cur + 32 * 528 + 128;
     auto mask_scores = [&](auto& s) {
         // Materialize validity addresses only when scores are masked.
@@ -146,7 +208,7 @@ __device__ void fp8_qk_decode_accum64(
         static_for<2>([&](auto n) {
             int first = int(n) * 16 + (mask_lane / 16) * 4;
             static_for<4>([&](auto j) {
-                int k          = first + int(j);
+                int k = first + int(j);
                 if(!reinterpret_cast<OPUS_LDS_ADDR const uint32_t*>(raw_cur + 32 * 528)[k])
                     s[int(n) * 4 + int(j)] = -INFINITY;
             });
@@ -168,19 +230,37 @@ __device__ void fp8_qk_decode_accum64(
             const int row = n * 16 + lane_id % 16;
             static_for<2>([&](auto half) {
                 const int kd = step * 128 + (lane_id / 16) * 16 + int(half) * 64;
-                auto part = *reinterpret_cast<OPUS_LDS_ADDR const vector_t<fp8_t, 16>*>(raw_cur + row * 528 + kd);
-                set_slice(keys[slot], part, number<int(half) * 16>{}, number<int(half) * 16 + 16>{});
+                // Explicit DS reads keep LLVM from strengthening the pipelined
+                // partial waits below. Immediate offsets avoid per-load VALU work.
+                vector_t<uint32_t, 4> words;
+                const uint32_t addr = uint32_t(reinterpret_cast<uintptr_t>(
+                    raw_cur + (lane_id % 16) * 528 + (lane_id / 16) * 16));
+                asm volatile("ds_read_b128 %0, %1 offset:%2"
+                             : "=v"(words)
+                             : "v"(addr), "n"(n * 16 * 528 + step * 128 + int(half) * 64)
+                             : "memory");
+                auto part = __builtin_bit_cast(vector_t<fp8_t, 16>, words);
+                set_slice(
+                    keys[slot], part, number<int(half) * 16>{}, number<int(half) * 16 + 16>{});
             });
-            scales[slot] = raw_cur[row * 528 + 512 + step * 4 + lane_id / 16];
+            const uint32_t scale_addr = uint32_t(
+                reinterpret_cast<uintptr_t>(raw_cur + (lane_id % 16) * 528 + lane_id / 16));
+            uint32_t code;
+            asm volatile("ds_read_u8 %0, %1 offset:%2"
+                         : "=v"(code)
+                         : "v"(scale_addr), "n"(n * 16 * 528 + 512 + step * 4)
+                         : "memory");
+            scales[slot] = code;
         };
         auto issue_qk = [&](auto index) {
             constexpr int i = int(index), slot = i % 2, step = i / 2, n = i % 2;
-            auto kw = __builtin_bit_cast(vector_t<uint32_t, 8>, keys[slot]);
-            auto qw = __builtin_bit_cast(vector_t<uint32_t, 8>, v_q[step]);
+            auto kw  = __builtin_bit_cast(vector_t<uint32_t, 8>, keys[slot]);
+            auto qw  = __builtin_bit_cast(vector_t<uint32_t, 8>, v_q[step]);
             auto acc = score[n];
             int ks = scales[slot], qs = q_scales[step];
             asm volatile("v_mfma_scale_f32_16x16x128_f8f6f4 %0, %1, %2, %0, %3, %4"
-                         : "+v"(acc) : "v"(kw), "v"(qw), "v"(ks), "v"(qs));
+                         : "+v"(acc)
+                         : "v"(kw), "v"(qw), "v"(ks), "v"(qs));
             score[n] = acc;
         };
         load_k(0_I);
@@ -211,35 +291,34 @@ __device__ void fp8_qk_decode_accum64(
         static_assert(sizeof(p) == 16 && sizeof(v) == 32 && sizeof(o) == 32);
         auto pw = __builtin_bit_cast(vector_t<uint32_t, 4>, p);
         static_for<2>([&](auto n) {
-            auto vw = __builtin_bit_cast(vector_t<uint32_t, 4>,
-                slice(v, number<int(n) * 8>{}, number<int(n) * 8 + 8>{}));
+            auto vw  = __builtin_bit_cast(vector_t<uint32_t, 4>,
+                                         slice(v, number<int(n) * 8>{}, number<int(n) * 8 + 8>{}));
             auto acc = slice(o, number<int(n) * 4>{}, number<int(n) * 4 + 4>{});
-            asm volatile("v_mfma_f32_16x16x32_bf16 %0, %1, %2, %0"
-                         : "+v"(acc) : "v"(vw), "v"(pw));
+            asm volatile("v_mfma_f32_16x16x32_bf16 %0, %1, %2, %0" : "+v"(acc) : "v"(vw), "v"(pw));
             set_slice(o, acc, number<int(n) * 4>{}, number<int(n) * 4 + 4>{});
         });
         return o;
     };
+    // Keep three V operands in flight. Partial waits count the outstanding
+    // LDS reads; the scheduling fences preserve their order relative to MFMA.
     auto compute_pv = [&](const auto& p, auto& v, auto& o, int kv_tile_idx) {
-        static_for<T::NUM_D_SLICES - 2>([&](auto i) {
-            constexpr int idx  = i.value;
-            constexpr int slot = idx & 1;
-            o[idx]             = pv_vgpr(p, v[slot], o[idx]);
-            v[slot]            = tr_load<T::VEC_TR_V>(s_kv, u_rv + skv_slice(number<idx + 2>{}));
-            s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
-            // Partial waits rely on LDS issue order and on which MFMA consumes
-            // the completed reads. Allow VALU across this boundary, but keep
-            // LDS, MFMA and SALU (including s_waitcnt) ordered. Allowing MFMA
-            // or SALU here makes a later slice consume still-pending reads.
-            // See experiments/20261014/PV_SCHEDULING.md for ISA and regressions.
+        static_for<T::NUM_D_SLICES - 3>([&](auto i) {
+            constexpr int idx = int(i), slot = idx % 3;
+            o[idx]  = pv_vgpr(p, v[slot], o[idx]);
+            v[slot] = tr_load<T::VEC_TR_V>(s_kv, u_rv + skv_slice(number<idx + 3>{}));
+            s_waitcnt_lgkmcnt(number<(3 - 1) * T::v_ds_read_insts>{});
             __builtin_amdgcn_sched_barrier(VALU_MASK);
         });
-        o[T::NUM_D_SLICES - 2] = pv_vgpr(p, v[(T::NUM_D_SLICES - 2) & 1], o[T::NUM_D_SLICES - 2]);
-        s_waitcnt_lgkmcnt(0_I);
-        __builtin_amdgcn_sched_barrier(0);
-        o[T::NUM_D_SLICES - 1] = pv_vgpr(p, v[(T::NUM_D_SLICES - 1) & 1], o[T::NUM_D_SLICES - 1]);
+        static_for<3>([&](auto j) {
+            constexpr int idx = T::NUM_D_SLICES - 3 + int(j);
+            o[idx]            = pv_vgpr(p, v[idx % 3], o[idx]);
+            if constexpr(int(j) + 1 < 3)
+            {
+                s_waitcnt_lgkmcnt(number<(3 - 2 - int(j)) * T::v_ds_read_insts>{});
+                __builtin_amdgcn_sched_barrier(0);
+            }
+        });
     };
-
 
     if constexpr(Source::is_packed)
         source.commit_raw(source.prefetch(0, warp_id, lane_id), raw_cur, warp_id, lane_id);
@@ -248,13 +327,16 @@ __device__ void fp8_qk_decode_accum64(
     s_waitcnt_vmcnt(0_I);
     s_waitcnt_lgkmcnt(0_I);
     __builtin_amdgcn_s_barrier();
+    auto next_row = source.prefetch_index(32 + (lane_id / 8) * 4 + warp_id);
     for(int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx)
     {
         typename Source::RawTile next_raw;
         if constexpr(Source::is_packed)
         {
-            if(tile_idx + 1 < num_kv_tiles)
-                next_raw = source.prefetch(tile_idx + 1, warp_id, lane_id);
+            auto current_row = next_row;
+            asm volatile("" : "+v"(current_row));
+            next_raw = source.prefetch_row(current_row, warp_id, lane_id);
+            next_row = source.prefetch_index((tile_idx + 2) * 32 + (lane_id / 8) * 4 + warp_id);
         }
         __builtin_amdgcn_sched_barrier(0);
 
@@ -262,13 +344,16 @@ __device__ void fp8_qk_decode_accum64(
         // Keep next-tile VMEM waits after QK, so QK covers raw prefetch
         // latency. This is a compiler fence, not a CTA barrier.
         __builtin_amdgcn_sched_barrier(0);
-        if(tile_idx + 1 < num_kv_tiles)
+        if constexpr(!LateCommit)
         {
-            if constexpr(Source::is_packed)
-                source.commit_raw(next_raw, raw_next, warp_id, lane_id);
-            else
-                source.template load_tile<T>(
-                    tile_idx + 1, s_kv.ptr, u_gkv, u_skv, warp_id, lane_id);
+            if(tile_idx + 1 < num_kv_tiles)
+            {
+                if constexpr(Source::is_packed)
+                    source.commit_raw(next_raw, raw_next, warp_id, lane_id);
+                else
+                    source.template load_tile<T>(
+                        tile_idx + 1, s_kv.ptr, u_gkv, u_skv, warp_id, lane_id);
+            }
         }
 
         // Reuse the sole V slot only after the previous iteration's barrier.
@@ -284,7 +369,8 @@ __device__ void fp8_qk_decode_accum64(
         // Explicit FMA contracts the scale/subtract despite -ffp-contract=off.
         // One v_fma_f32 plus one v_exp_f32 per score; FMA changes FP32 rounding.
         static_for<s_len>([&](auto i) {
-            v_s[int(i)] = __builtin_amdgcn_exp2f(__builtin_fmaf(v_s[int(i)], temperature_scale, -row_max));
+            v_s[int(i)] =
+                __builtin_amdgcn_exp2f(__builtin_fmaf(v_s[int(i)], temperature_scale, -row_max));
         });
         l_row *= rescale_m;
         l_row += attn_row_sum<T>(v_s);
@@ -292,11 +378,23 @@ __device__ void fp8_qk_decode_accum64(
         if(!below)
             scale_output_tile<T>(v_o, rescale_m);
 
+        if constexpr(LateCommit)
+        {
+            if(tile_idx + 1 < num_kv_tiles)
+            {
+                if constexpr(Source::is_packed)
+                    source.commit_raw(next_raw, raw_next, warp_id, lane_id);
+                else
+                    source.template load_tile<T>(
+                        tile_idx + 1, s_kv.ptr, u_gkv, u_skv, warp_id, lane_id);
+            }
+        }
+
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_barrier(); // All waves have finished writing V.
-        v_v[0] = tr_load<T::VEC_TR_V>(s_kv, u_rv);
-        v_v[1] = tr_load<T::VEC_TR_V>(s_kv, u_rv + skv_slice(1_I));
-        s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
+        static_for<3>(
+            [&](auto j) { v_v[int(j)] = tr_load<T::VEC_TR_V>(s_kv, u_rv + skv_slice(j)); });
+        s_waitcnt_lgkmcnt(number<(3 - 1) * T::v_ds_read_insts>{});
         __builtin_amdgcn_sched_barrier(0);
         compute_pv(v_p, v_v, v_o_slices, tile_idx);
         s_waitcnt_vmcnt(0_I);
@@ -307,4 +405,4 @@ __device__ void fp8_qk_decode_accum64(
     }
 }
 
-} // namespace
+} // namespace opus_mla_v4_prefill_a16w16_16mx8_32nx1
