@@ -934,3 +934,120 @@ def test_triton_unified_attn_asym_head_guards(case: str) -> None:
             shuffled_kv_cache=shuffled,
             backend="triton",
         )
+
+
+def poison_kv_tail(cache, block_tables, kv_lens, block_size):
+    """Write NaN into the cache slots that no query may attend to.
+
+    The slots are the ones past kv_len in the last used block and all blocks
+    of the table after the used blocks. generate_data gives each block to
+    one sequence only, so this changes no valid key or value.
+    """
+    int_dtype = {1: torch.uint8, 2: torch.int16, 4: torch.int32}[cache.element_size()]
+    raw = cache.view(int_dtype)
+    nan = torch.full((), float("nan"), device=cache.device).to(cache.dtype)
+    nan = nan.view(int_dtype)
+    for i, kv_len in enumerate(kv_lens.tolist()):
+        num_used = (kv_len + block_size - 1) // block_size
+        raw[block_tables[i, num_used:].long()] = nan
+        if kv_len % block_size:
+            raw[int(block_tables[i, num_used - 1]), kv_len % block_size :] = nan
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(1, 15), (8, 141), (4, 70), (1, 133), (34, 345), (12, 87), (1, 2049)],
+    ],
+)
+@pytest.mark.parametrize("num_heads", [(8, 1), (16, 2)])
+@pytest.mark.parametrize("head_size", [128, 512])
+@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, e4m3_dtype])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+@torch.inference_mode()
+def test_triton_unified_attn_ignores_kv_tail(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    block_size: int,
+    kv_dtype: torch.dtype,
+    backend: str,
+) -> None:
+    """Stale data in unused cache slots must not change the output."""
+    if backend == "gluon" and not _is_gluon_available():
+        pytest.skip(f"skip gluon backend, not available on {DEVICE_ARCH}")
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=4096,
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        kv_dtype=kv_dtype,
+        device="cuda",
+    )
+    poison_kv_tail(key_cache, block_tables, kv_lens, block_size)
+    poison_kv_tail(value_cache, block_tables, kv_lens, block_size)
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        output_scale=output_scale,
+        backend=backend,
+    )
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[x[0] for x in seq_lens],
+        kv_lens=[x[1] for x in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=output.dtype,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        output_scale=output_scale,
+    )
+
+    output = output.to(torch.float32)
+    ref_output = ref_output.to(torch.float32)
+    bad_rows = (~torch.isfinite(output)).flatten(1).any(1).nonzero().flatten()
+    assert bad_rows.numel() == 0, f"non-finite output rows: {bad_rows.tolist()[:16]}"
+    atol, rtol = (1.5e-1, 1.5e-1) if kv_dtype.itemsize == 1 else (1.5e-2, 1e-2)
+    torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)

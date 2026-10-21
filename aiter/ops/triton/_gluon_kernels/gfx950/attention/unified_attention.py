@@ -1093,6 +1093,7 @@ class AttentionProgram:
     safe_tile_end: gl.tensor
     query_mask_qk: gl.tensor
     context_len_q_pos_qk: gl.tensor
+    kv_len: gl.tensor
     QK_scale: gl.tensor
     SM_scale: gl.tensor
     SOFTCAP: gl.tensor
@@ -1113,6 +1114,7 @@ class AttentionProgram:
         safe_tile_end,
         query_mask_qk,
         context_len_q_pos_qk,
+        kv_len,
         QK_scale,
         SM_scale,
         SOFTCAP,
@@ -1130,6 +1132,7 @@ class AttentionProgram:
         self.safe_tile_end = safe_tile_end
         self.query_mask_qk = query_mask_qk
         self.context_len_q_pos_qk = context_len_q_pos_qk
+        self.kv_len = kv_len
         self.QK_scale = QK_scale
         self.SM_scale = SM_scale
         self.SOFTCAP = SOFTCAP
@@ -1251,6 +1254,7 @@ class AttentionProgram:
             safe_tile_end,
             query_mask_qk,
             context_len_q_pos_qk,
+            max_seq_prefix_len,
             QK_scale,
             SM_scale,
             SOFTCAP,
@@ -1467,6 +1471,24 @@ class AttentionProgram:
 
 
 @gluon.jit
+def zero_v_tail(kv_loader, buffer_id, row_limit, SYNC: gl.constexpr = False):
+    # Set the V rows at or past row_limit in shared memory to 0. Their p is 0, but
+    # stale NaN/Inf there makes 0 * v NaN in the PV dot. Call it after this thread
+    # waits for its V copy: the copy layout makes each thread change only its own data.
+    cfg = kv_loader.cfg
+    # Most programs skip this: only the end of the sequence has such rows
+    if not cfg.SHUFFLED_KV_CACHE and row_limit < cfg.TILE_SIZE:
+        layout: gl.constexpr = kv_loader.kv_cfg.blocked_v
+        tile = kv_loader.v_shared.index(buffer_id)
+        v = tile.load(layout=layout)
+        rows = gl.arange(0, cfg.TILE_SIZE, layout=gl.SliceLayout(1, layout))
+        tile.store(gl.where((rows < row_limit)[:, None], v, gl.zeros_like(v)))
+        if SYNC:
+            # Other warps read V next. row_limit is the same for all of them.
+            _barrier()
+
+
+@gluon.jit
 def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
     # One shared buffer, and every warp reads the whole tile because operand B is
     # replicated across warps
@@ -1534,6 +1556,7 @@ def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
     p, alpha, M = pgm.softmax_part0(S, M)
     p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
     gl.amd.cdna4.async_copy.wait_group(0)
+    zero_v_tail(kv_loader, 0, pgm.kv_len - j * pgm.cfg.TILE_SIZE)
     _barrier()
     v = kv_loader.load_v_from_shared(
         wait_count=0, target_dtype=q.dtype, buffer_id=0, skip_wait=True
@@ -1649,6 +1672,7 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
             next_physical_block_idx = next2_physical_block_idx
 
     # Last tile is always masked
+    v_row_limit = pgm.kv_len - (pgm.tile_end - 1) * pgm.cfg.TILE_SIZE
     if pgm.cfg.NUM_WARPS > 1:
         gl.amd.cdna4.async_copy.wait_group(0)
         _barrier()
@@ -1664,10 +1688,14 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
     p, alpha, M = pgm.softmax_part0(S, M)
     p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
     if pgm.cfg.NUM_WARPS == 1:
+        gl.amd.cdna4.async_copy.wait_group(0)
+        zero_v_tail(kv_loader, buffer_id, v_row_limit)
         v = kv_loader.load_v_from_shared(
             wait_count=0, target_dtype=q.dtype, buffer_id=buffer_id
         )
     else:
+        # After QK and softmax, so the extra LDS round trip overlaps them
+        zero_v_tail(kv_loader, buffer_id, v_row_limit, SYNC=True)
         v = kv_loader.load_v_from_shared(
             wait_count=0,
             target_dtype=q.dtype,
