@@ -189,19 +189,36 @@ def _find_rocm_home() -> str | None:
     # Guess #1
     rocm_home = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH")
     if rocm_home is None:
-        # Guess #2: rocm-sdk-devel pip package ships a self-contained ROCm
-        # tree under site-packages/_rocm_sdk_devel/. Prefer this over a
-        # hipcc-on-PATH lookup because the venv's bin/hipcc is a python
-        # wrapper, not a real binary — realpath() can't recover the SDK
-        # root from it.
-        try:
-            spec = importlib.util.find_spec("_rocm_sdk_devel")
-        except (ImportError, ValueError):
-            spec = None
-        if spec is not None and spec.submodule_search_locations:
-            candidate = spec.submodule_search_locations[0]
-            if _find_executable(os.path.join(candidate, "bin"), "hipconfig"):
-                rocm_home = candidate
+        # Guess #2: pip-installed ROCm SDK ships a self-contained ROCm tree
+        # under site-packages.  ROCm ≤6.x uses _rocm_sdk_devel; ROCm 10.0+
+        # uses _rocm_sdk_core.  Prefer this over a hipcc-on-PATH lookup
+        # because the venv's bin/hipcc is a python wrapper, not a real
+        # binary — realpath() can't recover the SDK root from it.
+        #
+        # Try importlib first, then fall back to probing the filesystem
+        # directly — importlib.util.find_spec() fails inside pip's
+        # build-isolation subprocess where the SDK isn't importable.
+        for _sdk_pkg in ("_rocm_sdk_devel", "_rocm_sdk_core"):
+            try:
+                spec = importlib.util.find_spec(_sdk_pkg)
+            except (ImportError, ValueError):
+                spec = None
+            if spec is not None and spec.submodule_search_locations:
+                candidate = spec.submodule_search_locations[0]
+                if _find_executable(os.path.join(candidate, "bin"), "hipconfig"):
+                    rocm_home = candidate
+                    break
+        else:
+            import sysconfig as _sysconfig
+
+            _site = _sysconfig.get_paths().get("purelib", "")
+            for _sdk_pkg in ("_rocm_sdk_devel", "_rocm_sdk_core"):
+                candidate = os.path.join(_site, _sdk_pkg)
+                if os.path.isdir(candidate) and _find_executable(
+                    os.path.join(candidate, "bin"), "hipconfig"
+                ):
+                    rocm_home = candidate
+                    break
     if rocm_home is None:
         # Guess #3
         hipcc_path = shutil.which("hipcc")
@@ -995,7 +1012,19 @@ def CUDAExtension(name, sources, *args, **kwargs):
     libraries.append("torch_cpu")
     libraries.append("torch_python")
     if IS_HIP_EXTENSION:
-        libraries.append("amdhip64")
+        rocm_lib_dir = _join_rocm_home("lib")
+        if os.path.isfile(os.path.join(rocm_lib_dir, "libamdhip64.so")):
+            libraries.append("amdhip64")
+        else:
+            import glob
+
+            versioned = sorted(
+                glob.glob(os.path.join(rocm_lib_dir, "libamdhip64.so.*"))
+            )
+            if versioned:
+                kwargs.setdefault("extra_link_args", []).append(versioned[-1])
+            else:
+                libraries.append("amdhip64")
         libraries.append("c10_hip")
         libraries.append("torch_hip")
     else:
@@ -1607,8 +1636,23 @@ def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exc
         if verbose:
             print("Detected CUDA files, patching ldflags", file=sys.stderr)
 
-        extra_ldflags.append(f'-L{_posix_path(_join_rocm_home("lib"))}')
-        extra_ldflags.append("-lamdhip64")
+        rocm_lib_dir = _posix_path(_join_rocm_home("lib"))
+        extra_ldflags.append(f"-L{rocm_lib_dir}")
+        # pip-installed ROCm SDK may only ship a versioned libamdhip64.so.N
+        # without the unversioned libamdhip64.so symlink that -l requires.
+        # In that case, link against the versioned library directly.
+        if os.path.isfile(os.path.join(rocm_lib_dir, "libamdhip64.so")):
+            extra_ldflags.append("-lamdhip64")
+        else:
+            import glob
+
+            versioned = sorted(
+                glob.glob(os.path.join(rocm_lib_dir, "libamdhip64.so.*"))
+            )
+            if versioned:
+                extra_ldflags.append(versioned[-1])
+            else:
+                extra_ldflags.append("-lamdhip64")
     if IS_WINDOWS:
         extra_ldflags = _resolve_mingw_import_libs(extra_ldflags)
     return extra_ldflags
