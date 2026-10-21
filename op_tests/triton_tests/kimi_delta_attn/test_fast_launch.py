@@ -201,8 +201,7 @@ def test_a_second_device_does_not_reuse_the_first_entry():
     first = make_inputs(B, T, H)
     run(first)  # the entry for this shape is now held against device 0
 
-    torch.cuda.set_device(1)
-    try:
+    with torch.cuda.device(1):
         second = make_inputs(B, T, H, device="cuda:1")
         with fast_launch.recording() as misses:
             got_o, got_s = run(second)
@@ -211,8 +210,6 @@ def test_a_second_device_does_not_reuse_the_first_entry():
             want_o, want_s = run(second)
         assert torch.equal(got_o, want_o)
         assert torch.equal(got_s, want_s)
-    finally:
-        torch.cuda.set_device(0)
 
 
 def test_alignment_is_part_of_the_key():
