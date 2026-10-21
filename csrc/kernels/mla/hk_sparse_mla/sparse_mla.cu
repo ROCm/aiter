@@ -87,12 +87,6 @@ __device__ __forceinline__ void lds_wait2(OpTile& t)
 {
     asm volatile("s_waitcnt lgkmcnt(%2)" : "+v"(frag(t, 0)), "+v"(frag(t, 1)) : "n"(N));
 }
-// E8M0 127 = 2^0 in every byte: unscaled fp8 through V_MFMA_SCALE
-__device__ __forceinline__ const kittens::fp8e8m0_4* unit_scale()
-{
-    static constexpr uint32_t one = 0x7f7f7f7fu;
-    return reinterpret_cast<const kittens::fp8e8m0_4*>(&one);
-}
 // combine across the four 16-lane rows (lanes l, l^16, l^32, l^48)
 __device__ __forceinline__ float rows_max(float m)
 {
@@ -127,6 +121,8 @@ __global__ __launch_bounds__(NT, 1) void sparse_mla_fwd(const uint8_t* __restric
                                                         float* __restrict__ part_o,
                                                         float* __restrict__ part_lse)
 {
+    const auto one = kittens::base_types::constants<kittens::fp8e8m0_4>::one();
+
     // nsplit > 1: workgroup (token, split) covers a contiguous range of key blocks and writes a
     // partial result (output normalized by its own sum, fp32 [T][nsplit][H][D], and log2-sum-exp
     // [T][nsplit][H]); a combine merges them.
@@ -240,13 +236,13 @@ __global__ __launch_bounds__(NT, 1) void sparse_mla_fwd(const uint8_t* __restric
             for(int ks = 0; ks < 4; ks++)
                 kittens::load(ka[ks], KvTile::subtile<16, 128>(kb[ks], {KPW / 16 * w + kt, 0}));
             lds_wait<6>(ka[0]);
-            kittens::mma_ABt_scaled(st[kt], ka[0], qt[0], st[kt], unit_scale(), unit_scale());
+            kittens::mma_ABt_scaled(st[kt], ka[0], qt[0], st[kt], &one, &one);
             lds_wait<4>(ka[1]);
-            kittens::mma_ABt_scaled(st[kt], ka[1], qt[1], st[kt], unit_scale(), unit_scale());
+            kittens::mma_ABt_scaled(st[kt], ka[1], qt[1], st[kt], &one, &one);
             lds_wait<2>(ka[2]);
-            kittens::mma_ABt_scaled(st[kt], ka[2], qt[2], st[kt], unit_scale(), unit_scale());
+            kittens::mma_ABt_scaled(st[kt], ka[2], qt[2], st[kt], &one, &one);
             lds_wait<0>(ka[3]);
-            kittens::mma_ABt_scaled(st[kt], ka[3], qt[3], st[kt], unit_scale(), unit_scale());
+            kittens::mma_ABt_scaled(st[kt], ka[3], qt[3], st[kt], &one, &one);
         }
 // mask: element r of st[kt] is key KPW w + 16kt + 4lg + r
 #pragma unroll
@@ -351,7 +347,7 @@ __global__ __launch_bounds__(NT, 1) void sparse_mla_fwd(const uint8_t* __restric
             {
                 lds_wait<0>(vt[cur]);
             }
-            kittens::mma_ABt_scaled(o[dt], pt, vt[cur], o[dt], unit_scale(), unit_scale());
+            kittens::mma_ABt_scaled(o[dt], pt, vt[cur], o[dt], &one, &one);
         }
     }
 
