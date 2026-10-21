@@ -1,3 +1,5 @@
+# Reuse pinned local fixture/adapter source to preserve the comparison contract.
+# ruff: noqa: S102
 """Reuse each V operand across four head groups; keep P resident across D slices."""
 
 import json
@@ -81,7 +83,8 @@ with (out / "tests.log").open("w") as log:
         cwd=repo,
         stdout=log,
         stderr=subprocess.STDOUT,
+        check=False,
     )
 print((out / "tests.log").read_text()[-10000:], flush=True)
-(out / "status.json").write_text(json.dumps(dict(exit_code=p.returncode)))
+(out / "status.json").write_text(json.dumps({"exit_code": p.returncode}))
 p.check_returncode()

@@ -1,3 +1,5 @@
+# Reuse pinned local fixture/adapter source to preserve the comparison contract.
+# ruff: noqa: S102
 import json
 import sys
 from pathlib import Path

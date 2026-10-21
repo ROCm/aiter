@@ -244,14 +244,15 @@ with (out / "tests.log").open("w") as log:
         cwd=repo,
         stdout=log,
         stderr=subprocess.STDOUT,
+        check=False,
     )
 print((out / "tests.log").read_text()[-10000:], flush=True)
 (out / "status.json").write_text(
     json.dumps(
-        dict(
-            exit_code=proc.returncode,
-            source_sha256=hashlib.sha256(text.encode()).hexdigest(),
-        )
+        {
+            "exit_code": proc.returncode,
+            "source_sha256": hashlib.sha256(text.encode()).hexdigest(),
+        }
     )
 )
 proc.check_returncode()

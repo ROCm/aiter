@@ -1,3 +1,5 @@
+# Reuse pinned local fixture/adapter source to preserve the comparison contract.
+# ruff: noqa: S102
 """Pinned decode fixture; profile one selected full path with ordinary launches."""
 
 import ast
@@ -35,7 +37,7 @@ src = ast.unparse(
     )
 )
 src = src.replace("if module is modules['fp8']:", "if True:")
-exec(compile(src, "profile_make_call", "exec"), dict(b=b, torch=torch), ns := {})
+exec(compile(src, "profile_make_call", "exec"), {"b": b, "torch": torch}, ns := {})
 b.make_call = ns["make_call"]
 src = ast.unparse(
     next(

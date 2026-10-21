@@ -18,6 +18,7 @@ for mode, case, kind, tag in [
             [sys.executable, str(work / "collect.py"), mode, case, kind, tag],
             stdout=log,
             stderr=subprocess.STDOUT,
+            check=False,
         )
     print(label, p.returncode, flush=True)
     p.check_returncode()

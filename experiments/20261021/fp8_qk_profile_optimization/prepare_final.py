@@ -71,11 +71,11 @@ hashes = {
 }
 (work / "selection.json").write_text(
     json.dumps(
-        dict(
-            candidate=tag,
-            baseline_commit="06ca613d93b1d19d7edb411f5dd79c26b6239c23",
-            source_sha256=hashes,
-        ),
+        {
+            "candidate": tag,
+            "baseline_commit": "06ca613d93b1d19d7edb411f5dd79c26b6239c23",
+            "source_sha256": hashes,
+        },
         indent=2,
     )
 )
@@ -99,6 +99,7 @@ with (out / "native.log").open("w") as log:
         cwd=repo,
         stdout=log,
         stderr=subprocess.STDOUT,
+        check=False,
     )
 print((out / "native.log").read_text()[-8000:])
 proc.check_returncode()
@@ -108,10 +109,10 @@ assert hashes == {
 binary = work / "jit/final/module_fused_dsv41_mxfp8.so"
 (out / "provenance.json").write_text(
     json.dumps(
-        dict(
-            source_sha256=hashes,
-            binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
-        ),
+        {
+            "source_sha256": hashes,
+            "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+        },
         indent=2,
     )
 )

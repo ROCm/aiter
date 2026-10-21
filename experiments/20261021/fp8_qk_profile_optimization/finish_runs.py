@@ -22,6 +22,7 @@ for label, args in jobs:
             [sys.executable, "-u", str(work / args[0]), *args[1:]],
             stdout=log,
             stderr=subprocess.STDOUT,
+            check=False,
         )
     print("DONE", label, p.returncode, flush=True)
     if p.returncode:

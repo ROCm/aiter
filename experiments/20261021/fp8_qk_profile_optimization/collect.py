@@ -62,11 +62,16 @@ else:
 cmd += ["--", sys.executable, str(work / "workload.py"), mode, case, tag]
 print("RUN", cmd, flush=True)
 result = subprocess.run(
-    cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300
+    cmd,
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    timeout=300,
+    check=False,
 )
 (work / (label + ".log")).write_text(result.stdout)
 (work / (label + ".json")).write_text(
-    json.dumps(dict(command=cmd, exit_code=result.returncode), indent=2)
+    json.dumps({"command": cmd, "exit_code": result.returncode}, indent=2)
 )
 print(result.stdout[-6000:])
 result.check_returncode()

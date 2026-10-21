@@ -1,3 +1,5 @@
+# Reuse pinned local fixture/adapter source to preserve the comparison contract.
+# ruff: noqa: S102
 from pathlib import Path
 
 base = Path("/home/jun_chen2_qle/yzhou_aiter")

@@ -22,10 +22,10 @@ for path in work.glob("*att*/stats*.csv"):
             op = "valu"
         for f in ["Hitcount", "Latency", "Stall", "Idle"]:
             agg[op][f] += int(r[f])
-    data = dict(
-        aggregate=dict(agg),
-        top_stalls=sorted(rows, key=lambda r: int(r["Stall"]), reverse=True)[:8],
-    )
+    data = {
+        "aggregate": dict(agg),
+        "top_stalls": sorted(rows, key=lambda r: int(r["Stall"]), reverse=True)[:8],
+    }
     summary[str(path.relative_to(work))] = data
     print(
         "ATT",

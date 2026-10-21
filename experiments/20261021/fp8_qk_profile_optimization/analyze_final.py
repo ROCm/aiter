@@ -25,22 +25,23 @@ rows = []
 for r in bench["rows"]:
     m = r["median_us"]
     rows.append(
-        dict(
-            name=r["name"],
-            case=r["case"],
-            median_us=m,
-            row_latency_reduction_pct=100 * (1 - m["fp8_row"] / m["fp8old_row"]),
-            paged_latency_reduction_pct=100 * (1 - m["fp8_paged"] / m["fp8old_paged"]),
-            row_vs_pr_latency_pct=100 * (m["fp8_row"] / m["pr_v41_full"] - 1),
-            dense_errors=r.get("dense_errors"),
-            pr_errors=r["pr_errors"],
-            previous_output_l2=r["fp8_vs_previous_output_l2"],
-        )
+        {
+            "name": r["name"],
+            "case": r["case"],
+            "median_us": m,
+            "row_latency_reduction_pct": 100 * (1 - m["fp8_row"] / m["fp8old_row"]),
+            "paged_latency_reduction_pct": 100
+            * (1 - m["fp8_paged"] / m["fp8old_paged"]),
+            "row_vs_pr_latency_pct": 100 * (m["fp8_row"] / m["pr_v41_full"] - 1),
+            "dense_errors": r.get("dense_errors"),
+            "pr_errors": r["pr_errors"],
+            "previous_output_l2": r["fp8_vs_previous_output_l2"],
+        }
     )
-result = dict(
-    selection=json.loads((work / "selection.json").read_text()),
-    rows=rows,
-    counters={
+result = {
+    "selection": json.loads((work / "selection.json").read_text()),
+    "rows": rows,
+    "counters": {
         label: counters(prefix, match)
         for label, prefix, match in [
             ("baseline", "baseline_row_4_", None),
@@ -50,7 +51,7 @@ result = dict(
             ("pr_epilogue", "baseline_pr_4_", "inverse_rope"),
         ]
     },
-    att={
+    "att": {
         tag: {
             k: info[k]
             for k in [
@@ -65,7 +66,7 @@ result = dict(
         for tag, info in att.items()
         if tag in ["baseline", "final"]
     },
-)
+}
 (work / "analysis_final.json").write_text(json.dumps(result, indent=2))
 print(json.dumps(result, indent=2))
 # Preserve exact final ISA context for the stalls discussed in the report.
@@ -75,11 +76,11 @@ contexts = []
 for stall in result["att"]["final"]["top_stalls"]:
     pc = int(stall["Vaddr"])
     contexts.append(
-        dict(
-            stall=stall,
-            instructions=[
+        {
+            "stall": stall,
+            "instructions": [
                 r for r in instructions if pc - 100 <= int(r["Vaddr"]) <= pc + 64
             ],
-        )
+        }
     )
 (work / "final_stall_contexts.json").write_text(json.dumps(contexts, indent=2))
