@@ -79,7 +79,7 @@ def _i32(vec):
 
 
 def _splat_f16x2(x):
-    return fx.Vector.filled(2, x, fx.Float16)
+    return fx.full(2, x, fx.Float16)
 
 
 def _clamp_fp16_overflow():
@@ -176,12 +176,7 @@ def _pack_e4m3_word(e, lane):
     e2 = fx.Int32(gpu.shuffle_idx(e, base + fx.Int32(4), WAVE))
     e3 = fx.Int32(gpu.shuffle_idx(e, base + fx.Int32(6), WAVE))
     b = fx.Int32(0xFF)
-    return (
-        (e0 & b)
-        | ((e1 & b) << fx.Int32(8))
-        | ((e2 & b) << fx.Int32(16))
-        | ((e3 & b) << fx.Int32(24))
-    )
+    return (e0 & b) | ((e1 & b) << 8) | ((e2 & b) << 16) | ((e3 & b) << 24)
 
 
 def _e4m3_decoding_scale(e):
@@ -192,7 +187,7 @@ def _quant_atom_fp16(atom, enc_pk):
     q = []
     lo = _splat_f16x2(fx.Float16(-8.0))
     hi = _splat_f16x2(fx.Float16(7.0))
-    bias = fx.Vector.filled(2, fx.Int16(8), fx.Int16)
+    bias = fx.full(2, 8, fx.Int16)
     for i in range_constexpr(4):
         w = fx.min(fx.maxnumf(_f16x2(atom[i]) * enc_pk, lo), hi)
         q.append(_i32(fx.roundeven(w).to(fx.Int16) + bias))
@@ -232,7 +227,7 @@ def _codec_dequant(packed, scale, acc=None):
 
 
 def _i32_to_bytes(i32_off):
-    return fx.Int64(i32_off) * fx.Int64(4)
+    return fx.Int64(i32_off) * 4
 
 
 def _store_v4i32_nt_global(addr_i64, data):
@@ -520,27 +515,21 @@ def make_quick_allreduce_int4_kernel(
                 weight_ptr, num_records_bytes=int(norm_hidden) * 2
             )
             red_ptr = lds.red.ptr
-            lane_i32 = tid * fx.Int32(4)
+            lane_i32 = tid * 4
         if const_expr(NORM_MXFP4):
             mxfp4_rsrc = buffer_ops.create_buffer_resource_from_addr(
-                mxfp4_ptr, num_records_bytes=nbytes // fx.Int64(4)
+                mxfp4_ptr, num_records_bytes=nbytes // 4
             )
             n_rows = nbytes // fx.Int64(int(norm_hidden) * 2)
             mxfp4_scale_rsrc = buffer_ops.create_buffer_resource_from_addr(
                 mxfp4_scale_ptr,
-                num_records_bytes=(n_rows + fx.Int64(255))
-                // fx.Int64(256)
-                * fx.Int64(256 * SCALE_N),
+                num_records_bytes=(n_rows + 255) // 256 * fx.Int64(256 * SCALE_N),
             )
             # Lane part of the shuffled scale index for group ``tid // 4`` of
             # an atom (see mx_scale_shuffle_idx); the atom's group base is a
             # multiple of 8, so the row and atom parts fold into soffset.
             g = tid // fx.Int32(MXFP4_GROUP // 8)
-            scale_lane = (
-                (g // fx.Int32(8)) * fx.Int32(256)
-                + (g % fx.Int32(4)) * fx.Int32(64)
-                + ((g % fx.Int32(8)) // fx.Int32(4)) * fx.Int32(2)
-            )
+            scale_lane = (g // 8) * 256 + (g % 4) * 64 + ((g % 8) // 4) * 2
         color_rsrc = buffer_ops.create_buffer_resource_from_addr(colors_ptr)
 
         def _pack_off(peer, i32_idx):
@@ -620,7 +609,7 @@ def make_quick_allreduce_int4_kernel(
             for off in range_constexpr(2):
                 amax = fx.maxnumf(amax, amax.shuffle_xor(1 << off, WAVE))
             e8m0 = fx.Int32(emit_mx_e8m0_scale(amax))
-            scale = as_ir_value((e8m0 << fx.Int32(23)).bitcast(fx.Float32))
+            scale = as_ir_value((e8m0 << 23).bitcast(fx.Float32))
             words = yb.bitcast(fx.Int32)
             pk = as_ir_value(fx.Int32(0))
             for j in range_constexpr(4):
@@ -777,8 +766,8 @@ def make_quick_allreduce_int4_kernel(
                     x = xs[i].bitcast(fx.BFloat16).to(fx.Float32)
                     w = ws[i].bitcast(fx.BFloat16).to(fx.Float32)
                     if const_expr(gemma_norm):
-                        w = w + fx.Vector.filled(8, fx.Float32(1.0), fx.Float32)
-                    y = x * w * fx.Vector.filled(8, rstd, fx.Float32)
+                        w = w + fx.full(8, 1.0, fx.Float32)
+                    y = x * w * fx.full(8, rstd, fx.Float32)
                     yb = y.to(fx.BFloat16)
                     _store_atom_bf16(
                         out_rsrc, _atom_soff(tile, atom), yb.bitcast(fx.Int32)
@@ -889,7 +878,7 @@ def make_quick_allreduce_int4_kernel(
             safe = (quad_id < limit).select(quad_id, fx.Int32(0))
             if quad_id < limit:
                 vec_idx = fx.Int32(release_i32_off) + lane_in_quad * fx.Int32(4)
-                v4 = fx.Vector.from_elements([color, color, color, color], fx.Int32)
+                v4 = fx.full(4, fx.Int32(color), fx.Int32)
                 dest = peer_vec[safe]
                 byte_off = _i32_to_bytes(
                     _sub_tile_i32(phase, inbox_src, fx.Int32(0)) + vec_idx
