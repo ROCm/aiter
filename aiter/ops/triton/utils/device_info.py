@@ -1,5 +1,4 @@
 import functools
-import glob
 import os
 import re
 
@@ -97,17 +96,21 @@ def _xcds_from_known_part(device_id=None) -> int:
         return 1
 
 
+@functools.cache
 def _rocm_major():
-    """Return the ROCm major version, or None when it cannot be detected."""
+    """Return the live HIP runtime's ROCm major version, or None on failure."""
     try:
-        from aiter.dist.device_communicators.rocm_version import get_rocm_version
+        import ctypes
 
-        version = get_rocm_version()
+        libhip = _hip_runtime()
+        libhip.hipRuntimeGetVersion.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        libhip.hipRuntimeGetVersion.restype = ctypes.c_int
+        version = ctypes.c_int()
+        if libhip.hipRuntimeGetVersion(ctypes.byref(version)) != 0:
+            return None
     except Exception:  # noqa: BLE001
         return None
-    if not version:
-        return None
-    return int(version[0])
+    return version.value // 10_000_000
 
 
 def _current_device_id() -> int:
@@ -209,24 +212,16 @@ def _header_beside_library(library_path: str) -> str | None:
     return None
 
 
+def _hip_runtime():
+    """Return the shared, cached HIP runtime handle."""
+    from aiter.jit.utils.chip_info import _load_hip_runtime
+
+    return _load_hip_runtime()
+
+
 def _loaded_amdhip64_path() -> str | None:
-    """Return the libamdhip64 this process loaded.
-
-    hipDeviceGetAttribute has to use the enumerator from that build. A
-    ROCM_PATH header from another install can name a different integer.
-    """
-    libhip = None
-    try:
-        import ctypes
-
-        libhip = ctypes.CDLL("libamdhip64.so")
-    except OSError:
-        try:
-            from aiter.jit.utils.chip_info import _load_hip_runtime
-
-            libhip = _load_hip_runtime()
-        except Exception:  # noqa: BLE001
-            return None
+    """Return the path of the shared HIP runtime handle."""
+    libhip = _hip_runtime()
     name = getattr(libhip, "_name", "")
     if name and os.path.isfile(name):
         return os.path.realpath(name)
@@ -243,51 +238,19 @@ def _loaded_amdhip64_path() -> str | None:
     return None
 
 
-def _rocm_version_key(path: str) -> tuple[int, ...]:
-    """Sort key for a versioned ROCm directory name."""
-    return tuple(int(piece) for piece in re.findall(r"\d+", os.path.basename(path)))
-
-
-def _rocm_install_roots() -> list[str]:
-    """ROCm trees to try when the loaded library's header cannot be found."""
-    roots = []
-    for env in ("ROCM_PATH", "ROCM_HOME", "HIP_PATH"):
-        path = os.environ.get(env)
-        if path:
-            roots.append(path)
-    try:
-        import importlib.util
-
-        spec = importlib.util.find_spec("_rocm_sdk_devel")
-    except (ImportError, ValueError):
-        spec = None
-    if spec is not None and spec.submodule_search_locations:
-        roots.append(spec.submodule_search_locations[0])
-    roots.append("/opt/rocm")
-    roots.extend(sorted(glob.glob("/opt/rocm-*"), key=_rocm_version_key, reverse=True))
-    return roots
-
-
 def _hip_runtime_api_header() -> str:
     """Return the hip_runtime_api.h that matches the loaded libamdhip64.
 
-    The library path is checked first. Install roots are only a fallback when
-    that library's tree has no header.
+    A header from any other installation is unsafe because HIP attribute
+    integers can change between releases.
     """
     library = _loaded_amdhip64_path()
-    if library is not None:
-        header = _header_beside_library(library)
-        if header is not None:
-            return header
-    seen = set()
-    for root in _rocm_install_roots():
-        if root in seen:
-            continue
-        seen.add(root)
-        header = os.path.join(root, "include", "hip", "hip_runtime_api.h")
-        if os.path.isfile(header):
-            return header
-    raise FileNotFoundError("hip_runtime_api.h")
+    if library is None:
+        raise FileNotFoundError("loaded libamdhip64 path")
+    header = _header_beside_library(library)
+    if header is None:
+        raise FileNotFoundError(f"hip_runtime_api.h beside {library}")
+    return header
 
 
 @functools.cache
@@ -305,9 +268,7 @@ def _hip_device_get_attribute(device_id: int, attribute: int) -> int:
     """
     import ctypes
 
-    from aiter.jit.utils.chip_info import _load_hip_runtime
-
-    libhip = _load_hip_runtime()
+    libhip = _hip_runtime()
     libhip.hipDeviceGetAttribute.argtypes = [
         ctypes.POINTER(ctypes.c_int),
         ctypes.c_int,

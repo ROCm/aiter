@@ -13,6 +13,8 @@ def _load_device_info():
         os.path.join(
             os.path.dirname(__file__),
             "..",
+            "..",
+            "..",
             "aiter",
             "ops",
             "triton",
@@ -73,14 +75,11 @@ class TestGetNumXcds(unittest.TestCase):
     def test_rocm_before_7_uses_part_table(self):
         with (
             mock.patch.object(device_info, "_rocm_major", return_value=6),
-            mock.patch.object(
-                device_info,
-                "_query_num_xccs",
-                side_effect=AssertionError("HIP queried on ROCm 6"),
-            ),
+            mock.patch.object(device_info, "_query_num_xccs") as query,
             mock.patch.object(device_info, "_xcds_from_known_part", return_value=6),
         ):
-            self.assertEqual(device_info.get_num_xcds(), 6)
+            self.assertEqual(device_info.get_num_xcds(0), 6)
+        query.assert_not_called()
 
     def test_rocm_7_uses_hip_count(self):
         with (
@@ -207,7 +206,7 @@ class TestGetNumXcds(unittest.TestCase):
             open(header, "w").close()
             self.assertEqual(device_info._header_beside_library(library), header)
 
-    def test_header_prefers_loaded_library_over_rocm_path(self):
+    def test_header_uses_loaded_library(self):
         with (
             tempfile.TemporaryDirectory() as root,
             tempfile.TemporaryDirectory() as other,
@@ -224,29 +223,50 @@ class TestGetNumXcds(unittest.TestCase):
             ):
                 self.assertEqual(device_info._hip_runtime_api_header(), header)
 
-    def test_versioned_rocm_roots_sort_by_version(self):
-        roots = [
-            "/opt/rocm-7.9.0",
-            "/opt/rocm-7.10.0",
-            "/opt/rocm-6.4.2",
-        ]
-        ordered = sorted(roots, key=device_info._rocm_version_key, reverse=True)
-        self.assertEqual(ordered[0], "/opt/rocm-7.10.0")
+    def test_header_rejects_other_rocm_install(self):
+        with tempfile.TemporaryDirectory() as root:
+            library = os.path.join(root, "lib", "libamdhip64.so")
+            os.makedirs(os.path.dirname(library))
+            open(library, "w").close()
+            os.environ["ROCM_PATH"] = "/opt/another-rocm"
+            with mock.patch.object(
+                device_info, "_loaded_amdhip64_path", return_value=library
+            ):
+                with self.assertRaises(FileNotFoundError):
+                    device_info._hip_runtime_api_header()
+
+    def test_rocm_major_uses_and_caches_live_runtime(self):
+        class Function:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, result):
+                self.calls += 1
+                result._obj.value = 7 * 10_000_000 + 2 * 100_000
+                return 0
+
+        runtime = mock.Mock()
+        runtime.hipRuntimeGetVersion = Function()
+        device_info._rocm_major.cache_clear()
+        try:
+            with mock.patch.object(device_info, "_hip_runtime", return_value=runtime):
+                self.assertEqual(device_info._rocm_major(), 7)
+                self.assertEqual(device_info._rocm_major(), 7)
+            self.assertEqual(runtime.hipRuntimeGetVersion.calls, 1)
+        finally:
+            device_info._rocm_major.cache_clear()
 
     def test_cu_num_override_skips_hip_query(self):
         os.environ["CU_NUM"] = "228"
         with (
             mock.patch.object(device_info, "_rocm_major", return_value=7),
-            mock.patch.object(
-                device_info,
-                "_query_num_xccs",
-                side_effect=AssertionError("HIP queried under CU_NUM"),
-            ),
+            mock.patch.object(device_info, "_query_num_xccs") as query,
             mock.patch.object(
                 device_info, "_xcds_from_known_part", return_value=6
             ) as table,
         ):
             self.assertEqual(device_info.get_num_xcds(1), 6)
+        query.assert_not_called()
         table.assert_called_once_with(None)
 
     def test_part_table_receives_device_id(self):
