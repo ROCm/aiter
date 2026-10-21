@@ -696,6 +696,18 @@ def run_benchmarks(
                 )
                 continue
 
+            # bench_mla_decode.py only supports DeepSeek-V3, the shapes are
+            # hardcoded. The shapes file records that config as DeepSeek-R1.
+            # Other MLA models (Kimi-K2 for instance) would still run DeepSeek's
+            # head count while the CSV row reports the model's own hq/hkv.
+            # > Skip until bench_mla_decode is extended.
+            if kernel == "mla" and model != "DeepSeek-R1":
+                print(
+                    f"Skipping mla for model '{model}': "
+                    "bench_mla_decode.py only supports deepseek-V3."
+                )
+                continue
+
             # MLA only reports time (ms)
             run_metric = "time" if kernel == "mla" else metric
 
