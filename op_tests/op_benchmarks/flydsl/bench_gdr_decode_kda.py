@@ -25,13 +25,12 @@ from aiter.ops.flydsl.kernels.gdr_decode import create_vk_gdr_decode_kernel
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, get_dtype_str
 from aiter.ops.flydsl.linear_attention_kernels import _decode_tiling, get_num_sms
 
-# The KDA oracle is test-only, so it ships with op_tests rather than with aiter
-# and is not importable from an installed wheel.
+# The oracle lives in the decode test, which an installed wheel does not ship.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from op_tests.kda_ref import kda_gate, l2norm, naive_recurrent_kda
+from op_tests.test_flydsl_gdr_decode import kda_gate, l2norm, naive_recurrent_kda
 
 # K3 @ TP8: 12 heads 1:1, 128-wide, bf16 activations over an f32 paged state.
 H, K, V = 12, 128, 128

@@ -33,13 +33,61 @@ RTOL = ATOL = 1e-3
 _TOL_ERR_RATIO = 1e-3
 _PERF_ROTATION_BUDGET = 1024**3
 _MAX_PERF_ROTATIONS = 101
+_L2NORM_EPS = 1e-6
 
-try:
-    from kda_ref import kda_gate, l2norm, naive_recurrent_kda
-except ModuleNotFoundError as e:
-    if e.name != "kda_ref":
-        raise
-    from op_tests.kda_ref import kda_gate, l2norm, naive_recurrent_kda
+
+def l2norm(x, eps=_L2NORM_EPS):
+    """Normalize the last axis in fp32. ``eps`` matches the kernel."""
+    x = x.float()
+    return x / torch.sqrt((x * x).sum(-1, keepdim=True) + eps)
+
+
+def kda_gate(a, A_log, dt_bias, g_min):
+    """Per-channel decay in log space. ``A_log`` is ``(H,)``, ``dt_bias`` is ``(H, K)``."""
+    A = A_log.float().exp()[:, None]
+    return g_min * torch.sigmoid(A * (a.float() + dt_bias.float()))
+
+
+def naive_recurrent_kda(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    scale=None,
+    initial_state=None,
+    output_final_state=False,
+):
+    """Delta-rule recurrence in f32. Does not normalize q/k.
+
+    ``g`` is log-space decay and ``beta`` is already through sigmoid.
+    ``initial_state`` is ``(B, H, K, V)``.
+    """
+    dtype = v.dtype
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+    if scale is None:
+        scale = K**-0.5
+
+    q, k, v, g, beta = (x.float() for x in (q, k, v, g, beta))
+    q = q * scale
+
+    S = k.new_zeros(B, H, K, V)
+    if initial_state is not None:
+        S = S + initial_state.float()
+
+    o = torch.zeros(B, T, H, V, dtype=torch.float32, device=v.device)
+    for i in range(T):
+        q_i, k_i, v_i, g_i, b_i = q[:, i], k[:, i], v[:, i], g[:, i], beta[:, i]
+        S = S * g_i[..., None].exp()
+        S = S + torch.einsum(
+            "bhk,bhv->bhkv",
+            b_i[..., None] * k_i,
+            v_i - (k_i[..., None] * S).sum(-2),
+        )
+        o[:, i] = torch.einsum("bhk,bhkv->bhv", q_i, S)
+
+    return o.to(dtype), S if output_final_state else None
 
 
 def _perf_rotation_count(*tensors):
