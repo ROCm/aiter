@@ -390,16 +390,22 @@ __global__ void swiglu_act_and_mul_bias_kernel(DTYPE_O* __restrict__ out,       
 }
 
 // Scaled activation and gating kernel template with flexible output type.
-// DTYPE_I: input type, DTYPE_O: output type (typically fp8 for quantization)
+// DTYPE_I: input type, DTYPE_O: output type (fp8 or int8)
+// out = saturate(act(x) * y / *scale), with the scale read on device.
 template <typename DTYPE_I, typename DTYPE_O, float (*ACT_FN)(const DTYPE_I&), int32_t VEC_SIZE_I>
 __global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // [..., d]
                                           const DTYPE_I* __restrict__ input, // [..., 2, d]
                                           const int d,
-                                          const float scale)
+                                          const int64_t in_row_stride,
+                                          const int64_t out_row_stride,
+                                          const float* __restrict__ scale_ptr)
 {
     const int64_t token_idx         = blockIdx.x;
-    auto const* ptr_x               = (input + token_idx * 2 * d);
-    auto const* ptr_y               = (input + token_idx * 2 * d + d);
+    auto const* ptr_x               = (input + token_idx * in_row_stride);
+    auto const* ptr_y               = (ptr_x + d);
+    const float scale               = 1.0f / *scale_ptr;
+    constexpr float out_min         = opus::finfo<DTYPE_O>::min();
+    constexpr float out_max         = opus::finfo<DTYPE_O>::max();
     using vec_i                     = opus::vector_t<DTYPE_I, VEC_SIZE_I>;
     using vec_o                     = opus::vector_t<DTYPE_O, VEC_SIZE_I>;
     static constexpr int32_t total_load_bytes = sizeof(DTYPE_I) * VEC_SIZE_I;
@@ -420,12 +426,14 @@ __global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // 
     auto buffer_x = opus::make_gmem<DTYPE_I>(ptr_x, oob_i * sizeof(DTYPE_I));
     auto buffer_y = opus::make_gmem<DTYPE_I>(ptr_y, oob_i * sizeof(DTYPE_I));
 
-    DTYPE_O* __restrict__ out_base  = out + token_idx * d;
+    DTYPE_O* __restrict__ out_base  = out + token_idx * out_row_stride;
     static constexpr int32_t ooba_o = 4 / sizeof(DTYPE_O);
     const int32_t oob_o             = (d + ooba_o - 1) / ooba_o * ooba_o;
     auto buffer_out = opus::make_gmem<DTYPE_O>(out_base, oob_o * sizeof(DTYPE_O));
 
-    for(int64_t idx = threadIdx.x * VEC_SIZE_I; idx < d; idx += blockDim.x * VEC_SIZE_I)
+    const int64_t d_vec = d / VEC_SIZE_I * VEC_SIZE_I;
+    int64_t idx         = threadIdx.x * VEC_SIZE_I;
+    for(; idx < d_vec; idx += blockDim.x * VEC_SIZE_I)
     {
         vec_i x{};
         vec_i y{};
@@ -465,18 +473,26 @@ __global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // 
                 result.y = act_vals.y * y_vals.y * scale_vals.y;
 #endif
 
-                r[j]     = opus::cast<DTYPE_O>(result.x);
-                r[j + 1] = opus::cast<DTYPE_O>(result.y);
+                r[j]     = opus::cast<DTYPE_O>(__builtin_amdgcn_fmed3f(result.x, out_min, out_max));
+                r[j + 1] = opus::cast<DTYPE_O>(__builtin_amdgcn_fmed3f(result.y, out_min, out_max));
             }
             else
             {
                 DTYPE_I x_val = x[j];
                 float rv      = ACT_FN(x_val) * opus::cast<float>(y[j]) * scale;
-                r[j]          = opus::cast<DTYPE_O>(rv);
+                r[j]          = opus::cast<DTYPE_O>(__builtin_amdgcn_fmed3f(rv, out_min, out_max));
             }
         }
 
         store_vector_nbytes<DTYPE_O, DTYPE_O, VEC_SIZE_I, store_chunk_bytes, 0>(buffer_out, r, idx);
+    }
+
+    // Partial last vector: the out buffer range is rounded up to a dword, so a
+    // vector store would spill into the next row. At most one thread gets here.
+    for(; idx < d; idx++)
+    {
+        float rv      = ACT_FN(ptr_x[idx]) * opus::cast<float>(ptr_y[idx]) * scale;
+        out_base[idx] = opus::cast<DTYPE_O>(__builtin_amdgcn_fmed3f(rv, out_min, out_max));
     }
 }
 
@@ -1237,22 +1253,23 @@ static constexpr int nextPow2(unsigned int num)
         DISPATCH_FP32_SWIGLU_BIAS_VEC_SIZE_CASE(1, swiglu_act_and_mul_bias_kernel, IDXTYPE, out_ptr, in_ptr, ids_ptr, bias_ptr, d, num_experts)  \
     }
 
-#define DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, inv_scale) \
-    DISPATCH_FP32_KERNEL(scaled_act_and_mul_kernel, KERNEL, out_ptr, in_ptr, d, inv_scale)
+#define DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, scale_ptr)               \
+    DISPATCH_FP32_KERNEL(                                                                   \
+        scaled_act_and_mul_kernel, KERNEL, out_ptr, in_ptr, d, in_row_stride, out_row_stride, scale_ptr)
 
 // Helper macro to dispatch scaled kernel with restricted output types (fp8 or int8)
-#define DISPATCH_OUTPUT_TYPE_SCALED(KERNEL, in_ptr, inv_scale)                      \
+#define DISPATCH_OUTPUT_TYPE_SCALED(KERNEL, in_ptr, scale_ptr)                      \
     if(out.dtype() == AITER_DTYPE_fp8)                                              \
     {                                                                               \
         using output_dtype = fp8_type;                                              \
         auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());       \
-        DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, inv_scale)         \
+        DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, scale_ptr)         \
     }                                                                               \
     else if(out.dtype() == AITER_DTYPE_i8)                                          \
     {                                                                               \
         using output_dtype = opus::i8_t;                                            \
         auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());       \
-        DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, inv_scale)         \
+        DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, scale_ptr)         \
     }                                                                               \
     else                                                                            \
     {                                                                               \
@@ -1314,16 +1331,35 @@ static constexpr int nextPow2(unsigned int num)
 #define LAUNCH_ACTIVATION_GATE_KERNEL(KERNEL) \
     LAUNCH_ACTIVATION_GATE_KERNEL_IMPL(KERNEL, false, 0.0f)
 
+// Row stride of a [..., n] tensor whose last dim is contiguous and whose leading
+// dims flatten into a single row dimension.
+static int64_t scaled_act_row_stride(const aiter_tensor_t& t, const char* name)
+{
+    AITER_CHECK(t.stride(-1) == 1, "scaled_act_and_mul: ", name, " last dim must be contiguous");
+    for(int i = 0; i + 2 < t.dim(); i++)
+        AITER_CHECK(t.stride(i) == t.stride(i + 1) * t.size(i + 1),
+                    "scaled_act_and_mul: ",
+                    name,
+                    " leading dims must flatten into rows");
+    return t.dim() >= 2 ? t.stride(-2) : t.size(-1);
+}
+
 // Launch scaled activation and gating kernel with flexible input/output types
 #define LAUNCH_SCALED_ACTIVATION_GATE_KERNEL(KERNEL)                                            \
     COMPUTE_SCALED_ACTIVATION_KERNEL_PARAMS                                                     \
+    const int64_t in_row_stride  = scaled_act_row_stride(input, "input");                       \
+    const int64_t out_row_stride = scaled_act_row_stride(out, "out");                           \
+    AITER_CHECK(out.size(-1) == d && out.numel() == static_cast<size_t>(num_tokens) * d,        \
+                "scaled_act_and_mul: out must have shape [..., input.size(-1) / 2]");           \
+    AITER_CHECK(scale.dtype() == AITER_DTYPE_fp32 && scale.numel() == 1 && scale.is_gpu(),      \
+                "scaled_act_and_mul: scale must be a single fp32 element on the GPU");          \
+    auto* scale_ptr = reinterpret_cast<const float*>(scale.data_ptr());                         \
     if(input.dtype() == AITER_DTYPE_fp32)                                                       \
     {                                                                                           \
         /* fp32 input: dispatch based on output type (fp8/bf16/fp16/fp32) */                    \
         using input_dtype = opus::fp32_t;                                                       \
         auto* in_ptr      = reinterpret_cast<input_dtype*>(input.data_ptr());                   \
-        float inv_scale   = 1.0f / (*reinterpret_cast<float*>(scale.data_ptr()));               \
-        DISPATCH_OUTPUT_TYPE_SCALED(KERNEL, in_ptr, inv_scale)                                  \
+        DISPATCH_OUTPUT_TYPE_SCALED(KERNEL, in_ptr, scale_ptr)                                  \
     }                                                                                           \
     else                                                                                        \
     {                                                                                           \
@@ -1331,8 +1367,7 @@ static constexpr int nextPow2(unsigned int num)
         AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "scaled_act_and_mul_kernel", [&] {       \
             using input_dtype = typename aiter::hip2opus<scalar_t>::type;                       \
             auto* in_ptr      = reinterpret_cast<input_dtype*>(input.data_ptr());               \
-            float inv_scale   = 1.0f / (*reinterpret_cast<float*>(scale.data_ptr()));           \
-            DISPATCH_OUTPUT_TYPE_SCALED(KERNEL, in_ptr, inv_scale)                              \
+            DISPATCH_OUTPUT_TYPE_SCALED(KERNEL, in_ptr, scale_ptr)                              \
         });                                                                                     \
     }
 

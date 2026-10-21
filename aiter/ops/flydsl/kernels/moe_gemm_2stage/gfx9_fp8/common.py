@@ -13,11 +13,15 @@ import flydsl.expr as fx
 import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
+from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr.meta import dsl_loc_tracing
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
+
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
 # RTA can be enabled if accuracy is acceptable. Simplified RTA may reverse NaNs although it should not
 #  occur in practice, so use with caution.
@@ -85,6 +89,51 @@ def _ptr(t):
     return flyc.from_c_void_p(_TORCH_TO_FX[t.dtype], t.data_ptr())
 
 
+def get_down_device_config():
+    if get_gfx_runtime() != "gfx942":
+        raise RuntimeError("specialized Down kernels require gfx942")
+    is_mi308 = get_cu_num() == 80
+    return is_mi308, 4 if is_mi308 else 8
+
+
+# gfx942 raw-buffer aux bit 1 selects the non-temporal policy for Down output stores.
+DOWN_STORE_CACHE_MODIFIER = 2
+
+
+class BufferTensor(fx.Tensor):
+    @dsl_loc_tracing
+    def load(self, *, voffset_bytes, soffset_bytes):
+        """Raw buffer load of this 32/64/128-bit packet at Int32 byte offsets."""
+        bits = fx.size(self).to_py_value() * self.dtype.width
+        resource = fx.rocdl.get_buffer_rsrc(fx.get_iter(self))
+        result = rocdl_dialect.RawPtrBufferLoadOp(
+            ir.VectorType.get([bits // 32], fx.Uint32.ir_type),
+            resource,
+            voffset_bytes.ir_value(),
+            soffset_bytes.ir_value(),
+            aux=ir.IntegerAttr.get(fx.Int32.ir_type, 0),
+        ).result
+        return Vec(result).bitcast(self.dtype)
+
+
+class LdsTensor(fx.Tensor):
+    """Shared-memory view addressed by an Int32 byte address plus a static byte offset."""
+
+    def _at(self, address_bytes, offset_bytes):
+        pointer = fx.inttoptr(fx.get_iter(self).type, address_bytes)
+        if offset_bytes:
+            pointer = pointer + offset_bytes // (self.dtype.width // 8)
+        return fx.make_view(pointer, self.layout)
+
+    @dsl_loc_tracing
+    def load(self, *, address_bytes, offset_bytes, into, copy_atom):
+        fx.copy(copy_atom, self._at(address_bytes, offset_bytes), into)
+
+    @dsl_loc_tracing
+    def store(self, vector, *, address_bytes, copy_atom, offset_bytes=0):
+        fx.copy(copy_atom, vector, self._at(address_bytes, offset_bytes))
+
+
 def validate_gemm_options(
     weight_dtype,
     weight_quant_type,
@@ -113,6 +162,10 @@ def validate_gemm_options(
         "ptpc",
         "per_tensor",
     ], "act_quant_type must be either 'no', 'ptpc' or 'per_tensor'"
+    if weight_dtype == "bf16" and (weight_quant_type != "no" or act_quant_type != "no"):
+        raise ValueError(
+            "BF16 kernels require weight_quant_type='no' and act_quant_type='no'"
+        )
     assert activation in [
         "silu",
         "swiglu",
@@ -412,9 +465,12 @@ def view_as_torch_tensor(ptr, shape, dtype=None):
 
 
 class FlyObjCache:
-    def __init__(self):
+    """Share MMA and copy builders with optional object caching."""
+
+    def __init__(self, *, cache_ir=True):
         self._cached_methods = {}
-        self._register_methods()
+        if cache_ir:
+            self._register_methods()
 
     def _register_methods(self):
         for name, attr in self.__class__.__dict__.items():
@@ -433,7 +489,7 @@ class FlyObjCache:
         return func
 
     @local_cache
-    def create_thr_mma(self, dtype, wave_mnk):
+    def create_thr_mma(self, dtype, wave_mnk, tid=None):
         mfma_M = 16
         mfma_N = 16
         mfma_K = {
@@ -458,7 +514,7 @@ class FlyObjCache:
         permutation_mnk = (None, None, k_perm)
         tiled_mma = fx.make_tiled_mma(mma_atom, thr_layout_mnk, permutation_mnk)
 
-        return tiled_mma.get_slice(fx.thread_idx.x)
+        return tiled_mma.get_slice(fx.thread_idx.x if tid is None else tid)
 
     @local_cache
     def get_universal_copy_atom(self, dtype, copy_bits):
@@ -473,18 +529,13 @@ class FlyObjCache:
     @local_cache
     def get_tiled_mma_copy(self, copy_atom, mm, abc, tid=None):
         assert abc in ["A", "B", "C"]
+        tid = mm.thr_idx if tid is None else tid
         if fx.const_expr(abc == "A"):
-            return fx.make_tiled_copy_A(copy_atom, mm).get_slice(
-                tid if tid is not None else fx.thread_idx.x
-            )
+            return fx.make_tiled_copy_A(copy_atom, mm).get_slice(tid)
         elif fx.const_expr(abc == "B"):
-            return fx.make_tiled_copy_B(copy_atom, mm).get_slice(
-                tid if tid is not None else fx.thread_idx.x
-            )
+            return fx.make_tiled_copy_B(copy_atom, mm).get_slice(tid)
         else:
-            return fx.make_tiled_copy_C(copy_atom, mm).get_slice(
-                tid if tid is not None else fx.thread_idx.x
-            )
+            return fx.make_tiled_copy_C(copy_atom, mm).get_slice(tid)
 
     @local_cache
     def get_partition_S(self, thrcopy, src):

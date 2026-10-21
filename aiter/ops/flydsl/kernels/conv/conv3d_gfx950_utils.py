@@ -179,6 +179,13 @@ TILES_PER_BARRIER = 2
 
 DEFAULT_TILE = (128, 128, 2, 4)
 
+# kW reuse double-buffers whole (kt, kh, channel block) groups.
+KW_REUSE_STAGES = 2
+
+# Per-CU LDS on gfx950, the only target of this kernel. Sizes how many blocks
+# an LDS footprint leaves resident.
+LDS_BYTES_PER_CU = 160 * 1024
+
 
 def validate_launch_config(tile_m, tile_n, wave_m, wave_n):
     """Why this tile cannot compile, or None. Problem-shape asserts stay at use sites."""
@@ -195,8 +202,10 @@ def validate_launch_config(tile_m, tile_n, wave_m, wave_n):
     block_vecs = LDG_VEC * block_threads
     if (tile_m * TILE_K) % block_vecs:
         return f"A tile {tile_m}x{TILE_K} not a multiple of {block_vecs} vecs"
-    if (tile_n * TILE_K) % block_vecs:
-        return f"B tile {tile_n}x{TILE_K} not a multiple of {block_vecs} vecs"
+    # B's last DMA round may be partial: the waves past its end are parked
+    # (WeightLoader.stage), which needs the round to end on a wave boundary.
+    if (tile_n * TILE_K // LDG_VEC) % WARP_SIZE:
+        return f"B tile {tile_n}x{TILE_K} not a whole number of waves of vecs"
     return None
 
 
@@ -222,9 +231,11 @@ class TileConfig(NamedTuple):
     mi_m: int
     mi_n: int
 
-    # Vectors one block loads per K tile, per operand.
+    # DMA rounds one block issues per K tile, per operand.
     ldg_a_count: int
     ldg_b_count: int
+    # Threads that carry B in its last round when that round is partial, else 0.
+    b_tail_threads: int
 
     # LDS stages, and the elements each operand's staging buffer holds.
     pipe_stages: int
@@ -240,6 +251,7 @@ def make_tile_config(tile):
 
     block_threads = wave_m * wave_n * WARP_SIZE
     block_vecs = LDG_VEC * block_threads
+    b_vecs = tile_n * TILE_K // LDG_VEC
     pipe_stages = 2 * TILES_PER_BARRIER
     return TileConfig(
         tile_m=tile_m,
@@ -251,7 +263,8 @@ def make_tile_config(tile):
         mi_m=tile_m // wave_m // MFMA_M,
         mi_n=tile_n // wave_n // MFMA_N,
         ldg_a_count=tile_m * TILE_K // block_vecs,
-        ldg_b_count=tile_n * TILE_K // block_vecs,
+        ldg_b_count=-(-b_vecs // block_threads),
+        b_tail_threads=b_vecs % block_threads,
         pipe_stages=pipe_stages,
         lds_a_elems=pipe_stages * tile_m * TILE_K,
         lds_b_elems=pipe_stages * tile_n * TILE_K,
@@ -307,19 +320,64 @@ class WeightLoader:
                 g_off = in_group.select(g_off, fx.Int32(OOB_SENTINEL_ELEM))
             yield i, self._src, g_off
 
+    def stage(self, stager, lds, stage_tile, k_base):
+        """DMA the K tile at ``k_base`` into B's LDS stage at ``stage_tile``."""
+        cfg = self._cfg
+        for i, src, voff in self.taps(k_base):
+            if const_expr(cfg.b_tail_threads and i == cfg.ldg_b_count - 1):
+                # Waves past the end of a partial last round still issue the
+                # DMA (no branch), reading nothing and landing in the park.
+                live = self._tid < cfg.b_tail_threads
+                voff = live.select(voff, fx.Int32(OOB_SENTINEL_ELEM))
+                dst = stager.dst(lds.b, stage_tile, i, park=(live, lds.b_park))
+            else:
+                dst = stager.dst(lds.b, stage_tile, i)
+            stager.copy(src, dst, voff)
+
 
 # ---------------------------------------------------------------------------
 # LDS staging: the DMA that fills a stage, and the MMA that reads it back
 # ---------------------------------------------------------------------------
 
 
-def make_shared_storage(elem_ty, cfg):
-    """The LDS struct one block allocates: ``pipe_stages`` tiles of A and of B."""
+def b_park_elems(cfg):
+    """LDS the parked waves of a partial last B round write to: one wave's DMA."""
+    return WARP_SIZE * LDG_VEC if cfg.b_tail_threads else 0
 
-    @fx.struct
-    class SharedStorage:
-        a: fx.Array[elem_ty, cfg.lds_a_elems, 16]
-        b: fx.Array[elem_ty, cfg.lds_b_elems, 16]
+
+def make_shared_storage(
+    elem_ty, cfg, strip_stage_elems=0, kw=0, patch_stage_elems=0, patch_park=False
+):
+    """The LDS struct one block allocates.
+
+    Default: ``pipe_stages`` tiles of A and of B. kW reuse: two strip stages
+    for A and, per stage, the ``kw`` B tiles that strip feeds. kH x kW reuse:
+    two patch stages for A and the default ``pipe_stages`` B tiles. Plus the
+    park when B's (or the patch's) last DMA round is partial.
+    """
+    if patch_stage_elems:
+        a_elems = KW_REUSE_STAGES * patch_stage_elems
+        b_elems = cfg.lds_b_elems
+    elif strip_stage_elems:
+        a_elems = KW_REUSE_STAGES * strip_stage_elems
+        b_elems = KW_REUSE_STAGES * kw * cfg.tile_n * cfg.tile_k
+    else:
+        a_elems, b_elems = cfg.lds_a_elems, cfg.lds_b_elems
+
+    if b_park_elems(cfg) or patch_park:
+
+        @fx.struct
+        class SharedStorage:
+            a: fx.Array[elem_ty, a_elems, 16]
+            b: fx.Array[elem_ty, b_elems, 16]
+            b_park: fx.Array[elem_ty, WARP_SIZE * LDG_VEC, 16]
+
+    else:
+
+        @fx.struct
+        class SharedStorage:
+            a: fx.Array[elem_ty, a_elems, 16]
+            b: fx.Array[elem_ty, b_elems, 16]
 
     return SharedStorage
 
@@ -341,8 +399,12 @@ class LdsStager:
         )
         self._atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), dma_bytes * 8)
 
-    def dst(self, lds_array, stage_tile, i):
-        """The LDS address vector ``i`` of this stage writes to."""
+    def dst(self, lds_array, stage_tile, i, park=None):
+        """The LDS address vector ``i`` of this stage writes to.
+
+        ``park``: ``(live, array)``; a wave that is not ``live`` (wave-uniform)
+        writes to the start of ``array`` instead.
+        """
         # buffer_load_lds takes one wave-uniform LDS base and fans the wave's
         # lanes out from it, so the lane-0 address is the base the whole wave
         # writes from.
@@ -351,6 +413,9 @@ class LdsStager:
         ) * fx.Int64(LDG_VEC)
         base_bytes = off_elems * fx.Int64(BF16_BYTES)
         addr = fx.Int64(fx.ptrtoint(lds_array.ptr)) + fx.Int64(base_bytes)
+        if const_expr(park is not None):
+            live, park_array = park
+            addr = live.select(addr, fx.Int64(fx.ptrtoint(park_array.ptr)))
         return fx.make_view(
             fx.inttoptr(self._lds_ptr_ty, sgpr(addr)), fx.make_layout(1, 1)
         )
@@ -386,6 +451,9 @@ class MmaTiling:
         ).get_slice(tid)
 
         self._a_lds, self._b_lds = lds.a, lds.b
+        self._lds_vec_ptr_ty = fx.PointerType.get(
+            elem_ty.ir_type, fx.AddressSpace.Shared, LDG_VEC * BF16_BYTES
+        )
         self._a_layout = fx.make_layout((cfg.tile_m, cfg.tile_k), (cfg.tile_k, 1))
         self._b_layout = fx.make_layout((cfg.tile_n, cfg.tile_k), (cfg.tile_k, 1))
 
@@ -422,6 +490,46 @@ class MmaTiling:
             self._thr_copy_a.retile(frag_a),
         )
         fx.rocdl.sched_dsrd(self._cfg.mi_m)
+        return frag_a
+
+    def a_rows(self):
+        """Per MFMA atom along M: (row, k offset) of this lane's A vector."""
+        cfg = self._cfg
+        rows = self._thr_mma.partition_A(
+            fx.make_view(0, fx.make_layout((cfg.tile_m, cfg.tile_k), (1, 0)))
+        )
+        cols = self._thr_mma.partition_A(
+            fx.make_view(0, fx.make_layout((cfg.tile_m, cfg.tile_k), (0, 1)))
+        )
+        return [
+            (
+                fx.Int64(fx.get_scalar(rows[LDG_VEC * mi])),
+                fx.Int64(fx.get_scalar(cols[LDG_VEC * mi])),
+            )
+            for mi in range_constexpr(cfg.mi_m)
+        ]
+
+    def read_a_at(self, lane_offs, const_off):
+        """Read A from LDS at per-lane element offsets, one per MFMA atom.
+
+        ``lane_offs[mi] + const_off`` is where this lane's 8-element vector of
+        atom ``mi`` starts in the A array; the address is the lane's own, so
+        the rows need not form an affine tile.
+        """
+        cfg = self._cfg
+        frag_a = self._thr_mma.make_fragment_A(
+            fx.make_view(self._a_lds.ptr, self._a_layout)
+        )
+        dst = self._thr_copy_a.retile(frag_a)
+        base = fx.Int64(fx.ptrtoint(self._a_lds.ptr))
+        for mi in range_constexpr(cfg.mi_m):
+            addr = base + (lane_offs[mi] + fx.Int64(const_off)) * fx.Int64(BF16_BYTES)
+            src = fx.make_view(
+                fx.inttoptr(self._lds_vec_ptr_ty, addr),
+                fx.make_layout((LDG_VEC, 1), (1, 0)),
+            )
+            fx.copy(self._lds_copy, src, dst[None, mi, 0])
+        fx.rocdl.sched_dsrd(cfg.mi_m)
         return frag_a
 
     def read_b(self, stage):
@@ -737,6 +845,9 @@ class LaunchGrid(NamedTuple):
     tile_m: int
     row_chk: bool
     wgm: int
+    # (rows, cols) when a block owns a 2D patch of output pixels (kH x kW
+    # reuse), else None: M tiles are then N * Do * ceil(Ho/rows) * ceil(Wo/cols).
+    out_block: object
 
     # N: per-group tiling, and whether the last tile of a group is partial.
     tile_n: int
@@ -753,8 +864,12 @@ class LaunchGrid(NamedTuple):
     use_splitk: bool
 
 
-def make_launch_grid(param, geom, cfg):
-    """The LaunchGrid for one problem and launch config, or an assertion."""
+def make_launch_grid(param, geom, cfg, out_block=None):
+    """The LaunchGrid for one problem and launch config, or an assertion.
+
+    ``out_block``: ``Im2colPlan.out_block`` -- (rows, cols) of the 2D output
+    patch a block owns under kH x kW reuse, or None for consecutive rows.
+    """
     tile_m, tile_n, tile_k = cfg.tile_m, cfg.tile_n, cfg.tile_k
     block_threads = cfg.block_threads
     k, groups = param.k, param.groups
@@ -775,7 +890,16 @@ def make_launch_grid(param, geom, cfg):
     )
     tiles_per_split = k_tiles // splitk
 
-    grid_m = (npq + tile_m - 1) // tile_m
+    if out_block is None:
+        grid_m = (npq + tile_m - 1) // tile_m
+        m_tail = npq % tile_m != 0
+    else:
+        rows, cols = out_block
+        assert (
+            rows * cols == tile_m
+        ), f"out_block {out_block} does not cover TILE_M={tile_m}"
+        grid_m = param.n * geom.do * (-(-geom.ho // rows)) * (-(-geom.wo // cols))
+        m_tail = geom.ho % rows != 0 or geom.wo % cols != 0
     max_grid_x = 0xFFFFFFFF // block_threads
     grid_x = min(grid_m, max_grid_x)
     m_chunks = (grid_m + grid_x - 1) // grid_x
@@ -797,10 +921,11 @@ def make_launch_grid(param, geom, cfg):
         tile_m=tile_m,
         # The last M tile is partial, or chunking over-provisioned the x axis:
         # either way some block owns rows past npq and must not write them.
-        row_chk=(npq % tile_m != 0) or (grid_x * m_chunks > grid_m),
+        row_chk=m_tail or (grid_x * m_chunks > grid_m),
         # Chunked M already uses z, so a swizzle over x/y would reorder blocks
         # that are no longer adjacent in M. WGM only applies to the flat case.
         wgm=1 if m_chunks > 1 else max(1, int(param.wgm)),
+        out_block=out_block,
         tile_n=tile_n,
         tiles_per_group=tiles_per_group,
         n_tail=n_tail,
@@ -824,6 +949,30 @@ class BlockCoords(NamedTuple):
     k_off: object
 
 
+# gfx950 parts deal a dispatch's workgroups round-robin over this many XCDs,
+# each behind its own L2.
+NUM_XCDS = 8
+
+
+def _xcd_contiguous(pid, total):
+    """Renumber dispatch-order block ``pid`` of ``total`` so each XCD runs a contiguous range.
+
+    Round-robin dealing puts consecutive M tiles, which share input rows, in
+    different L2s that each fetch those rows again; renumbered, neighbouring
+    tiles run on one XCD at about the same time. Under split-K this holds for
+    the first split's slice; the others are only permuted. Int32 in and out:
+    64-bit block coordinates cost VGPRs downstream, enough to drop a tile at
+    the 256-VGPR edge to one wave per SIMD.
+    """
+    per = (total + (NUM_XCDS - 1)) // NUM_XCDS
+    # XCDs that receive `per` blocks; the rest receive per - 1.
+    tall = total - (per - 1) * NUM_XCDS
+    xcd = pid % NUM_XCDS
+    local = pid // NUM_XCDS
+    short = tall * per + (xcd - tall) * (per - 1) + local
+    return (xcd < tall).select(xcd * per + local, short)
+
+
 def block_coords(grid, grid_m=None):
     """Decode this block's tile. Pass runtime ``grid_m`` on the dyn_hw path."""
     if const_expr(grid_m is None):
@@ -835,8 +984,12 @@ def block_coords(grid, grid_m=None):
         ) * grid.tile_m
         n_tile = fx.Int32(gpu.block_id("y"))
     elif const_expr(grid.wgm > 1):
-        pid = fx.Int64(gpu.block_id("x")) + fx.Int64(gpu.block_id("y")) * fx.Int64(
-            grid_m
+        pid = fx.Int64(
+            _xcd_contiguous(
+                fx.Int32(gpu.block_id("x"))
+                + fx.Int32(gpu.block_id("y")) * fx.Int32(grid_m),
+                fx.Int32(grid_m) * grid.grid_y,
+            )
         )
         blocks_per_swizzle = fx.Int64(grid.wgm * grid.grid_y)
         swizzle_id = pid // blocks_per_swizzle
@@ -846,9 +999,20 @@ def block_coords(grid, grid_m=None):
         local = pid % blocks_per_swizzle
         m_offset = (first_m + (local % swizzle_rows)) * grid.tile_m
         n_tile = local // swizzle_rows
+    elif const_expr(grid.grid_y == 1):
+        m_offset = _xcd_contiguous(fx.Int32(gpu.block_id("x")), fx.Int32(grid_m))
+        m_offset = m_offset * grid.tile_m
+        n_tile = fx.Int32(0)
     else:
-        m_offset = fx.Int32(gpu.block_id("x")) * grid.tile_m
-        n_tile = fx.Int32(gpu.block_id("y"))
+        pid = _xcd_contiguous(
+            fx.Int32(gpu.block_id("x"))
+            + fx.Int32(gpu.block_id("y")) * fx.Int32(grid_m),
+            fx.Int32(grid_m) * grid.grid_y,
+        )
+        # N fastest: an M tile's N tiles run back to back on one XCD, sharing
+        # its A in that L2.
+        m_offset = (pid // grid.grid_y) * grid.tile_m
+        n_tile = pid % grid.grid_y
 
     if const_expr(grid.groups > 1):
         gi = n_tile // grid.tiles_per_group
@@ -968,11 +1132,14 @@ def make_output_scatter_plan(param, geom, cfg, grid):
         # branch, but only where the store goes through a buffer descriptor:
         # split-K atomics and the 64-bit BIG_OUT path have no such address.
         route_store=need_chk and not use_splitk and not big_out,
+        # Under a 2D output block four consecutive tile rows are four pixels
+        # of one image row; Wo % 4 keeps them on one side of the W tail too.
         vec_store=(
             (not use_splitk)
             and (dhw % MFMA_C_VALUES == 0)
             and (not big_out)
             and (not out_ndhwc)
+            and (grid.out_block is None or geom.wo % MFMA_C_VALUES == 0)
         ),
     )
 
@@ -1025,12 +1192,28 @@ class OutputScatter:
             elem_ty.ir_type, fx.AddressSpace.Global, BF16_BYTES
         )
 
-    def store(self, acc, *, m_offset, n_offset, n_local, c_row, c_col):
+    def store(
+        self,
+        acc,
+        *,
+        m_offset,
+        n_offset,
+        n_local,
+        c_row,
+        c_col,
+        row_of=None,
+        row_ok=None,
+    ):
         """Write this block's accumulator out.
 
         ``c_row`` / ``c_col`` are the tile-local coordinates of the
         accumulator's elements, taken from the same tiled_mma that owns
         ``acc`` so the epilogue cannot drift from the MMA's own partitioning.
+
+        A 2D output block (kH x kW reuse) passes ``row_of(local)``, the GEMM
+        row of tile-local row ``local`` (rows local..local+3 stay consecutive),
+        and ``row_ok(local)``, whether that row is inside the output, which
+        replaces the ``row < npq`` tail test.
         """
         plan = self._plan
         elem_ty = self._elem_ty
@@ -1041,7 +1224,13 @@ class OutputScatter:
             bias_vals = self._load_bias(n_offset, n_local, c_col)
 
         for mi in range_constexpr(plan.mi_m):
-            row_base = m_offset + fx.get_scalar(c_row[MFMA_C_VALUES * mi])
+            local = fx.get_scalar(c_row[MFMA_C_VALUES * mi])
+            if const_expr(row_of is None):
+                row_base = m_offset + local
+                rv_base = None
+            else:
+                row_base = row_of(local)
+                rv_base = row_ok
             for ni in range_constexpr(plan.mi_n):
                 col, col_loc = self._cols(ni, n_offset, n_local, c_col)
                 a = fx.Vector(acc[None, mi, ni].load())
@@ -1050,6 +1239,7 @@ class OutputScatter:
 
                 if const_expr(plan.vec_store):
                     row0 = fx.Int64(row_base)
+                    rv0 = None if rv_base is None else rv_base(local)
                     off_nk0 = self._off_nk(row0, col, None)
 
                     def _emit_vec():
@@ -1066,12 +1256,12 @@ class OutputScatter:
                             self._y_reg_4,
                             fx.slice(
                                 self._y_div,
-                                (None, self._route(off_nk0, row0, col_loc)),
+                                (None, self._route(off_nk0, row0, col_loc, rv0)),
                             ),
                         )
 
                     if const_expr(plan.need_chk and not plan.route_store):
-                        if self._valid(row0, col_loc):
+                        if self._valid(row0, col_loc, rv0):
                             _emit_vec()
                     else:
                         _emit_vec()
@@ -1079,6 +1269,7 @@ class OutputScatter:
 
                 for i in range_constexpr(MFMA_C_VALUES):
                     row = fx.Int64(row_base + i)
+                    rv = None if rv_base is None else rv_base(local + i)
                     off_sk = row * plan.k + col
                     off_nk = self._off_nk(row, col, off_sk)
 
@@ -1104,12 +1295,12 @@ class OutputScatter:
                                     self._y_reg_1,
                                     fx.slice(
                                         self._y_div,
-                                        (None, self._route(off_nk, row, col_loc)),
+                                        (None, self._route(off_nk, row, col_loc, rv)),
                                     ),
                                 )
 
                     if const_expr(plan.need_chk and not plan.route_store):
-                        if self._valid(row, col_loc):
+                        if self._valid(row, col_loc, rv):
                             _emit()
                     else:
                         _emit()
@@ -1146,18 +1337,20 @@ class OutputScatter:
         n_idx, row_in_sample = ext.div_dhw.divmod(row)
         return n_idx * (fx.Int64(plan.k) * dhw) + col * dhw + row_in_sample
 
-    def _valid(self, row, col_loc):
+    def _valid(self, row, col_loc, row_valid=None):
         plan = self._plan
+        if const_expr(row_valid is None):
+            row_valid = row < fx.Int64(self._ext.npq)
         if const_expr(plan.row_chk and plan.n_tail):
-            return (row < fx.Int64(self._ext.npq)) & (col_loc < fx.Int64(plan.kg))
+            return row_valid & (col_loc < fx.Int64(plan.kg))
         if const_expr(plan.row_chk):
-            return row < fx.Int64(self._ext.npq)
+            return row_valid
         return col_loc < fx.Int64(plan.kg)
 
-    def _route(self, off, row, col_loc):
+    def _route(self, off, row, col_loc, row_valid=None):
         if const_expr(not self._plan.route_store):
             return fx.Int32(off)
-        return self._valid(row, col_loc).select(
+        return self._valid(row, col_loc, row_valid).select(
             fx.Int32(off), fx.Int32(OOB_SENTINEL_ELEM)
         )
 
