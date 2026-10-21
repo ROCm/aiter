@@ -126,7 +126,7 @@ def _block_m(num_q_tiles_per_wave):
 def _m_tile_idx():
     x = fx.Int32(gpu.block_id("x"))
     if REVERSE_M_ORDER:
-        x = fx.Int32(gpu.grid_dim.x) - fx.Int32(1) - x
+        x = fx.Int32(gpu.grid_dim.x) - 1 - x
     return x
 
 
@@ -800,7 +800,7 @@ def _pv_qk_gemm(
                     acc = (
                         o_acc_list[q_tile_idx][d_tile_idx]
                         if o_acc_list is not None
-                        else fx.Vector.filled(8, 0.0, fx.Float32)
+                        else fx.full(8, 0.0, fx.Float32)
                     )
                 p = p_list[q_tile_idx]
                 p_frag = p[2 * k_tile_idx].shuffle(
@@ -816,7 +816,7 @@ def _pv_qk_gemm(
             acc = (
                 s_acc_list[q_tile_idx][kv]
                 if d_tile_idx > 0
-                else fx.Vector.filled(8, 0.0, fx.Float32)
+                else fx.full(8, 0.0, fx.Float32)
             )
             s_acc_list[q_tile_idx][kv] = _wmma(
                 k_frag, q_frags_list[q_tile_idx][d_tile_idx], acc
@@ -1466,12 +1466,12 @@ def _core_attention_multi_kv_tiles(
                 _raw(m_init[q_tile_idx]),
                 _raw(d_init[q_tile_idx]),
             ]
-            + [_raw(fx.Vector.filled(8 * d_tiles, 0.0, fx.Float32))]
+            + [_raw(fx.full(8 * d_tiles, 0.0, fx.Float32))]
             + [
                 _raw(
-                    fx.Vector.filled(8, float("-inf"), fx.Float32)
+                    fx.full(8, float("-inf"), fx.Float32)
                     if _is_lagging_softmax
-                    else fx.Vector.filled(8, 0.0, fx.Float32).to(elem_dtype)
+                    else fx.full(8, 0.0, fx.Float32).to(elem_dtype)
                 )
                 for _ in range(num_kv_frags)
             ]
@@ -1698,9 +1698,7 @@ def _core_attention_multi_kv_tiles(
             # not-taken s_cbranch_vccz, and a row that stayed stale has corr == 1 exactly,
             # making its rescale inside the taken branch the identity.
             corr_vecs = [
-                fx.Vector.from_elements(
-                    [corr_list[q_tile_idx]], fx.Float32
-                ).broadcast_to(8)
+                fx.full(8, fx.Float32(corr_list[q_tile_idx]), fx.Float32)
                 for q_tile_idx in range(num_q_tiles)
             ]
             o_vecs = [
@@ -1914,7 +1912,7 @@ def _core_attention_multi_kv_tiles(
     state = _run_tiles(
         state,
         clean_hi_idx,
-        fx.Int32(num_tiles) + fx.Int32(1),
+        fx.Int32(num_tiles) + 1,
         mask_left=mask_left,
         mask_right=mask_right,
         kv_len=kv_len,
@@ -2322,7 +2320,7 @@ def _store_o_lse(
         inv_denom = (d_final > fx.Float32(0.0)).select(
             fx.Float32(1.0) / d_final, fx.Float32(0.0)
         )
-        inv_denom_vec = fx.Vector.from_elements([inv_denom], fx.Float32).broadcast_to(8)
+        inv_denom_vec = fx.full(8, fx.Float32(inv_denom), fx.Float32)
         o_norm = [o_final[d_tile_idx] * inv_denom_vec for d_tile_idx in range(d_tiles)]
         if q_tile_idx > 0:
             rocdl.s_wait_dscnt(0)  # drain prev q-tile's O ring/DS ops before reuse
@@ -2412,7 +2410,7 @@ def _epi_state_zeros(*, num_q_tiles_per_wave, v_hdim):
         m_list=[fx.Float32(0.0) for _ in range(num_q_tiles)],
         d_list=[fx.Float32(0.0) for _ in range(num_q_tiles)],
         o_list=[
-            [fx.Vector.filled(8, 0.0, fx.Float32) for _ in range(d_tiles)]
+            [fx.full(8, 0.0, fx.Float32) for _ in range(d_tiles)]
             for _ in range(num_q_tiles)
         ],
         o_lds_warp=fx.Int32(0),
@@ -2533,13 +2531,11 @@ def _zero_fill_attention(
 
     # i64: an i32 product (large total_q * stride) can overflow negative, then the
     # descriptor sign-extends it to a huge bound, defeating the 0x7FFFFFFF OOB drop.
-    o_num_records_bytes = (
-        fx.Int64(q_start + q_len) * fx.Int64(stride_o_seq) * fx.Int64(2)
-    )
+    o_num_records_bytes = fx.Int64(q_start + q_len) * fx.Int64(stride_o_seq) * 2
     o_rsrc = buffer_ops.create_buffer_resource(
         ptr_O, num_records_bytes=o_num_records_bytes
     )
-    zero_o = fx.Vector.filled(_chunk_elems, 0.0, elem_dtype)
+    zero_o = fx.full(_chunk_elems, 0.0, elem_dtype)
     for r in range(BLOCK_M * num_chunks_per_row // BLOCK_SIZE):
         chunk_idx = (
             fx.Int32(r * BLOCK_SIZE) + thread_idx
@@ -2713,8 +2709,8 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
             lse_num_records_bytes = (
                 fx.Int64(q_start + q_len - fx.Int32(1)) * fx.Int64(stride_lse_seq)
                 + fx.Int64(num_heads_q - fx.Int32(1)) * fx.Int64(stride_lse_head)
-                + fx.Int64(1)
-            ) * fx.Int64(4)
+                + 1
+            ) * 4
 
             # An empty batch must not enter the core: kv_len==0 would write O/0 = NaN.
             if (q_len > fx.Int32(0)) & (kv_len > fx.Int32(0)):
@@ -2855,9 +2851,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
         # LSE is [B, nheads_q, seq_q]: base = batch*stride_lse_batch; every valid
         # element offset is < base + stride_lse_batch (< the 0x7FFFFFFF drop).
         lse_base_elems = batch * stride_lse_batch
-        lse_num_records_bytes = fx.Int64(lse_base_elems + stride_lse_batch) * fx.Int64(
-            4
-        )
+        lse_num_records_bytes = fx.Int64(lse_base_elems + stride_lse_batch) * 4
 
         _core_kwargs = {
             "qk_hdim": QK_HDIM,

@@ -15,6 +15,7 @@ from aiter.ops.triton.fusions.fused_reduce_qk_norm_rope_swa_write import (
     fused_reduce_qk_norm_rope_swa_write,
 )
 from aiter.ops.triton.utils.types import str_to_torch_dtype
+from op_tests.op_benchmarks.triton.utils.argparse import override_parser_action
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
@@ -190,6 +191,9 @@ def parse_args(args: list[str] | None = None):
         default="time",
         choices=["time", "bandwidth"],
         help="Metric to report (default: time)",
+    )
+    override_parser_action(
+        parser, action="--metric", choices=["time", "bandwidth"], default="time"
     )
     parser.add_argument(
         "--warmup", type=int, default=25, help="do_bench warmup budget in ms"
