@@ -12,7 +12,7 @@ metadata block. Asserts:
   3. a slot whose resident entry names another expert is refreshed
 
 Run:
-    torchrun --standalone --nproc-per-node=8 op_tests/test_moonep_slot_cache.py
+    torchrun --standalone --nproc-per-node=8 op_tests/multigpu_tests/test_moonep_slot_cache.py
 """
 
 import sys

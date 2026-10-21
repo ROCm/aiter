@@ -375,6 +375,16 @@ def shuffle_weight_f4(src: torch.Tensor) -> torch.Tensor:
     return out.view(rows, kp).view(x_type)
 
 
+def shuffle_scale_a16w4_out_shape(shape: tuple[int, int]) -> tuple[int, int]:
+    """Shape ``shuffle_scale_a16w4`` returns for a ``[rows, k]`` e8m0 scale.
+
+    The layout packs two 4-scale dwords per tile-K group, so ``k`` is padded to
+    a multiple of 8 with E8M0 1.0 (0x7F).  Size ``out=`` storage with this.
+    """
+    rows, k = shape
+    return int(rows), (int(k) + 7) // 8 * 8
+
+
 def shuffle_scale(
     src: torch.Tensor,
     experts_cnt: int | None = None,
@@ -415,8 +425,8 @@ def shuffle_scale(
         raise ValueError("experts_cnt is required when is_guinterleave=True")
 
     n_experts, k_ = src.shape
-    if k_ % 8 != 0:
-        k_padded = (k_ + 7) // 8 * 8
+    _, k_padded = shuffle_scale_a16w4_out_shape(src.shape)
+    if k_padded != k_:
         scale_padded = torch.empty(
             n_experts, k_padded, dtype=src.dtype, device=src.device
         )

@@ -3,7 +3,11 @@
 import pytest
 import torch
 
-from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+from aiter.ops.shuffle import (
+    shuffle_scale_a16w4,
+    shuffle_scale_a16w4_out_shape,
+    shuffle_weight_a16w4,
+)
 
 
 @pytest.mark.parametrize("gate_up", [False, True])
@@ -38,12 +42,23 @@ def test_shuffle_scale_a16w4_can_write_padded_caller_storage(gate_up):
     )
     expected = shuffle_scale_a16w4(src, experts, gate_up)
     assert expected.shape == (experts * rows, 8)
-    out = torch.empty_like(expected)
+    assert shuffle_scale_a16w4_out_shape(src.shape) == expected.shape
+    # The 5 -> 8 pad is E8M0 1.0, as if the caller had padded it.
+    padded = torch.nn.functional.pad(src, (0, 3), value=0x7F)
+    torch.testing.assert_close(
+        shuffle_scale_a16w4(padded, experts, gate_up), expected, rtol=0, atol=0
+    )
+    out = torch.empty(shuffle_scale_a16w4_out_shape(src.shape), dtype=src.dtype)
 
     actual = shuffle_scale_a16w4(src, experts, gate_up, out=out)
 
     assert actual is out
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_shuffle_scale_a16w4_out_shape_pads_k_to_8():
+    assert shuffle_scale_a16w4_out_shape((64, 5)) == (64, 8)
+    assert shuffle_scale_a16w4_out_shape((64, 224)) == (64, 224)
 
 
 def test_shuffle_out_rejects_the_wrong_shape():

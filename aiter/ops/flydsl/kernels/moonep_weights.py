@@ -69,7 +69,8 @@ class MoonEPWeightPool:
                 f"expert rows must be positive 16-byte multiples, got {row_bytes}"
             )
         window = experts_per_rank + prefetch_slots
-        if any(window * b > 1 << 32 for b in row_bytes):
+        # MegaMoE's weight descriptors hold num_records = 2^32 - 1 bytes.
+        if any(window * b >= 1 << 32 for b in row_bytes):
             raise ValueError(
                 f"a {window}-expert window of {max(row_bytes)}-byte rows exceeds "
                 "4 GiB; use more ranks or fewer prefetch slots"
@@ -181,14 +182,19 @@ class MoonEPWeightPool:
                 "finish_home() must run on every rank before prefetch: peers "
                 "read the home rows directly"
             )
-        if experts_to_copy_row.dtype != torch.int32:
-            raise ValueError("experts_to_copy must be int32")
+        # The kernel reads one entry per slot from each table, unbounded.
+        if (
+            experts_to_copy_row.dtype != torch.int32
+            or experts_to_copy_row.numel() != self.prefetch_slots
+        ):
+            raise ValueError("experts_to_copy must be int32 with one entry per slot")
         stream = torch.cuda.current_stream(self.device)
         selected = experts_to_copy_row.contiguous()
         if resident is None:
             resident = self._no_resident
         elif resident.dtype != torch.int32 or resident.numel() != self.prefetch_slots:
             raise ValueError("resident must be int32 with one entry per slot")
+        resident = resident.contiguous()
         _run_compiled(
             self._jit,
             fx.Int64(selected.data_ptr()),
