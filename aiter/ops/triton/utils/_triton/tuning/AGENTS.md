@@ -31,7 +31,7 @@ here. Update this file in the same change as any behaviour change.
    `should_skip(config)`. Every rule returns True to reject; `build_space` reads as separate
    `if ...: continue` checks. When the kernel rejects every tile that fits the shape, `build_space`
    allows block sizes above the shape for that M (`oversized_tiles_allowed` in the plan). `gluon_candidates` is only for a key whose meaning differs under
-   gluon (gfx1250 a8w8 blockscale `num_stages` is `NUM_BUFFERS`).
+   gluon (gfx950 a8w8 blockscale `num_stages` is `NUM_STAGES`, at least 2).
 4. Results always install into `resolve_config_dir(op, config_name, backend)`. No export directory,
    no dry run.
 5. The installed file is seeded with this shape's file if it exists (keeping every bucket it does

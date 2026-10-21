@@ -964,6 +964,7 @@ class GroupCoordinator:
         eps: float,
         prefill_support: bool = False,
         emit_bf16: bool = False,
+        gemma_norm: bool = False,
     ):
         return self.fused_allreduce_rmsnorm_quant(
             input_,
@@ -973,6 +974,7 @@ class GroupCoordinator:
             prefill_support,
             quant_type="mxfp4",
             emit_bf16=emit_bf16,
+            gemma_norm=gemma_norm,
         )
 
     def _fused_allreduce_rmsnorm_out_place(
