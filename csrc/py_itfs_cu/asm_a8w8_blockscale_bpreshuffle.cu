@@ -262,8 +262,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const char*  kernelName,
     int          bpreshuffle,
     aiter_tensor_t* zero_bias_buf,
+    int          out_zeroed,
     hipStream_t  stream),
-    (A, B, out, A_scale, B_scale, bias, splitK, kernelName, bpreshuffle, zero_bias_buf, stream))
+    (A, B, out, A_scale, B_scale, bias, splitK, kernelName, bpreshuffle, zero_bias_buf, out_zeroed, stream))
 {
     validate_inputs(A, B, out, A_scale, B_scale);
     int Mdim = A->size(0);
@@ -323,8 +324,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                    (Kdim / k_per_split_aligned) == (selectedsplitK - 1),
                    __func__, " Kdim alignment check failed for splitK!");
 
-        // Step 3: Zero output buffer for atomic accumulation across splits.
-        if (selectedsplitK > 1) {
+        // Step 3: Zero output buffer for atomic accumulation across splits,
+        // unless the caller's producer already wrote the zeros (out_zeroed).
+        if (selectedsplitK > 1 && !out_zeroed) {
             HIP_CALL(hipMemsetAsync(out->ptr, 0, out->numel() * out->element_size(), stream));
         }
     }
