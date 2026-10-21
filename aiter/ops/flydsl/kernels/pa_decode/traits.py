@@ -59,6 +59,24 @@ def d256_page64_pipe(
     )
 
 
+def require_nhd_pipe(
+    arch, kv_dtype, head_dim, block_size, query_length, query_group_size
+) -> None:
+    """Raise ``NotImplementedError`` unless the NHD layout can run this shape.
+
+    The single source of truth for NHD shape support: ``PaDecodeSchedule``,
+    ``pa_decode`` and ``pa_decode_nhd_supported`` all call it.
+    """
+    if not d256_page64_pipe(
+        arch, kv_dtype, head_dim, block_size, query_length, query_group_size
+    ):
+        raise NotImplementedError(
+            "NHD pa_decode requires gfx950, FP8 KV, head 256, page 64, "
+            "and a uniform query_length * query_group_size "
+            f"of at most {D256_PIPE_MAX_ROWS} rows"
+        )
+
+
 def max_tiles_per_task(num_seqs, work_capacity, num_partitions, max_context_length):
     """Host bound on the KV tiles one dense planned task owns.
 
@@ -313,11 +331,14 @@ class PaDecodeSchedule:
             query_length,
             query_group_size,
         )
-        if nhd_layout and (not D256_PIPE or block_size != 64):
-            raise NotImplementedError(
-                "NHD pa_decode is the gfx950 FP8 head-256 page-64 decode "
-                "path for uniform query lengths of at most 32 query rows "
-                "(query_length * query_group_size)"
+        if nhd_layout:
+            require_nhd_pipe(
+                arch,
+                kv_dtype,
+                head_dim,
+                block_size,
+                query_length,
+                query_group_size,
             )
         # Splitting would change the CTA's rows and re-read K/V per split.
         assert (
