@@ -63,6 +63,7 @@ def gemm_a16w16_gated(
         assert bias.shape == (
             N,
         ), f"bias must have shape ({N},), got {tuple(bias.shape)}"
+        bias = bias.contiguous()
 
     w = w.T
 
