@@ -60,9 +60,30 @@ def parse_args(argv=None):
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument(
         "--timer",
-        choices=("both", "kernel", "wall"),
+        choices=("both", "kernel", "wall", "aiter", "all"),
         default="both",
-        help="kernel: profiler kernel-time sum; wall: CUDA events (default: both)",
+        help="kernel: profiler kernel-time sum; wall: CUDA events; both: kernel "
+        "and wall (default); aiter: aiter's run_perftest exactly as op_tests use "
+        "it; all: every timer",
+    )
+    p.add_argument(
+        "--aiter-iters",
+        type=int,
+        default=5,
+        help="run_perftest num_iters for --timer aiter (test_moe_2stage uses 5)",
+    )
+    p.add_argument(
+        "--aiter-warmup",
+        type=int,
+        default=2,
+        help="run_perftest num_warmup for --timer aiter (test_moe_2stage uses 2)",
+    )
+    p.add_argument(
+        "--aiter-rotate",
+        type=int,
+        default=0,
+        help="run_perftest num_rotate_args; 0 lets aiter choose, as op_tests do "
+        "(it deep-copies all inputs that many times: needs memory)",
     )
     p.add_argument(
         "--no-flush",
@@ -242,13 +263,16 @@ def kernel_breakdown(per_iter: list[list[tuple[str, float]]], width: int = 70) -
 
 
 class Timer:
-    """Times one call two ways.
+    """Times one call.
 
     kernel: sum of the device time of every kernel the call launches, from
         the torch profiler -- what aiter's run_perftest and rocprof report.
     wall: GPU time from the call's first to its last kernel (CUDA events),
         which also counts gaps between its kernels and GPU idle time while
         the host is still inside the call.
+    aiter: aiter.test_common.run_perftest with op_test settings: the same
+        kernel-time sum, but averaged over few iterations and made cold by
+        rotating deep copies of the inputs instead of flushing caches.
     """
 
     def __init__(self, torch, args):
@@ -256,17 +280,23 @@ class Timer:
         self.iters = args.iters
         self.warmup = args.warmup
         self.sleep_cycles = args.sleep_cycles
-        self.mode = args.timer
+        self.modes = {
+            "both": {"kernel", "wall"},
+            "all": {"kernel", "wall", "aiter"},
+        }.get(args.timer, {args.timer})
+        self.aiter_iters = args.aiter_iters
+        self.aiter_warmup = args.aiter_warmup
+        self.aiter_rotate = args.aiter_rotate
         self.flush_buf = None
-        if not args.no_flush and args.flush_mb > 0:
+        if self.modes & {"kernel", "wall"} and not args.no_flush and args.flush_mb > 0:
             self.flush_buf = torch.zeros(
                 args.flush_mb * (1 << 20) // 4, dtype=torch.float32, device=args.device
             )
         if not hasattr(torch.cuda, "_sleep"):
             self.sleep_cycles = 0
-            if self.mode != "wall":
+            if "kernel" in self.modes:
                 print("[replay] note: torch.cuda._sleep missing; kernel timer off")
-                self.mode = "wall"
+                self.modes.discard("kernel")
 
     def _flush(self) -> None:
         # Read-only: a write flush would leave dirty lines the call then evicts.
@@ -308,12 +338,28 @@ class Timer:
         ]
         return split_profiled_kernels(events, self.iters)
 
-    def run(self, fn) -> dict:
-        for _ in range(self.warmup):
-            fn()
-        self.torch.cuda.synchronize()
-        result: dict = {"iters": self.iters}
-        if self.mode in ("kernel", "both"):
+    def aiter(self, func, args: tuple, kwargs: dict) -> float:
+        from aiter.test_common import run_perftest
+
+        _, us = run_perftest(
+            func,
+            *args,
+            num_iters=self.aiter_iters,
+            num_warmup=self.aiter_warmup,
+            num_rotate_args=self.aiter_rotate,
+            **kwargs,
+        )
+        return float(us)
+
+    def run(self, fn, aiter_call: tuple | None = None) -> dict:
+        """Time ``fn``; ``aiter_call`` is ``(func, args, kwargs)`` for run_perftest."""
+        result: dict = {}
+        if self.modes & {"kernel", "wall"}:
+            for _ in range(self.warmup):
+                fn()
+            self.torch.cuda.synchronize()
+            result["iters"] = self.iters
+        if "kernel" in self.modes:
             per_iter = self.kernels(fn)
             if per_iter is None:
                 result["detail"] = "kernel timer: could not split profiler events"
@@ -325,7 +371,7 @@ class Timer:
                     kernel_count=round(statistics.median(len(k) for k in per_iter)),
                     kernel_breakdown=kernel_breakdown(per_iter),
                 )
-        if self.mode in ("wall", "both"):
+        if "wall" in self.modes:
             times = self.wall(fn)
             result.update(
                 wall_us=round(statistics.median(times), 3),
@@ -334,6 +380,8 @@ class Timer:
                     round(statistics.stdev(times), 3) if len(times) > 1 else 0.0
                 ),
             )
+        if "aiter" in self.modes and aiter_call is not None:
+            result["aiter_us"] = round(self.aiter(*aiter_call), 3)
         return result
 
 
@@ -352,6 +400,7 @@ CALL_FIELDS = [
     "recorded_kernels",
     "replayed_kernels",
     "kernels_match",
+    "layout_ok",
     "kernel_us",
     "kernel_min_us",
     "kernel_count",
@@ -359,6 +408,7 @@ CALL_FIELDS = [
     "wall_min_us",
     "wall_stdev_us",
     "iters",
+    "aiter_us",
     "kernel_breakdown",
     "detail",
 ]
@@ -370,11 +420,18 @@ SUMMARY_FIELDS = [
     "m_values",
     "kernels",
     "kernels_match_pct",
+    "layout_ok_pct",
     "kernel_us",
     "wall_us",
+    "aiter_us",
     "kernel_total_us",
     "wall_total_us",
+    "aiter_total_us",
 ]
+
+# fused_moe arguments op_tests pass positionally to run_perftest; it sizes its
+# input rotation from positional tensors only, so --timer aiter does the same.
+POSITIONAL_ARGS = ("hidden_states", "w1", "w2", "topk_weight", "topk_ids")
 
 
 def _median(values: list) -> float | str:
@@ -397,6 +454,7 @@ def summarize(rows: list[dict]) -> list[dict]:
     for bucket in sorted(by_bucket):
         group = by_bucket[bucket]
         compared = [r["kernels_match"] for r in group if r["kernels_match"] != ""]
+        layout = [r["layout_ok"] for r in group if r.get("layout_ok", "") != ""]
         m_counts = Counter(r["replay_m"] for r in group)
         summary.append(
             {
@@ -410,10 +468,15 @@ def summarize(rows: list[dict]) -> list[dict]:
                 "kernels_match_pct": (
                     round(100.0 * sum(compared) / len(compared), 1) if compared else ""
                 ),
+                "layout_ok_pct": (
+                    round(100.0 * sum(layout) / len(layout), 1) if layout else ""
+                ),
                 "kernel_us": _median([r.get("kernel_us", "") for r in group]),
                 "wall_us": _median([r.get("wall_us", "") for r in group]),
+                "aiter_us": _median([r.get("aiter_us", "") for r in group]),
                 "kernel_total_us": _total([r.get("kernel_us", "") for r in group]),
                 "wall_total_us": _total([r.get("wall_us", "") for r in group]),
+                "aiter_total_us": _total([r.get("aiter_us", "") for r in group]),
             }
         )
     return summary
@@ -427,15 +490,22 @@ def write_csv(path: Path, fields: list[str], rows: list[dict]) -> None:
 
 
 def print_summary(summary: list[dict]) -> None:
+    timers = [
+        t
+        for t in ("kernel_us", "wall_us", "aiter_us")
+        if any(s[t] != "" for s in summary)
+    ]
     print(
-        f"{'bucket':>7} {'calls':>6} {'share':>6} {'match':>6} "
-        f"{'kernel_us':>10} {'wall_us':>9}  kernels"
+        f"{'bucket':>7} {'calls':>6} {'share':>6} {'match':>6} {'layout':>6} "
+        + "".join(f"{t:>10}" for t in timers)
+        + "  kernels"
     )
     for s in summary:
         print(
             f"{s['bucket']:>7} {s['calls']:>6} {s['share_pct']:>5}% "
-            f"{s['kernels_match_pct']!s:>5}% {s['kernel_us']!s:>10} "
-            f"{s['wall_us']!s:>9}  {s['kernels']}"
+            f"{s['kernels_match_pct']!s:>5}% {s['layout_ok_pct']!s:>5}% "
+            + "".join(f"{s[t]!s:>10}" for t in timers)
+            + f"  {s['kernels']}"
         )
 
 
@@ -469,6 +539,7 @@ def main(argv=None) -> int:
 
     rows = []
     replayed = 0
+    alignment_notes: set[str] = set()
     for call in op_recorder.iter_calls(bundle, op="fused_moe"):
         if args.limit and replayed >= args.limit:
             break
@@ -498,6 +569,13 @@ def main(argv=None) -> int:
         except Exception as exc:  # noqa: BLE001 - report the call, keep replaying
             row.update(status="skipped:rebuild", detail=repr(exc)[:200])
             continue
+        # Check before padding, which changes per-token shapes on purpose.
+        mismatches, layout_notes = op_recorder.check_layout(call["args"], kwargs)
+        row["layout_ok"] = not mismatches
+        if mismatches:
+            row["detail"] = "layout: " + "; ".join(mismatches[:3])
+        if layout_notes:
+            alignment_notes.update(n.split(":")[0] for n in layout_notes)
         replay_m = m if call.get("capturing") else target_m(m, graph_sizes)
         pad_per_token(kwargs, m, replay_m, torch)
         row.update(replay_m=replay_m, bucket=get_padded_M(replay_m))
@@ -522,7 +600,18 @@ def main(argv=None) -> int:
         if replay_m != m:
             row["detail"] = (row["detail"] + f" padded from M={m}").strip()
         if timer is not None:
-            timing = timer.run(fn)
+            aiter_call = (
+                fused_moe,
+                tuple(kwargs[n] for n in POSITIONAL_ARGS),
+                {k: v for k, v in kwargs.items() if k not in POSITIONAL_ARGS},
+            )
+            try:
+                timing = timer.run(fn, aiter_call)
+            except Exception as exc:  # noqa: BLE001 - report the call, keep replaying
+                row.update(
+                    status="error", detail=f"timing: {type(exc).__name__}: {exc}"[:300]
+                )
+                continue
             note = timing.pop("detail", "")
             row.update(timing)
             if note:
@@ -538,6 +627,7 @@ def main(argv=None) -> int:
     mismatched = sum(
         1 for r in rows if r["status"] == "ok" and r["kernels_match"] is False
     )
+    bad_layout = sum(1 for r in rows if r.get("layout_ok") is False)
     print(
         f"[replay] {len(rows)} recorded calls: "
         + ", ".join(f"{k}={v}" for k, v in sorted(statuses.items()))
@@ -546,11 +636,21 @@ def main(argv=None) -> int:
         print(
             f"[replay] WARNING: {mismatched} calls ran different kernels than recorded"
         )
+    if bad_layout:
+        print(
+            f"[replay] WARNING: {bad_layout} calls have arguments whose layout differs "
+            "from the recording (see layout_ok/detail in replay_calls.csv)"
+        )
+    if alignment_notes:
+        print(
+            "[replay] note: data pointers less aligned than recorded for: "
+            + ", ".join(sorted(alignment_notes))
+        )
     for warning in sorted(set(factory.warnings)):
         print(f"[replay] warning: {warning}")
     print_summary(summary)
     print(f"[replay] results in {args.out}")
-    return 1 if mismatched else 0
+    return 1 if mismatched or bad_layout else 0
 
 
 if __name__ == "__main__":

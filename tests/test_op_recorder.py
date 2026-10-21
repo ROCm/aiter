@@ -331,6 +331,44 @@ def test_argument_factory_rejects_unsupported():
         factory.build(_tensor_enc([1], [1], "int32", 0, payload="nope"), "topk_ids")
 
 
+def test_check_layout(recorder, tmp_path):
+    op = recorder()
+    inputs = _inputs()
+    inputs["hidden_states"] = torch.randn(8, 4, dtype=torch.bfloat16).t()  # strided
+    op(**inputs)
+    rec._WRITER.close()
+    bundle = _bundle(tmp_path)
+    (call,) = list(rec.iter_calls(bundle))
+    built = rec.ArgumentFactory(rec.load_payloads(bundle), device="cpu").build_args(
+        call["args"]
+    )
+    assert built["hidden_states"].stride() == (1, 4)
+    # Alignment notes depend on the allocator and are informational only.
+    assert rec.check_layout(call["args"], built)[0] == []
+
+    tampered = dict(built)
+    tampered["hidden_states"] = built["hidden_states"].contiguous()
+    w1 = built["w1"].clone()  # attributes are not cloned
+    tampered["w1"] = w1
+    del tampered["topk_ids"]
+    mismatches, _ = rec.check_layout(call["args"], tampered)
+    assert "hidden_states.stride: recorded [1, 4], replay [8, 1]" in mismatches
+    assert "w1.is_shuffled: recorded True, replay <missing>" in mismatches
+    assert "topk_ids: recorded a tensor, replay has missing" in mismatches
+
+    nested = {"pair": {"__tuple__": [call["args"]["topk_ids"], 3]}}
+    assert rec.check_layout(nested, {"pair": (built["topk_ids"], 3)})[0] == []
+    assert rec.check_layout(nested, {"pair": (built["topk_ids"],)})[0] == [
+        "pair: recorded a sequence of 2"
+    ]
+
+    aligned = {"x": _tensor_enc([4], [1], "float32", 4096)}
+    aligned["x"]["__tensor__"]["align"] = 4096
+    base = torch.zeros(5)
+    _, notes = rec.check_layout(aligned, {"x": base[1:]})  # 4-byte offset
+    assert notes == ["x: 4B aligned, recorded 4096B"]
+
+
 def test_replay_padding_and_buckets():
     assert replay.target_m(12, [1, 2, 4, 8, 16, 24]) == 16
     assert replay.target_m(16, [1, 2, 4, 8, 16, 24]) == 16
@@ -406,6 +444,30 @@ def test_split_profiled_kernels():
     assert replay.split_profiled_kernels(events, iters=3) is None
     breakdown = replay.kernel_breakdown(per_iter)
     assert breakdown == "stage1=4.25; stage2=2.50; sort=1.25"
+
+
+def test_timer_modes(monkeypatch):
+    def timer(*flags):
+        args = replay.parse_args(["bundle", "--device", "cpu", "--no-flush", *flags])
+        return replay.Timer(torch, args)
+
+    assert timer().modes == {"kernel", "wall"}
+    assert timer("--timer", "all").modes == {"kernel", "wall", "aiter"}
+    t = timer("--timer", "aiter", "--aiter-iters", "7")
+    assert t.modes == {"aiter"} and t.aiter_iters == 7 and t.aiter_warmup == 2
+
+    calls = []
+
+    def fake_aiter(self, func, args, kwargs):
+        calls.append((func, args, kwargs))
+        return 12.3456
+
+    monkeypatch.setattr(replay.Timer, "aiter", fake_aiter)
+    ran = []
+    result = t.run(lambda: ran.append(1), (len, (1, 2), {"k": 3}))
+    assert result == {"aiter_us": 12.346}
+    assert ran == []  # aiter-only mode does not run the kernel/wall loops
+    assert calls == [(len, (1, 2), {"k": 3})]
 
 
 def test_replay_restores_environment(tmp_path, monkeypatch):

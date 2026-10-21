@@ -288,6 +288,65 @@ def find_unsupported(encoded: Any, path: str = "") -> list[str]:
     return found
 
 
+_MISSING = object()
+
+
+def check_layout(
+    encoded_args: Mapping[str, Any], built_args: Mapping[str, Any]
+) -> tuple[list[str], list[str]]:
+    """Compare rebuilt arguments with their recording.
+
+    Returns ``(mismatches, notes)``. Mismatches are differences in shape,
+    strides, storage offset, dtype or tensor attributes: the replayed call
+    would not match the recorded one. Notes are differences that are not
+    reproduced on purpose (memory alignment of the data pointer).
+    """
+    mismatches: list[str] = []
+    notes: list[str] = []
+    for name, enc in encoded_args.items():
+        _check_value(enc, built_args.get(name, _MISSING), name, mismatches, notes)
+    return mismatches, notes
+
+
+def _check_value(enc: Any, value: Any, path: str, mismatches: list, notes: list):
+    if isinstance(enc, list) or (isinstance(enc, dict) and "__tuple__" in enc):
+        items = enc if isinstance(enc, list) else enc["__tuple__"]
+        if not isinstance(value, (list, tuple)) or len(value) != len(items):
+            mismatches.append(f"{path}: recorded a sequence of {len(items)}")
+            return
+        for i, (e, v) in enumerate(zip(items, value)):
+            _check_value(e, v, f"{path}[{i}]", mismatches, notes)
+        return
+    if not (isinstance(enc, dict) and "__tensor__" in enc):
+        return
+    if not isinstance(value, torch.Tensor):
+        got = "missing" if value is _MISSING else type(value).__name__
+        mismatches.append(f"{path}: recorded a tensor, replay has {got}")
+        return
+    spec = enc["__tensor__"]
+    actual = {
+        "shape": list(value.shape),
+        "stride": list(value.stride()),
+        "storage_offset": value.storage_offset(),
+        "dtype": dtype_to_str(value.dtype),
+    }
+    for field, got in actual.items():
+        want = spec.get(field)
+        if want is not None and want != got:
+            mismatches.append(f"{path}.{field}: recorded {want}, replay {got}")
+    attrs = tensor_attrs(value)
+    for key, want in spec.get("attrs", {}).items():
+        got = attrs.get(key, _MISSING)
+        if got is _MISSING or got != want:
+            shown = "<missing>" if got is _MISSING else repr(got)
+            mismatches.append(f"{path}.{key}: recorded {want!r}, replay {shown}")
+    want_align = spec.get("align")
+    if want_align and value.numel():
+        got_align = _alignment(value.data_ptr())
+        if got_align < min(want_align, 256):
+            notes.append(f"{path}: {got_align}B aligned, recorded {want_align}B")
+
+
 # ---------------------------------------------------------------------------
 # Session information
 # ---------------------------------------------------------------------------

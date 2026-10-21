@@ -66,7 +66,12 @@ python op_tests/replay/replay_fused_moe.py /data/rec/minimax_m3_tp4/rank0-... \
 Before importing aiter the script restores the recorded `AITER_*` environment
 and points `AITER_CONFIG_FMOE` at the bundle's tuned config, so `fused_moe`
 selects kernels as it did in the framework. Each call is checked against the
-recorded kernels (exit code 1 if any differ).
+recording (exit code 1 if any check fails):
+
+- kernels: the kernels aiter selects must be the recorded ones
+- layout: every rebuilt tensor must have the recorded shape, strides, storage
+  offset, dtype and attributes (`is_shuffled`, ...). Data-pointer alignment is
+  not reproduced; lower alignment than recorded is reported as a note only
 
 `--pad-to-graph-sizes` pads each call's token count up to the batch sizes the
 framework captured graphs for, as graph mode would. Padding rows reuse the
@@ -83,16 +88,22 @@ warm). Two numbers are reported (`--timer both|kernel|wall`):
   with a GPU busy-wait queued in front so launch overhead before the call is
   hidden). It adds the gaps between the call's kernels and any time the GPU
   waits for the host inside the call. `wall_us - kernel_us` is that overhead.
+- `aiter_us` (`--timer aiter` or `--timer all`): aiter's own
+  `run_perftest`, called exactly as `op_tests` call it (5 iterations, 2
+  warm-up, inputs rotated through deep copies; `--aiter-iters`,
+  `--aiter-warmup`, `--aiter-rotate`). Use it to match op-test numbers
+  exactly. The rotation copies all inputs, weights included, several times,
+  so it needs much more memory on large recordings.
 
 Every layer keeps its own weight buffer (`--shared-weights` to use one set).
 
 Outputs:
 
 - `replay_calls.csv`: per call: M, padded M, bucket, recorded vs replayed
-  kernels, kernel and wall times, and a per-kernel breakdown
+  kernels, layout check, kernel/wall/aiter times, and a per-kernel breakdown
   (`kernel_breakdown`, median us per kernel name)
 - `replay_summary.csv`: per M bucket: number and share of calls, M values
-  seen, kernels, match rate, median and total kernel/wall time
+  seen, kernels, kernel-match and layout-match rates, median and total times
 
 `--check-only` verifies kernels without timing.
 
