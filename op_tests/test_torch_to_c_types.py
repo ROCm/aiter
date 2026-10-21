@@ -12,14 +12,16 @@ import ctypes
 import pytest
 import torch
 
-from csrc.cpp_itfs.torch_utils import torch_to_c_types
-
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs a HIP device"
 )
 
 
 def _handle(stream) -> int:
+    # torch_utils detects the GPU arch at import, so import it only when a
+    # test actually runs; the skipif marker cannot guard a module-level import.
+    from csrc.cpp_itfs.torch_utils import torch_to_c_types
+
     (c_arg,) = torch_to_c_types(stream)
     assert isinstance(c_arg, ctypes.c_void_p)
     return c_arg.value or 0

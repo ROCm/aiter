@@ -106,6 +106,8 @@ class TestRuntimeArchitecture(unittest.TestCase):
             ),
             mock.patch.object(self.torch.version, "hip", "6.3"),
             mock.patch.object(self.torch.cuda, "is_available", return_value=True),
+            mock.patch.object(self.torch.cuda, "device_count", return_value=1),
+            mock.patch.object(self.torch.cuda, "current_device", return_value=0),
             mock.patch.object(
                 self.torch.cuda, "get_device_properties", return_value=properties
             ) as get_properties,
@@ -170,6 +172,10 @@ class TestRuntimeArchitecture(unittest.TestCase):
                     mock.patch.object(self.torch.version, "hip", "6.3"),
                     mock.patch.object(
                         self.torch.cuda, "is_available", return_value=True
+                    ),
+                    mock.patch.object(self.torch.cuda, "device_count", return_value=1),
+                    mock.patch.object(
+                        self.torch.cuda, "current_device", return_value=0
                     ),
                     mock.patch.object(
                         self.torch.cuda,
