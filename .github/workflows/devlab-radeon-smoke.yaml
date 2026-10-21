@@ -1,0 +1,232 @@
+# DevLab Dispatch Radeon (Strix Halo) smoke.
+#
+# Request a self-hosted runner with the `devlab-dispatch` label. The pool
+# queues the job and registers the next available runner for that OS, then
+# tears the runner down when the job ends.
+#
+# Labels:
+#   Linux:   [self-hosted, linux,   devlab-dispatch, strix-halo]
+#   Windows: [self-hosted, windows, devlab-dispatch, strix-halo]
+#
+# Hardware on this pool is AMD Radeon Strix Halo (gfx1151). Manual only —
+# use Actions → DevLab Radeon Smoke → Run workflow.
+
+name: DevLab Radeon Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "Which DevLab OS pool to claim"
+        required: true
+        default: both
+        type: choice
+        options: [both, linux, windows]
+      ref:
+        description: "Branch, tag, or SHA to check out"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devlab-radeon-smoke-${{ github.ref }}-${{ inputs.platform }}
+  cancel-in-progress: false
+
+jobs:
+  radeon-linux:
+    name: Radeon Linux (Strix Halo)
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      && (inputs.platform == 'both' || inputs.platform == 'linux')
+    runs-on: [self-hosted, linux, devlab-dispatch, strix-halo]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout aiter
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 1
+
+      - name: Probe Radeon / ROCm
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## DevLab Radeon Linux probe"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| runner | \`${{ runner.name }}\` |"
+            echo "| os | \`${{ runner.os }}\` |"
+            echo "| host | \`$(hostname)\` |"
+            echo "| kernel | \`$(uname -r)\` |"
+            if [ -r /etc/os-release ]; then
+              # shellcheck disable=SC1091
+              . /etc/os-release
+              echo "| distro | \`${PRETTY_NAME:-unknown}\` |"
+            fi
+            echo ""
+            echo "### GPU"
+            echo '```'
+            if command -v rocminfo >/dev/null 2>&1; then
+              rocminfo | grep -E 'Marketing Name:|Name:[[:space:]]+gfx|Device Type:' || true
+            elif [ -x /opt/rocm/bin/rocminfo ]; then
+              /opt/rocm/bin/rocminfo | grep -E 'Marketing Name:|Name:[[:space:]]+gfx|Device Type:' || true
+            else
+              echo "rocminfo: not found"
+            fi
+            if command -v amd-smi >/dev/null 2>&1; then
+              amd-smi list || true
+            elif command -v rocm-smi >/dev/null 2>&1; then
+              rocm-smi --showproductname || true
+            fi
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+          gfx="$(
+            { rocminfo 2>/dev/null || /opt/rocm/bin/rocminfo 2>/dev/null || true; } \
+              | grep -Eo 'gfx[0-9a-f]+' | head -1 || true
+          )"
+          echo "Detected GFX=${gfx:-none}"
+          case "${gfx}" in
+            gfx1150|gfx1151|gfx1100|gfx1101|gfx1102|gfx1200|gfx1201)
+              echo "Radeon-class GPU looks usable (${gfx})."
+              ;;
+            *)
+              echo "::error::Expected a Radeon GFX target on DevLab Strix Halo; got '${gfx:-none}'."
+              exit 1
+              ;;
+          esac
+
+          if [ ! -e /dev/kfd ]; then
+            echo "::error::/dev/kfd is missing; HSA cannot initialize."
+            exit 1
+          fi
+          if [ ! -r /dev/kfd ] || [ ! -w /dev/kfd ]; then
+            echo "::error::/dev/kfd is not read/write for this runner user."
+            exit 1
+          fi
+
+      - name: Torch HIP smoke (if python3 available)
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "python3 not on PATH; skipping torch smoke."
+            exit 0
+          fi
+          python3 - <<'PY'
+          import sys
+          try:
+              import torch
+          except Exception as exc:
+              print(f"torch not importable ({exc}); skipping.")
+              sys.exit(0)
+          print(f"torch={torch.__version__}")
+          print(f"hip_available={torch.cuda.is_available()}")
+          if not torch.cuda.is_available():
+              raise SystemExit("torch cannot see a HIP device on this Radeon runner")
+          print(f"device0={torch.cuda.get_device_name(0)}")
+          x = torch.randn(1024, 1024, device="cuda")
+          y = x @ x
+          print(f"matmul_ok shape={tuple(y.shape)} sum={float(y.sum())}")
+          PY
+
+  radeon-windows:
+    name: Radeon Windows (Strix Halo)
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      && (inputs.platform == 'both' || inputs.platform == 'windows')
+    runs-on: [self-hosted, windows, devlab-dispatch, strix-halo]
+    timeout-minutes: 45
+    steps:
+      - name: Configure Git long paths
+        shell: powershell
+        run: git config --global core.longpaths true
+
+      - name: Checkout aiter
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 1
+
+      - name: Probe Radeon / Windows GPU
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          "## DevLab Radeon Windows probe" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "| Field | Value |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "| --- | --- |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "| runner | ``${{ runner.name }}`` |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "| os | ``${{ runner.os }}`` |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "| host | ``$env:COMPUTERNAME`` |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+          "### GPU (Get-CimInstance)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          $gpus = Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM, DriverVersion
+          $gpus | Format-List | Out-String | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+          $names = @($gpus | ForEach-Object { $_.Name })
+          $radeon = $names | Where-Object { $_ -match 'Radeon|AMD|gfx|RX |Strix|Halo|7900|7800|7700|7600|9060|9070' }
+          if (-not $radeon) {
+            Write-Host "::error::No AMD Radeon GPU reported by Win32_VideoController. Seen: $($names -join ', ')"
+            exit 1
+          }
+          Write-Host "Radeon GPU(s): $($radeon -join ', ')"
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Torch HIP smoke (ROCm pip, gfx1151)
+        shell: powershell
+        env:
+          GFX: gfx1151
+          ROCM_INDEX: https://stable.repo.amd.com/rocm/whl-next/
+          ROCM_VERSION: 10.1.0
+          TORCH_VERSION: 2.14.0+rocm10.1.0
+        run: |
+          $ErrorActionPreference = "Continue"
+          $venv = Join-Path $env:RUNNER_TEMP "aiter-devlab-radeon"
+          if (Test-Path $venv) { Remove-Item -Recurse -Force $venv }
+
+          python --version
+          python -m venv $venv
+          $python = Join-Path $venv "Scripts\python.exe"
+
+          & $python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & $python -m pip install `
+            --index-url "$env:ROCM_INDEX" `
+            "torch[device-$env:GFX]==$env:TORCH_VERSION" `
+            "rocm[devel,device-$env:GFX]==$env:ROCM_VERSION"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & $python -m rocm_sdk init
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $smoke = @'
+          import torch
+          print(f"torch={torch.__version__}")
+          print(f"hip_available={torch.cuda.is_available()}")
+          if not torch.cuda.is_available():
+              raise SystemExit("torch cannot see a HIP device on this Radeon runner")
+          print(f"device0={torch.cuda.get_device_name(0)}")
+          x = torch.randn(1024, 1024, device="cuda")
+          y = x @ x
+          print(f"matmul_ok shape={tuple(y.shape)} sum={float(y.sum())}")
+          '@
+          $smokePath = Join-Path $env:RUNNER_TEMP "devlab-radeon-smoke.py"
+          $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+          [System.IO.File]::WriteAllText($smokePath, $smoke, $utf8NoBom)
+          & $python $smokePath
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
