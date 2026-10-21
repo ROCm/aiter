@@ -447,8 +447,10 @@ def gemm_a16w4(shape, backend):
     )
 
     M, N, K = shape["M"], shape["N"], shape["K"]
+    # Per-channel scales when K is not a multiple of the group size, as the benchmark does.
+    group_size = 128 if K % 128 == 0 else -1
     x, w, w_scales, _, _, _, y, _ = generate_gemm_a16w4_inputs(
-        M, N, K, group_size=128, dtype=torch.bfloat16, output=True
+        M, N, K, group_size=group_size, dtype=torch.bfloat16, output=True
     )
 
     def call(config, x, w, w_scales, y):

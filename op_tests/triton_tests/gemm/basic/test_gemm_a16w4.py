@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import importlib.util
+import os
+
 import pytest
 import torch
 
@@ -52,6 +55,10 @@ def generate_gemm_a16w4_inputs(
     Returns (x, w, w_scales, w_zeros, x_perm, bias, y, q). q is the (N, K)
     uint4 weight that w packs. group_size -1 gives per-channel scales.
     """
+    assert group_size == -1 or K % group_size == 0, (
+        f"K={K} is not a multiple of group_size={group_size}: "
+        "use group_size=-1 (per-channel scales)"
+    )
     torch.manual_seed(0)
     num_groups = 1 if group_size == -1 else K // group_size
 
@@ -173,6 +180,51 @@ def test_gemm_a16w4_bias_and_output(M, N, K, scales_dtype, out_dtype):
     assert out.data_ptr() == y.data_ptr()
     ref = run_torch(x, q, w_scales, w_zeros, bias=bias, dtype=out_dtype)
     _check(out, ref, dtype)
+
+
+def test_gemm_a16w4_strided_perm_and_bias():
+    _skip_if_unsupported_arch()
+    M, N, K = 33, 1024, 2048
+    dtype = torch.bfloat16
+    x, w, w_scales, w_zeros, x_perm, bias, _, q = generate_gemm_a16w4_inputs(
+        M, N, K, dtype=dtype, has_zeros=True, act_order=True, bias=True
+    )
+    # Every other element of a larger tensor: same values, stride 2.
+    x_perm_strided = torch.stack((x_perm, torch.zeros_like(x_perm)), dim=1)[:, 0]
+    bias_strided = torch.stack((bias, torch.zeros_like(bias)), dim=1)[:, 0]
+
+    out = gemm_a16w4(
+        x, w, w_scales, w_zeros=w_zeros, x_perm=x_perm_strided, bias=bias_strided
+    )
+
+    _check(out, run_torch(x, q, w_scales, w_zeros, x_perm, bias, dtype=dtype), dtype)
+
+
+def _load_tuning_kernels(monkeypatch):
+    """The kernels.py of the tuning scripts, which imports _utils from its own directory."""
+    from aiter.ops.triton.utils._triton import arch_info
+
+    tuning_dir = os.path.join(os.path.dirname(arch_info.__file__), "tuning")
+    monkeypatch.syspath_prepend(tuning_dir)
+    spec = importlib.util.spec_from_file_location(
+        "aiter_tuning_kernels", os.path.join(tuning_dir, "kernels.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# K = 320 and 200 are not multiples of 128: the tuning entry uses per-channel scales.
+@pytest.mark.parametrize("M, N, K", [(1, 64, 320), (33, 72, 200), (16, 256, 512)])
+def test_gemm_a16w4_tuning_entry(M, N, K, monkeypatch):
+    _skip_if_unsupported_arch()
+    spec = _load_tuning_kernels(monkeypatch).KERNELS["gemm_a16w4"]
+    call, (x, w, w_scales, y), _ = spec.setup({"M": M, "N": N, "K": K}, "triton")
+
+    out = call(None, x, w, w_scales, y)
+
+    q = torch.stack((w & 0xF, w >> 4), dim=-1).reshape(N, K)
+    _check(out, run_torch(x, q, w_scales, dtype=x.dtype), x.dtype)
 
 
 def _pack_int32(values: torch.Tensor) -> torch.Tensor:

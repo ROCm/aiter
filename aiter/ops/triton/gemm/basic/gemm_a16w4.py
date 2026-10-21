@@ -80,18 +80,25 @@ def gemm_a16w4(
     assert K % 8 == 0, "K must be a multiple of 8"
     assert w_scales.dim() == 2 and w_scales.shape[0] == N
     num_groups = w_scales.shape[1]
-    assert K % num_groups == 0, "K must be a multiple of the group size"
+    assert (
+        K % num_groups == 0
+    ), f"K={K} must be a multiple of the group size (w_scales has {num_groups} groups)"
     group_size = K // num_groups
-    assert num_groups == 1 or (
-        group_size >= 16 and group_size & (group_size - 1) == 0
-    ), "group_size must be a power of two, 16 or more"
+    if num_groups > 1:
+        assert group_size >= 16 and group_size & (group_size - 1) == 0, (
+            f"group_size = K // w_scales.shape[1] = {group_size} must be a power of "
+            "two, 16 or more (or K, with one column of w_scales)"
+        )
     if w_zeros is not None:
         assert w_zeros.shape == w_scales.shape, "w_zeros must match w_scales"
         assert w_zeros.dtype == torch.uint8, "w_zeros must be uint8"
     if x_perm is not None:
         assert x_perm.shape == (K,) and x_perm.dtype == torch.int32
+        # The kernel reads x_perm and bias with unit stride.
+        x_perm = x_perm.contiguous()
     if bias is not None:
         assert bias.shape == (N,)
+        bias = bias.contiguous()
     if dtype is None:
         dtype = x.dtype
 
