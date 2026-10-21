@@ -31,6 +31,13 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from .errpage import (
+    SHARE_GLOBAL,
+    ErrInfo,
+    GlobalPage,
+    ReadbackRing,
+    decode_err,
+)
 from .plan import WindowReq
 
 log = logging.getLogger("aiter.gemm_fusion")
@@ -112,6 +119,7 @@ class CcoBackend:
             ("gf_uid_v1", [u32, vp]),
             ("gf_comm_create_v1", [u32, u32, i32, vp, u64, C.POINTER(vp)]),
             ("gf_win_register_v1", [vp, u64, C.POINTER(vp), C.POINTER(vp)]),
+            ("gf_peer_ptr_v1", [vp, vp, i32, C.POINTER(vp)]),
             ("gf_devcomm_create_v1", [vp, u32, C.POINTER(vp)]),
             ("gf_devcomm_info_v1", [vp, vp, C.POINTER(u64)]),
             ("gf_zero_v1", [i32, vp, u64]),
@@ -162,6 +170,12 @@ class CcoBackend:
             "gf_win_register",
         )
         return w.value, l.value
+
+    def peer_ptr(self, comm, local, peer):
+        """Address, in this process, of rank `peer`'s copy of the window byte at `local` (ccoGetPeerPtr)."""
+        o = C.c_void_p()
+        self._chk(self.lib.gf_peer_ptr_v1(comm, local, peer, C.byref(o)), "gf_peer_ptr")
+        return o.value
 
     def devcomm_create(self, comm, sdma_queues):
         o = C.c_void_p()
@@ -370,6 +384,16 @@ class FusionResources:
         self.devcomm_info = None  # set by finalize(): {lsaSize, lsaRank, sdmaNumQueue, worldSize, ...} read back from the created devcomm
         self.finalized = False
         self._released = False
+        # R12 (design card r2): the per-comm ERR/STEP/DIAG page, the async readback ring and the diagnostics hooks read by reset()
+        self._global: Window | None = None
+        self._gpage: GlobalPage | None = None
+        self._ring: ReadbackRing | None = None
+        self.readback_ops = (
+            None  # device ops of the readback ring (None = torch); injectable for tests
+        )
+        self._gpeers = None  # device-resident table of every rank's ERR address (peer-ERR propagation), built once by global_peers()
+        self.gpeers_factory = None  # (addresses, device) -> an object with .data_ptr(); None = a torch int64 device tensor; injectable for tests
+        self._report_hooks: dict[str, Callable[[], dict]] = {}
         self._init_comm()
 
     # -- helpers -----------------------------------------------------------
@@ -635,6 +659,7 @@ class FusionResources:
         self._regs.clear()
         self._shared.clear()
         self._unzeroed.clear()
+        self._global = self._gpage = self._gpeers = None
         self.backend.comm_destroy(self.comm)
         self.policy, self.policy_fallback_reason = "uniform", reason
         self._arena, self._arena_bytes, self._arena_top = None, 0, 0
@@ -742,6 +767,26 @@ class FusionResources:
                     f"pre-size by constructing FusionResources(profile=<the active profile>) (its window_budget)"
                 )
             for r in wreqs:
+                if (
+                    r.share == SHARE_GLOBAL
+                ):  # ONE ERR/STEP/DIAG page per comm, shared by every R12 plan (one more equal-size window)
+                    w = self._shared.get(SHARE_GLOBAL)
+                    if w is None:
+                        h, loc = self._register("<global>", "page", self.window_bytes)
+                        w = Window(
+                            "<global>",
+                            "page",
+                            r.kind,
+                            self.window_bytes,
+                            h,
+                            loc,
+                            shared=True,
+                        )
+                        self._regs.append(w)
+                        self._unzeroed.append(w)
+                        self._shared[SHARE_GLOBAL] = w
+                    wins[r.name] = w
+                    continue
                 h, loc = self._register(owner, r.name, self.window_bytes)
                 w = Window(owner, r.name, r.kind, self.window_bytes, h, loc)
                 wins[r.name] = w
@@ -756,6 +801,7 @@ class FusionResources:
             + [max(1, int(r.bytes)) for r in reqs if r.kind == "sdma_queue"]
         )
         self.windows[owner] = wins
+        self._global = self._shared.get(SHARE_GLOBAL)
         return wins
 
     def _agree_registration(self, owner: str, wreqs: list[WindowReq]):
@@ -874,7 +920,125 @@ class FusionResources:
             "zero_mode": "h2d_deferred",
             "heap_bytes": self._vmm,
             "arena_bytes": self._arena_bytes or None,
+            "global_page": self._global is not None,
+            "readback_slots": self._ring.slots if self._ring is not None else None,
         }
+
+    # -- R12 host API (design card r2 D2.6 / D-7) ----------------------------
+    def global_page(self) -> GlobalPage:
+        """The per-comm ERR/STEP/DIAG page (see errpage.py). Exists once an R12 plan has been ensured (its resources() carry the global page request)."""
+        w = self._global
+        if w is None:
+            raise ResourceError(
+                "no global ERR/STEP page on this FusionResources: no R12 (abi 3) plan has been ensured yet"
+            )
+        if self._gpage is None or self._gpage.local != int(w.local):
+            self._gpage = GlobalPage(w.local, w.bytes, self.device)
+        return self._gpage
+
+    def global_peers(self):
+        """Device-resident table {u32* err[world]} (LgGfPeers) of every rank's ERR word, indexed by world rank (own entry = this rank's, ignored by the kernels), for the
+        peer-ERR propagation of the CAS winner. Built ONCE (outside capture) from ccoGetPeerPtr of the page's ERR address and kept for the comm's lifetime; returns an
+        object with .data_ptr() (the address handed to the driver's page attach)."""
+        from .errpage import ERR_OFF
+
+        if self._gpeers is None:
+            page = self.global_page()
+            addrs = []
+            for r in range(self.world):
+                if r == self.rank:
+                    addrs.append(page.err_addr)
+                else:
+                    addrs.append(
+                        int(self.backend.peer_ptr(self.comm, page.local, r)) + ERR_OFF
+                    )
+            if self.gpeers_factory is not None:
+                self._gpeers = self.gpeers_factory(addrs, self.device)
+            else:
+                import torch
+
+                self._gpeers = torch.tensor(
+                    addrs, dtype=torch.int64, device=f"cuda:{self.device}"
+                )
+        return self._gpeers
+
+    def error_flag(self):
+        """int32 [1] device tensor: a zero-copy view of this rank's ERR word (the SAME tensor object on every call)."""
+        return self.global_page().err_tensor()
+
+    def step_tensor(self):
+        """int64 [1] device tensor: a zero-copy view of the STEP counter. ATOM ticks it with add_(1) at the top of the first fused site of every forward."""
+        return self.global_page().step_tensor()
+
+    def _get_ring(self) -> ReadbackRing:
+        if self._ring is None:
+            self._ring = ReadbackRing(ops=self.readback_ops)
+        return self._ring
+
+    def readback_enqueue(self, step_idx: int, stream=None) -> int:
+        """Enqueue ONE 4 B async D2H copy of the ERR word into pinned ring slot step_idx % R on `stream` (default: the current stream), in stream order. Call it right
+        before sampling, once per step, outside graph capture. Never synchronises. Returns the slot.
+        """
+        return self._get_ring().enqueue(step_idx, self.error_flag(), stream)
+
+    def readback_consume(self, step_idx: int, wait: bool = False) -> int | None:
+        """The ERR word captured at `step_idx` (0 = clean), or None if that copy has not completed (it is complete once the step's token sync returned). Never blocks
+        unless wait=True."""
+        return self._get_ring().consume(step_idx, wait)
+
+    def set_report_hook(self, key: str, fn: Callable[[], dict]):
+        """A diagnostics reader (e.g. the large path's report words) logged by reset() next to the page's ERR/DIAG."""
+        self._report_hooks[key] = fn
+
+    def error_info(self) -> tuple[ErrInfo, int, list[int]] | None:
+        """(decoded ERR, STEP, DIAG words) read from the device, or None without a page. Synchronous D2H: for diagnostics after a sync, never the hot path."""
+        if self._global is None:
+            return None
+        err, step, diag = self.global_page().read()
+        return decode_err(err), step, diag
+
+    def _log_error_page(self, where: str):
+        if self._global is None:
+            return None
+        try:
+            info = self.error_info()
+        except Exception as e:  # noqa: BLE001
+            # a diagnostics read must never block the recovery it belongs to
+            log.warning(
+                "event=resources error_page rank=%d where=%s read_failed=%s",
+                self.rank,
+                where,
+                e,
+            )
+            return None
+        err, step, diag = info
+        if not err.ok:
+            log.warning(
+                "event=resources error_page rank=%d where=%s step=%d err=%s diag=%s",
+                self.rank,
+                where,
+                step,
+                err.describe(),
+                [f"{v:#x}" for v in diag],
+            )
+            for key, fn in list(self._report_hooks.items()):
+                try:
+                    log.warning(
+                        "event=resources error_report rank=%d where=%s owner=%s report=%s",
+                        self.rank,
+                        where,
+                        key,
+                        fn(),
+                    )
+                except Exception as e:  # noqa: BLE001
+                    log.warning(
+                        "event=resources error_report rank=%d where=%s owner=%s read_failed=%s",
+                        self.rank,
+                        where,
+                        key,
+                        e,
+                    )
+        return info
 
     def log_poison(self, where: str) -> int:
         """Log every poisoned owner's reason (and the report words when available) BEFORE the reset zeroes them; returns the OR of the poison words.
@@ -1009,13 +1173,27 @@ class FusionResources:
         for w in wins:
             self.backend.zero(self.device, w.local, w.bytes)
 
+    def reset(self):
+        """COLLECTIVE recovery after an error (R12 I6): device sync -> log ERR + DIAG (+ the registered reports) -> drain hooks + sync -> barrier -> zero ALL windows (small
+        ctl+Rx, large S/R/C, the global page: ERR and STEP go back to 0) -> init hooks (large epoch = 1 + magic) -> sync -> barrier. Every rank must call it, and ATOM
+        decides uniformly (a non-zero readback on any rank). Every kernel on every rank is complete before the first barrier, so no propagation write can land after the zeroing.
+        """
+        self._collective_reset("reset")
+
     def quiesce_and_reset(self):
+        """The pre-R12 name of reset() (per-plan poison words are still logged for the pre-R12 plans that registered them). All ranks must call it."""
+        self._collective_reset("quiesce_and_reset")
+
+    def _collective_reset(self, where: str):
         """A2-H: device sync -> per-plan drain (large-M: lg_comm_drain_all) + device sync -> barrier -> reset/init windows
-        -> device sync -> barrier. All ranks must call it."""
+        -> device sync -> barrier."""
         self.backend.device_sync(self.device)
+        self._log_error_page(
+            where
+        )  # the reason must be logged BEFORE the zeroing below clears it
         self.log_poison(
-            "quiesce_and_reset"
-        )  # the reason must be logged BEFORE the drain/zero/init below clears it
+            where
+        )  # pre-R12 plans only: they registered per-plan poison hooks
         for hook in self._drain_hooks.values():
             hook()
         if self._drain_hooks:
@@ -1029,10 +1207,13 @@ class FusionResources:
             self._init_hooks.values()
         ):  # control-block images; one per owner, one for a shared set
             hook()
+        if self._ring is not None:
+            self._ring.reset()  # the old readings describe a state that no longer exists
         self.backend.device_sync(self.device)
         self._barrier()
         log.info(
-            "event=resources quiesce_and_reset rank=%d windows=%d",
+            "event=resources %s rank=%d windows=%d",
+            where,
             self.rank,
             len(self._regs),
         )
@@ -1073,5 +1254,6 @@ class FusionResources:
             )  # MORI teardown contract: WindowDeregister -> MemFree(localPtr) (before ccoCommDestroy)
         self._regs.clear()
         self._shared.clear()
+        self._global = self._gpage = self._ring = self._gpeers = None
         self.backend.comm_destroy(self.comm)
         self.windows.clear()

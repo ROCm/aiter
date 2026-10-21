@@ -63,9 +63,66 @@ class SmBindingV1(C.Structure):
     ]
 
 
-def load_driver(path: str):
+# ---- R12 (design card r2 D2.3): STUB against the card ABI until small/r19 and its driver land --------------------------------------------------------------------
+# SmRanArgsV3 is the RAN kernel's by-value kernarg block (one s_load_dwordx16): sizeof == 64 is pinned here and by the r19 header's static_assert. The host driver builds it
+# natively; this mirror exists to pin the layout and to unit-test the packing. err/step point into the per-comm global page.
+SM_RAN_ARGS_V3_BYTES = 64
+
+
+class SmRanArgsV3(C.Structure):
+    _fields_ = [
+        ("blk", C.c_void_p),
+        ("Ascale", C.c_void_p),
+        ("positions", C.c_void_p),
+        ("slot_mapping", C.c_void_p),
+        ("err", C.c_void_p),
+        ("step", C.c_void_p),
+        ("M", C.c_uint32),
+        ("rank", C.c_uint32),
+        ("t_valid", C.c_uint32),
+        ("call_id", C.c_uint32),
+    ]
+
+
+assert C.sizeof(SmRanArgsV3) == SM_RAN_ARGS_V3_BYTES
+
+
+def load_driver(path: str, abi: int = 2):
+    """Bind the small driver. abi 2 = the shipped v1 entry points; abi 3 = the R12 entry points (sm_attach_v3 / sm_launch_blk_v3; NO per-plan poison read). The abi 3
+    signatures are the card's (D2.6) and are CONFIRMED against the r19 driver when it lands: attach(rank, comm, rx_win, rx_local, ctl_win, ctl_local, gpage_local,
+    gpeers (NULL: the driver resolves the peers from gpage_local, ccoGetPeerPtr), gemm_hsaco, ran_hsaco, &ctx); launch(ctx, blk, A, W, strideA, Ascale, positions, slot,
+    t_valid, call_id, stream)."""
     lib = C.CDLL(path)
     vp, u32, i32 = C.c_void_p, C.c_uint32, C.c_int32
+    if abi == 3:
+        sig3 = [
+            (
+                "sm_attach_v3",
+                [
+                    u32,
+                    vp,
+                    vp,
+                    vp,
+                    vp,
+                    vp,
+                    vp,
+                    vp,
+                    C.c_char_p,
+                    C.c_char_p,
+                    C.POINTER(vp),
+                ],
+            ),
+            ("sm_bind_new_v1", [vp, vp, C.POINTER(vp)]),
+            ("sm_launch_blk_v3", [vp, vp, vp, vp, u32, vp, vp, vp, u32, u32, vp]),
+            ("sm_blk_free_v1", [vp]),
+            ("sm_free_v1", [vp]),
+            ("sm_info_v1", [vp]),
+        ]
+        for n, a in sig3:
+            f = getattr(lib, n)
+            f.restype = i32
+            f.argtypes = a
+        return lib
     sig = [
         (
             "sm_attach_v1",
@@ -135,6 +192,37 @@ class SmallContext:
             raise RuntimeError(f"sm_bind_new rc={rc}")
         self.blks.append(blk)
         return blk
+
+    def launch_v3(
+        self,
+        blk,
+        A_ptr: int,
+        W_ptr: int,
+        strideA: int,
+        Ascale_ptr: int,
+        positions_ptr: int,
+        slot_ptr: int,
+        t_valid: int,
+        call_id: int,
+        stream,
+    ):
+        """R12 launch (card D2.6): x_scale / positions / slot_mapping / t_valid / call_id are PER-LAUNCH kernargs (they are no longer part of the binding), err and step
+        come from the global page the driver was attached with."""
+        rc = self.lib.sm_launch_blk_v3(
+            self.ctx,
+            blk,
+            C.c_void_p(A_ptr),
+            C.c_void_p(W_ptr),
+            C.c_uint32(strideA),
+            C.c_void_p(Ascale_ptr),
+            C.c_void_p(positions_ptr),
+            C.c_void_p(slot_ptr),
+            C.c_uint32(t_valid),
+            C.c_uint32(call_id),
+            stream,
+        )
+        if rc != OK:
+            raise RuntimeError(f"sm_launch_blk_v3 rc={rc}")
 
     def launch(self, blk, A_ptr: int, W_ptr: int, strideA: int, stream):
         rc = self.lib.sm_launch_blk_v1(

@@ -35,7 +35,36 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 CSRC = os.path.abspath(
     os.path.join(_HERE, "..", "..", "..", "..", "csrc", "gemm_fusion", "sp_qkv")
 )
-SRCS = ("r17", "r18")
+SRCS = ("r17", "r18", "r19")
+LARGE_SRCS = ("r11", "r12")
+R18_FAMILY = (
+    "r18",
+    "r19",
+)  # r19 is derived from r18 (design card r2 D-1 path A): it accepts the r18-only flags
+# kernel ABI generation of a source: 2 = the shipped drivers (poison words, pointers baked in the device block); 3 = R12 (per-launch kernargs, per-comm ERR/STEP page,
+# call_id tags). Plans of abi 3 take `call_id` in run(), carry the global page request and register no per-plan poison hooks.
+SMALL_ABI = {"r17": 2, "r18": 2, "r19": 3}
+LARGE_ABI = {"r11": 2, "r12": 3}
+
+
+def src_abi(kind: str, src: str) -> int:
+    """Kernel ABI generation (2 or 3) of a source; kind = "small" | "large"."""
+    table = SMALL_ABI if kind == "small" else LARGE_ABI
+    if src not in table:
+        raise ValueError(f"{kind} src {src!r} not in {tuple(table)}")
+    return table[src]
+
+
+def _source_sha(kind: str, src: str) -> str:
+    """sha256 of <kind>/<src>/SOURCE_SHA256.txt; a clear BuildError while a source (r19 / r12) has not been delivered yet."""
+    path = os.path.join(CSRC, kind, src, "SOURCE_SHA256.txt")
+    if not os.path.exists(path):
+        raise BuildError(
+            f"{kind} source {src!r} is not present ({path}): the R12 sources (small/r19, large/r12) are delivered by the implementors"
+        )
+    return _sha(path)
+
+
 RECIPES = ("legacy", "aot1", "aot2")
 DEFAULT_RECIPE = "aot1"
 
@@ -104,14 +133,14 @@ def small_defs(params: dict, mode: str) -> tuple[list[str], list[str]]:
         f"-DSM_PUSH_HALVES={int(params.get('push_halves', 0))}",
         "-DSM_NT_STORES=0",
     ]
-    if src == "r18":
+    if src in R18_FAMILY:
         abi += [
             f"-DSM_B_ROWSPLIT={int(params.get('b_rowsplit', 0))}",
             f"-DSM_RX_BYPASS={int(params.get('rx_bypass', 0))}",
             f"-DSM_REUSE_NO_IDX={int(params.get('reuse_no_idx', 0))}",
         ]
     elif any(params.get(k) for k in ("b_rowsplit", "rx_bypass", "reuse_no_idx")):
-        raise ValueError("b_rowsplit/rx_bypass/reuse_no_idx require src=r18")
+        raise ValueError("b_rowsplit/rx_bypass/reuse_no_idx require src=r18 or r19")
     # device-only (Phase-1 build_device.sh defaults P0=1 P1=1 P2=0 STAMPS=0 R1=1 R2=0 R3=1 R4=1 U2=1)
     dev = abi + [
         "-DSM_U2_HOST_PTRS=1",
@@ -138,7 +167,7 @@ def _sha(path: str) -> str:
 
 def cache_key(src: str, dev: list[str], host: list[str], tool: dict[str, str]) -> str:
     h = hashlib.sha256()
-    h.update(_sha(os.path.join(CSRC, "small", src, "SOURCE_SHA256.txt")).encode())
+    h.update(_source_sha("small", src).encode())
     for rel in ("host/sm_fusion_driver.cpp", "host/gf_comm.cpp"):
         h.update(_sha(os.path.join(CSRC, rel)).encode())
     h.update(repr((sorted(dev), sorted(host), sorted(tool.items()))).encode())
@@ -540,10 +569,12 @@ def large_defs(params: dict, mode: str) -> list[str]:
     """
     if mode not in ("dense", "indexer", "reuse"):
         raise ValueError(f"mode {mode!r}")
-    allowed = {"plan", "n", "half_first", "quarter_first", "no_gridread"}
+    allowed = {"plan", "n", "half_first", "quarter_first", "no_gridread", "src"}
     extra = set(params) - allowed
     if extra:
         raise ValueError(f"unknown large-M params {sorted(extra)}")
+    if params.get("src", LARGE_SRC) not in LARGE_SRCS:
+        raise ValueError(f"large src {params.get('src')!r} not in {LARGE_SRCS}")
     ng = int(params.get("no_gridread", 1))
     if ng not in (0, 1, 2):
         raise ValueError("no_gridread")
@@ -572,16 +603,20 @@ def large_defs(params: dict, mode: str) -> list[str]:
     ]
 
 
-def large_cache_key(defs: list[str], tool: dict[str, str]) -> str:
+def large_cache_key(
+    defs: list[str], tool: dict[str, str], src: str | None = None
+) -> str:
     h = hashlib.sha256()
-    h.update(_sha(os.path.join(CSRC, "large", LARGE_SRC, "SOURCE_SHA256.txt")).encode())
+    h.update(_source_sha("large", src or LARGE_SRC).encode())
     h.update(_sha(os.path.join(CSRC, "host", "lg_fusion_driver.cpp")).encode())
     h.update(repr((sorted(defs), sorted(tool.items()))).encode())
     return h.hexdigest()[:20]
 
 
-def large_device_cmd(defs: list[str], tool: dict[str, str], out: str) -> list[str]:
-    ldir = os.path.join(CSRC, "large", LARGE_SRC)
+def large_device_cmd(
+    defs: list[str], tool: dict[str, str], out: str, src: str | None = None
+) -> list[str]:
+    ldir = os.path.join(CSRC, "large", src or LARGE_SRC)
     flags = defs + [
         f"-I{os.path.join(ldir, 'device')}",
         f"-I{os.path.join(ldir, 'interface')}",
@@ -605,8 +640,10 @@ def large_device_cmd(defs: list[str], tool: dict[str, str], out: str) -> list[st
     ]
 
 
-def large_host_cmd(defs: list[str], tool: dict[str, str], out: str) -> list[str]:
-    ldir = os.path.join(CSRC, "large", LARGE_SRC)
+def large_host_cmd(
+    defs: list[str], tool: dict[str, str], out: str, src: str | None = None
+) -> list[str]:
+    ldir = os.path.join(CSRC, "large", src or LARGE_SRC)
     hostdefs = [
         d
         for d in defs
@@ -653,9 +690,11 @@ def large_host_cmd(defs: list[str], tool: dict[str, str], out: str) -> list[str]
     ]
 
 
-def large_device_only_cmd(defs: list[str], tool: dict[str, str], out: str) -> list[str]:
+def large_device_only_cmd(
+    defs: list[str], tool: dict[str, str], out: str, src: str | None = None
+) -> list[str]:
     return device_only_cmd(
-        large_device_cmd(defs, tool, out),
+        large_device_cmd(defs, tool, out, src),
         os.path.join(out, "img", "lg_gemm_quad_fp8_comm.hsaco"),
     )
 
@@ -674,7 +713,8 @@ def build_large(
         return prebuild.build_large(params, mode, tool, recipe)
     tool = tool or toolchain()
     defs = large_defs(params, mode)
-    key = large_cache_key(defs, tool)
+    src = params.get("src", LARGE_SRC)
+    key = large_cache_key(defs, tool, src)
     final = os.path.join(jit_root(), "lg_" + key)
     mk = lambda d, sha="": LargeBuild(
         key,
@@ -691,7 +731,7 @@ def build_large(
     log: list[str] = []
     try:
         os.makedirs(os.path.join(tmp, "img"))
-        _run(large_device_cmd(defs, tool, tmp), log)
+        _run(large_device_cmd(defs, tool, tmp, src), log)
         so = os.path.join(tmp, "img", "lg_gemm_quad_fp8_comm.so")
         _unbundle(
             tool,
@@ -701,7 +741,7 @@ def build_large(
             log,
         )
         sha = _sha(os.path.join(tmp, "img", "lg_gemm_quad_fp8_comm.hsaco"))
-        _run(large_host_cmd(defs, tool, tmp), log)
+        _run(large_host_cmd(defs, tool, tmp, src), log)
         with open(os.path.join(tmp, "build-command.txt"), "w") as f:
             f.write("\n".join(log) + "\n")
         with open(os.path.join(tmp, "BUILD_OK"), "w") as f:

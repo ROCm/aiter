@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """CPU-only tests for sp_qkv small-M integration (S2-2b-ii): profile, flags, JIT command plan, FusionResources."""
 
+import contextlib
 import json
 import logging
 import os
@@ -160,6 +161,11 @@ def test_vendored_sources_match_manifest():
 
     for src in jit.SRCS:
         base = os.path.join(jit.CSRC, "small", src)
+        if not os.path.isdir(
+            base
+        ):  # r19 (R12) is delivered by the implementor after G0-eq; its manifest is checked once it exists
+            assert src == "r19", src
+            continue
         n = 0
         for line in _slurp(os.path.join(base, "SOURCE_SHA256.txt")).splitlines(
             keepends=True
@@ -255,7 +261,12 @@ def test_profile_has_15_rows_and_large_prefix_signatures():
     for (mode, T), (vid, params) in specs.LARGE_CELLS.items():
         sig = specs.sp_qkv_spec(mode).prefix(1).signature()
         r = prof.lookup(sig, "gfx950", 256, 4, T // 4)
-        assert r is not None and r.vid == "sp_qkv.large.v1" and dict(r.params) == params
+        # the large rows select the R12 kernels explicitly (src r12); r11 stays selectable per row for the A/B
+        assert (
+            r is not None
+            and r.vid == "sp_qkv.large.v1"
+            and dict(r.params) == {**params, "src": "r12"}
+        )
     # reuse and dense large rows have different signatures (reuse drops iq/ik in the exchange)
     assert (
         specs.sp_qkv_spec("dense").prefix(1).signature()
@@ -353,7 +364,9 @@ def test_large_variant_contract_and_sizes(monkeypatch):
         "p2p_window",
         "control",
         "sdma_queue",
+        "control",  # R12 (src r12): the per-comm ERR/STEP/DIAG page request (shared tag gf.global)
     ]
+    assert reqs[4].share == "gf.global" and reqs[4].bytes == 4 << 20
     assert (
         all(r.bytes % (4 << 20) == 0 for r in reqs[:3])
         and reqs[0].bytes == reqs[1].bytes == reqs[2].bytes
@@ -847,7 +860,7 @@ def _plan_for(vid_mode, T, large):
         sp = sp.prefix(1)
         return v.variants_large.SpQkvLarge(
             sp,
-            specs.LARGE_CELLS[(vid_mode, T)][1],
+            specs.large_cell_params(vid_mode, T),
             MatchCtx("gfx950", 256, 4, T // 4, caps),
         )
     return v.SpQkvSmall(
@@ -953,14 +966,20 @@ def test_uniform_policy_reproduces_phase1_equal_layout(monkeypatch):
     reqs = _all_plan_requests()
     prof = profmod.load_profile(PROFILE)
     wb = prof.meta["window_budget"]
-    assert (
-        wb["max_windows"]
-        == sum(
-            len([r for r in v if r.kind in ("p2p_window", "control")])
+    n_windows = (
+        sum(
+            len(
+                [
+                    r
+                    for r in v
+                    if r.kind in ("p2p_window", "control") and r.share != "gf.global"
+                ]
+            )
             for v in reqs.values()
         )
-        == 39
+        + 1  # every R12 plan requests the SAME per-comm global page: one window
     )
+    assert wb["max_windows"] == n_windows == 40
     assert wb["window_bytes"] % (4 << 20) == 0 and wb["window_bytes"] == max(
         r.bytes for v in reqs.values() for r in v
     )
@@ -972,18 +991,18 @@ def test_uniform_policy_reproduces_phase1_equal_layout(monkeypatch):
     r = make_res(
         dist=d, backend=be, profile=PROFILE, policy="uniform"
     )  # A-3: arena is the default; uniform stays selectable
-    assert r.window_bytes == wb["window_bytes"] and r.max_windows == 39
+    assert r.window_bytes == wb["window_bytes"] and r.max_windows == 40
     assert (
-        be.heap == heap_bytes_for(wb["window_bytes"], 39)
+        be.heap == heap_bytes_for(wb["window_bytes"], 40)
         and be.heap % (4 << 30) == 0
-        and be.heap >= 39 * wb["window_bytes"] + (256 << 20)
+        and be.heap >= 40 * wb["window_bytes"] + (256 << 20)
     )
     for (
         owner,
         rq,
     ) in reqs.items():  # register ALL 15 plans (the gate02 sequence), in any order
         r.ensure(owner, rq)
-    assert len(be.offsets) == 39 and set(be.sizes) == {
+    assert len(be.offsets) == 40 and set(be.sizes) == {
         wb["window_bytes"]
     }  # every window equal, 4 MiB multiple
     assert all(
@@ -1307,7 +1326,7 @@ def _w_ok(rows=9216, k=6144, shuffled=True):
     return w
 
 
-def _binding_rig(monkeypatch, mode="dense", T=64):
+def _binding_rig(monkeypatch, mode="dense", T=64, src=None):
     """A dense small plan whose _context is a recording stub and whose torch is a counting fake."""
     import types as _t
     from types import SimpleNamespace as NS
@@ -1325,9 +1344,12 @@ def _binding_rig(monkeypatch, mode="dense", T=64):
     fake_torch.float32, fake_torch.float8_e4m3fn, fake_torch.int64 = "f32", "fp8", "i64"
     fake_torch.finfo = lambda dt: NS(max=448.0)
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    cell_params = dict(specs.SMALL_CELLS[(mode, T)][1])
+    if src:  # e.g. "r19": the R12 (abi 3) build of the same cell
+        cell_params["src"] = src
     plan = v.SpQkvSmall(
         specs.sp_qkv_spec(mode),
-        specs.SMALL_CELLS[(mode, T)][1],
+        cell_params,
         MatchCtx("gfx950", 256, 4, T // 4, frozenset({"mori_cco", "gfx950_sc_bypass"})),
     )
     binds = []
@@ -1658,12 +1680,12 @@ def test_fusion_resources_budget_from_explicit_profile_with_env_unset(monkeypatc
         d, be = FakeDist(), FirstFitBackend(0)
         r = make_res(dist=d, backend=be, profile=prof, policy="uniform")
         assert (
-            r.window_bytes == 171966464 == 164 << 20 and r.max_windows == 39
+            r.window_bytes == 171966464 == 164 << 20 and r.max_windows == 40
         )  # the shipped profile's own numbers
         assert r.profile is not None and r.profile.name == "minimax_m3_sp4_gfx950_v1"
         assert be.heap == heap_bytes_for(
-            171966464, 39
-        ) and be.heap >= 39 * 171966464 + (256 << 20)
+            171966464, 40
+        ) and be.heap >= 40 * 171966464 + (256 << 20)
         # the failing ATOM sequence: a 4 MiB small plan first, then a 40 MiB large plan: both fit the 164 MiB uniform window
         r.ensure(
             "small",
@@ -1687,7 +1709,7 @@ def test_profile_name_resolves_without_env(monkeypatch):
     r = make_res(
         dist=FakeDist(), backend=FirstFitBackend(0), profile="minimax_m3_sp4_gfx950_v1"
     )  # a bare name -> configs/gemm_fusion/<name>.json
-    assert r.window_bytes == 171966464 and r.max_windows == 39
+    assert r.window_bytes == 171966464 and r.max_windows == 40
 
 
 def test_env_profile_is_never_read_by_fusion_resources(monkeypatch):
@@ -2176,7 +2198,9 @@ def test_arena_registers_exactly_one_window_and_every_plan_window_is_a_view(
         len(be.regs) == 1 and len(r._regs) == 1
     )  # ONE registration: the only size the comm ever sees
     A = r._arena
-    assert A.bytes == 380 * MiB == r._arena_bytes and r.policy == "arena"
+    assert (
+        A.bytes == 384 * MiB == r._arena_bytes and r.policy == "arena"
+    )  # 380 MiB of plan windows + the 4 MiB R12 global page
     # views: inside the arena, 4 MiB aligned, pairwise disjoint (shared set once), local = arena.local + offset
     seen = {}
     for w in r._views:
@@ -2190,8 +2214,8 @@ def test_arena_registers_exactly_one_window_and_every_plan_window_is_a_view(
     spans = sorted(seen.items())
     assert all(a + n <= b for (a, n), (b, _m) in pairwise(spans))  # disjoint
     assert (
-        sum(seen.values()) == 380 * MiB
-    )  # 12 small + shared S/R/C fill the arena exactly: the budget is exact
+        sum(seen.values()) == 384 * MiB
+    )  # 12 small + shared S/R/C + the global page fill the arena exactly: the budget is exact
     # every large owner got the SAME three views; the view struct reproduces arena + offset for local and peer addressing (stride/lsaRank unchanged)
     large = [o for o, _ in plans if o.startswith("sp_qkv.large/")]
     S0 = r.windows[large[0]][large[0] + "/S"]
@@ -2211,9 +2235,9 @@ def test_arena_registers_exactly_one_window_and_every_plan_window_is_a_view(
     n_views = len(r._views)
     be.log.clear()
     r.release()
-    assert n_views == 15 and len(be.freed) == 16 == len(
+    assert n_views == 16 and len(be.freed) == 17 == len(
         set(be.freed)
-    )  # 15 plan views (12 small + shared S/R/C) + the 1 view-self-test view, each freed exactly once
+    )  # 16 plan views (12 small + shared S/R/C + the global page) + the 1 view-self-test view, each freed exactly once
     assert (
         len([x for x in be.log if x[0] == "dereg"]) == 1 and r._views == []
     )  # the arena is the ONLY deregistered window
@@ -2841,8 +2865,8 @@ def test_A1_view_readback_mismatch_refuses_arena_and_rebuilds_the_comm_as_unifor
             r._arena is None
             and r._views == []
             and len(r._regs) == 15 + 24
-            or len(r._regs) == 39
-        )  # uniform: 39 equal windows (15 plans -> 39 windows)
+            or len(r._regs) == 40
+        )  # uniform: 40 equal windows (15 plans -> 39 windows + the global page)
         assert all(w.bytes == 171966464 for w in r._regs)
         assert any(
             "event=resources arena_refused" in m and "view read-back mismatch" in m
@@ -3009,8 +3033,11 @@ def test_runtime_never_imports_test_utils_and_the_removed_names_are_gone():
         "start_alignment",
     ):
         assert not hasattr(rmod, n), n
-    for n in ("va_info", "set_zero_mode", "peer_ptr"):
+    for n in ("va_info", "set_zero_mode"):
         assert not hasattr(rmod.CcoBackend, n), n
+    assert hasattr(
+        rmod.CcoBackend, "peer_ptr"
+    )  # restored for R12: the peer-ERR table of the global page (ccoGetPeerPtr)
     import inspect
 
     params = inspect.signature(rmod.FusionResources.__init__).parameters
@@ -3033,7 +3060,7 @@ def test_native_comm_has_no_memset_peer_ptr_or_va_info_entry_points():
     assert (
         "hipMemset(" not in gf
         and "gf_comm_va_info_v1" not in gf
-        and "gf_peer_ptr_v1" not in gf
+        and "int32_t gf_peer_ptr_v1(" in gf  # restored for R12 (peer-ERR table)
     )
     assert (
         "int32_t gf_zero_v1(int32_t device, void* local, uint64_t bytes)" in gf
@@ -3046,6 +3073,7 @@ def test_native_comm_has_no_memset_peer_ptr_or_va_info_entry_points():
         "gf_mem_info_v1",
         "gf_win_view_v1",
         "gf_win_free_v1",
+        "gf_peer_ptr_v1",
     ):
         assert f"int32_t {kept}(" in gf, kept
 
@@ -3121,7 +3149,7 @@ def test_init_images_written_before_finalize_survive_the_deferred_zeroing(monkey
     assert ev == ["init", "init", "init"]
 
 
-def test_policy_memory_log_lists_both_policies_and_the_arena_is_the_380_mib_budget(
+def test_policy_memory_log_lists_both_policies_and_the_arena_is_the_384_mib_budget(
     monkeypatch,
 ):
     for var in (
@@ -3140,10 +3168,10 @@ def test_policy_memory_log_lists_both_policies_and_the_arena_is_the_380_mib_budg
     assert (
         pm
         and "selected=arena" in pm[0]
-        and "uniform=6396MiB" in pm[0]
-        and "arena=380MiB" in pm[0]
+        and "uniform=6560MiB" in pm[0]
+        and "arena=384MiB" in pm[0]
     )
-    assert r._arena_size_from_budget() == 380 * MiB and r._vmm == 4 << 30
+    assert r._arena_size_from_budget() == 384 * MiB and r._vmm == 4 << 30
 
 
 # ---- test_utils: the aliasing assertion (C-S4) as free functions over a FusionResources
@@ -3266,9 +3294,9 @@ def test_test_utils_arena_probe_registers_once_checks_views_and_uses_rank_as_dev
     assert B.devs == [(0, 0), (1, 1), (2, 2), (3, 3)]  # HIP device = rank, NOT 0
     out = capsys.readouterr().out
     assert (
-        out.count("registrations=1 views=15") == 4
+        out.count("registrations=1 views=16") == 4
         and "result=FAIL" not in out
-        and out.count("view_winBase_ok=1") == 60
+        and out.count("view_winBase_ok=1") == 64
     )
     B.devs.clear()
     tu.run_arena(4 << 30, 2, 4, FakeDist(), B(), "x", device=5)
@@ -3402,9 +3430,21 @@ def test_every_ctypes_binding_exists_in_the_native_exports_and_none_is_dead():
     }  # the extraction really found them
     py, other = _runtime_sources()
     missing, dead = _check_bindings(py, exports)
+    # R12 entry points bound against the card ABI whose native side is not delivered yet (small/r19 + its driver wrapper). Bound ONLY for abi 3 sources, so the shipped
+    # abi 2 path never touches them. Drop each name from this list the moment its driver exports it: the assertion below fails if a pending name is already exported.
+    pending = {"sm_attach_v3", "sm_launch_blk_v3"}
+    exported = set().union(*exports.values())
+    assert not (
+        pending & exported
+    ), f"now exported, remove from the pending list: {sorted(pending & exported)}"
+    missing = {
+        f: [n for n in names if n not in pending] for f, names in missing.items()
+    }
+    missing = {f: names for f, names in missing.items() if names}
     assert (
         not missing
     ), f"ctypes bindings with no native export (a fake backend would hide this: AttributeError undefined symbol at load): {missing}"
+    dead = [n for n in dead if n not in pending]
     # a bound name counts as used when ANY runtime module calls it (the attach/window_bytes entries are called from variants*.py)
     _b, called_elsewhere = _py_bound_and_called(other)
     dead = [n for n in dead if n not in called_elsewhere]
@@ -3470,15 +3510,16 @@ def test_binding_checker_flags_a_missing_native_and_a_dead_binding_negative_cont
 
 
 # ======================================================================= task-264: plan.prepare/run input contract (inputs.py)
-def _small_ready(monkeypatch, mode="dense", T=64):
+def _small_ready(monkeypatch, mode="dense", T=64, src=None):
     """The binding rig plus a recording launch stub: returns (plan, st, meta, outs, res, launches, binds)."""
     from types import SimpleNamespace as NS
 
-    plan, st, meta, outs, res, binds, _z = _binding_rig(monkeypatch, mode, T)
+    plan, st, meta, outs, res, binds, _z = _binding_rig(monkeypatch, mode, T, src)
     launches = []
     plan._context = lambda r: NS(
         bind=lambda sb: binds.append(sb) or object(),
         launch=lambda *a: launches.append(a),
+        launch_v3=lambda *a: launches.append(("v3",) + a),
     )
     sys.modules["torch"].cuda = NS(is_current_stream_capturing=lambda: False)
     monkeypatch.setattr(
@@ -3771,7 +3812,10 @@ def _large_ready(monkeypatch, mode="dense", T=8192):
     plan = _plan_for(mode, T, True)
     M = T // 4
     launches = []
-    plan._context = lambda r: NS(launch=lambda *a, **k: launches.append(a))
+    plan._context = lambda r: NS(
+        launch=lambda *a, **k: launches.append(a),
+        launch_v3=lambda *a, **k: launches.append(a),
+    )
     monkeypatch.setattr(
         "aiter.ops.gemm_fusion.sp_qkv.small_rt.stream_handle", lambda s: "S"
     )
@@ -3792,6 +3836,7 @@ def _run_large(plan, st, res, **over):
         "w": st["w"],
         "w_scale": st["ws"],
         "res": res,
+        "call_id": 7,  # the profile's large plans are R12 (abi 3): call_id is required
     }
     kw.update(over)
     return plan.run(**kw)
@@ -3968,3 +4013,804 @@ def test_inputs_small_accepts_pad_rows_staged_as_T_long_arrays_and_never_reads_v
         assert (
             "a.index_slot_mapping[t]" in text and "(live ? a.positions[t] : 0)" in text
         )
+
+
+# ======================================================================= A1: R12 plumbing (jit/ABI tables, runtimes, abi 3 plans, profile, prebuild)
+def test_jit_abi_tables_sources_and_missing_source_error():
+    assert jit.SRCS == ("r17", "r18", "r19") and jit.LARGE_SRCS == ("r11", "r12")
+    assert [jit.src_abi("small", s) for s in jit.SRCS] == [2, 2, 3] and [
+        jit.src_abi("large", s) for s in jit.LARGE_SRCS
+    ] == [2, 3]
+    with pytest.raises(ValueError, match="not in"):
+        jit.src_abi("small", "r20")
+    # r19 is derived from r18: it accepts the r18-only flags; r17 still rejects them
+    _d, h = jit.small_defs({"src": "r19", "b_rowsplit": 1, "rx_bypass": 1}, "dense")
+    assert "-DSM_B_ROWSPLIT=1" in h and "-DSM_RX_BYPASS=1" in h
+    with pytest.raises(ValueError, match="require src=r18 or r19"):
+        jit.small_defs({"src": "r17", "b_rowsplit": 1}, "dense")
+    with pytest.raises(ValueError, match="src"):
+        jit.small_defs({"src": "r20"}, "dense")
+    # large: src is a parameter (default r11 for old profiles) and is validated
+    assert jit.large_defs({"src": "r12", "n": 2}, "dense") == jit.large_defs(
+        {"src": "r11", "n": 2}, "dense"
+    )  # same -D set: the source dir differs, not the flags
+    with pytest.raises(ValueError, match="large src 'r13'"):
+        jit.large_defs({"src": "r13"}, "dense")
+    tool = dict(TOOL_SIM)
+    # the r19 sources are delivered by the implementor later: a clear error, not a FileNotFoundError
+    dev, host = jit.small_defs({"src": "r19"}, "dense")
+    if not os.path.isdir(os.path.join(jit.CSRC, "small", "r19")):
+        with pytest.raises(jit.BuildError, match="small source 'r19' is not present"):
+            jit.cache_key("r19", dev, host, tool)
+    # large r12 IS delivered: its key differs from r11's and its commands point into large/r12
+    defs = jit.large_defs({"src": "r12"}, "dense")
+    k11, k12 = jit.large_cache_key(defs, tool, "r11"), jit.large_cache_key(
+        defs, tool, "r12"
+    )
+    assert k11 != k12 and k11 == jit.large_cache_key(
+        defs, tool
+    )  # the default stays r11
+    fwd = lambda cmd: [a.replace("\\", "/") for a in cmd]
+    out = fwd(jit.large_device_cmd(defs, tool, "/out", "r12"))
+    assert any("/large/r12/device" in a for a in out) and any(
+        a.endswith("large/r12/device/gemm_quad_fp8_comm.cu") for a in out
+    )
+    assert any(
+        "/large/r11/device" in a for a in fwd(jit.large_device_cmd(defs, tool, "/out"))
+    )
+    assert any(
+        "/large/r12/host" in a
+        for a in fwd(jit.large_host_cmd(defs, tool, "/out", "r12"))
+    )
+    assert any(
+        "/large/r12/device" in a
+        for a in fwd(jit.large_device_only_cmd(defs, tool, "/out", "r12"))
+    )
+
+
+TOOL_SIM = {
+    "hipcc": "/rocm/bin/hipcc",
+    "clangxx": "/rocm/llvm/bin/clang++",
+    "bundler": "/rocm/llvm/bin/clang-offload-bundler",
+    "rocm": "/rocm",
+    "mori_root": "/mori",
+    "mori_so": "/mori/libmori_cco.so",
+}
+
+
+def test_small_cache_key_of_an_r19_source_follows_its_manifest(monkeypatch):
+    import shutil
+    import tempfile
+    import uuid
+
+    root = os.path.join(tempfile.gettempdir(), "csrc_" + uuid.uuid4().hex)
+    os.makedirs(os.path.join(root, "small", "r19"))
+    os.makedirs(os.path.join(root, "host"))
+    for f in ("sm_fusion_driver.cpp", "gf_comm.cpp"):
+        _spit(os.path.join(root, "host", f), "x")
+    _spit(
+        os.path.join(root, "small", "r19", "SOURCE_SHA256.txt"),
+        "aa  device/ran_kernel.cu\n",
+    )
+    try:
+        monkeypatch.setattr(jit, "CSRC", root)
+        dev, host = jit.small_defs({"src": "r19"}, "dense")
+        k1 = jit.cache_key("r19", dev, host, TOOL_SIM)
+        _spit(
+            os.path.join(root, "small", "r19", "SOURCE_SHA256.txt"),
+            "bb  device/ran_kernel.cu\n",
+        )
+        k2 = jit.cache_key("r19", dev, host, TOOL_SIM)
+        assert len(k1) == 20 and k1 != k2  # a new r19 manifest is a new build
+        assert jit.recipe_key(k1, "aot1") != k1
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+class _FakeCDLL:
+    """A ctypes library stand-in: any attribute is a function object that takes restype / argtypes and records its calls."""
+
+    def __init__(self, exports=None):
+        self.exports = exports
+        self.calls = []
+        self._fn = {}
+        self.returns = {}
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        if self.exports is not None and name not in self.exports:
+            raise AttributeError(name)
+        f = self._fn.get(name)
+        if f is None:
+            f = self._fn[name] = types.SimpleNamespace(restype=None, argtypes=None)
+            real = f
+
+            class _Callable(types.SimpleNamespace):
+                pass
+
+            def call(*a, _n=name):
+                self.calls.append((_n, a))
+                return self.returns.get(_n, 0)
+
+            self._fn[name] = _CallableFn(real, call)
+        return self._fn[name]
+
+
+class _CallableFn:
+    def __init__(self, ns, call):
+        self.__dict__["_ns"], self.__dict__["_call"] = ns, call
+
+    def __setattr__(self, k, v):
+        setattr(self._ns, k, v)
+
+    def __getattr__(self, k):
+        return getattr(self._ns, k)
+
+    def __call__(self, *a):
+        return self._call(*a)
+
+
+def test_small_rt_v3_struct_layout_loader_and_launch_argument_order(monkeypatch):
+    import ctypes as C
+
+    from aiter.ops.gemm_fusion.sp_qkv import small_rt as srt
+
+    S = srt.SmRanArgsV3
+    assert C.sizeof(S) == srt.SM_RAN_ARGS_V3_BYTES == 64
+    off = {n: getattr(S, n).offset for n, _t in S._fields_}
+    assert off == {
+        "blk": 0,
+        "Ascale": 8,
+        "positions": 16,
+        "slot_mapping": 24,
+        "err": 32,
+        "step": 40,
+        "M": 48,
+        "rank": 52,
+        "t_valid": 56,
+        "call_id": 60,
+    }
+    fake3 = _FakeCDLL()
+    monkeypatch.setattr(srt.C, "CDLL", lambda path: fake3)
+    srt.load_driver("x.so", abi=3)
+    bound = {n for n, f in fake3._fn.items() if f.argtypes is not None}
+    assert {
+        "sm_attach_v3",
+        "sm_launch_blk_v3",
+        "sm_bind_new_v1",
+        "sm_blk_free_v1",
+        "sm_free_v1",
+        "sm_info_v1",
+    } == bound  # no per-plan poison entry
+    assert (
+        len(fake3.sm_attach_v3.argtypes) == 11
+        and len(fake3.sm_launch_blk_v3.argtypes) == 11
+    )
+    fake2 = _FakeCDLL()
+    monkeypatch.setattr(srt.C, "CDLL", lambda path: fake2)
+    srt.load_driver("x.so")
+    assert (
+        "sm_attach_v1" in fake2._fn
+        and "sm_poison_fast_v1" in fake2._fn
+        and "sm_attach_v3" not in fake2._fn
+    )  # abi 2 unchanged
+    ctx = srt.SmallContext(fake3, 0xC7)
+    ctx.launch_v3("blk", 0xA, 0xB, 6144, 0xE, 0xF, 0x10, 61, 777, "stream")
+    name, a = fake3.calls[-1]
+    assert (
+        name == "sm_launch_blk_v3"
+        and a[0] == 0xC7
+        and a[1] == "blk"
+        and [x.value for x in a[2:9]] == [0xA, 0xB, 6144, 0xE, 0xF, 0x10, 61]
+        and a[9].value == 777
+        and a[10] == "stream"
+    )
+    fake3.returns = {"sm_launch_blk_v3": -5}
+    with pytest.raises(RuntimeError, match="sm_launch_blk_v3 rc=-5"):
+        ctx.launch_v3("blk", 1, 2, 3, 4, 5, 6, 7, 8, "s")
+
+
+def test_large_rt_r12_loader_abi_check_and_launch(monkeypatch):
+    import ctypes as C
+
+    from aiter.ops.gemm_fusion.sp_qkv import large_rt as lrt
+
+    assert (
+        lrt.LG_COMM_ARGS_V3_BYTES,
+        lrt.LG_COMM_ABI_VERSION_V3,
+        lrt.LG_GF_PEERS_BYTES,
+    ) == (352, 4, 32)
+    fake = _FakeCDLL()
+    monkeypatch.setattr(lrt.C, "CDLL", lambda path: fake)
+    lrt.load_driver("x.so", abi=3)
+    bound = {n for n, f in fake._fn.items() if f.argtypes is not None}
+    assert {
+        "lg_gpage_attach_v1",
+        "lg_launch_v2",
+        "lg_abi_info_v1",
+        "lg_attach_v1",
+        "lg_report_v1",
+        "lg_drain_v1",
+        "lg_init_control_v1",
+    } <= bound
+    assert not ({"lg_launch_v1", "lg_poison_v1"} & bound)  # compiled out for ABI >= 4
+    assert (
+        len(fake.lg_launch_v2.argtypes) == 12
+        and len(fake.lg_gpage_attach_v1.argtypes) == 4
+    )
+    # abi_info + the static check
+    good = (4, 352, 0, 8, 64, 3072, 3104, 32)
+
+    def fill(b, vals):
+        for i, v in enumerate(vals):
+            b[i] = v
+        return 0
+
+    class Lib:
+        def __init__(self, vals):
+            self.vals = vals
+
+        def lg_abi_info_v1(self, b):
+            return fill(b, self.vals)
+
+    got = lrt.abi_info(Lib(good))
+    assert got == {
+        "abi": 4,
+        "args_bytes": 352,
+        "err_off": 0,
+        "step_off": 8,
+        "diag_off": 64,
+        "ctag_off": 3072,
+        "atag_off": 3104,
+        "peers_bytes": 32,
+    }
+    lrt.check_abi_info(got)
+    for field, bad in (
+        ("abi", 3),
+        ("args_bytes", 344),
+        ("err_off", 4),
+        ("diag_off", 128),
+        ("peers_bytes", 16),
+    ):
+        with pytest.raises(RuntimeError, match=rf"ABI mismatch.*'{field}': \({bad}"):
+            lrt.check_abi_info({**got, field: bad})
+    # launch_v3 / gpage_attach
+    ctx = lrt.LargeContext(fake, C.c_void_p(0x11), 2048, 2304, 0)
+    ctx.budget_us = 5_000_000
+    ctx.launch_v3(0xA, 0xB, 0xC, 0xD, 6144, 3, 2, 12345, "stream")
+    name, a = fake.calls[-1]
+    assert (
+        name == "lg_launch_v2"
+        and a[-1] == "stream"
+        and a[-2] == 12345
+        and a[-3] == 2
+        and a[-4] == 3
+        and a[7] == 5_000_000
+    )
+    for bad in (-1, 1 << 31):
+        with pytest.raises(ValueError, match="call_id"):
+            ctx.launch_v3(1, 2, 3, 4, 5, 1, 0, bad, "s")
+    ctx.gpage_attach(0x7000, 0x7008, 0x9000)
+    n2, a2 = fake.calls[-1]
+    assert n2 == "lg_gpage_attach_v1" and [x.value for x in a2[1:]] == [
+        0x7000,
+        0x7008,
+        0x9000,
+    ]
+    ctx.gpage_attach(
+        0x7000, 0x7008, None
+    )  # no peers table: no propagation, still attaches
+    assert fake.calls[-1][1][3].value in (0, None)
+    fake.returns = {"lg_launch_v2": -104}
+    with pytest.raises(RuntimeError, match="lg_launch_v2 rc=-104"):
+        ctx.launch_v3(1, 2, 3, 4, 5, 1, 0, 5, "s")
+    assert not hasattr(
+        ctx, "nan_fill"
+    )  # lg_launch_v2 launches the NaN-fill node itself: the runtime must not add its own
+
+
+def test_inputs_v3_token_arrays_call_id_and_short_arrays_are_legal(monkeypatch):
+    from aiter.gemm_fusion import ContractError
+
+    _plan, _st, _meta, outs, _res, _launches, _binds = _small_ready(
+        monkeypatch, src="r19"
+    )
+    from aiter.ops.gemm_fusion.sp_qkv import inputs
+
+    T = 64
+    ok = _T((T,), (1,), "i64")
+    assert (
+        inputs.check_token_arrays_v3("o", T=T, positions=ok, slot_mapping=ok, outs=outs)
+        == T
+    )
+    # SHORT arrays are legal for R12: t_valid is the shortest of the two (and at most T)
+    assert (
+        inputs.check_token_arrays_v3(
+            "o",
+            T=T,
+            positions=_T((61,), (1,), "i64"),
+            slot_mapping=_T((64,), (1,), "i64"),
+            outs=outs,
+        )
+        == 61
+    )
+    assert (
+        inputs.check_token_arrays_v3(
+            "o",
+            T=T,
+            positions=_T((64,), (1,), "i64"),
+            slot_mapping=_T((10,), (1,), "i64"),
+            outs=outs,
+        )
+        == 10
+    )
+    assert (
+        inputs.check_token_arrays_v3(
+            "o",
+            T=T,
+            positions=_T((200,), (1,), "i64"),
+            slot_mapping=_T((200,), (1,), "i64"),
+            outs=outs,
+        )
+        == T
+    )  # a longer buffer: only T are read
+    for bad, match in (
+        (_T((64,), (1,), "i32"), r"dtype i32 is not int64"),
+        (_T((64,), (2,), "i64"), r"must be contiguous"),
+        (_T((0,), (1,), "i64"), r"is empty"),
+    ):
+        with pytest.raises(ContractError, match=match):
+            inputs.check_token_arrays_v3(
+                "o", T=T, positions=bad, slot_mapping=ok, outs=outs
+            )
+    with pytest.raises(ContractError, match="output 'q' has 60 rows"):
+        inputs.check_token_arrays_v3(
+            "o", T=T, positions=ok, slot_mapping=ok, outs={"q": _T((60, 16, 128))}
+        )
+    assert (
+        inputs.check_call_id("o", 1) == 1
+        and inputs.check_call_id("o", (1 << 31) - 1) == (1 << 31) - 1
+    )
+    for bad in (0, -3, 1 << 31, True, 1.5, "7", None):
+        with pytest.raises(
+            ContractError, match=r"call_id must be an int in \[1, 2\^31\)"
+        ):
+            inputs.check_call_id("o", bad)
+
+
+def test_small_abi3_plan_binding_key_run_kernargs_and_pad_rows(monkeypatch):
+    from aiter.gemm_fusion import ContractError
+
+    plan, st, meta, outs, res, launches, binds = _small_ready(monkeypatch, src="r19")
+    T = 64
+    assert plan.abi == 3 and plan.src == "r19"
+    reqs = plan.resources()
+    assert (
+        [r.name.rsplit("/", 1)[-1] for r in reqs] == ["rx", "ctl", "gpage"]
+        and reqs[2].share == "gf.global"
+        and reqs[2].bytes == 4 << 20
+    )
+    # (a) run() needs call_id; it is validated before anything is bound or launched
+    for bad in (None, 0, 1 << 31, True):
+        with pytest.raises(ContractError, match="call_id"):
+            (
+                _run_small(plan, st, meta, outs, res, call_id=bad)
+                if bad is not None
+                else _run_small(plan, st, meta, outs, res)
+            )
+    assert launches == [] and binds == []
+    # (b) pad rows: T-long arrays whose values are never read (position 0 / slot -1 live inside the kernel), kernargs carry the pointers + t_valid + call_id
+    pos, slot = _NoRead((T,), (1,), "i64"), _NoRead((T,), (1,), "i64")
+    m2 = {**meta, "positions": pos, "slot_mapping": slot}
+    _run_small(plan, st, m2, outs, res, call_id=4242)
+    (
+        tag,
+        _blk,
+        a_ptr,
+        w_ptr,
+        stride_a,
+        xs_ptr,
+        pos_ptr,
+        slot_ptr,
+        t_valid,
+        call_id,
+        stream,
+    ) = launches[-1]
+    assert (
+        tag == "v3"
+        and (a_ptr, w_ptr, stride_a) == (st["x"].ptr, st["w"].ptr, 6144)
+        and (xs_ptr, pos_ptr, slot_ptr) == (st["xs"].ptr, pos.ptr, slot.ptr)
+    )
+    assert (t_valid, call_id, stream) == (T, 4242, "S")
+    # (c) short arrays (positions carries the real token count): legal, t_valid says how many rows are real
+    _run_small(
+        plan, st, {**meta, "positions": _T((61,), (1,), "i64")}, outs, res, call_id=4242
+    )
+    assert launches[-1][8] == 61
+    # (d) the binding no longer contains x_scale / positions / slot_mapping: fresh tensors every call never create a binding (abi 2 does)
+    assert len(binds) >= 1
+    n = len(binds)
+    for _ in range(3):
+        _run_small(
+            plan,
+            {**st, "xs": _T((16, 1), (1, 1))},
+            {
+                **meta,
+                "positions": _T((T,), (1,), "i64"),
+                "slot_mapping": _T((T,), (1,), "i64"),
+            },
+            outs,
+            res,
+            call_id=9,
+        )
+    assert len(binds) == n  # no new binding
+    sb = binds[0]
+    assert (
+        not sb.Ascale
+        and not sb.positions
+        and not sb.slot_mapping
+        and not sb.index_slot_mapping
+        and sb.Wscale == st["ws"].ptr
+    )  # w_scale stays baked; the rest are kernargs
+    plan2, st2, meta2, outs2, res2, launches2, binds2 = _small_ready(
+        monkeypatch, src=None
+    )  # control: the shipped abi-2 plan keeps the pointers in the binding
+    assert plan2.abi == 2
+    _run_small(plan2, st2, meta2, outs2, res2)
+    _run_small(plan2, {**st2, "xs": _T((16, 1), (1, 1))}, meta2, outs2, res2)
+    assert len(binds2) == 2 and launches2[-1][0] != "v3"
+    # (e) no per-plan poison for R12 plans
+    with pytest.raises(RuntimeError, match="no per-plan poison word"):
+        plan.poison(res)
+    assert not hasattr(plan2, "never") and plan2.poison  # abi 2 keeps its method
+
+
+class _FakeRes:
+    """Just enough of FusionResources for a plan's _context()."""
+
+    def __init__(self, wins):
+        self.rank, self.comm, self.devcomm, self.device = 1, 0xC0, 0xD0, 3
+        self.finalized, self.sdma_queues, self.windows = True, 1, {}
+        self.wins, self.calls = wins, []
+        self.wait_budget_us, self.wait_budget_source = 5_000_000, "default"
+
+    def ensure(self, owner, reqs):
+        self.calls.append(("ensure", owner, [r.name for r in reqs]))
+        self.windows[owner] = self.wins
+        return self.wins
+
+    def global_page(self):
+        return types.SimpleNamespace(local=0x7000, err_addr=0x7000, step_addr=0x7008)
+
+    def global_peers(self):
+        return types.SimpleNamespace(data_ptr=lambda: 0x9000)
+
+    def __getattr__(self, name):
+        if name.startswith("set_"):
+            return lambda *a, **k: (self.calls.append((name, a, k)), True)[1]
+        raise AttributeError(name)
+
+
+def test_small_abi3_context_attaches_with_the_page_and_registers_no_poison_hook(
+    monkeypatch,
+):
+    plan, *_ = _binding_rig(monkeypatch, src="r19")
+    del plan._context  # the rig stubbed it: use the real one against fakes
+    v = sys.modules["aiter.ops.gemm_fusion.sp_qkv.variants"]
+    from aiter.ops.gemm_fusion.sp_qkv import small_rt as srt
+
+    exp = v.small_window_bytes(plan.mode)
+    lib = _FakeCDLL()
+    monkeypatch.setattr(
+        v,
+        "build_small",
+        lambda params, mode: types.SimpleNamespace(
+            driver_so="d.so", gemm_hsaco="g.hsaco", ran_hsaco="r.hsaco"
+        ),
+    )
+    seen = {}
+    monkeypatch.setattr(
+        srt, "load_driver", lambda path, abi=2: (seen.update(abi=abi), lib)[1]
+    )
+    monkeypatch.setattr(
+        srt, "info", lambda lib_: {"rx_bytes": exp["rx"], "ctl_bytes": exp["ctl"]}
+    )
+    wins = {
+        plan.owner + "/rx": types.SimpleNamespace(handle=1, local=0x100),
+        plan.owner + "/ctl": types.SimpleNamespace(handle=2, local=0x200),
+    }
+    res = _FakeRes(wins)
+    plan._context(res)
+    assert seen["abi"] == 3
+    name, a = lib.calls[-1]
+    assert name == "sm_attach_v3"
+    assert (
+        a[0] == 1 and a[1] == 0xC0 and a[2:6] == (1, 0x100, 2, 0x200)
+    )  # rank, comm, rx handle/local, ctl handle/local
+    assert (
+        a[6].value == 0x7000 and a[7].value == 0x9000
+    )  # the global page's local address, the device-resident peers table
+    assert [c[0] for c in res.calls if c[0].startswith("set_")] == [
+        "set_close"
+    ]  # NO set_poison: the error is the per-comm ERR word
+    # control: the shipped abi-2 plan still attaches with v1 and registers its poison hook
+    plan2, *_ = _binding_rig(
+        monkeypatch, src=None
+    )  # re-imports the variant module: patch THIS one
+    del plan2._context
+    v2 = sys.modules["aiter.ops.gemm_fusion.sp_qkv.variants"]
+    monkeypatch.setattr(
+        v2,
+        "build_small",
+        lambda params, mode: types.SimpleNamespace(
+            driver_so="d.so", gemm_hsaco="g.hsaco", ran_hsaco="r.hsaco"
+        ),
+    )
+    lib2 = _FakeCDLL()
+    seen2 = {}
+    monkeypatch.setattr(
+        srt, "load_driver", lambda path, abi=2: (seen2.update(abi=abi), lib2)[1]
+    )
+    res2 = _FakeRes(
+        {
+            plan2.owner + "/rx": types.SimpleNamespace(handle=1, local=0x100),
+            plan2.owner + "/ctl": types.SimpleNamespace(handle=2, local=0x200),
+        }
+    )
+    plan2._context(res2)
+    assert (
+        seen2["abi"] == 2
+        and lib2.calls[-1][0] == "sm_attach_v1"
+        and [c[0] for c in res2.calls if c[0].startswith("set_")]
+        == ["set_close", "set_poison"]
+    )
+
+
+def _forget_sp_modules():
+    """Drop the variant modules (sys.modules AND the package attributes: `from . import x` checks those first) so the next import re-registers them."""
+    pkg = sys.modules.get("aiter.ops.gemm_fusion.sp_qkv")
+    for n in ("variants", "variants_large"):
+        sys.modules.pop(f"aiter.ops.gemm_fusion.sp_qkv.{n}", None)
+        if pkg is not None and hasattr(pkg, n):
+            delattr(pkg, n)
+
+
+def _large_ctx_fixture(monkeypatch, src, shared=True):
+    """A large plan whose real _context runs against fakes (driver library, build, windows, resources)."""
+    from aiter.gemm_fusion import catalog
+    from aiter.gemm_fusion.match import MatchCtx as MC
+
+    monkeypatch.setattr(catalog, "_CATALOG", {})
+    _forget_sp_modules()
+    import aiter.ops.gemm_fusion.sp_qkv.variants_large as vl
+    from aiter.ops.gemm_fusion.sp_qkv import large_rt as lrt
+
+    params = {**specs.LARGE_CELLS[("dense", 16384)][1], "src": src}
+    plan = vl.SpQkvLarge(
+        specs.sp_qkv_spec("dense").prefix(1),
+        params,
+        MC("gfx950", 256, 4, 4096, frozenset({"mori_cco", "sdma"})),
+    )
+
+    class Lib(_FakeCDLL):
+        def __getattr__(self, name):
+            f = super().__getattr__(name)
+            return f
+
+    lib = Lib()
+    expect = {
+        "lg_window_bytes_v1": vl.large_window_bytes("dense", 4096),
+        "lg_attach_v1": 0x55,
+        "lg_comm_R_ptr": 0x1000,
+    }
+
+    def info_call(b):
+        for i, v in enumerate((plan.F, plan.n, 0, 0, 0, 0)[:6]):
+            b[i] = v
+        return 0
+
+    def abi_call(b):
+        for i, v in enumerate((4, 352, 0, 8, 64, 3072, 3104, 32)):
+            b[i] = v
+        return 0
+
+    real_getattr = Lib.__getattr__
+
+    def getattr_(self, name):
+        f = real_getattr(self, name)
+        if name == "lg_info_v1":
+            return _CallableFn(
+                types.SimpleNamespace(),
+                lambda b: (self.calls.append((name, ())), info_call(b))[1],
+            )
+        if name == "lg_abi_info_v1":
+            return _CallableFn(
+                types.SimpleNamespace(),
+                lambda b: (self.calls.append((name, ())), abi_call(b))[1],
+            )
+        if name in expect:
+            return _CallableFn(
+                types.SimpleNamespace(),
+                lambda *a, _n=name: (self.calls.append((_n, a)), expect[_n])[1],
+            )
+        return f
+
+    Lib.__getattr__ = getattr_
+    monkeypatch.setattr(
+        vl,
+        "build_large",
+        lambda p, m: types.SimpleNamespace(
+            hsaco="h.hsaco", hsaco_sha256="s" * 64, driver_so="d.so"
+        ),
+    )
+    monkeypatch.setattr(vl, "_sha", lambda path: "s" * 64)
+    monkeypatch.setattr(vl, "preflight_attach", lambda *a, **k: None)
+    seen = {}
+    monkeypatch.setattr(
+        lrt, "load_driver", lambda path, abi=2: (seen.update(abi=abi), lib)[1]
+    )
+    W = lambda h, loc, **kw: types.SimpleNamespace(handle=h, local=loc, **kw)
+    wins = {
+        plan.owner + "/S": W(1, 0x10),
+        plan.owner + "/R": W(2, 0x20),
+        plan.owner + "/C": W(3, 0x30, shared=shared),
+    }
+    return plan, vl, lib, _FakeRes(wins), seen
+
+
+def test_large_r12_context_attaches_the_page_checks_the_abi_and_registers_no_poison(
+    monkeypatch,
+):
+    plan, _vl, lib, res, seen = _large_ctx_fixture(monkeypatch, "r12")
+    assert plan.abi == 3 and [r.name.rsplit("/", 1)[-1] for r in plan.resources()] == [
+        "S",
+        "R",
+        "C",
+        "q",
+        "gpage",
+    ]
+    plan._context(res)
+    assert seen["abi"] == 3
+    names = [c[0] for c in lib.calls]
+    assert (
+        names.index("lg_abi_info_v1")
+        < names.index("lg_attach_v1")
+        < names.index("lg_gpage_attach_v1")
+    )  # ABI check, attach, then the page
+    gp = next(c for c in lib.calls if c[0] == "lg_gpage_attach_v1")
+    assert [x.value for x in gp[1][1:]] == [
+        0x7000,
+        0x7008,
+        0x9000,
+    ]  # err, step, the peers table
+    hooks = [c[0] for c in res.calls if c[0].startswith("set_")]
+    assert (
+        "set_poison" not in hooks
+        and "set_report_hook" in hooks
+        and "set_drain" in hooks
+        or "set_shared_hooks" in hooks
+    )
+    sh = next(c for c in res.calls if c[0] == "set_shared_hooks")
+    assert sh[2]["poison"] is None  # the shared control block registers init/drain only
+    # r11 selectable for the A/B: no page, the poison reader is registered
+    plan11, _vl11, lib11, res11, seen11 = _large_ctx_fixture(monkeypatch, "r11")
+    assert plan11.abi == 2 and [
+        r.name.rsplit("/", 1)[-1] for r in plan11.resources()
+    ] == ["S", "R", "C", "q"]
+    plan11._context(res11)
+    assert seen11["abi"] == 2 and not any(
+        c[0] in ("lg_abi_info_v1", "lg_gpage_attach_v1") for c in lib11.calls
+    )
+    sh11 = next(c for c in res11.calls if c[0] == "set_shared_hooks")
+    assert sh11[2]["poison"] is not None
+
+
+def test_large_r12_abi_mismatch_is_reported_before_attach(monkeypatch):
+    plan, _vl, lib, res, _seen = _large_ctx_fixture(monkeypatch, "r12")
+    from aiter.ops.gemm_fusion.sp_qkv import large_rt as lrt
+
+    monkeypatch.setattr(
+        lrt,
+        "abi_info",
+        lambda lib_: {
+            "abi": 3,
+            "args_bytes": 352,
+            "err_off": 0,
+            "step_off": 8,
+            "diag_off": 64,
+            "ctag_off": 3072,
+            "atag_off": 3104,
+            "peers_bytes": 32,
+        },
+    )
+    with pytest.raises(
+        RuntimeError, match=r"large driver ABI mismatch.*'abi': \(3, 4\)"
+    ):
+        plan._context(res)
+    assert not any(c[0] in ("lg_attach_v1", "lg_gpage_attach_v1") for c in lib.calls)
+
+
+def test_large_r12_run_needs_call_id_and_calls_launch_v3_r11_ignores_it(monkeypatch):
+    from aiter.gemm_fusion import ContractError
+
+    plan, st, res, launches = _large_ready(
+        monkeypatch
+    )  # the profile's large cells: src r12
+    assert plan.abi == 3
+    with pytest.raises(ContractError, match="needs run\\(call_id=...\\)"):
+        plan.run(x=st["x"], x_scale=st["xs"], w=st["w"], w_scale=st["ws"], res=res)
+    assert launches == []
+    _run_large(plan, st, res, call_id=31337)
+    assert (
+        launches[-1][-2] == 31337 and len(launches) == 1
+    )  # (…, half_first, call_id, stream)
+    with pytest.raises(RuntimeError, match="no per-plan poison word"):
+        plan.poison(res)
+
+
+def test_profile_selects_r12_for_large_rows_and_rules_and_budgets_the_page():
+    clear_profile_cache()
+    prof = profmod.load_profile(PROFILE)
+    large = [e for e in prof.entries() if e.vid == "sp_qkv.large.v1"]
+    assert len(large) == 9 + 12 and {dict(e.params)["src"] for e in large} == {"r12"}
+    small = [e for e in prof.rows() if e.vid == "sp_qkv.small.v1"]
+    assert all(
+        dict(e.params)["src"] in ("r17", "r18") for e in small
+    )  # small stays on the shipped sources until r19 passes G0-eq
+    wb = prof.meta["window_budget"]
+    assert wb["shared"]["gf.global"] == 4 << 20 and wb["max_windows"] == 40
+    assert (
+        specs.large_cell_params("dense", 8192)
+        == {**specs.LARGE_CELLS[("dense", 8192)][1], "src": "r12"}
+        and specs.LARGE_PROFILE_SRC == "r12"
+    )
+    # the arena is the sum of the shared set and the small windows: 384 MiB (380 + the page)
+    assert sum(wb["shared"].values()) + sum(wb["small_window_sizes"]) == 384 << 20
+
+
+def test_prebuild_large_units_follow_the_profile_source(monkeypatch):
+    import shutil
+    import tempfile
+    import uuid
+
+    from aiter.ops.gemm_fusion.sp_qkv import prebuild as pb
+
+    root = os.path.join(tempfile.gettempdir(), "jitroot_" + uuid.uuid4().hex)
+    os.makedirs(root)
+    monkeypatch.setenv("AITER_JIT_DIR", root)
+    try:
+        u12 = pb.large_unit(
+            {"n": 2, "half_first": 0, "src": "r12"}, "dense", TOOL_SIM, "aot1"
+        )
+        u11 = pb.large_unit(
+            {"n": 2, "half_first": 0, "src": "r11"}, "dense", TOOL_SIM, "aot1"
+        )
+        udef = pb.large_unit(
+            {"n": 2, "half_first": 0}, "dense", TOOL_SIM, "aot1"
+        )  # an old profile row without src: r11
+        assert u12.meta["src"] == "r12" and u12.key != u11.key and u11.key == udef.key
+        sink = []
+        for t in u12.tasks:
+            if t.name == "lg_gemm":
+                os.makedirs(os.path.join(root, "t", "img"), exist_ok=True)
+                with contextlib.suppress(
+                    Exception
+                ):  # the fake runner writes no files, so the unbundle step fails: the compile command is what we look at
+                    t.run(
+                        os.path.join(root, "t"),
+                        lambda argv: sink.append(list(argv)) or "",
+                    )
+        assert sink and any(
+            "/large/r12/device" in a.replace("\\", "/") for a in sink[0]
+        )
+        from aiter.gemm_fusion import catalog as _cat
+        from aiter.gemm_fusion import prebuild as engine
+
+        monkeypatch.setattr(_cat, "_CATALOG", {})
+        _forget_sp_modules()  # a fresh import registers the variants (and their prebuild hooks) into this scratch catalog
+        units, skipped = engine.plan_profile(PROFILE, recipe="aot1", tool=TOOL_SIM)
+        assert skipped == [] and len(units) == 9
+        assert {u.meta["src"] for u in units if u.kind == "sp_qkv.large.v1"} == {"r12"}
+    finally:
+        shutil.rmtree(root, ignore_errors=True)

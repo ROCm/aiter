@@ -21,13 +21,14 @@ from __future__ import annotations
 import logging
 
 from aiter.gemm_fusion.catalog import Contract, register_variant
+from aiter.gemm_fusion.errpage import GLOBAL_PAGE_BYTES, SHARE_GLOBAL
 from aiter.gemm_fusion.match import ContractError
 from aiter.gemm_fusion.plan import Plan, WindowReq
-from aiter.gemm_fusion.resources import round_up
+from aiter.gemm_fusion.resources import SHARED_KEY, round_up
 
 from . import large_rt as lrt
 from . import specs
-from .jit import _sha, build_large, large_defs
+from .jit import LARGE_SRC, _sha, build_large, large_defs, src_abi
 from .small_rt import stream_handle
 
 log = logging.getLogger("aiter.gemm_fusion")
@@ -171,6 +172,10 @@ class SpQkvLarge(Plan):
                 )
             if self.half_first == 1 and self.n == 1:
                 raise ContractError("half-first needs n >= 2")
+        self.src = self.params.get("src", LARGE_SRC)
+        self.abi = src_abi(
+            "large", self.src
+        )  # 2 = r11 (per-plan poison word); 3 = r12 (per-comm ERR/STEP page, call_id tags, NaN-fill node inside lg_launch_v2)
         self.F = _F[self.mode]
         self.owner = f"sp_qkv.large/{self.mode}/M{self.M}"
         self.build_key = (
@@ -183,7 +188,7 @@ class SpQkvLarge(Plan):
         b = large_window_bytes(self.mode, self.M)
         # bytes = the per-plan equal-size convention (the uniform policy); share + min_bytes serve the arena policy: ONE S and ONE R sized to the largest
         # large plan and ONE control window used by every large plan.
-        return [
+        reqs = [
             WindowReq(self.owner + "/S", b, "p2p_window", share=SHARE_S, min_bytes=b),
             WindowReq(self.owner + "/R", b, "p2p_window", share=SHARE_R, min_bytes=b),
             WindowReq(
@@ -195,6 +200,19 @@ class SpQkvLarge(Plan):
             ),
             WindowReq(self.owner + "/q", 0, "sdma_queue"),
         ]
+        if (
+            self.abi >= 3
+        ):  # the per-comm ERR/STEP/DIAG page: ONE per comm, shared by every R12 plan (small and large)
+            reqs.append(
+                WindowReq(
+                    self.owner + "/gpage",
+                    GLOBAL_PAGE_BYTES,
+                    "control",
+                    share=SHARE_GLOBAL,
+                    min_bytes=GLOBAL_PAGE_BYTES,
+                )
+            )
+        return reqs
 
     def _context(self, res):
         sc = res.__dict__.setdefault("_sp_qkv_large", {})
@@ -216,7 +234,11 @@ class SpQkvLarge(Plan):
             sha = _sha(built.hsaco)
             if sha != built.hsaco_sha256:
                 raise RuntimeError(f"HSACO_HASH_MISMATCH {sha} != {built.hsaco_sha256}")
-            lib = lrt.load_driver(built.driver_so)
+            lib = lrt.load_driver(built.driver_so, abi=self.abi)
+            if self.abi >= 3:
+                lrt.check_abi_info(
+                    lrt.abi_info(lib)
+                )  # args size, page/tag offsets: a mismatch names the field instead of corrupting a launch
             geo = lrt.info(lib)
             if (
                 geo["f"] != self.F
@@ -262,6 +284,13 @@ class SpQkvLarge(Plan):
             got = sc[self.owner] = lrt.LargeContext(
                 lib, C.c_void_p(h), self.M, self.F, res.rank
             )
+            if (
+                self.abi >= 3
+            ):  # attach the per-comm ERR/STEP page (+ the device-resident peer-ERR table) once per context, before the first launch
+                page = res.global_page()
+                got.gpage_attach(
+                    page.err_addr, page.step_addr, res.global_peers().data_ptr()
+                )
             got.budget_us = int(
                 getattr(res, "wait_budget_us", 0) or 0
             )  # profile wait_budget_us / env / 5 s default; baked into captured graphs at capture time
@@ -276,9 +305,13 @@ class SpQkvLarge(Plan):
                 self.owner, got.close
             )  # L-5 (per context: each frees its own module/ctx)
             hooks = {
-                "poison": lambda c=got: c.poison(
-                    stream_handle(None)
-                ),  # cheap per-step check on the CURRENT torch stream (4-byte D2H + that stream sync)
+                "poison": (
+                    None
+                    if self.abi >= 3
+                    else lambda c=got: c.poison(
+                        stream_handle(None)
+                    )  # cheap per-step check on the CURRENT torch stream (4-byte D2H + that stream sync)
+                ),  # R12: no per-plan poison: the error is the per-comm ERR word
                 "drain": lambda c=got: c.drain_all(
                     C.c_void_p(None)
                 ),  # A2-H: quietQueue on all peer queues before any reset
@@ -287,17 +320,24 @@ class SpQkvLarge(Plan):
             if getattr(Cw, "shared", False):
                 # ONE control block for every large plan: its init/drain/poison are registered ONCE (by the first context that attaches). A later
                 # context attaching to the already LIVE block must not run init_control (that would reset the epoch on this rank only).
-                res.set_shared_hooks(
+                first = res.set_shared_hooks(
                     init=hooks["init"],
                     drain=hooks["drain"],
                     poison=hooks["poison"],
                     poison_report=got.report,
                     poison_decode=decode_large_poison,
                 )
+                if self.abi >= 3 and first:
+                    res.set_report_hook(
+                        SHARED_KEY, got.report
+                    )  # logged by reset() next to the page's ERR/DIAG
             else:
-                res.set_poison(
-                    self.owner, hooks["poison"], got.report, decode_large_poison
-                )
+                if hooks["poison"] is not None:
+                    res.set_poison(
+                        self.owner, hooks["poison"], got.report, decode_large_poison
+                    )
+                else:
+                    res.set_report_hook(self.owner, got.report)
                 res.set_drain(self.owner, hooks["drain"])
                 res.set_init(self.owner, hooks["init"])
         self._ctx = got
@@ -320,7 +360,19 @@ class SpQkvLarge(Plan):
             self._check_inputs(x, x_scale, w_scale)
         return self._context(res)
 
-    def run(self, *, x, x_scale, w, w_scale, outs=None, meta=None, res, stream=None):
+    def run(
+        self,
+        *,
+        x,
+        x_scale,
+        w,
+        w_scale,
+        outs=None,
+        meta=None,
+        res,
+        stream=None,
+        call_id=None,
+    ):
         from .small_rt import stream_handle
         from .variants import _require_zeroed
 
@@ -331,16 +383,35 @@ class SpQkvLarge(Plan):
         self._check_inputs(
             x, x_scale, w_scale, w
         )  # at capture once, in eager every call; a graph replay runs no Python
-        c.launch(
-            x.data_ptr(),
-            w.data_ptr(),
-            x_scale.data_ptr(),
-            w_scale.data_ptr(),
-            x.stride(0) * x.element_size(),
-            self.n,
-            self.half_first,
-            stream_handle(stream),
-        )
+        if (
+            self.abi >= 3
+        ):  # R12: the tag E = (STEP << 32) | call_id; the launch includes quiet_ready and the NaN-fill node
+            if call_id is None:
+                raise ContractError(
+                    f"{self.owner}: an R12 (abi {self.abi}) plan needs run(call_id=...): the 31-bit decision key of (site, tokens, vid, n_fused)"
+                )
+            c.launch_v3(
+                x.data_ptr(),
+                w.data_ptr(),
+                x_scale.data_ptr(),
+                w_scale.data_ptr(),
+                x.stride(0) * x.element_size(),
+                self.n,
+                self.half_first,
+                int(call_id),
+                stream_handle(stream),
+            )
+        else:
+            c.launch(
+                x.data_ptr(),
+                w.data_ptr(),
+                x_scale.data_ptr(),
+                w_scale.data_ptr(),
+                x.stride(0) * x.element_size(),
+                self.n,
+                self.half_first,
+                stream_handle(stream),
+            )
         self._epochs += 1
         packed = (outs or {}).get("packed")
         if packed is not None:
@@ -369,6 +440,10 @@ class SpQkvLarge(Plan):
 
     def poison(self, res) -> int:
         """Cheap host read of the device poison word (4-byte D2H on the current torch stream + that stream sync). Outside capture only; all-reduce MAX across ranks, then res.quiesce_and_reset()."""
+        if self.abi >= 3:
+            raise RuntimeError(
+                "R12 plans have no per-plan poison word: use FusionResources.error_flag() / readback_enqueue() / readback_consume() and the collective reset()"
+            )
         return self._context(res).poison(stream_handle(None))
 
     @classmethod

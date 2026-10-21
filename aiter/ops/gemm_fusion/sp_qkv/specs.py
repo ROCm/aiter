@@ -148,3 +148,10 @@ LARGE_CELLS = {
         {"n": 4, "half_first": 0, "no_gridread": 1},
     ),  # r6x4 n4
 }
+
+LARGE_PROFILE_SRC = "r12"  # the large rows/rules of the shipped profile run the R12 kernels; "r11" stays selectable per row/rule for the A/B
+
+
+def large_cell_params(mode: str, T: int) -> dict:
+    """The profile params of a large cell: the tuned plan params plus the kernel source the profile selects."""
+    return {**LARGE_CELLS[(mode, T)][1], "src": LARGE_PROFILE_SRC}

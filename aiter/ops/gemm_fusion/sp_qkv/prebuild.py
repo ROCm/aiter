@@ -199,7 +199,8 @@ def small_unit(params: dict, mode: str, tool: dict[str, str], recipe: str) -> Un
 
 def large_unit(params: dict, mode: str, tool: dict[str, str], recipe: str) -> Unit:
     defs = jit.large_defs(params, mode)
-    key = jit.recipe_key(jit.large_cache_key(defs, tool), recipe)
+    src = params.get("src", jit.LARGE_SRC)
+    key = jit.recipe_key(jit.large_cache_key(defs, tool, src), recipe)
     root = jit.jit_root()
     dev_only = recipe == "aot2"
     name = "lg_gemm_quad_fp8_comm"
@@ -207,7 +208,7 @@ def large_unit(params: dict, mode: str, tool: dict[str, str], recipe: str) -> Un
         Task(
             "lg_gemm",
             _device_task_body(
-                lambda tmp: jit.large_device_cmd(defs, tool, tmp),
+                lambda tmp: jit.large_device_cmd(defs, tool, tmp, src),
                 name,
                 os.path.join("img", name + ".hsaco"),
                 dev_only,
@@ -217,7 +218,7 @@ def large_unit(params: dict, mode: str, tool: dict[str, str], recipe: str) -> Un
         ),
         Task(
             "lg_host",
-            lambda tmp, run_cmd: run_cmd(jit.large_host_cmd(defs, tool, tmp)),
+            lambda tmp, run_cmd: run_cmd(jit.large_host_cmd(defs, tool, tmp, src)),
             cost=COST_HINTS["lg_host"],
         ),
     ]
@@ -238,7 +239,7 @@ def large_unit(params: dict, mode: str, tool: dict[str, str], recipe: str) -> Un
         tasks,
         finalize=finalize,
     )
-    u.meta = {"defs": defs, "mode": mode}
+    u.meta = {"defs": defs, "mode": mode, "src": src}
     return u
 
 
@@ -416,7 +417,7 @@ def verify_device_only(tool=None, jobs=None) -> dict:
                 name = t.name if t.name != "lg_gemm" else "lg_gemm_quad_fp8_comm"
                 if t.name == "lg_gemm":
                     cmd_fn = lambda tmp_: jit.large_device_cmd(
-                        u.meta["defs"], tool, tmp_
+                        u.meta["defs"], tool, tmp_, u.meta["src"]
                     )
                 else:
                     cmd_fn = lambda tmp_, n=name: jit.device_cmd_one(

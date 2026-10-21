@@ -22,6 +22,7 @@ import logging
 import re
 
 from aiter.gemm_fusion.catalog import Contract, register_variant
+from aiter.gemm_fusion.errpage import GLOBAL_PAGE_BYTES, SHARE_GLOBAL
 from aiter.gemm_fusion.match import ContractError
 from aiter.gemm_fusion.plan import Plan, WindowReq
 from aiter.gemm_fusion.resources import round_up
@@ -33,7 +34,7 @@ from . import (
     specs,
 )
 from . import small_rt as rt
-from .jit import build_small, small_defs
+from .jit import build_small, small_defs, src_abi
 
 SRC_SHA = {
     "r17": "3f597cdb6141c39dd4450a1ea635785ffe44867006434157478f7822357d8ee3",
@@ -116,6 +117,10 @@ class SpQkvSmall(Plan):
         self.mode = specs.mode_of(spec)
         self.ctx_m = ctx.m
         small_defs(self.params, self.mode)  # validates params
+        self.src = self.params.get("src", "r17")
+        self.abi = src_abi(
+            "small", self.src
+        )  # 2 = r17/r18; 3 = r19 (R12: per-launch kernargs, per-comm ERR/STEP page, call_id tags)
         if self.params.get("rx_bypass") and "gfx950_sc_bypass" not in ctx.available:
             raise ContractError(
                 "sp_qkv.small.v1 rx_bypass=1 requires capability gfx950_sc_bypass (R2 is gfx950-only)"
@@ -151,10 +156,23 @@ class SpQkvSmall(Plan):
     def resources(self) -> list[WindowReq]:
         b = small_window_bytes(self.mode)
         cap = round_up(max(b["rx"], b["ctl"], 8192))
-        return [
+        reqs = [
             WindowReq(self.owner + "/rx", cap, "p2p_window"),
             WindowReq(self.owner + "/ctl", cap, "control"),
         ]
+        if (
+            self.abi >= 3
+        ):  # the per-comm ERR/STEP/DIAG page: ONE per comm, shared by every R12 plan (small and large)
+            reqs.append(
+                WindowReq(
+                    self.owner + "/gpage",
+                    GLOBAL_PAGE_BYTES,
+                    "control",
+                    share=SHARE_GLOBAL,
+                    min_bytes=GLOBAL_PAGE_BYTES,
+                )
+            )
+        return reqs
 
     # ---- runtime ----
     def _context(self, res):
@@ -163,7 +181,7 @@ class SpQkvSmall(Plan):
         if got is None:
             wins = res.ensure(self.owner, self.resources())
             built = build_small(self.params, self.mode)
-            lib = rt.load_driver(built.driver_so)
+            lib = rt.load_driver(built.driver_so, abi=self.abi)
             geo = rt.info(lib)
             exp = small_window_bytes(self.mode)
             if geo["rx_bytes"] != exp["rx"] or geo["ctl_bytes"] != exp["ctl"]:
@@ -172,17 +190,34 @@ class SpQkvSmall(Plan):
 
             h = C.c_void_p()
             rx, ct = wins[self.owner + "/rx"], wins[self.owner + "/ctl"]
-            rc = lib.sm_attach_v1(
-                res.rank,
-                res.comm,
-                rx.handle,
-                rx.local,
-                ct.handle,
-                ct.local,
-                built.gemm_hsaco.encode(),
-                built.ran_hsaco.encode(),
-                C.byref(h),
-            )
+            if self.abi >= 3:
+                # R12 attach (card D2.6): + the global page's local address; the peers table is a device pointer (0 = the driver resolves the peers itself)
+                page = res.global_page()
+                rc = lib.sm_attach_v3(
+                    res.rank,
+                    res.comm,
+                    rx.handle,
+                    rx.local,
+                    ct.handle,
+                    ct.local,
+                    C.c_void_p(page.local),
+                    C.c_void_p(res.global_peers().data_ptr()),
+                    built.gemm_hsaco.encode(),
+                    built.ran_hsaco.encode(),
+                    C.byref(h),
+                )
+            else:
+                rc = lib.sm_attach_v1(
+                    res.rank,
+                    res.comm,
+                    rx.handle,
+                    rx.local,
+                    ct.handle,
+                    ct.local,
+                    built.gemm_hsaco.encode(),
+                    built.ran_hsaco.encode(),
+                    C.byref(h),
+                )
             if rc != 0:
                 if (
                     h.value
@@ -193,12 +228,15 @@ class SpQkvSmall(Plan):
             res.set_close(
                 self.owner, got.close
             )  # L-5: frees Blk, P, modules, ctx before comm teardown
-            res.set_poison(
-                self.owner,
-                lambda c=got: c.poison_fast(rt.stream_handle(None)),
-                None,
-                decode_small_poison,
-            )  # cheap per-step check on the CURRENT torch stream (4-byte D2H + that stream sync)
+            if (
+                self.abi < 3
+            ):  # R12 plans have no per-plan poison word: the error is the per-comm ERR word (FusionResources.error_flag / readback)
+                res.set_poison(
+                    self.owner,
+                    lambda c=got: c.poison_fast(rt.stream_handle(None)),
+                    None,
+                    decode_small_poison,
+                )  # cheap per-step check on the CURRENT torch stream (4-byte D2H + that stream sync)
         self._ctx = got
         return got
 
@@ -235,6 +273,11 @@ class SpQkvSmall(Plan):
             "q_out": outs["q"],
             **caches,
         }
+        if (
+            self.abi >= 3
+        ):  # R12: x_scale / positions / slot_mapping are PER-LAUNCH kernargs, not part of the binding: eager calls with fresh tensors never create one
+            for n in ("x_scale", "positions", "slot_mapping"):
+                named.pop(n)
         for n in ("k", "v", "index_q"):
             if n in outs:
                 named[n + "_out"] = outs[n]
@@ -286,7 +329,10 @@ class SpQkvSmall(Plan):
             caches["k_cache"], caches["v_cache"], self.block
         )  # spec page vs actual cache layout
         sb = rt.SmBindingV1()
-        sb.Ascale, sb.Wscale = x_scale.data_ptr(), w_scale.data_ptr()
+        sb.Ascale, sb.Wscale = (
+            None if self.abi >= 3 else x_scale.data_ptr(),
+            w_scale.data_ptr(),
+        )
         sb.qw, sb.kw = meta["q_norm_w"].data_ptr(), meta["k_norm_w"].data_ptr()
         sb.cos_cache, sb.sin_cache = (
             meta["cos_cache"].data_ptr(),
@@ -294,8 +340,9 @@ class SpQkvSmall(Plan):
         )
         sb.cos_stride_pos = meta["cos_cache"].stride(0)
         sb.positions, sb.slot_mapping = (
-            meta["positions"].data_ptr(),
-            meta["slot_mapping"].data_ptr(),
+            (None, None)
+            if self.abi >= 3
+            else (meta["positions"].data_ptr(), meta["slot_mapping"].data_ptr())
         )
         for n, t in caches.items():
             setattr(sb, n, t.data_ptr())
@@ -317,7 +364,9 @@ class SpQkvSmall(Plan):
             sb.k_out, sb.v_out = outs["k"].data_ptr(), outs["v"].data_ptr()
             sb.index_q_out = zeros.data_ptr() if zeros is not None else None
         sb.iqw, sb.ikw = iqw.data_ptr(), ikw.data_ptr()
-        sb.index_slot_mapping = meta["slot_mapping"].data_ptr()
+        sb.index_slot_mapping = (
+            None if self.abi >= 3 else meta["slot_mapping"].data_ptr()
+        )
         sb.M, sb.T, sb.block_size, sb.x_size = (
             x.shape[0],
             4 * x.shape[0],
@@ -344,6 +393,16 @@ class SpQkvSmall(Plan):
         inputs.check_weight_scale(self.owner, w_scale, N=_NA[self.mode] * 128)
         if w is not None:
             inputs.check_weight(self.owner, w, N=_NA[self.mode] * 128)
+        if (
+            self.abi >= 3
+        ):  # R12: short arrays are legal (the kernel pads rows t >= t_valid as position 0 / slot -1); returns t_valid
+            return inputs.check_token_arrays_v3(
+                self.owner,
+                T=4 * M,
+                positions=meta["positions"],
+                slot_mapping=meta["slot_mapping"],
+                outs=outs,
+            )
         inputs.check_token_arrays(
             self.owner,
             T=4 * M,
@@ -351,6 +410,7 @@ class SpQkvSmall(Plan):
             slot_mapping=meta["slot_mapping"],
             outs=outs,
         )
+        return 4 * M
 
     def prepare(self, *, x, x_scale, w_scale, outs, meta, res):
         """Create the binding (and attach the context) outside graph capture. Idempotent. Checks the input contract (once, outside capture)."""
@@ -358,13 +418,31 @@ class SpQkvSmall(Plan):
         self._context(res)
         return self._binding(x, x_scale, w_scale, outs, meta, res)
 
-    def run(self, *, x, x_scale, w, w_scale, outs, meta, res, stream=None):
+    def run(
+        self,
+        *,
+        x,
+        x_scale,
+        w,
+        w_scale,
+        outs,
+        meta,
+        res,
+        stream=None,
+        call_id=None,
+    ):
         import torch
 
         _require_zeroed(res, self.owner)
-        self._check_inputs(
+        t_valid = self._check_inputs(
             x, x_scale, w_scale, outs, meta, w
         )  # at capture once, in eager every call; a graph replay runs no Python
+        if self.abi >= 3:
+            if call_id is None:
+                raise ContractError(
+                    f"{self.owner}: an R12 (abi {self.abi}) plan needs run(call_id=...): the 31-bit decision key of (site, tokens, vid, n_fused)"
+                )
+            inputs.check_call_id(self.owner, call_id)
         sc = self._context(res)
         blk = self._binding(
             x,
@@ -375,6 +453,22 @@ class SpQkvSmall(Plan):
             res,
             in_capture=torch.cuda.is_current_stream_capturing(),
         )
+        if (
+            self.abi >= 3
+        ):  # x_scale / positions / slot_mapping / t_valid / call_id are per-launch kernargs; err and step come from the attached global page
+            sc.launch_v3(
+                blk,
+                x.data_ptr(),
+                w.data_ptr(),
+                x.stride(0) * x.element_size(),
+                x_scale.data_ptr(),
+                meta["positions"].data_ptr(),
+                meta["slot_mapping"].data_ptr(),
+                t_valid,
+                call_id,
+                rt.stream_handle(stream),
+            )
+            return
         sc.launch(
             blk,
             x.data_ptr(),
@@ -389,6 +483,10 @@ from . import variants_large  # noqa: F401  (registers sp_qkv.large.v1)
 
 def _small_poison(self, res) -> int:
     """Cheap host read of the device poison word (4-byte D2H on the current torch stream + that stream sync). Outside capture only; all-reduce MAX across ranks, then res.quiesce_and_reset()."""
+    if self.abi >= 3:
+        raise RuntimeError(
+            "R12 plans have no per-plan poison word: use FusionResources.error_flag() / readback_enqueue() / readback_consume() and the collective reset()"
+        )
     return self._context(res).poison_fast(rt.stream_handle(None))
 
 

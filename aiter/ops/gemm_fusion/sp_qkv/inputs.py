@@ -118,6 +118,45 @@ def check_weight(owner: str, w, *, N: int, K: int = K_HIDDEN) -> None:
         )
 
 
+def check_call_id(owner: str, call_id) -> int:
+    """R12: the 31-bit decision key that tags every handshake of this launch. Must be an int in [1, 2^31): 0 is refused (a zero tag equals the content of a zeroed window)."""
+    if (
+        isinstance(call_id, bool)
+        or not isinstance(call_id, int)
+        or not 1 <= call_id < (1 << 31)
+    ):
+        _fail(
+            owner,
+            f"call_id must be an int in [1, 2^31) (the 31-bit decision key of site/tokens/vid/n_fused), got {call_id!r}",
+        )
+    return call_id
+
+
+def check_token_arrays_v3(owner: str, *, T: int, positions, slot_mapping, outs) -> int:
+    """R12 small plans: positions / slot_mapping are PER-LAUNCH kernargs now and the kernel pads: it reads only t < t_valid and treats rows t >= t_valid as (position 0,
+    slot -1). So a SHORT array is legal (the pad rows run as ordinary rows whose cache writes are skipped); what is required is int64, contiguous and at least one
+    element. t_valid = min(numel(positions), numel(slot_mapping), T). The outputs still need T rows (the kernel writes q/k/v/index_q for every row).
+    """
+    import torch
+
+    for name, t in (("positions", positions), ("slot_mapping", slot_mapping)):
+        if int(t.numel()) < 1:
+            _fail(owner, f"{name} is empty")
+        if not _is(t, torch, "int64"):
+            _fail(
+                owner, f"{name} dtype {t.dtype} is not int64 (the kernel reads int64)"
+            )
+        if not t.is_contiguous():
+            _fail(owner, f"{name} must be contiguous")
+    for name, t in (outs or {}).items():
+        if name in ("q", "k", "v", "index_q") and t.shape[0] < T:
+            _fail(
+                owner,
+                f"output {name!r} has {t.shape[0]} rows but the kernel writes {T}",
+            )
+    return min(int(positions.numel()), int(slot_mapping.numel()), int(T))
+
+
 def check_token_arrays(owner: str, *, T: int, positions, slot_mapping, outs) -> None:
     """Small plans: positions[t] / slot_mapping[t] (int64) are read for every t < T = 4*M, and q/k/v/index_q are written for every t < T. Padded rows are supported: the
     caller stages T-long arrays whose pad rows are (position 0, slot_mapping -1); the kernel runs norm/rope on them like any row (in-bounds, discarded by the caller) and skips

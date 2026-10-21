@@ -119,6 +119,13 @@ int32_t gf_win_info_v1(void* comm, void* win, uint64_t* out3) {
     out3[0] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(h.winBase)); out3[1] = h.stride4G; out3[2] = static_cast<uint64_t>(h.lsaRank);
     return OK;
 }
+// Address, in THIS process's VA space, of peer `peer`'s copy of the window byte at `local` (R12: the global page's ERR word, for the peer-ERR propagation table).
+int32_t gf_peer_ptr_v1(void* comm, void* local, int32_t peer, void** out) {
+    if (!comm || !local || !out) return E_ARG;
+    gf::DeviceScope scope(comm_dev(comm));
+    *out = mori::cco::ccoGetPeerPtr(static_cast<mori::cco::ccoComm*>(comm), local, peer);
+    return *out ? OK : E_CCO;
+}
 int32_t gf_devcomm_create_v1(void* comm, uint32_t sdma_queues, void** out_dev) {
     if (!comm || !out_dev) return E_ARG;
     gf::DeviceScope scope(comm_dev(comm));

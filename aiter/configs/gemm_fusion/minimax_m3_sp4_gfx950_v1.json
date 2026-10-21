@@ -2,7 +2,7 @@
   "profile": "minimax_m3_sp4_gfx950_v1",
   "window_budget": {
     "window_bytes": 171966464,
-    "max_windows": 39,
+    "max_windows": 40,
     "small_owners": 6,
     "large_owners": 9,
     "small_window_sizes": [
@@ -22,7 +22,8 @@
     "shared": {
       "sp_qkv.large/S": 171966464,
       "sp_qkv.large/R": 171966464,
-      "sp_qkv.large/C": 4194304
+      "sp_qkv.large/C": 4194304,
+      "gf.global": 4194304
     }
   },
   "wait_budget_us": 5000000,
@@ -137,7 +138,8 @@
       "params": {
         "n": 3,
         "half_first": 2,
-        "no_gridread": 1
+        "no_gridread": 1,
+        "src": "r12"
       },
       "cell": "dense_T8192"
     },
@@ -151,7 +153,8 @@
       "params": {
         "n": 2,
         "half_first": 0,
-        "no_gridread": 1
+        "no_gridread": 1,
+        "src": "r12"
       },
       "cell": "dense_T16384"
     },
@@ -165,7 +168,8 @@
       "params": {
         "n": 4,
         "half_first": 0,
-        "no_gridread": 1
+        "no_gridread": 1,
+        "src": "r12"
       },
       "cell": "dense_T32768"
     },
@@ -179,7 +183,8 @@
       "params": {
         "n": 2,
         "half_first": 1,
-        "no_gridread": 1
+        "no_gridread": 1,
+        "src": "r12"
       },
       "cell": "indexer_T8192"
     },
@@ -193,7 +198,8 @@
       "params": {
         "n": 4,
         "half_first": 0,
-        "no_gridread": 1
+        "no_gridread": 1,
+        "src": "r12"
       },
       "cell": "indexer_T16384"
     },
@@ -207,7 +213,8 @@
       "params": {
         "n": 4,
         "half_first": 0,
-        "no_gridread": 1
+        "no_gridread": 1,
+        "src": "r12"
       },
       "cell": "indexer_T32768"
     },
@@ -221,7 +228,8 @@
       "params": {
         "n": 2,
         "half_first": 1,
-        "no_gridread": 1
+        "no_gridread": 1,
+        "src": "r12"
       },
       "cell": "reuse_T8192"
     },
@@ -235,7 +243,8 @@
       "params": {
         "n": 4,
         "half_first": 0,
-        "no_gridread": 1
+        "no_gridread": 1,
+        "src": "r12"
       },
       "cell": "reuse_T16384"
     },
@@ -249,7 +258,8 @@
       "params": {
         "n": 4,
         "half_first": 0,
-        "no_gridread": 1
+        "no_gridread": 1,
+        "src": "r12"
       },
       "cell": "reuse_T32768"
     }
@@ -267,7 +277,8 @@
       "params": {
         "n": 1,
         "half_first": 0,
-        "no_gridread": 1
+        "no_gridread": 1,
+        "src": "r12"
       },
       "name": "dense_m1024-8192_x256",
       "note": "PLACEHOLDER params: fallback n=1; final params from the tuning sweep"
@@ -284,7 +295,8 @@
       "params": {
         "n": 2,
         "half_first": 0,
-        "no_gridread": 1
+        "no_gridread": 1,
+        "src": "r12"
       },
       "name": "dense_m1024-8192_x512",
       "note": "PLACEHOLDER params: nearest exact row (m=4096); final params from the tuning sweep"
@@ -301,7 +313,8 @@
       "params": {
         "n": 2,
         "half_first": 0,
-        "no_gridread": 1
+        "no_gridread": 1,
+        "src": "r12"
       },
       "name": "dense_m1024-6144_x1024",
       "note": "PLACEHOLDER params: nearest exact row (m=4096); final params from the tuning sweep"
@@ -318,7 +331,8 @@
       "params": {
         "n": 4,
         "half_first": 0,
-        "no_gridread": 1
+        "no_gridread": 1,
+        "src": "r12"
       },
       "name": "dense_m7168-8192_x1024",
       "note": "PLACEHOLDER params: nearest exact row (m=8192); final params from the tuning sweep"
@@ -335,7 +349,8 @@
       "params": {
         "n": 1,
         "half_first": 0,
-        "no_gridread": 1
+        "no_gridread": 1,
+        "src": "r12"
       },
       "name": "indexer_m1024-8192_x256",
       "note": "PLACEHOLDER params: fallback n=1; final params from the tuning sweep"
@@ -352,7 +367,8 @@
       "params": {
         "n": 2,
         "half_first": 1,
-        "no_gridread": 1
+        "no_gridread": 1,
+        "src": "r12"
       },
       "name": "indexer_m1024-8192_x512",
       "note": "PLACEHOLDER params: nearest exact row (m=2048); final params from the tuning sweep"
@@ -369,7 +385,8 @@
       "params": {
         "n": 2,
         "half_first": 1,
-        "no_gridread": 1
+        "no_gridread": 1,
+        "src": "r12"
       },
       "name": "indexer_m1024-3072_x1024",
       "note": "PLACEHOLDER params: nearest exact row (m=2048); final params from the tuning sweep"
@@ -386,7 +403,8 @@
       "params": {
         "n": 4,
         "half_first": 0,
-        "no_gridread": 1
+        "no_gridread": 1,
+        "src": "r12"
       },
       "name": "indexer_m4096-8192_x1024",
       "note": "PLACEHOLDER params: nearest exact rows; final params from the tuning sweep"
@@ -403,7 +421,8 @@
       "params": {
         "n": 1,
         "half_first": 0,
-        "no_gridread": 1
+        "no_gridread": 1,
+        "src": "r12"
       },
       "name": "reuse_m1024-8192_x256",
       "note": "PLACEHOLDER params: fallback n=1; final params from the tuning sweep"
@@ -420,7 +439,8 @@
       "params": {
         "n": 2,
         "half_first": 1,
-        "no_gridread": 1
+        "no_gridread": 1,
+        "src": "r12"
       },
       "name": "reuse_m1024-8192_x512",
       "note": "PLACEHOLDER params: nearest exact row (m=2048); final params from the tuning sweep"
@@ -437,7 +457,8 @@
       "params": {
         "n": 2,
         "half_first": 1,
-        "no_gridread": 1
+        "no_gridread": 1,
+        "src": "r12"
       },
       "name": "reuse_m1024-3072_x1024",
       "note": "PLACEHOLDER params: nearest exact row (m=2048); final params from the tuning sweep"
@@ -454,7 +475,8 @@
       "params": {
         "n": 4,
         "half_first": 0,
-        "no_gridread": 1
+        "no_gridread": 1,
+        "src": "r12"
       },
       "name": "reuse_m4096-8192_x1024",
       "note": "PLACEHOLDER params: nearest exact rows; final params from the tuning sweep"

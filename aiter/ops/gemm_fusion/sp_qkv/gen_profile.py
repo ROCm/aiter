@@ -14,9 +14,14 @@ import json
 import os
 import sys
 
+from aiter.gemm_fusion.errpage import GLOBAL_PAGE_BYTES, SHARE_GLOBAL
+
 from . import specs
 
 ARCH, CU, WORLD = "gfx950", 256, 4
+LARGE_PROFILE_SRC = (
+    specs.LARGE_PROFILE_SRC
+)  # the large rows and rules run the R12 kernels (ERR page, call_id tags, NaN-fill node); "r11" to A/B
 
 
 def build_rows():
@@ -53,7 +58,7 @@ def build_large_rows():
                 "world": WORLD,
                 "m": T // WORLD,
                 "vid": vid,
-                "params": dict(params),
+                "params": {**params, "src": LARGE_PROFILE_SRC},
                 "cell": f"{mode}_T{T}",
             }
         )
@@ -65,6 +70,7 @@ FALLBACK_PARAMS = {
     "n": 1,
     "half_first": 0,
     "no_gridread": 1,
+    "src": LARGE_PROFILE_SRC,
 }  # valid for every M multiple of 256 (n=1 needs no divisibility)
 
 
@@ -95,7 +101,7 @@ def build_large_rules():
     for mode in ("dense", "indexer", "reuse"):
         sp = specs.sp_qkv_spec(mode).prefix(1)  # GEMM + SPExchange only
         cells = sorted(
-            (T // WORLD, vid, dict(params))
+            (T // WORLD, vid, {**params, "src": LARGE_PROFILE_SRC})
             for (md, T), (vid, params) in specs.LARGE_CELLS.items()
             if md == mode and params.get("half_first") != 2
         )
@@ -174,10 +180,12 @@ def window_budget():
         vl.SHARE_S: sr,
         vl.SHARE_R: sr,
         vl.SHARE_C: round_up(vl.LG_CONTROL_MIN_BYTES),
+        # R12: the per-comm ERR/STEP/DIAG page shared by every R12 plan (arena: one 4 MiB view; uniform: one more equal-size window, counted in max_windows)
+        SHARE_GLOBAL: round_up(GLOBAL_PAGE_BYTES),
     }
     return {
         "window_bytes": wb,
-        "max_windows": 2 * len(small) + 3 * len(large),
+        "max_windows": 2 * len(small) + 3 * len(large) + 1,
         "small_owners": len(small),
         "large_owners": len(large),
         "small_window_sizes": small_sizes,

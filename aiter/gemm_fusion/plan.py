@@ -29,8 +29,20 @@ class Plan:
         raise NotImplementedError
 
     def run(
-        self, *, x, x_scale, w, w_scale, outs: dict, meta: dict, res, stream=None
+        self,
+        *,
+        x,
+        x_scale,
+        w,
+        w_scale,
+        outs: dict,
+        meta: dict,
+        res,
+        stream=None,
+        call_id: int | None = None,
     ) -> None:
         """Run the covered stage prefix. ``res`` is a bound resources object
-        (see aiter.gemm_fusion.resources.FusionResources)."""
+        (see aiter.gemm_fusion.resources.FusionResources). ``call_id`` is the
+        31-bit decision key of the launch (R12 plans require it: it tags the
+        handshake; pre-R12 plans ignore it)."""
         raise NotImplementedError
