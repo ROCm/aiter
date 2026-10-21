@@ -14,6 +14,7 @@ from aiter.ops.triton.attention.mha import (
 from aiter.test_mha_common import (
     attention_ref,
     attention_ref_with_tol,
+    construct_local_mask,
     generate_qkv,
     generate_random_padding_mask,
 )
@@ -293,12 +294,10 @@ def test_mha_dao_ai_dropout_scores(dao_ai_impl, causal, window_size):
         return_attn_probs=True,
     )
 
-    query_pos = torch.arange(seqlen, device="cuda")[:, None]
-    key_pos = torch.arange(seqlen, device="cuda")[None, :]
-    if causal:
-        allowed = key_pos <= query_pos
-    else:
-        allowed = (key_pos >= query_pos - 16) & (key_pos <= query_pos + 16)
+    mask_window = (window_size[0], 0) if causal else window_size
+    allowed = ~construct_local_mask(
+        seqlen, seqlen, window_size=mask_window, device="cuda"
+    )
     assert scores.shape == (1, 4, seqlen, seqlen)
     assert torch.all(scores[..., ~allowed] == 0)
     assert torch.any(scores[..., allowed] < 0)
