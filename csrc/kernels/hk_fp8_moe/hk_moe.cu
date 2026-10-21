@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// HipKittens block-FP8 grouped MoE for gfx950. See hk_moe.h for the C API and tensor layouts.
+// gfx950 block-FP8 MoE. Tensor layouts and API: hk_moe.h.
 #include "hk_moe.h"
 
 #include <type_traits>
@@ -10,30 +10,19 @@
 
 using namespace kittens;
 
-// ================================================================ 1. tile-load metadata
-// Buffer resource and per-wave LDS base for weights in AITER's shuffled layout.
+// Shuffled-weight buffer and per-wave LDS base.
 struct precomputed_addresses
 {
     i32x4 srsrc;
     uintptr_t lds_base;
 };
 
-// ================================================================ 2. pinned-register tiles
-// Pinned-register (art) tiles of the 4-wave HW-scaled FP8 GEMM.
-//
-// Register plan per wave (art convention: index >= 256 is AGPR i - 256):
-//   a[0:255]: accumulators c[I][J], at AGPR base (2I+J)*64.
-//   v[128:255]: FP8 operands A0=v128, A1=v160, B0=v192, B1=v224 (64x128, 32 VGPRs each).
-//   v[0:127]: compiler values (kernel attribute amdgpu_num_vgpr(128)).
-// I selects a 128-row half; J selects a 128-column weight block.
-// The kernel clobbers these ranges up front so they are allocated. amdgpu_num_vgpr(128) is NOT
-// honored once all 256 AGPRs are in use, so the compiler may still hand out v128+ for temporaries:
-// keep compiler register pressure low and check builds with op_tests/test_hk_fp8_moe_codegen.py (no
-// compiler-generated instruction may touch v128+ or an AGPR).
-//
-// MFMAs are operand-swapped (weights are the MFMA A operand), so the art subtile (m, n) of an
-// accumulator tile (weight block m, activation subtile n) lives at register base + (n*4 + m)*4, and
-// lane l holds C[n*16 + l%16][m*16 + 4*(l/16) .. +3]: four row-contiguous outputs.
+// Pinned registers per wave: a0:a255 accumulators, v128:v255 operands, v0:v127 temporaries.
+// Accumulator (I,J) starts at a[(2*I+J)*64]; I/J select 128-row/column blocks.
+// ART indices >= 256 address AGPRs. amdgpu_num_vgpr(128) does not protect the pinned
+// ranges with all AGPRs occupied: verify compiler output with test_hk_fp8_moe_codegen.py.
+// Weights are MFMA operand A. Subtile (m,n) starts at base+(n*4+m)*4;
+// lane l holds C[n*16+l%16][m*16+4*(l/16) .. +3].
 
 namespace pin {
 using namespace kittens;
@@ -49,10 +38,10 @@ using acc_ranges = ducks::art::transpose_2d<
     4,
     4>;
 
-// 64x128 fp8 operand tile pinned at v[BASE..BASE+31] (4 rt_16x128 subtiles)
+// Four FP8 subtiles in v[BASE..BASE+31].
 template <int BASE>
 using OpTile = art<fp8e4m3, 64, 128, ducks::rt_layout::row, rt_16x128_s, op_ranges<BASE>>;
-// 64x64 fp32 accumulator tile pinned at a[ACC..ACC+63]
+// FP32 accumulators in a[ACC..ACC+63].
 template <int ACC>
 using AccTile = art<float, 64, 64, ducks::rt_layout::col, rt_16x16_s, acc_ranges<ACC>>;
 
@@ -68,7 +57,7 @@ __device__ __forceinline__ void clobber_all()
     ducks::art::clobber<acc_ranges<192>>();
 }
 
-// Zero all 256 accumulator AGPRs (+2 wait states before an MFMA reads them).
+// MFMA needs two wait states after AGPR writes.
 template <int ACC>
 __device__ __forceinline__ void zero_acc()
 {
@@ -88,7 +77,7 @@ __device__ __forceinline__ void zero_acc_all()
     asm volatile("s_nop 2" ::: "memory");
 }
 
-// Accumulator subtile (n, m) of the tile at AGPR base ACC <-> four floats.
+// Transfer accumulator subtile (n,m) to/from four floats.
 template <int ACC, int n, int m>
 __device__ __forceinline__ void acc_rd4(float (&x)[4])
 {
@@ -108,10 +97,8 @@ __device__ __forceinline__ void acc_wr4(const float (&x)[4])
     macros::v_mov_b32_up2p<range::lo + 3>(x[3]);
 }
 
-// Store one 64x64 accumulator tile (AGPR base ACC) as bf16 with 16-byte stores: subtiles m, m+1 are
-// paired and v_permlane16_swap gives each lane 8 contiguous columns. store_acc into a buffer over
-// one 256-row output tile (rows relative to it): rows >= nv (padding) get an out-of-range offset,
-// so the write is dropped but the instruction still issues and counts in vmcnt like the others
+// Pair adjacent subtiles for 16-byte BF16 stores. Rows >= nv use out-of-range offsets:
+// the buffer drops their writes, but the instructions still count toward vmcnt.
 template <int ACC>
 __device__ __forceinline__ void store_acc_rows(const i32x4 rsrc,
                                                const int ldc,
@@ -149,14 +136,8 @@ __device__ __forceinline__ void store_acc_rows(const i32x4 rsrc,
 
 } // namespace pin
 
-// ================================================================ 3. tile loads and the K-step
-// MFMA cluster Global -> LDS tile loads and the pinned MFMA/load cluster of the grouped GEMM's
-// K-step.
-//
-// A 128x128 fp8 shared tile is filled by 4 direct-to-LDS 16-byte loads per thread (load i = 0..3).
-// Three sources: plain_tile_load uses HK group loads on 32x128 row-major subtiles;
-// shuf_tile_load reads AITER's shuffle_weight(w, (16,16)) layout; gather_tile_load reads rows
-// from a token-major matrix through per-thread byte offsets.
+// Tile loads: four 16-byte transfers per thread fill a 128x128 FP8 LDS tile.
+// Sources are contiguous subtiles, shuffled weights, or gathered token rows.
 
 constexpr int NUM_WARPS = 4;
 using G                 = kittens::group<NUM_WARPS>;
@@ -179,9 +160,7 @@ struct plain_tile_load
     }
 };
 
-// aiter shuffle_weight(w, (16,16)) fp8 layout: [N][K] viewed as [N/16][K/32][2][16 rows][16 B]. A
-// 128-row block is 128*K contiguous bytes; a 128-column K-step advances 16x further; each lane's
-// 16-byte chunk moves to its shuffled offset.
+// shuffle_weight(w, (16,16)): [N/16][K/32][2][16 rows][16 bytes].
 template <int K>
 __device__ __forceinline__ uint32_t shuf_off(int row, int col)
 {
@@ -256,8 +235,7 @@ __device__ __forceinline__ void load_tile_shuf(ST& dst, const fp8e4m3* w, int rb
     ld.template issue<3>();
 }
 
-// Gathered rows: srsrc spans the whole token-major source, off[i] = byte offset (row and column) of
-// load i, soff = K-step base (buffer instruction scalar offset).
+// srsrc spans the source; off[i] is a row/column byte offset, soff the K-step offset.
 struct gather_src
 {
     i32x4 srsrc;
@@ -302,17 +280,15 @@ __device__ __forceinline__ void load_tile_gather(ST& dst, const gather_src& gs)
     ld.template issue<3>();
 }
 
-// One quarter of a K-step: the 16 MFMAs of accumulator tile ACC (activation operand tile AR, weight
-// operand tile BR) interleaved with the 4 global->LDS loads of the next tile (ld) and the 8
-// LDS->register reads of the next operand tile DST. Weight block m uses byte JSEL of the weight
-// scale pb, activation subtile n byte n of pa.
+// Quarter K-step: 16 MFMAs interleaved with 4 global->LDS loads and 8 LDS reads.
+// AR/BR are activation/weight operands, DST the next operand. Scales use bytes JSEL of pb, n of pa.
 #define PIN_SMMA(n, m)                                                \
     do                                                                \
     {                                                                 \
         if constexpr(!SKIP)                                           \
             mma_ABt_scaled<m, n, JSEL, n>(acc, wt, act, acc, pb, pa); \
     } while(0)
-// SKIP: loads and LDS reads only (the accumulator's rows are all padding)
+// SKIP preserves loads but omits MFMAs for padding rows.
 template <int JSEL, int ACC, int AR, int BR, int DST, bool SKIP = false, typename LOAD, typename ST>
 __device__ __forceinline__ void
 do_interleaved_cluster(LOAD ld, const ST& src, const uint32_t pa, const uint32_t pb)
@@ -389,45 +365,29 @@ do_interleaved_cluster(LOAD ld, const ST& src, const uint32_t pa, const uint32_t
 
 } // namespace pin
 
-// ================================================================ 4. grouped GEMM
-// Persistent grouped FP8 GEMM for the two MoE stages (4 waves, pinned registers, E8M0 scales via
-// V_MFMA_SCALE).
-//
-// Rows are expert-sorted and padded to 256-row tiles (tile_expert[t] = expert of row tile t,
-// tile_expert[n_mtiles] = number of used tiles). Each workgroup walks output tiles (256 rows x 256
-// columns) with stride gridDim.x and keeps one K-step pipeline running across tile boundaries: the
-// last two K-steps of a tile already prefetch the first two of the next one (the last tile
-// prefetches itself, never consumed).
-//
-//   GATE_UP (stage 1): A rows gathered from the token-major quantized activations through AOFF; the
-//   tile's two
-//     128-row weight blocks are gate j and up j; epilogue act = silu(min(g, L)) * clamp(u, -L, L)
-//     quantized to FP8 with a pow2 scale per (row, 128 columns) -> act_out [rows][NTOT/2] and,
-//     already packed for stage 2's MFMA, act_pa (PA layout below, K/128 = NTOT/256).
-//   !GATE_UP (stage 2): A = act_out rows (contiguous); epilogue stores the unweighted expert output
-//   as bf16
-//     Cout [rows][NTOT] (the router weight is applied by the combine).
-// Weights: [E][NTOT][K] fp8 in aiter's shuffle_weight(w, (16,16)) layout.
-// Scales: PA = per-lane packed A-scale words [K/128][n_mtiles][2][2][16]; SB = fp32 pow2 weight
-// block scales [E][NTOT/128][K/128] (only the exponent byte is used).
+// Persistent grouped GEMM: 256x256 tiles, four waves, expert rows padded to 256.
+// tile_expert[n_mtiles] holds the used-tile count. Workgroups advance by gridDim.x;
+// each tile's last two K-steps prefetch the next tile (the final prefetch is unused).
+// Stage 1 gathers via AOFF, then applies SwiGLU and FP8 quantization into act_out/act_pa.
+// Stage 2 reads contiguous activations and writes unweighted BF16 Cout[rows][NTOT].
+// W[E][NTOT][K] uses shuffle_weight(w, (16,16)). Packed activation scales:
+// PA[K/128][n_mtiles][2][2][16]. SB[E][NTOT/128][K/128] stores FP32 power-of-two
+// weight scales; V_MFMA_SCALE consumes their exponent bytes.
 
-constexpr int MOE_ROWS_MAX =
-    1 << 21; // row extent of the A global layouts (only their strides are used)
+constexpr int MOE_ROWS_MAX = 1 << 21; // Layout extent; only strides are used.
 
 namespace pin {
 __device__ __forceinline__ float lane_max16(float m)
-{ // max over the 4 16-lane rows (xor 16, xor 32)
+{ // Max across four 16-lane rows.
     auto s = __builtin_amdgcn_permlane16_swap(__float_as_uint(m), __float_as_uint(m), false, false);
     m      = fmaxf(__uint_as_float(s[0]), __uint_as_float(s[1]));
     auto t = __builtin_amdgcn_permlane32_swap(__float_as_uint(m), __float_as_uint(m), false, false);
     return fmaxf(__uint_as_float(t[0]), __uint_as_float(t[1]));
 }
 
-// Stage-1 epilogue for row tile br, weight column block nb0 (gate) / its up block: two passes over
-// the accumulators. Pass 1 computes the activations, writes them back over the (no longer needed)
-// gate accumulators and records the per-row amax of this wave's 64 columns in LDS; pass 2 applies
-// the pow2 row scale, quantizes and stores the activations and the scale exponents (as stage 2's
-// packed A-scale words: byte n of word [nb0][br][I][wm][lr] is row I*128 + wm*64 + n*16 + lr).
+// Pass 1 overwrites gate accumulators with SwiGLU and records row maxima in LDS.
+// Pass 2 quantizes and packs scales: byte n of [nb0][br][I][wm][lr] describes
+// row I*128 + wm*64 + n*16 + lr.
 template <int NTOT>
 __device__ __forceinline__ void epilogue_silu_quant(const int br,
                                                     const int nb0,
@@ -442,8 +402,7 @@ __device__ __forceinline__ void epilogue_silu_quant(const int br,
 {
     constexpr int WARPS_COL = 2, BLOCK_SIZE_ROW = 256, ACT_N = NTOT / 2;
     __shared__ float amax_s[WARPS_COL][BLOCK_SIZE_ROW];
-    // silu(min(g, L)) * clamp(u, -L, L) for accumulator subtile (n, m) of row half I (gate tile
-    // c[I][0], up c[I][1])
+    // Clamped SwiGLU on gate c[I][0] and up c[I][1], subtile (n,m).
     auto act4 = [&]<int I, int n, int m>(float(&o)[4]) {
         float gg[4], uu[4];
         acc_rd4<I * 128, n, m>(gg);
@@ -486,7 +445,7 @@ __device__ __forceinline__ void epilogue_silu_quant(const int br,
             ...);
     }(std::make_integer_sequence<int, 8>{});
     asm volatile("s_waitcnt lgkmcnt(0)\n s_barrier" ::: "memory");
-    // 8-byte stores: subtile pairs (m, m+1) exchanged with permlane16_swap
+    // Pair subtiles with permlane16_swap for 8-byte stores.
     const int colw = nb0 * 128 + wn * 64;
     uint32_t pw    = 0;
     [&]<int... Is>(std::integer_sequence<int, Is...>) {
@@ -536,8 +495,7 @@ __device__ __forceinline__ void epilogue_silu_quant(const int br,
 }
 } // namespace pin
 
-// HALF_SKIP: tiles whose rows 128..255 are all padding skip those rows' MFMAs (worth it when most
-// experts fill under half a tile; the duplicated clusters cost a little I-cache otherwise)
+// HALF_SKIP omits MFMAs for an empty second half; use only for small expert batches.
 template <int NTOT, int K, bool GATE_UP, bool HALF_SKIP = false>
 __global__ __launch_bounds__(256, 1) __attribute__((amdgpu_num_vgpr(128))) void moe_gemm_kernel(
     const kittens::gl<fp8e4m3, 1, 1, MOE_ROWS_MAX, K> A,
@@ -560,9 +518,7 @@ __global__ __launch_bounds__(256, 1) __attribute__((amdgpu_num_vgpr(128))) void 
     constexpr int blocks_col = NTOT / BLOCK_SIZE_COL;
     constexpr int k_iters    = K / BLOCK_K;
     static_assert(k_iters >= 4, "pipeline needs >= 4 K-steps per tile");
-    // vmcnt of a steady-state step (16 tile loads + this wave's newest scale load newer than the
-    // awaited tile); the first steps of a tile also have the previous tile's epilogue stores in
-    // flight
+    // vmcnt: 16 tile loads + 1 scale load; tile entry also counts prior epilogue stores.
     constexpr int VS     = 17;
     constexpr int NSTORE = GATE_UP ? 16 : 32;
     constexpr int VW     = VS + NSTORE;
@@ -574,8 +530,7 @@ __global__ __launch_bounds__(256, 1) __attribute__((amdgpu_num_vgpr(128))) void 
 
     __shared__ ST_A As[2][2];
     __shared__ ST_B Bs[2][2];
-    // per-wave ring of packed A-scale words (one direct-to-LDS load per wave per K-step, read at
-    // the top of the step)
+    // Packed A scales: one direct-to-LDS load per wave per K-step.
     __shared__ uint32_t sring[4][NUM_WARPS][64];
 
     clobber_all();
@@ -589,15 +544,14 @@ __global__ __launch_bounds__(256, 1) __attribute__((amdgpu_num_vgpr(128))) void 
     if((int)blockIdx.x >= total)
         return;
 
-    // work item s -> (row tile r, column tile c); consecutive groups of 8 workgroups share a column
-    // (weight reuse)
+    // Map work to (row, column); groups of eight reuse a weight column.
     auto map = [&](int s, int& r, int& c) {
         const int b  = s % G;
         const int wg = (s - b + G <= total && G % 8 == 0) ? s - b + (b % 8) * (G / 8) + b / 8 : s;
         r            = wg / blocks_col;
         c            = wg % blocks_col;
     };
-    // 128-row weight block j of column tile c (GATE_UP: gate block c, up block c + NTOT/256)
+    // Stage 1 pairs gate block c with up block c + NTOT/256.
     auto nb_of = [](int c, int j) { return GATE_UP ? c + j * (NTOT / 256) : 2 * c + j; };
 
     int warp_m          = (warpid() / WARPS_COL);
@@ -619,8 +573,7 @@ __global__ __launch_bounds__(256, 1) __attribute__((amdgpu_num_vgpr(128))) void 
     auto pa_of = [&](int gg, int I) {
         return sring[gg & 3][warpid()][I * 32 + warp_m * 16 + laneid() % 16];
     };
-    // MFMA weight-scale word of column tile c: E8M0 exponent of its weight block 0 in byte 0, block
-    // 1 in byte 1
+    // Pack weight-block exponents into bytes 0 and 1.
     auto pb_raw = [&](int e, int c, int kk) {
         const uint32_t b0 = SBc[((size_t)e * (NTOT / 128) + nb_of(c, 0)) * KB + kk],
                        b1 = SBc[((size_t)e * (NTOT / 128) + nb_of(c, 1)) * KB + kk];
@@ -637,8 +590,7 @@ __global__ __launch_bounds__(256, 1) __attribute__((amdgpu_num_vgpr(128))) void 
     int s = blockIdx.x, br, bc;
     map(s, br, bc);
     int ex = TE[br];
-    // rows 128..255 of the tile are all padding: skip their MFMAs (accumulators 128 / 192 stay
-    // zero; loads still issue, so the vmcnt accounting is unchanged)
+    // Skip empty-half MFMAs, retaining loads for unchanged vmcnt accounting.
     auto half_empty = [&](int r, int e) {
         return HALF_SKIP &&
                ((cint_p)ecnt)[e] - (r * BLOCK_SIZE_ROW - ((cint_p)eoff)[e]) <= BLOCK_SIZE_ROW / 2;
@@ -647,8 +599,7 @@ __global__ __launch_bounds__(256, 1) __attribute__((amdgpu_num_vgpr(128))) void 
     int nbr_ = br, nbc = bc, nex = ex;
     bool has_next = false;
 
-    // GATE_UP: gathered-row byte offsets of this thread's 8 A rows for the current / next tile
-    // (next loaded 4 K-steps before the switch)
+    // Stage-1 gather offsets; prefetch the next tile's offsets four K-steps early.
     uint32_t aoc[8], aon[8];
     const i32x4 q_rsrc = make_srsrc((void*)A.raw_ptr, 0x7ffffff0u);
     auto load_aoff     = [&](int row_tile, uint32_t(&o)[8]) {
@@ -673,7 +624,7 @@ __global__ __launch_bounds__(256, 1) __attribute__((amdgpu_num_vgpr(128))) void 
             gs.off[i] = o[h * 4 + i];
         return gs;
     };
-    // A half h (128 rows) of row tile r, K-step kk into LDS tile dst
+    // Load 128-row half h at K-step kk.
     auto load_a_tile = [&](ST_A& dst, int h, int r, int kk) {
         if constexpr(GATE_UP)
             load_tile_gather(dst, gsrc(aoc, h, kk));
@@ -724,10 +675,8 @@ __global__ __launch_bounds__(256, 1) __attribute__((amdgpu_num_vgpr(128))) void 
 
     uint32_t pbr = pb_raw(ex, bc, 0);
 
-    // K-step k of the current tile; the global loads it issues are for step k + 2 (wrapping to the
-    // next tile) !GATE_UP: the previous tile's output is stored one accumulator at a time inside
-    // the next tile's first K-step, each right before the cluster that reuses that accumulator, so
-    // the stores overlap MFMAs
+    // Prefetch K-step k+2 across tile boundaries. Stage 2 overlaps prior output stores
+    // with the next tile's first step, storing each accumulator before reusing it.
     i32x4 p_crs{};
     int p_nv = 0, p_col0 = 0, p_col1 = 0;
     auto epi_part = [&]<int ACC>() {
@@ -760,8 +709,7 @@ __global__ __launch_bounds__(256, 1) __attribute__((amdgpu_num_vgpr(128))) void 
         gather_src ga0, ga1;
         if constexpr(GATE_UP)
         {
-            // opaque per step: nothing derived from the offsets can be hoisted across the unrolled
-            // K loop
+            // Prevent offset calculations from being hoisted across K-steps.
             asm volatile(""
                          : "+v"(aoc[0]),
                            "+v"(aoc[1]),
@@ -863,8 +811,7 @@ __global__ __launch_bounds__(256, 1) __attribute__((amdgpu_num_vgpr(128))) void 
         }
         else
         {
-            // the previous tile's stores go out inside step 0: none before its top wait, two parts
-            // (16) before the mid one
+            // Step 0: no prior stores at the first wait; 16 at the second.
             step.template operator()<VS, VS + NSTORE / 2, true>(0);
             step.template operator()<VW, VS, false>(1);
         }
@@ -895,8 +842,7 @@ __global__ __launch_bounds__(256, 1) __attribute__((amdgpu_num_vgpr(128))) void 
             }
             else
             {
-                // valid rows of this tile (the rest pad expert ex to whole tiles; their outputs are
-                // never read)
+                // Exclude padding rows from output stores.
                 const int nv    = ((cint_p)ecnt)[ex] - (br * BLOCK_SIZE_ROW - ((cint_p)eoff)[ex]);
                 const i32x4 crs = make_srsrc(Cout + (size_t)br * BLOCK_SIZE_ROW * NTOT,
                                              BLOCK_SIZE_ROW * NTOT * 2);
@@ -925,35 +871,27 @@ __global__ __launch_bounds__(256, 1) __attribute__((amdgpu_num_vgpr(128))) void 
         first       = false;
         half1_empty = half_empty(br, ex);
     }
-    asm volatile(
-        "s_waitcnt vmcnt(0)" ::
-            : "memory"); // dead prefetches still landing in LDS: drain before the block retires
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory"); // Drain unused LDS prefetches before exit.
 }
 
-// ================================================================ 5. routing and combine
-// Routing (expert sort into 256-row tiles) and the final weighted combine.
-//
-// Sorted rows: expert e owns rows [off[e], off[e] + roundup(cnt[e], TM)); row r holds token tok[r]
-// (-1 = padding) with router weight w[r]; pos[t * S + j] = sorted row of token t's j-th selection.
-// Selections of an out-of-range expert id go to expert 0 with weight 0.
+// Routing: expert e owns [off[e], off[e]+roundup(cnt[e],TM)).
+// tok[r]=-1 marks padding; pos[t*S+j] maps a selection to its sorted row.
+// Invalid expert IDs map to expert 0 with zero weight.
 
 constexpr int SORT_EMAX = 1024, SORT_PER_BLOCK = 4096;
 constexpr int SORT_THREADS = 1024, SORT_WAVES = SORT_THREADS / 64;
-// Limit the striped histogram to 304 experts to keep count_and_quant's LDS allocation
-// below 40 KiB (four allocations fit per CU).
+// 304 experts keep striped LDS below 40 KiB: four allocations per CU.
 constexpr int SORT_STRIPED_EMAX = 304;
 static_assert(SORT_PER_BLOCK % SORT_THREADS == 0 && SORT_PER_BLOCK < 65536);
 typedef unsigned u32x4 __attribute__((ext_vector_type(4)));
 
-// Bank = lane for every histogram access, even when all lanes select one expert.
-// Pack two 16-bit counts in each word; their block-wide sums fit without carry.
+// Lane-striped histogram; two 16-bit counts per word cannot overflow within a block.
 __device__ __forceinline__ void
 moe_count_block(int blk, const int* __restrict__ tk_e, int n, int E, int* __restrict__ cnt)
 {
     if(E > SORT_STRIPED_EMAX)
     {
-        // Larger expert sets exceed the striped LDS budget; retain the full
-        // API range using global atomics, which do not access LDS banks.
+        // Larger expert sets exceed the LDS budget.
         const int b = blk * SORT_PER_BLOCK;
         for(int i = b + threadIdx.x; i < min(n, b + SORT_PER_BLOCK); i += blockDim.x)
         {
@@ -994,9 +932,8 @@ moe_count_block(int blk, const int* __restrict__ tk_e, int n, int E, int* __rest
             atomicAdd(&cnt[e], totals[e]);
 }
 
-// Expert offsets (tile-padded), tile_e[t] = expert of row tile t (-1 past the used tiles) and
-// tile_e[max_tiles] = number of used tiles (read by the persistent GEMM); marks each expert's
-// padding rows (tok -1, weight 0). One block of SORT_EMAX threads (thread e = expert e).
+// One thread per expert: assign padded offsets and tile IDs, initialize padding.
+// tile_e[max_tiles] stores the used-tile count; unused tile IDs are -1.
 template <int TM>
 __global__ void moe_scan(const int* __restrict__ cnt,
                          int E,
@@ -1029,7 +966,7 @@ __global__ void moe_scan(const int* __restrict__ cnt,
     if(e == 0)
         tile_e[max_tiles] = s_off[E] / TM;
     __syncthreads();
-    // padding rows: wave i takes experts i, i + 16, ..., one row per lane
+    // Wave i pads experts i, i+16, ...; one row per lane.
     for(int x = threadIdx.x / 64; x < E; x += SORT_EMAX / 64)
     {
         const int cx = cnt[x], end = s_off[x + 1];
@@ -1038,8 +975,7 @@ __global__ void moe_scan(const int* __restrict__ cnt,
             tok[r] = -1;
             w[r]   = 0.f;
         }
-        // The expert already owns this tile range. Fill it directly instead of
-        // binary-searching shared offsets independently for every tile.
+        // Fill this expert's tile IDs directly.
         for(int t = s_off[x] / TM + threadIdx.x % 64; t < end / TM; t += 64)
             tile_e[t] = x;
     }
@@ -1095,8 +1031,7 @@ __global__ void moe_scatter(const int* __restrict__ tk_e,
         local[j]           = (old >> shift) & 0xffffu;
     }
     __syncthreads();
-    // Build lane prefixes independently for each expert pair. Subtraction and
-    // addition operate on both packed halves without borrow or carry.
+    // Per-expert lane prefixes; packed halves cannot borrow or carry.
     for(int p = wave; p < pairs; p += SORT_WAVES)
     {
         const unsigned own = hist[p][lane];
@@ -1120,15 +1055,14 @@ __global__ void moe_scatter(const int* __restrict__ tk_e,
             striped[p * 2 + 1][lane] = prefix >> 16;
     }
     __syncthreads();
-    // Issue expert reservations across all lanes, not serially from wave leaders.
+    // Distribute expert reservations across lanes.
     for(int e = threadIdx.x; e < E; e += blockDim.x)
     {
         const unsigned count = totals[e];
         totals[e]            = count ? atomicAdd(&cursor[e], count) : 0;
     }
     __syncthreads();
-    // Uniform base loads broadcast within each wave. Replicate the bases into
-    // the lane-striped offsets so the final expert-indexed lookup stays bank-free.
+    // Broadcast bases into lane-striped offsets for bank-conflict-free lookups.
     for(int e = wave; e < E; e += SORT_WAVES)
         striped[e][lane] += totals[e];
     __syncthreads();
@@ -1147,8 +1081,7 @@ __global__ void moe_scatter(const int* __restrict__ tk_e,
     }
 }
 
-// out[t] = sum_j row_w[pos] * cw[pos] over token t's S sorted rows (stage 2 stores unweighted
-// expert outputs).
+// Weighted sum of each token's S expert outputs.
 template <int D, int S>
 __global__ void moe_reduce_w(const bf16* __restrict__ cw,
                              const int* __restrict__ pos,
@@ -1162,7 +1095,7 @@ __global__ void moe_reduce_w(const bf16* __restrict__ cw,
     {
         const int r   = pos[t * S + j];
         const float w = row_w[r];
-        // read once and too large to stay cached: non-temporal
+        // One-use expert outputs: non-temporal loads.
         const u32x4 vv =
             __builtin_nontemporal_load(reinterpret_cast<const u32x4*>(cw + (size_t)r * D + c));
         const uint4 v = {vv.x, vv.y, vv.z, vv.w};
@@ -1179,14 +1112,10 @@ __global__ void moe_reduce_w(const bf16* __restrict__ cw,
     *reinterpret_cast<uint4*>(out + (size_t)t * D + c) = o;
 }
 
-// ================================================================ 6. activation quantization and
-// scale tables Activation quantization and the scale / offset tables the grouped GEMM consumes.
-//
-// Activations use e4m3 with a power-of-two scale per (row, 128 columns); weights use e4m3
-// with a power-of-two scale per 128x128 block. E8M0 scale exponents are fed to V_MFMA_SCALE.
+// Activation quantization and gather tables.
 
-// One wave per token: pow2 1x128 FP8 quant (token-major q [T][D], scales s [D/128][T]). Lane = 16
-// contiguous elements (32 B read, 16 B store), 8 lanes per 128-column scale block.
+// Power-of-two 1x128 FP8 quantization: q[T][D], scales s[D/128][T].
+// One wave per token, 16 elements per lane, eight lanes per scale block.
 template <int D>
 __device__ __forceinline__ void quant_tok16_block(
     int blk, const bf16* __restrict__ x, int T, fp8e4m3* __restrict__ q, float* __restrict__ s)
@@ -1230,8 +1159,7 @@ __device__ __forceinline__ void quant_tok16_block(
     }
 }
 
-// Expert counts (blocks [0, count_blocks)) and the input quantization (the rest, 4 tokens each) in
-// one launch: the two are independent, and the counts must be complete before moe_scan.
+// Fuse independent counting and quantization grids; finish counting before moe_scan.
 template <int D>
 __global__ void count_and_quant(const int* __restrict__ tk_e,
                                 int n,
@@ -1250,9 +1178,7 @@ __global__ void count_and_quant(const int* __restrict__ tk_e,
 }
 
 namespace pin {
-// Tile row / column (element) of the 16 bytes this thread loads in load i: the lane mapping of
-// load_one_shuf. Kept as a separate copy because routing the GEMM's loads through this helper
-// perturbs the GEMM's instruction schedule.
+// Same coordinates as load_one_shuf; sharing this helper changes the GEMM schedule.
 struct tile_rc
 {
     int row, col;
@@ -1282,15 +1208,10 @@ __device__ __forceinline__ tile_rc load_coord(int i)
 
 } // namespace pin
 
-// Stage-1 tables, one block per row tile:
-//   aoff[tile][thread][h*4 + i] = token(row) * K + column of the 16 bytes the thread loads in load
-//   i of A half h
-//     (padding rows -> token 0: computed, never used); the K-step base goes in the buffer
-//     instruction's scalar offset. Only for the used tiles.
-//   pa[kb][tile][I][wm][l]: MFMA A-scale words; byte n = E8M0 exponent of row tile*256 + I*128 +
-//   wm*64 + n*16 + l,
-//     read from the token-major scales s [KB][T] through tok (padding rows and rows past the used
-//     tiles, whose tok is uninitialized, get 1.0).
+// Stage-1 tables, one block per tile. aoff[tile][thread][h*4+i] stores token*K+column;
+// the K-step offset is added by the buffer instruction. Padding gathers token 0.
+// pa[kb][tile][I][wm][l] byte n is the scale exponent for row
+// tile*256+I*128+wm*64+n*16+l. Padding rows use unit scale.
 template <int K, int KB>
 __global__ void build_gather_tables(const int* __restrict__ tok,
                                     const int* __restrict__ tile_e,
@@ -1302,7 +1223,7 @@ __global__ void build_gather_tables(const int* __restrict__ tok,
 {
     using ST_A     = st_fp8e4m3<128, 128, st_16x128_s>;
     const int tile = blockIdx.x;
-    // Unused tiles have no initialized token rows and are never read by GEMM.
+    // Unused tiles have uninitialized token IDs; do not read them.
     if(tile >= tile_e[max_tiles])
         return;
 #pragma unroll
@@ -1339,12 +1260,12 @@ __global__ void build_gather_tables(const int* __restrict__ tok,
     p[1]     = {o[4], o[5], o[6], o[7]};
 }
 
-// ================================================================ 7. host side
+// Host launch and workspace.
 
 namespace {
 constexpr int D = 4096, I = 1024, KB1 = D / 128, KB2 = I / 128, TM = 256;
 inline size_t align256(size_t x) { return (x + 255) & ~size_t(255); }
-// sorted rows: every expert padded to whole tiles (upper bound E * (TM - 1) padding rows)
+// At most TM-1 padding rows per expert.
 inline int rowmax(int T, int S, int E)
 {
     return (int)((((size_t)T * S + (size_t)E * (TM - 1)) + 255) / 256 * 256);
@@ -1365,7 +1286,7 @@ struct Workspace
     int* pos;             // [T * S] sorted row of each selection
     int *cnt, *off, *cur; // [E] routing counters
 };
-// Carves the workspace at base (nullptr: size only); returns the bytes used.
+// Return workspace bytes; nullptr queries size only.
 size_t carve(char* base, int T, int S, int E, Workspace* ws)
 {
     const size_t R = rowmax(T, S, E), NT = R / TM;
@@ -1394,7 +1315,7 @@ size_t carve(char* base, int T, int S, int E, Workspace* ws)
         *ws = w;
     return o;
 }
-// Per call: a process may drive several devices.
+// Query the current device on every call.
 int num_cus()
 {
     int n = 0, dev = 0;
@@ -1431,10 +1352,10 @@ int forward(const bf16* x,
     moe_scan<TM><<<1, SORT_EMAX, 0, st>>>(ws.cnt, E, ws.off, ws.cur, ws.tile_e, NT, ws.tok, ws.w);
     moe_scatter<<<count_blocks, SORT_THREADS, 0, st>>>(
         tk_e, tk_w, n, E, S, ws.cur, ws.tok, ws.w, ws.pos);
-    // stage 1: gate/up GEMM on gathered token rows + clamped SwiGLU + FP8 requant
+    // Stage 1: gate/up, clamped SwiGLU, FP8 requantization.
     build_gather_tables<D, KB1>
         <<<NT, 256, 0, st>>>(ws.tok, ws.tile_e, NT, ws.sa1, T, ws.aoff, ws.pa1);
-    // Skip all-padding tile halves when routed experts average at most 144 rows.
+    // Half-skip when routed experts average <=144 rows.
     const bool half_skip = (long)T * 8 <= 144L * (E - (S == 9 ? 1 : 0));
     auto gemm1 =
         half_skip ? moe_gemm_kernel<2 * I, D, true, true> : moe_gemm_kernel<2 * I, D, true, false>;
@@ -1451,7 +1372,7 @@ int forward(const bf16* x,
                                                              ws.aoff,
                                                              ws.cnt,
                                                              ws.off);
-    // stage 2: down GEMM, then the weighted per-token combine
+    // Stage 2: down projection and weighted combine.
     auto gemm2 =
         half_skip ? moe_gemm_kernel<D, I, false, true> : moe_gemm_kernel<D, I, false, false>;
     gemm2<<<std::min(ncu, NT * (D / 256)), 256, 0, st>>>(

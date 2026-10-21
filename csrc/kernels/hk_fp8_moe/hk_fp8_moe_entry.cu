@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// ctypes entry points for the HipKittens block-FP8 grouped MoE (hk_moe.h): the layer forward and
-// its workspace size. Shapes, dtypes and the workspace allocation are checked / done by
-// aiter/ops/hk_fp8_moe.py.
+// ctypes bindings; aiter/ops/hk_fp8_moe.py validates tensors and allocates workspace.
 #include "aiter_hip_common.h"
 
 #include "aiter_ctypes_error.h"
@@ -26,7 +24,7 @@ const char* moe_status_message(int rc)
 }
 } // namespace
 
-// Workspace in 256-byte units (an int return; bytes can pass 2^31 at large T).
+// Use 256-byte units to fit workspace sizes in the int return.
 AITER_CTYPES_DEFINE_ENTRYPOINT(
     aiter_hk_fp8_moe_workspace_units,
     (int64_t num_tokens, int64_t topk, int64_t num_experts, hipStream_t stream),
