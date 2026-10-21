@@ -257,6 +257,55 @@ def test_op(
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
 
 
+def _e2m1_lut(device):
+    return torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+        device=device,
+        dtype=torch.float32,
+    )
+
+
+def _dequant_packed_fp4(w_packed, w_scale):
+    """Exact fp32 weights from the kernel inputs: w_packed (E, K/2, N) uint8 (low nibble =
+    lower K), w_scale (E, K/32, N) uint8 e8m0 -> (E, K, N)."""
+    E, K2, N = w_packed.shape
+    lut = _e2m1_lut(w_packed.device)
+    lo = lut[(w_packed & 0xF).long()]
+    hi = lut[(w_packed >> 4).long()]
+    vals = torch.stack([lo, hi], dim=2).reshape(E, 2 * K2, N)
+    scale = torch.ldexp(
+        torch.ones(w_scale.shape, device=w_scale.device, dtype=torch.float32),
+        w_scale.to(torch.int32) - 127,
+    ).repeat_interleave(32, dim=1)
+    return vals * scale
+
+
+@pytest.mark.parametrize("scale_lo, scale_hi", [(120, 134), (3, 40), (200, 222)])
+@pytest.mark.parametrize("m, n, k, n_expts_tot, n_expts_act", [(192, 1536, 5120, 384, 6), (24, 5120, 2304, 48, 6)])
+def test_gfx942_gluon_dequant_codes_and_scales(m, n, k, n_expts_tot, n_expts_act, scale_lo, scale_hi):
+    """gfx942 Gluon kernel: every fp4 code (incl. -0) under e8m0 scales across the supported
+    range, against an exact reference built from the same packed inputs."""
+    if arch_info.get_arch() != "gfx942":
+        pytest.skip("gfx942 Gluon a16w4 kernel only")
+    device = "cuda"
+    torch.manual_seed(0)
+    m, rdata, gindx, sindx = init_routing_data(m, n_expts_tot, n_expts_act, True, False, device=device)
+    x = (torch.randn((m, k), device=device) * 0.1).to(torch.bfloat16)
+    w_packed = torch.randint(0, 256, (n_expts_tot, n, k // 2), dtype=torch.uint8, device=device)
+    w_scale = torch.randint(scale_lo, scale_hi + 1, (n_expts_tot, n, k // 32), dtype=torch.uint8, device=device)
+    # the kernel takes (E, K/2, N) with stride(-2) == 1 and (E, K/32, N) views (as vLLM does)
+    w_tri = w_packed.transpose(1, 2)
+    s_tri = w_scale.transpose(1, 2)
+    w_ref = _dequant_packed_fp4(w_tri, s_tri).to(torch.bfloat16)
+    ref_y = moe_gemm_torch(x, w_ref, None, rdata, gindx, None, None, False)
+    tri_y = moe_gemm_a16w4(
+        x, w_tri, None, s_tri, None, None, None, rdata, gindx, None, None, None,
+        torch.bfloat16, False, backend="gluon",
+    )
+    # bf16 accumulation differences only: the dequant itself is exact
+    assert_close(ref_y, tri_y, maxtol=4e-1 * 2.0 ** (scale_hi - 127), rmstol=4e-2)
+
+
 def _ep_setup(
     m, n, k, n_expts_tot, n_expts_act, ep_size, ep_rank, do_gather, do_scatter
 ):
