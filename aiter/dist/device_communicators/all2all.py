@@ -179,10 +179,7 @@ class MoriV2All2AllManager(All2AllManagerBase):
             op_cls = dispatch_module.EpDispatchCombineOp
         except (ImportError, AttributeError) as exc:
             raise ImportError(
-                "MoRI v2 requires 'mori.cco' and "
-                "'mori.ops.dispatch_combine_v2'. Please follow "
-                "https://github.com/ROCm/mori/blob/main/README.md to install "
-                "a MoRI version with v2 CCO support."
+                "MoRI v2 requires 'mori.cco' and 'mori.ops.dispatch_combine_v2'."
             ) from exc
 
         super().__init__(cpu_group)
