@@ -47,8 +47,8 @@ CALL_ID_LIMIT = 1 << 31
 
 def load_driver(path: str, abi: int = 2):
     """Bind the large driver. abi 3 (r12 build, LG_COMM_ABI_VERSION >= 4): lg_launch_v1 / lg_poison_v1 are compiled out; lg_gpage_attach_v1 attaches the per-comm ERR/STEP
-    page once after lg_attach_v1; lg_launch_v2 = GEMM + quiet_ready (LG_QR_WGS workgroups; the best-effort NaN fill under ERR is folded into it: there is NO separate fill node and the runtime must NOT add one); lg_abi_info_v1 reports the ABI for the
-    runtime's static checks."""
+    page once after lg_attach_v1; lg_launch_v2 = GEMM + quiet_ready (LG_QR_WGS workgroups; the best-effort NaN fill under ERR is folded into it: there is NO separate fill node and the runtime must NOT add one); lg_abi_info_v2 reports the ABI (and the host
+    build's LG_QR_WGS) for the runtime's static checks."""
     lib = C.CDLL(path)
     vp, u32, u64, i32 = C.c_void_p, C.c_uint32, C.c_uint64, C.c_int32
     if abi == 3:
@@ -77,8 +77,8 @@ def load_driver(path: str, abi: int = 2):
         lib.lg_window_bytes_v1.argtypes = [u32]
         lib.lg_info_v1.restype = i32
         lib.lg_info_v1.argtypes = [vp]
-        lib.lg_abi_info_v1.restype = i32
-        lib.lg_abi_info_v1.argtypes = [C.POINTER(u64)]
+        lib.lg_abi_info_v2.restype = i32
+        lib.lg_abi_info_v2.argtypes = [C.POINTER(u64)]
         lib.lg_comm_R_ptr.restype = vp
         lib.lg_comm_R_ptr.argtypes = [vp]
         lib.lg_init_control_v1.restype = i32
@@ -194,9 +194,10 @@ def info(lib):
 
 
 def abi_info(lib) -> dict:
-    """lg_abi_info_v1: {abi, args_bytes, err_off, step_off, diag_off, ctag_off, atag_off, peers_bytes} of an ABI >= 4 build."""
-    b = (C.c_uint64 * 8)()
-    if lib.lg_abi_info_v1(b) != 0:
+    """lg_abi_info_v2: {abi, args_bytes, err_off, step_off, diag_off, ctag_off, atag_off, peers_bytes, qr_wgs} of an ABI >= 4 build (r12d: out[8] = the HOST build's
+    LG_QR_WGS, the quiet_ready workgroups its launcher starts)."""
+    b = (C.c_uint64 * 9)()
+    if lib.lg_abi_info_v2(b) != 0:
         raise RuntimeError("lg_abi_info")
     return dict(
         zip(
@@ -209,14 +210,18 @@ def abi_info(lib) -> dict:
                 "ctag_off",
                 "atag_off",
                 "peers_bytes",
+                "qr_wgs",
             ),
             list(b),
         )
     )
 
 
-def check_abi_info(got: dict) -> None:
-    """The runtime's static check of the driver against this module's layout constants and the global page layout (errpage.py)."""
+def check_abi_info(got: dict, qr_wgs: int) -> None:
+    """The runtime's static check of the driver against this module's layout constants and the global page layout (errpage.py), and of the host library's LG_QR_WGS
+    against `qr_wgs`, the value the DEVICE image was built with: the launcher starts the quiet_ready workgroups, the image's fill / reset logic assumes the count, and the
+    device refuses a mismatching launch (CONFIG), so a stale or hand-built pair is refused here, at attach, with both numbers.
+    """
     from aiter.gemm_fusion import errpage
 
     want = {
@@ -232,6 +237,10 @@ def check_abi_info(got: dict) -> None:
     bad = {k: (got.get(k), v) for k, v in want.items() if got.get(k) != v}
     if bad:
         raise RuntimeError(f"large driver ABI mismatch (got, expected): {bad}")
+    if got.get("qr_wgs") != qr_wgs:
+        raise RuntimeError(
+            f"large driver qr_wgs mismatch: the host library starts {got.get('qr_wgs')} quiet_ready workgroups but the device image was built with LG_QR_WGS={qr_wgs}"
+        )
 
 
 class LargeContext:

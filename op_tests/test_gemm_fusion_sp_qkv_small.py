@@ -4302,7 +4302,7 @@ def test_large_rt_r12_loader_abi_check_and_launch(monkeypatch):
     assert {
         "lg_gpage_attach_v1",
         "lg_launch_v2",
-        "lg_abi_info_v1",
+        "lg_abi_info_v2",
         "lg_attach_v1",
         "lg_report_v1",
         "lg_drain_v1",
@@ -4314,7 +4314,7 @@ def test_large_rt_r12_loader_abi_check_and_launch(monkeypatch):
         and len(fake.lg_gpage_attach_v1.argtypes) == 4
     )
     # abi_info + the static check
-    good = (4, 352, 0, 8, 64, 3072, 3104, 32)
+    good = (4, 352, 0, 8, 64, 3072, 3104, 32, 64)
 
     def fill(b, vals):
         for i, v in enumerate(vals):
@@ -4325,7 +4325,7 @@ def test_large_rt_r12_loader_abi_check_and_launch(monkeypatch):
         def __init__(self, vals):
             self.vals = vals
 
-        def lg_abi_info_v1(self, b):
+        def lg_abi_info_v2(self, b):
             return fill(b, self.vals)
 
     got = lrt.abi_info(Lib(good))
@@ -4338,8 +4338,9 @@ def test_large_rt_r12_loader_abi_check_and_launch(monkeypatch):
         "ctag_off": 3072,
         "atag_off": 3104,
         "peers_bytes": 32,
+        "qr_wgs": 64,
     }
-    lrt.check_abi_info(got)
+    lrt.check_abi_info(got, 64)
     for field, bad in (
         ("abi", 3),
         ("args_bytes", 344),
@@ -4348,7 +4349,15 @@ def test_large_rt_r12_loader_abi_check_and_launch(monkeypatch):
         ("peers_bytes", 16),
     ):
         with pytest.raises(RuntimeError, match=rf"ABI mismatch.*'{field}': \({bad}"):
-            lrt.check_abi_info({**got, field: bad})
+            lrt.check_abi_info({**got, field: bad}, 64)
+    # r12d: the host library reports its LG_QR_WGS (out[8]); the check refuses a value that differs from the one the device image was built with, naming both
+    lrt.check_abi_info({**got, "qr_wgs": 1}, 1)
+    for host, image in ((64, 1), (1, 64), (63, 64)):
+        with pytest.raises(
+            RuntimeError,
+            match=rf"qr_wgs mismatch: the host library starts {host} quiet_ready workgroups but the device image was built with LG_QR_WGS={image}",
+        ):
+            lrt.check_abi_info({**got, "qr_wgs": host}, image)
     # launch_v3 / gpage_attach
     ctx = lrt.LargeContext(fake, C.c_void_p(0x11), 2048, 2304, 0)
     ctx.budget_us = 5_000_000
@@ -4650,7 +4659,7 @@ def _forget_sp_modules():
             delattr(pkg, n)
 
 
-def _large_ctx_fixture(monkeypatch, src, shared=True):
+def _large_ctx_fixture(monkeypatch, src, shared=True, extra=None, host_qr_wgs=64):
     """A large plan whose real _context runs against fakes (driver library, build, windows, resources)."""
     from aiter.gemm_fusion import catalog
     from aiter.gemm_fusion.match import MatchCtx as MC
@@ -4660,7 +4669,7 @@ def _large_ctx_fixture(monkeypatch, src, shared=True):
     import aiter.ops.gemm_fusion.sp_qkv.variants_large as vl
     from aiter.ops.gemm_fusion.sp_qkv import large_rt as lrt
 
-    params = {**specs.LARGE_CELLS[("dense", 16384)][1], "src": src}
+    params = {**specs.LARGE_CELLS[("dense", 16384)][1], "src": src, **(extra or {})}
     plan = vl.SpQkvLarge(
         specs.sp_qkv_spec("dense").prefix(1),
         params,
@@ -4685,7 +4694,7 @@ def _large_ctx_fixture(monkeypatch, src, shared=True):
         return 0
 
     def abi_call(b):
-        for i, v in enumerate((4, 352, 0, 8, 64, 3072, 3104, 32)):
+        for i, v in enumerate((4, 352, 0, 8, 64, 3072, 3104, 32, host_qr_wgs)):
             b[i] = v
         return 0
 
@@ -4698,7 +4707,7 @@ def _large_ctx_fixture(monkeypatch, src, shared=True):
                 types.SimpleNamespace(),
                 lambda b: (self.calls.append((name, ())), info_call(b))[1],
             )
-        if name == "lg_abi_info_v1":
+        if name == "lg_abi_info_v2":
             return _CallableFn(
                 types.SimpleNamespace(),
                 lambda b: (self.calls.append((name, ())), abi_call(b))[1],
@@ -4748,7 +4757,7 @@ def test_large_r12_context_attaches_the_page_checks_the_abi_and_registers_no_poi
     assert seen["abi"] == 3
     names = [c[0] for c in lib.calls]
     assert (
-        names.index("lg_abi_info_v1")
+        names.index("lg_abi_info_v2")
         < names.index("lg_attach_v1")
         < names.index("lg_gpage_attach_v1")
     )  # ABI check, attach, then the page
@@ -4774,7 +4783,7 @@ def test_large_r12_context_attaches_the_page_checks_the_abi_and_registers_no_poi
     ] == ["S", "R", "C", "q"]
     plan11._context(res11)
     assert seen11["abi"] == 2 and not any(
-        c[0] in ("lg_abi_info_v1", "lg_gpage_attach_v1") for c in lib11.calls
+        c[0] in ("lg_abi_info_v2", "lg_gpage_attach_v1") for c in lib11.calls
     )
     sh11 = next(c for c in res11.calls if c[0] == "set_shared_hooks")
     assert sh11[2]["poison"] is not None
@@ -4796,6 +4805,7 @@ def test_large_r12_abi_mismatch_is_reported_before_attach(monkeypatch):
             "ctag_off": 3072,
             "atag_off": 3104,
             "peers_bytes": 32,
+            "qr_wgs": 64,
         },
     )
     with pytest.raises(
@@ -4803,6 +4813,38 @@ def test_large_r12_abi_mismatch_is_reported_before_attach(monkeypatch):
     ):
         plan._context(res)
     assert not any(c[0] in ("lg_attach_v1", "lg_gpage_attach_v1") for c in lib.calls)
+
+
+def test_large_r12_qr_wgs_mismatch_between_host_library_and_device_image_is_refused_at_attach(
+    monkeypatch,
+):
+    # the device image is built with the plan's qr_wgs (default 64); the host library reports its own through lg_abi_info_v2 out[8]
+    for extra, host, image in (
+        (None, 64, 64),
+        ({"qr_wgs": 1}, 1, 1),
+        (None, 1, 64),
+        ({"qr_wgs": 1}, 64, 1),
+    ):
+        plan, _vl, lib, res, _seen = _large_ctx_fixture(
+            monkeypatch, "r12", extra=extra, host_qr_wgs=host
+        )
+        assert plan.qr_wgs == image
+        if host == image:
+            plan._context(res)  # attaches
+            assert any(c[0] == "lg_gpage_attach_v1" for c in lib.calls)
+        else:
+            with pytest.raises(
+                RuntimeError,
+                match=rf"starts {host} quiet_ready workgroups but the device image was built with LG_QR_WGS={image}",
+            ):
+                plan._context(res)
+            # refused BEFORE any attach: nothing to quarantine, nothing launched
+            assert not any(
+                c[0] in ("lg_attach_v1", "lg_gpage_attach_v1") for c in lib.calls
+            )
+    # r11 has no knob and no ABI-3 check
+    plan11, *_ = _large_ctx_fixture(monkeypatch, "r11")
+    assert plan11.qr_wgs is None
 
 
 def test_large_r12_run_needs_call_id_and_calls_launch_v3_r11_ignores_it(monkeypatch):
@@ -4965,7 +5007,7 @@ def test_every_r12_binding_matches_the_c_declaration_it_binds(monkeypatch):
         "lg_attach_v1",
         "lg_gpage_attach_v1",
         "lg_launch_v2",
-        "lg_abi_info_v1",
+        "lg_abi_info_v2",
         "lg_report_v1",
         "lg_drain_v1",
         "lg_init_control_v1",

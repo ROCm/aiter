@@ -133,7 +133,7 @@ def _mode_from_owner(owner: str) -> str:  # owner = "sp_qkv.large/<mode>/M<M>"
 # sha256 of large/<src>/SOURCE_SHA256.txt (pinned to the manifest files by a test)
 LARGE_SRC_SHA = {
     "r11": "9874fe1ecb3b6a997523c96210a960434179c8eab84fffc00537170d49836643",
-    "r12": "b253d2a05a9bb9775273929c29844bd00e52f9fe9047da3c5c9412eafb39c68f",  # R12 (abi 3) + LG_TAG_EARLY / LG_POLL_BATCH (r12b) + the NaN fill folded into quiet_ready, LG_QR_WGS (r12c), derived from r11
+    "r12": "6b47263546d9189457b3d584fe8219e542a0cd32b19d1a32306c2fda015a7f38",  # R12 (abi 3) + LG_TAG_EARLY / LG_POLL_BATCH (r12b) + the NaN fill folded into quiet_ready, LG_QR_WGS (r12c) + qr_wgs in the launch args / lg_abi_info_v2 (r12d), derived from r11
 }
 
 
@@ -183,6 +183,9 @@ class SpQkvLarge(Plan):
         self.abi = src_abi(
             "large", self.src
         )  # 2 = r11 (per-plan poison word); 3 = r12 (per-comm ERR/STEP page, call_id tags; the best-effort NaN fill is folded into quiet_ready, no separate node)
+        # the quiet_ready workgroup count the DEVICE image is built with (r12c / r12d: LG_QR_WGS, 64 by default); the host library reports its own through lg_abi_info_v2 and the
+        # attach refuses a mismatch. r11 has no such knob.
+        self.qr_wgs = int(self.params.get("qr_wgs", 64)) if self.src == "r12" else None
         self.F = _F[self.mode]
         self.owner = f"sp_qkv.large/{self.mode}/M{self.M}"
         self.build_key = (
@@ -244,8 +247,8 @@ class SpQkvLarge(Plan):
             lib = lrt.load_driver(built.driver_so, abi=self.abi)
             if self.abi >= 3:
                 lrt.check_abi_info(
-                    lrt.abi_info(lib)
-                )  # args size, page/tag offsets: a mismatch names the field instead of corrupting a launch
+                    lrt.abi_info(lib), self.qr_wgs
+                )  # args size, page/tag offsets, and the host build's LG_QR_WGS vs the device image's: a mismatch names the field instead of corrupting a launch
             geo = lrt.info(lib)
             if (
                 geo["f"] != self.F
