@@ -1946,13 +1946,12 @@
     },
     "module_hk_fp8_moe": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/kernels/hk_fp8_moe/hk_moe.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/hk_fp8_moe/hk_fp8_moe_entry.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/hk_fp8_moe/hk_moe.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": ["'-DKITTENS_CDNA4'"],
         "extra_ldflags": "None",
-        "extra_include": ["f'{AITER_CSRC_DIR}/kernels/hk_fp8_moe'"],
+        "extra_include": [],
         "verbose": "False",
         "torch_exclude": "True",
         "blob_gen_cmd": "''",

@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// gfx950 block-FP8 MoE. Tensor layouts and API: hk_moe.h.
-#include "hk_moe.h"
+// gfx950 block-FP8 MoE. Tensor layouts and API: aiter/ops/hk_fp8_moe.py.
+#include "aiter_hip_common.h"
+
+#include "aiter_ctypes_error.h"
 
 #include <type_traits>
 
 #include "kittens.cuh"
+
+AITER_CTYPES_ERROR_DEF
 
 using namespace kittens;
 
@@ -1325,19 +1329,19 @@ int num_cus()
 }
 
 template <int S>
-int forward(const bf16* x,
-            bf16* out,
-            int T,
-            const int* tk_e,
-            const float* tk_w,
-            const fp8e4m3* w13,
-            const float* s13,
-            const fp8e4m3* w2,
-            const float* s2,
-            int E,
-            float swiglu_limit,
-            const Workspace& ws,
-            hipStream_t st)
+void forward(const bf16* x,
+             bf16* out,
+             int T,
+             const int* tk_e,
+             const float* tk_w,
+             const fp8e4m3* w13,
+             const float* s13,
+             const fp8e4m3* w2,
+             const float* s2,
+             int E,
+             float swiglu_limit,
+             const Workspace& ws,
+             hipStream_t st)
 {
     const int R = rowmax(T, S, E), NT = R / TM, n = T * S, ncu = num_cus();
     kittens::gl<fp8e4m3, 1, 1, MOE_ROWS_MAX, D> A1(ws.q, nullptr, nullptr, nullptr, nullptr);
@@ -1378,60 +1382,82 @@ int forward(const bf16* x,
     gemm2<<<std::min(ncu, NT * (D / 256)), 256, 0, st>>>(
         A2, W2, ws.cw, ws.pa2, s2, ws.tile_e, NT, nullptr, nullptr, 0.f, nullptr, ws.cnt, ws.off);
     moe_reduce_w<D, S><<<T, 512, 0, st>>>(ws.cw, ws.pos, ws.w, out);
-    return hipGetLastError() == hipSuccess ? HK_MOE_OK : HK_MOE_ERR_LAUNCH;
+    const hipError_t error = hipGetLastError();
+    AITER_CHECK(error == hipSuccess, "hk_fp8_moe: ", hipGetErrorString(error));
 }
 } // namespace
 
-extern "C" {
-size_t hk_moe_workspace_bytes(int T, int topk, int num_experts)
+// Use 256-byte units to fit workspace sizes in the int return.
+AITER_CTYPES_DEFINE_ENTRYPOINT(
+    aiter_hk_fp8_moe_workspace_units,
+    (int64_t num_tokens, int64_t topk, int64_t num_experts, hipStream_t stream),
+    (num_tokens, topk, num_experts, stream))
 {
-    return carve(nullptr, T, topk, num_experts, nullptr);
+    return static_cast<int>((carve(nullptr,
+                                   static_cast<int>(num_tokens),
+                                   static_cast<int>(topk),
+                                   static_cast<int>(num_experts),
+                                   nullptr) +
+                             255) /
+                            256);
 }
 
-int hk_moe_forward(const void* x,
-                   void* out,
-                   int T,
-                   int hidden,
-                   int inter,
-                   const int* topk_ids,
-                   const float* topk_w,
-                   int topk,
-                   const void* w13,
-                   const float* s13,
-                   const void* w2,
-                   const float* s2,
-                   int num_experts,
-                   float swiglu_limit,
-                   void* workspace,
-                   size_t ws_bytes,
-                   hipStream_t stream)
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(aiter_hk_fp8_moe_fwd,
+                                    (size_t x,
+                                     size_t out,
+                                     int64_t num_tokens,
+                                     size_t topk_ids,
+                                     size_t topk_weights,
+                                     int64_t topk,
+                                     size_t w13,
+                                     size_t w13_scale,
+                                     size_t w2,
+                                     size_t w2_scale,
+                                     int64_t num_experts,
+                                     float swiglu_limit,
+                                     size_t workspace,
+                                     int64_t workspace_bytes,
+                                     hipStream_t stream),
+                                    (x,
+                                     out,
+                                     num_tokens,
+                                     topk_ids,
+                                     topk_weights,
+                                     topk,
+                                     w13,
+                                     w13_scale,
+                                     w2,
+                                     w2_scale,
+                                     num_experts,
+                                     swiglu_limit,
+                                     workspace,
+                                     workspace_bytes,
+                                     stream))
 {
-    if(hidden != D || inter != I || T < 0 || T > 0x7ffffff0 / D)
-        return HK_MOE_ERR_SHAPE;
-    if(topk != 8 && topk != 9)
-        return HK_MOE_ERR_TOPK;
-    if(num_experts < 1 || num_experts > SORT_EMAX)
-        return HK_MOE_ERR_EXPERTS;
-    if(T <= 0)
-        return HK_MOE_OK;
+    AITER_CHECK(num_tokens >= 0 && num_tokens <= 0x7ffffff0 / D,
+                "hk_fp8_moe: token count exceeds the gather address range");
+    AITER_CHECK(topk == 8 || topk == 9, "hk_fp8_moe: top-k must be 8 or 9");
+    AITER_CHECK(num_experts >= 1 && num_experts <= SORT_EMAX,
+                "hk_fp8_moe: expert count must be in [1, 1024]");
+    if(num_tokens == 0)
+        return;
+    const int T = num_tokens, S = topk, E = num_experts;
     Workspace ws;
-    if(carve((char*)workspace, T, topk, num_experts, &ws) > ws_bytes)
-        return HK_MOE_ERR_WORKSPACE;
-    auto run = [&]<int S>() {
-        return forward<S>((const bf16*)x,
-                          (bf16*)out,
-                          T,
-                          topk_ids,
-                          topk_w,
-                          (const fp8e4m3*)w13,
-                          s13,
-                          (const fp8e4m3*)w2,
-                          s2,
-                          num_experts,
-                          swiglu_limit,
-                          ws,
-                          stream);
-    };
-    return topk == 8 ? run.template operator()<8>() : run.template operator()<9>();
-}
+    AITER_CHECK(workspace_bytes >= 0 && carve(reinterpret_cast<char*>(workspace), T, S, E, &ws) <=
+                                            static_cast<size_t>(workspace_bytes),
+                "hk_fp8_moe: workspace too small");
+    auto run = topk == 8 ? forward<8> : forward<9>;
+    run(reinterpret_cast<const bf16*>(x),
+        reinterpret_cast<bf16*>(out),
+        T,
+        reinterpret_cast<const int*>(topk_ids),
+        reinterpret_cast<const float*>(topk_weights),
+        reinterpret_cast<const fp8e4m3*>(w13),
+        reinterpret_cast<const float*>(w13_scale),
+        reinterpret_cast<const fp8e4m3*>(w2),
+        reinterpret_cast<const float*>(w2_scale),
+        E,
+        swiglu_limit,
+        ws,
+        stream);
 }

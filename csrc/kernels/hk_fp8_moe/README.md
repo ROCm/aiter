@@ -42,13 +42,7 @@ Each GEMM workgroup processes 256x256 output tiles. Its two-step K pipeline cont
 boundaries, and the down GEMM overlaps output stores with the next tile's MFMAs. A small-batch variant
 skips MFMAs for tile halves containing only padding rows.
 
-## Source files
-
-| File | Purpose |
-|---|---|
-| `hk_moe.h` | C API, tensor layouts, and workspace size query |
-| `hk_moe.cu` | Routing, grouped GEMMs, quantization, combine, and launch sequence |
-| `hk_fp8_moe_entry.cu` | AITER ctypes entry points |
+The kernels, launch sequence, workspace query, and AITER ctypes entrypoints are in `hk_moe.cu`.
 
 ## Build and test
 
