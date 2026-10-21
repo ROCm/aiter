@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Tune gemm_a4w4 on gfx1250 (MXFP4, 1x32 e8m0 scales in the 32x4 layout).
 
-Candidates are the FlyDSL compute 256x256 and general kernels plus the asm F4GEMM kernel; the
+Candidates are the FlyDSL compute 256x256 and general kernels plus the asm F4GEMM heuristic; the
 fastest per shape becomes a flydsl or asm row of the a4w4_mxscale_bpreshuffle table.
 Stage 1 times all compute configs and the general structures at 1x1 / no split-K, stage 2 adds
 cluster shapes and split-K to the --top-structures best, stage 3 re-times the --confirm best and
@@ -13,6 +13,7 @@ asm in --confirm-rounds interleaved rounds (median).
 """
 
 import concurrent.futures
+import functools
 import multiprocessing
 import os
 import statistics
@@ -23,6 +24,7 @@ import torch
 import torch.nn.functional as F
 
 from aiter import QuantType, dtypes, get_hip_quant, logger
+from aiter.jit.core import AITER_ASM_DIR
 from aiter.ops.shuffle import shuffle_mxfp8fp4_scale, shuffle_weight
 from aiter.utility import fp4_utils
 from aiter.utility.base_tuner import GemmCommonTuner
@@ -32,8 +34,34 @@ TUNED_FILE = "aiter/configs/model_configs/dsr1_a4w4_mxscale_bpreshuffle_tuned_ge
 UNTUNED_FILE = (
     "aiter/configs/model_configs/dsr1_a4w4_mxscale_bpreshuffle_untuned_gemm.csv"
 )
-# The one asm F4GEMM kernel for MXFP4, row-major A and a bf16 output (hsa/gfx1250/f4gemm).
+# The asm F4GEMM kernels for MXFP4, row-major A and a bf16 output (hsa/gfx1250/f4gemm).
 ASM_KERNEL = "_ZN5aiter44f4gemm_bf16_mxfp4_BpreShuffle_256x256_4x4_psE"
+ASM_NPS_KERNEL = "_ZN5aiter41f4gemm_bf16_mxfp4_BpreShuffle_192x256_4x4E"
+
+
+@functools.cache
+def _asm_kernels(gfx):
+    """knl_name of every kernel registered in hsa/<gfx>/f4gemm/f4gemm.csv."""
+    try:
+        df = pd.read_csv(f"{AITER_ASM_DIR}{gfx}/f4gemm/f4gemm.csv", comment="#")
+    except OSError:
+        return frozenset()
+    return frozenset(df["knl_name"])
+
+
+def asm_kernel_name(gfx, M, N, K):
+    """The kernel gemm_mxfp4_asm runs for this shape, mirroring get_heuristic_kernel in
+    csrc/py_itfs_cu/asm_f4gemm.cu: the 192x256 no-ps kernel, when registered, on whole 4x4
+    clusters and at most 48 of them; else the persistent 256x256 one."""
+    if (
+        M % (192 * 4) == 0
+        and N % (256 * 4) == 0
+        and K % 256 == 0
+        and M * N <= 48 * (192 * 4) * (256 * 4)
+        and ASM_NPS_KERNEL in _asm_kernels(gfx)
+    ):
+        return ASM_NPS_KERNEL
+    return ASM_KERNEL
 
 
 def generate_data(m, n, k, seed, device="cuda"):
@@ -196,7 +224,7 @@ class GemmA4W4MxscaleBpreshuffleTuner(GemmCommonTuner):
             if with_asm:
                 runs.append(
                     (
-                        (info_keys, 0, 0, ASM_KERNEL, "asm"),
+                        (info_keys, 0, 0, asm_kernel_name(gfx, M, N, K), "asm"),
                         run_gemm_asm,
                         (gemm_keys[:4],),
                     )

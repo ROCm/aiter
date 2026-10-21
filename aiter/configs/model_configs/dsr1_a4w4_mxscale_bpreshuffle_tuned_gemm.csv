@@ -6,7 +6,7 @@ gfx1250,256,128,7168,16384,flydsl,2528,1,11.1104,flydsl_a4w4_bpreshuffle_wmma_t6
 gfx1250,256,256,7168,16384,flydsl,5682,1,14.4924,flydsl_a4w4_bpreshuffle_wmma_t128x64x1024_mw2_nw2_nb3_sk1_cm2_cn4,4149.04,4449.74,0.0
 gfx1250,256,512,7168,16384,flydsl,6672,1,18.1785,flydsl_a4w4_bpreshuffle_wmma_t128x128x512_mw2_nw2_nb4_sk1_cm4_cn2,6615.46,3864.71,0.0
 gfx1250,256,1024,7168,16384,flydsl,10242,1,29.2,flydsl_a4w4_bpreshuffle_wmma_t256x128x512_mw4_nw1_nb3_sk1_cm2_cn4,8236.92,2800.99,0.0
-gfx1250,256,1536,7168,16384,flydsl,12258,1,33.7104,flydsl_a4w4_bpreshuffle_compute_wmma_t256x256x256_mw2_nw2_nb4_sk1_cm3_cn2,10702.25,2768.38,0.0
+gfx1250,256,1536,7168,16384,asm,0,0,29.3271,_ZN5aiter41f4gemm_bf16_mxfp4_BpreShuffle_192x256_4x4E,12301.84,3182.15,0.0
 gfx1250,256,2048,7168,16384,flydsl,12268,1,44.82,flydsl_a4w4_bpreshuffle_compute_wmma_t256x256x256_mw2_nw2_nb4_sk1_cm4_cn4,10732.63,2339.53,0.0
 gfx1250,256,4096,7168,16384,flydsl,12250,1,75.9248,flydsl_a4w4_bpreshuffle_compute_wmma_t256x256x256_mw2_nw2_nb4_sk1_cm2_cn4,12671.39,1988.74,0.0
 gfx1250,256,8192,7168,16384,flydsl,12268,1,139.2747,flydsl_a4w4_bpreshuffle_compute_wmma_t256x256x256_mw2_nw2_nb4_sk1_cm4_cn4,13815.47,1746.69,0.0
@@ -32,7 +32,7 @@ gfx1250,256,128,24576,1536,flydsl,6605,1,4.9215,flydsl_a4w4_bpreshuffle_wmma_t12
 gfx1250,256,256,24576,1536,flydsl,10135,1,5.4700,flydsl_a4w4_bpreshuffle_wmma_t256x128x512_mw2_nw2_nb3_sk1_cm1_cn1,3533.34,5786.82,0.0
 gfx1250,256,512,24576,1536,flydsl,10971,1,7.9000,flydsl_a4w4_bpreshuffle_wmma_t256x256x512_mw2_nw2_nb2_sk1_cm1_cn1,4893.00,5624.48,0.0
 gfx1250,256,1024,24576,1536,asm,0,0,12.8600,_ZN5aiter44f4gemm_bf16_mxfp4_BpreShuffle_256x256_4x4_psE,6011.62,5442.65,0.0
-gfx1250,256,1536,24576,1536,asm,0,0,21.7500,_ZN5aiter44f4gemm_bf16_mxfp4_BpreShuffle_256x256_4x4_psE,5331.68,4393.17,0.0
+gfx1250,256,1536,24576,1536,asm,0,0,21.7500,_ZN5aiter41f4gemm_bf16_mxfp4_BpreShuffle_192x256_4x4E,5331.68,4393.17,0.0
 gfx1250,256,2048,24576,1536,asm,0,0,23.1600,_ZN5aiter44f4gemm_bf16_mxfp4_BpreShuffle_256x256_4x4_psE,6676.11,5229.30,0.0
 gfx1250,256,4096,24576,1536,asm,0,0,41.2600,_ZN5aiter44f4gemm_bf16_mxfp4_BpreShuffle_256x256_4x4_psE,7494.85,5413.15,0.0
 gfx1250,256,8192,24576,1536,asm,0,0,78.6100,_ZN5aiter44f4gemm_bf16_mxfp4_BpreShuffle_256x256_4x4_psE,7867.64,5442.30,0.0
