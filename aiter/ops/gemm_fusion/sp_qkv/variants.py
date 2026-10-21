@@ -39,8 +39,8 @@ from .jit import build_small, small_defs, src_abi, src_mp
 SRC_SHA = {
     "r17": "3f597cdb6141c39dd4450a1ea635785ffe44867006434157478f7822357d8ee3",
     "r18": "0e48e3f01e917c9c5209c71efd90748e83eacf59d0e92cd10e5549955a450c29",
-    "r19": "d421799342c158798c3924ccae0f2babd88ec34b6e188edba15e5f98ad9eaac5",  # R12 (abi 3), derived from r18; sha256 of small/r19/SOURCE_SHA256.txt
-    "r20": "13874481c54a87ba789ae6d2d9d47074a6779c7a69063ae45139950270fac3d9",  # R13 MP64 (abi 3, SM_MP 64), derived from r19
+    "r19": "79bb051aac0b8ef048b40f69b9c39a30218aa300078a239063f092fcd2c83be9",  # R12 (abi 3), derived from r18; sha256 of small/r19/SOURCE_SHA256.txt
+    "r20": "11cd4ab3de2bbd44d8380821f579d8672f5303610c4b5c51cdad0723748f46db",  # R13 MP64 (abi 3, SM_MP 64), derived from r19
 }
 # analytic geometry (mirrors sm_abi_v2.h; cross-checked against sm_info_v1 after build)
 _F = {"dense": 2304, "indexer": 2560, "reuse": 2560}
