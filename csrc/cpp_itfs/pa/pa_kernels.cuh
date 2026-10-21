@@ -85,6 +85,8 @@ _paged_attention_kernel(const int* block_table_seq,
     constexpr int GQA_RATIO_PER_LOOP     = GQA_RATIO / GQA_RATIO_LOOP;
     constexpr int GQA_RATIO_MTP_PARALLEL = GQA_RATIO_PER_LOOP * MTP_PARALLEL_THREADS;
     constexpr int GQA_RATIO4             = DIVIDE_ROUND_UP(GQA_RATIO_MTP_PARALLEL, 4);
+    static_assert(GQA_RATIO % GQA_RATIO_LOOP == 0,
+                  "GQA_RATIO > 16 must be a multiple of DIVIDE_ROUND_UP(GQA_RATIO, 16)");
 
     // shared_logits is used for multiple purposes
     __shared__ _B16x4 shared_logits[GQA_RATIO_LOOP][HEAD_LOOP][MTP_PER_THREAD][NWARPS][4][16][4];
@@ -114,7 +116,7 @@ _paged_attention_kernel(const int* block_table_seq,
 
     _B16x8 Klocal[HEAD_LOOP][TLOOP][QKHELOOP]; // can be interpreted as B8x16 for 8 bit types
 
-    const int wg_start_head_idx    = kv_head_idx * GQA_RATIO_PER_LOOP;
+    const int wg_start_head_idx    = kv_head_idx * GQA_RATIO;
     const int wg_start_kv_head_idx = kv_head_idx;
     const int total_num_heads      = gridDim.z * GQA_RATIO;
 
@@ -1237,6 +1239,8 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
     constexpr int GQA_RATIO_PER_LOOP     = GQA_RATIO / GQA_RATIO_LOOP;
     constexpr int GQA_RATIO_MTP_PARALLEL = GQA_RATIO_PER_LOOP * MTP_PARALLEL_THREADS;
     constexpr int GQA_RATIO4             = DIVIDE_ROUND_UP(GQA_RATIO_MTP_PARALLEL, 4);
+    static_assert(GQA_RATIO % GQA_RATIO_LOOP == 0,
+                  "GQA_RATIO > 16 must be a multiple of DIVIDE_ROUND_UP(GQA_RATIO, 16)");
 
     // shared_logits is used for multiple purposes
     __shared__ _B16x4 shared_logits[GQA_RATIO_LOOP][HEAD_LOOP][MTP_PER_THREAD][NWARPS][4][16][4];
@@ -1265,7 +1269,7 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
     // sub partition of tokens per warp for qk calculation
     constexpr int TOKENS_PER_WARP = T_PAR_SIZE / NWARPS;
     const int wg_start_head_idx =
-        kv_head_idx * GQA_RATIO_PER_LOOP; // Jacob: kv_head_idx=0, GQA_RATIO_PER_LOOP=6
+        kv_head_idx * GQA_RATIO; // Jacob: kv_head_idx=0, GQA_RATIO_PER_LOOP=6
     const int wg_start_kv_head_idx = kv_head_idx;
     const int total_num_heads      = gridDim.z * GQA_RATIO;
 
