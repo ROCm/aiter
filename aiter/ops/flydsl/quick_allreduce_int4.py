@@ -353,16 +353,16 @@ class QuickAllReduceInt4:
                     )
                     shared_grid = torch.tensor(grid, dtype=torch.int64)
                     dist.all_reduce(shared_grid, op=dist.ReduceOp.MIN, group=group)
-                    build_kw = dict(
-                        world_size=self.world_size,
-                        rank=self.rank,
-                        super_tile=st,
-                        grid=int(shared_grid.item()),
-                        inbox_memory=resolved_inbox,
-                        rs_codec=rs_codec,
-                        ag_codec=ag_codec,
-                        block=b,
-                    )
+                    build_kw = {
+                        "world_size": self.world_size,
+                        "rank": self.rank,
+                        "super_tile": st,
+                        "grid": int(shared_grid.item()),
+                        "inbox_memory": resolved_inbox,
+                        "rs_codec": rs_codec,
+                        "ag_codec": ag_codec,
+                        "block": b,
+                    }
                     spec = algo.build(**build_kw)
                     self._build_kw[key] = build_kw
                     if spec["lds_bytes"] > lds_capacity:
