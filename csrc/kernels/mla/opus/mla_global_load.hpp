@@ -89,3 +89,23 @@ global_load(const D* g_base, void* smem_base, const LayoutG&, const LayoutS& u_s
 #endif
     });
 }
+
+__device__ void llvm_amdgcn_global_load_lds(__attribute__((address_space(1))) void* gptr,
+                                            OPUS_LDS_ADDR void* lptr,
+                                            unsigned size,
+                                            unsigned offset,
+                                            unsigned aux) __asm("llvm.amdgcn.global.load.lds");
+
+template <opus::index_t VEC, int M0_IMM, int G_IMM, class D, class S>
+__device__ inline void global_load_lds(const D* src, const S* lds_base)
+{
+    constexpr unsigned BYTES = VEC * sizeof(D);
+    static_assert((BYTES == 16 || BYTES == 12 || BYTES == 4 || BYTES == 2 || BYTES == 1) &&
+                  G_IMM >= 0 && G_IMM < 4096 && G_IMM % 4 == 0 && M0_IMM >= 0 && M0_IMM % 4 == 0);
+    llvm_amdgcn_global_load_lds(
+        (__attribute__((address_space(1))) void*)(const_cast<D*>(src)),
+        (OPUS_LDS_ADDR void*)(reinterpret_cast<__UINTPTR_TYPE__>(lds_base) + M0_IMM),
+        BYTES,
+        G_IMM,
+        0);
+}

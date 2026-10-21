@@ -224,13 +224,6 @@ def parse_args(args: list[str] | None = None):
         help="Activation function to apply to the output. One of ('gelu', 'gelu_tanh', 'silu', 'silu_exp2', 'relu').",
     )
     parser.add_argument(
-        "--backend",
-        type=str,
-        choices=["triton", "gluon"],
-        default=None,
-        help="Backend to use. Default: auto-detect (gluon on gfx1250, triton elsewhere).",
-    )
-    parser.add_argument(
         "--persistent",
         action="store_true",
         default=False,

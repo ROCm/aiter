@@ -1650,6 +1650,58 @@ def test_swiglu_mxfp4_nonsplit_nobias_dispatch():
     )
 
 
+def test_swiglu_mxfp4_untagged_layout_dispatch():
+    """Callers that never tag w1.gate_up_interleave (None) -- ATOM's MiniMax-M3, for
+    one -- must keep the CK-Tile split-k route with the standard post-activation
+    layout for bf16 activations. MiniMax-M3-MXFP4 at TP8 (per-rank MoE call:
+    model_dim 6144, inter_dim 512, intermediate_pad 0) fell through to the
+    unshuffled-weights fallback instead and decoded garbage until max tokens."""
+    if get_gfx() != "gfx950":
+        aiter.logger.info(
+            "skip SwiGLU MXFP4 untagged-layout dispatch test on %s", get_gfx()
+        )
+        return
+    model_dim, inter_dim, intermediate_pad, E, topk = 6144, 512, 0, 129, 5
+    for token in (1, 8, 32, 128):
+        metadata = get_2stage_cfgs(
+            get_padded_M(token),
+            model_dim,
+            inter_dim,
+            E,
+            topk,
+            torch.bfloat16,
+            dtypes.bf16,
+            dtypes.fp4x2,
+            aiter.QuantType.per_1x32,
+            True,
+            aiter.ActivationType.Swiglu,
+            False,
+            0,
+            intermediate_pad,
+            True,
+            GateMode.SEPARATED.value,
+            swiglu_limit=7.0,
+            opus_weights_shuffled=True,
+            gate_up_interleave=None,
+        )
+        stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
+        assert (
+            stage1_func is cktile_moe_stage1
+        ), f"{token=}: expected CK-Tile stage1, got {stage1_func!r}"
+        layout = metadata.stage1.keywords.get("post_activation_layout")
+        assert layout == "standard", (
+            f"{token=}: untagged gate/up layout with bf16 activations must keep "
+            f"post_activation_layout='standard', got {layout!r}"
+        )
+        assert metadata.stage1.keywords["split_k"] >= 2, (
+            f"{token=}: expected the CK-Tile split-k route, got "
+            f"split_k={metadata.stage1.keywords['split_k']}"
+        )
+    aiter.logger.info(
+        "moe_2stage: SwiGLU MXFP4 untagged-layout dispatch regression test passed"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -1668,6 +1720,7 @@ if args.bm16_scale_boundary:
 else:
     test_output_buffer_contract()
     test_swiglu_mxfp4_nonsplit_nobias_dispatch()
+    test_swiglu_mxfp4_untagged_layout_dispatch()
     # Skip unrelated tuned-CSV validation for an explicit CLI quant sweep.
     if not args.no_flydsl_csv and args.quant is None:
         _case_iters.append(
