@@ -170,15 +170,7 @@ def _make_spec_inputs(batch, Hloc, num_spec):
 
 
 def _generate_spec_pool_inputs(batch, Hloc, num_spec):
-    """Build one speculative-decode case, with its own state clones.
-
-    Pure setup, not measured. Each call is one rotating-buffer pool entry:
-    independent random projections and state, so replaying through the pool
-    during timing defeats cache residency instead of timing one fixed
-    buffer repeatedly. State drifts across replays same as it did across
-    do_bench reps in the single-buffer version; that does not change the
-    launch shape or instruction path.
-    """
+    """Build one speculative-decode case, with its own state clones."""
     inp = _make_spec_inputs(batch, Hloc, num_spec)
     conv_state = inp["conv_state"].clone()
     ssm_state = inp["ssm_state"].clone()
