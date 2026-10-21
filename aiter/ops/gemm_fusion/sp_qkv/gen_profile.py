@@ -2,10 +2,10 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Generate aiter/configs/gemm_fusion/minimax_m3_sp4_gfx950_v1.json from specs.py (signatures computed, never hand-typed).
 Run: python -m aiter.ops.gemm_fusion.sp_qkv.gen_profile [out.json]   (pure Python; works without torch/GPU)
-Rows: exact (sig, arch=gfx950, cu=256, world=4, m=T/4): the 6 small cells and the 9 large cells.
-Rules (P1): large range rules for local m = 1024..8192 step 256 (see aiter.gemm_fusion.profile): consulted only where no exact row exists, the most specific
-(largest m_multiple) rule wins. The params of the rules are PLACEHOLDERS (nearest exact row whose plan is valid at every covered m, else n=1); the final params come
-from the tuning sweep.
+Rows: exact (sig, arch=gfx950, cu=256, world=4, m): the 6 small cells (T64/T128, src r19) and 87 large cells, one per (mode, local m = 1024..8192 step 256) with that
+cell's best (n, half_first) from the P1 sweep (p1_sweep.py, src r12).
+Rules (P1): the "chunks mod 4 classes" fallback family (9 rules, see aiter.gemm_fusion.profile): consulted only where no exact row exists; none exists on the grid, so they
+document the default for any other m % 256 == 0 in range.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import sys
 
 from aiter.gemm_fusion.errpage import GLOBAL_PAGE_BYTES, SHARE_GLOBAL
 
-from . import specs
+from . import p1_sweep, specs
 
 ARCH, CU, WORLD = "gfx950", 256, 4
 LARGE_PROFILE_SRC = (
@@ -44,34 +44,8 @@ def build_rows():
     return rows
 
 
-def build_large_rows():
-    rows = []
-    for (mode, T), (vid, params) in specs.LARGE_CELLS.items():
-        sp = specs.sp_qkv_spec(mode).prefix(
-            1
-        )  # GEMM + SPExchange only; HeadNormRopeCache runs natively in ATOM
-        rows.append(
-            {
-                "sig": sp.signature(),
-                "arch": ARCH,
-                "cu": CU,
-                "world": WORLD,
-                "m": T // WORLD,
-                "vid": vid,
-                "params": {**params, "src": LARGE_PROFILE_SRC},
-                "cell": f"{mode}_T{T}",
-            }
-        )
-    return rows
-
-
+LARGE_VID = "sp_qkv.large.v1"
 RULE_M_MIN, RULE_M_MAX, RULE_M_BASE = 1024, 8192, 256
-FALLBACK_PARAMS = {
-    "n": 1,
-    "half_first": 0,
-    "no_gridread": 1,
-    "src": LARGE_PROFILE_SRC,
-}  # valid for every M multiple of 256 (n=1 needs no divisibility)
 
 
 def _plan_valid(mode, params, m):
@@ -88,67 +62,93 @@ def _plan_valid(mode, params, m):
     return True
 
 
+def build_large_rows():
+    """One EXACT row per (mode, m) cell of the P1 sweep (p1_sweep.P1_BEST): local m = 1024..8192 step 256 x dense / indexer / reuse = 87 rows, each with that cell's best
+    (n, half_first) on the r12 kernels. Compact m-range rules lose up to 4.6 % against this table (half_first at n=4 has no closed form), so the table IS the profile.
+    The r11-era tuned rows (specs.LARGE_CELLS) are kept where the table agrees and replaced where it differs; a replaced row carries a `note` with the old params.
+    """
+    legacy = {
+        (mode, T // WORLD): params
+        for (mode, T), (_vid, params) in specs.LARGE_CELLS.items()
+    }
+    rows = []
+    for mode in ("dense", "indexer", "reuse"):
+        sp = specs.sp_qkv_spec(mode).prefix(
+            1
+        )  # GEMM + SPExchange only; HeadNormRopeCache runs natively in ATOM
+        for m in p1_sweep.P1_GRID:
+            n, half_first = p1_sweep.P1_BEST[mode][m]
+            params = {
+                "n": n,
+                "half_first": half_first,
+                "no_gridread": 1,
+                "src": LARGE_PROFILE_SRC,
+            }
+            assert _plan_valid(mode, params, m), (
+                mode,
+                m,
+                params,
+            )  # the sweep only timed legal points; keep the generator honest
+            row = {
+                "sig": sp.signature(),
+                "arch": ARCH,
+                "cu": CU,
+                "world": WORLD,
+                "m": m,
+                "vid": LARGE_VID,
+                "params": params,
+                "cell": f"{mode}_T{WORLD * m}",
+            }
+            old = legacy.get((mode, m))
+            if old is not None and (old["n"], old["half_first"]) != (n, half_first):
+                row["note"] = (
+                    f"P1 sweep best; replaces the r11-era tuned (n={old['n']}, half_first={old['half_first']})"
+                )
+            rows.append(row)
+    return rows
+
+
+# The safe fallback for any m % 256 == 0 in range that is not on the sweep grid (none exist: the grid is every multiple of 256 in 1024..8192, so every rule below is shadowed
+# by an exact row; they document the default): the "chunks mod 4 classes" family of the sweep, half_first 0. Layered by m_multiple (the most specific rule wins):
+#   chunks % 4 == 0  (m % 1024 == 0)  -> n=4        chunks % 4 == 2  (m % 512 == 0)  -> n=2        odd chunks  -> n=1.
+# Measured worst loss against the per-point best (Evidence): 4.6 % (dense) / 4.5 % (indexer) / 3.8 % (reuse), all at chunks % 4 == 0; the other classes lose <= 1.5 %.
+FALLBACK_LAYERS = (
+    (RULE_M_BASE, 1),
+    (2 * RULE_M_BASE, 2),
+    (4 * RULE_M_BASE, 4),
+)  # (m_multiple, n)
+
+
 def build_large_rules():
-    """P1 range rules for local m = 1024..8192, built in LAYERS by m_multiple (the most specific rule wins, see aiter.gemm_fusion.profile): the large plan needs
-    (M/256) % n == 0, so params with n=2 are valid only for M multiples of 512 and n=4 only for multiples of 1024.
-      layer 256   : the whole range, FALLBACK_PARAMS (n=1): valid everywhere;
-      layer 512   : M multiples of 512, the nearest exact row with n <= 2;
-      layer 1024  : M multiples of 1024, the nearest exact row with n <= 4.
-    PLACEHOLDER params: nearest exact large row of the same mode (distance in m, ties to the smaller m; the M=2048-only quarter-first plan is never extended);
-    every assignment is validated against the real plan constructor at every m it covers. Replace with the tuned params when the sweep is done (edit this
-    function and regenerate: `python op_tests/gen_gemm_fusion_profile.py`)."""
+    """Range rules for local m = 1024..8192: the chunks-mod-4 fallback family, one layer per m_multiple and mode (9 rules). Every assignment is validated against the real
+    plan constructor at every m it covers."""
     rules = []
     for mode in ("dense", "indexer", "reuse"):
         sp = specs.sp_qkv_spec(mode).prefix(1)  # GEMM + SPExchange only
-        cells = sorted(
-            (T // WORLD, vid, {**params, "src": LARGE_PROFILE_SRC})
-            for (md, T), (vid, params) in specs.LARGE_CELLS.items()
-            if md == mode and params.get("half_first") != 2
-        )
-        vid0 = cells[0][1]
-        for step in (RULE_M_BASE, 2 * RULE_M_BASE, 4 * RULE_M_BASE):
-            runs = []  # [first_m, last_m, params, source]
+        for step, n in FALLBACK_LAYERS:
+            params = {
+                "n": n,
+                "half_first": 0,
+                "no_gridread": 1,
+                "src": LARGE_PROFILE_SRC,
+            }
             for m in range(RULE_M_MIN, RULE_M_MAX + 1, step):
-                eligible = [
-                    c
-                    for c in cells
-                    if step % (RULE_M_BASE * int(c[2].get("n", 1))) == 0
-                    and _plan_valid(mode, c[2], m)
-                ]
-                if eligible:
-                    src_m, _vid, params = min(
-                        eligible, key=lambda c: (abs(c[0] - m), c[0])
-                    )
-                    source = f"nearest exact row (m={src_m})"
-                else:
-                    params, source = dict(FALLBACK_PARAMS), "fallback n=1"
                 assert _plan_valid(mode, params, m), (mode, step, m, params)
-                if runs and runs[-1][2] == params:
-                    runs[-1][1] = m
-                    if runs[-1][3] != source:
-                        runs[-1][3] = "nearest exact rows"
-                else:
-                    runs.append([m, m, params, source])
-            if (
-                step > RULE_M_BASE
-            ):  # a layer that only repeats the fallback adds nothing
-                runs = [r for r in runs if r[2] != FALLBACK_PARAMS]
-            for lo, hi, params, source in runs:
-                rules.append(
-                    {
-                        "sig": sp.signature(),
-                        "arch": ARCH,
-                        "cu": CU,
-                        "world": WORLD,
-                        "m_min": lo,
-                        "m_max": hi,
-                        "m_multiple": step,
-                        "vid": vid0,
-                        "params": params,
-                        "name": f"{mode}_m{lo}-{hi}_x{step}",
-                        "note": f"PLACEHOLDER params: {source}; final params from the tuning sweep",
-                    }
-                )
+            rules.append(
+                {
+                    "sig": sp.signature(),
+                    "arch": ARCH,
+                    "cu": CU,
+                    "world": WORLD,
+                    "m_min": RULE_M_MIN,
+                    "m_max": RULE_M_MAX,
+                    "m_multiple": step,
+                    "vid": LARGE_VID,
+                    "params": params,
+                    "name": f"{mode}_chunks_mod4_x{step}",
+                    "note": "fallback default (chunks mod 4 classes, half_first 0); shadowed by the 87 exact P1 rows on the sweep grid",
+                }
+            )
     return rules
 
 

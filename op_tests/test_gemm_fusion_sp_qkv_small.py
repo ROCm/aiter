@@ -261,19 +261,55 @@ def test_small_variant_registers_and_contract(monkeypatch):
 
 
 # ======================================================================= large-M (S2-2b-iii)
-def test_profile_has_15_rows_and_large_prefix_signatures():
+def test_profile_has_93_rows_and_large_prefix_signatures():
+    """6 small rows + 87 EXACT large rows (one per mode x local m = 1024..8192 step 256, each cell's best (n, half_first) from the P1 sweep, src r12)."""
+    from aiter.ops.gemm_fusion.sp_qkv import p1_sweep
+
     clear_profile_cache()
     prof = profmod.load_profile(PROFILE)
-    assert len(prof) == 15
-    for (mode, T), (vid, params) in specs.LARGE_CELLS.items():
+    assert len(prof) == 93
+    assert (
+        len(p1_sweep.P1_GRID) == 29
+        and sum(len(v) for v in p1_sweep.P1_BEST.values()) == 87
+    )
+    for mode in specs.MODES:
         sig = specs.sp_qkv_spec(mode).prefix(1).signature()
-        r = prof.lookup(sig, "gfx950", 256, 4, T // 4)
-        # the large rows select the R12 kernels explicitly (src r12); r11 stays selectable per row for the A/B
-        assert (
-            r is not None
-            and r.vid == "sp_qkv.large.v1"
-            and dict(r.params) == {**params, "src": "r12"}
-        )
+        for m in p1_sweep.P1_GRID:
+            n, hf = p1_sweep.P1_BEST[mode][m]
+            r = prof.lookup(sig, "gfx950", 256, 4, m)
+            # the large rows select the R12 kernels explicitly (src r12); r11 stays selectable per row for the A/B; F0 only (no_gridread)
+            assert (
+                r is not None
+                and r.vid == "sp_qkv.large.v1"
+                and dict(r.params)
+                == {"n": n, "half_first": hf, "no_gridread": 1, "src": "r12"}
+            ), (mode, m)
+    # the r11-era tuned rows (specs.LARGE_CELLS): kept where the sweep agrees, replaced (and noted in the file) where it differs
+    with open(profmod._resolve(PROFILE), encoding="utf-8") as f:
+        doc = json.load(f)
+    notes = {
+        (r["cell"].split("_T")[0], r["m"]): r.get("note", "")
+        for r in doc["rows"]
+        if r["vid"] == "sp_qkv.large.v1"
+    }
+    differ = set()
+    for (mode, T), (_vid, old) in specs.LARGE_CELLS.items():
+        new = p1_sweep.P1_BEST[mode][T // 4]
+        if (old["n"], old["half_first"]) == new:
+            assert notes[(mode, T // 4)] == "", (mode, T)
+        else:
+            differ.add((mode, T // 4))
+            assert (
+                f"replaces the r11-era tuned (n={old['n']}, half_first={old['half_first']})"
+                in notes[(mode, T // 4)]
+            ), (mode, T)
+    assert differ == {
+        ("dense", 4096),
+        ("indexer", 4096),
+        ("indexer", 8192),
+        ("reuse", 4096),
+    }
+    assert sum(1 for v in notes.values() if v) == 4
     # reuse and dense large rows have different signatures (reuse drops iq/ik in the exchange)
     assert (
         specs.sp_qkv_spec("dense").prefix(1).signature()
@@ -386,13 +422,13 @@ def test_large_variant_contract_and_sizes(monkeypatch):
             spec, MatchCtx("gfx950", 256, 4, 2048, frozenset({"mori_cco"})), PROFILE
         )
     # 2-stage prefix has no row at large M -> falls to the 1-stage row (n == 1) ; at M=16 the small variant would apply.
-    # m=1024 has no exact row but a P1 range rule covers it (source "rule"); outside the rules' range or off the 256 grid it is still native
+    # m=1024 is an exact P1 row (n=1: the sweep's best there); outside 1024..8192 or off the 256 grid it is still native
     p1024, n1024 = match_prefix(spec, MatchCtx("gfx950", 256, 4, 1024, caps), PROFILE)
     assert (
         n1024 == 1
-        and p1024.profile_source == "rule"
+        and p1024.profile_source == "row"
         and p1024.M == 1024
-        and p1024.n == 2
+        and (p1024.n, p1024.half_first) == (1, 0)
     )
     for m_native in (512, 768, 1100, 8448):
         assert match_prefix(
@@ -4749,7 +4785,9 @@ def test_profile_selects_r12_for_large_rows_and_rules_and_budgets_the_page():
     clear_profile_cache()
     prof = profmod.load_profile(PROFILE)
     large = [e for e in prof.entries() if e.vid == "sp_qkv.large.v1"]
-    assert len(large) == 9 + 12 and {dict(e.params)["src"] for e in large} == {"r12"}
+    assert len(large) == 87 + 9 and {dict(e.params)["src"] for e in large} == {
+        "r12"
+    }  # 87 exact rows + the 9 fallback rules
     small = [e for e in prof.rows() if e.vid == "sp_qkv.small.v1"]
     assert len(small) == 6 and {dict(e.params)["src"] for e in small} == {
         "r19"

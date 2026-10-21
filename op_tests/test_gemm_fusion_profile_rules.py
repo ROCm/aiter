@@ -49,7 +49,7 @@ from aiter.gemm_fusion import (
 )
 from aiter.gemm_fusion import prebuild as engine
 from aiter.gemm_fusion import profile as profmod
-from aiter.ops.gemm_fusion.sp_qkv import gen_profile, jit, specs
+from aiter.ops.gemm_fusion.sp_qkv import gen_profile, jit, p1_sweep, specs
 from aiter.ops.gemm_fusion.sp_qkv import prebuild as pb
 from aiter.ops.gemm_fusion.sp_qkv.test_utils import clear_profile_cache
 
@@ -506,7 +506,9 @@ CAPS = frozenset({"mori_cco", "sdma"})
 def test_shipped_profile_rules_are_signature_checked_and_match_the_generator():
     clear_profile_cache()
     prof = profmod.load_profile(PROFILE)
-    assert len(prof) == 15 and len(prof.rules()) == 12
+    assert (
+        len(prof) == 6 + 87 and len(prof.rules()) == 9
+    )  # 6 small + 87 exact P1 large rows; the 9 fallback rules (3 layers x 3 modes)
     sigs = {
         specs.sp_qkv_spec(m).prefix(1).signature(): m for m in specs.MODES
     }  # large plans cover GEMM + SPExchange only
@@ -516,7 +518,12 @@ def test_shipped_profile_rules_are_signature_checked_and_match_the_generator():
             and r.vid == "sp_qkv.large.v1"
             and (r.arch, r.cu, r.world) == ("gfx950", 256, 4)
         ), r.label()
-        assert r.m_multiple % 256 == 0 and 1024 <= r.m_min <= r.m_max <= 8192 and r.name
+        assert (
+            r.m_multiple % 256 == 0
+            and 1024 <= r.m_min <= r.m_max <= 8192
+            and r.name
+            and "chunks_mod4" in r.name
+        )
         assert (
             pb.row_mode(r) == sigs[r.sig]
         )  # the enumeration recovers the mode of a rule exactly as for a row
@@ -531,14 +538,14 @@ def test_shipped_profile_rules_are_signature_checked_and_match_the_generator():
         assert r.m_multiple in (256, 512, 1024)
 
 
-def test_every_large_m_on_the_grid_matches_a_plan_rows_win_rules_fill_the_rest(
+def test_every_large_m_on_the_grid_is_an_exact_row_with_the_sweeps_best_params(
     sp_qkv_catalog,
 ):
     seen = {"row": 0, "rule": 0}
     for mode in specs.MODES:
         spec = specs.sp_qkv_spec(
             mode
-        )  # the full 2-stage spec: the large rows/rules sit at the 1-stage prefix
+        )  # the full 2-stage spec: the large rows sit at the 1-stage prefix
         for m in GRID:
             plan, n = match_prefix(spec, MatchCtx("gfx950", 256, 4, m, CAPS), PROFILE)
             assert (
@@ -547,52 +554,58 @@ def test_every_large_m_on_the_grid_matches_a_plan_rows_win_rules_fill_the_rest(
                 and plan.vid == "sp_qkv.large.v1"
                 and plan.M == m
             ), (mode, m)
-            assert plan.profile_source == ("row" if m in LARGE_ROW_M else "rule"), (
-                mode,
-                m,
-            )
+            assert (plan.n, plan.half_first) == p1_sweep.P1_BEST[mode][m], (mode, m)
             seen[plan.profile_source] += 1
             assert (
                 (m // 256) % plan.n == 0 if plan.half_first != 2 else m == 2048
             )  # the plan constructor accepted the params at this M
     assert seen == {
-        "row": 9,
-        "rule": 3 * len(GRID) - 9,
-    }  # 29 grid points x 3 modes; 9 exact rows
-    # the exact tuned rows keep their tuned params (n3q at m=2048 dense is the exact row, not an extension of a rule)
+        "row": 87,
+        "rule": 0,
+    }  # 29 grid points x 3 modes, every one exact: the rules are shadowed
     d2048, _ = match_prefix(
         specs.sp_qkv_spec("dense"), MatchCtx("gfx950", 256, 4, 2048, CAPS), PROFILE
     )
-    assert (d2048.n, d2048.half_first, d2048.profile_source) == (3, 2, "row")
+    assert (d2048.n, d2048.half_first, d2048.profile_source) == (
+        3,
+        2,
+        "row",
+    )  # quarter-first only here
 
 
-def test_layered_placeholder_params_follow_the_chunk_divisibility(sp_qkv_catalog):
+def _rules_only_profile():
+    """The shipped rules without any row: what a deployment would run for an m the sweep did not cover (the documented default)."""
+    with open(profmod._resolve(PROFILE), encoding="utf-8") as f:
+        shipped = json.load(f)
+    return profmod.parse_profile(
+        {"profile": "rules_only", "rows": [], "rules": shipped["rules"]}
+    )
+
+
+def test_fallback_rules_are_the_chunks_mod4_classes_and_valid_on_the_whole_grid(
+    sp_qkv_catalog,
+):
+    only = _rules_only_profile()
+
     def at(mode, m):
         plan, _ = match_prefix(
-            specs.sp_qkv_spec(mode), MatchCtx("gfx950", 256, 4, m, CAPS), PROFILE
+            specs.sp_qkv_spec(mode), MatchCtx("gfx950", 256, 4, m, CAPS), only
         )
         return plan.n, plan.half_first, plan.profile_source
 
-    # odd chunk counts (M/256 odd) can only run n=1: the broad fallback rule
-    for m in (1280, 1792, 2304, 2816, 3328, 7936):
-        assert at("dense", m) == (1, 0, "rule") and at("indexer", m) == (
-            1,
-            0,
-            "rule",
-        ), m
-    # even chunks, not a multiple of 1024: the n=2 layer (nearest exact row with n <= 2)
-    assert (
-        at("dense", 1536) == (2, 0, "rule")
-        and at("indexer", 1536) == (2, 1, "rule")
-        and at("reuse", 3584) == (2, 1, "rule")
-    )
-    # multiples of 1024: n=4 where the nearest row is n=4, else the n=2 row
-    assert at("dense", 1024) == (2, 0, "rule") and at("dense", 7168) == (4, 0, "rule")
-    assert (
-        at("indexer", 1024) == (2, 1, "rule")
-        and at("indexer", 5120) == (4, 0, "rule")
-        and at("indexer", 7168) == (4, 0, "rule")
-    )
+    for mode in specs.MODES:
+        for m in GRID:
+            chunks = m // 256
+            want = (4 if chunks % 4 == 0 else 2 if chunks % 2 == 0 else 1, 0, "rule")
+            assert at(mode, m) == want, (
+                mode,
+                m,
+            )  # odd chunks -> n=1, chunks % 4 == 2 -> n=2, chunks % 4 == 0 -> n=4; half_first 0; valid for the real plan at all 87 points
+    # a rules-only profile has no exact rows: off-grid / out-of-range m stay native
+    for m in (512, 1100, 1281, 8448):
+        assert match_prefix(
+            specs.sp_qkv_spec("dense"), MatchCtx("gfx950", 256, 4, m, CAPS), only
+        ) == (None, 0)
 
 
 def test_off_grid_and_out_of_range_m_stay_native_and_small_m_is_unaffected(
@@ -619,10 +632,11 @@ def test_off_grid_and_out_of_range_m_stay_native_and_small_m_is_unaffected(
     ) == (None, 0)
 
 
-def test_the_dispatch_log_names_the_rule_for_the_shipped_profile(sp_qkv_catalog):
+def test_the_dispatch_log_names_row_or_rule_source(sp_qkv_catalog):
+    only = _rules_only_profile()
     with capture() as msgs:
         match_prefix(
-            specs.sp_qkv_spec("dense"), MatchCtx("gfx950", 256, 4, 1024, CAPS), PROFILE
+            specs.sp_qkv_spec("dense"), MatchCtx("gfx950", 256, 4, 1024, CAPS), only
         )
         match_prefix(
             specs.sp_qkv_spec("dense"), MatchCtx("gfx950", 256, 4, 2048, CAPS), PROFILE
@@ -632,7 +646,7 @@ def test_the_dispatch_log_names_the_rule_for_the_shipped_profile(sp_qkv_catalog)
         )
     disp = [m for m in msgs if "event=dispatch" in m and "n_stages=" in m]
     assert (
-        "source=rule rule=dense_m1024-6144_x1024" in disp[0]
+        "source=rule rule=dense_chunks_mod4_x1024" in disp[0]
         and "vid=sp_qkv.large.v1" in disp[0]
         and "m=1024" in disp[0]
     )
@@ -734,3 +748,30 @@ def test_unknown_signature_and_arch_rules_are_skipped_with_a_rule_label(jit_root
         "rule m=1024..2048 step 256" in s and "not a known sp_qkv spec" in s
         for s in skipped
     ) and any("gfx950 only" in s for s in skipped)
+
+
+def test_87_exact_large_rows_still_collapse_into_the_same_few_build_units():
+    """Builds are keyed by mode + build params (no_gridread, src), never by m, n or half_first: the 87 exact P1 rows add no unit beyond the pre-sweep profile's 9
+    (the small builds + the 2 large builds), and the rules (fallback layers) add none either.
+    """
+    units, skipped = _units(PROFILE)
+    assert skipped == [] and len(units) == 9
+    large = [u for u in units if u.kind == "sp_qkv.large.v1"]
+    assert len(large) == 2 and {u.meta["src"] for u in large} == {
+        "r12"
+    }  # the dense and the indexer build (reuse shares the dense build)
+    assert len({u.key for u in large}) == len(large)
+    # the same enumeration without ANY large row (rules only) yields the same large builds: rules and rows imply identical units
+    with open(profmod._resolve(PROFILE), encoding="utf-8") as f:
+        doc = json.load(f)
+    only_rules = profmod.parse_profile(
+        {
+            "profile": "r",
+            "rows": [r for r in doc["rows"] if r["vid"] != "sp_qkv.large.v1"],
+            "rules": doc["rules"],
+        }
+    )
+    u2, s2 = _units(only_rules)
+    assert s2 == [] and {(u.kind, u.key) for u in u2} == {
+        (u.kind, u.key) for u in units
+    }

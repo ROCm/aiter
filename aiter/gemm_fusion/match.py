@@ -15,7 +15,7 @@ import logging
 from dataclasses import dataclass
 
 from . import catalog
-from .profile import load_profile
+from .profile import Profile, load_profile
 from .spec import FusionSpec
 
 log = logging.getLogger("aiter.gemm_fusion")
@@ -79,10 +79,11 @@ def _load_builtin(vid: str):
 
 
 def match_prefix(
-    spec: FusionSpec, ctx: MatchCtx, profile: str | None = None
+    spec: FusionSpec, ctx: MatchCtx, profile: str | Profile | None = None
 ) -> tuple[object | None, int]:
-    """Return (plan, n_stages) for the longest covered prefix, or (None, 0)."""
-    prof = load_profile(profile)
+    """Return (plan, n_stages) for the longest covered prefix, or (None, 0). ``profile``: a name/path, an already loaded Profile (used as is: a rules-only profile has no
+    rows, so it must never be tested for truthiness), or None (the env var)."""
+    prof = profile if isinstance(profile, Profile) else load_profile(profile)
     for n in range(len(spec.stages), 0, -1):
         sub = spec.prefix(n)
         row, source = prof.resolve(sub.signature(), ctx.arch, ctx.cu, ctx.world, ctx.m)

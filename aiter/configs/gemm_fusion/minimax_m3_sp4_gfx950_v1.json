@@ -133,6 +133,66 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
+      "m": 1024,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T4096"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1280,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T5120"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1536,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 1,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T6144"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1792,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T7168"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
       "m": 2048,
       "vid": "sp_qkv.large.v1",
       "params": {
@@ -148,7 +208,22 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
-      "m": 4096,
+      "m": 2304,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T9216"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2560,
       "vid": "sp_qkv.large.v1",
       "params": {
         "n": 2,
@@ -156,7 +231,323 @@
         "no_gridread": 1,
         "src": "r12"
       },
-      "cell": "dense_T16384"
+      "cell": "dense_T10240"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2816,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T11264"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 3072,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 1,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T12288"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 3328,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T13312"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 3584,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T14336"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 3840,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T15360"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4096,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 1,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T16384",
+      "note": "P1 sweep best; replaces the r11-era tuned (n=2, half_first=0)"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4352,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T17408"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4608,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T18432"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4864,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T19456"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 5120,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T20480"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 5376,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T21504"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 5632,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T22528"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 5888,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T23552"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 6144,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T24576"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 6400,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T25600"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 6656,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T26624"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 6912,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T27648"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 7168,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T28672"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 7424,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T29696"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 7680,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T30720"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 7936,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "dense_T31744"
     },
     {
       "sig": "15f0490f0df1d837",
@@ -178,6 +569,66 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
+      "m": 1024,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T4096"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1280,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T5120"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1536,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 1,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T6144"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1792,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T7168"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
       "m": 2048,
       "vid": "sp_qkv.large.v1",
       "params": {
@@ -193,7 +644,173 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
+      "m": 2304,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T9216"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2560,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T10240"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2816,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T11264"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 3072,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 1,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T12288"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 3328,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T13312"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 3584,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T14336"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 3840,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T15360"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
       "m": 4096,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 1,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T16384",
+      "note": "P1 sweep best; replaces the r11-era tuned (n=4, half_first=0)"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4352,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T17408"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4608,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T18432"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4864,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T19456"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 5120,
       "vid": "sp_qkv.large.v1",
       "params": {
         "n": 4,
@@ -201,7 +818,172 @@
         "no_gridread": 1,
         "src": "r12"
       },
-      "cell": "indexer_T16384"
+      "cell": "indexer_T20480"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 5376,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T21504"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 5632,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T22528"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 5888,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T23552"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 6144,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T24576"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 6400,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T25600"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 6656,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T26624"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 6912,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T27648"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 7168,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T28672"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 7424,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T29696"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 7680,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T30720"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 7936,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T31744"
     },
     {
       "sig": "0fd134d47bb1534f",
@@ -212,11 +994,72 @@
       "vid": "sp_qkv.large.v1",
       "params": {
         "n": 4,
+        "half_first": 1,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "indexer_T32768",
+      "note": "P1 sweep best; replaces the r11-era tuned (n=4, half_first=0)"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1024,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
         "half_first": 0,
         "no_gridread": 1,
         "src": "r12"
       },
-      "cell": "indexer_T32768"
+      "cell": "reuse_T4096"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1280,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "reuse_T5120"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1536,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 1,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "reuse_T6144"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1792,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "reuse_T7168"
     },
     {
       "sig": "1f5973865d6bcd73",
@@ -238,7 +1081,173 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
+      "m": 2304,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "reuse_T9216"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2560,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "reuse_T10240"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2816,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "reuse_T11264"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 3072,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 1,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "reuse_T12288"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 3328,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "reuse_T13312"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 3584,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "reuse_T14336"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 3840,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "reuse_T15360"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
       "m": 4096,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 1,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "reuse_T16384",
+      "note": "P1 sweep best; replaces the r11-era tuned (n=4, half_first=0)"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4352,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "reuse_T17408"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4608,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "reuse_T18432"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4864,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "reuse_T19456"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 5120,
       "vid": "sp_qkv.large.v1",
       "params": {
         "n": 4,
@@ -246,7 +1255,172 @@
         "no_gridread": 1,
         "src": "r12"
       },
-      "cell": "reuse_T16384"
+      "cell": "reuse_T20480"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 5376,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "reuse_T21504"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 5632,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "reuse_T22528"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 5888,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "reuse_T23552"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 6144,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "reuse_T24576"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 6400,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "reuse_T25600"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 6656,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "reuse_T26624"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 6912,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "reuse_T27648"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 7168,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "reuse_T28672"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 7424,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "reuse_T29696"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 7680,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "reuse_T30720"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 7936,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r12"
+      },
+      "cell": "reuse_T31744"
     },
     {
       "sig": "1f5973865d6bcd73",
@@ -280,8 +1454,8 @@
         "no_gridread": 1,
         "src": "r12"
       },
-      "name": "dense_m1024-8192_x256",
-      "note": "PLACEHOLDER params: fallback n=1; final params from the tuning sweep"
+      "name": "dense_chunks_mod4_x256",
+      "note": "fallback default (chunks mod 4 classes, half_first 0); shadowed by the 87 exact P1 rows on the sweep grid"
     },
     {
       "sig": "15f0490f0df1d837",
@@ -298,8 +1472,8 @@
         "no_gridread": 1,
         "src": "r12"
       },
-      "name": "dense_m1024-8192_x512",
-      "note": "PLACEHOLDER params: nearest exact row (m=4096); final params from the tuning sweep"
+      "name": "dense_chunks_mod4_x512",
+      "note": "fallback default (chunks mod 4 classes, half_first 0); shadowed by the 87 exact P1 rows on the sweep grid"
     },
     {
       "sig": "15f0490f0df1d837",
@@ -307,24 +1481,6 @@
       "cu": 256,
       "world": 4,
       "m_min": 1024,
-      "m_max": 6144,
-      "m_multiple": 1024,
-      "vid": "sp_qkv.large.v1",
-      "params": {
-        "n": 2,
-        "half_first": 0,
-        "no_gridread": 1,
-        "src": "r12"
-      },
-      "name": "dense_m1024-6144_x1024",
-      "note": "PLACEHOLDER params: nearest exact row (m=4096); final params from the tuning sweep"
-    },
-    {
-      "sig": "15f0490f0df1d837",
-      "arch": "gfx950",
-      "cu": 256,
-      "world": 4,
-      "m_min": 7168,
       "m_max": 8192,
       "m_multiple": 1024,
       "vid": "sp_qkv.large.v1",
@@ -334,8 +1490,8 @@
         "no_gridread": 1,
         "src": "r12"
       },
-      "name": "dense_m7168-8192_x1024",
-      "note": "PLACEHOLDER params: nearest exact row (m=8192); final params from the tuning sweep"
+      "name": "dense_chunks_mod4_x1024",
+      "note": "fallback default (chunks mod 4 classes, half_first 0); shadowed by the 87 exact P1 rows on the sweep grid"
     },
     {
       "sig": "0fd134d47bb1534f",
@@ -352,8 +1508,8 @@
         "no_gridread": 1,
         "src": "r12"
       },
-      "name": "indexer_m1024-8192_x256",
-      "note": "PLACEHOLDER params: fallback n=1; final params from the tuning sweep"
+      "name": "indexer_chunks_mod4_x256",
+      "note": "fallback default (chunks mod 4 classes, half_first 0); shadowed by the 87 exact P1 rows on the sweep grid"
     },
     {
       "sig": "0fd134d47bb1534f",
@@ -366,12 +1522,12 @@
       "vid": "sp_qkv.large.v1",
       "params": {
         "n": 2,
-        "half_first": 1,
+        "half_first": 0,
         "no_gridread": 1,
         "src": "r12"
       },
-      "name": "indexer_m1024-8192_x512",
-      "note": "PLACEHOLDER params: nearest exact row (m=2048); final params from the tuning sweep"
+      "name": "indexer_chunks_mod4_x512",
+      "note": "fallback default (chunks mod 4 classes, half_first 0); shadowed by the 87 exact P1 rows on the sweep grid"
     },
     {
       "sig": "0fd134d47bb1534f",
@@ -379,24 +1535,6 @@
       "cu": 256,
       "world": 4,
       "m_min": 1024,
-      "m_max": 3072,
-      "m_multiple": 1024,
-      "vid": "sp_qkv.large.v1",
-      "params": {
-        "n": 2,
-        "half_first": 1,
-        "no_gridread": 1,
-        "src": "r12"
-      },
-      "name": "indexer_m1024-3072_x1024",
-      "note": "PLACEHOLDER params: nearest exact row (m=2048); final params from the tuning sweep"
-    },
-    {
-      "sig": "0fd134d47bb1534f",
-      "arch": "gfx950",
-      "cu": 256,
-      "world": 4,
-      "m_min": 4096,
       "m_max": 8192,
       "m_multiple": 1024,
       "vid": "sp_qkv.large.v1",
@@ -406,8 +1544,8 @@
         "no_gridread": 1,
         "src": "r12"
       },
-      "name": "indexer_m4096-8192_x1024",
-      "note": "PLACEHOLDER params: nearest exact rows; final params from the tuning sweep"
+      "name": "indexer_chunks_mod4_x1024",
+      "note": "fallback default (chunks mod 4 classes, half_first 0); shadowed by the 87 exact P1 rows on the sweep grid"
     },
     {
       "sig": "1f5973865d6bcd73",
@@ -424,8 +1562,8 @@
         "no_gridread": 1,
         "src": "r12"
       },
-      "name": "reuse_m1024-8192_x256",
-      "note": "PLACEHOLDER params: fallback n=1; final params from the tuning sweep"
+      "name": "reuse_chunks_mod4_x256",
+      "note": "fallback default (chunks mod 4 classes, half_first 0); shadowed by the 87 exact P1 rows on the sweep grid"
     },
     {
       "sig": "1f5973865d6bcd73",
@@ -438,12 +1576,12 @@
       "vid": "sp_qkv.large.v1",
       "params": {
         "n": 2,
-        "half_first": 1,
+        "half_first": 0,
         "no_gridread": 1,
         "src": "r12"
       },
-      "name": "reuse_m1024-8192_x512",
-      "note": "PLACEHOLDER params: nearest exact row (m=2048); final params from the tuning sweep"
+      "name": "reuse_chunks_mod4_x512",
+      "note": "fallback default (chunks mod 4 classes, half_first 0); shadowed by the 87 exact P1 rows on the sweep grid"
     },
     {
       "sig": "1f5973865d6bcd73",
@@ -451,24 +1589,6 @@
       "cu": 256,
       "world": 4,
       "m_min": 1024,
-      "m_max": 3072,
-      "m_multiple": 1024,
-      "vid": "sp_qkv.large.v1",
-      "params": {
-        "n": 2,
-        "half_first": 1,
-        "no_gridread": 1,
-        "src": "r12"
-      },
-      "name": "reuse_m1024-3072_x1024",
-      "note": "PLACEHOLDER params: nearest exact row (m=2048); final params from the tuning sweep"
-    },
-    {
-      "sig": "1f5973865d6bcd73",
-      "arch": "gfx950",
-      "cu": 256,
-      "world": 4,
-      "m_min": 4096,
       "m_max": 8192,
       "m_multiple": 1024,
       "vid": "sp_qkv.large.v1",
@@ -478,8 +1598,8 @@
         "no_gridread": 1,
         "src": "r12"
       },
-      "name": "reuse_m4096-8192_x1024",
-      "note": "PLACEHOLDER params: nearest exact rows; final params from the tuning sweep"
+      "name": "reuse_chunks_mod4_x1024",
+      "note": "fallback default (chunks mod 4 classes, half_first 0); shadowed by the 87 exact P1 rows on the sweep grid"
     }
   ]
 }
