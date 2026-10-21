@@ -111,3 +111,6 @@ csrc/opus_gemm/gen_co/*/asm/
 
 # Merge-conflict backups, which git writes next to the file being merged.
 *.orig
+
+vLLM/venv
+vLLM/results
