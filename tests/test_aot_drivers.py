@@ -1,10 +1,10 @@
 """AOT driver coverage: config wiring, cache signatures, and GPU worker policy."""
 
-from contextlib import nullcontext
 import inspect
 import pathlib
 import sys
 import unittest
+from contextlib import nullcontext
 from unittest.mock import MagicMock, call, patch
 
 if str(pathlib.Path(__file__).resolve().parents[1]) not in sys.path:
