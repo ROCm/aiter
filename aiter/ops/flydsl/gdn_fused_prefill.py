@@ -20,7 +20,7 @@ import functools
 
 import torch
 
-from .kernels.gdr_prefill import compile_gdn_fused_prefill
+from .kernels.gdn_prefill import compile_gdn_fused_prefill
 from .kernels.tensor_shim import _run_compiled
 
 _KD = 128

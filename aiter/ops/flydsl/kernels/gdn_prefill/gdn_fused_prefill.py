@@ -129,22 +129,15 @@ def _mm16_x3(a, b, c4):
 
 
 def _dpp_i32(src, ctrl, row_mask, bank_mask, bound_ctrl=False, old=0):
-    from flydsl._mlir.dialects import llvm as _llvm
-
     return fx.Int32(
-        _llvm.call_intrinsic(
+        rocdl.update_dpp(
             fx.Int32.ir_type,
-            "llvm.amdgcn.update.dpp.i32",
-            [
-                fx.Int32(old).ir_value(),
-                fx.Int32(src).ir_value(),
-                fx.Int32(ctrl).ir_value(),
-                fx.Int32(row_mask).ir_value(),
-                fx.Int32(bank_mask).ir_value(),
-                fx.Boolean(bound_ctrl).ir_value(),
-            ],
-            [],
-            [],
+            fx.Int32(old).ir_value(),
+            fx.Int32(src).ir_value(),
+            ctrl,
+            row_mask,
+            bank_mask,
+            bound_ctrl,
         )
     )
 
