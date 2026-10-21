@@ -5,8 +5,9 @@
 Runs the same skewed routing through a plain MegaMoEV2 and through a
 plain instance over ``R * (EPR + B)`` experts whose weight window is ``[EPR
 home | B slots]``, fed the virtual ids ``MoonEPPlanner`` rewrites the routes to.
-The slots are filled from the ``placed`` table the planner
-wrote, the way a production weight pool would.  Outputs must match.
+Each layer's window is a ``MoonEPWeightPool`` whose slots its own prefetch
+kernel fills from the ``placed`` table the planner wrote.  Outputs must be
+bit-identical.
 
     torchrun --nproc-per-node 8|4 op_tests/multigpu_tests/test_moonep_mega.py
 """
@@ -29,6 +30,7 @@ from test_mega_moe_v2 import (
 
 from aiter.ops.flydsl.kernels.mega_moe import MegaMoEV2
 from aiter.ops.flydsl.kernels.moonep_plan import MoonEPPlanner
+from aiter.ops.flydsl.kernels.moonep_weights import MoonEPWeightPool
 
 MODEL_DIM, INTER_DIM, EXPERTS, TOPK, SWIGLU = 7168, 3072, 384, 6, 10.0
 
@@ -92,33 +94,27 @@ def main():
     rank, world, device = _setup_dist()
     epr = EXPERTS // world
     B = args.slots
+    layers = []
     try:
 
         def per_expert(t):
             return t.contiguous().view(torch.uint8).view(epr, -1)
 
-        layers = []
         for layer in range(args.layers):
-            everyone = [
-                _quantize_weights(MODEL_DIM, INTER_DIM, epr, r, 7 + 31 * layer, device)[
-                    :4
-                ]
-                for r in range(world)
-            ]
-            home = everyone[rank]
-            # All experts, flattened per expert, in global order.
-            bank = [torch.cat([per_expert(e[i]) for e in everyone]) for i in range(4)]
-            windows = [
-                torch.cat(
-                    [per_expert(t), torch.zeros_like(per_expert(t)[:B])]
-                ).contiguous()
-                for t in home
-            ]
-            views = [win.view(t.dtype) for win, t in zip(windows, home)]
-            layers.append(
-                {"home": home, "bank": bank, "windows": windows, "views": views}
+            home = _quantize_weights(
+                MODEL_DIM, INTER_DIM, epr, rank, 7 + 31 * layer, device
+            )[:4]
+            rows = [per_expert(t) for t in home]
+            pool = MoonEPWeightPool(
+                rank=rank,
+                world_size=world,
+                experts_per_rank=epr,
+                prefetch_slots=B,
+                parts=[((r.shape[1],), torch.uint8) for r in rows],
             )
-            del everyone
+            pool.stage_home(rows)
+            views = [win.view(t.dtype) for win, t in zip(pool.local, home)]
+            layers.append({"home": home, "pool": pool, "views": views})
 
         def bind(moe, weights):
             w1, w1s, w2, w2s = weights
@@ -168,14 +164,7 @@ def main():
             if args.skip_prefetch:
                 return
             placed, prev = layer["state"]["placed"], layer["state"]["prev"]
-            want = placed[rank].long()
-            copy = (want >= 0) & (want != prev[rank].long())
-            src = want.clamp(min=0)
-            for win, all_experts in zip(layer["windows"], layer["bank"]):
-                rows = win[epr:]
-                rows.copy_(
-                    torch.where(copy[:, None], all_experts.index_select(0, src), rows)
-                )
+            layer["pool"].prefetch(placed[rank], prev[rank])
 
         def run(layer, x, wts, ids, balance):
             if balance:
@@ -249,7 +238,7 @@ def main():
                     if rank == 0:
                         rels = [float(g[0]) for g in gathered]
                         exacts = sum(int(g[1]) for g in gathered)
-                        step_ok = max(rels) < 2e-2
+                        step_ok = exacts == world
                         ok &= step_ok
                         print(
                             f"step={step} layer={index} balance={balance} hot={step % 2 == 0} "
@@ -262,6 +251,9 @@ def main():
             print("ALL_OK" if ok else "SOME_FAILED", flush=True)
     finally:
         _barrier()
+        for layer in layers:
+            layer.pop("views")
+            layer.pop("pool").close()
         _cleanup()
     return 0 if ok else 1
 

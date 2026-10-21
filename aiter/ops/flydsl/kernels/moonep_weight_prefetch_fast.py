@@ -9,8 +9,10 @@ scale) in one launch.
 
 Why
 ---
-Measured on MI355X (8 ranks, H=7168 I=2048, one weight matrix = 29.4 MB,
-busiest-rank bytes over slowest-rank time, upstream ``bench_comm`` methodology):
+The flat grid-stride kernel this one replaced, measured on MI355X with a
+standalone script that is not part of aiter (8 ranks, H=7168 I=2048, one weight
+matrix = 29.4 MB, busiest-rank bytes over slowest-rank time, upstream
+``bench_comm`` methodology):
 
 =====================  ==========  ===========
 routing                    us          GB/s
