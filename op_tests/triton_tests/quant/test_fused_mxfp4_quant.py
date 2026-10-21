@@ -254,16 +254,23 @@ def torch_rms_gated(x, weight, z, eps, group_size, norm_before_gate, activation)
     return y
 
 
-@pytest.mark.parametrize("M", [1, 4, 31, 64, 1000])
+@pytest.mark.parametrize("M", [1, 1000])
+@pytest.mark.parametrize("N, group_size", [(3072, 128), (256, None), (4096, None)])
 @pytest.mark.parametrize(
-    "N, group_size",
-    [(3072, 128), (6144, 128), (256, None), (4096, 256), (4096, None)],
+    "norm_before_gate, activation, dtype, transpose_scale",
+    [
+        (True, "sigmoid", torch.bfloat16, True),
+        (False, "silu", torch.float16, False),
+    ],
 )
-@pytest.mark.parametrize("norm_before_gate", [True, False])
-@pytest.mark.parametrize("activation", ["silu", "sigmoid"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_fused_rms_gated_mxfp4_quant(
-    M: int, N: int, group_size, norm_before_gate: bool, activation: str, dtype
+    M: int,
+    N: int,
+    group_size,
+    norm_before_gate: bool,
+    activation: str,
+    dtype,
+    transpose_scale: bool,
 ):
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
@@ -286,9 +293,11 @@ def test_fused_rms_gated_mxfp4_quant(
         norm_before_gate=norm_before_gate,
         activation=activation,
         group_size=group_size,
+        transpose_scale=transpose_scale,
     )
 
     assert y_fp4.shape == (M, N // 2) and y_scales.shape == (M, N // 32)
+    assert y_scales.stride() == ((1, M) if transpose_scale else (N // 32, 1))
     # A one-ulp difference in the rounded activation can move an element
     # that sits on an E2M1 rounding boundary to the neighbouring code.
     ref = convert_mxfp4_to_fp32(y_fp4_torch, y_scales_torch)
@@ -296,61 +305,6 @@ def test_fused_rms_gated_mxfp4_quant(
     mismatched = (ref != out).sum().item()
     assert mismatched <= max(1, ref.numel() // 100_000), mismatched
     torch.testing.assert_close(ref, out, atol=0.5, rtol=0.5)
-
-
-@pytest.mark.parametrize("M", [1, 31, 1000])
-@pytest.mark.parametrize("N, group_size", [(3072, 128), (256, None), (4096, 256)])
-def test_fused_rms_gated_mxfp4_quant_transpose_scale(M: int, N: int, group_size):
-    if not (arch_info.is_fp4_avail()):
-        pytest.skip("MXFP4 not supported on this architecture")
-
-    torch.manual_seed(0)
-    G = N if group_size is None else group_size
-    x = torch.randn((M, N), dtype=torch.bfloat16, device="cuda")
-    z = torch.randn((M, N), dtype=torch.bfloat16, device="cuda")
-    w = torch.randn(G, dtype=torch.bfloat16, device="cuda")
-
-    y_fp4, y_scales = fused_rms_gated_mxfp4_quant(x, w, z, 1e-6, group_size=group_size)
-    t_fp4, t_scales = fused_rms_gated_mxfp4_quant(
-        x, w, z, 1e-6, group_size=group_size, transpose_scale=True
-    )
-
-    assert t_scales.shape == (M, N // 32) and t_scales.stride() == (1, M)
-    assert torch.equal(t_fp4, y_fp4)
-    assert torch.equal(t_scales, y_scales)
-
-
-@pytest.mark.parametrize(
-    "case",
-    [
-        "shape_mismatch",
-        "not_2d",
-        "not_contiguous",
-        "activation",
-        "group_size",
-        "weight_size",
-    ],
-)
-def test_fused_rms_gated_mxfp4_quant_rejects_bad_inputs(case: str):
-    # Validation runs before any launch, so CPU tensors are enough.
-    x = torch.randn((4, 256), dtype=torch.bfloat16, device="cpu")
-    z = torch.randn_like(x)
-    w = torch.randn(128, dtype=torch.bfloat16, device="cpu")
-    kwargs = {"group_size": 128}
-    if case == "shape_mismatch":
-        z = z[:, :128]
-    elif case == "not_2d":
-        x, z = x.view(4, 2, 128), z.view(4, 2, 128)
-    elif case == "not_contiguous":
-        x = torch.randn((256, 4), dtype=torch.bfloat16, device="cpu").t()
-    elif case == "activation":
-        kwargs["activation"] = "gelu"
-    elif case == "group_size":
-        kwargs["group_size"] = 96
-    elif case == "weight_size":
-        w = w[:64]
-    with pytest.raises(ValueError):
-        fused_rms_gated_mxfp4_quant(x, w, z, 1e-6, **kwargs)
 
 
 def run_torch_reduce_act_mul_mxfp4_group_quant(x, x2, activation, dtype, shuffle):

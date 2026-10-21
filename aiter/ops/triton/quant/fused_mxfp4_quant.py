@@ -289,7 +289,9 @@ def fused_rms_gated_mxfp4_quant(
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
         NORM_BEFORE_GATE=norm_before_gate,
-        ACTIVATION="sigmoid" if activation == "sigmoid" else "silu",
+        ACTIVATION=_get_activation_from_str(
+            "silu" if activation == "swish" else activation
+        ),
         num_warps=num_warps,
     )
 

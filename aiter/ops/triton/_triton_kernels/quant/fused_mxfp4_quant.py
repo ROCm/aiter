@@ -322,10 +322,7 @@ def _fused_rms_gated_mxfp4_quant_kernel(
         other=other,
         cache_modifier=".cg",
     ).to(tl.float32)
-    if ACTIVATION == "sigmoid":
-        gate = tl.sigmoid(z)
-    else:
-        gate = z * tl.sigmoid(z)
+    gate = ACTIVATION(z)
 
     w_mask = None
     w_other = None
