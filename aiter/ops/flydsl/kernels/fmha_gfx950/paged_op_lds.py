@@ -237,15 +237,12 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8KernelContext):
             False,
             False,
         )
-        return Vec.from_elements(
-            [
-                fx.Int32(llvm.extractvalue(T.i32, pair_lo, [0])),
-                fx.Int32(llvm.extractvalue(T.i32, pair_lo, [1])),
-                fx.Int32(llvm.extractvalue(T.i32, pair_hi, [0])),
-                fx.Int32(llvm.extractvalue(T.i32, pair_hi, [1])),
-            ],
-            fx.Int32,
-        )
+        words = [
+            llvm.extractvalue(T.i32, pair, [index])
+            for pair in (pair_lo, pair_hi)
+            for index in (0, 1)
+        ]
+        return Vec.from_elements(words, fx.Int32)
 
     def load_v(self, tile_start, buf_id, page_id=None, *, mask_padding=True):
         """Stage native V pages in the matching FP8 LDS layout."""

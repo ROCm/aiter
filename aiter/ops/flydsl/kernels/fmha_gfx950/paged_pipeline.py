@@ -709,6 +709,8 @@ class DualwaveFp8KernelContext:
                 num_pages = fx.min(
                     fx.Int64(num_pages), fx.Int64(self.request_page_count)
                 )
+            # The host bound can be even while this request has odd or zero pages.
+            # Bound both metadata modes here so padding IDs never become K/V bases.
             bounded = fx.rocdl.make_buffer_tensor(
                 request, num_records_bytes=(num_pages * 4).ir_value()
             )

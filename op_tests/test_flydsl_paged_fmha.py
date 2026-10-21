@@ -422,6 +422,76 @@ def test_scalar_and_paired_page64_paths(d, dv, heads):
 
 
 @gfx950
+@pytest.mark.parametrize("csr", [False, True])
+def test_paired_page64_ids_are_bounded_by_request(csr):
+    """An even launch capacity must not expose an odd/empty request's padding."""
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+
+    from aiter.ops.flydsl.kernels.fmha_gfx950.paged_pipeline import (
+        DualwaveFp8KernelContext,
+        _make_paged_dualwave_swp_fp8_traits,
+    )
+    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
+
+    traits = _make_paged_dualwave_swp_fp8_traits(
+        1, 1, 128, 128, 6.0, metadata_mode="csr" if csr else "block_table"
+    )
+    # The request starts at slot 10; unused slots and neighboring rows are poison.
+    table = torch.full((30,), -1, dtype=torch.int32, device="cuda")
+    output = torch.empty(2, dtype=torch.int64, device="cuda")
+
+    @flyc.kernel(known_block_size=[64, 1, 1])
+    def probe(table: fx.Pointer, output: fx.Pointer, klen: fx.Int32, tile: fx.Int32):
+        ctx = DualwaveFp8KernelContext(traits)
+        ctx.BlockTable = fx.make_view(table, fx.make_layout(30, 1))
+        ctx.block_table_stride = 10
+        ctx.batch_idx = fx.Index(1)
+        ctx.page_base = fx.Int64(10)
+        ctx.seqlen_kv_v = fx.Index(klen)
+        ctx.request_page_count = (fx.Int64(klen) + 63) // 64
+        ctx.init_page_table()
+        pages = ctx.load_page_id_pair(fx.Int64(tile) * 64)
+        if fx.thread_idx.x == 0:
+            fx.generic_store(output, fx.Vector.from_elements(pages, fx.Int64))
+
+    @flyc.jit
+    def launch(
+        table: fx.Pointer,
+        output: fx.Pointer,
+        klen: fx.Int32,
+        tile: fx.Int32,
+        stream: fx.Stream,
+    ):
+        probe(table, output, klen, tile).launch(
+            grid=(1, 1, 1), block=(64, 1, 1), stream=stream
+        )
+
+    for klen, tile, expected in (
+        (640, 8, [108, 109]),  # Both halves of the last pair are valid.
+        (513, 8, [108, 0]),  # Nine pages in a ten-slot row: preserve the last ID.
+        (1, 0, [100, 0]),
+        (0, 0, [0, 0]),
+        (513, 10, [0, 0]),  # A speculative pair beyond this request is all zero.
+    ):
+        count = (klen + 63) // 64
+        table.fill_(-1)
+        table[10 : 10 + count] = torch.arange(
+            100, 100 + count, dtype=torch.int32, device="cuda"
+        )
+        output.fill_(-1)
+        _run_compiled(
+            launch,
+            ptr_arg(table, fx.Int32),
+            ptr_arg(output, fx.Int64),
+            klen,
+            tile,
+            torch.cuda.current_stream(),
+        )
+        assert output.tolist() == expected, (csr, klen, tile)
+
+
+@gfx950
 @pytest.mark.parametrize(
     "page,layout,d,dv",
     [
