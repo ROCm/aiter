@@ -72,9 +72,22 @@ def test_build_target_is_not_the_runtime_arch(device1_selected_empty_tool, monke
 
 
 def test_cu_fallback_reads_current_device(device1_selected_empty_tool):
-    if chip_info.IS_WINDOWS:
-        pytest.skip("Windows get_cu_num_custom_op reads device 0, not rocminfo")
     assert chip_info._torch_cu_num() == 304
+    assert chip_info.get_cu_num_custom_op() == 304
+
+
+def test_windows_fallbacks_read_current_device(
+    device1_selected_empty_tool, monkeypatch
+):
+    def missing_hipinfo():
+        raise FileNotFoundError("hipinfo")
+
+    for m in _MODULES:
+        monkeypatch.setattr(m, "IS_WINDOWS", True)
+        monkeypatch.setattr(m, "_gpu_info_output", missing_hipinfo)
+    monkeypatch.setattr(torch.version, "hip", "7.2")
+    _clear_caches()
+    assert chip_info.get_gfx_runtime() == "gfx942"
     assert chip_info.get_cu_num_custom_op() == 304
 
 

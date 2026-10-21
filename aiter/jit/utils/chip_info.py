@@ -171,11 +171,11 @@ def get_gfx_runtime() -> str:
             raise
         import torch
 
-        if torch.version.hip is None or not torch.cuda.is_available():
+        if torch.version.hip is None:
             raise
-        gfx_arch = (
-            torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0].lower()
-        )
+        gfx_arch = _torch_gcn_arch()
+        if gfx_arch is None:
+            raise
     supported = set(GFX_MAP.values())
     if gfx_arch not in supported:
         raise KeyError(
@@ -326,11 +326,10 @@ def get_cu_num_custom_op() -> int:
     cu_num = int(os.getenv("CU_NUM", "0"))
     if cu_num == 0:
         if IS_WINDOWS:
-            import torch
-
-            props = torch.cuda.get_device_properties(0)
-            gfx = props.gcnArchName.split(":", 1)[0]
-            return torch_processor_count_to_cu(gfx, props.multi_processor_count)
+            cu_num = _torch_cu_num()
+            if cu_num is None:
+                raise RuntimeError("No GPU compute unit from the live HIP device.")
+            return cu_num
         gpu_compute_units: list[int] = []
         tool_error: Exception | None = None
         try:
