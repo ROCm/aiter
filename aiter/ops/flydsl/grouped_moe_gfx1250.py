@@ -4,10 +4,9 @@
 
 Supports optional DeepGEMM-style contiguous-M scheduler
 (AITER_GROUPED_DEEPGEMM_CONTIGUOUS=1 or CSV grouped_contiguous_m=1).
-For A4W4, the tuned CSV ``a_preshuffle`` field selects packed
-(M/16, K/128, 4, 16, 32) A for both grouped GEMMs. When set, the
-``AITER_GROUPED_A4W4_A_PRESHUFFLE`` environment variable explicitly overrides
-the CSV selection.
+For A4W4, the matched tuned CSV row's ``a_preshuffle`` field selects packed
+(M/16, K/128, 4, 16, 16-byte) A for both grouped GEMMs. The field defaults to
+zero and follows the same token-bucket lookup as the other kernel parameters.
 """
 
 import csv
@@ -628,9 +627,7 @@ def _grouped_a8w4_tdm_moe(
     )
     if _compact:
         stage2_scatter = _compact_ctx
-    _a_preshuffle_requested = data_format == "fp4" and _as_bool(
-        os.environ.get("AITER_GROUPED_A4W4_A_PRESHUFFLE"), bool(a_preshuffle)
-    )
+    _a_preshuffle_requested = data_format == "fp4" and bool(a_preshuffle)
     a_preshuffled = bool(_a_preshuffle_requested and not _compact)
     if tile_m2 is None:
         tile_m2 = tile_m
@@ -817,9 +814,7 @@ def _grouped_a8w4_tdm_moe(
                 "slot_stride": int(stage2_scatter.max_tokens_per_rank) * int(topk),
             }
     _apre_row_to_token = (
-        torch.full(
-            (int(contiguous_m),), -1, dtype=torch.int32, device=device
-        )
+        torch.full((int(contiguous_m),), -1, dtype=torch.int32, device=device)
         if a_preshuffled
         else None
     )
@@ -1655,14 +1650,9 @@ def grouped_gemm_gfx1250_a8w4(
                 cfg_row.get("lds_soa_load_interleave"), 0
             )
             _tdm_kw["rolled_drain"] = _as_int(cfg_row.get("rolled_drain"), 0)
-            # Config lookup uses padded token buckets (for example 6144 ->
-            # 8192). A-preshuffle is intentionally enabled for the DSR1
-            # prefill range only, so do not let bucket fallback turn it on for
-            # a smaller real input. An explicit environment override is still
-            # applied later by _grouped_a8w4_tdm_moe.
-            _tdm_kw["a_preshuffle"] = int(
-                _as_int(cfg_row.get("a_preshuffle"), 0) and token_num >= 8192
-            )
+            # Follow the matched CSV bucket, including padded token counts
+            # (for example, 6144 -> 8192), just like the other kernel knobs.
+            _tdm_kw["a_preshuffle"] = _as_int(cfg_row.get("a_preshuffle"), 0)
             # GEMM1 always has a local epilogue; stage2_scatter only changes
             # GEMM2, so it does not restrict GEMM1's persistent scheduler.
             _tdm_kw["persistent_workers"] = _as_int(
