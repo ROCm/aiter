@@ -56,13 +56,13 @@ def fixture(heads, page, raw_q, seed=711):
         )
         scales[:, : page * 16].view(pages, page, 16)[ix // page, ix % page] = codes
         pool = data.flatten()
-        kw = dict(
-            cache_scales=scales.flatten(),
-            cache_page_size=page,
-            cache_num_rows=n,
-            cache_data_page_stride=ds,
-            cache_scale_page_stride=ss,
-        )
+        kw = {
+            "cache_scales": scales.flatten(),
+            "cache_page_size": page,
+            "cache_num_rows": n,
+            "cache_data_page_stride": ds,
+            "cache_scale_page_stride": ss,
+        }
     else:
         pool = torch.cat(
             (
@@ -129,7 +129,7 @@ def test_fp8_qk_dense(heads, page, raw_q):
         attn_sink=sink,
         q_is_rotated=not raw_q,
         fp8_qk=True,
-        debug_out=debug
+        debug_out=debug,
     )
     torch.testing.assert_close(out[2], mx, rtol=1e-4, atol=3e-5)
     torch.testing.assert_close(out[3], lse, rtol=1e-4, atol=3e-5)
@@ -147,11 +147,11 @@ def test_fp8_qk_reject(kind):
         args[1] = torch.ones(1, 512, device="cuda", dtype=torch.bfloat16)
         args[2] = torch.zeros(1, device="cuda", dtype=torch.int32)
     if kind == "extend":
-        kw = dict(
-            extend_kv=torch.ones(1, 512, device="cuda", dtype=torch.bfloat16),
-            extend=torch.zeros(1, device="cuda", dtype=torch.int32),
-            extend_indptr=args[3],
-        )
+        kw = {
+            "extend_kv": torch.ones(1, 512, device="cuda", dtype=torch.bfloat16),
+            "extend": torch.zeros(1, device="cuda", dtype=torch.int32),
+            "extend_indptr": args[3],
+        }
     with pytest.raises((ValueError, RuntimeError), match="FP8 QK requires"):
         fused_dsv41_mxfp8(*args, **kw, fp8_qk=True)
 
@@ -165,7 +165,12 @@ def test_fp8_qk_replay():
             *args, **kw, fp8_qk=True, q_is_rotated=False, attn_sink=sink
         )
         refs = [x.clone() for x in out]
-        buffers = dict(out=out[0], out_scale=out[1], max_logits=out[2], lse=out[3])
+        buffers = {
+            "out": out[0],
+            "out_scale": out[1],
+            "max_logits": out[2],
+            "lse": out[3],
+        }
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
             fused_dsv41_mxfp8(
@@ -191,7 +196,7 @@ def test_fp8_qk_zero_tokens():
 @pytest.mark.parametrize("page", [0, 7, 32, 128])
 def test_fp8_prepared_q(heads, page):
     args, kw, _, _, sink = fixture(heads, page, True)
-    q, pool, ids, ptr, cos, sin, pos = args
+    q, _pool, _ids, _ptr, cos, sin, pos = args
     q8, qs = quantize_fp8(rotate(q, cos, sin, pos).bfloat16())
     q8 = q8.reshape_as(q)
     qs = qs.reshape(q.shape[0], heads, 16)
@@ -213,7 +218,7 @@ def test_prepared_q_contract(bad):
     q8, qs = quantize_fp8(args[0])
     args[0] = q8.reshape_as(args[0])
     qs = qs.reshape(1, 64, 16)
-    kw = dict(fp8_qk=True, q_scale=qs)
+    kw = {"fp8_qk": True, "q_scale": qs}
     if bad == "flag":
         kw["fp8_qk"] = False
     if bad == "rotate":
