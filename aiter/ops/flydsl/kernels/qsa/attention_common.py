@@ -181,29 +181,8 @@ def _mfma(a, b, c):
 
 
 def _maximum(a, b):
-    # One opaque v_max_f32: fx.maxnumf adds canonicalizing maxes, 0.3-0.5% slower.
-    return fx.Float32(
-        llvm.inline_asm(
-            fx.Float32.ir_type,
-            [fx.Float32(a).ir_value(), fx.Float32(b).ir_value()],
-            "v_max_f32 $0, $1, $2",
-            "=v,v,v",
-            has_side_effects=False,
-        )
-    )
-
-
-def _advance_max(old, new):
-    # Tied move: the new maximum takes the old one's register after the rescale.
-    return fx.Float32(
-        llvm.inline_asm(
-            fx.Float32.ir_type,
-            [old.ir_value(), new.ir_value()],
-            "v_mov_b32 $0, $2",
-            "=v,0,v",
-            has_side_effects=True,
-        )
-    )
+    # nnan drops the canonicalizing maxes that quiet signaling NaNs.
+    return fx.Float32(fx.maxnumf(fx.Float32(a), fx.Float32(b), fastmath="nnan"))
 
 
 def _pack_bf16(values):
@@ -260,7 +239,15 @@ def _buffer_store_words(words, buffer, offset):
 
 
 def _read_address(address, immediate=0):
-    # Opaque LDS read: the pipeline counts lgkmcnt for these reads itself.
+    # Inline asm instead of an LLVM load (plain and volatile both measured):
+    # - Without alias info, SIInsertWaitcnts assumes the in-flight LDS DMA
+    #   (raw_ptr_buffer_load_lds) may write what a load reads, and puts s_waitcnt
+    #   vmcnt(0) before every read (32 per phase): the DMA no longer overlaps the reads.
+    # - The lgkmcnt waits are counted by hand in program order (_v_operands); LLVM
+    #   reschedules visible loads, adding waits and breaking the S1 MFMA/VALU interleave
+    #   (0.4-2.8% slower).
+    # Nothing waits for an asm result: those explicit waits and the stage barriers make
+    # the read safe; ~{memory} keeps it ordered with the other memory operations.
     return fx.Vector(
         llvm.inline_asm(
             ir.VectorType.get([4], fx.Int32.ir_type),
@@ -270,6 +257,14 @@ def _read_address(address, immediate=0):
             has_side_effects=True,
         )
     )
+
+
+def _write_address(address, words):
+    ptr_type = fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Shared, 16)
+    lds = fx.make_view(fx.inttoptr(ptr_type, fx.Int32(address)), fx.make_layout(4, 1))
+    data = fx.make_rmem_tensor(4, fx.Int32)
+    data.store(fx.Vector(words).bitcast(fx.Int32))
+    fx.copy(fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32), data, fx.Tensor(lds))
 
 
 @flyc.jit
@@ -333,32 +328,15 @@ def _max(values):
 
 
 def _cross(value, addresses):
-    # Opaque ds_bpermute: rocdl.ds_bpermute adds compiler waits, 0.2-0.9% slower.
+    bits = fx.Float32(value).bitcast(fx.Int32)
     return tuple(
-        fx.Float32(
-            llvm.inline_asm(
-                fx.Float32.ir_type,
-                [address.ir_value(), value.ir_value()],
-                "ds_bpermute_b32 $0, $1, $2",
-                "=v,v,v,~{memory}",
-                has_side_effects=True,
-            )
-        )
+        fx.Int32(rocdl.ds_bpermute(fx.Int32.ir_type, address, bits)).bitcast(fx.Float32)
         for address in addresses
     )
 
 
 def _center_one(value, scale, maximum):
-    # Opaque FMAs stay out of the VALU sched groups; fx.fma is 0.9-3.6% slower.
-    return fx.Float32(
-        llvm.inline_asm(
-            fx.Float32.ir_type,
-            [value.ir_value(), scale.ir_value(), maximum.ir_value()],
-            "v_fma_f32 $0, $1, $2, -$3",
-            "=v,v,v,v",
-            has_side_effects=False,
-        )
-    )
+    return fx.Float32(fx.fma(fx.Float32(value), scale, -fx.Float32(maximum)))
 
 
 def _center(values, scale, maximum):
@@ -507,7 +485,9 @@ def _pv(
         [acc[n][i] for n in range(8) for i in range(4)], fx.Float32
     )
     if center_args is not None:
-        return result, fx.Vector.from_elements(centered, fx.Float32), new_max, ballot
+        # Pinned: unpinned, LLVM moves these FMAs out of the stage (0.4-1.3% slower).
+        centered = _pin(fx.Vector.from_elements(centered, fx.Float32))
+        return result, centered, new_max, ballot
     if summary_args is not None:
         return result, row_sum, candidate
     return result

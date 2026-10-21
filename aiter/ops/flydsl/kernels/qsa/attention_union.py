@@ -12,11 +12,9 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import rocdl
 
 from .attention_common import (
-    _advance_max,
     _buffer,
     _buffer_words,
     _center,
@@ -45,6 +43,7 @@ from .attention_common import (
     _uniform,
     _v_lds_address,
     _v_operands,
+    _write_address,
 )
 
 __all__ = ["run"]
@@ -108,65 +107,26 @@ def _union_dma(
     base_destination = fx.Int32(base_row * 512 + base_channel * 2)
     immediate = destination_offset - offset
     row, limit = fx.Uint32(rows[packet // 4]), limits[packet & 3]
-    if read_address is not None:
-        # One asm leaf keeps SOFFSET, M0 and the paired LDS read together; split
-        # producers get hazard nops between them.
-        result = llvm.inline_asm(
-            ir.Type.parse("!llvm.struct<(vector<4xi32>, i32)>"),
-            [
-                fx.Int32(read_address).ir_value(),
-                resource,
-                fx.Int32(voffset).ir_value(),
-                base_destination.ir_value(),
-                fx.Int32(row).ir_value(),
-                fx.Int32(limit).ir_value(),
-            ],
-            "s_min_u32 $1, $6, $7\n"
-            f"s_add_u32 m0, $5, {immediate}\n"
-            f"ds_read_b128 $0, $2 offset:{read_immediate}\n"
-            f"buffer_load_dword $4, $3, $1 offen offset:{offset} lds",
-            "=&v,=&s,v,s,v,s,s,s,~{m0},~{scc},~{memory}",
-            has_side_effects=True,
-        )
-        return fx.Vector(
-            llvm.extractvalue(ir.VectorType.get([4], fx.Int32.ir_type), result, [0])
-        )
-    destination = fx.Int32(
-        llvm.inline_asm(
-            fx.Int32.ir_type,
-            [base_destination.ir_value()],
-            f"s_add_u32 $0, $1, {immediate}",
-            "=s,s,~{scc}",
-            has_side_effects=True,
-        )
-    )
+    data = None if read_address is None else _read_address(read_address, read_immediate)
     # Raw LDS DMA: BufferCopyLDS adds its own vmcnt wait; the pipeline waits itself.
     rocdl.raw_ptr_buffer_load_lds(
         resource,
-        fx.to_llvm_ptr(fx.get_iter(storage) + destination),
+        fx.to_llvm_ptr(fx.get_iter(storage) + (base_destination + immediate)),
         4,
         fx.Int32(voffset),
         _min(row, limit),
         offset,
     )
+    return data
 
 
 def _prefetch_mask(resource, tile, offset, bq):
     # S0 issues this request; the existing S2 vmcnt(0) retires it before S3.
-    # Opaque, so LLVM adds no vmcnt wait of its own at the first use.
-    return fx.Int32(
-        llvm.inline_asm(
-            fx.Int32.ir_type,
-            [
-                resource,
-                fx.Int32(offset).ir_value(),
-                fx.Int32(tile * bq * 8).ir_value(),
-            ],
-            "buffer_load_ushort $0, $2, $1, $3 offen",
-            "=v,s,v,s,~{memory}",
-            has_side_effects=True,
-        )
+    bits = rocdl.raw_ptr_buffer_load(
+        fx.Int16.ir_type, resource, fx.Int32(offset), fx.Int32(tile * bq * 8), 0
     )
+    # Only bits 0..15 are read, so the sign extension is harmless.
+    return fx.Int16(bits).to(fx.Int32)
 
 
 def _apply_mask(scores, bits):
@@ -193,14 +153,7 @@ def _output(
             words = _pack_bf16(values)
             column = (((tid >> 4) & 3) * 4 + i) * 8 + half * 128
             address = fx.Int32(shared + ((row * 256 + column) ^ ((row & 7) * 8)) * 2)
-            # Opaque like the reads below; lgkmcnt(0) and the barrier order them.
-            llvm.inline_asm(
-                ir.Type.parse("!llvm.void"),
-                [address.ir_value(), words.ir_value()],
-                "ds_write_b128 $0, $1",
-                "v,v,~{memory}",
-                has_side_effects=True,
-            )
+            _write_address(address, words)
     rocdl.s_waitcnt(lgkmcnt=0)
     _stage_end()
     parts = []
@@ -254,7 +207,7 @@ def _body(
     source_blocks, output_fn = _source_blocks, _output
     qk, local_sum, local_max, cross = _qk, _sum, _max, _cross
     exps, pack, center = _exps, _pack_bf16, _center
-    rescale, advance_max = _rescale, _advance_max
+    rescale = _rescale
     slices = (BQ * GP + 127) // 128
     tile_id, hkv = work // (HK * slices), work % HK
     row_offset = ((work // HK) % slices) * 128
@@ -513,7 +466,6 @@ def _body(
         )
         _schedule(32, 3, 4)
         o0, o1, row_sum = rescale(o0, o1, row_sum, maximum, new_max, ballot)
-        new_max = advance_max(maximum, new_max)
         _stage_end()
         return (
             current,
@@ -526,20 +478,14 @@ def _body(
             future_offsets,
         )
 
-    for t in range(fx.Int32(1), tiles, fx.Int32(1)):
-        scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, next_offsets = (
-            phase(
-                scores,
-                maximum,
-                row_sum,
-                o0,
-                o1,
-                v_offsets,
-                current_offsets,
-                next_offsets,
-                t,
-            )
-        )
+    state = (scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, next_offsets)
+    # Two phases per trip swap the max registers; one phase copies it after its barrier.
+    for t in range(fx.Int32(1), tiles - 1, fx.Int32(2)):
+        state = phase(*state, t)
+        state = phase(*state, fx.Int32(t) + 1)
+    if (tiles > 1) & ((tiles & 1) == 0):
+        state = phase(*state, tiles - 1)
+    scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, next_offsets = state
     offsets = fx.Vector(v_offsets)
     for packet in fx.range_constexpr(16):
         _union_dma(

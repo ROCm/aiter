@@ -12,7 +12,6 @@ import math
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import rocdl
 
 from .attention_common import (
@@ -28,6 +27,7 @@ from .attention_common import (
     _read_address,
     _stage_end,
     _uniform,
+    _write_address,
 )
 
 
@@ -75,14 +75,7 @@ def _output(
             words = _pack_bf16(values)
             col = (((tid >> 4) & 3) * 4 + i) * 8 + half * 128
             address = fx.Int32(shared + ((row * 256 + col) ^ ((row & 7) * 8)) * 2)
-            # Opaque like the reads below; lgkmcnt(0) and the barrier order them.
-            llvm.inline_asm(
-                ir.Type.parse("!llvm.void"),
-                [address.ir_value(), words.ir_value()],
-                "ds_write_b128 $0, $1",
-                "v,v,~{memory}",
-                has_side_effects=True,
-            )
+            _write_address(address, words)
     rocdl.s_waitcnt(lgkmcnt=0)
     _stage_end()
     parts = []
