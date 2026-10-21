@@ -1,5 +1,8 @@
 # DSV4.1 FP8 QK pipeline optimization, 2026-10-21
 
+> Follow-up: [softmax FMA and H128 architecture experiments](fused_dsv41_fp8_qk_h128.md).
+
+
 This update lowers full-path FP8 latency by 40–48% on the original six MI355X
 fixtures relative to commit `3881a17`. QK remains scaled E4M3FN with E8M0
 group32 scales, softmax and accumulation remain FP32, and PV remains BF16.

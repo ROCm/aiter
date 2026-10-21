@@ -280,8 +280,12 @@ __device__ void fp8_qk_decode_accum64(
         row_max         = below ? m_row : max(m_row, row_max);
         D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
         m_row           = row_max;
-        attn_row_scale_sub<T>(v_s, temperature_scale, row_max);
-        attn_exp2_slice<T, 0, s_len>(v_s);
+        // temperature_scale already includes log2(e); row_max is in base-2 units.
+        // Explicit FMA contracts the scale/subtract despite -ffp-contract=off.
+        // One v_fma_f32 plus one v_exp_f32 per score; FMA changes FP32 rounding.
+        static_for<s_len>([&](auto i) {
+            v_s[int(i)] = __builtin_amdgcn_exp2f(__builtin_fmaf(v_s[int(i)], temperature_scale, -row_max));
+        });
         l_row *= rescale_m;
         l_row += attn_row_sum<T>(v_s);
         v_p = cast<D_ATTN>(v_s);
