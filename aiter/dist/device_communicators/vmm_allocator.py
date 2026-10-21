@@ -12,10 +12,13 @@ which exports a POSIX fd that can be passed across processes via Unix sockets.
 import array
 import ctypes
 import functools
+import logging
 import os
 import socket
 import struct
 import threading
+
+logger = logging.getLogger(__name__)
 
 
 def load_hip_runtime() -> ctypes.CDLL:
@@ -39,6 +42,7 @@ def load_hip_runtime() -> ctypes.CDLL:
             maps = f.readlines()
     except OSError:
         maps = []
+    mapped_err = None
     for line in maps:
         # The kernel escapes only "\n" in maps paths, as "\012".
         path = line[line.find("/") :].rstrip("\n").removesuffix(" (deleted)")
@@ -46,8 +50,14 @@ def load_hip_runtime() -> ctypes.CDLL:
         if "/" in line and os.path.basename(path).startswith("libamdhip64.so"):
             try:
                 return ctypes.CDLL(path)
-            except OSError:
-                pass
+            except OSError as e:
+                mapped_err = e
+    if mapped_err is not None:
+        logger.warning(
+            "Could not load the mapped HIP runtime (%s). The soname search can "
+            "map a second runtime.",
+            mapped_err,
+        )
     candidates = ["libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6"]
     last_err = None
     for name in candidates:
