@@ -61,7 +61,7 @@ IGLP_PARAMS = {
     },
     "a4w4": {
         "default": {"mma_group": 10, "mma_first_group": 10, "ds_first_n": 0},
-        "prefill": {"mma_group": 11, "mma_first_group": 13, "ds_first_n": 16},
+        "prefill": {"mma_group": 8, "mma_first_group": 8, "ds_first_n": 16},
     },
 }
 # Prefill means tile_m == tile_n == tile_k == 256 for either data format.

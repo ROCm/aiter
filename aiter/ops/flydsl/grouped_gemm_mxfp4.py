@@ -29,7 +29,7 @@ def _select_bool_env(name: str, csv_value: int) -> int:
 
 def _select_tdm_b_th(csv_tdm_b_th: int) -> int:
     """Selects the B-only TDM temporal hint."""
-    value = os.environ.get("AITER_TDM_B_TH")
+    value = os.environ.get("AITER_TDM_B_TH", "1")
     temporal_hint = int(csv_tdm_b_th) if value is None else int(value.strip())
     if not 0 <= temporal_hint <= 6:
         raise ValueError("AITER_TDM_B_TH must be between 0 and 6")
