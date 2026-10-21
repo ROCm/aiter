@@ -71,7 +71,7 @@ def _build_weight_sets(n_sets, seed=7):
             else torch.randperm(EXPERTS, generator=gen_cpu)
         ).cuda()
 
-        def pick(t):
+        def pick(t, perm=perm):
             u8 = t.view(torch.uint8).index_select(0, perm).contiguous()
             return u8.view(t.dtype)
 

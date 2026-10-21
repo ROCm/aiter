@@ -30,7 +30,7 @@ def _on_gfx950():
         from aiter.jit.utils.chip_info import get_gfx_runtime
 
         return torch.cuda.is_available() and get_gfx_runtime() == "gfx950"
-    except Exception:
+    except (ImportError, RuntimeError):
         return False
 
 
@@ -332,9 +332,9 @@ def test_fold_sort_tables_match_aux_sort(tp8, epilogue, M, routing):
         seen = []
         real = fm.fused_moe_2stages
 
-        def spy(*args, **kwargs):
-            seen.append(args[4:8])
-            return real(*args, **kwargs)
+        def spy(*args, _seen=seen, _real=real, **kwargs):
+            _seen.append(args[4:8])
+            return _real(*args, **kwargs)
 
         fm.fused_moe_2stages = spy
         try:
@@ -444,13 +444,13 @@ def test_guard_needs_gfx950(tp8, monkeypatch):
     _use_config(monkeypatch, GLM5_CSV)
     hidden, weights, ids = _inputs(6, "uniform", seed=6)
     meta = _tp8_metadata(6)
-    kwargs = dict(
-        model_dim=MODEL_DIM,
-        inter_dim=256,
-        global_E=257,
-        output=None,
-        swiglu_limit=None,
-    )
+    kwargs = {
+        "model_dim": MODEL_DIM,
+        "inter_dim": 256,
+        "global_E": 257,
+        "output": None,
+        "swiglu_limit": None,
+    }
     args = (meta, hidden, tp8.w1, ids, weights)
     assert fm._use_mxfp4_sort_fold(*args, **kwargs)
     for arch in ("gfx942", "gfx1250"):

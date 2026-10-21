@@ -394,11 +394,11 @@ def compile_gemm1_sort_fold(
             nbi = tile % fx.Int32(NNB)
             if const_expr(not wave_sort):
                 # which expert owns this m-block?
-                if mbi >= excl_t:
+                if mbi >= excl_t:  # noqa: SIM102 - DSL runtime branch
                     if mbi < excl_t + nb_t:
                         _scalar_store(mi_tiles, fx.Int32(0), tx_i32, fx.Int32)
                         _scalar_store(mi_tiles, fx.Int32(1), mbi - excl_t, fx.Int32)
-                if tx_i32 == fx.Int32(0):
+                if tx_i32 == fx.Int32(0):  # noqa: SIM102 - DSL runtime branch
                     if mbi >= t256:
                         _scalar_store(mi_tiles, fx.Int32(0), fx.Int32(256), fx.Int32)
                         _scalar_store(mi_tiles, fx.Int32(1), mbi - t256, fx.Int32)
@@ -446,7 +446,7 @@ def compile_gemm1_sort_fold(
                         + (u2 & _lt_mask(fx.Int32(2), wave))
                     )
                     d = base + p + incl2 - x - row_lo
-                    if x == fx.Int32(1):
+                    if x == fx.Int32(1):  # noqa: SIM102 - DSL runtime branch
                         if fx.Uint32(d) < fx.Uint32(BM):
                             tok = item // fx.Int32(TOPK)
                             slot = item - tok * fx.Int32(TOPK)
@@ -524,7 +524,7 @@ def compile_gemm1_sort_fold(
                 arg_sk_part=arg_sk_part,
                 b_scale_aux=2,
             )
-        if const_expr(token_rows):
+        if const_expr(token_rows):  # noqa: SIM102 - DSL runtime branch
             if bx_i32 >= bound:
                 zero_init()
 
