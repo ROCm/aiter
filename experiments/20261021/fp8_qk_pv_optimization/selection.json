@@ -1,0 +1,8 @@
+{
+  "candidate": "h64_flags_prefetch",
+  "baseline_commit": "950eaa3f23411469db0c426f5876039f63594715",
+  "source_sha256": {
+    "csrc/kernels/mla/fused_dsv41/decode_fp8_qk.hpp": "c10853a4ac9555a3dcdfd0059804c5d6715826530d5cc21d36e316655922e69b",
+    "csrc/kernels/mla/fused_dsv41_mxfp8.cu": "18a0425817d7db7635dd4dca7b3fbb7e91959d259842ea2165d59219aa0edda9"
+  }
+}

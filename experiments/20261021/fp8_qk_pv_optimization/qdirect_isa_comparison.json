@@ -1,0 +1,14 @@
+{
+  "baseline": {
+    "ds_bpermute_b32": 64,
+    "v_cvt_scalef32_pk_fp8_f32": 0,
+    "global_load_dwordx4": 16,
+    "global_load_dwordx2": 11
+  },
+  "final": {
+    "ds_bpermute_b32": 12,
+    "v_cvt_scalef32_pk_fp8_f32": 0,
+    "global_load_dwordx4": 18,
+    "global_load_dwordx2": 3
+  }
+}

@@ -83,6 +83,9 @@ struct Fp8QkSource64 : PackedDecodeSource64<true, PageSize>
         auto* bytes =
             reinterpret_cast<OPUS_LDS_ADDR uint8_t*>(reinterpret_cast<uintptr_t>(raw_dst));
         const int row = (lane / 8) * 4 + wave;
+        // Every row owned by this wave is valid. Bit 1 in its first row's
+        // existing flag lets QK skip the per-score mask loads on full tiles.
+        const bool all_live = __builtin_amdgcn_ballot_w64(raw.live) == ~uint64_t(0);
         opus::static_for<4>([&](auto j) {
             const int d = int(j) * 128 + (lane % 8) * 16;
             *reinterpret_cast<OPUS_LDS_ADDR opus::vector_t<uint32_t, 4>*>(bytes + row * 528 + d) =
@@ -90,7 +93,8 @@ struct Fp8QkSource64 : PackedDecodeSource64<true, PageSize>
         });
         if((lane & 7) == 0)
         {
-            *reinterpret_cast<OPUS_LDS_ADDR uint32_t*>(bytes + 32 * 528 + row * 4) = raw.live;
+            *reinterpret_cast<OPUS_LDS_ADDR uint32_t*>(bytes + 32 * 528 + row * 4) =
+                uint32_t(raw.live) | (uint32_t(all_live) << 1);
             const opus::vector_t<uint32_t, 4> codes =
                 raw.live
                     ? raw.scales
@@ -99,9 +103,13 @@ struct Fp8QkSource64 : PackedDecodeSource64<true, PageSize>
                 codes;
         }
     }
-    template <class Pointer, class RawPointer>
+    template <bool CacheScales, class Pointer, class RawPointer>
     __device__ __forceinline__ void
-    dequant_current(RawPointer raw_src, Pointer dst, int wave, int lane) const
+    dequant_current(RawPointer raw_src,
+                    Pointer dst,
+                    int wave,
+                    int lane,
+                    const opus::vector_t<uint32_t, 4>& scale_words) const
     {
         auto* bytes =
             reinterpret_cast<OPUS_LDS_ADDR const uint8_t*>(reinterpret_cast<uintptr_t>(raw_src));
@@ -115,7 +123,12 @@ struct Fp8QkSource64 : PackedDecodeSource64<true, PageSize>
             const int d = int(j) * 128 + (lane % 8) * 16;
             auto bits   = *reinterpret_cast<OPUS_LDS_ADDR const opus::vector_t<uint32_t, 4>*>(
                 bytes + row * 528 + d);
-            float scale = __uint_as_float(uint32_t(bytes[row * 528 + 512 + d / 32]) << 23);
+            float scale;
+            if constexpr(CacheScales)
+                scale =
+                    __uint_as_float(((scale_words[int(j)] >> (((lane % 8) / 2) * 8)) & 255u) << 23);
+            else
+                scale = __uint_as_float(uint32_t(bytes[row * 528 + 512 + d / 32]) << 23);
             opus::vector_t<bf16_t, 16> values;
             opus::static_for<4>([&](auto half) {
                 uint32_t word = bits[int(half)];
@@ -141,7 +154,7 @@ struct Fp8QkSource64 : PackedDecodeSource64<true, PageSize>
 };
 
 namespace opus_mla_v4_prefill_a16w16_16mx8_32nx1 {
-template <class Traits, bool LateCommit = false, class Source>
+template <class Traits, bool H64Schedule = false, class Source>
 __device__ void fp8_qk_decode_accum64(const Source& source,
                                       int valid_kv_len,
                                       int num_kv_tiles,
@@ -200,7 +213,18 @@ __device__ void fp8_qk_decode_accum64(const Source& source,
 
     auto* raw_cur  = reinterpret_cast<OPUS_LDS_ADDR uint8_t*>(reinterpret_cast<uintptr_t>(raw_lds));
     auto* raw_next = raw_cur + 32 * 528 + 128;
+    vector_t<uint32_t, 4> tile_flags;
     auto mask_scores = [&](auto& s) {
+        vector_t<uint32_t, 4> flags;
+        if constexpr(H64Schedule)
+            flags = tile_flags;
+        else
+            flags =
+                *reinterpret_cast<OPUS_LDS_ADDR const vector_t<uint32_t, 4>*>(raw_cur + 32 * 528);
+        const uint32_t full = flags[0] & flags[1] & flags[2] & flags[3];
+        if(__builtin_amdgcn_readfirstlane(full) & 2u)
+            return;
+
         // Materialize validity addresses only when scores are masked.
         int mask_lane = lane_id;
         asm volatile("" : "+v"(mask_lane));
@@ -320,8 +344,14 @@ __device__ void fp8_qk_decode_accum64(const Source& source,
         });
     };
 
+    opus::vector_t<uint32_t, 4> current_scales;
     if constexpr(Source::is_packed)
-        source.commit_raw(source.prefetch(0, warp_id, lane_id), raw_cur, warp_id, lane_id);
+    {
+        const auto initial = source.prefetch(0, warp_id, lane_id);
+        if constexpr(H64Schedule)
+            current_scales = initial.scales;
+        source.commit_raw(initial, raw_cur, warp_id, lane_id);
+    }
     else
         source.template load_tile<T>(0, s_kv.ptr, u_gkv, u_skv, warp_id, lane_id);
     s_waitcnt_vmcnt(0_I);
@@ -340,11 +370,18 @@ __device__ void fp8_qk_decode_accum64(const Source& source,
         }
         __builtin_amdgcn_sched_barrier(0);
 
+        if constexpr(H64Schedule)
+        {
+            // Issue validity before K operands. The first lgkmcnt(3) drains this
+            // older read along with operand 0; no additional wait is needed after QK.
+            const uint32_t flags_addr = uint32_t(reinterpret_cast<uintptr_t>(raw_cur + 32 * 528));
+            asm volatile("ds_read_b128 %0, %1" : "=v"(tile_flags) : "v"(flags_addr) : "memory");
+        }
         compute_qk(v_s);
         // Keep next-tile VMEM waits after QK, so QK covers raw prefetch
         // latency. This is a compiler fence, not a CTA barrier.
         __builtin_amdgcn_sched_barrier(0);
-        if constexpr(!LateCommit)
+        if constexpr(!H64Schedule)
         {
             if(tile_idx + 1 < num_kv_tiles)
             {
@@ -357,7 +394,10 @@ __device__ void fp8_qk_decode_accum64(const Source& source,
         }
 
         // Reuse the sole V slot only after the previous iteration's barrier.
-        source.dequant_current(raw_cur, s_kv.ptr, warp_id, lane_id);
+        // The H64 schedule carries scale words across iterations; H128 keeps
+        // native LDS scale reads to avoid its measured register-pressure cost.
+        source.template dequant_current<H64Schedule>(
+            raw_cur, s_kv.ptr, warp_id, lane_id, current_scales);
 
         D_ACC row_max = track_max<T>(v_s, temperature_scale, actual_max);
         bool below =
@@ -378,7 +418,7 @@ __device__ void fp8_qk_decode_accum64(const Source& source,
         if(!below)
             scale_output_tile<T>(v_o, rescale_m);
 
-        if constexpr(LateCommit)
+        if constexpr(H64Schedule)
         {
             if(tile_idx + 1 < num_kv_tiles)
             {
@@ -401,6 +441,8 @@ __device__ void fp8_qk_decode_accum64(const Source& source,
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_barrier(); // All PV reads finish before V is reused.
 
+        if constexpr(H64Schedule)
+            current_scales = next_raw.scales;
         std::swap(raw_cur, raw_next);
     }
 }

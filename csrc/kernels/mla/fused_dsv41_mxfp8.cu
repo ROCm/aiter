@@ -583,7 +583,7 @@ __global__ __launch_bounds__(256, 2) void fused_dsv41_mxfp8_decode_64(FusedDsv41
 #endif
 }
 
-template <bool RotateQ, int PageSize, bool PreparedQ = false, bool LateCommit = false>
+template <bool RotateQ, int PageSize, bool PreparedQ = false, bool H64Schedule = false>
 __global__ __launch_bounds__(256, 1) void fused_dsv41_fp8_qk_decode_64(FusedDsv41Args a)
 {
 #if defined(__gfx950__)
@@ -602,49 +602,67 @@ __global__ __launch_bounds__(256, 1) void fused_dsv41_fp8_qk_decode_64(FusedDsv4
     int q_scales[4];
     opus::vector_t<float, 8> o[16];
     opus::static_for<16>([&](auto chunk) { opus::clear(o[int(chunk)]); });
-    if constexpr(PreparedQ)
-    {
-        opus::static_for<4>([&](auto step) {
-            const int d  = int(step) * 128 + group * 32;
-            q[int(step)] = *reinterpret_cast<const opus::vector_t<opus::fp8_t, 32>*>(
-                reinterpret_cast<const uint8_t*>(a.q) + (int64_t(t) * a.heads + hload) * 512 + d);
-            q[int(step)]        = pack_fp8_qk_group(q[int(step)], lane);
-            q_scales[int(step)] = a.q_scale[(int64_t(t) * a.heads + hload) * 16 + d / 32];
-        });
-    }
-    else
-    {
-        // One lane owns all 32 elements of a quantization group: no reduction barrier.
-        // BF16 rounding after forward RoPE matches the existing attention boundary.
-        opus::static_for<4>([&](auto step) {
-            opus::vector_t<float, 32> values;
-            const int d = int(step) * 128 + group * 32;
-            opus::static_for<4>([&](auto sub) {
-                B8 x = *reinterpret_cast<const B8*>(a.q + (int64_t(t) * a.heads + hload) * 512 + d +
-                                                    int(sub) * 8);
-                if constexpr(RotateQ && int(step) == 3)
-                {
-                    if(group >= 2)
-                        opus::static_for<4>([&](auto pair) {
-                            int i = int(pair) * 2, ri = (d + int(sub) * 8 + i - 448) / 2;
-                            float x0 = f32(x[i]), x1 = f32(x[i + 1]), c = f32(cs[ri]),
-                                  snv = f32(sn[ri]);
-                            x[i]      = static_cast<B>(fmaf(x0, c, -x1 * snv));
-                            x[i + 1]  = static_cast<B>(fmaf(x0, snv, x1 * c));
-                        });
-                }
-                opus::static_for<8>(
-                    [&](auto j) { values[int(sub) * 8 + int(j)] = f32(x[int(j)]); });
+    // Each lane reads the two 16-byte pieces consumed by scaled MFMA.
+    // Only two scalar group maxima and one scale code cross lanes per step.
+    opus::static_for<4>([&](auto step) {
+        if constexpr(PreparedQ)
+        {
+            opus::static_for<2>([&](auto part) {
+                const int d =
+                    int(step) * 128 + (group / 2) * 32 + (group % 2) * 16 + int(part) * 64;
+                const auto values = *reinterpret_cast<const opus::vector_t<opus::fp8_t, 16>*>(
+                    reinterpret_cast<const uint8_t*>(a.q) + (int64_t(t) * a.heads + hload) * 512 +
+                    d);
+                opus::set_slice(q[int(step)],
+                                values,
+                                opus::number<int(part) * 16>{},
+                                opus::number<int(part) * 16 + 16>{});
             });
-            float amax = 1e-30f;
-            opus::static_for<32>([&](auto j) { amax = fmaxf(amax, fabsf(values[int(j)])); });
-            const unsigned bits = __float_as_uint(amax / 448.0f);
-            const int exponent  = int((bits - 1) >> 23) + 1 - 127;
-            const float mul     = __uint_as_float(uint32_t(127 - exponent) << 23);
-            q_scales[int(step)] = exponent + 127;
-            q[int(step)]        = pack_fp8_qk_group(opus::cast<opus::fp8_t>(values * mul), lane);
-        });
-    }
+            q_scales[int(step)] =
+                a.q_scale[(int64_t(t) * a.heads + hload) * 16 + int(step) * 4 + group];
+        }
+        else
+        {
+            int codes[2];
+            opus::static_for<2>([&](auto part) {
+                const int d =
+                    int(step) * 128 + (group / 2) * 32 + (group % 2) * 16 + int(part) * 64;
+                opus::vector_t<float, 16> values;
+                opus::static_for<2>([&](auto sub) {
+                    B8 x = *reinterpret_cast<const B8*>(a.q + (int64_t(t) * a.heads + hload) * 512 +
+                                                        d + int(sub) * 8);
+                    if constexpr(RotateQ && int(step) == 3 && int(part) == 1)
+                        opus::static_for<4>([&](auto pair) {
+                            const int i    = int(pair) * 2;
+                            const int ri   = (d + int(sub) * 8 + i - 448) / 2;
+                            const float x0 = f32(x[i]), x1 = f32(x[i + 1]), cv = f32(cs[ri]),
+                                        sv = f32(sn[ri]);
+                            x[i]           = static_cast<B>(fmaf(x0, cv, -x1 * sv));
+                            x[i + 1]       = static_cast<B>(fmaf(x0, sv, x1 * cv));
+                        });
+                    opus::static_for<8>(
+                        [&](auto j) { values[int(sub) * 8 + int(j)] = f32(x[int(j)]); });
+                });
+                float amax = 1e-30f;
+                opus::static_for<16>([&](auto j) { amax = fmaxf(amax, fabsf(values[int(j)])); });
+                const uint32_t other =
+                    __builtin_amdgcn_ds_bpermute((lane ^ 16) * 4, __float_as_uint(amax));
+                amax                = fmaxf(amax, __uint_as_float(other));
+                const unsigned bits = __float_as_uint(amax / 448.0f);
+                const int exponent  = int((bits - 1) >> 23) + 1 - 127;
+                const float mul     = __uint_as_float(uint32_t(127 - exponent) << 23);
+                codes[int(part)]    = exponent + 127;
+                const auto quant    = opus::cast<opus::fp8_t>(values * mul);
+                opus::set_slice(q[int(step)],
+                                quant,
+                                opus::number<int(part) * 16>{},
+                                opus::number<int(part) * 16 + 16>{});
+            });
+            const uint32_t code = (group & 1) ? codes[1] : codes[0];
+            const int src       = lane % 16 + ((group % 2) * 2 + group / 2) * 16;
+            q_scales[int(step)] = __builtin_amdgcn_ds_bpermute(src * 4, code);
+        }
+    });
     constexpr float log2e = 1.4426950408889634f;
     float m = -__FLT_MAX__, actual_max = -INFINITY, l = 0;
     int begin = max(0, min(a.prefix_capacity, a.prefix_indptr[t]));
@@ -656,18 +674,18 @@ __global__ __launch_bounds__(256, 1) void fused_dsv41_fp8_qk_decode_64(FusedDsv4
                                      end - begin,
                                      (PageSize == -2 ? a.cache.num_rows : a.pool_bytes),
                                      a.cache}};
-        fp8_qk_decode_accum64<T, LateCommit>(src,
-                                             end - begin,
-                                             (end - begin + 31) / 32,
-                                             reinterpret_cast<char*>(kv_tile),
-                                             q,
-                                             q_scales,
-                                             raw_k,
-                                             o,
-                                             actual_max,
-                                             m,
-                                             l,
-                                             a.softmax_scale * log2e);
+        fp8_qk_decode_accum64<T, H64Schedule>(src,
+                                              end - begin,
+                                              (end - begin + 31) / 32,
+                                              reinterpret_cast<char*>(kv_tile),
+                                              q,
+                                              q_scales,
+                                              raw_k,
+                                              o,
+                                              actual_max,
+                                              m,
+                                              l,
+                                              a.softmax_scale * log2e);
     }
     __syncthreads();
     auto* staging = reinterpret_cast<uint8_t*>(kv_tile);
