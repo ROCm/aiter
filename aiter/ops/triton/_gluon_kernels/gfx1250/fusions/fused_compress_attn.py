@@ -71,8 +71,7 @@ def fused_compress_attn_fp4_gfx1250(
     RMS_EPS: gl.constexpr,
     STATE_SIZE: gl.constexpr,
     K_PER_BLOCK: gl.constexpr,
-    KV_STATE_SLOT_STRIDE: gl.constexpr,
-    SCORE_STATE_SLOT_STRIDE: gl.constexpr,
+    STATE_SLOT_STRIDE: gl.constexpr,
     cache_modifier: gl.constexpr,
     window_layout: gl.constexpr,
 ):
@@ -132,8 +131,8 @@ def fused_compress_attn_fp4_gfx1250(
         # The older tokens come from the state ring. Slots can be far apart, so use a
         # 64-bit slot offset.
         slot = state_slot.to(gl.int64)
-        kv_ring = kv_state_ptr + slot * KV_STATE_SLOT_STRIDE
-        score_ring = score_state_ptr + slot * SCORE_STATE_SLOT_STRIDE
+        kv_ring = kv_state_ptr + slot * STATE_SLOT_STRIDE
+        score_ring = score_state_ptr + slot * STATE_SLOT_STRIDE
         state_start = (token_pos % STATE_SIZE) * ROW_VALUES
         # The compiler does not know the alignment. The hint gives 16-byte loads.
         state_start = gl.multiple_of(state_start + col_offset, [8, 8])
@@ -166,13 +165,13 @@ def fused_compress_attn_fp4_gfx1250(
         cos, sin = load_interleaved_cos_sin(
             cos_ptr, sin_ptr, entry * RATIO, HEAD_DIM, ROPE_DIM, window_layout
         )
-        weight = gl.load(rms_weight_ptr + col).to(gl.float32)
+        weight = gl.load(rms_weight_ptr + col)
 
         # --- 2. Softmax pool ---
         # Each token comes from at most one source. A masked source gives 0 and -inf,
         # so add the values and take the max of the scores.
-        values = state_values + input_values.to(gl.float32)
-        scores = gl.maximum(state_scores, input_scores.to(gl.float32) + ape)
+        values = state_values + input_values
+        scores = gl.maximum(state_scores, input_scores + ape)
         max_score = gl.max(scores, axis=0)[None, :]
         # gl.exp adds a denormal fix-up to each value. exp_scaled(1.0, x) is exp(x) with
         # one exp2.

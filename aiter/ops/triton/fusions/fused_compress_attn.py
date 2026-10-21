@@ -54,8 +54,8 @@ def fused_compress_attn_fp4(
 
     Args:
         kv_in, score_in: [T, 256] bf16 input rows with the same row stride.
-        kv_state, score_state: [S, state_size, 256] f32 state rings. The slots
-            can be strided.
+        kv_state, score_state: [S, state_size, 256] f32 state rings with the same
+            strides. The slots can be strided.
         state_slots: [B] int32 state slot of each sequence.
         plan: [P, 4] int32 rows of (last_token_row, seq, last_pos, num_from_state).
             num_from_state is the number of window tokens from the state ring. A row
@@ -79,13 +79,10 @@ def fused_compress_attn_fp4(
     # The kernel reads both inputs with one stride and 16-byte loads.
     assert kv_in.stride(0) == score_in.stride(0) and kv_in.stride(0) % 8 == 0
     assert kv_in.stride(1) == 1 and score_in.stride(1) == 1
-    # The kernel takes the other strides as constants.
-    for state in (kv_state, score_state):
-        assert (
-            state.stride(1) == 2 * HEAD_DIM
-            and state.stride(2) == 1
-            and state.stride(0) % 8 == 0
-        )
+    # The kernel takes the state strides as constants. Both rings use one slot stride.
+    assert kv_state.stride() == score_state.stride()
+    assert kv_state.stride(1) == 2 * HEAD_DIM and kv_state.stride(2) == 1
+    assert kv_state.stride(0) % 8 == 0
     for tensor in (plan, ape, cos, sin, kv_cache, cache_scale):
         assert tensor.is_contiguous()
     assert block_tables.stride(1) == 1
@@ -112,8 +109,7 @@ def fused_compress_attn_fp4(
         RMS_EPS=rms_eps,
         STATE_SIZE=kv_state.shape[1],
         K_PER_BLOCK=kv_cache.shape[1],
-        KV_STATE_SLOT_STRIDE=kv_state.stride(0),
-        SCORE_STATE_SLOT_STRIDE=score_state.stride(0),
+        STATE_SLOT_STRIDE=kv_state.stride(0),
         **config,
         **get_fused_compress_attn_fp4_layouts(config["num_warps"]),
     )
