@@ -235,8 +235,8 @@ def test_paged_attn(
         attn_scale,
         max_context_len,
         compute_type,
-        k_scale=torch.tensor([1.0]),
-        v_scale=torch.tensor([1.0]),
+        k_scale=torch.tensor([1.0], dtype=torch.float32),
+        v_scale=torch.tensor([1.0], dtype=torch.float32),
         num_seq_partitions=0,
         alibi_slopes=None,
     )
@@ -338,8 +338,8 @@ def test_paged_attn_multi_partition_dispatch(B, H_Q, H_KV, SEQ_LEN, dtype, monke
         1.0 / head_size**0.5,
         int(max_context_len),
         compute_type,
-        k_scale=torch.tensor([1.0]),
-        v_scale=torch.tensor([1.0]),
+        k_scale=torch.tensor([1.0], dtype=torch.float32),
+        v_scale=torch.tensor([1.0], dtype=torch.float32),
     )
 
     num_partitions = -(-SEQ_LEN // pa_decode_mod._SEQ_PARTITION_SIZE)

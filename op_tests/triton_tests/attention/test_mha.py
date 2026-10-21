@@ -1087,14 +1087,20 @@ def test_mha_backward_varlen_very_negative_logits(bwd_mode, monkeypatch):
     NUM_HEADS, HEAD_SZ = 4, 128
     seqlens = [300, 250]
     total = sum(seqlens)
-    u = torch.nn.functional.normalize(torch.randn(HEAD_SZ, device="cuda"), dim=0)
+    u = torch.nn.functional.normalize(
+        torch.randn(HEAD_SZ, device="cuda", dtype=torch.float32), dim=0
+    )
     a = 34.0  # q . k ~ -a^2, so logits ~ -a^2 / sqrt(HEAD_SZ) ~ -102
-    q = (-a * u + 0.5 * torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda")).to(
-        torch.bfloat16
-    )
-    k = (a * u + 0.5 * torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda")).to(
-        torch.bfloat16
-    )
+    q = (
+        -a * u
+        + 0.5
+        * torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda", dtype=torch.float32)
+    ).to(torch.bfloat16)
+    k = (
+        a * u
+        + 0.5
+        * torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda", dtype=torch.float32)
+    ).to(torch.bfloat16)
     v = torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda", dtype=torch.bfloat16)
     do = torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda", dtype=torch.bfloat16)
     q.requires_grad = True
