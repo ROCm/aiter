@@ -17,7 +17,7 @@ This kernel dequantises with ``v_perm_b32`` byte lookups instead:
 * the e8m0 scale is applied as an exponent-field integer subtract (exact: bf16(fp4 * 2^e)
   needs no rounding), 2 elements per op.
 
-Per 8 weight elements: 22 VALU ops, all 32-bit, versus ~44 for the compiler-generated chain.
+Per 8 weight elements: 24 VALU ops, all 32-bit, versus ~44 for the compiler-generated chain.
 
 Scale range: the bias C = 0x3000 keeps the lookup values below the sign bit and makes the
 subtract saturate +-0 to -0.0 for every scale 3 <= e8m0 <= 222 (weights 2^-124 .. 2^95).
@@ -38,41 +38,47 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a16w4 import (
 # ---------------------------------------------------------------------------------------------
 # Dequant inline asm
 # ---------------------------------------------------------------------------------------------
-# One packed dword in ($7) holds fp4 elements e0..e7 (e_{2b} = low nibble of byte b).
-# Constant byte tables ($8..$11, VGPRs hoisted out of the loop): bf16 bit patterns T'[m] of
+# One packed dword in ($8) holds fp4 elements e0..e7 (e_{2b} = low nibble of byte b).
+# Constant byte tables ($9..$12, VGPRs hoisted out of the loop): bf16 bit patterns T'[m] of
 # the fp4 magnitudes m = 0..7 plus the bias C, split into low bytes (tlo0: m 0..3, tlo1: m 4..7)
 # and high bytes (thi0, thi1).  T'[0] = 0x8000 so that +-0 end up as -0.0 after the subtract.
-# $12 = D = (C + 127<<7) - (e8m0 << 7), replicated in both 16-bit halves, per (32-K group, n).
+# $13 = the e8m0 scale of this (32-K group, n), zero-extended and replicated in both 16-bit halves.
+# D = (C + 127<<7) - (e8m0 << 7) is formed inside the asm (packed 16-bit ops) so the compiler cannot
+# narrow it: with a Triton-side uint16 expression LLVM emitted (word >> 1) without masking the low byte.
 # Outputs: $0 = (e0,e4), $1 = (e1,e5), $4 = (e2,e6), $3 = (e3,e7) as bf16x2 (low, high half);
-# $2 is scratch; $5/$6 are SGPR scratch for the v_perm selectors (VOP3 has no literals on gfx9).
+# $2 is scratch; $5..$7 are SGPR scratch for selectors/constants (VOP3/VOP3P take no literals on gfx9).
 # v_perm_b32 D, S0, S1, SEL: SEL bytes 0-3 select bytes of S1, 4-7 select bytes of S0.
 _ASM_DEQUANT = tl.constexpr(
     """
 s_mov_b32 $5, 0x06020400
 s_mov_b32 $6, 0x07030501
-v_and_b32 $4, 0x07070707, $7
-v_lshrrev_b32 $2, 4, $7
+s_mov_b32 $7, 0x00070007
+v_and_b32 $4, 0x07070707, $8
+v_lshrrev_b32 $2, 4, $8
 v_and_b32 $2, 0x07070707, $2
-v_perm_b32 $0, $9, $8, $4
-v_perm_b32 $1, $11, $10, $4
-v_perm_b32 $3, $11, $10, $2
-v_perm_b32 $2, $9, $8, $2
-v_lshlrev_b32 $4, 4, $7
+v_perm_b32 $0, $10, $9, $4
+v_perm_b32 $1, $12, $11, $4
+v_perm_b32 $3, $12, $11, $2
+v_perm_b32 $2, $10, $9, $2
+v_lshlrev_b32 $4, 4, $8
 v_and_b32 $4, 0x80808080, $4
 v_or_b32 $1, $4, $1
-v_and_b32 $4, 0x80808080, $7
+v_and_b32 $4, 0x80808080, $8
 v_or_b32 $3, $4, $3
 v_perm_b32 $4, $1, $0, $6
 v_perm_b32 $0, $1, $0, $5
 v_perm_b32 $1, $3, $2, $5
 v_perm_b32 $3, $3, $2, $6
-v_pk_sub_i16 $0, $0, $12 clamp
-v_pk_sub_i16 $1, $1, $12 clamp
-v_pk_sub_i16 $3, $3, $12 clamp
-v_pk_sub_i16 $4, $4, $12 clamp
+v_pk_lshlrev_b16 $2, $7, $13
+s_mov_b32 $5, 0x6f806f80
+v_pk_sub_u16 $2, $5, $2
+v_pk_sub_i16 $0, $0, $2 clamp
+v_pk_sub_i16 $1, $1, $2 clamp
+v_pk_sub_i16 $3, $3, $2 clamp
+v_pk_sub_i16 $4, $4, $2 clamp
 """
 )
-_ASM_CONSTRAINTS = tl.constexpr("=&v,=&v,=&v,=&v,=&v,=&s,=&s,v,v,v,v,v,v")
+_ASM_CONSTRAINTS = tl.constexpr("=&v,=&v,=&v,=&v,=&v,=&s,=&s,=&s,v,v,v,v,v,v")
 
 LUT_BIAS = tl.constexpr(0x3000)
 # T'[m] = bf16(fp4 magnitude m) + C: 0x8000, 0x6F00, 0x6F80, 0x6FC0, 0x7000, 0x7040, 0x7080, 0x70C0
@@ -80,8 +86,6 @@ TLO0 = tl.constexpr(0xC0800000)  # low bytes of T'[0..3]
 TLO1 = tl.constexpr(0xC0804000)  # low bytes of T'[4..7]
 THI0 = tl.constexpr(0x6F6F6F80)  # high bytes of T'[0..3]
 THI1 = tl.constexpr(0x70707070)  # high bytes of T'[4..7]
-# D = (C + 127 << 7) - (e8m0 << 7)
-D_BASE = tl.constexpr(0x3000 + 0x3F80)
 
 
 def gfx942_a16w4_layouts(block_m, block_n, block_k, num_warps):
@@ -169,16 +173,16 @@ def _relabel_w(wq, KG: gl.constexpr, BLOCK_N: gl.constexpr, DOT_W16: gl.constexp
 
 @gluon.jit
 def _dequant_tile(
-    wu, d16, tlo0, tlo1, thi0, thi1, BLOCK_K: gl.constexpr, BLOCK_N: gl.constexpr, DOT_W: gl.constexpr
+    wu, sc16, tlo0, tlo1, thi0, thi1, BLOCK_K: gl.constexpr, BLOCK_N: gl.constexpr, DOT_W: gl.constexpr
 ):
-    """wu: (BLOCK_K//4, BLOCK_N) uint16 packed fp4 in the k_width=2 operand layout; d16: the
-    per-(group, n) subtrahend in the same layout.  Returns the bf16 (BLOCK_K, BLOCK_N) B operand
+    """wu: (BLOCK_K//4, BLOCK_N) uint16 packed fp4 in the k_width=2 operand layout; sc16: the e8m0
+    scale of each element's (group, n), as uint16 in the same layout.  Returns the bf16 (BLOCK_K, BLOCK_N) B operand
     with semantic K = 8d + 2s + h <-> fp4 element s + 4h of dword d."""
-    o0, o1, _junk, o3, o2, _s1, _s2 = gl.inline_asm_elementwise(
+    o0, o1, _junk, o3, o2, _s1, _s2, _s3 = gl.inline_asm_elementwise(
         _ASM_DEQUANT,
         _ASM_CONSTRAINTS,
-        [wu, tlo0, tlo1, thi0, thi1, d16],
-        dtype=(gl.uint16, gl.uint16, gl.uint16, gl.uint16, gl.uint16, gl.uint16, gl.uint16),
+        [wu, tlo0, tlo1, thi0, thi1, sc16],
+        dtype=(gl.uint16, gl.uint16, gl.uint16, gl.uint16, gl.uint16, gl.uint16, gl.uint16, gl.uint16),
         is_pure=True,
         pack=2,
     )
@@ -399,12 +403,12 @@ def _moe_gemm_a16w4_gfx942(
         wq = gl.load(WPtrs, cache_modifier=W_CACHE_MODIFIER)
         sc = gl.load(SPtrs, cache_modifier=W_CACHE_MODIFIER)
 
-        # weights: relabel into the k_width=2 operand layout, build D, dequantise
+        # weights: relabel into the k_width=2 operand layout, spread the scales, dequantise
         wu = _relabel_w(wq, KG, BLOCK_N, DOT_W16)
-        d16 = (D_BASE - (sc.to(gl.uint32) << 7)).to(gl.uint16)  # (KG, 4, BLOCK_N)
-        d16 = gl.join(d16, d16)  # both 16-bit halves
-        d16 = gl.convert_layout(gl.reshape(gl.permute(d16, (0, 1, 3, 2)), (PK2, BLOCK_N)), DOT_W16, assert_trivial=True)
-        wb = _dequant_tile(wu, d16, tlo0, tlo1, thi0, thi1, BLOCK_K, BLOCK_N, DOT_W)
+        sc16 = sc.to(gl.uint16)  # (KG, 4, BLOCK_N)
+        sc16 = gl.join(sc16, sc16)  # both 16-bit halves of each dword
+        sc16 = gl.convert_layout(gl.reshape(gl.permute(sc16, (0, 1, 3, 2)), (PK2, BLOCK_N)), DOT_W16, assert_trivial=True)
+        wb = _dequant_tile(wu, sc16, tlo0, tlo1, thi0, thi1, BLOCK_K, BLOCK_N, DOT_W)
 
         # activations: stage through LDS in the semantic K order of the W operand
         x_smem.store(_relabel_x(x, BLOCK_M, BLOCK_K))
