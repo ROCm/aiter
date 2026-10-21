@@ -1578,7 +1578,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                              num_workers, // gdx
                              1,           // gdy
                              1,           // gdz
-                             256,         // bdx: 8 wave32
+                             128,         // bdx: 4 wave32
                              1,           // bdy
                              1,           // bdz
                              stream,
