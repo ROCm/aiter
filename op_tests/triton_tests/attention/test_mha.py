@@ -793,6 +793,89 @@ def test_mha_backward(
         torch.testing.assert_close(tri, ref.to(tri.dtype), atol=atol, rtol=rtol)
 
 
+@pytest.mark.parametrize("head_size", [33, 53, 64])
+@pytest.mark.parametrize("varlen", [False, True])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(97, 113), (113, 97)])
+@pytest.mark.parametrize("strided", [False, True])
+def test_mha_dao_ai_backward_head_size(
+    head_size, varlen, seqlen_q, seqlen_k, strided, monkeypatch
+):
+    from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import bwd, interface_v2
+    from aiter.ops.triton.attention import mha
+
+    monkeypatch.setattr(interface_v2, "BWD_MODE", "fused")
+    kernel = bwd.bwd_kernel_fused_causal
+    original_run = kernel.run
+    launches = 0
+
+    def trace_run(*args, **kwargs):
+        nonlocal launches
+        result = original_run(*args, **kwargs)
+        launches += 1
+        return result
+
+    monkeypatch.setattr(kernel, "run", trace_run)
+
+    monkeypatch.setattr(mha, "_MHA_IMPL", "dao_ai")
+    torch.manual_seed(20)
+    batch = 2
+    q = torch.randn(
+        batch,
+        seqlen_q,
+        4,
+        head_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    k = torch.randn(
+        batch,
+        seqlen_k,
+        2,
+        head_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    v = torch.randn_like(k, requires_grad=True)
+    do = torch.randn_like(q)
+    inputs = (q, k, v)
+    if varlen:
+        inputs = tuple(x.flatten(0, 1) for x in inputs)
+    if strided:
+        # Change token/head strides after packing so flatten cannot undo them.
+        inputs = tuple(
+            x.transpose(-3, -2).contiguous().transpose(-3, -2).detach().requires_grad_()
+            for x in inputs
+        )
+        assert all(not x.is_contiguous() for x in inputs)
+    if varlen:
+        cu_q = torch.arange(
+            0, (batch + 1) * seqlen_q, seqlen_q, device="cuda", dtype=torch.int32
+        )
+        cu_k = torch.arange(
+            0, (batch + 1) * seqlen_k, seqlen_k, device="cuda", dtype=torch.int32
+        )
+        out = flash_attn_varlen_func(
+            *inputs, cu_q, cu_k, seqlen_q, seqlen_k, causal=True, backend="triton"
+        )
+    else:
+        out = flash_attn_func(*inputs, causal=True, backend="triton")
+    grads = torch.autograd.grad(out, inputs, do.reshape_as(out))
+    assert launches > 0, "Expected the Dao-AI fused causal backward kernel"
+    ref_out, ref_grads, fwd_tol, bwd_tols = attention_ref_with_tol(
+        q, k, v, do, causal=True
+    )
+    torch.testing.assert_close(
+        out, ref_out.reshape_as(out).to(out.dtype), atol=fwd_tol[0], rtol=fwd_tol[1]
+    )
+    for inp, grad, ref, (atol, rtol) in zip(inputs, grads, ref_grads, bwd_tols):
+        assert grad.shape == inp.shape
+        torch.testing.assert_close(
+            grad, ref.reshape_as(grad).to(grad.dtype), atol=atol, rtol=rtol
+        )
+
+
 @pytest.mark.parametrize("BATCH", [2, 4])
 @pytest.mark.parametrize("SEQLEN_Q", [256, 512])
 @pytest.mark.parametrize("SEQLEN_K", [256, 512])

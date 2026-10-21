@@ -15,6 +15,7 @@ import triton
 from aiter.ops.triton.normalization.fused_rmsnorm_add_rmsnorm import (
     fused_rmsnorm_add_rmsnorm,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import override_parser_action
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 from op_tests.triton_tests.normalization.test_fused_rmsnorm_add_rmsnorm import (
     generate_fused_rmsnorm_add_rmsnorm_inputs,
@@ -84,11 +85,8 @@ def parse_args(args: list[str] | None = None):
         metavar=("M", "N"),
         help="user-defined shape to benchmark",
     )
-    parser.add_argument(
-        "--metric",
-        choices=["time", "bandwidth"],
-        default="time",
-        help="metric to report",
+    override_parser_action(
+        parser, action="--metric", choices=["time", "bandwidth"], default="time"
     )
     parser.add_argument("-o", action="store_true", help="write results to CSV")
     parsed = parser.parse_args(args=args)

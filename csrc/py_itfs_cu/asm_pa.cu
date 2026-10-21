@@ -430,7 +430,7 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
 
     // 3. "gqa_ratio"
     // 4. "mtp" , 5. "mask"
-    msk = mask;
+    msk = (ps == 1 && block_size == 16 && max_qlen == 1 && mask == 0) ? 1 : mask;
     gqa = block_size == 16 ? gqa_ratio : 0;
     mtp = block_size == 16 && max_qlen > 1 ? max_qlen + 10 : 0;
 
