@@ -730,8 +730,8 @@ hipError_t launch_cache_mode(const FusedDsv41Args* a, int rotate_q, hipStream_t 
     // Commit/load is after QK (H64) or PV (H128). Mixed sources keep v4.
     if(!a->extend_indptr && (a->heads == 64 || a->heads == 128))
     {
-        dim3 grid(a->tokens);
-        if(a->heads == 64)
+        dim3 grid(a->tokens, PageSize == -2 ? 1 : a->heads / 64);
+        if(a->heads == 64 || (a->heads == 128 && PageSize != -2))
         {
             if(rotate_q)
                 fused_dsv41_mxfp8_decode_64<true, PageSize><<<grid, 256, 0, stream>>>(*a);

@@ -99,11 +99,12 @@ struct PackedDecodeSource64
                     // Materialize the scalar: clang 22 bit-casting a vector
                     // element lvalue directly repeated word 0 for word 1.
                     uint32_t word = raw.bytes[int(j)][int(half)];
-                    auto fp8      = __builtin_bit_cast(opus::fp8x4_t, word);
-                    auto x        = opus::cast<float>(fp8);
-                    opus::static_for<4>([&](auto k) {
-                        values[int(half) * 4 + int(k)] = static_cast<bf16_t>(x[int(k)] * scale);
-                    });
+                    // gfx950 converts and scales directly to BF16; QK/PV stay BF16.
+                    auto lo = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(word, scale, false);
+                    auto hi = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(word, scale, true);
+                    auto* pairs = reinterpret_cast<opus::vector_t<bf16_t, 2>*>(&values);
+                    pairs[int(half) * 2] = __builtin_bit_cast(opus::vector_t<bf16_t, 2>, lo);
+                    pairs[int(half) * 2 + 1] = __builtin_bit_cast(opus::vector_t<bf16_t, 2>, hi);
                 });
             }
             *reinterpret_cast<OPUS_LDS_ADDR opus::vector_t<bf16_t, 8>*>(
@@ -434,11 +435,12 @@ struct PackedDecodeSource128
                     // Materialize the scalar: clang 22 bit-casting a vector
                     // element lvalue directly repeated word 0 for word 1.
                     uint32_t word = raw.bytes[int(j)][int(half)];
-                    auto fp8      = __builtin_bit_cast(opus::fp8x4_t, word);
-                    auto x        = opus::cast<float>(fp8);
-                    opus::static_for<4>([&](auto k) {
-                        values[int(half) * 4 + int(k)] = static_cast<bf16_t>(x[int(k)] * scale);
-                    });
+                    // gfx950 converts and scales directly to BF16; QK/PV stay BF16.
+                    auto lo = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(word, scale, false);
+                    auto hi = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(word, scale, true);
+                    auto* pairs = reinterpret_cast<opus::vector_t<bf16_t, 2>*>(&values);
+                    pairs[int(half) * 2] = __builtin_bit_cast(opus::vector_t<bf16_t, 2>, lo);
+                    pairs[int(half) * 2 + 1] = __builtin_bit_cast(opus::vector_t<bf16_t, 2>, hi);
                 });
             }
             *reinterpret_cast<OPUS_LDS_ADDR opus::vector_t<bf16_t, 8>*>(
