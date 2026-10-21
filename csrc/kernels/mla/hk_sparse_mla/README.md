@@ -2,7 +2,7 @@
 
 DeepSeek Sparse Attention's attention step: every query token attends to its own list of `topk` selected KV slots.
 All heads share one latent KV row (MQA), so the same row is both K and V. Exposed as `aiter.hk_sparse_mla_fwd` (JIT
-module `module_hk_sparse_mla`, ctypes entry point in `hk_sparse_mla_entry.cu`). The kernel implementation is
+module `module_hk_sparse_mla`, ctypes entry point in `sparse_mla.cu`). The kernel implementation is
 maintained here in AITER; HipKittens provides the tile and MMA primitives.
 
 ```
@@ -19,12 +19,6 @@ out[t][h][:] = softmax_k(q[t][h] . kv[idx[t][k]] * sm_scale) @ kv[idx[t][k]][:51
 | `out` | `[T][32][512]` bf16 |
 | numerics | fp32 scores, P quantized as fp8(P * 448) before PV (same as the TileLang kernel); a row with no valid key outputs 0 |
 
-```c
-int    hk_sparse_mla_fwd(const void *q, const void *kv, const int *idx, void *out, int T, int topk,
-                         long kv_stride_bytes, long num_slots, float sm_scale, hipStream_t stream);
-```
-
-`hk_sparse_mla_fwd` returns 0, -1 (invalid shape, alignment or scale), or -2 (launch failed).
 Any other head count or latent size is not supported, so callers fall back to another kernel.
 Each query uses one workgroup without a workspace. Use HK for batches of at least 512 queries;
 callers should dispatch smaller batches to Gluon. This wrapper does not select a fallback.
@@ -53,7 +47,8 @@ callers should dispatch smaller batches to Gluon. This wrapper does not select a
 - Scores are computed as `S^T = K Q^T`, so each lane holds 4 consecutive keys of one head. The softmax row max and sum
   then reduce with `permlane16/32_swap` instead of LDS round trips.
 - `PV` reads V one 16-dim tile ahead of its MFMA.
-- Check registers and spills with `hipcc ... --cuda-device-only -S` (see the MoE README for the flags).
+- Check registers and spills by rerunning the JIT compile command from `ninja -t compdb` with
+  `--cuda-device-only -S` in place of `-c`.
 
 ## Build and test
 

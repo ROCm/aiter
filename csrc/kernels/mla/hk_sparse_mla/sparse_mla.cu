@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// gfx950 sparse MLA, H32/D512. Contract: sparse_mla.h; design: README.md.
+// gfx950 sparse MLA, H32/D512. Contract: aiter/ops/hk_sparse_mla.py; design: README.md.
 // Q/KV are unscaled E4M3; scores accumulate in FP32, P is quantized as FP8(P*448).
 // Each workgroup handles one query, double-buffering 128-key KV blocks.
-#include "sparse_mla.h"
+#include "aiter_hip_common.h"
+
+#include "aiter_ctypes_error.h"
 
 #include <cmath>
 #include <cstdint>
 
 #include "kittens.cuh"
+
+AITER_CTYPES_ERROR_DEF
 
 namespace {
 constexpr int H = 32, D = 512, BI = 128;
@@ -339,36 +343,41 @@ __global__ __launch_bounds__(NT, 1) void sparse_mla_fwd(const uint8_t* __restric
 
 } // namespace
 
-// Launch contract: sparse_mla.h.
-extern "C" int hk_sparse_mla_fwd(const void* q,
-                                 const void* kv,
-                                 const int* idx,
-                                 void* out,
-                                 int T,
-                                 int topk,
-                                 long kv_stride_bytes,
-                                 long num_slots,
-                                 float sm_scale,
-                                 hipStream_t stream)
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    aiter_hk_sparse_mla_fwd,
+    (size_t q,
+     size_t kv,
+     size_t indices,
+     size_t out,
+     int64_t num_tokens,
+     int64_t topk,
+     int64_t kv_stride_bytes,
+     int64_t num_slots,
+     float sm_scale,
+     hipStream_t stream),
+    (q, kv, indices, out, num_tokens, topk, kv_stride_bytes, num_slots, sm_scale, stream))
 {
-    if(T <= 0)
-        return HK_SPARSE_MLA_OK;
-    // Gather transfers are 16-byte aligned.
-    if(topk <= 0 || topk % BI || topk > MAX_TOPK || kv_stride_bytes % 16 || (uintptr_t)kv % 16)
-        return HK_SPARSE_MLA_BAD_SHAPE;
-    if(num_slots <= 0 || num_slots > INT32_MAX || kv_stride_bytes < D || !std::isfinite(sm_scale) ||
-       sm_scale <= 0.f)
-        return HK_SPARSE_MLA_BAD_SHAPE;
+    if(num_tokens <= 0)
+        return;
+    AITER_CHECK(topk > 0 && topk % BI == 0 && topk <= MAX_TOPK,
+                "hk_sparse_mla_fwd: top-k must be a positive multiple of 128 (<= 2304)");
+    AITER_CHECK(kv_stride_bytes >= D && kv_stride_bytes % 16 == 0 && kv % 16 == 0,
+                "hk_sparse_mla_fwd: KV rows must contain 512 bytes and be 16-byte aligned");
+    AITER_CHECK(num_slots > 0 && num_slots <= INT32_MAX,
+                "hk_sparse_mla_fwd: num_slots must be in [1, 2^31)");
+    AITER_CHECK(std::isfinite(sm_scale) && sm_scale > 0.f,
+                "hk_sparse_mla_fwd: sm_scale must be finite and positive");
     // Pools beyond 32-bit buffer offsets need 64-bit global gathers.
     const bool wide_pool = (unsigned long)num_slots * (unsigned long)kv_stride_bytes > UINT32_MAX;
     auto* fwd            = wide_pool ? sparse_mla_fwd<true> : sparse_mla_fwd<false>;
-    fwd<<<T, NT, 0, stream>>>((const uint8_t*)q,
-                              (const uint8_t*)kv,
-                              idx,
-                              (uint16_t*)out,
-                              topk,
-                              kv_stride_bytes,
-                              (int)num_slots,
-                              sm_scale * 1.4426950408889634f);
-    return hipGetLastError() == hipSuccess ? HK_SPARSE_MLA_OK : HK_SPARSE_MLA_LAUNCH_FAILED;
+    fwd<<<num_tokens, NT, 0, stream>>>(reinterpret_cast<const uint8_t*>(q),
+                                       reinterpret_cast<const uint8_t*>(kv),
+                                       reinterpret_cast<const int*>(indices),
+                                       reinterpret_cast<uint16_t*>(out),
+                                       static_cast<int>(topk),
+                                       kv_stride_bytes,
+                                       static_cast<int>(num_slots),
+                                       sm_scale * 1.4426950408889634f);
+    const hipError_t error = hipGetLastError();
+    AITER_CHECK(error == hipSuccess, "hk_sparse_mla_fwd: ", hipGetErrorString(error));
 }
