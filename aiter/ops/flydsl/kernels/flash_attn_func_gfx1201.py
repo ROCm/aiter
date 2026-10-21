@@ -196,7 +196,7 @@ def build_flash_attn_func_module_primary(
             b_frag.store(Vec(b_v8))
             c_frag.store(Vec(c_v8))
             fx.gemm(wmma_atom, c_frag, a_frag, b_frag, c_frag)
-            return Vec(c_frag.load())
+            return c_frag.load()
 
         seq_len_v = fx.Uint64(seq_len)
 
@@ -374,7 +374,7 @@ def build_flash_attn_func_module_primary(
 
         # First KV column fully masked for this wave.
         wave_kv_limit_i32 = fx.Int32(q_start + wave_q_offset + fx.Int64(ROWS_PER_WAVE))
-        c_zero_v8f16 = Vec.filled(8, 0.0, elem_dtype)
+        c_zero_v8f16 = fx.full(8, 0.0, elem_dtype)
         q_b_packs = []
         for ks in range_constexpr(K_STEPS_QK):
             q_col = fx.Int64(ks * K_STEP_QK) + klane * WMMA_LANE_K
@@ -386,7 +386,7 @@ def build_flash_attn_func_module_primary(
         c_zero_f = fx.Float32(0.0)
         c_one_f = fx.Float32(1.0)
         c_sm_scale_log2e = fx.Float32(sm_scale * _LOG2E)
-        c_zero_v8f32 = Vec.filled(8, 0.0, fx.Float32)
+        c_zero_v8f32 = fx.full(8, 0.0, fx.Float32)
         width_i32 = fx.Int32(WARP_SIZE)
         shuf_16_i32 = fx.Int32(16)
 
@@ -495,38 +495,38 @@ def build_flash_attn_func_module_primary(
                 s_v14 = s_raw[14]
                 s_v15 = s_raw[15]
                 if tile_needs_mask:
-                    klane_off_i32 = klane_i32 * fx.Int32(8)
-                    _b0 = kv_start_i32 + fx.Int32(0) + klane_off_i32
+                    klane_off_i32 = klane_i32 * 8
+                    _b0 = kv_start_i32 + 0 + klane_off_i32
                     s_v0 = (_b0 > q_row_i32).select(c_neg_inf, s_v0)
-                    _b1 = kv_start_i32 + fx.Int32(1) + klane_off_i32
+                    _b1 = kv_start_i32 + 1 + klane_off_i32
                     s_v1 = (_b1 > q_row_i32).select(c_neg_inf, s_v1)
-                    _b2 = kv_start_i32 + fx.Int32(2) + klane_off_i32
+                    _b2 = kv_start_i32 + 2 + klane_off_i32
                     s_v2 = (_b2 > q_row_i32).select(c_neg_inf, s_v2)
-                    _b3 = kv_start_i32 + fx.Int32(3) + klane_off_i32
+                    _b3 = kv_start_i32 + 3 + klane_off_i32
                     s_v3 = (_b3 > q_row_i32).select(c_neg_inf, s_v3)
-                    _b4 = kv_start_i32 + fx.Int32(4) + klane_off_i32
+                    _b4 = kv_start_i32 + 4 + klane_off_i32
                     s_v4 = (_b4 > q_row_i32).select(c_neg_inf, s_v4)
-                    _b5 = kv_start_i32 + fx.Int32(5) + klane_off_i32
+                    _b5 = kv_start_i32 + 5 + klane_off_i32
                     s_v5 = (_b5 > q_row_i32).select(c_neg_inf, s_v5)
-                    _b6 = kv_start_i32 + fx.Int32(6) + klane_off_i32
+                    _b6 = kv_start_i32 + 6 + klane_off_i32
                     s_v6 = (_b6 > q_row_i32).select(c_neg_inf, s_v6)
-                    _b7 = kv_start_i32 + fx.Int32(7) + klane_off_i32
+                    _b7 = kv_start_i32 + 7 + klane_off_i32
                     s_v7 = (_b7 > q_row_i32).select(c_neg_inf, s_v7)
-                    _b8 = kv_start_i32 + fx.Int32(16) + klane_off_i32
+                    _b8 = kv_start_i32 + 16 + klane_off_i32
                     s_v8 = (_b8 > q_row_i32).select(c_neg_inf, s_v8)
-                    _b9 = kv_start_i32 + fx.Int32(17) + klane_off_i32
+                    _b9 = kv_start_i32 + 17 + klane_off_i32
                     s_v9 = (_b9 > q_row_i32).select(c_neg_inf, s_v9)
-                    _b10 = kv_start_i32 + fx.Int32(18) + klane_off_i32
+                    _b10 = kv_start_i32 + 18 + klane_off_i32
                     s_v10 = (_b10 > q_row_i32).select(c_neg_inf, s_v10)
-                    _b11 = kv_start_i32 + fx.Int32(19) + klane_off_i32
+                    _b11 = kv_start_i32 + 19 + klane_off_i32
                     s_v11 = (_b11 > q_row_i32).select(c_neg_inf, s_v11)
-                    _b12 = kv_start_i32 + fx.Int32(20) + klane_off_i32
+                    _b12 = kv_start_i32 + 20 + klane_off_i32
                     s_v12 = (_b12 > q_row_i32).select(c_neg_inf, s_v12)
-                    _b13 = kv_start_i32 + fx.Int32(21) + klane_off_i32
+                    _b13 = kv_start_i32 + 21 + klane_off_i32
                     s_v13 = (_b13 > q_row_i32).select(c_neg_inf, s_v13)
-                    _b14 = kv_start_i32 + fx.Int32(22) + klane_off_i32
+                    _b14 = kv_start_i32 + 22 + klane_off_i32
                     s_v14 = (_b14 > q_row_i32).select(c_neg_inf, s_v14)
-                    _b15 = kv_start_i32 + fx.Int32(23) + klane_off_i32
+                    _b15 = kv_start_i32 + 23 + klane_off_i32
                     s_v15 = (_b15 > q_row_i32).select(c_neg_inf, s_v15)
                 s_raw = [
                     s_v0,
@@ -582,7 +582,7 @@ def build_flash_attn_func_module_primary(
             l_corr = _fmul(corr, l_running)
             l_new = _fadd(l_corr, tile_sum)
 
-            corr_vec = Vec.from_elements([corr], fx.Float32).broadcast_to(8)
+            corr_vec = fx.full(8, corr, fx.Float32)
             for dc in range_constexpr(D_CHUNKS):
                 o_accs[dc] = _fmul(o_accs[dc], corr_vec)
 
@@ -676,7 +676,7 @@ def build_flash_attn_func_module_primary(
         o_finals = [loop_results[2 + dc] for dc in range_constexpr(D_CHUNKS)]
 
         inv_l = c_one_f / l_final
-        inv_l_vec = Vec.from_elements([inv_l], fx.Float32).broadcast_to(8)
+        inv_l_vec = fx.full(8, fx.Float32(inv_l), fx.Float32)
 
         if q_in_bounds:
             for dc in range_constexpr(D_CHUNKS):
