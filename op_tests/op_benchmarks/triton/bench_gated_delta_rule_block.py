@@ -16,7 +16,6 @@ Example::
 
 from __future__ import annotations
 
-import argparse
 import importlib.util
 import statistics
 import sys
@@ -31,6 +30,10 @@ from aiter.ops.prefill_batch_metadata import (
     build_gated_delta_rule_prefill_metadata,
 )
 from aiter.ops.triton.gated_delta_net import chunk_gated_delta_rule_opt_vk
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    override_parser_action,
+)
 
 CHUNK_SIZE = 64
 
@@ -449,15 +452,16 @@ def _selected_cases(args, PrefillArgs):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Benchmark GDN prefill block for Qwen3.5-35B / 397B shapes."
-    )
-    parser.add_argument(
+    parser = get_parser(kernel_name="Gated Delta Rule Block")
+
+    override_parser_action(
+        parser,
         "--model",
-        choices=sorted(MODELS),
         default="35b",
+        choices=sorted(MODELS),
         help="Qwen3.5-35B (Hv=32) or Qwen3.5-397B (Hv=64).",
     )
+
     parser.add_argument(
         "--tp",
         type=int,

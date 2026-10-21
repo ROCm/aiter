@@ -21,6 +21,7 @@ from aiter.ops.triton.rope.fused_qk_norm_rope_gate_fp8_quant import (
     MAX_SEQUENCES,
     fused_qk_norm_rope_gate_fp8_quant,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import override_parser_action
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
@@ -171,10 +172,8 @@ def main():
     parser.add_argument("--num-kv-heads", type=int, default=1)
     parser.add_argument("--head-dim", type=int, default=256)
     parser.add_argument("--rotary-dim", type=int, default=64)
-    parser.add_argument(
-        "--metric",
-        choices=["time", "bandwidth"],
-        default="time",
+    override_parser_action(
+        parser, action="--metric", choices=["time", "bandwidth"], default="time"
     )
     parser.add_argument(
         "-o",
