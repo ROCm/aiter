@@ -130,6 +130,13 @@ def _mode_from_owner(owner: str) -> str:  # owner = "sp_qkv.large/<mode>/M<M>"
     return owner.split("/")[1]
 
 
+# sha256 of large/<src>/SOURCE_SHA256.txt (pinned to the manifest files by a test)
+LARGE_SRC_SHA = {
+    "r11": "9874fe1ecb3b6a997523c96210a960434179c8eab84fffc00537170d49836643",
+    "r12": "93bfbcbae1205dce2583a584832b580756f93c1cf3916c5a2e4ca93f342176ac",  # R12 (abi 3) + LG_TAG_EARLY / LG_POLL_BATCH (r12b), derived from r11
+}
+
+
 @register_variant(
     vid="sp_qkv.large.v1",
     family="gemm_ep.sp_qkv",
@@ -143,7 +150,7 @@ def _mode_from_owner(owner: str) -> str:  # owner = "sp_qkv.large/<mode>/M<M>"
         m_multiple=256,
         mutates=(),
     ),
-    source_sha="r11=9874fe1ecb3b6a997523c96210a960434179c8eab84fffc00537170d49836643",
+    source_sha=";".join(f"{k}={v}" for k, v in LARGE_SRC_SHA.items()),
 )
 class SpQkvLarge(Plan):
     n_stages = 1

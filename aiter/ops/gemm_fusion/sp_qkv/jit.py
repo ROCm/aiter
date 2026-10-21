@@ -601,7 +601,16 @@ def large_defs(params: dict, mode: str) -> list[str]:
     """
     if mode not in ("dense", "indexer", "reuse"):
         raise ValueError(f"mode {mode!r}")
-    allowed = {"plan", "n", "half_first", "quarter_first", "no_gridread", "src"}
+    allowed = {
+        "plan",
+        "n",
+        "half_first",
+        "quarter_first",
+        "no_gridread",
+        "src",
+        "tag_early",
+        "poll_batch",
+    }
     extra = set(params) - allowed
     if extra:
         raise ValueError(f"unknown large-M params {sorted(extra)}")
@@ -610,7 +619,20 @@ def large_defs(params: dict, mode: str) -> list[str]:
     ng = int(params.get("no_gridread", 1))
     if ng not in (0, 1, 2):
         raise ValueError("no_gridread")
-    return [
+    # r12b knobs (large/r12 only; the header defaults are 1, build_device.sh passes 1): tag_early = LG_TAG_EARLY (0|1: arrival tag stored in the first-put batch),
+    # poll_batch = LG_POLL_BATCH (0|1|2: target + ERR loaded back-to-back; 2 = ERR every 8th iteration). Passed EXPLICITLY for r12 so an A/B is a different build key and a
+    # header default change cannot move a build silently; r11 has no such knobs.
+    knobs = [k for k in ("tag_early", "poll_batch") if k in params]
+    if knobs and params.get("src", LARGE_SRC) != "r12":
+        raise ValueError(f"{knobs} exist only in large/r12 (src=r12)")
+    tag_early, poll_batch = int(params.get("tag_early", 1)), int(
+        params.get("poll_batch", 1)
+    )
+    if tag_early not in (0, 1):
+        raise ValueError("tag_early must be 0 or 1")
+    if poll_batch not in (0, 1, 2):
+        raise ValueError("poll_batch must be 0, 1 or 2")
+    defs = [
         f"-DLG_X_INDEXER={1 if mode == 'indexer' else 0}",
         f"-DLG_NO_GRIDREAD={ng}",
         "-DBUILD_CCO_SDMA=1",
@@ -633,6 +655,9 @@ def large_defs(params: dict, mode: str) -> list[str]:
         "-DLG_NEGCTRL_ISO=0",
         "-DLG_ISO_DELAY_ITERS=0",
     ]
+    if params.get("src", LARGE_SRC) == "r12":
+        defs += [f"-DLG_TAG_EARLY={tag_early}", f"-DLG_POLL_BATCH={poll_batch}"]
+    return defs
 
 
 def large_cache_key(

@@ -4103,7 +4103,10 @@ def test_jit_abi_tables_sources_and_missing_source_error():
     # large: src is a parameter (default r11 for old profiles) and is validated
     assert jit.large_defs({"src": "r12", "n": 2}, "dense") == jit.large_defs(
         {"src": "r11", "n": 2}, "dense"
-    )  # same -D set: the source dir differs, not the flags
+    ) + [
+        "-DLG_TAG_EARLY=1",
+        "-DLG_POLL_BATCH=1",
+    ]  # r12 = r11's flags + the two r12b knobs (passed explicitly, default 1)
     with pytest.raises(ValueError, match="large src 'r13'"):
         jit.large_defs({"src": "r13"}, "dense")
     tool = dict(TOOL_SIM)
@@ -5351,3 +5354,114 @@ def test_r21_plan_m_range_window_request_and_run_path(monkeypatch):
     assert (
         plan.owner != mk(65, {"nh": 2}).owner
     )  # the B_HEADS A/B is its own owner (windows / context): never mixed with NH1
+
+
+# ======================================================================= r12b / r19-r20 "overhead round" knobs: defaults, explicit passing, manifests
+def _header_defaults(text):
+    """`#ifndef NAME` / `#define NAME <int>` default pairs of a C header or source."""
+    import re
+
+    return {
+        n: int(v) for n, v in re.findall(r"#ifndef (\w+)\s*\n\s*#define \1 (\d+)", text)
+    }
+
+
+def test_large_r12_knobs_are_explicit_validated_and_equal_the_header_and_build_device_defaults():
+    import re
+
+    tool = dict(TOOL_SIM)
+    d12, d11 = jit.large_defs({"src": "r12"}, "dense"), jit.large_defs(
+        {"src": "r11"}, "dense"
+    )
+    assert d12 == d11 + ["-DLG_TAG_EARLY=1", "-DLG_POLL_BATCH=1"] and not any(
+        "TAG_EARLY" in d or "POLL_BATCH" in d for d in d11
+    )  # r11 has no such knobs
+    # the A/B: another value is another BUILD (a different key), and bad values / r11 knobs are refused before a compile
+    ab = jit.large_defs({"src": "r12", "tag_early": 0, "poll_batch": 0}, "dense")
+    assert "-DLG_TAG_EARLY=0" in ab and "-DLG_POLL_BATCH=0" in ab
+    assert jit.large_cache_key(ab, tool, "r12") != jit.large_cache_key(d12, tool, "r12")
+    assert "-DLG_POLL_BATCH=2" in jit.large_defs(
+        {"src": "r12", "poll_batch": 2}, "indexer"
+    )
+    for bad, match in (
+        ({"tag_early": 2}, "tag_early must be 0 or 1"),
+        ({"poll_batch": 3}, "poll_batch must be 0, 1 or 2"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            jit.large_defs({"src": "r12", **bad}, "dense")
+    for src in ("r11", None):
+        params = {"tag_early": 0} if src is None else {"src": src, "poll_batch": 0}
+        with pytest.raises(ValueError, match="exist only in large/r12"):
+            jit.large_defs(
+                params, "dense"
+            )  # no src = r11 (the default of old profiles)
+    # THE CHECK: what Python passes == the header default (the effective value when a knob is NOT passed) == the build_device.sh default
+    root = os.path.join(jit.CSRC, "large", "r12")
+    header = _header_defaults(
+        _slurp(os.path.join(root, "interface", "lg_comm_abi_v3.h"), encoding="utf-8")
+    )
+    script = dict(
+        re.findall(
+            r'(LG_\w+)="\$\{\1:-(\d+)\}"',
+            _slurp(os.path.join(root, "build_device.sh"), encoding="utf-8"),
+        )
+    )
+    assert (
+        header["LG_TAG_EARLY"] == int(script["LG_TAG_EARLY"]) == 1
+        and header["LG_POLL_BATCH"] == int(script["LG_POLL_BATCH"]) == 1
+    )
+    passed = dict(f[2:].split("=") for f in d12)
+    for name, val in passed.items():
+        if (
+            name in script and name != "LG_X_INDEXER"
+        ):  # LG_X_INDEXER is the MODE (the script default is the indexer build)
+            assert val == script[name], (name, val, script[name])
+    for name, val in script.items():
+        if (
+            name not in passed and name in header
+        ):  # a flag the script passes and Python does not: the header default applies and must equal the script's
+            assert header[name] == int(val), (name, header[name], val)
+    # every tag-test seam is OFF by default on both sides (Python never passes them)
+    seams = [n for n in script if n.startswith("LG_X_TEST_")]
+    assert seams and all(
+        int(script[n]) == 0 and header[n] == 0 and n not in passed for n in seams
+    )
+
+
+def test_small_r19_r20_overhead_knobs_default_to_one_and_the_python_defs_do_not_pass_them():
+    for src in ("r19", "r20"):
+        text = _slurp(
+            os.path.join(jit.CSRC, "small", src, "device", "ran_kernel.cu"),
+            encoding="utf-8",
+        )
+        d = _header_defaults(text)
+        assert (
+            d["SM_TAG_EARLY"] == 1 and d["SM_POLL_BATCH"] == 1
+        ), src  # the source default applies when the flag is not passed
+        params = {"src": src, "sk": 3, "nh": 1, "no_credit": 1, "rx_bypass": 1}
+        dev, host = jit.small_defs(params, "dense")
+        assert not any("TAG_EARLY" in x or "POLL_BATCH" in x for x in dev + host), src
+        # the knobs are not profile params: an unknown param is refused (no silent A/B through a row)
+        with pytest.raises(ValueError, match="unknown small-M params"):
+            jit.small_defs({**params, "tag_early": 0}, "dense")
+
+
+def test_large_src_sha_constants_are_the_manifest_hashes():
+    """LARGE_SRC_SHA is read from the SOURCE (ast), not by importing variants_large: a second import would register the variant into the live catalog twice."""
+    import ast
+    import hashlib
+
+    path = os.path.join(os.path.dirname(jit.__file__), "variants_large.py")
+    tree = ast.parse(_slurp(path, encoding="utf-8"))
+    consts = [
+        ast.literal_eval(n.value)
+        for n in tree.body
+        if isinstance(n, ast.Assign)
+        and any(getattr(t, "id", "") == "LARGE_SRC_SHA" for t in n.targets)
+    ]
+    assert len(consts) == 1
+    sha = consts[0]
+    assert set(sha) == set(jit.LARGE_SRCS)
+    for src in jit.LARGE_SRCS:
+        manifest = os.path.join(jit.CSRC, "large", src, "SOURCE_SHA256.txt")
+        assert hashlib.sha256(_slurp(manifest, "rb")).hexdigest() == sha[src], src
