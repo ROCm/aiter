@@ -5,11 +5,12 @@
 
 ``qsa_indexer_block_ids`` writes indexer ``block_ids [M, 512]`` from paged
 compressed K. Rows up to 512 blocks use the fused emit kernel; longer rows
-use tiled BLOCK_N=32 BF16 MFMA scoring plus the stable decode radix below
-32768 columns and streaming radix at or above that width. Batches averaging
-at least two query rows per request (prefill, mixed prefill and decode, MTP
-decode) score 16 rows per workgroup. The indexer head count is 4 or
-8, each a separate compile.
+use tiled BLOCK_N=32 BF16 MFMA scoring plus the stable decode radix for
+prefill and below 32768 columns, and streaming radix for wider decode rows.
+Batches averaging at least two query rows per request (prefill, mixed
+prefill and decode, MTP decode) score 16 rows by 64 columns per workgroup,
+and a prefill workgroup walks four column tiles. The indexer head count is
+4 or 8, each a separate compile.
 
 ``qsa_sparse_gqa`` writes sparse GQA ``o [M, Hq, D]`` from paged K/V at the
 selected token ids. Decode runs a BLOCK_N=16 two-wave tile with split-K and
@@ -235,6 +236,23 @@ def _k1_uses_prefill_scorer(
     return not (arch.startswith("gfx942") and n_heads == 8)
 
 
+_ROWS_SCORER_TILES_PER_WG = 4
+_ROWS_SCORER_MULTI_TILE_MIN_ROWS_PER_REQUEST = 16
+
+
+def _k1_rows_scorer_tiles_per_wg(n_requests: int, rows: int) -> int:
+    """Column tiles each 16-row scorer workgroup walks with one Q staging.
+
+    A prefill tile almost always belongs to one request with long rows, so
+    four tiles reuse Q and the row setup with the grid still full. MTP rows
+    are short and a tile spans several requests: there one tile per
+    workgroup keeps enough workgroups to fill the machine.
+    """
+    if rows >= _ROWS_SCORER_MULTI_TILE_MIN_ROWS_PER_REQUEST * n_requests:
+        return _ROWS_SCORER_TILES_PER_WG
+    return 1
+
+
 @functools.lru_cache(maxsize=1)
 def _active_columns_plan():
     return build_qsa_indexer_active_columns_module()
@@ -313,9 +331,10 @@ def qsa_indexer_score_and_select(
     the widest visible row. The score buffer stays the width of the
     table, and the selector sees that prefix. A padded table with at
     most 64 rows and at most 20000 live columns uses the one-workgroup
-    decode radix. More rows keep the streaming selector. A packed table
-    uses the stable decode radix below 32768 columns and streaming radix
-    (``tie='low'``) at or above that. ``row_bounded``
+    decode radix. More than 64 rows use the stable decode radix at any
+    width. Otherwise a packed table uses the stable decode radix below
+    32768 columns and streaming radix (``tie='low'``) at or above that.
+    ``row_bounded``
     runs the one-workgroup decode radix on the full width instead: it
     stops at each row's ``row_lens``, so it needs no readback of the
     widest row.
@@ -347,6 +366,8 @@ def qsa_indexer_score_and_select(
     wide_cache = span_bytes(k_cache) > (1 << 32)
     k_strides = tuple(int(s) for s in k_cache.stride()[:3]) if wide_cache else None
     if _k1_uses_prefill_scorer(int(context_lens.shape[0]), m, n_heads, arch):
+        col_tiles = (n_columns + _ROWS_BLOCK_N - 1) // _ROWS_BLOCK_N
+        tiles_per_wg = _k1_rows_scorer_tiles_per_wg(int(context_lens.shape[0]), m)
         _run_compiled(
             _prefill_scores_plan(page_size, use_k32, n_heads, wide_cache, k_strides),
             q,
@@ -363,7 +384,8 @@ def qsa_indexer_score_and_select(
             float(score_scale),
             int(k_cache.shape[0]),
             (m + 15) // 16,
-            (n_columns + _ROWS_BLOCK_N - 1) // _ROWS_BLOCK_N,
+            (col_tiles + tiles_per_wg - 1) // tiles_per_wg,
+            tiles_per_wg,
             torch.cuda.current_stream(q.device),
         )
     else:
@@ -416,8 +438,9 @@ def qsa_indexer_score_and_select(
     # The prefix is contiguous in each row (stride 1). Narrowing it is what
     # lets a padded allocation take the short-row selector: that dispatch
     # reads the tensor width, not row_lens. One workgroup per row is the
-    # decode shape (at most 64 rows). A prefill has too many rows for that
-    # kernel, so it keeps the streaming selector, on the live prefix.
+    # decode shape (at most 64 rows). A prefill takes the decode radix at any
+    # width: it stops at each row's row_lens, and on a padded 65856-column
+    # table it ran 1.3x to 1.8x faster than the streaming selector.
     scored = (
         scores if select_columns == n_columns else scores.narrow(1, 0, select_columns)
     )
@@ -427,7 +450,11 @@ def qsa_indexer_score_and_select(
         and select_columns <= _ONE_WORKGROUP_MAX_ROW_WIDTH
         and m <= _DECODE_MAX_ROWS
     )
-    if one_workgroup or (not narrowed and select_columns < _STREAM_SELECT_MIN_COLUMNS):
+    if (
+        one_workgroup
+        or m > _DECODE_MAX_ROWS
+        or (not narrowed and select_columns < _STREAM_SELECT_MIN_COLUMNS)
+    ):
         flydsl_top_k_per_row_decode(
             scored,
             1,
@@ -533,9 +560,9 @@ def qsa_indexer_block_ids(
     allocates it. Emit does not read it. The buffer is overwritten and is
     not returned. Batches averaging two or more rows per request score 16
     query rows per workgroup, except gfx942 H=8; one-row decode uses one row
-    per workgroup. Selection is the
-    stable decode radix below 32768 columns
-    and streaming radix (``tie='low'``) at or above that width.
+    per workgroup. Selection is the stable decode radix for prefill (more
+    than 64 rows) and, otherwise, below 32768 columns; streaming radix
+    (``tie='low'``) at or above that width.
     Expand+tail is still separate. An empty context, cache, or page table
     writes ``-1`` and does not launch. A page table with fewer request
     rows than ``context_lens`` is rejected.
@@ -600,7 +627,7 @@ def qsa_indexer_block_ids(
     # wider allocation is the padded max_model_len table. Decode (at most
     # 64 rows) reads the widest visible row and dispatches on that. A
     # prefill has too many rows for that readback to pay, and its selector
-    # is already the streaming one, so it keeps the allocation width. So
+    # stops at each row's length, so it keeps the allocation width. So
     # does a graph capture: the readback is not allowed there, and the
     # graph would replay the width of the capture batch. Decode under
     # capture selects with the one-workgroup radix on the full width,
