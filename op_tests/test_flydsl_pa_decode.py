@@ -153,14 +153,21 @@ def test_bf16_swa_query_split_schedule(
     [
         ("fp8", "per-tensor", -1, 0),
         ("fp8", "per-tensor", 0, 0),
-        ("fp8", "per-tensor", 128, 128),
         ("fp8", "none", -1, 0),
         ("fp8", "per-token", 128, None),
         ("fp8", "per-tensor", -2, None),
-        ("fp8", "per-tensor", 129, None),
-        ("bf16", "none", 128, 128),
-        ("bf16", "none", -1, None),
-        ("bf16", "none", 0, None),
+        ("bf16", "none", -1, 0),
+        ("bf16", "none", 0, 0),
+        *[
+            (dtype, scale, window, window)
+            for dtype, scale in (("fp8", "per-tensor"), ("bf16", "none"))
+            for window in (128, 129, 1024)
+        ],
+        *[
+            (dtype, scale, window, None)
+            for dtype, scale in (("fp8", "per-tensor"), ("bf16", "none"))
+            for window in (127, 1025)
+        ],
     ],
 )
 def test_asymmetric_tuning_cli_window(kv_dtype, scale_mode, window, expected_window):
@@ -188,6 +195,31 @@ def test_asymmetric_tuning_cli_window(kv_dtype, scale_mode, window, expected_win
         assert error.value.code == 2
     else:
         assert tuning._parse_args(argv).sliding_window == expected_window
+
+
+@pytest.mark.parametrize("kv_dtype", ["fp8", "bf16"])
+@pytest.mark.parametrize("window", [127, 1025])
+def test_asymmetric_schedule_rejects_window(monkeypatch, kv_dtype, window):
+    """Direct scheduler calls must enforce the asymmetric window bounds."""
+    traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
+    monkeypatch.setattr(traits, "get_rocm_arch", lambda: "gfx950")
+    kwargs = {
+        "head_dim": 192,
+        "value_dim": 128,
+        "query_group_size": 16,
+        "block_size": 64,
+        "num_seqs": 1,
+        "num_kv_heads": 1,
+        "num_compute_units": 256,
+        "work_capacity": 8,
+        "num_partitions": 8,
+        "query_dtype": "bf16",
+        "kv_dtype": kv_dtype,
+        "query_length": 8,
+        "sliding_window": window,
+    }
+    with pytest.raises(ValueError, match=r"sliding window in \[128, 1024\]"):
+        traits.PaDecodeSchedule.select(**kwargs)
 
 
 @pytest.mark.parametrize("value_dim", [None, 128, 64])
@@ -366,7 +398,26 @@ _COMMON_CASES = [
         for pattern in ("small_query", "probability_tail")
     ],
 ]
+_ASYMMETRIC_WINDOW_CASES = [
+    (
+        f"asymmetric-window-{window}",
+        {
+            "query_length": 8,
+            "group_size": 16,
+            "head_dim": 192,
+            "value_dim": 128,
+            "block_size": 64,
+            "max_partitions": 8,
+            "window": window,
+            "sink_dtype": torch.float32,
+            "capture": True,
+            "lengths": (0, 1, 7, 8, 63, 64, 65, 127, 128, 129, 257, 1027, 8192),
+        },
+    )
+    for window in (257, 1024)
+]
 _FP8_CASES = _COMMON_CASES + [
+    *_ASYMMETRIC_WINDOW_CASES,
     (
         "qlen8-full-d192-v128",
         {
@@ -451,6 +502,11 @@ _FP8_CASES = _COMMON_CASES + [
     ),
 ]
 _BF16_CASES = _COMMON_CASES + [
+    *_ASYMMETRIC_WINDOW_CASES,
+    (
+        "asymmetric-full",
+        {**_ASYMMETRIC_WINDOW_CASES[0][1], "window": 0},
+    ),
     *[
         (
             f"qlen8-d128-w{window}-np{parts}",
@@ -648,9 +704,11 @@ _INVALID_CASES = [
 ]
 
 
-def _check_output(output, reference):
+def _check_output(output, reference, tolerance=5e-3):
     assert torch.isfinite(output).all()
-    torch.testing.assert_close(output.float(), reference, atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(
+        output.float(), reference, atol=tolerance, rtol=tolerance
+    )
 
 
 def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
@@ -671,12 +729,15 @@ def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
         value = torch.empty((1, 1, 4, 128, 16), dtype=query.dtype, device=query.device)
 
     def unexpected_compile(**_):
-        pytest.fail("invalid BF16 inputs reached kernel compilation")
+        pytest.fail("invalid inputs reached kernel compilation")
 
     monkeypatch.setattr(pa, "compile_pa_decode_tile", unexpected_compile)
+    value_dim = query.shape[-1] if case["value_dim"] is None else case["value_dim"]
     with pytest.raises(case["error"], match=case["match"]):
         pa.pa_decode(
-            torch.empty_like(query),
+            torch.empty(
+                (*query.shape[:-1], value_dim), dtype=query.dtype, device=query.device
+            ),
             query,
             key,
             value,
@@ -750,6 +811,27 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
         ],
         *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _BF16_CASES],
         *[pytest.param(geometry, id=name) for name, geometry in _PIPE_CASES],
+        *[
+            pytest.param(
+                {
+                    "invalid_input": "asymmetric-window",
+                    "error": NotImplementedError,
+                    "match": r"sliding window in \[128, 1024\]",
+                    "query_length": 8,
+                    "group_size": 16,
+                    "head_dim": 192,
+                    "value_dim": 128,
+                    "block_size": 64,
+                    "kv_dtype": dtype,
+                    "scale_mode": "per-tensor" if dtype == "fp8" else "none",
+                    "window": window,
+                    "lengths": (257,),
+                },
+                id=f"invalid-{dtype}-asymmetric-window-{window}",
+            )
+            for dtype in ("fp8", "bf16")
+            for window in (127, 1025)
+        ],
         *[
             pytest.param(
                 {
@@ -957,7 +1039,8 @@ def test_pa_decode(case, device, monkeypatch):
             window,
             sinks,
         )
-        _check_output(output, reference)
+        tolerance = 1e-2 if case["kv_dtype"] == "fp8" else 5e-3
+        _check_output(output, reference, tolerance)
 
     launch()
     check()
