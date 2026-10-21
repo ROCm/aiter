@@ -10,7 +10,7 @@ from collections import namedtuple
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl.expr import arith, const_expr, range_constexpr, rocdl, tdm_ops
+from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import Constexpr, T
@@ -108,7 +108,7 @@ def _pack_bytes_i32(byte_vals):
     assert 1 <= len(byte_vals) <= 4, len(byte_vals)
     packed = None
     for n, b in enumerate(byte_vals):
-        w = fx.Int32(arith.extui(T.i32, _raw(b)))
+        w = fx.Int32(fx.Uint8(b))
         if n:
             w = w << fx.Int32(8 * n)
         packed = w if packed is None else packed | w
@@ -1430,9 +1430,7 @@ def launch_gemm_a8w4_tdm(
                     _rm_dst_lanes.append(
                         fx.Int32(
                             fx.ptr_load(
-                                _rm_i32
-                                + blk_m64 * fx.Int64(2)
-                                + fx.Int64(_scatter_safe_row) * fx.Int64(2)
+                                _rm_i32 + blk_m64 * 2 + fx.Int64(_scatter_safe_row) * 2
                             )
                         )
                     )
@@ -1449,8 +1447,8 @@ def launch_gemm_a8w4_tdm(
                     _weight_bits = fx.Int32(
                         fx.ptr_load(
                             _rm_i32
-                            + blk_m64 * fx.Int64(2)
-                            + fx.Int64(_weight_safe_row) * fx.Int64(2)
+                            + blk_m64 * 2
+                            + fx.Int64(_weight_safe_row) * 2
                             + fx.Int64(1)
                         )
                     )
@@ -1710,14 +1708,14 @@ def launch_gemm_a8w4_tdm(
                     alignment=1,
                 )
                 scale_ptr = fx.recast_iter(i32_ptr_g, arg_quant_scale)
-                is_kgrp0 = fx.Int32(kgrp) == fx.Int32(0)
+                is_kgrp0 = fx.Int32(kgrp) == 0
                 # i32_n is the pre-activation gate+up width; the quantized
                 # output has half as many columns and one scale dword per K128.
                 q_dst_scale_dwpr = i32_n // 256
                 scale_rsrc = create_buffer_resource_from_addr(
                     fx.ptrtoint(scale_ptr),
                     num_records_bytes=(
-                        fx.Int64(i32_m) * fx.Int64(q_dst_scale_dwpr) * fx.Int64(4)
+                        fx.Int64(i32_m) * fx.Int64(q_dst_scale_dwpr) * 4
                     ).ir_value(),
                 )
 
@@ -1884,7 +1882,7 @@ def launch_gemm_a8w4_tdm(
                 def _biased_acc(wm, wn, col_rel):
                     acc = Vec(accs[wm * output_n_rep + wn])
                     if const_expr(has_bias):
-                        acc = acc + Vec(
+                        acc = acc + (
                             fx.ptr_load(
                                 bias_map + expert * i32_n + col_rel,
                                 result_type=T.vec(8, out_elem),
@@ -1907,7 +1905,7 @@ def launch_gemm_a8w4_tdm(
                     # multiple of four starts mid-dword, and a wider store would
                     # reach into the next warp's scales.
                     _e8m0_pack_dwords = _n_mx_blks // 4 if _n_mx_blks % 4 == 0 else 0
-                    _is_kgrp0 = fx.Int32(kgrp) == fx.Int32(0)
+                    _is_kgrp0 = fx.Int32(kgrp) == 0
                     _p8_scale = fx.PointerType.get(
                         elem_ty=fx.Int8.ir_type,
                         address_space=fx.AddressSpace.Shared,

@@ -507,7 +507,7 @@ def _build_kernel_mfma_r_w(
             lo_fix = _fix_i32(fx.Int32(raw))
             hi_fix = _fix_i32(fx.Int32(raw >> 32))
             lo_64 = fx.Int64(fx.Uint32(lo_fix))
-            hi_64 = fx.Int64(fx.Uint32(hi_fix)) << fx.Int64(32)
+            hi_64 = fx.Int64(fx.Uint32(hi_fix)) << 32
             return (lo_64 | hi_64).ir_value()
 
         # ---- Preload window bounds, Q frags, and weights for all RPB rows ----
@@ -579,7 +579,7 @@ def _build_kernel_mfma_r_w(
                 abs_ni = wave_ni_base + fx.Int32(ni)
                 col = col0 + abs_ni * fx.Int32(MFMA_N) + lane_mod_N
                 cols[ni] = col
-                col_clamped = fx.min(col, seq_len_kv - fx.Int32(1))
+                col_clamped = fx.min(col, seq_len_kv - 1)
                 kv_scales_tile[ni] = fx.Float32(sc_t[col_clamped])
                 base_b = col_clamped * fx.Int32(D)
                 for kk in range_constexpr(K_STEPS):
@@ -891,7 +891,7 @@ def _build_kernel_mfma_lds_pipe(
 
             dma_bytes = fx.Int32(DMA_BYTES)
             d = fx.Int32(D)
-            seq_len_kv_m_1 = seq_len_kv - fx.Int32(1)
+            seq_len_kv_m_1 = seq_len_kv - 1
 
             for i in range_constexpr(NUM_ASYNC_LOADS):
                 lin_bytes = (tid + fx.Int32(i * MR_BLOCK_THREADS)) * dma_bytes
@@ -1039,7 +1039,7 @@ def _build_kernel_mfma_lds_pipe(
             for ni in range_constexpr(N_TILES):
                 col = col0 + fx.Int32(ni * mfma.MFMA_N) + lane_mod_N
                 cols[ni] = col
-                col_cl = fx.min(col, seq_len_kv - fx.Int32(1))
+                col_cl = fx.min(col, seq_len_kv - 1)
                 kv_scales_tile[ni] = fx.Float32(sc_t[col_cl])
                 col_local = fx.Int32(ni * mfma.MFMA_N) + lane_mod_N
                 for kk in range_constexpr(K_STEPS):

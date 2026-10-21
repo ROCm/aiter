@@ -168,6 +168,9 @@ for file in "${sharded_files[@]}"; do
         op_tests/test_flydsl_pa_decode.py)
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
+        op_tests/test_f4gemm.py)
+            test_cmd=(timeout 60m python3 "$file" --mode func)
+            ;;
         op_tests/test_gemm_a6w6.py)
             {
                 echo "Running tuned dispatch plus every compatible A6W6 ASM kernel"
