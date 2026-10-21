@@ -185,6 +185,10 @@ def gdn_fused_prefill_fwd(
                 f"{tuple(track_state.shape)} {track_state.dtype}"
             )
         trs = track_state.view(-1)
+        if track_chunk_idx.dim() != 1 or track_chunk_idx.numel() < N:
+             raise ValueError(
+                 f"track_chunk_idx must be 1-D with at least {N} entries"
+             )
         tri = track_chunk_idx[:N].to(torch.int32).contiguous()
     else:
         # Not dereferenced when HAS_TRACK is off.
