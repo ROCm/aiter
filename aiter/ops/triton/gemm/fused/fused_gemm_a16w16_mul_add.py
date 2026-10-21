@@ -104,6 +104,11 @@ def fused_gemm_a16w16_mul_add(
     a, is_a_scalar, stride_a = _mul_add_operand(a, B, S, N, x.device)
     b, is_b_scalar, stride_b = _mul_add_operand(b, B, S, N, x.device)
 
+    # The kernel reads the bias with unit stride, as every other Triton GEMM
+    # in aiter does. An (N,) view with a stride needs a copy first.
+    if bias is not None:
+        bias = bias.contiguous()
+
     w = w.T
 
     if y is None:

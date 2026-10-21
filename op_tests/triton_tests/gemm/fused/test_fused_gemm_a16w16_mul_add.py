@@ -70,6 +70,22 @@ def test_fused_gemm_a16w16_mul_add_2d(M, N, K, dtype, a_kind, b_kind, bias):
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-2)
 
 
+@pytest.mark.parametrize("M, N, K", [(128, 256, 256), (1024, 1152, 1152)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("step", [2, 3])
+def test_fused_gemm_a16w16_mul_add_strided_bias(M, N, K, dtype, step):
+    """The bias can be an (N,) view with a stride, for example one column of a
+    packed bias table."""
+    x, w, a, b, _ = generate_fused_gemm_a16w16_mul_add_inputs(
+        1, M, N, K, dtype, "scalar", "scalar", bias=False, x_3d=False
+    )
+    bias = torch.randn((N, step), dtype=dtype, device="cuda")[:, step - 1]
+    assert not bias.is_contiguous()
+    torch_out = run_torch(x, w, a, b, bias, dtype)
+    triton_out = fused_gemm_a16w16_mul_add(x, w, a, b, bias=bias, dtype=dtype)
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-2)
+
+
 def get_3d_vals():
     x_vals = [(2, 77, 640, 320)]  # S is not a multiple of the tile
     x_vals += [(2, 333, 2432, 2432)]  # SD3.5-Large context stream
