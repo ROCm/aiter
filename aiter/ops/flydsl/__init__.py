@@ -177,9 +177,9 @@ _LAZY_IMPORTS = {
 }
 
 __all__ = [
-    "DenseGemmConfig",
     "FP8_MQA_LOGITS_DEFAULT_VARIANT",
     "FP8_MQA_LOGITS_VARIANTS",
+    "DenseGemmConfig",
     "Fp4MqaPlan",
     "GateMode",
     "PreshuffledA16WFP4Weight",
