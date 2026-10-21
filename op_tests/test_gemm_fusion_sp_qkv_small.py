@@ -75,7 +75,7 @@ def test_profile_rows_exact_and_distinct():
     prof = profmod.load_profile(PROFILE)
     small = [r for r in prof.rows() if r.vid == "sp_qkv.small.v1"]
     assert (
-        len(small) == 27 == len(specs.small_exact_cells())
+        len(small) == 24 == len(specs.small_exact_cells())
     )  # 6 tuned + 15 P2 copies (m 1, 2, 4, 8, 12) + 3 r20 rows (m 64)
     for (mode, T), (vid, params) in specs.SMALL_CELLS.items():
         r = prof.lookup(specs.sp_qkv_spec(mode).signature(), "gfx950", 256, 4, T // 4)
@@ -259,7 +259,7 @@ def test_small_variant_registers_and_contract(monkeypatch):
     )
     assert n == 2 and plan.params["reuse_no_idx"] == 1
     # not a validated cell -> native (m 1..64 all fuse: rows + the r19 / r20 rules; m 65..255 is native by design, incl. the default bucket m=128)
-    for m_native in (129, 200, 255):
+    for m_native in (65, 100, 128, 255):
         assert match_prefix(
             spec, MatchCtx("gfx950", 256, 4, m_native, frozenset({"mori_cco"})), PROFILE
         ) == (None, 0), m_native
@@ -281,13 +281,13 @@ def test_small_variant_registers_and_contract(monkeypatch):
 
 
 # ======================================================================= large-M (S2-2b-iii)
-def test_profile_has_114_rows_and_large_prefix_signatures():
+def test_profile_has_111_rows_and_large_prefix_signatures():
     """24 small rows (see test_small_profile_rows...) + 87 EXACT large rows (one per mode x local m = 1024..8192 step 256, each cell's best (n, half_first) from the P1 sweep, src r12)."""
     from aiter.ops.gemm_fusion.sp_qkv import p1_sweep
 
     clear_profile_cache()
     prof = profmod.load_profile(PROFILE)
-    assert len(prof) == 114  # 27 small + 87 large
+    assert len(prof) == 111  # 24 small + 87 large
     assert (
         len(p1_sweep.P1_GRID) == 29
         and sum(len(v) for v in p1_sweep.P1_BEST.values()) == 87
@@ -1054,7 +1054,7 @@ def test_uniform_policy_reproduces_phase1_equal_layout(monkeypatch):
         )
         + 1  # every R12 plan requests the SAME per-comm global page: one window
     )
-    assert wb["max_windows"] == n_windows == 52
+    assert wb["max_windows"] == n_windows == 46
     assert wb["window_bytes"] % (4 << 20) == 0 and wb["window_bytes"] == max(
         r.bytes for v in reqs.values() for r in v
     )
@@ -1066,18 +1066,18 @@ def test_uniform_policy_reproduces_phase1_equal_layout(monkeypatch):
     r = make_res(
         dist=d, backend=be, profile=PROFILE, policy="uniform"
     )  # A-3: arena is the default; uniform stays selectable
-    assert r.window_bytes == wb["window_bytes"] and r.max_windows == 52
+    assert r.window_bytes == wb["window_bytes"] and r.max_windows == 46
     assert (
-        be.heap == heap_bytes_for(wb["window_bytes"], 52)
+        be.heap == heap_bytes_for(wb["window_bytes"], 46)
         and be.heap % (4 << 30) == 0
-        and be.heap >= 52 * wb["window_bytes"] + (256 << 20)
+        and be.heap >= 46 * wb["window_bytes"] + (256 << 20)
     )
     for (
         owner,
         rq,
     ) in reqs.items():  # register ALL 15 plans (the gate02 sequence), in any order
         r.ensure(owner, rq)
-    assert len(be.offsets) == 52 and set(be.sizes) == {
+    assert len(be.offsets) == 46 and set(be.sizes) == {
         wb["window_bytes"]
     }  # every window equal, 4 MiB multiple
     assert all(
@@ -1758,12 +1758,12 @@ def test_fusion_resources_budget_from_explicit_profile_with_env_unset(monkeypatc
         d, be = FakeDist(), FirstFitBackend(0)
         r = make_res(dist=d, backend=be, profile=prof, policy="uniform")
         assert (
-            r.window_bytes == 171966464 == 164 << 20 and r.max_windows == 52
+            r.window_bytes == 171966464 == 164 << 20 and r.max_windows == 46
         )  # the shipped profile's own numbers
         assert r.profile is not None and r.profile.name == "minimax_m3_sp4_gfx950_v1"
         assert be.heap == heap_bytes_for(
-            171966464, 52
-        ) and be.heap >= 52 * 171966464 + (256 << 20)
+            171966464, 40
+        ) and be.heap >= 40 * 171966464 + (256 << 20)
         # the failing ATOM sequence: a 4 MiB small plan first, then a 40 MiB large plan: both fit the 164 MiB uniform window
         r.ensure(
             "small",
@@ -1787,7 +1787,7 @@ def test_profile_name_resolves_without_env(monkeypatch):
     r = make_res(
         dist=FakeDist(), backend=FirstFitBackend(0), profile="minimax_m3_sp4_gfx950_v1"
     )  # a bare name -> configs/gemm_fusion/<name>.json
-    assert r.window_bytes == 171966464 and r.max_windows == 52
+    assert r.window_bytes == 171966464 and r.max_windows == 46
 
 
 def test_env_profile_is_never_read_by_fusion_resources(monkeypatch):
@@ -2277,8 +2277,8 @@ def test_arena_registers_exactly_one_window_and_every_plan_window_is_a_view(
     )  # ONE registration: the only size the comm ever sees
     A = r._arena
     assert (
-        A.bytes == 444 * MiB == r._arena_bytes and r.policy == "arena"
-    )  # 336 MiB shared S/R/C + page, 108 MiB of small windows (12 owners: 9 x 2 x 4 MiB + 3 r21 owners x (8 MiB Rx + 4 MiB ctl))
+        A.bytes == 408 * MiB == r._arena_bytes and r.policy == "arena"
+    )  # 336 MiB shared S/R/C + page, 72 MiB of small windows (9 owners x 2 x 4 MiB: 6 r19/r18-family + 3 r20 MP64)
     # views: inside the arena, 4 MiB aligned, pairwise disjoint (shared set once), local = arena.local + offset
     seen = {}
     for w in r._views:
@@ -2292,7 +2292,7 @@ def test_arena_registers_exactly_one_window_and_every_plan_window_is_a_view(
     spans = sorted(seen.items())
     assert all(a + n <= b for (a, n), (b, _m) in pairwise(spans))  # disjoint
     assert (
-        sum(seen.values()) == 444 * MiB
+        sum(seen.values()) == 408 * MiB
     )  # 12 small + shared S/R/C + the global page fill the arena exactly: the budget is exact
     # every large owner got the SAME three views; the view struct reproduces arena + offset for local and peer addressing (stride/lsaRank unchanged)
     large = [o for o, _ in plans if o.startswith("sp_qkv.large/")]
@@ -2313,9 +2313,9 @@ def test_arena_registers_exactly_one_window_and_every_plan_window_is_a_view(
     n_views = len(r._views)
     be.log.clear()
     r.release()
-    assert n_views == 28 and len(be.freed) == 29 == len(
+    assert n_views == 22 and len(be.freed) == 23 == len(
         set(be.freed)
-    )  # 28 plan views (24 small + shared S/R/C + the global page) + the 1 view-self-test view, each freed exactly once
+    )  # 22 plan views (18 small + shared S/R/C + the global page) + the 1 view-self-test view, each freed exactly once
     assert (
         len([x for x in be.log if x[0] == "dereg"]) == 1 and r._views == []
     )  # the arena is the ONLY deregistered window
@@ -2787,7 +2787,7 @@ def test_A3_arena_is_the_default_and_only_uniform_stays_selectable(monkeypatch):
     assert (
         ru.policy == "uniform"
         and ru.policy_source == "explicit"
-        and ru._vmm == 12 << 30
+        and ru._vmm == 8 << 30
         and ru.policy_fallback_reason is None
     )  # 6.4 GiB: documented cost
     monkeypatch.delenv("AITER_GEMM_FUSION_WINDOW_POLICY")
@@ -2871,7 +2871,7 @@ def test_A1_abi_pin_mismatch_refuses_arena_at_construction_and_falls_back_to_uni
         undo()
     for r in (bad, explicit):
         assert (
-            r.policy == "uniform" and r._vmm == 12 << 30 and r.window_bytes == 171966464
+            r.policy == "uniform" and r._vmm == 8 << 30 and r.window_bytes == 171966464
         )  # uniform heap/budget from the profile
     assert (
         "MORI ABI pin mismatch" in bad.policy_fallback_reason
@@ -2940,8 +2940,8 @@ def test_A1_view_readback_mismatch_refuses_arena_and_rebuilds_the_comm_as_unifor
             be.creates == 2
         )  # the comm was destroyed and recreated: NO second window size on the arena's comm
         assert (
-            r._arena is None and r._views == [] and len(r._regs) == 52
-        )  # uniform: 52 equal windows (21 plans -> 51 windows + the global page)
+            r._arena is None and r._views == [] and len(r._regs) == 46
+        )  # uniform: 40 equal windows (15 plans -> 39 windows + the global page)
         assert all(w.bytes == 171966464 for w in r._regs)
         assert any(
             "event=resources arena_refused" in m and "view read-back mismatch" in m
@@ -3224,7 +3224,7 @@ def test_init_images_written_before_finalize_survive_the_deferred_zeroing(monkey
     assert ev == ["init", "init", "init"]
 
 
-def test_policy_memory_log_lists_both_policies_and_the_arena_is_the_444_mib_budget(
+def test_policy_memory_log_lists_both_policies_and_the_arena_is_the_408_mib_budget(
     monkeypatch,
 ):
     for var in (
@@ -3243,10 +3243,10 @@ def test_policy_memory_log_lists_both_policies_and_the_arena_is_the_444_mib_budg
     assert (
         pm
         and "selected=arena" in pm[0]
-        and "uniform=8528MiB" in pm[0]
-        and "arena=444MiB" in pm[0]
+        and "uniform=7544MiB" in pm[0]
+        and "arena=408MiB" in pm[0]
     )
-    assert r._arena_size_from_budget() == 444 * MiB and r._vmm == 4 << 30
+    assert r._arena_size_from_budget() == 408 * MiB and r._vmm == 4 << 30
 
 
 # ---- test_utils: the aliasing assertion (C-S4) as free functions over a FusionResources
@@ -3369,9 +3369,9 @@ def test_test_utils_arena_probe_registers_once_checks_views_and_uses_rank_as_dev
     assert B.devs == [(0, 0), (1, 1), (2, 2), (3, 3)]  # HIP device = rank, NOT 0
     out = capsys.readouterr().out
     assert (
-        out.count("registrations=1 views=28") == 4
+        out.count("registrations=1 views=22") == 4
         and "result=FAIL" not in out
-        and out.count("view_winBase_ok=1") == 112
+        and out.count("view_winBase_ok=1") == 88
     )
     B.devs.clear()
     tu.run_arena(4 << 30, 2, 4, FakeDist(), B(), "x", device=5)
@@ -4827,20 +4827,19 @@ def test_profile_selects_r12_for_large_rows_and_rules_and_budgets_the_page():
         "r12"
     }  # 87 exact rows + the 9 fallback rules
     small = [e for e in prof.rows() if e.vid == "sp_qkv.small.v1"]
-    assert len(small) == 27 and {dict(e.params)["src"] for e in small} == {
+    assert len(small) == 24 and {dict(e.params)["src"] for e in small} == {
         "r19",
         "r20",
-        "r21",
     }  # r19 for local m <= 32, r20 (MP64) at m=64; r17/r18 stay selectable per row
     wb = prof.meta["window_budget"]
-    assert wb["shared"]["gf.global"] == 4 << 20 and wb["max_windows"] == 52
+    assert wb["shared"]["gf.global"] == 4 << 20 and wb["max_windows"] == 46
     assert (
         specs.large_cell_params("dense", 8192)
         == {**specs.LARGE_CELLS[("dense", 8192)][1], "src": "r12"}
         and specs.LARGE_PROFILE_SRC == "r12"
     )
     # the arena is the sum of the shared set and the small windows: 384 MiB (336 shared + 72 small)
-    assert sum(wb["shared"].values()) + sum(wb["small_window_sizes"]) == 444 << 20
+    assert sum(wb["shared"].values()) + sum(wb["small_window_sizes"]) == 408 << 20
 
 
 def test_prebuild_large_units_follow_the_profile_source(monkeypatch):
@@ -4885,8 +4884,8 @@ def test_prebuild_large_units_follow_the_profile_source(monkeypatch):
         _forget_sp_modules()  # a fresh import registers the variants (and their prebuild hooks) into this scratch catalog
         units, skipped = engine.plan_profile(PROFILE, recipe="aot1", tool=TOOL_SIM)
         assert (
-            skipped == [] and len(units) == 15
-        )  # 6 small (r19) + 3 (r20) + 3 (r21) + 2 large (r12) + the comm
+            skipped == [] and len(units) == 12
+        )  # 6 small (r19) + 3 small (r20) + 2 large (r12) + the comm
         assert {u.meta["src"] for u in units if u.kind == "sp_qkv.large.v1"} == {"r12"}
     finally:
         shutil.rmtree(root, ignore_errors=True)
@@ -5002,7 +5001,7 @@ def test_profile_small_rows_run_r19_with_the_r18_family_flags_and_one_unit_each(
     clear_profile_cache()
     prof = profmod.load_profile(PROFILE)
     small = [r for r in prof.rows() if r.vid == "sp_qkv.small.v1"]
-    assert len(small) == 27
+    assert len(small) == 24
     for (mode, T), (_vid, legacy) in specs.SMALL_CELLS.items():
         row_params = dict(
             prof.lookup(
@@ -5028,9 +5027,9 @@ def test_profile_small_rows_run_r19_with_the_r18_family_flags_and_one_unit_each(
     assert (
         skipped == []
         and len(smalls)
-        == 12  # 6 r19 owners (the P2 rows add none) + 3 r20 (MP64) + 3 r21 (MP128) owners
-        and {u.meta["src"] for u in smalls} == {"r19", "r20", "r21"}
-        and len({u.key for u in smalls}) == 12
+        == 9  # 6 r19 owners (the P2 rows add none) + 3 r20 (MP64) owners
+        and {u.meta["src"] for u in smalls} == {"r19", "r20"}
+        and len({u.key for u in smalls}) == 9
     )
     u = next(x for x in smalls if x.meta["src"] == "r19")
     gemm_cmd = jit.device_cmd_one("r19", u.meta["dev"], tool, "/out", "sm_gemm")
@@ -5200,7 +5199,7 @@ def test_r20_owner_is_one_per_mode_and_the_p2_rows_share_the_m16_owner(monkeypat
         owners.setdefault(mode, {})[m] = p.build_key
         assert (
             p.src == params["src"]
-            and p.mp == {"r20": 64, "r21": 128}.get(params["src"], 32)
+            and p.mp == (64 if params["src"] == "r20" else 32)
             and p.abi == 3
         )
     for mode in specs.MODES:
@@ -5212,27 +5211,25 @@ def test_r20_owner_is_one_per_mode_and_the_p2_rows_share_the_m16_owner(monkeypat
             o[16],
             o[32],
         )  # the tuned m32 cell and the r20 owner are their own
-        assert o[128] not in (o[16], o[32], o[64])  # the r21 (MP128) owner is its own
     assert (
-        len({k for o in owners.values() for k in o.values()}) == 12
-    )  # 3 modes x (m16 group, m32, r20, r21)
+        len({k for o in owners.values() for k in o.values()}) == 9
+    )  # 3 modes x (m16 group, m32, r20)
 
 
-def test_window_budget_counts_the_twelve_small_owners_and_the_mp64_mp128_geometry():
-    from collections import Counter
-
+def test_window_budget_counts_the_nine_small_owners_and_the_mp64_geometry():
     clear_profile_cache()
     wb = profmod.load_profile(PROFILE).meta["window_budget"]
-    assert wb["small_owners"] == 12 and wb["large_owners"] == 9
-    # 9 owners x (rx + ctl) at 4 MiB (r20's 2.36 / 2.62 MB Rx fits one granule) + 3 r21 owners x (8 MiB Rx view + 4 MiB control window)
-    assert Counter(wb["small_window_sizes"]) == {4 << 20: 9 * 2 + 3, 8 << 20: 3}
-    assert wb["max_windows"] == 2 * 12 + 3 * 9 + 1 == 52
-    assert sum(wb["shared"].values()) + sum(wb["small_window_sizes"]) == 444 << 20
+    assert wb["small_owners"] == 9 and wb["large_owners"] == 9
+    assert (
+        wb["small_window_sizes"] == [4 << 20] * 18
+    )  # 9 owners x (rx + ctl), each a 4 MiB view (r20's 2.36 / 2.62 MB Rx fits)
+    assert wb["max_windows"] == 2 * 9 + 3 * 9 + 1 == 46
+    assert sum(wb["shared"].values()) + sum(wb["small_window_sizes"]) == 408 << 20
     with open(profmod._resolve(PROFILE), encoding="utf-8") as f:
         doc = json.load(f)
     assert (
         doc["native_m_ranges"] == [dict(r) for r in specs.NATIVE_M_RANGES]
-        and doc["native_m_ranges"][0]["m_min"] == 129
+        and doc["native_m_ranges"][0]["m_min"] == 65
         and doc["native_m_ranges"][0]["m_max"] == 255
     )
 

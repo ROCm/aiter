@@ -120,9 +120,9 @@ def small_cell_params(mode: str, T: int) -> dict:
 # params (same build, same owner / windows / context: no new unit, no new window). R13 MP64 (r20, SM_MP 64) serves local m 33..64: an exact row at m=64 (T=256, the default
 # captured bucket) and a range rule over 33..64 (any padded T = 4 m in 132..256, e.g. a custom capture list or an eager step). r20 has ONE push shape (the r15-r18 shape switches
 # do not exist), requires rx_bypass=1 in every mode and B_HEADS=1; reuse keeps reuse_no_idx=0 (untuned). R13 MP128 (r21, SM_MP 128; its Rx needs an 8 MiB arena view) serves local m
-# 65..128: an exact row at m=128 (T=512, the default captured bucket) and a range rule over 65..128; the 33..64 -> r20 mapping is kept (BM128 is cheaper at m=64 in the M3 bench:
-# a later timing decision). r21 also supports B_HEADS=2 (nh) for an occupancy A/B. Local m 129..255 (T 516..1020) has no fused path: it is deliberately native (no row, no rule);
-# local m 256..1023 likewise (the large path starts at m=1024).
+# 65..128 (an exact row at m=128 and a range rule over 65..128 WHEN SMALL_R21_IN_PROFILE: off, see below); r21 also supports B_HEADS=2 (nh) for an occupancy A/B. Local m 65..255
+# (T 260..1020, including the default bucket T=512) has no fused path in the shipped profile: it is deliberately native (no row, no rule); local m 256..1023 likewise (the large
+# path starts at m=1024).
 SMALL_P2_M = (1, 2, 4, 8, 12)
 SMALL_R20_ROW_M = (64,)
 SMALL_R20_RULE_M = (33, 64)  # (m_min, m_max), every m (m_multiple 1)
@@ -130,13 +130,30 @@ SMALL_R20_SRC = "r20"
 SMALL_R21_ROW_M = (128,)
 SMALL_R21_RULE_M = (65, 128)  # (m_min, m_max), every m (m_multiple 1)
 SMALL_R21_SRC = "r21"
+# r21 (MP128) is NOT selected by the shipped profile: formal timing on GPU58 (two windows agreeing within 1.3 %) puts it at 0.90-0.97x of native at T=512 (m=128) in all 3 modes, so
+# m 65..255 stays explicitly native. Its source, owner support and the nh (B_HEADS) param remain for later work; flip this flag (or select r21 in a row) once an MP128 build
+# beats native. gen_profile reads it at CALL time (tests switch it on to keep the r21 profile path exercised).
+SMALL_R21_IN_PROFILE = False
 NATIVE_M_RANGES = (
     {
-        "m_min": 129,
+        "m_min": 65,
         "m_max": 255,
-        "note": "no fused path (T 516..1020): native by design; the small kernels end at m=128 (r21 MP128), the large path starts at m=1024",
+        "note": "no fused path (T 260..1020, incl. the default capture bucket T=512): native by design; the small kernels end at m=64, the large path starts at m=1024; r21 (MP128) measured 0.90-0.97x of native at T=512 (formal timing, GPU58), so it is not selected",
     },
 )
+
+
+def native_m_ranges() -> tuple[dict, ...]:
+    """The documented native ranges for the current profile definition: m 65..255 (r21 off, the shipped state) or m 129..255 (r21 on)."""
+    if not SMALL_R21_IN_PROFILE:
+        return NATIVE_M_RANGES
+    return (
+        {
+            "m_min": 129,
+            "m_max": 255,
+            "note": "no fused path (T 516..1020): native by design; the small kernels end at m=128 (r21 MP128), the large path starts at m=1024",
+        },
+    )
 
 
 def small_r20_params(mode: str) -> dict:
@@ -184,7 +201,7 @@ def small_exact_cells() -> list[tuple[str, int, str, dict]]:
             cells[m] = (vid16, {**p16, "src": SMALL_PROFILE_SRC})
         for m in SMALL_R20_ROW_M:
             cells[m] = (vid16, small_r20_params(mode))
-        for m in SMALL_R21_ROW_M:
+        for m in SMALL_R21_ROW_M if SMALL_R21_IN_PROFILE else ():
             cells[m] = (vid16, small_r21_params(mode))
         for m in sorted(cells):
             out.append((mode, m, cells[m][0], cells[m][1]))
@@ -193,14 +210,14 @@ def small_exact_cells() -> list[tuple[str, int, str, dict]]:
 
 def small_range_rules() -> list[dict]:
     """The small range rules as dicts {mode, m_min, m_max, m_multiple, vid, params, name, note}, per mode (m_multiple 1, disjoint ranges; exact rows win):
-    local m 1..16 on r19 with a COPY of the mode's m=16 params, 17..32 on r19 with a COPY of the m=32 params, 33..64 on r20 (MP64), 65..128 on r21 (MP128).
-    So eager decode and custom capture lists at ANY local m <= 128 fuse. The shape switches follow the copy: push8 (an M <= 16 shape) only below 17, b_rowsplit /
+    local m 1..16 on r19 with a COPY of the mode's m=16 params, 17..32 on r19 with a COPY of the m=32 params, 33..64 on r20 (MP64), and (only when SMALL_R21_IN_PROFILE) 65..128
+    on r21 (MP128). So eager decode and custom capture lists at ANY local m <= 64 fuse (<= 128 with r21). The shape switches follow the copy: push8 (an M <= 16 shape) only below 17, b_rowsplit /
     push_halves (M > 16 shapes) only above 16; the generator validates every covered m against the real plan constructor.
     """
     out = []
     for mode in MODES:
         vid, _p = SMALL_CELLS[(mode, 64)]
-        for lo, hi, params, label, note in (
+        ranges = [
             (
                 1,
                 16,
@@ -222,14 +239,18 @@ def small_range_rules() -> list[dict]:
                 f"mp64_m{SMALL_R20_RULE_M[0]}-{SMALL_R20_RULE_M[1]}",
                 "R13 MP64 (src r20), any padded T = 4 m in 132..256; m=64 (T=256, the default capture bucket) is an exact row",
             ),
-            (
-                SMALL_R21_RULE_M[0],
-                SMALL_R21_RULE_M[1],
-                small_r21_params(mode),
-                f"mp128_m{SMALL_R21_RULE_M[0]}-{SMALL_R21_RULE_M[1]}",
-                "R13 MP128 (src r21, 8 MiB Rx view), any padded T = 4 m in 260..512; m=128 (T=512, the default capture bucket) is an exact row",
-            ),
-        ):
+        ]
+        if SMALL_R21_IN_PROFILE:
+            ranges.append(
+                (
+                    SMALL_R21_RULE_M[0],
+                    SMALL_R21_RULE_M[1],
+                    small_r21_params(mode),
+                    f"mp128_m{SMALL_R21_RULE_M[0]}-{SMALL_R21_RULE_M[1]}",
+                    "R13 MP128 (src r21, 8 MiB Rx view), any padded T = 4 m in 260..512; m=128 (T=512, the default capture bucket) is an exact row",
+                )
+            )
+        for lo, hi, params, label, note in ranges:
             out.append(
                 {
                     "mode": mode,

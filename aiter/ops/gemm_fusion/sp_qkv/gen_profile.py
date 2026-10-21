@@ -266,7 +266,7 @@ def build_profile():
             "note": "m is local tokens per rank (T/4); exact rows plus P1 large range rules (placeholder params)",
         },
         # local m with NO fused path, routed native by design (informational: the semantics is "no row and no rule for any prefix")
-        "native_m_ranges": [dict(r) for r in specs.NATIVE_M_RANGES],
+        "native_m_ranges": [dict(r) for r in specs.native_m_ranges()],
         "rows": build_rows(),
         "rules": build_small_rules() + build_large_rules(),
     }

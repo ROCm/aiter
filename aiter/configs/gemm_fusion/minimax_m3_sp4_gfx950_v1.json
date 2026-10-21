@@ -2,16 +2,10 @@
   "profile": "minimax_m3_sp4_gfx950_v1",
   "window_budget": {
     "window_bytes": 171966464,
-    "max_windows": 52,
-    "small_owners": 12,
+    "max_windows": 46,
+    "small_owners": 9,
     "large_owners": 9,
     "small_window_sizes": [
-      8388608,
-      8388608,
-      8388608,
-      4194304,
-      4194304,
-      4194304,
       4194304,
       4194304,
       4194304,
@@ -46,9 +40,9 @@
   },
   "native_m_ranges": [
     {
-      "m_min": 129,
+      "m_min": 65,
       "m_max": 255,
-      "note": "no fused path (T 516..1020): native by design; the small kernels end at m=128 (r21 MP128), the large path starts at m=1024"
+      "note": "no fused path (T 260..1020, incl. the default capture bucket T=512): native by design; the small kernels end at m=64, the large path starts at m=1024; r21 (MP128) measured 0.90-0.97x of native at T=512 (formal timing, GPU58), so it is not selected"
     }
   ],
   "rows": [
@@ -180,23 +174,6 @@
       },
       "cell": "dense_T256",
       "note": "R13 MP64 (src r20)"
-    },
-    {
-      "sig": "50b7acf9943802c2",
-      "arch": "gfx950",
-      "cu": 256,
-      "world": 4,
-      "m": 128,
-      "vid": "sp_qkv.small.v1",
-      "params": {
-        "src": "r21",
-        "sk": 3,
-        "nh": 1,
-        "no_credit": 1,
-        "rx_bypass": 1
-      },
-      "cell": "dense_T512",
-      "note": "R13 MP128 (src r21, 8 MiB Rx view)"
     },
     {
       "sig": "9b114a3a8b31ec50",
@@ -332,23 +309,6 @@
       "note": "R13 MP64 (src r20)"
     },
     {
-      "sig": "9b114a3a8b31ec50",
-      "arch": "gfx950",
-      "cu": 256,
-      "world": 4,
-      "m": 128,
-      "vid": "sp_qkv.small.v1",
-      "params": {
-        "src": "r21",
-        "sk": 3,
-        "nh": 1,
-        "no_credit": 1,
-        "rx_bypass": 1
-      },
-      "cell": "indexer_T512",
-      "note": "R13 MP128 (src r21, 8 MiB Rx view)"
-    },
-    {
       "sig": "46e08c40c4ec4374",
       "arch": "gfx950",
       "cu": 256,
@@ -481,23 +441,6 @@
       },
       "cell": "reuse_T256",
       "note": "R13 MP64 (src r20)"
-    },
-    {
-      "sig": "46e08c40c4ec4374",
-      "arch": "gfx950",
-      "cu": 256,
-      "world": 4,
-      "m": 128,
-      "vid": "sp_qkv.small.v1",
-      "params": {
-        "src": "r21",
-        "sk": 3,
-        "nh": 1,
-        "no_credit": 1,
-        "rx_bypass": 1
-      },
-      "cell": "reuse_T512",
-      "note": "R13 MP128 (src r21, 8 MiB Rx view)"
     },
     {
       "sig": "15f0490f0df1d837",
@@ -1868,25 +1811,6 @@
       "note": "R13 MP64 (src r20), any padded T = 4 m in 132..256; m=64 (T=256, the default capture bucket) is an exact row"
     },
     {
-      "sig": "50b7acf9943802c2",
-      "arch": "gfx950",
-      "cu": 256,
-      "world": 4,
-      "m_min": 65,
-      "m_max": 128,
-      "m_multiple": 1,
-      "vid": "sp_qkv.small.v1",
-      "params": {
-        "src": "r21",
-        "sk": 3,
-        "nh": 1,
-        "no_credit": 1,
-        "rx_bypass": 1
-      },
-      "name": "dense_mp128_m65-128",
-      "note": "R13 MP128 (src r21, 8 MiB Rx view), any padded T = 4 m in 260..512; m=128 (T=512, the default capture bucket) is an exact row"
-    },
-    {
       "sig": "9b114a3a8b31ec50",
       "arch": "gfx950",
       "cu": 256,
@@ -1941,25 +1865,6 @@
       },
       "name": "indexer_mp64_m33-64",
       "note": "R13 MP64 (src r20), any padded T = 4 m in 132..256; m=64 (T=256, the default capture bucket) is an exact row"
-    },
-    {
-      "sig": "9b114a3a8b31ec50",
-      "arch": "gfx950",
-      "cu": 256,
-      "world": 4,
-      "m_min": 65,
-      "m_max": 128,
-      "m_multiple": 1,
-      "vid": "sp_qkv.small.v1",
-      "params": {
-        "src": "r21",
-        "sk": 3,
-        "nh": 1,
-        "no_credit": 1,
-        "rx_bypass": 1
-      },
-      "name": "indexer_mp128_m65-128",
-      "note": "R13 MP128 (src r21, 8 MiB Rx view), any padded T = 4 m in 260..512; m=128 (T=512, the default capture bucket) is an exact row"
     },
     {
       "sig": "46e08c40c4ec4374",
@@ -2017,25 +1922,6 @@
       },
       "name": "reuse_mp64_m33-64",
       "note": "R13 MP64 (src r20), any padded T = 4 m in 132..256; m=64 (T=256, the default capture bucket) is an exact row"
-    },
-    {
-      "sig": "46e08c40c4ec4374",
-      "arch": "gfx950",
-      "cu": 256,
-      "world": 4,
-      "m_min": 65,
-      "m_max": 128,
-      "m_multiple": 1,
-      "vid": "sp_qkv.small.v1",
-      "params": {
-        "src": "r21",
-        "sk": 3,
-        "nh": 1,
-        "no_credit": 1,
-        "rx_bypass": 1
-      },
-      "name": "reuse_mp128_m65-128",
-      "note": "R13 MP128 (src r21, 8 MiB Rx view), any padded T = 4 m in 260..512; m=128 (T=512, the default capture bucket) is an exact row"
     },
     {
       "sig": "15f0490f0df1d837",
