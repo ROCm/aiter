@@ -53,6 +53,7 @@ def _launcher(
     prefetch=True,
     exact_scale_edge=False,
     split_k=1,
+    shuffled_w=False,
 ):
     if block_m % 16 or block_n % 16 or K % (32 * unroll):
         raise ValueError("MFMA requires M/N tiles divisible by 16 and aligned K")
@@ -82,6 +83,21 @@ def _launcher(
     if mxfp4_reg and K % 128:
         raise ValueError("MXFP4 register path needs K divisible by 128")
     a_load_vec = 8
+    if shuffled_w and not mxfp4:
+        raise ValueError("shuffled weight layout is MXFP4-only")
+
+    def w_byte(col, kb):
+        """Byte offset of packed-FP4 weight (row ``col``, K byte ``kb``) inside one expert."""
+        if fx.const_expr(shuffled_w):
+            kb16 = kb // 16
+            return (
+                (col // 16) * (w_k // 64 * 1024)
+                + (kb16 // 4) * 1024
+                + (kb16 % 4) * 256
+                + (col % 16) * 16
+                + kb % 16
+            )
+        return col * w_k + kb
 
     @fx.struct
     class SharedTiles:
@@ -153,7 +169,7 @@ def _launcher(
     def load_weight(resource, scales, col, k_base):
         if fx.const_expr(mxfp4):
             packed = buffer_ops.buffer_load(
-                resource, (col * w_k + k_base // 2) // 4, vec_width=1, dtype=T.i32
+                resource, w_byte(col, k_base // 2) // 4, vec_width=1, dtype=T.i32
             )
             scale = buffer_ops.buffer_load(
                 scales, col * (K // 32) + k_base // 32, vec_width=1, dtype=T.i8
@@ -348,7 +364,7 @@ def _launcher(
                                 words.append(
                                     buffer_ops.buffer_load(
                                         b_r,
-                                        (col * w_k + load_k // 2) // 4,
+                                        w_byte(col, load_k // 2) // 4,
                                         vec_width=4,
                                         dtype=T.i32,
                                     )
@@ -532,7 +548,7 @@ def _launcher(
                                     for q in range_constexpr(scale_count):
                                         packed = buffer_ops.buffer_load(
                                             b_r,
-                                            (col * w_k + tile_k // 2 + q * 16) // 4,
+                                            w_byte(col, tile_k // 2 + q * 16) // 4,
                                             vec_width=4,
                                             dtype=T.i32,
                                         )
@@ -955,6 +971,7 @@ def launch_muse_moe_gemm(
             bool(cfg.get("FLYDSL_PREFETCH", True)),
             bool(cfg.get("FLYDSL_EXACT_SCALE_EDGE", False)),
             split_k,
+            bool(cfg.get("FLYDSL_SHUFFLED_W", False)),
         ),
         a,
         b,
