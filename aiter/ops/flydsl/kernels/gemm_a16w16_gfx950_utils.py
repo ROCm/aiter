@@ -3,7 +3,6 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import (
     const_expr,
@@ -11,7 +10,6 @@ from flydsl.expr import (
     range_constexpr,
     rocdl,
 )
-from flydsl.expr.typing import T
 
 from .tensor_shim import buf_base_i64
 
@@ -25,10 +23,19 @@ def wait_vmcnt_and_barrier(vmcnt=0):
     rocdl.s_barrier()
 
 
-def get_llvm_ptr(ptr, offset, dtype_bytes, ptr_type):
-    byte_offset = fx.Int64(fx.Index(offset) * fx.Index(dtype_bytes))
+def get_llvm_ptr(ptr, offset, dtype_bytes):
+    byte_offset = fx.Int64(offset) * dtype_bytes
     address = buf_base_i64(ptr) + byte_offset
-    return llvm.IntToPtrOp(ptr_type, address.ir_value()).result
+    ptr_type = fx.PointerType.get(fx.Int8.ir_type, fx.AddressSpace.Global, 1)
+    return fx.to_llvm_ptr(fx.inttoptr(ptr_type, address))
+
+
+def _global_sync_ptr(ptr, offset, dtype):
+    """Naturally aligned global pointer for split-K tickets and signals."""
+    size = dtype.width // 8
+    address = buf_base_i64(ptr) + fx.Int64(offset) * size
+    ptr_type = fx.PointerType.get(dtype.ir_type, fx.AddressSpace.Global, size)
+    return fx.inttoptr(ptr_type, address)
 
 
 def store_global_f32_vec(c_ptr, global_offset, vec, vec_size):
@@ -40,7 +47,6 @@ def store_global_f32_vec(c_ptr, global_offset, vec, vec_size):
             c_ptr,
             global_offset + vec_idx * 4,
             4,
-            ir.Type.parse("!llvm.ptr<1>"),
         )
         llvm.InlineAsmOp(
             None,
@@ -183,7 +189,6 @@ class SplitKProtocol:
                             self.c_ptr,
                             c_offset,
                             self.C_DTYPE_BYTES,
-                            ir.Type.parse("!llvm.ptr<1>"),
                         )
                         llvm.InlineAsmOp(
                             None,
@@ -203,21 +208,10 @@ class SplitKProtocol:
         # ever uses the tag (it publishes and it spins), so it stays in a register.
         expected = fx.Int32(0)
         if self.tid == 0:
-            semaphore_ptr = get_llvm_ptr(
-                self.semaphore_ptr,
-                self.signal_idx,
-                8,
-                ir.Type.parse("!llvm.ptr<1>"),
-            )
-            ticket = fx.Int64(
-                llvm.AtomicRMWOp(
-                    llvm.AtomicBinOp.add,
-                    semaphore_ptr,
-                    fx.Int64(1).ir_value(),
-                    llvm.AtomicOrdering.monotonic,
-                    syncscope="agent",
-                    alignment=8,
-                ).result
+            ticket = fx.atomic_add(
+                _global_sync_ptr(self.semaphore_ptr, self.signal_idx, fx.Int64),
+                fx.Int64(1),
+                syncscope="agent",
             )
             expected = (ticket // split_k.to(fx.Int64) + 1).to(fx.Int32)
         return expected
@@ -229,17 +223,10 @@ class SplitKProtocol:
             rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
             if self.tid == 0:
-                signal_ptr = get_llvm_ptr(
-                    self.signal_ptr,
-                    self.signal_idx,
-                    4,
-                    ir.Type.parse("!llvm.ptr<1>"),
-                )
-                llvm.StoreOp(
-                    expected.ir_value(),
-                    signal_ptr,
-                    alignment=4,
-                    ordering=llvm.AtomicOrdering.monotonic,
+                fx.generic_store(
+                    _global_sync_ptr(self.signal_ptr, self.signal_idx, fx.Int32),
+                    expected,
+                    memory_order=fx.AtomicOrdering.Monotonic,
                     syncscope="agent",
                 )
 
@@ -250,20 +237,10 @@ class SplitKProtocol:
             # launch's tag. cur starts off the tag to force at least one load.
             cur = expected + 1
             while cur != expected:
-                signal_ptr = get_llvm_ptr(
-                    self.signal_ptr,
-                    self.signal_idx,
-                    4,
-                    ir.Type.parse("!llvm.ptr<1>"),
-                )
-                cur = fx.Int32(
-                    llvm.LoadOp(
-                        T.i32,
-                        signal_ptr,
-                        alignment=4,
-                        ordering=llvm.AtomicOrdering.monotonic,
-                        syncscope="agent",
-                    ).result
+                cur = fx.generic_load(
+                    _global_sync_ptr(self.signal_ptr, self.signal_idx, fx.Int32),
+                    memory_order=fx.AtomicOrdering.Monotonic,
+                    syncscope="agent",
                 )
         rocdl.sched_barrier(0)
         gpu.barrier()
