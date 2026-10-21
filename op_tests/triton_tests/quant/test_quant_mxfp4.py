@@ -596,7 +596,7 @@ def _mxfp4_quant_op_kernel(
 def test_mxfp4_quant_op_asm_matches_bits(scaling_mode):
     torch.manual_seed(scaling_mode)
     m, n = 1024, 128
-    x = torch.randn(m, n, device="cuda") * torch.exp2(
+    x = torch.randn(m, n, dtype=torch.float32, device="cuda") * torch.exp2(
         torch.randint(-140, 120, (m, 1), device="cuda").float()
     )
     # Rounding ties, -0.0 and an all-zero block.
