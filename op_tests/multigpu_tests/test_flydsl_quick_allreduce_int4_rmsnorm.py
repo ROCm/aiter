@@ -213,30 +213,34 @@ def _run_rank(rank, tp, init_method, cases, time_it):
                 "inplace": inplace,
                 "sqnr_out_db": _sqnr_db(out.float(), ref_out.float()),
                 "sqnr_res_db": _sqnr_db(res_out.float(), ref_res.float()),
-                "err_out_vs_unfused": 0.0
-                if not same_cfg
-                else float(
-                    checkAllclose(
-                        unf_out.float(),
-                        out.float(),
-                        rtol=TIGHT_RTOL,
-                        atol=TIGHT_ATOL,
-                        tol_err_ratio=TIGHT_ERR_RATIO,
-                        printLog=False,
-                        msg=f"{tag} out",
+                "err_out_vs_unfused": (
+                    0.0
+                    if not same_cfg
+                    else float(
+                        checkAllclose(
+                            unf_out.float(),
+                            out.float(),
+                            rtol=TIGHT_RTOL,
+                            atol=TIGHT_ATOL,
+                            tol_err_ratio=TIGHT_ERR_RATIO,
+                            printLog=False,
+                            msg=f"{tag} out",
+                        )
                     )
                 ),
-                "err_res_vs_unfused": 0.0
-                if not same_cfg
-                else float(
-                    checkAllclose(
-                        unf_res.float(),
-                        res_out.float(),
-                        rtol=TIGHT_RTOL,
-                        atol=TIGHT_ATOL,
-                        tol_err_ratio=TIGHT_ERR_RATIO,
-                        printLog=False,
-                        msg=f"{tag} residual_out",
+                "err_res_vs_unfused": (
+                    0.0
+                    if not same_cfg
+                    else float(
+                        checkAllclose(
+                            unf_res.float(),
+                            res_out.float(),
+                            rtol=TIGHT_RTOL,
+                            atol=TIGHT_ATOL,
+                            tol_err_ratio=TIGHT_ERR_RATIO,
+                            printLog=False,
+                            msg=f"{tag} residual_out",
+                        )
                     )
                 ),
                 "ranks_equal": same_out and same_res,

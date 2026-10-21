@@ -32,7 +32,6 @@ from flydsl.expr.typing import Int32, Int64, ReductionOp, Stream, T, as_ir_value
 
 from .. import buffer_ops
 from ..quant_utils import emit_mx_e8m0_scale
-
 from .allreduce_shared import (
     _INBOX_POLICY,
     ATOMS,
@@ -46,7 +45,6 @@ from .allreduce_shared import (
     SUPPORTED_WORLDS,
     TILE_BYTES,
     WAVE,
-    WAVES,
     WORLD,
     _acquire_inbox,
     _buffer_load,
