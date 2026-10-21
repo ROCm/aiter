@@ -7,10 +7,9 @@
 // q: E4M3 [T,32,512]; out: BF16 [T,32,512].
 // kv: E4M3 rows at slot*kv_stride_bytes; first 512 bytes are latent, rows aligned to 16.
 // idx: int32 [T,topk]; topk is a positive multiple of 128, <=2304.
-// Slots outside [0,num_slots) are masked. Workspace: hk_sparse_mla_workspace_bytes.
+// Slots outside [0,num_slots) are masked. No workspace is needed.
 #pragma once
 #include <hip/hip_runtime.h>
-#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,15 +17,11 @@ extern "C" {
 
 enum HkSparseMlaStatus : int
 {
-    HK_SPARSE_MLA_OK              = 0,
-    HK_SPARSE_MLA_BAD_SHAPE       = -1,
-    HK_SPARSE_MLA_LAUNCH_FAILED   = -2,
-    HK_SPARSE_MLA_SMALL_WORKSPACE = -3,
+    HK_SPARSE_MLA_OK            = 0,
+    HK_SPARSE_MLA_BAD_SHAPE     = -1,
+    HK_SPARSE_MLA_LAUNCH_FAILED = -2,
 };
 
-int hk_sparse_mla_splits(int T, int topk);
-// Zero workspace for one split.
-size_t hk_sparse_mla_workspace_bytes(int T, int topk);
 // Returns HkSparseMlaStatus; graph-capturable on stream.
 int hk_sparse_mla_fwd(const void* q,
                       const void* kv,
@@ -37,8 +32,6 @@ int hk_sparse_mla_fwd(const void* q,
                       long kv_stride_bytes,
                       long num_slots,
                       float sm_scale,
-                      void* workspace,
-                      size_t ws_bytes,
                       hipStream_t stream);
 
 #ifdef __cplusplus

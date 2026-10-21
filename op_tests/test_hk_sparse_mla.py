@@ -3,7 +3,7 @@
 
 """Correctness + perf for the HipKittens sparse MLA (DSA) forward against an fp32 torch reference.
 
-Covers split-K decode (small T) and prefill, kpool-tail index padding, masked keys (-1 and slots past the pool),
+Covers small and large query batches, kpool-tail index padding, masked keys (-1 and slots past the pool),
 dense 512-byte rows and a KV pool past 4 GiB (64-bit gather addresses).
 """
 
@@ -15,39 +15,11 @@ import torch
 import aiter
 from aiter.ops.hk_sparse_mla import DIM, HEADS, hk_sparse_mla_fwd
 from aiter.test_common import perftest
+from op_tests.hk_sparse_mla_utils import make_inputs, rand_fp8, reference, rel_err
 
 FP8 = torch.float8_e4m3fn
 # fp8 q / kv rounding is shared with the reference; the rest is fp8 P (x448) and the bf16 output.
 TOL = 0.04
-
-
-def make_inputs(T, num_slots, topk_real, topk, row_bytes):
-    """Random fp8 q / kv; topk_real random indices, then 3 live tail slots and -1 padding up to topk."""
-    q = (torch.randn(T, HEADS, DIM, device="cuda") * 0.4).to(FP8)
-    kv = (torch.randn(num_slots, 1, row_bytes, device="cuda") * 0.4).to(FP8)
-    idx = torch.randint(0, num_slots, (T, topk), device="cuda", dtype=torch.int32)
-    idx[:, topk_real:] = -1
-    if topk > topk_real:
-        idx[:, topk_real : topk_real + 3] = torch.randint(
-            0, num_slots, (T, 3), device="cuda", dtype=torch.int32
-        )
-    idx[:, ::7] = -1  # scattered masked keys
-    return q, kv, idx
-
-
-def reference(q, kv, idx, sm_scale, rows):
-    out = []
-    for t in rows:
-        valid = (idx[t] >= 0) & (idx[t] < kv.shape[0])
-        k = kv[idx[t].clamp(0, kv.shape[0] - 1).long(), 0, :DIM].float()
-        s = (q[t].float() @ k.T) * sm_scale
-        s[:, ~valid] = -float("inf")
-        out.append(torch.softmax(s, -1).nan_to_num() @ k)
-    return torch.stack(out)
-
-
-def rel_err(out, ref):
-    return ((out.float() - ref).norm() / ref.norm().clamp_min(1e-12)).item()
 
 
 @perftest()
@@ -90,10 +62,10 @@ def test_large_pool():
     """A pool past 4 GiB: slots on both sides of the 4 GiB mark."""
     num_slots = (5 << 30) // 576
     torch.manual_seed(5)
-    q = (torch.randn(64, HEADS, DIM, device="cuda") * 0.4).to(FP8)
+    q = rand_fp8((64, HEADS, DIM))
     kv = torch.empty(num_slots, 1, 576, dtype=FP8, device="cuda")
-    kv[:8192] = (torch.randn(8192, 1, 576, device="cuda") * 0.4).to(FP8)
-    kv[-8192:] = (torch.randn(8192, 1, 576, device="cuda") * 0.4).to(FP8)
+    kv[:8192] = rand_fp8((8192, 1, 576))
+    kv[-8192:] = rand_fp8((8192, 1, 576))
     idx = torch.randint(
         num_slots - 8192, num_slots, (64, 2048), device="cuda", dtype=torch.int32
     )
@@ -173,7 +145,7 @@ def test_replay():
                 idx[:, -1] = 0
             else:
                 idx.fill_(2**31 - 1)
-            q.copy_((torch.randn_like(q, dtype=torch.float32) * 0.4).to(FP8))
+            q.copy_(rand_fp8(q.shape))
             graph.replay()
             first = out.clone()
             graph.replay()
@@ -230,11 +202,11 @@ if __name__ == "__main__":
         results = [test_case(T, 2048, 2048) for T in args.tokens]
     else:
         results = [
-            test_case(1, 2048, 2048),  # decode: split-K + combine
+            test_case(1, 2048, 2048),
             test_case(8, 2048, 2048),
             test_case(32, 2048, 2051),  # kpool tail, padded to a 128 multiple by the op
             test_case(128, 2048, 2048),
-            test_case(512, 2048, 2048),  # no split
+            test_case(512, 2048, 2048),
             test_case(4096, 2048, 2176),
             test_case(16384, 2048, 2048, row_bytes=512),  # prefill, dense rows
             test_case(64, 1024, 1024),  # short context

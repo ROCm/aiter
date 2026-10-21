@@ -4,7 +4,6 @@
 
 import argparse
 import gc
-import importlib.util
 import json
 import os
 import statistics
@@ -14,14 +13,9 @@ from pathlib import Path
 
 import torch
 
+from op_tests.hk_sparse_mla_utils import rand_fp8, reference, rel_err
+
 ROOT = Path(__file__).resolve().parents[2]
-
-
-def module(path, name):
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
 
 
 def capture(fn):
@@ -58,7 +52,7 @@ def measure(graphs, rounds, flush=None):
 
 
 def accuracy(out, ref, rows, tolerance):
-    error = ((out[rows].float() - ref).norm() / ref.norm().clamp_min(1e-12)).item()
+    error = rel_err(out[rows], ref)
     finite = torch.isfinite(out).all().item()
     assert finite and error < tolerance, (error, finite, tolerance)
     return {"relative_l2": error, "all_finite": finite}
@@ -72,7 +66,6 @@ def sparse():
     )
     from aiter.ops.triton.attention.sparse_mla import sparse_mla_fwd
 
-    tests = module(ROOT / "op_tests/test_hk_sparse_mla.py", "hk_tests")
     one = torch.ones(1, dtype=torch.float32, device="cuda")
     flush = torch.empty(512 << 20, dtype=torch.uint8, device="cuda")
     result = {
@@ -103,9 +96,7 @@ def sparse():
         kv = torch.empty(slots, 512, dtype=torch.float8_e4m3fn, device="cuda")
         for first in range(0, slots, 65536):
             n = min(65536, slots - first)
-            kv[first : first + n] = (torch.randn(n, 512, device="cuda") * 0.4).to(
-                kv.dtype
-            )
+            kv[first : first + n] = rand_fp8((n, 512))
         kv_bf16 = kv.to(torch.bfloat16)
         kv_nope = torch.zeros_like(kv)
         kv_rope = kv[:, 448:].to(torch.bfloat16).contiguous()
@@ -114,11 +105,11 @@ def sparse():
         sink = torch.full((32,), float("-inf"), dtype=torch.float32, device="cuda")
         for T in (1, 8, 32, 128, 512, 2048, 8192, 16384):
             torch.manual_seed(T + slots)
-            q = (torch.randn(T, 32, 512, device="cuda") * 0.4).to(kv.dtype)
+            q = rand_fp8((T, 32, 512))
             ids = torch.randint(slots, (T, K), device="cuda", dtype=torch.int32)
             indptr = torch.arange(T + 1, device="cuda", dtype=torch.int32) * K
             rows = list(range(0, T, max(1, T // 16)))[:16]
-            expected = tests.reference(q, kv[:, None, :], ids, 512**-0.5, rows)
+            expected = reference(q, kv[:, None, :], ids, 512**-0.5, rows)
             calls = {"hk": partial(hk_sparse_mla_fwd, q, kv, ids, 512**-0.5)}
             for precision in ("fp8", "bf16"):
                 for split in (None, 1, 2, 4, 8, 16, 32):
@@ -222,14 +213,14 @@ def sparse():
             phases = []
             for seed in (1701, 2701):
                 torch.manual_seed(seed + T)
-                q.copy_((torch.randn(T, 32, 512, device="cuda") * 0.4).to(kv.dtype))
+                q.copy_(rand_fp8((T, 32, 512)))
                 ids.copy_(
                     torch.randint(slots, (T, K), device="cuda", dtype=torch.int32)
                 )
                 q_bf16.copy_(q)
                 q_nope[:, :, :448].copy_(q[:, :, :448])
                 q_rope.copy_(q[:, :, 448:])
-                expected = tests.reference(q, kv[:, None, :], ids, 512**-0.5, rows)
+                expected = reference(q, kv[:, None, :], ids, 512**-0.5, rows)
                 for graph in graphs.values():
                     graph.replay()
                 torch.cuda.synchronize()

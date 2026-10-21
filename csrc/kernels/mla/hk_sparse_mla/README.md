@@ -2,7 +2,7 @@
 
 DeepSeek Sparse Attention's attention step: every query token attends to its own list of `topk` selected KV slots.
 All heads share one latent KV row (MQA), so the same row is both K and V. Exposed as `aiter.hk_sparse_mla_fwd` (JIT
-module `module_hk_sparse_mla`, ctypes entry points in `hk_sparse_mla_entry.cu`). The kernel implementation is
+module `module_hk_sparse_mla`, ctypes entry point in `hk_sparse_mla_entry.cu`). The kernel implementation is
 maintained here in AITER; HipKittens provides the tile and MMA primitives.
 
 ```
@@ -18,25 +18,23 @@ out[t][h][:] = softmax_k(q[t][h] . kv[idx[t][k]] * sm_scale) @ kv[idx[t][k]][:51
 | `idx` | `[T][topk]` int32 slots; `idx < 0` is masked. `topk` must be a positive multiple of 128, up to 2304: pad with -1 |
 | `out` | `[T][32][512]` bf16 |
 | numerics | fp32 scores, P quantized as fp8(P * 448) before PV (same as the TileLang kernel); a row with no valid key outputs 0 |
-| workspace | `hk_sparse_mla_workspace_bytes(T, topk)` bytes (0 when no split is used). The fp32 partials for the split-K path; allocate once for the largest decode batch, before graph capture |
 
 ```c
 int    hk_sparse_mla_fwd(const void *q, const void *kv, const int *idx, void *out, int T, int topk,
-                         long kv_stride_bytes, long num_slots, float sm_scale, void *workspace, size_t ws_bytes,
-                         hipStream_t stream);
-size_t hk_sparse_mla_workspace_bytes(int T, int topk);
-int    hk_sparse_mla_splits(int T, int topk);   // key splits per token chosen for T
+                         long kv_stride_bytes, long num_slots, float sm_scale, hipStream_t stream);
 ```
 
-`hk_sparse_mla_fwd` returns 0, -1 (unsupported topk, misaligned kv or `num_slots` outside `[1, 2^31)`), -2 (launch failed) or -3 (workspace too small).
+`hk_sparse_mla_fwd` returns 0, -1 (invalid shape, alignment or scale), or -2 (launch failed).
 Any other head count or latent size is not supported, so callers fall back to another kernel.
+Each query uses one workgroup without a workspace. Use HK for batches of at least 512 queries;
+callers should dispatch smaller batches to Gluon. This wrapper does not select a fallback.
 
 ## Design
 
-- One 512-thread workgroup (8 waves, two per SIMD) per (token, key split), in 128-key blocks. Each wave scores 16
+- One 512-thread workgroup (8 waves, two per SIMD) per token, in 128-key blocks. Each wave scores 16
   keys of the block and accumulates 64 output dims. The second wave per SIMD hides part of the other's LDS and
   MFMA latency.
-- The split's index list is staged in LDS once.
+- The query's index list is staged in LDS once.
 - A KV block is four HipKittens `st_fp8e4m3<128, 128>` shared tiles (st_16x128 swizzle), double-buffered. KV rows
   are gathered straight into them with `buffer_load ... lds`, where each lane's buffer offset is its slot times
   the row stride. Wave w fills the tile for dims 128w.
@@ -55,15 +53,12 @@ Any other head count or latent size is not supported, so callers fall back to an
 - Scores are computed as `S^T = K Q^T`, so each lane holds 4 consecutive keys of one head. The softmax row max and sum
   then reduce with `permlane16/32_swap` instead of LDS round trips.
 - `PV` reads V one 16-dim tile ahead of its MFMA.
-- Small T (decode) splits each token's keys across workgroups until the grid covers the CUs. Each split writes an
-  output normalized by its own sum, plus a log2-sum-exp per head. A combine kernel merges the splits.
-- Registers: the forward kernel uses 195 VGPR with no spills (1 workgroup per CU); the combine kernel uses 175 VGPR.
-  Check with `hipcc ... --cuda-device-only -S` (see the MoE README for the flags).
+- Check registers and spills with `hipcc ... --cuda-device-only -S` (see the MoE README for the flags).
 
 ## Build and test
 
 aiter JIT-builds the module on first use, with HipKittens headers from `HIP_KITTENS_DIR` (fetched at the pinned
-commit by default). `op_tests/test_hk_sparse_mla.py` checks against an fp32 reference: prefill and split-K decode,
+commit by default). `op_tests/test_hk_sparse_mla.py` checks against an fp32 reference: small and large query batches,
 masked keys, padded top-k, slots past the pool and a pool past 4 GiB.
 
 Run `python op_tests/test_hk_sparse_mla.py` on gfx950. The suite also checks changed-input graph
@@ -80,7 +75,7 @@ be contiguous, 16-byte aligned, and use separate storage from the inputs. Warm t
 python op_tests/op_benchmarks/bench_hk_sparse_mla.py --output /tmp/hk-sparse-benchmark.json
 ```
 
-The benchmark tests FP8 and BF16 compute and the default split count plus 1, 2, 4, 8, 16 and 32.
+The benchmark tests AITER FP8 and BF16 compute and the default split count plus 1, 2, 4, 8, 16 and 32.
 It checks accuracy before selecting candidates, then confirms the fastest candidates and both defaults
 with two fresh input seeds. Cases cover 1 to 16384 queries and 8 MiB / 5 GiB KV pools. All selected
 slots are valid, so AITER can use its asynchronous LDS path. HK pads its index rows inside the call.

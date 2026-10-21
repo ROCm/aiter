@@ -18,14 +18,6 @@ HEADS, DIM, MAX_TOPK, KEY_BLOCK = 32, 512, 2304, 128
 
 
 @compile_ops(
-    "module_hk_sparse_mla",
-    fc_name="aiter_hk_sparse_mla_workspace_units",
-    ffi_type="ctypes",
-)
-def _hk_sparse_mla_workspace_units(num_tokens: int, topk: int) -> int: ...
-
-
-@compile_ops(
     "module_hk_sparse_mla", fc_name="aiter_hk_sparse_mla_fwd", ffi_type="ctypes"
 )
 def _hk_sparse_mla_fwd_raw(
@@ -38,8 +30,6 @@ def _hk_sparse_mla_fwd_raw(
     kv_stride_bytes: int,
     num_slots: int,
     sm_scale: float,
-    workspace: int,
-    workspace_bytes: int,
 ) -> None: ...
 
 
@@ -54,9 +44,9 @@ def hk_sparse_mla_fwd(
 
     q [T, 32, 512] (cast to kv's fp8 dtype); kv [N, ..., >= 512] fp8 e4m3 whose rows are addressed by
     kv.stride(0) (the first 512 entries are the latent; rows 16-byte aligned); indices [T, topk] int32 slots,
-    -1 or >= N masked, padded here to a multiple of 128. Returns bf16 [T, 32, 512]. Small T splits each token's
-    keys and merges the partials; their workspace comes from torch's caching allocator, so the call is
-    graph-capturable.
+    -1 or >= N masked, padded here to a multiple of 128. Returns bf16 [T, 32, 512].
+    Uses one workgroup per query without a workspace. Optimized for T >= 512;
+    callers should dispatch smaller batches to another backend. Warm the JIT before graph capture.
     """
     if not q.is_cuda:
         raise ValueError("hk_sparse_mla_fwd: q must be on a HIP device")
@@ -137,11 +127,6 @@ def hk_sparse_mla_fwd(
             f"hk_sparse_mla_fwd: at most {MAX_TOPK} indices per token, got {topk}"
         )
     with torch.cuda.device(q.device):
-        ws = torch.empty(
-            max(_hk_sparse_mla_workspace_units(T, topk) * 256, 1),
-            dtype=torch.uint8,
-            device=q.device,
-        )
         _hk_sparse_mla_fwd_raw(
             q.data_ptr(),
             kv.data_ptr(),
@@ -152,7 +137,5 @@ def hk_sparse_mla_fwd(
             kv.stride(0) * kv.element_size(),
             kv.shape[0],
             float(sm_scale),
-            ws.data_ptr(),
-            ws.numel(),
         )
     return out

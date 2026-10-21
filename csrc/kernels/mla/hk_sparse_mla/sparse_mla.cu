@@ -3,8 +3,7 @@
 //
 // gfx950 sparse MLA, H32/D512. Contract: sparse_mla.h; design: README.md.
 // Q/KV are unscaled E4M3; scores accumulate in FP32, P is quantized as FP8(P*448).
-// Each workgroup handles one (query, key split), double-buffering 128-key KV blocks.
-// Small batches split keys and combine normalized outputs via log-sum-exp.
+// Each workgroup handles one query, double-buffering 128-key KV blocks.
 #include "sparse_mla.h"
 
 #include <cmath>
@@ -90,29 +89,21 @@ __global__ __launch_bounds__(NT, 1) void sparse_mla_fwd(const uint8_t* __restric
                                                         int topk,
                                                         long kv_stride,
                                                         int num_slots,
-                                                        float sc /* sm_scale * log2(e) */,
-                                                        int nsplit,
-                                                        float* __restrict__ part_o,
-                                                        float* __restrict__ part_lse)
+                                                        float sc /* sm_scale * log2(e) */)
 {
     const auto one = kittens::base_types::constants<kittens::fp8e8m0_4>::one();
 
-    // Splits write normalized FP32 [T,nsplit,H,D] outputs and [T,nsplit,H] log2-sums.
     __shared__ KvTile kvs[2][D / 128]; // 128 KB
     __shared__ PTile ps;               // 4 KB
     __shared__ int idx_all[MAX_TOPK];
     __shared__ float mx_s[NW][H];
     __shared__ float al_s[H];
     __shared__ float l_s[NW][H];
-    __shared__ float m_s[H];
 
-    const int tok = blockIdx.x / nsplit, split = blockIdx.x % nsplit, tid = threadIdx.x,
-              w = tid / 64, l = tid % 64, lr = l % 16, lg = l / 16;
-    const int nblk_all = topk / BI;
-    const int b0       = (int)((long)nblk_all * split / nsplit),
-              b1       = (int)((long)nblk_all * (split + 1) / nsplit);
-    const int nblk     = b1 - b0;
-    const int* ix      = idx + (size_t)tok * topk + b0 * BI; // Split-local keys.
+    const int tok = blockIdx.x, tid = threadIdx.x, w = tid / 64, l = tid % 64, lr = l % 16,
+              lg   = l / 16;
+    const int nblk = topk / BI;
+    const int* ix  = idx + (size_t)tok * topk;
 
     // Q is MFMA operand B: qt[ks] subtile ht covers heads 16*ht.., dims 128*ks...
     OpTile qt[4];
@@ -315,15 +306,13 @@ __global__ __launch_bounds__(NT, 1) void sparse_mla_fwd(const uint8_t* __restric
         }
     }
 
-// Normalize outputs; write BF16 or FP32 split partials.
+// Normalize outputs and round to BF16.
 #pragma unroll
     for(int ht = 0; ht < 2; ht++)
     {
         const float v = rows_sum(l_run[ht]);
         if(lg == 0)
             l_s[w][16 * ht + lr] = v;
-        if(lg == 0 && w == 0)
-            m_s[16 * ht + lr] = m_run[ht];
     }
     __syncthreads();
 #pragma unroll
@@ -337,106 +326,19 @@ __global__ __launch_bounds__(NT, 1) void sparse_mla_fwd(const uint8_t* __restric
             for(int i = 1; i < NW; i++)
                 lt += l_s[i][h];
             const float inv = lt > 0.f ? 1.f / (lt * P_SCALE) : 0.f;
-            if(nsplit == 1)
-            {
-                uint16_t* orow = out + ((size_t)tok * H + h) * D + DPW * w + lr;
+            uint16_t* orow  = out + ((size_t)tok * H + h) * D + DPW * w + lr;
 #pragma unroll
-                for(int dt = 0; dt < DT; dt++)
-                {
-                    const float v       = acc4(o[dt], ht, 0)[r] * inv;
-                    const uint32_t bits = __float_as_uint(v);
-                    orow[16 * dt]       = (uint16_t)((bits + 0x7fff + ((bits >> 16) & 1)) >>
-                                               16); // BF16, round to nearest even.
-                }
-            }
-            else
+            for(int dt = 0; dt < DT; dt++)
             {
-                const size_t pr = ((size_t)tok * nsplit + split) * H + h;
-                float* orow     = part_o + pr * D + DPW * w + lr;
-#pragma unroll
-                for(int dt = 0; dt < DT; dt++)
-                    orow[16 * dt] = acc4(o[dt], ht, 0)[r] * inv;
-                if(w == 0 && lr == 0)
-                    part_lse[pr] = lt > 0.f ? log2f(lt) + m_s[h] * sc : -INFINITY;
+                const float v       = acc4(o[dt], ht, 0)[r] * inv;
+                const uint32_t bits = __float_as_uint(v);
+                orow[16 * dt]       = (uint16_t)((bits + 0x7fff + ((bits >> 16) & 1)) >> 16);
             }
         }
 }
 
-// Merge partials weighted by exp2(lse_s - max_lse), then normalize.
-// One workgroup per (token, four heads); preload all splits.
-constexpr int MAX_SPLITS = MAX_TOPK / BI;
-__global__ __launch_bounds__(256) void sparse_mla_combine(const float* __restrict__ part_o,
-                                                          const float* __restrict__ part_lse,
-                                                          uint16_t* __restrict__ out,
-                                                          int nsplit)
-{
-    const int tok = blockIdx.x / (H / 4), h = (blockIdx.x % (H / 4)) * 4 + threadIdx.x / 64,
-              c0     = (threadIdx.x % 64) * 8;
-    const float* lse = part_lse + (size_t)tok * nsplit * H + h;
-    float ls[MAX_SPLITS];
-    float4 va[MAX_SPLITS], vb[MAX_SPLITS];
-#pragma unroll
-    for(int s = 0; s < MAX_SPLITS; s++)
-        if(s < nsplit)
-        {
-            ls[s]             = lse[s * H];
-            const float4* src = reinterpret_cast<const float4*>(
-                part_o + (((size_t)tok * nsplit + s) * H + h) * D + c0);
-            va[s] = src[0];
-            vb[s] = src[1];
-        }
-    float mx = -INFINITY;
-#pragma unroll
-    for(int s = 0; s < MAX_SPLITS; s++)
-        if(s < nsplit)
-            mx = fmaxf(mx, ls[s]);
-    float wsum = 0.f, acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-#pragma unroll
-    for(int s = 0; s < MAX_SPLITS; s++)
-        if(s < nsplit && ls[s] != -INFINITY)
-        {
-            const float wt = exp2f(ls[s] - mx);
-            wsum += wt;
-            acc[0] += wt * va[s].x;
-            acc[1] += wt * va[s].y;
-            acc[2] += wt * va[s].z;
-            acc[3] += wt * va[s].w;
-            acc[4] += wt * vb[s].x;
-            acc[5] += wt * vb[s].y;
-            acc[6] += wt * vb[s].z;
-            acc[7] += wt * vb[s].w;
-        }
-    const float inv = wsum > 0.f ? 1.f / wsum : 0.f;
-    uint32_t pk[4];
-#pragma unroll
-    for(int i = 0; i < 4; i++)
-    {
-        uint32_t b0 = __float_as_uint(acc[2 * i] * inv), b1 = __float_as_uint(acc[2 * i + 1] * inv);
-        b0    = (b0 + 0x7fff + ((b0 >> 16) & 1)) >> 16;
-        b1    = (b1 + 0x7fff + ((b1 >> 16) & 1)) >> 16;
-        pk[i] = b0 | (b1 << 16);
-    }
-    *reinterpret_cast<uint4*>(out + ((size_t)tok * H + h) * D + c0) = {pk[0], pk[1], pk[2], pk[3]};
-}
 } // namespace
 
-// Cover the CUs with (token,split) workgroups, capped by the number of key blocks.
-extern "C" int hk_sparse_mla_splits(int T, int topk)
-{
-    if(T <= 0 || topk <= 0 || topk % BI || topk > MAX_TOPK)
-        return 1;
-    int ncu = 0, dev = 0;
-    hipGetDevice(&dev);
-    hipDeviceGetAttribute(&ncu, hipDeviceAttributeMultiprocessorCount, dev);
-    const int want = (ncu + T - 1) / T, maxs = topk / BI;
-    return want < 1 ? 1 : (want > maxs ? maxs : want);
-}
-// FP32 partials; no workspace for one split.
-extern "C" size_t hk_sparse_mla_workspace_bytes(int T, int topk)
-{
-    const int ns = hk_sparse_mla_splits(T, topk);
-    return ns <= 1 ? 0 : (size_t)T * ns * H * (D + 1) * sizeof(float);
-}
 // Launch contract: sparse_mla.h.
 extern "C" int hk_sparse_mla_fwd(const void* q,
                                  const void* kv,
@@ -447,8 +349,6 @@ extern "C" int hk_sparse_mla_fwd(const void* q,
                                  long kv_stride_bytes,
                                  long num_slots,
                                  float sm_scale,
-                                 void* workspace,
-                                 size_t ws_bytes,
                                  hipStream_t stream)
 {
     if(T <= 0)
@@ -461,28 +361,14 @@ extern "C" int hk_sparse_mla_fwd(const void* q,
         return HK_SPARSE_MLA_BAD_SHAPE;
     // Pools beyond 32-bit buffer offsets need 64-bit global gathers.
     const bool wide_pool = (unsigned long)num_slots * (unsigned long)kv_stride_bytes > UINT32_MAX;
-    const int ns         = hk_sparse_mla_splits(T, topk);
-    float *part_o = nullptr, *part_lse = nullptr;
-    if(ns > 1)
-    {
-        if(ws_bytes < hk_sparse_mla_workspace_bytes(T, topk))
-            return HK_SPARSE_MLA_SMALL_WORKSPACE;
-        part_o   = (float*)workspace;
-        part_lse = part_o + (size_t)T * ns * H * D;
-    }
-    auto* fwd = wide_pool ? sparse_mla_fwd<true> : sparse_mla_fwd<false>;
-    fwd<<<T * ns, NT, 0, stream>>>((const uint8_t*)q,
-                                   (const uint8_t*)kv,
-                                   idx,
-                                   (uint16_t*)out,
-                                   topk,
-                                   kv_stride_bytes,
-                                   (int)num_slots,
-                                   sm_scale * 1.4426950408889634f,
-                                   ns,
-                                   part_o,
-                                   part_lse);
-    if(ns > 1)
-        sparse_mla_combine<<<T*(H / 4), 256, 0, stream>>>(part_o, part_lse, (uint16_t*)out, ns);
+    auto* fwd            = wide_pool ? sparse_mla_fwd<true> : sparse_mla_fwd<false>;
+    fwd<<<T, NT, 0, stream>>>((const uint8_t*)q,
+                              (const uint8_t*)kv,
+                              idx,
+                              (uint16_t*)out,
+                              topk,
+                              kv_stride_bytes,
+                              (int)num_slots,
+                              sm_scale * 1.4426950408889634f);
     return hipGetLastError() == hipSuccess ? HK_SPARSE_MLA_OK : HK_SPARSE_MLA_LAUNCH_FAILED;
 }
