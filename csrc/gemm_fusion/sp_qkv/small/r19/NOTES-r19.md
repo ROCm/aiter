@@ -26,3 +26,5 @@ Status: SOURCE ONLY (uncompiled, no GPU). Derived from r18 (r18 untouched). Desi
 4. A tag mismatch is detected per wave: waves that loaded the tag before the late store see a mismatch, others may not; their rows are NaN only for the observing waves (the sticky ERR word makes every later launch NaN, and the step's requests are aborted per I4).
 5. `t_valid > T` is refused by the host (E_ARG); positions/slot_mapping must hold at least `t_valid` int64 and Ascale at least M floats.
 6. `sm_attach_v3` requires `gpage_local` to be 64 B aligned and, when gpeers is NULL, to lie in a registered window so `ccoGetPeerPtr` resolves the peers.
+## Test seam added after Evidence control (iv) (default 0, preprocessor-only: the code object is byte-identical when the macro is 0)
+- `SM_TEST_DELAY_PUSH_DATA=<n>`: every wave of the push WGs and IK owners sleeps n x s_sleep(127) BEFORE issuing its push16 DATA stores (the flag release is not delayed). Usable alone; intended together with `SM_TEST_RX_BEFORE_FLAG=1` (needs `SM_RX_BYPASS=1`; default in r20/r21, explicit in r19) so that the pre-flag bypass loads observe stale/torn Rx. n=20 is about 80 us.

@@ -26,3 +26,5 @@ Status: SOURCE ONLY (uncompiled, no GPU). Covers local m = 1..64 (the target is 
 3. Wasted work by design at small M: push half 1 (rows 32..63) and IK owner 1 do clamped loads when m <= 32; stores are masked. Timing at m = 33..48 is expected to be dominated by the dead-pass overhead only in the push WG.
 4. Self/B/IK still hold `s_row[16*128]` (16-row LDS) per WG: no LDS growth.
 5. The host side is unchanged from r19 (`sm_attach_v3`, `sm_launch_blk_v3` in the shared fusion driver); aiter-integrator owns the MP64 owner/profile rows. `bind` accepts M up to 64 through SM_MP.
+## Test seam added after Evidence control (iv) (default 0, preprocessor-only: the code object is byte-identical when the macro is 0)
+- `SM_TEST_DELAY_PUSH_DATA=<n>`: every wave of the push WGs and IK owners sleeps n x s_sleep(127) BEFORE issuing its push16 DATA stores (the flag release is not delayed). Usable alone; intended together with `SM_TEST_RX_BEFORE_FLAG=1` (needs `SM_RX_BYPASS=1`; default in r20/r21, explicit in r19) so that the pre-flag bypass loads observe stale/torn Rx. n=20 is about 80 us.

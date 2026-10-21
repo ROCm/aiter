@@ -156,6 +156,11 @@
 #ifndef SM_TEST_TAG_AFTER_RELEASE
 #define SM_TEST_TAG_AFTER_RELEASE 0
 #endif
+// SM_TEST_DELAY_PUSH_DATA=<n> (default 0 = no code, byte-identical; test-only, never a candidate; usable ALONE, and meant to be combined with SM_TEST_RX_BEFORE_FLAG=1 for the R2 control (iv)): every wave of the push WGs and the IK owners sleeps n x s_sleep(127) after the
+// entry decision and BEFORE it issues its push16 data stores. The flag release is NOT delayed by this seam (it still follows the stores' retire), so a reader that loads Rx before the flag poll (control iv) observes the previous epoch's data or torn rows. n=20 is about 80 us.
+#ifndef SM_TEST_DELAY_PUSH_DATA
+#define SM_TEST_DELAY_PUSH_DATA 0
+#endif
 #ifndef SM_TEST_SKIP_FLAG_ACQ_FOR_SRC
 #define SM_TEST_SKIP_FLAG_ACQ_FOR_SRC 0
 #endif
@@ -821,6 +826,9 @@ __device__ __forceinline__ void ran_body(const SmDev* __restrict__ blk, const Sm
         if (tid == 0) SM_STAMP(rec, 30);
         float vv[2][8];
         _Pragma("unroll") for (uint32_t pass = 0; pass < 2u; ++pass) { _Pragma("unroll") for (int i = 0; i < 8; ++i) vv[pass][i] = qnan(); }
+#if SM_TEST_DELAY_PUSH_DATA
+        for (int dly_ = 0; dly_ < SM_TEST_DELAY_PUSH_DATA; ++dly_) __builtin_amdgcn_s_sleep(127);   // r19+ test seam: every wave sleeps BEFORE issuing the push16 DATA stores (the release is not delayed); with SM_TEST_RX_BEFORE_FLAG=1 the readers' pre-flag loads then see stale/torn Rx
+#endif
         if (ok) {
             _Pragma("unroll") for (uint32_t pass = 0; pass < 2u; ++pass) {
                 const uint32_t m = static_cast<uint32_t>(row16) + 16u * (pbase + pass);
@@ -902,6 +910,9 @@ __device__ __forceinline__ void ran_body(const SmDev* __restrict__ blk, const Sm
         const bool ok = (s_ok == 1u);
         const uint32_t par = static_cast<uint32_t>(e & 1ull);
         if (tid == 0) SM_STAMP(rec, 30);
+#if SM_TEST_DELAY_PUSH_DATA
+        for (int dly_ = 0; dly_ < SM_TEST_DELAY_PUSH_DATA; ++dly_) __builtin_amdgcn_s_sleep(127);   // r19+ test seam: every wave sleeps BEFORE issuing the push16 DATA stores (the release is not delayed); with SM_TEST_RX_BEFORE_FLAG=1 the readers' pre-flag loads then see stale/torn Rx
+#endif
         if (ok) {
             uint16_t* const rx_dst = reinterpret_cast<uint16_t*>(rwin_peer(a, static_cast<int>(d)));
             _Pragma("unroll") for (uint32_t kk = 0; kk < 3u; ++kk) if (kk < nu) {
