@@ -574,5 +574,50 @@ class TestUpdateConfigFiles(unittest.TestCase):
                 os.unlink(merged_path)
 
 
+class TestGpuModelKey(unittest.TestCase):
+    """Tuned rows keyed by gpu_model must not mix SKUs of one arch."""
+
+    def test_products_sharing_an_arch_get_distinct_models(self):
+        from aiter.jit.utils.chip_info import normalize_gpu_model
+
+        self.assertEqual(normalize_gpu_model("AMD Instinct MI300X"), "mi300x")
+        self.assertEqual(normalize_gpu_model("AMD Instinct MI325X"), "mi325x")
+        self.assertEqual(normalize_gpu_model("AMD Instinct MI355X"), "mi355x")
+
+    def test_an_unrecognized_name_is_kept_rather_than_dropped(self):
+        from aiter.jit.utils.chip_info import normalize_gpu_model
+
+        self.assertEqual(normalize_gpu_model("Radeon RX 7900"), "radeon-rx-7900")
+        self.assertEqual(normalize_gpu_model(""), "unknown")
+
+    def test_a_name_without_a_model_falls_back_to_the_pci_product(self):
+        from unittest import mock
+
+        import torch
+
+        from aiter.jit.utils import chip_info
+
+        def model(name, from_pci):
+            chip_info.get_gpu_model.cache_clear()
+            with (
+                mock.patch.dict(os.environ, {"AITER_GPU_MODEL": ""}),
+                mock.patch.object(torch.cuda, "get_device_name", return_value=name),
+                mock.patch.object(torch.cuda, "get_device_properties"),
+                mock.patch.object(
+                    chip_info, "_gpu_model_from_pci", return_value=from_pci
+                ) as pci,
+            ):
+                return chip_info.get_gpu_model(0), pci.called
+
+        try:
+            self.assertEqual(model("AMD Radeon Graphics", "mi355x"), ("mi355x", True))
+            self.assertEqual(
+                model("AMD Radeon Graphics", None), ("amd-radeon-graphics", True)
+            )
+            self.assertEqual(model("AMD Instinct MI355X", "mi350x"), ("mi355x", False))
+        finally:
+            chip_info.get_gpu_model.cache_clear()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
