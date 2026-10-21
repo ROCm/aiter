@@ -54,7 +54,6 @@ def generate_test_data(
     random.seed(t.seed)
     torch.manual_seed(t.seed)
     torch.cuda.manual_seed(t.seed)
-    torch.backends.cudnn.deterministic = True
 
     assert t.h_q % t.h_kv == 0
 
