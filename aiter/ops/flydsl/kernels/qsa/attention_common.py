@@ -221,6 +221,24 @@ def _schedule(pairs, count, group, exp=False):
         rocdl.sched_group_barrier(0x400 if exp else 0x002, count, group)
 
 
+class _LdsQueue:
+    """Issue-order ledger of LDS reads and ds_bpermute, which retire in order."""
+
+    def __init__(self):
+        self.issued = 0
+
+    def issue(self, count):
+        """Count issued ops; the returned ready(n) waits until the first n of them retired."""
+        self.issued += count
+        first = self.issued - count
+        return lambda done: self.wait(first + done)
+
+    def wait(self, upto=None, vmcnt=None):
+        """Wait until the ops issued before index upto (default: all) have retired."""
+        lgkmcnt = 0 if upto is None else self.issued - upto
+        rocdl.s_waitcnt(vmcnt=vmcnt, lgkmcnt=lgkmcnt)
+
+
 def _buffer(tensor, size_bytes):
     """Byte-addressed buffer pointer over tensor; loads at or past size_bytes return zero."""
     return rocdl.make_buffer_ptr(
@@ -287,7 +305,7 @@ def _mma():
     )
 
 
-def _q_fragment(resource, offset, lane):
+def _read_q_g2r(resource, offset, lane):
     parts = [
         _buffer_words(resource, offset + (lane >> 4) * 16 + k * 64) for k in range(8)
     ]
@@ -325,12 +343,16 @@ def _max(values):
     return parts[0]
 
 
-def _cross(value, addresses):
+def _cross(value, addresses, queue):
     bits = fx.Float32(value).bitcast(fx.Int32)
-    return tuple(
+    result = tuple(
         fx.Int32(rocdl.ds_bpermute(fx.Int32.ir_type, address, bits)).bitcast(fx.Float32)
         for address in addresses
     )
+    queue.issue(len(addresses))
+    # LLVM would sink the ds_bpermutes below the LDS reads that the queue counts after them.
+    rocdl.sched_barrier(0)
+    return result
 
 
 def _center_one(value, scale, maximum):
@@ -364,20 +386,41 @@ def _copy_coordinates(wave, packet, page=0):
     return token, (wave >> 2) * 128
 
 
-def _read_k(storage, addresses, half, lower_first=False):
-    parts = [None] * 16
+def _k_reads(addresses, half, lower_first=False):
+    """(slot, address, immediate) of one K half's 16 LDS reads, in issue order."""
     order = (
         [(n, k + high * 4) for high in range(2) for n in range(2) for k in range(4)]
         if lower_first
         else [(n, k) for n in range(2) for k in range(8)]
     )
-    for n, k in order:
-        parts[n * 8 + k] = _load_lds(
-            storage, addresses[n * 2 + k % 2], half * 16384 + (k // 2) * 128
-        )
+    return [
+        (n * 8 + k, addresses[n * 2 + k % 2], half * 16384 + (k // 2) * 128)
+        for n, k in order
+    ]
+
+
+def _v_reads(address, half):
+    """(slot, address, immediate) of one V half's 16 LDS reads, in issue order."""
+    return [
+        (block * 8 + row, address, half * 256 + block * 16384 + row * 512)
+        for block in range(2)
+        for row in range(8)
+    ]
+
+
+def _lds_words(parts):
     return fx.Vector.from_elements(
         [part[i] for part in parts for i in range(4)], fx.Int32
     )
+
+
+def _read_s2r(plan, queue):
+    """Issue a (storage, reads) plan; ready(n) waits until its first n reads have landed."""
+    storage, reads = plan
+    parts = [None] * len(reads)
+    for slot, address, immediate in reads:
+        parts[slot] = _load_lds(storage, address, immediate)
+    return _lds_words(parts), queue.issue(len(reads))
 
 
 def _k_operands(words):
@@ -389,23 +432,11 @@ def _k_operands(words):
     return fx.make_view(fx.get_iter(frag), fx.make_layout((4, 2, 16), (1, 64, 4)))
 
 
-def _read_v(storage, address, half, blocks=2):
-    parts = []
-    for block in range(blocks):
-        for row in range(8):
-            parts.append(
-                _load_lds(storage, address, half * 256 + block * 16384 + row * 512)
-            )
-    return fx.Vector.from_elements(
-        [part[i] for part in parts for i in range(4)], fx.Int32
-    )
-
-
-def _v_operands(values, step, progressive):
+def _v_operands(values, step, ready=None):
     raw = fx.Vector(values)
-    row = (step // 2) * 8 + (step % 2) * 4
-    if progressive:
-        rocdl.s_waitcnt(lgkmcnt=12 - step * 4)
+    row = step * 4
+    if ready is not None:
+        ready(row + 4)
         _keep_vgpr(
             fx.Vector.from_elements(
                 [raw[i] for i in range(row * 4, row * 4 + 16)], fx.Int32
@@ -432,12 +463,17 @@ def _pv(
     probabilities,
     values,
     output,
-    progressive=False,
+    ready=None,
     prepared=None,
-    center_args=None,
-    summary_args=None,
+    center=None,
+    sum_max=None,
     steps=4,
 ):
+    """O += P V over one V half; center and sum_max fold softmax VALU work into its MFMAs.
+
+    sum_max = (S, lane sum, other sums, l) also returns l + row sum and the lane max of S;
+    center = (S, lane max, other maxima, scale, m) returns S * scale - m', m' and the ballot.
+    """
     p = fx.Vector(probabilities)
     acc = [
         fx.Vector.from_elements([output[n * 4 + i] for i in range(4)], fx.Float32)
@@ -445,7 +481,7 @@ def _pv(
     ]
     prepared_steps = 0 if prepared is None else prepared.numel // 16
     operands = (
-        _v_operands(values, 0, progressive)
+        _v_operands(values, 0, ready)
         if prepared is None
         else fx.Vector.from_elements([prepared[i] for i in range(16)], fx.Int32)
     )
@@ -458,9 +494,7 @@ def _pv(
             )
         else:
             following = (
-                _v_operands(values, step + 1, progressive)
-                if step + 1 < steps
-                else operands
+                _v_operands(values, step + 1, ready) if step + 1 < steps else operands
             )
         b = fx.Vector.from_elements([p[step * 4 + i] for i in range(4)], fx.BFloat16)
         for n in range(8):
@@ -468,8 +502,8 @@ def _pv(
                 [operands[n * 2 + i] for i in range(2)], fx.Int32
             ).bitcast(fx.Int16)
             acc[n] = _mfma(a, b.bitcast(fx.Int16), acc[n])
-        if center_args is not None:
-            current, candidate, maxima, scale, maximum = center_args
+        if center is not None:
+            current, candidate, maxima, scale, maximum = center
             if step == 0:
                 candidate = (
                     _maximum(
@@ -482,23 +516,23 @@ def _pv(
                 new_max = predicate.select(candidate + 1.0, maximum)
             for i in range(step * 4, step * 4 + 4):
                 centered.append(_center_one(current[i], scale, new_max))
-        if summary_args is not None and step == 3:
-            current, total, sums, row_sum = summary_args
+        if sum_max is not None and step == 3:
+            current, total, sums, row_sum = sum_max
             row_sum = row_sum + ((total + sums[0]) + (sums[1] + sums[2]))
             candidate = _max(current)
         if step + 1 < steps and step + 1 >= prepared_steps:
-            _schedule(8, 3 if center_args is not None else 2, 20 + step)
-        elif summary_args is not None:
+            _schedule(8, 3 if center is not None else 2, 20 + step)
+        elif sum_max is not None:
             _schedule(8, 3, 23)
         rocdl.sched_barrier(0)
         operands = following
     result = fx.Vector.from_elements(
         [acc[n][i] for n in range(8) for i in range(4)], fx.Float32
     )
-    if center_args is not None:
+    if center is not None:
         # Pinned: unpinned, LLVM moves these FMAs out of the stage (0.4-1.3% slower).
         centered = _pin(fx.Vector.from_elements(centered, fx.Float32))
         return result, centered, new_max, ballot
-    if summary_args is not None:
+    if sum_max is not None:
         return result, row_sum, candidate
     return result
