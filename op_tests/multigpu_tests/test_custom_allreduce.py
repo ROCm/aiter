@@ -334,7 +334,7 @@ def _start_queue_evictions(stop):
 
 
 def _allreduce_mixed_size_regression(
-    rank, tp_size, sizes, iterations, distributed_init_method, stop, name
+    rank, tp_size, sizes, iterations, distributed_init_method, stop, name, check_every
 ):
     from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
 
@@ -360,7 +360,7 @@ def _allreduce_mixed_size_regression(
     done = torch.cuda.Event()
     for iteration in range(iterations):
         outs = [ca_comm.custom_all_reduce(x, use_new=True) for x in inputs]
-        if iteration % 100 != 99:
+        if iteration % check_every != check_every - 1:
             continue
         done.record()
         deadline, evicting = time.time() + 30, evict and not stop.is_set()
@@ -373,11 +373,26 @@ def _allreduce_mixed_size_regression(
                 stop.set()
                 deadline, evicting = time.time() + 60, False
             time.sleep(0.001)
-        for out, ref in zip(outs, refs):
-            torch.testing.assert_close(out, ref, rtol=0, atol=0)
+        for n, out, ref in zip(sizes, outs, refs):
+            context = f"{name} {rank=} {iteration=} numel={n}"
+            torch.testing.assert_close(
+                out,
+                ref,
+                rtol=0,
+                atol=0,
+                msg=lambda msg, context=context: f"{context}\n{msg}",
+            )
     stop.set()
     torch.cuda.synchronize()
     dist.barrier()
+    if rank == 0:
+        logger.info(
+            "%s mixed-size regression passed: TP%d, %d rounds of %s",
+            name,
+            tp_size,
+            iterations,
+            sizes,
+        )
     ca_comm.close()
     dist.destroy_process_group()
 
@@ -388,21 +403,23 @@ def test_allreduce_ll128_mixed_size_regression(tp_size, iterations=1000):
     sizes = _LL128_MIXED_SIZES.get(tp_size)
     if sizes is None:
         return
-    _run_mixed_size_regression(tp_size, sizes, iterations, "LL128")
+    _run_mixed_size_regression(tp_size, sizes, iterations, "LL128", 100)
 
 
 def test_allreduce_ll_gfx1250_mixed_size_regression(tp_size, iterations=1000):
     # The gfx1250 LL kernel kept one epoch per block while the grid followed the
     # message size, so a packet's owning block could reuse a stale epoch and
-    # bank when the size changed, accepting the previous call's lines.
+    # bank when the size changed: the first rounds could accept the previous
+    # call's lines, and later rounds could overwrite a slower peer's unread
+    # lines. Check every round so the early stale reads are not skipped.
     if not _is_gfx1250():
         return
     _run_mixed_size_regression(
-        tp_size, _LL_GFX1250_MIXED_SIZES, iterations, "gfx1250 LL"
+        tp_size, _LL_GFX1250_MIXED_SIZES, iterations, "gfx1250 LL", 1
     )
 
 
-def _run_mixed_size_regression(tp_size, sizes, iterations, name):
+def _run_mixed_size_regression(tp_size, sizes, iterations, name, check_every):
     torch.multiprocessing.spawn(
         _allreduce_mixed_size_regression,
         args=(
@@ -412,6 +429,7 @@ def _run_mixed_size_regression(tp_size, sizes, iterations, name):
             get_distributed_init_method(get_ip(), get_open_port()),
             torch.multiprocessing.get_context("spawn").Event(),
             name,
+            check_every,
         ),
         nprocs=tp_size,
         join=True,
