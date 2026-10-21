@@ -456,6 +456,7 @@ def build_qsa_indexer_prefill_scores_module(
     wide_cache: bool = False,
     k_strides: tuple[int, int, int] | None = None,
     block_n: int = _ROWS_BLOCK_N,
+    fold_heads: bool = False,
 ):
     """Build the 16-row MFMA scorer, ``block_n`` columns per workgroup.
 
@@ -466,6 +467,11 @@ def build_qsa_indexer_prefill_scores_module(
     rows, so a request-major batch (vLLM's layout) gathers each K tile once
     per request it touches. A workgroup walks ``tiles_per_wg`` consecutive
     column tiles, a launch argument, so one Q staging serves several K tiles.
+
+    ``fold_heads`` (4 heads only) puts 4 rows x 4 heads on the MFMA M axis
+    instead of 16 rows per head: a tile is 4 rows, one MFMA chain, and each
+    lane holds one row's four heads, so the head sum stays in the lane. An
+    MTP batch with 4 rows per request then has one request per tile.
     """
     if page_size < 1:
         raise ValueError(f"page_size must be positive, got {page_size}")
@@ -473,6 +479,8 @@ def build_qsa_indexer_prefill_scores_module(
         raise ValueError(f"score heads must be {_SCORE_HEADS}, got {n_heads}")
     if block_n not in (32, 64):
         raise ValueError(f"16-row scorer block_n must be 32 or 64, got {block_n}")
+    if fold_heads and n_heads != 4:
+        raise ValueError(f"fold_heads needs 4 heads, got {n_heads}")
     dense_k_strides = _dense_indexer_strides(page_size)
     if k_strides is None:
         k_strides = dense_k_strides
@@ -480,7 +488,9 @@ def build_qsa_indexer_prefill_scores_module(
         k_strides = tuple(int(s) for s in k_strides)
     strided_wide = wide_cache and k_strides != dense_k_strides
 
-    block_m = 16
+    # Rows per tile; the MFMA M axis is always 16 (rows, or rows x heads).
+    block_m = 16 // n_heads if fold_heads else 16
+    mfma_chains = 1 if fold_heads else n_heads
     num_waves = block_n // 16
     block_threads = 64 * num_waves
     qk_k = 32 if use_k32 else 16
@@ -513,6 +523,7 @@ def build_qsa_indexer_prefill_scores_module(
             d=_D,
             blk=block_threads,
             qkk=qk_k,
+            fh=int(fold_heads),
             wide=int(wide_cache),
             **({"kvs": "x".join(str(s) for s in k_strides)} if strided_wide else {}),
         ),
@@ -547,6 +558,12 @@ def build_qsa_indexer_prefill_scores_module(
         lane = tid - wave * Int32(64)
         lane_m = lane % Int32(16)
         lane_kg = _idiv(lane, Int32(16))
+        # The A row this lane feeds: row lane_m, or (row, head) when folded.
+        if const_expr(fold_heads):
+            a_row = _idiv(lane_m, Int32(n_heads))
+            a_head = lane_m - a_row * Int32(n_heads)
+        else:
+            a_row = lane_m
         vec_layout = fx.make_layout(vec, 1)
         g_copy = buf_copy_atom(16, BFloat16)
         # A buffer resource is wave-uniform, so a per-lane wide row would
@@ -605,7 +622,7 @@ def build_qsa_indexer_prefill_scores_module(
             if (tile0 == zero) & row_live:
                 row_lens[row] = visible
         gpu.barrier()
-        # Every lane reads the same 16 entries, so these and every branch on
+        # Every lane reads the same block_m entries, so these and every branch on
         # them below are workgroup-uniform.
         tile_visible = zero
         req_lo = n_req
@@ -710,16 +727,18 @@ def build_qsa_indexer_prefill_scores_module(
                             live_lds[col_t] = col_live_t.select(one, zero)
                         gpu.barrier()
 
-                        # This wave's 16 columns against all 16 rows, per head.
+                        # This wave's 16 columns against the tile: 16 rows per
+                        # head, or 4 rows x 4 heads in one chain when folded.
                         n_row_t = wave * Int32(16) + lane_m
                         accs_t = []
-                        for head_t in range_constexpr(n_heads):
+                        for head_t in range_constexpr(mfma_chains):
                             acc4_t = fx.Vector.filled(4, 0.0, Float32)
+                            a_head_t = a_head if const_expr(fold_heads) else head_t
                             for ks_t in range_constexpr(k_steps):
                                 dk_t = Int32(ks_t * qk_k) + lane_kg * Int32(qk_vec)
                                 a_vec_t = fx.Vector.from_elements(
                                     [
-                                        q_lds[lane_m, head_t, dk_t + Int32(i_t)]
+                                        q_lds[a_row, a_head_t, dk_t + Int32(i_t)]
                                         for i_t in range_constexpr(qk_vec)
                                     ],
                                     BFloat16,
@@ -744,19 +763,19 @@ def build_qsa_indexer_prefill_scores_module(
                                 )
                             accs_t.append(acc4_t)
 
-                        # 16x16 C: n = lane%16 (column), m = 4*(lane/16) + elem (row).
+                        # 16x16 C: n = lane%16 (column), m = 4*(lane/16) + elem:
+                        # the row, or 4*row + head when folded.
                         out_col_t = tile_t * Int32(block_n) + n_row_t
                         # A visible column on an invalid page scored a zeroed K;
                         # it must not tie into the top-512.
                         page_live_t = live_lds[n_row_t] != zero
-                        for i_t in range_constexpr(4):
-                            row_local_t = lane_kg * Int32(4) + Int32(i_t)
+                        if const_expr(fold_heads):
+                            # m = 4*(lane/16) + elem = 4*row + head.
+                            row_local_t = lane_kg
                             row_t = row_tile * Int32(block_m) + row_local_t
                             score_t = Float32(0.0)
-                            for head_t in range_constexpr(n_heads):
-                                score_t = score_t + fx.max(
-                                    accs_t[head_t][i_t], Float32(0.0)
-                                )
+                            for i_t in range_constexpr(4):
+                                score_t = score_t + fx.max(accs_t[0][i_t], Float32(0.0))
                             # Rows of other requests are written by their own
                             # iteration.
                             mine_t = req_lds[row_local_t] == cur
@@ -764,12 +783,31 @@ def build_qsa_indexer_prefill_scores_module(
                                 live_t = (
                                     out_col_t < visible_lds[row_local_t]
                                 ) & page_live_t
-                                # ``scores`` must keep a dynamic row stride: a
-                                # static layout, use_32bit_stride=True, or an
-                                # Int32 linear index would wrap.
                                 scores[row_t, out_col_t] = live_t.select(
                                     score_t * score_scale, _neg_inf()
                                 )
+                        else:
+                            for i_t in range_constexpr(4):
+                                row_local_t = lane_kg * Int32(4) + Int32(i_t)
+                                row_t = row_tile * Int32(block_m) + row_local_t
+                                score_t = Float32(0.0)
+                                for head_t in range_constexpr(n_heads):
+                                    score_t = score_t + fx.max(
+                                        accs_t[head_t][i_t], Float32(0.0)
+                                    )
+                                # Rows of other requests are written by their
+                                # own iteration.
+                                mine_t = req_lds[row_local_t] == cur
+                                if mine_t & (row_t < rows) & (out_col_t < n_columns):
+                                    live_t = (
+                                        out_col_t < visible_lds[row_local_t]
+                                    ) & page_live_t
+                                    # ``scores`` must keep a dynamic row stride:
+                                    # a static layout, use_32bit_stride=True, or
+                                    # an Int32 linear index would wrap.
+                                    scores[row_t, out_col_t] = live_t.select(
+                                        score_t * score_scale, _neg_inf()
+                                    )
                         # The next tile or request overwrites k_lds and live_lds.
                         gpu.barrier()
 
