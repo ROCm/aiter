@@ -927,7 +927,9 @@ def _run_kda_triton(inputs: KdaInputs, cu_seqlens: torch.Tensor) -> torch.Tensor
     ).view(1, batch, _KDA_HEADS, _KDA_DIM)
 
 
-def _kda_decode_work(batch: int, fuse_f_b: bool, state: torch.Tensor) -> tuple[int, int]:
+def _kda_decode_work(
+    batch: int, fuse_f_b: bool, state: torch.Tensor
+) -> tuple[int, int]:
     hidden = _KDA_HEADS * _KDA_DIM
     # Per token and head, the recurrence costs about 7*K*V + 2*V FLOPs as in
     # _recurrent_decode_work; the width-4 Q/K/V convolution adds 2*W per
@@ -953,21 +955,26 @@ def _kda_decode_work(batch: int, fuse_f_b: bool, state: torch.Tensor) -> tuple[i
 
 
 @benchmark()
-def test_flydsl_kda_decode(batch, conv_layout):
+def test_flydsl_kda_decode(batch, conv_layout, state_dtype):
     f_a, f_b_weight, seed = _make_kda_fb_inputs(
-        batch, conv_width_major=conv_layout == "width_major"
+        batch,
+        conv_width_major=conv_layout == "width_major",
+        state_dtype=state_dtype,
     )
     reference_inputs = _copy_kda_inputs(seed)
     reference = _kda_reference(reference_inputs)
     cu_seqlens = torch.arange(batch + 1, dtype=torch.int64, device=_KDA_DEVICE)
 
+    flydsl_tols = _KDA_FLYDSL_TOLS
+    if state_dtype == dtypes.bf16:
+        flydsl_tols = (_KDA_OUTPUT_TOL, _KDA_BF16_STATE_TOL, _TOL_ERR_RATIO)
     # raw_g holds the f_b projection, so every candidate shares one reference.
     candidates = {
-        "flydsl": (_run_kda, False, _KDA_FLYDSL_TOLS),
+        "flydsl": (_run_kda, False, flydsl_tols),
         "flydsl_f_b": (
             lambda inputs: _run_kda_with_f_b(f_a, f_b_weight, inputs),
             True,
-            _KDA_FLYDSL_TOLS,
+            flydsl_tols,
         ),
     }
     # The Triton kernel takes the conv cache as SGLang's transposed view only.
@@ -1040,10 +1047,13 @@ def test_flydsl_kda_decode_exports() -> None:
 
 
 @_requires_kda
+@pytest.mark.parametrize("state_dtype", [dtypes.fp32, dtypes.bf16])
 @pytest.mark.parametrize("conv_layout", ["channel_major", "width_major"])
 @pytest.mark.parametrize("batch", [1, 8, 16])
-def test_flydsl_kda_decode_matches_reference(batch: int, conv_layout: str) -> None:
-    result = test_flydsl_kda_decode(batch, conv_layout)
+def test_flydsl_kda_decode_matches_reference(
+    batch: int, conv_layout: str, state_dtype: torch.dtype
+) -> None:
+    result = test_flydsl_kda_decode(batch, conv_layout, state_dtype)
     assert result["flydsl err"] == 0
     assert result["flydsl_f_b err"] == 0
 
@@ -1605,6 +1615,14 @@ def main():
         default=["channel_major", "width_major"],
         help="KDA conv cache layout; width_major is SGLang's transposed view.",
     )
+    parser.add_argument(
+        "--state-dtype",
+        type=dtypes.str2Dtype,
+        choices=[dtypes.fp32, dtypes.bf16],
+        nargs="*",
+        default=[dtypes.fp32, dtypes.bf16],
+        help="KDA recurrent-state dtype; bf16 is SGLang's --mamba-ssm-dtype bfloat16.",
+    )
     args = parser.parse_args()
 
     rows = []
@@ -1656,8 +1674,10 @@ def main():
         aiter.logger.warning("FlyDSL KDA decode unsupported on %s; skipping", get_gfx())
         return
     rows = [
-        test_flydsl_kda_decode(batch, conv_layout)
-        for conv_layout, batch in itertools.product(args.conv_layout, args.batch)
+        test_flydsl_kda_decode(batch, conv_layout, state_dtype)
+        for state_dtype, conv_layout, batch in itertools.product(
+            args.state_dtype, args.conv_layout, args.batch
+        )
     ]
     df = pd.DataFrame(rows)
     aiter.logger.info(
