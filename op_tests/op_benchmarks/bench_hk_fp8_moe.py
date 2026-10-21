@@ -17,32 +17,17 @@ ROOT = Path(__file__).resolve().parents[2]
 D, INTER, ROUTED_EXPERTS = 4096, 1024, 288
 
 
-def make_weights():
-    import torch
-
+def prepare_weights():
     from aiter.ops.shuffle import (
         shuffle_scale_a16w4,
         shuffle_weight,
         shuffle_weight_a16w4,
     )
+    from op_tests.hk_fp8_moe_utils import dequant, make_weights
 
-    generator = torch.Generator(device="cuda").manual_seed(0)
-
-    def quantize(n, k, gate_up):
-        w = (
-            torch.randn(ROUTED_EXPERTS + 1, n, k, device="cuda", generator=generator)
-            * 0.02
-        )
-        blocks = w.view(ROUTED_EXPERTS + 1, n // 128, 128, k // 128, 128)
-        scale = torch.exp2(
-            torch.ceil(
-                torch.log2(
-                    blocks.abs().amax(dim=(2, 4), keepdim=True).clamp_min(1e-12) / 448.0
-                )
-            )
-        )
-        q = (blocks / scale).to(torch.float8_e4m3fn).view_as(w)
-        reference = (q.float().view_as(blocks) * scale).view_as(w)
+    def pack(q, scale, gate_up):
+        _, n, k = q.shape
+        reference = dequant(q, scale)
         packed = shuffle_weight(q, (16, 16))
         # Repeat each power-of-two 128x128 scale over its 1x32 sub-blocks.
         # The E4M3 payload and every dequantized weight remain exactly equal.
@@ -61,43 +46,13 @@ def make_weights():
             mx_scale,
         )
 
-    w13, s13, reference13, mx13, mxs13 = quantize(2 * INTER, D, True)
-    w2, s2, reference2, mx2, mxs2 = quantize(D, INTER, False)
+    q13, scale13, q2, scale2 = make_weights(ROUTED_EXPERTS + 1)
+    w13, s13, reference13, mx13, mxs13 = pack(q13, scale13, True)
+    w2, s2, reference2, mx2, mxs2 = pack(q2, scale2, False)
     return w13, s13, w2, s2, reference13, reference2, mx13, mxs13, mx2, mxs2
 
 
-def make_inputs(tokens, topk):
-    import torch
-
-    generator = torch.Generator(device="cuda").manual_seed(tokens)
-    x = torch.randn(tokens, D, dtype=torch.bfloat16, device="cuda", generator=generator)
-    logits = torch.randn(tokens, ROUTED_EXPERTS, device="cuda", generator=generator)
-    weights, ids = torch.topk(logits.softmax(-1), 8, dim=-1)
-    if topk == 9:
-        ids = torch.cat((ids, torch.full_like(ids[:, :1], ROUTED_EXPERTS)), dim=1)
-        weights = torch.cat((weights, torch.ones_like(weights[:, :1])), dim=1)
-    return x, ids.to(torch.int32).contiguous(), weights.float().contiguous()
-
-
-def reference(x, ids, weights, w13, w2, limit=0.0):
-    import torch
-
-    rows = torch.linspace(0, x.shape[0] - 1, min(x.shape[0], 128), device="cuda").long()
-    xs, es, ws = x[rows].float(), ids[rows], weights[rows]
-    out = torch.zeros(len(rows), D, dtype=torch.float32, device="cuda")
-    for expert in torch.unique(es).tolist():
-        token, slot = (es == expert).nonzero(as_tuple=True)
-        gate, up = (xs[token] @ w13[expert].T).chunk(2, dim=-1)
-        if limit > 0:
-            gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
-        hidden = torch.nn.functional.silu(gate) * up
-        out.index_add_(0, token, (hidden @ w2[expert].T) * ws[token, slot, None])
-    return rows, out
-
-
 def capture_repeated(call, repetitions):
-    import torch
-
     for _ in range(5):
         call()
     torch.cuda.synchronize()
@@ -113,8 +68,6 @@ def capture_repeated(call, repetitions):
 
 def measure_pair(graphs, repetitions, rounds):
     import statistics
-
-    import torch
 
     samples = {name: [] for name in graphs}
     names = list(graphs)
@@ -143,8 +96,6 @@ def measure_pair(graphs, repetitions, rounds):
 
 
 def dispatch_metadata(fm, tokens, topk, experts, native=False):
-    import torch
-
     from aiter import ActivationType, QuantType
 
     metadata = fm.get_2stage_cfgs(
@@ -231,9 +182,10 @@ def moe():
 
     import aiter
     from aiter.ops.hk_fp8_moe import hk_fp8_moe
+    from op_tests.hk_fp8_moe_utils import make_routing, reference
 
     fm = importlib.import_module("aiter.fused_moe")
-    w13, s13, w2, s2, ref13, ref2, mx13, mxs13, mx2, mxs2 = make_weights()
+    w13, s13, w2, s2, ref13, ref2, mx13, mxs13, mx2, mxs2 = prepare_weights()
     result = {
         "mode": "moe",
         "base": os.environ["REVIEW_BASE"],
@@ -260,8 +212,9 @@ def moe():
         shared_a.gate_up_interleave = True
         shared_b.gate_up_interleave = False
         for T in (1, 128, 1024, 2048, 4096, 8192, 16384):
-            x, ids, tw = make_inputs(T, topk)
-            rows, expected = reference(x, ids, tw, ref13, ref2)
+            x, ids, tw = make_routing(T, E)
+            rows = torch.linspace(0, T - 1, min(T, 128), device="cuda").long()
+            expected = reference(x[rows], ref13, ref2, tw[rows], ids[rows], 0.0)
             out = torch.empty_like(x)
             calls = {
                 "hk": partial(hk_fp8_moe, x, ids, tw, a, s13[:E], b, s2[:E]),
