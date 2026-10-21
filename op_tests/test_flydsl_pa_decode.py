@@ -20,7 +20,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 def device(monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("ROCm is not available")
-    if get_gfx_runtime() not in ("gfx942", "gfx950"):
+    if get_gfx_runtime() not in ("gfx942", "gfx950", "gfx1250"):
         pytest.skip(f"pa_decode is unsupported on {get_gfx_runtime()}")
     if importlib.util.find_spec("flydsl") is None:
         pytest.skip("FlyDSL is not installed")
@@ -232,6 +232,18 @@ _COMMON_CASES = [
     ],
 ]
 _FP8_CASES = _COMMON_CASES + [
+    (
+        "packed-mtp4",
+        {
+            "query_length": 4,
+            "kv_heads": 2,
+            "group_size": 8,
+            "head_dim": 256,
+            "block_size": 128,
+            "max_partitions": 7,
+            "sink_dtype": torch.float32,
+        },
+    ),
     (
         "mtp",
         {
@@ -493,7 +505,10 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
     assert compile_kwargs[-1]["wide_kv_addressing"] == case["wide"]
     if case["pipe"]:
         # The cache key ends with (D256_PIPE, staged page ids).
-        pipe, staged = PaDecodeSchedule.select(**compile_kwargs[-1]).cache_key[-2:]
+        schedule_kwargs = dict(compile_kwargs[-1])
+        schedule_kwargs.pop("architecture", None)
+        schedule_kwargs.pop("direct_output", None)
+        pipe, staged = PaDecodeSchedule.select(**schedule_kwargs).cache_key[-2:]
         assert pipe == (arch == "gfx950")
         if pipe:
             assert (staged > 0) == (case["staged"] is not False)
@@ -569,6 +584,15 @@ def test_pa_decode(case, device, monkeypatch):
     if case["max_partitions"] is not None and case["max_partitions"] > num_cu:
         pytest.skip(f"plan_pa_decode caps max_partitions at {num_cu} CUs")
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    if get_gfx_runtime() == "gfx1250":
+        if case.get("invalid_input") in ("fp16-query", "plain-v"):
+            pytest.skip("gfx1250 supports FP16 queries and plain BF16 V caches")
+        if (
+            case["kv_dtype"] == "bf16"
+            and case["head_dim"] % 128
+            and case["head_dim"] != 64
+        ):
+            pytest.skip("gfx1250 supports head_dim 64 or multiples of 128")
     query_length, kv_heads, group_size, dim, page, window = (
         case[name]
         for name in (
@@ -599,7 +623,7 @@ def test_pa_decode(case, device, monkeypatch):
     if case["kv_dtype"] == "fp8":
         compute_type = (
             torch.float8_e4m3fn
-            if get_gfx_runtime() == "gfx950"
+            if get_gfx_runtime() in ("gfx950", "gfx1250")
             else torch.float8_e4m3fnuz
         )
         vector = 16

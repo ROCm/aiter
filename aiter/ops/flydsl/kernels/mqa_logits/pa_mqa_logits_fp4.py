@@ -322,7 +322,7 @@ def build_pa_mqa_logits_fp4_module(
             return scales
 
         def _issue_nt_mfmas(kv_list_in, kvs_scales_per_nt, nt):
-            zero = fx.Vector.filled(4, 0.0, fx.Float32)
+            zero = fx.full(4, 0.0, fx.Float32)
             accs = [zero] * m_tiles
             for k_tile in range_constexpr(k_tiles):
                 b_frag = fx.make_rmem_tensor(4, fx.Int32)
@@ -344,7 +344,7 @@ def build_pa_mqa_logits_fp4_module(
             return accs
 
         def _post_process_nt(accs, nt, c_i32_arg):
-            zero = fx.Vector.filled(4, 0.0, fx.Float32)
+            zero = fx.full(4, 0.0, fx.Float32)
             ni_warp = warp_id * fx.Int32(N_TILES_PER_WARP) + fx.Int32(nt)
             token_base = (chunk_start + c_i32_arg) * fx.Int32(
                 block_k
@@ -360,7 +360,7 @@ def build_pa_mqa_logits_fp4_module(
             lane_i32 = fx.Int32(lane_id)
 
             def _bperm_xor_add(val, sh):
-                peer_byte = (lane_i32 ^ fx.Int32(sh)) * fx.Int32(4)
+                peer_byte = (lane_i32 ^ fx.Int32(sh)) * 4
                 peer_i32 = fx.Int32(
                     rocdl.ds_bpermute(T.i32, peer_byte, val.bitcast(fx.Int32))
                 )
@@ -446,8 +446,8 @@ def build_pa_mqa_logits_fp4_module(
                 for mi in range(m_tiles)
             ]
             c_idx_i32 = fx.Int32(c_idx)
-            c_next_i32 = c_idx_i32 + fx.Int32(1)
-            c_next_next_i32 = c_next_i32 + fx.Int32(1)
+            c_next_i32 = c_idx_i32 + 1
+            c_next_next_i32 = c_next_i32 + 1
 
             # Compute current chunk using pre-issued nt=0.
             _compute_chunk(
