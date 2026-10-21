@@ -3687,10 +3687,11 @@ def _varlen_descale_reject_reason(q, k, v, **gate_kwargs) -> str:
 # FP8 varlen with q/k/v_descale: FlyDSL FP8 vs the CK descale route, causal,
 # gfx950 (MI355X) GPU timings from PR #6266:
 # - qk/v head_dim 192/128: FlyDSL 1.42-1.74x faster at every measured shape.
-# - 128/128: FlyDSL 1.1-1.5x faster up to 4096 total q tokens; at 8192 tokens it
-#   is 0.82-0.98x with 12 heads (24 heads: still 1.03-1.11x), so hand off to CK
-#   from this many total q tokens.
-_FLYDSL_FP8_DESCALE_HD128_MAX_Q_TOKENS = 8192
+# - 128/128: FlyDSL 1.1-1.5x faster up to 4096 total q tokens; about even (~0.96x)
+#   at 6144-7168 tokens and 0.82-0.98x at 8192 tokens with 12 heads (24 heads:
+#   still 1.03-1.11x). Route is head-count independent, so stop at the largest
+#   size measured faster for every head count; above it, CK serves the call.
+_FLYDSL_FP8_DESCALE_HD128_MAX_Q_TOKENS = 4096
 
 
 def _flydsl_varlen_ck_only_feature(
@@ -3715,7 +3716,7 @@ def _prefer_flydsl_fp8_descale(q, v) -> bool:
         return True
     if head_dims == (128, 128):
         # Varlen q is [total_q_tokens, heads, head_dim].
-        return q.shape[0] < _FLYDSL_FP8_DESCALE_HD128_MAX_Q_TOKENS
+        return q.shape[0] <= _FLYDSL_FP8_DESCALE_HD128_MAX_Q_TOKENS
     return False
 
 
@@ -3843,18 +3844,6 @@ def flash_attn_varlen_func(
             cu_seqlens=(cu_seqlens_q, cu_seqlens_k),
         )
 
-    # Non-fp8 backends (e.g. the gfx1250 bf16 FlyDSL kernel) would ignore the
-    # descales, so reject them before any dispatch. Both FP8 encodings are valid
-    # here (e4m3fnuz is gfx942's native FP8); the FlyDSL gate declines fnuz and
-    # those calls take the CK descale route.
-    if has_any_descale and q.dtype not in (
-        torch.float8_e4m3fn,
-        torch.float8_e4m3fnuz,
-    ):
-        raise ValueError(
-            "flash_attn_varlen_func: q/k/v_descale require FP8 inputs "
-            f"(float8_e4m3fn or float8_e4m3fnuz), got q {q.dtype}"
-        )
     if has_any_descale and not has_all_descales:
         raise ValueError(
             "FP8 attention requires q_descale, k_descale, and v_descale together"
@@ -3939,10 +3928,13 @@ def flash_attn_varlen_func(
     # take the CK path, which also consumes the descales. Without CK, FlyDSL is
     # the only backend that honors descales, so always try it. Features FlyDSL
     # cannot express (soft-cap, padded cu_seqlens) never take the FlyDSL route.
+    # Only e4m3fn descale calls may reach FlyDSL: its non-fp8 kernels would drop
+    # the descales, so other dtypes keep main's CK route (or the no-CK raise).
     try_flydsl = _FLYDSL_AVAILABLE and (
         not has_all_descales
         or (
             ck_only_feature is None
+            and q.dtype == torch.float8_e4m3fn
             and (not ENABLE_CK or _prefer_flydsl_fp8_descale(q, v))
         )
     )

@@ -1950,10 +1950,21 @@ def _fp8_public_varlen_inputs(seq_len=256, num_heads=4, head_dim=128):
 
 
 @_gfx950_only
-def test_fp8_public_varlen_descale_routes_to_flydsl():
-    """flash_attn_varlen_func passes per-tensor descales to the FlyDSL fp8 kernel."""
-    from aiter import flash_attn_varlen_func
+def test_fp8_public_varlen_descale_routes_to_flydsl(monkeypatch):
+    """flash_attn_varlen_func passes per-tensor descales to the FlyDSL fp8 kernel.
 
+    CK is stubbed to fail so a silent FlyDSL decline cannot pass via CK.
+    """
+    from aiter import flash_attn_varlen_func
+    from aiter.ops import mha as mha_module
+
+    class _CkStub:
+        @staticmethod
+        def apply(*args):
+            pytest.fail("expected the FlyDSL fp8 route, got CK")
+
+    monkeypatch.setattr(mha_module, "ENABLE_CK", True)
+    monkeypatch.setattr(mha_module, "FlashAttnVarlenFunc", _CkStub)
     (q, k, v), (qs, ks, vs), cu = _fp8_public_varlen_inputs()
     L = q.shape[0]
     out = flash_attn_varlen_func(
@@ -2059,27 +2070,93 @@ def test_fp8_public_varlen_descale_overflow_falls_back_to_ck(monkeypatch):
     assert out == "ck"
 
 
+@pytest.mark.parametrize("enable_ck", [True, False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_public_varlen_descale_rejects_non_fp8_before_dispatch(monkeypatch, dtype):
-    """Descales with non-fp8 q raise before any backend could drop them.
+def test_public_varlen_descale_non_fp8_keeps_main_contract(
+    monkeypatch, dtype, enable_ck
+):
+    """Non-fp8 q with descales keeps main's behaviour and never reaches FlyDSL.
 
-    The FlyDSL entry is stubbed to accept the call, like the gfx1250 bf16 m32x8
-    path that ignores descales, so the check is exercised on every arch.
+    With CK the call and its descales go to CK unchanged; without CK it raises
+    RuntimeError. The FlyDSL stub would accept the call, like the gfx1250 bf16
+    m32x8 kernel that has no descale input, so routing there would drop them.
     """
     from aiter import flash_attn_varlen_func
+    from aiter.ops import mha as mha_module
     from aiter.ops.flydsl import fmha_kernels
 
+    ck_args = []
+
+    class _CkStub:
+        @staticmethod
+        def apply(*args):
+            ck_args.append(args)
+            return "ck"
+
+    monkeypatch.setattr(mha_module, "ENABLE_CK", enable_ck)
+    monkeypatch.setattr(mha_module, "FlashAttnVarlenFunc", _CkStub)
     monkeypatch.setattr(
         fmha_kernels,
         "flydsl_flash_attn_varlen_func",
-        lambda *a, **kw: pytest.fail("descales reached backend dispatch"),
+        lambda *a, **kw: pytest.fail("non-fp8 descales reached FlyDSL"),
     )
+    L, H = 1024, 4
+    q, k = (torch.empty(L, H, 192, dtype=dtype) for _ in range(2))
+    v = torch.empty(L, H, 128, dtype=dtype)
+    qs, ks, vs = (torch.full((1,), x, dtype=torch.float32) for x in (0.5, 2.0, 4.0))
+    cu = torch.tensor([0, L], dtype=torch.int32)
+    kwargs = {"causal": True, "q_descale": qs, "k_descale": ks, "v_descale": vs}
+    if enable_ck:
+        assert flash_attn_varlen_func(q, k, v, cu, cu, L, L, **kwargs) == "ck"
+        assert len(ck_args) == 1
+        assert ck_args[0][-3:] == (qs, ks, vs)
+    else:
+        with pytest.raises(RuntimeError, match="requires ENABLE_CK=1"):
+            flash_attn_varlen_func(q, k, v, cu, cu, L, L, **kwargs)
+        assert ck_args == []
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_public_varlen_partial_descales_raise(monkeypatch, dtype):
+    """Passing only some of q/k/v_descale stays a ValueError, as on main."""
+    from aiter import flash_attn_varlen_func
+
+    _stub_varlen_backends(monkeypatch)
     L, H, D = 128, 4, 128
-    q, k, v = (torch.randn(L, H, D, dtype=dtype) for _ in range(3))
+    q, k, v = (torch.empty(L, H, D, dtype=dtype) for _ in range(3))
     s = torch.ones(1, dtype=torch.float32)
     cu = torch.tensor([0, L], dtype=torch.int32)
-    with pytest.raises(ValueError, match="require FP8"):
+    with pytest.raises(ValueError, match="together"):
         flash_attn_varlen_func(q, k, v, cu, cu, L, L, causal=True, q_descale=s)
+
+
+def test_flydsl_varlen_bf16_kernel_declines_descales(monkeypatch):
+    """The gfx1250 bf16 varlen entry returns None for descales instead of dropping them.
+
+    Without descales the call passes the gate and reaches ``_check_out`` (stubbed
+    to raise a sentinel), so the decline comes from the descales alone.
+    """
+    from aiter.jit.utils import chip_info
+    from aiter.ops.flydsl import fmha_kernels
+
+    class _ReachedKernel(Exception):
+        pass
+
+    def _sentinel(*args, **kwargs):
+        raise _ReachedKernel
+
+    monkeypatch.setattr(chip_info, "get_gfx", lambda: "gfx1250")
+    monkeypatch.setattr(fmha_kernels, "_check_out", _sentinel)
+    L, H, D = 128, 4, 128
+    q, k, v = (torch.empty(L, H, D, dtype=torch.bfloat16) for _ in range(3))
+    s = torch.ones(1, dtype=torch.float32)
+    cu = torch.tensor([0, L], dtype=torch.int32)
+    with pytest.raises(_ReachedKernel):
+        fmha_kernels.flydsl_flash_attn_varlen_func(q, k, v, cu, cu, L, L, causal=True)
+    out = fmha_kernels.flydsl_flash_attn_varlen_func(
+        q, k, v, cu, cu, L, L, causal=True, q_descale=s, k_descale=s, v_descale=s
+    )
+    assert out is None
 
 
 def _stub_varlen_backends(monkeypatch):
@@ -2111,7 +2188,10 @@ def _stub_varlen_backends(monkeypatch):
         (1024, 192, "flydsl"),
         (16384, 192, "flydsl"),
         (1024, 128, "flydsl"),
-        (8191, 128, "flydsl"),
+        (4096, 128, "flydsl"),
+        (4097, 128, "ck"),
+        (6144, 128, "ck"),
+        (8191, 128, "ck"),
         (8192, 128, "ck"),
         (16384, 128, "ck"),
         (1024, 64, "ck"),
@@ -2146,6 +2226,40 @@ def test_public_varlen_descale_route(monkeypatch, total_q, qk_hdim, expected):
     )
     assert out == expected
     assert calls == [expected]
+
+
+def test_public_varlen_descale_hd128_cutoff_is_inclusive_4096():
+    """128/128 takes FlyDSL up to and including 4096 total q tokens, then CK.
+
+    4096 is the largest size the PR measured FlyDSL faster at every head count;
+    6144-8192 tokens with 12 heads measured at or below CK.
+    """
+    from aiter.ops import mha as mha_module
+
+    assert mha_module._FLYDSL_FP8_DESCALE_HD128_MAX_Q_TOKENS == 4096
+    v = torch.empty(1, 1, 128, dtype=torch.float8_e4m3fn)
+    for heads in (1, 12, 24):
+        for total_q, expected in ((4096, True), (4097, False)):
+            q = torch.empty(total_q, heads, 128, dtype=torch.float8_e4m3fn)
+            assert mha_module._prefer_flydsl_fp8_descale(q, v) is expected
+
+
+def test_public_varlen_descale_without_ck_ignores_the_cutoff(monkeypatch):
+    """Without CK, FlyDSL is the only descale backend, so 128/128 tries it at any size."""
+    from aiter import flash_attn_varlen_func
+    from aiter.ops import mha as mha_module
+
+    calls = _stub_varlen_backends(monkeypatch)
+    monkeypatch.setattr(mha_module, "ENABLE_CK", False)
+    L, H = 8192, 1
+    q, k, v = (torch.empty(L, H, 128, dtype=torch.float8_e4m3fn) for _ in range(3))
+    s = torch.ones(1, dtype=torch.float32)
+    cu = torch.tensor([0, L], dtype=torch.int32)
+    out = flash_attn_varlen_func(
+        q, k, v, cu, cu, L, L, causal=True, q_descale=s, k_descale=s, v_descale=s
+    )
+    assert out == "flydsl"
+    assert calls == ["flydsl"]
 
 
 def test_public_varlen_descale_fnuz_reaches_ck(monkeypatch):

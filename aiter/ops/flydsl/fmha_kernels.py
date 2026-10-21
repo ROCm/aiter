@@ -458,6 +458,10 @@ def flydsl_flash_attn_varlen_func(
         and alibi_slopes is None
         and _sink_ok
         and not return_attn_probs
+        # The bf16/fp16 kernel has no descale input; decline rather than drop them.
+        and q_descale is None
+        and k_descale is None
+        and v_descale is None
     )
     if not supported:
         return None
