@@ -32,7 +32,7 @@ mode costs up to 20%; `tie='low'` is the request. `tie=` also narrows the
 backend set to those that can promise a direction, which costs speed.
 """
 
-from functools import lru_cache
+from functools import cache, lru_cache
 
 import torch
 import triton
@@ -157,13 +157,18 @@ def _unsupported_arch() -> str | None:
     return None if gfx in _SUPPORTED_GFX else gfx
 
 
-@lru_cache(maxsize=8)
+@cache
 def _full_rows(rows: int, width: int, device: torch.device) -> torch.Tensor:
     """The default `end`: every row live to the full width.
 
     Cached because it is a constant the kernels only read, and building it per
     call is an allocation and a fill launch -- 6us against 7-10us of device time
     for the selection.
+
+    Never evicted: a CUDA graph captured around a selection bakes this tensor's
+    address in, and a caller that captures one graph per batch size touches a
+    `rows` per graph. A bounded cache frees the tensors of the earlier graphs,
+    which then replay reading whatever reuses that memory as row lengths.
     """
     return torch.full((rows,), width, dtype=torch.int32, device=device)
 

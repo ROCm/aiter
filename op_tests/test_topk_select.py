@@ -475,6 +475,36 @@ def test_invariants(m, n, k):
     return failures
 
 
+def test_default_end_outlives_captured_graphs(sizes: int = 20, width: int = 248320):
+    """Graphs captured at many row counts keep a valid default `end`.
+
+    A speculative drafter captures one graph per batch size around a
+    `tie='low'` argmax with no `end`, so each graph bakes in the default
+    row-length tensor for its row count. With the tensor cache bounded below the
+    number of sizes, the early graphs replayed reading freed memory as row
+    lengths and returned garbage indices. Returns the failing row counts.
+    """
+    graphs = []
+    for rows in range(1, sizes + 1):
+        x = torch.randn(rows, width, dtype=dtypes.bf16)
+        out = torch.empty(rows, 1, dtype=torch.int32)
+        topk_select(x, 1, tie="low", output_idx=out)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            topk_select(x, 1, tie="low", output_idx=out)
+        graphs.append((rows, g, x, out))
+    # Reuse whatever an evicted row-length tensor would have left behind.
+    scratch = [torch.zeros(1 << 16, dtype=torch.int32) for _ in range(64)]
+    bad = []
+    for rows, g, x, out in graphs:
+        out.fill_(-1)
+        g.replay()
+        if not torch.equal(out[:, 0].long(), x.float().argmax(dim=1)):
+            bad.append(rows)
+    del scratch
+    return bad
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("topk_select unsupported on %s; skipping", get_gfx())
@@ -529,6 +559,11 @@ def main():
     aiter.logger.info(
         "half-format invariants: %s",
         "all hold" if not bad else f"{len(bad)} FAILED: {bad}",
+    )
+    bad = test_default_end_outlives_captured_graphs()
+    aiter.logger.info(
+        "default end under captured graphs: %s",
+        "all hold" if not bad else f"{len(bad)} FAILED: rows {bad}",
     )
 
     df = [
