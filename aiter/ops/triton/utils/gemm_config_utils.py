@@ -248,6 +248,15 @@ def compute_splitk_params(config: dict, K: int) -> dict:
     return config
 
 
+def clamp_num_buffers(
+    num_buffers: int, k_tiles: int, prefetch_all: bool = False
+) -> int:
+    """
+    Clamp the NUM_BUFFERS of a gfx1250 Gluon GEMM to the K tiles of one split.
+    """
+    return min(num_buffers, k_tiles if prefetch_all else k_tiles + 1)
+
+
 def _padded_size_32_4(n):
     pad = (n >> 5) << 2
     if (n & 31) == 0 and pad >= 4:

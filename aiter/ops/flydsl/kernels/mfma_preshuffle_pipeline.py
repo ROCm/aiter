@@ -13,12 +13,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl.expr.typing import T
 
 
 def crd2idx(crd, layout):
-    """crd2idx returning an index-typed ir.Value (unwraps fly.int_tuple)."""
+    """crd2idx returning an index-typed value (unwraps fly.int_tuple)."""
     return fx.Index(fx.get_scalar(fx.crd2idx(crd, layout))).ir_value()
 
 
@@ -30,8 +29,7 @@ def swizzle_xor16(row, col, k_blocks16):
     k_blocks16 is always a power of 2 (tile_k_bytes / 16), so use
     bitwise AND instead of remui to save ~10 VALU cycles on CDNA.
     """
-    mask = fx.Index(k_blocks16) - 1
-    rem = fx.Index(row) & mask
+    rem = fx.Index(row) & (k_blocks16 - 1)
     return fx.Index(col) ^ (rem * 16)
 
 
@@ -95,8 +93,8 @@ class PreshuffleScaleLayout:
 
 def make_preshuffle_scale_layout(
     *,
-    c_mn: ir.Value,
-    c_k: ir.Value,
+    c_mn,
+    c_k,
     mn_pack: int = 2,
     k_pack: int = 2,
     elem_bytes: int = 4,
@@ -107,12 +105,12 @@ def make_preshuffle_scale_layout(
     Layout shape: ``(c_mn1, c_k1, 4, 16)`` where
     ``c_mn1 = c_mn / 16 / mn_pack`` and ``c_k1 = (c_k / scale_block_size) / 4 / k_pack``.
     """
-    c16 = fx.Index(16)
-    c4 = fx.Index(4)
-    c_k_scale = c_k // fx.Index(scale_block_size)
+    c16 = 16
+    c4 = 4
+    c_k_scale = c_k // scale_block_size
 
-    c_mn1 = (c_mn // c16) // fx.Index(mn_pack)
-    c_k1 = (c_k_scale // c4) // fx.Index(k_pack)
+    c_mn1 = (c_mn // c16) // mn_pack
+    c_k1 = (c_k_scale // c4) // k_pack
     if elem_bytes != mn_pack * k_pack:
         raise ValueError(
             f"elem_bytes of scale must be {mn_pack} * {k_pack}, got {elem_bytes!r}"
@@ -151,8 +149,8 @@ class PreshuffleBLayout:
 
 def make_preshuffle_b_layout(
     *,
-    c_n: ir.Value,
-    c_k: ir.Value,
+    c_n,
+    c_k,
     kpack_bytes: int = 16,
     elem_bytes: int = 1,
     k_major: bool = False,
@@ -166,29 +164,29 @@ def make_preshuffle_b_layout(
     if kpack_bytes not in (8, 16):
         raise ValueError(f"kpack_bytes must be 8 or 16, got {kpack_bytes!r}")
 
-    c16 = fx.Index(16)
-    c_kpack = fx.Index(kpack_bytes)
+    c16 = 16
+    c_kpack = kpack_bytes
 
     if elem_bytes not in (1, 2):
         raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
-    c_k_bytes = c_k * fx.Index(elem_bytes)
+    c_k_bytes = c_k * elem_bytes
     n0 = c_n // c16
 
-    c_kpack_elems = c_kpack if elem_bytes == 1 else (c_kpack // fx.Index(elem_bytes))
+    c_kpack_elems = c_kpack if elem_bytes == 1 else (c_kpack // elem_bytes)
 
     stride_nlane = c_kpack_elems
 
     if k_major:
-        c32 = fx.Index(32)
-        c2 = fx.Index(2)
+        c32 = 32
+        c2 = 2
         c_k0 = c_k_bytes // c32
         klane_dim = 2
         stride_klane = c16 * stride_nlane
         stride_n0 = c2 * stride_klane
         stride_k0 = n0 * stride_n0
     else:
-        c64 = fx.Index(64)
-        c4 = fx.Index(4)
+        c64 = 64
+        c4 = 4
         c_k0 = c_k_bytes // c64
         klane_dim = 4
         stride_klane = c16 * stride_nlane
@@ -212,7 +210,7 @@ def make_preshuffle_b_layout(
 
 def tile_chunk_coord_i32(
     *,
-    tx_i32_base: ir.Value,
+    tx_i32_base,
     i: int,
     total_threads: int,
     layout_tile_div4,
@@ -221,7 +219,7 @@ def tile_chunk_coord_i32(
     """Map (thread, chunk_id) -> (row_local, col_local_i32) for X/A loads."""
     if chunk_i32 not in (1, 2, 4):
         raise ValueError(f"chunk_i32 must be one of (1,2,4), got {chunk_i32!r}")
-    chunk_off_i32 = fx.Index(i * total_threads * chunk_i32)
+    chunk_off_i32 = i * total_threads * chunk_i32
     tile_idx_i32 = tx_i32_base + chunk_off_i32
     coord_local = fx.idx2crd(fx.Int32(tile_idx_i32), layout_tile_div4)
     row_local = fx.get(coord_local, 0)
@@ -233,7 +231,7 @@ def buffer_copy_gmem16_dwordx4(
     buffer_ops,
     *,
     elem_type,
-    idx_i32: ir.Value,
+    idx_i32,
     rsrc,
     vec_elems: int = 16,
     elem_bytes: int = 1,
@@ -256,12 +254,12 @@ def _lds_store_xor16(
     *,
     lds_ptr,
     layout_lds,
-    row_local: ir.Value,
-    col_local_i32: ir.Value,
-    tx_c4: ir.Value,
-    k_blocks16: ir.Value,
-    lds_base: ir.Value,
-    vec_part: ir.Value,
+    row_local,
+    col_local_i32,
+    tx_c4,
+    k_blocks16,
+    lds_base,
+    vec_part,
     elem_bytes: int,
 ):
     """Store one chunk into LDS (fly u8 ptr) with CK-style XOR16 K swizzle."""
@@ -279,12 +277,12 @@ def lds_store_16b_xor16(
     *,
     lds_ptr,
     layout_lds,
-    row_local: ir.Value,
-    col_local_i32: ir.Value,
-    tx_c4: ir.Value,
-    k_blocks16: ir.Value,
-    lds_base: ir.Value,
-    vec_part_i32x4: ir.Value,
+    row_local,
+    col_local_i32,
+    tx_c4,
+    k_blocks16,
+    lds_base,
+    vec_part_i32x4,
     elem_bytes: int = 1,
 ):
     """Store one 16B chunk into LDS (fly u8 ptr) with CK-style XOR16 K swizzle."""
@@ -305,12 +303,12 @@ def lds_store_8b_xor16(
     *,
     lds_ptr,
     layout_lds,
-    row_local: ir.Value,
-    col_local_i32: ir.Value,
-    tx_c4: ir.Value,
-    k_blocks16: ir.Value,
-    lds_base: ir.Value,
-    vec_part_i32x2: ir.Value,
+    row_local,
+    col_local_i32,
+    tx_c4,
+    k_blocks16,
+    lds_base,
+    vec_part_i32x2,
     elem_bytes: int = 1,
 ):
     """Store one 8B chunk into LDS (fly u8 ptr) with CK-style XOR16 K swizzle."""
@@ -331,12 +329,12 @@ def lds_store_4b_xor16(
     *,
     lds_ptr,
     layout_lds,
-    row_local: ir.Value,
-    col_local_i32: ir.Value,
-    tx_c4: ir.Value,
-    k_blocks16: ir.Value,
-    lds_base: ir.Value,
-    vec_part_i32x1: ir.Value,
+    row_local,
+    col_local_i32,
+    tx_c4,
+    k_blocks16,
+    lds_base,
+    vec_part_i32x1,
     elem_bytes: int = 1,
 ):
     """Store one 4B chunk into LDS (fly u8 ptr) with CK-style XOR16 K swizzle."""
@@ -385,29 +383,24 @@ def xcd_remap_bx_by(
     if xcd_swizzle <= 0:
         return bx, by
 
-    _c1 = fx.Index(1)
-    _c_tm = fx.Index(tile_m)
     grid_n = (N + tile_n - 1) // tile_n if N % tile_n else N // tile_n
-    _gx = fx.Index(grid_n)
-    _gy = (c_m + _c_tm - _c1) // _c_tm
+    _gy = (c_m + tile_m - 1) // tile_m
 
-    _linear_id = bx * _gx + by
-    _num_wgs = _gx * _gy
+    _linear_id = bx * grid_n + by
+    _num_wgs = grid_n * _gy
 
-    _c_xcds = fx.Index(num_xcds)
-    _q = _num_wgs // _c_xcds
-    _r = _num_wgs % _c_xcds
-    _xcd = _linear_id % _c_xcds
-    _in_xcd = _linear_id // _c_xcds
+    _q = _num_wgs // num_xcds
+    _r = _num_wgs % num_xcds
+    _xcd = _linear_id % num_xcds
+    _in_xcd = _linear_id // num_xcds
     _clip = (_xcd < _r).select(_xcd, _r)
     _wgid = _xcd * _q + _clip + _in_xcd
 
-    _c_wgm = fx.Index(xcd_swizzle)
-    _num_wgid_in_group = _c_wgm * _gx
+    _num_wgid_in_group = xcd_swizzle * grid_n
     _group_id = _wgid // _num_wgid_in_group
-    _first_pid_m = _group_id * _c_wgm
+    _first_pid_m = _group_id * xcd_swizzle
     _remaining_m = _gy - _first_pid_m
-    _group_size_m = (_remaining_m < _c_wgm).select(_remaining_m, _c_wgm)
+    _group_size_m = (_remaining_m < xcd_swizzle).select(_remaining_m, xcd_swizzle)
 
     _wgid_in_group = _wgid % _num_wgid_in_group
     new_bx = _first_pid_m + (_wgid_in_group % _group_size_m)

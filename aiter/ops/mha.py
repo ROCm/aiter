@@ -1246,7 +1246,7 @@ def cmdGenFunc_mha_bwd(
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
-        "flags_extra_cc": ["'-DONLY_FAV3=0'"],
+        "flags_extra_cc": ["-DONLY_FAV3=0"],
     }
 
 
@@ -1504,7 +1504,7 @@ def cmdGenFunc_mha_varlen_bwd(
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
-        "flags_extra_cc": ["'-DONLY_FAV3=0'"],
+        "flags_extra_cc": ["-DONLY_FAV3=0"],
     }
 
 
@@ -3787,9 +3787,8 @@ def flash_attn_varlen_func(
         is_hd192x128 = hdim_q == 192 and hdim_v == 128
         if not ((hdim_q in (64, 128) and hdim_v == hdim_q) or is_hd192x128):
             return False
-        # Experimental FlyDSL m32x8 kernel owns the 128/128 path when enabled;
-        # yield so it reaches flydsl_flash_attn_varlen_func below.
-        if hdim_q == 128 and is_experimental_enabled():
+        # Yield these to the FlyDSL m32x8 kernel below; without 192 the bshd and thd routers disagree.
+        if hdim_q in (64, 128, 192) and is_experimental_enabled():
             return False
         if nhead_q % nhead_k != 0:
             return False
@@ -3843,15 +3842,13 @@ def flash_attn_varlen_func(
             v_descale,
         )
 
-    # FlyDSL path returns result if supported, None otherwise. window_size[2] (sink
-    # size) is unsupported: the FlyDSL gate rejects it, and this screen keeps it off
-    # the path so a sink-token request is never silently dropped.
-    # FlyDSL also does not consume precomputed Q/K/V descales, so keep
-    # prequantized FP8 attention on the CK path.
     if (
         _FLYDSL_AVAILABLE
         and not has_all_descales
         and (len(window_size) < 3 or window_size[2] == 0)
+        and cu_seqlens_q_padded is None
+        and cu_seqlens_k_padded is None
+        and logits_soft_cap == 0.0
     ):
         from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
 

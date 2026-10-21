@@ -1408,18 +1408,27 @@ def mla_decode_fwd(
             num_kv_splits = get_mla_decode_fwd_max_splits(
                 ori_nhead, max_seqlen_q, q.dtype, kv_buffer.dtype
             )
+        # FP8 Q/KV with per-tensor scales, or BF16 Q/KV (no scales read).
+        ps1_is_fp8 = (
+            q.dtype == dtypes.fp8
+            and kv_buffer.dtype == dtypes.fp8
+            and q_scale is not None
+            and kv_scale is not None
+        )
+        ps1_is_bf16 = q.dtype == dtypes.bf16 and kv_buffer.dtype == dtypes.bf16
         use_flydsl_ps1 = (
             os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") == "1"
             and get_gfx() == "gfx1250"
             and page_size == 1
-            and q.dtype == dtypes.fp8
-            and kv_buffer.dtype == dtypes.fp8
+            and (ps1_is_fp8 or ps1_is_bf16)
             and nhead in (16, 32, 64, 96, 128)
-            and (nhead in (16, 96) or max_seqlen_q == 1)
+            and (
+                nhead == 96
+                or max_seqlen_q == 1
+                or (nhead <= 64 and max_seqlen_q <= 4 and nhead * max_seqlen_q <= 128)
+            )
             and (cp_world_size == 1 or g_kv_indptr is not None)
             and not intra_batch_mode
-            and q_scale is not None
-            and kv_scale is not None
         )
         if use_flydsl_ps1:
             pass
@@ -1570,11 +1579,12 @@ def mla_decode_fwd(
             )
         )
 
-        # Head counts with code objects exported from the FlyDSL PS1 kernel
+        # FP8 head counts with code objects exported from the FlyDSL PS1 kernel
         # (hsa/gfx1250/mla_dsl/mla_dsl.csv) take them by default;
-        # AITER_MLA_DECODE_PS1_ASM=0 keeps them on FlyDSL JIT.
+        # AITER_MLA_DECODE_PS1_ASM=0 keeps them on FlyDSL JIT. BF16 is JIT only.
         use_ps1_asm = (
             use_flydsl_ps1
+            and ps1_is_fp8
             and nhead in (96, 128)
             and os.environ.get("AITER_MLA_DECODE_PS1_ASM", "1") == "1"
         )
@@ -1599,6 +1609,28 @@ def mla_decode_fwd(
                 g_kv_indptr,
                 cp_world_size,
                 cp_rank,
+            )
+        elif use_flydsl_ps1 and ps1_is_bf16:
+            from aiter.ops.flydsl.mla_kernels import flydsl_mla_pagesize1_bf16_bf16
+
+            flydsl_mla_pagesize1_bf16_bf16(
+                logits.view(-1, nhead, v_head_dim),
+                attn_lse.view(-1, nhead),
+                o,
+                q,
+                kv_buffer,
+                kv_indices,
+                work_indptr,
+                work_info_set,
+                sm_scale,
+                final_lse=final_lse,
+                max_seqlen_q=max_seqlen_q,
+                causal=causal,
+                qo_indptr=qo_indptr,
+                kv_indptr=kv_indptr,
+                g_kv_indptr=g_kv_indptr,
+                cp_world_size=cp_world_size,
+                cp_rank=cp_rank,
             )
         elif use_flydsl_ps1:
             from aiter.ops.flydsl.mla_kernels import flydsl_mla_pagesize1_fp8_fp8
