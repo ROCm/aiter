@@ -17,6 +17,7 @@ Default run (CI, ``python3 op_tests/test_moe_swiglu_oai_flat.py``):
 """
 
 import importlib
+import inspect
 import math
 
 import torch
@@ -248,9 +249,11 @@ def check_token(token, w, expected_kernel, seed=0):
 def check_guard(dispatch_call, **override):
     """Re-resolve a captured asm dispatch with one argument changed."""
     args, kwargs = dispatch_call
-    kwargs = {**kwargs, **override}
+    # Bind to names so positional arguments (e.g. gate_mode) can be overridden.
+    bound = inspect.signature(fm.get_2stage_cfgs).bind(*args, **kwargs).arguments
+    kwargs = {**bound, **override}
     try:
-        metadata = fm.get_2stage_cfgs(*args, **kwargs)
+        metadata = fm.get_2stage_cfgs(**kwargs)
     except NotImplementedError:
         return  # rejected outright: also never reaches the asm kernel
     assert asm_kernel_of(metadata) not in (
@@ -262,6 +265,35 @@ def check_guard(dispatch_call, **override):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+def test_torch_moe_act_swiglu():
+    """The torch_moe reference helpers compute OAI SwiGLU for Swiglu (no GPU needed)."""
+    dp = importlib.import_module("aiter.fused_moe_dp_shared_expert")
+    inter_dim = 64
+    gen = torch.Generator(device="cpu").manual_seed(0)
+    x = torch.randn((8, 2 * inter_dim), generator=gen, device="cpu") * 4
+    gate, up = x.split([inter_dim, inter_dim], dim=-1)
+    # OAI SwiGLU, written out: alpha=1.702, gate clamped above, up to +-7, up + 1.
+    g = gate.clamp(max=7.0)
+    expected = g * torch.sigmoid(1.702 * g) * (up.clamp(-7.0, 7.0) + 1)
+    torch_act = aiter.get_torch_act(ActivationType.Swiglu)
+    for mod in (fm, dp):
+        out = mod.torch_moe_act(
+            x, torch_act, inter_dim, activation=ActivationType.Swiglu
+        )
+        torch.testing.assert_close(out, expected, msg=f"{mod.__name__}.torch_moe_act")
+        try:
+            mod.torch_moe_act(
+                gate, torch_act, inter_dim, activation=ActivationType.Swiglu
+            )
+        except NotImplementedError:
+            pass
+        else:
+            raise AssertionError(f"{mod.__name__}: non-g1u1 Swiglu must raise")
+    # Matches the swiglu() used by torch_moe_stage1 (the fused-path reference).
+    torch.testing.assert_close(expected, fm.swiglu(gate, up))
+    print("[pass] test_torch_moe_act_swiglu")
+
+
 def _skip_reason():
     if not torch.cuda.is_available():
         return "no GPU"
@@ -284,14 +316,18 @@ def test_swiglu_oai_flat_minimax_m3():
         if kernel is not None and asm_dispatch is None:
             asm_dispatch = dispatch
     assert asm_dispatch is not None
-    # The asm kernels hard-code alpha/limit and take no bias: such calls must
-    # fall back instead of silently computing a different function.
+    # The asm kernels hard-code alpha/limit, take no bias and read GGUU
+    # (separated) weights: such calls must fall back instead of silently
+    # computing a different function.
     check_guard(asm_dispatch, has_stage1_bias=True)
     check_guard(asm_dispatch, has_stage2_bias=True)
     check_guard(asm_dispatch, swiglu_limit=5.0)
+    check_guard(asm_dispatch, gate_mode=GateMode.INTERLEAVE.value)
+    check_guard(asm_dispatch, gate_up_interleave=True)
     print("[pass] test_swiglu_oai_flat_minimax_m3")
 
 
 if __name__ == "__main__":
+    test_torch_moe_act_swiglu()
     torch.set_default_device("cuda")
     test_swiglu_oai_flat_minimax_m3()
