@@ -159,6 +159,14 @@ def gdn_fused_prefill_fwd(
         raise ValueError(
             f"cache_indices has {cache_indices.numel()} entries for {N} sequences"
         )
+    for name, tensor in (
+        ("cu_seqlens", cu_seqlens),
+        ("cache_indices", cache_indices),
+        ("track_state", track_state),
+        ("track_chunk_idx", track_chunk_idx if track_state is not None else None),
+    ):
+        if tensor is not None and tensor.device != q.device:
+            raise ValueError(f"{name} must be on {q.device}, got {tensor.device}")
     cu = cu_seqlens.to(torch.int32).contiguous()
     idx = cache_indices[:N].to(torch.int32).contiguous()
 
