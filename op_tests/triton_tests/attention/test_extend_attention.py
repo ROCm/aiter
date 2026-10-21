@@ -136,15 +136,6 @@ def input_helper(
     )
 
 
-@pytest.fixture(autouse=True)
-def restore_torch_defaults():
-    """test_op_fwd sets the default device and dtype. Restore them for the tests after it."""
-    dtype, device = torch.get_default_dtype(), torch.get_default_device()
-    yield
-    torch.set_default_dtype(dtype)
-    torch.set_default_device(None if device.type == "cpu" else device)
-
-
 @pytest.mark.parametrize(
     "B, H, prefix, extend, kv_lora_rank, qk_rope_head_dim, v_head_dim",
     [
@@ -289,6 +280,9 @@ def test_op_fwd(
 
         ref_out[start_q:end_q] = out_prefix.to(dtype) + out_extend.to(dtype)
 
+    # Reset the defaults that this test set, so that later tests get the torch defaults
+    torch.set_default_dtype(torch.float32)
+    torch.set_default_device(None)
     torch.testing.assert_close(ref_out, tri_out, rtol=2e-2, atol=2e-2)
 
 
