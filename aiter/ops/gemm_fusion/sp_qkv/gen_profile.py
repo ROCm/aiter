@@ -2,7 +2,10 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Generate aiter/configs/gemm_fusion/minimax_m3_sp4_gfx950_v1.json from specs.py (signatures computed, never hand-typed).
 Run: python -m aiter.ops.gemm_fusion.sp_qkv.gen_profile [out.json]   (pure Python; works without torch/GPU)
-Rows: exact (sig, arch=gfx950, cu=256, world=4, m=T/4). Small cells here; large cells are added in S2-2b-iii.
+Rows: exact (sig, arch=gfx950, cu=256, world=4, m=T/4): the 6 small cells and the 9 large cells.
+Rules (P1): large range rules for local m = 1024..8192 step 256 (see aiter.gemm_fusion.profile): consulted only where no exact row exists, the most specific
+(largest m_multiple) rule wins. The params of the rules are PLACEHOLDERS (nearest exact row whose plan is valid at every covered m, else n=1); the final params come
+from the tuning sweep.
 """
 
 from __future__ import annotations
@@ -55,6 +58,92 @@ def build_large_rows():
             }
         )
     return rows
+
+
+RULE_M_MIN, RULE_M_MAX, RULE_M_BASE = 1024, 8192, 256
+FALLBACK_PARAMS = {
+    "n": 1,
+    "half_first": 0,
+    "no_gridread": 1,
+}  # valid for every M multiple of 256 (n=1 needs no divisibility)
+
+
+def _plan_valid(mode, params, m):
+    """Would the large plan accept these params at local M = m? (the real constructor: n in {1,2,4} with (M/256) % n == 0, n3q only at M=2048, ...)"""
+    from aiter.gemm_fusion.match import ContractError, MatchCtx
+
+    from . import variants_large
+
+    ctx = MatchCtx(ARCH, CU, WORLD, m, frozenset({"mori_cco", "sdma"}))
+    try:
+        variants_large.SpQkvLarge(specs.sp_qkv_spec(mode).prefix(1), dict(params), ctx)
+    except ContractError:
+        return False
+    return True
+
+
+def build_large_rules():
+    """P1 range rules for local m = 1024..8192, built in LAYERS by m_multiple (the most specific rule wins, see aiter.gemm_fusion.profile): the large plan needs
+    (M/256) % n == 0, so params with n=2 are valid only for M multiples of 512 and n=4 only for multiples of 1024.
+      layer 256   : the whole range, FALLBACK_PARAMS (n=1): valid everywhere;
+      layer 512   : M multiples of 512, the nearest exact row with n <= 2;
+      layer 1024  : M multiples of 1024, the nearest exact row with n <= 4.
+    PLACEHOLDER params: nearest exact large row of the same mode (distance in m, ties to the smaller m; the M=2048-only quarter-first plan is never extended);
+    every assignment is validated against the real plan constructor at every m it covers. Replace with the tuned params when the sweep is done (edit this
+    function and regenerate: `python op_tests/gen_gemm_fusion_profile.py`)."""
+    rules = []
+    for mode in ("dense", "indexer", "reuse"):
+        sp = specs.sp_qkv_spec(mode).prefix(1)  # GEMM + SPExchange only
+        cells = sorted(
+            (T // WORLD, vid, dict(params))
+            for (md, T), (vid, params) in specs.LARGE_CELLS.items()
+            if md == mode and params.get("half_first") != 2
+        )
+        vid0 = cells[0][1]
+        for step in (RULE_M_BASE, 2 * RULE_M_BASE, 4 * RULE_M_BASE):
+            runs = []  # [first_m, last_m, params, source]
+            for m in range(RULE_M_MIN, RULE_M_MAX + 1, step):
+                eligible = [
+                    c
+                    for c in cells
+                    if step % (RULE_M_BASE * int(c[2].get("n", 1))) == 0
+                    and _plan_valid(mode, c[2], m)
+                ]
+                if eligible:
+                    src_m, _vid, params = min(
+                        eligible, key=lambda c: (abs(c[0] - m), c[0])
+                    )
+                    source = f"nearest exact row (m={src_m})"
+                else:
+                    params, source = dict(FALLBACK_PARAMS), "fallback n=1"
+                assert _plan_valid(mode, params, m), (mode, step, m, params)
+                if runs and runs[-1][2] == params:
+                    runs[-1][1] = m
+                    if runs[-1][3] != source:
+                        runs[-1][3] = "nearest exact rows"
+                else:
+                    runs.append([m, m, params, source])
+            if (
+                step > RULE_M_BASE
+            ):  # a layer that only repeats the fallback adds nothing
+                runs = [r for r in runs if r[2] != FALLBACK_PARAMS]
+            for lo, hi, params, source in runs:
+                rules.append(
+                    {
+                        "sig": sp.signature(),
+                        "arch": ARCH,
+                        "cu": CU,
+                        "world": WORLD,
+                        "m_min": lo,
+                        "m_max": hi,
+                        "m_multiple": step,
+                        "vid": vid0,
+                        "params": params,
+                        "name": f"{mode}_m{lo}-{hi}_x{step}",
+                        "note": f"PLACEHOLDER params: {source}; final params from the tuning sweep",
+                    }
+                )
+    return rules
 
 
 def window_budget():
@@ -111,9 +200,10 @@ def build_profile():
         "generated_by": {
             "tool": "aiter.ops.gemm_fusion.sp_qkv.gen_profile",
             "ledger": "sp4-opus-mori-playground records/branch-ledger.md r165 (small), r152 (large)",
-            "note": "m is local tokens per rank (T/4); exact rows only",
+            "note": "m is local tokens per rank (T/4); exact rows plus P1 large range rules (placeholder params)",
         },
         "rows": build_rows(),
+        "rules": build_large_rules(),
     }
 
 

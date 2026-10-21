@@ -29,7 +29,7 @@
   "generated_by": {
     "tool": "aiter.ops.gemm_fusion.sp_qkv.gen_profile",
     "ledger": "sp4-opus-mori-playground records/branch-ledger.md r165 (small), r152 (large)",
-    "note": "m is local tokens per rank (T/4); exact rows only"
+    "note": "m is local tokens per rank (T/4); exact rows plus P1 large range rules (placeholder params)"
   },
   "rows": [
     {
@@ -252,6 +252,212 @@
         "no_gridread": 1
       },
       "cell": "reuse_T32768"
+    }
+  ],
+  "rules": [
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 1024,
+      "m_max": 8192,
+      "m_multiple": 256,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1
+      },
+      "name": "dense_m1024-8192_x256",
+      "note": "PLACEHOLDER params: fallback n=1; final params from the tuning sweep"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 1024,
+      "m_max": 8192,
+      "m_multiple": 512,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1
+      },
+      "name": "dense_m1024-8192_x512",
+      "note": "PLACEHOLDER params: nearest exact row (m=4096); final params from the tuning sweep"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 1024,
+      "m_max": 6144,
+      "m_multiple": 1024,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1
+      },
+      "name": "dense_m1024-6144_x1024",
+      "note": "PLACEHOLDER params: nearest exact row (m=4096); final params from the tuning sweep"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 7168,
+      "m_max": 8192,
+      "m_multiple": 1024,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1
+      },
+      "name": "dense_m7168-8192_x1024",
+      "note": "PLACEHOLDER params: nearest exact row (m=8192); final params from the tuning sweep"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 1024,
+      "m_max": 8192,
+      "m_multiple": 256,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1
+      },
+      "name": "indexer_m1024-8192_x256",
+      "note": "PLACEHOLDER params: fallback n=1; final params from the tuning sweep"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 1024,
+      "m_max": 8192,
+      "m_multiple": 512,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 1,
+        "no_gridread": 1
+      },
+      "name": "indexer_m1024-8192_x512",
+      "note": "PLACEHOLDER params: nearest exact row (m=2048); final params from the tuning sweep"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 1024,
+      "m_max": 3072,
+      "m_multiple": 1024,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 1,
+        "no_gridread": 1
+      },
+      "name": "indexer_m1024-3072_x1024",
+      "note": "PLACEHOLDER params: nearest exact row (m=2048); final params from the tuning sweep"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 4096,
+      "m_max": 8192,
+      "m_multiple": 1024,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1
+      },
+      "name": "indexer_m4096-8192_x1024",
+      "note": "PLACEHOLDER params: nearest exact rows; final params from the tuning sweep"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 1024,
+      "m_max": 8192,
+      "m_multiple": 256,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1
+      },
+      "name": "reuse_m1024-8192_x256",
+      "note": "PLACEHOLDER params: fallback n=1; final params from the tuning sweep"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 1024,
+      "m_max": 8192,
+      "m_multiple": 512,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 1,
+        "no_gridread": 1
+      },
+      "name": "reuse_m1024-8192_x512",
+      "note": "PLACEHOLDER params: nearest exact row (m=2048); final params from the tuning sweep"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 1024,
+      "m_max": 3072,
+      "m_multiple": 1024,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 1,
+        "no_gridread": 1
+      },
+      "name": "reuse_m1024-3072_x1024",
+      "note": "PLACEHOLDER params: nearest exact row (m=2048); final params from the tuning sweep"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 4096,
+      "m_max": 8192,
+      "m_multiple": 1024,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1
+      },
+      "name": "reuse_m4096-8192_x1024",
+      "note": "PLACEHOLDER params: nearest exact rows; final params from the tuning sweep"
     }
   ]
 }

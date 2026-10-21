@@ -365,11 +365,22 @@ def test_large_variant_contract_and_sizes(monkeypatch):
         match_prefix(
             spec, MatchCtx("gfx950", 256, 4, 2048, frozenset({"mori_cco"})), PROFILE
         )
-    # 2-stage prefix has no row at large M -> falls to the 1-stage row (n == 1) ; at M=16 the small variant would apply
-    assert match_prefix(spec, MatchCtx("gfx950", 256, 4, 1024, caps), PROFILE) == (
-        None,
-        0,
+    # 2-stage prefix has no row at large M -> falls to the 1-stage row (n == 1) ; at M=16 the small variant would apply.
+    # m=1024 has no exact row but a P1 range rule covers it (source "rule"); outside the rules' range or off the 256 grid it is still native
+    p1024, n1024 = match_prefix(spec, MatchCtx("gfx950", 256, 4, 1024, caps), PROFILE)
+    assert (
+        n1024 == 1
+        and p1024.profile_source == "rule"
+        and p1024.M == 1024
+        and p1024.n == 2
     )
+    for m_native in (512, 768, 1100, 8448):
+        assert match_prefix(
+            spec, MatchCtx("gfx950", 256, 4, m_native, caps), PROFILE
+        ) == (
+            None,
+            0,
+        )
     # invalid plan params are contract errors, not silent
     sp = specs.sp_qkv_spec("indexer").prefix(1)
     with pytest.raises(ContractError):

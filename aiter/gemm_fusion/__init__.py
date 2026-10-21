@@ -5,7 +5,7 @@ from .catalog import Contract, VariantInfo, get_variant, register_variant
 from .match import ContractError, MatchCtx, match_prefix
 from .plan import Plan, WindowReq
 from .prebuild import prebuild_profile
-from .profile import Profile, ProfileError, load_profile, parse_profile
+from .profile import Profile, ProfileError, Rule, load_profile, parse_profile
 from .resources import (
     CcoBackend,
     FusionResources,
@@ -39,6 +39,7 @@ __all__ = [
     "Profile",
     "ProfileError",
     "ResourceError",
+    "Rule",
     "SPExchange",
     "VariantInfo",
     "Window",

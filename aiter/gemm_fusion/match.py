@@ -2,8 +2,11 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Longest-prefix matching of a FusionSpec against an immutable profile.
 
-Semantics (Artemis §3.4): no profile row for any prefix -> (None, 0) = native.
-Row found but its variant contract is not satisfied -> ContractError.
+Semantics (Artemis §3.4): no profile row (or range rule) for any prefix -> (None, 0) = native.
+Row (or rule) found but its variant contract is not satisfied -> ContractError.
+
+Per prefix the entry is the EXACT row, else the range rule covering m (Profile.resolve); the longest prefix with an entry wins, whatever its source. The result
+depends only on (spec, arch, cu, world, m, available capabilities, graph_mode) and the immutable profile, so every rank resolves identically.
 """
 
 from __future__ import annotations
@@ -35,6 +38,11 @@ class MatchCtx:
 def _check_contract(info, sub: FusionSpec, ctx: MatchCtx, row):
     c = info.contract
     bad = []
+    m_multiple = getattr(row, "m_multiple", None)  # a range rule
+    if m_multiple is not None and m_multiple % c.m_multiple:
+        bad.append(
+            f"range rule {row.label()} m_multiple {m_multiple} is not a multiple of the variant's {c.m_multiple}"
+        )
     if ctx.arch not in c.arch:
         bad.append(f"arch {ctx.arch}")
     if ctx.world != c.world:
@@ -77,7 +85,7 @@ def match_prefix(
     prof = load_profile(profile)
     for n in range(len(spec.stages), 0, -1):
         sub = spec.prefix(n)
-        row = prof.lookup(sub.signature(), ctx.arch, ctx.cu, ctx.world, ctx.m)
+        row, source = prof.resolve(sub.signature(), ctx.arch, ctx.cu, ctx.world, ctx.m)
         if row is None:
             continue
         if row.vid not in catalog._CATALOG:
@@ -91,16 +99,21 @@ def match_prefix(
         plan = info.factory(sub, dict(row.params), ctx)
         plan.vid = row.vid
         plan.n_stages = n
+        plan.profile_source = source  # "row" | "rule"
         log.info(
-            "event=dispatch sig=%s m=%d vid=%s n_stages=%d params=%s",
+            "event=dispatch sig=%s m=%d vid=%s n_stages=%d source=%s%s params=%s",
             sub.signature(),
             ctx.m,
             row.vid,
             n,
+            source,
+            f" rule={row.label()}" if source == "rule" else "",
             dict(row.params),
         )
         return plan, n
     log.info(
-        "event=dispatch sig=%s m=%d vid=native n_stages=0", spec.signature(), ctx.m
+        "event=dispatch sig=%s m=%d vid=native n_stages=0 source=none",
+        spec.signature(),
+        ctx.m,
     )
     return None, 0

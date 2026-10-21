@@ -499,7 +499,7 @@ def plan_profile(
         )
     rows = [
         r
-        for r in profile.rows()
+        for r in profile.entries()  # exact rows AND range rules: a rule implies the builds of the params it selects
         if (arch is None or r.arch == arch)
         and (cu is None or int(r.cu) == int(cu))
         and (world is None or int(r.world) == int(world))

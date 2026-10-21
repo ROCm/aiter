@@ -61,6 +61,13 @@ def _mode_tables():
     return full, pre
 
 
+def _where(entry) -> str:
+    """Human label of a profile row or range rule for skip messages."""
+    if hasattr(entry, "m"):
+        return f"row m={entry.m}"
+    return f"rule m={entry.m_min}..{entry.m_max} step {entry.m_multiple}"
+
+
 def row_mode(row) -> str | None:
     """dense | indexer | reuse of a profile row, recovered from its signature (the row does not store the mode); None when the signature is not an sp_qkv spec."""
     full, pre = _mode_tables()
@@ -270,7 +277,7 @@ def units_for_rows(
         mode = row_mode(r)
         if mode is None:
             skipped.append(
-                f"{r.vid}: row m={r.m} cu={r.cu}: signature is not a known sp_qkv spec"
+                f"{r.vid}: {_where(r)} cu={r.cu}: signature is not a known sp_qkv spec"
             )
             continue
         if r.arch != "gfx950":
