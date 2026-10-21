@@ -9,6 +9,7 @@ from .profile import Profile, ProfileError, Rule, load_profile, parse_profile
 from .resources import (
     CcoBackend,
     FusionResources,
+    ResetError,
     ResourceError,
     Window,
     round_up,
@@ -38,6 +39,7 @@ __all__ = [
     "Plan",
     "Profile",
     "ProfileError",
+    "ResetError",
     "ResourceError",
     "Rule",
     "SPExchange",

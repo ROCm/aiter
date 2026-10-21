@@ -28,9 +28,10 @@ MiB = 1 << 20
 class FakeDist:
     """torch.distributed stand-in (single process). ``diverge_rank``: all_gather_object pretends that rank saw a different object."""
 
-    def __init__(self, diverge_rank=None):
+    def __init__(self, diverge_rank=None, gather_hook=None):
         self.calls = []
         self.diverge_rank = diverge_rank
+        self.gather_hook = gather_hook  # obj -> the list every rank "contributed" (scripts what the OTHER ranks report)
 
     def broadcast_object_list(self, obj, src=0, group=None):
         self.calls.append(("bcast", src))
@@ -40,6 +41,11 @@ class FakeDist:
 
     def all_gather_object(self, out, obj, group=None):
         self.calls.append(("allgather",))
+        if self.gather_hook is not None:
+            vals = self.gather_hook(obj)
+            for i in range(len(out)):
+                out[i] = vals[i]
+            return
         for i in range(len(out)):
             out[i] = obj if i != self.diverge_rank else ("DIVERGED",) + tuple(obj[1:])
 

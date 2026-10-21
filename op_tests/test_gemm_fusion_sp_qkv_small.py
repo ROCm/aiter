@@ -1016,6 +1016,9 @@ def test_atom_cross_repo_api_audit(monkeypatch):
     r.finalize()
     assert r.finalized and small.build_key in r.windows
     assert r.poison_local() == 0
+    r.err_reader = (
+        lambda: 0
+    )  # an R12 plan has the global page: reset() verifies ERR (a device read in production)
     r.quiesce_and_reset()
     r.release()
 

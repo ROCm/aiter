@@ -142,6 +142,10 @@ class GlobalPage:
         """int64 [8], a zero-copy view of DIAG (logging only)."""
         return self._tensor("diag", self.diag_addr, (DIAG_WORDS,), "<i8")
 
+    def read_err(self) -> int:
+        """The ERR word only (4 B D2H, synchronous: after a device sync, never the hot path); used by reset() to verify the zeroing held."""
+        return int(self.err_tensor().cpu()[0]) & 0xFFFFFFFF
+
     def read(self) -> tuple[int, int, list[int]]:
         """(err word, step, diag words): D2H of 4 + 8 + 64 bytes. Needs the device to be quiet (the caller synchronises); NOT for the hot path."""
         err = int(self.err_tensor().cpu()[0]) & 0xFFFFFFFF

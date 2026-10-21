@@ -68,8 +68,23 @@ LG_POISON_NAMES = {
 SHARED_KEY = "<shared>"  # hook key of the shared window set
 
 
+RESET_MAX_ROUNDS = (
+    3  # collective reset(): zero / sync / barrier / verify rounds before it gives up
+)
+
+
 class ResourceError(RuntimeError):
     pass
+
+
+class ResetError(ResourceError):
+    """The collective reset() could not reach an all-zero ERR state: some rank's ERR word was still non-zero after the last round (a peer kernel still inside its wait budget
+    or a remote propagation write that keeps landing). Fatal: the comm cannot be trusted; `words` = {rank: ERR word} of the last verification.
+    """
+
+    def __init__(self, msg: str, words: dict[int, int]):
+        super().__init__(msg)
+        self.words = dict(words)
 
 
 class _ArenaRefused(Exception):
@@ -385,6 +400,13 @@ class FusionResources:
         self.finalized = False
         self._released = False
         # R12 (design card r2): the per-comm ERR/STEP/DIAG page, the async readback ring and the diagnostics hooks read by reset()
+        self.reset_max_rounds = (
+            RESET_MAX_ROUNDS  # reset(): max zero / verify rounds (>= 1)
+        )
+        self.last_reset_rounds = (
+            0  # rounds the last reset() needed (0 = none yet); also logged
+        )
+        self.err_reader = None  # () -> this rank's ERR word; None = a D2H read of the global page's ERR (torch). Injectable for tests / fakes
         self._global: Window | None = None
         self._gpage: GlobalPage | None = None
         self._ring: ReadbackRing | None = None
@@ -1174,9 +1196,15 @@ class FusionResources:
             self.backend.zero(self.device, w.local, w.bytes)
 
     def reset(self):
-        """COLLECTIVE recovery after an error (R12 I6): device sync -> log ERR + DIAG (+ the registered reports) -> drain hooks + sync -> barrier -> zero ALL windows (small
-        ctl+Rx, large S/R/C, the global page: ERR and STEP go back to 0) -> init hooks (large epoch = 1 + magic) -> sync -> barrier. Every rank must call it, and ATOM
-        decides uniformly (a non-zero readback on any rank). Every kernel on every rank is complete before the first barrier, so no propagation write can land after the zeroing.
+        """COLLECTIVE recovery after an error (R12 I6). Every rank must call it, and ATOM decides uniformly (a non-zero readback on any rank).
+        (1) drain: device sync -> log ERR + DIAG (+ the registered reports) -> drain hooks + device sync: every fused kernel of this rank has finished, including ones that were
+            waiting out a timeout;
+        (2) barrier: now every rank's kernels are finished;
+        (3) zero ALL windows (small ctl+Rx, large S/R/C, the global page: ERR and STEP go back to 0), re-run the init hooks (large epoch = 1 + magic), forget the readback ring;
+        (4) device sync + barrier;
+        (5) verify: all-gather every rank's ERR word. If any is non-zero (a peer's propagated ERR, or its remote propagation write, landed AFTER the zeroing: the D-6(b) "ack =>
+            performed" assumption does not hold in practice) repeat (3)-(5), at most `reset_max_rounds` rounds in all, then raise ResetError with the decoded words.
+        The number of rounds needed is logged (`rounds=`) and kept in `last_reset_rounds`. Without a global page (pre-R12 plans only) there is nothing to verify: one round.
         """
         self._collective_reset("reset")
 
@@ -1184,9 +1212,35 @@ class FusionResources:
         """The pre-R12 name of reset() (per-plan poison words are still logged for the pre-R12 plans that registered them). All ranks must call it."""
         self._collective_reset("quiesce_and_reset")
 
+    def _read_err_word(self) -> int:
+        """This rank's ERR word (synchronous D2H; call after a device sync). A failed read propagates: the verification must never take an unreadable word for zero."""
+        if self.err_reader is not None:
+            return int(self.err_reader())
+        return self.global_page().read_err()
+
+    def _gather_err_words(self) -> dict[int, int]:
+        """{rank: ERR word} of every rank (all-gather: the SAME dict on every rank, so every rank decides the same way)."""
+        mine = int(self._read_err_word()) & 0xFFFFFFFF
+        got = [None] * self.world
+        self.dist.all_gather_object(got, mine, group=self.group)
+        return {r: int(w) & 0xFFFFFFFF for r, w in enumerate(got)}
+
+    def _zero_everything(self):
+        self._zero_windows(
+            self._regs
+        )  # every registered window exactly once (a shared window / the arena is not zeroed once per owner)
+        self._unzeroed.clear()
+        for hook in list(
+            self._init_hooks.values()
+        ):  # control-block images; one per owner, one for a shared set
+            hook()
+        if self._ring is not None:
+            self._ring.reset()  # the old readings describe a state that no longer exists
+
     def _collective_reset(self, where: str):
-        """A2-H: device sync -> per-plan drain (large-M: lg_comm_drain_all) + device sync -> barrier -> reset/init windows
-        -> device sync -> barrier."""
+        """See reset(): drain -> barrier -> [zero -> sync -> barrier -> verify] x <= reset_max_rounds."""
+        max_rounds = max(1, int(self.reset_max_rounds))
+        # (1) drain
         self.backend.device_sync(self.device)
         self._log_error_page(
             where
@@ -1198,24 +1252,48 @@ class FusionResources:
             hook()
         if self._drain_hooks:
             self.backend.device_sync(self.device)
+        # (2) every rank's kernels are finished before anyone zeroes
         self._barrier()
-        self._zero_windows(
-            self._regs
-        )  # every registered window exactly once (a shared window is not zeroed once per owner)
-        self._unzeroed.clear()
-        for hook in list(
-            self._init_hooks.values()
-        ):  # control-block images; one per owner, one for a shared set
-            hook()
-        if self._ring is not None:
-            self._ring.reset()  # the old readings describe a state that no longer exists
-        self.backend.device_sync(self.device)
-        self._barrier()
+        verify = self._global is not None
+        rounds, words = 0, {}
+        while True:
+            rounds += 1
+            # (3) zero everything, (4) sync + barrier
+            self._zero_everything()
+            self.backend.device_sync(self.device)
+            self._barrier()
+            if not verify:
+                break
+            # (5) verify
+            words = self._gather_err_words()
+            bad = {r: w for r, w in words.items() if w}
+            if not bad:
+                break
+            log.warning(
+                "event=resources reset_retry rank=%d where=%s round=%d/%d nonzero=%s",
+                self.rank,
+                where,
+                rounds,
+                max_rounds,
+                {r: decode_err(w).describe() for r, w in bad.items()},
+            )
+            if rounds >= max_rounds:
+                self.last_reset_rounds = rounds
+                raise ResetError(
+                    f"{where}: ERR still non-zero after {rounds} zeroing round(s); "
+                    + ", ".join(
+                        f"rank {r}: {decode_err(w).describe()}"
+                        for r, w in sorted(bad.items())
+                    ),
+                    words,
+                )
+        self.last_reset_rounds = rounds
         log.info(
-            "event=resources %s rank=%d windows=%d",
+            "event=resources %s rank=%d windows=%d rounds=%d",
             where,
             self.rank,
             len(self._regs),
+            rounds,
         )
 
     def release(self):
