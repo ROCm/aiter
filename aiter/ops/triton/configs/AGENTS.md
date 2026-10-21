@@ -60,7 +60,7 @@ Two config names must not give the same `<d_type>`: `GEMM-FOO-BAR` and
 | ------ | --------- |
 | `utils/config_utils.py` | `resolve_config_dir`, `load_config_json`, `select_leq_config` |
 | `utils/gemm_config_utils.py` | `get_gemm_config`, `compute_splitk_params`, `clamp_num_buffers`, `add_default_gemm_config_params`, `pick_gemm_num_stages` |
-| `utils/moe_config_utils.py` | `get_moe_dispatch` |
+| `utils/moe_config_utils.py` | `get_moe_dispatch`, `select_moe_row_bucket` |
 | `utils/conv_config_utils.py` | `get_conv_config` and the shape-key helpers |
 | `utils/mhc_config_utils.py` | `get_mhc_config`, `get_mhc_post_config` and the other MHC loaders |
 | `utils/tuned_config_utils.py` | `get_tuned_kernel_config`, `autotune_configs` |
@@ -177,6 +177,10 @@ there is no file. Do not change the returned dict.
 | `A4W4` | `gluon` | `bm<block_m>_n<N>_k<K>_<bucket>`, then `bm<block_m>_any` | `block_n`, `block_k`, `num_buffers`, `num_warps` |
 
 - `block_m` is the key. Do not put `BLOCK_SIZE_M` or `block_m` in an entry.
+- A Triton `A8W4` entry can instead hold row buckets when the winner moves
+  with the routed row count M: `M_LEQ_<n>` keys plus `"any"`, each a full
+  entry. `select_moe_row_bucket(entry, M)` picks one with
+  `select_leq_config()` and returns plain entries unchanged.
 - `<bucket>` comes from `m2bucket()`: `tiny` (M ≤ 8), `small` (M ≤ 32),
   `medium` (M ≤ 128), `medium2` (M ≤ 256), `large` (M ≤ 512) and `xlarge`
   (M > 512). Give each new Gluon shape all six buckets. A missing bucket

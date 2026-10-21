@@ -28,10 +28,10 @@
         "waves_per_eu": 2
     },
     "bm128_n2880_k2880": {
-        "BLOCK_SIZE_K": 256,
-        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 512,
+        "BLOCK_SIZE_N": 256,
         "num_stages": 2,
-        "num_warps": 4,
+        "num_warps": 8,
         "waves_per_eu": 2
     },
     "bm128_n2880_k360": {
@@ -72,7 +72,7 @@
     "bm128_n5760_k2880": {
         "BLOCK_SIZE_K": 256,
         "BLOCK_SIZE_N": 128,
-        "num_stages": 2,
+        "num_stages": 3,
         "num_warps": 4,
         "waves_per_eu": 2
     },
@@ -119,11 +119,41 @@
         "waves_per_eu": 0
     },
     "bm16_n2880_k2880": {
-        "BLOCK_SIZE_K": 512,
-        "BLOCK_SIZE_N": 64,
-        "num_stages": 2,
-        "num_warps": 4,
-        "waves_per_eu": 0
+        "M_LEQ_8": {
+            "BLOCK_SIZE_K": 512,
+            "BLOCK_SIZE_N": 64,
+            "num_stages": 3,
+            "num_warps": 4,
+            "waves_per_eu": 0
+        },
+        "M_LEQ_40": {
+            "BLOCK_SIZE_K": 512,
+            "BLOCK_SIZE_N": 64,
+            "num_stages": 3,
+            "num_warps": 4,
+            "waves_per_eu": 0
+        },
+        "M_LEQ_160": {
+            "BLOCK_SIZE_K": 512,
+            "BLOCK_SIZE_N": 128,
+            "num_stages": 2,
+            "num_warps": 8,
+            "waves_per_eu": 0
+        },
+        "M_LEQ_640": {
+            "BLOCK_SIZE_K": 512,
+            "BLOCK_SIZE_N": 64,
+            "num_stages": 2,
+            "num_warps": 4,
+            "waves_per_eu": 0
+        },
+        "any": {
+            "BLOCK_SIZE_K": 512,
+            "BLOCK_SIZE_N": 128,
+            "num_stages": 2,
+            "num_warps": 8,
+            "waves_per_eu": 0
+        }
     },
     "bm16_n2880_k360": {
         "BLOCK_SIZE_K": 128,
@@ -140,11 +170,41 @@
         "waves_per_eu": 0
     },
     "bm16_n5760_k2880": {
-        "BLOCK_SIZE_K": 512,
-        "BLOCK_SIZE_N": 64,
-        "num_stages": 2,
-        "num_warps": 4,
-        "waves_per_eu": 0
+        "M_LEQ_8": {
+            "BLOCK_SIZE_K": 512,
+            "BLOCK_SIZE_N": 128,
+            "num_stages": 2,
+            "num_warps": 4,
+            "waves_per_eu": 0
+        },
+        "M_LEQ_40": {
+            "BLOCK_SIZE_K": 512,
+            "BLOCK_SIZE_N": 64,
+            "num_stages": 2,
+            "num_warps": 4,
+            "waves_per_eu": 0
+        },
+        "M_LEQ_160": {
+            "BLOCK_SIZE_K": 512,
+            "BLOCK_SIZE_N": 64,
+            "num_stages": 2,
+            "num_warps": 4,
+            "waves_per_eu": 0
+        },
+        "M_LEQ_640": {
+            "BLOCK_SIZE_K": 512,
+            "BLOCK_SIZE_N": 64,
+            "num_stages": 2,
+            "num_warps": 4,
+            "waves_per_eu": 0
+        },
+        "any": {
+            "BLOCK_SIZE_K": 512,
+            "BLOCK_SIZE_N": 128,
+            "num_stages": 2,
+            "num_warps": 8,
+            "waves_per_eu": 0
+        }
     },
     "bm16_n7168_k512": {
         "BLOCK_SIZE_K": 256,
@@ -176,7 +236,7 @@
     },
     "bm32_n2880_k2880": {
         "BLOCK_SIZE_K": 512,
-        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_N": 128,
         "num_stages": 2,
         "num_warps": 4,
         "waves_per_eu": 0
@@ -218,8 +278,8 @@
     },
     "bm32_n5760_k2880": {
         "BLOCK_SIZE_K": 512,
-        "BLOCK_SIZE_N": 256,
-        "num_stages": 1,
+        "BLOCK_SIZE_N": 128,
+        "num_stages": 3,
         "num_warps": 4,
         "waves_per_eu": 2
     },
@@ -269,7 +329,7 @@
         "BLOCK_SIZE_K": 512,
         "BLOCK_SIZE_N": 128,
         "num_stages": 2,
-        "num_warps": 8,
+        "num_warps": 4,
         "waves_per_eu": 0
     },
     "bm64_n2880_k360": {

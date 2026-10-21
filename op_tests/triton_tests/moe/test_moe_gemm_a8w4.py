@@ -25,6 +25,8 @@ from aiter.ops.triton.moe.quant_moe import (
 
 # target-specific utilities
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+from aiter.ops.triton.utils.moe_config_utils import select_moe_row_bucket
 from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
 from op_tests.triton_tests.moe.moe_test_utils import assert_close
 from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
@@ -238,6 +240,46 @@ def test_op(
                 f"Shape {m}x{n}x{k} is not supported for scale swizzling on gfx1250."
             )
 
+    _check_moe_gemm_a8w4(
+        m=m,
+        n=n,
+        k=k,
+        do_gather=do_gather,
+        do_scatter=do_scatter,
+        has_y_gammas=has_y_gammas,
+        apply_swiglu=apply_swiglu,
+        fused_quant=fused_quant,
+        out_mx_quant=out_mx_quant,
+        preshuffled=preshuffled,
+        backend=backend,
+        n_expts_tot=n_expts_tot,
+        n_expts_act=n_expts_act,
+        act_dtype_str=act_dtype_str,
+        hbm_swizzling=hbm_swizzling,
+        device=device,
+    )
+
+
+def _check_moe_gemm_a8w4(
+    m,
+    n,
+    k,
+    do_gather,
+    do_scatter,
+    has_y_gammas,
+    apply_swiglu,
+    fused_quant,
+    out_mx_quant,
+    preshuffled,
+    backend,
+    n_expts_tot,
+    n_expts_act,
+    act_dtype_str,
+    hbm_swizzling,
+    device="cuda",
+):
+    """Run ``moe_gemm_a8w4`` on random data and compare to ``moe_gemm_torch``."""
+    n_out = n // (2 if apply_swiglu else 1)
     torch.manual_seed(0)
 
     weight_dtype_str = "mxfloat4_e2m1"
@@ -343,3 +385,76 @@ def test_op(
     elif not act_mxfp8 and fused_quant:
         tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
+
+
+# ---------------
+# gfx1250 row-bucketed Triton configs
+# ---------------
+
+
+def test_gfx1250_triton_row_buckets():
+    """Every row-bucketed entry selects the bucket each side of each bound."""
+    cfg_dir = resolve_config_dir("moe", "A8W4", backend="triton", arch="gfx1250")
+    table = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    required = {"BLOCK_SIZE_N", "BLOCK_SIZE_K", "num_warps", "num_stages"}
+    # gpt-oss GEMM1 (N=5760) and GEMM2 (N=2880) decode shapes ship row buckets
+    assert "any" in table["bm16_n5760_k2880"]
+    assert "any" in table["bm16_n2880_k2880"]
+    for key, entry in table.items():
+        if "any" not in entry:
+            assert required <= entry.keys(), key
+            continue
+        bounds = sorted(int(b.removeprefix("M_LEQ_")) for b in entry if b != "any")
+        assert len(bounds) == len(entry) - 1, f"{key}: only M_LEQ_<rows> and any"
+        buckets = [entry[f"M_LEQ_{b}"] for b in bounds] + [entry["any"]]
+        assert all(required <= cfg.keys() for cfg in buckets), key
+        assert select_moe_row_bucket(entry, 1) == buckets[0], key
+        for i, bound in enumerate(bounds):
+            assert select_moe_row_bucket(entry, bound) == buckets[i], (key, bound)
+            assert select_moe_row_bucket(entry, bound + 1) == buckets[i + 1], (
+                key,
+                bound + 1,
+            )
+
+
+# The gpt-oss expert GEMMs on the gfx1250 Triton backend as SGLang's W4A8 layer
+# calls them: static fp8 activations, unswizzled scales; GEMM1 gathers and
+# applies SwiGLU, GEMM2 scatters with gammas. With 4 experts per token,
+# m = 2, 3, 41, 161 put M = 8, 12, 164, 644 routed rows on each side of the
+# bm16 row-bucket bounds; m = 1024 runs a larger block_m.
+@pytest.mark.parametrize("m", [2, 3, 41, 161, 1024])
+@pytest.mark.parametrize(
+    "n, k, apply_swiglu, do_gather, do_scatter, has_y_gammas",
+    [
+        (5760, 2880, True, True, False, False),
+        (2880, 2880, False, False, True, True),
+    ],
+)
+def test_op_gfx1250_triton_gpt_oss(
+    m,
+    n,
+    k,
+    apply_swiglu,
+    do_gather,
+    do_scatter,
+    has_y_gammas,
+):
+    if get_arch() != "gfx1250":
+        pytest.skip("These are the gfx1250 Triton A8W4 tuned shapes.")
+    _check_moe_gemm_a8w4(
+        m=m,
+        n=n,
+        k=k,
+        do_gather=do_gather,
+        do_scatter=do_scatter,
+        has_y_gammas=has_y_gammas,
+        apply_swiglu=apply_swiglu,
+        fused_quant=False,
+        out_mx_quant=False,
+        preshuffled=False,
+        backend="triton",
+        n_expts_tot=32,
+        n_expts_act=4,
+        act_dtype_str="float8_e4m3fn",
+        hbm_swizzling=False,
+    )

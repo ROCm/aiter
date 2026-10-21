@@ -31,7 +31,10 @@ from aiter.ops.triton.moe.reduce import (
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
-from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
+from aiter.ops.triton.utils.moe_config_utils import (
+    get_moe_dispatch,
+    select_moe_row_bucket,
+)
 
 
 def can_overflow_int32(tensor: torch.Tensor):
@@ -114,9 +117,12 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
     # Tuned dispatch: per-(block_m, N, K) winners from a sweep tuner.
     # Entries carry BLOCK_SIZE_N, BLOCK_SIZE_K, num_warps, num_stages, … but
     # omit BLOCK_SIZE_M because block_m is the dispatch key, not a tunable
-    # (routing decides block_m for the layer).
-    tuned = get_moe_dispatch("A8W4", arch, "triton").get(f"bm{block_m}_n{n}_k{k}")
+    # (routing decides block_m for the layer). An entry may be split further
+    # into row buckets by m (see select_moe_row_bucket).
+    dispatch = get_moe_dispatch("A8W4", arch, "triton")
+    tuned = dispatch.get(f"bm{block_m}_n{n}_k{k}")
     if tuned is not None:
+        tuned = select_moe_row_bucket(tuned, m)
         return {
             "block_m": block_m,
             "block_n": tuned["BLOCK_SIZE_N"],
@@ -137,13 +143,16 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
     # geometry and num_stages from that entry are a better starting point than
     # a generic default, and avoid regressing to num_stages=1 on gfx950.
     # Under CDNA4 swizzle, skip BLOCK_K<256 entries since unswizzle can't compile them.
-    dispatch = get_moe_dispatch("A8W4", arch, "triton")
+    same_nk = (
+        select_moe_row_bucket(v, m)
+        for bm in (16, 32, 64, 128)
+        if (v := dispatch.get(f"bm{bm}_n{n}_k{k}")) is not None
+    )
     proxy = next(
         (
             v
-            for bm in (16, 32, 64, 128)
-            if (v := dispatch.get(f"bm{bm}_n{n}_k{k}")) is not None
-            and (swizzle_mx_scale != "CDNA4_SCALE" or v.get("BLOCK_SIZE_K", 0) >= 256)
+            for v in same_nk
+            if swizzle_mx_scale != "CDNA4_SCALE" or v.get("BLOCK_SIZE_K", 0) >= 256
         ),
         None,
     )

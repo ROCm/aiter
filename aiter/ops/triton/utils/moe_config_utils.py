@@ -12,6 +12,7 @@ from aiter.ops.triton.utils.config_utils import (
     USE_LRU_CACHE,
     load_config_json,
     resolve_config_dir,
+    select_leq_config,
 )
 
 
@@ -30,6 +31,10 @@ def get_moe_dispatch(config_name: str, arch: str, backend: str) -> dict:
     ``resolve_config_dir()`` reads the same value from ``arch_info``. The
     returned dict is the shared cached object -- treat it as read-only.
 
+    A triton entry is either one config, or row buckets for the shapes whose
+    winner moves with the routed row count: ``M_LEQ_<rows>`` keys plus an
+    ``"any"`` fallback, resolved by ``select_moe_row_bucket()``.
+
     Args:
         config_name: MOE family name, e.g. ``"A8W4"`` or ``"A4W4"``.
         arch: the running architecture, as the caller resolved it.
@@ -38,3 +43,15 @@ def get_moe_dispatch(config_name: str, arch: str, backend: str) -> dict:
     cfg_dir = resolve_config_dir("moe", config_name, backend=backend)
     dispatch = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
     return dispatch if dispatch is not None else {}
+
+
+def select_moe_row_bucket(entry: dict, m: int) -> dict:
+    """Config for ``m`` routed rows from one ``get_moe_dispatch()`` entry.
+
+    A bucketed entry (``M_LEQ_<rows>`` keys plus ``"any"``) yields the
+    smallest bucket with ``m <= rows``, else ``"any"``, as a copy; a plain
+    entry is returned as is (the shared cached object -- read-only).
+    """
+    if "any" not in entry:
+        return entry
+    return select_leq_config(entry, m, prefix="M_LEQ_")
