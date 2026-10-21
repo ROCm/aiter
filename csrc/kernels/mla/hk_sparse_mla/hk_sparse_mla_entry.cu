@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// ctypes entry points for the HipKittens sparse MLA (DSA) forward (sparse_mla.h) and its split-K
-// workspace size. Shapes, dtypes, index padding and the workspace allocation are handled by
-// aiter/ops/hk_sparse_mla.py.
+// ctypes bindings; aiter/ops/hk_sparse_mla.py validates tensors and allocates workspace.
 #include "aiter_hip_common.h"
 
 #include "aiter_ctypes_error.h"
@@ -11,7 +9,7 @@
 
 AITER_CTYPES_ERROR_DEF
 
-// Workspace in 256-byte units (0 when the call does not split keys).
+// Workspace in 256-byte units; zero for one split.
 AITER_CTYPES_DEFINE_ENTRYPOINT(aiter_hk_sparse_mla_workspace_units,
                                (int64_t num_tokens, int64_t topk, hipStream_t stream),
                                (num_tokens, topk, stream))
