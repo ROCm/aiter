@@ -71,7 +71,7 @@ def generate_test_data(
     max_seqlen = cache_seqlens_cpu.max().item()
     max_seqlen_pad = cdiv(max_seqlen, 256) * 256
 
-    q = torch.randn(t.b, t.s_q, t.h_q, t.d, device="cuda")
+    q = torch.randn(t.b, t.s_q, t.h_q, t.d, dtype=torch.float32, device="cuda")
     q.clamp_(min=-1.0, max=1.0)
 
     block_table = torch.arange(
@@ -81,7 +81,15 @@ def generate_test_data(
         torch.randperm(block_table.numel(), device="cuda")
     ].view(t.b, -1)
     blocked_k = (
-        torch.randn(block_table.numel(), t.block_size, t.h_kv, t.d, device="cuda") / 10
+        torch.randn(
+            block_table.numel(),
+            t.block_size,
+            t.h_kv,
+            t.d,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        / 10
     )
     blocked_k.clamp_(min=-1.0, max=1.0)
 
