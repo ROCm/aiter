@@ -314,9 +314,13 @@ def get_kernel_config_gluon_gfx942(m, n, k, routing_data):
     num_stages = 1
     split_k = 1
 
+    # the kernel needs K % BLOCK_K == 0 (no K tail); K is always a multiple of 128 here (checked by
+    # the caller), but TP-sharded intermediate sizes padded to 128 (e.g. 384, 640) are not multiples of 256
+    block_k_decode = 256 if k % 256 == 0 else 128
+
     if block_m == 16:
         block_n = 128
-        block_k = 256
+        block_k = block_k_decode
         num_warps = 4
         grid_m = routing_data.n_blocks(m, block_m)
         grid_n = triton.cdiv(n, block_n)
@@ -328,7 +332,7 @@ def get_kernel_config_gluon_gfx942(m, n, k, routing_data):
             grid = grid_m * grid_n * split_k
     elif block_m == 32:
         block_n = 128
-        block_k = 256
+        block_k = block_k_decode
         num_warps = 4
     elif block_m == 64:
         block_n = 128
