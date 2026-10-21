@@ -137,6 +137,9 @@ def _fwd(
     [
         (1, 4, 4, 64, 64),
         (1, 8, 2, 64, 128),  # GQA
+        (2, 4, 4, 128, 128),  # batch=2, four scale rows
+        (1, 4, 4, 192, 64),  # six scale rows
+        (1, 4, 4, 96, 64),  # last 64-wide tile is half full
     ],
 )
 @pytest.mark.parametrize("causal", [False, True])
@@ -182,6 +185,9 @@ def test_mxfp8_attn_fwd_quantized(B, HQ, HK, S, D, causal):
     [
         (1, 4, 4, 64, 64),
         (1, 8, 2, 64, 64),  # GQA
+        (2, 4, 4, 128, 128),  # batch=2, four scale rows
+        (1, 4, 4, 192, 64),  # six scale rows
+        (1, 4, 4, 96, 64),  # last 64-wide tile is half full
     ],
 )
 @pytest.mark.parametrize("causal", [False, True])
