@@ -24,7 +24,7 @@ from aiter.ops.flydsl.kernels.pa_decode_plan import (
     PADecodePlan,
     plan_pa_decode,
 )
-from aiter.ops.flydsl.pa_decode import pa_decode, pa_decode_default_workgroup_budget
+from aiter.ops.flydsl.pa_decode import _default_workgroup_budget, pa_decode
 
 _PA_DECODE_CONFIGS_PATH = Path(__file__).parent / "configs" / "pa"
 
@@ -49,11 +49,14 @@ def _cache_geometry(key_cache):
 class _PADecodeAutotuneResources:
     """Prepare candidate plans and graphs outside FlyDSL's timed replay."""
 
-    def __init__(self, query, args, options, max_partitions, max_batch_size=None):
+    def __init__(
+        self, query, args, options, max_partitions, default_budget, max_batch_size
+    ):
         self.query = query
         self.args = args
         self.options = options
         self.max_partitions = max_partitions
+        self.default_budget = default_budget
         self.max_batch_size = max_batch_size
         self.outputs = {}
         self.graphs = {}
@@ -166,30 +169,8 @@ def _pa_decode_configs(*args, resources, num_cu, **kwargs):
     return list(capacities.values())
 
 
-def _pa_decode_default(
-    *args,
-    num_cu,
-    head_dim,
-    block_size,
-    kv_dtype,
-    query_length,
-    query_group_size,
-    sliding_window,
-    **kwargs,
-):
-    # The autotune key holds the dtype as str(torch.dtype).
-    return Config(
-        workgroup_budget=pa_decode_default_workgroup_budget(
-            architecture=get_gfx_runtime(),
-            num_compute_units=num_cu,
-            kv_dtype=getattr(torch, kv_dtype.removeprefix("torch.")),
-            head_dim=head_dim,
-            block_size=block_size,
-            query_length=query_length,
-            query_group_size=query_group_size,
-            sliding_window=sliding_window,
-        )
-    )
+def _pa_decode_default(*args, resources, **kwargs):
+    return Config(workgroup_budget=resources.default_budget)
 
 
 @contextmanager
@@ -291,9 +272,8 @@ def prepare_pa_decode_plan(
     """Select a work budget using native FlyDSL autotune, then build a plan.
 
     Call outside graph capture with the actual decode tensors/options. Native
-    cache hits and misses with the default do not launch candidates. The
-    default budget is the CU count for dense page-64 shapes of the gfx950
-    head-256 pipe (see ``d256_pipe``) and 2*CU otherwise.
+    cache hits and misses with the default do not launch candidates. A miss
+    takes ``pa_decode_default_workgroup_budget``.
     Set FLYDSL_AUTOTUNE=1 to prepare candidate workspaces/graphs and search with
     FlyDSL's default benchmark and fastest-config selection. Candidates must
     agree with the 2*CU baseline before timing.
@@ -329,15 +309,16 @@ def prepare_pa_decode_plan(
         head_dim = query.shape[-1]
         query_group_size = query.shape[1] // num_kv_heads
         kv_dtype = str(key_cache.dtype)
-        default_budget = pa_decode_default_workgroup_budget(
-            architecture=get_gfx_runtime(),
-            num_compute_units=num_cu,
-            kv_dtype=key_cache.dtype,
-            head_dim=head_dim,
-            block_size=block_size,
-            query_length=query_length,
-            query_group_size=query_group_size,
-            sliding_window=sliding_window,
+        arch = get_gfx_runtime()
+        default_budget = _default_workgroup_budget(
+            arch,
+            num_cu,
+            key_cache.dtype,
+            head_dim,
+            block_size,
+            query_length,
+            query_group_size,
+            sliding_window,
         )
         # Validate plan geometry even when native autotune takes the default.
         default_plan = plan_pa_decode(
@@ -369,10 +350,10 @@ def prepare_pa_decode_plan(
             ),
             options,
             limit,
+            default_budget,
             default_plan.max_batch_size,
         )
 
-        arch = get_gfx_runtime()
         config_dir = None if config_dir is None else Path(config_dir)
         tuner = _get_pa_decode_autotuner(arch, config_dir)
         tuning_args = {

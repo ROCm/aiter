@@ -59,16 +59,21 @@ def d256_page64_pipe(
     )
 
 
+def nhd_max_query_length(arch, kv_dtype, head_dim, block_size, query_group_size) -> int:
+    """Longest uniform query the NHD layout runs, or 0 for unsupported shapes."""
+    if query_group_size < 1 or not d256_page64_pipe(
+        arch, kv_dtype, head_dim, block_size, 1, query_group_size
+    ):
+        return 0
+    return D256_PIPE_MAX_ROWS // query_group_size
+
+
 def require_nhd_pipe(
     arch, kv_dtype, head_dim, block_size, query_length, query_group_size
 ) -> None:
-    """Raise ``NotImplementedError`` unless the NHD layout can run this shape.
-
-    The single source of truth for NHD shape support: ``PaDecodeSchedule``,
-    ``pa_decode`` and ``pa_decode_nhd_supported`` all call it.
-    """
-    if not d256_page64_pipe(
-        arch, kv_dtype, head_dim, block_size, query_length, query_group_size
+    """Raise ``NotImplementedError`` unless the NHD layout can run this shape."""
+    if query_length > nhd_max_query_length(
+        arch, kv_dtype, head_dim, block_size, query_group_size
     ):
         raise NotImplementedError(
             "NHD pa_decode requires gfx950, FP8 KV, head 256, page 64, "
