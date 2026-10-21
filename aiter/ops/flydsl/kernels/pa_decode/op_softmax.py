@@ -121,8 +121,8 @@ class PaDecodeSoftmax:
                 ],
                 dtype=fx.Float32,
             )
-            needs_mask = (
-                tile_valid < self.traits.TILE_TOK + self.traits.query_length - 1
+            needs_mask = tile_valid < self.traits.TILE_TOK + (
+                self.traits.query_length - 1 if self.traits.causal else 0
             )
             if const_expr(self.traits.sliding_window > 0):
                 needs_mask = needs_mask | (window_left > 0)

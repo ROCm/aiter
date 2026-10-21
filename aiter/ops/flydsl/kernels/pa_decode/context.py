@@ -121,7 +121,10 @@ class PaDecodeContext:
 
     def init_causal_offsets(self):
         # Distance to the newest query keeps causal bounds tile-relative.
-        if const_expr(self.traits.QUERIES_PER_CTA == 1):
+        if const_expr(not self.traits.causal):
+            # Every query row of a non-causal block sees the whole context.
+            self.causal_offset = [0 for _m in range_constexpr(self.traits.M_TILES)]
+        elif const_expr(self.traits.QUERIES_PER_CTA == 1):
             self.causal_offset = [
                 self.traits.query_length - 1 - self.query_begin
                 for _m in range_constexpr(self.traits.M_TILES)

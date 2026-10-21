@@ -106,6 +106,7 @@ def compile_pa_decode_tile(
     sliding_window: int = 0,
     direct_output: bool = False,
     trans_k: bool = True,
+    causal: bool = True,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -133,6 +134,8 @@ def compile_pa_decode_tile(
     ``work_capacity`` is a positive host integer matching the work plan.
     Positive ``sliding_window`` includes the query token.
     Plans cover the MTP window union; scores are masked per query row.
+    ``causal=False`` lets every query row see the whole context and excludes
+    sliding windows.
     ``trans_k=False`` is not implemented.
     gfx1250 uses wave32 WMMA, native BF16 or OCP FP8, and its larger LDS budget.
     A one-partition gfx1250 plan can write final output directly when sinks
@@ -204,6 +207,7 @@ def compile_pa_decode_tile(
         max_context_length=max_context_length,
         sliding_window=sliding_window,
         trans_k=trans_k,
+        causal=causal,
     )
     cached = _PA_DECODE_TILE_CACHE.get(schedule.cache_key)
     if cached is not None:
