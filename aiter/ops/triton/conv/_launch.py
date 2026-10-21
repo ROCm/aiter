@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
+import torch.nn.functional as F
 import triton
 
 from aiter.ops.triton._triton_kernels.conv.conv3d_1x1x1 import (
@@ -84,7 +85,12 @@ from aiter.ops.triton._triton_kernels.conv.ncx_to_cblocked import (
 from aiter.ops.triton._triton_kernels.conv.ncx_to_cblocked import (
     _ncx_to_cblocked_kernel,
 )
-from aiter.ops.triton.conv._utils import _winograd_transform_storage_dtype
+from aiter.ops.triton.conv._utils import (
+    _ensure_layout,
+    _normalize_tuple,
+    _validate_conv2d_padding_mode,
+    _winograd_transform_storage_dtype,
+)
 from aiter.ops.triton.utils.conv_config_utils import (
     format_prepack_shape_key,
     format_prepack_shape_key_3d,
@@ -141,6 +147,41 @@ def _make_wino_output_grid(T, K_out):
         return (T, triton.cdiv(K_out, meta["BLOCK_K"]))
 
     return grid
+
+
+def _prepare_conv2d_padding(
+    source: torch.Tensor,
+    padding,
+    padding_mode: str = "zeros",
+    *,
+    layout: str = "nchw",
+) -> tuple[torch.Tensor, tuple[int, int]]:
+    """Return the input and effective padding for an existing Conv2D kernel.
+
+    Nonzero modes use F.pad, then convert to the requested storage layout.
+    Zeros and zero-padding calls return the original tensor without allocation
+    or launch; layout conversion on those paths is the caller's responsibility.
+    Using F.pad here does not provide a backward for the convolution kernels.
+    """
+    if source.ndim != 4:
+        raise ValueError(f"conv2d padding input must be 4-D NCHW, got {source.ndim}-D")
+    if layout not in ("nchw", "nhwc"):
+        raise ValueError(f"layout must be 'nchw' or 'nhwc', got {layout!r}")
+    padding = _normalize_tuple(padding, 2, "padding", allow_zero=True)
+    height, width = source.shape[2:]
+    _validate_conv2d_padding_mode(padding_mode, height, width, padding)
+    if padding_mode == "zeros" or padding == (0, 0):
+        return source, padding
+    if not source.is_cuda:
+        raise ValueError("materialized conv2d padding requires a CUDA/ROCm tensor")
+
+    pad_height, pad_width = padding
+    output = F.pad(
+        source,
+        (pad_width, pad_width, pad_height, pad_height),
+        mode=padding_mode,
+    )
+    return _ensure_layout(output, layout), (0, 0)
 
 
 def _launch_nchw_to_cblocked(x, x_blocked, N, C, H, W, C_pad, block_c):
