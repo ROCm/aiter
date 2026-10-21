@@ -33,6 +33,8 @@ from aiter.test_common import (
 )
 from aiter.utility import fp4_utils
 
+logger = aiter.logger
+
 BLOCK_SIZE_M = 32
 MAX_TOKENS = 4096 * 4
 
@@ -413,9 +415,7 @@ def run_ep_csv(args):
         raise RuntimeError(f"EP CSV requires gfx1250, got {gpu_arch}")
     with open(args.csv_path, newline="") as csv_file:
         rows = list(csv.DictReader(csv_file))
-    ep_rows = [
-        (index, row) for index, row in enumerate(rows) if row["topk"] == "-1"
-    ]
+    ep_rows = [(index, row) for index, row in enumerate(rows) if row["topk"] == "-1"]
     if not ep_rows:
         raise ValueError(f"No EP rows (topk=-1) in {args.csv_path}")
 
@@ -454,7 +454,7 @@ def run_ep_csv(args):
             )
         except Exception as exc:  # Keep checking the remaining CSV rows.
             failures.append((index, str(exc)))
-            print(f"[ep-csv] row {index}: FAILED: {exc}", flush=True)
+            logger.exception("[ep-csv] row %s: FAILED", index)
 
     print(
         f"[ep-csv] {len(ep_rows) - len(failures)}/{len(ep_rows)} rows passed",

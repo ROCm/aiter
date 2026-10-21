@@ -3527,9 +3527,7 @@ def flydsl_moe_fused_quant_preshuffle(
             and not remap_rows
             and not fuse_ep_psum
         )
-        if payload_preshuffled and (
-            not prequantized or use_prequantized_apre_scatter
-        ):
+        if payload_preshuffled and (not prequantized or use_prequantized_apre_scatter):
             if row_to_token is None:
                 raise ValueError(
                     "A-preshuffle tile quant requires grouped-row -> token mapping"

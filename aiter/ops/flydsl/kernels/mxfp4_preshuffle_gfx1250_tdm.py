@@ -2296,9 +2296,7 @@ def launch_gemm_a8w4_tdm(
                         (tile_m // 16, STORE_N * 16),
                         (out_stride * 16, 1),
                     )
-                    atomC = make_tdm_store(
-                        gtC, (mn_oob + 15) // 16, out_stride * 16
-                    )
+                    atomC = make_tdm_store(gtC, (mn_oob + 15) // 16, out_stride * 16)
                     src = tensor_view(
                         fx.recast_iter(oc_store, base_ptr),
                         (tile_m // 16, STORE_N * 16),
