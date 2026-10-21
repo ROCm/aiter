@@ -1478,7 +1478,7 @@ def test_fused_conv_rms_gate(N, T, H):
         **kw,
     )
     x, w, S2, cs2 = mixed.float(), cw.float(), S.clone(), cs.clone()
-    y = torch.empty(TT, 3 * lp, device=DEVICE)
+    y = torch.empty(TT, 3 * lp, device=DEVICE, dtype=torch.float32)
     for t in range(T):
         rows = torch.arange(t, TT, T, device=DEVICE)
         h = cs2[idx.long()].float()
@@ -1554,7 +1554,7 @@ def test_fused_conv_rms_gate_spec(N, k, padded):
     )
     # reference: torch conv under vLLM's window rules, then the recurrence alone
     x, w, S2, cs2 = mixed.float(), cw.float(), S.clone(), cs.clone()
-    y = torch.zeros(TT, 3 * lp, device=DEVICE)
+    y = torch.zeros(TT, 3 * lp, device=DEVICE, dtype=torch.float32)
     for n in range(N):
         c, off, rows = int(idx[n, 0]), int(acc[n]) - 1, slice(n * T, (n + 1) * T)
         if c == 0:

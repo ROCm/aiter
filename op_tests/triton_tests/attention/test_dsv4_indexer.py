@@ -111,7 +111,7 @@ def test_bwd():
         p_idx = torch.arange(P, device=q.device)[None, :]
         allowed = (p_idx + 1) * compress_ratio - 1 <= s_idx
         scores_ref = torch.where(
-            allowed, scores_ref, torch.tensor(0.0, device=q.device)
+            allowed, scores_ref, torch.tensor(0.0, device=q.device, dtype=torch.float32)
         )
 
         (scores_ref * d_scores).sum().backward()
