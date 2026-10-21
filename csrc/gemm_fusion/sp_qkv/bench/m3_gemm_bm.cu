@@ -144,9 +144,9 @@ OPUS_D void gemm_body(const BArgs& args, unsigned char* stage) {
         const int cw = wave - bm::PRODUCER_WAVES;                 // 0: rows 0-15 of every 32-row tile, 1: rows 16-31
         const auto wc = consumer_wave_coord(cw);
         const auto lc = lane_coord(base.p_shape_c(), lane);
-        const auto pc = make_tuple(get<0>(wc), get<0>(lc), get<1>(wc), get<1>(lc));
-        const auto u_cm = partition_layout_c(mma, make_tuple(1_I, 0_I), pc);
-        const auto u_cn = partition_layout_c(mma, make_tuple(0_I, 1_I), pc);
+        const auto pc = opus::make_tuple(opus::get<0>(wc), opus::get<0>(lc), opus::get<1>(wc), opus::get<1>(lc));
+        const auto u_cm = partition_layout_c(mma, opus::make_tuple(1_I, 0_I), pc);
+        const auto u_cn = partition_layout_c(mma, opus::make_tuple(0_I, 1_I), pc);
         const auto u_acc = accumulator_register_view(mma);
         const int l16 = lane & 15, g = lane >> 4;
         const auto u_af = a_frag_view<AQMAX * 16>();
@@ -195,7 +195,7 @@ OPUS_D void gemm_body(const BArgs& args, unsigned char* stage) {
         #pragma unroll
         for (int t = 0; t < MT; ++t) {
             static_ford(mma.y_shape_c(), [&](auto im, auto rept, auto item, auto jn) {
-                const auto y = make_tuple(im, rept, item, jn);
+                const auto y = opus::make_tuple(im, rept, item, jn);
                 const int m = t * 32 + u_cm(y), n = col_base + u_cn(y);
                 if (m < M && n < N) {
                     const int acc_idx = static_cast<int>(u_acc(y));

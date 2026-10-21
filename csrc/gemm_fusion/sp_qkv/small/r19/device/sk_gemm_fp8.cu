@@ -109,9 +109,9 @@ OPUS_D void gemm_body(const SmGemmArgsV1& args, unsigned char* stage) {
         const int cw = wave - sks::PRODUCER_WAVES;                                // 0: rows 0-15, 1: rows 16-31
         const auto wc = sks::consumer_wave_coord(cw);
         const auto lc = sks::lane_coord(base.p_shape_c(), lane);
-        const auto pc = make_tuple(get<0>(wc), get<0>(lc), get<1>(wc), get<1>(lc));
-        const auto u_cm = partition_layout_c(mma, make_tuple(1_I, 0_I), pc);
-        const auto u_cn = partition_layout_c(mma, make_tuple(0_I, 1_I), pc);
+        const auto pc = opus::make_tuple(opus::get<0>(wc), opus::get<0>(lc), opus::get<1>(wc), opus::get<1>(lc));
+        const auto u_cm = partition_layout_c(mma, opus::make_tuple(1_I, 0_I), pc);
+        const auto u_cn = partition_layout_c(mma, opus::make_tuple(0_I, 1_I), pc);
         const auto u_acc = sks::accumulator_register_view(mma);
         const bool live_wave = (AQ == 2) || (cw == 0);                            // M<=16: rows 16..31 wave idles
         // LDS fragment offsets (bytes inside a stage). A/B lane decode: l16 = lane%16 (row / n), g = lane/16 (K group 0..3).
@@ -153,7 +153,7 @@ OPUS_D void gemm_body(const SmGemmArgsV1& args, unsigned char* stage) {
         if (tid == 128) SM_STAMP(rec, 6);
         const auto u_p = sks::partial_view(N);
         static_ford(mma.y_shape_c(), [&](auto im, auto rept, auto item, auto jn) {
-            const auto y = make_tuple(im, rept, item, jn);
+            const auto y = opus::make_tuple(im, rept, item, jn);
             const int m = u_cm(y), n = col_base + u_cn(y);
             if (m < M && n < N) {                                                // only live rows are stored
                 const int acc_idx = static_cast<int>(u_acc(y));
