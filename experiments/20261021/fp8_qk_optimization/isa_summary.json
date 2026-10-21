@@ -1,0 +1,427 @@
+{
+  "binary_sha256": "5818cf46551bd58e6a199957e4dcf279eec9f459d01920d032be35045b6fb921",
+  "instructions": {
+    "000000000004cc00 <void fused_dsv41_fp8_qk_decode_64<false, 0, true>(FusedDsv41Args)>": {
+      "scaled_fp8": 8,
+      "bf16": 32,
+      "scratch": 0,
+      "barriers": 5
+    },
+    "0000000000051100 <void fused_dsv41_fp8_qk_decode_64<true, 0, false>(FusedDsv41Args)>": {
+      "scaled_fp8": 8,
+      "bf16": 32,
+      "scratch": 0,
+      "barriers": 5
+    },
+    "0000000000056500 <void fused_dsv41_fp8_qk_decode_64<false, 0, false>(FusedDsv41Args)>": {
+      "scaled_fp8": 8,
+      "bf16": 32,
+      "scratch": 0,
+      "barriers": 5
+    },
+    "00000000000a3400 <void fused_dsv41_fp8_qk_decode_64<false, 32, true>(FusedDsv41Args)>": {
+      "scaled_fp8": 8,
+      "bf16": 32,
+      "scratch": 0,
+      "barriers": 5
+    },
+    "00000000000a7900 <void fused_dsv41_fp8_qk_decode_64<true, 32, false>(FusedDsv41Args)>": {
+      "scaled_fp8": 8,
+      "bf16": 32,
+      "scratch": 0,
+      "barriers": 5
+    },
+    "00000000000acd00 <void fused_dsv41_fp8_qk_decode_64<false, 32, false>(FusedDsv41Args)>": {
+      "scaled_fp8": 8,
+      "bf16": 32,
+      "scratch": 0,
+      "barriers": 5
+    },
+    "00000000000fa500 <void fused_dsv41_fp8_qk_decode_64<false, 128, true>(FusedDsv41Args)>": {
+      "scaled_fp8": 8,
+      "bf16": 32,
+      "scratch": 0,
+      "barriers": 5
+    },
+    "00000000000fea00 <void fused_dsv41_fp8_qk_decode_64<true, 128, false>(FusedDsv41Args)>": {
+      "scaled_fp8": 8,
+      "bf16": 32,
+      "scratch": 0,
+      "barriers": 5
+    },
+    "0000000000103e00 <void fused_dsv41_fp8_qk_decode_64<false, 128, false>(FusedDsv41Args)>": {
+      "scaled_fp8": 8,
+      "bf16": 32,
+      "scratch": 0,
+      "barriers": 5
+    },
+    "0000000000151700 <void fused_dsv41_fp8_qk_decode_64<false, -1, true>(FusedDsv41Args)>": {
+      "scaled_fp8": 8,
+      "bf16": 32,
+      "scratch": 0,
+      "barriers": 5
+    },
+    "0000000000155d00 <void fused_dsv41_fp8_qk_decode_64<true, -1, false>(FusedDsv41Args)>": {
+      "scaled_fp8": 8,
+      "bf16": 32,
+      "scratch": 0,
+      "barriers": 5
+    },
+    "000000000015b200 <void fused_dsv41_fp8_qk_decode_64<false, -1, false>(FusedDsv41Args)>": {
+      "scaled_fp8": 8,
+      "bf16": 32,
+      "scratch": 0,
+      "barriers": 5
+    }
+  },
+  "resources": [
+    {
+      ".agpr_count": 0,
+      ".args": [
+        {
+          ".offset": 0,
+          ".size": 208,
+          ".value_kind": "by_value"
+        }
+      ],
+      ".group_segment_fixed_size": 67840,
+      ".kernarg_segment_align": 8,
+      ".kernarg_segment_size": 208,
+      ".language": "OpenCL C",
+      ".language_version": [
+        2,
+        0
+      ],
+      ".max_flat_workgroup_size": 256,
+      ".name": "_Z28fused_dsv41_fp8_qk_decode_64ILb0ELi0ELb1EEv14FusedDsv41Args",
+      ".private_segment_fixed_size": 0,
+      ".sgpr_count": 58,
+      ".sgpr_spill_count": 0,
+      ".symbol": "_Z28fused_dsv41_fp8_qk_decode_64ILb0ELi0ELb1EEv14FusedDsv41Args.kd",
+      ".uses_dynamic_stack": false,
+      ".vgpr_count": 244,
+      ".vgpr_spill_count": 0,
+      ".wavefront_size": 64,
+      "symbol": "void fused_dsv41_fp8_qk_decode_64<false, 0, true>(FusedDsv41Args)"
+    },
+    {
+      ".agpr_count": 0,
+      ".args": [
+        {
+          ".offset": 0,
+          ".size": 208,
+          ".value_kind": "by_value"
+        }
+      ],
+      ".group_segment_fixed_size": 67840,
+      ".kernarg_segment_align": 8,
+      ".kernarg_segment_size": 208,
+      ".language": "OpenCL C",
+      ".language_version": [
+        2,
+        0
+      ],
+      ".max_flat_workgroup_size": 256,
+      ".name": "_Z28fused_dsv41_fp8_qk_decode_64ILb1ELi0ELb0EEv14FusedDsv41Args",
+      ".private_segment_fixed_size": 0,
+      ".sgpr_count": 56,
+      ".sgpr_spill_count": 0,
+      ".symbol": "_Z28fused_dsv41_fp8_qk_decode_64ILb1ELi0ELb0EEv14FusedDsv41Args.kd",
+      ".uses_dynamic_stack": false,
+      ".vgpr_count": 244,
+      ".vgpr_spill_count": 0,
+      ".wavefront_size": 64,
+      "symbol": "void fused_dsv41_fp8_qk_decode_64<true, 0, false>(FusedDsv41Args)"
+    },
+    {
+      ".agpr_count": 0,
+      ".args": [
+        {
+          ".offset": 0,
+          ".size": 208,
+          ".value_kind": "by_value"
+        }
+      ],
+      ".group_segment_fixed_size": 67840,
+      ".kernarg_segment_align": 8,
+      ".kernarg_segment_size": 208,
+      ".language": "OpenCL C",
+      ".language_version": [
+        2,
+        0
+      ],
+      ".max_flat_workgroup_size": 256,
+      ".name": "_Z28fused_dsv41_fp8_qk_decode_64ILb0ELi0ELb0EEv14FusedDsv41Args",
+      ".private_segment_fixed_size": 0,
+      ".sgpr_count": 58,
+      ".sgpr_spill_count": 0,
+      ".symbol": "_Z28fused_dsv41_fp8_qk_decode_64ILb0ELi0ELb0EEv14FusedDsv41Args.kd",
+      ".uses_dynamic_stack": false,
+      ".vgpr_count": 244,
+      ".vgpr_spill_count": 0,
+      ".wavefront_size": 64,
+      "symbol": "void fused_dsv41_fp8_qk_decode_64<false, 0, false>(FusedDsv41Args)"
+    },
+    {
+      ".agpr_count": 0,
+      ".args": [
+        {
+          ".offset": 0,
+          ".size": 208,
+          ".value_kind": "by_value"
+        }
+      ],
+      ".group_segment_fixed_size": 67840,
+      ".kernarg_segment_align": 8,
+      ".kernarg_segment_size": 208,
+      ".language": "OpenCL C",
+      ".language_version": [
+        2,
+        0
+      ],
+      ".max_flat_workgroup_size": 256,
+      ".name": "_Z28fused_dsv41_fp8_qk_decode_64ILb0ELi32ELb1EEv14FusedDsv41Args",
+      ".private_segment_fixed_size": 0,
+      ".sgpr_count": 60,
+      ".sgpr_spill_count": 0,
+      ".symbol": "_Z28fused_dsv41_fp8_qk_decode_64ILb0ELi32ELb1EEv14FusedDsv41Args.kd",
+      ".uses_dynamic_stack": false,
+      ".vgpr_count": 244,
+      ".vgpr_spill_count": 0,
+      ".wavefront_size": 64,
+      "symbol": "void fused_dsv41_fp8_qk_decode_64<false, 32, true>(FusedDsv41Args)"
+    },
+    {
+      ".agpr_count": 0,
+      ".args": [
+        {
+          ".offset": 0,
+          ".size": 208,
+          ".value_kind": "by_value"
+        }
+      ],
+      ".group_segment_fixed_size": 67840,
+      ".kernarg_segment_align": 8,
+      ".kernarg_segment_size": 208,
+      ".language": "OpenCL C",
+      ".language_version": [
+        2,
+        0
+      ],
+      ".max_flat_workgroup_size": 256,
+      ".name": "_Z28fused_dsv41_fp8_qk_decode_64ILb1ELi32ELb0EEv14FusedDsv41Args",
+      ".private_segment_fixed_size": 0,
+      ".sgpr_count": 58,
+      ".sgpr_spill_count": 0,
+      ".symbol": "_Z28fused_dsv41_fp8_qk_decode_64ILb1ELi32ELb0EEv14FusedDsv41Args.kd",
+      ".uses_dynamic_stack": false,
+      ".vgpr_count": 244,
+      ".vgpr_spill_count": 0,
+      ".wavefront_size": 64,
+      "symbol": "void fused_dsv41_fp8_qk_decode_64<true, 32, false>(FusedDsv41Args)"
+    },
+    {
+      ".agpr_count": 0,
+      ".args": [
+        {
+          ".offset": 0,
+          ".size": 208,
+          ".value_kind": "by_value"
+        }
+      ],
+      ".group_segment_fixed_size": 67840,
+      ".kernarg_segment_align": 8,
+      ".kernarg_segment_size": 208,
+      ".language": "OpenCL C",
+      ".language_version": [
+        2,
+        0
+      ],
+      ".max_flat_workgroup_size": 256,
+      ".name": "_Z28fused_dsv41_fp8_qk_decode_64ILb0ELi32ELb0EEv14FusedDsv41Args",
+      ".private_segment_fixed_size": 0,
+      ".sgpr_count": 60,
+      ".sgpr_spill_count": 0,
+      ".symbol": "_Z28fused_dsv41_fp8_qk_decode_64ILb0ELi32ELb0EEv14FusedDsv41Args.kd",
+      ".uses_dynamic_stack": false,
+      ".vgpr_count": 244,
+      ".vgpr_spill_count": 0,
+      ".wavefront_size": 64,
+      "symbol": "void fused_dsv41_fp8_qk_decode_64<false, 32, false>(FusedDsv41Args)"
+    },
+    {
+      ".agpr_count": 0,
+      ".args": [
+        {
+          ".offset": 0,
+          ".size": 208,
+          ".value_kind": "by_value"
+        }
+      ],
+      ".group_segment_fixed_size": 67840,
+      ".kernarg_segment_align": 8,
+      ".kernarg_segment_size": 208,
+      ".language": "OpenCL C",
+      ".language_version": [
+        2,
+        0
+      ],
+      ".max_flat_workgroup_size": 256,
+      ".name": "_Z28fused_dsv41_fp8_qk_decode_64ILb0ELi128ELb1EEv14FusedDsv41Args",
+      ".private_segment_fixed_size": 0,
+      ".sgpr_count": 60,
+      ".sgpr_spill_count": 0,
+      ".symbol": "_Z28fused_dsv41_fp8_qk_decode_64ILb0ELi128ELb1EEv14FusedDsv41Args.kd",
+      ".uses_dynamic_stack": false,
+      ".vgpr_count": 244,
+      ".vgpr_spill_count": 0,
+      ".wavefront_size": 64,
+      "symbol": "void fused_dsv41_fp8_qk_decode_64<false, 128, true>(FusedDsv41Args)"
+    },
+    {
+      ".agpr_count": 0,
+      ".args": [
+        {
+          ".offset": 0,
+          ".size": 208,
+          ".value_kind": "by_value"
+        }
+      ],
+      ".group_segment_fixed_size": 67840,
+      ".kernarg_segment_align": 8,
+      ".kernarg_segment_size": 208,
+      ".language": "OpenCL C",
+      ".language_version": [
+        2,
+        0
+      ],
+      ".max_flat_workgroup_size": 256,
+      ".name": "_Z28fused_dsv41_fp8_qk_decode_64ILb1ELi128ELb0EEv14FusedDsv41Args",
+      ".private_segment_fixed_size": 0,
+      ".sgpr_count": 58,
+      ".sgpr_spill_count": 0,
+      ".symbol": "_Z28fused_dsv41_fp8_qk_decode_64ILb1ELi128ELb0EEv14FusedDsv41Args.kd",
+      ".uses_dynamic_stack": false,
+      ".vgpr_count": 244,
+      ".vgpr_spill_count": 0,
+      ".wavefront_size": 64,
+      "symbol": "void fused_dsv41_fp8_qk_decode_64<true, 128, false>(FusedDsv41Args)"
+    },
+    {
+      ".agpr_count": 0,
+      ".args": [
+        {
+          ".offset": 0,
+          ".size": 208,
+          ".value_kind": "by_value"
+        }
+      ],
+      ".group_segment_fixed_size": 67840,
+      ".kernarg_segment_align": 8,
+      ".kernarg_segment_size": 208,
+      ".language": "OpenCL C",
+      ".language_version": [
+        2,
+        0
+      ],
+      ".max_flat_workgroup_size": 256,
+      ".name": "_Z28fused_dsv41_fp8_qk_decode_64ILb0ELi128ELb0EEv14FusedDsv41Args",
+      ".private_segment_fixed_size": 0,
+      ".sgpr_count": 60,
+      ".sgpr_spill_count": 0,
+      ".symbol": "_Z28fused_dsv41_fp8_qk_decode_64ILb0ELi128ELb0EEv14FusedDsv41Args.kd",
+      ".uses_dynamic_stack": false,
+      ".vgpr_count": 244,
+      ".vgpr_spill_count": 0,
+      ".wavefront_size": 64,
+      "symbol": "void fused_dsv41_fp8_qk_decode_64<false, 128, false>(FusedDsv41Args)"
+    },
+    {
+      ".agpr_count": 0,
+      ".args": [
+        {
+          ".offset": 0,
+          ".size": 208,
+          ".value_kind": "by_value"
+        }
+      ],
+      ".group_segment_fixed_size": 67840,
+      ".kernarg_segment_align": 8,
+      ".kernarg_segment_size": 208,
+      ".language": "OpenCL C",
+      ".language_version": [
+        2,
+        0
+      ],
+      ".max_flat_workgroup_size": 256,
+      ".name": "_Z28fused_dsv41_fp8_qk_decode_64ILb0ELin1ELb1EEv14FusedDsv41Args",
+      ".private_segment_fixed_size": 0,
+      ".sgpr_count": 64,
+      ".sgpr_spill_count": 0,
+      ".symbol": "_Z28fused_dsv41_fp8_qk_decode_64ILb0ELin1ELb1EEv14FusedDsv41Args.kd",
+      ".uses_dynamic_stack": false,
+      ".vgpr_count": 245,
+      ".vgpr_spill_count": 0,
+      ".wavefront_size": 64,
+      "symbol": "void fused_dsv41_fp8_qk_decode_64<false, -1, true>(FusedDsv41Args)"
+    },
+    {
+      ".agpr_count": 0,
+      ".args": [
+        {
+          ".offset": 0,
+          ".size": 208,
+          ".value_kind": "by_value"
+        }
+      ],
+      ".group_segment_fixed_size": 67840,
+      ".kernarg_segment_align": 8,
+      ".kernarg_segment_size": 208,
+      ".language": "OpenCL C",
+      ".language_version": [
+        2,
+        0
+      ],
+      ".max_flat_workgroup_size": 256,
+      ".name": "_Z28fused_dsv41_fp8_qk_decode_64ILb1ELin1ELb0EEv14FusedDsv41Args",
+      ".private_segment_fixed_size": 0,
+      ".sgpr_count": 62,
+      ".sgpr_spill_count": 0,
+      ".symbol": "_Z28fused_dsv41_fp8_qk_decode_64ILb1ELin1ELb0EEv14FusedDsv41Args.kd",
+      ".uses_dynamic_stack": false,
+      ".vgpr_count": 245,
+      ".vgpr_spill_count": 0,
+      ".wavefront_size": 64,
+      "symbol": "void fused_dsv41_fp8_qk_decode_64<true, -1, false>(FusedDsv41Args)"
+    },
+    {
+      ".agpr_count": 0,
+      ".args": [
+        {
+          ".offset": 0,
+          ".size": 208,
+          ".value_kind": "by_value"
+        }
+      ],
+      ".group_segment_fixed_size": 67840,
+      ".kernarg_segment_align": 8,
+      ".kernarg_segment_size": 208,
+      ".language": "OpenCL C",
+      ".language_version": [
+        2,
+        0
+      ],
+      ".max_flat_workgroup_size": 256,
+      ".name": "_Z28fused_dsv41_fp8_qk_decode_64ILb0ELin1ELb0EEv14FusedDsv41Args",
+      ".private_segment_fixed_size": 0,
+      ".sgpr_count": 64,
+      ".sgpr_spill_count": 0,
+      ".symbol": "_Z28fused_dsv41_fp8_qk_decode_64ILb0ELin1ELb0EEv14FusedDsv41Args.kd",
+      ".uses_dynamic_stack": false,
+      ".vgpr_count": 245,
+      ".vgpr_spill_count": 0,
+      ".wavefront_size": 64,
+      "symbol": "void fused_dsv41_fp8_qk_decode_64<false, -1, false>(FusedDsv41Args)"
+    }
+  ]
+}

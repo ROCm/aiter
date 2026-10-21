@@ -1,0 +1,322 @@
+{
+  "baseline": {
+    "SQ_INSTS_LDS": {
+      "median": 9922560.0,
+      "samples": [
+        {
+          "event_id": 1,
+          "value": 9922560.0,
+          "instances": 32
+        },
+        {
+          "event_id": 2,
+          "value": 9922560.0,
+          "instances": 32
+        },
+        {
+          "event_id": 3,
+          "value": 9922560.0,
+          "instances": 32
+        }
+      ]
+    },
+    "SQ_INSTS_MFMA": {
+      "median": 3072000.0,
+      "samples": [
+        {
+          "event_id": 1,
+          "value": 3072000.0,
+          "instances": 32
+        },
+        {
+          "event_id": 2,
+          "value": 3072000.0,
+          "instances": 32
+        },
+        {
+          "event_id": 3,
+          "value": 3072000.0,
+          "instances": 32
+        }
+      ]
+    },
+    "SQ_INSTS_VALU": {
+      "median": 51701760.0,
+      "samples": [
+        {
+          "event_id": 1,
+          "value": 51701760.0,
+          "instances": 32
+        },
+        {
+          "event_id": 2,
+          "value": 51701760.0,
+          "instances": 32
+        },
+        {
+          "event_id": 3,
+          "value": 51701760.0,
+          "instances": 32
+        }
+      ]
+    },
+    "SQ_WAVES": {
+      "median": 3840.0,
+      "samples": [
+        {
+          "event_id": 1,
+          "value": 3840.0,
+          "instances": 32
+        },
+        {
+          "event_id": 2,
+          "value": 3840.0,
+          "instances": 32
+        },
+        {
+          "event_id": 3,
+          "value": 3840.0,
+          "instances": 32
+        }
+      ]
+    },
+    "pass0": {
+      "db": "/home/jun_chen2_qle/yzhou_aiter/fp8-qk-opt-20261021/profile_baseline_0/counters_results.db",
+      "sha256": "145f3337ec74afafe35a43f8f6bd4343f4c23fd4ace899f9cdb2e040c14ec152",
+      "durations_us": [
+        318.762,
+        323.402,
+        322.723
+      ]
+    },
+    "LDSBankConflict": {
+      "median": 3.940631004132631,
+      "samples": [
+        {
+          "event_id": 1,
+          "value": 3.939561617867818,
+          "instances": 1
+        },
+        {
+          "event_id": 2,
+          "value": 3.940631004132631,
+          "instances": 1
+        },
+        {
+          "event_id": 3,
+          "value": 3.9556478303750158,
+          "instances": 1
+        }
+      ]
+    },
+    "MeanOccupancyPerCU": {
+      "median": 3.516002461735758,
+      "samples": [
+        {
+          "event_id": 1,
+          "value": 3.49559750927968,
+          "instances": 1
+        },
+        {
+          "event_id": 2,
+          "value": 3.516002461735758,
+          "instances": 1
+        },
+        {
+          "event_id": 3,
+          "value": 3.5219359596433537,
+          "instances": 1
+        }
+      ]
+    },
+    "OccupancyPercent": {
+      "median": 10.98617153031065,
+      "samples": [
+        {
+          "event_id": 1,
+          "value": 10.922411587491263,
+          "instances": 1
+        },
+        {
+          "event_id": 2,
+          "value": 10.98617153031065,
+          "instances": 1
+        },
+        {
+          "event_id": 3,
+          "value": 11.00471290296667,
+          "instances": 1
+        }
+      ]
+    },
+    "pass1": {
+      "db": "/home/jun_chen2_qle/yzhou_aiter/fp8-qk-opt-20261021/profile_baseline_1/counters_results.db",
+      "sha256": "07d6924072bc600aeb095ee02599ee8027c8af56e062f7a68862b3c6d403dc37",
+      "durations_us": [
+        321.523,
+        322.122,
+        321.083
+      ]
+    }
+  },
+  "qkpipe": {
+    "SQ_INSTS_LDS": {
+      "median": 10306560.0,
+      "samples": [
+        {
+          "event_id": 1,
+          "value": 10306560.0,
+          "instances": 32
+        },
+        {
+          "event_id": 2,
+          "value": 10306560.0,
+          "instances": 32
+        },
+        {
+          "event_id": 3,
+          "value": 10306560.0,
+          "instances": 32
+        }
+      ]
+    },
+    "SQ_INSTS_MFMA": {
+      "median": 3072000.0,
+      "samples": [
+        {
+          "event_id": 1,
+          "value": 3072000.0,
+          "instances": 32
+        },
+        {
+          "event_id": 2,
+          "value": 3072000.0,
+          "instances": 32
+        },
+        {
+          "event_id": 3,
+          "value": 3072000.0,
+          "instances": 32
+        }
+      ]
+    },
+    "SQ_INSTS_VALU": {
+      "median": 29441280.0,
+      "samples": [
+        {
+          "event_id": 1,
+          "value": 29441280.0,
+          "instances": 32
+        },
+        {
+          "event_id": 2,
+          "value": 29441280.0,
+          "instances": 32
+        },
+        {
+          "event_id": 3,
+          "value": 29441280.0,
+          "instances": 32
+        }
+      ]
+    },
+    "SQ_WAVES": {
+      "median": 3840.0,
+      "samples": [
+        {
+          "event_id": 1,
+          "value": 3840.0,
+          "instances": 32
+        },
+        {
+          "event_id": 2,
+          "value": 3840.0,
+          "instances": 32
+        },
+        {
+          "event_id": 3,
+          "value": 3840.0,
+          "instances": 32
+        }
+      ]
+    },
+    "pass0": {
+      "db": "/home/jun_chen2_qle/yzhou_aiter/fp8-qk-opt-20261021/profile_qkpipe_0/counters_results.db",
+      "sha256": "77d3c6f9e3374cc4de60fcbd0885f77469d5eb763c9fb63e498835e8f569a05e",
+      "durations_us": [
+        172.361,
+        172.201,
+        173.921
+      ]
+    },
+    "LDSBankConflict": {
+      "median": 8.684246234565109,
+      "samples": [
+        {
+          "event_id": 1,
+          "value": 8.709611570477037,
+          "instances": 1
+        },
+        {
+          "event_id": 2,
+          "value": 8.655558366163179,
+          "instances": 1
+        },
+        {
+          "event_id": 3,
+          "value": 8.684246234565109,
+          "instances": 1
+        }
+      ]
+    },
+    "MeanOccupancyPerCU": {
+      "median": 6.441938094662656,
+      "samples": [
+        {
+          "event_id": 1,
+          "value": 6.453300189262682,
+          "instances": 1
+        },
+        {
+          "event_id": 2,
+          "value": 6.441938094662656,
+          "instances": 1
+        },
+        {
+          "event_id": 3,
+          "value": 6.420023025125515,
+          "instances": 1
+        }
+      ]
+    },
+    "OccupancyPercent": {
+      "median": 20.128496891130556,
+      "samples": [
+        {
+          "event_id": 1,
+          "value": 20.164014523776597,
+          "instances": 1
+        },
+        {
+          "event_id": 2,
+          "value": 20.128496891130556,
+          "instances": 1
+        },
+        {
+          "event_id": 3,
+          "value": 20.060017925117535,
+          "instances": 1
+        }
+      ]
+    },
+    "pass1": {
+      "db": "/home/jun_chen2_qle/yzhou_aiter/fp8-qk-opt-20261021/profile_qkpipe_1/counters_results.db",
+      "sha256": "0b608d5f8e207dd2770fcb85219fcbd05e96481e0c5cd99c500dce2b8cabf963",
+      "durations_us": [
+        173.121,
+        173.242,
+        172.482
+      ]
+    }
+  }
+}

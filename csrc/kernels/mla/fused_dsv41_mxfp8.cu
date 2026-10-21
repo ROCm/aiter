@@ -592,12 +592,12 @@ __global__ __launch_bounds__(256, 1) void fused_dsv41_fp8_qk_decode_64(FusedDsv4
     const int tid = threadIdx.x, lane = tid % 64, wave = tid / 64, group = lane / 16;
     const int hl = wave * 16 + lane % 16, h = blockIdx.y * 64 + hl, t = blockIdx.x;
     const int hload = min(h, a.heads - 1);
-    __shared__ __align__(16) B kv_tile[2 * T::smem_kv_tile_elems];
+    __shared__ __align__(16) B kv_tile[T::smem_kv_tile_elems];
     const int64_t pos = a.positions64 ? static_cast<const int64_t*>(a.positions)[t]
                                       : static_cast<const int*>(a.positions)[t];
     const B* cs       = a.cos + pos * 32;
     const B* sn       = a.sin + pos * 32;
-    __shared__ __align__(32) uint8_t raw_k[2 * 32 * 528];
+    __shared__ __align__(32) uint8_t raw_k[2 * (32 * 528 + 128)];
     opus::vector_t<opus::fp8_t, 32> q[4];
     int q_scales[4];
     opus::vector_t<float, 8> o[16];

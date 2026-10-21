@@ -1,5 +1,10 @@
 # DSV4.1 fused scaled-FP8 QK, 2026-10-21
 
+> This document records the initial implementation. The current kernel uses
+> the [optimized single-V pipeline](fused_dsv41_fp8_qk_optimization.md),
+> reducing LDS to 66.25 KiB and improving the measured FP8 full paths by 40–48%.
+> Historical timings and the double-V diagram below describe the initial version.
+
 The optional `fp8_qk=True` path quantizes BF16 Q after optional forward RoPE,
 executes scaled FP8 QK with FP32 accumulation, and retains BF16 PV. It is
 correctness-validated but slower than the existing BF16 QK implementation on
