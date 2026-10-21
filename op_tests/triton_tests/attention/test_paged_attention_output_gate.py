@@ -346,7 +346,7 @@ def test_module_imports_without_the_gluon_dialect():
     that: with `triton.experimental.gluon` made unimportable, importing the
     wrapper still has to succeed.
     """
-    import importlib
+    import runpy
     import sys
 
     module = "aiter.ops.triton.attention.paged_attention_output_gate"
@@ -366,7 +366,7 @@ def test_module_imports_without_the_gluon_dialect():
         del sys.modules[k]
     sys.meta_path.insert(0, _BlockGluon())
     try:
-        importlib.import_module(module)  # must not raise
+        runpy.run_module(module)  # must not raise
     finally:
         sys.meta_path.pop(0)
         sys.modules.update(saved)
