@@ -494,12 +494,27 @@ __device__ __forceinline__ void r6_poster_block(const LgCommArgsV3& a) {
 #endif
 }
 
+// ---- r12c NaN fill of R (best effort; overhead-r2 A1): grid-stride by `nwg` workgroups x 256 threads, share of workgroup `wg`. R + the reuse pad = 8*M*F + LG_R_PAD_BYTES bytes (a multiple of 16). No drain of incoming puts. ----
+__device__ __forceinline__ void r12_fill_nan(const LgCommArgsV3& a, uint32_t wg, uint32_t nwg) {
+    typedef __attribute__((ext_vector_type(4))) uint32_t u32x4;
+    u32x4* p = reinterpret_cast<u32x4*>(ccoGetLocalPtr(a.Rwin, 0));
+    const uint64_t n16 = (8ull * a.M * a.F + LG_R_PAD_BYTES) / 16ull;
+    const u32x4 nan4 = {0x7FC07FC0u, 0x7FC07FC0u, 0x7FC07FC0u, 0x7FC07FC0u};              // 8 x BF16 NaN
+    for (uint64_t i = static_cast<uint64_t>(wg) * 256ull + opus::thread_id_x(); i < n16; i += static_cast<uint64_t>(nwg) * 256ull) p[i] = nan4;
+}
+
 // ---- quiet_ready for r6: W2 + reset + epoch advance (no posting, no W1). ONE WG, threads 0..2 = peers. ----
 __device__ __forceinline__ void r6_quiet_ready(const LgCommArgsV3& a) {
     const int tid = static_cast<int>(opus::thread_id_x());
+    const uint32_t wg = static_cast<uint32_t>(opus::block_id_x());
+    const bool err0 = err_clear(a);                                                 // ONE ERR read at entry per workgroup (r12c)
+    if (wg != 0u) {                                                                 // helper WGs: no waits, no flags
+        if (!err0) r12_fill_nan(a, wg, LG_QR_WGS);                                  // ERR set before/at dispatch: fill this WG's share of R with NaN
+        return;                                                                     // clean launch: exit at once (block-uniform; WG0 alone runs the barriers below)
+    }
     const uint64_t e = ld_u64(cw(a, LGC_EP_OFF));
     const uint64_t E = tag_E(a);
-    if (tid < 3 && err_clear(a)) {                                                  // r12 sticky: under ERR (at entry) W2 is skipped; the reset below still runs
+    if (tid < 3 && err0) {                                                  // r12 sticky: under ERR (at entry) W2 is skipped; the reset below still runs
         const int d = peer_of(static_cast<int>(a.rank), tid);
         bool got = false; uint64_t v = 0ull;
         const uint64_t t0 = __builtin_amdgcn_s_memrealtime(), budget = r6_budget_ticks(a);
@@ -539,13 +554,20 @@ __device__ __forceinline__ void r6_quiet_ready(const LgCommArgsV3& a) {
     if (tid == 0) __hip_atomic_store(reinterpret_cast<uint64_t*>(cw(a, LGC_FIRSTPUT_OFF)), 0ull, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 #endif
     mori::cco::impl::syncThreads();
+    __shared__ uint32_t s_fill;                                                     // 0 = no fill, 1 = fill my share (ERR was set at entry), 2 = fill ALL of R alone (ERR appeared in this launch)
     if (tid == 0) {
         mori::cco::impl::threadFenceSystem();
-        if (err_clear(a)) {                               // poisoned epochs are NOT advanced
+        const bool clear_now = err_clear(a);
+        if (clear_now) {                                  // poisoned epochs are NOT advanced
             add_report(a, 5, 1);
             st_u64_rel_x(cw(a, LGC_EP_OFF), e + 1ull);
         }
+        s_fill = err0 ? 1u : (clear_now ? 0u : 2u);       // the helper WGs saw ERR == 0 at their entry and exited: if WG0 set (or saw) ERR itself, WG0 must fill all of R
     }
+    mori::cco::impl::syncThreads();
+    const uint32_t fm = s_fill;
+    if (fm == 1u) r12_fill_nan(a, 0u, LG_QR_WGS);
+    else if (fm == 2u) r12_fill_nan(a, 0u, 1u);
 }
 
 // ---- host recovery step (F-A): quietQueue on EVERY peer queue of this rank; run + synchronize before any re-init / next epoch after a poisoned epoch. 1 WG, threads 0..2 ----

@@ -172,8 +172,12 @@ enum { LGC_POISON_W1_TIMEOUT = 1, LGC_POISON_W2_TIMEOUT = 2, LGC_POISON_EPOCH_MI
 #define LG_ENTRY_GEMM_N3Q "lg_r9_gemm_n3q_v1"   /* r9: quarter-first, THREE put groups per peer (chunks [0,2) as 128x128 quarter items, [2,3) and [3,8) as full tiles), dense M=2048 only; plan code bit 0x800 (host half_first = 2) */
 #define LG_R9_QC 2                              /* chunks in group 0 of the quarter-first plan (the first LG_R9_QC chunk rows run as quarter items) */
 #define LG_R9_G1 1                              /* chunks in group 1 (full tiles); group 2 = the remaining chunks - LG_R9_QC - LG_R9_G1 */
-#define LG_ENTRY_NAN_FILL "lg_nan_fill_v1"       /* r12 (card D-3, alternative B): separate graph node after quiet_ready, before the golden receiver: exits at once when *err == 0, else fills R with BF16 NaN (best effort) */
-#define LG_NAN_FILL_WGS 256u                      /* grid of lg_nan_fill_v1 (x 256 threads, grid-stride); a compile-time constant so the kernel never reads the dispatch packet */
+/* r12c (overhead-r2 A1): NO separate NaN-fill node. quiet_ready runs LG_QR_WGS workgroups (x 256 threads): WG0 = the W2/reset/epoch role (unchanged); every WG reads ERR ONCE at entry; WG >= 1 exits when ERR == 0, else grid-stride fills its share of
+   R (+ the reuse pad) with BF16 NaN; if WG0 itself sees ERR during this launch (it was clear at its entry) WG0 fills ALL of R alone. No inter-WG wait or flag. 1 = A1' (single WG: identical to the r11 healthy path; the fill is done by WG0 alone / its stride). */
+#ifndef LG_QR_WGS
+#define LG_QR_WGS 64u
+#endif
+static_assert(LG_QR_WGS >= 1u && LG_QR_WGS <= 256u, "LG_QR_WGS in [1, 256]");
 #define LG_ENTRY_DRAIN "lg_drain_all_v2"           /* r6b host recovery step: quietQueue on every peer queue (run + sync before any re-init after a poisoned epoch) */
 #define LG_POLL_BUDGET_US_DEFAULT 50000u          /* r6b: poster/quiet_ready wait budget in microseconds (s_memrealtime, 100 MHz); passed in args.reserved[1] (must be non-zero). Must exceed worst-case GEMM time + rank skew + late poster dispatch at M=8192 (GEMM ~0.26-1.3 ms there). */
 

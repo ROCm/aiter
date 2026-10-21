@@ -30,7 +30,7 @@ struct LgCommCtx {
     void *Sva = nullptr, *Rva = nullptr, *Cva = nullptr;
     uint32_t rank = 0, M = 0, Q = 1;
     uint32_t* err = nullptr; const uint64_t* step = nullptr; const LgGfPeers* gpeers = nullptr;   // r12: per-comm ERR/STEP page (owned by the runtime; set by lg_comm_set_gpage), peer-ERR table (device pointer, may be null)
-    hipModule_t mod = nullptr; hipFunction_t fgemm[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}, fquiet = nullptr, fdrain = nullptr, fnan = nullptr;   // r6x: n1/n2/n4 entries (puts per peer) in one HSACO
+    hipModule_t mod = nullptr; hipFunction_t fgemm[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}, fquiet = nullptr, fdrain = nullptr;   // r6x: n1/n2/n4 entries (puts per peer) in one HSACO
 };
 
 extern "C" {
@@ -112,7 +112,7 @@ void* lg_comm_create(uint32_t rank, const uint8_t* uid128, uint32_t M, uint64_t 
     LGD(rank, "hipModuleLoad rc=%d path=%s", static_cast<int>(e_ml), hsaco_path);
     if (e_ml != hipSuccess) { delete c; return nullptr; }
     struct { hipFunction_t* f; const char* name; } fns[] = {{&c->fgemm[0], LG_ENTRY_GEMM_N1}, {&c->fgemm[1], LG_ENTRY_GEMM_N2}, {&c->fgemm[2], LG_ENTRY_GEMM_N4}, {&c->fgemm[3], LG_ENTRY_GEMM_N2H},
-                                                 {&c->fgemm[4], LG_ENTRY_GEMM_N4H}, {&c->fgemm[5], LG_ENTRY_GEMM_N3Q}, {&c->fquiet, LG_ENTRY_QUIET}, {&c->fdrain, LG_ENTRY_DRAIN}, {&c->fnan, LG_ENTRY_NAN_FILL}};
+                                                 {&c->fgemm[4], LG_ENTRY_GEMM_N4H}, {&c->fgemm[5], LG_ENTRY_GEMM_N3Q}, {&c->fquiet, LG_ENTRY_QUIET}, {&c->fdrain, LG_ENTRY_DRAIN}};
     for (auto& fn : fns) {
         const hipError_t e_gf = hipModuleGetFunction(fn.f, c->mod, fn.name);
         LGD(rank, "hipModuleGetFunction %s rc=%d", fn.name, static_cast<int>(e_gf));
@@ -145,7 +145,7 @@ int32_t lg_comm_set_gpage(void* h, void* err, const void* step, const void* gpee
     c->err = static_cast<uint32_t*>(err); c->step = static_cast<const uint64_t*>(step); c->gpeers = static_cast<const LgGfPeers*>(gpeers);
     return 0;
 }
-// One epoch = GEMM(grid = items + 1 poster WGs x 512) -> quiet_ready(1 WG x 256) -> lg_nan_fill_v1 (LG_NAN_FILL_WGS x 256, exits at once when ERR == 0), same stream. Returns hip error code.
+// One epoch = GEMM(grid = items + 1 poster WGs x 512) -> quiet_ready(LG_QR_WGS WGs x 256; includes the best-effort NaN fill under ERR), same stream. Returns hip error code.
 // call_id: the 31-bit rank-uniform key of (site, tokens, vid, n_fused); the tags E = (STEP << 32) | call_id ride on the credit/arrival words.
 int32_t lg_comm_launch(void* h, const void* A, const void* W, const float* Ascale, const float* Wscale,
                        uint32_t strideA, uint64_t poll_iterations, uint64_t poll_budget_us, uint32_t puts_per_peer, uint32_t half_first, uint32_t call_id, void* stream) {   // half_first (r7): 1 = group-0 remote tiles as half-N items (needs puts_per_peer 2 or 4); 0 = r6x plan   // puts_per_peer 0 => default_puts_per_peer(M); else 1, 2 or 4 (selects the ENTRY)
@@ -171,16 +171,12 @@ int32_t lg_comm_launch(void* h, const void* A, const void* W, const float* Ascal
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &a, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END};
     hipError_t r = hipModuleLaunchKernel(c->fgemm[hg == 2u ? 5 : (hg ? (npp == 2u ? 3 : 4) : (npp == 1u ? 0 : (npp == 2u ? 1 : 2)))], grid_items(a.chunks, npp, hg), 1, 1, 512, 1, 1, 0, static_cast<hipStream_t>(stream), nullptr, cfg);
 #if LG_R8_FOLD
-#error "r12 supports LG_R8_FOLD=0 only (the folded poster has no tag check / ERR skip / NaN-fill node)"
+#error "r12 supports LG_R8_FOLD=0 only (the folded poster has no tag check / ERR skip / NaN fill in quiet_ready)"
     return static_cast<int32_t>(r);                                          // r8 A2: no quiet_ready launch: the poster block folded W2 + reset + epoch advance (the GEMM kernel end implies R complete)
 #else
     if (r != hipSuccess) return static_cast<int32_t>(r);
-    r = hipModuleLaunchKernel(c->fquiet, 1, 1, 1, 256, 1, 1, 0, static_cast<hipStream_t>(stream), nullptr, cfg);
-    if (r != hipSuccess) return static_cast<int32_t>(r);
-    // r12 D-3: the NaN-fill node (best effort; exits at once when ERR == 0). R + the reuse pad = 8*M*F + LG_R_PAD_BYTES bytes (a multiple of 16).
-    struct { const uint32_t* err; void* R; uint64_t bytes; } fa = {c->err, c->Rva, 8ull * c->M * LG_COMM_F + LG_R_PAD_BYTES};
-    size_t fsz = sizeof fa; void* fcfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &fa, HIP_LAUNCH_PARAM_BUFFER_SIZE, &fsz, HIP_LAUNCH_PARAM_END};
-    r = hipModuleLaunchKernel(c->fnan, LG_NAN_FILL_WGS, 1, 1, 256, 1, 1, 0, static_cast<hipStream_t>(stream), nullptr, fcfg);
+    // r12c: quiet_ready = LG_QR_WGS workgroups x 256 threads: WG0 = W2/reset/epoch, every WG reads ERR once, helper WGs exit when ERR == 0 else fill their share of R (+ reuse pad) with NaN; NO separate fill node (graph: 3 nodes as r11).
+    r = hipModuleLaunchKernel(c->fquiet, LG_QR_WGS, 1, 1, 256, 1, 1, 0, static_cast<hipStream_t>(stream), nullptr, cfg);
     return static_cast<int32_t>(r);
 #endif
 }

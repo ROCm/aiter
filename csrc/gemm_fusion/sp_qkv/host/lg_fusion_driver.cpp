@@ -10,8 +10,8 @@
 //   D2 lg_info_v1 / lg_window_bytes_v1: build constants and the window size the runtime must register.
 //   D3 lg_free_v1 (L-5): unload the module and delete the context (call after a device sync, before comm teardown).
 //   D4 lg_report_fast_v1: poison word only (4-byte D2H on the given stream), for the per-step host check.
-//   D7 (r12, LG_COMM_ABI_VERSION >= 4 only; an r11 build is unchanged): lg_gpage_attach_v1 attaches the per-comm ERR/STEP page (+ peer-ERR table) owned by FusionResources; lg_launch_v2 = lg_launch_v1 + call_id (the step/call tags) and also launches the
-//      lg_nan_fill_v1 node after quiet_ready (the runtime must NOT add its own fill node); lg_nan_fill_v1 entry resolved in lg_attach_v1; lg_abi_info_v1 reports the ABI/offsets for the runtime's static checks.
+//   D7 (r12, LG_COMM_ABI_VERSION >= 4 only; an r11 build is unchanged): lg_gpage_attach_v1 attaches the per-comm ERR/STEP page (+ peer-ERR table) owned by FusionResources; lg_launch_v2 = lg_launch_v1 + call_id (the step/call tags) and launches
+//      quiet_ready with the best-effort NaN fill folded in (r12c: NO separate fill node; the graph keeps r11's 3 nodes per call; the runtime must not add one); lg_abi_info_v1 reports the ABI/offsets for the runtime's static checks.
 //      The per-plan poison hooks (lg_poison_v1, lg_launch_v1) are compiled out for ABI >= 4: ERR is a per-comm global word now (card R2 D2.6).
 //   D6 Process-global HIP state (gf_device_scope.hpp): the Phase-1 entry points lg_comm_launch / lg_comm_init_control / lg_comm_read_report /
 //      lg_comm_drain_all use the CALLER'S current device and the only hipSetDevice(rank) in the file sits in lg_comm_create (never called here).
@@ -80,11 +80,7 @@ void* lg_attach_v1(uint32_t rank, uint32_t M, void* comm, const void* devcomm, v
     }
     if (const hipError_t e = hipModuleLoad(&c->mod, hsaco_path); e != hipSuccess) { diag[0] = 6; diag[1] = static_cast<uint64_t>(e); std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=hipModuleLoad rank=%u err=%d (%s) path=%s\n", rank, static_cast<int>(e), hipGetErrorString(e), hsaco_path); delete c; return nullptr; }
     struct { hipFunction_t* f; const char* name; } fns[] = {{&c->fgemm[0], LG_ENTRY_GEMM_N1}, {&c->fgemm[1], LG_ENTRY_GEMM_N2}, {&c->fgemm[2], LG_ENTRY_GEMM_N4}, {&c->fgemm[3], LG_ENTRY_GEMM_N2H},
-                                                 {&c->fgemm[4], LG_ENTRY_GEMM_N4H}, {&c->fgemm[5], LG_ENTRY_GEMM_N3Q}, {&c->fquiet, LG_ENTRY_QUIET}, {&c->fdrain, LG_ENTRY_DRAIN}
-#if LG_COMM_ABI_VERSION >= 4
-                                                 , {&c->fnan, LG_ENTRY_NAN_FILL}
-#endif
-                                                };
+                                                 {&c->fgemm[4], LG_ENTRY_GEMM_N4H}, {&c->fgemm[5], LG_ENTRY_GEMM_N3Q}, {&c->fquiet, LG_ENTRY_QUIET}, {&c->fdrain, LG_ENTRY_DRAIN}};
     int entry_idx = 0;
     for (auto& fn : fns) if (const hipError_t e = hipModuleGetFunction(fn.f, c->mod, fn.name); e != hipSuccess) {
         diag[0] = 7; diag[1] = static_cast<uint64_t>(e); diag[2] = static_cast<uint64_t>(&fn - fns); (void)entry_idx;
@@ -134,7 +130,7 @@ int32_t lg_gpage_attach_v1(void* h, void* err, const void* step, const void* gpe
     auto* c = static_cast<LgCommCtx*>(h); if (!c) return -1;
     return lg_comm_set_gpage(h, err, step, gpeers);
 }
-// r12 launch: GEMM -> quiet_ready -> lg_nan_fill_v1 on `stream` (graph-capturable; no allocation, no sync). call_id = 31-bit rank-uniform decision key.
+// r12 launch: GEMM -> quiet_ready (LG_QR_WGS WGs, NaN fill under ERR included) on `stream` (graph-capturable; no allocation, no sync). call_id = 31-bit rank-uniform decision key.
 int32_t lg_launch_v2(void* h, const void* A, const void* W, const float* Ascale, const float* Wscale, uint32_t strideA, uint64_t poll_iterations,
                      uint64_t poll_budget_us, uint32_t puts_per_peer, uint32_t half_first, uint32_t call_id, void* stream) {
     auto* c = static_cast<LgCommCtx*>(h); if (!c) return -1;

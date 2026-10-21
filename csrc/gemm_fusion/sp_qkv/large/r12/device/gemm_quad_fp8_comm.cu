@@ -654,22 +654,6 @@ void lg_quiet_ready_v2(LgCommArgsV3 args) {
     __builtin_trap();
 #endif
 }
-// r12 (R12 design card r2, D-3 alternative B): separate graph node after quiet_ready and before the golden receiver. Exits at once when *err == 0 (one relaxed system load per WG; no inter-WG wait or flag);
-// otherwise a grid-stride fill of R (+ the reuse pad) with the BF16 NaN pattern 0x7FC0. BEST EFFORT: it does not drain incoming puts, so a put issued by a peer before it observed ERR may land after the fill.
-// Grid = LG_NAN_FILL_WGS x 256 (compile-time, so the kernel never reads the dispatch packet). `bytes` must be a multiple of 16 (host-checked).
-extern "C" __global__ __launch_bounds__(256)
-void lg_nan_fill_v1(const uint32_t* err, void* R, uint64_t bytes) {
-#if defined(__gfx950__)
-    if (__hip_atomic_load(err, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) == 0u) return;       // clean launch: nothing to do
-    typedef __attribute__((ext_vector_type(4))) uint32_t u32x4;
-    u32x4* p = reinterpret_cast<u32x4*>(R);
-    const uint64_t n16 = bytes / 16ull;
-    const u32x4 nan4 = {0x7FC07FC0u, 0x7FC07FC0u, 0x7FC07FC0u, 0x7FC07FC0u};                  // 8 x BF16 NaN
-    for (uint64_t i = static_cast<uint64_t>(opus::block_id_x()) * 256ull + opus::thread_id_x(); i < n16; i += static_cast<uint64_t>(LG_NAN_FILL_WGS) * 256ull) p[i] = nan4;
-#else
-    __builtin_trap();
-#endif
-}
 // r6b host recovery step: drain every peer queue of this rank (see lgc::r6_drain_all)
 extern "C" __global__ __launch_bounds__(64)
 void lg_drain_all_v2(LgCommArgsV3 args) {
@@ -691,5 +675,4 @@ extern "C" __global__ __launch_bounds__(512, 1) void lg_r7_gemm_n4h_v1(LgCommArg
 extern "C" __global__ __launch_bounds__(512, 1) void lg_r9_gemm_n3q_v1(LgCommArgsV3) {}
 extern "C" __global__ __launch_bounds__(256) void lg_quiet_ready_v2(LgCommArgsV3) {}
 extern "C" __global__ __launch_bounds__(64) void lg_drain_all_v2(LgCommArgsV3) {}
-extern "C" __global__ __launch_bounds__(256) void lg_nan_fill_v1(const uint32_t*, void*, uint64_t) {}
 #endif

@@ -160,6 +160,11 @@
 #ifndef SM_POLL_BATCH
 #define SM_POLL_BATCH 1
 #endif
+//  SM_IK_PAR_REL (default 1; B-H2): the IK owner releases its 3 destinations IN PARALLEL: after the existing per-wave vmcnt(0) + barrier, lane 0 of waves 0/1/2 each does (its own tag, already stored early) fence -> vmcnt(0) -> RMW for ONE destination
+//   (same argument as the PUSH8 straddler: the releasing thread stores its own tag, D-2). The chain becomes 1 round trip instead of 3. 0 = the serial loop by tid 0.
+#ifndef SM_IK_PAR_REL
+#define SM_IK_PAR_REL 1
+#endif
 #ifndef SM_TEST_DELAY_RELEASE
 #define SM_TEST_DELAY_RELEASE 0
 #endif
@@ -857,7 +862,11 @@ __device__ __forceinline__ void ran_body(const SmDev* __restrict__ blk, const Sm
 #endif
         if (ok) {
 #if SM_TAG_EARLY
+#if SM_IK_PAR_REL
+            if ((tid & 63) == 0 && (tid >> 6) < 3) { const uint32_t rr_ = static_cast<uint32_t>(tid) >> 6; tag_store(a, static_cast<int>((rr_ >= rank) ? rr_ + 1u : rr_), rank, par, E); if (tid == 0) SM_STAMP(rec, 38); }   // B-H2: lane 0 of wave rr stores ITS destination's tag (it will release it)
+#else
             if (tid == 0) { _Pragma("unroll") for (uint32_t rr = 0; rr < 3u; ++rr) tag_store(a, static_cast<int>((rr >= rank) ? rr + 1u : rr), rank, par, E); SM_STAMP(rec, 38); }   // F1: all 3 destination tags with the IK data stores
+#endif
 #endif
             _Pragma("unroll") for (uint32_t pass = 0; pass < 2u; ++pass) {
                 const uint32_t m = static_cast<uint32_t>(row16) + 16u * (pbase + pass);
@@ -874,10 +883,20 @@ __device__ __forceinline__ void ran_body(const SmDev* __restrict__ blk, const Sm
         __builtin_amdgcn_s_waitcnt(0x0);                                           // EVERY wave: vmcnt(0) before the release barrier, all exec paths
         if (tid == 0) SM_STAMP(rec, 25);
         mori::cco::impl::syncThreads();
+#if SM_IK_PAR_REL
+        if ((tid & 63) == 0 && (tid >> 6) < 3 && ok) {                             // B-H2: lane 0 of waves 0/1/2 each release ONE destination (its own tag was stored early by this thread): 1 round trip instead of 3
+            const uint32_t rr_ = static_cast<uint32_t>(tid) >> 6, d_ = (rr_ >= rank) ? rr_ + 1u : rr_;
+            if (tid == 0) SM_STAMP(rec, 36);
+            release_tagged(a, static_cast<int>(d_), rank, par, E);
+            SM_STAMP(rec, 40u + rr_);                                              // release of destination slot rr_ done (40/41/42); 25 -> 26/40..42 is the IK release chain
+            if (tid == 0) SM_STAMP(rec, 26);
+        }
+#else
         if (tid == 0 && ok) {                                                      // ONE release per destination (fence(release,system) -> vmcnt(0) -> relaxed RMW)
             SM_STAMP(rec, 36); _Pragma("unroll") for (uint32_t rr = 0; rr < 3u; ++rr) { const uint32_t d = (rr >= rank) ? rr + 1u : rr; release_tagged(a, static_cast<int>(d), rank, par, E); }
             SM_STAMP(rec, 26);
         }
+#endif
         {                                                                          // self fusion AFTER the remote release (does not delay the other ranks); r19: also in NANMODE (vv stays NaN)
             RowPre pre[2];
             _Pragma("unroll") for (uint32_t pass = 0; pass < 2u; ++pass) { const uint32_t rc = rowc(static_cast<uint32_t>(row16) + 16u * (pbase + pass), Mm1); pre_a(a, ka.positions, ka.slot_mapping, ka.t_valid, rank * M + rc, pre[pass]); }
@@ -1059,7 +1078,7 @@ __device__ __forceinline__ void ran_body(const SmDev* __restrict__ blk, const Sm
                 const uint32_t rr = (rank > s) ? rank - 1u : rank;
                 const uint64_t K = t1r::kcount(rr);
                 s_ticket = poll_range64(a, ka.err, rank, E, cwin_local(a, SM_T1_FLAG(s)), K * e, K * (e + 1ull), &it) ? 1u : 0u;   // >= K*e, poison if > K*(e+1); own system acquire fence on exit
-                sum_fl = it; SM_STAMP(rec, 8); SM_STAMP_VAL(rec, 15, it);
+                sum_fl = it; SM_STAMP(rec, 8); SM_STAMP_VAL(rec, 15, it); SM_STAMP_VAL(rec, 43, s);   // 43 = source rank of this B WG (flag-seen per source/destination pair)
             }
             mori::cco::impl::syncThreads();                                // fence (thread 0) -> barrier -> reads
             if (s_ticket != 1u) ok = false;
