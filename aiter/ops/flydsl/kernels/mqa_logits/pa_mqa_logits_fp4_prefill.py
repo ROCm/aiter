@@ -658,7 +658,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
             return kv_list, kvs_packed_list
 
         def _issue_nt_mfmas(kv_list_in, kvs_packed_per_kt, nt):
-            zero = fx.Vector.filled(4, 0.0, fx.Float32)
+            zero = fx.full(4, 0.0, fx.Float32)
             accs = [zero] * m_tiles
             # opsel_b=nt is baked into the atom; scale_b is the packed 4-nt word.
             atom = mfma_atoms[nt]
@@ -683,7 +683,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
 
         def _post_process_nt(accs, nt, c_i32_arg):
             """relu + per-head weight + per-thread sum + bperm + windowed store."""
-            zero = fx.Vector.filled(4, 0.0, fx.Float32)
+            zero = fx.full(4, 0.0, fx.Float32)
             ni_warp = warp_id * fx.Int32(N_TILES_PER_WARP) + fx.Int32(nt)
             token_base = (chunk_start + c_i32_arg) * fx.Int32(
                 block_k
@@ -699,7 +699,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
             lane_i32 = fx.Int32(lane_id)
 
             def _bperm_xor_add(val, sh):
-                peer_byte = (lane_i32 ^ fx.Int32(sh)) * fx.Int32(4)
+                peer_byte = (lane_i32 ^ fx.Int32(sh)) * 4
                 peer_i32 = fx.Int32(
                     rocdl.ds_bpermute(T.i32, peer_byte, val.bitcast(fx.Int32))
                 )
@@ -778,8 +778,8 @@ def build_pa_mqa_logits_fp4_prefill_module(
                 for mi in range(m_tiles)
             ]
             c_idx_i32 = fx.Int32(c_idx)
-            c_next_i32 = c_idx_i32 + fx.Int32(1)
-            c_next_next_i32 = c_next_i32 + fx.Int32(1)
+            c_next_i32 = c_idx_i32 + 1
+            c_next_next_i32 = c_next_i32 + 1
 
             _compute_chunk(
                 kv_cur_list, kvs_cur_list, c_idx_i32, nt0_accs_in=nt0_accs_cur
