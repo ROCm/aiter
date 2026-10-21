@@ -2158,7 +2158,8 @@ namespace py = pybind11;
           py::arg("rotary_dim") = 0,                                   \
           py::arg("v_norm")     = false,                              \
           py::arg("q_out_fp8")  = py::none(),                          \
-          py::arg("per_tensor_q_scale") = py::none());                 \
+          py::arg("per_tensor_q_scale") = py::none(),                  \
+          py::arg("k_out_unquantized") = py::none());                  \
     m.def("fused_qk_norm_rope_cache_block_quant_shuffle",              \
           &aiter::fused_qk_norm_rope_cache_block_quant_shuffle,        \
           py::arg("qkv"),                                              \
