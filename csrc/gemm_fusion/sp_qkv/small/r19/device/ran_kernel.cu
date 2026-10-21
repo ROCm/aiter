@@ -150,11 +150,24 @@
 #endif
 // r19 seams (default 0, test-only, never candidates): SM_TEST_DELAY_RELEASE=<n>: the releasing thread sleeps n x s_sleep(127) BEFORE its tag store + release (a delayed source, G10a). SM_TEST_TAG_AFTER_RELEASE=<n>: the releasing thread does the flag RMW FIRST, sleeps
 // n x s_sleep(127), and stores the tag AFTER it (violates D-2): consumers can then observe the flag with a stale tag => 0x30 mismatches MUST appear (G10b).
+// R12-small-overhead F1/F2 (r19/r20 optimisation round, A/B switches):
+//  SM_TAG_EARLY (default 1): the releasing thread stores its destination tag(s) in the SAME batch as its push16 data stores (IK owner: all 3 tags with its data), so the per-wave vmcnt(0) before the barrier already retired them and the later fence(release)
+//   has no remote store outstanding (C1: the tag store RTT used to sit between the fence and the RMW). D-2 still holds: the SAME thread, in program order BEFORE its own fence. 0 = the r19 behaviour (tag store immediately before the fence).
+//  SM_POLL_BATCH (default 1): poll_range64 issues the flag load and the ERR load back-to-back and waits once (C2: they used to be two serialised uncached loads per iteration). ERR is a liveness signal only. 0 = the r19 loop.
+#ifndef SM_TAG_EARLY
+#define SM_TAG_EARLY 1
+#endif
+#ifndef SM_POLL_BATCH
+#define SM_POLL_BATCH 1
+#endif
 #ifndef SM_TEST_DELAY_RELEASE
 #define SM_TEST_DELAY_RELEASE 0
 #endif
 #ifndef SM_TEST_TAG_AFTER_RELEASE
 #define SM_TEST_TAG_AFTER_RELEASE 0
+#endif
+#if SM_TEST_TAG_AFTER_RELEASE && SM_TAG_EARLY
+#error "SM_TEST_TAG_AFTER_RELEASE needs SM_TAG_EARLY=0 (with EARLY the tag is already published before the release)"
 #endif
 // SM_TEST_DELAY_PUSH_DATA=<n> (default 0 = no code, byte-identical; test-only, never a candidate; usable ALONE, and meant to be combined with SM_TEST_RX_BEFORE_FLAG=1 for the R2 control (iv)): every wave of the push WGs and the IK owners sleeps n x s_sleep(127) after the
 // entry decision and BEFORE it issues its push16 data stores. The flag release is NOT delayed by this seam (it still follows the stores' retire), so a reader that loads Rx before the flag poll (control iv) observes the previous epoch's data or torn rows. n=20 is about 80 us.
@@ -234,6 +247,10 @@ SM_INL void set_err(const SmDev& a, const uint32_t* err, uint32_t rank, uint32_t
 SM_INL bool poll_range64(const SmDev& a, const uint32_t* err, uint32_t rank, uint64_t E, const void* p, uint64_t lo, uint64_t hi, uint64_t* iters) {
     for (uint64_t i = 0; i < a.poll_iterations; ++i) {
         const uint64_t v = ld_rlx64(p);
+#if SM_POLL_BATCH
+        const uint32_t ez = __hip_atomic_load(err, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);   // F2: issued back-to-back with the flag load, ONE wait (the barrier keeps the compiler from sinking it into the branch below)
+        asm volatile("" ::: "memory");
+#endif
         if (v > hi) { set_err(a, err, rank, SM_ERRR_FLAG_OVERSHOOT, E, 0ull, v); return false; }
         if (v >= lo) {
 #if SM_RX_BYPASS
@@ -244,7 +261,11 @@ SM_INL bool poll_range64(const SmDev& a, const uint32_t* err, uint32_t rank, uin
             if (iters) *iters = i;
             return true;
         }
+#if SM_POLL_BATCH
+        if (ez != 0u) { if (iters) *iters = i; return false; }                                       // PEER_ERR (liveness only)
+#else
         if (__hip_atomic_load(err, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) != 0u) { if (iters) *iters = i; return false; }      // PEER_ERR
+#endif
         __builtin_amdgcn_s_sleep(2);
     }
     set_err(a, err, rank, SM_ERRR_FLAG_TIMEOUT, E, 0ull, ld_rlx64(p));
@@ -699,6 +720,9 @@ SM_INL void sys_add_release(void* p, uint64_t v) {
     __hip_atomic_fetch_add(reinterpret_cast<uint64_t*>(p), v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 // r19 D-2: the SAME thread that executes fence(release) -> vmcnt(0) -> RMW first stores the destination's tag (relaxed system store, sc0 sc1 flavour like push16), in program order before its own fence, so the release sequence publishes it.
+SM_INL void tag_store(const SmDev& a, int d, uint32_t rank, uint32_t par, uint64_t E) {      // system-scope relaxed store of the producer tag into destination d's ctl window (sc0 sc1 flavour, like push16)
+    __hip_atomic_store(reinterpret_cast<uint64_t*>(cwin_peer(a, d, SM_C_TAG(par, rank))), E, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
 SM_INL void release_tagged(const SmDev& a, int d, uint32_t rank, uint32_t par, uint64_t E) {
 #if SM_TEST_DELAY_RELEASE
     for (int dly = 0; dly < SM_TEST_DELAY_RELEASE; ++dly) __builtin_amdgcn_s_sleep(127);
@@ -706,9 +730,11 @@ SM_INL void release_tagged(const SmDev& a, int d, uint32_t rank, uint32_t par, u
 #if SM_TEST_TAG_AFTER_RELEASE
     sys_add_release(cwin_peer(a, d, SM_T1_FLAG(rank)), 1ull);                                   // G10b NEGATIVE CONTROL: tag AFTER the release (illegal)
     for (int dly = 0; dly < SM_TEST_TAG_AFTER_RELEASE; ++dly) __builtin_amdgcn_s_sleep(127);
-    __hip_atomic_store(reinterpret_cast<uint64_t*>(cwin_peer(a, d, SM_C_TAG(par, rank))), E, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    tag_store(a, d, rank, par, E);
+#elif SM_TAG_EARLY
+    sys_add_release(cwin_peer(a, d, SM_T1_FLAG(rank)), 1ull);                                   // F1: this thread already stored the tag together with its data stores (retired by the per-wave vmcnt(0) before the barrier)
 #else
-    __hip_atomic_store(reinterpret_cast<uint64_t*>(cwin_peer(a, d, SM_C_TAG(par, rank))), E, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    tag_store(a, d, rank, par, E);                                                              // r19 order: tag store immediately before the fence
     sys_add_release(cwin_peer(a, d, SM_T1_FLAG(rank)), 1ull);
 #endif
 }
@@ -835,6 +861,9 @@ __device__ __forceinline__ void ran_body(const SmDev* __restrict__ blk, const Sm
         for (int dly_ = 0; dly_ < SM_TEST_DELAY_PUSH_DATA; ++dly_) __builtin_amdgcn_s_sleep(127);   // r19+ test seam: every wave sleeps BEFORE issuing the push16 DATA stores (the release is not delayed); with SM_TEST_RX_BEFORE_FLAG=1 the readers' pre-flag loads then see stale/torn Rx
 #endif
         if (ok) {
+#if SM_TAG_EARLY
+            if (tid == 0) { _Pragma("unroll") for (uint32_t rr = 0; rr < 3u; ++rr) tag_store(a, static_cast<int>((rr >= rank) ? rr + 1u : rr), rank, par, E); SM_STAMP(rec, 38); }   // F1: all 3 destination tags with the IK data stores
+#endif
             _Pragma("unroll") for (uint32_t pass = 0; pass < 2u; ++pass) {
                 const uint32_t m = static_cast<uint32_t>(row16) + 16u * pass;
                 _Pragma("unroll") for (int i = 0; i < 8; ++i) { float pp[SM_SK_CFG]; _Pragma("unroll") for (int q = 0; q < SM_SK_CFG; ++q) pp[q] = pk[q][pass][i]; vv[pass][i] = red_u(pp, ws[i], as_[pass]); }   // the ONE reduction/scale/BF16 rounding of IK
@@ -851,7 +880,7 @@ __device__ __forceinline__ void ran_body(const SmDev* __restrict__ blk, const Sm
         if (tid == 0) SM_STAMP(rec, 25);
         mori::cco::impl::syncThreads();
         if (tid == 0 && ok) {                                                      // ONE release per destination (fence(release,system) -> vmcnt(0) -> relaxed RMW)
-            _Pragma("unroll") for (uint32_t rr = 0; rr < 3u; ++rr) { const uint32_t d = (rr >= rank) ? rr + 1u : rr; release_tagged(a, static_cast<int>(d), rank, par, E); }
+            SM_STAMP(rec, 36); _Pragma("unroll") for (uint32_t rr = 0; rr < 3u; ++rr) { const uint32_t d = (rr >= rank) ? rr + 1u : rr; release_tagged(a, static_cast<int>(d), rank, par, E); }
             SM_STAMP(rec, 26);
         }
         {                                                                          // self fusion AFTER the remote release (does not delay the other ranks); r19: also in NANMODE (vv stays NaN)
@@ -944,6 +973,12 @@ __device__ __forceinline__ void ran_body(const SmDev* __restrict__ blk, const Sm
         for (int dly_ = 0; dly_ < SM_TEST_DELAY_PUSH_DATA; ++dly_) __builtin_amdgcn_s_sleep(127);   // r19+ test seam: every wave sleeps BEFORE issuing the push16 DATA stores (the release is not delayed); with SM_TEST_RX_BEFORE_FLAG=1 the readers' pre-flag loads then see stale/torn Rx
 #endif
         if (ok) {
+#if SM_TAG_EARLY
+            if (tid == 0) { _Pragma("unroll") for (uint32_t rr = 0; rr < 3u; ++rr) if (t1r::touches(wgid, rr)) { tag_store(a, static_cast<int>((rr >= rank) ? rr + 1u : rr), rank, par, E); break; } SM_STAMP(rec, 38); }
+#if SM_PUSH8
+            if (tid == 256) { uint32_t seen_ = 0; _Pragma("unroll") for (uint32_t rr = 0; rr < 3u; ++rr) if (t1r::touches(wgid, rr)) { if (seen_++ == 1u) tag_store(a, static_cast<int>((rr >= rank) ? rr + 1u : rr), rank, par, E); } }
+#endif
+#endif
             const uint32_t m = static_cast<uint32_t>(prow) + 16u * pass_h;
             _Pragma("unroll") for (uint32_t kk = 0; kk < NS; ++kk) if (sl_real[kk] && m < M) {
                 const uint32_t gu = g0 + sl_u[kk];
@@ -961,7 +996,7 @@ __device__ __forceinline__ void ran_body(const SmDev* __restrict__ blk, const Sm
         if (ok) {
             // one system RELEASE per touched destination (fence(release,system) -> vmcnt(0) -> relaxed RMW on flag[src]); the first by thread 0, the second (Q1 straddlers) by thread 256 = a different wave, so the two releases overlap
             if (tid == 0) {
-                _Pragma("unroll") for (uint32_t rr = 0; rr < 3u; ++rr) if (t1r::touches(wgid, rr)) { release_tagged(a, static_cast<int>((rr >= rank) ? rr + 1u : rr), rank, par, E); break; }
+                SM_STAMP(rec, 36); _Pragma("unroll") for (uint32_t rr = 0; rr < 3u; ++rr) if (t1r::touches(wgid, rr)) { release_tagged(a, static_cast<int>((rr >= rank) ? rr + 1u : rr), rank, par, E); break; }
                 SM_STAMP(rec, 26);
             }
 #if SM_PUSH8
@@ -1021,6 +1056,9 @@ __device__ __forceinline__ void ran_body(const SmDev* __restrict__ blk, const Sm
         for (int dly_ = 0; dly_ < SM_TEST_DELAY_PUSH_DATA; ++dly_) __builtin_amdgcn_s_sleep(127);   // r19+ test seam: every wave sleeps BEFORE issuing the push16 DATA stores (the release is not delayed); with SM_TEST_RX_BEFORE_FLAG=1 the readers' pre-flag loads then see stale/torn Rx
 #endif
         if (ok) {
+#if SM_TAG_EARLY
+            if (tid == 0) { tag_store(a, static_cast<int>(d), rank, par, E); SM_STAMP(rec, 38); }                       // F1: same thread that releases to d, same batch as its data stores
+#endif
             uint16_t* const rx_dst = reinterpret_cast<uint16_t*>(rwin_peer(a, static_cast<int>(d)));
             _Pragma("unroll") for (uint32_t kk = 0; kk < 3u; ++kk) if (kk < nu) {
                 const uint32_t h = (g0 + kk) % t1r::HEADS;
@@ -1046,7 +1084,7 @@ __device__ __forceinline__ void ran_body(const SmDev* __restrict__ blk, const Sm
 #endif
 #if !SM_TEST_ADD_BEFORE_RETIRE
         if (tid == 0 && ok) {                                               // ONE system RELEASE (fence(release,system) -> vmcnt(0) -> relaxed RMW) on flag[src] of the single destination
-            release_tagged(a, static_cast<int>(d), rank, par, E);
+            SM_STAMP(rec, 36); release_tagged(a, static_cast<int>(d), rank, par, E);
             SM_STAMP(rec, 26);
         }
 #endif
@@ -1133,6 +1171,7 @@ __device__ __forceinline__ void ran_body(const SmDev* __restrict__ blk, const Sm
         {
             if (tid == 0) {
                 uint64_t it = 0;
+                SM_STAMP(rec, 39);                                                  // poll start (stamp 8 = flag seen)
                 const uint32_t rr = (rank > s) ? rank - 1u : rank;
                 const uint64_t K = t1r::kcount(rr);
                 s_ticket = poll_range64(a, ka.err, rank, E, cwin_local(a, SM_T1_FLAG(s)), K * e, K * (e + 1ull), &it) ? 1u : 0u;   // >= K*e, poison if > K*(e+1); own system acquire fence on exit
