@@ -837,9 +837,8 @@ def test_k1_table_padded_to_max_model_len():
     request's pages, so K1 sees tens of thousands of columns no row can see.
     The table here is 4096 pages of 16 wide, which also crosses into the
     streaming selector. Every request shares one packed cache and differs in
-    its length. Covers the one-row scorer (decode, decode mixed with a
-    prefill chunk, and two prefill prompts) and the 16-row scorer (one
-    request). The 16-row scorer launches only for a single request.
+    its length. Covers the one-row scorer (decode) and the 16-row scorer
+    (decode mixed with a prefill chunk, two prefill prompts, one request).
     """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
@@ -908,8 +907,8 @@ def test_k1_table_padded_to_max_model_len():
     )
 
     # Two prefill prompts. Eight rows end the long context and twenty-four
-    # end a short one, so the selected sets differ. Two context lengths keep
-    # this on one row per workgroup.
+    # end a short one, so the selected sets differ and the first 16-row
+    # block spans both.
     left, right, short = 8, 24, 4096
     two_pos = torch.cat(
         (
@@ -941,6 +940,87 @@ def test_k1_table_padded_to_max_model_len():
         torch.arange(start, start + m, dtype=dtypes.i32, device=device),
         "K1 16-row prefill on a max_model_len table diverged",
     )
+
+
+def test_k1_row_tile_spanning_requests_gathers_each_requests_pages():
+    """A 16-row block that spans requests scores each row on its own pages.
+
+    Every request has its own compressed K on disjoint physical pages, so a
+    block that gathers the wrong request's pages, or writes rows of another
+    request, selects a different set. Covers MTP decode (four requests of
+    four rows, one block) and a prefill chunk whose last block also holds
+    three decode rows.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FLASH_NEXT_INDEXER
+    device = torch.device("cuda")
+    page_size, width = 16, 400
+    lens = [9001, 3000, 20000, 12345]
+    gen = torch.Generator(device=device)
+    gen.manual_seed(2)
+    torch.manual_seed(2)
+    k_bars, caches, tables, base = [], [], [], 0
+    for n in lens:
+        k_bar = torch.randn(
+            n // idx.compress_ratio, idx.head_dim, dtype=dtypes.bf16, device=device
+        )
+        cache, table = pack_paged_cache(k_bar.unsqueeze(1), page_size, generator=gen)
+        k_bars.append(k_bar)
+        caches.append(cache)
+        tables.append(table[0] + base)
+        base += cache.shape[0]
+    index_cache = torch.cat(caches)
+    table = torch.zeros(len(lens), width, dtype=dtypes.i32, device=device)
+    for r, t in enumerate(tables):
+        table[r, : t.numel()] = t
+    slen = torch.tensor(lens, dtype=dtypes.i32, device=device)
+
+    def run(rows_per_req, what):
+        t2r = torch.cat(
+            [
+                torch.full((n,), r, dtype=dtypes.i32, device=device)
+                for r, n in enumerate(rows_per_req)
+            ]
+        )
+        qpos = torch.cat(
+            [
+                torch.arange(lens[r] - n, lens[r], dtype=dtypes.i32, device=device)
+                for r, n in enumerate(rows_per_req)
+            ]
+        )
+        q = torch.randn(
+            t2r.numel(), idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device
+        )
+        refs = []
+        for r, n in enumerate(rows_per_req):
+            rows = t2r == r
+            refs.append(
+                qsa_topk_blocks(
+                    qsa_indexer_scores(
+                        q[rows],
+                        k_bars[r],
+                        qpos[rows],
+                        slen[r : r + 1],
+                        torch.zeros(n, dtype=dtypes.i32, device=device),
+                        idx.compress_ratio,
+                        score_scale=FLASH_NEXT_SCORE_SCALE,
+                    ),
+                    idx.block_budget,
+                )
+            )
+        width_ids = max(ref.shape[1] for ref in refs)
+        ref_ids = torch.cat(
+            [
+                torch.nn.functional.pad(ref, (0, width_ids - ref.shape[1]), value=-1)
+                for ref in refs
+            ]
+        )
+        got = qsa_indexer_block_ids(q, index_cache, table, t2r, qpos, slen, heads=(4,))
+        _assert_k1_block_ids(ref_ids, got, what)
+
+    run([4, 4, 4, 4], "K1 MTP decode block spanning four requests diverged")
+    run([37, 1, 1, 1], "K1 prefill chunk block holding decode rows diverged")
 
 
 def test_k1_padded_decode_graph_capture():
