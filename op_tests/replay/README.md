@@ -49,6 +49,13 @@ Weights and activations are not saved; replay fills them synthetically.
 Recording copies routing tensors to the host on every call, so the run is
 slower than usual; its own performance numbers are not meaningful.
 
+To see what a bundle contains (GPU, aiter commit, patches, configs, and the
+calls grouped by weight shape, M and kernels):
+
+```bash
+python op_tests/replay/inspect_bundle.py <bundle-dir>
+```
+
 ## 2. Replay (any machine with the same GPU, no framework needed)
 
 ```bash

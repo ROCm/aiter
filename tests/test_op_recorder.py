@@ -30,6 +30,7 @@ def _load(name, relpath):
 
 rec = _load("aiter_op_recorder_under_test", "aiter/op_recorder.py")
 replay = _load("replay_fused_moe_under_test", "op_tests/replay/replay_fused_moe.py")
+inspect_bundle = _load("inspect_bundle_under_test", "op_tests/replay/inspect_bundle.py")
 
 
 class Act(enum.Enum):
@@ -211,6 +212,27 @@ def test_error_is_recorded_and_raised(recorder, tmp_path):
     rec._WRITER.close()
     (call,) = list(rec.iter_calls(_bundle(tmp_path)))
     assert call["error"] == "RuntimeError: boom"
+
+
+def test_inspect_bundle(recorder, tmp_path, capsys):
+    op = recorder()
+    for m in (1, 1, 4):
+        op(**_inputs(m=m))
+    with pytest.raises(RuntimeError):
+        op(**_inputs(m=4), fail=True)
+    rec._WRITER.close()
+    bundle = _bundle(tmp_path)
+
+    _, groups, flags = inspect_bundle.summarize(bundle)
+    assert groups[("fake_moe", "[8, 32, 16]", "1", "k_M1")] == 2
+    key4 = ("fake_moe", "[8, 32, 16]", "4", "k_M4")
+    assert groups[key4] == 2 and flags[(key4, "error")] == 1
+
+    assert inspect_bundle.main([str(bundle)]) == 0
+    out = capsys.readouterr().out
+    assert "op fake_moe:" in out and "config:   AITER_CONFIG_FAKE" in out
+    assert "error=1" in out and "4 calls" in out
+    assert inspect_bundle.main([str(tmp_path)]) == 2
 
 
 def test_unsupported_objects_are_flagged(recorder, tmp_path):
