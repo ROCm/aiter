@@ -20,8 +20,6 @@ from op_tests.triton_tests.quant.test_quant_mxfp4 import (
 
 DEVICE_ARCH = arch_info.get_arch()
 
-torch.set_default_device("cuda")
-
 
 def uniform_random(shape, start=0, end=1, dtype=None, device=None):
     return (end - start) * torch.rand(shape, dtype=dtype, device=device) + start
@@ -367,7 +365,9 @@ def test_mla_decode_fwd(
         )
 
     output = torch.empty(
-        (total_num_query_tokens, num_query_heads, kv_lora_rank), dtype=out_dtype
+        (total_num_query_tokens, num_query_heads, kv_lora_rank),
+        dtype=out_dtype,
+        device="cuda",
     )
 
     if shuffled_kv_cache:
@@ -657,7 +657,9 @@ def test_mla_prefill_fwd(
         out_scale = 1 / torch.rand(1, dtype=torch.float32, device="cuda")
 
     out = torch.empty(
-        (total_num_query_tokens, num_query_heads, kv_lora_rank), dtype=out_dtype
+        (total_num_query_tokens, num_query_heads, kv_lora_rank),
+        dtype=out_dtype,
+        device="cuda",
     )
 
     mla_prefill_fwd(
@@ -760,23 +762,25 @@ def test_mla_gluon_decode_over_2gb(batch, ctx, nhead, kv_lora_rank, qk_rope_head
     random.seed(0)
     torch.manual_seed(0)
     used = batch * ctx
-    kv_data = torch.randn((used, head_dim), dtype=dtype)
-    q_nope = torch.randn((batch, nhead, kv_lora_rank), dtype=dtype)
-    q_pe = torch.randn((batch, nhead, qk_rope_head_dim), dtype=dtype)
-    kv_indptr = torch.arange(0, (batch + 1) * ctx, ctx, dtype=torch.int32)
+    kv_data = torch.randn((used, head_dim), dtype=dtype, device="cuda")
+    q_nope = torch.randn((batch, nhead, kv_lora_rank), dtype=dtype, device="cuda")
+    q_pe = torch.randn((batch, nhead, qk_rope_head_dim), dtype=dtype, device="cuda")
+    kv_indptr = torch.arange(
+        0, (batch + 1) * ctx, ctx, dtype=torch.int32, device="cuda"
+    )
 
     # reference: small cache (rows 0..used) -> within_2gb=True -> buffer_load path
-    idx_ref = torch.arange(used, dtype=torch.int32)
+    idx_ref = torch.arange(used, dtype=torch.int32, device="cuda")
     assert kv_data.shape[0] * kv_data.stride(0) * 2 <= gb2
     o_ref = _mla_gluon_decode(
         mla_gluon, kv_data, idx_ref, kv_indptr, q_nope, q_pe, batch, nhead, ctx
     )
 
     # under test: >2 GB cache, identical KV at the top -> global_load path
-    kv_big = torch.zeros((n_big, head_dim), dtype=dtype)
+    kv_big = torch.zeros((n_big, head_dim), dtype=dtype, device="cuda")
     base = n_big - used
     kv_big[base : base + used].copy_(kv_data)
-    idx_big = torch.arange(used, dtype=torch.int32) + base
+    idx_big = torch.arange(used, dtype=torch.int32, device="cuda") + base
     assert kv_big.shape[0] * kv_big.stride(0) * 2 > gb2
     o_big = _mla_gluon_decode(
         mla_gluon, kv_big, idx_big, kv_indptr, q_nope, q_pe, batch, nhead, ctx

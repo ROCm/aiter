@@ -12,8 +12,6 @@ from aiter.ops.triton.attention.dsv4_indexer import (
     indexer_fwd,
 )
 
-torch.set_default_device("cuda")
-
 
 def ref_indexer_fwd(q, k, w, compress_ratio):
     """PyTorch reference: q=[S,H,Hd], k=[P,Hd], w=[S,H] → scores=[S,P]."""
@@ -62,9 +60,9 @@ def test_fwd():
     print("FWD Tests:")
     for S, H, Hd, P in TEST_CONFIGS:
         compress_ratio = S // P
-        q = torch.randn(S, H, Hd, dtype=torch.bfloat16)
-        k = torch.randn(P, Hd, dtype=torch.bfloat16)
-        w = torch.randn(S, H, dtype=torch.float32) * 0.1
+        q = torch.randn(S, H, Hd, dtype=torch.bfloat16, device="cuda")
+        k = torch.randn(P, Hd, dtype=torch.bfloat16, device="cuda")
+        w = torch.randn(S, H, dtype=torch.float32, device="cuda") * 0.1
 
         ref = ref_indexer_fwd(q, k, w, compress_ratio)
         out = indexer_fwd(q, k, w, compress_ratio)
@@ -91,9 +89,9 @@ def test_bwd():
     print("BWD Tests:")
     for S, H, Hd, P in TEST_CONFIGS:
         compress_ratio = S // P
-        q = torch.randn(S, H, Hd, dtype=torch.bfloat16)
-        k = torch.randn(P, Hd, dtype=torch.bfloat16)
-        w = torch.randn(S, H, dtype=torch.float32) * 0.1
+        q = torch.randn(S, H, Hd, dtype=torch.bfloat16, device="cuda")
+        k = torch.randn(P, Hd, dtype=torch.bfloat16, device="cuda")
+        w = torch.randn(S, H, dtype=torch.float32, device="cuda") * 0.1
 
         ref_scores = ref_indexer_fwd(q, k, w, compress_ratio)
         d_scores = torch.randn_like(ref_scores)
@@ -138,9 +136,13 @@ def test_autograd():
     print("AUTOGRAD Tests:")
     for S, H, Hd, P in TEST_CONFIGS:
         compress_ratio = S // P
-        q = torch.randn(S, H, Hd, dtype=torch.bfloat16, requires_grad=True)
-        k = torch.randn(P, Hd, dtype=torch.bfloat16, requires_grad=True)
-        w = (torch.randn(S, H, dtype=torch.float32) * 0.1).requires_grad_(True)
+        q = torch.randn(
+            S, H, Hd, dtype=torch.bfloat16, device="cuda", requires_grad=True
+        )
+        k = torch.randn(P, Hd, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        w = (
+            torch.randn(S, H, dtype=torch.float32, device="cuda") * 0.1
+        ).requires_grad_(True)
 
         scores, _indices = dsv4_indexer(q, k, w, compress_ratio, topk=min(512, P))
         valid = scores != float("-inf")

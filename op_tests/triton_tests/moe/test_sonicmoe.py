@@ -129,7 +129,7 @@ def test_sonicmoe_pre_routed_forward_backward(activation):
     out, _ = moe_pre_routed_inputs(
         x,
         scores,
-        torch.tensor(counts, dtype=torch.int32),
+        torch.tensor(counts, dtype=torch.int32, device="cuda"),
         w1,
         None,
         w2,

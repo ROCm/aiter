@@ -6,9 +6,7 @@ import torch
 
 from aiter import logger
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import FP8_ARCHS
-from aiter.ops.triton.attention.mha import (
-    mha_set_use_fused_bwd_kernel,
-)
+from aiter.ops.triton.attention import mha
 from aiter.ops.triton.attention.mha_v3 import (
     flash_attn_fp8_func,
     flash_attn_varlen_fp8_func,
@@ -120,7 +118,6 @@ def test_mha_varlen(
 ):
     HEAD_SZ: int = 128
 
-    torch.set_printoptions(threshold=10000)
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
@@ -222,6 +219,7 @@ def test_mha_backward(
     NUM_Q_HEADS: int,
     CAUSAL: bool,
     FUSED: bool,
+    monkeypatch,
     dtype=torch.bfloat16,
 ):
     HEAD_SZ: int = 128
@@ -234,7 +232,7 @@ def test_mha_backward(
 
     torch.cuda.empty_cache()
     torch.manual_seed(20)
-    mha_set_use_fused_bwd_kernel(FUSED)
+    monkeypatch.setattr(mha, "_USE_FUSED_BWD_KERNEL", FUSED)
 
     q = torch.randn(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
     k = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
@@ -285,6 +283,7 @@ def test_mha_backward_varlen(
     NUM_Q_HEADS: int,
     CAUSAL: bool,
     FUSED: bool,
+    monkeypatch,
     dtype=torch.bfloat16,
 ):
     HEAD_SZ: int = 128
@@ -295,7 +294,7 @@ def test_mha_backward_varlen(
 
     torch.cuda.empty_cache()
     torch.manual_seed(20)
-    mha_set_use_fused_bwd_kernel(FUSED)
+    monkeypatch.setattr(mha, "_USE_FUSED_BWD_KERNEL", FUSED)
 
     q = torch.randn(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
     k = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)

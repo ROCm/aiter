@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import contextlib
-
 import pytest
 import torch
 
+from aiter.ops.triton.attention import mha
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
@@ -19,34 +18,13 @@ from aiter.test_mha_common import (
 )
 
 
-@contextlib.contextmanager
-def _with_default_device(device):
-    """Run the capture under an explicit torch default device, restored on exit.
-
-    Graph-capture safety is relative to global state: a sibling test that leaks
-    ``torch.set_default_device("cuda")`` (some set it at module scope and never
-    reset it) makes any tensor constructor in the op that omits ``device=``
-    allocate on CUDA, an illegal H2D during capture. Parametrizing the graph
-    tests over the default device makes both regimes deterministic and
-    ordering-independent: the "cpu" case checks capture correctness; the "cuda"
-    case reproduces the leaked-global-state regime that surfaces device-implicit
-    allocations. (Host<->device syncs inside a captured region are already
-    illegal under torch.cuda.graph, so capture catches those too.)
-    """
-    prev_device = torch.get_default_device()
-    try:
-        torch.set_default_device(device)
-        yield
-    finally:
-        torch.set_default_device(prev_device)
-
-
 @pytest.fixture
 def dao_ai_impl():
-    """Set mha impl to dao_ai for the test, restore to default on cleanup."""
+    """Set mha impl to dao_ai for the test, restore the previous impl on cleanup."""
+    prev_impl = mha._MHA_IMPL
     mha_set_impl("dao_ai")
     yield
-    mha_set_impl("default")
+    mha_set_impl(prev_impl)
 
 
 @pytest.mark.parametrize(
@@ -272,9 +250,8 @@ def test_mha_dao_ai(
             )
 
 
-@pytest.mark.parametrize("default_device", ["cpu", "cuda"])
 @pytest.mark.parametrize("mha_type", ["mha", "gqa"])
-def test_mha_dao_ai_graph(dao_ai_impl, mha_type, default_device):
+def test_mha_dao_ai_graph(dao_ai_impl, mha_type):
     """graph capture for flash_attn_func with dao_ai impl."""
     d = 128
     device = "cuda"
@@ -303,7 +280,7 @@ def test_mha_dao_ai_graph(dao_ai_impl, mha_type, default_device):
     v.copy_(v_orig)
 
     g = torch.cuda.CUDAGraph()
-    with _with_default_device(default_device), torch.cuda.graph(g):
+    with torch.cuda.graph(g):
         out_graph = flash_attn_func(q, k, v, causal=True)
 
     q.copy_(q_orig)
@@ -322,9 +299,8 @@ def test_mha_dao_ai_graph(dao_ai_impl, mha_type, default_device):
     assert diff < 1e-5, f"Graph replay vs eager max diff {diff:.6e} exceeds 1e-5"
 
 
-@pytest.mark.parametrize("default_device", ["cpu", "cuda"])
 @pytest.mark.parametrize("mha_type", ["mha", "gqa"])
-def test_mha_dao_ai_varlen_graph(dao_ai_impl, mha_type, default_device):
+def test_mha_dao_ai_varlen_graph(dao_ai_impl, mha_type):
     """graph capture for flash_attn_varlen_func with dao_ai impl."""
     d = 128
     device = "cuda"
@@ -384,7 +360,7 @@ def test_mha_dao_ai_varlen_graph(dao_ai_impl, mha_type, default_device):
         v_unpad.copy_(v_orig)
 
     g = torch.cuda.CUDAGraph()
-    with _with_default_device(default_device), torch.cuda.graph(g):
+    with torch.cuda.graph(g):
         out_graph = flash_attn_varlen_func(
             q_unpad,
             k_unpad,

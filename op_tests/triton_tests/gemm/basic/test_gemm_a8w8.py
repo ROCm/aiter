@@ -381,9 +381,26 @@ def test_gemm_splitk_skip_reduce(in_dtype, out_dtype, m, n, k, num_ksplit):
 def test_legacy_gluon_import_path_warns():
     """The pre-move path still resolves here, but tells callers to move on."""
     legacy = "aiter.ops.triton.gluon.gemm_a8w8"
+    canonical = "aiter.ops.triton.gemm.basic.gemm_a8w8"
+    gluon = importlib.import_module("aiter.ops.triton.gluon")
+    # Importing the legacy path aliases sys.modules[legacy], re-runs the
+    # canonical module into sys.modules[canonical] and binds that copy on the
+    # gluon package. Put all three back so later imports see the original
+    # modules.
+    touched = [
+        (sys.modules, legacy),
+        (sys.modules, canonical),
+        (vars(gluon), "gemm_a8w8"),
+    ]
+    saved = [(names, key, names[key]) for names, key in touched if key in names]
     sys.modules.pop(legacy, None)
-
-    with pytest.warns(DeprecationWarning, match="has moved to"):
-        mod = importlib.import_module(legacy)
+    try:
+        with pytest.warns(DeprecationWarning, match="has moved to"):
+            mod = importlib.import_module(legacy)
+    finally:
+        for names, key in touched:
+            names.pop(key, None)
+        for names, key, value in saved:
+            names[key] = value
 
     assert mod.gemm_a8w8.__module__ == "aiter.ops.triton.gemm.basic.gemm_a8w8"

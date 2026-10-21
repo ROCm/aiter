@@ -85,6 +85,18 @@ PARAMS = [params for params, _ in _MATRIX]
 IDS = [tid for _, tid in _MATRIX]
 
 
+@pytest.fixture(autouse=True)
+def isolated_conv2d_weight_pack_caches(monkeypatch):
+    """Give every test fresh Conv2D weight-pack caches.
+
+    The library caches hold strong references to each source weight and its
+    pack, so without this the weights and packs of every test would stay
+    alive in the process-wide caches after the test ends.
+    """
+    for name in CONV2D_WEIGHT_PACK_CACHE_NAMES:
+        monkeypatch.setattr(conv_prepack, name, conv_prepack._LRUPackCache())
+
+
 def _make_suite(dtype, layout):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")

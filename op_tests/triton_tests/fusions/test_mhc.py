@@ -666,20 +666,17 @@ def test_triton_mhc_matches_hip(M, n, C):
     # residual, fn_hip, hc_scale, hc_base = _triton_to_hip_pre_inputs(
     #     x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams
     # )
-    # # aiter.mhc_pre allocates outputs via torch.empty without a device kwarg,
-    # # so it needs an active torch.device context to land on the GPU.
-    # with torch.device(x.device):
-    #     post_h, comb_h, li_h = _aiter.mhc_pre(
-    #         residual,
-    #         fn_hip,
-    #         hc_scale,
-    #         hc_base,
-    #         rms_eps=rms_eps,
-    #         hc_pre_eps=hc_pre_eps,
-    #         hc_sinkhorn_eps=hc_sinkhorn_eps,
-    #         hc_post_mult_value=hc_post_mult_value,
-    #         sinkhorn_repeat=sinkhorn_repeat,
-    #     )
+    # post_h, comb_h, li_h = _aiter.mhc_pre(
+    #     residual,
+    #     fn_hip,
+    #     hc_scale,
+    #     hc_base,
+    #     rms_eps=rms_eps,
+    #     hc_pre_eps=hc_pre_eps,
+    #     hc_sinkhorn_eps=hc_sinkhorn_eps,
+    #     hc_post_mult_value=hc_post_mult_value,
+    #     sinkhorn_repeat=sinkhorn_repeat,
+    # )
     post_h, comb_h, _hpre_ref, li_h = mhc_torch(
         x,
         phi,
@@ -864,8 +861,7 @@ def test_triton_mhc_post_matches_hip(M, n, C, dtype):
     out_t = mhc_post(None, layer_input, residual, post_mix, comb_mix)
 
     out_h = torch.empty(M, n, C, dtype=dtype, device=layer_input.device)
-    with torch.device(layer_input.device):
-        _aiter.mhc_post(out_h, layer_input, residual, post_mix, comb_mix)
+    _aiter.mhc_post(out_h, layer_input, residual, post_mix, comb_mix)
 
     cfg = f"(M={M}, n={n}, C={C}, dtype={dtype})"
     msg = f"mhc_post Triton vs aiter.mhc_post mismatch at {cfg}"

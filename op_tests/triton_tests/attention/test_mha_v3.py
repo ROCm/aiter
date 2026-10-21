@@ -627,7 +627,21 @@ def test_flash_attn_kvcache_noncontiguous_paged(
     )
 
 
+@pytest.fixture
+def reset_dynamo():
+    """Compile on a fresh torch._dynamo state and leave none behind.
+
+    Every parametrization compiles the same nested ``fn`` code object, so without
+    a reset one parametrization's cached entries and automatic-dynamic shape
+    state would steer how the next one compiles.
+    """
+    torch._dynamo.reset()
+    yield
+    torch._dynamo.reset()
+
+
 # torch.compile tests
+@pytest.mark.usefixtures("reset_dynamo")
 @pytest.mark.parametrize("new_kv", [False, True])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("mha_type", ["mha", "gqa"])

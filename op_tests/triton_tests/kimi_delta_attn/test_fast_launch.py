@@ -33,7 +33,7 @@ K_DIM = 128
 LOWER_BOUND = -5.0
 
 
-def make_inputs(B, T, H, seed=0, bias=False, state=False, varlen=False):
+def make_inputs(B, T, H, seed=0, bias=False, state=False, varlen=False, device=device):
     g = torch.Generator(device=device).manual_seed(seed)
 
     def rnd(*shape, dt=dtype):
@@ -81,6 +81,9 @@ def test_matches_ordinary_path(B, T, H, bias, state):
     args = make_inputs(B, T, H, bias=bias, state=state)
     with fast_launch.bypassed():
         want_o, want_s = run(args)
+    # A key's first launch misses, which is the ordinary path again: warm it, so
+    # the run compared below is a hit whichever tests ran before this one.
+    run(args)
     got_o, got_s = run(args)
     assert torch.equal(got_o, want_o)
     assert torch.equal(got_s, want_s)
@@ -91,6 +94,7 @@ def test_matches_ordinary_path_when_segmented(chunks_per_seg):
     args = make_inputs(1, 4096, 12)
     with fast_launch.bypassed():
         want_o, want_s = run(args, chunks_per_seg=chunks_per_seg)
+    run(args, chunks_per_seg=chunks_per_seg)  # warm the key, as above
     got_o, got_s = run(args, chunks_per_seg=chunks_per_seg)
     assert torch.equal(got_o, want_o)
     assert torch.equal(got_s, want_s)
@@ -100,12 +104,17 @@ def test_matches_ordinary_path_varlen():
     args = make_inputs(3, 512, 12, varlen=True)
     with fast_launch.bypassed():
         want_o, want_s = run(args)
+    run(args)  # warm the key, as above
     got_o, got_s = run(args)
     assert torch.equal(got_o, want_o)
     assert torch.equal(got_s, want_s)
 
 
 def test_a_second_shape_does_not_reuse_the_first_entry():
+    # Start from empty caches: an earlier test may have run the "unseen" shape
+    # below, and it would then hit rather than miss.
+    for w in _wrapped():
+        w.clear()
     small, large = make_inputs(1, 512, 12), make_inputs(1, 1024, 12)
     run(small)  # whatever either shape needs is compiled and cached by now
     run(large)
@@ -158,31 +167,27 @@ def test_entries_do_not_pin_their_inputs():
     assert entries, "nothing was cached, so nothing was tested"
 
 
-def test_the_cache_is_bounded():
+def test_the_cache_is_bounded(monkeypatch):
     """Past the bound the oldest entry goes, and asking for it again rebuilds it."""
     wrappers = _wrapped()
     for w in wrappers:
         w.clear()
     shapes = [256, 512, 1024, 2048]
-    original = fast_launch._MAX_ENTRIES
-    fast_launch._MAX_ENTRIES = 2
-    try:
-        for T_ in shapes:
-            run(make_inputs(1, T_, 12))
-        # Which kernels a shape reaches depends on the route, so the ones left
-        # empty are the ones this configuration does not use.
-        filled = [w for w in wrappers if w._cache]
-        assert filled, "nothing was cached, so nothing was bounded"
-        for w in filled:
-            assert len(w._cache) <= 2, f"grew to {len(w._cache)}"
+    monkeypatch.setattr(fast_launch, "_MAX_ENTRIES", 2)
+    for T_ in shapes:
+        run(make_inputs(1, T_, 12))
+    # Which kernels a shape reaches depends on the route, so the ones left
+    # empty are the ones this configuration does not use.
+    filled = [w for w in wrappers if w._cache]
+    assert filled, "nothing was cached, so nothing was bounded"
+    for w in filled:
+        assert len(w._cache) <= 2, f"grew to {len(w._cache)}"
 
-        # The first shape was evicted, so it has to miss -- and still be right.
-        args = make_inputs(1, shapes[0], 12)
-        with fast_launch.recording() as misses:
-            got_o, got_s = run(args)
-        assert misses, "an evicted shape should have been rebuilt, not reused"
-    finally:
-        fast_launch._MAX_ENTRIES = original
+    # The first shape was evicted, so it has to miss -- and still be right.
+    args = make_inputs(1, shapes[0], 12)
+    with fast_launch.recording() as misses:
+        got_o, got_s = run(args)
+    assert misses, "an evicted shape should have been rebuilt, not reused"
     with fast_launch.bypassed():
         want_o, want_s = run(args)
     assert torch.equal(got_o, want_o)
@@ -198,15 +203,16 @@ def test_a_second_device_does_not_reuse_the_first_entry():
     ordinal rather than producing wrong numbers.
     """
     B, T, H = 1, 512, 12
+    # Start from empty caches, so device 1 cannot already have an entry.
+    for w in _wrapped():
+        w.clear()
     first = make_inputs(B, T, H)
     run(first)  # the entry for this shape is now held against device 0
 
-    torch.cuda.set_device(1)
-    try:
-        second = {
-            k: (v.to("cuda:1") if isinstance(v, torch.Tensor) else v)
-            for k, v in first.items()
-        }
+    # The key reads the current device, so that is what has to change; the
+    # context puts the previous one back even if an assert below fails.
+    with torch.cuda.device(1):
+        second = make_inputs(B, T, H, device="cuda:1")
         with fast_launch.recording() as misses:
             got_o, got_s = run(second)
         assert misses, "a second device has to miss, not reuse device 0's module"
@@ -214,13 +220,14 @@ def test_a_second_device_does_not_reuse_the_first_entry():
             want_o, want_s = run(second)
         assert torch.equal(got_o, want_o)
         assert torch.equal(got_s, want_s)
-    finally:
-        torch.cuda.set_device(0)
 
 
 def test_alignment_is_part_of_the_key():
     """A tensor off a 16-byte boundary must not reach a kernel told otherwise."""
     B, T, H = 1, 512, 12
+    # Start from empty caches, so the misaligned key cannot already have an entry.
+    for w in _wrapped():
+        w.clear()
     args = make_inputs(B, T, H)
     run(args)
 

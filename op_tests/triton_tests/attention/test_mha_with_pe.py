@@ -4,10 +4,10 @@
 import pytest
 import torch
 
+from aiter.ops.triton.attention import mha
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
-    mha_set_use_fused_bwd_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.test_mha_common import (
@@ -241,6 +241,7 @@ def test_mha_backward_with_pe(
     HEAD_SZ_V: int,
     DROPOUT: float,
     CAUSAL: bool,
+    monkeypatch,
 ):
     HAS_DROPOUT: bool = DROPOUT > 0.0
 
@@ -318,7 +319,7 @@ def test_mha_backward_with_pe(
 
     # Triton backward
     # PE support isn't implemented in fused backward.
-    mha_set_use_fused_bwd_kernel(False)
+    monkeypatch.setattr(mha, "_USE_FUSED_BWD_KERNEL", False)
     triton_dq, triton_dk, triton_dv = torch.autograd.grad(triton_out, (q, k, v), do)
 
     # Torch backward
@@ -367,6 +368,7 @@ def test_mha_backward_varlen_with_pe(
     HEAD_SZ_V: int,
     DROPOUT: float,
     CAUSAL: bool,
+    monkeypatch,
 ):
     BATCH = 4
     HAS_DROPOUT: bool = DROPOUT > 0.0
@@ -489,7 +491,7 @@ def test_mha_backward_varlen_with_pe(
 
     # Triton backward
     # PE support isn't implemented in fused backward.
-    mha_set_use_fused_bwd_kernel(False)
+    monkeypatch.setattr(mha, "_USE_FUSED_BWD_KERNEL", False)
     triton_dq, triton_dk, triton_dv = torch.autograd.grad(
         triton_out, (q_unpad, k_unpad, v_unpad), do
     )

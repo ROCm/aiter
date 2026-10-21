@@ -1,4 +1,6 @@
+import importlib
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -7,14 +9,15 @@ import torch
 import triton
 import triton.language as tl
 from triton.backends.compiler import GPUTarget
+from triton.compiler.compiler import CompiledKernel
 from triton.tools.compile import CompileArgs, compile_kernel
 
 from aiter import logger
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.utility.triton.triton_metadata_redirect import (
-    AOTMetadataContext,
-    with_custom_metadata_path,
-)
+
+# Imported per test by the metadata_redirect fixture, not at module scope:
+# importing it patches triton's CompiledKernel.__init__ for the whole process.
+METADATA_REDIRECT_MODULE: str = "aiter.utility.triton.triton_metadata_redirect"
 
 TARGET_ARCH: str = "gfx942"
 SKIP_TEST: bool = get_arch() != TARGET_ARCH
@@ -5777,7 +5780,40 @@ aot_kernel0_hsaco = [
 ]
 
 
-def test_f32_kernel():
+@pytest.fixture
+def metadata_redirect(monkeypatch):
+    """Yield the metadata redirect module and undo its global changes afterwards.
+
+    Importing the module patches CompiledKernel.__init__. If this fixture does
+    the first import, teardown unloads the module and monkeypatch restores the
+    original __init__, so a later import patches again from scratch; a module
+    that was already imported (by an AOT wrapper, say) keeps its patch.
+    with_custom_metadata_path() never unregisters the kernels it registers, so
+    each test gets an empty registry and the previous one is restored afterwards.
+    Teardown runs even if the test, or this fixture's setup, fails.
+    """
+    first_import = METADATA_REDIRECT_MODULE not in sys.modules
+    # Record the current __init__ before the import below (a first import
+    # patches it), so monkeypatch puts it back at teardown.
+    monkeypatch.setattr(CompiledKernel, "__init__", CompiledKernel.__init__)
+    try:
+        module = importlib.import_module(METADATA_REDIRECT_MODULE)
+        monkeypatch.setattr(
+            module._thread_local, "replacement_registry", {}, raising=False
+        )
+        yield module
+    finally:
+        # Also runs if setup fails after the import, so the module is never
+        # left cached while monkeypatch undoes its patch.
+        if first_import:
+            package, _, name = METADATA_REDIRECT_MODULE.rpartition(".")
+            sys.modules.pop(METADATA_REDIRECT_MODULE, None)
+            parent = sys.modules.get(package)
+            if parent is not None:
+                vars(parent).pop(name, None)
+
+
+def test_f32_kernel(metadata_redirect):
     with tempfile.TemporaryDirectory() as temp_dir:
         logger.info("temp_dir: %s", temp_dir)
 
@@ -5799,13 +5835,21 @@ def test_f32_kernel():
             num_warps=4,
             num_stages=2,
             out_name="kernel_f32",
+            # Write the generated C stubs into temp_dir, not the working directory.
+            out_path=Path(temp_dir) / "kernel_f32",
         )
 
-        with AOTMetadataContext("empty_kernel", temp_dir):
-            _triton_kernel0, _output_files0 = compile_kernel(compile_args)
+        with metadata_redirect.AOTMetadataContext("empty_kernel", temp_dir):
+            # compile_kernel() prepends kernel.py's directory to sys.path and
+            # never removes it; restore sys.path, even if compiling fails.
+            saved_sys_path = sys.path[:]
+            try:
+                _triton_kernel0, _output_files0 = compile_kernel(compile_args)
+            finally:
+                sys.path[:] = saved_sys_path
 
 
-def test_jit():
+def test_jit(metadata_redirect):
     with tempfile.TemporaryDirectory() as temp_dir:
         logger.info("temp_dir: %s", temp_dir)
 
@@ -5819,7 +5863,7 @@ def test_jit():
         with open(json_file, "w") as f:
             f.write(aot_kernel0_json)
 
-        @with_custom_metadata_path(temp_dir)
+        @metadata_redirect.with_custom_metadata_path(temp_dir)
         @triton.jit
         def empty_kernel(x_ptr, SIZE: tl.constexpr):
             return
@@ -5831,7 +5875,7 @@ def test_jit():
         assert kernel.metadata.hash in aot_kernel0_json, "hash not found in json"
 
 
-def test_separate_compile_and_run():
+def test_separate_compile_and_run(metadata_redirect):
     with tempfile.TemporaryDirectory() as temp_dir:
         logger.info("temp_dir: %s", temp_dir)
 
@@ -5858,7 +5902,7 @@ def test_separate_compile_and_run():
             },
             constexprs={"SIZE": 64},
         )
-        with AOTMetadataContext("empty_kernel", temp_dir):
+        with metadata_redirect.AOTMetadataContext("empty_kernel", temp_dir):
             kernel = triton.compile(src, target=target)
 
         # run kernel0
@@ -5879,6 +5923,7 @@ if __name__ == "__main__":
     if SKIP_TEST:
         logger.info(SKIP_REASON)
     else:
-        test_f32_kernel()
-        test_jit()
-        test_separate_compile_and_run()
+        redirect = importlib.import_module(METADATA_REDIRECT_MODULE)
+        test_f32_kernel(redirect)
+        test_jit(redirect)
+        test_separate_compile_and_run(redirect)

@@ -239,9 +239,9 @@ def generate_data(
         min(max_num_blocks_per_seq * num_seqs, num_blocks) // num_seqs
     )
     total_ind_count = num_seqs * max_num_blocks_per_seq
-    values = torch.arange(0, total_ind_count, dtype=torch.int)
-    values = values[torch.randperm(total_ind_count)]
-    block_tables = values.view(num_seqs, max_num_blocks_per_seq).contiguous().to(device)
+    values = torch.arange(0, total_ind_count, dtype=torch.int, device=device)
+    values = values[torch.randperm(total_ind_count, device=device)]
+    block_tables = values.view(num_seqs, max_num_blocks_per_seq).contiguous()
 
     sinks = torch.randn(num_query_heads, dtype=torch.float32, device=device)
 

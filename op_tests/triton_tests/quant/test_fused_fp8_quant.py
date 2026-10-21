@@ -226,7 +226,7 @@ def test_rmsnorm_quant_fuse(m, n):
     x_shape = (m, n)
     dtype = torch.bfloat16
     x = torch.randn(x_shape, dtype=dtype, device="cuda")
-    w = torch.ones(n, dtype=dtype).cuda()
+    w = torch.ones(n, dtype=dtype, device="cuda")
 
     DTYPE_MAX = (
         torch.finfo(rocm_fp8_dtype).max
@@ -491,12 +491,12 @@ def generate_fused_reduce_act_mul_fp8_group_quant(
     N2: int = 1,
 ):
     if SPK == 1:
-        x = torch.randn((M, N1 * 2), dtype=dtype).cuda() / 10
+        x = torch.randn((M, N1 * 2), dtype=dtype, device="cuda") / 10
     else:
-        x = torch.randn((SPK, M, N1 * 2), dtype=torch.float32).cuda() / 10
+        x = torch.randn((SPK, M, N1 * 2), dtype=torch.float32, device="cuda") / 10
     x2 = None
     if SPK > 1:
-        x2 = torch.randn((SPK, M, N2), dtype=torch.float32).cuda() / 10
+        x2 = torch.randn((SPK, M, N2), dtype=torch.float32, device="cuda") / 10
 
     return x, x2
 

@@ -19,7 +19,10 @@ import math
 import pytest
 import torch
 
-from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_delta_attn_fwd
+from aiter.ops.triton._triton_kernels.kimi_delta_attn import (
+    chunk_delta_attn_fwd,
+    fast_launch,
+)
 from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_fwd as _chunk_fwd
 from aiter.ops.triton._triton_kernels.kimi_delta_attn import flash_kda as _flash_kda
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.flash_kda import (
@@ -99,17 +102,26 @@ def _k2_tuner_search_space():
     The launch path pins one config, and Triton consults its autotune cache
     only when there is more than one to choose between, so a test about the
     key has to supply the space the key indexes.
+
+    Launches go the ordinary way while the space is installed. A fast_launch
+    hit never reaches the autotuner, so an entry left by an earlier run of
+    these shapes would keep every key out of its cache, and an entry made here
+    would outlive the test holding a config from this space. The autotuner's
+    cache is put back as it was found.
     """
     if len(_flash_kda._K2_CONFIGS) < 2:
         pytest.skip("no published K2 candidates on this device to key between")
     kern = _flash_kda._flash_kda_segment_kernel
     saved = kern.configs
+    saved_cache = dict(kern.cache)
     kern.configs = list(_flash_kda._K2_CONFIGS)
     try:
-        yield kern
+        with fast_launch.bypassed():
+            yield kern
     finally:
         kern.configs = saved
         kern.cache.clear()
+        kern.cache.update(saved_cache)
 
 
 def run_reference(q, k, v, g, beta, A_log, dt_bias, scale, **kw):

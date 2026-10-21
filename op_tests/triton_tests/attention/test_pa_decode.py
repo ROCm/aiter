@@ -88,7 +88,7 @@ def input_helper(
         query = torch.randn(
             B, H_Q, D, dtype=torch.float16, device="cuda"
         )  # assumption dtype is 8bits or lower
-        query = query.to(dtype=dtype, device="cuda")
+        query = query.to(dtype=dtype)
     else:
         query = torch.randn(B, H_Q, D, dtype=dtype, device="cuda")
 
@@ -125,8 +125,8 @@ def input_helper(
             value_cache, min=1e-3
         )  # For FP8 case, this is needed to prevent NANs
 
-    key_cache_tri = key_cache.permute(0, 1, 3, 2, 4).flatten(3, 4).contiguous().cuda()
-    value_cache_tri = value_cache.permute(0, 1, 3, 2).contiguous().cuda()
+    key_cache_tri = key_cache.permute(0, 1, 3, 2, 4).flatten(3, 4).contiguous()
+    value_cache_tri = value_cache.permute(0, 1, 3, 2).contiguous()
 
     context_lens = torch.full((B,), SEQ_LEN, device="cuda")
     max_context_len = max(context_lens)
@@ -196,7 +196,6 @@ def test_paged_attn(
         pytest.skip("B>={4} and SEQ_LEN>={8192} tests are too slow")
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
-    torch.set_printoptions(threshold=100000)
 
     num_blocks = NUM_BLK
 
@@ -395,7 +394,6 @@ def test_paged_attn_per_token_quant(
         pytest.skip("B>={4} and SEQ_LEN>={8192} tests are too slow")
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
-    torch.set_printoptions(precision=5, threshold=10000)
 
     num_blocks = NUM_BLK
 
