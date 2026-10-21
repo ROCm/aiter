@@ -229,11 +229,13 @@ class TestGetNumXcds(unittest.TestCase):
             os.makedirs(os.path.dirname(library))
             open(library, "w").close()
             os.environ["ROCM_PATH"] = "/opt/another-rocm"
-            with mock.patch.object(
-                device_info, "_loaded_amdhip64_path", return_value=library
+            with (
+                mock.patch.object(
+                    device_info, "_loaded_amdhip64_path", return_value=library
+                ),
+                self.assertRaises(FileNotFoundError),
             ):
-                with self.assertRaises(FileNotFoundError):
-                    device_info._hip_runtime_api_header()
+                device_info._hip_runtime_api_header()
 
     def test_rocm_major_uses_and_caches_live_runtime(self):
         class Function:
