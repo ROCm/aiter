@@ -206,27 +206,10 @@ def test_gemm(dtype, M, N, K, layout, output, backend, shuffle):
 def test_legacy_gluon_import_path_warns():
     """The pre-move path still resolves here, but tells callers to move on."""
     legacy = "aiter.ops.triton.gluon.gemm_a8w8_blockscale"
-    canonical = "aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale"
-    gluon = importlib.import_module("aiter.ops.triton.gluon")
-    # Importing the legacy path aliases sys.modules[legacy], re-runs the
-    # canonical module into sys.modules[canonical] and binds that copy on the
-    # gluon package. Put all three back so later imports see the original
-    # modules.
-    touched = [
-        (sys.modules, legacy),
-        (sys.modules, canonical),
-        (vars(gluon), "gemm_a8w8_blockscale"),
-    ]
-    saved = [(names, key, names[key]) for names, key in touched if key in names]
     sys.modules.pop(legacy, None)
-    try:
-        with pytest.warns(DeprecationWarning, match="has moved to"):
-            mod = importlib.import_module(legacy)
-    finally:
-        for names, key in touched:
-            names.pop(key, None)
-        for names, key, value in saved:
-            names[key] = value
+
+    with pytest.warns(DeprecationWarning, match="has moved to"):
+        mod = importlib.import_module(legacy)
 
     assert (
         mod.gemm_a8w8_blockscale.__module__

@@ -34,7 +34,7 @@ def _make_cos_sin_cache(tokens: int, device: torch.device) -> torch.Tensor:
         :, None
     ] * torch.exp(
         -torch.arange(half, dtype=torch.float32, device=device)[None, :]
-        * (torch.log(torch.tensor(10000.0, dtype=torch.float32, device=device)) / half)
+        * (torch.log(torch.tensor(10000.0, device=device)) / half)
     )
     return torch.cat((angles.cos(), angles.sin()), dim=-1).to(torch.bfloat16)
 

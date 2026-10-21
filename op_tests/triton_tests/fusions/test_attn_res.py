@@ -715,7 +715,7 @@ def test_attn_res_gate_launch_cache_bit_identical(monkeypatch, quant, close_bloc
         torch.testing.assert_close(a.float(), b.float(), atol=0, rtol=0)
 
 
-def test_attn_res_gate_launch_cache_is_bounded_in_token_count(monkeypatch):
+def test_attn_res_gate_launch_cache_is_bounded_in_token_count():
     """Token count must not be a cache axis, or decode would leak an entry a step.
 
     N reaches the key only through the properties Triton specializes on
@@ -723,9 +723,7 @@ def test_attn_res_gate_launch_cache_is_bounded_in_token_count(monkeypatch):
     """
     D, B = 256, 3
     dtype = torch.bfloat16
-    # Count into a private, empty cache: the shared one stays as other tests
-    # left it, and nothing they cached is counted here.
-    monkeypatch.setattr(attn_res_module, "_LAUNCH_CACHE", {})
+    attn_res_module._LAUNCH_CACHE.clear()
     for N in range(17, 49):
         prefix, block_residual, score_weight, _, _ = generate_attn_res_gate_inputs(
             N, D, B, dtype, with_add=False

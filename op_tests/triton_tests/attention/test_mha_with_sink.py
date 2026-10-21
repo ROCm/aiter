@@ -4,10 +4,10 @@
 import pytest
 import torch
 
-from aiter.ops.triton.attention import mha
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
+    mha_set_use_fused_bwd_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.test_mha_common import (
@@ -44,7 +44,6 @@ def test_mha_with_sink(
     DROPOUT: float,
     CAUSAL: bool,
     backend: str,
-    monkeypatch,
 ):
     HAS_DROPOUT: bool = DROPOUT > 0.0
     skip_if_gluon_unsupported(
@@ -127,7 +126,7 @@ def test_mha_with_sink(
 
     do = torch.randn_like(q)
 
-    monkeypatch.setattr(mha, "_USE_FUSED_BWD_KERNEL", False)
+    mha_set_use_fused_bwd_kernel(False)
     triton_dq, triton_dk, triton_dv, triton_dsink = torch.autograd.grad(
         triton_out, (q, k, v, sink), do
     )
@@ -184,7 +183,6 @@ def test_mha_varlen_with_sink(
     DROPOUT: float,
     CAUSAL: bool,
     backend: str,
-    monkeypatch,
 ):
     BATCH = 2
     HAS_DROPOUT: bool = DROPOUT > 0.0
@@ -307,7 +305,7 @@ def test_mha_varlen_with_sink(
 
     do = torch.randn_like(q)
 
-    monkeypatch.setattr(mha, "_USE_FUSED_BWD_KERNEL", False)
+    mha_set_use_fused_bwd_kernel(False)
     triton_dq, triton_dk, triton_dv, triton_dsink = torch.autograd.grad(
         triton_out, (q_unpad, k_unpad, v_unpad, sink), do
     )
@@ -370,7 +368,6 @@ def test_mha_with_sink_sliding_window(
     CAUSAL: bool,
     WINDOW_SIZE_LEFT: int,
     backend: str,
-    monkeypatch,
 ):
     skip_if_gluon_unsupported(backend)
     # The Gluon backend is forward-only.
@@ -440,7 +437,7 @@ def test_mha_with_sink_sliding_window(
 
     do = torch.randn_like(q)
 
-    monkeypatch.setattr(mha, "_USE_FUSED_BWD_KERNEL", False)
+    mha_set_use_fused_bwd_kernel(False)
     triton_dq, triton_dk, triton_dv, triton_dsink = torch.autograd.grad(
         triton_out, (q, k, v, sink), do
     )
@@ -496,7 +493,6 @@ def test_mha_sliding_window_no_sink(
     CAUSAL: bool,
     WINDOW_SIZE_LEFT: int,
     backend: str,
-    monkeypatch,
 ):
     BATCH = 1
     skip_if_gluon_unsupported(backend)
@@ -562,7 +558,7 @@ def test_mha_sliding_window_no_sink(
 
     do = torch.randn_like(q)
 
-    monkeypatch.setattr(mha, "_USE_FUSED_BWD_KERNEL", False)
+    mha_set_use_fused_bwd_kernel(False)
     triton_dq, triton_dk, triton_dv = torch.autograd.grad(triton_out, (q, k, v), do)
 
     torch_dq, torch_dk, torch_dv = torch.autograd.grad(torch_out, (q, k, v), do)
@@ -592,7 +588,7 @@ def test_mha_sliding_window_no_sink(
     )
 
 
-def test_mha_sliding_window_fused_backward_raises(monkeypatch):
+def test_mha_sliding_window_fused_backward_raises():
     q = torch.randn(
         (1, 128, 8, 64), device="cuda", dtype=torch.bfloat16, requires_grad=True
     )
@@ -604,15 +600,18 @@ def test_mha_sliding_window_fused_backward_raises(monkeypatch):
     )
     do = torch.randn_like(q)
 
-    monkeypatch.setattr(mha, "_USE_FUSED_BWD_KERNEL", True)
-    out = flash_attn_func(q, k, v, causal=True, window_size=(32, -1))
-    with pytest.raises(
-        ValueError, match="Fused backward doesn't support sliding window attention"
-    ):
-        torch.autograd.grad(out, (q, k, v), do)
+    mha_set_use_fused_bwd_kernel(True)
+    try:
+        out = flash_attn_func(q, k, v, causal=True, window_size=(32, -1))
+        with pytest.raises(
+            ValueError, match="Fused backward doesn't support sliding window attention"
+        ):
+            torch.autograd.grad(out, (q, k, v), do)
+    finally:
+        mha_set_use_fused_bwd_kernel(False)
 
 
-def test_mha_varlen_sliding_window_fused_backward_raises(monkeypatch):
+def test_mha_varlen_sliding_window_fused_backward_raises():
     q = torch.randn(
         (1, 64, 8, 64), device="cuda", dtype=torch.bfloat16, requires_grad=True
     )
@@ -648,19 +647,22 @@ def test_mha_varlen_sliding_window_fused_backward_raises(monkeypatch):
     v_unpad.requires_grad = True
     do = torch.randn_like(q_unpad)
 
-    monkeypatch.setattr(mha, "_USE_FUSED_BWD_KERNEL", True)
-    out = flash_attn_varlen_func(
-        q_unpad,
-        k_unpad,
-        v_unpad,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        causal=True,
-        window_size=(32, -1),
-    )
-    with pytest.raises(
-        ValueError, match="Fused backward doesn't support sliding window attention"
-    ):
-        torch.autograd.grad(out, (q_unpad, k_unpad, v_unpad), do)
+    mha_set_use_fused_bwd_kernel(True)
+    try:
+        out = flash_attn_varlen_func(
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            causal=True,
+            window_size=(32, -1),
+        )
+        with pytest.raises(
+            ValueError, match="Fused backward doesn't support sliding window attention"
+        ):
+            torch.autograd.grad(out, (q_unpad, k_unpad, v_unpad), do)
+    finally:
+        mha_set_use_fused_bwd_kernel(False)

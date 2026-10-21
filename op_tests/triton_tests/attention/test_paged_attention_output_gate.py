@@ -362,27 +362,14 @@ def test_module_imports_without_the_gluon_dialect():
         for k, v in sys.modules.items()
         if k == module or k.startswith((blocked, "aiter.ops.triton._gluon_kernels"))
     }
-    # The import also binds each module it creates on its parent package, and
-    # `from <package> import <module>` reads that binding. Save the bindings and
-    # put them back with sys.modules, so later tests get the original module
-    # rather than the copy imported here.
-    bindings = []
-    for name in saved:
-        parent, _, child = name.rpartition(".")
-        namespace = vars(sys.modules[parent]) if parent in sys.modules else {}
-        if child in namespace:
-            bindings.append((namespace, child, namespace[child]))
     for k in saved:
         del sys.modules[k]
-    blocker = _BlockGluon()
-    sys.meta_path.insert(0, blocker)
+    sys.meta_path.insert(0, _BlockGluon())
     try:
         importlib.import_module(module)  # must not raise
     finally:
-        sys.meta_path.remove(blocker)
+        sys.meta_path.pop(0)
         sys.modules.update(saved)
-        for namespace, child, value in bindings:
-            namespace[child] = value
 
 
 def test_gluon_probe_is_satisfied_here():

@@ -372,25 +372,23 @@ def test_contexted_kv_attention(
     output_torch = torch.empty_like(output)
     output_triton = output
 
-    # Run Triton. Triton launches on the current CUDA device, so select the
-    # inputs' device for the call; the previous device is restored on exit.
-    with torch.cuda.device(device):
-        context_attention_fwd(
-            query,
-            k,
-            v,
-            output_triton,
-            kv_cache_dtype,
-            k_cache,
-            v_cache,
-            block_table,
-            b_start_loc,
-            b_seq_len,
-            max_input_len,
-            k_scale,
-            v_scale,
-            sliding_window=sliding_window,
-        )
+    # Run Triton
+    context_attention_fwd(
+        query,
+        k,
+        v,
+        output_triton,
+        kv_cache_dtype,
+        k_cache,
+        v_cache,
+        block_table,
+        b_start_loc,
+        b_seq_len,
+        max_input_len,
+        k_scale,
+        v_scale,
+        sliding_window=sliding_window,
+    )
     # Run Torch
     context_attention_fwd_torch(
         query,
@@ -456,25 +454,23 @@ def test_contexted_kv_attention_alibi(
     output_torch = torch.empty_like(output)
     output_triton = output
 
-    # Run Triton. Triton launches on the current CUDA device, so select the
-    # inputs' device for the call; the previous device is restored on exit.
-    with torch.cuda.device(device):
-        context_attention_fwd(
-            query,
-            k,
-            v,
-            output_triton,
-            kv_cache_dtype,
-            k_cache,
-            v_cache,
-            block_table,
-            b_start_loc,
-            b_seq_len,
-            max_input_len,
-            k_scale,
-            v_scale,
-            alibi_slopes=alibi_slopes,
-        )
+    # Run Triton
+    context_attention_fwd(
+        query,
+        k,
+        v,
+        output_triton,
+        kv_cache_dtype,
+        k_cache,
+        v_cache,
+        block_table,
+        b_start_loc,
+        b_seq_len,
+        max_input_len,
+        k_scale,
+        v_scale,
+        alibi_slopes=alibi_slopes,
+    )
     # Run Torch
     context_attention_fwd_torch(
         query,

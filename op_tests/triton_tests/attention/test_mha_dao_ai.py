@@ -4,7 +4,6 @@
 import pytest
 import torch
 
-from aiter.ops.triton.attention import mha
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
@@ -20,11 +19,10 @@ from aiter.test_mha_common import (
 
 @pytest.fixture
 def dao_ai_impl():
-    """Set mha impl to dao_ai for the test, restore the previous impl on cleanup."""
-    prev_impl = mha._MHA_IMPL
+    """Set mha impl to dao_ai for the test, restore to default on cleanup."""
     mha_set_impl("dao_ai")
     yield
-    mha_set_impl(prev_impl)
+    mha_set_impl("default")
 
 
 @pytest.mark.parametrize(

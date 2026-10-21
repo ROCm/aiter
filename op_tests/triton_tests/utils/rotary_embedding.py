@@ -68,8 +68,6 @@ class RotaryEmbedding(nn.Module):
         base: int,
         is_neox_style: bool,
         dtype: torch.dtype,
-        *,
-        device: str | None = "cuda",
     ) -> None:
         super().__init__()
         self.head_size = head_size
@@ -78,7 +76,6 @@ class RotaryEmbedding(nn.Module):
         self.base = base
         self.is_neox_style = is_neox_style
         self.dtype = dtype
-        self.device = device
 
         cache = self._compute_cos_sin_cache()
         cache = cache.to(dtype)
@@ -94,10 +91,7 @@ class RotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (
             base
             ** (
-                torch.arange(
-                    0, self.rotary_dim, 2, dtype=torch.float, device=self.device
-                )
-                / self.rotary_dim
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim
             )
         )
         return inv_freq
@@ -105,9 +99,7 @@ class RotaryEmbedding(nn.Module):
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         """Compute the cos and sin cache."""
         inv_freq = self._compute_inv_freq(self.base)
-        t = torch.arange(
-            self.max_position_embeddings, dtype=torch.float, device=self.device
-        )
+        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
 
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
@@ -233,14 +225,9 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             / yarn_get_mscale(self.scaling_factor, float(mscale_all_dim))
             * attn_factor
         )
+        self.device = device
         super().__init__(
-            head_size,
-            rotary_dim,
-            max_position_embeddings,
-            base,
-            is_neox_style,
-            dtype,
-            device=device,
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
@@ -299,6 +286,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             query_pass = query[..., self.rotary_dim :]
             key_pass = key[..., self.rotary_dim :]
 
+        self.cos_sin_cache: torch.Tensor = self.cos_sin_cache.to(positions.device)
         cos_sin = self.cos_sin_cache[
             torch.add(positions, offsets) if offsets is not None else positions
         ]

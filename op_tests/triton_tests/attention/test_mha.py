@@ -7,10 +7,11 @@ import torch
 
 from aiter import logger
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
-from aiter.ops.triton.attention import mha
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
+    mha_set_use_fused_bwd_kernel,
+    mha_set_use_int64_strides,
 )
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
@@ -359,7 +360,6 @@ def test_mha_return_lse_softmax(
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_mha_int64_strides(
     backend: str,
-    monkeypatch,
     dtype=torch.bfloat16,
     test_backward=True,
 ):
@@ -381,7 +381,7 @@ def test_mha_int64_strides(
     torch.manual_seed(20)
     # use int64 strides for the backend under test.
     # NOTE: if you set this to false this test case will segfault
-    monkeypatch.setattr(mha, "_USE_INT64_STRIDES", True)
+    mha_set_use_int64_strides(True)
 
     # generate inputs with large strides
     def _generate_input(
@@ -468,6 +468,7 @@ def _test_mha_varlen_impl(
 ):
     skip_if_gluon_unsupported(backend, dropout_p=DROPOUT)
 
+    torch.set_printoptions(threshold=10000)
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
@@ -731,7 +732,6 @@ def test_mha_backward(
     CAUSAL: bool,
     DROPOUT: float,
     FUSED: bool,
-    monkeypatch,
     dtype=torch.bfloat16,
 ):
     HAS_DROPOUT = DROPOUT > 0.0
@@ -743,7 +743,7 @@ def test_mha_backward(
 
     torch.cuda.empty_cache()
     torch.manual_seed(20)
-    monkeypatch.setattr(mha, "_USE_FUSED_BWD_KERNEL", FUSED)
+    mha_set_use_fused_bwd_kernel(FUSED)
 
     q = torch.randn(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
     k = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
@@ -802,6 +802,7 @@ def test_mha_dao_ai_backward_head_size(
     head_size, varlen, seqlen_q, seqlen_k, strided, monkeypatch
 ):
     from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import bwd, interface_v2
+    from aiter.ops.triton.attention import mha
 
     monkeypatch.setattr(interface_v2, "BWD_MODE", "fused")
     kernel = bwd.bwd_kernel_fused_causal
@@ -893,7 +894,6 @@ def test_mha_backward_sbhd_do(
     HEAD_SZ: int,
     CAUSAL: bool,
     FUSED: bool,
-    monkeypatch,
     dtype=torch.bfloat16,
 ):
     """Verify backward correctness when dO has SBHD memory layout (strides differ from O).
@@ -908,7 +908,7 @@ def test_mha_backward_sbhd_do(
 
     torch.cuda.empty_cache()
     torch.manual_seed(42)
-    monkeypatch.setattr(mha, "_USE_FUSED_BWD_KERNEL", FUSED)
+    mha_set_use_fused_bwd_kernel(FUSED)
 
     q = torch.randn(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
     k = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
@@ -962,7 +962,6 @@ def test_mha_backward_varlen(
     CAUSAL: bool,
     DROPOUT: float,
     FUSED: bool,
-    monkeypatch,
     dtype=torch.bfloat16,
 ):
     BATCH = 3
@@ -977,7 +976,7 @@ def test_mha_backward_varlen(
 
     torch.cuda.empty_cache()
     torch.manual_seed(20)
-    monkeypatch.setattr(mha, "_USE_FUSED_BWD_KERNEL", FUSED)
+    mha_set_use_fused_bwd_kernel(FUSED)
 
     q = torch.randn(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
     k = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
@@ -1084,7 +1083,7 @@ def test_mha_backward_varlen_very_negative_logits(bwd_mode, monkeypatch):
     # so that partial block exists.
     torch.cuda.empty_cache()
     torch.manual_seed(0)
-    monkeypatch.setattr(mha, "_USE_FUSED_BWD_KERNEL", False)
+    mha_set_use_fused_bwd_kernel(False)
     NUM_HEADS, HEAD_SZ = 4, 128
     seqlens = [300, 250]
     total = sum(seqlens)
