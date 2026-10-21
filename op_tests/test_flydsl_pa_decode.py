@@ -1039,7 +1039,9 @@ def test_pa_decode(case, device, monkeypatch):
             window,
             sinks,
         )
-        tolerance = 1e-2 if case["kv_dtype"] == "fp8" else 5e-3
+        tolerance = (
+            1e-2 if case["kv_dtype"] == "fp8" and value_dim != head_dim else 5e-3
+        )
         _check_output(output, reference, tolerance)
 
     launch()
