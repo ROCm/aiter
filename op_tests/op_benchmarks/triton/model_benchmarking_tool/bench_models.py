@@ -451,7 +451,7 @@ class MhaKernelHandler(KernelHandler):
             "dqk": shape["dqk"],
             "dv": shape["dv"],
             "mha_layout": self._mha_layout,
-            "sink": shape.get("sink", "false"),
+            "sink": bool(shape.get("sink", False)),
             "sliding_window": shape.get("sliding_window_left", None),
             self._metric: bench_result,
         }
