@@ -90,6 +90,9 @@ _DISPATCH = {
 _SPLIT = {
     **_DISPATCH,
     "split_target_programs": 2048,
+    "split_max_programs": 1024,
+    "split_short_seq": 1024,
+    "split_short_min_programs": 128,
     "split_max_partitions": 64,
     "split_sizes": [1024, 512, 256, 128],
 }
@@ -155,6 +158,11 @@ def test_dispatch_without_busy_rule(monkeypatch):
         (64, 2048, 128, 128),
         (128, 8192, 16, 512),  # 128 programs x 16 partitions reaches the target
         (2048, 8192, 128, 1024),  # busy enough: keep the default size
+        (1023, 1024, 128, 256),  # one program under the busy cap still splits
+        (1024, 1024, 128, 1024),  # at the busy cap: not split
+        (127, 512, 128, 128),  # short sequence but few programs: split
+        (128, 512, 128, 1024),  # short sequence on a busy-enough grid: not split
+        (128, 1024, 128, 128),  # sequence at the short limit: splits again
         (8, 8192, 256, 256),  # sizes must be a multiple of the page size
         (8, 8192, 48, 1024),  # no size divides this page: keep the default
         (8, 100, 16, 1024),  # sizes above the sequence length are not used
@@ -166,6 +174,11 @@ def test_select_seq_partition_size(programs, seq_len, page, expected):
 
 def test_select_seq_partition_size_needs_split_keys():
     assert pa._select_seq_partition_size(8, 8192, 128, _DISPATCH) == 1024
+
+
+def test_select_seq_partition_size_busy_cap_is_optional():
+    no_cap = {k: v for k, v in _SPLIT.items() if k != "split_max_programs"}
+    assert pa._select_seq_partition_size(1024, 1024, 128, no_cap) == 512
 
 
 def test_dispatch_splits_gqa_sequence(monkeypatch):
@@ -207,6 +220,9 @@ def test_gfx1250_config_schema():
             "v1_min_programs",
             "v1_busy_max_partitions",
             "split_target_programs",
+            "split_max_programs",
+            "split_short_seq",
+            "split_short_min_programs",
             "split_max_partitions",
             "split_sizes",
         }

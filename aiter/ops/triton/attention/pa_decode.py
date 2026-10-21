@@ -41,11 +41,18 @@ def _select_seq_partition_size(
 
     Picks the largest size that gives at least ``split_target_programs`` programs
     (``num_programs`` x partitions) without exceeding ``split_max_partitions``. When
-    nothing reaches the target it takes the smallest size within the cap. Returning
-    ``_SEQ_PARTITION_SIZE`` keeps the default v1/v2 choice.
+    nothing reaches the target it takes the smallest size within the cap. Grids with
+    at least ``split_max_programs`` programs are already busy and are not split, and
+    neither are sequences shorter than ``split_short_seq`` on grids with at least
+    ``split_short_min_programs`` programs, where the extra reduce costs more than it
+    gains. Returning ``_SEQ_PARTITION_SIZE`` keeps the default v1/v2 choice.
     """
     target = dispatch.get("split_target_programs")
-    if target is None:
+    if target is None or num_programs >= dispatch.get("split_max_programs", 1 << 62):
+        return _SEQ_PARTITION_SIZE
+    if max_seq_len < dispatch.get(
+        "split_short_seq", 0
+    ) and num_programs >= dispatch.get("split_short_min_programs", 1 << 62):
         return _SEQ_PARTITION_SIZE
     max_parts = dispatch["split_max_partitions"]
     sizes = [
