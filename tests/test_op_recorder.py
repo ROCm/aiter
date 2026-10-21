@@ -355,7 +355,8 @@ def test_replay_summary():
             "status": "ok",
             "bucket": bucket,
             "replay_m": m,
-            "median_us": us,
+            "kernel_us": us,
+            "wall_us": us + 4.0,
             "kernels_match": match,
             "replayed_kernels": kernels,
         }
@@ -370,8 +371,41 @@ def test_replay_summary():
     assert summary[16]["calls"] == 2 and summary[16]["share_pct"] == 66.7
     assert summary[16]["m_values"] == "12:1 16:1"
     assert summary[16]["kernels_match_pct"] == 50.0
-    assert summary[16]["median_us"] == 15.0 and summary[16]["total_us"] == 30.0
+    assert summary[16]["kernel_us"] == 15.0 and summary[16]["kernel_total_us"] == 30.0
+    assert summary[16]["wall_us"] == 19.0 and summary[16]["wall_total_us"] == 38.0
     assert summary[8]["kernels_match_pct"] == ""
+    # check-only rows have no timings
+    untimed = replay.summarize(
+        [row(4, 4, 0.0, True) | {"kernel_us": "", "wall_us": ""}]
+    )
+    assert untimed[0]["kernel_us"] == "" and untimed[0]["wall_total_us"] == ""
+
+
+def test_split_profiled_kernels():
+    spin = "spin_kernel(long)"
+    # iteration = spin, flush, spin, call kernels; events deliberately unsorted
+    events = [
+        ("stage2", 15.0, 3.0),
+        (spin, 0.0, 1.0),
+        ("reduce_kernel", 1.0, 5.0),  # flush, dropped
+        (spin, 6.0, 2.0),
+        ("sort", 8.0, 1.0),
+        ("stage1", 9.0, 4.0),
+        (spin, 20.0, 1.0),
+        ("reduce_kernel", 21.0, 5.0),
+        (spin, 26.0, 2.0),
+        ("sort", 28.0, 1.5),
+        ("stage1", 29.5, 4.5),
+        ("stage2", 34.0, 2.0),
+    ]
+    per_iter = replay.split_profiled_kernels(events, iters=2)
+    assert per_iter == [
+        [("sort", 1.0), ("stage1", 4.0), ("stage2", 3.0)],
+        [("sort", 1.5), ("stage1", 4.5), ("stage2", 2.0)],
+    ]
+    assert replay.split_profiled_kernels(events, iters=3) is None
+    breakdown = replay.kernel_breakdown(per_iter)
+    assert breakdown == "stage1=4.25; stage2=2.50; sort=1.25"
 
 
 def test_replay_restores_environment(tmp_path, monkeypatch):

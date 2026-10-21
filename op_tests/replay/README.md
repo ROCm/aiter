@@ -73,16 +73,26 @@ framework captured graphs for, as graph mode would. Padding rows reuse the
 routing of real rows.
 
 Timing: each call is run `--iters` times, with caches flushed between
-iterations (`--no-flush` to keep them warm) and a GPU busy-wait queued in
-front so host dispatch overhead is not timed. Every layer keeps its own weight
-buffer (`--shared-weights` to use one set).
+iterations by a read-only pass over a 1 GB buffer (`--no-flush` to keep them
+warm). Two numbers are reported (`--timer both|kernel|wall`):
+
+- `kernel_us`: sum of the device time of every kernel the call launches
+  (torch profiler). This is what aiter op_tests (`run_perftest`) and rocprof
+  report, so compare with those.
+- `wall_us`: GPU time from the call's first to its last kernel (CUDA events,
+  with a GPU busy-wait queued in front so launch overhead before the call is
+  hidden). It adds the gaps between the call's kernels and any time the GPU
+  waits for the host inside the call. `wall_us - kernel_us` is that overhead.
+
+Every layer keeps its own weight buffer (`--shared-weights` to use one set).
 
 Outputs:
 
 - `replay_calls.csv`: per call: M, padded M, bucket, recorded vs replayed
-  kernels, median/min/mean/stdev us
+  kernels, kernel and wall times, and a per-kernel breakdown
+  (`kernel_breakdown`, median us per kernel name)
 - `replay_summary.csv`: per M bucket: number and share of calls, M values
-  seen, kernels, match rate, median and total time
+  seen, kernels, match rate, median and total kernel/wall time
 
 `--check-only` verifies kernels without timing.
 

@@ -16,6 +16,12 @@ The recorded AITER_* environment and tuned configs are restored before aiter
 is imported, so fused_moe makes the same dispatch decision the framework made.
 Every replayed call is checked against the recorded kernels.
 
+Each call is timed two ways:
+    kernel_us  sum of the device time of every kernel the call launches
+               (torch profiler) -- comparable to aiter op_tests and rocprof
+    wall_us    GPU time from the call's first to last kernel (CUDA events),
+               which adds gaps between kernels and waits on the host
+
 Outputs (in --out):
     replay_calls.csv    one row per recorded call
     replay_summary.csv  one row per M bucket (aiter's tuned-config token key)
@@ -52,6 +58,12 @@ def parse_args(argv=None):
     )
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--warmup", type=int, default=3)
+    p.add_argument(
+        "--timer",
+        choices=("both", "kernel", "wall"),
+        default="both",
+        help="kernel: profiler kernel-time sum; wall: CUDA events (default: both)",
+    )
     p.add_argument(
         "--no-flush",
         action="store_true",
@@ -191,30 +203,83 @@ def kernel_key(dispatch: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 
+SPIN_KERNEL = "spin_kernel"  # torch.cuda._sleep's kernel, used as a marker
+
+
+def split_profiled_kernels(
+    events: list[tuple[str, float, float]], iters: int
+) -> list[list[tuple[str, float]]] | None:
+    """Group device kernels (name, start_us, duration_us) per iteration.
+
+    Each iteration is queued as: spin marker, cache flush, spin marker, call.
+    Kernels after every second marker belong to the call; the flush (between
+    the two markers of an iteration) is dropped. None if markers are missing.
+    """
+    per_iter: list[list[tuple[str, float]]] = [[] for _ in range(iters)]
+    spins = 0
+    for name, _start, duration in sorted(events, key=lambda e: e[1]):
+        if SPIN_KERNEL in name:
+            spins += 1
+            continue
+        if spins and spins % 2 == 0 and spins // 2 <= iters:
+            per_iter[spins // 2 - 1].append((name, duration))
+    return per_iter if spins == 2 * iters else None
+
+
+def kernel_breakdown(per_iter: list[list[tuple[str, float]]], width: int = 70) -> str:
+    """Median time per kernel name across iterations, e.g. 'stage1=12.3; sort=2.1'."""
+    by_name: dict[str, list[float]] = defaultdict(list)
+    for kernels in per_iter:
+        totals: dict[str, float] = defaultdict(float)
+        for name, duration in kernels:
+            totals[name] += duration
+        for name, total in totals.items():
+            by_name[name].append(total)
+    parts = sorted(
+        ((statistics.median(v), n) for n, v in by_name.items()), reverse=True
+    )
+    return "; ".join(f"{n.removeprefix('void ')[:width]}={us:.2f}" for us, n in parts)
+
+
 class Timer:
+    """Times one call two ways.
+
+    kernel: sum of the device time of every kernel the call launches, from
+        the torch profiler -- what aiter's run_perftest and rocprof report.
+    wall: GPU time from the call's first to its last kernel (CUDA events),
+        which also counts gaps between its kernels and GPU idle time while
+        the host is still inside the call.
+    """
+
     def __init__(self, torch, args):
         self.torch = torch
         self.iters = args.iters
         self.warmup = args.warmup
         self.sleep_cycles = args.sleep_cycles
+        self.mode = args.timer
         self.flush_buf = None
         if not args.no_flush and args.flush_mb > 0:
-            self.flush_buf = torch.empty(
-                args.flush_mb * (1 << 20) // 4, dtype=torch.int32, device=args.device
+            self.flush_buf = torch.zeros(
+                args.flush_mb * (1 << 20) // 4, dtype=torch.float32, device=args.device
             )
-        if self.sleep_cycles and not hasattr(torch.cuda, "_sleep"):
+        if not hasattr(torch.cuda, "_sleep"):
             self.sleep_cycles = 0
+            if self.mode != "wall":
+                print("[replay] note: torch.cuda._sleep missing; kernel timer off")
+                self.mode = "wall"
 
-    def run(self, fn) -> list[float]:
+    def _flush(self) -> None:
+        # Read-only: a write flush would leave dirty lines the call then evicts.
+        if self.flush_buf is not None:
+            self.flush_buf.sum()
+
+    def wall(self, fn) -> list[float]:
         torch = self.torch
-        for _ in range(self.warmup):
-            fn()
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         times = []
         for _ in range(self.iters):
-            if self.flush_buf is not None:
-                self.flush_buf.add_(1)
+            self._flush()
             if self.sleep_cycles:
                 torch.cuda._sleep(self.sleep_cycles)
             start.record()
@@ -223,6 +288,53 @@ class Timer:
             end.synchronize()
             times.append(start.elapsed_time(end) * 1000.0)
         return times
+
+    def kernels(self, fn) -> list[list[tuple[str, float]]] | None:
+        torch = self.torch
+        from torch.profiler import ProfilerActivity, profile
+
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+            for _ in range(self.iters):
+                torch.cuda._sleep(1000)
+                self._flush()
+                torch.cuda._sleep(max(self.sleep_cycles, 1000))
+                fn()
+            torch.cuda.synchronize()
+        device = torch.autograd.DeviceType.CUDA
+        events = [
+            (e.name, e.time_range.start, e.time_range.elapsed_us())
+            for e in prof.events()
+            if e.device_type == device
+        ]
+        return split_profiled_kernels(events, self.iters)
+
+    def run(self, fn) -> dict:
+        for _ in range(self.warmup):
+            fn()
+        self.torch.cuda.synchronize()
+        result: dict = {"iters": self.iters}
+        if self.mode in ("kernel", "both"):
+            per_iter = self.kernels(fn)
+            if per_iter is None:
+                result["detail"] = "kernel timer: could not split profiler events"
+            else:
+                sums = [sum(d for _, d in k) for k in per_iter]
+                result.update(
+                    kernel_us=round(statistics.median(sums), 3),
+                    kernel_min_us=round(min(sums), 3),
+                    kernel_count=round(statistics.median(len(k) for k in per_iter)),
+                    kernel_breakdown=kernel_breakdown(per_iter),
+                )
+        if self.mode in ("wall", "both"):
+            times = self.wall(fn)
+            result.update(
+                wall_us=round(statistics.median(times), 3),
+                wall_min_us=round(min(times), 3),
+                wall_stdev_us=(
+                    round(statistics.stdev(times), 3) if len(times) > 1 else 0.0
+                ),
+            )
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -240,11 +352,14 @@ CALL_FIELDS = [
     "recorded_kernels",
     "replayed_kernels",
     "kernels_match",
-    "median_us",
-    "min_us",
-    "mean_us",
-    "stdev_us",
+    "kernel_us",
+    "kernel_min_us",
+    "kernel_count",
+    "wall_us",
+    "wall_min_us",
+    "wall_stdev_us",
     "iters",
+    "kernel_breakdown",
     "detail",
 ]
 
@@ -255,10 +370,21 @@ SUMMARY_FIELDS = [
     "m_values",
     "kernels",
     "kernels_match_pct",
-    "median_us",
-    "mean_us",
-    "total_us",
+    "kernel_us",
+    "wall_us",
+    "kernel_total_us",
+    "wall_total_us",
 ]
+
+
+def _median(values: list) -> float | str:
+    values = [v for v in values if v != ""]
+    return round(statistics.median(values), 2) if values else ""
+
+
+def _total(values: list) -> float | str:
+    values = [v for v in values if v != ""]
+    return round(sum(values), 1) if values else ""
 
 
 def summarize(rows: list[dict]) -> list[dict]:
@@ -270,7 +396,6 @@ def summarize(rows: list[dict]) -> list[dict]:
     summary = []
     for bucket in sorted(by_bucket):
         group = by_bucket[bucket]
-        timed = [r["median_us"] for r in group if r["median_us"] != ""]
         compared = [r["kernels_match"] for r in group if r["kernels_match"] != ""]
         m_counts = Counter(r["replay_m"] for r in group)
         summary.append(
@@ -285,9 +410,10 @@ def summarize(rows: list[dict]) -> list[dict]:
                 "kernels_match_pct": (
                     round(100.0 * sum(compared) / len(compared), 1) if compared else ""
                 ),
-                "median_us": round(statistics.median(timed), 2) if timed else "",
-                "mean_us": round(statistics.fmean(timed), 2) if timed else "",
-                "total_us": round(sum(timed), 1) if timed else "",
+                "kernel_us": _median([r.get("kernel_us", "") for r in group]),
+                "wall_us": _median([r.get("wall_us", "") for r in group]),
+                "kernel_total_us": _total([r.get("kernel_us", "") for r in group]),
+                "wall_total_us": _total([r.get("wall_us", "") for r in group]),
             }
         )
     return summary
@@ -301,12 +427,15 @@ def write_csv(path: Path, fields: list[str], rows: list[dict]) -> None:
 
 
 def print_summary(summary: list[dict]) -> None:
-    header = f"{'bucket':>7} {'calls':>7} {'share':>6} {'match':>6} {'median_us':>10} {'total_us':>11}  kernels"
-    print(header)
+    print(
+        f"{'bucket':>7} {'calls':>6} {'share':>6} {'match':>6} "
+        f"{'kernel_us':>10} {'wall_us':>9}  kernels"
+    )
     for s in summary:
         print(
-            f"{s['bucket']:>7} {s['calls']:>7} {s['share_pct']:>5}% "
-            f"{s['kernels_match_pct']:>5}% {s['median_us']!s:>10} {s['total_us']!s:>11}  {s['kernels']}"
+            f"{s['bucket']:>7} {s['calls']:>6} {s['share_pct']:>5}% "
+            f"{s['kernels_match_pct']!s:>5}% {s['kernel_us']!s:>10} "
+            f"{s['wall_us']!s:>9}  {s['kernels']}"
         )
 
 
@@ -393,14 +522,11 @@ def main(argv=None) -> int:
         if replay_m != m:
             row["detail"] = (row["detail"] + f" padded from M={m}").strip()
         if timer is not None:
-            times = timer.run(fn)
-            row.update(
-                median_us=round(statistics.median(times), 3),
-                min_us=round(min(times), 3),
-                mean_us=round(statistics.fmean(times), 3),
-                stdev_us=round(statistics.stdev(times), 3) if len(times) > 1 else 0.0,
-                iters=len(times),
-            )
+            timing = timer.run(fn)
+            note = timing.pop("detail", "")
+            row.update(timing)
+            if note:
+                row["detail"] = f"{row['detail']} {note}".strip()
         row["status"] = "ok"
         replayed += 1
 
