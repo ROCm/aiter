@@ -39,7 +39,14 @@ from .conv3d_gfx950_utils import (
     unit_divisors,
     weight_bytes,
 )
-from .conv3d_im2col import Im2colGather, make_im2col_plan
+from .conv3d_im2col import (
+    Im2colGather,
+    PatchGather,
+    StripGather,
+    make_im2col_plan,
+    patch_needs_park,
+    strip_elems,
+)
 
 
 @fx.struct
@@ -73,6 +80,12 @@ class Conv3dImplicitParam:
     out_ndhwc: fx.Constexpr[bool]
     # Runtime D/H/W; host still uses d/h/w to build geometry. Closure must not capture extents.
     dyn_hw: fx.Constexpr[bool]
+    # Request the LDS-reuse A paths (kW strip, and kH x kW when block_rows > 1);
+    # make_im2col_plan decides whether one applies.
+    kw_reuse: fx.Constexpr[bool]
+    # Output rows of a block's 2D patch (kH x kW reuse); 1 = consecutive rows.
+    # Needs kw_reuse; make_im2col_plan decides whether it applies.
+    block_rows: fx.Constexpr[int]
 
 
 def make_conv3d_implicit_param(
@@ -102,6 +115,8 @@ def make_conv3d_implicit_param(
     groups=1,
     out_ndhwc=False,
     dyn_hw=False,
+    kw_reuse=False,
+    block_rows=1,
 ):
     """Defaults for ``Conv3dImplicitParam`` (fx.struct has none)."""
     return Conv3dImplicitParam(
@@ -131,6 +146,8 @@ def make_conv3d_implicit_param(
         groups=groups,
         out_ndhwc=out_ndhwc,
         dyn_hw=dyn_hw,
+        kw_reuse=kw_reuse,
+        block_rows=block_rows,
     )
 
 
@@ -189,15 +206,18 @@ def _assert_shape_agnostic(param, cfg, kernel_grid, im2col_plan, scatter_plan, u
         param.groups,
         param.out_ndhwc,
         param.dyn_hw,
+        param.kw_reuse,
+        param.block_rows,
     )
     try:
         probe_geom = make_conv_geometry(probe)
-        probe_grid = make_launch_grid(probe, probe_geom, cfg)
+        probe_im2col = make_im2col_plan(probe, probe_geom, cfg)
+        probe_grid = make_launch_grid(probe, probe_geom, cfg, probe_im2col.out_block)
         if probe_grid.m_chunks != 1:
             # The probe needs M chunking, which this path rules out anyway.
             return
         probe_plans = (
-            make_im2col_plan(probe, probe_geom, cfg),
+            probe_im2col,
             make_output_scatter_plan(probe, probe_geom, cfg, probe_grid),
             unit_divisors(probe, probe_geom),
         )
@@ -247,7 +267,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
 
     # How the work is spread: the grid, its limits, and what a block decodes
     # to find its own (M, N, K) tile.
-    grid = make_launch_grid(param, geom, cfg)
+    grid = make_launch_grid(param, geom, cfg, im2col_plan.out_block)
 
     # How C is written back: the 5D scatter, the tail masking and the split-K
     # staging, against the same grid the gather reads A on.
@@ -277,7 +297,211 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         static_in_ext = static_input_extents(param)
 
     elem_ty = fx.BFloat16
-    SharedStorage = make_shared_storage(elem_ty, cfg)
+    N_CC = geom.cgp // cfg.tile_k
+    if const_expr(im2col_plan.kh_reuse):
+        assert (
+            not grid.use_splitk
+        ), "kH x kW reuse walks whole groups; split-K is ruled out"
+        KH_R, KH_C = im2col_plan.out_block
+        PATCH_ELEMS = im2col_plan.patch_alloc_vecs * LDG_VEC
+        SharedStorage = make_shared_storage(
+            elem_ty,
+            cfg,
+            patch_stage_elems=PATCH_ELEMS,
+            patch_park=patch_needs_park(
+                cfg, im2col_plan.patch_ldg, im2col_plan.patch_alloc_vecs
+            ),
+        )
+        # One group = one (kt, channel block): all kH*kW taps read one patch.
+        KH_GROUPS = [(kt_i, cc) for kt_i in range(param.kt) for cc in range(N_CC)]
+        KH_STEPS = [
+            (g, kt_i, cc, kh_i, kw_i)
+            for g, (kt_i, cc) in enumerate(KH_GROUPS)
+            for kh_i in range(param.kh)
+            for kw_i in range(param.kw)
+        ]
+    elif const_expr(im2col_plan.kw_reuse):
+        assert not grid.use_splitk, "kW reuse walks whole groups; split-K is ruled out"
+        STRIP_ELEMS = strip_elems(im2col_plan)
+        SharedStorage = make_shared_storage(elem_ty, cfg, STRIP_ELEMS, param.kw)
+        # One group = one (kt, kh, channel block); its KW taps share a strip.
+        GROUPS = [
+            (kt_i, kh_i, cc)
+            for kt_i in range(param.kt)
+            for kh_i in range(param.kh)
+            for cc in range(N_CC)
+        ]
+    else:
+        SharedStorage = make_shared_storage(elem_ty, cfg)
+
+    def _body_kw_reuse(y, x, weight, bias, ext, grid_m):
+        KW = param.kw
+        strip = StripGather(im2col_plan, x, ext)
+        weights = WeightLoader(cfg, kernel_grid, CRS, weight, W_BYTES)
+        scatter = OutputScatter(scatter_plan, y, bias, elem_ty, ext)
+        lds = fx.SharedAllocator(static=False).allocate(SharedStorage).peek()
+        tid = fx.Int32(gpu.thread_id("x"))
+        blk = block_coords(kernel_grid, grid_m)
+
+        mma = MmaTiling(cfg, elem_ty, tid, lds, scratch=y)
+        acc = mma.acc
+        strip.bind_block(tid, blk.m_offset)
+        weights.bind_block(tid, blk.n_offset, blk.n_local)
+        stager = LdsStager(cfg, elem_ty, tid)
+        a_offs = [strip.row_offset(row) + col for row, col in mma.a_rows()]
+
+        def b_stage(gs, kw_i):
+            return gs * KW + kw_i
+
+        def load_group(g, gs):
+            kt_i, kh_i, cc = GROUPS[g]
+            for i, src, voff in strip.taps(kt_i, kh_i, cc):
+                stager.copy(src, stager.dst(lds.a, gs * STRIP_ELEMS, i), voff)
+            for kw_i in range_constexpr(KW):
+                k_base = ((kt_i * param.kh + kh_i) * KW + kw_i) * CGP + cc * cfg.tile_k
+                b_tile = b_stage(gs, kw_i) * cfg.tile_n * cfg.tile_k
+                weights.stage(stager, lds, b_tile, k_base)
+
+        def read_tap(gs, kw_i):
+            a = mma.read_a_at(a_offs, gs * STRIP_ELEMS + kw_i * param.dw * cfg.tile_k)
+            b = mma.read_b(b_stage(gs, kw_i))
+            return a, b
+
+        load_group(0, 0)
+        for g in range_constexpr(len(GROUPS)):
+            gs = g % 2
+            # Group g has landed, and every wave is done reading stage gs ^ 1,
+            # which the DMA below overwrites.
+            barrier(vmcnt=0, lgkmcnt=0)
+            # All of this group's LDS reads are issued ahead of the next DMA;
+            # at most two taps' fragments are live at once.
+            pending = []
+            for kw_i in range_constexpr(KW):
+                pending.append(read_tap(gs, kw_i))
+                if const_expr(len(pending) == 2 and kw_i < KW - 1):
+                    a, b = pending.pop(0)
+                    acc = mma.compute(acc, a, b)
+            if const_expr(g + 1 < len(GROUPS)):
+                load_group(g + 1, (g + 1) % 2)
+                fx.rocdl.sched_vmem(im2col_plan.strip_ldg + KW * cfg.ldg_b_count)
+            for a, b in pending:
+                acc = mma.compute(acc, a, b)
+
+        scatter.store(
+            acc,
+            m_offset=blk.m_offset,
+            n_offset=blk.n_offset,
+            n_local=blk.n_local,
+            c_row=mma.c_row,
+            c_col=mma.c_col,
+        )
+
+    def _body_kh_reuse(y, x, weight, bias, ext, grid_m):
+        KH, KW = param.kh, param.kw
+        PIPE = cfg.pipe_stages
+        patch = PatchGather(im2col_plan, x, ext)
+        weights = WeightLoader(cfg, kernel_grid, CRS, weight, W_BYTES)
+        scatter = OutputScatter(scatter_plan, y, bias, elem_ty, ext)
+        lds = fx.SharedAllocator(static=False).allocate(SharedStorage).peek()
+        tid = fx.Int32(gpu.thread_id("x"))
+        blk = block_coords(kernel_grid, grid_m)
+
+        # M tile b owns output rows [ohb*R, +R) x cols [owb*C, +C) of one
+        # (n, t) plane, owb fastest. Ho is not a runtime scalar of its own.
+        wo = ext.wo
+        ho = ext.ho if const_expr(ext.is_static) else ext.div_wo.div(ext.hw_o)
+        wb = (wo + (KH_C - 1)) // KH_C
+        hb = (ho + (KH_R - 1)) // KH_R
+        b_id = fx.Int64(blk.m_offset) // cfg.tile_m
+        band = b_id // wb
+        oh0 = (band % hb) * KH_R
+        ow0 = (b_id % wb) * KH_C
+        m0 = ((band // hb) * ho + oh0) * wo + ow0
+
+        def row_of(r):
+            r = fx.Int64(r)
+            return m0 + (r // KH_C) * wo + r % KH_C
+
+        def row_ok(r):
+            r = fx.Int64(r)
+            return (oh0 + r // KH_C < fx.Int64(ho)) & (ow0 + r % KH_C < fx.Int64(wo))
+
+        mma = MmaTiling(cfg, elem_ty, tid, lds, scratch=y)
+        acc = mma.acc
+        patch.bind_block(tid, m0)
+        weights.bind_block(tid, blk.n_offset, blk.n_local)
+        stager = LdsStager(cfg, elem_ty, tid)
+        a_offs = [patch.lane_offset(row) + col for row, col in mma.a_rows()]
+
+        def load_patch(g, rounds):
+            kt_i, cc = KH_GROUPS[g]
+            base = (g % 2) * PATCH_ELEMS
+            for i, src, voff, live in patch.taps(kt_i, cc):
+                if const_expr(i in rounds):
+                    park = None if live is None else (live, lds.b_park)
+                    stager.copy(src, stager.dst(lds.a, base, i, park=park), voff)
+
+        def load_b(s):
+            _, kt_i, cc, kh_i, kw_i = KH_STEPS[s]
+            k_base = ((kt_i * KH + kh_i) * KW + kw_i) * CGP + cc * cfg.tile_k
+            weights.stage(stager, lds, (s % PIPE) * cfg.tile_n * cfg.tile_k, k_base)
+
+        n_steps = len(KH_STEPS)
+        first = [g * KH * KW for g in range(len(KH_GROUPS))]
+        # Patch g goes into stage g % 2, last read by group g - 2 (whose last
+        # step is first[g-1] - 1): it may be issued from the batch after that
+        # read's, and must be issued before the batch that first reads it.
+        # Its DMA rounds are spread over that window (all at once is slower).
+        patch_at = {}
+        for g in range(1, len(KH_GROUPS)):
+            lo = 0 if g == 1 else (first[g - 1] - 1) // TILES_PER_BARRIER + 1
+            hi = first[g] // TILES_PER_BARRIER - 1
+            assert lo <= hi, (g, lo, hi)
+            span = hi - lo + 1
+            for j in range(span):
+                rounds = set(range(patch.ldg * j // span, patch.ldg * (j + 1) // span))
+                if rounds:
+                    patch_at.setdefault(lo + j, []).append((g, rounds))
+
+        load_patch(0, set(range(patch.ldg)))
+        for s in range_constexpr(min(TILES_PER_BARRIER, n_steps)):
+            load_b(s)
+
+        for s0 in range_constexpr(0, n_steps, TILES_PER_BARRIER):
+            batch = list(range(s0, min(s0 + TILES_PER_BARRIER, n_steps)))
+            barrier(vmcnt=0, lgkmcnt=0)
+            a_frags = [
+                mma.read_a_at(
+                    a_offs,
+                    (KH_STEPS[s][0] % 2) * PATCH_ELEMS
+                    + patch.tap_offset(KH_STEPS[s][3], KH_STEPS[s][4]),
+                )
+                for s in batch
+            ]
+            b_frags = [mma.read_b(s % PIPE) for s in batch]
+            issued = 0
+            for s in batch:
+                if const_expr(s + TILES_PER_BARRIER < n_steps):
+                    load_b(s + TILES_PER_BARRIER)
+                    issued += cfg.ldg_b_count
+            for g, rounds in patch_at.get(s0 // TILES_PER_BARRIER, []):
+                load_patch(g, rounds)
+                issued += len(rounds)
+            if const_expr(issued):
+                fx.rocdl.sched_vmem(issued)
+            for j in range_constexpr(len(batch)):
+                acc = mma.compute(acc, a_frags[j], b_frags[j])
+
+        scatter.store(
+            acc,
+            m_offset=m0,
+            n_offset=blk.n_offset,
+            n_local=blk.n_local,
+            c_row=mma.c_row,
+            c_col=mma.c_col,
+            row_of=row_of,
+            row_ok=row_ok if const_expr(scatter_plan.row_chk) else None,
+        )
 
     def _body(y, x, weight, bias, ext, grid_m):
         # A's whole convolution: which input element each A vector taps, and
@@ -314,8 +538,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
 
         def async_load_b_to_lds(k_tile, stage):
             stage_tile = fx.Int64(stage) * cfg.tile_n * cfg.tile_k
-            for i, src, voff in weights.taps(blk.k_off + k_tile * cfg.tile_k):
-                stager.copy(src, stager.dst(lds.b, stage_tile, i), voff)
+            weights.stage(stager, lds, stage_tile, blk.k_off + k_tile * cfg.tile_k)
 
         # Double-buffer TILES_PER_BARRIER K-tiles: prefetch, then compute
         # while issuing the next DMA.
@@ -355,6 +578,11 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
             c_row=mma.c_row,
             c_col=mma.c_col,
         )
+
+    if im2col_plan.kh_reuse:
+        body = _body_kh_reuse
+    else:
+        body = _body_kw_reuse if im2col_plan.kw_reuse else _body
 
     if const_expr(param.dyn_hw):
         # The extents arrive as scalars. FlyDSL binds kernel parameters by
@@ -398,7 +626,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
                 x_elems,
                 x_sample_elems,
             )
-            _body(y, x, weight, bias, dyn_extents(s, dyn_unit), s.grid_m)
+            body(y, x, weight, bias, dyn_extents(s, dyn_unit), s.grid_m)
 
         @flyc.jit
         def launch(
@@ -456,7 +684,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         def conv3d_implicit_kernel(
             y: fx.Tensor, x: fx.Tensor, weight: fx.Tensor, bias: fx.Tensor
         ):
-            _body(y, x, weight, bias, static_extents(static_in_ext, geom), None)
+            body(y, x, weight, bias, static_extents(static_in_ext, geom), None)
 
         @flyc.jit
         def launch(
