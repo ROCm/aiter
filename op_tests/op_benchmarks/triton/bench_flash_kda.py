@@ -25,6 +25,7 @@ python bench_flash_kda.py --seg-sweep
 python bench_flash_kda.py -o
 """
 
+import functools
 import math
 import os
 import sys
@@ -39,14 +40,21 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import torch
-import triton
 
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.flash_kda import (
     FLASH_KDA_CHUNK,
     flash_kda_fwd,
 )
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
+    get_caller_name_no_ext,
+)
 
 # (B, T, H, K, V) – H=12 is the Kimi K3 shape this path was built for; the rest
 # bracket it so a regression in the segmentation heuristic shows up as well as a
@@ -117,6 +125,47 @@ def _bytes(B, T, H, K, V, HV, elem_bytes=2):
     return read + write
 
 
+def _generate_flash_kda_pool_inputs(B, T, H):
+    """Build one dense q/k/v/g/beta/A_log/dt_bias set.
+
+    Pure setup, not measured. Each call is one rotating-buffer pool entry,
+    so replaying through the pool during timing defeats cache residency
+    instead of timing one fixed buffer repeatedly. scale is a constant
+    (K is fixed at 128) and stays outside the pool.
+    """
+    inp = _make_inputs(B, T, H)
+    return (
+        inp["q"],
+        inp["k"],
+        inp["v"],
+        inp["g"],
+        inp["beta"],
+        inp["A_log"],
+        inp["dt_bias"],
+    )
+
+
+_FLASH_KDA_POOL_FIELDS = ["q", "k", "v", "g", "beta", "A_log", "dt_bias"]
+
+
+def _make_flash_kda_kernel_fn(scale, chunks_per_seg):
+    def kernel_fn(q, k, v, g, beta, A_log, dt_bias):
+        flash_kda_fwd(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            lower_bound=LOWER_BOUND,
+            chunks_per_seg=chunks_per_seg,
+        )
+
+    return kernel_fn
+
+
 def _seg_label(chunks_per_seg):
     if chunks_per_seg is None:
         return "auto"
@@ -124,6 +173,8 @@ def _seg_label(chunks_per_seg):
 
 
 def run_benchmark(args):
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
     if args.shape is not None:
         B, T, H, K, V = args.shape
         if K != K_DIM or V != K_DIM:
@@ -141,7 +192,11 @@ def run_benchmark(args):
     rows = []
     for B, T, H, K, V in x_vals_list:
         HV = H
-        t = _make_inputs(B, T, H)
+        scale = 1.0 / math.sqrt(K)
+        pool_gen = functools.partial(_generate_flash_kda_pool_inputs, B, T, H)
+        rot_bufs = generate_rotating_buffers_pool(
+            [pool_gen], [_FLASH_KDA_POOL_FIELDS], **kwargs_rot_bufs
+        )
 
         if args.seg_sweep:
             # A segment longer than the sequence would leave the grid empty.
@@ -150,22 +205,8 @@ def run_benchmark(args):
             segs = [None]
 
         for m in segs:
-
-            def fn(t=t, m=m):
-                return flash_kda_fwd(**t, lower_bound=LOWER_BOUND, chunks_per_seg=m)
-
-            # Time-based warmup: run until WARMUP_MS elapsed so JIT/autotune completes.
-            _elapsed = 0.0
-            while _elapsed < args.warmup_ms:
-                _t0 = torch.cuda.Event(enable_timing=True)
-                _t1 = torch.cuda.Event(enable_timing=True)
-                _t0.record()
-                fn()
-                _t1.record()
-                torch.cuda.synchronize()
-                _elapsed += _t0.elapsed_time(_t1)
-
-            ms = triton.testing.do_bench(fn, warmup=0, rep=args.rep_ms)
+            kernel_fn = _make_flash_kda_kernel_fn(scale, m)
+            ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
             tflops = _flops(B, T, H, K, V, FLASH_KDA_CHUNK) / ms * 1e-9
             bw = _bytes(B, T, H, K, V, HV) / (ms * 1e-3) * 1e-9
 
@@ -217,13 +258,14 @@ def parse_args(args=None):
         "--warmup-ms",
         type=float,
         default=300.0,
-        help="Warmup budget in ms (time-based, ensures JIT/autotune completes).",
+        help="Unused: timing is now do_bench_aiter_triton's rotating-buffer CUDA "
+        "graph replay, with its own fixed warmup. Kept for CLI compatibility.",
     )
     parser.add_argument(
         "--rep-ms",
         type=float,
         default=500.0,
-        help="Measurement budget in ms passed to triton.testing.do_bench.",
+        help="Unused, see --warmup-ms. Kept for CLI compatibility.",
     )
     return parser.parse_args(args=args)
 
