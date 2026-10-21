@@ -85,7 +85,7 @@ def _score_pair_sum(v_s, zero_f, fm_fast):
 
 
 def _scale_o_accs(v_o, scale_scalar, traits):
-    scale_vec = Vec.from_elements([scale_scalar], fx.Float32).broadcast_to(16)
+    scale_vec = fx.full(16, fx.Float32(scale_scalar), fx.Float32)
     for dc in range_constexpr(traits.D_CHUNKS):
         v_o[dc] = Vec(v_o[dc]) * scale_vec
 

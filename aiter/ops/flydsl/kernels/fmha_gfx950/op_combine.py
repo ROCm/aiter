@@ -54,7 +54,7 @@ class DualwaveSplitKCombineContext:
         self.elem_dtype = fx.BFloat16  # fp8 in, bf16 out
         self.fm_fast = fx.arith.FastMathFlags.fast
         self.c_zero_f = fx.Float32(0.0)
-        self.c_zero_v4f32 = Vec.filled(4, 0.0, fx.Float32)
+        self.c_zero_v4f32 = fx.full(4, 0.0, fx.Float32)
 
     def init_runtime_indices(self):
         self.seq_len_v = fx.Index(self.seq_len)
@@ -186,7 +186,7 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
 
         @flyc.jit
         def _accum_split(acc, den):
-            if fx.Float32(l_i) > fx.Float32(0.0):
+            if fx.Float32(l_i) > 0.0:
                 w = fx.Float32(m_i - m_max).exp2(fastmath="afn").ir_value()
                 wl = w * l_i
                 den = den + wl
@@ -197,7 +197,7 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
                     dtype=T.i32,
                 )
                 o4 = Vec(o2_raw, (2,), fx.Int32).bitcast(self.elem_dtype).to(fx.Float32)
-                w4 = Vec.from_elements([fx.Float32(wl)], fx.Float32).broadcast_to(4)
+                w4 = fx.full(4, fx.Float32(wl), fx.Float32)
                 acc = acc + w4 * o4
             return acc, den
 
@@ -212,11 +212,11 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
     def pack_output(self, acc, den):
         inv_rcp = rocdl.rcp(T.f32, den)
         inv = (fx.Float32(den) > self.c_zero_f).select(inv_rcp, self.c_zero_f)
-        inv4 = Vec.from_elements([fx.Float32(inv)], fx.Float32).broadcast_to(4)
+        inv4 = fx.full(4, fx.Float32(inv), fx.Float32)
         out4 = Vec(acc * inv4, (4,), fx.Float32)
         lo = rocdl.cvt_pk_bf16_f32(out4[0], out4[1])
         hi = rocdl.cvt_pk_bf16_f32(out4[2], out4[3])
-        return Vec.from_elements([fx.Int32(lo), fx.Int32(hi)], fx.Int32)
+        return Vec.from_elements([lo, hi], fx.Int32)
 
     def store_lse(self, m_max, den):
         # row_valid only bounds seq_idx by max_seqlen_q; varlen batches are shorter.

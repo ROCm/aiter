@@ -1405,11 +1405,16 @@ void get_mla_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
     // (16-head fold + host Q fold) is unchanged when FlyDSL is off.
     const bool flydsl_ps1 = std::getenv("AITER_MLA_DECODE_PS1_FLYDSL") != nullptr &&
                             std::atoi(std::getenv("AITER_MLA_DECODE_PS1_FLYDSL")) != 0;
+    // FP8 or BF16 Q/KV, the dtypes the FlyDSL PS1 kernels take.
+    const bool flydsl_ps1_dtypes =
+        (q_dtype == kv_dtype) && (q_is_fp8 || (q_dtype == AITER_DTYPE_bf16));
     const bool gfx1250_flydsl_ps1_heads =
-        flydsl_ps1 && (arch_id == "gfx1250") && q_is_fp8 && kv_is_fp8 &&
+        flydsl_ps1 && (arch_id == "gfx1250") && flydsl_ps1_dtypes &&
         ((num_heads == 96) ||
          (((num_heads == 32) || (num_heads == 64) || (num_heads == 128)) &&
-          (max_seqlen_qo == 1)));
+          (max_seqlen_qo == 1)) ||
+         (((num_heads == 32) || (num_heads == 64)) && (max_seqlen_qo <= 4) &&
+          (num_heads * max_seqlen_qo <= 128)));
 
     const bool natively_supported =
         (num_heads == 16) || gfx1250_flydsl_ps1_heads ||
