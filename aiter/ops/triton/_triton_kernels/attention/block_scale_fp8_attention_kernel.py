@@ -73,6 +73,16 @@ def get_padded_headsize(size):
     return padded_d_model
 
 
+def pad_scale_block_count(n):
+    """Round a K-scale block count up so ``tl.arange`` gets a power-of-two length.
+
+    The kernel masks off the extra slots, so a length like 3 (seqlen 192) is
+    loaded as 4.
+    """
+    count = max(int(n), 1)
+    return 1 << (count - 1).bit_length()
+
+
 @triton.jit
 def cdiv_fn(x, y):
     return (x + y - 1) // y
@@ -357,8 +367,10 @@ def _attn_fwd_inner(
 
 
 def get_autotune_fwd_configs():
-    pinned = get_tuned_kernel_config("attention", "FP8_ATTN", "attn_fwd", _FWD_FALLBACK)
-    return autotune_configs("FP8_ATTN_FWD", [pinned], pinned), [
+    pinned = get_tuned_kernel_config(
+        "attention", "BLOCK_SCALE_FP8_ATTN", "attn_fwd", _FWD_FALLBACK
+    )
+    return autotune_configs("BLOCK_SCALE_FP8_ATTN_FWD", [pinned], pinned), [
         "IS_CAUSAL",
         "dropout_p",
         "MAX_SEQLENS_Q",
@@ -1036,9 +1048,9 @@ def _bwd_preprocess_use_o(
 
 def get_autotune_bwd_configs():
     pinned = get_tuned_kernel_config(
-        "attention", "FP8_ATTN", "_bwd_kernels", _BWD_FALLBACK
+        "attention", "BLOCK_SCALE_FP8_ATTN", "_bwd_kernels", _BWD_FALLBACK
     )
-    return autotune_configs("FP8_ATTN_BWD", [pinned], pinned), [
+    return autotune_configs("BLOCK_SCALE_FP8_ATTN_BWD", [pinned], pinned), [
         "BLOCK_DMODEL_QK",
         "BLOCK_DMODEL_V",
         "ACTUAL_BLOCK_DMODEL_QK",

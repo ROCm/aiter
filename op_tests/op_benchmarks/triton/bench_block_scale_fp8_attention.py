@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Benchmark for the FP8 Flash Attention v2 kernel (attn_fwd, USE_FP8=False path).
+"""Benchmark for the block-scale FP8 Flash Attention v2 kernel (attn_fwd, USE_FP8=False path).
 
 Usage:
-    python bench_fp8_attention.py
-    python bench_fp8_attention.py --causal
-    python bench_fp8_attention.py -metric bandwidth
+    python bench_block_scale_fp8_attention.py
+    python bench_block_scale_fp8_attention.py --causal
+    python bench_block_scale_fp8_attention.py -metric bandwidth
 """
 
 import argparse
@@ -16,7 +16,7 @@ import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import FP8_ARCHS
-from aiter.ops.triton.attention.fp8_attention import (
+from aiter.ops.triton.attention.block_scale_fp8_attention import (
     attn_fwd,
     get_padded_headsize,
 )

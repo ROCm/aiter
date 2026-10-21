@@ -1,18 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Public Python wrapper for the FP8 Flash Attention v2 Triton kernels.
+"""Public Python wrapper for the block-scale FP8 Flash Attention v2 Triton kernels.
 
 Exposes attn_fwd and related utilities at the public aiter.ops.triton.attention
 boundary so callers do not need to import internal _triton_kernels symbols.
-`flash_attn_block_scale` is the block-scale entry used by `flash_attn_func`
+`block_scale_fp8_attention` is the entry used by `flash_attn_func`
 when the caller passes q_block_descale, k_block_descale, and v_scale.
 """
 
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.attention.fp8_attention_kernel import (
+from aiter.ops.triton._triton_kernels.attention.block_scale_fp8_attention_kernel import (
     FIXED_BLOCK_M,
     FIXED_BLOCK_N,
     _bwd_kernel_dkdv,
@@ -21,6 +21,7 @@ from aiter.ops.triton._triton_kernels.attention.fp8_attention_kernel import (
     attn_fwd,
     compute_fp8_scaling_factors,
     get_padded_headsize,
+    pad_scale_block_count,
 )
 from aiter.ops.triton.utils import types
 
@@ -29,8 +30,8 @@ __all__ = [
     "_bwd_kernel_dq",
     "_bwd_preprocess_use_o",
     "attn_fwd",
+    "block_scale_fp8_attention",
     "compute_fp8_scaling_factors",
-    "flash_attn_block_scale",
     "get_padded_headsize",
 ]
 
@@ -225,7 +226,7 @@ def _launch_fwd(
         stride_kdescale_z=k_scale.stride(0),
         stride_kdescale_h=k_scale.shape[-1],
         stride_kdescale_m=k_scale.stride(2),
-        padded_kscale_block_num=k_scale.shape[-1],
+        padded_kscale_block_num=pad_scale_block_count(k_scale.shape[-1]),
         cu_seqlens_q=None,
         cu_seqlens_k=None,
         dropout_p=0.0,
@@ -260,7 +261,7 @@ def _launch_fwd(
     return out_user, _compact_lse(lse, seqlen_q, FIXED_BLOCK_M)
 
 
-def flash_attn_block_scale(
+def block_scale_fp8_attention(
     q,
     k,
     v,
