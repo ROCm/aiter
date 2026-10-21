@@ -5,13 +5,16 @@
 Benchmark for the fused x * sigmoid(gate) kernel.
 """
 
-import argparse
 import sys
 
 import torch
 import triton
 
 from aiter.ops.triton.fusions.fused_sigmoid_mul import fused_sigmoid_mul
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    override_parser_action,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
@@ -29,6 +32,8 @@ arg_to_torch_dtype = {
 _PROVIDERS = ("fused", "eager")
 _ARRAYS = {"fused": 3, "eager": 5}
 _GATE_WIDTH = 4096
+# Kimi-K3 at TP8: the gate is a 1536-wide slice of the 3648-wide merged q_a|kv_a|gate row.
+_STRIDED_WIDTH, _STRIDED_ROW = 1536, 3648
 _DECODE_TOKENS = (1, 2, 4, 8, 16, 32, 64, 128)
 _PREFILL_TOKENS = (1166, 4096, 8192, 16384)
 
@@ -42,12 +47,17 @@ def get_benchmark_shapes(args):
         tokens += _DECODE_TOKENS
     if args.sweep in ("prefill", "all"):
         tokens += _PREFILL_TOKENS
-    return [(n, _GATE_WIDTH) for n in tokens]
+    width = _STRIDED_WIDTH if args.layout == "strided" else _GATE_WIDTH
+    return [(n, width) for n in tokens]
 
 
 def bench_fused_sigmoid_mul_fn(N, D, provider, metric, args):
     dtype = arg_to_torch_dtype[args.dtype]
     x, gate = generate_fused_sigmoid_mul_inputs((N, D), dtype)
+    if args.layout == "strided":
+        gate = torch.randn(N, args.row_stride, dtype=dtype, device=x.device)[:, -D:]
+        if args.x_row_stride:
+            x = torch.randn(N, args.x_row_stride, dtype=dtype, device=x.device)[:, :D]
     elem_size = x.element_size()
     mem = _ARRAYS[provider] * N * D * elem_size
 
@@ -85,7 +95,7 @@ def run_benchmark(args):
             : len(line_vals)
         ],
         ylabel="",
-        plot_name=get_caller_name_no_ext() + f"_{args.dtype}",
+        plot_name=get_caller_name_no_ext() + f"_{args.layout}_{args.dtype}",
         args={},
     )
 
@@ -98,11 +108,7 @@ def run_benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark fused sigmoid-mul",
-        description="Benchmark the Triton fused x * sigmoid(gate) kernel",
-        allow_abbrev=False,
-    )
+    parser = get_parser(kernel_name="fused sigmoid-mul")
     parser.add_argument("-N", type=int, default=None, help="Number of tokens")
     parser.add_argument("-D", type=int, default=None, help="Gated hidden width")
     parser.add_argument(
@@ -120,14 +126,29 @@ def parse_args():
         help="fused kernel, eager two-pass baseline, or both",
     )
     parser.add_argument(
-        "--dtype", type=str, default="bf16", choices=list(arg_to_torch_dtype)
+        "--layout",
+        type=str,
+        default="contiguous",
+        choices=["contiguous", "strided"],
+        help="contiguous inputs, or the gate as a column slice of a wider row",
     )
     parser.add_argument(
-        "--metric",
-        type=str,
-        default="all",
-        choices=["all", "time", "bandwidth"],
-        help="Metric to report (default: all)",
+        "--row_stride",
+        type=int,
+        default=_STRIDED_ROW,
+        help="Row stride of the strided gate (default: K3 merged row)",
+    )
+    parser.add_argument(
+        "--x_row_stride",
+        type=int,
+        default=0,
+        help="Row stride of a strided x, 0 keeps x dense (K3 padded 16 heads: 2048)",
+    )
+    parser.add_argument(
+        "--dtype", type=str, default="bf16", choices=list(arg_to_torch_dtype)
+    )
+    override_parser_action(
+        parser, action="--metric", choices=["all", "time", "bandwidth"], default="all"
     )
     parser.add_argument("--warmup", type=int, default=25)
     parser.add_argument("--rep", type=int, default=100)

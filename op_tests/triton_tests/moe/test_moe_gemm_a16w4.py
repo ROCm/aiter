@@ -87,6 +87,9 @@ def init_compute_data(
 # ---------------
 
 
+_TUNED_ARCH = "gfx942"
+
+
 @dataclass
 class Case:
     m: int
@@ -118,6 +121,9 @@ class Case:
             Case(300, 400, 800, 8, 4),
             Case(1000, 704, 800, 8, 2),
             Case(4097, 1024, 1024, 128, 4),
+            # gfx942 tuned table: m=256 -> block_m=128, m=128 -> block_m=64
+            Case(256, 1536, 5120, 2, 1),
+            Case(128, 1536, 5120, 2, 1),
             Case(16, 32, 256, 2, 1, hbm_swizzling=True),
             Case(16, 256, 256, 8, 4, hbm_swizzling=True),
             Case(32, 6144, 3072, 128, 4, hbm_swizzling=True),
@@ -169,7 +175,7 @@ def test_op(
     ):
         pytest.skip("Test will take too long on FFM")
 
-    if not (arch_info.is_fp4_avail()):
+    if not (arch_info.is_fp4_avail() or arch_info.get_arch() == _TUNED_ARCH):
         pytest.skip("MXFP4 not supported on this architecture")
 
     if hbm_swizzling:
@@ -249,3 +255,151 @@ def test_op(
         backend=backend,
     )
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
+
+
+def _ep_setup(
+    m, n, k, n_expts_tot, n_expts_act, ep_size, ep_rank, do_gather, do_scatter
+):
+    device = "cuda"
+    torch.manual_seed(0)
+    weight_dtype = str_to_torch_dtype["mxfp4_e2m1"]
+    m, rdata, gindx, sindx = init_routing_data(
+        m, n_expts_tot, n_expts_act, do_gather, do_scatter, device=device
+    )
+    x, w, bias, _ = init_compute_data(
+        m,
+        n,
+        k,
+        gindx,
+        sindx,
+        n_expts_tot,
+        n_expts_act,
+        torch.bfloat16,
+        torch.bfloat16,
+        False,
+        device=device,
+    )
+    w_tri, w_scale_tri = downcast_to_mxfp(w, weight_dtype, axis=1)
+    n_local = n_expts_tot // ep_size
+    lo, hi = ep_rank * n_local, (ep_rank + 1) * n_local
+    expert_map = torch.full((n_expts_tot,), -1, dtype=torch.int32, device=device)
+    expert_map[lo:hi] = torch.arange(n_local, dtype=torch.int32, device=device)
+    gate_valid = (expert_map[rdata.topk_ids.long()] >= 0).to(torch.int32).contiguous()
+    return (
+        x,
+        w_tri,
+        w_scale_tri,
+        bias,
+        rdata,
+        gindx,
+        sindx,
+        lo,
+        hi,
+        expert_map,
+        gate_valid,
+    )
+
+
+@pytest.mark.parametrize(
+    "m, n, k, n_expts_tot, n_expts_act",
+    [
+        (16, 256, 256, 8, 2),
+        (64, 512, 512, 128, 4),
+        (300, 400, 800, 8, 4),
+        (1024, 512, 512, 128, 4),
+    ],
+)
+@pytest.mark.parametrize("ep_size, ep_rank", [(4, 0), (4, 2)])
+@pytest.mark.parametrize(
+    "do_gather, do_scatter", [(True, False), (False, True), (True, True)]
+)
+@pytest.mark.parametrize("apply_swiglu", [False, True])
+def test_op_expert_parallel(
+    m,
+    n,
+    k,
+    n_expts_tot,
+    n_expts_act,
+    ep_size,
+    ep_rank,
+    do_gather,
+    do_scatter,
+    apply_swiglu,
+):
+    """Rank-local weights + global routing reproduce the local experts' output;
+    non-local gates contribute exactly 0 to the top-k combine."""
+    if not arch_info.is_fp4_avail():
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    x, w_tri, w_scale_tri, bias, rdata, gindx, sindx, lo, hi, expert_map, gate_valid = (
+        _ep_setup(
+            m, n, k, n_expts_tot, n_expts_act, ep_size, ep_rank, do_gather, do_scatter
+        )
+    )
+
+    # Reference on all global experts with non-local weights/bias zeroed.
+    w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
+    bias_ref = bias.clone()
+    is_nonlocal = torch.ones(n_expts_tot, dtype=torch.bool, device=x.device)
+    is_nonlocal[lo:hi] = False
+    w_ref[is_nonlocal] = 0
+    bias_ref[is_nonlocal] = 0
+    ref_y = moe_gemm_torch(
+        x.clone(), w_ref, bias_ref, rdata, gindx, sindx, None, apply_swiglu
+    )
+
+    tri_y = moe_gemm_a16w4(
+        x,
+        w_tri[lo:hi],
+        None,
+        w_scale_tri[lo:hi],
+        None,
+        None,
+        bias[lo:hi],
+        rdata,
+        gindx,
+        sindx,
+        None,
+        None,
+        torch.bfloat16,
+        apply_swiglu,
+        backend="triton",
+        expert_map=expert_map,
+        gate_valid=gate_valid,
+    )
+
+    if not do_scatter:
+        # Sorted output: only local experts' rows are written.
+        offs = rdata.expt_data.token_offs_raw
+        r0, r1 = int(offs[lo]), int(offs[hi])
+        ref_y, tri_y = ref_y[r0:r1], tri_y[r0:r1]
+    assert_close(ref_y, tri_y, maxtol=4e-1, rmstol=4e-2)
+
+
+def test_op_expert_parallel_rejects_bad_inputs():
+    if not arch_info.is_fp4_avail():
+        pytest.skip("MXFP4 not supported on this architecture")
+    x, w_tri, w_scale_tri, bias, rdata, gindx, sindx, lo, hi, expert_map, gate_valid = (
+        _ep_setup(16, 256, 256, 8, 2, 4, 1, True, True)
+    )
+    args = (
+        x,
+        w_tri[lo:hi],
+        None,
+        w_scale_tri[lo:hi],
+        None,
+        None,
+        bias[lo:hi],
+        rdata,
+        gindx,
+        sindx,
+    )
+    with pytest.raises(AssertionError, match="requires gate_valid"):
+        moe_gemm_a16w4(*args, backend="triton", expert_map=expert_map)
+    with pytest.raises(AssertionError, match="n_expts_tot"):
+        moe_gemm_a16w4(
+            *args,
+            backend="triton",
+            expert_map=expert_map[:-1].contiguous(),
+            gate_valid=gate_valid,
+        )
