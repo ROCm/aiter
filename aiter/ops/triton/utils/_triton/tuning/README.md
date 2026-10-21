@@ -65,11 +65,23 @@ exceed the arch's LDS is never compiled; each kernel declares its element widths
 and a kernel whose `num_ctas` splits the tile over a CTA cluster declares `cta_split`, so the
 check counts one CTA's share; and a register check: a config whose fp32 accumulator per thread,
 BLOCK_M x BLOCK_N / (num_warps x wave size), exceeds `MAX_ACC_PER_THREAD` (512 on gfx1250, 256
-elsewhere) only spills, so it is never run. On gfx1250 1024 per thread measured 16-19x slower)
+elsewhere) only spills, so it is never run. On gfx1250 1024 per thread measured 16-19x slower;
+and, for Triton kernels only, an operand check: `tl.dot` holds the whole BLOCK_K operand tiles in
+registers, so a config whose operands plus accumulator need more than twice `MAX_ACC_PER_THREAD`
+per thread is never compiled. On gfx1250 every such config spilled or overflowed LDS, and they
+took 1.5-3 minutes each to compile)
 and the kernel's own `should_skip(config)` in `kernels.py` (what the kernel asserts, and buffer
 counts its wrapper clamps so they would only repeat another candidate). Every rule returns True
-to reject. If the kernel rejects every tile that fits the shape (a kernel that needs 64-row tiles
-at M=16), block sizes above the shape are allowed for that M and the plan says so.
+to reject. The LDS and register checks are estimates, so the worker also compiles each candidate
+without a launch and skips it when the compiled kernels use more LDS than the device has or spill
+registers (`exceeds_compiled_resources`). If the kernel rejects every tile that fits the shape (a
+kernel that needs 64-row tiles at M=16), block sizes above the shape are allowed for that M and
+the plan says so.
+
+`cache_modifier` sweeps the four different load policies: `None` (the same as `.ca`), `.cg`,
+`.cs` and `.cv`. On gfx950, `.cs` sets the same policy as `.cg` (SC0+NT), so the gfx950 space
+does not have `.cs` (`SAME_LOAD_POLICY` in `space.py`). `waves_per_eu` 0 gives no occupancy hint
+to the compiler. `NUM_BUFFERS` goes from 1 to 8.
 There are no command-line overrides: edit the table. A one-value list pins a key. Keys the wrapper
 never reads (`ignored_keys` in the spec) and `matrix_instr_nonkdim`/`kpack` under gluon stay at
 their `DEFAULT.json` value. The driver prints the candidates per key, the config count and an ETA
@@ -92,11 +104,31 @@ carries keys that `DEFAULT.json` does not have are those stripped and the rest p
 (`dropped_keys` in the record). The numbers include dispatch gaps and both split-K kernels, so
 they are not comparable with the old rocprof logs.
 
+Each timing worker first times the installed config on its own GPU (a `reference` record) and
+stores every candidate's time relative to it: `rel` = time / reference. GPUs of one node differ by
+a few percent, so screening and the final-round shortlist compare `rel`, not `us`. The final round
+then times the shortlist on one GPU, and those numbers pick the winner. The summary shows the gain
+of each candidate over the installed config. When the installed config does not run, the worker
+records no `rel` and does not screen.
+
+`--screen X` makes a far-off candidate cheap. After the first warm-up replay, one timed replay
+decides: a candidate whose `rel` is above X times the lowest `rel` of its M so far stops there,
+and that replay is its time (`screened` in the record). The lowest `rel` starts at 1 (the
+installed config) or lower, from the fully timed records of all GPUs in the results file. A
+candidate whose eager warm-up launch alone takes more than 1 ms and 1.25 times that limit stops
+before the graph replays. `--screen 1` stops every candidate that is slower than the fastest one
+so far, so also every candidate that is slower than the installed config.
+The final round re-times the ten fastest records, screened ones included, so a candidate that one
+noisy replay put just behind the leader still gets a full measurement. The baseline and the final
+round are always timed in full. A candidate stops only between two launches: the worker never
+kills a running kernel. `--screen 0` (the default) times every candidate in full.
+
 ## Results, resume, failures
 
 Results go to `runs/sweep-<arch>-<backend>-<kernel>-[B=..-]M=..-N=..-K=..jsonl` (worker output in
 `<that file>.gpu<g>.log`), one JSON line per config: `config` (the raw candidate), `status` `ok` (`us`, `us_min`, `us_max`, `tflops`), `error`
-(the exception; the sweep continues), `crashed` or `hung` (the worker died or stalled on it; the
+(the exception; the sweep continues), `skipped` (the compiled kernels overflow LDS or spill
+registers; `reason` says which), `crashed` or `hung` (the worker died or stalled on it; the
 driver restarts the worker on the remaining configs). The baseline record carries `is_tuned`.
 The full field list is in the `harness.py` docstring. Re-running the same command skips configs that already have a record, provided `--calls` and
 `--replays` are unchanged (otherwise it refuses); `--fresh` discards them. The plan of each M is
