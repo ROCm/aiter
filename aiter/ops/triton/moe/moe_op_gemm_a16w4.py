@@ -2,6 +2,7 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_details/_matmul.py
 
 import itertools
+import os
 from functools import lru_cache
 
 import torch
@@ -354,6 +355,12 @@ def get_kernel_config_gluon_gfx942(m, n, k, routing_data):
     }
 
 
+# AITER_A16W4_GFX942_W_LDS=1 stages the fp4 weight tile through LDS with coalesced global loads
+# (2 columns x 128 B per quarter-wave); default loads it straight into the operand layout
+# (16 columns x 16 B per quarter-wave). Experimental switch, pending A/B on hardware.
+_GFX942_W_VIA_LDS = os.environ.get("AITER_A16W4_GFX942_W_LDS", "0") == "1"
+
+
 @lru_cache(maxsize=64)
 def _gfx942_layouts_cached(block_m, block_n, block_k, num_warps):
     return gfx942_a16w4_layouts(block_m, block_n, block_k, num_warps)
@@ -603,7 +610,7 @@ def moe_gemm_a16w4(
 
     # launch kernel
     if backend == "gluon" and get_arch() == "gfx942":
-        load_x, load_w, load_s, mfma_layout = _gfx942_layouts_cached(
+        load_x, load_w, load_s, mfma_layout, load_w_coal = _gfx942_layouts_cached(
             config["block_m"], config["block_n"], config["block_k"], config["num_warps"]
         )
         _moe_gemm_a16w4_gluon_gfx942[(grid,)](
@@ -654,6 +661,8 @@ def moe_gemm_a16w4(
             LOAD_W=load_w,
             LOAD_S=load_s,
             MFMA_LAYOUT=mfma_layout,
+            LOAD_W_COAL=load_w_coal,
+            W_VIA_LDS=_GFX942_W_VIA_LDS,
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             num_warps=config["num_warps"],
             num_stages=config["num_stages"],

@@ -91,7 +91,7 @@ THI1 = tl.constexpr(0x70707070)  # high bytes of T'[4..7]
 def gfx942_a16w4_layouts(block_m, block_n, block_k, num_warps):
     """Register layouts of the gfx942 kernel for one launch config.
 
-    Returns (LOAD_X, LOAD_W, LOAD_S, MFMA):
+    Returns (LOAD_X, LOAD_W, LOAD_S, MFMA, LOAD_W_COAL):
       LOAD_X  (block_m, block_k) bf16 global-load layout, 16 B per lane along K.
       LOAD_W  (block_k//4, block_n) uint16 view of the packed fp4 tile: lane (g = lane//16,
               n = lane%16) holds 2*KG contiguous uint16 (KG = block_k//32 dwords = 32 B for
@@ -101,6 +101,7 @@ def gfx942_a16w4_layouts(block_m, block_n, block_k, num_warps):
               of the 32-K groups its weight dwords belong to (groups g*KG//4 .. +KG//4-1 of the tile);
               the size-1 dim is broadcast to the 4 dwords per group in the kernel.
       MFMA    the 16x16x16 bf16 MFMA accumulator layout.
+      LOAD_W_COAL  coalesced global-load layout for the W tile (used when W_VIA_LDS).
     The kernel checks (at compile time) that these match the dot-operand layouts.
     """
     assert block_k % 128 == 0 and block_k <= 512, block_k
@@ -134,13 +135,21 @@ def gfx942_a16w4_layouts(block_m, block_n, block_k, num_warps):
         block_bases=[],
         shape=[KGL, 1, 4, block_n],
     )
+    # coalesced global-load layout for the W tile when it is staged through LDS: a 16-lane quarter-wave
+    # reads 2 columns x 128 B instead of 16 columns x 16 B (4x fewer cache lines per load instruction)
+    load_w_coal = gl.BlockedLayout(
+        size_per_thread=[8, 1],
+        threads_per_warp=[PK2 // 8, 64 // (PK2 // 8)],
+        warps_per_cta=[1, num_warps],
+        order=[0, 1],
+    )
     mfma = gl.amd.AMDMFMALayout(
         version=3,
         instr_shape=[16, 16, 16],
         transposed=True,
         warps_per_cta=[1, num_warps],
     )
-    return load_x, load_w, load_s, mfma
+    return load_x, load_w, load_s, mfma, load_w_coal
 
 
 @gluon.jit
@@ -265,6 +274,8 @@ def _moe_gemm_a16w4_gfx942(
     LOAD_W: gl.constexpr,
     LOAD_S: gl.constexpr,
     MFMA_LAYOUT: gl.constexpr,
+    LOAD_W_COAL: gl.constexpr,
+    W_VIA_LDS: gl.constexpr,
     num_warps: gl.constexpr,
     UPCAST_INDICES: gl.constexpr = False,
 ):
@@ -364,10 +375,16 @@ def _moe_gemm_a16w4_gfx942(
 
     # ---- W pointers: uint16 view, lane (g, n) reads 2*KG contiguous uint16 of column n
     W16 = W.to(gl.pointer_type(gl.uint16))
-    offs_w_n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, LOAD_W))
+    if W_VIA_LDS:
+        W_GLOAD: gl.constexpr = LOAD_W_COAL
+        W_VEC: gl.constexpr = 8
+    else:
+        W_GLOAD: gl.constexpr = LOAD_W
+        W_VEC: gl.constexpr = 2 * KG
+    offs_w_n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, W_GLOAD))
     offs_w_n = gl.max_contiguous(gl.multiple_of(offs_w_n % N, BLOCK_N), BLOCK_N)
-    offs_w_q = PK2 * pid_k + gl.arange(0, PK2, layout=gl.SliceLayout(1, LOAD_W))
-    offs_w_q = gl.max_contiguous(gl.multiple_of(offs_w_q, 2 * KG), 2 * KG)
+    offs_w_q = PK2 * pid_k + gl.arange(0, PK2, layout=gl.SliceLayout(1, W_GLOAD))
+    offs_w_q = gl.max_contiguous(gl.multiple_of(offs_w_q, W_VEC), W_VEC)
     # column stride and expert stride are multiples of 16 bytes (K % 256 == 0): keep the 16-byte
     # vector loads by stating it for the combined offsets
     offs_w = (
@@ -375,7 +392,7 @@ def _moe_gemm_a16w4_gfx942(
         + offs_w_n.to(index_type)[None, :] * (stride_w_n // 2)
         + w_expt_id * (stride_w_e // 2)
     )
-    offs_w = gl.max_contiguous(gl.multiple_of(offs_w, [8, 8]), [2 * KG, 1])
+    offs_w = gl.max_contiguous(gl.multiple_of(offs_w, [8, 8]), [W_VEC, 1])
     WPtrs = W16 + offs_w
 
     # ---- scale pointers: (KGL, 1, 4, BLOCK_N); lane (g, n) reads the KGL groups of its dwords
@@ -393,6 +410,10 @@ def _moe_gemm_a16w4_gfx942(
     SPtrs = WMxScale + offs_s
 
     x_smem = gl.allocate_shared_memory(gl.bfloat16, [BLOCK_M, BLOCK_K], SMEM_X)
+    if W_VIA_LDS:
+        # K-major tile (columns are K-contiguous); 16-byte vectors, swizzled across columns
+        SMEM_W: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 8, order=[0, 1])
+        w_smem = gl.allocate_shared_memory(gl.uint16, [PK2, BLOCK_N], SMEM_W)
     tlo0 = _const_u16_pairs((PK2, BLOCK_N), TLO0, DOT_W16)
     tlo1 = _const_u16_pairs((PK2, BLOCK_N), TLO1, DOT_W16)
     thi0 = _const_u16_pairs((PK2, BLOCK_N), THI0, DOT_W16)
@@ -402,8 +423,15 @@ def _moe_gemm_a16w4_gfx942(
     num_k_iter = K // (BLOCK_K * SPLIT_K)
     for k in range(num_k_iter):
         x = gl.load(XPtrs)
-        wq = gl.load(WPtrs, cache_modifier=W_CACHE_MODIFIER)
+        wg = gl.load(WPtrs, cache_modifier=W_CACHE_MODIFIER)
         sc = gl.load(SPtrs, cache_modifier=W_CACHE_MODIFIER)
+        if W_VIA_LDS:
+            # coalesced global load -> LDS -> per-lane 32-byte runs in the operand-compatible layout
+            w_smem.store(wg)
+            gl.barrier()
+            wq = w_smem.load(LOAD_W)
+        else:
+            wq = wg
 
         # weights: relabel into the k_width=2 operand layout, spread the scales, dequantise
         wu = _relabel_w(wq, KG, BLOCK_N, DOT_W16)
