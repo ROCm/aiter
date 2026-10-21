@@ -87,19 +87,29 @@ _DISPATCH = {
     "v1_min_programs": 2048,
     "v1_busy_max_partitions": 8,
 }
+_SPLIT = {
+    **_DISPATCH,
+    "split_target_programs": 2048,
+    "split_max_partitions": 64,
+    "split_sizes": [1024, 512, 256, 128],
+}
 
 
-def _picked_kernel(monkeypatch, dispatch, num_seqs, seq_len, num_kv_heads=8):
-    """Name of the paged_attn_decode_* entry point the dispatcher calls."""
+def _dispatch(monkeypatch, dispatch, num_seqs, seq_len, num_kv_heads=8, grp=4, page=1):
+    """(entry point, args, kwargs) of the paged_attn_decode_* call the dispatcher makes."""
     called = []
     monkeypatch.setattr(pa, "_get_dispatch_config", lambda kv_dtype: dispatch)
-    monkeypatch.setattr(pa, "paged_attn_decode_v1", lambda *a, **k: called.append("v1"))
-    monkeypatch.setattr(pa, "paged_attn_decode_v2", lambda *a, **k: called.append("v2"))
+    monkeypatch.setattr(
+        pa, "paged_attn_decode_v1", lambda *a, **k: called.append(("v1", a, k))
+    )
+    monkeypatch.setattr(
+        pa, "paged_attn_decode_v2", lambda *a, **k: called.append(("v2", a, k))
+    )
     pa.paged_attention_decode(
         output=None,
-        query=torch.empty(num_seqs, 4 * num_kv_heads, 1, dtype=torch.float16),
-        key_cache=torch.empty(1, num_kv_heads, 1, 1, dtype=torch.float16),
-        value_cache=torch.empty(1, num_kv_heads, 1, 1, dtype=torch.float16),
+        query=torch.empty(num_seqs, grp * num_kv_heads, 1, dtype=torch.float16),
+        key_cache=torch.empty(1, num_kv_heads, page, 1, dtype=torch.float16),
+        value_cache=torch.empty(1, num_kv_heads, page, 1, dtype=torch.float16),
         seq_lens=None,
         block_tables=None,
         attn_scale=1.0,
@@ -110,6 +120,11 @@ def _picked_kernel(monkeypatch, dispatch, num_seqs, seq_len, num_kv_heads=8):
     )
     assert len(called) == 1
     return called[0]
+
+
+def _picked_kernel(monkeypatch, dispatch, num_seqs, seq_len, num_kv_heads=8):
+    """Name of the paged_attn_decode_* entry point the dispatcher calls."""
+    return _dispatch(monkeypatch, dispatch, num_seqs, seq_len, num_kv_heads)[0]
 
 
 @pytest.mark.parametrize(
@@ -132,6 +147,47 @@ def test_dispatch_without_busy_rule(monkeypatch):
     assert _picked_kernel(monkeypatch, dispatch, 4096, 8192) == "v2"
 
 
+@pytest.mark.parametrize(
+    "programs, seq_len, page, expected",
+    [
+        (8, 512, 128, 128),  # nothing reaches the target: smallest size in the cap
+        (8, 16384, 128, 256),  # 128 would need 128 partitions, over the cap of 64
+        (64, 2048, 128, 128),
+        (128, 8192, 16, 512),  # 128 programs x 16 partitions reaches the target
+        (2048, 8192, 128, 1024),  # busy enough: keep the default size
+        (8, 8192, 256, 256),  # sizes must be a multiple of the page size
+        (8, 8192, 48, 1024),  # no size divides this page: keep the default
+        (8, 100, 16, 1024),  # sizes above the sequence length are not used
+    ],
+)
+def test_select_seq_partition_size(programs, seq_len, page, expected):
+    assert pa._select_seq_partition_size(programs, seq_len, page, _SPLIT) == expected
+
+
+def test_select_seq_partition_size_needs_split_keys():
+    assert pa._select_seq_partition_size(8, 8192, 128, _DISPATCH) == 1024
+
+
+def test_dispatch_splits_gqa_sequence(monkeypatch):
+    name, args, kwargs = _dispatch(monkeypatch, _SPLIT, 1, 8192, page=128)
+    assert name == "v2"
+    assert kwargs["seq_partition_size"] == 128
+    assert args[-1] == 64  # max_num_partitions follows the new size
+
+
+def test_dispatch_keeps_default_when_busy(monkeypatch):
+    name, _, _ = _dispatch(monkeypatch, _SPLIT, 256, 8192, page=128)
+    assert name == "v1"
+
+
+def test_dispatch_never_splits_mha(monkeypatch):
+    # The MHA kernels keep the default partition size.
+    name, args, kwargs = _dispatch(monkeypatch, _SPLIT, 1, 8192, grp=1, page=128)
+    assert name == "v2"
+    assert kwargs["seq_partition_size"] == pa._SEQ_PARTITION_SIZE
+    assert args[-1] == 8
+
+
 def test_dispatch_without_config_keeps_legacy_rule(monkeypatch):
     # Legacy: v1 only for max_seq_len <= 8192 and one partition or many heads.
     assert _picked_kernel(monkeypatch, None, 8, 1024) == "v1"
@@ -150,10 +206,19 @@ def test_gfx1250_config_schema():
             "v1_max_partitions",
             "v1_min_programs",
             "v1_busy_max_partitions",
+            "split_target_programs",
+            "split_max_partitions",
+            "split_sizes",
         }
+        sizes = dispatch.pop("split_sizes")
         assert all(isinstance(v, int) and v >= 1 for v in dispatch.values())
         # The busy rule only widens the v1 range.
         assert dispatch["v1_busy_max_partitions"] >= dispatch["v1_max_partitions"]
+        # Partition counts above 64 were not validated on gfx1250.
+        assert dispatch["split_max_partitions"] <= 64
+        # The default size is in the list; it means "do not split".
+        assert pa._SEQ_PARTITION_SIZE in sizes
+        assert all(isinstance(s, int) and s >= 16 and s & (s - 1) == 0 for s in sizes)
 
     for kernel in ("v1_w_dot", "v2_w_dot"):
         table = config["launch"][kernel]

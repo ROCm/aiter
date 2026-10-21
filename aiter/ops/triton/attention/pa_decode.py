@@ -34,6 +34,35 @@ _SEQ_PARTITION_SIZE = 1024  # HIP
 _KV_DTYPE_NAMES = {torch.bfloat16: "bf16", torch.float16: "fp16"}
 
 
+def _select_seq_partition_size(
+    num_programs: int, max_seq_len: int, kv_blk_sz: int, dispatch: dict
+) -> int:
+    """Sequence partition size for the split-K (v2) GQA kernel.
+
+    Picks the largest size that gives at least ``split_target_programs`` programs
+    (``num_programs`` x partitions) without exceeding ``split_max_partitions``. When
+    nothing reaches the target it takes the smallest size within the cap. Returning
+    ``_SEQ_PARTITION_SIZE`` keeps the default v1/v2 choice.
+    """
+    target = dispatch.get("split_target_programs")
+    if target is None:
+        return _SEQ_PARTITION_SIZE
+    max_parts = dispatch["split_max_partitions"]
+    sizes = [
+        p
+        for p in sorted(dispatch["split_sizes"], reverse=True)
+        if p % kv_blk_sz == 0 and (p == _SEQ_PARTITION_SIZE or p <= max_seq_len)
+    ]
+    parts = lambda p: (max_seq_len + p - 1) // p
+    for p in sizes:
+        if num_programs * parts(p) >= target and parts(p) <= max_parts:
+            return p
+    within = [p for p in sizes if parts(p) <= max_parts]
+    if within:
+        return min(within)
+    return _SEQ_PARTITION_SIZE
+
+
 def paged_attention_decode(
     output: torch.Tensor,  # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
     query: torch.Tensor,  # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
@@ -102,6 +131,16 @@ def paged_attention_decode(
         use_v1 = max_seq_len <= 8192 and (
             max_num_partitions == 1 or num_seqs * num_q_heads > 512
         )
+    seq_partition_size = _SEQ_PARTITION_SIZE
+    if dispatch is not None and num_q_heads != num_kv_heads:  # GQA only
+        seq_partition_size = _select_seq_partition_size(
+            num_seqs * num_kv_heads, max_seq_len, key_cache.shape[2], dispatch
+        )
+        if seq_partition_size != _SEQ_PARTITION_SIZE:
+            use_v1 = False
+            max_num_partitions = (max_seq_len + seq_partition_size - 1) // (
+                seq_partition_size
+            )
     if k_scale.numel() > 1:
         if use_v1:
             paged_attn_decode_v1_per_token_quant(
@@ -169,6 +208,7 @@ def paged_attention_decode(
                 k_scale.item(),
                 v_scale.item(),
                 max_num_partitions,
+                seq_partition_size=seq_partition_size,
             )
 
 
@@ -297,6 +337,7 @@ def paged_attn_decode_v2(
     blocksparse_vert_stride: int = 0,
     blocksparse_block_size: int = 64,
     blocksparse_head_sliding_step: int = 0,
+    seq_partition_size: int = _SEQ_PARTITION_SIZE,  # GQA only
 ):
     """
     #TODO: Add Doc
@@ -432,7 +473,7 @@ def paged_attn_decode_v2(
             QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
             KV_BLK_SZ=kv_blk_sz,
             KV_BLK_SZ_POW2=kv_blk_sz_pow2,
-            SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
+            SEQ_PARTITION_SZ=seq_partition_size,
             **launch,
         )
         grid = (num_seqs, num_kv_heads, 1)
@@ -455,7 +496,7 @@ def paged_attn_decode_v2(
             HEAD_SZ_POW2=head_sz_pow2,
             QUERY_GRP_SZ=query_grp_sz,
             QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
-            SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
+            SEQ_PARTITION_SZ=seq_partition_size,
             MAX_NUM_SEQ_PARTITIONS_POW2=int(triton.next_power_of_2(max_num_partitions)),
         )
 
