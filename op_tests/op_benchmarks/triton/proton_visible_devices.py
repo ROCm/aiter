@@ -13,11 +13,14 @@ The context manager puts the two variables back when the block ends.
 """
 
 import os
-import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-_told = False
+from aiter import logger
+
+# Log message about ROCR_VISIBLE_DEVICES and HIP_VISIBLE_DEVICES one time per
+# process.
+_WAS_LOGGED: bool = False
 
 
 @contextmanager
@@ -67,12 +70,12 @@ def proton_visible_devices() -> Iterator[None]:
                     "Visible GPUs follow ROCR_VISIBLE_DEVICES."
                 )
 
-        # Print the message one time.
-        global _told
-        if log_lines and not _told:
-            _told = True
+        # Log the message one time.
+        global _WAS_LOGGED
+        if log_lines and not _WAS_LOGGED:
+            _WAS_LOGGED = True
             log_lines.append("These variables are restored when this block returns.")
-            print("\n".join(log_lines), file=sys.__stderr__ or sys.stderr)
+            logger.warning("%s", "\n".join(log_lines))
 
         yield
 
