@@ -75,12 +75,8 @@ def fused_compress_attn_fp4_gfx1250(
     cache_modifier: gl.constexpr,
     window_layout: gl.constexpr,
 ):
-    # Arguments after the first 30 dwords cost a memory load. Keep the runtime
-    # arguments in 30 dwords.
 
-    # Compile-time constants
     WINDOW: gl.constexpr = 2 * RATIO
-    # A state, input or ape row has the previous group, then the current group.
     ROW_VALUES: gl.constexpr = 2 * HEAD_DIM
     # Two e2m1 values fit in one byte. One e8m0 scale covers 32 values.
     ROW_BYTES: gl.constexpr = HEAD_DIM // 2
@@ -99,12 +95,9 @@ def fused_compress_attn_fp4_gfx1250(
     seq = gl.load(plan_row_ptr + 1)
     last_pos = gl.load(plan_row_ptr + 2)
     num_from_state = gl.load(plan_row_ptr + 3)
-    # Row i of a decode plan is usually sequence i, so load that slot together with
-    # the plan row. Clamp, because a plan can have more rows than sequences.
     state_slot = gl.load(state_slots_ptr + gl.minimum(plan_row, num_seqs - 1))
 
-    # An empty plan row has a negative position. The slot test stops the compiler
-    # from moving the slot load after the plan-row load.
+    # An empty plan row has a negative position
     if (last_pos >= 0) & ((state_slot >= 0) | (seq != plan_row)):
         # A row of another sequence loads its own slot.
         if seq != plan_row:
@@ -115,7 +108,7 @@ def fused_compress_attn_fp4_gfx1250(
         cache_row = block * K_PER_BLOCK + entry % K_PER_BLOCK
 
         # =================================================================
-        # 1. Load the window, the RoPE values and the RMSNorm weight
+        # Load the window, the RoPE values and the RMSNorm weight
         # =================================================================
         window_token = gl.arange(0, WINDOW, layout=gl.SliceLayout(1, window_layout))
         window_token = window_token[:, None]
@@ -124,20 +117,15 @@ def fused_compress_attn_fp4_gfx1250(
         is_real = token_pos >= 0
         from_state = is_real & (window_token < num_from_state)
         from_input = is_real & (window_token >= num_from_state)
-        # The previous group uses the first half of a row, the current group the
-        # second half.
+        # The previous group uses the first half of a row, the current group the second half
         col_offset = gl.where(window_token >= RATIO, HEAD_DIM, 0)
 
-        # The older tokens come from the state ring. Slots can be far apart, so use a
-        # 64-bit slot offset.
+        # The older tokens come from the state ring. Slots can be far apart, so use a 64-bit slot offset.
         slot = state_slot.to(gl.int64)
         kv_ring = kv_state_ptr + slot * STATE_SLOT_STRIDE
         score_ring = score_state_ptr + slot * STATE_SLOT_STRIDE
         state_start = (token_pos % STATE_SIZE) * ROW_VALUES
-        # The compiler does not know the alignment. The hint gives 16-byte loads.
         state_start = gl.multiple_of(state_start + col_offset, [8, 8])
-        # A masked gl.load adds a branch for each load. A buffer load sets masked lanes
-        # out of range, so it needs no branch.
         state_values = gl.amd.gfx1250.buffer_load(
             kv_ring, state_start + col[None, :], from_state, 0.0
         )
@@ -155,11 +143,10 @@ def fused_compress_attn_fp4_gfx1250(
             score_in_ptr, input_start + col[None, :], from_input, float("-inf")
         )
         # The state ring stores scores with ape added. Add ape to the input scores only.
+        # The other tokens have an input score of -inf, so the ape load needs no mask.
         ape_start = (window_token % RATIO) * ROW_VALUES
         ape_start = gl.multiple_of(ape_start + col_offset, [8, 8])
-        ape = gl.amd.gfx1250.buffer_load(
-            ape_ptr, ape_start + col[None, :], from_input, 0.0
-        )
+        ape = gl.amd.gfx1250.buffer_load(ape_ptr, ape_start + col[None, :])
 
         # The cache row uses the RoPE angle of the first position in its group.
         cos, sin = load_interleaved_cos_sin(
@@ -167,29 +154,25 @@ def fused_compress_attn_fp4_gfx1250(
         )
         weight = gl.load(rms_weight_ptr + col)
 
-        # --- 2. Softmax pool ---
-        # Each token comes from at most one source. A masked source gives 0 and -inf,
-        # so add the values and take the max of the scores.
+        # --- Softmax pool ---
+        # Each token comes from at most one source
         values = state_values + input_values
         scores = gl.maximum(state_scores, input_scores + ape)
         max_score = gl.max(scores, axis=0)[None, :]
-        # gl.exp adds a denormal fix-up to each value. exp_scaled(1.0, x) is exp(x) with
-        # one exp2.
         weights = exp_scaled(1.0, scores - max_score)
-        # The IEEE divide is slow. fast_dividef uses v_rcp_f32 (1 ulp).
         pooled = gl.extra.libdevice.fast_dividef(
             gl.sum(weights * values, axis=0), gl.sum(weights, axis=0)
         )
 
-        # --- 3. RMSNorm ---
+        # --- RMSNorm ---
         normed = _rmsnorm_op(pooled, weight, HEAD_DIM, RMS_EPS)[None, :]
 
-        # --- 4. RoPE ---
+        # --- RoPE ---
         # RoPE is on the last ROPE_DIM columns.
         is_rope = col[None, :] >= HEAD_DIM - ROPE_DIM
         rotated = gl.where(is_rope, interleaved_rope(normed, cos, sin), normed)
 
-        # --- 5. MXFP4 ---
+        # --- MXFP4 ---
         # SCALING_MODE=1 rounds each scale up, as the torch reference does.
         packed, scales = _mxfp4_downcast_op(
             rotated,
@@ -200,19 +183,17 @@ def fused_compress_attn_fp4_gfx1250(
         )
 
         # =================================================================
-        # 6. Write the cache row
+        # Write the cache row
         # =================================================================
-        # A cache can have more than 2^31 bytes. Use a 64-bit row offset.
-        row = cache_row.to(gl.int64)
         byte = gl.arange(0, ROW_BYTES, layout=gl.SliceLayout(0, packed.type.layout))
         gl.store(
-            kv_cache_ptr + row * ROW_BYTES + byte[None, :],
+            kv_cache_ptr + cache_row * ROW_BYTES + byte[None, :],
             packed,
             cache_modifier=cache_modifier,
         )
         group = gl.arange(0, NUM_SCALES, layout=gl.SliceLayout(0, scales.type.layout))
         gl.store(
-            cache_scale_ptr + row * NUM_SCALES + group[None, :],
+            cache_scale_ptr + cache_row * NUM_SCALES + group[None, :],
             scales,
             cache_modifier=cache_modifier,
         )
