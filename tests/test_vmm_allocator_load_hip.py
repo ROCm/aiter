@@ -33,12 +33,13 @@ def cdll_calls(maps, load: bool = True, side_effect=None) -> list:
     call load_hip_runtime() if ``load``, and return the CDLL calls."""
     real_open = open
 
-    def fake_open(path, *args, **kwargs):
+    def fake_open(path, mode="r", *args, **kwargs):
         if path == "/proc/self/maps":
             if maps is None:
                 raise FileNotFoundError(path)
-            return io.StringIO(maps)
-        return real_open(path, *args, **kwargs)
+            data = os.fsencode(maps)
+            return io.BytesIO(data) if "b" in mode else io.StringIO(data.decode())
+        return real_open(path, mode, *args, **kwargs)
 
     spec = importlib.util.spec_from_file_location("vmm_allocator_under_test", PATH)
     module = importlib.util.module_from_spec(spec)
@@ -64,6 +65,10 @@ class LoadHipRuntimeTest(unittest.TestCase):
         path = "/opt/my venv\n/lib/libamdhip64.so.7"
         maps = MAPS.replace(CORE, "/opt/my venv\\012/lib/libamdhip64.so.7")
         self.assertEqual(cdll_calls(maps), [mock.call(path)])
+
+    def test_skips_a_mapped_path_that_is_not_utf8(self):
+        maps = "7f0000500000-7f0000600000 r--p 0 08:01 9 /data/caf\udce9.bin\n" + MAPS
+        self.assertEqual(cdll_calls(maps), [mock.call(CORE)])
 
     def test_warns_and_falls_back_if_the_mapped_copy_fails_to_load(self):
         def cdll(name):

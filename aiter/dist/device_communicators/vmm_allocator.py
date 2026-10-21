@@ -38,8 +38,8 @@ def load_hip_runtime() -> ctypes.CDLL:
     streams fail with hipErrorContextIsDestroyed.
     """
     try:
-        with open("/proc/self/maps") as f:
-            maps = f.readlines()
+        with open("/proc/self/maps", "rb") as f:
+            maps = [os.fsdecode(line) for line in f]
     except OSError:
         maps = []
     mapped_err = None
