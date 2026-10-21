@@ -26,4 +26,6 @@ void fused_dsv41_mxfp8_fwd(const aiter_tensor_t& q,
                            int64_t cache_page_size,
                            int64_t cache_num_rows,
                            int64_t cache_data_page_stride,
-                           int64_t cache_scale_page_stride);
+                           int64_t cache_scale_page_stride,
+                           bool fp8_qk,
+                           const std::optional<aiter_tensor_t>& q_scale);

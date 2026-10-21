@@ -39,6 +39,8 @@ def fused_dsv41_mxfp8_fwd(
     cache_num_rows: int = 0,
     cache_data_page_stride: int = 0,
     cache_scale_page_stride: int = 0,
+    fp8_qk: bool = False,
+    q_scale: torch.Tensor | None = None,
 ) -> None:
     """Write caller-allocated outputs; see :func:`fused_dsv41_mxfp8`."""
 
@@ -68,12 +70,24 @@ def fused_dsv41_mxfp8(
     max_logits: torch.Tensor | None = None,
     lse: torch.Tensor | None = None,
     debug_out: torch.Tensor | None = None,
+    fp8_qk: bool = False,
+    q_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return ``(out, out_scale, max_logits, lse)`` in one kernel launch.
 
     ``q`` is contiguous BF16 ``[T,H,512]``, H in {8,16,32,64,128}, in
     ordinary head-major layout. Set ``q_is_rotated=False`` to apply forward
     RoPE to its final 64 channels. KV rows must already have RoPE applied.
+
+    Set ``fp8_qk=True`` for scaled FP8 QK with fused group32 Q quantization
+    after optional RoPE. This opt-in mode supports H64/H128 with FP8 KV
+    and no BF16 extend. PV remains BF16 and accumulation remains FP32.
+    This experimental path is slower than BF16 QK on the measured fixtures;
+    see ``docs/fused_dsv41_fp8_qk.md`` for the benchmark and precision scope.
+    Alternatively supply FP8 E4M3FN ``q[T,H,512]`` and contiguous uint8
+    ``q_scale[T,H,16]`` with ``fp8_qk=True, q_is_rotated=True`` to consume
+    already rotated and quantized Q. Q then requires 32-byte alignment;
+    scales use finite E8M0 codes. This mode skips all Q preparation.
 
     BF16 mode: ``pool`` is contiguous BF16 ``[S,512]`` and ``prefix``
     contains int32 row indices. FP8 page metadata must be omitted. Values
@@ -164,6 +178,8 @@ def fused_dsv41_mxfp8(
             cache_num_rows,
             cache_data_page_stride,
             cache_scale_page_stride,
+            fp8_qk,
+            q_scale,
         )
     return out, out_scale, max_logits, lse
 

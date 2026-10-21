@@ -8,6 +8,7 @@ using B = opus::dtypes::bf16;
 struct FusedDsv41Args
 {
     const B* q;
+    const uint8_t* q_scale;
     const uint8_t* pool;
     const void* prefix;
     const int* prefix_indptr;
@@ -21,6 +22,7 @@ struct FusedDsv41Args
     int tokens, heads, extend_rows, prefix_capacity, extend_capacity, positions64;
     int64_t pool_bytes;
     float softmax_scale;
+    bool fp8_qk;
     Fp8CacheLayout cache;
     template <int PageSize>
     __device__ __forceinline__ const void* prefix_at(int begin) const

@@ -60,7 +60,9 @@ void fused_dsv41_mxfp8_fwd(const aiter_tensor_t& q,
                            int64_t cache_page_size,
                            int64_t cache_num_rows,
                            int64_t cache_data_page_stride,
-                           int64_t cache_scale_page_stride)
+                           int64_t cache_scale_page_stride,
+                           bool fp8_qk,
+                           const std::optional<aiter_tensor_t>& q_scale)
 {
     aiter_detail::AiterThrowGuard errors;
     AITER_CHECK(q.is_gpu() && q.dim() == 3, "q must be a GPU tensor [T,H,512]");
@@ -68,7 +70,18 @@ void fused_dsv41_mxfp8_fwd(const aiter_tensor_t& q,
     const int device = q.device_id;
     AITER_CHECK(h == 8 || h == 16 || h == 32 || h == 64 || h == 128, "unsupported head count");
     AITER_CHECK(t <= INT_MAX && prefix.numel() <= INT_MAX, "dimensions must fit int32");
-    check_tensor(q, "q", AITER_DTYPE_bf16, {t, h, 512}, device, 16);
+    if(q_scale)
+    {
+        AITER_CHECK(fp8_qk && q_is_rotated,
+                    "prequantized Q requires fp8_qk=True and q_is_rotated=True");
+        check_tensor(q, "q", AITER_DTYPE_fp8, {t, h, 512}, device, 32);
+        check_tensor(*q_scale, "q_scale", AITER_DTYPE_u8, {t, h, 16}, device);
+    }
+    else
+        check_tensor(q, "q", AITER_DTYPE_bf16, {t, h, 512}, device, 16);
+    AITER_CHECK(!fp8_qk || ((h == 64 || h == 128) && pool.dtype() != AITER_DTYPE_bf16 &&
+                            !extend_kv && !extend && !extend_indptr),
+                "FP8 QK requires H64/H128, FP8 KV, and no BF16 extend source");
     const bool bf16_cache = pool.dtype() == AITER_DTYPE_bf16;
     if(bf16_cache)
     {
@@ -194,6 +207,8 @@ void fused_dsv41_mxfp8_fwd(const aiter_tensor_t& q,
     a.prefix_capacity = prefix.numel();
     a.pool_bytes      = pool.numel();
     a.positions64     = positions.dtype() == AITER_DTYPE_i64;
+    a.fp8_qk = fp8_qk;
+    a.q_scale = q_scale ? static_cast<const uint8_t*>(q_scale->data_ptr()) : nullptr;
     a.softmax_scale   = softmax_scale;
     HIP_CALL(launch_fused_dsv41_mxfp8(&a, !q_is_rotated, aiter::getCurrentHIPStream()));
 }
