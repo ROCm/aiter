@@ -81,6 +81,12 @@ static_assert(LG_COMM_F % LG_TILE_N == 0, "slab columns must be a whole number o
 #endif
 #define LGC_FOLD_CNT_OFF (LGC_LOCK_OFF + 60u)   /* u32 fold counter: lock word 15 (unused by the r6 poster path; r4 locks use words 0..15 only in the r5b CAS build); device-reset by the last folded waiter */
 #define LG_R_PAD_BYTES 4096u          /* r8 A1: R window padding so a [T,2560] view with row stride 2304 (reuse) stays inside the allocation */
+#ifndef LG_TAG_EARLY
+#define LG_TAG_EARLY 1                /* r12b (overhead study F6/F1): 1 = the ARRIVAL tag is stored right after the credit-tag check, i.e. in the batch of the first put (before the puts), by the poster lane that later releases the arrival: by the time of the arrival release (after quietQueue) it has long retired, so the release fence has no outstanding remote store. 0 = r12 behaviour (tag store immediately before the arrival release). The credit tag cannot move earlier (it is the poster's first action; its RTT is hidden behind GEMM group 0). Safe: the store follows the peer's credit e, which the peer issues only after its quiet_ready e-1 read atag[us]. */
+#endif
+#ifndef LG_POLL_BATCH
+#define LG_POLL_BATCH 1               /* r12b (F2): 1 = W1/W2/credit/gdone polls load the target word and ERR back-to-back (one wait, one RTT per iteration); 2 = ERR only every 8th iteration; 0 = r12 behaviour (ERR loaded after the target compare). ERR is a liveness signal: a late observation only delays the sticky skip (bounded). */
+#endif
 #ifndef LG_X_TEST_BAD_CTAG
 #define LG_X_TEST_BAD_CTAG 0          /* r12 seam (debug only, NEVER production): the poster of peer slot 0 stores E ^ 1 as its credit tag => the receiving peer must set ERR TAG_CREDIT (0x31) before any put */
 #endif

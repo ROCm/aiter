@@ -271,27 +271,51 @@ __device__ __forceinline__ void r6x_put_group(const LgCommArgsV3& a, int peer, u
 // ---- r6b waits: RELAXED system-scope spin + ONE acquire fence after success (review P-C3: an ACQUIRE load per spin would issue a buffer_inv per spin for the whole GEMM). Budgets are in
 // MICROSECONDS measured with s_memrealtime (100 MHz => 100 ticks/us), not iteration counts (review P-C9/L-1): args.reserved[1] = budget per wait (default 50 ms), must be non-zero.
 __device__ __forceinline__ uint64_t r6_budget_ticks(const LgCommArgsV3& a) { return a.reserved[1] * 100ull; }
-// r12: the waits also read the local ERR word every iteration. Return: 1 = condition reached (ONE acquire fence issued), 0 = budget expired, -1 = ERR observed (someone already set it: the caller leaves without setting again).
-// The condition is tested before ERR, so an already-satisfied wait is not aborted by a later ERR.
+// r12: the waits also read the local ERR word. Return: 1 = condition reached (ONE acquire fence issued), 0 = budget expired, -1 = ERR observed (someone already set it: the caller leaves without setting again).
+// The condition is tested before ERR, so an already-satisfied wait is not aborted by a later ERR. LG_POLL_BATCH (r12b): 1 = target + ERR loaded back-to-back (default), 2 = ERR every 8th iteration, 0 = r12 (ERR after the compare).
 __device__ __forceinline__ int r12_poll_u32_ge(const LgCommArgsV3& a, const uint32_t* p, uint32_t want, uint64_t budget_ticks) {
     const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+#if LG_POLL_BATCH == 2
+    uint32_t it = 0;
+#endif
     for (;;) {
-        if (__hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) >= want) { __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, ""); return 1; }   // ONE system acquire fence after success
-        if (!err_clear(a)) return -1;
-        if (__builtin_amdgcn_s_memrealtime() - t0 >= budget_ticks) return 0;
-        __builtin_amdgcn_s_sleep(1);
-    }
-}
-__device__ __forceinline__ int r12_poll_u64_ge(const LgCommArgsV3& a, const uint64_t* p, uint64_t want, uint64_t budget_ticks) {
-    const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
-    for (;;) {
+#if LG_POLL_BATCH == 1
+        const uint32_t v = __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        const bool ez = !err_clear(a);                                              // issued back-to-back with the target load: ONE wait covers both (F2)
+        if (v >= want) { __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, ""); return 1; }  // ONE system acquire fence after success
+        if (ez) return -1;
+#elif LG_POLL_BATCH == 2
+        if (__hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) >= want) { __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, ""); return 1; }
+        if ((++it & 7u) == 0u && !err_clear(a)) return -1;                          // ERR every 8th iteration
+#else
         if (__hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) >= want) { __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, ""); return 1; }
         if (!err_clear(a)) return -1;
+#endif
         if (__builtin_amdgcn_s_memrealtime() - t0 >= budget_ticks) return 0;
         __builtin_amdgcn_s_sleep(1);
     }
-}
-static_assert(!LG_R8_FOLD, "r12 (sticky ERR + tags) supports the F0 production configuration only (LG_R8_FOLD=0): the folded poster has no tag check / ERR skip");
+}__device__ __forceinline__ int r12_poll_u64_ge(const LgCommArgsV3& a, const uint64_t* p, uint64_t want, uint64_t budget_ticks) {
+    const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+#if LG_POLL_BATCH == 2
+    uint32_t it = 0;
+#endif
+    for (;;) {
+#if LG_POLL_BATCH == 1
+        const uint64_t v = __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        const bool ez = !err_clear(a);                                              // issued back-to-back with the target load: ONE wait covers both (F2)
+        if (v >= want) { __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, ""); return 1; }  // ONE system acquire fence after success
+        if (ez) return -1;
+#elif LG_POLL_BATCH == 2
+        if (__hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) >= want) { __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, ""); return 1; }
+        if ((++it & 7u) == 0u && !err_clear(a)) return -1;                          // ERR every 8th iteration
+#else
+        if (__hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) >= want) { __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, ""); return 1; }
+        if (!err_clear(a)) return -1;
+#endif
+        if (__builtin_amdgcn_s_memrealtime() - t0 >= budget_ticks) return 0;
+        __builtin_amdgcn_s_sleep(1);
+    }
+}static_assert(!LG_R8_FOLD, "r12 (sticky ERR + tags) supports the F0 production configuration only (LG_R8_FOLD=0): the folded poster has no tag check / ERR skip");
 
 // X-1 IMMUNITY (review lg-r5x-review-r1.md (3): "a missing arrival is a silent stale pass" in r5b/r5x quiet_ready). In r6/r6x the ARRIVAL store is the LAST statement of r6_poster_block and is
 // reachable ONLY through the loop below: for every group g < NP the poster has (1) passed the bounded wait `r6_poll_u32_ge(gdone[peer][g] >= want)` with want = (chunks/NP)*LG_ITEMS_PER_GROUP (every
@@ -349,6 +373,11 @@ __device__ __forceinline__ void r6_poster_block(const LgCommArgsV3& a) {
     if (!err_clear(a)) return;                                                    // r12 sticky: ERR already set => no credit, no wait, no put, no arrival (the GEMM item blocks still run locally)
     const uint64_t e = ld_u64(cw(a, LGC_EP_OFF));
     const uint64_t E = tag_E(a);                                                  // (STEP << 32) | call_id: rank-uniform by construction
+#if LG_X_TEST_BAD_ATAG
+    const uint64_t atag_v = (wave == 0) ? (E ^ 1ull) : E;
+#else
+    const uint64_t atag_v = E;
+#endif
     const uint64_t budget = r6_budget_ticks(a);
     uint32_t issued = 0;                                                          // puts already posted to this peer in this epoch
     // F-A (review): on ANY timeout after a put was issued, drain that peer's queue before returning poisoned (the engine may still be copying into the peer's R).
@@ -400,6 +429,11 @@ __device__ __forceinline__ void r6_poster_block(const LgCommArgsV3& a) {
                 const uint64_t seen = __hip_atomic_load(reinterpret_cast<const uint64_t*>(cw(a, LGC_CTAG_OFF + 8u * peer)), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
                 if (seen != E) { set_err(a, LGC_POISON_TAG_CREDIT, E, seen, e, e); return; }
             }
+#if LG_TAG_EARLY && !LG_X_TEST_ATAG_AFTER_RELEASE
+            // r12b F1: arrival tag stored HERE (the peer's credit e is observed => its quiet_ready e-1 already read atag[us]: no WAR), in the batch of the first put, by the lane that releases the arrival later:
+            // it has retired long before the arrival release, whose fence then has no outstanding remote store. Ordered before the arrival by program order + that fence.
+            __hip_atomic_store(reinterpret_cast<uint64_t*>(cw_peer(a, peer, LGC_ATAG_OFF + 8u * a.rank)), atag_v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+#endif
 #if LG_STAMPS
             ps[2] = stamp_now();
 #endif
@@ -440,16 +474,13 @@ __device__ __forceinline__ void r6_poster_block(const LgCommArgsV3& a) {
     ps[11] = stamp_now();
 #endif
     if (!err_clear(a)) return;                                                    // r12: ERR set while the puts drained => no arrival (the peers' quiet_ready skips W2 under the propagated ERR)
-    {   // r12 D-2: arrival tag stored by the releasing thread before its release (same rule as the credit tag)
-#if LG_X_TEST_BAD_ATAG
-        const uint64_t atag_v = (wave == 0) ? (E ^ 1ull) : E;
-#else
-        const uint64_t atag_v = E;
-#endif
+    {   // r12 D-2: arrival tag stored by the releasing lane before its release: early (LG_TAG_EARLY=1: stored with the first put above) or, as in r12, immediately before the release
 #if LG_X_TEST_ATAG_AFTER_RELEASE
         st_u64_rel_x(cw_peer(a, peer, LGC_ARRIVAL_OFF + 8u * a.rank), e);          // seam (negative control)
         for (uint32_t i = 0; i < LG_X_TEST_TAG_DELAY_ITERS; ++i) __builtin_amdgcn_s_sleep(100);
         __hip_atomic_store(reinterpret_cast<uint64_t*>(cw_peer(a, peer, LGC_ATAG_OFF + 8u * a.rank)), atag_v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+#elif LG_TAG_EARLY
+        st_u64_rel_x(cw_peer(a, peer, LGC_ARRIVAL_OFF + 8u * a.rank), e);
 #else
         __hip_atomic_store(reinterpret_cast<uint64_t*>(cw_peer(a, peer, LGC_ATAG_OFF + 8u * a.rank)), atag_v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
         st_u64_rel_x(cw_peer(a, peer, LGC_ARRIVAL_OFF + 8u * a.rank), e);
@@ -472,11 +503,23 @@ __device__ __forceinline__ void r6_quiet_ready(const LgCommArgsV3& a) {
         const int d = peer_of(static_cast<int>(a.rank), tid);
         bool got = false; uint64_t v = 0ull;
         const uint64_t t0 = __builtin_amdgcn_s_memrealtime(), budget = r6_budget_ticks(a);
-        for (;;) {                                                                  // relaxed spin on OWN arrival[d] + ERR each iteration; one acquire fence on success; budget in us
+#if LG_POLL_BATCH == 2
+        uint32_t it = 0;
+#endif
+        for (;;) {                                                                  // relaxed spin on OWN arrival[d] + ERR (LG_POLL_BATCH); one acquire fence on success; budget in us
             v = __hip_atomic_load(reinterpret_cast<const uint64_t*>(cw(a, LGC_ARRIVAL_OFF + 8u * d)), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+#if LG_POLL_BATCH == 1
+            const bool ez = !err_clear(a);                                          // back-to-back with the arrival load: one wait
+#endif
             if (v == e) { __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, ""); got = true; break; }
             if (v > e) { set_err(a, LGC_POISON_EPOCH_MISMATCH, e, v, v, e); break; }
-            if (!err_clear(a)) break;                                               // ERR set elsewhere (propagated or local): leave, no second set
+#if LG_POLL_BATCH == 1
+            if (ez) break;                                                          // ERR set elsewhere (propagated or local): leave, no second set
+#elif LG_POLL_BATCH == 2
+            if ((++it & 7u) == 0u && !err_clear(a)) break;
+#else
+            if (!err_clear(a)) break;
+#endif
             if (__builtin_amdgcn_s_memrealtime() - t0 >= budget) break;
             __builtin_amdgcn_s_sleep(1);
         }
