@@ -39,7 +39,7 @@ configs/<arch>/<backend>/<op>/<d_type>/<CONFIG_NAME>-<suffix>.json
 | ---- | ------ |
 | `<arch>` | `gfx942`, `gfx950`, `gfx1100`, `gfx1101`, `gfx1150`, `gfx1151`, `gfx1200`, `gfx1201`, `gfx1250` |
 | `<backend>` | `triton` or `gluon` |
-| `<op>` | `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions`, `quant` |
+| `<op>` | `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions`, `quant`, `normalization` |
 | `<d_type>` | `config_name.lower().replace("-", "_")`: `GEMM-AFP4WFP4` → `gemm_afp4wfp4` |
 
 Examples:
@@ -65,6 +65,7 @@ Two config names must not give the same `<d_type>`: `GEMM-FOO-BAR` and
 | `utils/mhc_config_utils.py` | `get_mhc_config`, `get_mhc_post_config` and the other MHC loaders |
 | `utils/tuned_config_utils.py` | `get_tuned_kernel_config`, `autotune_configs` |
 | `utils/quant_config_utils.py` | `get_quant_config` (Gluon quant) |
+| `utils/normalization_config_utils.py` | `get_normalization_config` |
 
 Each function has one home. Do not add re-exports or forwarding wrappers.
 Attention and GMM kernels read their `DEFAULT.json` with
