@@ -168,20 +168,49 @@ def small_exact_cells() -> list[tuple[str, int, str, dict]]:
 
 
 def small_range_rules() -> list[dict]:
-    """The small range rules as dicts {mode, m_min, m_max, m_multiple, vid, params}: the r20 rule over local m 33..64 per mode."""
+    """The small range rules as dicts {mode, m_min, m_max, m_multiple, vid, params, name, note}, per mode (m_multiple 1, disjoint ranges; exact rows win):
+    local m 1..16 on r19 with a COPY of the mode's m=16 params, 17..32 on r19 with a COPY of the m=32 params, 33..64 on r20 (MP64).
+    So eager decode and custom capture lists at ANY local m <= 64 fuse. The shape switches follow the copy: push8 (an M <= 16 shape) only below 17, b_rowsplit /
+    push_halves (M > 16 shapes) only above 16; the generator validates every covered m against the real plan constructor.
+    """
     out = []
     for mode in MODES:
         vid, _p = SMALL_CELLS[(mode, 64)]
-        out.append(
-            {
-                "mode": mode,
-                "m_min": SMALL_R20_RULE_M[0],
-                "m_max": SMALL_R20_RULE_M[1],
-                "m_multiple": 1,
-                "vid": vid,
-                "params": small_r20_params(mode),
-            }
-        )
+        for lo, hi, params, label, note in (
+            (
+                1,
+                16,
+                small_cell_params(mode, 64),
+                "r19_m1-16",
+                "copy of the mode's m=16 params (r19); exact rows win at m 1, 2, 4, 8, 12, 16",
+            ),
+            (
+                17,
+                32,
+                small_cell_params(mode, 128),
+                "r19_m17-32",
+                "copy of the mode's m=32 params (r19); exact row wins at m=32",
+            ),
+            (
+                SMALL_R20_RULE_M[0],
+                SMALL_R20_RULE_M[1],
+                small_r20_params(mode),
+                f"mp64_m{SMALL_R20_RULE_M[0]}-{SMALL_R20_RULE_M[1]}",
+                "R13 MP64 (src r20), any padded T = 4 m in 132..256; m=64 (T=256, the default capture bucket) is an exact row",
+            ),
+        ):
+            out.append(
+                {
+                    "mode": mode,
+                    "m_min": lo,
+                    "m_max": hi,
+                    "m_multiple": 1,
+                    "vid": vid,
+                    "params": params,
+                    "name": f"{mode}_{label}",
+                    "note": note,
+                }
+            )
     return out
 
 

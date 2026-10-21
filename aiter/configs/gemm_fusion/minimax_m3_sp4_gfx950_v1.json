@@ -1758,6 +1758,44 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
+      "m_min": 1,
+      "m_max": 16,
+      "m_multiple": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1
+      },
+      "name": "dense_r19_m1-16",
+      "note": "copy of the mode's m=16 params (r19); exact rows win at m 1, 2, 4, 8, 12, 16"
+    },
+    {
+      "sig": "50b7acf9943802c2",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 17,
+      "m_max": 32,
+      "m_multiple": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "b_rowsplit": 1,
+        "rx_bypass": 1
+      },
+      "name": "dense_r19_m17-32",
+      "note": "copy of the mode's m=32 params (r19); exact row wins at m=32"
+    },
+    {
+      "sig": "50b7acf9943802c2",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
       "m_min": 33,
       "m_max": 64,
       "m_multiple": 1,
@@ -1770,7 +1808,44 @@
         "rx_bypass": 1
       },
       "name": "dense_mp64_m33-64",
-      "note": "R13 MP64 (src r20): local m 33..64, any padded T = 4 m in 132..256; m=64 (T=256, the default capture bucket) is an exact row"
+      "note": "R13 MP64 (src r20), any padded T = 4 m in 132..256; m=64 (T=256, the default capture bucket) is an exact row"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 1,
+      "m_max": 16,
+      "m_multiple": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "push8": 1
+      },
+      "name": "indexer_r19_m1-16",
+      "note": "copy of the mode's m=16 params (r19); exact rows win at m 1, 2, 4, 8, 12, 16"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 17,
+      "m_max": 32,
+      "m_multiple": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1
+      },
+      "name": "indexer_r19_m17-32",
+      "note": "copy of the mode's m=32 params (r19); exact row wins at m=32"
     },
     {
       "sig": "9b114a3a8b31ec50",
@@ -1789,7 +1864,45 @@
         "rx_bypass": 1
       },
       "name": "indexer_mp64_m33-64",
-      "note": "R13 MP64 (src r20): local m 33..64, any padded T = 4 m in 132..256; m=64 (T=256, the default capture bucket) is an exact row"
+      "note": "R13 MP64 (src r20), any padded T = 4 m in 132..256; m=64 (T=256, the default capture bucket) is an exact row"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 1,
+      "m_max": 16,
+      "m_multiple": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "reuse_no_idx": 1
+      },
+      "name": "reuse_r19_m1-16",
+      "note": "copy of the mode's m=16 params (r19); exact rows win at m 1, 2, 4, 8, 12, 16"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 17,
+      "m_max": 32,
+      "m_multiple": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "push_halves": 1
+      },
+      "name": "reuse_r19_m17-32",
+      "note": "copy of the mode's m=32 params (r19); exact row wins at m=32"
     },
     {
       "sig": "46e08c40c4ec4374",
@@ -1808,7 +1921,7 @@
         "rx_bypass": 1
       },
       "name": "reuse_mp64_m33-64",
-      "note": "R13 MP64 (src r20): local m 33..64, any padded T = 4 m in 132..256; m=64 (T=256, the default capture bucket) is an exact row"
+      "note": "R13 MP64 (src r20), any padded T = 4 m in 132..256; m=64 (T=256, the default capture bucket) is an exact row"
     },
     {
       "sig": "15f0490f0df1d837",

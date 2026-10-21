@@ -258,8 +258,8 @@ def test_small_variant_registers_and_contract(monkeypatch):
         PROFILE,
     )
     assert n == 2 and plan.params["reuse_no_idx"] == 1
-    # not a validated cell -> native (m=48 is NOT: the r20 rule covers 33..64, see below; m=24 has no row and m 65..255 is native by design)
-    for m_native in (24, 65, 100, 128, 255):
+    # not a validated cell -> native (m 1..64 all fuse: rows + the r19 / r20 rules; m 65..255 is native by design, incl. the default bucket m=128)
+    for m_native in (65, 100, 128, 255):
         assert match_prefix(
             spec, MatchCtx("gfx950", 256, 4, m_native, frozenset({"mori_cco"})), PROFILE
         ) == (None, 0), m_native

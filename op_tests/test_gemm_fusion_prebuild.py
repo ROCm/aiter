@@ -174,9 +174,9 @@ def test_row_mode_recovery_and_unknown_rows_are_skipped_not_errors(jit_root):
         "reuse": 29,
     }
     assert Counter(pb.row_mode(r) for r in prof.rules()) == {
-        "dense": 4,
-        "indexer": 4,
-        "reuse": 4,
+        "dense": 6,  # per mode: 3 chunks-mod-4 large layers + 3 small ranges (r19 1..16, r19 17..32, r20 33..64)
+        "indexer": 6,
+        "reuse": 6,
     }  # 3 chunks-mod-4 layers + 1 MP64 rule per mode
     first = prof.rows()[0]
     bad = Row(

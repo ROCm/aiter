@@ -427,11 +427,10 @@ def test_KEY_every_profile_key_of_the_shipped_profile_has_a_distinct_nonzero_cal
         28672,
     } <= tokens  # ... and the m values the range rules add (m = 1024..8192 step 256, tokens = 4 m)
     n_entries = len({(k[2], k[1], k[3]) for k in keys})
-    # the key has no mode: dense and indexer at the same token count are the same key (a site is one mode). 39 small token counts (m = 1, 2, 4, 8, 12, 16, 32 and the 32
-    # values 33..64 of the MP64 rule) + 29 large (m = 1024..8192 step 256)
+    # the key has no mode: dense and indexer at the same token count are the same key (a site is one mode). 64 small token counts (every local m 1..64: the exact rows plus
+    # the r19 rules over 1..16 / 17..32 and the MP64 rule over 33..64) + 29 large (m = 1024..8192 step 256)
     assert (
-        len(keys) == n_entries * len(MODEL_SITES + DRAFT_SITES)
-        and n_entries == 7 + 32 + 29
+        len(keys) == n_entries * len(MODEL_SITES + DRAFT_SITES) and n_entries == 64 + 29
     )
     rep = callid.check_profile_call_ids(prof, MODEL_SITES + DRAFT_SITES, world=4)
     assert (

@@ -506,12 +506,12 @@ CAPS = frozenset({"mori_cco", "sdma"})
 def test_shipped_profile_rules_are_signature_checked_and_match_the_generator():
     clear_profile_cache()
     prof = profmod.load_profile(PROFILE)
-    assert len(prof) == 24 + 87 and len(prof.rules()) == 12
+    assert len(prof) == 24 + 87 and len(prof.rules()) == 18
     large_rules = [r for r in prof.rules() if r.vid == "sp_qkv.large.v1"]
     small_rules = [r for r in prof.rules() if r.vid == "sp_qkv.small.v1"]
     assert (
-        len(large_rules) == 9 and len(small_rules) == 3
-    )  # 3 chunks-mod-4 layers x 3 modes; one MP64 (r20) rule per mode
+        len(large_rules) == 9 and len(small_rules) == 9
+    )  # 3 chunks-mod-4 layers x 3 modes; per mode 3 small ranges: r19 1..16, r19 17..32, r20 (MP64) 33..64
     sigs = {
         specs.sp_qkv_spec(m).prefix(1).signature(): m for m in specs.MODES
     }  # large plans cover GEMM + SPExchange only
@@ -534,12 +534,15 @@ def test_shipped_profile_rules_are_signature_checked_and_match_the_generator():
     }  # the small plans cover the whole 2-stage spec
     for r in small_rules:
         assert r.sig in sigs2 and (r.arch, r.cu, r.world) == ("gfx950", 256, 4)
-        assert (r.m_min, r.m_max, r.m_multiple) == (33, 64, 1) and "mp64" in r.name
-        assert dict(r.params) == specs.small_r20_params(sigs2[r.sig])
+        assert (r.m_min, r.m_max) in ((1, 16), (17, 32), (33, 64)) and r.m_multiple == 1
         assert pb.row_mode(r) == sigs2[r.sig]
-    assert {r.sig for r in small_rules} == set(
-        sigs2
-    )  # one per mode; a large rule never shares a signature with a small row/rule
+        assert ("mp64" in r.name) == (r.m_min == 33)
+        assert dict(r.params)["src"] == ("r20" if r.m_min == 33 else "r19")
+        if r.m_min == 33:
+            assert dict(r.params) == specs.small_r20_params(sigs2[r.sig])
+    assert {r.sig for r in small_rules} == set(sigs2) and all(
+        sum(1 for r in small_rules if r.sig == sg) == 3 for sg in sigs2
+    )  # three disjoint ranges per mode; a large rule never shares a signature with a small row/rule
     small_sigs = {r.sig for r in prof.rows() if r.vid == "sp_qkv.small.v1"}
     assert small_sigs.isdisjoint({r.sig for r in large_rules})
     # the file is exactly what the generator writes (rules included): regenerate with op_tests/gen_gemm_fusion_profile.py
@@ -632,9 +635,14 @@ def test_off_grid_and_out_of_range_m_stay_native_and_small_m_is_unaffected(
             PROFILE,
         )
         assert n == 2 and plan.vid == "sp_qkv.small.v1" and plan.profile_source == "row"
-    assert match_prefix(
-        specs.sp_qkv_spec("dense"), MatchCtx("gfx950", 256, 4, 24, CAPS), PROFILE
-    ) == (None, 0)
+    p24, n24 = match_prefix(
+        specs.sp_qkv_spec("dense"),
+        MatchCtx("gfx950", 256, 4, 24, CAPS | {"gfx950_sc_bypass"}),
+        PROFILE,
+    )
+    assert (
+        n24 == 2 and p24.profile_source == "rule" and p24.src == "r19"
+    )  # no exact row at m=24: the r19 rule over 17..32 fuses it
     # another cu / world: no rule
     assert match_prefix(
         specs.sp_qkv_spec("dense"), MatchCtx("gfx950", 304, 4, 1024, CAPS), PROFILE
@@ -724,19 +732,15 @@ def test_a_rule_with_a_new_build_param_adds_exactly_the_units_it_implies(jit_roo
     shipped = json.loads(Path(profmod._resolve(PROFILE)).read_text(encoding="utf-8"))
     only_rules = parse_profile({"profile": "r", "rows": [], "rules": shipped["rules"]})
     u2, _ = _units(only_rules)
-    assert sorted(u.kind for u in u2) == [
-        "gf_comm",
-        "sp_qkv.large.v1",
-        "sp_qkv.large.v1",
-        "sp_qkv.small.v1",
-        "sp_qkv.small.v1",
-        "sp_qkv.small.v1",
-    ]  # dense + indexer large builds (reuse shares dense) + the 3 r20 (MP64) small builds of the small rules, no small rows
+    assert (
+        sorted(u.kind for u in u2)
+        == ["gf_comm"] + ["sp_qkv.large.v1"] * 2 + ["sp_qkv.small.v1"] * 9
+    )  # dense + indexer large builds (reuse shares dense) + the 9 small builds the small rules imply (6 r19 + 3 r20), no small rows
     # filters apply to rules like to rows
     assert (
         _units(only_rules, cu=304)[0] == []
         and _units(only_rules, arch="gfx942")[0] == []
-        and len(_units(only_rules, world=4)[0]) == 6
+        and len(_units(only_rules, world=4)[0]) == 12
     )
 
 
@@ -888,7 +892,7 @@ def test_mp64_rule_covers_33_to_64_every_m_on_r20_and_the_exact_row_wins_at_64(
 
 
 def test_everything_else_is_explicitly_native(sp_qkv_catalog):
-    """m 65..255 (T 260..1020, incl. the default bucket T=512) and 256..1023 have no fused path; so do the m <= 32 values no row covers (e.g. 20, 24, 28)."""
+    """m 65..255 (T 260..1020, incl. the default bucket T=512) and 256..1023 have no fused path (every m <= 64 fuses: see the test below)."""
     clear_profile_cache()
     prof = profmod.load_profile(PROFILE)
     ranges = prof.meta["native_m_ranges"]
@@ -901,14 +905,64 @@ def test_everything_else_is_explicitly_native(sp_qkv_catalog):
                 mode,
                 m,
             )  # the full spec: neither the 2-stage nor the 1-stage (large) prefix has an entry
-        for m in (3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 17, 20, 24, 28, 31):
-            assert _small_at(mode, m) == (None, 0), (
-                mode,
-                m,
-            )  # no row: native (the default capture list never produces them)
     # the documented native range is also free of rows AND rules
     assert not any(65 <= r.m <= 255 for r in prof.rows())
     assert all(not (r.m_min <= 255 and r.m_max >= 65) for r in prof.rules())
+
+
+def test_every_local_m_up_to_64_fuses_and_the_shape_switches_follow_their_m_limits(
+    sp_qkv_catalog,
+):
+    """Exact rows at m 1, 2, 4, 8, 12, 16, 32, 64; r19 rules fill 1..16 (copy of the m16 params) and 17..32 (copy of the m32 params), r20 fills 33..64: so eager decode and
+    custom capture lists at ANY m <= 64 fuse. push8 (an M <= 16 shape) must never be applied above 16, b_rowsplit / push_halves (M > 16 shapes) never at or below 16.
+    """
+    clear_profile_cache()
+    prof = profmod.load_profile(PROFILE)
+    exact = {1, 2, 4, 8, 12, 16, 32, 64}
+    for mode in specs.MODES:
+        sig = specs.sp_qkv_spec(mode).signature()
+        p16 = dict(prof.lookup(sig, "gfx950", 256, 4, 16).params)
+        p32 = dict(prof.lookup(sig, "gfx950", 256, 4, 32).params)
+        sources = {"row": 0, "rule": 0}
+        for m in range(1, 65):
+            plan, n = _small_at(mode, m)
+            assert plan is not None and n == 2 and plan.vid == "sp_qkv.small.v1", (
+                mode,
+                m,
+            )
+            assert plan.profile_source == ("row" if m in exact else "rule"), (mode, m)
+            sources[plan.profile_source] += 1
+            want = p16 if m <= 16 else p32 if m <= 32 else specs.small_r20_params(mode)
+            assert dict(plan.params) == want, (mode, m)
+            assert plan.src == ("r19" if m <= 32 else "r20") and plan.mp == (
+                32 if m <= 32 else 64
+            )
+            if plan.params.get("push8"):
+                assert m <= 16, (mode, m, "push8 applied above 16")
+            if plan.params.get("b_rowsplit") or plan.params.get("push_halves"):
+                assert m > 16, (mode, m, "an M > 16 shape applied at or below 16")
+        assert sources == {
+            "row": 8,
+            "rule": 56,
+        }  # 64 values: 8 exact rows, every other m through a rule
+        # the shape limits are enforced by the plan itself (not only by the profile): the copy params at the wrong M are refused
+        from aiter.gemm_fusion import ContractError
+
+        v = sys.modules["aiter.ops.gemm_fusion.sp_qkv.variants"]
+        if p16.get("push8"):
+            with pytest.raises(ContractError, match="push8 build supports M<=16"):
+                v.SpQkvSmall(
+                    specs.sp_qkv_spec(mode),
+                    p16,
+                    MatchCtx("gfx950", 256, 4, 17, SMALL_CAPS),
+                )
+        if p32.get("b_rowsplit"):
+            with pytest.raises(ContractError, match="b_rowsplit build supports M>16"):
+                v.SpQkvSmall(
+                    specs.sp_qkv_spec(mode),
+                    p32,
+                    MatchCtx("gfx950", 256, 4, 16, SMALL_CAPS),
+                )
 
 
 def test_p2_rows_add_no_unit_and_the_r20_rows_and_rule_imply_three_small_units(

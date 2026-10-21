@@ -69,8 +69,9 @@ def build_rows():
 
 
 def build_small_rules():
-    """The r20 (MP64) range rule per mode over local m 33..64 (every m): consulted only where no exact row exists (m=64 is exact). Every covered m is validated against the
-    real plan constructor."""
+    """The small range rules per mode (specs.small_range_rules: r19 over m 1..16 and 17..32, r20 over 33..64; every m): consulted only where no exact row exists. Every
+    covered m is validated against the real plan constructor (push8 above 16, b_rowsplit at or below 16 and an r20 build without the bypass would be refused).
+    """
     rules = []
     for r in specs.small_range_rules():
         mode = r["mode"]
@@ -87,8 +88,8 @@ def build_small_rules():
                 "m_multiple": r["m_multiple"],
                 "vid": r["vid"],
                 "params": dict(r["params"]),
-                "name": f"{mode}_mp64_m{r['m_min']}-{r['m_max']}",
-                "note": "R13 MP64 (src r20): local m 33..64, any padded T = 4 m in 132..256; m=64 (T=256, the default capture bucket) is an exact row",
+                "name": r["name"],
+                "note": r["note"],
             }
         )
     return rules
