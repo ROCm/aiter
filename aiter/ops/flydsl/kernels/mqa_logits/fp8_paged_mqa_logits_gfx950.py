@@ -514,9 +514,10 @@ def flydsl_fp8_paged_mqa_logits(
     - ``[B]``: the full length ``L_b`` of request ``b``, including its ``next_n``
       query tokens, or
     - ``(B, next_n)``: row ``b`` is ``[L_b - next_n + 1, ..., L_b]``, the layout
-      vLLM builds. Only the last column is read: query row ``j``
-      (``0 <= j < next_n``) attends to KV positions ``[0, L_b - next_n + 1 + j)``,
-      so other row values are not supported.
+      vLLM builds. Only the last column is read: query row ``j`` attends to KV
+      positions ``[0, L_b - n_b + 1 + j)``, where ``n_b`` is the number of live
+      rows (``min(next_n_lens[b], next_n)`` when ``next_n_lens`` is given, else
+      ``next_n``), so other row values are not supported.
 
     ``(B, 1)`` is the same as ``[B]``. Anything else raises ``ValueError``; a
     strided tensor is rejected rather than copied.
