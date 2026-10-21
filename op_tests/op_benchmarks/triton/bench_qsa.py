@@ -10,17 +10,28 @@ Shapes from Qwen3.8-Flash-Next-120B:
 Usage:
     python op_tests/op_benchmarks/triton/bench_qsa.py
     python op_tests/op_benchmarks/triton/bench_qsa.py --op select
-    python op_tests/op_benchmarks/triton/bench_qsa.py --op gqa -metric bandwidth
+    python op_tests/op_benchmarks/triton/bench_qsa.py --op gqa --
+    metric bandwidth
 """
 
-import argparse
+import functools
 
 import torch
 import triton
 
 from aiter.ops.qsa import qsa_select_paged_tokens
 from aiter.ops.triton.attention.qsa import qsa_sparse_paged_gqa
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+    override_parser_action,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
+    get_caller_name_no_ext,
+)
 
 # Qwen3.8-Flash-Next-120B model config
 BLOCK_SIZE = 64
@@ -87,20 +98,36 @@ def _make_scenario(batch, tokens_per_seq, context_len):
         device="cuda",
     )
     values = torch.randn_like(keys)
-    return {
-        "positions": positions,
-        "tables": tables,
-        "requests": requests,
-        "lengths": lengths,
-        "index_q": index_q,
-        "compressed": compressed,
-        "query": query,
-        "keys": keys,
-        "values": values,
-        "rows": rows,
-        "total_pages": total_pages,
-        "pages_per_req": pages_per_req,
-    }
+    return (
+        positions,
+        tables,
+        requests,
+        lengths,
+        index_q,
+        compressed,
+        query,
+        keys,
+        values,
+        rows,
+        total_pages,
+        pages_per_req,
+    )
+
+
+_SCENARIO_POOL_FIELDS = [
+    "positions",
+    "tables",
+    "requests",
+    "lengths",
+    "index_q",
+    "compressed",
+    "query",
+    "keys",
+    "values",
+    "rows",
+    "total_pages",
+    "pages_per_req",
+]
 
 
 # -- qsa_select_paged_tokens (scoring + topk + expand) --------------------
@@ -125,8 +152,16 @@ _SELECT_SHAPES = [
 ]
 
 
+def _select_kernel_fn(index_q, compressed, tables, requests, positions, lengths, **_):
+    qsa_select_paged_tokens(
+        index_q, compressed, tables, requests, positions, lengths, BUDGET, RATIO
+    )
+
+
 def bench_select(args):
     unit = "ms" if args.metric == "time" else "GB/s"
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     config = triton.testing.Benchmark(
         x_names=["batch", "tokens_per_seq", "context_len"],
@@ -143,23 +178,23 @@ def bench_select(args):
     @triton.testing.perf_report([config])
     def _run(batch, tokens_per_seq, context_len, provider):
         torch.manual_seed(42)
-        s = _make_scenario(batch, tokens_per_seq, context_len)
-        columns = s["pages_per_req"] * COMPRESSED_PAGE_SIZE
-        rows = s["rows"]
+        pool_gen = functools.partial(_make_scenario, batch, tokens_per_seq, context_len)
+        rot_bufs = generate_rotating_buffers_pool(
+            [pool_gen],
+            [_SCENARIO_POOL_FIELDS],
+            # _select_kernel_fn never reads keys/values -- _make_scenario only
+            # builds them because bench_gqa's generator reuses it. Counting
+            # their full paged-capacity size here would undersize pool_len
+            # for what select actually touches (its own full read of
+            # compressed, scored over every page).
+            exclude_from_sizing=["keys", "values"],
+            **kwargs_rot_bufs,
+        )
+        columns = rot_bufs[0]["pages_per_req"] * COMPRESSED_PAGE_SIZE
+        rows = rot_bufs[0]["rows"]
         elem = 2  # bf16
 
-        fn = lambda: qsa_select_paged_tokens(
-            s["index_q"],
-            s["compressed"],
-            s["tables"],
-            s["requests"],
-            s["positions"],
-            s["lengths"],
-            BUDGET,
-            RATIO,
-        )
-
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+        ms = do_bench_aiter_triton(_select_kernel_fn, rot_bufs, **kwargs_do_bench_graph)
         if args.metric == "time":
             return ms
         mem = (
@@ -196,8 +231,75 @@ _GQA_SHAPES = [
 ]
 
 
+def _generate_gqa_pool_entry(batch, tokens_per_seq, context_len):
+    """One scenario plus its (untimed) selected-token indices.
+
+    qsa_sparse_paged_gqa needs qsa_select_paged_tokens' output as input, so
+    each pool entry primes it the same way moe2 is primed by moe1's output in
+    the MoE benchmarks: one untimed call ahead of time, per entry.
+    """
+    (
+        positions,
+        tables,
+        requests,
+        lengths,
+        index_q,
+        compressed,
+        query,
+        keys,
+        values,
+        rows,
+        total_pages,
+        pages_per_req,
+    ) = _make_scenario(batch, tokens_per_seq, context_len)
+    selected = qsa_select_paged_tokens(
+        index_q, compressed, tables, requests, positions, lengths, BUDGET, RATIO
+    )
+    return (
+        query,
+        keys,
+        values,
+        selected,
+        tables,
+        requests,
+        rows,
+        total_pages,
+        pages_per_req,
+    )
+
+
+_GQA_POOL_FIELDS = [
+    "query",
+    "keys",
+    "values",
+    "selected",
+    "tables",
+    "requests",
+    "rows",
+    "total_pages",
+    "pages_per_req",
+]
+
+
+def _make_gqa_kernel_fn(batch, tokens_per_seq):
+    def kernel_fn(query, keys, values, selected, tables, requests, **_):
+        qsa_sparse_paged_gqa(
+            query,
+            keys,
+            values,
+            selected,
+            tables,
+            requests,
+            num_decode_requests=batch if tokens_per_seq == 1 else None,
+        )
+
+    return kernel_fn
+
+
 def bench_gqa(args):
     unit = "ms" if args.metric == "time" else "GB/s"
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     config = triton.testing.Benchmark(
         x_names=["batch", "tokens_per_seq", "context_len"],
@@ -214,33 +316,27 @@ def bench_gqa(args):
     @triton.testing.perf_report([config])
     def _run(batch, tokens_per_seq, context_len, provider):
         torch.manual_seed(42)
-        s = _make_scenario(batch, tokens_per_seq, context_len)
-        rows = s["rows"]
+        pool_gen = functools.partial(
+            _generate_gqa_pool_entry, batch, tokens_per_seq, context_len
+        )
+        rot_bufs = generate_rotating_buffers_pool(
+            [pool_gen],
+            [_GQA_POOL_FIELDS],
+            # qsa_sparse_paged_gqa gathers only `selected`'s topk rows out of
+            # keys/values' full paged capacity, so their allocated size
+            # (proportional to context_len) way overstates what one call
+            # touches (proportional to BUDGET). Counting the full capacity
+            # here would undersize pool_len relative to the real gather
+            # footprint, defeating the point of rotating through the pool.
+            exclude_from_sizing=["keys", "values"],
+            **kwargs_rot_bufs,
+        )
+        rows = rot_bufs[0]["rows"]
+        topk = rot_bufs[0]["selected"].shape[1]
         elem = 2  # bf16
 
-        selected = qsa_select_paged_tokens(
-            s["index_q"],
-            s["compressed"],
-            s["tables"],
-            s["requests"],
-            s["positions"],
-            s["lengths"],
-            BUDGET,
-            RATIO,
-        )
-        topk = selected.shape[1]
-
-        fn = lambda: qsa_sparse_paged_gqa(
-            s["query"],
-            s["keys"],
-            s["values"],
-            selected,
-            s["tables"],
-            s["requests"],
-            num_decode_requests=batch if tokens_per_seq == 1 else None,
-        )
-
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+        kernel_fn = _make_gqa_kernel_fn(batch, tokens_per_seq)
+        ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
         if args.metric == "time":
             return ms
         mem = (
@@ -258,19 +354,15 @@ def bench_gqa(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(prog="Benchmark QSA", allow_abbrev=False)
+    parser = get_parser(kernel_name="QSA")
+    override_parser_action(
+        parser, action="--metric", choices=["time", "bandwidth"], default="time"
+    )
     parser.add_argument(
         "--op",
         choices=["select", "gqa", "all"],
         default="all",
         help="Which op to benchmark (default: all)",
-    )
-    parser.add_argument(
-        "-metric",
-        nargs="?",
-        const="time",
-        choices=["time", "bandwidth"],
-        default="time",
     )
     parser.add_argument("-o", action="store_true", default=False)
     return parser.parse_args()

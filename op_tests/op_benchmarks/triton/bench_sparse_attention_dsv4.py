@@ -26,7 +26,16 @@ from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
 )
 from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
 from aiter.ops.triton.utils._triton import arch_info
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+    override_parser_action,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
+)
 
 # The Gluon prefill kernel is opt-in (gfx950 + Triton >= 3.6). Probe it once at
 # import time; the benchmark falls back to Triton-only when unavailable.
@@ -200,42 +209,34 @@ def _launch_prefill(
 # ---------------------------------------------------------------------------
 # Benchmark drivers
 # ---------------------------------------------------------------------------
-def _bench(fn, *, warmup=5, reps=50):
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
+def _generate_prefill_pool_inputs(num_queries, num_heads, num_kv, topk, device):
+    """Build one request: fresh Q, KV pool, and CSR topk-slot lists.
 
-    ev0 = torch.cuda.Event(enable_timing=True)
-    ev1 = torch.cuda.Event(enable_timing=True)
-    ev0.record()
-    for _ in range(reps):
-        fn()
-    ev1.record()
-    torch.cuda.synchronize()
-    return ev0.elapsed_time(ev1) / reps
-
-
-def _time_backend(backend, q, kv, indices, indptr, num_queries, num_heads, scale):
-    """Compile + time one backend; returns its mean per-call latency in ms."""
-    attn_sink = torch.empty(1, device=q.device, dtype=torch.float32)
-    out = torch.empty_like(q)
-    _launch_prefill(
-        backend,
-        q,
-        kv,
-        indices,
-        indptr,
-        out,
-        num_queries,
-        num_heads,
-        HEAD_DIM,
-        False,
-        attn_sink,
-        scale,
+    Pure setup, not measured. Each call is one rotating-buffer pool entry:
+    independent random Q/KV/indices, so replaying through the pool during
+    timing defeats cache residency instead of timing one lucky/unlucky draw
+    repeatedly.
+    """
+    q = torch.randn(
+        num_queries, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
     )
-    torch.cuda.synchronize()
-    return _bench(
-        lambda: _launch_prefill(
+    kv = _alloc_kv(num_kv, device)
+    indices, indptr, _ = _build_csr(num_queries, num_kv, topk, device)
+    out = torch.empty_like(q)
+    attn_sink = torch.empty(1, device=device, dtype=torch.float32)
+    return q, kv, indices, indptr, out, attn_sink
+
+
+_PREFILL_POOL_FIELDS = ["q", "kv", "indices", "indptr", "out", "attn_sink"]
+
+
+def _time_backend(
+    backend, rot_bufs, num_queries, num_heads, scale, kwargs_do_bench_graph
+):
+    """Time one backend over the shared rotating pool; returns mean per-call ms."""
+
+    def kernel_fn(q, kv, indices, indptr, out, attn_sink):
+        _launch_prefill(
             backend,
             q,
             kv,
@@ -249,29 +250,38 @@ def _time_backend(backend, q, kv, indices, indptr, num_queries, num_heads, scale
             attn_sink,
             scale,
         )
-    )
+
+    return do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
 
 
 def run_prefill_bench(args, device: str):
     print("\n========== PREFILL ==========")
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
     rows = []
     for cfg in args.prefill_cfgs:
         num_queries, num_heads, num_kv, topk = cfg
         torch.manual_seed(0)
-        q = torch.randn(
-            num_queries, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
-        )
-        kv = _alloc_kv(num_kv, device)
-        indices, indptr, _ = _build_csr(num_queries, num_kv, topk, device)
-        nnz = int(indptr[-1].item())  # number of non-zeros
         scale = 1.0 / (HEAD_DIM**0.5)
+
+        # Shared across all three backends so the comparison stays apples to
+        # apples. _alloc_kv pads every entry to >2 GiB (Triton's AMD buffer-op
+        # specialization boundary), so keep the floor small.
+        pool_gen = functools.partial(
+            _generate_prefill_pool_inputs, num_queries, num_heads, num_kv, topk, device
+        )
+        rot_bufs = generate_rotating_buffers_pool(
+            [pool_gen], [_PREFILL_POOL_FIELDS], **kwargs_rot_bufs
+        )
+        sample = rot_bufs[0]
+        nnz = int(sample["indptr"][-1].item())  # number of non-zeros
 
         # FLOPS: per query, for each of `nnz` K positions, 2*H*D for QK + 2*H*D for PV.
         flops = 4.0 * num_heads * HEAD_DIM * nnz
         # Bytes: Q [Q,H,D] + KV gather [nnz, D] + out [Q,H,D]
         bytes_moved = (
-            q.numel() * q.element_size()
-            + nnz * HEAD_DIM * kv.element_size()
+            sample["q"].numel() * sample["q"].element_size()
+            + nnz * HEAD_DIM * sample["kv"].element_size()
             + num_queries * num_heads * HEAD_DIM * 2
         )
 
@@ -279,18 +289,23 @@ def run_prefill_bench(args, device: str):
             return flops / (ms * 1e-3) / 1e12, bytes_moved / (ms * 1e-3) / 1e9
 
         tri_ms = _time_backend(
-            "triton", q, kv, indices, indptr, num_queries, num_heads, scale
+            "triton", rot_bufs, num_queries, num_heads, scale, kwargs_do_bench_graph
         )
         tri_tflops, tri_gbps = _perf(tri_ms)
         pa_ms = _time_backend(
-            "pa_prefill_sparse", q, kv, indices, indptr, num_queries, num_heads, scale
+            "pa_prefill_sparse",
+            rot_bufs,
+            num_queries,
+            num_heads,
+            scale,
+            kwargs_do_bench_graph,
         )
         pa_tflops, _pa_gbps = _perf(pa_ms)
         pa_cols = (pa_ms, pa_tflops, f"{tri_ms / pa_ms:.2f}x")
 
         if HAS_GLUON:
             glu_ms = _time_backend(
-                "gluon", q, kv, indices, indptr, num_queries, num_heads, scale
+                "gluon", rot_bufs, num_queries, num_heads, scale, kwargs_do_bench_graph
             )
             glu_tflops, _glu_gbps = _perf(glu_ms)
             speedup = tri_ms / glu_ms if glu_ms > 0 else float("nan")
@@ -422,6 +437,9 @@ def check_correctness(device: str):
 
 def _parse_args():
     p = get_parser(kernel_name="Sparse Attention DSV4")
+    # _alloc_kv pads every pool entry to >2 GiB (Triton's AMD buffer-op
+    # specialization boundary), so default to a smaller floor than the shared 4.
+    override_parser_action(p, action="--rot-bufs-min-pool-len", default=2)
     p.add_argument(
         "--shapes",
         choices=["all", "prefill"],
