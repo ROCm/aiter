@@ -3908,3 +3908,52 @@ if __name__ == "__main__":
             dtype=dtype,
             seed=42,
         )
+
+
+_VIRTUAL_SINK_CASES = [
+    (1, -1, True),
+    (1, 8, True),
+    (1, 1, True),
+    (2, -1, True),
+    (1, -1, False),
+]
+
+
+@pytest.mark.parametrize("qo_len,window_left,with_sink", _VIRTUAL_SINK_CASES)
+def test_batch_prefill_virtual_sink(qo_len, window_left, with_sink):
+    kv_len, num_heads, head_dim = 4, 8, 128
+    q = torch.zeros((qo_len, num_heads, head_dim), dtype=torch.bfloat16, device="cuda")
+    k = torch.zeros((kv_len, 1, head_dim), dtype=q.dtype, device=q.device)
+    v = torch.ones_like(k)
+    sink = (
+        torch.full((num_heads,), math.log(kv_len), dtype=torch.float32, device=q.device)
+        if with_sink
+        else None
+    )
+    out = aiter.mha_batch_prefill_func(
+        q,
+        k,
+        v,
+        torch.tensor([0, qo_len], dtype=torch.int32, device=q.device),
+        torch.tensor([0, kv_len], dtype=torch.int32, device=q.device),
+        torch.arange(kv_len, dtype=torch.int32, device=q.device),
+        max_seqlen_q=qo_len,
+        max_seqlen_k=kv_len,
+        causal=True,
+        window_size=(window_left, -1),
+        sink_ptr=sink,
+    )
+    expected = ref_masked_attention_with_sink(
+        q,
+        k.expand(-1, num_heads, -1),
+        v.expand(-1, num_heads, -1),
+        window_left,
+        0,
+        sink,
+    )
+    torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-3)
+
+
+if __name__ == "__main__":
+    for case in _VIRTUAL_SINK_CASES:
+        test_batch_prefill_virtual_sink(*case)
