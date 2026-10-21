@@ -69,20 +69,7 @@ class FakeOp:
         self.events.append("handle-close")
 
 
-@pytest.fixture
-def manager(monkeypatch):
-    FakeCcoCommunicator.reset()
-    FakeOp.events = []
-
-    def init_base(self, cpu_group):
-        self.cpu_group = cpu_group
-        self.rank = 0
-        self.world_size = 4
-        self.internode = False
-
-    monkeypatch.setattr(All2AllManagerBase, "__init__", init_base)
-    monkeypatch.setattr(all2all, "has_mori", lambda: True)
-
+def install_fake_mori_v2_modules(monkeypatch):
     mori_module = ModuleType("mori")
     mori_module.__path__ = []
     cco_module = ModuleType("mori.cco")
@@ -99,12 +86,42 @@ def manager(monkeypatch):
     monkeypatch.setitem(sys.modules, "mori.cco", cco_module)
     monkeypatch.setitem(sys.modules, "mori.ops", ops_module)
     monkeypatch.setitem(sys.modules, "mori.ops.dispatch_combine_v2", v2_module)
+
+
+@pytest.fixture
+def manager(monkeypatch):
+    FakeCcoCommunicator.reset()
+    FakeOp.events = []
+
+    def init_base(self, cpu_group):
+        self.cpu_group = cpu_group
+        self.rank = 0
+        self.world_size = 4
+        self.internode = False
+
+    monkeypatch.setattr(All2AllManagerBase, "__init__", init_base)
+    install_fake_mori_v2_modules(monkeypatch)
     monkeypatch.setattr(
         all2all.torch.distributed,
         "get_global_rank",
         lambda group, group_rank: 17,
     )
     return MoriV2All2AllManager(cpu_group="ep-cpu-group")
+
+
+@pytest.mark.parametrize(
+    "missing_module",
+    ["mori.cco", "mori.ops.dispatch_combine_v2"],
+)
+def test_init_requires_mori_v2_modules(monkeypatch, missing_module):
+    install_fake_mori_v2_modules(monkeypatch)
+    monkeypatch.delitem(sys.modules, missing_module)
+
+    with pytest.raises(
+        ImportError,
+        match=r"MoRI v2 requires 'mori\.cco'.*'mori\.ops\.dispatch_combine_v2'",
+    ):
+        MoriV2All2AllManager(cpu_group="ep-cpu-group")
 
 
 def test_cco_communicator_is_created_collectively_and_reused(manager, monkeypatch):
@@ -254,11 +271,7 @@ def test_destroy_closes_handles_before_communicator(manager, monkeypatch):
         def close(self):
             events.append("handle-close")
 
-    monkeypatch.setattr(
-        sys.modules["mori.ops.dispatch_combine_v2"],
-        "EpDispatchCombineOp",
-        OrderedOp,
-    )
+    monkeypatch.setattr(manager, "_dispatch_op_cls", OrderedOp)
     monkeypatch.setattr(
         all2all.torch.distributed,
         "broadcast_object_list",

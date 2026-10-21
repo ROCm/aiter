@@ -171,14 +171,24 @@ class MoriV2All2AllManager(All2AllManagerBase):
     """
 
     def __init__(self, cpu_group):
-        if not has_mori():
+        try:
+            cco_module = importlib.import_module("mori.cco")
+            dispatch_module = importlib.import_module("mori.ops.dispatch_combine_v2")
+            communicator_cls = cco_module.Communicator
+            config_cls = dispatch_module.EpDispatchCombineConfig
+            op_cls = dispatch_module.EpDispatchCombineOp
+        except (ImportError, AttributeError) as exc:
             raise ImportError(
-                "MoRI kernels not found. Please follow "
+                "MoRI v2 requires 'mori.cco' and "
+                "'mori.ops.dispatch_combine_v2'. Please follow "
                 "https://github.com/ROCm/mori/blob/main/README.md to install "
-                "MoRI kernels."
-            )
+                "a MoRI version with v2 CCO support."
+            ) from exc
 
         super().__init__(cpu_group)
+        self._cco_communicator_cls = communicator_cls
+        self._dispatch_config_cls = config_cls
+        self._dispatch_op_cls = op_cls
         self.handle_cache = Cache()
         self._live_handles: WeakSet = WeakSet()
         self._cco_communicator: Any | None = None
@@ -186,9 +196,7 @@ class MoriV2All2AllManager(All2AllManagerBase):
         self._cco_lock = threading.RLock()
 
     def _create_cco_communicator(self, per_rank_vmm: int):
-        from mori.cco import Communicator
-
-        uid = Communicator.get_unique_id() if self.rank == 0 else None
+        uid = self._cco_communicator_cls.get_unique_id() if self.rank == 0 else None
         objects = [uid]
         root_global_rank = torch.distributed.get_global_rank(self.cpu_group, 0)
         torch.distributed.broadcast_object_list(
@@ -197,7 +205,7 @@ class MoriV2All2AllManager(All2AllManagerBase):
             group=self.cpu_group,
         )
 
-        comm = Communicator.init(
+        comm = self._cco_communicator_cls.init(
             self.world_size,
             self.rank,
             objects[0],
@@ -258,13 +266,8 @@ class MoriV2All2AllManager(All2AllManagerBase):
             return comm
 
     def _make_handle(self, comm, **kwargs):
-        from mori.ops.dispatch_combine_v2 import (
-            EpDispatchCombineConfig,
-            EpDispatchCombineOp,
-        )
-
-        config = EpDispatchCombineConfig(**kwargs)
-        return EpDispatchCombineOp(config, comm)
+        config = self._dispatch_config_cls(**kwargs)
+        return self._dispatch_op_cls(config, comm)
 
     def get_handle(self, kwargs, index: int = 0):
         """Return a cached MORI v2 dispatch/combine op.
