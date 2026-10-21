@@ -948,8 +948,10 @@ def test_k1_row_tile_spanning_requests_gathers_each_requests_pages():
     Every request has its own compressed K on disjoint physical pages, so a
     block that gathers the wrong request's pages, or writes rows of another
     request, selects a different set. Covers MTP decode (four requests of
-    four rows, one block) and a prefill chunk whose last block also holds
-    three decode rows.
+    four rows, one block, and uneven rows whose folded 4-row tiles straddle
+    requests), a prefill chunk whose last block also holds three decode
+    rows, and a batch with 20 rows per request, where each 16-row block walks
+    several column tiles while spanning requests.
     """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
@@ -1020,7 +1022,9 @@ def test_k1_row_tile_spanning_requests_gathers_each_requests_pages():
         _assert_k1_block_ids(ref_ids, got, what)
 
     run([4, 4, 4, 4], "K1 MTP decode block spanning four requests diverged")
+    run([5, 6, 7, 3], "K1 MTP decode with tiles straddling requests diverged")
     run([37, 1, 1, 1], "K1 prefill chunk block holding decode rows diverged")
+    run([60, 1, 20, 1], "K1 multi-tile prefill block holding decode rows diverged")
 
 
 def test_k1_padded_decode_graph_capture():
