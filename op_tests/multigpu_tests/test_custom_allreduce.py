@@ -294,6 +294,19 @@ _LL128_MIXED_SIZES = {
     4: [4 * 8192, 4 * 8192, 28800],
 }
 
+# Back-to-back gfx1250 LL messages of different sizes (bf16 elements), any TP
+# size. The kernel picks 512 threads below 64 KiB and 256 at or above it, and
+# sizes the grid from the message, so these sizes give each packet a different
+# owning block (16, 32 and 1 blocks) from one call to the next.
+_LL_GFX1250_MIXED_SIZES = [32000, 32768, 512]
+
+
+def _is_gfx1250() -> bool:
+    return (
+        torch.cuda.is_available()
+        and "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
+    )
+
 
 def _start_queue_evictions(stop):
     """Repeatedly evict this process's GPU queues so its kernels pause mid-flight.
@@ -320,8 +333,8 @@ def _start_queue_evictions(stop):
     threading.Thread(target=evict, daemon=True).start()
 
 
-def _allreduce_ll128_mixed_size_regression(
-    rank, tp_size, sizes, iterations, distributed_init_method, stop
+def _allreduce_mixed_size_regression(
+    rank, tp_size, sizes, iterations, distributed_init_method, stop, name
 ):
     from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
 
@@ -331,7 +344,7 @@ def _allreduce_ll128_mixed_size_regression(
         "gloo", world_size=tp_size, rank=rank, init_method=distributed_init_method
     )
     ca_comm = CustomAllreduce(dist.group.WORLD, device)
-    assert not ca_comm.disabled, "The LL128 regression requires custom allreduce"
+    assert not ca_comm.disabled, f"The {name} regression requires custom allreduce"
     generator = torch.Generator().manual_seed(2026)
     inputs, refs = [], []
     for n in sizes:
@@ -354,7 +367,7 @@ def _allreduce_ll128_mixed_size_regression(
         while not done.query():
             if time.time() > deadline:
                 if not evicting:
-                    logger.error(f"{rank=} LL128 hang before {iteration=} {sizes=}")
+                    logger.error(f"{rank=} {name} hang before {iteration=} {sizes=}")
                     os._exit(1)
                 logger.warning(f"{rank=} stalled before {iteration=}; stop evicting")
                 stop.set()
@@ -375,14 +388,30 @@ def test_allreduce_ll128_mixed_size_regression(tp_size, iterations=1000):
     sizes = _LL128_MIXED_SIZES.get(tp_size)
     if sizes is None:
         return
+    _run_mixed_size_regression(tp_size, sizes, iterations, "LL128")
+
+
+def test_allreduce_ll_gfx1250_mixed_size_regression(tp_size, iterations=1000):
+    # The gfx1250 LL kernel kept one epoch per block while the grid followed the
+    # message size, so a packet's owning block could reuse a stale epoch and
+    # bank when the size changed, accepting the previous call's lines.
+    if not _is_gfx1250():
+        return
+    _run_mixed_size_regression(
+        tp_size, _LL_GFX1250_MIXED_SIZES, iterations, "gfx1250 LL"
+    )
+
+
+def _run_mixed_size_regression(tp_size, sizes, iterations, name):
     torch.multiprocessing.spawn(
-        _allreduce_ll128_mixed_size_regression,
+        _allreduce_mixed_size_regression,
         args=(
             tp_size,
             sizes,
             iterations,
             get_distributed_init_method(get_ip(), get_open_port()),
             torch.multiprocessing.get_context("spawn").Event(),
+            name,
         ),
         nprocs=tp_size,
         join=True,
@@ -470,7 +499,8 @@ parser.add_argument(
 parser.add_argument(
     "--regression",
     action="store_true",
-    help="run only the correctness checks: tail (eager and graph) and LL128",
+    help="run only the correctness checks: tail (eager and graph), LL128 and "
+    "gfx1250 LL mixed sizes",
 )
 parser.add_argument(
     "--iterations",
@@ -510,6 +540,7 @@ if __name__ == "__main__":
             for tp in _LL128_MIXED_SIZES:
                 if tp <= args.tp_size:
                     test_allreduce_ll128_mixed_size_regression(tp)
+            test_allreduce_ll_gfx1250_mixed_size_regression(args.tp_size)
     if args.regression:
         raise SystemExit(0)
     with_graph = args.mode == "graph"
