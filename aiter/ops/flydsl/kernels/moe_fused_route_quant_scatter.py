@@ -590,11 +590,11 @@ def _pack_block_group_dword(c, e8m0_scale):
     Only the lane holding block 4k ends up with them in the right order; the
     caller predicates on that.
     """
-    v = fx.Int32(e8m0_scale) & fx.Int32(0xFF)
+    v = fx.Int32(e8m0_scale) & 0xFF
     p1 = v.shuffle_xor(c.c4_i32, c.c_wave)
-    half = v | (p1 << fx.Int32(8))
+    half = v | (p1 << 8)
     p2 = half.shuffle_xor(fx.Int32(8), c.c_wave)
-    return half | (p2 << fx.Int32(16))
+    return half | (p2 << 16)
 
 
 def _emit_interleaved_scale_dwords(c, scale_dword, e8m0_scale):
@@ -1530,7 +1530,7 @@ def build_moe_fused_quant_preshuffle_module(
                 # masked_m[expert], so quantizing them is pure waste. With high
                 # capacity-factor padding this elides most of the work.
                 valid = fx.Uint32(ptr_buf_tensor(masked_m)[expert])
-                slot_valid = fx.Uint32(slot) < fx.Uint32(valid)
+                slot_valid = fx.Uint32(slot) < valid
                 if slot_valid:
                     _emit_row()
             else:
@@ -1735,7 +1735,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
             m_p = ptr_buf_tensor(masked_m)
             p_p = ptr_buf_tensor(psum_out)
             first_route = bid * fx.Uint32(warps_per_block)
-            scan_block = (bid == fx.Uint32(0)) | (first_route < valid_route_count)
+            scan_block = (bid == 0) | (first_route < valid_route_count)
             if scan_block:
                 tile_v = fx.Uint32(tile_m)
                 tile_minus_1 = tile_v - 1
@@ -1757,9 +1757,9 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                         dst[tid] = val + prev
                     gpu.barrier()
                     src, dst = dst, src
-                is_writer = bid == fx.Uint32(0)
+                is_writer = bid == 0
                 if const_expr(ksplit):
-                    is_writer = is_writer & (fx.Uint32(fx.block_idx.y) == fx.Uint32(0))
+                    is_writer = is_writer & (fx.Uint32(fx.block_idx.y) == 0)
                 if in_expert:
                     is_not_first = tid != 0
                     start = fx.Int32(0)
@@ -1783,7 +1783,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         # are dead-tail padding rows of the dispatch buffer -> skip the gather+quant.
         # When truncation is disabled the caller passes a null pointer, which must
         # not be dereferenced, so the load is predicated rather than unconditional.
-        route_in_range = fx.Uint32(route) < fx.Uint32(valid_route_count)
+        route_in_range = fx.Uint32(route) < valid_route_count
         rows_t = ptr_buf_tensor(topids_to_rows)
         # An EP route with no grouped row carries the negative DROPPED_ROUTE_ROW
         # sentinel: a destination row derived from it would overwrite a kept
@@ -1794,7 +1794,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
             # Scalar (SMEM) load: `route` is wave-uniform, and landing the row in
             # an SGPR is what makes the per-row destination descriptor uniform.
             row_raw = fx.Int32(buf_scalar_load(rows_t, route))
-        row_is_mapped = row_raw >= fx.Int32(0)
+        row_is_mapped = row_raw >= 0
         if row_is_mapped:
             row = fx.Uint32(row_raw)
             if const_expr(fuse_ep_psum):
@@ -2157,7 +2157,7 @@ def build_moe_token_multidest_quant_module(
             hidden_lds_idx = fx.index_cast(T.index, ptrtoint(h_lds))
             hidden_lds_load, _ = make_lds_copy_ops(128)
             hidden_lds_row_off = warp_in_block * fx.Int32(hidden_chunk_bytes)
-            valid_rows = fx.Int32(token_num) - fx.Int32(token0)
+            valid_rows = token_num - fx.Int32(token0)
             hg_base = fx.recast_iter(fx.Int8, hidden) + fx.Int64(token0) * (
                 feat_dim * 2
             )
@@ -2471,7 +2471,7 @@ def build_moe_token_multidest_compact_quant_module(
             token = token0 + warp_in_block
             chunk_prefetch = None
             if const_expr(tdm_hidden_chunks):
-                valid_rows = fx.Int32(token_num) - fx.Int32(token0)
+                valid_rows = token_num - fx.Int32(token0)
                 hg_base = fx.recast_iter(fx.Int8, hidden) + fx.Int64(token0) * (
                     feat_dim * 2
                 )
@@ -2862,8 +2862,8 @@ def build_moe_fused_route_psum_quant_scatter_module(
             expert = fx.Uint32(global_expert)
             keep = global_expert >= c0_i32
             if const_expr(direct_ep):
-                keep = keep & (global_expert // fx.Int32(experts) == fx.Int32(rank))
-                expert = fx.Uint32(global_expert % fx.Int32(experts))
+                keep = keep & (global_expert // experts == rank)
+                expert = fx.Uint32(global_expert % experts)
             if (lane == 0) & keep:
                 _atomic_add(count, expert, c1_i32)
 
@@ -2949,8 +2949,8 @@ def build_moe_fused_route_psum_quant_scatter_module(
             expert = fx.Uint32(global_expert)
             keep = global_expert >= c0_i32
             if const_expr(direct_ep):
-                keep = keep & (global_expert // fx.Int32(experts) == fx.Int32(rank))
-                expert = fx.Uint32(global_expert % fx.Int32(experts))
+                keep = keep & (global_expert // experts == rank)
+                expert = fx.Uint32(global_expert % experts)
 
             # lane 0 claims the within-expert slot and reads the (published) per-
             # expert row base; both are warp-uniform, broadcast via readlane.
@@ -2987,7 +2987,7 @@ def build_moe_fused_route_psum_quant_scatter_module(
 
             if keep:
                 # per-row scale-preshuffle geometry from the global grouped_row.
-                scale_tile = fx.Uint32(grouped_row) // fx.Uint32(c_rows_per_tile)
+                scale_tile = grouped_row // fx.Uint32(c_rows_per_tile)
                 row_in_tile = grouped_row - scale_tile * c_rows_per_tile
                 wmma_row = fx.Uint32(row_in_tile) // fx.Uint32(c16_i32)
                 row_lane16 = row_in_tile - wmma_row * c16_i32
