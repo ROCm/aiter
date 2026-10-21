@@ -480,7 +480,7 @@ def gemm_a8w8(shape, backend):
     gluon_default_archs=("gfx1250",),
     gluon_candidates={
         "num_stages": [2, 3, 4, 6]
-    },  # gfx1250 gluon reads it as NUM_BUFFERS
+    },  # gfx950 gluon reads it as NUM_STAGES, at least 2
 )
 def gemm_a8w8_blockscale(shape, backend):
     import torch
@@ -532,9 +532,6 @@ def gemm_a8w8_blockscale(shape, backend):
     bits=(8, 8),
     gluon_archs=("gfx1250",),
     gluon_default_archs=("gfx1250",),
-    gluon_candidates={
-        "num_stages": [2, 3, 4, 6]
-    },  # gfx1250 gluon reads it as NUM_BUFFERS
 )
 def gemm_a8w8_blockscale_preshuffle(shape, backend):
     import torch

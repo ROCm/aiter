@@ -29,7 +29,10 @@ import triton
 from aiter.ops.triton.fusions.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    override_parser_action,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
@@ -260,7 +263,7 @@ def parse_int_or_list(value):
 
 def parse_args(args: list[str] | None = None):
     parser = get_parser(kernel_name="fused_qk_rope_reshape_and_cache")
-    parser.set_defaults(metric="time")
+    override_parser_action(parser, action="--metric", default="time")
     parser.add_argument(
         "-M",
         type=parse_int_or_list,

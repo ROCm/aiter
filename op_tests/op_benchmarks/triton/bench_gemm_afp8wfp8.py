@@ -249,13 +249,6 @@ def parse_args(args: list[str] | None = None):
         help="Preshuffle the weight (layout=(16, 16)) and use gemm_afp8wfp8_preshuffle.",
     )
     parser.add_argument(
-        "--backend",
-        type=str,
-        choices=["triton", "gluon"],
-        default=None,
-        help="Backend for the preshuffle kernel. Default auto-detects (gluon on gfx1250, else triton). Ignored without --shuffle.",
-    )
-    parser.add_argument(
         "--dtype",
         type=str,
         choices=list(DTYPE_MAP.keys()),
