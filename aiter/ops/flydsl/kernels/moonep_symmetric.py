@@ -17,6 +17,7 @@ MoonEP buffer, weight pools included: sum ``MoonEPPlanner.vmm_bytes`` and
 from __future__ import annotations
 
 import functools
+import socket
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -48,6 +49,23 @@ def cco_vmm_bytes(*nbytes: int) -> int:
     """``per_rank_vmm`` that the ``alloc_mem`` calls of these sizes occupy."""
     g = CCO_ALLOC_GRANULARITY
     return sum(-(-n // g) * g for n in nbytes)
+
+
+_ONE_NODE_GROUPS: set = set()
+
+
+def _check_one_node(group: dist.ProcessGroup | None, world_size: int) -> None:
+    """The kernels load and store peers' memory directly (cco LSA), which only
+    reaches GPUs of the same node.  Device indices may map to ranks freely."""
+    if id(group) in _ONE_NODE_GROUPS:
+        return
+    hosts = [None] * world_size
+    dist.all_gather_object(hosts, socket.gethostname(), group=group)
+    if len(set(hosts)) != 1:
+        raise ValueError(
+            f"MoonEP needs every EP rank on one node (P2P), got hosts {hosts}"
+        )
+    _ONE_NODE_GROUPS.add(id(group))
 
 
 @functools.cache
@@ -122,6 +140,7 @@ class MoonEPSymmetric:
                     f"EP{world_size} inside a world of {dist.get_world_size()} "
                     "ranks: pass the EP process group as group="
                 )
+            _check_one_node(group, world_size)
             self._memory = communicator.alloc_mem(nbytes)
             self._window = communicator.register_window(self._memory.ptr, nbytes)
             self.storage = _from_gpu_ptr(self._window.local_ptr, (nbytes,), torch.uint8)

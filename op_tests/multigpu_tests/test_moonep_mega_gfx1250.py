@@ -142,6 +142,11 @@ def main():
         help="control: compare plain against itself (MegaMoE's own run-to-run noise)",
     )
     parser.add_argument(
+        "--rotate-devices",
+        action="store_true",
+        help="rank r runs on cuda:(r + 1) %% N: EP ranks need not be device indices",
+    )
+    parser.add_argument(
         "--max-flaky-rate",
         type=float,
         default=0.3,
@@ -153,7 +158,11 @@ def main():
         os.environ["AITER_FORCE_A8W4"] = "1"
     ctx = Dist()
     rank, world = ctx.rank, ctx.world
-    device = torch.device("cuda", ctx.local_rank)
+    local = ctx.local_rank
+    if args.rotate_devices:
+        local = (local + 1) % torch.cuda.device_count()
+        torch.cuda.set_device(local)
+    device = torch.device("cuda", local)
     epr = EXPERTS // world
     B = args.slots
     spec = resolve_spec(f"{args.quant}_mxfp4")
