@@ -10,102 +10,13 @@
 
 using namespace kittens;
 
-// ================================================================ 1. tile-load helpers
-// From HipKittens kernels/cdna4/gemm/fp8fp32/FP8_4wave/utils.cpp: buffer resource + LDS base of a
-// shared tile, and the direct-to-LDS load of one quarter of it.
+// ================================================================ 1. tile-load metadata
+// Buffer resource and per-wave LDS base for weights in AITER's shuffled layout.
 struct precomputed_addresses
 {
     i32x4 srsrc;
     uintptr_t lds_base;
 };
-
-/**
- * @brief Precompute the buffer resource for the given shared tile and global memory.
- * @param dst The shared tile.
- * @param src The global memory.
- * @param idx The index of the shared tile.
- * @return The buffer resource.
- */
-template <typename ST, typename GL>
-__device__ __forceinline__ static precomputed_addresses
-precompute_addresses(ST& dst, const GL& src, const coord<ST>& idx)
-{
-    constexpr int axis = 2;
-    using T            = typename ST::dtype;
-
-    const int row_stride = src.template stride<axis>();
-
-    coord<> unit_coord = idx.template unit_coord<axis, 3>();
-    T* global_ptr      = (T*)&src[unit_coord];
-    i32x4 srsrc        = make_srsrc(global_ptr, row_stride * ST::rows * sizeof(T));
-
-    constexpr int bytes_per_thread = ST::underlying_subtile_bytes_per_thread;
-    constexpr int bytes_per_warp   = bytes_per_thread * kittens::WARP_THREADS;
-    constexpr int elem_per_warp    = bytes_per_warp / sizeof(T);
-    const int warp_id              = warpid();
-
-    uintptr_t lds_base = reinterpret_cast<uintptr_t>(&dst.data[0]) + (warp_id * bytes_per_warp);
-
-    return {srsrc, lds_base};
-}
-
-/**
- * @brief Perform one buffer_load_dwordx4 from the global memory to the shared tile.
- * @param dst The shared tile.
- * @param src The global memory.
- * @param addresses The buffer resource and LDS base address.
- */
-template <int i, typename ST, typename GL>
-__device__ inline static void load_one(ST& dst, const GL& src, precomputed_addresses addresses)
-{
-    constexpr int axis  = 2;
-    const int N_THREADS = kittens::num_warps() * kittens::WARP_THREADS;
-
-    using T = typename ST::dtype;
-
-    constexpr int bytes_per_thread = ST::underlying_subtile_bytes_per_thread;
-    constexpr int bytes_per_warp   = bytes_per_thread * kittens::WARP_THREADS;
-    static_assert(ST::rows * ST::cols * sizeof(T) >= bytes_per_warp,
-                  "shared tile must be at least 1024 bytes");
-
-    const int num_warps = N_THREADS / kittens::WARP_THREADS;
-    const int laneid    = kittens::laneid();
-    const int warpid    = kittens::warpid() % num_warps;
-
-    const int row_stride = src.template stride<axis>();
-
-    const int lane_byte_offset =
-        (laneid * bytes_per_thread) + (warpid * bytes_per_warp) + (i * num_warps * bytes_per_warp);
-    const int subtile_id               = lane_byte_offset / ST::underlying_subtile_bytes;
-    const int subtile_row              = subtile_id / ST::underlying_subtiles_per_row;
-    const int subtile_col              = subtile_id % ST::underlying_subtiles_per_row;
-    const int subtile_lane_byte_offset = lane_byte_offset % ST::underlying_subtile_bytes;
-
-    const int row = subtile_lane_byte_offset / ST::underlying_subtile_row_bytes;
-    const int col = (subtile_lane_byte_offset % ST::underlying_subtile_row_bytes) / sizeof(T);
-
-    const uint32_t swizzled_shared_byte_offset = dst.swizzle({row, col});
-
-    const int swizzled_global_row =
-        (swizzled_shared_byte_offset / ST::underlying_subtile_row_bytes) +
-        subtile_row * ST::underlying_subtile_rows;
-    const int swizzled_global_col =
-        (swizzled_shared_byte_offset % ST::underlying_subtile_row_bytes) / sizeof(T) +
-        subtile_col * ST::underlying_subtile_cols;
-    const uint32_t swizzled_global_byte_offset =
-        (swizzled_global_row * row_stride + swizzled_global_col) * sizeof(T);
-
-    uintptr_t lds_addr     = addresses.lds_base + (i * num_warps * bytes_per_warp);
-    as3_uint32_ptr lds_ptr = (as3_uint32_ptr)(lds_addr);
-
-    llvm_amdgcn_raw_buffer_load_lds(addresses.srsrc, // buffer resource
-                                    lds_ptr,
-                                    bytes_per_thread,
-                                    swizzled_global_byte_offset,
-                                    0,
-                                    0,                                       // instruction offset
-                                    static_cast<int>(coherency::cache_all)); // cache coherency
-}
 
 // ================================================================ 2. pinned-register tiles
 // Pinned-register (art) tiles of the 4-wave HW-scaled FP8 GEMM.
@@ -132,17 +43,11 @@ constexpr int PA0 = 128, PA1 = 160, PB0 = 192, PB1 = 224;
 template <int BASE>
 using op_ranges =
     ducks::art::split_many_t<ducks::art::type_list<ducks::art::range<BASE, BASE + 31>>, 8>;
-template <int ACC, typename Seq>
-struct acc_ranges_impl;
-template <int ACC, int... Is>
-struct acc_ranges_impl<ACC, std::integer_sequence<int, Is...>>
-{
-    using type =
-        ducks::art::type_list<ducks::art::range<256 + ACC + ((Is % 4) * 4 + Is / 4) * 4,
-                                                256 + ACC + ((Is % 4) * 4 + Is / 4) * 4 + 3>...>;
-};
 template <int ACC>
-using acc_ranges = typename acc_ranges_impl<ACC, std::make_integer_sequence<int, 16>>::type;
+using acc_ranges = ducks::art::transpose_2d<
+    ducks::art::split_many_t<ducks::art::type_list<ducks::art::range<256 + ACC, 319 + ACC>>, 4>,
+    4,
+    4>;
 
 // 64x128 fp8 operand tile pinned at v[BASE..BASE+31] (4 rt_16x128 subtiles)
 template <int BASE>
@@ -248,11 +153,10 @@ __device__ __forceinline__ void store_acc_rows(const i32x4 rsrc,
 // MFMA cluster Global -> LDS tile loads and the pinned MFMA/load cluster of the grouped GEMM's
 // K-step.
 //
-// A 128x128 fp8 shared tile is filled by 4 direct-to-LDS 16-byte loads per thread (load i = 0..3);
-// the LDS destination and swizzle are those of FP8_4wave's load_one. Three sources:
-//   plain_tile_load    row-major rows of a global layout (FP8_4wave precompute_addresses /
-//   load_one) shuf_tile_load     weights in aiter's shuffle_weight(w, (16,16)) layout
-//   gather_tile_load   rows gathered from a token-major matrix through per-thread byte offsets
+// A 128x128 fp8 shared tile is filled by 4 direct-to-LDS 16-byte loads per thread (load i = 0..3).
+// Three sources: plain_tile_load uses HK group loads on 32x128 row-major subtiles;
+// shuf_tile_load reads AITER's shuffle_weight(w, (16,16)) layout; gather_tile_load reads rows
+// from a token-major matrix through per-thread byte offsets.
 
 constexpr int NUM_WARPS = 4;
 using G                 = kittens::group<NUM_WARPS>;
@@ -265,12 +169,13 @@ struct plain_tile_load
     ST& dst;
     const GL& src;
     coord<ST> idx;
-    precomputed_addresses addr;
-    __device__ __forceinline__ void prepare() { addr = precompute_addresses(dst, src, idx); }
+    __device__ __forceinline__ void prepare() {}
     template <int i>
     __device__ __forceinline__ void issue()
     {
-        load_one<i>(dst, src, addr);
+        static_assert(ST::rows == 128 && ST::cols == 128 && i >= 0 && i < 4);
+        auto chunk = kittens::subtile_inplace<32, 128>(dst, {i, 0});
+        G::load(chunk, src, {idx.b, idx.d, idx.r * 4 + i, idx.c});
     }
 };
 
