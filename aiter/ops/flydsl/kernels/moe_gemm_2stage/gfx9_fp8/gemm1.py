@@ -1042,7 +1042,7 @@ def compile_moe_gemm1(
         p_weight: fx.Pointer,
         p_output: fx.Pointer,
         p_topk_ids: fx.Pointer,
-        p_topk_weights: fx.Pointer,
+        p_clear_output: fx.Pointer,
         p_w_scale: fx.Pointer,
         task_num: fx.Int32,
         stream: fx.Stream,
@@ -1050,9 +1050,9 @@ def compile_moe_gemm1(
         CompilationContext.get_current()
         num_n_blocks = fxh.div_up(N, BLOCK_TILE_SIZE_N)
         batch_size = task_num // TOPK
-        # The Down output to clear travels in the routing-weight slot.
+        # Other launchers take the routing weights in the p_clear_output position.
         moe_2stage_gateup_batch1(
-            p_input, p_weight, p_output, p_topk_ids, p_topk_weights, p_w_scale
+            p_input, p_weight, p_output, p_topk_ids, p_clear_output, p_w_scale
         ).launch(
             grid=(num_n_blocks, TOPK, batch_size),
             block=(256, 1, 1),

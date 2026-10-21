@@ -1160,8 +1160,7 @@ def make_gemm_helpers(K, weight_dtype, BLOCK_TILE_SIZE_M, TOPK):
                     c_frag_reduce[0, m, None].store(acc)
                 else:
                     c_frag_reduce[None, m, (None, n)].store(acc)
-                if const_expr(m * n_blocks + n + 1 < (TILE_M // 16) * n_blocks):
-                    gpu.barrier()
+                gpu.barrier()
 
         return c_frag_reduce
 

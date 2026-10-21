@@ -82,26 +82,11 @@ class Config:
         )
 
     def unsupported_reason(self, problem: "_Problem") -> str | None:
-        if not self.use_prefill:
-            tile = (self.BLOCK_M, self.BLOCK_N, self.BLOCK_K)
-            if self.use_batch1_algorithm:
-                if not 2 <= problem.batch <= 8:
-                    return "direct decoding requires 2 to 8 tokens"
-                if tile != (16, 16, 16):
-                    return "direct decoding uses the fixed 16_16_16 config"
-            elif not 1 <= problem.batch <= 256:
-                return "decoding requires 1 to 256 tokens"
-            elif problem.batch == 1:
-                if tile != (16, 16, 16):
-                    return "batch1 uses the fixed 16_16_16 config"
-            # 16_16_16 is the BN64 sorted-decoding tile of rows tuned before BN/BK were selectable.
-            elif tile not in ((16, 16, 16), (16, 64, 64), (16, 128, 64)):
-                return "sorted decoding requires 16_16_16, 16_64_64 or 16_128_64"
-            if problem.hidden_dim % 256 or problem.inter_dim % 64:
-                return (
-                    "decoding requires hidden_dim divisible by 256 and inter_dim by 64"
-                )
-            return None
+        if self.use_batch1_algorithm and not 2 <= problem.batch <= 8:
+            return "direct decoding requires 2 to 8 tokens"
+        # Batch 1 runs the batch-1 kernels for any tile; tune it only as 16_16_16.
+        if not self.use_prefill and problem.batch == 1 and self.BLOCK_N != 16:
+            return "batch 1 uses the 16_16_16 config"
         if self.down_path != "default":
             if self.BLOCK_M != 64:
                 return "specialized Down paths require unchanged M64 Gate/Up metadata"
@@ -193,7 +178,6 @@ def get_tune_space():
     configs = [
         Config(16, 16, 16, False),
         Config(16, 16, 16, False, use_batch1_algorithm=True),
-        Config(16, 64, 64, False),
         Config(16, 128, 64, False),
     ]
     configs.extend(Config(64, block_n, block_k, True) for block_n, block_k in prefill)
@@ -564,9 +548,7 @@ def _run_decode(
     if problem.batch * problem.topk <= problem.experts:
         grid = problem.batch * problem.topk
 
-    legacy_tile = (config.BLOCK_N, config.BLOCK_K) == (16, 16)
-    block_n = 64 if legacy_tile else config.BLOCK_N
-    block_k = None if legacy_tile else config.BLOCK_K
+    block_n = 64 if config.BLOCK_N == 16 else config.BLOCK_N
     gemm1_out = _gateup_output(hidden_states, problem)
     weight_dtype_str = "bf16" if w1.dtype == torch.bfloat16 else "fp8"
     gateup_kernel = _get_compiled_kernel(
@@ -577,7 +559,6 @@ def _run_decode(
         TOPK=problem.topk,
         BLOCK_TILE_SIZE_M=config.BLOCK_M,
         BLOCK_TILE_SIZE_N=block_n,
-        BLOCK_TILE_SIZE_K=block_k,
         stage="gateup",
         alg="splitk",
         E=problem.experts,
@@ -606,7 +587,6 @@ def _run_decode(
         TOPK=problem.topk,
         BLOCK_TILE_SIZE_M=config.BLOCK_M,
         BLOCK_TILE_SIZE_N=block_n,
-        BLOCK_TILE_SIZE_K=block_k,
         stage="down",
         alg="splitk",
         E=problem.experts,
@@ -789,13 +769,7 @@ def run_flydsl_moe_gfx942_impl(
     quant_dtype = (
         torch.bfloat16 if request.w1.dtype == torch.bfloat16 else torch.float8_e4m3fnuz
     )
-    # Decoding kernels read BF16 activations even with FP8 weights.
-    supported_q_dtypes_a = (
-        (None, quant_dtype)
-        if config.use_prefill or quant_dtype == torch.bfloat16
-        else (None, quant_dtype, torch.bfloat16)
-    )
-    if request.q_dtype_a not in supported_q_dtypes_a:
+    if request.q_dtype_a not in (None, quant_dtype):
         raise NotImplementedError(
             "gfx942 FlyDSL whole-graph activation dtype must match the weight mode"
         )
