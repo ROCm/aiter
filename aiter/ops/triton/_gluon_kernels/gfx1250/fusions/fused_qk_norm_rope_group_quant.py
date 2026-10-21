@@ -208,7 +208,7 @@ def fused_qk_norm_rope_group_quant_gfx1250(
         )
         store_rows(nope_ptr, rope_ptr, nope, scales, rope, cache_modifier)
         # Skip the SWA write for pad tokens, stale positions and rows that are not
-        # in the SWA cache. The HIP kernel (swa_row_for_token) does the same checks.
+        # in the SWA cach
         swa_row_ok = (swa_dest_row >= 0) & (swa_dest_row < swa_num_rows)
         if swa_row_ok & (batch_id >= 0) & (swa_pos >= 0):
             store_rows(
