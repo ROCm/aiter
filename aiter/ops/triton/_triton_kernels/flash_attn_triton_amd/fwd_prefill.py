@@ -286,6 +286,7 @@ def _attn_fwd_inner(
     offs_d_v,
     block_min,
     block_max,
+    n_extra_tokens,
     alibi_slope,
     q_descale,
     k_descale,
@@ -360,6 +361,13 @@ def _attn_fwd_inner(
 
         # setup qk accumulator
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
+
+        # Mask the partial K block before the dot as well as after it.
+        if APPLY_MASK and ((n_extra_tokens != 0) and (start_n + BLOCK_N == block_max)):
+            boundary_m = tl.full([BLOCK_M], seqlen_k, dtype=tl.int32)
+            size_n = start_n + offs_n[None, :]
+            mask = size_n < boundary_m[:, None]
+            qk = tl.where(mask, qk, float("-inf"))
 
         # -- compute qk ----
         if IS_FP8:
@@ -1100,6 +1108,7 @@ def attn_fwd(
             offs_d_v,
             block_min,  # Start of front masked blocks
             block_max,  # End of front masked blocks
+            0,
             alibi_slope,
             q_descale,
             k_descale,
@@ -1166,6 +1175,7 @@ def attn_fwd(
             offs_d_v,
             block_min,  # Start of range: 0
             block_max,  # End of range: n_full_blocks * BLOCK_N
+            0,
             alibi_slope,
             q_descale,
             k_descale,
@@ -1237,6 +1247,7 @@ def attn_fwd(
             offs_d_v,
             block_min,  # Start of range: n_full_blocks * BLOCK_N
             block_max,  # End of range: n_visible_k_blocks * BLOCK_N
+            n_extra_tokens,
             alibi_slope,
             q_descale,
             k_descale,
